@@ -1,5 +1,6 @@
 import AuthoredCapabilities
 import Foundation
+import Experiences
 import AttentionRouting
 import DreamREMCycle
 import NativeAgentCore
@@ -8,20 +9,26 @@ import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
-// Blueprint: | `SchedulerDueJobRunner+Execution.swift` | `SchedulerDueJobRunner`: body-rhythm-only `execute` (a `part` job fires its part's `schedule:` signal), `watch` (a `connector_action` read posts the rows new since its last read as one news per job), `disabledDreamResult`; scheduled intention runners are retired |
+// Blueprint: | `SchedulerDueJobRunner+Execution.swift` | Shared dream matters and REM receipts; due jobs consume the same recorded result |
 
 extension SchedulerDueJobRunner {
     func execute(job: DueJob) async throws -> JobResult {
         try Task.checkCancellation()
         guard let kind = JobKind(rawValue: job.kind) else {
             throw NSError(domain: "NativeAgentScheduler", code: -410, userInfo: [
-                NSLocalizedDescriptionKey: "schedule_kind_unsupported: Scheduled Desk task kind '\(job.kind)' is unsupported. Set a supported kind and its complete payload through schedule.update."
+                NSLocalizedDescriptionKey: """
+                    schedule_kind_unsupported: Scheduled Desk task kind '\(job.kind)' is unsupported. Set a supported kind and its complete payload through \
+                    schedule.update.
+                    """
             ])
         }
         guard isLiveDataRoot else {
             throw NSError(domain: "NativeAgentScheduler", code: -403, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "schedule_root_not_live: Scheduled effects are refused for \(root.path). In NativeAgent's running app, use queue.add for intentions or schedule.create for body rhythms in its active data folder."
+                    """
+                        schedule_root_not_live: Scheduled effects are refused for \(root.path). In NativeAgent's running app, use queue.add for intentions or \
+                        schedule.create for body rhythms in its active data folder.
+                        """
             ])
         }
         switch kind {
@@ -57,9 +64,8 @@ extension SchedulerDueJobRunner {
                 output: scan.output
             )
         case .part:
-            // The deadline only fires the signal; the run is the stem's, on its own gate chain.
-            // Fires that land while the part's run still waits are one news. Posting is all
-            // this job knows: the run's outcome is the ability's own record, never claimed here.
+            // The deadline only fires the signal; the run is the stem's, on its own gate chain. Fires that land while the part's run still waits are one news.
+            // Posting is all this job knows: the run's outcome is the ability's own record, never claimed here.
             let part = string(job.payload["part"]) ?? "", signal = string(job.payload["signal"]) ?? ""
             AbilityStore(dataRoot: root).signal(signal, part: part)
             return JobResult(status: "completed", detail: "\(signal) posted for \(part); its run is recorded on the ability: app ability.read {id:\"\(part)\"}",
@@ -86,15 +92,9 @@ extension SchedulerDueJobRunner {
         )
     }
 
-    /// Every scheduled read is a watch, below the model. Its rows (the objects in
-    /// the result's arrays) are compared with the ones its last read kept on the job;
-    /// the rows new since then are posted as one news from this job, so the next
-    /// replaces it on the board. A row is known by its identifier fields (id, …Id,
-    /// …_id) when it has them, else by its digest. The first read only keeps what
-    /// it saw; a read that did not complete keeps nothing, so the last stays.
-    /// The rows are what the read returned, under the door's receipt (`result`):
-    /// a part's own answer (`returned`), never its runner's ledger of calls. A read whose
-    /// `returned` is only a count (Dream Diary, Studio) keeps its rows beside it.
+    /// Keep observed rows on the job so only new content posts news; the job identity makes later news replace it on the board. Row IDs take precedence
+    /// over digests. The first read establishes a baseline; an incomplete read preserves the last baseline. Observe the part's returned content, never
+    /// its call ledger; count-only answers keep their content beside the count.
     static func watch(job: DueJob, actionId: String, output: JSONValue) async throws -> (seen: [String], fresh: Int) {
         var payload = output
         if case .object(let receipt) = payload, receipt["action"] != nil, let result = receipt["result"] { payload = result }
@@ -126,8 +126,7 @@ extension SchedulerDueJobRunner {
             case .array(let values):
                 return try values.flatMap { try project($0, collectionRoot: false) }
             case .object(let fields):
-                // Receipt status is not observed content. Nested detail (including
-                // a screen's controls) stays in the observation, not an empty row.
+                // Receipt status is not observed content. Nested detail (including a screen's controls) stays in the observation, not an empty row.
                 guard !fields.isEmpty else { return try project(.null) }
                 let arrays = fields.keys.sorted().compactMap { key -> [JSONValue]? in
                     if case .array(let values)? = fields[key] { return values }; return nil
@@ -189,16 +188,14 @@ extension SchedulerDueJobRunner {
             if let disabledResult = Self.disabledDreamResult(for: error) {
                 return disabledResult
             }
-            // Named once here: what failed reading, by the field it names.
             throw NSError(domain: "SchedulerDueJobRunner", code: 1, userInfo: [NSLocalizedDescriptionKey:
                 "The nightly dream (dream cycle) failed: " + JSONValue.describe(error)])
         }
         let entries = Self.anyInt(response["entriesWritten"])
-        let sessions = Self.anyInt(response["sessionsProcessed"])
         let disabled = Self.anyBool(response["disabled"])
-        var errors = Self.anyStringArray(response["errors"])
+        let errors = Self.anyStringArray(response["errors"])
         let failedWithoutEntry = entries <= 0 && !errors.isEmpty
-        let output = Self.jsonValue(from: response)
+        let output: JSONValue = .object(try NativeActionWire.jsonValueBody(response))
 
         if disabled {
             return JobResult(
@@ -226,56 +223,9 @@ extension SchedulerDueJobRunner {
             )
         }
 
-        let dateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(Date())
-        let entriesForToday: [DreamDiarySnippet]
-        do { entriesForToday = try Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey) }
-        catch {
-            // The cycle already ran. Keep its result and name the separate
-            // presentation failure; never rerun a dream to reconstruct a card.
-            entriesForToday = []
-            errors.append("The dream result is retained, but its diary presentation is unavailable: \(error.localizedDescription)")
-        }
-        let paths = entriesForToday.map { $0.path }
-        let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
-        let title = failedWithoutEntry ? "\(agentName) dream needs repair" : "\(agentName) dreamed"
-        let message = Self.dreamInboxMessage(
-            entriesWritten: entries,
-            sessionsProcessed: sessions,
-            errors: errors,
-            entries: entriesForToday
-        )
-        let itemId = "dream-cycle-\(dateKey)-\(UUID().uuidString.lowercased())"
-        try await appendNotificationInbox(
-            title: title,
-            message: message,
-            source: "dream_cycle",
-            severity: entries > 0 || failedWithoutEntry ? "important" : "info",
-            jobId: job.id,
-            itemId: itemId,
-            relatedPaths: paths,
-            presentation: Self.dreamCardPresentation
-        )
-        let archivedDreamCards = try await archiveOlderDreamInboxItems(keeping: itemId)
-        let delivery = entries > 0
-            ? await postCycleNotification(title: title, body: Self.notificationBody(message), jobId: job.id, source: "dream_cycle", itemId: itemId)
-            : .object(["delivered": .array([]), "errors": .array([])])
-        let detail = entries > 0
-            ? "dream pass wrote \(entries) entr\(entries == 1 ? "y" : "ies") and surfaced inbox item"
-            : "dream pass ran with no new entries; surfaced inbox receipt"
-        var outputObj = Self.object(output)
-        outputObj["inboxItemId"] = .string(itemId)
-        outputObj["archivedOlderDreamInboxItems"] = .int(Int64(archivedDreamCards))
-        outputObj["delivery"] = delivery
-        if failedWithoutEntry {
-            outputObj["failureKind"] = .string("dream_failed_before_write")
-        }
-        return JobResult(
-            status: failedWithoutEntry ? "error" : (errors.isEmpty ? "completed" : "warn"),
-            detail: failedWithoutEntry
-                ? "dream pass failed before writing; repair remains owed"
-                : detail,
-            output: .object(outputObj)
-        )
+        return JobResult(status: failedWithoutEntry ? "error" : errors.isEmpty ? "completed" : "warn",
+            detail: failedWithoutEntry ? "dream failed before writing; repair remains owed" : "dream result and its matter retained",
+            output: output)
     }
 
     static func disabledDreamResult(for error: Error) -> JobResult? {
@@ -293,10 +243,50 @@ extension SchedulerDueJobRunner {
         )
     }
 
+    /// The shared engine calls this once after a real dream; the scheduler consumes its receipt without filing another matter.
+    public func surfaceDreamResult(_ output: JSONValue) async throws -> JSONValue {
+        let row = try JSONRow(output)
+        guard let entries = try row.optionalInt("entriesWritten"), let sessions = try row.optionalInt("sessionsProcessed"),
+              let disabled = try row.optionalBool("disabled") else { throw JSONRow.Malformed.field("dream result") }
+        var errors = try row.strings("errors")
+        guard !disabled, try row.optionalString("skipReason") != "already_running",
+              entries > 0 || !errors.isEmpty else { return .object([:]) }
+        let failedWithoutEntry = entries <= 0 && !errors.isEmpty
+        let dateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(Date())
+        let entriesForToday: [DreamDiarySnippet]
+        do { entriesForToday = try Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey) }
+        catch {
+            // The cycle already ran. Keep its result and name the separate presentation failure; never rerun a dream to reconstruct a card.
+            entriesForToday = []
+            errors.append("The dream result is retained, but its diary presentation is unavailable: \(error.localizedDescription)")
+        }
+        let paths = entriesForToday.map { $0.path }
+        let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
+        let title = failedWithoutEntry ? "\(agentName) dream needs repair" : "\(agentName) dreamed"
+        let message = Self.dreamInboxMessage(
+            entriesWritten: entries,
+            sessionsProcessed: sessions,
+            errors: errors,
+            entries: entriesForToday
+        )
+        let itemId = "dream-cycle-\(dateKey)-\(UUID().uuidString.lowercased())"
+        let delivery = try await tellScheduledMatter(Matter(id: itemId, form: failedWithoutEntry ? .wentWrong : .done,
+            from: "dream_cycle", title: title, summary: String(message.prefix(500)), words: message,
+            symbol: "moon.stars.fill", badge: "DREAM", artifacts: paths.map { .init(source: Matter.files, id: $0) }),
+            reach: .person(from: nil))
+        let archivedDreamCards = try await archiveOlderDreamInboxItems(keeping: itemId)
+
+        var receipt: [String: JSONValue] = [
+            "inboxItemId": .string(itemId), "archivedOlderDreamInboxItems": .int(Int64(archivedDreamCards)), "delivery": delivery
+        ]
+        if failedWithoutEntry { receipt["failureKind"] = .string("dream_failed_before_write") }
+        return .object(receipt)
+    }
+
     private func executeREM(job: DueJob) async throws -> JobResult {
         // Scheduled REM honors the weekly claim to avoid duplicate proposals.
         let response = try await platform.runRem(force: false)
-        let output = Self.jsonValue(from: response)
+        let output: JSONValue = .object(try NativeActionWire.jsonValueBody(response))
         guard let rawOutcome = response["outcome"] as? String,
               let outcome = REMRunReportPayload.Outcome(rawValue: rawOutcome) else {
             throw PersistenceCoreError.ioFailure("REM returned no typed outcome; completion is unavailable.")
@@ -344,18 +334,9 @@ extension SchedulerDueJobRunner {
         )
         let itemId = "rem-cycle-\(NativeAgentDreamCycleSchedule.runDateKey(Date()))-\(UUID().uuidString.lowercased())"
         let paths = Self.remRelatedPaths(dataRoot: root)
-        try await appendNotificationInbox(
-            title: title,
-            message: message,
-            source: "rem_cycle",
-            // This card is a receipt; each proposal has its own rem.proposal approval.
-            severity: "info",
-            jobId: job.id,
-            itemId: itemId,
-            relatedPaths: paths,
-            presentation: Self.remCardPresentation
-        )
-        let delivery = await postCycleNotification(title: title, body: Self.notificationBody(message), jobId: job.id, source: "rem_cycle", itemId: itemId)
+        let delivery = try await tellScheduledMatter(Matter(id: itemId, form: .done, from: "rem_cycle",
+            title: title, summary: String(message.prefix(500)), words: message, symbol: "sparkles", badge: "REM",
+            artifacts: paths.map { .init(source: Matter.files, id: $0) }), reach: .person(from: nil))
         var outputObj = Self.object(output)
         outputObj["inboxItemId"] = .string(itemId)
         outputObj["delivery"] = delivery

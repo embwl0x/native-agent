@@ -3,6 +3,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import ChatSessionWork
+import ChatToolParsing
 // Blueprint: | `OutcomeTissueV2.swift` | `ResponseOutcomeObservationV2`: `make` |
 
 extension ResponseOutcomeObservationV2 {
@@ -32,10 +33,11 @@ extension ResponseOutcomeObservationV2 {
             else { return nil }
             let sourceID = dispatch.id ?? "sequence:\(index)"
             let opaqueID = CausalTransitionEvidence.opaqueIdentity("\(turnID)|tool|\(sourceID)")
+            let reply = ToolResult(dispatch.result)
             return ResponseOutcomeToolReference(
                 callID: opaqueID,
                 tool: tool,
-                resultClass: ChatToolOutcome.exactResultClass(dispatch.result).rawValue
+                resultClass: reply.outcome.rawValue
             )
         }
         var seenMotorReferences = Set<String>()
@@ -50,10 +52,7 @@ extension ResponseOutcomeObservationV2 {
         var states: [String: OutcomeEvidenceState] = [
             "responsePersistence": .observed,
             "context": packet == nil ? .censored : .observed,
-            // A model string alone cannot name a transport. A production
-            // context does carry the admitted provider route, however, so
-            // preserve that pre-dispatch fact on the canonical assistant row
-            // instead of leaving a permanently unwired historical join.
+            // Preserve the admitted route on the canonical row; model names alone cannot attest transport identity.
             "provider": context?.providerId == nil
                 ? (result == nil ? .censored : .unknown)
                 : .observed,
@@ -108,16 +107,13 @@ extension ResponseOutcomeObservationV2 {
             if case .bool(false)? = object["verifyPassed"] { return .unverified }
             if case .bool(false)? = object["verified"] { return .unverified }
             if case .string(let raw)? = object["verification"] {
-                // Chrome's current wire receipt uses "verified" (its protocol's value).
+                // Match Chrome's owner-defined `verified` wire value.
                 if raw == "verified" { return .verified }
                 if let canonical = MotorVerificationState(rawValue: raw) {
                     return outcomeEvidence(for: canonical)
                 }
             }
-            // Browser's owner defines an observed successful WKWebView
-            // navigation (`opened`) as satisfied verification. Preserve that
-            // exact owner fact in the response anchor even if the process
-            // exits before the detached motor trace reaches disk.
+            // Preserve Browser's observed `opened` navigation as satisfied verification even if detached trace persistence has not finished.
             if binding.domain == .browser, case .bool(let opened)? = object["opened"] {
                 return opened ? .verified : .unverified
             }

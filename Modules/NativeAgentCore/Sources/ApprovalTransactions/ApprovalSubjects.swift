@@ -9,15 +9,14 @@ import MemoryV2
 import ApprovalInbox
 import DreamREMCycle
 import TrustCenter
-// Blueprint: | `ApprovalSubjects.swift` | Proposal owners return actual outcomes to common approval settlement; REM application resumes canonical GROWTH/graduation evidence |
+// Blueprint: | `ApprovalSubjects.swift` | Domain outcomes feed shared settlement. |
 extension ApprovalExecution {
     private static func notDone(_ reason: String) -> ApprovalExecutionOwners.Settlement {
         .init(action: .object(["status": .string("refused"), "effects": .string("none"),
             "error": .string(reason)]), detail: "Not done: " + reason)
     }
 
-    /// Only an owner's explicit no-effect refusal is terminal. An uncertain
-    /// write still throws to the shared owed-application owner.
+    /// Only an owner's explicit no-effect refusal is terminal. An uncertain write still throws to the shared owed-application owner.
     private func performPartApprovalExecution(_ rec: ApprovalRecord,
         operation: () async throws -> ApprovalExecutionOwners.Settlement
     ) async {
@@ -29,7 +28,7 @@ extension ApprovalExecution {
         }
     }
 
-    func applyApprovedSelfImprovement(from rec: ApprovalRecord) async {
+    func applyApprovedSelfImprovement(from rec: ApprovalRecord, turn: Turn?) async {
         guard rec.action == "self_improvement.apply", rec.status == "resolved", rec.decision == "approved" else { return }
         await performPartApprovalExecution(rec) {
             guard case .object(let payload) = rec.payload,
@@ -40,7 +39,9 @@ extension ApprovalExecution {
             }
             var outcome: [String: JSONValue] = ["op": .string(op), "target": .string(target)]
             switch op {
-            case "disable_skill": try await effects.disableSkill(name: target)
+            case "disable_skill":
+                let turn = await approvedEffectTurn(from: rec)
+                try await effects.disableSkill(name: target, turn: turn)
             case "enable_skill":
                 let digest: String?
                 switch apply["reviewedDigest"] {
@@ -48,7 +49,8 @@ extension ApprovalExecution {
                 case nil, .null?: digest = nil // Markdown-only guidance has no executable digest.
                 default: return Self.notDone("the card has no valid reviewed digest")
                 }
-                try await effects.enableSkill(name: target, reviewedDigest: digest)
+                let turn = await approvedEffectTurn(from: rec)
+                try await effects.enableSkill(name: target, reviewedDigest: digest, turn: turn)
                 outcome["reviewedDigest"] = digest.map(JSONValue.string) ?? .null
             default: return Self.notDone("unknown self-improvement operation: \(op)")
             }
@@ -56,7 +58,6 @@ extension ApprovalExecution {
         }
     }
 
-    /// REMProposalStore owns idempotent GROWTH and graduation application.
     func applyResolvedREMProposal(from rec: ApprovalRecord) async {
         guard rec.action == "rem.proposal", rec.status == "resolved", let decision = rec.decision else { return }
         await Self.performDomainApprovalExecution(rec, dataRoot: dataRoot) {
@@ -71,7 +72,9 @@ extension ApprovalExecution {
                 guard case .string(let reviewedText)? = proposal["proposalText"], !reviewedText.isEmpty else {
                     throw ApprovalInboxError.malformedResponse("REM approval carries no reviewed proposal text")
                 }
-                let application = try await store.applyApprovedLesson(proposalId: proposalID, expectedProposalText: reviewedText)
+                // The resolved card applies durable lesson evidence; no live turn or sense read owns this reconciliation.
+                let application = try await store.applyApprovedLesson(proposalId: proposalID, expectedProposalText: reviewedText,
+                    context: MemoryWriteContext(turn: nil, senseReads: nil))
                 if application.stale {
                     return .init(action: .object(["op": .string("rem_proposal_stale"), "proposalId": .string(proposalID), "error": .string("stale")]),
                         detail: "Standing lesson stale — its source correction changed before application. Nothing was added to GROWTH or graduated.")
@@ -90,7 +93,8 @@ extension ApprovalExecution {
                         : "REM proposal approved — existing GROWTH lesson and source graduation reconciled")
             case "denied":
                 _ = try await store.applyDenial(proposalId: proposalID, reason: "denied via approval inbox")
-                return .init(action: .object(["op": .string("rem_proposal_deny"), "proposalId": .string(proposalID)]), detail: "REM proposal denied — tombstoned")
+                return .init(action: .object(["op": .string("rem_proposal_deny"), "proposalId": .string(proposalID)]),
+                    detail: "REM proposal denied — tombstoned")
             case "canceled":
                 try await store.clearApprovalStamp(proposalId: proposalID)
                 return .init(action: .object(["op": .string("rem_proposal_cancel"), "proposalId": .string(proposalID)]),
@@ -100,7 +104,7 @@ extension ApprovalExecution {
         }
     }
 
-    public func applyResolvedSkillScriptInstall(from rec: ApprovalRecord) async {
+    public func applyResolvedSkillScriptInstall(from rec: ApprovalRecord, turn: Turn?) async {
         guard rec.action == SwiftNativeApprovalInbox.skillScriptInstallAction, rec.status == "resolved" else { return }
         await performPartApprovalExecution(rec) {
             guard let (skill, digest) = SwiftNativeApprovalInbox.skillScriptInstallBinding(rec) else {
@@ -109,7 +113,8 @@ extension ApprovalExecution {
             var done: [String: JSONValue] = ["skill": .string(skill), "digest": .string(digest), "installed": .bool(false)]
             var detail = "Not approved: \(skill)'s script stays drafted."
             if rec.decision == ApprovalDecision.approved.rawValue {
-                try await effects.enableSkill(name: skill, reviewedDigest: digest)
+                let turn = await approvedEffectTurn(from: rec)
+                try await effects.enableSkill(name: skill, reviewedDigest: digest, turn: turn)
                 done["installed"] = .bool(true)
                 detail = "Installed \(skill)'s script, digest \(digest.prefix(12))."
             }
@@ -117,7 +122,7 @@ extension ApprovalExecution {
         }
     }
 
-    /// Canon writes require StudioCanonSeatGate and her live turn.
+    /// Canon writes require StudioCanonSeatGate and the agent's live turn.
     public func applyResolvedStudioCanonProposal(from rec: ApprovalRecord, dataRoot requestedRoot: URL? = nil) async {
         let root = requestedRoot ?? dataRoot
         guard rec.action == StudioCanonProposal.approvalAction, rec.status == "resolved", let decision = rec.decision else { return }
@@ -137,10 +142,11 @@ extension ApprovalExecution {
                 return .init(action: .object(["op": .string("studio_canon_already_applied"), "work": .string(work), "rowWritten": .bool(false)]),
                     detail: "Canon row for \(work) is already on the ledger")
             }
-            let herSeat = StudioCanonSeat.isAgent(rec.decidedBy)
-            return .init(action: .object(["op": .string(herSeat ? "studio_canon_needs_her_turn" : "studio_canon_refused"),
+            let agentSeat = StudioCanonSeat.isAgent(rec.decidedBy)
+            return .init(action: .object(["op": .string(agentSeat ? "studio_canon_needs_agent_turn" : "studio_canon_refused"),
                 "decidedBy": .string(rec.decidedBy ?? ""), "work": .string(work), "rowWritten": .bool(false)]),
-                detail: herSeat ? "The approved canon row has not landed; run app studio.canon_resolve in her live turn. It is idempotent by proposal id."
+                detail: agentSeat ? "The approved canon row has not landed; run app studio.canon_resolve in the agent's live turn. "
+                    + "It is idempotent by proposal id."
                     : "Canon proposal not applied: \(StudioCanonError.approvalNotFromAgentSeat(rec.decidedBy ?? "unknown").localizedDescription)")
         }
     }

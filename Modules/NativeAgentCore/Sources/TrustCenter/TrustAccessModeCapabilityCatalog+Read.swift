@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `TrustAccessModeCapabilityCatalog+Read.swift` | Trust projections; effective Full Mac uses MacControlGate's admitted-call projection and PermissionLaw's Full Mac posture: no category approval prompts; saved restricted-mode approval metadata remains unchanged |
+// Blueprint: | `TrustAccessModeCapabilityCatalog+Read.swift` | Effective grants preserve saved restricted settings. |
 
 extension TrustAccessModeCapabilityCatalog {
     public enum FileChangeState {
@@ -42,8 +42,7 @@ extension TrustAccessModeCapabilityCatalog {
             shellAllowed: effective.categoryAllowed["shell_allowed"] == true,
             notificationsAllowed: effective.categoryAllowed["notifications_allowed"] == true,
             spotlightAllowed: effective.categoryAllowed["spotlight_allowed"] == true,
-            // PermissionLaw's Full Mac posture admits ordinary category writes.
-            // Saved approval metadata is not an effective approval boundary.
+            // PermissionLaw's Full Mac posture admits ordinary category writes. Saved approval metadata is not an effective approval boundary.
             approvalRequiredFor: [],
             remoteFromIosAllowed: effective.remoteFromIOSAllowed)
     }
@@ -76,13 +75,11 @@ extension TrustAccessModeCapabilityCatalog {
         return normalizedMode(fallback)
     }
 
-    /// The ACTIVE verdict is the law's (`PermissionLaw.posture`), the same
-    /// one every gate reads. Full Mac has no timer: it is the saved policy.
+    /// Read the same saved, untimed posture every gate uses.
     public static func fullMacGrantIsActive(_ policy: TrustPolicy) -> Bool {
         posture(policy) == .fullMac
     }
 
-    /// The saved policy's posture, as every gate reads it.
     public static func posture(_ policy: TrustPolicy) -> PermissionPosture {
         PermissionLaw.posture(permissionLevel: policy.permissionLevel,
                               outsideWorkspaceDefault: policy.filePolicy?.outsideWorkspaceDefault ?? "")

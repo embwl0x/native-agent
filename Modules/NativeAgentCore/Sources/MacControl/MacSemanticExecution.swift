@@ -13,7 +13,7 @@ import Senses
 import os
 import CoreText
 import ScreenCaptureKit
-// Blueprint: | `MacSemanticExecution.swift` | Shared semantic/physical execution under driver authority; unreadable delivered text retains unverified status and offers a pixel look |
+// Blueprint: | `MacSemanticExecution.swift` | Shared semantic/physical execution; uncertain delivered text remains unverified with a pixel-look remedy |
 extension MacFourVerbs {
     static func frontChangedWords(_ reply: MacFourVerbsReply, verbName: String) -> MacFourVerbsReply {
         guard string(reply.detail["error"]) == "front_changed" else { return reply }
@@ -25,26 +25,18 @@ extension MacFourVerbs {
     }
     static let keystrokeEditableKinds: Set<String> = ["text", "text area", "combo", "searchfield", "search field"]
 
-    /// A search field by its kind, name or placeholder ("Search Maps").
     static func searchLike(_ candidate: ActTarget) -> Bool {
         [candidate.kind, candidate.label ?? "", candidate.placeholder ?? ""].contains { words in
             normalize(words).split(separator: " ").contains { $0.hasPrefix("search") }
         }
     }
-    /// A step that presses return or enter.
     static func pressesReturn(_ step: MacActStep) -> Bool {
         let verb = parseVerb(step.verb).0
         guard verb == "key" || (verb == "press" && pressMeansKey(step.target)) else { return false }
         return ["return", "enter"].contains(normalize(keySpec(step.target) ?? step.target))
     }
-    /// Only the caller's explicit front:true permits a cross-app drag to raise.
-    @TaskLocal static var foregroundRequested = false
 
-    /// In a batch, what the step before a key step typed: a change that is
-    /// only that text is not the key's effect.
-    @TaskLocal static var typedJustBefore: String?
-
-    /// The named element (exact) or something inside it holds keyboard focus in this read.
+    /// Keyboard focus must belong to the exact named element or its subtree.
     static func holdsFocus(_ target: String, in seen: Sighting, exact: Bool) -> Bool {
         guard let focus = seen.focusPath, case .hit(let hit) = resolve(target, among: seen.targets),
               let path = hit.sourceAXPath else { return false }
@@ -54,17 +46,23 @@ extension MacFourVerbs {
         guard let ago = MacPersonInput.activeSecondsAgo() else { return nil }
         return MacFourVerbsReply(
             ok: false,
-            text: "The person is using the Mac (input \(Int(ago.rounded()))s ago), so nothing was typed. Let them finish and hand back control before continuing.",
+            text: """
+                The person is using the Mac (input \(Int(ago.rounded()))s ago), so nothing was typed. Let them finish and hand back control before \
+                continuing.
+                """,
             detail: ["error": .string("person_active"), "person_active": .bool(true), "effects": .string("unknown"),
                 "remedy": Repair.why(owner: "Mac foreground control", tap: "NativeAgent Mac chat > composer controls > Let [agent name] use the Mac",
-                    instruction: "Let the person finish. Under Full Mac, the next action reacquires control; otherwise ask them to use Let [agent name] use the Mac.")]
+                    instruction: """
+                        Let the person finish. Under Full Mac, the next action reacquires control; otherwise ask them to use Let [agent name] use \
+                        the Mac.
+                        """)]
         )
     }
-    /// Real keystrokes to whatever has focus in the app in front — how a
-    /// person types where accessibility has no value to set.
+    /// Use real keys at observed focus when AX exposes no value setter.
     internal func typeKeystrokes(
         _ text: String, into place: String, before: Sighting?, frontPid: Int32? = nil,
-        expect: FrontExpectation?, attention: BurstAttention?
+        expect: FrontExpectation?, attention: BurstAttention?,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         if let busy = Self.personActiveRefusal() { return busy }
         // Every key goes only while the app this read saw in front still is.
@@ -76,13 +74,13 @@ extension MacFourVerbs {
                         instruction: "Inspect the intended app and confirm keyboard focus before typing.")]
             )
         }
-        let reply = await Self.$requiredFrontPid.withValue(pid) {
-            await performHand(
+        let reply = await context.holding(\.requiredFrontPid, pid) {
+            context in await performHand(
                 body: ["gesture": .string("type"), "text": .string(text)],
                 description: "Typed into \(place) with the keyboard.",
                 attention: attention,
                 before: before
-            )
+            , turn: turn, context: context)
         }
         var detail = reply.detail
         detail["verb"] = .string("type")
@@ -99,10 +97,11 @@ extension MacFourVerbs {
         holding: String?,
         button: String? = nil,
         attention: BurstAttention?,
-        before: Sighting
+        before: Sighting,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         let spokenTarget = Self.spokenName(candidate, requestedAs: target)
-        // A left click on a control the look named is judged by its consequence.
+        // Judge named left clicks by their observed consequence.
         let pressed = verb == .click && button != "right" && !candidate.isSupplemental && !candidate.physicalOnly
             ? candidate : nil
         if let viewId = candidate.viewId, let mark = candidate.mark,
@@ -127,10 +126,10 @@ extension MacFourVerbs {
                 target: target,
                 verb: verb.rawValue,
                 attention: attention
-            )
+            , turn: turn, context: context)
             // On mark drift, refresh once and resolve the same name before one dispatch.
             guard !first.ok, Self.string(first.detail["error"])?.hasPrefix("mark_drifted") == true,
-                  case .seen(let fresh) = await sight(part: nil),
+                  case .seen(let fresh) = await sight(part: nil, turn: turn, context: context),
                   case .hit(let again) = Self.resolve(target, among: fresh.targets),
                   Self.answers(target, again, exact: Self.committingVerbs.contains(verb)),
                   let freshView = again.viewId, let freshMark = again.mark else { return first }
@@ -144,7 +143,7 @@ extension MacFourVerbs {
                 target: target,
                 verb: verb.rawValue,
                 attention: attention
-            )
+            , turn: turn, context: context)
         }
         var body: [String: JSONValue] = [:]
         var aim: MacPointerPosition?
@@ -189,11 +188,7 @@ extension MacFourVerbs {
             body["text"] = .string(text)
         case .scroll:
             if usesPageKey {
-                // Live Chrome proof: synthesized wheel events were accepted
-                // but inert on the AX web area, while the ordinary Page key
-                // moved the same visible document and produced fresh proof.
-                // Keep that physical distinction below the natural scroll
-                // verb; the caller still names the region and direction.
+                // Web-area wheel input may be accepted without moving content; Page keys use the physical route that moves the observed document.
                 body["gesture"] = .string("key")
                 body["keys"] = .string(direction == .up ? "pageup" : "pagedown")
             } else {
@@ -203,24 +198,21 @@ extension MacFourVerbs {
                 body["dy"] = .int(direction == .up ? magnitude : direction == .down ? -magnitude : 0)
             }
         }
-        // The native-surface exception permits real input only for this exact
-        // observed app. Carry its PID through the hand's per-event front guard,
-        // including any await between this capture and dispatch.
-        if Self.nativeSurfaceApp != nil, before.pid == nil {
+        // Native-surface input stays bound to the exact observed pid across awaits and every posted event.
+        if context.nativeSurfaceApp != nil, before.pid == nil {
             return MacFourVerbsReply(ok: false,
                 text: "The selected native surface changed before I could act. I haven't touched it; read the screen again.\n" + before.render,
                 detail: ["error": .string("native_surface_changed")])
         }
-        let frontPid = Self.nativeSurfaceApp != nil ? before.pid : Self.requiredFrontPid
-        let reply = await MacAppActGate.$looking.withValue(verb == .scroll) { await Self.$requiredFrontPid.withValue(frontPid) {
-            // A press on a named control takes the one pointer tail: clear of
-            // anything covering the window, at the safe aim, the observed pid.
+        let frontPid = context.nativeSurfaceApp != nil ? before.pid : context.requiredFrontPid
+        let reply = await context.holding(\.looking, verb == .scroll) { context in await context.holding(\.requiredFrontPid, frontPid) { context in
+            // Named pointer presses retain safe aim, obstruction checks and observed-pid admission.
             if let pressed, let aim {
                 return await performPointer(
                     "click", at: aim, to: nil, saying: spokenTarget, destination: nil, before: before,
                     excluding: candidate.excludedFrames, seconds: nil, holding: holding, button: button,
                     attention: attention, pressed: pressed
-                )
+                , turn: turn, context: context)
             }
             return await performHand(
                 body: body,
@@ -232,7 +224,7 @@ extension MacFourVerbs {
                 attention: attention,
                 before: before,
                 afterPart: candidate.physicalOnly ? "visual surface" : nil
-            )
+            , turn: turn, context: context)
         }
         }
         var detail = reply.detail
@@ -255,9 +247,7 @@ extension MacFourVerbs {
         // A hand refused because the person took the front: their choice stands.
         return Self.frontChangedWords(MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail), verbName: verb.rawValue)
     }
-    /// Acted (observed or not) needs evidence that input went out: a reply
-    /// that succeeded, or one whose events say some were emitted. A refusal
-    /// before the first event stays the refusal it is.
+    /// An acted verdict needs emitted-input evidence; pre-emission refusals remain refusals.
     static func inputLeftTheHand(_ reply: MacFourVerbsReply) -> Bool {
         reply.ok || (Self.int(reply.detail["requested_events_emitted"]) ?? 0) > 0
             || reply.detail["effects_may_have_occurred"] == .bool(true)
@@ -269,29 +259,29 @@ extension MacFourVerbs {
         before: Sighting,
         target: String,
         verb: String,
-        attention: BurstAttention?
+        attention: BurstAttention?,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         let result: MacControlResult
         var request = body
         Self.addAttention(attention, to: &request)
-        do { result = try await host.dispatch(action: action, body: request) }
+        do { result = try await host.dispatch(action: action, body: request, turn: turn, context: context) }
         catch {
             return Self.unknownActionReply(error, operation: "\(verb) \(target)", app: before.appName)
         }
         guard result.ok else {
             return MacFourVerbsReply(
                 ok: false,
-                text: "No verified result for \(verb) \"\(target)\". \(Self.string(Self.object(result.output)["detail"]) ?? result.error ?? "The Mac refused the action.")\n" + before.render,
+                text: """
+                    No verified result for \(verb) \"\(target)\". \
+                    \(Self.string(Self.object(result.output)["detail"]) ?? result.error ?? "The Mac refused the action.")\n
+                    """ + before.render,
                 detail: Self.operationDetail(result, app: before.appName).merging(["error": .string(result.error ?? "refused")]) { current, _ in current }
             )
         }
-        return await observedReply(result: result, description: description, before: before)
+        return await observedReply(result: result, description: description, before: before, turn: turn, context: context)
     }
-    /// After a `front:true` raise: the pid every posted hand event requires in front.
-    @TaskLocal static var requiredFrontPid: Int32?
-    /// A watch's hand: the exact window that must be its app's front window at every event.
-    @TaskLocal static var requiredFrontWindow: Int?
-    @TaskLocal static var holdsActSerial = false
+
     func performHand(
         body: [String: JSONValue],
         description: String,
@@ -301,18 +291,19 @@ extension MacFourVerbs {
         afterPart: String? = nil,
         pointerTarget: String? = nil,
         pressed: ActTarget? = nil,
-        confirm: Bool = true
+        confirm: Bool = true,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         // Named acts retain the slot through observation/settlement; watch hands share its owner and held-input rule.
-        if !Self.holdsActSerial {
-            guard await MacActSerial.shared.acquire() else {
+        if !context.holdsActSerial {
+            guard await MacActSerial.shared.acquire(context: context) else {
                 return .init(ok: false, text: "The action was cancelled before it started.", detail: ["error": .string("cancelled")])
             }
-            await MacActSerial.shared.ownInputs(MacDriverContext.binding)
-            let reply = await Self.$holdsActSerial.withValue(true) {
-                await performHand(body: body, description: description, unverifiedDescription: unverifiedDescription,
+            await MacActSerial.shared.ownInputs(context.driver)
+            let reply = await context.holding(\.holdsActSerial, true) {
+                context in await performHand(body: body, description: description, unverifiedDescription: unverifiedDescription,
                     attention: attention, before: before, afterPart: afterPart, pointerTarget: pointerTarget,
-                    pressed: pressed, confirm: confirm)
+                    pressed: pressed, confirm: confirm, turn: turn, context: context)
             }
             return await settle {
                 await MacActSerial.shared.release()
@@ -322,25 +313,23 @@ extension MacFourVerbs {
         let result: MacControlResult
         var request = body
         Self.addAttention(attention, to: &request)
-        guard let pid = Self.requiredFrontPid ?? (before?.isFront == true ? before?.pid : nil) else {
+        guard let pid = context.requiredFrontPid ?? (before?.isFront == true ? before?.pid : nil) else {
             return .init(ok: false, text: "I can't bind this input to the observed foreground app. Nothing was sent; read the screen again.",
                          detail: ["error": .string("front_unknown"), "effects": .string("none")])
         }
         request["require_front_pid"] = .int(Int64(pid))
-        if let number = Self.requiredFrontWindow { request["require_front_window"] = .int(Int64(number)) }
-        // This composed physical-only act already owns a fresh pre-observation
-        // and the mandatory observedReply below. Recapturing inside the hand
-        // delays input after its motion-compensated point was calculated. A
-        // watch's hand (no confirm) is observed by its stream instead.
+        if let number = context.requiredFrontWindow { request["require_front_window"] = .int(Int64(number)) }
+        // Physical acts already own fresh pre-observation and mandatory post-observation; another capture would age the motion-compensated aim.
+        // Read-only confirmation for watch hands comes from their stream.
         if !confirm || before != nil && afterPart == "visual surface" {
             request["defer_visual_verification"] = .bool(true)
         }
-        do { result = try await host.dispatch(action: "hand", body: request) }
+        do { result = try await host.dispatch(action: "hand", body: request, turn: turn, context: context) }
         catch {
             return Self.unknownActionReply(error, operation: "the requested input", app: before?.appName)
         }
         guard result.ok else {
-            if Self.nativeSurfaceApp != nil, result.error == "front_changed" {
+            if context.nativeSurfaceApp != nil, result.error == "front_changed" {
                 let output = Self.object(result.output)
                 var detail = Self.operationDetail(result)
                 if Self.int(output["requested_events_emitted"]) == 0 {
@@ -355,7 +344,10 @@ extension MacFourVerbs {
             }
             return MacFourVerbsReply(
                 ok: false,
-                text: "No verified result. \(Self.string(Self.object(result.output)["guidance"]) ?? Self.string(Self.object(result.output)["note"]) ?? Self.string(Self.object(result.output)["detail"]) ?? result.error ?? "The Mac refused the action.")"
+                text: """
+                    No verified result. \
+                    \(Self.string(Self.object(result.output)["guidance"]) ?? Self.string(Self.object(result.output)["note"]) ?? Self.string(Self.object(result.output)["detail"]) ?? result.error ?? "The Mac refused the action.")
+                    """
                     + (before.map { "\n" + $0.render } ?? ""),
                 detail: Self.operationDetail(result, app: before?.appName).merging(["error": .string(result.error ?? "refused")]) { current, _ in current }
             )
@@ -382,9 +374,9 @@ extension MacFourVerbs {
             afterPart: afterPart,
             pointerTarget: pointerTarget,
             pressed: pressed
-        ))
+        , turn: turn, context: context))
     }
-    /// An act verb this hand has, or the short answer listing them.
+    /// Refusals list the executing hand’s own verbs.
     static func unknownVerb(_ rawVerb: String, target: String) -> MacFourVerbsReply? {
         var name = parseVerb(rawVerb).0
         if name == "press" { name = pressMeansKey(target) ? "key" : "click" }

@@ -7,20 +7,16 @@ import Transcripts
 import ChatTurnRuntime
 import ChatSessionWork
 import AppToolRuntime
-// Blueprint: | `AppModel+ChatSessions.swift` | `AppModel`: chat load/selection/index refresh; `composerDraft(for:)` owns one draft per session for main/detached composers and commands, exact accepted-edit clearing and empty-only prefills; quiet chat commands delegate to shared transcript/session transactions |
+// Blueprint: | `AppModel+ChatSessions.swift` | `AppModel`, `composerDraft(for:)`: Shared drafts and checked session transactions |
 
 extension Notification.Name {
-    /// A turn's user-visible notice (retry, timeout, advisory); ChatView
-    /// places it in the turn's lane or as a toast.
     static let nativeAgentTurnNotice = Notification.Name("nativeagent.turn.notice")
 }
 
 @MainActor
 extension AppModel: MacChatSessionSelectionPort {
     func loadChatState() async {
-        // Idempotent; the earliest post-construction entry point AppModel owns.
-        // Keeps the UserDefaults-backed settings block live so a bridge or
-        // out-of-process write is picked up without a relaunch.
+        // Install the defaults observer at the earliest model entry point so external writes reach the running app.
         installDefaultsBackedSettingsObserver()
         await reloadChatState()
     }
@@ -42,7 +38,10 @@ extension AppModel: MacChatSessionSelectionPort {
                 target.edit(draft.text)
                 draft.edit("")
             } else {
-                systemToasts.push(error: "An earlier unsent draft is kept separately because this conversation already has a draft. Start a new chat to move it into an empty composer.")
+                systemToasts.push(error: """
+                    An earlier unsent draft is kept separately because this conversation already has a draft. Start a new chat to move it into an empty \
+                    composer.
+                    """)
             }
         }
         if let pending = chatPendingAttachments.removeValue(forKey: ""), !pending.isEmpty {
@@ -80,10 +79,7 @@ extension AppModel: MacChatSessionSelectionPort {
         composerDraft(for: sessionId).text
     }
 
-    /// Prepare the actual composer draft before routing to Chat. A
-    /// notification-only handoff can select Chat before its first session
-    /// exists and silently lose the requested starter; an existing draft is
-    /// intentionally preserved.
+    /// Prepare the draft before routing so a handoff before the first session cannot lose its starter; preserve existing edits.
     @MainActor
     @discardableResult
     func requestSkillBuild(starter: String = "Create a skill from this conversation: ") -> SkillLifecycleActionPresentation.Build {
@@ -104,7 +100,7 @@ extension AppModel: MacChatSessionSelectionPort {
         await engine.transcripts.sessionTransactions.load { await performLoadChatState() }
     }
 
-    /// Index file events refresh shared session projections without reloading the active transcript.
+    /// Index events must refresh session projections without reloading the active transcript.
     @MainActor
     func refreshChatSessionIndex() async {
         await refreshChatSessionIndex { [transcripts = engine.transcripts] in
@@ -112,7 +108,7 @@ extension AppModel: MacChatSessionSelectionPort {
         }
     }
 
-    /// Failed index reads retain proven rows; equal reads do not invalidate observers.
+    /// Failed index reads retain proven rows; equal reads must not invalidate observers.
     @MainActor
     func refreshChatSessionIndex(
         load: @escaping @MainActor @Sendable () async throws -> [ChatSession]
@@ -167,9 +163,7 @@ extension AppModel: MacChatSessionSelectionPort {
         await selectChatSession(resolved.session, userInitiated: false)
     }
 
-    /// Simple has no conversation list, so it follows the conversation User is
-    /// in: when the anchor MOVES (he sent from another door) the window moves
-    /// with it. A chat he opened here stays until the anchor moves again.
+    /// Without a conversation list, Simple follows the user's cross-surface anchor; local selection lasts until that anchor moves.
     @MainActor
     func followMovedAnchorInSimple() async {
         engine.transcripts.refreshNavigationIdentity()
@@ -184,7 +178,7 @@ extension AppModel: MacChatSessionSelectionPort {
             guard chatSelectionGeneration == selection else { return }
         }
         guard let session = engine.transcripts.sessions.first(where: {
-            $0.id == anchorId && $0.archived != true && SessionConversation.kind($0).isHisConversation
+            $0.id == anchorId && $0.archived != true && SessionConversation.kind($0).isPersonConversation
         })
         else { return }
         await selectChatSession(session, userInitiated: false)
@@ -193,13 +187,12 @@ extension AppModel: MacChatSessionSelectionPort {
     @MainActor
     private func performLoadChatState() async {
         let selectionGenerationAtStart = chatSelectionGeneration
-        // The conversation on screen loads first, straight from disk, while the
-        // rest of startup (health, trust, the index, lifecycle repair) runs.
+        // Load the visible conversation alongside startup so health and lifecycle work cannot delay its first frame.
         let remembered = activeChatSessionId
         let firstRead: Task<Void, Never>? = remembered.isEmpty ? nil : Task { [engine] in
             _ = try? await engine.transcripts.refreshMessages(sessionId: remembered)
         }
-        // Health runs beside startup, never in front of the conversation list.
+        // Health must not block the conversation list.
         if engine.doctor.health?.ok != true {
             Task { [engine] in await engine.doctor.refreshHealth() }
         }
@@ -210,8 +203,7 @@ extension AppModel: MacChatSessionSelectionPort {
                 chatSessionIndexRefreshFailed = false
                 engine.transcripts.publishSessionIndexRead(fetchedSessions)
             })
-            // Automatic selection on every Mac surface resolves a live direct
-            // row. Only an explicit choice made this launch may retain a helper.
+            // Automatic selection requires a live direct row; only an explicit selection this launch may retain a helper.
             guard chatSelectionGeneration == selectionGenerationAtStart else { return }
             let currentIsLive = engine.transcripts.sessions.contains { $0.id == activeChatSessionId && $0.archived != true }
             if !MacChatSelectionIntent.userChoseThisLaunch || !currentIsLive {
@@ -234,11 +226,10 @@ extension AppModel: MacChatSessionSelectionPort {
                 await self.readCanonicalChatTurnTerminalProof(identity: identity)
             }
             guard chatSelectionGeneration == selectionGenerationAtStart else { return }
-            // Pruning reads the index: only while it is still the one read here.
-            // The conversation itself loads either way.
+            // Prune only against the index read that is still current; load the conversation either way.
             if engine.transcripts.sessions == indexSnapshot {
                 pruneChatDrafts()
-                // Prune absent sessions' message caches while preserving unsent composer work.
+                // Pruning must preserve unsent composer work.
                 pruneStaleSessionChatState(knownSessionIds: knownSessionIds)
             }
             let targetSessionId = activeChatSessionId
@@ -252,13 +243,11 @@ extension AppModel: MacChatSessionSelectionPort {
         }
     }
 
-    /// The open conversation reads the store when its file changes.
     func readActiveTranscript(sessionId: String) async {
         guard activeChatSessionId == sessionId else { return }
         await engine.readMountedTranscript(sessionId: sessionId, failure: { setFailureStatus($0, action: "refresh your chats") })
     }
 
-    /// A detached conversation reads the store when its file changes.
     func readDetachedTranscript(sessionId: String) async {
         guard DetachedChatWindowController.shared.isDetached(sessionId) else { return }
         var failures: [String] = []
@@ -285,9 +274,7 @@ extension AppModel: MacChatSessionSelectionPort {
 
     @MainActor
     func commitChatSessionSelection(_ requestedId: String) {
-        // Publish the identity only after the requested transcript slot is
-        // ready. This keeps the previous conversation visible through an
-        // uncached load and leaves it untouched when that load fails.
+        // Publish identity after the transcript is ready so failed or uncached loads preserve the previous conversation.
         activeChatSessionId = requestedId
     }
 
@@ -296,12 +283,10 @@ extension AppModel: MacChatSessionSelectionPort {
         let activityAt = Date()
         do {
             let session = try await engine.transcripts.sessionTransactions.create(store: engine.transcripts)
-            // His new chat becomes the conversation anchor across surfaces.
             publishConversationAnchor(sessionId: session.id, conversationKind: .direct, activityAt: activityAt)
             MacChatSelectionIntent.noteUserChoice()
             chatSelectionGeneration += 1
-            // Seed before publishing the session: the next await lets its
-            // composer start a turn, which must retain ownership of these rows.
+            // Seed before publishing because the next suspension lets the composer start a turn that owns these rows.
             engine.transcripts.setMessages([], for: session.id)
             activeChatSessionId = session.id
             await refreshChatSessionIndex()
@@ -323,7 +308,7 @@ extension AppModel: MacChatSessionSelectionPort {
 }
 
 extension AppModel: QuietChatSessionCommandPort {
-    /// The live model has no override: its engine's root is the root (X-DEAD-2 removed the stored field).
+    /// The live model must use its engine's data root.
     var dataRootOverride: URL? { engine.dataRoot }
     var chatSessionTransactions: MacChatSessionTransactions { engine.transcripts.sessionTransactions }
     var chatCommandTranscripts: TranscriptsFacade { engine.transcripts }
@@ -357,13 +342,13 @@ extension AppModel: QuietChatSessionCommandPort {
         let result = await archiveActiveChat(sessionId: sessionId)
         return (result.succeeded, result.agentMessage)
     }
-    func compactQuietChat(sessionId: String, model: String?, providerID: String?, force: Bool) async throws -> ChatSessionCompactionOutcome {
-        try await compactSession(sessionId: sessionId, model: model, providerID: providerID, force: force)
-    }
     func exportQuietChat(session: NativeAgentShared.ChatSession?, sessionId: String, messages: [ChatMessage]) async throws -> ChatExportResult {
         try await ChatExport.export(session: session, sessionId: sessionId, messages: messages)
     }
     func isQuietSyntheticNotice(_ message: ChatMessage) -> Bool {
         message.id.hasPrefix(Self.syntheticErrorIDPrefix)
+    }
+    func regenerateAssistantMessage(_ message: ChatMessage, parent: Turn) async {
+        await regenerateChatResponse(message, parent: parent)
     }
 }

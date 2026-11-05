@@ -13,8 +13,7 @@ enum OAuthProductionSession {
             cfg.timeoutIntervalForResource = try timeoutValue(resourceTimeout, defaultValue: 600)
             failure = nil
         } catch {
-            // Construction remains nonthrowing, but the session is unavailable.
-            // Both adapters validate it before any token or transport operation.
+            // Construction remains nonthrowing, but the session is unavailable. Both adapters validate it before any token or transport operation.
             failure = error.localizedDescription
         }
         cfg.waitsForConnectivity = false
@@ -35,7 +34,10 @@ enum OAuthProductionSession {
         guard let raw else { return defaultValue }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let parsed = TimeInterval(trimmed), parsed.isFinite, parsed > 0 else {
-            throw LLMError.providerError(message: "OAuth timeout override must be a finite positive number of seconds. Correct the NATIVE_AGENT OAuth timeout environment setting and restart NativeAgent.")
+            throw LLMError.providerError(message: """
+                OAuth timeout override must be a finite positive number of seconds. Correct the NATIVE_AGENT OAuth timeout environment setting and \
+                restart NativeAgent.
+                """)
         }
         return parsed
     }

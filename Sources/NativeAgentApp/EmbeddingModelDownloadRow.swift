@@ -14,7 +14,10 @@ struct EmbeddingModelDownloadRow: View {
                     .font(.caption)
                 if controller.status.running, controller.status.total > 0 {
                     ProgressView(value: Double(controller.status.completed), total: Double(controller.status.total))
-                    Text("\(ByteCountFormatter.string(fromByteCount: controller.status.completed, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: controller.status.total, countStyle: .file))")
+                    Text("""
+                        \(ByteCountFormatter.string(fromByteCount: controller.status.completed, countStyle: .file)) of \
+                        \(ByteCountFormatter.string(fromByteCount: controller.status.total, countStyle: .file))
+                        """)
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }

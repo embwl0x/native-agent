@@ -51,7 +51,7 @@ and [CHANGELOG.md](../CHANGELOG.md).
 | [Continuous cognitive substrate](CONTINUOUS_COGNITIVE_SUBSTRATE.md) | The substrate engineering boundaries |
 | [Jev (retired)](JEV.md) | Retirement and legacy-data guidance |
 | [Chrome surface](../Extensions/NativeAgentChrome/README.md), [Chrome protocol](../Extensions/NativeAgentChrome/protocol/PROTOCOL.md) | Group-owned tabs, trusted text/key input, document-selected DOM/picture reads and effect/cleanup evidence |
-| [Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md), [Image generation](IMAGE_GENERATION.md) | Specific integrations |
+| [Image generation](IMAGE_GENERATION.md) | Specific integrations |
 | [Skill manifest spec](skill_manifest_spec.md), [example manifests](example_manifests/), [Approval schema](approval-schema.md) | Formats |
 
 ## Building and releasing
@@ -94,7 +94,7 @@ Do not move or rename these without updating their readers:
   `completionPolicy` in `LLMCompatibilityPrompt.swift` reads named
   `<!-- section -->` / `<!-- end -->` blocks and substitutes positional `%@`
   slots once; missing files, sections or mismatched slots fail explicitly.
-  Serializers and the connection probe stay with their callers; crew, courier
+  Serializers and the connection probe stay with their callers; courier
   and morning-brief parts retain their policies.
 - `eval_acknowledgments.json` — read at runtime by the heartbeat.
 - `licenses/A2A-gRPC-NOTICES.txt` — Mac app resource in `project.yml`.

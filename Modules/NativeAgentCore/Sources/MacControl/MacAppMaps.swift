@@ -2,44 +2,24 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacAppMaps.swift` | `MacAppMapStore` owns per-app control maps and control-scoped press outcome evidence; reads and flush outcomes are checked, failed writes stay dirty, and malformed maps remain in place without overwrite |
+// Blueprint: | `MacAppMaps.swift` | `MacAppMapStore`: Verified control maps; scoped press evidence; checked reads/flushes |
 
-// After a VERIFIED act (the closed loop saw the effect, and the element acted
-// on answered the name asked), the app remembers where that named control
-// lives: `data/her_screen/app_maps/<bundle id>.json`. When fresh name
-// resolution misses, `act` uses a remembered path ONLY if the live element there
-// still answers the name — role and label, the same `answers()` rule. A map entry is a hint about WHERE to look, never a license
-// to act: nothing here is ever clicked without a live read agreeing.
-//
-// Stored: the window KIND (AX role/subrole only — never a title), the name as
-// asked and as labelled, the kind, the AX path relative to the walked root,
-// when it was last verified, and how often. Only APP CHROME is stored: a label
-// that is a stable system word, a key-sized label, or one the app's own menu
-// bar carries. Never a field's value, a secure field, a row, or anything that
-// could be a name, subject or file name — when in doubt, nothing is stored.
-//
-// Legacy app-wide `learned` values remain readable on disk. Press routing
-// uses only control-scoped evidence below, never those exclusive claims.
+// Remember only verified app-chrome controls. Paths are hints: live role/label agreement remains required before acting. Never store field values, secure
+// fields, rows, titles or content-like labels; ambiguous labels are not retained.
 
-/// One remembered control.
 public struct MacAppMapEntry: Codable, Sendable, Equatable {
-    /// `role/subrole` — see `MacAppMaps.windowKind`.
     public var window: String
-    /// The name as she asked for it, normalised.
     public var asked: String
-    /// The label the control carried when it was verified.
     public var label: String
-    /// The renderer's kind word (`button`, `checkbox`, …).
     public var kind: String
-    /// The AX path relative to the walked root, as `act`/`ax_act` address it.
+    /// Paths use the same walked root as act/ax_act so map hints resolve in the right coordinate tree.
     public var path: [Int]
-    /// ISO-8601, UTC. LRU order.
+    /// Use UTC timestamps for LRU ordering.
     public var verified: String
     public var hits: Int
 }
 
-/// Outcomes for one exact control/context. Counts retain contrary and
-/// uncertain attempts; only the latest verified pointer outcome nominates it.
+/// Outcomes for one exact control/context. Counts retain contrary and uncertain attempts; only the latest verified pointer outcome nominates it.
 public struct MacPressRouteEvidence: Codable, Sendable, Equatable {
     public var counts: [String: Int] = [:]
     public var lastMethod = ""
@@ -48,10 +28,8 @@ public struct MacPressRouteEvidence: Codable, Sendable, Equatable {
     public var suggestsPointer: Bool { lastMethod == "pointer" && lastOutcome == "satisfied" }
 }
 
-/// One app's file: its remembered controls and what use has taught.
 public struct MacAppMap: Codable, Sendable, Equatable {
     public var controls: [MacAppMapEntry] = []
-    // Retain old file bytes on a later save; no live app-wide learning API.
     private var learned: [String: String] = [:]
     public var pressRoutes: [String: MacPressRouteEvidence] = [:]
 
@@ -68,25 +46,21 @@ public struct MacAppMap: Codable, Sendable, Equatable {
 public enum MacAppMaps {
     public static let maxEntriesPerApp = 300
 
-    /// The window's KIND, never its content: AX role/subrole only
-    /// (`AXWindow/AXStandardWindow`, `AXSheet`, `AXWindow/AXDialog`).
+    /// Key by role/subrole only so window content never enters map identity.
     public static func windowKind(role: String?, subrole: String?) -> String {
         (role ?? "AXWindow") + (subrole.map { "/" + $0 } ?? "")
     }
 
-    /// Words every app uses for its own chrome.
     static let systemLabels: Set<String> = Set<String>([
         "ok", "cancel", "save", "done", "close", "open", "delete", "back", "forward", "share", "send", "reply",
         "new", "edit", "search", "settings", "add", "remove", "next", "previous", "apply", "undo", "redo",
         "copy", "paste", "cut", "print", "refresh", "reload", "home", "help", "more", "menu", "options",
         "bold", "italic", "underline", "zoom in", "zoom out", "sidebar", "info", "filter", "sort",
-        // Calculator-style keys.
         "ac", "c", "ce", "mc", "mr", "m+", "m-", "rad", "deg",
     ]).union(MacFourVerbs.symbolAliases.values.flatMap { $0 })
 
-    /// A label that cannot be anyone's content: a known system word, a single
-    /// character, or ≤4 digits/operators ("7", "×", "+/-"). Two letters could
-    /// be someone's initials, so they are not enough on their own.
+    /// A label that cannot be anyone's content: a known system word, a single character, or ≤4 digits/operators ("7", "×", "+/-"). Two letters could be
+    /// someone's initials, so they are not enough on their own.
     static func isStableSystemLabel(_ label: String) -> Bool {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         if systemLabels.contains(trimmed.lowercased()) { return true }
@@ -95,8 +69,7 @@ public enum MacAppMaps {
             && trimmed.allSatisfy { $0.isNumber || $0.isPunctuation || $0.isSymbol }
     }
 
-    /// Store keys are bundle ids; anything else is refused rather than
-    /// becoming a path component.
+    /// Store keys are bundle ids; anything else is refused rather than becoming a path component.
     static func fileName(_ bundle: String) -> String? {
         guard !bundle.isEmpty, bundle.count <= 200,
               bundle.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }),
@@ -105,8 +78,7 @@ public enum MacAppMaps {
     }
 }
 
-/// One small JSON per app, cached in memory on the file's mtime; writes are
-/// batched — `flush()` runs once at the end of each `act` call.
+/// One small JSON per app, cached in memory on the file's mtime; writes are batched — `flush()` runs once at the end of each `act` call.
 public actor MacAppMapStore {
     public static let shared = MacAppMapStore(
         directory: PersistenceCore.defaultDataRoot()
@@ -180,14 +152,12 @@ public actor MacAppMapStore {
         store(bundle, map)
     }
 
-    /// Whether this exact control is already remembered (its label was vetted
-    /// as chrome when it was first stored).
+    /// Existing entries already passed the chrome-only label privacy boundary.
     public func has(bundle: String, window: String, asked: String, label: String) throws -> Bool {
         try entries(bundle: bundle, window: window).contains { $0.asked == asked && $0.label == label }
     }
 
-    /// A verified act: add the entry, or refresh it (live path/label, date,
-    /// hit). LRU-evicts past the cap.
+    /// Refresh only verified controls and LRU-evict beyond the cap so map growth stays bounded.
     public func record(bundle: String, window: String, asked: String, label: String, kind: String, path: [Int], at date: Date = Date()) throws {
         guard !asked.isEmpty, !label.isEmpty, !path.isEmpty else { return }
         var map = try load(bundle)
@@ -210,8 +180,7 @@ public actor MacAppMapStore {
         store(bundle, map)
     }
 
-    /// The live window no longer agreed. `evict` when something ELSE is at that
-    /// path now; otherwise one hit is taken off and the entry goes at zero.
+    /// Evict a contradicted live path; otherwise weaken its hit count until zero rather than treating missing evidence as removal.
     public func penalize(bundle: String, window: String, path: [Int], evict: Bool) throws {
         var map = try load(bundle)
         guard let index = map.controls.firstIndex(where: { $0.window == window && $0.path == path }) else { return }

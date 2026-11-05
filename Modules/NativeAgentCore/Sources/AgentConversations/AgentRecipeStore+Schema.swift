@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentRecipeStore+Schema.swift` | AgentRecipeStore write argument schema beside its exact Codable document validator, including host route, launch, desktop content region and navigation shapes |
+// Blueprint: | `AgentRecipeStore+Schema.swift` | Writes require the exact Codable recipe shape. |
 
 extension AgentRecipeStore {
     /// The document write decodes exactly; optional fields also accept null, as Codable does.
@@ -25,7 +25,8 @@ extension AgentRecipeStore {
         let routine = object(["mainChat": text, "routines": text, "webhookURL": text, "webhookKey": text], optional: [
             "list": control, "pause": control, "navigation": list(step), "copyURL": text, "copyKey": text])
         let desktop = object(Dictionary(uniqueKeysWithValues: ["newChat", "backToMain", "chatsButton", "chatsPanel", "log", "composerCore",
-            "userPrefix", "assistantPrefix", "userLabel", "assistantMarker", "stop", "unreadSuffix", "actionsSuffix", "current", "currentValue"].map { ($0, text) }),
+            "userPrefix", "assistantPrefix", "userLabel", "assistantMarker", "stop", "unreadSuffix", "actionsSuffix", "current", "currentValue"]
+                .map { ($0, text) }),
             optional: ["contentRole": text])
         let card = object(["endpoint": text, "version": text, "binding": text, "auth": strings,
             "streaming": flag, "pushNotifications": flag, "extendedCard": flag,

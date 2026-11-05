@@ -1,28 +1,12 @@
-// SwiftUI's `.onDrag` hides NSDraggingSource's
-// `draggingSession(_:endedAt:operation:)` callback, so we can't detect
-// "the user dropped this on empty desktop (no in-app target accepted)".
-// This file adds an AppKit drag source that overlays the SwiftUI session
-// row and writes the custom `com.nativeagent.chat-session` pasteboard type
-// (declared in the app Info.plist), which the pinned-strip drop accepts.
-//
-// Click pass-through: the underlying NSView's `hitTest` returns nil, so
-// taps and right-clicks reach the SwiftUI row beneath. Drag detection is
-// done via an app-local NSEvent monitor that observes mouseDown/mouseDragged
-// regardless of hit-test, fire `beginDraggingSession` past a small
-// threshold, and only consume the dragged event (clicks pass through
-// untouched). On drag end, the detached panel opens IFF the left button is
-// RELEASED and the drop point is OUTSIDE every app window. Point-based, not
-// `operation`-based — with the custom-UTI-only payload Finder rejects the
-// drop, so desktop drops and Esc-cancels both report an empty operation;
-// the button state is what separates them (an Esc-cancel ends the session
-// with the button still held). `pressedMouseButtons` is a process-global
-// sample, not the ending event itself — a mistimed sample degrades to
-// "no detach, drag again" or a rare stray panel, never a desktop file.
+// SwiftUI hides drag completion, so AppKit must distinguish desktop drops from cancellation.
+// Finder rejects the custom UTI for both; only a released button outside app windows detaches.
+// Pass clicks through and monitor drags locally so the SwiftUI row keeps its normal interactions.
+// pressedMouseButtons is a global sample; a mistimed read may miss detachment or open a stray panel.
 
 import SwiftUI
 import AppKit
 
-// Blueprint: | `SessionDragSourceView.swift` | `SessionDragSource`: AppKit drag completion/desktop-detach bridge with pasteboard identity and monitor teardown |
+// Blueprint: | `SessionDragSourceView.swift` | `SessionDragSource`: AppKit desktop-detach bridge and monitor teardown |
 
 enum SessionDragPresentation {
     static func shouldDetach(
@@ -31,8 +15,7 @@ enum SessionDragPresentation {
         visibleWindowFrames: [NSRect]
     ) -> Bool {
         guard pressedMouseButtons & 0x1 == 0 else { return false }
-        // A release on a window edge is still an in-app drop, not a desktop
-        // detach. The one-point margin avoids a flickering boundary decision.
+        // Include a one-point window-edge margin to avoid flickering desktop-detach decisions.
         return !visibleWindowFrames.contains { $0.insetBy(dx: -1, dy: -1).contains(screenPoint) }
     }
 }
@@ -56,7 +39,7 @@ struct SessionDragSource: NSViewRepresentable {
         nsView.sessionTitle = sessionTitle
     }
 
-    // Remove the row-local event monitor before SwiftUI recycles the view.
+    // Remove the event monitor before SwiftUI recycles the row.
     static func dismantleNSView(_ nsView: SessionDragSourceNSView, coordinator: ()) {
         nsView.teardownMonitor()
     }
@@ -71,8 +54,7 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
     private var pressStart: NSPoint?
     private var dragInFlight = false
 
-    // Click/right-click pass-through: never claim hits. Drag is detected
-    // via an app-local NSEvent monitor instead of mouseDown overrides.
+    // Pass clicks through; detect drags with the local monitor instead of mouseDown overrides.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func viewDidMoveToWindow() {
@@ -83,8 +65,7 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
     }
 
     deinit {
-        // NSEvent monitor removal is main-actor-isolated indirectly via
-        // NSEvent.removeMonitor, but it's safe to call here.
+        // Monitor removal is safe here despite NSEvent.removeMonitor's indirect main-actor isolation.
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
     }
 
@@ -93,8 +74,7 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
         pressStart = nil
     }
 
-    /// Public teardown entry for `dismantleNSView` — deterministic monitor
-    /// removal when SwiftUI tears the row out of the hierarchy.
+    /// Deterministic teardown prevents monitors surviving removal from the SwiftUI hierarchy.
     func teardownMonitor() { removeMonitor() }
 
     private func installMonitor() {
@@ -138,9 +118,7 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
         dragItem.setDraggingFrame(NSRect(origin: imageOrigin, size: image.size), contents: image)
 
         let session = beginDraggingSession(with: [dragItem], event: event, source: self)
-        // Finder now REJECTS the drop (nothing it can read), which would
-        // bounce the drag image back to the source — visually contradicting
-        // the detached window that opens at the drop point. Suppress it.
+        // Finder rejects this UTI; suppress its return animation because a detached window opens at the drop point.
         session.animatesToStartingPositionsOnCancelOrFail = false
     }
 

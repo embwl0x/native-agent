@@ -2,19 +2,18 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter+PathPolicy.swift` | Capability effects and Mac Control file admission use NativeAgentWorkspaceRoot's byte-exact path law; supported file mutations inspect declared I/O arguments only through execution's resolver; other capability paths retain conservative reach classification; `capabilityWritesOutsideAppData`, `pathIsInsideRoots`, `pathLikeStrings` |
+// Blueprint: | `SecurityCenter+PathPolicy.swift` | `capabilityWritesOutsideAppData`, `pathIsInsideRoots`, `pathLikeStrings`; Byte-exact path reach. |
 
 extension SwiftNativeSecurityCenter {
-    /// Her line for the paths a call names: true when one lands beyond her
-    /// data root and Trust's workspace roots. File mutations share execution's
-    /// resolver; relative paths with no known I/O base still count as beyond.
+    /// File mutations share execution's resolver; unknown relative bases conservatively count outside app data and workspace roots.
     static func capabilityWritesOutsideAppData(
         tool: String,
         input: [String: JSONValue],
         dataRoot: URL,
+        turn: Turn?,
         trustedWorkspaceRoots: [URL] = []
     ) throws -> Bool {
-        let binding = tool == "app" ? try AppActionBinding.action(input: input) : nil
+        let binding = tool == "app" ? try AppActionBinding.action(input: input, turn: turn) : nil
         let operation = ToolNameAliases.canonical(binding?.tool ?? tool)
         let pathInput = input
         if ["write_file", "copy_file", "move_file", "trash_file"].contains(operation) {
@@ -37,8 +36,7 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
-    /// Compare the resolved, standardized absolute path the caller will open.
-    /// Preserve its bytes: whitespace and Unicode spelling are part of a name.
+    /// Compare the resolved, standardized absolute path the caller will open. Preserve its bytes: whitespace and Unicode spelling are part of a name.
     static func pathIsInsideRoots(_ resolvedPath: String, roots: [URL]) -> Bool {
         guard resolvedPath.hasPrefix("/") else { return false }
         return roots.contains {

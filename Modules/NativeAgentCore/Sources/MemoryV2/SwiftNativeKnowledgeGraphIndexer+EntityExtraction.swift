@@ -31,17 +31,14 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
 
         for match in regexCaptures(#"`([^`]{2,80})`"#, in: content) {
-            // `tests`, `Tests`, `main`: a bare word in backticks is prose
-            // emphasis or a directory name, not an entity. Identifiers carry
-            // punctuation, a digit, or a space ("git ls-files", "USER.md").
+            // Bare backticked words may be prose or directories; require punctuation, digits or spaces to identify code entities.
             if match.range(of: "^[A-Za-z]+$", options: .regularExpression) != nil { continue }
             add(match)
         }
         for match in regexMatches(#"\b[A-Za-z0-9_./-]+\.(?:app|md|json|swift|sqlite|mlpackage|mlmodelc)\b"#, in: content) {
             add(match)
         }
-        // Tag people, places and organisations on-device; capitalization alone does not establish an entity.
-        // Whole mentions of caller-supplied known names identify people regardless of the tagger.
+        // Capitalization alone cannot establish an entity; known whole-name mentions override the tagger.
         for (name, type) in taggedNames(in: content, knownPeople: knownPeople) {
             add(name, forcedType: type)
         }
@@ -49,15 +46,13 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return Array(ordered.prefix(24))
     }
 
-    /// Tagged personal, place and organisation names pass credibility filters for short memory rows.
     private nonisolated static func taggedNames(
         in content: String,
         knownPeople: [String]
     ) -> [(String, String)] {
         let tagger = NLTagger(tagSchemes: [.nameType])
         tagger.string = content
-        // Short rows may not establish a language. Leave it unknown rather
-        // than teaching the tagger an English interpretation without evidence.
+        // Short rows may not establish a language. Leave it unknown rather than teaching the tagger an English interpretation without evidence.
         let recognizer = NLLanguageRecognizer()
         recognizer.processString(content)
         if let language = recognizer.dominantLanguage {
@@ -99,8 +94,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         "time", "timezone", "style", "manual", "standard",
     ]
 
-    /// False when a tagged name is one of the tagger's known mistakes on a
-    /// memory row. A known person is always credible.
+    /// Known people remain credible even when the tagger's short-row filters reject a proposed name.
     nonisolated static func taggedNameIsCredible(
         _ name: String,
         type: String,
@@ -111,21 +105,18 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let tokens = name.split(separator: " ").map(String.init)
         let lowerKnown = knownPeople.map { $0.lowercased() }
         if lowerKnown.contains(name.lowercased()) { return true }
-        // Glue: "KG upgrades", "User values Agent" — a lowercase word inside a
-        // name is the tagger joining a verb or noun onto a capital.
+        // A lowercase interior word usually glues a verb or noun onto a capitalized name.
         if tokens.count > 1,
            tokens.contains(where: { ($0.first?.isLowercase ?? false) && !nameParticles.contains($0.lowercased()) }) {
             return false
         }
-        // A known person glued to a leading verb ("Greet User", "Reuse User").
-        // "User Rogan" leads with the known name and stays a person.
+        // A leading verb can be glued to a known person's name; a known name followed by a surname stays credible.
         if type == "person", tokens.count > 1,
            let known = lowerKnown.first(where: { tokens.map { $0.lowercased() }.contains($0) }),
            tokens.first?.lowercased() != known {
             return false
         }
-        // Acronyms: "AI", "API", "CLI", "APFS" are not organisations. Known
-        // terms (APNS, MCP) were added before the tagger ran.
+        // Acronyms are not organizations merely through capitalization; known terms already have explicit identities.
         if tokens.count == 1, name.count <= 5, name == name.uppercased(),
            name.rangeOfCharacter(from: .lowercaseLetters) == nil {
             return false
@@ -134,7 +125,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         if tokens.count > 1, tokens.contains(where: isAcronymFragmentToken) {
             return false
         }
-        // A title, not an organisation: "Agentic Systems Architect".
+        // Occupational titles cannot establish an organization.
         if type == "organization", tokens.count > 1,
            let last = tokens.last?.lowercased(), roleNouns.contains(last) {
             return false
@@ -143,25 +134,17 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let after = content[range.upperBound..<content.endIndex]
         let prevWord = before.split(whereSeparator: { !$0.isLetter && $0 != "\'" }).last.map { String($0).lowercased() }
         let nextWord = after.split(whereSeparator: { !$0.isLetter }).first.map { String($0).lowercased() }
-        // "the Sky" (Fear the Sky): an article before a single capital is a
-        // common noun the tagger capitalised into a name.
+        // An article before a single capital may indicate a common noun rather than a name.
         if tokens.count == 1, type != "person", let prevWord, ["the", "a", "an"].contains(prevWord) {
             return false
         }
-        // "Pacific time", "Chicago style": a place used as an adjective.
+        // Place names used adjectivally do not establish a place entity.
         if type == "place", let nextWord, attributivePlaceFollowers.contains(nextWord) {
             return false
         }
-        // A sentence-initial single word ("Judge glass…", "Nudge it…",
-        // "Acceptance requires…") is capitalised because sentences are, not
-        // because it is a name — unless the same word also appears
-        // mid-sentence in this row.
+        // Sentence-initial capitalization alone proves no name; require another mid-sentence use.
         if tokens.count == 1, isSentenceInitial(range.lowerBound, in: content) {
-            // A person at the start of a sentence is usually its subject:
-            // "Sarah is User's sister", "Sarah often visits", "Sarah, User's
-            // sister,", "Sarah's birthday", "Sarah and Mike". The imperative
-            // mistakes ("Judge glass…", "Nudge it…", "Greet User") put a noun,
-            // pronoun, determiner or adjective right after the word instead.
+            // Sentence subjects suggest people; imperative verbs followed by nouns, pronouns, determiners or adjectives do not.
             if type == "person" {
                 let rest = content[range.upperBound...]
                 let trimmed = rest.drop(while: { $0 == " " })
@@ -193,8 +176,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return true
     }
 
-    /// True when only whitespace, or a sentence terminator / bullet followed
-    /// by whitespace, precedes `index`.
     private nonisolated static func isSentenceInitial(_ index: String.Index, in content: String) -> Bool {
         let before = content[content.startIndex..<index]
         let trimmed = before.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -211,8 +192,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// Dynamic people use the same whole-word, case-insensitive frame as the
-    /// fixed terms compiled below.
+    /// Match dynamic people with the same whole-word, case-insensitive rules as fixed terms.
     private static func knownTermMentioned(_ term: String, in content: String) -> Bool {
         let pattern = "\\b" + NSRegularExpression.escapedPattern(for: term) + "\\b"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
@@ -248,9 +228,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return collapsed
     }
 
-    /// Persona-document paths and their bare filenames are one entity. Keep
-    /// this deliberately narrow: collapsing arbitrary same-basename paths
-    /// would merge unrelated source files from different repositories.
+    /// Collapse only persona-document paths to bare filenames; general basename folding would merge unrelated repository files.
     private static func canonicalFileEntityName(_ raw: String) -> String {
         let normalized = raw.replacingOccurrences(of: "\\", with: "/")
         let basename = normalized.split(separator: "/").last.map(String.init) ?? normalized
@@ -351,7 +329,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
         "july", "august", "september", "october", "november", "december",
         "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
         "oct", "nov", "dec",
-        // Relative-day + sentence-initial filler/imperatives.
         "today", "tomorrow", "yesterday", "tonight", "now", "next",
         "last", "first", "finally", "also", "just", "still", "again",
         "remember", "reminder", "update", "updated", "note", "noted",

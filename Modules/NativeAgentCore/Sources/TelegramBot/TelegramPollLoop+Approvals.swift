@@ -3,7 +3,7 @@ import NativeAgentShared
 import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`; approval commands/callbacks carry decisions and terminalize keyboards; shared approval transactions own reporting turns, whose replies use the session's update-delivery journal |
+// Blueprint: | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`: shared approval ownership; session journal delivers replies |
 
 extension TelegramPollLoop {
     func handleApprovalSlashCommand(
@@ -49,8 +49,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// A read whose absence is an answer (the card was answered or withdrawn);
-    /// every other inbox failure still throws.
+    /// A read whose absence is an answer (the card was answered or withdrawn); every other inbox failure still throws.
     static func approvalIfPresent(_ inbox: SwiftNativeApprovalInbox, _ id: String) async throws -> ApprovalRecord? {
         do { return try await inbox.get(id) }
         catch ApprovalInboxError.notFound { return nil }
@@ -62,8 +61,7 @@ extension TelegramPollLoop {
         let admitted = await turnCoordinator.runCommandUntilAdmitted(destination: parsed.destination) { admissionReady in
             admissionReady()
             _ = await resolveApprovalCallback(update: update, callback: callback)
-            // Cancellation cannot prevent settlement of the durable ingress
-            // claim after its command finishes.
+            // Cancellation cannot prevent settlement of the durable ingress claim after its command finishes.
             await Task {
                 do {
                     _ = try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).transition(
@@ -147,8 +145,7 @@ extension TelegramPollLoop {
                 context: "approval_callback_answer",
                 update: update
             )
-            // An approval that settled, or a mirrored card (not an approval
-            // record) that was just answered: its buttons are done either way.
+            // An approval that settled, or a mirrored card (not an approval record) that was just answered: its buttons are done either way.
             let record = try await Self.approvalIfPresent(approvalInbox, parsed.command.id)
             if record == nil || record?.status != "pending" {
                 await terminalizeApprovalKeyboard(

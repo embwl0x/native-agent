@@ -1,32 +1,22 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `ActivityPolicy.swift` | `ActivityPolicy` and `ActivityPolicyStore`: checked capture consent, exclusions, title permissions and policy persistence |
+// Blueprint: | `ActivityPolicy.swift` | `ActivityPolicy`, `ActivityPolicyStore`: capture consent, exclusions, title gates and persistence |
 
 /// Opt-in activity recording: capture, titles, browser titles and model access
 /// default off; exclusions start non-empty. Sendable policy snapshots gate AX
 /// reads, history queries and retroactive deletion without shared mutable state.
 public struct ActivityPolicy: Sendable, Codable, Equatable {
-    /// Master switch. FALSE by default — the whole organ is opt-in.
+    /// The whole organ requires explicit opt-in.
     public var captureEnabled: Bool
-    /// Whether the frontmost window's title is captured at all. FALSE by default.
-    /// `ActivityTitleRedaction` catches shaped secrets, not all private content.
+    /// Title redaction catches shaped secrets, not all private content; title capture defaults off.
     public var captureTitles: Bool
-    /// Browser titles are their own decision, and their own default-off.
-    /// Private-browsing state is not reliably detectable via AX across
-    /// Safari/Chrome versions, so we never ship a "private browsing excluded"
-    /// claim a browser update can turn into a lie.
+    /// Browser titles need separate opt-in because AX cannot reliably identify private browsing.
     public var browserTitlesEnabled: Bool
-    /// Global override: app names only, no titles anywhere, whatever else says.
     public var appNameOnlyMode: Bool
-    /// Whether an activity answer may be returned to the selected chat model.
-    /// FALSE by default. Capture remains useful as a local record without
-    /// silently turning that record into provider input.
+    /// Local capture does not imply consent to send activity history to a model.
     public var allowModelAccess: Bool
-    /// User-editable exclusions. Ships with a starter list (see
-    /// `defaultExcludedBundleIDs`) rather than empty.
     public var excludedBundleIDs: Set<String>
-    /// Retention in days; older spans are pruned and physically deleted.
     public var retentionDays: Int
 
     public init(
@@ -56,9 +46,8 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
     public static var alwaysExcludedBundleIDs: Set<String> {
         var ids: Set<String> = [
             "com.apple.loginwindow",             // a lock signal, never a span
-            ActivityPolicy.selfProcessBundleID,  // the watcher's own process
+            ActivityPolicy.selfProcessBundleID,
         ]
-        // Whatever this binary actually is, it never records itself.
         if let host = Bundle.main.bundleIdentifier, !host.isEmpty {
             ids.insert(host)
         }
@@ -69,16 +58,14 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
     /// span without opening another or reading AX content.
     public static let selfProcessBundleID = "nativeagent.activity-watch.self"
 
-    /// Browsers, for the `browserTitlesEnabled` gate. Bundle ids only — we never
-    /// sniff a browser by name, because a name match would be trivially spoofed
-    /// into title capture by any app calling itself "Safari".
+    /// Use bundle ids: app names can be spoofed to bypass the browser-title gate.
     public static let browserBundleIDs: Set<String> = [
         "com.apple.Safari",
         "com.apple.SafariTechnologyPreview",
         "com.google.Chrome",
         "com.google.Chrome.beta",
         "com.google.Chrome.canary",
-        "company.thebrowser.Browser",            // Arc
+        "company.thebrowser.Browser",
         "org.mozilla.firefox",
         "org.mozilla.firefoxdeveloperedition",
         "com.brave.Browser",
@@ -90,55 +77,44 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
     /// Credential, health and finance defaults exclude the whole app: no title,
     /// app name or row. Title redaction alone cannot protect private content.
     public static let defaultExcludedBundleIDs: Set<String> = [
-        // --- password managers / credential stores ---
-        "com.1password.1password",               // 1Password 8
-        "com.agilebits.onepassword7",            // 1Password 7
-        "com.agilebits.onepassword-osx",         // 1Password 6 and earlier
-        "com.apple.keychainaccess",              // Keychain Access
-        "com.apple.Passwords",                   // macOS Passwords.app
-        "com.bitwarden.desktop",                 // Bitwarden
-        "com.lastpass.LastPass",                 // LastPass
-        "com.lastpass.lastpassmacdesktop",       // LastPass (MAS build)
-        "com.dashlane.Dashlane",                 // Dashlane
-        "in.sinew.Enpass-Desktop",               // Enpass
-        "org.keepassxc.keepassxc",               // KeePassXC
-        "com.apple.systempreferences",           // Settings — shows account panes
-        // --- health ---
-        "com.apple.Health",                      // Health
-        "com.apple.MobileSMS",                   // Messages: 2FA codes land here
-        // --- finance / banking ---
-        "com.apple.stocks",                      // Stocks
-        "com.apple.Wallet",                      // Wallet
-        "com.intuit.identity.mint",              // Mint
-        "com.quicken.Quicken",                   // Quicken
-        "com.ynab.YNAB",                         // YNAB
-        "com.coinbase.Coinbase",                 // Coinbase
+        "com.1password.1password",
+        "com.agilebits.onepassword7",
+        "com.agilebits.onepassword-osx",
+        "com.apple.keychainaccess",
+        "com.apple.Passwords",
+        "com.bitwarden.desktop",
+        "com.lastpass.LastPass",
+        "com.lastpass.lastpassmacdesktop",
+        "com.dashlane.Dashlane",
+        "in.sinew.Enpass-Desktop",
+        "org.keepassxc.keepassxc",
+        "com.apple.systempreferences", // Account panes contain private content.
+        "com.apple.Health",
+        "com.apple.MobileSMS", // Two-factor codes arrive here.
+        "com.apple.stocks",
+        "com.apple.Wallet",
+        "com.intuit.identity.mint",
+        "com.quicken.Quicken",
+        "com.ynab.YNAB",
+        "com.coinbase.Coinbase",
     ]
 
     // MARK: - Decisions
 
-    /// The complete exclusion set actually enforced: the user's list plus the
-    /// non-overridable one.
     public var effectiveExcludedBundleIDs: Set<String> {
         excludedBundleIDs.union(ActivityPolicy.alwaysExcludedBundleIDs)
     }
 
-    /// CAPTURE-TIME gate. Called BEFORE any AX read for that app — we do not
-    /// read an excluded app's title and then discard it, because a discarded
-    /// read is still a read and a later refactor turns it into a stored one.
+    /// Gate before AX: even a discarded read exposes excluded content.
     public func isExcluded(bundleID: String) -> Bool {
         effectiveExcludedBundleIDs.contains(bundleID)
     }
 
-    /// Whether ANY row may be written for this app.
     public func allowsCapture(bundleID: String) -> Bool {
         captureEnabled && !isExcluded(bundleID: bundleID)
     }
 
-    /// Whether the frontmost window's title may even be READ for this app.
-    ///
-    /// Browser titles require BOTH switches. `appNameOnlyMode` overrides
-    /// everything, and an excluded app never gets here at all.
+    /// Browser titles require both switches; app-name-only mode and exclusions override them.
     public func allowsTitleCapture(bundleID: String) -> Bool {
         guard allowsCapture(bundleID: bundleID) else { return false }
         guard !appNameOnlyMode, captureTitles else { return false }
@@ -151,9 +127,7 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
 
 // MARK: - Persistence
 
-/// JSON-on-disk home for `ActivityPolicy`, in the same `activity_watch/`
-/// directory as the span DB so a wipe of that directory takes the policy with
-/// it. See `ActivityWatchPaths` for why that directory is not `activity/`.
+/// Keep policy beside the span DB so wiping the activity-watch directory removes both.
 public struct ActivityPolicyStore: Sendable {
     public enum StoreError: Error, LocalizedError, Equatable {
         case unavailable(String)
@@ -161,7 +135,10 @@ public struct ActivityPolicyStore: Sendable {
         public var errorDescription: String? {
             switch self {
             case .unavailable(let detail):
-                return "The saved activity policy is unavailable: \(detail). Its bytes were preserved and activity settings cannot be changed until it is repaired."
+                return """
+                    The saved activity policy is unavailable: \(detail). Its bytes were preserved and activity settings cannot be changed \
+                    until it is repaired.
+                    """
             }
         }
     }

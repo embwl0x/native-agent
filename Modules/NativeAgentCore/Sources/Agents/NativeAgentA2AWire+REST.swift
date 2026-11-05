@@ -1,16 +1,24 @@
 import Foundation
 import Network
+import PersistenceCore
 
-// Blueprint: | `NativeAgentA2AWire+REST.swift` | `AgentContactA2AEndpoint.handleREST`: authenticated REST binding over the shared A2A parser, task owner and projections |
+// Blueprint: | `NativeAgentA2AWire+REST.swift` | `AgentContactA2AEndpoint.handleREST` |
 
 extension AgentContactA2AEndpoint {
     public enum RESTResponse: @unchecked Sendable {
-        case json(Int, [String: Any], onSent: (@Sendable () async -> Void)? = nil)
-        case stream(AsyncStream<AgentContactEvent>, onSent: @Sendable (AgentContactEvent) async -> Void)
+        case json(Int, [String: Any], onSent: (@Sendable () async -> Void)? = nil, onFailed: (@Sendable () -> Void)? = nil)
+        case stream(AsyncStream<AgentContactEvent>, metadata: JSONValue,
+                    onSent: @Sendable (AgentContactEvent) async -> Void, settle: @Sendable (Bool) -> Void)
+
+        func failed() {
+            switch self {
+            case .json(_, _, _, let onFailed): onFailed?()
+            case .stream(_, _, _, let settle): settle(false)
+            }
+        }
     }
 
-    /// REST is a binding over the same parser, task owner and projections.
-    /// This entry is reached only after the contact route's bearer check.
+    /// REST is a binding over the same parser, task owner and projections. This entry is reached only after the contact route's bearer check.
     public func handleREST(method: String, target: String, body: Data,
                     principal: AgentBridgePrincipal, version: String?) async -> RESTResponse {
         do {
@@ -91,12 +99,18 @@ extension AgentContactA2AEndpoint {
             let request: [String: Any] = ["jsonrpc": "2.0", "id": "rest", "method": operation, "params": params]
             switch await handle(request, byteCount: try JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]).count,
                                 principal: principal, version: version ?? "1.0") {
-            case .stream(_, let events, _, let onSent): return .stream(events, onSent: onSent)
-            case .json(let envelope, let onSent):
+            case .stream(_, let events, _, let metadata, let onSent, let settle):
+                return .stream(events, metadata: metadata, onSent: onSent, settle: settle)
+            case .json(let envelope, let onSent, let onFailed):
                 if let error = envelope["error"] as? [String: Any] {
+                    onFailed?()
                     return Self.restError(code: error["code"] as? Int ?? -32603, message: error["message"] as? String ?? "Request failed")
                 }
-                return .json(200, envelope["result"] as? [String: Any] ?? [:], onSent: onSent)
+                guard let result = envelope["result"] as? [String: Any] else {
+                    onFailed?()
+                    return Self.restError(code: -32603, message: "The response has no result; held messages remain undelivered")
+                }
+                return .json(200, result, onSent: onSent, onFailed: onFailed)
             }
         } catch {
             return Self.restError(code: -32700, message: "Invalid JSON")

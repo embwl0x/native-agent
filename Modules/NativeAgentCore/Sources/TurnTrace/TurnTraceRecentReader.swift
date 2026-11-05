@@ -2,142 +2,86 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TurnTraceRecentReader.swift` | Checked recent/day-file reads and usage queries; projects canonical daily evidence alongside standalone receipts without merging fields or inferring duplicate identities; preserves outcomes and read coverage |
+import Experiences
+// Blueprint: | `TurnTraceRecentReader.swift` | Checked record windows, model-call evidence and measured coverage |
 
-/// Reads the writer's day files using its calendar and root overrides.
+/// Reads turn evidence and standalone receipts from the one record.
 public struct TurnTraceRecentReader: Sendable {
     public static let maxRows = 2_000
-    public static let maxBytes = 8 * 1_024 * 1_024
 
     public struct Snapshot: Sendable {
-        public let sourceURL: URL
         public let events: [TurnTraceEvent]
-        public let sourceURLs: [URL]
-        public let truncated: Bool
-        public let oldestRetainedDay: Date?
-        public let malformedRows: Int
-        public let trailingPartialLine: Bool
-        public var completeSequences: Bool { !truncated && malformedRows == 0 && !trailingPartialLine }
+        public let unreadable: Int
+        /// The query reached its row bound; earlier evidence may remain outside this read.
+        public let limitReached: Bool
+        /// Timestamp of the first retained detail in record order; nil when absent or unreadable.
+        public let firstRetainedAt: Date?
+        public let lastSeq: Int64?
+        /// The read covered its whole window readably. It says nothing about health; an empty window is covered, not settled.
+        public var completeSequences: Bool { !limitReached && unreadable == 0 }
 
-        public init(sourceURL: URL, events: [TurnTraceEvent], sourceURLs: [URL] = [], truncated: Bool = false, oldestRetainedDay: Date? = nil, malformedRows: Int = 0, trailingPartialLine: Bool = false) {
-            self.sourceURL = sourceURL
+        public init(events: [TurnTraceEvent], unreadable: Int = 0, limitReached: Bool = false,
+                    firstRetainedAt: Date? = nil, lastSeq: Int64? = nil) {
             self.events = events
-            self.sourceURLs = sourceURLs.isEmpty ? [sourceURL] : sourceURLs
-            self.truncated = truncated
-            self.oldestRetainedDay = oldestRetainedDay
-            self.malformedRows = malformedRows
-            self.trailingPartialLine = trailingPartialLine
+            self.unreadable = unreadable
+            self.limitReached = limitReached
+            self.firstRetainedAt = firstRetainedAt
+            self.lastSeq = lastSeq
         }
     }
 
     private let lane: TurnTracePersistLane
     private let rowLimit: Int
 
-    /// `rowLimit` widens the tail for a reader that must find one session's
-    /// latest turn: on a busy day 2,000 rows can end before it.
     public init(dataRootOverride: URL? = nil, rowLimit: Int = TurnTraceRecentReader.maxRows) {
         self.lane = TurnTracePersistLane(dataRootOverride: dataRootOverride)
-        self.rowLimit = rowLimit
+        self.rowLimit = max(1, rowLimit)
     }
 
-    /// Unwindowed history shares a tail budget; since reads the complete retained window.
-    /// With `holding`, framing is checked before selecting a kind or turn id.
-    public func read(now: Date = Date(), history: Bool = false, since: Date? = nil, holding marks: [String] = [], trace: String? = nil, maximumReadBytes: Int = TurnTraceRecentReader.maxBytes) async throws -> Snapshot {
-        let sourceURL = lane.path(for: now)
-        let paths: [URL]
-        var oldestRetainedDay: Date?
-        if let trace {
-            let filename = String(trace.dropFirst("turn_traces/".count))
-            guard trace == "turn_traces/" + filename, filename.hasSuffix(".jsonl"),
-                  let day = TurnTracePersistLane.day(from: String(filename.dropLast(6))),
-                  filename == TurnTracePersistLane.dayString(from: day) + ".jsonl" else {
-                throw PersistenceCoreError.ioFailure("trace must name turn_traces/<yyyy-MM-dd>.jsonl.")
-            }
-            paths = [sourceURL.deletingLastPathComponent().appendingPathComponent(filename)]
-        } else if let since {
-            let directory = sourceURL.deletingLastPathComponent()
-            let entries = FileManager.default.fileExists(atPath: directory.path)
-                ? try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) : []
-            let days = entries.compactMap { path -> (URL, Date)? in
-                guard path.pathExtension == "jsonl",
-                      let day = TurnTracePersistLane.day(from: path.deletingPathExtension().lastPathComponent), day <= now else { return nil }
-                return (path, day)
-            }
-            oldestRetainedDay = days.map(\.1).min()
-            paths = days.filter { $0.1 >= TurnTracePersistLane.dayCalendar.startOfDay(for: since) }
-                .map(\.0).sorted { $0.lastPathComponent > $1.lastPathComponent }
-        } else {
-            paths = (0..<(history ? TurnTraceRetention.defaultKeepDays : 1)).compactMap {
-                TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -$0, to: now).map { lane.path(for: $0) }
-            }
+    /// A since window or a named turn reads its full retained evidence through `now`. Other reads take the newest bounded record window of
+    /// `now`'s whole day (with history, of every retained day through it), as a day's evidence read before. Holding selects kinds or turn ids
+    /// after coverage is checked; `kinds` narrows the query itself. Trace names a turn's subject in the record.
+    public func read(now: Date = Date(), history: Bool = false, since: Date? = nil, holding marks: [String] = [],
+                     trace: String? = nil, kinds: [String]? = nil) async throws -> Snapshot {
+        if let trace, NativeAgentChatSessionID.normalizedPathComponent(trace) != trace {
+            throw PersistenceCoreError.ioFailure("trace must name a turn id in the record.")
         }
-        var events: [TurnTraceEvent] = []
-        var sources: [URL] = []
-        var remainingRows = rowLimit
-        var remainingBytes = maximumReadBytes
-        var truncated = false
-        var malformedRows = 0
-        var trailingPartialLine = false
-        for path in paths {
-            guard trace != nil || since != nil || (remainingRows > 0 && remainingBytes > 0) else { truncated = true; break }
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory) else {
-                if trace != nil { truncated = true }
-                continue
+        let limit: Int? = since == nil && trace == nil ? rowLimit : nil
+        let calendar = TurnTracePersistLane.dayCalendar
+        let from = since ?? (history || trace != nil ? nil : calendar.startOfDay(for: now))
+        var through = now
+        if limit != nil {
+            guard let dayEnd = calendar.dateInterval(of: .day, for: now)?.end else {
+                throw PersistenceCoreError.ioFailure("Could not resolve the record day containing \(now).")
             }
-            if isDirectory.boolValue {
-                throw PersistenceCoreError.ioFailure("turn trace path is a directory: \(path.path)")
-            }
-            if since != nil || trace != nil {
-                sources.append(path)
-                let receipt = try await TurnTraceReplayReader.read(path)
-                malformedRows += receipt.report.malformedLineCount
-                trailingPartialLine = trailingPartialLine || receipt.report.trailingPartialLine
-                if !receipt.report.isClean { truncated = true }
-                for event in receipt.events {
-                    guard marks.isEmpty || marks.contains(event.kind) || marks.contains(event.turnId) else { continue }
-                    guard since.map({ event.ts >= $0 }) ?? true, event.ts <= now else { continue }
-                    events.append(event)
-                }
-                continue
-            }
-            let receipt = try await TurnTraceReplayReader.tail(path, limit: remainingRows, maxBytes: remainingBytes)
-            sources.append(path)
-            malformedRows += receipt.report.malformedLineCount
-            events += receipt.events
-            remainingRows -= receipt.report.physicalLineCount
-            remainingBytes -= receipt.bytesRead
-            truncated = truncated || receipt.truncated || remainingRows <= 0
+            through = dayEnd.addingTimeInterval(-0.001)
         }
-        return Snapshot(sourceURL: sourceURL, events: events, sourceURLs: sources, truncated: truncated, oldestRetainedDay: oldestRetainedDay, malformedRows: malformedRows, trailingPartialLine: trailingPartialLine)
+        let read = try await lane.events(.init(subjects: trace.map { [$0] }, kinds: kinds, from: from, through: through, limit: limit,
+                                               newestFirst: limit != nil))
+        let first = try await lane.events(.init(through: now, limit: 1))
+        let ordered = limit == nil ? read.events : Array(read.events.reversed())
+        let events = ordered.filter { marks.isEmpty || marks.contains($0.kind) || marks.contains($0.turnId) }
+        return Snapshot(events: events, unreadable: read.unreadable,
+                        limitReached: limit.map { read.events.count + read.unreadable >= $0 } ?? false,
+                        firstRetainedAt: first.events.first?.ts, lastSeq: read.lastSeq)
     }
 
-    /// Turn evidence has one durable owner. Daily events and standalone receipts
-    /// are read as recorded, without inferred identities or merged measurements.
-    public func traceEvidence(
-        now: Date = Date(), since: Date? = nil,
-        maximumReadBytes: Int = TurnTraceRecentReader.maxBytes
-    ) async throws -> (rows: [JSONValue], report: JSONLReadReport, turns: Snapshot, sourceAbsent: Bool) {
-        let turns = try await read(now: now, history: true, since: since,
-                                   holding: since == nil ? [] : ["llm.call", "provider.noReply", "tool.dispatch", "memory.commit", "context.compact", "turn.terminal", "work.identified"],
-                                   maximumReadBytes: maximumReadBytes)
-        let path = lane.resolvedDataRoot().appendingPathComponent("traces/events.jsonl")
-        let ledger: (rows: [JSONValue], report: JSONLReadReport)
-        if since != nil {
-            ledger = try await SwiftNativePersistenceCore.readJSONLReporting(path)
-        } else {
-            let tail = try await SwiftNativePersistenceCore.tailJSONLReadReceipt(path, limit: rowLimit, maxBytes: maximumReadBytes)
-            ledger = (tail.rows, JSONLReadReport(malformedLineCount: tail.malformedJSONRowCount))
-        }
+    /// Recorded receipts and turn evidence share one query; no second feed or inferred measurement is merged into it.
+    /// `kinds` narrows the query to the kinds a caller reads; nil reads every kind, standalone receipts included.
+    public func traceEvidence(now: Date = Date(), since: Date? = nil, kinds: [String]? = nil) async throws -> (rows: [JSONValue], turns: Snapshot) {
+        let turns = try await read(now: now, history: true, since: since, kinds: kinds)
         var rows: [JSONValue] = []
         for event in turns.events {
-            guard !event.diagnostic.isEmpty || ["llm.call", "provider.noReply", "tool.dispatch"].contains(event.kind),
-                  case .object(var payload) = event.payload else { continue }
+            guard !event.diagnostic.isEmpty || ["llm.call", "provider.noReply", "tool.dispatch"].contains(event.kind) else { continue }
+            guard case .object(var payload) = event.payload else {
+                throw PersistenceCoreError.ioFailure("The \(event.kind) detail has no object payload.")
+            }
             if event.kind == "tool.dispatch", payload["phase"] != .string("end"), event.diagnostic.isEmpty { continue }
             payload["turnId"] = .string(event.turnId)
             let title: String
             if let value = event.diagnostic["title"]?.stringValue { title = value }
-            else if case .string(let value)? = payload[event.kind == "tool.dispatch" ? "name" : event.kind == "llm.call" ? "model" : "provider"] { title = value }
+            else if case .string(let value)? = payload[event.kind == "tool.dispatch" ? "name" : event.kind == "llm.call" ? "model"
+                : "provider"] { title = value }
             else { title = event.kind }
             let id: String
             if let value = event.diagnostic["id"]?.stringValue { id = value }
@@ -149,41 +93,34 @@ public struct TurnTraceRecentReader: Sendable {
             }
             rows.append(.object([
                 "id": .string(id), "kind": .string(event.kind), "title": .string(title),
-                "status": event.diagnostic["status"] ?? payload["status"] ?? .string(event.kind == "provider.noReply" ? "failed" : event.kind == "llm.call" ? "unknown" : "ok"),
+                "status": event.diagnostic["status"] ?? payload["status"] ?? .string(event.kind == "provider.noReply" ? "failed" : event.kind == "llm.call"
+                    ? "unknown" : "ok"),
                 "createdAt": event.diagnostic["createdAt"] ?? .string(event.ts.formatted(TurnTraceEvent.fractionalISO8601)),
                 "payload": .object(payload),
             ]))
         }
-        rows += ledger.rows
-        var report = ledger.report
-        report.malformedLineCount += turns.malformedRows
-        report.trailingPartialLine = report.trailingPartialLine || turns.trailingPartialLine
         var dated: [(row: JSONValue, date: Date, index: Int)] = []
         for (index, row) in rows.enumerated() {
-            var date = Date.distantPast
-            if case .object(let object) = row, case .string(let raw)? = object["createdAt"],
-               let parsed = TurnTraceEvent.parseISO8601(raw) { date = parsed }
+            guard case .object(let object) = row, case .string(let raw)? = object["createdAt"],
+                  let date = TurnTraceEvent.parseISO8601(raw) else {
+                throw PersistenceCoreError.ioFailure("A recorded receipt has no readable createdAt.")
+            }
             dated.append((row, date, index))
         }
         dated.sort { $0.date == $1.date ? $0.index < $1.index : $0.date < $1.date }
-        rows = dated.map(\.row)
-        return (rows, report, turns,
-                turns.sourceURLs.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) }
-                    && !FileManager.default.fileExists(atPath: path.path))
+        return (dated.map(\.row), turns)
     }
 
     public func modelCalls(now: Date = Date()) async throws -> JSONValue {
         let weekAgo = now.addingTimeInterval(-7 * 86_400)
         let evidence = try await traceEvidence(now: now, since: weekAgo)
         var calls: [(Date, String, String, Int64?)] = []
-        var oldest: Date?
         for row in evidence.rows {
             guard case .object(let object) = row,
                   case .string(let rawDate)? = object["createdAt"],
                   let date = TurnTraceEvent.parseISO8601(rawDate) else {
                 throw PersistenceCoreError.ioFailure("Model calls: a trace row has no readable createdAt; inspect the retained trace sources.")
             }
-            oldest = min(oldest ?? date, date)
             guard object["kind"] == .string("llm.call"), date <= now,
                   date >= now.addingTimeInterval(-7 * 86_400) else { continue }
             guard case .object(let payload)? = object["payload"] else {
@@ -219,14 +156,13 @@ public struct TurnTraceRecentReader: Sendable {
                     $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
                 }.prefix(5).map { .object(["purpose": .string($0.key), "total_ms": .int($0.value)]) }),
                 "missing_duration_calls": .int(missingDuration),
-                "predates_retained_rows": .bool(oldest.map { since < $0 } ?? true),
+                "before_first_retained_detail": week.firstRetainedAt.map { .bool(since < $0) } ?? .null,
                 "rounds_per_turn": .object(["turns": .int(Int64(finished.count)),
                     "p50": Self.percentile(finished, 0.5).map { .int(Int64($0)) } ?? .null,
                     "p90": Self.percentile(finished, 0.9).map { .int(Int64($0)) } ?? .null]),
             ])
         }
-        // The week's five heaviest asks and the first six calls each made: her
-        // own, refusals included; a call run inside another names its parent.
+        // Include refusals in heaviest asks and retain parent identity for nested calls.
         let top = rounds.sorted { $0.rounds > $1.rounds }.prefix(5)
         let asks = week.events
         let heaviest: [JSONValue] = top.map { turn in
@@ -242,19 +178,22 @@ public struct TurnTraceRecentReader: Sendable {
                             "first_six": .array(made.prefix(6).map(JSONValue.string))])
         }
         return .object([
-            "status": .string(evidence.report.malformedLineCount == 0 && !evidence.report.trailingPartialLine && !week.truncated ? "ok" : "incomplete"),
+            "status": .string(week.unreadable > 0 || week.limitReached ? "incomplete" : calls.isEmpty ? "unmeasured" : "ok"),
             "title": .string("Model calls"), "until": .string(now.formatted(.iso8601)),
-            "measurement": .string("Recorded llm.call rows in turn_traces and standalone calls in traces/events.jsonl, including recorded failures. Unbound calls use turn_id unknown; unlabelled older calls use purpose other. Windows may exceed retained rows. Missing durations are not estimated. rounds_per_turn is each finished turn's model rounds (its first call and one per tool round, from its turn.terminal row in the per-day turn traces), nearest-rank p50/p90; heaviest_asks are the week's five turns with the most rounds, ! marking a call that failed."),
-            "malformed_rows": .int(Int64(evidence.report.malformedLineCount)),
-            "trailing_partial_line": .bool(evidence.report.trailingPartialLine),
+            "measurement": .string("""
+                Recorded llm.call details, including standalone calls and recorded failures. Unbound calls use turn_id unknown; calls without a purpose use \
+                purpose other. Windows may exceed retained evidence. Missing durations are not estimated. rounds_per_turn is each finished turn's model \
+                rounds (its first call and one per tool round, from its turn.terminal detail), \
+                nearest-rank p50/p90; heaviest_asks are the week's five turns with the most rounds, ! marking a call that failed.
+                """),
+            "unreadable_details": .int(Int64(evidence.turns.unreadable)),
             "windows": .array(windows),
             "heaviest_asks": .array(heaviest),
-            "turn_traces_incomplete": .bool(week.truncated),
+            "limit_reached": .bool(week.limitReached),
         ])
     }
 
-    /// Each finished turn's model rounds: its first call and one per tool
-    /// round, as its terminal row counts them.
+    /// Read model-round counts from the terminal owner: first call plus one per tool round.
     public static func rounds(_ events: [TurnTraceEvent]) -> [(turn: String, at: Date, rounds: Int)] {
         events.compactMap { event in
             guard event.kind == "turn.terminal", case .object(let payload) = event.payload,
@@ -269,7 +208,7 @@ public struct TurnTraceRecentReader: Sendable {
         return sorted.isEmpty ? nil : sorted[max(0, Int((Double(sorted.count) * p).rounded(.up)) - 1)]
     }
 
-    /// An app call as heaviest_asks names it: its action, or what it read.
+    /// Identify heaviest asks by the actual app action or read target.
     static func callLabel(_ payload: [String: JSONValue]) -> String {
         if case .object(let receipt)? = payload["receipt"], case .string(let action)? = receipt["action"], action != "app" { return action }
         let decoded: [String: JSONValue]? = if case .string(let raw)? = payload["args"],
@@ -291,7 +230,6 @@ public struct TurnTraceRecentReader: Sendable {
     public func usage(since: Date, now: Date = Date(), by: String = "model") async throws -> JSONValue {
         let evidence = try await traceEvidence(now: now, since: since)
         let snapshot = evidence.turns
-        var oldestEvidence = snapshot.oldestRetainedDay
         let metrics = ["inputTokens", "cacheReadInputTokens", "outputTokens", "durationMs"]
         let zero = Dictionary(uniqueKeysWithValues: (["calls"] + metrics).map { ($0, Int64(0)) })
         var totals = zero
@@ -305,7 +243,6 @@ public struct TurnTraceRecentReader: Sendable {
                   case .object(let payload)? = object["payload"] else {
                 throw PersistenceCoreError.ioFailure("Damaged usage evidence: a model call has no readable date or payload.")
             }
-            oldestEvidence = min(oldestEvidence ?? date, date)
             guard date >= since, date <= now else { continue }
             let key: String
             if by == "day" { key = TurnTracePersistLane.dayString(from: date) }
@@ -331,21 +268,18 @@ public struct TurnTraceRecentReader: Sendable {
         }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions.insert(.withFractionalSeconds)
-        let predatesRetention = oldestEvidence.map { since < $0 } ?? false
-        let incomplete = !evidence.report.isClean || snapshot.truncated
+        let incomplete = snapshot.unreadable > 0 || snapshot.limitReached
         return .object([
-            "status": .string(incomplete ? "incomplete" : "ok"), "by": .string(by),
+            "status": .string(incomplete ? "incomplete" : totals["calls"] == 0 ? "unmeasured" : "ok"), "by": .string(by),
             "since": .string(formatter.string(from: since)), "until": .string(formatter.string(from: now)),
-            "covered_since": oldestEvidence.map { .string(formatter.string(from: max(since, $0))) } ?? .null,
-            "oldest_retained_day": snapshot.oldestRetainedDay.map { .string(TurnTracePersistLane.dayString(from: $0)) } ?? .null,
-            "predates_retention": .bool(predatesRetention),
-            "coverage": .string(oldestEvidence == nil ? "No retained model-call evidence is available." : predatesRetention
-                ? "The requested window predates retained evidence; earlier usage is unavailable."
-                : "The requested window is within retained evidence. Retention and damaged rows can leave gaps."),
-            "malformed_rows": .int(Int64(evidence.report.malformedLineCount)),
-            "trailing_partial_line": .bool(evidence.report.trailingPartialLine),
-            "turn_traces_incomplete": .bool(snapshot.truncated),
-            "measurement": .string("Exact checked sums of recorded llm.call values from canonical daily turn traces and standalone traces/events.jsonl. No inferred duplicate identities or cross-feed field merging. missing_fields counts absent or null measurements; invalid domains or overflowing totals fail explicitly. Input and cached input are separate counters. Retention and read damage limit coverage."),
+            "first_retained_detail_at": snapshot.firstRetainedAt.map { .string(formatter.string(from: $0)) } ?? .null,
+            "coverage": .string("Recorded values only. Gaps and forgotten details cannot be estimated; record order does not prove a time boundary."),
+            "unreadable_details": .int(Int64(evidence.turns.unreadable)),
+            "limit_reached": .bool(snapshot.limitReached),
+            "measurement": .string("""
+                Exact checked sums of recorded llm.call details, including standalone calls. missing_fields counts absent or null measurements; invalid \
+                domains or overflowing totals fail explicitly. Input and cached input are separate counters. Retention and read damage limit coverage.
+                """),
             "totals": .object(counts(totals, missing: totalMissing)),
             "groups": .array(groups.sorted { $0.key < $1.key }.map { key, values in
                 var row = counts(values, missing: missing[key] ?? [:])

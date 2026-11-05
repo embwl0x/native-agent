@@ -1,6 +1,6 @@
 import Foundation
 import EngineRuntime
-// Blueprint: | `AppModel+Refresh.swift` | `AppModel`: `setIfChanged`, `refreshAll`; Telegram form reads share `refreshTelegramSettingsDraft` with the direct refresh |
+// Blueprint: | `AppModel+Refresh.swift` | `AppModel`, `setIfChanged`, `refreshAll`, `refreshTelegramSettingsDraft`: Shared refresh and Telegram draft reads |
 
 @MainActor
 extension AppModel {
@@ -32,15 +32,11 @@ extension AppModel {
             }
         }
 
-        // Start a fresh, complete failure set for this pass. Individual lanes
-        // append their detail through `recordRefreshFailure`; a successful
-        // empty result remains a real empty projection rather than looking
-        // like one of those failures.
+        // Collect failures per pass so successful empty reads remain distinct from unavailable projections.
         refreshAllFailureDetails.removeAll(keepingCapacity: true)
         isRecordingRefreshAllFailures = true
         setIfChanged(\.lastRefreshError, nil)
-        // Each engine facade owns its retained reads and their availability.
-        // App-only fields below are published together after their reads.
+        // Engine facades own retained reads and availability; publish app-only fields together after reading.
         await engine.doctor.refreshHealth()
 
         _ = await decodeLogged("getRuns") { try await engine.runs.refresh(dataRoot: engine.dataRoot) }

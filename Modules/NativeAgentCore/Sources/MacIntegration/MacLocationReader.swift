@@ -15,7 +15,7 @@ import PersistenceCore
 import Photos
 import MacControl
 import UserNotifications
-// Blueprint: | `MacLocationReader.swift` | One retained CoreLocation manager, cached authorization and bounded shared fresh-fix requests; caller-owned cancellation-aware waits retire only their own registration |
+// Blueprint: | `MacLocationReader.swift` | bounded fixes and caller-owned cancellation |
 
 /// One retained manager answers with its held fix and age; only reads with no fix wait for the bounded fresh request.
 @MainActor
@@ -25,7 +25,7 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
     private var waiters: [UUID: ScopedWaiter] = [:]
     private var results: [UUID: JSONValue] = [:]
     private var deadline: Task<Void, Never>?
-    /// The retained manager's authorization is protected by statusLock.
+    /// Guard the retained manager authorization with statusLock.
     nonisolated private static let statusLock = NSLock()
     nonisolated(unsafe) private static var knownStatus: CLAuthorizationStatus?
     public nonisolated static var authorizationStatus: CLAuthorizationStatus {
@@ -33,9 +33,9 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         Task { @MainActor in _ = shared }
         return CLLocationManager().authorizationStatus
     }
-    /// A held fix this old asks for a fresh one, for the next read.
+    /// Refresh stale fixes for the next read without blocking the current held-fix response.
     private static let freshness: TimeInterval = 300
-    /// With no fix held: CoreLocation gives one this fast or not at all (measured 0.6–1.4 s).
+    /// Bound the initial wait beyond the observed 0.6–1.4-second CoreLocation response.
     private static let answer: Duration = .seconds(2)
 
     override private init() {
@@ -51,16 +51,15 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         }
     }
 
-    public static func read() async throws -> JSONValue { try await shared.read() }
+    public static func read(context: MacOperationContext) async throws -> JSONValue { try await shared.read(context: context) }
 
-    /// The newest fix CoreLocation gave this Mac.
     private var held: CLLocation? {
         guard let fix = manager.location, fix.horizontalAccuracy >= 0 else { return nil }
         return fix
     }
 
-    private func read() async throws -> JSONValue {
-        guard !Task.isCancelled, !TaskWaitDeadline.expired else { throw TaskWaitDeadline.cancellationError }
+    private func read(context: MacOperationContext) async throws -> JSONValue {
+        guard !Task.isCancelled, !context.expired else { throw context.cancellationError }
         if let held {
             if -held.timestamp.timeIntervalSinceNow >= Self.freshness, deadline == nil { request() }
             return Self.fix(held)
@@ -72,8 +71,8 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
             results.removeValue(forKey: id)
         }
         if deadline == nil { request() }
-        await done.park()
-        guard !Task.isCancelled, !TaskWaitDeadline.expired else { throw TaskWaitDeadline.cancellationError }
+        await done.park(budget: context.waitBudget)
+        guard !Task.isCancelled, !context.expired else { throw context.cancellationError }
         guard let result = results[id] else {
             return Self.failure("location_unavailable", "The location wait ended without a result from its owner.")
         }
@@ -100,7 +99,6 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         NotificationCenter.default.post(name: SystemPermissionPreflight.permissionDidChange, object: nil)
     }
 
-    /// The fix just given is the one the manager now holds.
     public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) { finish() }
 
     public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {

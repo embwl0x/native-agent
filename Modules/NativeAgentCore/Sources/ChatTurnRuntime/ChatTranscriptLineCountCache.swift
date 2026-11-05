@@ -1,10 +1,9 @@
 import Foundation
 import PersistenceCore
 import Darwin
-// Blueprint: | `ChatTranscriptLineCountCache.swift` | `ChatTranscriptLineCountCache`: bounded stat-validated counts; writers establish deltas under the transcript flock |
+// Blueprint: | `ChatTranscriptLineCountCache.swift` | `ChatTranscriptLineCountCache`; Revision-validated counts under transcript lock |
 
-/// Process-wide transcript counts, carried forward under the transcript flock.
-/// A filesystem revision stamp validates each entry; changed files are recounted.
+/// Validate cached counts against filesystem revision under the transcript lock; recount changed files.
 final class ChatTranscriptLineCountCache: @unchecked Sendable {
     private struct Entry {
         var stamp: SnapshotTailOpLog.FileStamp
@@ -17,8 +16,6 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
 
-    /// Current line count for `path`, recomputing only when the file on disk is
-    /// not the one this cache last measured.
     func count(at path: URL, recount: (URL) throws -> Int) throws -> Int {
         let key = path.path
         let before = SnapshotTailOpLog.fileStamp(path)
@@ -32,9 +29,7 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
         }
         let counted = try recount(path)
         lock.lock()
-        // Only cache when the file did not move under the read. If it did, the
-        // pairing of (count, stamp) would be a lie — drop it and let the next
-        // caller recount.
+        // Publish only an unchanged file's count and stamp; a moving file must be recounted by the next caller.
         if let before, before != .absent, let after = SnapshotTailOpLog.fileStamp(path), before == after {
             makeRoom(for: key)
             entries[key] = Entry(stamp: after, count: counted)
@@ -45,8 +40,7 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
         return counted
     }
 
-    /// Record a count the caller established authoritatively (it just wrote the
-    /// file under the lock). Returns the same count for call-site chaining.
+    /// A locked writer's authoritative count may publish directly without rereading the file.
     @discardableResult
     func record(count: Int, at path: URL) -> Int {
         let key = path.path
@@ -61,7 +55,7 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
         return count
     }
 
-    /// Called with the cache lock held. Eviction only costs a later recount.
+    /// Eviction only costs a later recount; the cache lock must be held.
     private func makeRoom(for key: String) {
         if entries[key] == nil, entries.count >= Self.capacity, let evicted = entries.keys.first {
             entries.removeValue(forKey: evicted)

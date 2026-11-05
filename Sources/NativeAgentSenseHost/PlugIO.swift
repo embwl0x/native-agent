@@ -3,7 +3,6 @@ import Foundation
 import Senses
 // Blueprint: | `Sources/NativeAgentSenseHost/PlugIO.swift` | Bounded JSON-line transport |
 
-/// Bounded JSON-line transport over stdin/stdout.
 final class PlugIO {
     static let maximumLineBytes = 24 * 1024 * 1024
     private var pending = Data()

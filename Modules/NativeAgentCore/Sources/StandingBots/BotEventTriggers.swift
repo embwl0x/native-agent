@@ -1,18 +1,16 @@
 import Foundation
 import Experiences
 
-// Blueprint: | `BotEventTriggers.swift` | `BotEventRouter` and `BotEventStore`: Slack event matching/admission and durable wake records from already received events |
+// Blueprint: | `BotEventTriggers.swift` | `BotEventRouter`, `BotEventStore`: Slack admission and durable wake evidence |
 
-/// Slack events wake bots through StandingBots matching, admission and wake
-/// records; the listener stays with the socket-mode runner that receives them.
+/// Reuse the socket-mode listener so trigger admission needs no separate event loop.
 public enum BotEventSource: String, Codable, Sendable, CaseIterable {
     case slack
 
     public var label: String { "Slack" }
 }
 
-/// Persisted on the definition. `filter` is the Slack channel ID; `keyword` is
-/// optional and must appear in the event text.
+/// Store Slack channel IDs because incoming events cannot resolve names.
 public struct BotEventTrigger: Codable, Equatable, Sendable {
     public var source: BotEventSource
     public var filter: String
@@ -25,23 +23,19 @@ public struct BotEventTrigger: Codable, Equatable, Sendable {
         self.keyword = (trimmed?.isEmpty ?? true) ? nil : trimmed
     }
 
-    /// "Slack · C0123ABCD", with the keyword appended.
     public var label: String {
         let base = "\(source.label) · \(filter.trimmingCharacters(in: .whitespacesAndNewlines))"
         guard let keyword else { return base }
         return base + " · \(keyword)"
     }
 
-    /// Slack delivers a channel ID, never a name, and nothing in the app resolves
-    /// one to the other — so a Slack trigger stores the ID and the editor asks for
-    /// it. A name would silently never match.
+    /// Slack delivers IDs without name resolution; storing a name would silently prevent matching.
     public static func isChannelID(_ value: String) -> Bool {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard text.count >= 8, let first = text.first, "CGD".contains(first) else { return false }
         return text.allSatisfy { $0.isNumber || ($0.isLetter && $0.isUppercase) }
     }
 
-    /// Match the admitted Slack channel ID before applying the optional keyword.
     func wants(_ event: BotIncomingEvent) -> Bool {
         guard filter.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(
             event.target.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame else { return false }
@@ -53,12 +47,9 @@ public struct BotEventTrigger: Codable, Equatable, Sendable {
     }
 }
 
-/// What an arriving event is: where it came from, one line for the card, and the
-/// text the run reads.
 public struct BotIncomingEvent: Sendable, Equatable {
     public let id: String
     public let source: BotEventSource
-    /// The Slack channel id the runner received.
     public let target: String
     public let summary: String
     public let detail: String
@@ -79,7 +70,6 @@ public enum BotEventOutcome: String, Codable, Sendable {
     case queued, held, notRun = "not_run"
 }
 
-/// The last event that woke a bot, shown on the bot card.
 public struct BotEventRecord: Codable, Equatable, Sendable {
     public var source: BotEventSource
     public var target: String
@@ -99,8 +89,7 @@ public struct BotEventRecord: Codable, Equatable, Sendable {
     }
 }
 
-/// One small file beside the definitions. Evidence only: reading it never runs
-/// anything.
+/// Wake evidence is read-only; inspecting it cannot execute a bot.
 public struct BotEventStore: Sendable {
     private let disk: StandingBotsDisk
     public init(dataRoot: URL) { disk = StandingBotsDisk(dataRoot: dataRoot) }
@@ -117,9 +106,7 @@ public struct BotEventStore: Sendable {
         }, uniquingKeysWith: { first, _ in first })
     }
 
-    /// The event was accepted when it arrived and a gate shut before its request
-    /// was admitted. The record already on disk is the one that describes it, so
-    /// it is the one that changes — nothing here invents an event.
+    /// Update the admitted event's existing evidence; a later gate refusal must not invent another event.
     func hold(bot id: UUID, detail: String) throws {
         try disk.locked {
             var saved = try records()
@@ -140,9 +127,7 @@ public struct BotEventStore: Sendable {
     }
 }
 
-/// Delivery: match the event against every bot's trigger, then admit through
-/// the ordinary run queue so concurrency and the daily budget are unchanged.
-/// Autonomy off holds the event instead of running it — the record says so.
+/// Shared queue admission preserves concurrency, daily budgets and unattended-work authority.
 public struct BotEventRouter: Sendable {
     private let dataRoot: URL
     private let isAutonomyEnabled: @Sendable () async -> Bool
@@ -152,23 +137,25 @@ public struct BotEventRouter: Sendable {
         self.isAutonomyEnabled = isAutonomyEnabled
     }
 
-    /// Returns the bots this event woke. A bot with no trigger, a paused bot, or
-    /// a trigger that does not want the event is untouched.
     @discardableResult
-    public func deliver(_ event: BotIncomingEvent) async throws -> [UUID] {
-        do { return try await deliverChecked(event) }
+    public func deliver(_ event: BotIncomingEvent, scope: BotRunScope) async throws -> [UUID] {
+        do { return try await deliverChecked(event, scope: scope) }
         catch {
             RepairOwed.owe(dataRoot, id: "bot-event-admission:" + event.id, kind: .run,
                 evidence: [.init(source: "slack/inbound_delivery_journal.json", id: event.id)],
                 operation: "bots.event.admission:" + event.id,
                 owner: "bots/definitions, run-queue.json and last-events.json",
-                words: "Helper event \(event.id) from \(event.source.label) in \(event.target) was not fully recorded: \(error). Its accepted input remains in slack/inbound_delivery_journal.json. Inspect accepted run-queue requests before repairing the wake record; do not admit the event again to replace missing evidence.",
+                words: """
+                    Helper event \(event.id) from \(event.source.label) in \(event.target) was not fully recorded: \(error). Its accepted \
+                    input remains in slack/inbound_delivery_journal.json. Inspect accepted run-queue requests before repairing the wake \
+                    record; do not admit the event again to replace missing evidence.
+                    """,
                 lever: "Repair the named helper storage and reconcile its retained queue receipt.")
             throw error
         }
     }
 
-    private func deliverChecked(_ event: BotIncomingEvent) async throws -> [UUID] {
+    private func deliverChecked(_ event: BotIncomingEvent, scope: BotRunScope) async throws -> [UUID] {
         let definitions = try BotDefinitionStore(dataRoot: dataRoot).list()
         let matched = definitions.filter { bot in
             guard !bot.paused, let trigger = bot.eventTrigger else { return false }
@@ -177,8 +164,7 @@ public struct BotEventRouter: Sendable {
         guard !matched.isEmpty else { return [] }
         let store = BotEventStore(dataRoot: dataRoot)
         let queue = BotRunQueue(dataRoot: dataRoot)
-        // Event waking is unattended provider spend and passes the same master
-        // Autonomy switch scheduled runs pass.
+        // Event waking spends unattended provider work and must honor its master switch.
         let allowed = await isAutonomyEnabled()
         var woken: [UUID] = []
         for bot in matched {
@@ -192,7 +178,7 @@ public struct BotEventRouter: Sendable {
             let receipt: BotRunReceipt
             do {
                 receipt = try queue.enqueue(bot: bot.id, context: context, origin: .event,
-                                            provenance: event.provenance)
+                                            provenance: event.provenance, scope: scope)
             } catch {
                 let admissionError = error
                 do {
@@ -200,7 +186,10 @@ public struct BotEventRouter: Sendable {
                         summary: event.summary, outcome: .notRun,
                         detail: "Helper admission failed: \(admissionError)"), bot: bot.id)
                 } catch {
-                    throw StandingBotsError.corruptStore("Helper admission failed for \(bot.id): \(admissionError). Its wake record also failed: \(error). Inspect the queue and repair the named storage before reconciling this event.")
+                    throw StandingBotsError.corruptStore("""
+                        Helper admission failed for \(bot.id): \(admissionError). Its wake record also failed: \(error). Inspect the queue and \
+                        repair the named storage before reconciling this event.
+                        """)
                 }
                 throw admissionError
             }
@@ -209,15 +198,17 @@ public struct BotEventRouter: Sendable {
                     summary: event.summary, outcome: receipt.accepted ? .queued : .notRun,
                     detail: receipt.accepted ? nil : receipt.reason), bot: bot.id)
             } catch {
-                throw StandingBotsError.corruptStore("Helper wake record unavailable for \(bot.id), request \(receipt.runID): \(error). The queue retains any accepted request; repair last-events.json without repeating admission.")
+                throw StandingBotsError.corruptStore("""
+                    Helper wake record unavailable for \(bot.id), request \(receipt.runID): \(error). The queue retains any accepted \
+                    request; repair last-events.json without repeating admission.
+                    """)
             }
             if receipt.accepted { woken.append(bot.id) }
         }
         return woken
     }
 
-    /// The text the brief sees. Untrusted outside content: it is the run's
-    /// input, never an instruction to the app.
+    /// Outside text is run input, never authority to instruct the app.
     static func context(_ event: BotIncomingEvent) -> String {
         var lines = ["\(event.source.label) · \(event.target)", event.summary]
         if event.detail != event.summary, !event.detail.isEmpty { lines.append(event.detail) }

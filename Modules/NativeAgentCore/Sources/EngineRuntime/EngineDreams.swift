@@ -1,4 +1,7 @@
 import Foundation
+import ChatTurnContracts
+import Experiences
+import SchedulerExecution
 import AttentionRouting
 import Cognition
 import NativeAgentCore
@@ -6,11 +9,10 @@ import ProviderRouting
 import BackgroundWork
 import DreamREMCycle
 import PersistenceCore
-// Blueprint: | `EngineDreams.swift` | NativeAgentEngine dream and REM commands; previewDream shares manual dream provider/prompt assembly, evaluates decoded care judgments through the substrate copy path and records only mind.run_now preview evidence; no owed-moment drain, body/vitals sink, diary, care or learning commit; preview refuses unopened minds, alternate roots and an unbounded provider wall; real scheduled/manual dreams retain receipts and mood settlement |
+// Blueprint: | `EngineDreams.swift` | Manual and scheduled dreams share one matter and delivery receipt; previews commit nothing |
 
 extension NativeAgentEngine {
-    /// A real generated dream over the currently lived material, with only an
-    /// inert run-now trace. It never drains owed moments to create more input.
+    /// Preview dreams use lived material without draining owed moments or recording a live run.
     public static func previewDream(dataRoot root: URL) async throws -> MindClockResult {
         let fields: [String: JSONValue] = ["preview": .bool(true), "effects": .string("none"), "execution": .string("preview")]
         guard root.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else {
@@ -28,16 +30,9 @@ extension NativeAgentEngine {
         if let why = await cognition.mindPreviewRefusal() {
             result = .init("unavailable", why, fields: fields)
         } else {
-            // Preview calls spend provider usage, not the calling turn's token
-            // budget or session usage receipt, and feed no body/vitals observer.
-            let report = try await LLMCallContext.$preview.withValue(true) {
-                let impl = try await dreamCycle(dataRoot: root, preview: true)
-                return try await LLMCallContext.$sessionId.withValue(nil) {
-                    try await LLMCallContext.$turnTokenBudget.withValue(nil) {
-                        try await impl.previewDream()
-                    }
-                }
-            }
+            // Preview spends provider usage without charging the calling turn’s budget or feeding body/vitals observers.
+            let impl = try await dreamCycle(dataRoot: root, preview: true)
+            let report = try await impl.previewDream()
             var fields = fields
             fields["sessionsProcessed"] = .int(Int64(report.sessionsProcessed))
             fields["owedMomentsNotDrained"] = .bool(true)
@@ -58,7 +53,10 @@ extension NativeAgentEngine {
                     return NativeCognitionRuntime.recordClockRun("dream", .init("unavailable",
                         "The dream generated, but its care material was unavailable; no care verdict is available.", fields: fields))
                 }
-                result = .init("would_dream", "Generated and decoded the real dream. Care answers, stance changes and merges were evaluated on a copy of current cares. Nothing was applied or recorded as learning; provider usage was spent.", fields: fields)
+                result = .init("would_dream", """
+                    Generated and decoded the real dream. Care answers, stance changes and merges were evaluated on a copy of current cares. Nothing was \
+                    applied or recorded as learning; provider usage was spent.
+                    """, fields: fields)
             } else {
                 result = .init("held", report.skipReason ?? "No dream was generated; no verdict is available.", fields: fields)
             }
@@ -99,11 +97,7 @@ extension NativeAgentEngine {
 }
 
 extension NativeAgentEngine {
-    /// One dream pass, for the scheduled nightly and the manual run alike:
-    /// the same MemoryV2 Self-half, felt tone, felt origins (the diary names
-    /// the journal entry a feeling came from), receipts and mood sink as the
-    /// background loop, so neither path silently dreams with an empty
-    /// Self-half. A committed dream then reaches the organism.
+    /// Manual and scheduled dreams share the same Self-half, felt origins and receipt owners; committed dreams reach the organism.
     public static func runDream(
         dataRoot root: URL,
         force: Bool = false,
@@ -121,19 +115,24 @@ extension NativeAgentEngine {
             "entriesWritten": report.entriesWritten, "disabled": report.disabled, "errors": report.errors,
         ]
         if let skipReason = report.skipReason { response["skipReason"] = skipReason }
+        if !report.busy.isEmpty { response["busy"] = report.busy }
         if !report.errors.isEmpty {
             response["remedy"] = (report.repair ?? Repair.remedy(owner: "dream cycle",
                 nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mind.dream")])]), tap: nil)).foundationObject
         }
+        let output = JSONValue.object(try NativeActionWire.jsonValueBody(response))
+        let saved: Result<JSONValue, Error> = await settle {
+            do {
+                return .success(try await SchedulerDueJobRunner(root: root).surfaceDreamResult(output))
+            } catch { return .failure(error) }
+        }
+        if case .object(let receipt) = try saved.get() {
+            for (key, value) in receipt { response[key] = value.foundationObject }
+        }
         return response
     }
 
-    /// Weekly REM consolidation. It stages approvals like the background
-    /// loop, so a manual run's proposals reach the inbox. `force` defaults to
-    /// the manual behaviour (the weekly marker is distinct from the
-    /// one-dream-per-night diary contract); the persisted Sunday job passes
-    /// false so a "Run REM now" earlier the same week and the 04:30 job never
-    /// distil the same dreams twice.
+    /// Manual and weekly REM share approval staging; the weekly job passes `force: false` so an earlier manual run cannot distil the same dreams twice.
     public static func runRem(dataRoot root: URL, force: Bool = true, repair: Bool = false) async throws -> [String: Any] {
         let cognition = cognitionRuntime(for: root)
         let impl = try makeDreamREMCycle(
@@ -162,13 +161,7 @@ extension NativeAgentEngine {
 }
 
 private struct EngineREMProposalNotifications: REMProposalNotificationPort {
-    func notifyIfAttentionWorthy(
-        dataRoot: URL, itemId: String, title: String, summary: String,
-        source: String, severity: String
-    ) async {
-        await NativeAgentEngine.live.ports.backgroundWork.attention.notifyIfAttentionWorthy(
-            dataRoot: dataRoot, itemId: itemId, title: title, summary: summary,
-            source: source, severity: severity
-        )
+    func tell(_ matter: Matter, dataRoot: URL, reach: AttentionRouter.Reach, turn: Turn?) async throws -> AttentionOutcome {
+        try await EngineBackgroundWorkPort().tell(matter, dataRoot: dataRoot, reach: reach, turn: turn)
     }
 }

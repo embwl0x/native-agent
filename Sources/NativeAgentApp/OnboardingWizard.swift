@@ -3,7 +3,7 @@ import Onboarding
 import EngineRuntime
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `OnboardingWizard.swift` | Fresh identity setup and shared wizard presentation; recovery, profile repair and reset are separate identity operations |
+// Blueprint: | `OnboardingWizard.swift` | Fresh identity and wizard presentation; distinct recovery, repair and reset |
 
 // MARK: - Models
 
@@ -12,8 +12,7 @@ extension AbilityOverviewEntry: @retroactive Identifiable {}
 struct OnboardingWizard: View {
     let onComplete: () -> Void
 
-    // Loading/actions require the real model; an offscreen identity fixture only
-    // needs wizard state. Optional lookup avoids eagerly starting a runtime.
+    // Offscreen identity presentation needs state without starting a runtime.
     @Environment(AppModel.self) private var appModel: AppModel?
     @State private(set) var state = OnboardingWizardState()
     init(onComplete: @escaping () -> Void) {
@@ -23,7 +22,6 @@ struct OnboardingWizard: View {
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
-                // Progress dots
                 if state.step.rawValue < OnboardingWizardState.Step.building.rawValue {
                     HStack(spacing: 8) {
                         ForEach(0..<OnboardingWizardState.interactiveStepCount, id: \.self) { i in
@@ -38,7 +36,6 @@ struct OnboardingWizard: View {
 
                 if state.step != .identity { Spacer() }
 
-                // Step content
                 ZStack {
                     switch state.step {
                     case .identity:   IdentityAndAbilitiesStep(state: state)
@@ -67,21 +64,16 @@ struct OnboardingWizard: View {
                     } : nil)
                     }
                 }
-                // Each step arrives once: the old one leaves at once (no
-                // overlap, no lingering labels) and the new one fades up. The
-                // step changes themselves carry no animation, so the dots,
-                // spacers and nav bar never ride along.
+                // Remove the departing step immediately and animate only new content, keeping navigation fixed.
                 .motionArrival()
                 .id(state.step)
                 .frame(maxWidth: 520)
-                // The step owns its viewport. Native scroll content must not
-                // paint above it over the progress dots or below the nav bar.
+                // Keep scroll content from painting over progress and navigation.
                 .clipped()
                 .padding(.horizontal, NativeAgentSpacing.xl)
 
                 if state.step != .identity { Spacer() }
 
-                // Navigation buttons
                 if state.step.rawValue < OnboardingWizardState.Step.building.rawValue {
                     OnboardingNavBar(state: state) {
                         Task { await handleContinue() }
@@ -153,7 +145,7 @@ struct OnboardingWizard: View {
         }
     }
 
-    /// Raw backend error codes are not user-facing copy.
+    /// Backend error codes are not user-facing copy.
     static func buildFailureMessage(error: String?, detail: String?) -> String {
         switch error {
         case "persona_already_exists":
@@ -165,9 +157,7 @@ struct OnboardingWizard: View {
         }
     }
 
-    /// Fresh completion and pending-transaction resume both require scaffold repair.
-    /// Registered owners repair scaffolding; canonical owners initialize runtime stores.
-    /// Failure keeps committed identity documents and offers repair again, never reset.
+    /// Fresh and resumed identity commits need scaffold repair; failure retains identity and offers repair.
     func finishSuccessfulOnboarding() async {
         guard let appModel = setupModel() else { return }
         state.releaseNames(agent: state.agentName, user: state.userName)
@@ -185,12 +175,10 @@ struct OnboardingWizard: View {
             return
         }
         appModel.markFirstRunWelcomePending()
-        // Fresh setup opens Simple view and the greeting.
         UserDefaults.standard.set(SimpleViewMode.simple, forKey: SimpleViewMode.key)
         onComplete()
     }
 
-    /// Name the failed scaffold check, the saved identity and the repair action.
     static func scaffoldRepairFailureMessage(_ outcome: DoctorFacade.RunOutcome) -> String {
         let detail = outcome.failureDetail.trimmingCharacters(in: .whitespacesAndNewlines)
         return [
@@ -313,8 +301,7 @@ private struct AbilityOverviewTile: View {
 
 // MARK: - Provider connect step
 
-/// Uses the Providers sign-in and configuration controls; connecting adopts the account for Chat.
-/// Setup can finish without a connection.
+/// Provider connection is optional; connecting adopts the account for Chat.
 private struct ProviderConnectStep: View {
     @Bindable var state: OnboardingWizardState
     @Environment(AppModel.self) private var appModel
@@ -340,8 +327,6 @@ private struct ProviderConnectStep: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                // Sign in with a subscription account (same OAuth buttons as
-                // the Providers tab).
                 NativePanel {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         Text("Sign in with your account")
@@ -368,7 +353,7 @@ private struct ProviderConnectStep: View {
                 // Keep API-key configuration behind disclosure so account sign-in stays prominent.
                 DisclosureGroup(isExpanded: $showsAPIKeys) {
                     NativePanel {
-                        // Sign-in controls are above; this list contains API-key rows only.
+                        // Exclude sign-in rows here to avoid duplicating the controls above.
                         ForEach(state.providers.filter { !Self.signInProviderIDs.contains($0.provider_id) }) { provider in
                             ProviderRowView(provider: provider) { configureSheet = provider.provider_id }
                         }
@@ -440,7 +425,7 @@ private struct ProviderConnectStep: View {
         }
     }
 
-    /// Passive reads preserve saved provider choices; connection operations own adoption.
+    /// Passive reads must preserve provider choices; connection operations own adoption.
     private func reload() async {
         await state.reloadProviders(refresh: { await appModel.loadProvidersForChat() })
     }

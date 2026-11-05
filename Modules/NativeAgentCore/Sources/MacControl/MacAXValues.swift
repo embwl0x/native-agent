@@ -17,7 +17,7 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacAXValues.swift` | Accessibility identity, geometry, node and query values; window identities carry optional-attribute gaps without scoring failed titles as absent; typed optional-attribute and action-name gaps retain element evidence and derive observation summaries, counting transient-menu nodes once by native identity; enabled evidence stays optional and snapshots retain bounded read-failure causes |
+// Blueprint: | `MacAXValues.swift` | AX identity, geometry and queries preserve gaps and bounded failure evidence |
 public struct MacAXFrame: Sendable, Hashable {
     public let x: Double
     public let y: Double
@@ -38,10 +38,7 @@ public struct MacAXFrame: Sendable, Hashable {
         ])
     }
 }
-/// One element's readable attributes. Missing AX attributes remain absent.
-/// `actionsUnreadable` names a failed action-name read, distinct from an
-/// observed empty list; it does not discard the other readable attributes.
-/// `attributeGaps` names optional attributes whose reads failed, not absence.
+/// Failed action/optional-attribute reads retain named gaps while other attributes remain usable; failed reads are distinct from observed absence.
 public struct MacAXAttributes: Sendable, Equatable {
     public let role: String
     public let subrole: String?
@@ -51,14 +48,12 @@ public struct MacAXAttributes: Sendable, Equatable {
     public let selected: Bool?
     public let frame: MacAXFrame?
     public let actions: [String]
-    /// When present, `actions` contains no claimed names, not evidence that
-    /// this element supports no actions. Actuation checks the live source.
+    /// When present, `actions` contains no claimed names, not evidence that this element supports no actions. Actuation checks the live source.
     public let actionsUnreadable: String?
     public let attributeGaps: [String]
     /// A name or caption read failed; no alternate name is claimed for this control.
     public let labelUnreadable: Bool
-    /// An editable field's placeholder ("Search Maps") — what a person sees in
-    /// it and calls it by, when its AX name says something else.
+    /// A field's visible placeholder can name it independently of its AX identity.
     public let placeholder: String?
     public let selectionRange: NSRange?
     /// Typed AXValue state, never prose obtained by stringifying a boolean.
@@ -66,15 +61,13 @@ public struct MacAXAttributes: Sendable, Equatable {
     /// Presentation metadata, not another text channel.
     public let liveRegion: Bool
     public let valueIsHelp: Bool
-    /// A display-only name when help duplicates the identity title. The
-    /// original title remains authoritative for redaction and act identity.
+    /// A display-only name when help duplicates the identity title. The original title remains authoritative for redaction and act identity.
     public let titleIsHelp: Bool
     public let displayTitle: String?
     public let listSummary: String?
     /// Hidden or modifier-only alternate, absent from the default menu.
     public let isHiddenMenuItem: Bool
-    /// A menu item's command identity (identifier and key equivalent) when it
-    /// has one: two items with the same path and the same key are one command.
+    /// A menu item's command identity (identifier and key equivalent) when it has one: two items with the same path and the same key are one command.
     public let menuCommandKey: String?
     public init(
         role: String,
@@ -122,8 +115,7 @@ public struct MacAXAttributes: Sendable, Equatable {
         self.labelUnreadable = labelUnreadable
     }
 }
-/// An emitted tree node. `path` is the child-index chain from the window root
-/// (root itself is `[]`); actions resolve it against the live window.
+/// Paths remain window-relative so actions can resolve them against the live window.
 public struct MacAXNode: Sendable, Equatable {
     public let attributes: MacAXAttributes
     public let path: [Int]
@@ -156,45 +148,18 @@ public struct MacAXAppInfo: Sendable, Equatable {
         ])
     }
 }
-/// Call-local foreground lease. Native window identity never goes through JSON.
+/// Keep native foreground identity out of JSON.
 struct MacForegroundSnapshot: Sendable {
     let app: MacAXAppInfo
     let window: MacAXWindowIdentity?
-    @TaskLocal static var restoring: MacForegroundSnapshot?
+
 }
-/// WHICH WINDOW a look was taken of, in terms that survive a new
-/// `AXUIElement` instance.
-///
-/// The reader and the actuator each mint their OWN element handles, per
-/// instance, into their own tables — so "the window root the look walked"
-/// cannot be handed to the act path as a reference. And `AXUIElement` itself
-/// is not a durable identity across processes/queries in any way this code may
-/// rely on: `CFHash` is documented only for use with `CFEqual` on live
-/// references, and the one genuinely durable id — the CGWindowID behind
-/// `_AXUIElementGetWindow` — is PRIVATE API this app does not call. There is
-/// no public, read-only, stable window id on macOS.
-///
-/// So the identity is a COMPOSITE of read-only public attributes:
-///
-///   • `pid`      — the process.
-///   • `role` / `subrole` — `AXWindow` + `AXStandardWindow`/`AXDialog`/…,
-///     which separates a sheet from the document window behind it.
-///   • `title`    — `AXTitle`. The strongest signal, and the one that MOVES
-///     (a dirty marker, a tab switch), so it is never required on its own.
-///   • `frame`    — `AXPosition`+`AXSize`. Survives a retitle; moves when the
-///     user drags the window.
-///   • `index`    — position in the app's `AXWindows` array at look time. The
-///     weakest signal (z-order reshuffles it) and never decisive alone.
-///
-/// Live captures additionally retain the native AX window. Their continuation
-/// requires CF identity equality; a replacement at the same rectangle is never
-/// the captured window. Attribute scoring is only for external descriptive
-/// queries that did not capture a native window.
+/// Reader and actuator handles cannot cross source tables. Public AX exposes no durable read-only window ID, so descriptive queries use composite attributes:
+/// role/subrole distinguish window kinds, title and frame tolerate independent drift, and z-order index is never decisive alone. Live captures require native
+/// CF identity; a replacement at the same rectangle is a different window.
 public struct MacAXWindowIdentity: Sendable, Equatable {
     public let pid: Int32
-    /// Position in the app's `AXWindows` array when the look was taken, or nil
-    /// when the source answered with a window but not with a position. nil
-    /// never scores — an index guessed at would rank a wrong candidate up.
+    /// An unknown AXWindows index never scores; guessing could promote the wrong window.
     public let index: Int?
     public let role: String
     public let subrole: String?
@@ -235,8 +200,7 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         self.frame = frame
         self.attributeGaps = attributeGaps
     }
-    /// Rects drift by a point under a re-layout; two DIFFERENT windows are
-    /// never a point apart in both origin and size.
+    /// One point tolerates layout rounding without conflating distinct window origins and sizes.
     public static let rectTolerance = 2.0
     static func rectsMatch(_ lhs: MacAXFrame?, _ rhs: MacAXFrame?) -> Bool {
         guard let lhs, let rhs else { return false }
@@ -245,19 +209,12 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
             && abs(lhs.w - rhs.w) <= rectTolerance
             && abs(lhs.h - rhs.h) <= rectTolerance
     }
-    /// How strongly `candidate` looks like THIS window. nil ⇒ it cannot be:
-    /// a different process or a different kind of window is disqualifying, not
-    /// merely unlikely.
+    /// Process or window-kind disagreement disqualifies a candidate rather than merely lowering its score.
     public func score(against candidate: MacAXWindowIdentity) -> Int? {
         guard candidate.pid == pid else { return nil }
         guard candidate.role == role else { return nil }
         if let subrole, let other = candidate.subrole, subrole != other { return nil }
-        // DISQUALIFYING contradiction: both signals are known on both sides and
-        // both disagree. One of them moving is ordinary (a retitle, a drag);
-        // both moving at once means this is a different window. Without this
-        // the sole-window rule below would happily match the ONE window an app
-        // has left after the window she looked at closed and a different one
-        // replaced it.
+        // A retitle or a drag is ordinary; both title and frame disagreeing disqualifies a replacement even if it is the only remaining window.
         let titleContradicts = title != nil && candidate.title != nil && title != candidate.title
         let rectContradicts = frame != nil && candidate.frame != nil
             && !Self.rectsMatch(frame, candidate.frame)
@@ -269,26 +226,15 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         if let index, let other = candidate.index, index == other { score += 1 }
         return score
     }
-    /// A title or rect hit. Below this a candidate is only "the right app and
-    /// the right kind of window", which two documents of one app both are.
+    /// A title or rect hit distinguishes documents that share process and window kind.
     static let decisiveScore = 3
     public enum Match<Handle>: Sendable where Handle: Sendable {
-        /// Exactly one window is this window.
         case matched(Handle, reason: String)
-        /// The app is alive but nothing there is the window that was looked at.
         case gone
-        /// Two or more candidates are equally plausible. Refusing is the whole
-        /// point: acting on a coin-flip between two windows of the same app is
-        /// the bug this identity exists to prevent.
+        /// Equal candidates must refuse; a coin flip could act on another document.
         case ambiguous(String)
     }
-    /// Pick the candidate that IS this window.
-    ///
-    /// - a single candidate that survives the hard filters is the window (an
-    ///   app with one window cannot be acted on in the "wrong" one, and its
-    ///   title changing is ordinary — a dirty marker, a tab switch);
-    /// - otherwise a decisive signal (matching title, or matching rect) is
-    ///   required, and the best score must be strictly better than the runner-up.
+    /// A sole candidate surviving hard filters tolerates retitles; multiple candidates require a title/rect hit and a score strictly above the runner-up.
     public static func match<Handle: Sendable>(
         _ identity: MacAXWindowIdentity,
         among candidates: [(handle: Handle, identity: MacAXWindowIdentity)]
@@ -308,11 +254,7 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         }
         guard !scored.isEmpty else { return .gone }
         if scored.count == 1 {
-            // Exactly one window can still be this one. Either the app has only
-            // that window (and a title that moved is ordinary — a dirty marker,
-            // a tab switch), or every other window contradicted itself out of
-            // the running above. Refusing here would refuse every act after a
-            // retitle, which is most of them.
+            // A sole surviving candidate tolerates ordinary retitles; other windows already failed the hard identity filters.
             return .matched(
                 scored[0].handle,
                 reason: candidates.count == 1 ? "sole_window" : "only_surviving_candidate"
@@ -335,8 +277,7 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
             "role": .string(role),
         ]
         if let subrole { object["subrole"] = .string(subrole) }
-        // The TITLE is window text and rides every sink this result rides, so
-        // it leaves redacted like every other text channel.
+        // Window titles cross every result sink, so redact them like other text.
         if let title {
             object["title"] = MacScreenViewTextRedaction.redactedLegendString(
                 title,
@@ -355,8 +296,7 @@ package struct MacAXNativeWindowIdentity: @unchecked Sendable, Equatable {
     package static func == (lhs: Self, rhs: Self) -> Bool { CFEqual(lhs.element, rhs.element) }
 }
 #endif
-/// One of an app's windows, as the READ seam sees it: the source's own element
-/// handle plus the identity that survives the handle.
+/// Window identity must survive read-source handles.
 public struct MacAXWindowHandle: Sendable {
     public let ref: MacAXElementRef
     public let identity: MacAXWindowIdentity
@@ -365,11 +305,9 @@ public struct MacAXWindowHandle: Sendable {
         self.identity = identity
     }
 }
-/// Hard bounds. A pathological app (Xcode, a huge web view) exposes tens of
-/// thousands of AX elements; an unbounded read would flood the turn. The
-/// `hard*` values are ceilings the caller CANNOT raise — `init` clamps.
+/// Hard ceilings prevent pathological AX trees from flooding the turn; callers may lower but never raise them.
 public struct MacAXLimits: Sendable, Equatable {
-    @TaskLocal public static var readDeadline: Date?
+
     static let readSeconds: TimeInterval = 5
     public static let hardMaxNodes = 400
     public static let hardMaxDepth = 12
@@ -390,10 +328,7 @@ public struct MacAXLimits: Sendable, Equatable {
         self.valueChars = max(1, min(valueChars, MacAXLimits.hardValueChars))
         self.maxMatches = max(1, min(maxMatches, MacAXLimits.hardMaxMatches))
     }
-    /// The deeper budget for a web page the ordinary walk had to cut: pages
-    /// nest controls under hundreds of unnamed groups (Claude's simulator
-    /// toolbar sits past 12 levels and 400 nodes). Same bound the name seek
-    /// uses. Only the page-first walk takes it, and only after a cut.
+    /// Web controls can sit beyond ordinary depth/node caps; only a size-cut page walk earns this deeper bounded budget.
     public static let deepPageMaxNodes = 1_200
     public static let deepPageMaxDepth = 64
     public static let deepPage: MacAXLimits = {
@@ -402,8 +337,7 @@ public struct MacAXLimits: Sendable, Equatable {
         limits.maxDepth = deepPageMaxDepth
         return limits
     }()
-    /// Bounded by its deadline alone: the desktop picture shows a window's own
-    /// pixels only when every element of it was seen, so no count may cut it.
+    /// Bounded by its deadline alone: the desktop picture shows a window's own pixels only when every element of it was seen, so no count may cut it.
     public static let whole: MacAXLimits = {
         var limits = MacAXLimits()
         limits.maxNodes = .max
@@ -417,22 +351,14 @@ public struct MacAXLimits: Sendable, Equatable {
         return limits
     }()
 }
-/// Result of a bounded walk. Truncation is REPORTED, never silent.
-///
-/// `skippedAtLeast` is a floor, not a total: when the node cap is reached the
-/// walker stops enumerating children of unvisited elements, so the true count
-/// of unseen elements is ≥ this number. The field name says so on purpose —
-/// claiming an exact count would require the unbounded walk the caps exist to
-/// prevent.
+/// Report truncation. skippedAtLeast is a floor because capped walks never enumerate every unseen descendant; an exact count would require an unbounded walk.
 public struct MacAXTreeSnapshot: Sendable, Equatable {
     public let nodes: [MacAXNode]
     public let truncated: Bool
-    /// Sorted, stable reason slugs: `depth_cap`, `node_cap`, `unreadable_element`.
     public let truncationReasons: [String]
     public let skippedAtLeast: Int
     public let readFailures: [String]
-    /// Derived from this snapshot's elements, never a second error ledger.
-    /// Counts describe only the elements actually read, not unseen branches.
+    /// Derived from this snapshot's elements, never a second error ledger. Counts describe only the elements actually read, not unseen branches.
     var readGapsJSON: [String: JSONValue] {
         let errors = nodes.compactMap { $0.attributes.actionsUnreadable }
         let attributeErrors = nodes.flatMap { $0.attributes.attributeGaps }
@@ -441,9 +367,8 @@ public struct MacAXTreeSnapshot: Sendable, Equatable {
                 "attribute_gaps_count": .int(Int64(attributeErrors.count)),
                 "attribute_gaps_first_error": attributeErrors.first.map(JSONValue.string) ?? .null]
     }
-    /// Menus may also appear in the window walk. Count native identities once,
-    /// using the later menu observation for an overlap; never equate their
-    /// private menu paths with window-relative paths.
+    /// Menus may also appear in the window walk. Count native identities once, using the later menu observation for an overlap; never equate their private menu
+    /// paths with window-relative paths.
     func readGapsJSON(including additionalNodes: [MacAXNode], source: any MacAXElementSource) -> [String: JSONValue] {
         var combined = nodes
         for node in additionalNodes {
@@ -497,25 +422,13 @@ public struct MacAXMatch: Sendable, Equatable {
         self.score = score
     }
 }
-/// Opaque handle into a `MacAXElementSource`. The source owns the mapping to
-/// whatever it really is (an `AXUIElement` in production, an array index in
-/// tests); nothing outside the source may interpret `id`.
+/// Element IDs are opaque; only their source may interpret them.
 public struct MacAXElementRef: Sendable, Hashable {
     public let id: Int
     public init(id: Int) { self.id = id }
 }
-/// The canonical public-AX window inventory. `AXWindows` is ordinarily the
-/// complete ordered list, but Finder can omit a focused `AXSheet` from it.
-/// Keep the listed order, then append the focused and main windows only when
-/// they are not already present. The live sources supply `CFEqual`, rather
-/// than handle equality: AX returns fresh element references for one live
-/// window, and those references still compare equal by CF identity.
-///
-/// This generic seam deliberately has no AX dependency so the exact
-/// focused-sheet case is hermetically executable in tests. Both the reader and
-/// actuator call it with the same order and equality relation; an identity
-/// captured from a sheet therefore has a matching ACT candidate for that sheet
-/// rather than falling through to its document-window parent.
+/// Finder can omit a focused sheet from AXWindows. Preserve listed order and append missing focused/main windows using CFEqual, since AX remints references.
+/// Reader and actuator share this inventory so a captured sheet cannot resolve to its document parent.
 enum MacAXWindowInventory {
     static func union<Element>(
         listed: [Element],
@@ -538,5 +451,3 @@ enum MacAXWindowInventory {
         return inventory
     }
 }
-/// Read-only element access. Every method is failure-tolerant by contract:
-/// an element that cannot be read returns nil / empty rather than throwing,

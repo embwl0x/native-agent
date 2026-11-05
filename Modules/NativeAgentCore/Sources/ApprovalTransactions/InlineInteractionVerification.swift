@@ -23,24 +23,17 @@ import ChatSessionWork
 import AgentConversations
 import ChatToolParsing
 import DreamREMCycle
-import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
-// Blueprint: | `InlineInteractionVerification.swift` | Real-world card completion verification; Mail cards and transcript projections read the integration-status owner's checked readiness |
+// Blueprint: | `InlineInteractionVerification.swift` | Canonical owners alone confirm completion. |
 extension InlineInteractionResolver {
-    //
-    // One rule, six kinds: ask the canonical owner, never the card, and never
-    // the transcript. Each of these re-reads live state AFTER the control
-    // closed, which is also what makes a cancelled sheet settle as "not done"
-    // instead of as success.
+    // Re-read canonical owners after controls close so cancellation cannot masquerade as success.
     enum Verification {
         case success(InlineInteraction.Outcome)
         case failure(String)
     }
-    /// Settle a waiting card ONLY if its owner now says it is done; otherwise
-    /// write nothing. For re-checks while the person is away in System
-    /// Settings: a grant still in progress must not fail the card under them.
+    /// Rechecks write only verified completion; a grant still in progress must not fail its card.
     @discardableResult
     public static func completeIfVerified(
         id: String,
@@ -50,8 +43,7 @@ extension InlineInteractionResolver {
     ) async -> Bool {
         let current: InlineInteraction
         do {
-            // No card remains for this local watch to settle. This retires
-            // only the watch; it records no successful effect or outcome.
+            // No card remains for this local watch to settle. This retires only the watch; it records no successful effect or outcome.
             guard let found = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else { return true }
             current = found
         } catch {
@@ -66,7 +58,7 @@ extension InlineInteractionResolver {
         ) else { return false }
         do {
             return try await finish(current, verification: .success(outcome), sessionID: sessionID,
-                                    dataRoot: dataRoot).state.outcome != nil
+                                    turn: nil, dataRoot: dataRoot).state.outcome != nil
         } catch let error as ResolveError {
             if case .staleRevision = error { return true }
             recordControlFailure(id, dataRoot: dataRoot, error: error)
@@ -76,12 +68,7 @@ extension InlineInteractionResolver {
             return false
         }
     }
-    /// READ SIDE ONLY. A card whose thing is already done — connected in the
-    /// sheet, on the Connectors page, by Agent, before a relaunch — draws as
-    /// the receipt its owner would give now. Nothing is written and nothing
-    /// resumes: the owner's live state is the answer, every read. Kinds that
-    /// need a pick (model, choose) are left to their own controls; Mail reads
-    /// the integration-status owner's evidence without starting a Mail check.
+    /// Project confirmed owner state without writing or resuming; choices stay with controls and Mail reads existing readiness.
     public static func liveProjection(
         _ interaction: InlineInteraction,
         dataRoot: URL
@@ -127,17 +114,16 @@ extension InlineInteractionResolver {
                 return .success(.init(selection: "chrome", summary: "Chrome connected"))
             }
             if interaction.target == "iphone" {
-                guard let count = await platform.pairedPhoneCount() else {
+                guard let standing = await platform.phoneStanding() else {
                     return .failure("Paired iPhone storage is unavailable. Restore access to the paired-phone store before checking setup again.")
                 }
-                guard count > 0 else {
-                    return .failure("No iPhone is paired yet: open NativeAgent on the iPhone, then choose Pair here when the codes match.")
+                // The card asks for a phone that can approve: its device key paired with the Pair button, not merely a phone that chats.
+                guard standing.canApprove else {
+                    return .failure(standing.line + " Open NativeAgent on the iPhone, then choose Pair here when the codes match.")
                 }
-                return .success(.init(selection: "iphone", summary: "iPhone paired"))
+                return .success(.init(selection: "iphone", summary: "iPhone can approve"))
             }
-            // Connectors' own derived auth state — the same field the
-            // Connectors page shows. A pasted-but-invalid token does not read
-            // as connected here, which is the point.
+            // Read derived connector auth state so a rejected saved token cannot count as connected.
             let target = InlineInteractionRegistry.canonicalConnectorID(interaction.target)
             let records: [InlineInteractionConnectorStatus]
             do { records = try await platform.connectorRecords(root: dataRoot) }
@@ -147,10 +133,7 @@ extension InlineInteractionResolver {
             }) else {
                 return .failure("\(interaction.title) isn't in Connectors on this Mac.")
             }
-            // Telegram's row says `configured` (a saved, enabled bot) rather
-            // than `connected`; with health ok that is its connected.
-            // Telegram's row says `configured` (a saved, enabled bot); its health is a
-            // separate reading that only a successful poll proves.
+            // Telegram configuration proves a saved enabled bot; only a successful poll proves health.
             guard record.authState == "connected"
                 || (target == "telegram" && record.authState == "configured" && record.healthStatus != "disabled")
             else {
@@ -163,15 +146,7 @@ extension InlineInteractionResolver {
                 summary: "\(InlineInteractionRegistry.connectorDisplayName(target, dataRoot: dataRoot)) connected"
             ))
         case .permission:
-            // EVERY capability in the chain, re-read from ITS OWN owner. A
-            // chain asked once must be granted once — a partial grant is not a
-            // settled card.
-            //
-            // Two owners, not one. MacIntegration capabilities live in the
-            // permission store; Trust's Mac Control categories live in
-            // `trust/policy.json` behind the posture gate, and before this a
-            // card for one of those could never settle because only the store
-            // was ever asked.
+            // Verify the entire chain against each capability's owner; integration axes and Trust categories have separate stores.
             let granted: [String: MacIntegrationPermission]
             if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
                 do { granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked() }
@@ -195,9 +170,7 @@ extension InlineInteractionResolver {
                 if !MacIntegrationID.all.contains(capability),
                    SystemPermissionPreflight.cardSettingsCapability(capability) != nil { continue }
                 let permission = granted[capability]
-                // Only the axis that was asked for. A read need settles on
-                // read; it does not wait for a write the card never requested,
-                // and it is not settled by a write alone.
+                // Only the requested axis can settle this need.
                 let mode = interaction.mode
                 let readOK = (permission?.read ?? false)
                 let writeOK = (permission?.write ?? false)
@@ -206,11 +179,7 @@ extension InlineInteractionResolver {
                 case .read: allowed = readOK
                 case .write: allowed = writeOK
                 case .readWrite, .none:
-                    // BOTH axes, because both is what the card said. A
-                    // `read_write` need asked for both, and a legacy need with
-                    // no mode is drawn as "covering reading and changing" and
-                    // granted on both axes — so one axis landing is a partial
-                    // grant, and a partial grant is not a settled card.
+                    // Both axes must land when the card promises reading and changing, including needs without a mode.
                     let promisedRead = MacIntegrationID.supportsRead(capability)
                     let promisedWrite = MacIntegrationID.supportsWrite(capability)
                     allowed = (!promisedRead || readOK) && (!promisedWrite || writeOK)
@@ -219,29 +188,20 @@ extension InlineInteractionResolver {
             }
             guard missing.isEmpty else {
                 let names = missing.map { InlineInteractionRegistry.macCapabilityDisplayName($0) }
-                // A launch-applied grant's probe can stay denied until the
-                // process restarts, so a denial does not prove the switch is off.
-                var seen: Set<SystemPermissionCapability> = []
-                let launchApplied = missing.compactMap(SystemPermissionPreflight.cardSettingsCapability).filter {
-                    SystemPermissionPreflight.appliesAtLaunch.contains($0) && seen.insert($0).inserted
-                }
+                // A launch-applied grant's probe can stay denied until the process restarts, so a denial does not prove the switch is off.
+                let launchApplied = SystemPermissionPreflight.launchPending(missing)
                 let restart = launchApplied.isEmpty ? "" : " If you turned "
                     + InlineInteractionRegistry.englishList(launchApplied.map(\.displayName))
-                    + " on, it takes effect only after I restart. Tell me to restart and I will, then Try again here."
+                    + " on, it takes effect after I restart: use Restart on this card."
                 return .failure(
                     "Still not allowed: \(InlineInteractionRegistry.englishList(names))." + restart
                 )
             }
-            // On in System Settings, but a grant macOS applies only at launch
-            // is not this process's until it restarts: the card does not
-            // settle on a probe that agrees too early.
+            // A launch-applied grant needs a restart even when its probe already agrees.
             let atLaunch = SystemPermissionPreflight.awaitingLaunch(interaction.allTargets)
             guard atLaunch.isEmpty else {
                 let names = InlineInteractionRegistry.englishList(atLaunch.map(\.displayName))
-                return .failure(
-                    "\(names) is on, and it takes effect only after I restart. "
-                    + "Tell me to restart and I will, then Try again here."
-                )
+                return .failure("\(names) is on, and it takes effect after I restart: use Restart on this card.")
             }
             if let blocked = await platform.cardBlockReason(interaction.allTargets, mode: interaction.mode) {
                 return .failure(blocked)
@@ -263,21 +223,15 @@ extension InlineInteractionResolver {
             }
             let model = qualified.modelID
             if resolvedScope == .thisRequestOnly {
-                // Nothing to read back: the binding IS the resolution, and it
-                // is applied to the resumed request rather than stored. It is
-                // verified by construction — a model was named, and this turn
-                // will run on it.
+                // Request-only binding is verified by construction because the resumed turn carries the named model.
                 return .success(.init(
-                    // The QUALIFIED id is carried, so the binding around the
-                    // resumed turn runs on the account the person picked.
+                    // Qualified identity preserves the account the person selected.
                     selection: picked,
                     summary: "Using \(model) for this one",
                     scope: .thisRequestOnly
                 ))
             }
-            // A permanent change was written by Providers' own group save.
-            // Read the routing snapshot back and confirm the group actually
-            // moved before the card claims it did.
+            // Confirm a permanent choice against Providers' saved routing snapshot before claiming it landed.
             let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
             let snapshot: ProviderRoutingSnapshot
             do { snapshot = try await router.checkedRoutingSnapshotReadOnly() }
@@ -297,8 +251,6 @@ extension InlineInteractionResolver {
                 scope: .persistent
             ))
         case .apiKey where interaction.secret != nil:
-            // The keyring's own answer: removed; or a value kept since this
-            // card was raised that may go everywhere asked.
             let name = String(interaction.target.dropFirst("secret:".count))
             let kept: Keyring.Entry?
             do { kept = try Keyring.entry(name) } catch {
@@ -315,10 +267,7 @@ extension InlineInteractionResolver {
             return .success(.init(selection: interaction.target,
                                   summary: "\(name) kept \u{00B7} for \(ask.line)" + (kept.account.map { " \u{00B7} account \($0)" } ?? "")))
         case .apiKey:
-            // The provider's own readiness, as Providers reports it. A key
-            // that was typed but rejected is not ready, and does not settle.
-            // A provider you sign into counts as connected through either
-            // door: the pasted key's own row, or the signed-in account's.
+            // Providers readiness, through key or sign-in, must confirm connection; rejected keys cannot settle.
             let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
             let doors = [target] + [InlineInteractionRegistry.providerSignIn(for: target)?.oauthProviderID]
                 .compactMap { $0 }

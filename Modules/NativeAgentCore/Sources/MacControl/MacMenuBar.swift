@@ -2,42 +2,30 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MacMenuBar.swift` | Checked menu reads retain element-scoped optional attribute gaps; press walks only the exact named branch under the shared AX budget, retaining sibling duplicate evidence; normalized resolution and occurrence selectors share discovery's command identity |
+// Blueprint: | `MacMenuBar.swift` | Scoped AX gaps; exact-branch press discovery retains siblings; normalized paths and choices share identity |
 
 public enum MacMenuBar {
-    /// Named levels returned by a listing.
     public static let maxPathDepth = 3
-    /// Named levels searched by find and press.
     public static let findPathDepth = 5
-    /// Items returned per top-level menu; hitting a bound marks the read truncated.
+    /// Hitting a presentation bound must mark the read truncated.
     public static let maxItems = 160
-    /// Children considered per menu, including unnamed AX wrappers.
+    /// Unnamed AX wrappers still consume the child budget.
     public static let maxChildrenPerMenu = 60
-    /// Characters of one item's title. Menu titles are short by design; a
-    /// longer one is a document name that wandered into a Window menu.
+    /// Bound anomalously long titles such as document names in the Window menu.
     public static let maxTitleChars = 80
-    /// A path's allowance: every title whole, and the " › " between them.
+    /// Allow whole titles plus separators so budgeting cannot truncate an address.
     public static func pathChars(_ depth: Int) -> Int { maxTitleChars * depth + 3 * (depth - 1) }
 
-    /// The separators a person or a model might type between levels. `›` is
-    /// what this organ PRINTS; the rest are accepted because refusing a path
-    /// over a character is a refusal about typography, not about the app.
+    /// Accept common separators so typography cannot prevent menu addressing.
     public static let separators: [String] = ["›", "»", "->", "→", ">", "/", "|"]
 
-    /// One addressable menu path.
     public struct Item: Sendable, Equatable {
-        /// The named levels, outermost first: ["File", "Export", "PDF…"].
         public let titlePath: [String]
-        /// The child-index chain from the AXMenuBar element. This is the ACT
-        /// address and it never leaves this module — it is bookkeeping, and the
-        /// four-verb wall exists so bookkeeping does not reach the model.
+        /// Child-index addresses stay private; the model names paths rather than AX bookkeeping.
         public let path: [Int]
         public let enabled: Bool?
-        /// True when this item OPENS something rather than doing something. It
-        /// is still returned (a model that cannot see "Export" cannot ask for
-        /// "Export › PDF"), and pressing it is still a legitimate act.
+        /// Submenu openers remain actionable so callers can discover and enter deeper paths.
         public let hasSubmenu: Bool
-        /// Identifier and key equivalent, when the item publishes them.
         public let commandKey: String?
         public let attributeGaps: [String]
 
@@ -57,18 +45,15 @@ public enum MacMenuBar {
             self.attributeGaps = attributeGaps
         }
 
-        /// How this organ PRINTS a path.
         public var display: String { titlePath.joined(separator: " › ") }
     }
 
     public struct Reading: Sendable, Equatable {
         public let items: [Item]
-        /// True when a bound cut the walk. Reported so a model can tell "this
-        /// app has no Export" apart from "I stopped counting".
+        /// Truncation distinguishes an absent command from an incomplete search.
         public let truncated: Bool
-        /// Set when there is no menu bar to read at all.
         public let unavailable: String?
-        /// Includes unnamed wrappers and items whose names could not be read.
+        /// Unseen names still count toward the bounded walk.
         public let attributeGaps: [String]
 
         public init(items: [Item], truncated: Bool, unavailable: String? = nil, attributeGaps: [String] = []) {
@@ -81,31 +66,20 @@ public enum MacMenuBar {
 
     // MARK: - The walk
 
-    /// ONE bounded, read-only descent of the app's menu bar. Nothing is
-    /// pressed, nothing is opened, no attribute is written.
-    ///
-    /// Structure, which is fixed across every Cocoa and Electron app:
-    ///   AXMenuBar → AXMenuBarItem "File" → AXMenu → AXMenuItem "Export"
-    ///                                             → AXMenu → AXMenuItem "PDF…"
-    /// The AXMenu wrappers carry no name, so they cost a level of TREE depth
-    /// but not a level of NAMED depth — which is why the cap is expressed in
-    /// named levels: it is the thing a person counts when they say
-    /// "File › Export › PDF".
-    ///
-    /// `top` restricts the walk to top-level names containing it;
-    /// `until` stops at the first item it accepts. `matchingPath` restricts
-    /// descent to exact named levels, retaining siblings for duplicate checks.
+    /// AXMenu wrappers consume tree depth but not named depth; bound the levels a person can address. Exact-path descent retains siblings so duplicate checks
+    /// remain complete.
     public static func read(
         source: any MacAXElementSource,
         pid: Int32,
         top: String? = nil,
         until stop: ((Item) -> Bool)? = nil,
         matchingPath: [String]? = nil,
-        depth: Int = maxPathDepth
+        depth: Int = maxPathDepth,
+        context: MacOperationContext
     ) -> Reading {
         do {
-            return try MacAccessibilityReader.withReadBudget {
-                try readChecked(source: source, pid: pid, top: top, until: stop, matchingPath: matchingPath, depth: depth)
+            return try MacAccessibilityReader.withReadBudget(context: context) { context in
+                try readChecked(source: source, pid: pid, top: top, until: stop, matchingPath: matchingPath, depth: depth, context: context)
             }
         } catch {
             return Reading(items: [], truncated: true, unavailable: error.localizedDescription)
@@ -113,14 +87,14 @@ public enum MacMenuBar {
     }
 
     private static func readChecked(source: any MacAXElementSource, pid: Int32, top: String?,
-                                    until stop: ((Item) -> Bool)?, matchingPath: [String]?, depth: Int) throws -> Reading {
+                                    until stop: ((Item) -> Bool)?, matchingPath: [String]?, depth: Int, context: MacOperationContext) throws -> Reading {
         guard pid != getpid() else {
             return Reading(items: [], truncated: false, unavailable: "self_process")
         }
         guard source.isTrusted() else {
             return Reading(items: [], truncated: false, unavailable: "accessibility_not_trusted")
         }
-        guard let root = source.menuBarRoot(pid: pid) else {
+        guard let root = source.menuBarRoot(pid: pid, context: context) else {
             return Reading(items: [], truncated: false, unavailable: "no_menu_bar")
         }
         var items: [Item] = []
@@ -141,18 +115,16 @@ public enum MacMenuBar {
 
         func checkDeadline() throws {
             try Task.checkCancellation()
-            if MacAXLimits.readDeadline.map({ Date() >= $0 }) == true {
+            if context.readDeadline.map({ Date() >= $0 }) == true {
                 throw MacAccessibilityReader.NativeReadFailure(detail: "Menu reading exhausted the shared AX time budget; menu coverage is incomplete.")
             }
         }
         func children(_ element: MacAXElementRef) throws -> [MacAXElementRef] {
             try checkDeadline()
-            let total = try source.checkedChildCount(of: element)
-            // A press spends the shared node budget on its branch, not the
-            // listing's 60-child/160-item presentation caps. Read its siblings
-            // too: an unseen duplicate cannot establish uniqueness.
+            let total = try source.checkedChildCount(of: element, context: context)
+            // Presses use the shared node budget rather than listing caps; unread siblings cannot establish uniqueness.
             let limit = min(total, wantedPath == nil ? maxChildrenPerMenu : max(0, maxNodes - nodeCount))
-            let children = try source.checkedChildren(of: element, limit: limit)
+            let children = try source.checkedChildren(of: element, limit: limit, context: context)
             guard children.count == limit else {
                 throw MacAccessibilityReader.NativeReadFailure(detail: "Menu child read was incomplete.")
             }
@@ -161,7 +133,7 @@ public enum MacMenuBar {
         }
         func attributes(_ element: MacAXElementRef, path: [Int]) throws -> MacAXAttributes {
             try checkDeadline()
-            let attributes = try source.checkedAttributes(of: element)
+            let attributes = try source.checkedAttributes(of: element, context: context)
             for gap in attributes.attributeGaps {
                 attributeGaps.append("\(path): \(gap)")
             }
@@ -199,12 +171,10 @@ public enum MacMenuBar {
                 case "AXMenuBarItem", "AXMenuItem":
                     guard !observed.labelUnreadable else { continue }
                     let title = cleanTitle(observed.title ?? observed.value)
-                    // A separator publishes no title. It is furniture, not an
-                    // address; skipping it is not hiding anything.
+                    // Untitled separators are furniture rather than hidden addresses.
                     guard let title, !title.isEmpty else { continue }
                     if titles.isEmpty {
-                        // A new top-level menu: its own budget, and only the
-                        // named one when a path said which.
+                        // Each top-level menu gets its own budget; explicit paths restrict it to the named branch.
                         if let wantedTop, !normalized(title).contains(wantedTop) { continue }
                         inMenu = 0
                     }
@@ -213,11 +183,7 @@ public enum MacMenuBar {
                         guard names.count <= wantedPath.count,
                               names.map(normalized) == Array(wantedPath.prefix(names.count)) else { continue }
                     }
-                    // Does it OPEN something? The AXMenu child is the answer,
-                    // and asking costs one ranged child read. Its real OFFSET
-                    // is recorded, never assumed to be 0 — the act address is
-                    // a child-index chain and an assumed index is a wrong-press
-                    // waiting to happen in the one app that orders it otherwise.
+                    // Record the AXMenu child’s actual offset; assuming zero could press a different item.
                     var submenu: (offset: Int, element: MacAXElementRef)?
                     for (offset, candidate) in try children(child).enumerated() {
                         guard nodeCount < maxNodes else { truncated = true; break }
@@ -239,15 +205,12 @@ public enum MacMenuBar {
                         break
                     }
                     if wantedPath?.count == names.count {
-                        // The target and its same-level siblings are the whole
-                        // required scope; its descendants cannot change it.
+                        // Target and same-level siblings establish identity; descendants cannot change it.
                         continue
                     } else if let submenu, names.count < namedDepth {
                         pending.append((submenu.element, names, indexPath + [submenu.offset]))
                     } else if submenu != nil {
-                        // The cap stopped the descent, and saying so is the
-                        // difference between "this app has no PDF export" and
-                        // "I did not look that deep".
+                        // Report depth truncation so incomplete walks cannot claim a command is absent.
                         truncated = true
                     }
                 default:
@@ -268,19 +231,15 @@ public enum MacMenuBar {
 
     public enum Resolution: Sendable, Equatable {
         case matched(Item)
-        /// Nothing answers to that path. `nearest` is what the menu bar DOES
-        /// offer at the same depth, so a refusal teaches instead of stonewalls.
+        /// Misses offer observed same-depth alternatives so the caller can repair the path.
         case notFound(nearest: [String])
         case ambiguous(candidates: [String])
-        /// It is right there, and the app has it switched off. A different fact
-        /// from "not found", and the only one that stops a re-try loop.
+        /// Disabled commands differ from absent ones; report them to prevent futile retries.
         case disabled(Item)
         case unavailable(Item)
     }
 
-    /// Split a spoken path on any accepted separator.
-    /// "/" and "|" separate levels only when no ›, », → or > is used, so
-    /// "Edit › Find/Replace" keeps its item whole.
+    /// Slash and pipe split only without explicit arrow separators, preserving names such as "Find/Replace".
     public static func components(_ raw: String) -> [String] {
         var working = raw
         let used = isPath(raw) ? separators.filter { $0 != "/" && $0 != "|" } : separators
@@ -293,16 +252,14 @@ public enum MacMenuBar {
             .filter { !$0.isEmpty }
     }
 
-    /// Written as a menu path: a ›, », → or > between levels ("/" alone is
-    /// a name, "Find/Replace").
+    /// Slash alone may be a literal item name rather than an explicit menu path.
     public static func isPath(_ raw: String) -> Bool {
         raw.contains(where: { "›»→>".contains($0) })
     }
 
     private static let occurrenceNames = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth"]
 
-    /// An explicit occurrence is part of a displayed choice, never a cached
-    /// AX address. Resolve it again against this call's current menu order.
+    /// Displayed occurrences are choices, not cached AX addresses; resolve against current order.
     static func selection(_ raw: String) -> (path: String, occurrence: Int?) {
         let raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard raw.hasSuffix("]"), let suffix = raw.range(of: " [", options: .backwards) else { return (raw, nil) }
@@ -319,15 +276,8 @@ public enum MacMenuBar {
         return item.display + " [" + (index < occurrenceNames.count ? occurrenceNames[index] : "item \(index + 1)") + "]"
     }
 
-    /// Resolve a spoken path against one reading.
-    ///
-    /// Execution requires every normalized title component exactly. Partial
-    /// names remain discovery suggestions, never a different command to press.
-    /// One full named path is one command when the duplicates are published
-    /// commands (each has an identifier or key equivalent: Safari's ⌘W and
-    /// ⇧⌘W "Close Window"), or exactly one is enabled, or a supplied chord picks
-    /// one. Duplicates that publish nothing (two windows titled alike under
-    /// Window) stay an answer, never a guess.
+    /// Execution requires exact normalized components; partial names are discovery only. Published identity, one enabled copy or a supplied chord may resolve
+    /// duplicates; unpublished duplicates remain choices.
     static func uniqueCommands(_ items: [Item], prefer: (Item) -> Bool = { _ in false }) -> [Item] {
         var order: [[String]] = [], groups: [[String]: [Item]] = [:]
         for item in items {
@@ -341,8 +291,7 @@ public enum MacMenuBar {
             let available = enabled.isEmpty ? group : enabled
             let preferred = available.filter(prefer)
             let choices = preferred.isEmpty ? available : preferred
-            // Rank enabled and supplied-chord copies before collapsing a
-            // published command. Unpublished copies remain addressable choices.
+            // Rank enabled and chord-matching commands before collapsing duplicates; unpublished copies stay distinct.
             if choices.count == 1 || choices.allSatisfy({ $0.commandKey != nil }) {
                 return Array(choices.prefix(1))
             }
@@ -351,10 +300,7 @@ public enum MacMenuBar {
     }
 
     public static func resolve(_ raw: String, among items: [Item], prefer: (Item) -> Bool = { _ in false }) -> Resolution {
-        // BOTH SIDES are normalized, and that is not a detail: a menu title
-        // carries a trailing ellipsis ("Export…") that a person never types,
-        // and normalizing only the menu's side means the exact path this organ
-        // PRINTS does not resolve when it is handed straight back.
+        // Normalize both sides so printed paths with ellipses can be passed back unchanged.
         let selected = selection(raw)
         let wanted = components(selected.path).map(normalized)
         guard !wanted.isEmpty else { return .notFound(nearest: topLevelNames(items)) }
@@ -380,8 +326,7 @@ public enum MacMenuBar {
         return .notFound(nearest: nearest(to: wanted, among: items))
     }
 
-    /// Menu titles carry trailing ellipses ("Export…") and surrounding space;
-    /// a person says "Export". Neither is part of the name.
+    /// Ellipses and surrounding space are presentation rather than the spoken command name.
     static func normalized(_ text: String) -> String {
         text.lowercased()
             .replacingOccurrences(of: "…", with: "")
@@ -393,16 +338,14 @@ public enum MacMenuBar {
         items.filter { $0.titlePath.count == 1 }.map(\.display)
     }
 
-    /// What the menu bar offers at the depth she asked about, so a "not found"
-    /// carries the alternatives rather than a dead end.
+    /// Observed alternatives make missing paths recoverable.
     static func nearest(to wanted: [String], among items: [Item], limit: Int = 10) -> [String] {
         let sameDepth = items.filter { $0.titlePath.count == wanted.count }
         let pool = sameDepth.isEmpty ? items.filter { $0.titlePath.count == 1 } : sameDepth
         guard let head = wanted.first.map(normalized) else {
             return Array(pool.prefix(limit).map(\.display))
         }
-        // Prefer the ones whose FIRST level she got right — "File › Exprt"
-        // should come back with File's items, not with the whole menu bar.
+        // Prefer the correctly named first level so one typo does not return the whole menu bar.
         let sameBranch = pool.filter { normalized($0.titlePath.first ?? "").hasPrefix(head) }
         let chosen = sameBranch.isEmpty ? pool : sameBranch
         return Array(chosen.prefix(limit).map(\.display))
@@ -410,7 +353,6 @@ public enum MacMenuBar {
 
     // MARK: - Words and JSON
 
-    /// The refusal, in words. Every branch names the state and the next move.
     public static func words(for resolution: Resolution, requested raw: String) -> String? {
         func safe(_ title: String) -> String {
             if case .string(let text) = MacScreenViewTextRedaction.redactedLegendString(
@@ -439,11 +381,7 @@ public enum MacMenuBar {
         }
     }
 
-    /// The read's payload. Titles go through the same shape redactor every
-    /// other perception organ uses: a Window menu lists open document names,
-    /// and a document can be called anything.
-    /// `statesKnown` false (the app is not in front): enabled states are not
-    /// claimed — a background app's menus report stale ones.
+    /// Redact titles because document names may hold secrets; background enabled states are stale and cannot be claimed.
     public static func json(_ reading: Reading, statesKnown: Bool = true, depth: Int = maxPathDepth) -> JSONValue {
         var out: [String: JSONValue] = [
             "count": .int(Int64(reading.items.count)),

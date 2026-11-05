@@ -2,12 +2,6 @@
 
 Selected stores and their source owners; this is not a complete inventory.
 
-Current Workshop policy and inbox writers use `workshopPolicy`,
-`related_execution_id` and `executionId` on both devices. Retained old snapshots
-and inbox records still require their checked Mission-key readers; those are
-data conversion obligations, not a mixed-device compatibility contract. Only
-current `NATIVE_AGENT_*EXECUTION*` environment controls select execution limits.
-
 Model-catalog and dream-theme caches, memory repair/backfill receipts,
 desktop-chat identities, pending welcomes, named-run Stop markers, gRPC
 descriptors, abandoned-turn cursors, recovered builder inboxes and widget status
@@ -66,7 +60,6 @@ Paths below are relative to `<dataRoot>` unless stated otherwise.
 
 | Path | Purpose / source owner |
 |---|---|
-| `living_fabric/procedures/` | `Procedures/ProcedureArtifactStore.swift` owns immutable artifacts, invocation receipts, exact activation manifests and active pointers. [Admission and declaration contract](#procedure-artifacts). Off-disk backup only; excluded from local backup, production export and phone sync. |
 | `ui/layout.json`, `ui/layout.previous.json` | `AgentWorkspace/SurfaceLayoutStore.swift` owns the layout and replaced bytes. Every document write, including restoring previous content, checks the caller's current version token after refreshing inside the writer lock; matching previous content never bypasses that check. A failed layout read publishes unavailable with its file path and repair instruction, never a cached layout or in-memory seed. Mac content remains reachable from the shipped surface vocabulary alongside that repair, under shipped profile visibility and the independent Helpers switch; no substitute layout or editable fold state is supplied. The app page index, find and parts ranking use the shipped page set independently of layout. The phone renders the checked availability; `ui_layout.json` carries `SurfaceLayoutAvailability`, including the owner's failure. Only checked file absence permits first creation. |
 | `workspace_desktops/<scope-sha256>.json` | `AgentWorkspace/AgentWorkspaceDesktopStore.swift` reads and writes one version-2 desktop shape. `path`, `drafts`, `observations`, `keptPlaces`, `focusedWork` and `placeActions` are required; nested saved desktops require `path`, `keptPlaces`, `focusedWork` and `placeActions`. References and notes the writer omits remain optional. Missing/malformed structural fields fail the read and prevent replacement of existing bytes. `AgentWorkspaceDesktopNavigation.swift` restores the validated saved Back path (up to eight positions) unchanged; only an explicitly empty path opens the saved current place with Home. |
 | `notifications/publications/<eventId>.json` | `DeviceSync/MacSyncMobileNotificationRelay.swift` owns immutable notification title/body/userInfo/timestamp retained before transport under a per-event lock. Retries reuse it, including after restart; unreadable or conflicting content stays preserved and fails through `ToolFailureError`. Covered by the notifications privacy scope, excluded from local backup/export; only the signed wire envelope goes to the phone. |
@@ -75,8 +68,9 @@ Paths below are relative to `<dataRoot>` unless stated otherwise.
 | `life-id` | `PersistenceCore/DataRootLife.swift` owns the data root's life through the durable writer and exclusive first-life link; written once when absent, replaced by the restore intent's new identity, retained in backup metadata |
 | `.onboarded` | Onboarding's durable completion evidence; pending completion/reset still blocks admission. Carried by local/off-disk backup and production export with identity data, never raw phone sync. Restore installs the captured marker; a snapshot without it leaves the live marker unchanged and never creates one from missing evidence. |
 | `chat/proactive_speech.json` | `ChatTurnRuntime/ProactiveAssistantSpeech.swift` owns claims and hourly quota. Only an absent store starts empty; existing root, caller, key, timestamp and destination fields must decode before a write. Damaged bytes are preserved and posting throws a storage error. Legacy missing destinations remain eligible for transcript reconciliation. |
-| `chat/messages/<sessionId>.jsonl` | Per-session transcript; `Transcripts/TranscriptRows.swift` (`ContactThread`) owns byte mutations and checked seek/read slices; `ChatSessionWork/SentTurnContext.swift` stores exact user-leading context in row metadata ([contract](conversation-context-history.md)); `ChatSessionWork/ChatSessionAutocompactor.swift` selects compaction rows. Displayed messages require their saved id, role, content and createdAt; damaged rows cannot acquire invented identity or time. Opening/last-turn scans and context statistics report unreadable sources rather than certifying older or empty history |
-| `chat/index/history.sqlite` | Derived history projections owned by `ChatToolRuntime/ChatHistoryIndex.swift`; SQLite retains cold rows/receipts, reads materialize the requested transcript, and manifest replacement changes only added/departed references and reclaims departures. The launch catalog sweep reconciles missing files once. Projection semantics, rather than app builds, version rows; schema 2 migrates its manifest references once to schema 3. Excluded from backup, export and phone sync. |
+| `chat/messages/<sessionId>.jsonl` | Per-session transcript; `Transcripts/TranscriptRows.swift` (`ContactThread`) owns byte mutations and checked seek/read slices; `ChatSessionWork/SentTurnContext.swift` stores exact user-leading context in row metadata ([contract](conversation-context-history.md)); `ChatSessionWork/SessionHistoryTail.swift` selects replay without mutating transcript rows. Displayed messages require their saved id, role, content and createdAt; damaged rows cannot acquire invented identity or time. Opening/last-turn scans and context statistics report unreadable sources rather than certifying older or empty history |
+| `chat/index/history.sqlite` | Derived history projections owned by `ChatToolRuntime/ChatHistoryIndex.swift`; SQLite retains cold rows/receipts, reads materialize the requested transcript, and manifest replacement changes only added/departed references and reclaims departures. Each batch of at most 64 new rows holds one checked action catalog through nested receipt redaction, including lookup misses ([turn anatomy](ANATOMY_OF_A_TURN.md#2-the-user-message-becomes-durable)). The launch catalog sweep reconciles missing files once. Projection semantics, rather than app builds, version rows; schema 2 migrates its manifest references once to schema 3. Excluded from backup, export and phone sync. |
+| `chat/tool_results/<turn-hash>/<result-hash>.txt` | Exact overflowing provider-facing result bodies, written before the one-line file pointer is admitted; retained with chat. |
 | `chat/sessions/<sessionId>/scratch.json` | Session scratch JSON object; `Transcripts/ChatSessionScratch.swift` owns path, locked mutation and reads for Mac, Telegram and tools; only an absent file bootstraps empty, and an existing non-object refuses writes with its bytes preserved; off-disk backup only; no local backup/export/phone sync |
 | `backups/restore-receipt.json` | `TrustPersistence/TrustBackupRestore.swift` durably records the last completed restore and each unreadable piece, why it was omitted, and what was not kept; private local state, covered by the existing backups privacy category, outside backup scope and excluded from production export and phone sync |
 | `chat/mac_turn_lifecycle.json` | `ChatTurnRuntime/MacChatTurnLifecycleStore.swift` owns lifecycle evidence and pending requests; local backup captures this file before attachment bytes; requests retain their life and Resume starts stopped requests fresh |
@@ -84,7 +78,7 @@ Paths below are relative to `<dataRoot>` unless stated otherwise.
 | `memory/memory.sqlite` | MemoryV2 storage; `MemoryV2/MemoryV2+Storage.swift` |
 | `agents/a2a-receipts/outcomes.sqlite` | `Agents/AgentContactTaskReceipts.swift` keeps payload-bearing and compacted inbound contact/builder tasks in the existing `outcomes(key, receipt)` table. The finished per-reply JSON importer is removed after the old directory was verified empty against this store. Payload expiry updates the same row and excludes unresolved payload-recovery debt; launch recovery and owed callbacks read this store. Ordinary builder ingress writes here, retaining selected-session bindings for queued recovery; historical builder JSONL receipts remain readable where no canonical task exists. Covered by the agents privacy scope; no local backup, production export or raw phone sync. |
 | `expansion/record.json` | Each mind's practice at the door (phase 4): per mind (`self`, `helper:<id>`, `agent:<id>`), and authority (its own turns, or turns the same untrusted principals steered, kept apart), its field-free situations' last 8 next calls, including the first reads after `start woke:<kind>` (the call as written, never one carrying a `:secret` argument, with the paths each value flowed from, the gap before it and its run time) and per prediction its record (tries, hits, unknown, changes, delivered, prepared, withheld, the stem's own run times); `ChatTurnRuntime/Expansion.swift` writes it atomically off every call's path, one checked write at a time (changes made during a write go in the next). Failed saves retain unsaved practice as unavailable and owe the exact file's repair, without automatic retry; the [manifest](skill_manifest_spec.md#expansion-a-part-is-a-prediction) owns acknowledgement and closure. Record v3 folds retained v2 model-separated practices on load, keeping the newest bounded examples and pooling counters only for identical historical signatures; v2 backup records were still present in the 2026-11-01 read-only inventory, so this reader remains owed until explicit conversion. Only a missing file starts empty; an unsupported version remains unavailable with its bytes preserved. Local only; no phone sync. |
-| `memory/after_turn_surprise.jsonl` | Append-only record (version 3) of each turn's complete no-op prediction, whether it was deferred, and its label (what the judgment, live or batch, said per channel), keyed by agent, memory model and detector; `MemoryV2/AfterTurnSurpriseLedger.swift`. Numeric evidence and source IDs, no conversation/memory prose. Covered by the existing memory privacy scope; no raw phone sync. |
+| `memory/after_turn_surprise.jsonl` | Append-only record (version 3) of each turn's complete no-op prediction, whether it was deferred, and its label (what the judgment, live or batch, said per channel), keyed by agent, memory model and detector; `MemoryV2/AfterTurnSurpriseLedger.swift`. Precedent vectors are stored once per turn, on its prediction row; a recovery attempt that judged nothing adds no row. Numeric evidence and source IDs, no conversation/memory prose. Covered by the existing memory privacy scope; no raw phone sync. |
 | `<personaRoot>/USER.md` | MemoryV2's generated user-document projection when an explicit persona root is supplied; see below |
 | `telegram/config.json` | Telegram configuration; `TelegramBot/TelegramBot+Config.swift`; credentials use only `bot_token_keychain_ref`, voice size is a positive integer `voice_max_bytes`, and ProviderRouting alone owns model/effort. One locked status read separates checked metadata from the actual credential failure; disconnect reads metadata without resolving the credential and preserves allowlists, mention and voice settings. `ownerUserId` is the single owner identity used by sessions, restart, approvals, notifications and rhythm history. No plaintext import, retired allowlist parsing or monolithic-config cleanup runs on load |
 | `telegram/state.json` | `TelegramBot/TelegramPollLoop.readState` and `mutateState` own checked reads and locked mutations for polling and status consumers; only missing state starts empty; unreadable/non-object state is unavailable, names this path, and is preserved |
@@ -105,17 +99,25 @@ Paths below are relative to `<dataRoot>` unless stated otherwise.
 | `mind/rhythm.json` | Timestamp/door-only evidence for the person's day: 24 seven-day forgetting bins, 30 days of hourly first activities and starts, standing claims and once-per-kind/local-day break identities. `Cognition/NativeCognitionRuntime+Rhythm.swift` is the sole writer, using `CognitiveSubstrate/PersonRhythm.swift`; only absence cold-starts from indexed owner history, corrupt bytes remain intact with repair owed. [Rhythm](RHYTHM.md) owns the evidence and admission rules |
 | `mind/self.json` | Their existing dream's evidence-linked self-reading: at most five if-then traits, five story lines and 128 person lines, bounded to 256,000 bytes. `CognitiveSubstrate/CognitiveSelfKnowledge.swift` owns the schema and atomic durable write; the substrate is the sole writer/cache owner. Versioned by schema, committed diary source, write time and mind epoch. No persona or memory content is seeded here; corrupt bytes remain intact with repair owed, Clear removes the file and pre-Clear epochs cannot return. [Becoming](BECOMING.md) owns the material windows and turn admission |
 | `cognition/dream_themes.json` | Derived dream-theme cache (root, canonical embedding epoch, diary, stamp, phrases with vectors); `Cognition/NativeCognitionRuntime+Continuity.swift`; rebuildable, single-flight writer per root; old or mismatched caches rebuild, including equal-width model changes. Query vectors share the root/epoch key and use the canonical query embedding form. |
-| `cognition/caring_appraisals.jsonl` | One typed interpretation receipt, amended with what the body did; `Cognition/CaringReceiptLog.swift`; a projection of the lived moment's first fold, never read back into their mind; off-disk backup only |
+| `experiences/experiences.sqlite` | Caring appraisals, dosing responses and feedback reactions are immutable details of their turn; see below. |
 | `memory/moments_held.json` | Empty retired held-turn file left untouched; no reader or writer. The lived-moment journal owns all owed turns. |
 | `workflows/approvals/requests.json` | Approval records; `ApprovalInbox/ApprovalInbox.swift` |
 | `workflows/approvals/telegram-deliveries.json` | Telegram approval/inline prompt dispatch and returned-send receipts; `ApprovalTransactions/TelegramApprovalCoordinator.swift`. A dispatch without a returned receipt is unknown and cannot authorize a resend. Local approval backup/export scope; not a phone snapshot. |
 | `runs/runs.json` | Run ledger; `SwarmRuns/RunLedger.swift` |
 | `improvements/gauntlet/runs.json` | Bounded run array (latest 200); `AppToolRuntime/NativeRegistryEvaluation.swift` appends under the file lock. Only absence starts empty; an existing non-array root raises a schema error and preserves the file. |
-| `turn_traces/<yyyy-MM-dd>.jsonl` | Turn-correlated diagnostics; `TurnTrace/TurnTracePersistLane.swift` also owns standalone `traces/events.jsonl` receipts; `TurnTrace/TurnTraceRecentReader.swift` projects both feeds as recorded through `traceEvidence`, without duplicate inference or field merging. |
+| `turn_traces/<yyyy-MM-dd>.jsonl`, `traces/events.jsonl` | Retired: turn events and standalone receipts are details in the record (`experiences/experiences.sqlite`, [Storage](EXPERIENCE.md#storage)), written by `TurnTrace/TurnTracePersistLane.swift` and read through it. Existing files are untouched and no code reads or writes them; `~/.claude`-side tooling may import their last two weeks once. |
 | `ability_fetches/<uuid>.json` | `ToolExecution/ToolExecution+RunSandbox.swift` saves each admitted modifying fetch's (any method but GET/HEAD) complete redacted transport receipt once, after actual exit; a read keeps no receipt or experience and is safe to repeat. Excluded from off-disk backup. Its `fetch:<uuid>` experience references this file and owns the `finish` obligation; caller expiry/Stop/run close never removes the request or its late result. Missing/unreadable receipts are unavailable evidence requiring service reconciliation, never automatic replay. No age-based cleanup is currently applied. |
 | `turn_traces/practice/<agent>.json`, `turn_traces/practice/<agent>.tape.jsonl` | Retired nightly candidate ledger and nominated-call tape ([Habits H4](HABITS.md#h4--one-crystallizer)); no live reader or writer. Existing files are untouched and remain under turn-trace privacy exclusions (no backup, archive input or phone sync). Existing abilities' embedded tape fixtures stay with the ability owner and its replay/admission checks. |
 
 Source paths above are under `Modules/NativeAgentCore/Sources/`.
+
+`Cognition/CaringReceiptLog.swift` writes `caring.appraisal` and the body's later
+`caring.dosing` response. `ChatSessionWork/OutcomeFeedbackStore.swift` writes and
+reads transcript-anchored `feedback.reaction` details. The experience record owns
+their two-week horizon. Its strictest detail scope excludes the whole record
+from local/off-disk backup, export and raw phone sync. Retired trail files stay
+untouched. The inbox, its archive shelf and the delivery ledger are readings of the experiences addressed to them
+(`Experiences/ForPerson.swift`); their old files are converted once offline and leave the data root.
 
 Proactive claims, transcript reconciliation and append share the claim-store
 lock. A duplicate result requires the exact assistant row at the recorded
@@ -194,39 +196,6 @@ so a returning thread can resolve its retained conversation.
 Use [Data bounds](data-bounds.md) for retention and
 [Runtime storage limits](runtime-storage-limits.md) for disposable diagnostics.
 
-## Procedure artifacts
-
-Installation and discovery share one 1,024-artifact ceiling and the same
-checked listing of nonhidden `artifacts/*.json`. Installation holds the
-invocation-ledger reference lock, then the artifact lock, through count and
-publication. A new identity at capacity is refused with
-`artifact_capacity_exceeded`; reinstalling an identical artifact at the ceiling
-adds no slot. An already over-capacity store refuses installation and discovery.
-A missing directory is empty; a failed listing is `corrupt_artifact`, never
-spare capacity. Retention preserves active and recently invoked artifacts and
-cannot promise to make room when all artifacts are protected.
-
-Only the canonical domain executor dispatches procedure work. Replay reports
-`matched`, `abstained` or `refused`, with the actual reason and matched-step
-count; dry run reports eligibility or refusal with its reason. An ineligible
-invocation records no dispatch. Artifacts, activation manifests and invocation
-receipts declare no fallback route or rollback mechanism. Current schemas are
-`declarative-procedure-transition-table.v3`,
-`procedure-exact-activation-manifest.v2` and
-`declarative-procedure-invocation.v2`; validation admits only those schemas.
-Artifact identities bind the current encoded semantic fields; activation
-proposals bind that exact artifact identity. A retained artifact/approval must
-be explicitly accounted for before changing that binding. The 2026-11-01
-read-only inventory of Application Support and the main checkout's data root
-found no artifacts, invocation ledger, activation manifests or active pointers;
-only their zero-byte `migrations/legacy-revalidation-v1.done` markers remained,
-untouched. No conversion, approval invalidation or retained-format reader was
-needed for this declaration removal.
-
-Trajectory extraction reports `missing_metadata` for missing, malformed or
-inconsistent contract metadata; there is no separate `inconsistent_contract`
-outcome.
-
 ## Restore law
 
 **A restore brings back what they had, never what they was doing.** Every
@@ -265,8 +234,8 @@ their per-file writer locks and each SQLite database uses a read-only online
 backup; chat scopes share the session-index lock and take per-file locks.
 Make uses its directory lock. Ordinary scopes, including persona, Trust,
 abilities, workflows and connectors, use filesystem copies without a shared
-writer lock; workshop and senses filter their top-level children, then copy
-nested directories directly. Files in those scopes may reflect different
+writer lock; senses filters its top-level children, then copies nested
+directories directly. Files in those scopes may reflect different
 instants. Hashes prove the staged bytes, not cross-scope atomicity. Integrity,
 link and SQLite-conversion inventories throw traversal errors rather than
 returning a successful prefix.

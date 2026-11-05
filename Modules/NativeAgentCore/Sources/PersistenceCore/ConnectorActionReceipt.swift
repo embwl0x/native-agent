@@ -1,9 +1,7 @@
 import Foundation
-// Blueprint: | `ConnectorActionReceipt.swift` | Shared connector action/Slack HTTP receipt schema, path and capped append owner; producer timestamps and outputs retained; local/off-disk backup, credential-free phone health projection, no production export; PrivacyMap/connectors |
+// Blueprint: | `ConnectorActionReceipt.swift` | Sole capped receipt writer; health projects outcomes. |
 
-/// Schema and sole append owner for connectors/actions/receipts.jsonl.
-/// Locally/off-disk backed up; no production export; phone connector health
-/// derives from outcomes, never raw rows. PrivacyMap: connectors.
+/// Health projects outcomes without raw receipt rows; backup retains them but production export excludes them.
 public struct ConnectorActionReceipt: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var actionId: String

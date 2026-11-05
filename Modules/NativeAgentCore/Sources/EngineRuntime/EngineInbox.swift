@@ -8,27 +8,18 @@ import PersistenceCore
 import TriggerScheduler
 import Cognition
 import BackgroundWork
-// Blueprint: | `EngineInbox.swift` | InboxFacade publishes checked items, triggers and read errors through LatestRead; each caller receives its own rows; markRead and committed trigger changes use write; owner-scoped observe/observeTriggers, including canonical ability invalidations for authored trigger defaults, loading and availability; newest physical row per stable card id. |
+import Experiences
+// Blueprint: | `EngineInbox.swift` | Root-specific ForPerson inbox reading, face-change subscription lifetime and checked trigger publication |
 
 extension InboxItemRecord {
     public var isUnread: Bool { normalizedStatus == "unread" }
 }
 
-/// `NativeAgentEngine.inbox` (S10): the live notification inbox for one data
-/// root, as core `InboxItemRecord`s. Today's notes, the Inbox page, the chat
-/// strip and the badges render `items`; LatestRead owns publication here.
-/// Phone snapshots receive their own checked read. Card actions run through
-/// the app's `InboxCardActions`.
+/// Share one root’s checked inbox across surfaces through LatestRead; phone snapshots return their own read, and native owners execute card actions.
 @MainActor
 @Observable
 public final class InboxFacade {
     public nonisolated let dataRoot: URL
-    /// The file's one owner for this root. The default root shares the
-    /// process-wide actor, which keeps the parsed 1–2 MB feed until the file
-    /// changes; another root gets its own.
-    public nonisolated let store: LiveNotificationInbox
-
-    /// Every card, newest first, as of the last published read.
     public private(set) var items: [InboxItemRecord] = [] {
         didSet { itemsDidChange?() }
     }
@@ -43,6 +34,9 @@ public final class InboxFacade {
     private var pendingTriggerReads = 0
     @ObservationIgnored private lazy var itemRead = LatestRead()
     @ObservationIgnored private lazy var triggerRead = LatestRead()
+    @ObservationIgnored var faceChanges: Task<Void, Never>?
+
+    isolated deinit { faceChanges?.cancel() }
 
     public var refreshErrorText: String? {
         loadError.map { _ in
@@ -62,13 +56,9 @@ public final class InboxFacade {
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
-        self.store = LiveNotificationInbox.live(dataRoot: dataRoot)
     }
 
-    /// Cards newest first by checked `created_at`, then id. Any unreadable
-    /// physical line/card throws with its cause; previous items remain visible
-    /// with loadError, never published as a healthy shorter inbox.
-    /// The phone's inbox snapshot shares this order.
+    /// Failed owner reads retain proven rows with loadError; the phone receives the same checked reading.
     public func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
         pendingItemReads += 1
         defer { pendingItemReads -= 1 }
@@ -90,32 +80,22 @@ public final class InboxFacade {
     }
 
     private nonisolated func read() async throws -> [InboxItemRecord] {
-        let rows = try await store.rows()
-        var items = try InboxItemRecord.latest(in: rows)
-        items.sort { lhs, rhs in
-            if lhs.created_at != rhs.created_at { return lhs.created_at > rhs.created_at }
-            return lhs.id > rhs.id
-        }
-        return items
+        try await ForPerson.at(dataRoot).inbox()
     }
 
     public func refresh() async { _ = try? await list() }
 
-    /// Mounted inbox surfaces observe the same source and publish to every reader.
+    /// Mounted inbox surfaces must share one source and revision.
     public func observe() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [LiveNotificationInbox.livePath(dataRoot: dataRoot)]) {
+        for await _ in await ForPerson.at(dataRoot).changes() {
+            guard !Task.isCancelled else { return }
             await self.refresh()
         }
     }
 
-    /// Marks the shown card read after a successful read action. Reading does
-    /// not settle an owner obligation.
+    /// The read action already committed; publish its owner's current reading, including any answer that landed meanwhile.
     public func markRead(_ id: String) {
-        itemRead.write {
-            if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
-                items[idx].status = "read"
-            }
-        }
+        Task { await refresh() }
     }
 }
 
@@ -132,8 +112,6 @@ extension InboxFacade {
         }
     }
 
-    /// The kinds of card she raises unasked (morning brief, idle check-in,
-    /// file watch…), as TriggerScheduler keeps them for this root.
     public func triggers() async throws -> [TriggerConfig] {
         pendingTriggerReads += 1
         defer { pendingTriggerReads -= 1 }
@@ -153,7 +131,7 @@ extension InboxFacade {
         return try result.get()
     }
 
-    /// Turn one trigger on or off. A name the scheduler does not know throws.
+    /// Unknown trigger names must throw instead of silently ignoring the request.
     public func setTrigger(_ name: String, enabled: Bool) async throws {
         let scheduler = NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: dataRoot)
         let status = try await enabled
@@ -186,10 +164,7 @@ extension InboxRelatedGroup {
     }
 }
 
-/// The persisted inbox action list includes control verbs which the Desk owns
-/// itself: opening a card marks it read, and viewing/replying are not direct
-/// button operations. Project once at the presentation boundary so every Desk
-/// surface offers exactly the native action that its button will invoke.
+/// Project card actions once at the Desk boundary so every offered button invokes its exact native operation.
 public enum InboxVisibleActionsPresentation {
     private static let hiddenActionIDs: Set<String> = ["view", "read", "reply"]
 
@@ -219,15 +194,8 @@ public enum InboxVisibleActionsPresentation {
 }
 
 
-/// WHAT STILL NEEDS THE PERSON, as opposed to what she has already told him.
-///
-/// The inbox was one flat list per lane in arrival order, and opening a card
-/// marked it read — so an approval he opened, thought about and did not act on
-/// sank under the next hour of notices and was gone. Reading is not resolving;
-/// the same OwnerAttentionPolicy as the overview owns this section.
-///
-/// Resolution is what removes it. Every surface renders the latest checked
-/// InboxFacade revision, including a card restored by its durable owner.
+/// Reading is not resolving: share OwnerAttentionPolicy with the overview and retain unresolved cards, including owner-restored cards, in the latest
+/// checked revision.
 public enum InboxNeedsYou {
     public struct Sections {
         public let needsYou: [InboxItemRecord]
@@ -236,9 +204,6 @@ public enum InboxNeedsYou {
         public var isEmpty: Bool { needsYou.isEmpty && rest.isEmpty }
     }
 
-    /// - Parameter everywhere: the visible population across every lane.
-    /// - Parameter lane: the lane's own visible population, which keeps its
-    ///   arrival order below.
     public static func sections(
         everywhere: [InboxItemRecord],
         lane: [InboxItemRecord]

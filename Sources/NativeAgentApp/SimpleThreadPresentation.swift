@@ -12,10 +12,28 @@ import PersistenceCore
 import ProviderRouting
 import AppKit
 import AppToolRuntime
-// Blueprint: | `SimpleThreadPresentation.swift` | Shared thread column, header and transcript text render the chat's typography and shared inline outcomes; missing recorded times display Time unavailable; pending preparation is explicit |
+// Blueprint: | `SimpleThreadPresentation.swift` | Thread typography, outcomes, `SimpleThreadDocument` rows; absent time and pending work stay explicit |
+
+/// A Simple thread as document rows, in the order given: each line is a left-seated paragraph headed by its speaker, as the thread
+/// always read. They are display rows (role "system": nothing to regenerate, no first-render receipt) and are never written anywhere.
+enum SimpleThreadDocument {
+    struct Line {
+        let id: String
+        let speaker: String
+        let text: String
+        let at: Date?
+    }
+
+    static func groups(_ lines: [Line]) -> MessageGrouper.GroupedTranscript {
+        MessageGrouper.projection(for: lines.map { line in
+            ChatMessage(id: line.id, role: "system", content: "**\(line.speaker)**\n\n\(line.text)",
+                        createdAt: line.at.map(NativeTimestampFormat.plainZulu) ?? "")
+        })
+    }
+}
 
 extension View {
-    /// Threads share the chat transcript's width, gutter and anchor.
+    /// Share transcript geometry so changing thread kind cannot shift its text column.
     func simpleRoomColumn(gutter: CGFloat = NativeAgentShellLayout.roomGutter) -> some View {
         padding(.horizontal, gutter)
             .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
@@ -25,7 +43,7 @@ extension View {
     }
 }
 
-/// Pinned thread headers share chat typography and dissolve scrolling words beneath them.
+/// Dissolve scrolling text beneath pinned headers so their words never overlap.
 struct SimpleThreadHeader<Mark: View>: View {
     let title: String
     let subtitle: String
@@ -53,8 +71,6 @@ struct SimpleThreadHeader<Mark: View>: View {
     }
 }
 
-/// One read-only transcript entry: who, when, and the words in the chat's
-/// reply type.
 struct SimpleTranscriptEntry: View, Equatable {
     let speaker: String
     let text: String
@@ -81,7 +97,7 @@ struct SimpleTranscriptEntry: View, Equatable {
         .accessibilityElement(children: .combine)
     }
 
-    /// Bold, italics and code as the chat shows them; line breaks kept.
+    /// Preserve line breaks when applying the chat's inline markdown styling.
     nonisolated static func inline(_ text: String) -> AttributedString {
         ChatMarkdownCache.inline(text).presentation
     }

@@ -1,8 +1,4 @@
-// KnowledgeGraph tokenization and ranking over canonical SQLite candidates.
-// MemoryStorage owns memory.sqlite and its schema; the checked SQLite reader
-// uses that owner's pool.
-// SwiftNativeKnowledgeGraphIndexer and KnowledgeGraphStore own Swift writes
-// through the shared pool, including memory and studio projections.
+// Use MemoryStorage's canonical schema and pool for checked graph reads and Swift memory/studio writes.
 
 import Foundation
 import NativeAgentShared
@@ -12,7 +8,6 @@ import PersistenceCore
 
 // MARK: - Stopwords + tokenizer
 
-/// Common words excluded from graph name tokens.
 public let knowledgeGraphStopwords: Set<String> = [
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "he", "her",
     "his", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our", "she",
@@ -20,7 +15,6 @@ public let knowledgeGraphStopwords: Set<String> = [
     "with", "you", "your",
 ]
 
-/// Lowercase Unicode alphanumeric/underscore runs, excluding stopwords.
 public func knowledgeGraphNameTokens(_ name: String) -> Set<String> {
     let lowered = name.lowercased()
     var tokens: Set<String> = []
@@ -41,11 +35,9 @@ public func knowledgeGraphNameTokens(_ name: String) -> Set<String> {
     return tokens
 }
 
-/// Pure in-memory ranking view of canonical SQLite candidates.
 public struct KnowledgeGraphStore: Sendable {
     /// Canonical candidates keyed by id; ranking ties preserve `entityOrder`.
     public let entities: [String: JSONValue]
-    /// Stable entity ranking order.
     public let entityOrder: [String]
     public init(
         entities: [String: JSONValue],
@@ -78,9 +70,8 @@ public struct KnowledgeGraphStore: Sendable {
         }
     }
 
-    /// Rank against an explicit clock for recency buckets.
     public func searchEntities(_ q: String, now: Date) -> [JSONValue] {
-        // Trim newlines and tabs as well as spaces before exact-name matching.
+        // Normalize all whitespace before exact-name matching.
         let qLower = q.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let qTokens = knowledgeGraphNameTokens(q)
         if qLower.isEmpty && qTokens.isEmpty { return [] }
@@ -158,7 +149,6 @@ public struct KnowledgeGraphStore: Sendable {
 // MARK: - JSONValue graph helpers
 
 extension JSONValue {
-    /// Mention counts truncate doubles toward zero; unparseable values return nil.
     fileprivate var intForGraph: Int? {
         switch self {
         case .int(let i): return Int(i)

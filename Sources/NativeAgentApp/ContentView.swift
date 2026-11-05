@@ -14,6 +14,7 @@ import NativeAgentShared
 import MemoryV2
 import Onboarding
 import PersistenceCore
+import StandingBots
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -23,21 +24,18 @@ import DeviceSync
 import CoreSpotlight
 import CloudKit
 import DeviceSync
+import Foundation
 #endif
 
-// Blueprint: | `ContentView.swift` | `ContentView`: Simple/Advanced/Agent shell assembly, scene-owned chat shortcut panels and onward navigation, first-run presentation and iCloud action refresh routing |
+// Blueprint: | `ContentView.swift` | `ContentView`: shell, scene navigation, first-run and iCloud refresh routing |
 
 struct ContentView: View {
-    // Page transitions respect Reduce Motion.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @SceneStorage("selection") private var selectionRaw = SidebarItem.chat.rawValue
-    @State private var hasMountedBots = false
     @AppStorage("nativeagent.showTour") private var showTour = false
-    /// The visible Simple, Advanced or Agent shell.
     @AppStorage(SimpleViewMode.key) private var viewModeRaw = ""
-    /// ⌘0 hides the rail (and Chat's conversations column) so chat fills the window.
     @AppStorage(WorkPaneState.sidebarsHiddenKey) private var sidebarsHidden = false
     @AppStorage(WorkPaneState.openKey) private var workPaneOpen = false
     @AppStorage(ShellRailTab.storageKey(.capabilities)) private var capabilitiesTab = "capabilities"
@@ -52,26 +50,16 @@ struct ContentView: View {
     @State private var showFirstRunOnboarding = false
     @State private var firstRunReadError: String?
     @State private var showCommandPalette = false
-    /// A route to Desk must reset its local DeskHub mode even when Desk is
-    /// already selected (for example, when the user is viewing Schedule).
-    @State private var deskRootRouteVersion = 0
-    /// Same for Settings: its NavigationStack keeps its pages across visits
-    /// (the detail `.id` is the sidebar item, so re-selecting Settings does not
-    /// remount it), which left a visitor standing two pages deep on a fresh
-    /// click. Bumped on every route to Settings; it is SetupView's `.id`, so a
-    /// bump remounts the stack at its root.
-    @State private var settingsRootRouteVersion = 0
-    // ContentView owns Desk's new-task sheet so repeated presentations remain available.
-    @State private var showNewWorkshopTask = false
+    /// Remount Settings' unbound NavigationStack by identity so every route reaches its root.
+    // Own the task sheet outside Desk so macOS permits repeated presentations.
+    @State private var showNewDeskTask = false
     @State private var navigationMountID: UUID?
     @State private var chatShortcut: ChatSlashPage?
     @State private var agentRoom = "home"
 
     private var selection: Binding<SidebarItem> {
         Binding {
-            // Normalize saved selections and command routes on both read and write.
             let item = (SidebarItem(rawValue: selectionRaw) ?? .chat).normalized
-            // Tab destinations select their parent rail page.
             if let home = SidebarItem.shellHome(for: item) { return home.parent }
             return item
         } set: {
@@ -83,15 +71,12 @@ struct ContentView: View {
         selection.wrappedValue.normalized
     }
 
-    /// Chat stays mounted; this controls only drawing and hit testing.
+    /// Keep Chat mounted; visibility affects drawing and hit testing only.
     private var isShowingChat: Bool {
         selection.wrappedValue.normalized == .chat
     }
 
-    private var isShowingBots: Bool { selection.wrappedValue.normalized == .bots }
-
     var body: some View {
-        // RenderAudit counts root evaluations only when its audit flag is enabled.
         RenderAudit.bump("contentview.body")
         return ZStack {
             Group {
@@ -111,11 +96,9 @@ struct ContentView: View {
                 AgentScreenView(room: $agentRoom)
             } else {
             ShellFrame {
-                // The rail owns its width and marks pending approvals with one dot.
                 if !sidebarsHidden {
                 ShellSidebarRail(
                     selection: selection,
-                    // The checked rail decides which rows exist; its Today dot reads the shared count.
                     needsYou: appModel.engine.desk.ownerWaitingCount.map { $0 > 0 ? [.activity] : [] },
                     attentionItem: .activity
                 )
@@ -123,7 +106,6 @@ struct ContentView: View {
                 }
             } detail: {
                 VStack(spacing: 0) {
-                // Each panel shows retained-data failures here; Chat renders its own notice.
                 if activeContentItem != .chat,
                    let notice = appModel.panelStaleNotice(for: activeContentItem) {
                     StalePanelNotice(text: notice)
@@ -131,124 +113,58 @@ struct ContentView: View {
                         .padding(.top, 8)
                 }
                 ZStack {
-                // Chat remains mounted for the window's lifetime.
                 ChatView()
-                    // Hidden chat disables keyboard commands, dictation and scroll monitoring.
                     .environment(\.chatPageIsVisible, isShowingChat)
-                    // Keep Liquid Glass in the shared shell's composition.
-                    // A separate native host changes its backdrop boundary.
-                    // Fluid glass: it fades in when it comes to the front and
-                    // goes at once when it leaves, so two pages never draw
-                    // over each other. Only the opacity is animated.
+                    // Keep glass in the shared composition; a separate native host changes its backdrop boundary.
                     .animation(isShowingChat ? NativeAgentMotion.crossfade : nil) {
                         $0.opacity(isShowingChat ? 1 : 0)
                     }
                     .allowsHitTesting(isShowingChat)
-                    // Pointer hiding alone does not guard assistive actions.
-                    // An AXPress carries no point, so VoiceOver/automation was
-                    // still reaching the hidden transcript: a press on
-                    // Personality > Dreams landed on a conversation-list row and
-                    // one on Bots > New bot landed on the chat header's Trust
-                    // button. `.disabled` is what an assistive press respects —
-                    // a disabled control refuses the action and cannot take
-                    // focus — and `children: .ignore` prunes the descendant
-                    // elements that `.accessibilityHidden` alone leaves in the
-                    // tree for AppKit-backed subviews. Both are driven by the
-                    // same boolean, so Chat stays mounted either way.
+                    // AXPress has no pointer location: disable hidden controls and prune AppKit descendants so they cannot act or take focus.
                     .disabled(!isShowingChat)
                     .accessibilityHidden(!isShowingChat)
                     .accessibilityElement(children: isShowingChat ? .contain : .ignore)
 
-                // Retain one visited shelf, not a cache of navigation destinations.
-                // AppKit leaks AX observer arrays when these text controls are torn
-                // down. Hidden work is cancelled inside the shelf.
-                if hasMountedBots || isShowingBots {
-                    BotsShelfView(onContinue: applyNavigationDestination, isVisible: isShowingBots)
-                        .animation(isShowingBots ? NativeAgentMotion.crossfade : nil) {
-                            $0.opacity(isShowingBots ? 1 : 0)
-                        }
-                        .allowsHitTesting(isShowingBots)
-                        .disabled(!isShowingBots)
-                        .accessibilityHidden(!isShowingBots)
-                        .accessibilityElement(children: isShowingBots ? .contain : .ignore)
-                        .onAppear { hasMountedBots = true }
-                }
-
                 ZStack {
-                if !isShowingChat && !isShowingBots {
+                if !isShowingChat {
                 Group {
-                    // Routed child surfaces remain reachable without adding primary sidebar tabs.
                     switch selection.wrappedValue.normalized {
-                    // ── Primary ───────────────────────────────────────────────
-                    // .chat is mounted above, outside this switch.
                     case .chat: EmptyView()
-                    case .bots: EmptyView()
+                    case .bots: FacePageView(page: "bots", isReading: appModel.panelRefreshCounts[.bots, default: 0] > 0)
                     case .activity: TodayView()
-                    // Memories and the knowledge graph as tabs; a
-                    // memory-review request lands on the Memories tab
-                    // (applyActivitySection writes the tab first).
-                    case .memories: MemoriesRailPage()
-                    case .desk: DeskPageView(rootRouteVersion: deskRootRouteVersion)
-                    case .personality: PersonalityRailPage()
+                    case .memories: FacePageView(page: "memories").modifier(MemoriesFaceNavigation())
+                    case .desk: FacePageView(page: "desk").modifier(DeskFaceEditors())
+                    case .personality: FacePageView(page: "personality").personalityDestinations()
                     case .connectors: ConnectorsRailPage()
-                    case .trust: TrustRailPage()
+                    case .trust: FacePageView(page: "trust")
                     case .providers:
-                        ShellRailPage(title: "Providers", subtitlePage: .providers, alive: true) { ProviderSettingsView() }
+                        FacePageView(page: "providers", isReading: appModel.panelRefreshCounts[.providers, default: 0] > 0)
                     case .settings:
-                        // A route to Settings is a route to its ROOT, and
-                        // the stack inside SetupView owns its own path —
-                        // nothing can unwind it from out here. `.id` does
-                        // it the only way an unbound stack allows: a fresh
-                        // SetupView, standing on Settings.
-                        SetupView().id(settingsRootRouteVersion)
-                    // ── Advanced / routed child surfaces ──────────────────────
+                        FacePageView(page: "settings")
                     case .capabilities:
                         CapabilitiesRailPage()
                     case .diagnostics: DiagnosticsRailPage()
                     case .inboxPolicy:
                         ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
-                    // Retired destinations resolve before rendering.
                     case .skills, .tools,
                          .macIntegration, .knowledge, .dreams, .cognition, .inspector, .telegram:
                         EmptyView()  // unreachable: normalized and shellHome resolve these above
                     }
                 }
-                // id() gives each page distinct identity so a switch mounts the
-                // new page rather than reusing the old one's state; state
-                // within a page is untouched while its selection is stable.
+                // Give each page distinct identity so navigation cannot reuse another page's state.
                 .id(selection.wrappedValue.normalized)
-                // Fluid glass: only the incoming page fades in; the outgoing
-                // one is gone in the same frame.
                 .transition(NativeAgentMotion.fadeIn)
                 }
                 }
-                // Replace pages atomically. Crossfading two translucent pages
-                // superimposes their text; retained chat/bots keep their state.
-                // Local control animations remain owned by their own views.
+                // Replace pages atomically to avoid superimposed translucent text; local controls own their animations.
                 .animation(nil, value: selection.wrappedValue.normalized)
                 }
-                // The per-panel refresh belongs to the SELECTION, not to the
-                // switch above — Chat now sits outside it and must still get
-                // its refresh on arrival.
+                // Refresh by selection so mounted Chat also receives its arrival refresh.
                 .task(id: selectionRaw) {
                     let item = activeContentItem
-                    if item.normalized == .diagnostics {
-                        // Doctor owns its report; Status and Runs share the
-                        // DiagnosticsView snapshot owner. Avoid racing a second
-                        // navigation-level read against those mounted surfaces.
-                        return
-                    } else if item.normalized == .activity {
-                        // Activity's five queue rows must distinguish an
-                        // empty, fully-read set from a failed backing read.
-                        // Its complete refresh records that receipt; the
-                        // sidebar's smaller file-watch refresh remains the
-                        // low-cost owner between Activity visits.
-                        //
-                        // Today already runs that exact refresh as the
-                        // initial read of its own file watcher, so doing it
-                        // here too paid for the five queue fetches twice on
-                        // every arrival.
-                    } else if item.normalized == .capabilities || item.normalized == .settings || item == .tools
+                    if item.normalized == .activity {
+                        // Today owns the complete queue-read receipt and watcher; another arrival refresh would duplicate its five fetches.
+                    } else if item.normalized == .settings || item == .tools
                                 || (item.normalized == .memories
                                     && UserDefaults.standard.string(forKey: ShellRailTab.storageKey(.memories)) != "knowledge") {
                         // These pages own their arrival refresh, so the shell does not repeat it.
@@ -258,11 +174,7 @@ struct ContentView: View {
                 }
                 }
             }
-            // Keep the Activity badge honest without pulling the full
-            // Activity surface while another tab is open. The full
-            // Today owns detailed proposal/improvement refreshes. On the
-            // frame, not the rail: ⌘0 hides the rail, and this refresh also
-            // keeps the approvals the turn card and Work pane read current.
+            // Watch badges on the frame so hidden rails still keep approvals current without loading the full Activity surface.
             .task(id: scenePhase) {
                 guard scenePhase == .active else { return }
                 await appModel.engine.watchActivityChanges {
@@ -271,10 +183,8 @@ struct ContentView: View {
             }
             }
             }
-            // S.5: hide NavigationSplitView from VoiceOver while onboarding overlay is active
             .accessibilityHidden((showTour && appModel.engine.layout.layout != nil) || showFirstRunOnboarding)
 
-            // The tour appears only when explicitly replayed from About.
             if showTour, let layout = appModel.engine.layout.layout {
                 OnboardingTourOverlay(
                     layout: layout,
@@ -301,7 +211,6 @@ struct ContentView: View {
                 }
             }
         }
-        // The notice lane sits under pinned chat chrome or at the top of other pages.
         .overlayPreferenceValue(NoticeLaneRoomKey.self) { room in
             GeometryReader { proxy in
                 NoticeLane(centers: [appModel.systemToasts] + [room?.notices].compactMap { $0 })
@@ -344,12 +253,7 @@ struct ContentView: View {
         .liveTask(id: sensesVisible) {
             if sensesVisible { await appModel.engine.senses.observe(dataRoot: appModel.engine.dataRoot) }
         }
-        // All Mac projections of chat sessions share AppModel's one canonical
-        // list: Chat, detached-window titles, Status, command search, and the
-        // optional project/session lineage page. Keep it current from the
-        // canonical index while the app scene is active. This watcher is
-        // vnode-driven, burst-coalesced, and performs no idle polling; the
-        // lightweight refresh also suppresses equal observed writes.
+        // Watch the canonical session index so every Mac projection shares current titles without idle polling.
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             await appModel.engine.transcripts.watchIndexChanges {
@@ -363,7 +267,6 @@ struct ContentView: View {
                     selectionRaw = SidebarItem.chat.rawValue
                     await appModel.reloadPersonality()
                     _ = await appModel.refreshForSidebarItem(.chat)
-                    // Fire after Chat loads; ChatView's task is a backup.
                     let greeting = await appModel.maybeSendFirstRunGreeting()
                     if let message = greeting.routeFailureMessage {
                         appModel.statusText = "Onboarding finished, but \(message)."
@@ -389,14 +292,14 @@ struct ContentView: View {
             CommandPaletteView(isPresented: $showCommandPalette)
         }
         .onReceive(NotificationCenter.default.publisher(for: .openCommandPaletteRequest)) { _ in
-            guard !appModel.deskHoldsCommandPalette else { return }
+            guard appModel.engine.desk.faceRequest == nil else { return }
             showCommandPalette = true
         }
-        .sheet(isPresented: $showNewWorkshopTask) {
-            NewWorkshopTaskSheet()
+        .sheet(isPresented: $showNewDeskTask) {
+            NewDeskTaskSheet()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .newWorkshopTaskRequest)) { _ in
-            showNewWorkshopTask = true
+        .onReceive(NotificationCenter.default.publisher(for: .newDeskTaskRequest)) { _ in
+            showNewDeskTask = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .iCloudInboxDidProcess)) { _ in
             let route = ICloudInboxDidProcessRoute.resolve(selectionRaw: selectionRaw)
@@ -409,9 +312,7 @@ struct ContentView: View {
                 }
             }
         }
-        // Build-in-Chat writes through AppModel first. This receiver owns only
-        // routing and the first-session recovery; it never writes a second
-        // draft over the one the action already prepared.
+        // AppModel already prepared the draft; this receiver only routes and recovers a missing first session.
         .onReceive(NotificationCenter.default.publisher(for: .skillBuildRequest)) { note in
             selectionRaw = SidebarItem.chat.rawValue
             let starter = (note.object as? String) ?? "Create a skill from this conversation:"
@@ -422,9 +323,7 @@ struct ContentView: View {
                 _ = appModel.requestSkillBuild(starter: starter)
             }
         }
-        // Inbox "Act" on a chat-shaped item — same shape as skillBuildRequest
-        // above: switch to Chat, prefill only when the composer is empty so a
-        // half-typed message is never clobbered.
+        // Prefill only an empty composer so routing cannot clobber a half-written message.
         .onReceive(NotificationCenter.default.publisher(for: .openChatDraftRequest)) { note in
             selectionRaw = SidebarItem.chat.rawValue
             guard let draft = note.object as? String, !draft.isEmpty else { return }
@@ -433,7 +332,7 @@ struct ContentView: View {
                 appModel.injectChatDraft(draft, sessionId: appModel.activeChatSessionId)
             }
         }
-        // The message is already persisted; reload its session without touching the composer.
+        // The message is durable; reload its session without touching the composer.
         .onReceive(NotificationCenter.default.publisher(for: .openSpokenChatRequest)) { note in
             selectionRaw = SidebarItem.chat.rawValue
             guard let sessionId = note.object as? String, !sessionId.isEmpty else { return }
@@ -483,14 +382,17 @@ struct ContentView: View {
             }
         }
         switch destination {
-        case .chatShortcut: break // Handled above.
+        case .chatShortcut: break
         case .savedThing(let saved):
-            appModel.pendingPaletteDestination = saved
             viewModeRaw = SimpleViewMode.advanced
             switch saved {
-            case .botReply: selectSidebarItem(.bots)
-            case .dream: selectSidebarItem(.dreams)
+            case .botReply(let botID, let entryID):
+                Task { await openHelperReply(botID: botID, entryID: entryID) }
+            case .dream:
+                appModel.pendingPaletteDestination = saved
+                selectSidebarItem(.dreams)
             case .memory:
+                appModel.pendingPaletteDestination = saved
                 UserDefaults.standard.set("memories", forKey: ShellRailTab.storageKey(.memories))
                 selectSidebarItem(.memories)
             }
@@ -512,8 +414,6 @@ struct ContentView: View {
                 applyActivityRoot()
                 return
             }
-            // A page route lands on its first visible tab; SettingsLink
-            // chooses a requested tab after routing.
             let layout = appModel.engine.layout.availability
             if let first = ShellRailTab.all(layout).first(where: { $0.page == target })?.tabs.first?.key {
                 UserDefaults.standard.set(first, forKey: ShellRailTab.storageKey(target))
@@ -522,26 +422,36 @@ struct ContentView: View {
         }
     }
 
+    private func openHelperReply(botID: UUID, entryID: UUID) async {
+        let root = appModel.engine.dataRoot
+        do {
+            let entry = try await Task.detached { try ShelfStore(dataRoot: root).entry(entryID) }.value
+            guard entry.botId == botID, let sessionID = entry.sessionID else {
+                appModel.statusText = "This reply has no matching helper conversation. Its saved result is kept."
+                return
+            }
+            await appModel.refreshChatSessionIndex()
+            guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionID }) else {
+                appModel.statusText = "This helper conversation could not be read from the conversation index. Its saved reply is kept."
+                return
+            }
+            await appModel.selectChatSession(session)
+            if appModel.activeChatSessionId == sessionID { selectSidebarItem(.chat) }
+        } catch { appModel.statusText = UserFacingError.message(error, action: "open that helper's reply") }
+    }
+
     private func selectSidebarItem(_ target: SidebarItem) {
-        // Write the tab key before selecting its parent so the page mounts on that tab.
+        // Write the tab before selecting its parent so the page mounts on that tab.
         if let home = SidebarItem.shellHome(for: target) {
             UserDefaults.standard.set(home.tab, forKey: ShellRailTab.storageKey(home.parent))
             selectionRaw = home.parent.rawValue
             return
         }
-        deskRootRouteVersion = DeskRootRoutePresentation.nextRootRouteVersion(
-            current: deskRootRouteVersion,
-            destination: target)
-        if target.normalized == .settings {
-            settingsRootRouteVersion &+= 1
-        }
+        if target.normalized == .desk { appModel.pendingDeskHandle = nil }
         selectionRaw = target.normalized.rawValue
     }
 
     private func applyActivitySection(_ section: ActivitySection) {
-        // Behind the rail, Activity IS Today and it has no NavigationStack to
-        // push onto. The memory review lives on the Memories place's
-        // Pending tab, so route there instead of stranding the request.
         if section == .memoryProposals {
             appModel.pendingActivitySectionRaw = nil
             // The waiting card is on the Memories tab, not the graph.
@@ -604,44 +514,22 @@ struct MetricTile: View {
 extension Notification.Name {
     static let openApprovalsRequest = Notification.Name("NativeAgent.openApprovalsRequest")
     static let openTelegramRequest = Notification.Name("NativeAgent.openTelegramRequest")
-    /// Opens Trust where screen capture and the other multimodal grants live.
     static let openTrustMultimodalRequest = Notification.Name("openTrustMultimodalRequest")
     static let openCommandRouteRequest = Notification.Name("NativeAgent.openCommandRouteRequest")
     static let openCommandPaletteRequest = Notification.Name("NativeAgent.openCommandPaletteRequest")
-    /// Posted by the Desk page's New task button; ContentView owns the sheet
-    /// (a sheet attached inside the page presents only once on macOS).
-    static let newWorkshopTaskRequest = Notification.Name("NativeAgent.newWorkshopTaskRequest")
-    /// Posted by the New Task sheet once the task exists, so an open Desk
-    /// re-reads its board instead of waiting for its next poll.
+    /// Own the sheet in ContentView: a sheet attached inside Desk presents only once on macOS.
+    static let newDeskTaskRequest = Notification.Name("NativeAgent.newDeskTaskRequest")
     static let deskTaskCreated = Notification.Name("NativeAgent.deskTaskCreated")
-    /// The object is an `ActivitySection.rawValue` string naming the queue Today opens.
     static let openActivitySectionRequest = Notification.Name("NativeAgent.openActivitySectionRequest")
     static let openActivityRootRequest = Notification.Name("NativeAgent.openActivityRootRequest")
-    /// Inbox "Act" on a chat-shaped item (morning brief, idle check-in, …):
-    /// switch to Chat and prefill the composer with the object string via
-    /// AppModel.injectChatDraft — same idiom as skillBuildRequest.
     static let openChatDraftRequest = Notification.Name("NativeAgent.openChatDraftRequest")
-    /// Opens the session containing the agent's persisted message without changing the composer.
     static let openSpokenChatRequest = Notification.Name("NativeAgent.openSpokenChatRequest")
 }
 
 
 
 
-// Capabilities' two tabs (CapabilitiesRailPage). Hardening is not a third: it
-// moved, whole, behind the "For developers" fold at the bottom of the page.
-// "What needs a look" held only a third approval inbox and is gone: approvals
-// are the chat's inline cards and Today's Approvals (⌘⇧A).
-enum CapabilityWorkspaceMode: String, CaseIterable, Identifiable {
-    case canDo = "What I can do"
-    case installed = "What's installed"
-
-    var id: String { rawValue }
-}
-
-/// Routes an iCloud inbox mutation to the smallest current Activity read. The
-/// route is selected when the notification arrives, before an async refresh can
-/// observe a later sidebar change.
+/// Resolve the route on notification receipt before an async refresh can observe a later sidebar selection.
 enum ICloudInboxDidProcessRoute: Equatable, Sendable {
     case refreshActivity
     case refreshActivityBadge
@@ -651,5 +539,31 @@ enum ICloudInboxDidProcessRoute: Equatable, Sendable {
             return .refreshActivityBadge
         }
         return .refreshActivity
+    }
+}
+
+// MARK: - Render audit
+
+// Enable render counters only on request to keep ordinary rendering quiet.
+final class RenderAudit: @unchecked Sendable {
+    static let shared = RenderAudit()
+    let enabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_RENDER_AUDIT"] == "1"
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+    private var lastDump = Date()
+
+    static func bump(_ key: String) { shared._bump(key) }
+
+    private func _bump(_ key: String) {
+        guard enabled else { return }
+        lock.lock(); defer { lock.unlock() }
+        counts[key, default: 0] += 1
+        if Date().timeIntervalSince(lastDump) >= 5 {
+            let line = counts.sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+            FileHandle.standardError.write(Data("RenderAudit[5s]: \(line)\n".utf8))
+            counts = [:]
+            lastDump = Date()
+        }
     }
 }

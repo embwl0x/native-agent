@@ -1,3 +1,4 @@
+import NativeAgentCore
 import Foundation
 import NativeAgentShared
 import PersistenceCore
@@ -5,11 +6,8 @@ import PersistenceCore
 
 /// Bridge wire translation; the client owns execution gates and the receipt.
 public enum MacControlActionRoutes {
-    public static func auditPath(dataRoot: URL) -> URL {
-        dataRoot.appendingPathComponent("mac_control_audit.jsonl")
-    }
-
-    public static func run(path: String, bodyData: Data, dataRoot: URL, makeClient: (URL) -> any MacControlClient) async throws -> JSONValue {
+    public static func run(path: String, bodyData: Data, dataRoot: URL, turn: Turn, context: MacOperationContext, makeClient: (
+        URL) -> any MacControlClient) async throws -> JSONValue {
         let bodyDict: [String: JSONValue]? = {
             if bodyData.isEmpty { return [:] }
             guard let parsed = try? JSONValue.parse(bodyData),
@@ -20,9 +18,9 @@ public enum MacControlActionRoutes {
             guard macControlDispatchableActions.contains(action) else {
                 return .object(["error": .string("unknown_action"), "action": .string(action)])
             }
-            let impl = makeClient(auditPath(dataRoot: dataRoot))
+            let impl = makeClient(dataRoot)
             do {
-                return try await impl.dispatch(action: action, body: bodyDict).toJSON()
+                return try await impl.dispatch(action: action, body: bodyDict, turn: turn, context: context).toJSON(readContent: context.readContent)
             } catch let mcErr as MacControlError {
                 return .object([
                     "error": .string(mcErr.errorDescription ?? "\(mcErr)"),
@@ -36,7 +34,7 @@ public enum MacControlActionRoutes {
         ])
     }
 
-    /// Preserve callers' existing /v1/mac_control/* paths.
+    /// Keep bridge paths aligned with native callers so wire translation cannot redirect an action.
     fileprivate static func macControlActionFromPath(_ path: String) -> String? {
         let prefix = "/v1/mac_control/"
         guard path.hasPrefix(prefix) else { return nil }
@@ -65,9 +63,8 @@ public enum MacControlWorkbenchAvailability: Equatable {
 
 }
 
-/// The only action routes the mounted workbench can invoke. Keeping route,
-/// native action name, policy gate, and user-facing label together prevents a
-/// button from quietly drifting onto an unsupported 501 action.
+/// The only action routes the mounted workbench can invoke. Keeping route, native action name, policy gate, and user-facing label together prevents a button
+/// from quietly drifting onto an unsupported 501 action.
 public enum MacControlWorkbenchAction: String, CaseIterable, Sendable {
     case shell
     case fileRead = "file/read"

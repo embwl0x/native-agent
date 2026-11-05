@@ -1,43 +1,39 @@
 import Darwin
 import Foundation
-// Blueprint: | `VolumeIO.swift` | Serial off-pool volume operations; ready-file admission rejects dataless/nonregular reads; ContinuationOnce releases each caller on Stop or a bounded inherited deadline without cancelling issued filesystem work |
+// Blueprint: | `VolumeIO.swift` | Serial off-pool filesystem work; bounded waits never cancel issued writes |
 
 public enum VolumeIO {
     private static let queue = DispatchQueue(label: "NativeAgent.volume-io", qos: .utility)
 
-    /// The deadline ends the wait, not an issued write. A late operation owns
-    /// its physical completion; callers must reconcile effects before replay.
+    /// The deadline ends the wait, not an issued write. A late operation owns its physical completion; callers must reconcile effects before replay.
     public static func run<T: Sendable>(
+        budget: OperationWaitBudget = .init(),
         onFinish: @escaping @Sendable () -> Void = {},
         _ body: @escaping @Sendable () throws -> T
     ) async throws -> T {
-        let deadline = TaskWaitDeadline.current ?? ContinuousClock.now.advanced(by: .seconds(30))
-        return try await TaskWaitDeadline.$current.withValue(deadline) {
-            let result = ContinuationOnce<Result<T, Error>>()
-            if Task.isCancelled || TaskWaitDeadline.expired {
-                result.resume(.failure(TaskWaitDeadline.cancellationError))
-            }
-            queue.async {
-                defer { onFinish() }
-                guard result.isPending else { return }
-                let outcome = Result { try body() }
-                if !result.resume(outcome) {
-                    let state = switch outcome { case .success: "completed"; case .failure: "failed" }
-                    NSLog("[VolumeIO] issued filesystem operation %@ after its caller stopped waiting; reconcile its destination before replay", state)
-                }
-            }
-            return try await result.wait(cancellingWith: .failure(TaskWaitDeadline.cancellationError)).get()
+        let budget = budget.deadline == nil ? budget.capped(seconds: 30) : budget
+        let result = ContinuationOnce<Result<T, Error>>()
+        if Task.isCancelled || budget.expired {
+            result.resume(.failure(budget.cancellationError))
         }
+        queue.async {
+            defer { onFinish() }
+            guard result.isPending else { return }
+            let outcome = Result { try body() }
+            if !result.resume(outcome) {
+                let state = switch outcome { case .success: "completed"; case .failure: "failed" }
+                NSLog("[VolumeIO] issued filesystem operation %@ after its caller stopped waiting; reconcile its destination before replay", state)
+            }
+        }
+        return try await result.wait(budget: budget, cancellingWith: .failure(budget.cancellationError)).get()
     }
 
-    /// The same checked operation for owners whose existing receipt is Result.
-    public static func result<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async -> Result<T, Error> {
-        do { return .success(try await run(body)) }
+    public static func result<T: Sendable>(budget: OperationWaitBudget = .init(), _ body: @escaping @Sendable () throws -> T) async -> Result<T, Error> {
+        do { return .success(try await run(budget: budget, body)) }
         catch { return .failure(error) }
     }
 
-    /// Metadata admission never downloads bytes. A cloud placeholder remains
-    /// unavailable until its owning sync mechanism has made it resident.
+    /// Metadata admission never downloads bytes. A cloud placeholder remains unavailable until its owning sync mechanism has made it resident.
     public static func requireReadyForReading(_ url: URL) throws {
         var info = stat()
         guard stat(url.path, &info) == 0 else {

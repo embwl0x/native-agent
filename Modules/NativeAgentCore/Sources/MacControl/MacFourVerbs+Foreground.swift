@@ -1,24 +1,22 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacFourVerbs+Foreground.swift` | `MacFourVerbs`: `FrontExpectation`, `actBroughtForward`, `settlementDispatch`, `missBeforeRaise`; named-app acts borrow and settle the exact foreground window under the driver generation |
+// Blueprint: | `MacFourVerbs+Foreground.swift` | `MacFourVerbs`, `FrontExpectation`, `actBroughtForward`, `settlementDispatch`, `missBeforeRaise` |
 
 extension MacFourVerbs {
-    /// After a `front:true` raise: the exact process and window that must be
-    /// in front when the act looks, or it refuses.
+    /// After a `front:true` raise: the exact process and window that must be in front when the act looks, or it refuses.
     typealias FrontExpectation = (pid: Int32, frame: MacAXFrame?)
 
-    /// Release an act's temporary foreground/AX state even after Stop. The
-    /// original generation still yields to takeover and explicit handback.
-    func settlementDispatch(action: String, body: [String: JSONValue]) async -> MacControlResult? {
-        let driver = MacDriverContext.binding?.settlementBinding()
-        // `settle` detaches: carry the exact foreground lease through the
-        // whole dispatch, including its inherited native execution task.
-        let restoration = MacForegroundSnapshot.restoring
+    /// Release an act's temporary foreground/AX state even after Stop. The original generation still yields to takeover and explicit handback.
+    func settlementDispatch(action: String, body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult? {
+        let driver = context.driver?.settlementBinding()
+        // `settle` detaches: carry the exact foreground lease through the whole dispatch, including its retained native execution task.
+        let restoration = context.restoring
         return await settle {
-            await MacForegroundSnapshot.$restoring.withValue(restoration) {
-                await MacDriverContext.$binding.withValue(driver) {
-                    do { return try await host.dispatch(action: action, body: body) }
+            let context = context.settling()
+            return await context.holding(\.restoring, restoration) { context in
+                await context.holding(\.driver, driver) { context in
+                    do { return try await host.dispatch(action: action, body: body, turn: turn, context: context) }
                     catch {
                         return MacControlResult(ok: false, action: action,
                             output: .object(["status": .string("settlement_failed"),
@@ -38,12 +36,11 @@ extension MacFourVerbs {
         raise: Bool,
         missBefore: (Sighting?) async -> MacFourVerbsReply?,
         inBack: (Sighting?) async -> MacFourVerbsReply,
-        run: (FrontExpectation?, Sighting?) async -> MacFourVerbsReply
-    ) async -> MacFourVerbsReply {
+        turn: Turn, context: MacOperationContext, run: (FrontExpectation?, Sighting?) async -> MacFourVerbsReply) async -> MacFourVerbsReply {
         var anchored: Sighting?
         var windowless: MacFourVerbsReply?
         let capture = MacSightCaptureBinding(frameID: UUID().uuidString)
-        switch await sight(part: nil, app: app, seek: seek, observed: capture) {
+        switch await sight(part: nil, app: app, seek: seek, observed: capture, turn: turn, context: context) {
         case .blind(let reply):
             let front = Self.object(reply.detail["frontmost_app"])
             let frontName = Self.string(front["name"])
@@ -51,8 +48,7 @@ extension MacFourVerbs {
             guard raise || inFront else { return await inBack(nil) }
             guard menuOrKey, Self.windowlessApp(reply.detail) else { return reply }
             if let miss = await missBefore(nil) { return miss }
-            // Already in front with no window: act there, refused at each event
-            // if the front moves. Only a permitted raise activates anything.
+            // Already in front with no window: act there, refused at each event if the front moves. Only a permitted raise activates anything.
             if inFront, let pid = Self.int(front["pid"]).flatMap(Int32.init(exactly:)) { return await run((pid, nil), nil) }
             windowless = reply
         case .seen(let hit): anchored = hit
@@ -92,14 +88,14 @@ extension MacFourVerbs {
         if let anchored, let miss = await missBefore(anchored) { return miss }
         /// Restore once through the typed lease; the handler confirms its native window too.
         func restore() async -> (restored: Bool, gone: Bool, receipt: JSONValue?) {
-            let result = await MacForegroundSnapshot.$restoring.withValue(lease) {
-                await settlementDispatch(action: "focus_app", body: ["pid": .int(Int64(previous.pid))])
+            let result = await context.holding(\.restoring, lease) {
+                context in await settlementDispatch(action: "focus_app", body: ["pid": .int(Int64(previous.pid))], turn: turn, context: context)
             }
             let output = Self.object(result?.output)
             return (
                 result?.ok == true && Self.bool(output["frontmost_pid_matches"]) == true,
                 Self.string(output["status"]) == "app_gone",
-                result?.toJSON()
+                result?.toJSON(readContent: context.readContent)
             )
         }
         func restoreWords(_ restore: (restored: Bool, gone: Bool, receipt: JSONValue?)) -> (String, [String: JSONValue]) {
@@ -118,7 +114,7 @@ extension MacFourVerbs {
         if let anchored, let targetPid = anchored.pid {
             focusBody = ["pid": .int(Int64(targetPid)), "frame_id": .string(anchored.frameId)]
         } else { focusBody = ["app": .string(app)] }
-        let raised = try? await host.dispatch(action: "focus_app", body: focusBody)
+        let raised = try? await host.dispatch(action: "focus_app", body: focusBody, turn: turn, context: context)
         let raisedOutput = Self.object(raised?.output)
         if let raised, let error = raised.error, error.hasPrefix("human_takeover:") {
             return MacFourVerbsReply(ok: false, text: error,
@@ -145,7 +141,7 @@ extension MacFourVerbs {
         var reply = await run((targetPid, frame), nil)
         if Self.string(reply.detail["error"]) == "owner_changed_apps" {
             if windowless != nil { return reply }
-            // He picked a new front app mid-act; putting his old one back would undo him.
+            // A person's mid-act focus choice wins; restoring the captured foreground would undo that choice.
             return stamped(reply, note: nil, [
                 "brought_forward": .string(appName), "owner_front_changed": .bool(true), "owner_front_restored": .bool(false),
             ])
@@ -155,14 +151,14 @@ extension MacFourVerbs {
         if windowless != nil {
             return stamped(reply, note: wasFront ? "\(app) had no window, so I used its menu bar."
                 : "\(app) had no window, so I brought it forward to use its menu bar, then "
-                    + (restored.restored ? "put \(previous.name) back." : "couldn't restore \(previous.name)'s prior foreground."),
-                ["brought_forward": .string(app), "owner_front_changed": .bool(true), "owner_front_restored": .bool(restored.restored)])
+                    + (restored.restored ? "put \(previous.name) back." : "couldn't restore \(previous.name)'s prior foreground."), ["brought_forward": .string(
+                        app), "owner_front_changed": .bool(true), "owner_front_restored": .bool(restored.restored)])
         }
         let (words, extra) = restoreWords(restored)
-        // The screen in the reply was read while the app was in front; once
-        // the person's app is back it no longer is.
+        // The screen in the reply was read while the app was in front; once the person's app is back it no longer is.
         if restored.restored, let range = reply.text.range(of: " · FRONT") {
-            reply = MacFourVerbsReply(ok: reply.ok, text: reply.text.replacingCharacters(in: range, with: " · back now (\(previous.name) restored)"), detail: reply.detail)
+            reply = MacFourVerbsReply(ok: reply.ok, text: reply.text.replacingCharacters(in: range, with: " · back now (\(previous.name) restored)"),
+                detail: reply.detail)
         }
         let seconds = max(1, Int((clock.monotonicSeconds() - startedAt).rounded()))
         let note = "Brought \(appName) forward for ~\(seconds)s"
@@ -175,14 +171,15 @@ extension MacFourVerbs {
     }
 
     /// Before raising, resolve the named target in the background; a miss moves nothing.
-    func missBeforeRaise(verb rawVerb: String, target: String, in seen: Sighting) async -> MacFourVerbsReply? {
+    func missBeforeRaise(verb rawVerb: String, target: String, in seen: Sighting, turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply? {
         var verbName = Self.parseVerb(rawVerb).0
         if verbName == "press" { verbName = Self.pressMeansKey(target) ? "key" : "click" }
         guard let verb = MacActVerb(rawValue: verbName), !Self.isPotentialDynamicVisualReference(target),
               !target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let clickish = [MacActVerb.click, .open, .select, .toggle].contains(verb)
         if !(clickish && Self.isMenuPath(target)) {
-            switch verb == .scroll ? Self.resolveScrollTarget(target, among: seen.targets, viewport: seen.visibleFrame ?? seen.windowFrame) : Self.resolve(target, among: seen.targets) {
+            switch verb == .scroll ? Self.resolveScrollTarget(target, among: seen.targets, viewport: seen.visibleFrame ?? seen.windowFrame)
+                : Self.resolve(target, among: seen.targets) {
             case .ambiguous: return nil
             case .hit(let candidate) where candidate.regionOnly || Self.answers(target, candidate): return nil
             default: break
@@ -194,13 +191,10 @@ extension MacFourVerbs {
             if verb != .scroll, Self.bareField(target, in: seen)?.hit != nil { return nil }
             if verb == .type, Self.typesAtFocus(target, in: seen) { return nil }
         }
-        // A menu path is never judged from the back: a background app's menus
-        // keep the last key window's titles (Make Plain Text reads Make Rich
-        // Text), so only the press after the raise can tell. It refuses and
-        // restores if the item really isn't there.
+        // Background menu titles can reflect stale key-window validation. Judge only after raising; on a real miss, refuse and restore.
         if clickish, Self.isMenuPath(target) { return nil }
         let name = seen.appName ?? "that app"
-        let hint = await menuHint(target, verb: verb, app: seen.appName)
+        let hint = await menuHint(target, verb: verb, app: seen.appName, turn: turn, context: context)
         return MacFourVerbsReply(
             ok: false,
             text: "Nothing in \(name)'s window is called \"\(target)\", so I didn't bring \(name) forward. Nothing moved."

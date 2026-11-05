@@ -2,13 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `Research.swift` | Research values validate current SearXNG fields, skip malformed result and engine-failure rows as named gaps before capping valid siblings, expose independent receipt-retention state and require complete saved Lab rows; required envelope failures and DNS/refused-connection/timeout causes remain explicit |
+// Blueprint: | `Research.swift` | Checked search rows, named gaps and complete saved Lab records |
 
 // MARK: - Research
-//
-// Swift-native SearXNG autodetect, search, fetched-source receipts, and research lab
-// persistence. Focused extensions own autodetect, search/fetch parsing,
-// lab execution, activity/trace emission, helpers, and transports.
 
 // MARK: - Result types
 
@@ -22,9 +18,8 @@ public struct SearXNGCandidate: Sendable, Equatable {
     }
 }
 
-/// The result of one SearXNG discovery attempt. Research owns presentation of
-/// this result so an incidental discovery cannot replace the app-wide status
-/// message used by other mounted surfaces.
+/// The result of one SearXNG discovery attempt. Research owns presentation of this result so an incidental discovery cannot replace the app-wide status message
+/// used by other mounted surfaces.
 public enum SearXNGAutodetectOutcome: Equatable, Sendable {
     case found(String, gaps: [String])
     case notFound(String)
@@ -68,7 +63,6 @@ public struct SearXNGAutodetectResult: Sendable, Equatable {
         self.gaps = gaps
     }
 
-    /// `baseURL`, `source` and `error` serialize as null when absent.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [:]
         obj["found"] = .bool(found)
@@ -94,7 +88,6 @@ public struct ResearchSearchResult: Identifiable, Sendable, Hashable, Codable {
         self.source = source
     }
 
-    /// `source` is the comma-joined recorded engine list, or null when absent.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [:]
         obj["title"] = .string(title)
@@ -200,10 +193,7 @@ public struct ResearchSearchResponse: Sendable, Equatable {
 
 // MARK: - fetch / lab result types
 
-/// A fetched-source receipt with `{id, url, text, createdAt}`, source coverage
-/// and a read outcome. The bounded extraction is retained;
-/// readJSON selection and output paging are described in the web-read blueprint.
-/// Receipt is written to `data/research/source-<id>.json`.
+/// Retain bounded extraction and coverage in source receipts; selection and paging read that extraction without another fetch.
 public struct ResearchFetchRecord: Sendable, Equatable {
     public let id: String
     public let url: String
@@ -214,7 +204,8 @@ public struct ResearchFetchRecord: Sendable, Equatable {
     public let verdict: [String: JSONValue]
     let retentionDirectory: URL
 
-    public init(id: String, url: String, text: String, createdAt: String, verdict: [String: JSONValue], retentionDirectory: URL, coverage: JSONValue? = nil, sourceReceipt: JSONValue? = nil) {
+    public init(id: String, url: String, text: String, createdAt: String, verdict: [String: JSONValue], retentionDirectory: URL,
+        coverage: JSONValue? = nil, sourceReceipt: JSONValue? = nil) {
         self.id = id
         self.url = url
         self.text = text
@@ -244,7 +235,6 @@ public struct ResearchFetchRecord: Sendable, Equatable {
     }
 }
 
-/// A persisted lab run; `error` serializes as null when absent.
 public struct ResearchLabRun: Identifiable, Sendable, Hashable {
     public let id: String
     public let objective: String
@@ -290,8 +280,7 @@ public struct ResearchLabRun: Identifiable, Sendable, Hashable {
 // MARK: - Stored rows
 
 extension ResearchSearchResult {
-    /// One stored source row requires string title/url/snippet and nullable
-    /// source, exactly as written by toJSON.
+    /// One stored source row requires string title/url/snippet and nullable source, exactly as written by toJSON.
     public init?(row: JSONValue) {
         guard case .object(let obj) = row,
               case .string(let title)? = obj["title"],
@@ -306,8 +295,7 @@ extension ResearchSearchResult {
 }
 
 extension ResearchLabRun {
-    /// The complete current saved shape. Unknown historical evidence cannot
-    /// become an empty query, brief, timestamp or connector.
+    /// The complete current saved shape. Unknown historical evidence cannot become an empty query, brief, timestamp or connector.
     public init?(row: JSONValue) {
         guard case .object(let obj) = row,
               case .string(let id)? = obj["id"],
@@ -340,9 +328,7 @@ extension ResearchLabRun {
 // MARK: - Errors
 
 public enum ResearchClientError: LocalizedError, Sendable, Equatable {
-    /// No SearXNG base URL is configured.
     case notConfigured
-    /// Non-2xx response or unparseable body.
     case malformedResponse(String)
     case httpStatus(Int)
     case transport(String)
@@ -383,8 +369,7 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
         return .transport(String(describing: error))
     }
 
-    /// Keep the actual read failure useful in ordinary Workspace recovery.
-    /// NSError's synthesized enum number otherwise hides even an HTTP refusal.
+    /// Keep the actual read failure useful in ordinary Workspace recovery. NSError's synthesized enum number otherwise hides even an HTTP refusal.
     public var errorDescription: String? {
         switch self {
         case .notConfigured:
@@ -400,8 +385,7 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
         case .timedOut(let host):
             return "The read from \(host) timed out; no page was read."
         case .transport(let detail) where detail.range(of: #"Code=-120[0-6]\b"#, options: .regularExpression) != nil:
-            // 10-08: a search hit was a lookalike mirror; its certificate failed
-            // and the raw NSError dump read as "the site is down".
+            // Distinguish certificate rejection from an unavailable site so recovery preserves the trust failure.
             return "The site's security certificate is not valid for this address, so nothing was read. It may not be "
                 + "the site it looks like; prefer the official domain."
         case .transport(let detail):
@@ -432,11 +416,8 @@ public actor SwiftNativeResearchClient {
     let configPath: URL
     let receiptsDir: URL
     let labRunsPath: URL
-    // Activity-feed + trace-ledger sinks. The Mac UI runs research lab
-    // in-process; the activity feed and trace ledger both read these files, so
-    // emitting here keeps those surfaces complete.
+    // The activity feed sink. The Mac UI runs research lab in-process; its standalone trace receipts go to the record under this root.
     let activityPath: URL
-    let tracesPath: URL
     let http = URLSessionResearchHTTPClient()
     let docker = SystemDockerPSExecutor()
 
@@ -446,6 +427,5 @@ public actor SwiftNativeResearchClient {
         self.configPath = receiptsDir.appendingPathComponent("config.json")
         self.labRunsPath = receiptsDir.appendingPathComponent("lab/runs.json")
         self.activityPath = SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
-        self.tracesPath = root.appendingPathComponent("traces/events.jsonl")
     }
 }

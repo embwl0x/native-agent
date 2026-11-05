@@ -1,10 +1,8 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `MacToolsPresentation.swift` | Policy hints for shared executable phone actions, volume target wording, notification feedback and Spotlight results |
+// Blueprint: | `MacToolsPresentation.swift` | Shared Mac action policy hints, requested volume, notification feedback and Spotlight results |
 
-/// The iPhone must not treat a missing Mac trust projection as evidence that
-/// Mac Control was intentionally disabled. The two cases have different owner
-/// actions: wait for publishing versus change a policy on the Mac.
+/// A missing trust projection requires publication, while disabled Mac Control requires a policy change; do not conflate the two.
 enum MacToolsPolicyGatePresentation {
     enum State: Equatable {
         case snapshotUnavailable
@@ -33,10 +31,7 @@ enum MacToolsPolicyGatePresentation {
     }
 }
 
-/// The individual Mac privileges remain independently fail-closed even after
-/// the enclosing Mac Control policy has enabled this screen. Keeping their
-/// decision and owner-facing explanation together prevents a dimmed control
-/// from losing the reason it is unavailable.
+/// Keep each privilege fail-closed and its explanation alongside the decision so disabled controls retain a remedy.
 enum MacToolsPrivilegePresentation {
     static func isAllowed(_ privilege: PhoneMacControlAction, policy: MacControlPolicyWireSnapshot?) -> Bool {
         guard let policy else { return false }
@@ -58,7 +53,7 @@ enum MacToolsPrivilegePresentation {
     }
 }
 
-/// The slider is a requested target, rather than a live Mac volume monitor.
+/// Volume is a requested target; never imply the slider monitors live Mac volume.
 enum MacVolumeControlPresentation {
     static let defaultTargetFraction = 0.5
     static let currentVolumeDisclosure = "Pick a volume target to send to your Mac. The slider doesn’t track later changes on the Mac."
@@ -77,9 +72,7 @@ enum MacVolumeControlPresentation {
     }
 }
 
-/// Explicit presentation state for the notification composer. A result must
-/// identify both the operation and its outcome instead of appearing as an
-/// unlabeled line beside a disabled-looking control.
+/// Name notification operation and outcome so feedback cannot look like an unlabeled disabled control.
 enum MacNotificationSendPresentation {
     enum Feedback: Equatable {
         case sent
@@ -96,9 +89,7 @@ enum MacNotificationSendPresentation {
     }
 }
 
-/// Spotlight's empty string means the Mac did not provide a search response.
-/// That is different from a nonempty response whose lines contain no usable
-/// results, which is a completed zero-result search.
+/// Empty Spotlight response means unavailable; a nonempty response without usable rows proves a completed zero-result search.
 enum MacToolsSpotlightPresentation {
     static let collapsedResultLimit = 8
 

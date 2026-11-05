@@ -263,9 +263,7 @@ enum ResearchSearchServicePresentation {
     }
 }
 
-/// Shared eligibility and explanatory state for the Research surface. The
-/// actual save/search actions remain on their root-scoped Research and
-/// AppModel owners; this only projects whether the controls may invite them.
+/// Root-scoped Research and AppModel own actions; this projection only determines control eligibility.
 struct ResearchSearchConfigurationPresentation: Equatable {
     let statusText: String
     let validationError: String?

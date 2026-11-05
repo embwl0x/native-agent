@@ -4,7 +4,7 @@ import PersistenceCore
 // Blueprint: | `LLMClient+OpenAIResponsesDecoding.swift` | `ChatGPTTransport`: `consumeResponsesStream`, `incompleteReasonText`, `incompleteNote` |
 
 extension ChatGPTTransport {
-    /// Shared Responses SSE execution; authentication and HTTP retries stay with each lane.
+    /// Shared SSE execution leaves authentication and HTTP retry ownership with each adapter.
     static func consumeResponsesStream(
         bytes: URLSession.AsyncBytes,
         request req: URLRequest,
@@ -17,7 +17,7 @@ extension ChatGPTTransport {
         errorPrefix: String,
         transport: OpenAIExecutionControls.Transport = .chatGPTOAuth,
         networkError: (Error) -> LLMError,
-        continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation, call: LLMCall
     ) async throws {
         struct PendingCall {
             var callId: String
@@ -34,13 +34,13 @@ extension ChatGPTTransport {
                 continuation.yield(.replyTextSettled(false))
             }
         }
-        // TTFT starts at the first text, function-call or argument frame; usage comes from response.completed.
+        // Text and tool output both establish TTFT; usage belongs to the terminal frame.
         var capturedUsage: LLMUsage?
         var ttftMs: Int?
-        // response.incomplete supplies the terminal incomplete reason.
+        // Keep the provider's explicit incomplete reason.
         var incompleteReason: String?
         var refusalTextByPart: [String: String] = [:]
-        var runaway = RunawayOutputDetector(diagnosticDataRoot: telemetry.diagnosticDataRoot)
+        var runaway = RunawayOutputDetector(diagnosticDataRoot: telemetry.diagnosticDataRoot(call: call), call: call)
 
         func stampTTFT() {
             if ttftMs == nil {
@@ -51,7 +51,8 @@ extension ChatGPTTransport {
         func yieldToolCall(id: String, name: String, args: String) throws {
             guard !id.isEmpty, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   (try? JSONSerialization.jsonObject(with: Data(args.utf8))) is [String: Any] else {
-                throw LLMError.providerError(message: "\(providerLabel): incomplete function call; a call ID, name and object arguments are required. Repair the provider stream.")
+                throw LLMError.providerError(
+                    message: "\(providerLabel): incomplete function call; a call ID, name and object arguments are required. Repair the provider stream.")
             }
             sawFunctionCall = true
             yieldedToolCall = true
@@ -110,9 +111,7 @@ extension ChatGPTTransport {
                     }
                     sawFunctionCall = true
                     resumeReply()
-                    // First model-output frame for a
-                    // tool-call-first response — stamp TTFT
-                    // here, not at output_item.done.
+                    // A tool-first reply establishes TTFT before its item completes.
                     stampTTFT()
                     guard let callId = item["call_id"] as? String, !callId.isEmpty,
                           let name = item["name"] as? String, !name.isEmpty,
@@ -127,20 +126,19 @@ extension ChatGPTTransport {
                 resumeReply()
                 if let id = event["item_id"] as? String,
                    let delta = event["delta"] as? String {
-                    // Argument deltas are model output even
-                    // when the item wasn't registered by a
-                    // recognized `added` frame — stamp
-                    // unconditionally.
+                    // Argument deltas establish output even if the item's added frame was unrecognized.
                     stampTTFT()
                     guard pendingByItemId[id] != nil else {
                         throw LLMError.providerError(message: "\(providerLabel): function-call arguments arrived before their item identity")
                     }
                     pendingByItemId[id]?.args.append(delta)
+                    // A call's argument delta is movement that says what is being written and how much.
+                    if let pending = pendingByItemId[id] {
+                        continuation.yield(.callInput(LLMStreamCallInput(name: pending.name, input: pending.args.utf8)))
+                    }
                 } else {
                     throw LLMError.providerError(message: "\(providerLabel): function-call delta has no item ID or arguments")
                 }
-                // Tool-argument deltas emit keepAlive because accumulated output still proves liveness.
-                continuation.yield(.keepAlive)
             } else if etype == "response.output_item.done" {
                 if let item = event["item"] as? [String: Any],
                    (item["type"] as? String) == "message",
@@ -158,24 +156,20 @@ extension ChatGPTTransport {
                           let name = item["name"] as? String, name == pending.name,
                           let arguments = item["arguments"] as? String,
                           pending.args.isEmpty || pending.args == arguments else {
-                        throw LLMError.providerError(message: "\(providerLabel): function-call completion lacks or contradicts its registered identity/arguments")
+                        throw LLMError.providerError(
+                            message: "\(providerLabel): function-call completion lacks or contradicts its registered identity/arguments")
                     }
                     try yieldToolCall(id: callID, name: name, args: arguments)
                     pendingByItemId.removeValue(forKey: id)
                 }
             } else if etype == "response.completed" || etype == "response.done" {
-                // Usage rides on the terminal frame.
                 let respObj = event["response"] as? [String: Any]
                 if let usageObj = respObj?["usage"] as? [String: Any] {
                     capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
                 }
                 return true
             } else if etype == "response.incomplete" {
-                // Terminal: the model stopped at a limit, the
-                // transport did not drop. Without this the
-                // stream ended `shouldStop == false` and threw
-                // `.streamTruncated`, sending an output-limit
-                // completion into the reconnect ladder.
+                // An output-limit terminal is incomplete output, not transport truncation; it must not trigger reconnect recovery.
                 let respObj = event["response"] as? [String: Any]
                 if let usageObj = respObj?["usage"] as? [String: Any] {
                     capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
@@ -199,24 +193,17 @@ extension ChatGPTTransport {
                     "\(errorPrefix) error: \(detail)"
                 )
             } else if etype.hasPrefix("response.reasoning") {
-                // Liveness: extended-reasoning frames
-                // (response.reasoning_text.delta /
-                // reasoning_summary_text.delta / …) carry no
-                // user-visible content but ARE real model activity.
-                // Emit `.keepAlive` so a long reasoning phase
-                // doesn't trip the guard's idle timeout — parity
-                // with the Anthropic thinking_delta path. Reasoning
-                // is NOT surfaced as reply text (no content yield).
+                // Reasoning frames renew liveness without becoming reply text, preventing idle cuts during active thinking.
                 continuation.yield(.keepAlive)
             }
             return false
         }
 
-        // SSEEventStream owns line framing, multiline data and EOF flush; processPayload owns Responses semantics.
-        // Initial and mid-stream transport failures share the same mapper.
+        // SSEEventStream owns line framing, multiline data and EOF flush; processPayload owns Responses semantics. Initial and mid-stream transport
+        // failures share the same mapper.
         var shouldStop = false
         do {
-            for try await sse in SSEEventStream(bytes) {
+            for try await sse in SSEEventStream(bytes, lifetime: call.lifetime) {
                 try Task.checkCancellation()
                 shouldStop = try processPayload(sse.data)
                 if shouldStop { break }
@@ -231,7 +218,7 @@ extension ChatGPTTransport {
             throw mapTransportError(error, fallback: networkError(error))
         }
         if let reason = runaway.toolBoundaryReason {
-            await telemetry.record(
+            await telemetry.record(call: call,
                 requestBody: req.httpBody,
                 provider: providerId,
                 model: model,
@@ -253,7 +240,7 @@ extension ChatGPTTransport {
             )
         }
         if let reason = incompleteReason {
-            await telemetry.record(
+            await telemetry.record(call: call,
                 requestBody: req.httpBody,
                 provider: providerId,
                 model: model,
@@ -266,7 +253,7 @@ extension ChatGPTTransport {
                 stopReason: reason
             )
             if reason == "max_output_tokens" || reason == "max_tokens" {
-                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot)
+                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot(call: call), call: call)
                 continuation.yield(.toolBoundary(.outputLimit))
                 return
             }
@@ -280,9 +267,8 @@ extension ChatGPTTransport {
                 message: "\(providerLabel) stream produced no content (terminal event, empty)"
             )
         }
-        // Each successful stream records one llm.call row.
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-        await telemetry.record(
+        await telemetry.record(call: call,
             requestBody: req.httpBody,
             provider: providerId,
             model: model,
@@ -294,7 +280,6 @@ extension ChatGPTTransport {
         )
     }
 
-    /// The reason a `response.incomplete` frame gives for stopping.
     static func incompleteReasonText(from event: [String: Any]) -> String {
         let response = event["response"] as? [String: Any]
         let details = response?["incomplete_details"] as? [String: Any]

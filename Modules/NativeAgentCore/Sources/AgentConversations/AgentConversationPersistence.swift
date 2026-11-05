@@ -12,15 +12,16 @@ import TurnTrace
 // Blueprint: | `AgentConversationPersistence.swift` | Checked conversation serialization and projection publication under the existing file lock |
 
 extension AgentConversationStore {
-    /// Heal decisions already saved before this process saw them, including a denial racing a queued follow-up's begin. Approval storage is checked; unavailable authority leaves the exchange untouched.
+    /// Checked approval storage settles saved decisions, including queued-send races; unavailable authority leaves exchanges untouched.
     func reconcileDeniedApprovals(_ rows: inout [AgentConversationRecord]) throws -> Bool {
-        // The receipt alone says the send waits on a card; a record that left "attention" another way (a stop, a release) still settles its denial.
+        // The receipt owns approval waiting even if the record left attention through another path.
         let held = rows.indices.filter {
             guard case .object(let receipt)? = rows[$0].receipt else { return false }
             return receipt["approvalId"] != nil && AgentConversationRecord.approvalWaits(receipt["status"]?.stringValue ?? "")
         }
-        // Older sends in the ledger wait on their own cards; a decision made after the record moved on settles them too.
-        let ledgerHeld = rows.indices.filter { rows[$0].exchanges?.contains { $0.approvalId != nil && AgentConversationRecord.approvalWaits($0.status) } == true }
+        // Ledger entries retain their own cards after the record advances.
+        let ledgerHeld = rows.indices.filter { rows[$0].exchanges?.contains { $0.approvalId != nil && AgentConversationRecord.approvalWaits(
+            $0.status) } == true }
         guard !held.isEmpty || !ledgerHeld.isEmpty else { return false }
         let decisions = try SwiftNativeApprovalInbox.loadApprovalRowsChecked(
             at: fileURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("workflows/approvals/requests.json"))
@@ -33,7 +34,8 @@ extension AgentConversationStore {
         }
         for i in ledgerHeld {
             guard var history = rows[i].exchanges else { continue }
-            for index in history.indices where history[index].approvalId != nil && AgentConversationRecord.approvalWaits(history[index].status) && history[index].id != rows[i].operationID {
+            for index in history.indices where history[index].approvalId != nil && AgentConversationRecord.approvalWaits(history[index].status)
+                && history[index].id != rows[i].operationID {
                 guard let status = decided(history[index].approvalId!) else { continue }
                 history[index].status = status; history[index].phase = "ready"
                 if history[index].settledAt == nil { history[index].settledAt = Date() }
@@ -50,7 +52,7 @@ extension AgentConversationStore {
             rows[i].receipt = .object(["status": .string(status), "sent": .bool(false), "completed": .bool(false),
                 "approvalId": receipt["approvalId"]!, "detail": .string(outcome.sentence())])
             rows[i].phase = "ready"; rows[i].automaticRead = false; rows[i].nextReadAt = nil; rows[i].deliveryState = nil
-            // Keep its own time: settling an old denial must not make it the contact's newest send (it hid newer replies behind "denied").
+            // Preserve the denial’s own time so it cannot hide newer replies.
             try Self.absorbExchange(into: &rows[i], file: fileURL)
             changed = true
         }
@@ -59,7 +61,6 @@ extension AgentConversationStore {
 
     func select(_ rows: [AgentConversationRecord], scope: String, agent: String, label: String?) throws -> AgentConversationRecord? {
         let matches = rows.filter { $0.scopeSessionID == scope && $0.agent == agent }
-        // Without a name, use the selected thread or latest activity; ambiguous names require an id.
         if let label {
             let named = matches.filter { $0.id == label || $0.label.caseInsensitiveCompare(label) == .orderedSame }
             guard named.count <= 1 else {
@@ -87,7 +88,10 @@ extension AgentConversationStore {
         }
         for row in rows {
             guard row.operationStartedAt != nil else {
-                throw Failure(message: "Conversation \(row.id) has no operation start time. Repair its retained evidence in \(fileURL.path); existing bytes were preserved.")
+                throw Failure(message: """
+                    Conversation \(row.id) has no operation start time. Repair its retained evidence in \(fileURL.path); existing bytes were \
+                    preserved.
+                    """)
             }
             try AgentConversationExchange.validate(row.exchanges, file: fileURL)
         }
@@ -99,7 +103,8 @@ extension AgentConversationStore {
                 rows[i].queued?[j].waitingForMac = nil
                 if rows[i].queueReservation == rows[i].queued?[j].id { rows[i].queueReservation = nil }
             }
-            for j in rows[i].exchanges?.indices ?? 0..<0 where ["held", "delivering"].contains(rows[i].exchanges?[j].status ?? "") && DataRootLife.life(of: rows[i].exchanges?[j].lifeID) != life {
+            for j in rows[i].exchanges?.indices ?? 0..<0 where ["held", "delivering"].contains(rows[i].exchanges?[j].status ?? "")
+                && DataRootLife.life(of: rows[i].exchanges?[j].lifeID) != life {
                 rows[i].exchanges?[j].phase = "stopped"
                 rows[i].exchanges?[j].status = DataRootLife.stoppedReason
             }
@@ -117,19 +122,7 @@ extension AgentConversationStore {
             receipt["reason"] = .string(DataRootLife.stoppedReason)
             rows[i].receipt = .object(receipt)
         }
-        let peers = try AgentPeerStore(dataRoot: root).list()
-        for index in rows.indices where rows[index].phase == "waiting" && AgentConversationDelivery.claudeInbox(rows[index]) {
-            guard case .object(var receipt)? = rows[index].receipt, receipt["read"] != .bool(true),
-                  case .string(let path)? = receipt["filePath"], case .string(let message)? = rows[index].readInput?["message_id"],
-                  let peer = peers.first(where: { "peer:" + $0.id == rows[index].agent }) else { continue }
-            guard let door = (peer.handles ?? []).compactMap({ AgentConversationDelivery.door(for: $0, dataRoot: root, contacts: peers) })
-                .first(where: { $0.inbox.path == path }) else { continue }
-            receipt["remedy"] = door.remedy()
-            if try DelegationStatusProjector.requestRecords(inbox: door.inbox, ids: [message])[message]?["read"] == "true" { receipt["read"] = .bool(true) }
-            AgentConversationSession.absorb(.object(receipt), into: &rows[index])
-            try Self.absorbExchange(into: &rows[index], file: fileURL)
-        }
-        return try reconcilingExpiredReplies(rows, peers: peers)
+        return try reconcilingExpiredReplies(rows, peers: try AgentPeerStore(dataRoot: root).list())
     }
 
     func reconcilingExpiredReplies(_ records: [AgentConversationRecord], peers: [AgentPeerContact]) throws -> [AgentConversationRecord] {
@@ -137,7 +130,7 @@ extension AgentConversationStore {
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         let requests = GrokRequestStore(dataRoot: root)
         for i in rows.indices where ["sending", "waiting", "attention"].contains(rows[i].phase) {
-            // A send retains the previous receipt until dispatch settles.
+            // Retain the previous receipt until dispatch settles.
             var receipt = rows[i].phase == "sending" ? .object([:]) : rows[i].receipt ?? .object([:])
             if peers.contains(where: { "peer:" + $0.id == rows[i].agent && $0.transport == .grokBot }),
                case .object(let fields) = receipt, fields["reply_deadline"] == nil,
@@ -176,7 +169,7 @@ extension AgentConversationStore {
             }
         }
         for row in rows { try AgentConversationExchange.validate(row.exchanges, file: fileURL) }
-        // A send the bounded ledger lets go keeps its evidence on the record, in this same write, until its last state is on its own transcript row.
+        // Pruned ledger evidence stays on the record until its terminal state reaches its transcript row.
         var released = false
         for index in rows.indices where rows[index].agent.hasPrefix("peer:") {
             guard let old = previous.first(where: { $0.id == rows[index].id }) else { continue }

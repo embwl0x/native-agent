@@ -28,7 +28,6 @@ extension iCloudSyncEngine {
         static let transactions = "transactions/ios"
     }
 
-    // Ephemeral-mailbox retention and prune cadence.
     static var ephemeralRetentionSeconds: TimeInterval { 14 * 24 * 60 * 60 }
     static var ephemeralPruneIntervalSeconds: TimeInterval { 24 * 60 * 60 }
     static var ephemeralPruneStampKey: String { "NativeAgentMobile.ephemeralPrunedAt" }
@@ -73,15 +72,10 @@ extension iCloudSyncEngine {
 
         pruneEphemeralDirectoriesIfDue()
 
-        // Initial load stays light. Heavy/tab-specific snapshots are loaded
-        // by the visible tab on demand so launch cannot hydrate every chat
-        // transcript or memory payload into iPhone RAM.
+        // Load heavy snapshots only for visible tabs so launch cannot hydrate every transcript or memory into phone RAM.
     }
 
-    /// Prune old terminal transactions and consumed responses off-main, at setup and at most daily.
-    /// Only a retained terminal response receipt proves consumption.
-    /// Recheck file identity before removal; unreadable or changed files survive.
-    /// Nonterminal transactions, snapshots and inbox files remain untouched.
+    /// Prune off-main at most daily, using retained terminal consumption proof; keep unreadable/changed files and all nonterminal work.
     func pruneEphemeralDirectoriesIfDue(force: Bool = false) {
         let defaults = UserDefaults.standard
         let now = Date().timeIntervalSince1970
@@ -94,8 +88,7 @@ extension iCloudSyncEngine {
         let cutoff = Date(timeIntervalSince1970: now - Self.ephemeralRetentionSeconds)
         Task.detached(priority: .utility) {
             let result = await VolumeIO.result {
-                // Read the ledger BEFORE deleting anything from it: a response is
-                // only prunable because some terminal row says it was answered.
+                // Read the ledger before deleting responses; only terminal rows prove a response was consumed.
                 var terminalTransactions: [URL] = []
                 var consumedResponseIDs = Set<String>()
                 if let transactions {
@@ -120,8 +113,7 @@ extension iCloudSyncEngine {
                 }
                 for file in terminalTransactions {
                     let record = try JSONDecoder().decode(ICloudTransactionRecord.self, from: VolumeIO.contents(of: file))
-                    // Keep the consumption proof while its response survives
-                    // (too young, changed, or not removed).
+                    // Keep consumption proof while its response survives pruning.
                     guard let messageID = record.msgId else { continue }
                     if let responses,
                        try Self.readActionMailboxFile(at: responses.appendingPathComponent("\(messageID).json")) != nil {
@@ -139,8 +131,7 @@ extension iCloudSyncEngine {
         }
     }
 
-    /// Every non-directory entry directly inside `directory`. An unavailable
-    /// ledger aborts retention before any response deletion.
+    /// Unavailable ledger aborts retention before any response deletion.
     private nonisolated static func prunableFiles(in directory: URL) throws -> [URL] {
         let files = try FileManager.default.contentsOfDirectory(
             at: directory,
@@ -152,18 +143,13 @@ extension iCloudSyncEngine {
         }
     }
 
-    /// The states after which nothing more will happen to a transaction. A row
-    /// in any other state (`queued`, `sent`, `pending_approval`) is still
-    /// outstanding and is never pruned, however old it is.
+    /// Prune terminal states only; queued, sent and pending_approval remain outstanding regardless of age.
     nonisolated static func isTerminalTransactionState(_ state: String) -> Bool {
         ["completed", "failed", "send_failed", "cancelled", "orphaned"]
             .contains(state.lowercased())
     }
 
-    /// Delete `url` only if it is older than `cutoff` AND is still the same
-    /// file it was when that was measured — same inode, same modification date,
-    /// same size. A replacement written into the same name between the two
-    /// stats survives.
+    /// Recheck inode, mtime and size before removing an old file so replacements written under the same name survive.
     private nonisolated static func removeIfUnchanged(_ url: URL, olderThan cutoff: Date) throws {
         let before = try Self.fileIdentity(url)
         guard
@@ -217,13 +203,11 @@ extension iCloudSyncEngine {
         refreshInFlight = false
         refreshQueued = false
         cloudKitCatchUpIncomplete = false
-        cloudKitCatchUpFailed = false
+        cloudKitCatchUpFailures = 0
         syncError = nil
     }
 
-    /// Select the local cache populated by bounded CloudKit NAStatus records.
-    /// The bytes retain the existing snapshot contracts; only their transport
-    /// changes for public Mac builds that cannot use CloudDocuments.
+    /// CloudKit's bounded NAStatus cache preserves snapshot byte contracts where public Mac builds cannot use CloudDocuments.
     func enableCloudKitSnapshotCache() async {
         lifecycleGeneration &+= 1
         refreshInFlight = false
@@ -252,18 +236,22 @@ extension iCloudSyncEngine {
         responsesDir = responses
         transactionDir = transactions
         isSetUp = true
+        // What this phone last received opens first: the conversations and their chat are on disk, so Chat shows them before any network
+        // or mailbox work, and later deliveries change only what changed.
+        _ = await refreshSnapshotGroup(.core)
+        _ = await refreshSnapshotGroup(.chat)
         pruneEphemeralDirectoriesIfDue()
         await settleUnobservedActionResponses()
     }
 
-    /// Claim a status generation only after durable application and a successful
-    /// current-lifecycle refresh; interrupted or failed reads remain eligible.
+    /// Claim generation only after durable application and successful current-lifecycle refresh; failed/interrupted reads remain eligible.
     @discardableResult
     func applyCloudKitSnapshotStatus(
         _ value: String,
         group: NAMobileSnapshotGroup,
         originatingPairing: Data,
-        writtenAt: Date? = nil
+        writtenAt: Date? = nil,
+        recovery: DeviceSyncRecovery = .init()
     ) async -> Bool {
         let generation = lifecycleGeneration
         let deliveryPairing = originatingPairing
@@ -281,8 +269,7 @@ extension iCloudSyncEngine {
                 try fm.createDirectory(at: directory, withIntermediateDirectories: true)
                 for (filename, data) in files {
                     if filename == "work_overview.json" {
-                        // Compare and write together so concurrent deliveries
-                        // cannot undo a newer overview.
+                        // Compare and write atomically so concurrent deliveries cannot replace a newer overview.
                         try Self.writeWorkOverviewCache(data, to: directory.appendingPathComponent(filename))
                         continue
                     }
@@ -296,9 +283,8 @@ extension iCloudSyncEngine {
             guard generation == lifecycleGeneration else { return false }
             prefersCloudKitSnapshotCache = true
             snapshotDir = directory
-            // Only an explicitly successful group refresh accepts this status
-            // and renews its delivery clock; keep failed reads eligible for retry.
-            let refreshed = await refreshSnapshotGroup(group)
+            // Only successful group refresh accepts status and renews delivery age; failed reads remain eligible.
+            let refreshed = await refreshSnapshotGroup(group, recovery: recovery)
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return false }
             if refreshed {
@@ -352,31 +338,28 @@ extension iCloudSyncEngine {
             let writtenAt = signal?.components(separatedBy: "|").first.flatMap {
                 ISO8601DateFormatter().date(from: $0)
             }
-            // The ping says the Mac published; only the group read that
-            // actually landed is evidence THAT group's rows arrived, so each
-            // group renews its own delivery clock on its own success.
-            if let groups = Self.snapshotSignalGroups(signal), !groups.isEmpty {
-                for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
-                    if await self.refreshSnapshotGroup(group) {
-                        if let writtenAt {
-                            iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
-                        }
-                        self.noteTransportDelivery(groups: [group])
-                    }
-                }
-            } else {
+            // Publication pings do not prove every group arrived; renew each delivery clock only on that group's successful read.
+            guard let groups = Self.snapshotSignalGroups(signal) else {
                 guard signal != nil else { return }
-                self.syncError = "The Mac's snapshot signal names no supported publication group. Refresh the Mac's phone snapshots to repair this signal."
+                self.syncError = "The Mac's snapshot signal carries no publication groups. Refresh the Mac's phone snapshots to repair this signal."
+                return
+            }
+            // Faces are never named (older phones refuse a name they do not know), so every ping reads them.
+            for group in NAMobileSnapshotGroup.allCases where groups.contains(group) || group == .faces {
+                if await self.refreshSnapshotGroup(group) {
+                    if let writtenAt {
+                        iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
+                    }
+                    self.noteTransportDelivery(groups: [group])
+                }
             }
         }
     }
 
-    /// Returns whether this group's read landed. The caller claims freshness
-    /// from this value alone.
+    /// Freshness may advance only when this group's read reports successful adoption.
     @discardableResult
-    func refreshSnapshotGroup(_ group: NAMobileSnapshotGroup) async -> Bool {
-        // Every group refresh re-reads the Mac's staleness marker: the group
-        // that went stale is often NOT the group being refreshed.
+    func refreshSnapshotGroup(_ group: NAMobileSnapshotGroup, recovery: DeviceSyncRecovery = .init()) async -> Bool {
+        // Reread Mac staleness on every group refresh because another group may have become stale.
         await refreshSnapshotStaleness()
         switch group {
         case .core:
@@ -390,9 +373,11 @@ extension iCloudSyncEngine {
         case .scheduler:
             return await refreshSchedulerSnapshot()
         case .activity:
-            return await refreshActivitySnapshot()
+            return await refreshActivitySnapshot(recovery: recovery)
         case .work:
             return await refreshWorkActivitySnapshot()
+        case .faces:
+            return await refreshFacesSnapshot()
         case .advanced:
             let summaries = await refreshTurnSummariesSnapshot()
             let runs = await refreshRunsSnapshot().outcome == .refreshed
@@ -402,20 +387,15 @@ extension iCloudSyncEngine {
         }
     }
 
-    /// A publication names only current groups; malformed/unknown signals are refused.
+    /// The groups a publication names. A name this build does not know is a newer Mac's group and is left out, never voiding the rest; only a
+    /// signal with no group list is malformed.
     nonisolated static func snapshotSignalGroups(
         _ value: String?
     ) -> Set<NAMobileSnapshotGroup>? {
         guard let value,
               let marker = value.range(of: "|groups=") else { return nil }
-        var groups: Set<NAMobileSnapshotGroup> = []
-        for token in value[marker.upperBound...].split(separator: ",") {
-            let name = token.trimmingCharacters(in: .whitespaces)
-            // An empty slot names nothing; it does not make the signal unknown.
-            guard !name.isEmpty else { continue }
-            guard let group = NAMobileSnapshotGroup(rawValue: name) else { return nil }
-            groups.insert(group)
-        }
-        return groups
+        return Set(value[marker.upperBound...].split(separator: ",").compactMap {
+            NAMobileSnapshotGroup(rawValue: $0.trimmingCharacters(in: .whitespaces))
+        })
     }
 }

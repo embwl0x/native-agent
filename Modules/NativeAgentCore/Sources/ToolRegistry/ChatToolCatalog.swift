@@ -1,29 +1,24 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `ChatToolCatalog.swift` | `ChatToolCatalogSnapshot`, schema and dispatch-plan values: typed tool inventory and runtime safety categories, with presentation-only taxonomy |
+// Blueprint: | `ChatToolCatalog.swift` | `ChatToolCatalogSnapshot`: typed schema and execution policy |
 
 // MARK: - The catalog as the Tools page reads it
 
-/// One row of the full tool manifest (`SwiftToolDispatcher.toolManifest`): what the tool is (Core's row)
-/// and whether it may run here right now (the Security gate's decision the app
-/// wrapper stamps on each row).
+/// Core declarations and the app's current Security decision share one row so schema presence cannot imply authority.
 public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
     public var id: String { name }
     public var name: String
     public var description: String
     public var parametersPreview: String?
     public var dispatchableVia: String?
-    /// Whether this schema is carried to the model by the current request contract.
+    /// Only current request-contract schemas reach the model.
     public var modelVisible: Bool?
     public var effectiveAutonomy: String?
     public var availableNow: Bool?
-    /// Typed runtime category emitted by the dispatcher registry. Unlike tags,
-    /// this is the visible safety contract for every registered tool name.
+    /// Runtime categories are the dispatcher's safety contract, independent of presentation tags.
     public var catalogBucket: String?
-    /// Catalog-provided, presentation-only taxonomy. An absent tag is never
-    /// inferred from a display name; callers keep it in the ordinary-tool
-    /// bucket until a checked catalog (or canonical fallback) says otherwise.
+    /// Absent presentation tags remain ordinary; display names cannot invent catalog taxonomy.
     public var tags: Set<String>?
 
     public init(
@@ -48,11 +43,10 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
         self.tags = tags
     }
 }
-/// The full tool manifest, typed: every row, membership in the fixed floor, and the
-/// Full Mac lanes the Trust Center has open or locked.
+/// Full manifest membership stays distinct from Trust's current execution authority.
 public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     public var tools: [ChatCatalogTool]
-    /// The current always-on schemas, intersected with this catalog.
+    /// Always-on schemas must also exist in this catalog.
     public var alwaysOnTools: Set<String>
     public var builderAvailable: [String]
     public var builderPolicyLocked: [String]
@@ -65,7 +59,6 @@ public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     public var builderModeDetail: String
     public var permissionLevel: String
 
-    /// Reads a full manifest; nil when it is not an object.
     public init?(envelope value: JSONValue) {
         guard case .object(let obj) = value else { return nil }
 

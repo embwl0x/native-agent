@@ -8,16 +8,16 @@ import CognitiveSubstrate
 import ChatTurnContracts
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `MemoryStorage+Projections.swift` | `MemoryStorage`: ordered USER.md, Spotlight and graph projection tails, attachment, canonical readback and shutdown settlement without cancelling canonical writes; startup eviction publication and `userPromptCore` |
+// Blueprint: | `MemoryStorage+Projections.swift` | `MemoryStorage`, `userPromptCore`: ordered derived hooks and user prompt core |
 
 extension MemoryStorage {
-    /// Attach a USER.md generator so mutations debounce-regenerate the file.
+    /// Debounce USER.md regeneration from canonical mutations.
     public func attachUserMDGenerator(_ generator: UserMDGenerator) async {
         guard !projectionsClosed else { await generator.shutdown(); return }
         guard userMDGenerator !== generator else { return }
         let previous = self.userMDGenerator
         self.userMDGenerator = generator
-        // Replacement retires the old generator's deadline and accepted work.
+        // Retire the replaced generator's deadline and accepted work.
         if let previous {
             let retirement = enqueueUserMDProjection { await previous.shutdown() }
             await retirement?.value
@@ -31,9 +31,7 @@ extension MemoryStorage {
         }
     }
 
-    /// Install a Spotlight-index hook. Fires for every insert/update/
-    /// acceptProposal/archive/delete with `deleted` derived from final row
-    /// projection eligibility.
+    /// Notify Spotlight for every canonical mutation using final row eligibility to derive deletion.
     public func attachSpotlightHook(
         _ hook: @escaping @Sendable (StoredMemory, Bool) async -> Void
     ) {
@@ -140,9 +138,8 @@ extension MemoryStorage {
         }
     }
 
-    /// Close only derived-work admission. Canonical writes remain accepted;
-    /// already-enqueued projections drain in order without blanket cancellation.
-    /// Writes arriving after closure are reconciled from SQLite at next launch.
+    /// Close only derived-work admission. Canonical writes remain accepted; already-enqueued projections drain in order without blanket cancellation. Writes
+    /// arriving after closure are reconciled from SQLite at next launch.
     public func shutdownProjections() async {
         projectionsClosed = true
         spotlightHook = nil
@@ -179,8 +176,7 @@ extension MemoryStorage {
         await pokeDerivedState(stored, deleted: deleted)
     }
 
-    /// Re-read and enqueue the complete batch without an actor suspension.
-    /// A deleted row must not be reinserted by an older captured warning update.
+    /// Re-read and enqueue the complete batch without an actor suspension. A deleted row must not be reinserted by an older captured warning update.
     func refreshProjectionHooks(ids: [String]) async throws {
         let current = try enqueueCurrentProjectionHooks(ids: ids)
         for row in current {
@@ -221,9 +217,8 @@ extension MemoryStorage {
         }
     }
 
-    /// Read pinned facts about User in chosen order, or disclosure-filtered user
-    /// facts before the first pin. Both admit only `userIdentityKinds`. An
-    /// empty result never restores unfiltered USER.md.
+    /// Only userIdentityKinds enter the user prompt core; chosen pins or disclosure-filtered facts supply order, and empty results never restore unfiltered
+    /// USER.md.
     public func userPromptCore(surface: String) async throws -> [String]? {
         let now = Date()
         let dataRoot = path.deletingLastPathComponent().deletingLastPathComponent()

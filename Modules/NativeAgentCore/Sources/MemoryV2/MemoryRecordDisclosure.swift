@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MemoryRecordDisclosure.swift` | `MemoryRecordDisclosurePolicy`: pure shared record privacy/persona/surface disclosure, independent of Trust tool admission |
+// Blueprint: | `MemoryRecordDisclosure.swift` | `MemoryRecordDisclosurePolicy`: record privacy independent of tool admission |
 
 public enum MemoryDisclosurePrivacy: String, Sendable, Codable, CaseIterable {
     case localPrivate = "local_private"
@@ -42,31 +42,22 @@ public struct MemoryDisclosureClassification: Sendable, Codable, Equatable {
     private func normalize(_ value: String) -> String { Self.normalize(value) }
 }
 
-/// One pure disclosure policy consumed by automatic Context projection and
-/// explicit MemoryV2 recall. TrustCenter still independently authorizes the
-/// tool; this policy only decides whether a record may leave MemoryV2 for the
-/// requested persona/surface.
+/// Share record disclosure between automatic Context and explicit recall; TrustCenter independently authorizes the tool.
 public enum MemoryRecordDisclosurePolicy {
-    /// Keep both `workshop` and `missions` for persisted rows and older readers.
-    /// A standing bot runs under the agent's own Trust and can read local-private memories.
-    public static let allSurfaces: Set<String> = ([
-        "chat", "telegram", "ios", "slack", "bridge", "bot",
-    ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
+    /// Persisted surface IDs share disclosure scope; standing bots use the agent's Trust for local-private memories.
+    public static let allSurfaces: Set<String> = [
+        "chat", "telegram", "ios", "slack", "bridge", "bot", WorkshopSurfaceVocabulary.canonical,
+    ]
     /// Authenticated personal surfaces and local bot runs share the local-private tier.
-    public static let localPrivateSurfaces: Set<String> = ([
-        "chat", "telegram", "ios", "bridge", "bot",
-    ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
+    public static let localPrivateSurfaces: Set<String> = [
+        "chat", "telegram", "ios", "bridge", "bot", WorkshopSurfaceVocabulary.canonical,
+    ]
 
-    /// Canonicalize persisted `missions` to `workshop` and agent bridge surfaces to `bridge`.
+    /// The disclosure scope of a turn surface: the agent-bridge surface shares the `bridge` scope; every other surface is its own scope.
     public static func canonicalSurface(_ value: String) -> String {
         let normalized = normalize(value)
-        switch normalized {
-        case "claude-bridge", "claude_bridge",
-             "codex-bridge", "codex_bridge",
-             // PeerTurnEffectPolicy fences effects; peer sessions retain ordinary bridge recall.
-             "agent-bridge", "agent_bridge": return "bridge"
-        default: return WorkshopSurfaceVocabulary.canonicalSurface(normalized)
-        }
+        // PeerTurnEffectPolicy fences effects; peer sessions retain ordinary bridge recall.
+        return normalized == "agent-bridge" ? "bridge" : normalized
     }
 
     public static func classify(
@@ -95,7 +86,6 @@ public enum MemoryRecordDisclosurePolicy {
         }
 
         var surfaceNames = strings(metadata, key: "permittedSurfaces")
-        if surfaceNames.isEmpty { surfaceNames = strings(metadata, key: "surfaces") }
         surfaceNames.append(contentsOf: normalizedTags.compactMap { tag in
             guard tag.hasPrefix("surface:") else { return nil }
             return String(tag.dropFirst("surface:".count))
@@ -114,8 +104,7 @@ public enum MemoryRecordDisclosurePolicy {
         )
     }
 
-    /// A record whose `valid_to` has passed was true once and is not now: it
-    /// stays in the store and leaves what is disclosed, like a superseded one.
+    /// Expired validity withholds current disclosure without deleting historical truth.
     public static func isTemporallyEligible(validTo: String?, at now: Date) -> Bool {
         guard let validTo else { return true }
         guard let expiry = MemoryRecallScoring.parseTimestamp(validTo) else { return false }

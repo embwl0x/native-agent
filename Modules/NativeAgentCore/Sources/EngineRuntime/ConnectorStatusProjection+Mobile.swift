@@ -3,9 +3,9 @@ import NativeAgentShared
 import Connectors
 import DeviceSync
 import PersistenceCore
-// Blueprint: | `ConnectorStatusProjection+Mobile.swift` | Credential-free mobile rows and commands use their own checked refresh result from ConnectorReadiness; Mac and phone toggles share update and its checked verification; committed disconnect fences earlier reads through write before lane restart and checked verification. |
+// Blueprint: | `ConnectorStatusProjection+Mobile.swift` | Credential-free mobile snapshots and checked mutations |
 
-/// Credential-free rows shared by the existing snapshot and mutation receipts.
+/// Share credential-free rows between snapshots and mutation receipts.
 extension MobileConnectorSnapshot {
     public static let credentialProviders: Set<String> = ["slack"]
 
@@ -41,8 +41,7 @@ extension ConnectorReadiness {
             throw Self.connectorFailure("This connector cannot be disconnected here.")
         }
         try await ConnectorRegistryActions.disconnectSlack(root: root)
-        // The revoke committed. Earlier reads cannot republish its old account
-        // state while the lane restarts; the checked read below publishes it.
+        // Fence earlier reads after revocation so the restart cannot republish the old account.
         snapshotRead.write {}
         await Self.restartSlackLane(root: root)
         guard let recovered = try await mobileConnectors().first(where: { $0.id == id }),

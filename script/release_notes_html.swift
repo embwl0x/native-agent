@@ -1,22 +1,11 @@
 #!/usr/bin/env swift
-// Markdown release notes -> styled HTML fragment for the Sparkle update dialog.
-//
-// Reads markdown on stdin, writes a self-contained <div> fragment on stdout:
-// headings, bullet lists (with two-space continuation lines), paragraphs,
-// **bold**, and `code`, plus a <style> block that follows the system
-// appearance (light/dark) inside Sparkle's WKWebView. HTML is escaped FIRST,
-// so notes content can never smuggle markup; every tag in the output is
-// emitted by this script.
-//
-// Called by script/generate_appcast.sh for markdown notes. It exits non-zero
-// on empty input; the caller treats any failure as fatal (no silent <pre>
-// fallback — a converter bug should stop the release, not quietly ship).
+// Escape input before generating HTML so release notes cannot inject markup into Sparkle's WKWebView. Follow system appearance; conversion failure must stop
+// release rather than ship unreadable notes.
 
 import Foundation
 
 func escape(_ s: String) -> String {
-    // The \u{01}/\u{02} bytes are reserved as code-span placeholders in
-    // inline(); dropping them here is what makes that reservation safe.
+    // The \u{01}/\u{02} bytes are reserved as code-span placeholders in inline(); dropping them here is what makes that reservation safe.
     s.replacingOccurrences(of: "\u{01}", with: "")
         .replacingOccurrences(of: "\u{02}", with: "")
         .replacingOccurrences(of: "&", with: "&amp;")
@@ -24,11 +13,8 @@ func escape(_ s: String) -> String {
         .replacingOccurrences(of: ">", with: "&gt;")
 }
 
-// Inline transforms run on ESCAPED text: **bold** and `code`. Pairs only —
-// an unmatched marker stays literal. Code spans are lifted out FIRST via
-// placeholders so the bold pass can never match into a code span (or vice
-// versa) and emit crossed tags like <strong>a <code>b</strong> c</code>.
-// The placeholder bytes are control characters that escape() strips from input.
+// Lift code spans from escaped text before bold processing to prevent crossed tags. Strip reserved placeholder control bytes from input so they cannot spoof
+// restored spans.
 let codeRE = try! NSRegularExpression(pattern: "`([^`]+)`")
 let boldRE = try! NSRegularExpression(pattern: "\\*\\*([^*]+)\\*\\*")
 
@@ -107,7 +93,6 @@ func flushList() {
     if olOpen { html.append("</ol>"); olOpen = false }
 }
 
-// "1. item" / "12. item" → the body after the marker, else nil.
 func orderedItemBody(_ line: String) -> String? {
     var digits = 0
     for ch in line {
@@ -169,8 +154,7 @@ for rawLine in input.components(separatedBy: "\n") {
         flushItem()
         itemLines.append(body)
     } else if (listOpen || olOpen) && line.hasPrefix("  ") {
-        // Continuation of the current bullet (our notes wrap list items with
-        // a two-space indent).
+        // Two-space indentation extends the current bullet instead of starting a paragraph.
         itemLines.append(trimmed)
     } else {
         flushList()

@@ -3,10 +3,10 @@ import PersistenceCore
 import MacIntegration
 import Synchronization
 import NativeAgentShared
-// Blueprint: | `AgentWorkspacePorts.swift` | `AgentWorkspacePorts` enum; PreparedWorkspaceGlance carries text and an owner-stamp delivery callback; the parts ranking the app door registers, read by the turn glance; workspace row decisions and pure helper faces enter L0 through the caller's native tool port |
+import NativeAgentCore
+// Blueprint: | `AgentWorkspacePorts.swift` | `AgentWorkspacePorts`: native ports retain authority and delivery stamps |
 
-/// Synchronous projections over the existing conversation owner. The lower
-/// target shares values, never the store, settlement, or send authority.
+/// Synchronous projections over the existing conversation owner. The lower target shares values, never the store, settlement, or send authority.
 package protocol AgentWorkspaceConversationPort: Sendable {
     func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth]
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
@@ -16,11 +16,8 @@ package protocol AgentWorkspaceConversationPort: Sendable {
     func answeredRequests(dataRoot: URL) throws -> [(message: String?, run: String?, chat: String?, modified: Date)]
     func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue
     func presentation(_ row: AgentConversationRecord) -> JSONValue
-    func liveHandOff(_ row: AgentConversationRecord) -> Bool
     func unsettledAttention(_ row: AgentConversationRecord) -> Bool
-    /// A room in chat `scope` showed her these replies of a contact's (send
-    /// id: the words shown); the ones that chat asked for, shown exactly as
-    /// saved, are hers there and not handed over again.
+    /// Only exact replies shown for this chat's own sends are acknowledged here, preventing duplicate delivery.
     func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL) throws
 }
 
@@ -42,23 +39,20 @@ package struct AgentWorkspacePeer: Sendable {
 package protocol AgentWorkspaceToolPort: Sendable {
     func readout(_ input: JSONValue, dataRoot: URL) async throws -> JSONValue
     func readoutFace(_ input: JSONValue, dataRoot: URL) async -> PartCallResult<PartFace>
-    func usableAgentLanes(dataRoot: URL) throws -> Set<String>
     func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String>
-    /// The `app` action a tool folded into, nil for a tool of its own.
     func appAction(_ tool: String) -> String?
-    func macIntegrationGate(_ name: String) -> (integration: String, mode: MacIntegrationPermissionMode)?
+    func macIntegrationAccess(_ name: String) -> MacIntegrationAccess?
     func markConsumed(peer: String)
     func withWebScheme(_ value: String) -> String
     func builderSourceRepoRoot(dataRoot: URL) -> URL?
     var listedPeerState: String { get }
-    func builtAbilities(dataRoot: URL, now: Date) async -> String
+    func builtAbilities(dataRoot: URL, now: Date) async throws -> String
 }
 
 /// Read-only words and their owner-stamp acknowledgement, carried with preparation.
 package struct PreparedWorkspaceGlance: Sendable {
     package let text: String
-    /// The captured owner stamps, acknowledged only if their text was delivered.
-    /// Bookkeeping failures report repair without failing the accepted reply.
+    /// The captured owner stamps, acknowledged only if their text was delivered. Bookkeeping failures report repair without failing the accepted reply.
     package let delivered: (@Sendable (String) -> Void)?
 
     package init(_ text: String, delivered: (@Sendable (String) -> Void)? = nil) {
@@ -67,12 +61,11 @@ package struct PreparedWorkspaceGlance: Sendable {
     }
 }
 
-/// Bound by the chat entry points for the whole structured workspace operation.
-/// A nested gated dispatch inherits the same owners; nothing is cached here.
+/// Explicit dependencies of a workspace operation; no task supplies hidden owners.
 package enum AgentWorkspacePorts {
     /// The existing workspace failure face, with the owner's evidence and remedy.
     package static func readFailure(_ error: any Error, reason: String, remedy: JSONValue) -> String {
-        HerScreen.readFailure(error, reason: reason, remedy: remedy)
+        AgentScreen.readFailure(error, reason: reason, remedy: remedy)
     }
 
     package struct Binding: Sendable {
@@ -84,20 +77,40 @@ package enum AgentWorkspacePorts {
             self.tools = tools
         }
     }
-    @TaskLocal package static var binding: Binding?
-    package static var current: Binding {
-        guard let binding else { preconditionFailure("Workspace entry point requires its owner ports") }
-        return binding
-    }
 
-    /// Her own parts against a message, ranked the way find ranks: the app
-    /// door registers its ranking when it starts (`AppToolExecutor`).
-    private static let partsRanking = Mutex<(@Sendable (String, URL) async -> PreparedWorkspaceGlance)?>(nil)
-    package static func rankParts(_ rank: @escaping @Sendable (String, URL) async -> PreparedWorkspaceGlance) {
+    /// Use the app door's registered ranking so part matches agree with Find.
+    /// A person-facing preview has no turn and must not acknowledge delivery.
+    private static let partsRanking = Mutex<(@Sendable (String, URL, Turn?) async -> PreparedWorkspaceGlance)?>(nil)
+    package static func rankParts(_ rank: @escaping @Sendable (String, URL, Turn?) async -> PreparedWorkspaceGlance) {
         partsRanking.withLock { $0 = rank }
     }
-    package static func parts(for message: String, dataRoot: URL) async -> PreparedWorkspaceGlance {
-        guard let rank = partsRanking.withLock({ $0 }) else { return PreparedWorkspaceGlance("Your own parts could not be read: the app door has not started.") }
-        return await rank(message, dataRoot)
+    package static func parts(for message: String, dataRoot: URL, turn: Turn?) async -> PreparedWorkspaceGlance {
+        guard let rank = partsRanking.withLock({ $0 }) else { return PreparedWorkspaceGlance("Your own parts could not be read: the app door has not started.")
+            }
+        return await rank(message, dataRoot, turn)
+    }
+}
+
+/// One workspace read's dependencies, permission evidence and presentation mode.
+/// Child tasks capture this value; each new action reads its own permissions.
+package struct WorkspaceOperation: Sendable {
+    package let ports: AgentWorkspacePorts.Binding
+    package let turn: Turn?
+    package var previewing: Bool
+    /// The selected action is re-entering dispatch through this workspace operation.
+    package var insideDispatch: Bool
+    var readiness: AgentWorkspaceReadiness.Snapshot?
+
+    package init(ports: AgentWorkspacePorts.Binding, turn: Turn?, previewing: Bool = false, insideDispatch: Bool = false) {
+        self.ports = ports
+        self.turn = turn
+        self.previewing = previewing
+        self.insideDispatch = insideDispatch
+    }
+
+    package func preview() -> Self {
+        var operation = self
+        operation.previewing = true
+        return operation
     }
 }

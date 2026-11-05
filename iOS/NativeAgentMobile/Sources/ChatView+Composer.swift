@@ -14,7 +14,6 @@ extension ChatView {
     }
 
     private var composerPlaceholder: String {
-        // Before any name is known the fallback is the product, not the agent.
         return agentDisplayName == NativeAgentIdentity.displayName(nil) ? "Message…" : "Message \(agentDisplayName)…"
     }
 
@@ -72,7 +71,8 @@ extension ChatView {
                 .accessibilityLabel("Talk to \(agentDisplayName)")
                 .accessibilityHint("Start a hands-free conversation in this chat")
 
-                if !voiceInput.isListening && !voiceInput.isStarting && (!store.activeTurnRunIDs.isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true)) {
+                if !voiceInput.isListening && !voiceInput.isStarting
+                    && (!store.activeTurnRunIDs.isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true)) {
                     Button {
                         guard !isChatSample else { return }
                         store.stop(client: bridgeClient)
@@ -89,7 +89,6 @@ extension ChatView {
 
                 Button {
                     if voiceInput.isListening || voiceInput.isStarting {
-                        // One tap: stop listening, and send once the words land.
                         sendWhenDictationLands = true
                         voiceInput.stop()
                     } else {
@@ -105,7 +104,6 @@ extension ChatView {
                             Circle().fill(active
                                 ? HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true)
                                 : NativeAgentMobileTheme.Colors.softFill)
-                            // Animate control-state changes unless Reduce Motion is enabled.
                             .animation(
                                 AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion),
                                 value: active)
@@ -120,7 +118,6 @@ extension ChatView {
         }
         .foregroundStyle(AlivePalette.text)
         .hazeTinted()
-        // One floating glass capsule: the functional layer, over the thread.
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
         .aliveGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous), interactive: true)
@@ -150,10 +147,9 @@ extension ChatView {
             id: next.id,
             isLoading: store.isLoading
         )
-        // One line: what waits, its preview, and ONE menu for what to do with
-        // it (send, remove, and the rest of the queue when there is more).
         return HStack(spacing: 10) {
-            Text(!store.canDeliverQueuedSend(next) ? "Saved for another pairing" : store.isSelectedQueuePaused ? "Paused" : turns.count > 1 ? "Next of \(turns.count)" : "Next")
+            Text(!store.canDeliverQueuedSend(next) ? "Saved for another pairing" : store.isSelectedQueuePaused ? "Paused" : turns.count > 1
+                ? "Next of \(turns.count)" : "Next")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(AlivePalette.secondary)
                 .fixedSize()
@@ -196,7 +192,8 @@ extension ChatView {
                                     onSend: { store.resumeQueuedSends(startingWith: $0) }
                                 ) }
                             } label: {
-                                Label(store.canDeliverQueuedSend(queued) ? action.menuTitle(position: index + 1, preview: queued.preview) : "Submit to this Mac as new: \(queued.preview)", systemImage: "arrow.up")
+                                Label(store.canDeliverQueuedSend(queued) ? action.menuTitle(position: index + 1, preview: queued.preview)
+                                    : "Submit to this Mac as new: \(queued.preview)", systemImage: "arrow.up")
                             }
                             Button(role: .destructive) {
                                 store.removeQueuedSend(queued.id)
@@ -288,10 +285,7 @@ extension ChatView {
         }
     }
 
-    /// PhotosPicker's label is an escaping @Sendable closure, so it cannot
-    /// reference the MainActor-isolated `isLoadingPhotos` directly. Reading it
-    /// into a local `Bool` (a Sendable value) before building the label means
-    /// the closure captures the value, not `self`.
+    /// Capture a local Sendable Bool: PhotosPicker's escaping @Sendable label cannot read MainActor-isolated state.
     private var photosPickerButton: some View {
         let loading = isLoadingPhotos
         let sessionKey = store.queueSessionKey(store.selectedSessionID)
@@ -352,7 +346,7 @@ extension ChatView {
         voiceInput.isListening || voiceInput.isStarting || voiceInput.isFinalizing
     }
 
-    /// Attachments, or while recording the cancel in their place (the mic never moves under a held finger).
+    /// Replace attachments with recording cancel in the same slot so the microphone cannot move beneath a held finger.
     @ViewBuilder private var leadingButtons: some View {
         if isRecordingVoice {
             Button(action: cancelVoiceInput) {
@@ -370,7 +364,6 @@ extension ChatView {
         }
     }
 
-    /// The words show above, full width; this row keeps the clock and the live waveform.
     private var recordingStrip: some View {
         HStack(spacing: 8) {
             if voiceInput.isLocked { Image(systemName: "lock.fill").font(.footnote) }
@@ -399,8 +392,7 @@ extension ChatView {
         invalidateAttachmentPreparation()
         if composerSessionKey == store.queueSessionKey(nil),
            MobileChatSelectionIntent.explicitlySelectedSessionID == nil {
-            // Main gaining its identity binds this composer; it does not
-            // open a different conversation with an empty composer.
+            // Adopting main's identity binds the existing composer; it must not clear it as a different conversation.
             composerSessionKey = destination
             return
         }
@@ -426,7 +418,7 @@ extension ChatView {
             ? (attachments.count == 1 ? "Look at this attachment." : "Look at these attachments.")
             : text
         guard store.send(text: sendText, client: bridgeClient, controls: runtimeControls, attachments: attachments) else { return }
-        autoFollowChat = true
+        followEnd()
         draft.text = ""
         pendingPhotos = []
         pendingFiles = []
@@ -500,7 +492,9 @@ extension ChatView {
                     guard let sourceData = try await item.loadTransferable(type: Data.self),
                           let prepared = await Task.detached(priority: .userInitiated, operation: {
                               guard let jpeg = MobileChatAttachmentPreparation.preparedJPEGData(from: sourceData),
-                                    let thumbnail = MobileChatAttachmentPreparation.thumbnail(from: jpeg, maxDimension: 240) else { return nil as (MultimodalAttachment, UIImage)? }
+                                    let thumbnail = MobileChatAttachmentPreparation.thumbnail(from: jpeg, maxDimension: 240) else {
+                                  return nil as (MultimodalAttachment, UIImage)?
+                              }
                               let attachment = MultimodalAttachment(id: UUID().uuidString, type: "image",
                                   base64: jpeg.base64EncodedString(), mime: "image/jpeg",
                                   name: "iphone-photo-\(index + 1).jpg", byteSize: jpeg.count)

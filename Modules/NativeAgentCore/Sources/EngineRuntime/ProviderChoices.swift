@@ -1,7 +1,7 @@
 import AppToolRuntime
 import NativeAgentShared
 import ProviderRouting
-// Blueprint: | `ProviderChoices.swift` | Provider model catalogs, shared first-party descriptor conversion, Codex auth readout and quiet-composer conformances; reasoning values come from NativeAgentShared |
+// Blueprint: | `ProviderChoices.swift` | Provider catalogs and shared descriptor, auth and reasoning conversion |
 
 public struct ModelCatalogItem: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -47,10 +47,9 @@ public struct ModelCatalogResponse: Codable, Hashable, Sendable {
     public var models: [ModelCatalogItem]
     public var reasoningEfforts: [ReasoningEffortOption]
     public var updatedAt: String?
-    /// Where the discovered rows came from: live, cached, stale or unavailable.
+    /// Retain whether discovered rows are live, cached, stale or unavailable.
     public var catalogFreshness: String?
-    /// Why the provider's list could not be loaded, and how old a
-    /// last-known list is — nil when the rows are the provider's current answer.
+    /// Keep failure cause and last-known age; nil means the provider’s current answer.
     public var catalogNote: String? = nil
     public init(
         status: String,

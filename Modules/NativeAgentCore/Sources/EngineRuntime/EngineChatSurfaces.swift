@@ -17,20 +17,19 @@ import SlackBot
 import StandingBots
 import TelegramBot
 import ToolExecution
-// Blueprint: | `EngineChatSurfaces.swift` | NativeAgentEngine chat-surface composition: Slack Socket Mode, Telegram polling, approvals, provider choices, speech transcription and permission cards |
+// Blueprint: | `EngineChatSurfaces.swift` | Slack and Telegram ingress; speech permission episodes use the body attention port |
 
 extension NativeAgentEngine {
     public static let telegramUnconfiguredReason =
         "telegram not configured (no enabled bot token in telegram/config.json)"
 
-    /// The configured Socket Mode worker, or a visible disabled lane.
     public static func makeSlackSocketModeLane(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> LoopRegistration {
         do {
             return try SlackSocketModeLoop.ifConfigured(
                 dataRoot: dataRoot,
-                chatClient: { NativeAgentEngine.live.chatClient(profile: .slack) },
+                chatClient: { _ in NativeAgentEngine.live.chatClient(profile: .slack) },
                 // Reply delivery does not wait for the Mac UI to reload.
                 turnCompleted: { sessionID in
                     Task { @MainActor in
@@ -41,7 +40,7 @@ extension NativeAgentEngine {
                     try await BotEventIntake.slackMessage(channelId: channelId, text: text,
                                                      userId: userId, eventId: eventId, dataRoot: dataRoot,
                                                      isAutonomyEnabled: {
-                        await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
+                        await UnattendedWork.allowed(dataRoot: dataRoot)
                     })
                 }
             ).map(LoopRegistration.enabled) ?? .disabled(
@@ -54,7 +53,7 @@ extension NativeAgentEngine {
         }
     }
 
-    /// Missing or disconnected settings are off; unreadable credentials are unavailable.
+    /// Unreadable credentials are unavailable; missing or disconnected settings are off.
     public static func makeTelegramPollLane(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> LoopRegistration {
@@ -74,9 +73,7 @@ extension NativeAgentEngine {
     private static func makeTelegramPollLoop(
         cfg: TelegramBot.TelegramConfig, dataRoot: URL
     ) -> TelegramPollLoop {
-        // Brain state has one owner: providers/surfaces.json. Resolve it at
-        // handler time so /model, /think, /fast, Mac settings, and iPhone
-        // controls all affect the very next turn without restarting this loop.
+        // Resolve `providers/surfaces.json` at handler time so every surface’s setting affects the next turn without a restart.
         let providerRouting = SwiftNativeProviderRouting(dataRoot: dataRoot)
         let telegramSessions = TelegramSessionStore(dataRoot: dataRoot)
         let approvalFiler = TelegramApprovalFiler(
@@ -86,27 +83,25 @@ extension NativeAgentEngine {
                 try await TelegramApprovalFiler.sendTelegramApprovalPrompt(
                     token: token, chatId: chatId, approval: approval,
                     toolName: toolName, payload: payload,
-                    send: TelegramPollLoop.defaultSendMessageWithReplyMarkup
+                    send: TelegramPollLoop.defaultSendMessageWithReplyMarkupReturningId
                 )
             },
             approvalResolver: { id, decision, provenance in
                 _ = try await NativeAgentEngine.live.ports.backgroundWork.approvals.resolveApproval(
-                    id: id, decision: decision.rawValue, provenance: provenance
+                    id: id, decision: decision.rawValue, provenance: provenance, turn: provenance.resolvingTurn
                 )
             }
         )
         ApprovalChatCards.useTelegram(approvalFiler)
-        // Keep the exact Telegram profile and approval filer resident for the
-        // loop lifetime. Routing/policy remain per-turn snapshots; only the
-        // stateless orchestration graph and schema caches are reused.
+        // Retain the profile, filer and stateless graph for the loop lifetime; resolve routing and policy for each turn.
         let client = NativeAgentEngine.live.chatClient(
             profile: .telegram,
             approvalFiler: approvalFiler
         )
         let telegramFace: PartFaces.Call = { id, input, version in
             do {
-                return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native("telegram:projection:" + id)) {
-                    await Parts(root: dataRoot).face(id: id, input: input, version: version)
+                return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native("telegram:projection:" + id)) { door in
+                    await Parts(root: dataRoot).face(id: id, input: input, version: version, invocation: door.invocation)
                 }
             } catch {
                 return .failure(.init(code: "unavailable", message: error.localizedDescription))
@@ -119,32 +114,18 @@ extension NativeAgentEngine {
                 memory: TelegramMemoryWriterBridge(dataRoot: dataRoot),
                 restart: TelegramRestartBridge(dataRoot: dataRoot, deferredRestart: { reason in
                     await AppRelaunch.shared.requestRestartDeferringTerminate(
-                        reason: reason,
+                        turn: nil, reason: reason,
                         source: "telegram:/restart"
                     )
                 })
             ),
-            compactionHandler: { sessionId in
-                let outcome = try await client.compactSession(
-                    sessionId: sessionId,
-                    model: "",
-                    surface: "telegram",
-                    force: true
-                )
-                if outcome.compacted {
-                    Task { @MainActor in
-                        NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionId)
-                    }
-                }
-                return outcome
-            },
-            partCall: { id, input in
-                guard let envelope = ChatToolSessionContext.envelope, envelope.surface == "telegram", envelope.workIdentity != nil else {
+            partCall: { id, input, turn in
+                guard let envelope = turn.envelope, envelope.surface == "telegram", envelope.workIdentity != nil else {
                     return .failure(.init(code: "unavailable", message: "The Telegram command has no authenticated originating update."))
                 }
                 do {
-                    return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: envelope) {
-                        await Parts(root: dataRoot).call(id: id, input: input, as: JSONValue.self)
+                    return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: envelope, turn: turn) { door in
+                        await Parts(root: dataRoot).call(id: id, input: input, invocation: door.invocation, as: JSONValue.self)
                     }
                 } catch {
                     return .failure(.init(code: "unavailable", message: error.localizedDescription))
@@ -178,8 +159,7 @@ extension NativeAgentEngine {
             syncCommandMenu: TelegramPollLoop.defaultSyncCommandMenu,
             approvalHandler: approvalFiler,
             attachmentChatHandler: handler,
-            // Memory promotion already runs under the turn engine's ownership.
-            // Telegram completion must not wait for this optional background work.
+            // Turn ownership handles memory promotion; Telegram completion must not wait for optional background work.
             voiceTranscriber: makeTelegramVoiceTranscriber(cfg: cfg, dataRoot: dataRoot),
             onCapabilityDenied: { capability in
                 await fileSystemPermissionNotice(capability: capability, dataRoot: dataRoot)
@@ -189,7 +169,7 @@ extension NativeAgentEngine {
     }
 
     public static func fileSystemPermissionNotice(capability: String, dataRoot: URL) async {
-        // Ask for undecided speech permission; only a refusal needs the pane.
+        // Request undecided speech access directly; only refusal needs Settings.
         if capability == "speechRecognition",
            await NativeAgentEngine.live.ports.backgroundWork.requestSpeechPermissionIfNotDetermined().isGranted {
             await retireSystemPermissionCardIfGranted(dataRoot: dataRoot)
@@ -199,11 +179,7 @@ extension NativeAgentEngine {
             capability: capability, dataRoot: dataRoot,
             permissionStatus: { NativeAgentEngine.live.ports.backgroundWork.speechPermission },
             assistanceCard: { try await EngineBackgroundWorkPort().assistanceCard(dataRoot: dataRoot, input: $0) },
-            notify: { root, id, title, summary, source, severity in
-                await NativeAgentEngine.live.ports.backgroundWork.attention.notifyIfAttentionWorthy(
-                    dataRoot: root, itemId: id, title: title, summary: summary,
-                    source: source, severity: severity)
-            })
+            notifications: EngineBackgroundWorkPort())
     }
 
     public static func retireSystemPermissionCardIfGranted(dataRoot: URL) async {
@@ -212,10 +188,7 @@ extension NativeAgentEngine {
             permissionStatus: { NativeAgentEngine.live.ports.backgroundWork.speechPermission })
     }
 
-    /// The Telegram surface's one transcriber factory. Keeping this at the
-    /// assembly boundary means the config chooses a backend once, while each
-    /// inbound voice note still executes through the shared poll-loop error and
-    /// permission-card path.
+    /// Choose the transcription backend once at assembly, preserving shared error and permission-card handling for every voice note.
     public static func makeTelegramVoiceTranscriber(
         cfg: TelegramBot.TelegramConfig,
         dataRoot: URL

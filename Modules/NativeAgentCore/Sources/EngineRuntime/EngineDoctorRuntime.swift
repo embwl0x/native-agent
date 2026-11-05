@@ -7,9 +7,9 @@ import Synchronization
 import NativeAgentShared
 import Browser
 import MacControl
-// Blueprint: | `EngineDoctorRuntime.swift` | Live Doctor orchestration, owner-scoped Mac/browser recovery readings, frozen repair admission, cancellation, rechecks and repair-obligation publication |
+// Blueprint: | `EngineDoctorRuntime.swift` | Frozen repair admission, cancellation, rechecks and obligations |
 
-/// Platform observations and callbacks; Doctor owns interpretation and repair admission.
+/// Native ports observe; Doctor owns interpretation and repair admission.
 public protocol EngineDoctorPlatformPort: Sendable {
     var doctorEngine: NativeAgentEngine { get }
     var doctorManager: BackgroundLoops.BackgroundLoopLifetimes { get }
@@ -23,14 +23,15 @@ public protocol EngineDoctorPlatformPort: Sendable {
 
 private let doctorRepairInFlight = Mutex(false)
 
-/// Live health and repair policy for the engine's mounted owners.
 public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
     let port: Port
     public let dataRoot: URL
+    let turn: Turn?
 
-    public init(dataRoot: URL, port: Port) {
+    public init(dataRoot: URL, port: Port, turn: Turn? = nil) {
         self.dataRoot = dataRoot
         self.port = port
+        self.turn = turn
     }
 
     public func runDoctor(repair: Bool = false, repairScope: DoctorRepairScope = .automatic,
@@ -83,8 +84,7 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
                         actionCompleted = result.repairApplied == true
                         receipt = result.receipt ?? (id == "oauth_token_expiry"
                             ? result.detail : result.repair ?? "Repair attempted; no completion receipt returned.")
-                        // The OAuth result carries the exchange verdict. A
-                        // disk-only reread cannot distinguish rejected from untried.
+                        // Use the OAuth exchange verdict; disk-only state cannot distinguish rejection from an untried exchange.
                         if id == "oauth_token_expiry" {
                             checks[index] = result
                         } else {
@@ -194,7 +194,7 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
         async let search = searchDoctorCoverageCheck(probe: probeSearch)
         async let tools = toolsDoctorCoverageCheck()
         async let autonomy = autonomyDoctorCoverageCheck()
-        // Loop-health verdicts feed the live Doctor report.
+        // Share loop verdicts with the live Doctor report.
         async let loops = self.doctorBackgroundLoopsCheck()
         async let loopDetails = self.doctorBackgroundLoopChecks()
         async let memory = memoryDoctorCoverageCheck()
@@ -215,7 +215,10 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
             id: "live.mac_operation_recovery", title: "Mac action recovery",
             status: macIssue == nil ? "ok" : "fail",
             detail: macIssue ?? "Mac operation recovery completed; new effects still pass ordinary Trust and domain checks.",
-            human_action: macIssue == nil ? nil : "Preserve and repair mac_control/operations.json, inspect affected apps with mac.look to reconcile unknown effects, then restart NativeAgent. Looking and other surfaces remain available.")
+            human_action: macIssue == nil ? nil : """
+                Preserve and repair mac_control/operations.json, inspect affected apps with mac.look to reconcile unknown effects, then restart \
+                NativeAgent. Looking and other surfaces remain available.
+                """)
         let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         var issues = [browser.recoveryIssue].compactMap { $0 }
         do { issues += try await browser.canonicalRunIssues() }
@@ -226,6 +229,9 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
             detail: issues.isEmpty
                 ? "Browser operation recovery completed; new effects still pass ordinary Trust and domain checks."
                 : issues.joined(separator: "\n"),
-            human_action: issues.isEmpty ? nil : "Preserve and repair the named browser run or projection feed, reconcile unknown effects by observing the existing page without reopening its URL, then restart NativeAgent. Other surfaces remain available.")]
+            human_action: issues.isEmpty ? nil : """
+                Preserve and repair the named browser run or projection feed, reconcile unknown effects by observing the existing page without \
+                reopening its URL, then restart NativeAgent. Other surfaces remain available.
+                """)]
     }
 }

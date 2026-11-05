@@ -2,7 +2,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `OpenRouterModelCatalog.swift` | `OpenRouterModelCatalog`: live-backed model availability and capability owner; supported_parameters and reasoning metadata supply exact effort choices, mandatory reasoning and absent selectors, retained through providerJSON and cache decode; checked catalog cache through shared TTL machinery |
+// Blueprint: | `OpenRouterModelCatalog.swift` | `OpenRouterModelCatalog`: live-backed membership and controls |
 
 extension ProviderModelInfo {
     public func providerJSON() -> [String: JSONValue] {
@@ -31,12 +31,11 @@ extension ProviderModelInfo {
 
 public enum OpenRouterModelCatalog {
     public enum CachedModelAvailability: Equatable, Sendable {
-        /// A recent live-backed cache contains the exact id.
+        /// Only recent live-backed rows establish membership.
         case available
-        /// A recent live-backed cache does not contain the exact id.
+        /// Only recent complete live-backed rows establish absence.
         case unavailable
-        /// No recent live-backed catalog exists; stale bytes or no list at all
-        /// are insufficient evidence to reject a user pin.
+        /// No recent live-backed catalog exists; stale bytes or no list at all are insufficient evidence to reject a user pin.
         case unknown
     }
     public static let endpoint = URL(string: "https://openrouter.ai/api/v1/models?output_modalities=text")!
@@ -58,7 +57,7 @@ public enum OpenRouterModelCatalog {
         await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// The read reports whether it reached OpenRouter and why it did not.
+    /// Discovery provenance retains whether the network was reached and why not.
     public static func modelsWithFreshness(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         session: URLSession = .shared,
@@ -101,7 +100,8 @@ public enum OpenRouterModelCatalog {
                   row["supported_parameters"] is [String],
                   (architecture["output_modalities"] as? [String])?.isEmpty == false
                     || (architecture["modality"] as? String)?.isEmpty == false else {
-                throw LLMError.providerError(message: "OpenRouter model row lacks identity or capability evidence. Refresh its model catalog before selecting a model.")
+                throw LLMError.providerError(
+                    message: "OpenRouter model row lacks identity or capability evidence. Refresh its model catalog before selecting a model.")
             }
             guard let model = try parseModel(row) else { continue }
             byId[model.id] = model
@@ -109,16 +109,13 @@ public enum OpenRouterModelCatalog {
         return sortModels(Array(byId.values))
     }
 
-    /// Envelope keys whose non-empty value NAMES a further page. A cursor or a
-    /// next link that is present but null/empty/false says the opposite: this
-    /// is the last page.
+    /// Pagination requires a nonempty continuation value; null, empty and false mean no further page.
     private static let continuationKeys = ["next", "next_page", "next_cursor", "cursor"]
 
-    /// Envelope keys that may nest those continuation markers.
+    /// Continuation evidence may be nested under these envelope keys.
     private static let continuationContainerKeys = ["pagination", "links", "meta"]
 
-    /// Only a complete list may exclude a selected model. Pagination metadata
-    /// marks an incomplete list only when it names another page.
+    /// Only a complete list may exclude a selected model. Pagination metadata marks an incomplete list only when it names another page.
     static func responseIsComplete(_ root: [String: Any]?) -> Bool {
         guard let root else { return true }
         if envelopeSaysMore(root) { return false }
@@ -136,9 +133,8 @@ public enum OpenRouterModelCatalog {
         return false
     }
 
-    /// A marker "says more" only when it carries an actual value: null, false,
-    /// 0 and the empty string are all a provider saying there is nothing after
-    /// this page.
+    /// A marker "says more" only when it carries an actual value: null, false, 0 and the empty string are all a provider saying there is nothing after this
+    /// page.
     private static func truthy(_ value: Any?) -> Bool {
         guard let value, !(value is NSNull) else { return false }
         if let number = value as? NSNumber { return number.doubleValue != 0 }
@@ -197,10 +193,8 @@ public enum OpenRouterModelCatalog {
             id: id,
             name: name,
             context_length: context,
-            // Capability = upstream declaration AND a NativeAgent wire path.
-            // The adapter implements SSE for every text model; the remaining
-            // capabilities stay model-specific and come from OpenRouter's
-            // own live metadata.
+            // Capability = upstream declaration AND a NativeAgent wire path. The adapter implements SSE for every text model; the remaining capabilities
+            // stay model-specific and come from OpenRouter's own live metadata.
             supports_streaming: true,
             supports_vision: inputModalities.contains("image"),
             supports_tools: supportedParameters.contains("tools"),
@@ -214,8 +208,7 @@ public enum OpenRouterModelCatalog {
         )
     }
 
-    /// OpenRouter's current per-model reasoning object owns these controls.
-    /// Omitted effort selection means provider-default execution, not a guessed list.
+    /// OpenRouter's current per-model reasoning object owns these controls. Omitted effort selection means provider-default execution, not a guessed list.
     private static func reasoningControls(_ row: [String: Any]) throws -> (defaultEffort: String, efforts: [String]) {
         guard let raw = row["reasoning"], !(raw is NSNull) else { return ("default", ["default"]) }
         func invalid() -> LLMError {
@@ -240,8 +233,7 @@ public enum OpenRouterModelCatalog {
             // A model with no effort selector still executes with its provider's default.
             defaultEffort = supported.contains(declared) ? declared : "default"
         } else { defaultEffort = "default" }
-        // "default" is the explicit choice to omit this optional request control.
-        // It is not an effort guessed from the model's family or name.
+        // "default" is the explicit choice to omit this optional request control. It is not an effort guessed from the model's family or name.
         return (defaultEffort, ["default"] + supported)
     }
 

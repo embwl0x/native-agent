@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacControl+OperationSupport.swift` | Separate bounded response signal and actual-exit result; root-bound registry retains the newest 32 settled outcomes in process, including produced output on settlement failure; receipt projections preserve unknown effects on unanswered cancellation/deadline |
+// Blueprint: | `MacControl+OperationSupport.swift` | Bounded response waits retain actual-exit ownership, produced output and unknown effects |
 
 enum MacControlExecutionSignal: Sendable, Equatable {
     case result
@@ -21,8 +21,8 @@ final class MacControlInFlightExecution: @unchecked Sendable {
         self.task = task
     }
 
-    func wait() async -> MacControlExecutionSignal {
-        await signal.wait(cancellingWith: TaskWaitDeadline.expired ? .deadline : .cancellationRequested,
+    func wait(context: MacOperationContext) async -> MacControlExecutionSignal {
+        await signal.wait(budget: context.waitBudget, cancellingWith: context.expired ? .deadline : .cancellationRequested,
             onCancel: { self.task.cancel() })
     }
     func finish(_ result: Result<MacControlResult, Error>) {
@@ -44,8 +44,7 @@ final class MacControlInFlightRegistry: @unchecked Sendable {
         let operationId: String
     }
     private var executions: [Key: MacControlInFlightExecution] = [:]
-    // Payload remains in this process, never in the payload-free lifecycle file.
-    // Keep the newest 32 settled bodies for idempotent result retrieval.
+    // Payload remains in this process, never in the payload-free lifecycle file. Keep the newest 32 settled bodies for idempotent result retrieval.
     private var completed: [Key] = []
 
     func insert(_ execution: MacControlInFlightExecution, key: Key) {
@@ -80,8 +79,7 @@ public enum MacControlReceiptOutcome: String, Sendable, Equatable {
     case timedOut = "timed_out"
     case effectUnconfirmed = "effect_unconfirmed"
 
-    /// The compact human statement for this outcome. Only the unconfirmed case
-    /// says anything the transport booleans cannot.
+    /// Only unconfirmed outcomes need explanatory wording beyond transport flags.
     public var sentence: String {
         switch self {
         case .running: return "Still running"
@@ -115,9 +113,7 @@ public enum MacControlReceiptOutcome: String, Sendable, Equatable {
         }
     }
 
-    /// The same projection read off a returned `MacControlResult.toJSON()`
-    /// envelope. Returns nil when the envelope carries no operation record, so
-    /// non-MacControl tool results keep their existing classification.
+    /// Return nil for envelopes without a Mac operation record so unrelated tool results retain their own classification.
     public static func projecting(envelope: JSONValue) -> MacControlReceiptOutcome? {
         guard case .object(let fields) = envelope,
               case .string(let rawState)? = fields["operationState"],
@@ -132,14 +128,13 @@ public enum MacControlReceiptOutcome: String, Sendable, Equatable {
 }
 
 extension SwiftNativeMacControl {
-    /// A failed lifecycle write is its own failure, never permission to erase
-    /// what the completed body produced. The raw outcome stays attached here.
+    /// A failed lifecycle write is its own failure, never permission to erase what the completed body produced. The raw outcome stays attached here.
     static func settlementFailure(_ error: Error, body: Result<MacControlResult, Error>,
-                                  action: String, operationId: String) -> MacControlResult {
+                                  action: String, operationId: String, context: MacOperationContext) -> MacControlResult {
         var output: [String: JSONValue] = ["status": .string("settlement_failed"),
             "effects": .string("unknown"), "settlement_error": .string(error.localizedDescription)]
         switch body {
-        case .success(let result): output["body_result"] = result.toJSON()
+        case .success(let result): output["body_result"] = result.toJSON(readContent: context.readContent)
         case .failure(let bodyError):
             output["body_error"] = .string(bodyError.localizedDescription)
             let produced: ProcessRunResult?
@@ -164,7 +159,10 @@ extension SwiftNativeMacControl {
         MacControlResult(ok: false, action: action, output: .object([
             "status": .string("timed_out"), "timed_out": .bool(true),
             "effects": .string("unknown"), "verification": .string("unverified"),
-            "detail": .string("The tool call timed out and cancellation was requested. Earlier input or changes may have reached the app; completion was not verified. Inspect the affected app before another action.")
+            "detail": .string("""
+                The tool call timed out and cancellation was requested. Earlier input or changes may have reached the app; completion was not verified. \
+                Inspect the affected app before another action.
+                """)
         ]), error: "Mac Control tool-call deadline exceeded", durationMs: 0,
             httpStatus: 408, verification: .unverified)
     }
@@ -235,7 +233,9 @@ extension SwiftNativeMacControl {
                 "effects": .string("unknown"),
                 "detail": .string("Outcome unknown. " + cause),
                 "remedy": Repair.reconcile(
-                    instruction: "Inspect the affected app from the original request before another action; name it in mac.look args.app if it is not in front.",
+                    instruction: """
+                        Inspect the affected app from the original request before another action; name it in mac.look args.app if it is not in front.
+                        """,
                     nextCall: .object(["tool": .string("app"), "input": .object([
                         "action": .string("mac.look"), "args": .object([:]),
                     ])])),
@@ -308,14 +308,12 @@ extension SwiftNativeMacControl {
             return verified ? .satisfied : .unverified
         }
         switch action {
-        // These reads return observed state. The document read restores its
-        // temporary scroll; menu reads never press an item.
+        // These reads return observed state. The document read restores its temporary scroll; menu reads never press an item.
         case "file/read", "file/list", "spotlight", "ax_status", "ax_tree", "ax_find",
              "view", "look", "menu", "clipboard_read", "read":
             return .satisfied
-        // Posting input or rereading a control does not verify the intended
-        // effect. An explicit verified flag (including wake and clipboard
-        // write read-back) is handled above, before this default classification.
+        // Posting input or rereading a control does not verify the intended effect. An explicit verified flag (including wake and clipboard write read-back) is
+        // handled above, before this default classification.
         case "notify", "file/write", "file/move", "file/trash", "focus_app", "quit_app",
              "applescript", "shell", "keystroke", "click", "scroll", "ax_act", "hand",
              "menu_press", "act", "wake", "nudge":

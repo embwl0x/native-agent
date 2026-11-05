@@ -1,4 +1,5 @@
 import Transcripts
+import NativeAgentCore
 import Foundation
 import NativeAgentShared
 import PersistenceCore
@@ -7,9 +8,9 @@ import TrustCenter
 import ProviderRouting
 import ChatSessionWork
 import PersonaEngine
-// Blueprint: | `RuntimeReadProjection.swift` | Checked Mac activity history rejects damaged rows; canonical activity identity is executionId only. Session context projects matching provider-observed input usage and the detected window; absent measurements are unavailable, never estimates or zeroes. Autonomy delegates to TrustFacade's policy projection. |
+// Blueprint: | `RuntimeReadProjection.swift` | Checked activity and observed context usage; unknown measurements stay unavailable |
 
-/// Mac-local activity rows use the canonical execution identity.
+/// Use canonical execution identity for Mac-local activity.
 public struct ActivityEvent: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var kind: String
@@ -57,36 +58,28 @@ public struct ActivityTailReadout: Sendable {
     public let malformedRowCount: Int
 }
 
-/// Runtime read decisions shared by local and remote surfaces.
+/// Share read decisions between local and remote surfaces.
 public enum RuntimeReadouts {
     public static func getSessionContext(
         sessionId: String,
         model: String? = nil,
         providerID: String,
-        dataRoot: URL,
-        configuredThresholdTokens: Int?
+        dataRoot: URL
     ) async throws -> SessionContextStatus {
-        // The ring reports observed provider usage. Compaction separately sizes
-        // the next built request through the same measurement owner.
-        let resolvedModel = (model?.isEmpty == false ? model! : "")
-        // The detected model window, limited by a Custom cap. Unknown stays unknown.
-        var windowConfig = ChatSessionAutocompactionConfig.productionDefault()
-        if let configuredThresholdTokens, configuredThresholdTokens > 0 {
-            windowConfig.thresholdTokens = configuredThresholdTokens
-            windowConfig.contextWindowMode = .custom
-        }
-        let window = windowConfig.effectiveWindowTokens(forModel: resolvedModel, providerID: providerID, dataRoot: dataRoot)
-        guard let window, window > 0 else {
-            throw ProviderRoutingError.configurationFailed(windowConfig.configurationFailure
-                ?? "The selected model's context window is unavailable. Refresh its catalog in Providers.")
+        let resolvedModel = model ?? ""
+        guard let window = ContextBudgetPolicy.windowTokens(forModel: resolvedModel, providerID: providerID, dataRoot: dataRoot) else {
+            throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable. Refresh its catalog in Providers.")
         }
         let measurement = try await SessionContextMeasurement.read(sessionId: sessionId,
-            model: resolvedModel, providerID: providerID, dataRoot: dataRoot, windowTokens: window)
+            model: resolvedModel, providerID: providerID, dataRoot: dataRoot, windowTokens: window,
+            call: .init(turn: nil, surface: "chat", purpose: "context_usage", session: sessionId))
         guard let usedTokens = measurement.observedInputTokens else {
-            throw RuntimeReadError.unreadableFeed("Context usage has not been observed for this session's selected provider and model. Send a turn on this route to obtain a provider usage receipt.")
+            throw RuntimeReadError.unreadableFeed("""
+                Context usage has not been observed for this session's selected provider and model. Send a turn on this route to obtain a provider \
+                usage receipt.
+                """)
         }
         let budget = window
-        let threshold = windowConfig.triggerTokens(in: window, outputTokens: measurement.outputTokens)
         let percent = (Double(usedTokens) / Double(budget)) * 100.0
 
         return SessionContextStatus(
@@ -99,9 +92,6 @@ public enum RuntimeReadouts {
             budget: budget,
             percent: percent,
             message_count: measurement.messageCount,
-            // A short transcript can still exceed its window.
-            compactable: usedTokens >= threshold,
-            auto_compact_threshold: threshold,
             model: resolvedModel,
             context_loaded: true,
             context_mode: "provider_usage_receipt",
@@ -120,7 +110,10 @@ public enum RuntimeReadouts {
             throw NSError(
                 domain: "NativeAgentActivity",
                 code: -422,
-                userInfo: [NSLocalizedDescriptionKey: "Activity history is unavailable (\(readout.malformedRowCount) damaged rows in the recent ledger). Repair the retained rows before relying on a complete history."]
+                userInfo: [NSLocalizedDescriptionKey: """
+                    Activity history is unavailable (\(readout.malformedRowCount) damaged rows in the recent ledger). Repair the retained rows before \
+                    relying on a complete history.
+                    """]
             )
         }
         return readout.records.map(\.event)

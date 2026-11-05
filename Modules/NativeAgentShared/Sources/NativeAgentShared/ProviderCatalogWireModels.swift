@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ProviderCatalogWireModels.swift` | Shared checked provider connections, model capabilities, typed check results, reasoning-choice values/table/filter and surface-group vocabulary; callers own their default reasoning policies |
+// Blueprint: | `ProviderCatalogWireModels.swift` | Shared provider/model values and group vocabulary; callers own reasoning policy |
 
 public struct ReasoningEffortOption: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -166,9 +166,7 @@ public struct ProviderTestResult: Codable, Hashable, Sendable {
 
 /// The three model choices share this membership and presentation vocabulary.
 public struct ProviderSurfaceMember: Sendable, Equatable {
-    /// The routing surface id, as written in `providers/surfaces.json`.
     public let surface: String
-    /// What the Providers page calls it, in a person's words.
     public let label: String
 
     public init(_ surface: String, _ label: String) {
@@ -190,7 +188,6 @@ public struct ProviderSurfaceGroup: Sendable, Equatable, Identifiable {
 
     public var surfaces: [String] { members.map(\.surface) }
 
-    /// The caption under a group's row: what this choice actually governs.
     public var caption: String {
         let names = members.map(\.label)
         guard names.count > 1 else { return names.first ?? "" }
@@ -214,7 +211,6 @@ public enum ProviderSurfaceGroups {
             .init("desk", "Desk"),
             .init("workshop", "Task execution"),
             .init("autonomy", "Independent tasks"),
-            .init("swarms", "Coordinated tasks"),
             .init("training", "Skill practice"),
             .init("heartbeat", "Background check-ins"),
             .init("diagnostics", "Diagnostics"),
@@ -227,15 +223,13 @@ public enum ProviderSurfaceGroups {
             .init("dream", "Dreams"),
             .init("rem", "REM"),
             .init("cognition_reflection", "Reflection"),
-            .init("compaction", "Conversation summaries"),
             .init("self_improvement", "Learning"),
             .init("studio_wander", "Creative exploration"),
         ]
     )
     public static let all: [ProviderSurfaceGroup] = [chat, work, mind]
 
-    /// Every label, keyed by surface — the page reads its row names from here so
-    /// a name can never drift from the group that owns it.
+    /// Every label, keyed by surface — the page reads its row names from here so a name can never drift from the group that owns it.
     public static func rows(visible: [String]) -> [ProviderSurfaceGroup] {
         all.compactMap { group in
             let members = group.members.filter { visible.contains($0.surface) }
@@ -260,7 +254,7 @@ public enum ProviderSurfaceLabel: Equatable, Sendable {
         guard !trimmed.isEmpty, trimmed == rawSurface, rawSurface == rawSurface.lowercased() else {
             return .malformed
         }
-        guard let label = ProviderSurfaceGroups.labels[rawSurface == "missions" ? "workshop" : rawSurface] else {
+        guard let label = ProviderSurfaceGroups.labels[rawSurface] else {
             return .unrecognized(rawSurface)
         }
         return .named(label)

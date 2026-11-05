@@ -9,10 +9,9 @@ import TrustCenter
 import Darwin
 import Darwin
 #endif
-// Blueprint: | `FileReading.swift` | Descriptor-bound strict UTF-8 text windows/excerpts and explicitly requested exact raw bytes; folder matching; checked ENOENT alone establishes missing paths; metadata-only sense watches admit directory paths under the same root and sensitive-path checks without reading file contents |
+// Blueprint: | `FileReading.swift` | Descriptor-bound UTF-8 windows and exact bytes; only ENOENT proves absence; metadata-only watches |
 extension FileSystemActions {
-    /// Only ENOENT establishes absence. Permission and I/O failures must not
-    /// become a missing-file verdict for a source watch.
+    /// Only ENOENT proves absence; permission and I/O errors cannot become missing-file verdicts.
     private static func readPathIsDirectory(_ path: URL) throws -> Bool? {
         var info = stat()
         guard lstat(path.path, &info) == 0 else {
@@ -29,10 +28,8 @@ extension FileSystemActions {
     }
     static func openRegularReadHandle(_ path: URL) throws -> FileHandle {
         #if canImport(Darwin)
-        // Descriptor-relative walk from the verified root: each parent is
-        // opened O_DIRECTORY|O_NOFOLLOW and the final component O_NOFOLLOW, so
-        // a symlink swapped in after the sandbox check cannot redirect this
-        // read. Everything below reads the DESCRIPTOR, never the path again.
+        // Walk O_DIRECTORY|O_NOFOLLOW parents and an O_NOFOLLOW final component; read only the resulting descriptor. A pathname swap after authorization must
+        // never redirect the bytes.
         let descriptor: Int32
         do { descriptor = try VerifiedPath.open(path, flags: O_RDONLY | O_NONBLOCK) }
         catch let failure as VerifiedPath.Failure {
@@ -45,7 +42,8 @@ extension FileSystemActions {
         }
         guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
             close(descriptor)
-            throw FileReadFailure(message: "File reads support regular files only; pipes, devices and sockets cannot provide file windows.", code: "unsupported_file_type")
+            throw FileReadFailure(
+                message: "File reads support regular files only; pipes, devices and sockets cannot provide file windows.", code: "unsupported_file_type")
         }
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         #else
@@ -59,7 +57,8 @@ extension FileSystemActions {
         useCompactDefault: Bool,
         offset: Int,
         expectedVersion: String,
-        preserveInvalidUTF8: Bool = false
+        preserveInvalidUTF8: Bool = false,
+        metadataOnly: Bool = false
     ) throws -> (data: Data, totalBytes: Int, version: String, byteLimit: Int) {
         func limit(for totalBytes: Int) -> Int {
             if useCompactDefault && shouldUseCompactReadDefault(path: path, actualBytes: totalBytes) {
@@ -88,7 +87,7 @@ extension FileSystemActions {
                 throw FileReadFailure(message: "offset exceeds the file size.", code: "bad_input")
             }
             let byteLimit = limit(for: totalBytes)
-            if FileReadSourceMaterial.metadataOnly { return (Data(), totalBytes, observedVersion, byteLimit) }
+            if metadataOnly { return (Data(), totalBytes, observedVersion, byteLimit) }
             try handle.seek(toOffset: UInt64(offset))
             let data = try handle.read(upToCount: byteLimit) ?? Data()
             if !preserveInvalidUTF8 && offset > 0 && (data.isEmpty || data.first.map { $0 & 0xC0 == 0x80 } == true) {
@@ -115,15 +114,16 @@ extension FileSystemActions {
                   version(after) == observedVersion else {
                 throw FileReadFailure(message: "File changed during the read. Restart at offset 0 without version.", code: "file_changed")
             }
-            // Trim only a scalar split by the requested window. Invalid source
-            // bytes (including an EOF fragment) are never replacement-decoded.
+            // Trim only the requested window's split scalar; invalid source bytes and EOF fragments must fail strict decoding.
             var slice = offset + data.count < totalBytes ? completeUTF8Prefix(data) : data
             if preserveInvalidUTF8 { slice = data }
             if byteLimit > 0 && slice.isEmpty && !data.isEmpty {
                 throw FileReadFailure(message: "max_bytes cannot hold the next UTF-8 character. Use at least 4 bytes.", code: "window_too_small")
             }
             if !preserveInvalidUTF8, String(data: slice, encoding: .utf8) == nil {
-                throw FileReadFailure(message: "This text window contains invalid UTF-8. Request files.read with raw:true to read the exact bytes as base64.", code: "invalid_utf8")
+                throw FileReadFailure(
+                    message: "This text window contains invalid UTF-8. Request files.read with raw:true to read the exact bytes as base64.",
+                    code: "invalid_utf8")
             }
             return (slice, totalBytes, observedVersion, byteLimit)
         }
@@ -174,7 +174,6 @@ extension FileSystemActions {
             return errResult("max_bytes must be an integer, got \(jsonRepr(rawMb))", code: "bad_input")
         }
         maxBytes = min(maxBytes, connectorReadFileDefaultMaxBytes)
-        // Negative max_bytes produces an empty window.
         maxBytes = max(0, maxBytes)
         if let query = input["query"], query != .null {
             guard case .string(let text) = query else { return errResult("query must be a string", code: "bad_input") }
@@ -203,7 +202,7 @@ extension FileSystemActions {
         } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code) }
         catch { return errResult(error.localizedDescription, code: "read_failed") }
         if isDirectory {
-            if FileReadSourceMaterial.metadataOnly {
+            if ctx.readOptions.metadataOnly {
                 return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(0)])
             }
             let pattern = input["match"]?.stringValue ?? ""
@@ -213,20 +212,17 @@ extension FileSystemActions {
             }
             return readMatching(in: resolved, pattern: pattern, input: input, ctx)
         }
-        // Nonblocking open plus fstat precedes image decoding too: a FIFO
-        // with an image extension must not block inside the pixel loader.
+        // Nonblocking open and fstat prevent an image-named FIFO from blocking the pixel loader.
         let handle: FileHandle
         do { handle = try openRegularReadHandle(resolved) }
         catch let error as FileReadFailure { return errResult(error.message, code: error.code) }
         catch { return errResult("could not open file", code: "read_failed") }
         defer { try? handle.close() }
-        // Decode from the bytes THIS verified descriptor produces. Reopening the
-        // path to decode would validate one
-        // file and render another after a swap.
-        // Explicit raw reads preserve exact bytes regardless of the sniffed prefix.
+        // Decode the verified descriptor's bytes; reopening after validation could render a swapped-in file. Explicit raw reads retain exact bytes regardless
+        // of prefix classification.
         let binary: Bool
         do {
-            if FileReadSourceMaterial.metadataOnly { binary = false }
+            if ctx.readOptions.metadataOnly { binary = false }
             else { binary = try FileReadSourceMaterial.isBinary(handle: handle) }
         }
         catch { return errResult("could not classify file: \(error.localizedDescription)", code: "read_failed") }
@@ -235,19 +231,22 @@ extension FileSystemActions {
             guard offset == 0 && expectedVersion.isEmpty else {
                 return errResult("Image reads return pixels, not byte windows. Omit offset and version.", code: "bad_input")
             }
-            if !FileReadSourceMaterial.metadataOnly {
+            if !ctx.readOptions.metadataOnly {
                 let bytes = ((try? handle.read(upToCount: LocalToolImage.maximumBytes + 1)) ?? nil) ?? Data()
-                return VerifiedImageRead.deliver(data: bytes, name: resolved.lastPathComponent)
+                return VerifiedImageRead.deliver(data: bytes, name: resolved.lastPathComponent, sink: ctx.readOptions.imageSink)
             }
         }
         // Documents read as text through mac.read; other binary kinds need a sense.
-        if !explicitlyRaw, !FileReadSourceMaterial.metadataOnly, binary {
+        if !explicitlyRaw, !ctx.readOptions.metadataOnly, binary {
             let document = ["pdf", "pages", "numbers", "key", "rtfd", "docx", "doc", "rtf"]
                 .contains(resolved.pathExtension.lowercased())
             var refusal: [String: JSONValue] = ["ok": .bool(false), "error_code": .string("binary_file"),
                 "error": .string(document
                     ? "\(resolved.lastPathComponent) is a document, not plain text; nothing was read. Its text comes from mac.read."
-                    : "\(resolved.lastPathComponent) is binary, not text; nothing was read. Grow a sense with sense.make to understand this kind through ordinary files.read from then on. Pass raw:true for its bytes as base64.")]
+                    : """
+                        \(resolved.lastPathComponent) is binary, not text; nothing was read. Grow a sense with sense.make to understand this kind \
+                        through ordinary files.read from then on. Pass raw:true for its bytes as base64.
+                        """)]
             refusal["next_call"] = .object(["tool": .string("app"), "input": .object([
                 "action": .string(document ? "mac.read" : "sense.make"),
                 "args": .object(document ? ["path": .string(resolved.path)]
@@ -258,14 +257,14 @@ extension FileSystemActions {
         do {
             window = try readFileWindow(
                 handle: handle, path: resolved, maxBytes: maxBytes, useCompactDefault: !hasExplicitMaxBytes,
-                offset: offset, expectedVersion: expectedVersion, preserveInvalidUTF8: explicitlyRaw
+                offset: offset, expectedVersion: expectedVersion, preserveInvalidUTF8: explicitlyRaw, metadataOnly: ctx.readOptions.metadataOnly
             )
         } catch let error as FileReadFailure {
             return errResult(error.message, code: error.code)
         } catch {
             return errResult("could not read file: \(error.localizedDescription)", code: "read_failed")
         }
-        if FileReadSourceMaterial.metadataOnly {
+        if ctx.readOptions.metadataOnly {
             return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(Int64(window.totalBytes))])
         }
         let nextOffset = offset + window.data.count
@@ -294,8 +293,7 @@ extension FileSystemActions {
         if explicitlyRaw {
             result["encoding"] = .string("base64")
         }
-        // A whole-file read carries the hash a guarded replacement checks
-        // (version is the paging cursor, not this).
+        // Guarded replacement needs the whole-file hash; the paging version identifies only the cursor.
         if offset == 0, !hasMore {
             result["content_sha256"] = .string(SHA256.hash(data: window.data).map { String(format: "%02x", $0) }.joined())
         }
@@ -312,13 +310,11 @@ extension FileSystemActions {
         }
         return .object(result)
     }
-    /// An explicit byte request bypasses text/sense interpretation.
+    /// Explicit byte requests bypass interpretation so the result preserves exact source bytes.
     static func rawBytes(_ input: [String: JSONValue], _ path: String) -> Bool {
         input["raw"] == .bool(true)
     }
-    /// read_file on a folder with a glob: the first eight matching files by
-    /// name in one call, each through the ordinary single-file read (same
-    /// gates; images as pixels).
+    /// Folder matches use ordinary single-file gates, including image delivery, rather than a separate read path.
     static let folderReadLimit = 8
     private static func readMatching(
         in folder: URL, pattern: String, input: [String: JSONValue], _ ctx: ConnectorActionContext
@@ -340,13 +336,12 @@ extension FileSystemActions {
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         var single = input
         single["match"] = nil; single["offset"] = nil; single["version"] = nil
-        // Images past the round's budget come back as paths, read next.
         var files: [JSONValue] = [], later: [JSONValue] = []
         for name in names.prefix(folderReadLimit) {
             let path = folder.appendingPathComponent(name)
             // Only a pixel read spends the budget; raw and metadata-only reads never wait.
-            if VerifiedImageRead.isImagePath(path), !rawBytes(single, path.path), !FileReadSourceMaterial.metadataOnly,
-               LocalToolImage.sink?.round.hasRoom == false {
+            if VerifiedImageRead.isImagePath(path), !rawBytes(single, path.path), !ctx.readOptions.metadataOnly,
+               ctx.readOptions.imageSink?.round.hasRoom == false {
                 later.append(.string(path.path)); continue
             }
             single["path"] = .string(path.path)
@@ -409,16 +404,19 @@ extension FileSystemActions {
         do {
             let handle = try openRegularReadHandle(resolved)
             defer { try? handle.close() }
-            if FileReadSourceMaterial.metadataOnly {
+            if ctx.readOptions.metadataOnly {
                 let metadata = try readFileWindow(handle: handle, path: resolved, maxBytes: 0,
-                    useCompactDefault: false, offset: 0, expectedVersion: expectedVersion)
+                    useCompactDefault: false, offset: 0, expectedVersion: expectedVersion, metadataOnly: true)
                 return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(Int64(metadata.totalBytes))])
             }
             window = try readExcerptWindow(handle: handle, path: resolved, startLine: startLine,
                 maxLines: maxLines, terms: terms, expectedVersion: expectedVersion)
         } catch let failure as FileReadFailure {
             if failure.code == "file_changed" {
-                return errResult("The file changed during this read; a consistent excerpt could not be established. Retry the selection. If it came from a search, repeat that search because line positions may have moved.", code: "file_changed")
+                return errResult("""
+                    The file changed during this read; a consistent excerpt could not be established. Retry the selection. If it came from a \
+                    search, repeat that search because line positions may have moved.
+                    """, code: "file_changed")
             }
             return errResult(failure.message, code: failure.code)
         } catch {
@@ -457,9 +455,7 @@ extension FileSystemActions {
         }
         return .object(result)
     }
-    /// Count the complete stable source while retaining only the requested
-    /// lines. Reuse the byte reader's version checks and UTF-8 boundaries;
-    /// newline state persists across chunks, including a split CRLF.
+    /// Count the stable source while retaining only requested lines; carry newline state across chunks, including split CRLF.
     private static func readExcerptWindow(
         handle: FileHandle, path: URL, startLine: Int, maxLines: Int, terms: [String], expectedVersion: String
     ) throws -> (total: Int, lines: [(number: Int, text: String)], bytes: Int, version: String, matches: Int, next: Int?) {
@@ -484,7 +480,9 @@ extension FileSystemActions {
                     let size = try JSONValue.string(current).serialize(pretty: false).utf8.count + 64
                     if lines.count >= maxLines || retainedBytes + size > 24_000 {
                         guard !lines.isEmpty else {
-                            throw FileReadFailure(message: "Matching line \(total + 1) exceeds one search page. Read that record with read_file byte windows.", code: "excerpt_too_large")
+                            throw FileReadFailure(
+                                message: "Matching line \(total + 1) exceeds one search page. Read that record with read_file byte windows.",
+                                code: "excerpt_too_large")
                         }
                         next = total + 1
                     } else {
@@ -504,10 +502,12 @@ extension FileSystemActions {
                 offset: offset, expectedVersion: version
             )
             guard let text = String(data: chunk.data, encoding: .utf8) else {
-                throw FileReadFailure(message: "This excerpt contains invalid UTF-8. Request files.read with raw:true for exact bytes as base64.", code: "invalid_utf8")
+                throw FileReadFailure(
+                    message: "This excerpt contains invalid UTF-8. Request files.read with raw:true for exact bytes as base64.", code: "invalid_utf8")
             }
             if !terms.isEmpty, chunk.data.contains(0) {
-                throw FileReadFailure(message: "query searches plain text only. Request files.read with raw:true for exact bytes as base64.", code: "binary_file")
+                throw FileReadFailure(
+                    message: "query searches plain text only. Request files.read with raw:true for exact bytes as base64.", code: "binary_file")
             }
             version = chunk.version
             for scalar in text.unicodeScalars {
@@ -524,12 +524,16 @@ extension FileSystemActions {
                     if !terms.isEmpty || selected() {
                         currentBytes += scalar.utf8.count
                         guard currentBytes <= 1_048_576 else {
-                            throw FileReadFailure(message: "Line \(total + 1) exceeds 1 MiB of text. Read that record with read_file byte windows.", code: "excerpt_too_large")
+                            throw FileReadFailure(
+                                message: "Line \(total + 1) exceeds 1 MiB of text. Read that record with read_file byte windows.", code: "excerpt_too_large")
                         }
                         if terms.isEmpty { retainedBytes += scalar.utf8.count }
                         guard retainedBytes <= 1_048_576 else {
                             throw FileReadFailure(
-                                message: "Requested excerpt exceeds 1 MiB of text. Narrow max_lines, or use read_file byte windows and its returned next arguments for a very long line.",
+                                message: """
+                                    Requested excerpt exceeds 1 MiB of text. Narrow max_lines, or use read_file byte windows and its returned next \
+                                    arguments for a very long line.
+                                    """,
                                 code: "excerpt_too_large"
                             )
                         }

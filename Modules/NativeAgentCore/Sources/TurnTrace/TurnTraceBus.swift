@@ -3,15 +3,13 @@ import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
 import os
-// Blueprint: | `TurnTraceBus.swift` | In-process multicast and bounded ingress/disk queues with sole retained workers; durable terminal delivery before checkpoint retirement; turn-scoped flush markers retain prior accepted-write failure and capture outstanding tickets with cancellation and a five-second deadline, independent of later traffic |
+// Blueprint: | `TurnTraceBus.swift` | Bounded live/disk queues; durable terminals and scoped flush |
 
-/// Nonblocking live multicast with bounded subscriber buffers;
-/// overflow drops the oldest buffered event.
+/// Nonblocking live multicast with bounded subscriber buffers; overflow drops the oldest buffered event.
 public actor TurnTraceBus {
     public static let shared = TurnTraceBus()
 
-    /// Default per-subscriber ring capacity. Bounded so a stalled consumer
-    /// can't grow memory without limit.
+    /// Default per-subscriber ring capacity. Bounded so a stalled consumer can't grow memory without limit.
     public static let defaultBufferCapacity = 512
 
     public struct Subscription: Sendable {
@@ -36,9 +34,7 @@ public actor TurnTraceBus {
 
     // MARK: Subscribe / unsubscribe
 
-    /// Register a bounded subscriber. Returns a `Subscription` whose `stream`
-    /// yields live events until `unsubscribe(id:)` is called or the consumer
-    /// stops iterating (onTermination unregisters automatically).
+    /// Termination unregisters bounded subscriptions so abandoned consumers cannot retain buffers.
     public func subscribe(
         capacity: Int = TurnTraceBus.defaultBufferCapacity
     ) -> Subscription {
@@ -49,8 +45,7 @@ public actor TurnTraceBus {
         )
         sinks[id] = continuation
         continuation.onTermination = { [weak self] _ in
-            // Consumer went away (cancel / break out of for-await). Detached so
-            // we never await from the termination callback.
+            // Detach cleanup because stream termination callbacks cannot await.
             Task { [weak self] in await self?.removeSink(id) }
         }
         return Subscription(id: id, stream: stream)
@@ -66,8 +61,7 @@ public actor TurnTraceBus {
 
     // MARK: Emit
 
-    /// Bounded ingress retains one drain task; overload drops events without
-    /// allocating a task per event.
+    /// Bounded ingress retains one drain task; overload drops events without allocating a task per event.
     private nonisolated static let emissionPump = _FIFO<PendingEmission>(capacity: 4096)
 
     private struct PendingEmission: Sendable {
@@ -80,8 +74,7 @@ public actor TurnTraceBus {
         let ticket: UUID
     }
 
-    /// A marker covers this turn's prior failures and outstanding accepted events.
-    /// Later traffic cannot extend it; neither cancellation nor a deadline waits
+    /// A marker covers this turn's prior failures and outstanding accepted events. Later traffic cannot extend it; neither cancellation nor a deadline waits
     /// for a blocked persistence worker to return.
     private final class TurnFlushes: @unchecked Sendable {
         final class Marker: @unchecked Sendable {
@@ -119,9 +112,8 @@ public actor TurnTraceBus {
         }
         private let lock = NSLock()
         private var pending: [String: Set<UUID>] = [:]
-        // One retained cause per damaged turn is enough to forbid a clean flush.
-        // Never evict or clear it on capture: a later successful append cannot
-        // restore an earlier lost row. Successful turns retain no result state.
+        // One retained cause per damaged turn is enough to forbid a clean flush. Never evict or clear it on capture: a later successful append cannot restore
+        // an earlier lost row. Successful turns retain no result state.
         private var failures: [String: Error] = [:]
         private var waiting: [UUID: Waiting] = [:]
 
@@ -179,8 +171,7 @@ public actor TurnTraceBus {
         private var idleWaiters: [CheckedContinuation<Void, Never>] = []
         private let capacity: Int
         init(capacity: Int) { self.capacity = capacity }
-        /// Queue admission and publication of the sole retained worker share
-        /// the lock. Its handle retires only after the final delivery settles.
+        /// Share queue admission and worker publication under one lock; retire the worker only after final delivery settles.
         @discardableResult
         func enqueue(_ pending: Element, deliver: @escaping @Sendable (Element) async -> Void) -> Bool {
             lock.lock(); defer { lock.unlock() }
@@ -191,6 +182,32 @@ public actor TurnTraceBus {
                 while let next = self.next() { await deliver(next) }
             }
             return true
+        }
+        /// Batch delivery: the worker takes everything queued (up to `limit`) at once, so one write carries a whole flush.
+        @discardableResult
+        func enqueue(_ pending: Element, limit: Int, deliverBatch: @escaping @Sendable ([Element]) async -> Void) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            guard queue.count - head < capacity else { return false }
+            queue.append(pending)
+            guard worker == nil else { return true }
+            worker = Task.detached(priority: .utility) { [self] in
+                while let batch = self.nextBatch(limit) { await deliverBatch(batch) }
+            }
+            return true
+        }
+        func nextBatch(_ limit: Int) -> [Element]? {
+            guard let first = next() else { return nil }
+            var batch = [first]
+            while batch.count < limit, let more = takeIfQueued() { batch.append(more) }
+            return batch
+        }
+        /// The next queued element without retiring the worker when none is queued.
+        private func takeIfQueued() -> Element? {
+            lock.lock(); defer { lock.unlock() }
+            guard head < queue.count else { return nil }
+            let value = queue[head]
+            head += 1
+            return value
         }
         func next() -> Element? {
             lock.lock()
@@ -213,11 +230,8 @@ public actor TurnTraceBus {
             lock.unlock()
             return value
         }
-        /// Suspend until the pump is idle (queue empty AND the drain worker,
-        /// which pops each item BEFORE awaiting its delivery, has finished its
-        /// final delivery and observed the empty queue). Resumes immediately
-        /// when already idle. Process-exit drain for short-lived CLI hosts;
-        /// the hot emit path never touches this.
+        /// Idle requires both an empty queue and completed final delivery because the worker dequeues before awaiting. Use only for short-lived process exit;
+        /// hot emission never waits here.
         func waitUntilIdle() async {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 lock.lock()
@@ -232,17 +246,14 @@ public actor TurnTraceBus {
         }
     }
 
-    /// Drain accepted ingress, then this bus's persistence queue, before process exit.
-    /// Dropped events stay lost; never await this on a turn's hot path.
+    /// Drain accepted ingress, then this bus's persistence queue, before process exit. Dropped events stay lost; never await this on a turn's hot path.
     public nonisolated func drainForProcessExit() async {
         await Self.emissionPump.waitUntilIdle()
         await persistQueue.waitUntilIdle()
     }
 
-    /// Flush this turn's already-accepted queue entries, with a five-second
-    /// deadline. Any prior accepted-write failure on this bus still throws.
-    /// This is ordering evidence only: the caller must still verify the
-    /// checkpoint and persisted terminal. Queue loss is never completion.
+    /// Flush this turn's already-accepted queue entries, with a five-second deadline. Any prior accepted-write failure on this bus still throws. This is
+    /// ordering evidence only: the caller must still verify the checkpoint and persisted terminal. Queue loss is never completion.
     public nonisolated func flush(turnId: String) async throws {
         try Task.checkCancellation()
         let marker = flushes.capture(turnId)
@@ -259,8 +270,7 @@ public actor TurnTraceBus {
         try Task.checkCancellation()
     }
 
-    /// Nonblocking emission through bounded ingress and per-bus persistence queues.
-    /// Events over either queue's capacity are dropped.
+    /// Nonblocking emission through bounded ingress and per-bus persistence queues. Events over either queue's capacity are dropped.
     public nonisolated static func fire(_ event: TurnTraceEvent, on bus: TurnTraceBus = .shared) {
         let event = sequencingDispatch(event)
         let tracked = TrackedEvent(event: event, ticket: bus.flushes.begin(event.turnId))
@@ -271,28 +281,30 @@ public actor TurnTraceBus {
         }
     }
 
-    /// Convenience: build + fire in one call, reading turnId/sessionId/surface
-    /// off the ambient context when not supplied. Skips entirely when no turn
-    /// is bound (the common non-turn caller).
+    /// Capture explicit request metadata before asynchronous emission; trace-only correlation may supply the act id.
     public nonisolated static func fireFromContext(
         kind: String,
-        sessionId: String? = LLMCallContext.sessionId,
-        surface: String? = LLMCallContext.surface,
+        sessionId: String? = nil,
+        surface: String? = nil,
         payload: JSONValue = .object([:]),
+        turn: Turn?,
         on bus: TurnTraceBus? = nil
     ) {
-        guard let turnId = TurnTraceContext.turnId else { return }
+        guard let turnId = turn?.id ?? TurnTraceContext.turnId else { return }
         let event = TurnTraceEvent(
             turnId: turnId,
             kind: kind,
-            sessionId: sessionId,
+            sessionId: sessionId ?? turn?.session,
             surface: surface,
-            payload: payload
+            destinationId: TurnTraceContext.destinationId,
+            threadId: TurnTraceContext.threadId,
+            payload: payload,
+            turn: turn
         )
         fire(event, on: bus ?? TurnTraceContext.bus ?? .shared)
     }
 
-    /// Publish to subscribers without awaiting them, then enqueue persistence.
+    /// Keep subscriber delivery independent of disk latency.
     public func deliver(_ event: TurnTraceEvent) {
         deliver(TrackedEvent(event: event, ticket: flushes.begin(event.turnId)))
     }
@@ -300,13 +312,13 @@ public actor TurnTraceBus {
     private func deliver(_ tracked: TrackedEvent) {
         let event = tracked.event
         if event.turnId != "unknown" || event.diagnostic.isEmpty { deliverToSubscribers(event) }
-        if !persistQueue.enqueue(tracked, deliver: { [persistLane, flushes] next in
+        if !persistQueue.enqueue(tracked, limit: 256, deliverBatch: { [persistLane, flushes] batch in
             do {
-                try await persistLane.appendChecked(next.event)
-                flushes.end(next)
+                try await persistLane.appendBatch(batch.map(\.event))
+                for next in batch { flushes.end(next) }
             } catch {
-                ModuleLog(category: "TurnTracePersistLane")("append failed (\(next.event.kind), turn \(next.event.turnId)): \(error)", level: .error)
-                flushes.end(next, error: error)
+                ModuleLog(category: "TurnTracePersistLane")("append of \(batch.count) events failed: \(error)", level: .error)
+                for next in batch { flushes.end(next, error: error) }
             }
         }) {
             flushes.end(tracked, error: ToolFailureError("Trace persistence queue was full; the turn's evidence is incomplete.", effects: .unknown))
@@ -315,12 +327,11 @@ public actor TurnTraceBus {
 
     /// A terminal must reach disk before its restart checkpoint can be removed.
     public func deliverDurably(_ event: TurnTraceEvent) async throws {
-        let wrote = try await persistLane.appendGuarded(event, shouldAppend: { current in
+        let wrote = try await persistLane.appendGuarded(event, unless: { current in
             guard event.kind == "turn.terminal", case .object(let payload) = event.payload,
-                  case .string(let status)? = payload["status"] else { return true }
-            // This terminal is known by its live owner. Damage elsewhere in
-            // the feed cannot prevent its append or invalidate an exact duplicate.
-            return !TurnTraceReplayReader.containsTerminal(forTurn: event.turnId, in: current.events, status: status)
+                  case .string(let status)? = payload["status"] else { return false }
+            // This terminal is known by its live owner: only an exact duplicate among its turn's own events stops it.
+            return TurnTraceReplayReader.containsTerminal(forTurn: event.turnId, in: current, status: status)
         })
         if wrote { deliverToSubscribers(event) }
     }
@@ -331,8 +342,7 @@ public actor TurnTraceBus {
     }
     private static let dispatchCoverage = OSAllocatedUnfairLock<[String: DispatchCoverage]>(initialState: [:])
 
-    /// Stamp before either lossy queue. Turn closure carries the final count,
-    /// so even losing both ends of a dispatch leaves a detectable gap.
+    /// Stamp before either lossy queue. Turn closure carries the final count, so even losing both ends of a dispatch leaves a detectable gap.
     private nonisolated static func sequencingDispatch(_ event: TurnTraceEvent) -> TurnTraceEvent {
         guard event.kind == "tool.dispatch" || event.kind == "tool.dispatch.closed", case .object(var payload) = event.payload else { return event }
         let mark = dispatchCoverage.withLock { rows -> JSONValue in
@@ -350,17 +360,15 @@ public actor TurnTraceBus {
         payload["dispatchCoverage"] = mark
         var sequenced = TurnTraceEvent(turnId: event.turnId, ts: event.ts, kind: event.kind,
             sessionId: event.sessionId, surface: event.surface, destinationId: event.destinationId,
-            threadId: event.threadId, payload: .object(payload))
+            threadId: event.threadId, payload: .object(payload), turn: nil)
         sequenced.diagnostic = event.diagnostic
         return sequenced
     }
 
-    /// Live delivery without persistence. Reconciliation uses this after its
-    /// guarded append so the event is not written twice.
+    /// Live delivery without persistence. Reconciliation uses this after its guarded append so the event is not written twice.
     func deliverToSubscribers(_ event: TurnTraceEvent) {
         for continuation in sinks.values {
-            // `.bufferingNewest(cap)` means yield NEVER blocks; on overflow it
-            // drops the OLDEST buffered value and reports `.dropped`.
+            // `.bufferingNewest(cap)` means yield NEVER blocks; on overflow it drops the OLDEST buffered value and reports `.dropped`.
             if case .terminated = continuation.yield(event) { continuation.finish() }
         }
     }

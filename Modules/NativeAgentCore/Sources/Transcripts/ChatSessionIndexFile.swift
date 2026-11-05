@@ -4,7 +4,7 @@ import NativeAgentCore
 import Darwin
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `ChatSessionIndexFile.swift` | Canonical durable index writer, creator-declared conversation kinds and exact-owner corrections, checked index schema and message-index, projection-generation, transcript-rewrite and retention-removal transactions; count/acknowledgment reads under index → transcript locks, retention on every message within the index transaction; `recordContinuityParticipant`, `recordConversationChange`; backup/export/sync/privacy decisions live here |
+// Blueprint: | `ChatSessionIndexFile.swift` | `recordContinuityParticipant`, `recordConversationChange`: Durable index and continuity transactions |
 
 public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatable {
     case unreadable(path: String, reason: String)
@@ -35,15 +35,9 @@ public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatabl
     }
 }
 
-/// Checked mutation and durable commit owner for `chat/sessions.json`.
-///
-/// A missing file is the only state treated as a new index. Existing files
-/// must be readable, non-empty JSON arrays containing only object rows. This
-/// prevents read failures and malformed rows from being collapsed into an
-/// empty index and overwritten by the next surface that creates a session.
-/// Callers hold its shared lock across read, row edits and write.
-/// Storage: local/off-disk backup and PrivacyMap/chat include it; data export
-/// excludes it. DeviceSync publishes selected session rows, not this raw file.
+/// Only missing storage creates a new index; unreadable or malformed existing bytes must never be overwritten as empty. Hold the shared lock across read, row
+/// edits, durable commit and dependent effects. Local/off-disk backup and PrivacyMap/chat include this index; export excludes it and phone sync projects
+/// selected rows.
 public enum ChatSessionIndexFile {
     /// Keep index publication, destination binding and retention under one lock.
     public static func ensureSession(
@@ -92,8 +86,7 @@ public enum ChatSessionIndexFile {
         }
     }
 
-    /// Compound transactions may commit before their next effect (retention,
-    /// binding publication). The existing lock scope remains held across both.
+    /// Compound transactions may commit before their next effect (retention, binding publication). The existing lock scope remains held across both.
     public static func write(_ rows: [[String: JSONValue]], to path: URL, removeWhenEmpty: Bool = false) throws {
         try CredentialFileLock.withLock(path) {
             if removeWhenEmpty && rows.isEmpty { try FileManager.default.removeItem(at: path) }
@@ -106,9 +99,8 @@ public enum ChatSessionIndexFile {
 
     private static let pendingSyncs = OSAllocatedUnfairLock(initialState: [String: Int]())
 
-    /// An overlapping sync may observe another writer's bytes. Keep its
-    /// transcript hot until every admitted writer has finished its own index
-    /// commit; after a crash, the persisted exact-version guard takes over.
+    /// An overlapping sync may observe another writer's bytes. Keep its transcript hot until every admitted writer has finished its own index commit; after a
+    /// crash, the persisted exact-version guard takes over.
     public static func beginTranscriptIndexSync(at path: URL) {
         pendingSyncs.withLock { $0[path.standardizedFileURL.path, default: 0] += 1 }
     }
@@ -125,9 +117,8 @@ public enum ChatSessionIndexFile {
         pendingSyncs.withLock { $0[path.standardizedFileURL.path] != nil }
     }
 
-    /// Exact filesystem version acknowledged while holding the transcript lock.
-    /// Integer seconds/nanoseconds avoid ISO8601 millisecond rounding; inode
-    /// and size also distinguish atomic replacements and same-clock appends.
+    /// Exact filesystem version acknowledged while holding the transcript lock. Integer seconds/nanoseconds avoid ISO8601 millisecond rounding; inode and size
+    /// also distinguish atomic replacements and same-clock appends.
     public static let acknowledgedTranscriptKey = "acknowledgedTranscriptVersion"
 
     public static func transcriptVersion(at path: URL) -> JSONValue? {
@@ -141,9 +132,7 @@ public enum ChatSessionIndexFile {
         ])
     }
 
-    /// Unknown or mixed participants stay unavailable. Legacy transcripts are
-    /// not relabeled from their latest turn. An assistant-led opening binds
-    /// only when the whole transcript proves the first user's provenance.
+    /// Unknown participants stay unavailable; bind an assistant-led opening only when the whole transcript proves the first user's provenance.
     public static func recordContinuityParticipant(
         in row: inout [String: JSONValue], participant: String?, scope: String?, messageCount: Int,
         verifiedOpening: Bool = false
@@ -157,9 +146,8 @@ public enum ChatSessionIndexFile {
             row["continuityParticipant"] = .null
         }
     }
-    /// The last transcript generation containing conversational speech. Tool
-    /// receipts still advance transcriptGeneration, but do not announce a new
-    /// exchange to another open workspace.
+    /// The last transcript generation containing conversational speech. Tool receipts still advance transcriptGeneration, but do not announce a new exchange to
+    /// another open workspace.
     public static func recordConversationChange(in row: inout [String: JSONValue], role: String) {
         guard ["user", "assistant"].contains(role), let generation = transcriptGeneration(in: row) else { return }
         row["lastConversationGeneration"] = .int(generation)
@@ -209,11 +197,8 @@ public enum ChatSessionIndexFile {
         return rows
     }
 
-    /// Canonical sessions.json message-index transaction. The JSON object-array
-    /// schema is locally backed up, excluded from production export, projected
-    /// to phone sessions/pins and inventoried under PrivacyMap's chat category.
-    /// Count and filesystem acknowledgment are read inside index → transcript
-    /// locks; retention remains inside the same index transaction on every message.
+    /// Read counts and acknowledgments under index → transcript locks; keep retention in that index transaction on every message. Back up the object-array
+    /// index locally; export excludes it and phone sync projects sessions and pins under PrivacyMap/chat.
     package static func recordMessage(
         sessionId: String, role normalizedRole: String, source: String, sourceKey: String?, kind: ChatThreadKind?, ownedSessionID: String?,
         timestamp: String, syncedAt: String, preview: String, stamp: TranscriptRowStamp,
@@ -241,7 +226,7 @@ public enum ChatSessionIndexFile {
                               case .string(let role)? = fields["role"],
                               case .object(let metadata)? = fields["metadata"] else { return false }
                         return ["user", "assistant"].contains(role)
-                            && ChatSessionRecollections.admitsContinuity(
+                            && ConversationHistory.admitsContinuity(
                                 role: role, metadata: metadata, participant: continuityParticipant,
                                 source: source, scope: continuityScope)
                     }
@@ -280,9 +265,6 @@ public enum ChatSessionIndexFile {
                 }
                 if ownedSessionID == sessionId, let kind {
                     row["threadKind"] = .string(kind.rawValue)
-                } else if row["threadKind"] == nil {
-                    let existingSource: String = if case .string(let value)? = row["source"] { value } else { source }
-                    row["threadKind"] = .string(ChatThreadKind.inferred(fromSource: existingSource).rawValue)
                 }
                 updated = row
             }
@@ -335,7 +317,7 @@ public enum ChatSessionIndexFile {
         }
     }
 
-    /// Projection-only changes preserve every other index field.
+    /// Projection changes must preserve unrelated index fields.
     package static func recordProjectionChanges(
         sessionIDs: Set<String>, dataRoot: URL
     ) async throws {
@@ -352,7 +334,7 @@ public enum ChatSessionIndexFile {
         }
     }
 
-    /// A rewritten transcript acknowledges its exact filesystem version and count.
+    /// Acknowledge the rewritten transcript's exact version and count so retention cannot archive an uncommitted generation.
     package static func recordTranscriptRewrite(
         sessionID: String, dataRoot: URL, countMessages: @escaping @Sendable (URL) throws -> Int
     ) async throws {
@@ -371,7 +353,7 @@ public enum ChatSessionIndexFile {
         }
     }
 
-    /// Retention calls this while holding index and archived transcript locks.
+    /// Caller must hold index and archived transcript locks.
     static func removeArchivedRow(
         _ row: [String: JSONValue], from rows: inout [[String: JSONValue]], at path: URL
     ) throws {
@@ -401,10 +383,7 @@ public enum ChatSessionIndexFile {
     public static func transcriptGeneration(in row: [String: JSONValue]) -> Int64? {
         switch row[transcriptGenerationKey] {
         case .int(let value): return value
-        // A hand-edited or foreign-writer row can carry the counter as a JSON
-        // float. Range-checked, never a bare `Int64(value)` — that traps on
-        // anything outside Int64, and this reader sits inside the
-        // session-index writer.
+        // Foreign writers can supply JSON floats; range-check before Int64 conversion to avoid trapping inside the index transaction.
         case .double(let value):
             let truncated = value.rounded(.towardZero)
             guard truncated >= -9_007_199_254_740_992,
@@ -423,17 +402,13 @@ public enum ChatSessionIndexFile {
         return true
     }
 
-    /// Whether this row's transcript version can no longer advance. A clear
-    /// checks this BEFORE deleting any transcript bytes: an empty transcript
-    /// published without a newer version is one the phone must refuse, which
-    /// would leave the two surfaces disagreeing about the chat forever.
+    /// Check generation exhaustion before deleting bytes: a clear without a newer generation would leave the phone showing stale history.
     public static func isTranscriptGenerationExhausted(in row: [String: JSONValue]) -> Bool {
         transcriptGeneration(in: row) == Int64.max
     }
 }
 
-/// A `sessions.json` row that does not read as a session: a required field is
-/// missing, or a field holds the wrong JSON type.
+/// Missing or mistyped required fields cannot establish a session row.
 public struct ChatSessionRowError: Error, LocalizedError, Sendable, Equatable {
     public let field: String
     public var errorDescription: String? {
@@ -442,11 +417,7 @@ public struct ChatSessionRowError: Error, LocalizedError, Sendable, Equatable {
 }
 
 public extension ChatSession {
-    /// One `sessions.json` row, read straight from its parsed object. The
-    /// same contract the row's Codable decode had: `id`, `title` and
-    /// `createdAt` are required strings; every other field is absent/null or
-    /// its exact type (integers accept an integral JSON float); anything else
-    /// fails the row, and so the listing.
+    /// Require id, title and createdAt strings; optional fields must be null/absent or exactly typed so malformed rows fail listing.
     init(row o: [String: JSONValue]) throws {
         do {
             let row = try JSONRow(.object(o))

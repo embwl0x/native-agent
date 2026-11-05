@@ -58,7 +58,6 @@ owner evidence rather than labeling the refusal an attempted write.
 | `MemoryV2/MemoryStorage+Recall.swift`, `MemoryRecallScoring.swift` | Cached recall candidates and vector/lexical scoring. Raw BM25 mathematics are shared with earlier-session snippets; memory normalizes by the maximum and weights at one standard deviation of the query's dense similarities (`lexicalBoostWeight`). Each caller owns tokenization, its candidate cohort and ranking. |
 | `MemoryV2/MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live journal-only interpretation: User's own turns judge now unless a complete-no-op claim stands; other recorded turns stay owed for a batch. Writes meaning before applying and keeps facts by operation identity. Keeps trusted facts, stages the rest. Deferral and labels follow [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
 | `MemoryV2/AdaptiveMemoryPromoter+Recovery.swift` | The same promoter's owed-turn recovery on its live serialization tail: recorded-provenance replay, fair retries and bounded wake/idle/night batches with judgment settlement. |
-| `MemoryV2/AdaptiveMemoryPromoter+Migrations.swift` | The retained moment-to-care conversion for stored moment rows; its durable marker keeps converted work from repeating. |
 | `MemoryV2/AfterTurnMemorySurprise.swift`, `AfterTurnSurpriseLedger.swift` | The agent's own learned complete no-op prediction (language-independent warm-vector precedents, keyed by agent, memory model and detector), stable precedent claims and their labelled record; `NativeAgentCore/Expectation.swift` owns Wilson-bound cost standing. See [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation). |
 | `ChatTurnRuntime/MindMemoryManager.swift` | At most one shared model interpretation per turn, returning memories, affect, a caring judgment, what moved their (cares) and optional reply promises, or one call for a batch of owed turns (the rules once, one section per turn; a missing section stays owed); its checked route key scopes the prediction record. |
 | `MemoryV2/AdaptiveMemoryPromises.swift` | Files the same interpretation's promises through `MyQueue.add` with their exact reply sentence and settled turn provenance, for live and batch/refold paths. Desk owns deduplication and the inferred cap; these are [intentions](INTENTIONS.md#promises-they-makes), not memories. |
@@ -294,18 +293,6 @@ mark on the exchange: the after-turn call's cares section writes it as a care
 movement (the felt word, their note, how far it moved their and the
 `exchange:<session>/<turn>` pointer) in [SUBCONSCIOUS.md](SUBCONSCIOUS.md#cares).
 Nothing stages, caps or reviews a moment.
-
-Once per store, at cognition bootstrap (`moveMomentsIntoCaresOnce`, marker
-`memory/migrations/moments_into_cares_v1.done`), every kept moment and every
-moment still pending became a care movement through the same `applyCares`:
-on the care whose story already points at its exchange (then nothing is
-written twice), else the live care the moment touches (the care law: its
-cosine stands out past chance among their live cares, `caresStandingOut`), else
-a new care of theirs alone; moved from its valence, felt a plain word from valence and
-salience, note its own sentence (≤120 characters), at its time. A pending
-moment was then rejected with the receipt "now a care" (an untrusted peer's
-with no care to join: "not kept"). A kept moment stays in the store as a
-record and an ordinary memory: not `.personal`, not re-felt.
 
 `memory.proposals` lists what still waits on them (an untrusted peer's facts or
 a fact acceptance left for review; `status: "rejected"` for what was let go) and

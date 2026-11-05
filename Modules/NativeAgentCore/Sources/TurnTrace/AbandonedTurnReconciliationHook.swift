@@ -2,16 +2,11 @@ import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook` enum; `arm`, `disarm`; retains sweep/resume jobs through exit and removes its observer at engine termination; excludes active turns and claims checkpoint resumes; terminal settlement awaits the installed anchor-intent adapter; post-resume confirmation uses a cancellable five-second flush covering this turn's prior write failures and outstanding accepted trace entries |
+// Blueprint: | `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook`, `arm`, `disarm`: Bounded recovery; cancellation-aware trace flush |
 
-/// Resume unfinished turns at launch; reconcile legacy turns at settled boundaries.
+/// Resume checkpoints and reconcile prior-process trace evidence once at launch.
 @MainActor
 public enum AbandonedTurnReconciliationHook {
-    /// Settled boundaries reuse the launch sweep without repeatedly reading disk.
-    private static let minimumIntervalSeconds: TimeInterval = 300
-
-    private static var observer: NSObjectProtocol?
-    private static var lastSweepAt: Date?
     private static var generation: UUID?
     private static var sweepTask: Task<Void, Never>?
     private static var resumeJobs: [UUID: Task<Void, Never>] = [:]
@@ -28,34 +23,21 @@ public enum AbandonedTurnReconciliationHook {
         try await retainReplyMirror?(dataRoot, sessionId, runId)
     }
 
-    public static func arm(completedTurnNotification: Notification.Name,
-                           inFlight: @escaping @Sendable () -> Set<String>,
+    public static func arm(inFlight: @escaping @Sendable () -> Set<String>,
                            resume: @escaping @Sendable (TurnCheckpoint) async throws -> Void) {
-        guard observer == nil else { return }
+        guard generation == nil else { return }
         self.inFlight = inFlight
         self.resume = resume
         generation = UUID()
-        // Pin the process epoch at launch: only turns accepted BEFORE it are
-        // ever reconcilable.
+        // Pin the process epoch at launch: only turns accepted BEFORE it are ever reconcilable.
         _ = AbandonedTurnReconciler.processEpoch
-        observer = NotificationCenter.default.addObserver(
-            forName: completedTurnNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            MainActor.assumeIsolated { sweepIfDue() }
-        }
-        sweepIfDue()
+        sweepAtLaunch()
     }
 
     public static func disarm() {
         generation = nil
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
-        lastSweepAt = nil
         sweepTask?.cancel()
-        // A queued job checks the generation before admission. A resume that
-        // already began is accepted turn work and keeps its owner until exit.
+        // A queued job checks the generation before admission. A resume that already began is accepted turn work and keeps its owner until exit.
         resume = nil
         inFlight = { [] }
     }
@@ -82,8 +64,7 @@ public enum AbandonedTurnReconciliationHook {
                 return
             }
             if turnId.isEmpty {
-                // Each checkpoint reconciles on its own; one that fails owes its own
-                // repair and never holds back its siblings.
+                // Each checkpoint reconciles on its own; one that fails owes its own repair and never holds back its siblings.
                 var failed: Error?
                 for turn in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: sessionId) {
                     try Task.checkCancellation()
@@ -103,9 +84,9 @@ public enum AbandonedTurnReconciliationHook {
             try Task.checkCancellation()
             try await TurnTraceBus.shared.flush(turnId: turnId)
             try Task.checkCancellation()
-            try confirmed(checkpoint, dataRoot: dataRoot)
+            try await confirmed(checkpoint, dataRoot: dataRoot)
             await RepairOwed.settle(dataRoot, operation: "turn.reconcile:" + turnId,
-                evidence: .init(source: "turn_traces", id: turnId)).value
+                evidence: .init(source: "experiences/experiences.sqlite", id: turnId)).value
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -117,37 +98,26 @@ public enum AbandonedTurnReconciliationHook {
         }
     }
 
-    private static func confirmed(_ checkpoint: TurnCheckpoint, dataRoot: URL) throws {
+    private static func confirmed(_ checkpoint: TurnCheckpoint, dataRoot: URL) async throws {
         guard try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: checkpoint.sessionId, turnId: checkpoint.turnId) == nil else {
             throw ToolFailureError("The resumed turn still has unfinished work or an unaccepted reply.", effects: .unknown)
         }
-        let days = Set([checkpoint.acceptedAt, checkpoint.updatedAt, Date()].flatMap { day in
-            [day] + [-1, 1].compactMap { TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: $0, to: day) }
-        }.map { dataRoot.appendingPathComponent("turn_traces/" + TurnTracePersistLane.dayString(from: $0) + ".jsonl") })
-        for day in days where FileManager.default.fileExists(atPath: day.path) {
-            let read = TurnTraceReplayReader.parse(try Data(contentsOf: day))
-            // Recovery still needs a complete ledger, unlike a live owner's
-            // terminal append, which already knows this turn's outcome.
-            guard read.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
-            if ["completed", "waiting"].contains(where: { TurnTraceReplayReader.containsTerminal(forTurn: checkpoint.turnId, in: read.events, status: $0) }) { return }
-        }
+        let read = try await TurnTracePersistLane(dataRootOverride: dataRoot).events(.init(subjects: [checkpoint.turnId]))
+        // Missing or unreadable evidence never confirms recovery.
+        guard read.isClean else { throw CocoaError(.fileReadCorruptFile) }
+        if ["completed", "waiting"].contains(where: { TurnTraceReplayReader.containsTerminal(forTurn: checkpoint.turnId, in: read.events,
+            status: $0) }) { return }
         throw ToolFailureError("The resumed turn has no confirmed completed or waiting terminal; recovery remains owed.", effects: .unknown)
     }
 
-    private static func sweepIfDue() {
+    private static func sweepAtLaunch() {
         guard let generation, sweepTask == nil else { return }
-        let now = Date()
-        if let lastSweepAt, now.timeIntervalSince(lastSweepAt) < minimumIntervalSeconds {
-            return
-        }
-        lastSweepAt = now
         let active = inFlight().union(resuming)
-        // Never behind telemetry: only an earlier process's turns are
-        // candidates, and a resuming one is excluded until it confirms.
+        // Never behind telemetry: only an earlier process's turns are candidates, and a resuming one is excluded until it confirms.
         sweepTask = Task(priority: .utility) {
             defer {
                 sweepTask = nil
-                if self.generation != generation { sweepIfDue() }
+                if self.generation != generation { sweepAtLaunch() }
             }
             let outcome = await AbandonedTurnReconciler().sweep(inFlightTurnIds: active)
             guard self.generation == generation, !Task.isCancelled else { return }
@@ -161,16 +131,16 @@ public enum AbandonedTurnReconciliationHook {
                             sessionId: checkpoint.sessionId, turnId: checkpoint.turnId)
                     } catch {
                         guard self.generation == generation, !Task.isCancelled else { return }
-                        OrganPulse.record("abandoned_turns", .skipped,
+                        OrganPulse.record("abandoned_turns", .failed,
                             note: "Turn \(checkpoint.turnId) still owes recovery: \(error.localizedDescription)")
                     }
                 }
             }
             if let failure = outcome.failure {
-                OrganPulse.record("abandoned_turns", .skipped, note: failure)
+                OrganPulse.record("abandoned_turns", .failed, note: failure)
             } else {
                 OrganPulse.record("abandoned_turns", found: outcome.reconciled.count,
-                                  note: "\(outcome.resumable.count) resuming, \(outcome.reconciled.count) legacy turns owe recovery")
+                                  note: "\(outcome.resumable.count) resuming, \(outcome.reconciled.count) without a checkpoint owe recovery")
             }
             guard !outcome.reconciled.isEmpty else { return }
             FileHandle.standardError.write(

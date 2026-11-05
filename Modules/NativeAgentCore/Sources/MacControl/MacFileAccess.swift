@@ -16,7 +16,7 @@ import OSAKit
 import os
 #endif
 
-// Blueprint: | `MacFileAccess.swift` | `FileBytes`: bounded regular-file reads/appends, atomic writes, directory listing, entry moves and trash; checked entry/content readback distinguishes ENOENT from unavailable reads; `MacFileText` selects a lossless encoding from a bounded sample and returns complete-character byte windows |
+// Blueprint: | `MacFileAccess.swift` | `FileBytes`, `MacFileText`: Checked regular-file IO and lossless bounded text windows |
 
 public final class FileBytes: Sendable {
     public enum CheckedRead<Value: Sendable>: Sendable {
@@ -26,10 +26,7 @@ public final class FileBytes: Sendable {
     }
 
     public init() {}
-    // FileManager.default is NOT Sendable as of Swift 6 — fetch per-call
-    // instead of storing on the actor/adapter. Per Apple's own audit it's
-    // thread-safe for these operations even though the type lacks
-    // the Sendable bill of health.
+    // FileManager is not Sendable in Swift 6; fetch it per call because these operations are thread-safe without storing the non-Sendable instance.
     public func readData(at url: URL, maxBytes: Int, fromEnd: Bool = false) throws -> Data {
         let handle = try regularFileHandle(at: url, writing: false)
         defer { try? handle.close() }
@@ -41,8 +38,7 @@ public final class FileBytes: Sendable {
     }
     private func regularFileHandle(at url: URL, writing: Bool) throws -> FileHandle {
         #if canImport(Darwin)
-        // A FIFO blocks during open, before FileHandle can impose any read
-        // limit. Inspect the opened descriptor, not a racy path preflight.
+        // A FIFO blocks during open, before FileHandle can impose any read limit. Inspect the opened descriptor, not a racy path preflight.
         let flags = writing ? O_WRONLY | O_APPEND : O_RDONLY
         let fd = Darwin.open(url.path, flags | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -83,8 +79,7 @@ public final class FileBytes: Sendable {
         } else {
             let parent = url.deletingLastPathComponent()
             try fm.createDirectory(at: parent, withIntermediateDirectories: true)
-            // A failed replacement (including a full disk) must leave the
-            // previous file intact, rather than truncating it before writing.
+            // A failed replacement (including a full disk) must leave the previous file intact, rather than truncating it before writing.
             try data.write(to: url, options: .atomic)
         }
     }
@@ -103,8 +98,7 @@ public final class FileBytes: Sendable {
         try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
     }
     public func entry(at url: URL) -> CheckedRead<Void> {
-        // Entry existence includes a dangling symlink: move/trash manipulate
-        // the link itself, so following it cannot verify the mutation.
+        // Entry existence includes a dangling symlink: move/trash manipulate the link itself, so following it cannot verify the mutation.
         checkedRead {
             #if canImport(Darwin)
             var metadata = stat()
@@ -135,8 +129,7 @@ public final class FileBytes: Sendable {
     }
 }
 
-/// Raw file/read is a byte window, unlike document extraction. Keep source
-/// bytes (including NULs) intact and name the encoding used to interpret them.
+/// Raw file/read is a byte window, unlike document extraction. Keep source bytes (including NULs) intact and name the encoding used to interpret them.
 enum MacFileText {
     struct Window {
         let data: Data
@@ -172,9 +165,8 @@ enum MacFileText {
                 encoding = .utf8; source = "utf8_validation"; bomBytes = 0
                 sample = Data(sample.prefix(utf8End))
             } else {
-                // Detection is encoding selection, not replacement decoding.
-                // No encoding / a lossy choice remains unavailable. Do not
-                // label every non-UTF-8 file Latin-1 merely because it can map bytes.
+                // Detection is encoding selection, not replacement decoding. No encoding / a lossy choice remains unavailable. Do not label every non-UTF-8
+                // file Latin-1 merely because it can map bytes.
                 var lossy = ObjCBool(false)
                 let detected = NSString.stringEncoding(for: sample,
                     encodingOptions: [.allowLossyKey: false],
@@ -185,8 +177,7 @@ enum MacFileText {
             }
         }
         let payload = Data(sample.dropFirst(bomBytes))
-        // A sample may itself end inside a Unicode scalar. Only a known sample
-        // cap permits boundary trimming; malformed bytes at EOF still refuse.
+        // A sample may itself end inside a Unicode scalar. Only a known sample cap permits boundary trimming; malformed bytes at EOF still refuse.
         let unicodeEncodings: [String.Encoding] = [.utf8, .utf16LittleEndian, .utf16BigEndian,
                                                  .utf32LittleEndian, .utf32BigEndian]
         let unicode = unicodeEncodings.contains(encoding)
@@ -199,8 +190,7 @@ enum MacFileText {
             }
         }
         guard let validSample else { return nil }
-        // The sample is valid in this one encoding. A shorter window can only
-        // fail at its terminal character; never switch decoder after a failure.
+        // The sample is valid in this one encoding. A shorter window can only fail at its terminal character; never switch decoder after a failure.
         let keptBOM = min(maxBytes, bomBytes)
         if keptBOM < bomBytes {
             return Window(data: Data(), content: "", encoding: name(encoding),

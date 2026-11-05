@@ -4,8 +4,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ProviderRouting.swift` | `SwiftNativeProviderRouting` actor; `checkedProviderSnapshot`, `checkedRoutingSnapshot`, `saveGroupSelection`, `adoptConnectedProvider`, `catalogContextLength`, `routingRepairInput`, `reconstructRouting`; effort-only and tier-only group rows inherit Chat's current model/account without seeding other controls; provider interpretation, byte-checked picker/configuration decode reuse with fresh credential/readiness checks; checked picker revisions come from both files under the transaction lock and travel with phone snapshots/readbacks, recoverable forward group writes/adoption and byte-preserving explicit routing reconstruction; preview snapshots use existing checked read-only admission and refuse pending recovery |
-/// Owns provider registry, credentials and per-surface routing state.
+// Blueprint: | `ProviderRouting.swift` | `SwiftNativeProviderRouting`, `checkedProviderSnapshot`, `checkedRoutingSnapshot`, `saveGroupSelection`, `adoptConnectedProvider`, `catalogContextLength`, `routingRepairInput`, `reconstructRouting` |
 public actor SwiftNativeProviderRouting: Sendable {
     let dataRoot: URL
     let surfacesPath: URL
@@ -17,13 +16,12 @@ public actor SwiftNativeProviderRouting: Sendable {
         let active: [String: String]
     }
     private nonisolated let pickerGeneration = OSAllocatedUnfairLock<PickerGeneration?>(initialState: nil)
-    // Only validated file objects live here, never resolved Keychain values or readiness. The writer's lock and a fresh byte read precede every lookup. Raw Foundation JSON is immutable; the lock guards the memo and callers mutate only
-    // their value copies, never its stored dictionaries.
+    // Only validated file objects live here, never resolved Keychain values or readiness. The writer's lock and a fresh byte read precede every lookup. Raw
+    // Foundation JSON is immutable; the lock guards the memo and callers mutate only their value copies, never its stored dictionaries.
     nonisolated let configurationGenerations = OSAllocatedUnfairLock(
         uncheckedState: [String: (bytes: Data, read: ProviderConfigRead)]()
     )
-    /// `dataRoot` owns provider registry/config/catalog reads and writes. The two path overrides are narrower fixture seams for picker files only; they must not silently leave the rest of the actor on the personal root. Secondary/test
-    /// runtimes therefore pass their exact data root.
+    /// Picker path overrides do not confine registry/credentials/catalogs; alternate runtimes must provide their exact data root.
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         surfacesPathOverride: URL? = nil,
@@ -64,13 +62,15 @@ public actor SwiftNativeProviderRouting: Sendable {
             return .object(fields)
         }
     }
-    /// An explicit complete replacement, guarded by the bytes inspected by the caller. The old projections and intent remain beside their files, named by digest.
+    /// An explicit complete replacement, guarded by the bytes inspected by the caller. The old projections and intent remain beside their files, named by
+    /// digest.
     public func reconstructRouting(_ input: JSONValue) async throws {
         guard case .object(let fields) = input,
               case .object(let surfaces)? = fields["surfaces"],
               case .object(let active)? = fields["active"],
               surfaces["chat"] != nil, active["chat"] != nil else {
-            throw ProviderRoutingError.configurationFailed("Reconstruction needs complete surfaces and active objects, including Chat, and the three BaseHash values from providers.routing_repair.")
+            throw ProviderRoutingError.configurationFailed(
+                "Reconstruction needs complete surfaces and active objects, including Chat, and the three BaseHash values from providers.routing_repair.")
         }
         try Self.validateSurfacePreferences(surfaces)
         let routes = try Self.loadActiveProviderObjectChecked(active)
@@ -101,7 +101,8 @@ public actor SwiftNativeProviderRouting: Sendable {
                                 ("pending", transactionPath)] {
                 let hash = try Self.fileSHA256(path)
                 guard fields[key + "BaseHash"] == (hash.map(JSONValue.string) ?? .null) else {
-                    throw ProviderRoutingError.configurationFailed("Provider routing changed after inspection. Read providers.routing_repair again; nothing was replaced.")
+                    throw ProviderRoutingError.configurationFailed(
+                        "Provider routing changed after inspection. Read providers.routing_repair again; nothing was replaced.")
                 }
             }
             try Task.checkCancellation()
@@ -120,7 +121,8 @@ public actor SwiftNativeProviderRouting: Sendable {
             ))
         }
     }
-    /// Provider state is bootstrap-empty only when absent. Existing unreadable, malformed, or wrong-shaped bytes are unavailable and must never be rewritten by a picker/config mutation as if they were missing.
+    /// Provider state is bootstrap-empty only when absent. Existing unreadable, malformed, or wrong-shaped bytes are unavailable and must never be
+    /// rewritten by a picker/config mutation as if they were missing.
     public nonisolated static func loadProviderStateObjectChecked(
         at path: URL,
         description: String
@@ -166,7 +168,10 @@ public actor SwiftNativeProviderRouting: Sendable {
         }
         let generation = (try? fileSHA256(path)) ?? "unreadable"
         return ToolFailureError(
-            "Saved \(description) state \(detail). Inspect providers.routing_repair, then set its JSON text with the inspected BaseHash values and explicitly chosen complete surfaces and active objects. Original bytes are retained by digest; inspection does not repair routing.",
+            """
+                Saved \(description) state \(detail). Inspect providers.routing_repair, then set its JSON text with the inspected BaseHash values and \
+                explicitly chosen complete surfaces and active objects. Original bytes are retained by digest; inspection does not repair routing.
+                """,
             effects: .none, owner: "\(path.path) generation \(generation)",
             nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string("providers.routing_repair")])])
         )
@@ -336,8 +341,9 @@ public actor SwiftNativeProviderRouting: Sendable {
         updated[surface] = .string(providerId)
         return updated
     }
-    /// Finish an interrupted two-file picker commit before any later read or mutation observes the surface/model tuple. The durable intent is valid only while each live projection is either its recorded base bytes or the exact intended
-    /// object; unrelated concurrent bytes fail closed and leave the marker available for explicit recovery instead of being silently overwritten.
+    /// Finish an interrupted two-file picker commit before any later read or mutation observes the surface/model tuple. The durable intent is valid only
+    /// while each live projection is either its recorded base bytes or the exact intended object; unrelated concurrent bytes fail closed and leave the
+    /// marker available for explicit recovery instead of being silently overwritten.
     func reconcilePendingSurfaceConfigurationLocked() async throws {
         guard let data = try ProviderStateValidation.dataIfPresent(at: surfaceTransactionPath) else { return }
         guard case .object(let raw) = try JSONValue.parse(data) else {
@@ -353,7 +359,8 @@ public actor SwiftNativeProviderRouting: Sendable {
         let activeAtTarget = try activeAtBase || (ProviderStateValidation.dataIfPresent(at: activeProviderPath) != nil
             && Self.loadProviderStateObjectChecked(at: activeProviderPath, description: "active-provider") == pending.active)
         guard surfacesAtTarget, activeAtTarget else {
-            throw Self.providerStateFailure(at: surfaceTransactionPath, description: "pending provider selection", detail: "conflicts with newer provider state")
+            throw Self.providerStateFailure(at: surfaceTransactionPath, description: "pending provider selection",
+                detail: "conflicts with newer provider state")
         }
         if surfacesAtBase {
             try await SwiftNativePersistenceCore.withFileLock(surfacesPath) {
@@ -392,13 +399,15 @@ public actor SwiftNativeProviderRouting: Sendable {
             return try self.checkedPickerStateLocked()
         }
     }
-    /// The transaction lock still guards recovery and both fresh byte reads. Only decoding/canonicalization carries across identical checked bytes; a read failure can never serve the previous generation.
+    /// The transaction lock still guards recovery and both fresh byte reads. Only decoding/canonicalization carries across identical checked bytes; a read
+    /// failure can never serve the previous generation.
     nonisolated func checkedPickerStateLocked() throws -> (
         surfaces: [String: JSONValue], active: [String: String], revision: Double
     ) {
         let surfacesBytes = try Self.providerStateBytesChecked(at: surfacesPath, description: "surface preference")
         let activeBytes = try Self.providerStateBytesChecked(at: activeProviderPath, description: "active-provider")
-        // Source revision is read under the same transaction lock as both picker files. Arrival, request order and a later serialization are not the revision of these recovered bytes.
+        // Source revision is read under the same transaction lock as both picker files. Arrival, request order and a later serialization are not the
+        // revision of these recovered bytes.
         var revision: Double = 0
         for (url, bytes) in [(surfacesPath, surfacesBytes), (activeProviderPath, activeBytes)] where bytes != nil {
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -420,7 +429,7 @@ public actor SwiftNativeProviderRouting: Sendable {
             let active: [String: String]
             do { active = try Self.loadActiveProviderObjectChecked(rawActive) }
             catch { throw Self.providerStateFailure(at: activeProviderPath, description: "active-provider", detail: error.localizedDescription) }
-            // Both files enter memory through one vocabulary; only a write migrates their bytes.
+            // Both picker files share one vocabulary; reads cannot migrate authority bytes.
             let checked = PickerGeneration(
                 surfacesBytes: surfacesBytes, activeBytes: activeBytes,
                 surfaces: surfaces,
@@ -430,23 +439,24 @@ public actor SwiftNativeProviderRouting: Sendable {
             return (checked.surfaces, checked.active, revision)
         }
     }
-    /// Read Swift-native provider picker state and seed every MODEL_SURFACE. Surface models/efforts come from `providers/surfaces.json`; active provider hints come from `providers/active.json`.
+    /// Seed every model surface from the checked provider state.
     public func computeModelPreferences() async throws -> [String: SurfacePreference] {
         try await checkedRoutingSnapshot().preferences
     }
-    /// Preferences, active-provider hints, and explicit pins derived from one recovered tuple while the common transaction lock is held by `reconciledPickerState()`. No caller can observe a model from one picker commit paired with the
-    /// provider from another.
-    public func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot {
-        if LLMCallContext.preview { return try await checkedRoutingSnapshotReadOnly() }
+    /// Preferences, active-provider hints, and explicit pins derived from one recovered tuple while the common transaction lock is held by
+    /// `reconciledPickerState()`. No caller can observe a model from one picker commit paired with the provider from another.
+    public func checkedRoutingSnapshot(preview: Bool = false) async throws -> ProviderRoutingSnapshot {
+        if preview { return try await checkedRoutingSnapshotReadOnly() }
         let pickerState = try await reconciledPickerState()
         return try selectionRoutingSnapshot(
             surfaces: pickerState.surfaces,
-            active: pickerState.active, revision: pickerState.revision
+            active: pickerState.active, revision: pickerState.revision, preview: false
         )
     }
-    /// Checked diagnostic view of the picker that never repairs or writes its authority files. A pending two-file selection is intentionally adverse here: execution may resume its exact recovery transaction, but a read-only CLI must not
-    /// turn a request to inspect routing into a write.  Hold the writer's transaction lock across both reads without running recovery. Marker absence alone cannot rule out a complete save between the reads. The lock may create a sidecar,
-    /// but never writes authority.
+    /// Checked diagnostic view of the picker that never repairs or writes its authority files. A pending two-file selection is intentionally adverse here:
+    /// execution may resume its exact recovery transaction, but a read-only CLI must not turn a request to inspect routing into a write.  Hold the writer's
+    /// transaction lock across both reads without running recovery. Marker absence alone cannot rule out a complete save between the reads. The lock may
+    /// create a sidecar, but never writes authority.
     public func checkedRoutingSnapshotReadOnly() async throws -> ProviderRoutingSnapshot {
         let transactionPath = surfaceTransactionPath
         let (surfaces, active, revision) = try await SwiftNativePersistenceCore.withFileLock(transactionPath) {
@@ -458,31 +468,31 @@ public actor SwiftNativeProviderRouting: Sendable {
             return try self.checkedPickerStateLocked()
         }
         return try selectionRoutingSnapshot(
-            surfaces: surfaces, active: active, revision: revision
+            surfaces: surfaces, active: active, revision: revision, preview: true
         )
     }
-    /// Every route this build can connect: the ids the provider list always shows, and the ids the sole-connected probe walks. ONE list, because the probe used to carry its own copy and `kimi-code` was missing from it — a Kimi Code-only
-    /// install with nothing saved resolved no model at all.
+    /// Provider inventory and sole-connected discovery must share one complete route list.
     static let connectableProviderIds = [
         "anthropic", "anthropic_oauth_direct",
         "openai", "openai_oauth_direct", "codex",
         "xai_oauth_direct", "moonshot", "kimi-code", "openrouter",
     ]
-    /// The provider ids the sole-connected probe walks. Named so the routing snapshot can pre-read exactly these config files once.
+    /// Name discovery routes so a snapshot can pre-read their configs exactly once.
     static var soleConnectedProbeIds: [String] { connectableProviderIds }
-    /// The exact route of one connected account, or nil when none or several are ready.
+    /// Zero or several connected accounts cannot establish a sole route.
     func soleConnectedProviderID(cache: ProviderConfigCache? = nil) -> String? {
         var connected: [String] = []
         for id in Self.soleConnectedProbeIds where providerReadiness(id: id, cache: cache).ready {
             connected.append(id)
         }
         if connected.count == 1 { return connected.first }
-        // One ChatGPT sign-in makes TWO ids ready — `openai_oauth_direct` and `codex` both read `codex_home/auth.json`. That is one account, so it still answers, with the in-app adapter's id (the transport a turn takes unless a person
-        // picks the CLI row). Any other pair is genuinely two accounts and stays ambiguous.
+        // One ChatGPT sign-in makes TWO ids ready — `openai_oauth_direct` and `codex` both read `codex_home/auth.json`. That is one account, so it still
+        // answers, with the in-app adapter's id (the transport a turn takes unless a person picks the CLI row). Any other pair is genuinely two accounts
+        // and stays ambiguous.
         if Set(connected) == ["openai_oauth_direct", "codex"] { return "openai_oauth_direct" }
         return nil
     }
-    /// Read the canonical surface→provider map, preserving routing read failures.
+    /// Canonical route reads must preserve configuration failures.
     public func activeProvidersForSurfacesChecked() async throws -> [String: String] {
         try await checkedRoutingSnapshot().activeProviders
     }

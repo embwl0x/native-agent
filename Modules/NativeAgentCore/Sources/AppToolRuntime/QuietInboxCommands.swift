@@ -9,7 +9,7 @@ import NativeAgentShared
 import NotificationInbox
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`: inbox fences and commands; completed mutations retain done across unknown readback; full REM note reads include the linked approval's retained review, with missing/unreadable links explicit |
+// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`; Inbox fences and receipts; committed effects survive unknown readback |
 
 @MainActor public protocol QuietInboxHost: QuietToolHost {
     var inboxDataRoot: URL { get }
@@ -17,7 +17,7 @@ import TrustCenter
     func interactionForInboxItem(_ id: String, dataRoot: URL) async throws -> InlineInteraction?
     func readInbox() async throws -> [InboxItemRecord]
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord])
-    func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?) async throws
+    func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws
     func withdrawApproval(id: String, decidedBy: String) async throws
     func refreshInboxSurfaces() async
     func inboxActDescription(_ item: InboxItemRecord, action: String) -> String
@@ -25,32 +25,23 @@ import TrustCenter
 
 // MARK: - inbox
 
-/// The `inbox` tool over the Inbox page's own reads and `inboxAction`, so a
-/// note she settles leaves Today, the Desk and the phone exactly as a tap does.
-/// What an inbox verb acts on once nothing refuses it.
+/// Settling a note shares the page's inboxAction so Today, Desk and phone converge on the same state.
 private struct QuietInboxTarget {
     let items: [InboxItemRecord]
     var ids: [String] = []
     var byID: [String: InboxItemRecord] = [:]
-    /// withdraw: her pending approval, by id and title.
     var approval: (id: String, title: String)?
-    /// act and repair: the note, and the button pressed on it.
     var press: (item: InboxItemRecord, action: String)?
-    /// The button is User's below Full Mac: Full Mac let it through, and
-    /// he sees it as a decided row.
+    /// Full Mac admits user-only buttons with a decided row visible to the user.
     var decided = false
 }
 
 private struct QuietInboxRefusal: Error { let json: JSONValue }
 
 extension QuietInboxHost {
-    /// Every check that refuses an inbox verb before anything is written:
-    /// the ids, a reason to put a note away, withdrawing only her own
-    /// pending ask, and below Full Mac a note's button that is User's (a
-    /// permission or capability card, an approval). Reads only, so the
-    /// door's preview asks it too and refuses what the real call would.
-    public func quietInboxFence(verb: String, input: [String: JSONValue]) async -> JSONValue? {
-        if case .failure(let refusal) = await inboxGate(verb: verb, input: input) { return refusal.json }
+    /// Preview shares execution's read-only id, reason, pending-ask ownership and below-Full-Mac user-button checks.
+    public func quietInboxFence(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
+        if case .failure(let refusal) = await inboxGate(verb: verb, input: input, turn: turn) { return refusal.json }
         return nil
     }
 
@@ -58,8 +49,9 @@ extension QuietInboxHost {
         input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    private func inboxGate(verb: String, input: [String: JSONValue]) async -> Result<QuietInboxTarget, QuietInboxRefusal> {
-        func refuse(_ json: JSONValue) -> Result<QuietInboxTarget, QuietInboxRefusal> { .failure(QuietInboxRefusal(json: ChatToolOutcome.refusedBeforeRunning(json))) }
+    private func inboxGate(verb: String, input: [String: JSONValue], turn: Turn) async -> Result<QuietInboxTarget, QuietInboxRefusal> {
+        func refuse(_ json: JSONValue) -> Result<QuietInboxTarget, QuietInboxRefusal> { .failure(QuietInboxRefusal(json: ChatToolOutcome.refusedBeforeRunning(
+            json))) }
         func text(_ key: String) -> String { Self.inboxText(input, key) }
         let items: [InboxItemRecord]
         do { items = try await self.readInbox() } catch {
@@ -113,12 +105,12 @@ extension QuietInboxHost {
                     "That approval is another agent's ask, not yours, so answering it is the owner's. Leave it for them."))
             }
             target.approval = (approvalID, record.title)
-        default: // act, repair, not_now
+        default:
             guard ids.count == 1, let item = byID[ids[0]] else {
                 return refuse(AppToolExecutor.failure("one_id", "\(verb) takes one id."))
             }
             let actionIDs = inboxPresentation(item).actions.map { InboxActionVocabulary.normalizedAction($0.id) }
-            // A note's buttons in the words its read shows (inbox.not_now, inbox.open_on_mac · User's).
+            // Resolve note buttons by the exact ids exposed in their read.
             let shown = inboxPresentation(item).actions.compactMap { AppToolExecutor.noteButton(id: $0.id, label: $0.label) }
             // A card's Not now is inbox.not_now, its warning on its line; never a bare reject.
             let requested = verb == "repair" ? "repair" : verb == "not_now" ? "reject" : text("action").lowercased()
@@ -141,27 +133,27 @@ extension QuietInboxHost {
                         : "This note has no \(action) action. Its actions: \(shown.joined(separator: ", ")).",
                     extra: ["actions": .array(shown.map { .string($0) })]))
             }
-            // Full Mac makes the person's buttons available to her.
+            // Full Mac makes the person's buttons available to the agent.
             let fullMac = await AppToolExecutor.freshQuietPosture(
                 dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())?.name == AppToolExecutor.fullMacModeName
             let opensForUser = item.source == self.interactionSource && action == "act"
             if !fullMac, opensForUser {
                 return refuse(AppToolExecutor.failure("opens_for_owner",
-                    "That card's Open on Mac only opens it for the person at the Mac (inbox.open_on_mac is theirs). inbox.not_now declines it; if it is stale, inbox.archive or inbox.dismiss it with a reason.",
+                    """
+                        That card's Open on Mac only opens it for the person at the Mac (inbox.open_on_mac is theirs). inbox.not_now declines it; if it is \
+                        stale, inbox.archive or inbox.dismiss it with a reason.
+                        """,
                     extra: ["id": .string(item.id)]))
             }
             let fence = opensForUser ? nil : await inboxFloor(item, action: action, dataRoot: self.inboxDataRoot)
-            let peerSteered = CapabilityLifecycle.writeRefusal != nil
-                || (PeerTurnEffectPolicy.isPeerBridge(surface: TurnEnvelope.current(surface: "").surface) && !PeerDataTaint.trustedTurn)
+            let peerSteered = CapabilityLifecycle.writeRefusal(turn: turn) != nil
+                || (PeerTurnEffectPolicy.isPeerBridge(surface: TurnEnvelope.current(turn: turn, surface: "").surface) && !PeerDataTaint.trustedTurn(turn))
             if action == "approve", peerSteered, item.related_approval_id == nil {
                 return refuse(AppToolExecutor.failure("owners_call",
                     "This inbox item has no owner-review approval record. A peer-steered turn cannot supply the person's consent.",
                     extra: ["remedy": Repair.why(owner: "inbox item \(item.id)", tap: "Today > \(item.title) > Approve")]))
             }
-            // Two cards are a person's under Full Mac too: an executable keep
-            // (approving admits the script as his) and a destructive call's (User,
-            // 10-17: what cannot be undone on his side waits for a human's tap, one
-            // card every time). Her own approve never stands in for his.
+            // Executable keeps and destructive approvals require a person's tap even under Full Mac; agent approval cannot substitute.
             if action == "approve", let approvalID = item.related_approval_id {
                 let record: ApprovalRecord
                 do { record = try await SwiftNativeApprovalInbox(root: self.inboxDataRoot).get(approvalID) }
@@ -178,7 +170,7 @@ extension QuietInboxHost {
                             tap: "Today > \(record.title) > Approve")]))
                 }
                 let ownerOnly: Bool
-                do { ownerOnly = try install || PermissionLaw.humanDecides(action: record.action, payload: record.payload) }
+                do { ownerOnly = try install || PermissionLaw.humanDecides(action: record.action, payload: record.payload, turn: turn) }
                 catch { return refuse(ChatToolOutcome.failure(error: error, tool: "app")) }
                 if ownerOnly {
                     return refuse(AppToolExecutor.failure("owners_call",
@@ -200,9 +192,9 @@ extension QuietInboxHost {
         return .success(target)
     }
 
-    public func quietInbox(verb: String, input: [String: JSONValue]) async -> JSONValue {
+    public func quietInbox(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let target: QuietInboxTarget
-        switch await inboxGate(verb: verb, input: input) {
+        switch await inboxGate(verb: verb, input: input, turn: turn) {
         case .failure(let refusal): return refusal.json
         case .success(let ready): target = ready
         }
@@ -249,7 +241,7 @@ extension QuietInboxHost {
                 do {
                     try await self.performInboxAction(id, action: action, metadata: [
                         "settled_by": .string("agent"), "settled_reason": .string(reason),
-                    ], quiet: false, dataRootOverride: self.dataRootOverride)
+                    ], quiet: true, dataRootOverride: self.dataRootOverride, turn: turn)
                     done.append(.object(["id": .string(id), "was": .string(item.status)]))
                 } catch {
                     await self.refreshInboxSurfaces()
@@ -276,7 +268,7 @@ extension QuietInboxHost {
             var unobserved: [String] = []
             done = done.map { row in
                 guard case .object(var fields) = row, case .string(let id)? = fields["id"] else { return row }
-                // Newest first, so the first row is the card on screen.
+                // Newest first matches the visible card.
                 guard let now = after.first(where: { $0.id == id })?.status else {
                     fields["verification"] = .string("unknown")
                     unobserved.append(id)
@@ -293,12 +285,17 @@ extension QuietInboxHost {
             ]
             if !unobserved.isEmpty {
                 receipt["unobserved_ids"] = .array(unobserved.map(JSONValue.string))
-                receipt["detail"] = .string("Completed actions remain in done; cards absent from this live read have unknown verification and may have moved to the archive.")
+                receipt["detail"] = .string("""
+                    Completed actions remain in done; cards absent from this live read have unknown verification and may have moved to the archive.
+                    """)
             }
             if !unstuck.isEmpty {
                 receipt["ok"] = .bool(false)
                 receipt["effects"] = .string("occurred")
-                receipt["detail"] = .string("Written, but \(unstuck.joined(separator: ", ")) now read as not \(expected). See now on each; the readback does not establish why the state changed.")
+                receipt["detail"] = .string("""
+                    Written, but \(unstuck.joined(separator: ", ")) now read as not \(expected). See now on each; the readback does not establish why the \
+                    state changed.
+                    """)
             }
             return .object(receipt)
         case "withdraw":
@@ -314,10 +311,10 @@ extension QuietInboxHost {
             return .object(["status": .string("ok"), "verb": .string(verb), "id": .string(ids[0]),
                             "approval_id": .string(approvalID),
                             "detail": .string("Withdrew \(title). Nothing it asked for will run.")])
-        default: // act, repair
+        default:
             let (item, action) = target.press!
             do {
-                try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: true, dataRootOverride: self.dataRootOverride)
+                try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: true, dataRootOverride: self.dataRootOverride, turn: turn)
             } catch {
                 return AppToolExecutor.ownedFailure(error, code: "inbox_act_failed", owner: "inbox \(item.id) action \(action)",
                     instruction: "Read this note's current state and resolve the reported cause before acting again.",
@@ -325,7 +322,7 @@ extension QuietInboxHost {
             }
             await self.refreshInboxSurfaces()
             if target.decided {
-                HarnessDecidedRow.post(requester: "Full Mac", tool: "inbox.\(action)",
+                HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "inbox.\(action)",
                                        sessionID: input["__session_id"]?.scalarText,
                                        dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             }
@@ -334,7 +331,7 @@ extension QuietInboxHost {
         }
     }
 
-    /// Needs you as Today and the Desk count it (`OwnerAttentionPolicy`).
+    /// Needs-you counts share OwnerAttentionPolicy with Today and Desk.
     private func inboxNeedsYou(_ item: InboxItemRecord) -> Bool {
         item.requiresOwnerInput
     }
@@ -384,12 +381,12 @@ extension QuietInboxHost {
         return .object(row)
     }
 
-    /// Why running `action` on this note is User's below Full Mac, or nil when it is hers.
+    /// Below Full Mac, note button ownership determines the refusal; nil means the agent may act.
     private func inboxFloor(_ item: InboxItemRecord, action: String, dataRoot: URL) async -> String? {
         guard item.source == self.interactionSource else {
             return ["approve", "reject"].contains(action) ? "it decides an approval" : nil
         }
-        // "Not now" withdraws her own ask; it grants nothing.
+        // "Not now" withdraws the agent's own ask; it grants nothing.
         if action == "reject" { return nil }
         let found: InlineInteraction?
         do { found = try await self.interactionForInboxItem(item.id, dataRoot: dataRoot) }
@@ -403,7 +400,7 @@ extension QuietInboxHost {
         case .capability: return "it raises Trust"
         case .unknown: return "its card is a kind this build doesn't know"
         case .choose, .modelChoice:
-            return action.hasPrefix("interaction_choice_") ? "it is his answer to give" : nil
+            return action.hasPrefix("interaction_choice_") ? "it is the person's answer to give" : nil
         }
     }
 

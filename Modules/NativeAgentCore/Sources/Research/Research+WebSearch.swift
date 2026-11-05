@@ -1,13 +1,10 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Research+WebSearch.swift` | `WebSearchRoutes`: checked SearXNG results, explicit not-configured/runtime failures and untrusted web-content labels; no alternate search route |
+// Blueprint: | `Research+WebSearch.swift` | `WebSearchRoutes`: checked SearXNG results and setup failures |
 
-/// SearXNG owns web search. Configuration and transport failures remain
-/// failed search receipts with the cause and setup remedy.
+/// SearXNG owns web search. Configuration and transport failures remain failed search receipts with the cause and setup remedy.
 public enum WebSearchRoutes {
-    /// The whole result envelope: `{status: ok, result: {results, route, elapsed_ms, ...}}`,
-    /// or `{status: failed, reason, message}`.
     public static func search(
         query: String, categories: String?, timeRange: String?,
         searxng: @Sendable () async throws -> ResearchSearchResponse

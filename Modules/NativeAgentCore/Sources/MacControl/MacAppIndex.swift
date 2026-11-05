@@ -4,7 +4,7 @@ import CoreServices
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `MacAppIndex.swift` | One resident Spotlight query materializes app rows and named directory gaps in one snapshot on gather/update edges; ancestor read failures never override an app's own classification; synchronous reads consume only the kept snapshot or report not ready, async gathering has a cancellable four-second ceiling capped by the inherited deadline without stopping the query; unavailable install facts retain per-row causes; classification/gap changes emit edges; the engine termination drain calls shutdown after consumers settle |
+// Blueprint: | `MacAppIndex.swift` | Resident Spotlight snapshots retain row/directory gaps; bounded async gather never stops the query |
 
 /// The Mac's app index, kept live by Spotlight. No app is opened or activated.
 public final class MacAppIndex: @unchecked Sendable {
@@ -21,8 +21,7 @@ public final class MacAppIndex: @unchecked Sendable {
         /// "installed", "copy", or "unavailable" when installation evidence is missing.
         public let kind: String
         public let classificationFailures: [String]
-        /// A known copy or iOS build is already outside the Mac installed
-        /// projection; its missing sibling facts cannot block another app.
+        /// A known copy or iOS build is already outside the Mac installed projection; its missing sibling facts cannot block another app.
         public var installationUncertain: Bool {
             kind != "copy" && platform != "ios" && kind == "unavailable"
         }
@@ -36,8 +35,7 @@ public final class MacAppIndex: @unchecked Sendable {
         ]) }
     }
 
-    /// One materialization: directory evidence belongs to the directory,
-    /// rather than making every readable app below it unavailable.
+    /// One materialization: directory evidence belongs to the directory, rather than making every readable app below it unavailable.
     public struct Inventory: Sendable {
         public let apps: [App]
         public let directoryGaps: [String]
@@ -50,20 +48,19 @@ public final class MacAppIndex: @unchecked Sendable {
         return twice
     }
 
-    /// The Mac's own app folders, as the Apps screen reads them.
     static let appFolders: [String] = ["/Applications", "/System/Applications",
         FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.appendingPathComponent("Applications").path]
 
-    /// Where build tools put what they build (Xcode, SwiftPM, npm, Cargo, Python, Electron packagers).
-    static let buildFolders: Set<String> = ["DerivedData", "dist", "build", "Build", "target", "node_modules", ".build", "out", "Products", "__pycache__", "release-builds"]
+    /// Exclude known build directories from installed-app identity regardless of bundle ID.
+    static let buildFolders: Set<String> = ["DerivedData", "dist", "build", "Build", "target", "node_modules", ".build", "out", "Products", "__pycache__",
+        "release-builds"]
 
-    /// What Finder and the Apps screen call the bundle, in the person's language.
+    /// Use the localized Finder name so installed-app lookup matches what the person sees.
     static func shownName(_ url: URL) -> String {
         let shown = FileManager.default.displayName(atPath: url.path)
         return shown.hasSuffix(".app") ? String(shown.dropLast(4)) : shown
     }
 
-    /// What the Apps screen shows: the installed copy of each Mac app.
     public static func installed(_ apps: [App]) -> [App] { apps.filter { $0.kind == "installed" && $0.platform == "mac" } }
 
     private let queue = DispatchQueue(label: "NativeAgent.MacAppIndex", qos: .utility)
@@ -71,7 +68,7 @@ public final class MacAppIndex: @unchecked Sendable {
     private var failure: Error?
     private var rows: [App] = []
     private var directoryGaps: [String] = []
-    /// The last materialized rows, readable without the indexing queue.
+    /// Keep materialized rows readable without waiting on the indexing queue.
     private let snapshotLock = NSLock()
     private var snapshot: Result<Inventory, Error>?
     private var observers: [NSObjectProtocol] = []
@@ -87,7 +84,8 @@ public final class MacAppIndex: @unchecked Sendable {
             MDQuerySetSearchScope(query, [kMDQueryScopeComputer] as CFArray, 0)
             MDQuerySetDispatchQueue(query, queue)
             for name in [kMDQueryDidFinishNotification, kMDQueryDidUpdateNotification] {
-                observers.append(NotificationCenter.default.addObserver(forName: Notification.Name(name! as String), object: query, queue: nil) { [self] notification in
+                observers.append(NotificationCenter.default.addObserver(forName: Notification.Name(name! as String), object: query,
+                    queue: nil) { [self] notification in
                     guard !stopped, failure == nil else { return }
                     let changed = materialize()
                     if notification.name.rawValue == kMDQueryDidFinishNotification as String { finishGather() }
@@ -118,7 +116,7 @@ public final class MacAppIndex: @unchecked Sendable {
         }
     }
 
-    private func initialGather(bounded: Bool = true) async throws {
+    private func initialGather(bounded: Bool = true, context: MacOperationContext) async throws {
         try Task.checkCancellation()
         if let snapshot = snapshotLock.withLock({ self.snapshot }) {
             _ = try snapshot.get()
@@ -134,16 +132,19 @@ public final class MacAppIndex: @unchecked Sendable {
         }
         defer { queue.async { self.gatherWaiters[id] = nil } }
         let ceiling = ContinuousClock.now.advanced(by: .seconds(4))
-        // A resident observer lives until an edge or shutdown/Stop. Requests
-        // instead have a finite cold-gather wait even without a tool deadline.
-        let deadline: ContinuousClock.Instant? = bounded ? TaskWaitDeadline.current.map { min($0, ceiling) } ?? ceiling : TaskWaitDeadline.current
-        let pending = MacControlError.ioFailure("app_index_not_ready: The request's wait ended before Spotlight finished gathering. The live query remains active; no installed-app verdict is available yet.")
-        try await TaskWaitDeadline.$current.withValue(deadline) {
-            guard !TaskWaitDeadline.expired else { throw pending }
-            try await answer.wait(cancellingWith: .failure(TaskWaitDeadline.expired ? pending : TaskWaitDeadline.cancellationError), onCancel: { [self] in
+        // A resident observer lives until an edge or shutdown/Stop. Requests instead have a finite cold-gather wait even without a tool deadline.
+        let deadline: ContinuousClock.Instant? = bounded ? context.deadline.map { min($0, ceiling) } ?? ceiling : context.deadline
+        let pending = MacControlError.ioFailure("""
+            app_index_not_ready: The request's wait ended before Spotlight finished gathering. The live query remains active; no installed-app verdict is \
+            available yet.
+            """)
+        try await context.holding(\.deadline, deadline) { context in
+            guard !context.expired else { throw pending }
+            try await answer.wait(budget: context.waitBudget, cancellingWith: .failure(context.expired ? pending : context.cancellationError),
+                onCancel: { [self] in
                 queue.async { self.gatherWaiters[id] = nil }
             }).get()
-            guard !TaskWaitDeadline.expired else { throw pending }
+            guard !context.expired else { throw pending }
         }
         try Task.checkCancellation()
     }
@@ -155,8 +156,7 @@ public final class MacAppIndex: @unchecked Sendable {
         query = nil
     }
 
-    /// Terminal domain shutdown. Session/view stop does not own this resident
-    /// query; the engine termination drain must call this explicitly.
+    /// Terminal domain shutdown. Session/view stop does not own this resident query; the engine termination drain must call this explicitly.
     public func shutdown() async {
         await withCheckedContinuation { done in
             queue.async { [self] in
@@ -176,9 +176,8 @@ public final class MacAppIndex: @unchecked Sendable {
         }
     }
 
-    /// Initial gathering and subsequent updates use this same query.
-    public func changes() async throws -> AsyncStream<Void> {
-        try await initialGather(bounded: false)
+    public func changes(context: MacOperationContext) async throws -> AsyncStream<Void> {
+        try await initialGather(bounded: false, context: context)
         let id = UUID()
         let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         continuation.onTermination = { [self] _ in queue.async { self.listeners[id] = nil } }
@@ -204,18 +203,17 @@ public final class MacAppIndex: @unchecked Sendable {
         }
     }
 
-    public func apps() async throws -> [App] {
-        try await inventory().apps
+    public func apps(context: MacOperationContext) async throws -> [App] {
+        try await inventory(context: context).apps
     }
 
-    public func inventory() async throws -> Inventory {
-        try await initialGather()
+    public func inventory(context: MacOperationContext) async throws -> Inventory {
+        try await initialGather(context: context)
         try Task.checkCancellation()
         return try checkedSnapshot()
     }
 
-    /// The kept rows if the first gather has finished, else nil: a lookup on a hot
-    /// path never waits for Spotlight.
+    /// The kept rows if the first gather has finished, else nil: a lookup on a hot path never waits for Spotlight.
     public func readyApps() -> [App]? {
         snapshotLock.withLock {
             if case .success(let inventory)? = snapshot { return inventory.apps }
@@ -231,7 +229,10 @@ public final class MacAppIndex: @unchecked Sendable {
     private func checkedSnapshot() throws -> Inventory {
         try snapshotLock.withLock {
             guard let snapshot else {
-                throw MacControlError.ioFailure("app_index_not_ready: Spotlight has not finished gathering apps; no installed-app verdict is available. Try again after gathering completes.")
+                throw MacControlError.ioFailure("""
+                    app_index_not_ready: Spotlight has not finished gathering apps; no installed-app verdict is available. Try again after gathering \
+                    completes.
+                    """)
             }
             return try snapshot.get()
         }
@@ -271,9 +272,7 @@ public final class MacAppIndex: @unchecked Sendable {
             let item = Unmanaged<MDItem>.fromOpaque(MDQueryGetResultAtIndex(query, index)).takeUnretainedValue()
             guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String else { return nil }
             let url = URL(fileURLWithPath: path)
-            // A real .app, not a helper inside another bundle (an .app, a .framework,
-            // a .service, an .xpc…), not a copy under a Library folder (an installer's
-            // staging area, a tool's own versions, a cache).
+            // Exclude nested helpers and Library staging/cache copies so discovery reports launchable app bundles.
             guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { return nil }
             let ancestors = classify(url.deletingLastPathComponent())
             guard !ancestors.excluded else { return nil }
@@ -289,17 +288,15 @@ public final class MacAppIndex: @unchecked Sendable {
             } else if let builtFor = info?["DTPlatformName"] as? String, !builtFor.isEmpty {
                 platforms = [builtFor.lowercased()]
             } else { platforms = [] }
-            // A bundle is a Mac app unless it declares only an iPhone/iPad platform: macOS
-            // launches an app that names no platform as a Mac app (Chrome declares none).
+            // A bundle is a Mac app unless it declares only an iPhone/iPad platform: macOS launches an app that names no platform as a Mac app (Chrome declares
+            // none).
             let platform = !platforms.contains("macosx")
                 && platforms.contains(where: { $0.hasPrefix("iphone") || $0.hasPrefix("ipad") || $0.hasPrefix("ios") }) ? "ios" : "mac"
-            // Build output is a copy whatever its bundle id: the folders build tools write
-            // into, and anything built inside a working tree (a .git, a Package.swift, an
-            // .xcodeproj above it). The Desktop and ~/Applications are not working trees.
+            // Build output is a copy whatever its bundle id: the folders build tools write into, and anything built inside a working tree (a .git, a
+            // Package.swift, an .xcodeproj above it). The Desktop and ~/Applications are not working trees.
             let buildOutput = url.pathComponents.contains { Self.buildFolders.contains($0) } || ancestors.workingTree
-            // Installed: every bundle in the Mac's own app folders (what the Apps screen shows,
-            // a beta beside its release included), and elsewhere the one copy Launch Services
-            // opens for that bundle id. Build output is never installed.
+            // Installed: every bundle in the Mac's own app folders (what the Apps screen shows, a beta beside its release included), and elsewhere the one copy
+            // Launch Services opens for that bundle id. Build output is never installed.
             let inAppFolder = Self.appFolders.contains { NativeAgentWorkspaceRoot.relativePath(url.standardizedFileURL.path, under: $0)?.isEmpty == false }
             let kind: String
             if let bundleID, failures.isEmpty {
@@ -315,10 +312,10 @@ public final class MacAppIndex: @unchecked Sendable {
                 kind = "unavailable"
             }
             return App(url: url, info: info,
-                // The name the Apps screen and Finder show: the Mac's own localized display name ("Find My").
                 name: Self.shownName(url),
                 bundleID: bundleID,
-                version: info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String ?? MDItemCopyAttribute(item, kMDItemVersion) as? String ?? "",
+                version: info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String ?? MDItemCopyAttribute(item,
+                    kMDItemVersion) as? String ?? "",
                 platform: platform, kind: kind, classificationFailures: failures)
         }.sorted { ($0.name.localizedLowercase, $0.url.path) < ($1.name.localizedLowercase, $1.url.path) }
         func identity(_ app: App) -> [String] {

@@ -9,15 +9,20 @@ is what it declares, never which door made it.
 
 `turn` (`abilities/turn.js`) exports `step(state, event) → {state, do:[effects]}`; the stem owns the loop. Events:
 
-- `message`: text, attachments, sender, surface and trust.
-- `model`: final text and requested calls, each with `id` and `index`. Visible text streams directly; no chunk events. The closing one (no calls) carries `repeated: {call, count}` with the longest stretch of one call, with the same input, made again round after round.
-- `result`: one call's `{index,id,name,ok,effect}`. Effect comes from explicit receipts, else `execution:executed`, including batch receipts/script ledgers: an ability's all-read ledger reports `read`; `part` names effectful ability/sense work, else strongest of irreversible/write/read; absent when nothing landed. The broker's per-call class, not declared ability permissions or its prose, decides whether a reached call reads.
+- `message`: the moment, read-only: `text`, `surface` (authorizing) and `door` (arrival), `attachments`, `who` (`person`, `self` or `agent:<id>`), `verified` (transport-attested user id or null), `trust`, `steered_by` (steering peers) and `posture` (`full_mac`, `work`, `safe` or `unreadable: <cause>`; the saved posture, which untrusted steering caps to Work at each gate).
+- `model`: final text and requested calls, each with `id` and `index`. Visible text streams directly; no chunk events.
+- `result`: one call's `{index,id,name,ok,effect}`; their own call's result has its `id` and no `index`. A round's last result may carry `practice: {route, hand, loop?: {call, count}}`, the familiarity nerve's signal for their next thought. Effect comes from explicit receipts, else `execution:executed`, including batch receipts/script ledgers: an ability's all-read ledger reports `read`; `part` names effectful ability/sense work, else strongest of irreversible/write/read; absent when nothing landed. The broker's per-call class, not declared ability permissions or its prose, decides whether a reached call reads.
 - `provider_failure`: provider, model, text, remedy, work, owed, tries and available repair calls.
 - `observation`; `resumed`, whose `effect` uses the same reading over saved receipts.
 
 Effects are `model.call`, `app`, `reply.stream`, `reply.end` and `after`. `model.call` accepts `effect`, optional `id`, `purpose`, `note` (adds their words before the call); the first requires `system:{stable,dynamic}` and may name `tools:[names]`. Later `system`/`tools` and all `messages`/`stream`/`chunks` fields fail validation and trigger current recovery; the stem owns conversation and streaming. This ABI differs from the host primitive `host.model.call` below.
-`app` runs one requested call verbatim, by id or index, once through the turn's gates. Only `provider_failure` also admits an explicit repair `call:{tool:"app",input:{…}}`, assigned a new repair identity.
-`reply.end` follows a model reply without calls, an owned provider failure or its repair result (incomplete). Delivery completes at `reply.end` and `after`; later effects run privately after return ([turn anatomy §6](ANATOMY_OF_A_TURN.md)). Reach: `turn.persona()`, `turn.pins()`, `turn.recall()`, `turn.context()`.
+`app` either runs one model-requested call verbatim, by id or index, or, at any step, runs their own `call:{tool:"app",input:{…}}`, named `own_<event>_<position>_<input digest>`; each runs once through the turn's door and gates, and resume never reruns a started one. A step cannot call `app.*` itself (`effects_only`): steps replay.
+`reply.end` may come at any step, after their own words or none; in its step only
+`after` may follow it, and nothing of theirs runs after it. With no words or selected
+attachments, a silent end posts nothing and settles completed. The heard
+experience's `answer` obligation settles `accepted` with silence evidence naming
+the turn ([turn anatomy §6](ANATOMY_OF_A_TURN.md)). Reach: `turn.persona()`,
+`turn.pins()`, `turn.recall()`, `turn.context()`.
 
 `turn.persona()` supplies the compiled `prompt`, caller-supplied `guidance` and
 `expression:{established:bool}` for ordinary turns (null for internal thoughts).
@@ -84,7 +89,8 @@ While on and Autonomy allows unattended work, an ability runs as `authored.<id>`
   absent root and `changed:[]` when no earlier identity was admitted or no member changed;
   ordinary changes omit `available`. Exact self-write suppression stays tied to the declared watched path,
   including the folder rather than a changed child.
-- `turn.ended`: `turn_id,outcome,session_id,trace` (day file in `turn_traces/`); excludes turns the ability's own run started.
+- `turn.ended`: `turn_id,outcome,session_id,seq` (`Int64` sequence of the terminal detail in the life record);
+  excludes turns the ability's own run started.
 - `message.arrived:telegram`, `message.arrived:slack`: `text,session_id,turn_id` and chat/channel/user ids, after handling.
 - `held`: the held resource's `id,kind` (`program`, `connection` or `listener`) for a resident ability, once per arrival. Runs serialize; duplicate waiting news coalesces. `receive`/`accept` reads it; an empty wait returns `pending`. Unread arrivals survive Autonomy-off or unreadable-catalog periods.
 - `resumed`: once per app launch, for code to reopen held resources; likewise waits for Autonomy and a readable catalog.
@@ -372,17 +378,17 @@ outcomes or a previous-version success from last-run fields. Missing counts
 leave the stored bytes preserved and unavailable. `states()` reads without
 writing and reuses only the exact checked accounting file identity.
 
-What they works out by hand repeatedly, they keeps. Hand work or one call
-repeated with the same input 3+ rounds offers a private keep after the reply:
-keep the route as an ability, revise the part they worked around or looped,
-or keep nothing. The native stem meets only the hand work's ordered
-tool/action ids (landed writes or irreversible non-ability calls, with
-incidental reads and arguments left out), or the one repeated call when
-there is no such hand work, as one `practice: ` line through `FamiliarLines`
-in `mind/familiar.bin`. The first meeting records it without a keep call.
-The second and later meetings admit it unless an active ability's current
-learned-use or validation route covers those ids in order. Later rounds
-finish an admitted keep. This uses the same bounded habituation as lines
+What they works out by hand repeatedly, they keeps, inside the turn. After
+each tool round the native stem meets the hand work's ordered tool/action ids
+(landed writes or irreversible non-ability calls, with incidental reads and
+arguments left out), or the one call repeated with the same input 3+ rounds
+when there is no such hand work, as one `practice: ` line through
+`FamiliarLines` in `mind/familiar.bin`. The first meeting only records it.
+A later meeting, unless an active ability's current learned-use or validation
+route covers those ids in order, sends `practice` on that round's last result,
+once a turn; the shipped turn makes it their next call's note: keep the route as
+an ability, revise the part they worked around or looped, or keep nothing.
+This uses the same bounded habituation as lines
 ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)).
 New parts cannot take shipped seed ids in `Resources/abilities/*.js` or ids
 starting `native-` (`AbilityStore.seedCatalog`). `ability.save` can revise an
@@ -397,9 +403,9 @@ fades nothing.
 
 Their own abilities are in front of their each turn: the turn glance lists callable
 abilities one line each (their own action, `authored.<id>` unless a face names
-it), newly kept first, then by find's ranking against the message. Unranked rows
+it), by find's ranking against the message. Unranked rows
 put failures first, then the most recently used, then the existing action order.
-An empty message has no ranking; it shows new, failed and recent abilities first.
+An empty message has no ranking; it shows failed and recent abilities first.
 Each description ends at a word boundary within 100 characters, including a
 truncation ellipsis. Explicit zero/one use counts appear only as "never used" or
 "used once"; a missing use counter adds no count label.
@@ -412,16 +418,7 @@ The census computes `call_fit` on demand; it is not a stored stale verdict, and
 Abilities whose header has `resident:true` or a nonempty `wake` leave the rows
 and become "+N run on their own (find)"; find still offers their full actions.
 The 900-character row budget includes that count, and `ability.read <id>` hints
-appear only when all rows fit with them. Rendering captures fresh rows' exact
-kept stamps without writing shown markers. The accepted-context delivery hook
-conditionally acknowledges those stamps on the first nonempty provider text or
-tool call, only when their text is carried in that context and the live turn/time
-stamp still matches. A failed preparation, cancellation before output or screen
-preview consumes nothing; an omitted row or collapsed autonomous count does
-not acknowledge a new part. A shown-marker save failure leaves the provider reply
-proceeding and reports a `readFailure` repair note through `RepairOwed` for
-`abilities.shown`; marker effects remain unknown and any markers already saved
-are preserved. The existing home repair rows carry the note after the turn.
+appear only when all rows fit with them. Rendering writes nothing.
 Find requires checked semantic ranking. An unavailable embedder, unusable vectors
 or mismatched index epoch returns `action_ranking_unavailable` and the owner repair;
 it produces no word-only substitute. Exact current action addressing remains a
@@ -657,8 +654,8 @@ Omitting fixtures captures one bounded rehearsal with supplied input (default `{
 ### Compiled from practice
 
 The nightly compiler, its compile-only save context and tape recording are
-removed ([Habits H4](HABITS.md#h4--one-crystallizer)). The turn's private keep
-is now the only crystallizer. Ordinary hand-written fixtures still supply
+removed ([Habits H4](HABITS.md#h4--one-crystallizer)). The practice note inside
+the turn is now the only crystallizer. Ordinary hand-written fixtures still supply
 input and expected, with optional calls and answers, within 16 cases in
 256 KiB; `fixtures:[]` explicitly clears inherited fixtures.
 

@@ -1,15 +1,13 @@
 import ChatSessionWork
+import ChatToolParsing
 import ChatTurnContracts
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import TurnTrace
-// Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`: `impl_tool_result_page`; retained-response search coverage, matching/displayed/remaining counts and source-positioned matching records |
+// Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`, `impl_tool_result_page`: Retain turn-bound results without loss. |
 
-/// Lossless, turn-scoped spill storage for provider results that are too large
-/// to inject in one model message. Files live under the user's private temp
-/// directory with owner-only permissions, are addressed by random handles,
-/// and can only be read from the same chat session and turn.
+/// Lossless, turn-scoped spill storage for provider results that are too large to inject in one model message. Files live under the user's private temp
+/// directory with owner-only permissions, are addressed by random handles, and can only be read from the same chat session and turn.
 package actor ProviderToolResultRecoveryStore {
     package static let shared = ProviderToolResultRecoveryStore()
 
@@ -18,8 +16,7 @@ package actor ProviderToolResultRecoveryStore {
     /// Bound pages by raw and serialized bytes, leaving envelope space below the projection ceiling.
     package static let pageSerializedUTF8Bytes = 10_000
 
-    /// Bytes one scalar costs INSIDE a serialized JSON string, matching
-    /// `JSONValue.encodeString` exactly.
+    /// Bytes one scalar costs INSIDE a serialized JSON string, matching `JSONValue.encodeString` exactly.
     package static func jsonEscapedByteCount(_ v: UInt32) -> Int {
         switch v {
         case 0x22, 0x5C, 0x08, 0x09, 0x0A, 0x0C, 0x0D: return 2
@@ -33,7 +30,6 @@ package actor ProviderToolResultRecoveryStore {
     package static let maxEntryBytes = 64 * 1024 * 1024
     package static let maxTotalBytes = 128 * 1024 * 1024
     package static let maxEntries = 32
-    /// Cleanup age for unowned spill files.
     package static let ttl: TimeInterval = 30 * 60
 
     /// Turns retain handles until scope removal or this absolute wall-clock ceiling.
@@ -76,8 +72,7 @@ package actor ProviderToolResultRecoveryStore {
         var sectionPages: (query: String, pages: [[JSONValue]], counts: [Int])?
     }
 
-    // Turn-scoped UTF-8 envelopes in OS temporary storage, excluded from
-    // backup/export/phone sync and the data-root PrivacyMap; expiry owns removal.
+    // Turn-scoped UTF-8 envelopes in OS temporary storage, excluded from backup/export/phone sync and the data-root PrivacyMap; expiry owns removal.
     private let root: URL
     private var entries: [String: Entry] = [:]
     private var totalBytes = 0
@@ -96,9 +91,8 @@ package actor ProviderToolResultRecoveryStore {
         try? fm.createDirectory(at: root, withIntermediateDirectories: true)
         try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
 
-        // Crash leftovers have no in-memory authorization record and are never
-        // readable. Remove old ones eagerly; newer ones remain protected by the
-        // 0700 directory until a later cleanup pass.
+        // Crash leftovers have no in-memory authorization record and are never readable. Remove old ones eagerly; newer ones remain protected by the 0700
+        // directory until a later cleanup pass.
         if let urls = try? fm.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: [.contentModificationDateKey],
@@ -129,9 +123,8 @@ package actor ProviderToolResultRecoveryStore {
         guard entries.count < Self.maxEntries,
               totalBytes + data.count <= Self.maxTotalBytes else { return nil }
 
-        // Build valid Unicode-scalar byte boundaries once. Bounding bytes (not
-        // grapheme count) prevents a pathological combining sequence from
-        // becoming an unexpectedly huge provider page.
+        // Build valid Unicode-scalar byte boundaries once. Bounding bytes (not grapheme count) prevents a pathological combining sequence from becoming an
+        // unexpectedly huge provider page.
         var pageByteOffsets = [0]
         var byteOffset = 0
         var pageStartByte = 0
@@ -150,7 +143,7 @@ package actor ProviderToolResultRecoveryStore {
             byteOffset += scalarBytes
             pageSerializedBytes += escapedBytes
         }
-        // Every page has a start and end, including one empty page at [0, 0].
+        // Retain an empty page at [0, 0] so empty output remains readable.
         if pageByteOffsets.count == 1 || pageByteOffsets.last != byteOffset {
             pageByteOffsets.append(byteOffset)
         }
@@ -159,10 +152,8 @@ package actor ProviderToolResultRecoveryStore {
         let fields = parsed?.objectValue ?? [:]
         let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
         let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
-        let day = URL(fileURLWithPath: source).deletingPathExtension().lastPathComponent
-        let dated = source.hasPrefix("data/turn_traces/") && TurnTracePersistLane.day(from: day) != nil
-        let handle = (source == "data/traces/events.jsonl" ? nil : receipt)
-            .map { "receipt-" + $0.uuidString.lowercased() + (dated ? "." + day : "") } ?? UUID().uuidString.lowercased()
+        let handle = (source == "detail" ? receipt : nil)
+            .map { "receipt-" + $0.uuidString.lowercased() } ?? UUID().uuidString.lowercased()
         let url = root.appendingPathComponent(handle, isDirectory: false)
         do {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
@@ -206,8 +197,9 @@ package actor ProviderToolResultRecoveryStore {
         query: String? = nil
     ) -> JSONValue {
         var result = readPage(handle: handle, page: page, sessionId: sessionId, turnId: turnId, query: query)
+        let reply = ToolResult(result)
         if let scope = Scope(sessionId: sessionId, turnId: turnId),
-           case .object(var object) = result, object["status"] == .string("completed") {
+           case .object(var object) = result, reply.said("completed"), reply.status == object["status"]?.stringValue {
             let next: Int?
             if case .int(let value)? = object["next_page"] { next = Int(exactly: value) }
             else { next = nil }
@@ -221,8 +213,7 @@ package actor ProviderToolResultRecoveryStore {
         return result
     }
 
-    /// Continue the exact last read in this turn, preserving its query/mode.
-    /// Before the first read only an unambiguous retained result is selected.
+    /// Continue the exact last read in this turn, preserving its query/mode. Before the first read only an unambiguous retained result is selected.
     package func continueReading(handle: String?, sessionId: String?, turnId: String?) -> JSONValue {
         cleanupExpired(now: Date())
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else {
@@ -251,7 +242,10 @@ package actor ProviderToolResultRecoveryStore {
                 "reason": .string(candidates.isEmpty ? "result_handle_unavailable" : "choose_result"),
                 "results": .array(candidates.map { .object(["result_handle": .string($0.handle), "tool": .string($0.toolName)]) }),
                 "recovery_hint": .string(candidates.isEmpty
-                    ? "No matching retained result is readable in this turn. Inline results are not retained; handles expire at turn end. Follow the original read's next arguments if it has more; never repeat a write to recover output."
+                    ? """
+                        No matching retained result is readable in this turn. Inline results are not retained; handles expire at turn end. Follow \
+                        the original read's next arguments if it has more; never repeat a write to recover output.
+                        """
                     : "Several results are retained. Choose result_handle once; subsequent continue reads keep its position."),
             ])
         }
@@ -259,16 +253,19 @@ package actor ProviderToolResultRecoveryStore {
     }
 
     private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
-        let parts = handle.dropFirst(8).split(separator: ".")
-        let receipt = handle.hasPrefix("receipt-") ? parts.first.flatMap { UUID(uuidString: String($0)) } : nil
+        let receipt = handle.hasPrefix("receipt-") ? UUID(uuidString: String(handle.dropFirst(8))) : nil
         var args: [String: JSONValue] = ["view": .string("receipts")]
         if let receipt { args["receipt_id"] = .string(receipt.uuidString.lowercased()) }
-        if receipt != nil, parts.count == 2, TurnTracePersistLane.day(from: String(parts[1])) != nil {
-            args["trace"] = .string("turn_traces/\(parts[1]).jsonl")
-        }
         if let sessionId { args["session_id"] = .string(sessionId) }
+        let recovery = receipt == nil
+            ? "This handle has no bound receipt; next_call lists this conversation's receipts."
+            : "next_call reads the original dispatch receipt."
         return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string(reason),
-            "detail": .string("Retained output \(handle) is unavailable. \(receipt == nil ? "This older or untraced handle has no bound receipt; next_call lists this conversation's receipts." : "next_call reads the original dispatch receipt.") Missing output does not establish failure; never repeat a write to recover output."),
+            "detail": .string("""
+                Retained output \(handle) is unavailable. \
+                \(recovery) \
+                Missing output does not establish failure; never repeat a write to recover output.
+                """),
             "remedy": .object(["kind": .string("inspect"),
                 "instruction": .string("Read the retained receipt with next_call; missing output never authorizes repeating a write."),
                 "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(args)])])])])
@@ -293,7 +290,10 @@ package actor ProviderToolResultRecoveryStore {
             guard pages.indices.contains(page) else {
                 return .object(["status": .string("failed"), "reason": .string("page_out_of_range"),
                     "page_count": .int(Int64(pages.count)),
-                    "recovery_hint": .string("Read the same retained result with a page from 0 through \(pages.count - 1), keeping query and raw unchanged; do not rerun the original operation.")])
+                    "recovery_hint": .string("""
+                        Read the same retained result with a page from 0 through \(pages.count - 1), keeping query and raw unchanged; do not rerun \
+                        the original operation.
+                        """)])
             }
             let matching = counts[pages.count], remaining = matching - counts[page + 1]
             let sections = pages[page].map { section -> JSONValue in
@@ -319,7 +319,11 @@ package actor ProviderToolResultRecoveryStore {
                 "has_more": .bool(page + 1 < pages.count),
                 "next_page": page + 1 < pages.count ? .int(Int64(page + 1)) : .null,
                 "raw_page_count": .int(Int64(max(1, entry.pageByteOffsets.count - 1))),
-                "detail": .string("Page \(page + 1) of \(pages.count) displays \(sections.count) of \(matching) matching sections; \(remaining) remain after this page. Paths and line numbers identify positions in this retained response only; unread source content was not searched. Continue with next_call. raw=true reads the original response bytes."),
+                "detail": .string("""
+                    Page \(page + 1) of \(pages.count) displays \(sections.count) of \(matching) matching sections; \(remaining) remain after this \
+                    page. Paths and line numbers identify positions in this retained response only; unread source content was not searched. \
+                    Continue with next_call. raw=true reads the original response bytes.
+                    """),
             ])
         }
         let pageCount = max(1, entry.pageByteOffsets.count - 1)
@@ -372,8 +376,7 @@ package actor ProviderToolResultRecoveryStore {
 
     private func cleanupExpired(now: Date) {
         for entry in Array(entries.values) {
-            // The absolute ceiling binds even on a live turn — it is the only
-            // thing that frees a scope whose `remove(scope:)` never arrived.
+            // The absolute ceiling binds even on a live turn — it is the only thing that frees a scope whose `remove(scope:)` never arrived.
             if now.timeIntervalSince(entry.createdAt) >= Self.liveTurnMaxLifetime {
                 remove(handle: entry.handle)
             }
@@ -404,7 +407,7 @@ package actor ProviderToolResultRecoveryStore {
 }
 
 extension SwiftToolDispatcher {
-    package func impl_tool_result_page(input: [String: JSONValue]) async -> JSONValue {
+    package func impl_tool_result_page(turn: Turn, input: [String: JSONValue]) async -> JSONValue {
         if input["continue"] == .bool(true) {
             // Continue owns the position, even when a page is also supplied.
             let blank: (JSONValue?) -> Bool = {
@@ -413,12 +416,15 @@ extension SwiftToolDispatcher {
             }
             guard ["query", "raw"].allSatisfy({ blank(input[$0]) }) else {
                 return .object(["status": .string("failed"), "reason": .string("conflicting_read_selection"),
-                    "recovery_hint": .string("Use continue:true with optional result_handle and page, or omit continue to select an explicit page/query/raw mode. Continue ignores page and retains the previous mode and position.")])
+                    "recovery_hint": .string("""
+                        Use continue:true with optional result_handle and page, or omit continue to select an explicit page/query/raw mode. \
+                        Continue ignores page and retains the previous mode and position.
+                        """)])
             }
             let handle = input["result_handle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             return await ProviderToolResultRecoveryStore.shared.continueReading(
                 handle: handle?.isEmpty == false ? handle : nil,
-                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: TurnTraceContext.turnId)
+                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: turn.id)
         }
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
             return .object([
@@ -443,14 +449,17 @@ extension SwiftToolDispatcher {
                 "status": .string("failed"),
                 "effects": .string("none"),
                 "reason": .string("invalid_page"),
-                "recovery_hint": .string("Set page to a whole number starting at 0, or copy next_page from the previous response. Keep result_handle, query and raw unchanged; do not rerun the original operation."),
+                "recovery_hint": .string("""
+                    Set page to a whole number starting at 0, or copy next_page from the previous response. Keep result_handle, query and raw \
+                    unchanged; do not rerun the original operation.
+                    """),
             ])
         }
         return await ProviderToolResultRecoveryStore.shared.page(
             handle: handle,
             page: page,
             sessionId: ChatToolSessionInjection.explicitSessionId(in: input),
-            turnId: TurnTraceContext.turnId,
+            turnId: turn.id,
             query: input["raw"] == .bool(true) ? nil : (input["query"]?.stringValue ?? "")
         )
     }

@@ -1,7 +1,6 @@
 import ProviderRouting
 
-// Blueprint: | `AnthropicSetupTokenInput.swift` | `AnthropicSetupTokenInput`: setup-token paste, submission and visible status through existing provider setup |
-// Saves a pasted Anthropic setup token, then lets ProvidersFacade adopt it.
+// Blueprint: | `AnthropicSetupTokenInput.swift` | `AnthropicSetupTokenInput`: Setup-token submission and provider status |
 
 import SwiftUI
 import PersistenceCore

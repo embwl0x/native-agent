@@ -1,47 +1,18 @@
-// The ONE definition of USER.md's section markers.
-//
-// Three subsystems read or write these strings and none of them can import
-// the others:
-//
-//   * MemoryV2 (`UserMDGenerator`)      — writes them
-//   * Context  (`ContextMarkdownCompiler`) — cuts per-fact atoms inside them
-//   * Context  (`ContextPreparation`)  — decides precoverage from them
-//
-// They used to be three independent literals. A literal that drifts here does
-// not fail loudly: the generator keeps writing, the compiler silently stops
-// atomizing, and precoverage silently stops applying. Same class of bug as
-// `MemoryDisplayText` — two renderers of one string compared for equality —
-// so it gets the same treatment: one owner, in the base target both sides
-// already depend on.
+// Generation, atomization and precoverage must share exact section markers; spelling drift silently disables derived context coverage.
 
 import Foundation
 
-// Blueprint: | `UserMDAutogenMarkers.swift` | `UserMDAutogenMarkers`: one USER.md section marker vocabulary and shared prompt/pinned-section handling; `promptByteCap`, the person picture's bound (one floor turn's recall memory) |
+// Blueprint: | `UserMDAutogenMarkers.swift` | `UserMDAutogenMarkers`, `promptByteCap`: markers and picture bound |
 
 public enum UserMDAutogenMarkers {
-    /// Opens the human-edited preamble that generation must preserve.
     public static let preambleStart = "<!-- USER_PREAMBLE_START -->"
-    /// Closes the human-edited preamble.
     public static let preambleEnd = "<!-- USER_PREAMBLE_END -->"
-    /// Opens the machine-generated fact body.
     public static let bodyStart = "<!-- USER_MD_AUTOGEN_START -->"
-    /// Closes the machine-generated fact body.
     public static let bodyEnd = "<!-- USER_MD_AUTOGEN_END -->"
 
-    /// THE BOUND on the person picture, in UTF-8 bytes, including the
-    /// renderer's `# USER\n` heading. The picture rides every turn, so it takes
-    /// what one turn carries of memory at the floor window every model clears:
-    /// recall's floor of 5 rows of 1,200 characters
-    /// (`ContextBudgetPolicy.floorRecallRowLimit` × `floorMemoryRowChars`,
-    /// which this base target cannot import; change them together). Bytes,
-    /// not characters, so it never exceeds that allowance. Was 3,500 (no
-    /// stated derivation); 10-27 the picture admits every person kind, and
-    /// her person facts (about 3.7 KB once her generic saves are classified)
-    /// no longer fit it, newest first, so the oldest (the email preference)
-    /// would have fallen out. Facts past the bound are not lost: they stay
-    /// in the memory lane (`ContextPreparation` precovers only the facts
-    /// carried). Nil core preserves the whole document until the first pin;
-    /// an empty core carries only prose.
+    /// The person picture rides every turn, so cap UTF-8 bytes at recall's floor allowance: five rows of 1,200 characters. Keep this bound aligned with
+    /// ContextBudgetPolicy.floorRecallRowLimit and floorMemoryRowChars, which this target cannot import. Excess facts remain in memory; only carried facts are
+    /// precovered. Nil core preserves the whole document until the first pin; empty core carries only prose.
     public static let promptByteCap = 5 * 1_200
 
     public static func promptText(_ document: String, pinnedCore: [String]?) -> String {
@@ -51,9 +22,8 @@ public enum UserMDAutogenMarkers {
             .joined(separator: "\n\n")
     }
 
-    /// The pinned facts `promptText` carries (same order, same cap), as their
-    /// own section for the turn's dynamic tail. The stable segment holds only
-    /// what changes when her documents change; what memory adds rides after.
+    /// The pinned facts `promptText` carries (same order, same cap), as their own section for the turn's dynamic tail. The stable segment holds only what
+    /// changes when the agent's documents change; what memory adds rides after.
     public static func pinnedSection(_ document: String, pinnedCore: [String]?) -> String {
         guard let pinnedCore else { return "" }
         let facts = carry(document, pinnedCore: pinnedCore).facts

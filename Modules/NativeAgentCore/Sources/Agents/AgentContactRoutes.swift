@@ -9,7 +9,7 @@ import AgentLinkTransport
 import NativeAgentCore
 import PersistenceCore
 import Privacy
-// Blueprint: | `AgentContactRoutes.swift` | Authenticated contact ingress, MCP/A2A requests, retained reply pagination (failed prose followed by its terminal cause), top-level builder attachments and canonical file bytes, event waits and transport-confirmed text/file fetch acknowledgements; A2A HTTP waits retain their worker and cancel on connection failure or stop, preserving the reply path on receive half-close without canceling the accepted canonical turn |
+// Blueprint: | `AgentContactRoutes.swift` | Authenticated ingress shares retained task ownership. |
 
 private final class AgentContactHTTPWait: @unchecked Sendable {
     private let lock = NSLock()
@@ -51,7 +51,8 @@ public struct AgentContactRoutes: Sendable {
         self.receiveGrok = receiveGrok
     }
 
-    static let contactPaths: Set<String> = ["/agent/grok-reply", "/agent/mcp", "/.well-known/agent-card.json", "/a2a", "/agent/card", "/agent/reply", "/agent/message"]
+    static let contactPaths: Set<String> = ["/agent/grok-reply", "/agent/mcp", "/.well-known/agent-card.json", "/a2a", "/agent/card", "/agent/reply",
+        "/agent/message"]
     public static func isContactPath(_ path: String) -> Bool {
         contactPaths.contains(path) || path.hasPrefix("/a2a/")
     }
@@ -59,7 +60,8 @@ public struct AgentContactRoutes: Sendable {
     /// Peer bearers admit contacts; explicit identity headers still require the listener bearer.
     public static func admit(headers: [String: String], liveToken: String,
                                dataRoot: URL,
-                               readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> (BridgeAuthDecision, AgentBridgePrincipal) {
+                               readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> (BridgeAuthDecision,
+                                   AgentBridgePrincipal) {
         guard !liveToken.isEmpty else { return (.serverStopping, .anonymous) }
         let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: dataRoot, readCredential: readCredential)
         let decision: BridgeAuthDecision = !AgentBridgePrincipal.claimsIdentity(headers: headers) && principal.peerID != nil
@@ -97,9 +99,7 @@ public struct AgentContactRoutes: Sendable {
         }
         var handled = true
         func routeContact() {
-        // A revoked or wrong connection key stops working HERE, before any
-        // route sees the request. The bearer opened the port; it does not
-        // excuse a missing, revoked, or unknown contact credential.
+        // Reject revoked or unknown contact credentials before routing; the listener bearer alone cannot excuse them.
         if principal.peerID == nil {
             BridgeCore.writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
             return
@@ -107,13 +107,7 @@ public struct AgentContactRoutes: Sendable {
         if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
 
         let isGrok = principal.replyOnly
-        // Grok Bot is a two-way contact like any other: its
-        // credential answers a pending request here and starts conversations
-        // through the same messaging door (/agent/mcp) every contact uses,
-        // under her Trust's peer posture: untrusted, its turn's first effect
-        // asks the person; trusted in Trust → Connected agents, it acts as the
-        // person would. It never reaches A2A or tools. Identity comes from the
-        // verified bearer.
+        // A verified routine bearer uses the same peer messaging and Trust boundaries as other contacts; it grants no A2A or tool access.
         if path == "/agent/grok-reply" || (isGrok && path != "/agent/mcp") {
             guard isGrok, path == "/agent/grok-reply", method == "POST", body.count <= GrokReplyInput.maximumBytes else {
                 BridgeCore.writeJSON(conn, status: 403, obj: ["error": "reply_scope_only"])
@@ -151,12 +145,14 @@ public struct AgentContactRoutes: Sendable {
                 let endpoint = AgentContactA2AEndpoint(tasks: self.tasks(), port: port(),
                     grpcPort: grpcPort())
                 let response = await endpoint.handleREST(method: method, target: path, body: body,
-                    principal: principal, version: headers["a2a-version"])
-                guard !Task.isCancelled else { return }
+                        principal: principal, version: headers["a2a-version"])
+                guard !Task.isCancelled else { response.failed(); return }
                 switch response {
-                case .json(let status, let value, let onSent):
-                    Self.writeA2AJSON(conn, status: status, object: value, onSent: { Task { await onSent?() } })
-                case .stream(let events, let onSent): AgentContactSSE.write(conn, id: "rest", events: events, version: "1.0", rest: true, onSent: onSent)
+                case .json(let status, let value, let onSent, let onFailed):
+                    Self.writeA2AJSON(conn, status: status, object: value, onSent: { Task { await onSent?() } }, onFailed: onFailed)
+                case .stream(let events, let metadata, let onSent, let settle):
+                    AgentContactSSE.write(conn, id: "rest", events: events, version: "1.0", rest: true,
+                        metadata: metadata, onSent: onSent, settle: settle)
                 }
             }
             return
@@ -176,9 +172,7 @@ public struct AgentContactRoutes: Sendable {
                 BridgeCore.writeJSON(conn, status: rejection, obj: ["error": "unsupported_mcp_transport_headers"])
                 return
             }
-            // Her messages held for this host (it has no command line): a tool
-            // call takes a bounded batch in one step, and its response settles
-            // them: delivered once written, held again if it was not.
+            // Settle drained pull-host messages only after their response is written; failed responses leave them held.
             let conversations = AgentConversationStore(dataRoot: dataRoot)
             let request = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
             let tool = request?["method"] as? String == "tools/call" ? (request?["params"] as? [String: Any])?["name"] as? String : nil
@@ -186,11 +180,13 @@ public struct AgentContactRoutes: Sendable {
             func wire(_ item: AgentConversationStore.Held) -> [String: String] {
                 ["at": NativeTimestampFormat.plainZulu(item.at), "text": item.text, "conversation_id": item.conversation ?? session]
             }
-            let held: (taken: [AgentConversationStore.Held], remaining: Int)
+            let held: AgentConversationStore.HeldDrain
             do {
-                if tool != nil, let peer = principal.peerID {
-                    held = try conversations.takeHeld(agent: "peer:" + peer) { NativeAgentMCPWire.heldFits($0.map(wire)) }
-                } else { held = ([], 0) }
+                if let tool, let peer = principal.peerID {
+                    held = try conversations.drainHeld(peer: peer, name: principal.displayName ?? principal.id, via: tool) {
+                        NativeAgentMCPWire.heldFits($0.map(wire))
+                    }
+                } else { held = .nothing }
             } catch {
                 BridgeCore.writeJSON(conn, status: 503, obj: ["error": "held_message_drain_failed",
                     "source": conversations.fileURL.path,
@@ -198,20 +194,7 @@ public struct AgentContactRoutes: Sendable {
                 return
             }
             let taken = held.taken
-            let settle: @Sendable (Bool) -> Void = { written in
-                guard !taken.isEmpty, let tool else { return }
-                do { try conversations.settleHeld(taken, written: written, to: principal.displayName ?? principal.id, via: tool) }
-                catch {
-                    let words = "Held message settlement failed: " + error.localizedDescription
-                        + "; response written: \(written); exchanges: " + taken.map(\.exchange).joined(separator: ", ")
-                    RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message,
-                        operation: "agent.held.settle:" + principal.id, owner: conversations.fileURL.path,
-                        words: words, lever: "Repair the saved delivery transition against its original response outcome before any resend.",
-                        nextCall: ToolFailureError.call("app", ["action": .string("agent.read"), "args": .object([
-                            "agent": .string("peer:" + principal.id)])]))
-                    nativeLog("%@", words)
-                }
-            }
+            let settle = held.settle
             switch NativeAgentMCPWire.parse(request, byteCount: body.count, defaultSession: principal.conversationID(protocolName: "mcp"),
                                             held: (taken.map(wire), held.remaining)) {
             case .message(let message, let replayBody, let wait, let project):
@@ -220,8 +203,7 @@ public struct AgentContactRoutes: Sendable {
                                progressToken: headers["x-nativeagent-relay-sse"] == "1" ? wait.progressToken : nil)
                 handleContactMessage(conn: conn, json: message, tasks: self.tasks(),
                               peer: peerTurnContext(principal: principal, protocolName: "mcp",
-                                                    // The message, not the JSON-RPC envelope: a retry under
-                                                    // the same request_id carries a new JSON-RPC id.
+                                                    // Digest the message, not its JSON-RPC envelope, because retries may change envelope IDs.
                                                     requestBody: replayBody),
                               responseProjection: project, mcpWait: mcpWait, settle: settle)
             case .reply(let request, let session, let offset, let waitSeconds, let project):
@@ -257,12 +239,15 @@ public struct AgentContactRoutes: Sendable {
             Self.request(conn) {
                 let response = await AgentContactA2AEndpoint(tasks: self.tasks(), port: port(),
                     grpcPort: grpcPort())
-                    .handle(try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed]), byteCount: body.count, principal: principal, version: headers["a2a-version"])
-                guard !Task.isCancelled else { return }
+                    .handle(try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed]), byteCount: body.count, principal: principal,
+                        version: headers["a2a-version"])
+                guard !Task.isCancelled else { response.failed(); return }
                 switch response {
-                case .json(let object, let onSent):
-                    BridgeCore.writeJSON(conn, status: 200, obj: object, onSent: { Task { await onSent?() } })
-                case .stream(let id, let events, let version, let onSent): AgentContactSSE.write(conn, id: id, events: events, version: version, onSent: onSent)
+                case .json(let object, let onSent, let onFailed):
+                    BridgeCore.writeJSON(conn, status: 200, obj: object, onSent: { Task { await onSent?() } }, onFailed: onFailed)
+                case .stream(let id, let events, let version, let metadata, let onSent, let settle):
+                    AgentContactSSE.write(conn, id: id, events: events, version: version,
+                        metadata: metadata, onSent: onSent, settle: settle)
                 }
             }
         case "/agent/card":
@@ -292,8 +277,14 @@ public struct AgentContactRoutes: Sendable {
                 let result = await peerReplyReceipt(requestID: requestID, sessionID: sessionID,
                     offset: Self.peerInteger(json["offset"]) ?? 0, maxChars: Self.peerInteger(json["max_chars"]) ?? 8000,
                     principal: principal, tasks: tasks)
-                BridgeCore.writeJSON(conn, status: result.receipt["status"] as? String == "invalid_request" ? 400 : 200, obj: result.receipt,
-                          onSent: Self.fetched(result.receipt, task: result.task, tasks: tasks))
+                do {
+                    let held = try AgentContactHeldResponse(principal: principal, dataRoot: dataRoot, via: "/agent/reply")
+                    let fetched = Self.fetched(result.receipt, task: result.task, tasks: tasks)
+                    BridgeCore.writeJSON(conn, status: result.receipt["status"] as? String == "invalid_request" ? 400 : 200,
+                        obj: held.adding(to: result.receipt), onSent: { fetched?(); held.settle(true) }, onFailed: { held.settle(false) })
+                } catch {
+                    BridgeCore.writeJSON(conn, status: 503, obj: AgentContactHeldResponse.failure(error, dataRoot: dataRoot))
+                }
             }
         case "/agent/message":
             guard method == "POST" else {
@@ -301,9 +292,13 @@ public struct AgentContactRoutes: Sendable {
                 return
             }
             let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-            handleContactMessage(conn: conn, json: json, tasks: self.tasks(),
-                          peer: peerTurnContext(principal: principal, protocolName: "agent-message",
-                                                requestBody: body))
+            do {
+                let held = try AgentContactHeldResponse(principal: principal, dataRoot: dataRoot, via: "/agent/message")
+                handleContactMessage(conn: conn, json: json, tasks: self.tasks(),
+                    peer: peerTurnContext(principal: principal, protocolName: "agent-message", requestBody: body), held: held)
+            } catch {
+                BridgeCore.writeJSON(conn, status: 503, obj: AgentContactHeldResponse.failure(error, dataRoot: dataRoot))
+            }
         default:
             handled = false
         }
@@ -312,9 +307,8 @@ public struct AgentContactRoutes: Sendable {
         return handled
     }
 
-    /// The connection owns only its HTTP wait. Canceling it never calls the
-    /// retained task's explicit cancel operation or owns the canonical turn.
-    /// Receive EOF is a half-close: the peer can still read the whole reply.
+    /// The connection owns only its HTTP wait. Canceling it never calls the retained task's explicit cancel operation or owns the canonical turn. Receive EOF
+    /// is a half-close: the peer can still read the whole reply.
     private static func request(_ conn: NWConnection, operation: @escaping @Sendable () async -> Void) {
         let wait = AgentContactHTTPWait()
         let previous = conn.stateUpdateHandler
@@ -337,11 +331,9 @@ public struct AgentContactRoutes: Sendable {
     private func peerTurnContext(principal: AgentBridgePrincipal, protocolName: String,
                                  requestBody: Data) -> PeerTurnContext {
         PeerTurnContext(
-            principal: principal,
+                        principal: principal,
             protocolName: protocolName,
-            // The ORIGINAL request bytes. A2A re-mints its server-side request
-            // id on every send, so digesting the projected body would make two
-            // identical client messages look different.
+            // Digest original request bytes because projected A2A requests mint a different server ID on each send.
             bodyDigest: AgentPeerReplayClaimStore.digest(requestBody)
         )
     }
@@ -356,14 +348,13 @@ public struct AgentContactRoutes: Sendable {
     }
 
     private func peerReplyReceipt(requestID: String, sessionID: String, offset: Int = 0, maxChars: Int = 8000,
-                                  waitSeconds: Int = 0, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> (receipt: [String: Any], task: AgentContactTask?) {
+                                  waitSeconds: Int = 0, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> (receipt: [String: Any],
+                                      task: AgentContactTask?) {
         let protocolSession = NativeAgentMCPWire.validSession(sessionID) || NativeAgentA2AWire.validContext(sessionID)
         let storedSession = protocolSession ? principal.storedConversation(sessionID) : sessionID
-        // The task is filed under the transport's context; the session is the contact's one thread.
+        // Protocol context locates the task; the contact’s canonical session owns its turn.
         let taskID = Self.taskID(requestID: requestID, sessionID: sessionID, principal: principal)
-        // agent_reply's wait: back the moment the reply settles (its stream
-        // ends with it), or when the caller's bound passes, as agent_message waits.
-        // A wait that cannot watch the reply says why, never a silent immediate read.
+        // Wait only to settlement or the caller’s bound; inability to observe the reply must be explicit.
         if waitSeconds > 0 {
             do {
                 let events = try await tasks.subscribe(taskID, owner: principal.id)
@@ -373,7 +364,9 @@ public struct AgentContactRoutes: Sendable {
             } catch {
                 return (["status": "unavailable", "retrieval_result_class": "failed", "evidence": "canonical_task_wait_unavailable",
                     "request_id": requestID, "session_id": sessionID,
-                    "detail": "The retained task could not be watched: \(error.localizedDescription). Repair task observation; do not repeat the message."], nil)
+                    "detail": """
+                        The retained task could not be watched: \(error.localizedDescription). Repair task observation; do not repeat the message.
+                        """], nil)
             }
         }
         return await Self.retainedReply(requestID: requestID, sessionID: sessionID,
@@ -390,7 +383,7 @@ public struct AgentContactRoutes: Sendable {
 
     static func retainedReply(requestID: String, sessionID: String, taskID: String, receiptSessionID: String,
                               offset: Int, maxChars: Int, principal: AgentBridgePrincipal,
-                              tasks: AgentContactTasks) async -> (receipt: [String: Any], task: AgentContactTask?) {
+                                      tasks: AgentContactTasks) async -> (receipt: [String: Any], task: AgentContactTask?) {
         do {
             let task = try await tasks.get(taskID, owner: principal.id)
             return (contactReply(task, requestID: requestID, sessionID: sessionID, offset: offset, maxChars: maxChars), task)
@@ -417,15 +410,17 @@ public struct AgentContactRoutes: Sendable {
         return { Task { await tasks.recordReplyFetch(task) } }
     }
 
-    /// Peer and builder doors share the retained task execution owner.
+    /// Peer and builder doors must share one retained execution owner.
     private func handleContactMessage(conn: NWConnection, json: [String: Any]?,
                                       tasks: AgentContactTasks, peer: PeerTurnContext,
                                       responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil,
                                       mcpWait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?)? = nil,
+                                      held: AgentContactHeldResponse? = nil,
                                       settle: (@Sendable (Bool) -> Void)? = nil) {
+        let settle = held?.settle ?? settle
         func reply(_ status: Int, _ object: [String: Any]) {
             BridgeCore.writeJSON(conn, status: responseProjection == nil ? status : 200,
-                      obj: responseProjection?(status, object) ?? object,
+                      obj: responseProjection?(status, object) ?? held?.adding(to: object) ?? object,
                       onSent: { settle?(true) }, onFailed: { settle?(false) })
         }
         guard let json,
@@ -436,8 +431,7 @@ public struct AgentContactRoutes: Sendable {
         let requested = json["sessionId"] as? String
         let protocolSession = peer.protocolName == "mcp"
         let prefix = AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)
-        // An MCP session id is the task's own locator as the host sent it; the
-        // turn runs in the contact's one conversation either way.
+        // MCP session IDs remain transport locators; all contexts run in the contact’s one conversation.
         let stored = protocolSession ? requested.map { prefix + $0 }
             : ClaudeBridgeMessageRuntime.genericAgentSessionID(requested: requested, owner: principal.id)
         guard let stored, stored.hasPrefix(prefix) else {
@@ -463,13 +457,8 @@ public struct AgentContactRoutes: Sendable {
         }
     }
 
-    /// Holds an MCP `agent_message` open until the reply settles or the
-    /// caller's bound passes, so hosts get the answer without polling. With a
-    /// progress token the answer is an SSE stream (Streamable HTTP): the reply
-    /// so far as `notifications/progress`, then the tool result. Without one
-    /// it is the same single JSON response, only later. The task, its receipt
-    /// and replay claim are untouched: leaving early only ends this wait, and
-    /// `agent_reply` still reads the same retained reply.
+    /// Hold the HTTP response until settlement or the caller’s bound to avoid polling. Progress tokens select SSE; ending either wait leaves the retained
+    /// task, receipt and replay claim untouched.
     private static func writeWaitedReply(conn: NWConnection, ack: [String: Any], taskID: String, requestID: String,
                                          sessionID: String, owner: String, tasks: AgentContactTasks,
                                          wait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?),
@@ -568,8 +557,6 @@ public struct AgentContactRoutes: Sendable {
         } catch { nativeLog("Contact result could not be encoded: %@", error.localizedDescription); conn.cancel() }
     }
 
-    /// The caller's wait on a reply (agent_message's, agent_reply's): `watch`
-    /// returns when the reply settles, or the caller's bound passes first.
     private static func untilSettled(seconds: Int, _ watch: @escaping @Sendable () async -> Void) async {
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await watch() }
@@ -584,7 +571,8 @@ public struct AgentContactRoutes: Sendable {
         let reply = task.state == .failed
             ? [task.text, task.detail ?? "The reply could not be completed. Work: outcome unknown."].filter { !$0.isEmpty }.joined(separator: "\n\n")
             : task.text
-        guard offset >= 0, offset <= reply.count, (1...16000).contains(maxChars) else { return ["status": "invalid_request", "retrieval_result_class": "failed"] }
+        guard offset >= 0, offset <= reply.count, (1...16000).contains(maxChars) else { return ["status": "invalid_request",
+            "retrieval_result_class": "failed"] }
         let slice = String(reply.dropFirst(offset).prefix(maxChars))
         var receipt: [String: Any] = ["status": task.state.terminal ? "ok" : "pending",
             "retrieval_result_class": task.replyRecovery != nil ? "failed" : task.state.terminal ? "succeeded" : "unknown",
@@ -598,9 +586,8 @@ public struct AgentContactRoutes: Sendable {
             receipt["reply_recovery"] = ["source": recovery.source, "detail": recovery.detail]
             receipt["detail"] = [task.detail, recovery.detail].compactMap { $0 }.joined(separator: "\n")
         }
-        // Canonical file parts carry their bytes. Builder results additionally
-        // retain their door's attachment descriptors (including saved paths);
-        // return that live payload at the same top-level keys its readers use.
+        // Canonical file parts carry their bytes. Builder results additionally retain their door's attachment descriptors (including saved paths); return that
+        // live payload at the same top-level keys its readers use.
         receipt["attachments"] = task.parts.enumerated().compactMap { index, part -> [String: Any]? in
             guard case .file(let name, let mediaType, let bytes, _) = part else { return nil }
             return ["id": "\(task.id):\(index)", "type": mediaType.hasPrefix("image/") ? "image" : "file",
@@ -642,14 +629,59 @@ public struct AgentContactRoutes: Sendable {
 
 
 extension AgentContactRoutes {
-    static func writeA2AJSON(_ connection: NWConnection, status: Int, object: [String: Any], onSent: (@Sendable () -> Void)? = nil) {
-        guard let body = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { connection.cancel(); return }
+    static func writeA2AJSON(_ connection: NWConnection, status: Int, object: [String: Any], onSent: (@Sendable () -> Void)? = nil,
+                             onFailed: (@Sendable () -> Void)? = nil) {
+        guard let body = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            onFailed?(); connection.cancel(); return
+        }
         let reason = status == 200 ? "OK" : (status == 404 ? "Not Found" : (status == 500 ? "Internal Server Error" : "Bad Request"))
-        var bytes = Data("HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/a2a+json\r\nCache-Control: no-store\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+        var bytes = Data("""
+            HTTP/1.1 \(status) \(reason)\r\nContent-Type: application/a2a+json\r\nCache-Control: no-store\r\nContent-Length: \
+            \(body.count)\r\nConnection: close\r\n\r\n
+            """.utf8)
         bytes.append(body)
         connection.send(content: bytes, completion: .contentProcessed { error in
-            if error == nil { onSent?() }
+            if error == nil { onSent?() } else { onFailed?() }
             connection.cancel()
         })
+    }
+}
+
+/// A response projection over the conversation owner's claim, never a second held-message store.
+struct AgentContactHeldResponse: Sendable {
+    private let drain: AgentConversationStore.HeldDrain
+    private let conversation: String
+    var settle: @Sendable (Bool) -> Void { drain.settle }
+
+    init(principal: AgentBridgePrincipal, dataRoot: URL, via door: String) throws {
+        let conversation = principal.conversationID(protocolName: "mcp") ?? ""
+        self.conversation = conversation
+        guard let peer = principal.peerID else { drain = .nothing; return }
+        drain = try AgentConversationStore(dataRoot: dataRoot).drainHeld(peer: peer, name: principal.displayName ?? principal.id, via: door) {
+            NativeAgentMCPWire.heldFits(Self.messages($0, conversation: conversation))
+        }
+    }
+
+    private static func messages(_ items: [AgentConversationStore.Held], conversation: String) -> [[String: String]] {
+        items.map { ["at": NativeTimestampFormat.plainZulu($0.at), "text": $0.text, "conversation_id": $0.conversation ?? conversation] }
+    }
+
+    func adding(to object: [String: Any]) -> [String: Any] {
+        guard !drain.taken.isEmpty || drain.remaining > 0 else { return object }
+        var result = object
+        result["held_messages"] = Self.messages(drain.taken, conversation: conversation)
+        result["held_remaining"] = drain.remaining
+        return result
+    }
+
+    var metadata: JSONValue {
+        guard !drain.taken.isEmpty || drain.remaining > 0 else { return .object([:]) }
+        return JSONValue(fromFoundation: ["nativeagent.held_messages": Self.messages(drain.taken, conversation: conversation),
+            "nativeagent.held_remaining": drain.remaining])
+    }
+
+    static func failure(_ error: Error, dataRoot: URL) -> [String: Any] {
+        ["error": "held_message_drain_failed", "source": AgentConversationStore(dataRoot: dataRoot).fileURL.path,
+            "detail": NativeAgentSecretRedactor.redactText(error.localizedDescription)]
     }
 }

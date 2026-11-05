@@ -3,14 +3,12 @@ import PersistenceCore
 import NativeAgentCore
 import NativeAgentShared
 
-private let nestedOpenLog = ModuleLog(category: "Receipts", trail: true)
+private let nestedOpenLog = ModuleLog(category: "Receipts")
 // Blueprint: | `DeskContinuation.swift` | `DeskContinuation`; life-stamped resumable work, stopped/restored projection; receiptIsUnresolved and toJSON |
 
 public struct DeskContinuation: Codable, Sendable, Equatable {
     public enum State: String, Codable, Sendable { case running, ready, blocked, complete, canceled, stopped }
-    /// One dispatched call. Only a redacted, bounded summary and the
-    /// references a domain verifier needs are kept — never raw arguments or
-    /// results, which can carry typed secrets.
+    /// Retain only bounded, redacted summaries and verifier references because raw calls can carry secrets.
     public struct Step: Codable, Sendable, Equatable {
         public var id: String
         public var tool: String
@@ -22,8 +20,7 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
         public var requestID: String?
         public var readOnly = false
         public var runID: String?
-        /// Digest of the exact call (tool and full arguments): the same effect
-        /// proposed again has the same digest.
+        /// Identical effects share a digest so they can be recognized across proposals.
         public var effect: String?
 
         public init(id: String, tool: String, input: String, reference: [String: JSONValue]? = nil, effect: String? = nil) {
@@ -81,17 +78,10 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
         self.helperDefinition = helperDefinition
     }
 
-    /// True when a receipt says its effect has not reached a definite outcome:
-    /// still queued or running, outcome or effects unknown, or verification
-    /// unsatisfied — including inside MCP `content`/`structuredContent` and
-    /// JSON text bodies. Such an effect is never settled by its own receipt.
+    /// Nested queued, running, unknown or unverified effects cannot settle from the outer receipt alone.
     public static func receiptIsUnresolved(_ value: JSONValue, depth: Int = 0) -> Bool {
         guard let path = unresolvedPath(value, depth: depth, path: "") else { return false }
-        // Measuring before cutting (10-29): an open child under a closed outer receipt is a producer
-        // that does not own its child's evidence. Each one logged here is a producer to fix; when none
-        // log, this dig becomes a read of the outer receipt alone.
-        // A root reason reads ".status=accepted"; only a deeper location is a
-        // child receipt (10-31: all 36 logged lines were root matches).
+        // A root path starts with "."; only deeper paths reveal missing child evidence in the outer receipt.
         let location = path.split(separator: "=", maxSplits: 1).first.map(String.init) ?? path
         if depth == 0, location.dropFirst().contains(where: { $0 == "." || $0 == "[" }), case .object(let outer) = value {
             let who = ["action", "tool", "verb", "kind", "source"].compactMap { outer[$0]?.scalarText }.first ?? "?"
@@ -101,7 +91,6 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
         return true
     }
 
-    /// Where a receipt says its effect is still open, as a dotted path; nil when it is settled.
     static func unresolvedPath(_ value: JSONValue, depth: Int, path: String) -> String? {
         guard depth < 8 else { return path + "(depth)" }
         switch value {
@@ -163,7 +152,6 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
 
 public enum DeskContinuationScope {
     public static let processID = UUID().uuidString
-    @TaskLocal public static var current: DeskContinuationTurn?
 }
 
 public enum DeskContinuationError: Error, LocalizedError {
@@ -186,7 +174,7 @@ public actor DeskContinuationTurn {
     private var writing = false
     private var writers: [ScopedWaiter] = []
     private var fenced = false
-    /// Steps this process began; any other pending step lost its receipt.
+    /// A pending step not begun by this process has lost its receipt.
     private var begun: Set<String> = []
 
     public init(store: SwiftNativeDeskStore, record: DeskContinuation, handle: String? = nil) {
@@ -195,9 +183,7 @@ public actor DeskContinuationTurn {
         self.handle = handle
     }
 
-    /// Steps recorded before attachment (settled and unresolved alike) move
-    /// onto the task with it, so an earlier async or unknown effect stays
-    /// pending for its domain verifier instead of being lost.
+    /// Move every pre-attachment step onto the task so unresolved effects keep their verifier.
     public func attach(handle: String, remainingWork: String) async throws {
         await acquireWriter()
         defer { releaseWriter() }
@@ -211,8 +197,7 @@ public actor DeskContinuationTurn {
         guard record.settled.count + record.pending.count <= 128 else { throw DeskContinuationError.full }
         let item = try await store.liveState().items.first { $0.handle == handle }
         guard let item, !item.status.isTerminal else { throw DeskContinuationError.conflict }
-        // A new life starts fresh. Within one life an unresolved effect still
-        // belongs to its continuation, even after Stop.
+        // A new life starts fresh; same-life unresolved effects remain owned even after Stop.
         if let previous = item.continuation {
             guard [.complete, .canceled, .blocked, .stopped].contains(previous.state) else { throw DeskContinuationError.conflict }
             guard previous.state == .stopped || previous.pending.isEmpty else { throw DeskContinuationError.unsafe }
@@ -232,8 +217,7 @@ public actor DeskContinuationTurn {
         try await save()
     }
 
-    /// Returns the step as admitted: a call whose earlier run lost its receipt
-    /// is admitted as that same step, so its settlement resolves it.
+    /// Re-admit a receipt-less call as the same step so settlement resolves its original obligation.
     @discardableResult
     public func begin(_ step: DeskContinuation.Step, peerSources: [String]) async throws -> DeskContinuation.Step {
         await acquireWriter()
@@ -263,10 +247,8 @@ public actor DeskContinuationTurn {
         return inFlight
     }
 
-    /// `settled` is true only for a definite outcome. An owner-run effect
-    /// (Workshop, helper) stays pending under its reference until that
-    /// domain's receipt settles it; any other unresolved step stops the
-    /// continuation at the end of the turn and asks.
+    /// Only a definite outcome settles; owner-run effects wait on their domain receipt.
+    /// Other unresolved effects stop the continuation and ask at turn end.
     public func settle(_ step: DeskContinuation.Step, result: String, settled: Bool,
                        owner: String? = nil, ownerID: String? = nil, requestID: String? = nil,
                        peerSources: [String]) async throws {

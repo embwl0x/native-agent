@@ -16,7 +16,7 @@ struct ContentView: View {
     private let talk = TalkModeController.shared
     private let sync = iCloudSyncEngine.shared
 
-    // Shared stores so the tab badges stay in sync with the views' stores
+    // Share stores so tab badges and destination views read the same state.
     @StateObject private var approvalsStore = ApprovalsStore()
     @StateObject private var inboxStore = InboxStore()
 
@@ -28,9 +28,10 @@ struct ContentView: View {
     @State private var lastNotificationOpenAt: Date = .distantPast
     @State private var suppressActivityRefreshUntil: Date = .distantPast
     @State private var activityNavigationTarget: ActivitySection?
+    /// A card a face's link asked Today to open.
+    @State private var activityCardID: String?
+    @Environment(\.openURL) private var openURL
     @State private var notifiedSessionID: String?
-    @State private var notifiedDeskHandle: String?
-    @State private var deskTaskNavigationTarget: NativeAgentNotificationLaunchIntent?
     @State private var opensMemories = {
         let args = ProcessInfo.processInfo.arguments
         guard let index = args.firstIndex(of: "-initialTab"), args.indices.contains(index + 1) else { return false }
@@ -46,7 +47,6 @@ struct ContentView: View {
         return overview.needsYouCount
     }
 
-    /// Parse the current `-initialTab <name>` destinations.
     private static func initialTabFromLaunchArgs() -> Tab {
         initialTab(fromLaunchArguments: ProcessInfo.processInfo.arguments)
     }
@@ -123,6 +123,51 @@ struct ContentView: View {
         talk.begin(client: bridgeClient, controls: controls)
     }
 
+    /// A face's link to a place of the shell: a conversation in Chat, Today's queues and cards, the Desk, the browser. Answers the words for a
+    /// place this phone does not have.
+    private func followFaceLink(_ link: String) -> String? {
+        guard PartFace.isLink(link), let colon = link.firstIndex(of: ":") else { return "This row has no destination on iPhone." }
+        let kind = String(link[..<colon]), target = String(link[link.index(after: colon)...])
+        switch kind {
+        case "chat":
+            notifiedSessionID = target
+            selection = .chat
+        case "approval":
+            activityNavigationTarget = .inbox
+            selection = .activity
+        case "card":
+            activityCardID = target
+            selection = .activity
+        case "url":
+            guard let url = URL(string: target) else { return "This link could not be opened." }
+            openURL(url)
+        case "page":
+            let parts = target.split(separator: "/", maxSplits: 1).map(String.init)
+            switch parts[0] {
+            case "today" where parts.count == 2:
+                // Approvals and notes are one Inbox, as on the Mac.
+                guard let section = parts[1] == "approvals" ? .inbox : ActivitySection(rawValue: parts[1]) else {
+                    return "This queue opens on your Mac."
+                }
+                activityNavigationTarget = section
+                selection = .activity
+            case "today":
+                selection = .activity
+            case "desk":
+                selection = .desk
+            case "memory_proposals":
+                activityNavigationTarget = .memoryProposals
+                selection = .activity
+            default:
+                // A page is named by its own face; a page the phone has never read keeps its catalog name.
+                return (sync.faces[parts[0]]?.face?.title ?? QuietToolPage.page(named: parts[0])?.title ?? parts[0]) + " opens on your Mac."
+            }
+        default:
+            return "This opens on your Mac."
+        }
+        return nil
+    }
+
     private var tabContent: some View {
         TabView(selection: $selection) {
             ChatView(notifiedSessionID: $notifiedSessionID)
@@ -135,22 +180,21 @@ struct ContentView: View {
 
             ActivityView(
                 skipInitialRefresh: $skipNextActivityInitialRefresh,
-                navigationTarget: $activityNavigationTarget
+                navigationTarget: $activityNavigationTarget,
+                cardTarget: $activityCardID
             )
                 .environmentObject(approvalsStore)
                 .environmentObject(inboxStore)
                 .tabItem {
-                    Label("Activity", systemImage: "tray")
+                    Label("Today", systemImage: "sun.max")
                     .environment(\.symbolVariants, .none)
                 }
                 .badge(activityBadgeCount.flatMap { $0 > 0 ? String($0) : nil })
                 .tag(Tab.activity)
 
             NavigationStack {
-                // More → Desk pushes WorkshopView inside More's navigation stack
-                // for directed work; this tab opens the canonical Desk board.
-                // The More route keeps More selected and does not switch to this tab.
-                MobileDeskView(notifiedHandle: $notifiedDeskHandle)
+                // Directed work stays inside More's navigation stack; the Desk tab owns the canonical board.
+                MobileFacePage(page: "desk", style: .root)
             }
                 .tabItem {
                     Label("Desk", systemImage: "rectangle.3.group")
@@ -165,8 +209,7 @@ struct ContentView: View {
                 }
                 .tag(Tab.settings)
 
-            // AdvancedView's own title names the page; no second label above it.
-            AdvancedView(deskTaskNavigationTarget: $deskTaskNavigationTarget, opensMemories: $opensMemories)
+            AdvancedView(opensMemories: $opensMemories)
                 .tabItem {
                     Label("More", systemImage: "ellipsis.circle")
                     .environment(\.symbolVariants, .none)
@@ -174,8 +217,8 @@ struct ContentView: View {
                 .tag(Tab.more)
         }
         .tint(HazeColor(stored: hazeColorRaw).control(dark: colorScheme == .dark, labelled: false))
-        // Outlined tab glyphs keep one weight; tint and the selection pill indicate the active tab.
         .environment(\.symbolVariants, .none)
+        .environment(\.faceRouter, FaceRouter(follow: followFaceLink))
         .onAppear {
             openSharedChatIfNeeded()
             if MobileQuickAskRoute.isPending { selection = .chat }
@@ -190,7 +233,7 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .top) {
-            // Top toasts avoid the tab bar and composer; an empty overlay neither shifts layout nor intercepts taps.
+            // Top toasts avoid composer/tab controls; an empty overlay must neither move content nor intercept taps.
             iOSSystemToastBar(center: SystemToastCenter.shared)
         }
         .onAppear {
@@ -200,35 +243,27 @@ struct ContentView: View {
             consumePendingNotificationOpenIfNeeded()
         }
         .onChange(of: sync.approvals) { _, _ in
-            approvalsStore.applySyncedApprovalsFromSnapshot(
-                notifyNewPending: true
-            )
+            approvalsStore.applySyncedApprovalsFromSnapshot()
             Task {
                 await pruneActivityNotifications()
             }
         }
         .onChange(of: activityBadgeCount, initial: true) { _, count in
             Task {
-                // An unavailable count has no badge, just as on the tab.
                 do { try await UNUserNotificationCenter.current().setBadgeCount(count ?? 0) }
                 catch { NSLog("[Activity] badge update failed: %@", error.localizedDescription) }
             }
         }
         .onChange(of: sync.inboxItems) { _, _ in
-            approvalsStore.applySyncedApprovalsFromSnapshot(
-                notifyNewPending: true
-            )
-            inboxStore.applySyncedInboxFromSnapshot(
-                notifyNewArrivals: true
-            )
+            approvalsStore.applySyncedApprovalsFromSnapshot()
+            inboxStore.applySyncedInboxFromSnapshot()
             Task {
                 await pruneActivityNotifications()
             }
         }
         .task {
             if openedFromNotificationLaunch {
-                // Let the launch/tap transition settle before touching iCloud
-                // snapshots or UNUserNotificationCenter again.
+                // Let launch/tap transitions settle before rereading iCloud or notification state.
                 try? await Task.sleep(nanoseconds: 900_000_000)
             } else {
                 await refreshActivityBadgesIfAllowed()
@@ -247,14 +282,12 @@ struct ContentView: View {
         }
     }
 
-    /// Known destinations share aliases; each ingress owns its unknown-input default.
     private static func tab(forScreen screen: String) -> Tab? {
         switch screen.lowercased() {
         case "chat": return .chat
         case "memories", "memory": return .more
         case "desk": return .desk
         case "skills": return .more
-        case "workshop": return .more
         case "settings": return .settings
         case "more": return .more
         case "mac_integration", "macintegration", "mac-integration": return .more
@@ -269,8 +302,6 @@ struct ContentView: View {
         let target = Self.tab(forScreen: screen) ?? .activity
         if ["memory", "memories"].contains(screen.lowercased()) { opensMemories = true }
         notifiedSessionID = destination.sessionID
-        notifiedDeskHandle = screen == "desk" ? destination.taskID : nil
-        if screen == "workshop" { deskTaskNavigationTarget = destination }
         activityNavigationTarget = target == .activity
             ? ActivityScreenPresentation.activityDestination(for: screen)
             : nil
@@ -289,7 +320,7 @@ struct ContentView: View {
         notificationOpenRefreshTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_250_000_000)
             guard !Task.isCancelled else { return }
-            await refreshActivityBadges(pruneNotifications: false, notifyNewActivity: false)
+            await refreshActivityBadges(pruneNotifications: false)
             openedFromNotificationLaunch = false
         }
     }
@@ -302,20 +333,15 @@ struct ContentView: View {
 
     @MainActor
     private func refreshActivityBadges(
-        pruneNotifications: Bool = true,
-        notifyNewActivity: Bool = true
+        pruneNotifications: Bool = true
     ) async {
         guard !isRefreshingActivityBadges else { return }
         isRefreshingActivityBadges = true
         defer { isRefreshingActivityBadges = false }
         await sync.refreshActivitySnapshot()
         if pairingStore.usesICloudTransport {
-            approvalsStore.applySyncedApprovalsFromSnapshot(
-                notifyNewPending: notifyNewActivity
-            )
-            inboxStore.applySyncedInboxFromSnapshot(
-                notifyNewArrivals: notifyNewActivity
-            )
+            approvalsStore.applySyncedApprovalsFromSnapshot()
+            inboxStore.applySyncedInboxFromSnapshot()
         }
         if pruneNotifications {
             await pruneActivityNotifications()
@@ -334,8 +360,7 @@ struct ContentView: View {
 }
 
 enum NativeAgentActivityNotificationCleaner {
-    /// A missing queue is unavailable; only a successfully read empty queue
-    /// proves that its delivered notifications have resolved.
+    /// Only a successfully read empty queue proves resolution; a missing queue remains unavailable.
     static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord]?, pendingApprovalIDs: Set<String>?) async {
         guard activeInboxItems != nil || pendingApprovalIDs != nil else { return }
         let activeItemIDs = activeInboxItems.map { Set($0.filter { $0.isUnread }.map(\.id)) }
@@ -377,10 +402,7 @@ enum NativeAgentActivityNotificationCleaner {
                 continue
             }
 
-            // A NativeAgent activity notification without an inbox identity
-            // cannot be reconciled once the inbox snapshot is available.
-            // Retaining it via a source-prefix allowlist leaks stale alerts
-            // whenever a new Mac publisher is introduced.
+            // Without inbox identity an activity alert cannot reconcile; source allowlists would retain stale alerts from newly added publishers.
             if activeItemIDs != nil {
                 removeIDs.append(notification.request.identifier)
             }

@@ -6,7 +6,7 @@ import NativeAgentShared
 import SwiftUI
 import UIKit
 
-// Blueprint: | `PhoneSenses.swift` | One opt-in phone sense/setup outbox with pairing-independent opt-out, checked pairing retention and durable signed delivery independent of new-reading admission; wake-only sampling, bounded motion callback and confidence, no coordinate export |
+// Blueprint: | `PhoneSenses.swift` | Opt-in sense outbox; local opt-out, checked pairing and durable delivery; bounded wake-only sampling |
 @MainActor
 final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhoneSenses()
@@ -62,8 +62,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
             do { try await body() }
             catch {
                 errorMessage = "Phone senses are waiting: \(error.localizedDescription)"
-                // Admission can fail at capacity; accepted pending work still
-                // gets its drain and can release capacity through its receipt.
+                // Drain accepted work despite new admission failure so receipts can release outbox capacity.
                 await publishNow()
             }
         }
@@ -84,29 +83,26 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
     private var pairing: String? { AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) }
 
     @discardableResult
-    func set(_ source: PhoneSenseEvent.Source, enabled value: Bool) -> Task<Void, Never> {
-        // Places owns its individual switches.
+    func set(_ source: PhoneSenseEvent.Source, enabled value: Bool, authority: PhoneSettingWrite) -> Task<Void, Never> {
         return enqueue {
             guard source != .places else { throw PhoneLocalSetting.failure("Use the saved place's switch.") }
-            try PhoneSettingWrite.check(raising: value && !self.state.enabled.contains(source))
+            try authority.check(raising: value && !self.state.enabled.contains(source))
             if value {
                 guard self.pairing != nil && iCloudBridge.shared.usesCloudKitDeviceTransport else {
                     self.errorMessage = "Pair this phone with the Mac over CloudKit before sharing a phone sense."; return
                 }
                 try await self.reconcilePairing()
             }
-            // Opting out is local authority: checkpoint it and retire this
-            // source's queue before any pairing-dependent sampling or sending.
+            // Checkpoint local opt-out and retire this source before pairing-dependent sampling or sending.
             try await self.save { state in
-                try PhoneSettingWrite.check(raising: value && !state.enabled.contains(source))
+                try authority.check(raising: value && !state.enabled.contains(source))
                 if value { state.enabled.insert(source) } else { state.enabled.remove(source) }
-                // Keep the source timestamp across off/on. A reading queued
-                // before disabling cannot overwrite its newer disabled event.
+                // Keep source timestamps across toggles so old readings cannot overwrite a newer disabled event.
                 state.pending.removeAll { $0.event.source == source }
             }
-            try PhoneSettingWrite.check(raising: value)
+            try authority.check(raising: value)
             if source == .focus, value {
-                self.requestFocusAuthorization()
+                self.requestFocusAuthorization(authority: authority)
             }
             if source == .motion {
                 self.motionQuery = nil; self.motionDeadline?.cancel(); self.motionDeadline = nil
@@ -118,14 +114,13 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
     }
 
-    /// The system prompt may wait for the person indefinitely. It must not
-    /// hold the settings/sampling queue or prevent switching Focus off.
-    private func requestFocusAuthorization() {
+    /// OS consent may wait indefinitely; it must not hold the sampling/settings queue or block disabling Focus.
+    private func requestFocusAuthorization(authority: PhoneSettingWrite) {
         guard focusAuthorization == nil else { return }
         focusAuthorization = Task {
             defer { focusAuthorization = nil }
             guard enabled.contains(.focus) else { return }
-            do { try PhoneSettingWrite.check(raising: true) }
+            do { try authority.check(raising: true) }
             catch { errorMessage = error.localizedDescription; return }
             let status = await INFocusStatusCenter.default.requestAuthorization()
             if enabled.contains(.focus), status != .authorized {
@@ -138,10 +133,10 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
     var settingControls: [PhoneLocalSetting] {
         PhoneSenseEvent.Source.allCases.filter { $0 != .places }.map { source in
             PhoneLocalSetting(id: "phone.senses.\(source.rawValue)", label: "iPhone \(source.title)", type: "boolean",
-                read: { try self.settingEnabled(source) ? "true" : "false" }, write: { value in
+                read: { try self.settingEnabled(source) ? "true" : "false" }, write: { value, authority in
                     let wanted = try PhoneLocalSetting.boolean(value)
                     if try self.settingEnabled(source) == wanted { return }
-                    await self.set(source, enabled: wanted).value
+                    await self.set(source, enabled: wanted, authority: authority).value
                     guard try self.settingEnabled(source) == wanted else {
                         throw PhoneLocalSetting.failure(self.errorMessage ?? "The phone sense switch did not change.")
                     }
@@ -156,8 +151,7 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
         return enabled.contains(source)
     }
 
-    /// Called by foreground, place, significant-location and existing background push refresh wakes.
-    /// No activity stream, continuous location updates or timer keeps the app alive.
+    /// Sample only on existing wakes; no activity stream, continuous updates or timer may keep the app alive.
     func wake() { enqueue { try await self.sample() } }
 
     private func reconcilePairing() async throws {
@@ -303,7 +297,6 @@ final class PhoneSenses: NSObject, ObservableObject, @preconcurrency CLLocationM
                 self.enqueue {
                     guard self.state.enabled.contains(.motion), self.pairing == key else { return }
                     try await self.record(.motion, value: value, at: end, confidence: reportedConfidence, activityStartedAt: activityTime)
-                    // An explicit enable may just have completed the iOS permission prompt.
                     try await self.record(.motion, value: "setup", setup: self.setup(for: .motion))
                     await self.publishNow()
                 }
@@ -379,11 +372,19 @@ struct PhoneSensesSettings: View {
     var body: some View {
         AliveSection("Phone senses") {
             VStack(alignment: .leading, spacing: 12) {
-                toggle(.motion, "Shares stationary, walking, running, cycling or driving estimates and confidence when this app wakes. Requires Motion & Fitness access.")
-                toggle(.focus, "Shares Focus on, off or unknown with your Mac. iOS does not share its name (such as Sleep or Work). Requires Focus Status access.")
-                toggle(.charging, "Shares charging and whether it is night here. With Motion enabled, your Mac may infer probably asleep; it never treats this as fact.")
+                toggle(.motion,
+                    "Shares stationary, walking, running, cycling or driving estimates and confidence when this app wakes. Requires Motion & Fitness access.")
+                toggle(.focus,
+                    "Shares Focus on, off or unknown with your Mac. iOS does not share its name (such as Sleep or Work). Requires Focus Status access.")
+                toggle(.charging,
+                    "Shares charging and whether it is night here. With Motion enabled, your Mac may infer probably asleep; it never treats this as fact.")
                 otherSenses
-                Text("All start off. These switches explicitly allow the selected summary to travel through your paired iCloud connection to your Mac and the AI provider selected there. Setup state (switch, required permission and missing steps) is shared so your agent can help you. No coordinates are shared by these senses. Always location, if already allowed for Places, also lets significant location changes wake a brief reading. iOS may delay updates; silence means unknown.")
+                Text("""
+                    All start off. These switches explicitly allow the selected summary to travel through your paired iCloud connection to your Mac and the \
+                    AI provider selected there. Setup state (switch, required permission and missing steps) is shared so your agent can help you. No \
+                    coordinates are shared by these senses. Always location, if already allowed for Places, also lets significant location changes wake a \
+                    brief reading. iOS may delay updates; silence means unknown.
+                    """)
                     .font(.footnote).foregroundStyle(AlivePalette.secondary)
                 if let error = senses.errorMessage { Text(error).font(.footnote).foregroundStyle(.red) }
             }.aliveRow()
@@ -392,15 +393,22 @@ struct PhoneSensesSettings: View {
     private var otherSenses: some View {
         Group {
             toggle(.battery, "Shares battery percentage when this app wakes; it never reads battery history.")
-            toggle(.headphones, "Shares whether this app's audio route is headphones, Bluetooth or another route; no device names. Bluetooth does not prove headphones.")
+            toggle(.headphones,
+                "Shares whether this app's audio route is headphones, Bluetooth or another route; no device names. Bluetooth does not prove headphones.")
             toggle(.network, "Shares Wi-Fi, cellular, wired or unavailable from the phone's network path; no network names or addresses.")
-            toggle(.music, "Shares the Music app's playback state and available song title and artist when this app wakes; no audio or listening history. Requires Media & Apple Music access.")
-            toggle(.photos, "Shares only a count of visible photos dated today, including synced or imported photos; Limited Access counts only your selection, never the images.")
+            toggle(.music, """
+                Shares the Music app's playback state and available song title and artist when this app wakes; no audio or listening history. Requires Media \
+                & Apple Music access.
+                """)
+            toggle(.photos, """
+                Shares only a count of visible photos dated today, including synced or imported photos; Limited Access counts only your selection, never the \
+                images.
+                """)
         }
     }
     private func toggle(_ source: PhoneSenseEvent.Source, _ description: String) -> some View {
         VStack(alignment: .leading) {
-            Toggle(source.title, isOn: Binding(get: { senses.enabled.contains(source) }, set: { senses.set(source, enabled: $0) }))
+            Toggle(source.title, isOn: Binding(get: { senses.enabled.contains(source) }, set: { senses.set(source, enabled: $0, authority: .person) }))
             Text(description).font(.footnote).foregroundStyle(AlivePalette.secondary)
         }
     }

@@ -32,7 +32,6 @@ import ChatToolRuntime
 import DreamREMCycle
 import Research
 import TriggerScheduler
-import WorkshopExecution
 import NotificationInbox
 import ScreenVision
 import Dispatcher
@@ -43,13 +42,12 @@ import Connectors
 import Browser
 import SchedulerExecution
 import TrustPersistence
-// Blueprint: | `AppModel.swift` | `AppModel`: app composition and UI/editor state; canonical state derives from engine owners; shared draft/session storage and surface presentation |
+// Blueprint: | `AppModel.swift` | `AppModel`: Composition, shared drafts and owner-derived UI state |
 
 @MainActor
 @Observable
 final class AppModel: Sendable {
-    // Unfinished edits belong to their subject, across every presentation.
-    // Memory only. Never put credentials here; secure fields stay view-local.
+    // Edits belong to their subject across presentations; keep credentials view-local and out of shared drafts.
     private var editDrafts: [String: (value: Any, baseline: Any)] = [:]
 
     func editDraft<Value>(_ subject: String, seed: @autoclosure () -> Value) -> Value {
@@ -64,16 +62,14 @@ final class AppModel: Sendable {
         editDrafts[subject] = (value, editDrafts[subject]?.baseline ?? baseline ?? value)
     }
 
-    /// An accepted save: the draft goes, or, edited again while it saved, it
-    /// now builds on what was saved, so its next merge cannot undo the edit.
+    /// After save, retain only newer edits rebased on the saved generation so a later merge cannot undo them.
     func acceptEditDraft<Value: Equatable>(_ subject: String, submitted: Value, saved: Value) {
         guard let held = editDrafts[subject] else { return }
         if (held.value as? Value) == submitted { editDrafts[subject] = nil }
         else { editDrafts[subject] = (held.value, saved) }
     }
 
-    /// Keep only edits made while this save was in flight, based on the saved
-    /// generation. Carrying the whole old draft would resurrect unrelated fields.
+    /// Carry only edits made during the save; the full old draft would resurrect unrelated fields.
     func acceptEditDraft<Value: Codable & Equatable>(_ subject: String, submitted: Value, rebasingOn saved: Value) throws {
         guard let pending = editDrafts[subject]?.value as? Value else { return }
         if pending == submitted { editDrafts[subject] = nil }
@@ -107,8 +103,7 @@ final class AppModel: Sendable {
         editDrafts.removeValue(forKey: subject)
     }
 
-    /// Global toast/status surface. ContentView draws it in the one NoticeLane and
-    /// any code path can call appModel.systemToasts.push(...).
+    /// Use the shared toast center so feedback appears in the one notice lane.
     let systemToasts = SystemToastCenter()
     private var iCloudAccountToastID: UUID?
 
@@ -128,9 +123,7 @@ final class AppModel: Sendable {
     // Search configuration belongs to the engine; this property only reads its projection.
     var searxngBaseURL: String { engine.configuration.searxngBaseURL }
 
-    /// A credential draft belongs only in the secure field until the user
-    /// explicitly saves it through `telegram/config.json`.  In particular,
-    /// never mirror it into UserDefaults while the user is typing.
+    /// Keep credential drafts in secure fields until explicit save; never mirror typing into UserDefaults.
     var telegramToken: String = ""
 
     var telegramAllowedChats: String = UserDefaults.standard.string(forKey: "telegramAllowedChats") ?? "" {
@@ -145,7 +138,7 @@ final class AppModel: Sendable {
         didSet { UserDefaults.standard.set(telegramRequireMention, forKey: "telegramRequireMention") }
     }
 
-    /// Only an unsaved picker edit is local; saved choices belong to providers.
+    /// Only unsaved picker edits are local; saved choices belong to providers.
     var pendingChatBrainSelection: ProviderTurnChoice?
     var chatModel: String {
         get { pendingChatBrainSelection?.model ?? engine.providers.selection(for: "chat").model }
@@ -182,28 +175,23 @@ final class AppModel: Sendable {
         }
     }
 
-    /// Last checked form values, used only to preserve unsaved UI edits.
+    /// Retain checked form values only to preserve unsaved edits.
     var telegramSettingsDraftBaseline: TelegramSettingsDraftSnapshot?
     @ObservationIgnored let telegramSettingsRead = LatestRead()
-    /// One observer per model; reload write-backs cannot re-enter themselves.
+    /// One observer per model and a re-entry guard prevent reload write-back loops.
     @ObservationIgnored nonisolated(unsafe) var defaultsObserver: NSObjectProtocol?
     @ObservationIgnored var reloadingDefaults = false
 
     var telegramEnabled = false
     var isSavingTelegram = false
-    /// The Telegram settings surface owns this receipt. `statusText` remains
-    /// a cross-app activity line and may be replaced by an unrelated refresh.
+    /// Keep the Telegram receipt separate because unrelated refreshes can replace statusText.
     var telegramSettingsSaveOutcome: TelegramSettingsSaveOutcome?
     var isTestingTelegram = false
     var isClearingTelegramLogs = false
     var telegramClearLogsOutcome: TelegramClearLogsPresentation.Outcome?
-    /// A failed status refresh does not erase the last readable Telegram
-    /// receipt snapshot. The settings surface must mark that snapshot stale
-    /// instead of presenting it as a current read.
+    /// Failed refreshes retain the last readable receipt and mark it stale instead of claiming a current read.
     var telegramStatusRefreshError: String?
-    // The chat opens on the conversation it was left on, so the transcript is
-    // built once, with its own identity, from the first frame; startup still
-    // resolves it against live direct rows and moves only if it is gone.
+    // Build the transcript with its saved identity from the first frame; startup then resolves it against live direct rows.
     var activeChatSessionId: String = UserDefaults.standard.string(forKey: "activeChatSessionId") ?? "" {
         didSet {
             if activeChatSessionId.isEmpty { UserDefaults.standard.removeObject(forKey: "activeChatSessionId") }
@@ -214,7 +202,6 @@ final class AppModel: Sendable {
             NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: true)
         }
     }
-    /// The active session's loaded transcript (`engine.transcripts`).
     var chatMessages: [ChatMessage] { engine.transcripts.messages(for: activeChatSessionId) }
     typealias PanelRefreshStatus = EngineRuntime.PanelRefreshStatus
 
@@ -231,84 +218,69 @@ final class AppModel: Sendable {
         return hasContent ? .content : .empty
     }
 
-    /// Last refresh outcome per sidebar panel. Written only by
-    /// `refreshForSidebarItem`; read by views via `panelStaleNotice(for:)`.
+    /// Only refreshForSidebarItem writes panel outcomes so views share the same freshness receipt.
     var panelRefreshStatus: [SidebarItem: PanelRefreshStatus] = [:]
     @ObservationIgnored var panelRefreshReads: [SidebarItem: LatestRead] = [:]
-    /// Pending scoped reads, counted so overlapping readers keep their signal.
+    /// Count overlapping reads so one completion cannot hide another pending read.
     var panelRefreshCounts: [SidebarItem: Int] = [:]
-    /// Compact readers keep independent freshness from full-page refreshes.
+    /// Compact readers need freshness independent of full-page refreshes.
     var sidebarActivityRefreshStatus: PanelRefreshStatus?
     @ObservationIgnored let sidebarActivityRead = LatestRead()
-    /// A selected saved identity awaiting its live page, never an offscreen read.
+    /// Offscreen reads must not consume a selected identity awaiting its live page.
     var pendingPaletteDestination: PaletteSavedDestination?
+    var pendingMemoryFaceTarget: MemoriesFaceTarget?
     var detachedChatRefreshStatus: [String: PanelRefreshStatus] = [:]
 
-    /// Set by `performLoadChatState` when the chat message/session fetch threw.
-    /// Folded into the `.chat` panel's failed-endpoint list.
+    /// Fold transcript fetch failures into the chat panel's failed-endpoint list.
     var chatStateLoadFailed = false
-    /// The event-driven session-index read failed, so shared Mac projections
-    /// are retaining their last proven rows until the next canonical edge.
+    /// Retain proven session-index rows after failure until the next canonical edge.
     var chatSessionIndexRefreshFailed = false
 
-    /// Either failed session read dims retained sidebar rows.
+    /// Either failed session read must dim retained sidebar rows.
     var chatSidebarSessionListOpacity: Double {
         chatStateLoadFailed || chatSessionIndexRefreshFailed ? 0.55 : 1
     }
 
-    /// Only a successful active-transcript load clears both sidebar failure flags.
+    /// Only a successful active-transcript load may clear both sidebar failure flags.
     func markChatSidebarLoadSucceeded() {
         chatStateLoadFailed = false
         chatSessionIndexRefreshFailed = false
     }
 
     var supportDiagnostics: SupportDiagnostics?
-    /// Support Snapshot tracks its own bounded read independently of Doctor.
+    /// Support Snapshot must not share Doctor's read state.
     var supportDiagnosticsLoading = false
-    var capabilityCatalogSourceSaveInFlight = false
-    /// The live engine owns canonical state; memory pages observe `engine.memory`.
+    /// Observe engine.memory because the live engine owns canonical memory state.
     @ObservationIgnored let engine: NativeAgentEngine
     @ObservationIgnored private let workStatusPublication = WorkStatusPublication()
-    /// The immutable Mac chat client shares the engine’s owners and per-turn effect gates.
+    /// Share engine owners and per-turn effect gates through the immutable Mac client.
     @ObservationIgnored lazy var macChatClient = engine.chatClient(profile: .mac)
-    /// Explicitly publish the persona name after profile loads/saves so memory separates agent and user facts.
+    /// Publish the persona name after profile reads and saves so memory distinguishes agent and user facts.
     func teachMemoryHygieneName(previousName: String?) {
         engine.memory.teachAssistantName(engine.persona.profile)
         if previousName != engine.persona.profile?.name { NativeAgentShortcuts.updateAppShortcutParameters() }
-        // Every sentence about the agent, wherever it is built, speaks in
-        // the persona's name and the chosen pronoun.
+        // Build agent-facing identity from the persona's name and chosen pronoun.
         let name = agentDisplayName
         if !name.isEmpty { AgentVoice.live = AgentVoice.current(name: name) }
     }
-    /// Repeated Tools refresh clicks share one toolbar operation and receipt.
+    /// Repeated Tools refreshes must share one operation and receipt.
     var isRefreshingTools = false
     var toolsRefreshState: ToolsRefreshPresentation.State = .idle
-    var graphSearchResults: [GraphSearchResult] = []
-    @ObservationIgnored let graphSearchRead = LatestRead()
-    @ObservationIgnored let capabilityEvaluationRead = LatestRead()
-    var latestCapabilityTrustEvaluation: CapabilityTrustEvaluation?
-    /// The last action initiated on the Trust surface. Unlike `statusText`, it
-    /// cannot be overwritten by refreshes or work from another surface.
+    /// Keep Trust feedback separate so another surface or refresh cannot overwrite it.
     var trustCenterActionOutcome: TrustCenterActionOutcome?
     var isSavingChatBrain: Bool { engine.providers.isSavingChatBrain }
     var chatProvider: String { pendingChatBrainSelection?.provider ?? engine.providers.selection(for: "chat").provider }
-    enum CapabilityRunStatus { case reported, failed }
-    /// Context and tone for the current status line, set by run-action producers.
-    /// Any other status writer retires this context without inspecting its words.
-    var capabilityRunStatus: CapabilityRunStatus?
+    /// A new status retires the previous raw cause.
     var statusText: String = "Not checked" {
-        didSet { statusCause = nil; capabilityRunStatus = nil }
+        didSet { statusCause = nil }
     }
-    /// The raw error behind a failure `statusText` names in plain words. User's
-    /// screen shows `statusText` only; the agent's tool results read
-    /// `statusForAgent`, which keeps the cause she needs to act on.
+    /// Keep the raw cause in agent-facing results while the user's screen shows the plain status line.
     var statusCause: String?
     var statusForAgent: String {
         UserFacingError.forAgent(statusText, cause: statusCause)
     }
 
-    /// A failure on the status line: the plain line for User, the raw cause
-    /// kept for the agent.
+    /// Preserve the raw cause for the agent while the user sees a plain failure line.
     func setFailureStatus(_ error: Error, action: String) {
         setFailureStatus(UserFacingError.message(error, action: action), cause: error)
     }
@@ -317,18 +289,15 @@ final class AppModel: Sendable {
         statusText = line
         statusCause = error.localizedDescription
     }
-    /// Desk consumes the requested handle once its rows have loaded.
-    var pendingDeskHandle: String?
-    /// The transcript message a link asked the chat to land on (a miss's
-    /// `history:` locator), held the same way until ChatView reveals it.
+    /// Navigation shares the Desk owner's selected identity; the face resolves it when its rows arrive.
+    var pendingDeskHandle: String? {
+        get { engine.desk.faceItem }
+        set { engine.desk.faceItem = newValue }
+    }
+    /// Retain a message locator until ChatView can reveal it.
     var pendingChatMessageID: String?
-    /// True while the Desk page is on screen. ⌘K there opens the one palette
-    /// with the Desk's rows and verbs, so ContentView leaves the press to it.
-    var deskHoldsCommandPalette = false
-    /// Bounded, non-transient receipts for mutations initiated from Tools.
-    /// Unlike `statusText`, repeated identical failures remain distinct rows.
+    /// Retain repeated identical tool failures as distinct bounded receipts rather than transient status.
     var toolOperationStatusReceipts: [ToolOperationStatusReceipt] = []
-    // Refresh failure details exposed to the status surface.
     var lastRefreshError: String? = nil
     @ObservationIgnored let firstRunWelcomeTransaction = FirstRunWelcomeTransaction()
     var chatTurnLifecycleRepairCompleted: Bool {
@@ -337,7 +306,7 @@ final class AppModel: Sendable {
     }
     var chatSelectionGeneration = 0
 
-    /// Normalized persona selection persists through PersonaSelection and notifies context flow.
+    /// Persist persona selection through its owner so context flow is notified.
     var chatPersona: String = {
         let saved = PersonaSelection.current()
         return NativeChatTurnOptions.normalizedPickerPersona(saved)
@@ -356,14 +325,12 @@ final class AppModel: Sendable {
     }
     var agentDisplayName: String { engine.persona.displayName }
 
-    /// Address and display names share the persona owner's availability.
+    /// Address and display names must share the persona owner's availability.
     var agentAddressName: String { agentDisplayName }
     var isLoadingSkillManifests = false
     var skillManifestError: String?
-    /// Event-identified feedback for the mounted Skill Lifecycle banner/toast.
     var skillLifecycleFeedback: SkillLifecycleFeedback?
 
-    /// The miss ledger, this week and last: the Self-Improvement page's first section.
     var missLessons: [MemoryMissLesson] = []
     @ObservationIgnored let missLessonsRead = LatestRead()
     var dreamError: String?
@@ -374,8 +341,11 @@ final class AppModel: Sendable {
     @ObservationIgnored var chatComposerDrafts: [String: ChatComposerDraft] = [:]
     var chatPendingAttachments: [String: [MultimodalAttachment]] = [:]
 
-    /// ContentView holds the requested section across navigation; Today consumes and clears it on appear.
+    /// Retain the requested section across navigation until Today consumes it.
     var pendingActivitySectionRaw: String? = nil
+    var diagnosticsRunID: String?
+
+    @ObservationIgnored private var settingsFaceUpdates: SettingsFaceUpdates?
 
     deinit {
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
@@ -383,6 +353,8 @@ final class AppModel: Sendable {
 
     init() {
         self.engine = .live
+        settingsFaceUpdates = SettingsFaceUpdates(self)
+        bindDiagnosticsFace()
         engine.bindResidentPresentation(
             publishWorkStatus: { [weak self] in await self?.publishWorkStatus() },
             policyChanged: { [weak self] in
@@ -396,8 +368,7 @@ final class AppModel: Sendable {
             }
         )
         Task { @MainActor in await self.refreshProviderPresentation() }
-        // Every Desk write in this process re-reads the overview, so a new
-        // owner wait counts and pushes whether or not phone sync is on.
+        // Re-read Desk after every local write so owner waits publish even with phone sync off.
         Task { [weak self] in
             for await change in StoreChangeBus.shared.changes() where change.store == .desk {
                 guard let self else { return }
@@ -416,7 +387,7 @@ final class AppModel: Sendable {
     var refreshAllFailureDetails: [String] = []
     var isRecordingRefreshAllFailures = false
 
-    /// Record labeled refresh failures before returning nil.
+    /// Record the labeled failure before returning nil.
     @MainActor
     func decodeLogged<T>(_ label: String, _ fetch: () async throws -> T) async -> T? {
         do {
@@ -450,5 +421,32 @@ extension AppModel {
                     WidgetCenter.shared.reloadTimelines(ofKind: NativeAgentWidgetSnapshot.kind)
                 }
             })
+    }
+}
+
+// MARK: - Diagnostics face
+
+extension AppModel {
+    @MainActor func bindDiagnosticsFace() {
+        engine.bindDiagnosticsFace { [weak self] action, checkID in
+            guard let self else { throw PartCallError(code: "unattached", message: "Reopen NativeAgent to use Diagnostics.") }
+            if action == "doctor.support_report" {
+                switch await loadSupportDiagnostics() {
+                case .unavailable(let reason): throw PartCallError(code: "support_unavailable", message: reason)
+                case .loaded(let report, _):
+                    return "Support report: \(report.app) \(report.version), health \(report.doctorStatus ?? "unknown"), made \(report.generatedAt)."
+                        + " Ask me to export a support bundle for a file to send the developer."
+                }
+            }
+            let repair = action == "doctor.repair"
+            switch await runDoctor(repair: repair, repairScope: .button, checkID: checkID) {
+            case .unavailable(let reason): throw PartCallError(code: "doctor_unavailable", message: reason)
+            case .completed:
+                guard let report = engine.doctor.report else {
+                    throw PartCallError(code: "report_unavailable", message: "The completed run has no report. Run checks again.")
+                }
+                return repair ? DoctorFacade.repairCompletionMessage(report: report) : nil
+            }
+        }
     }
 }

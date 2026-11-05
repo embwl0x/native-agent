@@ -10,15 +10,11 @@ actor AsyncSerialQueue {
     private var tail: Task<Void, Never> = Task {}
 
     func run<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) async throws -> T {
-        // Capture the current tail, install ourselves as the new tail.
         let prev = tail
-        // Create a task that waits for `prev` and then runs `body`.
-        // The next caller will see this Task as their `prev`.
         let me = Task { () -> Result<T, Error> in
             await prev.value
             do {
-                // Waiting for the predecessor does not observe cancellation.
-                // A canceled queued refresh must never enter its body.
+                // A canceled queued refresh must not run; waiting for its predecessor does not observe cancellation.
                 try Task.checkCancellation()
                 let v = try await body()
                 return .success(v)
@@ -26,9 +22,9 @@ actor AsyncSerialQueue {
                 return .failure(error)
             }
         }
-        // Erase the typed result so the tail chain stays Task<Void, Never>.
+        // Erase the result to keep the shared tail Task<Void, Never>.
         tail = Task { _ = await me.value }
-        // Forward caller cancellation to the queued refresh.
+        // Caller cancellation must reach the queued refresh.
         let result = await withTaskCancellationHandler {
             await me.value
         } onCancel: {

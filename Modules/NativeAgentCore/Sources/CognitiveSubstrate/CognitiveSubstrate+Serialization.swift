@@ -1,10 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Serialization.swift` | `CognitiveArtifactCodec` validates present fields and nested evidence before restore projections; current episode, proposal, timeline and reflection codecs; `cleanedSessionId` |
+// Blueprint: | `CognitiveSubstrate+Serialization.swift` | `CognitiveArtifactCodec`, `cleanedSessionId`: checked evidence decoding |
 
-/// Validate present evidence before any optional projection can discard it.
-/// Missing optional evidence remains unknown; malformed evidence refuses restore.
+/// Validate present evidence before any optional projection can discard it. Missing optional evidence remains unknown; malformed evidence refuses restore.
 enum CognitiveArtifactCodec {
     struct FieldFailure: Error, CustomStringConvertible {
         let path: String
@@ -24,7 +23,8 @@ enum CognitiveArtifactCodec {
         case "episode": required = ["evidenceNodeIds", "externalEvidenceIds", "lineageId"]
         case "schema_proposal": required = ["confidence", "evidenceNodeIds", "externalEvidenceIds", "lineageId"]
         case "developmental_timeline": required = ["lineageId", "subjectId", "instanceId", "forkMetadata", "externalEvidenceIds"]
-        case "reflection_receipt": required = ["requestSourceNodeIds", "requestSourcePeerIds", "requestMaterial", "judgment", "cancelled", "dispositionSaveFailed", "estimatedPromptTokens", "estimatedResultTokens", "estimatedCostUnits", "proposalIds"]
+        case "reflection_receipt": required = ["requestSourceNodeIds", "requestSourcePeerIds", "requestMaterial", "judgment", "cancelled",
+            "dispositionSaveFailed", "estimatedPromptTokens", "estimatedResultTokens", "estimatedCostUnits", "proposalIds"]
         default: required = []
         }
         for key in required where object[key] == nil { throw FieldFailure(path: family + "." + key + " (missing)") }
@@ -224,13 +224,11 @@ extension CognitiveAffectState {
             "updatedAt": .double(updatedAt.timeIntervalSince1970),
         ]
         if lived > 0 {
-            // JSONValue's integer is signed; keep the full watermark when it
-            // does not fit, rather than trapping or lowering the proof.
+            // JSONValue's integer is signed; keep the full watermark when it does not fit, rather than trapping or lowering the proof.
             object["lived"] = Int64(exactly: lived).map(JSONValue.int) ?? .string(String(lived))
         }
-        // These are temporal anchors for the existing analytic quiet-time
-        // projection, not a second affect owner. Optional anchors remain absent
-        // when no corresponding presence has been observed.
+        // These are temporal anchors for the existing analytic quiet-time projection, not a second affect owner. Optional anchors remain absent when no
+        // corresponding presence has been observed.
         if let lastUserPresenceAt {
             object["lastUserPresenceAt"] = .double(lastUserPresenceAt.timeIntervalSince1970)
         }
@@ -408,7 +406,7 @@ extension CognitiveReflectionReceipt {
             catch { return nil }
         } else {
             guard object["careIntegrationPending"] != .bool(true) else { return nil }
-            requestCares = [] // Existing integrated receipts never owed a target lookup.
+            requestCares = [] // Completed receipts need no target lookup.
         }
         let request = CognitiveReflectionRequest(
             reason: reason,
@@ -418,7 +416,7 @@ extension CognitiveReflectionReceipt {
             provider: requestProvider,
             reasoningEffort: reasoningEffort,
             requestedAt: requestedAt,
-            // Historical receipts without frozen evidence retain an empty set.
+            // Absent frozen evidence stays empty rather than being reconstructed.
             sourceNodeIds: object["requestSourceNodeIds"]?.arrayValue?.compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) } ?? [],
             sourcePeerIds: {
                 guard case .array(let rows)? = object["requestSourcePeerIds"],

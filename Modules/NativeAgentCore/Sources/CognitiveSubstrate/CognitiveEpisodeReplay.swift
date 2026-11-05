@@ -173,8 +173,7 @@ public struct CognitiveReplayIntegrationInput: Sendable, Equatable {
     public var reason: String
     public var dreamEntries: [CognitiveDreamReplayReference]
     public var remProposals: [CognitiveREMProposalReference]
-    /// Evidence the reader could not read, each with its cause: the lists
-    /// above are what was read, not the whole past.
+    /// Evidence the reader could not read, each with its cause: the lists above are what was read, not the whole past.
     public var unavailableEvidence: [String]
 
     public init(

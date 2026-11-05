@@ -17,7 +17,6 @@ import ChatToolParsing
 import TrustCenter
 import ToolRegistry
 import DreamREMCycle
-import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
@@ -38,6 +37,7 @@ extension ApprovalExecution {
         var executed = 0
         for record in records
         where record.action.hasPrefix("connector.action.") && record.executedAction == nil {
+            // Reconciliation is record-only; no caller turn exists here.
             _ = await client.applyResolvedConnectorAction(from: record, dataRoot: dataRoot)
             executed += 1
         }
@@ -68,9 +68,8 @@ extension ApprovalExecution {
             input: input
         )
     }
-    /// Execute the exact bounded connector input carried by the approval. The
-    /// return value controls visible-card archival: an uncertain or refused
-    /// effect stays visible instead of presenting an approved card as done.
+    /// Execute the exact bounded connector input carried by the approval. The return value controls visible-card archival: an uncertain or refused effect stays
+    /// visible instead of presenting an approved card as done.
     func applyResolvedConnectorAction(
         from record: ApprovalRecord,
         dataRoot: URL
@@ -82,7 +81,8 @@ extension ApprovalExecution {
         if let retained = owners.settlement(root: dataRoot, approvalID: record.id) {
             receiptOwnsRelease = true
             guard case .success = await settleApprovalExecution(record.id, dataRoot: dataRoot, settlement: retained) else { return false }
-            return ChatToolOutcome.exactResultClass(retained.action) == .succeeded
+            let reply = ToolResult(retained.action)
+            return reply.outcome == .succeeded
         }
         guard record.status == "resolved", let decision = record.decision else { return false }
         guard decision == "approved" else {
@@ -152,12 +152,14 @@ extension ApprovalExecution {
         let settlement: ApprovalExecutionOwners.Settlement
         let succeeded: Bool
         do {
+            let turn = await approvedEffectTurn(from: record)
             let receipt = try await effects.runConnectorAction(
                 descriptor: descriptor,
                 dryRun: false,
                 input: replay.input,
                 approvedReplayApprovalID: record.id,
-                dataRoot: dataRoot
+                dataRoot: dataRoot,
+                turn: turn
             )
             settlement = .init(action: .object([
                     "op": .string("connector_action_replay"),
@@ -167,7 +169,8 @@ extension ApprovalExecution {
                 ]),
                 detail: "Connector action \(replay.actionID) finished after approval with status \(receipt.status)."
             )
-            succeeded = ChatToolOutcome.exactResultClass(.object(["status": .string(receipt.status)])) == .succeeded
+            let reply = ToolResult(.object(["status": .string(receipt.status)]))
+            succeeded = reply.outcome == .succeeded
         } catch {
             settlement = .init(action: .object([
                     "op": .string("connector_action_replay"),

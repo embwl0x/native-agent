@@ -6,36 +6,18 @@ import Vision
 #endif
 
 // MARK: - ELEMENT LAYER (c): saliency
-//
-// `VNGenerateAttentionBasedSaliencyImageRequest` ranks and adds pixel candidates:
-//   1. RANK: a colour region or text band the attention map also lights up is
-//      more likely to be a thing a human would reach for. It raises `target`
-//      confidence — never `role`, because saliency knows nothing about what a
-//      region IS.
-//   2. ADD: salient boxes that neither colour nor text found become candidates
-//      in their own right, with LOW role confidence (AXUnknown) — this is the
-//      only layer that can see a non-text iconic control.
+// Saliency may improve target confidence but knows no semantic role; saliency-only candidates therefore remain low-confidence AXUnknown.
 
 public enum VisionSaliencyLayer {
-    /// A candidate overlapping a salient box by at least this IoU is "seen by
-    /// saliency" and gets the rank boost.
+    /// Overlap establishes corroboration for the target-rank boost.
     private static let matchIoU: Double = 0.25
-    /// A salient box smaller/larger than these fractions of frame area is not
-    /// offered as a new candidate (a speck, or the whole window).
+    /// Exclude specks and whole-window saliency boxes from new candidates.
     private static let minAreaFraction: Double = 0.0004
     private static let maxAreaFraction: Double = 0.35
-    /// At most this many saliency-only candidates. Attention maps are blobby;
-    /// an unbounded add would swamp the precise candidates with vague ones.
+    /// Bound vague saliency additions so they cannot swamp more precise candidates.
     private static let maxAdded: Int = 8
 
-    /// Attention bounds are deliberately soft. A glow, shadow, or focus halo
-    /// can make the saliency box several times larger than the precise colour
-    /// region at its centre, leaving their IoU below the ordinary overlap
-    /// threshold even though both layers saw the same physical object.
-    ///
-    /// Accept tight, centre-aligned containment as corroboration, but cap the
-    /// area ratio so a broad panel cannot swallow a distinct control merely
-    /// because the control happens to sit inside it.
+    /// Soft halos may contain precise colour cores despite low IoU; require aligned centres and bounded area ratio to avoid merging panels.
     static func corroborates(
         _ salient: VisionRect,
         _ candidate: VisionRect
@@ -52,7 +34,7 @@ public enum VisionSaliencyLayer {
             && dy <= max(smaller.h, 1) * 0.5
     }
 
-    /// Rank existing candidates and add the ones only saliency saw.
+    /// Preserve precise candidates while adding evidence only saliency sees.
     public static func fold(
         salient: [(rect: VisionRect, score: Double)],
         into candidates: [VisionCandidate],
@@ -81,9 +63,7 @@ public enum VisionSaliencyLayer {
                 corroborates(region.rect, $0.rect)
             }
             if covered { continue }
-            // Saliency bounds are BLOBBY — the attention map is coarse and the
-            // box is a heat-region, not an edge. 0.35 is the honest number and
-            // it is why these rows will rarely clear an act's target bar.
+            // Heat-map bounds are coarse rather than real edges; 0.35 confidence prevents them from claiming precise action geometry.
             ranked.append(VisionCandidate(
                 rect: region.rect,
                 sources: [.saliency],
@@ -111,7 +91,7 @@ public struct VisionKitSalienceProvider: Sendable {
         let height = Double(image.height)
         return objects.map { object in
             let box = object.boundingBox
-            // Normalized, bottom-left origin → top-left image pixels.
+            // Convert normalized bottom-left coordinates once into top-left image pixels.
             let rect = VisionRect(
                 x: Double(box.minX) * width,
                 y: (1 - Double(box.maxY)) * height,

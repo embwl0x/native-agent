@@ -4,14 +4,13 @@ import PersistenceCore
 import StandingBots
 // Blueprint: | `AgentConversationRouting.swift` | `AgentConversationRouting` enum; `route`, `wrap` |
 
-/// Argument translation only. Callers must dispatch through the original tool's
-/// admission and execution owners; this type grants no authority or tool access.
+/// Argument translation only. Callers must dispatch through the original tool's admission and execution owners; this type grants no authority or tool access.
 public enum AgentConversationRouting {
     /// Security reads the same checked contact and recipe owners as dispatch.
-    public static func messagesHostByCommand(_ raw: String, dataRoot: URL) throws -> Bool {
+    public static func messagesHostByCommand(conversation: AgentConversationContext, _ raw: String, dataRoot: URL) throws -> Bool {
         let input: [String: JSONValue] = ["agent": .string(raw)]
-        if HelperContact.matches(input) { return false }
-        let named = try namingSavedContact("agent_message", input, dataRoot: dataRoot)
+        if HelperContact.matches(conversation: conversation, input) { return false }
+        let named = try namingSavedContact(conversation: conversation, "agent_message", input, dataRoot: dataRoot)
         guard let agent = named["agent"]?.stringValue, !agent.isEmpty else { throw invalid("Name the contact to classify its effects.") }
         if agent.hasPrefix("bot:") {
             guard let id = UUID(uuidString: String(agent.dropFirst(4))),
@@ -33,7 +32,8 @@ public enum AgentConversationRouting {
         guard let host = peer.endpoint.host, !host.isEmpty else { throw invalid("The contact's host recipe identity is missing.") }
         let launch = try AgentRecipeStore.launch(host, dataRoot: dataRoot)
         if peer.transport == .acp {
-            guard launch.acp != nil else { throw invalid("The addressed ACP recipe has no ACP launch declaration. Repair agents/recipes/\(host).json before sending.") }
+            guard launch.acp != nil else { throw invalid(
+                "The addressed ACP recipe has no ACP launch declaration. Repair agents/recipes/\(host).json before sending.") }
             return true
         }
         return launch.commandLine != nil
@@ -56,8 +56,9 @@ public enum AgentConversationRouting {
         public var errorDescription: String? { message }
     }
 
-    public static func namingSavedContact(_ tool: String, _ input: [String: JSONValue], dataRoot: URL?) throws -> [String: JSONValue] {
-        if tool == "agent_message", HelperContact.matches(input) { return input }
+    public static func namingSavedContact(conversation: AgentConversationContext, _ tool: String, _ input: [String: JSONValue],
+        dataRoot: URL?) throws -> [String: JSONValue] {
+        if tool == "agent_message", HelperContact.matches(conversation: conversation, input) { return input }
         guard ["agent_message", "agent_read", "agent_cancel"].contains(tool), let dataRoot,
               case .string(let raw)? = input["agent"], !raw.contains(":") else { return input }
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -75,102 +76,63 @@ public enum AgentConversationRouting {
         return input
     }
 
-    public static func route(tool: String, input: [String: JSONValue], dataRoot: URL? = nil) throws -> Route? {
-        if tool == "agent_message", HelperContact.matches(input) { return nil }
+    public static func route(conversation: AgentConversationContext, tool: String, input: [String: JSONValue]) throws -> Route? {
+        if tool == "agent_message", HelperContact.matches(conversation: conversation, input) { return nil }
         guard tool == "agent_message" || tool == "agent_read" else { return nil }
         if let details = input["details"], details != .null {
             guard tool == "agent_read", case .bool = details else { throw invalid("details is a boolean for agent_read only.") }
         }
-        let optional: Set<String> = ["conversation_id", "message_id", "task_id", "options", "limit", "offset", "max_chars"]
+        let optional: Set<String> = ["conversation_id", "message_id", "task_id", "limit", "offset", "max_chars"]
         let input = input.filter { $0.key != "details" && !(optional.contains($0.key) && ($0.value == .string(""))) }
         let sending = tool == "agent_message"
         let allowed: Set<String> = sending
-            ? ["agent", "text", "conversation_id", "message_id", "options", "expects_reply", "session_id", "__session_id"]
+            ? ["agent", "text", "conversation_id", "message_id", "expects_reply", "session_id", "__session_id"]
             : ["agent", "conversation_id", "message_id", "limit", "offset", "session_id", "__session_id"]
-        let raw = try string(input["agent"], field: "agent", maximum: 180)
-        let agent = raw
-        let door = try dataRoot.flatMap { try AgentConversationDelivery.door(for: agent, dataRoot: $0) }
-        if door != nil, AgentRecipeStore.dryRun { return nil }
+        let agent = try string(input["agent"], field: "agent", maximum: 180)
         if agent.hasPrefix("peer:") {
             guard UUID(uuidString: String(agent.dropFirst(5))) != nil else { throw invalid("peer reference must contain a UUID.") }
-            if !sending || door == nil { return nil } // The selected recipe retains its own owner.
+            return nil // The selected recipe retains its own owner.
         }
         try keys(input, allowed: allowed)
-        let botID: UUID?
-        if agent.hasPrefix("bot:") {
-            guard let id = UUID(uuidString: String(agent.dropFirst(4))) else { throw invalid("bot reference must contain a UUID.") }
-            botID = id
-        } else {
-            guard door != nil else { throw invalid("No contact is named '\(raw)'. Use a name exactly as agent_contacts shows it.") }
-            botID = nil
-        }
-        let canonical = botID.map { "bot:" + $0.uuidString } ?? agent
+        guard agent.hasPrefix("bot:") else { throw invalid("No contact is named '\(agent)'. Use a name exactly as agent_contacts shows it.") }
+        guard let botID = UUID(uuidString: String(agent.dropFirst(4))) else { throw invalid("bot reference must contain a UUID.") }
+        let canonical = "bot:" + botID.uuidString
         let conversation = try optionalString(input["conversation_id"], field: "conversation_id", maximum: 512)
         let message = try optionalString(input["message_id"], field: "message_id", maximum: 160)
-        if let botID, let conversation {
+        if let conversation {
             guard conversation.hasPrefix("bot:"), UUID(uuidString: String(conversation.dropFirst(4))) == botID else {
                 throw invalid("conversation_id must identify this same bot; use its bot:<UUID> handle.")
             }
         }
-        // These are harness context, not the remote conversation or bot session.
-        // Preserve even malformed values for the existing admission owner to reject.
+        // These are harness context, not the remote conversation or bot session. Preserve even malformed values for the existing admission owner to reject.
         var args = input.filter { ["session_id", "__session_id"].contains($0.key) }
         if sending {
             let text = try string(input["text"], field: "text", maximum: 100_000)
-            let options: [String: JSONValue]
-            if let supplied = input["options"] {
-                guard case .object(let object) = supplied else { throw invalid("options must be an object.") }
-                options = object.filter { $0.value != .string("") }
-            } else { options = [:] }
-            if let botID {
-                guard options.isEmpty, message == nil else { throw invalid("Bot messages do not support options or caller-supplied message_id; read the returned shelf entry without replaying the ask.") }
-                args["id"] = .string(botID.uuidString)
-                args["question"] = .string(text)
-                return Route(tool: "bot_ask", input: args, agent: canonical)
-            }
-            guard let door else { throw invalid("No saved inbox door for this contact.") }
-            try validate(options: options, allowed: door.options, continuing: conversation != nil)
-            args.merge(options) { _, new in new }
-            args["text"] = .string(text)
-            args["conversation_mode"] = .string(conversation == nil ? "new" : "resume")
-            if let conversation { args["conversation_id"] = .string(conversation) }
-            if let message { args["message_id"] = .string(message) }
-            // Only a live inbox reader selects its door from this field;
-            // command inbox executors already own their recipient.
-            if door.liveReader { args["agent"] = .string(door.handle) }
-            if door.liveReader, let expects = input["expects_reply"], case .bool = expects { args["expects_reply"] = expects }
-            return Route(tool: door.tool, input: args, agent: canonical)
+            guard message == nil else { throw invalid(
+                "Bot messages do not support a caller-supplied message_id; read the returned shelf entry without replaying the ask.") }
+            args["id"] = .string(botID.uuidString)
+            args["question"] = .string(text)
+            return Route(tool: "bot_ask", input: args, agent: canonical)
         }
-        if let botID {
-            guard input["offset"] == nil else { throw invalid("Bot shelf pagination uses an opaque cursor; offset is unsupported.") }
-            if let message {
-                guard let id = UUID(uuidString: message) else { throw invalid("A bot message_id must be the exact returned shelf entry UUID.") }
-                guard input["limit"] == nil else { throw invalid("limit does not apply to an exact bot message.") }
-                args["id"] = .string(id.uuidString)
-                args["bot_id"] = .string(botID.uuidString)
-                return Route(tool: "shelf_entry", input: args, agent: canonical)
-            }
-            if let limit = input["limit"] {
-                args["id"] = .string(botID.uuidString)
-                args["limit"] = try integer(limit, field: "limit", range: 1...100)
-                return Route(tool: "shelf_read", input: args, agent: canonical)
-            }
-            // Opening a bot conversation should show its latest actual reply,
-            // not an unread index that disappears after being acknowledged.
+        guard input["offset"] == nil else { throw invalid("Bot shelf pagination uses an opaque cursor; offset is unsupported.") }
+        if let message {
+            guard let id = UUID(uuidString: message) else { throw invalid("A bot message_id must be the exact returned shelf entry UUID.") }
+            guard input["limit"] == nil else { throw invalid("limit does not apply to an exact bot message.") }
+            args["id"] = .string(id.uuidString)
             args["bot_id"] = .string(botID.uuidString)
             return Route(tool: "shelf_entry", input: args, agent: canonical)
         }
-        guard conversation == nil else { throw invalid("Coding-agent reads currently require message_id without conversation_id; conversation filtering is not supported by delegation_status.") }
-        args["agent"] = .string(agent)
-        args["detail"] = .string("full")
-        if let message { args["message_id"] = .string(message) }
-        if let limit = input["limit"] { args["limit"] = try integer(limit, field: "limit", range: 1...12) }
-        if let offset = input["offset"] { args["offset"] = try integer(offset, field: "offset", range: 0...Int64.max) }
-        return Route(tool: "delegation_status", input: args, agent: canonical)
+        if let limit = input["limit"] {
+            args["id"] = .string(botID.uuidString)
+            args["limit"] = try integer(limit, field: "limit", range: 1...100)
+            return Route(tool: "shelf_read", input: args, agent: canonical)
+        }
+        // Use the latest actual reply because acknowledging an unread index removes it.
+        args["bot_id"] = .string(botID.uuidString)
+        return Route(tool: "shelf_entry", input: args, agent: canonical)
     }
 
-    /// Keep the complete owner receipt and its lifecycle. Request identities are
-    /// not substituted for missing acknowledgement identities.
+    /// Keep the complete owner receipt and its lifecycle. Request identities are not substituted for missing acknowledgement identities.
     public static func wrap(result: JSONValue, route: Route, input: [String: JSONValue] = [:]) -> JSONValue {
         var object: [String: JSONValue]
         if case .object(let receipt) = result { object = receipt }
@@ -191,7 +153,7 @@ public enum AgentConversationRouting {
                                      conversation: object["conversation_id"], task: nil) {
             object["read_with"] = locator
         }
-        if ["delegation_status", "shelf_read", "shelf_entry"].contains(route.tool) {
+        if ["shelf_read", "shelf_entry"].contains(route.tool) {
             return AgentConversationView.read(.object(object), agent: route.agent, input: input)
         }
         return .object(object)
@@ -213,21 +175,6 @@ public enum AgentConversationRouting {
             }
         } else { return nil }
         return .object(["tool": .string("agent_read"), "input": .object(input)])
-    }
-
-    package static func validate(options: [String: JSONValue], allowed: Set<String>, continuing: Bool) throws {
-        try keys(options, allowed: allowed)
-        if continuing, options["working_directory"] != nil || options["topic"] != nil {
-            throw invalid("A continuation reuses its existing workspace and topic; omit those options.")
-        }
-        for (key, value) in options {
-            switch key {
-            case "fast", "pair_reviewer":
-                guard case .bool = value else { throw invalid("\(key) must be boolean.") }
-            case "timeout_seconds": _ = try integer(value, field: key, range: 60...3600)
-            default: _ = try string(value, field: key, maximum: key == "working_directory" ? 4096 : 200)
-            }
-        }
     }
 
     private static func keys(_ input: [String: JSONValue], allowed: Set<String>) throws {

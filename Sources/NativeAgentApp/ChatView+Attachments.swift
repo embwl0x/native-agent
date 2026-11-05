@@ -9,7 +9,7 @@ import ScreenVision
 // Blueprint: | `ChatView+Attachments.swift` | `ChatView`: `endDictation`, `toggleVoice`, `captureScreen` |
 
 extension ChatView {
-    /// Stop recognition without writing into the newly selected conversation's composer.
+    /// Ending dictation must not write into a newly selected conversation.
     func endDictation() {
         voiceSessionId = ""
         voiceDraftBeforeListening = ""
@@ -61,7 +61,7 @@ extension ChatView {
             return
         }
         guard !isCapturing else { return }
-        // Screenshot sends share the send latch because admission suspends before marking the session busy.
+        // Share the send latch because screenshot admission suspends before marking the session busy.
         guard !isSubmittingSend else { return }
         guard appModel.engine.trust.policy?.multimodalPolicy?.screen_capture == true else {
             showToast("Enable screen capture in Trust → Features → Multimodal")
@@ -88,15 +88,13 @@ extension ChatView {
                 }
                 return true
             }, submit: { prompt, attachments in
-                scrollCoordinator.forceFollow()
-                return await appModel.startActiveChatTurn(
+                await appModel.startActiveChatTurn(
                     prompt, attachments: attachments, expectedSessionId: captureSessionId)
             }, accepted: { acceptedSessionId in
                 guard acceptedSessionId == captureSessionId,
                       appModel.activeChatSessionId == acceptedSessionId,
                       draftSessionId == acceptedSessionId else { return }
                 transcriptLatestRequest &+= 1
-                scrollCoordinator.forceFollow()
                 if captured.clearIfUnchanged(appModel: appModel, draft: draft, attachments: &pendingAttachments) {
                     endDictation()
                 }
@@ -109,7 +107,6 @@ extension ChatView {
                       revision: voiceDraftRevision)
     }
 
-    /// Prefer a copied image; otherwise let the person choose files.
     func attachFromClipboardOrPickFile() {
         let destination = appModel.activeChatSessionId
         ChatAttachmentTypeResolver.attachFromClipboardOrPickFile(
@@ -120,7 +117,7 @@ extension ChatView {
         )
     }
 
-    /// Picker, paste and drop share the same bounded file intake.
+    /// Share bounded intake across picker, paste and drop.
     func attachLocalFile(_ url: URL, sessionId: String) {
         ChatAttachmentTypeResolver.attachLocalFile(
             url,

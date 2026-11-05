@@ -1,11 +1,9 @@
 import Foundation
 
-// Blueprint: | `ProviderCallEvidence.swift` | Payload-free provider lifecycle events and observation, learned first-output deadlines and request input-byte evidence |
+// Blueprint: | `ProviderCallEvidence.swift` | Provider lifecycle evidence and learned first-output deadlines |
 
-/// Payload-free evidence emitted by the shared provider router around one real
-/// adapter invocation. The call id is minted before the adapter starts and is
-/// reused for its terminal phase, so the organism can predict an outcome before
-/// observing it instead of inferring provider health after the fact.
+/// Payload-free evidence emitted by the shared provider router around one real adapter invocation. The call id is minted before the adapter starts and is
+/// reused for its terminal phase, so the organism can predict an outcome before observing it instead of inferring provider health after the fact.
 public enum LLMCallLifecyclePhase: String, Sendable, Equatable {
     case started
     case succeeded
@@ -21,20 +19,16 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
     public let surface: String
     public let sessionId: String?
     public let turnId: String?
-    /// Exact request-scoped reasoning effort presented to the shared provider
-    /// router. This is payload-free lifecycle evidence, not a quality claim.
+    /// Exact request-scoped reasoning effort presented to the shared provider router. This is payload-free lifecycle evidence, not a quality claim.
     public let reasoningEffort: String?
     public let streaming: Bool
     public let occurredAt: Date
-    /// A terminal call's first text or tool output in milliseconds from its
-    /// request, as the adapter stamped it on the call's `llm.call` row.
+    /// A terminal call's first text or tool output in milliseconds from its request, as the adapter stamped it on the call's `llm.call` row.
     public let firstOutputMs: Int?
-    /// A terminal streamed call's `LLMMessagesStreamKind` raw value; nil when
-    /// it did not come through `streamMessages`.
+    /// A terminal streamed call's `LLMMessagesStreamKind` raw value; nil when it did not come through `streamMessages`.
     public let streamKind: String?
     /// The stream guard cut this call (`ProviderFailure.noReply`).
     public let noReply: Bool
-    /// What the request asked the provider to read (`LLMMessage.inputBytes`).
     public let requestBytes: Int?
 
     public init(
@@ -95,22 +89,18 @@ public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
 
 public protocol LLMCallLifecycleObserving: Sendable {
     func observeProviderCall(_ event: LLMCallLifecycleEvent) async
-    /// Asked once as a stream starts: how long this provider has taken to its
-    /// first output on this model and stream kind, for a request this size.
+    /// Asked once as a stream starts: how long this provider has taken to its first output on this model and stream kind, for a request this size.
     func firstOutputDeadline(provider: String, model: String, streamKind: String?, requestBytes: Int) async -> FirstOutputDeadline
 }
 
-/// A provider's slowest first output (text, thinking or tool, the adapter's `ttftMs`)
-/// over its retained streamed calls. Below `callsNeeded` calls the slowest is
-/// not yet evidence and the deadline is unmeasured.
+/// A provider's slowest first output (text, thinking or tool, the adapter's `ttftMs`) over its retained streamed calls. Below `callsNeeded` calls the slowest
+/// is not yet evidence and the deadline is unmeasured.
 public struct FirstOutputDeadline: Sendable, Equatable {
     public static let callsNeeded = 100
     public let calls: Int
     public let slowest: TimeInterval?
-    /// The slowest first output per input byte among those calls: what reading
-    /// (upload and prefill) has cost this provider at its worst.
+    /// The slowest first output per input byte among those calls: what reading (upload and prefill) has cost this provider at its worst.
     public let slowestPerByte: Double?
-    /// This request's input bytes.
     public let requestBytes: Int
 
     public init(calls: Int, slowest: TimeInterval?, slowestPerByte: Double? = nil, requestBytes: Int = 0) {
@@ -134,8 +124,7 @@ public struct FirstOutputDeadline: Sendable, Equatable {
 }
 
 extension LLMMessage {
-    /// Text presented to this request, in characters. Image encoding is not
-    /// text; its token cost remains part of the provider's reported input.
+    /// Text presented to this request, in characters. Image encoding is not text; its token cost remains part of the provider's reported input.
     public static func inputCharacters(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema]) -> Int {
         (system?.count ?? 0) + tools.reduce(0) {
             $0 + $1.name.count + $1.description.count + String(decoding: $1.parametersJSON, as: UTF8.self).count
@@ -150,8 +139,7 @@ extension LLMMessage {
             }
         }
     }
-    /// What a request asks the provider to read, in bytes as sent: the system
-    /// prompt, every block (an image as its base64) and the tool schemas.
+    /// What a request asks the provider to read, in bytes as sent: the system prompt, every block (an image as its base64) and the tool schemas.
     public static func inputBytes(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema] = []) -> Int {
         (system?.utf8.count ?? 0) + tools.reduce(0) { $0 + $1.name.utf8.count + $1.description.utf8.count + $1.parametersJSON.count }
             + messages.reduce(0) { total, message in

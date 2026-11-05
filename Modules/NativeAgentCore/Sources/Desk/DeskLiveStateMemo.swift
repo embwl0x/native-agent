@@ -5,25 +5,17 @@ import PersistenceCore
 import NativeAgentCore
 import Synchronization
 // Blueprint: | `DeskLiveStateMemo.swift` | Replay memo keyed by the canonical feed stamp |
-/// Process-wide memo behind `SwiftNativeDeskStore.liveState()`.
-///
-/// Every entry is keyed on the ops path AND stamped with the stat identity of
-/// the two files a replay reads. A hit is only ever served while the caller
-/// holds the ops flock, so this is strictly a decode+reduce skip: the lock, the
-/// blocking behaviour, and the compaction-straddle guarantee are untouched.
+/// Key replay on the ops path and both files’ stat identities; serve hits only under the ops flock.
+/// Memoization skips decoding, preserving lock ordering and compaction isolation.
 actor DeskLiveStateMemo {
     typealias FeedStamp = SnapshotTailOpLog.FeedStamp
-    /// Bound on distinct data roots held at once. Roots are few (live + any
-    /// test/secondary root); the cap exists so a long-lived process that walks
-    /// many temp roots cannot grow this map without limit — every insert has a
-    /// matching eviction.
+    /// Bound retained roots so a long-lived process visiting temporary roots cannot grow the map indefinitely.
     static let maxEntries = 8
     private struct Entry: Sendable {
         let stamp: FeedStamp
         let state: DeskState
     }
     private var entries: [String: Entry] = [:]
-    /// Least-recently-stored first; the eviction order for `maxEntries`.
     private var order: [String] = []
     func lookup(key: String, stamp: FeedStamp?) -> DeskState? {
         guard let stamp, let entry = entries[key], entry.stamp == stamp else {

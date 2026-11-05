@@ -4,7 +4,7 @@ import ImageIO
 #if canImport(UIKit)
 import UIKit
 #endif
-// Blueprint: | `ConversationModels.swift` | Shared conversations and `ChatThreadKind` declarations, navigation, canonical transcript/phone metadata codec with retained receipt spellings, tool evidence, transcripts, attachments and oriented thumbnail decoding; engine-resolved display titles default to title; Mac-owned navigation retains pin/anchor order, thread kind and exact helper owner |
+// Blueprint: | `ConversationModels.swift` | `ChatThreadKind`, shared transcript codecs, attachments and Mac-owned navigation |
 
 public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -16,7 +16,16 @@ public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
     public var path: String?
     public var utterance: SpeechUtterance?
 
-    public init(id: String = UUID().uuidString, type: String, base64: String, mime: String, name: String? = nil, byteSize: Int = 0, path: String? = nil, utterance: SpeechUtterance? = nil) {
+    public init(
+        id: String = UUID().uuidString,
+        type: String,
+        base64: String,
+        mime: String,
+        name: String? = nil,
+        byteSize: Int = 0,
+        path: String? = nil,
+        utterance: SpeechUtterance? = nil
+    ) {
         self.id = id
         self.type = type
         self.base64 = base64
@@ -59,31 +68,21 @@ public struct TranscriptAttachmentPreview: Codable, Hashable, Sendable {
     }
 }
 
-/// What KIND of conversation a chat session row is — recorded on the session
-/// index row by its creator. Readers use `SessionConversation` in Transcripts,
-/// never the ID's shape. Rows without a kind still read by their source.
-///
-/// Only its owner may correct a session's conversation kind.
-/// Anchoring is a temporary role (`ChatAnchorPin`), not a conversation kind.
-///
-/// `legacy` is the honest label for a row minted without a thread
-/// classification. Rows keep it until something classifies them.
+/// What KIND of conversation a chat session row is — recorded on the session index row by its creator. Readers use `SessionConversation` in
+/// Transcripts, never the ID's shape. Rows without a kind still read by their source. Only its owner may correct a session's conversation kind.
+/// Anchoring is a temporary role (`ChatAnchorPin`), not a conversation kind. A row whose kind nothing proves stays `unclassified` until an owner classifies it.
 public enum ChatThreadKind: String, Sendable, Equatable, CaseIterable, Codable {
-    /// A private conversation between User and her, on any surface.
     case direct
-    /// A Slack channel or Slack-threaded reply — other humans are present.
+    /// Other people may be present, so a Slack channel or thread is not a private conversation.
     case channel
-    /// Her conversation with another agent or helper. User may talk
-    /// in it; it is still not his conversation with her.
+    /// The person may join an agent/helper conversation without changing its ownership.
     case agent
-    /// Her own work: resident wakes, workers and builder work, with no person.
     case builder
-    /// An unrouted bridge probe. Diagnostic traffic.
     case ephemeral
-    /// Minted with no classification behind it.
-    case legacy
+    /// Neither a recorded kind, a creator key nor the source proves who the conversation is with.
+    case unclassified
 
-    public var isHisConversation: Bool { self == .direct }
+    public var isPersonConversation: Bool { self == .direct }
     public var isPeerConversation: Bool { self == .agent }
     public var isOwnWork: Bool { self == .builder }
 
@@ -92,9 +91,7 @@ public enum ChatThreadKind: String, Sendable, Equatable, CaseIterable, Codable {
         return ChatThreadKind(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
-    /// Creator-owned conversation keys carry the same declaration as today's
-    /// minting boundary. They correct historical kinds on read, without using
-    /// session-ID spelling or the last surface to append a message.
+    /// Creator-owned keys correct conversation kinds without guessing from session-ID spelling or the last message surface.
     public static func creatorDeclaration(source: String?, sourceKey: String?) -> ChatThreadKind? {
         guard let source, let sourceKey else { return nil }
         let fields = sourceKey.split(separator: ":", omittingEmptySubsequences: false)
@@ -117,30 +114,35 @@ public enum ChatThreadKind: String, Sendable, Equatable, CaseIterable, Codable {
         }
     }
 
-    /// The kind implied by a session row's `source`, used when a row is
-    /// read without a kind. Deliberately conservative: it classifies only what the source
-    /// actually proves. Mixed-purpose transports need a recorded kind or
-    /// creator key; their source alone proves neither a private chat nor a room.
+    /// The kind implied by a session row's `source`, used when a row is read without a kind. Deliberately conservative: it classifies only what the
+    /// source actually proves. Mixed-purpose transports need a recorded kind or creator key; their source alone proves neither a private chat nor a
+    /// room.
     public static func inferred(fromSource source: String) -> ChatThreadKind {
         switch normalizedSource(source) {
         case "ios", "app": return .direct
-        case "bot", "agent-bridge", "codex-bridge", "claude-bridge", "omp-bridge",
-             "agent_bridge", "codex_bridge", "claude_bridge", "omp_bridge",
-             "bridge", "claude", "codex", "omp": return .agent
+        case "bot", "agent-bridge": return .agent
         case "resident-wake", "builder", "worker": return .builder
-        default: return .legacy
+        default: return .unclassified
         }
     }
 
-    /// Canonical transcript source, shared by persistence and identity comparisons.
+    /// A transcript source compared trimmed and lowercased. Each source has one spelling (`app` this Mac, `ios` the phone, hyphenated bridges), so an
+    /// empty or unknown name stays itself and classifies as unclassified.
     public static func normalizedSource(_ raw: String) -> String {
-        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch normalized {
-        case "telegram": return "telegram"
-        case "ios", "mobile", "iphone", "icloud": return "ios"
-        case "app", "chat", "mac", "default", "": return "app"
-        default: return normalized
-        }
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// The source a turn surface writes on its rows. Surfaces are a separate vocabulary: this Mac's chat surface is `chat` and its rows are `app`;
+    /// every other surface (ios, telegram, slack, bot, agent-bridge, …) names its rows with its own word.
+    public static func transcriptSource(surface: String) -> String {
+        let surface = normalizedSource(surface)
+        return surface == "chat" ? "app" : surface
+    }
+
+    /// The turn surface a transcript source arrived on: the inverse of `transcriptSource`, so a reader holding a row's source never treats it as a surface.
+    public static func surface(transcriptSource source: String) -> String {
+        let source = normalizedSource(source)
+        return source == "app" ? "chat" : source
     }
 }
 
@@ -281,6 +283,8 @@ public struct ChatMessageRecord: Identifiable, Codable, Hashable, Sendable {
     public var interactionDescriptorJSON: String? = nil
     public var interactionSessionID: String? = nil
     public var toolEvents: [ToolEvent]? = nil
+    /// What the Mac read of this row; the phone builds the same face from it.
+    public var face: TranscriptRowFace? = nil
     public init(id: String, sessionId: String?, role: String, content: String, createdAt: String,
                 runId: String?, source: String?, metadata: ChatMessageMetadata?, isPersonVisible: Bool) {
         self.id = id; self.sessionId = sessionId; self.role = role; self.content = content
@@ -291,7 +295,7 @@ public struct ChatMessageRecord: Identifiable, Codable, Hashable, Sendable {
     public var isPersonVisible = true
     private enum CodingKeys: String, CodingKey {
         case id, sessionId, role, content, createdAt, runId, source, metadata
-        case interactionJSON, interactionDescriptorJSON, interactionSessionID, toolEvents
+        case interactionJSON, interactionDescriptorJSON, interactionSessionID, toolEvents, face
     }
     public mutating func omitAttachmentPreviews() {
         guard let attachments = metadata?.attachments else { return }
@@ -331,8 +335,7 @@ public struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable 
             transcriptGeneration = try c.decode(Int.self, forKey: .transcriptGeneration)
             hasOlder = try c.decode(Bool.self, forKey: .hasOlder)
         } else {
-            // An explicitly unavailable projection makes no claim about its
-            // generation or paging. It cannot authorize clearing local rows.
+            // An explicitly unavailable projection makes no claim about its generation or paging. It cannot authorize clearing local rows.
             transcriptGeneration = try c.decodeIfPresent(Int.self, forKey: .transcriptGeneration)
             hasOlder = try c.decodeIfPresent(Bool.self, forKey: .hasOlder)
         }
@@ -346,7 +349,6 @@ public struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable 
 }
 
 public struct ChatMessageMetadata: Codable, Hashable, Sendable {
-    // Assistant brain metadata
     public var model: String?
     public var requestedModel: String?
     public var reasoningEffort: String?
@@ -361,10 +363,9 @@ public struct ChatMessageMetadata: Codable, Hashable, Sendable {
     public var cancelled: Bool? = nil
     /// Exact saved turn outcome prevents duplicate reply bubbles on the phone.
     public var completionState: String?
-    // Tool-use pill metadata (role=tool messages).
     public var kind: String?          // "tool_use" | `approvalPendingKind`
-    public var toolName: String?      // e.g. "read_file"
-    // Input dict serialized as JSON string for Codable simplicity
+    public var toolName: String?
+    /// JSON keeps heterogeneous tool arguments Codable.
     public var inputJSON: String?
     public var resultSummary: String?
     /// Row settlement, locked with its receipt; the tool fold trusts it over the receipt envelope.
@@ -373,10 +374,8 @@ public struct ChatMessageMetadata: Codable, Hashable, Sendable {
     public var interactionState: String?
     public var ok: Bool?
     public var durationMs: Int?
-    // write_file diff support
     public var beforeContent: String?
     public var afterContent: String?
-    // approval_pending
     public var approvalId: String?
 
     /// Decode-only origin of a cross-conversation card (`ApprovalChatCards.interactionMirrorKind`).
@@ -393,15 +392,14 @@ public struct ChatMessageMetadata: Codable, Hashable, Sendable {
     public var origin: ChatMessageOriginMetadata?
     /// Decode-only surface/agent projection of the recorded turn envelope: the provenance every row carries.
     public var envelope: ChatMessageOriginMetadata?
-    /// Engine-stamped leading pre-tool characters; person-facing bubbles keep them visible.
-    /// Absent on single-round turns and user rows.
+    /// Engine-stamped leading pre-tool characters; person-facing bubbles keep them visible. Absent on single-round turns and user rows.
     public var workingCommentaryChars: Int?
     /// Opaque identity of the turn that produced this assistant row.
     public var turnTraceId: String?
     /// Decode-only engine stamp: `systemRow` marks a persisted turn-failure notice, never a reply.
     public var mechanicalKind: String?
-    /// Failed-turn effects: `ProviderFailure.WorkState` raw value, or "not sent" with proof it never left the Mac.
-    /// Decode-only on saved rows, stamped on synthetic bubbles; Retry must preserve possible effects.
+    /// Failed-turn effects: `ProviderFailure.WorkState` raw value, or "not sent" with proof it never left the Mac. Decode-only on saved rows, stamped
+    /// on synthetic bubbles; Retry must preserve possible effects.
     public var failureWork: String?
 
     // Preserve persisted key spellings on the wire.
@@ -425,7 +423,6 @@ public struct ChatMessageMetadata: Codable, Hashable, Sendable {
         case turnTraceId
     }
 
-    /// Empty metadata for callers that stamp individual fields.
     public init() {}
 
     /// Only `syntheticError(_:userRowPersisted:)` bubbles carry this; nil on decoded rows.
@@ -433,8 +430,7 @@ public struct ChatMessageMetadata: Codable, Hashable, Sendable {
     /// Payload-free guard against text-only regeneration when an unsaved user row had attachments.
     public var syntheticInputHadAttachments: Bool?
 
-    /// Retained Mac receipts use these spellings; all new encoded projections
-    /// use CodingKeys. Presence chooses the schema, never a failed decode.
+    /// Retained Mac receipts use these spellings; all new encoded projections use CodingKeys. Presence chooses the schema, never a failed decode.
     private enum RetainedKeys: String, CodingKey {
         case toolName, resultSummary, resultStatus, approvalId, inputJSON
         case interaction, interactionId, interactionSessionId, envelope, mechanicalKind

@@ -1,95 +1,110 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import os
 import AgentWorkspace
 import Desk
 import Transcripts
 import TurnTrace
-// Blueprint: | `ChatTurnSteering.swift` | `ChatTurnSteering` actor; open turns (the one live-turn truth, read without a hop, with idle edges for free-time owners) and turn-activity clock; atomic resident claim/reservation under the common free-time law, including NetworkSense's immediate offline hold before ledger claim; person admission opens immediately |
+// Blueprint: | `ChatTurnSteering.swift` | `ChatTurnSteering`; Canonical open turns, offers from waiting arrivals and atomic resident reservation |
 
-/// Messages sent during work are offered to the running turn in that conversation on the same door.
-/// Each stays queued until taken or run as its own turn; Steer manually offers a queued message again.
-///
-/// An offer made here is picked up by the running loop at its next tool boundary, BEFORE the
-/// model chooses another action, and delivered as ordinary text in that round's
-/// tool_result turn. The model reads it and decides whether it corrects or
-/// extends the task: no steering toggle, no keyword classifier, nothing added
-/// to any prompt when there is no offer.
-///
-/// SAFE BOUNDARY ONLY. Nothing here cancels or rewinds an executing action —
-/// its receipt and outcome land exactly as they would have.
-///
-/// LOSSLESS. An offer that is never picked up (the turn finished first) is
-/// returned by `close` to its owner, which leaves it queued to run as an
-/// ordinary turn. Every offer therefore either steers the live turn or runs as
-/// its own turn — never both, never neither.
+/// Offer new input only at a tool boundary; never cancel or rewind an action already executing.
+/// Persist before delivery, then let the next admitted provider round read it.
+/// An offer no turn reads stays with its arrival, which runs as its own door's turn when admission reaches it.
 public actor ChatTurnSteering {
     public static let shared = ChatTurnSteering()
 
-    public struct Offer: Sendable, Equatable {
-        /// The queued-turn id the offer came from, so its owner can drop the
-        /// queue entry once the running turn has taken it.
-        public let id: String
-        public let text: String
-        public let envelope: TurnEnvelope
-        public let origin: ChatMessageOrigin?
-        /// Attempt identity, retained even when commitment is still unresolved.
-        /// The queue reconciles it before deciding whether to append on replay.
-        public internal(set) var enqueuedRunID: String?
-        public internal(set) var receivingTurnID: String?
-
-        /// `runID`: the run its queued turn would write it under, so either one writes it once.
-        public init(id: String, text: String, envelope: TurnEnvelope, origin: ChatMessageOrigin?, runID: String? = nil) {
-            self.id = id
-            self.text = text
-            self.envelope = envelope
-            self.origin = origin
-            self.enqueuedRunID = runID
-        }
+    /// An arrival waiting in admission, offered to whichever turn of the agent's in the conversation reaches a step first.
+    public struct Offer: Sendable {
+        public let arrival: TurnArrival
+        /// The door's own turn: its run names the row; its envelope, origin and taint say who sent it.
+        public let turn: Turn
+        /// What the reading turn appends to its conversation.
+        public let reading: [LLMContentBlock]
+        /// The arrival's place in admission's line: being read wakes it too.
+        let waiter = ScopedWaiter()
+        /// A stopped round already saved its row, so no turn writes it again.
+        var saved = false
+        /// Its admission already took it as read while a round carried it, so close drops it.
+        var settled = false
     }
 
-    /// Bounded so a person holding Return cannot grow an unbounded array behind
-    /// a long turn; past this, sends simply stay queued as they always were.
-    static let maxPending = 8
+    /// Who answers a waiting arrival, decided once on this actor.
+    enum Withdrawal { case taken(TurnAdmission.Steered), withdrawn }
+
+    /// The offer an arrival makes while it waits.
+    nonisolated static func offer(_ arrival: TurnArrival, turn: Turn, dataRoot: URL) -> Offer? {
+        let input: SwiftNativeChatOrchestrationClient.TurnAttachmentInput
+        // An arrival the agent's turn cannot read runs alone, where its own door reports why.
+        do {
+            input = try SwiftNativeChatOrchestrationClient.turnAttachmentInput(
+                message: arrival.words, attachments: arrival.attachments, dataRoot: dataRoot, runId: turn.run)
+        } catch { return nil }
+        let text = arrival.row == .hidden ? input.userMessage : deliveryText(input.userMessage, turn: turn)
+        return Offer(arrival: arrival, turn: turn, reading: [.text(text)] + input.imageBlocks)
+    }
 
     private var pending: [String: [Offer]] = [:]
-    /// Sessions with pending, drainable offers; streaming replies check without an actor hop.
     nonisolated private static let pendingSessions = OSAllocatedUnfairLock<Set<String>>(initialState: [])
     nonisolated public static func hasPending(_ sessionId: String) -> Bool {
         pendingSessions.withLock { $0.contains(sessionId) }
     }
-    /// Unsettled reservations suppress the flag because drain cannot yet consume the offer.
+    /// Only an offer the open turn can read cuts its round; unsettled reservations wait for their round to answer.
     private func syncPendingFlag(_ sessionId: String) {
-        let waiting = reserved[sessionId] == nil && pending[sessionId]?.isEmpty == false
+        let waiting = reserved[sessionId] == nil
+            && open[sessionId].map { turn in pending[sessionId]?.contains(where: turn.takes) == true } == true
         Self.pendingSessions.withLock { if waiting { $0.insert(sessionId) } else { $0.remove(sessionId) } }
     }
     private var reserved: [String: [Offer]] = [:]
-    private var delivered: [String: [Offer]] = [:]
-    private var stranded: [String: [Offer]] = [:]
-    /// Queue owner: reserve the attempt (false), then retire it at settlement (true).
-    private var deliveryHandlers: [String: @MainActor @Sendable (Offer, Bool) async -> Bool] = [:]
-    private var returnHandlers: [UUID: [String: @MainActor @Sendable (Offer) async -> Void]] = [:]
+    /// Arrivals a delivered round answered, until their admission collects the answer.
+    private var answered: [String: TurnAdmission.Steered] = [:]
     public typealias Persister = @Sendable (String, Offer) async -> Bool
 
     struct OpenTurn {
         let token: UUID
         let turnId: String
+        let run: String
         let dataRoot: URL
-        /// Where its reply goes; nil for the Mac's own conversation.
         let door: ChatToolSessionContext.ReplyRoute?
         /// This turn's persister cannot be replaced by another door.
         let persist: Persister?
+        let helper: Bool
+        /// Who started this turn and the peers already steering it.
+        let principal: String
+        let sources: Set<String>
+        let fileAccess: String?
+        /// Arrivals whose row this turn could not save run alone, so they never cut its rounds again.
+        var unsaved: Set<String> = []
+
+        /// The arrival's answer is this turn's: its run, and the request its door correlates it with.
+        func steered(_ sessionId: String) -> TurnAdmission.Steered {
+            TurnAdmission.Steered(sessionID: sessionId, turnID: turnId, runID: run, requestID: door?.correlationId)
+        }
+
+        /// The person's and the agent's own untainted words join any turn of the agent's. Anything an agent or peer said joins only a turn that same sender
+        /// started under the same steering, so it never rides past the floor its own turn would meet; refused, it runs alone under that floor.
+        func takes(_ offer: Offer) -> Bool {
+            guard persist != nil, !helper, !unsaved.contains(offer.turn.run) else { return false }
+            let from = offer.turn, carried = Set(from.peerSteering?.checkpointSources ?? [])
+            if from.originPrincipal == "self" {
+                // The agent's line's narrower file ceiling cannot widen by joining a turn already in progress.
+                let current = fileAccess.flatMap { ICloudChatFileAccessPolicy.Mode($0) }
+                switch from.fileAccess.flatMap({ ICloudChatFileAccessPolicy.Mode($0) }) {
+                case .some(.none): guard current == .some(.none) else { return false }
+                case .readOnly?: guard current == .readOnly || current == .some(.none) else { return false }
+                case nil: return false
+                case .auto?, .workspace?, .full?: break
+                }
+            }
+            if ["person", "self"].contains(from.originPrincipal), from.peerSteering?.isTainted != true { return true }
+            return from.originPrincipal == principal && carried.isSubset(of: sources)
+        }
     }
 
-    /// sessionId → the turn whose window is open. A token, not a flag: the
-    /// close runs in a detached task, and without it a just-finished turn's
-    /// close could shut the window of the NEXT turn that already opened.
+    /// Token-match close against the open window so detached cleanup cannot close a newer turn.
     private var open: [String: OpenTurn] = [:]
     private var lastTurnActivityAt: [String: Date] = [:]
-    /// The same windows, readable without an actor hop: the one truth of "a turn
-    /// of hers is running" for every free-time owner. Nothing mirrors it from
-    /// transcript events, which drift whenever a saved message is taken by a call
-    /// (a peer's reply to an awaited send) instead of answered by its own turn.
+    /// Free-time owners read the actual open windows; transcript events cannot mirror turns because some messages are consumed without a turn.
     nonisolated private static let openRoots = OSAllocatedUnfairLock<[String: OpenRoot]>(initialState: [:])
     nonisolated private static let idleListeners = OSAllocatedUnfairLock<[UUID: IdleListener]>(initialState: [:])
     private struct OpenRoot: Sendable { let root: String; let helper: Bool }
@@ -100,9 +115,7 @@ public actor ChatTurnSteering {
         dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
-    /// Each time the last open turn of hers in this data root closes. Free-time
-    /// owners re-consider on it: a turn's completion event can land before its
-    /// window closes, so the event alone would find her still busy.
+    /// Signal the last window closing, since completion events may arrive while the turn still appears busy.
     nonisolated public static func idleEdges(dataRoot: URL) -> AsyncStream<Void> {
         let (stream, edge) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let id = UUID()
@@ -111,46 +124,39 @@ public actor ChatTurnSteering {
         return stream
     }
 
-    /// Every turn registers its session so inline-card resume can check isTurnOpen before starting another.
-    ///
-    /// `persist` is how THIS turn writes a delivered message to the transcript.
-    /// True proves the row is on disk; false leaves the attempt unresolved and
-    /// must not deliver it — the queue reconciles its identity before replay.
+    /// Register every turn so inline-card resume sees the same open window.
+    /// Only a successful durable write permits delivery; unresolved attempts retain identity for queue reconciliation.
     @discardableResult
     public func openTurn(
         sessionId: String, turnId: String, dataRoot: URL, door: ChatToolSessionContext.ReplyRoute? = nil,
-        persist: Persister? = nil
+        persist: Persister? = nil,
+        turn: Turn
     ) throws -> UUID? {
         guard !sessionId.isEmpty else { return nil }
         let helper = try SessionConversation.checkedIsHelper(sessionId, dataRoot: dataRoot)
-        let token = TurnAdmission.token ?? UUID()
-        open[sessionId] = OpenTurn(token: token, turnId: turnId, dataRoot: dataRoot, door: door, persist: persist)
+        let token = turn.admissionToken ?? UUID()
+        open[sessionId] = OpenTurn(token: token, turnId: turnId, run: turn.run, dataRoot: dataRoot, door: door, persist: persist,
+                                   helper: helper, principal: turn.originPrincipal, sources: Set(turn.peerSteering?.checkpointSources ?? []),
+                                   fileAccess: turn.fileAccess)
         Self.openRoots.withLock { $0[sessionId] = OpenRoot(root: Self.rootKey(dataRoot), helper: helper) }
         noteTurnActivity(for: dataRoot, at: Date())
-        HerOpened.shared.began(sessionId)
+        AgentOpened.shared.began(sessionId)
+        syncPendingFlag(sessionId)
         return token
     }
 
-    /// Close only this turn, returning unused offers before admission passes on.
+    /// Close only this turn; offers its rounds read but never answered wait again, their rows saved.
     public func closeTurn(sessionId: String, token: UUID?) async {
         guard let token, let turn = open[sessionId], turn.token == token else { return }
         noteTurnActivity(for: turn.dataRoot, at: Date())
         open.removeValue(forKey: sessionId)
         Self.openRoots.withLock { _ = $0.removeValue(forKey: sessionId) }
         ResidentWake.shared.turnEnded(dataRoot: turn.dataRoot)
-        HerOpened.shared.ended(sessionId, dataRoot: turn.dataRoot)
-        for offer in delivered.removeValue(forKey: sessionId) ?? [] {
-            if let handler = deliveryHandlers.removeValue(forKey: offer.id) { _ = await handler(offer, true) }
+        AgentOpened.shared.ended(sessionId, dataRoot: turn.dataRoot)
+        if let unanswered = reserved.removeValue(forKey: sessionId)?.filter({ !$0.settled }), !unanswered.isEmpty {
+            pending[sessionId] = unanswered + (pending[sessionId] ?? [])
         }
-        let handlers = returnHandlers.removeValue(forKey: token) ?? [:]
-        let offers = (stranded.removeValue(forKey: sessionId) ?? [])
-            + (reserved.removeValue(forKey: sessionId) ?? [])
-            + (pending.removeValue(forKey: sessionId) ?? [])
         syncPendingFlag(sessionId)
-        for offer in offers.reversed() {
-            deliveryHandlers[offer.id] = nil
-            if let handler = handlers[offer.id] { await handler(offer) }
-        }
         guard !Self.hasOpenResidentTurn(dataRoot: turn.dataRoot) else { return }
         let root = Self.rootKey(turn.dataRoot)
         for listener in Self.idleListeners.withLock({ Array($0.values) }) where listener.root == root {
@@ -158,29 +164,28 @@ public actor ChatTurnSteering {
         }
     }
 
-    /// The person removed this message from the queue before the turn took it.
-    public func withdraw(id: String) {
-        for key in pending.keys { pending[key]?.removeAll { $0.id == id }; syncPendingFlag(key) }
-        for key in stranded.keys { stranded[key]?.removeAll { $0.id == id } }
-        deliveryHandlers[id] = nil
-        for token in returnHandlers.keys { returnHandlers[token]?[id] = nil }
-    }
-
-    /// Whether a turn is narrating this session RIGHT NOW.
-    ///
-    /// Asked by the inline-card resume before it starts anything: a settled
-    /// card whose continuation starts a second turn puts two turns on one
-    /// transcript at once, which is how a decline answered mid-turn narrated
-    /// over the turn that raised it.
+    /// Card resume must check the open window so it cannot start a second narrator on the same transcript.
     public func isTurnOpen(sessionId: String) -> Bool {
         open[sessionId] != nil
     }
 
-    /// Her resident wake and her free time wait for an open turn of hers;
+    /// A card can hand back only to the exact act that raised it.
+    public func isTurnOpen(sessionId: String, turnID: String) -> Bool {
+        open[sessionId]?.turnId == turnID
+    }
+
+    /// The agent's resident wake and free time wait for an open turn of the agent's;
     /// helper-owned loops are independent (classified when the turn opens).
-    nonisolated public static func hasOpenResidentTurn(dataRoot: URL) -> Bool {
+    /// `besides`: the session asking — a run started from a turn is not held by that same turn.
+    nonisolated public static func hasOpenResidentTurn(dataRoot: URL, besides session: String? = nil) -> Bool {
         let root = rootKey(dataRoot)
-        return openRoots.withLock { $0.values.contains { $0.root == root && !$0.helper } }
+        return openRoots.withLock { $0.contains { $0.key != session && $0.value.root == root && !$0.value.helper } }
+    }
+
+    /// The agent's live lines: every conversation of the agent's with an open turn in this root, helpers excluded.
+    nonisolated public static func liveSessions(dataRoot: URL) -> [String] {
+        let root = rootKey(dataRoot)
+        return openRoots.withLock { $0.filter { $0.value.root == root && !$0.value.helper }.map(\.key).sorted() }
     }
 
     public func noteTurnActivity(for dataRoot: URL, at: Date) {
@@ -195,15 +200,11 @@ public actor ChatTurnSteering {
         return at
     }
 
-    package func residentWakeIsFree(dataRoot: URL, nextFreeAt: @Sendable (Date, Date) -> Date?) -> Bool {
+    /// Conversations in other sessions do not hold arrivals; only this wake's own open session does.
+    package func residentWakeIsFree(dataRoot: URL) -> Bool {
         guard NetworkSense.isUp else { return false }
-        if Self.hasOpenResidentTurn(dataRoot: dataRoot) {
+        if let turn = open[ResidentWake.session], Self.rootKey(turn.dataRoot) == Self.rootKey(dataRoot) {
             ResidentWake.shared.wait(dataRoot: dataRoot, until: nil)
-            return false
-        }
-        let now = Date()
-        if let due = nextFreeAt(now, turnActivityOrSeed(for: dataRoot, at: now)) {
-            ResidentWake.shared.wait(dataRoot: dataRoot, until: due)
             return false
         }
         return true
@@ -211,121 +212,112 @@ public actor ChatTurnSteering {
 
     /// Desk revision, freedom, ledger claim and turn reservation share this critical section.
     package func claimResidentWake(dataRoot: URL, items: [ResidentWake.Item], deskRevision: UInt64,
-                                   nextFreeAt: @Sendable (Date, Date) -> Date?)
+                                   quietItems: Set<String>, nextFreeAt: @Sendable (Date, Date) -> Date?, turn: Turn)
         -> (text: String, items: [ResidentWake.Item])? {
-        guard let token = TurnAdmission.token,
+        guard let token = turn.admissionToken,
               deskRevision == SwiftNativeDeskStore.currentRevision,
-              residentWakeIsFree(dataRoot: dataRoot, nextFreeAt: nextFreeAt),
-              let wake = ResidentWake.shared.claim(dataRoot: dataRoot, prepared: items) else { return nil }
-        open[ResidentWake.session] = OpenTurn(token: token, turnId: TurnTraceContext.turnId ?? token.uuidString,
-                                            dataRoot: dataRoot, door: nil, persist: nil)
+              residentWakeIsFree(dataRoot: dataRoot) else { return nil }
+        var items = items
+        let now = Date()
+        if items.contains(where: { quietItems.contains($0.id) }) {
+            let due = nextFreeAt(now, turnActivityOrSeed(for: dataRoot, at: now))
+            let busy = Self.hasOpenResidentTurn(dataRoot: dataRoot)
+            if busy || due != nil {
+                items.removeAll { quietItems.contains($0.id) }
+                if items.isEmpty {
+                    if !busy, let due { ResidentWake.shared.wait(dataRoot: dataRoot, until: due, items: quietItems) }
+                    return nil
+                }
+            }
+        }
+        guard !items.isEmpty, let wake = ResidentWake.shared.claim(dataRoot: dataRoot, now: now, prepared: items) else { return nil }
+        open[ResidentWake.session] = OpenTurn(token: token, turnId: turn.id, run: turn.run, dataRoot: dataRoot, door: nil, persist: nil,
+                                            helper: false, principal: turn.originPrincipal, sources: [], fileAccess: turn.fileAccess)
         Self.openRoots.withLock { $0[ResidentWake.session] = OpenRoot(root: Self.rootKey(dataRoot), helper: false) }
         noteTurnActivity(for: dataRoot, at: Date())
         return wake
     }
 
-    /// Offer a message to the session's running turn. `false` means it was not
-    /// taken (no open turn, or the pending bound is reached) and the caller
-    /// keeps it queued.
-    public func offer(_ offer: Offer, sessionId: String,
-                      onDelivered: (@MainActor @Sendable (Offer, Bool) async -> Bool)? = nil,
-                      onReturned: (@MainActor @Sendable (Offer) async -> Void)? = nil) -> Bool {
-        let door = offer.envelope.deliveryRoute
-        guard let turn = open[sessionId], turn.door?.surface == door?.surface,
-              turn.door?.destinationId == door?.destinationId, turn.door?.threadId == door?.threadId else { return false }
-        var queue = pending[sessionId] ?? []
-        guard queue.count < Self.maxPending, !queue.contains(where: { $0.id == offer.id }) else { return false }
-        queue.append(offer)
-        pending[sessionId] = queue
+    /// Admission posts an arrival that waits; a turn of the agent's in its conversation may read it at its next step.
+    func post(_ offer: Offer, sessionId: String) {
+        pending[sessionId, default: []].append(offer)
         syncPendingFlag(sessionId)
-        deliveryHandlers[offer.id] = onDelivered
-        returnHandlers[turn.token, default: [:]][offer.id] = onReturned
-        return true
     }
 
-    /// Called only after the next provider round is admitted. Offers stay
-    /// reserved until a provider round reads them (`markDelivered`), so a Stop
-    /// or a failed turn returns even committed rows to the ordinary queue with
-    /// their enqueue identity intact.
+    /// The arrival woke (read, its own place, or its own cancellation): taken once a round answered it or carries it now, else withdrawn
+    /// for good. Drains run on this same actor, so neither can slip between the other.
+    func withdraw(sessionId: String, run: String) -> Withdrawal {
+        if let steered = answered.removeValue(forKey: run) { return .taken(steered) }
+        if let turn = open[sessionId], let index = reserved[sessionId]?.firstIndex(where: { $0.turn.run == run }) {
+            reserved[sessionId]?[index].settled = true
+            if let offer = reserved[sessionId]?[index] { Self.retireCheckpoint(of: offer, sessionId: sessionId, dataRoot: turn.dataRoot) }
+            return .taken(turn.steered(sessionId))
+        }
+        pending[sessionId]?.removeAll { $0.turn.run == run }
+        if pending[sessionId]?.isEmpty == true { pending[sessionId] = nil }
+        syncPendingFlag(sessionId)
+        return .withdrawn
+    }
+
+    /// Reserve what this turn can read and save each row before delivery; Stop or failure leaves them waiting with their saved rows.
     public func drain(sessionId: String, cancelFlagPath: URL? = nil) async -> [Offer] {
         guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath),
               reserved[sessionId] == nil,
-              let turn = open[sessionId],
-              let queue = pending.removeValue(forKey: sessionId), !queue.isEmpty else {
+              let turn = open[sessionId], let persist = turn.persist,
+              let waiting = pending[sessionId] else {
             return []
         }
+        let taken = waiting.filter(turn.takes)
+        guard !taken.isEmpty else { return [] }
+        let runs = Set(taken.map(\.turn.run))
+        pending[sessionId] = waiting.filter { !runs.contains($0.turn.run) }
+        // Reserve before saving so a withdrawal and the write cannot race.
+        reserved[sessionId] = taken
         syncPendingFlag(sessionId)
-        // The person really did send this message, so the transcript records it
-        // as their message, in the order they sent it — before the reply the
-        // running turn is still composing. PERSIST FIRST: a message the model
-        // answers but the transcript never got is gone from the queue AND
-        // absent after reload, so a failed write un-delivers the offer — it is
-        // stranded instead, and its owner re-queues it as an ordinary turn.
-        guard let persist = turn.persist else {
-            stranded[sessionId, default: []].append(contentsOf: queue)
-            return []
-        }
-        // Each gets its attempt identity now, then leaves the visible queue
-        // before the save: from here only this turn or cleanup owns it, so a
-        // remove or Send next can't race the write.
-        reserved[sessionId] = queue.map {
-            var offer = $0
-            offer.enqueuedRunID = offer.enqueuedRunID ?? UUID().uuidString
-            return offer
-        }
-        var gone: Set<String> = []
-        for offer in reserved[sessionId] ?? [] {
-            // No claim left (removed while reserving): the queue let it go, so the turn does too.
-            guard let handler = deliveryHandlers[offer.id] else { gone.insert(offer.id); continue }
-            if await handler(offer, false) == false {
-                gone.insert(offer.id)
-                deliveryHandlers[offer.id] = nil
-            }
-        }
-        reserved[sessionId]?.removeAll { gone.contains($0.id) }
-        let taken = reserved[sessionId] ?? []
-        guard !taken.isEmpty else {
-            if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
-            syncPendingFlag(sessionId)
-            return []
-        }
-        for index in taken.indices {
+        for offer in taken where !offer.saved {
             if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { return [] }
-            guard let savedOffer = reserved[sessionId]?[index], savedOffer.enqueuedRunID != nil else { return [] }
-            let committed = await persist(sessionId, savedOffer)
+            let committed = await persist(sessionId, offer)
             guard open[sessionId]?.token == turn.token else { return [] }
             guard committed else {
                 // Keep their order, including rows saved before this failure.
-                stranded[sessionId, default: []].append(
-                    contentsOf: reserved.removeValue(forKey: sessionId) ?? [])
+                open[sessionId]?.unsaved.insert(offer.turn.run)
+                pending[sessionId] = (reserved.removeValue(forKey: sessionId) ?? []) + (pending[sessionId] ?? [])
                 syncPendingFlag(sessionId)
                 return []
             }
+            if let index = reserved[sessionId]?.firstIndex(where: { $0.turn.run == offer.turn.run }) { reserved[sessionId]?[index].saved = true }
         }
         guard !Task.isCancelled, !ChatCancelFlag.isRaised(cancelFlagPath) else { return [] }
         return reserved[sessionId] ?? []
     }
 
-    /// Delivered means a provider round carrying the offers produced output.
-    /// Only then does the turn's close retire them from the queue.
-    public func markDelivered(_ offers: [Offer], sessionId: String) async -> Bool {
+    /// Delivered means a provider round carrying the offers produced output: this turn answers each arrival.
+    public func markDelivered(_ offers: [Offer], sessionId: String) -> Bool {
         guard let turn = open[sessionId] else { return false }
-        for var offer in offers {
-            offer.receivingTurnID = turn.turnId
-            guard let handler = deliveryHandlers[offer.id], await handler(offer, false),
-                  open[sessionId]?.token == turn.token,
-                  let index = reserved[sessionId]?.firstIndex(where: { $0.id == offer.id }) else { return false }
-            reserved[sessionId]?.remove(at: index)
-            delivered[sessionId, default: []].append(offer)
+        for offer in offers {
+            guard let index = reserved[sessionId]?.firstIndex(where: { $0.turn.run == offer.turn.run }) else { continue }
+            // An arrival whose admission already took it holds no answer slot.
+            if reserved[sessionId]?.remove(at: index).settled == false {
+                answered[offer.turn.run] = turn.steered(sessionId)
+                Self.retireCheckpoint(of: offer, sessionId: sessionId, dataRoot: turn.dataRoot)
+            }
+            offer.waiter.resume()
         }
         if reserved[sessionId]?.isEmpty == true { reserved[sessionId] = nil }
         syncPendingFlag(sessionId)
         return true
     }
 
-    /// How a delivered message announces itself in the round. One line, only
-    /// when there IS a message — the standing prompt is untouched.
-    public static func deliveryText(_ text: String) -> String {
-        "[The person sent this just now, while you were working:]\n" + text
+    /// A read arrival's own saved checkpoint no longer stands for an unanswered message; one left behind would resume it at relaunch.
+    nonisolated private static func retireCheckpoint(of offer: Offer, sessionId: String, dataRoot: URL) {
+        do { try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: offer.turn.id)?.remove(dataRoot: dataRoot) }
+        catch { nativeLog("[steering] arrival %@ checkpoint not retired: %@", offer.turn.id, error.localizedDescription) }
+    }
+
+    /// Shown words say who sent them and through which door, since any door's arrival joins the agent's turn.
+    nonisolated static func deliveryText(_ text: String, turn: Turn) -> String {
+        let who = turn.origin?.authored == .agent ? turn.origin?.agent ?? "An agent" : "The person"
+        let door = turn.arrivalSurface(authorizing: turn.envelope?.surface ?? "chat")
+        return "[\(who) sent this just now from \(door), while you were working:]\n" + text
     }
 }

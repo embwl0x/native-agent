@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `PhoneSenseEvent.swift` | Coordinate-free phone observations and per-organ setup evidence, shared labels and validation; motion preserves activity flags, confidence and activity time |
+// Blueprint: | `PhoneSenseEvent.swift` | Authenticated phone observations and setup evidence; confidence never proves absence |
 public struct PhoneSenseEvent: Codable, Sendable, Identifiable {
     public enum Source: String, Codable, Sendable, Hashable, CaseIterable {
         case places, motion, focus, charging, battery, headphones, network, music, photos

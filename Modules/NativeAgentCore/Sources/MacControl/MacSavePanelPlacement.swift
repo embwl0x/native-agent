@@ -12,26 +12,27 @@ import CoreGraphics
 #if canImport(UserNotifications)
 import UserNotifications
 #endif
-// Blueprint: | `MacSavePanelPlacement.swift` | Save-panel placement through the existing act verification loop; native full-directory URL and exact name readback own verification, never a folder basename |
+// Blueprint: | `MacSavePanelPlacement.swift` | Shared act verification requires native full-directory URL and exact basename readback |
 extension SwiftNativeMacControl {
-    /// Go-to-folder selects the directory; AXValue sets the basename; the common act loop verifies both.
+    /// Directory and basename use separate controls; the common act loop verifies both.
     func placeInSavePanel(_ placement: MacSavePanelPlacement, target: MacAXActTarget, window: MacAXWindowRef, pid: Int32,
-                                 handle: String, frontBefore: MacAXAppInfo?) async -> MacActPerformed {
+                                 handle: String, frontBefore: MacAXAppInfo?, turn: Turn, context: MacOperationContext) async -> MacActPerformed {
         func wherePopup() throws -> MacAXActTarget? {
             for label in ["Where", "Where:"] {
-                if let target = try accessibilityActSource.uniqueTarget(
+                if let target = try accessibilityActSource(context: context).uniqueTarget(
                     role: "AXPopUpButton", label: label, labelSource: "title", inWindow: window
-                ) { return target }
+                , context: context) { return target }
             }
             return nil
         }
-        let inputStart = MacDriverContext.binding?.inputCount ?? 0
+        let inputStart = context.driver?.inputCount ?? 0
         var extra: [String: JSONValue] = ["directory": .string(placement.directory), "name": .string(placement.name),
             "where_before": .null]
         func result(_ error: String? = nil, guidance: String? = nil) -> MacActPerformed {
-            extra["posted_events"] = .int(Int64((MacDriverContext.binding?.inputCount ?? inputStart) - inputStart))
+            extra["posted_events"] = .int(Int64((context.driver?.inputCount ?? inputStart) - inputStart))
             if let guidance { extra["guidance"] = .string(guidance) }
-            return MacActPerformed(ok: error == nil, method: "save_panel_placement", requestedAction: "type", error: error, target: target, postState: accessibilityActSource.reread(target), actedHandle: handle,
+            return MacActPerformed(ok: error == nil, method: "save_panel_placement", requestedAction: "type", error: error, target: target,
+                postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                 extra: extra, expectedText: placement.name)
         }
         let before: String?
@@ -46,15 +47,16 @@ extension SwiftNativeMacControl {
         }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: placement.directory, isDirectory: &isDirectory), isDirectory.boolValue else {
-            return result("folder_missing", guidance: "there is no folder at \(placement.directory); make it first, or save into one that exists. Nothing was typed.")
+            return result("folder_missing",
+                guidance: "there is no folder at \(placement.directory); make it first, or save into one that exists. Nothing was typed.")
         }
-        let opened = await handleKeystroke(["keys": .string("cmd+shift+g")])
+        let opened = await handleKeystroke(["keys": .string("cmd+shift+g")], turn: turn, context: context)
         guard opened.ok else { return result(opened.error ?? "save_panel_placement_unverified") }
         try? await Task.sleep(nanoseconds: 400_000_000)
-        let typed = await handleKeystroke(["text": .string(placement.directory)])
+        let typed = await handleKeystroke(["text": .string(placement.directory)], turn: turn, context: context)
         guard typed.ok else { return result(typed.error ?? "save_panel_placement_unverified") }
         try? await Task.sleep(nanoseconds: 250_000_000)
-        let confirmed = await handleKeystroke(["keys": .string("return")])
+        let confirmed = await handleKeystroke(["keys": .string("return")], turn: turn, context: context)
         guard confirmed.ok else { return result(confirmed.error ?? "save_panel_placement_unverified") }
         var whereNow: String?
         var directoryNow: URL?
@@ -65,19 +67,25 @@ extension SwiftNativeMacControl {
             do {
                 let popup = try wherePopup()
                 whereNow = popup?.value
-                directoryNow = try popup.flatMap { try accessibilityActSource.url(of: $0) }
+                directoryNow = try popup.flatMap { try accessibilityActSource(context: context).url(of: $0, context: context) }
             } catch { return result("ax_evidence_unavailable", guidance: error.localizedDescription) }
             if directoryNow?.standardizedFileURL.resolvingSymlinksInPath() == wantedDirectory { break }
         }
         let placed = directoryNow?.standardizedFileURL.resolvingSymlinksInPath() == wantedDirectory
-        let nameOutcome = accessibilityActSource.setValue(target, value: placement.name)
+        let nameOutcome = accessibilityActSource(context: context).setValue(target, value: placement.name, turn: turn, context: context)
         extra.merge(nameOutcome.receipt) { _, new in new }
         let named = nameOutcome == .performed
-        let nameNow = accessibilityActSource.reread(target)?.value
+        let nameNow = accessibilityActSource(context: context).reread(target, context: context)?.value
         let ok = placed && named
         let text = ok
-            ? "Pointed the save panel at \(placement.directory) (Where: \(whereNow ?? "")) and named the file \(placement.name); its Save button saves it there."
-            : "The save panel " + (placed ? "points at \(placement.directory)" : "has no verified full directory URL for \(placement.directory) after the Go-to-folder sheet (Where: \(whereNow ?? "unknown"))")
+            ? """
+                Pointed the save panel at \(placement.directory) (Where: \(whereNow ?? "")) and named the file \(placement.name); its Save button saves it \
+                there.
+                """
+            : "The save panel " + (
+                placed ? "points at \(placement.directory)" : """
+                    has no verified full directory URL for \(placement.directory) after the Go-to-folder sheet (Where: \(whereNow ?? "unknown"))
+                    """)
                 + (named ? "; the name \(placement.name) is set" : "; the name field did not take \(placement.name)") + ". Read the panel before pressing Save."
         extra["where_after"] = whereNow.map(JSONValue.string) ?? .null
         extra["directory_url_after"] = directoryNow.map { .string($0.absoluteString) } ?? .null
@@ -87,13 +95,11 @@ extension SwiftNativeMacControl {
     }
 }
 
-
 /// A save panel's name field turns a path into a colon-named file; separate the destination folder from the name.
 public struct MacSavePanelPlacement: Sendable, Equatable {
     public let directory: String
     public let name: String
 
-    /// The fields a save panel names its file by, as the screen labels them.
     static let nameFieldLabels: Set<String> = ["save as", "export as", "file name", "name"]
 
     public static func isNameField(role: String, label: String?) -> Bool {
@@ -103,8 +109,7 @@ public struct MacSavePanelPlacement: Sendable, Equatable {
         return nameFieldLabels.contains(bare)
     }
 
-    /// A place with a name: absolute (or `~`) with at least one folder and a
-    /// non-empty last component. A bare name, or a name with no folder, is nil.
+    /// Only paths with a folder and final component need directory placement; bare names do not.
     public static func split(_ text: String) -> MacSavePanelPlacement? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("/") || trimmed.hasPrefix("~") else { return nil }

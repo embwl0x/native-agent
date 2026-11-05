@@ -2,13 +2,17 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceDesktopNavigation.swift` | `AgentWorkspaceNavigation`: `restoredSession` preserves the validated saved Back path; only an empty path uses the saved current place. `canEvict` and `draftAttemptIsDurable` guard persisted drafts and navigation. |
+// Blueprint: | `AgentWorkspaceDesktopNavigation.swift` | `AgentWorkspaceNavigation`, `restoredSession`, `canEvict`, `draftAttemptIsDurable`: durable drafts |
+// Restore the validated Back path; use saved current place only when that path is empty.
 
 extension AgentWorkspaceNavigation {
     package func currentPlace(dataRoot: URL, scope: String) -> String? {
         guard NativeAgentChatSessionID.normalizedPathComponent(scope) != nil else { return nil }
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
-        let unavailable = "Saved place in this conversation could not be read. Open app {} to inspect the workspace storage notice; do not assume a prior position."
+        let unavailable = """
+            Saved place in this conversation could not be read. Open app {} to inspect the workspace storage notice; do not assume \
+            a prior position.
+            """
         let state: AgentWorkspaceDesktopState
         if let session = sessions[key] {
             guard session.persistenceIssue == nil else { return unavailable }
@@ -46,7 +50,7 @@ extension AgentWorkspaceNavigation {
         var errorDescription: String? { message }
     }
 
-    func restoredSession(dataRoot: URL, scope: String) -> Session {
+    func restoredSession(workspace: WorkspaceOperation, dataRoot: URL, scope: String) -> Session {
         var session = Session()
         let store = AgentWorkspaceDesktopStore(dataRoot: dataRoot, scope: scope)
         session.store = store
@@ -61,30 +65,31 @@ extension AgentWorkspaceNavigation {
             }
         } catch {
             session.needsStorageReload = true
-            session.persistenceIssue = "Saved workspace storage is unavailable. Its bytes were preserved; current navigation remains temporary. " + error.localizedDescription
+            session.persistenceIssue = "Saved workspace storage is unavailable. Its bytes were preserved; current navigation remains temporary. " + error
+                .localizedDescription
         }
         // Existing conversations are watched for arrivals; only open work becomes windows.
         let present = Set(session.arrangement.places.compactMap { place -> String? in
             guard case .record("agent_read", let input, _) = place, case .string(let agent)? = input["agent"] else { return nil }
             return agent
         })
-        do { session.watched = try Self.conversationWindows(dataRoot: dataRoot).filter {
+        do { session.watched = try Self.conversationWindows(workspace: workspace, dataRoot: dataRoot).filter {
             guard case .record(_, let input, _) = $0, case .string(let agent)? = input["agent"] else { return false }
             return !present.contains(agent)
-        } } catch { session.persistenceIssue = "Conversation watching is unavailable: " + error.localizedDescription + ". Repair conversation storage, then reopen this workspace." }
+        } } catch { session.persistenceIssue = "Conversation watching is unavailable: " + error.localizedDescription
+            + ". Repair conversation storage, then reopen this workspace." }
         return session
     }
 
-    /// Newest conversation per contact, ordered oldest first for arrival watching.
-    private static func conversationWindows(dataRoot: URL) throws -> [AgentWorkspaceLocation] {
-        let rows = try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)
+    private static func conversationWindows(workspace: WorkspaceOperation, dataRoot: URL) throws -> [AgentWorkspaceLocation] {
+        let rows = try workspace.ports.conversations.records(dataRoot: dataRoot, locked: true)
         var windows: [(at: Date, agent: String, location: AgentWorkspaceLocation)] = rows.filter { $0.phase != "sending" }.map { row in
             var input: [String: JSONValue] = ["agent": .string(row.agent)]
             if !row.agent.hasPrefix("bot:") { input["conversation"] = .string(row.label) }
             return (row.updatedAt, row.agent, .record(tool: "agent_read", input: input, title: row.name))
         }
         // Verified incoming bridge chats join the watched conversations.
-        let people = try AgentWorkSession.people(dataRoot: dataRoot)
+        let people = try AgentWorkSession.people(workspace: workspace, dataRoot: dataRoot)
         for session in try AgentWorkSession.verified(dataRoot: dataRoot) {
             guard let person = AgentWorkSession.owner(session.sender, people: people),
                   let updated = session.row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
@@ -145,8 +150,7 @@ extension AgentWorkspaceNavigation {
             && session.lastPersisted == Self.snapshot(session)
     }
 
-    /// Never enter an effect while disk still contains a ready-to-submit copy
-    /// of these inputs. Failed storage must not turn restart into silent replay.
+    /// Never enter an effect while disk still contains a ready-to-submit copy of these inputs. Failed storage must not turn restart into silent replay.
     func draftAttemptIsDurable(_ form: AgentWorkspaceForm, key: String) -> Bool {
         guard let session = sessions[key] else { return false }
         guard session.store != nil else { return true }
@@ -156,8 +160,7 @@ extension AgentWorkspaceNavigation {
         return saved?.needsOutcomeReview == true && saved?.draftValues == form.draftValues && saved?.bound == form.bound
     }
 
-    /// Persistence is reported separately from the actual tool outcome. A disk
-    /// failure must never turn a completed send/write into a request to replay.
+    /// Report persistence separately: a disk failure must never invite replay of a completed effect.
     func persistDesktop(key: String) -> JSONValue {
         guard var session = sessions[key] else { return .object(["storage": .string("unavailable")]) }
         if session.needsStorageReload, let store = session.store, Date() >= session.nextPersistenceAttempt {
@@ -165,7 +168,11 @@ extension AgentWorkspaceNavigation {
                 if let previous = try store.load() {
                     let recovered = previous.drafts.filter { old in !session.arrangement.drafts.contains { $0.draftID == old.draftID } }
                     guard session.arrangement.drafts.count + recovered.count <= 4 else {
-                        throw DesktopFailure(message: "Saved and resident drafts exceed four slots. Discard a resident draft before storage recovery; saved bytes remain intact.")
+                        throw DesktopFailure(
+                            message: """
+                                Saved and resident drafts exceed four slots. Discard a resident draft before storage recovery; saved bytes remain \
+                                intact.
+                                """)
                     }
                     let drafts = session.arrangement.drafts + recovered
                     if session.arrangement.path == [.home] {
@@ -179,7 +186,8 @@ extension AgentWorkspaceNavigation {
                 }
                 session.needsStorageReload = false; session.persistenceIssue = nil
             } catch {
-                session.persistenceIssue = "Saved workspace could not be recovered; existing bytes and resident drafts are preserved. " + error.localizedDescription
+                session.persistenceIssue = "Saved workspace could not be recovered; existing bytes and resident drafts are preserved. " + error
+                    .localizedDescription
                 session.nextPersistenceAttempt = Date().addingTimeInterval(5)
             }
         }
@@ -205,7 +213,11 @@ extension AgentWorkspaceNavigation {
             do { try store.save(snapshot); session.lastPersisted = snapshot; session.persistenceIssue = nil }
             catch {
                 session.nextPersistenceAttempt = Date().addingTimeInterval(5)
-                session.persistenceIssue = "Navigation could not be saved. A later workspace action will retry storage only; the tool outcome is unchanged and no effect is repeated. " + error.localizedDescription
+                session
+                    .persistenceIssue = """
+                        Navigation could not be saved. A later workspace action will retry storage only; the tool outcome is unchanged and no \
+                        effect is repeated.\u{20}
+                        """ + error.localizedDescription
             }
         }
         sessions[key] = session
@@ -215,10 +227,14 @@ extension AgentWorkspaceNavigation {
         var metadata: [String: JSONValue] = [
             "name": .string(name), "selected_place": .string(selected.title),
             "open_places": .array(Self.recognizedPlaces(session).map { .string($0.title) }),
-            "storage": .string(session.persistenceIssue != nil ? "unavailable" : session.store == nil ? "temporary" : session.arrangement.drafts.contains(where: { !$0.canPersist }) ? "saved_with_temporary_drafts" : "saved"),
+            "storage": .string(session.persistenceIssue != nil ? "unavailable" : session.store == nil ? "temporary" : session.arrangement.drafts.contains(
+                where: { !$0.canPersist }) ? "saved_with_temporary_drafts" : "saved"),
             "unfinished_drafts": .int(Int64(session.arrangement.drafts.count)),
             "temporary_drafts": .int(Int64(session.arrangement.drafts.filter { !$0.canPersist }.count)),
-            "meaning": .string("Arrangement, eight Back positions and up to four supported drafts are scoped to this chat. Restart restores inputs, never approvals, loaded evidence or running actions. Current schemas, owners and permissions are rechecked before use.")
+            "meaning": .string("""
+                Arrangement, eight Back positions and up to four supported drafts are scoped to this chat. Restart restores inputs, never approvals, loaded \
+                evidence or running actions. Current schemas, owners and permissions are rechecked before use.
+                """)
         ]
         if let issue = session.persistenceIssue { metadata["attention"] = .string(issue) }
         if let note = session.arrangement.workNote {
@@ -249,7 +265,8 @@ extension AgentWorkspaceNavigation {
     func saveWorkspace(name: String, empty: Bool, key: String) throws -> AgentWorkspaceLocation {
         guard var session = sessions[key] else { throw DesktopFailure(message: "Open your workspace first.") }
         try requireName(name, session: session)
-        guard session.arrangement.saved.count < 12 else { throw DesktopFailure(message: "Twelve workspaces are already saved. Forget an old arrangement before saving another; its files and work will remain intact.") }
+        guard session.arrangement.saved.count < 12 else { throw DesktopFailure(
+            message: "Twelve workspaces are already saved. Forget an old arrangement before saving another; its files and work will remain intact.") }
         let state = Self.snapshot(session)
         let entry = AgentWorkspaceSavedDesktop(name: name, current: empty ? .home : state.current,
             places: empty ? [] : state.places, workAnchor: empty ? nil : state.workAnchor,
@@ -286,7 +303,8 @@ extension AgentWorkspaceNavigation {
         }
         session.arrangement.path = (saved.path.isEmpty ? [.home, saved.current] : saved.path).compactMap(refreshed)
         if session.arrangement.path.isEmpty { session.arrangement.path = [.home] }
-        session.arrangement.places = saved.places.compactMap(refreshed); session.arrangement.workAnchor = saved.workAnchor; session.arrangement.workTopic = saved.workTopic
+        session.arrangement.places = saved.places.compactMap(refreshed); session.arrangement.workAnchor = saved.workAnchor; session.arrangement
+            .workTopic = saved.workTopic
         session.arrangement.workNote = saved.workNote; session.arrangement.keptPlaces = saved.keptPlaces
         session.arrangement.focusedWork = saved.focusedWork; session.arrangement.lastWorkAction = saved.lastWorkAction
         session.arrangement.placeActions = saved.placeActions
@@ -338,7 +356,10 @@ extension AgentWorkspaceNavigation {
         let session = sessions[key] ?? Session()
         return .init(title: "Saved workspaces", content: .object([
             "status": .string(session.persistenceIssue == nil ? "ok" : "unavailable"),
-            "message": .string(session.persistenceIssue ?? "Named arrangements in this chat. Reopen restores places and reads the selected owner. Saving and switching never resumes work or sends a message; forgetting only removes the saved arrangement.")]),
+            "message": .string(session.persistenceIssue ?? """
+                Named arrangements in this chat. Reopen restores places and reads the selected owner. Saving and switching never resumes work or sends a \
+                message; forgetting only removes the saved arrangement.
+                """)]),
             items: session.arrangement.saved.map { saved in
                 var content: [String: JSONValue] = [
                     "selected_place": .string(saved.current.title),

@@ -1,18 +1,18 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
 import ChatTurnContracts
 // Blueprint: | `DeskClickApprovalFiler.swift` | Package-scoped local-click approval filing under `ApprovalTransactions` |
 
-/// Only the mounted local Desk command path supplies this filer. It is not
-/// part of the tool registry or any remote request's selectable authority.
+/// Only the mounted local Desk command path supplies this filer. It is not part of the tool registry or any remote request's selectable authority.
 package struct DeskClickApprovalFiler: ApprovalFiler {
     let dataRoot: URL
 
     package init(dataRoot: URL) { self.dataRoot = dataRoot }
 
     package func fileApprovalRequest(
-        toolName: String, surface: String, payload: JSONValue, reason: String
+        toolName: String, surface: String, payload: JSONValue, reason: String, turn: Turn
     ) async throws -> String {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let body: JSONValue = .object([
@@ -21,7 +21,7 @@ package struct DeskClickApprovalFiler: ApprovalFiler {
             "reason": .string(reason + " — auto-approved: initiated by a local desk click"),
             "remoteResolvable": .bool(false),
         ])
-        let record = try await inbox.create(body)
+        let record = try await inbox.create(body, turn: turn)
         _ = try await inbox.resolve(
             record.id, decision: .approved, decidedBy: "local_desk_click")
         return record.id

@@ -2,11 +2,10 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+EmbeddingEpoch.swift` | `MemoryStorage`: exact-byte corpus snapshots, usable-vector-gated atomic epoch/dimension activation with per-row failure evidence and durable activation refusal for Doctor, checked owed-row admission; derived action vectors and failures keyed by epoch and exact-text SHA-256 |
+// Blueprint: | `MemoryStorage+EmbeddingEpoch.swift` | `MemoryStorage`: atomic corpus activation and per-item failures |
 
 extension MemoryStorage {
-    /// Derived action vectors share memory's database and vector codec, never
-    /// its canonical corpus or recall generation.
+    /// Derived action vectors share memory's database and vector codec, never its canonical corpus or recall generation.
     public func actionEmbeddings(epoch: MemoryEmbeddingEpoch) async throws -> [String: [Float]] {
         try await dbPool.read { db in
             var vectors: [String: [Float]] = [:]
@@ -14,8 +13,7 @@ extension MemoryStorage {
                                        arguments: [epoch.rawValue]) {
                 guard let vector = try Self.decodeEmbedding(row["vector"]), !vector.isEmpty,
                       vector.allSatisfy(\.isFinite), vector.contains(where: { $0 != 0 }) else {
-                    // Derived damage is a miss: the index writer replaces it
-                    // from the exact action text, never using a bad vector.
+                    // Derived damage is a miss: the index writer replaces it from the exact action text, never using a bad vector.
                     continue
                 }
                 vectors[row["text_hash"]] = vector
@@ -66,9 +64,8 @@ extension MemoryStorage {
 
     // MARK: - Embedding epoch activation
 
-    /// Snapshot every canonical text-bearing row. Callers embed this immutable
-    /// candidate off the turn path, then pass it back to
-    /// `activateEmbeddingEpoch`; activation rejects any intervening drift.
+    /// Snapshot every canonical text-bearing row. Callers embed this immutable candidate off the turn path, then pass it back to `activateEmbeddingEpoch`;
+    /// activation rejects any intervening drift.
     public func embeddingCorpusSnapshot() async throws -> [MemoryEmbeddingCorpusRow] {
         try await dbPool.read { db in try Self.embeddingCorpus(in: db) }
     }
@@ -77,11 +74,8 @@ extension MemoryStorage {
         try await dbPool.read { db in try Self.embeddingEpochState(in: db) }
     }
 
-    /// Switch all memories, proposals, and tombstones to one vector space in a
-    /// single SQLite transaction. Legacy vectors are never stamped in place:
-    /// every row has an explicit prediction outcome, identity-checked and
-    /// content-hash checked before the canonical switch. Unembeddable rows
-    /// lose their old vector and retain their own error in that transaction.
+    /// Switch memories, proposals and tombstones atomically after identity and content-hash checks on every prediction. Never stamp unverified vectors in
+    /// place; unusable rows lose their vector and retain their named error.
     public func activateEmbeddingEpoch(
         _ epoch: MemoryEmbeddingEpoch,
         dimensions: Int,
@@ -128,9 +122,11 @@ extension MemoryStorage {
                 do { try VectorMath.requireUsable(activationProbe, dimensions: dimensions) }
                 catch { throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "activation probe: \(error.localizedDescription)") }
             } else if !staged.contains(where: { if case .vector = $0.result { return true }; return false }) {
-                let reason = "The memory search model produced no usable vectors for \(live.count) canonical rows. Inspect Doctor's coreml_embedder finding and repair the model before rebuilding; no epoch was activated."
-                // Commit the refusal, not the candidate. Throwing inside this
-                // transaction would erase the fact Doctor must judge.
+                let reason = """
+                    The memory search model produced no usable vectors for \(live.count) canonical rows. Inspect Doctor's coreml_embedder finding and repair \
+                    the model before rebuilding; no epoch was activated.
+                    """
+                // Commit the refusal, not the candidate. Throwing inside this transaction would erase the fact Doctor must judge.
                 try db.execute(sql: """
                     UPDATE memory_embedding_state SET refused_epoch = ?, refusal_reason = ?, refused_at = ? WHERE id = 1
                     """, arguments: [epoch.rawValue, reason, activatedAt])
@@ -189,8 +185,7 @@ extension MemoryStorage {
 
     private static func embeddingCorpus(in db: Database) throws -> [MemoryEmbeddingCorpusRow] {
         var result: [MemoryEmbeddingCorpusRow] = []
-        // An active row whose vector is owed is the fill's: it lands through
-        // the write's own checks, so activation leaves it for the fill.
+        // An active row whose vector is owed is the fill's: it lands through the write's own checks, so activation leaves it for the fill.
         result += try Row.fetchAll(db, sql: """
             SELECT id, content FROM memories WHERE embedding IS NOT NULL OR status <> 'active' ORDER BY id
             """).map {
@@ -234,8 +229,7 @@ extension MemoryStorage {
         "\(kind.rawValue):\(id)"
     }
 
-    /// A recorded failure belongs only to these exact bytes in this space.
-    /// A changed/deleted row cannot acquire a late prediction's verdict.
+    /// A recorded failure belongs only to these exact bytes in this space. A changed/deleted row cannot acquire a late prediction's verdict.
     func recordUnembeddable(_ row: MemoryEmbeddingCorpusRow, epoch: MemoryEmbeddingEpoch, reason: String) async throws -> Bool {
         try await dbPool.write { db in
             let state = try Self.embeddingEpochState(in: db)
@@ -245,7 +239,8 @@ extension MemoryStorage {
             let table = row.kind == .tombstone ? "tombstones" : (row.kind == .proposal ? "proposals" : "memories")
             let key = row.kind == .tombstone ? "content_hash" : "id"
             let activeOnly = row.kind == .memory ? " AND status = 'active'" : ""
-            guard let content = try String.fetchOne(db, sql: "SELECT content FROM \(table) WHERE \(key) = ? AND embedding IS NULL\(activeOnly)", arguments: [row.id]),
+            guard let content = try String.fetchOne(db, sql: "SELECT content FROM \(table) WHERE \(key) = ? AND embedding IS NULL\(activeOnly)", arguments: [row
+                .id]),
                   Data(content.utf8) == Data(row.content.utf8) else { return false }
             try Self.writeEmbeddingFailure(in: db, row: row, epoch: epoch, reason: reason)
             return true
@@ -297,7 +292,9 @@ extension MemoryStorage {
         let state = try embeddingEpochState(in: db)
         guard let active = state.activeEpoch, let dimensions = state.dimensions else {
             throw MemoryStorageError.searchFailure("Memory search awaits a validated epoch and dimensions.",
-                code: "memory_search_index_updating", instruction: "Allow memory search convergence to activate the selected model; inspect Doctor if it cannot complete.")
+                code: "memory_search_index_updating", instruction: """
+                    Allow memory search convergence to activate the selected model; inspect Doctor if it cannot complete.
+                    """)
         }
         guard epoch == active else {
             throw MemoryStorageError.embeddingEpochMismatch(expected: active, actual: epoch)

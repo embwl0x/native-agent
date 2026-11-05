@@ -1,10 +1,11 @@
 import Privacy
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
-// Blueprint: | `SchedulerDueJobRunner.swift` | `SchedulerDueJobRunner` actor; `runDueJobs` stops restored intention records with a Desk notice before body-rhythm execution, with no notify/turn/workshop kinds; reads canonical job rows through `SchedulerJobs`; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
+// Blueprint: | `SchedulerDueJobRunner.swift` | Canonical rhythm claims and settlement; reconciliation tells one matter |
 
 public actor SchedulerDueJobRunner {
     enum JobKind: String, CaseIterable, Sendable {
@@ -37,10 +38,8 @@ public actor SchedulerDueJobRunner {
     let root: URL
     let platform: any SchedulerExecutionPlatform
     let schedulerJobs: SwiftNativeTriggerScheduler
-    /// The pass's first fault: unwritable activity evidence, unreadable or
-    /// unrepairable job state, or a result that could not be settled. The loop
-    /// owner reads it after a pass and publishes a failed loop receipt, so an
-    /// unknown inventory never reads as "nothing due". Only a new pass clears it.
+    /// The pass's first fault: unwritable activity evidence, unreadable or unrepairable job state, or a result that could not be settled. The loop owner reads
+    /// it after a pass and publishes a failed loop receipt, so an unknown inventory never reads as "nothing due". Only a new pass clears it.
     public internal(set) var activityFeedError: String?
     var running = false
     /// A part's schedule that does not parse, said once rather than every pass.
@@ -53,11 +52,6 @@ public actor SchedulerDueJobRunner {
 
     var activityPath: URL {
         SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
-    }
-
-    var notificationInboxPath: URL {
-        root.appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
     }
 
     public init(
@@ -106,7 +100,7 @@ public actor SchedulerDueJobRunner {
                 try await appendActivity(
                     jobId: nil,
                     title: "Scheduled Desk tasks retired",
-                    detail: "Retired \(retiredJobs) job row(s); reasons recorded in scheduler/retired.jsonl",
+                    detail: "Retired \(retiredJobs) job row(s)",
                     status: "ok",
                     payload: .object(["removed": .int(Int64(retiredJobs))])
                 )
@@ -130,9 +124,8 @@ public actor SchedulerDueJobRunner {
         // Defer stuck recovered claims for this pass so other due jobs can run.
         var deferredJobIds: Set<String> = []
         var exhaustedBatch = true
-        // Claim exactly one occurrence immediately before its effect. Claiming
-        // a whole batch would make later untouched rows look ambiguous if the
-        // process crashed while executing the first row.
+        // Claim exactly one occurrence immediately before its effect. Claiming a whole batch would make later untouched rows look ambiguous if the process
+        // crashed while executing the first row.
         for _ in 0..<max(1, maxJobs) {
             guard !Task.isCancelled else { exhaustedBatch = false; break }
             let claimed: ClaimedDueJobs
@@ -152,8 +145,7 @@ public actor SchedulerDueJobRunner {
                 return settled
             }
 
-            // A durable claim left by a prior process means the effect may
-            // have happened. Never blindly replay it.
+            // A durable claim left by a prior process means the effect may have happened. Never blindly replay it.
             for recovery in claimed.recoveredUnknown {
                 guard await recordUnknownOccurrence(recovery) else {
                     deferredJobIds.insert(recovery.jobId)
@@ -177,10 +169,7 @@ public actor SchedulerDueJobRunner {
                 continue
             }
 
-            // Each job runs under a per-kind deadline (see jobTimeoutSeconds).
-            // A blown deadline yields a loud failed(timeout) receipt, then this
-            // pass stops. The timed-out body remains lifecycle-quarantined until
-            // it actually exits, so no later scheduled effect can overlap it.
+            // A timed-out body retains execution exclusion until actual exit so no later scheduled effect can overlap it.
             let rawResult = await executeWithTimeout(job: job)
             let result = Self.attachingOccurrence(rawResult, key: job.occurrenceKey)
 
@@ -201,8 +190,7 @@ public actor SchedulerDueJobRunner {
                         "output": NativeAppSecretRedactor.redactValue(result.output),
                     ])
                 )
-                // Every settled occurrence is work this pass did, whatever its
-                // outcome; a failed job is never "nothing due".
+                // Every settled occurrence is work this pass did, whatever its outcome; a failed job is never "nothing due".
                 return true
             } catch {
                 await noteFault("\(job.name) ran (\(result.status)) but its result could not be settled: \(error.localizedDescription)")
@@ -210,7 +198,10 @@ public actor SchedulerDueJobRunner {
                     try await appendActivity(
                         jobId: job.id,
                         title: "Scheduled Desk task update failed",
-                        detail: "scheduler_settlement_unconfirmed: \(job.name): result \(result.status); settlement is unconfirmed: \(error.localizedDescription). Inspect this occurrence's retained output and delivery receipts before resuming it.",
+                        detail: """
+                            scheduler_settlement_unconfirmed: \(job.name): result \(result.status); settlement is unconfirmed: \(error.localizedDescription). \
+                            Inspect this occurrence's retained output and delivery receipts before resuming it.
+                            """,
                         status: "error",
                         payload: .object([
                             "jobId": .string(job.id),
@@ -253,14 +244,11 @@ public actor SchedulerDueJobRunner {
                     "reason": recovery.reason.map(JSONValue.string) ?? .null,
                 ])
             )
-            try await appendNotificationInbox(
+            try await tellScheduledMatter(Matter(id: Self.reconciliationItemId(for: recovery.occurrenceKey),
+                form: .words, from: "scheduler_reconciliation",
                 title: recovery.reason == nil ? "\(recovery.jobName) needs a quick check" : "\(recovery.jobName) stopped",
-                message: recovery.detail,
-                source: "scheduler_reconciliation",
-                severity: "important",
-                jobId: recovery.jobId,
-                itemId: Self.reconciliationItemId(for: recovery.occurrenceKey)
-            )
+                summary: recovery.detail, open: "page:scheduler",
+                evidence: [.init(source: "scheduler/jobs.json", id: recovery.occurrenceKey)]), reach: .person(from: nil))
             return true
         } catch {
             noteFault("Scheduler reconciliation evidence could not be written: \(error.localizedDescription)")

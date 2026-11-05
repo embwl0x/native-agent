@@ -23,34 +23,24 @@ public actor SwiftNativeAPNSSender {
         let jwt: String
         let issuedAt: Date
     }
-    /// Signed provider JWT, cached by (keyId, teamId). The actor's isolation
-    /// serializes access, so concurrent sends can never double-mint.
+    /// Actor isolation prevents concurrent sends from minting twice for the same key/team.
     private var cachedProviderToken: CachedProviderToken?
 
     /// Rejected JWTs bypass the reusable 0600 cache beside the .p8 key so the next send mints a fresh token.
     private var providerTokenRejected = false
     private var providerTokenStoreURL: URL?
 
-    /// After Apple rejects a push with `TooManyProviderTokenUpdates`, hold
-    /// re-mints for this long — Apple's remedy is to stop updating the token
-    /// and keep using the current one, not to sign a fresh JWT (which makes
-    /// the rejection worse).
+    /// Apple's TooManyProviderTokenUpdates remedy is to hold minting and reuse the current token; re-signing worsens rejection.
     static let providerTokenUpdateBackoff: TimeInterval = 10 * 60
 
-    /// Absolute reuse ceiling while a hold is active: never serve a token old
-    /// enough to cross Apple's 60-min hard expiry mid-flight.
+    /// Hold reuse must still leave enough margin to avoid Apple's 60-minute expiry in flight.
     static let providerTokenHardCap: TimeInterval = 58 * 60
 
-    /// End of the current re-mint hold, set by `noteRejection`, cleared by the
-    /// next successful mint.
     private var providerTokenHoldUntil: Date?
 
     public init() {}
 
-    /// Returns a signed provider token for the given credentials, minting only
-    /// on first use, expiry, or a credential (keyId/teamId) change. A signing
-    /// error propagates and leaves any prior cache untouched — no stale token is
-    /// silently returned, and the failure surfaces to the caller.
+    /// Mint only for first use, expiry or credential change; signing failure must surface without returning stale authority.
     func providerToken(keyId: String, teamId: String, keyPath: String) throws -> String {
         let current = Date()
         let storeURL = URL(fileURLWithPath: keyPath).deletingLastPathComponent()
@@ -61,8 +51,7 @@ public actor SwiftNativeAPNSSender {
                 cachedProviderToken = try JSONDecoder().decode(CachedProviderToken.self, from: data)
                 providerTokenStoreURL = storeURL
             } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-                // Only a missing cache admits the first mint. Other read and
-                // decode failures retain their cause at the APNs owner.
+                // Only a missing cache permits first mint; preserve all other read and decode failures.
             }
         }
         if let cached = cachedProviderToken,
@@ -73,9 +62,7 @@ public actor SwiftNativeAPNSSender {
             if age < Self.providerTokenTTL {
                 return cached.jwt
             }
-            // During a `TooManyProviderTokenUpdates` hold, keep serving
-            // the cached token past its normal TTL instead of re-minting,
-            // but never past the hard cap.
+            // A rejection hold extends normal reuse, never the hard expiry cap.
             if let hold = providerTokenHoldUntil, current < hold, age < Self.providerTokenHardCap {
                 return cached.jwt
             }
@@ -99,13 +86,7 @@ public actor SwiftNativeAPNSSender {
         }
         return jwt
     }
-    /// Class-specific APNs rejection handling (C3). `TooManyProviderTokenUpdates`
-    /// means the provider JWT was re-signed too often — the fix is to back off
-    /// on minting and respect the cached token, so start a re-mint hold. Every
-    /// other reason keeps its existing behavior. `ExpiredProviderToken` /
-    /// `InvalidProviderToken` drop the token that was rejected (only that one:
-    /// a late rejection must not discard a token minted since) so the next
-    /// send mints.
+    /// TooManyProviderTokenUpdates holds minting; expired/invalid rejections evict only the rejected token so late replies cannot discard a newer one.
     func noteRejection(reason: String?, jwt: String) throws {
         if reason == "ExpiredProviderToken" || reason == "InvalidProviderToken" {
             guard cachedProviderToken?.jwt == jwt else { return }
@@ -127,8 +108,6 @@ public actor SwiftNativeAPNSSender {
         guard reason == "TooManyProviderTokenUpdates" else { return }
         providerTokenHoldUntil = Date().addingTimeInterval(Self.providerTokenUpdateBackoff)
     }
-    /// Parses the `reason` field from an APNs error response body,
-    /// e.g. `{"reason":"BadDeviceToken"}`.
     static func rejectionReason(fromResponseBody data: Data) -> String? {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let reason = obj["reason"] as? String,

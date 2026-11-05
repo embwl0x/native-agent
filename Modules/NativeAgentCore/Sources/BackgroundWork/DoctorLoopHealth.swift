@@ -5,7 +5,8 @@ import BackgroundLoops
 import DoctorChecks
 import Privacy
 import PersistenceCore
-// Blueprint: | `DoctorLoopHealth.swift` | `DoctorLoopHealth`, `LoopHealthVerdict`; health, dormancy and schedule interpretation of supplied manager observations, plus bounded failure-receipt parsing |
+import Experiences
+// Blueprint: | `DoctorLoopHealth.swift` | `DoctorLoopHealth`, `LoopHealthVerdict`; Health and schedule rules |
 
 // Live scheduler state and bounded durable receipts distinguish persistent
 // failures from transient failures without changing scheduling or due clocks.
@@ -18,7 +19,7 @@ public enum LoopHealthLevel: String, Sendable {
     case off
     case notNeeded
 
-    /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
+    /// Shared status vocabulary keeps theme colors and badges consistent.
     public var statusText: String {
         switch self {
         case .ok: "ok"
@@ -47,34 +48,19 @@ public struct LoopHealthVerdict: Equatable, Identifiable, Sendable {
 
 public enum DoctorLoopHealth {
     public struct FailureIncident: Sendable {
-        let firstAt: Date?
-        let lastAt: Date
-        let cumulativeOccurrences: Int
+        let dates: [Date]
 
         func confirmedOccurrences(since cutoff: Date, through now: Date) -> Int {
-            if let firstAt, firstAt >= cutoff, firstAt <= lastAt, lastAt <= now {
-                return cumulativeOccurrences
-            }
-            // A coalesced incident has no timestamps for its middle failures.
-            // Across a window boundary only its endpoints are evidence.
-            var count = lastAt >= cutoff && lastAt <= now ? 1 : 0
-            if cumulativeOccurrences > 1, let firstAt, firstAt < lastAt,
-               firstAt >= cutoff, firstAt <= now {
-                count += 1
-            }
-            return count
+            dates.filter { $0 >= cutoff && $0 <= now }.count
         }
     }
 
-    /// A skip whose reason starts with this is a lane that cannot run on this
-    /// Mac (iCloud Drive off): it is shown as a WARN row with the reason rather
-    /// than folded into "nothing was due".
+    /// Unavailable work needs a warning, not a misleading nothing-due verdict.
     public static let unavailableSkipPrefix = "unavailable: "
 
     public static let iCloudDriveStep = "Open System Settings → Apple Account → iCloud → Drive and turn on Sync this Mac."
 
-    /// Restart scheduling of the loops already registered with Core's manager.
-    /// Never reassembles loops, forces a workload, or resets a due clock.
+    /// Restart registered scheduling only; never force work, reassemble loops or reset due clocks.
     public static func safeRepair(
         manager: BackgroundLoops.BackgroundLoopLifetimes
     ) async -> DoctorExecutableRepair? {
@@ -96,25 +82,23 @@ public enum DoctorLoopHealth {
         }
     }
 
-    /// Receipts inside the grace window needed to call a failure persistent
-    /// rather than a blip. At the common 5-minute tick interval the 30-minute
-    /// floor holds up to 6 ticks, so 3 = half the window solidly failing.
+    /// Three failures cover half the six common five-minute ticks in the minimum grace window.
     public static let persistentFailureThreshold = 3
 
-    /// Grace window = max(3 × registered interval, 30 min).
     public static func graceWindow(for observation: LoopStatus) -> TimeInterval {
-        max(3 * observation.interval, 30 * 60)
+        // Event failures still have a bounded observation window, without inventing a cadence.
+        guard let period = observation.wake?.period else { return 30 * 60 }
+        return max(3 * period, 30 * 60)
     }
 
-    /// How far past `nextRun` a loop may drift before Doctor calls it overdue.
-    /// Half the registered interval, floored at 60s, so ordinary tick jitter and
-    /// a tick body that legitimately runs long never flap the verdict.
+    /// Half-interval slack with a 60-second floor prevents normal jitter and long ticks from flapping health.
     public static func overdueTolerance(for observation: LoopStatus) -> TimeInterval {
-        max(observation.interval / 2, 60)
+        // An active event tick retains the watchdog's slack; idle event organs have no overdue check.
+        guard let period = observation.wake?.period else { return 60 }
+        return max(period / 2, 60)
     }
 
-    /// Pure health rule. Incidents stay compact; only occurrences confirmed
-    /// inside the loop's grace window count toward persistence.
+    /// Only occurrences proven inside the grace window count toward persistent failure.
     public static func evaluate(
         observations: [LoopStatus],
         recentFailureDates: [String: [FailureIncident]],
@@ -133,14 +117,10 @@ public enum DoctorLoopHealth {
         }
     }
 
-    /// Consecutive stream-ends (with no event in between) that turn a listener
-    /// from "restarting, may recover" into "this source is gone". Matched to
-    /// the 1s/5s/30s restart backoff: by the third end the loop has been
-    /// event-blind for over half a minute and is retrying at the ceiling.
+    /// Three consecutive ends reach the 30-second restart ceiling after over half a minute without events.
     public static let eventListenerFailureThreshold = 3
 
-    /// Verdict contribution from the EVENT lane. nil when the loop has no event
-    /// listener, or when the listener is alive and has not been flapping.
+    /// Missing or stable listeners contribute no event-source failure.
     public static func eventListenerVerdict(
         for observation: LoopStatus,
         now: Date
@@ -153,33 +133,25 @@ public enum DoctorLoopHealth {
         let restarts = listener.restartCount == 1 ? "1 restart" : "\(listener.restartCount) restarts"
         let detail = "Event listener \(listener.active ? "restarted but not yet delivering" : "is down")"
             + " (\(listener.consecutiveEnds) consecutive stream end(s), \(restarts), \(endedPhrase))"
-            + (listener.lastError.map { "; last listener error: \($0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))" } ?? "") + "."
+            + (listener.lastError.map { """
+                ; last listener error: \($0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))
+                """ } ?? "") + "."
         let level: LoopHealthLevel = listener.consecutiveEnds >= eventListenerFailureThreshold
             ? .fail
             : .warn
         return (level, detail)
     }
 
-    /// C8: how long a running loop may go without COMPLETING work before
-    /// Doctor calls it dormant. Floored at a week so a genuinely slow lane is
-    /// not slandered, and scaled to `3 × interval` so a weekly loop needs three
-    /// missed weeks — the same "three periods" shape `graceWindow` uses.
+    /// A week floor protects slow work; three intervals lets a weekly loop miss three periods before dormancy.
     public static let dormancyFloor: TimeInterval = 7 * 24 * 60 * 60
 
-    public static func dormancyThreshold(for observation: LoopStatus) -> TimeInterval {
-        max(dormancyFloor, 3 * observation.interval)
+    public static func dormancyThreshold(for observation: LoopStatus) -> TimeInterval? {
+        guard let period = observation.wake?.period else { return nil }
+        return max(dormancyFloor, 3 * period)
     }
 
-    /// True when the loop's last tick was a skip that IS evidence of health:
-    /// nothing was due, the feature is not switched on, there was no queued
-    /// work. Those are normal life for a loop, not a fault.
-    ///
-    /// A skip taken INSIDE a loop's own failure backoff is excluded because the
-    /// scheduler deliberately leaves `lastError` standing on a health-neutral
-    /// skip (see `record(outcome:)`), so `lastError == nil` is exactly "this
-    /// skip was the loop working". The single-flight coalesce skip is excluded
-    /// too: it means another tick was already running, which says nothing about
-    /// what this loop achieved.
+    /// Legitimate nothing-due or disabled skips show normal operation.
+    /// Backoff skips retain lastError, and single-flight coalescing proves no work; neither counts as healthy.
     public static func lastOutcomeWasLegitimateSkip(_ observation: LoopStatus) -> Bool {
         guard observation.lastError == nil,
               let result = observation.lastResult,
@@ -189,20 +161,9 @@ public enum DoctorLoopHealth {
             && reason != LoopTickOutcome.notDueSkipReason
     }
 
-    /// Verdict contribution from the WORK lane: registered, ticking, no error —
-    /// and nothing to show for it. nil for a loop that is not running (the
-    /// schedule rules already fail that), that has completed recently, or that
-    /// has not yet been given its threshold's worth of time to complete
-    /// anything.
-    ///
-    /// Dormancy requires a tick expected to complete work; legitimate skips are healthy.
-    ///
-    /// A loop that has NEVER completed is judged from `firstSeenAt` — the
-    /// durable stamp of when it was first registered. `lastRun` cannot serve:
-    /// a lane that ticks hourly and completes nothing has a fresh `lastRun`
-    /// forever, which is precisely the state this rule exists to catch. With no
-    /// first-seen stamp (a loop registered by an older build) the rule stays
-    /// silent rather than guessing.
+    /// Dormancy needs expected work and elapsed time; legitimate skips remain healthy.
+    /// Judge never-completed work from firstSeenAt: regular idle ticks keep lastRun fresh forever.
+    /// Without first-seen evidence, remain silent rather than inventing age.
     public static func dormancyVerdict(
         for observation: LoopStatus,
         now: Date
@@ -210,7 +171,7 @@ public enum DoctorLoopHealth {
         guard observation.running else { return nil }
         guard observation.lastRun != nil else { return nil }
         guard !lastOutcomeWasLegitimateSkip(observation) else { return nil }
-        let threshold = dormancyThreshold(for: observation)
+        guard let threshold = dormancyThreshold(for: observation) else { return nil }
         let reference = [observation.lastSuccessfulWorkAt, observation.firstSeenAt]
             .compactMap { $0 }
             .max()
@@ -220,7 +181,9 @@ public enum DoctorLoopHealth {
         let lead = observation.lastSuccessfulWorkAt == nil
             ? "Registered and ticking, but it has NEVER completed any work"
             : "Registered and ticking, but no work completed in \(describeAge(idle))"
-        let reason = observation.lastResult.map { "; last outcome: \($0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))" } ?? ""
+        let reason = observation.lastResult.map { """
+            ; last outcome: \($0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))
+            """ } ?? ""
         return (
             .warn,
             "\(lead) (dormancy bound \(describeAge(threshold)))\(reason)."
@@ -246,11 +209,7 @@ public enum DoctorLoopHealth {
         now: Date
     ) -> LoopHealthVerdict {
         guard let lastError = observation.lastError else {
-            // LOOPS-3: "no error recorded" is NOT the same as "healthy".
-            // A loop whose scheduler task is not active, or that is
-            // scheduled for a time long past, has produced no error
-            // precisely because it never ran. Those are the states this
-            // rule used to report green.
+            // No error can also mean no active scheduler or a starved deadline; silence is not health.
             return scheduleVerdict(for: observation, now: now)
         }
         let window = graceWindow(for: observation)
@@ -266,31 +225,23 @@ public enum DoctorLoopHealth {
             return LoopHealthVerdict(
                 loopId: observation.name,
                 level: .fail,
-                detail: "Failing persistently (at least \(recentFailures) failures in \(describeAge(window))); last tick \(age) ago; last failure: \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))."
+                detail: """
+                    Failing persistently (at least \(recentFailures) failures in \(describeAge(window))); last tick \(age) ago; last failure: \
+                    \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))).
+                    """
             )
         }
         return LoopHealthVerdict(
             loopId: observation.name,
             level: .warn,
-            // Never ticked: the lane could not be built (its configuration
-            // could not be read), so the error is why it cannot run.
+            // Before any tick, the registration error explains why the loop cannot run.
             detail: observation.lastRun == nil ? "Cannot run: \(lastError)."
                 : "Last tick failed \(age) ago: \(lastError.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))."
         )
     }
 
-    /// Verdict for a loop with no recorded error: judge whether it is actually
-    /// SCHEDULED and RUNNING rather than assuming silence means health.
-    ///
-    /// - not running          → fail (a registered loop with no active
-    ///                          scheduler task cannot tick; nothing self-clears)
-    /// - running, no nextRun  → fail (registered but never scheduled)
-    /// - never ticked, overdue→ fail (the starvation signature: the first tick
-    ///                          never fired)
-    /// - overdue past grace   → fail
-    /// - overdue past slack   → warn (may still land)
-    /// - otherwise            → the last tick's word: worked or nothing to do
-    ///                          (ok), off, not needed
+    /// Verify scheduling and liveness before accepting a clean error record.
+    /// Missing scheduling or grace-expired deadlines fail; ordinary deadline slack only warns.
     public static func scheduleVerdict(
         for observation: LoopStatus,
         now: Date
@@ -308,6 +259,9 @@ public enum DoctorLoopHealth {
         guard observation.running else {
             return verdict(.fail, "Not running: registered, but no scheduler task is active; \(lastTickPhrase)")
         }
+        guard let wake = observation.wake else {
+            return verdict(.warn, "Configured wake unavailable; \(lastTickPhrase)")
+        }
         if observation.executing {
             let age = observation.executionStartedAt
                 .map { max(0, now.timeIntervalSince($0)) }
@@ -320,6 +274,10 @@ public enum DoctorLoopHealth {
             let agePhrase = age.map { " for \(describeAge($0))" } ?? ""
             return verdict(.ok, "Active tick in progress\(agePhrase).")
         }
+        if wake.period == nil {
+            if let skip = deliberateSkipVerdict(for: observation) { return verdict(skip.level, skip.detail) }
+            return verdict(.ok, "Runs on change; no periodic tick is due; \(lastTickPhrase)")
+        }
         guard let nextRun = observation.nextRun else {
             return verdict(.fail, "Not scheduled: running, but no next tick is planned; \(lastTickPhrase)")
         }
@@ -330,17 +288,11 @@ public enum DoctorLoopHealth {
                 return verdict(.ok, "First check in \(describeAge(-overdueBy)).")
             }
             let changed = observation.lastSuccessfulWorkAt
-            guard lastOutcomeWasLegitimateSkip(observation),
-                  let reason = observation.lastResult?.dropFirst("skipped: ".count) else {
+            guard lastOutcomeWasLegitimateSkip(observation) else {
                 let changedPhrase = changed.map { "\(describeAge(now.timeIntervalSince($0))) ago" } ?? "never"
                 return verdict(.ok, "Worked \(describeAge(now.timeIntervalSince(lastRun))) ago; last changed something \(changedPhrase).")
             }
-            for (prefix, level, word) in [(unavailableSkipPrefix, LoopHealthLevel.warn, "Unavailable"),
-                                          (LoopTickOutcome.offPrefix, .off, "Off"),
-                                          (LoopTickOutcome.notNeededPrefix, .notNeeded, "Not needed")]
-            where reason.hasPrefix(prefix) {
-                return verdict(level, "\(word): \(reason.dropFirst(prefix.count)).")
-            }
+            if let skip = deliberateSkipVerdict(for: observation) { return verdict(skip.level, skip.detail) }
             let since = changed ?? observation.firstSeenAt
             return verdict(.ok, since.map { "Nothing to do since \(Self.day($0))." } ?? "Nothing to do on the last check.")
         }
@@ -354,6 +306,18 @@ public enum DoctorLoopHealth {
         return verdict(.warn, "Overdue by \(describeAge(overdueBy)); \(lastTickPhrase)")
     }
 
+    private static func deliberateSkipVerdict(for observation: LoopStatus) -> (level: LoopHealthLevel, detail: String)? {
+        guard lastOutcomeWasLegitimateSkip(observation),
+              let reason = observation.lastResult?.dropFirst("skipped: ".count) else { return nil }
+        for (prefix, level, word) in [(unavailableSkipPrefix, LoopHealthLevel.warn, "Unavailable"),
+                                      (LoopTickOutcome.offPrefix, .off, "Off"),
+                                      (LoopTickOutcome.notNeededPrefix, .notNeeded, "Not needed")]
+        where reason.hasPrefix(prefix) {
+            return (level, "\(word): \(reason.dropFirst(prefix.count)).")
+        }
+        return nil
+    }
+
     private static func rank(_ level: LoopHealthLevel) -> Int {
         switch level {
         case .fail: 0
@@ -364,7 +328,6 @@ public enum DoctorLoopHealth {
         }
     }
 
-    /// Month-day on this Mac's calendar ("10-09").
     public static func day(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "MM-dd"
@@ -379,40 +342,15 @@ public enum DoctorLoopHealth {
         return "\(Int(s / 86400))d"
     }
 
-    /// Parses compact failure incidents per loop from the scheduler's durable
-    /// receipts file (logs/background_loop_failures.jsonl). Bounded: reads at
-    /// most the trailing `maxBytes` of the file and the newest `maxReceipts`
-    /// rows, so a months-old file cannot balloon a Doctor load.
+    /// Fold the newest incidents from occurrence details; every timestamp can prove grace-window membership.
     public static func recentFailureDates(
-        receiptsFile: URL,
-        maxBytes: Int = 512 * 1024,
+        dataRoot: URL,
         maxReceipts: Int = 500
-    ) throws -> [String: [FailureIncident]] {
-        guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(receiptsFile, limit: .max, maxBytes: maxBytes) else { return [:] }
+    ) async throws -> [String: [FailureIncident]] {
+        let incidents = try await LoopFailureReceipts.incidents(dataRoot: dataRoot, limit: maxReceipts)
         var result: [String: [FailureIncident]] = [:]
-        // Drop the first line when we started mid-file: it is almost certainly
-        // a partial JSON row.
-        let usable = read.lines.dropFirst(read.leadingFragment ? 1 : 0)
-        for line in usable.suffix(maxReceipts) {
-            guard let row = try JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  let loopId = row["loopId"] as? String else {
-                throw PersistenceCoreError.ioFailure("Loop failure history at \(receiptsFile.path) contains a malformed row; repair the retained ledger before judging loop health")
-            }
-            let timestamp = (row["lastAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
-            guard let date = NativeTimestampFormat.parseISO8601(timestamp) else {
-                throw PersistenceCoreError.ioFailure("Loop failure history at \(receiptsFile.path) has an invalid lastAt/createdAt timestamp for \(loopId); repair the retained ledger before judging loop health")
-            }
-            let firstTimestamp = (row["firstAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
-            let firstAt = NativeTimestampFormat.parseISO8601(firstTimestamp)
-            guard let firstAt, firstAt <= date,
-                  let occurrences = row["occurrences"] as? Int, occurrences > 0 else {
-                throw PersistenceCoreError.ioFailure("Loop failure history at \(receiptsFile.path) has invalid firstAt/occurrences for \(loopId); repair the retained ledger before judging loop health")
-            }
-            result[loopId, default: []].append(FailureIncident(
-                firstAt: firstAt,
-                lastAt: date,
-                cumulativeOccurrences: occurrences
-            ))
+        for incident in incidents {
+            result[incident.loopId, default: []].append(FailureIncident(dates: incident.dates))
         }
         return result
     }
@@ -422,17 +360,13 @@ public enum DoctorLoopHealth {
     /// `live.` excludes this mounted fleet from offline and onboarding rollups.
     public static let doctorCheckID = "live.background_loops"
 
-    /// Roll up failing > dormant > degraded > off > not needed > healthy;
-    /// off and not needed never count as healthy. Read the existing dormancy
-    /// verdict, preserving the schedule/error lanes' failing precedence.
+    /// Error and schedule failures outrank dormancy; off and not-needed never count as healthy.
     public static func doctorCheck(
         observations: [LoopStatus],
         recentFailureDates: [String: [FailureIncident]],
         now: Date
     ) -> CheckResult {
-        // Absence of loops is no signal, never health: the app registers its
-        // fleet at launch, so an empty status list means the scheduler has not
-        // come up (or has gone away) rather than that everything is fine.
+        // The fleet registers at launch; an empty status list proves no scheduler health.
         guard !observations.isEmpty else {
             return CheckResult(source: "Background loop registrations",
                 id: doctorCheckID,
@@ -476,8 +410,7 @@ public enum DoctorLoopHealth {
         if notNeeded > 0 { counts.append("\(notNeeded) not needed") }
         counts.append("\(healthy) healthy")
         var detail = "\(verdicts.count) background loop(s): \(counts.joined(separator: ", "))"
-        // `evaluate` sorts worst-first, so the head of the list IS the worst
-        // offender; naming it means the pill's tooltip points somewhere.
+        // Worst-first ordering lets the tooltip name the actual worst offender.
         if let worst = verdicts.first, worst.level.isFault {
             detail += "; worst: \(worst.loopId) — \(worst.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))"
         }

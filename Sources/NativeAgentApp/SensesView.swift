@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import Senses
 import EngineRuntime
-// Blueprint: | `SensesView.swift` | `SensesView`; engine Senses projection with scoped changes and actual live watches, lifecycle controls and native share picker |
+// Blueprint: | `SensesView.swift` | `SensesView`: engine projection, scoped changes, live watches and lifecycle controls |
 
 
 struct SensesView: View {

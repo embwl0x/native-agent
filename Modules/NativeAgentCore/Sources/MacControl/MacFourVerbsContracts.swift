@@ -4,23 +4,16 @@ import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `MacFourVerbsContracts.swift` | `MacFourVerbsSupplementalTarget`, `MacFourVerbsSupplement`, `MacFourVerbsSupplementalPerceptionSource`; four verbs dispatch through `MacControlClient`; permissionRemedy is the shared macOS grant remedy builder consumed by SystemPermissionPreflight and lower-level MacControl producers |
 
-/// A target discovered by the fused screenshot/vision lane. The addressing
-/// tokens remain on this side of the four-verb wall: the model sees the label
-/// or role ordinal, while the implementation may use a current view mark or a
-/// confidence-gated physical point.
+/// Vision addressing tokens stay private; the model addresses labels or role ordinals, not motor coordinates.
 public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
-    /// The real AX role, when this target came from accessibility.
     public let role: String?
     public let actions: [String]
     public let settableAttributes: [String]
-    /// The screenshot mark's AX identity, private to fusion and never an
-    /// action authority or a rendered name. Nil denotes pixel-only evidence.
+    /// AX identity is private fusion evidence, never an action authority; nil means pixel-only evidence.
     public let sourceAXPath: [Int]?
     public let enabled: Bool?
     public let label: MacScreenText?
-    /// Exact natural names for the same target. They add no second address and
-    /// resolve through the ordinary ambiguity rules when several objects share
-    /// an appearance.
+    /// Aliases share one target and ordinary ambiguity rules; they do not create another address.
     public let aliases: [String]
     public let kind: String
     public let secret: Bool
@@ -33,12 +26,9 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
     public let mark: Int?
     public let ordinal: Int?
     public let regionOnly: Bool
-    /// Pixel evidence can pin a useful place without knowing what kind of UI
-    /// object occupies it. Such a target may receive literal hand gestures,
-    /// but must never be promoted into type/select/toggle/dismiss semantics.
+    /// Pixel-only evidence permits literal gestures, never inferred type/select/toggle/dismiss semantics.
     public let physicalOnly: Bool
-    /// The live vision owner has not yet distinguished motion from a jump.
-    /// A time-sensitive click may collect bounded fresh frames before aiming.
+    /// Unresolved motion may earn bounded fresh frames before a time-sensitive click.
     public let motionUncertain: Bool
 
     public init(
@@ -84,9 +74,7 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
     }
 }
 
-/// Additive evidence from the fused screenshot lane. It never replaces AX:
-/// semantic targets win when both organs describe the same region, and this
-/// fills only the things AX could not name plus genuinely pixel-only regions.
+/// Vision adds evidence without replacing AX; semantic targets win where both describe the same region.
 public struct MacFourVerbsSupplement: Sendable, Equatable {
     public let appName: String?
     public let bundleIdentifier: String?
@@ -97,11 +85,9 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
     public let controls: [MacScreenRender.Control]
     public let values: [MacScreenRender.Value]
     public let targets: [MacFourVerbsSupplementalTarget]
-    /// Other apps' windows above this one, in screen points (wherever the
-    /// pixels came from): where a physical act must not land or pass.
+    /// Occluding windows bound where physical acts may land or pass, regardless of the pixels’ source.
     public let obstructions: [MacAXFrame]
-    /// Non-rendered, handle-free telemetry for diagnosing the perception
-    /// boundary. This never becomes screen prose or an action authority.
+    /// Fusion telemetry never becomes screen prose or action authority.
     public let diagnostics: [String: JSONValue]
 
     public init(
@@ -132,9 +118,8 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
 }
 
 public protocol MacFourVerbsSupplementalPerceptionSource: Sendable {
-    func observe(app: String?) async -> MacFourVerbsSupplement?
-    /// The last observed supplement was not this look's own window and was
-    /// discarded; a source must drop anything it kept from that capture.
+    func observe(app: String?, turn: Turn, context: MacOperationContext) async -> MacFourVerbsSupplement?
+    /// Discard supplements from another window so retained pixels cannot contaminate this look.
     func rejected()
 }
 
@@ -151,9 +136,7 @@ public enum MacTypeMode: String, Sendable {
     case replace, append
 }
 
-/// A place on an image she was handed, in that image's pixels: `at` (a
-/// drag's start) and a drag's end `to`. `image` is its frame id; nil is her
-/// session's latest. Only the hands turn it into a screen point.
+/// Image points stay in delivered-image pixels; only the hands resolve them to screen coordinates.
 public struct MacImagePlace: Sendable, Equatable {
     public let image: String?
     public let at: MacPointerPosition
@@ -166,9 +149,7 @@ public struct MacImagePlace: Sendable, Equatable {
     }
 }
 
-/// Her-screen Phase 5 — one step of a batched `act`: a verb, a name (or a
-/// place on an image, or a recorded frame/handle identity), text/mode for `type`, a named drag's `to`, and the
-/// same held keys and mouse button as a single act. No repeat inside a step.
+/// Batch steps share single-act addressing and held-input semantics; repeats belong outside the step.
 public struct MacActStep: Sendable, Equatable {
     public let verb: String
     public let target: String
@@ -199,23 +180,16 @@ public struct MacActStep: Sendable, Equatable {
 
 // MARK: - The reply
 
-/// What a verb answers with.
-///
-/// `text` answers in prose with the screen. `detail` carries diagnostics and
-/// workspace-owned exact references, including frame IDs and selection receipts;
-/// ordinary named actions resolve their targets from a fresh observation.
+/// Diagnostics retain workspace-owned exact references; named actions still resolve against a fresh observation.
 public struct MacFourVerbsReply: Sendable, Equatable {
     public let ok: Bool
     public let text: String
     public let detail: [String: JSONValue]
 
-    /// Effect comparison keeps complete readouts internally. The agent sees
-    /// their bounded SAYS rendering and can ask screen(part:) for more, rather
-    /// than receiving the same strings twice more in diagnostic arrays.
+    /// Keep complete readouts for effect comparison; render bounded SAYS text once and expose the rest through screen(part:).
     public var agentDetail: [String: JSONValue] {
         var visible = detail.filter { $0.key != "vision_value_text" && $0.key != "vision_effect_value_text" }
-        // Keep the motor's typed settlement vocabulary inside the runtime;
-        // the receipt says plainly what its observed verdict means.
+        // Keep motor settlement types private while the receipt explains the observed verdict.
         if visible["verification"] == .string("satisfied") { visible["verification"] = .string("verified") }
         return visible
     }
@@ -234,16 +208,21 @@ public struct MacFourVerbsReply: Sendable, Equatable {
         let pane: String, capability: String
         switch code {
         case "accessibility_not_trusted", "accessibility_permission_missing":
-            pane = "Accessibility"; capability = "accessibility"
+            pane = accessibilityGrantName; capability = "privacy:accessibility"
         case "screen_recording_not_trusted":
-            pane = "Screen Recording"; capability = "screenRecording"
+            pane = "Screen Recording"; capability = "privacy:screenRecording"
         default: return nil
         }
         return permissionRemedy(capability, name: pane)
     }
 
-    /// Shared by the MacIntegration preflight and its lower-level MacControl
-    /// producers, which cannot import the module that depends on them.
+    /// The name the person sees for the Accessibility grant: macOS 27 calls it Device Control and Data Access. Its pane anchor and TCC service are
+    /// unchanged. SystemPermissionPreflight's grant vocabulary reads this one name.
+    public static let accessibilityGrantName = ProcessInfo.processInfo.isOperatingSystemAtLeast(
+        OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)) ? "Device Control and Data Access" : "Accessibility"
+
+    /// MacControl cannot import its dependent MacIntegration module, so both share this remedy builder. `capability` is the card's own target:
+    /// privacy:<grant> or applescript:<bundle_id>, which permissions.request hands to its card unchanged.
     public static func permissionRemedy(_ capability: String, name: String,
                                         mode: InlineInteraction.AccessMode? = nil) -> JSONValue {
         var args: [String: JSONValue] = ["capability": .string(capability),

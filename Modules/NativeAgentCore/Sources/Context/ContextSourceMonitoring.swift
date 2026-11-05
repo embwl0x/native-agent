@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `ContextSourceMonitoring.swift` | `ContextSourceRegistry`, monitor and coalescer: explicit source allowlists, owner inventories and bounded directory invalidations |
+// Blueprint: | `ContextSourceMonitoring.swift` | `ContextSourceRegistry`: allowlists, owner inventories and bounded invalidation |
 
 public struct ContextSourceRegistration: Sendable, Equatable {
     public let descriptor: ContextSourceDescriptor
@@ -30,8 +30,7 @@ public enum ContextSourceRegistryError: Error, Equatable, Sendable {
     case duplicateSource(String)
 }
 
-/// Explicit source allowlist. Registering one project file never authorizes a
-/// scan of its parent tree or any other path on the Mac.
+/// Explicit source allowlist. Registering one project file never authorizes a scan of its parent tree or any other path on the Mac.
 public actor ContextSourceRegistry {
     private var allowedRoots: Set<URL>
     private var registrations: [ContextSourceID: ContextSourceRegistration] = [:]
@@ -69,9 +68,8 @@ public actor ContextSourceRegistry {
         authoritativeOwners.insert(owner)
     }
 
-    /// `replaceOwned` declares each owner's complete inventory, including an
-    /// empty inventory so a removed owner's last source can be
-    /// retired even when discovery starts against a persisted generation.
+    /// `replaceOwned` declares each owner's complete inventory, including an empty inventory so a removed owner's last source can be retired even when
+    /// discovery starts against a persisted generation.
     public func authoritativeSourceIDsByOwner() -> [String: Set<ContextSourceID>] {
         var result = Dictionary(uniqueKeysWithValues: authoritativeOwners.map {
             ($0, Set<ContextSourceID>())
@@ -100,8 +98,7 @@ public actor ContextSourceRegistry {
 
     public func watchedDirectories() -> [URL] {
         var directories = Set(registrations.values.map { $0.fileURL.deletingLastPathComponent() })
-        // Parent watches catch directory replacement so the child watch can be
-        // rearmed after editors or migrations swap whole directories.
+        // Parent watches catch directory replacement so the child watch can be rearmed after editors or migrations swap whole directories.
         for directory in Array(directories) {
             directories.insert(directory.deletingLastPathComponent())
         }
@@ -139,8 +136,7 @@ public actor ContextSourceRegistry {
     }
 }
 
-/// Process-owned directory watcher group. It emits only dirty-directory
-/// signals; the coordinator rereads registered canonical sources afterward.
+/// Process-owned directory watcher group. It emits only dirty-directory signals; the coordinator rereads registered canonical sources afterward.
 public actor ContextSourceMonitor {
     public typealias DirectoryChangeSink = @Sendable (URL) async -> Void
 
@@ -240,8 +236,7 @@ public actor ContextSourceEventCoalescer {
         let directories = dirtyDirectories
         dirtyDirectories.removeAll()
         guard !directories.isEmpty else { return }
-        // Retain the handler after the debounce fires. A newer burst waits for
-        // it and goes next; only shutdown cancels a running build.
+        // Retain the handler after the debounce fires. A newer burst waits for it and goes next; only shutdown cancels a running build.
         activeFlush = Task {
             if !Task.isCancelled { await handler(directories) }
             activeFlush = nil

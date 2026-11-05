@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-// Blueprint: | `ProcessTreeReaper.swift` | `ProcessTreeReaper` exposes checked process-identity observations for resource accounting; termination signals only the group established before exec by `OwnedProcessGroup`, with its leader retained until settlement; unavailable enumeration remains explicit evidence |
+// Blueprint: | `ProcessTreeReaper.swift` | `ProcessTreeReaper`, `OwnedProcessGroup`: identity-bound process evidence |
 
 public struct ProcessTreeIdentity: Sendable, Equatable, Hashable {
     public let pid: Int32
@@ -12,15 +12,15 @@ public struct ProcessTreeIdentity: Sendable, Equatable, Hashable {
     }
 }
 
-/// Inspection is evidence for resource accounting, never a containment or
-/// termination mechanism. Failed inspection cannot establish an empty tree.
+/// Inspection is evidence for resource accounting, never a containment or termination mechanism. Failed inspection cannot establish an empty tree.
 public struct ProcessTreeSnapshot: Sendable, Equatable {
     public let rootPID: Int32
     public let rootIdentity: ProcessTreeIdentity?
     public let descendants: [ProcessTreeIdentity]
     public let inspectionFailure: String?
     public let groupOwnerID: UUID?
-    public init(rootPID: Int32, rootIdentity: ProcessTreeIdentity?, descendants: [ProcessTreeIdentity], inspectionFailure: String? = nil, groupOwnerID: UUID? = nil) {
+    public init(rootPID: Int32, rootIdentity: ProcessTreeIdentity?, descendants: [ProcessTreeIdentity], inspectionFailure: String? = nil,
+        groupOwnerID: UUID? = nil) {
         self.rootPID = rootPID; self.rootIdentity = rootIdentity
         self.descendants = descendants; self.inspectionFailure = inspectionFailure
         self.groupOwnerID = groupOwnerID
@@ -57,12 +57,13 @@ public enum ProcessTreeReaper {
             return ProcessTreeSnapshot(rootPID: rootPID, rootIdentity: root, descendants: descendants, groupOwnerID: ownerID)
         } catch {
             return ProcessTreeSnapshot(rootPID: rootPID, rootIdentity: root, descendants: descendants,
-                inspectionFailure: "Process tree \(rootPID) could not be inspected: \(error.localizedDescription). Its descendants are unknown.", groupOwnerID: ownerID)
+                inspectionFailure: """
+                    Process tree \(rootPID) could not be inspected: \(error.localizedDescription). Its descendants are unknown.
+                    """, groupOwnerID: ownerID)
         }
     }
 
-    /// Only a still-owned unreaped child grants permission to signal a PGID.
-    /// No descendant enumeration, direct PID, or second mechanism is used.
+    /// Only a still-owned unreaped child grants permission to signal a PGID. No descendant enumeration, direct PID, or second mechanism is used.
     @discardableResult public static func signal(_ snapshot: ProcessTreeSnapshot, signal: Int32) -> Bool {
         guard let owner = OwnedProcessGroup.owner(snapshot.rootPID), owner.identity == snapshot.groupOwnerID else { return false }
         return owner.send(signal)
@@ -72,7 +73,9 @@ public enum ProcessTreeReaper {
         guard let owner = OwnedProcessGroup.owner(snapshot.rootPID), owner.identity == snapshot.groupOwnerID else {
             return ProcessTreeSnapshot(rootPID: snapshot.rootPID, rootIdentity: snapshot.rootIdentity,
                 descendants: snapshot.descendants,
-                inspectionFailure: "No retained child owns process group \(snapshot.rootPID); termination was not attempted.", groupOwnerID: snapshot.groupOwnerID)
+                inspectionFailure: """
+                    No retained child owns process group \(snapshot.rootPID); termination was not attempted.
+                    """, groupOwnerID: snapshot.groupOwnerID)
         }
         guard owner.send(SIGSTOP) else { return snapshot }
         if owner.send(SIGKILL) { owner.observeStop() }

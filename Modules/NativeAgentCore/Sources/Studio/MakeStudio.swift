@@ -5,26 +5,25 @@ import Observation
 import AuthoredCapabilities
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MakeStudio.swift` | Root-scoped artifact metadata, native decoding, durable version allocation and previews; generated-image registration is editable `Resources/abilities/make-generated.js`, composing native raw generation results with `make.add` (prompt/model metadata retained); native generation receipt paths are scoped to that call, and the registration primitive admits those verified app outputs while arbitrary files retain the workspace fence; `MakeStudio.Shelf` owns watcher/coalescing lifetime and publishes its read results through `LatestRead`; each preview file/revision owns L0 `PartFaces` for editable `Resources/abilities/make-title.js` (HTML title → prompt → filename); native unavailable/failed status accompanies the face, views only read their preview's snapshots; shutdown drains projections and cancellation never rearms a retired shelf |
+// Blueprint: | `MakeStudio.swift` | Root-scoped artifact metadata, native decoding, durable version allocation and previews; generated-image registration is editable `Resources/abilities/make-generated.js`, composing native raw generation results with `make.add` (prompt/model metadata retained); `MakeRegistration` explicitly carries native generation receipt paths to that registration call, and the registration primitive admits those verified app outputs while arbitrary files retain the workspace fence; `MakeStudio.Shelf` owns watcher/coalescing lifetime and publishes its read results through `LatestRead`; each preview file/revision owns L0 `PartFaces` for editable `Resources/abilities/make-title.js` (HTML title → prompt → filename); native unavailable/failed status accompanies the face, views only read their preview's snapshots; shutdown drains projections and cancellation never rearms a retired shelf |
 
-/// What she makes for User: mockups, screens, icons, artwork. Each piece is a
-/// ref with numbered versions, so an earlier one stays one click back and a
-/// comment can name the exact version it is about.
-///
-/// <dataRoot>/make/<ref>/v<N>.<ext> + meta.json. Beside generated_images and
-/// apart from studio/ (her taste journal), so a ref folder never reads as one
-/// of the journal's. A version is a copy: what User commented on stays as it was.
+/// Native receipts admitted for one registration operation. Parts cannot supply this evidence in their input.
+public struct MakeRegistration: Sendable {
+    public let generatedImagePaths: Set<String>
+    public init(generatedImagePaths: Set<String>) { self.generatedImagePaths = generatedImagePaths }
+}
+
+/// Numbered copies keep each version and the user's comments tied to unchanged bytes. Store refs under make/, apart from the taste journal's studio/ directory
+/// to prevent identity collisions.
 public struct MakeStudio: Sendable {
-    /// Native generation receipt paths, scoped to its registration call. A
-    /// part cannot add provenance by naming a file or a directory in its input.
-    @TaskLocal public static var generatedImagePaths: Set<String> = []
-
     public struct Version: Codable, Sendable, Equatable {
         public let n: Int
         public let file: String
         public let prompt: String?
         public let model: String?
         public let created: String
+        /// Native provenance for another agent's output registered as the agent's: "made by ‹contact› for ‹job›". The agent's own versions have none.
+        public var madeBy: String?
     }
 
     public struct Meta: Codable, Sendable, Equatable {
@@ -99,9 +98,9 @@ public struct MakeStudio: Sendable {
             .max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") }
     }
 
-    /// Copies `file` in as the next version of `ref`, or of a new ref when nil.
     @discardableResult
-    public func add(_ file: URL, ref: String? = nil, prompt: String? = nil, model: String? = nil) throws -> (ref: String, version: Version) {
+    public func add(_ file: URL, ref: String? = nil, prompt: String? = nil, model: String? = nil,
+                    madeBy: String? = nil) throws -> (ref: String, version: Version) {
         let ref = ref?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         return try CredentialFileLock.withLock(root) {
             var meta: Meta
@@ -119,7 +118,7 @@ public struct MakeStudio: Sendable {
             }
             let ext = file.pathExtension.lowercased()
             let version = Version(n: n, file: ext.isEmpty ? "v\(n)" : "v\(n).\(ext)", prompt: prompt, model: model,
-                                  created: NativeTimestampFormat.sixDigitUTCOffset(Date()))
+                                  created: NativeTimestampFormat.sixDigitUTCOffset(Date()), madeBy: madeBy)
             let dir = folder(meta.ref)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let copy = try checkedDestination(meta.ref, file: version.file)
@@ -130,8 +129,7 @@ public struct MakeStudio: Sendable {
             do {
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(meta), to: checkedDestination(meta.ref, file: "meta.json"))
             } catch let writeError {
-                // A directory-sync error can follow the metadata rename. Keep a
-                // referenced copy (or an unreadable commit); remove only a known orphan.
+                // A directory-sync error can follow the metadata rename. Keep a referenced copy (or an unreadable commit); remove only a known orphan.
                 do {
                     if try readMeta(meta.ref)?.versions.contains(version) != true {
                         try FileManager.default.removeItem(at: copy)
@@ -146,7 +144,7 @@ public struct MakeStudio: Sendable {
 }
 
 extension MakeStudio {
-    /// Prepared off-main, then handed to the renderer without mutating its image.
+    /// Prepare off-main without mutating the image handed to the renderer.
     public struct Preview: Sendable {
         public let file: URL
         public let revision: Int
@@ -165,7 +163,7 @@ extension MakeStudio {
                 ? URL(fileURLWithPath: path, isDirectory: true) : nil
         }
         var target = project?.appendingPathComponent(name)
-        // Never over a file already there: the panel asks first.
+        // Preserve an existing destination until the panel confirms replacement.
         if let planned = target, FileManager.default.fileExists(atPath: planned.path)
             || FileManager.default.fileExists(atPath: planned.deletingPathExtension().appendingPathExtension("prompt.txt").path) {
             target = nil
@@ -176,7 +174,7 @@ extension MakeStudio {
     public struct ExportResult: Sendable {
         public enum Output: Sendable {
             case saved(URL)
-            /// An atomic write threw; its final effect has not been established.
+            /// A thrown atomic write leaves its final effect unconfirmed.
             case unconfirmed(URL, String)
             case notAttempted(URL)
 
@@ -193,10 +191,9 @@ extension MakeStudio {
         public var message: String { "Work: \(work.message) Prompt: \(prompt.message)" }
     }
 
-    /// One owner prepares both outputs before replacing either, then reports
-    /// each replacement independently. Two file replacements are not a transaction.
+    /// One owner prepares both outputs before replacing either, then reports each replacement independently. Two file replacements are not a transaction.
     public static func export(_ file: URL, to target: URL, prompt: String) throws -> ExportResult {
-        // The same file by identity (a hard link or symlink too), not by path.
+        // Compare file identity so hard links and symlinks cannot bypass the same-file check.
         func identity(_ url: URL) throws -> (system: NSNumber, file: NSNumber)? {
             let attributes: [FileAttributeKey: Any]
             do { attributes = try FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path) }
@@ -225,7 +222,7 @@ extension MakeStudio {
         return ExportResult(work: .saved(target), prompt: .saved(sidecar))
     }
 
-    /// One event-driven index serves the visible shelf and the auto-open signal.
+    /// Share one event-driven index so the visible shelf and auto-open signal cannot disagree.
     @MainActor
     @Observable
     public final class Shelf {
@@ -233,8 +230,7 @@ extension MakeStudio {
         private var refs: [String] = []
         public private(set) var newest: MakeStudio.Meta?
         public private(set) var loaded = false
-        /// Why the shelf shows less than the disk holds; the last good
-        /// membership and metadata stand meanwhile, never an empty shelf.
+        /// Keep last-good membership and metadata visible when the disk read is incomplete.
         public private(set) var fault: String?
         private nonisolated let studio: MakeStudio
         private var watcher: FileChangeWatcher?
@@ -258,7 +254,8 @@ extension MakeStudio {
         public nonisolated func folder(_ ref: String) -> URL { studio.folder(ref) }
 
         public func preview(_ ref: String, _ version: Version, revision: Int) async -> Preview {
-            if stopped || Task.isCancelled { return Preview(file: file(ref, version), revision: revision, titleFaces: nil, image: nil, imageFailure: "Image preview preparation stopped.") }
+            if stopped || Task.isCancelled { return Preview(file: file(ref, version), revision: revision, titleFaces: nil, image: nil,
+                imageFailure: "Image preview preparation stopped.") }
             let id = UUID()
             let read = Task { await preparePreview(ref, version, revision: revision) }
             previewReads[id] = read
@@ -292,7 +289,7 @@ extension MakeStudio {
                     image, imageFailure)
             }
             let (input, unavailable, image, imageFailure) = await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
-            // Each file/revision has its own source, including concurrent page renders.
+            // Scope sources per file and revision so concurrent previews cannot publish each other's titles.
             let key = "\(file.path) \(revision)"
             let faces = titleProjections[key]?.faces ?? PartFaces(dataRoot: studio.dataRoot, call: project)
             if !stopped, !Task.isCancelled {
@@ -322,7 +319,7 @@ extension MakeStudio {
             changed(studio.root)
         }
 
-        /// Terminal engine shutdown retires this root's shelf and its reads.
+        /// Retire shelf reads at engine shutdown so they cannot rearm observers.
         public func shutdown() -> Task<Void, Never> {
             stopped = true
             lifecycle = UUID()
@@ -399,8 +396,7 @@ extension MakeStudio {
             }
         }
 
-        /// Every ref's meta, not only the shown one's: a new version of another
-        /// ref is the new newest. A new ref changes the set, so it is re-armed.
+        /// Watch every ref: any new version can become newest, and a new ref requires rearming membership observation.
         private func rearm(_ studio: MakeStudio) {
             let paths = [studio.root] + refs.sorted().map { studio.folder($0).appendingPathComponent("meta.json") }
             guard paths != armed else { return }

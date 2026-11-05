@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded resident generations, immutable snapshot leases, serialized publication and honest pressure accounting |
+// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded generations, leases and pressure |
 
 public enum ContextArenaBudget: Int, CaseIterable, Sendable, Codable {
     case mib32 = 32
@@ -221,8 +221,7 @@ public struct ContextArenaMetrics: Sendable, Equatable {
     public let prewarmingAllowed: Bool
 }
 
-/// Idempotent pin for one immutable snapshot. Explicit release is preferred;
-/// deinitialization is a final safety net.
+/// Explicit release promptly unpins the snapshot; deinitialization still releases an abandoned lease.
 public final class ContextGenerationLease: @unchecked Sendable {
     public let snapshot: ContextGenerationSnapshot
 
@@ -253,8 +252,7 @@ public final class ContextGenerationLease: @unchecked Sendable {
     }
 }
 
-/// Bounded logical RAM arena. All swaps and lease accounting are serialized by
-/// one short-held lock; snapshot construction happens before that lock is taken.
+/// One short-held lock serializes swaps and lease accounting; construct snapshots before taking it.
 public final class ContextArena: @unchecked Sendable {
     public static let defaultHotTierByteLimit = 16 * 1_048_576
 
@@ -333,9 +331,7 @@ public final class ContextArena: @unchecked Sendable {
         )
     }
 
-    /// Replaces resident mirrors/index metadata without inventing a durable
-    /// generation. Valid only for the exact published source fingerprint and
-    /// while normal-pressure prewarming is allowed.
+    /// Refresh mirrors only for the exact published source fingerprint while normal-pressure prewarming is allowed; do not invent a durable generation.
     @discardableResult
     public func rehydrate(
         _ candidate: ContextGenerationSnapshot
@@ -417,8 +413,7 @@ public final class ContextArena: @unchecked Sendable {
 
         state.pressure = pressure
         state.prewarmingAllowed = pressure == .normal
-        // Entries describe payload retained by the generation owner; removing
-        // descriptors cannot free it. Pressure closes optional prewarming only.
+        // Descriptors cannot free payload retained by the generation owner; pressure closes optional prewarming only.
         let snapshot = current.snapshot
         return ContextArenaTrimReceipt(
             pressure: pressure,

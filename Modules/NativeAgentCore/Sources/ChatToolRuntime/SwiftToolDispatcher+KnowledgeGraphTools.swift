@@ -10,21 +10,17 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+KnowledgeGraphTools.swift` | `SwiftToolDispatcher`: `impl_search_kg`, `kgSeenDate`; failed semantic recall or graph hydration returns partial search with the checked read's cause |
+// Blueprint: | `SwiftToolDispatcher+KnowledgeGraphTools.swift` | `SwiftToolDispatcher`, `impl_search_kg`, `kgSeenDate`; partial search preserves causes |
 
 // MARK: - Knowledge graph tools
 
 extension SwiftToolDispatcher {
     func impl_search_kg(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // Bad input is a thrown refusal before any gate, so an empty call is
-        // an error whatever the switch says.
+        // Bad input is a thrown refusal before any gate, so an empty call is an error whatever the switch says.
         let openID = optionalString(input, "entity_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let query = optionalString(input, "query")
         let limit = min(100, max(1, Self.jsonInt(input["limit"]) ?? 10))
-        // The Knowledge Graph page's filters: its type/kind menus (one
-        // attribute, entity.type) and its time window on last_seen, falling
-        // back to first_seen.
+        // Share the page’s entity.type and seen-date filters so both doors browse the same graph.
         let types = Set((optionalString(input, "type") ?? "")
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -71,7 +67,6 @@ extension SwiftToolDispatcher {
             graphPath: knowledgeGraphPath
         )
         if let openID {
-            // The page's entity detail: MemoryFacade.neighborhood's read.
             guard case .found(.object(let found)) = try await reader.entityChecked(id: openID),
                   let entity = found["entity"], permitsDisclosure(entity) else {
                 return .object([
@@ -113,8 +108,7 @@ extension SwiftToolDispatcher {
             ])
         }
         guard let query else {
-            // Filters with no text browse the whole graph, as the page does
-            // with an empty search field.
+            // Filters with no text browse the whole graph, as the page does with an empty search field.
             var rows: [JSONValue] = []
             var page = 0
             while rows.count < limit, page < 500 {
@@ -174,8 +168,7 @@ extension SwiftToolDispatcher {
                 via[nodeID, default: []].append(lexical ? "keyword" : "meaning")
             }
         } catch {
-            // Preserve text hits, but neither a failed recall nor failed graph
-            // hydration proves complete semantic coverage.
+            // Preserve text hits, but neither a failed recall nor failed graph hydration proves complete semantic coverage.
             meaningSearch = "unavailable"
             meaningSearchError = error.localizedDescription
         }
@@ -191,7 +184,6 @@ extension SwiftToolDispatcher {
         return .object(answer)
     }
 
-    /// The Knowledge Graph page's date reading (KnowledgeGraphView.parseKGDate).
     static func kgSeenDate(_ s: String) -> Date? {
         if let date = NativeTimestampFormat.parseISO8601FractionalFirst(s) { return date }
         let dateOnly = DateFormatter()

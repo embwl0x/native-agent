@@ -30,14 +30,13 @@ import ApplicationServices
 #endif
 #if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
-// Blueprint: | `MacScreenViewCapture.swift` | Window/display capture selection and immutable image provenance; bounded capture-time AX hit regions and event-time window/frame validation plus control validation where a named control was captured share the existing AX hit owners, and live input ownership correcting transparent backings; `SystemMacVisualObstructionProbe` and `SystemMacScreenCaptureSource`; exactly-once callback cancellation invalidates results and resumes immediately, with no cancellation-ignoring join on an unabortable ScreenCaptureKit callback |
+// Blueprint: | `MacScreenViewCapture.swift` | `SystemMacVisualObstructionProbe`, `SystemMacScreenCaptureSource`: Exact capture, hit evidence and cancellation |
 #endif
 
 // MARK: - Production capture source (ScreenCaptureKit)
 
 #if canImport(CoreGraphics)
-/// Select in global logical points, never display pixels: neighbouring screens
-/// may have different scales, and a window's centre may sit in a desktop gap.
+/// Select in logical points because adjacent displays may differ in scale or leave a gap under the window centre.
 enum MacScreenCaptureDisplaySelection {
     static func selectedID(
         displays: [(id: UInt32, bounds: CGRect)],
@@ -66,9 +65,7 @@ enum MacScreenCaptureDisplaySelection {
     }
 }
 
-/// One window-server stacking read (Shotgun and her pointer left out: her
-/// hand passes through them): what another app's window over a frame covers.
-/// The four verbs' sight and a watch's hands share it.
+/// Sight and watch hands share one stacking read; exclude agent overlays because input passes through them.
 struct MacVisualWindowRecord: Sendable, Equatable {
     let number: Int
     let ownerPID: Int32
@@ -86,15 +83,12 @@ extension MacImageCapture {
         }, targets: nil)
     }
 
-    /// The complete existing AX walk supplies regions; the hit-test owner
-    /// supplies the identity actually reached there. Never store field values
-    /// or raw captions in the image's transport/trace metadata.
+    /// Use the complete AX walk for regions and hit-test identity for ownership; never put field values or raw captions in image metadata.
     public static func pointTargets(nodes: [MacAXNode], pid: Int32, deadline: Date,
-                                    source: any MacAXActSource) -> [PointTarget] {
-        // Spend at most 750 ms and a quarter of the existing read's remaining
-        // time. Desktop still owes its post-capture secret inspection.
+                                    source: any MacAXActSource, context: MacOperationContext) -> [PointTarget] {
+        // Cap hit reads at 750 ms and a quarter of the remaining read budget so post-capture secret inspection still has time.
         let hitDeadline = min(deadline, Date().addingTimeInterval(min(0.75, max(0, deadline.timeIntervalSinceNow / 4))))
-        return MacAXLimits.$readDeadline.withValue(hitDeadline) {
+        return context.holding(\.readDeadline, hitDeadline) { context in
             var seen = Set<MacAXFrame>()
             var hits: [MacAXFrame: MacAXActTarget] = [:]
             // Name-bearing inner controls earn the bounded hit reads first.
@@ -111,7 +105,7 @@ extension MacImageCapture {
                 if seen.insert(frame).inserted, node.attributes.title?.isEmpty == false
                     && Date() < hitDeadline && !Task.isCancelled
                     && SystemMacVisualObstructionProbe.hitPID(x: x, y: y) == pid {
-                    hits[frame] = source.elementAtPosition(x: x, y: y, pid: pid)
+                    hits[frame] = source.elementAtPosition(x: x, y: y, pid: pid, context: context)
                 }
                 let hit = hits[frame]
                 // A centre that hits a child cannot vouch for its entire parent.
@@ -133,9 +127,8 @@ extension MacImageCapture {
         #endif
     }
 
-    /// Window identity must still agree at the requested point; where a named
-    /// control was captured there, its role/label/frame must agree too.
-    func refusal(at point: MacPointerPosition, now: Date) -> (code: String, reason: String)? {
+    /// Point revalidation requires the captured window and any captured control’s role, label and frame to agree.
+    func refusal(at point: MacPointerPosition, now: Date, context: MacOperationContext) -> (code: String, reason: String)? {
         let age = now.timeIntervalSince(capturedAt)
         guard age >= 0, age <= MacLookFrameStore.ttlSeconds, !windows.isEmpty else {
             return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The image has no current capture evidence; look again with pixels:true.")
@@ -146,11 +139,11 @@ extension MacImageCapture {
         }
         guard let expected = SystemMacVisualObstructionProbe.topmost(in: captured, x: point.x, y: point.y),
               let hitPID = SystemMacVisualObstructionProbe.hitPID(x: point.x, y: point.y) else {
-            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The image's window cannot be established at that point; look again with pixels:true.")
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue,
+                "The image's window cannot be established at that point; look again with pixels:true.")
         }
         let live = SystemMacVisualObstructionProbe.windows()
-        // AX's actual input owner corrects input-transparent window-server
-        // backings, exactly as the shared obstruction owner does.
+        // AX input ownership corrects input-transparent window backings through the shared obstruction rule.
         guard let current = SystemMacVisualObstructionProbe.topmost(in: live.filter { $0.ownerPID == hitPID }, x: point.x, y: point.y) else {
             return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The current input window cannot be established; look again with pixels:true.")
         }
@@ -158,22 +151,19 @@ extension MacImageCapture {
               current.frame == expected.frame else {
             return ("window_drifted", "The captured window moved, resized, was replaced or is covered at that point; look again with pixels:true.")
         }
-        // Resolve only within the captured top window's owner. A masked front
-        // layer cannot borrow a rear layer's control. Never inherit a broad
-        // ancestor's identity when its smaller inner region lacks evidence.
+        // Resolve within the captured top owner only; masked or unavailable inner regions cannot borrow another layer’s control identity.
         let regions = (targets ?? []).filter {
             $0.pid == expected.ownerPID && $0.windowNumber == expected.number && point.isInside($0.frame)
         }
-        // A canvas, game or picture has no named control there: the window's
-        // identity checked above is the evidence, as pixel pointing needs.
-        // Absence of a control is not a refusal (10-31 review).
+        // Canvases and games may lack named controls; checked window identity still permits pixel pointing.
         guard let area = regions.map({ $0.w * $0.h }).min() else { return nil }
         let narrowest = regions.filter { $0.w * $0.h == area }
         guard let target = narrowest.first, let role = target.role, let label = target.labelDigest else { return nil }
         guard narrowest.allSatisfy({ $0 == target }), regions.allSatisfy({ target.path.starts(with: $0.path) }) else {
-            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The captured control identity is ambiguous at that point; look again with pixels:true.")
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue,
+                "The captured control identity is ambiguous at that point; look again with pixels:true.")
         }
-        guard let hit = defaultMacAXActSource().elementAtPosition(x: point.x, y: point.y, pid: hitPID) else {
+        guard let hit = defaultMacAXActSource().elementAtPosition(x: point.x, y: point.y, pid: hitPID, context: context) else {
             return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The control under the image point cannot be read; look again with pixels:true.")
         }
         guard hit.role == role, Self.labelDigest(hit.title) == label, hit.frame == target.frame else {
@@ -198,11 +188,7 @@ public struct MacVisualObstruction: Sendable, Equatable {
 public struct SystemMacVisualObstructionProbe: Sendable {
     public init() {}
 
-    /// What a pointer at the target's centre would land on is the one real
-    /// test of cover. The window server's stacking list alone is not: it
-    /// carries windows that pass input through (loginwindow's full-screen
-    /// backings sit in front of everything, at layers 2001 and 2004, on an
-    /// unlocked Mac), so every act would read as obstructed by them.
+    /// Hit-test the target centre for actual input ownership; stacking alone includes input-transparent loginwindow backings.
     public func obstructions(over frame: MacAXFrame, targetPID: Int32) -> [MacVisualObstruction] {
         let windows = Self.windows()
         let listed = Self.obstructions(in: windows, over: frame, targetPID: targetPID)
@@ -217,12 +203,7 @@ public struct SystemMacVisualObstructionProbe: Sendable {
         return [MacVisualObstruction(ownerPID: hit, ownerName: name, coverage: 1, frame: frame)]
     }
 
-    /// The process owning the accessibility element under a screen point;
-    /// nil when accessibility cannot answer (no permission, nothing there).
-    /// A system-wide hit can land in this process (the point is over her own
-    /// window); AppKit then walks her SwiftUI accessibility tree on the calling
-    /// thread, which is main-thread work, so the hit runs on the AX main lane
-    /// (10-28 23:52: a sight over her own window from a tool's task trapped).
+    /// System-wide hits may enter this app’s SwiftUI AX tree, so run them on the main AX lane.
     static func hitPID(x: Double, y: Double) -> Int32? {
         #if canImport(ApplicationServices)
         MacAXExecutionLane.sync {
@@ -238,26 +219,22 @@ public struct SystemMacVisualObstructionProbe: Sendable {
         #endif
     }
 
-    /// The window a pointer at (x, y) lands on: the topmost there that would
-    /// cover anything.
+    /// Only input-owning windows can obstruct a pointer target.
     static func topmost(in windows: [MacVisualWindowRecord], x: Double, y: Double) -> MacVisualWindowRecord? {
         windows.first { covers($0) && x >= $0.frame.x && x < $0.frame.x + $0.frame.w && y >= $0.frame.y && y < $0.frame.y + $0.frame.h }
     }
 
-    /// Visible windows above the desktop can take input. Owner names and
-    /// display-sized geometry do not establish that input passes through;
-    /// known person-only pass-through windows are excluded by `windows()`.
+    /// Names and display-sized geometry cannot prove pass-through; exclude only known person-only windows.
     private static func covers(_ window: MacVisualWindowRecord) -> Bool {
         window.alpha > 0.05 && window.layer >= 0
     }
 
-    /// On-screen windows, front to back.
     static func windows() -> [MacVisualWindowRecord] {
         guard let raw = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly], kCGNullWindowID
         ) as? [[String: Any]] else { return [] }
         return raw.compactMap { value -> MacVisualWindowRecord? in
-            // Her clicks pass through Shotgun, so it covers nothing of hers.
+            // Input passes through the pointer overlay, so it is not an obstruction.
             guard let number = value[kCGWindowNumber as String] as? Int,
                   !PersonOnlyWindows.contains(number: number),
                   let pid = value[kCGWindowOwnerPID as String] as? Int,
@@ -290,9 +267,7 @@ public struct SystemMacVisualObstructionProbe: Sendable {
         return windows[..<targetIndex].compactMap { window -> MacVisualObstruction? in
             guard covers(window) else { return nil }
             let coverage = intersectionArea(window.frame, frame) / frameArea
-            // A small dialog can completely cover a small target. Screen-area
-            // thresholds hid real obstructions on large displays. Preserve
-            // exact overlap geometry, including same-app floating windows.
+            // Keep exact overlap including same-app floating windows; even small dialogs can fully cover a target.
             guard coverage > 0 else { return nil }
             return MacVisualObstruction(ownerPID: window.ownerPID, ownerName: window.ownerName, coverage: coverage, frame: window.frame)
         }
@@ -308,19 +283,14 @@ public struct SystemMacVisualObstructionProbe: Sendable {
 
 #if canImport(ScreenCaptureKit) && os(macOS)
 
-/// SCScreenshotManager and SCShareableContent have no cancel/stop handle in
-/// ScreenCaptureKit. Invalidate the result on cancellation, resume the caller
-/// exactly once. A late callback can only consume its immutable OS value;
-/// it has no continuation or authority to mutate the cancelled growth job.
-// ScreenCaptureKit's immutable content snapshot is not annotated Sendable in
-// the SDK. Transfer it only through this callback-owned, immutable envelope.
+/// ScreenCaptureKit offers no cancellation handle: invalidate delivery and resume once, leaving late callbacks no mutation authority. Transfer its unannotated
+/// immutable snapshot only through the callback-owned envelope.
 struct MacScreenCaptureValue<Value>: @unchecked Sendable {
     let value: Value
 }
 
 func macScreenCaptureWait<Value>(
-    issue: (@escaping @Sendable (Value?, Error?) -> Void) -> Void
-) async throws -> Value {
+    context: MacOperationContext, issue: (@escaping @Sendable (Value?, Error?) -> Void) -> Void) async throws -> Value {
     try Task.checkCancellation()
     let request = ContinuationOnce<Result<MacScreenCaptureValue<Value>, Error>>()
     issue { value, error in
@@ -328,26 +298,21 @@ func macScreenCaptureWait<Value>(
         else if let value { request.resume(.success(MacScreenCaptureValue(value: value))) }
         else { request.resume(.failure(CocoaError(.coderValueNotFound))) }
     }
-    let result = await request.wait(cancellingWith: .failure(TaskWaitDeadline.cancellationError))
+    let result = await request.wait(budget: context.waitBudget, cancellingWith: .failure(context.cancellationError))
     try Task.checkCancellation()
     return try result.get().value
 }
 
-/// Live capture.
-///
-/// Captures window sub-rects for annotation through ScreenCaptureKit.
-/// NativeScreenCapture owns whole-primary-display chat attachments;
-/// this source retains window identity and reads the same permission.
+/// Window capture retains exact identity; whole-display chat attachments have a separate capture owner with the same permission.
 public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
     public init() {}
 
-    /// Read-only preflight. Never `CGRequestScreenCaptureAccess` — that shows
-    /// the OS prompt, and the grant is User's, not code's, to initiate.
+    /// Preflight never prompts; only the user may initiate Screen Recording acquisition.
     public func isScreenRecordingTrusted() -> Bool {
         CGPreflightScreenCaptureAccess()
     }
 
-    private static func windowImage(_ window: SCWindow, maxPixelWidth: Int? = nil) async throws -> MacScreenShot {
+    private static func windowImage(_ window: SCWindow, maxPixelWidth: Int? = nil, context: MacOperationContext) async throws -> MacScreenShot {
         try Task.checkCancellation()
         let capture = MacImageCapture(windows: SystemMacVisualObstructionProbe.windows().filter {
             $0.number == Int(window.windowID)
@@ -370,7 +335,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         configuration.showsCursor = false
         configuration.captureResolution = .best
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        let image: CGImage = try await macScreenCaptureWait { receive in
+        let image: CGImage = try await macScreenCaptureWait(context: context) { receive in
             SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration, completionHandler: receive)
         }
         try Task.checkCancellation()
@@ -379,12 +344,12 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
             pixelWidth: image.width, pixelHeight: image.height, cgImage: image, capture: capture)
     }
 
-    public func capture(window requested: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+    public func capture(window requested: MacAXWindowIdentity, context: MacOperationContext) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
         guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
         var operation = "SCShareableContent.getExcludingDesktopWindows"
         do {
             try Task.checkCancellation()
-            let content: SCShareableContent = try await macScreenCaptureWait { receive in
+            let content: SCShareableContent = try await macScreenCaptureWait(context: context) { receive in
                 SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true, completionHandler: receive)
             }
             try Task.checkCancellation()
@@ -397,20 +362,21 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
                     w: window.frame.width, h: window.frame.height))
             }, requested: requested)
             guard let selected, let window = windows.first(where: { $0.windowID == selected }) else {
-                return .failure(.operationFailed("window selection", "The requested window is absent, ambiguous, or person-only; read the app again for its current window."))
+                return .failure(.operationFailed("window selection",
+                    "The requested window is absent, ambiguous, or person-only; read the app again for its current window."))
             }
             operation = "SCScreenshotManager.captureImage"
-            return .success(try await Self.windowImage(window))
+            return .success(try await Self.windowImage(window, context: context))
         } catch {
             return .failure(.operationFailed(operation, error.localizedDescription))
         }
     }
 
-    public func windowCapture() async -> MacScreenWindowCapture {
+    public func windowCapture(context: MacOperationContext) async -> MacScreenWindowCapture {
         guard isScreenRecordingTrusted() else { return { _, _ in .failure(.screenRecordingNotTrusted) } }
         let content: MacScreenCaptureValue<SCShareableContent>
         do {
-            content = MacScreenCaptureValue(value: try await macScreenCaptureWait { receive in
+            content = MacScreenCaptureValue(value: try await macScreenCaptureWait(context: context) { receive in
                 SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true, completionHandler: receive)
             })
         } catch {
@@ -422,27 +388,27 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
                 try Task.checkCancellation()
                 guard let window = content.value.windows.first(where: { Int($0.windowID) == windowNumber }),
                       !PersonOnlyWindows.contains(number: windowNumber) else {
-                    return .failure(.operationFailed("window selection", "The requested window is absent or person-only; read the app again for its current window."))
+                    return .failure(.operationFailed("window selection",
+                        "The requested window is absent or person-only; read the app again for its current window."))
                 }
-                return .success(try await Self.windowImage(window, maxPixelWidth: maxPixelWidth))
+                return .success(try await Self.windowImage(window, maxPixelWidth: maxPixelWidth, context: context))
             } catch {
                 return .failure(.operationFailed("SCScreenshotManager.captureImage", error.localizedDescription))
             }
         }
     }
 
-    public func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+    public func capture(rect: MacAXFrame?, context: MacOperationContext) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
         guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
         let content: SCShareableContent
         do {
-            content = try await macScreenCaptureWait { receive in
+            content = try await macScreenCaptureWait(context: context) { receive in
                 SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true, completionHandler: receive)
             }
         } catch {
             return .failure(.operationFailed("SCShareableContent.getExcludingDesktopWindows", error.localizedDescription))
         }
-        // Prefer the display containing the centre. If the centre lies in a
-        // desktop gap, retain the largest visible portion on a real display.
+        // Prefer the centre’s display; a centre in a desktop gap needs the largest visible portion instead.
         let wanted = rect
         let displays = content.displays
         guard !displays.isEmpty else { return .failure(.noDisplay) }
@@ -457,8 +423,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         }
 
         let displayBounds = CGDisplayBounds(display.displayID)
-        // Global (AX) points → this display's local points. Identical for the
-        // main display at the origin; not identical for any other.
+        // Translate global AX points into the selected display’s local space; secondary displays need a nonzero offset.
         let globalRect: CGRect = {
             guard let wanted, wanted.w > 0, wanted.h > 0 else { return displayBounds }
             return CGRect(x: wanted.x, y: wanted.y, width: wanted.w, height: wanted.h)
@@ -473,13 +438,13 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
             width: globalRect.width,
             height: globalRect.height
         )
-        // Native pixel density of THIS display: physical pixels per point.
+        // Use this display’s physical pixels per point.
         let mode = CGDisplayCopyDisplayMode(display.displayID)
         let densityX = (mode?.pixelWidth).map { Double($0) / Double(max(1, display.width)) } ?? 1.0
         let densityY = (mode?.pixelHeight).map { Double($0) / Double(max(1, display.height)) } ?? 1.0
         let density = max(1.0, min(max(densityX, densityY), 4.0))
 
-        // Shotgun stays out of her pictures; she sees what is under it.
+        // Exclude the pointer overlay so captures show the underlying scene.
         let filter = SCContentFilter(
             display: display,
             excludingWindows: content.windows.filter { PersonOnlyWindows.contains(number: Int($0.windowID)) }
@@ -495,15 +460,13 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         let capture = MacImageCapture(windows: SystemMacVisualObstructionProbe.windows())
         let image: CGImage
         do {
-            image = try await macScreenCaptureWait { receive in
+            image = try await macScreenCaptureWait(context: context) { receive in
                 SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration, completionHandler: receive)
             }
         } catch {
             return .failure(.operationFailed("SCScreenshotManager.captureImage", error.localizedDescription))
         }
-        // The SHOT reports the pixel size that came back, not the size that was
-        // asked for. Everything downstream derives its scale from this, so a
-        // pipeline that clamped or rounded the request cannot displace a marker.
+        // Derive downstream scale from returned pixels rather than requested size so clamping or rounding cannot move markers.
         return .success(MacScreenShot(
             bounds: MacAXFrame(
                 x: Double(globalRect.origin.x),
@@ -521,11 +484,11 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
 
 #endif
 
-/// Platform fallback: honest unavailability, never a fabricated picture.
+/// Unsupported platforms report unavailability rather than fabricated pixels.
 public struct UnavailableMacScreenCaptureSource: MacScreenCaptureSource {
     public init() {}
     public func isScreenRecordingTrusted() -> Bool { false }
-    public func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+    public func capture(rect: MacAXFrame?, context: MacOperationContext) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
         .failure(.unavailableOnThisPlatform)
     }
 }

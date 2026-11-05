@@ -3,7 +3,11 @@
   "id": "today-readout", "kind": "ability", "version": 1,
   "reach": {"capabilities": [], "readPaths": [], "hosts": [], "apps": []},
   "face": {"projection":true},
-  "record": {"description": "Compose my Today rows from frozen, provenance-checked sources, including thinking per turn today against the week and the next five clock intentions in Ahead. Returned source keys are rebound by the native owner; the waiting sentence is a cached pure face.", "actions": [], "inputSchema": {"type": "object", "required": ["moments","dream","nextDream","toward","thinking","intentions","recollections","conversations","builders","notes","clusters"]}}
+  "record": {
+    "description": "Draw Today as a timed timeline, upcoming intentions, earlier notes and named source gaps.",
+    "actions": [], "inputSchema": {"type": "object",
+      "required": ["moments","dream","nextDream","toward","thinking","intentions","conversations","builders","notes","clusters"]}
+  }
 }
 */
 function run(input) {
@@ -86,14 +90,12 @@ function run(input) {
         // The gutter shows the clock time; the line names the day only when it is not today.
         ahead.push(row(i.key,words,i.time.startsWith("at ") ? "" : i.time,[i.key]));
     });
-    const recollection=input.recollections.filter(r=>r.text).slice().sort((a,b)=>b.at-a.at)[0];
-    if (recollection) did.push(row(recollection.key,"I wrote down what we talked about","A note to myself, so I remember it later.",[recollection.key]));
     if (input.conversations.length) {
         const count=input.conversations.length, places=[...new Set(input.conversations.map(c=>c.surface))].sort().join(" and ");
         did.push(row("talked","Talked with you",spelled(count)+" "+(count===1 ? "conversation" : "conversations")+(places ? ", on "+places : "")+".",input.conversations.map(c=>c.key)));
     }
     if (input.builders.length) {
-        const names=[...new Set(input.builders.map(b=>b.agent))].sort().map(capital).join(" and ");
+        const names=[...new Set(input.builders.map(b=>b.agent))].sort().join(" and ");
         const count=new Set(input.builders.map(b=>b.session)).size;
         did.push(row("worked","I worked with "+names,spelled(count)+" "+(count===1 ? "conversation" : "conversations")+".",input.builders.map(b=>b.key)));
     }
@@ -133,7 +135,7 @@ function run(input) {
         did.push(row("claude-fold:"+job,title,"",group.flatMap(n=>n.sources)));
     });
     const facts=new Map();
-    [...moments,...intentions,...input.recollections,...input.notes,...input.conversations,...input.builders].forEach(f=>facts.set(f.key,f));
+    [...moments,...intentions,...input.notes,...input.conversations,...input.builders].forEach(f=>facts.set(f.key,f));
     if (dreamAvailable) facts.set("dream",{at:input.dream.at});
     if (input.nextDream.state === "available") facts.set("nextDream",{at:input.nextDream.at});
     if (input.toward.state === "available") facts.set("facing",{at:input.toward.at});
@@ -179,21 +181,59 @@ function run(input) {
     return {did,ahead,earlier,omitted};
 }
 function face(input) {
-    if (input.mode === "waiting") return {sections:[{id:"waiting",rows:[{id:"waiting",title:run(input)}]}]};
+    if (input.mode === "waiting") return {title:"Today",
+        sections:[{id:"waiting",style:"waiting",rows:[{id:"waiting",title:run(input)}]}]};
     const decision=run(input), sections=[];
+    const waiting=input.waitingRows ? input.waitingRows.slice() : [];
+    if (input.waitingDesk) waiting.push({id:"desk",title:run(input.waitingDesk),open:"page:desk"});
+    for (let i=0;i<waiting.length;i+=256) {
+        sections.push({id:"waiting:"+i,title:"Waiting for you",style:"list",rows:waiting.slice(i,i+256)});
+    }
+    const facts=new Map();
+    for (const field of ["moments","intentions"]) {
+        if (["available","partial"].includes(input[field].state)) for (const fact of input[field].rows) facts.set(fact.key,fact);
+    }
+    for (const field of ["notes","conversations","builders"]) for (const fact of input[field]) facts.set(fact.key,fact);
+    for (const [key,field] of [["dream","dream"],["nextDream","nextDream"],["facing","toward"],["thinking","thinking"]]) {
+        if (["available","partial"].includes(input[field].state)) facts.set(key,input[field]);
+    }
+    function at(keys,newest=false) {
+        const times=keys.map(key=>(facts.get(key)||{}).at).filter(Number.isFinite);
+        if (!times.length) return undefined;
+        return new Date((newest ? Math.max(...times) : Math.min(...times))*1000).toISOString();
+    }
     for (const area of ["did","ahead"]) {
+        const rows=[];
         for (const row of decision[area]) {
-            sections.push({id:area+":"+row.id,title:row.title,rows:row.sources.map((key,i)=>({id:key,title:i===0 ? row.line : ""}))});
-            if (row.details.length) sections.push({id:"details:"+row.id,rows:row.details.map((title,i)=>({id:"detail:"+i,title}))});
+            const linked=row.sources.map(key=>facts.get(key)).find(fact=>fact && fact.open);
+            rows.push({id:row.id,title:row.title,detail:row.line,at:at(row.sources),open:linked ? linked.open : undefined});
+            row.details.forEach((title,i)=>rows.push({id:"detail:"+row.id+":"+i,title,tone:"quiet"}));
+        }
+        if (rows.length) sections.push({id:area,title:area === "did" ? "What I did" : "Ahead",
+            style:area === "did" ? "timeline" : "flow",rows});
+    }
+    const earlier=decision.earlier.map(group=>{
+        const newest=group.sources.slice().sort((a,b)=>((facts.get(b)||{}).at||0)-((facts.get(a)||{}).at||0))[0];
+        return {id:newest,title:group.title,value:String(group.sources.length),at:at(group.sources,true),
+            tone:group.failure ? "failed" : "quiet",open:(facts.get(newest)||{}).open};
+    });
+    for (const row of decision.omitted) earlier.push({id:"omitted:"+row.id,title:"Today row "+row.id+" omitted",
+        detail:row.sources.length ? "Missing facts: "+row.sources.join(", ")+"." : "No source.",tone:"quiet"});
+    const gaps=input.availability ? input.availability.unavailable.slice() : [];
+    for (const [field,label] of [["moments","Memory"],["dream","Dream"],["nextDream","Dream schedule"],
+        ["toward","Direction"],["thinking","Thinking"],["intentions","Intentions"]]) {
+        const source=input[field];
+        if (["unavailable","partial"].includes(source.state)) {
+            gaps.push(label+" source "+source.state+"."+(source.reason ? " "+source.reason : ""));
         }
     }
-    const dates=new Map(input.notes.map(n=>[n.key,n.at]));
-    const earlier=decision.earlier.map(group=>{
-        const sorted=group.sources.slice().sort((a,b)=>dates.get(b)-dates.get(a));
-        return {id:(group.failure ? "failure:" : "")+sorted[0],title:group.title,
-            detail:sorted[sorted.length-1],value:String(group.sources.length)};
-    });
-    for (let i=0;i<earlier.length;i+=256) sections.push({id:"earlier:"+i,rows:earlier.slice(i,i+256)});
-    for (const row of decision.omitted) sections.push({id:"omitted:"+row.id,rows:row.sources.map(key=>({id:key,title:""}))});
-    return {sections};
+    [...new Set(gaps)].forEach((title,i)=>earlier.push({id:"source-gap:"+i,title,tone:"quiet"}));
+    for (let i=0;i<earlier.length;i+=256) sections.push({id:"earlier:"+i,title:"Earlier",style:"values",rows:earlier.slice(i,i+256)});
+    sections.push({id:"queues",style:"flow",rows:[
+        {id:"approvals",title:"Approvals and past decisions",open:"page:today/approvals"},
+        {id:"inbox",title:"Every note I've left you",open:"page:today/inbox"},
+        {id:"self-improvement",title:"Self-improvement",open:"page:today/selfImprovement"},
+        {id:"rem",title:"REM Replay Lineage",open:"page:today/cognitionProposals"}
+    ]});
+    return {title:"Today",line:input.line,sections};
 }

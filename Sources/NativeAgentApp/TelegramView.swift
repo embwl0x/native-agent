@@ -7,7 +7,7 @@ import TelegramBot
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `TelegramView.swift` | `TelegramView`: credential-free settings/status projections, access confirmation and save/test/log controls; outbound success never proves inbound poller health |
+// Blueprint: | `TelegramView.swift` | `TelegramView`: credential-free settings and receipts; outbound success proves no inbound health |
 
 enum TelegramPanelPresentation {
     enum ReadState: Equatable {
@@ -93,10 +93,7 @@ enum TelegramSettingsSaveOutcome: Equatable {
 enum TelegramBotTokenPresentation {
     static let accessibilityIdentifier = "telegram.bot-token"
 
-    /// A field projection is deliberately credential-free. The secure draft
-    /// belongs to the input binding only; all text rendered around it reports
-    /// configuration state without ever carrying the token back into another
-    /// observable value.
+    /// Keep the secure draft only in its input binding so surrounding observable text never exposes credentials.
     struct FieldState: Equatable {
         let accessibilityIdentifier: String
         let canSave: Bool
@@ -133,9 +130,7 @@ enum TelegramClearLogsPresentation {
     }
 }
 
-/// The test-reply button reports outbound credential validation and inbound
-/// poller liveness separately.  A green send alone must never look like a
-/// healthy Telegram surface when the long-poll loop is absent or stalled.
+/// Outbound validation cannot prove inbound poller health; report them independently.
 enum TelegramTestReplyPresentation {
     static func summary(for response: TelegramTestResponse) -> String {
         let delivery = "Telegram test sent to \(response.chatId). Bot token verified."
@@ -230,7 +225,9 @@ struct TelegramView: View {
                 } else if settingsLoading {
                     ProgressView("Reading Telegram settings…")
                 } else {
-                    ProviderNote(text: "Telegram settings are unavailable. \(appModel.telegramStatusRefreshError ?? "Try refreshing again.")", color: NativeAgentShell.trouble)
+                    ProviderNote(
+                        text: "Telegram settings are unavailable. \(appModel.telegramStatusRefreshError ?? "Try refreshing again.")",
+                        color: NativeAgentShell.trouble)
                     Button("Retry") { Task { await loadSettings() } }
                 }
             }
@@ -249,7 +246,10 @@ struct TelegramView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(verbatim: "Telegram can reply to allowed chats and users when enabled. If group mentions are not required, it can reply in allowed groups without being mentioned.")
+            Text(verbatim: """
+                Telegram can reply to allowed chats and users when enabled. If group mentions are not required, it can reply in allowed \
+                groups without being mentioned.
+                """)
         }
         .confirmationDialog(
             "Clear Telegram diagnostics?",
@@ -420,7 +420,10 @@ struct TelegramView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                     }
-                    ProviderNote(text: "To find your ID, leave Telegram off, save the bot token, then send the bot a message in Telegram. Check sender shows its numeric chat ID below. Admit only a sender you recognize, then save with Telegram on.", color: NativeAgentShell.secondary)
+                    ProviderNote(text: """
+                        To find your ID, leave Telegram off, save the bot token, then send the bot a message in Telegram. Check sender shows \
+                        its numeric chat ID below. Admit only a sender you recognize, then save with Telegram on.
+                        """, color: NativeAgentShell.secondary)
                     Button(checkingSender ? "Checking…" : "Check sender") {
                         checkingSender = true
                         Task {
@@ -428,7 +431,9 @@ struct TelegramView: View {
                             do {
                                 let count = try await appModel.engine.telegram.discoverTelegramSenders(token: appModel.telegramToken)
                                 await appModel.refreshTelegram()
-                                senderCheckMessage = count == 0 ? "No messages found. Send your bot a message, then check again." : "Sender IDs are in Blocked and ignored below. Choose your chat ID and save to admit it."
+                                senderCheckMessage = count == 0
+                                    ? "No messages found. Send your bot a message, then check again."
+                                    : "Sender IDs are in Blocked and ignored below. Choose your chat ID and save to admit it."
                             } catch {
                                 senderCheckMessage = "Could not check senders: "
                                     + TurnSecretRedactor.redactText(error.localizedDescription)
@@ -622,7 +627,10 @@ struct TelegramView: View {
                             ForEach(status.receipts.prefix(6)) { receipt in
                                 TelegramEventRow(
                                     title: "\(receipt.kind ?? "reply") · chat \(receipt.chatId ?? "unknown")",
-                                    detail: [receipt.replyPreview ?? receipt.textPreview ?? "", receipt.model.map { "\($0) / \(receipt.reasoningEffort ?? "default")" }].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n"),
+                                    detail: [
+                                        receipt.replyPreview ?? receipt.textPreview ?? "",
+                                        receipt.model.map { "\($0) / \(receipt.reasoningEffort ?? "default")" }
+                                    ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n"),
                                     metadata: receipt.at
                                 )
                             }
@@ -723,9 +731,6 @@ struct TelegramView: View {
 }
 
 // MARK: - Page kit
-//
-// The page's own small vocabulary: an eyebrow over a run, the card the
-// controls sit in, and the three shapes of line inside one.
 
 private struct TelegramStatusLine: View {
     let text: String
@@ -733,8 +738,7 @@ private struct TelegramStatusLine: View {
     let tone: TrustTone
 
     var body: some View {
-        // The mark carries the tone; the words stay in text colour, since
-        // light calm and trouble fail 4.5:1 on the card fill.
+        // Keep words in text colour; calm and trouble colours fail 4.5:1 on the card fill.
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: systemImage)
                 .font(ShellType.labelSemibold)

@@ -4,7 +4,7 @@ import Network
 import PersistenceCore
 import Security
 import NativeAgentShared
-// Blueprint: | `BrowserIPCServer.swift` | browser IPC routing with NativeLoopbackListener and BridgeCore; checked private browser_ipc.json publication precedes port/readiness admission; failure stops the listener and retains its cause for Doctor; connection retirement cancels its task; deadlines report unknown effect outcome; discovery excluded from backup/export/phone |
+// Blueprint: | `BrowserIPCServer.swift` | Authenticated discovery precedes admission; failed publication stops listening; deadlines retain uncertainty |
 
 @MainActor
 public final class BrowserIPCServer: BridgeHTTPServer {
@@ -31,12 +31,11 @@ public final class BrowserIPCServer: BridgeHTTPServer {
         return (discoveryFailure ?? health.failure, ready ? health.boundPort : nil, ready, health.port)
     }
 
-    /// Drop a connection that hasn't completed its request/response within this window
-    /// so stalled/half-open peers can't accumulate in `connections` indefinitely.
+    /// Bound incomplete requests so stalled peers cannot accumulate connections indefinitely.
     private static let ipcIdleTimeout: Duration = .seconds(15)
 
-    // The descriptor owns endpoint and token discovery for external clients.
-    // Credential-filtered from all backups/archives; no phone copy; PrivacyMap: browser_ipc.
+    // The descriptor owns endpoint and token discovery for external clients. Credential-filtered from all backups/archives; no phone copy; PrivacyMap:
+    // browser_ipc.
     private var descriptorFileURL: URL {
         dataRoot.appendingPathComponent("browser_ipc.json")
     }
@@ -152,9 +151,7 @@ public final class BrowserIPCServer: BridgeHTTPServer {
             if case .failed = state    { Task { @MainActor in self?.dropIPCConnection(key) } }
         }
         conn.start(queue: .global(qos: .userInitiated))
-        // Idle/read timeout: a peer that connects but never completes a request would
-        // otherwise sit in `connections` forever. Cancel it after the timeout; the
-        // connection's .cancelled handler then evicts it from the dict.
+        // Bound idle peers; cancellation evicts their connections even when no complete request arrives.
         connectionTimeouts[key] = Task { [weak self, weak conn] in
             try? await Task.sleep(for: Self.ipcIdleTimeout)
             guard !Task.isCancelled else { return }
@@ -182,20 +179,15 @@ public final class BrowserIPCServer: BridgeHTTPServer {
     private func routeIPC(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
         let timeoutKey = ObjectIdentifier(conn)
         guard connections[timeoutKey] === conn, connectionOperations[timeoutKey] == nil else { return }
-        // Request fully read & routed — swap the 15s idle/read deadline for a
-        // generous routed-OPERATION deadline. The 15s would kill a legitimate slow
-        // navigate mid-flight; removing the timeout entirely would leak a connection
-        // wedged on a hung WebKit callback. Re-arm to 120s: long enough for any real
-        // browser op, short enough to reap a wedge. Retiring a connection cancels
-        // its operation too; a deadline cannot prove a dispatched effect stopped.
+        // Allow routed operations 120s rather than the 15s idle limit so slow navigation can finish. A hung callback still releases the connection and task;
+        // expiry cannot prove an effect stopped.
         connectionTimeouts[timeoutKey]?.cancel()
         connectionTimeouts[timeoutKey] = Task { [weak self, weak conn] in
             try? await Task.sleep(for: .seconds(120))
             guard !Task.isCancelled else { return }
             guard let self, let conn, self.connections[timeoutKey] === conn else { return }
             self.connectionOperations.removeValue(forKey: timeoutKey)?.cancel()
-            // Keep the socket owned while the unknown-outcome response drains.
-            // A peer that does not read still loses the socket at the idle limit.
+            // Keep the socket owned while the unknown-outcome response drains. A peer that does not read still loses the socket at the idle limit.
             self.connectionTimeouts[timeoutKey] = Task { [weak conn] in
                 do { try await Task.sleep(for: Self.ipcIdleTimeout) } catch { return }
                 conn?.cancel()

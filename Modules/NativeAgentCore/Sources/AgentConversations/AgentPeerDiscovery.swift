@@ -6,10 +6,9 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `probe` discovers protocols, never names: loopback A2A cards, programs carrying ACP methods or advertising an ACP entry, and settings holding mcpServers, read from verified regular files. Bundle programs/settings consume MacAppIndex's checked installed-Mac projection. Recipes claim known finds; unknown finds carry a draft under an id of protocol and path. Only Agents and explicit discover probe; `Launch` admits bounded --help and initialize under the send's `agentProgramLaunch` rule (Full Mac as is, otherwise the builder sandbox, denied or locked down never). |
+// Blueprint: | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery`, `probe`, `Launch`, `agentProgramLaunch` |
 
-/// Bounded read-only discovery. A website, an HTTP success, or an unsupported
-/// protocol is not a connected agent. No contact or credential is written here.
+/// Bounded read-only discovery. A website, an HTTP success, or an unsupported protocol is not a connected agent. No contact or credential is written here.
 package enum AgentPeerDiscovery {
     static func localCandidates(ports: Set<Int>) -> [URL] {
         ports.filter { (1...65535).contains($0) }.sorted().flatMap { port in
@@ -20,15 +19,14 @@ package enum AgentPeerDiscovery {
     }
 
     static func localCard(_ url: URL) async throws -> AgentDiscoveryCandidate? {
-        // Validate before creating any request, including when a caller supplies a candidate.
-        // Nothing serving there is absence; a card served there that cannot be used is said.
-        // Any listening port is asked, so only what reads as a card is one.
+        // Validate every candidate before requests; only a readable supported card establishes an agent.
         guard let response = try? await AgentPeerHTTP.getLoopbackCard(url), (200..<300).contains(response.statusCode),
               case .object(let card)? = response.json, card["name"] != nil,
               ["skills", "capabilities", "protocolVersion", "supportedInterfaces"].contains(where: { card[$0] != nil }) else { return nil }
         guard case .string(let name)? = card["name"], !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               name.utf8.count <= 480, case .object? = card["capabilities"], case .array? = card["skills"] else {
-            throw AgentCommunicationError.invalid("\(url.absoluteString) serves an agent card this app cannot use (name, capabilities, skills and a supported interface are required)")
+            throw AgentCommunicationError.invalid(
+                "\(url.absoluteString) serves an agent card this app cannot use (name, capabilities, skills and a supported interface are required)")
         }
         let selected = try AgentA2AWire.selectInterface(card: .object(card), cardURL: url)
         try AgentPeerHTTP.validateLoopbackCandidate(selected.endpoint)
@@ -45,7 +43,7 @@ package enum AgentPeerDiscovery {
         return candidate
     }
 
-    /// Every running program's path, from the process table. Nothing is run.
+    /// Read process paths without running programs.
     static func runningPrograms() -> [String] {
         var pids = [pid_t](repeating: 0, count: Int(max(0, proc_listallpids(nil, 0))) + 64)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
@@ -64,15 +62,14 @@ package enum AgentPeerDiscovery {
         try await MacAppIndex.shared.apps()
     }
 
-    /// The app's own program among the running ones, not a helper or updater inside it.
+    /// Exclude helper and updater processes when identifying the application.
     static func running(_ app: URL, _ info: NSDictionary?, in programs: [String]) -> [String] {
         guard let name = info?["CFBundleExecutable"] as? String else { return [] }
         let main = app.path + "/Contents/MacOS/" + name
         return programs.contains(main) ? ["process: " + main] : []
     }
 
-    /// Recipes own installation evidence; settings and running programs only
-    /// annotate it. An app name alone establishes no messaging route.
+    /// Recipes own installation evidence; settings and running programs only annotate it. An app name alone establishes no messaging route.
     static func scanLocal() async -> [AgentDiscoveryCandidate] {
         let programs = runningPrograms()
         let fm = FileManager.default
@@ -113,15 +110,12 @@ package enum AgentPeerDiscovery {
         return results
     }
 
-    /// Discover protocol signatures: loopback A2A cards, ACP methods/entries and mcpServers settings.
-    /// Recipes then claim known finds by `hostID`; unknown finds carry their `draft` recipe.
-    /// Probes only read unless an explicit discover's `launch` admits --help and initialize under the send's rule.
-    /// Bounds: cards 0.6s, --help 1s, initialize 3s. Bonjour has no A2A service type and needs Local Network access;
-    /// chat windows without a recipe label are not checked.
+    /// Probe signatures read-only unless explicit launch admission permits bounded help and initialization. Bound cards to 0.6 s, help to 1 s and
+    /// initialization to 3 s; unlabelled windows and undocumented Bonjour types prove no route.
     static func probe(_ bundles: [Bundle], launch: Launch?, dataRoot: URL) async -> [AgentDiscoveryCandidate] {
         async let programs = acpPrograms(bundles, launch: launch, dataRoot: dataRoot)
         async let settings = mcpSettings(bundles)
-        // One card per agent: the agent-card.json path wins when it serves both.
+        // Prefer agent-card.json when both card paths identify the same agent.
         var cards: [AgentDiscoveryCandidate] = []
         await withTaskGroup(of: AgentDiscoveryCandidate?.self) { group in
             for url in localCandidates(ports: listeningPorts().union(AgentRecipeStore.rows.flatMap(\.a2aPorts))) {
@@ -144,21 +138,21 @@ package enum AgentPeerDiscovery {
             guard let id = found.draft?.id, AgentRecipeStore.recipe(id) != nil else { return found }
             var held = found
             held.connectable = false
-            held.setupFailure = "agents/recipes/\(id).json already holds a recipe that does not find this one (\(found.foundBy.first ?? found.name)), so its draft is not offered. Read it with agent.recipe."
+            held.setupFailure = """
+                agents/recipes/\(id).json already holds a recipe that does not find this one (\(found.foundBy.first ?? found.name)), so its draft \
+                is not offered. Read it with agent.recipe.
+                """
             return held
         } + cards.sorted { $0.id < $1.id }.filter { endpoints.insert($0.endpoint ?? $0.cardURL!).inserted }
     }
 
-    /// May a found program run (its --help, then initialize), as the caller's
-    /// rule for running another agent's program decides: the command that runs
-    /// it (bare, or inside the sandbox), or why it may not.
+    /// The caller’s launch rule owns whether a found program may run, including any sandbox command.
     package enum Launch: Sendable {
         case run(@Sendable (_ executable: String, _ arguments: [String]) -> [String])
         case refused(String)
     }
 
-    /// Nonblocking open and fstat require a regular file of at most `limit` bytes; read owned chunks until `each` stops.
-    /// FIFOs/devices cannot block a pass and no mapping can be truncated under it. False for any other file.
+    /// Nonblocking regular-file reads are bounded by size; FIFOs and devices must not stall discovery, and truncation cannot invalidate a mapping.
     static func readRegular(_ path: String, limit: Int64, _ each: (Data) -> Bool) -> Bool {
         let fd = Darwin.open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { return false }
@@ -191,7 +185,6 @@ package enum AgentPeerDiscovery {
         return SnapshotTailOpLog.FileStamp(info)
     }
 
-    /// Every TCP port a program other than this app listens on, from the process table.
     static func listeningPorts() -> Set<Int> {
         var pids = [pid_t](repeating: 0, count: Int(max(0, proc_listallpids(nil, 0))) + 64)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
@@ -212,18 +205,16 @@ package enum AgentPeerDiscovery {
         return ports
     }
 
-    /// ACP candidates on the login PATH or inside apps carry its methods (in their bytes or beside a linked script)
-    /// or advertise an ACP entry in their name/launcher. When `launch` admits it, initialize uses the transport's start
-    /// and arguments from its recipe, name or --help. Clients carry the methods too; only an answer is connectable.
+    /// Only an initialization answer proves ACP connectability; clients can carry the same method signatures.
     static func acpPrograms(_ bundles: [Bundle], launch: Launch?, dataRoot: URL) async -> [AgentDiscoveryCandidate] {
-        // Without the login PATH, its own row says why.
+        // Missing login PATH must retain its own failure reason.
         guard case .success(let environment) = AgentHostCommandLines.loginEnvironment else { return [] }
         let fm = FileManager.default
         @Sendable func program(_ path: String) -> Bool {
             var info = stat()
             return stat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG && access(path, X_OK) == 0
         }
-        // Each file once, by the name it is called; the one its own file carries wins ("grok" for grok-macos-aarch64).
+        // Use each file’s declared program name to avoid duplicate candidates.
         var programs: [String: URL] = [:]
         let folders = (environment["PATH"] ?? "").components(separatedBy: ":").filter { $0.hasPrefix("/") }
         for folder in folders {
@@ -247,7 +238,6 @@ package enum AgentPeerDiscovery {
         @Sendable func says(_ text: some StringProtocol) -> Bool {
             text.range(of: #"(?<![A-Za-z])acp(?![A-Za-z])|agent client protocol"#, options: [.regularExpression, .caseInsensitive]) != nil
         }
-        /// One read of a file: whether it carries the methods, and its first bytes.
         @Sendable func scan(_ path: String) -> (carries: Bool, head: Data)? {
             guard !Task.isCancelled, let stamp = signatureStamp(path) else { return nil }
             if let saved = programSignatures.withLock({ $0[path] }), saved.stamp == stamp {
@@ -261,13 +251,13 @@ package enum AgentPeerDiscovery {
                 return !missing.isEmpty
             }) else { return nil }
             guard !Task.isCancelled, signatureStamp(path) == stamp else { return nil }
-            // Only launchers need their first bytes retained; binaries keep a bit.
+            // Retain launcher bytes only; binaries need just their signature bit.
             let retainedHead = head.flatMap { $0.starts(with: Data("#!".utf8)) ? $0 : nil } ?? Data()
             let carries = missing.isEmpty
             programSignatures.withLock { $0[path] = ProgramSignature(stamp: stamp, carries: carries, head: retainedHead) }
             return (carries, retainedHead)
         }
-        /// What makes it an ACP candidate, read without running it: its methods, or its launcher naming acp.
+        /// ACP candidates require method bytes or an explicitly named launcher, without running them.
         @Sendable func signature(_ path: String, beside: Bool) -> String? {
             guard let read = scan(path) else { return nil }
             if read.carries { return "carries ACP's session/new and session/prompt" }
@@ -287,9 +277,7 @@ package enum AgentPeerDiscovery {
             var running = 0
             var found: [AgentDiscoveryCandidate] = []
             while !Task.isCancelled {
-                // At most two programs read signatures or run bounded probes.
-                // Refill only after a worker finishes, rather than spawning one
-                // task per executable and letting them compete for disk reads.
+                // Limit signature reads and probes to two concurrent programs, refilling after completion to bound disk contention.
                 while running < 2, let (file, link) = remaining.next() {
                     running += 1
                     group.addTask {
@@ -297,7 +285,7 @@ package enum AgentPeerDiscovery {
                         let name = link.lastPathComponent
                         guard let why = says(name) ? "its name says acp" : signature(file, beside: link.path != file) else { return nil }
                         var seen = ["acp: \(link.path): \(why)"]
-                        // A recipe she wrote from this find's own draft is its recipe, wherever it resolves now.
+                        // A recipe authored from this draft owns its find even if resolution moved.
                         let row = rows.first { $0.installation.executables.values.contains(file) }
                             ?? AgentRecipeStore.recipe(recipeID(name, "acp", file)).flatMap { $0.seededFrom == "discovery" ? $0.host : nil }
                         var arguments = row?.acp?.arguments, answer: [String: JSONValue] = [:]
@@ -308,8 +296,8 @@ package enum AgentPeerDiscovery {
                             seen.append("not run: " + why)
                         case .run(let command)?:
                             // Run exactly the file that was read, as a send would.
-                            guard let executable = try? AgentACPExecutable.capture(path: file) else { seen.append("not run: \(file) could not be read whole"); break }
-                            // A program whose own name says acp is its entry.
+                            guard let executable = try? AgentACPExecutable.capture(path: file) else { seen.append(
+                                "not run: \(file) could not be read whole"); break }
                             if arguments == nil, says(name) { arguments = [] }
                             if arguments == nil, let help = try? await executable.reported(environment: environment,
                                 command: command(file, ["--help"]), errors: true, grace: .seconds(1), limit: 65_536) {
@@ -317,10 +305,11 @@ package enum AgentPeerDiscovery {
                             }
                             guard let arguments else { seen.append("entry: its --help names no ACP entry"); break }
                             seen.append("entry: \(([name] + arguments).joined(separator: " "))" + (row?.acp != nil ? " (its recipe)" : ""))
-                            // The transport's own start, and nothing after it.
+                            // Use only the transport’s declared start arguments.
                             let started = command(file, arguments)
                             do {
-                                if case .object(let result) = try await AgentACPClient(dataRoot: dataRoot).initialize(executable: started[0], arguments: Array(started.dropFirst()),
+                                if case .object(let result) = try await AgentACPClient(dataRoot: dataRoot).initialize(executable: started[0],
+                                    arguments: Array(started.dropFirst()),
                                     directory: FileManager.default.temporaryDirectory, environment: environment,
                                     approvedExecutable: executable, timeout: .seconds(3)) { answer = result }
                                 seen.append("initialize: answered ACP 1")
@@ -329,16 +318,20 @@ package enum AgentPeerDiscovery {
                         }
                         let agent: [String: JSONValue] = if case .object(let info)? = answer["agentInfo"] { info } else { [:] }
                         func said(_ key: String) -> String? {
-                            if case .string(let text)? = agent[key], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { String(text.prefix(80)) } else { nil }
+                            if case .string(let text)? = agent[key], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { String(
+                                text.prefix(80)) } else { nil }
                         }
                         if let row {
-                            var known = AgentDiscoveryCandidate(name: row.displayName, detail: "Installed: " + row.installation.evidence.joined(separator: "; "),
+                            var known = AgentDiscoveryCandidate(name: row.displayName, detail: "Installed: " + row.installation.evidence.joined(
+                                separator: "; "),
                                 hostID: row.id, settingsPath: nil, cardURL: nil, endpoint: nil)
                             known.foundBy = seen
                             return known
                         }
                         let speaks = !answer.isEmpty ? "Speaks ACP over stdio (\(([name] + (arguments ?? [])).joined(separator: " ")))."
-                            : launch.flatMap { if case .run = $0 { "Looks like an ACP agent, but it did not answer as one; write its recipe's acp.arguments from its own documentation." } else { nil } }
+                            : launch.flatMap { if case .run = $0 { """
+                                Looks like an ACP agent, but it did not answer as one; write its recipe's acp.arguments from its own documentation.
+                                """ } else { nil } }
                             ?? "Looks like an ACP agent; it has not been run, so whether it answers is not checked."
                         let line = try? JSONValue.object(["executable": .string(name), "arguments": .array((arguments ?? []).map(JSONValue.string)),
                             "documentation": .string("https://agentclientprotocol.com/protocol/v1/transports"), "permissionMode": .string("ask"),
@@ -367,12 +360,10 @@ package enum AgentPeerDiscovery {
         }
     }
 
-    /// The arguments a --help names for ACP: a command or flag on an entry
-    /// line (indented, as help lists them) that says ACP ("  acp  Run as an
-    /// ACP server", "  --acp"), or a flag whose choices include acp
-    /// ("  --mode <text|json|acp>"). Prose about ACP is not an entry.
+    /// Accept ACP entry commands or flags in help; prose mentioning ACP does not establish an entry.
     static func acpEntry(_ help: String) -> [String]? {
-        for line in help.split(separator: "\n") where line.first?.isWhitespace == true && line.range(of: #"\bacp\b|agent client protocol"#, options: [.regularExpression, .caseInsensitive]) != nil {
+        for line in help.split(separator: "\n") where line.first?.isWhitespace == true && line.range(of: #"\bacp\b|agent client protocol"#,
+            options: [.regularExpression, .caseInsensitive]) != nil {
             let words = line.split(whereSeparator: \.isWhitespace).map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: ",")) }
             guard let entry = words.first, entry.range(of: #"^-{0,2}[A-Za-z][A-Za-z0-9-]*$"#, options: .regularExpression) != nil else { continue }
             if entry.hasPrefix("-"), words.count > 1, words[1].range(of: #"[<|(\[]acp[>|)\]]"#, options: [.regularExpression, .caseInsensitive]) != nil {
@@ -383,15 +374,11 @@ package enum AgentPeerDiscovery {
         return nil
     }
 
-    /// MCP hosts: a settings file holding an mcpServers table, wherever an app
-    /// keeps one (~/Library/Application Support/*/*.json, ~/.config/*/mcp*.json,
-    /// ~/.*/mcp*.json). Its folder names the app; an installed app of that name
-    /// or bundle id is the program a connection is written for.
+    /// Use settings files as MCP host evidence, scoped to the installed application named by their folder.
     static func mcpSettings(_ bundles: [Bundle]) -> [AgentDiscoveryCandidate] {
         let fm = FileManager.default, home = fm.homeDirectoryForCurrentUser.path
         let apps = MacAppIndex.installed(bundles).filter { !$0.url.path.hasPrefix("/System/") && $0.bundleID?.hasPrefix("com.apple.") != true }
-        // Application Support also holds what macOS guards (Contacts, Calendars):
-        // only an installed app's own folder there is read.
+        // Read only installed apps’ own support folders to avoid protected macOS data.
         let owned = Set(apps.flatMap { [$0.bundleID, $0.name].compactMap { $0 } })
         var files: [(folder: String, path: String)] = []
         for (root, dotted, settings) in [(home + "/Library/Application Support", false, false), (home + "/.config", false, true), (home, true, true)] {
@@ -403,7 +390,7 @@ package enum AgentPeerDiscovery {
                 }
             }
         }
-        // A file a recipe names is that recipe's own pass to speak for.
+        // A recipe-named file belongs to that recipe’s discovery pass.
         let known = Set(AgentHostDirectory.rows.flatMap { ([$0.configPath] + ($0.configPaths ?? [])).map(AgentHostDirectory.expand) })
         return files.compactMap { folder, path in
             var bytes = Data()
@@ -414,9 +401,11 @@ package enum AgentPeerDiscovery {
             let owner = folder.hasPrefix(".") ? String(folder.dropFirst()) : folder
             let app = apps.first { [$0.bundleID, $0.name, $0.url.deletingPathExtension().lastPathComponent].contains(owner) }
             var found = AgentDiscoveryCandidate(name: app?.name ?? owner,
-                detail: "Its settings take MCP servers" + (app.map { " (\($0.url.path))." } ?? ", but no installed app is named \(owner), so a connection has no program to be written for.") + " No recipe knows it yet.",
+                detail: "Its settings take MCP servers" + (app.map { " (\($0.url.path))." }
+                    ?? ", but no installed app is named \(owner), so a connection has no program to be written for.") + " No recipe knows it yet.",
                 hostID: nil, settingsPath: path, cardURL: nil, endpoint: nil)
-            found.draft = AgentHostRow(id: recipeID(owner, "mcp", path), displayName: found.name, description: "An app found on this Mac whose settings take MCP servers.",
+            found.draft = AgentHostRow(id: recipeID(owner, "mcp", path), displayName: found.name,
+                description: "An app found on this Mac whose settings take MCP servers.",
                 aliases: [], installMarkers: app.map { [$0.url.path] } ?? [], configPath: shown, format: .jsonMCPServers,
                 restartRequired: true, restartNote: "Restart it to load the new connection.",
                 documentation: "https://modelcontextprotocol.io/docs/develop/connect-local-servers",
@@ -428,16 +417,14 @@ package enum AgentPeerDiscovery {
         }
     }
 
-    /// A found agent's recipe id: its name as a file name, made its own by
-    /// the whole digest of its protocol and canonical path.
+    /// Bind discovered IDs to protocol and canonical path so equal names do not merge identities.
     static func recipeID(_ name: String, _ route: String, _ path: String) -> String {
         let canonical = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
         return AgentHostDirectory.normalize(name).map { ("a"..."z").contains($0) || ("0"..."9").contains($0) ? String($0) : "-" }.joined()
             + "-" + SHA256.hash(data: Data((route + "\u{0}" + canonical).utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// One row per agent: a probe's find that a recipe's own pass listed adds
-    /// what it saw. Only an established host match merges; every other find is its own.
+    /// Merge only established host matches; unrelated finds keep separate identities.
     static func merged(_ found: [AgentDiscoveryCandidate]) -> [AgentDiscoveryCandidate] {
         var rows: [AgentDiscoveryCandidate] = []
         for candidate in found {

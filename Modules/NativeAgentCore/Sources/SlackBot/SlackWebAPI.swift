@@ -2,10 +2,9 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SlackWebAPI.swift` | Shared HTTP response normalization for replies, reconciliation's injected session and explicit setup tokens; bounded reply posts/updates and uploads propagate checked grant-read failures and record proofs through ConnectorActionReceipt; `requireConfiguredToken` |
+// Blueprint: | `SlackWebAPI.swift` | `requireConfiguredToken`; checked HTTP replies, uploads and reconciliation with ConnectorActionReceipt proofs |
 
-/// Slack Web API HTTP mechanics, replies and uploads. Callers own token grants,
-/// setup validation, reconciliation sessions and connection-proof policy.
+/// Slack Web API HTTP mechanics, replies and uploads. Callers own token grants, setup validation, reconciliation sessions and connection-proof policy.
 public enum SlackWebAPI {
     private static let replySession: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -22,10 +21,7 @@ public enum SlackWebAPI {
         return URL(string: "https://slack.com/api/\(method)")!
     }
 
-    /// Validate local Slack authentication without making a network request.
-    /// Completion delivery uses this before recording that dispatch began so a
-    /// missing credential remains a retryable pre-dispatch failure rather than
-    /// an ambiguous external outcome.
+    /// Check credentials before recording dispatch so their absence stays a retryable pre-dispatch failure.
     public static func requireConfiguredToken(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws {
@@ -82,8 +78,7 @@ public enum SlackWebAPI {
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        // Slack accepts JSON without an explicit charset, but returns a
-        // `missing_charset` response warning.
+        // Slack accepts JSON without an explicit charset, but returns a `missing_charset` response warning.
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         do { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
         catch { throw NotificationDeliveryFailure(.notDelivered(reason: error.localizedDescription), error.localizedDescription) }
@@ -258,8 +253,7 @@ public enum SlackWebAPI {
                     NSLocalizedDescriptionKey: "Slack token snapshot is empty"
                 ])
             }
-            // A snapshot a turn captured is used only while it is still the granted
-            // token: every request and upload step checks, so Disconnect stops them all.
+            // A snapshot a turn captured is used only while it is still the granted token: every request and upload step checks, so Disconnect stops them all.
             guard try SlackCredentials.read(.bot, dataRoot: dataRoot) == token else {
                 throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
                     NSLocalizedDescriptionKey: "Slack was disconnected; nothing more was sent"
@@ -270,7 +264,6 @@ public enum SlackWebAPI {
         return try loadToken(dataRoot: dataRoot)
     }
 
-    /// SlackCredentials owns tokens in Keychain.
     private static func loadToken(dataRoot root: URL = PersistenceCore.defaultDataRoot()) throws -> String {
         guard let token = try SlackCredentials.read(.bot, dataRoot: root) else {
             throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
@@ -294,10 +287,16 @@ public enum SlackWebAPI {
         ]
         if let error = response["error"] as? String, !error.isEmpty {
             obj["error"] = .string(error)
-            // What to do next, in words, for the codes that have one.
             let fix: String? = switch error {
-            case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
-            case "missing_scope": "The owner must add \((response["needed"] as? String) ?? "the required scope") in the Slack app settings, then sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
+            case "not_authed", "invalid_auth", "token_revoked", "account_inactive":
+                """
+                The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view.
+                """
+            case "missing_scope":
+                """
+                The owner must add \((response["needed"] as? String) ?? "the required scope") in the Slack app settings, \
+                then sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view.
+                """
             case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
             case "ratelimited": "Slack is rate limiting; wait a minute before trying again."
             default: nil
@@ -311,8 +310,7 @@ public enum SlackWebAPI {
         SlackTokenRedactor.redactValue(value)
     }
 
-    /// `files.getUploadURLExternal` may return a short-lived signed URL, but
-    /// the file body must still only leave for Slack's HTTPS upload domain.
+    /// `files.getUploadURLExternal` may return a short-lived signed URL, but the file body must still only leave for Slack's HTTPS upload domain.
     static func trustedExternalUploadURL(_ raw: String) -> URL? {
         guard let url = URL(string: raw),
               url.scheme?.lowercased() == "https",
@@ -359,11 +357,7 @@ private enum SlackTokenRedactor {
             return .array(items.map { redactValue($0) })
         case .object(let object):
             return .object(object.reduce(into: [:]) { redacted, pair in
-                // `files.getUploadURLExternal` returns a short-lived signed
-                // upload credential. A partial/malformed Slack response can
-                // still flow through the ordinary failure envelope, so scrub
-                // it by field identity even when its value does not resemble a
-                // bot token.
+                // Signed upload credentials can appear in malformed responses; redact by field even without token-shaped values.
                 if pair.key.lowercased() == "upload_url" {
                     redacted[pair.key] = .string("[REDACTED_SLACK_UPLOAD_URL]")
                 } else {

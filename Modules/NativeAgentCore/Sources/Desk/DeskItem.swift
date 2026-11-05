@@ -2,11 +2,11 @@ import NativeAgentShared
 import Transcripts
 import Foundation
 import PersistenceCore
-// Blueprint: | `DeskItem.swift` | Derived live Desk items and explicit progress; statusDescription reads existing status/waitingOn without rewriting persisted rows |
+// Blueprint: | `DeskItem.swift` | Derived work and explicit progress; statusDescription shares persisted wait truth |
 
 // MARK: - Item (a derived row — never serialized as a mutation, only state.json)
 
-/// Explicit progress reported by the agent. The Desk never derives a value: callers must provide a positive total and a completed count inside it.
+/// Progress is explicit; the Desk cannot infer completed work.
 public struct DeskProgress: Sendable, Equatable {
     public let done: Int
     public let total: Int
@@ -38,7 +38,7 @@ public struct DeskProgress: Sendable, Equatable {
 }
 
 public struct DeskItem: Sendable, Equatable {
-    /// Person waits keep the existing persisted status/party fields. All readers speak the same status without migrating an agent's stored work.
+    /// Interpret persisted person waits consistently across readers without rewriting stored work.
     public var statusDescription: String {
         if !status.isTerminal, let party = waitingOn?.trimmingCharacters(in: .whitespacesAndNewlines), !party.isEmpty {
             return "waiting on " + party
@@ -47,7 +47,7 @@ public struct DeskItem: Sendable, Equatable {
     }
     public var continuation: DeskContinuation?
     public var findingKey: String?
-    public var handle: String           // stable
+    public var handle: String
     public var alias: String            // view number "2" / "2.1" — stable, never renumbered
     public var parent: String?
     public var kind: DeskKind
@@ -55,7 +55,7 @@ public struct DeskItem: Sendable, Equatable {
     public var project: String
     public var title: String
     public var summary: String?
-    /// Delegation display metadata only. Neither field changes hierarchy, scheduling, admission, or ownership semantics.
+    /// Delegation display fields never change ownership, hierarchy or admission.
     public var assignee: String?
     public var laneOf: String?
     public var progress: DeskProgress?
@@ -74,26 +74,22 @@ public struct DeskItem: Sendable, Equatable {
     public var pinned: Bool
     public var blockedReason: String?
     public var waitingOn: String?
-    /// Stable blocker handles; `DeskSequencing` derives blockedness so closing a blocker unblocks dependents.
+    /// Derive readiness from stable blocker handles and defer dates so settlement needs no unblocking write.
     public var blockedOn: [String]
-    /// `yyyy-MM-dd` day or full ISO stamp this item is deliberately parked until. A deferred item is not ready AND is never flagged stale.
     public var deferUntil: String?
     public var origin: DeskOrigin       // immutable after create; default .owner
     public var pursuit: Pursuit?        // present only for origin=agent, kind=project
-    /// Direct Desk-owned execution attempts for non-pursuit lanes.
     public var workAttempts: [DeskWorkAttempt]
 
-    /// True for a store-recognized pursuit: self-authored project. The work-session ops and the open-pursuit cap key on exactly this shape.
+    /// The pursuit cap and work-session gates share this exact recognized shape.
     public var isPursuit: Bool { origin == .agent && kind == .project && pursuit != nil }
 
-    /// The declared lifetime is elapsed days from this durable work's opening.
     public var pursuitExpiresAt: Date? {
         guard isPursuit, let pursuit, let opened = DeskClock.parseISO(openedAt) else { return nil }
         return opened.addingTimeInterval(TimeInterval(pursuit.maxDays) * 86_400)
     }
 
-    /// True only when canonical Desk state names the human owner as the party that must unblock a nonterminal item (`OwnerAttentionPolicy`). A generic `blocked` status is not enough: verification failures, unavailable external systems, and
-    /// domain-owned reconciliation can all be blocked without requiring user action.
+    /// Only canonical owner waits require user action; generic blockage or failed verification is insufficient.
     public var requiresOwnerInput: Bool { OwnerAttentionPolicy.waitsOnOwner(self) }
 
     public init(
@@ -156,7 +152,6 @@ public struct DeskItem: Sendable, Equatable {
         self.workAttempts = workAttempts
     }
 
-    /// Live refs in render priority order (gh_pr > gh_issue > … > note), capped.
     public func liveRefs(limit: Int = 3) -> [DeskRef] {
         Array(refs.sorted { $0.priority < $1.priority }.prefix(limit))
     }
@@ -185,10 +180,8 @@ public struct DeskItem: Sendable, Equatable {
         if let closedAt, !closedAt.isEmpty { obj["closedAt"] = .string(closedAt) }
         if let blockedReason, !blockedReason.isEmpty { obj["blockedReason"] = .string(blockedReason) }
         if let waitingOn, !waitingOn.isEmpty { obj["waitingOn"] = .string(waitingOn) }
-        // Default sequencing fields are omitted to preserve existing row shapes.
         if !blockedOn.isEmpty { obj["blockedOn"] = .array(blockedOn.map { .string($0) }) }
         if let deferUntil, !deferUntil.isEmpty { obj["deferUntil"] = .string(deferUntil) }
-        // Default origin is omitted for byte compatibility; pursuit is emitted only when present.
         if origin != .owner { obj["origin"] = .string(origin.rawValue) }
         if let pursuit { obj["pursuit"] = pursuit.toJSON() }
         if !workAttempts.isEmpty { obj["workAttempts"] = .array(workAttempts.map { $0.toJSON() }) }
@@ -197,8 +190,7 @@ public struct DeskItem: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Every stored item is current-form and complete; collections never lose
-    /// a reference, note, blocker or work identity during decoding.
+    /// Decode stored collections completely so references, notes, blockers and work identity cannot disappear.
     public static func fromJSON(_ value: JSONValue) -> DeskItem? {
         guard case .object(let obj) = value,
               let handle = obj["handle"]?.stringValue,
@@ -212,15 +204,15 @@ public struct DeskItem: Sendable, Equatable {
               case .bool(let pinned)? = obj["pinned"],
               let cadenceValue = obj["cadence"], let cadence = Cadence.fromJSON(cadenceValue),
               let notifyValue = obj["notify"], let notify = NotifyPolicy.fromJSON(notifyValue),
-              DeskJSON.optionalStringsAreValid(obj, keys: ["parent", "summary", "assignee", "laneOf", "closedAt", "blockedReason", "waitingOn", "origin", "deferUntil", "findingKey"]),
+              DeskJSON.optionalStringsAreValid(obj, keys: ["parent", "summary", "assignee", "laneOf", "closedAt", "blockedReason", "waitingOn", "origin",
+                  "deferUntil", "findingKey"]),
               let refs = deskStoredCollection(obj["refs"], decode: DeskRef.fromJSON),
               let notes = deskStoredCollection(obj["notes"], decode: DeskNote.fromJSON),
               let blockedOn = DeskJSON.strings(obj["blockedOn"]) else { return nil }
         guard let workAttempts = DeskWorkAttempt.readAttempts(obj) else { return nil }
         let pursuit = obj["pursuit"].flatMap(Pursuit.fromJSON)
         if let pursuitValue = obj["pursuit"] {
-            // A present pursuit must be an OBJECT, and every nested ledger collection that is present must be a fully-decodable array — a wrong-typed value decoding to empty/default would silently shrink the reservation cap ledger or the
-            // dossier.
+            // Reject malformed pursuit collections so decoding cannot shrink evidence or reservation budgets.
             guard case .object(let pursuitObj) = pursuitValue else { return nil }
             guard let pursuit else { return nil }
             if let evidenceValue = pursuitObj["evidence"] {
@@ -258,7 +250,6 @@ public struct DeskItem: Sendable, Equatable {
             pinned: pinned,
             blockedReason: obj["blockedReason"]?.stringValue,
             waitingOn: obj["waitingOn"]?.stringValue,
-            // Origin defaults to .owner; pursuit is optional.
             origin: origin,
             pursuit: pursuit,
             blockedOn: blockedOn,

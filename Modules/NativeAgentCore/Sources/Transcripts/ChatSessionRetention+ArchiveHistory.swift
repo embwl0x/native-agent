@@ -4,7 +4,7 @@ import PersistenceCore
 import NativeAgentShared
 import CryptoKit
 import os
-// Blueprint: | `ChatSessionRetention+ArchiveHistory.swift` | Checked archive-index decoding, ordered transcript discovery and byte-preserving restoration; callers retain sessions-index then transcript lock order |
+// Blueprint: | `ChatSessionRetention+ArchiveHistory.swift` | Checked archive restoration under index → transcript locks |
 
 extension ChatSessionRetention {
     package static func archiveIndexRows(dataRoot: URL) throws -> [[String: JSONValue]] {
@@ -31,42 +31,12 @@ extension ChatSessionRetention {
     }
 
     public static func archivedTranscripts(dataRoot: URL) throws -> [String: [URL]] {
-        func entries(_ directory: URL) throws -> [URL] {
-            do { return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) }
-            catch CocoaError.fileReadNoSuchFile { return [] }
-        }
         var files: [String: [URL]] = [:]
         for row in try archiveIndexRows(dataRoot: dataRoot).reversed() {
             guard case .string(let id)? = row["id"],
                   case .string(let relative)? = row["messagesArchivePath"] else { continue }
             let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
             if !files[id, default: []].contains(file) { files[id, default: []].append(file) }
-        }
-        let sessions = dataRoot.appendingPathComponent("chat/sessions", isDirectory: true).resolvingSymlinksInPath()
-        for session in try entries(sessions) {
-            let id = session.lastPathComponent
-            guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil,
-                  try session.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
-            guard session.resolvingSymlinksInPath().deletingLastPathComponent().path == sessions.path else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            let backups = try entries(session).filter {
-                $0.lastPathComponent.hasPrefix("messages.compact.") && $0.pathExtension == "jsonl"
-            }.sorted { $0.lastPathComponent > $1.lastPathComponent }
-            for file in backups {
-                guard file.resolvingSymlinksInPath().deletingLastPathComponent().path == session.path else {
-                    throw CocoaError(.fileReadCorruptFile)
-                }
-                files[id, default: []].append(file)
-            }
-        }
-        let originals = dataRoot.appendingPathComponent("chat/archive/originals", isDirectory: true).resolvingSymlinksInPath()
-        for file in try entries(originals) where file.pathExtension == "jsonl" {
-            guard let id = NativeAgentChatSessionID.normalizedPathComponent(file.deletingPathExtension().lastPathComponent),
-                  file.resolvingSymlinksInPath().deletingLastPathComponent().path == originals.path else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            files[id, default: []].append(file)
         }
         return files
     }
@@ -100,9 +70,8 @@ extension ChatSessionRetention {
         return hot.map { ($0.deletingPathExtension().lastPathComponent, $0) } + cold
     }
 
-    /// Restore the newest archived row and copy its bytes into the hot tier, retaining the archive.
-    /// Nil means no archive row. Known history with unavailable bytes throws.
-    /// Caller holds the sessions lock before the transcript lock.
+    /// Restore the newest archived row and copy its bytes into the hot tier, retaining the archive. Nil means no archive row. Known history with unavailable
+    /// bytes throws. Caller holds the sessions lock before the transcript lock.
     public static func restoreArchivedRow(
         sessionId: String,
         dataRoot: URL
@@ -118,7 +87,11 @@ extension ChatSessionRetention {
         let archivedBytes: Data
         do { archivedBytes = try Data(contentsOf: dataRoot.appendingPathComponent(relative)) }
         catch {
-            throw PersistenceCoreError.ioFailure("The archived conversation’s transcript could not be read: \(error.localizedDescription). Its saved history must be repaired before opening it.")
+            throw PersistenceCoreError.ioFailure(
+                """
+                    The archived conversation’s transcript could not be read: \(error.localizedDescription). Its saved history must be \
+                    repaired before opening it.
+                    """)
         }
         let messagesPath = chat
             .appendingPathComponent("messages", isDirectory: true)
@@ -127,8 +100,7 @@ extension ChatSessionRetention {
             let hot: Data
             do { hot = try Data(contentsOf: messagesPath) }
             catch CocoaError.fileReadNoSuchFile { hot = Data() }
-            // The atomic copy may have succeeded before the caller's index
-            // commit failed. Its exact prefix also survives later appends.
+            // The atomic copy may have succeeded before the caller's index commit failed. Its exact prefix also survives later appends.
             if !archivedBytes.isEmpty, hot.starts(with: archivedBytes) { return }
             try ContactThread.replace(archivedBytes + hot, to: messagesPath)
         }

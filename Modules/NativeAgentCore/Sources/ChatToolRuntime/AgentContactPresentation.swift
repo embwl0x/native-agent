@@ -30,8 +30,7 @@ extension SwiftToolDispatcher {
             try store.finishConnectionProbe(peerID: contact.id, nonce: $0, ran: ran, workspace: workspace, recipe: recipe)
         } == true
         store.recordProof(peerID: contact.id, outbound: replied || arrived)
-        // Launch alone proves neither delivery nor a broken connection. Only
-        // a command that did not launch marks this path unavailable.
+        // Launch alone proves neither delivery nor a broken connection. Only a command that did not launch marks this path unavailable.
         if ran && replied && !probe {
             store.recordRoundTrip(peerID: contact.id, executable: executable, workspace: workspace, recipe: recipe)
         } else if !probe, !ran {
@@ -39,10 +38,13 @@ extension SwiftToolDispatcher {
         }
         return arrived
     }
-    /// The probe's own reason, so "stays set up" is never a shrug: the command
-    /// was missing, the run timed out, or it simply did not answer back.
+    /// Keep the probe's actual cause visible when connection proof is missing.
     static func probeReason(_ probe: JSONValue?, row: AgentHostRow? = nil) -> String {
-        let check = row.map { " Checked agents/recipes/\($0.id).json host.commandLine, host.searchPaths and host.configPath=\($0.expandedConfigPath). Run agent.verify, correct the named recipe fields or settings file, then connect. Restart: \($0.restartNote) A message must arrive through this contact's connector to prove it." } ?? ""
+        let check = row.map { """
+             Checked agents/recipes/\($0.id).json host.commandLine, host.searchPaths and host.configPath=\($0.expandedConfigPath). Run \
+            agent.verify, correct the named recipe fields or settings file, then connect. Restart: \($0.restartNote) A message must arrive through \
+            this contact's connector to prove it.
+            """ } ?? ""
         guard case .object(let value)? = probe else { return "No callback probe was recorded." + check }
         if value["reason"] == .string("trust_center_full_mac_required"),
            case .string(let detail)? = value["detail"] { return detail }
@@ -50,7 +52,7 @@ extension SwiftToolDispatcher {
         if case .string(let detail)? = value["detail"] { return detail + check }
         return "The probe ran and nothing arrived through the entry." + check
     }
-    /// Connect owns its entry name: another install's entry there was replaced, and the receipt says so first.
+    /// Connection entry ownership is per install; disclose an overwrite before the remaining setup evidence.
     static func sayReplaced(_ outcome: AgentHostConfigWriter.Outcome, in value: inout [String: JSONValue]) {
         guard let helper = outcome.replacedInstall else { return }
         let note = "Replaced an entry from another install of this app at \(helper); backup at \(outcome.backupPath ?? "none")."
@@ -67,54 +69,63 @@ extension SwiftToolDispatcher {
         // A trust refusal says nothing about whether the other app needs a restart.
         value["restart_required"] = nil
     }
-    /// A HOST THAT PULLS (no command line). Her message is held in this
-    /// conversation and goes out in the result of the host's next call through
-    /// its entry (`held_messages`, AgentConversationStore.held); held is not
-    /// sent, and the receipt says which. It never reaches for a window.
-    static func hostPull(row: AgentHostRow?, contact: AgentPeerContact, text: String?, peers: [AgentPeerContact] = []) throws -> JSONValue {
+    /// Pull-only hosts receive held messages on their next inbound call; retained messages are not evidence of sending.
+    static func hostPull(invocation: ChatToolInvocation, row: AgentHostRow?, contact: AgentPeerContact, text: String?,
+        peers: [AgentPeerContact] = []) throws -> JSONValue {
         let name = row?.displayName ?? contact.name
         var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("mcpHost"),
             "host": .string(row?.id ?? ""), "completed": .bool(false)]
         let presence = AgentContactHealth.checkIn(contact)?.detail ?? ""
         guard let text else {
             result["status"] = .string("nothing_to_read"); result["read"] = .bool(false)
-            result["detail"] = .string("\(name)'s answers arrive as its own messages; this conversation's exchanges say which of yours are held and which were delivered, and when. " + presence)
+            result["detail"] = .string("""
+                \(name)'s answers arrive as its own messages; this conversation's exchanges say which of yours are held and which were delivered, \
+                and when.\u{20}
+                """ + presence)
             return .object(result)
         }
         if try currentPeerState(contact, peers: peers) == .unavailable {
             result["status"] = .string("unavailable"); result["sent"] = .bool(false)
             result["detail"] = .string(AgentPeerCredentials.unavailableDetail + " Nothing was held: \(name) cannot call in without its key.")
             result["remedy"] = Repair.remedy(owner: "Keychain peer:" + contact.id, nextCall: .object([
-                "tool": .string("app"), "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + contact.id)])])]), tap: nil)
+                "tool": .string("app"), "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + contact.id)])])]),
+                    tap: nil)
             return .object(result)
         }
         // The held copy is the exchange's own prompt; one longer would be clipped.
         guard text.utf8.count <= AgentConversationExchange.textLimit else {
             result["status"] = .string("invalid_arguments"); result["sent"] = .bool(false); result["argument_path"] = .string("text")
-            result["detail"] = .string("Nothing was held: a message held for \(name) keeps at most \(AgentConversationExchange.textLimit / 1024) KiB. Send it in parts.")
+            result["detail"] = .string("""
+                Nothing was held: a message held for \(name) keeps at most \(AgentConversationExchange.textLimit / 1024) KiB. Send it in parts.
+                """)
             return .object(result)
         }
-        if AgentRecipeStore.dryRun {
+        if invocation.dryRun {
             result["status"] = .string("passed"); result["dry_run"] = .bool(true); result["sent"] = .bool(false)
             result["detail"] = .string("Dry run: a message to \(name) would be held for its next check-in. Nothing was held.")
             return .object(result)
         }
-        // Held means kept in a conversation of hers; a send outside one has nowhere to wait.
-        guard AgentConversationLiveContext.target != nil else {
+        // Held means kept in one of the agent's conversations; a send outside one has nowhere to wait.
+        guard invocation.liveTarget != nil else {
             result["status"] = .string("invalid_arguments"); result["sent"] = .bool(false); result["argument_path"] = .string("conversation_id")
-            result["detail"] = .string("Nothing was held: a message to \(name) waits in one of your conversations with it. Name the conversation, or omit it for the current one, rather than protocol ids.")
+            result["detail"] = .string("""
+                Nothing was held: a message to \(name) waits in one of your conversations with it. Name the conversation, or omit it for the \
+                current one, rather than protocol ids.
+                """)
             return .object(result)
         }
         result["status"] = .string("held"); result["delivered"] = .bool(false)
         result["delivery"] = .string("held")
-        // The host's own session for this conversation: the session_id it answers in.
         result["conversation_id"] = .string("mcp-" + contact.id)
-        result["detail"] = .string("Held, not sent: it waits for \(name)'s next check-in and goes out in the result of that call; nothing is lost. Do not resend. " + presence)
+        result["detail"] = .string("""
+            Held, not sent: it waits for \(name)'s next check-in and goes out in the result of that call; nothing is lost. Do not resend.\u{20}
+            """ + presence)
         return .object(result)
     }
-    /// One sentence of truth about a closed desktop app: this app can type into
-    /// it, and the answer comes back through this app's own inbound door.
-    static let desktopSetupNote = "Send-only. For this contact to answer, add this app's MCP server to it (command: nativeagent-link mcp) and have it reply with its agent_message tool; the reply arrives as an ordinary inbound message."
+    static let desktopSetupNote = """
+        Send-only. For this contact to answer, add this app's MCP server to it (command: nativeagent-link mcp) and have it reply with its \
+        agent_message tool; the reply arrives as an ordinary inbound message.
+        """
     static let desktopSendOnlyDetail = "Desktop contacts are send-only. Nothing was opened, focused or read. " + desktopSetupNote
     static let hostInboundOnlyDetail =
         "This contact pulls: it has no command line this build knows, and its window is not a transport, so nothing of it is opened or read. "
@@ -135,8 +146,7 @@ extension SwiftToolDispatcher {
     static func currentPeerState(_ peer: AgentPeerContact, peers: [AgentPeerContact]) throws -> AgentPeerContactState {
         try AgentPeerCredentials.availability(peer, peers: peers).get() ? peer.state : .unavailable
     }
-    /// "hermes-agent", "hermes-acp" and "Hermes" name one agent: letters and
-    /// digits only, without a trailing agent / acp / cli / bot.
+    /// Normalize executable suffixes so alternate host labels do not create duplicate contacts.
     static func sameAgent(_ a: String, _ b: String) -> Bool {
         func bare(_ name: String) -> String {
             var core = name.lowercased().filter { $0.isLetter || $0.isNumber }
@@ -150,8 +160,7 @@ extension SwiftToolDispatcher {
     }
     static func compactContact(_ value: JSONValue) -> JSONValue {
         guard case .object(let row) = value else { return value }
-        // Workspace Message buttons use these declarations, even on the
-        // compact listing; a missing declaration cannot imply permission.
+        // Workspace Message buttons use these declarations, even on the compact listing; a missing declaration cannot imply permission.
         let keys: Set<String> = ["agent", "name", "state", "last_answered", "capabilities", "can_start_turn", "state_failure"]
         return .object(row.filter { keys.contains($0.key) })
     }
@@ -171,7 +180,8 @@ extension SwiftToolDispatcher {
             value["readiness"] = .string("unavailable")
             if peer.transport == .mcpHost {
                 value["remedy"] = Repair.remedy(owner: "Keychain peer:" + peer.id, nextCall: .object([
-                    "tool": .string("app"), "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer.id)])])]), tap: nil)
+                    "tool": .string("app"), "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer.id)])])]),
+                        tap: nil)
             }
         }
         return .object(value)
@@ -186,7 +196,10 @@ extension SwiftToolDispatcher {
                 "can_start_turn": .bool(peer.grokSetup == "set up"), "can_answer_back": .bool(true),
                 "capabilities": .array([.string("message"), .string("read")]),
                 "read_inputs": .array([.string("message_id")]),
-                "state_detail": .string("Webhook acceptance starts a run. Only a correlated local reply is an answer. Grok Bot may ask for local execution approval each time.")]
+                "state_detail": .string("""
+                    Webhook acceptance starts a run. Only a correlated local reply is an answer. Grok Bot may ask for local execution approval each \
+                    time.
+                    """)]
             if let proof = peer.roundTripProof {
                 value["round_trip_proof"] = .object([
                     "route": .string("grokBot"), "at": .string(proof.at),
@@ -195,13 +208,11 @@ extension SwiftToolDispatcher {
             }
             return .object(value)
         }
-        // The state, in the same four words everywhere, on every contact.
         var value: [String: JSONValue] = ["agent": .string("peer:" + peer.id), "name": .string(peer.name),
             "can_start_turn": .bool(peer.canStartTurn), "can_answer_back": .bool(peer.canAnswerBack),
             "state": .string(peer.state.rawValue), "state_detail": .string(peer.state.detail)]
         if let workspace = peer.hostWorkspace { value["workspace"] = .string(workspace) }
-        // Reply times come from the displayed contact thread at listing time.
-        // Route proofs below are historical connection evidence only.
+        // Reply times come from the displayed contact thread at listing time. Route proofs below are historical connection evidence only.
         if let stamp = peer.provenOutboundAt { value["last_message_out"] = .string(stamp) }
         if let proof = peer.roundTripProof {
             value["round_trip_proof"] = .object([
@@ -230,7 +241,11 @@ extension SwiftToolDispatcher {
             value["outbound_route"] = .string("acp")
             value["capabilities"] = .array([.string("message")])
             value["readiness"] = .string("not_checked")
-            value["setup"] = .string("Can start a conversation and receive its answer in the same call. The app remembers the conversation within your current chat and continues it when supported; use conversation to select a named discussion. It runs on this Mac as you; this app asks you only when the agent asks it for permission.")
+            value["setup"] = .string("""
+                Can start a conversation and receive its answer in the same call. The app remembers the conversation within your current chat and \
+                continues it when supported; use conversation to select a named discussion. It runs on this Mac as you; this app asks you only when \
+                the agent asks it for permission.
+                """)
             value["executable"] = peer.approvedExecutablePath.map(JSONValue.string) ?? .null
             value["working_directory"] = peer.acpWorkingDirectory.map(JSONValue.string) ?? .null
             if let id = AgentPeerStore.hostRowID(peer.endpoint), let line = AgentHostDirectory.row(named: id)?.acp {
@@ -267,10 +282,17 @@ extension SwiftToolDispatcher {
                 value["readiness"] = ChatGPTDotIPCTransport.readiness
                 value["can_start_turn"] = .bool(ChatGPTDotIPCTransport.available)
                 value["capabilities"] = .array(ChatGPTDotIPCTransport.available ? [.string("message"), .string("read")] : [.string("read")])
-                value["read_inputs"] = .array([.string("conversation_id"), .string("limit"), .string("offset"), .string("max_chars"), .string("text_offset"), .string("source_version")])
+                value["read_inputs"] = .array([.string("conversation_id"), .string("limit"), .string("offset"), .string("max_chars"),
+                    .string("text_offset"), .string("source_version")])
                 value["setup"] = .string(ChatGPTDotIPCTransport.available
-                    ? "NativeAgent messages Dot in-house after a read-only route check. Unknown delivery is read by its original receipt, never resent. Dot's nativeagent-link inbound commands and per-agent Trust remain unchanged."
-                    : "Dot is inbound only: his messages arrive through nativeagent-link on this Mac as ordinary inbound turns, and a read returns the retained conversation. There is no way to send him a message from here; nothing to repair.")
+                    ? """
+                        NativeAgent messages Dot in-house after a read-only route check. Unknown delivery is read by its original receipt, never \
+                        resent. Dot's nativeagent-link inbound commands and per-agent Trust remain unchanged.
+                        """
+                    : """
+                        Dot is inbound only: Dot's messages arrive through nativeagent-link on this Mac as ordinary inbound turns, and a read returns \
+                        the retained conversation. There is no way to send Dot a message from here; nothing to repair.
+                        """)
             }
             return .object(value)
         }
@@ -280,7 +302,10 @@ extension SwiftToolDispatcher {
             value["app_bundle_id"] = .string(AgentPeerStore.desktopBundleID(peer.endpoint) ?? "")
             value["capabilities"] = .array([.string("message")])
             value["read_inputs"] = .array([.string("conversation_id")])
-            value["setup"] = .string("A message is typed into your own chat in its app and its answer comes back in the same call. The app remembers that chat within your conversation; start a new conversation for a fresh chat there.")
+            value["setup"] = .string("""
+                A message is typed into your own chat in its app and its answer comes back in the same call. The app remembers that chat within \
+                your conversation; start a new conversation for a fresh chat there.
+                """)
             return .object(value)
         }
         if peer.transport == .desktop {
@@ -291,7 +316,10 @@ extension SwiftToolDispatcher {
             value["execution"] = .string("app_managed_desktop_route")
             value["capabilities"] = .array([.string("message")])
             value["setup"] = .string(peer.readsReplyInWindow
-                ? "A message is pasted into its chat \u{201C}\(peer.conversationLabel ?? "grok")\u{201D} in the Grok Bot app and its answer is read back from that same chat in the same call (up to three minutes)."
+                ? """
+                    A message is pasted into its chat \u{201C}\(peer.conversationLabel ?? "grok")\u{201D} in the Grok Bot app and its answer is \
+                    read back from that same chat in the same call (up to three minutes).
+                    """
                 : desktopSetupNote)
             if let label = peer.conversationLabel { value["conversation_label"] = .string(label) }
             return .object(value)

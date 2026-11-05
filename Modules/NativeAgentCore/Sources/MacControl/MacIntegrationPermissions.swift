@@ -1,23 +1,14 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `MacIntegrationPermissions.swift` | Integration identity, consent values and mutation provenance; persisted integration IDs are stable |
 
 // MARK: - Mac Integration permissions
-//
-// `MacIntegrationPermissionStore` gates host effects; explicit OFF wins over Full Mac.
-// Supported reads default on; writes default off except notifications and scheduler.
-// Writes require a grant or admitted Full Mac. Authority lives in security/mac_integration_permissions.json.
-// PersistenceCore serializes atomic writes under the file's cross-process flock.
+// Explicit OFF fences Full Mac; supported reads default on, writes off except notifications and scheduler. The permission store owns authority; PersistenceCore
+// serializes atomic writes with a cross-process flock.
 
 // MARK: - Public types
 
-/// Which axis a caller is asking about.
-public enum MacIntegrationPermissionMode: String, Sendable, Codable {
-    case read
-    case write
-}
-
-/// The pair of axis bits for one integration.
 public struct MacIntegrationPermission: Sendable, Codable, Equatable {
     public var read: Bool
     public var write: Bool
@@ -27,7 +18,7 @@ public struct MacIntegrationPermission: Sendable, Codable, Equatable {
     }
 }
 
-/// Read-only readiness evidence. Explicit revocations are distinct from the untouched defaults that an admitted Full Mac conversation may cover.
+/// Readiness distinguishes explicit revocations from untouched defaults admitted Full Mac may cover.
 public struct MacIntegrationPermissionReadiness: Sendable {
     public let operatorReadOff: Set<String>
     public let operatorWriteOff: Set<String>
@@ -37,7 +28,10 @@ public struct MacIntegrationPermissionReadiness: Sendable {
         let name = MacIntegrationID.displayName(for: integration)
         let hands = mode == .write && !MacIntegrationID.appBundleIDs(for: integration).isEmpty
             ? " You can look but not act in \(name)." : ""
-        return "operator_permission_off: \(name) \(mode.rawValue.capitalized) is off.\(hands) Only the owner can enable Trust > Mac > Apps and features > \(name) > \(mode.rawValue.capitalized)."
+        return """
+            operator_permission_off: \(name) \(mode.rawValue.capitalized) is off.\(hands) Only the owner can enable Trust > Mac > Apps and features > \(name) \
+            > \(mode.rawValue.capitalized).
+            """
     }
 }
 
@@ -106,7 +100,7 @@ public enum MacIntegrationPermissionStoreError: Error, Sendable, Equatable, Loca
 
 // MARK: - Stable identifiers
 
-/// Stable string IDs for each Mac integration. UI rows + tool dispatch both reference these strings — do NOT rename without a migration step that rewrites the on-disk permissions file.
+/// UI, dispatch and stored authority share these ids; renaming one requires rewriting its stored key.
 public enum MacIntegrationID {
     public static let calendar      = "calendar"
     public static let reminders     = "reminders"
@@ -120,7 +114,7 @@ public enum MacIntegrationID {
     public static let spotlight     = "spotlight"
     public static let scheduler     = "scheduler"
 
-    /// The integration owns these apps, for both its tools and her hands.
+    /// Integration ownership applies equally to tools and physical input.
     public static func appBundleIDs(for id: String) -> [String] {
         switch id {
         case mail: ["com.apple.mail"]
@@ -138,7 +132,6 @@ public enum MacIntegrationID {
         all.first { appBundleIDs(for: $0).contains(appBundleID) }
     }
 
-    /// Stable display-order for the UI tab.
     public static let all: [String] = [
         calendar, reminders, contacts, mail, messages, notes, music,
         notifyMac, notifyMobile, spotlight, scheduler,
@@ -146,7 +139,6 @@ public enum MacIntegrationID {
 
     // MARK: - UI strings
 
-    /// Per-id display name for the UI row.
     public static func displayName(for id: String) -> String {
         switch id {
         case calendar:     return "Calendar"
@@ -164,7 +156,6 @@ public enum MacIntegrationID {
         }
     }
 
-    /// Per-id description for the UI tooltip.
     public static func description(for id: String) -> String {
         switch id {
         case calendar:     return "Read events; Write permits changes and hands in Calendar"
@@ -184,7 +175,7 @@ public enum MacIntegrationID {
 
     // MARK: - Axis support
 
-    /// True iff the integration has a meaningful "read" axis. notify_mac / notify_mobile / scheduler are send-only — no read concept.
+    /// Send-only integrations have no read axis to grant.
     public static func supportsRead(_ id: String) -> Bool {
         switch id {
         case notifyMac, notifyMobile, scheduler:
@@ -194,7 +185,7 @@ public enum MacIntegrationID {
         }
     }
 
-    /// True iff the integration has a meaningful "write" axis. Spotlight is search-only — no write concept.
+    /// Search-only Spotlight has no write axis to grant.
     public static func supportsWrite(_ id: String) -> Bool {
         switch id {
         case spotlight:
@@ -206,10 +197,9 @@ public enum MacIntegrationID {
 
     // MARK: - Defaults
 
-    /// the user's chosen defaults — read ON for everything that has a read axis, write OFF for the sensitive surfaces (contacts/mail/messages/notes/ music), write ON for notifications + scheduler (she already uses these and the user trusts
-    /// them). For an axis the integration doesn't support, the returned value on that axis is `false` (no concept).
+    /// Shipped defaults are the user’s choice: supported reads on, sensitive writes off, notification and scheduler writes on. Unsupported axes remain false.
     public static func defaultPermission(for id: String) -> MacIntegrationPermission {
-        let read = supportsRead(id) // default ON for every read-capable surface
+        let read = supportsRead(id)
         let write: Bool
         switch id {
         case notifyMac, notifyMobile, scheduler:
@@ -217,7 +207,7 @@ public enum MacIntegrationID {
         default:
             write = false
         }
-        // Spotlight has no write axis — clamp to false even though the switch above would default it to false; this keeps the rule explicit.
+        // Clamp unsupported writes independently of the switch default.
         let writeClamped = supportsWrite(id) ? write : false
         return MacIntegrationPermission(read: read, write: writeClamped)
     }

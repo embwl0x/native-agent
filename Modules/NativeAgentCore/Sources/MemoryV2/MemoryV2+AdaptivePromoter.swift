@@ -8,43 +8,41 @@ import Experiences
 import CognitiveSubstrate
 import ChatTurnContracts
 import TurnTrace
+import Senses
 
-// Blueprint: | `MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live interpretation; settlement records queue.add's origin principal and carried steer; meaning before apply, trusted fact acceptance by operation identity, non-owner-turn and learned complete-no-op deferral with labels under the judging model |
+// Blueprint: | `MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter`: live interpretation and provenance-bound settlement |
 
-// Only the shared interpretation judges facts and care movements from the exchange and known memories.
-// Facts from the owner, trusted peers or her reply are kept; other facts await review.
+// Only the shared interpretation judges facts and care movements from the exchange and known memories. Facts from the owner, trusted peers or the agent's
+// reply are kept; other facts await review.
 
-/// The journal owns unfinished turns; the retired held file is import-only.
+/// The journal owns unfinished turns.
 public actor AdaptiveMemoryPromoter {
     public static let shared = AdaptiveMemoryPromoter()
 
     var memory: SwiftNativeMemoryV2?
-    /// A nil memory manager stages no facts.
+    /// Without a configured manager, stage no facts.
     var memoryManager: (any MemoryManaging)?
     /// The person's configured name, read fresh so a rename shows up.
     var personName: (@Sendable () throws -> String?)? = nil
-    /// The fold. The String identifies the recorded moment; true when every
-    /// piece of her landed.
+    /// Report fold success only when every piece of the recorded moment lands.
     var finishInterpretation: (@Sendable (AfterTurnContext, AfterTurnInterpretation?, String?) async -> Bool)?
-    /// The door her lived moments come in by (`LivedMomentDoor`), installed by
-    /// the cognition runtime. Without a recorded row nothing is applied.
+    /// The door the agent's lived moments come in by (`LivedMomentDoor`), installed by the cognition runtime. Without a recorded row nothing is applied.
     var door: LivedMomentDoor?
-    /// Moments recorded by this process whose interpretation is queued or
-    /// running on the live path; the owed-moment drain leaves them alone.
+    /// Moments recorded by this process whose interpretation is queued or running on the live path; the owed-moment drain leaves them alone.
     var inFlightMoments: Set<String> = []
-    /// Accepted transcript settlements, including ones still reaching the door.
-    /// Sleep joins these recordings independently of the interpretation tail.
+    /// Accepted transcript settlements, including ones still reaching the door. Sleep joins these recordings independently of the interpretation tail.
     private var owedRecordings: [UUID: Task<String?, Never>] = [:]
-    /// The owed-row retry cursor: attempts, when the row is next due, and
-    /// when it was last tried (RAM: a relaunch starts every row due).
-    var owedRetry: [String: (attempts: Int, notBefore: Date, lastTried: Date)] = [:]
-    /// The one scheduled idle drain pass.
+    /// The owed-row retry cursor: whether a batch skipped the row, what its failed attempt depended on, when it was last tried (RAM: a relaunch starts
+    /// every row due).
+    var owedRetry: [String: OwedAttempt] = [:]
+    /// Turns this process recorded owed; a row that failed outside the model call is due again once another turn is held.
+    var heldTurns = 0
+    /// Judgment calls the provider answered, by judging route; a row whose call failed is due again once its route answers.
+    var answeredCalls: [String?: Int] = [:]
     var owedDrainTimer: (id: UUID, deadline: Date, task: Task<Void, Never>)?
-    /// Live observations waiting on or running under the shared tail.
     var pendingLiveObservations = 0
     var observationTail: Task<AdaptiveMemoryObservation, Never>?
-    /// Every observation or drain still running (the tail and the ones it waits
-    /// on), so sleep can stop them all.
+    /// Every observation or drain still running (the tail and the ones it waits on), so sleep can stop them all.
     var liveOperations: [UUID: Task<AdaptiveMemoryObservation, Never>] = [:]
     var observationID: UUID?
     var stopped = false
@@ -84,12 +82,13 @@ public actor AdaptiveMemoryPromoter {
         sessionId: String,
         surface: String = "chat",
         standingAgentName: String? = nil,
-        turnId: String? = nil
+        turn: Turn,
+        senseReads: SenseTurnReads?
     ) async -> AdaptiveMemoryObservation {
         guard !stopped else {
             return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [], semanticStatus: .skipped))
         }
-        let origin = AfterTurnSource.origin
+        let origin = turn.afterTurnOrigin
         let previous = observationTail
         let id = UUID()
         observationID = id
@@ -105,7 +104,7 @@ public actor AdaptiveMemoryPromoter {
             return await self.interpretAndObserve(userMessage: userMessage,
                 assistantMessage: assistantMessage,
                 sessionId: sessionId, surface: surface, origin: origin,
-                standingAgentName: standingAgentName, turnId: turnId ?? origin?.runId)
+                standingAgentName: standingAgentName, turnId: turn.id, turn: turn, senseReads: senseReads)
         }
         observationTail = operation
         liveOperations[id] = operation
@@ -118,9 +117,8 @@ public actor AdaptiveMemoryPromoter {
         return observation
     }
 
-    /// Record accepted transcript settlements as owed under the turn's provenance,
-    /// before earlier promotions finish, even during sleep. Only a care-bearing
-    /// wake with a reply is a moment among her own work.
+    /// Record accepted transcript settlements as owed under the turn's provenance, before earlier promotions finish, even during sleep. Only a care-bearing
+    /// wake with a reply is a moment among the agent's own work.
     @discardableResult
     public func recordOwedTurn(
         userMessage: String,
@@ -128,29 +126,30 @@ public actor AdaptiveMemoryPromoter {
         sessionId: String,
         surface: String = "chat",
         standingAgentName: String? = nil,
-        turnId: String? = nil, repliedAt: Date? = nil
+        repliedAt: Date? = nil,
+        turn: Turn
     ) async -> String? {
         guard let door else { return nil }
-        let origin = AfterTurnSource.origin
-        let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
-                                          peerID: ChatToolSessionContext.envelope?.verifiedUserId)
-        let turn = CognitiveMomentTurn(
+        let origin = turn.afterTurnOrigin
+        let steer = PeerDataTaint.carried(turn: turn, peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                                          peerID: turn.envelope?.verifiedUserId)
+        let momentTurn = CognitiveMomentTurn(
             sessionId: sessionId, surface: surface, user: userMessage,
             asked: origin?.userMessage ?? userMessage, assistant: assistantMessage,
-            turnId: turnId ?? origin?.runId, runId: origin?.runId, messageId: origin?.messageId,
+            turnId: turn.id, runId: turn.run, messageId: origin?.messageId,
             occurredAt: origin?.occurredAt, repliedAt: repliedAt, took: origin?.took, standingAgentName: standingAgentName,
-            envelope: TurnEnvelope.current(surface: surface).persistedMetadata(),
-            sourceCheckpoint: MemoryDataProvenance.sources(in: MemoryDataProvenance.stamping(nil)),
-            elevatedSources: steer.elevated, originPrincipal: ChatPersistenceContext.originPrincipal,
+            envelope: TurnEnvelope.current(turn: turn, surface: surface).persistedMetadata(),
+            sourceCheckpoint: MemoryDataProvenance.sources(in: MemoryDataProvenance.stamping(nil, turn: turn)),
+            elevatedSources: steer.elevated, originPrincipal: turn.originPrincipal,
             carriedSources: steer.sources, careWakes: origin?.careWakes)
         let recordingID = UUID()
         let recording = Task<String?, Never> {
             defer { owedRecordings[recordingID] = nil }
             let ownWork = await conversationKind(sessionId)?.isOwnWork == true
-            guard !ownWork || turn.isCareWake else { return nil }
-            // Everything the door needs is in the captured turn; settlement
-            // does not inherit task locals or the caller's cancellation.
-            let id = await settle { await door.recordOwed(turn) }
+            guard !ownWork || momentTurn.isCareWake else { return nil }
+            // Everything the door needs is in the captured turn; settlement does not inherit task locals or the caller's cancellation.
+            let id = await settle { await door.recordOwed(momentTurn) }
+            if id != nil { heldTurns += 1 }
             if let id, !stopped { inFlightMoments.insert(id) }
             return id
         }
@@ -165,8 +164,7 @@ public actor AdaptiveMemoryPromoter {
         return inFlightMoments.contains(id) ? id : nil
     }
 
-    /// Stop producing and cancel interpretations, joining the fold in flight.
-    /// Settled turns still record owed; returned judgments are already meant.
+    /// Stop producing and cancel interpretations, joining the fold in flight. Settled turns still record owed; returned judgments are already meant.
     public func sleep() async {
         stopped = true
         heldDrainIsIdle = nil
@@ -178,8 +176,7 @@ public actor AdaptiveMemoryPromoter {
         _ = await observationTail?.value
     }
 
-    /// No new turns or passive recovery after stop. Already accepted turn
-    /// interpretation and its canonical writes keep their original result.
+    /// No new turns or passive recovery after stop. Already accepted turn interpretation and its canonical writes keep their original result.
     public func shutdown() async {
         stopped = true
         heldDrainIsIdle = nil
@@ -198,14 +195,17 @@ public actor AdaptiveMemoryPromoter {
         finishInterpretation = finish
     }
 
-    public func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String? = nil, topK: Int? = nil) async throws -> Set<String> {
+    public func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String? = nil,
+        topK: Int? = nil) async throws -> Set<String> {
         guard let memoryManager else {
             throw MemoryV2Error.underlying("Recall relevance is unavailable. Configure the selected memory model in Settings, then retry this query.")
         }
         switch await memoryManager.relevantRecallIDs(query: query, candidates: candidates, generation: generation, topK: topK) {
         case .success(let ids): return ids
         case .failure(let failure):
-            throw MemoryV2Error.underlying("Recall relevance could not be checked (\(failure.reason.rawValue)). \(failure.recovery) Nothing was returned as a memory answer.")
+            throw MemoryV2Error.underlying("""
+                Recall relevance could not be checked (\(failure.reason.rawValue)). \(failure.recovery) Nothing was returned as a memory answer.
+                """)
         }
     }
 
@@ -217,7 +217,8 @@ public actor AdaptiveMemoryPromoter {
     private func interpretAndObserve(userMessage: String, assistantMessage: String,
                                      sessionId: String,
                                      surface: String, origin: AfterTurnOrigin?,
-                                     standingAgentName: String?, turnId: String?) async -> AdaptiveMemoryObservation {
+                                     standingAgentName: String?, turnId: String?, turn: Turn,
+                                     senseReads: SenseTurnReads?) async -> AdaptiveMemoryObservation {
         let skipped = AdaptiveMemoryObservation(proposals: [], extraction: .init(
             candidates: [], semanticStatus: .skipped
         ))
@@ -234,9 +235,8 @@ public actor AdaptiveMemoryPromoter {
             speaker: peerSpeaker, memory: memory, userMessage: userMessage,
             assistantMessage: assistantMessage, sessionId: sessionId, surface: surface,
             origin: origin, turnId: turnId, standingAgent: standingAgent,
-            momentID: momentID)
-        // The fact owner checks authority before interpretation and commit.
-        // A later policy read cannot erase the result of effects already saved.
+            momentID: momentID, turn: turn, senseReads: senseReads)
+        // The fact owner checks authority before interpretation and commit. A later policy read cannot erase the result of effects already saved.
         return observation
     }
 
@@ -255,12 +255,11 @@ public actor AdaptiveMemoryPromoter {
         let enabled = try adaptivePromotionEnabled()
         let root = door?.dataRoot ?? PersistenceCore.defaultDataRoot()
         await RepairOwed.settle(root, operation: "memory.promotion.authority",
-            evidence: .init(source: "trust", id: SavedTrustPolicyAuthority.policyURL(dataRoot: root).path)).value
+            evidence: .init(source: "trust", id: SwiftNativeTrustCenter.policyURL(dataRoot: root).path)).value
         return enabled
     }
 
-    /// The proposal metadata key carrying a fact decision's operation identity
-    /// (life | moment | ordinal).
+    /// Use life, moment and ordinal as the fact decision's operation identity.
     static let momentOperationKey = "moment_op"
 
     public static func encodedMeaning(_ interpretation: AfterTurnInterpretation) -> JSONValue? {
@@ -273,12 +272,10 @@ public actor AdaptiveMemoryPromoter {
         return try? JSONDecoder().decode(AfterTurnInterpretation.self, from: data)
     }
 
-    /// mind.why, the "interpretation" lane: what became of a turn's
-    /// interpretation (deferred, judged in a batch, left owed), with
-    /// the prediction and its standing.
+    /// Expose interpretation outcomes with their prediction and standing through mind.why.
     static func whyInterpretation(turn: String, session: String, surface: String,
-                                  route: ChatToolSessionContext.ReplyRoute?, outcome: String,
-                                  check: AfterTurnMemorySurprise?) {
+                                  route: TurnEnvelope.DeliveryRoute?, outcome: String,
+                                  check: AfterTurnMemorySurprise?, heldTurn: Turn?) {
         var fields: [String: JSONValue] = ["lane": .string("interpretation"), "outcome": .string(outcome)]
         if let check {
             fields["prediction"] = .string(check.verdict.rawValue)
@@ -290,6 +287,6 @@ public actor AdaptiveMemoryPromoter {
             fields["hits"] = .int(Int64(check.hits ?? 0))
         }
         TurnTraceBus.fire(TurnTraceEvent(turnId: turn, kind: "mind.why", sessionId: session, surface: surface,
-            destinationId: route?.destinationId, threadId: route?.threadId, payload: .object(fields)))
+            destinationId: route?.destinationId, threadId: route?.threadId, payload: .object(fields), turn: heldTurn))
     }
 }

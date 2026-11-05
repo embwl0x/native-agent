@@ -1,21 +1,10 @@
 import Foundation
-// Blueprint: | `NativeAgentWorkspaceRoot.swift` | Canonical workspace root, byte-preserving file spelling, target/entry canonicalization and byte-exact component-relative paths; callers select bases and retain admission authority |
+// Blueprint: | `NativeAgentWorkspaceRoot.swift` | Byte-exact containment and entry identity; callers own admission. |
 
-/// Canonical user-work root for every NativeAgent surface.
-///
-/// A source-backed development install keeps the historical `<repo>/workspace`
-/// location. A public/app-only install has no source checkout, so its workspace
-/// lives inside the canonical application data root:
-/// `~/Library/Application Support/NativeAgent/workspace`.
-///
-/// For data-root work files: local backup/export and phone file-content sync
-/// exclude workspace/; off-disk backup includes it; PrivacyMap lists it.
-/// File contents are task-defined, owned by the tool that creates them.
-/// This owns only path resolution and directory preparation. TrustCenter and
-/// each tool's execution boundary retain permission and effect authority.
+/// Resolve and prepare workspace paths without granting effects; Trust and each tool retain authority. Source-backed installs use repo/workspace; app-only
+/// installs use the canonical data root.
 public enum NativeAgentWorkspaceRoot {
-    /// Compare caller-selected lexical or resolved paths by filesystem bytes.
-    /// Equality has an empty tail; outside paths have no tail.
+    /// Compare caller-selected lexical or resolved paths by filesystem bytes. Equality has an empty tail; outside paths have no tail.
     public static func relativePath(_ path: String, under root: String) -> String? {
         if path.utf8.elementsEqual(root.utf8) { return "" }
         let prefix = root.hasSuffix("/") ? root : root + "/"
@@ -46,23 +35,20 @@ public enum NativeAgentWorkspaceRoot {
             .standardizedFileURL
     }
 
-    /// The path file mutations actually use, shared with containment. Relative
-    /// names (including the workspace/ alias) start in the canonical workspace.
+    /// The path file mutations actually use, shared with containment. Relative names (including the workspace/ alias) start in the canonical workspace.
     /// Preserve whitespace; it is part of the file name.
     public static func resolveFileMutationPath(_ raw: String, dataRoot: URL) -> URL {
         let workspace = resolve(dataRoot: dataRoot)
         return canonicalFileURL(fileCandidate(raw, relativeTo: workspace, workspaceRoot: workspace))
     }
 
-    /// The entry a move or trash acts on: its folder's aliases resolved, the named
-    /// item kept, so a symlink is moved or trashed itself and never its target.
+    /// The entry a move or trash acts on: its folder's aliases resolved, the named item kept, so a symlink is moved or trashed itself and never its target.
     public static func resolveFileEntryPath(_ raw: String, dataRoot: URL) -> URL {
         let workspace = resolve(dataRoot: dataRoot)
         return canonicalFileURL(fileCandidate(raw, relativeTo: workspace, workspaceRoot: workspace), followFinalLink: false)
     }
 
-    /// Resolve folder aliases, optionally keeping the final entry itself.
-    /// macOS firmlink spellings also canonicalize when the leaf does not exist.
+    /// Resolve folder aliases, optionally keeping the final entry itself. macOS firmlink spellings also canonicalize when the leaf does not exist.
     public static func canonicalFileURL(_ candidate: URL, followFinalLink: Bool = true) -> URL {
         let entry = candidate.standardizedFileURL
         let resolved = followFinalLink || entry.path == "/" ? entry.resolvingSymlinksInPath()
@@ -115,8 +101,7 @@ public enum NativeAgentWorkspaceRoot {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        // createDirectory does not tighten an already-existing directory.
-        // Reassert the public workspace boundary on every launch/first use.
+        // createDirectory does not tighten existing permissions, so reassert the workspace boundary on use.
         try fileManager.setAttributes(
             [.posixPermissions: 0o700],
             ofItemAtPath: root.path

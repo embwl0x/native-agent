@@ -2,25 +2,27 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `AgentWorkspaceMessages.swift` | `AgentWorkspaceMessages` enum; `project` |
 
-/// Navigation over Messages-owned identities. Never derive recipients from a
-/// display name, chat ID, preview text, or embedded action-looking content.
+/// Navigation over Messages-owned identities. Never derive recipients from a display name, chat ID, preview text, or embedded action-looking content.
 enum AgentWorkspaceMessages {
     static func replyAction(_ row: [String: JSONValue], requested: String?, title: String) -> AgentWorkspaceAction? {
         guard let id = text(row["thread_id"]), requested == id, case .array(let participants)? = row["participants"] else { return nil }
         let handles = participants.compactMap { $0.objectValue.flatMap { text($0["handle"]) } }
         guard !handles.isEmpty, handles.count == participants.count, Set(handles).count == handles.count else { return nil }
-        return .perform(tool: "messages_send", input: ["thread_id": .string(id), "expected_participants": .array(handles.map(JSONValue.string))], title: "Reply to \(title)", textField: "body", isEffect: true)
+        return .perform(tool: "messages_send", input: ["thread_id": .string(id), "expected_participants": .array(handles.map(JSONValue.string))],
+            title: "Reply to \(title)", textField: "body", isEffect: true)
     }
 
     static func project(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         let compose = AgentWorkspaceButton(label: "Compose message", action: .configure(tool: "messages_send", input: [:], title: "Compose message"))
-        let openApp = AgentWorkspaceButton(label: "Open Messages view", action: .perform(tool: "go", input: ["name": .string("Messages")], title: "Messages view", textField: nil, isEffect: true))
+        let openApp = AgentWorkspaceButton(label: "Open Messages view", action: .perform(tool: "go", input: ["name": .string("Messages")],
+            title: "Messages view", textField: nil, isEffect: true))
         let rowsKey = input["from_me"] == nil ? "threads" : "messages"
         guard case .object(var content) = result, content["status"] == .string("completed"),
               case .array(let rows)? = content[rowsKey] else {
             var failure: [String: JSONValue]
             if case .object(let value) = result { failure = value } else { failure = ["result": result] }
-            failure["history_note"] = .string("The conversation reader is unavailable. Open Messages view remains available; it does not itself select a particular thread.")
+            failure["history_note"] = .string(
+                "The conversation reader is unavailable. Open Messages view remains available; it does not itself select a particular thread.")
             return .init(title: "Messages", content: .object(failure), items: [], actions: [openApp, compose])
         }
         content.removeValue(forKey: rowsKey)
@@ -49,9 +51,11 @@ enum AgentWorkspaceMessages {
                 let sender = message["from_me"] == .bool(true) ? "You" : (text(message["sender"]) ?? "Participant")
                 let status = text(message["text_status"])
                 if status == "archived_text_not_decoded" {
-                    message["display_note"] = .string("Message text is stored in a format this reader cannot decode. Open Messages view to read it; this is not an empty message.")
+                    message["display_note"] = .string(
+                        "Message text is stored in a format this reader cannot decode. Open Messages view to read it; this is not an empty message.")
                 } else if status == "no_plain_text" {
-                    message["display_note"] = .string(message["has_attachments"] == .bool(true) ? "Attachment content is available in Messages view." : "No plain text is available for this record; it may be a reaction or other special message.")
+                    message["display_note"] = .string(message["has_attachments"] == .bool(true) ? "Attachment content is available in Messages view."
+                        : "No plain text is available for this record; it may be a reaction or other special message.")
                 }
                 let title = text(message["date"]).map { "\(sender) · \($0)" } ?? sender
                 items.append(.init(title: String(title.prefix(200)), content: .object(message), actions: []))
@@ -59,23 +63,31 @@ enum AgentWorkspaceMessages {
         }
         content["conversation_note"] = .string(requested == nil
             ? "Open a conversation to read recent messages. Each conversation keeps its exact identity."
-            : "This window keeps the exact conversation and its participants. Unavailable message formats are labeled explicitly. Replies recheck participants before sending.")
+            : """
+                This window keeps the exact conversation and its participants. Unavailable message formats are labeled explicitly. Replies recheck \
+                participants before sending.
+                """)
         if input["from_me"] != nil { content["conversation_note"] = content["history_ordering"] }
         var actions = [openApp, compose]
         if requested == nil {
             if case .int(let next)? = content["next_offset"] {
-                actions.insert(.init(label: "More conversations", action: .open(.record(tool: "messages_recent_threads", input: input.merging(["offset": .int(next)]) { _, new in new }, title: "Messages"))), at: 0)
+                actions.insert(.init(label: "More conversations", action: .open(.record(tool: "messages_recent_threads", input: input.merging(["offset": .int(
+                    next)]) { _, new in new }, title: "Messages"))), at: 0)
             }
-            actions.append(.init(label: "Find messages", action: .perform(tool: "messages_recent_threads", input: [:], title: "Find messages", textField: "query", isEffect: false), needsText: true))
+            actions.append(.init(label: "Find messages", action: .perform(tool: "messages_recent_threads", input: [:], title: "Find messages",
+                textField: "query", isEffect: false), needsText: true))
         }
         if let requested {
             if case .int(let cursor)? = content.removeValue(forKey: "older_before_message_id"), cursor > 0 {
-                actions.append(.init(label: "Older messages", action: .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(requested), "before_message_id": .int(cursor)], title: conversationTitle))))
+                actions.append(.init(label: "Older messages", action: .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(requested),
+                    "before_message_id": .int(cursor)], title: conversationTitle))))
             }
             if input["before_message_id"] != nil {
-                actions.append(.init(label: "Recent messages", action: .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(requested)], title: conversationTitle))))
+                actions.append(.init(label: "Recent messages", action: .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(requested)],
+                    title: conversationTitle))))
             }
-            actions.append(.init(label: "All Messages conversations", action: .open(.record(tool: "messages_recent_threads", input: ["limit": .int(16)], title: "Messages"))))
+            actions.append(.init(label: "All Messages conversations", action: .open(.record(tool: "messages_recent_threads", input: ["limit": .int(16)],
+                title: "Messages"))))
         }
         return .init(title: conversationTitle, content: .object(content), items: items, actions: actions)
     }

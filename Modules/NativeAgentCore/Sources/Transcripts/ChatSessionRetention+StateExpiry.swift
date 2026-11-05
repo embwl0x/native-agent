@@ -5,7 +5,7 @@ import PersistenceCore
 import NativeAgentShared
 import CryptoKit
 import Darwin
-// Blueprint: | `ChatSessionRetention+StateExpiry.swift` | Bounded orphan session-state expiry under the caller's locked index snapshot; one archive-tier change/interval admission mark, with canonical history never expired |
+// Blueprint: | `ChatSessionRetention+StateExpiry.swift` | Bounded orphan state expiry preserves history |
 
 extension ChatSessionRetention {
     /// Expire orphaned `chat/session_state/<id>/` derived state, never transcripts.
@@ -24,8 +24,8 @@ extension ChatSessionRetention {
         pruneSessionState(dataRoot: dataRoot, now: now, rows: rows)
     }
 
-    /// Remove only orphaned `chat/session_state/<id>/` dirs whose newest directory/child
-    /// mtime predates retention. Best-effort and bounded; canonical history never expires.
+    /// Remove only orphaned `chat/session_state/<id>/` dirs whose newest directory/child mtime predates retention. Best-effort and bounded; canonical history
+    /// never expires.
     private static func pruneSessionState(dataRoot: URL, now: Date, rows: [[String: JSONValue]]) {
         let fm = FileManager.default
         let chatDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
@@ -76,7 +76,6 @@ extension ChatSessionRetention {
         return newest
     }
 
-    /// Longest derived state goes without an opportunistic cleanup pass.
     public static let pruneMinIntervalSeconds: TimeInterval = 10 * 60
 
     private struct PruneMark {
@@ -88,8 +87,7 @@ extension ChatSessionRetention {
     /// At the cap, inserting a new root evicts only the stalest mark.
     private static let pruneMarksMax = 16
 
-    /// Record only admitted passes, preserving skipped deadlines and the pre-scan
-    /// stamp so mid-pass archivals remain visible to the next pass.
+    /// Record only admitted passes, preserving skipped deadlines and the pre-scan stamp so mid-pass archivals remain visible to the next pass.
     private static func pruneIsDue(archiveDir: URL, now: Date) -> Bool {
         let key = archiveDir.resolvingSymlinksInPath().path
         guard let messages = SnapshotTailOpLog.fileStamp(archiveDir.appendingPathComponent("messages", isDirectory: true)),

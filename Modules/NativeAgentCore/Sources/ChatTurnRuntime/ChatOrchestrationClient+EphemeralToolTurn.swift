@@ -8,22 +8,19 @@ import AuthoredCapabilities
 import Desk
 import ChatSessionWork
 import ProviderRouting
-// Blueprint: | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`: `runEphemeralToolTurn`, `runPartToolTurn`; prepared part messages enter the same canonical loop and admitted routing with caller limits, restricted tools and taint, without persona/recall assembly, parent checkpoints or after-turn mind work; every exit joins answer/heard settlement with retained prose and dispatch artifacts; interrupted errors keep partial output and distinguish Stop; explicit part-thought surfaces admit their saved route without the parent's ProviderTurnChoice, omitted surfaces inherit; PartToolThinkingContext marks only that internal thought |
+// Blueprint: | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`; `runEphemeralToolTurn`; `runPartToolTurn` |
 
 /// An internal thought owns no reply or after-turn mind work. It uses the
 /// canonical loop and inherits its caller's gates, taint and remaining limits.
-enum PartToolThinkingContext {
-    @TaskLocal static var active = false
-}
 
 public typealias EphemeralToolTurnIncomplete = ChatTurnContracts.EphemeralToolTurnIncomplete
 
 extension SwiftNativeChatOrchestrationClient {
-    /// Prepared part input enters the existing tool-turn owner without persona,
-    /// recall, cognition preparation or another provider route. The dispatcher
-    /// supplied to this client is the part's own restricted host.
-    public func runPartToolTurn(messages: [LLMMessage], surface requestedSurface: String? = nil) async throws -> String {
-        guard let surface = requestedSurface ?? LLMCallContext.surface else {
+    /// Prepared part input uses the canonical loop with its restricted dispatcher; it owns no extra persona, recall or provider assembly.
+    public func runPartToolTurn(messages: [LLMMessage], surface requestedSurface: String? = nil, turn: Turn, work: ChatTurnWork,
+        call: LLMCall) async throws -> String {
+        let surface = requestedSurface ?? call.surface
+        guard !surface.isEmpty else {
             throw ChatOrchestrationError.underlying("A part thought needs an existing admitted routing surface.")
         }
         if let requestedSurface, !MODEL_SURFACES.contains(canonicalRoutingSurface(requestedSurface)) {
@@ -39,73 +36,73 @@ extension SwiftNativeChatOrchestrationClient {
         let system = messages.prefix { $0.role == .system }
         reach.guidance = system.map(text).joined(separator: "\n\n")
         let history = messages.dropFirst(system.count).dropLast()
-        let names = try await tools.listAvailableTools()
-        let schemas = try await tools.listAvailableToolSchemas(named: Set(names))
-        let run: @Sendable () async throws -> String = { [self, reach] in
-            guard let model = LLMCallContext.admittedModel, let client = LLMCallContext.client else {
+        let names = try await tools.listAvailableTools(turn: turn, surface: surface)
+        let schemas = try await tools.listAvailableToolSchemas(named: Set(names), turn: turn, surface: surface)
+        let run: @Sendable (Turn) async throws -> String = { [self, reach] turn in
+            guard let model = turn.admission?.model, let client = turn.client else {
                 throw ChatOrchestrationError.underlying("The part thought has no admitted model.")
             }
             let context = TurnContext(surface: surface, personaDocs: [:], personaFingerprint: "", recalled: [],
-                modelId: model, reasoningEffort: LLMCallContext.reasoningEffort ?? "",
-                providerId: LLMCallContext.providerId, serviceTier: LLMCallContext.serviceTier,
+                modelId: model, reasoningEffort: turn.admission?.reasoningEffort ?? "",
+                providerId: turn.admission?.provider, serviceTier: turn.admission?.serviceTier,
                 toolsAvailable: names, userMessage: text(last), toolSchemas: schemas,
                 historyMessages: Array(history), turnReach: reach)
-            // The canonical loop owns transient provider recovery, context and
-            // tool-contract evidence by turn id. A nested thought cannot borrow
-            // its caller's identity and overwrite those owners' parent records.
+            // Nested thoughts need their own turn identity so provider recovery and contract evidence cannot overwrite parent records.
             let thought = UUID().uuidString
             let root = dataRoot
-            let cause = Experience.currentAct ?? TurnTraceContext.turnId
-            let heard = Experience(id: thought, kind: .heard, cause: cause.map { [$0] } ?? [],
+            let cause = turn.id
+            let heard = Experience(id: thought, kind: .heard, cause: [cause],
                 face: Self.face(text(last), []), addressedTo: ["her"], owes: ["answer": .init(to: "caller")])
             let began = ExperienceStore.record(root, thought) { try await $0.begin(heard) }
             await began.value
+            let turn = turn.derived(id: thought, run: thought)
             let observation = ToolLoopTraceObservation()
             var produced: TurnEngineResult?
             do {
-            let result = try await ToolLoopTraceObservation.$current.withValue(observation) {
-            try await PartToolThinkingContext.$active.withValue(true) {
+            let result = try await holding(turn.with(\.observation, observation)) { turn in
+            try await holding(work.with(\.thinking, true)) { work in
             try await TurnTraceContext.$turnId.withValue(thought) {
-            try await LLMCallContext.$sessionId.withValue(thought) {
-            try await ConversationPrefixTelemetry.$sink.withValue(.unmeasuredRequestShape) {
-            try await LLMCallContext.$turnActiveTools.withValue(Set(names)) {
-            try await ReplyChoices.$current.withValue(nil) {
-            try await DeskContinuationScope.$current.withValue(nil) {
-            try await TurnCheckpointScope.$current.withValue(nil) {
-            try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
+            try await holding(call.with(\.session, thought)) { call in
+            try await holding(work.with(\.prefixTelemetry, .unmeasuredRequestShape)) { work in
+            try await holding(turn.with(\.offeredTools, Set(names))) { turn in
+            try await holding(turn.with(\.replyChoices, nil)) { turn in
+            try await holding(work.with(\.journal, nil)) { work in
+            try await holding(work.with(\.checkpoint, nil)) { work in
+            try await holding(turn.with(\.execution, ChatTurnExecution())) { turn in
                 try await engine.executeTurnWithStreamingToolLoop(surface: surface, userMessage: text(last),
-                    toolSessionId: ChatToolSessionContext.verifiedSessionId, llm: client,
-                    tools: tools, preBuiltContext: context, fileAccess: ChatToolSessionContext.fileAccess ?? "auto")
+                    toolSessionId: turn.verifiedSessionID, llm: client,
+                    tools: tools, preBuiltContext: context, fileAccess: turn.fileAccess ?? "auto", turn: turn, work: work, call: call)
             } } } } } } } } } }
             produced = result
             guard result.completionState == .completed else {
                 throw EphemeralToolTurnIncomplete(output: result.reply, reason: "The part thought did not complete.")
             }
             try Task.checkCancellation()
-            await Self.settleEphemeralAnswer(runID: thought, output: result.reply,
+            _ = try await Self.settleEphemeralAnswer(runID: thought, output: result.reply,
                 dispatches: result.toolDispatches, state: .completed, dataRoot: root)
             return result.reply
             } catch {
                 let failure = Self.ephemeralFailure(error, produced: produced, observation: observation)
-                await Self.settleEphemeralAnswer(runID: thought, output: failure.output,
-                    dispatches: produced?.toolDispatches ?? observation.toolDispatches,
-                    state: failure.state, dataRoot: root)
+                // The thought's own failure is the answer; a settlement that also fails is reported beside it, never in its place.
+                do {
+                    _ = try await Self.settleEphemeralAnswer(runID: thought, output: failure.output,
+                        dispatches: produced?.toolDispatches ?? observation.toolDispatches,
+                        state: failure.state, dataRoot: root)
+                } catch let settlement {
+                    nativeLog("Part thought %@ settlement failed after its own failure: %@", thought, settlement.localizedDescription)
+                }
                 throw failure.error
             }
         }
-        if requestedSurface == nil, LLMCallContext.admittedModel != nil { return try await run() }
+        if requestedSurface == nil, turn.admission?.model != nil { return try await run(turn) }
         // An explicit surface owns its saved route; a parent's per-turn pick
         // applies only when this thought did not select a surface of its own.
-        let route = try await ProviderTurnChoice.$current.withValue(requestedSurface == nil ? ProviderTurnChoice.current : nil) {
-            try await engine.router.checkedRouteAdmission(for: surface)
-        }
-        return try await withModelContext(route, surface: surface, run)
+        let route = try await engine.router.checkedRoutingSnapshot().routeAdmission(for: surface,
+            choice: requestedSurface == nil ? turn.providerChoice : nil)
+        return try await withModelContext(route, surface: surface, turn: turn, run)
     }
 
-    /// Executes a one-shot tool-capable turn without creating chat session state.
-    /// The caller owns the tool scope; execution synthesis supplies its restricted
-    /// read-only dispatcher. All configured schemas are request-scoped through
-    /// `turnActiveTools`, so no transcript is needed.
+    /// Request-scoped tool schemas and the caller's restricted dispatcher let this turn run without owning a chat transcript.
     public func runEphemeralToolTurn(
         message: String,
         model: String = "",
@@ -118,17 +115,18 @@ extension SwiftNativeChatOrchestrationClient {
         verifiedSessionId: String? = nil,
         requireCompleted: Bool = false,
         surface: String,
-        providerAdmission: (@Sendable () async throws -> Void)? = nil
+        providerAdmission: (@Sendable () async throws -> Void)? = nil,
+        purpose: String = "other",
+        turn: Turn, work: ChatTurnWork
     ) async throws -> ChatResponse {
-        guard surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "missions" else {
-            throw ToolFailureError("The routing surface is workshop. Correct the caller's surface before starting its turn.", effects: .none, recovery: .correctArguments)
-        }
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty && attachments.isEmpty {
             throw ChatOrchestrationError.emptyMessage
         }
 
-        let runId = UUID().uuidString
+        let runId = Turn.mintID()
+        let parentID = turn.id
+        let thoughtTurn = turn.derived(id: runId, run: runId).with(\.session, nil)
         // Trust's multimodal gates apply to every surface that carries attachments.
         let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot)
@@ -136,42 +134,32 @@ extension SwiftNativeChatOrchestrationClient {
         let modelOverride = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let effortOverride = reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
         let providerOverride = providerID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        // Ephemeral/execution turns are still turns of the same resident mind.
-        // Freeze and commit the existing cognitive projection once, then feed
-        // that exact capsule/posture through the ordinary runtime-context seam.
-        // The synthetic identity is request-scoped and creates no chat session
-        // or transcript owner.
+        // Freeze and commit one cognitive projection for the turn; request-scoped identity creates no session or transcript owner.
         let projectionSessionId = "ephemeral:\(surface):\(runId)"
-        // Lazy native tools still require a verified request identity even
-        // though this path intentionally creates no chat-session row. The
-        // synthetic identity expires with the request and grants no authority
-        // beyond the resolver/membrane already supplied by the caller.
+        // Native tools require verified request identity even without a session row; it expires with the request and widens no authority.
         let toolSessionId = verifiedSessionId ?? projectionSessionId
-        let prepare = { [self] () async throws in
+        let prepare = { [self] (turn: Turn) async throws in
             let context = try await engine.buildTurnContext(
                 surface: surface,
                 userMessage: attachmentInput.userMessage,
                 personaOverride: persona,
                 imageBlocks: imageBlocks,
-                sessionID: nil
-            )
+                sessionID: nil,
+             turn: turn, work: work)
             let cognitiveProjection = try await prepareCognitiveTurnProjection(
                 surface: surface,
                 userMessage: message,
                 sessionId: projectionSessionId,
-                runId: runId
-            )
+                runId: runId,
+             turn: turn)
             let contextWithCognition = await Self.contextByAppendingCognitiveCapsule(
                 to: context,
                 projection: cognitiveProjection?.projection
             )
-            return (contextWithCognition, cognitiveProjection)
+            return (turn, contextWithCognition, cognitiveProjection)
         }
-        // A caller that supplies any part of its route has that whole route
-        // admitted once, before anything sizes against it (context, packet
-        // budget, runtime line, cognitive capsule): every supplied part kept,
-        // the rest the surface's pick. A caller that supplies none runs on the
-        // route it was called under, as it always has.
+        // Admit any explicitly supplied route before sizing context; preserve every supplied field and resolve the rest from its surface.
+        // An unadmitted thought obtains its route here; preparation never chooses a model.
         var route: TurnRouteAdmission?
         if !modelOverride.isEmpty || !effortOverride.isEmpty || !providerOverride.isEmpty || serviceTierOverride != nil {
             let surfaceRoute = try await engine.router.checkedRouteAdmission(for: surface, suppliedModel: modelOverride)
@@ -182,12 +170,16 @@ extension SwiftNativeChatOrchestrationClient {
                 providerId: providerOverride.isEmpty ? surfaceRoute.providerId : providerOverride,
                 serviceTier: serviceTierOverride ?? surfaceRoute.serviceTier
             )
+        } else if thoughtTurn.admission == nil {
+            route = try await engine.router.checkedRoutingSnapshot().routeAdmission(
+                for: surface, choice: thoughtTurn.providerChoice)
         }
-        let (projectedContext, pendingProjectionCommit) = if let route {
-            try await withModelContext(route, surface: surface) { try await prepare() }
+        let (turn, projectedContext, pendingProjectionCommit) = if let route {
+            try await withModelContext(route, surface: surface, turn: thoughtTurn) { turn in try await prepare(turn) }
         } else {
-            try await prepare()
+            try await prepare(thoughtTurn)
         }
+        let call = LLMCall(turn: turn, surface: surface, purpose: purpose, session: runId)
         let requestTools = Set(projectedContext.toolSchemas.map(\.name))
         // Every surface uses ordinary Trust; successful chat writes settle exact-session progression.
         let gated = makeGatedToolDispatchClient(
@@ -197,14 +189,12 @@ extension SwiftNativeChatOrchestrationClient {
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
             verifiedSessionId: toolSessionId,
-            tracePeerTurn: true
+            tracePeerTurn: true,
+            work: work
         )
-        // Temporary workers still own a real execution identity. Bind their
-        // own run rather than leaving traces unknown or inheriting the parent
-        // turn's ID; this creates no chat session or additional trace store.
-        // The worker run is a turn of her mind hearing its brief, caused by the
-        // turn that started it when one did; its answer returns to its caller.
-        let heard = Experience(id: runId, kind: .heard, cause: TurnTraceContext.turnId.map { [$0] } ?? [],
+        // Bind each worker's own run ID so its traces cannot be unknown or overwrite the parent turn.
+        // Its answer belongs to its caller, without creating a conversation or trace store.
+        let heard = Experience(id: runId, kind: .heard, cause: [parentID],
                                face: Self.face(message, []), addressedTo: ["her"],
                                owes: ["answer": .init(to: "caller")])
         let began = ExperienceStore.record(dataRoot, runId) { store in
@@ -217,14 +207,14 @@ extension SwiftNativeChatOrchestrationClient {
         do {
             // Images and pending tool state belong to this worker's context,
             // never the parent turn or another worker that inherited it.
-            result = try await ToolLoopTraceObservation.$current.withValue(observation) {
-            try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
-            try await PeerDataTaint.withScope {
+            result = try await holding(turn.with(\.observation, observation)) { turn in
+            try await holding(turn.with(\.execution, ChatTurnExecution())) { turn in
+            try await holding(turn.with(\.peerSteering, turn.peerSteering ?? PeerDataTaint())) { turn in
             try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(runId) {
             // A worker answers its caller, never the parent's reply: nothing it attaches goes there.
-            try await ReplyChoices.$current.withValue(nil) {
-            try await LLMCallContext.$turnActiveTools.withValue(requestTools) {
+            try await holding(turn.with(\.replyChoices, nil)) { turn in
+            try await holding(turn.with(\.offeredTools, requestTools)) { turn in
                 try await engine.executeTurnWithStreamingToolLoop(
                     surface: surface,
                     userMessage: message,
@@ -234,10 +224,10 @@ extension SwiftNativeChatOrchestrationClient {
                     llm: llm,
                     tools: gated,
                     preBuiltContext: projectedContext,
-                    onDelivery: { await self.commitDeliveredCognitiveTurnProjection(pendingProjectionCommit, turnId: runId) },
+                    onDelivery: { await self.commitDeliveredCognitiveTurnProjection(pendingProjectionCommit, turn: turn) },
                     providerAdmission: providerAdmission,
-                    fileAccess: fileAccess
-                )
+                    fileAccess: fileAccess,
+                 turn: turn, work: work, call: call)
             }
             }
             }
@@ -247,13 +237,13 @@ extension SwiftNativeChatOrchestrationClient {
             }
         } catch {
             let failure = Self.ephemeralFailure(error, produced: nil, observation: observation)
-            await Self.settleEphemeralAnswer(runID: runId, output: failure.output,
+            try await Self.settleEphemeralAnswer(runID: runId, output: failure.output,
                 dispatches: observation.toolDispatches, state: failure.state, dataRoot: dataRoot)
             throw failure.error
         }
         let state = Task.isCancelled ? TurnEngineResult.TerminalState.stopped
             : result.resolvedTerminalReason(dataRoot: dataRoot).state
-        let generatedAttachments = await Self.settleEphemeralAnswer(runID: runId, output: result.reply,
+        let generatedAttachments = try await Self.settleEphemeralAnswer(runID: runId, output: result.reply,
             dispatches: result.toolDispatches, state: state, dataRoot: dataRoot)
         if state == .stopped {
             throw TurnEngineError.streamCancelled(partial: result.reply, underlying: CancellationError())
@@ -308,11 +298,16 @@ extension SwiftNativeChatOrchestrationClient {
     @discardableResult
     private static func settleEphemeralAnswer(runID: String, output: String,
         dispatches: [TurnEngineResult.ToolDispatchRecord], state: TurnEngineResult.TerminalState, dataRoot: URL
-    ) async -> [MultimodalAttachment] {
+    ) async throws -> [MultimodalAttachment] {
         let attachments = ChatGeneratedImageArtifacts.attachments(from: dispatches, dataRoot: dataRoot)
+        let answer = ChatResponse(runId: runID, model: "", output: output, attachments: attachments, terminalState: state)
         await settle {
             await recordAnswer(runID: runID, heardID: runID, evidence: nil, state: state,
-                dataRoot: dataRoot, words: output, attachments: attachments)
+                dataRoot: dataRoot, words: output, attachments: attachments, silence: answer.isSilentCompletion ? runID : nil)
+        }
+        if answer.isSilentCompletion,
+           try silentTurn(dataRoot: dataRoot, sessionId: nil, runId: runID, turnId: runID) == nil {
+            throw ChatOrchestrationError.underlying("The turn's chosen silence could not be saved; repair its experience record.")
         }
         return attachments
     }

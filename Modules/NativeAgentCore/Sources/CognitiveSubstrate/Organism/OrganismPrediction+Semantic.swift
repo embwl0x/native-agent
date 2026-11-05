@@ -2,49 +2,35 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OrganismPrediction+Semantic.swift` | Conversational expectation metadata and scope; `OrganismPredictiveBody` minting, reaction resolution and deterministic IDs |
+// Blueprint: | `OrganismPrediction+Semantic.swift` | `OrganismPredictiveBody`: scoped expectations, reactions and stable IDs |
 
-/// Semantic predictions use only `CognitiveSubstrate` appraisal metadata:
-/// what her completed turn expects and how the next user turn says it landed.
-/// No metadata means no expectation; this lane makes no model call, reads no
-/// cares and adds nothing to a prompt.
+/// Only scoped substrate appraisal metadata mints and resolves semantic expectations; absent metadata supplies no expectation or model work.
 public enum OrganismSemanticExpectation {
-    /// Metadata key on an `.assistantSpoke` signal: an OBJECT carrying the
-    /// concern she has at stake in the turn she just finished plus that turn's
-    /// scope. The label is a care id (`care:<UUID>`), never the content of the work.
-    ///
-    /// The same key carries `{session, turn}` alone as PROVENANCE on the felt
-    /// cognitive event a semantic resolution produces.
+    /// Carry a care-id concern and opaque turn scope, never work content; felt resolutions reuse the key for provenance only.
     public static let mintMetadataKey = "semanticExpectation"
-    /// Metadata key on a `.userSpoke` signal: an OBJECT carrying the appraisal
-    /// owner's read of how the previous turn landed, plus the scope of the
-    /// completion it is a verdict on.
+    /// Metadata key on a `.userSpoke` signal: an OBJECT carrying the appraisal owner's read of how the previous turn landed, plus the scope of the completion
+    /// it is a verdict on.
     public static let reactionMetadataKey = "semanticReaction"
 
-    /// Nested fields preserve the top-level somatic metadata key budget.
-    /// Both objects carry opaque session and completion-turn ids, never content;
-    /// minting and resolution require the complete scope.
+    /// Nested fields preserve the top-level somatic metadata key budget. Both objects carry opaque session and completion-turn ids, never content; minting and
+    /// resolution require the complete scope.
     public static let concernField = "concern"
     public static let reactionField = "reaction"
     public static let sessionField = "session"
     public static let turnField = "turn"
-    /// A grounded disagreement with the prior statement. Absent, empty or
-    /// unrecognised readings never settle an expectation.
+    /// A grounded disagreement with the prior statement. Absent, empty or unrecognised readings never settle an expectation.
     public static let pushbackReaction = "pushback"
     /// Explicit confirmation of the prior claim, never inferred from good mood.
     public static let confirmedReaction = "confirmed"
     /// Per-session pending cap; a fourth row evicts the oldest without an outcome.
     public static let maximumPendingPerSession = 3
-    /// Backstop only. The next user turn normally resolves an expectation long
-    /// before this; a day later, whatever she expected is no longer about the
+    /// Backstop only. The next user turn normally resolves an expectation long before this; a day later, whatever the agent expected is no longer about the
     /// turn that produced it.
     public static let horizon: TimeInterval = 24 * 60 * 60
-    /// Reserved id namespace, so a semantic row can never collide with the
-    /// correlation-keyed `pending:` / `terminal:` ids.
+    /// Reserved id namespace, so a semantic row can never collide with the correlation-keyed `pending:` / `terminal:` ids.
     public static let idPrefix = "semantic"
 
-    /// The scope inside the object at `key`. Both fields or neither: a
-    /// half-scoped signal is a producer bug and must not mint or resolve.
+    /// The scope inside the object at `key`. Both fields or neither: a half-scoped signal is a producer bug and must not mint or resolve.
     public static func scope(in metadata: [String: JSONValue], key: String) -> OrganismSemanticScope? {
         guard case .object(let object)? = metadata[key],
               case .string(let rawSession)? = object[sessionField],
@@ -53,7 +39,6 @@ public enum OrganismSemanticExpectation {
         return scope.isUsable ? scope : nil
     }
 
-    /// A named string field inside the object at `key`.
     static func field(_ field: String, in metadata: [String: JSONValue], key: String) -> String? {
         guard case .object(let object)? = metadata[key],
               case .string(let raw)? = object[field] else { return nil }
@@ -62,10 +47,7 @@ public enum OrganismSemanticExpectation {
     }
 }
 
-/// Which conversation, and which of her turns, an expectation is about.
-/// Opaque identifiers only; bounded at construction so a producer cannot grow a
-/// prediction row. An absent `OrganismPrediction.semanticScope` decodes as nil;
-/// a scoped reaction never resolves an unscoped row.
+/// Require bounded complete session/turn scope so a reaction cannot settle an unscoped expectation.
 public struct OrganismSemanticScope: Codable, Sendable, Equatable {
     public let sessionID: String
     public let turnID: String
@@ -85,11 +67,7 @@ public struct OrganismSemanticScope: Codable, Sendable, Equatable {
 extension OrganismPredictiveBody {
     // MARK: - Semantic expectations
 
-    /// Open an expectation about how the turn she just finished will land.
-    /// Bounded four ways: the label AND the scope must be present and legible,
-    /// at most `maximumPendingPerSession` may be open for that session, and a
-    /// replayed signal cannot open the same row twice (the id folds in the turn
-    /// and its own second).
+    /// Require label and full scope, enforce the per-session cap and fold turn/time into identity so replay cannot mint twice.
     static func mintSemanticExpectation(
         signal: SomaticSignal,
         in ledger: inout OrganismPredictionLedger
@@ -109,7 +87,7 @@ extension OrganismPredictiveBody {
         let id = semanticExpectationID(signal: signal, label: label, scope: scope)
         guard ledger.predictions[id] == nil else { return }
 
-        // Keep three pending rows per session, evicting oldest first.
+        // The per-session cap evicts oldest rows without declaring outcomes.
         let sessionPending = ledger.predictions.values
             .filter {
                 $0.kind == .semanticExpectation && $0.status == .pending

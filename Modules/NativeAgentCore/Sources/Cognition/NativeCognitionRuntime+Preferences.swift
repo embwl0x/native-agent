@@ -19,8 +19,7 @@ import Transcripts
 // Blueprint: | `NativeCognitionRuntime+Preferences.swift` | `NativeCognitionRuntime` preferences, checked configuration refresh and onboarding transitions |
 
 extension NativeCognitionRuntime {
-    /// Read the configured user name from `<dataRoot>/memory/profile.json`
-    /// (`userName`, written at onboarding). An unreadable existing profile throws.
+    /// An unreadable existing profile throws rather than inventing an onboarding name.
     public nonisolated static func resolveUserName(dataRoot: URL) throws -> String {
         let path = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
@@ -63,15 +62,12 @@ extension NativeCognitionRuntime {
             _ = try await routing.checkedRoutingSnapshot()
             providerRoutingFailure = nil
         } catch {
-            // Provider files are authoritative for reflection. Corruption closes
-            // only the provider-using lane instead of silently reviving a stale
-            // UserDefaults route.
+            // Provider files own reflection routing; corrupt files close that route rather than reviving stale defaults.
             configuration.reflectiveCallsEnabled = false
             providerRoutingFailure = "cognitive provider state unavailable: \(error.localizedDescription)"
         }
         await substrate.configure(configuration)
-        // The promoter is process-wide: only the canonical-root runtime may
-        // install its entire interpretation binding, including the callbacks.
+        // Only the canonical-root runtime may install the process-wide interpretation binding and callbacks.
         if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
             await AdaptiveMemoryPromoter.shared.configureInterpretation(
                 isIdle: { [weak self] in
@@ -79,15 +75,12 @@ extension NativeCognitionRuntime {
                     return await !self.liveTurnInFlight
                 },
                 finish: { [weak self] context, interpretation, momentID in
-                    // True when the mind's and body's shares both landed.
                     await self?.foldTurnMoment(context, interpretation: interpretation, momentID: momentID) ?? false
                 },
                 door: livedMomentDoor()
             )
         }
-        // A verdict the
-        // mind turns away never reaches the body, so it amends its own
-        // appraisal row from here, with the same fields a body outcome writes.
+        // A verdict refused by the mind never reaches the body, so amend its appraisal receipt at this boundary.
         await substrate.setCaringRefusalRecorder { [weak self] session, turn, why in
             guard let self else { return }
             await self.caringReceiptLog.amendReceiptRefused(
@@ -102,8 +95,7 @@ extension NativeCognitionRuntime {
             defaults: preferenceDefaults
         )
         await organismKernel.configure(organismConfiguration)
-        // Configuration replaces the pushed clock. Invalidate after that await
-        // so a concurrent body read cannot consume the invalidation too early.
+        // Invalidate after replacing the clock so a concurrent read cannot consume invalidation before the new state exists.
         sourceWakes.clockDirty = true
         await somaticSignalBus.configure(organismConfiguration)
     }
@@ -141,10 +133,7 @@ extension NativeCognitionRuntime {
         publishRuntimeChange(reason: "configuration:reflection_budget")
     }
 
-    /// The user-facing Subconscious switch is one transaction over the
-    /// existing cognition and organism owners. Keeping this composition here
-    /// prevents UI call sites from omitting a lane or triggering a cascade of
-    /// redundant configuration reloads and invalidations.
+    /// Compose the Subconscious preference transaction here so UI callers cannot omit an owner or trigger redundant reloads.
     public func setSubconsciousMasterEnabled(
         _ enabled: Bool,
         reflectionBudget: Int
@@ -158,11 +147,7 @@ extension NativeCognitionRuntime {
         await refreshConfiguration()
         if enabled {
             if alreadyBootstrapped {
-                // A launch with the inner life off read none of her substrate;
-                // waking reads it once (seeding and migrating her cares). A substrate
-                // already read keeps its resident state (restore runs once),
-                // and the body, restored dormant at the opening, is never
-                // reloaded over.
+                // Read dormant substrate once on waking; never reload resident substrate or the body already restored during opening.
                 await bootstrap()
                 await enterDoor()
                 defer { leaveDoor() }
@@ -181,8 +166,7 @@ extension NativeCognitionRuntime {
                 }
                 await refreshOrganismBodySchema(reason: "subconscious enabled")
                 await persistOrganismContinuity(reason: "subconscious enabled")
-                // Desk changes while she was off did not reach the work projection;
-                // waking reads the Desk once.
+                // Refresh Desk on waking because disabled-time edits did not reach its projection.
                 await startPursuitRefresh()
             } else {
                 await bootstrap()
@@ -210,9 +194,7 @@ extension NativeCognitionRuntime {
         return await subconsciousRuntimeState()
     }
 
-    /// Setup completion and launch share the explicit switch's preference
-    /// transaction, but automatic initialization never replaces a saved choice.
-    /// The independent hour preference is deliberately not part of this master.
+    /// Automatic setup shares the explicit preference transaction but cannot replace saved choice; the hour preference remains independent.
     nonisolated static func initializeMissingInnerLifePreferences(
         dataRoot: URL, providerReady: Bool, defaults: UserDefaults
     ) {
@@ -236,7 +218,7 @@ extension NativeCognitionRuntime {
         if !onlyMissing || defaults.object(forKey: reflectionBudgetKey) == nil {
             defaults.set(enabled ? max(1, reflectionBudget) : 0, forKey: reflectionBudgetKey)
         }
-        // Write the master last so an interrupted initialization can resume.
+        // Write the master preference last so interrupted initialization can resume.
         if !onlyMissing || defaults.object(forKey: enabledKey) == nil {
             defaults.set(enabled, forKey: enabledKey)
         }
@@ -256,12 +238,12 @@ extension NativeCognitionRuntime {
         let backgroundEnabled = enabled && (
             defaults.object(forKey: backgroundKey) as? Bool ?? true
         )
-        // The personality ships on, reflection included; off is a choice.
+        // Ship inner life and reflection enabled; disabling them is a saved choice.
         let reflectionEnabled = enabled && (
             defaults.object(forKey: reflectionKey) as? Bool ?? true
                 || env["NATIVE_AGENT_COGNITION_REFLECTION_ENABLED"] == "1"
         )
-        // Rolling 24h cost ceiling; admission is load.
+        // The rolling 24-hour cost ceiling bounds spending; admission uses load.
         let budgetDefault = reflectionEnabled ? 2 : 0
         let storedBudget = defaults.object(forKey: reflectionBudgetKey) as? Int
         let budget = max(0, storedBudget ?? budgetDefault)
@@ -313,8 +295,7 @@ extension NativeCognitionRuntime {
     private static let backgroundKey = "cognitiveSubstrateBackgroundEnabled"
     private static let reflectionKey = "cognitiveSubstrateReflectionEnabled"
     private static let reflectionBudgetKey = "cognitiveSubstrateDailyReflectionBudget"
-    /// Unresolved-load admission threshold for spontaneous reflection. No UI
-    /// knob: the ceiling is what User steers; this is the shape's tuning seam.
+    /// Tune reflection admission by unresolved load; the person controls its cost ceiling.
     private static let reflectionLoadThresholdKey = "cognitiveSubstrateReflectionLoadThreshold"
     static let organismKernelEnabledKey = "organismKernelEnabled"
 }

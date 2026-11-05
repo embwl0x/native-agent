@@ -2,18 +2,14 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-/// Assembly provenance is request metadata, never an inference from prompt prose.
+/// The background client owns this operation's persona assembly explicitly.
 public enum PrivateWorkContextAssembly: Sendable {
     case compilePersona
     case suppliedPersona
     case taskOnly
-
-    @TaskLocal public static var current: PrivateWorkContextAssembly = .compilePersona
 }
 
-/// What woke the dream. `schedule` is the 03:30 daily job on the Mac's local clock.
-/// `manual` is a person asking for a pass now, from the Dreams tab or a tool. Receipts carry it so a dream's
-/// provenance is never guessed from its timestamp.
+/// Retain the trigger so dream provenance cannot be guessed from time; scheduled runs use the Mac's local clock.
 public enum DreamTrigger: String, Sendable, Equatable, CaseIterable, Codable {
     case schedule
     case manual
@@ -24,19 +20,18 @@ public struct DreamReport: Sendable, Equatable {
     public var sessionsProcessed: Int
     public var entriesWritten: Int
     public var errors: [String]
+    /// Effects kept owed because a shared slot was busy: not errors, each naming its holder and when to try again.
+    public var busy: [String] = []
     public var disabled: Bool
     public var trigger: DreamTrigger
-    /// Set when a run wrote nothing for a reason that is NOT a failure, so the
-    /// scheduler's existing skipped-outcome shape can say WHICH honest reason:
-    /// `no_new_material` (nothing past the high-water mark; an existing entry
-    /// for the day is never a reason) or `already_running`.
+    /// Keep nonfailure skips distinct and name their actual reason; an existing diary entry alone cannot justify skipping new material.
     public var skipReason: String?
-    /// Her cares as the committed dream was shown them, with its answer lines.
     public var careNight: CognitiveCareNight?
-    /// Generated and decoded through the real dream path; never committed.
+    /// Preview uses real generation and decoding without committing.
     public var preview: JSONValue?
-    /// Previously committed sections whose retained work finished on this pass.
     public var effectsSettled: Int = 0
+    /// Lessons this run committed to memory, from its own dream and any earlier night it settled.
+    public var lessonsSaved: Int = 0
 
     public var committed: Bool { entriesWritten > 0 && !disabled && errors.isEmpty }
 
@@ -57,57 +52,33 @@ public struct DreamReport: Sendable, Equatable {
     }
 }
 
-/// Provider for the "self half" of the dream prompt — recent memory deltas
-/// (persona-feedback episodic entries, KG nudges, anything she's absorbed
-/// about herself since the last dream). It is handed the run's own cutoff
-/// (the high-water mark the conversations are read from), so a night that
-/// retries a missed stretch dreams that stretch's memories too. Each string
-/// is one pre-formatted delta. Default returns empty so tests don't need to
-/// wire one. Production
-/// (BackgroundLoopsAssembly) wires this against SwiftNativeMemoryV2 filtered
-/// by the `persona-feedback` tag.
+/// Use the run's conversation high-water cutoff for self-memory deltas too, so missed stretches retain matching evidence.
 public typealias DreamMemoryDeltaProvider = @Sendable (_ since: Date) async throws -> [String]
 
-/// CPU reading of existing surprise records over the same high-water window
-/// as the dream. The runner adds the prompt-owned header and bounds the block.
+/// Read surprise evidence over the dream's own window; the runner owns prompt headers and bounds.
 public typealias DreamSurpriseProvider = @Sendable (_ since: Date, _ through: Date) async throws -> String
 
-/// Provider for the "felt" tone of the dream prompt — ONE bounded, read-time
-/// summary of what the day FELT like, pulled from the cognitive substrate's
-/// felt layer (per-node emotional tags + derived mood). Returns nil when nothing
-/// was felt / affect is disabled, in which case the dream's felt section is
-/// OMITTED entirely (feeling-silence stays silence, mirroring the capsule's
-/// neutral path). Default returns nil so tests don't need to wire one. Production
-/// (BackgroundLoopsAssembly) wires this against the substrate's
-/// `feltDaySummary(at:)`. It colors the dream's TONE — it never scripts content.
+/// Omit felt tone when affect is absent or disabled; feeling-silence stays silence.
+/// Use bounded substrate evidence to color tone without scripting dream content.
 public typealias DreamFeltSummaryProvider = @Sendable () async throws -> String?
 
-/// Provider for the felt nodes' provenance behind `DreamFeltSummaryProvider`'s
-/// text — the same last-24h felt population, subject/metadata only. Default is
-/// empty, so a dream with nothing wired cites nothing and reads exactly as it
-/// did before.
+/// Use the same felt population's subject metadata for provenance; absent origins supply no citations.
 public typealias DreamFeltOriginProvider = @Sendable () async throws -> [CognitiveFeltOrigin]
 
-/// Her cares for the dream prompt: what moved her today and what is still open,
-/// with the keys the dream may answer by. nil when the inner life is off.
+/// Open-care keys bind dream answers to shown cares; disabled inner life supplies none.
 public typealias DreamCareNightProvider = @Sendable () async throws -> CognitiveCareNight?
 
-/// Receipt channel for the dream lane. DreamREMCycle holds no substrate
-/// reference (and must not: cognition lives above it), so a receipt it owns is
-/// handed OUT to whoever holds the store — the same shape
-/// `CognitiveSubstrate.recordReceiptChecked(kind:payload:)` takes. Default is
-/// an explicit unavailable failure, never an acknowledgment.
+/// Send receipts to the injected owner because cognition sits above DreamREMCycle.
+/// An unavailable sink must fail explicitly rather than acknowledge.
 public typealias DreamReceiptSink = @Sendable (_ kind: String, _ payload: JSONValue) async throws -> Void
 
-/// Her explicit affect judgment, after the dream commits. The dated sink answers
-/// whether the effect persisted or its owner is explicitly switched off.
+/// Acknowledge dream affect only after dated persistence or an explicitly disabled owner.
 public typealias DreamDatedMoodSink = @Sendable (
     _ affect: Double,
     _ dateKey: String
 ) async throws -> DreamEffectResult
 
-/// One owed step, carrying its retained input. Producing a reflection is distinct
-/// from integrating it: its judgment must be saved before it can change her.
+/// Save produced reflection judgment before integration so no effect can precede its durable cause.
 public enum DreamEffect: Sendable {
     case reflectionJudgment([String: CognitiveReflectionCause])
     case reflectionIntegration(CognitiveReflectionReceipt)
@@ -116,13 +87,21 @@ public enum DreamEffect: Sendable {
     case completion(occurredAt: Date, feltSummary: String?)
 }
 
+/// An effect whose shared slot other work holds stays owed and is not a failure; the words name the holder and when to try again.
+public struct DreamBusy: Error, LocalizedError, CustomStringConvertible, Sendable {
+    public let words: String
+    public init(_ words: String) { self.words = words }
+    public var errorDescription: String? { words }
+    public var description: String { words }
+}
+
 public enum DreamEffectResult: Sendable {
     case done
     case skipped(String)
     case reflection(CognitiveReflectionReceipt)
 }
 
-/// Delivery of the exact saved section, never a fresh lookup of the latest dream.
+/// Deliver the exact saved section rather than looking up a newer dream.
 public struct DreamDelivery: Sendable {
     public let id: UUID
     public let date: String
@@ -134,4 +113,4 @@ public struct DreamDelivery: Sendable {
 
 public typealias DreamEffectSink = @Sendable (DreamDelivery) async throws -> DreamEffectResult
 import CognitiveSubstrate
-// Blueprint: | `DreamCycleContracts.swift` | Dream trigger, report, provider and saved-effect delivery contracts, including bounded CPU surprise material and the uncommitted decoded preview result |
+// Blueprint: | `DreamCycleContracts.swift` | DreamCycleContracts owner. |

@@ -1,15 +1,8 @@
 import Foundation
 import GRDB
-// Blueprint: | `ActivitySpanStore.swift` | `ActivitySpanStore`; asynchronous per-root store acquisition shared by capture, retention and queries; retention deletes atomically owe durable compaction until VACUUM and both checkpoints succeed |
+// Blueprint: | `ActivitySpanStore.swift` | `ActivitySpanStore`: per-root acquisition; retention owes compaction until VACUUM and checkpoints succeed |
 
-/// Single-writer SQLite store for activity spans.
-///
-/// Construction style mirrors `ContextSQLiteStore` (subdirectory + GRDB
-/// `Configuration` + `DatabaseMigrator`). Own DB file, mode 0600, inside
-/// `<dataRoot>/activity_watch/activity_spans.sqlite`.
-///
-/// `activity_span.title_redacted` holds redacted window titles; a separate
-/// singleton row records physical compaction still owed by retention.
+/// One writer owns private activity spans and durable compaction debt in an owner-only database.
 public actor ActivitySpanStore {
     private actor Stores {
         var stores: [URL: (store: ActivitySpanStore, identity: NSObject)] = [:]
@@ -45,7 +38,6 @@ public actor ActivitySpanStore {
         try await stores.acquire(dataRoot: dataRoot, existingOnly: existingOnly)
     }
 
-    /// Default retention is 30 days, configurable through `ActivityPolicy.retentionDays`.
     public static let defaultRetention: TimeInterval =
         Double(ActivityPolicy.defaultRetentionDays) * 86_400
 
@@ -73,7 +65,10 @@ public actor ActivitySpanStore {
         try dbQueue.write { db in
             if try db.tableExists("activity_span") {
                 let columns = Set(try db.columns(in: "activity_span").map(\.name))
-                guard columns.isSuperset(of: ["id", "started_at", "ended_at", "last_seen_at", "bundle_id", "app_name", "event_count", "close_reason", "tz_offset_min", "title_redacted"]) else {
+                guard columns.isSuperset(of: [
+                    "id", "started_at", "ended_at", "last_seen_at", "bundle_id", "app_name",
+                    "event_count", "close_reason", "tz_offset_min", "title_redacted"
+                ]) else {
                     throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: databaseURL.path])
                 }
             } else {
@@ -90,8 +85,7 @@ public actor ActivitySpanStore {
                 """)
         }
 
-        // Owner-only. This file is a record of where the human was; a
-        // group/world-readable mode would be a privacy defect on its own.
+        // Activity history must remain owner-only; group or world readability exposes private behavior.
         try? FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o600))],
             ofItemAtPath: databaseURL.path
@@ -100,12 +94,11 @@ public actor ActivitySpanStore {
 
     // MARK: - Write path
 
-    /// Apply one command in one write transaction.
     public func apply(_ command: ActivityStoreCommand) throws {
         try dbQueue.write { db in
             switch command {
             case .open(let span):
-                // Open rows and last-seen timestamps survive an ungraceful exit.
+                // Persist open rows and last observation for crash settlement.
                 try db.execute(
                     sql: """
                     INSERT OR REPLACE INTO activity_span (
@@ -121,7 +114,7 @@ public actor ActivitySpanStore {
                     ]
                 )
             case .touch(let id, let timestamp):
-                // Count events and never rewind the crash-recovery bound.
+                // Never rewind the crash-recovery bound when counting events.
                 try db.execute(
                     sql: """
                     UPDATE activity_span
@@ -131,7 +124,7 @@ public actor ActivitySpanStore {
                     arguments: [timestamp, id]
                 )
             case .heartbeat(let id, let timestamp):
-                // Liveness advances without counting a human event.
+                // Liveness must not fabricate a human event.
                 try db.execute(
                     sql: """
                     UPDATE activity_span
@@ -141,7 +134,7 @@ public actor ActivitySpanStore {
                     arguments: [timestamp, id]
                 )
             case .retitle(let id, let titleRedacted, let timestamp):
-                // Set the initial title only while open, counting its arrival.
+                // Only an open span may learn its initial title.
                 try db.execute(
                     sql: """
                     UPDATE activity_span
@@ -162,7 +155,7 @@ public actor ActivitySpanStore {
                     arguments: [timestamp, reason.rawValue, id]
                 )
             case .reconcileAbandoned:
-                // Close at the last observation, never inventing time after a crash.
+                // A crash provides no evidence of activity after the last observation.
                 try db.execute(
                     sql: """
                     UPDATE activity_span
@@ -177,10 +170,7 @@ public actor ActivitySpanStore {
 
     // MARK: - Retention
 
-    /// Deletes spans whose end (or last-seen, for still-open rows) predates the
-    /// retention window, then VACUUMs so the bytes actually leave the file.
-    /// Deletion and its compaction debt commit together. A later pass retries
-    /// that debt even if no more rows expire, including after a process exit.
+    /// Commit deletion with compaction debt so physical privacy cleanup remains owed across failure or restart.
     @discardableResult
     public func prune(
         olderThan retention: TimeInterval = ActivitySpanStore.defaultRetention,
@@ -194,8 +184,7 @@ public actor ActivitySpanStore {
             )
             let deleted = db.changesCount
             if deleted > 0 {
-                // Keep the first unpaid deletion's time until physical cleanup
-                // succeeds; subsequent deletions join the same obligation.
+                // Retain the first unpaid deletion time until physical cleanup succeeds.
                 try db.execute(
                     sql: "INSERT INTO activity_compaction_owed (id, since) VALUES (1, ?) ON CONFLICT(id) DO NOTHING",
                     arguments: [now]
@@ -210,7 +199,7 @@ public actor ActivitySpanStore {
         if result.compactionOwed {
             try checkpointAndVacuum()
         } else {
-            // Retention checkpoints the WAL even when no rows expire.
+            // Checkpoint the WAL even when no rows expire so ordinary capture also becomes durable.
             try checkpointWAL()
         }
         return result.deleted
@@ -228,9 +217,7 @@ public actor ActivitySpanStore {
 
     // MARK: - Read path
 
-    /// Spans OVERLAPPING the window — the shape every rollup needs. A span that
-    /// began yesterday and ran into today belongs to today's buckets for the
-    /// part that lands in them, even when its start precedes the window.
+    /// Query overlap, not starts: a span begun yesterday still contributes its time inside today.
     public func spansOverlapping(
         from: Double,
         to: Double,
@@ -243,9 +230,7 @@ public actor ActivitySpanStore {
             var predicate = "started_at <= ? AND COALESCE(ended_at, last_seen_at) >= ?"
             var arguments: [DatabaseValueConvertible] = [to, from]
             if let bundleID, !bundleID.isEmpty {
-                // Apply the caller's bundle restriction before LIMIT. Filtering
-                // an already-capped array could turn a dense valid answer into
-                // an apparently empty one.
+                // Restrict before LIMIT so unrelated rows cannot displace valid matches and imply an empty answer.
                 predicate += " AND bundle_id = ?"
                 arguments.append(bundleID)
             }
@@ -260,8 +245,7 @@ public actor ActivitySpanStore {
         }
     }
 
-    /// Apply current exclusions in SQL before LIMIT, even before retroactive
-    /// deletion, so excluded history cannot displace legitimate answer rows.
+    /// Apply current exclusions before LIMIT so excluded history cannot displace valid answer rows.
     private static func fetchSpans(
         _ db: Database,
         predicate: String,
@@ -290,7 +274,7 @@ public actor ActivitySpanStore {
 
     // MARK: - Retroactive deletion
 
-    /// Delete every row for a bundle ID and clear its recoverable database/WAL bytes.
+    /// Remove recoverable database and WAL bytes as well as the logical rows.
     @discardableResult
     public func purge(bundleID: String) throws -> Int {
         let deleted = try dbQueue.write { db -> Int in
@@ -304,8 +288,7 @@ public actor ActivitySpanStore {
         return deleted
     }
 
-    /// Checkpoint → VACUUM → checkpoint, in that order: fold WAL into the database,
-    /// rewrite without freed pages, then clear the WAL left by VACUUM's rewrite.
+    /// Checkpoint, VACUUM, then checkpoint: merge WAL, remove freed pages, then clear the rewrite WAL.
     public func checkpointAndVacuum() throws {
         try dbQueue.writeWithoutTransaction { db in
             func checkpoint() throws {
@@ -317,15 +300,12 @@ public actor ActivitySpanStore {
             try checkpoint()
             try db.execute(sql: "VACUUM")
             try checkpoint()
-            // A crash or failure before this commit leaves the obligation for
-            // the next pass. Clearing it never precedes physical cleanup.
+            // Clear the obligation only after physical cleanup, leaving it owed across a crash or failure.
             try db.execute(sql: "DELETE FROM activity_compaction_owed WHERE id = 1")
         }
     }
 
-    /// Folds ordinary in-window writes out of the WAL without rewriting the
-    /// main database. Called by the due retention pass when there is nothing to
-    /// delete, so capture has one durable checkpoint cadence either way.
+    /// When nothing expires, checkpoint ordinary writes through the same retention cadence.
     public func checkpointWAL() throws {
         try dbQueue.writeWithoutTransaction { db in
             try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")

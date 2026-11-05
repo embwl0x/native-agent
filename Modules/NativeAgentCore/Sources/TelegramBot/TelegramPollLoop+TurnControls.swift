@@ -54,9 +54,7 @@ extension TelegramPollLoop {
             await answer("Showing safe work details.")
             await card.showDetails()
         case .stop:
-            // The callback spinner is released before waiting for cooperative
-            // cancellation evidence. Card state moves to canceled only from
-            // the turn's own CancellationError path.
+            // Acknowledge before awaiting cancellation; only the turn's CancellationError may mark its card canceled.
             await answer("Stopping this Telegram turn.")
             _ = await requestLiveTurnStop(
                 destination: parsed.destination,

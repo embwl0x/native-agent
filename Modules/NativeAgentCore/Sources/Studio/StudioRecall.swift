@@ -7,8 +7,7 @@ import CryptoKit
 
 // MARK: - Recall query
 
-/// A read-only query over the journal. Every supplied field narrows the result (AND); an empty query matches everything. There is NO relevance score — the only ordering is newest-first, because the response text is the point and ranking it
-/// would be the taste-score this store refuses to keep.
+/// AND filters and newest-first order preserve the response as evidence without assigning taste scores.
 public struct StudioRecallQuery: Sendable, Equatable {
     public var text: String?
     public var title: String?
@@ -43,7 +42,7 @@ public struct StudioRecallQuery: Sendable, Equatable {
     }
 }
 
-/// Matches, newest-first, plus an HONEST statement of what was left out.
+/// Report omitted coverage alongside verbatim matches.
 public struct StudioRecallResult: Sendable, Equatable {
     public var entries: [StudioJournalEntry]
     public var matchedCount: Int
@@ -61,17 +60,16 @@ public struct StudioEncounterCandidate: Sendable, Equatable, Hashable {
     public enum Source: String, Sendable, CaseIterable, Equatable {
         /// A consult with real artifact refs is an invitation, not an assignment.
         case named
-        /// A work the knowledge graph holds that the journal never answered.
         case unjournaledWork
     }
 
     public var source: Source
-    /// What it is called, when anything actually knows. A consult carries refs, not a title, and inventing one would be the dishonesty the whole design exists to prevent — so this stays optional.
+    /// Titles stay optional: consult refs cannot prove a work's name.
     public var title: String?
     public var creator: String?
-    /// The path or URL she would receive it through. TEXT: nothing in the intake path opens it. An honest encounter happens in front of the work, through the vision/browser organs, never by a queue quietly reading a file.
+    /// Intake exposes paths as text only; an encounter requires actually viewing the work through the vision or browser owner.
     public var reference: String?
-    /// What names this candidate for dedup — a consult id, an entity id.
+    /// Use consult or entity identity to deduplicate candidates.
     public var originID: String
     public var noticedAt: String
 

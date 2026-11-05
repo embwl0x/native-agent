@@ -4,7 +4,7 @@ import DreamREMCycle
 import NativeAgentCore
 import PersistenceCore
 import BackgroundLoops
-// Blueprint: | `NativeCognitionRuntime+Replay.swift` | `NativeCognitionRuntime` replay evidence composition, checked integration and bounded event-driven reconciliation |
+// Blueprint: | `NativeCognitionRuntime+Replay.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
     func handleEventDrivenReplayOutcome(
@@ -43,11 +43,7 @@ extension NativeCognitionRuntime {
     }
 
     private func retryPendingReplayReconciliation() async {
-        // Hold `replayRetryTask` non-nil across the replay await. The
-        // arm site guards on `replayRetryTask == nil`, so clearing it before
-        // awaiting would let a concurrent dream signal observe "no retry armed"
-        // and double-run replay. Reconciliation stays idempotent; the task
-        // self-clears only after this body completes.
+        // Hold the retry-task claim across replay's await so concurrent dream signals cannot double-run it; clear only after completion.
         guard replayReconciliationPending, !isFlushedForTermination else {
             replayRetryTask = nil
             return
@@ -57,8 +53,7 @@ extension NativeCognitionRuntime {
         replayRetryTask = nil
     }
 
-    /// The deadline bounds the wait on a retained flight, never its commit.
-    /// Only that flight's terminal result settles reconciliation and reflection.
+    /// Bound only the wait on retained work; its real terminal result alone settles reconciliation and reflection.
     func runEventDrivenReplayWithDeadline(
         reason: String,
         material: [String: CognitiveReflectionCause]? = [:],
@@ -87,8 +82,7 @@ extension NativeCognitionRuntime {
                     case .skipped(let detail, _): detail == "no new replay evidence"
                     case .failed: false
                     }
-                    // A later commit may have arrived after this pass captured
-                    // its inputs. Integrate it before reflecting its material.
+                    // Integrate any commit arriving after captured inputs before reflecting its material.
                     if complete && !self.eventReplayAgain, let material = self.replayReflectionMaterial {
                         self.replayReflectionMaterial = nil
                         await self.scheduleEventDrivenReflection(reason: "reflection_" + reason, material: material)
@@ -126,18 +120,28 @@ extension NativeCognitionRuntime {
         if let replayTask {
             let result = await replayTask.value
             guard requiringFreshInput else { return result }
-            // That flight may have frozen its inputs before this event's commit.
-            // Its owner clears the slot before returning; a new pass reads after it.
+            // Start a fresh pass after the prior flight clears so inputs include this event's later commit.
             return await runReplay(reason: reason)
         }
         guard !isFlushedForTermination else { return .skipped(reason: "runtime stopping") }
         let flight = Task {
             let result = await self.performReplay(reason: reason)
             self.replayTask = nil
+            Self.beatReplay(result)
             return result
         }
         replayTask = flight
         return await flight.value
+    }
+
+    /// One beat per replay pass, whichever path started it; a caller that joins the flight shares its beat. Finding no new evidence is a pass that
+    /// found nothing.
+    private static func beatReplay(_ result: LoopTickOutcome) {
+        if case .skipped(let reason, _) = result, reason == "no new replay evidence" {
+            OrganJudge.beat("cognition_replay", .nothing, note: reason, cadence: substrateClockCadence)
+        } else {
+            OrganJudge.beat("cognition_replay", tick: result, cadence: substrateClockCadence)
+        }
     }
 
     private func performReplay(reason: String) async -> LoopTickOutcome {

@@ -5,29 +5,18 @@ import PersistenceCore
 
 // Blueprint: | `ErrorFeeds.swift` | `ErrorFeeds`: shared live error-feed inventory and bounded recent-burst scans with explicit read/integrity availability |
 
-/// The live error sinks the heartbeat and the weekly self-improvement pass
-/// read. A burst across them is `errorBurstThreshold` rows inside
-/// `errorBurstWindow`.
 public enum ErrorFeeds {
-    /// Rows across the watched error feeds within the window required to call
-    /// it a "burst." 10 is high enough to mean "something is repeatedly
-    /// failing," low enough to catch a fault before it floods.
+    /// Ten errors distinguishes repeated failure from a transient fault before the feed floods.
     public static let errorBurstThreshold = 10
-    /// The recency window for the burst count, short enough that the count
-    /// reflects a CURRENT cluster, not errors the feeds retain for days.
+    /// Use a recent window so old retained errors cannot masquerade as a current burst.
     public static let errorBurstWindow: TimeInterval = 10 * 60
-    /// A watched live feed with no write in this long carries no current signal,
-    /// rather than evidence of health. Seven days catches a silent writer
-    /// without treating an ordinary quiet stretch as failure.
+    /// Seven silent days means no current signal, not health or failure; ordinary quiet stretches remain neutral.
     public static let feedSilentAfter: TimeInterval = 7 * 24 * 60 * 60
 
     // MARK: - Watched error feeds
 
-    /// One watched error sink.
     public struct ErrorFeed: Sendable, Equatable {
-        /// Short name used in the heartbeat line.
         public let label: String
-        /// Path relative to the data root.
         public let relativePath: String
 
         public init(label: String, relativePath: String) {
@@ -42,40 +31,30 @@ public enum ErrorFeeds {
         }
     }
 
-    /// Live surface error feeds and background-loop failure receipts.
+    /// Error feeds that are still files. Loop failures are `loop.failure` details in the record, scanned beside them under `loopFailureLabel`.
     public static let errorFeeds: [ErrorFeed] = [
         ErrorFeed(label: "telegram", relativePath: "telegram/errors.jsonl"),
         ErrorFeed(label: "slack", relativePath: "slack/errors.jsonl"),
-        ErrorFeed(label: "loops", relativePath: "logs/background_loop_failures.jsonl"),
     ]
+    public static let loopFailureLabel = "loops"
 
-    /// Bounded recent evidence from one watched feed.
     public struct ErrorFeedStatus: Sendable {
-        public let feed: ErrorFeed
+        public let label: String
         public let unavailable: String?
-        /// Rows inside `errorBurstWindow` (always 0 for a silent feed — it is
-        /// not read at all).
+        /// Silent feeds contribute no current rows and are not opened.
         public let recentCount: Int
         public let earliestExpiry: Date?
-        /// Up to 30 of those rows, oldest-first, truncated for evidence.
+        /// Cap retained evidence at 30 rows, oldest first, so a burst cannot flood context.
         public let recentLines: [String]
     }
 
-    /// Max bytes read from the END of each feed per tick. The files are
-    /// append-only and can be large; reading them whole every tick is a
-    /// cooperative-pool blocker. 256 KiB of tail comfortably covers any
-    /// realistic 15-minute window (a burst that overflows it still trips
-    /// the threshold from the lines that fit).
+    /// Read only a 256 KiB tail: append-only feeds can be huge, and a burst overflowing that cap still trips the threshold.
     static let errorLogTailBytes = 256 * 1024
 
-    /// Reads every watched feed's bounded tail and reports what it saw. Rows
-    /// without a parseable timestamp make the reading unavailable; they cannot
-    /// establish a current burst or a clean count. The whole bounded tail is scanned (no
-    /// early break — interleaved out-of-order timestamps must not hide newer
-    /// rows). A silent feed is never opened: its rows cannot be current, and a
-    /// bogus future timestamp in a dead file must not manufacture a burst.
-    public static func scanErrorFeeds(dataRoot: URL, now: Date) -> [ErrorFeedStatus] {
-        errorFeeds.map { feed in
+    /// Undated rows make burst evidence unavailable, never a clean count; scan the bounded tail without early breaks.
+    /// Never open silent feeds: stale files with bogus future timestamps must not manufacture current bursts.
+    public static func scanErrorFeeds(dataRoot: URL, now: Date) async -> [ErrorFeedStatus] {
+        let files = errorFeeds.map { feed in
             let path = feed.url(dataRoot: dataRoot)
             do {
                 let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
@@ -83,24 +62,43 @@ public enum ErrorFeeds {
                     throw PersistenceCoreError.ioFailure("modification date unavailable at \(path.path)")
                 }
                 guard now.timeIntervalSince(lastWriteAt) <= feedSilentAfter else {
-                    return ErrorFeedStatus(feed: feed, unavailable: nil,
+                    return ErrorFeedStatus(label: feed.label, unavailable: nil,
                         recentCount: 0, earliestExpiry: nil, recentLines: [])
                 }
                 let kept = try recentRows(at: path, now: now)
-                return ErrorFeedStatus(feed: feed, unavailable: nil,
+                return ErrorFeedStatus(label: feed.label, unavailable: nil,
                     recentCount: kept.lines.count, earliestExpiry: kept.earliestExpiry,
                     recentLines: Array(kept.lines.prefix(30).reversed()))
             } catch CocoaError.fileReadNoSuchFile {
-                return ErrorFeedStatus(feed: feed, unavailable: nil,
+                return ErrorFeedStatus(label: feed.label, unavailable: nil,
                     recentCount: 0, earliestExpiry: nil, recentLines: [])
             } catch {
-                return ErrorFeedStatus(feed: feed, unavailable: "\(path.path): \(error.localizedDescription)",
+                return ErrorFeedStatus(label: feed.label, unavailable: "\(path.path): \(error.localizedDescription)",
                     recentCount: 0, earliestExpiry: nil, recentLines: [])
             }
         }
+        let loops = await recentLoopFailures(dataRoot: dataRoot, now: now)
+        return files + [loops]
     }
 
-    /// Newest-first rows inside the burst window from one feed's bounded tail.
+    /// One row per loop failure incident whose last occurrence is inside the burst window, as the incident row the trail held; an unreadable
+    /// record makes this feed unavailable, never quiet.
+    private static func recentLoopFailures(dataRoot: URL, now: Date) async -> ErrorFeedStatus {
+        do {
+            let cutoff = now.addingTimeInterval(-errorBurstWindow)
+            let recent = try await LoopFailureReceipts.incidents(dataRoot: dataRoot)
+                .filter { $0.lastAt >= cutoff && !SwiftNativeLoopScheduler.isOfflineError($0.error) }
+                .sorted { $0.lastAt > $1.lastAt }
+            let lines = try recent.map { String(decoding: try $0.row.serializedData(pretty: false), as: UTF8.self).prefix(280).description }
+            let expiry = recent.map { $0.lastAt.addingTimeInterval(errorBurstWindow + 0.001) }.min()
+            return ErrorFeedStatus(label: loopFailureLabel, unavailable: nil, recentCount: recent.count, earliestExpiry: expiry,
+                recentLines: Array(lines.prefix(30).reversed()))
+        } catch {
+            return ErrorFeedStatus(label: loopFailureLabel, unavailable: "experiences/experiences.sqlite (loop.failure): \(error.localizedDescription)",
+                recentCount: 0, earliestExpiry: nil, recentLines: [])
+        }
+    }
+
     private static func recentRows(at path: URL, now: Date) throws -> (lines: [String], earliestExpiry: Date?) {
         guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: .max, maxBytes: errorLogTailBytes) else { return ([], nil) }
         let cutoff = now.addingTimeInterval(-errorBurstWindow)
@@ -112,13 +110,13 @@ public enum ErrorFeeds {
                   let ts = (obj["lastAt"] as? String ?? obj["createdAt"] as? String ?? obj["at"] as? String
                     ?? obj["ts"] as? String ?? obj["timestamp"] as? String).flatMap(parseISO)
             else {
-                throw PersistenceCoreError.ioFailure("error feed has a malformed or undated row at \(path.path); repair the retained evidence before judging its burst count")
+                throw PersistenceCoreError.ioFailure(
+                    "error feed has a malformed or undated row at \(path.path); repair the retained evidence before judging its burst count"
+                )
             }
-            // No early break: writers can interleave slightly out-of-order
-            // timestamps, and one stale row must not hide newer rows behind
-            // it. The scan is already bounded by errorLogTailBytes.
+            // Scan the whole bounded tail: interleaved stale timestamps must not hide newer rows.
             if ts < cutoff { continue }
-            // Offline errors do not count as faults.
+            // Offline errors are network weather, not faults.
             if SwiftNativeLoopScheduler.isOfflineError(line) { continue }
             let expiry = ts.addingTimeInterval(errorBurstWindow + 0.001)
             earliestExpiry = min(earliestExpiry ?? expiry, expiry)

@@ -1,10 +1,8 @@
 import SwiftUI
 
-// Blueprint: | `ChatFocusedCommands.swift` | `ChatFocusedCommands`: active-window chat action closures and page visibility, keeping shortcuts out of hidden controls |
+// Blueprint: | `ChatFocusedCommands.swift` | `ChatFocusedCommands`: Visible-window commands |
 
-/// Window-focused chat actions keep keyboard shortcuts out of invisible
-/// production buttons. The active main or detached chat window owns the
-/// closures; the app command menu only invokes that focused owner.
+/// Active windows own focused actions so hidden buttons cannot intercept shortcuts.
 struct ChatFocusedCommandActions {
     let send: () -> Void
     let attach: () -> Void
@@ -57,7 +55,7 @@ struct ChatFocusedCommands: Commands {
     }
 }
 
-/// Hidden mounted chats cannot act; standalone chats are visible by default.
+/// Hidden mounted chats must not act; standalone chats are visible by default.
 private struct ChatPageIsVisibleKey: EnvironmentKey {
     static let defaultValue: Bool = true
 }

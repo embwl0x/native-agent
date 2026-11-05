@@ -3,7 +3,7 @@ import Foundation
 import PersistenceCore
 import ProviderRouting
 import NativeAgentCore
-// Blueprint: | `AgentPeerPolicy.swift` | `AgentPeerPolicy`: shared A2A origin normalization, `peerFailure`, `peerAuthorizeInterface`; discovery retains its separate card-to-contact check |
+// Blueprint: | `AgentPeerPolicy.swift` | `AgentPeerPolicy`, `peerFailure`, `peerAuthorizeInterface` |
 
 package enum AgentPeerPolicy {
     package static func origin(_ url: URL) -> String {
@@ -26,9 +26,8 @@ package enum AgentPeerPolicy {
         var candidate = AgentPeerContact(name: "Peer endpoint", endpoint: interface.endpoint, transport: .a2a)
         candidate.credentialKey = nil
         try AgentPeerStore.validate(candidate)
-        // HTTP/2 may listen beside the card's HTTP listener. The card may
-        // authorize a gRPC port on the same host with the same TLS policy,
-        // never a different host or a downgrade from HTTPS to plaintext.
+        // HTTP/2 may listen beside the card's HTTP listener. The card may authorize a gRPC port on the same host with the same TLS policy, never a different
+        // host or a downgrade from HTTPS to plaintext.
         let sameGRPCHost = interface.binding == "GRPC"
             && interface.endpoint.host?.lowercased() == cardURL.host?.lowercased()
             && interface.endpoint.scheme?.lowercased() == cardURL.scheme?.lowercased()
@@ -37,7 +36,8 @@ package enum AgentPeerPolicy {
                 owner: interface.endpoint.absoluteString,
                 nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]),
                 code: "agent_interface_origin_mismatch", status: .refused,
-                instruction: "Read contacts, then configure that origin under its own contact name; do not forward this contact's credential.", recovery: .inspect)
+                instruction: "Read contacts, then configure that origin under its own contact name; do not forward this contact's credential.",
+                    recovery: .inspect)
         }
         guard case .array(let alternatives) = interface.securityRequirements,
               case .object(let schemes) = interface.securitySchemes else {
@@ -78,7 +78,10 @@ package enum AgentPeerPolicy {
                 owner: cardURL.absoluteString,
                 nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]),
                 code: "agent_credential_required", status: .refused,
-                instruction: "Read contacts and obtain the owner's real token. Configure the authenticated connection with name, endpoint, transport:a2a and bearer_token in agent.connect.", recovery: .inspect)
+                instruction: """
+                    Read contacts and obtain the owner's real token. Configure the authenticated connection with name, endpoint, transport:a2a and \
+                    bearer_token in agent.connect.
+                    """, recovery: .inspect)
         }
         throw ToolFailureError("No advertised authentication alternative is supported; this connection supports HTTP bearer authentication without scopes.",
             effects: .none, owner: cardURL.absoluteString, tap: "\(cardURL.absoluteString) → securityRequirements / securitySchemes",

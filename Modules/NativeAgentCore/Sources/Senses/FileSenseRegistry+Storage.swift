@@ -2,7 +2,7 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `FileSenseRegistry+Storage.swift` | Registry validation, sealed candidate or bundled source resolution, bounded JavaScript manifests and path/symlink fences. Persisted sense timestamps validate within the supported Date range; built-in and shared records may omit an unknown creation date. |
+// Blueprint: | `FileSenseRegistry+Storage.swift` | Sealed source validation, bounded manifests, timestamp validation and path/symlink fences |
 
 extension FileSenseRegistry {
     public func sourceFiles(_ record: SenseRecord) throws -> [String: Data] {
@@ -39,7 +39,9 @@ extension FileSenseRegistry {
 
     static func validateID(_ id: String) throws {
         guard !id.isEmpty, id.utf8.count <= 128,
-              id.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_").contains($0) }) else {
+              id.unicodeScalars.allSatisfy({
+                  CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_").contains($0)
+              }) else {
             throw failure("Sense id must contain only letters, digits, hyphens and underscores.")
         }
     }
@@ -117,10 +119,10 @@ extension FileSenseRegistry {
         }
     }
 
-    /// Reject symlinks in the owned root and every existing path component.
-    /// Missing paths are allowed for publication; other filesystem errors propagate.
+    /// Missing paths permit publication; symlinks in any existing component and other filesystem failures must refuse it.
     static func safeURL(_ relative: String, under root: URL) throws -> URL {
-        guard !relative.hasPrefix("/"), !relative.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else {
+        guard !relative.hasPrefix("/"),
+            !relative.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else {
             throw failure("Sense storage path escapes its root.")
         }
         var current = root

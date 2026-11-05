@@ -1,21 +1,14 @@
-// CognitiveSubstrate+Continuity.swift
-// Dream and gap cues compete for the one felt slot.
-// Dreams suggest associations without establishing facts or writing memory.
-// Gaps span User's own turns across surfaces; wakes and peer threads do not open or close them.
+// Dream cues are associations, never facts or memory writes. Gaps span only the user's verified turns; wakes and peers cannot change them.
 
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `CognitiveSubstrate+Continuity.swift` | `CognitiveSubstrate` continuity cues: dream-theme association and since-gap candidates compete for the existing felt slot |
+// Blueprint: | `CognitiveSubstrate+Continuity.swift` | `CognitiveSubstrate`: dream and gap candidates for the single felt slot |
 
-/// One residue phrase from last night's diary, scored against this message.
 public struct CognitiveDreamTheme: Sendable, Equatable {
-    /// `<diary date>#<n>`: stable per phrase per diary. The ledger key, and
-    /// `dream:<id>` is the source `mind.why` shows and `mind.reject` takes.
+    /// `<diary date>#<n>`: stable per phrase per diary. The ledger key, and `dream:<id>` is the source `mind.why` shows and `mind.reject` takes.
     public let id: String
-    /// The diary's own words.
     public let text: String
-    /// Similarity to this message, as the wiring scored it.
     public let score: Double
 
     public init(id: String, text: String, score: Double) {
@@ -28,8 +21,7 @@ public struct CognitiveDreamTheme: Sendable, Equatable {
 extension CognitiveSubstrate {
     /// One dream line at most every three hours, whichever phrase.
     static let dreamThemeCooldown: TimeInterval = 3 * 3_600
-    /// A phrase surfaces once in its diary's life (the wiring retires a diary
-    /// after 60 h; this outlives it).
+    /// A phrase surfaces once in its diary's life (the wiring retires a diary after 60 h; this outlives it).
     static let dreamThemeRepeatWindow: TimeInterval = 72 * 3_600
     /// "ok", "lol", "yes do it" have nothing for a dream to rhyme with.
     static let dreamThemeMinimumTerms = 2
@@ -41,9 +33,8 @@ extension CognitiveSubstrate {
         return now.timeIntervalSince(last) >= dreamThemeCooldown
     }
 
-    /// The one residue phrase this message connects to, if any. One local
-    /// lookup at most, and none while the cooldown is closed. Re-checked
-    /// against the LIVE ledger after the await, as Reminded-of is.
+    /// The one residue phrase this message connects to, if any. One local lookup at most, and none while the cooldown is closed. Re-checked against the LIVE
+    /// ledger after the await, as Reminded-of is.
     func dreamThemeCue(
         for request: CognitiveCapsuleRequest,
         from read: CognitiveFrozenRead,
@@ -72,8 +63,7 @@ extension CognitiveSubstrate {
             .max { $0.score != $1.score ? $0.score < $1.score : $0.id > $1.id }
     }
 
-    /// Marked as a dream, and as an association rather than an event, in the
-    /// line itself: the cue must never read as something that happened.
+    /// Marked as a dream, and as an association rather than an event, in the line itself: the cue must never read as something that happened.
     func dreamCapsuleLine(for residue: CognitiveDreamTheme) -> String? {
         let text = capsuleLineText(residue.text, maxCharacters: 120)
         guard text.count >= 8 else { return nil }
@@ -84,11 +74,7 @@ extension CognitiveSubstrate {
 
     // MARK: - B2 since we last talked
 
-    /// When the gap this turn closes opened, if it is a real one that has not
-    /// spoken yet. Measured from User's previous verified turn (`UserTurnStamp`,
-    /// the one source E's initiative reads too), so a door switch inside
-    /// minutes is not a gap and her wakes and peers never move it. A gap whose
-    /// line lost the slot stays owed.
+    /// Use `UserTurnStamp` across surfaces so door switches are not gaps and wakes or peers cannot move the anchor. Clipped gap cues remain owed.
     static func sinceGapOpened(
         _ state: CognitiveCapsulePresentationState,
         previousUserTurn: Date?,
@@ -99,14 +85,12 @@ extension CognitiveSubstrate {
         let gap = dyn.sessionBridgeGapHours * 3_600
         guard gap > 0, let last = previousUserTurn,
               now.timeIntervalSince(last) >= gap else { return nil }
-        // Once per gap: `lastSessionBridgeAt` holds the opening of the gap a
-        // bridge last spoke for, so only that same gap is closed.
+        // Once per gap: `lastSessionBridgeAt` holds the opening of the gap a bridge last spoke for, so only that same gap is closed.
         if state.lastSessionBridgeAt == last { return nil }
         return last
     }
 
-    /// What happened while User was away, read only on the first turn back
-    /// after a real gap; nil (no lookup at all) on every other turn.
+    /// Read gap events only on the user's first turn back; all other turns perform no lookup.
     func sinceGapItems(
         for request: CognitiveCapsuleRequest,
         from read: CognitiveFrozenRead,
@@ -128,8 +112,7 @@ extension CognitiveSubstrate {
         return (moved.map { ["a moment: \"\(capsuleLineText($0.note, maxCharacters: 90))\""] } ?? []) + gap.value
     }
 
-    /// The receipt for a continuity source that could not be read: one line
-    /// each, so its silence never reads as an empty past.
+    /// The receipt for a continuity source that could not be read: one line each, so its silence never reads as an empty past.
     static func unreadableCueLine(_ source: String) -> String {
         "- Unreadable just now: \(source). Nothing from it came to mind, which is not the same as nothing there."
     }

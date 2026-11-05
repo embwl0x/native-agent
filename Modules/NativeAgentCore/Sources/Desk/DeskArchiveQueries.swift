@@ -4,15 +4,10 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskArchiveQueries.swift` | Archival, complete checked archive history, current-life readings and hierarchy queries; pending scheduler imports cannot be archived before the migration commit |
+// Blueprint: | `DeskArchiveQueries.swift` | Archival and locked hierarchy queries; partial archive commits preserve receipts |
 extension SwiftNativeDeskStore {
-    /// archive_item -> append ArchiveRecord(s) to desk_archive.jsonl and exclude
-    /// the item (and its whole subtree) from live state. REFUSES any standing
-    /// or unfinished item in the subtree; archive records are summaries, not
-    /// recoverable snapshots of unfinished work.
-    /// Cascade-archives the entire subtree so no live descendant is orphaned.
-    /// Runs the whole check-then-write under the ops flock so the refusal can't
-    /// race a sibling mutation.
+    /// Archive only finished non-standing subtrees: summaries cannot recover unfinished work.
+    /// The ops flock keeps validation and deepest-first writes together so no live child is orphaned.
     @discardableResult
     public func archiveItem(_ handle: String) async throws -> ArchiveRecord {
         return try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -44,20 +39,14 @@ extension SwiftNativeDeskStore {
             let now = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             // Existing archive records prevent duplicate receipts after a crash before the archive op.
             let alreadyArchived = Set(try await self.archivedRecords().map(\.handle))
-            // Deepest-first (subtree is breadth-first, so reverse it), target
-            // LAST: a partial crash then never leaves a parent archived above a
-            // still-live child, and record-before-op keeps "never vanished
-            // without a record" per node.
+            // Deepest-first and receipt-before-op keep partial commits valid and every removal recorded.
             var targetRecord: ArchiveRecord?
             var appendedCanonicalOp = false
             do {
                 for node in Array(subtree.reversed()) + [item] {
                     let rec = Self.makeArchiveRecord(node, now: now)
                     if !alreadyArchived.contains(node.handle) {
-                        // takeLock: false — the caller already holds the ops
-                        // flock, which serializes every archive write.
-                        //
-                        // The archive receipt is durable before the removing op can commit.
+                        // The caller holds the ops flock; make the receipt durable before removing the item.
                         try await appendJSONLCapped(
                             rec.toJSON(), to: archivePath, maxLines: JSONLLineCaps.deskArchive,
                             logLabel: SwiftNativeDeskStore.logLabel,
@@ -66,9 +55,7 @@ extension SwiftNativeDeskStore {
                         )
                     }
                     let archiveOp = DeskOp(ts: now, handle: node.handle, body: .archiveItem)
-                    // The whole subtree was validated against one locked state.
-                    // Append every canonical op first, then reduce once for
-                    // compaction while this same flock is held.
+                    // Append every validated op before reducing once for compaction under the same flock.
                     try await appendOpUnlocked(archiveOp)
                     feed.ops.append(archiveOp)
                     feed.noteAppendedRows(1)
@@ -76,9 +63,7 @@ extension SwiftNativeDeskStore {
                     if node.handle == handle { targetRecord = rec }
                 }
             } catch {
-                // The two append-only feeds cannot be one filesystem
-                // transaction. Deepest-first keeps a partial commit valid;
-                // readers must observe those committed ops even on failure.
+                // The feeds cannot commit atomically; readers must observe even a partial committed removal.
                 if appendedCanonicalOp {
                     changeBus.emit(StoreChange(store: .desk, path: opsPath))
                 }
@@ -90,27 +75,10 @@ extension SwiftNativeDeskStore {
             return targetRecord ?? Self.makeArchiveRecord(item, now: now)
         }
     }
-    /// Live state reads base and tail under the ops flock so compaction cannot cause double replay.
-    /// Replay is memoized on both files' (device, inode, size, mtime_ns) identities.
-    ///
-    /// Three properties keep this a work skip and never a truth skip:
-    ///
-    /// 1. **The flock is still taken, and the stat happens INSIDE it.** The
-    ///    lock ordering, the blocking behaviour against a concurrent writer,
-    ///    and the "no reader may straddle a compaction" guarantee documented
-    ///    above are all unchanged. Only the decode+reduce is skipped.
-    /// 2. **Compaction invalidates.** It rewrites the base (new mtime/size AND
-    ///    a new inode — `writeJSON` is atomic-replace) and truncates the ops
-    ///    file to zero. Either half alone changes the stamp.
-    /// 3. **A racing non-flock writer cannot poison the memo.** The stamp is
-    ///    taken before the read and RE-TAKEN after it; the entry is stored only
-    ///    if the two agree, so a write that lands mid-read costs one wasted
-    ///    replay rather than caching a torn view.
-    ///
-    /// The one skipped side effect is `SnapshotTailOpLog.noteIntegrity`'s
-    /// stderr line, which is already dedupe-latched per (feed, path, summary)
-    /// after its first emission — so a memo hit suppresses nothing the
-    /// unmemoized path would have printed a second time.
+    /// Memoize replay on both files’ stat identities under the ops flock, preserving compaction isolation.
+    /// Atomic base replacement or tail truncation invalidates the memo.
+    /// Stamp before and after reading so a racing non-flock writer cannot cache a torn view.
+    /// Integrity logging is already deduplicated, so a memo hit hides no new diagnostic.
     public func liveState() async throws -> DeskState {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let key = Self.memoKey(opsPath)
@@ -127,9 +95,7 @@ extension SwiftNativeDeskStore {
             return try inCurrentLife(state)
         }
     }
-    /// `liveState()` without the file lock, for a glance that must not wait:
-    /// the feed's stamp is taken before and after the read, and a read that
-    /// raced a write throws instead of returning a torn view.
+    /// A nonblocking glance rejects a feed changed during the read instead of returning a torn view.
     public func liveStateUnlocked() async throws -> DeskState {
         let key = Self.memoKey(opsPath)
         let before = Self.feedStamp(opsPath: opsPath, basePath: basePath)
@@ -168,39 +134,35 @@ extension SwiftNativeDeskStore {
         }
         return state
     }
-    /// Process-wide `liveState()` memo. Keyed on the ops path so alternate data
-    /// roots (tests, secondary roots, the sweep CLI's root) never collide.
+    /// Key on the ops path so distinct data roots cannot share replayed state.
     static let sharedLiveStateMemo = DeskLiveStateMemo()
     /// Resolve symlinks so every path to the same desk shares one memo entry.
     static func memoKey(_ opsPath: URL) -> String {
         opsPath.resolvingSymlinksInPath().path
     }
-    /// The feed's identity: a stat-strength stamp for each of the two files a
-    /// replay reads. `nil` means at least one file's state is UNKNOWABLE (a
-    /// stat that failed for a reason other than "does not exist"), which never
-    /// matches a stored stamp and is never stored — that path always replays.
+    /// An unknowable stat identity never matches or enters the memo, forcing replay.
     static func feedStamp(opsPath: URL, basePath: URL) -> DeskLiveStateMemo.FeedStamp? {
         guard let ops = SnapshotTailOpLog.fileStamp(opsPath),
               let base = SnapshotTailOpLog.fileStamp(basePath) else { return nil }
         return DeskLiveStateMemo.FeedStamp(ops: ops, base: base)
     }
-    /// All archived item records, in feed (append) order. A malformed record
-    /// makes this history unavailable; it never becomes a successful omission
-    /// from archive identity checks or the archive presentation.
+    /// Malformed archive history fails whole so identity checks cannot silently omit a record.
     public func archivedRecords() async throws -> [ArchiveRecord] {
         let raw = try await SwiftNativePersistenceCore.readJSONL(archivePath)
         var records: [ArchiveRecord] = []
         records.reserveCapacity(raw.count)
         for (index, value) in raw.enumerated() {
             guard let record = ArchiveRecord.fromJSON(value) else {
-                throw PersistenceCoreError.ioFailure("Desk archive history unavailable at \(archivePath.path): record \(index + 1) is not a complete archive record. Original bytes retained; repair the named record before reading or changing archive history.")
+                throw PersistenceCoreError.ioFailure("""
+                    Desk archive history unavailable at \(archivePath.path): record \(index + 1) is not a complete archive record. Original \
+                    bytes retained; repair the named record before reading or changing archive history.
+                    """)
             }
             records.append(record)
         }
         return records
     }
-    /// Every descendant of `handle` (children, grandchildren, …) in `state`,
-    /// breadth-first. Cycle-safe: each handle is visited at most once.
+    /// Visit each handle once so malformed hierarchy cycles cannot hang traversal.
     public static func descendants(of handle: String, in state: DeskState, maxDepth: Int = .max) -> [DeskItem] {
         descendants(of: handle, in: Dictionary(grouping: state.items, by: \.parent), maxDepth: maxDepth)
     }
@@ -220,22 +182,13 @@ extension SwiftNativeDeskStore {
         state.items.filter { $0.status.isTerminal
             && descendants(of: $0.handle, in: state).contains(where: { !$0.status.isTerminal }) }
     }
-    /// Count of OPEN (non-terminal) origin=agent pursuits in `state`. The
-    /// open-pursuit cap keys on exactly this — a terminal (done/canceled/
-    /// abandoned) pursuit doesn't count, but reopening one does (it re-enters
-    /// this set).
+    /// Only open agent pursuits consume the cap; reopening a terminal pursuit consumes it again.
     static func openAgentPursuitCount(in state: DeskState) -> Int {
         state.items.filter { $0.origin == .agent && $0.kind == .project && !$0.status.isTerminal }.count
     }
-    /// Pursuit invariants are enforced at WRITE time on every append
-    /// path — create, reopen, and the dedicated openPursuit path all route here.
-    ///
-    /// - A create with origin=agent MUST be kind=project + carry a valid pursuit
-    ///   (required fields present, dossier passes the source-mix gate) and MUST
-    ///   NOT breach the open-pursuit cap. The GENERIC path (viaGenericPath) may
-    ///   NEVER mint origin=agent at all.
-    /// - A set_status REOPEN (non-terminal) of a currently-terminal agent pursuit
-    ///   counts against the cap — close/reopen tricks cannot exceed 2 open.
+    /// Every create and reopen checks pursuit invariants under the write lock.
+    /// Agent projects require valid evidence and capacity; generic creation cannot mint pursuits.
+    /// Reopening consumes the same cap so close/reopen cannot bypass it.
     static func validatePursuitInvariants(
         _ op: DeskOp,
         in state: DeskState,
@@ -246,10 +199,8 @@ extension SwiftNativeDeskStore {
             if viaGenericPath, Self.equivalentDeskText(project) == MyQueue.project {
                 throw DeskError.queueCreationRequiresQueuePath
             }
-            // A create_item can NEVER mint an agent pursuit — that path is
-            // open_pursuit only. An origin=agent create_item is refused
-            // regardless of who calls it, but for a top-level MY QUEUE plan.
-            guard origin == .agent else { return }   // owner/system creates are unconstrained here
+            // Only open_pursuit may mint a pursuit; generic agent creation is limited to MY QUEUE plans.
+            guard origin == .agent else { return }
             if !viaGenericPath, kind == .plan, project == MyQueue.project, parent == nil, pursuit == nil { return }
             throw DeskError.genericPathCannotCreateAgent(handle: op.handle)
         case let .openPursuit(_, _, _, _, pursuit, _):
@@ -262,7 +213,6 @@ extension SwiftNativeDeskStore {
                 }
                 throw DeskError.pursuitFieldMissing(reason: reason)
             }
-            // Cap: this create would be the (N+1)th OPEN pursuit.
             let open = openAgentPursuitCount(in: state)
             if open >= maxOpenAgentPursuits {
                 throw DeskError.pursuitCapReached(openCount: open)
@@ -306,14 +256,12 @@ extension SwiftNativeDeskStore {
                 throw DeskError.unknownReservation(reservationId: reservationId, handle: op.handle)
             }
         case let .setStatus(status, _, _, _, _, _):
-            // Only a REOPEN (terminal → non-terminal) of an agent pursuit is
-            // capped. Any other status move on a pursuit is free.
+            // Only reopening an agent pursuit consumes new capacity.
             guard !status.isTerminal,
                   let item = state.items.first(where: { $0.handle == op.handle }),
                   item.origin == .agent, item.kind == .project,
                   item.status.isTerminal else { return }
-            // The item is currently terminal (NOT in the open set); reopening it
-            // adds it back, so the cap must have room WITHOUT counting it.
+            // A terminal pursuit is outside the open set, so capacity must exist without counting it.
             let open = openAgentPursuitCount(in: state)
             if open >= maxOpenAgentPursuits {
                 throw DeskError.pursuitCapReached(openCount: open)
@@ -359,10 +307,7 @@ extension SwiftNativeDeskStore {
         case .vetoPursuit:
             try rejectTerminalParentWithOpenDescendant(op.handle, in: state)
         case .closeItem:
-            // A second close is not idempotent: it rewrites the outcome
-            // summary, the closedAt stamp, and (done ⇄ canceled) the verdict
-            // itself. Refuse it under the ops flock, where the read that
-            // decided cannot go stale — a caller's own pre-check can.
+            // A second close would overwrite the outcome and timestamp; refuse it against locked state.
             if let item = state.items.first(where: { $0.handle == op.handle }),
                item.status.isTerminal {
                 throw DeskError.closeRefusedTerminal(handle: op.handle, status: item.status)
@@ -385,8 +330,7 @@ extension SwiftNativeDeskStore {
             )
         }
     }
-    /// Includes `startingAt` itself, then walks toward the root. Cycle-tolerant
-    /// because legacy/hand-authored event feeds are decoded permissively.
+    /// Include the starting item; visit each ancestor once because authored feeds can contain cycles.
     private static func terminalAncestor(startingAt handle: String, in state: DeskState) -> DeskItem? {
         var byHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
         var current: String? = handle
@@ -399,8 +343,6 @@ extension SwiftNativeDeskStore {
         }
         return nil
     }
-    /// Build the final archive record for an item (the shared shape used by both
-    /// single-item archive and subtree cascade).
     static func makeArchiveRecord(_ item: DeskItem, now: String) -> ArchiveRecord {
         ArchiveRecord(
             handle: item.handle,

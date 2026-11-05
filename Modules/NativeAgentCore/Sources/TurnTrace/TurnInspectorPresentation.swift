@@ -1,16 +1,14 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `TurnInspectorPresentation.swift` | Inspector statuses, titles, rows, cards and redacted details; token titles use shared checked current measurements and name absent counts unavailable; includes memory-promotion prediction, deferral and unlabelled evidence |
+// Blueprint: | `TurnInspectorPresentation.swift` | Shared Inspector rows and bounded redacted details |
 
-/// Rendered status for one row's status dot / chip color. Derived from the
-/// event's payload (`status` / `phase` fields), never from raw content.
+/// Rendered status for one row's status dot / chip color. Derived from the event's payload (`status` / `phase` fields), never from raw content.
 public enum InspectorRowStatus: String, Equatable, Sendable {
     case ok
     case failed
     case running
     case neutral
 
-    /// The app's `NativeAgentTheme.statusColor` vocabulary.
     public var themeStatus: String {
         switch self {
         case .ok: return "ok"
@@ -21,23 +19,16 @@ public enum InspectorRowStatus: String, Equatable, Sendable {
     }
 }
 
-/// One event in a turn's timeline, flattened for display. Built purely from a
-/// `TurnTraceEvent`; carries the redacted previews already present in the event
-/// payload (NEVER re-derives or re-emits content).
+/// Reuse redacted event previews; presentation must not derive or emit new content.
 public struct InspectorEventRow: Identifiable, Equatable, Sendable {
     public let id: String
-    /// The raw event kind, e.g. "tool.dispatch", "llm.call", "assembly.stage".
     public let kind: String
     public let ts: Date
     public let status: InspectorRowStatus
-    /// Compact one-line label (e.g. tool name, stage name, "12.3k tok").
     public let title: String
-    /// Duration in ms when the event carries one (tool end, etc.), else nil.
     public let durationMs: Int?
-    /// Whether this row can expand to show detail lines.
     public let isExpandable: Bool
-    /// Key/value detail lines shown when the row is expanded. Already redacted +
-    /// bounded at emission; we only pretty-print them here.
+    /// Only pretty-print details already bounded and redacted at emission.
     public let detailLines: [DetailLine]
 
     public struct DetailLine: Identifiable, Equatable, Sendable {
@@ -47,7 +38,6 @@ public struct InspectorEventRow: Identifiable, Equatable, Sendable {
         public let value: String
     }
 
-    /// Short chip text for the kind (drops the namespace prefix for density).
     public var kindChip: String {
         if let dot = kind.firstIndex(of: ".") {
             return String(kind[kind.index(after: dot)...])
@@ -56,33 +46,24 @@ public struct InspectorEventRow: Identifiable, Equatable, Sendable {
     }
 }
 
-/// One turn's worth of events, grouped + summarized. Newest turn renders on top
-/// (see `TurnInspectorGrouping.group`); rows within are chronological.
+/// Group from shared evidence so newest-first cards retain chronological rows.
 public struct InspectorTurnCard: Identifiable, Equatable, Sendable {
-    public let id: String          // turnId
+    public let id: String
     public let surface: String?
     public let sessionId: String?
-    /// Chronological rows (oldest → newest within the turn).
     public let rows: [InspectorEventRow]
-    /// Earliest event timestamp in the turn (drives newest-turn-on-top sort).
+    /// Earliest timestamp controls newest-started-turn order.
     public let startedAt: Date
-    /// Latest event timestamp in the turn.
     public let lastAt: Date
 
-    // Summary line fields.
     public let eventCount: Int
-    /// Total wall time across the turn's events, in milliseconds.
     public let wallMs: Int
-    /// Total LLM tokens (input + output) summed across llm.call events, when any.
     public let llmTokens: Int?
-    /// First TTFT (ms) observed on an llm.call event, when present.
     public let ttftMs: Int?
 }
 
-/// Pure transform: a flat event list → per-turn cards, newest turn first.
 public enum TurnInspectorGrouping {
 
-    /// Newest-started turns first, chronological rows within each turn, including unknown turn ids.
     public static func group(_ events: [TurnTraceEvent]) -> [InspectorTurnCard] {
         cards(TurnTraceGrouping.group(events))
     }
@@ -115,8 +96,7 @@ public enum TurnInspectorGrouping {
         let duration = p["durationMs"]?.integerValue.flatMap(Int.init(exactly:))
         var details = detailLines(kind: ev.kind, payload: p)
         if let measurementError { details.append(.init(label: "Measurement error", value: measurementError)) }
-        // Payloads with projected details (including memory-promotion shadow
-        // agreement) get an expander; other events stay a one-liner.
+        // Expand only projected details so plain events stay compact.
         let expandable = !details.isEmpty
         return InspectorEventRow(
             id: id,
@@ -175,9 +155,9 @@ public enum TurnInspectorGrouping {
                 : ""
             return "system \(total) chars\(cognitive)"
         case "stream.tick":
-            let chars = p["chars"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
-            let chunks = p["chunks"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
-            return "\(chars) chars · \(chunks) chunks"
+            // A tick without a call is movement that is no call: a thought or held text.
+            guard let call = p["call"]?.stringValue, let bytes = p["bytes"]?.integerValue else { return "moving" }
+            return "writing \(call) · \(bytes) bytes"
         case "thinking.delta":
             return p["text"]?.stringValue.map { String($0.prefix(80)) } ?? "thinking"
         case "memory.commit":
@@ -210,7 +190,6 @@ public enum TurnInspectorGrouping {
         case "file.touch":
             add("tool", "tool")
             add("mode", "mode")
-            // paths is an array — render each.
             if case .array(let arr)? = p["paths"] {
                 for (i, v) in arr.enumerated() {
                     if case .string(let s) = v {
@@ -265,7 +244,10 @@ public enum TurnInspectorGrouping {
                 out.append(.init(label: "memory deferral",
                     value: (deferred ? "Deferred: this turn stays owed and is judged in a batch later. "
                         : "Judged now. ")
-                        + "Predicted no-op on \(predicted) turns; changed something on \(changed); not yet labelled \(incomplete). Lower bound \(lower) against cost bar \(bar)."))
+                        + """
+                            Predicted no-op on \(predicted) turns; changed something on \(changed); not yet labelled \(incomplete). Lower bound \(lower) \
+                            against cost bar \(bar).
+                            """))
                 if flags["surpriseLedgerReadable"]?.boolValue != true {
                     out.append(.init(label: "deferral evidence", value: "Ledger unavailable or incomplete; no prediction can stand on it."))
                 }
@@ -303,12 +285,11 @@ public enum TurnInspectorGrouping {
         return rendered.isEmpty ? nil : rendered.joined(separator: "\n\n")
     }
 
-    /// Render any leaf payload value as a short display string for a detail line.
     private static func displayValue(_ v: JSONValue?) -> String? {
         if let text = v?.scalarText { return text }
         switch v {
         case .array, .object:
-            // Serialize compactly; already bounded at emission.
+            // Values are already bounded at emission; serialize compactly.
             return (try? v?.serialize(pretty: false)) ?? nil
         default:
             return nil

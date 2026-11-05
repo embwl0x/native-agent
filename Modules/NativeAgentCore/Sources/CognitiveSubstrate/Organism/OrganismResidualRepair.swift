@@ -3,10 +3,9 @@ import Foundation
 
 public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     public var generatedAt: Date
-    /// Five-residual product used by Dream/recalibration lanes.
+    /// Combine residuals for bounded local repair without a model judgment.
     public var pressure: Double
-    /// Bounded field-repair signal, distinct because the product contributes
-    /// at most 0.15 from field charge and cannot reach the 0.30 local repair gate.
+    /// Bounded field-repair signal, distinct because the product contributes at most 0.15 from field charge and cannot reach the 0.30 local repair gate.
     public var localRepairPressure: Double
     public var components: OrganismSleepPressureComponents
     public var fieldUncertaintyResidual: Double
@@ -107,9 +106,7 @@ public enum OrganismResidualRepair {
             return total + decay.value(at: now)
         })
 
-        // Inspect current tissue directly instead of comparing untrusted source
-        // timestamps with a local repair receipt. This makes delayed events
-        // visible while the exact IDs causally bind the later operation.
+        // Inspect current tissue and bind exact target ids so delayed source timestamps cannot hide repairable evidence.
         let charged = hasUnrepairedFieldMutation ? Array(field.nodes.values.filter(OrganismDreamRepair.hasRepairableCharge)
             .sorted {
                 if $0.charge != $1.charge { return $0.charge > $1.charge }
@@ -172,10 +169,8 @@ public enum OrganismResidualRepair {
             1,
             components.predictionResidual + components.fieldChargeResidual + fieldUncertainty
         )
-        // Once a bounded repair pass has started for a generation, finish the
-        // remaining exact targets even if the aggregate residue drops below
-        // the initial arming threshold. Otherwise the fifth-and-later target
-        // could remain permanently charged behind a small residual sum.
+        // Once a bounded repair pass has started for a generation, finish the remaining exact targets even if the aggregate residue drops below the initial
+        // arming threshold. Otherwise the fifth-and-later target could remain permanently charged behind a small residual sum.
         let localRepairPressure = (isFinishingBoundedRepair && !charged.isEmpty)
             || (isFinishingBoundedRepair && !noisy.isEmpty)
             ? max(minimumPressure, measuredLocalRepairPressure)
@@ -188,9 +183,8 @@ public enum OrganismResidualRepair {
             + (derivedCalibration > 0 && ledger.lastUpdatedAt != nil ? 1 : 0))
         let repairableFieldEvidenceCount = charged.count + noisy.count
 
-        // Scheduling follows the trusted ingestion anchor. Source event and
-        // persisted field timestamps remain provenance, but a future-dated or
-        // delayed source clock must never delay/accelerate quiet physiology.
+        // Scheduling follows the trusted ingestion anchor. Source event and persisted field timestamps remain provenance, but a future-dated or delayed source
+        // clock must never delay/accelerate quiet physiology.
         let trustedIngestionAt = lastSignalAt.flatMap { $0 <= now ? $0 : nil }
         let trustedRepairAt = lastRepairAt.flatMap { $0 <= now ? $0 : nil }
         let fallbackEvidenceAt = ([field.lastUpdatedAt]
@@ -214,9 +208,8 @@ public enum OrganismResidualRepair {
         let candidateDeadlines = [localNext, pendingPredictionDue]
             .compactMap { $0 }
             .filter { $0 > now }
-        // Below threshold, monotonic residual decay cannot create a crossing;
-        // only exact pending prediction expiries are worth scheduling.
-        // Heat never disarms repair.
+        // Below threshold, monotonic residual decay cannot create a crossing; only exact pending prediction expiries are worth scheduling. Heat never disarms
+        // repair.
         let nextWake = candidateDeadlines.min()
         return OrganismResidualRepairOpportunity(
             generatedAt: now,

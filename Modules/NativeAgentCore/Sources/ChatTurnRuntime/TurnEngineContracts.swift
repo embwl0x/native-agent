@@ -14,26 +14,25 @@ import Context
 import CognitiveSubstrate
 import ToolRegistry
 import TurnTrace
-// Blueprint: | `TurnEngineContracts.swift` | `TurnContext` carries the prepared parts delivery callback; value projections with module-scoped setters, immutable admitted routing and retained sent-context/window metadata; `TurnEngineResult` aliases TurnTraceEvent's terminal status vocabulary |
+import ChatToolParsing
+// Blueprint: | `TurnEngineContracts.swift` | `TurnContext`; `TurnEngineResult`; Prepared context and engine-owned terminal truth |
 
 // MARK: - TurnEngineError
 
 public enum TurnEngineError: Error, LocalizedError {
     case personaLoadFailed(underlying: Error)
-    /// Context Flow is on but could not prepare this turn's context. The turn
-    /// ends here with the cause and the way out, never on a stand-in prompt.
+    /// Preparation failure ends the turn with its cause and remedy; no stand-in prompt can replace required context.
     case contextLoadFailed(underlying: Error)
-    /// Listing the turn's tool catalog threw. The turn ends here rather than
-    /// running the model with no or partial tools.
+    /// A catalog read failure ends the turn; partial or empty tools cannot stand in for unavailable descriptors.
     case toolCatalogLoadFailed(underlying: Error)
     case emptyMessage
-    /// A failed provider stream carries visible partial prose for persistence.
+    /// Preserve visible partial prose when a provider stream fails.
     case streamInterrupted(partial: String, underlying: Error)
     /// User Stop preserves partial prose with cancelled:true and rethrows CancellationError.
     case streamCancelled(partial: String, underlying: Error)
-    /// Her turn part failed with no clean version left to swap in.
+    /// Report exhaustion of clean turn programs instead of pretending the turn part ran.
     case turnPartFailed(String)
-    /// The helper owner's single admission attempt could not start her turn part.
+    /// Keep helper admission failure attached to its own single attempt.
     case turnHelperUnavailable(String)
 
     public var errorDescription: String? {
@@ -53,7 +52,10 @@ public enum TurnEngineError: Error, LocalizedError {
         case .streamCancelled(_, let underlying):
             return (underlying as? LocalizedError)?.errorDescription ?? String(describing: underlying)
         case .turnPartFailed(let why):
-            return "turn_part_failed: \(why) The shipped turn part also failed. Read app {action:\"trace.recent\"} for the failing step; repair that cause before starting new work. This turn ended incomplete."
+            return """
+                turn_part_failed: \(why) The shipped turn part also failed. Read app {action:\"trace.recent\"} for the failing step; repair that \
+                cause before starting new work. This turn ended incomplete.
+                """
         case .turnHelperUnavailable(let why):
             return "turn_helper_unavailable: \(why) This turn ended before its helper started."
         }
@@ -66,37 +68,37 @@ public typealias ToolDispatchClient = ChatTurnContracts.ToolDispatchClient
 
 // MARK: - TurnContext
 
-/// What the stem gathers for her turn part to compose its prompt from:
-/// `turn.persona()` (prompt, supplied guidance, expression facts), `turn.pins()`, `turn.recall()` and
-/// `turn.context()` (digest, packet, history, facts, runtime). The order and the joins
-/// are hers, in `abilities/turn.js`.
+/// The stem gathers persona, pins, recall and context; turn.js owns their ordering and joins.
 public struct TurnReach: Sendable, Equatable {
     public internal(set) var persona = ""
     public internal(set) var guidance = ""
-    /// Null for an internal part thought: no persona or expression policy is injected.
+    /// Internal part thoughts receive no injected persona or expression policy.
     public internal(set) var expression: JSONValue = .null
     public internal(set) var pins: [String] = []
     public internal(set) var recall = ""
     public internal(set) var digest = ""
     public internal(set) var packet = ""
     public internal(set) var history = ""
-    /// The facts of the moment, each already trimmed and non-empty.
     public internal(set) var facts: [String] = []
     public internal(set) var runtime: JSONValue = .null
 }
 
-/// The context handed to the LLM for one turn. Its system prompt is what her
-/// turn part composed from `turnReach` (`composing`).
+/// One line of the agent: when its present was last read (nil: not yet, so the next read starts at the agent's last reply here),
+/// and whether a peer steers it (words from other doors then stay out).
+struct AgentNowCursor: Sendable {
+    let at: Date?
+    let peer: Bool
+}
+
+/// The part owns system composition from these gathered inputs.
 public struct TurnContext: Sendable {
     public let surface: String
-    /// Exact persona selected for this turn. This follows the turn into tool
-    /// dispatch so explicit memory recall uses the same disclosure boundary
-    /// as automatic Fluid Context projection.
+    /// Carry the exact persona into dispatch so explicit recall shares automatic recall's disclosure boundary.
     public let personaID: String?
     public let personaDocs: [String: String]
-    /// Source revision captured before USER's per-turn memory-core projection.
+    /// Capture source revision before projecting USER for this turn.
     public let personaFingerprint: String
-    /// Off-mode recall hits before rendering trims them; active turns use packet provenance.
+    /// Off mode retains pre-render hits; active mode uses packet provenance.
     public let recalled: [MemoryRecallHit]
     public internal(set) var modelId: String
     public internal(set) var reasoningEffort: String
@@ -105,51 +107,41 @@ public struct TurnContext: Sendable {
     /// a valid mid-turn preference change cannot splice generations.
     public let providerId: String?
     public let serviceTier: String?
-    /// Names captured at context assembly, before schema filtering.
     public let toolsAvailable: [String]
-    /// Current filtered offer; ProviderToolNameMap translates its names on the wire.
-    /// Empty when the dispatcher only supplies names.
+    /// Wire-name mapping uses only this filtered offer; name-only dispatchers supply no schema offer.
     public internal(set) var toolSchemas: [LLMToolSchema]
     public internal(set) var systemPrompt: String?
     public let userMessage: String
-    /// When present, systemSegments.combined equals systemPrompt, joining nonempty segments with "\n\n".
-    /// Segments place Anthropic's cache breakpoint after stable content; nil uses the unsplit prompt.
+    /// Keep combined segments equal to systemPrompt so adapter cache boundaries describe the actual sent prompt.
     public internal(set) var systemSegments: SystemPromptSegments?
-    /// Per-turn DYNAMIC image content blocks for the CURRENT user message.
-    /// CACHE INVARIANT: image blocks live ONLY on the in-flight user message —
-    /// they MUST NEVER enter `systemPrompt`/`systemSegments` (would churn the
-    /// cached prefix every turn) and MUST NOT be persisted/re-sent on later
-    /// turns. Default `[]` keeps every existing TurnContext construction site
-    /// byte-identical to pre-multimodal behavior.
+    /// Image blocks belong only to the current in-flight user message, never cached system segments or later-turn replay.
     public let imageBlocks: [LLMContentBlock]
     /// Pins one immutable ContextFlow generation through the complete
     /// provider/tool loop. nil denotes explicitly selected direct context assembly.
     public let fluidContextTurn: ContextPreparedTurn?
-    /// SessionHistoryMessages replays bounded prior turns oldest first for byte-stable caching; other callers leave this empty.
+    /// Replay bounded prior turns oldest first so provider prefixes remain byte-stable.
     public internal(set) var historyMessages: [LLMMessage]
-    /// v2Prefix: the per-turn volatile mass (packet, recall, digest, derived
-    /// history blocks, clock/runtime, plan hint, capsule) AFTER it has been
-    /// lifted out of `systemSegments.dynamic` — see `splittingVolatileBlock()`.
-    /// nil until that split runs.
+    /// Hold the complete volatile mass until user-block keyframe/delta seeding; nil means no split has run.
     public internal(set) var turnVolatileBlock: String?
-    /// Only metadata attached to user turns that the projection actually replays.
+    /// Replay metadata only for user rows actually included in the history projection.
     package var historyReplaySpec: SessionReplaySpec? = nil
     package var historyRowCharacters: [String: Int] = [:]
     package var replayedTurnContexts: [SentTurnContext] = []
-    /// Retained recollection identities, not turn-varying text.
+    /// Keep recollection identity independent of turn-varying rendered text.
     package var historyContextWindow = "0:"
-    /// Frozen duration from the context preparation summary, absent if unmeasured.
+    /// Absent measurement stays absent; do not invent a preparation duration.
     public var preparationMs: Int64?
-    /// The memory records this context delivers (packet provenance, or the
-    /// direct lane's rendered rows). Their usage credit is written once the
-    /// provider accepts the context, never at assembly.
+    /// Credit delivered memory only after provider acceptance, never during assembly.
     public internal(set) var usageCreditMemoryIDs: [String] = []
     /// Exact parts stamps carried by this preparation; no state changes until provider output.
     var partsDelivery: (@Sendable (String) -> Void)? = nil
+    /// The body line these facts carry; stamped as said only when the provider accepts a context containing it.
+    var bodyFelt: BodyFelt.Pending? = nil
+    /// Where the agent's present was read for this line; every later step reads only what changed in the agent since.
+    var agentNow: AgentNowCursor? = nil
     var cognitiveRuntimeContext: String? = nil
     public internal(set) var turnReach: TurnReach
-    /// Recall provenance for stamping: untrimmed Off-mode hits, then packet IDs,
-    /// deduplicated and capped at 32. Delivery credit uses usageCreditMemoryIDs.
+    /// Keep bounded deduplicated provenance separately from the rendered memory IDs used for delivery credit.
     public var resolvedRecalledIds: [String] {
         var out: [String] = []
         var seen = Set<String>()
@@ -206,7 +198,6 @@ public struct TurnContext: Sendable {
         self.turnReach = turnReach
     }
 
-    /// The system her turn part named, and the tools it offered.
     func composing(_ system: SystemPromptSegments, tools: [String]?) -> TurnContext {
         var copy = self
         copy.systemSegments = system
@@ -215,29 +206,10 @@ public struct TurnContext: Sendable {
         return copy
     }
 
-    /// Lift the full built block at the message-seeding boundary
-    /// (the two lanes) after every dynamic contributor has appended.
-    ///
-    /// Before paragraph delta selection, `turnVolatileBlock` is
-    /// literally the same string `systemSegments.dynamic` held, in the same
-    /// order, byte for byte. All that moves is WHERE it is delivered: out of
-    /// the churning tail of the system prompt into the current user turn,
-    /// after replayed history. Seeding selects its keyframe/delta and stores
-    /// the delivered bytes as metadata on that user row. `systemPrompt` is
-    /// rebuilt from the emptied segments so the
-    /// adapter-verified `systemPrompt == segments.combined` invariant still
-    /// holds by construction.
-    ///
-    /// `trailingSection` is per-turn text the CALLER wants delivered with the
-    /// volatile mass rather than inside the cached prefix — today the
-    /// text-compat lane's "Also loaded this session:" catalog run. It lands as
-    /// its own trailing section, AFTER everything `dynamic` already held (so
-    /// after the capsule). Empty (the default) is byte-identical to the
-    /// original single-argument behavior, including the "nothing to move"
-    /// early return.
-    ///
-    /// Returns `self` unchanged when there are no segments or nothing volatile
-    /// to move — the split is never a way to lose bytes.
+    /// Move the complete dynamic segment only after all contributors append, preserving order and bytes before delta selection.
+    /// Deliver it after replayed history on the current user row, then store exactly those delivered bytes as metadata.
+    /// Rebuild systemPrompt from emptied segments so it remains equal to their combined value.
+    /// Append caller-supplied trailing material after the dynamic block; absent segments or volatile text leave the context unchanged.
     public func splittingVolatileBlock(appending trailingSection: String = "") -> TurnContext {
         guard let segments = systemSegments else { return self }
         let volatileBlock = [segments.dynamic, trailingSection]
@@ -343,21 +315,15 @@ public struct TurnEngineResult: Sendable {
     public let recalledIds: [String]
     public let toolDispatches: [ToolDispatchRecord]
     public let elapsedMs: Int
-    /// Exact number of provider completions issued by this engine invocation.
-    /// Non-loop callers may supply their terminal observation directly; owners
-    /// that cannot prove the count leave it nil rather than inventing zero.
+    /// Only owners with authoritative provider completion counts may supply accounting; unknown stays nil.
     public let providerCallCount: Int?
-    /// Engine-owned terminal truth, independent of any nonempty fallback prose.
-    /// Legacy paths that do not report this evidence leave it unknown.
+    /// Terminal truth comes from the engine's evidence, never from nonempty reply prose.
     public let completionState: CompletionState?
     public let terminalReason: TerminalReason?
     public let loopCounters: LoopCounters?
     /// Memory recording and private work released by the saved answer.
     public internal(set) var afterReply: AfterReply?
-    /// How many LEADING characters of `reply` were spoken before tool rounds.
-    /// Person-facing replies retain these words, live and settled. The boundary
-    /// remains available to machine callers that explicitly request answerOnly.
-    /// nil/0 for single-round turns, which have no commentary at all.
+    /// Retain working commentary on user-facing surfaces; only explicit answer-only callers trim at this recorded boundary.
     public let workingCommentaryCharacters: Int?
 
     public init(
@@ -402,7 +368,10 @@ public struct TurnEngineResult: Sendable {
             let pendingIDs = Set(rows.map(\.id))
             if approvalIDs.contains(where: pendingIDs.contains) { return .approvalRequired }
         }
-        if toolDispatches.contains(where: { ChatToolOutcome.isWaitingInteraction($0.result) }) { return .interactionRequired }
+        if toolDispatches.contains(where: {
+            let reply = ToolResult($0.result)
+            return reply.isWaitingInteraction
+        }) { return .interactionRequired }
         switch completionState {
         case .completed: return .replyCompleted
         case .incomplete: return .incomplete

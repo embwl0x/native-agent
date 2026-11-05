@@ -1,10 +1,9 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `ChatStore+ReplyObservation.swift` | One signed reply/rejection/resync receiver across chat, talk and background audio; attaching resumes bounded delivery observation after durable restoration |
+// Blueprint: | `ChatStore+ReplyObservation.swift` | Shared signed reply/rejection/resync receiver; restores bounded delivery observation |
 
 extension ChatStore {
-    /// Both doors attach to this one receiver. Its lifetime is the shared
-    /// store's, so presenting the call cannot remove the chat's ears.
+    /// The shared store owns this receiver so presenting Talk cannot remove Chat's observation.
     func attachReplyReceiver(using client: MacBridgeClient) {
         pendingRetryClient = client
         Task { [weak self] in

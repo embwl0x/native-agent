@@ -2,15 +2,13 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Tombstones.swift` | `MemoryStorage`: forgetting preserves existing vectors; owed vectors land on exact hash/content; semantic consumers name and exclude proven unembeddable claims, await unresolved vectors and retain exact-hash suppression; near-verbatim gate and `nearestTombstones` |
+// Blueprint: | `MemoryStorage+Tombstones.swift` | `MemoryStorage`, `nearestTombstones`: exact/semantic suppression and owed vectors |
 
 extension MemoryStorage {
     // MARK: - Tombstones
 
-    /// Forgetting copies an existing record's vector without admitting new
-    /// semantics. It must commit even when the model or epoch is unavailable;
-    /// convergence owns any needed vector replacement.
-    /// Preserve an existing embedding when the new write carries none.
+    /// Forgetting copies an existing record's vector without admitting new semantics. It must commit even when the model or epoch is unavailable; convergence
+    /// owns any needed vector replacement. Preserve an existing embedding when the new write carries none.
     static func upsertTombstone(
         db: Database,
         content: String,
@@ -69,10 +67,8 @@ extension MemoryStorage {
         }
     }
 
-    /// Absence of a vector is not evidence that the claim was not forgotten.
-    /// The canonical convergence flight fills it. A proven per-text failure
-    /// is a named semantic gap, not a global admission failure; unresolved
-    /// vectors still await convergence. Exact hash suppression always applies.
+    /// Absence of a vector is not evidence that the claim was not forgotten. The canonical convergence flight fills it. A proven per-text failure is a named
+    /// semantic gap, not a global admission failure; unresolved vectors still await convergence. Exact hash suppression always applies.
     static func requireTombstoneVectors(in db: Database) throws {
         for failed in try Row.fetchAll(db, sql: """
             SELECT f.row_id, f.reason FROM memory_embedding_failures f
@@ -111,8 +107,7 @@ extension MemoryStorage {
         }
     }
 
-    /// Semantic admission blocks paraphrases at a high cosine threshold while admitting contradictions.
-    /// Scan the tombstone set only on writes (store/accept).
+    /// Semantic admission blocks paraphrases at a high cosine threshold while admitting contradictions. Scan the tombstone set only on writes (store/accept).
     /// Unresolved vectors await convergence; proven unembeddable rows are named gaps.
     public func matchesTombstone(
         content: String,
@@ -129,9 +124,7 @@ extension MemoryStorage {
         }
     }
 
-    /// The forgotten claims nearest `query`, closest first, in the active
-    /// vector space: what the memory manager is shown beside the memories it
-    /// may update, so "is this the same claim" is judged, not thresholded.
+    /// Show nearest forgotten claims to the memory manager so claim identity is judged rather than decided by a threshold.
     public func nearestTombstones(
         embedding query: [Float],
         embeddingEpoch queryEpoch: MemoryEmbeddingEpoch?,
@@ -153,7 +146,9 @@ extension MemoryStorage {
             var scored: [(content: String, cosine: Double)] = []
             for row in try Row.fetchAll(db, sql: sql, arguments: arguments) {
                 guard let e = try Self.decodeEmbedding(row.decode(forColumn: "embedding")), e.count == query.count else {
-                    throw MemoryStorageError.databaseUnavailable("Rejection vector dimensions do not match the active memory model; repair the tombstone before semantic admission.")
+                    throw MemoryStorageError.databaseUnavailable("""
+                        Rejection vector dimensions do not match the active memory model; repair the tombstone before semantic admission.
+                        """)
                 }
                 guard let content: String = try row.decode(forColumn: "content") else { continue }
                 scored.append((content: content, cosine: VectorMath.cosine(query, e)))
@@ -162,8 +157,7 @@ extension MemoryStorage {
         }
     }
 
-    /// Shared matcher usable both standalone and INSIDE a write transaction
-    /// (acceptProposal gates in the same txn — nesting pool calls would hang).
+    /// Shared matcher usable both standalone and INSIDE a write transaction (acceptProposal gates in the same txn — nesting pool calls would hang).
     static func tombstoneMatch(
         db: Database,
         content: String,
@@ -185,7 +179,9 @@ extension MemoryStorage {
         let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
         for row in rows {
             guard let e = try decodeEmbedding(row.decode(forColumn: "embedding")), e.count == query.count else {
-                throw MemoryStorageError.databaseUnavailable("Rejection vector dimensions do not match the active memory model; repair the tombstone before semantic admission.")
+                throw MemoryStorageError.databaseUnavailable("""
+                    Rejection vector dimensions do not match the active memory model; repair the tombstone before semantic admission.
+                    """)
             }
             let forgotten: String = try row.decode(forColumn: "content")
             if semanticDuplicate(content, forgotten, similarity: VectorMath.cosine(query, e)) { return true }

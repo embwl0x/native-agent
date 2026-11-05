@@ -7,14 +7,13 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport+Messages.swift` | Asset-sized send waits that never cancel the upload (CloudKit's own limit reports the real result), exact server replay proof and signed delivery; serialized drains apply iOS chat before notifications and admit the cursor after both record families |
+// Blueprint: | `CloudKitDeviceTransport+Messages.swift` | Signed sends, exact replay proof and serialized two-family drains |
 
 extension CloudKitDeviceTransport {
     // MARK: send
 
-    /// How long the caller waits before calling a send's outcome unknown:
-    /// CloudKit's own upload limit plus ten seconds. The wait never cancels
-    /// the upload; CloudKit's limit decides it and reports the real result.
+    /// How long the caller waits before calling a send's outcome unknown: CloudKit's own upload limit plus ten seconds. The wait never cancels the
+    /// upload; CloudKit's limit decides it and reports the real result.
     public static func sendTimeoutSeconds(for message: BridgeMessage) throws -> TimeInterval {
         let fields = try NAChatMessageCodec.encode(message)
         return sendTimeoutSeconds(assetBytes: NAChatMessageCodec.usesAsset(fields) ? fields.payloadJSON.utf8.count + 28 : 0)
@@ -24,8 +23,7 @@ extension CloudKitDeviceTransport {
         uploadSeconds(assetBytes: assetBytes) + 10
     }
 
-    /// Cellular-sized: fifteen seconds for the record, plus one second per
-    /// started 50,000 encrypted asset bytes, capped at two minutes.
+    /// Cellular-sized: fifteen seconds for the record, plus one second per started 50,000 encrypted asset bytes, capped at two minutes.
     private static func uploadSeconds(assetBytes: Int) -> TimeInterval {
         min(120, 15 + ceil(Double(assetBytes) / 50_000))
     }
@@ -99,9 +97,7 @@ extension CloudKitDeviceTransport {
                 op.qualityOfService = .userInitiated
                 do { try await self.performModifyRecords(op, resourceTimeout: uploadTimeout) }
                 catch let error as DeviceSyncError {
-                    // Reconcile exact accepted bytes, including an existing
-                    // requested result whose record predates the family split.
-                    // A rejected record-type change can be an underlying CK error.
+                    // Only exact accepted bytes prove replay; record-type rejection may be wrapped in an underlying CloudKit error.
                     if Self.canReconcileSend(error), await self.existingMessageRecordMatches(fields) {
                         do { try await self.resignalMessage(named: fields.recordName) }
                         catch { throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription) }
@@ -127,8 +123,7 @@ extension CloudKitDeviceTransport {
         }
     }
 
-    /// Renew the original delivery, never mint a second request. A changed
-    /// query clock makes it eligible for an update push; the signed payload keeps
+    /// Renew the original delivery, never mint a second request. A changed query clock makes it eligible for an update push; the signed payload keeps
     /// its original timestamp and identity. Uses the existing CloudKit schema.
     public func resignalMessage(named recordName: String) async throws {
         try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.resignal", onFailure: accountFailureReporter) {
@@ -148,8 +143,7 @@ extension CloudKitDeviceTransport {
         }
     }
 
-    /// Resolves timeout-after-commit and stable-id retries without weakening
-    /// conflict handling. Only exact payloadJSON + direction equality converts
+    /// Resolves timeout-after-commit and stable-id retries without weakening conflict handling. Only exact payloadJSON + direction equality converts
     /// the ambiguous write into success.
     private static func canReconcileSend(_ error: DeviceSyncError) -> Bool {
         switch error {
@@ -158,8 +152,7 @@ extension CloudKitDeviceTransport {
         }
     }
 
-    /// Event kind chooses the renderer before any transport runs. Keep the
-    /// signed envelope unchanged; both record families reach the same reader.
+    /// Event kind chooses the renderer before any transport runs. Keep the signed envelope unchanged; both record families reach the same reader.
     static func recordType(for message: BridgeMessage) -> String {
         message.metadata?["kind"] == "notification"
             && message.metadata?["userInfo.source"] != "requested_result"
@@ -167,14 +160,13 @@ extension CloudKitDeviceTransport {
             : NADeviceSyncRecordType.chatMessage
     }
 
-    /// A missing/unreadable record is no proof of rejection. Callers retain
-    /// the unknown outcome and may check again within their own bounded window.
-    public func messageRecordMatches(_ message: BridgeMessage, timeoutSeconds: TimeInterval = 5) async -> Bool {
+    /// A missing/unreadable record is no proof of rejection. Callers retain the unknown outcome and may check again within their own bounded window.
+    public func messageRecordMatches(_ message: BridgeMessage, timeoutSeconds: TimeInterval = deviceCKHangSeconds) async -> Bool {
         guard let fields = try? NAChatMessageCodec.encode(message) else { return false }
         return await existingMessageRecordMatches(fields, timeoutSeconds: timeoutSeconds)
     }
 
-    private func existingMessageRecordMatches(_ fields: NAChatMessageFields, timeoutSeconds: TimeInterval = 5) async -> Bool {
+    private func existingMessageRecordMatches(_ fields: NAChatMessageFields, timeoutSeconds: TimeInterval = deviceCKHangSeconds) async -> Bool {
         let secret = await loadAssetSecretProvider()?()
         return await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", seconds: timeoutSeconds, onFailure: accountFailureReporter) {
             let record = try await self.database.record(
@@ -198,46 +190,50 @@ extension CloudKitDeviceTransport {
     }
 
     public func ensurePushSubscriptions() async -> Bool {
-        // Each family owns its registration and failure. A rejected alert
-        // subscription cannot prevent chat wakes from being registered.
-        // The return value describes chat wakes, as observeIncoming's caller
-        // uses it to assess incoming chat push availability.
+        // Each family owns its registration and failure. A rejected alert subscription cannot prevent chat wakes from being registered. The return
+        // value describes chat wakes, as observeIncoming's caller uses it to assess incoming chat push availability.
         let chatReady: Bool
         do {
             try await subscribeToChatChanges()
             chatReady = true
         } catch {
-            devicePushLog.error("Chat subscription failed id=\(DeviceCloudKitSubscriptionID.chat, privacy: .public) role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
+            devicePushLog.error("""
+                Chat subscription failed id=\(DeviceCloudKitSubscriptionID.chat, privacy: .public) \
+                role=\(self.role.rawValue, privacy: .public): \
+                \(String(describing: error), privacy: .public)
+                """)
             chatReady = false
         }
         do {
             try await subscribeToVisibleNotifications()
         } catch {
-            devicePushLog.error("Visible notification subscription failed id=\(DeviceCloudKitSubscriptionID.visibleNotifications, privacy: .public) role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
+            devicePushLog.error("""
+                Visible notification subscription failed id=\(DeviceCloudKitSubscriptionID.visibleNotifications, privacy: .public) \
+                role=\(self.role.rawValue, privacy: .public): \
+                \(String(describing: error), privacy: .public)
+                """)
         }
         return chatReady
     }
 
-    /// Pull incoming messages since the last cursor, decode, dispatch to the
-    /// registered handler, and advance the cursor with a clock-skew overlap
-    /// window. Idempotent per message id. Failed queries never report an empty success.
-    /// Periodic callers use queueIfBusy: false: a busy owner already covers
-    /// their wake, and repeated timer ticks must not keep that owner running.
+    /// Pull incoming messages since the last cursor, decode, dispatch to the registered handler, and advance the cursor with a clock-skew overlap
+    /// window. Idempotent per message id. Failed queries never report an empty success. Periodic callers use queueIfBusy: false: a busy owner already
+    /// covers their wake, and repeated timer ticks must not keep that owner running.
     @discardableResult
-    public func drainIncoming(queueIfBusy: Bool = true) async -> DeviceSyncDrainResult {
-        guard NADeviceSyncRecoveryBudget.hasTime else { return .skipped(0) }
+    public func drainIncoming(queueIfBusy: Bool = true, recovery: DeviceSyncRecovery = .init()) async -> DeviceSyncDrainResult {
+        guard recovery.hasTime else { return .skipped(0) }
         guard holdsPairing else { return .skipped(0) }
         // Acquire the single drain slot under a synchronous lock, never across an await.
         guard beginDrainOrCoalesce(queueIfBusy: queueIfBusy) else {
             if !queueIfBusy { return .skipped(0) }
-            return .skipped(await drainIncomingControls())
+            return .skipped(await drainIncomingControls(recovery: recovery))
         }
         var total = 0
         var outcome: DeviceSyncDrainResult = .skipped(0)
         while true {
-            outcome = await drainIncomingBody()
+            outcome = await drainIncomingBody(recovery: recovery)
             total += outcome.dispatchedCount
-            if endDrainOrContinue() { continue }  // a concurrent caller requested a re-run
+            if endDrainOrContinue(recovery: recovery) { continue }
             break
         }
         if case .success = outcome { return .success(total) }
@@ -245,8 +241,7 @@ extension CloudKitDeviceTransport {
         return .skipped(total)
     }
 
-    /// Acquire the single drain slot. Returns true if acquired; false if a drain
-    /// is already running (queues a re-run only for callers requesting one).
+    /// Coalesce only callers requesting a re-run; periodic wakes must not extend an active drain.
     private func beginDrainOrCoalesce(queueIfBusy: Bool) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if drainInFlight {
@@ -257,18 +252,16 @@ extension CloudKitDeviceTransport {
         return true
     }
 
-    /// End a drain iteration. Returns true if a re-run is needed (clearing the
-    /// request); false if the slot is now free.
-    private func endDrainOrContinue() -> Bool {
+    private func endDrainOrContinue(recovery: DeviceSyncRecovery) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if drainAgain && NADeviceSyncRecoveryBudget.hasTime { drainAgain = false; return true }
+        if drainAgain && recovery.hasTime { drainAgain = false; return true }
         drainAgain = false
         drainInFlight = false
         return false
     }
 
     // Only the serialized drain calls this body; concurrent bodies can lose records.
-    private func drainIncomingBody() async -> DeviceSyncDrainResult {
+    private func drainIncomingBody(recovery: DeviceSyncRecovery) async -> DeviceSyncDrainResult {
         let (handler, since) = loadHandlerAndCursor()
         guard handler != nil else { return .skipped(0) }
         let queryStartedAt = Date()
@@ -280,18 +273,19 @@ extension CloudKitDeviceTransport {
             var records = try await pull(
                 recordType: NADeviceSyncRecordType.chatMessage,
                 since: since,
-                inboundDirection: inbound
+                inboundDirection: inbound,
+                recovery: recovery
             )
             if role == .ios {
-                // Show words as soon as chat is fetched. The notification read
-                // may be slow or fail; it must not hold already-fetched words.
-                // Keep the shared cursor pinned until both families were read.
+                // Show words as soon as chat is fetched. The notification read may be slow or fail; it must not hold already-fetched words. Keep the
+                // shared cursor pinned until both families were read.
                 earlyDispatched = await deliverIncoming(records.records, since: since, queryStartedAt: queryStartedAt,
-                                                        advanceCursor: false)
+                                                        advanceCursor: false, recovery: recovery)
                 let notifications = try await pull(
                     recordType: NADeviceSyncRecordType.notification,
                     since: since,
-                    inboundDirection: inbound
+                    inboundDirection: inbound,
+                    recovery: recovery
                 )
                 records.records += notifications.records
                 records.payloadError = records.payloadError ?? notifications.payloadError
@@ -303,14 +297,14 @@ extension CloudKitDeviceTransport {
         }
 
         let remainingDispatched = await deliverIncoming(fetched.records, since: since, queryStartedAt: queryStartedAt,
-                                                        advanceCursor: fetched.payloadError == nil)
+                                                        advanceCursor: fetched.payloadError == nil, recovery: recovery)
         let dispatched = earlyDispatched + remainingDispatched
         if let error = fetched.payloadError { return .failure(error, dispatched: dispatched) }
         return .success(dispatched)
     }
 
     func deliverIncoming(_ fetched: [(fields: NAChatMessageFields, modDate: Date?)], since: Date?, queryStartedAt: Date,
-                         advanceCursor: Bool = true) async -> Int {
+                         advanceCursor: Bool = true, recovery: DeviceSyncRecovery) async -> Int {
         guard let handler = loadHandlerAndCursor().0 else { return 0 }
         let inbound = role.inboundDirection.rawValue
         // CloudKit query order is undefined; deliver in server chronology.
@@ -318,16 +312,15 @@ extension CloudKitDeviceTransport {
 
         // Controls in this batch must reach their owners before awaiting chat.
         var decoded: [Int: (id: String, message: Result<BridgeMessage, Error>?)] = [:]
-        guard let controls = await deliverControls(sorted, decoded: &decoded) else { return 0 }
+        guard let controls = await deliverControls(sorted, decoded: &decoded, recovery: recovery) else { return 0 }
         var dispatched = controls
         // Pin the cursor before the first undelivered inbound record.
         var cursorAdvance: Date? = nil
         var halted = false
         for (index, item) in sorted.enumerated() {
-            // A concurrent cancellation has not yet earned acknowledgement.
-            // Never advance the ordinary cursor past its temporary claim.
+            // A concurrent cancellation has not yet earned acknowledgement. Never advance the ordinary cursor past its temporary claim.
             if isControlDrainInFlight() { halted = true; break }
-            if !NADeviceSyncRecoveryBudget.hasTime { halted = true; break }
+            if !recovery.hasTime { halted = true; break }
             if halted && role != .ios { break }
             let m = item.modDate
             guard item.fields.direction == inbound else {
@@ -335,7 +328,6 @@ extension CloudKitDeviceTransport {
                 continue
             }
             let id = decoded[index]?.id ?? Self.deliveryClaimKey(item.fields)
-            // Fresh atomic claims exclude concurrent drains.
             guard let claimed = claimForSerialDrain(id) else { halted = true; break }
             guard claimed else {
                 if !halted, let m { cursorAdvance = m }    // already delivered — safe to pass
@@ -348,20 +340,17 @@ extension CloudKitDeviceTransport {
             }
             if await handler(message) {
                 dispatched += 1
-                NADeviceSyncRecoveryBudget.didApplyData?()
+                recovery.didApplyData?()
                 if !halted, let m { cursorAdvance = m }
             } else {
                 releaseClaim(id)                  // not delivered — retry next drain
-                halted = true                     // do not advance past this record
-                // iPhone replies are independent deliveries. Keep the failed
-                // row unclaimed and the cursor pinned, but deliver later replies.
+                halted = true
+                // iPhone replies are independent deliveries. Keep the failed row unclaimed and the cursor pinned, but deliver later replies.
             }
         }
         if isControlDrainInFlight() { halted = true }
-        // Keep a sliding 30s overlap (matches the memory framework). An idle
-        // successful query must still move an established cursor forward;
-        // otherwise a quiet bridge re-queries from the date of its last record
-        // forever. A halted delivery never advances past the rejected row.
+        // Keep a sliding 30s overlap (matches the memory framework). An idle successful query must still move an established cursor forward;
+        // otherwise a quiet bridge re-queries from the date of its last record forever. A halted delivery never advances past the rejected row.
         if advanceCursor, let nextCursor = Self.nextPullCursor(
             previousCursor: since,
             queryStartedAt: queryStartedAt,
@@ -385,25 +374,25 @@ extension CloudKitDeviceTransport {
         }
     }
 
-    /// Mac-only admission; the bridge authenticates phone actions and handoffs.
-    /// Ordinary chat delivery and its terminal receipt retain their original owner.
+    /// Mac-only admission; the bridge authenticates phone actions and handoffs. Ordinary chat delivery and its terminal receipt retain their original
+    /// owner.
     public func setControlAdmission(_ admission: @escaping @Sendable (BridgeMessage) async -> Bool) {
         lock.lock(); defer { lock.unlock() }
         controlAdmission = admission
     }
 
     @discardableResult
-    public func drainIncomingControls() async -> Int {
-        guard role == .mac, NADeviceSyncRecoveryBudget.hasTime, holdsPairing,
+    public func drainIncomingControls(recovery: DeviceSyncRecovery = .init()) async -> Int {
+        guard role == .mac, recovery.hasTime, holdsPairing,
               loadControlAdmission() != nil, beginControlDrain() else { return 0 }
         defer { endControlDrain() }
         let (_, since) = loadHandlerAndCursor()
         do {
             let records = try await pull(recordType: NADeviceSyncRecordType.chatMessage,
-                                         since: since, inboundDirection: role.inboundDirection.rawValue)
+                                         since: since, inboundDirection: role.inboundDirection.rawValue, recovery: recovery)
             if let error = records.payloadError { nativeLog("[ck-device] cancellation payload failed: %@", error.localizedDescription) }
             var decoded: [Int: (id: String, message: Result<BridgeMessage, Error>?)] = [:]
-            return await deliverAdmittedControls(Self.orderedIncoming(records.records), decoded: &decoded)
+            return await deliverAdmittedControls(Self.orderedIncoming(records.records), decoded: &decoded, recovery: recovery)
         } catch {
             nativeLog("[ck-device] cancellation pull failed: \(error)")
             return 0
@@ -433,21 +422,21 @@ extension CloudKitDeviceTransport {
     }
 
     func deliverControls(_ records: [(fields: NAChatMessageFields, modDate: Date?)],
-                         decoded: inout [Int: (id: String, message: Result<BridgeMessage, Error>?)]) async -> Int? {
+                         decoded: inout [Int: (id: String, message: Result<BridgeMessage, Error>?)], recovery: DeviceSyncRecovery) async -> Int? {
         guard role == .mac, loadControlAdmission() != nil else { return 0 }
         guard beginControlDrain() else { return nil }
         defer { endControlDrain() }
-        return await deliverAdmittedControls(records, decoded: &decoded)
+        return await deliverAdmittedControls(records, decoded: &decoded, recovery: recovery)
     }
 
     private func deliverAdmittedControls(_ records: [(fields: NAChatMessageFields, modDate: Date?)],
-                                         decoded: inout [Int: (id: String, message: Result<BridgeMessage, Error>?)]) async -> Int {
+                                         decoded: inout [Int: (id: String, message: Result<BridgeMessage, Error>?)],
+                                             recovery: DeviceSyncRecovery) async -> Int {
         guard let admission = loadControlAdmission(),
               let handler = loadHandlerAndCursor().0 else { return 0 }
         var delivered = 0
         for (index, record) in records.enumerated() {
-            guard NADeviceSyncRecoveryBudget.hasTime else { break }
-            // Seen control records bypass decoding and signature checks on every drain.
+            guard recovery.hasTime else { break }
             guard record.fields.direction == role.inboundDirection.rawValue else { continue }
             let id = Self.deliveryClaimKey(record.fields)
             let message = isSeen(id) ? nil : Result { try NAChatMessageCodec.decode(record.fields) }
@@ -455,13 +444,12 @@ extension CloudKitDeviceTransport {
             guard let message = try? message?.get(), await admission(message), claimIfUnseen(id) else { continue }
             if await handler(message) {
                 delivered += 1
-                NADeviceSyncRecoveryBudget.didApplyData?()
+                recovery.didApplyData?()
             } else {
                 releaseClaim(id)
             }
         }
-        // This path never writes the cursor. The serial drain accounts for
-        // every intervening chat and any cancellation whose response failed.
+        // This path never writes the cursor. The serial drain accounts for every intervening chat and any cancellation whose response failed.
         return delivered
     }
 
@@ -480,10 +468,8 @@ extension CloudKitDeviceTransport {
             return max(previousCursor, candidate)
         }
 
-        // On a first-ever empty pull, retain nil so the next attempt still
-        // performs a complete bootstrap read. Once a durable cursor exists (or
-        // this pull saw a record), successful emptiness is an observed high
-        // watermark and can slide the overlap window forward safely.
+        // On a first-ever empty pull, retain nil so the next attempt still performs a complete bootstrap read. Once a durable cursor exists (or this
+        // pull saw a record), successful emptiness is an observed high watermark and can slide the overlap window forward safely.
         guard previousCursor != nil || safeRecordDate != nil else { return nil }
         let highWatermark = max(queryStartedAt, safeRecordDate ?? queryStartedAt)
         let candidate = highWatermark.addingTimeInterval(-overlap)

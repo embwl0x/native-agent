@@ -22,43 +22,19 @@ import ToolExecution
 import TurnTrace
 import NativeAgentShared
 import AppKit
-// Blueprint: | `EnginePartWake.swift` | `EnginePartWake`: `start`, `deliver`, `run`, `readsOnly`, `reindex`; one signal observer feeds parts and cognition's intention releases; open intentions join header-declared file watches by canonical path through a LatestRead Desk projection, retired on closure, with bounded directory-member identities from the senses' shared manifest; Autonomy-gated wake index, per-part single flight, including source-triggered sense interpretation (material/transport stay source-owned, bundled senses need no wake header); a `held`, `resumed` or source-subscription wake Autonomy refused waits (`holdBack`, preserving source slot/helper generation independently of the header index) and is delivered when a trust-policy change finds the switch on; unreadable authority clears the part index with repair owed, and a `held` or `resumed` wake meanwhile waits for it to read again; tainted signals skip write-capable parts (`tainted_signal` trace, no card); gated resident tools/skills and resident senses; sense header/source wakes await readiness at their own read, each file subscription bounds readiness then reports unavailable news and waits for the installer's success edge until repair or Stop, without holding unrelated part signals; current Chat model and signal audit; file-change watches name added/edited/removed members in capped `changed` records with `changed_more`, keep the declared signal and self-write scope, consume the source owner's explicit change/absent/unavailable readings, clear membership only on checked absence, retire only the exiting subscription generation, and merge waiting member news per part/watched path; directory metadata churn is not a member edit; stop joins runs and all current/replaced file, Desk and trust watchers; turn-end steer retained; `resumed` delivered once at launch; `person.away`/`person.here` read PersonPresence from Mac input edges and durable phone motion, refreshing carried readiness; the first presence deadline is armed from existing idle after this observer registers; `network.down`/`network.up` arrive from the shared NetworkSense after a five-second stable path, through the same AbilityStore signal and intention release path; header-declared runs are `HerOpened` work |
+// Blueprint: | `EnginePartWake.swift` | `EnginePartWake`, `start`, `deliver`, `run`, `readsOnly`, `reindex`, `held`, `resumed`, `holdBack`, `tainted_signal`, `changed`, `changed_more`, `person.away`, `person.here`, `network.down`, `network.up`, `AgentOpened` |
 
-/// The stem delivering signals (AGENT_IS_THE_APP S4). A source that fired
-/// posts `AbilityStore.signalled` after its own work (a turn's end is its
-/// durable terminal row); each part whose `wake` lists the signal runs once
-/// with it as input: a tool or skill through the door, the way a turn calls
-/// it (a resident part keeps its context), a sense through its resident
-/// owner. Nothing here polls or keeps a clock: a schedule is the part's
-/// TriggerScheduler job, a declared file is the senses' own watch, the rest
-/// are posted by their sources. Like every unattended runner, nothing runs
-/// while the owner's Autonomy switch is off; a `held` arrival waits for it,
-/// since what came stays unread and nothing more is read until its part runs,
-/// and so does `resumed`, since nothing else takes up what a part held;
-/// either also waits out a catalog that does not read.
-/// A live sense's explicit source subscription is already its wake: its
-/// newest captured material returns through this same per-part admission,
-/// without requiring a second subscription in the part header. Its wake
-/// waits out Autonomy too, retaining the source slot and helper generation.
-///
-/// A run has no turn behind it, so it gets its own gate chain (contract #2):
-/// principal her, on her resident session, so a card it raises reaches the
-/// person like any approval and the run waits for it, through his quiet
-/// hours too; autonomy the current Trust level; origin the signal; taint when
-/// the signal carries the words of anyone the person has not trusted.
-///
-/// A part is not woken by its own hand: its own writes to a file it watches
-/// are echoes, a turn its run started does not wake it, and its arrivals
-/// share one ResidentWake thread.
+/// Deliver source signals after their own work settles, including durable turn terminals. Schedules belong to TriggerScheduler and file watches to
+/// senses; this owner never polls. Autonomy and unreadable catalogs hold wakes without consuming their input; source subscriptions retain their helper
+/// generation. Each unattended run gets its own resident gate chain, approval route, current Trust and source taint; approvals wait through quiet hours.
+/// Suppress self-write and self-turn echoes, and serialize arrivals through one ResidentWake thread.
 actor EnginePartWake {
     static let shared = EnginePartWake()
-    /// Each signal's parts, rebuilt when a part changes; nil while the catalog does not read.
+    /// Unreadable catalogs leave the signal index unavailable, never empty.
     private var index: [String: [AbilityStore.File]]?
-    /// The files each part watches, as the self-write registry holds them.
     private var watched: [String: [URL]] = [:]
-    /// `file.changed:` through the senses' watch, one per declared path.
+    /// Share the senses watch for each declared `file.changed:` path.
     private var watches: [String: (id: UUID, task: Task<Void, Never>)] = [:]
-    /// Receipt of the last unavailable source reading, including exited tasks.
     private var unavailableFileWatches: Set<String> = []
     private var intentionFiles: [String: Set<String>] = [:]
     private let intentionRead = LatestRead()
@@ -71,17 +47,15 @@ actor EnginePartWake {
     private var workspaceCenter: NotificationCenter?
     private var lifecycle: UUID?
     private var stopped = false
-    /// Receipt of the last presence signal, not a presence reading. A late
-    /// source can refine the departure time without signalling absence twice.
+    /// Retain signal receipt, not presence state, so late sources can refine departure without signalling absence twice.
     private var lastSignalledPresence: Bool?
-    /// The same signal already waiting for a part is the same news.
+    /// Coalesce identical pending news per part.
     private var waiting: [String: UUID] = [:]
-    /// File arrivals keep one waiting input per part/watched path, with all its news.
+    /// Coalesce file news by part and watched path without dropping member changes.
     private var fileInputs: [UUID: [String: JSONValue]] = [:]
-    /// `held` and `resumed` wakes wait out Autonomy or an unread catalog;
-    /// source wakes wait out Autonomy with their helper generation intact.
+    /// Hold wakes across Autonomy or catalog unavailability without losing source helper generations.
     private var heldBack: [String: (signal: String, part: String?, payload: [String: JSONValue])] = [:]
-    /// The trust policy's own watch, only while something is held back.
+    /// Observe Trust only while wakes are held.
     private var autonomyWatch: Task<Void, Never>?
     private var retiringWatches: [UUID: Task<Void, Never>] = [:]
 
@@ -95,19 +69,19 @@ actor EnginePartWake {
         }
     }
 
-    /// Once at launch before loop sources fire; sense consumers own readiness.
+    /// Register before loop sources fire; sense consumers own readiness.
     func start(dataRoot: URL) async {
         guard lifecycle == nil, !stopped, !Task.isCancelled else { return }
         let epoch = UUID()
         lifecycle = epoch
         let root = dataRoot.standardizedFileURL
         let center = NotificationCenter.default
-        // A turn's end carries whose words steered it, from the turn's own taint.
-        TurnTraceEvent.steer = {
-            if let taint = PeerDataTaint.current, taint.isTainted { return taint.sourceDescription }
-            let turn = TurnEnvelope.current(surface: "")
-            guard PeerTurnEffectPolicy.isPeerBridge(surface: turn.surface), !PeerDataTaint.trustedTurn else { return nil }
-            return turn.verifiedUserId.map { "peer:" + $0 } ?? "another agent"
+        // Carry the completed turn’s own steering taint into its signal.
+        TurnTraceEvent.steer = { turn in
+            if let taint = turn.peerSteering, taint.isTainted { return taint.sourceDescription }
+            let envelope = TurnEnvelope.current(turn: turn, surface: "")
+            guard PeerTurnEffectPolicy.isPeerBridge(surface: envelope.surface), !PeerDataTaint.trustedTurn(turn) else { return nil }
+            return envelope.verifiedUserId.map { "peer:" + $0 } ?? "another agent"
         }
         observers.append(center.addObserver(forName: AbilityStore.signalled, object: nil, queue: nil) { note in
             guard note.object as? String == root.path, let signal = note.userInfo?["signal"] as? String else { return }
@@ -116,26 +90,29 @@ actor EnginePartWake {
             Task { await Self.shared.signalled(signal, only: part, payload, dataRoot: root, epoch: epoch) }
         })
         observers.append(center.addObserver(forName: .turnTraceTerminalPersisted, object: nil, queue: nil) { note in
-            guard let info = note.userInfo, let trace = info["trace"] as? String,
-                  let tail = NativeAgentWorkspaceRoot.relativePath(trace, under: root.path), !tail.isEmpty,
+            guard let info = note.userInfo, let seq = info["seq"] as? Int64,
                   let turn = info["turnId"] as? String, let kind = info["kind"] as? String else { return }
             var payload: [String: JSONValue] = ["turn_id": .string(turn), "outcome": .string(kind),
-                "trace": .string("turn_traces/" + URL(fileURLWithPath: trace).lastPathComponent),
+                "seq": .int(seq),
                 "session_id": (info["sessionId"] as? String).map(JSONValue.string) ?? .null]
             if let steer = info["agent"] as? String { payload["agent"] = .string(steer) }
             let starter = info["part"] as? String
-            Task { await Self.shared.signalled("turn.ended", except: starter, payload, dataRoot: root, epoch: epoch) }
-            if info["sessionId"] as? String == ResidentWake.session {
-                Task { await EngineCarriedHabits.record(turn: turn, dataRoot: root) }
+            let resident = info["sessionId"] as? String == ResidentWake.session
+            let wake = payload
+            Task {
+                guard await Self.holdsDetail(seq: seq, turn: turn, kind: kind, dataRoot: root) else { return }
+                if resident { Task { await EngineCarriedHabits.record(turn: turn, dataRoot: root) } }
+                await Self.shared.signalled("turn.ended", except: starter, wake, dataRoot: root, epoch: epoch)
             }
         })
-        // A private keep can outlive the terminal. Its closing trace retries
-        // the same idempotent trial read after all dispatches have landed.
+        // Dispatch closure can persist after the terminal; its closing trace repeats the idempotent read after dispatches land.
         observers.append(center.addObserver(forName: .turnTraceDispatchClosedPersisted, object: nil, queue: nil) { note in
-            guard let info = note.userInfo, let trace = info["trace"] as? String,
-                  let tail = NativeAgentWorkspaceRoot.relativePath(trace, under: root.path), !tail.isEmpty,
+            guard let info = note.userInfo, let seq = info["seq"] as? Int64,
                   let turn = info["turnId"] as? String else { return }
-            Task { await EngineCarriedHabits.record(turn: turn, dataRoot: root) }
+            Task {
+                guard await Self.holdsDetail(seq: seq, turn: turn, kind: "tool.dispatch.closed", dataRoot: root) else { return }
+                await EngineCarriedHabits.record(turn: turn, dataRoot: root)
+            }
         })
         observers.append(center.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { _ in
             Task { await Self.shared.refresh(dataRoot: root, epoch: epoch) }
@@ -150,7 +127,7 @@ actor EnginePartWake {
         }
         await refreshIntentions(dataRoot: root, epoch: epoch)
         guard lifecycle == epoch, !Task.isCancelled else { return }
-        // Body changes, once per transition, from their shared sense owners.
+        // Use shared sense transitions to avoid duplicate body signals.
         observers.append(center.addObserver(forName: MacPersonInput.presenceChanged, object: nil, queue: nil) { note in
             guard let signal = note.userInfo?["signal"] as? String else { return }
             let idle = note.userInfo?["idle_seconds"] as? Double ?? 0
@@ -174,9 +151,8 @@ actor EnginePartWake {
             guard let up = note.userInfo?["is_up"] as? Bool else { return }
             Task { await Self.shared.network(up, dataRoot: root, epoch: epoch) }
         })
-        _ = NetworkSense.isUp // Start the body's shared path observation at launch.
-        // The app came back: each ability that wakes on it takes up again
-        // what it held (its own code and state know what that was).
+        _ = NetworkSense.isUp
+        // Resume each part with the code and state that knows what it held.
         await deliver("resumed", [:], dataRoot: root, epoch: epoch)
     }
 
@@ -186,8 +162,7 @@ actor EnginePartWake {
         guard let transition = reading.transition else { return }
         await NativeAgentEngine.cognitionRuntime(for: dataRoot).rhythmPresenceChanged(here: transition.here)
         guard lifecycle == epoch, !Task.isCancelled else { return }
-        // A newer source callback may have run while rhythm settled. Never
-        // overwrite its delivery receipt with the pre-suspension reading.
+        // A newer callback can run during suspension; never overwrite its receipt with an older reading.
         if let current = PersonPresence.read(dataRoot: dataRoot).transition {
             signalPresence(current.here, payload: ["idle_seconds": .double(idle)], dataRoot: dataRoot)
         }
@@ -205,8 +180,7 @@ actor EnginePartWake {
 
     private func signalPresence(_ here: Bool, payload: [String: JSONValue], dataRoot: URL) {
         guard lastSignalledPresence != here else { return }
-        // Record before posting or suspending: both source callbacks share
-        // this actor, including when the other callback arrives during a wake.
+        // Record before posting or suspending because both source callbacks share this actor.
         lastSignalledPresence = here
         AbilityStore(dataRoot: dataRoot).signal(here ? "person.here" : "person.away", payload)
     }
@@ -239,8 +213,7 @@ actor EnginePartWake {
         tails.removeAll(); waiting.removeAll(); fileInputs.removeAll(); heldBack.removeAll()
         retireWatch(autonomyWatch); autonomyWatch = nil
         index = nil
-        // Runs remove themselves while settling; join the captured tasks before
-        // their caller retires the senses, programs and tool dependencies.
+        // Capture and join settling runs before retiring their dependencies.
         await settle { for task in admitted { await task.value } }
         while !retiringWatches.isEmpty {
             let watches = Array(retiringWatches.values)
@@ -249,8 +222,7 @@ actor EnginePartWake {
         }
     }
 
-    /// The original source edge releases intentions once. A part's later
-    /// held-back delivery is still the same edge, not a second release.
+    /// Release intentions only at the original source edge; held delivery is not a second release.
     private func signalled(_ signal: String, only: String? = nil, except: String? = nil,
                            _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
@@ -270,8 +242,7 @@ actor EnginePartWake {
     private func deliver(_ signal: String, only: String? = nil, except: String? = nil,
                          _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
-        // A source retains the newest material; it asks this same admission
-        // owner to interpret it, including bundled senses without a wake header.
+        // Source subscriptions use the same admission owner even without a wake header.
         if signal == "sense.source.changed", let part = only,
            case .string(let slot)? = payload["slot"],
            case .string(let value)? = payload["generation"], let generation = UUID(uuidString: value) {
@@ -292,18 +263,17 @@ actor EnginePartWake {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         let indexed = Self.indexedSignal(signal, dataRoot: dataRoot)
         let fileNews = signal.hasPrefix("file.changed:") && payload["changed"] != nil
-        // Member paths are the news, not separate queue identities. Other
-        // provenance still distinguishes arrivals (in particular peer taint).
+        // Queue identity excludes member paths but retains provenance, including peer taint.
         let identity = fileNews ? payload.filter { !["path", "changed", "changed_more"].contains($0.key) } : payload
         let news = (fileNews ? indexed : signal) + ((try? JSONValue.object(identity).serialize(pretty: false)) ?? "")
         guard let index else {
-            // What came stays unread, so its wake waits for the catalog to read again.
+            // Keep unread wakes pending until the catalog reads again.
             if ["held", "resumed"].contains(signal) { heldBack[(only ?? "") + "\u{0}" + news] = (signal, only, payload) }
             return
         }
         let parts = (index[indexed] ?? []).filter { (only == nil || $0.id == only) && $0.id != except }
         guard !parts.isEmpty else { return }
-        // The wake's own record, kept apart from the part's input (it arrives as input.wake).
+        // Keep wake evidence separate from part input, which receives `input.wake`.
         var input = payload
         input["signal"] = .string(signal)
         input["at"] = .string(ISO8601DateFormatter().string(from: Date()))
@@ -325,14 +295,13 @@ actor EnginePartWake {
                 guard self.lifecycle == epoch, !Task.isCancelled else { return }
                 let input = self.fileInputs.removeValue(forKey: id) ?? input
                 self.begin(key, id: id)
-                // A resident part busy with a call it was given keeps the wake
-                // until that call ends; then the wake is admitted afresh.
+                // A busy resident part retains its wake for fresh admission after the call settles.
                 repeat {
-                    // Read when it runs, not when it queued: Autonomy may have gone off while it waited.
-                    let allowed = await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
+                    // Recheck Autonomy at execution because it may change while queued.
+                    let allowed = await UnattendedWork.allowed(dataRoot: dataRoot)
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
                     self.reindex(dataRoot: dataRoot)
-                    // A catalog that stopped reading keeps held/resumed wakes for its recovery.
+                    // Retain held and resumed wakes while the catalog is unavailable.
                     if self.index == nil, ["held", "resumed"].contains(signal) {
                         return self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch)
                     }
@@ -341,12 +310,13 @@ actor EnginePartWake {
                         if ["held", "resumed"].contains(signal) { self.holdBack(key, signal, part: file.id, payload, dataRoot: dataRoot, epoch: epoch) }
                         return nativeLog("[wake] %@ did not wake %@: Autonomy is off", signal, file.id)
                     }
-                    // Exactly as the part's own write left it: its echo, not news.
+                    // Suppress exact self-write echoes rather than interpreting them as news.
                     if signal.hasPrefix("file.changed:"),
                        PhysiologySelfWriteRegistry.shared.isSelfWriteEcho(loopId: Self.echo(file.id, Self.watchedURL(signal, dataRoot: dataRoot))) { return }
                     await Self.run(current, input: input, dataRoot: dataRoot)
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
-                    let waited = await OwnedProgramRunner.waitedForSlot(file.id, dataRoot: dataRoot)
+                    // A source arrival has no caller deadline; lifecycle cancellation and slot release end this wait.
+                    let waited = await OwnedProgramRunner.waitedForSlot(file.id, dataRoot: dataRoot, deadline: nil)
                     guard self.lifecycle == epoch, !Task.isCancelled, waited else { return }
                 } while true
             }
@@ -361,7 +331,7 @@ actor EnginePartWake {
         await previous?.value
         guard lifecycle == epoch, !Task.isCancelled else { return }
         begin(key, id: id)
-        let allowed = await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
+        let allowed = await UnattendedWork.allowed(dataRoot: dataRoot)
         guard lifecycle == epoch, !Task.isCancelled else { return }
         if allowed {
             do {
@@ -391,8 +361,20 @@ actor EnginePartWake {
         if tails[part] == id { tails.removeValue(forKey: part) }
     }
 
-    /// Preserve each observed change, including successive changes to one member.
-    /// The count includes records omitted by either source arrival or this merge.
+    /// Process-wide notices carry a sequence; only the matching written detail in this root can wake its parts.
+    private static func holdsDetail(seq: Int64, turn: String, kind: String, dataRoot: URL) async -> Bool {
+        guard seq > 0 else { return false }
+        do {
+            let read = try await TurnTracePersistLane(dataRootOverride: dataRoot)
+                .events(.init(subjects: [turn], kinds: [kind], after: seq - 1, limit: 1))
+            return read.isClean && read.lastSeq == seq && read.events.first?.turnId == turn
+        } catch {
+            nativeLog("part wake detail %lld could not be read: %@", seq, error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Preserve successive member changes and count source or merge omissions.
     private static func mergeFileNews(_ earlier: [String: JSONValue], _ later: [String: JSONValue], watched: String) -> [String: JSONValue] {
         guard case .array(let first)? = earlier["changed"], case .array(let next)? = later["changed"] else { return later }
         var merged = later
@@ -407,21 +389,16 @@ actor EnginePartWake {
         return merged
     }
 
-    /// A held connection, program or listener reads nothing more while its
-    /// arrival waits unread, and what a part held is taken up only by its
-    /// `resumed`. Source helpers likewise retain their newest unread material.
-    /// Their wakes wait too: each change of the trust policy re-reads the switch,
-    /// and once it allows unattended work every held-back wake is delivered
-    /// (checked again there).
+    /// Held arrivals stay unread; only `resumed` continues held work. Retain newest source material and recheck Trust both at policy changes and delivery.
     private func holdBack(_ key: String, _ signal: String, part: String, _ payload: [String: JSONValue], dataRoot: URL, epoch: UUID) {
         heldBack[key] = (signal, part, payload)
         guard autonomyWatch == nil else { return }
         let policy = dataRoot.appendingPathComponent("trust/policy.json")
         autonomyWatch = Task {
-            // Its first edge closes the race with a switch-on before the watch armed.
+            // The first policy edge covers a switch-on before watch registration.
             let changes = FileChangeEvents(paths: [policy])
             for await _ in changes.stream {
-                if await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot) { break }
+                if await UnattendedWork.allowed(dataRoot: dataRoot) { break }
             }
             changes.cancel()
             guard self.lifecycle == epoch, !Task.isCancelled else { return }
@@ -445,8 +422,11 @@ actor EnginePartWake {
         let wake = "wake-" + UUID().uuidString.lowercased()
         let taint = PeerDataTaint()
         if case .string(let agent)? = input["agent"], !PeerTrust.ownerTrusts(agent, dataRoot: dataRoot) { taint.mark(peer: agent) }
-        // A tainted signal reaches only a part that can do no harm with it: a
-        // part that can write skips it with a trace row; a card is a decision.
+        let work = "wake:" + file.id
+        let turn = Turn(id: wake, run: wake, session: ResidentWake.session)
+            .with(\.envelope, .native(work)).with(\.verifiedSessionID, ResidentWake.session)
+            .with(\.partID, file.id).with(\.peerSteering, taint).with(\.speechInitiative, taint.isTainted ? .scheduled : .intention)
+        // Tainted signals may reach only read-only parts; effectful parts skip with a trace because a card itself is a decision.
         let readOnly: Bool
         do {
             if taint.isTainted { readOnly = try Self.readsOnly(file, dataRoot: dataRoot) }
@@ -455,17 +435,18 @@ actor EnginePartWake {
         catch {
             await RepairOwed.owe(dataRoot, id: "wake-classification:" + wake, kind: .run,
                 operation: "wake.classification:\(file.id)", owner: "abilities/\(file.id)",
-                words: "Wake admission could not read the action catalog: \(error.localizedDescription). Repair the catalog before this part handles another peer-steered wake.").value
+                words: """
+                    Wake admission could not read the action catalog: \(error.localizedDescription). Repair the catalog before this part handles another \
+                    peer-steered wake.
+                    """).value
             TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake", sessionId: ResidentWake.session, surface: "chat",
                 payload: .object(["part": .string(file.id), "result": .object(["status": .string("unavailable"),
-                    "reason": .string("action_catalog_unavailable"), "detail": .string(error.localizedDescription), "effects": .string("none")])])))
+                    "reason": .string("action_catalog_unavailable"), "detail": .string(error.localizedDescription), "effects": .string("none")])]), turn: turn))
             return
         }
         if taint.isTainted, !readOnly {
             let peer = taint.sourceDescription
-            // The peer's name comes from its authenticated contact binding,
-            // never from parsing the steer's own words.
-            // Several authenticated peers may have steered it; each is named, or none is.
+            // Read peer identity from authenticated contact bindings, never steering text; name every authenticated peer or none.
             let sources: [String] = if case .string(let agent)? = input["agent"] { agent.components(separatedBy: ", ") } else { [] }
             let names = sources.map { PeerDataTaint.sourceName($0) }
             let tap = !names.isEmpty && names.allSatisfy({ $0 != nil })
@@ -477,27 +458,26 @@ actor EnginePartWake {
                     tap: failure.tap ?? "Trust > Connected agents (steering peer unidentified)")])
             TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake",
                 sessionId: ResidentWake.session, surface: "chat",
-                payload: .object(["part": .string(file.id), "input": .object(input), "result": result])))
+                payload: .object(["part": .string(file.id), "input": .object(input), "result": result]), turn: turn))
             return
         }
-        let result = await throughOwnDoor(work: "wake:" + file.id, run: wake, part: file.id, taint: taint, dataRoot: dataRoot) {
-            if file.kind == .sense { return try await sense(file.id, input: .object(["wake": .object(input)])) }
-            // It is given none of its own input; what woke it rides as input.wake.
+        // A watch's signal is its pacing, as an intention's moment is: its notices skip the hourly quota and stay
+        // deduplicated. A peer-steered signal keeps the quota.
+        let result = await throughOwnDoor(work: work, turn: turn, dataRoot: dataRoot, wake: .object(input)) { door in
+            if file.kind == .sense { return try await sense(file.id, input: .object(["wake": .object(input)]), turn: door.turn) }
+            // Provide wake material through `input.wake`, never the part’s own input.
             let call: [String: JSONValue] = ["action": .string("authored." + file.id), "args": .object([:])]
-            return try await OwnedProgramRunner.$wake.withValue(.object(input)) {
-                guard let dispatch = AppDoorReentry.perform else { throw PartError.invalid("The part door has no dispatcher.") }
-                return try await dispatch("app", call)
-            }
+            return try await door.perform("app", call)
         }
-        // Every run leaves a trace, on her resident session.
+        // Every unattended run must leave a resident-session trace.
         TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake",
             sessionId: ResidentWake.session, surface: "chat",
-            payload: .object(["part": .string(file.id), "input": .object(input), "result": Self.outcome(result)])))
+            payload: .object(["part": .string(file.id), "input": .object(input), "result": Self.outcome(result)]), turn: turn))
     }
 
-    /// A habit is her own call, with the carried step's steering still intact.
+    /// Retain carried steering when admitting a habit as the agent’s own call.
     static func runCarried(_ step: DeskStep, handle: String, dataRoot: URL) async -> JSONValue {
-        guard await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot) else {
+        guard await UnattendedWork.allowed(dataRoot: dataRoot) else {
             return .object(["status": .string("refused"), "reason": .string("autonomy_off"),
                 "detail": .string("The habit did not run: Autonomy is off."), "effects": .string("none")])
         }
@@ -510,48 +490,51 @@ actor EnginePartWake {
         let taint = PeerDataTaint(restoring: step.peers, elevated: step.elevated)
         taint.keep(line: step.words)
         let run = "habit-" + UUID().uuidString.lowercased()
-        let result = await ProactiveSpeechInitiative.$current.withValue(.intention) {
-            await throughOwnDoor(work: "carry." + handle, run: run, part: part, taint: taint, dataRoot: dataRoot) {
-                guard let dispatch = AppDoorReentry.perform else { throw PartError.invalid("The part door has no dispatcher.") }
-                return try await dispatch("app", call)
-            }
+        let work = "carry." + handle
+        let turn = Turn(id: run, run: run, session: ResidentWake.session)
+            .with(\.envelope, .native(work)).with(\.verifiedSessionID, ResidentWake.session)
+            .with(\.partID, part).with(\.peerSteering, taint).with(\.speechInitiative, .intention)
+        let result = await throughOwnDoor(work: work, turn: turn, dataRoot: dataRoot) { door in
+            try await door.perform("app", call)
         }
         TurnTraceBus.fire(TurnTraceEvent(turnId: run, kind: "habit.run", sessionId: ResidentWake.session, surface: "chat",
-            payload: .object(["workIdentity": .string("carry." + handle), "call": .object(call), "result": Self.outcome(result)])))
+            payload: .object(["workIdentity": .string(work), "call": .object(call), "result": Self.outcome(result)]), turn: turn))
         return result
     }
 
-    /// One posture and gate chain for unattended self calls, whether a part
-    /// heard its signal or her carried moment came round. No planning model.
-    private static func throughOwnDoor(work: String, run: String, part: String?, taint: PeerDataTaint, dataRoot: URL,
-                                       operation: @escaping @Sendable () async throws -> JSONValue) async -> JSONValue {
+    /// Share one unattended posture and gate chain across signalled parts and carried moments, without a planning model.
+    private static func throughOwnDoor(work: String, turn: Turn, dataRoot: URL, wake: JSONValue? = nil,
+        operation: @escaping @Sendable (PartDoor) async throws -> JSONValue) async -> JSONValue {
         let wrote: @Sendable (URL) -> Void = { url in
-            PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: echo(part ?? work, url))
+            PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: echo(turn.partID ?? work, url))
             if work.hasPrefix("carry.") {
                 PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: PhysiologySelfWriteRegistry.intentionWriteID(work, url))
             }
         }
-        HerOpened.shared.began(run)
-        let result = await TurnTraceContext.$turnId.withValue(run) { await SkillRunContext.$partID.withValue(part) {
-            await SkillRunContext.$wrote.withValue(wrote) { await PeerDataTaint.$current.withValue(taint) {
-                do {
-                    return try await NativeAgentEngine.forRoot(dataRoot).chatClient(profile: .background).withCurrentChatModel {
-                        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native(work)) {
-                            try Task.checkCancellation()
-                            return try await operation()
-                        }
+        let engine = NativeAgentEngine.forRoot(dataRoot)
+        let client = engine.chatClient(profile: .background)
+        AgentOpened.shared.began(turn.id)
+        let result = await TurnTraceContext.$turnId.withValue(turn.id) {
+            do {
+                return try await client.withCurrentChatModel(turn: turn) { turn, admit in
+                    try await engine.tools.withPartDoor(envelope: .native(work), turn: turn,
+                        wake: wake, wrote: wrote, admitModel: { turn in
+                            guard let turn else { throw PartError.invalid("The model call has no originating turn.") }
+                            return try await admit(turn)
+                        }) { door in
+                        try Task.checkCancellation()
+                        return try await operation(door)
                     }
-                } catch { return ChatToolOutcome.failure(error: error, tool: "app") }
-            } }
-        } }
-        await settle { HerOpened.shared.ended(run, dataRoot: dataRoot) }
+                }
+            } catch { return ChatToolOutcome.failure(error: error, tool: "app") }
+        }
+        await settle { AgentOpened.shared.ended(turn.id, dataRoot: dataRoot) }
         return result
     }
 
-    /// A part that reads only: every capability it declares is a read and every
-    /// action it depends on is a read, by the registry's own classification.
+    /// Read-only requires every declared capability and dependency action to be a read by the registry’s classification.
     private static func readsOnly(_ file: AbilityStore.File, dataRoot: URL) throws -> Bool {
-        if file.kind == .part, let own = try AppActions.authored(dataRoot: dataRoot).first(where: { $0.id == "authored." + file.id }) {
+        if file.kind == .part, let own = try AppActions.authored(dataRoot: dataRoot, turn: nil).first(where: { $0.id == "authored." + file.id }) {
             return own.read
         }
         var capabilities: [String] = [], actions: [String] = []
@@ -562,17 +545,17 @@ actor EnginePartWake {
             actions = list.compactMap { if case .string(let s) = $0 { return s }; return nil }
         }
         let capabilitiesRead = capabilities.allSatisfy { ["app_data_read", "computer_files"].contains($0) || $0.hasPrefix("app_read:") }
-        return try capabilitiesRead && actions.allSatisfy { try AppActions.action($0, dataRoot: dataRoot)?.read == true }
+        return try capabilitiesRead && actions.allSatisfy { try AppActions.action($0, dataRoot: dataRoot, turn: nil)?.read == true }
     }
 
-    /// What the run came to, small enough that its trace row is never cut.
+    /// Bound outcome detail so its trace row is never cut.
     private static func outcome(_ result: JSONValue) -> JSONValue {
         guard case .object(let fields) = result else { return result }
         return .object(fields.filter { ["status", "reason", "detail", "effects", "log", "remedy"].contains($0.key) })
     }
 
-    /// A sense hears its wake through its resident owner, as an event.
-    private static func sense(_ id: String, input: JSONValue) async throws -> JSONValue {
+    /// Deliver sense wakes through the resident owner.
+    private static func sense(_ id: String, input: JSONValue, turn: Turn) async throws -> JSONValue {
         let hub = SensesHub.shared
         try await hub.waitUntilReady()
         guard let receiver = hub.runner, let source = hub.source,
@@ -580,17 +563,14 @@ actor EnginePartWake {
             throw SenseFailure(code: "unavailable", message: "Sense \(id) is off, or the senses are not installed.")
         }
         try Task.checkCancellation()
-        try await SensesHub.$passiveObservation.withValue(true) {
-            if case .failed(let failure) = await receiver.run(record, request: .event(input), source: source) {
-                throw failure
-            }
+        if case .failed(let failure) = await receiver.run(record, request: .event(input), source: source,
+            operation: .init(turn: turn, passive: true)) {
+            throw failure
         }
         return .object(["status": .string("ok")])
     }
 
-    /// A declared path read the way her files are: relative names (and the
-    /// workspace/ alias) start in her workspace, so a relative wake watches the
-    /// file she named instead of a path from the app's working directory.
+    /// Resolve relative and `workspace/` paths from the agent’s workspace, never the app’s working directory.
     private static func watchedURL(_ signal: String, dataRoot: URL) -> URL {
         NativeAgentWorkspaceRoot.resolveFileEntryPath(
             NativeAgentWorkspaceRoot.fileSpelling(String(signal.dropFirst(13))), dataRoot: dataRoot)
@@ -600,8 +580,7 @@ actor EnginePartWake {
     }
     private static func echo(_ part: String, _ url: URL) -> String { "part:" + part + ":" + url.standardizedFileURL.path }
 
-    /// Desk registration precedes the first read; older reads cannot restore
-    /// a watch after a newer closure has published.
+    /// Register Desk before the first read; older reads cannot restore a closed watch.
     private func refreshIntentions(dataRoot: URL, epoch: UUID) async {
         _ = await intentionRead.read({ () -> Result<[String: Set<String>], Error> in
             do {
@@ -627,8 +606,7 @@ actor EnginePartWake {
         })
     }
 
-    /// Keys are already canonical file.changed paths. Unchanged memberships
-    /// retain their stamps; closure, unreadability and shutdown release them.
+    /// Preserve stamps for unchanged canonical paths; release them on closure, unreadability or shutdown.
     private func replaceIntentionFiles(_ files: [String: Set<String>]) {
         for (signal, handles) in intentionFiles {
             let url = URL(fileURLWithPath: String(signal.dropFirst("file.changed:".count)))
@@ -646,7 +624,7 @@ actor EnginePartWake {
         intentionFiles = files
     }
 
-    /// The index again; when the catalog reads after it did not, what waited for it goes now.
+    /// Catalog recovery must deliver wakes held while it was unreadable.
     private func refresh(dataRoot: URL, epoch: UUID) async {
         guard lifecycle == epoch, !Task.isCancelled else { return }
         let unread = index == nil
@@ -665,7 +643,10 @@ actor EnginePartWake {
                 source: dataRoot.appendingPathComponent("abilities"), detail: error.localizedDescription)
             RepairOwed.owe(dataRoot, id: "parts-index:" + UUID().uuidString.lowercased(), kind: .run,
                 operation: "parts.index", owner: failure.owner ?? dataRoot.appendingPathComponent("abilities").path,
-                words: "Part wakes stopped because the catalog did not read: \(error.localizedDescription). Preserve the named source before repairing it; old wake wiring is not current authority.",
+                words: """
+                    Part wakes stopped because the catalog did not read: \(error.localizedDescription). Preserve the named source before repairing it; old \
+                    wake wiring is not current authority.
+                    """,
                 nextCall: failure.nextCall)
             return nativeLog("[wake] part wakes stopped: abilities do not read (%@)", error.localizedDescription)
         }
@@ -677,15 +658,12 @@ actor EnginePartWake {
         }
         index = built
         let live = Set(files.filter { !$0.wakes.isEmpty }.map(\.id))
-        // Source wakes belong to the helper generation, including bundled
-        // senses without a wake header; the runner retires that generation.
+        // Source wakes retain their helper generation even without a wake header.
         for run in runs.values where !run.source && !live.contains(run.part) { run.task.cancel() }
-        // Retired queued arrivals no longer suppress a later, newly admitted
-        // arrival. Their cancelled tasks still keep their serialization slot
-        // until actual exit; identity-checked cleanup cannot remove the new key.
+        // Cancelled tasks retain serialization until exit; identity-checked cleanup must not remove a newly admitted arrival.
         waiting = waiting.filter { _, id in runs[id].map { $0.source || live.contains($0.part) } ?? false }
         heldBack = heldBack.filter { _, wake in
-            // Source subscriptions need no header; the runner owns their generation fence.
+            // The runner owns source generation fencing even without a wake header.
             wake.signal == "sense.source.changed"
                 || (wake.part.map { part in built[Self.indexedSignal(wake.signal, dataRoot: dataRoot)]?.contains(where: { $0.id == part }) == true } ?? true)
         }
@@ -711,8 +689,7 @@ actor EnginePartWake {
             let generation = UUID()
             let task = Task {
                 defer {
-                    // Actual exit retires only this subscription, never a
-                    // replacement installed while its cancellation settled.
+                    // Actual exit retires only its subscription, never a replacement admitted during cancellation.
                     if watches[signal]?.id == generation { watches.removeValue(forKey: signal) }
                 }
                 var last: [String: [Int64]]?
@@ -725,8 +702,7 @@ actor EnginePartWake {
                 }
                 func news(_ now: [String: [Int64]], available: Bool) {
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
-                    // A repaired read is an edge even when no earlier identity
-                    // was admitted. It asserts availability, never guessed additions.
+                    // Repair proves availability even without a prior identity, never guessed membership additions.
                     let paths = last.map { before in
                         Set(before.keys).union(now.keys).filter { before[$0] != now[$0] }.sorted()
                     } ?? []
@@ -741,8 +717,7 @@ actor EnginePartWake {
                     AbilityStore(dataRoot: dataRoot).signal(signal, payload)
                 }
                 let corner = SenseCorner.fileKind(URL(fileURLWithPath: file).pathExtension.lowercased())
-                // Arm before reading readiness: a repair racing the bounded
-                // wait or its unavailable news remains buffered for this path.
+                // Arm before readiness reads so repair racing the bounded wait stays buffered.
                 let repairs = EventDeadlinePhysiology.storeAndFileEvents(paths: [], notifications: [SensesHub.didBecomeReady])
                 var ready = repairs.makeAsyncIterator()
                 while !Task.isCancelled {
@@ -753,8 +728,7 @@ actor EnginePartWake {
                     catch {
                         guard self.lifecycle == epoch, !Task.isCancelled else { return }
                         await unavailable(SenseFailure(error, code: "source_unavailable"))
-                        // No repair edge leaves this subscription unavailable,
-                        // not a blocked resident owner; Stop retires its wait.
+                        // A missing repair edge leaves this subscription unavailable; Stop retires its wait without blocking resident ownership.
                         guard await ready.next() != nil else { return }
                     }
                 }
@@ -763,7 +737,8 @@ actor EnginePartWake {
                     guard let provider = SensesHub.shared.source as? any SenseSourceWatchingProvider else {
                         throw SenseFailure(code: "source_unavailable", message: "The senses' file source is not installed.")
                     }
-                    let stream = try await provider.changes(for: corner, address: file)
+                    // This passive subscription has no turn, action callback or enclosing read deadline.
+                    let stream = try await provider.changes(for: corner, address: file, operation: .init(turn: nil, passive: true))
                     for await change in stream {
                         guard self.lifecycle == epoch, !Task.isCancelled else { return }
                         switch change {
@@ -780,8 +755,7 @@ actor EnginePartWake {
                             news(identity, available: available)
                             last = identity
                         case .absent:
-                            // A checked absent root is a real empty baseline:
-                            // deletion removes it; later creation adds it.
+                            // Checked root absence is an empty baseline; deletion removes members and creation adds them.
                             let available = unavailableFileWatches.remove(signal) != nil
                             if available {
                                 await SenseNewsBoard.shared.keep(SenseNews(senseID: "file-watch", version: 1,
@@ -790,13 +764,13 @@ actor EnginePartWake {
                             news([:], available: available)
                             last = [:]
                         case .unavailable(let failure):
-                            // Keep the last admitted identity. A failed read
-                            // is never evidence of a removed member.
+                            // Retain the admitted identity on failure; unreadability never proves member removal.
                             await unavailable(failure)
                         }
                     }
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
-                    await unavailable(SenseFailure(code: "source_unavailable", message: "Source observation ended; a part/catalog change registers the source again."))
+                    await unavailable(SenseFailure(code: "source_unavailable",
+                        message: "Source observation ended; a part/catalog change registers the source again."))
                 } catch {
                     guard self.lifecycle == epoch, !Task.isCancelled else { return }
                     await unavailable(SenseFailure(code: "source_unavailable", message: error.localizedDescription))

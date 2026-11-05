@@ -2,7 +2,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 
-// Blueprint: | `CognitiveSubstrate+CaresSettlement.swift` | Complete-link care cluster nominations over cached vectors; shared value transformations for care answers, multi-day stances and revision-checked merges, used by committed nights and preview copies; each proposed merge reports submitted IDs, requested/resolved survivor and outcome; history unions and newest donor gap inheritance retain one implementation |
+// Blueprint: | `CognitiveSubstrate+CaresSettlement.swift` | Shared care answers, stance and complete-link merge transformations |
 
 public struct CognitiveCareMerge: Sendable, Equatable {
     public var keep: UUID?
@@ -26,9 +26,8 @@ public struct CognitiveCareStanceChange: Sendable, Equatable {
 }
 
 extension CognitiveSubstrate {
-    /// Both directions must stand out against the whole live inventory, with
-    /// self excluded. Complete-link clusters cannot join unrelated endpoints
-    /// through a chain of intermediate cares. Stable order, six by six at most.
+    /// Both directions must stand out against the whole live inventory, with self excluded. Complete-link clusters cannot join unrelated endpoints through a
+    /// chain of intermediate cares. Stable order, six by six at most.
     static func careMergeClusters(among inventory: [CognitiveCare], vectors: [UUID: [Float]]) -> [[CognitiveCare]] {
         guard inventory.allSatisfy({ vectors[$0.id] != nil }) else { return [] }
         let ordered = inventory.sorted {
@@ -180,7 +179,8 @@ extension CognitiveSubstrate {
                 $0.createdAt != $1.createdAt ? $0.createdAt < $1.createdAt : $0.id.uuidString < $1.id.uuidString
             }
             guard let keep = answer.keep ?? members.first?.id, var kept = cares[keep],
-                  members.allSatisfy({ Set($0.with) == Set(kept.with) }) else { outcome("skipped: the kept care is missing or held with different people"); continue }
+                  members.allSatisfy({ Set($0.with) == Set(kept.with) }) else { outcome(
+                      "skipped: the kept care is missing or held with different people"); continue }
             outcome("merged into \(String(kept.about.prefix(60)))", kept: keep)
             if kept.open == nil {
                 kept.open = members.filter { $0.open != nil }.max {
@@ -189,8 +189,7 @@ extension CognitiveSubstrate {
                     return left != right ? left < right : $0.id.uuidString < $1.id.uuidString
                 }?.open
             }
-            // Record before union so its normal bounds cannot fold the history
-            // just collected from the other cares in this same night.
+            // Record before union so its normal bounds cannot fold the history just collected from the other cares in this same night.
             kept.record(.init(at: now, moved: 0, by: .her, felt: "came together", note: answer.why, source: night.source))
             for var other in members where other.id != keep {
                 kept.absorbHistory(of: other)

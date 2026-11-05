@@ -1,9 +1,3 @@
-// Mac device-sync storage and inbox bookkeeping.
-// SnapshotWriter: source mutations write app-owned Swift runtime state to iCloud Drive `snapshots/`.
-//   Touches KVS key `snapshot_updated` so iOS observes immediately.
-// InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
-//   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
-
 import CommonCrypto
 import AppKit
 import Foundation
@@ -13,10 +7,9 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Storage.swift` | `MacSyncEngine`: consolidated replay/digest restoration and device bookkeeping await `DeviceSyncStorage`; one current identity/digest schema admits action-ledger reads, writes, release and terminal retention |
+// Blueprint: | `MacSyncEngine+Storage.swift` | `MacSyncEngine`, `DeviceSyncStorage`; Checked replay/digest and ledger storage. |
 
 extension MacSyncEngine {
-    /// Record a msgId as processed, capping the set at processedIdsCap (drops oldest first).
     func recordProcessed(_ msgId: String) {
         guard !processedMsgIds.contains(msgId) else { return }
         processedMsgIds.insert(msgId)
@@ -50,7 +43,10 @@ extension MacSyncEngine {
             } catch {
                 digests = [:]
                 if !Self.isNoSuchFileError(error) {
-                    digestFailure = "Snapshot digest cache is unavailable (\(error.localizedDescription)); preserve icloud/snapshot_digests.json and repair its read before restarting phone sync."
+                    digestFailure = """
+                        Snapshot digest cache is unavailable (\(error.localizedDescription)); preserve icloud/snapshot_digests.json and repair its read \
+                        before restarting phone sync.
+                        """
                     nativeLog("[MacSyncEngine] %@", digestFailure ?? "")
                 }
             }
@@ -74,7 +70,7 @@ extension MacSyncEngine {
         return true
     }
 
-    /// Trim oldest first without evicting marker or newly completed ids; 30-day marker retention bounds the exemption.
+    /// Eviction must protect markers and newly completed IDs; 30-day marker retention bounds that exemption.
     nonisolated static func cappedPreservingMarkers(
         _ ids: [String], cap: Int, markerIds: Set<String>
     ) -> [String] {
@@ -92,8 +88,8 @@ extension MacSyncEngine {
         return trimmed
     }
 
-    /// Missing means genesis; unreadable state retains memory, preserves bytes and reports the error.
-    /// Completion markers prevent replay even when filing the response failed.
+    /// Missing means genesis; unreadable state retains memory, preserves bytes and reports the error. Completion markers prevent replay even when filing the
+    /// response failed.
     nonisolated static func restoreProcessedIds(
         dataRoot: URL,
         inMemory: [String] = []
@@ -105,7 +101,10 @@ extension MacSyncEngine {
         let markers: [String]
         do { markers = try ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot) }
         catch {
-            let message = "Completed iPhone command evidence could not be read (\(error.localizedDescription)). Command admission is paused; restore access to icloud/completed-unarchived and reconnect the phone."
+            let message = """
+                Completed iPhone command evidence could not be read (\(error.localizedDescription)). Command admission is paused; restore access to \
+                icloud/completed-unarchived and reconnect the phone.
+                """
             nativeLog("[MacSyncEngine] %@", message)
             return (ids, true, message, [])
         }
@@ -125,15 +124,14 @@ extension MacSyncEngine {
         do {
             let data = try Data(contentsOf: url)
             let stored = try JSONDecoder().decode([String].self, from: data)
-            // Preserve insertion order; append marker and in-memory ids after the stored window.
+            // Preserve stored insertion order before appending markers and in-memory completions.
             var merged = stored
             for id in ids where !stored.contains(id) { merged.append(id) }
             return (merged, false, messages.isEmpty ? nil : messages.joined(separator: " "), Set(markers))
         } catch {
             nativeLog("[MacSyncEngine] processed_ids.json UNREADABLE (%@) — keeping %d in-memory id(s); not trusting the empty read",
                   error.localizedDescription, ids.count)
-            // Preserve the bytes before any later save overwrites them: this is
-            // both the recovery evidence and the durable signal Doctor reports.
+            // Preserve damaged bytes before saving so recovery evidence and Doctor's durable signal survive.
             let backup = ICloudSyncStatePaths.processedIdsCorruptBackup(dataRoot: dataRoot)
             if !FileManager.default.fileExists(atPath: backup.path) {
                 try? FileManager.default.copyItem(at: url, to: backup)
@@ -166,10 +164,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Durably records that `msgId` completed even though its bookkeeping did
-    /// not. Returns false when even the marker could not be written — the only
-    /// case in which a replay is still possible, and one the caller surfaces
-    /// rather than swallows.
+    /// A completion marker prevents replay when bookkeeping fails; marker failure must surface the remaining replay risk.
     @discardableResult
     nonisolated static func writeCompletedUnarchivedMarker(
         dataRoot: URL,
@@ -193,27 +188,17 @@ extension MacSyncEngine {
         }
     }
 
-    /// Outcome of the post-response bookkeeping transaction for one command.
     struct CompletionCommit: Sendable, Equatable {
-        /// True when the completion is durable through the NORMAL path
-        /// (processed-id list saved AND pending file archived).
+        /// Both the processed-id save and pending-file archive must land before completion is clean.
         var clean: Bool
-        /// True when a durable completion marker guarantees no re-dispatch.
+        /// A durable marker also forbids redispatch after incomplete bookkeeping.
         var markerWritten: Bool
-        /// nil only when `clean`.
         var syncError: String?
-        /// Transaction state to record; nil when `clean` (the caller already
-        /// wrote the completed/failed state).
+        /// Clean completion needs no ledger update because the caller already recorded the terminal state.
         var transactionState: String?
     }
 
-    /// The post-response half of processing an iOS command, as ONE decision.
-    ///
-    /// By the time this runs the action has executed and its response has
-    /// landed, so the only acceptable outcome is "never dispatch this again".
-    /// If either bookkeeping step failed, a durable local marker takes over
-    /// that job; if even the marker fails, that is the one case where a replay
-    /// is still possible and it is stated plainly instead of swallowed.
+    /// After a response lands, bookkeeping or its durable marker must forbid redispatch; failure of both exposes replay risk.
     nonisolated static func commitCompletionBookkeeping(
         dataRoot: URL,
         msgId: String,
@@ -231,7 +216,10 @@ extension MacSyncEngine {
         let marked = writeCompletedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId, reason: reason)
         let message = marked
             ? "Command \(msgId) finished but its completion record could not be filed (\(reason)). It is marked completed and will not run again."
-            : "Command \(msgId) finished but NEITHER its completion record NOR the fallback marker could be written (\(reason)). It could run again on restart — free disk space and check iCloud permissions."
+            : """
+                Command \(msgId) finished but NEITHER its completion record NOR the fallback marker could be written (\(reason)). It could run again on \
+                restart — free disk space and check iCloud permissions.
+                """
         nativeLog("MacSyncEngine.commitCompletionBookkeeping: %@", message)
         return CompletionCommit(
             clean: false,
@@ -241,7 +229,6 @@ extension MacSyncEngine {
         )
     }
 
-    /// Drops the marker once the completion is durable through the normal path.
     nonisolated static func clearCompletedUnarchivedMarker(dataRoot: URL, msgId: String) {
         let url = ICloudSyncStatePaths.completedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
@@ -265,15 +252,13 @@ extension MacSyncEngine {
         case present(ICloudTransactionRecord)
     }
 
-    /// Read the durable transaction ledger row for id.
     func readTransaction(id: String) async -> InboxTransactionLookup {
         guard let transactionDir,
               let url = InboxActionFileBoundary.jsonURL(
                 in: transactionDir,
                 validatedID: id
               ) else {
-            // No ledger directory (or a path we refuse to derive) means we
-            // cannot prove the action has not already run. Unknown, not fresh.
+            // No ledger directory proves no outcome; admission must remain unknown rather than fresh.
             return .unreadable
         }
         return await Task.detached(priority: .utility) { [url] () -> InboxTransactionLookup in
@@ -298,8 +283,7 @@ extension MacSyncEngine {
         return MacSyncSnapshotIntegrity.digest(canonical)
     }
 
-    /// The Mac's ledger schema requires the exact envelope identity and digest.
-    /// Unbound rows remain unavailable evidence, never replay or dispatch authority.
+    /// Exact envelope identity and digest bind the ledger; unbound rows authorize neither replay nor dispatch.
     nonisolated static func hasCurrentInboxBinding(_ record: ICloudTransactionRecord, transactionID: String) -> Bool {
         guard InboxActionFileBoundary.isCanonicalUUID(transactionID),
               record.id == transactionID, record.direction == "ios_to_mac",
@@ -320,8 +304,7 @@ extension MacSyncEngine {
         return record.msgId == msgId && record.actionDigest == digest && record.action == action
     }
 
-    /// True when the ledger state proves the action's effect has already been
-    /// dispatched to the router, so a redelivery must never run it again.
+    /// Dispatched ledger states forbid rerunning a redelivered action.
     static func inboxActionDidExecute(_ state: String) -> Bool {
         ["running", "completed", "failed", "pending_approval", "outcome_unknown",
          "response_write_failed", "completed_unarchived", "unknown"].contains(state)
@@ -354,9 +337,7 @@ extension MacSyncEngine {
             return nil
         }
         let now = ISO8601DateFormatter().string(from: Date())
-        // Off-main read-modify-write, AWAITED so sequential state transitions for
-        // the same transaction id (received -> running -> done) complete in order
-        // and can't clobber each other under iCloud slowness.
+        // Await off-main transitions in order so slow iCloud writes cannot overwrite a later transaction state.
         let written = await Task.detached(priority: .utility) { [id, action, state, attempts, error, response, msgId, actionDigest, url, now] () -> Data? in
             // Preserve unreadable ledger bytes and fail the write so the outcome remains unknown.
             let existing: ICloudTransactionRecord?
@@ -411,8 +392,7 @@ extension MacSyncEngine {
         return InboxTransactionWrite(url: url, contents: written)
     }
 
-    /// Retirement before dispatch releases only this write. Comparison and
-    /// replacement share one coordinated access so an advanced row stays intact.
+    /// Release only this pre-dispatch reservation; coordinated comparison protects advanced rows.
     func releaseUndispatchedInboxAction(_ reservation: InboxTransactionWrite) async {
         await sync.storage.perform {
             var coordinationError: NSError?
@@ -438,17 +418,14 @@ extension MacSyncEngine {
         }
     }
 
-    /// Why a coordinated read produced no data. `missing` is a normal answer;
-    /// `failed` means the file may exist and we could not read it.
+    /// Missing is normal absence; failed reads leave file existence and outcome unknown.
     enum CoordinatedReadOutcome: Sendable {
         case data(Data)
         case missing
         case failed
     }
 
-    /// Coordinated read of an iCloud-resident file, distinguishing "there is no
-    /// such file" from "the read failed". nonisolated static — safe to call
-    /// from detached tasks off the main actor.
+    /// Nonisolated coordinated reads run off main and preserve the distinction between missing and unreadable.
     nonisolated static func coordinatedReadOutcome(at url: URL) -> CoordinatedReadOutcome {
         var outcome: CoordinatedReadOutcome = .failed
         let coordinator = NSFileCoordinator(filePresenter: nil)
@@ -483,8 +460,7 @@ extension MacSyncEngine {
         return outcome
     }
 
-    /// True only for "no such file or directory" — the one error that means
-    /// absence rather than an unknown outcome.
+    /// Only no-such-file errors prove absence; other failures leave the outcome unknown.
     public nonisolated static func isNoSuchFileError(_ error: Error) -> Bool {
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain,
@@ -500,15 +476,13 @@ extension MacSyncEngine {
         return false
     }
 
-    /// Coordinated read of an iCloud-resident file. Returns nil if missing or unreadable.
-    /// nonisolated static — safe to call from detached tasks off the main actor.
+    /// Nonisolated for detached reads; nil conflates missing and unreadable, so callers cannot infer absence.
     nonisolated static func coordinatedRead(at url: URL) -> Data? {
         guard case .data(let data) = coordinatedReadOutcome(at: url) else { return nil }
         return data
     }
 
-    /// Coordinated write returning an optional error description (nil = success).
-    /// nonisolated static — safe to call from detached tasks off the main actor.
+    /// Nonisolated for detached writes; nil proves success and a description retains failure.
     nonisolated static func coordinatedWriteReturningError(data: Data, to url: URL) -> String? {
         var writeError: String?
         let coordinator = NSFileCoordinator(filePresenter: nil)
@@ -527,7 +501,6 @@ extension MacSyncEngine {
         return writeError
     }
 
-
     // Reclaim missing/expired response keys within KVS's 1024-key/1 MB quota; pressure alone cannot discard recent readable replies.
     func sweepInboxResponseKVSKeys() async {
         let keyPrefix = inboxResponseKeyPrefix
@@ -541,11 +514,7 @@ extension MacSyncEngine {
         }
         guard !keys.isEmpty else { return }
         let now = Date()
-        // The per-key file stats below hit the iCloud-resident responses dir and
-        // can block (fileExists / resourceValues / attributesOfItem) — with up to
-        // inboxResponseKeyMaxCount keys this is run on every inbox pass, so it must
-        // NOT run on the main actor. Build the (key → exists/modified) array off
-        // main, then hop back to @MainActor for the KVS mutations below.
+        // iCloud file stats may block: collect metadata off main before MainActor applies KVS mutations.
         let keyPrefixCount = inboxResponseKeyPrefix.count
         let entries: [MacSyncInboxResponseSweep.Entry] = await Task.detached(priority: .utility) { [responsesDir, keys] in
             let fm = FileManager.default
@@ -575,11 +544,14 @@ extension MacSyncEngine {
             cap: inboxResponseKeyMaxCount
         )
         if sweepPlan.exceedsCap {
-            print("[MacSyncEngine] inbox_response_* KVS keys (\(sweepPlan.retainedCount)) exceed backstop cap \(inboxResponseKeyMaxCount); recent readable response keys were retained rather than dropped.")
+            print(
+                """
+                    [MacSyncEngine] inbox_response_* KVS keys (\(sweepPlan.retainedCount)) exceed backstop cap \(inboxResponseKeyMaxCount); recent readable \
+                    response keys were retained rather than dropped.
+                    """)
         }
         if !sweepPlan.keysToRemove.isEmpty {
-            // Sendable-capture: snapshot to a let so the @Sendable closure
-            // doesn't capture the outer `var`.
+            // Capture an immutable snapshot because the Sendable closure cannot share the outer var.
             let snapshot = sweepPlan
             let didSynchronize = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.removeKeys") {
                 let kvs = NSUbiquitousKeyValueStore.default
@@ -600,15 +572,8 @@ extension MacSyncEngine {
             .appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
     }
 
-    /// One retention reconcile at a time, owned by this task: each request
-    /// cancels its predecessor and awaits its end before scanning, and every
-    /// scan and delete runs on the engine's storage executor. The loop prunes,
-    /// finds the next exact crossing from metadata, sleeps until it, repeats.
-    /// Directory and exact transaction-file events reconcile again (including
-    /// downloads and readability changes); failed deletion keeps its floor.
-    /// Rejected files get the same 7-day TTL and 50 MB cap as other archives.
-    /// Completion markers must outlive any pending file that could re-present
-    /// the same command (7-day archive TTL), so they keep 30 days.
+    /// Serialize scan/delete on the storage executor; exact metadata crossings and file events own future wakes. Failed deletion keeps its retry floor.
+    /// Archives retain seven days/50 MB; replay markers retain 30 days to outlive pending files.
     func reconcileArchiveRetention(pruneFirst: Bool) {
         let rejectedDir = inboxDir?.appendingPathComponent("_rejected")
         let dirs = [inboxDir, responsesDir, rejectedDir].compactMap { $0 }
@@ -623,8 +588,7 @@ extension MacSyncEngine {
             guard let self, !Task.isCancelled, self.isActive,
                   generation == self.snapshotLifecycleGeneration else { return }
             defer { if generation == self.snapshotLifecycleGeneration, !Task.isCancelled { self.pruneDeadlineTask = nil } }
-            // Register before reading transaction metadata or contents. The
-            // directory watch remains armed while this file set is discovered.
+            // Keep the directory watch armed while discovering exact files, then register them before reading metadata or contents.
             let observing = await self.startArchiveRetentionWatcher(transactionDirectories: transactionDirectories)
             if !observing { return }
             var prune = pruneFirst && (self.archiveRetentionRetryAfter ?? .distantPast) <= Date()
@@ -643,9 +607,7 @@ extension MacSyncEngine {
                                                      completionMarkerDirectory: markerDir)
                 }
                 guard !Task.isCancelled, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
-                // No expiry and no failed deletion: directory and exact-file
-                // events own the next wake, including a deferred read becoming
-                // available. Empty archives need no daily sampling pass.
+                // Without expiry or failed deletion, only exact file events owe a wake; empty archives need no sampling.
                 guard let next = self.archiveRetentionRetryAfter ?? deadline else { return }
                 let delay = next.timeIntervalSince(Date())
                 if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
@@ -654,8 +616,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Metadata only, never file contents. A row past its crossing was
-    /// decided by the prune that crossing armed and does not re-arm it.
+    /// Read only metadata; a crossing already handled by pruning must not re-arm itself.
     nonisolated static func nextArchiveRetentionDeadline(
         in dirs: [URL],
         after now: Date,
@@ -686,7 +647,9 @@ extension MacSyncEngine {
             if totalBytes > maxBytes { deadlines.append(now) }
         }
         for transactionDirectory in transactionDirectories {
-            guard !Task.isCancelled, let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            guard !Task.isCancelled, let items = try? fm.contentsOfDirectory(
+                at: transactionDirectory,
+                includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
             for item in items where !Task.isCancelled {
                 if let due = transactionRetentionCrossing(at: item), due > now {
                     deadlines.append(due)
@@ -705,7 +668,7 @@ extension MacSyncEngine {
         return deadlines.min()
     }
 
-    /// A row's clock is its last write, which is when its updatedAt was set.
+    // Last write is the row's updatedAt, so it owns the retention clock.
     nonisolated static func transactionRetentionCrossing(at url: URL) -> Date? {
         guard url.pathExtension == "json",
               let written = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
@@ -713,13 +676,8 @@ extension MacSyncEngine {
         return written.addingTimeInterval(30 * 24 * 60 * 60)
     }
 
-    /// Keep active, uncertain action and unreadable rows. Recovered chats are
-    /// terminal even with an unknown outcome; thirty days exceed their window.
-    /// Contents are read only for a local file or an iCloud item whose
-    /// metadata says it is current: a read of anything else blocks its thread
-    /// until iCloud answers. Unreadable metadata is not readable yet; an item
-    /// not yet current has its download asked for. Its exact file is already
-    /// watched, so content or attribute changes wake the next prune.
+    /// Keep active, uncertain and unreadable actions; recovered chats are terminal and retain 30 days. Read only local/current iCloud contents to avoid
+    /// blocking; request downloads otherwise and let exact-file events resume pruning.
     nonisolated static func isTerminalTransaction(at url: URL) -> Bool {
         guard let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
               let ubiquitous = values.isUbiquitousItem else { return false }
@@ -737,9 +695,7 @@ extension MacSyncEngine {
             || (record.action == "chat" && record.state == "unknown")
     }
 
-    /// Drops completion markers older than the retention floor. A marker only
-    /// matters while a pending file for the same command could still be seen,
-    /// and those are gone after 7 days.
+    /// Thirty-day completion markers outlive the seven-day pending files that could replay a command.
     @discardableResult
     nonisolated static func pruneCompletedUnarchivedMarkers(
         in dir: URL,
@@ -767,13 +723,13 @@ extension MacSyncEngine {
         return failed
     }
 
-    /// nonisolated static — runs the prune scan/delete off the main actor.
+    /// Nonisolated so blocking scan/delete work stays off the main actor.
     @discardableResult
     nonisolated static func pruneArchiveDirs(_ dirs: [URL], transactionDirectories: [URL] = []) -> Bool {
         let fm = FileManager.default
         let now = Date()
         let cutoff = now.addingTimeInterval(-7 * 24 * 3600)
-        let maxBytes: Int = 50 * 1024 * 1024  // 50 MB
+        let maxBytes: Int = 50 * 1024 * 1024
         var failed = false
         func remove(_ url: URL) -> Bool {
             do {
@@ -787,20 +743,21 @@ extension MacSyncEngine {
             }
         }
         for dirURL in dirs {
-            guard let items = try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey], options: []) else { continue }
-            // Prune FILES ONLY — never delete subdirectories. inboxDir's listing
-            // includes the `_rejected` subdir as an item; removeItem on it would
-            // recursively wipe newer rejected files by the folder's own date. The
-            // _rejected dir is pruned as its own entry in `dirs`.
+            guard let items = try? fm.contentsOfDirectory(
+                at: dirURL,
+                includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey],
+                options: []) else { continue }
+            // Prune files only; recursive directory deletion could erase younger rejected entries.
             func isDir(_ u: URL) -> Bool { ((try? u.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false) }
-            // Delete files older than 7 days
             for url in items where !isDir(url) {
                 if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate, created < cutoff {
                     _ = remove(url)
                 }
             }
-            // Cap at 50 MB — delete oldest first
-            let remaining = ((try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey], options: [])) ?? [])
+            let remaining = ((try? fm.contentsOfDirectory(
+                at: dirURL,
+                includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey],
+                options: [])) ?? [])
                 .compactMap { url -> (url: URL, created: Date, size: Int)? in
                     let values = try? url.resourceValues(forKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey])
                     guard values?.isDirectory != true else { return nil }
@@ -813,7 +770,9 @@ extension MacSyncEngine {
             }
         }
         for transactionDirectory in transactionDirectories {
-            guard let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]) else { continue }
+            guard let items = try? fm.contentsOfDirectory(
+                at: transactionDirectory,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]) else { continue }
             for item in items {
                 if let due = transactionRetentionCrossing(at: item), due <= now, isTerminalTransaction(at: item) {
                     _ = remove(item)

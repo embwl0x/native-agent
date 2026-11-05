@@ -20,9 +20,8 @@ extension SwiftNativeOnboardingClient {
         return nil
     }
     static func canonicalPath(_ url: URL) -> String {
-        // Keep the transaction identity stable even when the target directory
-        // did not exist at preparation time. Resolving symlinks can change the
-        // string after directory creation and falsely orphan a valid manifest.
+        // Keep the transaction identity stable even when the target directory did not exist at preparation time. Resolving symlinks can change the string after
+        // directory creation and falsely orphan a valid manifest.
         url.standardizedFileURL.path
     }
     static func sha256(_ data: Data) -> String {
@@ -45,8 +44,7 @@ extension SwiftNativeOnboardingClient {
         ]
         return sha256(Data(components.joined(separator: "\u{0}").utf8))
     }
-    /// USER.md is either the onboarding template or a bounded memory projection with an optional preamble.
-    /// Its content identifies the writer, never completion.
+    /// USER.md is either the onboarding template or a bounded memory projection with an optional preamble. Its content identifies the writer, never completion.
     enum UserDocShape: Equatable {
         /// No file. Nothing to protect, nothing to prove.
         case absent
@@ -55,9 +53,8 @@ extension SwiftNativeOnboardingClient {
         /// Foreign text or edited preamble; reset must back it up before replacement.
         case authored
     }
-    /// Classify only the generator's exact section structure as reproducible.
-    /// Foreign headings/comments and malformed markers are authored content.
-    /// A file that is there but cannot be read throws: unreadable is not absent.
+    /// Classify only the generator's exact section structure as reproducible. Foreign headings/comments and malformed markers are authored content. A file that
+    /// is there but cannot be read throws: unreadable is not absent.
     static func classifyUserDoc(at path: URL) throws -> UserDocShape {
         guard FileManager.default.fileExists(atPath: path.path) else { return .absent }
         let text: String
@@ -115,9 +112,8 @@ extension SwiftNativeOnboardingClient {
         }
         try atomicWriteData(data, to: path)
     }
-    /// Idempotently commit one staged target. Existing intended bytes prove a
-    /// previous attempt reached this step. Otherwise only the exact base bytes
-    /// observed at transaction preparation may be replaced.
+    /// Idempotently commit one staged target. Existing intended bytes prove a previous attempt reached this step. Otherwise only the exact base bytes observed
+    /// at transaction preparation may be replaced.
     static func ensureCommitted(_ intent: OnboardingTargetIntent, to path: URL) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: path.path) {
@@ -155,7 +151,6 @@ extension SwiftNativeOnboardingClient {
             throw OnboardingError.ioFailure("\(path.lastPathComponent) failed post-write verification")
         }
     }
-    /// UTC stamp: yyyyMMddTHHmmssZ, without fractional seconds.
     static func utcStamp() -> String {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!
@@ -164,7 +159,6 @@ extension SwiftNativeOnboardingClient {
                       comps.year ?? 1970, comps.month ?? 1, comps.day ?? 1,
                       comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0)
     }
-    /// Create missing parent directories with default permissions.
     func ensureDirectoryExists(_ dir: URL) throws {
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -172,13 +166,10 @@ extension SwiftNativeOnboardingClient {
             throw OnboardingError.ioFailure("mkdir \(dir.path) failed: \(error.localizedDescription)")
         }
     }
-    /// Durable private write shared with the other canonical stores.
     static func atomicWriteText(_ content: String, to path: URL) throws {
         try atomicWriteData(Data(content.utf8), to: path)
     }
-    /// Byte-preserving sibling used by reset backups. Persona files are
-    /// normally UTF-8, but reset is a safety operation and must preserve the
-    /// exact bytes it found rather than normalizing invalid or legacy text.
+    /// Reset backups must preserve exact bytes, including invalid or differently encoded text, so recovery cannot normalize away authored content.
     static func atomicWriteData(_ data: Data, to path: URL) throws {
         do {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)

@@ -5,7 +5,7 @@ import PersistenceCore
 import Privacy
 import ToolRegistry
 import TrustCenter
-// Blueprint: | `ApprovalCardPresentation.swift` | Approval card verb and recipient scope projected from canonical replay arguments and PermissionLaw; no prose inference or draft-retention promise |
+// Blueprint: | `ApprovalCardPresentation.swift` | Scope comes from approved arguments, never prose. |
 
 public struct ApprovalCardPresentation: Sendable {
     public let primaryLabel: String
@@ -20,10 +20,14 @@ public struct ApprovalCardPresentation: Sendable {
         let call = ToolNameAliases.ranCall(replay.toolName, input: replay.input)
         let tool = ToolNameAliases.canonical(call.tool)
         let effect: ToolClass
-        do { effect = try PermissionLaw.toolClass(tool, input: call.input) }
+        // A saved card's presentation holds no running turn; it cannot borrow the viewer's authority.
+        do { effect = try PermissionLaw.toolClass(tool, input: call.input, turn: nil) }
         catch {
             primaryLabel = "Unavailable"
-            scopeLines = ["This action's effect could not be read: \(error.localizedDescription). Repair the action catalog and reopen this card before approving it."]
+            scopeLines = ["""
+                This action's effect could not be read: \(error.localizedDescription). Repair the action catalog and reopen this card before \
+                approving it.
+                """]
             return
         }
         if tool == "agent_connect", call.input["disconnect"] != .bool(true) {
@@ -31,8 +35,7 @@ public struct ApprovalCardPresentation: Sendable {
         } else {
             primaryLabel = effect == .send ? "Send it" : "Go ahead"
         }
-        // Only known send contracts name recipients. Other tools, missing
-        // arguments and reply targets that require a service read stay unnamed.
+        // Only known send contracts name recipients. Other tools, missing arguments and reply targets that require a service read stay unnamed.
         let fields: [(String, String)] = switch tool {
         case "mail_send": [("to", "To"), ("cc", "Cc"), ("bcc", "Bcc")]
         case "messages_send": call.input["thread_id"] == nil

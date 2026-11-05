@@ -3,7 +3,6 @@ import UIKit
 import NativeAgentShared
 
 extension ChatStore {
-    /// Snapshot ingestion owns versions and reconciliation before any surface reads it.
     func refresh(using client: MacBridgeClient) {
         guard Date().timeIntervalSince(lastRefreshAt) >= refreshThrottleSeconds else { return }
         lastRefreshAt = Date()

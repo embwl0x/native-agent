@@ -1,3 +1,4 @@
+import AgentConversations
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -6,7 +7,6 @@ import DoctorChecks
 import PersistenceCore
 import Desk
 import ApprovalInbox
-import WorkshopExecution
 import AgentWorkspace
 import NotificationInbox
 import Privacy
@@ -22,29 +22,27 @@ extension HeartbeatBackgroundWork {
     }
     internal func nextHeartbeatAssessmentDeadline(dataRoot: URL, after now: Date) async -> Date? {
         var deadlines: [Date] = []
-        _ = heartbeatExecutionsIssue(dataRoot: dataRoot, now: now) { deadlines.append($0) }
-        _ = heartbeatErrorBurstIssue(dataRoot: dataRoot, now: now) { deadlines.append($0) }
+        _ = heartbeatJobsIssue(dataRoot: dataRoot, now: now) { deadlines.append($0) }
+        _ = await heartbeatErrorBurstIssue(dataRoot: dataRoot, now: now) { deadlines.append($0) }
         _ = await heartbeatStaleTaskIssue(dataRoot: dataRoot, now: now) { deadlines.append($0) }
         guard !Task.isCancelled else { return nil }
         _ = await heartbeatDurableResidueSummary(dataRoot: dataRoot, now: now) { deadlines.append($0) }
         guard !Task.isCancelled else { return nil }
         return deadlines.filter { $0 > now }.min()
     }
-    /// Composes the heartbeat's deterministic verdict and stable inbox cards.
     public func gatherHeartbeatAssessment(
         dataRoot: URL,
-        now: Date = Date(),
-        bridgeConfigRoot: URL? = nil
+        now: Date = Date()
     ) async -> HeartbeatAssessment {
         var issues: [HeartbeatIssue] = []
 
         let doctor = heartbeatDoctorIssue(dataRoot: dataRoot)
         if let issue = doctor { issues.append(issue) }
 
-        let executions = heartbeatExecutionsIssue(dataRoot: dataRoot, now: now)
-        if let issue = executions { issues.append(issue) }
+        let jobs = heartbeatJobsIssue(dataRoot: dataRoot, now: now)
+        if let issue = jobs { issues.append(issue) }
 
-        let errors = heartbeatErrorBurstIssue(dataRoot: dataRoot, now: now)
+        let errors = await heartbeatErrorBurstIssue(dataRoot: dataRoot, now: now)
         if let issue = errors { issues.append(issue) }
 
         let staleTasks = await heartbeatStaleTaskIssue(dataRoot: dataRoot, now: now)
@@ -52,7 +50,6 @@ extension HeartbeatBackgroundWork {
 
         let residue = await heartbeatDurableResidueSummary(
             dataRoot: dataRoot,
-            bridgeConfigRoot: bridgeConfigRoot,
             now: now
         )
         await reconcileDurableResidueCard(dataRoot: dataRoot, summary: residue, now: now)
@@ -104,7 +101,10 @@ extension HeartbeatBackgroundWork {
             return HeartbeatIssue(
                 id: "doctor-malformed",
                 summary: "Doctor finding ownership is unavailable.",
-                detail: "The body report could not be read, so heartbeat cannot verify the health checklist. Resolve the body report read error before judging failures.",
+                detail: """
+                    The body report could not be read, so heartbeat cannot verify the health checklist. Resolve the body report read error before judging \
+                    failures.
+                    """,
                 priority: 20,
                 actions: []
             )
@@ -126,60 +126,40 @@ extension HeartbeatBackgroundWork {
             actions: []
         )
     }
-    private func heartbeatExecutionsIssue(
+    /// A job of the agent's, a line included, that has not moved for the stuck age looks stuck; the deadline is when the next one would cross it.
+    private func heartbeatJobsIssue(
         dataRoot: URL,
         now: Date,
         deadline: (Date) -> Void = { _ in }
     ) -> HeartbeatIssue? {
-        let executionsDir = dataRoot
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent("executions", isDirectory: true)
-        var stale: [(id: String, title: String, status: String, age: TimeInterval)] = []
-        do {
-            let subs: [URL]
-            do { subs = try FileManager.default.contentsOfDirectory(at: executionsDir,
-                includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) }
-            catch CocoaError.fileReadNoSuchFile { subs = [] }
-            for sub in subs {
-                guard try sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
-                let mp = ExecutionRecordFile.canonicalPath(in: sub)
-                let data = try Data(contentsOf: mp)
-                guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let status = obj["status"] as? String else {
-                    throw PersistenceCoreError.ioFailure("Execution status unreadable at \(mp.path)")
-                }
-                guard ["queued", "running", "blocked_on_approval"].contains(status) else { continue }
-                let updated = obj["updated_at"] as? String
-                let created = obj["created_at"] as? String
-                guard let age = heartbeatAgeSeconds(updatedAt: updated, createdAt: created, now: now,
-                        crossingAge: heartbeatExecutionStuckAge, deadline: deadline) else {
-                    throw PersistenceCoreError.ioFailure("Active execution timestamp unavailable at \(mp.path)")
-                }
-                guard age >= heartbeatExecutionStuckAge else { continue }
-                let id = obj["id"] as? String ?? sub.lastPathComponent
-                let title = obj["title"] as? String ?? id
-                stale.append((id: id, title: title, status: status, age: age))
+        let jobs: [AgentJob]
+        do { jobs = try AgentJobStore(dataRoot: dataRoot).jobs() }
+        catch {
+            return HeartbeatIssue(id: "job-evidence-unavailable", summary: "Job health could not be measured.",
+                detail: "\(error.localizedDescription). Repair agents/jobs.json before judging their health.", priority: 30, actions: [])
+        }
+        var stale: [(job: AgentJob, age: TimeInterval)] = []
+        for job in jobs where !job.state.isTerminal {
+            let age = max(0, now.timeIntervalSince(job.updatedAt))
+            guard age >= heartbeatJobStuckAge else {
+                deadline(job.updatedAt.addingTimeInterval(heartbeatJobStuckAge))
+                continue
             }
-        } catch {
-            return HeartbeatIssue(id: "execution-evidence-unavailable", summary: "Execution health could not be measured.",
-                detail: "\(error.localizedDescription). Repair the execution records before judging their health.", priority: 30, actions: [])
+            stale.append((job, age))
         }
         guard !stale.isEmpty else { return nil }
         let rows = stale.prefix(5).map {
-            "\($0.title) [\($0.status), \(heartbeatCompactAge($0.age)) old]"
+            "\($0.job.isOwn ? "your line" : $0.job.name): \(String($0.job.brief.prefix(60))) [\($0.job.state.rawValue), \(heartbeatCompactAge($0.age)) unmoved]"
         }.joined(separator: "; ")
-        let hasBlocked = stale.contains { $0.status == "blocked_on_approval" }
+        let waits = stale.contains { $0.job.state == .needsYou }
         return HeartbeatIssue(
-            id: "execution-stuck", // compatibility wire ID: persisted in heartbeat status/dedup state
-            summary: "\(stale.count) Desk execution(s) look stuck.",
-            detail: "\(stale.count) Desk execution(s) have been queued/running/blocked longer than \(Int(heartbeatExecutionStuckAge / 3600))h: \(rows).",
+            id: "job-stuck",
+            summary: "\(stale.count) job(s) look stuck.",
+            detail: "\(stale.count) job(s) have not moved for \(Int(heartbeatJobStuckAge / 3600))h: \(rows).",
             priority: 35,
-            actions: hasBlocked
-                ? [HeartbeatCardAction.openApprovals.noticeAction]
-                : []
+            actions: waits ? [HeartbeatCardAction.openApprovals.noticeAction] : []
         )
     }
-    /// "2h 13m" / "13m" / "under 1m".
     public func heartbeatCompactAge(_ seconds: TimeInterval) -> String {
         let total = max(0, Int(seconds.rounded()))
         let hours = total / 3600
@@ -194,14 +174,14 @@ extension HeartbeatBackgroundWork {
         dataRoot: URL,
         now: Date,
         deadline: (Date) -> Void = { _ in }
-    ) -> HeartbeatIssue? {
-        let statuses = ErrorFeeds.scanErrorFeeds(dataRoot: dataRoot, now: now)
+    ) async -> HeartbeatIssue? {
+        let statuses = await ErrorFeeds.scanErrorFeeds(dataRoot: dataRoot, now: now)
         statuses.compactMap(\.earliestExpiry).forEach(deadline)
         let windowMinutes = Int(ErrorFeeds.errorBurstWindow / 60)
         let total = statuses.reduce(0) { $0 + $1.recentCount }
 
         // Error-only sinks can be absent or quiet during healthy operation.
-        // Availability is a file-access fact, not time since the last error.
+        // Availability is a read fact (file or record), not time since the last error.
         let unreadable = statuses.compactMap(\.unavailable)
         if !unreadable.isEmpty {
             return HeartbeatIssue(
@@ -215,7 +195,7 @@ extension HeartbeatBackgroundWork {
         }
         guard total >= ErrorFeeds.errorBurstThreshold else { return nil }
         let samples = statuses
-            .flatMap { status in status.recentLines.map { "[\(status.feed.label)] \($0)" } }
+            .flatMap { status in status.recentLines.map { "[\(status.label)] \($0)" } }
             .suffix(3)
             .map(NativeAgentSecretRedactor.redactText)
             .joined(separator: "\n")
@@ -259,10 +239,7 @@ extension HeartbeatBackgroundWork {
             actions: []
         )
     }
-    /// Read-only review projection over durable state that should not be
-    /// replayed or silently deleted. It is informational rather than a
-    /// heartbeat failure: the old rows may be intentional historical residue,
-    /// but should have one bounded place where they remain visible.
+    /// Durable residue needs one bounded review surface; informational visibility cannot replay or delete its state.
     private func heartbeatAlertBody(primary: HeartbeatIssue, issues: [HeartbeatIssue]) -> String {
         var parts = [primary.detail]
         let others = issues.filter { $0.id != primary.id }
@@ -285,7 +262,5 @@ extension HeartbeatBackgroundWork {
         deadline(date.addingTimeInterval(crossingAge))
         return max(0, now.timeIntervalSince(date))
     }
-    /// Upserts a stable heartbeat-alert card to notifications/inbox.jsonl.
-    /// Card id is keyed by condition, not day, so a flapping condition updates
-    /// one visible card instead of stacking daily duplicates.
+    /// Condition identity keeps a flapping alert on one card rather than creating daily duplicates.
 }

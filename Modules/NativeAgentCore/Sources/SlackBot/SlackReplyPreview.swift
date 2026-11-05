@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `SlackReplyPreview.swift` | `SlackReplyPreview`: latest-value visible reply publication; joins an admitted send before final delivery, without blocking model deltas on the wire |
+// Blueprint: | `SlackReplyPreview.swift` | `SlackReplyPreview`: latest-value publication joins admitted sends before final delivery |
 
 /// One writer for the live reply. Its durable identity belongs to the inbound journal.
 actor SlackReplyPreview {

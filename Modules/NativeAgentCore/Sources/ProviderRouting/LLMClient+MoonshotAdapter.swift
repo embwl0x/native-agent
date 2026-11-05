@@ -4,19 +4,16 @@ import PersistenceCore
 
 // Blueprint: | `LLMClient+MoonshotAdapter.swift` | `MoonshotTransport`: structured Chat Completions, vision/SSE and Kimi reasoning state across tool loops |
 
-/// First-class Moonshot/Kimi adapter over the provider's OpenAI-compatible
-/// Chat Completions surface. Unlike the generic API-key fallthrough, this
-/// preserves structured tool calls, vision inputs, SSE deltas, and Kimi's
-/// required reasoning state across K3/K2.7 tool loops.
+/// Kimi tool loops require retained reasoning state alongside structured calls, images and SSE output.
 public final class MoonshotTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
-    /// This transport sends no output-cap field.
-    public func requestOutputTokens(model: String) throws -> Int { 0 }
+    /// The transport declares no output-cap field.
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
 
     public let providerId = "moonshot"
 
     public static let defaultEndpoint = URL(string: "https://api.moonshot.ai/v1/chat/completions")!
-    /// The default is the provider catalog's first row, or empty when the catalog is empty.
+    /// An empty catalog cannot supply a default model.
     public static var defaultModel: String {
         FirstPartyModelCatalog.models(forProviderID: "moonshot").first?.id ?? ""
     }
@@ -50,20 +47,20 @@ public final class MoonshotTransport: LLMTransport {
         prompt: String,
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
-        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools)
+        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
     }
 
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         // The stream carries the reasoning ledger for tool calls, as a turn's does.
         return try await LLMMessageStreamEvent.reply(collecting:
-            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
+            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
 
@@ -72,7 +69,7 @@ public final class MoonshotTransport: LLMTransport {
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         let session = self.session
         let endpoint = self.endpoint
@@ -88,24 +85,25 @@ public final class MoonshotTransport: LLMTransport {
                     request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
                     applyStreamingLLMHeaders(to: &request)
                     request.httpBody = try JSONSerialization.data(withJSONObject: await self.buildBody(
-                        model: model, messages: messages, system: system, tools: tools, stream: true
+                        model: model, messages: messages, system: system, tools: tools, stream: true, call: call
                     ))
 
                     let started = DispatchTime.now().uptimeNanoseconds
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
-                        (bytes, response) = try await ProviderWire.open(session, request)
+                        (bytes, response) = try await ProviderWire.open(session, request, call: call)
                     } catch {
                         throw mapTransportError(error, fallback: .transient(message: "connection failed: \(endpoint.host ?? "moonshot")"))
                     }
                     defer { bytes.task.cancel() }
                     try await ProviderWire.validateChatCompletions(bytes, response)
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot", retainReasoning: true, diagnosticDataRoot: telemetry.diagnosticDataRoot)
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot", retainReasoning: true, diagnosticDataRoot: telemetry
+                        .diagnosticDataRoot(call: call), call: call)
                     try await decoder.consume(
-                        SSEEventStream(bytes), continuation: continuation,
+                        SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
                         request: request, providerID: providerID, model: model, idPrefix: "moonshot_tool",
-                        started: started, telemetry: telemetry
+                        started: started, telemetry: telemetry, call: call
                     ) { calls, reasoning in
                         if !calls.isEmpty, !reasoning.isEmpty {
                             await ledger.record(reasoning, callIDs: calls.map(\.id))
@@ -116,7 +114,7 @@ public final class MoonshotTransport: LLMTransport {
                     continuation.finish(throwing: error)
                 }
             }
-            ProviderReplyWork.current?.own(task)
+            call.replyWork?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -126,7 +124,7 @@ public final class MoonshotTransport: LLMTransport {
         messages: [LLMMessage],
         system: String?,
         tools: [LLMToolSchema]?,
-        stream: Bool
+        stream: Bool, call: LLMCall
     ) async throws -> [String: Any] {
         var apiMessages: [[String: Any]] = []
         if let system, !system.isEmpty { apiMessages.append(["role": "system", "content": system]) }
@@ -136,7 +134,7 @@ public final class MoonshotTransport: LLMTransport {
         var body: [String: Any] = ["model": model, "messages": apiMessages, "stream": stream]
         if stream { body["stream_options"] = ["include_usage": true] }
         try OpenAITransport.applyTools(to: &body, tools: tools)
-        try applyReasoningControls(to: &body, model: model)
+        try applyReasoningControls(to: &body, model: model, call: call)
         return body
     }
 
@@ -152,16 +150,17 @@ public final class MoonshotTransport: LLMTransport {
     }
 
     /// The wire form is the model row's declaration; an id with no row sends none.
-    private func applyReasoningControls(to body: inout [String: Any], model: String) throws {
+    private func applyReasoningControls(to body: inout [String: Any], model: String, call: LLMCall) throws {
         guard let row = FirstPartyModelCatalog.descriptor(for: model, providerID: "moonshot") else {
-            if LLMCallContext.reasoningEffort != nil {
+            if call.admission?.reasoningEffort != nil {
                 throw LLMError.providerError(message: "Moonshot Think controls for \(model) are unknown. Choose a supported control in Providers.")
             }
             return
         }
-        let requested = LLMCallContext.reasoningEffort?.lowercased()
+        let requested = call.admission?.reasoningEffort?.lowercased()
         if let requested, !row.supportedReasoningEfforts.contains(requested) {
-            throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model) on Moonshot. Choose a supported control in Providers.")
+            throw LLMError.providerError(
+                message: "Think level '\(requested)' is unsupported for \(model) on Moonshot. Choose a supported control in Providers.")
         }
         switch row.reasoningWire {
         case .thinkingSwitch:

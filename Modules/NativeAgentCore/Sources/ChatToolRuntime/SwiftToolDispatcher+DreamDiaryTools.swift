@@ -1,15 +1,4 @@
-// SwiftToolDispatcher+DreamDiaryTools.swift
-// dream_diary_read — read the diary she writes.
-//
-// `inner_state` carries last night's dream residue; this reads the record.
-//
-// A pure local read of her own files
-// under `<dataRoot>/dream_diary/`, no write, no spawn, no network.
-//
-// Reads go through `FileBackedDreamDiary`, the SAME reader the Dreams page
-// uses, so the page and the tool can never disagree about what is in the diary
-// — including its path containment (a `date` can carry no separator and cannot
-// escape the diary dir) and its archive merge.
+// Share FileBackedDreamDiary with the Dreams page so containment, archive merging and visible entries agree.
 
 import DreamREMCycle
 import Foundation
@@ -19,25 +8,21 @@ import PersistenceCore
 extension SwiftToolDispatcher {
 
 
-    /// Weeks of index returned when the caller does not say. Eight weeks is
-    /// about as far back as the diary stays one readable stretch.
+    /// Eight weeks keeps the default index one readable stretch.
     static let dreamDiaryDefaultWeeks = 8
     static let dreamDiaryMaximumWeeks = 52
-    /// Entries scanned for the index/query. The diary holds one file per night,
-    /// so a year is the whole of it and also the reader's own hard clamp.
+    /// One file per night makes a year the full scan and the reader’s hard clamp.
     static let dreamDiaryScanLimit = 365
     static let dreamDiaryQueryDefaultLimit = 10
     static let dreamDiaryQueryMaximumLimit = 25
     static let dreamDiaryExcerptCharacters = 120
-    /// One night's text, bounded. A dream entry is a page; anything past this
-    /// is truncated OUT LOUD rather than quietly cut.
+    /// A dream is a page; any truncation must be disclosed.
     static let dreamDiaryEntryCharacters = 20_000
 
     func impl_dream_diary_read(input: [String: JSONValue]) async throws -> JSONValue {
         let reader = FileBackedDreamDiary(dataRoot: dataRoot)
 
-        // ONE night, by date. Goes first: a date is the most specific ask, and
-        // it is the one shape that must reach the archive by name.
+        // An exact date takes precedence and must reach archived entries by name.
         if let rawDate = optionalString(input, "date"),
            !rawDate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let key = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -72,8 +57,7 @@ extension SwiftToolDispatcher {
                     "note": .string("no diary entry for \(key) — you did not dream that night, or the night was never written"),
                 ].merging(Self.dreamDiaryStorageFields(storage)) { current, _ in current })
             case .entry(let entry, let archived):
-                // The night was read, so the diary is readable — whatever the
-                // rest of it holds.
+                // A successful night read proves readability independently of the rest of the diary.
                 var fields = Self.dreamDiaryEntryJSON(entry, archived: archived)
                 fields["storage"] = .string("readable")
                 return .object(fields)
@@ -81,9 +65,7 @@ extension SwiftToolDispatcher {
         }
 
         let listing = reader.listEntriesChecked(limit: Self.dreamDiaryScanLimit)
-        // A READ FAILURE is not an empty diary. Saying "no dreams" because the
-        // directory could not be listed is the one answer this tool must never
-        // give — she would be told she never dreamt.
+        // An unreadable directory is unknown storage, never evidence of an empty diary.
         if listing.storageUnreadable {
             let said = "your dream diary could not be read just now — this is a read failure, "
                 + "not an empty diary, so do not say you have no entries"
@@ -108,8 +90,6 @@ extension SwiftToolDispatcher {
             ]
             : Self.dreamDiaryStorageFields(listing.storage)
 
-        // TEXT search across the diary. Same verbatim-entry contract as the
-        // by-date read, just several of them, newest first and capped.
         if let rawQuery = optionalString(input, "query"),
            !rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let needle = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -134,7 +114,6 @@ extension SwiftToolDispatcher {
             ]) { _, new in new }.merging(unreadable) { _, carried in carried })
         }
 
-        // The INDEX, grouped the way the Dreams page groups it.
         let weeksAsked = max(1, min(
             Self.dreamDiaryMaximumWeeks,
             Self.jsonInt(input["weeks"]) ?? Self.dreamDiaryDefaultWeeks))
@@ -165,9 +144,7 @@ extension SwiftToolDispatcher {
         var count: Int { rows.count }
     }
 
-    /// One night, verbatim. `content` is her own writing and is returned as
-    /// written — the same contract `studio_recall` keeps with the journal — only
-    /// bounded, and the bound is stated when it bites.
+    /// Return the writer’s words verbatim, disclosing any bound that truncates them.
     static func dreamDiaryEntryJSON(_ entry: DreamEntry, archived: Bool) -> [String: JSONValue] {
         let text = entry.content ?? ""
         let bounded = String(text.prefix(dreamDiaryEntryCharacters))
@@ -186,7 +163,6 @@ extension SwiftToolDispatcher {
         return out
     }
 
-    /// Render the availability established by the diary reader.
     static func dreamDiaryStorageFields(_ storage: String) -> [String: JSONValue] {
         if storage == "missing" {
             return [
@@ -207,10 +183,7 @@ extension SwiftToolDispatcher {
         return ["storage": .string("readable")]
     }
 
-    /// One night in the index: the night's dream as Today and the Dreams page
-    /// name it (the latest, by `DreamNight`), and every dream of the night when
-    /// a later run added one — a re-dream lives inside the night it is about,
-    /// so there is no separate day for it.
+    /// Group added dreams inside their original night; rerunning a night does not create a separate day.
     static func dreamDiaryIndexRow(_ entry: DreamEntry, activeFilenames: Set<String>) -> JSONValue {
         let night = entry.night
         var row: [String: JSONValue] = [
@@ -229,7 +202,6 @@ extension SwiftToolDispatcher {
         return .object(row)
     }
 
-    /// The index, grouped by the Dreams page's own rule (`DreamDiaryWeeks`).
     static func dreamDiaryWeeks(
         _ entries: [DreamEntry],
         activeFilenames: Set<String>,

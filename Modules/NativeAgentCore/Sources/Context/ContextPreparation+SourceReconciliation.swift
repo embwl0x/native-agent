@@ -6,7 +6,7 @@ import TrustCenter
 import CryptoKit
 import GRDB
 import PersonaEngine
-// Blueprint: | `ContextPreparation+SourceReconciliation.swift` | Source compilation and generation publication through one admission gate; committed source-read faults retain source identity before a first row and reach health and turn selection; checked reads recover degradation |
+// Blueprint: | `ContextPreparation+SourceReconciliation.swift` | source compilation, checked faults and gated generation publication |
 
 extension ContextPreparation {
     struct PendingRegistration: Sendable {
@@ -35,9 +35,8 @@ extension ContextPreparation {
         _ = await reconcileSourceChanges(changes)
     }
 
-    /// Request-scoped completion for callers that fence a foreground choice
-    /// on publication. Health is not a completion receipt: cancellation keeps
-    /// health unchanged, and another request may publish while this one fails.
+    /// Request-scoped completion for callers that fence a foreground choice on publication. Health is not a completion receipt: cancellation keeps health
+    /// unchanged, and another request may publish while this one fails.
     public func reconcileSourceChanges(_ changes: [DerivedSourceChange]) async -> Bool {
         guard !reconciliationClosed, mode != .off, !changes.isEmpty, !Task.isCancelled else { return false }
         let lifecycleID = self.lifecycleID
@@ -51,13 +50,11 @@ extension ContextPreparation {
         let registrationChanges = semanticChanges.filter {
             !projectionNamespaces.contains($0.namespace)
         }
-        // An unrelated candidate database must not refresh discovery, acquire
-        // a publication request ID, or supersede pending live-owner demand.
+        // An unrelated candidate database must not refresh discovery, acquire a publication request ID, or supersede pending live-owner demand.
         guard !registrationChanges.isEmpty || !invalidatedProjectionIDs.isEmpty else { return true }
 
-        // Projection-owned invalidations do not reread every other compiled
-        // source. A Workshop status edge must not rescan/embed MemoryV2, and a
-        // memory write must not replay Desk. Both remain background rebuilds.
+        // Projection-owned invalidations do not reread every other compiled source. A Desk edge must not rescan/embed MemoryV2, and a memory write
+        // must not replay Desk. Both remain background rebuilds.
         if registrationChanges.isEmpty, !invalidatedProjectionIDs.isEmpty {
             return await reconcile(
                 registrations: [],
@@ -87,9 +84,8 @@ extension ContextPreparation {
         }
         let completed: Bool
         if requiresFullReconciliation {
-            // Discovery already refreshed this request's complete registry.
-            // Reusing that snapshot avoids a second persona/catalog read pass
-            // while still rebuilding every compiled projection on a full edge.
+            // Discovery already refreshed this request's complete registry. Reusing that snapshot avoids a second persona/catalog read pass while still
+            // rebuilding every compiled projection on a full edge.
             completed = await reconcile(
                 registrations: all,
                 reason: "direct_invalidation",
@@ -227,8 +223,7 @@ extension ContextPreparation {
         return await commit(candidate)
     }
 
-    /// `stopWhenSuperseded`: a newer request has taken over this batch's
-    /// demand and its commit would be refused, so stop between sources.
+    /// `stopWhenSuperseded`: a newer request has taken over this batch's demand and its commit would be refused, so stop between sources.
     private func checkCandidateAdmission(_ requestID: UInt64, enabled: Bool) throws {
         if enabled, reconciliationClosed || Task.isCancelled || requestID != nextReconciliationRequestID {
             throw CancellationError()
@@ -261,9 +256,8 @@ extension ContextPreparation {
         let authoritativeSources = await registry.authoritativeSourceIDsByOwner()
         try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
         var changedSources: [ContextCompiledSource] = []
-        // Discovery can remove a registration before this loop sees it.
-        // Retire only sources whose owner explicitly supplied a complete
-        // inventory, including empty inventories after restart.
+        // Discovery can remove a registration before this loop sees it. Retire only sources whose owner explicitly supplied a complete inventory, including
+        // empty inventories after restart.
         var removedSourceIDs = Set(previousBySource.compactMap { sourceID, source in
             guard let currentIDs = authoritativeSources[source.descriptor.owner],
                   !currentIDs.contains(sourceID) else { return nil as ContextSourceID? }
@@ -315,9 +309,8 @@ extension ContextPreparation {
             }
         }
 
-        // SQLite may have advanced before a mirror/arena failure retained the
-        // live generation. Rebuild projection metadata against that durable
-        // baseline before a selective retry can accept it.
+        // SQLite may have advanced before a mirror/arena failure retained the live generation. Rebuild projection metadata against that durable baseline before
+        // a selective retry can accept it.
         let projectionIdentifiers = active?.generation.id != activeStoredGeneration?.generation.id
             ? Set(compiledProjectionProviders.map(\.projectionIdentifier))
             : batch.compiledProjectionIdentifiers
@@ -364,8 +357,7 @@ extension ContextPreparation {
 
         do {
             var candidate = candidate
-            // Compilation suspends outside the publication gate. An earlier
-            // publisher may have replaced its baseline while this diff waited.
+            // Compilation suspends outside the publication gate. An earlier publisher may have replaced its baseline while this diff waited.
             if try await store.activeGeneration()?.id != candidate.baselineGenerationID {
                 var compileFailures: [ContextSourceID: String] = [:]
                 candidate = try await makeCandidate(for: candidate.batch, compileFailures: &compileFailures)
@@ -436,8 +428,7 @@ extension ContextPreparation {
             await pruneStoreIfDue()
             return !Task.isCancelled
         } catch is CancellationError {
-            // A cancelled caller must not mint an orange health incident or a
-            // persistent degradation. Pending demand remains retryable.
+            // A cancelled caller must not mint an orange health incident or a persistent degradation. Pending demand remains retryable.
             return false
         } catch {
             recordReconciliationFailure(error)
@@ -445,8 +436,7 @@ extension ContextPreparation {
         }
     }
 
-    /// Make `stored` the generation turns read: its mirrors, arena snapshot
-    /// and projection identities publish together or not at all.
+    /// Make `stored` the generation turns read: its mirrors, arena snapshot and projection identities publish together or not at all.
     func activate(_ stored: ContextStoredGeneration, requestID: UInt64,
                   readFailures: [SourceReadOwner: [ContextSourceID: String]]? = nil) async throws {
         let mirrors = try await mirrorProvider.requiredDocumentMirrors()
@@ -551,11 +541,9 @@ extension ContextPreparation {
     private func recordReconciliationFailure(_ error: any Error) {
         lastError = String(describing: error)
         reconciliationFailure = lastError
-        // Failed discovery/health demand supersedes any older publisher too.
-        // Reuse the admission owner's existing request identity; no second clock.
+        // Failed discovery/health demand supersedes any older publisher too. Reuse the admission owner's existing request identity; no second clock.
         nextReconciliationRequestID &+= 1
-        // Leave failed demand pending. A later external reconciliation will
-        // coalesce and retry it without scheduling an immediate retry loop.
+        // Leave failed demand pending. A later external reconciliation will coalesce and retry it without scheduling an immediate retry loop.
     }
 
     func refreshWatchedDirectories() async {

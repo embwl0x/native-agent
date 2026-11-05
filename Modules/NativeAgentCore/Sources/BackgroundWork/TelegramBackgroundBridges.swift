@@ -16,7 +16,7 @@ public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
         self.memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
     }
 
-    public func remember(text: String, source: String) async throws -> String {
+    public func remember(text: String, source: String, turn: Turn) async throws -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TelegramBotError.invalidRequest }
         let record = try await memory.store(
@@ -25,12 +25,13 @@ public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
             metadata: .object([
                 "surface": .string("telegram"),
                 "command": .string("/remember"),
-            ])
+            ]),
+            context: MemoryWriteContext(turn: turn, senseReads: nil)
         )
         return record.id
     }
 
-    public func note(text: String, kind: String, source: String) async throws -> String {
+    public func note(text: String, kind: String, source: String, turn: Turn) async throws -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw TelegramBotError.invalidRequest }
         let resolvedKind = kind.isEmpty ? "telegram_note" : kind
@@ -44,7 +45,8 @@ public struct TelegramMemoryWriterBridge: TelegramMemoryWriteRef, Sendable {
                 "importance": .double(0.5),
                 "surface": .string("telegram"),
                 "command": .string("/note"),
-            ])
+            ]),
+            context: MemoryWriteContext(turn: turn, senseReads: nil)
         )
         return record.id
     }

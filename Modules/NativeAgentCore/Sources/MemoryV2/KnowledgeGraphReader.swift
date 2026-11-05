@@ -1,23 +1,13 @@
-// Checked reads from the canonical MemoryV2 SQLite graph. Missing or unreadable storage throws.
-//
-// Checked graph read envelopes:
-//   all  -> {"entities": [...], "edges": [...], "total_entities", "total_edges", "page"}
-//   search -> {"results": [...]}
-//   entity -> {"entity": {...}|null, "edges": [...], "neighbors": {...}}
-// Entity/edge envelopes project the canonical row columns and checked metadata,
-// so the Mac decode models (KGEntity / KGEntityResponse /
-// KGSearchResponse / KGNeighborsResponse) decode them identically.
-//
+// Read canonical graph rows through checked envelopes shared by Mac decoders; missing or unreadable storage throws.
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `KnowledgeGraphReader.swift` | `SwiftNativeKnowledgeGraphReader`: one canonical SQLite admission for bounded single and batched reads and optional entity enrichment |
+// Blueprint: | `KnowledgeGraphReader.swift` | `SwiftNativeKnowledgeGraphReader`: bounded checked canonical reads |
 
 // MARK: - Errors
 
 public enum KnowledgeGraphReadError: Error, LocalizedError, Sendable {
-    /// The backing store exists but could not be read. The associated detail
-    /// is human-renderable (KnowledgeGraphView shows it verbatim).
+    /// Surface unreadable storage detail verbatim to the user.
     case storeUnreadable(String)
     case malformedEnvelope(String)
     case paginationLimitExceeded(Int)
@@ -40,7 +30,6 @@ public enum KnowledgeGraphReadError: Error, LocalizedError, Sendable {
     }
 }
 
-/// Entity lookup yields a neighbors envelope or an explicit not-found result.
 public enum KnowledgeGraphEntityResult: Sendable {
     case found(JSONValue)
     case notFound
@@ -49,7 +38,6 @@ public enum KnowledgeGraphEntityResult: Sendable {
 // MARK: - SwiftNative impl
 
 public struct SwiftNativeKnowledgeGraphReader: Sendable {
-    /// Absolute path to the canonical memory.sqlite.
     public let graphPath: URL
 
     public init(graphPath: URL) {
@@ -97,7 +85,6 @@ public struct SwiftNativeKnowledgeGraphReader: Sendable {
 
 // MARK: - Factory
 
-/// Returns the checked reader for the selected graph or the default data root.
 public func makeKnowledgeGraphReader(
     graphPath: URL? = nil
 ) -> SwiftNativeKnowledgeGraphReader {

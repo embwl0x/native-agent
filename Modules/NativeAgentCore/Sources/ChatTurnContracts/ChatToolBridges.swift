@@ -1,13 +1,11 @@
 import NativeAgentCore
 import PersistenceCore
 import Foundation
-// Blueprint: | `ChatToolBridges.swift` | `PureToolArgumentValidating` protocol; `argumentRefusal`; MacIntegrationToolBridge requires the requesting data root for due-reminders |
+// Blueprint: | `ChatToolBridges.swift` | `PureToolArgumentValidating`; `argumentRefusal`; Execution-parser preflight without I/O |
 
-/// Optional argument validation owned by the executor. Implementations must use
-/// their execution parser, perform no I/O or permission requests, and return the
-/// same actionable error. Nil means these preconditions accept the arguments.
+/// Use the execution parser without I/O or permission requests so preflight and execution return the same actionable error.
 public protocol PureToolArgumentValidating: Sendable {
-    func argumentRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue?
+    func argumentRefusal(tool: String, input: [String: JSONValue], turn: Turn) async -> JSONValue?
 }
 
 // MARK: - MacIntegrationToolBridge
@@ -26,85 +24,54 @@ public protocol MacIntegrationToolBridge: Sendable {
     func phoneRequest(input: [String: JSONValue]) async throws -> JSONValue
     func spotlightSearch(input: [String: JSONValue]) async throws -> JSONValue
 
-    /// Search the user's local Contacts (CNContactStore). Read.
     func contactsSearch(input: [String: JSONValue]) async throws -> JSONValue
-    /// Create a new contact or update an existing one (identifier optional). Write.
     func contactsCreateOrUpdate(input: [String: JSONValue]) async throws -> JSONValue
 
-    /// List recent messages from Apple Mail's primary inbox. Read.
     func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue
     func mailAttachment(input: [String: JSONValue]) async throws -> (filename: String, data: Data)
     func mailReadBatch(input: [String: JSONValue]) async throws -> JSONValue
     func mailTriageBatch(input: [String: JSONValue]) async throws -> JSONValue
-    /// Search Apple Mail across mailboxes. Read.
     func mailSearch(input: [String: JSONValue]) async throws -> JSONValue
     func mailSenders(input: [String: JSONValue]) async throws -> JSONValue
-    /// Compose and send an email through Apple Mail. Write.
     func mailSend(input: [String: JSONValue]) async throws -> JSONValue
 
-    /// List recent iMessage threads. Read.
     func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue
-    /// Send an iMessage to a phone or email handle. Write.
     func messagesSend(input: [String: JSONValue]) async throws -> JSONValue
 
-    /// Search Apple Notes by query. Read.
     func notesSearch(input: [String: JSONValue]) async throws -> JSONValue
-    /// Create a new Apple Note in an optional folder. Write.
     func notesCreate(input: [String: JSONValue]) async throws -> JSONValue
 
-    /// Report what Apple Music is currently playing. Read.
     func musicNowPlaying(input: [String: JSONValue]) async throws -> JSONValue
-    /// Control Apple Music playback (play / pause / toggle / next / previous). Write.
     func musicControl(input: [String: JSONValue]) async throws -> JSONValue
 
     // Sensitive writes default off in MacIntegrationPermissionStore.
 
-    // EventKit writes
-    /// Create a new EKEvent in the user's Calendar. Write.
     func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue
-    /// Modify an existing EKEvent (by EKEvent.eventIdentifier). Write.
     func calendarModifyEvent(input: [String: JSONValue]) async throws -> JSONValue
-    /// Delete one exact calendar occurrence, with title/start preconditions. Write.
+    /// Exact occurrence and title/start preconditions prevent deleting a different event.
     func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue
-    /// Create a new EKReminder in the user's Reminders. Write.
     func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue
     func remindersListRename(input: [String: JSONValue]) async throws -> JSONValue
     func remindersListCreate(input: [String: JSONValue]) async throws -> JSONValue
-    /// Mark an EKReminder complete by EKReminder.calendarItemIdentifier. Write.
     func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue
     func remindersDelete(input: [String: JSONValue]) async throws -> JSONValue
 
-    // Mail manage (AppleScript-backed)
-    /// Mark a Mail message read. Write.
     func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue
-    /// Archive a Mail message. Write.
     func mailArchive(input: [String: JSONValue]) async throws -> JSONValue
-    /// Delete a Mail message. Write.
     func mailDelete(input: [String: JSONValue]) async throws -> JSONValue
-    /// Reply to a Mail message. Write.
     func mailReply(input: [String: JSONValue]) async throws -> JSONValue
     func mailDraft(input: [String: JSONValue]) async throws -> JSONValue
 
-    // Notes update (AppleScript-backed)
-    /// Update or move an exact Apple Note to Recently Deleted. Write.
     func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue
 
-    // Music library (read)
-    /// Search the user's Apple Music library (track/artist/album). Read.
     func musicSearchLibrary(input: [String: JSONValue]) async throws -> JSONValue
-    /// Page through the user's Apple Music library tracks. Read.
     func musicListLibrary(input: [String: JSONValue]) async throws -> JSONValue
-    /// Page through the user's Apple Music playlists. Read.
     func musicListPlaylists(input: [String: JSONValue]) async throws -> JSONValue
 
-    // Contacts delete
-    /// Delete a contact by CNContact.identifier. Write.
     func contactsDelete(input: [String: JSONValue]) async throws -> JSONValue
 
-    // Scheduler (no read axis)
-    /// List queued/scheduled TriggerScheduler jobs. Write (no read axis on scheduler).
+    // Scheduler access has no read axis; listing jobs requires write permission.
     func schedulerListJobs(input: [String: JSONValue]) async throws -> JSONValue
-    /// Create a new TriggerScheduler job. Write.
     func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue
     func schedulerCancelJob(input: [String: JSONValue]) async throws -> JSONValue
     func schedulerSetJobEnabled(input: [String: JSONValue], enabled: Bool) async throws -> JSONValue

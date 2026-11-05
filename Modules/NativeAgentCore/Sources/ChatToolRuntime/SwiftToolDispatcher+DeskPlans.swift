@@ -18,12 +18,11 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher+DeskPlans.swift` | `SwiftToolDispatcher`: Desk plan construction through locked create-or-reuse, validated batch-position dependencies, ordered child writes and retained identity/operation receipts on partial writes or failed readback |
+// Blueprint: | `SwiftToolDispatcher+DeskPlans.swift` | `SwiftToolDispatcher`; locked plans; partial-write receipts |
 
 extension SwiftToolDispatcher {
-    /// Create or extend a parent with ordered children, dependency edges and defer dates.
-    /// Bare integers in blocked_on are batch positions; other tokens resolve live Desk references.
-    /// Wire top-level bare numbers afterward with desk_blocked_on; mid-batch refusals report partial writes.
+    /// Bare blocked_on integers are batch positions; wire top-level numbers afterward with desk_blocked_on. Mid-batch refusals must retain partial-write
+    /// evidence.
     func impl_desk_breakdown(input: [String: JSONValue]) async throws -> JSONValue {
         guard case .array(let rawChildren)? = input["children"], !rawChildren.isEmpty else {
             throw deskInvalid("children", reason: "desk_breakdown: children must be a non-empty array")
@@ -46,7 +45,10 @@ extension SwiftToolDispatcher {
             let unknown = obj.keys.filter { !allowedChildKeys.contains($0) }.sorted()
             guard unknown.isEmpty else {
                 throw deskInvalid("children.\(idx).\(unknown[0])",
-                    reason: "desk_breakdown: child \(idx + 1) has unknown field(s) \(unknown.joined(separator: ", ")) — allowed: title, summary, blocked_on, defer_until. For ordering, put the blocking sibling positions in blocked_on (e.g. \"1,2\" or [1,2]).")
+                    reason: """
+                        desk_breakdown: child \(idx + 1) has unknown field(s) \(unknown.joined(separator: ", ")) — allowed: title, summary, \
+                        blocked_on, defer_until. For ordering, put the blocking sibling positions in blocked_on (e.g. \"1,2\" or [1,2]).
+                        """)
             }
             func str(_ k: String) -> String? {
                 if case .string(let s)? = obj[k] { return s.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -62,7 +64,6 @@ extension SwiftToolDispatcher {
                     switch entry {
                     case .string(let s): tokens.append(s)
                     case .int(let i): tokens.append(String(i))
-                    // An integral JSON double is an integer position.
                     case .double(let d) where d == d.rounded() && d.magnitude < 1_000_000:
                         tokens.append(String(Int(d)))
                     default:
@@ -85,7 +86,7 @@ extension SwiftToolDispatcher {
                 deferUntil: (str("defer_until")?.isEmpty == false) ? str("defer_until") : nil
             ))
         }
-        // Validate batch positions before any write.
+        // Validate positions before writing so invalid edges leave no partial plan.
         for (idx, spec) in specs.enumerated() {
             for token in spec.blockedOn {
                 if let pos = Int(token) {
@@ -110,7 +111,6 @@ extension SwiftToolDispatcher {
         var committedOperations: [JSONValue] = []
         let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let parentRaw, !parentRaw.isEmpty {
-            // Graft mode: attach the new sub-items to an existing item.
             let state = try await store.liveState()
             parentHandle = try resolveDeskRef(parentRaw, in: state, field: "parent")
             guard let parentItem = state.items.first(where: { $0.handle == parentHandle }) else {
@@ -214,10 +214,12 @@ extension SwiftToolDispatcher {
             }
         }
 
-        // The numbered plan + what's actionable right now, aliases only.
         let state: DeskState
         do { state = try await store.liveState() }
-        catch { return partial("final plan readback unavailable: \(error.localizedDescription). The committed identities are retained; read them before repeating this call.") }
+        catch { return partial("""
+            final plan readback unavailable: \(error.localizedDescription). The committed identities are retained; read them before repeating \
+            this call.
+            """) }
         let plan = DeskSequencing.compute(state)
         let byHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
         var lines: [String] = []
@@ -239,7 +241,8 @@ extension SwiftToolDispatcher {
                 "committed_operations": .array(committedOperations),
                 "plan": .array(lines.map { .string($0) }),
                 "ready_now": .array(readyNow.map { .string($0) }),
-                "confirmation": .string("campaign \(parentAlias) already live · added \(addedHandles.count) missing step(s), \(reusedSteps.count) already open"),
+                "confirmation": .string(
+                    "campaign \(parentAlias) already live · added \(addedHandles.count) missing step(s), \(reusedSteps.count) already open"),
             ])
         }
         return .object([
@@ -250,7 +253,10 @@ extension SwiftToolDispatcher {
             "committed_operations": .array(committedOperations),
             "plan": .array(lines.map { .string($0) }),
             "ready_now": .array(readyNow.map { .string($0) }),
-            "confirmation": .string("campaign \(parentAlias) · \(createdHandles.count) sub-items · ready now: \(readyNow.isEmpty ? "none" : readyNow.joined(separator: ", "))"),
+            "confirmation": .string("""
+                campaign \(parentAlias) · \(createdHandles.count) sub-items · ready now: \
+                \(readyNow.isEmpty ? "none" : readyNow.joined(separator: ", "))
+                """),
         ])
     }
 }

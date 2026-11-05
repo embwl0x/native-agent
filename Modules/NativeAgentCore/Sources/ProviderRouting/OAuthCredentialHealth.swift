@@ -2,8 +2,7 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `OAuthCredentialHealth.swift` | Secret-free maintenance projection of adapter-owned expiry, refresh binding and readiness verdicts |
 
-/// Secret-free credential metadata. No expiry means no scheduled expiry, not
-/// an expired token or proof that a remote service will accept it.
+/// Secret-free credential metadata. No expiry means no scheduled expiry, not an expired token or proof that a remote service will accept it.
 public struct OAuthCredentialHealth: Sendable {
     public let configured: Bool
     public let expiresAt: Date?

@@ -1,14 +1,7 @@
 import Foundation
-// Blueprint: | `NotificationChannelPreference.swift` | Shared phone, Telegram and native banner preferences read by delivery claim admission; Settings writes the same keys |
+// Blueprint: | `NotificationChannelPreference.swift` | Shared delivery-admission preferences. |
 
-/// Which ways out the app is allowed to use when it reaches for a person.
-///
-/// AttentionRouter.policy selects the destination. Its ledger settles an off
-/// channel as suppressed; it never selects another channel because one is off.
-/// Native banner admission reads inApp at that same claim boundary.
-///
-/// Every channel ships ON, so an install that never touches these behaves
-/// exactly as it did before they existed.
+/// Suppress disabled destinations at claim admission; policy never selects another channel because one is off.
 public enum NotificationChannelPreference {
     public static let pushKey = "nativeagent.notify.channel.push"
     public static let telegramKey = "nativeagent.notify.channel.telegram"

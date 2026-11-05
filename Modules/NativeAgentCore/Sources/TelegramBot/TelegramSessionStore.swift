@@ -6,7 +6,7 @@ import PersonaEngine
 import TurnTrace
 import Transcripts
 
-// Blueprint: | `TelegramSessionStore.swift` | `TelegramSessionStore`: locked session mint/adoption and delivery mapping with exact resolution traces; the shared anchor selects the owner's ordinary conversation; owner resume/list admission requires a live direct row before binding |
+// Blueprint: | `TelegramSessionStore.swift` | `TelegramSessionStore`: locked mint/adoption; shared anchor selects owner DM |
 
 public struct TelegramSessionStatus: Sendable, Equatable {
     public let chatId: Int
@@ -55,9 +55,15 @@ public enum TelegramSessionStoreError: LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .anchorSelectionRefused(let reason):
-            return "telegram_conversation_selection_failed: The shared conversation selection was refused (\(reason)). Read /session before trying another selection."
+            return """
+                telegram_conversation_selection_failed: The shared conversation selection was refused (\(reason)). Read /session \
+                before trying another selection.
+                """
         case .sessionStorageUnavailable:
-            return "telegram_conversation_store_unavailable: Conversation bindings cannot be read. Repair telegram/session_map.json before using /resume; inspect the conversation list before changing bindings."
+            return """
+                telegram_conversation_store_unavailable: Conversation bindings cannot be read. Repair telegram/session_map.json \
+                before using /resume; inspect the conversation list before changing bindings.
+                """
         case .missingSessionId:
             return "telegram_conversation_id_required: Send /sessions, then /resume <id> with a conversation ID."
         case .sessionNotFound(let id):
@@ -65,7 +71,10 @@ public enum TelegramSessionStoreError: LocalizedError, Sendable, Equatable {
         case .sessionNotResumable(let id):
             return "telegram_conversation_not_resumable: '\(id)' is not a live direct conversation. Send /sessions for resumable conversations."
         case .ambiguousSessionPrefix(let prefix, let matches):
-            return "telegram_conversation_ambiguous: '\(prefix)' matches \(matches.prefix(5).joined(separator: ", ")). Send /resume with a longer conversation ID."
+            return """
+                telegram_conversation_ambiguous: '\(prefix)' matches \(matches.prefix(5).joined(separator: ", ")). Send /resume \
+                with a longer conversation ID.
+                """
         }
     }
 }
@@ -81,12 +90,10 @@ public struct TelegramSessionStore: Sendable {
         let activityAt = Date()
         let chatKey = Self.chatKey(destination)
         if try isOwnerDestination(destination) {
-            // The map records the session used for delivery recovery; only the
-            // shared anchor selects the owner's ordinary direct conversation.
+            // The map records the session used for delivery recovery; only the shared anchor selects the owner's ordinary direct conversation.
             let resolved = try await patchChatMap(chatKey: chatKey) { entry -> (id: String, resolution: SessionIdentityTrace.Resolution) in
                 let initialSession: String?
-                // The map can hold a thread an invalid anchor once named; it
-                // stands only while it may still be his conversation.
+                // Retain an uncertain anchor's thread only while it may still belong to the person's conversation.
                 if case .string(let id)? = entry["activeSessionId"],
                    ConversationAnchor.mayAnchor(id, dataRoot: dataRoot) { initialSession = id }
                 else { initialSession = nil }
@@ -122,8 +129,7 @@ public struct TelegramSessionStore: Sendable {
         }
         // Mint or adopt the session inside the chat-map lock so concurrent first messages agree.
         let initialSessionID = Self.sourceKey(destination)
-        // The closure runs inside the flock on another executor, so it reports
-        // BOTH facts through its return value rather than mutating a capture.
+        // The closure runs inside the flock on another executor, so it reports BOTH facts through its return value rather than mutating a capture.
         let outcome = try await patchChatMap(chatKey: chatKey) { entry -> (id: String, adopted: Bool) in
             if case .string(let existing)? = entry["activeSessionId"] {
                 let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -137,7 +143,6 @@ public struct TelegramSessionStore: Sendable {
         }
         let resolved = outcome.id
         let adopted = outcome.adopted
-        // Create the row for the session selected under the lock.
         try await ensureSessionRow(id: resolved, destination: destination, title: Self.sessionTitle(destination))
         try await publishAnchor(sessionId: resolved, destination: destination, activityAt: activityAt)
         emitIdentityTrace(
@@ -160,18 +165,14 @@ public struct TelegramSessionStore: Sendable {
                 entry["updatedAt"] = .string(Self.nowString())
             }
         }
-        // `/new` is a REAL new session — User uses it to clear her head — and
-        // the new one becomes the anchor. The previous session is untouched and
-        // stays reachable (`/resume`, the Mac sidebar, session search).
+        // A new session becomes the shared anchor while the previous conversation remains reachable.
         try await publishAnchor(sessionId: sessionId, destination: destination, activityAt: activityAt)
         emitIdentityTrace(sessionId: sessionId, destination: destination, resolvedBy: .minted)
         return sessionId
     }
 
     // MARK: - Anchor + identity instrumentation
-    //
-    // The owner's DM consumes the shared anchor. Explicit session selection
-    // publishes it; groups and other people's conversations cannot move it.
+    // The owner's DM consumes the shared anchor. Explicit session selection publishes it; groups and other people's conversations cannot move it.
 
     private func publishAnchor(sessionId: String, destination: TelegramDestination, activityAt: Date) async throws {
         // Only the authenticated owner's private chat may move the anchor.
@@ -202,8 +203,7 @@ public struct TelegramSessionStore: Sendable {
         )
     }
 
-    /// Display/diagnostic attribution only. No consumer of the anchor may
-    /// branch on this value — see `ConversationAnchor`.
+    /// Display/diagnostic attribution only. No consumer of the anchor may branch on this value — see `ConversationAnchor`.
     private static let anchorSource = "telegram"
 
     private func isOwnerDestination(_ destination: TelegramDestination) throws -> Bool {
@@ -254,7 +254,7 @@ public struct TelegramSessionStore: Sendable {
               case .object(let row) = value, row["archived"] != .bool(true) else { return false }
         guard ownerDestination else { return true }
         guard case .string(let id)? = row["id"] else { return false }
-        return SessionConversation(rows: [row]).kind(id)?.isHisConversation == true
+        return SessionConversation(rows: [row]).kind(id)?.isPersonConversation == true
     }
 
     public func recentSessions(destination: TelegramDestination, fromUserId: Int?, limit: Int = 8) async throws -> [TelegramRecentSession] {
@@ -293,9 +293,7 @@ public struct TelegramSessionStore: Sendable {
                 entry["updatedAt"] = .string(Self.nowString())
             }
         }
-        // `/resume` moves the conversation User is in, so it moves the anchor —
-        // same fact, same hook. Without this the Mac and phone would keep
-        // pinning the session he just left.
+        // Resume must move the shared anchor so Mac and phone follow the same selected conversation.
         try await publishAnchor(sessionId: sessionId, destination: destination, activityAt: activityAt)
         emitIdentityTrace(sessionId: sessionId, destination: destination, resolvedBy: .requested)
         return try await status(destination: destination, sessionId: sessionId)
@@ -312,7 +310,6 @@ public struct TelegramSessionStore: Sendable {
         return sessionId
     }
 
-    /// The conversation a private chat is in now, or nil.
     public func boundSessionId(chatId: Int) async throws -> String? {
         if try isOwnerDestination(.chat(chatId)) {
             return ConversationAnchor.currentSessionId(dataRoot: dataRoot)
@@ -363,8 +360,7 @@ public struct TelegramSessionStore: Sendable {
         }
     }
 
-    /// Called under the map lock. Only absence may bootstrap; damaged bytes
-    /// stay in place so every subsequent access continues to report the error.
+    /// Called under the map lock. Only absence may bootstrap; damaged bytes stay in place so every subsequent access continues to report the error.
     private func loadSessionMap() throws -> [String: JSONValue] {
         let bytes: Data
         do {
@@ -402,11 +398,7 @@ public struct TelegramSessionStore: Sendable {
         }
     }
 
-    /// Locked read-modify-write of one chat's map entry.
-    ///
-    /// The generic return is what makes mint-or-adopt possible: the mutation
-    /// closure both DECIDES the session id and reports it, inside the flock, so
-    /// no caller can act on a value it read before the lock.
+    /// Decide and return the session inside the flock so no caller acts on a value read before locking.
     @discardableResult
     private func patchChatMap<T: Sendable>(
         chatKey: String,

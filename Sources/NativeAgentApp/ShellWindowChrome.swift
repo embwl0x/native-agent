@@ -1,9 +1,9 @@
 import AppKit
 import SwiftUI
 
-// Blueprint: | `ShellWindowChrome.swift` | `ShellWindowChrome` and `ShellFrame`: native window/titlebar integration, split shell layout and explicit keyboard target order |
+// Blueprint: | `ShellWindowChrome.swift` | `ShellWindowChrome`, `ShellFrame`: native chrome, split layout and keyboard order |
 
-/// A transparent title bar lets the shell run edge to edge beneath the traffic lights.
+/// Let the shell extend beneath the traffic lights without opaque title chrome.
 struct ShellWindowChrome: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
@@ -29,12 +29,10 @@ struct ShellWindowChrome: NSViewRepresentable {
     }
 }
 
-/// The shell lays the rail and the content side by side itself, so no system
-/// pane draws corners.
+/// Lay out columns directly so system panes cannot add separate corners.
 struct ShellFrame<Sidebar: View, Detail: View>: View {
     @State private var keyboardOrder = ShellKeyboardOrder()
-    /// The haze is drawn only without Reduce Transparency, and where it is
-    /// drawn it replaces the warm lamp: the two mixed to olive-khaki.
+    /// Replace the warm lamp where haze draws; mixing them muddies the colour.
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @ViewBuilder var sidebar: () -> Sidebar
     @ViewBuilder var detail: () -> Detail
@@ -44,10 +42,8 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
             sidebar().focusSection()
             detail().focusSection()
         }
-        // One glass sheet and lamp span the transparent columns; only the rail floats above them.
         .background {
             ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture())
-                // One haze sits over the sheet and beneath every column.
                 .overlay { WindowHaze() }
                 .overlay { if reduceTransparency && shellLampUnderContent { ShellLamp() } }
         }
@@ -82,10 +78,7 @@ final class ShellKeyboardOrder {
     @discardableResult
     func move(from id: UUID, backwards: Bool) -> Bool {
         let order = ordered
-        // Other pages retain their native traversal through all page controls.
-        // Without Keyboard navigation (System Settings > Keyboard) macOS keeps
-        // buttons out of focus, so a hop to the rail or Send would land nowhere
-        // and eat the Tab; the native loop keeps it.
+        // With Keyboard navigation off, native buttons cannot take focus; preserve the native loop.
         guard NSApp.isFullKeyboardAccessEnabled,
               order.contains(where: { $0.region == .composer }),
               let index = order.firstIndex(where: { $0.id == id }) else { return false }
@@ -94,8 +87,6 @@ final class ShellKeyboardOrder {
             enteredReceiptsFromComposer = false
         }
         let target: Destination
-        // Leaving the draft goes straight to the newest visible Details.
-        // Shift-Tab at the start of the rail returns directly to the draft.
         if !backwards, current.region == .composer,
            let receipt = order.first(where: { $0.region == .receipt }) {
             enteredReceiptsFromComposer = true
@@ -106,8 +97,7 @@ final class ShellKeyboardOrder {
         } else if !backwards, enteredReceiptsFromComposer, current.region == .receipt,
                   index + 1 < order.count, order[index + 1].region == .composer,
                   let send = order.first(where: { $0.region == .send }) {
-            // Complete the forward circuit without returning to the draft
-            // and entering the receipts again before reaching Send/the rail.
+            // Finish the circuit without re-entering receipts before Send and the rail.
             target = send
         } else if !backwards, enteredReceiptsFromComposer, current.region == .receipt,
                   index + 1 < order.count, order[index + 1].region == .composer,
@@ -137,9 +127,7 @@ private struct ShellKeyboardTarget: ViewModifier {
     var sortsLast = false
     var composerFocused: Bool = false
     var focusComposer: (() -> Void)?
-    /// Offered the draft's Tab before the window-wide order is. The composer's
-    /// own settings words are a local ring inside the region, so Tab walks them
-    /// before it leaves the composer at all.
+    /// Let local composer settings finish their focus ring before the window-wide order takes Tab.
     var tabInto: ((Bool) -> Bool)?
     var suggestionKey: ((UInt16) -> Bool)?
     var onPaste: (([NSItemProvider]) -> Void)?
@@ -148,8 +136,7 @@ private struct ShellKeyboardTarget: ViewModifier {
         Group {
             if region == .composer {
                 content.background {
-                    // A retained, hidden composer may still have a stale
-                    // FocusState. It must not intercept another page's keys.
+                    // A hidden composer may retain stale FocusState; it must not intercept another page's keys.
                     ComposerKeys(active: enabled && composerFocused, move: { backwards in
                         if tabInto?(backwards) == true { return true }
                         return order?.move(from: id, backwards: backwards) ?? false
@@ -157,8 +144,7 @@ private struct ShellKeyboardTarget: ViewModifier {
                 }
             } else {
                 content.focused($focused)
-                    // The rail draws its own rounded ring in the haze's edge
-                    // light instead of the square system one.
+                    // Keep rail focus consistent with its rounded haze ring.
                     .focusEffectDisabled(region == .rail)
                     .overlay { if region == .rail, focused { ShellRailFocusRing() } }
                     .onKeyPress(keys: [.tab, .backTab]) { press in
@@ -193,24 +179,18 @@ private struct ShellKeyboardTarget: ViewModifier {
 }
 
 extension KeyEquivalent {
-    /// Shift-Tab arrives as U+0019, not as `.tab` with Shift held, so a
-    /// `keys: [.tab]` handler never saw it and Shift-Tab fell to the native
-    /// loop: the rail's first word went to Send instead of back to the draft.
+    /// Shift-Tab arrives as U+0019, so a shifted .tab handler cannot intercept it.
     static let backTab = KeyEquivalent("\u{19}")
 }
 
 extension View {
-    /// A button or switch is a focus stop by itself while Keyboard navigation
-    /// is on, and `.focusable()` over it adds a second, invisible stop: Tab
-    /// off the last word, or through a pane, did nothing once. So it is added
-    /// only when the system leaves buttons out; one stop either way.
+    /// Native buttons already take focus with Keyboard navigation on; add focusable only when needed to avoid double stops.
     @MainActor @ViewBuilder
     func buttonFocusable() -> some View {
         if NSApp.isFullKeyboardAccessEnabled { self } else { focusable() }
     }
 
-    /// `sortsLast`: a control pinned below a scrolling list (Simple's
-    /// Settings) comes after every row, wherever the list is scrolled.
+    /// Pinned controls must sort after every scrolling row regardless of scroll position.
     func shellKeyboardTarget(_ region: ShellKeyboardOrder.Region, sortsLast: Bool = false) -> some View {
         modifier(ShellKeyboardTarget(region: region, sortsLast: sortsLast))
     }
@@ -233,7 +213,7 @@ extension View {
     }
 }
 
-/// Places the lamp beneath content so cards and text remain above its light.
+/// Put the lamp beneath content so its light cannot wash out cards or text.
 var shellLampUnderContent: Bool {
     #if DEBUG
     return ProcessInfo.processInfo.environment["SHELL_LAMP_UNDER"] == "1"

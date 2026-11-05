@@ -1,16 +1,16 @@
 import Foundation
+import NativeAgentCore
 import ChatTurnContracts
 import NativeAgentShared
 import ProviderRouting
 
-// Blueprint: | `InlineInteractionResolver+MissingProvider.swift` | `InlineInteractionResolver.raiseMissingChatProvider`: setup card records the accepted request's origin before provider dispatch; only text-only questions can resume |
+// Blueprint: | `InlineInteractionResolver+MissingProvider.swift` | `InlineInteractionResolver.raiseMissingChatProvider`; Text-only resume. |
 
 public extension InlineInteractionResolver {
     static func raiseMissingChatProvider(
-        sessionID: String, userContent: String, hasAttachments: Bool, dataRoot: URL
+        sessionID: String, userContent: String, hasAttachments: Bool, dataRoot: URL, turn: Turn
     ) async {
-        // No provider call could raise this card. Attachment bytes are not
-        // retained, so only a text-only question may resume after setup.
+        // No provider call could raise this card. Attachment bytes are not retained, so only a text-only question may resume after setup.
         _ = await raise(
             InlineInteraction(
                 kind: .modelChoice,
@@ -26,7 +26,8 @@ public extension InlineInteractionResolver {
             sessionID: sessionID,
             resumeText: hasAttachments ? nil : userContent,
             resumable: !hasAttachments,
-            origin: TurnEnvelope.current(surface: "chat"),
+            origin: TurnEnvelope.current(turn: turn, surface: "chat"),
+            turn: turn,
             dataRoot: dataRoot
         )
     }

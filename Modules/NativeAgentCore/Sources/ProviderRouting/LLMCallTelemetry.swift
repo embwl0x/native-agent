@@ -4,29 +4,21 @@ import NativeAgentCore
 import os
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `LLMCallTelemetry.swift` | `LLMCallTraceRecorder`; successful/failed call receipts with full/delta context byte sizes, keyframe status, purpose, timing, provider identity and redacted underlying failure detail; whole-reply partial receipts save redacted output and cause through settle at the selected root; memory, digest and probe telemetry retain their own surfaces when routing inherits Chat; a bound `spent` tally adds each row's usage (their turn's own rounds); explicit preview generation emits no usage or call evidence for behavioral readers |
+// Blueprint: | `LLMCallTelemetry.swift` | `LLMCallTraceRecorder`, `spent`: one receipt per request; partial output settles |
 
 public extension Notification.Name {
-    /// Posted after the exact per-session provider usage receipt is durable.
-    /// `object` is the normalized chat session id.
+    /// Publish session usage only after its exact receipt is durable.
     static let nativeAgentSessionProviderUsageDidChange = Notification.Name(
         "NativeAgent.sessionProviderUsageDidChange"
     )
 }
 
-// TurnTrace owns bound model calls; standalone calls use traces/events.jsonl.
-// Session usage receipts remain independently owned by their current writer.
-//
-// Preview privacy follows TurnTraceRedactor; model-call receipts can retain headPreviews.
-// Recording failures are diagnostic and leave the provider result unchanged.
+// Calls carry their identity into TurnTrace; standalone calls use the shared feed. Recording faults cannot change provider results; preview privacy follows
+// TurnTraceRedactor.
 public final class LLMCallTraceRecorder: @unchecked Sendable {
-    /// One `llm.call` row per provider request. The router binds a fresh
-    /// receipt as the request's identity; the first row written under it (the
-    /// adapter's or the router's failure row) claims it, leaves its `ttftMs`
-    /// there for the router's lifecycle, and any later row drops.
+    /// One request identity claims its first receipt, preventing adapter and router failure rows from double-counting.
     @TaskLocal public static var requestRecorded: OSAllocatedUnfairLock<Receipt>?
-    /// What her turn's own model rounds read and wrote, in tokens: the stem
-    /// binds it around its calls, and each row's usage adds to it.
+    /// The turn's tally counts only its own bound model rounds.
     public struct Spend: Sendable {
         public var knownTokens = 0
         public var complete = true
@@ -38,24 +30,23 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
     public struct Receipt: Sendable {
         public var recorded = false
         public var ttftMs: Int?
-        /// What the request asked the provider to read, set before it is sent.
+        /// Capture request size before send.
         public var requestBytes: Int?
         public var requestCharacters: Int?
         public var requestPlan: Data?
         public init() {}
     }
 
-    /// An explicit root overrides live data-root resolution at append time.
+    /// Resolve the explicit root at append time so diagnostics stay with their body.
     private let dataRootOverride: URL?
 
     public init(dataRootOverride: URL? = nil) {
         self.dataRootOverride = dataRootOverride
     }
 
-    /// Diagnostics from this adapter belong to the same selected body. The
-    /// request-scoped override is resolved at use, never captured from another call.
-    var diagnosticDataRoot: URL {
-        LLMCallContext.traceDataRootOverride ?? dataRootOverride ?? PersistenceCore.defaultDataRoot()
+    /// Diagnostics from this adapter belong to the held call's selected body.
+    func diagnosticDataRoot(call: LLMCall) -> URL {
+        call.traceDataRoot ?? dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
     private struct SessionUsageReceiptWrite: Sendable {
@@ -89,8 +80,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                 ModuleLog(category: "LLMCallTraceRecorder")("session usage receipt read failed: \(error)", level: .error)
                 return
             }
-            // Counts on disk are evidence, not trusted arithmetic operands.
-            // Preserve a damaged receipt for repair rather than replacing it.
+            // Counts on disk are evidence, not trusted arithmetic operands. Preserve a damaged receipt for repair rather than replacing it.
             if case .object(let object) = existing {
                 for field in ["lastRequestInputTokens", "previousTurnInputTokens"] {
                     if let value = object[field] {
@@ -128,9 +118,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                 let baselineTokens: Int64
                 if isSameBoundTurn,
                    case .int(let preservedBaseline)? = existingObject["previousTurnInputTokens"] {
-                    // Tool loops can make several provider requests in one
-                    // turn. Keep comparing the final request to the preceding
-                    // turn instead of resetting the delta after each tool.
+                    // Tool loops can make several provider requests in one turn. Keep comparing the final request to the preceding turn instead of
+                    // resetting the delta after each tool.
                     baselineTokens = preservedBaseline
                 } else {
                     baselineTokens = existingTokens
@@ -158,8 +147,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         }
     }
 
-    /// Append one `llm.call` row under the task-local `LLMCallContext.surface`.
     public func record(
+        call: LLMCall,
         requestBody: Data? = nil,
         provider: String,
         model: String,
@@ -168,19 +157,14 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         ttftMs: Int?,
         durationMs: Int,
         status: String = "ok",
-        /// Set ONLY when an enumerated model remap actually rewrote the
-        /// caller's requested id (e.g. the OAuth-direct adapters' Claude→GPT
-        /// table or an `openai/` namespace strip).
+        /// Only an actual ID rewrite sets substitutedFrom, keeping model substitutions visible.
         substitutedFrom: String? = nil,
-        /// Every `cache_control` marker ACTUALLY present on the outgoing
-        /// request body, in render order (tools → system → messages).
-        /// Positions and TTLs only, never prompt bytes; absent unless supplied.
+        /// Read cache markers from the outgoing body in render order; receipts retain positions and TTLs, never prompt bytes.
         cacheMarkers: [LLMCacheMarker]? = nil,
-        /// Provider stop reason (end_turn, max_tokens, tool_use…). Additive.
         stopReason: String? = nil,
         errorDetail: String? = nil
     ) async {
-        guard !LLMCallContext.preview else { return }
+        guard !call.preview else { return }
         if let claim = Self.requestRecorded, claim.withLock({ receipt in
             defer { receipt.recorded = true }
             if !receipt.recorded { receipt.ttftMs = ttftMs }
@@ -204,8 +188,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                 return overflow
             }
         } else { accountingOverflow = false }
-        let purpose = LLMCallContext.purpose
-        let routedSurface = LLMCallContext.surface ?? "unknown"
+        let purpose = call.purpose
+        let routedSurface = call.surface
         let surface: String = {
             switch purpose {
             case "memory_interpret", "memory_held", "recall_judge", "kind_backfill": return "memory"
@@ -214,7 +198,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             }
         }()
         // Bound calls join the turn's trace; background calls retain an unknown turn id.
-        let turnId = TurnTraceContext.turnId ?? "unknown"
+        let turnId = call.turn?.id ?? "unknown"
         let recordedAt = Date()
         let recordedAtISO = ISO8601DateFormatter().string(from: recordedAt)
         let receiptOrder = Int64(recordedAt.timeIntervalSince1970 * 1_000_000)
@@ -233,16 +217,15 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         payload["tokenAccounting"] = .string(usageComplete && !accountingOverflow ? "complete" : "unavailable")
         if let bytes = Self.requestRecorded?.withLock({ $0.requestBytes }) { payload["requestBytes"] = .int(Int64(bytes)) }
         if let characters = Self.requestRecorded?.withLock({ $0.requestCharacters }) { payload["requestCharacters"] = .int(Int64(characters)) }
-        // How the adapter's streamMessages delivered this call; absent on
-        // calls that did not come through streamMessages.
+        // Only streamMessages calls carry a delivery kind.
         if let streamKind = LLMMessagesStreamKind.current {
             payload["streamKind"] = .string(streamKind.rawValue)
         }
         // Unbound callers omit prefix receipts; secondary calls explicitly report their shape as unmeasured.
-        let prefix = await ConversationPrefixTelemetry.sink?.resolved()
+        let prefix = await call.prefixMeasurement?.resolved()
         if let prefix {
             for (key, value) in prefix.payload { payload[key] = value }
-        } else if ConversationPrefixTelemetry.requestShapeUnmeasured {
+        } else if call.requestShapeUnmeasured {
             payload["requestShape"] = .string("unmeasured")
         }
         if let substitutedFrom, !substitutedFrom.isEmpty, substitutedFrom != model {
@@ -253,8 +236,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             payload["cacheMarkers"] = .array(cacheMarkers.map(\.json))
         }
         // Secondary calls carry their own unmeasured request binding.
-        if !ConversationPrefixTelemetry.requestShapeUnmeasured,
-           let weight = ConversationPrefixTelemetry.sink?.toolWeight {
+        if !call.requestShapeUnmeasured,
+           let weight = call.prefixMeasurement?.toolWeight {
             payload["tools.floorSchemaBytes"] = .int(Int64(weight.floorBytes))
             payload["tools.appendedSchemaBytes"] = .int(Int64(weight.appendedBytes))
             payload["tools.wireSchemaBytes"] = .int(Int64(weight.wireBytes))
@@ -284,30 +267,24 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             if let v = usage.cacheWrite30mInputTokens { payload["cacheWrite30mInputTokens"] = .int(Int64(v)) }
             if let v = usage.cacheWrite12hInputTokens { payload["cacheWrite12hInputTokens"] = .int(Int64(v)) }
         }
-        // Bound calls use the bus and daily trace; unbound calls use the shared feed.
-        TurnTraceBus.fireFromContext(
-            kind: "llm.call",
-            sessionId: LLMCallContext.sessionId,
-            surface: surface,
-            payload: .object(payload)
-        )
-        let row: TurnTraceEvent? = TurnTraceContext.turnId == nil ? TurnTraceEvent(
+        let row = TurnTraceEvent(
             kind: "llm.call", title: model, status: status,
-            payload: .object(payload), createdAt: recordedAtISO
-        ) : nil
+            payload: .object(payload), createdAt: recordedAtISO,
+            turnId: call.turn?.id, sessionId: call.session, surface: surface, turn: call.turn
+        )
         let usageReceipt: SessionUsageReceiptWrite? = {
             guard status == "ok",
-                  !ConversationPrefixTelemetry.requestShapeUnmeasured,
+                  !call.requestShapeUnmeasured,
                   let request = Self.requestRecorded?.withLock({ $0 }),
                   let requestCharacters = request.requestCharacters,
                   let requestPlan = request.requestPlan,
                   let usage,
                   let logicalInputTokens = usage.logicalInputTokens(provider: provider),
-                  let rawSessionID = LLMCallContext.sessionId,
+                  let rawSessionID = call.session,
                   let sessionID = NativeAgentChatSessionID.normalizedPathComponent(rawSessionID) else {
                 return nil
             }
-            let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let root = diagnosticDataRoot(call: call)
             let path = root
                 .appendingPathComponent("chat", isDirectory: true)
                 .appendingPathComponent("session_state", isDirectory: true)
@@ -346,53 +323,50 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                 recordedAtEpochMicros: receiptOrder
             )
         }()
-        await write(row, usageReceipt: usageReceipt)
+        await write(row, usageReceipt: usageReceipt, call: call)
     }
 
     /// Record `provider.noReply` once: the bound turn's daily trace or a standalone receipt.
-    public func recordNoReply(provider: String, seconds: Int, events: Int, surface: String) async {
-        guard !LLMCallContext.preview else { return }
+    public func recordNoReply(provider: String, seconds: Int, events: Int, surface: String, call: LLMCall) async {
+        guard !call.preview else { return }
         let payload: [String: JSONValue] = [
             "provider": .string(provider), "seconds": .int(Int64(seconds)), "events": .int(Int64(events)),
-            "surface": .string(surface), "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
+            "surface": .string(surface), "turnId": .string(call.turn?.id ?? "unknown"),
         ]
-        TurnTraceBus.fireFromContext(kind: "provider.noReply", surface: surface, payload: .object(payload))
-        guard TurnTraceContext.turnId == nil else { return }
         await write(TurnTraceEvent(kind: "provider.noReply", title: provider, status: "failed",
-            payload: .object(payload), createdAt: ISO8601DateFormatter().string(from: Date())), usageReceipt: nil)
+            payload: .object(payload), createdAt: ISO8601DateFormatter().string(from: Date()),
+            turnId: call.turn?.id, sessionId: call.session, surface: surface, turn: call.turn), usageReceipt: nil, call: call)
     }
 
-    /// Every whole-reply consumer records incomplete output before handing its
-    /// original error to the caller. This is evidence, never a successful reply.
-    func recordPartialReply(output: String, error: Error) async {
-        guard !LLMCallContext.preview else { return }
+    /// Every whole-reply consumer records incomplete output before handing its original error to the caller. This is evidence, never a successful reply.
+    func recordPartialReply(output: String, error: Error, call: LLMCall) async {
+        guard !call.preview else { return }
         let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
         let row = TurnTraceEvent(
             kind: "llm.reply.partial", title: "Incomplete model reply",
             status: cancelled ? "cancelled" : "failed",
             payload: .object([
-                "purpose": .string(LLMCallContext.purpose),
+                "purpose": .string(call.purpose),
                 "output": .string(TurnTraceRedactor.redactText(output)),
                 "outputBytes": .int(Int64(output.utf8.count)),
                 "error": .string(ProviderFailure.diagnosticDescription(error)),
                 "cancelled": .bool(cancelled),
             ]), createdAt: ISO8601DateFormatter().string(from: Date()),
-            turnId: TurnTraceContext.turnId
+            turnId: call.turn?.id, sessionId: call.session, surface: call.surface, turn: call.turn
         )
-        let root = diagnosticDataRoot
-        // Stop cancels the request, not saving what it produced. Use the trace
-        // owner's selected root even when this caller has no bound trace bus.
+        let root = diagnosticDataRoot(call: call)
+        // Stop cancels the request, not saving what it produced. Use the trace owner's selected root even when this caller has no bound trace bus.
         await settle { await TurnTracePersistLane(dataRootOverride: root).append(row) }
     }
 
-    private func write(_ row: TurnTraceEvent?,
-                       usageReceipt: SessionUsageReceiptWrite?) async {
-        if let row {
-            if let dataRootOverride { await TurnTracePersistLane(dataRootOverride: dataRootOverride).append(row) }
-            else { TurnTraceBus.fire(row, on: .shared) }
-        }
+    private func write(_ row: TurnTraceEvent,
+                       usageReceipt: SessionUsageReceiptWrite?, call: LLMCall) async {
+        let root = call.traceDataRoot ?? dataRootOverride
+        if call.turn != nil, let bus = TurnTraceContext.bus { TurnTraceBus.fire(row, on: bus) }
+        else if let root { await TurnTracePersistLane(dataRootOverride: root).append(row) }
+        else { TurnTraceBus.fire(row, on: .shared) }
         if let usageReceipt {
-            if dataRootOverride != nil { await SessionUsageReceiptWriter.shared.write(usageReceipt) }
+            if root != nil { await SessionUsageReceiptWriter.shared.write(usageReceipt) }
             else { Task.detached(priority: .utility) { await SessionUsageReceiptWriter.shared.write(usageReceipt) } }
         }
     }

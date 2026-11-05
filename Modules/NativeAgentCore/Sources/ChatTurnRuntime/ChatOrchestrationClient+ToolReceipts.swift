@@ -1,25 +1,38 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `ChatOrchestrationClient+ToolReceipts.swift` | `ToolReceipt` carries exact invocation identity through progress and `SwiftNativeChatOrchestrationClient.persistToolReceipt` |
+// Blueprint: | `ChatOrchestrationClient+ToolReceipts.swift` | `ToolReceipt`, `ToolProgress`; `SwiftNativeChatOrchestrationClient.persistToolReceipt` |
 
-/// A complete value-form receipt, redacted before leaving dispatch.
+/// Redact the complete value-form receipt before it leaves dispatch.
 struct ToolReceipt: Sendable {
-    /// Carries the exact dispatch through progress to its awaited receipt write.
-    @TaskLocal static var dispatched: ToolReceipt?
-    /// Bound only while emitting this invocation's start; results carry the
-    /// same value on their receipt, across parallel dispatch and actor hops.
-    @TaskLocal static var currentInvocationID: String?
+    let turn: Turn
+    let checkpoint: TurnCheckpointWriter?
     let invocationID: String
     let toolName: String
     let input: JSONValue
     let ranCall: (tool: String, input: [String: JSONValue])?
     let output: JSONValue
     let ok: Bool
-    /// What the cognitive tool event is read from — the lane's own choice of
-    /// raw or redacted output, kept exactly as each lane had it.
+    /// Preserve the producer's chosen raw or redacted output when building its cognitive event.
     let cognitiveOutput: JSONValue
+}
+
+/// Dispatch hands progress its exact receipt and invocation, including across
+/// parallel children. Plain prose progress carries neither.
+public struct ToolProgress: Sendable {
+    public init(_ sink: @escaping TurnEventSink) {
+        self.sink = { event, _, _ in await sink(event) }
+    }
+    init(_ sink: @escaping @Sendable (TurnStreamEvent, ToolReceipt?, String?) async -> Void) {
+        self.sink = sink
+    }
+    let sink: @Sendable (TurnStreamEvent, ToolReceipt?, String?) async -> Void
+    func callAsFunction(_ event: TurnStreamEvent, receipt: ToolReceipt? = nil,
+                        invocationID: String? = nil) async {
+        await sink(event, receipt, invocationID)
+    }
 }
 
 /// Await each receipt write; a failed row is reported without dropping later rows.
@@ -28,7 +41,6 @@ struct ToolReceiptWriter: Sendable {
     let sessionId: String
     let runId: String
     let surface: String
-    /// Names the lane in a failed write's log line.
     let laneLabel: String
     let onNotice: @Sendable (String, String) async -> Void
 
@@ -55,17 +67,17 @@ extension SwiftNativeChatOrchestrationClient {
                     tool: receipt.ranCall?.tool ?? ToolNameAliases.shown(receipt.toolName, input: receipt.input).name,
                     output: receipt.cognitiveOutput
                 ),
-                source: writer.surface
+                source: ChatThreadKind.transcriptSource(surface: receipt.turn.arrivalSurface(authorizing: writer.surface)), turn: receipt.turn
             )
-            await TurnCheckpointScope.current?.receiptWritten()
+            await receipt.checkpoint?.receiptWritten(turn: receipt.turn)
         } catch {
             await Self.reportTranscriptWriteFailure(
                 label: "appendToolMessage(\(receipt.toolName))\(writer.laneLabel)",
                 path: dataRoot,
                 error: error,
                 userText: "Couldn't save the receipt or restart checkpoint for tool '\(receipt.toolName)'; inspect the saved transcript before repeating it.",
-                onNotice: writer.onNotice
-            )
+                onNotice: writer.onNotice,
+             turn: receipt.turn)
         }
     }
 }

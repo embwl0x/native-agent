@@ -7,7 +7,7 @@ import ProviderRouting
 import NativeAgentShared
 import Darwin
 import os
-// Blueprint: | `TelegramVoiceTranscription.swift` | Telegram voice selects ffmpeg before converting declared OGG/Opus/WebM, passes readable system audio directly and runs one Apple Speech policy; owns and joins conversion, recognition and system-temp cleanup on Stop/deadline; temporary audio stays outside the data root, backup/export/phone sync and the PrivacyMap telegram tree |
+// Blueprint: | `TelegramVoiceTranscription.swift` | Convert declared containers once; join recognition and temp cleanup on Stop and deadline |
 
 // MARK: - Telegram voice transcription
 
@@ -61,8 +61,7 @@ private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
     private let lock = NSLock()
     private var task: SFSpeechRecognitionTask?
     private var continuation: CheckedContinuation<SpeechUtterance, Error>?
-    // Completion and cancellation can both precede recognitionTask returning.
-    // Keep the winning result until the continuation has been registered.
+    // Completion and cancellation can both precede recognitionTask returning. Keep the winning result until the continuation has been registered.
     private var result: Result<SpeechUtterance, Error>?
     private var wasCancelled = false
 
@@ -83,8 +82,7 @@ private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
             wasCancelled = true
             return self.task
         }
-        // The terminal recognition callback owns continuation settlement;
-        // cancellation requests exit without releasing the audio underneath it.
+        // The terminal recognition callback owns continuation settlement; cancellation requests exit without releasing the audio underneath it.
         task?.cancel()
     }
 
@@ -119,8 +117,7 @@ struct TelegramPreparedVoiceAudio: Sendable {
     }
 }
 
-/// Owns system-temp audio outside the data root; cleaned after use, never
-/// backed up, exported or synced. PrivacyMap's telegram tree does not count it.
+/// Owns system-temp audio outside the data root; cleaned after use, never backed up, exported or synced. PrivacyMap's telegram tree does not count it.
 enum TelegramVoiceAudioPreparer {
     static let speechReadableExtensions: Set<String> = ["aif", "aiff", "caf", "m4a", "mp3", "mp4", "wav"]
 
@@ -159,9 +156,7 @@ enum TelegramVoiceAudioPreparer {
             try await transcodeWithFFmpeg(ffmpeg: ffmpeg, input: input, output: output)
             return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
         } catch {
-            // A failed preparation never reaches the caller's deferred
-            // cleanup. Leaving the downloaded voice bytes behind turns a
-            // missing converter into an unbounded private-data leak.
+            // Preparation failure bypasses caller cleanup; remove downloaded bytes here to prevent a private-data leak.
             try? FileManager.default.removeItem(at: input)
             try? FileManager.default.removeItem(at: output)
             throw error
@@ -242,15 +237,11 @@ enum TelegramVoiceAudioPreparer {
     }
 }
 
-/// Swift-native, no-API-key Telegram voice-note transcriber backed by Apple's
-/// Speech framework. Telegram OGG/Opus files are converted to M4A before
-/// recognition because SFSpeechRecognizer consumes file URLs in system audio
-/// formats, not raw Telegram voice-note containers.
+/// Convert Telegram containers to system audio: SFSpeechRecognizer requires file URLs in formats the system can read.
 public final class SwiftAppleSpeechTranscriber: Sendable {
     public var hasSpeechPermission: Bool { SFSpeechRecognizer.authorizationStatus() == .authorized }
     private let localeIdentifier: String
     private let timeoutNanoseconds: UInt64
-    /// Words the recognizer should expect, read per note (the agent's name).
     private let contextualStrings: @Sendable () -> [String]
 
     public init(
@@ -264,14 +255,10 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
     }
 
     public func transcribe(_ attachment: TelegramMediaAttachment) async throws -> TelegramVoiceTranscription {
-        // Check the non-prompting grant before materializing the remote audio.
-        // A denied or fresh TCC state can never produce a transcript, and
-        // returning here makes the Telegram failure/card path immediate while
-        // ensuring this headless surface never reaches a prompting API.
+        // Check permission before creating audio so headless failures remain immediate and never invoke a prompting API.
         try validateSpeechAuthorization()
         let started = Date()
-        // Deadline and Stop cancel the owned body, then join its conversion,
-        // recognition and temporary-file cleanup before releasing the turn.
+        // Deadline and Stop cancel the owned body, then join its conversion, recognition and temporary-file cleanup before releasing the turn.
         let utterance = try await withThrowingTaskGroup(of: SpeechUtterance.self) { group in
             group.addTask { [self] in
                 let prepared = try await TelegramVoiceAudioPreparer.prepareSpeechURL(attachment)
@@ -299,10 +286,7 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
 
     private func recognizeOnce(url: URL) async throws -> SpeechUtterance {
         try Task.checkCancellation()
-        // Read authorization only: headless Telegram work cannot present the
-        // macOS prompt safely. Permission requests belong to MainActor's
-        // SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined().
-        // A denial here lets the caller raise a health card.
+        // Headless work cannot safely prompt: read authorization here; MainActor permission preflight owns requests.
         try validateSpeechAuthorization()
         let locale = Locale(identifier: localeIdentifier)
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {

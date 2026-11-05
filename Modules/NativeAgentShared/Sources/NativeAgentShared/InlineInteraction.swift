@@ -1,34 +1,20 @@
 import Foundation
 
-// Blueprint: | `InlineInteraction.swift` | `InlineInteraction`: durable card kind/state/scope, continuation and outcome contract shared by dispatch, transcript and renderers |
+// Blueprint: | `InlineInteraction.swift` | `InlineInteraction`: durable card/continuation contract; owners retain authority |
 
-/// One durable conversation interaction: a need raised at the point of use
-/// ("connect GitHub", "allow Desktop access", "which model for this image"),
-/// rendered inline as a card, resolved by the EXISTING control, and left in
-/// scrollback as the receipt.
-///
-/// This is the contract between three parties that never talk to each other
-/// directly: the dispatch boundary that raises the need, the transcript that
-/// persists it across relaunch, and the card that renders it. Display state
-/// grants no authority; the resolver checks the canonical owner. Runtime
-/// replay state follows the `Continuation` contract below.
-///
-/// Unknown card kinds/states remain inert `.unknown` evidence. Core identity,
-/// action and continuation fields must satisfy the current contract.
+/// Display state grants no authority; resolution checks the canonical owner. Dispatch, transcript and renderers share this durable receipt. Unknown
+/// kinds/states remain inert evidence; identity, action and continuation must satisfy the current contract.
 public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
-    /// Wire version of this value. Bumped only for a shape change readers
-    /// must notice; additive optional fields do not bump it.
+    /// Wire version of this value. Bumped only for a shape change readers must notice; additive optional fields do not bump it.
     public static let currentVersion = 1
 
     // MARK: Kind
 
-    /// The six control types. The card switches on THIS, never on a service
-    /// name — adding a connector adds a registry row, not a card branch.
+    /// Cards branch on control kind, never service name, so connectors need only a registry row.
     public enum Kind: String, Codable, Sendable, Equatable, CaseIterable {
         /// `target` is a canonical connector ID ("slack", "telegram").
         case connector
-        /// `target` is a canonical Mac capability/integration ID.
-        /// `additionalTargets` carries the rest of a predictable chain.
+        /// `target` is a canonical Mac capability/integration ID. `additionalTargets` carries the rest of a predictable chain.
         case permission
         /// `target` is an existing Providers group ID.
         case modelChoice = "model_choice"
@@ -83,13 +69,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     // MARK: Access mode
 
-    /// WHICH AXIS a permission need is asking for — the mode the blocked call
-    /// actually wanted.
-    ///
-    /// A read that was refused must not be settled by granting write as well.
-    /// The raise site knows which it was (a file READ, a file CHANGE), so it
-    /// says so, the card says so on its scope line, and the grant writes only
-    /// that axis where the owner has two of them to write.
+    /// A refused read must not grant write access. The raise site carries the requested axis through card scope to the permission owner.
     public enum AccessMode: String, Codable, Sendable, Equatable {
         case read
         case write
@@ -120,10 +100,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     // MARK: Secret
 
-    /// What an `.apiKey` card for a keyring secret (`target` "secret:<name>")
-    /// asks the person to grant: where the value may go, and the sign-in
-    /// NativeAgent runs in place of a paste when she supplied one. Public
-    /// parameters only; the value never rides here.
+    /// Secret grants carry destinations and optional sign-in parameters, never the secret value.
     public struct SecretAsk: Codable, Sendable, Equatable {
         public var hosts: [String]
         public var programs: [String]
@@ -133,10 +110,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         /// Where it is kept for now and stops going once this grant is kept.
         public var stops: [String]?
 
-        /// An OAuth authorization-code sign-in with PKCE through a loopback
-        /// redirect, or with `device` in place of `authorize` a device sign-in
-        /// (RFC 8628). `authorize` may carry extra query parameters of its own.
-        /// A client secret is never here: the person types it on the card.
+        /// An OAuth authorization-code sign-in with PKCE through a loopback redirect, or with `device` in place of `authorize` a device sign-in (RFC 8628).
+        /// `authorize` may carry extra query parameters of its own. A client secret is never here: the person types it on the card.
         public struct SignIn: Codable, Sendable, Equatable {
             public var authorize: String?
             /// The device authorization endpoint of a device sign-in.
@@ -146,7 +121,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             public var scopes: String?
             /// The registered loopback redirect, when the service needs an exact one.
             public var redirect: String?
-            /// "basic" when the client authenticates at the token endpoint by HTTP Basic; nil in the body.
+            /// "basic" selects HTTP Basic; nil sends credentials in the token request body.
             public var clientAuth: String?
             public init(authorize: String?, device: String? = nil, token: String, clientID: String, scopes: String? = nil, redirect: String? = nil,
                         clientAuth: String? = nil) {
@@ -160,7 +135,6 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             self.stops = stops.isEmpty ? nil : stops
         }
 
-        /// Where it may go, said once: "api.example.com, program npx".
         public var line: String {
             (hosts + programs.map { "program \($0)" }).joined(separator: ", ")
         }
@@ -168,14 +142,10 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     // MARK: Outcome / state
 
-    /// What actually happened, verified by the canonical owner. Bounded and
-    /// credential-free: an ID and a sentence, never a token or a key.
+    /// Canonical owners verify outcomes; receipts contain only bounded, credential-free IDs and prose.
     public struct Outcome: Codable, Sendable, Equatable {
-        /// Selected option / account / model / capability ID, when there is one.
         public var selection: String?
-        /// One line for the settled receipt ("GitHub connected").
         public var summary: String
-        /// Scope the resolution was applied at (model choice).
         public var scope: Scope?
 
         public init(selection: String? = nil, summary: String, scope: Scope? = nil) {
@@ -185,10 +155,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         }
     }
 
-    /// `pending → running → settled | declined | failed`.
-    ///
-    /// `failed` never retries on its own; the card keeps a retry control and
-    /// the interaction never reads as connected.
+    /// Failed cards require an explicit retry and never read as connected.
     public enum State: Sendable, Equatable {
         case pending
         case running
@@ -198,7 +165,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         case stopped(reason: String)
         /// Terminal replacement by a newer identical ask preserves one live card per ask.
         case superseded
-        /// A state this build does not know (forward compatibility).
+        /// Unknown states remain inert for forward compatibility.
         case unknown(String)
 
         public var name: String {
@@ -214,7 +181,6 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             }
         }
 
-        /// True while the originating request is still waiting on a person.
         public var isOpen: Bool {
             switch self {
             case .pending, .running: return true
@@ -222,8 +188,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             }
         }
 
-        /// True once the interaction has reached a terminal state; the
-        /// continuation may run at most once, from here.
+        /// A terminal continuation may run at most once.
         public var isTerminal: Bool { !isOpen && !isUnknown }
 
         public var isUnknown: Bool {
@@ -249,15 +214,42 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         }
     }
 
+    // MARK: Waiting on
+
+    /// The one thing a running permission card waits on: one of its own targets still off in macOS, or the one restart that makes its launch-applied grants
+    /// take effect. Written only by the card's own walk; every other transition clears it. On the wire it is the target ID, or "restart".
+    public enum WaitingOn: Codable, Sendable, Equatable {
+        /// A card target (privacy:<grant>, applescript:<bundle_id>, or an integration ID with a macOS grant behind it).
+        case target(String)
+        case restart
+
+        static let restartWire = "restart"
+
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            let raw = try c.decode(String.self)
+            guard !raw.isEmpty else {
+                throw DecodingError.dataCorruptedError(in: c, debugDescription: "A card cannot wait on an empty target.")
+            }
+            self = raw == Self.restartWire ? .restart : .target(raw)
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var c = encoder.singleValueContainer()
+            switch self {
+            case .target(let id): try c.encode(id)
+            case .restart: try c.encode(Self.restartWire)
+            }
+        }
+    }
+
     // MARK: Continuation
 
-    /// Runtime-owned durable record of a suspended request, including captured
-    /// replay input. The mobile card projection omits it; resolution still
-    /// checks canonical owners and signature provenance.
+    /// Runtime-owned durable record of a suspended request, including captured replay input. The mobile card projection omits it; resolution still checks
+    /// canonical owners and signature provenance.
     public struct Continuation: Codable, Sendable, Equatable {
         public enum Mode: String, Codable, Sendable, Equatable {
-            /// Replay the captured tool call through the ordinary gated
-            /// dispatcher once setup is verified.
+            /// Replay the captured tool call through the ordinary gated dispatcher once setup is verified.
             case retryBlockedTool = "retry_blocked_tool"
             /// A direct request resumes the turn without replaying a tool.
             case continueTurn = "continue_turn"
@@ -274,21 +266,13 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
         public enum ResumeState: String, Codable, Sendable, Equatable {
             case waiting
-            /// A resume claim is held; duplicate clicks and Mac/phone races
-            /// cannot start a second turn.
+            /// A resume claim is held; duplicate clicks and Mac/phone races cannot start a second turn.
             case claimed
-            /// The "I cannot tell" state, written to disk before anything
-            /// irreversible is attempted — the blocked call is about to be
-            /// DISPATCHED, or the continuation turn is about to be ADMITTED.
-            /// Either way a row found in it at relaunch is never auto-replayed,
-            /// because nothing readable from here can tell whether the call
-            /// landed or the turn started: it becomes a failed card the person
-            /// retries by hand, or nothing at all.
-            ///
+            /// Persist before dispatch or turn admission. After relaunch, an uncertain effect is never replayed automatically because its record cannot
+            /// prove whether it landed.
             case replaying
             case resumed
             case stopped
-            /// Dismissal, Stop, or a cleared conversation.
             case invalidated
 
             public init(from decoder: any Decoder) throws {
@@ -302,51 +286,31 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         }
 
         public var originRunId: String?
+        /// The act that raised this card; only that exact turn may consume its hand-back.
+        public var originTurnId: String?
         public var lifeID: String?
         public var reason: String?
         public var toolCallId: String?
         public var toolName: String?
-        /// Exact unredacted blocked-call arguments, replayed through the ordinary
-        /// gate. Nil continues the conversation without a captured-call replay.
+        /// Exact unredacted blocked-call arguments, replayed through the ordinary gate. Nil continues the conversation without a captured-call replay.
         public var toolArgumentsJSON: String?
         public var mode: Mode
         public var state: ResumeState
-        /// The person's text when no provider accepted the request and no user
-        /// row was persisted; other needs resume from the saved conversation.
+        /// The person's text when no provider accepted the request and no user row was persisted; other needs resume from the saved conversation.
         public var resumeText: String?
-        /// Stable ID for the continuation turn, so a duplicate resolve from a
-        /// second surface lands on the same claim instead of a second turn.
+        /// Stable ID for the continuation turn, so a duplicate resolve from a second surface lands on the same claim instead of a second turn.
         public var resumeRunId: String
-        /// When the blocked call was ACTUALLY replayed, recorded durably
-        /// BEFORE the continuation turn is admitted.
-        ///
-        /// The replay is an effect on the world; turn admission can still be
-        /// refused afterwards, and a refusal puts the claim back to `waiting`.
-        /// Without this checkpoint the next tap would replay the same effect a
-        /// second time. Never written for a replay that failed — a failed
-        /// replay did nothing, so it is honest to let a retry run it.
+        /// Persist successful replay before turn admission: a refused admission must not make the next tap repeat the effect. Failed replays never write
+        /// this checkpoint.
         public var replayedAt: Date?
-        /// What that replay returned, held so a retried continuation tells the
-        /// model the same thing instead of re-making the call.
+        /// What that replay returned, held so a retried continuation tells the model the same thing instead of re-making the call.
         public var replayedResult: String?
-        /// Proof that the turn which raised this card was signature-verified
-        /// by its transport — a MAC over `resumeRunId`, minted from the live
-        /// pairing material at raise time and RE-CHECKED against that same
-        /// material at replay.
-        ///
-        /// Not a flag. A persisted boolean saying "this was signed" is a
-        /// transcript granting authority, which is exactly what the envelope
-        /// refuses to do; this is a token only the holder of the pairing
-        /// secret could have written, and it stops verifying the moment that
-        /// secret changes (the phone was unpaired) — at which point the card
-        /// fails honestly instead of replaying unsigned.
+        /// A MAC over `resumeRunId` proves transport verification. Recheck against live pairing material at replay so unpairing revokes authority; a
+        /// persisted Boolean cannot confer it.
         public var signatureReceipt: String?
-        /// The turn that CARRIED this continuation, when the card was settled
-        /// from inside a turn already running on the session. That turn is the
-        /// continuation — the result was handed back to it — so no second turn
-        /// was ever started, and this records which one took it.
+        /// A running turn that receives this result owns the continuation; recording its identity prevents a second turn.
         public var resumedByTurnId: String?
-        /// Peer provenance of the suspended turn. Nil on older cards.
+        /// Peer provenance of the suspended turn; nil carries no peer evidence.
         public var peerSources: [String]?
         public var elevatedPeerSources: [String]?
 
@@ -387,42 +351,35 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     public var version: Int
     public var id: String
-    /// Bumped on every transition. A resolve carrying a stale revision is
-    /// refused, which is what makes duplicate clicks safe.
+    /// Bumped on every transition. A resolve carrying a stale revision is refused, which is what makes duplicate clicks safe.
     public var revision: Int
     public var kind: Kind
-    /// Canonical ID of the thing being connected/enabled/chosen. Empty for
-    /// `choose`.
+    /// Canonical ID of the thing being connected/enabled/chosen. Empty for `choose`.
     public var target: String
-    /// The rest of a predictable chain: when the checker can know a request
-    /// needs Mac Control AND Desktop access, it raises ONE need listing both
-    /// and the person grants once.
+    /// The rest of a predictable chain: when the checker can know a request needs Mac Control AND Desktop access, it raises ONE need listing both and the
+    /// person grants once.
     public var additionalTargets: [String]
-    /// The axis a `.permission` need is asking for. nil on every other kind,
-    /// and on transcripts written before this field existed.
+    /// Permission needs carry the requested axis; other kinds carry none.
     public var mode: AccessMode?
     public var title: String
-    /// One sentence explaining why this is being asked here and now.
     public var why: String
     public var primaryActionLabel: String
     public var secondaryActionLabel: String?
-    /// REQUIRED. Every decline says what happens next — the card never leaves
-    /// the person guessing what they are giving up.
+    /// Every decline explains its consequence so the person knows what they give up.
     public var declineConsequence: String
-    /// Permissions say how long they last: "Stays on until you turn it off in
-    /// Trust."
     public var persistenceNote: String?
     /// One sentence above the card without repeating its rows; nil uses `textLaneProse`.
     public var cardProse: String?
     public var options: [Option]
-    /// Scope the PRIMARY action applies at; the secondary applies the other.
+    /// The primary and secondary actions apply at different scopes.
     public var primaryScope: Scope?
     public var state: State
     public var createdAt: Date
     public var settledAt: Date?
     public var continuation: Continuation?
-    /// A keyring secret's ask; nil on every other card.
     public var secret: SecretAsk?
+    /// Set while a running permission card walks its grants; it is also what carries the card across its own restart.
+    public var waitingOn: WaitingOn?
 
     // MARK: Init
 
@@ -472,21 +429,12 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         self.secret = secret
     }
 
-    /// Every capability this interaction asks for, primary first. One grant
-    /// covers the whole list.
+    /// One grant covers the primary capability and its predictable chain.
     public var allTargets: [String] {
         target.isEmpty ? additionalTargets : [target] + additionalTargets
     }
 
-    /// The card, said out loud.
-    ///
-    /// A card is a REPLY, not decoration: it carries the reason, the way
-    /// forward, and what saying no costs. Only the Mac and iPhone chat UIs can
-    /// draw it. Every other route — the bridge, Telegram, Slack — has text and
-    /// nothing else, and a turn that parks on a card with no prose reaches them
-    /// as silence: "stream ended without final reply" on the bridge, and an
-    /// empty-reply notice on Telegram. So the same three things the card shows
-    /// are said in one sentence instead, and the person can answer either one.
+    /// Text-only routes need the card’s reason, remedy and decline consequence as prose; otherwise a parked turn reaches them as silence.
     public var textLaneProse: String {
         var line = why.trimmingCharacters(in: .whitespacesAndNewlines)
         if let last = line.last, !".!?".contains(last) { line += "." }
@@ -494,7 +442,6 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         guard !action.isEmpty else { return line }
         if !line.isEmpty { line += " " }
         line += "\(action) in the app, or say \u{201C}not now\u{201D}"
-        // Lowercase the consequence's lead when joining it mid-sentence.
         var consequence = InlineInteraction.lowercasedLead(
             declineConsequence.trimmingCharacters(in: .whitespacesAndNewlines)
         )
@@ -509,9 +456,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         return written.isEmpty ? textLaneProse : written
     }
 
-    /// Fixed copy shared by this file and the inline interaction registry.
     public enum ConsequenceCopy {
-        /// Every card-lane sentence ends here.
         public static let keepGoingSuffix = "or tell me not now and I'll keep going."
         public static let connectorCarryOn = "I'll carry on with whatever else I can reach."
         public static let permissionLeaveAlone = "alone and tell you what I couldn't do."
@@ -522,8 +467,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         public static let trustSwitchedOff = "is switched off in Trust."
     }
 
-    /// Lowercase a sentence folded into the middle of another one \u{2014} except
-    /// where the capital is the word's own: the pronoun "I" and its
+    /// Lowercase a sentence folded into the middle of another one \u{2014} except where the capital is the word's own: the pronoun "I" and its
     /// contractions, and a name carrying a second capital ("OpenAI").
     public static func lowercasedLead(_ text: String) -> String {
         guard let first = text.first, first.isUppercase else { return text }
@@ -537,14 +481,14 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
     }
 
     // MARK: Transitions
-    //
-    // Transitions are value-level and always bump `revision`; the resolver
-    // owns durability and the single-continuation claim.
+    // Transitions are value-level and always bump `revision`; the resolver owns durability and the single-continuation claim.
 
+    /// A tap starts a fresh walk; the walk records what it waits on at its first read.
     public func running() -> InlineInteraction {
         var copy = self
         copy.state = .running
         copy.revision += 1
+        copy.waitingOn = nil
         return copy
     }
 
@@ -553,6 +497,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         copy.state = .settled(outcome)
         copy.settledAt = date
         copy.revision += 1
+        copy.waitingOn = nil
         return copy
     }
 
@@ -561,18 +506,18 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         copy.state = .declined
         copy.settledAt = date
         copy.revision += 1
+        copy.waitingOn = nil
         return copy
     }
 
-    /// Replaced by a newer, identical ask. Terminal, so the continuation this
-    /// card was holding can never start a turn: the card the person is looking
-    /// at owns that now.
+    /// Only the newest identical ask owns the continuation; a superseded card must never start a turn.
     public func superseded(at date: Date = Date()) -> InlineInteraction {
         var copy = self
         copy.state = .superseded
         copy.settledAt = date
         copy.revision += 1
         copy.continuation?.state = .invalidated
+        copy.waitingOn = nil
         return copy
     }
 
@@ -581,19 +526,18 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         copy.state = .failed(reason: reason)
         copy.settledAt = date
         copy.revision += 1
+        copy.waitingOn = nil
         return copy
     }
 
     // MARK: Codable
-    //
-    // `state` is a discriminated object. Missing core evidence never creates
-    // an executable pending card; optional content remains optional.
+    // `state` is a discriminated object. Missing core evidence never creates an executable pending card; optional content remains optional.
 
     private enum CodingKeys: String, CodingKey {
         case version, id, revision, kind, target, additionalTargets, mode, title, why
         case primaryActionLabel, secondaryActionLabel, declineConsequence
         case persistenceNote, cardProse, options, primaryScope, state, createdAt, settledAt
-        case continuation, secret
+        case continuation, secret, waitingOn
     }
 
     private struct WireState: Codable {
@@ -627,6 +571,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         settledAt = try container.decodeIfPresent(Date.self, forKey: .settledAt)
         continuation = try container.decodeIfPresent(Continuation.self, forKey: .continuation)
         secret = try container.decodeIfPresent(SecretAsk.self, forKey: .secret)
+        waitingOn = try container.decodeIfPresent(WaitingOn.self, forKey: .waitingOn)
         let wire = try container.decode(WireState.self, forKey: .state)
         switch wire.name {
         case "pending": state = .pending
@@ -671,6 +616,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         try container.encodeIfPresent(settledAt, forKey: .settledAt)
         try container.encodeIfPresent(continuation, forKey: .continuation)
         try container.encodeIfPresent(secret, forKey: .secret)
+        try container.encodeIfPresent(waitingOn, forKey: .waitingOn)
         let wire: WireState
         switch state {
         case .pending: wire = WireState(name: "pending", outcome: nil, reason: nil)
@@ -688,25 +634,18 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
 // MARK: - Transcript vocabulary
 
-/// Wire constants shared by the writer, the renderer, and the resolver, so
-/// none of them re-guesses the other's spelling.
+/// Wire constants shared by the writer, the renderer, and the resolver, so none of them re-guesses the other's spelling.
 public enum InlineInteractionWire {
     /// Posted only after a durable card write; object is its originating session.
     public static let changedNotification = Notification.Name("NativeAgent.inlineInteractionChanged")
-    /// `metadata.kind` on the persisted `role: "tool"` row. PRESERVED after
-    /// settlement, so "GitHub connected" stays a compact card in scrollback.
+    /// `metadata.kind` on the persisted `role: "tool"` row. PRESERVED after settlement, so "GitHub connected" stays a compact card in scrollback.
     public static let transcriptKind = "inline_interaction"
-    /// `metadata.interaction` — the encoded `InlineInteraction`.
     public static let metadataKey = "interaction"
-    /// The tool-result `status` a raised need carries.
     public static let waitingStatus = "needs_input"
-    /// The tool-result key holding the raised need.
     public static let needsKey = "needs"
-    /// The single lazy agent-callable tool.
     public static let toolName = "request_interaction"
 
-    /// Canonical JSON encoder/decoder for the transcript: ISO-8601 dates so a
-    /// row is readable, diffable, and stable across surfaces.
+    /// Canonical JSON encoder/decoder for the transcript: ISO-8601 dates so a row is readable, diffable, and stable across surfaces.
     public static func encoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

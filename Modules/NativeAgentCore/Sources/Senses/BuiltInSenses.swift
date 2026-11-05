@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `BuiltInSenses.swift` | Bundle-owned native adapters and JavaScript defaults read once per resource root under a lock, with failures uncached; one schemaVersion-1 object manifest requires every identity, string corner, version, mode, entry and verbs; file overrides win and accounting lives in AbilityStore state; bundled records have built-in origin and no creation/enable placeholders |
+// Blueprint: | `BuiltInSenses.swift` | Locked bundle manifests; file overrides win; AbilityStore owns accounting |
 
 public enum BuiltInSenses {
     private static let defaultsLock = NSLock()
@@ -15,8 +15,7 @@ public enum BuiltInSenses {
         ("builtin-connectors", .stream(id: "connectors")),
     ]
 
-    // Specific grown/JS senses win the registry's exact lookup. These records
-    // represent today's generic readers, selected only after that lookup misses.
+    // Specific grown/JS senses must win exact lookup before these generic readers.
     public static func fallbackCorner(for corner: SenseCorner) -> SenseCorner? {
         switch corner {
         case .app: .app(bundleID: "*")
@@ -27,8 +26,7 @@ public enum BuiltInSenses {
         }
     }
 
-    /// Call after installing the registry in SensesHub. Missing/malformed kit
-    /// resources are launch errors, never an apparently successful empty kit.
+    /// Install after the registry; missing or malformed kit resources must fail launch rather than masquerade as an empty kit.
     public static func registerAll(dataRoot: URL, resources: URL? = nil) async throws {
         guard let registry = SensesHub.shared.registry else {
             throw SenseFailure(code: "source_unavailable", message: "The senses registry is not installed.")
@@ -150,10 +148,10 @@ struct ExistingCornerSense: Sendable {
     var id: String { record.id }
     var corner: SenseCorner { record.corner }
 
-    func run(_ request: SenseRequest, source: SenseSourceProvider) async -> SenseOutcome {
+    func run(_ request: SenseRequest, source: SenseSourceProvider, operation: SenseReadOperation) async -> SenseOutcome {
         if id == "builtin-chrome", case .act(let verb, let address, let args) = request {
             do {
-                guard ["click", "fill", "select"].contains(verb), let perform = SenseActionContext.perform else {
+                guard ["click", "fill", "select"].contains(verb), let perform = operation.perform else {
                     throw SenseFailure(code: "act_denied", message: "Chrome verbs require a served thing and an active app turn.")
                 }
                 let result = try await perform("chrome." + verb, address, args)
@@ -163,7 +161,7 @@ struct ExistingCornerSense: Sendable {
         }
         if case .act(let verb, let address, let args) = request, case .app = corner {
             do {
-                guard let perform = SenseActionContext.perform else {
+                guard let perform = operation.perform else {
                     throw SenseFailure(code: "act_denied", message: "Screen verbs require an active app turn.")
                 }
                 let result = try await perform("mac.act", address, SenseScreenThings.selection(address, verb: verb, args: args))
@@ -178,7 +176,7 @@ struct ExistingCornerSense: Sendable {
             return .failed(SenseFailure(code: "source_unavailable", message: "The existing corner readers are not installed."))
         }
         do {
-            let page = try await source.page(for: corner, address: address)
+            let page = try await source.page(for: corner, address: address, operation: operation)
             return .page(page, SenseProvenance(record: record))
         } catch let failure as SenseFailure { return .failed(failure) }
         catch { return .failed(SenseFailure(code: "source_unavailable", message: error.localizedDescription)) }

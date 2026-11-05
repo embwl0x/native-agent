@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `CognitiveSubstrate+CaringAppraisal.swift` | `CaringAppraisalRequest`, verdict and lane contracts: semantic caring judgments, distinctness and admission/refusal interfaces |
+// Blueprint: | `CognitiveSubstrate+CaringAppraisal.swift` | `CaringAppraisalRequest`: caring judgment and distinctness contracts |
 
 // Caring appraisal uses the Memory route; relays require explicit attribution to the human.
 
@@ -8,16 +8,13 @@ import Foundation
 
 // MARK: - The request
 
-/// One turn, as the appraisal sees it. Text only, plus the opaque scope the
-/// dedupe needs — never an event, never metadata.
+/// Keep appraisal input text-only; opaque scope serves deduplication, not judgment.
 public struct CaringAppraisalRequest: Codable, Sendable, Equatable {
-    /// Who said one line of the surrounding exchange.
     public enum Speaker: String, Codable, Sendable, Equatable {
         case person
         case agent
     }
 
-    /// One line of the surrounding exchange.
     public struct ContextTurn: Codable, Sendable, Equatable {
         public let speaker: Speaker
         public let text: String
@@ -28,8 +25,7 @@ public struct CaringAppraisalRequest: Codable, Sendable, Equatable {
         }
     }
 
-    /// One encounter that recently DOSED, as the relay judgment is shown it.
-    /// Kind, when, and the appraisal's own one-clause reason — never the message.
+    /// Recent dosed encounters show only kind, time and appraisal reason; the original message stays private.
     public struct RecentEncounter: Codable, Sendable, Equatable {
         public let kind: OrganismCaringEvent.Kind
         public let at: Date
@@ -42,18 +38,16 @@ public struct CaringAppraisalRequest: Codable, Sendable, Equatable {
         }
     }
 
-    /// The turn being appraised (the human's words, or the relay carrying them).
     public let userMessage: String
     /// The originating turn's clock anchors dosing and recent-encounter ages.
     public let at: Date
     /// Recent turns from both sides, oldest first, excluding the turn being judged.
     public let context: [ContextTurn]
-    /// True when this arrived over the bridge — another agent in the user seat,
-    /// which may or may not be relaying the human.
+    /// True when this arrived over the bridge — another agent in the user seat, which may or may not be relaying the human.
     public let relayed: Bool
     /// Recent dosed encounters establish relay distinctness; locally typed human turns leave this empty.
     public let recentEncounters: [RecentEncounter]
-    /// The human's configured name, so the prompt can name who it is looking for.
+    /// The configured person name grounds relay attribution.
     public let personName: String?
     public let session: String
     public let turn: String
@@ -80,8 +74,7 @@ public struct CaringAppraisalRequest: Codable, Sendable, Equatable {
     }
 }
 
-/// What came back. `kind == nil` is the model saying "not a caring moment",
-/// which is the answer for the overwhelming majority of turns.
+/// A valid nil kind means no caring moment; it is not a failed call.
 public struct CaringAppraisalVerdict: Codable, Sendable, Equatable {
     /// Relays are judged against recent encounters; only `.unstated` uses the six-hour window.
     public enum Distinctness: String, Codable, Sendable, Equatable {
@@ -96,9 +89,7 @@ public struct CaringAppraisalVerdict: Codable, Sendable, Equatable {
     }
 
     public let kind: OrganismCaringEvent.Kind?
-    /// One clause saying why. Never persisted into the organism — it exists for
-    /// the replay report, for a log line, and for the recent-encounter list the
-    /// next relay judgment is shown.
+    /// Reasons support relay judgment and observability but never persist into body chemistry.
     public let why: String
     public let distinctness: Distinctness
 
@@ -126,12 +117,9 @@ public typealias CaringRefusalRecording = @Sendable (
 // MARK: - The lane
 
 public enum CaringAppraisalLane {
-    /// A turn longer than this is clipped before it goes in the prompt. A
-    /// caring moment is a sentence or two; a pasted log is not one.
+    /// Bound prompt input to a caring exchange; pasted logs must not dominate appraisal.
     public static let messageCap = 2_000
-    /// How many surrounding turns, both sides, go in the prompt with the turn
-    /// being judged. Six is roughly three exchanges — enough to tell care from a
-    /// diagnostic question, short enough that the prompt stays one small call.
+    /// Six turns cover roughly three exchanges, enough to distinguish care from diagnostics in one small call.
     public static let contextTurns = 6
     public static func clip(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -141,9 +129,7 @@ public enum CaringAppraisalLane {
 
     // MARK: parse
 
-    /// The wire words, and the only ones accepted. Anything else — a kind the
-    /// model invented, a missing field, a reply that is not JSON — is `nil`,
-    /// which the caller treats as a failed call and doses nothing.
+    /// Only declared wire values are valid; malformed or missing fields fail the call and dose nothing.
     static let wireKinds: [String: OrganismCaringEvent.Kind] = [
         "cared_for": .caredFor,
         "room_made": .roomMade,
@@ -151,8 +137,7 @@ public enum CaringAppraisalLane {
         "repair": .repair,
     ]
 
-    /// Parse the decoded reply. `nil` is malformed; a verdict with `kind == nil`
-    /// is the successful answer "none".
+    /// Parse the decoded reply. `nil` is malformed; a verdict with `kind == nil` is the successful answer "none".
     public static func parse(_ object: [String: Any]) -> CaringAppraisalVerdict? {
         guard let kind = object["kind"] as? String,
               let rawWhy = object["why"] as? String,

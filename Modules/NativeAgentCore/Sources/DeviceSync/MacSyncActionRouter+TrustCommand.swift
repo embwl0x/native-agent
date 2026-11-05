@@ -32,15 +32,13 @@ extension MobileTrustAction {
             case .outsideDefault: body = ["filePolicy": ["outsideWorkspaceDefault": value]]
             case .developerMode:
                 body = TrustPolicyActions.developerModePatchBody(enabled: value == "true")
-            case .workshopEnabled: body = [WorkshopPolicyBlockVocabulary.wireKey: ["enabled": value == "true"]]
             case .dreamScheduler: body = ["trainingPolicy": ["dream_scheduler": value == "true"]]
             }
             saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
                 body: body, dataRoot: dataRoot,
                 guardedByLockedPolicy: { locked in
                     if field == .outsideDefault,
-                       let trust = MacControlPolicy.fromTrustPolicyObject(locked).trustPolicy,
-                       MacControlGate.fullMacActive(trust) {
+                       PermissionLaw.posture(locked) == .fullMac {
                         throw MobileTrustActionError.outsideFullMac
                     }
                 }

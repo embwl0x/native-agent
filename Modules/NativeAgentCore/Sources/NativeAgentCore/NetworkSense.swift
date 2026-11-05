@@ -1,10 +1,9 @@
 import Foundation
 import Network
 
-// Blueprint: | `NetworkSense.swift` | `NetworkSense`: one process-wide NWPathMonitor; immediate `isUp` and replaying `changes`, cancellation-aware bounded `returns(within:)`; `changed` posts only after the path holds for five seconds, feeding body signals through EnginePartWake |
+// Blueprint: | `NetworkSense.swift` | `NetworkSense`, `isUp`, `changes`, `returns(within:)`, `changed`: one path monitor and bounded waits |
 
-/// The Mac's network path is one body fact, shared by every network consumer.
-/// A satisfied path is reachability, not proof that a provider is healthy.
+/// The Mac's network path is one body fact, shared by every network consumer. A satisfied path is reachability, not proof that a provider is healthy.
 public enum NetworkSense {
     private static let owner = Owner()
     public static let changed = Notification.Name("NativeAgent.network.changed")
@@ -15,8 +14,7 @@ public enum NetworkSense {
     /// Immediate path state. Until Network delivers its first observation, hold.
     public static var isUp: Bool { owner.isUp }
 
-    /// Registers before replaying the current state, so a return cannot be lost
-    /// between a caller's offline read and its subscription. Cancel to retire.
+    /// Registers before replaying the current state, so a return cannot be lost between a caller's offline read and its subscription. Cancel to retire.
     public static var changes: AsyncStream<Bool> { owner.changes() }
 
     /// Wait only this long for a path. Stop remains cancellation, never offline.

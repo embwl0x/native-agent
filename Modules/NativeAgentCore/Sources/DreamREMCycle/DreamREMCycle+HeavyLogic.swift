@@ -5,27 +5,24 @@ import PersonaEngine
 import NativeAgentCore
 import MemoryV2
 
-// Blueprint: | `DreamREMCycle+HeavyLogic.swift` | REM stateless helpers: checked persona reads and rendering; durable denial tombstones; archival shares the dream reservation and retains damaged claim sections for repair, preserving live UUID collision copies |
+// Blueprint: | `DreamREMCycle+HeavyLogic.swift` | DreamREMCycle+HeavyLogic owner. |
 
-// REM tombstones and diary archival retain their persisted formats.
 
-/// Use the live compiler's checked active-persona selection while preserving
-/// Dream/REM's selected SOUL, VOICE, GROWTH and AGENTS documents and USER projection.
+/// Use the live compiler's checked persona selection so dream context and USER projection share its authority.
 func readDreamPersonaDocs(
-    dataRoot: URL, personaRoot: URL, surface: String
+    dataRoot: URL, personaRoot: URL, surface: String, preview: Bool
 ) async throws -> [String: String] {
     let compiler = PersonaCompiler(
         engine: SwiftNativePersonaEngine(root: personaRoot, dataRoot: dataRoot)
     )
     let snapshot = try await compiler.contextSourceSnapshot(surface: surface)
-    // USER carries the pinned core; dreams receive new memories separately.
+    // USER supplies pinned core; new memories arrive separately.
     let userCore: [String]?
     if try !MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) {
         userCore = []
-    } else if LLMCallContext.preview {
-        // A preview cannot call unreadable input an empty self-half. The
-        // admitted prompt is identical when the same canonical read succeeds.
-        userCore = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat")
+    } else if preview {
+        // Unreadable preview input cannot become an empty self section; successful reads assemble the same admitted prompt.
+        userCore = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat", preview: true)
     } else {
         userCore = try await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
     }
@@ -40,7 +37,6 @@ func readDreamPersonaDocs(
     return docs
 }
 
-/// The selected persona documents in their shared dream/REM order.
 func renderDreamPersonaDocs(_ docs: [String: String]) -> String {
     ["SOUL.md", "VOICE.md", "GROWTH.md", "USER.md", "AGENTS.md"].map { name in
         let raw = docs[name] ?? ""
@@ -51,7 +47,7 @@ func renderDreamPersonaDocs(_ docs: [String: String]) -> String {
 
 // MARK: - REMTombstoneStore
 
-/// Persisted fingerprint: lowercase, collapse whitespace, then the first 16 SHA256 hex characters.
+/// Keep tombstone fingerprint normalization stable so durable rejection identity cannot drift.
 public func _tombstone_fp(_ text: String) -> String {
     let pieces = text.lowercased()
         .split(whereSeparator: { $0.isWhitespace })
@@ -61,12 +57,12 @@ public func _tombstone_fp(_ text: String) -> String {
     return String(digest.prefix(16))
 }
 
-/// SHA256 without narrowing the input byte count.
+/// Hash the whole input without narrowing its byte count.
 private func sha256Hex(_ s: String) -> String {
     SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
-/// Persisted tombstone fields retain their snake_case JSON keys.
+/// Keep persisted tombstone keys stable across writes.
 public struct REMTombstoneRecord: Codable, Sendable, Equatable {
     public let rejected_at: String
     public let target_doc: String
@@ -81,9 +77,7 @@ public struct REMTombstoneRecord: Codable, Sendable, Equatable {
     }
 }
 
-/// A nonempty tombstone file is durable rejection state. Do not reinterpret an
-/// unreadable or malformed file as an empty denylist: callers must abort so a
-/// rejected proposal cannot return and a subsequent write cannot erase it.
+/// Unreadable rejection state must abort so rejected lessons cannot return or be erased by a later write.
 public enum REMTombstoneStoreError: Error, LocalizedError, Equatable, Sendable {
     case unreadable(path: String)
     case malformed(path: String)
@@ -102,14 +96,12 @@ public actor REMTombstoneStore {
     private let path: URL
     private let fm = FileManager.default
 
-    /// Tombstones are a JSON dictionary keyed by the first 16 SHA256 fingerprint characters.
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         let dir = dataRoot.appendingPathComponent("harness", isDirectory: true)
         self.path = dir.appendingPathComponent(".rem_tombstones.json")
     }
 
-    /// Read the current fingerprint dictionary. Only a missing file means no
-    /// tombstones; unreadable or malformed state preserves its rejection authority.
+    /// Only missing storage means no tombstones; unreadable rejection authority remains unavailable.
     public func loadAll() throws -> [String: REMTombstoneRecord] {
         guard fm.fileExists(atPath: path.path) else { return [:] }
         let data: Data
@@ -144,7 +136,7 @@ public actor REMTombstoneStore {
             reason: reason,
             preview: String(proposedText.prefix(200))
         )
-        // The sibling <path>.lock covers the whole read-modify-write.
+        // Hold the sibling lock across the complete read-modify-write.
         try await SwiftNativePersistenceCore.withFileLock(path) {
             var dict = try await self.loadAll()
             dict[fp] = record
@@ -152,8 +144,7 @@ public actor REMTombstoneStore {
         }
     }
 
-    /// Reload after distillation so denials committed during the LLM call apply
-    /// to the whole batch; never reuse the pre-run authority validation.
+    /// Reload denials after model work so concurrent rejections apply to the whole batch.
     public func filterTombstoned(_ proposals: [REMProposalRow]) throws -> [REMProposalRow] {
         guard !proposals.isEmpty else { return [] }
         let dict = try loadAll()
@@ -201,7 +192,7 @@ public actor DreamArchiver {
                 try fm.createDirectory(at: archiveDir, withIntermediateDirectories: true)
             }
             let src = diary.appendingPathComponent(name)
-            // Unavailable claim sections stay active until repaired, even past the age cutoff.
+            // Unreadable claim sections remain active for repair regardless of age.
             let content = try String(contentsOf: src, encoding: .utf8)
             guard DreamClaim.read(in: content).allSatisfy({ $0.unavailable == nil }) else { continue }
             var dst = archiveDir.appendingPathComponent(name)
@@ -211,8 +202,7 @@ public actor DreamArchiver {
                     moved += 1
                     continue
                 }
-                // A restored copy may be older than the archive. Keep both
-                // readable under their original date; never replace writing.
+                // Retain restored and archived copies under the same original date without replacing writing.
                 dst = archiveDir.appendingPathComponent("\(stem)_\(UUID().uuidString).md")
             }
             try fm.moveItem(at: src, to: dst)

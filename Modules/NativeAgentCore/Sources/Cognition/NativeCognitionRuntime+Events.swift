@@ -6,7 +6,7 @@ import NativeAgentShared
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+Events.swift` | `NativeCognitiveEventFactory` and runtime event ingestion: payload-free motor/provider observations; domain owners retain outcome authority |
+// Blueprint: | `NativeCognitionRuntime+Events.swift` | `NativeCognitiveEventFactory`. |
 
 enum NativeCognitiveEventFactory {
     static func remoteAction(
@@ -60,10 +60,7 @@ enum NativeCognitiveEventFactory {
         )
     }
 
-    /// Converts an existing owner's payload-free motor read model into
-    /// resident attention. This is observation only: the domain owner keeps
-    /// state and authority, and unknown external reality stays pending rather
-    /// than being relabeled success or failure.
+    /// Observe the domain owner's payload-free read model without taking its authority; unknown external reality remains pending.
     static func motorActionState(
         _ model: MotorActionReadModel,
         now: Date = Date()
@@ -80,8 +77,7 @@ enum NativeCognitiveEventFactory {
                 kind = .toolFailed
                 importance = 0.8
             case .notStarted, .pending, .unverified, .unknown:
-                // Transport terminality is not lived success while the
-                // claimed effect is still awaiting domain evidence.
+                // Transport terminality cannot prove success while domain effect evidence remains pending.
                 kind = .toolStarted
                 importance = 0.62
             }
@@ -144,9 +140,7 @@ enum NativeCognitiveEventFactory {
         )
     }
 
-    /// Payload-free durable join fact. Free-form expected-evidence prose and
-    /// owner timestamps are deliberately absent: historical settlement needs
-    /// only the closed domain/state vocabulary and universal opaque identity.
+    /// Persist only closed domain/state vocabulary and opaque identity; free-form expectations and owner timestamps are unnecessary.
     static func motorActionTrace(
         _ model: MotorActionReadModel,
         now: Date = Date()
@@ -169,7 +163,7 @@ enum NativeCognitiveEventFactory {
                 "verification": .string(model.verification.rawValue),
                 "payloadFree": .bool(true),
                 "controlAuthority": .bool(false),
-            ])
+            ]), turn: nil
         )
     }
 
@@ -347,9 +341,7 @@ extension NativeCognitionRuntime: LLMCallLifecycleObserving {
     public func observeProviderCall(_ event: LLMCallLifecycleEvent) async {
         await bootstrap()
         recordProviderLifecycleEvidence(event)
-        // INTEROCEPTION: passively feed the vitals sensor from the SAME lifecycle
-        // event. Band transitions become graded felt sluggishness. Zero new
-        // provider calls.
+        // Use the same provider lifecycle event for graded body evidence without another model call.
         await feedProviderVitals(event)
         let kind: SomaticSignalKind
         let intensity: Double
@@ -384,9 +376,7 @@ extension NativeCognitionRuntime: LLMCallLifecycleObserving {
         if let sessionId = event.sessionId { metadata["sessionId"] = .string(sessionId) }
         if let turnId = event.turnId { metadata["turnId"] = .string(turnId) }
 
-        // The router awaits only the in-memory organism mutation. Persistence
-        // coalesces behind the actor:
-        // provider lifecycle is body evidence, not new semantic context.
+        // Await only in-memory body mutation; persistence coalesces separately because lifecycle evidence is not semantic context.
         await ingestOrganismSignal(
             kind: kind,
             sourceOrgan: "provider.\(event.providerId)",

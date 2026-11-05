@@ -2,10 +2,9 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `MemoryEmbeddingEpoch.swift` | Embedding epoch and batch/item outcomes; engine-stopped reconciliation on the canonical memory owner; owed memory/tombstone fills retain per-text failures and land usable siblings; admission retained through actual flight exit |
+// Blueprint: | `MemoryEmbeddingEpoch.swift` | vector-space identity, item outcomes and owned convergence |
 
-/// Immutable identity of one vector space. Dimensions alone are deliberately
-/// insufficient: backend, model/tokenizer artifacts, preprocessing, pooling,
+/// Immutable identity of one vector space. Dimensions alone are deliberately insufficient: backend, model/tokenizer artifacts, preprocessing, pooling,
 /// normalization, and sequence length all participate in compatibility.
 public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatable, Hashable {
     public static let activationProbeText = "NativeAgent embedding epoch activation"
@@ -51,8 +50,7 @@ public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatab
             .joined()
     }
 
-    /// Big-endian 64-bit length prefix — the frame marker for the directory
-    /// digest below.
+    /// Length-prefix directory digest fields with big-endian 64-bit lengths to keep framing unambiguous.
     private static func byteLength(_ count: Int) -> Data {
         var big = UInt64(count).bigEndian
         return withUnsafeBytes(of: &big) { Data($0) }
@@ -89,8 +87,7 @@ public struct MemoryEmbeddingBatch: Sendable, Equatable {
     }
 }
 
-/// A prediction can be unusable for one text without losing its siblings.
-/// Transport, model and output-contract failures still throw for the call.
+/// A prediction can be unusable for one text without losing its siblings. Transport, model and output-contract failures still throw for the call.
 public enum MemoryEmbeddingItem: Sendable, Equatable {
     case vector([Float])
     case unembeddable(reason: String)
@@ -105,8 +102,7 @@ public struct MemoryEmbeddingItemBatch: Sendable {
         self.items = items
     }
 
-    /// Callers requiring every vector get an explicit indexed error, never a
-    /// shortened batch or a manufactured vector.
+    /// Callers requiring every vector get an explicit indexed error, never a shortened batch or a manufactured vector.
     func requireVectors() throws -> [[Float]] {
         try items.enumerated().map { index, item in
             switch item {
@@ -125,8 +121,7 @@ extension SwiftNativeMemoryV2 {
         await requestEmbeddingEpochReconcile()?.value ?? false
     }
 
-    /// One housekeeping flight converges the corpus for launch, model install
-    /// and recall (which never waits); a request mid-pass earns one more pass.
+    /// One housekeeping flight converges the corpus for launch, model install and recall (which never waits); a request mid-pass earns one more pass.
     @discardableResult
     func requestEmbeddingEpochReconcile() -> Task<Bool, Never>? {
         guard !embeddingConvergenceStopped else { return nil }
@@ -145,8 +140,7 @@ extension SwiftNativeMemoryV2 {
         return flight
     }
 
-    /// Rows written while the model was cold get their vectors here, each
-    /// through the checks a warm write passes (`landOwedVector`).
+    /// Rows written while the model was cold get their vectors here, each through the checks a warm write passes (`landOwedVector`).
     private func fillOwedMemoryVectors() async throws {
         guard let embedder, let disk = storage else { throw MemoryV2Error.storageUnavailable }
         try checkEmbeddingConvergence()
@@ -163,7 +157,8 @@ extension SwiftNativeMemoryV2 {
             for (row, item) in zip(owed, batch.items) {
                 switch item {
                 case .unembeddable(let reason):
-                    if try await disk.recordUnembeddable(MemoryEmbeddingCorpusRow(kind: .memory, id: row.id, content: row.content), epoch: batch.epoch, reason: reason) {
+                    if try await disk.recordUnembeddable(MemoryEmbeddingCorpusRow(kind: .memory, id: row.id, content: row.content), epoch: batch.epoch,
+                        reason: reason) {
                         nativeLog("[memory-epoch] unembeddable memory %@: %@", row.id, reason)
                         moved += 1
                     }
@@ -177,13 +172,12 @@ extension SwiftNativeMemoryV2 {
                     moved += 1
                 }
             }
-            // Nothing moved: newer writes own these rows; their own request fills them.
+            // Newer writes own unchanged rows and request their own fills.
             guard moved > 0 else { return }
         }
     }
 
-    /// Forget can win before an active row's vector lands. Tombstones are
-    /// canonical claims too, filled in the same epoch without reindexing.
+    /// Forget can win before an active row's vector lands. Tombstones are canonical claims too, filled in the same epoch without reindexing.
     private func fillOwedTombstoneVectors() async throws {
         guard let embedder, let disk = storage else { throw MemoryV2Error.storageUnavailable }
         while true {
@@ -200,7 +194,8 @@ extension SwiftNativeMemoryV2 {
             for (row, item) in zip(owed, batch.items) {
                 switch item {
                 case .unembeddable(let reason):
-                    if try await disk.recordUnembeddable(MemoryEmbeddingCorpusRow(kind: .tombstone, id: row.hash, content: row.content), epoch: batch.epoch, reason: reason) {
+                    if try await disk.recordUnembeddable(MemoryEmbeddingCorpusRow(kind: .tombstone, id: row.hash, content: row.content), epoch: batch.epoch,
+                        reason: reason) {
                         nativeLog("[memory-epoch] unembeddable tombstone %@: %@", row.hash, reason)
                         moved += 1
                     }

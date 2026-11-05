@@ -1,7 +1,6 @@
-// List, detail headers and neighbors read the Mac-produced typed iCloud graph.
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `KnowledgeGraphView.swift` | Graph presentation and ID-resolved entity details/neighbors from the shared typed graph; local search/loading state |
+// Blueprint: | `KnowledgeGraphView.swift` | Shared typed graph presentation and ID-resolved details/neighbors; local search/loading state |
 
 enum KnowledgeGraphPresentation {
     enum ContentState: Equatable {
@@ -50,7 +49,6 @@ enum KnowledgeGraphDetailNeighborsPresentation {
 
 // MARK: - Models
 
-// The checked SQLite projection publishes one array envelope.
 struct KGEntityResponse: Decodable, Equatable, Sendable {
     var entities: [KGEntity]
     var edges: [KnowledgeGraphEdgeWireSnapshot]
@@ -138,8 +136,7 @@ private final class KGStore: ObservableObject {
     var total: Int { snapshot?.total ?? 0 }
     @Published var isLoading = false
     @Published var bannerError: String?
-    /// This is deliberately separate from `bannerError`: a quiet initial
-    /// launch has neither an error nor a Mac-published projection.
+    /// Before first publication, an absent graph is not an error; keep availability separate from bannerError.
     var hasPublishedSnapshot: Bool { snapshot != nil }
     static let maxSearchResults = 200
 
@@ -175,7 +172,6 @@ struct KnowledgeGraphView: View {
         let displayEntities = displayEntities
         ZStack(alignment: .top) {
             List {
-                // E6: freshness of the Mac snapshot behind this graph, under the door.
                 VStack(alignment: .leading, spacing: 14) {
                     AlivePageHeader(title: "Knowledge Graph", line: "The people, places and projects I know about.",
                                     style: .pushed)
@@ -183,8 +179,7 @@ struct KnowledgeGraphView: View {
                     AliveFreshnessNote(group: "knowledge_graph")
                 }
                 .aliveListRow(top: 4, bottom: 10)
-                // Only over a graph already shown: before the first snapshot
-                // the empty state and the freshness note already say this.
+                // Avoid duplicating first-snapshot guidance; overlay delivery state only when a graph is already visible.
                 if let err = store.bannerError, store.hasPublishedSnapshot {
                     Label(err, systemImage: "icloud.slash")
                         .font(.footnote)
@@ -222,7 +217,7 @@ struct KnowledgeGraphView: View {
                                 KGEntityRowCell(entity: entity)
                             }
                             .buttonStyle(.plain)
-                            // Row chrome belongs on the row, not inside its label.
+                            // Apply row chrome outside the label so it belongs to the native row.
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
                             .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
@@ -261,10 +256,8 @@ struct KnowledgeGraphView: View {
         }
         .animation(AppMotion.snappy, value: store.bannerError)
         .alivePageChrome(title: "Knowledge Graph", root: false)
-        // The search floats over the list, like Memories: outside the chrome,
-        // so the list's bottom fade runs under it.
+        // Float search outside list chrome so the bottom fade continues beneath it.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            // Nothing to search until a graph has arrived.
             if store.hasPublishedSnapshot || MobileDesignSamples.screen != nil || !searchText.isEmpty {
                 AliveSearchField(prompt: "Search people, places and projects", text: $searchText)
                     .padding(.horizontal, AliveMetrics.pageInset)
@@ -339,7 +332,6 @@ private struct KGEntityDetailSheet: View {
         return NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    // Header card
                     MobileReadingSurface {
                         VStack(alignment: .leading, spacing: 12) {
                             MobileAdaptiveRow(spacing: 12) {
@@ -377,7 +369,6 @@ private struct KGEntityDetailSheet: View {
                         }
                     }
 
-                    // Edges / neighbors
                     if let nbr = neighbors {
                         if nbr.edges.isEmpty {
                             AliveCalmState(title: "No relationships", line: "No edges recorded yet for this entity.")

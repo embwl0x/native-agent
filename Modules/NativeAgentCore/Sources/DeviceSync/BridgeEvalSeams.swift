@@ -2,9 +2,9 @@ import Foundation
 import DeviceSyncState
 import NativeAgentShared
 
-// Blueprint: | `BridgeEvalSeams.swift` | Bridge value policies: durable seen-ID bounds, incoming disposition, KVS keyspace/nudge admission and snapshot/inbox sweep plans |
+// Blueprint: | `BridgeEvalSeams.swift` | Replay bounds, KVS headroom, nudge admission and retention plans. |
 
-/// Bounded, durable replay-filter state shared by bridge lifecycles.
+/// Durable replay bounds must agree across bridge lifecycles.
 enum ICloudSeenIDDefaultsStore {
     static func load(defaults: UserDefaults, key: String, cap: Int) throws -> [String] {
         guard let value = defaults.object(forKey: key) else { return [] }
@@ -51,9 +51,7 @@ enum ICloudDeliveryNudgePlan {
     static let delaysNanoseconds: [UInt64] = [1_000_000_000, 3_000_000_000]
 }
 
-/// Shared KVS keyspace contract. The ubiquitous store hard-stops at 1,024
-/// keys; leave deterministic room for pairing, snapshots, and inbox nudges so
-/// a stream-progress overwrite never reports success from a full keyspace.
+/// KVS stops at 1,024 keys; reserve room for pairing, snapshots and inbox nudges before admitting progress.
 struct ICloudKVSKeyspaceSnapshot: Equatable, Sendable {
     let totalKeyCount: Int
     let inboxResponseKeyCount: Int
@@ -80,8 +78,7 @@ enum ICloudKVSProgressWriteAdmission: Equatable, Sendable {
         if snapshot.inboxResponseKeyCount > inboxResponseKeyCeiling {
             return .responseSweepOverCeiling(snapshot)
         }
-        // An existing progress key is an overwrite, so it may use the final
-        // safe slot. A new key must leave the headroom intact after insertion.
+        // Overwrites may use the final safe slot; new keys must preserve headroom after insertion.
         if snapshot.totalKeyCount > totalKeyCeiling
             || (!snapshot.progressKeyExists && snapshot.totalKeyCount >= totalKeyCeiling) {
             return .keyspaceAtHeadroomLimit(snapshot)
@@ -132,9 +129,7 @@ struct MacSyncChatSnapshotCoalescerState: Equatable {
         return true
     }
 
-    /// Finishes only the matching lifecycle.  A stale task cannot erase work
-    /// queued by a newer lifecycle, while a matching stale generation clears its
-    /// own latch rather than leaving every later request permanently upgraded.
+    /// Match lifecycle and generation so a stale task cannot erase newer work or strand its own latch.
     mutating func resolve(generation: UInt64, currentGeneration: UInt64, isActive: Bool) -> Bool? {
         guard activeGeneration == generation else { return nil }
         activeGeneration = nil
@@ -150,7 +145,12 @@ struct MacSyncChatSnapshotCoalescerState: Equatable {
 }
 
 enum MacSyncArchiveRetentionWatchPaths {
-    static func resolve(inboxDirectory: URL?, responsesDirectory: URL?, transactionDirectory: URL?, dataRoot: URL, fileManager: FileManager = .default) -> [URL] {
+    static func resolve(
+        inboxDirectory: URL?,
+        responsesDirectory: URL?,
+        transactionDirectory: URL?,
+        dataRoot: URL,
+        fileManager: FileManager = .default) -> [URL] {
         guard let responsesDirectory, let transactionDirectory else { return [] }
         let rejected = inboxDirectory?.appendingPathComponent("_rejected", isDirectory: true)
         let paths = [inboxDirectory, responsesDirectory, rejected, transactionDirectory,
@@ -190,9 +190,7 @@ enum MacSyncInboxResponseSweep {
         var exceedsCap: Bool
     }
 
-    /// Missing and expired responses are always safe to remove.  Under pressure,
-    /// an unreadable/orphaned entry may be evicted, but a recent readable
-    /// response is never sacrificed merely to reach a numerical cap.
+    /// Quota pressure may evict unreadable or orphaned responses, never recent readable ones.
     static func keysToRemove(entries: [Entry], now: Date, ttl: TimeInterval, cap: Int) -> [String] {
         var removed: [String] = []
         let survivors = entries.filter { entry in
@@ -226,9 +224,6 @@ enum MacSyncInboxResponseSweep {
         )
     }
 
-    /// Apply the exact, already-audited eviction plan to any key-value store.
-    /// Production supplies the KVS remover; hermetic evaluations supply a
-    /// dictionary-backed fake without touching the user's iCloud account.
     static func apply(_ plan: Plan, remove: (String) -> Void) {
         for key in plan.keysToRemove {
             remove(key)

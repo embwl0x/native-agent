@@ -1,8 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `DeskNotify.swift` | `DeskNotificationRead`, `DeskNotificationProposal`: frozen native policy inputs and typed proposals; native consent/ceilings and defer truth; Desk/config revision checks and baseline/window commit under native locks; a nag's baseline and ledger settle only after channel acceptance or durable hold. No part execution under a lock. Notification, nag, drift wording and deadline policy live in Resources/abilities/desk-notify.js; the person's unmute and scheduled loop share it |
+// Blueprint: | `DeskNotify.swift` | `DeskNotificationRead`, `DeskNotificationProposal`: native consent and locked settlement |
 
-/// An editable decision, never a write to Desk or its notification ledger.
+/// Part decisions are proposals; native policy retains write authority.
 public struct DeskNotificationProposal: Codable, Sendable {
     public struct Notification: Codable, Sendable {
         public let handle: String
@@ -27,8 +27,7 @@ public struct DeskNotificationProposal: Codable, Sendable {
     public let deadline: Double?
 }
 
-/// Frozen native facts for both the scheduled pass and the person's unmute.
-/// Calling the part is the caller's job, through its originating app door.
+/// Freeze facts before calling the part through its originating app door.
 public struct DeskNotificationRead: Sendable {
     public let state: DeskState
     public let config: DeskNagConfig
@@ -54,7 +53,7 @@ public struct DeskNotificationRead: Sendable {
         return Self(state: state, config: config, now: now, unmute: unmute, facts: facts)
     }
 
-    /// Only policy facts cross this boundary, never notes, refs or work receipts.
+    /// Keep notes, refs and work receipts outside the policy boundary.
     public var input: JSONValue {
         func seconds(_ date: Date?) -> JSONValue { date.map { .double($0.timeIntervalSince1970) } ?? .null }
         var facts: [String: JSONValue] = [:]
@@ -91,7 +90,7 @@ public struct DeskNotificationRead: Sendable {
         ])
     }
 
-    /// Native consent and ceilings cannot be rewritten by a part's answer.
+    /// Part answers cannot override native consent or ceilings.
     public func validate(_ proposal: DeskNotificationProposal) throws {
         func unique(_ handles: [String]) -> Bool { Set(handles).count == handles.count }
         guard unique(proposal.notifications.map(\.handle)), unique(proposal.nags.map(\.handle)),
@@ -105,7 +104,6 @@ public struct DeskNotificationRead: Sendable {
                   let level = NotifyLevel(rawValue: notification.level), [.direct, .urgent].contains(level),
                   let ceiling = notificationConsent(item), level != .urgent || ceiling == .urgent,
                   notification.oneTimeAnnouncement == Self.explicit(item) else { throw InvalidProposal() }
-            // A part cannot republish an occurrence the native stamp settled.
             if let last = item.notify.lastNotifiedAt.flatMap(DeskClock.parseISO) {
                 let revision = item.status.isTerminal
                     ? item.closedAt.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap(DeskClock.parseISO) : DeskClock.parseISO(item.updatedAt)
@@ -127,11 +125,9 @@ public struct DeskNotificationRead: Sendable {
         }
     }
 
-    /// Compare BOTH sources under their native locks before publication.
-    /// A scheduled mute-expiry digest consumes its window only after delivery.
-    /// No JavaScript executes here. A changed read fails visibly, without replay.
-    public func commit(_ proposal: DeskNotificationProposal, dataRoot: URL, quietHours: Bool = false,
-                       digestAccepted: Bool = false) async throws -> DeskNagConfig {
+    /// Compare both sources under native locks; consume expiry windows only after delivery.
+    /// Execute no JavaScript while locked; stale reads fail visibly without replay.
+    public func commit(_ proposal: DeskNotificationProposal, dataRoot: URL, digestAccepted: Bool = false) async throws -> DeskNagConfig {
         try validate(proposal)
         try Task.checkCancellation()
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
@@ -140,9 +136,8 @@ public struct DeskNotificationRead: Sendable {
             let feed = try await store.readFeedUnlocked()
             let currentState = SwiftNativeDeskStore.compact(base: feed.base, feed.ops)
             guard feed.integrity.isClean, currentState.items == state.items else { throw ChangedRead() }
-            // No config write while disabled, quiet, or awaiting digest delivery.
-            // Direct pings are separate.
-            if !unmute && (quietHours || !config.enabled
+            // Delivery holds belong to the router; Desk retains only its own mute and digest rules.
+            if !unmute && (!config.enabled
                 || proposal.openWindow && !proposal.digest.isEmpty && !digestAccepted) {
                 guard try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked() == config else { throw ChangedRead() }
                 return config
@@ -163,7 +158,7 @@ public struct DeskNotificationRead: Sendable {
         }
     }
 
-    /// A failed delivery leaves both the movement baseline and window unconsumed.
+    /// Failed delivery must leave movement and attention available for a later attempt.
     public func recordNagDelivery(_ nag: DeskNotificationProposal.Nag, dataRoot: URL) async throws {
         guard let observed = facts[nag.handle]?.observed else { throw InvalidProposal() }
         _ = try await DeskNagConfigStore(dataRoot: dataRoot).updating { current in
@@ -206,7 +201,7 @@ public struct DeskNotificationRead: Sendable {
         return nil
     }
 
-    /// Dependency/defer truth stays native, including malformed parent chains.
+    /// Dependency and defer truth stay native even when parent chains are malformed.
     static func parking(_ item: DeskItem, in state: DeskState, now: Date) -> (parked: Bool, until: Date?) {
         var current: DeskItem? = item
         var seen: Set<String> = []

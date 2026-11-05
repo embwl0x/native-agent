@@ -2,11 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `ManagedLoopRunner.swift` | LoopExecutionGate and ManagedLoopRunner serialize each registration through physical worker exit and durable accounting |
+// Blueprint: | `ManagedLoopRunner.swift` | LoopExecutionGate and ManagedLoopRunner: serialize each registration until body exit and accounting settle |
 
-/// Serializes every execution request for one loop registration. A request
-/// arriving during an active tick waits for that tick and then returns without
-/// invoking the underlying loop again.
+/// Coalesce requests against active execution and join its physical exit instead of invoking the worker twice.
 
 internal actor LoopExecutionGate {
     struct Snapshot: Sendable {
@@ -22,8 +20,7 @@ internal actor LoopExecutionGate {
     /// `finish` only releases the execution that owns this token.
     private var generation: UInt64 = 0
 
-    /// Returns the ownership token to the request that owns this execution.
-    /// Coalesced callers wait for that owner and receive nil.
+    /// Give the owner its token; coalesced callers wait for settlement and receive nil.
     func acquireOrJoin(startedAt: Date) async -> UInt64? {
         guard accepting, !Task.isCancelled else { return nil }
         guard active else {
@@ -82,13 +79,12 @@ internal struct ManagedLoopRunner: LoopRunner {
     let onFinished: @Sendable () async -> Void
 
     var loopId: String { underlying.loopId }
-    var interval: TimeInterval { underlying.interval }
+    var wake: OrganWake { underlying.wake }
     var tickTimeoutOverride: TimeInterval? { underlying.tickTimeoutOverride }
 
-    /// The outer timeout selects the caller's verdict; this retained child
-    /// releases its gate token only after body exit and outcome accounting.
+    /// Managed registrations require the manager's explicit accounting handshake.
     func tickOutcome() async -> LoopTickOutcome {
-        await tickOutcome(ifDue: nil)
+        .failed(error: "Background work must start through its manager so its result is recorded.")
     }
 
     func shutdown() async {
@@ -98,10 +94,9 @@ internal struct ManagedLoopRunner: LoopRunner {
     }
 
     /// Gate admission precedes the durable due and lifecycle checks.
-    func tickOutcome(ifDue isDue: (@Sendable () async -> Bool)?) async -> LoopTickOutcome {
-        guard let accounting = LoopTickAccounting.current else {
-            return .failed(error: "Background work could not start because result tracking is unavailable.")
-        }
+    func tickOutcome(
+        ifDue isDue: (@Sendable () async -> Bool)?, execution: ManagedLoopExecution
+    ) async -> LoopTickOutcome {
         guard let token = await gate.acquireOrJoin(startedAt: clock()) else {
             return .skipped(reason: LoopTickOutcome.coalescedSkipReason)
         }
@@ -120,7 +115,7 @@ internal struct ManagedLoopRunner: LoopRunner {
             if !Task.isCancelled && !outcome.isHealthNeutralSkip {
                 PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: loopId)
             }
-            await finishAfterRecording(token: token, accounting: accounting)
+            await finishAfterRecording(token: token, accounting: execution.accounting)
             return outcome
         }
         await gate.retain(child, token: token)

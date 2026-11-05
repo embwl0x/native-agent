@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramUpdateInbox.swift` | `TelegramUpdateInbox` struct; `snapshots`, `ensurePending`, `failedReplyClaims`, `repair`; maintained claim index emits delivery invalidations and can be reconstructed from checked claims without changing phases; recovery exceptions retain a terminal quarantined claim and reason, excluded from automatic replay; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
+// Blueprint: | `TelegramUpdateInbox.swift` | `TelegramUpdateInbox`, `snapshots`, `ensurePending`, `failedReplyClaims`, `repair`: life-bound recovery |
 
 enum TelegramUpdateClaimPhase: String, Sendable, Equatable, Codable {
     case pending
@@ -41,7 +41,9 @@ struct TelegramUpdateClaim: Sendable, Codable, Equatable {
 
 extension TelegramUpdateClaim {
     enum CodingKeys: String, CodingKey {
-        case schemaVersion, lifeID, updateId, update, phase, assistantDelivery, assistantRunId, assistantSessionId, assistantOriginRunId, settledAssistantRuns, noRecoverableAnswer, failedBeforeAnswer, quarantineReason, queueAcknowledgementMessageId, resolvedRetryText, resolvedRetryMessage, resolvedSessionId, claimedAt, updatedAt
+        case schemaVersion, lifeID, updateId, update, phase, assistantDelivery, assistantRunId, assistantSessionId,
+            assistantOriginRunId, settledAssistantRuns, noRecoverableAnswer, failedBeforeAnswer, quarantineReason,
+            queueAcknowledgementMessageId, resolvedRetryText, resolvedRetryMessage, resolvedSessionId, claimedAt, updatedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -109,15 +111,20 @@ enum TelegramUpdateInboxError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .malformedClaim(let name):
-            return "telegram_claim_malformed: Inbox claim \(name) is malformed. Inspect that file in this bot's update_inbox and reconcile any delivery receipts before repairing it; do not delete it to replay the update."
+            return """
+                telegram_claim_malformed: Inbox claim \(name) is malformed. Inspect that file in this bot's update_inbox and \
+                reconcile any delivery receipts before repairing it; do not delete it to replay the update.
+                """
         case .mismatchedUpdateId(let expected, let actual):
-            return "telegram_claim_mismatch: Inbox claim ID is \(actual), expected \(expected). Reconcile \(expected).json in this bot's update_inbox with its delivery receipts before repairing it; do not replay the update."
+            return """
+                telegram_claim_mismatch: Inbox claim ID is \(actual), expected \(expected). Reconcile \(expected).json in this \
+                bot's update_inbox with its delivery receipts before repairing it; do not replay the update.
+                """
         }
     }
 }
 
-/// Claims precede the upstream offset and resume only within their life.
-/// Processing uncertainty never replays effects; queued claims retain their controls.
+/// Claims precede the upstream offset and resume only within their life. Processing uncertainty never replays effects; queued claims retain their controls.
 public struct TelegramUpdateInbox: Sendable {
     let directory: URL
     private let dataRoot: URL
@@ -158,7 +165,10 @@ public struct TelegramUpdateInbox: Sendable {
                 try await store.writeIndex(InboxClaimIndex(claims: claims))
                 _ = try await store.recoverableClaimsLocked()
                 return .object(["status": .string("ok"), "inbox": .string(inbox),
-                    "detail": .string("Telegram admission index rebuilt from its checked claims. Claim phases and uncertain effects are unchanged; the next successful inbox recovery settles the repair.")])
+                    "detail": .string("""
+                        Telegram admission index rebuilt from its checked claims. Claim phases and uncertain effects are unchanged; the \
+                        next successful inbox recovery settles the repair.
+                        """)])
             }
         } catch {
             throw store.repairFailure(error, dataRoot: dataRoot, effects: .unknown)
@@ -180,7 +190,10 @@ public struct TelegramUpdateInbox: Sendable {
         return ToolFailureError("Telegram admission recovery failed at \(owner): \(error.localizedDescription) "
             + (name == indexPath.lastPathComponent
                 ? "Rebuild the index from its checked claims; restarting the poller cannot repair this state."
-                : "Read this claim and restore it only from authoritative admission or delivery evidence, preserving unknown effects; then call telegram.repair for \(inbox)."),
+                : """
+                    Read this claim and restore it only from authoritative admission or delivery evidence, preserving unknown effects; \
+                    then call telegram.repair for \(inbox).
+                    """),
             effects: effects, owner: owner, nextCall: next)
     }
 
@@ -339,25 +352,6 @@ public struct TelegramUpdateInbox: Sendable {
         }
     }
 
-    @discardableResult
-    func recordQueueAcknowledgement(
-        updateId: Int,
-        messageId: Int
-    ) async throws -> TelegramUpdateClaim {
-        let path = claimPath(updateId: updateId)
-        return try await withClaimMutationLock(path) {
-            let current = try decodeClaim(at: path)
-            // A send can settle after the queued turn starts or is consumed.
-            // Preserve the returned message identity in every phase.
-            var next = current
-            next.queueAcknowledgementMessageId = messageId
-            next.updatedAt = _tgNowString()
-            try await write(next, to: path)
-            try await upsertIndex(next)
-            return next
-        }
-    }
-
     func claim(updateId: Int) throws -> TelegramUpdateClaim {
         try decodeClaim(at: claimPath(updateId: updateId))
     }
@@ -425,16 +419,13 @@ public struct TelegramUpdateInbox: Sendable {
             claim.failedBeforeAnswer = false
             claim.phase = .outcomeUnknown
             claim.updatedAt = _tgNowString()
-            // Publish recovery eligibility first. If the claim write fails,
-            // recovery reads the prior settled claim and repairs this index.
+            // Publish recovery eligibility first. If the claim write fails, recovery reads the prior settled claim and repairs this index.
             try await upsertIndex(claim)
             try await write(claim, to: path)
         }
     }
 
-    /// Recovery reads the maintained index, then opens only pending,
-    /// processing, queued, or permission-blocked claim files. Terminal retention never makes an idle Telegram
-    /// tick reread hundreds of historical update payloads.
+    /// Read only recovery-eligible claims through the index so idle ticks never scan retained historical payloads.
     func recoverableClaims() async throws -> [TelegramUpdateClaim] {
         try await SwiftNativePersistenceCore.withFileLock(indexPath) {
             try await recoverableClaimsLocked()
@@ -505,9 +496,7 @@ public struct TelegramUpdateInbox: Sendable {
         directory.appendingPathComponent("claims_index.json", isDirectory: false)
     }
 
-    // Index ownership precedes claim ownership and spans both durable writes.
-    // Recovery, migration, and pruning hold this same index lock, so none can
-    // replace another topic's index entry or remove an in-flight claim.
+    // Hold index before claim ownership across both writes so recovery and pruning cannot lose topics or in-flight claims.
     private func withClaimMutationLock<T: Sendable>(
         _ path: URL,
         _ body: @Sendable () async throws -> T
@@ -534,8 +523,7 @@ public struct TelegramUpdateInbox: Sendable {
             throw TelegramUpdateInboxError.mismatchedUpdateId(expected: claim.updateId, actual: claim.update.updateId)
         }
         if let delivery = claim.assistantDelivery {
-            // A reply reservation (previewPending, written by the session stream before any text)
-            // is a current claim shape: it waits for the canonical transcript.
+            // previewPending reserves delivery before any text and must await the canonical transcript.
             guard !delivery.reply.isEmpty || !(delivery.imagePaths ?? []).isEmpty || delivery.previewPending == true,
                   delivery.confirmedMessageIds.count <= TelegramRichMessageRenderer.render(delivery.reply).count,
                   (0...(delivery.imagePaths?.count ?? 0)).contains(delivery.confirmedImageCount ?? 0) else {
@@ -558,8 +546,7 @@ public struct TelegramUpdateInbox: Sendable {
 
     private func loadIndex() async throws -> InboxClaimIndex {
         guard FileManager.default.fileExists(atPath: indexPath.path) else {
-            // Only an empty store may bootstrap. Existing claims without an
-            // index need the explicit checked repair, never silent recovery.
+            // Only an empty store may bootstrap. Existing claims without an index need the explicit checked repair, never silent recovery.
             guard try await snapshots().isEmpty else {
                 throw TelegramUpdateInboxError.malformedClaim(indexPath.lastPathComponent)
             }

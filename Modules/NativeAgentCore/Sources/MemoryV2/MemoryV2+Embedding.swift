@@ -11,15 +11,11 @@ import PersistenceCore
 import CoreML
 #endif
 
-// Blueprint: | `MemoryV2+Embedding.swift` | Embedding provider contracts and `CoreMLEmbeddingProvider`: real-model loading, artifact epochs, bounded compiled-model storage, fail-closed availability, one batch prediction with per-text normalization outcomes; complete-vector callers receive indexed failures |
+// Blueprint: | `MemoryV2+Embedding.swift` | `CoreMLEmbeddingProvider`: checked real-model loading and batch outcomes |
 
 // MARK: - Embedding framework + on-disk store + Swift recaller
-//
-// Production model packaging happens outside runtime. bge-large-en-v1.5 and
-// its WordPiece vocabulary ship in Resources/embedding; a data-root copy may
-// supply the same model. Missing or broken assets fail closed by path.
-// Production callers go through SwiftNativeMemoryV2.recall(). When the real
-// model is unavailable, only an explicit mock opt-in permits synthetic vectors.
+// Production uses packaged bge and WordPiece artifacts from Resources or the data root; missing or broken assets fail by path. Synthetic vectors require
+// explicit mock selection.
 
 // MARK: - EmbeddingProvider protocol
 
@@ -30,8 +26,7 @@ public protocol EmbeddingProvider: Sendable {
     func embed(_ texts: [String]) async throws -> [[Float]]
     func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
     func embedItemsWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingItemBatch
-    /// Search queries, in the same space as the stored text they are scored
-    /// against. Never for text that is stored.
+    /// Search queries, in the same space as the stored text they are scored against. Never for text that is stored.
     func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
 }
 
@@ -41,7 +36,6 @@ public extension EmbeddingProvider {
         return MemoryEmbeddingItemBatch(epoch: batch.epoch, items: batch.vectors.map { .vector($0) })
     }
 
-    /// A symmetric model embeds a query like any other text.
     func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         try await embedWithEpoch(texts)
     }
@@ -52,7 +46,7 @@ public extension EmbeddingProvider {
 }
 
 // MARK: - MockEmbeddingProvider
-// Explicit synthetic provider: FNV-1a seeds xorshift64*, then L2 normalization.
+// Seed deterministic synthetic vectors explicitly and normalize them for cosine scoring.
 public struct MockEmbeddingProvider: EmbeddingProvider {
     public let dimensions: Int
     public let modelId: String = "mock"
@@ -84,7 +78,6 @@ public struct MockEmbeddingProvider: EmbeddingProvider {
         if state == 0 { state = 0x9E3779B97F4A7C15 }
         var out = [Float](repeating: 0, count: dim)
         for i in 0..<dim {
-            // xorshift64* — deterministic, decent distribution for tests.
             state ^= state >> 12
             state ^= state << 25
             state ^= state >> 27
@@ -134,17 +127,14 @@ public struct FailClosedEmbeddingProvider: EmbeddingProvider {
 }
 
 // MARK: - CoreMLEmbeddingProvider
-//
-// Require a loaded Core ML model and vocabulary; shared inference failures
-// throw, while corpus convergence retains each unusable prediction's outcome.
+// Require the model and vocabulary; shared inference failures throw while unusable corpus predictions retain item-scoped outcomes.
 public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
     public static let allowedModelExtensions: Set<String> = ["mlpackage", "mlmodelc", "mlmodel"]
     // Share the artifact digest independently of each provider's epoch parameters.
     private static let cachedExtrasEpoch = Mutex<(fingerprint: String, digest: String, epoch: MemoryEmbeddingEpoch?)?>(nil)
 
-    /// Cheap change detector for an installed extras model: every file under
-    /// the package plus the manifest and vocab, as relative path, size and
-    /// modification time.
+    /// Cheap change detector for an installed extras model: every file under the package plus the manifest and vocab, as relative path, size and modification
+    /// time.
     private static func extrasFingerprint(_ installed: InstalledExtrasModel) throws -> String {
         let fm = FileManager.default
         func stamp(_ url: URL, relativeTo base: URL) throws -> String {
@@ -176,14 +166,13 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     private let modelURL: URL
     private let tokenizer: WordPieceTokenizer
     private let maxSeqLength: Int
-    /// The one production embedding model, shipped in Resources/embedding.
     public static let bundledModelID = "bge-large-en-v1.5"
     public static let bundledDimensions = 1024
     #if canImport(CoreML) && !os(Linux)
     private let mlModel: MLModel
     #endif
 
-    /// The embedding model always uses CPU + Neural Engine, never the GPU.
+    /// Use CPU and Neural Engine so embedding never consumes GPU capacity.
     #if canImport(CoreML) && !os(Linux)
     public static func modelConfiguration() -> MLModelConfiguration {
         let configuration = MLModelConfiguration()
@@ -236,8 +225,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         )
 
         #if canImport(CoreML) && !os(Linux)
-        // The cache owner loads the compiled artifact before serving it.
-        // A failed load reports that artifact; only explicit repair removes it.
+        // The cache owner loads the compiled artifact before serving it. A failed load reports that artifact; only explicit repair removes it.
         let configuration = Self.modelConfiguration()
         do {
             if ext == "mlpackage" {
@@ -300,7 +288,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
 
     #if canImport(CoreML) && !os(Linux)
-    /// Explicit repair removes only this source artifact's current OS cache.
+    /// Explicit repair removes only the selected artifact's current OS cache.
     public static func wipeCompileCache(packageURL: URL) throws {
         let root = try compileCacheRoot()
         let cached = try compileCacheDirectory(packageURL: packageURL,
@@ -315,8 +303,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     #endif
 
     #if canImport(CoreML) && !os(Linux)
-    /// Load exactly once at its durable path under the cache's cross-process
-    /// lock. A failed artifact remains named for explicit repair, never served.
+    /// Load exactly once at its durable path under the cache's cross-process lock. A failed artifact remains named for explicit repair, never served.
     static func loadCompiledModel(
         packageURL: URL,
         artifactDigest: String,
@@ -345,7 +332,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             if fm.fileExists(atPath: cached.path) {
                 do { return try MLModel(contentsOf: cached, configuration: configuration) }
                 catch {
-                    throw EmbeddingError.modelNotLoaded(reason: "Compiled artifact \(cached.path) failed to load: \(error). Repair this artifact through Doctor.")
+                    throw EmbeddingError.modelNotLoaded(
+                        reason: "Compiled artifact \(cached.path) failed to load: \(error). Repair this artifact through Doctor.")
                 }
             }
 
@@ -456,7 +444,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
     #endif
 
-    /// Resolve bge from the data root or Resources/embedding, then load it.
     public static func bundled(extrasRoot: URL? = nil) throws -> CoreMLEmbeddingProvider {
         let installed = try installedExtrasModel(root: extrasRoot)
         return try CoreMLEmbeddingProvider(
@@ -467,14 +454,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         )
     }
 
-    /// bge installed under `<dataRoot>/extras/coreml/` or Resources/embedding,
-    /// described by `embedding.json` beside it:
-    ///
-    ///     {"model": "embedding.mlpackage", "vocab": "vocab.txt",
-    ///      "model_id": "bge-large-en-v1.5", "dimensions": 1024}
-    ///
-    /// Its artifacts participate in the embedding epoch; launch convergence
-    /// re-embeds a corpus still in an older vector space.
+    /// Read bge model and vocabulary from their colocated embedding.json; artifact identity enters the epoch so convergence replaces incompatible corpus
+    /// vectors.
     public struct InstalledExtrasModel: Sendable, Equatable {
         public let modelURL: URL
         public let vocabURL: URL
@@ -482,8 +463,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         public let dimensions: Int
     }
 
-    /// A present but unusable manifest throws immediately. With neither copy,
-    /// fail by name and path, exactly as for a broken install.
+    /// A present but unusable manifest throws immediately. With neither copy, fail by name and path, exactly as for a broken install.
     public static func installedExtrasModel(root: URL?) throws -> InstalledExtrasModel {
         _ = try EmbeddingModelDownload.configuredDescriptor()
         if let root,
@@ -505,16 +485,13 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         )
     }
 
-    /// nil when `dir` has no `embedding.json`; throws when it has one that
-    /// cannot be used, naming why.
+    /// Only an absent manifest returns nil; unusable configured artifacts throw with their cause.
     static func extrasModel(inDirectory dir: URL) throws -> InstalledExtrasModel? {
         let manifest = dir.appendingPathComponent("embedding.json")
         func unusable(_ reason: String) -> EmbeddingError {
             .installedModelUnusable(manifest: manifest.path, reason: reason)
         }
-        // Only a manifest that is genuinely absent means "nothing installed".
-        // lstat, not fileExists: a dangling symlink or an unreadable folder is
-        // a broken install, not an absent one.
+        // Use lstat so dangling symlinks and unreadable folders cannot masquerade as absent installs.
         var info = stat()
         if lstat(manifest.path, &info) != 0 {
             if errno == ENOENT || errno == ENOTDIR { return nil }
@@ -566,9 +543,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return resolvedEpoch
     }
 
-    /// Cheap bundle-resource probe used by Settings/status. This intentionally
-    /// does not compile or load the CoreML model, so merely opening Settings
-    /// cannot pull the model into memory.
+    /// Probe resources without compiling or loading CoreML so opening Settings cannot allocate the model.
     public static func bundledResourcesAvailable(extrasRoot: URL? = nil) -> Bool {
         do {
             _ = try installedExtrasModel(root: extrasRoot)
@@ -578,8 +553,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         }
     }
 
-    /// The shadow check must not infer absence from a clipped sentence. This
-    /// reads the already-loaded tokenizer's exact window, without inference.
+    /// The shadow check must not infer absence from a clipped sentence. This reads the already-loaded tokenizer's exact window, without inference.
     func coversCompleteTexts(_ texts: [String]) -> Bool {
         texts.allSatisfy { tokenizer.encode($0, maxLength: maxSeqLength).isComplete }
     }
@@ -602,7 +576,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
 
     private func embed(_ encoded: [(inputIds: [Int], attentionMask: [Int], isComplete: Bool)]) async throws -> [MemoryEmbeddingItem] {
         #if canImport(CoreML) && !os(Linux)
-        // Predict every text in one call as a single batch.
         var inputs: [MLFeatureProvider] = []
         var masks: [[Int]] = []
         inputs.reserveCapacity(encoded.count)
@@ -640,9 +613,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         for index in 0..<outputs.count {
             let out = outputs.features(at: index)
             let mask = masks[index]
-            // Take the first multiarray output and mean-pool over the token
-            // dimension when shape is [1, seq, dim]; if it's already [1, dim]
-            // (pooled output), use it as-is.
             var pooled: MemoryEmbeddingItem? = nil
             for name in out.featureNames {
                 guard let val = out.featureValue(for: name), let arr = val.multiArrayValue else { continue }
@@ -650,7 +620,9 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
                 if pooled != nil { break }
             }
             guard let vec = pooled else {
-                throw EmbeddingError.modelNotLoaded(reason: "no usable multiarray output in CoreML prediction (missing output or unexpected shape vs dim=\(dimensions))")
+                throw EmbeddingError.modelNotLoaded(reason: """
+                    no usable multiarray output in CoreML prediction (missing output or unexpected shape vs dim=\(dimensions))
+                    """)
             }
             results.append(vec)
         }
@@ -664,13 +636,12 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     #if canImport(CoreML) && !os(Linux)
     private static func meanPoolAndNormalize(_ arr: MLMultiArray, mask: [Int], dim: Int) -> MemoryEmbeddingItem? {
         let shape = arr.shape.map { $0.intValue }
-        // Case 1: [1, dim] or [dim] — already pooled.
         if shape == [1, dim] || shape == [dim] {
             var out = [Float](repeating: 0, count: dim)
             for i in 0..<dim { out[i] = arr[i].floatValue }
             return normalizedItem(out)
         }
-        // Case 2: [1, seq, dim] — mean-pool over seq using attention mask.
+        // Attention masking prevents padded tokens from affecting the pooled vector.
         if shape.count == 3, shape[0] == 1, shape[2] == dim {
             let seq = shape[1]
             var sum = [Float](repeating: 0, count: dim)
@@ -699,8 +670,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return normalized
     }
 
-    /// Only normalization of this prediction is item-scoped. Missing output,
-    /// wrong output shape and failed batch inference remain shared failures.
+    /// Only normalization of this prediction is item-scoped. Missing output, wrong output shape and failed batch inference remain shared failures.
     private static func normalizedItem(_ vector: [Float]) -> MemoryEmbeddingItem {
         do { return .vector(try l2norm(vector)) }
         catch { return .unembeddable(reason: error.localizedDescription) }

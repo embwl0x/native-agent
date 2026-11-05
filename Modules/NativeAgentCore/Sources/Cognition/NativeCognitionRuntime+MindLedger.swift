@@ -1,7 +1,5 @@
-// Why reads the turn trace, where each delivered turn records why its felt cue
-// (or none) won and each context build records which memories competed. The
-// prompt never carries any of it. Reject and undo are her own verbs over her
-// own mind; the substrate owns bounded rejections and one disposition undo.
+// Read cue and memory competition from traces on demand so the prompt carries no diagnostic weight.
+// The substrate owns bounded rejection and disposition undo.
 
 import ChatTurnContracts
 import AgentConversations
@@ -14,129 +12,190 @@ import Privacy
 import Studio
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+MindLedger.swift` | `NativeCognitionRuntime` mind ledger: trace-backed why (cue, memory, outreach, expansion and interpretation lanes), association rejection and undertone undo through substrate owners |
+// Blueprint: | `NativeCognitionRuntime+MindLedger.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
-    /// Why and terminal rows of today and yesterday (calendar days), newest
-    /// first, and each day's trace that could not be read: never "no record".
-    private static func whyEvents(dataRoot: URL) async -> (events: [TurnTraceEvent], unreadable: [String]) {
+    /// Keep each turn's evidence, including acts that never reached a why or terminal row: this day's and the previous day's whole days, each its
+    /// own bounded read. Unreadable details cannot be assigned to a turn; only a failed record read fails the ledger read.
+    private static func whyEvents(dataRoot: URL) async throws -> (events: [TurnTraceEvent], traceGaps: [JSONValue]) {
         let reader = TurnTraceRecentReader(dataRootOverride: dataRoot)
         let now = Date()
         var events: [TurnTraceEvent] = []
-        var unreadable: [String] = []
-        for (name, day) in [("today", now), ("yesterday", Calendar.current.date(byAdding: .day, value: -1, to: now) ?? now)] {
-            do {
-                let snapshot = try await reader.read(now: day)
-                events += snapshot.events.filter { $0.kind == "mind.why" || $0.kind == "turn.terminal" }
-                if !snapshot.completeSequences {
-                    unreadable.append("\(name)'s turn trace has incomplete coverage (truncated: \(snapshot.truncated), malformed rows: \(snapshot.malformedRows), partial tail: \(snapshot.trailingPartialLine))")
-                }
-            } catch {
-                unreadable.append("\(name)'s turn trace (\(error.localizedDescription))")
+        var traceGaps: [JSONValue] = []
+        for offset in 0..<2 {
+            guard let day = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -offset, to: now) else {
+                throw PersistenceCoreError.ioFailure("Could not resolve the record day.")
+            }
+            let snapshot = try await reader.read(now: day)
+            events += snapshot.events
+            if snapshot.limitReached || snapshot.unreadable > 0 {
+                traceGaps.append(.object([
+                    "source": .string("detail"),
+                    "day": .string(TurnTracePersistLane.dayString(from: day)),
+                    "limit_reached": .bool(snapshot.limitReached),
+                    "unreadable_rows": .int(Int64(snapshot.unreadable)),
+                    "detail": .string(
+                        "These gaps may hide other records; their turn ids cannot be established. They do not invalidate the rows read for a known turn."),
+                ]))
             }
         }
-        return (events.sorted { $0.ts > $1.ts }, unreadable)
+        return (events.sorted { $0.ts > $1.ts }, traceGaps)
     }
 
-    private static func lane(_ event: TurnTraceEvent) -> String {
-        if case .object(let payload) = event.payload, case .string(let lane)? = payload["lane"] { return lane }
-        return "cue"
+    /// Check every observed why row; a readable sibling row cannot conceal its gap.
+    /// Missing evidence describes only this act, never its outcome or a sibling's record.
+    private static func whyGap(turn: String, events: [TurnTraceEvent], whyAvailable: (TurnTraceEvent) -> Bool) -> JSONValue? {
+        var missing: [String] = []
+        if !events.contains(where: { TurnTraceEvent.isTerminalKind($0.kind) }) { missing.append("terminal") }
+        let why = events.filter { $0.kind == "mind.why" }
+        if why.isEmpty { missing.append("mind.why") }
+        for event in why where !whyAvailable(event) {
+            let label: String
+            if let lane = whyLane(event.payload) { label = "mind.why." + lane }
+            else { label = "mind.why" }
+            if !missing.contains(label) { missing.append(label) }
+        }
+        guard !missing.isEmpty else { return nil }
+        return .object([
+            "turn": .string(turn), "missing": .array(missing.map(JSONValue.string)),
+            "detail": .string("""
+                Some evidence is unavailable for this turn in the retained conversation trace: \(missing.joined(separator: ", ")). Evidence may be unreadable, \
+                may still arrive, may not have been emitted or retained, or may be withheld by current disclosure. This does not establish the turn's outcome.
+                """),
+        ])
     }
 
-    /// Why a cue or memory surfaced in the verified caller's conversation.
-    public func why(turn: String?) async -> JSONValue {
-        guard let caller = ChatTurnRuntimeContext.current,
-              let session = ChatToolSessionContext.verifiedSessionId,
-              !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !caller.surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .object(["status": .string("unavailable"),
-                            "detail": .string("This read needs a verified conversation.")])
-        }
-        let envelope = TurnEnvelope.current(surface: caller.surface)
-        let surface = MemoryRecordDisclosurePolicy.canonicalSurface(
-            envelope.agent == nil ? envelope.replyRoute.surface : "bridge")
-        let destination = TurnTraceContext.destinationId
-        let thread = TurnTraceContext.threadId
-        let (traced, unreadable) = await Self.whyEvents(dataRoot: dataRoot)
-        let events = traced.filter {
-            $0.sessionId == session && $0.surface == caller.surface
-                && $0.destinationId == destination && $0.threadId == thread
-        }
-        let unread = unreadable.isEmpty ? nil
-            : "Could not read " + unreadable.joined(separator: " or ") + ", so a record there may be missing."
-        let wanted = turn?.trimmingCharacters(in: .whitespacesAndNewlines)
-        var recent: [String] = []
-        for event in events where event.kind == "mind.why" && !recent.contains(event.turnId) {
-            recent.append(event.turnId)
-            if recent.count == 5 { break }
-        }
-        let completed = events.first {
-            guard $0.kind == "turn.terminal", $0.turnId != TurnTraceContext.turnId,
-                  case .object(let payload) = $0.payload else { return false }
-            return payload["status"] == .string("completed")
-        }
-        guard let target = (wanted?.isEmpty == false ? wanted : nil) ?? completed?.turnId else {
-            return .object(["status": .string("unavailable"),
-                            "detail": .string(unread ?? "No completed turn is recorded in this conversation. Pass turn explicitly to read its record."),
-                            "recent_turns": .array(recent.map { .string($0) })])
-        }
-        var rows: [(event: TurnTraceEvent, payload: JSONValue)] = []
-        for event in events where event.kind == "mind.why" && event.turnId == target {
-            if let payload = await disclosedWhyPayload(event.payload, surface: surface) {
-                rows.append((event, payload))
-            }
-        }
-        var out: [String: JSONValue] = [
-            "status": .string(unread != nil ? (rows.isEmpty ? "unavailable" : "incomplete") : rows.isEmpty ? "empty" : "ok"), "turn": .string(target)]
-        if rows.isEmpty {
-            out["detail"] = .string(unread ?? (target == TurnTraceContext.turnId
-                ? "No why record is available for this turn yet. Its cue record lands at delivery; pass this turn explicitly after it finishes."
-                : "No why record is available for the requested turn in this conversation."))
-        } else if let unread {
-            out["unreadable"] = .string(unread)
-        }
-        for row in rows where out[Self.lane(row.event)] == nil {
-            out[Self.lane(row.event)] = row.payload
-            out["at"] = out["at"] ?? .string(ISO8601DateFormatter().string(from: row.event.ts))
-        }
-        out["recent_turns"] = .array(recent.map { .string($0) })
-        return .object(out)
-    }
-
-    /// Trace copies cannot grant disclosure after a memory's policy changes.
-    /// Unsourced cue prose has the ordinary local-private boundary.
-    private func disclosedWhyPayload(_ payload: JSONValue, surface: String) async -> JSONValue? {
+    /// A known lane can still name its gap when its evidence cannot be read or disclosed.
+    private static func whyLane(_ payload: JSONValue) -> String? {
         guard case .object(let fields) = payload,
               case .string(let lane)? = fields["lane"],
               ["cue", "memory", "outreach", "expansion", "interpretation"].contains(lane) else { return nil }
-        if lane != "memory",
-           MemoryRecordDisclosurePolicy.classify(
-            personaID: nil, status: nil, lifecycle: nil, tags: nil, metadata: nil
-           )?.permits(surface: surface, personaID: nil) != true { return nil }
+        return lane
+    }
+
+    /// The same structural evidence check serves gap reporting and selected-row disclosure.
+    private static func whyEvidence(_ payload: JSONValue) -> (lane: String, sources: Set<String>)? {
+        guard let lane = whyLane(payload) else { return nil }
         var sources: Set<String> = []
         func collect(_ value: JSONValue) -> Bool {
             switch value {
             case .object(let object):
                 guard object["_truncated"] == nil else { return false }
                 if object["atom"] != nil, object["source"] == nil { return false }
-                if case .string(let source)? = object["source"] {
-                    sources.insert(source)
-                }
+                if case .string(let source)? = object["source"] { sources.insert(source) }
                 return object.values.allSatisfy(collect)
             case .array(let values): return values.allSatisfy(collect)
             default: return true
             }
         }
         guard collect(payload) else { return nil }
+        return (lane, sources)
+    }
+
+    /// Bind cue and memory explanations to the verified caller's conversation.
+    public func why(turn wantedTurn: String?, callerTurn turn: Turn) async -> JSONValue {
+        guard let caller = turn.runtime,
+              let session = turn.verifiedSessionID,
+              !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !caller.surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .object(["status": .string("unavailable"),
+                            "detail": .string("This read needs a verified conversation.")])
+        }
+        let envelope = TurnEnvelope.current(turn: turn, surface: caller.surface)
+        let surface = MemoryRecordDisclosurePolicy.canonicalSurface(
+            envelope.agent == nil ? envelope.replyRoute.surface : "bridge")
+        let destination = envelope.replyRoute.destinationId
+        let thread = envelope.replyRoute.threadId
+        let traced: [TurnTraceEvent]
+        let traceGaps: [JSONValue]
+        do {
+            (traced, traceGaps) = try await Self.whyEvents(dataRoot: dataRoot)
+        } catch {
+            return .object(["status": .string("unavailable"), "detail": .string(error.localizedDescription)])
+        }
+        let events = traced.filter {
+            $0.sessionId == session && $0.surface == caller.surface
+                && $0.destinationId == destination && $0.threadId == thread
+        }
+        let byTurn = Dictionary(grouping: events, by: \.turnId)
+        let wanted = wantedTurn?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var recent: [String] = []
+        for event in events where event.kind == "mind.why" && !recent.contains(event.turnId) {
+            recent.append(event.turnId)
+            if recent.count == 5 { break }
+        }
+        let completed = events.first {
+            guard $0.kind == "turn.terminal", $0.turnId != turn.id,
+                  case .object(let payload) = $0.payload else { return false }
+            return payload["status"] == .string("completed")
+        }
+        let target = (wanted?.isEmpty == false ? wanted : nil) ?? completed?.turnId
+        var rows: [(event: TurnTraceEvent, payload: JSONValue, lane: String)] = []
+        if let target {
+            for event in events where event.kind == "mind.why" && event.turnId == target {
+                if let disclosed = await disclosedWhyPayload(event.payload, surface: surface) {
+                    rows.append((event, disclosed.payload, disclosed.lane))
+                }
+            }
+        }
+        var gaps: [JSONValue] = []
+        for (id, recorded) in byTurn.sorted(by: { $0.key < $1.key }) where id != turn.id && id != target {
+            if let gap = Self.whyGap(turn: id, events: recorded, whyAvailable: {
+                Self.whyEvidence($0.payload) != nil
+            }) {
+                gaps.append(gap)
+            }
+        }
+        var out: [String: JSONValue] = [
+            "status": .string("ok"),
+            "recent_turns": .array(recent.map(JSONValue.string)),
+            "trace_gaps": .array(traceGaps),
+        ]
+        if let target {
+            let recorded = events.filter { $0.turnId == target }
+            let gap = Self.whyGap(turn: target, events: recorded, whyAvailable: { event in
+                rows.contains { $0.event == event }
+            })
+            if let gap { gaps.append(gap) }
+            out["turn"] = .string(target)
+            out["selection"] = .string(wanted?.isEmpty == false ? "requested" : "latest_recorded_completed")
+            out["record_status"] = .string(recorded.isEmpty ? "unrecorded" : gap == nil ? "recorded" : "incomplete")
+            out["detail"] = .string(rows.isEmpty
+                ? """
+                    No currently disclosable why record is available for turn \(target) in the retained conversation trace. This does not establish that none \
+                    was produced; it may still arrive.
+                    """
+                : "Why it surfaced on turn \(target), from its recorded evidence. Any missing evidence is named separately in turn_gaps and trace_gaps.")
+        } else {
+            out["record_status"] = .string("unrecorded")
+            out["detail"] = .string("""
+                No completed turn can be established from the retained records in this conversation. Pass turn explicitly to read the evidence available for \
+                it. This does not establish that no turn completed.
+                """)
+        }
+        for row in rows where out[row.lane] == nil {
+            out[row.lane] = row.payload
+            out["at"] = out["at"] ?? .string(ISO8601DateFormatter().string(from: row.event.ts))
+        }
+        out["turn_gaps"] = .array(gaps)
+        return .object(out)
+    }
+
+    /// Recheck current memory disclosure; a trace copy cannot grant access after policy changes.
+    private func disclosedWhyPayload(_ payload: JSONValue, surface: String) async -> (lane: String, payload: JSONValue)? {
+        guard let evidence = Self.whyEvidence(payload) else { return nil }
+        if evidence.lane != "memory",
+           MemoryRecordDisclosurePolicy.classify(
+            personaID: nil, status: nil, lifecycle: nil, tags: nil, metadata: nil
+           )?.permits(surface: surface, personaID: nil) != true { return nil }
         let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-        for source in sources where source.hasPrefix("memory:") {
+        for source in evidence.sources where source.hasPrefix("memory:") {
             let id = String(source.dropFirst(7))
             guard (try? await memory.readMemoryRecord(id: id, persona: nil, surface: surface)) != nil else {
                 return nil
             }
         }
-        // Gap prose may quote memories or peers, but the trace retains no
-        // source provenance with which to check their current disclosure.
+        // Gap prose lacks source provenance for current disclosure checks and may quote memories or peers.
         func redactGapText(_ value: JSONValue) -> JSONValue {
             switch value {
             case .object(var object):
@@ -149,17 +208,15 @@ extension NativeCognitionRuntime {
             default: return value
             }
         }
-        return redactGapText(payload)
+        return (evidence.lane, redactGapText(payload))
     }
 
-    /// She rejects one association: `source` (memory:/care:/dream:, or an
-    /// outreach subject desk:/ship:, which any rejection stops outright) stops
-    /// surfacing for messages like `turn`'s, or for any message when `always`.
     public func rejectAssociation(
         source: String,
-        turn: String?,
+        turn wantedTurn: String?,
         always: Bool,
-        seat: StudioCanonTurnProvenance
+        seat: StudioCanonTurnProvenance,
+        callerTurn turn: Turn
     ) async -> (ok: Bool, detail: String) {
         await bootstrap()
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -170,7 +227,7 @@ extension NativeCognitionRuntime {
         }
         var terms: [String] = []
         if !always {
-            guard case .object(let record) = await why(turn: turn),
+            guard case .object(let record) = await why(turn: wantedTurn, callerTurn: turn),
                   let lane = [record["cue"], record["memory"]].compactMap({ $0 }).first,
                   case .object(let fields) = lane,
                   case .array(let signature)? = fields["signature"] else {
@@ -190,9 +247,7 @@ extension NativeCognitionRuntime {
             : "\(source) will not surface for messages about \(terms.joined(separator: ", ")).")
     }
 
-    /// Memory that carries User's authority is never hers to suppress: the
-    /// pinned USER core (his pins), corrections, anything tagged safety. An
-    /// unreadable record fails closed.
+    /// Never suppress person-authorized pinned core, corrections or safety memory; unreadable authority fails closed.
     public static func rejectionRefusal(for record: MemoryRecord?) -> String? {
         guard let record else { return "that memory could not be read, so it cannot be checked; nothing was rejected" }
         let tags = Set((record.tags ?? []).map { $0.lowercased() })
@@ -204,7 +259,6 @@ extension NativeCognitionRuntime {
         return nil
     }
 
-    /// Undo one update of hers, or list what can be undone when `item` is nil.
     public func undo(
         item: String?,
         seat: StudioCanonTurnProvenance

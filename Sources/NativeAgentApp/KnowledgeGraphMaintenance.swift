@@ -9,9 +9,8 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `KnowledgeGraphMaintenance.swift` | Knowledge Graph orphan preview and reviewed deletion presentation; canonical maintenance actions require the exact candidate set |
+// Blueprint: | `KnowledgeGraphMaintenance.swift` | Orphan preview and deletion require the exact reviewed candidate set |
 
-/// Converts the canonical orphan-sweep result into visible state.
 enum KnowledgeGraphMaintenancePresentation {
     struct State: Equatable {
         let status: String?
@@ -74,7 +73,6 @@ enum KnowledgeGraphMaintenancePresentation {
 }
 
 extension KnowledgeGraphView {
-    // GC sweep: dry-run preview, then user-confirmed apply on this engine.
 
     func previewGCSweep() async {
         guard !gcRunning else { return }

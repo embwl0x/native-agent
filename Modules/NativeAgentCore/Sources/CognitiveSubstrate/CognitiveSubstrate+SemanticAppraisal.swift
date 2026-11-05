@@ -2,22 +2,21 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+SemanticAppraisal.swift` | `SemanticAppraisal`: meaning-weighted event appraisal against outcomes and embedding-touched cares; belief reaction requires a semantic judgment with exact prior-statement and incoming evidence, never valence |
+// Blueprint: | `CognitiveSubstrate+SemanticAppraisal.swift` | `SemanticAppraisal`: meaning, care stakes and grounded belief reactions |
 
-/// The appraised MEANING of one event, all dims computable without suspension.
+/// Read meaning synchronously so every dimension belongs to the same event transition.
 struct SemanticAppraisal: Sendable, Equatable {
-    var goalRelevance = 0.0          // 0…1  — does this matter to what she's doing
-    var goalCongruence = 0.0         // −1…1 — did it go WITH or AGAINST the goal
-    var selfAgency = 0.0             // −1…1 — who caused it (self/tool + , user −)
-    var novelty = 0.0                // 0…1  — how unexpected/new
-    var copingPotential = 0.0        // −1…1 — can she handle/repair from here
-    var relationshipStake = 0.0      // 0...1 -- is the user-Agent relationship implicated
-    var relationshipCongruence = 0.0 // −1…1 — how it landed relationally
-    var resolutionEvidence = 0.0     // 0…1  — did something actually RESOLVE
-    var effortEvidence = 0.0         // 0…1  — was the stretch effortful
-    // Signed real movement of the closest touched care with a stance.
-    var worldviewStance = 0.0        // −1…1 — toward or away from what she cares about
-    var worldviewConflict = 0.0      // 0…1  — how far that care moved away
+    var goalRelevance = 0.0          // Relevance spans 0...1.
+    var goalCongruence = 0.0         // Congruence ranges from against (−1) to with (+1) the goal.
+    var selfAgency = 0.0             // Agency distinguishes user (−1) from self/tool (+1) causation.
+    var novelty = 0.0                // Novelty spans 0...1.
+    var copingPotential = 0.0        // Coping spans unable (−1) to able (+1) to repair.
+    var relationshipStake = 0.0      // Relationship stake spans 0...1.
+    var relationshipCongruence = 0.0 // Relational landing spans −1...1.
+    var resolutionEvidence = 0.0     // Resolution spans 0...1.
+    var effortEvidence = 0.0         // Effort spans 0...1; stance movement comes from the closest touched care.
+    var worldviewStance = 0.0        // Care movement is signed toward (+1) or away (−1).
+    var worldviewConflict = 0.0
 
     static let neutral = SemanticAppraisal()
 }
@@ -34,18 +33,16 @@ extension CognitiveSubstrate {
     /// Movement away from a touched care adds to the generic valence read.
     static let appraisalWorldviewConflictWeight = 0.06
     static let appraisalWorldviewStanceCongruenceGain = 0.15
-    /// assistantTurnCompleted outcome band — replaces the flat +0.25 metronome.
+    /// Completion feeling follows outcome evidence rather than a flat reward for finishing.
     static let appraisalCompletionBaseFloor = -0.10
     static let appraisalCompletionBaseCeiling = 0.14
-    /// How far back peekNodes evidence looks for continuity/resolution/failure reads.
+    /// Bound nearby evidence so old failures cannot masquerade as current resolution.
     static let appraisalEvidenceWindow: TimeInterval = 45 * 60
 
     // MARK: - Derivation (pure, no suspension points)
 
-    /// Appraise `event` against her current state. `post` is the affect state the
-    /// event just produced (the same one being stamped). Reads only actor state
-    /// that is synchronously available.
-    /// Consumes the admitted event's supplied appraisal and warmth boost.
+    /// Appraise `event` against the agent's current state. `post` is the affect state the event just produced (the same one being stamped). Reads only actor
+    /// state that is synchronously available. Consumes the admitted event's supplied appraisal and warmth boost.
     func semanticAppraisal(
         for event: CognitiveEvent,
         post: CognitiveAffectState,
@@ -54,7 +51,7 @@ extension CognitiveSubstrate {
         precomputedCares touchedCares: [CognitiveCare]
     ) -> SemanticAppraisal {
         let now = dependencies.now()
-        // Text-derived appraisal reads only user-authored words, never her replies or tool output.
+        // Text-derived appraisal reads only user-authored words, never the agent's replies or tool output.
         let text = precomputedAppraisal
         let nodes = field.peekNodes()
         let recent = nodes.filter {
@@ -64,7 +61,6 @@ extension CognitiveSubstrate {
 
         var a = SemanticAppraisal()
 
-        // -- outcome sign + evidence reads shared by several dims --------------
         let outcomeSign = Double(event.terminalOutcomePolarity)
         // Tool outcome polarity reads status text, never mood-colored stamped valence.
         let toolObs = recent.filter { $0.kind == .toolObservation }
@@ -109,15 +105,13 @@ extension CognitiveSubstrate {
             guard let neg = lastNegativeAt, let pos = lastPositiveAt else { return 0 }
             return pos > neg ? 1 : 0
         }()
-        // Lexical resolution in THIS event, or a fresh positive tool outcome nearby.
-        let lexicalResolution = text.pressure < 0   // the resolving-together signature
+        // Resolution needs this event's words or a fresh positive tool outcome.
+        let lexicalResolution = text.pressure < 0
         a.resolutionEvidence = min(1, (lexicalResolution ? 0.7 : 0)
             + ((lastPositiveAt.map { now.timeIntervalSince($0) < 10 * 60 } ?? false) ? 0.5 : 0)
             + (event.isPositiveTerminalOutcome ? 0.6 : 0))
-        // Effort: how much tool churn led up to this moment.
         a.effortEvidence = min(1, Double(toolObs.count) / 6.0)
 
-        // -- goalRelevance ------------------------------------------------------
         let kindBase: Double
         switch event.kind {
         case .userCorrection, .toolFailed, .providerFailure: kindBase = 0.9
@@ -143,7 +137,6 @@ extension CognitiveSubstrate {
         a.goalRelevance = (0.45 * event.importance + 0.30 * kindBase
             + 0.20 * continuity + 0.10 * careHit).clamped01()
 
-        // -- goalCongruence -----------------------------------------------------
         let relief = (event.kind == .toolSucceeded && unresolvedRecentFailure == 0 && repairEvidence > 0) ? 1.0 : 0.0
         a.worldviewStance = touchedCares.first(where: { $0.stance != nil })?.charge(at: now).clampedSigned() ?? 0
         a.worldviewConflict = max(0, -a.worldviewStance)
@@ -151,7 +144,6 @@ extension CognitiveSubstrate {
             + 0.25 * relief - 0.25 * unresolvedRecentFailure
             + Self.appraisalWorldviewStanceCongruenceGain * a.worldviewStance).clampedSigned()
 
-        // -- selfAgency ---------------------------------------------------------
         switch event.kind {
         case .assistantTurnCompleted: a.selfAgency = 0.7
         case .toolStarted, .toolSucceeded, .toolFailed: a.selfAgency = 0.35
@@ -162,8 +154,7 @@ extension CognitiveSubstrate {
         case .organismResolutionFelt: a.selfAgency = 0.35
         }
 
-        // -- novelty ------------------------------------------------------------
-        // Similarity = recency-weighted "seen this lately" over subject key + kind.
+        // Recency-weighted subject/kind similarity measures whether this was seen lately.
         var similarity = 0.0
         for node in recent where !isSelfEvidence(node) {
             let sameSubject = "\(node.subjectReference.type):\(node.subjectReference.id)" == subjectKey
@@ -174,11 +165,9 @@ extension CognitiveSubstrate {
         }
         a.novelty = (1 - similarity).clamped01()
 
-        // -- copingPotential ----------------------------------------------------
-        let capacity = 1 - 0.6 * post.uncertainty - 0.4 * post.taskPressure   // 0…1
+        let capacity = 1 - 0.6 * post.uncertainty - 0.4 * post.taskPressure
         a.copingPotential = ((capacity * 2 - 1) * 0.7 + repairEvidence * 0.3).clampedSigned()
 
-        // -- relationship -------------------------------------------------------
         let isLiveChat = event.kind == .userMessageReceived || event.kind == .userCorrection
         let userRecent = lastUserPresenceAt.map { now.timeIntervalSince($0) < 30 * 60 } ?? false
         let lexicalRelational = text.warmth != 0 || precomputedWarmthBoost > 0
@@ -192,10 +181,7 @@ extension CognitiveSubstrate {
         return a
     }
 
-    /// R2-B: the meaning-weighted outcome base — replaces the flat ±0.25 eventBase.
-    /// Routine completions (nothing resolved, no reaction) land ~0; a real fix after
-    /// effort lands positive; an unresolved-failure completion can land mildly
-    /// negative. Success/failure events scale by how much they MATTERED.
+    /// Weight outcomes by meaning: routine completion is neutral; an effortful fix earns positive valence and unresolved failure can remain negative.
     func meaningWeightedOutcomeBase(for event: CognitiveEvent, appraisal a: SemanticAppraisal) -> Double {
         if event.isPositiveTerminalOutcome {
             return 0.25 * a.goalRelevance * max(0.25, a.resolutionEvidence)
@@ -205,8 +191,7 @@ extension CognitiveSubstrate {
         }
         switch event.kind {
         case .assistantTurnCompleted:
-            // The metronome killer: effort alone is charge, not happiness; an
-            // unresolved failure weighs the completion DOWN.
+            // Effort adds charge, not happiness; unresolved failure lowers the completion.
             let unresolvedDrag = a.goalCongruence < 0 ? 0.08 : 0.0
             let raw = 0.10 * a.resolutionEvidence
                 - 0.06 * a.effortEvidence * (1 - a.resolutionEvidence)
@@ -217,7 +202,6 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// The semantic term of the revised valence formula.
     func semanticValenceTerm(_ a: SemanticAppraisal) -> Double {
         Self.appraisalGoalRelevanceWeight * a.goalRelevance * a.goalCongruence
             + Self.appraisalCopingWeight * a.goalRelevance * a.copingPotential
@@ -229,13 +213,10 @@ extension CognitiveSubstrate {
 
     // MARK: - Cares as appraisal substrate
 
-    /// Read matching once before the await-free event transition. The four
-    /// seed cares participate in the same match as every grown live care: the
-    /// care cue's law (`caresStandingOut`), so a turn touches a care only when
-    /// one stands out for its words.
+    /// Match care meaning once before the await-free transition; seeds and grown cares obey the same relative-standing law.
     func appraisalCares(in text: String) async throws -> [CognitiveCare] {
         let live = cares.values.filter { $0.fadedAt == nil }
-        guard let cosines = try await careCosines(to: text, among: live) else { return [] }
+        guard let cosines = try await careCosines(to: text, among: live, turn: nil) else { return [] }
         return Self.caresStandingOut(cosines, among: live).compactMap { touched -> (CognitiveCare, Double)? in
             guard let current = cares[touched.care.id], current.fadedAt == nil,
                   current.updatedAt == touched.care.updatedAt else { return nil }
@@ -249,8 +230,7 @@ extension CognitiveSubstrate {
 
 extension CognitiveSubstrate {
 
-    /// Only a grounded judgment about this completion is belief evidence.
-    /// Feeling, silence and a change of subject say nothing about its truth.
+    /// Only a grounded judgment about this completion is belief evidence. Feeling, silence and a change of subject say nothing about its truth.
     static func semanticReactionLabel(appraisal: AffectAppraisal, target: String?,
                                       incoming: String) -> String? {
         guard let reaction = appraisal.beliefReaction, let target else { return nil }

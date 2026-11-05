@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import MacControl
 // Blueprint: | `MacChatTurnPresentationPort.swift` | `MacChatTurnPresentationPort` protocol; `chatHasConversationRows`, `captureMacWorkContinuation` |
@@ -9,8 +10,7 @@ public enum MacChatTurnPresentationEvent: Sendable {
     case activity(MacChatTurnActivity)
 }
 
-/// The app supplies selection and presentation only. Core calls this port at
-/// the original transaction boundaries; token snapshots use the stream port.
+/// Presentation remains app-owned; Core calls at transaction boundaries while tokens use the stream port.
 @MainActor
 public protocol MacChatTurnPresentationPort: AnyObject, Sendable {
     var macChatTurns: MacChatTurnRuntime { get }
@@ -20,11 +20,15 @@ public protocol MacChatTurnPresentationPort: AnyObject, Sendable {
     func captureMacWorkContinuation(_ text: String, taskReference: String) async -> MacWorkContinuation?
     func animateMacChatMutation(_ mutation: () -> Void)
     func presentMacChatTurn(_ event: MacChatTurnPresentationEvent)
-    func recordMacControlHandoff(text: String, reply: String, sessionId: String) async throws
+    func recordMacControlHandoff(text: String, reply: String, sessionId: String, turn: Turn) async throws
     func cancelICloudChatTurnForControlHandoff(sessionId: String)
+    /// Save a send before it is accepted: its row (files included) and its checkpoint, so a relaunch before it is answered resumes it.
+    func saveMacArrival(_ words: String, attachments: [NativeAgentShared.MultimodalAttachment], sessionId: String, turn: Turn) async throws
+    /// The person's row while the agent works, under the id the turn pins, so the turn that writes it later shows no second one.
+    func showMacChatUserBubble(_ text: String, attachments: [NativeAgentShared.MultimodalAttachment], sessionId: String, turn: Turn)
     func runMacChatTurnBody(
         _ text: String, attachments: [NativeAgentShared.MultimodalAttachment],
         sessionId: String, generation: Int,
-        hideUserBubble: Bool, activityIdentity: MacChatTurnIdentity
+        hideUserBubble: Bool, activityIdentity: MacChatTurnIdentity, turn: Turn
     ) async
 }

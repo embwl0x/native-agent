@@ -9,9 +9,8 @@ import NativeAgentShared
 import PersistenceCore
 import StandingBots
 import TurnTrace
-// Blueprint: | `Expansion.swift` | `Expansion`: live call threads, turn-start read claims and follow-up predictions, per-mind/authority practice storage, settlement and one checked coalescing writer; failed saves retain unavailable practice and owe repair for `expansion/record.json` |
+// Blueprint: | `Expansion.swift` | `Expansion`; `expansion/record.json`; Coalesced practice writes with repair owed |
 
-/// Live call threads, authority-separated practice storage and one coalescing writer.
 public actor Expansion {
     public static let shared = Expansion()
 
@@ -19,7 +18,6 @@ public actor Expansion {
     var unavailable: [String: String] = [:]
     private var threads: [String: CallThread] = [:]
     private var closing: [String: [ScopedWaiter]] = [:]
-    /// Roots with a write running, and roots changed since it began.
     private var writing: [String: Task<Void, Never>] = [:]
     private var dirty: Set<String> = []
 
@@ -27,47 +25,45 @@ public actor Expansion {
 
     // MARK: - Who is acting
 
-    /// The mind whose call this is, and the thread of calls it belongs to.
-    /// Nil for calls no mind chose in the moment: a part's own program, a
-    /// native owner's read, a replay.
+    /// Only model-chosen calls bind a mind and call thread; native reads, program steps and replays cannot learn as chosen calls.
     struct Caller: Sendable {
         let root: String
         let agent: String
         let model: String
+        let surface: String
         let session: String
-        let turn: String
-        /// What woke the turn, by kind: never a name or a phrase.
+        let heldTurn: Turn
+        var turn: String { heldTurn.id }
+        /// Classify wake by kind, never a person's name or phrase.
         let woke: String
-        /// Who steered the turn (`PeerDataTaint.abilitySources`): the untrusted
-        /// principals whose turn this is, empty when the mind's own. A turn of
-        /// one authority learns from and is offered only its own practice.
+        /// Separate learning and offered practice by the full steering-principal set; empty means the mind's own authority.
         let steered: [String]
 
         var authority: String { steered.isEmpty ? "own" : "steered:" + steered.joined(separator: ",") }
         var practice: String { [agent, authority].joined(separator: "\u{1}") }
         var thread: String { [root, agent, authority, session, turn].joined(separator: "\u{1}") }
 
-        static func current(dataRoot: URL, session: String?, surface: String) -> Caller? {
-            guard SkillRunContext.partID == nil else { return nil }
-            let session = session ?? ChatToolSessionContext.verifiedSessionId ?? LLMCallContext.sessionId ?? ""
-            let envelope = ChatToolSessionContext.envelope
+        static func current(dataRoot: URL, session: String?, surface: String, turn: Turn) -> Caller? {
+            guard turn.partID == nil else { return nil }
+            let session = session ?? turn.verifiedSessionID ?? turn.session ?? ""
+            let envelope = turn.envelope
             let agent: String
             let model: String
             // Keep the admitted model for diagnostics, never practice identity.
-            if let bot = StandingBotContinuity.currentBot {
-                guard let admitted = LLMCallContext.admittedModel else { return nil }
+            if let bot = turn.standingBot {
+                guard let admitted = turn.admission?.model else { return nil }
                 agent = "helper:" + bot.id.uuidString.lowercased()
                 model = admitted
-            } else if StandingBotContinuity.currentContract != nil {
+            } else if turn.botContract != nil {
                 guard let id = BotDefinition.id(forSession: session),
-                      let admitted = LLMCallContext.admittedModel else { return nil }
+                      let admitted = turn.admission?.model else { return nil }
                 agent = "helper:" + id.uuidString.lowercased()
                 model = admitted
-            } else if let turn = ChatTurnRuntimeContext.current {
+            } else if let runtime = turn.runtime {
                 agent = "self"
-                model = turn.model
+                model = runtime.model
             } else if let envelope, let named = envelope.agent, !named.isEmpty, named != "self" {
-                // An outside agent calling the door itself: its own model is unknown here.
+                // External callers have no attested model here; leave it unknown.
                 agent = "agent:" + (envelope.verifiedUserId ?? named)
                 model = ""
             } else {
@@ -78,15 +74,14 @@ public actor Expansion {
             if let work = envelope?.workIdentity, let kind = work.split(separator: ":").first, !kind.isEmpty {
                 woke += " work:" + String(kind)
             }
-            return Caller(root: dataRoot.standardizedFileURL.path, agent: agent, model: model, session: session,
-                          turn: TurnTraceContext.turnId ?? "", woke: woke, steered: PeerDataTaint.abilitySources)
+            return Caller(root: dataRoot.standardizedFileURL.path, agent: agent, model: model, surface: surface, session: session,
+                          heldTurn: turn, woke: woke, steered: PeerDataTaint.abilitySources(turn: turn))
         }
     }
 
     // MARK: - The door's three moments
 
-    /// Before the opening model call, the first read this wake's past turns
-    /// made. The actual first call labels it even when its read was delivered.
+    /// Label the opening read with the actual first call even if the read arrived before thought.
     func start(_ caller: Caller, at: Date, deliver: Bool) -> Plan? {
         load(caller.root)
         guard unavailable[caller.root] == nil, books[caller.root] != nil, threads[caller.thread] == nil else { return nil }
@@ -99,15 +94,13 @@ public actor Expansion {
         return plan
     }
 
-    /// A call arrives: it is the next call of whatever came before it in its
-    /// thread. It settles that step's predictions and is kept as an example of
-    /// that step's situation. Returns whether it is the thread's first call.
+    /// Use the actual next call to settle prior predictions and record its situation; preserve whether it opened the thread.
     func arrive(_ caller: Caller, tool: String, input: [String: JSONValue], at: Date) -> Bool {
         load(caller.root)
         guard unavailable[caller.root] == nil, books[caller.root] != nil else { return true }
         guard threads[caller.thread]?.ended != true else { return false }
         let call = Self.stripped(input)
-        // A new turn of this mind in this conversation ends its turns before.
+        // A new turn closes prior threads for the same mind and conversation.
         if !caller.turn.isEmpty {
             let ended = threads.filter { key, thread in
                 key != caller.thread && thread.caller.root == caller.root && thread.caller.agent == caller.agent
@@ -137,8 +130,7 @@ public actor Expansion {
         return first
     }
 
-    /// The call returned in `seconds`: what this follow-up costs when the mind
-    /// makes it herself, kept on its example.
+    /// Measure follow-up cost on the call the mind actually made.
     func ran(_ caller: Caller, seconds: Double) {
         guard unavailable[caller.root] == nil else { return }
         guard var thread = threads[caller.thread], let open = thread.open else { return }
@@ -150,14 +142,13 @@ public actor Expansion {
         books[caller.root]?.practices[caller.practice] = practice
     }
 
-    /// The call threw: there is no result for a next call to follow.
+    /// A thrown call has no result from which to predict a follow-up.
     func broke(_ caller: Caller) {
         threads[caller.thread]?.last = nil
         threads[caller.thread]?.open = nil
     }
 
-    /// A result came back: its situation, the predictions it makes now (each
-    /// a try), and the one to deliver, when one stands and is not withheld.
+    /// Each returned result records a prediction trial; deliver only standing, unwithheld predictions.
     func consider(_ caller: Caller, tool: String, input: [String: JSONValue], result: JSONValue,
                   first: Bool, at: Date, deliver: Bool) -> Plan? {
         load(caller.root)
@@ -195,7 +186,7 @@ public actor Expansion {
         var best: (plan: Plan, gain: Double)?
         var tries: [Try] = []
         let templates: [Template]
-        do { templates = try Self.templateEvidence(place.examples).templates }
+        do { templates = try Self.templateEvidence(place.examples, turn: caller.heldTurn).templates }
         catch { fail(caller.root, error); return nil }
         for template in templates {
             guard let call = Self.fill(template, from: values) else { continue }
@@ -203,8 +194,8 @@ public actor Expansion {
             var record = practice.records[signature] ?? Record(situation: situation, form: template.form, at: at)
             let nature: Nature?
             do {
-                nature = try Self.nature(call)
-                if firstCall, try !Self.openingRead(call) { continue }
+                nature = try Self.nature(call, turn: caller.heldTurn)
+                if firstCall, try !Self.openingRead(call, turn: caller.heldTurn) { continue }
             } catch { fail(caller.root, error); return nil }
             let measure = Law.measure(record, template, among: among)
             var attempt = Try(signature: signature, call: call, nature: nature, turn: caller.turn,
@@ -242,10 +233,8 @@ public actor Expansion {
         return best?.plan
     }
 
-    /// What became of a planned delivery: its result rode inside the call's
-    /// result (`landed`), or it did not run in time, failed, did not fit, or
-    /// was never started (`seconds` nil: no time left for it), and the try
-    /// stays a shadow one. Its time is the stem's own cost of it.
+    /// A delivery that fails, misses its deadline, does not fit or never starts remains a shadow trial.
+    /// Measure the stem's actual cost separately from whether the result landed.
     func delivered(_ caller: Caller, invocation: UUID, landed: JSONValue?, seconds: Double?) {
         guard var thread = threads[caller.thread],
               let index = thread.tries.firstIndex(where: { $0.invocation == invocation && $0.planned }) else { return }
@@ -269,8 +258,7 @@ public actor Expansion {
                 retain(thread, key: caller.thread)
                 return
             }
-            // What it showed that the mind did not already have: a later call
-            // carrying one of these used it.
+            // Only later calls using newly delivered data can prove the read was useful.
             let had = thread.tries[index].known
             var flat: [(path: String, value: JSONValue)] = []
             let complete = landed.leaves(into: &flat, limit: Law.leafCap, depthLimit: 128)
@@ -297,24 +285,24 @@ public actor Expansion {
     /// Resident, ephemeral and helper turns close their own practice, on every
     /// exit. Capture the trace before crossing `settle`: Stop cancels work,
     /// never its outcomes or the write that keeps them across a restart.
-    nonisolated(nonsending) static func withTurn<T>(dataRoot: URL?, afterReply: (T) -> AfterReply? = { _ in nil },
-                                                  _ work: () async throws -> T) async rethrows -> T {
-        guard let dataRoot, let turn = TurnTraceContext.turnId, !turn.isEmpty else { return try await work() }
+    nonisolated(nonsending) static func withTurn<T>(dataRoot: URL?, turn: Turn,
+        afterReply: (T) -> AfterReply? = { _ in nil }, _ operation: () async throws -> T
+    ) async rethrows -> T {
+        guard let dataRoot else { return try await operation() }
         let root = dataRoot.standardizedFileURL.path
         let bus = TurnTraceContext.bus
-        let surface = LLMCallContext.surface
-        let close: @Sendable () async -> Void = {
+        let close: @Sendable () async -> Void = { [turn] in
             await NativeAgentCore.settle {
                 await TurnTraceContext.$bus.withValue(bus) {
-                await TurnTraceContext.$turnId.withValue(turn) {
-                await LLMCallContext.$surface.withValue(surface) {
-                    await Self.shared.endTurn(root: root, turn: turn)
-                    TurnTraceBus.fireFromContext(kind: "tool.dispatch.closed")
-                } } }
+                    await TurnTraceContext.$turnId.withValue(turn.id) {
+                        await Self.shared.endTurn(root: root, turn: turn.id)
+                        TurnTraceBus.fireFromContext(kind: "tool.dispatch.closed", turn: turn)
+                    }
+                }
             }
         }
         do {
-            let result = try await work()
+            let result = try await operation()
             if let continuation = afterReply(result) { continuation.onSettled(close) }
             else { await close() }
             return result
@@ -364,15 +352,15 @@ public actor Expansion {
             if !caller.turn.isEmpty {
                 TurnTraceBus.fire(TurnTraceEvent(turnId: caller.turn, kind: "expansion.check",
                     sessionId: caller.session.isEmpty ? nil : caller.session,
-                    surface: TurnTraceContext.turnId == caller.turn ? LLMCallContext.surface : nil,
-                    payload: .object(row)),
+                    surface: caller.surface,
+                    payload: .object(row), turn: caller.heldTurn),
                     on: TurnTraceContext.bus ?? .shared)
             }
         }
         books[caller.root]?.practices[caller.practice] = practice
     }
 
-    /// A thread whose turn is over: what it predicted never came.
+    /// An ended thread cannot later receive its predicted call.
     private func end(_ key: String, observationLost: Bool = false) {
         guard var thread = threads[key] else { return }
         let caller = thread.caller
@@ -393,14 +381,12 @@ public actor Expansion {
 
     // MARK: - Learning
 
-    /// Keeps the next call as an example of the step it followed: the call as
-    /// the mind wrote it, and for each of its values the paths in that step's
-    /// call and result that held exactly that value.
+    /// Keep exact next-call values with the preceding call/result paths that supplied them.
     private func learn(_ caller: Caller, situation: String, call: [String: JSONValue], index: [String: [String]],
                        gap: Double, at: Date) -> Open? {
         do {
-            if situation.hasPrefix("start woke:"), try !Self.openingRead(call) { return nil }
-            if try Self.carriesSecret(call) { return nil }
+            if situation.hasPrefix("start woke:"), try !Self.openingRead(call, turn: caller.heldTurn) { return nil }
+            if try Self.carriesSecret(call, turn: caller.heldTurn) { return nil }
         } catch { fail(caller.root, error); return nil }
         guard ((try? JSONValue.object(call).serialize(pretty: false))?.utf8.count ?? .max) <= Law.callCap,
               var practice = books[caller.root]?.practices[caller.practice],
@@ -456,7 +442,8 @@ public actor Expansion {
         guard unavailable[caller.root] == nil, var book = books[caller.root] else { return }
         book.practices[caller.practice] = practice
         let active = Set(threads.values.filter { $0.caller.root == caller.root }.map { $0.caller.practice })
-        if book.practices.count > Law.practiceCap, let stalest = book.practices.filter({ !active.contains($0.key) }).min(by: { $0.value.lastAt < $1.value.lastAt })?.key {
+        if book.practices.count > Law.practiceCap, let stalest = book.practices.filter({ !active.contains($0.key) }).min(by: { $0.value.lastAt < $1.value
+            .lastAt })?.key {
             book.practices[stalest] = nil
         }
         books[caller.root] = book
@@ -472,8 +459,7 @@ public actor Expansion {
         }
     }
 
-    /// Writes coalesce with no clock: one write at a time per root, off every
-    /// call's path; changes made while it runs are written by the next one.
+    /// Coalesce writes per root off the call path; changes during a write belong to the next write.
     private func scheduleWrite(_ root: String) {
         guard books[root] != nil, unavailable[root] == nil else { return }
         dirty.insert(root)
@@ -491,21 +477,28 @@ public actor Expansion {
                 }.value
             } catch {
                 dirty.insert(root)
-                let words = "Durable expansion save unproven at \(url.path): \(error.localizedDescription). Inspect this exact file before repairing; publication may have preceded the failure. Unsaved practice is retained but unavailable in this runtime; no automatic write will retry."
+                let words = """
+                    Durable expansion save unproven at \(url.path): \(error.localizedDescription). Inspect this exact file before repairing; \
+                    publication may have preceded the failure. Unsaved practice is retained but unavailable in this runtime; no automatic write will \
+                    retry.
+                    """
                 fail(root, NSError(domain: "Expansion", code: 3, userInfo: [NSLocalizedDescriptionKey: words]))
                 TurnTraceBus.fireFromContext(kind: "expansion.record.failed", payload: .object([
                     "path": .string(url.path), "message": .string(words)
-                ]))
+                ]), turn: nil)
                 RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run,
                     operation: "expansion.record.save", owner: url.path, words: words,
-                    lever: "Inspect and repair the named storage failure without replacing retained practice with an empty record; then restart NativeAgent to read the repaired record.")
+                    lever: """
+                        Inspect and repair the named storage failure without replacing retained practice with an empty record; then restart \
+                        NativeAgent to read the repaired record.
+                        """)
                 writing[root] = nil
                 return
             }
             TurnTraceBus.fireFromContext(kind: "expansion.record.saved", payload: .object([
                 "path": .string(url.path), "version": .int(Int64(book.version)),
                 "pending_changes": .bool(dirty.contains(root))
-            ]))
+            ]), turn: nil)
             RepairOwed.settle(dataRoot, operation: "expansion.record.save", evidence: .init(source: url.path, id: "durable-save"))
         }
         writing[root] = nil

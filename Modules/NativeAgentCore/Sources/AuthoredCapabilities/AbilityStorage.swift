@@ -5,7 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityStorage.swift` | Checked canonical file and accounting encoding; one lstat per walked member supplies type and decode identity, file-name checks do no IO, successful writes warm canonical decodes; per-root state reads reuse only identity-matched validated rows and never memoize failures; recovery state schema shares accounting keys and outcome counters with validation |
+// Blueprint: | `AbilityStorage.swift` | Checked identity-matched file/state encoding and recovery validation |
 extension AbilityStore {
     /// Recovery restores accounting only. Counter relationships still belong to validateCounters.
     public static let recoveryStateSchema: JSONValue = {
@@ -26,7 +26,10 @@ extension AbilityStore {
         for name in ["uses", "useCount", "corrections"] { row[name] = count }
         row["runs"] = object(["versions": map(object(evidence, required: ["count"]))])
         var result = map(object(row, open: false)).objectValue!
-        result["description"] = .string("Ability id → recovered accounting row. Only accounting keys are admitted; preserve readable rows exactly. Nonnegative counters must agree: outcomes sum to count, reads ≤ ok, operation totals ≤ count. Authority stays in each ability file.")
+        result["description"] = .string("""
+            Ability id → recovered accounting row. Only accounting keys are admitted; preserve readable rows exactly. Nonnegative counters must agree: \
+            outcomes sum to count, reads ≤ ok, operation totals ≤ count. Authority stays in each ability file.
+            """)
         return .object(result)
     }()
 
@@ -35,7 +38,9 @@ extension AbilityStore {
         guard paths.count <= 1 else {
             throw ToolFailureError("Ability \(id) has both JavaScript and Markdown files in slot \(slot.rawValue).", effects: .none,
                 owner: root.path, nextCall: ToolFailureError.call("app", ["action": .string("files.list"), "args": .object(["path": .string(root.path)])]),
-                code: "ability_id_collision", instruction: "Inspect both files; resolve their identity collision while preserving both bodies and retained versions.", recovery: .inspect)
+                code: "ability_id_collision", instruction: """
+                    Inspect both files; resolve their identity collision while preserving both bodies and retained versions.
+                    """, recovery: .inspect)
         }
         guard let source = paths.first else { return nil }
         do { return try Self.decode(source) }
@@ -51,11 +56,11 @@ extension AbilityStore {
     static func checkItem(_ url: URL) throws {
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard attributes[.type] as? FileAttributeType != .typeSymbolicLink else { throw failure("Ability storage cannot follow symbolic links: \(url.path).") }
+            guard attributes[.type] as? FileAttributeType != .typeSymbolicLink else { throw failure(
+                "Ability storage cannot follow symbolic links: \(url.path).") }
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) { }
     }
-    /// Her ability folder: every file that reads, and each one that does not as its own named failure.
-    /// One damaged file never darkens its siblings; only the folder itself failing is the whole inventory's failure.
+    /// Inventory reports each unreadable file separately; only a folder read failure prevents the whole catalog.
     public struct Inventory: Sendable {
         public struct Damaged: Sendable { public let id: String; public let slot: Slot; public let failure: ToolFailureError }
         public var files: [(file: File, slot: Slot)] = []
@@ -65,7 +70,8 @@ extension AbilityStore {
         guard FileManager.default.fileExists(atPath: root.path) else { return Inventory() }
         try VerifiedPath.confirmNoSymlink(root)
         var inventory = Inventory(), seen: Set<String> = []
-        for url in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).sorted(by: { $0.path < $1.path }) {
+        for url in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).sorted(
+            by: { $0.path < $1.path }) {
             if ["state.json", ".old-layout"].contains(url.lastPathComponent) { continue }
             let stem = url.deletingPathExtension().lastPathComponent
             let slot: Slot = stem.hasSuffix(".prev") ? .previous : stem.hasSuffix(".next") ? .next : .current
@@ -74,15 +80,17 @@ extension AbilityStore {
                 let status: stat?
                 do { status = try Self.fileStatus(url) }
                 catch {
-                    // Preserve the checked-open failure that preceded lstat in the old reader.
+                    // Preserve checked-open failure evidence before consulting lstat.
                     try VerifiedPath.confirmNoSymlink(url)
                     throw error
                 }
                 let file = try Self.decode(url, status: status)
-                guard try Self.fileName(id: file.id, slot: slot, pathExtension: file.pathExtension) == url.lastPathComponent else { throw Self.failure("Ability header id differs from its file: \(url.lastPathComponent).") }
+                guard try Self.fileName(id: file.id, slot: slot, pathExtension: file.pathExtension) == url.lastPathComponent else { throw Self.failure(
+                    "Ability header id differs from its file: \(url.lastPathComponent).") }
                 guard seen.insert("\(slot.rawValue):\(file.id.lowercased())").inserted else {
                     throw ToolFailureError("Ability id collision: \(file.id) in slot \(slot.rawValue), including \(url.lastPathComponent).", effects: .none,
-                        code: "ability_id_collision", instruction: "Inspect both retained sources and restore their correct ids without discarding either body.", recovery: .inspect)
+                        code: "ability_id_collision",
+                            instruction: "Inspect both retained sources and restore their correct ids without discarding either body.", recovery: .inspect)
                 }
                 inventory.files.append((file, slot))
             } catch {
@@ -130,7 +138,7 @@ extension AbilityStore {
         guard type != mode_t(S_IFLNK) else { throw VerifiedPath.Failure.symlinkComponent(url.lastPathComponent) }
         let revision = fileRevision(status)
         if let known = withLock({ decoded[url.path] }), known.revision == revision { return known.file }
-        // On a miss retain the existing checked-open errors (including unreadable sources).
+        // Cache misses retain checked-open errors, including unreadable source failures.
         if !pathChecked { try VerifiedPath.confirmNoSymlink(url) }
         guard type == mode_t(S_IFREG) else { throw failure("Unreadable ability file: \(url.lastPathComponent).") }
         let file = try decodeContents(Data(contentsOf: url), at: url)
@@ -142,18 +150,24 @@ extension AbilityStore {
         let start = url.pathExtension == "md" ? "<!-- NativeAgent ability\n" : "/* NativeAgent ability\n"
         let end = url.pathExtension == "md" ? "\n-->\n" : "\n*/\n"
         guard text.hasPrefix(start), let boundary = text.range(of: end, range: text.index(text.startIndex, offsetBy: start.count)..<text.endIndex) else {
-            throw headerFailure("envelope", accepted: "a NativeAgent ability comment before the body", detail: "Invalid ability header comment: \(url.lastPathComponent). Restore its delimiters from retained evidence.")
+            throw headerFailure("envelope", accepted: "a NativeAgent ability comment before the body", detail: """
+                Invalid ability header comment: \(url.lastPathComponent). Restore its delimiters from retained evidence.
+                """)
         }
         let value: JSONValue
         do { value = try JSONValue.parse(Data(text[text.index(text.startIndex, offsetBy: start.count)..<boundary.lowerBound].utf8)) }
-        catch { throw headerFailure("json", accepted: "a JSON object inside the header comment", detail: "Invalid ability header JSON in \(url.lastPathComponent): \(error.localizedDescription)") }
+        catch { throw headerFailure("json", accepted: "a JSON object inside the header comment",
+            detail: "Invalid ability header JSON in \(url.lastPathComponent): \(error.localizedDescription)") }
         guard case .object(var header) = value else { throw headerFailure("json", accepted: "a JSON object inside the header comment") }
         guard let id = header.removeValue(forKey: "id")?.stringValue else { throw headerFailure("id", accepted: "the retained ability's string id") }
         guard let name = header.removeValue(forKey: "kind")?.stringValue, let kind = Kind(rawValue: name) else {
             throw headerFailure("kind", accepted: "ability, sense or turn")
         }
         guard header["reach"]?.objectValue != nil else {
-            throw headerFailure("reach", accepted: "the current reach object", detail: "Ability \(url.lastPathComponent) has no current reach declaration. Preserve its bytes and re-author it through ability.save or sense.make from its authenticated source.")
+            throw headerFailure("reach", accepted: "the current reach object", detail: """
+                Ability \(url.lastPathComponent) has no current reach declaration. Preserve its bytes and re-author it through ability.save or sense.make \
+                from its authenticated source.
+                """)
         }
         let file = try File(id: id, kind: kind, metadata: header, body: String(text[boundary.upperBound...]), pathExtension: url.pathExtension)
         try validate(file, header: file.metadata)
@@ -161,7 +175,8 @@ extension AbilityStore {
     }
     private static func validate(_ file: File, header: [String: JSONValue]) throws {
         if let key = header.keys.sorted().first(where: { !partKeys.union(["id", "kind", "version", "record", "candidate", "proof"]).contains($0) }) {
-            throw headerFailure(key, accepted: partKeys.union(["id", "kind", "version", "record", "candidate", "proof"]).sorted().joined(separator: ", "), detail: "Unknown ability header key: \(key). Remove it or use an accepted key.", code: "unknown_ability_header_key")
+            throw headerFailure(key, accepted: partKeys.union(["id", "kind", "version", "record", "candidate", "proof"]).sorted().joined(separator: ", "),
+                detail: "Unknown ability header key: \(key). Remove it or use an accepted key.", code: "unknown_ability_header_key")
         }
         _ = try partHeader(header)
         guard file.body.utf8.count <= sourceLimit else { throw failure("Part source exceeds \(sourceLimit) bytes.") }
@@ -190,9 +205,16 @@ extension AbilityStore {
             return rows
         }
         catch {
-            throw ToolFailureError("Ability run state is unreadable: \(error.localizedDescription) Read abilities/state.json with files.read, recover its state object without inventing run evidence, then pass state to abilities.restore_state. Saved bytes were preserved.", effects: .none,
-                owner: "abilities/state.json", nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(url.path)])]),
-                instruction: "After reconstructing state, call abilities.restore_state with state and expected_digest: \(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()).")
+            throw ToolFailureError("""
+                Ability run state is unreadable: \(error.localizedDescription) Read abilities/state.json with files.read, recover its state object without \
+                inventing run evidence, then pass state to abilities.restore_state. Saved bytes were preserved.
+                """, effects: .none,
+                owner: "abilities/state.json", nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(url
+                    .path)])]),
+                instruction: """
+                    After reconstructing state, call abilities.restore_state with state and expected_digest: \
+                    \(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()).
+                    """)
         }
     }
     static func decodeState(_ bytes: Data) throws -> [String: JSONValue] {

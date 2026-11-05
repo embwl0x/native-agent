@@ -4,18 +4,13 @@ import AgentWorkspace
 import BackgroundLoops
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DelegationOutcome.swift` | Store-read availability and delegated outcome/liveness interpretation; owner-proven terminal records need no execution timestamp and remain distinct from stalls |
-// Terminal outcomes remain distinct from the projector's stall classification.
-// A durable cursor advances only after the corresponding card is written.
+// Blueprint: | `DelegationOutcome.swift` | Owner-proven terminal outcomes remain distinct from stalls |
+// Terminal outcomes and stalls stay distinct; durable cursor progress requires card settlement.
 
 
-/// One store read: the readable jobs AND whether every configured store
-/// actually answered.
 public struct DelegationJobsRead: Sendable, Equatable {
     public var jobs: [DelegationReadout]
-    /// False when a store directory, job file, or ledger line could not be read
-    /// or parsed. An ABSENT store is readable — a bridge that is not configured
-    /// on this machine is not a failed read.
+    /// Unconfigured stores are absent, not unreadable; parse and access failures keep availability false.
     public var allStoresReadable: Bool
     public var availabilityError: String?
 
@@ -28,9 +23,7 @@ public struct DelegationJobsRead: Sendable, Equatable {
 extension DelegationReadout {
     public var displayName: String { contactName ?? DelegationOutcomeCard.displayName(source: source, agent: agent) }
 
-    /// An aborted run with reply words on record said something
-    /// before it stopped. The words may be interim narration, so the outcome
-    /// stays non-success; only the card stops calling it a failure.
+    /// Recorded speech may be interim narration; it does not turn an aborted run into success.
     var abortedAfterReply: Bool {
         statusWord == "aborted" && !(agentReplyTextHead ?? "").isEmpty
     }
@@ -59,13 +52,11 @@ extension DelegationReadout {
         return state?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             == "delivering"
     }
-    /// True when runner or delivery-owner evidence proves a terminal record;
-    /// delivery settlement need not carry an execution completion timestamp.
+    /// Delivery-owner terminal evidence need not carry an execution timestamp.
     public var isTerminal: Bool {
         if statusWord == "observation_unavailable" { return false }
         if completedAt != nil { return true }
-        // Delivery evidence — the settlement written AFTER the POST — is what
-        // makes a finished run terminal.
+        // POST settlement, rather than execution completion alone, makes delivery terminal.
         if isDelivering { return false }
         if stallBasis == .terminal { return true }
         if let statusWord, Self.terminalStatusWords.contains(statusWord) { return true }
@@ -76,17 +67,12 @@ extension DelegationReadout {
         guard isTerminal else { return nil }
         // A dry run made no POST, so a completed run proves no delegation outcome.
         if deliveryOutcome == "let_go" || deliveryOutcome == "dry_run" { return nil }
-        // Proven-lost outranks everything: a job whose answer never reached
-        // Agent is a failure of the delegation regardless of how the run went.
+        // Proven loss outranks execution success because the delegated answer did not arrive.
         if deliveryLost == true || deliveryOutcome == "lost" { return .deliveryLost }
-        // Execution may have completed or failed, but an explicitly blocked
-        // handoff is never a successful delegation or permission to rerun it.
-        // Reuse the existing actionable uncertainty outcome/cursor class.
+        // Blocked handoff proves neither successful delivery nor permission to rerun the work.
         if deliveryOutcome == "blocked" { return .unknown }
         if deliveryOutcome == "delivered" { return .succeeded }
         if deliveryOutcome == "failed_before_answer" { return .failed }
-        // A live Claude session receives the inbox handoff without spawning another session.
-        if statusWord == "delivered_live" { return .succeeded }
         // Inbox-only delivery without a confirmed reader remains unknown.
         if statusWord == "delivered_inbox" { return .unknown }
         if let statusWord, Self.failureStatusWords.contains(statusWord) { return .failed }
@@ -96,10 +82,7 @@ extension DelegationReadout {
         // completedAt with no status word at all: it ended, we cannot say how.
         return .unknown
     }
-    /// Shared resident-action projection for an asynchronous builder handoff.
-    /// A clean runner completion is deliberately still `unverified`: it proves
-    /// the delegated agent returned, not that its answer satisfied Agent's
-    /// original request.
+    /// Runner completion proves only that the delegate returned; satisfying the request remains unverified.
     public func motorActionReadModel() -> MotorActionReadModel {
         let phase: MotorActionPhase
         let verification: MotorVerificationState
@@ -107,7 +90,10 @@ extension DelegationReadout {
         if statusWord == "observation_unavailable" {
             phase = .unknown
             verification = .unknown
-            next = "Completion observation is unavailable. Repair the named evidence source and inspect the existing turn; do not interrupt or replay it from silence."
+            next = """
+                Completion observation is unavailable. Repair the named evidence source and inspect the existing turn; do not interrupt or replay it from \
+                silence.
+                """
         } else if isTerminal && deliveryOutcome == "blocked" && deliveryLost != true {
             phase = .blocked
             verification = .unknown
@@ -157,21 +143,16 @@ extension DelegationReadout {
             deadline: nil
         )
     }
-    /// The instant used to order this job against the cursor. `nil` when the
-    /// record carries no completion stamp — such a job is deduped by id alone.
+    /// Without a completion stamp, dedupe by identity alone rather than inventing cursor order.
     var completionStamp: Date? { DelegationOutcomeCursor.parseISO(completedAt) }
 }
-/// What a terminal delegated job amounted to.
 public enum DelegationOutcome: String, Sendable, Equatable, CaseIterable {
     case succeeded
     case failed
     case deliveryLost = "delivery_lost"
     case unknown
 
-    /// Only a clean success is `info`. Everything else is `actionable` —
-    /// including `unknown`, because an unconfirmed delivery is a thing User may
-    /// need to act on, and grading it `info` would bury it. A card whose
-    /// notice reaches her is `info` instead (`DelegationOutcomeCard.reachesHer`).
+    /// Unconfirmed delivery needs attention; a resident-delivered notice avoids a duplicate push to the person.
     public var severity: String { self == .succeeded ? "info" : "actionable" }
 
     /// Re-card only when the alarm rank increases; cards never quietly downgrade.

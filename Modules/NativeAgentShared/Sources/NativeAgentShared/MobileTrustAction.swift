@@ -1,13 +1,5 @@
 import Foundation
-// Blueprint: | `MobileTrustAction.swift` | Shared `TrustWorkshopPolicy` value and closed `MobileTrustAction` requests; TrustCenter retains policy authority |
-
-public struct TrustWorkshopPolicy: Sendable, Codable, Hashable {
-    public var enabled: Bool?
-
-    public init(enabled: Bool? = nil) {
-        self.enabled = enabled
-    }
-}
+// Blueprint: | `MobileTrustAction.swift` | Closed `MobileTrustAction` requests; TrustCenter retains policy authority |
 
 /// Closed, non-secret requests accepted only from a verified paired phone.
 public enum MobileTrustAction: Sendable {
@@ -36,8 +28,7 @@ public enum MobileTrustAction: Sendable {
 
         public var summary: String {
             switch self {
-            // What the permission law does under each posture (PermissionLaw),
-            // and what only Full Mac opens (the Mac-control categories).
+            // What the permission law does under each posture (PermissionLaw), and what only Full Mac opens (the Mac-control categories).
             case .safe: "Read files; change nothing on your side; no shell or git"
             case .workMode: "Edit approved workspaces; ask before sends or changes on your side; Mac control, shell and git need Full Mac"
             case .builder: "Edit workspaces and ask before writing elsewhere; Mac control, shell and git need Full Mac"
@@ -48,7 +39,7 @@ public enum MobileTrustAction: Sendable {
 
     public enum Field: String, CaseIterable, Sendable {
         case permissionLevel, autonomyDefault, requireBackups, outsideDefault, developerMode
-        case workshopEnabled, dreamScheduler
+        case dreamScheduler
 
         public var values: [String] {
             switch self {
@@ -69,8 +60,7 @@ public enum MobileTrustAction: Sendable {
         } else if Set(payload.keys) == ["field", "value", "confirmed"],
                   let field = Field(rawValue: payload["field"] ?? ""),
                   let value = payload["value"], field.values.contains(value), confirmed {
-            // Outside Allow grants Full Mac authority. Only the complete preset
-            // may grant it, after presenting the shared Full Mac disclosure.
+            // Outside Allow grants Full Mac authority. Only the complete preset may grant it, after presenting the shared Full Mac disclosure.
             guard field != .outsideDefault || value != "allow" else { return nil }
             self = .policy(field, value: value, confirmed: confirmed)
         } else {
@@ -95,6 +85,8 @@ public enum MobileTrustAction: Sendable {
 
     Workspace actions run autonomously, and access outside workspaces is allowed. Pre-write backups stay on.
 
-    Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
+    Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval \
+    in System Settings → Privacy & Security → \
+    Files and Folders (or Full Disk Access) before anything can read them.
     """
 }

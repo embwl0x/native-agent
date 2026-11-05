@@ -3,10 +3,18 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Dispatcher
-// Blueprint: | `BotTurnRunner.swift` | `BotTurnRunner` owns helper-only model/tool rounds over the shared prefix layout supplied by its adapter; conditioned final rounds decode `JobResult` into reply and optional Boolean verdict before progress or persistence; injected wire codecs, gated dispatch and row writer reuse their existing owners; Stop saves partial output through settle |
+// Blueprint: | `BotTurnRunner.swift` | `BotTurnRunner`: helper rounds; `JobResult` precedes progress/persistence; Stop settles partial output |
 
-/// Helpers think on their own history and instructions, never the resident's turn engine.
+/// Helpers own their history and instructions independently of the resident's turn engine.
 package enum BotTurnRunner {
+    package struct Request: Sendable {
+        package let conversation: [LLMMessage]
+        package let wire: [LLMMessage]
+        package let currentUserIndex: Int
+        package init(conversation: [LLMMessage], wire: [LLMMessage], currentUserIndex: Int) {
+            self.conversation = conversation; self.wire = wire; self.currentUserIndex = currentUserIndex
+        }
+    }
     private struct JobResult: Decodable {
         let reply: String
         let conditionMet: Bool?
@@ -32,34 +40,37 @@ package enum BotTurnRunner {
 
     package static func run(
         bot: BotDefinition, messages initialMessages: [LLMMessage], system: String,
-        model: String, llm: any LLMClient, schemas: [LLMToolSchema]?,
-        admitRequest: @Sendable ([LLMMessage]) async throws -> Void,
+        model: String, llm: any LLMClient, schemas: [LLMToolSchema]?, turn: Turn, call: LLMCall, options: BotRunOptions,
+        admitRequest: @Sendable ([LLMMessage]) async throws -> Request,
         visible: @Sendable (String) -> String,
         release: @Sendable (inout String) -> String,
         progress: @Sendable (String) async -> Void,
         decode: @Sendable (String, [LLMStreamToolCall]) throws -> [Call],
         feedback: @Sendable (String, [Call], [JSONValue], [LLMContentBlock]) throws -> [LLMMessage],
-        dispatch: @Sendable (Call, LocalToolImage.Round) async throws -> (JSONValue, [LLMContentBlock]),
+        dispatch: @Sendable (Call, LocalToolImage.Round, Turn) async throws -> (JSONValue, [LLMContentBlock]),
         waiting: @Sendable (JSONValue) -> BotTurnReply?,
         attachments: @Sendable () -> [MultimodalAttachment],
-        save: @escaping @Sendable (BotTurnReply, [MultimodalAttachment]) async throws -> Void
+        save: @escaping @Sendable (BotTurnReply, [MultimodalAttachment], Turn) async throws -> Void
     ) async throws -> BotTurnReply {
         var messages = initialMessages
         var output = ""
         var text = ""
         var outcome = BotTurnReply(reply: "", model: model)
-        let judgesCondition = BotRunner.conditionSessionID == bot.sessionID
+        let judgesCondition = options.conditionSessionID == bot.sessionID
         do {
             while true {
                 try Task.checkCancellation()
                 LocalToolImage.boundConversation(&messages)
-                try await admitRequest(messages)
+                let request = try await admitRequest(messages)
+                messages = request.conversation
                 text = ""
                 var pending = ""
                 var calls: [LLMStreamToolCall] = []
                 var boundary: LLMToolBoundaryReason?
-                for try await event in llm.streamMessages(messages: messages, system: system,
-                    model: model, surface: "bot", tools: schemas) {
+                var roundCall = call
+                roundCall.currentUserIndex = request.currentUserIndex
+                for try await event in llm.streamMessages(messages: request.wire, system: system,
+                    model: model, tools: schemas, call: roundCall) {
                     try Task.checkCancellation()
                     switch event {
                     case .textDelta(let delta):
@@ -68,14 +79,13 @@ package enum BotTurnRunner {
                         if !judgesCondition, !safe.isEmpty { await progress(safe) }
                     case .toolCall(let call): calls.append(call)
                     case .toolBoundary(let reason): boundary = boundary ?? reason
-                    case .keepAlive, .replyTextSettled: break
+                    case .keepAlive, .callInput, .replyTextSettled: break
                     }
                 }
                 var prose = visible(text)
                 let tail = visible(pending)
                 if !judgesCondition, !tail.isEmpty { await progress(tail) }
-                // Only the final, call-free round is the job's result. Tool
-                // narration and tool output cannot supply a verdict.
+                // Only final, call-free output can judge the job; tool narration is not a verdict.
                 let decoded: [Call]
                 if boundary == nil { decoded = try decode(text, calls) }
                 else { decoded = [] }
@@ -85,10 +95,11 @@ package enum BotTurnRunner {
                         prose = result.reply
                         outcome.conditionMet = result.conditionMet
                     } catch {
-                        // Keep what the helper actually returned as partial evidence.
-                        // An unreadable condition result cannot complete its contract.
+                        // Retain unreadable output as partial evidence; it cannot fulfill the condition contract.
                         outcome.status = .failed
-                        outcome.detail = "The helper's condition result could not be decoded: \(error). Repair its structured reply before judging the condition."
+                        outcome.detail = """
+                            The helper's condition result could not be decoded: \(error). Repair its structured reply before judging the condition.
+                            """
                     }
                 }
                 if !output.isEmpty && !prose.isEmpty { output += "\n\n" }
@@ -106,7 +117,7 @@ package enum BotTurnRunner {
                 let imageRound = LocalToolImage.Round()
                 for call in decoded {
                     try Task.checkCancellation()
-                    let (result, pixels) = try await dispatch(call, imageRound)
+                    let (result, pixels) = try await dispatch(call, imageRound, turn)
                     results.append(result)
                     images += pixels
                     if let held = waiting(result) { outcome = held; break }
@@ -115,7 +126,7 @@ package enum BotTurnRunner {
                 messages += try feedback(roundText, decoded, results, images)
             }
         } catch {
-            outcome.status = Task.isCancelled || error is CancellationError || LLMCallContext.turnTokenBudget?.exhausted == true ? .stopped : .failed
+            outcome.status = Task.isCancelled || error is CancellationError || turn.tokenBudget?.exhausted == true ? .stopped : .failed
             outcome.detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             output += visible(text)
         }
@@ -130,7 +141,7 @@ package enum BotTurnRunner {
         }
         let saved = outcome
         let persisted = await settle { () -> Result<Void, Error> in
-            do { try await save(saved, attachments); return .success(()) }
+            do { try await save(saved, attachments, turn); return .success(()) }
             catch { return .failure(error) }
         }
         try persisted.get()

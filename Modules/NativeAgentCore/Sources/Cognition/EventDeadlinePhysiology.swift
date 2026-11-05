@@ -3,17 +3,12 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `EventDeadlinePhysiology.swift` | `EventDeadlinePhysiology`: store/file invalidations and cancellable refresh adapters; canonical runners reread state and suppress only known self-write generations |
+// Blueprint: | `EventDeadlinePhysiology.swift` | `EventDeadlinePhysiology`. |
 
-/// App-owned signal adapters for event/deadline background runners. The
-/// events are invalidations only: every runner rereads its canonical store.
+/// Events invalidate only; runners reread canonical stores.
 public enum EventDeadlinePhysiology {
-    /// `loopId` arms self-write suppression: events observed while every
-    /// watched path still carries the generation stamped at the end of that
-    /// loop's own last tick are its own echo and are dropped. Omit it (nil) and
-    /// every event is delivered.
-    ///
-    /// System notifications, including clock and time-zone changes, bypass self-write suppression.
+    /// Suppress self-write echoes only while every path matches the loop's completed generation.
+    /// Without a loop ID deliver all events; system clock notifications always bypass suppression.
     public static func storeAndFileEvents(
         paths: [URL],
         stores: Set<StoreChange.Store> = [],
@@ -32,9 +27,7 @@ public enum EventDeadlinePhysiology {
             selfWrites.register(loopId: loopId, paths: Array(normalized))
         }
         let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        // Suppression is evaluated at DELIVERY, not at emit: the generation
-        // read has to reflect the file as the consumer would find it, and an
-        // FSEvent can arrive long after the write that caused it.
+        // Evaluate suppression at delivery because delayed filesystem events must be compared with the consumer's current read.
         let deliver: @Sendable () -> Void = { [continuation = pair.continuation] in
             if let loopId, selfWrites.isSelfWriteEcho(loopId: loopId) { return }
             continuation.yield(())
@@ -65,8 +58,7 @@ public enum EventDeadlinePhysiology {
         return pair.stream
     }
 
-    /// View-lifetime refresh over canonical invalidations. The source is armed
-    /// before the initial read so writes racing that read remain buffered.
+    /// Arm invalidations before the initial read so racing writes remain buffered.
     @MainActor
     public static func refreshOnChanges(
         paths: [URL],
@@ -83,8 +75,7 @@ public enum EventDeadlinePhysiology {
         let debouncer = StoreReloadDebouncer(delay: debounceDelay) {
             await refresh()
         }
-        // Arm the source before the initial read. Any write racing that read
-        // remains buffered by the source stream and is replayed below.
+        // Arm before reading so a racing write remains buffered for replay.
         await refresh()
         guard !Task.isCancelled else {
             await debouncer.cancel()

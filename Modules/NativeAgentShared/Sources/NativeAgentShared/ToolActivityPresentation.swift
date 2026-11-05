@@ -1,15 +1,14 @@
 import Foundation
 import os
 
-// Blueprint: | `ToolActivityPresentation.swift` | `ToolActivityPresentation`: shared card/progress/approval copy from bounded call names; tool IDs and execution arguments stay unchanged |
+// Blueprint: | `ToolActivityPresentation.swift` | `ToolActivityPresentation`: bounded display copy; execution stays unchanged |
 
-/// Display copy only. Tool identifiers and execution payloads stay unchanged.
+/// Presentation must not rewrite tool identifiers or execution payloads.
 public enum ToolActivityPresentation {
     public static func title(_ name: String) -> String {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if let title = titles[name.lowercased()] { return title }
-        // A part's network reach, keyless or as a signed-in connector: what a
-        // person reads on its card ("weather wants to fetch from the web").
+        // Cards describe network reach in the person’s words.
         if name.lowercased().hasPrefix("fetch.") {
             let source = name.dropFirst("fetch.".count)
                 .split(whereSeparator: { $0 == "_" || $0 == "." || $0 == "-" }).joined(separator: " ")
@@ -22,9 +21,7 @@ public enum ToolActivityPresentation {
         return first.uppercased() + words.dropFirst()
     }
 
-    /// What I'm doing, in a few plain words, for the turn card, Telegram and
-    /// the iPhone. `args` are the call's string arguments; only a short plain
-    /// name among them (an app, an agent, a page, a web host) reaches the words.
+    /// Progress copy admits only short plain names from arguments, never paths or query payloads.
     public static func progress(_ name: String, args: [String: String] = [:]) -> String {
         switch name.lowercased() {
         case "app", "workspace":
@@ -50,8 +47,6 @@ public enum ToolActivityPresentation {
         case "read_file", "file_excerpt": return "Reading file"
         case "list_dir": return "Listing folder"
         case "recall_memory", "recall_search": return "Searching memory"
-        case "claude_message", "codex_message", "invoke_codex", "omp_message", "agent_swarm":
-            return "Starting background work"
         case "search_kg": return "Searching knowledge graph"
         default:
             let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -60,18 +55,16 @@ public enum ToolActivityPresentation {
         }
     }
 
-    /// The app's own button words by `app` action id ("provider.test" → "Test
-    /// the connection"), and by the folded tool a call is shown as
-    /// (files.write → write_file), installed once at launch from the door's registry.
+    /// The app's own button words by `app` action id ("provider.test" → "Test the connection"), and by the folded tool a call is shown as (files.write →
+    /// write_file), installed once at launch from the door's registry.
     public static func installActionLabels(_ labels: [String: String]) {
         actionLabels.withLock { $0 = labels }
     }
 
     private static let actionLabels = OSAllocatedUnfairLock(initialState: [String: String]())
 
-    /// A label as something under way when its first word is a known verb
-    /// ("Test the connection" → "Testing the connection"), else as it is;
-    /// words after a "(", ";", ":" or "," are the model's notes and stay out.
+    /// A label as something under way when its first word is a known verb ("Test the connection" → "Testing the connection"), else as it is; words after a
+    /// "(", ";", ":" or "," are the model's notes and stay out.
     private static func underway(_ label: String) -> String? {
         let words = label.prefix { !"(;:,".contains($0) }.trimmingCharacters(in: .whitespaces)
         guard let first = words.split(separator: " ").first else { return nil }
@@ -105,8 +98,7 @@ public enum ToolActivityPresentation {
         return plainName(raw).map { "Opening \($0)" } ?? "Opening it"
     }
 
-    /// A short name a person would say ("Mail", "Codex", "inbox" → "Inbox");
-    /// nil for anything longer or with a path, ref or query in it.
+    /// Reject long names, paths, references and queries from display labels.
     private static func plainName(_ raw: String?) -> String? {
         guard let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty, text.count <= 32,
@@ -131,7 +123,6 @@ public enum ToolActivityPresentation {
         return "Finished: \(title(name))"
     }
 
-    /// Translate generated approval labels, preserving requesters and literal evidence.
     public static func approvalText(_ text: String, tool: String) -> String {
         guard !tool.isEmpty else { return text }
         let phrase = title(tool)
@@ -149,18 +140,15 @@ public enum ToolActivityPresentation {
 
     private static let titles = [
         "read": "Read a document", "apply_patch": "Edit files", "read_file": "Read a file",
-        // The Mac verbs: under Work every one of them is a card a person reads.
         "go": "Open an app, file or page", "act": "Use an app on screen", "screen": "Look at the screen",
         "menu": "Read an app's menus", "menu_press": "Choose a menu item", "wait": "Wait for the screen",
         "clipboard_read": "Read the clipboard", "clipboard_write": "Copy to the clipboard",
         "chat_reply": "Reply to a conversation",
-        "codex_message": "Send a coding request", "restart_app": "Restart the app",
+        "restart_app": "Restart the app",
         "write_file": "Write a file", "git": "Work with version history", "install_app": "Install the app",
         "shell": "Run a command", "list_dir": "List files", "image_generate": "Create an image",
-        "bash": "Run a command", "claude_message": "Send a helper request",
-        "studio_journal": "Write a working note", "omp_message": "Send a helper request",
-        "invoke_codex": "Ask a coding helper",
-        "agent_swarm": "Start background work",
+        "bash": "Run a command",
+        "studio_journal": "Write a working note",
         "desk_breakdown": "Break down a task",
         "mac_calendar_delete_event": "Delete a calendar event",
         "mac_calendar_create_event": "Create a calendar event",

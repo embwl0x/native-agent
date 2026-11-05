@@ -1,9 +1,8 @@
 import AppKit
 import Foundation
-// Blueprint: | `NativeOAuthPlatformPort.swift` | `NativeOAuthPlatformPort` protocol; `runAuthSession`, `isCanceledLogin`; shared `makeLoopbackSession` returns the concrete callback server; `openBrowser`, `runLoopbackAuthSession` defaults |
+// Blueprint: | `NativeOAuthPlatformPort.swift` | `NativeOAuthPlatformPort`, `runAuthSession`, `isCanceledLogin`, `makeLoopbackSession`, `openBrowser`, `runLoopbackAuthSession` |
 
-/// Platform effects used by the Core sign-in policy. Session entry points
-/// retain their MainActor isolation; listeners retain their own cancellation.
+/// Platform effects used by the Core sign-in policy. Session entry points retain their MainActor isolation; listeners retain their own cancellation.
 public protocol NativeOAuthPlatformPort: Sendable {
     @MainActor static func runAuthSession(authURL: URL, expectedState: String, providerId: String) async throws -> URL
     static func isCanceledLogin(_ error: Error) -> Bool

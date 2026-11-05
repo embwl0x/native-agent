@@ -3,21 +3,16 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 import NativeAgentShared
-// Blueprint: | `CognitiveSubstrate+Reflection.swift` | `CognitiveSubstrate`: causal `planReflectionChecked`, frozen per-cause peer/node provenance, judged reflection integration and receipts |
+// Blueprint: | `CognitiveSubstrate+Reflection.swift` | `CognitiveSubstrate`: `planReflectionChecked`, frozen causes and receipts |
 
-/// Who is asking for the introspective call.
 public enum CognitiveReflectionDemand: String, Sendable, Equatable {
-    /// A person asked (the Observatory button, an explicit call). The cost
-    /// ceiling still holds; unresolved load does not gate it — refusing a
-    /// direct ask because her seeds are quiet would be a lie about why.
+    /// A requested reflection still obeys the spend ceiling but never needs unresolved-load admission.
     case requested
-    /// Nobody asked: the dream/REM commit signal reached her. Admitted ONLY
-    /// when unresolved load is above threshold, under the same ceiling.
+    /// Unattended reflection requires unresolved load under the shared spend ceiling.
     case spontaneous
 }
 
-/// Why a reflection was (or was not) admitted — the honest ledger line behind
-/// a skipped autonomous call, including the load reading that produced it.
+/// Keep admission reasons and readings so a skipped reflection is explainable.
 public struct CognitiveReflectionAdmission: Sendable, Equatable {
     public var admitted: Bool
     public var reason: String
@@ -39,10 +34,7 @@ public enum CognitiveReflectionPlan: Sendable {
 }
 
 extension CognitiveSubstrate {
-    /// Admission-checked planning. A `.spontaneous` call must be earned by
-    /// unresolved load; a `.requested` one only has to fit under the ceiling.
-    /// The refusal carries its reason so the caller can report it instead of
-    /// swallowing a nil.
+    /// Requested calls need budget; spontaneous calls also need unresolved load. Return the refusal cause rather than an unexplained nil.
     public func planReflectionChecked(
         reason: String,
         demand: CognitiveReflectionDemand = .requested,
@@ -55,20 +47,18 @@ extension CognitiveSubstrate {
         guard admission.admitted else { return .refused(admission) }
         let now = dependencies.now()
         let read = await frozenRead(at: now)
-        // Reflection inspects the frozen state without resolving turn cues or
-        // committing presentation cadence.
+        // Reflection inspects the frozen state without resolving turn cues or committing presentation cadence.
         let capsule = compileFrozenCapsulePresentation(
             CognitiveCapsuleRequest(
                 surface: "reflection",
                 userMessage: reason,
                 mode: .inspectOnly,
                 maximumCharacters: min(800, configuration.maximumCapsuleCharacters)
-            ), from: read
+            ), from: read, turn: nil
         ).capsule
         let frozenEvidence = capsule.provenanceNodeIds
         let nodes = field.peekNodes()
-        // A committed wake supplies its own causes. Requested reflection uses
-        // exactly the capsule's sources, never unrelated field-score winners.
+        // A committed wake supplies its own causes. Requested reflection uses exactly the capsule's sources, never unrelated field-score winners.
         var causes = material ?? [:]
         if material == nil {
             for node in nodes where frozenEvidence.contains(node.id) {
@@ -82,7 +72,7 @@ extension CognitiveSubstrate {
             + nodes.map { "\($0.subjectReference.type):\($0.subjectReference.id)" }
         let identities: [String: String]
         do {
-            identities = try await ChatSessionRecollections.experienceIdentities(for: references,
+            identities = try await ConversationHistory.experienceIdentities(for: references,
                 dataRoot: store?.databaseURL.deletingLastPathComponent().deletingLastPathComponent())
         } catch {
             var refused = admission
@@ -100,8 +90,7 @@ extension CognitiveSubstrate {
         let sourceExcerpts = causes.sorted { $0.key < $1.key }.map { "[\($0.key)]\n\($0.value.text)" }
         let sourcePeers = CognitiveReflectionCause.unionPeerIds(causes.values.map(\.sourcePeerIds)
             + (capsule.combined.isEmpty ? [] : [capsule.sourcePeerIds]))
-        // Her cares, closest first: the reflection names the one its thought
-        // belongs to, or a new one. The embedding only orders the list.
+        // Embeddings order cares; the reflection names the care its thought belongs to.
         let shownCares: [CognitiveCareLine]
         do {
             shownCares = try await caresShown(
@@ -129,9 +118,7 @@ extension CognitiveSubstrate {
             refused.reason = "Reflection policy unavailable: \(error)"
             return .refused(refused)
         }
-        // frozenRead is async. Recheck after it returns: another manual or
-        // scheduled planner may have claimed the final slot while this actor was
-        // reentrant, or Settings may have disabled/lowered the budget.
+        // Recheck admission after frozenRead suspends: actor reentrancy permits another claim or a changed budget.
         let recheck = await reflectionAdmission(demand: demand)
         guard recheck.admitted else { return .refused(recheck) }
         guard epoch == mindEpoch else {
@@ -190,9 +177,7 @@ extension CognitiveSubstrate {
     ) async -> CognitiveReflectionReceipt? {
         await waitForMaintenanceTransition()
         let integrationEnabled = configuration.enabled && configuration.reflectiveCallsEnabled
-        // Only a request issued by planReflection may consume the public
-        // terminal path. A nil token is not a compatibility bypass, and a late
-        // expired request cannot integrate or release a newer reservation.
+        // Only a live issued reservation may settle; nil or expired tokens cannot release a newer claim.
         guard ownsReflectionReservation(request) else { return nil }
         defer {
             if ownsReflectionReservation(request) { reflectionReservation = nil }
@@ -211,8 +196,7 @@ extension CognitiveSubstrate {
             judgment: judgment
         )
         receipt.journalPending = journalPending
-        // Retain the judgment before any effect. Errors are observations, never
-        // gates; the pending flags below name work, not the last attempt.
+        // Retain the judgment before any effect. Errors are observations, never gates; the pending flags below name work, not the last attempt.
         if integrationEnabled, !cancelled, let judgment {
             receipt.careIntegrationPending = true
             receipt.dispositionSaveFailed = judgment.affect != nil
@@ -225,8 +209,7 @@ extension CognitiveSubstrate {
         return receipt
     }
 
-    /// Checkpoint the provider's input and judgment before any care or mood
-    /// mutation. The dream journal also retains this receipt as its step input.
+    /// Checkpoint the provider's input and judgment before any care or mood mutation. The dream journal also retains this receipt as its step input.
     public func checkpointReflectionResultChecked(_ receipt: CognitiveReflectionReceipt, requirePersistence: Bool = false) async throws {
         try requireIntegratedReflectionReceipt(receipt)
         let durable = requirePersistence || receipt.journalPending == true
@@ -239,8 +222,7 @@ extension CognitiveSubstrate {
         if durable, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
     }
 
-    /// Resume only the effects of a retained judgment. Prefer the live owner:
-    /// the journal's receipt is input, never a second progress authority.
+    /// Resume only the effects of a retained judgment. Prefer the live owner: the journal's receipt is input, never a second progress authority.
     public func persistReflectionResultChecked(_ input: CognitiveReflectionReceipt) async throws {
         await waitForMaintenanceTransition()
         if input.journalPending == true, !persistenceRestored || persistenceHealth.writesBlocked {
@@ -287,9 +269,8 @@ extension CognitiveSubstrate {
         }
         let artifacts = try reflectionEffectArtifacts(receipt, at: at)
         let written = disposition
-        // On failure the resident values and done flags stay together. The
-        // next attempt writes them; it does not apply them again. On restart
-        // their atomic receipt is the witness that the effects already landed.
+        // On failure the resident values and done flags stay together. The next attempt writes them; it does not apply them again. On restart their atomic
+        // receipt is the witness that the effects already landed.
         try await persistArtifactTransition(artifacts: artifacts, deletedArtifactIDs: [], at: at)
         if receipt.journalPending == true, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
         try requireIntegratedReflectionReceipt(receipt)
@@ -319,8 +300,7 @@ extension CognitiveSubstrate {
 
     public func acknowledgeDreamReflection(_ id: UUID) async throws {
         await waitForMaintenanceTransition()
-        // A repeated acknowledgment after its journal checkpoint failed may
-        // find a pruned, already settled receipt; no effect is owed here.
+        // A repeated acknowledgment after its journal checkpoint failed may find a pruned, already settled receipt; no effect is owed here.
         guard var receipt = reflectionReceipts[id] else { return }
         guard receipt.careIntegrationPending != true, !receipt.dispositionSaveFailed else {
             throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_receipt", detail: "reflection effects remain owed")
@@ -344,35 +324,29 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// Refusal vocabulary — stable strings, so a skipped call reads the same in
-    /// a loop outcome, a receipt and a test.
+    /// Stable refusal strings keep loop outcomes and receipts consistent.
     public static let reflectionRefusalDisabled = "reflection_disabled"
     public static let reflectionRefusalCeilingReached = "reflection_cost_ceiling_reached"
     public static let reflectionRefusalInFlight = "reflection_in_flight"
     public static let reflectionRefusalLoadBelowThreshold = "reflection_load_below_threshold"
     static let reflectionAdmittedReason = "admitted"
 
-    /// The cost ceiling's window. ROLLING, not calendar: a reflection at 23:50
-    /// used to free its slot ten minutes later, and a hard afternoon could not
-    /// borrow against a quiet morning.
+    /// A rolling window lets quiet hours leave room for harder hours without freeing slots at midnight.
     static let reflectionCostWindow: TimeInterval = 24 * 60 * 60
 
-    /// Reflection calls already spent inside the rolling window. The ledger is
-    /// the receipts themselves — the same rows the calendar-day count read.
+    /// Read spent calls from their receipt owner; do not mirror the ledger.
     func reflectionCallsInCostWindow(at now: Date) -> Int {
         let cutoff = now.addingTimeInterval(-Self.reflectionCostWindow)
         return reflectionReceipts.values.filter { $0.createdAt > cutoff }.count
     }
 
-    /// The pressure of everything still open for her, read from cares.
+    /// Only open cares contribute unresolved pressure.
     func reflectionUnresolvedLoad(at now: Date) -> Double {
         cares.values.filter { $0.fadedAt == nil && $0.open != nil }
             .reduce(0) { $0 + Self.carePressure($1, at: now) }
     }
 
-    /// Would a reflection be admitted right now, and why. Load is read only for
-    /// the spontaneous demand — a person asking is never told her cares are too
-    /// quiet.
+    /// Read load only for spontaneous demand; a person's request cannot be refused because cares are quiet.
     public func reflectionAdmission(
         demand: CognitiveReflectionDemand = .spontaneous
     ) async -> CognitiveReflectionAdmission {
@@ -404,14 +378,13 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// Unknown peer provenance is tainted, just as it was for view formation.
+    /// Unknown peer provenance remains tainted.
     func reflectionIsTainted(_ request: CognitiveReflectionRequest) -> Bool {
         guard let peers = request.sourcePeerIds else { return true }
         return peers.contains { !dependencies.peerTrusted($0) }
     }
 
-    /// `peer:<uuid>` for an agent conversation, the lane name for a built-in
-    /// one; an unknown peer session is returned as is (and trusts no one).
+    /// Agent sessions use `peer:<uuid>`; built-in sessions use their surface name. Unknown peer identity grants no trust.
     public static func peerIdentity(session: String, dataRoot: URL = defaultDataRoot()) -> String? {
         guard SessionConversation.kind(session, dataRoot: dataRoot, includingArchived: true)?.isPeerConversation == true else { return nil }
         let lowered = session.lowercased()
@@ -455,8 +428,7 @@ extension CognitiveSubstrate {
             else if lower.hasPrefix("because:") { because = rest("because:") }
             else if lower.hasPrefix("unless:") { unless = rest("unless:") }
         }
-        // Both judgments are prepared before applying either. A takeaway joins
-        // the view's care inside the synchronous mutation, unless it is a root.
+        // Both judgments are prepared before applying either. A takeaway joins the view's care inside the synchronous mutation, unless it is a root.
         let key = receipt.judgment?.care?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let named = key.flatMap { key in receipt.request.cares.first { $0.key.lowercased() == key }?.id }
         var judgments: [CognitiveCareJudgment] = []

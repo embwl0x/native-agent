@@ -40,18 +40,11 @@ public struct OrganismCapabilityBelief: Sendable, Equatable, Identifiable {
     }
 }
 
-/// A calibrated self-read over the predictive body. Beta smoothing prevents a
-/// single success/failure from becoming certainty; freshness is analytic and
-/// the read has no prose, prompt, action, or identity authority.
+/// A calibrated self-read over the predictive body. Beta smoothing prevents a single success/failure from becoming certainty; freshness is analytic and the
+/// read has no prose, prompt, action, or identity authority.
 public enum OrganismCapabilitySelfModel {
     public static let freshnessHalfLife: TimeInterval = 7 * 24 * 60 * 60
-    /// Half-life of the outcome evidence itself, applied on the organism clock
-    /// in `OrganismPersistentState.decayed(at:)`. Matched to
-    /// `freshnessHalfLife` so weight and freshness fade together: a week of
-    /// silence halves what the body still counts as known. The neighbouring
-    /// prediction horizons (`predictionHalfLife` 6h, typed body beliefs 2-3h)
-    /// govern single in-flight expectations and are far too fast for lifetime
-    /// capability evidence.
+    /// Match outcome decay to the week-scale freshness half-life; single in-flight expectation horizons are too short for capability evidence.
     public static let evidenceHalfLife: TimeInterval = freshnessHalfLife
 
     public static func beliefs(
@@ -74,11 +67,7 @@ public enum OrganismCapabilitySelfModel {
             let evidenceWeight = weights.map { $0.satisfied + $0.violated + $0.expired }
                 ?? 0
             let resolutionUncertainty = 1 / sqrt(resolvedWeight + 1)
-            // Smoothed by the SAME prior the posterior uses. As a bare ratio
-            // this penalty is scale-free, so forgetting shrinks numerator and
-            // denominator together and a bad stretch could never relax however
-            // long ago it was; measured against a fixed prior it decays as the
-            // evidence behind it does.
+            // Smooth penalty with the posterior's fixed prior so old failure evidence can relax as it decays.
             let missingEvidencePenalty = evidenceWeight <= 0
                 ? 0
                 : expiredWeight / (evidenceWeight + priorStrength)
@@ -108,8 +97,7 @@ public enum OrganismCapabilitySelfModel {
         }
     }
 
-    /// Display tallies saturate at Int's limit; unknown/nonpositive weight
-    /// supplies no count. The fractional weights remain the belief's evidence.
+    /// Display tallies saturate at Int's limit; unknown/nonpositive weight supplies no count. The fractional weights remain the belief's evidence.
     private static func displayedCount(_ weight: Double) -> Int {
         guard weight > 0 else { return 0 }
         return Int(exactly: weight.rounded()) ?? Int.max

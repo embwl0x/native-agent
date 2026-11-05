@@ -49,10 +49,11 @@ extension SwiftNativeProviderRouting {
                 let data = try ProviderStateValidation.dataIfPresent(at: path)
                 parsed = try data.map { try ProviderStateValidation.credential(data: $0) }
             } catch {
-                return (false, "Anthropic credentials at \(path.path) could not be read: \(error.localizedDescription). Repair that file before reconnecting.", nil, true)
+                return (false,
+                    "Anthropic credentials at \(path.path) could not be read: \(error.localizedDescription). Repair that file before reconnecting.", nil, true)
             }
         }
-        // The adapter that serves the calls decides (see credentialStatus).
+        // The serving adapter owns credential usability.
         let status = AnthropicOAuthTransport.credentialStatus(parsed)
         let access = parsed.flatMap { OAuthRefreshBinding.tokenSet($0, provider: "anthropic_oauth_direct")["access_token"] as? String }
         return (status.usable, status.detail, access?.isEmpty == false ? access : nil, false)
@@ -69,13 +70,14 @@ extension SwiftNativeProviderRouting {
             parsed = preRead.object
         } else {
             do { parsed = try XAIOAuthCredentialStore.read(at: path) }
-            catch { return (false, "xAI credentials at \(path.path) are unavailable: \(error.localizedDescription). Repair their Keychain reference in Providers.", nil, true) }
+            catch { return (false,
+                "xAI credentials at \(path.path) are unavailable: \(error.localizedDescription). Repair their Keychain reference in Providers.", nil, true) }
         }
         let status = XAIOAuthTransport.credentialStatus(parsed)
         let access = parsed.flatMap { OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet($0, provider: "xai_oauth_direct")["access_token"]) }
         return (status.usable, status.detail, status.usable ? access : nil, false)
     }
-    /// Decodes persisted OAuth expiry values in the shared app/routing compatibility order.
+    /// Persisted expiry uses the shared app/routing decoding order.
     public nonisolated static func parseAuthExpiresAt(_ raw: Any?) -> Date? {
         guard let raw else { return nil }
         // Persisted expiry must be a representable calendar instant, not merely a finite wire number. Invalid values remain invalid credentials.

@@ -6,8 +6,7 @@ import SwiftProtobuf
 import PersistenceCore
 // Blueprint: | `AgentA2AGRPC.swift` | `AgentA2AGRPC` enum; `send` projects protobuf framing and yields live updates into the peer exchange's channel |
 
-/// The protobuf binding projects the existing canonical ProtoJSON requests and
-/// receipts. Task ownership, continuation and stream recovery stay with A2A.
+/// Task ownership, continuation and stream recovery stay with A2A.
 enum AgentA2AGRPC {
     static func send(_ request: AgentA2AWire.Request, bearerToken: String?,
                      timeout: TimeInterval, liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?) async throws -> AgentPeerHTTP.Response {
@@ -42,7 +41,14 @@ enum AgentA2AGRPC {
             return try await withGRPCClient(transport: transport) { client in
                 switch method {
                 case "SendMessage":
-                    return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SendMessageRequest.self, Lf_A2a_V1_SendMessageResponse.self)
+                    return try await unary(
+                        client,
+                        method,
+                        json,
+                        callMetadata,
+                        callOptions,
+                        Lf_A2a_V1_SendMessageRequest.self,
+                        Lf_A2a_V1_SendMessageResponse.self)
                 case "SendStreamingMessage":
                     return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SendMessageRequest.self, request, bearerToken, liveFeed)
                 case "GetTask":
@@ -52,17 +58,61 @@ enum AgentA2AGRPC {
                 case "CancelTask":
                     return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_CancelTaskRequest.self, Lf_A2a_V1_Task.self)
                 case "SubscribeToTask":
-                    return try await stream(client, method, json, callMetadata, callOptions, Lf_A2a_V1_SubscribeToTaskRequest.self, request, bearerToken, liveFeed)
+                    return try await stream(
+                        client,
+                        method,
+                        json,
+                        callMetadata,
+                        callOptions,
+                        Lf_A2a_V1_SubscribeToTaskRequest.self,
+                        request,
+                        bearerToken,
+                        liveFeed)
                 case "CreateTaskPushNotificationConfig":
-                    return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_TaskPushNotificationConfig.self, Lf_A2a_V1_TaskPushNotificationConfig.self)
+                    return try await unary(
+                        client,
+                        method,
+                        json,
+                        callMetadata,
+                        callOptions,
+                        Lf_A2a_V1_TaskPushNotificationConfig.self,
+                        Lf_A2a_V1_TaskPushNotificationConfig.self)
                 case "GetTaskPushNotificationConfig":
-                    return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_GetTaskPushNotificationConfigRequest.self, Lf_A2a_V1_TaskPushNotificationConfig.self)
+                    return try await unary(
+                        client,
+                        method,
+                        json,
+                        callMetadata,
+                        callOptions,
+                        Lf_A2a_V1_GetTaskPushNotificationConfigRequest.self,
+                        Lf_A2a_V1_TaskPushNotificationConfig.self)
                 case "ListTaskPushNotificationConfigs":
-                    return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_ListTaskPushNotificationConfigsRequest.self, Lf_A2a_V1_ListTaskPushNotificationConfigsResponse.self)
+                    return try await unary(
+                        client,
+                        method,
+                        json,
+                        callMetadata,
+                        callOptions,
+                        Lf_A2a_V1_ListTaskPushNotificationConfigsRequest.self,
+                        Lf_A2a_V1_ListTaskPushNotificationConfigsResponse.self)
                 case "DeleteTaskPushNotificationConfig":
-                    return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_DeleteTaskPushNotificationConfigRequest.self, Google_Protobuf_Empty.self)
+                    return try await unary(
+                        client,
+                        method,
+                        json,
+                        callMetadata,
+                        callOptions,
+                        Lf_A2a_V1_DeleteTaskPushNotificationConfigRequest.self,
+                        Google_Protobuf_Empty.self)
                 case "GetExtendedAgentCard":
-                    return try await unary(client, method, json, callMetadata, callOptions, Lf_A2a_V1_GetExtendedAgentCardRequest.self, Lf_A2a_V1_AgentCard.self)
+                    return try await unary(
+                        client,
+                        method,
+                        json,
+                        callMetadata,
+                        callOptions,
+                        Lf_A2a_V1_GetExtendedAgentCardRequest.self,
+                        Lf_A2a_V1_AgentCard.self)
                 default: throw AgentA2AWire.WireError.unsupported("gRPC operation \(method)")
                 }
             }

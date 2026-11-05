@@ -4,9 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `LoopContracts.swift` | LoopRunner and event/deadline contracts, registrations, outcomes, backoff policy and bounded tick execution |
 
-/// Typed result of one background-loop attempt. Returning from `tick()` is not
-/// itself proof of success: loops that handle their own errors override
-/// `tickOutcome()` so the scheduler can preserve honest state and receipts.
+/// Returning from tick is not success proof; tickOutcome preserves the worker’s real outcome for state and receipts.
 public enum LoopTickOutcome: Sendable, Equatable {
     case completed(result: String?)
     /// Health-neutral skips preserve the failure streak, including self-backoff;
@@ -16,23 +14,15 @@ public enum LoopTickOutcome: Sendable, Equatable {
 
     /// Joining an active tick is health-neutral and preserves the consecutive-failure streak.
     public static let coalescedSkipReason = "coalesced with active tick"
-    /// An opportunistic wake arrived before the canonical durable cadence was
-    /// eligible. The wake is only a signal; it does not advance loop health,
-    /// counters, or the durable last-run clock.
+    /// An early OS wake is only a signal; it cannot advance health, counters or the durable cadence.
     public static let notDueSkipReason = "durable cadence not due"
 
-    /// Constructor for "I am skipping because I am failing". Prefer this over
-    /// a bare `.skipped(reason:)` in any loop that gates itself behind its own
-    /// backoff/cooldown after an operational failure.
+    /// Use health-neutral skips for self-backoff so an operational failure cannot erase its own streak.
     public static func backingOff(reason: String) -> LoopTickOutcome {
         .skipped(reason: reason, healthNeutral: true)
     }
 
-    /// A tick has one of four words: worked (`.completed`, the only outcome
-    /// that stamps `lastCompletedAt`), nothing to do (a plain skip), off (its
-    /// config switches it off) and not needed (another authority already does
-    /// its job). Off and not needed are skips whose reason carries the word,
-    /// so Doctor never counts them as healthy work.
+    /// Only completed work stamps lastCompletedAt; off/not-needed skip reasons must not count as healthy work.
     public static let offPrefix = "off: "
     public static let notNeededPrefix = "not needed: "
 
@@ -44,15 +34,19 @@ public enum LoopTickOutcome: Sendable, Equatable {
         .skipped(reason: notNeededPrefix + reason)
     }
 
-    /// True only for the manager's single-flight coalesce skip.
+    /// A shared slot held by other work is busy, not broken; the words name the holder and when to try again.
+    public static let busyPrefix = "busy: "
+
+    public static func busy(_ reason: String) -> LoopTickOutcome {
+        .skipped(reason: busyPrefix + reason)
+    }
+
     public var isCoalescedSkip: Bool {
         if case .skipped(let reason, _) = self { return reason == Self.coalescedSkipReason }
         return false
     }
 
-    /// True when this outcome proves nothing about the loop's health and must
-    /// therefore leave the consecutive-failure streak untouched. Covers both
-    /// the coalesced skip and any loop-declared health-neutral skip.
+    /// Coalesced and explicitly health-neutral skips provide no health evidence and must preserve the failure streak.
     public var isHealthNeutralSkip: Bool {
         if case .skipped(let reason, let healthNeutral) = self {
             return healthNeutral || reason == Self.coalescedSkipReason
@@ -61,16 +55,13 @@ public enum LoopTickOutcome: Sendable, Equatable {
     }
 }
 
-/// Exponential-with-jitter retry curve applied by the scheduler when a loop's
-/// tick fails, and by Telegram's intra-tick deadline gate. Each caller owns
-/// its failure counter and deadline; this policy owns the curve.
+/// Share the retry curve, while each scheduler or Telegram deadline gate owns its counter and deadline.
 public struct LoopFailureBackoffPolicy: Sendable, Equatable {
     public var baseDelay: TimeInterval
     public var maxDelay: TimeInterval
     public var multiplier: Double
     public var jitterRange: ClosedRange<Double>
 
-    /// Defaults: 5s → 300s cap, doubling, ±20% jitter, reset on first success.
     public init(
         baseDelay: TimeInterval = 5,
         maxDelay: TimeInterval = 300,
@@ -85,8 +76,7 @@ public struct LoopFailureBackoffPolicy: Sendable, Equatable {
 
     public static let `default` = LoopFailureBackoffPolicy()
 
-    /// `base * multiplier^(n-1)`, capped at `maxDelay`, jittered, then
-    /// re-clamped so the documented cap is a hard ceiling.
+    /// Clamp after jitter as well as before it so maxDelay remains a hard ceiling.
     public func delay(
         forConsecutiveFailures failures: Int,
         jitter: (ClosedRange<Double>) -> Double
@@ -98,22 +88,32 @@ public struct LoopFailureBackoffPolicy: Sendable, Equatable {
     }
 }
 
-/// A nonthrowing worker whose required `tickOutcome()` reports honest failure
-/// or skip evidence for durable state and receipts. Work belongs there;
-/// `tick()` only discards its result and must not be reimplemented.
-/// Cancellation must be observed promptly or work survives `stop()`;
-/// `tickWithTimeoutOutcome(_:timeout:)` bounds the caller's wait.
+/// Require honest tickOutcome evidence; tick only discards that result and must not be reimplemented.
+/// Observe cancellation promptly: timeout bounds the caller’s wait, while uncooperative work can outlive stop.
+/// What wakes an organ of the body. A rhythm is its nature (a daily backup, a weekly Doctor run, a presence heartbeat). An organ that runs on change
+/// has no clock: its events, its own next meaningful deadline and launch are its only wakes, so a missed event is a defect fixed where it was lost,
+/// never covered by a slow repair pass.
+public enum OrganWake: Sendable, Equatable {
+    case every(TimeInterval)
+    case onChange
+
+    /// The rhythm's period, or nil for an organ that runs on change (never overdue).
+    public var period: TimeInterval? {
+        if case .every(let period) = self { return max(0, period) }
+        return nil
+    }
+}
+
 public protocol LoopRunner: Sendable {
     var loopId: String { get }
-    var interval: TimeInterval { get }
-    /// Dynamically dispatched timeout override; nil uses the scheduler's default (300s).
+    var wake: OrganWake { get }
+    /// A nil timeout override uses the scheduler’s 300-second default.
     var tickTimeoutOverride: TimeInterval? { get }
-    /// Required honest outcome; no default completion.
+    /// Require explicit outcomes; no default completion can stand in for work.
     func tickOutcome() async -> LoopTickOutcome
-    /// Default entry point discards `tickOutcome()`; do not reimplement it.
+    /// Do not reimplement tick: its sole purpose is to discard the required tickOutcome result.
     func tick() async
-    /// Cancels and drains work that the loop intentionally owns beyond one
-    /// admitted tick. Most loops own no such work and use the default no-op.
+    /// Stop must cancel and drain work intentionally retained beyond an admitted tick.
     func shutdown() async
 }
 
@@ -127,12 +127,10 @@ public extension LoopRunner {
     func shutdown() async {}
 }
 
-/// A configured worker or a visible lane with no work to schedule.
 public enum LoopRegistration: Sendable {
     case enabled(any LoopRunner)
     case disabled(loopId: String, reason: String)
-    /// Its configuration could not be read: a fault that says its cause, never
-    /// off (an unreadable credential is not "not connected").
+    /// Unreadable configuration is unavailable, never off or disconnected.
     case unreadable(loopId: String, error: String)
 
     public var loopId: String {
@@ -148,23 +146,14 @@ public enum LoopRegistration: Sendable {
     }
 }
 
-/// An event-first background worker with one optional exact persisted deadline.
-///
-/// `interval` remains the deliberately slow integrity sweep used to recover a
-/// process-local event lost across a crash or an out-of-process write the
-/// primary signal path could not observe. Normal work is driven by
-/// `physiologyEvents()` and `nextMeaningfulDeadline(after:)`; neither path may
-/// manufacture user intent or provider work merely because time passed.
+/// Events carry normal work and the organ's own deadline crosses persisted eligibility; it never manufactures intent or provider work. An organ with
+/// `wake: .onChange` has nothing else; one whose nature is also a rhythm declares `.every`.
 public protocol EventDeadlineLoopRunner: LoopRunner {
-    /// Multicast/domain event stream. Events carry no authority or payload;
-    /// the tick rereads the canonical owner.
+    /// Events carry no authority or payload; reread the canonical owner on each tick.
     func physiologyEvents() -> AsyncStream<Void>
-    /// Earliest future instant at which a persisted state transition becomes
-    /// eligible. Return nil when no crossing exists. A date at/before `now`
-    /// is reconciled by the manager's startup/event pass and is not rescheduled
-    /// as a spin loop.
+    /// Return nil without a future crossing; reconcile already-due dates once rather than rescheduling a spin loop.
     func nextMeaningfulDeadline(after now: Date) async -> Date?
-    /// Trailing-edge burst coalescing before the canonical reread.
+    /// Coalesce event bursts before rereading the canonical owner.
     var eventCoalescingDelay: TimeInterval { get }
 }
 
@@ -172,14 +161,11 @@ public extension EventDeadlineLoopRunner {
     var eventCoalescingDelay: TimeInterval { 0.25 }
 }
 
-/// Thrown by `tickWithTimeoutOutcome` when a tick exceeds its allotted budget.
 public struct TickTimeoutError: Error, Equatable {
     public init() {}
 }
 
-/// Race one tick against its deadline, throwing `TickTimeoutError` on expiry.
-/// The unstructured tick is cancelled on timeout; it can outlive the caller's
-/// bounded wait until it observes cancellation or returns.
+/// Timeout cancels the tick and bounds only its caller’s wait; physical work remains alive until it observes cancellation.
 public func tickWithTimeoutOutcome(
     _ operation: @escaping @Sendable () async -> LoopTickOutcome,
     timeout: TimeInterval

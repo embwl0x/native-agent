@@ -11,20 +11,15 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
 // Blueprint: | `SwiftToolDispatcher+ToolManifest.swift` | `SwiftToolDispatcher`: `toolManifest` |
 
 // MARK: - The Tools page's manifest
 
 extension SwiftToolDispatcher {
-    /// What the Tools page and the slash-command menu read: the tools a chat
-    /// request carries (only `app`), each with
-    /// its schema when detail is full, and what Trust lets the folded Mac,
-    /// file and builder actions reach. Not a tool: she finds actions with
-    /// `app {find}`, and nothing is loaded.
-    public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
+    /// The manifest projects the single app contract and Trust’s reachable actions; discovery never loads extra tools.
+    public func toolManifest(turn: Turn, detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
         let fullDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "full"
-        let catalog = try await catalogSnapshot(includeSchemas: fullDetail, surface: surface)
+        let catalog = try await catalogSnapshot(turn: turn, includeSchemas: fullDetail, surface: surface)
         let access = catalog.access
         let trustedRoots = try await trustedWorkspaceRoots()
         let modelNameSet = Self.modelVisibleCatalogToolNames(Set(catalog.names))
@@ -38,10 +33,7 @@ extension SwiftToolDispatcher {
                     ? "nativeagent_app_tool_dispatcher" : "swift_tool_dispatcher"),
                 "model_visible": .bool(true),
             ]
-            // A registry-owned bucket makes the rendered catalog reflect the
-            // dispatch table rather than a second UI-only name list. An
-            // unreviewed runtime name is never fabricated as a safe category;
-            // the mounted Tools UI renders that adverse condition explicitly.
+            // Use the registry’s buckets so rendered categories cannot drift from dispatch; unreviewed names stay visibly adverse.
             row["catalog_bucket"] = .string(
                 (Self.catalogBucket(forRegisteredToolNamed: schema.name) ?? contributedBuckets[schema.name])?.rawValue
                     ?? ChatToolCatalogBucket.unclassified.rawValue
@@ -49,26 +41,29 @@ extension SwiftToolDispatcher {
             let parameters: JSONValue
             do { parameters = try JSONValue.parse(schema.parametersJSON) }
             catch {
-                throw ToolFailureError("The catalog's input schema for \(schema.name) could not be read: \(error.localizedDescription). Repair its registered schema before reading the catalog again.",
+                throw ToolFailureError("""
+                    The catalog's input schema for \(schema.name) could not be read: \(error.localizedDescription). Repair its registered schema \
+                    before reading the catalog again.
+                    """,
                     effects: .none, owner: "Tool catalog", code: "tool_schema_unavailable",
                     instruction: "Repair the registered input schema for \(schema.name).", recovery: .repair)
             }
             guard case .object = parameters else {
-                throw ToolFailureError("The catalog's input schema for \(schema.name) must be an object. Repair its registered schema before reading the catalog again.",
+                throw ToolFailureError("""
+                    The catalog's input schema for \(schema.name) must be an object. Repair its registered schema before reading the catalog \
+                    again.
+                    """,
                     effects: .none, owner: "Tool catalog", code: "tool_schema_unavailable",
                     instruction: "Repair the registered input schema for \(schema.name).", recovery: .repair)
             }
             row["parameters"] = parameters
             return .object(row)
         }
-        // Folded into app: listed as the actions they are, available by the
-        // whole catalog rather than the model-visible names.
         let listed = Set(catalog.names)
         let swiftBuilderTools = (Self.fullMacFileToolNames + Self.fullMacSystemToolNames + Self.fullMacBuilderToolNames + Self.fullMacRestartToolNames).sorted()
         let availableBuilderTools = swiftBuilderTools.filter { listed.contains($0) }.map { ToolNameAliases.appAction($0) ?? $0 }
         let lockedBuilderTools = swiftBuilderTools.filter { !listed.contains($0) }.map { ToolNameAliases.appAction($0) ?? $0 }
-        // Report folded Mac actions from the underlying catalog; legacy
-        // diagnostic tools without an app action stay out of discovery.
+        // Only executors with app actions belong in folded discovery.
         let axReadTools = Self.fullMacAccessibilityReadToolNames.sorted()
         let availableAXReadTools = axReadTools.filter { listed.contains($0) }.compactMap { ToolNameAliases.appAction($0) }
         let lockedAXReadTools = axReadTools.filter { !listed.contains($0) }.compactMap { ToolNameAliases.appAction($0) }
@@ -78,26 +73,6 @@ extension SwiftToolDispatcher {
         let axActTools = Self.fullMacAccessibilityInjectionToolNames.sorted()
         let availableAXActTools = axActTools.filter { listed.contains($0) }.compactMap { ToolNameAliases.appAction($0) }
         let lockedAXActTools = axActTools.filter { !listed.contains($0) }.compactMap { ToolNameAliases.appAction($0) }
-        let codexHelper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot)
-        let codexBridge = AgentBridgeRuntime.readiness(
-            helper: codexHelper,
-            cliName: "codex",
-            bridgeConfigRoot: agentBridgeConfigRoot
-        )
-        func bridgeReadinessRow(_ readiness: AgentBridgeRuntime.Readiness) -> JSONValue {
-            .object([
-                "status": .string(readiness.readyForAsyncRoundTrip
-                    ? "ready"
-                    : (readiness.readyToAttempt ? "return_path_unavailable" : "unavailable")),
-                "execution_ready": .bool(readiness.readyToAttempt),
-                "return_path_ready": .bool(readiness.returnPath.isReady),
-                "return_path_reason": .string(readiness.returnPath.reason),
-                "helper_present": .bool(readiness.helper != nil),
-                "runtime_present": .bool(readiness.runtime != nil),
-                "cli_present": .bool(readiness.cli != nil),
-                "authentication": .string("verified_on_execution"),
-            ])
-        }
         return .object([
             "status": .string("ok"),
             "runtime": .string("swift-native"),
@@ -111,8 +86,14 @@ extension SwiftToolDispatcher {
             "app_control_allowed": .bool(access.accessibilityAllowed),
             "builder_mode": .string(access.fileOpsAllowed ? "available" : "policy_locked"),
             "builder_mode_detail": .string(access.fileOpsAllowed
-                ? "Trust Center Full Mac file access is active. app's files.*, git.*, shell.run/shell.bash, files.patch, swift.build/swift.test and app.install/app.restart actions are all available (autonomy-gated)."
-                : "app files.write is available only inside Trust Center workspace roots; broader file, git and shell actions are locked until Trust Center Full Mac mode with file_ops_allowed is active."),
+                ? """
+                    Trust Center Full Mac file access is active. app's files.*, git.*, shell.run/shell.bash, files.patch, swift.build/swift.test \
+                    and app.install/app.restart actions are all available (autonomy-gated).
+                    """
+                : """
+                    app files.write is available only inside Trust Center workspace roots; broader file, git and shell actions are locked until \
+                    Trust Center Full Mac mode with file_ops_allowed is active.
+                    """),
             "trusted_workspace_roots": .array(trustedRoots.map { .string($0.path) }),
             // Read-only AX perception is listed separately from app control.
             "mac_accessibility_read_available_tools": .array(availableAXReadTools.map { .string($0) }),
@@ -126,9 +107,6 @@ extension SwiftToolDispatcher {
             "available_tools": .array(modelNameSet.sorted().map { .string($0) }),
             "builder_available_tools": .array(availableBuilderTools.map { .string($0) }),
             "builder_policy_locked_tools": .array(lockedBuilderTools.map { .string($0) }),
-            "builder_bridge_readiness": .object([
-                "codex": bridgeReadinessRow(codexBridge),
-            ]),
             "tools": .array(rows),
         ])
     }

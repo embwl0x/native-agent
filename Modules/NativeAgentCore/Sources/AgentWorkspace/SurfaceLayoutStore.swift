@@ -5,21 +5,15 @@ import NativeAgentShared
 import Observation
 import os
 import PersistenceCore
-// Blueprint: | `SurfaceLayoutStore.swift` | Root-scoped checked `SurfaceLayoutAvailability` and `SurfaceLayoutLive` feed Mac, DeviceSync and tour stops. Failed reads publish the path and repair, never retained layout or seed values; Mac content stays reachable through the shipped vocabulary under shipped profiles and the independent Helpers switch and page discovery is layout-independent. First creation requires checked entry absence. `read`/`write` validate one shape/version and preserve replaced bytes; every document write checks its expected version inside the writer lock, including previous-content restoration. Fold writes route through `setSurfaceExpanded`; snapshot reads publish through `LatestRead`. PrivacyMap inventories ui/, including the previous revision; checked versions refuse exhaustion before either write. |
+// Blueprint: | `SurfaceLayoutStore.swift` | `SurfaceLayoutAvailability`, `SurfaceLayoutLive`, `read`, `write`, `setSurfaceExpanded`, `LatestRead` |
+// Publish snapshot reads through LatestRead; writer-locked version checks also govern previous-content restoration.
+// Checked version exhaustion refuses before either write, and layout availability never owns page discovery.
 
-/// HOW THE APP LAYS OUT ITS SURFACES, as one file she can read and rewrite:
-/// ui/layout.json (`SurfaceLayout`). The window's views, her home and the
-/// presentation draw from it. Pages exist independently: an unreadable layout
-/// exposes the shipped vocabulary alongside its failure, never a substitute
-/// layout. The door's page index always lists the shipped page set. A
-/// missing file is seeded at version 1; a present one is never overwritten by
-/// a seed, so her edits win; one still exactly as a seed wrote it takes this
-/// build's seed when that changed. A block a newer build adds lands at its
-/// seed position. Cloned from `AgentRecipeStore`; every call names the
-/// host's data root, and what is cached is that root's.
-/// Current/previous layouts: off-disk backup only; phone projects the current ui_layout.json. PrivacyMap lists ui/.
+/// Every surface reads the same root-scoped ui/layout.json. Seed only checked absence or an untouched seed; preserve edits and unreadable bytes. New blocks
+/// take their seed positions, while unreadable layout exposes shipped vocabulary with its failure, never a substitute layout. Pages remain discoverable
+/// independently. Current/previous files enter off-disk backup; phone sync projects only current ui_layout.json, as PrivacyMap records.
 public enum SurfaceLayoutStore {
-    /// The partial document accepted by write; names come from the same vocabulary its validator uses.
+    /// Validate partial writes against the same vocabulary as full documents.
     public static let writeArgumentSchema: JSONValue = {
         func object(_ properties: [String: JSONValue], required: [String] = []) -> JSONValue {
             .object(["type": .string("object"), "properties": .object(properties),
@@ -50,17 +44,15 @@ public enum SurfaceLayoutStore {
         var stamp: SnapshotTailOpLog.FileStamp?
     }
 
-    /// By data root: a test copy or presentation host never reads or seeds another's.
+    /// Scope caches by data root so hosts cannot read or seed another runtime's layout.
     private static let loaded = OSAllocatedUnfairLock<[String: Loaded]>(initialState: [:])
 
-    /// The layout the window draws, re-read when the file changed.
+    /// Re-read layout when its file identity changes.
     public static func layout(dataRoot: URL) -> SurfaceLayoutAvailability { withLoaded(dataRoot) { $0.availability } }
 
-    /// The profile the window shows (`nativeagent.viewMode`); nil before a window set it.
     public static var profile: String? { UserDefaults.standard.string(forKey: "nativeagent.viewMode") }
 
-    /// `layout.read`: the layout, the version a write must carry, the one a
-    /// write replaced, and what every surface and block is.
+    /// Return the checked version with the layout so subsequent writes can detect concurrent edits.
     public static func read(dataRoot: URL) -> JSONValue {
         withLoaded(dataRoot) { state in
             if let failure = state.availability.failure { return failureResult(failure) }
@@ -79,12 +71,7 @@ public enum SurfaceLayoutStore {
         }
     }
 
-    /// `layout.write`: the layout as read, edited, or only the parts it
-    /// changes (a surface's whole block list, a profile, phone); the rest
-    /// stays. Every field it names is one the shape has, at the version it
-    /// was read, which a hand edit since moves as a write does. The write
-    /// bumps layoutVersion and keeps the replaced file as
-    /// layout.previous.json; writing that content back with the current version undoes it.
+    /// Partial writes retain omitted fields; check content and version so hand edits conflict too. Keep replaced bytes in layout.previous.json.
     public static func write(_ document: JSONValue, expectedVersion: String, dataRoot: URL, undoing receipt: JSONValue? = nil) -> JSONValue {
         guard case .object(let parts) = document else {
             return refused("invalid_layout", "layout is an object: layout.read's layout, or only the surfaces, profiles or phone it changes.")
@@ -101,12 +88,16 @@ public enum SurfaceLayoutStore {
                     let layout = try state.availability.get()
                     let currentVersion = try version(layout)
                     guard expectedVersion == currentVersion else {
-                        return refused("stale_layout", "That layout was read at version \(expectedVersion.isEmpty ? "(none given)" : expectedVersion); it is at \(currentVersion) now, by a write or a hand edit. Read it again with layout.read.")
+                        return refused("stale_layout", """
+                            That layout was read at version \(expectedVersion.isEmpty ? "(none given)" : expectedVersion); it is at \(currentVersion) now, by \
+                            a write or a hand edit. Read it again with layout.read.
+                            """)
                     }
                     if case .object(let receipt) = receipt, receipt["version"] != .string(currentVersion) {
                         return refused("stale_layout", "The layout changed after that receipt. Read it again with layout.read.")
                     }
-                    guard case .object(var merged) = try JSONValue.fromEncodable(layout) else { return refused("write_failed", "The layout could not be read.") }
+                    guard case .object(var merged) = try JSONValue.fromEncodable(layout) else { return refused("write_failed", "The layout could not be read.")
+                        }
                     for (key, value) in parts {
                         if case .object(let named) = value, case .object(var current)? = merged[key] {
                             current.merge(named) { $1 }
@@ -115,7 +106,8 @@ public enum SurfaceLayoutStore {
                     }
                     let given: SurfaceLayout
                     do { given = try validated(.object(merged)) }
-                    catch { return refused("invalid_layout", "layout doesn't match a layout's shape: \(error). Start from layout.read's layout and change only what you mean to.") }
+                    catch { return refused("invalid_layout",
+                        "layout doesn't match a layout's shape: \(error). Start from layout.read's layout and change only what you mean to.") }
                     // Previous-content recognition only labels the receipt; it never admits a stale write.
                     let givenContent = try content(given)
                     let restored: Int?
@@ -146,13 +138,13 @@ public enum SurfaceLayoutStore {
                     "reason": .string(failure?.code ?? "layout_write_failed"),
                     "detail": .string(failure?.message ?? "\(file.path) could not be written: \(error.localizedDescription)."),
                     "effects": .string(failure?.effects.rawValue ?? "unknown"),
-                    "remedy": Repair.reconcile(instruction: failure?.instruction ?? "Read the layout and backup before another write; fix the reported storage error.", nextCall: call)])
+                    "remedy": Repair.reconcile(instruction: failure?.instruction
+                        ?? "Read the layout and backup before another write; fix the reported storage error.", nextCall: call)])
             }
         }
     }
 
-    /// The person opened or closed a fold: written as a write is (version
-    /// bumped, the replaced one kept), under source "person".
+    /// Person fold changes follow the same versioned writer as agent edits.
     @discardableResult
     public static func setExpanded(_ open: Bool, surface: String, block: String, dataRoot: URL) -> SurfaceLayout? {
         withLoaded(dataRoot) { state in
@@ -173,7 +165,7 @@ public enum SurfaceLayoutStore {
         }
     }
 
-    /// The next version: the file it replaces kept as layout.previous.json.
+    /// Retain replaced bytes before publishing the next version.
     private static func commit(_ next: SurfaceLayout, over state: inout Loaded, source: String) throws -> SurfaceLayout {
         var saved = next
         let current = try state.availability.get()
@@ -199,15 +191,21 @@ public enum SurfaceLayoutStore {
         let backup = previous(state.root)
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(replaced, to: backup) }
         catch {
-            throw ToolFailureError("Backup write failed at \(backup.path): \(error.localizedDescription). The backup may have changed; layout replacement was not attempted.",
+            throw ToolFailureError(
+                "Backup write failed at \(backup.path): \(error.localizedDescription). The backup may have changed; layout replacement was not attempted.",
                 effects: .unknown, nextCall: ToolFailureError.call("app", ["action": .string("layout.read")]),
-                code: "layout_backup_write_failed", instruction: "Inspect the backup and fix the reported storage error before another write.", recovery: .reconcile)
+                code: "layout_backup_write_failed", instruction: "Inspect the backup and fix the reported storage error before another write.",
+                    recovery: .reconcile)
         }
         do { try write(saved, to: file) }
         catch {
-            throw ToolFailureError("The previous layout was saved at \(backup.path); replacing \(file.path) failed: \(error.localizedDescription). The on-disk layout is unverified.",
+            throw ToolFailureError("""
+                The previous layout was saved at \(backup.path); replacing \(file.path) failed: \(error.localizedDescription). The on-disk layout is \
+                unverified.
+                """,
                 effects: .partial, nextCall: ToolFailureError.call("app", ["action": .string("layout.read")]),
-                code: "layout_replacement_failed", instruction: "Read the layout and backup before another change; fix the reported storage error.", recovery: .reconcile)
+                code: "layout_replacement_failed", instruction: "Read the layout and backup before another change; fix the reported storage error.",
+                    recovery: .reconcile)
         }
         state.availability = .available(saved)
         // The next read checks the committed file, including any intervening hand edit.
@@ -217,7 +215,8 @@ public enum SurfaceLayoutStore {
 
     private static func refused(_ reason: String, _ detail: String) -> JSONValue {
         .object(["status": .string("refused"), "reason": .string(reason), "changed": .bool(false), "effects": .string("none"), "detail": .string(detail),
-            "remedy": .object(["kind": .string("correct_arguments"), "instruction": .string("Read the current layout and its shape; correct the requested change."),
+            "remedy": .object(["kind": .string("correct_arguments"), "instruction": .string(
+                "Read the current layout and its shape; correct the requested change."),
                 "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("layout.read")])])])])
     }
 
@@ -241,13 +240,10 @@ public enum SurfaceLayoutStore {
         }))
     }
 
-    /// The shape check, then the vocabulary: every surface, block and profile
-    /// one this build knows, each block once, `expanded` exactly on a fold.
-    /// Saved reads and writes use the same current vocabulary.
+    /// Read and write validators share one vocabulary; require unique blocks and fold-only `expanded`.
     private static func validated(_ document: JSONValue, addingMissing: Bool = true) throws -> SurfaceLayout {
         var layout = try document.decodedExactly(as: SurfaceLayout.self)
-        // Versions start at one. Int.max is readable but exhausted: commit
-        // reports that boundary before touching either saved file.
+        // Versions start at one. Int.max is readable but exhausted: commit reports that boundary before touching either saved file.
         guard layout.layoutVersion > 0 else {
             throw JSONValue.ShapeError(description: "layoutVersion must be a positive integer")
         }
@@ -260,11 +256,13 @@ public enum SurfaceLayoutStore {
             var seen = Set<String>()
             for (index, block) in blocks.enumerated() {
                 let at = "surfaces.\(surface)[\(index)]"
-                guard names.contains(block.name) else { throw shape("\(at).name \"\(block.name)\" is not a \(surface) block; they are \(names.joined(separator: ", "))") }
+                guard names.contains(block.name) else { throw shape(
+                    "\(at).name \"\(block.name)\" is not a \(surface) block; they are \(names.joined(separator: ", "))") }
                 guard seen.insert(block.name).inserted else { throw shape("\(at).name \"\(block.name)\" is listed twice") }
                 let folds = SurfaceLayout.folds.contains(surface + "." + block.name)
                 guard (block.expanded != nil) == folds else {
-                    throw shape(folds ? "\(at).expanded is missing" : "\(at).expanded is only on a block that folds: \(SurfaceLayout.folds.sorted().joined(separator: ", "))")
+                    throw shape(folds ? "\(at).expanded is missing"
+                        : "\(at).expanded is only on a block that folds: \(SurfaceLayout.folds.sorted().joined(separator: ", "))")
                 }
             }
         }
@@ -281,20 +279,21 @@ public enum SurfaceLayoutStore {
         return layout
     }
 
+    /// A saved file reads in the current vocabulary (`dropRemoved`); writes through the agent's door are checked against it strictly.
     private static func validated(file: URL, addingMissing: Bool = true) throws -> SurfaceLayout {
-        let document = try JSONValue.parse(Data(contentsOf: file))
-        return try validated(document, addingMissing: addingMissing)
+        var saved = try JSONValue.parse(Data(contentsOf: file)).decodedExactly(as: SurfaceLayout.self)
+        saved.dropRemoved()
+        return try validated(JSONValue.fromEncodable(saved), addingMissing: addingMissing)
     }
 
-    /// What the person sees, without who wrote it when: what a version and the digest cover.
+    /// Exclude author and time from the content digest so identical layouts compare equally.
     private static func content(_ layout: SurfaceLayout) throws -> JSONValue {
         var bare = layout
         (bare.layoutVersion, bare.seededFrom, bare.updatedAt, bare.source, bare.digest) = (0, "", "", "", "")
         return try JSONValue.fromEncodable(bare)
     }
 
-    /// The version a write must carry: the layout version and what it shows,
-    /// so a hand edit, which bumps nothing, still moves it.
+    /// Include visible content in the version so hand edits invalidate stale writes.
     private static func version(_ layout: SurfaceLayout) throws -> String { try "\(layout.layoutVersion)@" + content(layout).digest }
 
     private static func withLoaded<T: Sendable>(_ root: URL, _ body: @Sendable (inout Loaded) -> T) -> T {
@@ -337,14 +336,16 @@ public enum SurfaceLayoutStore {
     }
 
     private static func seed(_ file: URL, from build: String) throws {
-        // The Helpers rail switch this file replaced (`uiBotsShelfPreview`), as it was left.
+        // Read the persisted Helpers rail preference so its chosen value survives layout seeding.
         let helpersOff = UserDefaults.standard.object(forKey: "uiBotsShelfPreview") as? Bool == false
         var fresh = SurfaceLayout.seed(from: build, at: ISO8601DateFormatter().string(from: Date()), hidden: helpersOff ? ["rail.bots"] : [])
         fresh.digest = try content(fresh).digest
         try CredentialFileLock.withLock(file) {
             guard let identity = entryStamp(file) else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
             if identity != .absent {
-                let saved = try validated(file: file, addingMissing: false)
+                // Seed identity is structural: an untouched seed can contain a block the current vocabulary has removed.
+                // Authored documents still pass the current vocabulary check when scan reads the selected file.
+                let saved = try JSONValue.parse(Data(contentsOf: file)).decodedExactly(as: SurfaceLayout.self)
                 guard saved.layoutVersion == 1, saved.source == "seed",
                       saved.digest == (try content(saved).digest), saved.digest != fresh.digest else { return }
             }
@@ -366,10 +367,10 @@ public enum SurfaceLayoutStore {
     }
 }
 
-/// One engine root's observed layout, shared by its windows and phone snapshot.
-/// Her write, the person's fold or a hand edit re-renders every surface at once.
+/// Share one root's observed layout so every surface redraws on any writer's edit.
 @MainActor @Observable
 public final class SurfaceLayoutLive {
+    public static let didChange = Notification.Name("NativeAgent.surfaceLayoutChanged")
     public private(set) var availability: SurfaceLayoutAvailability
     public var layout: SurfaceLayout? { availability.value }
     private let root: URL
@@ -393,11 +394,17 @@ public final class SurfaceLayoutLive {
         let root = root
         let saved = await Task.detached { SurfaceLayoutStore.setExpanded(open, surface: surface, block: block, dataRoot: root) }.value
         if let saved {
-            snapshotRead.write { availability = .available(saved) }
+            snapshotRead.write {
+                availability = .available(saved)
+                NotificationCenter.default.post(name: Self.didChange, object: nil)
+            }
         } else {
             await snapshotRead.read {
                 await Task.detached { SurfaceLayoutStore.layout(dataRoot: root) }.value
-            } publish: { availability = $0 }
+            } publish: {
+                availability = $0
+                NotificationCenter.default.post(name: Self.didChange, object: nil)
+            }
         }
     }
 
@@ -409,7 +416,10 @@ public final class SurfaceLayoutLive {
                 await owner.snapshotRead.read {
                     await Task.detached { SurfaceLayoutStore.layout(dataRoot: root) }.value
                 } publish: { next in
-                    if next != owner.availability { owner.availability = next }
+                    if next != owner.availability {
+                        owner.availability = next
+                        NotificationCenter.default.post(name: Self.didChange, object: nil)
+                    }
                 }
             }
         } onCancel: { events.cancel() }

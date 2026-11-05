@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `RequiredDocumentMirror.swift` | `RequiredDocumentMirror` and `StablePromptKernel`: persona-slot/source naming, required document reads and deterministic logical byte accounting |
+// Blueprint: | `RequiredDocumentMirror.swift` | `RequiredDocumentMirror`, `StablePromptKernel`: required document and stable-prompt ownership |
 
 public struct RequiredDocumentID: RawRepresentable, Hashable, Comparable, Sendable, Codable {
     public let rawValue: String
@@ -21,15 +21,8 @@ public struct ContextPersonaID: RawRepresentable, Hashable, Comparable, Sendable
         self.rawValue = rawValue
     }
 
-    /// The persona-slot id PersonaEngine resolves when no custom persona is
-    /// active (its resolver's "Default" branch). Context persona ids are SLOT
-    /// ids ("canonical", or a custom subdir name like "Agent") — a DIFFERENT
-    /// vocabulary from MemoryV2 record persona ids, which are agent names
-    /// (MemoryV2Defaults.personaID, legacy display names). The two only meet
-    /// in context preparation: memory is shared across persona slots and
-    /// governed by record disclosure permissions, not by slot-id isolation.
-    /// PersonaEngine cannot import Context, so it keeps its own "canonical"
-    /// literal.
+    /// Context persona IDs identify slots; MemoryV2 IDs identify agents. Memory is shared across slots under record disclosure, never slot isolation.
+    /// PersonaEngine cannot import Context, so it owns the same `canonical` literal.
     public static let resident = ContextPersonaID(rawValue: "canonical")
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
@@ -49,20 +42,11 @@ public struct ContextSurfaceVariant: RawRepresentable, Hashable, Comparable, Sen
     }
 }
 
-/// ONE name for the persona source lane, and one way to read a persona
-/// source's locator.
-///
-/// Both the precoverage gate (`ContextPreparation`) and the stable-prefix
-/// renderer must agree about which sources are persona sources, which document
-/// a source carries, and — the reason this exists — whether that source permits
-/// the CURRENT turn's surface. Three copies of a string literal and a
-/// `split("/").last` is how those two places drift apart.
+/// Precoverage and stable-prefix rendering must share source identity, document lookup and surface permission checks so naming conventions cannot split their
+/// policy.
 public enum ContextPersonaSourceNaming {
-    /// Owner string every persona document source is registered under.
     public static let owner = "nativeagent.persona"
 
-    /// `persona/<personaID>/` — the locator prefix scoping a source to one
-    /// persona slot.
     public static func locatorPrefix(for personaID: ContextPersonaID) -> String {
         "persona/\(personaID.rawValue)/"
     }
@@ -93,19 +77,8 @@ public struct RequiredDocument: Sendable, Equatable {
     public let sourceHash: String
     public let text: String
     public let logicalByteCount: Int
-    /// PROVENANCE, carried with the bytes. The context source this document was
-    /// mirrored from, and the surfaces that source permits.
-    ///
-    /// A renderer that wants to put this document in the CACHED stable prefix
-    /// must be able to prove the current surface is allowed. Proving it by
-    /// re-deriving a source id from a locator string was a permission check
-    /// that a naming-convention change could silently switch off; carrying the
-    /// descriptor's own answer next to the text cannot drift from it.
-    ///
-    /// `nil` means UNPROVEN, not "permitted": a document built without
-    /// provenance is unavailable to the stable prefix and falls back to the
-    /// packet's own surface rules. Every production mirror populates these
-    /// (`PersonaContextFlowProvider.makeMirror`); only fixtures leave them nil.
+    /// Carry source provenance and permitted surfaces with document bytes so stable-prefix permission cannot drift with locator naming. Nil is unproven and
+    /// unavailable to that prefix; packet admission still applies its own surface rules.
     public let sourceID: ContextSourceID?
     public let permittedSurfaces: Set<ContextSurface>?
 
@@ -113,10 +86,7 @@ public struct RequiredDocument: Sendable, Equatable {
         sourceID != nil && permittedSurfaces != nil
     }
 
-    /// The single question the stable prefix asks of a document. Unproven
-    /// answers `false` — the deny direction is the safe one, because a document
-    /// wrongly withheld from the prefix is still reachable through the packet,
-    /// while one wrongly admitted has escaped a permission entirely.
+    /// Unproven provenance denies prefix admission: withholding leaves the packet route available, while admission would bypass permission.
     public func permitsStablePrefix(on surface: ContextSurface) -> Bool {
         guard let permittedSurfaces, sourceID != nil else { return false }
         return permittedSurfaces.contains(surface)
@@ -196,12 +166,10 @@ public struct StablePromptKernelKey: Hashable, Comparable, Sendable {
     }
 }
 
-/// Pre-rendered stable prompt bytes. Dynamic turn, runtime, and organism state
-/// must remain outside this value.
+/// Pre-rendered stable prompt bytes. Dynamic turn, runtime, and organism state must remain outside this value.
 public struct StablePromptKernel: Sendable, Equatable {
     public let key: StablePromptKernelKey
-    /// Selection captured by the builder of this published kernel, not the
-    /// preference observed after asynchronous compilation. Nil means default.
+    /// Selection captured by the builder of this published kernel, not the preference observed after asynchronous compilation. Nil means default.
     public let requestedPersonaOverride: String?
     public let renderedPrompt: String
     /// Surface instructions follow the permission-checked documents.
@@ -241,8 +209,7 @@ public struct StablePromptKernel: Sendable, Equatable {
     }
 }
 
-/// Exact required documents and all valid stable prompt projections for one
-/// persona/source generation. Documents are always stored in canonical order.
+/// Store required documents in canonical order within one persona/source generation.
 public struct RequiredDocumentMirror: Sendable, Equatable {
     public let personaID: ContextPersonaID
     public let sourceFingerprint: String

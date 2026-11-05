@@ -3,21 +3,20 @@ import NativeAgentShared
 import PersistenceCore
 import Experiences
 import NativeAgentCore
-// Blueprint: | `ShelfStore.swift` | `ShelfStore` struct; public entry/history/glance reads project canonical approvals after shelf evidence; locked entry/history reads retain observed decisions; `append`, `settleApproval`; query-bound cursor and plain offset paging with whole-word headlines; conditioned results with true or unknown verdicts remain pending until exact notification acknowledgement |
+// Blueprint: | `ShelfStore.swift` | `ShelfStore`; `append`, `settleApproval`: indexed history, canonical approvals and exact notification acknowledgement |
 
 public struct ShelfStore: Sendable {
+    public static let didChange = Notification.Name("StandingBots.shelfDidChange")
     public static let maximumPageSize = 100
     public static let conditionNotificationReaderID = "condition-notification"
     private let disk: StandingBotsDisk
-    /// Kept for the approval boundary in `ShelfApprovalReconciliation`.
     let dataRoot: URL
     public init(dataRoot: URL) {
         disk = StandingBotsDisk(dataRoot: dataRoot)
         self.dataRoot = dataRoot
     }
 
-    /// Logical append-only history. One indexed file per entry bounds append IO.
-    /// A global append sequence (not run time) means late/backdated runs remain pageable.
+    /// Per-entry files bound append IO; append sequence keeps late and backdated runs pageable.
     public func append(_ entry: ShelfEntry) throws {
         try disk.locked { try appendLocked(entry) }
     }
@@ -40,11 +39,8 @@ public struct ShelfStore: Sendable {
         recordExperience(entry)
     }
 
-    /// The approval this entry stopped on has been decided. The shelf is
-    /// append-only for RUNS; this rewrites one settled fact on an existing
-    /// book, in place and at its own sequence, so the reconciliation outlives
-    /// the approval row. If that row is later evicted or archived, the shelf
-    /// retains the positively observed decision; absence cannot supply it.
+    /// Persist observed approval decisions at their existing sequence so inbox eviction cannot erase settlement.
+    /// Approval absence cannot establish a decision.
     public func settleApproval(_ id: UUID, detail: String) throws {
         try disk.locked {
             var index = try loadIndex()
@@ -68,8 +64,7 @@ public struct ShelfStore: Sendable {
         return try reconciling([stored])[0]
     }
 
-    /// Only the claim-reconciliation transaction may inspect raw settlement
-    /// while already holding the store lock. Public readers project approvals.
+    /// Only locked claim reconciliation may bypass approval projection to inspect raw settlement.
     func rawEntryLocked(_ id: UUID) throws -> ShelfEntry? {
         _ = try loadIndex()
         guard let book = try disk.read(Book.self, at: indexedPath(id)) else { return nil }
@@ -78,8 +73,7 @@ public struct ShelfStore: Sendable {
         return book.entry
     }
 
-    /// Latest append for only the helpers already open in a workspace. This
-    /// is an owner read, never an acknowledgement or a new execution.
+    /// Open-workspace reads never acknowledge results or execute work.
     public func latestEntries(botIDs: Set<UUID>) throws -> [ShelfEntry] {
         guard botIDs.count <= 24 else { throw StandingBotsError.invalidValue("too many open helpers") }
         let entries: [ShelfEntry] = try disk.locked {
@@ -96,8 +90,7 @@ public struct ShelfStore: Sendable {
         return try reconciling(entries)
     }
 
-    /// `latestEntries` without the store lock, for a glance that must not
-    /// wait: read-only, never replays. An unavailable index or entry throws.
+    /// A glance cannot wait on the store lock; unavailable evidence throws without replay.
     public func latestEntriesUnlocked(botIDs: Set<UUID>) throws -> [ShelfEntry] {
         guard let index = try disk.read(Index.self, at: indexPath) else {
             guard try disk.files(at: indexedDirectory, extension: "json").isEmpty,
@@ -117,12 +110,8 @@ public struct ShelfStore: Sendable {
         return try reconciling(entries, persist: false)
     }
 
-    /// Ascending append order by default; newestFirst browses recent history.
-    /// `since` is an exclusive run-time filter; `topic` is a literal,
-    /// case-insensitive search of headline/findings/change/uncertainties. Cursors are query-bound.
-    /// `readerId` selects unread entries for that reader only (e.g. "agent" vs "ui:user").
-    /// Reads never acknowledge entries. Start with nil cursor to revisit unread holes or refresh.
-    /// `offset` skips matching rows; never combine it with a cursor.
+    /// Cursors bind the filters and ordering; offset cannot accompany a cursor.
+    /// Reads never acknowledge entries; restart with nil cursor to revisit unread holes or newly appended rows.
     public func shelfRead(bot: UUID? = nil, since: Date? = nil, topic: String? = nil,
                           limit: Int = 20, cursor: String? = nil, readerId: String? = nil,
                           newestFirst: Bool = false, offset: Int = 0) throws -> ShelfReadPage {
@@ -167,8 +156,7 @@ public struct ShelfStore: Sendable {
             }
             let hasMore = candidates.count > limit
             let next = try page.last.map { try disk.encode(PageCursor(version: 1, query: query, after: $0.sequence)).base64EncodedString() }
-            // Ascending readers can continue for later appends. Descending
-            // history ends at the oldest row; refresh from nil for new arrivals.
+            // Ascending cursors admit later appends; descending history requires a fresh cursor for new arrivals.
             let continuation = newestFirst && !hasMore ? nil : (next ?? cursor)
             return ShelfReadPage(rows: rows, nextCursor: continuation,
                                  truncated: hasMore || rows.contains(where: \.headlineTruncated),
@@ -176,10 +164,7 @@ public struct ShelfStore: Sendable {
         }
     }
 
-    /// Every settled entry, grouped by bot, in ONE checked pass under the
-    /// store lock — same `books()` validation as `shelfRead` and `entry`, and
-    /// the same ascending append order within each bot.
-    /// Reads ignore acknowledgement state and never acknowledge entries.
+    /// One checked bulk read shares shelf validation and append ordering without acknowledging results.
     public func entriesByBot() throws -> [UUID: [ShelfEntry]] {
         let stored = try disk.locked { try books().map(\.entry) }
         var grouped: [UUID: [ShelfEntry]] = [:]
@@ -203,8 +188,7 @@ public struct ShelfStore: Sendable {
         ExperienceStore.record(dataRoot, result.id) { try await $0.begin(result) }
     }
 
-    /// The verdict and result identity are committed together; the existing
-    /// exact reader acknowledgement records attention's delivery acceptance.
+    /// Commit verdict with identity so exact reader acknowledgement proves notification acceptance.
     public func pendingConditionNotifications() throws -> [ShelfEntry] {
         let stored = try disk.locked {
             let seen = try readerState(Self.conditionNotificationReaderID).readEntryIds
@@ -272,9 +256,7 @@ public struct ShelfStore: Sendable {
         if let saved = try disk.read(Index.self, at: indexPath) { return saved }
         let entries = try disk.files(at: indexedDirectory, extension: "json")
         if !entries.isEmpty {
-            // The first current append writes pending, entry, then index.
-            // Its exact pending record can finish that interrupted commit;
-            // an absent index alone never permits rebuilding saved history.
+            // Only the exact pending append can complete an interrupted commit; an absent index cannot rebuild history.
             guard let pending, pending.sequence == 1, entries.count == 1,
                   entries[0].standardizedFileURL.path == indexedPath(pending.entry.id).standardizedFileURL.path,
                   let saved = try disk.read(Book.self, at: entries[0]),
@@ -315,6 +297,7 @@ public struct ShelfStore: Sendable {
         try disk.write(index, at: indexPath)
         try disk.validatePath(pendingPath)
         try FileManager.default.removeItem(at: pendingPath)
+        NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
     }
 
     private func books() throws -> [Book] {

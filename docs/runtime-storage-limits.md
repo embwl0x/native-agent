@@ -6,21 +6,18 @@ applying the line policy before the byte policy and publishing the result once.
 
 | Feed | Row rotation | Byte rotation |
 |---|---|---|
-| `traces/events.jsonl` | 5,000 → 4,000 | 8 MiB → 4 MiB |
 | `activity/events.jsonl` | 5,000 → 4,000, preserving rare event kinds | No hard byte cap in this policy |
 | `telegram/receipts.jsonl` | 5,000 → 4,000 | No hard byte cap in this policy |
-| `turn_traces/<day>.jsonl` | 20,000 retained; checked on first append and every 4,096 appends | 12 MiB → 8 MiB |
 
-Trace/activity and Telegram receipt row checks run on the first append and then every 128 appends,
-so their row triggers can overshoot by 127. The shared trace byte ceiling is
-checked on every append. An oversized incoming diagnostic row is refused;
+Activity and Telegram receipt row checks run on the first append and then every 128 appends,
+so their row triggers can overshoot by 127. An oversized incoming diagnostic row is refused;
 inherited unreadable diagnostic bytes are preserved and appends that would
 cross the ceiling are refused.
 
-`TurnTraceRetention.swift` removes date-named turn ledgers older than its
-14-day window. Each persisted turn-trace row is bounded to 12 KiB by
-`TurnTraceEvent.swift`, except `llm.call` rows, which keep the 8 MiB allowance
-`PersistenceCore` grants a model exchange.
+Turn traces and standalone receipts are details in `experiences/experiences.sqlite`;
+the record forgets details older than `ExperienceStore.detailHorizon` (14 days) and
+refuses a detail row over 1 MiB. Each persisted turn-trace row is bounded to 12 KiB by
+`TurnTraceEvent.swift`, except `llm.call` rows.
 
 `Browser/BrowserCaptureCache.swift` owns temporary page text, links and
 screenshots. Captures share 128 MiB, 256 groups and seven days, enforced on
@@ -41,46 +38,22 @@ their own five-per-session policy; see [Data bounds](data-bounds.md).
 
 | Path | Owner and content | Retention |
 |---|---|---|
-| `turn_traces/<day>.jsonl.doctor-preserved-<UUID>.bak` | `TurnTracePersistLane.salvageValidRows`: original bytes before an explicit Doctor repair | No automatic expiry; date-named ledger retention does not select these copies |
 | `diagnostics/cutoffs/<turn-or-time>[-UUID].txt` | `RunawayOutputDetector.writeDiagnostic`: reason, character count and raw output; returns and logs its path | Existing writer keeps the newest 100 text files on write |
 
-Neither path is selected for local backup, production export or a raw phone
-snapshot; PrivacyMap inventories their parent folders. They are recovery and
-diagnostic review candidates, not proven orphans merely because no dedicated
-in-app content reader exists. `traces/events.jsonl` and `user_prefs.json`
-retain live readers and are not orphan stores.
+This path is not selected for local backup, production export or a raw phone
+snapshot; PrivacyMap inventories its parent folder. It is a diagnostic review
+candidate, not a proven orphan merely because no dedicated in-app content reader
+exists. `user_prefs.json` retains live readers and is not an orphan store.
 
 Source paths above are under `Modules/NativeAgentCore/Sources/`.
 
 ## Notification inbox
 
-`NotificationInbox/LiveNotificationInbox.swift` owns
-`notifications/inbox.jsonl`. Its 500-row target counts only rows without
-outstanding delivery intents, as checked against `notify/deliveries.json`.
-`held_delivery` is source intent, not a second delivery receipt. Rows with no
-ledger evidence or with pending/unknown current destinations remain protected;
-settled or superseded occurrences no longer pin their card. Protected rows are
-exempt from both the row target and the 30-day terminal-card cutoff; there is no
-hard total-row limit. Each mutation evicts at most 200 rows,
-so a backlog converges over subsequent writes. Every eviction reaches the
-uncapped `notifications/inbox_archive.jsonl` shelf before the live rewrite.
-
-The delivery ledger retains occurrence identities and outcomes without eviction;
-discarding an unknown or accepted receipt must not reauthorize its effect.
-It is local delivery evidence, not another inbox or a phone snapshot.
-
-The physical reader checks every line against `InboxItemRecord`'s current
-shared card schema. Missing/mistyped required fields, invalid timestamps or
-status, and malformed action lists make the complete feed unavailable with
-the line number and underlying cause. A whole-feed mutation requires that
-complete read and validates its output before retention or writing. It never
-rewrites a shortened projection over damaged bytes. The Mac keeps its previous
-published cards with the read error; a phone snapshot receives the checked read
-result. An actually missing or empty file is an empty inbox.
-
-Morning briefs use this same checked owner and the latest physical card per id
-for unread counts. An unreadable feed supplies unavailable evidence and its
-cause to the brief, with no unread count; the seed never invents card state.
+The inbox is a reading of the experiences addressed to them (`Experiences/ForPerson.swift`), held in memory: open
+matters plus those settled in the last 30 days, newest 500. Nothing is evicted from the record; the reading only
+forgets settled matters past its bound. There is no inbox file, archive shelf or delivery ledger. An unreadable
+record fails the read with its cause; the Mac keeps its previous published cards with the read error, and a phone
+snapshot receives the checked read result.
 
 Actions belong to the filing producer: an explicit empty list stays empty;
 readers do not invent executable controls. The phone always offers local Read
@@ -93,8 +66,5 @@ for missing or unsupported operations. A completed quiet inbox write stays in
 `unknown`, with the actual read error when present. Only an observed conflicting
 status produces `did_not_stick`.
 
-The current execution link is `related_execution_id`. The single retained
-`related_mission_id` reader remains in `InboxItemRecord` because live cards still
-carry that key (read-only inventory, 2026-11-01); no data conversion is performed
-by a read. Backlog scanning consumes that same checked card's links and declared
-actions. Presentation prose never supplies approval controls.
+The execution link is `related_execution_id`; it is the only key read. Backlog
+scanning consumes that same checked card's links and declared actions. Presentation prose never supplies approval controls.

@@ -38,8 +38,7 @@ struct ChatRuntimeControls: Equatable, Sendable, Codable {
         if !clean.model.isEmpty { out["model"] = clean.model }
         if !clean.reasoningEffort.isEmpty { out["reasoningEffort"] = clean.reasoningEffort }
         if !clean.serviceTier.isEmpty { out["serviceTier"] = clean.serviceTier }
-        // This required control was supplied even when blank. Preserve it so
-        // Mac ingress refuses malformed input instead of inferring Auto.
+        // Preserve supplied blank controls so Mac ingress refuses malformed input rather than inferring Auto.
         out["fileAccess"] = clean.fileAccess
         if !clean.providerId.isEmpty { out["providerId"] = clean.providerId }
         return out
@@ -70,18 +69,12 @@ struct ChatRuntimeControls: Equatable, Sendable, Codable {
 
 /// Only an explicitly published, newer empty Mac transcript can clear the phone's copy.
 enum MacTranscriptRead: Equatable {
-    /// No row for this session in the newest snapshot (still downloading, the
-    /// session is not in the published set, or the read failed). Hold last-good.
+    /// Missing, failed or unpublished rows are unavailable, so retain the last admitted transcript.
     case unavailable
-    /// The Mac's transcript for this session, possibly empty. `generation` is
-    /// the session's transcript version at publication — a counter the Mac
-    /// bumps on every clear and every transcript write. An empty transcript
-    /// only clears the phone when that counter is strictly greater than the
-    /// last one applied for the session.
+    /// Only a strictly newer Mac generation can clear the phone with an explicit empty transcript; every clear/write advances that generation.
     case published([ChatMessage], generation: Int?)
 
-    /// The rows the Mac published — empty both for `.unavailable` and for an
-    /// explicit empty transcript, so never branch on this alone.
+    /// Unavailable and published-empty reads both yield empty rows; the rows alone cannot authorize clearing.
     var messages: [ChatMessage] {
         guard case .published(let messages, _) = self else { return [] }
         return messages
@@ -139,11 +132,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var text: String
     var isStreaming: Bool = false
     var attachments: [ChatAttachmentSummary] = []
-    /// Tools/skills this assistant turn used (assistant messages only). Drives
-    /// the live flip-box while streaming and the collapsed summary when done.
     var toolEvents: [ToolEvent] = []
-    /// A settled bridge receipt that the Mac transcript has not yet published.
-    /// Kept in the shared projection until the matching Mac run is published.
+    /// Retain settled bridge receipts until the matching Mac run is published.
     var awaitingMacTranscript: Bool = false
     var runId: String?
     var turnID: String?
@@ -186,7 +176,6 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         self.interactionSessionID = interactionSessionID
     }
 
-    /// Same derivation as the Mac's NativeAgentEngine.phoneMessageID.
     nonisolated static func derivedMessageID(_ id: String) -> UUID {
         var bytes = Array(SHA256.hash(data: Data(("nativeagent.message:" + id).utf8)).prefix(16))
         bytes[6] = (bytes[6] & 0x0F) | 0x50
@@ -205,8 +194,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
             let descriptor = try rec.interactionDescriptorJSON.map { try decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
             guard roleStr == "user" || roleStr == "assistant" || interaction != nil else { return nil }
             let role: ChatMessage.Role = roleStr == "user" ? .user : .assistant
-            // Every row has one stable identity: a non-UUID row id (an older Mac's
-            // interaction mirror or approval card) maps to the same UUID the Mac derives.
+            // Derive non-UUID interaction/approval row IDs exactly as the Mac does so each row retains one stable identity.
             let uuid = UUID(uuidString: rec.id) ?? Self.derivedMessageID(rec.id)
             let attachments: [ChatAttachmentSummary] = (rec.metadata?.attachments ?? []).map { a in
                 ChatAttachmentSummary(
@@ -248,8 +236,7 @@ struct ChatSessionTab: Identifiable, Hashable {
     enum Kind: Hashable {
         case main
         case pinned(String)
-        /// The derived conversation-anchor tab. It is NOT a pin: nobody wrote it
-        /// into a pin list, so there is nothing to unpin and no close control.
+        /// Derived conversation anchors are not pins and must not expose an unpin control.
         case anchor(String)
     }
 
@@ -259,17 +246,13 @@ struct ChatSessionTab: Identifiable, Hashable {
     var sessionID: String?
     var kind: Kind
 
-    /// The session a close control may unpin — real Mac-owned pins only.
-    /// The anchor tab returns nil: an unpin request for it would name a row
-    /// the human may never have pinned, and would drop the live conversation
-    /// off the strip until the next publish put it back.
+    /// Only Mac-owned pins may unpin; closing a derived anchor could remove a conversation the user never pinned.
     var closableSessionID: String? {
         if case .pinned(let sessionID) = kind { return sessionID }
         return nil
     }
 }
 
-/// An explicit session choice lasts this launch; nil follows main.
 @MainActor
 enum MobileChatSelectionIntent {
     private(set) static var explicitlySelectedSessionID: String?
@@ -284,10 +267,7 @@ enum MobileChatSelectionIntent {
     }
 }
 
-/// Pure projection for the iOS tab strip. The phone has one current mobile
-/// session plus the exact ordered Mac-owned pinned snapshot—never a second
-/// source-based definition of what counts as a tab. The conversation anchor,
-/// when there is one, rides at the front of the pinned run as a derived tab.
+/// Use the exact ordered Mac pin snapshot, with the derived anchor first; source-based tab rules would create a second owner.
 enum ChatSessionTabs {
     static func make(
         mainSessionID: String?,

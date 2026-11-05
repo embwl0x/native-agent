@@ -4,13 +4,13 @@ import PersistenceCore
 
 enum HumanConversationRead {
     /// A selected conversation reads through its explicit owner; the list is the index's own rows.
-    static func read(_ input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue {
-        guard let id = input["conversation_session_id"] else { return try HumanConversationIndex.list(input, dataRoot: dataRoot) }
+    static func read(workspace: WorkspaceOperation, _ input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue {
+        guard let id = input["conversation_session_id"] else { return try HumanConversationIndex.list(workspace: workspace, input, dataRoot: dataRoot) }
         guard case .string(let session) = id else {
             return .object(["status": .string("unavailable"), "detail": .string("This conversation is unavailable. Open the conversation list again.")])
         }
         let limit: Int? = if case .int(let value)? = input["limit"] { Int(exactly: value) } else { nil }
-        return try await AgentWorkspacePorts.current.conversations.openHuman(sessionID: session, limit: limit, dataRoot: dataRoot)
+        return try await workspace.ports.conversations.openHuman(sessionID: session, limit: limit, dataRoot: dataRoot)
     }
 
     static func project(input: [String: JSONValue], result: JSONValue,
@@ -19,14 +19,14 @@ enum HumanConversationRead {
             return .init(title: "Conversations with you", content: result, items: [], actions: [])
         }
         if case .array(let conversations)? = row["conversations"] {
-            // Content titles use who and when to distinguish matching names.
+            // Duplicate titles need sender and time for disambiguation.
             let rows = conversations.compactMap { value -> [String: JSONValue]? in
                 guard case .object(let item) = value, item["conversation_session_id"] != nil else { return nil }
                 return item
             }
-            let named = rows.map { HerScreen.humanTitle($0["title"]?.stringValue ?? "Conversation with you", agentName: nil) }
-            let titles = HerScreen.disambiguate(named.map(\.title), who: named.map(\.who),
-                at: rows.map { $0["updated_at"]?.stringValue.flatMap(HerScreen.date) })
+            let named = rows.map { AgentScreen.humanTitle($0["title"]?.stringValue ?? "Conversation with you", agentName: nil) }
+            let titles = AgentScreen.disambiguate(named.map(\.title), who: named.map(\.who),
+                at: rows.map { $0["updated_at"]?.stringValue.flatMap(AgentScreen.date) })
             let items = zip(rows, titles).compactMap { item, title -> AgentWorkspaceItem? in
                 guard case .string(let id)? = item["conversation_session_id"] else { return nil }
                 let location = AgentWorkspaceLocation.record(tool: "chat_conversations",
@@ -55,7 +55,7 @@ enum HumanConversationRead {
         }
         actions.append(.init(label: "Read latest exchange", action: .open(.record(tool: "chat_conversations",
             input: input, title: row["title"]?.stringValue ?? "Conversation with you"))))
-        return .init(title: row["title"]?.stringValue.map { HerScreen.humanTitle($0, agentName: nil).title } ?? "Conversation with you",
+        return .init(title: row["title"]?.stringValue.map { AgentScreen.humanTitle($0, agentName: nil).title } ?? "Conversation with you",
                      content: result, items: [], actions: actions)
     }
 }

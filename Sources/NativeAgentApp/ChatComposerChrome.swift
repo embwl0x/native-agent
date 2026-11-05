@@ -10,8 +10,7 @@ import PersistenceCore
 
 // Blueprint: | `ChatComposerChrome.swift` | `ComposerKeys`: editor-scoped Tab, slash, Shift-Return and attachment paste interception; shared composer chrome |
 
-/// Intercept Tab and open slash suggestions while this draft owns the editor.
-/// Other typing and modified Return retain their existing dispatch.
+/// Intercept draft-owned keys only; preserve dispatch for ordinary typing and modified Return.
 struct ComposerKeys: NSViewRepresentable {
     var active: Bool
     var move: (Bool) -> Bool
@@ -56,9 +55,7 @@ struct ComposerKeys: NSViewRepresentable {
                    !editor.hasMarkedText(), suggestionKey?(event.keyCode) == true {
                     return nil
                 }
-                // SwiftUI's vertical TextField submits Shift-Return too. Keep
-                // it in the native editor so selection, undo and draft binding
-                // receive a newline without accepting or queuing a turn.
+                // Keep Shift-Return in the native editor so newline insertion preserves selection, undo and binding without accepting a turn.
                 if (event.keyCode == 36 || event.keyCode == 76),
                    event.modifierFlags.contains(.shift),
                    !event.modifierFlags.contains(.option),
@@ -164,40 +161,29 @@ enum ChatEmptyStateSuggestionAction {
 
 enum ChatComposerSendAction: Equatable {
     case send
-    case queueNext
-    case appendToQueue
-    case appendToPausedQueue
+    case steer
 
-    static func resolve(isRunning: Bool, hasQueuedTurns: Bool, isQueuePaused: Bool) -> Self {
-        // Idle with a paused backlog (after Stop): the send runs now and the
-        // backlog stays paused behind it (MacChatTurnAdmission decides the same).
-        if hasQueuedTurns { return isQueuePaused ? (isRunning ? .appendToPausedQueue : .send) : .appendToQueue }
-        return isRunning ? .queueNext : .send
+    static func resolve(isRunning: Bool) -> Self {
+        isRunning ? .steer : .send
     }
 
     var label: String {
         switch self {
         case .send: return "Send message"
-        case .queueNext: return "Queue message to send next"
-        case .appendToQueue: return "Add message to queue"
-        case .appendToPausedQueue: return "Add message to paused queue"
+        case .steer: return "Send into reply in progress"
         }
     }
 
     var hint: String {
         switch self {
         case .send: return "Start a response in this conversation"
-        case .queueNext: return "Wait for the current response to finish"
-        case .appendToQueue: return "Run after the messages already queued in this conversation"
-        case .appendToPausedQueue: return "The queue stays paused. Use Send next to resume it."
+        case .steer: return "The reply in progress takes this at its next step"
         }
     }
 }
 
 #if DEBUG
-/// Capture affordance only: a locked Mac takes neither a click nor a key, so a
-/// card can be asked for at launch while the frames are being taken. DEBUG-only,
-/// and never a product behaviour.
+/// DEBUG capture may request a card at launch because a locked Mac cannot accept clicks or keys.
 func composerCardRequestedForCapture() -> ChatComposerCard? {
     switch ProcessInfo.processInfo.environment["COMPOSER_CARD_OPEN"] {
     case "context": .context
@@ -209,17 +195,13 @@ func composerCardRequestedForCapture() -> ChatComposerCard? {
 }
 #endif
 
-/// One compact, shared composer action hierarchy for main and detached chat.
-/// Voice, screen capture, and attachments remain first-class actions (and keep
-/// their command-menu shortcuts), but no longer occupy three permanent buttons
-/// beside every draft. Stop and Send stay immediately visible because they are
-/// the live-turn controls whose timing matters.
+/// Keep Stop and Send immediately visible because live-turn timing matters; share secondary actions across composers.
 struct MacChatComposerControlStrip<InputContent: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
-    /// The native settings menu or context receipt; absent in detached chat.
+    /// Detached chat has no settings menu or context receipt.
     @Environment(ComposerShellState.self) private var composerCardState: ComposerShellState?
 
 
@@ -229,21 +211,18 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     let screenCaptureDisabled: Bool
     let pendingAttachmentCount: Int
     let isRunning: Bool
-    let hasQueuedTurns: Bool
-    let isQueuePaused: Bool
     let canSend: Bool
     let onToggleVoice: () -> Void
     let onCaptureScreen: () -> Void
     let onAttach: () -> Void
     let onStop: () -> Void
     let onSend: () -> Void
-    /// The whole card requests focus; interactive children retain their own hit areas.
+    /// Focus card padding without taking hit areas from interactive children.
     var onFocusRequest: (() -> Void)?
-    /// The text field's owner reports focus so the composer can distinguish its active state.
+    /// Use the text field owner's focus report so the composer reflects actual editor state.
     var isFocused: Bool = false
     var sessionId: String? = nil
     var showsConversationSettings: Bool = false
-    /// Incremented by the draft when Tab should move into the settings words.
     var focusWordToken: Int = 0
     let inputContent: InputContent
 
@@ -253,8 +232,6 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         screenCaptureDisabled: Bool,
         pendingAttachmentCount: Int,
         isRunning: Bool,
-        hasQueuedTurns: Bool = false,
-        isQueuePaused: Bool = false,
         canSend: Bool,
         onToggleVoice: @escaping () -> Void,
         onCaptureScreen: @escaping () -> Void,
@@ -273,8 +250,6 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         self.screenCaptureDisabled = screenCaptureDisabled
         self.pendingAttachmentCount = pendingAttachmentCount
         self.isRunning = isRunning
-        self.hasQueuedTurns = hasQueuedTurns
-        self.isQueuePaused = isQueuePaused
         self.canSend = canSend
         self.onToggleVoice = onToggleVoice
         self.onCaptureScreen = onCaptureScreen
@@ -299,10 +274,10 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     }
 
     private var sendAction: ChatComposerSendAction {
-        .resolve(isRunning: isRunning, hasQueuedTurns: hasQueuedTurns, isQueuePaused: isQueuePaused)
+        .resolve(isRunning: isRunning)
     }
 
-    /// Send ↔ Stop: the glyph swaps, the circle stays. None under Reduce Motion.
+    /// Keep the circle stable while swapping Send and Stop; Reduce Motion disables the glyph animation.
     private var glyphSwap: AnyTransition {
         reduceMotion ? .identity
             : .scale(scale: 0.5).combined(with: .opacity).animation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.2))
@@ -362,16 +337,14 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .help(isListening ? "Stop listening" : "Voice input")
                 .accessibilityLabel(isListening ? "Stop listening" : "Voice input")
 
-                // The words own the rest of the row so a card can be anchored
-                // to the word that opened it and clamped to the room's edge at
-                // any window width.
+                // Let settings words own the row so cards anchor to the opening word and remain inside the window.
                 if showsConversationSettings {
                     ChatComposerSettings(focusWordToken: focusWordToken)
                 } else {
                     Spacer(minLength: 0)
                 }
 
-                // Stop and Send share one slot; Return still queues drafts during a turn.
+                // Return sends into the live conversation while Stop keeps its button.
                 let lit = isRunning || canSend
                 Button(action: isRunning ? onStop : onSend) {
                     ZStack {
@@ -400,19 +373,20 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .help(isRunning ? "Stop generation" : "\(sendAction.label). \(sendAction.hint)")
                 .accessibilityLabel(isRunning ? "Stop generation" : sendAction.label)
                 .accessibilityHint(isRunning ? "" : sendAction.hint)
+                .contextMenu {
+                    if isRunning {
+                        Button(sendAction.label, action: onSend)
+                            .disabled(!canSend)
+                    }
+                }
             }
         }
-        // The inner gutter aligns the field with the transcript's text edges.
         .padding(.horizontal, NativeAgentShellLayout.roomGutter)
         .padding(.top, 12)
         .padding(.bottom, 11)
-        // Floating glass uses an opaque fill for reduced transparency and quiet bitmap captures.
+        // Use opaque fill for reduced transparency and reliable bitmap capture.
         .background {
-            // A click on the card's padding focuses the field. Only the padding:
-            // a click in the field is the field's own, and focusing it again
-            // from here (on mouse-up, from a focus state that had not caught
-            // up) restarted its editor with the caret at the start, so what
-            // was typed straight after the click split around it (10-18).
+            // Focus only padding; refocusing the field on mouse-up can restart its editor and move the caret before new typing.
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture {
@@ -433,12 +407,11 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
                 }
             }
-            // Glow and shimmer sit between the glass and the draft text.
+            // Place glow below draft text so it remains readable.
             HazeBottomGlow(cornerRadius: NativeAgentShellLayout.composerRadius)
             ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.composerRadius, sessionId: sessionId)
         }
-        // The card holds independent controls; interactive glass makes a
-        // click in the field press/dim the entire card on macOS 27.
+        // Avoid interactive glass because field clicks dim the entire card on macOS 27.
         .glassEffect(
             reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate,
             in: RoundedRectangle(
@@ -446,7 +419,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 style: .continuous
             )
         )
-        // Held keyboard focus stays visible on both glass and the opaque plate.
+        // Keep held keyboard focus visible on glass and opaque fill.
         .overlay {
             RoundedRectangle(
                 cornerRadius: NativeAgentShellLayout.composerRadius,
@@ -457,8 +430,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
             .allowsHitTesting(false)
             .accessibilityHidden(true)
         }
-        // The thinking rim: one arc of light travelling round the edge. Outside
-        // the focus animation's scope; it carries its own fade.
+        // Keep the travelling rim outside focus animation scope so it owns its fade.
         .overlay { ThinkingGlow(kind: .rim, cornerRadius: NativeAgentShellLayout.composerRadius, sessionId: sessionId) }
         #if DEBUG
         .onAppear {
@@ -468,7 +440,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
             }
         }
         #endif
-        // Reaching for the draft is the same gesture as putting a card away.
+        // Reaching for the draft dismisses its open card.
         .onChange(of: isFocused) { _, focused in
             if focused { composerCardState?.dismiss() }
         }
@@ -479,17 +451,15 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
 
 }
 
-/// Pending items share one tray and glass container with the composer, without glass on inner rows.
+/// Share one glass tray with the composer so inner rows do not stack glass.
 struct ChatComposerTray: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    /// A quiet screenshot takes the opaque tray, as the composer does.
+    /// Quiet capture needs an opaque tray, as with the composer.
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Namespace private var glass
 
-    let sessionId: String
-    let isBusy: Bool
     let attachments: [MultimodalAttachment]
     let onRemoveAttachment: (String) -> Void
     let otherRunning: [String]
@@ -497,26 +467,21 @@ struct ChatComposerTray: View {
     let onGoTo: (String) -> Void
     let onStop: (String) -> Void
 
-    /// The gap between the tray and the composer under it. Inside the
-    /// container's merge distance, so the two glass shapes fuse.
+    /// Keep the tray gap inside the merge distance so both glass shapes fuse.
     static let gap: CGFloat = 6
     static let radius: CGFloat = 16
 
-    /// What is in the tray, by identity. The spring keys on this and nothing
-    /// else, so a chip that only changes its words does not move the tray.
+    /// Animate tray identity changes only so a chip's wording cannot move the tray.
     private struct Contents: Equatable {
-        var queued: [String]
         var attachments: [String]
         var others: [String]
         var isEmpty: Bool {
-            queued.isEmpty && attachments.isEmpty && others.isEmpty
+            attachments.isEmpty && others.isEmpty
         }
     }
 
     private var contents: Contents {
         Contents(
-            queued: ChatQueuePresentation.visibleTurns(
-                appModel.engine.turns.queued(for: sessionId)).map(\.id),
             attachments: attachments.map(\.id),
             others: otherRunning
         )
@@ -556,10 +521,6 @@ struct ChatComposerTray: View {
 
     private func rows(_ contents: Contents) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if !contents.queued.isEmpty {
-                ChatQueuedTurnsView(sessionId: sessionId, isBusy: isBusy)
-                    .transition(.opacity)
-            }
             if !attachments.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ScrollView(.horizontal, showsIndicators: false) {

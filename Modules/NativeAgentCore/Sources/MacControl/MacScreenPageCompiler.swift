@@ -1,10 +1,9 @@
 import Foundation
 import PersistenceCore
 import Senses
-// Blueprint: | `MacScreenPageCompiler.swift` | Native AX reading order with checked menu availability/coverage, structural/activation alias folding, adjacent checkbox captions, document title ownership, sentence-first links, AX landmark/card sections, live-region text, full-context redaction and exact related-action bindings |
+// Blueprint: | `MacScreenPageCompiler.swift` | Structural AX reading order, scoped alias folding, whole sentences, secret redaction and exact related actions |
 
-/// The complete AX window in native form. The source walk and look frame own
-/// identity; this compiler owns reading order and representation, never input.
+/// The walk and look frame own identity; this compiler owns reading order and representation, never input.
 public enum MacScreenPageCompiler {
     static func ownName(_ attributes: MacAXAttributes, text: String?) -> String? {
         guard let text, !text.allSatisfy({ $0.isWhitespace || "•◦‣⁃".contains($0) }),
@@ -23,7 +22,7 @@ public enum MacScreenPageCompiler {
 
     public struct Compilation: Sendable {
         public let page: NativePage
-        /// Source paths for native zoom, not another rendered text channel.
+        /// Source paths support native zoom without another rendered text channel.
         public let blocks: JSONValue
     }
 
@@ -36,7 +35,7 @@ public enum MacScreenPageCompiler {
         var words: [[Int]: (title: String?, value: String?)] = [:]
         for (node, json) in zip(snapshot.nodes, redactedNodes) {
             guard case .object(let fields) = json else { continue }
-            // Words are never dropped on a guess about what they are.
+            // Do not guess away words.
             words[node.path] = (display(fields["title"]), display(fields["value"]))
         }
         let byPath = Dictionary(ordered.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
@@ -58,8 +57,7 @@ public enum MacScreenPageCompiler {
         let webAreas = ordered.filter { $0.attributes.role == "AXWebArea" }
         let webPaths = webAreas.map(\.path)
         func inPage(_ node: MacAXNode) -> Bool { webPaths.contains { node.path.starts(with: $0) } }
-        // The renderer's document has its own reading order. Shell controls
-        // cannot spend its page budget before the first paragraph is reached.
+        // Renderer documents own their reading order and budget; shell controls must not crowd out the first paragraph.
         let readingOrder = webAreas.isEmpty ? ordered : ordered.filter(inPage) + ordered.filter { !inPage($0) }
         var consumed: Set<[Int]> = []
         var things: [NativeThing] = []
@@ -74,7 +72,7 @@ public enum MacScreenPageCompiler {
         let appName = percept.app?.name ?? "App"
         let windowTitle = percept.windowTitleJSON.flatMap { display($0) }
         append(appName + (windowTitle.map { " · " + $0 } ?? "") + (isFront ? " · FRONT" : " · not front"), at: [])
-        // Menu titles make a menu path known without another read.
+        // Retain menu titles so paths need no extra read.
         if let menuReading {
             if let unavailable = menuReading.unavailable {
                 append("Menus unavailable: " + unavailable, at: [])
@@ -142,8 +140,7 @@ public enum MacScreenPageCompiler {
             return distinctTextNodes(leaves)
         }
         func distinctTextNodes(_ nodes: [MacAXNode]) -> [MacAXNode] {
-            // Equal words at different source positions remain separate runs.
-            // Fold only duplicate nodes or coincident representations.
+            // Equal words at different positions stay distinct; fold only duplicate nodes or coincident representations.
             var paths = Set<[Int]>()
             var names: [MacAXFrame: Set<String?>] = [:]
             return nodes.filter { leaf in
@@ -174,25 +171,19 @@ public enum MacScreenPageCompiler {
                 if parts.count > 1, same(label, parts.first), let text = runText(runs) { return text }
                 return inline(label)
             }
-            // An unnamed window button has an authoritative AX meaning.
-            // Keep every existing real label exactly as it was read.
+            // Use authoritative AX meanings only for unnamed window buttons; preserve observed labels.
             if let subrole = node.attributes.subrole,
                ["AXCloseButton", "AXMinimizeButton", "AXZoomButton"].contains(subrole) {
                 return MacScreenRender.kindName(role: String(subrole.dropLast("Button".count)))
             }
-            // Chromium gives composite buttons their name through descendant
-            // static text. Wrapper roles and status images are not that name.
+            // Chromium composite names come from descendant text, not wrapper roles or status images.
             return runText(staticRuns(node))
         }
-        // Presentation descendants repeat the owning control's activation in
-        // Chromium AX. Their role, containment, name and action set must all
-        // agree before folding them; a separately named button/link stays real.
+        // Fold presentation descendants only when role, containment, name and actions agree; independently named controls remain distinct.
         let activationActions: Set<String> = ["AXPress", "AXOpen", "AXShowMenu"]
         let labelOwners = MacPerceptionCompiler.controlRoles.union(["AXSwitch"])
         let checkableRoles: Set<String> = ["AXCheckBox", "AXRadioButton", "AXSwitch"]
-        // Resolve adjacent captions in the smallest semantic label container.
-        // Only one checkable input may own the text; other inputs, headings or
-        // paragraphs outside its label make a larger container ambiguous.
+        // Use the smallest label container with exactly one checkable input; larger containers may caption several controls.
         for node in ordered where checkableRoles.contains(node.attributes.role) && controls[node.path] != nil {
             for scope in ancestors(node.path) where ["AXGroup", "AXListItem", "AXParagraph"].contains(scope.attributes.role) {
                 let children = descendants(scope)
@@ -220,8 +211,7 @@ public enum MacScreenPageCompiler {
                 }
             }
         }
-        // A native label can also precede its input directly in a toolbar.
-        // Match the exact supplied caption locally, never all equal page text.
+        // Toolbar captions may precede inputs; match locally rather than deduplicating equal text across the page.
         for node in ordered where checkableRoles.contains(node.attributes.role) {
             guard let label = controlLabel(node) else { continue }
             let parent = Array(node.path.dropLast())
@@ -231,18 +221,14 @@ public enum MacScreenPageCompiler {
                 captionPaths[node.path, default: []].formUnion(descendants(sibling).map(\.path))
             }
         }
-        // An editor's value is an aggregate serialization of its structured
-        // document children. Read those children, retaining their headings,
-        // lists and controls, rather than publishing the value as a second body.
+        // Structured editor children retain headings, lists and controls; publishing their aggregate value too would duplicate the body.
         var structuredDocuments: Set<[Int]> = []
         var aggregateDocuments: Set<[Int]> = []
         for node in ordered where ["AXTextArea", "AXDocument"].contains(node.attributes.role) {
             let children = descendants(node)
             if children.contains(where: { ["AXHeading", "AXParagraph", "AXList", "AXListItem"].contains($0.attributes.role) }),
                children.contains(where: { $0.attributes.role == "AXStaticText" && ownName($0) != nil }) {
-                // Compare already-redacted content, not AX level/state values.
-                // Whitespace can separate runs; literal punctuation is content.
-                // Partial children must not erase the complete editor value.
+                // Compare redacted content rather than AX state; partial children cannot erase the complete editor value.
                 let textNodes = children.filter { child in
                     ["AXStaticText", "AXHeading", "AXLink", "AXCheckBox"].contains(child.attributes.role)
                         && !descendants(child).contains(where: { $0.attributes.role == "AXStaticText" })
@@ -283,8 +269,7 @@ public enum MacScreenPageCompiler {
                 return children.filter({ $0.attributes.role == "AXHeading" }).count == 1
                     && children.filter({ checkableRoles.contains($0.attributes.role) }).count == 1
             }) {
-                // Chromium exposes the card's activation on its badge too.
-                // The badge describes that card; it has no independent action.
+                // A card badge repeats its owner’s activation rather than adding an independent action.
                 controls.removeValue(forKey: node.path)
                 continue
             }
@@ -298,8 +283,7 @@ public enum MacScreenPageCompiler {
             else { continue }
             controls.removeValue(forKey: node.path)
         }
-        // An unnamed wrapper around real controls is structure, including a
-        // wrapper that repeats their press action.
+        // Unnamed wrappers remain structure even when they repeat child press actions.
         for node in ordered.reversed() where node.attributes.role == "AXGroup" && controls[node.path] != nil {
             let actions = descendants(node).filter {
                 controls[$0.path] != nil && (["AXButton", "AXLink"].contains($0.attributes.role) || checkableRoles.contains($0.attributes.role))
@@ -310,22 +294,17 @@ public enum MacScreenPageCompiler {
             }) { controls.removeValue(forKey: node.path) }
         }
         func headingText(_ node: MacAXNode) -> String? {
-            // AXHeading's numeric AXValue is its LEVEL, not its name.
-            // Chromium frequently exposes the actual name in static children.
-            // staticRuns excludes control-owned captions by source structure.
+            // AXHeading numeric values are levels; use static children for names and exclude control-owned captions.
             let parts = staticRuns(node).compactMap(ownName)
             if !parts.isEmpty {
                 return parts.joined(separator: " ")
             }
-            // Numeric values are levels. An aggregate title that includes child
-            // controls is not a heading label either.
+            // Levels and aggregate titles containing child controls are not heading names.
             guard !descendants(node).contains(where: { controls[$0.path] != nil }),
                   let title = words[node.path]?.title, readable(title) else { return nil }
             return inline(title)
         }
-        // A label and checkbox may be siblings inside the same label wrapper.
-        // Fold only an exact caption in a subtree with one real control; do
-        // not deduplicate prose globally or separate controls with equal names.
+        // Fold sibling checkbox captions only within a one-control label subtree; equal text elsewhere stays independent.
         for group in ordered.reversed() where ["AXGroup", "AXListItem"].contains(group.attributes.role) {
             let children = descendants(group)
             let actions = children.filter { controls[$0.path] != nil && labelOwners.contains($0.attributes.role) }
@@ -340,12 +319,7 @@ public enum MacScreenPageCompiler {
                 consumed.insert(child.path)
             }
         }
-        // A named primary control and its related sibling actions form one
-        // row. Recognize the relationship from containment and AX names,
-        // without guessing app names, status words or menu-label spellings.
-        // Nameless containers are structure; nameless inputs (an empty text,
-        // search or secure field, a checkbox) and enabled controls that press
-        // (an icon-only button) are still things she can use.
+        // Containment and AX names establish rows without app-specific guesses; unnamed inputs and enabled icon buttons remain usable.
         func unnamedName(_ node: MacAXNode) -> String? {
             if let kind = unnamedInputKind(node.attributes.role) { return kind }
             guard labelOwners.contains(node.attributes.role), controls[node.path]?.enabled == true,
@@ -373,8 +347,7 @@ public enum MacScreenPageCompiler {
             let owners = actions.filter { candidate in
                 guard ["AXButton", "AXLink"].contains(candidate.attributes.role),
                       let label = controlLabel(candidate) else { return false }
-                // Status belongs to the row, not to the session's identity.
-                // AX supplies the status labels; no app or status word list.
+                // Row status must not become session identity; use AX labels rather than a status vocabulary.
                 var statuses = descendants(candidate).filter {
                     ["AXGroup", "AXImage"].contains($0.attributes.role) && controls[$0.path] == nil
                 }.compactMap(ownName)
@@ -408,9 +381,7 @@ public enum MacScreenPageCompiler {
                actions.filter({ $0.path != primary.path }).allSatisfy({
                    controlLabel($0).map { names($0, owner: visibleName) } == true
                }) {
-                // The visible identity and related actions agree. Any leading
-                // accessible-name status belongs in detail, even when the app
-                // exposes no separate image/value for it.
+                // Accessible-name status belongs in detail even when no separate status image or value exists.
                 let state = String(label[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !state.isEmpty {
                     rowIdentities[primary.path] = visibleName
@@ -428,9 +399,7 @@ public enum MacScreenPageCompiler {
             else if let name = unnamedName(node) { controlNames[node.path] = name }
             else { controls.removeValue(forKey: node.path) }
         }
-        // A separately exposed activation of the same contained label is an
-        // alias, not another bookmark. Independent sibling controls keep their
-        // identity even when their labels happen to be equal.
+        // Contained activations of one label are aliases; equal independent sibling controls remain distinct.
         for node in ordered where controls[node.path] != nil && labelOwners.contains(node.attributes.role) {
             guard let owner = ancestors(node.path).first(where: {
                 controls[$0.path] != nil && labelOwners.contains($0.attributes.role)
@@ -446,9 +415,7 @@ public enum MacScreenPageCompiler {
                       !text.allSatisfy({ $0.isNumber || $0.isWhitespace }) else { return nil }
                 return text
             }
-            // Preserve a document's useful AX name. Numeric frame identifiers
-            // and repeated title components don't name its content; derive
-            // those sections from the document itself, without lexical guesses.
+            // Preserve useful document names; derive unnamed sections structurally rather than from numeric frame ids or lexical guesses.
             let editors = descendants(area).filter {
                 $0.attributes.role == "AXDocument" || structuredDocuments.contains($0.path) || aggregateDocuments.contains($0.path)
             }
@@ -465,15 +432,11 @@ public enum MacScreenPageCompiler {
                 ?? editors.compactMap { words[$0.path]?.value?.components(separatedBy: .newlines).first(where: readable) }.first
             if titleNamesEditor, let title = sectionText(words[area.path]?.title),
                contentTitle.map({ names(title, owner: $0) }) == true {
-                // A shared editor/page title that names its own heading is
-                // already meaningful. Keep that correctly read title intact.
+                // A title that names its document heading is already meaningful.
                 return title
             }
             if let contentTitle {
-                // A document toolbar can expose the full title when an iframe
-                // repeats its editor's generic name. Use the title occurrence
-                // anchored by this document's heading, inside its nearest pane.
-                // No app names, toolbar phrases or generic-title word list.
+                // Find a full title through its document heading in the nearest pane, never through app or generic-title word lists.
                 for scope in ancestors(area.path) {
                     let candidates = descendants(scope).filter {
                         ["AXWebArea", "AXDocument", "AXButton", "AXPopUpButton"].contains($0.attributes.role)
@@ -533,8 +496,7 @@ public enum MacScreenPageCompiler {
             var states = descendants(node).filter { child in
                 guard ["AXImage", "AXGroup"].contains(child.attributes.role), controls[child.path] == nil else { return false }
                 if child.attributes.role == "AXImage" || staticRuns(child).isEmpty { return true }
-                // Some status groups contain their own visible text. Related
-                // actions distinguish those statuses from the item's identity.
+                // Related actions distinguish a group’s visible status from the item’s identity.
                 guard let related = rowRelatedNames[node.path], let state = ownName(child),
                       label.map({ names($0, owner: state) }) == true else { return false }
                 return related.allSatisfy { !names($0, owner: state) }
@@ -551,8 +513,7 @@ public enum MacScreenPageCompiler {
             if node.attributes.role == "AXLink" { name = name.trimmingCharacters(in: CharacterSet(charactersIn: ",")) }
             guard !states.isEmpty else { return name }
             for state in states {
-                // Remove only a status the AX row itself publishes, at a word
-                // boundary. This handles leading, trailing and multiple states.
+                // Strip only AX-published statuses at word boundaries, including multiple leading or trailing states.
                 let pattern = "(?i)(?<![\\p{L}\\p{N}])" + NSRegularExpression.escapedPattern(for: state) + "(?![\\p{L}\\p{N}])"
                 name = name.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
             }
@@ -560,7 +521,8 @@ public enum MacScreenPageCompiler {
                 .trimmingCharacters(in: CharacterSet(charactersIn: " ·,:;–—-()[]"))
             return nameParts.isEmpty ? controlNames[node.path] ?? name : nameParts
         }
-        func controlRow(_ node: MacAXNode, inlineName: String? = nil, extraDetails: [String] = [], related: [MacAXNode] = [], includeValue: Bool = true) throws -> String {
+        func controlRow(_ node: MacAXNode, inlineName: String? = nil, extraDetails: [String] = [], related: [MacAXNode] = [],
+            includeValue: Bool = true) throws -> String {
             guard let control = controls[node.path] else { return "" }
             let a = node.attributes
             let kind = MacScreenRender.kindName(role: a.role)
@@ -583,8 +545,7 @@ public enum MacScreenPageCompiler {
             }
             verbs = MacFourVerbs.offeredVerbs(verbs)
             var activations: [String: JSONValue] = [:]
-            // A related action prints with its own handle, so `act` can use
-            // exactly what the page shows.
+            // Print each related action’s own handle so acts address exactly what the page shows.
             var printedVerbs = verbs
             for child in related {
                 guard let action = controls[child.path], let label = controlLabel(child) else { continue }
@@ -592,8 +553,7 @@ public enum MacScreenPageCompiler {
                     details.append(label + (action.enabled == false ? ": disabled" : ": enabled state unavailable"))
                     continue
                 }
-                // AX supplies the verb's words. Its binding is an exact frame
-                // handle and action, not a text lookup when the verb is spent.
+                // AX supplies verb words; execution retains exact frame and handle binding rather than looking text up again.
                 let verb = inline(label)
                 let activation = child.attributes.actions.contains("AXPress") ? "press"
                     : child.attributes.actions.contains("AXOpen") ? "open" : nil
@@ -621,8 +581,7 @@ public enum MacScreenPageCompiler {
             Self.sectionName(node.attributes, name: ownName(node))
                 ?? (itemSections.contains(node.path) ? ownName(node) ?? "Items" : nil)
         }
-        // A card's badge can precede its heading in AX order. Its smallest
-        // container with one heading owns the whole card, including that badge.
+        // A card’s one-heading container owns preceding badges too, despite AX order.
         var cardHeadings: [[Int]: MacAXNode] = [:]
         for image in ordered where image.attributes.role == "AXImage" {
             for scope in ancestors(image.path) where scope.attributes.role == "AXGroup" {
@@ -640,8 +599,7 @@ public enum MacScreenPageCompiler {
             guard !node.path.isEmpty, !consumed.contains(node.path) else { continue }
             let a = node.attributes
             let own = words[node.path]
-            // A live region is text, never a control row. Drop only an empty
-            // or duplicated container; leave its visible descendants to read.
+            // Live regions are text; drop only empty or duplicate wrappers while preserving visible descendants.
             if a.liveRegion {
                 if let text = own?.value ?? own?.title, readable(text) {
                     let leaves = descendants(node).filter { child in
@@ -662,8 +620,7 @@ public enum MacScreenPageCompiler {
             }
             if structuredDocuments.contains(node.path) { continue }
             if aggregateDocuments.contains(node.path) {
-                // One complete representation when AX has exposed only a
-                // partial/different child reading. Make that boundary visible.
+                // Partial or different child readings cannot replace the complete aggregate without a visible boundary.
                 if controls[node.path] != nil {
                     append(try controlRow(node, includeValue: false), at: node.path)
                 }
@@ -673,8 +630,7 @@ public enum MacScreenPageCompiler {
                 var inlineLinks: [(node: MacAXNode, range: Range<String.Index>)] = []
                 var unplaced: [MacAXNode] = []
                 func appendAggregate(until end: String.Index) throws {
-                    // With no inline links, preserve the existing aggregate
-                    // reading exactly. Link handles belong at their line's end.
+                    // Without inline links, preserve the aggregate reading; link handles belong at line ends.
                     if inlineLinks.isEmpty {
                         let text = String(body[cursor..<end]).trimmingCharacters(in: .newlines)
                         if !text.isEmpty { append(text, at: node.path) }
@@ -683,8 +639,7 @@ public enum MacScreenPageCompiler {
                         var renderedLines: [String] = []
                         while lineStart < end {
                             var lineEnd = body.range(of: "\n", range: lineStart..<end)?.lowerBound ?? end
-                            // AX can wrap a link caption. Never split that
-                            // caption merely because its text spans a newline.
+                            // Wrapped AX captions remain one link caption.
                             while let crossing = inlineLinks.first(where: {
                                 $0.range.lowerBound < lineEnd && $0.range.upperBound > lineEnd
                             }) {
@@ -717,9 +672,7 @@ public enum MacScreenPageCompiler {
                     inlineLinks.removeAll()
                     cursor = end
                 }
-                // Replace the caption's occurrence in the aggregate reading
-                // with its named control row, except links: their sentence
-                // stays whole, marked inline, with handles at the line's end.
+                // Replace owned captions with their control rows; links instead stay inline so sentences remain whole.
                 for child in descendants(node) where controls[child.path] != nil {
                     guard let label = controlLabel(child) else { unplaced.append(child); continue }
                     let pattern = label.split(whereSeparator: \.isWhitespace)
@@ -739,7 +692,8 @@ public enum MacScreenPageCompiler {
                 }
                 try appendAggregate(until: body.endIndex)
                 for child in unplaced { append(try controlRow(child), at: child.path) }
-                append("raw view · accessibility · The editor value was served once; its structured children do not expose the same complete text.", at: node.path)
+                append("raw view · accessibility · The editor value was served once; its structured children do not expose the same complete text.",
+                    at: node.path)
                 consumed.formUnion(descendants(node).map(\.path))
                 continue
             }
@@ -766,10 +720,7 @@ public enum MacScreenPageCompiler {
                 append(row, at: node.path)
                 continue
             }
-            // Inline AX links belong to their paragraph. Preserve their exact
-            // addresses in the sentence, rather than splitting the sentence at
-            // each link. A layout group needs line geometry or whitespace at
-            // the run boundaries; a semantic paragraph owns wrapped lines too.
+            // Keep exact link addresses inside their paragraphs; layout groups need line geometry or boundary whitespace to join runs.
             let subtree = descendants(node)
             if ["AXGroup", "AXParagraph", "AXStaticText"].contains(a.role), controls[node.path] == nil,
                !subtree.contains(where: { !["AXGroup", "AXStaticText", "AXLink"].contains($0.attributes.role) }),
@@ -809,9 +760,7 @@ public enum MacScreenPageCompiler {
             }
             if controls[node.path] != nil {
                 consumed.formUnion(captionPaths[node.path] ?? [])
-                // One composite button, one reading row. Keep independently
-                // named child actions inline with their exact original handles.
-                // Repeated wrapper names are folded, never their own actions.
+                // Fold repeated composite names into one row while retaining independently named child actions and their original handles.
                 let composite = labelOwners.contains(a.role)
                 let children = composite ? descendants(node).filter {
                     controls[$0.path] != nil && !ancestors($0.path).prefix(while: { $0.path != node.path })
@@ -823,8 +772,7 @@ public enum MacScreenPageCompiler {
                 var row = try controlRow(node, extraDetails: Array(NSOrderedSet(array: states).array.compactMap { $0 as? String }))
                 for child in children {
                     consumed.insert(child.path)
-                    // Print the bookmark/session name once. Every underlying
-                    // action remains in the native index and in this same row.
+                    // Print the item identity once while retaining every underlying action in the row and native index.
                     let repeatsOwner = same(controlLabel(child), controlLabel(node))
                     let inlineName = repeatsOwner ? "" : nil
                     row += " · " + (try controlRow(child, inlineName: inlineName))
@@ -841,9 +789,7 @@ public enum MacScreenPageCompiler {
                 append(row, at: node.path)
                 continue
             }
-            // A static element's styled runs, or a layout group's text on one
-            // actual AX line, are one label. Geometry prevents joining separate
-            // paragraphs or unrelated columns.
+            // Use styled runs or shared-line geometry to join labels without merging unrelated paragraphs or columns.
             let runs = staticRuns(node)
             let runFrames = runs.compactMap { $0.attributes.frame }
             let oneLine = runFrames.count == runs.count && runFrames.first.map { first in
@@ -874,15 +820,12 @@ public enum MacScreenPageCompiler {
                         if let text = words[child.path]?.value ?? words[child.path]?.title,
                            same(text, heading) || same(parts.joined(separator: " "), heading) { consumed.insert(child.path) }
                     }
-                    // A heading owns all of the text runs used to name it,
-                    // including repeated aggregate/static aliases.
+                    // Headings own every run used to name them, including aggregate aliases.
                     consumed.formUnion(staticRuns(node).map(\.path))
                 }
                 continue
             }
-            // Named, read-only status wrappers repeat in Chromium's tree.
-            // Fold only a status-shaped subtree, never repeated prose or two
-            // independently actionable controls with the same caption.
+            // Fold only status-shaped wrappers, never repeated prose or independently actionable equal captions.
             if a.role == "AXGroup", let name = ownName(node), staticRuns(node).count <= 1,
                !descendants(node).contains(where: { controls[$0.path] != nil || !["AXGroup", "AXImage", "AXStaticText"].contains($0.attributes.role) }),
                descendants(node).compactMap(ownName).allSatisfy({ same($0, name) }) {
@@ -896,16 +839,13 @@ public enum MacScreenPageCompiler {
                 consumed.formUnion(descendants(node).map(\.path))
                 continue
             }
-            // Layout wrappers do not become rows just because AX repeats a
-            // landmark's label on them. Their real content is read below.
+            // Repeated landmark labels do not make layout wrappers into rows; their content remains readable below.
             if a.role == "AXGroup", controls[node.path] == nil, own?.value == nil { continue }
             guard !["AXListMarker", "AXSeparator", "AXSplitter"].contains(a.role),
                   !a.liveRegion, let text = own?.value ?? own?.title, readable(text), text != a.role else { continue }
             if captionPaths.values.contains(where: { $0.contains(node.path) }) { continue }
             if same(text, windowTitle) || representedByControl(text, path: node.path) { continue }
-            // Container aggregate text and its leaf text are one AX reading,
-            // not two paragraphs. Equality is local to this subtree; repeated
-            // sentences in distinct paragraphs remain distinct sentences.
+            // Aggregate and leaf text within one subtree are one reading; equal sentences in separate paragraphs remain distinct.
             let leaves = subtree.filter { child in
                 guard (words[child.path]?.value ?? words[child.path]?.title) != nil else { return false }
                 return !descendants(child).contains { (words[$0.path]?.value ?? words[$0.path]?.title) != nil }
@@ -917,24 +857,19 @@ public enum MacScreenPageCompiler {
                 && (same(text, descendantWords.joined(separator: " ")) || same(text, descendantWords.joined()))
             if aggregate {
                 if subtree.contains(where: { controls[$0.path] != nil || $0.attributes.role == "AXWebArea" }) { continue }
-                // Keep the complete paragraph once, including styled runs,
-                // rather than splitting it into another raw leaf-text dump.
+                // Keep complete paragraphs and styled runs together rather than repeating a leaf-text dump.
                 consumed.formUnion(subtree.map(\.path))
             }
             let listItem = a.role == "AXListItem" || ancestors(node.path).contains { $0.attributes.role == "AXListItem" }
             append((listItem ? "- " : "") + text, at: node.path)
         }
-        // The frame every [handle] on this page belongs to, said once.
+        // State frame ownership once so every handle has an unambiguous source.
         lines[0] += "\n" + actLine(frameID: frameID)
         blocks[0] = .object(["text": .string(lines[0]), "path": .array([])])
         if snapshot.truncated {
             append("raw view · accessibility · The source tree is incomplete: " + snapshot.truncationReasons.joined(separator: ", "), at: [])
         }
-        // A section is visible only when it has a reading row. Keep the most
-        // specific heading before content, not a staircase of empty landmarks.
-        // Headings from the app's own document carry text and always stay.
-        // Generated section labels (## landmarks) are dropped only when their
-        // section is empty: the next row is another ## label or the end.
+        // Drop only empty generated sections; preserve specific headings and all app-authored document headings.
         func generated(_ line: String) -> Bool {
             let trimmed = line.drop(while: { $0.isWhitespace })
             return trimmed.hasPrefix("## ") && !trimmed.hasPrefix("### ")
@@ -952,14 +887,13 @@ public enum MacScreenPageCompiler {
             blocks: .array(retained.map { blocks[$0] }))
     }
 
-    /// The page's generated instruction line. Like the provenance line it is
-    /// scaffolding, not screen content: `wait` reads the page without both.
+    /// Instruction and provenance lines are scaffolding; exclude both when wait reads content.
     static func actLine(frameID: String) -> String {
         "Act: act {frame_id: \"\(frameID)\", handle: \"<an item's [handle]>\", verb: \"<one of its verbs>\"}."
             + " A verb printed with its own [handle] acts through that handle: press, or the verb in parentheses."
     }
 
-    /// A plain name for an unlabeled input, so an empty field stays usable.
+    /// Unlabeled fields still need a usable natural address.
     private static func unnamedInputKind(_ role: String) -> String? {
         switch role {
         case "AXTextField", "AXTextArea": "text field"

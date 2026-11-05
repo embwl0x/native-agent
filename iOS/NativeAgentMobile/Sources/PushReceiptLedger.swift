@@ -50,6 +50,9 @@ enum PushReceiptLedger {
 
     static func load() -> Reading {
         do { return Reading(entries: try MobileLocalStorage.restore([PushReceiptEntry].self, key: key, defaults: .standard) ?? []) }
-        catch { return Reading(entries: [], failure: "Push receipt history could not be read: \(error.localizedDescription). Its saved bytes are retained; repair this iPhone's receipt storage before recording further receipts.") }
+        catch { return Reading(entries: [], failure: """
+            Push receipt history could not be read: \(error.localizedDescription). Its saved bytes are retained; repair this iPhone's receipt storage before \
+            recording further receipts.
+            """) }
     }
 }

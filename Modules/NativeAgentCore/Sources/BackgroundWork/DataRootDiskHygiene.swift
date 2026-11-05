@@ -8,7 +8,6 @@ import DoctorChecks
 import PersistenceCore
 import TurnTrace
 import ApprovalInbox
-import NotificationInbox
 import MemoryV2
 import DreamREMCycle
 import AgentWorkspace
@@ -19,7 +18,7 @@ import ProviderRouting
 import Experiences
 import ToolRegistry
 import Cognition
-// Blueprint: | `DataRootDiskHygiene.swift` | `MaintenanceBackgroundWork` stores its port and disk card identity; `DataRootDiskHygiene`, reports and daily accounting; maintenance-assistance supplies storage prose; native owners retain unavailable plan reads, saved cleanup scope, receipts and acknowledgment by finding identity; no JS under the publication lock |
+// Blueprint: | `DataRootDiskHygiene.swift` | Disk matters point to locked saved cleanup offers; reclamation settles its receipt |
 
 public struct MaintenanceBackgroundWork: Sendable {
     let port: any MaintenanceBackgroundWorkPort
@@ -64,16 +63,12 @@ public struct MaintenanceBackgroundWork: Sendable {
             nativeLog("Disk hygiene accounting incomplete; prior notice preserved: %@", report.readFailures.joined(separator: "; "))
             return false
         }
-        // A bound reached (a deep tree like a Python venv, a huge folder) is
-        // partial but true: what it found is published; it never clears a notice.
+        // Bounded accounting remains useful but cannot clear a notice.
         let partial = report.truncated || report.depthTruncated
         guard report.tripped else {
             if partial { return true }
             do {
-                let now = Date()
-                _ = try await LiveNotificationInbox.live(dataRoot: dataRoot).archiveActive(
-                    ids: [diskHygieneCardId], readAt: now.ISO8601Format(), createdNoLaterThan: now,
-                    metadata: ["automatically_resolved": .bool(true), "actions": .array([]), "cleanup_plans": .array([])])
+                try await BodyNotice.resolve(key: diskHygieneCardId, from: "disk_hygiene", dataRoot: dataRoot)
                 return true
             } catch {
                 nativeLog("Disk hygiene: resolved notice could not be archived: %@", String(describing: error))
@@ -119,15 +114,9 @@ public struct MaintenanceBackgroundWork: Sendable {
                             "reclaimSize": .string(DataRootDiskHygiene.humanSize(reclaim)),
                             "policy": plan.map { .string($0.policy) } ?? .null])
         }
-        var actions: [JSONValue] = []
-        if reclaimable > 0 {
-            actions.append(.object(["id": .string("act"), "label": .string("Clean Up"),
-                "description": .string("Move the listed owner-approved bytes to Trash")]))
-        }
-        actions += [
-            .object(["id": .string("archive"), "label": .string("Archive"), "description": .string("Archive this card")]),
-            .object(["id": .string("dismiss"), "label": .string("Dismiss"), "description": .string("Dismiss this card")])
-        ]
+        var actions: [PartFace.Action] = []
+        if reclaimable > 0 { actions.append(.init(id: "act", label: "Clean Up", role: .primary)) }
+        actions += [.init(id: "archive", label: "Archive"), .init(id: "dismiss", label: "Dismiss")]
         do {
             let content = try await port.assistanceCard(dataRoot: dataRoot, input: .object([
                 "kind": .string("storage"), "usage": .array(usageRows), "planReads": .array(planReads),
@@ -140,21 +129,51 @@ public struct MaintenanceBackgroundWork: Sendable {
                 "accounting": .object(["status": .string(report.truncated || report.depthTruncated || report.readFailed ? "partial" : "available"),
                     "truncated": .bool(report.truncated), "depthTruncated": .bool(report.depthTruncated), "readFailed": .bool(report.readFailed)])
             ]))
-            let card: JSONValue = .object([
-                "id": .string(diskHygieneCardId), "created_at": .string(Date().ISO8601Format()),
-                "source": .string("disk_hygiene"), "severity": .string(reclaimable > 0 ? "actionable" : "info"),
-                "title": .string(content.title), "summary": .string(content.summary),
-                "detail": .string(content.detail), "finding_identity": .string(finding),
-                "cleanup_plans": try JSONValue.fromEncodable(plans), "actions": .array(actions),
-                "related_paths": .array([]), "related_groups": .array([]),
-                "related_execution_id": .null, "related_approval_id": .null,
-                "status": .string("unread"), "read_at": .null])
-            guard let notify = await upsertDiskHygieneCard(dataRoot: dataRoot, card: card, preserveStatus: true,
-                scanStartedAt: report.startedAt) else { return false }
-            if notify {
-                await port.notifyIfAttentionWorthy(dataRoot: dataRoot, itemId: diskHygieneCardId,
-                    title: content.title, summary: content.summary, source: "disk_hygiene",
-                    severity: reclaimable > 0 ? "actionable" : "info")
+            let forPerson = ForPerson.at(dataRoot)
+            let latest = try await forPerson.matters().first { $0.face?.from == "disk_hygiene" }
+            if let latest, latest.face?.row?.tone == .done {
+                guard let at = NativeTimestampFormat.parseISO8601FractionalFirst(latest.updatedAt ?? latest.at) else {
+                    throw diskFailure(409, "The cleanup receipt has no readable time; a later scan cannot be established.")
+                }
+                if at > report.startedAt {
+                    throw diskFailure(409, "Disk cleanup completed after this scan; fresh accounting is required.")
+                }
+            }
+            var episodeFinding = finding
+            if let latest, latest.progress != "resolved", latest.outcome?.domain != "disk_hygiene" {
+                let saved = try readDiskOffer(latest)
+                let old = try diskFinding(saved.finding)
+                let new = try diskFinding(finding)
+                if new.keys.isSubset(of: old.keys), new.tier <= old.tier { episodeFinding = saved.finding }
+            }
+            let findingID = episodeFinding
+            let offer = DiskCleanupOffer(finding: episodeFinding, plans: plans)
+            let choices = actions
+            try await BodyNotice.tell(key: diskHygieneCardId, from: "disk_hygiene",
+                finding: findingID, dataRoot: dataRoot) { id in
+                if let cleaned = try await forPerson.matters().first(where: {
+                    $0.face?.from == "disk_hygiene" && $0.face?.row?.tone == .done
+                }) {
+                    guard let at = NativeTimestampFormat.parseISO8601FractionalFirst(cleaned.updatedAt ?? cleaned.at) else {
+                        throw diskFailure(409, "The cleanup receipt time is unreadable; the scan's order is unknown.")
+                    }
+                    if at > report.startedAt { throw diskFailure(409, "Cleanup completed after this scan; fresh accounting is required.") }
+                }
+                if let current = try await forPerson.matter(id),
+                   ForPerson.reading(current) == .archived || ForPerson.reading(current) == .dismissed { return }
+                let path = dataRoot.appendingPathComponent("disk/cleanup/" + id + ".json")
+                try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try await SwiftNativePersistenceCore.withFileLock(path) {
+                    if let current = try await forPerson.matter(id),
+                       current.face?.row?.tone == .done || current.outcome?.domain == "disk_hygiene" {
+                        throw diskFailure(409, "Disk cleanup settled this offer; fresh accounting is required.")
+                    }
+                    try JSONEncoder().encode(offer).write(to: path, options: .atomic)
+                    try await port.tell(Matter(id: id, form: reclaimable > 0 ? .ask : .words, from: "disk_hygiene",
+                        title: content.title, summary: content.summary, words: content.detail, choices: choices,
+                        artifacts: [.init(source: Matter.files, id: path.path)]),
+                        dataRoot: dataRoot, reach: reclaimable > 0 ? .person(from: nil) : .inbox, turn: nil)
+                }
             }
             return true
         } catch {
@@ -163,40 +182,61 @@ public struct MaintenanceBackgroundWork: Sendable {
         }
     }
 
-    /// Both the card and inbox.clean_up execute this saved plan, never a larger fresh one.
-    public func cleanUpDiskHygiene(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> String {
-        let inboxPath = dataRoot.appendingPathComponent("notifications/inbox.jsonl")
-        // Prepare the newest saved card before locking; the locked read owns its scope.
-        if let row = try await LiveNotificationInbox.live(dataRoot: dataRoot).rows().last(where: {
-            $0.objectValue?["id"] == .string(diskHygieneCardId)
-        }), row.objectValue?["cleanup_plans"] == nil {
-            guard await fileDiskHygieneNotice(dataRoot: dataRoot, report: DataRootDiskHygiene.scan(dataRoot: dataRoot)) else {
-                throw NSError(domain: "NativeAgentDisk", code: 500, userInfo: [NSLocalizedDescriptionKey:
-                    "Disk finding could not be refreshed; nothing was moved."])
-            }
-            throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
-                "Disk finding refreshed. Review its current cleanup plan before running Clean Up."])
+    private struct DiskCleanupOffer: Codable, Sendable {
+        let finding: String
+        let plans: [DiskStorageOwner.Plan]
+    }
+
+    private func diskFinding(_ finding: String) throws -> (keys: Set<String>, tier: Int64) {
+        let parts = finding.split(separator: "|").map(String.init)
+        let tiers = parts.filter { $0.hasPrefix("reclaim-tier:") }
+        guard tiers.count == 1, let tier = Int64(tiers[0].dropFirst("reclaim-tier:".count)), tier >= 0 else {
+            throw diskFailure(409, "The saved disk finding is unreadable; no cleanup scope was inferred.")
         }
-        return try await SwiftNativePersistenceCore.withFileLock(inboxPath) {
-            let lines = try LiveNotificationInbox.readLines(inboxPath)
-            guard let object = lines.last(where: {
-                      $0.row?.objectValue?["id"] == .string(diskHygieneCardId)
-                  })?.row?.objectValue,
-                  let plans = object["cleanup_plans"] else {
-                throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
-                    "No saved cleanup plan. Refresh the disk finding before cleaning up."])
+        return (Set(parts.filter { !$0.hasPrefix("reclaim-tier:") }), tier)
+    }
+
+    private func diskFailure(_ code: Int, _ words: String) -> NSError {
+        NSError(domain: "NativeAgentDisk", code: code, userInfo: [NSLocalizedDescriptionKey: words])
+    }
+
+    private func diskOfferPath(_ matter: Experience) throws -> URL {
+        guard let path = matter.face?.artifacts.first(where: { $0.source == Matter.files })?.id else {
+            throw diskFailure(409, "No saved cleanup offer. Refresh the disk finding before cleaning up.")
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    private func readDiskOffer(_ matter: Experience) throws -> DiskCleanupOffer {
+        try JSONDecoder().decode(DiskCleanupOffer.self, from: Data(contentsOf: diskOfferPath(matter)))
+    }
+
+    /// Clean Up runs exactly the disk owner's saved offer; it never scans or expands its scope.
+    public func cleanUpDiskHygiene(dataRoot: URL = PersistenceCore.defaultDataRoot(), matterID: String? = nil) async throws -> String {
+        let forPerson = ForPerson.at(dataRoot)
+        let selected: Experience?
+        if let matterID { selected = try await forPerson.matter(matterID) }
+        else { selected = try await forPerson.matters().first { $0.face?.from == "disk_hygiene" } }
+        guard let selected, selected.face?.from == "disk_hygiene" else {
+            throw diskFailure(409, "No saved cleanup offer. Refresh the disk finding before cleaning up.")
+        }
+        let path = try diskOfferPath(selected)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            guard let current = try await forPerson.matter(selected.id),
+                  ForPerson.reading(current) == .unread || ForPerson.reading(current) == .read,
+                  current.face?.row?.tone == .attention else {
+                throw diskFailure(409, "This cleanup offer is already settled; no files were moved.")
             }
-            let card = (object, try JSONDecoder().decode([DiskStorageOwner.Plan].self, from: plans.serializedData(pretty: false)))
+            let offer = try readDiskOffer(current)
+            guard offer.plans.contains(where: { !$0.candidates.isEmpty }) else {
+                throw diskFailure(409, "No safely reclaimable bytes are offered. Storage was kept.")
+            }
             let owners = diskStorageOwners(dataRoot: dataRoot)
-            guard card.1.contains(where: { !$0.candidates.isEmpty }) else {
-                throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
-                    "No safely reclaimable bytes are offered by this card. Its storage is kept for the reasons shown."])
-            }
             var outcomes: [DiskStorageOwner.Outcome] = []
-            for plan in card.1 where !plan.candidates.isEmpty {
+            for plan in offer.plans where !plan.candidates.isEmpty {
                 do {
                     guard let owner = owners.first(where: { $0.id == plan.owner }) else {
-                        throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey: "Storage owner is unavailable; kept."])
+                        throw diskFailure(409, "Storage owner is unavailable; kept.")
                     }
                     outcomes += try await owner.reclaim(plan)
                 } catch {
@@ -212,91 +252,27 @@ public struct MaintenanceBackgroundWork: Sendable {
                 if let reason = $0.skippedReason { return "• Skipped \($0.relativePath): \(reason)" }
                 return "• Moved \($0.relativePath) to Trash: \(DataRootDiskHygiene.humanSize($0.sizeBytes))"
             }.joined(separator: "\n") + "\nTrash is recoverable and still occupies disk space until you empty it."
-            var replacement = card.0
-            replacement["cleanup_detail"] = .string(receipt)
-            replacement["detail"] = .string(receipt)
-            replacement["summary"] = .string(summary)
-            replacement["title"] = .string("Disk cleanup")
-            replacement["severity"] = .string(skipped == 0 ? "info" : "actionable")
-            replacement["status"] = .string("read")
-            replacement["read_at"] = .string(Date().ISO8601Format())
-            replacement["cleanup_completed_at"] = .double(Date().timeIntervalSince1970)
-            replacement["cleanup_plans"] = .array([])
-            if case .array(let actions)? = replacement["actions"] {
-                replacement["actions"] = .array(actions.filter {
-                    guard case .object(let action) = $0 else { return true }
-                    return action["id"] != .string("act")
-                })
+            let result: Result<Void, Error> = await settle {
+                do {
+                    try await forPerson.tell(Matter(id: current.id, form: .done, from: "disk_hygiene",
+                        title: "Disk cleanup", summary: summary, words: receipt,
+                        artifacts: [.init(source: Matter.files, id: path.path)]), doors: [])
+                    try await forPerson.answered(current.id, evidence: .init(source: Matter.files, id: path.path))
+                    try await forPerson.putAway(current.id, .resolved)
+                    return .success(())
+                } catch { return .failure(error) }
             }
-            guard await upsertDiskHygieneCard(dataRoot: dataRoot, card: .object(replacement), preserveStatus: false) != nil else {
-                throw NSError(domain: "NativeAgentDisk", code: 500, userInfo: [NSLocalizedDescriptionKey:
-                    receipt + "\nCleanup completed, but its card could not be saved."])
-            }
-            if reclaimed == 0, skipped > 0 {
-                throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey: receipt])
-            }
+            do { try result.get() }
+            catch { throw diskFailure(500, receipt + "\nCleanup completed, but its receipt could not be saved: " + error.localizedDescription) }
+            if reclaimed == 0, skipped > 0 { throw diskFailure(409, receipt) }
             return summary
         }
     }
 
-    /// Preserve acknowledgment by owner/budget finding, and retain the last cleanup receipt.
-    private func upsertDiskHygieneCard(
-        dataRoot: URL,
-        card: JSONValue,
-        preserveStatus: Bool,
-        scanStartedAt: Date? = nil
-    ) async -> Bool? {
-        do {
-            return try await LiveNotificationInbox.live(dataRoot: dataRoot)
-                .upsert(id: diskHygieneCardId) { existing in
-                    guard case .object(let obj)? = existing else { return (card, true) }
-                    var notify = false
-                    if let scanStartedAt, case .double(let completed)? = obj["cleanup_completed_at"],
-                       completed > scanStartedAt.timeIntervalSince1970 {
-                        throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
-                            "Disk cleanup completed after this scan; a fresh accounting is required."])
-                    }
-                    var replacement = card
-                    if preserveStatus, case .object(var newObj) = card {
-                        newObj["cleanup_completed_at"] = obj["cleanup_completed_at"]
-                        func identity(_ value: JSONValue?) -> (Set<String>, Int64) {
-                            guard case .string(let value) = value else { return ([], 0) }
-                            let parts = value.split(separator: "|").map(String.init)
-                            let tier = parts.first { $0.hasPrefix("reclaim-tier:") }
-                                .flatMap { Int64($0.dropFirst("reclaim-tier:".count)) } ?? 0
-                            return (Set(parts.filter { !$0.hasPrefix("reclaim-tier:") }), tier)
-                        }
-                        let oldFinding = identity(obj["finding_identity"])
-                        let newFinding = identity(newObj["finding_identity"])
-                        let sameFinding = obj["finding_identity"] == nil
-                            || (newFinding.0.isSubset(of: oldFinding.0) && newFinding.1 <= oldFinding.1)
-                        if sameFinding, obj["automatically_resolved"] != .bool(true) {
-                            newObj["status"] = obj["status"] ?? .string("unread")
-                            newObj["read_at"] = obj["read_at"] ?? .null
-                        } else { notify = true }
-                        if case .string(let receipt)? = obj["cleanup_detail"],
-                           case .string(let detail)? = newObj["detail"] {
-                            newObj["cleanup_detail"] = .string(receipt)
-                            newObj["detail"] = .string(detail + "\n\nLast cleanup:\n" + receipt)
-                        }
-                        replacement = .object(newObj)
-                    }
-                    return (replacement, notify)
-                }
-        } catch {
-            // A failed upsert must report failure so the loop rolls back the
-            // daily reservation and retries delivery on the next tick.
-            FileHandle.standardError.write(Data(
-                "DataRootDiskHygieneCheck: notice upsert failed: \(error)\n".utf8))
-            return nil
-        }
-    }
 }
 
-/// One oversized file the disk-hygiene scan found.
 public struct DiskHygieneOffender: Sendable, Equatable {
-    /// Path relative to `dataRoot` (so the notification never leaks the absolute
-    /// home-directory path).
+    /// Relative paths keep the notification from exposing the absolute home-directory path.
     public let relativePath: String
     public let sizeBytes: Int64
 
@@ -306,29 +282,23 @@ public struct DiskHygieneOffender: Sendable, Equatable {
     }
 }
 
-/// The result of one `dataRoot` size scan.
 public struct DiskHygieneReport: Sendable, Equatable {
     public let startedAt: Date
     public let storageBytes: [String: Int64]
-    /// Single files larger than `singleFileThreshold`, largest first.
     public let largeFiles: [DiskHygieneOffender]
-    /// Deepest over-threshold directory subtrees, plus any residue root regardless of size.
+    /// Only deepest oversized subtrees appear; residue roots appear regardless of size.
     public let largeDirectories: [DiskHygieneOffender]
-    /// Total bytes of every regular file walked (bounded by `maxDepth`).
     public let totalBytes: Int64
     public let staticModelBytes: Int64
     public var dynamicBytes: Int64 { totalBytes - staticModelBytes }
-    /// Whether dynamic bytes exceeded `totalThreshold`.
     public let totalOverBudget: Bool
     /// The file budget stopped the walk; totals and offenders may undercount.
     public let truncated: Bool
     /// The depth bound left directories unscanned, independently of the file budget.
     public let depthTruncated: Bool
-    /// A directory or required file attribute could not be read.
     public let readFailed: Bool
     public let readFailures: [String]
 
-    /// True when the scan found anything worth a notification.
     public var tripped: Bool {
         !largeFiles.isEmpty || !largeDirectories.isEmpty || totalOverBudget
     }
@@ -362,19 +332,15 @@ public struct DiskHygieneReport: Sendable, Equatable {
 
 /// Read-only disk-usage scanner over `dataRoot`; cleanup is a separate action.
 public enum DataRootDiskHygiene {
-    /// A single file this large trips a notification (default 1 GB).
-    /// Residue is identified separately by `residueRelativePrefixes`.
     public static let defaultSingleFileThreshold: Int64 = 1024 * 1024 * 1024
-    /// Dynamic `dataRoot` bytes above 1 GB trip a notification.
     public static let defaultTotalThreshold: Int64 = 1024 * 1024 * 1024
 
-    /// A directory subtree above 128 MB trips a notification.
     public static let defaultDirectoryThreshold: Int64 = 128 * 1024 * 1024
 
-    /// Bound each synchronous scan to 50,000 entries.
+    /// Bound synchronous scanning to protect responsiveness.
     public static let defaultMaxScannedEntries = 50_000
 
-    /// Descend at most seven levels; the entry budget also bounds the walk.
+    /// A depth limit complements the entry budget for deeply nested trees.
     public static let defaultMaxDepth = 7
 
     /// Sum regular files without following symlinks; a missing root has no storage to scan.
@@ -405,14 +371,11 @@ public enum DataRootDiskHygiene {
         var scanned = 0
         var truncated = false
         var depthTruncated = false
-        /// relative path → subtree bytes, for every directory descended into.
         var directoryBytes: [String: Int64] = [:]
         var fileBytes: [String: Int64] = [:]
-        /// Relative paths of directories holding an over-threshold descendant,
-        /// so only the deepest offender in a branch is reported.
+        /// Descendant tracking suppresses duplicate ancestors of the deepest offender.
         var hasOffendingChild: Set<String> = []
 
-        /// Returns the bytes `dir`'s subtree contributed.
         @discardableResult
         func walk(_ dir: URL, depth: Int) -> Int64 {
             var subtree: Int64 = 0
@@ -458,9 +421,7 @@ public enum DataRootDiskHygiene {
                     if depth < maxDepth {
                         subtree += walk(entry, depth: depth + 1)
                     } else {
-                        // A real directory sat past the depth bound — its files
-                        // are UNSCANNED, so flag it rather than silently
-                        // undercounting and reading as a clean bill.
+                        // Unvisited directories make accounting incomplete, never a clean bill.
                         depthTruncated = true
                     }
                     continue
@@ -503,9 +464,7 @@ public enum DataRootDiskHygiene {
         let directoryOffenders = directoryBytes
             .filter { rel, bytes in
                 (bytes > directoryThreshold && !hasOffendingChild.contains(rel))
-                    // Residue is reported whatever it weighs, and reported at
-                    // the residue root rather than at whichever descendant
-                    // happens to be fattest.
+                    // Residue is actionable at any size and belongs to one finding at its root.
                     || isResidue(relativePath: rel)
             }
             .filter { rel, _ in
@@ -529,16 +488,13 @@ public enum DataRootDiskHygiene {
         )
     }
 
-    /// True when `relativePath` IS a residue store's root. Case folded because
-    /// APFS is typically case-insensitive, so `Extras/HF_Cache` addresses the
-    /// same directory as `extras/hf_cache`.
+    /// Fold case because typical APFS volumes address differently cased paths as the same directory.
     public static func isResidue(relativePath: String) -> Bool {
         let normalized = relativePath.lowercased()
         return residueRelativePrefixes.contains { $0.lowercased() == normalized }
     }
 
-    /// True when `relativePath` sits strictly UNDER a residue store's root — so
-    /// the branch is reported once, at the root, instead of once per level.
+    /// Suppress descendants so each residue store is reported once at its root.
     static func isResidueDescendant(relativePath: String) -> Bool {
         let normalized = relativePath.lowercased()
         return residueRelativePrefixes.contains {
@@ -546,8 +502,7 @@ public enum DataRootDiskHygiene {
         }
     }
 
-    /// `entry`'s path relative to `root`, falling back to the last path
-    /// component when it is not under `root` (never leaks the absolute path).
+    /// Keep paths relative or basename-only so notifications never expose the absolute path.
     static func relativePath(of entry: URL, under root: URL) -> String {
         NativeAgentWorkspaceRoot.relativePath(entry.standardizedFileURL.path, under: root.standardizedFileURL.path)
             ?? entry.lastPathComponent
@@ -558,7 +513,6 @@ public enum DataRootDiskHygiene {
     /// Unused HuggingFace storage is reported at any size and may be trashed by cleanup.
     public static let residueRelativePrefixes = ["extras/hf_cache"]
 
-    /// A human-readable byte size (e.g. "194.0 MB").
     public static func humanSize(_ bytes: Int64) -> String {
         let units = ["B", "KB", "MB", "GB", "TB"]
         var value = Double(bytes)
@@ -571,19 +525,12 @@ public enum DataRootDiskHygiene {
     }
 }
 
-/// Once-per-day disk accounting. Walks `dataRoot`, and when a single file
-/// is oversized or the whole tree is over budget, files ONE notification-inbox
-/// card listing the offenders. NEVER deletes anything.
-///
-/// The owning factory wires the inbox write to the same
-/// `notifications/inbox.jsonl` upsert path HeartbeatLoop uses. The daily
-/// reservation runs through the shared `reserveOncePerPeriod` primitive so a
-/// BGTask wake and the in-app scheduler cannot double-run it the same day.
-/// Startup reconciles immediately; the persisted day books the next local
-/// midnight. Only an unreserved day retains the hourly failure retry.
+/// Accounting never deletes; only the saved cleanup action may reclaim storage.
+/// Shared daily reservation prevents BGTask and in-app drivers from duplicating a scan.
+/// The persisted day books local midnight; an unreserved day keeps the hourly failure retry.
 public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
     public let loopId: String = "data_root_disk_hygiene"
-    public let interval: TimeInterval
+    public let wake: OrganWake
     public var tickTimeoutOverride: TimeInterval? { 120 }
 
     private let dataRoot: URL
@@ -606,7 +553,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
         fileNotice: @escaping @Sendable (DiskHygieneReport) async -> Bool
     ) {
         self.directoryThreshold = directoryThreshold
-        self.interval = interval
+        self.wake = .every(interval)
         self.dataRoot = dataRoot
         self.clock = clock
         self.maxDepth = maxDepth
@@ -615,8 +562,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
         self.fileNotice = fileNotice
     }
 
-    /// Day bucket (yyyy-MM-dd) used as the reservation key so the scan runs
-    /// at most once per calendar day across every driver.
+    /// Calendar-day keys prevent duplicate accounting across every driver.
     static func dayKey(_ date: Date) -> String {
         NativeTimestampFormat.calendarDay(date)
     }
@@ -639,8 +585,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
 
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
         guard (try? String(contentsOf: marker, encoding: .utf8)) == Self.dayKey(now) else {
-            // Preserve the existing hourly retry while today's scan/notice
-            // remains unreserved, without waking hourly after it succeeds.
+            // Retry hourly only while the day remains unreserved.
             return now.addingTimeInterval(60 * 60)
         }
         let calendar = Calendar.current
@@ -671,10 +616,7 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
             totalThreshold: totalThreshold,
             directoryThreshold: directoryThreshold
         )
-        // Only a failed read can change by trying again. A bound reached is the
-        // same tomorrow (10-29/30: her chess venv sat past the depth bound and
-        // this re-scanned the whole data root every tick for two days), so the
-        // day is consumed and what was found still counts.
+        // A bound is not a transient read failure: consume the day and retain the partial findings.
         guard !report.readFailed else {
             await rollback()
             return .failed(error: "Disk accounting incomplete; prior notice preserved and day not consumed. "

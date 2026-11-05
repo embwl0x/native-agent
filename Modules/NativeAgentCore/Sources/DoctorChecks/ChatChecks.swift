@@ -7,9 +7,9 @@ import PersistenceCore
 import Transcripts
 import NativeAgentShared
 import ChatSessionWork
-// Blueprint: | `ChatChecks.swift` | ChatSessionsCheck uses ChatSession.init(row:); ChatMessagesIntegrityCheck uses SessionHistoryReader's full checked history without mutation; ChatMessagesScanCache memoizes canonical-path fingerprints and scan counts |
+// Blueprint: | `ChatChecks.swift` | Checked ChatSession/SessionHistoryReader reads; ChatMessagesScanCache memoizes path fingerprints |
 
-/// Read the canonical index without mutation: absence is a new index; unreadable or malformed rows fail.
+/// Missing indexes may bootstrap; unreadable or malformed rows cannot be treated as empty.
 public struct ChatSessionsCheck: DoctorCheck {
     public let id: String = "chat_sessions"
     public let title: String = "Persistent Chat Sessions"
@@ -53,7 +53,7 @@ public struct ChatSessionsCheck: DoctorCheck {
     }
 }
 
-/// Process-wide canonical-path scan memo; matching fingerprints reuse counts, while each run recomputes its verdict.
+/// Reuse counts only for matching canonical-path fingerprints; recompute each run's verdict.
 actor ChatMessagesScanCache {
     struct Entry: Sendable, Equatable {
         let stamp: SnapshotTailOpLog.FileStamp
@@ -84,7 +84,6 @@ public struct ChatMessagesIntegrityCheck: DoctorCheck {
     public let title: String = "Chat Message Logs"
     private let root: URL
 
-    /// Process-wide fingerprint memo.
     static let sharedScanCache = ChatMessagesScanCache()
 
     /// Resolve symlinks for shared memo identity and directory-scoped eviction.
@@ -189,7 +188,10 @@ public struct ChatMessagesIntegrityCheck: DoctorCheck {
                 harm: "Parts of saved conversations cannot be read.",
                 repair: nil,
                 human_action: malformedLines == 0 ? malformedFiles.first.map { ToolFailureError.fileRepairInstruction($0,
-                    shape: "This transcript holds one saved chat message JSON object per line, retaining the original message identities, roles, content and ordering.") } : nil)
+                    shape: """
+                        This transcript holds one saved chat message JSON object per line, retaining the original message identities, roles, content \
+                        and ordering.
+                        """) } : nil)
         }
         return CheckResult(source: "chat/messages/",
             id: id,

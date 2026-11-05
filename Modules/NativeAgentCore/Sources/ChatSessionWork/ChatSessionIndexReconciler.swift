@@ -7,18 +7,12 @@ import Transcripts
 import TurnTrace
 // Blueprint: | `ChatSessionIndexReconciler.swift` | `ChatSessionIndexReconciler` actor; `reconcile` selects repairs and commits through ChatSessionIndexFile |
 
-/// Bounded launch repair for the one unavoidable two-file chat commit window:
-/// a transcript row is durable before `sessions.json` is synchronized. This
-/// reconciler never rewrites transcript bytes and refuses to operate when the
-/// shared index itself is damaged.
+/// Repair the two-file commit window without rewriting transcript bytes; a damaged shared index refuses repair.
 public struct ChatSessionIndexReconciliationReport: Sendable, Equatable {
     public var transcriptsExamined = 0
     public var sessionsRecovered = 0
     public var corruptTranscripts = 0
     public var skippedForBounds = 0
-    /// Rows that survived the crash but described the transcript wrongly —
-    /// stale `messageCount`, `lastMessagePreview`, or `updatedAt` — and were
-    /// rewritten from the transcript. See the stale-row pass in `reconcile`.
     public var staleRowsRepaired = 0
 
     public init() {}
@@ -33,18 +27,13 @@ public actor ChatSessionIndexReconciler {
         self.dataRoot = dataRoot
     }
 
-    /// Legacy human-readable reconciliation time. Exact version identity is
-    /// shared with transcript writers and retention through ChatSessionIndexFile.
+    /// Share exact version identity with transcript writers and retention through ChatSessionIndexFile.
     static let transcriptStampKey = "reconciledTranscriptModifiedAt"
 
-    /// Wall-clock ceiling on the stale pass's transcript reads. Contended
-    /// transcript locks are skipped immediately; stop selecting further reads
-    /// after this long and leave the rest to the next launch.
+    /// Skip contended transcripts and bound stale reads so launch repair cannot block live work.
     static let staleReadCeiling: TimeInterval = 5
 
-    /// A row the stat gate tripped, picked under the index lock and read after
-    /// it is released. `updatedAt`/`stamp` are the values the selection was
-    /// made from, re-checked before the repair is written.
+    /// Recheck selected updatedAt/stamp values before writing a repair computed outside the index lock.
     private struct StaleCandidate: Sendable {
         let sessionID: String
         let url: URL
@@ -65,7 +54,6 @@ public actor ChatSessionIndexReconciler {
         let lastSpokenStamp: String?
     }
 
-    /// A transcript row's own stamp (`TranscriptRowStamp`), for the preview taken from it.
     private nonisolated static func stamp(_ row: [String: JSONValue]?) -> TranscriptRowStamp {
         let metadata: [String: JSONValue] = if case .object(let value)? = row?["metadata"] { value } else { [:] }
         return TranscriptRowStamp.of(id: string(row?["id"]) ?? "", role: string(row?["role"])?.lowercased() ?? "",
@@ -92,8 +80,7 @@ public actor ChatSessionIndexReconciler {
         let messagesDirectory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
         guard FileManager.default.fileExists(atPath: messagesDirectory.path) else { return .init() }
 
-        // Select missing and stale rows under the index lock using metadata only.
-        // Transcript locks and parsing belong outside this shared critical section.
+        // Select by metadata under the index lock; acquire transcript locks and parse outside it.
         let selection = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> SelectionPass in
             var report = ChatSessionIndexReconciliationReport()
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
@@ -111,15 +98,8 @@ public actor ChatSessionIndexReconciler {
                 options: [.skipsHiddenFiles]
             ).filter { $0.pathExtension == "jsonl" }
 
-            // This is a missing-index-row repair, not a transcript health
-            // audit. A transcript whose normalized filename already has a
-            // canonical index row cannot change the result below: the old
-            // implementation still locked, read, JSON-parsed, and validated
-            // every such file on every launch before reaching the final
-            // `knownIDs` guard. On a healthy long-lived root that meant all
-            // historical active transcripts and no repair. Keep invalid names
-            // visible as corruption candidates, but remove known transcripts
-            // before applying the bounded recovery budget.
+            // Exclude indexed transcripts before the bounded recovery budget so healthy history cannot starve orphan repair.
+            // Keep invalid filenames visible as corruption candidates.
             let candidates = directoryEntries.filter { transcript in
                 let raw = transcript.deletingPathExtension().lastPathComponent
                 guard NativeAgentChatSessionID.normalizedPathComponent(raw) == raw else {
@@ -127,9 +107,7 @@ public actor ChatSessionIndexReconciler {
                 }
                 return !knownIDs.contains(raw)
             }.sorted { lhs, rhs in
-                // Valid orphan IDs are the repair target. Examine them before
-                // invalid filenames so a pile of damaged names cannot starve a
-                // recoverable session under the file bound.
+                // Prioritize valid orphan IDs so damaged filenames cannot starve recoverable sessions.
                 func priority(_ url: URL) -> Int {
                     let raw = url.deletingPathExtension().lastPathComponent
                     return NativeAgentChatSessionID.normalizedPathComponent(raw) == raw ? 0 : 1
@@ -144,7 +122,7 @@ public actor ChatSessionIndexReconciler {
             let boundedCandidates = candidates.prefix(fileLimit)
             report.skippedForBounds += max(0, candidates.count - boundedCandidates.count)
 
-            // Bound stale-row reads by exact transcript version so orphan recovery cannot starve.
+            // Bound stale reads by exact transcript version so orphan recovery cannot starve.
             var staleCandidates: [StaleCandidate] = []
             var staleRepairBudget = max(0, maximumStaleRepairs)
             if staleRepairBudget > 0 {
@@ -168,7 +146,6 @@ public actor ChatSessionIndexReconciler {
                           row[ChatSessionIndexFile.acknowledgedTranscriptKey] != version
                               || row[TranscriptRowStamp.previewKey] == nil else { continue }
                     guard staleRepairBudget > 0 else {
-                        // Left for the next launch. The gate cost one stat.
                         report.skippedForBounds += 1
                         continue
                     }
@@ -195,8 +172,7 @@ public actor ChatSessionIndexReconciler {
 
         var report = selection.report
 
-        // Read orphan transcripts with the shared index lock released. A busy
-        // transcript is skipped; all other candidates can still be recovered.
+        // Release the index lock for transcript reads; a busy transcript cannot block its siblings' recovery.
         var consumedBytes: Int64 = 0
         var recovered: [[String: JSONValue]] = []
         for transcript in selection.orphans {
@@ -245,7 +221,7 @@ public actor ChatSessionIndexReconciler {
             let firstUserContent = objectRows.first(where: {
                 Self.string($0["role"])?.lowercased() == "user"
             }).flatMap { Self.content($0) }
-            // Session origin belongs to the first surface-authored row, excluding compaction system rows.
+            // Session origin comes from the first surface-authored row, excluding system rows.
             let creation = objectRows.first(where: { row in
                 guard Self.string(row["source"]) != nil else { return false }
                 return Self.string(row["role"])?.lowercased() != "system"
@@ -276,10 +252,7 @@ public actor ChatSessionIndexReconciler {
             recoveredRow[ChatSessionIndexFile.transcriptGenerationKey] = .int(1)
             recovered.append(recoveredRow)
         }
-        // PASS 2 — index lock RELEASED. Each tripped transcript is read under
-        // its own lock only, and the pass stops looking once the ceiling is
-        // reached; launch repair never gets to be the reason a live append
-        // waits.
+        // Read each transcript under its own lock with a bounded deadline so launch repair cannot hold up live appends.
         var repairs: [StaleRepair] = []
         let deadline = Date().addingTimeInterval(Self.staleReadCeiling)
         for (offset, candidate) in selection.candidates.enumerated() {
@@ -293,7 +266,7 @@ public actor ChatSessionIndexReconciler {
                 continue
             }
             let remainingBytes = maximumBytes - consumedBytes
-            // Measure and charge transcript bytes under the same lock as the read.
+            // Measure transcript bytes under the read's lock so the charged size matches the evidence.
             guard let read = try await Self.readTranscript(candidate.url, sessionID: candidate.sessionID,
                                                           maximumBytes: remainingBytes) else {
                 report.skippedForBounds += 1
@@ -301,11 +274,9 @@ public actor ChatSessionIndexReconciler {
             }
             consumedBytes += read.bytes
 
-            // Stale repairs require the same trusted transcript rows as orphan recovery.
+            // Stale and orphan repairs require the same trusted transcript shape.
             guard let objectRows = read.rows, !objectRows.isEmpty else {
-                // Damaged transcripts stay visible and unstamped: this pass
-                // repairs an index row from a transcript it trusts, and never
-                // the other way round.
+                // Leave damaged transcripts unstamped; repair the index only from trusted transcript evidence.
                 report.corruptTranscripts += 1
                 continue
             }
@@ -317,11 +288,9 @@ public actor ChatSessionIndexReconciler {
         let pendingRepairs = repairs
         let pendingRecovered = recovered
 
-        // PASS 3 — the index lock again, briefly, for the writes only.
         let writes = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> (recovered: Int, repaired: Int) in
             var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-            // An archive may have committed while transcript reads were outside
-            // the index lock. Its durable claim wins over orphan recovery.
+            // A concurrent archive's durable claim takes precedence over orphan recovery.
             let archivedIDs = try Self.archivedSessionIDs(dataRoot: self.dataRoot)
             var positions: [String: Int] = [:]
             for (offset, row) in rows.enumerated() {
@@ -356,11 +325,7 @@ public actor ChatSessionIndexReconciler {
                     row[TranscriptRowStamp.previewKey] = previewStamp
                     disagreed = true
                 }
-                // `updatedAt` orders the sidebar, so it only ever moves
-                // FORWARD here. Compaction PREPENDS its summary row and keeps
-                // an older tail, so a transcript's last row can be older than
-                // the row that describes it; that is not a reason to send the
-                // conversation down the list.
+                // Advance updatedAt only: an older appended row must not lower sidebar ordering.
                 if let lastStamp = read.lastSpokenStamp,
                    let lastDate = Self.date(lastStamp),
                    let rowDate = Self.date(Self.string(row["updatedAt"])),
@@ -378,8 +343,7 @@ public actor ChatSessionIndexReconciler {
                 wroteRow = true
                 if disagreed { repaired += 1 }
             }
-            // A live writer may have created an orphan's index row during the read.
-            // Its row wins; never replace it with the launch snapshot.
+            // A concurrent writer's index row takes precedence over the launch snapshot.
             let insertions = pendingRecovered.filter {
                 guard let id = Self.string($0["id"]) else { return false }
                 return positions[id] == nil && !archivedIDs.contains(id)
@@ -397,9 +361,7 @@ public actor ChatSessionIndexReconciler {
         return report
     }
 
-    /// Manual archives retain transcript bytes. Those files are intentionally
-    /// absent from the hot index, not lost rows to recover at the next launch.
-    /// Called under the shared session-index lock used by archive writers.
+    /// Archived transcripts remain on disk intentionally; their absence from the hot index must not trigger orphan recovery.
     private nonisolated static func archivedSessionIDs(dataRoot: URL) throws -> Set<String> {
         Set(try ChatSessionRetention.archiveIndexRows(dataRoot: dataRoot).compactMap { row in
             guard case .string(let id)? = row["id"] else { return nil }
@@ -407,8 +369,7 @@ public actor ChatSessionIndexReconciler {
         })
     }
 
-    /// Launch repair skips busy transcripts without queuing behind a writer.
-    /// Size, validation and preview all describe the same locked read.
+    /// Skip busy transcripts; size, validation and preview must describe the same locked read.
     private nonisolated static func readTranscript(
         _ transcript: URL, sessionID: String, maximumBytes: Int64
     ) async throws -> StaleRead? {
@@ -444,10 +405,7 @@ public actor ChatSessionIndexReconciler {
         }
     }
 
-    /// The shape both passes demand of a transcript before an index row is
-    /// written from it: every physical line a JSON object, every object
-    /// carrying string `role` and `content`, and no object claiming a
-    /// different session.
+    /// Repair only from JSON-object rows with string role/content and no conflicting session identity.
     private nonisolated static func rowsAreTrustworthy(
         _ objectRows: [[String: JSONValue]],
         parsedRowCount: Int,

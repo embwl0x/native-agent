@@ -1,36 +1,6 @@
 import ChatToolParsing
-// SwiftToolDispatcher+InnerStateTools.swift
-// The `inner_state` pull: read the recorded state before speaking about it.
-//
-// This is the tool that gives her something to read. It returns her own organs'
-// record: the felt fingerprint and its object, the mood integral and the
-// disposition undertone as words AND numbers, the window's felt nodes as
-// labelled points, the body's chemistry in the body line's own vocabulary,
-// what she is still waiting on, what the night left, and her cares.
-//
-// ── PAYLOAD-FREE, BY CONSTRUCTION ────────────────────────────────────────────
-// The reading itself (CognitiveSubstrate+InnerState.swift) is where the
-// discipline lives: labels and numbers, never node summaries, never the user's
-// words. This file only renders it. Anything that is not in the reading cannot
-// appear here, which is why the renderer is dumb on purpose.
-//
-// Her own prose crosses through her cares. This is
-// her own pull, and a record of her thinking with her thoughts removed is not a
-// record. But "hers" is a claim about PROVENANCE, not about content: her cares
-// may come from material that passed through a conversation, so their words run
-// through the SAME three filters the chat path already trusts before anything
-// is rendered (`innerStateSafeText`):
-//
-//   1. `ToolCallParser.stripToolUseMarkers`, then `neutralizeToolUseMarkers` —
-//      no tool-call syntax can ride back in as text and be re-parsed as a call.
-//      The stripper deletes the two attribute forms the tool loop emits; the
-//      neutralizer catches the bare `<tool_use>{…}</tool_use>` a hand-written
-//      care can carry, keeping her words and breaking the syntax.
-//   2. `ChatSecretRedactor.redactText` — the shared credential patterns,
-//      digest-bearing secret contract every durable local surface uses.
-//   3. `promptSafeCapabilityText` — the shipped prompt-injection marker scan,
-//      which also collapses whitespace and enforces the bound.
-//
+// The reading owns payload exclusion: labels and numbers cannot expose node summaries or user words. Care prose has provenance, not inherent trust: strip and
+// neutralize tool markers, redact secrets, then scan and bound. That order prevents hidden calls and truncation from disguising secrets.
 import CognitiveSubstrate
 import Foundation
 import NativeAgentCore
@@ -38,9 +8,7 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `SwiftToolDispatcher+InnerStateTools.swift` | `SwiftToolDispatcher`: `impl_inner_state`, `innerStateRawWindowHours`, `innerStateWindowHours` |
 
-/// The live mind, answering for itself. Implemented by the app's cognition
-/// runtime, which is the only object that owns both the substrate (mind) and
-/// the organism kernel (body).
+/// The cognition runtime owns both substrate and organism; only it can supply a live reading.
 public protocol InnerStateProviding: Sendable {
     func innerStateReading(
         windowHours: Double,
@@ -58,8 +26,7 @@ extension SwiftToolDispatcher {
 
         guard let observer = providerLifecycleObserver,
               let mind = observer as? any InnerStateProviding else {
-            // NORTHSTAR clause 2: no live body means no reading. Say it; do not
-            // return a shaped zero that reads like a mood.
+            // Without a live body, a shaped zero would falsely read as a mood.
             return .object([
                 "status": .string("unavailable"),
                 "available": .bool(false),
@@ -87,8 +54,7 @@ extension SwiftToolDispatcher {
     }
 
 
-    /// 1–168, default 6. Out-of-range values CLAMP rather than fail — she asked
-    /// about her own week, not about a parameter.
+    /// Clamp to 1–168 hours (default 6) so the requested week remains readable.
     static func innerStateWindowHours(_ input: [String: JSONValue]) -> Double {
         guard let raw = Self.innerStateRawWindowHours(input) else {
             return CognitiveInnerStateReading.defaultWindowHours
@@ -98,13 +64,8 @@ extension SwiftToolDispatcher {
             max(CognitiveInnerStateReading.minimumWindowHours, raw))
     }
 
-    /// The three filters, composed, in the order the chat path applies them.
-    ///
-    /// Strip FIRST (so a marker split across a redaction can't survive), redact
-    /// SECOND (so a secret is digested before any truncation can cut it into an
-    /// undetectable fragment), scan and bound LAST. Applied to every free-text
-    /// field this tool renders — there are exactly two, and they are the two
-    /// this function is called on.
+    /// Strip markers before redaction can split them; redact secrets before truncation can hide their shape. Scan and bound last, on every free-text field
+    /// rendered here.
     static func innerStateSafeText(_ raw: String, limit: Int) -> String {
         promptSafeCapabilityText(
             ChatSecretRedactor.redactText(
@@ -136,9 +97,7 @@ extension SwiftToolDispatcher {
         return out as String
     }
 
-    /// The renderer. Deliberately mechanical: every value here comes straight
-    /// off the reading, so the payload-free guarantee is enforced in ONE place
-    /// (the reading) and cannot be widened by accident here.
+    /// Render only the owner’s reading so payload exclusion stays enforced at one boundary.
     static func innerStateJSON(
         _ reading: CognitiveInnerStateReading,
         requestedWindowHours: Double? = nil
@@ -190,8 +149,7 @@ extension SwiftToolDispatcher {
                     // Age beside the timestamp distinguishes past moments from the present.
                     "age_hours": .double(
                         (reading.generatedAt.timeIntervalSince(node.when) / 3600 * 10).rounded() / 10),
-                    // Which list it came from: `felt` = among the window's
-                    // strongest, `recent` = among the newest. Different claims.
+                    // Which list it came from: `felt` = among the window's strongest, `recent` = among the newest. Different claims.
                     "selection": .string(node.selection.rawValue),
                     "subject": .string(node.subject),
                     "valence": .double(node.valence),
@@ -206,13 +164,11 @@ extension SwiftToolDispatcher {
                     "valence_sign": .int(Int64(expectation.valenceSign)),
                 ])
             }),
-            "his_day": .object([
+            "person_day": .object([
                 "title": reading.personDayTitle.map { .string(innerStateSafeText($0, limit: 160)) } ?? .null,
                 "claims": .array(reading.personDay.map { .string(innerStateSafeText($0, limit: 400)) }),
             ]),
-            // `toward` — the forward-facing register (#4). A label, a sign, a
-            // date. Absent when she is facing nothing, which renders as null
-            // rather than as a flat "nothing planned".
+            // An absent forward-facing stance renders as null, never an invented "nothing planned" verdict.
             "toward": reading.toward.map { toward in
                 .object([
                     "label": .string(toward.label),
@@ -223,8 +179,6 @@ extension SwiftToolDispatcher {
                 ])
             } ?? .null,
         ]
-        // What she cares about, most charged first: her words, its depth,
-        // whom it is held with, the newest feeling and the gap still open.
         out["cares"] = .array(reading.cares.map { care in
             .object([
                 "id": .string(care.id.uuidString),
@@ -244,7 +198,7 @@ extension SwiftToolDispatcher {
                 ? ["No changes recorded in the last 7 days."]
                 : reading.growthWeek
             out["growth_week"] = .array(lines.map(JSONValue.string))
-            // The raw care history stays distinct from her own telling of it.
+            // The raw care history stays distinct from the agent's own telling of it.
             out["care_history"] = .array(reading.story.map { .string(innerStateSafeText($0, limit: 400)) })
         }
         let knowledge = reading.selfKnowledge
@@ -277,12 +231,7 @@ extension SwiftToolDispatcher {
         return .object(out)
     }
 
-    /// The window, said out loud: what was asked for, what was used, and — only
-    /// when they differ — one line naming the cap that made the difference.
-    ///
-    /// `window_hours` keeps its meaning (the window ACTUALLY used) so every
-    /// existing reader is unchanged; the two new keys are what turn a silent
-    /// clamp into a stated one.
+    /// Disclose the requested and applied windows when clamping; window_hours always means the applied window.
     static func innerStateWindowFields(
         requested: Double?, applied: Double
     ) -> [String: JSONValue] {

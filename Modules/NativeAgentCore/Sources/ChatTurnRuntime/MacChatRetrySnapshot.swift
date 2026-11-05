@@ -14,9 +14,7 @@ public protocol MacChatRetryMessage {
     var retryOrigin: ChatMessageOrigin? { get }
 }
 
-/// Immutable evidence that a retry still targets the same transcript tail.
-/// The provider call is intentionally admitted only after both the local
-/// projection and the canonical transcript still match this snapshot.
+/// Admit retry only after both the rendered projection and canonical tail still match this immutable snapshot.
 public struct MacChatRetrySnapshot: Equatable, Sendable {
     public let sessionId: String
     public let assistantMessageId: String

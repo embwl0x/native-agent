@@ -6,17 +6,10 @@ import AuthoredCapabilities
 import Experiences
 import NativeAgentCore
 import TrustCenter
-// Blueprint: | `ApprovalRecord.swift` | `ApprovalRecord`, `ApprovalFilter`, `ApprovalDecision` and `ApprovalResolutionProvenance`; approval presentation including displaced REM content from the retained payload (old cards: not recorded), strict current stored-record decoding and nullable-versus-omitted wire fields; typed decision origin without queue authority |
+import Privacy
+// Blueprint: | `ApprovalRecord.swift` | Approval substance, checked origin doors and the one decision face; resolution provenance remains authority |
 
-/// One record in the autonomy approval queue. Preserves the stable
-/// `create_approval_request` shape plus NativeAgent's durable typed resolution
-/// provenance.
-///
-/// Timestamps are ISO-8601 strings. The `decision`, `resolvedAt`, `decidedBy`,
-/// and `resolutionProvenance` fields stay nil until the request is resolved.
-///
-/// `executedAction` preserves the domain's outcome. `detail` is its shared
-/// decision face. Unlike the nullable decision, both are omitted when nil.
+/// Timestamps are ISO-8601; decision fields stay nil until resolution.
 public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var id: String
     public var title: String
@@ -24,10 +17,9 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var risk: String
     public var reason: String
     public var status: String            // "pending" | "resolved" | "denied" | "canceled" | "orphaned"
-    public var payload: JSONValue        // arbitrary JSON dict
+    public var payload: JSONValue
     private var recordedPayloadPreview: String
-    /// Render from the retained proposal payload, including old cards. Never
-    /// rewrite history merely to add missing-history wording to its display.
+    /// Render retained history without rewriting it to add missing-history wording.
     public var payloadPreview: String {
         get {
             guard action == "rem.proposal" else { return recordedPayloadPreview }
@@ -45,9 +37,9 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         }
         set { recordedPayloadPreview = newValue }
     }
-    public var createdAt: String         // ISO-8601
+    public var createdAt: String
     /// When an identical pending request was last re-asked; nil until its first repeat.
-    public var lastRequestedAt: String?  // ISO-8601 or nil
+    public var lastRequestedAt: String?
 
     /// Shows the reason or owner-review preview, never serialized payload; surfaces apply redaction.
     public var readableAsk: String {
@@ -56,9 +48,9 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         guard SwiftNativeApprovalInbox.ownerReviewActions.contains(action) else { return "" }
         return payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    public var resolvedAt: String?       // ISO-8601 or nil
-    public var decision: String?         // "approved" | "denied" | "canceled" | nil
-    public var decidedBy: String?        // durable human/system decision attribution
+    public var resolvedAt: String?
+    public var decision: String?
+    public var decidedBy: String?
     public var resolutionProvenance: ApprovalResolutionProvenance?
     public var remoteResolvable: Bool
     public var localOnly: Bool
@@ -74,12 +66,14 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         guard let executedAction else { return .unknown }
         guard case .object(let execution) = executedAction,
               execution["op"] == .string("chat_tool_approval_replay") else {
-            return ChatToolOutcome.exactResultClass(executedAction)
+            let reply = ToolResult(executedAction)
+            return reply.outcome
         }
         if case .string(let raw)? = execution["resultClass"],
            let result = ChatToolOutcome.ExactResultClass(rawValue: raw) { return result }
         guard let status = execution["status"] else { return .unknown }
-        return ChatToolOutcome.exactResultClass(.object(["status": status]))
+        let reply = ToolResult(.object(["status": status]))
+        return reply.outcome
     }
 
     public var executionIsStopped: Bool {
@@ -87,10 +81,60 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         return execution["status"] == .string("stopped")
     }
 
-    /// The inbox owns the decision. Every reader gets this same expression,
-    /// including old rows whose execution sentence contradicted their receipt.
+    public var matter: Matter {
+        Matter(id: id, form: .ask, from: "approval", title: NativeAppSecretRedactor.redactText(title),
+               summary: NativeAppSecretRedactor.redactText(readableAsk), words: NativeAppSecretRedactor.redactText(payloadPreview),
+               symbol: "checkmark.shield.fill", badge: "APPROVAL", open: "approval:" + id,
+               choices: payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? []
+                   : [.init(id: "approve", label: "Approve", role: .primary), .init(id: "reject", label: "Reject", role: .destructive)],
+               evidence: [.init(source: Matter.approvals, id: id)])
+    }
+
+    public struct PersonOrigin: Sendable {
+        public let thread: Door?
+        public let session: String?
+    }
+
+    /// Only the two live chat filers write this origin; malformed routes remain a named read failure.
+    public var personOrigin: PersonOrigin? {
+        get throws {
+            guard let fields = payload.objectValue,
+                  fields["kind"] == .string("chat_tool_approval") || fields["kind"] == .string("agent_acp_live_approval"),
+                  let value = fields["origin"] else { return nil }
+            guard let origin = value.objectValue, let surface = origin["surface"]?.stringValue else {
+                throw ApprovalInboxError.malformedResponse("approval \(id) has an unreadable origin")
+            }
+            func text(_ key: String) throws -> String? {
+                guard let value = origin[key], value != .null else { return nil }
+                guard let raw = value.stringValue else {
+                    throw ApprovalInboxError.malformedResponse("approval \(id) has an unreadable origin \(key)")
+                }
+                let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                return clean.isEmpty ? nil : clean
+            }
+            switch surface {
+            case "telegram", "slack":
+                // A surface without a destination names no thread; the person's known phone and Mac doors still belong to the ask.
+                guard let destination = try text("destinationId") else { return PersonOrigin(thread: nil, session: nil) }
+                let thread = try text("threadId")
+                return PersonOrigin(thread: surface == "telegram" ? .telegram(chat: destination, thread: thread)
+                                    : .slack(channel: destination, thread: thread), session: nil)
+            case "chat", "app", "ios": return PersonOrigin(thread: nil, session: try text("sessionId"))
+            default: return nil
+            }
+        }
+    }
+
+    public var personDoors: [Door] {
+        get throws {
+            let origin = try personOrigin
+            return Door.person(thread: origin?.thread) + (origin?.session.map { [Door.conversation($0)] } ?? [])
+        }
+    }
+
+    /// Every reader uses the inbox decision independently of execution attribution.
     public var decisionExperience: Experience {
-        let ref = Experience.Ref(source: "workflows/approvals/requests.json", id: id)
+        let ref = Experience.Ref(source: Matter.approvals, id: id)
         var obligation = Experience.Obligation(to: "person")
         if decision != nil {
             obligation.phase = .accepted
@@ -116,23 +160,24 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
             words = [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
                 .compactMap { $0 }.joined(separator: " ")
         } else {
-            words = executionDetail ?? decision.map { "\(action): \($0)." } ?? readableAsk
+            words = executionDetail ?? decision.map { "\(action): \($0)." } ?? payloadPreview
         }
-        // Permission is not adoption. This receipt is written only after the
-        // application completes; false means the lesson was already present.
+        // Approval is not adoption; only completed application writes this receipt.
         let applied: Bool
+        let reply = ToolResult(.object(fields))
         if action == "rem.proposal", decision == "approved",
            fields["op"] == .string("rem_proposal_approve"), case .bool? = fields["growthAppended"],
-           !ChatToolOutcome.carriesFailureEvidence(.object(fields)) { applied = true } else { applied = false }
+           !reply.carriesFailureEvidence { applied = true } else { applied = false }
+        let row = PartFace.Row(id: id, title: matter.title, detail: matter.summary, value: matter.badge, at: createdAt,
+                               symbol: matter.symbol, tone: .attention, open: matter.open, actions: matter.choices)
         return Experience(id: id, kind: .decision, cause: cause.map { [$0] } ?? [], evidence: [ref],
                           outcome: decision.map { .init(domain: "approvals", status: $0, at: resolvedAt) },
-                          face: .init(words: words, artifacts: []), addressedTo: ["person"],
+                          face: .init(words: NativeAppSecretRedactor.redactText(words), artifacts: [], row: row, from: "approval"),
+                          addressedTo: [ForPerson.person],
                           owes: ["decide": obligation],
                           claims: applied ? [.init(claim: "applied", evidence: [ref])] : [])
     }
-    /// Who approved, in words, with the time: "you, in the Mac app, 18:22".
-    /// A person's channel says "you" (her receipts address the person); any
-    /// other decider is named by its own label.
+    /// Receipts address the person as "you" and name other deciders by their own labels.
     public var approvedBy: String? {
         guard decision == "approved",
               let provenance = resolutionProvenance ?? decidedBy.map(ApprovalResolutionProvenance.local) else { return nil }
@@ -148,8 +193,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         return "\(who), \(clock.string(from: at))"
     }
     public var chatContinuation: JSONValue? = nil
-    /// The inline conversation card: `{sessionId, telegramChatId?, at}`.
-    /// Display binding only; set once, so a request never posts two cards.
+    /// The inline conversation card: `{sessionId, telegramChatId?, at}`. Display binding only; set once, so a request never posts two cards.
     public var chatCard: JSONValue? = nil
 
     public init(
@@ -194,15 +238,11 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
 }
 
 extension ApprovalRecord {
-    /// The conversation that asked, for a chat tool approval: the filer
-    /// (`NativeAgentChatApprovalFiler`) records it as `payload.origin.sessionId`.
-    /// Only chat approvals carry a chat origin — every other kind is nil rather
-    /// than borrowing a lookalike field.
+    /// Only the chat approval filer supplies an origin; other kinds must not borrow lookalike fields.
     public var chatOriginSessionId: String? {
         guard case .object(let fields) = payload,
               case .string(let kind)? = fields["kind"],
-              // ACP questions belong to a live protocol request, not a tool
-              // replay. They share chat presentation only, never execution.
+              // ACP questions belong to a live protocol request, not a tool replay. They share chat presentation only, never execution.
               kind == "chat_tool_approval" || kind == "agent_acp_live_approval",
               case .object(let origin)? = fields["origin"],
               case .string(let sessionId)? = origin["sessionId"] else { return nil }
@@ -210,27 +250,19 @@ extension ApprovalRecord {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// Her own decision, filed here only so she can resolve it with her own
-    /// tool (`studio_canon_resolve`): never a card, note or button for the
-    /// person. The canon filer's action is the marker.
+    /// The canon filer marks agent-owned decisions so person-facing cards cannot decide them.
     public var isAgentsOwnDecision: Bool { action == "studio.canon" }
 
-    /// The conversation this approval's chat card was posted into, if any.
     public var chatCardSessionId: String? {
         guard case .object(let card)? = chatCard, case .string(let id)? = card["sessionId"],
               !id.isEmpty else { return nil }
         return id
     }
 
-    public var chatCardDelivered: Bool {
-        guard case .object(let card)? = chatCard else { return false }
-        return card["delivered"] == .bool(true)
-    }
 }
 
 extension ApprovalRecord {
-    /// Decode the current stored record. Invalid evidence never becomes an
-    /// invented empty field or a changed authority flag.
+    /// Decode the current stored record. Invalid evidence never becomes an invented empty field or a changed authority flag.
     public init?(json: JSONValue) {
         guard case .object(let obj) = json else { return nil }
         guard case .string(let savedID)? = obj["id"], !savedID.isEmpty,
@@ -296,10 +328,7 @@ extension ApprovalRecord {
         self.chatCard = obj["chatCard"]
     }
 
-    /// Serialize nullable decision fields as explicit `null`, not absent.
-    ///
-    /// `executedAction` and `detail` are OMITTED when nil (not written as
-    /// null) — these keys are added after action execution.
+    /// Nullable decision fields are explicit null; execution and detail keys are omitted until present.
     public func toJSON(forStorage: Bool = false) -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
@@ -339,11 +368,8 @@ extension ApprovalRecord {
 }
 
 public struct ApprovalFilter: Sendable, Equatable {
-    /// "pending", "resolved", "denied", "canceled", "orphaned", or nil for all.
     public var status: String?
-    /// If set, only records whose `action` matches — compared through
-    /// `ExecutionEventVocabulary`, so `mission.step` and `execution.step`
-    /// are the same filter.
+    /// If set, only records whose `action` matches, compared through `ExecutionEventVocabulary`.
     public var action: String?
 
     public init(status: String? = nil, action: String? = nil) {
@@ -356,19 +382,13 @@ public struct ApprovalFilter: Sendable, Equatable {
     public static let resolved = ApprovalFilter(status: "resolved")
 }
 
-/// Accepted approval decision values.
 public enum ApprovalDecision: String, Sendable, Equatable {
     case approved
     case denied
     case canceled
 }
 
-/// Typed, durable origin for an approval decision.
-///
-/// Remote cases are deliberately distinct from local decisions so
-/// the inbox can enforce `remoteResolvable` and bind transport identity while
-/// holding the same lock that commits the terminal decision. A caller cannot
-/// safely turn a Telegram or signed-iOS decision into a local string label.
+/// Distinct remote origins let the inbox bind transport authority under its decision-write lock; labels cannot confer it.
 public enum ApprovalResolutionProvenance: Sendable, Equatable {
     case local(decidedBy: String)
     case telegram(chatID: String, userID: String)

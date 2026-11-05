@@ -18,33 +18,45 @@ import TrustPersistence
 // Blueprint: | `AppQuietToolHost.swift` | `AppQuietToolHost`: `inboxFence`, `inbox`, `provider` |
 
 @MainActor final class AppQuietToolHost: AppQuietSettingsHost, QuietToolHost {
-    var activeChatSessionId: String { appModel.activeChatSessionId }
-    func pageRead(_ page: QuietToolPage) async -> [JSONValue] {
-        // The presentation port resolved this value from the same immutable page catalog.
-        await QuietSelfAdminRender.pageRead(for: QuietPages.page(named: page.id)!, appModel: appModel)
+    private let inboxTurn: Turn?
+
+    override init(_ appModel: AppModel) {
+        inboxTurn = nil
+        super.init(appModel)
     }
-    func composerState(sessionId: String) async -> [String: JSONValue] {
-        await QuietComposerCommands.state(appModel: appModel, sessionId: sessionId)
+
+    private init(_ appModel: AppModel, inboxTurn: Turn) {
+        self.inboxTurn = inboxTurn
+        super.init(appModel)
+    }
+
+    var activeChatSessionId: String { appModel.activeChatSessionId }
+    func pageRead(_ page: QuietToolPage, turn: Turn) async -> [JSONValue] {
+        // Use the presentation port's immutable catalog value so the tool host keeps no second page truth.
+        await QuietSelfAdminRender.pageRead(for: QuietPages.page(named: page.id)!, appModel: appModel, turn: turn)
+    }
+    func composerState(sessionId: String, turn: Turn) async -> [String: JSONValue] {
+        await QuietComposerCommands.state(appModel: appModel, sessionId: sessionId, turn: turn)
     }
     func runComposer(
         verb: String, value: String, choice: String, sessionId: String, attachments: [URL], reachesUser: Bool,
-        turnSessionId: String
+        turnSessionId: String, turn: Turn
     ) async -> QuietComposerOutcome {
         await QuietComposerCommands.run(
             verb: verb, value: value, choice: choice, sessionId: sessionId,
-            attachments: attachments, reachesUser: reachesUser, turnSessionId: turnSessionId, appModel: appModel
+            attachments: attachments, reachesUser: reachesUser, turnSessionId: turnSessionId, appModel: appModel, turn: turn
         )
     }
-    func runChatSession(verb: String, input: [String: JSONValue], reachesUser: Bool) async -> JSONValue {
-        await QuietChatSessionCommands.run(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel)
+    func runChatSession(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) async -> JSONValue {
+        await QuietChatSessionCommands.run(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel, turn: turn)
     }
-    func composerFence(verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String)
+    func composerFence(verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String, turn: Turn)
         -> QuietComposerOutcome? {
         QuietComposerCommands.fence(verb: verb, value: value, sessionId: sessionId, reachesUser: reachesUser,
-                                   turnSessionId: turnSessionId, appModel: appModel).refusal
+                                   turnSessionId: turnSessionId, appModel: appModel, turn: turn).refusal
     }
-    func chatSessionFence(verb: String, input: [String: JSONValue], reachesUser: Bool) -> JSONValue? {
-        if case .failure(let refusal) = QuietChatSessionCommands.fence(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel) {
+    func chatSessionFence(verb: String, input: [String: JSONValue], reachesUser: Bool, turn: Turn) -> JSONValue? {
+        if case .failure(let refusal) = QuietChatSessionCommands.fence(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel, turn: turn) {
             return refusal.json
         }
         return nil
@@ -59,19 +71,23 @@ import TrustPersistence
     }
     func upkeepFence(verb: String, input: [String: JSONValue]) async -> JSONValue? {
         guard verb == "backup_restore" else { return nil }
-        if case .failure(let failure) = await AppToolExecutor.quietBackupRestoreTarget(input, dataRoot: appModel.engine.trust.dataRoot) { return failure.refusal }
+        if case .failure(let failure) = await AppToolExecutor.quietBackupRestoreTarget(
+            input,
+            dataRoot: appModel.engine.trust.dataRoot
+        ) { return failure.refusal }
         return nil
     }
-    /// Each verb is the button's own call: Doctor's support report,
-    /// Capabilities' Export, Trust's Back up now, the embedding download row,
-    /// Setup's Release now and the Memories page's upkeep row.
-    func runUpkeep(verb: String, input: [String: JSONValue]) async -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
+    /// Share each page button's own call so tool and UI mutations have one owner.
+    func runUpkeep(verb: String, input: [String: JSONValue], turn: Turn) async -> (ok: Bool, detail: String, fields: [String: JSONValue]) {
         let retry = " Read \(AppToolExecutor.doorDoctor) to see what is wrong, then try again."
         switch verb {
         case "support_report":
             switch await appModel.loadSupportDiagnostics() {
             case .loaded(let report, _):
-                return (true, "Support report: \(report.app) \(report.version), health \(report.doctorStatus ?? "unknown"), made \(report.generatedAt). A file to send the developer: export.bundle {support:true}.",
+                return (true, """
+                    Support report: \(report.app) \(report.version), health \(report.doctorStatus ?? "unknown"), made \(report.generatedAt). A file to send \
+                    the developer: export.bundle {support:true}.
+                    """,
                         ["report": (try? JSONValue.fromEncodable(report)) ?? .null])
             case .unavailable(let detail): return (false, detail, [:])
             }
@@ -108,7 +124,7 @@ import TrustPersistence
             let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.engine.dataRoot)
             if case .indexed = outcome { return (true, outcome.userMessage, [:]) }
             return (false, outcome.agentMessage, [:])
-        // User's two below Full Mac; the door refuses them there.
+        // Below Full Mac, these controls belong to the user; the tool door refuses them.
         case "backup_restore":
             let backup: BackupRecord
             switch await AppToolExecutor.quietBackupRestoreTarget(input, dataRoot: appModel.engine.trust.dataRoot) {
@@ -120,8 +136,8 @@ import TrustPersistence
             case .saved(let detail): message = detail
             case .failed(let detail): return (false, detail + retry, [:])
             }
-            // Awaited: a restore that stages restarts the app once this turn ends.
-            _ = await HarnessDecidedRow.record(requester: "Full Mac", tool: "backup.restore \(backup.id)",
+            // Await staging because a staged restore restarts the app after this turn settles.
+            _ = await HarnessDecidedRow.record(turn: turn, requester: "Full Mac", tool: "backup.restore \(backup.id)",
                                                sessionID: input["__session_id"]?.scalarText,
                                                dataRoot: appModel.engine.dataRoot)
             return (true, message, ["id": .string(backup.id)])
@@ -133,7 +149,7 @@ import TrustPersistence
             case .failed(let message):
                 return (false, message + " Deletion could not be confirmed." + retry, [:])
             }
-            HarnessDecidedRow.post(requester: "Full Mac", tool: "history.clear",
+            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "history.clear",
                                    sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.engine.dataRoot)
             return (true, "Deleted all recorded activity (\(removed) spans). Recording settings are kept, "
@@ -157,19 +173,25 @@ extension AppQuietToolHost: QuietInboxHost {
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord]) {
         (item.isHiddenFromDefaultInbox, item.hasLinkedApproval, item.actions)
     }
-    func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?) async throws {
+    func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?, turn: Turn) async throws {
         try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
-            dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
+            dataRootOverride: dataRootOverride, turn: turn,
+            effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
     }
     func withdrawApproval(id: String, decidedBy: String) async throws {
+        guard let turn = inboxTurn else {
+            throw ToolFailureError("Inbox withdrawal has no invoking turn. Nothing was withdrawn.",
+                effects: .none, owner: "inbox", code: "inbox_turn_unavailable")
+        }
         _ = try await ApprovalExecution.app()
-            .resolveApproval(id: id, decision: "cancel", provenance: .local(decidedBy: decidedBy))
+            .resolveApproval(id: id, decision: "cancel", provenance: .local(decidedBy: decidedBy), turn: turn)
     }
-    func inboxFence(verb: String, input: [String: JSONValue]) async -> JSONValue? {
-        await quietInboxFence(verb: verb, input: input)
+    func inboxFence(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
+        await quietInboxFence(verb: verb, input: input, turn: turn)
     }
-    func inbox(verb: String, input: [String: JSONValue]) async -> JSONValue {
-        await quietInbox(verb: verb, input: input)
+    func inbox(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
+        // QuietInboxHost's withdrawal callback has no turn parameter; each invocation holds its own immutable binding.
+        await AppQuietToolHost(appModel, inboxTurn: turn).quietInbox(verb: verb, input: input, turn: turn)
     }
     func refreshInboxSurfaces() async {
         _ = await appModel.refreshForSidebarItem(.activity)
@@ -187,7 +209,6 @@ extension AppQuietToolHost: QuietInboxHost {
         }
         switch InboxCardActions.resolvePrimaryAction(for: item) {
         case .openApprovals: return "Marked the note read; its approvals wait on the Approvals page. The person's screen was not moved."
-        case .openDeskExecution: return "Marked the note read; its work is on the Desk. The person's screen was not moved."
         case .chatDraft: return "Marked the note read. Its action only drafts a chat message for the person, so nothing was put in their composer."
         case .chatSpoken: return "Posted the note into chat as your message and marked it read. The person's screen was not moved."
         case .diskCleanup: return "Moved the disk offenders to the Trash; the note now shows the result."
@@ -198,9 +219,9 @@ extension AppQuietToolHost: QuietInboxHost {
 }
 
 extension AppQuietToolHost {
-    func provider(verb: String, input: [String: JSONValue]) async -> JSONValue {
+    func provider(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
         await ProvidersFacade.runQuietProvider(
-            verb: verb, input: input, dataRoot: appModel.engine.dataRoot,
+            verb: verb, input: input, dataRoot: appModel.engine.dataRoot, turn: turn,
             refresh: {
                 switch await appModel.engine.providers.refreshSettings(refreshCatalog: true, cause: UserFacingError.cause) {
                 case .loaded(let snapshot):

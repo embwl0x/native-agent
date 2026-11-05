@@ -20,10 +20,9 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import TurnTrace
-// Blueprint: | `AgentContactConnection.swift` | Named contact connection and disconnection; one checked peer snapshot supplies current projections, with explicit unavailable readouts beside committed setup evidence |
+// Blueprint: | `AgentContactConnection.swift` | Read one checked peer snapshot; preserve committed setup evidence. |
 extension SwiftToolDispatcher {
-    /// A current contact and its peer set are one checked address-book read.
-    /// A failed read or a contact removed meanwhile cannot reuse an earlier binding.
+    /// A current contact and its peer set are one checked address-book read. A failed read or a contact removed meanwhile cannot reuse an earlier binding.
     static func checkedPeerSnapshot(_ id: String, store: AgentPeerStore) throws
         -> (contact: AgentPeerContact, peers: [AgentPeerContact]) {
         let peers = try store.list()
@@ -36,8 +35,7 @@ extension SwiftToolDispatcher {
         return (contact, peers)
     }
 
-    /// Post-effect readers keep the effect receipt and label its projection
-    /// unavailable if the current address-book read failed.
+    /// Post-effect readers keep the effect receipt and label its projection unavailable if the current address-book read failed.
     static func checkedPeerReadout(_ id: String, store: AgentPeerStore) -> (contact: JSONValue, fields: [String: JSONValue]) {
         do {
             let snapshot = try checkedPeerSnapshot(id, store: store)
@@ -60,16 +58,16 @@ extension SwiftToolDispatcher {
     static func peerFailure(_ failure: ProviderFailure.Report, into envelope: inout [String: JSONValue]) {
         AgentPeerPolicy.peerFailure(failure, into: &envelope)
     }
-    /// Connect-by-name. By the time this runs the person has already pressed
-    /// the button on the card `AgentHostConnection.cardText` wrote — a
-    /// confirm-tier tool body only executes on the approved replay — so this is
-    /// where the entry is actually written and not one step earlier.
-    func hostConnect(name: String, workspace: String?, executablePath: String?, store: AgentPeerStore, surface: String, workingDirectory: String? = nil, conversationLabel: String? = nil) async throws -> JSONValue {
+    /// Caller admission or Full Mac must authorize setup before the entry is written; any required approval precedes this boundary.
+    func hostConnect(turn: Turn, invocation: ChatToolInvocation, name: String, workspace: String?, executablePath: String?, store: AgentPeerStore,
+        surface: String, workingDirectory: String? = nil,
+        conversationLabel: String? = nil) async throws -> JSONValue {
         guard conversationLabel == nil || AgentHostDirectory.row(named: name)?.route == .grokBot else {
-            throw AgentCommunicationError.invalid("conversation_label by name applies to Grok Bot only; for a desktop app's chat use transport desktop with app_bundle_id")
+            throw AgentCommunicationError.invalid("""
+                conversation_label by name applies to Grok Bot only; for a desktop app's chat use transport desktop with app_bundle_id
+                """)
         }
-        // A chat app driven through its own window: nothing is written to its
-        // settings and no key is minted, so saving it needs no card.
+        // Desktop targets change no external settings and mint no key, so saving one needs no setup card.
         if let row = AgentHostDirectory.row(named: name), row.route == .desktopChat {
             guard row.isInstalled, let bundle = row.bundleIDs.first, let endpoint = URL(string: "app://" + bundle) else {
                 return .object(["status": .string("not_supported"), "requested": .string(name), "changed": .bool(false),
@@ -80,16 +78,16 @@ extension SwiftToolDispatcher {
                 "changed": .bool(true), "completed": .bool(false),
                 "detail": .string("Saved. Your first message opens a chat of your own in \(row.displayName) and brings its answer back in the same call.")])
         }
-        guard AgentHostDirectory.row(named: name)?.acp != nil || AgentHostConnection.personApproved else {
+        guard AgentHostDirectory.row(named: name)?.acp != nil || turn.personApprovedHost else {
             throw AgentCommunicationError.invalid("Connecting a named agent requires the person's approval card.")
         }
         guard usesCanonicalBody else {
             throw AgentCommunicationError.invalid("setting another agent up on this Mac is unavailable outside the canonical app")
         }
         var proposal: AgentHostConnection.Proposal
-        do { proposal = try AgentHostConnection.propose(name: name, store: store, dataRoot: dataRoot, workspace: workspace, workingDirectory: workingDirectory) }
+        do { proposal = try AgentHostConnection.propose(name: name, store: store, dataRoot: dataRoot, workspace: workspace,
+            workingDirectory: workingDirectory) }
         catch let refusal as AgentHostConnection.Refusal {
-            // Unknown or uninstalled: an honest result, nothing changed.
             return .object(["status": .string("not_supported"),
                             "requested": .string(name),
                             "known_agents": .array(AgentHostDirectory.knownNames.map(JSONValue.string)),
@@ -98,11 +96,13 @@ extension SwiftToolDispatcher {
         }
         if proposal.row.route == .grokBot {
             let result = try AgentHostConnection.connect(proposal: proposal, store: store)
-            // The Connect card's "Use this Bot": the exact sidebar name of the
-            // Bot that receives the routine request, chosen before it is sent.
+            // Select the recipient's exact sidebar name before sending the routine request.
             if let conversationLabel {
                 guard result.contact.grokConversation == nil else {
-                    throw AgentCommunicationError.invalid("The routine request already went to a Bot, so the Bot cannot be changed here. Disconnect Grok Bot (disconnect true, name peer:\(result.contact.id)) and connect again with conversation_label.")
+                    throw AgentCommunicationError.invalid("""
+                        The routine request already went to a Bot, so the Bot cannot be changed here. Disconnect Grok Bot (disconnect true, name \
+                        peer:\(result.contact.id)) and connect again with conversation_label.
+                        """)
                 }
                 do {
                     try store.updateGrok(result.contact.id) { current in
@@ -110,7 +110,10 @@ extension SwiftToolDispatcher {
                         current.conversationLabel = conversationLabel
                     }
                 } catch {
-                    throw AgentCommunicationError.invalid("conversation_label was not saved: it must be the Bot's exact sidebar name on one line, and the routine request must not have gone out yet")
+                    throw AgentCommunicationError.invalid("""
+                        conversation_label was not saved: it must be the Bot's exact sidebar name on one line, and the routine request must not \
+                        have gone out yet
+                        """)
                 }
             }
             return .object(["status": .string("grok_setup"), "peer_id": .string(result.contact.id)])
@@ -125,9 +128,7 @@ extension SwiftToolDispatcher {
             existing = setup.contact
             let repaired = setup.outcome.backupPath != nil
             let permissionsChanged = setup.permissionsChanged
-            // Connecting again approves the program installed now (the path the
-            // card showed) when the approved one is gone, changed, or no longer
-            // the installed version — updates leave old version folders behind.
+            // Reconnection approves the currently installed program; an update may leave obsolete version folders on disk.
             var programApproved = false
             if proposal.row.commandLine != nil,
                let path = proposal.executablePath, path == executablePath, existing.verifiedExecutablePath != path {
@@ -138,19 +139,26 @@ extension SwiftToolDispatcher {
                         nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]), recovery: .inspect)
                 }
             }
-            var value: [String: JSONValue] = ["status": .string(repaired ? "configured" : "already_configured"), "contact": Self.checkedPeerProjection(existing.id, store: store),
+            var value: [String: JSONValue] = ["status": .string(repaired ? "configured" : "already_configured"),
+                "contact": Self.checkedPeerProjection(existing.id, store: store),
                             "changed": .bool(repaired || permissionsChanged || programApproved),
                             "detail": .string(repaired
                                 ? "Repaired \(proposal.row.displayName)'s connector entry and key on the same contact. Restart: \(proposal.row.restartNote)"
                                 : programApproved
-                ? "Approved the \(proposal.row.displayName) program at \(executablePath ?? ""); a Full Mac launch runs exactly this file. Nothing else was changed."
+                ? """
+                    Approved the \(proposal.row.displayName) program at \(executablePath ?? ""); a Full Mac launch runs exactly this file. Nothing \
+                    else was changed.
+                    """
                                 : "\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")]
             if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == false {
                 value["detail"] = .string(Self.directCommandSetupDetail)
             }
-            if permissionsChanged { value["detail"] = .string("Enabled only this connection's two messaging tools in \(proposal.row.displayName). Send a message to verify the return path; existing Ask/Deny rules and all other permissions are unchanged. Restart: \(proposal.row.restartNote)") }
+            if permissionsChanged { value["detail"] = .string("""
+                Enabled only this connection's two messaging tools in \(proposal.row.displayName). Send a message to verify the return path; \
+                existing Ask/Deny rules and all other permissions are unchanged. Restart: \(proposal.row.restartNote)
+                """) }
             if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == true {
-                let probe = try await hostCommandRun(row: proposal.row, contact: existing,
+                let probe = try await hostCommandRun(turn: turn, invocation: invocation, row: proposal.row, contact: existing,
                     message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
                     session: nil, store: store, surface: surface, probe: true)
                 let fields = Self.checkedPeerReadout(existing.id, store: store).fields
@@ -165,12 +173,9 @@ extension SwiftToolDispatcher {
             return .object(value)
         }
         if proposal.row.acp != nil {
-            // The person already answered this named connect in chat (or Full Mac
-            // allows it): a second card here is filed where the chat never shows
-            // it, and the first live drive waited on it unseen for fifteen
-            // minutes. Ask here only when no one has been asked yet.
-            if !AgentHostConnection.personApproved {
-                guard try await AgentACPApproval.connect(proposal, appName: Self.appDisplayName,
+            // Reuse chat approval or Full Mac authority; ask here only if setup has not already been approved.
+            if !turn.personApprovedHost {
+                guard try await AgentACPApproval.connect(turn: turn, proposal, appName: Self.appDisplayName,
                     inbox: SwiftNativeApprovalInbox(root: dataRoot)) else {
                     return .object(["status": .string("denied"), "changed": .bool(false), "completed": .bool(false),
                                     "detail": .string("The person declined this connection; nothing was sent.")])
@@ -190,23 +195,20 @@ extension SwiftToolDispatcher {
         if row.acp != nil {
             return .object(["status": .string("configured"), "contact": Self.checkedPeerProjection(result.contact.id, store: store),
                 "changed": .bool(true), "completed": .bool(false),
-                "detail": .string("Saved this connection with its own key. Its settings were not changed. Send a message to check that it can answer; setup alone does not prove that.")])
+                "detail": .string("""
+                    Saved this connection with its own key. Its settings were not changed. Send a message to check that it can answer; setup alone \
+                    does not prove that.
+                    """)])
         }
-        // PROVE THE ROUND TRIP WHERE THAT IS POSSIBLE. The entry is written and
-        // approved; a host with a command line now gets one fixed probe asking
-        // it to answer through that entry. The contact turns connected only
-        // when the inbound request carrying this connection's key actually
-        // arrives — not because the probe returned, and never on a handshake.
+        // Only an authenticated inbound request proves the written entry works; CLI success or a handshake cannot promote it.
         var probe: JSONValue?
         if row.commandLine?.automaticMCPProbe == true {
-            probe = try await hostCommandRun(
+            probe = try await hostCommandRun(turn: turn, invocation: invocation,
                 row: row, contact: result.contact,
                 message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
                 session: nil, store: store, surface: surface, probe: true)
         }
-        // The probe's own reply is the CLI talking back on its command line.
-        // Only an inbound request through the entry proves the entry works, so
-        // the connect state is read back from the contact, never from the run.
+        // Read connection state from the saved contact: probe stdout cannot prove the authenticated inbound entry.
         let fields = Self.checkedPeerReadout(result.contact.id, store: store).fields
         let connected = fields["state"] == .string(AgentPeerContactState.connected.rawValue)
         var value: [String: JSONValue] = [
@@ -223,8 +225,14 @@ extension SwiftToolDispatcher {
                 + (connected
                    ? "The executable answered a request; the contact carries the scope and time of that proof."
                    : row.commandLine != nil
-                     ? "The probe did not come back through the entry, so this stays set up: an entry that exists proves only that it was written. " + Self.probeReason(probe, row: row)
-                     : "No inbound message authenticated this contact's key yet. Check agents/recipes/\(row.id).json host.configPath=\(row.expandedConfigPath) with agent.verify. Restart: \(row.restartNote) Then send a message through that host's connector to prove it.")),
+                     ? """
+                         The probe did not come back through the entry, so this stays set up: an entry that exists proves only that it was written.\u{20}
+                         """ + Self.probeReason(probe, row: row)
+                     : """
+                         No inbound message authenticated this contact's key yet. Check agents/recipes/\(row.id).json \
+                         host.configPath=\(row.expandedConfigPath) with agent.verify. Restart: \(row.restartNote) Then send a message through that \
+                         host's connector to prove it.
+                         """)),
         ]
         value.merge(fields) { _, current in current }
         if let probe { Self.includeConnectionProbe(probe, in: &value) }
@@ -236,7 +244,10 @@ extension SwiftToolDispatcher {
         Self.sayReplaced(result.outcome, in: &value)
         return .object(value)
     }
-    private static let directCommandSetupDetail = "Contact saved with permission for its two MCP messaging tools only. agent.message returns the command's answer; conversation_id continues it. No callback was attempted. The separate MCP reply path stays unverified until an inbound message arrives."
+    private static let directCommandSetupDetail = """
+        Contact saved with permission for its two MCP messaging tools only. agent.message returns the command's answer; conversation_id continues \
+        it. No callback was attempted. The separate MCP reply path stays unverified until an inbound message arrives.
+        """
     private static func environmentSetupResult(proposal: AgentHostConnection.Proposal, contact: AgentPeerContact,
                                                store: AgentPeerStore, changed: Bool, repaired: Bool = false) -> JSONValue {
         let prefix = "set -a && . " + AgentHostDirectory.shellQuoted(proposal.row.expandedConfigPath)
@@ -248,7 +259,13 @@ extension SwiftToolDispatcher {
             "changed": .bool(changed),
             "env_file": .string(proposal.row.expandedConfigPath), "outbound_route": .string("chatgpt-dot-ipc"),
             "message_command": .string(message), "reply_command": .string(reply), "restart_required": .bool(false),
-            "detail": .string("\(repaired ? "Repaired" : changed ? "Created" : "Already configured") ChatGPT Dot with its own scoped key and private (0600) environment file. No ChatGPT settings were edited. NativeAgent can message Dot in-house after a read-only route check.\nGive Dot this exact command:\n\(message)\nIf the answer is enqueued, use the session_id and request_id returned by that command:\n\(reply)\nKeep the same --session to continue the conversation. Read enqueued answers with reply; do not resend the message.")]
+            "detail": .string("""
+                \(repaired ? "Repaired" : changed ? "Created" : "Already configured") ChatGPT Dot with its own scoped key and private (0600) \
+                environment file. No ChatGPT settings were edited. NativeAgent can message Dot in-house after a read-only route check.\nGive Dot \
+                this exact command:\n\(message)\nIf the answer is enqueued, use the session_id and request_id returned by that \
+                command:\n\(reply)\nKeep the same --session to continue the conversation. Read enqueued answers with reply; do not resend the \
+                message.
+                """)]
         value.merge(readout.fields) { _, current in current }
         return .object(value)
     }
@@ -287,7 +304,9 @@ extension SwiftToolDispatcher {
                 ? "Removed exactly this app's entry, revoked that connection's key, and forgot the contact. Everything else in that file is unchanged."
                 : "Removed the contact and its saved key. No other app's settings were changed.")]
         if AgentPeerStore.hostRowID(contact.endpoint).flatMap({ AgentHostDirectory.row(named: $0)?.format }) == .shellEnvironment {
-            value["detail"] = .string("Deleted this contact's environment file, revoked its scoped key and removed ChatGPT Dot. No ChatGPT settings were changed.")
+            value["detail"] = .string("""
+                Deleted this contact's environment file, revoked its scoped key and removed ChatGPT Dot. No ChatGPT settings were changed.
+                """)
         }
         if let outcome {
             value["config_path"] = .string(outcome.path)

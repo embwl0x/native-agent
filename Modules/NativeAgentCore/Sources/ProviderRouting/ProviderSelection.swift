@@ -4,16 +4,15 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ProviderSelection.swift` | Provider picker transactions through the existing tuple lock; model/effort saves validate route-owned capabilities; incompatible account switches require an explicit combined account/model selection; failed projection writes retain exact forward intent with checked committed/pending projection receipts; helper model choices expose unreadable catalog causes with unavailable provenance and no replacement rows |
+// Blueprint: | `ProviderSelection.swift` | recoverable forward picker transactions |
 extension SwiftNativeProviderRouting {
     public func listProviders() async throws -> [Provider] {
         try await checkedProviderSnapshot().providers
     }
-    /// Catalog discovery finishes before the one checked routing read. Every
-    /// displayed connection and resolved preference then uses the same config cache.
+    /// Catalog discovery finishes before the one checked routing read. Every displayed connection and resolved preference then uses the same config cache.
     public func checkedProviderSnapshot(
         codexCacheURL: URL? = nil,
-        authEnvironment: [String: String] = ProcessInfo.processInfo.environment
+        authEnvironment: [String: String] = ProcessInfo.processInfo.environment, preview: Bool = false
     ) async throws -> ProviderCatalogSnapshot {
         async let openRouterRead = OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot)
         async let moonshotRead = MoonshotModelCatalog.modelsWithFreshness(dataRoot: dataRoot)
@@ -23,14 +22,14 @@ extension SwiftNativeProviderRouting {
             openRouterModels: openRouter.models.map { $0.providerJSON() },
             moonshotModels: moonshot.models.map { $0.providerJSON() },
             codexCacheURL: codexCacheURL, authEnvironment: authEnvironment,
-            additionalProviderIDs: Set(state.active.values)
+            additionalProviderIDs: Set(state.active.values), preview: preview
         )
         let cache = inventory.cache
         return ProviderCatalogSnapshot(
             routing: try routingSnapshot(
                 surfaces: state.surfaces, activeProviders: state.active,
                 soleConnectedRoute: soleConnectedProviderID(cache: cache), configCache: cache,
-                revision: state.revision
+                revision: state.revision, preview: preview
             ),
             providers: inventory.providers.map { provider in
                 var row = provider
@@ -72,8 +71,7 @@ extension SwiftNativeProviderRouting {
         }
         return provider
     }
-    /// Local choices for helper creation; no network probe or setting change.
-    /// The normal creation gate still validates the explicitly chosen tuple.
+    /// Local choices for helper creation; no network probe or setting change. The normal creation gate still validates the explicitly chosen tuple.
     public func botModelChoices() throws -> JSONValue {
         let openRouterModels = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
         let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
@@ -87,7 +85,8 @@ extension SwiftNativeProviderRouting {
             if case .array(let saved)? = provider.modelCatalog {
                 models = saved.compactMap { if case .object(let row) = $0 { return row }; return nil }
             } else { models = [] }
-            let keys: Set<String> = ["id", "name", "supported_reasoning_efforts", "default_reasoning_effort", "supports_fast", "supports_tools", "controls_note"]
+            let keys: Set<String> = ["id", "name", "supported_reasoning_efforts", "default_reasoning_effort", "supports_fast", "supports_tools",
+                "controls_note"]
             var choice: [String: JSONValue] = [
                 "provider": .string(provider.id), "name": .string(provider.displayName ?? provider.id),
                 "readiness": .string("credentials_available"),
@@ -102,7 +101,10 @@ extension SwiftNativeProviderRouting {
             return JSONValue.object(choice)
         }
         return .object(["providers": .array(rows),
-            "detail": .string("Choose provider, model and reasoning_effort explicitly. These are local catalog choices on configured accounts, not a live service test. Non-shipped catalogs may be incomplete; creation validates the chosen route. No account or model setting changed.")])
+            "detail": .string("""
+                Choose provider, model and reasoning_effort explicitly. These are local catalog choices on configured accounts, not a live service test. \
+                Non-shipped catalogs may be incomplete; creation validates the chosen route. No account or model setting changed.
+                """)])
     }
     public func configureProvider(id: String, config: JSONValue) async throws -> Provider {
         guard case .object(let body) = config else {
@@ -146,8 +148,7 @@ extension SwiftNativeProviderRouting {
             if let model = Self.firstString(body, keys: ["default_model"]) {
                 entry["default_model"] = .string(model)
             }
-            // A settings-only default-model patch must preserve the connection,
-            // including an authentication method that has never been chosen.
+            // A settings-only default-model patch must preserve the connection, including an authentication method that has never been chosen.
             if entry["auth_mode"] == nil, body.keys.contains(where: { $0 != "default_model" }) {
                 entry["auth_mode"] = .string(id.contains("oauth") ? "oauth" : "api_key")
             }
@@ -159,8 +160,7 @@ extension SwiftNativeProviderRouting {
                     try await SwiftNativePersistenceCore.writeJSON(.object(entry), to: path)
                 }
             } catch {
-                // writeJSON can fail after rename. Delete the new item only
-                // when checked readback proves its reference was not committed.
+                // writeJSON can fail after rename. Delete the new item only when checked readback proves its reference was not committed.
                 if let newReference {
                     var unreferenced = false
                     do {
@@ -192,10 +192,7 @@ extension SwiftNativeProviderRouting {
                 }
             }
         }
-        // Freshen the authenticated model catalog for providers whose live
-        // `/models` list needs credentials. Both refresh paths are non-fatal
-        // (models() swallows failures) and keep the on-disk cache — and its
-        // TTL stamp — current after a credential change.
+        // Credential changes refresh authenticated discovery without changing save success; catalog failure remains owned by its cache.
         switch id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "moonshot":
             _ = await MoonshotModelCatalog.models(dataRoot: dataRoot, refresh: true)
@@ -211,7 +208,7 @@ extension SwiftNativeProviderRouting {
               let rawSurface = Self.firstString(obj, keys: ["surface"]) else {
             throw ProviderRoutingError.invalidRequest
         }
-        // Saved surface aliases enter through the canonical vocabulary.
+        // Saved surface spellings must pass the canonical vocabulary.
         let surface = canonicalRoutingSurface(rawSurface)
         guard MODEL_SURFACES.contains(surface) else {
             throw ProviderRoutingError.invalidRequest
@@ -219,8 +216,7 @@ extension SwiftNativeProviderRouting {
         let model = Self.firstString(obj, keys: ["model"])
         let effort = Self.firstString(obj, keys: ["reasoningEffort"])
         let serviceTier = Self.firstString(obj, keys: ["serviceTier"])
-        // S12a: the `inferProvider` body flag (write a route read off the
-        // model's name) is gone; a model save keeps the surface's chosen route.
+        // Saving a model preserves the surface's chosen provider instead of inferring a route from its name.
         try await saveSurfaceConfiguration(
             surface: surface,
             model: model,
@@ -230,11 +226,7 @@ extension SwiftNativeProviderRouting {
         )
         return try await modelPreferencesFromComputed()
     }
-    /// One canonical logical mutation boundary for a provider group and its
-    /// optional account pin. A durable intent marker protects the two-file
-    /// update so restart reconciliation completes the exact tuple or fails
-    /// closed if unrelated bytes appeared. Once the marker exists, task
-    /// cancellation cannot turn a committed intent into a half-update.
+    /// Durable intent protects the group tuple across restart and cancellation; unrelated bytes fail closed instead of overwriting another commit.
     public func saveGroupSelection(
         group: ProviderSurfaceGroup,
         providerID: String? = nil,
@@ -251,9 +243,7 @@ extension SwiftNativeProviderRouting {
         return try await saveSurfaceConfigurations(
             surfaces: surfaces, model: model, reasoningEffort: reasoningEffort,
             serviceTier: serviceTier, providerId: providerID,
-            // Choosing a model or account completes the row; a tier-only or
-            // effort-only write changes that control alone, so Chat's effort
-            // keeps flowing to the group instead of being pinned on each surface.
+            // Effort/tier-only writes must not pin inherited model/account or other controls.
             seedMissingControls: model != nil || providerID != nil,
             reconcilePinnedModelWithProvider: model == nil && !clearOverride,
             clearOverride: clearOverride
@@ -270,7 +260,7 @@ extension SwiftNativeProviderRouting {
         clearOverride: Bool = false,
         selectionValidator: (@Sendable (String, String) throws -> Void)? = nil
     ) async throws {
-        // Surface commands mutate the owning group's choice, just like the picker.
+        // Surface commands must mutate their owning group like the picker.
         _ = try await saveSurfaceConfigurations(
             surfaces: ProviderSurfaceGroups.members(of: surface).filter { !clearOverride || $0 != "chat" }, model: model,
             reasoningEffort: reasoningEffort, serviceTier: serviceTier, providerId: providerId,
@@ -324,17 +314,15 @@ extension SwiftNativeProviderRouting {
             let savedActive = try Self.loadActiveProviderStateChecked(at: self.activeProviderPath)
             let originalActive = savedActive.mapValues(JSONValue.string)
             let active = savedActive
-            // Adoption decides from the saved assignments while holding the
-            // same transaction lock as the picker, never from a prior snapshot.
+            // Adoption decides from the saved assignments while holding the same transaction lock as the picker, never from a prior snapshot.
             let available = adoptingConnectedProvider ? Set(Self.connectableProviderIds.filter {
                 self.providerReadiness(id: $0).ready
             }) : []
             if adoptingConnectedProvider, !available.contains(providerId ?? "") {
                 return try await self.groupWriteResult(surfaces: [], surfaceRoot: originalSurfaces, activeRoot: originalActive)
             }
-            // Read the proposed controls before deriving inherited values, so a
-            // corrected value can repair an invalid saved choice without first
-            // admitting that invalid choice. Nothing is published here.
+            // Read the proposed controls before deriving inherited values, so a corrected value can repair an invalid saved choice without first admitting
+            // that invalid choice. Nothing is published here.
             var proposedSurfaces = originalSurfaces
             var proposedActive = active
             if !clearOverride {
@@ -349,7 +337,7 @@ extension SwiftNativeProviderRouting {
                 }
             }
             let current = !clearOverride ? try await self.selectionRoutingSnapshot(
-                surfaces: proposedSurfaces, active: proposedActive
+                surfaces: proposedSurfaces, active: proposedActive, preview: false
             ) : nil
             var surfaceRoot = originalSurfaces
             var activeRoot = originalActive
@@ -380,15 +368,17 @@ extension SwiftNativeProviderRouting {
                           let selected = current?.preferences[surface]?.model {
                     try validateSelection?(route, selected)
                 }
-                // An account-only change preserves the exact saved choice;
-                // an incompatible pin needs an explicit combined selection.
+                // An account-only change preserves the exact saved choice; an incompatible pin needs an explicit combined selection.
                 var surfacesUntouched = false
                 if reconcilePinnedModelWithProvider, !clearOverride, model == nil, let providerId {
                     let (models, _, _) = Self.parseSurfacesFile(.object(surfaceRoot))
                     if let pinned = Self.stringFrom(models, key: surface),
                        let inferred = self.inferProviderForModel(pinned),
                        !Self.providerCanServeModel(providerId, inferredProvider: inferred) {
-                        throw ProviderRoutingError.configurationFailed("\(providerId) does not serve the saved model \(pinned). Choose the account and model together in Providers; no setting changed.")
+                        throw ProviderRoutingError.configurationFailed("""
+                            \(providerId) does not serve the saved model \(pinned). Choose the account and model together in Providers; no setting \
+                            changed.
+                            """)
                     }
                     surfacesUntouched = true
                 }
@@ -428,10 +418,10 @@ extension SwiftNativeProviderRouting {
             let changed = surfaces.filter {
                 originalSurfaces[$0] != intendedSurfaces[$0] || originalActive[$0] != intendedActive[$0]
             }
-            // Validate the exact resulting controls before saving any intent.
+            // Validate resulting controls before publishing durable intent.
             let intendedRouting = try await self.selectionRoutingSnapshot(
                 surfaces: intendedSurfaces,
-                active: intendedActive.compactMapValues { if case .string(let id) = $0 { return id }; return nil }
+                active: intendedActive.compactMapValues { if case .string(let id) = $0 { return id }; return nil }, preview: false
             )
             for surface in surfaces {
                 if let fault = intendedRouting.unusablePickNotice(for: surface) {
@@ -441,9 +431,8 @@ extension SwiftNativeProviderRouting {
             guard intendedSurfaces != originalSurfaces || intendedActive != originalActive else {
                 return try await self.groupWriteResult(surfaces: [], surfaceRoot: intendedSurfaces, activeRoot: intendedActive)
             }
-            // Cancellation is honored before durable intent publication. From
-            // this point onward the operation owns recovery and must either
-            // converge now or be completed on the next checked read/mutation.
+            // Cancellation is honored before durable intent publication. From this point onward the operation owns recovery and must either converge now or
+            // be completed on the next checked read/mutation.
             try Task.checkCancellation()
             let pending = PendingSurfaceConfiguration(
                 surfacesBaseHash: try Self.fileSHA256(self.surfacesPath),
@@ -459,8 +448,7 @@ extension SwiftNativeProviderRouting {
             return try await self.groupWriteResult(surfaces: changed, surfaceRoot: intendedSurfaces, activeRoot: intendedActive)
         }
     }
-    /// Readback only: never replace the forward intent with preceding values.
-    /// The existing reconciliation owner finishes retained intent on the next
+    /// Readback only: never replace the forward intent with preceding values. The existing reconciliation owner finishes retained intent on the next
     /// checked read; missing/conflicting/unreadable intent is reported as such.
     private func pickerWriteFailure(_ error: Error, pending: PendingSurfaceConfiguration, changed: [String]) -> ProviderGroupWriteFailure {
         var committed: [String] = []
@@ -498,14 +486,16 @@ extension SwiftNativeProviderRouting {
             intentStatus = "unavailable"
             details.append("Intent readback is unavailable: \(error.localizedDescription)")
         }
-        details.append("Forward intent \(intentStatus) at \(surfaceTransactionPath.path); committed: \(committed.joined(separator: ", ")); pending: \(waiting.joined(separator: ", ")); unknown: \(unknown.joined(separator: ", ")).")
+        details.append("""
+            Forward intent \(intentStatus) at \(surfaceTransactionPath.path); committed: \(committed.joined(separator: ", ")); pending: \
+            \(waiting.joined(separator: ", ")); unknown: \(unknown.joined(separator: ", ")).
+            """)
         return ProviderGroupWriteFailure(detail: details.joined(separator: " "),
             forwardIntent: pending.json, intentStatus: intentStatus,
             projectionsCommitted: committed, projectionsPending: waiting, projectionsUnknown: unknown,
             surfacesPendingRecovery: intentStatus == "absent" && waiting.isEmpty && unknown.isEmpty ? [] : changed)
     }
-    /// Caller holds the selection lock. Publish durable intent; reconciliation
-    /// owns forward projection writes and verification.
+    /// Caller holds the selection lock; durable intent owns all projection writes and verification.
     func commitPickerStateLocked(_ pending: PendingSurfaceConfiguration) async throws {
         try await SwiftNativePersistenceCore.writeJSON(pending.json, to: surfaceTransactionPath)
         try await reconcilePendingSurfaceConfigurationLocked()
@@ -522,20 +512,20 @@ extension SwiftNativeProviderRouting {
             surfacesChanged: surfaces,
             snapshot: try selectionRoutingSnapshot(
                 surfaces: surfaceRoot,
-                active: active, revision: revision
+                active: active, revision: revision, preview: false
             )
         )
     }
-    func selectionRoutingSnapshot(surfaces: [String: JSONValue], active: [String: String], revision: Double = 0) throws -> ProviderRoutingSnapshot {
+    func selectionRoutingSnapshot(surfaces: [String: JSONValue], active: [String: String], revision: Double = 0,
+        preview: Bool = false) throws -> ProviderRoutingSnapshot {
         let cache = providerConfigCache(for: Set(Self.soleConnectedProbeIds).union(active.values))
         return try routingSnapshot(
             surfaces: surfaces, activeProviders: active,
             soleConnectedRoute: soleConnectedProviderID(cache: cache),
-            configCache: cache, revision: revision
+            configCache: cache, revision: revision, preview: preview
         )
     }
-    /// Restore inherited routing, removing the model, effort/tier and provider
-    /// pins in the same recoverable transaction. Chat owns the default.
+    /// Clear model/account and effort/tier together so inherited routing stays coherent.
     public func clearSurfaceOverride(surface: String) async throws {
         try await saveSurfaceConfiguration(
             surface: surface, model: nil, reasoningEffort: nil,
@@ -548,8 +538,7 @@ extension SwiftNativeProviderRouting {
               !providerId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProviderRoutingError.invalidRequest
         }
-        // Reconcile model pins with provider changes under the same transaction
-        // lock so a concurrent model pick cannot be overwritten from a stale read.
+        // Reconcile model pins with provider changes under the same transaction lock so a concurrent model pick cannot be overwritten from a stale read.
         try await saveSurfaceConfiguration(
             surface: surface,
             model: nil,
@@ -559,8 +548,7 @@ extension SwiftNativeProviderRouting {
             reconcilePinnedModelWithProvider: true
         )
     }
-    /// Connect fills a missing/unavailable Chat route and retires unavailable
-    /// overrides. The eligibility decision and both files commit together.
+    /// Adoption eligibility and both picker projections commit together.
     public func adoptConnectedProvider(_ providerId: String) async throws -> ProviderGroupWriteResult {
         try await saveSurfaceConfigurations(
             surfaces: MODEL_SURFACES, model: nil, reasoningEffort: nil,

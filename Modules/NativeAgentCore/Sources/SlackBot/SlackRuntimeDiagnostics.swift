@@ -4,9 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `SlackRuntimeDiagnostics.swift` | `SlackRuntimeStateWriteOutcome` enum |
 
-/// Result of patching the loop's diagnostic state. State is observational, but
-/// an existing unreadable file is still evidence: it must not be overwritten
-/// and then misrepresented as a fresh healthy state.
+/// Unreadable diagnostic evidence must not be overwritten and misrepresented as fresh healthy state.
 enum SlackRuntimeStateWriteOutcome: Sendable, Equatable {
     case stored
     case unavailableMalformedExistingState
@@ -45,10 +43,7 @@ enum SlackRuntimeStateStore {
                 for (key, value) in patch {
                     object[key] = value
                 }
-                // `state.json` is a runtime feed, not merely an accumulation
-                // of diagnostic keys. Its update time lets readers distinguish
-                // a quiet-but-live socket (kept fresh by ping) from a bridge
-                // that stopped reporting altogether.
+                // Ping refreshes the timestamp so readers can distinguish a quiet socket from a stopped bridge.
                 object["updatedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
                 try await SwiftNativePersistenceCore.writeJSON(.object(object), to: statePath)
                 return .stored
@@ -59,10 +54,7 @@ enum SlackRuntimeStateStore {
     }
 }
 
-/// Typed reader for the Socket Mode runtime feed. Missing evidence, malformed
-/// state, and a stale heartbeat are intentionally separate from a fresh
-/// disconnected state: none of the former can safely be rendered as a healthy
-/// Slack bridge.
+/// Missing, malformed and stale evidence cannot establish bridge health or a fresh disconnected state.
 public enum SlackRuntimeStateFeed {
     public static let staleAfter: TimeInterval = 90
 

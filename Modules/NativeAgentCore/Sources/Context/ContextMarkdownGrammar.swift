@@ -138,8 +138,8 @@ extension ContextMarkdownCompiler {
         return blocks
     }
 
-    /// Bytes between exactly one well-formed marker pair, allowing a manual preamble.
-    /// This cuts atoms; `ContextPreparation.generatedUserFacts` owns projection suppression.
+    /// Bytes between exactly one well-formed marker pair, allowing a manual preamble. This cuts atoms; `ContextPreparation.generatedUserFacts` owns projection
+    /// suppression.
     private static func generatedUserBodyByteRange(
         bytes: [UInt8],
         lines: [SourceLine]

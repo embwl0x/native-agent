@@ -6,7 +6,7 @@ import TrustCenter
 import CryptoKit
 import GRDB
 import PersonaEngine
-// Blueprint: | `ContextPreparation.swift` | One ContextPreparation actor owns lifecycle, health and publication admission; committed source-read failures retain their identities for health and turn selection before any source row exists; stop invalidates candidates and drains entered publication |
+// Blueprint: | `ContextPreparation.swift` | Context lifecycle, health, publication admission and shutdown drain |
 
 public enum ContextFlowMode: String, Codable, CaseIterable, Sendable {
     case off
@@ -37,11 +37,9 @@ public struct ContextFlowCoordinatorHealth: Sendable, Equatable {
     public let registeredSourceCount: Int
     public let degradedSourceCount: Int
     public let arenaMetrics: ContextArenaMetrics
-    /// Bounded rebuildable feedback retained across a coordinator restart.
-    /// This health gauge never grants authority.
+    /// Bounded rebuildable feedback retained across a coordinator restart. This health gauge never grants authority.
     public let feedbackEventCount: Int
-    /// Identity of the newest retained advisory event, for restart/cap
-    /// observability without exposing event payloads through every turn.
+    /// Identity of the newest retained advisory event, for restart/cap observability without exposing event payloads through every turn.
     public let newestFeedbackEventID: String?
     public let lastReconciledAt: Date?
     public let lastError: String?
@@ -79,7 +77,6 @@ public enum ContextFlowCoordinatorError: Error, Equatable, Sendable {
     case duplicateProjectedSource(ContextSourceID)
 }
 
-/// Resident event-driven compiler and RAM publication coordinator.
 public actor ContextPreparation: DerivedStateInvalidationSink {
     public let mode: ContextFlowMode
     public let store: ContextSQLiteStore
@@ -114,23 +111,18 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
         generationID: Int64, feedbackOrdinal: UInt64, timeBucket: Int64,
         snapshot: ContextFeedbackSnapshot
     )?
-    // Newer batches include every unacknowledged request. Compilation may
-    // overlap, but only the freshest batch can enter the publication gate.
+    // Newer batches include every unacknowledged request. Compilation may overlap, but only the freshest batch can enter the publication gate.
     var nextReconciliationRequestID: UInt64 = 0
     var pendingRegistrations: [ContextSourceID: PendingRegistration] = [:]
     var pendingProjectionReconciliationRequestIDs: [String: UInt64] = [:]
     var pendingReconciliationReason = "source_change"
     private var publicationInProgress = false
-    /// Admission and drain waiters park on one ScopedWaiter per publication: its
-    /// park never touches this actor's state (a continuation body that did crashed
-    /// her on 10-30, swift_task_checkIsolated in reconcilePending). Admission
-    /// waiters leave on cancellation or stop; stop drains an entered publisher
-    /// even if its own caller is cancelled.
+    /// ScopedWaiter parks without touching this actor's state. Admission leaves on cancellation or stop; stop drains entered publishers despite caller
+    /// cancellation.
     private var publicationDone = ScopedWaiter()
     var reconciliationClosed = false
     var lifecycleID: UInt64 = 0
-    /// One compile at a time. A request arriving during one waits, and only
-    /// the newest waiter compiles: an older one's commit would be refused.
+    /// One compile at a time. A request arriving during one waits, and only the newest waiter compiles: an older one's commit would be refused.
     var compileInProgress = false
     var compileDone = ScopedWaiter()
     /// Housekeeping rebuilds a turn requested or launch started; no turn awaits it.
@@ -216,9 +208,8 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     }
 
     public func stop() async {
-        // Close admission and invalidate compiled candidates before suspending.
-        // A publisher already inside the gate may finish, but replacement must
-        // not start until its durable and resident publications have drained.
+        // Close admission and invalidate compiled candidates before suspending. A publisher already inside the gate may finish, but replacement must not start
+        // until its durable and resident publications have drained.
         reconciliationClosed = true
         lifecycleID &+= 1
         nextReconciliationRequestID &+= 1
@@ -269,8 +260,7 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     }
 
     public func health() async -> ContextFlowCoordinatorHealth {
-        // An unread store is not a store with no degraded sources: the zero
-        // travels with the failed measurement as the health error.
+        // An unread store is not a store with no degraded sources: the zero travels with the failed measurement as the health error.
         var storeHealth: ContextStoreHealthSnapshot?
         var measurementError: String?
         do { storeHealth = try await store.healthSnapshot() } catch {

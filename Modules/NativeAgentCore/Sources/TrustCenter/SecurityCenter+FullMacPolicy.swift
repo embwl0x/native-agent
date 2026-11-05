@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SecurityCenter+FullMacPolicy.swift` | `SwiftNativeSecurityCenter`: `fullMacActive`, `fullMacYoloAuthority`, checked local `localFullMacYoloAdmitted`, `drivenAgentLaunchPermission` |
+// Blueprint: | `SecurityCenter+FullMacPolicy.swift` | Origin-aware Full Mac admission and driven-agent launch ceilings |
 
 extension SwiftNativeSecurityCenter {
     /// Full Mac follows the saved policy without a timer.
@@ -9,23 +9,17 @@ extension SwiftNativeSecurityCenter {
         PermissionLaw.posture(policy) == .fullMac
     }
 
-    /// The local operator has one admission for every native action. Read
-    /// checked saved authority at presentation time; never retain a grant.
+    /// The local operator has one admission for every native action. Read checked saved authority at presentation time; never retain a grant.
     public nonisolated static func localFullMacYoloAdmitted(dataRoot: URL) -> Bool {
-        switch SavedTrustPolicyAuthority.read(dataRoot: dataRoot) {
-        case .present(let policy): fullMacActive(policy: policy)
-        case .absent, .damaged: false
-        }
+        do { return fullMacActive(policy: try SwiftNativeTrustCenter(dataRoot: dataRoot).loadSavedPolicyChecked()) }
+        catch { return false }
     }
 
-    /// The public checked authority door for non-chat/raw consumers. A damaged
-    /// saved policy is distinguishable from an inactive grant and always fails
-    /// closed. Remote trust is resolved from the concrete origin here; a caller
-    /// cannot obtain YOLO authority by supplying only a surface label.
-    /// Effect owners may pass the fresh checked generation they just read.
+    /// Concrete origin proof and readable saved policy are both required; a surface label cannot confer Full Mac authority.
     public func fullMacYoloAuthority(
         origin: SecurityOriginContext,
-        snapshot: TrustPolicyAuthorizationSnapshot? = nil
+        snapshot: TrustPolicyAuthorizationSnapshot? = nil,
+        turn: Turn?
     ) async -> FullMacYoloAuthorityAssessment {
         do {
             let checkedSnapshot: TrustPolicyAuthorizationSnapshot
@@ -34,7 +28,7 @@ extension SwiftNativeSecurityCenter {
             } else {
                 checkedSnapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
             }
-            let originAssessment = try await assessOrigin(origin, policy: checkedSnapshot.policy)
+            let originAssessment = try await assessOrigin(origin, policy: checkedSnapshot.policy, turn: turn)
             return Self.fullMacYoloAuthority(
                 originAssessment: originAssessment,
                 snapshot: checkedSnapshot
@@ -47,14 +41,12 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
-    /// THE launch decision for an agent NativeAgent drives, for the request's
-    /// real origin: admitted Full Mac runs it with full access, a lower Trust
-    /// or an origin not admitted for Full Mac runs it restricted, and an
-    /// unreadable policy launches nothing.
+    /// Origin-aware admission selects full or restricted launch; unreadable authority cannot launch anything.
     public func drivenAgentLaunchPermission(
-        origin: SecurityOriginContext
+        origin: SecurityOriginContext,
+        turn: Turn?
     ) async -> DrivenAgentLaunchPermission {
-        let authority = await fullMacYoloAuthority(origin: origin)
+        let authority = await fullMacYoloAuthority(origin: origin, turn: turn)
         switch authority.state {
         case .admitted: return .fullMac
         case .inactive, .untrustedOrigin: return .restricted
@@ -62,8 +54,7 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
-    /// The most a driven-agent launch may hold right now, whatever its origin: the Mac's own
-    /// posture. A queued launch asks this when it launches and runs at the lower of it and its stamp.
+    /// Cap queued launches by the lower of current Mac posture and their admitted stamp.
     public func drivenAgentLaunchCeiling() async -> DrivenAgentLaunchPermission {
         let snapshot: TrustPolicyAuthorizationSnapshot
         do { snapshot = try await trustCenter.loadAuthorizationSnapshotChecked() }
@@ -77,9 +68,7 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
-    /// Shared pure evaluator for owners that already hold one checked
-    /// authorization generation. This is the single YOLO vocabulary: there is
-    /// intentionally no tool exclusion list and no saved per-tool entry.
+    /// One checked generation owns YOLO evaluation, without a separate tool exclusion or saved-entry policy.
     static func fullMacYoloAuthority(
         originAssessment: OriginAssessment,
         snapshot: TrustPolicyAuthorizationSnapshot
@@ -106,8 +95,6 @@ extension SwiftNativeSecurityCenter {
         )
     }
 
-    /// Checked-snapshot variant for TrustCenter consumers that already received
-    /// the concrete origin proof from SecurityCenter.
     public nonisolated static func fullMacYoloAuthority(
         surface: String,
         originTrusted: Bool,

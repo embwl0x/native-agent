@@ -8,9 +8,9 @@ import os
 import NativeAgentShared
 import Experiences
 import Observation
-// Blueprint: | `TurnTraceGrouping.swift` | Stable arrival-index grouping and exact nonnegative measurements with damage evidence shared by Inspector and phone summaries |
+// Blueprint: | `TurnTraceGrouping.swift` | Stable grouping and exact metrics with coverage gaps |
 
-/// Stable chronological evidence and metrics shared by the Inspector and phone summaries.
+/// Shared grouping keeps chronological evidence and metrics identical across Inspector and phone.
 public struct TurnTraceGroup: Identifiable, Sendable {
     public let id: String
     public let surface: String?
@@ -35,15 +35,14 @@ public enum TurnTraceGrouping {
         var cards: [TurnTraceGroup] = []
         cards.reserveCapacity(byTurn.count)
         for (turnId, group) in byTurn {
-            // Original arrival index breaks timestamp ties deterministically.
             let sortedPairs = group.sorted {
                 if $0.event.ts != $1.event.ts { return $0.event.ts < $1.event.ts }
                 return $0.index < $1.index
             }
             let sorted = sortedPairs.map(\.event)
-            // Skip empty groups rather than trapping the Inspector.
+            // An empty group cannot supply the Inspector's required first event.
             guard let started = sorted.first?.ts, let last = sorted.last?.ts else { continue }
-            // Surface/session: take the first non-nil we see (they're turn-wide).
+            // Surface and session are turn-wide; missing rows can borrow the first recorded value.
             let surface = sorted.lazy.compactMap { $0.surface }.first
             let session = sorted.lazy.compactMap { $0.sessionId }.first
             let (tokens, ttft, measurementError) = llmSummary(sorted)
@@ -59,14 +58,13 @@ public enum TurnTraceGrouping {
                 measurementError: measurementError
             ))
         }
-        // Newest STARTED turn on top. Tie-break by turnId for determinism.
+        // Break equal start times by turn ID for deterministic card order.
         return cards.sorted {
             if $0.startedAt != $1.startedAt { return $0.startedAt > $1.startedAt }
             return $0.id > $1.id
         }
     }
 
-    /// Sum input+output tokens across llm.call events and pick the first TTFT.
     private static func llmSummary(_ events: [TurnTraceEvent]) -> (tokens: Int?, ttftMs: Int?, error: String?) {
         var tokenTotal: Int64 = 0
         var sawTokens = false

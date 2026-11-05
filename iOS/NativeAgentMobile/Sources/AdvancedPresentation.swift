@@ -1,7 +1,7 @@
 import SwiftUI
 import Foundation
 import NativeAgentShared
-// Blueprint: | `AdvancedPresentation.swift` | Shared mobile reading presentation, bounded plain request summaries with raw prompts retained by callers, and process-local design samples |
+// Blueprint: | `AdvancedPresentation.swift` | Shared mobile presentation, bounded request summaries with raw prompts retained, and design samples |
 
 /// Process-local screenshot fixtures. Never published to a store or transport.
 enum MobileDesignSamples {
@@ -18,7 +18,7 @@ enum MobileDesignSamples {
     @MainActor static func rows<T: Decodable>(_ live: [T]) -> [T] {
         #if DEBUG
         guard screen != nil, live.isEmpty, let json = fixtures[String(describing: T.self)] else { return live }
-        // A malformed shipped DEBUG fixture must fail visibly, never masquerade as an empty screen.
+        // Malformed DEBUG fixtures must fail visibly rather than masquerade as empty screens.
         do { return try JSONDecoder().decode([T].self, from: Data(json.utf8)) }
         catch {
             SystemToastCenter.shared.push(error: "Design sample is unavailable: \(error.localizedDescription)")
@@ -35,7 +35,6 @@ enum MobileDesignSamples {
         "ApprovalRequest": ##"[{"id":"design-approval-hygiene","title":"Run memory hygiene after the test-heavy week","action":"self_improvement.apply","risk":"medium","reason":"[run_memory_hygiene] Run memory hygiene to consolidate duplicates and clear test-derived noise before it settles into long-term memory.","status":"pending","localOnly":true,"remoteResolvable":false},{"id":"design-approval-skill","title":"Keep this as a skill: workspace → workspace","action":"skill.proposal","risk":"low","reason":"This exact sequence ran 3 times across 2 days, verified successful every time. Approve to save the draft below as a skill body — she will find it through recall when a conversation enters its territory. It grants no permission, activates nothing, and runs nothing on its own. Deny and nothing is written.","payloadPreview":"# learned-workspace-then-workspace-8c211c66\n\nUse when a request calls for the same run of work this sequence keeps doing: `workspace` → `workspace`.\n\n## Steps\n1. `workspace` — arguments: path.\n2. `workspace` — arguments: path.\n","status":"pending","localOnly":true,"remoteResolvable":false},{"id":"design-approval","title":"Review the weekend project plan before sharing","action":"Share project summary","risk":"medium","reason":"The summary includes the updated milestones and a link to the working draft.","payloadPreview":"{\"tool\":\"mail_send\",\"input\":{\"to\":\"Sam\",\"subject\":\"Weekend project plan\",\"message\":\"Here is the updated plan with the new milestones. The working draft is linked at the bottom.\",\"attachDraft\":true,\"draftId\":\"doc_4821\"}}","status":"pending","localOnly":false,"remoteResolvable":true}]"##,
         "InboxItemRecord": #"[{"id":"design-inbox","created_at":"2026-09-07T18:00:00Z","source":"desk","severity":"info","title":"The research summary is ready to read","summary":"Three sources agree on the main result. One open question is included for the next conversation.","actions":[],"status":"unread"}]"#,
         "MobileDeskItem": #"[{"handle":"design-desk","alias":"D-14","kind":"task","status":"active","project":"Weekend research and planning","title":"Collect the final notes for the project review","summary":"Compare the remaining sources and prepare a short summary.","openedAt":"2026-09-07T18:00:00Z","updatedAt":"2026-09-07T18:00:00Z","pinned":false,"blockedOn":[],"origin":"user","requiresOwnerInput":false,"recentNotes":[]}]"#,
-        "WorkshopTaskRecord": #"[{"id":"design-task","title":"Prepare the project reading list","objective":"Collect the most useful references and explain what each adds.","status":"running","phase":"Research","summary":"Reviewing the final two references.","createdAt":"2026-09-07T18:00:00Z"}]"#,
         "KGEntity": #"[{"id":"design-entity","name":"Weekend research and planning","type":"project","mention_count":12,"aliases":["Reading list"],"summary":"A collection of references and decisions for the next project review."}]"#,
         "SkillManifestEntry": #"[{"id":"design-skill","name":"Research notes and source comparison","description":"Collect useful sources, compare the evidence, and write a concise summary.","source":"persona_body","triggers":[],"status":"active"}]"#,
         "MobileAppSetting": #"[{"id":"chat.file_access","page":"chat","label":"Chat file access","type":"choice","choices":["auto","workspace","read_only","none"],"writable":true,"value":"read_only"},{"id":"chat.quiet_mode","page":"chat","label":"Quiet mode","type":"boolean","choices":[],"writable":true,"value":"true"},{"id":"memories.mode","page":"memories","label":"Memory mode","type":"choice","choices":["performance","balanced","low_memory"],"writable":true,"value":"low_memory"},{"id":"memories.cross_session","page":"memories","label":"Remember across conversations","type":"boolean","choices":[],"writable":true,"value":"false"}]"#,
@@ -44,13 +43,12 @@ enum MobileDesignSamples {
     #endif
 }
 
-/// Secondary screens consume the shared foundation without adding another palette.
 struct MobileReadingSurface<Content: View>: View {
     @Environment(\.colorSchemeContrast) private var contrast
     @ViewBuilder var content: () -> Content
 
     var body: some View {
-        // The alive card: a fill over the haze, never glass (AliveKit).
+        // Content uses a fill over the haze; glass belongs to controls.
         content()
             .padding(NativeAgentMobileTheme.Spacing.lg)
             .aliveCard(radius: 16)
@@ -81,7 +79,6 @@ struct MobileReadingStat: View {
     }
 }
 
-/// Switch horizontal controls and facts to a reading column at accessibility sizes.
 struct MobileAdaptiveRow<Content: View>: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     var alignment: VerticalAlignment = .center
@@ -100,31 +97,12 @@ extension View {
     func mobileReadingScreen() -> some View {
         scrollContentBackground(.hidden)
             .background { AliveRoom() }
-            // In a sheet the room is the sheet itself, edge to edge under its
-            // bar, so every sheet wears the haze like the screens do. Ignored
-            // outside a presentation.
+            // Sheet backgrounds extend edge to edge so haze remains continuous under the bar.
             .presentationBackground { AliveRoom() }
-            // The haze control tint: sheet toolbar buttons (Done, Cancel,
-            // Add), links and pickers all take the chosen colour.
             .hazeTinted()
             .environment(\.defaultMinListRowHeight, NativeAgentMobileTheme.Layout.controlHeight)
             .navigationBarTitleDisplayMode(.inline)
             .allowsHitTesting(MobileDesignSamples.screen == nil)
-    }
-}
-
-enum RunsLogPresentation: Equatable {
-    case content
-    case empty
-    case unavailable(String)
-
-    static func state(runs: [RunRecord], hasLoaded: Bool, error: String?) -> RunsLogPresentation {
-        guard runs.isEmpty else { return .content }
-        if let error, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return .unavailable(error)
-        }
-        guard hasLoaded else { return .unavailable("The Mac run snapshot has not arrived. Keep NativeAgent open on the paired Mac and refresh after reconnecting.") }
-        return .empty
     }
 }
 
@@ -185,8 +163,7 @@ enum RunDetailCopyPresentation {
 enum RunDetailPromptPresentation {
     static let unavailableDescription = "The prompt was not captured for this run."
 
-    /// Keep the captured prompt verbatim for copy fidelity, but do not render a
-    /// prompt section (or a Copy action) for a blank payload.
+    /// Preserve the prompt verbatim for copying; blank payloads must not offer a section or Copy action.
     static func copyablePrompt(_ prompt: String?) -> String? {
         guard let prompt,
               !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -195,8 +172,7 @@ enum RunDetailPromptPresentation {
         return prompt
     }
 
-    /// Display only content fields, never JSON syntax or packed instructions.
-    /// Unknown, clipped or malformed structured requests say so; raw stays reachable.
+    /// Show content fields rather than packed instructions; name malformed/unknown data while retaining raw access.
     static func summary(_ prompt: String?) -> String? {
         guard let raw = copyablePrompt(prompt) else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -205,12 +181,6 @@ enum RunDetailPromptPresentation {
             guard !line.isEmpty else { return nil }
             if line.hasPrefix("{") || line.hasPrefix("[") { return nil }
             return line.count > 200 ? String(line.prefix(199)) + "…" : line
-        }
-        // Exact headings produced by Resources/prompts/workshop-plan.md and
-        // workshop-synthesis.md; the captured prompt itself stays untouched.
-        for heading in ["Workshop task title: ", "Workshop task objective: "] {
-            if let line = trimmed.components(separatedBy: .newlines).first(where: { $0.hasPrefix(heading) }),
-               let summary = text(String(line.dropFirst(heading.count))) { return summary }
         }
         if let object = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)) {
             func content(_ value: Any, depth: Int = 0) -> String? {
@@ -238,49 +208,6 @@ enum RunDetailPromptPresentation {
     }
 }
 
-enum OrganismStatusPresentation {
-    enum SnapshotState: Equatable {
-        case available
-        case disabled
-        case unavailable(reason: String?)
-        case invalidTimestamp(futureBy: TimeInterval)
-        case stale(age: TimeInterval)
-        case absent
-
-        var displaysDetails: Bool {
-            switch self {
-            case .available, .stale: true
-            case .disabled, .unavailable, .invalidTimestamp, .absent: false
-            }
-        }
-    }
-
-
-    static func snapshotState(
-        for organism: OrganismLivingStatusFile?,
-        now: Date = Date(),
-        maximumAge: TimeInterval = 300,
-        maximumFutureClockSkew: TimeInterval = 60
-    ) -> SnapshotState {
-        guard let organism else { return .absent }
-        switch organism.availabilityState {
-        case .unavailable:
-            return .unavailable(reason: organism.unavailableReason)
-        case .disabled:
-            return .disabled
-        case .live:
-            let age = now.timeIntervalSince(organism.generatedAt)
-            let allowedFutureSkew = max(0, maximumFutureClockSkew)
-            if age < -allowedFutureSkew {
-                return .invalidTimestamp(futureBy: -age)
-            }
-            return age > maximumAge ? .stale(age: age) : .available
-        }
-    }
-
-}
-
-/// Mac-owned snapshots become stale after 30 seconds on every phone surface.
 enum StatusConnectionPresentation {
     static let staleAfter: TimeInterval = 30
 

@@ -3,17 +3,10 @@ import CoreFoundation
 import NativeAgentShared
 // Blueprint: | `NativeAgentBuildIdentity.swift` | checked process-cached current app stamps; incomplete identity unavailable; `writeLaunchStamp` refuses it |
 
-/// Exact identity of the bytes currently running inside the app bundle.
-///
-/// Development and release builders stamp these values before signing. The
-/// source revision is useful only together with `sourceDirty`: a dirty build is
-/// intentionally never presented as exact proof of the named commit.
-/// `sourceContentID` identifies the source snapshot, including dirty edits.
-///
-/// All surfaces read the same process-cached running-binary identity.
+/// Build identity belongs to the running binary, shared across surfaces. A revision is exact proof only with sourceDirty; sourceContentID also binds dirty
+/// edits.
 public struct NativeAgentBuildIdentity: Sendable, Equatable {
-    /// Display labels. Unavailable processes say so explicitly; the payload
-    /// and launch writer never present these labels as stamped metadata.
+    /// Display labels. Unavailable processes say so explicitly; the payload and launch writer never present these labels as stamped metadata.
     public let version: String
     public let build: String
     public let sourceRevision: String?
@@ -62,7 +55,9 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
               let contentID = nonempty(infoDictionary["NativeAgentSourceContentID"] as? String),
               Self.isFullGitObjectID(contentID),
               let resourcesURL else {
-            return Self(unavailable: "This process has no complete current app stamp. Rebuild and install the app; command-line processes have no app identity.")
+            return Self(unavailable: """
+                This process has no complete current app stamp. Rebuild and install the app; command-line processes have no app identity.
+                """)
         }
         do {
             let resourceRevision = try String(contentsOf: resourcesURL.appendingPathComponent("VERSION_SHA"), encoding: .utf8)
@@ -113,7 +108,7 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             "sourceDirty": sourceDirty.map { $0 as Any } ?? NSNull(),
             "sourceContentID": sourceContentID ?? NSNull(),
             "writtenAt": NativeTimestampFormat.plainZulu(at),
-            // Which process this launch is: the same build relaunched is a new window.
+            // A relaunch needs a new window identity even when the build is unchanged.
             "pid": Int(ProcessInfo.processInfo.processIdentifier),
         ]
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

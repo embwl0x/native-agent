@@ -1,15 +1,34 @@
 import NativeAgentShared
-
-// Blueprint: | `InboxSettingsView.swift` | `InboxSettingsView`: master/trigger controls, independent writer outcomes and history navigation over canonical inbox policy |
 import SwiftUI
+import Observation
 import NativeAgentCore
 import NotificationInbox
 import TrustCenter
 import TriggerScheduler
 import PersistenceCore
+// Blueprint: | `InboxSettingsView.swift` | Notification preferences, trigger labels and shared history navigation over InboxFacade's ForPerson reading |
 
-/// A visible Inbox Policy outcome carries its own severity. Status text is
-/// user-facing copy and must never be treated as an error protocol.
+@MainActor @Observable final class InboxHistoryNavigation {
+    static let shared = InboxHistoryNavigation()
+    var isPresented = false
+}
+
+extension TriggerConfig: @retroactive Identifiable {
+    public var id: String { name }
+
+    var displayName: String {
+        switch name {
+        case "idle_checkin": return "Idle check-in"
+        case "morning_brief": return "Morning brief"
+        default:
+            let words = name.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
+            guard let first = words.first else { return name }
+            return String(first).uppercased() + words.dropFirst()
+        }
+    }
+}
+
+/// Severity belongs to the operation; user-facing status text is not an error protocol.
 struct InboxPolicyStatus: Equatable {
     enum Tone: Equatable {
         case success
@@ -20,7 +39,6 @@ struct InboxPolicyStatus: Equatable {
     let tone: Tone
 }
 
-/// Each writer owns its visible outcome; a successful toggle cannot hide a failed read.
 struct InboxPolicyStatusSlot: Equatable {
     enum Source: Hashable, Comparable {
         case settingsRead
@@ -60,8 +78,7 @@ struct InboxPolicyStatusSlot: Equatable {
 
 }
 
-/// Rendered truth for the policy's history sheet. This deliberately has no
-/// collection state: cards come directly from the engine's inbox revision.
+/// Render cards directly from the engine revision so history cannot drift in a second collection.
 enum InboxHistoryPresentation {
     static func statusLabel(for item: InboxItemRecord) -> String {
         switch item.normalizedStatus {
@@ -75,9 +92,7 @@ enum InboxHistoryPresentation {
     }
 }
 
-/// Trust reads are a three-state fact. `false` is meaningful only after a
-/// successful read; using it as the initial value made an unreadable policy
-/// look intentionally disabled and hid the trigger inventory behind it.
+/// False is a policy value only after a successful read; unread authority must not hide triggers as though intentionally disabled.
 enum InboxPolicyTrustReadState: Equatable {
     case loading
     case loaded(enabled: Bool)
@@ -89,7 +104,7 @@ struct InboxSettingsView: View {
 
     @State private var isSaving = false
     @State private var statusSlot = InboxPolicyStatusSlot()
-    @State private var showInboxHistory = false
+    @State private var history = InboxHistoryNavigation.shared
     private var triggers: [TriggerConfig] { appModel.engine.inbox.triggerRows }
     private var triggersRead: Bool { appModel.engine.inbox.triggersRead }
     private var isLoading: Bool { appModel.engine.inbox.isLoadingTriggers }
@@ -138,23 +153,22 @@ struct InboxSettingsView: View {
         .liveTask {
             async let policy: Void = appModel.engine.trust.observeInboxPolicy()
             async let triggers: Void = appModel.engine.inbox.observeTriggers()
-            _ = await (policy, triggers)
+            async let notes: Void = appModel.engine.inbox.observe()
+            _ = await (policy, triggers, notes)
         }
-        .sheet(isPresented: $showInboxHistory) {
+        .sheet(isPresented: $history.isPresented) {
             InboxHistoryView(
                 onRefresh: { await refreshInboxHistory() },
-                onClose: { showInboxHistory = false }
+                onClose: { history.isPresented = false }
             )
+            .task { await refreshInboxHistory() }
             .environment(appModel)
             .presentationDetents([.large])
         }
     }
 
-    // ── Alive glass ─────────────────────────────────────────────────────
 
-    /// The header's one sentence, in the agent's own voice. No "waiting"
-    /// count: this page holds settings, not things waiting on him. Nil until
-    /// both the setting and the triggers have been read.
+    /// Keep the header unknown until both policy and triggers are read; settings are not pending work.
     private var headerLine: String? {
         guard triggersRead else { return nil }
         switch trustReadState {
@@ -168,16 +182,16 @@ struct InboxSettingsView: View {
         }
     }
 
-    /// Same controls, same writes: the master switch and every trigger in ONE
-    /// group card, each row a title, a detail and the haze switch; the history
-    /// is a quiet line under it.
     private var aliveContent: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             VStack(alignment: .leading, spacing: 12) {
                 AliveGroupCard {
                     InboxAliveSwitchRow(
                         title: "Let \(appModel.agentDisplayName) raise things unasked",
-                        detail: "When this is on, \(appModel.agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without being asked.",
+                        detail: """
+                            When this is on, \(appModel.agentDisplayName) can share observations, file changes, finished Desk tasks and check-ins without \
+                            being asked.
+                            """,
                         isOn: masterEnabled,
                         isSaving: isSaving
                     )
@@ -257,7 +271,6 @@ struct InboxSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // ── Data loading ──────────────────────────────────────────────────────
 
     private var triggersReadFailed: Bool {
         appModel.engine.inbox.triggerError != nil
@@ -280,12 +293,14 @@ struct InboxSettingsView: View {
             try await appModel.engine.inbox.setTrigger(name, enabled: enabled)
             statusSlot.record(InboxPolicyStatus(text: "\(name) \(enabled ? "enabled" : "disabled").", tone: .success), from: .triggerToggle(name))
         } catch {
-            statusSlot.record(InboxPolicyStatus(text: UserFacingError.message(error, action: "change that trigger"), tone: .failure), from: .triggerToggle(name))
+            statusSlot.record(
+                InboxPolicyStatus(text: UserFacingError.message(error, action: "change that trigger"), tone: .failure),
+                from: .triggerToggle(name))
         }
     }
 
     private func openInboxHistory() async {
-        showInboxHistory = true
+        history.isPresented = true
         await refreshInboxHistory()
     }
 
@@ -303,9 +318,7 @@ struct InboxSettingsView: View {
 
 // MARK: - Inbox history
 
-/// Read-only history projection used only by Inbox Policy. It intentionally
-/// does not mount `InboxView`: there is one source of inbox rows, the shared
-/// InboxFacade revision, and this sheet merely renders it.
+/// Preferences history reads the shared InboxFacade revision.
 struct InboxHistoryView: View {
     @Environment(AppModel.self) private var appModel
 
@@ -391,8 +404,7 @@ private struct InboxHistoryRow: View {
                     .foregroundStyle(NativeAgentShell.tertiary)
             }
             Spacer(minLength: 8)
-            // The teal is the room's one "waiting on you" colour, and an
-            // unread inbox card is exactly that; a read one goes quiet.
+            // Unread notes use the waiting colour; read notes stay quiet.
             Text(InboxHistoryPresentation.statusLabel(for: item))
                 .font(ShellType.captionMedium)
                 .foregroundStyle(item.isUnread ? NativeAgentShell.needsYou : NativeAgentShell.secondary)
@@ -410,8 +422,6 @@ struct TriggerRowView: View {
 
     @State private var pendingEnabled: Bool?
 
-    /// Title, detail, haze switch. No glyph, and no pulsing dot: the switch
-    /// already says on, and nothing here animates per frame.
     var body: some View {
         InboxAliveSwitchRow(
             title: trigger.displayName,
@@ -429,16 +439,13 @@ struct TriggerRowView: View {
         pendingEnabled = enabled
         Task {
             await onToggle(enabled)
-            // The inbox owner publishes committed state, including changes
-            // made elsewhere while this request was pending.
+            // Publish the inbox owner's committed state, including writes made elsewhere while the request waited.
             pendingEnabled = nil
         }
     }
 }
 
-/// One row of the alive settings card: a title, a detail under it, and the
-/// haze switch on the right. The switch carries the title as its label, so
-/// it names itself the way the labelled toggle it replaces did.
+/// Give the switch its row title as an accessible label.
 private struct InboxAliveSwitchRow: View {
     let title: String
     let detail: String?

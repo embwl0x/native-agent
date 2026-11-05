@@ -1,7 +1,6 @@
 import Foundation
 // Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` owns the document shape, vocabulary and seed; `SurfaceLayoutAvailability` carries its checked value or `SurfaceLayoutFailure` path/detail/repair across Mac and phone, and exposes shipped content names through their shipped profiles without supplying a substitute layout. `addMissing`, `shown`, `arranged` project validated layouts; `QuietToolPage` owns shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases and door resolution (`step`, `place`, home rooms), deriving accepted part face pages from those definitions |
 
-/// The layout owner publishes either its checked document or its repair, including to the phone.
 public enum SurfaceLayoutAvailability: Codable, Sendable, Equatable {
     case available(SurfaceLayout)
     case unavailable(SurfaceLayoutFailure)
@@ -23,10 +22,8 @@ public enum SurfaceLayoutAvailability: Codable, Sendable, Equatable {
         return nil
     }
 
-    /// Layout controls presentation, never whether shipped content exists.
-    /// An unavailable document exposes the vocabulary with its failure; it
-    /// supplies no saved layout, fold state or writable version. The shipped
-    /// profile still determines which content belongs in this view.
+    /// Layout controls presentation, never whether shipped content exists. An unavailable document exposes the vocabulary with its failure; it supplies no
+    /// saved layout, fold state or writable version. The shipped profile still determines which content belongs in this view.
     public func contentNames(_ surface: String, profile: String?) -> [String] {
         switch self {
         case .available(let layout): return layout.shown(surface, profile: profile).map(\.name)
@@ -64,7 +61,11 @@ public struct QuietToolPage: Sendable, Equatable {
 
     public static let all: [QuietToolPage] = [
         QuietToolPage(id: "chat", title: "Chat",
-                  summary: "Conversations, attachments, voice, agent name and status. Background read: page:chat, item:<conversation id>, 8 messages (args {limit}: max 16). Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow next_call. chat.message expands clipped bodies. Screen controls are separate actions."),
+                  summary: """
+                      Conversations, attachments, voice, agent name and status. Background read: page:chat, item:<conversation id>, 8 messages (args \
+                      {limit}: max 16). Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow \
+                      next_call. chat.message expands clipped bodies. Screen controls are separate actions.
+                      """),
         QuietToolPage(id: "today", title: "Today",
                   summary: "Notifications, approvals, proposals, recent work, and what is waiting."),
         QuietToolPage(id: "memories", title: "Memories",
@@ -88,12 +89,16 @@ public struct QuietToolPage: Sendable, Equatable {
         QuietToolPage(id: "mac_integration", title: "Mac Integration",
                   summary: "Read and write access per Mac app: Calendar, Mail, Messages, Notes and the rest."),
         QuietToolPage(id: "pairing", title: "iPhone pairing",
-                  summary: "Paired phones and the iCloud pairing status. item:phone-senses reads each phone sense's setup, missing steps and the Phone senses guide."),
+                  summary: """
+                      Paired phones and the iCloud pairing status. item:phone-senses reads each phone sense's setup, missing steps and the Phone \
+                      senses guide.
+                      """),
         QuietToolPage(id: "agents", title: "Agents",
-                  summary: "Agent contacts and coding helpers: message, read, connect, stop, recipes, bridge jobs, and Claude's worklog of what she has been doing and working on, newest first."),
-        // Each Mac app and connector her actions reach is a page of its own:
-        // its access or connection, and its actions. A Mac app's page is
-        // where User sets its access (Trust → Mac integration).
+                  summary: """
+                      Agent contacts and coding helpers: message, read, connect, stop, recipes, bridge jobs, and Claude's worklog of what Claude has \
+                      been doing and working on, newest first.
+                      """),
+        // Each app’s page owns its access controls so the person can change access where its actions live.
         QuietToolPage(id: "mail", title: "Mail",
                   summary: "Apple Mail (every account added to Mail, Gmail included): read, search, triage, send and reply."),
         QuietToolPage(id: "calendar", title: "Calendar",
@@ -105,8 +110,7 @@ public struct QuietToolPage: Sendable, Equatable {
                   summary: "Contacts: search, create or update, and delete."),
         QuietToolPage(id: "messages", title: "Messages", summary: "Messages: recent threads, and send."),
         QuietToolPage(id: "slack", title: "Slack", summary: "Slack's connection and the model the agent answers Slack with."),
-        // Her hands on the Mac and the web. Files, the shell and the browser
-        // are Trust's to allow.
+        // Trust owns access to files, the shell and the browser.
         QuietToolPage(id: "files", title: "Files",
                   summary: "Read, list, search, excerpt and write files; apply a patch; Spotlight."),
         QuietToolPage(id: "shell", title: "Shell",
@@ -115,10 +119,12 @@ public struct QuietToolPage: Sendable, Equatable {
                   summary: "Read a public page privately, and search the web."),
         QuietToolPage(id: "browser", title: "Browser",
                   summary: "The NativeAgent browser and your own Chrome tab: open, read, links, screenshots, clicks and forms."),
-        // Her hands on the Mac itself: Full Mac's accessibility category is
-        // Trust's to allow; Music's access is Mac integration's.
+        // Trust owns Full Mac accessibility; Mac integration owns Music access.
         QuietToolPage(id: "mac", title: "Mac",
-                  summary: "The live screen: look, act by name, go to an app, file or URL, wait, read a document, menus, the clipboard, system info and app activity."),
+                  summary: """
+                      The live screen: look, act by name, go to an app, file or URL, wait, read a document, menus, the clipboard, system info and app \
+                      activity.
+                      """),
         QuietToolPage(id: "music", title: "Music",
                   summary: "Apple Music: what's playing, play, pause or skip, search the library, tracks and playlists."),
         QuietToolPage(id: "capabilities", title: "Capabilities",
@@ -179,11 +185,9 @@ public enum AppDoorNames {
         return aliases[key] ?? key
     }
 
-    /// One step of where the door takes a call's page before anything reads
-    /// or acts (`AppToolExecutor.runAppDoor`): an alias resolves and a
-    /// `page/item` path splits (`label` is the resolved page); with no action
-    /// and no item, a home room named as a page becomes home's item and `app`
-    /// is home (an empty `page` means none). Nil when the place is final.
+    /// One step of where the door takes a call's page before anything reads or acts (`AppToolExecutor.runAppDoor`): an alias resolves and a `page/item`
+    /// path splits (`label` is the resolved page); with no action and no item, a home room named as a page becomes home's item and `app` is home (an empty
+    /// `page` means none). Nil when the place is final.
     public static func step(page: String, item: String, action: Bool) -> (page: String, item: String?, label: String)? {
         let requested = page.trimmingCharacters(in: .whitespacesAndNewlines)
         let canonical = resolve(requested)
@@ -196,14 +200,12 @@ public enum AppDoorNames {
         return canonical == "app" ? ("", nil, "home") : ("home", canonical, "home." + canonical)
     }
 
-    /// The place the door's steps end at, for a call that names no action:
-    /// a page and item that are home's (or no page and an item) open or do
-    /// what home's item says; anything else reads.
+    /// The place the door's steps end at, for a call that names no action: a page and item that are home's (or no page and an item) open or do what home's
+    /// item says; anything else reads.
     public static func place(page: String, item: String) -> (page: String, item: String) {
         var page = page.trimmingCharacters(in: .whitespacesAndNewlines)
         var item = item.trimmingCharacters(in: .whitespacesAndNewlines)
-        // An alias resolves to a canonical page and a path splits once, so the
-        // steps end within a few; the bound only guards a cycle in the table.
+        // An alias resolves to a canonical page and a path splits once, so the steps end within a few; the bound only guards a cycle in the table.
         for _ in 0..<8 {
             guard let next = step(page: page, item: item, action: false) else { break }
             page = next.page
@@ -213,28 +215,34 @@ public enum AppDoorNames {
     }
 
     public static let items: [String: [String: String]] = [
-        "chat": ["<conversation id>": "background read: page:chat, item:<conversation id>; composer, latest 8 messages (args {limit}: max 16), and chat.reply eligibility. "
-                 + "Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow next_call. chat.message expands clipped bodies. Screen controls are separate actions."],
+        "chat": ["<conversation id>":
+            "background read: page:chat, item:<conversation id>; composer, latest 8 messages (args {limit}: max 16), and chat.reply eligibility. "
+                 + """
+                     Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow next_call. chat.message \
+                     expands clipped bodies. Screen controls are separate actions.
+                     """],
         "inbox": ["all": "compact notes newest first, archived and dismissed too, up to 200; read a note id for details and actions"],
         "desk": ["<exact title or handle>": "the matching Desk record; duplicate titles require the exact desk number"],
-        "pairing": ["phone-senses": "Phone senses guide: last reported per-sense on/off, iOS permission, missing setup and exact phone Settings steps; observations with source/time"],
+        "pairing": ["phone-senses": """
+            Phone senses guide: last reported per-sense on/off, iOS permission, missing setup and exact phone Settings steps; observations with \
+            source/time
+            """],
         "diagnostics": ["doctor": "Doctor's last report; run doctor.run for fresh checks"],
         "telegram": ["status": "the poller's health, config and log freshness; never tokens or ids"],
         "skills": ["<skill name>": "the built-in guidance, as ability.read reads it",
                    "census": "conversion progress and blockers, including preserved historical originals"],
         "tools": ["<ability id or name>": "what the ability declares, its status, versions and validation, and its code in pages",
-                  "census": "Abilities, persona procedures, senses and built-in guidance: what you grew, active/retired status, retained/waiting versions, conversion counterparts and cutover blockers."],
+                  "census": """
+                      Abilities, persona procedures, senses and built-in guidance: what you grew, active/retired status, retained/waiting versions, \
+                      conversion counterparts and cutover blockers.
+                      """],
     ]
 }
 
-/// How each surface lays out its named blocks: their order, which are hidden,
-/// whether a fold starts open, and per view (a profile: simple, advanced or
-/// agent, the `nativeagent.viewMode` values) which blocks that view leaves
-/// out. One document, ui/layout.json under the data root: written by the
-/// Mac's `SurfaceLayoutStore`, drawn by the Mac's views and her home, and
-/// carried to the phone in the core snapshot. Blocks, order, hidden,
-/// expanded and profiles only: nothing here names a colour, a font, a
-/// material or a size.
+/// How each surface lays out its named blocks: their order, which are hidden, whether a fold starts open, and per view (a profile: simple, advanced or
+/// agent, the `nativeagent.viewMode` values) which blocks that view leaves out. One document, ui/layout.json under the data root: written by the Mac's
+/// `SurfaceLayoutStore`, drawn by the Mac's views and the agent's home, and carried to the phone in the core snapshot. Blocks, order, hidden, expanded
+/// and profiles only: nothing here names a colour, a font, a material or a size.
 public struct SurfaceLayout: Codable, Sendable, Equatable {
     public struct Block: Codable, Sendable, Equatable {
         public var name: String
@@ -254,39 +262,34 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
 
     /// 1 as seeded; each write bumps it. A hand edit bumps nothing.
     public var layoutVersion: Int
-    /// The app build whose seed this layout started from.
     public var seededFrom: String
     public var updatedAt: String
-    /// What wrote this version: seed, her or person.
     public var source: String
     /// The layout's digest as this app last wrote it; a hand edit leaves it behind.
     public var digest: String
     public var surfaces: [String: [Block]]
     public var profiles: [String: Profile]
-    /// The profile the phone shows.
     public var phone: String
 
     public static let path = "ui/layout.json"
 
-    /// Home's PLACES rows: the places seed, and where a row breaks.
     public static let placeRows: [[String]] = [
         ["mail", "calendar", "desk", "files", "browser"],
         ["memory", "skills", "research", "messages", "reminders", "today", "replies", "create", "connections", "crews", "delegations", "code"],
         ["notes", "contacts", "music", "slack", "notify", "status", "activity", "app"],
     ]
 
-    /// Every surface, what it is, and its blocks in seed order with what each
-    /// shows (empty when the name says it). The seed and the vocabulary: a
-    /// name not here is refused, and one a newer build adds is placed at its
-    /// seed position in a layout that lacks it.
+    /// Every surface, what it is, and its blocks in seed order with what each shows (empty when the name says it). The seed and the vocabulary: a name not
+    /// here is refused, and one a newer build adds is placed at its seed position in a layout that lacks it.
     public static let vocabulary: [(surface: String, about: String, blocks: [(name: String, shows: String)])] = [
-        ("home", "Her home (app {} and the Agent view), top to bottom; people and helpers are also the Simple sidebar's Agents and Helpers, in this order", [
-            ("notable", "NOTABLE TODAY"), ("changed", "CHANGED since she last looked"), ("waits", "what waits on the person"),
-            ("queue", "MY QUEUE"), ("working", "WORKING: crews at work"), ("open", "OPEN: this chat's windows"),
-            ("people", "PEOPLE: the agents she talks to"), ("helpers", "HELPERS"), ("senses", "MY SENSES"),
+        ("home", "Home (app {} and the Agent view), top to bottom; people and helpers are also the Simple sidebar's Agents and Helpers, in this order", [
+            ("notable", "NOTABLE TODAY"), ("changed", "CHANGED since the agent last looked"), ("waits", "what waits on the person"),
+            ("queue", "MY QUEUE"), ("working", "WORKING: the agent's jobs and lines at work"), ("open", "OPEN: this chat's windows"),
+            ("people", "PEOPLE: the agents in conversation with this agent"), ("helpers", "HELPERS"), ("senses", "MY SENSES"),
             ("elsewhere", "ELSEWHERE"), ("places", "PLACES, in the places order"), ("mac", "MAC"),
         ]),
-        ("places", "Home's PLACES rows and the Agent view's rooms; a hidden place that names a page also leaves app {}'s page index", placeRows.joined().map { ($0, "") }),
+        ("places", "Home's PLACES rows and the Agent view's rooms; a hidden place that names a page also leaves app {}'s page index",
+            placeRows.joined().map { ($0, "") }),
         ("rail", "Advanced's rail, top to bottom, the last shown at its foot; a hidden page also leaves app {}'s page index", [
             ("chat", ""), ("today", ""), ("memories", ""), ("desk", ""), ("notifications", ""), ("bots", "Helpers"),
             ("divider", "the line between the rail's two groups"), ("personality", ""), ("providers", ""), ("trust", ""),
@@ -303,9 +306,9 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
         ("tabs.personality", "Personality's tabs, left to right", [("personality", ""), ("minds", "My minds"), ("dreams", "")]),
         ("tabs.trust", "Trust's tabs, left to right", [("trust", "Access"), ("features", ""), ("mac", ""), ("advanced", "")]),
         ("tabs.connectors", "Connectors' tabs, left to right", [("connectors", ""), ("agents", ""), ("telegram", ""), ("iphone", "")]),
-        ("tabs.capabilities", "Capabilities' tabs, left to right", [("capabilities", "What I can do"), ("installed", "What's installed"), ("senses", "")]),
+        ("tabs.capabilities", "Capabilities' tabs, left to right", [("capabilities", "What I can do"), ("senses", "")]),
         ("tabs.diagnostics", "Diagnostics' tabs, left to right", [
-            ("Doctor", "Health checks"), ("Status", ""), ("Runs Log", "Run history"), ("Cognition", ""),
+            ("diagnostics", "Health checks, status and runs"), ("Cognition", ""),
             ("Inspector", "Chat turn details"), ("skills", ""), ("tools", ""),
         ]),
         ("more", "The iPhone's More page, top to bottom", [("rooms", "Rooms"), ("setup", "Setup"), ("power", "Power user")]),
@@ -314,14 +317,16 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
     /// Blocks that fold, and so carry `expanded`; each starts closed.
     public static let folds: Set<String> = ["chat.briefs", "chat.working"]
 
-    public static let profilesAbout = "simple, advanced and agent are the window's views (settings.view_mode shows one); each hides surface.block names in that view only. phone is the profile the iPhone shows."
+    public static let profilesAbout = """
+        simple, advanced and agent are the window's views (settings.view_mode shows one); each hides surface.block names in that view only. phone is \
+        the profile the iPhone shows.
+        """
 
     public static let shippedProfiles: [String: Profile] = [
         "simple": Profile(hidden: ["chat.rows", "chat.briefs", "chat.working"]),
         "advanced": Profile(hidden: []), "agent": Profile(hidden: []),
     ]
 
-    /// Today's hardcoded orders. Simple shows no conversations column.
     public static func seed(from build: String, at: String, hidden: Set<String> = []) -> SurfaceLayout {
         var surfaces: [String: [Block]] = [:]
         for (surface, _, blocks) in vocabulary {
@@ -335,8 +340,18 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
                              phone: "simple")
     }
 
-    /// A surface, profile or block a newer build added, at its seed position:
-    /// after the nearest block that comes before it in the seed.
+    /// A surface, profile or block a newer build added, at its seed position: after the nearest block that comes before it in the seed.
+    /// A saved layout reads in the current vocabulary: a surface or block the vocabulary no longer has leaves, and what the person chose
+    /// about every other block stands.
+    public mutating func dropRemoved() {
+        let known = Dictionary(uniqueKeysWithValues: Self.vocabulary.map { ($0.surface, Set($0.blocks.map(\.name))) })
+        surfaces = Dictionary(uniqueKeysWithValues: surfaces.compactMap { surface, blocks in
+            known[surface].map { names in (surface, blocks.filter { names.contains($0.name) }) }
+        })
+        let named = Set(known.flatMap { surface, names in names.map { surface + "." + $0 } })
+        for name in profiles.keys { profiles[name]?.hidden.removeAll { !named.contains($0) } }
+    }
+
     public mutating func addMissing() {
         let fresh = Self.seed(from: seededFrom, at: updatedAt)
         for (surface, seeded) in fresh.surfaces {
@@ -350,14 +365,12 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
         for (name, profile) in fresh.profiles where profiles[name] == nil { profiles[name] = profile }
     }
 
-    /// A surface's blocks as `profile` shows them, in order.
     public func shown(_ surface: String, profile: String?) -> [Block] {
         let off = Set(profile.flatMap { profiles[$0]?.hidden } ?? [])
         return (surfaces[surface] ?? []).filter { !$0.hidden && !off.contains(surface + "." + $0.name) }
     }
 
-    /// `items` in the surface's order as `profile` shows them; one the
-    /// layout hides is left out.
+    /// `items` in the surface's order as `profile` shows them; one the layout hides is left out.
     public func arranged<Item>(_ surface: String, profile: String?, _ items: [Item], name: (Item) -> String) -> [Item] {
         shown(surface, profile: profile).compactMap { block in items.first { name($0) == block.name } }
     }

@@ -3,12 +3,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `PartRunStore.swift` | Checked HMAC-sealed checkpoints under skills/runs; a rename claims one byte image, failures preserve it, and explicit claim settlement consumes or releases it; checked retention/discard and DataRootLife projection |
+// Blueprint: | `PartRunStore.swift` | Sealed bounded checkpoints; rename claims bytes until explicit settlement |
 
-/// Stopped part runs, kept to resume: one file each under skills/runs in
-/// the data root, sealed (`seal`), at most 256 KB, the newest 50 waiting runs.
-/// Local backup/export include skills/; phone sync excludes runs; PrivacyMap lists skills.
-/// The seal stops edits, not a local writer: whoever can write the data root can read the 0600 key beside it.
+/// Seal bounded resumable checkpoints, retaining at most 50 waiting runs.
+/// The key prevents accidental edits, not a writer that controls the data root.
+/// Local export retains runs; phone sync excludes them.
 public enum PartRunStore {
     public static let keep = 50
     public static let byteLimit = 256 * 1024
@@ -43,7 +42,8 @@ public enum PartRunStore {
         for url in [file(id, root: root), claimedFile(id, root: root)] {
             do { try FileManager.default.removeItem(at: url); removed = true }
             catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError { continue }
-            catch { throw failure("run_cleanup_failed", "Checkpoint cleanup at \(url.path) failed: \(error.localizedDescription).", at: url, effects: removed ? .partial : .none) }
+            catch { throw failure("run_cleanup_failed", "Checkpoint cleanup at \(url.path) failed: \(error.localizedDescription).", at: url,
+                effects: removed ? .partial : .none) }
         }
     }
 
@@ -52,7 +52,8 @@ public enum PartRunStore {
         let directory = file("", root: root).deletingLastPathComponent()
         do { paths = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return [] }
-        catch { throw failure("run_inventory_unavailable", "Saved-run inventory at \(directory.path) could not be read: \(error.localizedDescription).", at: directory) }
+        catch { throw failure("run_inventory_unavailable", "Saved-run inventory at \(directory.path) could not be read: \(error.localizedDescription).",
+            at: directory) }
         return paths.filter { $0.lastPathComponent.range(of: "^run-[0-9a-f]{8}\\.json$", options: .regularExpression) != nil }
             .map { $0.deletingPathExtension().lastPathComponent }.sorted()
     }
@@ -74,7 +75,8 @@ public enum PartRunStore {
             }
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             do {
-                let runs = try fm.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey])
+                let runs = try fm.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: [.contentModificationDateKey,
+                    .isRegularFileKey])
                     .filter { $0.lastPathComponent.range(of: "^run-[0-9a-f]{8}\\.json$", options: .regularExpression) != nil }
                 let newest = try runs.map { path -> (URL, Date) in
                     let properties = try path.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
@@ -85,10 +87,13 @@ public enum PartRunStore {
                 }.sorted { $0.1 > $1.1 }
                 for (old, _) in newest.dropFirst(keep) { try fm.removeItem(at: old) }
             } catch {
-                throw failure("run_retention_failed", "Checkpoint was saved at \(url.path), but retention failed: \(error.localizedDescription).", at: url, effects: .occurred)
+                throw failure("run_retention_failed", "Checkpoint was saved at \(url.path), but retention failed: \(error.localizedDescription).", at: url,
+                    effects: .occurred)
             }
         } catch let error as ToolFailureError { throw error }
-        catch { throw failure("run_save_failed", "Checkpoint save at \(url.path) failed: \(error.localizedDescription). Inspect the path to reconcile whether the write committed.", at: url, effects: .unknown) }
+        catch { throw failure("run_save_failed",
+            "Checkpoint save at \(url.path) failed: \(error.localizedDescription). Inspect the path to reconcile whether the write committed.", at: url,
+            effects: .unknown) }
     }
 
     public struct Claim: Sendable {
@@ -101,25 +106,27 @@ public enum PartRunStore {
         }
         public func consume() throws {
             do { try FileManager.default.removeItem(at: claimed) }
-            catch { throw PartRunStore.failure("run_cleanup_failed", "Could not consume checkpoint at \(claimed.path): \(error.localizedDescription).", at: claimed) }
+            catch { throw PartRunStore.failure("run_cleanup_failed", "Could not consume checkpoint at \(claimed.path): \(error.localizedDescription).",
+                at: claimed) }
         }
         public func release() throws {
             do { try FileManager.default.moveItem(at: claimed, to: waiting) }
-            catch { throw PartRunStore.failure("run_release_failed", "Could not release checkpoint at \(claimed.path): \(error.localizedDescription). Its bytes remain claimed.", at: claimed) }
+            catch { throw PartRunStore.failure("run_release_failed",
+                "Could not release checkpoint at \(claimed.path): \(error.localizedDescription). Its bytes remain claimed.", at: claimed) }
         }
     }
 
-    /// Claim first, read those bytes once, and preserve the claimed file on
-    /// every read/admission failure. Only the caller's settlement consumes it.
+    /// Claim one byte image before reading; preserve it on admission failure until explicit settlement.
     public static func take(_ id: String, root: URL) async throws -> Claim {
         let waiting = file(id, root: root), claimed = claimedFile(id, root: root)
         do { try FileManager.default.moveItem(at: waiting, to: claimed) }
-        catch { throw failure("run_claim_failed", "Could not claim \(waiting.path): \(error.localizedDescription). Inspect both waiting and claimed checkpoints.", at: claimed) }
+        catch { throw failure("run_claim_failed",
+            "Could not claim \(waiting.path): \(error.localizedDescription). Inspect both waiting and claimed checkpoints.", at: claimed) }
         let run = try await read(id, at: claimed, root: root)
         return Claim(run: run, waiting: waiting, claimed: claimed)
     }
 
-    /// A waiting run as it is kept, its seal checked, claiming nothing.
+    /// Validate waiting bytes without claiming them so inspection cannot consume resumable work.
     public static func read(_ id: String, at url: URL? = nil, root: URL) async throws -> [String: JSONValue] {
         let url = url ?? file(id, root: root)
         do {
@@ -128,7 +135,8 @@ public enum PartRunStore {
             catch { throw failure("run_read_failed", "Checkpoint at \(url.path) could not be read: \(error.localizedDescription).", at: url) }
             guard data.count <= byteLimit, case .object(let run) = try JSONValue.parse(data),
                   run["run_id"] == .string(id), case .string(let held)? = run["seal"] else {
-                throw failure("run_checkpoint_invalid", "Checkpoint at \(url.path) has invalid size, identity or seal fields. Its bytes were preserved.", at: url)
+                throw failure("run_checkpoint_invalid", "Checkpoint at \(url.path) has invalid size, identity or seal fields. Its bytes were preserved.",
+                    at: url)
             }
             let mac = try await seal(run, root: root)
             guard
@@ -144,12 +152,11 @@ public enum PartRunStore {
             }
             return projected
         } catch let error as ToolFailureError { throw error }
-        catch { throw failure("run_validation_failed", "Checkpoint validation at \(url.path) failed: \(error.localizedDescription). Its bytes were preserved.", at: url) }
+        catch { throw failure("run_validation_failed",
+            "Checkpoint validation at \(url.path) failed: \(error.localizedDescription). Its bytes were preserved.", at: url) }
     }
 
-    /// HMAC-SHA256 over the run's body (all of it but its seal), keyed by the
-    /// install's signing key bound to this one use, so no tool manifest's
-    /// signature ever verifies as a run, nor a run's as a manifest.
+    /// Bind HMAC to the run domain so manifest signatures cannot authenticate checkpoints or vice versa.
     static func seal(_ run: [String: JSONValue], root: URL) async throws -> String {
         let base = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
         let body = try JSONValue.object(run.filter { $0.key != "seal" }).serializedData(pretty: false)
@@ -160,6 +167,7 @@ public enum PartRunStore {
 
     private static func failure(_ code: String, _ message: String, at url: URL, effects: ToolFailureError.Effects = .none) -> ToolFailureError {
         ToolFailureError(message, effects: effects, owner: url.path, code: code,
-            instruction: "Inspect the checkpoint at this path and its affected state; repair this owner before resuming. Do not repeat completed effects.", recovery: .inspect)
+            instruction: "Inspect the checkpoint at this path and its affected state; repair this owner before resuming. Do not repeat completed effects.",
+            recovery: .inspect)
     }
 }

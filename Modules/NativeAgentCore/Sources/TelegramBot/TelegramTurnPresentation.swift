@@ -1,19 +1,16 @@
 import Foundation
+import ChatToolParsing
 import NativeAgentCore
 import NativeAgentShared
 import ChatSessionWork
 import ChatTurnRuntime
-// Blueprint: | `TelegramTurnPresentation.swift` | `TelegramTurnPresentationPhase` typealias; canonical lifecycle adapter and native redaction; authored progress wording lives in telegram-progress.js |
+// Blueprint: | `TelegramTurnPresentation.swift` | `TelegramTurnPresentationPhase`: canonical lifecycle semantics |
 
-// Telegram names the surface-neutral presentation values.
 public typealias TelegramTurnPresentationPhase = TurnPresentationPhase
 public typealias TelegramTurnPresentationLifecycleEvent = TurnPresentationLifecycleEvent
 public typealias TelegramTurnPresentationState = TurnPresentationState
 
-/// Thin Telegram adapter: it maps Telegram progress vocabulary into the shared
-/// lifecycle kernel. Lifecycle semantics,
-/// terminal immutability, movement, history bounds, and stall classification
-/// remain owned by `TurnPresentationReducer`.
+/// Keep lifecycle semantics, terminal immutability and stall classification owned by TurnPresentationReducer.
 public enum TelegramTurnPresentationReducer {
     public static func reduce(
         _ state: TelegramTurnPresentationState,
@@ -28,13 +25,6 @@ public enum TelegramTurnPresentationReducer {
             return state
         case .toolUse(let name, _):
             let action = TelegramPollLoop.progressMessage(for: event) ?? ToolActivityPresentation.progress(name)
-            if let delegate = delegateName(forTool: name) {
-                return TurnPresentationReducer.reduce(
-                    state,
-                    lifecycle: .delegation(delegate: delegate, action: action),
-                    at: instant
-                )
-            }
             return TurnPresentationReducer.reduce(
                 state,
                 lifecycle: .tool(name: ToolActivityPresentation.title(name), action: action),
@@ -42,11 +32,12 @@ public enum TelegramTurnPresentationReducer {
             )
 
         case .toolResult(let name, let output):
+            let reply = ToolResult(output)
             return TurnPresentationReducer.reduce(
                 state,
                 lifecycle: .working(action: ToolActivityPresentation.finished(name,
-                    outcome: ChatToolOutcome.exactResultClass(output).rawValue,
-                    detail: [ChatToolOutcome.explanation(output), ChatToolOutcome.remedy(output)].compactMap { $0 }.joined(separator: " · "))),
+                    outcome: reply.outcome.rawValue,
+                    detail: [ChatToolOutcome.explanation(reply.payload), ChatToolOutcome.remedy(reply.payload)].compactMap { $0 }.joined(separator: " · "))),
                 at: instant
             )
 
@@ -104,13 +95,8 @@ public enum TelegramTurnPresentationReducer {
                 accumulatedUTF16Length: accumulatedUTF16Length,
                 at: instant
             )
-        }
-    }
-
-    private static func delegateName(forTool name: String) -> String? {
-        switch name.lowercased() {
-        case "claude_message", "codex_message", "invoke_codex", "omp_message", "agent_swarm": return "Background work"
-        default: return nil
+        case .writing(let writing):
+            return TurnPresentationReducer.recordMovement(state, writing: writing, at: instant)
         }
     }
 

@@ -103,13 +103,13 @@ struct MobileInteractionCard: View {
         .onChange(of: card.revision) { _, _ in answeredRevision = nil; response = nil }
         .sheet(isPresented: $showsTrust) {
             NavigationStack {
-                TrustPolicyView(store: settingsStore)
+                MobileFacePage(page: "trust")
                     .toolbar { Button("Done") { showsTrust = false } }
             }
         }
         .sheet(isPresented: $showsProviders) {
             NavigationStack {
-                ProviderSettingsView()
+                MobileFacePage(page: "providers")
                     .toolbar { Button("Done") { showsProviders = false } }
             }
         }

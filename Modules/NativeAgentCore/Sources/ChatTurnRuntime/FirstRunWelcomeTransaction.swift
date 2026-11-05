@@ -5,29 +5,24 @@ import TrustCenter
 import ChatSessionWork
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `FirstRunWelcomeTransaction.swift` | First-run welcome transaction; checked name before claim/send; completed greeting receipt resumes checked token/directive/met settlement before retiring its claim |
-// Storage: .needs_welcome.receipt retains session/title locally and in off-disk
-// backup; local backup, production export and phone sync exclude it. PrivacyMap: welcome_receipt.
+// Blueprint: | `FirstRunWelcomeTransaction.swift` | Claimed public welcome; checked receipt settlement |
+// Keep welcome receipts local and in off-disk backup; exclude them from local backup, public export and phone sync.
 
-/// The one-time greeting writer's outcome as observed by the onboarding route.
-/// A delivery accepted by the chat owner is distinct from a deferred or
-/// rejected handoff, so callers never present a missing greeting as success.
+/// Only chat-owner acceptance proves greeting delivery; deferred and rejected handoffs must not present success.
 public enum FirstRunGreetingOutcome: Equatable, Sendable {
     case notArmed
-    /// The persona already exists — someone has met this agent before. Not a
-    /// failure and not a deferral: the correct outcome is silence.
+    /// An existing persona needs no greeting, deferral or failure notice.
     case existingPersona
     case priorOutcomeUnknown
     case noActiveSession
     case providerUnavailable
     case claimFailed
     case delivered(sessionId: String)
-    case queued(sessionId: String)
     case rejected(message: String)
 
     public var routeFailureMessage: String? {
         switch self {
-        case .notArmed, .existingPersona, .delivered, .queued:
+        case .notArmed, .existingPersona, .delivered:
             return nil
         case .priorOutcomeUnknown:
             return "the first greeting's earlier delivery outcome is unknown, so NativeAgent did not send a duplicate"
@@ -44,17 +39,11 @@ public enum FirstRunGreetingOutcome: Equatable, Sendable {
 }
 
 // MARK: - First-run welcome greeting
-//
-// With a provider connected, a hidden kickoff opens the first conversation; only the agent's words persist.
-// The opener writes the person's requested role as one SOUL.md line through persona writers and shows a settled receipt.
-// Onboarding supplies the name; the opener never asks for it again.
-// The directive follows the person, schedules no third question and leaves treatment preferences to later lived moments.
-// Fresh personas require .needs_welcome from onboarding and no .first_conversation marker beside SOUL.md.
-// Marker creation and greeting require NativeAgentPaths.isPublicReleaseBundle; upgrades and dev installs never re-greet.
-// ContentView triggers after onboarding writes the marker; earlier ChatView hooks do nothing without it.
+// Only public-release onboarding may mark a fresh persona for welcome; upgrades and development installs never greet.
+// Persist only the agent's reply. The opener uses the supplied user name, writes one requested-role line through persona writers,
+// and leaves later preferences to conversation. Both marker and first-conversation evidence gate delivery.
 
-/// Read-only first-conversation evidence from the existing transcript model.
-/// Keeping this projection as a protocol avoids a dependency on EngineRuntime.
+/// Project transcript evidence through a protocol to avoid an EngineRuntime dependency.
 public protocol FirstRunWelcomeMessage {
     var id: String { get }
     var role: String { get }
@@ -63,9 +52,7 @@ public protocol FirstRunWelcomeMessage {
     var firstRunTurnCompleted: Bool { get }
 }
 
-/// Presentation and existing chat ingress supplied by the Mac surface. All
-/// reads stay on MainActor so the claim prefix and post-await rechecks retain
-/// the same ordering as the original AppModel transaction.
+/// Keep reads and pre/post-await checks on MainActor so greeting claims retain transactional ordering.
 @MainActor
 public protocol FirstRunWelcomePort: AnyObject {
     associatedtype FirstRunMessage: FirstRunWelcomeMessage
@@ -92,10 +79,7 @@ public final class FirstRunWelcomeTransaction {
             .appendingPathComponent(".needs_welcome", isDirectory: false)
     }
 
-    /// The durable claim is deliberately a sibling rather than a boolean in the
-    /// pending file. Renaming a file gives the sender a recoverable handoff:
-    /// after a process dies during `sendChat`, the next launch sees an unknown
-    /// outcome and never creates a second hidden greeting.
+    /// Rename a sibling claim file for recoverable handoff; a crash during send leaves unknown delivery and blocks duplicate greeting.
     private func firstRunWelcomeInFlightMarkerURL(port: some FirstRunWelcomePort) -> URL {
         port.firstRunDataRoot
             .appendingPathComponent(".needs_welcome.inflight", isDirectory: false)
@@ -103,7 +87,7 @@ public final class FirstRunWelcomeTransaction {
 
     // MARK: - The first conversation: fresh personas only
 
-    /// Markers, live/spent write tokens, unreadable SOUL.md, a role heading or conversation rows exclude freshness.
+    /// Markers, write tokens, unreadable persona, role headings and conversation rows all defeat freshness.
     /// An absent SOUL.md remains fresh because the opener may precede its first append.
     private func firstConversationIsFreshPersona(port: some FirstRunWelcomePort) -> Bool {
         let files = FileManager.default
@@ -132,9 +116,7 @@ public final class FirstRunWelcomeTransaction {
         !port.firstRunSessionIsBusy && !Self.hasConversationRows(port.chatMessages, syntheticErrorIDPrefix: port.firstRunSyntheticErrorIDPrefix)
     }
 
-    /// Only real user or assistant rows make a conversation non-empty. The
-    /// in-memory error notice a failed first greeting leaves behind does not,
-    /// so a provider hiccup on the greeting retries instead of sticking.
+    /// Only real conversational rows defeat emptiness; transient error notices must not block retrying a rejected greeting.
     public static func hasConversationRows<Message: FirstRunWelcomeMessage>(_ messages: [Message], syntheticErrorIDPrefix: String) -> Bool {
         messages.contains {
             ($0.role == "user" || $0.role == "assistant")
@@ -143,8 +125,7 @@ public final class FirstRunWelcomeTransaction {
         }
     }
 
-    /// The failure sentence a broken turn persists on an assistant row
-    /// (stamped `mechanicalKind: systemRow`). It is not the agent speaking.
+    /// Classify failure rows by their mechanical writer stamp so they cannot count as the agent speaking.
     public static func isPersistedFailureRow<Message: FirstRunWelcomeMessage>(_ message: Message) -> Bool {
         message.firstRunMechanicalKind == "systemRow"
     }
@@ -184,14 +165,20 @@ public final class FirstRunWelcomeTransaction {
         let directive = FirstConversationPersonaProgression.nextTurnDirective(title: receipt.title)
         if let saved = try ChatSessionDirective.load(dataRoot: dataRoot, sessionID: receipt.sessionID) {
             guard saved.directive == directive else {
-                throw ToolFailureError("The greeting's next-turn directive belongs to other work. Preserve it and reconcile the receipt; nothing was overwritten.", effects: .unknown)
+                throw ToolFailureError("""
+                    The greeting's next-turn directive belongs to other work. Preserve it and reconcile the receipt; nothing \
+                    was overwritten.
+                    """, effects: .unknown)
             }
         } else {
             let record = ChatSessionDirectiveRecord(
                 createdAt: ISO8601DateFormatter().string(from: Date()), directive: directive)
             guard ChatSessionDirective.write(record, dataRoot: dataRoot, sessionID: receipt.sessionID),
                   try ChatSessionDirective.load(dataRoot: dataRoot, sessionID: receipt.sessionID) == record else {
-                throw ToolFailureError("The greeting's next-turn directive could not be saved and verified. Its receipt and in-flight claim remain for repair.", effects: .unknown)
+                throw ToolFailureError("""
+                    The greeting's next-turn directive could not be saved and verified. Its receipt and in-flight claim remain \
+                    for repair.
+                    """, effects: .unknown)
             }
         }
         let marker = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
@@ -210,7 +197,10 @@ public final class FirstRunWelcomeTransaction {
     private static func settleGreeting(dataRoot: URL, receipt: GreetingReceipt) -> FirstRunGreetingOutcome {
         do { return try completeFirstRunGreeting(dataRoot: dataRoot, receipt: receipt) }
         catch {
-            return .rejected(message: "The greeting completed, but its saved next step needs repair: \(error.localizedDescription). Recheck setup after repair; the greeting will not be sent again.")
+            return .rejected(message: """
+                The greeting completed, but its saved next step needs repair: \(error.localizedDescription). Recheck setup after repair; the greeting \
+                will not be sent again.
+                """)
         }
     }
 
@@ -227,12 +217,7 @@ public final class FirstRunWelcomeTransaction {
         return .absent
     }
 
-    /// Arms the one-time welcome — IN PUBLIC-RELEASE BUNDLES ONLY.
-    ///
-    /// Called at onboarding completion, but a deliberate no-op everywhere else:
-    /// outside a public-release bundle no marker is written, so no greeting can
-    /// ever fire on a dev install (see the file header). Callers get no signal
-    /// either way; "marked" is not a postcondition of calling this.
+    /// Only public-release bundles arm welcome; calling this elsewhere does not imply a marker was written.
     @MainActor
     public func markFirstRunWelcomePending(port: some FirstRunWelcomePort) {
         guard port.firstRunIsPublicRelease else { return }
@@ -278,8 +263,7 @@ public final class FirstRunWelcomeTransaction {
         }
     }
 
-    /// Fire the one-time welcome. Called from onboarding-complete AND from
-    /// ChatView triggers. Marker + in-flight flag make it fire exactly once.
+    /// The durable marker and in-flight flag let onboarding and view triggers share one greeting.
     private static func kickoff(title: String) -> String {
         """
         [SYSTEM: First run. The person has just set you up and this is the first thing in an \
@@ -297,13 +281,30 @@ public final class FirstRunWelcomeTransaction {
         words. Whatever fits, I can still help with everyday things. We can figure it out \
         as we go, too."
 
-        Then one short line that offers setup and asks nothing, close to: "And whenever \
-        you like, just tell me what to hook up — email, calendar, Chrome and more — and \
-        I'll set it up right here in the chat."
+        Then your reach: what you can touch on this Mac. Before you write it, read \
+        app {page:"mac_integration"}. Its "macOS grants" rows are your live reach, in the order \
+        a card asks for them. Raise exactly ONE card in this opening, for every reach row whose \
+        state is not granted: request_interaction kind=permission, target the first such row's \
+        target, also_needed the rest of them in row order. The Automation rows (Mail, Messages, \
+        Notes, Music) stay off this card; ask for one of those in context, the first time you \
+        need that app. If every reach row is granted, raise no card.
 
-        SETUP IS BY TALKING. When they ask to set something up, or it is plainly useful for \
-        what they asked ("want me to connect your calendar?"), raise that one thing's \
-        request_interaction card. One card at a time, never a batch, and none in this opening.
+        Say it in one or two sentences in your own voice: what the card turns on and what that \
+        lets you do, close to "Allow these and I can read your calendar and see your screen; \
+        Screen Recording takes one restart, and the card does it." Then offer one real first \
+        thing you can do with what is on now (today's calendar, a reminder, a look at their \
+        mail): one, concrete, offered, not asked.
+
+        Full Mac, in one short clause: it is their own switch in Trust, for when they want you \
+        on more of the Mac. Never say you can turn it on, or that the card does.
+
+        The phone: read app {page:"pairing"}. If a phone is waiting to pair, say so in one \
+        line: Match the code on Today opens it, and they choose Pair when the codes match. Otherwise \
+        offer, in one sentence, to pair their iPhone. No phone card in this opening.
+
+        After this opening, SETUP IS BY TALKING. When they ask to set something up, or it is \
+        plainly useful for what they asked ("want me to connect your calendar?"), raise that \
+        one thing's request_interaction card, one card at a time.
 
         The opening line takes no name and no list. Use their name later in the turn \
         ONLY if you genuinely know it; \
@@ -333,10 +334,8 @@ public final class FirstRunWelcomeTransaction {
     @MainActor
     @discardableResult
     public func maybeSendFirstRunGreeting(port: some FirstRunWelcomePort) async -> FirstRunGreetingOutcome {
-        // SYNCHRONOUS guard prefix (no await) → MainActor serializes it, so only
-        // one trigger can claim the in-flight flag before the first await.
-        // Belt-and-suspenders with the marker-write gate: a stray marker on a
-        // dev data root (e.g. restored from a backup) still can't fire here.
+        // Claim synchronously on MainActor before awaiting so competing triggers cannot both start.
+        // Recheck bundle eligibility so a restored marker cannot greet on a development install.
         guard port.firstRunIsPublicRelease else { return .notArmed }
         return await sendFirstRunGreetingIfEligible(port: port)
     }
@@ -352,15 +351,14 @@ public final class FirstRunWelcomeTransaction {
                 }
                 return Self.settleGreeting(dataRoot: port.firstRunDataRoot, receipt: receipt)
             } catch {
-                return .rejected(message: "The greeting's receipt is unavailable: \(error.localizedDescription). Preserve its in-flight claim and repair the receipt; no duplicate was sent.")
+                return .rejected(message: """
+                    The greeting's receipt is unavailable: \(error.localizedDescription). Preserve its in-flight claim and repair the receipt; no \
+                    duplicate was sent.
+                    """)
             }
         }
         guard firstRunWelcomeMarkerState(port: port) == .pending, !firstRunGreetingInFlight else { return .notArmed }
-        // Fresh personas only. The pending marker is written on a blank-slate
-        // onboarding, so this should already be true — it is checked anyway
-        // because the two facts have different lifetimes (see the marker docs),
-        // and because the failure this prevents is asking someone who they want
-        // their agent to be after they have already told it.
+        // Recheck persona freshness independently of the pending marker because their lifetimes differ; never repeat an answered introduction.
         guard firstConversationIsFreshPersona(port: port) else { return .existingPersona }
         guard !port.activeChatSessionId.isEmpty else { return .noActiveSession }
         guard firstConversationSessionIsIdleAndEmpty(port: port) else { return .noActiveSession }
@@ -368,9 +366,7 @@ public final class FirstRunWelcomeTransaction {
         firstRunGreetingInFlight = true
         defer { firstRunGreetingInFlight = false }
 
-        // "Connecting to an LLM" gate: fetch a FRESH provider list (the cached
-        // one lags right after connect). If still not ready, leave the marker so
-        // a later trigger retries.
+        // Read providers fresh after connect; if none is ready, keep the marker for a later trigger.
         guard await port.firstRunGreetingHasReadyProvider() else { return .providerUnavailable }
         // The provider read suspends: a session switch or a human turn can
         // invalidate the empty first-conversation snapshot checked above.
@@ -381,7 +377,11 @@ public final class FirstRunWelcomeTransaction {
         let personName: String
         do { personName = try port.firstConversationPersonName }
         catch {
-            return .rejected(message: "The saved profile could not be read: \(error.localizedDescription). Repair memory/profile.json before the first greeting can be sent.")
+            return .rejected(
+                message: """
+                    The saved profile could not be read: \(error.localizedDescription). Repair memory/profile.json before the \
+                    first greeting can be sent.
+                    """)
         }
         guard !personName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .rejected(message: "The saved person's name is empty. Repair memory/profile.json.userName before sending the greeting.")
@@ -415,15 +415,16 @@ public final class FirstRunWelcomeTransaction {
                         }
                         return Self.settleGreeting(dataRoot: dataRoot, receipt: receipt)
                     } catch {
-                        return .rejected(message: "The greeting completed, but its receipt could not be retained: \(error.localizedDescription). Its in-flight claim remains; inspect the transcript before repairing progression. Do not send the greeting again.")
+                        return .rejected(message: """
+                            The greeting completed, but its receipt could not be retained: \(error.localizedDescription). Its in-flight claim \
+                            remains; inspect the transcript before repairing progression. Do not send the greeting again.
+                            """)
                     }
                 }
             }
             // Missing completion evidence leaves delivery unknown, never permission
             // to repeat an accepted handoff. Preserve the durable claim.
             return .priorOutcomeUnknown
-        case .queued:
-            return .queued(sessionId: sid)
         case .rejected(let message):
             restoreFirstRunWelcomeMarkerAfterRejectedSend(port: port)
             nativeLog("[first-run-welcome] greeting send rejected, restoring marker: %@", message)

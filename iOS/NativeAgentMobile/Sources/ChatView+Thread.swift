@@ -2,27 +2,9 @@ import SwiftUI
 import UIKit
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+Thread.swift` | Transcript rendering, scrolling and SwiftUI hooks; other-room excerpts match the Mac’s compact title/reply preview and open their ID-resolved conversation |
+// Blueprint: | `ChatView+Thread.swift` | The conversation's document: its rows, cards and actions, the composer's room and Latest |
 
 extension ChatView {
-    private var otherRoomRows: [String: [OtherRoomExchange]] {
-        guard let session = store.selectedSessionID ?? store.mainSessionID,
-              let transcript = sync.chatTranscripts[session] else { return [:] }
-        let shown = Set(visibleMessages.map { $0.id.uuidString.lowercased() })
-        return OtherRoomExchange.anchored(transcript.otherRooms, to: transcript.records.compactMap { row in
-            guard shown.contains(row.id.lowercased()), let at = UserDisplayFormatters.parseISOTimestamp(row.createdAt) else { return nil }
-            return (id: row.id.lowercased(), at: at)
-        })
-    }
-
-    private func exchangeRows(_ events: [OtherRoomExchange]) -> some View {
-        ForEach(events) { event in
-            Button { openedAgentContactID = event.contactID } label: {
-                OtherRoomExchangePreview(exchange: event).foregroundStyle(AlivePalette.text)
-            }.buttonStyle(.plain).id("other-room:" + event.id)
-        }
-    }
-
     // Process-local visual fixture: no transcript/cache writes and no transport sends.
     var isChatSample: Bool {
         #if DEBUG
@@ -48,12 +30,6 @@ extension ChatView {
                             text: "I'll finish the outline in the morning, then take the afternoon outside.")
             ]
             let extras = ProcessInfo.processInfo.arguments.contains("-chatSampleExtras")
-            if extras, let index = messages.firstIndex(where: { $0.id == UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4)) }) {
-                messages[index] = ChatMessage(id: messages[index].id, role: .assistant, text: messages[index].text,
-                                          toolEvents: [ToolEvent(name: "mac_calendar_list_upcoming", seq: 1),
-                                                       ToolEvent(name: "weather_forecast", seq: 2),
-                                                       ToolEvent(name: "read_skill", seq: 3)])
-            }
             if ProcessInfo.processInfo.arguments.contains("-chatSampleStreaming") {
                 messages.append(ChatMessage(id: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6)),
                                             role: .assistant, text: extras ? "" : "Writing the next step…", isStreaming: true,
@@ -65,8 +41,36 @@ extension ChatView {
         return store.messages
     }
 
-    /// A quiet door, in the agent's own voice: one serif line, one sentence,
-    /// and one action only when there is something to do.
+    #if DEBUG
+    /// The sample's rows as the Mac would send them: its messages, and with extras a tool run (the agent's words, one ask) before the fourth.
+    private var sampleRecords: [ChatMessageRecord] {
+        let extras = ProcessInfo.processInfo.arguments.contains("-chatSampleExtras")
+        var records: [ChatMessageRecord] = []
+        func add(_ id: String, _ role: String, _ content: String, minute: Int, face: TranscriptRowFace? = nil, approvalId: String? = nil) {
+            var metadata: ChatMessageMetadata?
+            if let approvalId {
+                metadata = ChatMessageMetadata()
+                metadata?.approvalId = approvalId
+            }
+            var record = ChatMessageRecord(id: id, sessionId: nil, role: role, content: content,
+                                           createdAt: String(format: "2026-11-04T09:%02d:00Z", minute), runId: nil, source: nil,
+                                           metadata: metadata, isPersonVisible: true)
+            record.face = face
+            records.append(record)
+        }
+        for (index, message) in visibleMessages.prefix(5).enumerated() {
+            if extras, index == 3 {
+                add("sample-tool-1", "tool", "", minute: 5, face: .init(seat: .left, line: "Calendar · upcoming",
+                                                                         headline: "Checked tomorrow's calendar and the weather"))
+                add("sample-tool-2", "tool", "", minute: 5, face: .init(seat: .left, line: "Weather forecast", detail: "Clear after noon"))
+                add("sample-approval", "tool", "", minute: 6, face: .init(seat: .left, asks: true), approvalId: "sample-approval")
+            }
+            add(message.id.uuidString, message.role.rawValue, message.text, minute: index * 2)
+        }
+        return records
+    }
+    #endif
+
     private var chatEmptyState: some View {
         let copy: (title: String, line: String) = transcriptNotSynced
             ? ("Not here yet", "This conversation is still on your Mac. I'll bring it over when it syncs.")
@@ -112,7 +116,6 @@ extension ChatView {
         return sessionID.flatMap { sync.chatTranscripts[$0]?.readError }
     }
 
-    /// Pending approvals read the shared sync projection and appear on their turn.
     private var inlineChatApprovals: [ApprovalRequest] {
         #if DEBUG
         if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleExtras") {
@@ -124,7 +127,10 @@ extension ChatView {
                                     localOnly: false, remoteResolvable: true),
                     ApprovalRequest(id: "sample-approval-hygiene", title: "",
                                     action: "self_improvement.apply", risk: "medium",
-                                    reason: "[run_memory_hygiene] Run memory hygiene to consolidate duplicates and clear test-derived noise before it settles into long-term memory.",
+                                    reason: """
+                                        [run_memory_hygiene] Run memory hygiene to consolidate duplicates and clear test-derived noise before it settles into \
+                                        long-term memory.
+                                        """,
                                     status: "pending", localOnly: true, remoteResolvable: false)]
         }
         #endif
@@ -134,55 +140,97 @@ extension ChatView {
         )
     }
 
-    /// Cards raised in another thread and mirrored into this conversation for
-    /// User; their buttons answer the original through the signed inbox action.
+    /// Mirrored cards answer their original thread through the signed inbox action.
     private var inlineChatCards: [InboxItemRecord] {
         guard let session = store.selectedSessionID, !session.isEmpty else { return [] }
-        let interactions = Set(visibleMessages.compactMap { $0.interaction.map { "interaction:\($0.id)" } })
         return sync.inboxItems.filter { item in
-            item.source == "interaction" && item.chat_session_id == session
-                && !["archived", "dismissed"].contains(item.status)
-                && !interactions.contains(item.id)
+            item.source == "interaction" && item.chat_session_id == session && !["archived", "dismissed"].contains(item.status)
         }
     }
 
-    @ViewBuilder
-    private func inlinePendingCards(approvals: [ApprovalRequest], cards: [InboxItemRecord]) -> some View {
-        ForEach(approvals) { approval in
-            InlineChatApprovalCard(approval: approval)
+    /// The Mac's rows for the conversation on screen, in its order (tool runs and asks included).
+    private var transcriptRecords: [ChatMessageRecord] {
+        #if DEBUG
+        if isChatSample { return sampleRecords }
+        #endif
+        guard let session = store.selectedSessionID ?? store.mainSessionID else { return [] }
+        return sync.chatTranscripts[session]?.records ?? []
+    }
+
+    /// The conversation as the document reads it: the Mac's rows and the phone's own, the streaming reply, approvals where they were
+    /// asked and the decisions still owed after everything, mirrored cards, other-room rows, and each row's buttons.
+    private var transcriptInput: MobileTranscriptInput {
+        let messages = visibleMessages
+        let rows = MobileTranscriptRow.rows(records: transcriptRecords, messages: messages)
+        let session = store.selectedSessionID ?? store.mainSessionID
+        let all = inlineChatApprovals
+        var byID: [String: ApprovalRequest] = [:]
+        for approval in all { byID[approval.id] = approval }
+        var approvals: [String: ApprovalRequest] = [:]
+        var asked: Set<String> = []
+        for row in rows {
+            guard row.face?.asks == true, let id = row.metadata?.approvalId else { continue }
+            asked.insert(id)
+            if let approval = byID[id] { approvals[row.id] = approval }
         }
-        ForEach(cards) { item in
-            InboxCardRow(item: item, onAction: { action in
+        // Only decisions still owed belong at the end; settled outcomes stay with the row that asked.
+        let owed = all.filter { !asked.contains($0.id) && ConversationApprovals.waitsOnYou($0) }
+        for approval in owed { approvals[approval.id] = approval }
+        var cards: [String: InboxItemRecord] = [:]
+        for item in inlineChatCards { cards[item.id] = item }
+        let live = messages.last { $0.role == .assistant && ($0.isStreaming || store.liveTurnBubbles.values.contains($0.id)) }
+        return MobileTranscriptInput(
+            sessionKey: store.selectedSessionID ?? "",
+            messages: messages,
+            rows: rows,
+            liveMessageID: live?.id,
+            // The agent's newest movement for this reply: the running tool, or what the agent is writing into a call.
+            waitingLine: live.map { store.streamingHint(for: $0) } ?? "",
+            approvals: approvals,
+            tailApprovals: owed,
+            inboxCards: cards,
+            exchanges: session.flatMap { sync.chatTranscripts[$0]?.otherRooms } ?? [],
+            cardsAvailable: transcriptReadError == nil,
+            canLoadOlder: store.canLoadOlderHistory,
+            isLoadingHistory: store.isLoadingHistory,
+            expired: Set(messages.filter { store.isExpiredRequest($0) }.map(\.id)),
+            retries: Dictionary(store.queuedSendsForSelectedSession.compactMap { send in send.placeholderID.map { ($0, send.id) } },
+                                uniquingKeysWith: { first, _ in first }),
+            sendsEnabled: !(store.isLoading || store.isSwitchingSession)
+        )
+    }
+
+    /// What the document's links, cards and menu do: the same store calls the rows' buttons made.
+    private var transcriptActions: MobileTranscriptActions {
+        MobileTranscriptActions(
+            loadOlder: { Task { await store.loadOlderHistory() } },
+            sendNow: { id in store.sendNow(messageId: id, client: bridgeClient) },
+            loadWholeMessage: { id in Task { await store.loadWholeMessage(id) } },
+            retrySend: { id in store.sendQueuedNow(id, client: bridgeClient) },
+            openExchange: { exchange in openedAgentContactID = exchange.contactID },
+            inboxAction: { itemID, actionID in
                 Task {
                     do {
-                        _ = try await sync.inboxAction(itemId: item.id, actionId: action)
+                        _ = try await sync.inboxAction(itemId: itemID, actionId: actionID)
                     } catch {
                         store.errorBanner = error.localizedDescription
                     }
                 }
-            }, onView: { inboxDetailID = item.id })
-        }
+            },
+            openInboxItem: { _ in showsInbox = true },
+            canRegenerate: store.canRegenerateLast,
+            regenerate: { store.regenerateLast(client: bridgeClient, controls: runtimeControls) },
+            canReadAloud: voiceOutput.enabled,
+            isReading: voiceOutput.isSpeaking,
+            readAloud: { text in voiceOutput.speak(text) },
+            stopReading: { voiceOutput.stop() }
+        )
     }
 
     var chatBody: some View {
-        let approvals = inlineChatApprovals
-        let retriesByPlaceholder = Dictionary(store.queuedSendsForSelectedSession.compactMap { send in
-            send.placeholderID.map { ($0, send) }
-        }, uniquingKeysWith: { first, _ in first })
-        var lastAssistantByTurnID: [String: UUID] = [:]
-        for message in visibleMessages where message.role == .assistant {
-            if let turnID = message.turnID { lastAssistantByTurnID[turnID] = message.id }
-        }
-        let approvalsByAnchor = Dictionary(grouping: approvals) {
-            $0.chatOriginTurnId.flatMap { lastAssistantByTurnID[$0] }
-        }
-        let cards = inlineChatCards
-        let cardAnchor = cards.isEmpty ? nil : visibleMessages.last(where: { $0.role == .assistant })?.id ?? visibleMessages.last?.id
-        let exchanges = otherRoomRows
+        let input = transcriptInput
         return NavigationStack {
             VStack(spacing: 0) {
-                // One banner lane: the newest notice shows, the rest wait
-                // behind a count instead of stacking down the screen.
                 MobileChatBannerLane(banners: chatBanners)
                 if let reason = transcriptReadError {
                     Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
@@ -193,178 +241,72 @@ extension ChatView {
                     chatSessionTabsBar
                 }
 
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        if visibleMessages.isEmpty && approvals.isEmpty && cards.isEmpty {
+                Group {
+                    if input.isEmpty {
+                        ScrollView {
                             chatEmptyState
                                 .containerRelativeFrame(.vertical)
-                        } else {
-                            // The paged transcript uses eager row heights to hold its bottom anchor through settlement.
-                            VStack(alignment: .leading, spacing: 26) {
-                                if store.canLoadOlderHistory {
-                                    Button(store.isLoadingHistory ? "Loading earlier messages…" : "Load earlier messages") {
-                                        Task { await store.loadOlderHistory() }
-                                    }
-                                    .disabled(store.isLoadingHistory)
-                                    .frame(maxWidth: .infinity)
-                                }
-	                                ForEach(visibleMessages) { msg in
-                                        exchangeRows(exchanges[msg.id.uuidString.lowercased()] ?? [])
-	                                    BubbleView(
-	                                        message: msg,
-	                                        streamingHint: store.streamingHint(for: msg),
-	                                        isLiveTurn: store.liveTurnBubbles.values.contains(msg.id),
-                                            cardsAvailable: transcriptReadError == nil
-	                                    )
-                                        .equatable()
-	                                    .id(msg.id.uuidString)
-                                        // Only appends animate; removals and replacements are instant.
-	                                    .transition(.asymmetric(
-	                                        insertion: .opacity.combined(with: .offset(y: 8)),
-	                                        removal: .identity))
-                                        // An expired request starts only on this explicit send.
-                                        if store.isExpiredRequest(msg) {
-                                            Button("Send now") {
-                                                store.sendNow(messageId: msg.id, client: bridgeClient)
-                                            }
-                                            .disabled(store.isLoading || store.isSwitchingSession)
-                                        }
-                                        if msg.text.hasSuffix(ChatStore.snapshotTruncationMarker) {
-                                            Button("Show the whole message") {
-                                                Task { await store.loadWholeMessage(msg.id) }
-                                            }
-                                            .disabled(store.isLoadingHistory)
-                                        }
-                                        if !msg.isStreaming,
-                                           let failed = retriesByPlaceholder[msg.id] {
-                                            Button("Retry send") {
-                                                store.sendQueuedNow(failed.id, client: bridgeClient)
-                                            }
-                                            .disabled(store.isLoading || store.isSwitchingSession)
-                                        }
-                                        // Place approvals at the last assistant carrying their Mac turn identity.
-                                        inlinePendingCards(
-                                            approvals: approvalsByAnchor[msg.id] ?? [],
-                                            cards: msg.id == cardAnchor ? cards : [])
-	                                }
-                                exchangeRows(exchanges[""] ?? [])
-                                // The bottom holds only what waits on you; a settled
-                                // outcome is history and shows with its own turn.
-                                inlinePendingCards(
-                                    approvals: (approvalsByAnchor[nil] ?? []).filter(ConversationApprovals.waitsOnYou),
-                                    cards: cardAnchor == nil ? cards : [])
-                                // Reaching the bottom by hand is following again:
-                                // the Latest button goes away on its own.
-                                Color.clear.frame(height: 1)
-                                    .id(Self.chatBottomID)
-                                    .onAppear {
-                                        autoFollowChat = true
-                                    }
-                            }
-                            .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
-                            .frame(maxWidth: .infinity)
-                            .padding(.horizontal, 20).padding(.vertical, 12)
                         }
-                    }
-                    // Follow the bottom through streaming and layout; preserve position while reading above.
-                    // Explicit scrolls serve sends, session changes, Latest and the keyboard.
-                    .defaultScrollAnchor(autoFollowChat ? .bottom : .top)
-                    // The transcript softens out under the composer and the tab bar.
-                    .aliveBottomFade(room: AliveChatRoom(store: store))
-                    // SwiftUI subtracts the measured composer inset from the keyboard-adjusted viewport.
-                    .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
-                        VStack(alignment: .trailing, spacing: 8) {
-                            // Only while scrolled up, and above the composer, never on it.
-                            if showLatestButton {
-                                Button {
-                                    autoFollowChat = true
-                                    scheduleScrollToBottom(proxy, animated: true, delayMilliseconds: 0, force: true)
-                                } label: {
-                                    Label("Latest", systemImage: "arrow.down")
-                                        .font(.footnote.weight(.semibold))
-                                        .foregroundStyle(AlivePalette.text)
-                                        .padding(.horizontal, 14)
-                                        .frame(minHeight: 44)
-                                        .aliveGlass(in: Capsule(), interactive: true)
-                                }
-                                .buttonStyle(.plain)
-                                .padding(.trailing, NativeAgentMobileTheme.Spacing.lg)
-                                .transition(.opacity)
-                            }
-                            GlassEffectContainer(spacing: NativeAgentMobileTheme.Spacing.md) { composerBar }
-                                .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
-                                .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                        .scrollDismissesKeyboard(.interactively)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            UIApplication.shared.sendAction(
+                                #selector(UIResponder.resignFirstResponder),
+                                to: nil, from: nil, for: nil
+                            )
                         }
-                        .animation(.easeOut(duration: 0.18), value: showLatestButton)
-                    }
-                    // Dragging or tapping the thread dismisses the keyboard.
-                    .scrollDismissesKeyboard(.interactively)
-                    .contentShape(Rectangle())
-	                    .onTapGesture {
-                        // Resign first responder on the focused TextField.
-                        UIApplication.shared.sendAction(
-                            #selector(UIResponder.resignFirstResponder),
-                            to: nil, from: nil, for: nil
-                        )
-                    }
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 8).onChanged { drag in
-                            if drag.translation.height > 0, store.isLoading || !store.messages.isEmpty {
-                                autoFollowChat = false
-                            }
+                    } else {
+                        // The document runs under the composer: the composer's room (and the keyboard's) is its bottom inset.
+                        GeometryReader { geometry in
+                            MobileTranscriptView(input: input, width: geometry.size.width, bottomInset: geometry.safeAreaInsets.bottom,
+                                                 actions: transcriptActions, handle: transcript)
+                                .ignoresSafeArea(edges: .bottom)
                         }
-                    )
-                    .onAppear {
-                        autoFollowChat = true
-                        scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 120, force: true)
-                    }
-                    .onChange(of: store.messages.count) {
-                        scheduleScrollToBottom(proxy, animated: false)
-                    }
-                    // A late reply requests an explicit scroll even while reading above.
-                    .onChange(of: store.scrollToBottomTick) {
-                        scheduleScrollToBottom(proxy, animated: true, delayMilliseconds: 0, force: true)
-                    }
-                    // A selected session opens at the bottom of its transcript.
-                    .onChange(of: store.selectedSessionID) {
-                        autoFollowChat = true
-                        scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 80, force: true)
-                    }
-                    // Scroll again after the new transcript arrives and lays out.
-                    .onChange(of: store.messages.first?.id) {
-                        scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 120, force: true)
-                    }
-                    .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-                        scheduleScrollToBottom(proxy, animated: false, force: true)
-                    }
-                    .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
-                        scheduleScrollToBottom(proxy, animated: false, force: true)
                     }
                 }
-
+                .aliveBottomFade(room: AliveChatRoom(store: store))
+                .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
+                    VStack(alignment: .trailing, spacing: 8) {
+                        // Keep Latest above the composer and visible only while the reader is away from the end.
+                        if showLatestButton {
+                            Button {
+                                followEnd()
+                            } label: {
+                                Label("Latest", systemImage: "arrow.down")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(AlivePalette.text)
+                                    .padding(.horizontal, 14)
+                                    .frame(minHeight: 44)
+                                    .aliveGlass(in: Capsule(), interactive: true)
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.trailing, NativeAgentMobileTheme.Spacing.lg)
+                            .transition(.opacity)
+                        }
+                        GlassEffectContainer(spacing: NativeAgentMobileTheme.Spacing.md) { composerBar }
+                            .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
+                            .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
+                    }
+                    .animation(.easeOut(duration: 0.18), value: showLatestButton)
+                }
+                // Only the reader's own acts move the chat: Latest, sending, the keyboard rising, opening a conversation.
+                .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in followEnd() }
             }
             .background { AliveChatRoom(store: store) }
-            // The header carries chat actions; the hidden title serves VoiceOver and the app switcher.
+            // Hide the visual navigation title but retain it for VoiceOver and the app switcher.
             .navigationTitle(agentDisplayName)
             .toolbar(.hidden, for: .navigationBar)
             .tint(AlivePalette.text)
             .animation(AppMotion.snappy, value: voiceInput.isListening)
-            // Sync-error dismissal lasts only as long as its condition.
+            // Sync-error dismissal must end when its condition changes.
             .onChange(of: sync.syncError) { _, newValue in
                 if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
                     dismissedSyncError = nil
                 }
             }
-            .sheet(isPresented: Binding(get: { inboxDetailID != nil }, set: { if !$0 { inboxDetailID = nil } }), onDismiss: { inboxGroup = nil }) {
-                if let inboxGroup {
-                    InboxView(initialGroup: inboxGroup)
-                } else {
-                    InboxDetailSheet(itemID: inboxDetailID ?? "", onOpenGroup: { group in
-                        inboxGroup = group
-                    }) {
-                        inboxDetailID = nil
-                    }
-                }
+            // A note's card opens the Inbox, where the note is read and answered in place.
+            .sheet(isPresented: $showsInbox) {
+                NavigationStack { MobileFacePage(page: "inbox") }
             }
             .sheet(isPresented: $showsChatSetup) {
                 PairingView(onSkip: { showsChatSetup = false }, onPaired: { showsChatSetup = false })
@@ -384,7 +326,8 @@ extension ChatView {
             .sheet(isPresented: $showsSyncConnection) {
                 NavigationStack { SettingsViewFull(opensConnection: true) }
             }
-            .fileImporter(isPresented: $showsFileImporter, allowedContentTypes: [.pdf, .plainText, .init(filenameExtension: "md") ?? .plainText], allowsMultipleSelection: true) { result in
+            .fileImporter(isPresented: $showsFileImporter, allowedContentTypes: [.pdf, .plainText, .init(filenameExtension: "md") ?? .plainText],
+                allowsMultipleSelection: true) { result in
                 loadFileAttachments(result)
             }
             .sheet(isPresented: $showsConfiguration) {
@@ -396,7 +339,6 @@ extension ChatView {
                         .toolbar { Button("Done") { showsConfiguration = false } }
                         .hazeTinted()
                 }
-                // Five rows: a half sheet, where the room's haze fills the view.
                 .presentationDetents([.medium, .large])
             }
             .task { await restoreConversation() }
@@ -410,13 +352,12 @@ extension ChatView {
             .onReceive(NotificationCenter.default.publisher(for: MobileQuickAskRoute.notification)) { _ in
                 if MobileQuickAskRoute.consume() { composerIsFocused = true }
             }
-            // Consume retained notification intent when session loading finishes.
             .onChange(of: store.isSwitchingSession) { _, switching in
                 guard !switching else { return }
                 consumeNotifiedChatSessionIfNeeded()
                 adoptMainSessionFromSnapshots()
             }
-            // Only process arguments can inject a turn; the release target has no URL route.
+            // Only process arguments may inject turns; Release exposes no URL route.
             .onReceive(NotificationCenter.default.publisher(for: .nativeagentDeepLinkSend)) { _ in
                 NativeAgentDeepLinkSendHook.deliverPending(
                     to: store,
@@ -425,7 +366,7 @@ extension ChatView {
                 )
             }
             .onChange(of: voiceInput.lastFinalTranscript, dictationFinished)
-            // No words came back (the error says why): nothing to send.
+            // Without recognized words there is nothing to send; the error already explains the cause.
             .onChange(of: voiceInput.error) { _, error in
                 if error != nil { sendWhenDictationLands = false }
             }
@@ -433,7 +374,6 @@ extension ChatView {
         }
     }
 
-    /// The agent's name, light and current activity or connection status.
     private var runtimeControlsBar: some View {
         let online = isChatSample || bridgeClient.connection.holds
         // Keep the shared tab-header height and the status chip's full 44pt target.
@@ -446,7 +386,6 @@ extension ChatView {
         .padding(.bottom, 6)
     }
 
-    /// What the agent is doing, in the Mac's words.
     private var agentDoing: (text: String, dot: AliveStatusDot.State) {
         if store.pendingExchanges.values.contains(where: {
             $0.sessionID == ChatStore.cleanSessionID(store.selectedSessionID) && $0.deliveryUnconfirmed
@@ -467,37 +406,8 @@ extension ChatView {
         return ("Here", .here)
     }
 
-    static let chatBottomID = "chat-bottom"
-
-    private func scheduleScrollToBottom(
-        _ proxy: ScrollViewProxy,
-        animated: Bool = false,
-        delayMilliseconds: Int = 30,
-        force: Bool = false
-    ) {
-        guard !visibleMessages.isEmpty else { return }
-        guard force || autoFollowChat else { return }
-        // The bottom follows every reply, other-room row, card and approval.
-        guard let serial = scrollScheduler.schedule(
-            animated: animated,
-            force: force
-        ) else { return }
-        let elapsed = Date().timeIntervalSince(lastScrollAt)
-        let minimumInterval = animated ? 0.12 : 0.09
-        let effectiveDelayMs = max(delayMilliseconds, Int(max(0, minimumInterval - elapsed) * 1000))
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(effectiveDelayMs)) {
-            guard scrollScheduler.complete(
-                serial: serial,
-                messagesAreAvailable: !visibleMessages.isEmpty
-            ) else { return }
-            lastScrollAt = Date()
-            if animated {
-                withAnimation(.easeOut(duration: 0.18)) {
-                    proxy.scrollTo(Self.chatBottomID, anchor: .bottom)
-                }
-            } else {
-                proxy.scrollTo(Self.chatBottomID, anchor: .bottom)
-            }
-        }
+    /// Back to the end, and following from there.
+    func followEnd() {
+        transcript.goToLatest()
     }
 }

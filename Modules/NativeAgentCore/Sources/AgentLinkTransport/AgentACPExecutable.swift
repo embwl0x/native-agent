@@ -27,7 +27,6 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
-    /// No program this app reads is larger: every read of one stops here.
     package static let maximumBytes: Int64 = 1 << 31
 
     private static func capture(path: String, handle: FileHandle) throws -> Self {
@@ -36,9 +35,7 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
               info.st_mode & 0o111 != 0, info.st_size <= maximumBytes else { throw AgentACPClient.Failure.unavailable }
         try handle.seek(toOffset: 0)
         var hash = SHA256()
-        // Each chunk is an autoreleased NSData: drained per chunk, a 240 MB
-        // program costs one chunk of memory, not its whole size. The size it
-        // had is the bound: a file still growing reads as changed below.
+        // Drain autoreleased chunks to bound memory; the initial size also detects a growing executable.
         var left = Int(info.st_size)
         while left > 0, let bytes = try autoreleasepool(invoking: { try handle.read(upToCount: min(65536, left)) }), !bytes.isEmpty {
             hash.update(data: bytes)
@@ -56,7 +53,6 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
                     digest: hash.finalize().map { String(format: "%02x", $0) }.joined())
     }
 
-    /// Recheck the approved absolute path immediately before a normal Mac launch.
     public func verify() throws {
         guard path.hasPrefix("/"),
               URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path == path
@@ -64,17 +60,12 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         let handle = try Self.openFile(path: path)
         defer { try? handle.close() }
         let current = try Self.capture(path: path, handle: handle)
-        // st_dev identifies the current mount and can change across a Mac
-        // restart. Keep it as capture metadata, not durable approval identity.
-        // Never refresh the approval: the exact path, inode and executable
-        // bytes must still match what was approved, immediately before spawn.
+        // Mount IDs can change across reboots; approval instead requires exact path, inode and bytes immediately before spawn.
         guard current.path == path, current.inode == inode, current.digest == digest,
               access(path, X_OK) == 0 else { throw AgentACPClient.Failure.executableChanged }
     }
 
-    /// For display and routing checks (`canStartTurn`, contact lists, sorts).
-    /// A program that passed a full `verify()` is not re-hashed while its file
-    /// stat is unchanged; the launch itself still runs `verify()` in full.
+    /// Display reads reuse a hash only while stat is unchanged; launch still verifies in full.
     public var isCurrent: Bool {
         let key = "\(path)\n\(inode)\n\(digest)"
         let before = Self.fileStamp(path)
@@ -84,7 +75,6 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         return true
     }
 
-    /// Approved program → the file stamp its last full verification passed under.
     private static let verifiedStamps = OSAllocatedUnfairLock(initialState: [String: SnapshotTailOpLog.FileStamp]())
 
     private static func fileStamp(_ path: String) -> SnapshotTailOpLog.FileStamp? {
@@ -93,12 +83,8 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         return SnapshotTailOpLog.FileStamp(info)
     }
 
-    /// A bounded probe, without a shell or inherited app credentials: its
-    /// --version, or discovery's --help (`errors`: some print it there), run
-    /// as `command` says (the caller's launch rule wraps it; nil runs it bare
-    /// with --version). It ends when its output closes or `limit` bytes are
-    /// read; `grace` is only the ceiling. Its whole process tree is stopped
-    /// either way. No agent conversation or configuration command is run.
+    /// Probe without a shell, inherited credentials or conversation commands; all exits stop the whole process tree. Output close, byte limit or grace ends the
+    /// probe; the caller's launch rule owns any wrapper.
     package func reported(environment: [String: String], command: [String]? = nil,
                           errors: Bool = false, grace: Duration = .seconds(3), limit: Int = 512) async throws -> String? {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("acp-version-\(UUID())")
@@ -127,9 +113,7 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
             }
             throw AgentACPClient.Failure.unavailable
         }
-        // Whichever ends first stops the other: the reader's end cancels the
-        // ceiling's wait, so the tree is stopped at once; the ceiling's stop
-        // ends a reader a descendant still holds open.
+        // Reader completion cancels the ceiling; the ceiling stops descendants holding output open.
         let terminationFailure = OSAllocatedUnfairLock(initialState: Optional<String>.none)
         let bytes = await withTaskGroup(of: Data?.self) { group in
             group.addTask {

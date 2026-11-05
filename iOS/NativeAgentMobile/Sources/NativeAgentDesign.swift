@@ -1,4 +1,3 @@
-// NativeAgentDesign.swift — Design tokens and reusable presentation primitives.
 
 import SwiftUI
 import Foundation
@@ -23,9 +22,9 @@ enum NativeAgentAppearance: String, CaseIterable, Identifiable {
                     throw PhoneLocalSetting.failure("The saved iPhone appearance is invalid. Choose a color scheme in iPhone NativeAgent Settings.")
                 }
                 return raw
-            }, write: { raw in
+            }, write: { raw, authority in
                 guard Self(rawValue: raw) != nil else { throw PhoneLocalSetting.failure("Choose a listed color scheme.") }
-                try PhoneSettingWrite.check()
+                try authority.check()
                 UserDefaults.standard.set(raw, forKey: storageKey)
             })
     }
@@ -73,14 +72,11 @@ enum AppMotion {
     // Animate appended bubbles at the mutation seam; list animation must not animate snapshot replacement.
     static let entrance = Animation.easeOut(duration: 0.22)
 
-    /// Reduce-motion-aware entrance for MODEL-layer mutation sites
-    /// (withAnimation in ChatStore has no SwiftUI Environment) — reads the
-    /// system setting directly.
+    /// Mutation sites lack SwiftUI Environment; read the system Reduce Motion setting directly.
     @MainActor static var entranceSystem: Animation? {
         UIAccessibility.isReduceMotionEnabled ? nil : entrance
     }
 
-    /// Return nil when Reduce Motion is enabled; otherwise preserve the given animation.
     static func respecting(_ animation: Animation?, reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : animation
     }

@@ -3,21 +3,9 @@ import SwiftUI
 
 // Blueprint: | `ChatCodeBlockView.swift` | `ChatCodeBlockView`: selectable fenced code, language label and idempotent copy; no renderer state or clock |
 
-/// A fenced code block in the transcript: monospaced, newline-preserving,
-/// selectable, with the fence's language label and a copy button.
-///
-/// NO STATE AND NO CLOCK. There is deliberately no "Copied!" confirmation
-/// flash — that needs a flag plus a timer to clear it, which is exactly the
-/// renderer-local state machine and renderer-local clock this surface is not
-/// allowed to grow. The copy is an unconfirmed, idempotent action.
-///
-/// NO SYNTAX HIGHLIGHTING. The language is shown as a label, not used to
-/// tokenize. Highlighting is a per-language tokenizer plus a light/dark theme
-/// we would own forever; the label plus copy carries nearly all of the value.
-///
-/// NO NESTED SCROLL VIEW. Long lines wrap. A horizontal `ScrollView` inside a
-/// `LazyVStack` row competes with the transcript's own scroll gesture and
-/// costs layout on every row; wrapping keeps text selection contiguous.
+/// Keep copy idempotent and unconfirmed so the renderer needs no state or timer.
+/// Show the language without a tokenizer or theme system to keep rendering lightweight.
+/// Wrap long lines because nested scroll views compete with transcript gestures and fragment text selection.
 struct ChatCodeBlockView: View {
     let language: String?
     let code: String

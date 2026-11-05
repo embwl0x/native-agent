@@ -2,9 +2,7 @@ import NativeAgentShared
 import AppToolRuntime
 
 // Blueprint: | `WindowHaze.swift` | Mac window haze palette, controls and shared `HazeView` presentation |
-// One single-hue haze drifts above the shared sheet and below every column.
-// Core Animation drives three radial-gradient discs without per-frame main-thread work.
-// Disc cores cap their combined overlap at 0.44 alpha to preserve text contrast.
+// Core Animation avoids per-frame main-thread work; cap combined disc overlap at 0.44 to preserve contrast.
 
 import AppKit
 import SwiftUI
@@ -12,10 +10,8 @@ import SwiftUI
 // MARK: - The colour setting
 
 extension HazeColor {
-    /// The haze itself, for glows on glass.
     var base: Color { swatch }
 
-    /// Its light shade, for light that travels on glass edges.
     var edgeLight: Color {
         switch self {
         case .unavailable: .clear
@@ -29,10 +25,9 @@ extension HazeColor {
         }
     }
 
-    /// The swatch colour: the middle-bright shade.
     var swatch: Color { Color(hex: shades[0]) }
 
-    /// Root control ink: retain the dark swatch, deepen it on the light room.
+    /// Deepen root ink in light rooms so the dark swatch retains contrast.
     func windowTint(dark: Bool) -> Color {
         guard !dark else { return base }
         let deep = NSColor(Color(hex: shades[1]))
@@ -41,12 +36,9 @@ extension HazeColor {
                                      blue: deep.blueComponent * 0.7, alpha: 1))
     }
 
-    /// A switch's "on" track: the base shade in dark (≥3.4:1 on the room for
-    /// every preset), the deep shade in light (the base teal and amber are
-    /// 2.8:1 on the light room; every deep shade clears 4.5). Anything that
-    /// carries a white label on the colour — a selected segment, a primary
-    /// button — always takes the deep shade: the label is ≥5:1 there, and
-    /// only 3.1:1 on the base teal and amber.
+    /// Use deep shades under white labels for at least 5:1 contrast; base teal and amber reach only 3.1:1.
+    /// Tracks need base shades in dark rooms (at least 3.4:1) and deep shades in light rooms (over 4.5:1).
+    /// Light-room base teal and amber reach only 2.8:1.
     func control(dark: Bool, labelled: Bool) -> NSColor {
         NSColor(Color(hex: dark && !labelled ? shades[0] : shades[1]))
     }
@@ -70,14 +62,12 @@ private struct HazeControlTint: ViewModifier {
         let color = HazeColor(stored: colorRaw).control(dark: colorScheme == .dark, labelled: kind != .toggle)
         content
             .tint(Color(nsColor: color))
-            // `.tint` never reaches a segmented picker's selected segment;
-            // its AppKit control takes the colour directly.
+            // tint does not reach AppKit's selected segment; set the native control colour directly.
             .background { if kind == .segments { SegmentBezelTint(color: color) } }
     }
 }
 
-/// Finds the NSSegmentedControl this sits behind and sets its selected
-/// segment's colour. Inert behind anything else.
+/// Touch only NSSegmentedControl so mounting behind another control remains inert.
 private struct SegmentBezelTint: NSViewRepresentable {
     var color: NSColor
 
@@ -122,18 +112,15 @@ private struct SegmentBezelTint: NSViewRepresentable {
 
 // MARK: - The window's haze
 
-/// The SwiftUI seam: reads the turn state and the setting, draws nothing under
-/// Reduce Transparency, holds still under Reduce Motion.
+/// Respect Reduce Transparency by drawing nothing and Reduce Motion by holding still.
 struct WindowHaze: View {
-    /// Optional so the headless snapshot renderers, which build a ShellFrame
-    /// with no model, get a still idle haze instead of a trap.
+    /// Optional lookup lets model-free snapshot hosts draw a still haze without starting a runtime.
     @Environment(AppModel.self) private var appModel: AppModel?
     @AppStorage(HazeColor.key) private var colorRaw = HazeColor.teal.rawValue
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    /// The conversation whose turn moves the haze: a detached chat window's
-    /// own. nil is the main window's active chat.
+    /// Detached windows must follow their own turn instead of the main chat.
     var sessionId: String? = nil
 
     var body: some View {
@@ -150,9 +137,7 @@ struct WindowHaze: View {
         }
     }
 
-    /// The composer's own "a turn is running" (the stop button's condition),
-    /// split by whether reply text has started to arrive. Every input is a
-    /// set that changes a few times per turn, never per token.
+    /// Read turn-phase sets instead of token events so haze invalidation stays bounded per turn.
     private var mood: HazeMood {
         guard let appModel else { return .idle }
         let id = sessionId ?? appModel.activeChatSessionId

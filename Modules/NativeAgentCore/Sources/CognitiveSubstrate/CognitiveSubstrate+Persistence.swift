@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import Experiences
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistAffectAndNodes`, checked owed-work receipts, diagnostic receipts and shared stage-specific persistence repair settlement |
+// Blueprint: | `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistAffectAndNodes`, checked stage repair |
 
 extension CognitiveSubstrate {
     /// Affect, consumed residue and node watermarks become durable together.
@@ -48,23 +48,19 @@ extension CognitiveSubstrate {
     public func recordReceipt(kind: String, payload: JSONValue = .object([:])) async {
         guard configuration.enabled, configuration.persistenceEnabled, let store else { return }
         do { try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now()) } catch {
-            // A log line has no resident state to reconcile: it stays an owed
-            // repair until its owner lets it go, without blocking health.
+            // A log line has no resident state to reconcile: it stays an owed repair until its owner lets it go, without blocking health.
             oweUnsaved("receipt.\(kind)", error, store: store)
         }
     }
 
-    /// The writes whose callers do not take the failure. A failure marks
-    /// persistence degraded under its stage and files one repair naming it;
-    /// the next write of that stage persists the current resident state (the
-    /// truth), which settles the repair and clears the stage. No replay.
+    /// A failed unattended write owes one stage repair; the next durable write of current owner state settles it without replay.
     func notingPersistence(_ stage: String, _ write: () async throws -> Void) async {
-        do { try await checkingPersistence(stage, write) } catch { /* Accounted for by the checked owner. */ }
+        do { try await checkingPersistence(stage, write) } catch { /* The checked owner accounts for this failure. */ }
     }
 
     /// A read can succeed with no source. That absence is not repair evidence.
     func notingPersistenceRead(_ stage: String, _ read: () async throws -> Bool) async {
-        do { try await checkingPersistenceOutcome(stage, read) } catch { /* Accounted for by the checked owner. */ }
+        do { try await checkingPersistenceOutcome(stage, read) } catch { /* The checked owner accounts for this failure. */ }
     }
 
     /// The same accounting when the caller must stop dependent settlement.
@@ -80,9 +76,8 @@ extension CognitiveSubstrate {
         do {
             guard try await operation() else { return }
             let wasUnsaved = unsavedStages.remove(stage) != nil
-            // Self-file debts may predate this process. Its checked read and
-            // write settle only their own claim; routine SQLite checkpoints
-            // need no repair-ledger read when no write has failed.
+            // Self-file debts may predate this process. Its checked read and write settle only their own claim; routine SQLite checkpoints need no
+            // repair-ledger read when no write has failed.
             guard wasUnsaved || stage == "mind.self" || stage == "mind.self.read" else { return }
             RepairOwed.settle(Self.dataRoot(of: store), operation: "cognition.persist:" + stage,
                               evidence: .init(source: "cognition/cognition.sqlite", id: stage))
@@ -93,13 +88,11 @@ extension CognitiveSubstrate {
                 lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
                 lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt)
         } catch {
-            // A write refused because writes are blocked (her mind not yet read,
-            // or a failed restore) is not a failed save: health already says
-            // writes are blocked, and no repair is owed for it.
+            // A write refused because writes are blocked (the agent's mind not yet read, or a failed restore) is not a failed save: health already says writes
+            // are blocked, and no repair is owed for it.
             if let refusal = error as? CognitivePersistenceError, case .writesBlocked = refusal { throw error }
-            // A write Clear's hold discarded is not durable and not a failure
-            // of its own: the failed Clear's one repair names it, and nothing
-            // it was saving is settled.
+            // A write Clear's hold discarded is not durable and not a failure of its own: the failed Clear's one repair names it, and nothing it was saving is
+            // settled.
             if error is CognitiveWriteDiscarded { throw error }
             oweUnsaved(stage, error, store: store)
             if !stage.hasPrefix("receipt."), !persistenceHealth.writesBlocked {
@@ -119,12 +112,11 @@ extension CognitiveSubstrate {
     private func oweUnsaved(_ stage: String, _ error: Error, store: CognitiveSQLiteStore) {
         RepairOwed.owe(Self.dataRoot(of: store), id: "cognition-persist:" + UUID().uuidString.lowercased(), kind: .run,
                        operation: "cognition.persist:" + stage, owner: "cognition",
-                       words: "Her \(stage) was not saved: \(error.localizedDescription)")
+                       words: "The agent's \(stage) was not saved: \(error.localizedDescription)")
     }
 
-    /// A failed Clear owes ONE repair, stage `clear`, naming the writes its hold
-    /// discarded (bounded). Nothing is written for them now: they land on
-    /// their next change.
+    /// A failed Clear owes ONE repair, stage `clear`, naming the writes its hold discarded (bounded). Nothing is written for them now: they land on their next
+    /// change.
     func oweFailedClear(_ discarded: [(kind: String, id: UUID)], error: Error) {
         guard let store, !discarded.isEmpty else { return }
         var seen = Set<String>()
@@ -179,9 +171,8 @@ extension CognitiveSubstrate {
     ) async throws {
         guard configuration.persistenceEnabled else { return }
         guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        // Clear holds the store under logical exclusion: a snapshot captured
-        // before it is discarded, never written after it (`forgetMind`), and
-        // the caller learns it is NOT durable.
+        // Clear holds the store under logical exclusion: a snapshot captured before it is discarded, never written after it (`forgetMind`), and the caller
+        // learns it is NOT durable.
         if forgettingInFlight {
             forgettingDiscarded.append(contentsOf: artifacts.map { (kind: $0.kind, id: $0.id) })
             forgettingDiscarded.append(contentsOf: deletedArtifactIDs.map { (kind: "deleted", id: $0) })
@@ -204,9 +195,8 @@ extension CognitiveSubstrate {
     ) async throws {
         guard configuration.persistenceEnabled else { return }
         guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        // Clear holds the store under logical exclusion: a snapshot captured
-        // before it is discarded, never written after it (`forgetMind`), and
-        // the caller learns it is NOT durable.
+        // Clear holds the store under logical exclusion: a snapshot captured before it is discarded, never written after it (`forgetMind`), and the caller
+        // learns it is NOT durable.
         if forgettingInFlight {
             forgettingDiscarded.append((kind: "snapshot", id: UUID()))
             forgettingDiscarded.append(contentsOf: artifacts.map { (kind: $0.kind, id: $0.id) })
@@ -248,13 +238,8 @@ extension CognitiveSubstrate {
 // MARK: - In-memory artifact caps (G-M2)
 
 extension CognitiveSubstrate {
-    // Each artifact family is disk-capped and restart-capped, but the in-process
-    // dict grew without bound over a days-long run so `.values` scans went O(N).
-    // Evict the oldest by timestamp at each record tail, retained-N matched to
-    // the family's
-    // restore limit in `restoreArtifactFamilyLoads()`. The disk copy survives, so
-    // eviction is safe — restart reloads up to the same N. Reflection work
-    // still owing effects/journal acknowledgment is not history and is exempt.
+    // Evict oldest settled artifacts to each family's restore bound so resident scans stay bounded. Unfinished reflection work is exempt; disk history
+    // survives.
 
     private func evictOldest<Value>(
         from dict: inout [UUID: Value],
@@ -291,11 +276,7 @@ extension CognitiveSubstrate {
         for receipt in settled.dropFirst(reflectionReceiptCap) { reflectionReceipts[receipt.id] = nil }
     }
 
-    // `replayEvidenceIds` is a dedup guard with no per-entry timestamp and no disk
-    // restore (it is cleared on restore). Bound it in lockstep with `episodes`:
-    // when it exceeds the episode cap, drop ids no longer referenced by any live
-    // episode. A dropped id's episode survives on disk, so a re-dream simply
-    // re-creates it — pruning unreferenced ids is safe.
+    // Bound replay dedup ids with episodes; unreferenced ids may drop because their disk episodes can be recreated on replay.
     func enforceReplayEvidenceCap() {
         let cap = 120
         guard replayEvidenceIds.count > cap else { return }
@@ -304,8 +285,7 @@ extension CognitiveSubstrate {
     }
 }
 
-/// A write Clear's hold discarded: not durable. Never a silent success, so a
-/// lived moment's part that hit one stays owed.
+/// A write Clear's hold discarded: not durable. Never a silent success, so a lived moment's part that hit one stays owed.
 public struct CognitiveWriteDiscarded: Error, CustomStringConvertible {
     public var description: String { "the write was discarded by a Clear in progress and is not saved" }
 }

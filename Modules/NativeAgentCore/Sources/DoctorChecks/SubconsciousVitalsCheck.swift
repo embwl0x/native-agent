@@ -2,46 +2,25 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `SubconsciousVitalsCheck.swift` | `SubconsciousVitalsCheck`: measured capsule/felt vocabulary and chemistry health from canonical local evidence |
+// Blueprint: | `SubconsciousVitalsCheck.swift` | `SubconsciousVitalsCheck`: measured capsule, felt vocabulary and chemistry |
 
 // MARK: - Subconscious vitals (Cognition)
-//
-// The cognitive capsule is the one part of her that nobody sees. It rides
-// INSIDE the prompt, it is never quoted back, and when it degrades — the
-// capsule stops being attached, the felt vocabulary collapses onto two words,
-// the same Inner line repeats for a week — the chat still looks fine. That is
-// exactly the drift NORTHSTAR clause 2 calls theater: a live mechanism whose
-// failure is silent.
-//
-// This row reads the `context.snapshot` turn-trace rows (bounded tail read, at
-// most 7 day files, only when Doctor runs) and the organism's own chemistry
-// file, and reports MEASURED numbers with their denominators. Nothing here is a
-// placeholder, and nothing here runs on a turn.
-//
-// The window starts at THIS BUILD's launch (DoctorWindowFloor) and is named in
-// the row. Rates and variety describe that window without grading her health.
-//
-// Wording comes only from the bounded `cognitiveCue` field, retained even when
-// the snapshot is truncated. Missing or clipped wording is not measured.
+// Capsule drift may leave chat looking normal; measure bounded context snapshots and chemistry explicitly in Doctor. Name the window from this build's launch;
+// rates and variety describe observations without grading the agent's health. Read wording only from retained cognitiveCue; missing or clipped wording cannot
+// be measured.
 
 public struct SubconsciousVitalsCheck: DoctorCheck {
     public let id: String = "subconscious_vitals"
     public let title: String = "Subconscious Vitals"
-    /// Doctor's eyes only. A window verdict must never become an unattended
-    /// push notification — see `DoctorCheck.heartbeatEligible`.
+    /// Measurement-window verdicts stay in Doctor and cannot trigger unattended pushes.
     public let heartbeatEligible: Bool = false
 
     private let root: URL
     private let cache: DoctorScanCache
 
-    /// Hard ceiling on day FILES opened; the window's floor is this build's
-    /// launch (see DoctorWindowFloor).
-    private let maximumDayFiles = 7
-    /// The conversational surfaces whose capsule observations are counted.
     private let capsuleSurfaces: Set<String> = ["chat", "telegram", "ios"]
-    /// The Sound line that says her phrasing has gone stale.
     private let rutMarker = "let the moment pick the word"
-    /// Report the chemistry's distance from its rails without grading it.
+    /// Values at chemistry rails remain readings, never health verdicts.
     private let pinnedHigh = 0.98
     private let pinnedLow = 0.02
     private let chemistryDimensions = ["agency", "confidence", "coherence", "warmth"]
@@ -81,100 +60,97 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         guard let window = DoctorWindowFloor.resolve(root: root, now: moment) else {
             return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
                 id: id, title: title, status: "unmeasured",
-                detail: "This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring this build.")
+                detail: """
+                    This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring \
+                    this build.
+                    """)
         }
-        let summary = await TurnTraceWindowReader.scan(
-            root: root,
-            now: moment,
-            days: window.dayFilesToRead(now: moment, maximum: maximumDayFiles),
-            floor: window.floor,
-            kinds: ["context.snapshot"]
-        ) { row in
-            let payload = row.payload.objectValue ?? [:]
-            guard let surface = row.surface, capsuleSurfaces.contains(surface) else { return }
-            // One snapshot per turn is the norm; a re-assembled turn must not
-            // count twice in any denominator.
-            let key = row.turnId.isEmpty ? UUID().uuidString : row.turnId
-            guard seenTurns.insert(key).inserted else { return }
-            eligibleTurns.insert(key)
+        let summary: TurnTraceScanSummary
+        do {
+            summary = try await TurnTraceWindowReader.scan(
+                root: root,
+                now: moment,
+                floor: window.floor,
+                kinds: ["context.snapshot"]
+            ) { row in
+                let payload = row.payload.objectValue ?? [:]
+                guard let surface = row.surface, capsuleSurfaces.contains(surface) else { return }
+                // Count each turn once even when its snapshot is reassembled.
+                let key = row.turnId.isEmpty ? UUID().uuidString : row.turnId
+                guard seenTurns.insert(key).inserted else { return }
+                eligibleTurns.insert(key)
 
-            let flag = payload["containsCognitiveSubstrate"]?.boolValue
-            let capsuleBytes = payload["cognitiveCapsuleBytes"]?.intValue
-            if flag == true || (capsuleBytes ?? 0) > 0 {
-                capsulePresent.insert(key)
-            } else if flag == nil && capsuleBytes == nil {
-                // Nothing in this row can speak to the capsule either way.
-                capsuleUnjudged.insert(key)
-            }
+                let flag = payload["containsCognitiveSubstrate"]?.boolValue
+                let capsuleBytes = payload["cognitiveCapsuleBytes"]?.intValue
+                if flag == true || (capsuleBytes ?? 0) > 0 {
+                    capsulePresent.insert(key)
+                } else if flag == nil && capsuleBytes == nil {
+                    // Nothing in this row can speak to the capsule either way.
+                    capsuleUnjudged.insert(key)
+                }
 
-            guard case .object(let cue)? = payload["cognitiveCue"],
-                  cue["truncated"]?.boolValue == false,
-                  let kind = cue["kind"]?.stringValue,
-                  let line = cue["line"]?.stringValue, !line.isEmpty else { return }
-            wordingTurns += 1
-            if kind == "felt" {
-                let felt = line.split(separator: ",").map { Self.feelingWord(in: $0) }
-                    .filter { !$0.isEmpty }
-                feltTurns += 1
-                for word in felt { feltCounts[word, default: 0] += 1 }
+                guard case .object(let cue)? = payload["cognitiveCue"],
+                      cue["truncated"]?.boolValue == false,
+                      let kind = cue["kind"]?.stringValue,
+                      let line = cue["line"]?.stringValue, !line.isEmpty else { return }
+                wordingTurns += 1
+                if kind == "felt" {
+                    let felt = line.split(separator: ",").map { Self.feelingWord(in: $0) }
+                        .filter { !$0.isEmpty }
+                    feltTurns += 1
+                    for word in felt { feltCounts[word, default: 0] += 1 }
+                }
+                if kind == "sound" {
+                    soundTurns += 1
+                    if line.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
+                }
+                if kind == "inner" {
+                    innerTurns += 1
+                    innerLines[line.lowercased(), default: 0] += 1
+                }
             }
-            if kind == "sound" {
-                soundTurns += 1
-                // The named rut rides its own Sound line after the echo.
-                if line.localizedCaseInsensitiveContains(rutMarker) { rutTurns += 1 }
-            }
-            if kind == "inner" {
-                innerTurns += 1
-                innerLines[line.lowercased(), default: 0] += 1
-            }
-        }
-
-        if let day = summary.unreadableDays.first {
-            let file = root.appendingPathComponent("turn_traces/\(day).jsonl")
-            return CheckResult(source: file.path,
+        } catch {
+            return CheckResult(source: TurnTraceWindowReader.source,
                 id: id, title: title, status: "fail",
-                detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
-                    + " not be read (\(summary.unreadableDays.joined(separator: ", "))), so her subconscious vitals are unmeasured \(window.describedAs).",
-                harm: "Her subconscious behavior cannot be checked from the saved turns.",
-                human_action: ToolFailureError.fileRepairInstruction(file,
-                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
+                detail: "The experience record could not be read, so the agent's subconscious vitals are unmeasured \(window.describedAs): \(error).",
+                harm: "The agent's subconscious behavior cannot be checked from the saved turns.")
         }
 
         let chemistry = readChemistry()
         if case .unreadable(let reason) = chemistry {
             return CheckResult(source: "cognition/organism_state.json",
                 id: id, title: title, status: "fail",
-                detail: "data/cognition/organism_state.json exists but \(reason), so her chemistry is unmeasured.",
-                harm: "Her saved body state cannot be read.",
+                detail: "data/cognition/organism_state.json exists but \(reason), so the agent's chemistry is unmeasured.",
+                harm: "The agent's saved body state cannot be read.",
                 human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent("cognition/organism_state.json"),
-                    shape: "This JSON object retains organism state, including a chemicalState object with finite numeric agency, confidence, coherence and warmth values. Recover only values supported by the retained bytes."))
+                    shape: """
+                        This JSON object retains organism state, including a chemicalState object with finite numeric agency, confidence, coherence \
+                        and warmth values. Recover only values supported by the retained bytes.
+                        """))
         }
 
         let coverageDetail = summary.coverageDetail
 
         if summary.isEmptyFeed {
-            return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
+            return CheckResult(source: "\(TurnTraceWindowReader.source) and cognition/organism_state.json",
                 id: id, title: title, status: "unmeasured",
-                detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
-                    + " data/turn_traces; "
-                    + chemistryLine(chemistry).sentence + "."
+                detail: "UNMEASURED \(window.describedAs) — no matching trace details were recorded; "
+                    + chemistryLine(chemistry).sentence + coverageDetail + "."
             )
         }
         guard !eligibleTurns.isEmpty else {
-            return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
+            return CheckResult(source: "\(TurnTraceWindowReader.source) and cognition/organism_state.json",
                 id: id, title: title,
                 status: "unmeasured",
-                detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
-                    + " trace day(s) read and \(summary.matchedRows) context.snapshot row(s)"
+                detail: "UNMEASURED \(window.describedAs) — \(summary.eventsRead) context.snapshot event(s)"
                     + " in window, but none on a capsule surface"
-                    + " (\(capsuleSurfaces.sorted().joined(separator: "/"))), so her subconscious behavior cannot be measured; "
+                    + " (\(capsuleSurfaces.sorted().joined(separator: "/"))), so the agent's subconscious behavior cannot be measured; "
                     + chemistryLine(chemistry).sentence + coverageDetail + "."
             )
         }
 
-        var parts: [String] = [window.describedAs]
+        var parts: [String] = [window.describedAs, summary.windowCovered]
 
-        // 1. Capsule attachment.
         let judged = eligibleTurns.count - capsuleUnjudged.count
         if judged > 0 {
             let percent = Double(capsulePresent.count) / Double(judged) * 100
@@ -199,7 +175,6 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 + " missing or clipped wording is NOT MEASURED"
         )
 
-        // 2. Felt-word mass.
         let feltTotal = feltCounts.values.reduce(0, +)
         if feltTotal > 0, let top = feltCounts.max(by: { lhs, rhs in
             lhs.value == rhs.value ? lhs.key > rhs.key : lhs.value < rhs.value
@@ -216,7 +191,6 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             parts.append("felt vocabulary UNMEASURED — no turn yielded a readable feeling line")
         }
 
-        // 3. The Sound rut line.
         if soundTurns > 0 {
             let percent = Double(rutTurns) / Double(soundTurns) * 100
             parts.append(
@@ -229,24 +203,20 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             parts.append("Sound line UNMEASURED — no turn yielded a readable Sound line")
         }
 
-        // 4. Inner-line variety.
         if innerTurns > 0 {
             parts.append("\(innerLines.count) distinct Inner line(s) over \(innerTurns) turn(s)")
         } else {
             parts.append("Inner line NOT MEASURED — no turn yielded complete Inner wording")
         }
 
-        // 5. Organism chemistry is a reading, including values at a rail.
+        // Chemistry values, including those at a rail, are observations rather than health grades.
         let chemLine = chemistryLine(chemistry)
         parts.append(chemLine.sentence)
 
-        if !summary.coverageParts.isEmpty {
-            parts.append(contentsOf: summary.coverageParts)
-            // A bounded read is coverage, not a fault; the detail names it.
-        }
+        parts.append(contentsOf: summary.coverageParts)
 
-        return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
-            id: id, title: title, status: chemLine.level ?? "ok",
+        return CheckResult(source: "\(TurnTraceWindowReader.source) and cognition/organism_state.json",
+            id: id, title: title, status: chemLine.level ?? (summary.unreadableRows == 0 ? "ok" : "unmeasured"),
             detail: parts.joined(separator: "; ") + "."
         )
     }
@@ -329,11 +299,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         }
     }
 
-    /// One comma-separated entry reduced to the feeling word itself. An entry
-    /// may name what the feeling is ABOUT after a dash — "curious — completion
-    /// event" is one feeling, "curious", not a distinct vocabulary item per
-    /// subject. Keeping the subject inflates apparent emotional range every
-    /// time the subject changes.
+    /// Strip the feeling's subject so a new topic cannot inflate apparent emotional vocabulary.
     private static func feelingWord(in entry: some StringProtocol) -> String {
         var value = entry.trimmingCharacters(in: .whitespaces)
         for separator in [" — ", " – ", " - ", "—", "–"] {

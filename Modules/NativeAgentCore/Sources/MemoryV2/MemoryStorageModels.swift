@@ -7,8 +7,7 @@ public enum MemoryV2Defaults {
     public static let personaID = "NativeAgent"
 }
 
-/// Hard bound on canonical MemoryV2 fact rows. Enforced inside every canonical
-/// insert/accept transaction and during store open for legacy overflow.
+/// Enforce the canonical row bound in every insert/accept transaction and at store open.
 public let memoryStoredRowCap = 2_000
 
 public enum MemoryLifecycle {
@@ -19,12 +18,10 @@ public enum MemoryLifecycle {
     public static let corrected = "corrected"
     public static let contradicted = "contradicted"
     public static let deleted = "deleted"
-    /// A standing lesson approved into GROWTH: kept as history (and in the
-    /// miss ledger), no longer recalled — the prefix carries it now.
+    /// A standing lesson approved into GROWTH: kept as history (and in the miss ledger), no longer recalled — the prefix carries it now.
     public static let graduated = "graduated"
 
     public static let recallExcluded: Set<String> = [corrected, contradicted, deleted, graduated]
-    /// `recallExcluded` as the SQL list every store query filters with.
     public static let recallExcludedSQL = "(" + recallExcluded.sorted().map { "'\($0)'" }.joined(separator: ", ") + ")"
 
     public static func normalized(_ value: String?) -> String {
@@ -61,20 +58,18 @@ public struct StoredMemory: Sendable {
     public var createdAt: String
     public var updatedAt: String
     public var embedding: [Float]?
-    /// Exact identity of the vector space that produced `embedding`. Nil is
-    /// legacy/unverified and is never presented as epoch-protected.
+    /// Unverified vector identity stays nil and cannot claim epoch protection.
     public var embeddingEpoch: String?
     public var status: String
     public var lifecycle: String
-    /// Truth interval, validated on write. A passed validTo excludes the row
-    /// from current recall, disclosure and USER.md while retaining history.
+    /// Truth interval, validated on write. A passed validTo excludes the row from current recall, disclosure and USER.md while retaining history.
     public var validFrom: String?
     public var validTo: String?
     public var observedAt: String?
     public var evidence: JSONValue?
     public var metadata: JSONValue?
-    /// `recordRecallHits` atomically counts access; `metadata.recall_count` counts merge evidence.
-    /// Capacity retention uses access recency; disuse alone never archives a row.
+    /// `recordRecallHits` atomically counts access; `metadata.recall_count` counts merge evidence. Capacity retention uses access recency; disuse alone never
+    /// archives a row.
     public var useCount: Int64
     public var lastUsedAt: String?
 
@@ -172,9 +167,7 @@ public struct MemoryPatch: Sendable {
     public var observedAt: String?
     public var evidence: JSONValue?
     public var metadata: JSONValue?
-    /// Keys merged into the row's current metadata inside the same SQLite
-    /// transaction as the rest of the patch. Narrow metadata updates use this
-    /// so a service-side read/replace cannot overwrite a concurrent owner write.
+    /// Merge narrow metadata patches in the same transaction so service-side read/replace cannot overwrite concurrent writes.
     public var metadataMerge: [String: JSONValue]?
 
     public init(
@@ -214,8 +207,7 @@ public enum MemoryStorageError: Error, LocalizedError {
     case notFound(String)
     case alreadyResolved(String)
     case databaseUnavailable(String)
-    /// The candidate content is a paraphrase of a tombstoned claim (semantic
-    /// gate) — blocked at store/accept time per the rejection denylist.
+    /// Block paraphrases of tombstoned claims at store and acceptance.
     case tombstoned(String)
     case embeddingEpochMismatch(expected: String, actual: String?)
     case embeddingActivationInvalid(EmbeddingActivationRefusal, String)
@@ -301,8 +293,7 @@ public struct MemoryEmbeddingCorpusRow: Sendable, Equatable {
     public let kind: MemoryEmbeddingCorpusKind
     public let id: String
     public let content: String
-    /// Exact UTF-8 SHA-256 for this derived candidate, distinct from the
-    /// normalized claim hash used by canonical tombstone matching.
+    /// Use exact UTF-8 SHA-256 for derived candidates; canonical tombstones use a normalized claim hash.
     public let contentHash: String
 
     public init(kind: MemoryEmbeddingCorpusKind, id: String, content: String) {

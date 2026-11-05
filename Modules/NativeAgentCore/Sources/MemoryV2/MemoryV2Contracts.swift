@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `MemoryV2Contracts.swift` | Recall candidate offsets and continuations; `MemoryCommitArguments` owns explicit scope bounds; `MemoryProposalEvidence` reads checked recorded recurrence and sessions; proposal contracts and `MemoryPatchContract` provenance |
+// Blueprint: | `MemoryV2Contracts.swift` | `MemoryCommitArguments`, `MemoryProposalEvidence`, `MemoryPatchContract` |
 
 // MARK: - Request / response types
 
@@ -67,7 +67,10 @@ public struct MemoryProposalEvidence: Sendable {
                 catch { failures.append(String(describing: error)) }
                 if let value = fields["supporting_session_ids"] {
                     if case .array(let values) = value,
-                       values.allSatisfy({ if case .string(let id) = $0 { return !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }; return false }) {
+                       values.allSatisfy({
+                           if case .string(let id) = $0 { return !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty };
+                           return false
+                       }) {
                         sessions = Array(Set(values.compactMap(\.stringValue))).sorted()
                     } else { failures.append("supporting_session_ids must contain only nonempty session ids") }
                 }
@@ -94,7 +97,7 @@ public struct MemoryV2RecallRequest: Sendable, Codable, Equatable {
     public var persona: String?
     public var surface: String?
     public var requiresRelevance: Bool?
-    /// Ranked disclosed candidates already examined, copied from nextOffset.
+    /// Count examined disclosed candidates from the same nextOffset.
     public var offset: Int?
 
     public init(
@@ -161,16 +164,12 @@ public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
     public var content: String
     public var personaId: String?
     public var source: String?
-    /// "pending" | "accepted" | "rejected".
     public var status: String
     public var createdAt: String
     /// When the row left `pending`, anchoring supersession-link recovery; nil while pending.
     public var resolvedAt: String?
     public var rejectionReason: String?
-    /// Carries the extractor's per-fact signal (confidence, kind) from staging
-    /// through promotion so `acceptProposal` can stamp it on the memory instead
-    /// of discarding it. Previously dropped at the bridge → every memory landed
-    /// at confidence 1.0 / kind nil (#1 signal-leak).
+    /// Carry extractor confidence and kind through promotion so acceptance preserves the original signal.
     public var metadata: JSONValue?
 
     public init(
@@ -198,17 +197,9 @@ public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
 
 // MARK: - Patch contract
 
-/// Metadata keys accepted by the SQLite bridge's untyped patch path.
 public enum MemoryPatchContract {
-    /// Untyped keys that round-trip through metadata.
-    ///
-    /// `pinned` — the Mac UI pin path.
-    /// `tags` / `importance` — surfaced back into typed slots by `toMemoryRecord`.
-    /// `recall_count` — `store()`'s duplicate guard bumps it.
-    /// `source_history` / `duplicate_occurrences` — byte-identical collapse provenance.
-    ///
-    /// `kind` is deliberately ABSENT: it is semantics-owned (kind-scoped decay)
-    /// and the approval-gated kind backfill uses its dedicated typed writer.
+    /// Untyped metadata round-trips pinning, tags, importance, duplicate counts and provenance. Exclude kind: semantic classification and approved backfill own
+    /// its typed writer.
     public static let untypedPassthroughKeys: Set<String> = [
         "pinned", "tags", "importance", "recall_count",
         "source_history", "duplicate_occurrences", "untrusted_sources", "peer_data_sources", "peer_sources",
@@ -216,8 +207,7 @@ public enum MemoryPatchContract {
 
 }
 
-/// One validated replacement: the memory an accepted update demotes, and the
-/// fingerprint that row had when the proposal was staged.
+/// Retain the reviewed replacement target and its staging-time fingerprint.
 public struct SupersedingAcceptance: Sendable, Equatable {
     public let targetId: String
     /// Acceptance requires a target fingerprint; proposals without one stay pending for re-review.

@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import CognitiveSubstrate
-// Blueprint: | `DreamPayload.swift` | `DreamPayload`, `DreamClaim` and `DreamLesson`: checked per-claim provenance and bounded optional learning; malformed present sections fail decoding rather than disappear |
+// Blueprint: | `DreamPayload.swift` | `DreamPayload`, `DreamClaim`, `DreamLesson`. |
 
 struct DreamLesson: Sendable, Codable {
     let lesson: String
@@ -21,8 +21,7 @@ struct DreamLesson: Sendable, Codable {
     }
 }
 
-/// Meaning judged by the dream that produced the claim, never by a lexical
-/// filter in a later reader. Nil is unknown and grants no outreach eligibility.
+/// Use the dream's own judgment rather than later lexical inference; unknown judgment grants no outreach eligibility.
 public struct DreamClaim: Sendable, Codable {
     public var provenance: DreamEntryProvenance
     public var gentle: Bool?
@@ -44,7 +43,7 @@ public struct DreamClaim: Sendable, Codable {
         try container.encode(aboutOwner, forKey: .aboutOwner)
     }
 
-    /// Older claims retain unknown judgments; only trailing section blocks count.
+    /// Absent judgments remain unknown; only trailing section blocks establish them.
     public static func read(in content: String) -> [DreamClaimSection<Self>] {
         DreamEntryProvenance.readClaims(in: content, as: Self.self)
     }
@@ -58,11 +57,10 @@ struct DreamPayload: Decodable {
     let emergingThemes: [String]
     let surprisingMoments: [String]
     let claims: [DreamClaim]
-    /// Optional `settled: <key>: <how>` / `let go: <key>` lines about her open cares.
     let cares: [String]
     let lessons: [DreamLesson]
     let careMerges: [CognitiveCareMerge]
-    /// Merge entries she wrote that could not be read, so a drop is visible.
+    /// Expose unreadable written entries so dropped dream content cannot disappear silently.
     let careMergesMalformed: Int
     let careStanceChanges: [CognitiveCareStanceChange]
     let traits: [CognitiveSelfKnowledge.Trait]

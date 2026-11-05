@@ -16,18 +16,11 @@ import AppKit
 import Carbon
 #endif
 
-// Blueprint: | `MacHandRepertoire.swift` | `MacHandRepertoire`: constructs bounded keyboard/pointer step sequences with one drag interpolation, held-key/button balance and residual-release accounting |
+// Blueprint: | `MacHandRepertoire.swift` | `MacHandRepertoire`: Bounded gestures with interpolated drags, balanced holds and residual releases |
 
-// Pure bounded plans in global screen coordinates; no app-specific policy.
-// Callers own admission, timing, emission and effect verification.
+// Plans are pure; callers own admission, timing, emission and effect verification.
 
-/// One step of a planned gesture. A gesture is an ordered list of these, and
-/// the caller posts them in order.
-///
-/// `.wait` is a step rather than a `Thread.sleep` inside the planner because a
-/// hover with a dwell, a press-and-hold, and a drag that pauses over a drop
-/// target are all real human gestures whose TIMING is part of the gesture. The
-/// planner states the timing; the caller performs it.
+/// Timing belongs in gesture steps so callers can perform dwells without blocking the pure planner.
 public enum MacHandStep: Sendable, Equatable {
     case mouse(MacMouseEvent)
     case key(MacKeyEvent)
@@ -47,30 +40,17 @@ extension MacHandStep {
 public enum MacHandRepertoire {
 
     // MARK: Bounds
-    //
-    // Every bound here is a SAFETY bound, not a preference. They cap what one
-    // planned gesture can be, so a bad number from a model becomes a clamped
-    // gesture rather than a hundred thousand events posted into the host.
+    // Safety bounds prevent model-supplied sizes from flooding the host with events.
 
-    /// Interpolation steps for one straight A→B drag. Below 2 that drag is a
-    /// teleport, so `drag(from:to:)` floors here. `dragPath` does NOT: a caller
-    /// who supplied the waypoints already chose the density, and forcing extra
-    /// interpolation into a hand-drawn path would silently change its shape.
+    /// Two-point drags need interpolation to avoid teleporting; authored paths already choose their own density.
     public static let minimumDragSteps = 2
     public static let maximumDragSteps = 240
-    /// Points in one `dragPath`. A path with more corners than this is not a
-    /// gesture, it is a drawing — and drawing is composed of many gestures.
+    /// Bound path complexity so one gesture cannot become an unbounded drawing.
     public static let maximumPathPoints = 64
-    /// A single planned dwell/hold. Longer waits are the caller's business.
+    /// Longer waits belong to the caller.
     public static let maximumWaitMilliseconds = 60_000
 
-    /// Virtual keycodes of the modifier keys, for holds. `MacKeyEvent` carries
-    /// modifiers as FLAGS, which is right for a chord — but a flag lives on an
-    /// event, and a hold has to stay down across events that carry no flags at
-    /// all. So a hold emits the modifier's PHYSICAL key down/up around the
-    /// inner steps AND sets the flags on every inner input event. Both,
-    /// because apps split on which they
-    /// watch: a text field reads the flags, a game reads the key.
+    /// Holds need physical key down/up and flags on inner events: games watch keys while text fields watch flags.
     public enum ModifierKeyCode {
         public static let command: UInt16 = 55
         public static let shift: UInt16 = 56
@@ -79,8 +59,7 @@ public enum MacHandRepertoire {
         public static let function: UInt16 = 63
     }
 
-    /// Physical keycodes for a modifier set, in a stable order so plans are
-    /// deterministic and byte-comparable in tests.
+    /// Stable modifier ordering keeps plans deterministic.
     public static func modifierKeyCodes(_ modifiers: MacKeyModifiers) -> [UInt16] {
         var codes: [UInt16] = []
         if modifiers.contains(.command) { codes.append(ModifierKeyCode.command) }
@@ -93,21 +72,16 @@ public enum MacHandRepertoire {
 
     // MARK: - Pointer
 
-    /// Move the cursor. No button state changes.
     public static func move(to point: CGPoint, button: MacMouseButton = .left) -> [MacHandStep] {
         [.mouse(MacMouseEvent(phase: .move, button: button, x: point.x, y: point.y))]
     }
 
-    /// Move somewhere and STAY there. Hover is not a move: tooltips, menu
-    /// reveals, hover-highlights and drop-target feedback all key off the
-    /// cursor resting, which a move alone never expresses.
+    /// Hover dwell lets tooltips, menus and drop targets react to a resting cursor.
     public static func hover(at point: CGPoint, dwellMs: Int) -> [MacHandStep] {
         move(to: point) + [.wait(.milliseconds(clampWait(dwellMs)))]
     }
 
-    /// Press and HOLD a button at a point. The matching `release` is the
-    /// caller's obligation — see `dragPath` / `pressAndHold` for the composed
-    /// forms that cannot leave a button down.
+    /// The caller owes a matching release; composed holds and drags balance it internally.
     public static func press(button: MacMouseButton, at point: CGPoint) -> [MacHandStep] {
         return [.mouse(MacMouseEvent(phase: .down, button: button, x: point.x, y: point.y, clickCount: 1))]
     }
@@ -116,8 +90,7 @@ public enum MacHandRepertoire {
         return [.mouse(MacMouseEvent(phase: .up, button: button, x: point.x, y: point.y, clickCount: 1))]
     }
 
-    /// Press, wait, release — a press-and-hold, which is a distinct gesture
-    /// from a click on long-press surfaces. Balanced by construction.
+    /// Balanced press/wait/release supports surfaces that distinguish long presses from clicks.
     public static func pressAndHold(
         button: MacMouseButton,
         at point: CGPoint,
@@ -128,11 +101,7 @@ public enum MacHandRepertoire {
             + release(button: button, at: point)
     }
 
-    /// Click: move → (down → up) × count, with `clickCount` counting UP across
-    /// the burst. The leading move puts hover-sensitive UI in the state a
-    /// human's click would find it in. The ascending clickCount is what makes a
-    /// double-click a double-click: macOS reads the click state off the event,
-    /// so two events both stamped 1 are two single clicks, not a double.
+    /// Leading movement primes hover state; ascending clickCount makes macOS recognize a double-click rather than two single clicks.
     public static func click(
         button: MacMouseButton,
         at point: CGPoint,
@@ -146,18 +115,8 @@ public enum MacHandRepertoire {
         return plan
     }
 
-    /// A straight drag from A to B, interpolated.
-    ///
-    /// EXACTLY `steps + 2` mouse events: one press at `from`, `steps`
-    /// intermediate drag moves, one release at `to`. The last interpolated move
-    /// lands exactly on `to` so the release never introduces a jump the app has
-    /// not already seen.
-    ///
-    /// There is deliberately NO leading `.move` here: `mouseDown` carries its
-    /// own position, so the press lands where it says it lands, and the event
-    /// arithmetic stays exactly `steps + 2`. When the target needs hover state
-    /// first (a drag handle that only appears on hover), compose:
-    /// `hover(at:dwellMs:) + drag(...)`.
+    /// The final interpolated move reaches `to` before release to avoid a jump. No leading move: mouseDown carries its position; hover-sensitive sources must
+    /// compose a hover first.
     public static func drag(
         button: MacMouseButton = .left,
         from: CGPoint,
@@ -169,31 +128,15 @@ public enum MacHandRepertoire {
         try dragPath(
             button: button,
             through: [from, to],
-            // The teleport floor lives HERE, on the two-point convenience —
-            // this is the call that would otherwise emit a single jump.
+            // Only the two-point convenience needs a floor against teleporting.
             stepsPerSegment: max(minimumDragSteps, steps),
             holdMs: holdMs,
             travelMs: travelMs
         )
     }
 
-    /// A drag along a PATH: press at the first point, travel through EVERY
-    /// remaining point in order, release at the last.
-    ///
-    /// `stepsPerSegment` interpolates WITHIN each segment. A real hand emits
-    /// many small moves; an app that integrates deltas (a slider, a scrub bar,
-    /// a canvas, a drag-and-drop list that measures velocity) sees a single
-    /// jump as no movement at all and drops the drag. Interpolation is
-    /// therefore not smoothing — it is the difference between a drag that works
-    /// and one that does nothing.
-    ///
-    /// `holdMs`, when non-zero, inserts a dwell after the press and another
-    /// before the release: many drop targets only arm after the pointer has
-    /// rested on them, and many sources only begin a drag after a hold.
-    ///
-    /// Balanced by construction: the press and the release are emitted by the
-    /// same call, and no path through this function can produce one without the
-    /// other.
+    /// Interpolate each segment so delta- and velocity-sensitive apps observe movement. Dwell at both ends lets drag sources and drop targets arm; one call
+    /// balances the press and release.
     public static func dragPath(
         button: MacMouseButton = .left,
         through points: [CGPoint],
@@ -207,8 +150,7 @@ public enum MacHandRepertoire {
         let path = Array(points.prefix(maximumPathPoints))
         let perSegment = max(1, min(stepsPerSegment, maximumDragSteps))
         let dwell = clampWait(holdMs)
-        // Optional elapsed travel is distributed across moves, not substituted
-        // with a pause at either endpoint.
+        // Optional elapsed travel is distributed across moves, not substituted with a pause at either endpoint.
         let travel = clampWait(travelMs)
         let moveCount = (path.count - 1) * perSegment
         var moveIndex = 0
@@ -241,20 +183,17 @@ public enum MacHandRepertoire {
         return plan
     }
 
-    /// A path that needs at least a start and an end.
     public enum MacHandPathError: Error, Equatable, Sendable {
         case needsAtLeastTwoPoints(Int)
     }
 
-    /// Wheel scroll. Deltas are the seam's own units; `unit` picks line
-    /// (notched wheel) or pixel (trackpad-grade) granularity.
+    /// Keep deltas in the sink’s declared wheel or pixel units.
     public static func scroll(dx: Int32, dy: Int32, unit: MacScrollUnit = .line) -> [MacHandStep] {
         [.scroll(MacScrollEvent(deltaX: dx, deltaY: dy, unit: unit))]
     }
 
     // MARK: - Keyboard
 
-    /// Literal text, one keyDown/keyUp pair per character carrying it verbatim.
     public static func type(text: String) -> [MacHandStep] {
         text.flatMap { character in
             let unit = String(character)
@@ -265,9 +204,7 @@ public enum MacHandRepertoire {
         }
     }
 
-    /// One key, with modifier flags on both the down and the up. The flags on
-    /// the UP matter: an app that tracks modifier state from events believes
-    /// the modifier is still held if the release arrives without them.
+    /// Modifier flags must reach key-up too, or apps may believe a modifier remains held.
     public static func chord(_ chord: MacKeyChord) -> [MacHandStep] {
         [
             .key(MacKeyEvent(keyCode: chord.keyCode, down: true, modifiers: chord.modifiers)),
@@ -275,7 +212,7 @@ public enum MacHandRepertoire {
         ]
     }
 
-    /// Wrap planned steps in physical key downs and reverse-order releases.
+    /// Reverse-order releases balance nested holds.
     public static func hold(
         modifiers: MacKeyModifiers = [],
         keys: [UInt16] = [],
@@ -286,7 +223,7 @@ public enum MacHandRepertoire {
             .key(MacKeyEvent(keyCode: $0, down: true, modifiers: modifiers))
         }
 
-        // Every inner input carries held flags as well as physical key downs.
+        // Apps may watch flags rather than physical modifier keys.
         plan.append(contentsOf: steps.map { step in
             switch step {
             case .key(let event):
@@ -322,13 +259,8 @@ public enum MacHandRepertoire {
     }
 
     // MARK: - Invariants
-    //
-    // These are not test helpers. A caller assembling gestures can assert them
-    // before posting anything, and the stuck-modifier failure mode is severe
-    // enough that "the plan is balanced" deserves to be checkable in
-    // production, not only under `swift test`.
+    // Production callers can check balance before posting to prevent stuck keys or buttons.
 
-    /// Keycodes pressed but never released, in press order. Empty is correct.
     public static func residualHeldKeys(in plan: [MacHandStep]) -> [UInt16] {
         var down: [UInt16] = []
         for step in plan {
@@ -342,8 +274,7 @@ public enum MacHandRepertoire {
         return down
     }
 
-    /// Buttons pressed but never released, in press order. A drag counts as
-    /// held: `.drag` neither presses nor releases.
+    /// Drag events preserve a held button; they neither press nor release it.
     public static func residualHeldButtons(in plan: [MacHandStep]) -> [MacMouseButton] {
         var down: [MacMouseButton] = []
         for step in plan {
@@ -360,8 +291,6 @@ public enum MacHandRepertoire {
         return down
     }
 
-    /// True when the plan leaves the hand exactly as it found it: no key down,
-    /// no button down.
     public static func isBalanced(_ plan: [MacHandStep]) -> Bool {
         residualHeldKeys(in: plan).isEmpty && residualHeldButtons(in: plan).isEmpty
     }

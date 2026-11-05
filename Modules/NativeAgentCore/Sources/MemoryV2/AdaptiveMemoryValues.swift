@@ -40,16 +40,12 @@ public struct AdaptiveExtractionReport: Sendable {
 public struct AdaptiveMemoryObservation: Sendable {
     public let proposals: [ProposalRecord]
     public internal(set) var extraction: AdaptiveExtractionReport
-    /// Decisions the fact lane refused this turn: below the confidence floor,
-    /// refused by `MemoryManagerLane.statementRejectionReason`, an embedding
-    /// near-duplicate of something already kept or pending, tombstoned, or a
-    /// staging error.
+    /// Keep explicit refusal evidence for confidence, quality, duplicates, tombstones and staging failures.
     public let hygieneRejectedCount: Int
     public let savedCorrectionCount: Int
     public let pendingCorrectionCount: Int
     public let failedCorrectionCount: Int
-    /// The agent's own complete no-op prediction for this turn, its standing,
-    /// and whether the turn was deferred (left owed) instead of judged now.
+    /// The agent's own complete no-op prediction for this turn, its standing, and whether the turn was deferred (left owed) instead of judged now.
     public var surprise: AfterTurnSurpriseObservation?
     var stagingFailed = false
     /// Judgment and cost evidence for complete surprise labels; nil when no judgment ran.
@@ -76,17 +72,14 @@ public struct AdaptiveMemoryObservation: Sendable {
     }
 }
 // MARK: - Shared candidate vocabulary
-/// Names used only to keep correction subject identifiers neutral. Semantic
-/// eligibility and grounding belong to the shared interpretation, in any language.
+/// Names used only to keep correction subject identifiers neutral. Semantic eligibility and grounding belong to the shared interpretation, in any language.
 public enum AdaptiveCandidateHygiene {
-    /// Names the assistant goes by, lowercased. The app adds the persona's
-    /// display name at launch; "assistant" is always in.
+    /// Launch adds the persona's lowercased display name; `assistant` is always recognized.
     private static let names = Mutex<Set<String>>(["assistant"])
     /// A locked snapshot; iterate this, never the storage.
     public static var assistantNames: Set<String> {
         names.withLock { $0 }
     }
-    /// Teach hygiene one more name the assistant goes by.
     public static func insertAssistantName(_ name: String) {
         let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return }

@@ -9,19 +9,17 @@ import ProviderRouting
 extension REMConsolidator {
     // MARK: GROWTH.md eviction-to-KG
 
-    /// Over the character cap, distill the oldest contiguous exact approved
-    /// paragraphs to the KG and remove them; all other authored text stays.
-    /// Returns characters evicted, or zero when no passage qualifies.
+    /// Evict only contiguous exact approved paragraphs; preserve other authored text.
     func runGrowthEviction(proposalRows: [REMProposalRow]? = nil) async throws -> Int {
         let proposalRows = try proposalRows ?? REMProposalStore(dataRoot: dataRoot).loadAllStrictly()
         let growth = personaRoot.appendingPathComponent("GROWTH.md")
         guard FileManager.default.fileExists(atPath: growth.path) else { return 0 }
 
-        // Distill outside GROWTH.md's shared writer lock; splice under it only if the exact slice still stands.
+        // Distill outside the shared GROWTH lock; splice only if the exact slice still stands under it.
         let planned = Self.evictionRange(
             in: try String(contentsOf: growth, encoding: .utf8), proposalRows: proposalRows
         )
-        // A distill failure surfaces inside the lock, after the repair pass.
+        // Surface distillation failure only after locked repair can settle prior work.
         let distilled: Result<(slice: String, node: KGNode), Error>?
         if let planned {
             do { distilled = .success((planned.slice, try await distillToKGNode(planned.slice))) }
@@ -32,21 +30,19 @@ extension REMConsolidator {
         }
     }
 
-    /// The oldest evictable slice of an over-cap body, or nil.
     private static func evictionRange(
         in body: String, proposalRows: [REMProposalRow]
     ) -> (range: Range<String.Index>, slice: String)? {
         if body.count <= REMConstants._REM_GROWTH_CHAR_CAP { return nil }
 
-        // Exact approved paragraphs are the only evictable boundaries.
+        // Only exact approved paragraphs establish evictable boundaries.
         let approvedRows = proposalRows
             .filter { $0.status == "approved" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
         let lessons = Set(approvedRows.map { $0.proposalText.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }.flatMap { REMGrowthWriter.entryParagraphRanges(body, $0) })
             .sorted { $0.lowerBound == $1.lowerBound ? $0.upperBound > $1.upperBound : $0.lowerBound < $1.lowerBound }
         guard var range = lessons.first else { return nil }
-        // Keep one contiguous passage for recovery; only whitespace may join
-        // approved paragraphs, and authored text ends the pass.
+        // Keep one recoverable contiguous passage; authored text ends selection and only whitespace may join approved paragraphs.
         for next in lessons.dropFirst() {
             if body[range].count >= REMConstants._REM_GROWTH_EVICT_CHARS { break }
             guard next.lowerBound >= range.upperBound else { continue }
@@ -56,14 +52,13 @@ extension REMConsolidator {
         return (range, String(body[range]))
     }
 
-    /// The locked critical section of `runGrowthEviction`. Must only be
-    /// called while holding the GROWTH.md flock.
+    /// The caller must hold the GROWTH file lock.
     private func evictGrowthUnderLock(
         growth: URL, proposalRows: [REMProposalRow], distilled: Result<(slice: String, node: KGNode), Error>?
     ) async throws -> Int {
-        // An unreadable GROWTH.md aborts the pass; pending history stays pending.
+        // Unreadable GROWTH aborts while retained history stays pending.
         let body = try String(contentsOf: growth, encoding: .utf8)
-        // Reconcile pending history against the locked body before the cap can skip this pass.
+        // Reconcile pending history before the size cap can skip the pass.
         try await REMGrowthEvictionHistory.reconcilePending(
             growthBody: body,
             dataRoot: dataRoot,
@@ -71,7 +66,7 @@ extension REMConsolidator {
                 try await Self.growthDistillationNodeExists(id: id, dataRoot: dataRoot)
             }
         )
-        // Failed distillation leaves the source passage intact in GROWTH.md.
+        // Failed distillation preserves the GROWTH source.
         guard let planned = Self.evictionRange(in: body, proposalRows: proposalRows),
               let distilled = try distilled?.get(), planned.slice == distilled.slice else { return 0 }
         let evictedSlice = planned.slice
@@ -79,8 +74,7 @@ extension REMConsolidator {
         let approvedRows = proposalRows
             .filter { $0.status == "approved" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
         let kgNode = distilled.node
-        // Retain the exact passage under the data root before the KG merge or GROWTH splice.
-        // Record pending before eviction and committed only after the splice; pending alone means retained.
+        // Retain exact source and pending history before graph merge or splice; only a successful splice can certify eviction.
         let historyRecord = REMGrowthEvictionRecord(
             id: kgNode.id,
             evictedAt: kgNode.createdAt,
@@ -91,22 +85,15 @@ extension REMConsolidator {
             state: .pending
         )
         try await REMGrowthEvictionHistory.append(historyRecord, dataRoot: dataRoot)
-        // A cancel during the distill above (its own LLM call) must not fall
-        // through to the KG+GROWTH commit pair below. One guard here covers both
-        // writes: the KG-first ordering means a throw leaves GROWTH.md intact and
-        // the KG untouched.
+        // Check cancellation before either commit so cancellation during distillation leaves graph and GROWTH untouched.
         try Task.checkCancellation()
-        // KG must retain the passage before GROWTH removes it; failure aborts the pass.
+        // Retain the passage in the graph before removing it from GROWTH; merge failure aborts.
         try await appendKGNode(kgNode)
 
-        // Splice the evicted section out, leaving the preamble + remainder.
-        // ONLY reached when the KG merge above succeeded.
         var rebuilt = String(body[..<evictableStart])
         rebuilt += String(body[cursor...])
         try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(rebuilt.utf8), to: growth)
-        // The splice landed: NOW the eviction is true, and the history may say
-        // so. A failure here leaves the pending row standing — the passage is
-        // retained and the record still doesn't overclaim.
+        // Mark committed only after the splice; failed history writes leave retention pending without overclaiming eviction.
         var committed = historyRecord
         committed.state = .committed
         try await REMGrowthEvictionHistory.append(committed, dataRoot: dataRoot)
@@ -120,9 +107,7 @@ extension REMConsolidator {
         let createdAt: String
     }
 
-    /// The approved proposals whose text sits inside this evicted slice — the
-    /// approvals the retained passage came in by. Read-only over rows the store
-    /// already holds; nothing new is persisted here.
+    /// Derive approval provenance from existing proposal rows without persisting a second authority.
     fileprivate static func proposalRefs(
         in slice: String,
         rows: [REMProposalRow]
@@ -144,10 +129,10 @@ extension REMConsolidator {
         let prompt = try completionPolicy("growth-compression", section: "prompt", arguments: [text])
         let raw = try await llm.complete(
             prompt: prompt, system: try completionPolicy("growth-compression", section: "system"),
-            model: nil, surface: "rem", purpose: "rem", tools: nil
+            model: nil, tools: nil, call: LLMCall(turn: nil, surface: "rem", purpose: "rem")
         )
         let summary = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // An empty response fails eviction with the GROWTH source intact.
+        // An empty response fails eviction with source intact.
         guard !summary.isEmpty else {
             throw NSError(
                 domain: "REMConsolidator",
@@ -159,15 +144,9 @@ extension REMConsolidator {
         }
         let id = Self.growthDistillationID(text)
         return KGNode(
-            // Stable over the source slice, not the model summary. If the KG
-            // commit succeeds but the following GROWTH.md splice fails, the
-            // next pass upserts this same entity instead of minting a duplicate.
+            // Key by exact source passage so a retry after graph-only success upserts instead of duplicating.
             id: id,
-            // THE NODE POINTS AT THE ORIGINAL. The id is already shared with the
-            // retained-passage record, but a compressed node whose pointer is an
-            // unwritten convention is a node nobody expands — so it says where
-            // the full passage is in the canonical SQLite graph.
-            // The 400-character bound is the summary's; the pointer after it stays whole.
+            // Keep the canonical retained-passage pointer whole after the bounded summary so compressed nodes remain expandable.
             summary: String(summary.prefix(400)) + "\n\n" + REMGrowthEvictionHistory.pointer(id: id),
             sourceLines: text.split(separator: "\n").count,
             createdAt: isoNow()
@@ -181,9 +160,7 @@ extension REMConsolidator {
         return "growth_\(digest)"
     }
 
-    /// Corroborating identity for a reconciled eviction: the distilled node
-    /// carrying the record's id in the graph (memory.sqlite). An unavailable
-    /// graph fails reconciliation with the original pending record intact.
+    /// Corroborate eviction with the matching graph node; unavailable graph evidence leaves original history pending.
     fileprivate static func growthDistillationNodeExists(id: String, dataRoot: URL) async throws -> Bool {
         let sqliteURL = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
@@ -192,11 +169,7 @@ extension REMConsolidator {
         return try await indexer.growthDistillationExists(id: id)
     }
 
-    /// Merge a GROWTH-eviction distillation node into the graph in
-    /// memory.sqlite. THROWS on any failure (no store yet included), and the
-    /// caller (`runGrowthEviction`) must NOT splice the GROWTH.md slice unless
-    /// this call succeeded — otherwise the slice would be gone from both
-    /// GROWTH and the graph.
+    /// Graph merge must succeed before GROWTH removal so the passage cannot disappear from both stores.
     private func appendKGNode(_ node: KGNode) async throws {
         let kgDir = dataRoot.appendingPathComponent("memory", isDirectory: true)
         let indexer = try SwiftNativeKnowledgeGraphIndexer(

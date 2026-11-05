@@ -2,12 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `MacFourVerbs+ScreenFusion.swift` | Call-local sight binding retains AX reference sessions across look/pixel dispatches; percept and pixel fusion bind to window/frame identity; partial derives from percept truncation; natural targets and named read gaps survive, and empty looks supply no act window |
+// Blueprint: | `MacFourVerbs+ScreenFusion.swift` | Call-local AX/pixel fusion binds window identity, targets and read gaps; empty looks grant no act window |
 
-/// Call-local proof supplied by the canonical view capture, never
-/// by app-name matching. Pixels that cannot bind to this look are discarded.
+/// Call-local proof supplied by the canonical view capture, never by app-name matching. Pixels that cannot bind to this look are discarded.
 final class MacSightCaptureBinding: @unchecked Sendable {
-    @TaskLocal static var current: MacSightCaptureBinding?
+
     let frameID: String
     private let lock = NSLock()
     private var validate: (@Sendable () async -> Bool)?
@@ -30,12 +29,12 @@ final class MacSightCaptureBinding: @unchecked Sendable {
         }
     }
     init(frameID: String) { self.frameID = frameID }
-    /// A complete uncapped walk and its seam; replacing it clears its percept.
+    /// Clear the percept whenever its complete walk is replaced so both retain one source epoch.
     var walked: (read: MacAXRead, seam: [String: JSONValue])? {
         get { lock.withLock { read } }
         set { lock.withLock { read = newValue; compiledPercept = nil } }
     }
-    /// The compiler's typed result, including its full-context redaction verdicts.
+    /// Retain the compiler's contextual redaction verdict so downstream rendering never rejudges isolated text.
     var percept: MacLookPercept? {
         get { lock.withLock { compiledPercept } }
         set { lock.withLock { compiledPercept = newValue } }
@@ -51,13 +50,12 @@ final class MacSightCaptureBinding: @unchecked Sendable {
 }
 
 extension MacFourVerbs {
-    /// `seek`: a name the caller is about to act on. When the ordinary walk
-    /// stops short of it, the look searches deeper and frames it (`seekScoped`).
+    /// `seek`: a name the caller is about to act on. When the ordinary walk stops short of it, the look searches deeper and frames it (`seekScoped`).
     /// `requiresWindow`: acts need targets; a plain look can observe their absence.
     func sight(part: String?, app: String? = nil, seek: String? = nil,
-               observed: MacSightCaptureBinding? = nil, requiresWindow: Bool = true) async -> Sighted {
+               observed: MacSightCaptureBinding? = nil, requiresWindow: Bool = true, turn: Turn, context: MacOperationContext) async -> Sighted {
         let captureBinding = observed ?? MacSightCaptureBinding(frameID: UUID().uuidString)
-        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
+        let continuation = turn.macContinuation.flatMap { $0.isPending ? $0 : nil }
         let app = continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app
         let result: MacControlResult
         do {
@@ -66,8 +64,8 @@ extension MacFourVerbs {
             if let app { body["app"] = .string(app) }
             if let part { body["section"] = .string(part) }
             if let seek = seek ?? part, !seek.isEmpty { body["seek"] = .string(seek) }
-            result = try await MacSightCaptureBinding.$current.withValue(captureBinding) {
-                try await host.dispatch(action: "look", body: body)
+            result = try await context.holding(\.capture, captureBinding) { context in
+                try await host.dispatch(action: "look", body: body, turn: turn, context: context)
             }
         } catch {
             return .blind(MacFourVerbsReply(
@@ -81,8 +79,7 @@ extension MacFourVerbs {
            output["running"] == .bool(false) || Self.windowlessApp(output) {
             var detail = Self.operationDetail(result).merging(output) { _, new in new }
             if requiresWindow {
-                // A successful empty observation supplies no window targets.
-                // Keep that fact, but refuse a caller that needs one to act.
+                // A successful empty observation supplies no window targets. Keep that fact, but refuse a caller that needs one to act.
                 detail["status"] = .string("refused")
                 detail["error"] = .string(output["running"] == .bool(false) ? "app_not_running" : "no_window_in_app")
             }
@@ -107,9 +104,7 @@ extension MacFourVerbs {
             return .blind(MacFourVerbsReply(
                 ok: false,
                 text: Self.runningAppsLine(output) + "I can't see the screen right now. " + why,
-                // The refusal's own words, unwrapped. A caller with a different
-                // lead sentence (the cross-app drag: "I can't drop into Mail")
-                // must not have to strip this one's off the front.
+                // Keep refusal wording unwrapped so callers can supply their own lead without parsing prose.
                 detail: Self.operationDetail(result).merging([
                     "error": .string(result.error ?? "look_failed"),
                     "message": .string(why),
@@ -134,9 +129,8 @@ extension MacFourVerbs {
         let (rows, controls) = Self.partition(percept)
         var targets: [ActTarget] = []
         var rowRoleOrdinals: [String: Int] = [:]
-        // Render limits keep the model's reply bounded; they must never become
-        // an input limit. A control or row revealed by a prior zoom remains a
-        // valid natural target even when the next full-screen render elides it.
+        // Render limits keep the model's reply bounded; they must never become an input limit. A control or row revealed by a prior zoom remains a valid
+        // natural target even when the next full-screen render elides it.
         for (index, row) in rows.enumerated() {
             let kind = MacScreenRender.kindName(role: row.role)
             let roleOrdinal = (rowRoleOrdinals[kind] ?? 0) + 1
@@ -206,8 +200,8 @@ extension MacFourVerbs {
         var supplementalDiagnostics: [String: JSONValue] = [:]
         var nativeAXSupplement: MacFourVerbsSupplement?
         var mergedAXPaths: Set<[Int]> = []
-        let supplement = await MacSightCaptureBinding.$current.withValue(captureBinding) {
-            await supplementalSource?.observe(app: app)
+        let supplement = await context.holding(\.capture, captureBinding) {
+            context in await supplementalSource?.observe(app: app, turn: turn, context: context)
         }
         if let detail = supplement?.diagnostics, detail["remedy"] != nil {
             return .blind(MacFourVerbsReply(ok: false, text: Self.string(detail["message"]) ?? "The requested screen capture failed.", detail: detail))
@@ -224,14 +218,12 @@ extension MacFourVerbs {
                 let duplicateIndex = Self.supplementalDuplicateIndex(candidate, among: targets)
                 if let duplicateIndex {
                     if let path = candidate.sourceAXPath { mergedAXPaths.insert(path) }
-                    // Enrich the semantic handle with the fused frame and mark
-                    // so a named target also retains its physical address.
+                    // Enrich the existing semantic handle so a physical point cannot create a competing target identity.
                     let existing = targets[duplicateIndex]
                     let mergedLabel = existing.label ?? display
                     let mergedFrame = existing.frame ?? candidate.frame
-                    // A containing row and its filename are one named item,
-                    // but their marks still address DIFFERENT AX elements.
-                    // Keep the semantic leaf handle; never donate the row mark.
+                    // A containing row and its filename are one named item, but their marks still address DIFFERENT AX elements. Keep the semantic leaf handle;
+                    // never donate the row mark.
                     let sameAXElement = existing.sourceAXPath == nil || candidate.sourceAXPath == nil
                         || existing.sourceAXPath == candidate.sourceAXPath
                     let mergedViewId = existing.viewId ?? (sameAXElement ? candidate.viewId : nil)
@@ -293,13 +285,13 @@ extension MacFourVerbs {
             supplementalSource?.rejected()
         }
 
-        // Expose the look frame's existing handle for an empty focused editor as a role ordinal.
+        // Expose the existing focus handle for empty editors so they remain addressable without invented content.
         var focusedControl: (label: String, kind: String)?
         if let focus = percept.focus, let handle = focus.handle {
             let kind = MacScreenRender.kindName(role: focus.role)
             let label = focus.displayLabel ?? "focused \(kind)"
             if let index = targets.firstIndex(where: { $0.handle == handle }) {
-                // Give an unnamed focused editable control a natural name and aliases on its existing handle.
+                // Give unnamed focused editors aliases on their existing handle so naming cannot mint a second address.
                 if targets[index].label == nil {
                     focusedControl = (label, kind)
                     targets[index].label = label
@@ -341,8 +333,7 @@ extension MacFourVerbs {
             return "POINTER: \(x)%,\(y)% of the observed surface (system position)."
         }()
         let windowKind = Self.string(output["window_kind"])
-        // A walk its caps cut must not read as the whole window: say so, and
-        // how to reach the rest (a named act searches past the cut).
+        // A walk its caps cut must not read as the whole window: say so, and how to reach the rest (a named act searches past the cut).
         let cutLine: String? = !percept.truncated ? nil
             : percept.truncationReasons.contains("ax_error")
             ? "partial: the app didn't answer every accessibility read; this is only the content read so far."
@@ -350,15 +341,13 @@ extension MacFourVerbs {
             ? "partial: budget reached; this is only the accessibility content read so far."
             : "partial: some accessibility content was not read (\(percept.truncationReasons.joined(separator: ", ")))."
         let rendererNote = Self.string(Self.object(output["seam"])["renderer_wait_note"])
-        // Native blocks own AX presentation; the pixel renderer adds only
-        // independently recognized regions and canvas evidence.
+        // Native blocks own AX presentation; the pixel renderer adds only independently recognized regions and canvas evidence.
         guard var nativePage = result.nativePage else {
             return .blind(MacFourVerbsReply(ok: false,
                 text: "raw view · accessibility · The look reader did not return a native screen page.",
                 detail: ["error": .string("screen_page_unavailable")]))
         }
-        // Resolve the names and presses the native page actually offers,
-        // rather than a same-named decorative element from the raw percept.
+        // Resolve the names and presses the native page actually offers, rather than a same-named decorative element from the raw percept.
         for thing in nativePage.things {
             guard let address = try? JSONValue.parse(Data(thing.address.utf8)),
                   let handle = Self.string(Self.object(address)["handle"]),
@@ -460,7 +449,7 @@ extension MacFourVerbs {
             }
         }
         if let name = percept.app?.name {
-            // Scroll-bar positions are raw state, excluded from home readouts.
+            // Scrollbar positions are raw state, never document readouts.
             sightRecorder?.record(app: name, kind: windowKind,
                                   readouts: percept.readouts.filter { $0.role != "AXValueIndicator" }.compactMap(\.displayText))
         }
@@ -505,7 +494,7 @@ extension MacFourVerbs {
             windowKind: windowKind,
             focusPath: percept.focus?.path,
             editableHandles: {
-                // Password fields never count, whatever their role says.
+                // Exclude password fields regardless of role so missing role classification cannot expose credentials.
                 let fieldRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
                 let secure = Set(percept.affordances.filter {
                     $0.role == "AXSecureTextField" || $0.subrole == "AXSecureTextField"

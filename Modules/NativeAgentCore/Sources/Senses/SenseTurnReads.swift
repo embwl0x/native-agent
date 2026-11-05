@@ -1,10 +1,8 @@
 import Foundation
 // Blueprint: | `SenseTurnReads.swift` | `SenseTurnReads`: bounded turn-local served-version evidence |
 
-/// One box per turn, inherited by its tool calls (including parallel calls).
-/// No session/global history: the next turn starts empty.
+/// The execution owner passes this accumulator to parallel reads; the next execution makes its own.
 public final class SenseTurnReads: @unchecked Sendable {
-    @TaskLocal public static var current: SenseTurnReads?
     private let lock = NSLock()
     private var reads: [SenseProvenance] = []
     private var overflowed = false

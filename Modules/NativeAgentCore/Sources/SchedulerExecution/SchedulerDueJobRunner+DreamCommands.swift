@@ -4,15 +4,13 @@ import TriggerScheduler
 // Blueprint: | `SchedulerDueJobRunner+DreamCommands.swift` | canonical recurring-dream command selection and job receipts |
 
 extension SchedulerDueJobRunner {
-    public func createIntegrationJob(input: [String: JSONValue], writer: SwiftNativeTriggerScheduler, createJob: @Sendable ([String: JSONValue]) async throws -> JSONValue) async throws -> JSONValue {
-        // A repeating dream is the nightly reflection, which has one canonical
-        // job. Recreating it goes through Add Nightly Reflection's own path
-        // (reactivating a cancelled job) instead of adding a second daily dream.
-        // A one-time dream is still an ordinary job.
+    public func createIntegrationJob(input: [String: JSONValue], writer: SwiftNativeTriggerScheduler,
+        createJob: @Sendable ([String: JSONValue]) async throws -> JSONValue) async throws -> JSONValue {
+        // A repeating dream is the nightly reflection, which has one canonical job. Recreating it goes through Add Nightly Reflection's own path (reactivating
+        // a cancelled job) instead of adding a second daily dream. A one-time dream is still an ordinary job.
         if input["kind"] == .string("dream"),
            !SchedulerJobNormalizer.isOneShot(input) {
-            // This early return is still a create request. Validate through the
-            // same owner before it can reactivate a real nightly occurrence.
+            // This early return is still a create request. Validate through the same owner before it can reactivate a real nightly occurrence.
             _ = try SchedulerJobNormalizer.normalize(body: input, now: { Date() },
                 uuid: { UUID().uuidString.lowercased() })
             return try await nightlyDreamJob(writer: writer)

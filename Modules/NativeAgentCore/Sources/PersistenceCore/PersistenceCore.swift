@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import Darwin
 import NativeAgentShared
-// Blueprint: | `PersistenceCore.swift` | JSON/JSONL atomic and durable persistence, strict UTF-8 physical-line reads with integrity reporting and directory sync; bounded atomic `PhonePlaceHistory` written only by the Mac bridge |
+// Blueprint: | `PersistenceCore.swift` | `PhonePlaceHistory`; Durable atomic storage and strict physical-line reads. |
 
 /// Bounded, atomic source history; the Mac bridge is its sole writer.
 public enum PhonePlaceHistory {
@@ -26,13 +26,10 @@ public enum PhonePlaceHistory {
 
 // MARK: - Errors
 
-/// Errors raised by the persistence layer.
 public enum PersistenceCoreError: Error, Equatable {
     case nonFiniteFloat(Double, path: String)
     case ioFailure(String)
-    /// A JSON file exists but does not parse. The file is left where it is
-    /// (the next successful write replaces it); `quarantine` is the copy of
-    /// its bytes kept beside it, or nil if that copy could not be written.
+    /// Preserve malformed source bytes; quarantine identifies a private copy when one could be written.
     case corruptJSON(path: String, quarantine: String?)
 }
 
@@ -50,11 +47,8 @@ extension PersistenceCoreError: LocalizedError {
 
 /// JSONL scan integrity, separating malformed rows from a tolerated trailing partial.
 public struct JSONLReadReport: Sendable, Equatable {
-    /// Lines rejected by decoding, excluding the tolerated trailing partial.
     public var malformedLineCount: Int
-    /// A tolerated parse failure on the final, unterminated UTF-8 line.
     public var trailingPartialLine: Bool
-    /// Every scanned physical line, decoded or not, for feed-size thresholds.
     public var physicalLineCount: Int
 
     public init(
@@ -75,15 +69,13 @@ public struct JSONLReadReport: Sendable, Equatable {
 
 /// Stateless file operations; async entry points retain their executor boundary.
 extension CocoaError {
-    /// The file is absent. FileHandle reports that as fileNoSuchFile (4) while
-    /// Data and FileManager report fileReadNoSuchFile (260); both mean absent.
+    /// FileHandle and Data/FileManager use different Cocoa error codes for the same absence.
     public var isFileAbsent: Bool { code == .fileNoSuchFile || code == .fileReadNoSuchFile }
 }
 
 public enum SwiftNativePersistenceCore {
 
-    /// Malformed JSON attempts a private quarantine copy before throwing;
-    /// callers needing a nonmutating inspection must read and parse directly.
+    /// Malformed JSON attempts a private quarantine copy before throwing; callers needing a nonmutating inspection must read and parse directly.
     public static func readJSON(_ path: URL, ifMissing: JSONValue) async throws -> JSONValue {
         let data: Data
         do {
@@ -155,9 +147,7 @@ public enum SwiftNativePersistenceCore {
         try appendRecords([record], to: path, durable: false)
     }
 
-    /// Durable batch append — one write, one `F_FULLFSYNC`. Same contract as the
-    /// single-record `appendJSONLDurable`; used by the op-log stores that commit
-    /// a multi-op transaction under one flock.
+    /// Commit multi-op transactions with one write and full flush under the caller's flock.
     public static func appendJSONLDurable(_ records: [JSONValue], to path: URL) async throws {
         try appendRecords(records, to: path, durable: true)
     }
@@ -179,12 +169,7 @@ public enum SwiftNativePersistenceCore {
         return payload
     }
 
-    /// Append a pre-serialized JSON line (no re-encode) with 0o666 create-mode
-    /// (umask-derived 0644) and no chmod on an existing file.
-    /// The caller supplies the current serialized receipt. A trailing newline
-    /// is appended (one row per line). The
-    /// caller is responsible for holding `withFileLock` around this when the
-    /// file has multiple writers.
+    /// Append caller-serialized receipts without chmod on existing files; multiple writers must hold the shared file lock.
     public static func appendAuditLineRaw(_ jsonLine: String, to path: URL) async throws {
         let dir = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -195,12 +180,14 @@ public enum SwiftNativePersistenceCore {
     public static func readJSONL(_ path: URL) async throws -> [JSONValue] {
         let read = try await readJSONLReporting(path)
         guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else {
-            throw PersistenceCoreError.ioFailure("JSONL evidence is incomplete at \(path.path): \(read.report.malformedLineCount) malformed row(s), trailingPartial=\(read.report.trailingPartialLine). Repair the feed or use the reporting reader to retain its integrity receipt.")
+            throw PersistenceCoreError.ioFailure("""
+                JSONL evidence is incomplete at \(path.path): \(read.report.malformedLineCount) malformed row(s), \
+                trailingPartial=\(read.report.trailingPartialLine). Repair the feed or use the reporting reader to retain its integrity receipt.
+                """)
         }
         return read.rows
     }
 
-    /// Read rows with the shared physical framing and integrity report.
     public static func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
         let data: Data
         do { data = try Data(contentsOf: path) }
@@ -208,9 +195,7 @@ public enum SwiftNativePersistenceCore {
         return Self.decodeJSONL(data) { value, _ in value }
     }
 
-    /// Shared physical framing for file reads and already-read JSONL bytes.
-    /// Invalid UTF-8 is malformed; only a final unterminated JSON parse failure is tolerated.
-    /// The row decoder receives the line byte count plus a newline allowance; nil marks a malformed row.
+    /// Invalid UTF-8 is malformed; only the final unterminated parse failure is tolerated in shared physical framing.
     public static func decodeJSONL<Row>(
         _ data: Data, row: (JSONValue, Int) -> Row?
     ) -> (rows: [Row], report: JSONLReadReport) {
@@ -249,9 +234,7 @@ public enum SwiftNativePersistenceCore {
         try appendRecords([record], to: path, durable: true)
     }
 
-    /// Bounded JSONL read result. Consumers which need to distinguish an empty
-    /// trace from a malformed one can surface this receipt without changing the
-    /// canonical tailing semantics used by the rest of the persistence layer.
+    /// Preserve integrity evidence so bounded readers can distinguish empty from malformed input.
     public struct JSONLTailReadReceipt: Sendable {
         public let rows: [JSONValue]
         public let physicalRowsScanned: Int
@@ -277,14 +260,15 @@ public enum SwiftNativePersistenceCore {
     public static func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] {
         let receipt = try await tailJSONLReadReceipt(path, limit: limit, maxBytes: maxBytes)
         guard receipt.malformedJSONRowCount == 0 else {
-            throw PersistenceCoreError.ioFailure("JSONL tail evidence is incomplete at \(path.path): \(receipt.malformedJSONRowCount) malformed row(s). Repair the feed or use the receipt reader to disclose the source gap.")
+            throw PersistenceCoreError.ioFailure("""
+                JSONL tail evidence is incomplete at \(path.path): \(receipt.malformedJSONRowCount) malformed row(s). Repair the feed or use the \
+                receipt reader to disclose the source gap.
+                """)
         }
         return receipt.rows
     }
 
-    /// Same bounded physical-line tail as `tailJSONL`, with enough receipt data
-    /// for read-only evaluations to disclose skipped malformed input. The rows
-    /// remain exactly the valid JSON values `tailJSONL` has always returned.
+    /// Keep the bounded tail's valid rows while disclosing skipped malformed input to read-only consumers.
     public static func tailJSONLReadReceipt(
         _ path: URL,
         limit: Int,
@@ -345,8 +329,7 @@ public enum SwiftNativePersistenceCore {
         var chunks: [Data] = []
         var newlineCount = 0
         var endsWithNewline = false
-        // Read backward until the requested physical lines are complete. A nil
-        // byte ceiling permits a long row, not a whole-file read for every tail.
+        // Read backward until the requested physical lines are complete. A nil byte ceiling permits a long row, not a whole-file read for every tail.
         while offset > lowerBound {
             try Task.checkCancellation()
             let count = min(64 * 1024, offset - lowerBound)
@@ -367,18 +350,14 @@ public enum SwiftNativePersistenceCore {
                 offset > 0 && !parts.isEmpty && parts.count <= limit)
     }
 
-    /// Synchronous append of caller-serialized, newline-terminated lines, for a
-    /// writer that must keep its bytes exact or cannot await. The same
-    /// chokepoint as `appendJSONL` (torn-line repair, O_APPEND, 0600 create);
-    /// the caller holds the feed's lock when it has more than one writer.
+    /// Synchronous writers preserve exact serialized bytes through shared torn-line repair; multiple writers require the feed lock.
     public static func appendLines(_ data: Data, to path: URL) throws {
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         try appendBytes(data, to: path)
     }
 
-    /// `appendBytes` for stores outside this module that own their
-    /// serialization and hold the feed's lock (chat session retention, Studio).
+    /// External stores own serialization and must hold the feed lock.
     public static func appendOwnedBytes(_ data: Data, to path: URL, durable: Bool = false) throws {
         try appendBytes(data, to: path, durable: durable)
     }
@@ -410,7 +389,10 @@ public enum SwiftNativePersistenceCore {
                 var lastByte: UInt8 = 0
                 let count = pread(probeFD, &lastByte, 1, info.st_size - 1)
                 guard count == 1 else {
-                    throw PersistenceCoreError.ioFailure("Cannot read append framing at \(path.path): \(count < 0 ? String(cString: strerror(errno)) : "source changed during inspection")")
+                    throw PersistenceCoreError.ioFailure("""
+                        Cannot read append framing at \(path.path): \
+                        \(count < 0 ? String(cString: strerror(errno)) : "source changed during inspection")
+                        """)
                 }
                 if lastByte != 0x0A {
                     payload = Data([0x0A]) + data
@@ -442,8 +424,7 @@ public enum SwiftNativePersistenceCore {
         handedOff = true
         try flushAndClose(fd: fd, path: path, durable: durable)
         if durable {
-            // Also persist the entry if this append created the file, including
-            // a retry after an earlier append failed to sync the directory.
+            // Persist a newly created entry, including retries after directory-sync failure.
             try syncDirectory(path.deletingLastPathComponent())
         }
     }
@@ -472,9 +453,7 @@ public enum SwiftNativePersistenceCore {
         }
     }
 
-    /// Durable regular files require a drive-cache flush. Directories persist
-    /// namespace changes with fsync, selected by kind before any operation.
-    /// Unsupported guarantees fail; no weaker mechanism runs after failure.
+    /// Files need drive-cache flush and directories need namespace fsync; unsupported guarantees fail without a weaker mechanism.
     private static func syncDescriptor(fd: Int32, path: URL, driveCache: Bool) throws {
         var code: Int32 = 0
         for _ in 0..<8 {
@@ -489,8 +468,7 @@ public enum SwiftNativePersistenceCore {
         )
     }
 
-    /// Replace relative to a borrowed parent descriptor, or open the pathname's parent.
-    /// The private 0600 temp uses a drive-cache flush when fullFlush is true;
+    /// Replace relative to a borrowed parent descriptor, or open the pathname's parent. The private 0600 temp uses a drive-cache flush when fullFlush is true;
     /// its parent always uses a checked namespace fsync.
     package static func atomicWrite(_ data: Data, to path: URL, parentFD: Int32? = nil, fullFlush: Bool = false) throws {
         let dir = path.deletingLastPathComponent()

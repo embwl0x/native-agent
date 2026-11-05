@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MacAppleScriptBridge+MailAppleEvents.swift` | `MacAppleScriptBridge`: one exact-id Apple Event mutation lookup, checked account scope and encoded mailbox metadata; bodies read only through the paired local-byte owner |
+// Blueprint: | `MacAppleScriptBridge+MailAppleEvents.swift` | `MacAppleScriptBridge`: checked mailbox identity and metadata |
 
 extension MacAppleScriptBridge {
     static func mailLookupCommand(_ command: String, deadline: String? = nil) -> String {
@@ -101,8 +101,7 @@ extension MacAppleScriptBridge {
         """
     }
 
-    /// Inverse of the script's fixed escaping alphabet. Reject malformed escapes;
-    /// decode once so literal percent sequences never become structural delimiters.
+    /// Inverse of the script's fixed escaping alphabet. Reject malformed escapes; decode once so literal percent sequences never become structural delimiters.
     static func decodeConversationTransport(_ value: String) -> String? {
         let allowed: Set<String> = ["25", "7C", "3A", "2C", "0A", "0D"]
         var cursor = value.startIndex

@@ -5,13 +5,9 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
-// Blueprint: | `CognitionObservatoryView+LoopHarness.swift` | Observatory loop/workspace/association panels: same-snapshot endpoint resolution and honest unavailable receipt/graph presentation |
+// Blueprint: | `CognitionObservatoryView+LoopHarness.swift` | Same-snapshot association graph and explicit receipt availability |
 
-/// The Association Graph is only meaningful when at least one of its edge
-/// endpoints can be resolved from the same cognitive snapshot. A single
-/// evicted node is ordinary decay and stays visible on its row; every endpoint
-/// missing at once is a broken/partial snapshot, not a graph of forgotten
-/// memories.
+/// Resolve graph endpoints against the same snapshot; one missing node is decay, but all missing endpoints mean a partial or broken read.
 enum CognitiveAssociationGraphPresentation {
     static let visibleEdgeLimit = 8
 
@@ -181,9 +177,7 @@ extension CognitionObservatoryView {
     private func payloadSummary(_ value: JSONValue) -> String {
         switch value {
         case .object(let object):
-            // Preferred keys lead for scanability, but every key renders with its
-            // value — a keys-only fallback made prune / consolidation receipts read
-            // as broken ("deletedNodes, maxNodes" with the counts silently dropped).
+            // Render every value beside its key so compact receipts retain their evidence.
             let preferredKeys = [
                 "reason", "status", "workspaceCount", "inhibitedCount", "nodeCount",
                 "reinforced", "calmed", "surface", "model", "provider", "resource",
@@ -215,8 +209,7 @@ extension CognitionObservatoryView {
         case .double(let value):
             return String(format: "%.2f", value)
         case .string(let value):
-            // Long error/reason strings would reintroduce the wall-of-text the
-            // collapse work just removed — cap the scalar, full value in the db.
+            // Bound long scalar display while retaining the full value in storage.
             return value.count > 120 ? String(value.prefix(120)) + "…" : value
         case .array(let values):
             return "\(values.count) items"
@@ -226,8 +219,7 @@ extension CognitionObservatoryView {
     }
 }
 
-/// Presentation policy for the mounted Loop Activity panel.  An empty array
-/// is a real, observable quiet loop only when its receipt read succeeded.
+/// An empty activity array proves quiet only after its receipt read succeeds.
 enum CognitionLoopActivityPresentation {
     enum State: Equatable, Sendable {
         case receipts([CognitiveReceiptRecord])

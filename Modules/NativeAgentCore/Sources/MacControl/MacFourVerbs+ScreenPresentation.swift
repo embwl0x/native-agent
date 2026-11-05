@@ -5,9 +5,7 @@ import Senses
 // Blueprint: | `MacFourVerbs+ScreenPresentation.swift` | `MacFourVerbs`: supplemental AX native-page merge, `zoom`, `parseVerb`, `isRightClick` |
 
 extension MacFourVerbs {
-    /// Merge every acquired pathless AX surface (notably open menus) into the
-    /// native representation, ahead of the document; the window compiler owns
-    /// every window-relative row. Pixel evidence stays with its own renderer.
+    /// Pathless menus retain separate action roots; merge them ahead of the document without duplicating window-relative rows or pixel rendering.
     static func addingNativeAX(_ supplement: MacFourVerbsSupplement, to page: inout NativePage,
                                blocks: inout [[String: JSONValue]], targets: [ActTarget], frameID: String) throws {
         let bundle = if case .app(let bundle) = page.corner { bundle } else { "*" }
@@ -24,15 +22,12 @@ extension MacFourVerbs {
         var represented = Set(page.things.map(\.address))
         var usedControls: Set<Int> = []
         for candidate in supplement.targets where !candidate.provenance.isVision {
-            // The complete window compiler owns window-relative AX rows,
-            // including deliberately folded wrappers/decorations. A second
-            // mark list cannot reintroduce their discarded action handles.
-            // Pathless menus/popovers remain independent supplemental surfaces.
+            // The window compiler owns window-relative rows and folded handles. Supplemental lists must not reintroduce them; pathless menus remain
+            // independent.
             if candidate.sourceAXPath != nil { continue }
             guard candidate.role != nil,
                   let index = supplementalDuplicateIndex(candidate, among: targets) else {
-                // Still on screen: readable content, offered without verbs
-                // because it cannot be bound to exactly one acting target.
+                // Still on screen: readable content, offered without verbs because it cannot be bound to exactly one acting target.
                 if let label = candidate.label?.display ?? (candidate.label?.withheld == true ? "⟨redacted⟩" : nil) {
                     add(label)
                 }
@@ -45,9 +40,7 @@ extension MacFourVerbs {
                 address = try JSONValue.object(["app": .string(bundle), "frame_id": .string(frameID),
                     "handle": .string(target.handle)]).serialize(pretty: false)
             } else if let selector {
-                // Native popup items have no window handle or view mark.
-                // Their existing action mechanism resolves a current target;
-                // never invent a window-relative AX path for them.
+                // Popup items have no window handle or mark; resolve through their native owner without inventing a window-relative path.
                 var selection: [String: JSONValue] = ["app": .string(bundle), "__sense_screen_frame": .string(frameID),
                     "target": .string(selector)]
                 if let label = target.label { selection["label"] = .string(label) }
@@ -64,8 +57,7 @@ extension MacFourVerbs {
             let control = controlIndex.map { supplement.controls[$0] }
             if let controlIndex { usedControls.insert(controlIndex) }
             guard represented.insert(address).inserted else {
-                // A popup can also appear inside the window tree. Move its
-                // existing representation to the front, retaining its handle.
+                // Move overlapping popup content ahead of the document while retaining its original handle so duplication cannot mint a new address.
                 if let existing = blocks.firstIndex(where: {
                     Self.string($0["text"])?.contains("[" + SenseScreenThings.printed(address) + "]") == true
                 }) {
@@ -108,12 +100,9 @@ extension MacFourVerbs {
         }
     }
 
-    /// Publish capabilities of the exact route retained by fusion. A region
-    /// cannot be pressed, even when its AX mark advertises AXPress. Mark-only
-    /// dispatch supports AXPress and AXValue; handle dispatch also supports
-    /// focus and typing into a focusable editor. Selection invokes AXPress,
-    /// so a writable selection attribute alone cannot authorize that verb.
-    /// Physical scrolling needs a safe frame.
+    /// Publish capabilities of the exact route retained by fusion. A region cannot be pressed, even when its AX mark advertises AXPress. Mark-only dispatch
+    /// supports AXPress and AXValue; handle dispatch also supports focus and typing into a focusable editor. Selection invokes AXPress, so a writable selection
+    /// attribute alone cannot authorize that verb. Physical scrolling needs a safe frame.
     static func nativeAXVerbs(_ target: ActTarget) -> [String] {
         let scrollable = target.frame != nil && (target.regionOnly || Self.physicalScrollKinds.contains(target.kind))
             || (!target.isSupplemental && target.actions.contains("AXScrollToVisible"))
@@ -132,8 +121,7 @@ extension MacFourVerbs {
         return Self.offeredVerbs(verbs)
     }
 
-    /// Scope the native page from capture-local AX paths, retaining the
-    /// independent pixel renderer without constructing another AX screen.
+    /// Scope the native page from capture-local AX paths, retaining the independent pixel renderer without constructing another AX screen.
     static func zoom(
         _ percept: MacLookPercept, supplement: MacFourVerbsSupplement?,
         mergedAXPaths: Set<[Int]>, focusedControl: (label: String, kind: String)?, part: String?
@@ -225,10 +213,10 @@ extension MacFourVerbs {
 
     static func parseVerb(_ raw: String) -> (String, ScrollDirection) {
         let words = normalize(raw).split(separator: " ").map(String.init)
-        // The words an agent naturally reaches for name the same verbs.
-        let synonyms = ["set": "type", "fill": "type", "enter": "type", "choose": "select", "pick": "select", "tap": "click", "menu": "click", "chord": "key", "shortcut": "key", "keys": "key"]
-        // A person right-clicks and double-clicks: "right_click" is a click
-        // with the right button (see isRightClick), "double click" its own hand.
+        // Normalize natural verb synonyms at one owner so aliases share action admission.
+        let synonyms = ["set": "type", "fill": "type", "enter": "type", "choose": "select", "pick": "select", "tap": "click", "menu": "click", "chord": "key",
+            "shortcut": "key", "keys": "key"]
+        // Keep right-click as a click with a button choice; double-click needs its own balanced physical gesture.
         let joined = words.joined(separator: "_").replacingOccurrences(of: "-", with: "_")
         let head = isRightClick(raw) ? "click"
             : ["double_click", "doubleclick", "dbl_click"].contains(joined) ? "double_click"
@@ -268,7 +256,9 @@ extension MacFourVerbs {
 
     static func obstructedPointReply(screen: String) -> MacFourVerbsReply {
         MacFourVerbsReply(ok: false,
-            text: "That point is covered by a foreground window; I haven't sent input. Name a clear part of the surface or move the obstruction first.\n" + screen,
+            text: """
+                That point is covered by a foreground window; I haven't sent input. Name a clear part of the surface or move the obstruction first.\n
+                """ + screen,
             detail: ["error": .string("target_point_obstructed")])
     }
 
@@ -391,15 +381,16 @@ extension MacFourVerbs {
     static func operationDetail(_ result: MacControlResult, app: String? = nil) -> [String: JSONValue] {
         var detail: [String: JSONValue] = [:]
         if case .object(let output) = result.output {
-            // Emission counts ride every receipt: whether input went out is
-            // what tells a refusal from an act that was not observed.
-            for key in ["reason", "detail", "effects", "note", "guidance", "message", "remedy", "blocked_by", "block_reason", "matched_name", "bundle_identifier", "process_identifier",
+            // Emission counts ride every receipt: whether input went out is what tells a refusal from an act that was not observed.
+            for key in ["reason", "detail", "effects", "note", "guidance", "message", "remedy", "blocked_by", "block_reason", "matched_name",
+                "bundle_identifier", "process_identifier",
                         "requested_events_emitted", "recovery_events_emitted", "effects_may_have_occurred",
                         "ax_outcome", "ax_emission_attempted", "ax_cause", "ax_native_code", "ax_outcomes", "ax_readback"] { detail[key] = output[key] }
         }
         if let error = result.error { detail["error"] = .string(error) }
         if result.error?.hasPrefix("human_takeover:") == true, case .object(let receipt) = result.output {
-            for key in ["status", "posted_events", "characters_sent", "text_character_count", "requested_events_emitted", "recovery_events_emitted", "gesture", "element", "app", "window", "frame_id", "handle", "method", "ax_delivered", "effect"] {
+            for key in ["status", "posted_events", "characters_sent", "text_character_count", "requested_events_emitted", "recovery_events_emitted", "gesture",
+                "element", "app", "window", "frame_id", "handle", "method", "ax_delivered", "effect"] {
                 detail[key] = receipt[key]
             }
         }

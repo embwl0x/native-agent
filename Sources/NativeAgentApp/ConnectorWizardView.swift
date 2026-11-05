@@ -9,16 +9,14 @@ import ChatToolRuntime
 import SlackBot
 import NativeAgentCore
 
-// Blueprint: | `ConnectorWizardView.swift` | `ConnectorWizardView` and state: existing connector setup routes, cancellable sign-in/save steps; successful Slack save reconciles the worker and connector projection through `settle` before canceled view updates stop; truthful external-browser handoff outcomes |
+// Blueprint: | `ConnectorWizardView.swift` | `ConnectorWizardView`: cancellable setup; `settle` reconciles saved Slack state despite cancellation |
 
 // MARK: - Models
 
 typealias ConnectorWizardSetupRoute = Connectors.ConnectorWizardSetupRoute
 
 
-/// The Slack setup page is an external browser handoff, not a completed
-/// connector setup. Keep the request outcome visible so a missing browser
-/// handler cannot look like a successful navigation.
+/// Keep browser handoff outcomes visible: opening Slack setup does not prove a connector was saved.
 enum SlackSettingsPortal {
     enum OpenOutcome: Equatable {
         case requested
@@ -47,14 +45,11 @@ enum SlackSettingsPortal {
 @MainActor
 final class ConnectorWizardState {
     var step: WizardStep = .loading
-    /// The one error line: what happened and what to do. Never a service's
-    /// own text, which goes to the log only.
+    /// Service error text stays in the log; the visible error names the cause and remedy.
     var errorMessage: String?
-    // Tracks the running sign-in or save so a sheet dismissed mid-flow, or a
-    // step left with Back, cannot mutate the wizard afterward.
+    // Cancel work on Back or dismissal so a departed step cannot mutate the wizard.
     var flowTask: Task<Void, Never>?
 
-    /// One page each. Which pages a connector walks is `ConnectorWizardView.trail`.
     enum WizardStep {
         case loading
         case slackTokens
@@ -66,18 +61,14 @@ final class ConnectorWizardState {
 
 // MARK: - ConnectorWizardView
 
-/// Connecting an account, one page at a time: a title and where you are, one
-/// page of cards, and Back / Cancel / the next step along the bottom. A
-/// resizable sheet in the shell's card style (the alive kit), not a stack of
-/// panels in a fixed box.
 struct ConnectorWizardView: View {
     let provider: String
     let onDismiss: () -> Void
 
     @Environment(AppModel.self) private var appModel
     @State private var state = ConnectorWizardState()
-    // Tokens and OAuth secrets deliberately stay view-local and die with the wizard.
-    // The saved policy, or why it could not be read; saving waits until it reads.
+    // Keep tokens and OAuth secrets view-local so they die with the wizard.
+    // Saving requires a successful policy read; an unreadable policy is not an empty one.
     private var slackPolicyRead: Result<SlackIngressPolicy, Error>? { appModel.engine.connectors.slackPolicy }
     private var slackPolicy: SlackIngressPolicy? { try? slackPolicyRead?.get() }
     @State private var slackToken: String = ""
@@ -86,7 +77,9 @@ struct ConnectorWizardView: View {
     @State private var isSaving = false
 
     private var slackAllowedChannels: String {
-        get { appModel.editDraft("connector:\(connectorID):slackAllowedChannels", seed: (slackPolicy?.allowedChannelIds.sorted() ?? []).joined(separator: ", ")) }
+        get { appModel.editDraft(
+            "connector:\(connectorID):slackAllowedChannels",
+            seed: (slackPolicy?.allowedChannelIds.sorted() ?? []).joined(separator: ", ")) }
         nonmutating set { appModel.setEditDraft(newValue, for: "connector:\(connectorID):slackAllowedChannels") }
     }
     private var slackAllowedUsers: String {
@@ -132,8 +125,6 @@ struct ConnectorWizardView: View {
             Divider()
             footer
         }
-        // Resizable: the sheet opens at the ideal size and the person can
-        // drag it larger.
         .frame(minWidth: 480, idealWidth: 560, minHeight: 440, idealHeight: 600)
         .animation(NativeAgentMotion.standard, value: state.step)
         .animation(NativeAgentMotion.standard, value: state.errorMessage)
@@ -161,7 +152,6 @@ struct ConnectorWizardView: View {
         .padding(.vertical, NativeAgentSpacing.lg)
     }
 
-    /// The pages this connector walks, in order, for "Step 2 of 4".
     private var trail: [ConnectorWizardState.WizardStep] {
         switch route {
         case .manualToken:
@@ -259,7 +249,6 @@ struct ConnectorWizardView: View {
 
     // MARK: - Pieces
 
-    /// An eyebrow over one card: the alive kit's card, on the sheet.
     private func card<Content: View>(_ title: String? = nil, @ViewBuilder _ content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
             if let title { AliveEyebrow(title) }
@@ -306,7 +295,10 @@ struct ConnectorWizardView: View {
             card("Bot token") {
                 SecureField("xoxb-…", text: $slackToken)
                     .textFieldStyle(.roundedBorder)
-                note("From your Slack app's OAuth & Permissions page. Leave it empty if it's already saved. It stays on this Mac, and I check it with Slack before saving.")
+                note("""
+                    From your Slack app's OAuth & Permissions page. Leave it empty if it's already saved. It stays on this Mac, and I check it with Slack \
+                    before saving.
+                    """)
             }
             card("App token, to chat with me in Slack") {
                 SecureField("xapp-…", text: $slackAppToken)
@@ -342,11 +334,23 @@ struct ConnectorWizardView: View {
 
     private var slackAccessView: some View {
         card("Who can message me") {
-            TextField("Channel IDs, like C0123", text: appModel.editBinding("connector:\(connectorID):slackAllowedChannels", seed: (slackPolicy?.allowedChannelIds.sorted() ?? []).joined(separator: ", ")))
+            TextField(
+                "Channel IDs, like C0123",
+                text: appModel.editBinding(
+                    "connector:\(connectorID):slackAllowedChannels",
+                    seed: (slackPolicy?.allowedChannelIds.sorted() ?? []).joined(separator: ", ")))
                 .textFieldStyle(.roundedBorder)
-            TextField("User IDs, like U0123", text: appModel.editBinding("connector:\(connectorID):slackAllowedUsers", seed: (slackPolicy?.allowedUserIds.sorted() ?? []).joined(separator: ", ")))
+            TextField(
+                "User IDs, like U0123",
+                text: appModel.editBinding(
+                    "connector:\(connectorID):slackAllowedUsers",
+                    seed: (slackPolicy?.allowedUserIds.sorted() ?? []).joined(separator: ", ")))
                 .textFieldStyle(.roundedBorder)
-            Toggle("In channels and groups, only answer when @mentioned", isOn: appModel.editBinding("connector:\(connectorID):slackRequireMention", seed: slackPolicy?.requireMention ?? true))
+            Toggle(
+                "In channels and groups, only answer when @mentioned",
+                isOn: appModel.editBinding(
+                    "connector:\(connectorID):slackRequireMention",
+                    seed: slackPolicy?.requireMention ?? true))
             note("Add at least one channel or user. With both empty, I stay out of Slack chats. Direct messages never need an @mention.")
         }
     }
@@ -369,7 +373,6 @@ struct ConnectorWizardView: View {
 
     // MARK: - Logic
 
-    /// Moving between pages stops whatever the last page started.
     private func go(_ step: ConnectorWizardState.WizardStep) {
         state.flowTask?.cancel()
         state.flowTask = nil

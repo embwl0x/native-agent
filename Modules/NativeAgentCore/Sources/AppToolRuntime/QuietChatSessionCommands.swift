@@ -9,7 +9,7 @@ import NativeAgentShared
 import PersistenceCore
 import Transcripts
 
-// Blueprint: | `QuietChatSessionCommands.swift` | `QuietChatSessionCommands`: effect-free session fences, session operations and queued-turn receipts through canonical turn owners |
+// Blueprint: | `QuietChatSessionCommands.swift` | `QuietChatSessionCommands`; Effect-free fences and canonical session receipts |
 
 @MainActor
 public protocol QuietChatTranscriptPort: MacChatSessionStore {
@@ -38,36 +38,33 @@ public protocol QuietChatSessionCommandPort: MacChatTurnPresentationPort {
     func unpinQuietChatSession(_ sessionId: String) -> Bool?
     func clearQuietChatMessages(sessionId: String) async -> (succeeded: Bool, agentMessage: String)
     func archiveQuietChat(sessionId: String) async -> (succeeded: Bool, agentMessage: String)
-    func compactQuietChat(sessionId: String, model: String?, providerID: String?, force: Bool) async throws -> ChatSessionCompactionOutcome
     func exportQuietChat(session: NativeAgentShared.ChatSession?, sessionId: String, messages: [Transcript.Message]) async throws -> ChatExportResult
     func publishChatSnapshot()
     func quietChatIsDetached(_ sessionId: String) -> Bool
     func openQuietChatWindow(sessionId: String)
     func closeQuietChatWindow(sessionId: String)
     func isQuietSyntheticNotice(_ message: Transcript.Message) -> Bool
-    func regenerateAssistantMessage(_ message: Transcript.Message) async
+    func regenerateAssistantMessage(_ message: Transcript.Message, parent: Turn) async
 }
 
-/// Session intake and receipts share the turn runtime, without selecting a
-/// conversation or retaining a second lifecycle. The calling conversation
-/// cannot interrupt or wait on itself.
+/// Session intake shares the canonical turn runtime without selecting conversations; a caller cannot interrupt or wait on itself.
 public enum QuietChatSessionCommands {
 
     /// Agent sends keep their provenance and never move the owner conversation anchor.
-    public static let agentOrigin = ChatMessageOrigin(surface: "app", agent: "self", authored: .agent)
+    public static let agentOrigin = ChatMessageOrigin(surface: "chat", agent: "self", authored: .agent)
 
     @MainActor
     public static func run<Host: QuietChatSessionCommandPort>(
-        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host
+        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host, turn: Turn
     ) async -> JSONValue {
         let session: ChatSessionRef
-        switch fence(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel) {
+        switch fence(verb: verb, input: input, reachesUser: reachesUser, appModel: appModel, turn: turn) {
         case .failure(let refusal): return refusal.json
         case .success(let found?): session = found
         case .success(nil):
             if verb == "new" { return await newChat(title: text(input["title"]), appModel: appModel) }
             if verb == "list" { return await list(input, appModel: appModel) }
-            return stopOthers(calling: text(input["__session_id"]), his: reachesUser, appModel: appModel)
+            return stopOthers(calling: text(input["__session_id"]), reachesUser: reachesUser, appModel: appModel)
         }
         switch verb {
         case "show":
@@ -82,7 +79,8 @@ public enum QuietChatSessionCommands {
             guard !title.isEmpty else { return failure("missing_title", "Pass the new name in title.", session) }
             await appModel.renameChatSession(id: session.id, title: title)
             let now = appModel.chatCommandTranscripts.sessions.first { $0.id == session.id }
-            guard let now, now.title == title else { return failure("rename_failed", "Renaming \(session.id) was not verified. \(appModel.statusForAgent)", session, effects: "unknown") }
+            guard let now, now.title == title else { return failure("rename_failed", "Renaming \(session.id) was not verified. \(appModel.statusForAgent)",
+                session, effects: "unknown") }
             return ok(ChatSessionRef(row: now), changed: session.title != title, "Renamed from \(session.title) to \(title).")
         case "pin":
             let was = appModel.quietPinnedChatSessionIDs.contains(session.id)
@@ -103,7 +101,7 @@ public enum QuietChatSessionCommands {
         case "clear":
             let result = await appModel.clearQuietChatMessages(sessionId: session.id)
             guard result.succeeded else { return failure("clear_failed", result.agentMessage, session, effects: "unknown") }
-            HarnessDecidedRow.post(requester: "Full Mac", tool: "chat.clear \(session.id)",
+            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "chat.clear \(session.id)",
                                    sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             return ok(session, changed: true, "Every message in \(session.title) is gone for good.")
@@ -116,40 +114,9 @@ public enum QuietChatSessionCommands {
                 return ok(session, changed: false, "\(session.title) has no reply running.")
             }
             appModel.stopChatStream(sessionId: session.id)
-            return ok(session, changed: true, "Stopped the reply in \(session.title). Its send-next queue is paused, as Stop leaves it.")
+            return ok(session, changed: true, "Stopped the reply in \(session.title).")
         case "regenerate":
-            return await regenerate(session, appModel: appModel)
-        case "queue":
-            return queue(session, input: input, appModel: appModel)
-        case "compact_now":
-            do {
-                let outcome = try await appModel.compactQuietChat(
-                    sessionId: session.id, model: appModel.chatModel,
-                    providerID: appModel.chatProvider, force: true
-                )
-                if let failure = compactionFailure(outcome) {
-                    return self.failure("compact_failed", failure, session, effects: "unknown")
-                }
-                let runtime = appModel.macChatTurns
-                let generation = runtime.taskGenerations[session.id]
-                let version = appModel.chatCommandTranscripts.structureVersion(for: session.id)
-                let lifecycle = runtime.lifecycle(for: session.id)
-                if !runtime.busySessions.contains(session.id),
-                   !runtime.streamingSessions.contains(session.id), runtime.tasks[session.id] == nil,
-                   let messages = try? await appModel.chatCommandTranscripts.loadMessages(sessionId: session.id, cached: true) {
-                    if !runtime.busySessions.contains(session.id),
-                       !runtime.streamingSessions.contains(session.id), runtime.tasks[session.id] == nil,
-                       runtime.taskGenerations[session.id] == generation,
-                       runtime.lifecycle(for: session.id) == lifecycle,
-                       appModel.chatCommandTranscripts.structureVersion(for: session.id) == version {
-                        appModel.chatCommandTranscripts.setMessages(messages, for: session.id)
-                    }
-                }
-                return ok(session, changed: true, "Older messages in \(session.title) are compacted into a summary.")
-            } catch {
-                if error is ToolFailureError { return ChatToolOutcome.failure(error: error) }
-                return failure("compact_failed", "Compaction failed: \(error.localizedDescription)", session, effects: "unknown")
-            }
+            return await regenerate(session, appModel: appModel, turn: turn)
         case "export":
             do {
                 let messages = try await appModel.chatCommandTranscripts.loadMessages(sessionId: session.id, cached: true)
@@ -172,7 +139,8 @@ public enum QuietChatSessionCommands {
         case "detach":
             appModel.openQuietChatWindow(sessionId: session.id)
             guard appModel.quietChatIsDetached(session.id) else {
-                return failure("detach_failed", "Its window did not open; the conversation list may still be loading. Try again in a moment.", session, effects: "unknown")
+                return failure("detach_failed", "Its window did not open; the conversation list may still be loading. Try again in a moment.", session,
+                    effects: "unknown")
             }
             return ok(session, changed: true, "\(session.title) is open in its own window.")
         case "close_window":
@@ -187,22 +155,14 @@ public enum QuietChatSessionCommands {
     /// Preview and execution use the same effect-free owner/session fences.
     @MainActor
     public static func fence<Host: QuietChatSessionCommandPort>(
-        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host
+        verb: String, input: [String: JSONValue], reachesUser: Bool, appModel: Host, turn: Turn
     ) -> Result<ChatSessionRef?, Refusal> {
         if ["new", "list"].contains(verb) || (verb == "stop" && text(input["session_id"]).lowercased() == "others") {
             return .success(nil)
         }
         let session: ChatSessionRef
-        switch resolve(text(input["session_id"]), appModel: appModel) {
+        switch resolve(text(input["session_id"]), appModel: appModel, turn: turn) {
         case .success(let found): session = found
-        case .failure where verb == "compact_now":
-            let id = text(input["session_id"])
-            guard NativeAgentChatSessionID.normalizedPathComponent(id) == id,
-                  FileManager.default.fileExists(atPath: (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-                    .appendingPathComponent("chat/messages/\(id).jsonl").path) else {
-                return .failure(Refusal(json: AppToolExecutor.failure("missing_transcript", "Pass the exact session_id of the retained recollection.")))
-            }
-            session = ChatSessionRef(row: ChatSessionRow(id: id, title: id, createdAt: ""))
         case .failure(let refusal): return .failure(refusal)
         }
         if !reachesUser, ["show", "detach", "close_window"].contains(verb) {
@@ -213,10 +173,7 @@ public enum QuietChatSessionCommands {
                 session
             )))
         }
-        let queued = text(input["action"]).lowercased()
-        let interruptsReply = verb == "queue" && ["steer", "send_next"].contains(queued)
-            && !text(input["turn_id"]).isEmpty && isRunning(session.id, appModel)
-        if !reachesUser, (["stop", "archive", "regenerate", "clear"].contains(verb) || interruptsReply), userIsIn(session.id, appModel) {
+        if !reachesUser, ["stop", "archive", "regenerate", "clear"].contains(verb), userIsIn(session.id, appModel) {
             return .failure(Refusal(json: failure(
                 "owner_is_in_it",
                 "The person is in \(session.title) (on screen or in its own window), and they did not start this turn. "
@@ -228,13 +185,10 @@ public enum QuietChatSessionCommands {
         if ["stop", "archive", "regenerate", "clear"].contains(verb) {
             return .failure(Refusal(json: ownTurn(verb, session)))
         }
-        if verb == "queue", ["steer", "send_next"].contains(queued), isRunning(session.id, appModel) {
-            return .failure(Refusal(json: ownTurn(queued, session)))
-        }
         return .success(session)
     }
 
-    /// Archived rows are read only when requested; listing changes nothing.
+    /// Archived rows require an explicit read; listing must not unarchive them.
     @MainActor
     private static func list<Host: QuietChatSessionCommandPort>(_ input: [String: JSONValue], appModel: Host) async -> JSONValue {
         let archived = input["archived"]?.scalarText?.lowercased() == "true"
@@ -267,11 +221,14 @@ public enum QuietChatSessionCommands {
             ]) }),
             "offset": .int(Int64(offset)), "total": .int(Int64(rows.count)),
             "next_offset": next < rows.count ? .int(Int64(next)) : .null,
-            "note": .string("Message count is the indexed transcript count, which can shrink after compaction. Message times are conversational message stamps; null means not recorded. created_at is session creation and last_active is index activity, not message time."),
+            "note": .string("""
+                Message count is the indexed transcript count. Message times are conversational message stamps; null means \
+                not recorded. created_at is session creation and last_active is index activity, not message time.
+                """),
         ])
     }
 
-    /// Creating a conversation leaves the selected conversation on screen.
+    /// Creating a conversation must leave the visible selection alone.
     @MainActor
     private static func newChat<Host: QuietChatSessionCommandPort>(title: String, appModel: Host) async -> JSONValue {
         let row: ChatSessionRow
@@ -293,9 +250,9 @@ public enum QuietChatSessionCommands {
     }
 
     @MainActor
-    private static func stopOthers<Host: QuietChatSessionCommandPort>(calling: String, his: Bool, appModel: Host) -> JSONValue {
+    private static func stopOthers<Host: QuietChatSessionCommandPort>(calling: String, reachesUser: Bool, appModel: Host) -> JSONValue {
         let others = appModel.otherRunningChatSessionIDs.filter {
-            $0 != calling && (his || !appModel.quietChatIsDetached($0))
+            $0 != calling && (reachesUser || !appModel.quietChatIsDetached($0))
         }
         for id in others { appModel.stopChatStream(sessionId: id) }
         return .object([
@@ -305,13 +262,13 @@ public enum QuietChatSessionCommands {
             "detail": .string(others.isEmpty
                 ? "No other conversation had a reply running."
                 : "Stopped \(others.count) running repl\(others.count == 1 ? "y" : "ies"), as Stop Others does. "
-                    + (his ? "Yours and the one on screen were left alone."
+                    + (reachesUser ? "Yours and the one on screen were left alone."
                         : "Yours, the one on screen and any in its own window were left alone.")),
         ])
     }
 
     @MainActor
-    private static func regenerate<Host: QuietChatSessionCommandPort>(_ session: ChatSessionRef, appModel: Host) async -> JSONValue {
+    private static func regenerate<Host: QuietChatSessionCommandPort>(_ session: ChatSessionRef, appModel: Host, turn: Turn) async -> JSONValue {
         if isRunning(session.id, appModel) {
             return failure("still_running", "\(session.title) is still replying. Stop it first (verb stop), or wait.", session)
         }
@@ -345,85 +302,14 @@ public enum QuietChatSessionCommands {
                 + "Send the question again with the file attached (chat.send with attachments).", session)
         }
         // Regeneration must not inherit the asking turn's route or envelope.
-        Task.detached { [appModel, last] in await appModel.regenerateAssistantMessage(last) }
+        Task.detached { [appModel, last, turn] in await appModel.regenerateAssistantMessage(last, parent: turn) }
         return ok(session, changed: true, "Regenerating the last reply in \(session.title); the new one replaces it there when done.")
-    }
-
-    @MainActor
-    private static func queue<Host: QuietChatSessionCommandPort>(
-        _ session: ChatSessionRef, input: [String: JSONValue], appModel: Host
-    ) -> JSONValue {
-        let turns = appModel.macChatTurns
-        let action = text(input["action"]).lowercased()
-        let turnId = text(input["turn_id"])
-        let busy = isRunning(session.id, appModel)
-        func listing(_ detail: String, changed: Bool) -> JSONValue {
-            var body: [String: JSONValue] = [
-                "status": .string("ok"), "changed": .bool(changed),
-                "session_id": .string(session.id), "title": .string(session.title),
-                "busy": .bool(busy), "queue_paused": .bool(turns.pausedQueueSessions.contains(session.id)),
-                "queued": .array(queuedRows(session.id, appModel)), "detail": .string(detail),
-            ]
-            if let reason = queuePauseReason(session.id, appModel) { body["queue_paused_reason"] = .string(reason) }
-            return .object(body)
-        }
-        switch action {
-        case "", "list":
-            return listing("The send-next queue of \(session.title).", changed: false)
-        case "steer", "send_next":
-            if turnId.isEmpty {
-                guard action == "send_next" else {
-                    return failure("missing_turn_id", "Pass turn_id; verb queue lists them.", session)
-                }
-                appModel.resumeQueuedChatTurns(sessionId: session.id)
-                return listing("The queue of \(session.title) is running again.", changed: true)
-            }
-            guard (turns.queuedBySession[session.id] ?? []).contains(where: { $0.id == turnId }) else {
-                return failure("unknown_turn", "No queued turn \(turnId) in \(session.title); verb queue lists them.", session)
-            }
-            if busy {
-                appModel.sendQueuedChatTurnNow(turnId, sessionId: session.id)
-                return listing("Stopped the reply in progress; \(turnId) runs next.", changed: true)
-            }
-            appModel.resumeQueuedChatTurns(sessionId: session.id, startingWith: turnId)
-            return listing("\(turnId) is running now.", changed: true)
-        case "remove":
-            guard (turns.queuedBySession[session.id] ?? []).contains(where: { $0.id == turnId }) else {
-                return failure("unknown_turn", "No queued turn \(turnId.isEmpty ? "named" : turnId) in \(session.title); verb queue lists them.", session)
-            }
-            appModel.removeQueuedChatTurn(turnId, sessionId: session.id)
-            return listing("Removed \(turnId) from the queue.", changed: true)
-        default:
-            return failure("unknown_action", "action is list, steer, send_next or remove.", session)
-        }
-    }
-
-    @MainActor
-    public static func queuedRows<Host: QuietChatSessionCommandPort>(_ sessionId: String, _ appModel: Host) -> [JSONValue] {
-        (appModel.macChatTurns.queuedBySession[sessionId] ?? []).filter(\.shouldDisplayInSendNextQueue).map { turn in
-            var row: [String: JSONValue] = [
-                "turn_id": .string(turn.id),
-                "preview": .string(turn.preview),
-                "attachments": .int(Int64(turn.attachments.count)),
-                "from": .string(turn.origin == nil ? "owner" : "you"),
-            ]
-            if let reason = turn.stoppedReason { row["status"] = .string("stopped"); row["reason"] = .string(reason) }
-            return .object(row)
-        }
     }
 
     @MainActor
     public static func isRunning<Host: QuietChatSessionCommandPort>(_ sessionId: String, _ appModel: Host) -> Bool {
         !sessionId.isEmpty && appModel.macChatTurns.lifecycleBySession[sessionId]?.replyTextSettled != true
             && (appModel.macChatTurns.busySessions.contains(sessionId) || appModel.macChatTurns.streamingSessions.contains(sessionId))
-    }
-
-    @MainActor
-    public static func queuePauseReason<Host: QuietChatSessionCommandPort>(_ sessionId: String, _ appModel: Host) -> String? {
-        guard appModel.macChatTurns.pausedQueueSessions.contains(sessionId),
-              let reason = appModel.macChatTurns.queuePauseReasons[sessionId]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !reason.isEmpty else { return nil }
-        return reason
     }
 
     public struct ChatSessionRef {
@@ -437,12 +323,11 @@ public enum QuietChatSessionCommands {
         public let json: JSONValue
     }
 
-    /// An id, an exact title, or nothing: "this chat" is the conversation the
-    /// request came from (bridge, phone, Telegram), else the one on screen.
+    /// This chat resolves to the originating bridge/phone/Telegram conversation; only an absent origin uses the visible conversation.
     @MainActor
-    public static func resolve<Host: QuietChatSessionCommandPort>(_ raw: String, appModel: Host) -> Result<ChatSessionRef, Refusal> {
+    public static func resolve<Host: QuietChatSessionCommandPort>(_ raw: String, appModel: Host, turn: Turn?) -> Result<ChatSessionRef, Refusal> {
         let sessions = appModel.chatCommandTranscripts.sessions
-        let asking = ChatToolSessionContext.verifiedSessionId.flatMap { id in sessions.contains { $0.id == id } ? id : nil }
+        let asking = turn?.verifiedSessionID.flatMap { id in sessions.contains { $0.id == id } ? id : nil }
         let wanted = raw.isEmpty ? (asking ?? appModel.activeChatSessionId) : raw
         guard !wanted.isEmpty else {
             return .failure(Refusal(json: AppToolExecutor.failure(
@@ -461,14 +346,6 @@ public enum QuietChatSessionCommands {
                 : "\(titled.count) conversations share that title; pass the session_id instead (chat.list lists them).",
             extra: ["requested": .string(raw)]
         )))
-    }
-
-    private static func compactionFailure(_ result: ChatSessionCompactionOutcome) -> String? {
-        guard !result.compacted, result.summaryRowId == nil else { return nil }
-        let detail = result.reason.trimmingCharacters(in: .whitespacesAndNewlines)
-        return detail.isEmpty
-            ? "Context compaction did not run. Try again after the next context refresh."
-            : "Context compaction did not run: \(detail)"
     }
 
     private static func ok(_ session: ChatSessionRef, changed: Bool, _ detail: String) -> JSONValue {

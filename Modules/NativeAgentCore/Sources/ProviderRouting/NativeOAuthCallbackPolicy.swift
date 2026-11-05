@@ -1,11 +1,8 @@
 import Foundation
-// Blueprint: | `NativeOAuthCallbackPolicy.swift` | Shared callback validation with exactly one state and caller-specific messages; handleCallbackURL, validateCallback, parseCallback |
+// Blueprint: | `NativeOAuthCallbackPolicy.swift` | exact callback state |
 
 extension NativeOAuthFlow {
-    /// Fallback path: forwarded from the SwiftUI `onOpenURL` handler when the
-    /// OS hands the app a `nativeagent://oauth/...` URL directly (e.g. the
-    /// browser opened the URL after the ASWebAuth sheet was dismissed).
-    /// Resolves any pending callback continuation for this state.
+    /// Direct custom-scheme URLs must resolve the same pending state as the authentication session callback.
     public static func handleCallbackURL(_ url: URL) -> Bool {
         guard url.scheme == callbackURLScheme, url.host == "oauth" else {
             return false

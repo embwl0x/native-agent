@@ -6,17 +6,15 @@ import NativeAgentShared
 import os
 import PersistenceCore
 import Transcripts
-// Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`: `sendEvidence`, `sendStatus`, `sendFailed` and `sendReceipt` project one send outcome from its receipt, with failed dispatch above stale executor progress; `AgentConversationExchange.messageID` binds the protocol's string to its operation UUID; reply expectation defaults true; `nextReadAt` schedules reads/delivery, not reply lifetime. Associated-door history projects through Transcripts' `ContactThread.project`; resumable work retains DataRootLife; other-life work reads stopped/restored. Selected history read and UTF-8 failures propagate as unavailable. |
+// Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`, `sendEvidence`, `sendStatus`, `sendFailed`, `sendReceipt`, `AgentConversationExchange.messageID`, `nextReadAt`, `ContactThread.project` |
+// nextReadAt bounds eligible read/delivery scheduling, never reply lifetime.
+// Resumable work retains DataRootLife; other-life work reads stopped/restored, and selected history failures stay unavailable.
 
-/// App-owned routing bookmarks, not another transcript or authority store.
-/// The last receipt is a bounded cache; the adapter remains the evidence owner.
+/// App-owned routing bookmarks, not another transcript or authority store. The last receipt is a bounded cache; the adapter remains the evidence owner.
 public struct AgentConversationRecord: Codable, Sendable {
-    /// A retained answer, unwrapping only a single job and preserving reply-key precedence.
     public var retainedReply: (text: String, resultID: UUID?)? {
-        guard case .object(let root)? = receipt else { return nil }
-        var value = root
-        if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
-        for key in ["reply", "answer", "agent_reply_text", "agent_reply_text_head", "completion_text_head"] {
+        guard case .object(let value)? = receipt else { return nil }
+        for key in ["reply", "answer"] {
             if case .string(let text)? = value[key], !text.isEmpty {
                 let id: UUID? = if case .string(let id)? = value["entry_id"] ?? value["message_id"] { UUID(uuidString: id) } else { nil }
                 return (text, id)
@@ -25,14 +23,11 @@ public struct AgentConversationRecord: Codable, Sendable {
         return nil
     }
 
-    /// The send's receipt owns its outcome. A failed dispatch outranks stale
-    /// executor progress carried beside it, including on older saved records.
+    /// The receipt owns send outcome; failed dispatch outranks cached executor progress.
     public var sendEvidence: [String: JSONValue] { Self.sendEvidence(receipt) }
 
     public static func sendEvidence(_ receipt: JSONValue?) -> [String: JSONValue] {
         guard case .object(let root)? = receipt else { return [:] }
-        if Self.failedSend(root) { return root }
-        if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { return job }
         return root
     }
 
@@ -55,14 +50,14 @@ public struct AgentConversationRecord: Codable, Sendable {
             || status == "observation_unavailable" { return false }
         // An approval or a held message has not failed dispatch.
         if ["held", "delivering"].contains(status) || approvalWaits(status) { return false }
-        return fields["sent"] == .bool(false) || [.failed, .refused].contains(ChatToolOutcome.exactResultClass(.object(fields.filter { $0.key != "result" })))
+        let reply = ToolResult(.object(fields.filter { $0.key != "result" }))
+        return fields["sent"] == .bool(false) || [.failed, .refused].contains(reply.outcome)
             || fields["execution_error"]?.stringValue?.isEmpty == false
             || status == "invalid_arguments"
             || ["failed", "error"].contains(fields["run_status"]?.stringValue ?? "")
     }
 
-    /// Receipt detail uses the same state word as home and history, while
-    /// retaining the adapter's failure cause and other evidence.
+    /// Receipt detail uses the same state word as home and history, while retaining the adapter's failure cause and other evidence.
     public var sendReceipt: JSONValue? {
         guard phase != "sending", sendFailed, case .object(var fields)? = receipt else { return receipt }
         fields["status"] = .string("failed")
@@ -95,37 +90,27 @@ public struct AgentConversationRecord: Codable, Sendable {
     public var replyRoute: [String: String]?
     public var selected: Bool = false
     public var exchanges: [AgentConversationExchange]?
-    /// Sends the bounded ledger let go whose last state is not yet on their
-    /// own transcript row: the evidence stays here until it is (`Entry.state`).
+    /// Retain unsettled transcript states until the send's own row carries the evidence (`Entry.state`).
     public var releasing: [AgentConversationExchange]?
-    /// The current send was typed by the person in the contact's thread, so
-    /// its answer settles here and never starts an agent turn.
+    /// The current send was typed by the person in the contact's thread, so its answer settles here and never starts an agent turn.
     public var personInitiated: Bool?
-    /// Fixed at send time: explicit sender choice, otherwise true; saved records may omit it.
+    /// Fix reply expectation at send time; an omitted sender choice means true.
     public var expectsReply: Bool?
-    /// Follow-ups written while a reply was still in flight, oldest first.
-    /// Each goes by itself, in order, once the reply ahead of it settles.
+    /// Follow-ups wait in order for the preceding reply to settle.
     public var queued: [AgentConversationQueued]?
-    /// Exact terminal transitions, committed with the conversation that removed them.
+    /// Commit terminal transitions with the conversation that removes them.
     public var settledObligations: [String: [String: Experience.Obligation]]?
-    /// A stop asked for on the in-flight reply (`agent_cancel`).
     public var stop: AgentConversationStop?
-    /// The queued message taken to be sent next: the thread is its alone
-    /// until that send begins.
+    /// The queued message owns the thread until its send begins.
     public var queueReservation: String?
-    /// "<operation>:<phase>" whose settled result her own call already
-    /// returned to her (a blocking lane's reply, an immediate failure), so it
-    /// is no arrival. A later change on that send (a late reply) still is.
+    /// Already-returned settlements are not arrivals; a later change on the same send still is.
     public var shownInline: String?
-    /// A built-in delegate's stall or bad outcome on the current send, held
-    /// until the continuation tells her in this chat (once per event).
+    /// A built-in delegate's stall or bad outcome on the current send, held until the continuation tells the agent in this chat (once per event).
     public var notice: AgentConversationNotice?
-    /// Who said the reply its receipt caches, as the writer stamped it: the
-    /// answering turn's door and steering when one wrote it there
-    /// (`reply_from`, `reply_steered_by`), else the route this record's
-    /// transport read, which is what the app wrote the receipt from.
+    /// Reply attribution comes from the answering turn's stamp or the exact transport that supplied its receipt.
     public var cachedReplyStamp: TranscriptRowStamp {
-        guard case .object(let receipt)? = receipt, case .string(let from)? = receipt["reply_from"] else { return .init(source: agent, steeredBy: [], contact: true) }
+        guard case .object(let receipt)? = receipt, case .string(let from)? = receipt["reply_from"] else { return .init(source: agent, steeredBy: [],
+            contact: true) }
         let steering: [String] = if case .array(let values)? = receipt["reply_steered_by"] {
             values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
         } else { [] }
@@ -192,16 +177,13 @@ public struct AgentConversationRecord: Codable, Sendable {
 
 }
 
-/// One delegation event for her, in the chat the send came from.
 public struct AgentConversationNotice: Codable, Sendable, Equatable {
     public var event: String
     public var text: String
     public init(event: String, text: String) { self.event = event; self.text = text }
 }
 
-/// A message waiting on its thread behind the reply in progress (09-25: a
-/// second message used to be refused). Never dropped: it goes, or it stays
-/// here `held` with the reason. A pre-Return Mac hold alone releases on free input.
+/// Queued messages must be sent or retained `held` with a reason; only pre-Return Mac holds release on free input.
 public struct AgentConversationQueued: Codable, Sendable, Equatable {
     public var lifeID: String?
     public var id: String
@@ -228,11 +210,7 @@ public struct AgentConversationQueued: Codable, Sendable, Equatable {
 
 }
 
-/// The thread's stop state for one operation: "stopping" (asked, the lane has
-/// not confirmed), "stopped" (the reply ended because of it), "finished" (it
-/// answered first), "released" (no stop exists, but its answer comes back on its
-/// own, so the thread stops waiting), or "cannot_stop"
-/// (this lane has no stop; the reply keeps coming).
+/// Stop remains unconfirmed until the route reports stopped or finished; releasing a wait does not stop its reply.
 public struct AgentConversationStop: Codable, Sendable, Equatable {
     public var state: String
     public var operationID: String
@@ -251,33 +229,28 @@ public struct AgentConversationStop: Codable, Sendable, Equatable {
 }
 
 
-/// Bounded display history inside the routing bookmark. Never provider context,
-/// replay input or a replacement for the reply's owner. Experience settlement
+/// Bounded display history inside the routing bookmark. Never provider context, replay input or a replacement for the reply's owner. Experience settlement
 /// reads its retained reply/status as evidence; eviction supplies no acceptance.
 public struct AgentConversationExchange: Codable, Sendable {
     public var lifeID: String?
     public var id: String
-    /// The outbound protocol's message identity, bound to this operation once.
-    /// A peer's string identity is independent of our internal UUID.
+    /// Bind the protocol's opaque message identity once; it is independent of the operation UUID.
     public var messageID: String?
     public var sentAt: Date
     public var prompt: String?
     public var reply: String?
-    /// The shelf result this reply belongs to, retained when the next send starts.
+    /// Keep the shelf binding across subsequent sends.
     public var resultID: UUID?
     public var partialReply: String?
     public var promptTruncated: Bool
     public var replyTruncated: Bool
     public var phase: String
     public var status: String
-    /// Typed by the person in the contact's thread, not sent by the agent.
+    /// Person-typed sends must not start an agent turn on reply.
     public var byPerson: Bool?
-    /// Reply arrival or send settlement time; nil while in flight or when unrecorded.
     public var settledAt: Date?
-    /// The agent's first sign of work on this send (text, a tool, bytes), if any.
     public var firstActivityAt: Date?
-    /// The card this send waits on, kept so a decision made after the record
-    /// moved on to a newer send still settles this one.
+    /// The card this send waits on, kept so a decision made after the record moved on to a newer send still settles this one.
     public var approvalId: String?
 
     package init(id: String,
@@ -306,33 +279,23 @@ public struct AgentConversationExchange: Codable, Sendable {
 
 }
 
-/// One contact's conversation with her lives in one chat session the contact
-/// owns: what she sends it, what it says to her, and the turns either one starts.
-/// Every view of the contact reads it.
+/// Every contact view reads the same contact-owned chat session.
 public typealias ContactThread = Transcripts.ContactThread
 
 extension ContactThread {
-    /// Every session a contact owns starts with this: its id, hashed.
     public static func prefix(owner: String) -> String { ChatSessionRetention.contactSessionPrefix(owner: owner) }
 
-    /// A transcript message id a history page or selection may name: bounded,
-    /// letters, digits and hyphens (a row's UUID, or an imported `<UUID>-sent`).
-    /// Which message it is resolves by exact membership in the contact's lines.
+    /// Resolve a bounded message selector by exact membership, never by its spelling alone.
     public static func isMessageID(_ id: String) -> Bool {
         (1...128).contains(id.utf8.count) && id.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
     }
 
-    /// The contact's own conversation (a peer's id, or a built-in lane's
-    /// name); for a peer, the one its MCP door opens.
     public static func session(owner: String) -> String { prefix(owner: owner) + "mcp-" + owner }
 
-    /// Presentation-only union for Simple and home rows. Route readers use lines.
-    /// Everything said between her and the contact, oldest first, from its
-    /// sessions: the live logs and the copies each compaction kept, once each
-    /// by message id (`tailBytes`: only the newest bytes of each live log).
-    /// The contact's lines are the turns it sent and its saved replies; hers
-    /// are her sends (each carries its send id) and her answers to turns it
-    /// started. Her turn on one of its replies is her own: it went nowhere.
+    /// Presentation-only union for Simple and home rows. Route readers use lines. Everything said between the agent and the contact, oldest first, from its
+    /// sessions: the live and archived logs, once each by message id (`tailBytes`: only the newest bytes of each live log). The contact's lines
+    /// are the turns it sent and its saved replies; the agent's are its sends (each carries its send id) and its answers to turns the contact started. The
+    /// agent's turn on one of its replies is its own: it went nowhere.
     public static func mergedLines(dataRoot: URL, owner: String, tailBytes: Int? = nil, identity: AgentContactIdentity,
                                    transcripts: [(String, URL)]? = nil) throws -> [Line] {
         let owners = identity.owners(owner)
@@ -383,7 +346,6 @@ extension ContactThread {
     /// Cache each owner's transcript lines until a session or reply file changes.
     private static let cache = OSAllocatedUnfairLock<[String: (paths: [URL], stamp: [SnapshotTailOpLog.FileStamp?], lines: [Line])]>(initialState: [:])
 
-    /// A file's identity, size and times; any write moves it.
     private static func fileStamp(_ path: String) -> SnapshotTailOpLog.FileStamp? {
         var info = stat()
         guard lstat(path, &info) == 0 else { return errno == ENOENT ? .absent : nil }
@@ -401,7 +363,7 @@ extension ContactThread {
         let offset = tailBytes.map { size > UInt64($0) ? size - UInt64($0) : 0 } ?? 0
         try handle.seek(toOffset: offset)
         var data = try handle.readToEnd() ?? Data()
-        // The first line of a cut window is partial.
+        // The cut window may start mid-line.
         if offset > 0, let end = data.firstIndex(of: 0x0A) { data = data[data.index(after: end)...] }
         if let end = data.lastIndex(of: 0x0A) { data = data[..<data.index(after: end)] }
         else { data = Data() } // The writer has not completed a physical row yet.
@@ -412,20 +374,15 @@ extension ContactThread {
     }
 
     public enum Entry: Sendable {
-        /// A message to the contact: hers, or the person's from its thread.
-        case send(owner: String, text: String, sendID: String, byPerson: Bool)
-        /// The contact's answer to a send, when no turn of hers carries it there.
-        /// `from` and `steeredBy` are the stamp of whoever said it, as its own
-        /// transport attested it (the route a read went to, or the door whose
-        /// turn carried it); `owner` only places it.
+        case send(owner: String, text: String, sendID: String, byPerson: Bool, turn: Turn)
+        /// Reply attribution follows its transport stamp; `owner` only places the line.
         case reply(owner: String, name: String, text: String, replyID: String, at: Date, from: String, steeredBy: [String])
-        /// A send's last state, kept on its own row when the record's bounded
-        /// ledger lets the send go: the evidence stays with the send.
+        /// A send's last state, kept on its own row when the record's bounded ledger lets the send go: the evidence stays with the send.
         case state(owner: String, sendID: String, status: String)
 
         var owner: String {
             switch self {
-            case .send(let owner, _, _, _), .reply(let owner, _, _, _, _, _, _), .state(let owner, _, _): owner
+            case .send(let owner, _, _, _, _), .reply(let owner, _, _, _, _, _, _), .state(let owner, _, _): owner
             }
         }
     }
@@ -436,14 +393,13 @@ extension ContactThread {
     /// The engine root, which owns the chat client that appends to a session.
     public static func installWriter(_ write: @escaping Writer) { writer.withLock { $0 = write } }
 
-    /// Appends the entry to the contact's session. The thread's own record
-    /// keeps the send either way; a failed append is logged.
+    /// Keep the send record even when transcript append fails; log that failure.
     public static func write(_ entry: Entry, dataRoot: URL) async {
         do { try await attempt(entry, dataRoot: dataRoot) }
         catch { nativeLog("ContactThread: a message with \(entry.owner) was not saved to its session: \(error)") }
     }
 
-    /// The same write, its failure the caller's to report.
+    /// The caller must report append failure.
     public static func attempt(_ entry: Entry, dataRoot: URL) async throws {
         guard let write = writer.withLock({ $0 }) else {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "no conversation writer is installed yet"])

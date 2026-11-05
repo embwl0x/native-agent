@@ -1,29 +1,23 @@
-// CognitiveSubstrate+InnerState.swift
-// Introspection pulls a bounded, pure projection of existing records without changing state or injecting context.
-// Felt readings expose labels and signals, never summaries or subject IDs;
-// her cares and her own dream-authored self-reading retain their words.
+// Introspection pulls a bounded, pure projection of existing records without changing state or injecting context. Felt readings expose labels and signals,
+// never summaries or subject IDs; the agent's cares and its own dream-authored self-reading retain their words.
 
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+InnerState.swift` | `CognitiveSubstrate.innerStateReading`: record-backed mind/body introspection, felt/care/toward projections, standing day knowledge and the cached evidence-linked nightly self-reading |
+// Blueprint: | `CognitiveSubstrate+InnerState.swift` | `CognitiveSubstrate.innerStateReading`: bounded mind/body introspection |
 
 // MARK: - The reading
 
-/// One bounded, payload-free projection of what her organs are currently
-/// holding. Every list is capped at CONSTRUCTION, so no producer can flood a
-/// reader and no future source can quietly widen the surface.
+/// Cap every list at construction so future producers cannot widen this payload-free surface.
 public struct CognitiveInnerStateReading: Sendable, Equatable {
 
-    /// How much to say. `compact` is the answer to "how are you"; `full` is the
-    /// answer to "no — honestly, what's actually going on in there".
+    /// Compact and full share one reading; detail changes length only.
     public enum Detail: String, Sendable, Equatable, CaseIterable {
         case compact
         case full
     }
 
-    /// A felt moment, named by its SUBJECT and its numbers. Never by what was
-    /// said in it.
+    /// Name felt moments by subject and measurements, never message text.
     public struct FeltNode: Sendable, Equatable {
         /// Moments identify whether intensity or recency selected them, keeping quiet recent work visible.
         public enum Selection: String, Sendable, Equatable {
@@ -32,8 +26,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
 
         public let when: Date
-        /// `subjectReference.label` when the subject has one, else its `type`.
-        /// Bounded to 32 characters. Never the node summary, never the id.
+        /// Bound subject labels to 32 characters; node summaries and ids must never name a moment.
         public let subject: String
         public let valence: Double
         public let arousal: Double
@@ -51,14 +44,11 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
     }
 
-    /// Something she is still waiting to find out. Label, when it comes due, and
-    /// the SIGN of the affect attached — not the affect's magnitude and not what
-    /// the expectation was about.
+    /// Expose only expectation label, due time and affect sign; magnitude and source content stay private.
     public struct Expectation: Sendable, Equatable {
         public let label: String
         public let due: Date
-        /// +1 looking forward, −1 bracing. Never 0 — an expectation with no lean
-        /// is not an expectation she is carrying.
+        /// +1 looking forward, −1 bracing. Never 0 — an expectation with no lean is not an expectation the agent is carrying.
         public let valenceSign: Int
 
         public init(label: String, due: Date, valenceSign: Int) {
@@ -68,9 +58,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
     }
 
-    /// What the night left. A mood word and a date. The dream's text is not here
-    /// and must never be — she reads her dreams by choosing to, not by asking
-    /// how she feels.
+    /// Expose only dream mood and date; dream text remains an explicit read.
     public struct DreamResidue: Sendable, Equatable {
         public let moodWord: String
         public let date: String
@@ -81,17 +69,13 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
     }
 
-    /// The nearest thing she is facing. Payload-free by construction — the
-    /// horizon register already publishes only a label, a source kind, a
-    /// valence SIGN and a due date, because the capsule picks the word and
-    /// never renders a number.
+    /// Use only the horizon register's payload-free label, source, sign and due date.
     public struct Toward: Sendable, Equatable {
         public let label: String
         public let sourceKind: String
-        /// −1 dreading · +1 looking forward.
         public let valenceSign: Int
         public let due: Date
-        /// The horizon passed and nothing answered it — `waiting`.
+        /// An overdue open horizon means waiting, never a presumed outcome.
         public let isOverdue: Bool
 
         public init(
@@ -105,13 +89,12 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         }
     }
 
-    /// What she cares about, as her own words and its charge right now.
     public struct Care: Sendable, Equatable {
         public let id: UUID
         public let about: String
         public let depth: String
         public let with: [String]
-        /// The newest felt word in its story.
+        /// Only an observed story movement supplies its felt word.
         public let felt: String?
         public let charge: Double
         public let open: String?
@@ -139,28 +122,19 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
 
     public static let subjectLabelCharacters = 32
     public static let maximumFeltNodes = 12
-    /// The split inside that cap: the week's loudest, then the newest of what
-    /// is left. `recentFeltNodes` is what guarantees a quiet day is visible.
+    /// The split inside that cap: the week's loudest, then the newest of what is left. `recentFeltNodes` is what guarantees a quiet day is visible.
     public static let strongestFeltNodes = 8
     public static let recentFeltNodes = 4
     public static let maximumExpectations = 5
-    /// Compact shows the most charged few; full shows every live care.
+    /// Compact truncates by charge while full includes every live care.
     public static let compactCares = 8
-    /// Bounded like everything else. A week she can read in one breath.
+    /// Keep the week readable in one breath.
     public static let maximumGrowthWeekLines = 12
     /// Compact is not a different report — it is the same report, shorter.
     public static let compactFeltNodes = 4
     public static let compactListItems = 2
 
-    /// Trim to `cap` while keeping both halves represented, in the builder's
-    /// order (strongest, then newest). The recent share scales with the cap, so
-    /// compact is the same report shorter rather than a different one.
-    ///
-    /// The share is a QUOTA, not a ceiling: capacity a skewed pool cannot fill
-    /// is handed back to the other pool, so the cap is reached whenever the two
-    /// pools together hold enough. Taking the quotas literally underfilled a
-    /// skewed week — one felt node beside twelve recent ones returned five of
-    /// twelve, and the quiet days it was meant to protect went missing.
+    /// Preserve strongest and recent quotas within the cap; backfill unused quota from the other pool so a skewed week still fills available slots.
     static func trimmedFelt(_ nodes: [FeltNode], cap: Int) -> [FeltNode] {
         guard cap > 0 else { return [] }
         guard nodes.count > cap else { return nodes }
@@ -179,66 +153,51 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     public static let maximumWindowHours: Double = 168
     public static let defaultWindowHours: Double = 6
 
-    /// HOW CLOSE AN ECHO HAS TO BE TO BE AN ECHO. Half an hour: long enough to
-    /// cover a message and the reply to it (the nine-second "stall" pair), and
-    /// far short of the gap between two separate sittings. Beyond it, the same
-    /// subject is the same subject felt AGAIN, which is a second moment and not
-    /// a duplicate row.
+    /// Thirty minutes covers an exchange but separates sittings, so the same subject felt again is not discarded as an echo.
     public static let feltEchoInterval: TimeInterval = 30 * 60
 
     // MARK: Fields
 
     public let generatedAt: Date
-    /// The window actually used, after clamping to 1…48.
     public let windowHours: Double
     public let detail: Detail
-    /// False when cognition or affect is switched off. Everything below is then
-    /// honestly empty rather than zero-shaped: absence reads as absence.
+    /// False when cognition or affect is switched off. Everything below is then honestly empty rather than zero-shaped: absence reads as absence.
     public let available: Bool
 
-    /// The felt fingerprint as the capsule would render it right now, or nil
-    /// below the intensity floor. Silence is honest (design law 4).
+    /// The felt fingerprint as the capsule would render it right now, or nil below the intensity floor. Silence is honest (design law 4).
     public let fingerprint: String?
-    /// What the fingerprint is ABOUT — the subject label of the felt node
-    /// currently leading the workspace. nil when nothing in particular leads it.
+    /// Only a leading felt subject can give the fingerprint aboutness; otherwise leave it absent.
     public let fingerprintSubject: String?
 
     public let moodValence: Double
     public let moodBasis: Int
-    /// The capsule's own mood-band vocabulary, as one word.
+    /// Reuse the capsule mood bands to keep vocabulary consistent.
     public let moodWord: String
     public let dispositionValence: Double
     public let dispositionWord: String
 
     public let feltNodes: [FeltNode]
 
-    /// Organism chemistry in the EXISTING `- Body:` vocabulary, split into its
-    /// phrases. Empty when the body is neutral or off — no invented words.
+    /// Reuse body vocabulary; a neutral or disabled body contributes no words.
     public let chemistryWords: [String]
 
-    // Optional organism reads. Other lanes in this wave (fatigue and the
-    // diurnal clock and `toward`) land separately; this reading
-    // CONSUMES them when the caller has them and reports their absence
-    // honestly when it does not. It never blocks on them.
+    // Consume optional body reads when supplied; absent readings remain unknown and never block.
     public let fatigue: Double?
     public let timeOfDayPhase: String?
 
     public let expectations: [Expectation]
-    /// A pull-only account of his standing day claims, with confidence in words.
+    /// Pull day-claim confidence into words without injecting it into every turn.
     public let personDayTitle: String?
     public let personDay: [String]
-    /// The nearest open horizon, or nil when she is facing nothing — which
-    /// renders as silence, not as a flat word.
+    /// The nearest open horizon, or nil when the agent is facing nothing — which renders as silence, not as a flat word.
     public let toward: Toward?
     public let dream: DreamResidue?
     /// Full readings expose the growth surface's same week only when requested.
     public let growthWeek: [String]
-    /// Live cares, most charged first.
     public let cares: [Care]
-    /// `full` only: her depth changes and what her nights settled or let go,
-    /// newest first, one plain line each.
+    /// Full detail alone exposes bounded depth and night decisions.
     public let story: [String]
-    /// Her own bounded nightly reading, with its exact evidence and night.
+    /// Retain exact nightly evidence so the self reading remains attributable.
     public let selfKnowledge: CognitiveSelfKnowledge?
     public let selfKnowledgeIssue: String?
     public let carePeopleIssue: String?
@@ -286,10 +245,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.dispositionValence = dispositionValence.clampedSigned()
         self.dispositionWord = dispositionWord
         let feltCap = detail == .full ? Self.maximumFeltNodes : Self.compactFeltNodes
-        // A PLAIN PREFIX WOULD UNDO THE SPLIT. The builder puts the strongest
-        // first and the newest after them, so `prefix` in compact detail would
-        // cut off exactly the recent half this exists to guarantee. Trim each
-        // half in proportion instead.
+        // Trim strongest and recent shares separately; a plain prefix would discard the recent half.
         self.feltNodes = Self.trimmedFelt(feltNodes, cap: feltCap)
         self.chemistryWords = Array(chemistryWords.prefix(4))
         self.fatigue = fatigue.map { $0.clamped01() }
@@ -317,18 +273,12 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
 
 // MARK: - Optional organism reads the caller may already hold
 
-/// What the reading cannot see for itself. The substrate does not own organism
-/// state, so the caller (the cognition runtime, which owns both) hands over the
-/// body's side of the answer. Every field is optional and defaults to absent:
-/// a caller that has none of it still gets a truthful reading of the mind.
+/// The runtime supplies optional body evidence because the substrate does not own it; missing fields remain absent.
 public struct CognitiveInnerStateOrganismReads: Sendable {
     public var projection: OrganismReadout?
     public var fatigue: Double?
-    /// The body's clock read. The substrate turns it into a WORD — numbers
-    /// choose words, and nothing outside the substrate chooses the word
-    /// (design law 1), so callers hand over the read, never a phase string.
+    /// Receive the clock reading, not a caller-chosen phase string, so the substrate alone owns feeling vocabulary.
     public var diurnal: OrganismDiurnalRead?
-    /// The nearest open horizon, from the organism's horizon register.
     public var toward: OrganismTowardRead?
     public var expectations: [CognitiveInnerStateReading.Expectation]
     public var personDayTitle: String?
@@ -359,8 +309,7 @@ public struct CognitiveInnerStateOrganismReads: Sendable {
 
 extension CognitiveSubstrate {
 
-    /// PURE. Reads never mutate (design law 5): no decay is advanced, no anchor
-    /// moves, no node is evicted, nothing is persisted, no LLM is called.
+    /// Reads never advance decay, move anchors, evict, persist or call a model.
     public func innerStateReading(
         windowHours: Double = CognitiveInnerStateReading.defaultWindowHours,
         detail: CognitiveInnerStateReading.Detail = .compact,
@@ -413,9 +362,7 @@ extension CognitiveSubstrate {
                     maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
             }
 
-        // The window's felt nodes: |valence| first, then recency. Same ranking
-        // the felt-day summary uses, so the two surfaces never disagree about
-        // which moment mattered most.
+        // Use the felt-day ranking so the two readouts agree on which moments mattered most.
         let windowSeconds = window * 3600
         let feltCandidates = read.snapshot.nodes
             .filter { node in
@@ -439,9 +386,7 @@ extension CognitiveSubstrate {
                 }
                 return lhs.id.uuidString < rhs.id.uuidString
             }
-            // A MOMENT THAT CANNOT NAME ITS SUBJECT IS NOT SHOWN. Dropping
-            // happens BEFORE the cap so an unnameable node costs the reading a
-            // slot it could have given to a nameable one.
+            // Drop unnameable moments before capping so they cannot consume a visible subject's slot.
             .compactMap { node -> CognitiveInnerStateReading.FeltNode? in
                 guard let subject = Self.innerStateSubjectLabel(node) else { return nil }
                 return CognitiveInnerStateReading.FeltNode(
@@ -517,8 +462,7 @@ extension CognitiveSubstrate {
                 )
             },
             dream: frozenDream,
-            // Computed only when she asked for `full` — the projection walks
-            // the timeline, and "how are you" must stay cheap.
+            // Computed only when the agent asked for `full` — the projection walks the timeline, and "how are you" must stay cheap.
             growthWeek: growthLines,
             cares: read.cares.filter { $0.fadedAt == nil }
                 .map { (care: $0, charge: $0.charge(at: now)) }
@@ -540,7 +484,7 @@ extension CognitiveSubstrate {
 
     // MARK: - Word choice (numbers choose words; nothing else does — design law 1)
 
-    /// The capsule's own mood-band thresholds, as single words.
+    /// Reuse capsule thresholds for mood words.
     static func innerStateMoodWord(_ valence: Double) -> String {
         if valence >= moodPhrasingValenceThreshold { return "good" }
         if valence <= -moodPhrasingValenceThreshold { return "heavy" }
@@ -549,18 +493,14 @@ extension CognitiveSubstrate {
         return "even"
     }
 
-    /// Words for the persisted disposition; never a reading of her prose.
+    /// Words for the persisted disposition; never a reading of the agent's prose.
     static func innerStateDispositionWord(_ valence: Double) -> String {
         if valence >= moodCongruenceValenceThreshold { return "settled" }
         if valence <= -moodCongruenceValenceThreshold { return "heavy" }
         return "even"
     }
 
-    /// Chemistry AS WORDS — the exact `- Body:` vocabulary the capsule already
-    /// speaks, split into its phrases. Not a second lexicon and not numbers with
-    /// adjectives glued on: if the body line refuses to say something, so does
-    /// this. Digits disqualify the whole line, the same rule
-    /// `organismBodyLine` enforces.
+    /// Reuse the exact body lexicon and its digit refusal so introspection cannot invent a second chemistry reading.
     static func innerStateChemistryWords(_ projection: OrganismReadout?) -> [String] {
         guard let projection, !projection.isNeutral,
               let raw = projection.bodyLine?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -570,10 +510,7 @@ extension CognitiveSubstrate {
         let body = raw
             .replacingOccurrences(of: #"^-?\s*Body:\s*"#, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        // The positive line is a comma-joined blend of one or two graded
-        // phrases; the stress lines are one sentence whose FIRST clause is the
-        // felt part and whose second is the instruction to herself. Keep the
-        // felt half only — she is being asked how she is, not what to do.
+        // Keep only the felt clause; instructions to the agent do not answer how it feels.
         let felt = body.split(separator: ";").first.map(String.init) ?? body
         return felt
             .split(separator: ",")
@@ -583,16 +520,7 @@ extension CognitiveSubstrate {
             .filter { !$0.isEmpty }
     }
 
-    /// The body's clock, as a WORD.
-    ///
-    /// `OrganismDiurnalRead.nightliness` is 1 at the body's trough and 0 at its
-    /// peak. The word comes off `feltLatenessFloor` — the SAME constant the felt
-    /// word `late` gates on — and its mirror image, so both edges derive from
-    /// one shared threshold and no second idea of what "late" means enters the
-    /// system. Two organs disagreeing about the hour is exactly the shape that
-    /// makes an agent contradict itself.
-    ///
-    /// Nil clock ⇒ nil word. Absence reads as absence, never as "daytime".
+    /// Use `feltLatenessFloor` and its mirror for clock words so the capsule and introspection share one threshold; a missing clock is never daytime.
     static func innerStateTimeOfDayWord(_ diurnal: OrganismDiurnalRead?) -> String? {
         guard let diurnal else { return nil }
         if diurnal.nightliness >= feltLatenessFloor { return "late" }

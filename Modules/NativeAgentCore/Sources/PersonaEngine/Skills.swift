@@ -1,10 +1,9 @@
 import Foundation
 // Blueprint: | `Skills.swift` | `SkillRecord`: built-in guidance carried directly through discovery, reads, Mac and phone |
 
-// A skill is built-in guidance from the persona, read and never run; what
-// she writes is a part (ToolExecution's `Parts`).
+// Built-in skill guidance is read-only persona material; authored executable work belongs to parts.
 
-/// One guidance row, as the Skills page and the phone snapshot carry it.
+/// Share the guidance row between Skills and the phone snapshot.
 public struct SkillRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var name: String

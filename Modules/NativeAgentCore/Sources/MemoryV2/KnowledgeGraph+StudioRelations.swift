@@ -1,37 +1,6 @@
-// The studio journal's relations, become KNOWLEDGE-GRAPH EDGES.
-//
-// ── WHAT THIS WRITES ─────────────────────────────────────────────────────────
-// From the append-only journal:
-//   • one entity per WORK      (type `work`)    — keyed by title + creator
-//   • one entity per CREATOR   (type `creator`) — deduped by name, written once
-//   • work —created_by→ creator
-//   • work —deepens|contradicts|revises|echoes→ work, from an entry's typed link
-//     to an EARLIER ENTRY, resolved to that entry's work
-// Every edge names the journal entries that assert it, in
-// `metadata_json.studio_entry_ids`, so the causal chain is auditable back to the
-// judgment that made the claim. That is the provenance requirement.
-//
-// ── WHY IT IS A FULL RE-DERIVE, NOT AN INCREMENT ─────────────────────────────
-// `indexStudioJournal` takes the WHOLE journal and is idempotent: it SETS the
-// edge's entry-id list, mention count and weight rather than incrementing them.
-// The journal is a curated life record — a few entries a week — so reading it
-// whole is honest and cheap (the store says the same about `readJournal`), and
-// an idempotent writer means the one-shot backfill and the per-append update are
-// the SAME operation. There is no dual-write period and no drift to reconcile.
-//
-// ── NO SCORE ─────────────────────────────────────────────────────────────────
-// `weight` here is EVIDENCE COUNT, not taste: how many distinct entries assert
-// this edge, mapped into the band the graph's own ordering expects. No judgment
-// is ranked against another, and nothing about a work's stance touches it.
-//
-// ── WHY THESE ROWS SURVIVE THE MEMORY LANES ──────────────────────────────────
-// The memory indexer's rebuild deletes what it owns by
-// `metadata_json.indexer IN (swift-memory-kg-*)`; GC's orphan scan only
-// considers entities that carry a `last_memory_id`; the stale sweep only
-// considers entities with `provenance IS NULL`. Studio rows carry the studio
-// indexer stamp, no `last_memory_id`, and an explicit provenance — so all three
-// memory-side lanes step over them instead of collecting a life record as
-// garbage.
+// Derive work identity from title plus creator and cite asserting journal entry IDs on every edge. Rederive the whole bounded journal with SET semantics so
+// appends and backfill stay idempotent. Weight counts evidence, never taste. Studio provenance, its distinct indexer stamp and absence of `last_memory_id` keep
+// these rows outside memory rebuild, orphan GC and stale-entity deletion.
 
 import CryptoKit
 import Foundation
@@ -40,18 +9,14 @@ import PersistenceCore
 import Studio
 // Blueprint: | `KnowledgeGraph+StudioRelations.swift` | Studio journal relation publication with its own provenance |
 
-/// What one indexing pass actually wrote. Returned so the caller can say it out
-/// loud rather than assert it.
+/// Return actual write counts so callers can report evidence.
 public struct StudioGraphIndexReport: Sendable, Equatable {
-    /// False when there is no `memory.sqlite` yet — a fresh install with no
-    /// memory has no graph to write into, which is not an error.
+    /// Missing memory storage means graph projection is unavailable, not a failed journal write.
     public var graphAvailable: Bool
     public var worksIndexed: Int
     public var creatorsIndexed: Int
     public var edgesWritten: Int
-    /// Relations naming an entry the journal does not contain. Kept as a COUNT
-    /// rather than dropped silently: a dangling link is a fact about the
-    /// journal, not something to invent an endpoint for.
+    /// Count dangling journal links explicitly; missing entries cannot supply invented endpoints.
     public var unresolvedRelations: Int
 
     public static let unavailable = StudioGraphIndexReport(
@@ -62,23 +27,15 @@ public struct StudioGraphIndexReport: Sendable, Equatable {
 
 extension SwiftNativeKnowledgeGraphIndexer {
 
-    /// Stamp on every studio-written row. Deliberately NOT a `swift-memory-kg-*`
-    /// version, so the memory rebuild's owned-row delete cannot reach these.
+    /// Use a distinct studio stamp so memory rebuild's owned-row deletion cannot reach these rows.
     public static let studioIndexVersion = "swift-studio-kg-v1"
-    /// `kg_entities.provenance` / `kg_relationships.provenance` for studio rows.
-    /// Also what keeps them out of the stale-entity sweep.
+    /// Explicit studio provenance keeps these rows outside stale-entity deletion.
     public static let studioProvenance = "studio-journal"
     public static let studioWorkEntityType = "work"
     public static let studioCreatorEntityType = "creator"
     public static let studioCreatedByRelationType = "created_by"
-    /// Re-derive the whole studio subgraph from the journal.
-    ///
-    /// Idempotent: calling it twice with the same entries leaves the same rows.
-    /// The refresh caller holds the journal's flock from its read through this
-    /// commit, so an older snapshot cannot overwrite newer evidence.
-    /// A missing `memory.sqlite` returns `.unavailable` rather than throwing —
-    /// the indexer never creates that file, and a journal write must not fail
-    /// because the graph has not been born yet.
+    /// Rederive idempotently while the caller holds the journal flock through commit, preventing stale evidence from overwriting newer entries. Missing memory
+    /// storage returns unavailable; this writer never creates it.
     @discardableResult
     public func indexStudioJournal(
         _ entries: [StudioJournalEntry],
@@ -141,10 +98,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             }
             var edgesWritten = 0
             var creatorIDsByWorkID: [String: Set<String>] = [:]
-            // Work keys whose derived creator edges did NOT all get written
-            // (an id this pass could not resolve without stealing another
-            // key's). Their existing edges are the only record of that
-            // creator, so the cleanup below leaves them alone.
+            // Unresolved creator IDs must retain existing edges because those edges may be the only record of the creator.
             var incompleteCreatorWorkKeys = Set<String>()
             for edge in edges.keys.sorted(by: {
                 ($0.from, $0.to, $0.type) < ($1.from, $1.to, $1.type)
@@ -202,18 +156,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
 
     // MARK: - Encounter intake
 
-    /// Works the graph holds that the journal has never answered.
-    ///
-    /// The second intake source: "a KG work entity with no journal entry." It is
-    /// a live query over `kg_entities`, not a stub — it returns rows the moment
-    /// a work reaches the graph from anywhere other than the journal (a memory
-    /// naming one, a future museum lane). While the journal is the only writer
-    /// of `work` entities it returns nothing, and that is the correct answer,
-    /// not a missing feature: no intake means no encounter, by design.
-    ///
-    /// `journaledWorks` are `SwiftNativeStudioStore.journaledWorkIdentity`
-    /// keys — title BY SOMEONE, folded — from the journal. The caller owns the
-    /// journal, this owns the graph, and neither reaches into the other.
+    /// Query graph works without journal encounters using title-plus-creator keys supplied by the journal owner. Empty intake is valid when every graph work is
+    /// already journaled.
     public func unjournaledWorkCandidates(
         journaledWorks: Set<String>,
         limit: Int = 20
@@ -277,14 +221,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
         var unresolvedRelations = 0
     }
 
-    /// Journal → nodes and typed edges. PURE: no I/O, no clock, no SQL. The
-    /// whole shape of the studio subgraph is decided here so it can be tested
-    /// without a database.
+    /// Derive journal nodes and edges without I/O, clocks or SQL so storage cannot alter their identity.
     static func deriveStudioGraph(from entries: [StudioJournalEntry]) -> StudioDerivedGraph {
         var graph = StudioDerivedGraph()
-        // entry id → the work key that entry is ABOUT. A relation names an
-        // earlier ENTRY; the edge it becomes is between the two WORKS, because
-        // an entry is one act of judgment and the work is what persists.
+        // Entry relations become work edges because judgments are acts while work identity persists.
         var workKeyByEntry: [String: String] = [:]
 
         for entry in entries {
@@ -334,10 +274,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     graph.unresolvedRelations += 1
                     continue
                 }
-                // A later entry about the SAME work deepening an earlier one is
-                // a real and common shape, but the graph has no self-loops: the
-                // relation survives as the entry's own provenance line, and the
-                // edge would say nothing the entity does not already say.
+                // Keep same-work deepening as journal provenance: a self-loop adds no evidence beyond the entity.
                 guard fromKey != toKey else { continue }
                 graph.edges[
                     StudioEdgeKey(from: fromKey, to: toKey, type: relation.kind.rawValue),
@@ -352,20 +289,18 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return graph
     }
 
-    /// A work's key is title + creator; optional medium and date never split its identity.
+    /// Work identity is title plus creator; medium and date never split it.
     static func studioWorkNodeKey(title: String, creator: String) -> String {
         studioNodeKey(type: studioWorkEntityType, name: title)
             + "|" + studioFold(creator)
     }
 
-    /// Stable node key: type + case/diacritic-folded name. Two entries about
-    /// "the green ray" and "The Green Ray" are one work.
+    /// Fold case and diacritics so spelling variants identify one node.
     static func studioNodeKey(type: String, name: String) -> String {
         "\(type.lowercased())|\(studioFold(name))"
     }
 
-    /// Deterministic entity id derived from the node key, so re-indexing after a
-    /// row was deleted mints the SAME id rather than a second node for one work.
+    /// Derive IDs from stable keys so reindexing cannot duplicate a deleted-and-recreated work.
     static func studioEntityID(forKey key: String) -> String {
         let digest = SHA256.hash(data: Data(key.utf8))
         return "studio_" + digest.map { String(format: "%02x", $0) }.joined().prefix(16)
@@ -386,14 +321,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
 
     // MARK: - SQL
 
-    /// Upsert by the DETERMINISTIC id, then fall back to a name+type match so a
-    /// work the memory lane already knows under another id is reused rather than
-    /// duplicated.
-    ///
-    /// Returns nil when no id can be used for this key without stealing one
-    /// another key already resolved to in this pass. The caller then holds no id
-    /// for the key and its edges are skipped — a missing edge is recoverable on
-    /// the next re-derive; two works collapsed into one node is not.
+    /// Resolve deterministic IDs and existing name/type identities without stealing another key's node. Skip unresolved edges: later derivation can repair
+    /// missing evidence, but merging distinct works loses identity.
     private static func upsertStudioEntity(
         _ db: Database,
         key: String,
@@ -411,7 +340,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let derivedRowExists = try Row.fetchOne(
             db, sql: "SELECT id FROM kg_entities WHERE id = ?", arguments: [derivedID]
         ) != nil
-        // Every resolution branch rejects ids already claimed by another key.
+        // Reject IDs another key already owns on every resolution path.
         if derivedRowExists, claimedIDs.contains(derivedID) { return nil }
         let existingID: String? = try {
             if derivedRowExists { return derivedID }
@@ -421,11 +350,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 ORDER BY mention_count DESC, last_seen DESC
                 LIMIT 1
                 """, arguments: [name, type])
-            // The name+type fallback exists to reuse a row the memory lane
-            // already minted for this work. It must not hand this key a row
-            // another node has already claimed in this pass, nor one that IS
-            // another key's derived id — that row belongs to that key even when
-            // this pass reaches it first.
+            // Name/type reuse must respect claimed and reserved derived IDs so visitation order cannot merge distinct keys.
             guard let id: String = row?["id"],
                   !claimedIDs.contains(id),
                   !reservedDerivedIDs.contains(id) else { return nil }
@@ -450,8 +375,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 ])
             return derivedID
         }
-        // SET, never increment — this pass re-derives the whole journal, so an
-        // increment would inflate on every append.
+        // SET, never increment — this pass re-derives the whole journal, so an increment would inflate on every append.
         try db.execute(sql: """
             UPDATE kg_entities
             SET name = ?, mention_count = ?,
@@ -483,8 +407,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             "studio_entry_ids": .array(entryIDs.map { .string($0) }),
             "last_seen": .string(now),
         ])
-        // Evidence count, not taste: 0.5 for one entry asserting the edge,
-        // rising to 1.0 at ten. Deterministic, so a re-derive is a no-op.
+        // Evidence count, not taste: 0.5 for one entry asserting the edge, rising to 1.0 at ten. Deterministic, so a re-derive is a no-op.
         let weight = min(1.0, 0.5 + 0.05 * Double(max(0, entryIDs.count - 1)))
         try db.execute(sql: """
             INSERT INTO kg_relationships

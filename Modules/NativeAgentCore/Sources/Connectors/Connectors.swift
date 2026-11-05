@@ -3,10 +3,9 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Connectors.swift` | Canonical workspace-array read and tilde-expanded string paths for search and journal roots; typed search stop reasons disclose capped and unvisited workspace coverage in results and activity; checked identity metadata; empty queries echo their original input |
+// Blueprint: | `Connectors.swift` | Checked workspace search and identity; capped or unvisited scope remains explicit |
 
-// Searches saved workspaces with a 2,000-file limit per workspace and 50 results overall.
-// Each directory's files are searched before descending into its subdirectories.
+// Search files before subdirectories so a workspace's own files get the bounded search budget first.
 
 public final class SwiftNativeConnectorsClient: Sendable {
     private let root: URL
@@ -22,7 +21,6 @@ public final class SwiftNativeConnectorsClient: Sendable {
         root.appendingPathComponent("connectors/workspaces.json")
     }
 
-    /// <root>/activity/events.jsonl.
     private var activityPath: URL {
         SwiftNativePersistenceCore.activityEventsPath(dataRoot: root)
     }
@@ -40,8 +38,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
         if query.isEmpty { return WorkspaceSearchResponse(query: rawQuery, results: [], unexamined: nil) }
 
         var results: [Result<WorkspaceSearchResult, Error>] = []
-        // Scope the search could not examine, "path: why": a miss there is
-        // not a searched-and-absent miss.
+        // Unexamined scope cannot prove that a match is absent.
         var unexamined: [String] = []
         let workspaces = try await listWorkspaces()
 
@@ -82,7 +79,6 @@ public final class SwiftNativeConnectorsClient: Sendable {
 
     // MARK: - Activity receipt
 
-    /// Appends the finalized outcome with redacted query/payload and unexamined scope.
     private func recordSearchActivity(query: String, resultCount: Int, unexamined: [String]) async throws {
         let event = SwiftNativePersistenceCore.activityEvent(
             id: UUID().uuidString.lowercased(),
@@ -104,7 +100,6 @@ public final class SwiftNativeConnectorsClient: Sendable {
         )
     }
 
-    /// ISO-8601 UTC with fractional seconds and a `+00:00` offset.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
@@ -150,7 +145,6 @@ public final class SwiftNativeConnectorsClient: Sendable {
                 continue
             }
             if rv.isDirectory == true {
-                // Exclusions match directory names only.
                 if !skipDirs.contains(entry.lastPathComponent) {
                     subdirs.append(entry)
                 }
@@ -172,8 +166,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
             if lowerName.contains(query) || lowerRel.contains(query) {
                 matchReason = "filename"
             } else {
-                // Sizes came with the listing; a file too large to read is
-                // searched by name only, which is its ordinary scope.
+                // Oversized files remain name-searchable without reading their contents.
                 let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
                 if let size, size <= maxContentBytes {
                     // Content matches require a supported text encoding.
@@ -223,12 +216,10 @@ public final class SwiftNativeConnectorsClient: Sendable {
         return path.isEmpty ? nil : URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(path))
     }
 
-    /// POSIX relative path of standardized file URLs.
     private static func relativePath(of file: URL, under root: URL) -> String {
         NativeAgentWorkspaceRoot.relativePath(file.standardizedFileURL.path, under: root.standardizedFileURL.path)
             ?? file.lastPathComponent
     }
 }
 
-// Connector redaction uses NativeAgentCore's canonical contract.
 typealias SecretRedactor = NativeAgentSecretRedactor

@@ -19,10 +19,10 @@ import MacIntegration
 import Context
 import Senses
 import TrustCenter
-// Blueprint: | `AfterReply.swift` | `AfterReply`, `SwiftNativeTurnEngine.afterReply`: saved-answer release, recording before start, abandonment release and retained private flights through once-only settlement, surviving conversational Stop |
+// Blueprint: | `AfterReply.swift` | `AfterReply`; `SwiftNativeTurnEngine.afterReply`; Saved-answer release and once-only private settlement |
 
 extension SwiftNativeTurnEngine {
-    /// The saved answer releases private work on this actor with the turn's own scopes.
+    /// Saved output releases private work under the originating turn's scopes.
     func afterReply(_ work: @escaping () async -> Void) -> AfterReply {
         let held = AfterReply()
         let id = UUID()
@@ -30,15 +30,13 @@ extension SwiftNativeTurnEngine {
             defer { afterReplyFlights[id] = nil }
             await settled.park()
             if started.withLock({ $0 }) { await work() }
-            // The turn includes private work, or its abandonment if the reply
-            // could not be saved. Its predictions settle exactly once here.
+            // Private predictions settle exactly once, including abandonment when the reply cannot be saved.
             if let finish = completion.withLock({ $0 }) { await finish() }
         }
         return held
     }
 }
 
-/// Work released by the saved answer; abandonment releases private settlement unrun.
 public final class AfterReply: Sendable {
     fileprivate let started = OSAllocatedUnfairLock(initialState: false)
     fileprivate let settled = ScopedWaiter()

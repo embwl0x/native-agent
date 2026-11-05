@@ -1,9 +1,8 @@
 import Foundation
 import Security
-// Blueprint: | `DeviceSecretKeychain.swift` | Device-only Keychain bytes and account listing; accepted writes retain exact-item unverified evidence on readback failure, without restoration or deletion; callers own locked references |
+// Blueprint: | `DeviceSecretKeychain.swift` | Device-only writes retain unverified outcomes for exact-item repair. |
 
-/// Device-only secret bytes. Callers serialize the lifecycle and reference
-/// commits under their authority owner's lock.
+/// Device-only secret bytes. Callers serialize the lifecycle and reference commits under their authority owner's lock.
 public enum DeviceSecretKeychain {
     private static func query(service: String, account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -24,7 +23,6 @@ public enum DeviceSecretKeychain {
         return data
     }
 
-    /// Every account kept under `service`.
     public static func accounts(service: String) throws -> [String] {
         var request = query(service: service, account: "")
         request.removeValue(forKey: kSecAttrAccount as String)
@@ -52,8 +50,7 @@ public enum DeviceSecretKeychain {
         try verifyAcceptedWrite(data, service: service, account: account)
     }
 
-    /// Acceptance is real even when verification is unavailable. Never undo it;
-    /// the caller must reread this exact item before a deliberate forward repair.
+    /// Acceptance is real even when verification is unavailable. Never undo it; the caller must reread this exact item before a deliberate forward repair.
     private static func verifyAcceptedWrite(_ data: Data, service: String, account: String) throws {
         let observed: Data?
         do { observed = try read(service: service, account: account) }
@@ -75,7 +72,10 @@ public enum DeviceSecretKeychain {
             switch self {
             case .unavailable: return "Device Keychain secret is unavailable."
             case .acceptedButUnverified(let service, let account):
-                return "Keychain accepted the write to \(service)/\(account), but its bytes could not be verified. No restoration or deletion ran. Reread this exact item before deliberately repairing it; do not assume the prior secret is active."
+                return """
+                    Keychain accepted the write to \(service)/\(account), but its bytes could not be verified. No restoration or deletion ran. Reread \
+                    this exact item before deliberately repairing it; do not assume the prior secret is active.
+                    """
             }
         }
     }

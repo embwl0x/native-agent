@@ -11,16 +11,14 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `ChatShellPresentation.swift` | `ChatShellStatus`, `ChatShellCopy`; waiting/failure status and composer/greeting copy |
 
-// Shell presentation projects existing state without storage or network effects.
+// Shell presentation must not cause storage or network effects.
 
-/// What the single status dot says right now. Exactly one dot, one line, and
-/// the teal is spent only on "waiting on you".
+/// Use one status line and reserve teal for waiting on the user.
 enum ChatShellStatus: Equatable, Sendable {
-    /// Nothing is wrong; the header stays quiet.
+    /// Keep the header quiet when nothing needs attention.
     case settled
-    /// An approval is pending. This is the only place the teal is spent.
+    /// Only pending approval may spend teal here.
     case waitingOnYou
-    /// The last turn failed or the runtime is unreachable.
     case trouble
 
     static func make(
@@ -50,9 +48,8 @@ enum ChatShellStatus: Equatable, Sendable {
     }
 }
 
-/// Copy for the room's named states.
 enum ChatShellCopy {
-    /// The composer uses the agent's name, or "the agent" until named, never a pronoun.
+    /// Use the agent's name or an explicit unnamed label so the composer never substitutes a pronoun.
     static func composerPlaceholder(agentName: String) -> String {
         let trimmed = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.lowercased() != "the agent" else {
@@ -70,16 +67,12 @@ enum ChatShellCopy {
         "Tell me about yourself",
     ]
 
-    // ChatTurnFailure.line states the failed turn's proven effects so Retry can be judged safely.
+    // Use proven effects from ChatTurnFailure.line so Retry can be judged safely.
     static let errorStuckLink = "Still stuck? Settings"
 
-    /// Her conversations with other agents and her helpers, apart from his.
     static func workingRowTitle(agentName: String) -> String { agentName + " with agents" }
     static let conversationsTitle = "Conversations"
-    /// Sessions she opened herself and no person ever answered.
     static let briefsRowTitle = "Morning briefs"
 }
 
-/// Tool traffic in plain words. The room shows ONE quiet row per turn; opening
-/// it shows what she actually touched. Raw JSON never renders here — it stays
-/// available in Diagnostics, where a developer is looking for it.
+/// Keep raw JSON in Diagnostics; expandable activity sentences let normal chat explain actual tool use.

@@ -4,13 +4,10 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import SlackBot
-// Blueprint: | `NativeOAuthFlow+Slack.swift` | `saveSlackToken` validates explicit setup tokens through `SlackWebAPI` and records the person's connected decision; canonical auth metadata and grant publication delegate to SlackCredentials without a legacy copy. Saved fields describe setup, while runtime health requires action proof; publication checks its captured revision under the commit locks, and disconnect advances the registry credential generation |
+// Blueprint: | `NativeOAuthFlow+Slack.swift` | `saveSlackToken` verifies via `SlackWebAPI`; SlackCredentials owns revision-checked publication |
 
 extension NativeOAuthFlow {
-    /// Store a Slack OAuth token that the user already generated in Slack's app
-    /// console. Slack's app UI exposes a Bot User OAuth Token after install, so
-    /// this path validates that token with auth.test and persists it directly
-    /// instead of forcing the generic browser OAuth wizard.
+    /// Slack exposes a generated bot token after installation; validate it with auth.test before saving.
     public static func saveSlackToken(
         _ rawToken: String,
         appToken rawAppToken: String? = nil,
@@ -46,7 +43,10 @@ extension NativeOAuthFlow {
         let users = allowedUserIds ?? []
         guard !channels.isEmpty || !users.isEmpty else {
             return OAuthFlowResult(ok: false,
-                error: "Add at least one allowed Slack channel or user before saving. NativeAgent will not create an inbound connector with an empty allowlist.")
+                error: """
+                    Add at least one allowed Slack channel or user before saving. NativeAgent will not create an inbound connector with an empty \
+                    allowlist.
+                    """)
         }
 
         let authFields: [String: String]
@@ -61,8 +61,7 @@ extension NativeOAuthFlow {
         let now = NativeTimestampFormat.basicZulu(Date())
         let connectorPath = TransportAllowlist.slackMetadataPath(dataRoot: root)
 
-        // Stage an immutable, verified grant before a durable save intent.
-        // Startup finishes that exact intent before admitting the connection.
+        // Stage an immutable, verified grant before a durable save intent. Startup finishes that exact intent before admitting the connection.
         do {
             try SlackCredentials.recoverPendingSave(dataRoot: root)
             _ = try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
@@ -75,8 +74,7 @@ extension NativeOAuthFlow {
                             throw PersistenceCoreError.ioFailure("Slack credentials changed while saving. The token was not saved.")
                         }
                         let policy = try TransportAllowlist.slackPolicy(dataRoot: root)
-                        // Publish only the current schema, not a copy of any
-                        // obsolete policy keys a prior document may contain.
+                        // Publish exactly the current schema; unrelated document keys cannot enter auth metadata.
                         var connector: [String: JSONValue] = [:]
                         let savedAppToken = appToken.isEmpty
                             ? try SlackCredentials.read(.app, dataRoot: root, allowMissingGrant: !providedToken.isEmpty)
@@ -132,8 +130,7 @@ extension NativeOAuthFlow {
         return token.count > 20 && token.range(of: #"\s"#, options: .regularExpression) == nil
     }
 
-    /// Caller holds registry and connector locks. The registry epoch
-    /// also detects revocation when there were no credential files to remove.
+    /// Caller holds registry and connector locks. The registry epoch also detects revocation when there were no credential files to remove.
     private static func slackSaveRevision(dataRoot: URL) throws -> [JSONValue] {
         let registry = try ConnectorOAuthRegistry.readRegistry(at: ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot))
         let row = registry.first {

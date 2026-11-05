@@ -9,22 +9,19 @@ import PersonaEngine
 import PersistenceCore
 import MemoryV2
 
-// Blueprint: | `NativeCognitionRuntime+Notify.swift` | `NativeCognitionRuntime.innerStateReading`: one reading across mind/body owners, pending stake-bearing expectations and rhythm's standing claims with certainty in words |
+// Blueprint: | `NativeCognitionRuntime+Notify.swift` | `NativeCognitionRuntime.innerStateReading`. |
 
-// The runtime reads substrate and organism together for one inner-state answer.
+// Read substrate and organism together for one inner-state answer.
 
 extension NativeCognitionRuntime: InnerStateProviding {
 
-    /// PURE. Every read below is a non-mutating peek: the substrate's own
-    /// inner-state projection, and the organism's `frozenRead`, which decays a
-    /// COPY at a fixed instant and never settles or rewrites the live kernel.
-    /// Asking herself how she feels must not change how she feels (design law 5).
+    /// Inner-state reads must not change feelings: peek substrate state and decay only a frozen body copy, never settle the live kernel.
     public func innerStateReading(
         windowHours: Double,
         detail: CognitiveInnerStateReading.Detail,
         surface: String = "chat"
     ) async -> CognitiveInnerStateReading {
-        // A read never bootstraps; it only waits for a bootstrap the owner has started.
+        // A read may await an existing bootstrap but cannot start one.
         guard let bootstrapTask else {
             return .unavailable(at: now(), windowHours: windowHours, detail: detail)
         }
@@ -34,20 +31,17 @@ extension NativeCognitionRuntime: InnerStateProviding {
         }
         let at = now()
         let frozen = await organismKernel.frozenRead(at: at)
-        // A disabled organism reports absence, never fabricated zeroes.
+        // Disabled body state is absent, never fabricated zeroes.
         let organism = CognitiveInnerStateOrganismReads(
             projection: frozen.snapshot.enabled ? frozen.projection : nil,
             fatigue: frozen.snapshot.enabled ? frozen.snapshot.chemicalState.fatigue : nil,
-            // `frozen.projection.diurnal` is the read the projection ACTUALLY
-            // applied at this instant, not a fresh clock sample — so the word
-            // she reads and the chemistry she is running on came from the same
-            // moment.
+            // Use the diurnal value the frozen projection actually applied so words and chemistry describe the same instant.
             diurnal: frozen.snapshot.enabled ? frozen.projection.diurnal : nil,
             toward: frozen.toward,
             expectations: await pendingStakeBearingExpectations(at: at),
-            personDayTitle: HerScreen.names(dataRoot).person + "'s day, as I know it",
+            personDayTitle: AgentScreen.names(dataRoot).person + "'s day, as I know it",
             personDay: rhythm.value?.claims.map {
-                $0.words(person: HerScreen.names(dataRoot).person, day: at)
+                $0.words(person: AgentScreen.names(dataRoot).person, day: at)
                     + ($0.confidence >= 0.7 ? " Sure." : " Fairly sure.")
             } ?? []
         )
@@ -60,7 +54,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
         )
     }
 
-    /// Read only person- or promise-bearing expectations, without settling the ledger.
+    /// Read only person- or promise-bearing expectations without settling the ledger.
     private func pendingStakeBearingExpectations(
         at instant: Date
     ) async -> [CognitiveInnerStateReading.Expectation] {
@@ -74,13 +68,10 @@ extension NativeCognitionRuntime: InnerStateProviding {
                   prediction.dueAt >= instant
             else { continue }
             out.append(CognitiveInnerStateReading.Expectation(
-                // Use the substrate's human label, never the case name.
+                // Use the substrate's human label rather than the enum case name.
                 label: kind.humanLabel,
                 due: prediction.dueAt,
-                // The SIGN only, never the magnitude: a confident expectation is
-                // something she is looking forward to, a low-confidence one is
-                // something she is bracing for. Same split
-                // `OrganismProspectiveAffect` uses to modulate the projection.
+                // Use valence sign alone to distinguish anticipation from bracing, matching prospective-affect modulation.
                 valenceSign: prediction.confidence >= 0.5 ? 1 : -1
             ))
         }

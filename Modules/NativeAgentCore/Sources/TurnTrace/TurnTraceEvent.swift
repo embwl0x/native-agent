@@ -4,32 +4,28 @@ import os
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TurnTraceEvent.swift` | Canonical event schema, terminal kind/status vocabulary, envelope and payload bounds; model-call receipts retain the shared ledger byte budget |
+// Blueprint: | `TurnTraceEvent.swift` | Canonical events; bounded envelopes retain receipt evidence |
 
-/// A turn event delivered by TurnTraceBus.deliver or deliverDurably.
-/// Callers must pre-redact payloads: no raw prompt/completion bodies or bot tokens.
+/// A turn event delivered by TurnTraceBus.deliver or deliverDurably. Callers must pre-redact payloads: no raw prompt/completion bodies or bot tokens.
 public struct TurnTraceEvent: Sendable, Equatable {
     public enum TerminalState: String, Sendable, Codable {
         case completed, stopped, interrupted, waiting, failed
     }
     /// Per-string payload cap, except for model-call receipts.
     public static let maxPayloadStringChars = 2000
-    /// Serialized row ceiling includes the envelope. Model-call receipts use
-    /// traceMaximumBytes to preserve cache-prefix evidence.
+    /// Serialized row ceiling includes the envelope. Model-call receipts use traceMaximumBytes to preserve cache-prefix evidence.
     public static let maxPayloadBytes = 12 * 1024
-    // Keep hostile envelope metadata from consuming the space reserved for
-    // the frozen context.snapshot scalar manifest.
+    // Keep hostile envelope metadata from consuming the space reserved for the frozen context.snapshot scalar manifest.
     private static let maxEnvelopeFieldUTF8Bytes = 480
     private static let maxEnvelopeFieldJSONBytes = 512
     private static let oversizedPreviewBytes = 6 * 1024
 
-    /// Whose words steered the turn in flight, when they are not the owner's.
-    /// Installed by the engine over the turn's own taint.
-    public static var steer: @Sendable () -> String? {
+    /// The engine projects steering from the supplied turn; never from the emitting task.
+    public static var steer: @Sendable (Turn) -> String? {
         get { steerHook.withLock { $0 } }
         set { steerHook.withLock { $0 = newValue } }
     }
-    private static let steerHook = OSAllocatedUnfairLock<@Sendable () -> String?>(initialState: { nil })
+    private static let steerHook = OSAllocatedUnfairLock<@Sendable (Turn) -> String?>(initialState: { _ in nil })
 
     public let turnId: String
     public let ts: Date
@@ -38,28 +34,26 @@ public struct TurnTraceEvent: Sendable, Equatable {
     public static func isTerminalKind(_ kind: String) -> Bool { terminalKinds.contains(kind) }
     public let sessionId: String?
     public let surface: String?
-    /// The conversation this turn answers into. Defaulted from
-    /// `TurnTraceContext` — the turn's own reply route — so no emission point
-    /// has to pass it, and captured HERE (on the turn's task) rather than at
-    /// serialization time, which happens on a detached persist lane that does
-    /// not inherit task-locals.
+    /// Captured from the held turn's envelope, or trace correlation for an emitter without a turn.
     public let destinationId: String?
     public let threadId: String?
-    /// Callers redact content; turn payloads are bounded, standalone receipts
-    /// retain their content under the shared feed's retention budget.
+    /// Callers redact content; turn payloads are bounded, standalone receipts retain their content under the shared feed's retention budget.
     public let payload: JSONValue
     internal var diagnostic: [String: JSONValue] = [:]
 
-    /// Standalone receipts keep their envelope; bound turns store receipt metadata
-    /// beside their canonical event.
+    /// Standalone receipts keep their envelope; bound turns store receipt metadata beside their canonical event.
+    /// Supply the turn being served, or explicit nil for a receipt with no held turn.
     public init(
         kind: String, title: String, status: String, payload: JSONValue,
         id: String = UUID().uuidString.lowercased(), createdAt: String, ts: Date = Date(),
-        turnId: String? = nil, sessionId: String? = LLMCallContext.sessionId,
-        surface: String? = LLMCallContext.surface
+        turnId: String? = nil, sessionId: String? = nil,
+        surface: String? = nil, turn: Turn?
     ) {
+        let turnId = turnId ?? turn?.id
+        let sessionId = sessionId ?? turn?.session
         if let turnId, turnId != "unknown" {
-            self.init(turnId: turnId, ts: ts, kind: kind, sessionId: sessionId, surface: surface, payload: payload)
+            self.init(turnId: turnId, ts: ts, kind: kind, sessionId: sessionId, surface: surface,
+                payload: payload, turn: turn)
         } else {
             self.init(canonicalTurnId: "unknown", ts: ts, canonicalKind: kind,
                 canonicalSessionId: sessionId, canonicalSurface: surface,
@@ -69,30 +63,40 @@ public struct TurnTraceEvent: Sendable, Equatable {
                       "status": .string(status), "createdAt": .string(createdAt)]
     }
 
+    /// Live emitters supply their held turn; reconstruction explicitly supplies nil and keeps the recorded payload.
     public init(
         turnId: String,
         ts: Date = Date(),
         kind: String,
         sessionId: String? = nil,
         surface: String? = nil,
-        destinationId: String? = nil,
-        threadId: String? = nil,
-        payload: JSONValue = .object([:])
+        destinationId: String? = TurnTraceContext.destinationId,
+        threadId: String? = TurnTraceContext.threadId,
+        payload: JSONValue = .object([:]),
+        turn: Turn?
     ) {
         let boundedTurnID = Self.boundEnvelopeString(turnId)
         let boundedKind = Self.boundEnvelopeString(kind)
         let boundedSessionID = sessionId.map(Self.boundEnvelopeString)
         let boundedSurface = surface.map(Self.boundEnvelopeString)
-        let boundedDestination = (destinationId ?? TurnTraceContext.destinationId)
-            .map(Self.boundEnvelopeString)
-        let boundedThread = (threadId ?? TurnTraceContext.threadId)
-            .map(Self.boundEnvelopeString)
-        // A turn's end names the part whose run started it (its end must not
-        // wake that part) and whose words steered it, read on the turn's own task.
+        let destination: String?
+        let thread: String?
+        if let turn {
+            let route = turn.traceReplyRoute?(turn)
+            destination = route?.destinationId
+            thread = route?.threadId
+        } else {
+            // Explicit recorded fields (including nil) stay recorded; omitted fields capture trace correlation here.
+            destination = destinationId
+            thread = threadId
+        }
+        let boundedDestination = destination.map(Self.boundEnvelopeString)
+        let boundedThread = thread.map(Self.boundEnvelopeString)
+        // A terminal emitter hands over the turn before detached persistence; replaying a saved row adds no current provenance.
         var payload = payload
-        if Self.isTerminalKind(boundedKind), case .object(var fields) = payload {
-            if let part = SkillRunContext.partID { fields["part"] = .string(part) }
-            if let steer = Self.steer() { fields["steered_by"] = .string(steer) }
+        if let turn, turn.id == turnId, Self.isTerminalKind(boundedKind), case .object(var fields) = payload {
+            if let part = turn.partID { fields["part"] = .string(part) }
+            if let steer = Self.steer(turn) { fields["steered_by"] = .string(steer) }
             payload = .object(fields)
         }
         self.turnId = boundedTurnID
@@ -134,11 +138,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
         self.payload = boundedPayload
     }
 
-    /// Bound turn-event string leaves, then enforce the serialized row ceiling.
-    /// Model-call telemetry uses its larger byte budget without the string-leaf cap.
-    /// Oversized payloads retain stable lifecycle fields plus a bounded JSON
-    /// preview, original byte count, and digest so truncation remains explicit
-    /// without making the per-day ledger unbounded.
+    /// Bound row size while retaining lifecycle fields, an explicit clipped preview, original byte count and digest. Model-call telemetry needs its larger byte
+    /// budget to preserve evidence.
     static func boundPayload(
         _ value: JSONValue,
         turnId: String,
@@ -179,8 +180,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
             ),
         ]
         if case .object(let object) = leafBound {
-            // Canonical model-call receipts retain every scalar measurement
-            // when larger structured metadata forces preview summarization.
+            // Canonical model-call receipts retain every scalar measurement when larger structured metadata forces preview summarization.
             if kind == "llm.call" {
                 for (key, field) in object {
                     switch field {
@@ -194,11 +194,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "milestone", "provider", "model", "resultClass",
                 "durationMs", "elapsedMs", "inputTokens", "outputTokens",
                 "argKeys", "shown", "receipt", "parentId", "automaticOrigin", "cacheMarkers",
-                // Context snapshots can include bounded previews that are
-                // intentionally much larger than one trace row. Keep their
-                // scalar integrity facts when that preview is summarized so
-                // the canonical row stays queryable rather than leaving a
-                // JSON fragment whose surviving keys depend on sort order.
+                // Preserve context scalar integrity facts when large previews are summarized so rows stay queryable despite sorted-key truncation.
                 "containsCognitiveSubstrate", "cognitiveCapsuleBytes", "cognitiveCue",
                 "toolSchemaCount", "toolSchemaParameterBytes",
                 "toolSchemaMaterialBytes", "toolSchemaFingerprintSHA256",
@@ -207,8 +203,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "stableBytes", "dynamicBytes", "userMessageBytes",
                 "userBlockBytes", "preparationMs",
                 "promptTextBytes", "imagePayloadBytes", "segmented",
-                // Preserve the composer's component measurements and bounded
-                // memoryRecall object when snapshot previews are summarized.
+                // Preserve the composer's component measurements and bounded memoryRecall object when snapshot previews are summarized.
                 "historyMessageBytes", "historyMessageCount",
                 "volatileBlockBytes", "personaSourceBytes", "memoryRecall",
                 "toolCatalogSystemBytes", "toolCatalogBriefBytes", "toolCatalogMeasurementError",
@@ -242,9 +237,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
             previewBytes = max(0, previewBytes - max(256, rowBytes - byteLimit + 64))
         }
 
-        // Defensive fallback removes optional lifecycle fields only. The
-        // context.snapshot scalar manifest is a persisted contract and may
-        // never be traded away to make room for hostile envelope metadata.
+        // Optional lifecycle fields may yield space; the persisted context scalar manifest must survive hostile envelope metadata.
         summary.removeValue(forKey: "_preview")
         for key in [
             "argKeys", "outputTokens", "inputTokens",
@@ -266,13 +259,11 @@ public struct TurnTraceEvent: Sendable, Equatable {
             }
             summary.removeValue(forKey: key)
         }
-        // With four envelope fields capped at 512 serialized bytes, the fixed
-        // scalar manifest plus integrity fields has a reserved budget well
-        // below 12 KiB. Return it intact; never fall back to integrity-only.
+        // Four 512-byte envelope caps leave the scalar manifest and integrity fields below 12 KiB; preserve that reserved evidence intact.
         return .object(summary)
     }
 
-    private static func ordinaryEnvelope(
+    static func ordinaryEnvelope(
         payload: JSONValue,
         turnId: String,
         ts: Date,
@@ -298,14 +289,12 @@ public struct TurnTraceEvent: Sendable, Equatable {
     static func boundString(_ s: String) -> String {
         let cap = maxPayloadStringChars
         guard s.count > cap else { return s }
-        // Keep the newest-truncation honest: prefix kept, marker appended.
+        // Keep truncation explicit: preserve a prefix and append its marker.
         let prefix = String(s.prefix(cap))
         return prefix + "…[+\(s.count - cap) chars]"
     }
 
-    /// Envelope fields are bounded by UTF-8 bytes, then checked in their JSON
-    /// string representation. Character-count caps are not byte caps (`🧠` is
-    /// one Character and four bytes), and JSON escaping can add bytes again.
+    /// Cap serialized UTF-8 bytes: grapheme counts miss multibyte content and JSON escaping adds further bytes.
     private static func boundEnvelopeString(_ value: String) -> String {
         let source = Data(value.utf8)
         if source.count <= maxEnvelopeFieldUTF8Bytes,
@@ -333,17 +322,12 @@ public struct TurnTraceEvent: Sendable, Equatable {
         return "…[+\(source.count) bytes]"
     }
 
-    /// Decode and re-bound a persisted row through the construction path.
-    /// Malformed fields or timestamps return nil; replay reports skipped rows.
+    /// Decode and re-bound a persisted row through the construction path. Malformed fields or timestamps return nil; replay reports skipped rows.
     public init?(jsonRow value: JSONValue) {
         self.init(persistedJSONRow: value, physicalByteCount: 0)
     }
 
-    /// Decode a physical persisted row without repeating the expensive payload
-    /// serialization proof that the writer already completed. The fast path is
-    /// admitted only when the physical row is within the canonical byte cap,
-    /// every envelope field is already canonical, and no payload string leaf
-    /// needs clipping. Other rows use the defensive construction path.
+    /// Reuse the writer's size proof only for physically bounded rows with canonical envelopes and unclipped leaves; otherwise reapply construction.
     public init?(persistedJSONRow value: JSONValue, physicalByteCount: Int) {
         guard case .object(let obj) = value,
               case .string(let turnId)? = obj["turnId"],
@@ -401,7 +385,8 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 surface: surface,
                 destinationId: destinationId,
                 threadId: threadId,
-                payload: payload
+                payload: payload,
+                turn: nil
             )
         }
         diagnostic = obj.filter { ["id", "title", "status", "createdAt", "transitionId"].contains($0.key) }
@@ -420,17 +405,15 @@ public struct TurnTraceEvent: Sendable, Equatable {
         }
     }
 
-    /// Parse fractional or plain ISO8601 seconds from persisted timestamps.
     public static func parseISO8601(_ s: String) -> Date? {
         if let d = try? fractionalISO8601.parse(s) { return d }
         return try? Date.ISO8601FormatStyle().parse(s)
     }
 
-    /// Shared Sendable format for row writes and repeated summary reads.
+    /// Share Sendable timestamp formatting across writes and repeated summary reads.
     static let fractionalISO8601 = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
 
-    /// Turn rows use fractional timestamps for chronological replay;
-    /// standalone diagnostics preserve their six-field receipt envelope.
+    /// Turn rows use fractional timestamps for chronological replay; standalone diagnostics preserve their six-field receipt envelope.
     public var jsonRow: JSONValue {
         if turnId == "unknown", !diagnostic.isEmpty {
             return .object(diagnostic.merging(["kind": .string(kind), "payload": payload]) { _, current in current })

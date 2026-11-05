@@ -4,7 +4,7 @@ import PersistenceCore
 import ProviderRouting
 import BackgroundLoops
 import TelegramBot
-// Blueprint: | `EngineTelegram+Commands.swift` | Telegram configuration and mobile commands; Telegram token admission, settings and delivery commands, typed diagnostic-clear receipt; diagnostic state edits delegate to TelegramPollLoop.mutateState |
+// Blueprint: | `EngineTelegram+Commands.swift` | Checked token/configuration mutations and diagnostic receipts |
 
 public struct TelegramDiagnosticsClearReceipt: Equatable, Sendable {
     public let clearedAt: String
@@ -14,9 +14,7 @@ public struct TelegramDiagnosticsClearReceipt: Equatable, Sendable {
 }
 
 extension TelegramFacade {
-    /// A Telegram token is a numeric bot identifier followed by an opaque,
-    /// URL-safe secret.  This is intentionally local syntax validation only:
-    /// Telegram remains the authority that can prove a credential works.
+    /// Local token syntax cannot prove credentials work; Telegram remains authoritative.
     public nonisolated static func tokenValidationMessage(for draft: String) -> String? {
         let token = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { return nil }
@@ -44,9 +42,7 @@ extension TelegramFacade {
         clearToken: Bool = false,
         restartPollLoop: (@Sendable () async -> Void)? = nil
     ) async throws {
-        // If `token` arrives empty (UI cleared after a successful save), keep
-        // the existing on-disk token so the IDs the user just edited don't
-        // wipe out the stored token. Clear is still explicit via clearToken.
+        // Empty UI token fields preserve saved credentials while ids are edited; only explicit clear removes them.
         let root = dataRoot
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let snapshot = try CredentialFileLock.withLock(root.appendingPathComponent("telegram/config.json")) {
@@ -63,9 +59,7 @@ extension TelegramFacade {
             allowedUserIds,
             invalid: TelegramConfigurationError.invalidAllowedUserID
         )
-        // A saved-disabled token round-trips without being resolved before the
-        // routing await. Clear and missing credentials force enabled=false;
-        // otherwise the caller's explicit `enabled` arg wins.
+        // Preserve saved-disabled credentials without resolving them; clear or missing tokens force disabled, otherwise respect explicit enabled state.
         let effectiveEnabled = !clearToken && (!effectiveToken.isEmpty || existing?.tokenConfigured == true) && enabled
         guard !effectiveEnabled || !chatIds.isEmpty || !userIds.isEmpty else {
             throw TelegramConfigurationError.destinationRequired
@@ -75,7 +69,7 @@ extension TelegramFacade {
         if !trimmedModel.isEmpty || !trimmedEffort.isEmpty {
             var body: [String: JSONValue] = ["surface": .string("telegram")]
             if !trimmedModel.isEmpty {
-                // S12a: the model only; Telegram keeps its chosen route.
+                // Change only the model so Telegram retains its chosen route.
                 body["model"] = .string(trimmedModel)
             }
             if !trimmedEffort.isEmpty {
@@ -103,12 +97,13 @@ extension TelegramFacade {
         if let restartPollLoop { await restartPollLoop() }
     }
 
-    /// One owner-requested read, with no command dispatch or sender admission.
+    /// Explicit diagnostic reads must not dispatch commands or admit senders.
     public nonisolated func discoverTelegramSenders(token: String) async throws -> Int {
         let root = dataRoot
         let saved = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: root)
         guard saved?.enabled != true else {
-            throw TelegramConfigurationError.persistenceFailed("Turn Telegram off and save before checking senders; the active poller already records blocked senders.")
+            throw TelegramConfigurationError.persistenceFailed(
+                "Turn Telegram off and save before checking senders; the active poller already records blocked senders.")
         }
         let typed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let effective = typed.isEmpty ? (saved?.botToken ?? "") : typed
@@ -160,7 +155,6 @@ extension TelegramFacade {
             try await recordTelegramTestStatus(root: root, error: reason)
             throw TelegramBotError.underlying(reason)
         }
-        // The module reads the saved config and calls Telegram directly.
         let impl = SwiftNativeTelegramBot(dataRoot: root)
         let result: TelegramTestResult
         do {
@@ -182,9 +176,7 @@ extension TelegramFacade {
     }
 
     public nonisolated func clearTelegramDiagnostics(manager: BackgroundLoopLifetimes) async throws -> TelegramDiagnosticsClearReceipt {
-        // SwiftNative clear + refreshed status. Take the receipt count before
-        // deletion, so the UI can distinguish a completed no-op from a clear
-        // that removed diagnostic evidence.
+        // Count receipts before deletion so a completed no-op remains distinguishable from removed diagnostic evidence.
         let root = dataRoot
         let before = try Self.telegramDiagnosticsEvidence(in: root)
         let impl = SwiftNativeTelegramBot(
@@ -245,7 +237,7 @@ extension TelegramFacade {
         let root = dataRoot
         try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/config.json")) {
             let existing = try TelegramConfig.loadSavedConfiguration(dataRoot: root, resolveCredential: false)
-            // Validate readback before replacing config, including on disconnect.
+            // Validate readback before replacing config, even on disconnect.
             _ = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
             try TelegramConfig.saveToDisk(TelegramConfig(
                 botToken: "",
@@ -272,8 +264,7 @@ extension TelegramFacade {
         let url = root.appendingPathComponent("telegram/config.json")
         return try await SwiftNativePersistenceCore.withFileLock(url) {
             let observedAt = Date().timeIntervalSince1970
-            // Validate before projecting current metadata or a disconnected state,
-            // so malformed settings never appear as saved defaults.
+            // Validate before publishing metadata so malformed settings cannot appear as saved defaults.
             try TelegramConfig.validateMobileConfiguration(at: root)
             let routing = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
             let status = try await TelegramFacade(dataRoot: root).loadStatus(

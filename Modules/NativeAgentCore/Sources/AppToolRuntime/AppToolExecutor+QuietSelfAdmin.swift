@@ -3,6 +3,7 @@ import ChatToolRuntime
 import ChatToolParsing
 import ChatSessionWork
 import Dispatcher
+import Desk
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -10,16 +11,11 @@ import PersistenceCore
 import ProviderRouting
 import Privacy
 import TrustCenter
-// Blueprint: | `AppToolExecutor+QuietSelfAdmin.swift` | `AppToolExecutor`: `performMacSelfAppRoute` propagates self-window look outcomes, carrying `behind` (the person's app behind their own window) onto the read; only independently verified navigation retains its success with a supplementary observation; `quietPosture`, `freshQuietPosture` |
+// Blueprint: | `AppToolExecutor+QuietSelfAdmin.swift` | `AppToolExecutor`, `performMacSelfAppRoute`, `behind`, `quietPosture`, `freshQuietPosture`; posture |
 
-/// The `app` door's posture, page read and setting set.
-///
-/// Core owns admission, catalog reads and receipts. The mounted window,
-/// page rendering and visible controls remain behind the presentation ports.
+/// Core owns admission, catalog reads and receipts; mounted rendering and controls stay behind presentation ports.
 extension AppToolExecutor {
-    /// Consume the self-window handoff inside the original tool call, through
-    /// the `app` door's own read or action (and its posture checks), as a
-    /// direct `app` call runs them (`runSelfAppRoute`).
+    /// Finish self-window handoffs inside the originating gated call through the same app-door checks as direct calls.
     public static func performMacSelfAppRoute(
         _ result: JSONValue,
         run: ([String: JSONValue]) async -> JSONValue
@@ -45,28 +41,16 @@ extension AppToolExecutor {
         }
         guard case .object(var response) = outcome else { return outcome }
         response["ok"] = .bool(response["status"] == .string("ok"))
-        // A look at her own app, in front: the read carries who is behind her.
+        // Self-window look retains the app behind it so observation does not lose the user's context.
         if case .string(let behind)? = detail["behind"] { response["behind"] = .string(behind) }
         return .object(response)
     }
 
     // MARK: - Posture
 
-    /// Safe, Work mode, Builder, Full Mac — read back off the saved policy.
-    ///
-    /// `permissionLevel` alone cannot tell Work from Builder: the two presets
-    /// write the SAME level ("balanced") and differ by how files outside the
-    /// workspace are treated ("deny" vs "ask"), so that is the axis that
-    /// decides through the shared preset plan.
-    ///
-    /// `changesAllowed` is about THIS APP's own settings, not about the Mac.
-    /// The agent administers the app under every posture but Safe: a knowledge
-    /// graph switch or a thinking level is not a Mac effect, not a file the
-    /// person owns, and not a send. Work mode's fence is where files may be
-    /// written, and it still stands — it was never a fence around the app's own
-    /// controls. This helper governs setting edits through `ownerOnly` and
-    /// `fullMacOnly`. Permission acquisition and setup follow the canonical
-    /// authority law in docs/TOOL_LOADING.md#authority-and-receipts.
+    /// Work and Builder share balanced permissionLevel; outside-workspace writes (deny/ask) distinguish them.
+    /// App settings admission uses ownerOnly/fullMacOnly independently of Mac effects and workspace fences.
+    /// Permission acquisition follows docs/TOOL_LOADING.md#authority-and-receipts.
     public struct QuietPosture: Sendable {
         public let name: String
         let changesAllowed: Bool
@@ -75,9 +59,7 @@ extension AppToolExecutor {
     /// One Full Mac name keeps catalog writability and write refusals aligned.
     public static let fullMacModeName = "Full Mac"
 
-    /// The saved posture, as `PermissionLaw.posture` reads it for every gate,
-    /// named for the person. Work with outside-workspace writes on ask is
-    /// the Builder preset.
+    /// Name the saved PermissionLaw posture; Work with outside-workspace writes on ask is Builder.
     public static func quietPosture(_ policy: [String: JSONValue]) -> QuietPosture {
         switch PermissionLaw.posture(policy) {
         case .fullMac: return QuietPosture(name: fullMacModeName, changesAllowed: true)
@@ -88,14 +70,7 @@ extension AppToolExecutor {
         }
     }
 
-    /// The posture as saved RIGHT NOW, read through the same checked authority
-    /// seam the security gates use (`loadTrustPolicyChecked`).
-    ///
-    /// `appModel.engine.trust.policy` is a cached projection that a page refreshes when
-    /// it feels like it, and a permissively decoded one: a policy saved as Work
-    /// mode in another window kept authorizing writes here until something
-    /// happened to reload it. Damaged or unreadable authority throws, and a
-    /// throw is a refusal.
+    /// Read checked saved authority at the gate boundary; cached UI projections cannot authorize writes. Unreadable authority refuses.
     public static func freshQuietPosture(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> QuietPosture? {
@@ -104,12 +79,7 @@ extension AppToolExecutor {
         return quietPosture(policy)
     }
 
-    /// Full Mac as ONE locked authority generation spells it.
-    ///
-    /// `freshQuietPosture` answers for the moment it is called; a write that
-    /// carries Full Mac authority re-asks this question inside the transaction
-    /// that writes, against the generation it is merging into
-    /// (`applyPolicyPatchChecked(_:guardedByLockedPolicy:)`).
+    /// Authority-bearing writes recheck Full Mac inside the transaction against the exact locked generation they merge into.
     public static func lockedPolicyIsFullMac(_ policy: [String: JSONValue]) -> Bool {
         PermissionLaw.posture(policy) == .fullMac
     }
@@ -123,8 +93,7 @@ extension AppToolExecutor {
         )
     }
 
-    /// The posture gate setting.set stands behind, for the app's other
-    /// writes (Doctor repair, upkeep). Nil when changes are allowed.
+    /// Other app writes share setting.set's posture gate; nil means changes are allowed.
     static func readOnlyFailure(_ posture: QuietPosture) -> JSONValue {
         failure(
             "trust_mode_read_only",
@@ -167,31 +136,24 @@ extension AppToolExecutor {
 
     // MARK: - Chat
 
-    /// User, 10-02: no rule is only for when he is at the Mac, and under Full
-    /// Mac all of it is hers. Below Full Mac, a turn User started himself from
-    /// any door (no out-of-band origin, no agent lane; Mac chat, his paired
-    /// phone, or Telegram or Slack from a sender allowlisted by user id) may
-    /// move his screen, speak, and touch a conversation he is in. Any other
-    /// turn leaves all of that alone.
-    static func reachesUser(surface: String, fullMac: Bool, dataRoot: URL) async throws -> Bool {
+    /// Full Mac permits user effects. Below it, only verified user-started turns may move their screen, speak or touch their conversation.
+    static func reachesUser(surface: String, fullMac: Bool, dataRoot: URL, turn: Turn) async throws -> Bool {
         if fullMac { return true }
-        let envelope = TurnEnvelope.current(surface: surface)
+        let envelope = TurnEnvelope.current(turn: turn, surface: surface)
         let door = envelope.surface.lowercased()
-        var user = ChatPersistenceContext.originProvenance == nil && envelope.agent == nil
-            && ["chat", "app", "mac", "ios", "telegram", "slack"].contains(door)
+        var user = turn.origin == nil && envelope.agent == nil
+            && MyQueue.Door(rawValue: door) != nil
         if user, ["telegram", "slack"].contains(door) {
             user = try await SwiftNativeSecurityCenter(dataRoot: dataRoot).remoteSenderIsAllowlisted(.currentTurn(
-                verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface))
+                turn: turn, surface: surface))
         }
         return user
     }
 
-    /// One chat action (`runFolded`): Safe has already refused it. The
-    /// posture is read again for the receipt; the conversation-level fences
-    /// (User's screen, User is in it, her own conversation) are the app's.
+    /// Chat actions re-read posture for receipts; app-owned screen and conversation fences still apply.
     @MainActor
     func runChatSessionAction(
-        verb: String, input: [String: JSONValue], surface: String, host: any QuietToolHost
+        verb: String, input: [String: JSONValue], surface: String, host: any QuietToolHost, turn: Turn
     ) async -> JSONValue {
         guard let posture = await Self.freshQuietPosture(
             dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -199,9 +161,9 @@ extension AppToolExecutor {
         guard posture.changesAllowed else { return Self.readOnlyFailure(posture) }
         let reachesUser: Bool
         do { reachesUser = try await Self.reachesUser(surface: surface, fullMac: posture.name == Self.fullMacModeName,
-                                               dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()) }
+                                               dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot(), turn: turn) }
         catch { return ChatToolOutcome.failure(error: error, tool: "chat_session", effects: ToolFailureError.Effects.none) }
-        let answer = await host.runChatSession(verb: verb, input: input, reachesUser: reachesUser)
+        let answer = await host.runChatSession(verb: verb, input: input, reachesUser: reachesUser, turn: turn)
         guard case .object(var body) = answer else {
             return Self.doorRefusal("handler_result_missing", "The conversation handler returned no structured result; its effects are unknown.",
                 remedy: "inspect", "Read the conversation's current state before another change.",
@@ -224,10 +186,9 @@ extension AppToolExecutor {
         ]) { _, receipt in receipt })
     }
 
-    /// The `app` door's page read: each setting row also carries its type,
-    /// choices and note, so the read is all `setting.set` needs.
+    /// Setting rows carry types, choices and notes so page reads supply the complete setting.set contract.
     @MainActor
-    func runAppPageRead(input: [String: JSONValue]) async -> JSONValue {
+    func runAppPageRead(input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let requested = Self.text(input["page"])
         if requested.lowercased() == "context" { return await presentation.contextReceiptRead(input: input) }
         if requested.lowercased() == "agent_view" { return await presentation.agentViewRead(input: input) }
@@ -242,7 +203,7 @@ extension AppToolExecutor {
         }
         guard let appModel = quietHost() else { return Self.unattachedFailure() }
 
-        let content = await appModel.pageRead(page)
+        let content = await appModel.pageRead(page, turn: turn)
         let posture = await Self.freshQuietPosture()
         let fullMac = posture?.name == Self.fullMacModeName
         var settingRows: [JSONValue] = []
@@ -274,7 +235,7 @@ extension AppToolExecutor {
             "title": .string(page.title),
             "about": .string(page.summary),
             "settings": .array(settingRows),
-            // What the page SAYS, built from the records the page draws from.
+            // Build text from the same records the page draws.
             "content": .array(content),
             "trust_mode": .string(posture?.name ?? "unreadable"),
             "changes_allowed": .bool(posture?.changesAllowed ?? false),
@@ -283,21 +244,19 @@ extension AppToolExecutor {
 
     // MARK: - Setting set
 
-    /// A set every check before the row's own rule has let through.
     private struct GatedSetting {
         let setting: QuietSetting
         let host: any QuietToolHost
-        let posture: QuietPosture
+        let posture: QuietPosture?
         let value: JSONValue
         let request: String?
         let restoresPrevious: Bool
-        let write: @MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void
+        let write: @MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void
     }
 
-    /// The setting, the posture and its rows' fences (owner-only, Safe,
-    /// Full-Mac-only), and that there is a value to write.
+    /// Resolve settings, posture, row fences and value before mutation.
     @MainActor
-    private func settingGate(input: [String: JSONValue]) async -> Result<GatedSetting, GateRefusal> {
+    private func settingGate(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> Result<GatedSetting, GateRefusal> {
         func refuse(_ answer: JSONValue) -> Result<GatedSetting, GateRefusal> { .failure(GateRefusal(answer: answer)) }
         let requestedPage = Self.text(input["page"])
         let requestedSetting = Self.text(input["setting"])
@@ -338,8 +297,7 @@ extension AppToolExecutor {
         do { currentValue = try await setting.read(appModel) }
         catch { return refuse(Self.settingReadFailure(error, setting: setting)) }
 
-        // The person's own posture. Refused for what it IS, not for the mode
-        // the session is in — this one does not open up under Full Mac.
+        // User-owned posture controls remain user-only regardless of session mode or Full Mac.
         if setting.ownerOnly {
             return refuse(Self.failure(
                 "owner_only",
@@ -356,20 +314,19 @@ extension AppToolExecutor {
 
         var request: String?
         var restoresPrevious = false
-        if case .object(let receipt) = Self.undoReceipt {
+        if case .object(let receipt) = execution.undoReceipt {
             guard receipt["setting"] == .string(setting.id), receipt["old_value"] == input["value"],
                   receipt["new_value"] == currentValue else {
                 return refuse(Self.failure("stale_setting", "The setting changed after that receipt. Read its page again. Nothing was written."))
             }
             request = Self.text(receipt["user_request"])
             restoresPrevious = true
-        } else if ChatTurnRuntimeContext.current != nil,
+        } else if !setting.mindOwned, turn.runtime != nil,
                   await Self.freshQuietPosture()?.name != Self.fullMacModeName {
-            // Under Full Mac her own dials are hers (owner-only rows refused above);
-            // below it a change needs the person's words.
+            // Under Full Mac the agent's own dials are its own (owner-only rows refused above); below it a change needs the person's words.
             request = Self.text(input["because"])
             guard let request, request.split(whereSeparator: \.isWhitespace).count >= 3,
-                  let restores = await ChatToolSessionContext.settingRequestEvidence?(setting.id, input["value"] ?? .null, currentValue, request) else {
+                  let restores = await turn.settingRequestEvidence?(setting.id, input["value"] ?? .null, currentValue, request) else {
                 return refuse(Self.failure("setting_not_requested",
                     "No one asked to change \(setting.id); quote the request in because. Nothing changed.",
                     extra: ["setting": .string(setting.id), "effects": .string("none"), "changed": .bool(false)]))
@@ -377,15 +334,19 @@ extension AppToolExecutor {
             restoresPrevious = restores
         }
 
-        guard let posture = await Self.freshQuietPosture() else {
-            return refuse(Self.unreadablePostureFailure(extra: [
-                "setting": .string(setting.id),
-                "page": .string(setting.page),
-                "requested_value": input["value"] ?? .null,
-                "current_value": currentValue,
-            ]))
+        var posture: QuietPosture?
+        if !setting.mindOwned {
+            guard let checkedPosture = await Self.freshQuietPosture() else {
+                return refuse(Self.unreadablePostureFailure(extra: [
+                    "setting": .string(setting.id),
+                    "page": .string(setting.page),
+                    "requested_value": input["value"] ?? .null,
+                    "current_value": currentValue,
+                ]))
+            }
+            posture = checkedPosture
         }
-        guard posture.changesAllowed else {
+        if let posture, !posture.changesAllowed {
             return refuse(Self.failure(
                 "trust_mode_read_only",
                 "\(posture.name) is the posture that changes nothing at all — it is the person's "
@@ -399,15 +360,13 @@ extension AppToolExecutor {
                 ]
             ))
         }
-        // Full Mac is wide open, and only there may the agent move the Trust
-        // fence — down, never up. Below it these read and refuse, saying the
-        // one thing that never changes: turning Full Mac ON is the person's.
-        if setting.fullMacOnly, posture.name != Self.fullMacModeName {
+        // Only Full Mac may lower Trust; raising to Full Mac always requires the person.
+        if setting.fullMacOnly, posture?.name != Self.fullMacModeName {
             return refuse(Self.failure(
                 "trust_posture_needs_full_mac",
                 QuietSettings.belowFullMacRefusal,
                 extra: [
-                    "trust_mode": .string(posture.name),
+                    "trust_mode": .string(posture?.name ?? "unreadable"),
                     "setting": .string(setting.id),
                     "page": .string(setting.page),
                     "requested_value": input["value"] ?? .null,
@@ -435,23 +394,19 @@ extension AppToolExecutor {
                 return refuse(await Self.settingWriteFailure(error, setting, requestedValue, host: appModel, detail: ["effects": .string("none")]))
             }
         }
-        return .success(GatedSetting(setting: setting, host: appModel, posture: posture, value: requestedValue, request: request, restoresPrevious: restoresPrevious, write: write))
+        return .success(GatedSetting(setting: setting, host: appModel, posture: posture, value: requestedValue, request: request,
+            restoresPrevious: restoresPrevious, write: write))
     }
 
-    /// Every check that refuses a set before anything is written, the row's
-    /// own value rule (`QuietSetting.check`: lower-only, narrow-only) last.
-    /// Reads only, so the door's preview asks it and refuses what the set
-    /// would; the set meets the same row rule again inside its write.
+    /// Preview shares every pre-write check; each write rechecks its lower/narrow-only value rule against current state.
     @MainActor
-    func settingRefusal(input: [String: JSONValue]) async -> JSONValue? {
-        switch await settingGate(input: input) {
+    func settingRefusal(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue? {
+        switch await settingGate(input: input, turn: turn, execution: execution) {
         case .failure(let refusal): return refusal.answer
         case .success(let gated):
-            guard let refused = await QuietSettings.$fullMac.withValue(gated.posture.name == Self.fullMacModeName, operation: {
-                await QuietSettings.$restoringPreviousValue.withValue(gated.restoresPrevious) {
-                    await gated.setting.check?(gated.host, gated.value)
-                }
-            }) else { return nil }
+            let admitted = turn.with(\.settingFullMac, gated.posture?.name == Self.fullMacModeName)
+                .with(\.restoresPreviousSetting, gated.restoresPrevious)
+            guard let refused = await gated.setting.check?(gated.host, gated.value, admitted) else { return nil }
             return await Self.settingWriteFailure(refused, gated.setting, gated.value, host: gated.host, detail: ["effects": .string("none")])
         }
     }
@@ -472,8 +427,7 @@ extension AppToolExecutor {
         return failure("read_unavailable", error.localizedDescription, extra: extra)
     }
 
-    /// A write the row refused or that failed, with what was asked and what
-    /// it reads now. A value that would raise Trust is User's: `owners_call`.
+    /// Failed settings writes retain requested/current values; Trust raises below Full Mac remain owners_call.
     @MainActor
     private static func settingWriteFailure(
         _ error: Error, _ setting: QuietSetting, _ requestedValue: JSONValue, host: any QuietToolHost,
@@ -500,10 +454,9 @@ extension AppToolExecutor {
         return failure(code, error.localizedDescription, extra: extra)
     }
 
-    /// One setting's current value, read from the page's own state: the
-    /// inverse of setting.set, with its names and refusals.
+    /// setting.get reads the same page-owned state and names as setting.set.
     @MainActor
-    func runAppSettingGet(input: [String: JSONValue]) async -> JSONValue {
+    func runAppSettingGet(input: [String: JSONValue], turn: Turn) async -> JSONValue {
         let requested = Self.text(input["setting"])
         guard !requested.isEmpty else {
             return Self.failure("missing_setting", "Name the setting. Its page read (app {page}) has the names.")
@@ -520,7 +473,8 @@ extension AppToolExecutor {
                             "setting": .string(setting.id), "page": .string(setting.page), "label": .string(setting.label),
                             "kind": .string(setting.kind.rawValue), "value": try await setting.read(appModel)]
             if setting.kind == .boolean { reply["accepted_values"] = .array([.bool(false), .bool(true)]) }
-            let posture = await Self.freshQuietPosture(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            let posture = setting.mindOwned ? nil
+                : await Self.freshQuietPosture(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             if case .object(let catalog) = try await setting.catalogRow(
                 fullMac: posture?.name == Self.fullMacModeName, host: { self.quietHost() }
             ) {
@@ -528,7 +482,9 @@ extension AppToolExecutor {
                     reply[key] = catalog[key]
                 }
             }
-            if let posture {
+            if setting.mindOwned {
+                reply["writable"] = .bool(setting.writable(fullMac: false))
+            } else if let posture {
                 if !posture.changesAllowed {
                     reply["writable"] = .bool(false)
                     reply["refusal"] = .string("\(posture.name) permits reads only. The person changes this in Trust.")
@@ -537,65 +493,41 @@ extension AppToolExecutor {
                 reply["writable"] = .bool(false)
                 reply["refusal"] = .string("The saved Trust policy is unreadable; no setting change is authorized.")
             }
-            if setting.id == "chat.compaction_percent" {
-                let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                let model: String
-                let provider: String?
-                if let turn = ChatTurnRuntimeContext.current {
-                    model = turn.model
-                    provider = turn.providerID
-                } else {
-                    let route = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
-                        .routeAdmission(for: "chat", choice: nil)
-                    model = route.modelId
-                    provider = route.providerId
-                }
-                reply["context_window"] = .object(try await ChatSessionAutocompactionConfig.productionDefault()
-                    .contextWindowReadout(forModel: model, providerID: provider, dataRoot: root))
-                reply["accepted_range"] = .string("30–95% (whole percentage)")
-            }
             return .object(reply)
         } catch { return Self.settingReadFailure(error, setting: setting) }
         } catch { return Self.settingReadFailure(error, requestedSetting: requested) }
     }
 
     @MainActor
-    func runAppSettingSet(input: [String: JSONValue], surface: String) async -> JSONValue {
+    func runAppSettingSet(input: [String: JSONValue], surface: String, turn: Turn, execution: AppActionExecution) async -> JSONValue {
         let gated: GatedSetting
-        switch await settingGate(input: input) {
+        switch await settingGate(input: input, turn: turn, execution: execution) {
         case .failure(let refusal): return refusal.answer
         case .success(let ready): gated = ready
         }
         let (setting, appModel, posture, requestedValue, write) = (gated.setting, gated.host, gated.posture, gated.value, gated.write)
 
-        // The receipt's "before" is read from the page's own state, immediately
-        // before the write, so it is what the person would have seen.
+        // The receipt's "before" is read from the page's own state, immediately before the write, so it is what the person would have seen.
         let before: JSONValue
         do { before = try await setting.read(appModel) }
         catch { return Self.settingReadFailure(error, setting: setting) }
-        // A raise: the row's own rule refuses it below Full Mac. Under Full
-        // Mac it is hers, and User sees it as a decided row.
+        // Below Full Mac, the row refuses raises; Full Mac permits them with a decided row for the user.
         var raise = false
-        if posture.name == Self.fullMacModeName, case QuietSettingError.users? = await setting.check?(appModel, requestedValue) {
+        if posture?.name == Self.fullMacModeName,
+           case QuietSettingError.users? = await setting.check?(appModel, requestedValue, turn) {
             raise = true
         }
         let writeDetail = QuietWriteDetail()
+        let admitted = turn.with(\.settingFullMac, posture?.name == Self.fullMacModeName)
+            .with(\.restoresPreviousSetting, gated.restoresPrevious)
         do {
-            try await QuietWriteDetail.$current.withValue(writeDetail) {
-                try await QuietSettings.$fullMac.withValue(posture.name == Self.fullMacModeName) {
-                    try await QuietSettings.$restoringPreviousValue.withValue(gated.restoresPrevious) {
-                        if case .object(let receipt) = Self.undoReceipt,
-                           receipt["new_value"] != (try await setting.read(appModel)) {
-                            throw QuietSettingError.unavailable("The setting changed after that receipt. Read its page again. Nothing was written.")
-                        }
-                        try await write(appModel, requestedValue)
-                    }
-                }
+            if case .object(let receipt) = execution.undoReceipt,
+               receipt["new_value"] != (try await setting.read(appModel)) {
+                throw QuietSettingError.unavailable("The setting changed after that receipt. Read its page again. Nothing was written.")
             }
+            try await write(appModel, requestedValue, QuietSettingWrite(turn: admitted, detail: writeDetail))
         } catch {
-            // A write that touches several surfaces says which ones it had
-            // already changed before it failed and rolled them back, so the
-            // receipt cannot quietly under-report its own reach.
+            // Multi-surface failures report every surface already touched so rollback cannot understate actual reach.
             let touched = writeDetail.take()
             return await Self.settingWriteFailure(error, setting, requestedValue, host: appModel, detail: touched)
         }
@@ -607,14 +539,12 @@ extension AppToolExecutor {
                 detail: detail.merging(["effects": .string("unknown")]) { _, new in new })
         }
         if raise {
-            HarnessDecidedRow.post(requester: "Full Mac", tool: "setting.set \(setting.id)",
+            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "setting.set \(setting.id)",
                                    sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         }
 
-        // This IS the receipt. A tool result is what appendToolMessage writes
-        // into the transcript, so page/setting/old/new land in the same trail
-        // every other tool call leaves — no second ledger to disagree with it.
+        // The tool result is the receipt persisted in the transcript; a second ledger would diverge.
         var receipt: [String: JSONValue] = [
             "status": .string("ok"),
             "changed": .bool(before != after),
@@ -623,12 +553,12 @@ extension AppToolExecutor {
             "label": .string(setting.label),
             "old_value": before,
             "new_value": after,
-            "trust_mode": .string(posture.name),
             "surface": .string(surface),
             "note": .string(
                 "Set through the same in-process action the page's own control takes, so the page shows it now. "
                 + "Nothing was brought forward and no click was synthesized."),
         ]
+        if let posture { receipt["trust_mode"] = .string(posture.name) }
         for (key, value) in detail { receipt[key] = value }
         if let request = gated.request {
             receipt["user_request"] = .string(request)

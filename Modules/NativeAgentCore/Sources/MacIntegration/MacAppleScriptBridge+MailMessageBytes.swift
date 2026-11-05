@@ -1,13 +1,14 @@
+import MacControl
 import Foundation
 import SQLite3
 import PersistenceCore
 import UniformTypeIdentifiers
-// Blueprint: | `MacAppleScriptBridge+MailMessageBytes.swift` | `MacAppleScriptBridge`: paired-identity .emlx reads, contained attachments and bounded MIME/HTML decoding |
+// Blueprint: | `MacAppleScriptBridge+MailMessageBytes.swift` | `MacAppleScriptBridge`: identity-bound bytes and attachments |
 
 extension MacAppleScriptBridge {
     /// ROWID locates the file; the index and RFC header must both match the paired identity.
-    static func mailFileRead(input: [String: JSONValue], batch: Bool = false) throws -> [String: JSONValue] {
-        let message = try mailFileMessage(input: input)
+    static func mailFileRead(input: [String: JSONValue], batch: Bool = false, context: MacOperationContext) throws -> [String: JSONValue] {
+        let message = try mailFileMessage(input: input, context: context)
         let parts = try mailMessageParts(message.source, attachmentsRoot: message.attachmentsRoot)
         let plain = parts.plain.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
         guard let body = plain ?? parts.html.map(mailHTMLText) ?? (parts.attachments.isEmpty ? nil : "") else { throw mailMIMEError() }
@@ -25,26 +26,28 @@ extension MacAppleScriptBridge {
         return row
     }
 
-    public static func mailAttachment(input: [String: JSONValue]) throws -> (filename: String, data: Data) {
+    public static func mailAttachment(input: [String: JSONValue], context: MacOperationContext) throws -> (filename: String, data: Data) {
         guard mailReadScope(input) != nil, MailReadLocator.parse(input) != nil else {
             throw NSError(domain: "MailFileRead", code: 3, userInfo: [NSLocalizedDescriptionKey: "Use the scope and paired message identity from a Mail read."])
         }
-        let message = try mailFileMessage(input: input)
+        let message = try mailFileMessage(input: input, context: context)
         let parts = try mailMessageParts(message.source, attachmentsRoot: message.attachmentsRoot).attachments
         let matches = parts.enumerated().filter { index, part in
             (input["index"] == nil || input["index"] == .int(Int64(index + 1)))
                 && (input["filename"] == nil || input["filename"] == .string(part.filename))
         }
         guard input["index"] != nil || input["filename"] != nil, matches.count == 1 else {
-            throw NSError(domain: "MailFileRead", code: 5, userInfo: [NSLocalizedDescriptionKey: "Select one attachment by its 1-based index or unique filename from the Mail read."])
+            throw NSError(domain: "MailFileRead", code: 5, userInfo: [NSLocalizedDescriptionKey: """
+                Select one attachment by its 1-based index or unique filename from the Mail read.
+                """])
         }
         let part = matches[0].element
         guard let data = part.data else { throw mailFileError(4, "This attachment is not on disk. Download the message in Mail, then save it again.") }
         return (part.filename, data)
     }
 
-    /// Distinguishes missing index entries, identity mismatches, unreadable storage and undownloaded messages.
-    private static func mailFileMessage(input: [String: JSONValue]) throws -> (row: [String: JSONValue], source: Data, attachmentsRoot: URL?) {
+    private static func mailFileMessage(input: [String: JSONValue], context: MacOperationContext) throws -> (row: [String: JSONValue], source: Data,
+        attachmentsRoot: URL?) {
         guard let locator = MailReadLocator.parse(input, allowMissingMessageID: true), !locator.messageID.isEmpty, let accountID = locator.accountID else {
             // A supplied id the locator could not take is refused, never read as absent.
             if let supplied = input["expected_account_id"], supplied != .null {
@@ -52,10 +55,12 @@ extension MacAppleScriptBridge {
             }
             throw mailFileError(6, "The local read needs expected_message_id and expected_account_id from a mail_list_recent row.")
         }
-        let mismatch = mailFileError(7, "Mismatch: message_id \(locator.id) is a different email than expected_message_id names. Use the identifiers from one fresh mail_list_recent row.")
+        let mismatch = mailFileError(7, """
+            Mismatch: message_id \(locator.id) is a different email than expected_message_id names. Use the identifiers from one fresh mail_list_recent row.
+            """)
         let indexError = NSError(domain: "MailFileRead", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "Mail's index is unavailable. Check Mail's index and Full Disk Access."])
-        guard let database = mailIndexDatabase() else { throw indexError }
+        guard let database = mailIndexDatabase(context: context) else { throw indexError }
         defer { sqlite3_close(database) }
         var statement: OpaquePointer?
         let sql = """
@@ -80,7 +85,10 @@ extension MacAppleScriptBridge {
         // The index names an account by its id, the host of the mailbox URL, never by name.
         let host = mailbox.host ?? ""
         guard host.caseInsensitiveCompare(accountID) == .orderedSame else {
-            throw mailFileError(10, "Mismatch: Mail's index files message_id \(locator.id) under account id \(host.isEmpty ? "(none)" : host), not expected_account_id \(accountID). Use the identifiers from one fresh mail_list_recent row.")
+            throw mailFileError(10, """
+                Mismatch: Mail's index files message_id \(locator.id) under account id \(host.isEmpty ? "(none)" : host), not expected_account_id \
+                \(accountID). Use the identifiers from one fresh mail_list_recent row.
+                """)
         }
         guard identity(text(1)) == identity(locator.messageID) else { throw mismatch }
         let root = URL(fileURLWithPath: String(cString: indexPath)).deletingLastPathComponent().deletingLastPathComponent()
@@ -113,7 +121,6 @@ extension MacAppleScriptBridge {
                     if let account = locator.account { row["expected_account"] = .string(account) }
                     row["expected_account_id"] = .string(accountID)
                     if let position = locator.position { row["position"] = .int(Int64(position)) }
-                    // The locator names no mailbox, so scope is the one passed in.
                     row["verification"] = .string("Account verified by the local read against Mail's index; scope is the one passed in.")
                     return (row, source, suffix == "partial.emlx"
                         ? directory.deletingLastPathComponent().appendingPathComponent("Attachments/\(locator.id)") : nil)
@@ -121,10 +128,13 @@ extension MacAppleScriptBridge {
             }
         }
         if otherEmail { throw mismatch }
-        throw mailFileError(9, "No local copy of this message is on disk at its indexed mailbox. Download the message in Mail, then refresh its locator before reading its body or attachments.")
+        throw mailFileError(9, """
+            No local copy of this message is on disk at its indexed mailbox. Download the message in Mail, then refresh its locator before reading its body \
+            or attachments.
+            """)
     }
 
-    /// `body_tables` accompanies the unchanged body: uniform width 2–10, at most 30 rows and 200 cells; multiline cells omit the table.
+    /// Only bounded, uniform, single-line tables accompany the body; irregular tables remain in the body text.
     static func mailHTMLTables(source: String) -> [JSONValue] {
         mailHTMLTables(html: (try? mailMIMEParts(Data(source.utf8)))?.html)
     }
@@ -157,7 +167,6 @@ extension MacAppleScriptBridge {
         return tables
     }
 
-    /// A cell's text on one line, or nil when it breaks over lines or runs long.
     private static func mailCellText(_ inner: String) -> String? {
         // One block (a <p> or <div> around the text) is still one line; a break or a second block is not.
         if inner.range(of: #"<(br|li|tr|h[1-6])\b"#, options: [.regularExpression, .caseInsensitive]) != nil
@@ -213,11 +222,16 @@ extension MacAppleScriptBridge {
         -> (plain: String?, html: String?, attachments: [MailMIMEAttachment]) {
         var result = try mailMIMEParts(source, attachmentsRoot: attachmentsRoot)
         if let root = attachmentsRoot, FileManager.default.fileExists(atPath: root.path) {
-            for part in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            for part in try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+                .sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 guard try part.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
-                for file in try FileManager.default.contentsOfDirectory(at: part, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                for file in try FileManager.default.contentsOfDirectory(at: part, includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles]).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                     guard !result.attachments.contains(where: { $0.part == part.lastPathComponent && $0.filename == file.lastPathComponent }) else { continue }
-                    guard NativeAgentWorkspaceRoot.relativePath(file.resolvingSymlinksInPath().path, under: root.resolvingSymlinksInPath().path).map({ !$0.isEmpty }) == true,
+                    guard NativeAgentWorkspaceRoot.relativePath(
+                        file.resolvingSymlinksInPath().path,
+                        under: root.resolvingSymlinksInPath().path
+                    ).map({ !$0.isEmpty }) == true,
                           try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { throw mailMIMEError() }
                     result.attachments.append((file.lastPathComponent,
                         UTType(filenameExtension: file.pathExtension)?.preferredMIMEType ?? "application/octet-stream",
@@ -252,7 +266,8 @@ extension MacAppleScriptBridge {
             let file = attachmentsRoot?.appendingPathComponent(partNumber.isEmpty ? "1" : partNumber).appendingPathComponent(filename)
             let data: Data?
             if let file, FileManager.default.fileExists(atPath: file.path) {
-                guard NativeAgentWorkspaceRoot.relativePath(file.resolvingSymlinksInPath().path, under: attachmentsRoot!.resolvingSymlinksInPath().path).map({ !$0.isEmpty }) == true,
+                guard NativeAgentWorkspaceRoot.relativePath(file.resolvingSymlinksInPath().path, under: attachmentsRoot!.resolvingSymlinksInPath().path)
+                    .map({ !$0.isEmpty }) == true,
                       try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { throw mailMIMEError() }
                 data = try Data(contentsOf: file)
             } else if attachmentsRoot != nil && body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -300,12 +315,15 @@ extension MacAppleScriptBridge {
         case "base64":
             data = Data(base64Encoded: body.filter { !$0.isWhitespace })
         case "quoted-printable":
-            guard let encoded = body.replacingOccurrences(of: "=\r\n", with: "").replacingOccurrences(of: "=\n", with: "").data(using: .isoLatin1) else { throw mailMIMEError() }
+            guard let encoded = body.replacingOccurrences(of: "=\r\n", with: "")
+                .replacingOccurrences(of: "=\n", with: "")
+                .data(using: .isoLatin1) else { throw mailMIMEError() }
             let input = Array(encoded)
             var bytes: [UInt8] = [], i = 0
             while i < input.count {
                 if input[i] == UInt8(ascii: "=") {
-                    guard i + 2 < input.count, let byte = UInt8(String(decoding: input[(i + 1)...(i + 2)], as: UTF8.self), radix: 16) else { throw mailMIMEError() }
+                    guard i + 2 < input.count,
+                          let byte = UInt8(String(decoding: input[(i + 1)...(i + 2)], as: UTF8.self), radix: 16) else { throw mailMIMEError() }
                     bytes.append(byte); i += 3
                 } else { bytes.append(input[i]); i += 1 }
             }

@@ -1,8 +1,8 @@
 import Foundation
 // Blueprint: | `OAuthRefreshQueueRegistry.swift` | `OAuthRefreshQueueRegistry` class; `queue` (per credential path or key) |
 
-/// Retains one refresh queue per credential (a standardized path, or a key) for the process lifetime.
-/// Each provider adapter owns a separate static registry, even for identical paths.
+/// Retains one refresh queue per credential (a standardized path, or a key) for the process lifetime. Each provider adapter owns a separate static
+/// registry, even for identical paths.
 final class OAuthRefreshQueueRegistry: @unchecked Sendable {
     // All dictionary access is protected by this synchronous lock.
     private var sharedRefreshActors: [String: AsyncSerialQueue] = [:]
@@ -10,7 +10,7 @@ final class OAuthRefreshQueueRegistry: @unchecked Sendable {
 
     func queue(for path: URL) -> AsyncSerialQueue { queue(forKey: path.standardizedFileURL.path) }
 
-    /// One queue per credential however it is named (a keyring secret's name).
+    /// All names for one credential must share its queue.
     func queue(forKey key: String) -> AsyncSerialQueue {
         sharedRefreshActorsLock.lock()
         defer { sharedRefreshActorsLock.unlock() }

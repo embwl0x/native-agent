@@ -3,40 +3,35 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `CapabilityTraceFeed.swift` | `CapabilityTraceFeed` enum; asynchronous timeline over canonical turn evidence and standalone ledger rows |
 
-/// Read model for canonical turn evidence and standalone traces in Capabilities.
-/// Missing, empty, partially malformed, and unreadable evidence deliberately
-/// remain distinct so the timeline never turns a failed read into "No traces".
+/// Keep unread, empty, malformed and unreadable evidence distinct so failed reads never become "No traces".
 public enum CapabilityTraceFeed {
     public static let maximumRows = 200
-    public static let maximumReadBytes = 1_048_576
 
     public enum State: Equatable {
         case current([RuntimeTrace])
         case partial([RuntimeTrace], rejectedRows: Int)
-        case sourceAbsent
+        /// The record has not been read yet.
+        case unread
         case empty
         case unavailable(String)
 
         public var traces: [RuntimeTrace] {
             switch self {
             case .current(let traces), .partial(let traces, _): traces
-            case .sourceAbsent, .empty, .unavailable: []
+            case .unread, .empty, .unavailable: []
             }
         }
     }
 
     public static func read(
         dataRoot root: URL,
-        limit: Int = CapabilityTraceFeed.maximumRows,
-        maximumReadBytes: Int = CapabilityTraceFeed.maximumReadBytes
+        limit: Int = CapabilityTraceFeed.maximumRows
     ) async -> State {
-        guard limit > 0, maximumReadBytes > 0 else { return .empty }
+        guard limit > 0 else { return .empty }
         do {
-            let evidence = try await TurnTraceRecentReader(dataRootOverride: root)
-                .traceEvidence(maximumReadBytes: maximumReadBytes)
-            if evidence.sourceAbsent { return .sourceAbsent }
+            let evidence = try await TurnTraceRecentReader(dataRootOverride: root).traceEvidence()
             var decoded: [RuntimeTrace] = []
-            var rejectedRows = evidence.report.malformedLineCount
+            var rejectedRows = evidence.turns.unreadable
             for row in evidence.rows {
                 guard let fields = row.objectValue,
                       let id = fields["id"]?.stringValue,

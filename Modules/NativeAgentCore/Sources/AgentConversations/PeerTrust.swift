@@ -5,22 +5,23 @@ import ChatTurnContracts
 import PersistenceCore
 import TrustCenter
 
-// Blueprint: | `PeerTrust.swift` | `PeerTrust`: installed trust reader and exact contact/principal resolution; authority follows attested doors and person grants |
+// Blueprint: | `PeerTrust.swift` | `PeerTrust` |
 
 /// Authority follows an attested door id and the person's grant on that door.
 public enum PeerTrust {
-    /// Bind `PeerDataTaint`'s trust question to this one, for this data root.
-    /// The engine installs it; until then nothing is trusted.
+    /// Bind trust only after the engine installs the data-root reader; until then nothing is trusted.
     public static func install(dataRoot: URL) {
         PeerDataTaint.ownerTrusts = { ownerTrusts($0, dataRoot: dataRoot) }
         PeerDataTaint.principal = { principal($0, dataRoot: dataRoot) }
-        CapabilityLifecycle.turnWriteCheck = { PeerDataTaint.abilityWriteFailure }
+        CapabilityLifecycle.turnWriteCheck = { turn in
+            { turn.flatMap { PeerDataTaint.abilityWriteFailure(turn: $0) } }
+        }
         PeerDataTaint.sourceName = { source in
             guard !["another agent", "a remote peer", PeerDataTaint.unrecorded].contains(source) else { return nil }
             var key = source.lowercased()
             if key.hasPrefix("peer:") { key = String(key.dropFirst(5)) }
             if ConversationSurfaceProfile(key).isAgentBridge {
-                for suffix in ["-bridge", "_bridge"] where key.hasSuffix(suffix) { key = String(key.dropLast(suffix.count)) }
+                if key.hasSuffix("-bridge") { key = String(key.dropLast("-bridge".count)) }
             }
             guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return nil }
             guard let door = contact(forLane: key, among: peers) ?? peers.first(where: { $0.id == key || $0.name.lowercased() == key }) else { return nil }
@@ -28,10 +29,7 @@ public enum PeerTrust {
         }
     }
 
-    /// The one contact a locator names, as its attested id: a peer handle
-    /// stands; a lane or a contact's exact name that the address book resolves
-    /// to exactly one contact becomes `peer:<id>`; anything else stands as
-    /// written and so carries no grant.
+    /// Only a uniquely resolved contact can become an attested peer ID; ambiguous locators carry no grant.
     public static func principal(_ source: String, dataRoot: URL, peers: [AgentPeerContact]? = nil) -> String {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         var key = trimmed.lowercased()
@@ -39,7 +37,7 @@ public enum PeerTrust {
               !["another agent", "a remote peer", PeerDataTaint.unrecorded].contains(key),
               let peers = peers ?? (try? AgentPeerStore(dataRoot: dataRoot).list()) else { return trimmed }
         if ConversationSurfaceProfile(key).isAgentBridge {
-            for suffix in ["-bridge", "_bridge"] where key.hasSuffix(suffix) { key = String(key.dropLast(suffix.count)) }
+            if key.hasSuffix("-bridge") { key = String(key.dropLast("-bridge".count)) }
         }
         if let door = contact(forLane: key, among: peers) { return "peer:" + door.id }
         let named = peers.filter { $0.id == key || $0.name.lowercased() == key }
@@ -50,11 +48,9 @@ public enum PeerTrust {
     public static func ownerTrusts(_ source: String, dataRoot: URL) -> Bool {
         let principal = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let key = principal.hasPrefix("peer:") ? String(principal.dropFirst(5)) : principal
-        // Her own lane (a wake, a part she runs) is hers, not a peer's.
+        // The agent's own lane (a wake, a part it runs) is the agent's, not a peer's.
         if key == "self" { return true }
-        // A helper of this install, made by the person or by her, carries the
-        // person's grant: it is part of the household, not an outside agent.
-        // Its lane reads "bot:<id>", its session "bot-<id>".
+        // Install-local helpers carry the person’s household grant; their lane and session IDs remain scoped to this install.
         if let id = BotDefinition.id(forSession: key.hasPrefix("bot:") ? "bot-" + key.dropFirst(4) : key) {
             let file = dataRoot.appendingPathComponent("bots/definitions/\(id.uuidString).json")
             guard let data = try? Data(contentsOf: file),

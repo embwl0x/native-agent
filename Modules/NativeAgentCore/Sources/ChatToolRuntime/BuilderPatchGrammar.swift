@@ -143,10 +143,7 @@ extension SwiftToolDispatcher {
                NSHomeDirectory() + "/.ssh", NSHomeDirectory() + "/Library/Keychains"])
             .map { URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path }
     }
-    /// The subtrees the builder sandbox profile denies `file-write*` on — the
-    /// live trust policy under the data root, and the repo-local `data/trust`
-    /// of the source checkout. One list, so the SBPL profile and the
-    /// in-process patch path fence the same directories.
+    /// One denied-directory list keeps sandbox subprocesses and in-process patches behind the same live Trust-store fence.
     static func builderWriteDeniedSubtrees(dataRoot: URL) -> [URL] {
         var paths = [dataRoot.appendingPathComponent("trust", isDirectory: true)]
         if let source = builderSourceRepoRoot(dataRoot: dataRoot) {
@@ -208,9 +205,8 @@ extension SwiftToolDispatcher {
         dataRoot: URL,
         sandboxMode: BuilderShellSandboxMode
     ) -> JSONValue {
-        // One staged body per resolved path. Repeated sections (including
-        // symlink/path aliases) apply in order to the previous section's result,
-        // not to independent copies that would overwrite earlier changes.
+        // One staged body per resolved path. Repeated sections (including symlink/path aliases) apply in order to the previous section's result, not to
+        // independent copies that would overwrite earlier changes.
         var stagedFiles: [(url: URL, path: String, original: [String], lines: [String])] = []
         var stagedIndex: [String: Int] = [:]
         func failure(_ reason: String, detail: String? = nil, path: String? = nil, effects: String = "none") -> JSONValue {
@@ -294,8 +290,7 @@ extension SwiftToolDispatcher {
             }
             stagedFiles[index].lines = lines
         }
-        // Validate the entire patch before the first write; publish only net
-        // changes, once per file. This is not a cross-file atomic transaction.
+        // Validate the entire patch before the first write; publish only net changes, once per file. This is not a cross-file atomic transaction.
         let pendingWrites = stagedFiles.filter { $0.lines != $0.original }
         let changedFiles = pendingWrites.map(\.path)
         for write in pendingWrites {

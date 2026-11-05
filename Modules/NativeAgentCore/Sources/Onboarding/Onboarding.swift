@@ -7,8 +7,8 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 // Blueprint: | `Onboarding.swift` | Onboarding client roots, start verdict and ability catalog |
-/// Pending completion/reset controls stay local; completion evidence travels in backup/export, never raw phone sync.
-/// PersonaEngine commits profiles; UserMDGenerator commits USER.md.
+/// Pending completion/reset controls stay local; completion evidence travels in backup/export, never raw phone sync. PersonaEngine commits profiles;
+/// UserMDGenerator commits USER.md.
 public struct SwiftNativeOnboardingClient: Sendable {
     let personaRoot: URL
     let dataRoot: URL
@@ -23,14 +23,10 @@ public struct SwiftNativeOnboardingClient: Sendable {
     }
     public func startOnboarding() async throws -> OnboardingStartResult {
         return try await SwiftNativePersistenceCore.withFileLock(transactionManifestPath) {
-            // A reset is an operation, not an ambiguous half-onboarded state.
-            // Finish its exact manifest before exposing start state so a crash
-            // after one rename can never make the wizard exit or resume the
-            // completion transaction the reset was cancelling.
+            // A reset is an operation, not an ambiguous half-onboarded state. Finish its exact manifest before exposing start state so a crash after one rename
+            // can never make the wizard exit or resume the completion transaction the reset was cancelling.
             try await reconcilePendingResetLocked()
-            // A user is "already onboarded" if ANY transaction-owned persona
-            // doc or the completion marker exists. `completeOnboarding` refuses
-            // this exact set when no resumable manifest owns it.
+            // Any transaction-owned document or completion marker prevents a fresh submit unless a resumable manifest owns it.
             let fm = FileManager.default
             let targets = Self.expectedTargetURLs(
                 personaRoot: personaRoot,
@@ -51,12 +47,9 @@ public struct SwiftNativeOnboardingClient: Sendable {
                 || personaPaths.contains { fm.fileExists(atPath: $0.path) }
                 || fm.fileExists(atPath: onboardedSentinel.path)
             let hasCompletionAnchor = NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
-            // Persona bytes with no proof of completion: partial state, which
-            // takes the reset lane. A generator-only USER.md remains fresh state.
+            // Persona bytes without completion proof require reset; a generator-only USER.md remains fresh state.
             let hasPartialPersonaState = !hasCompletionAnchor
                 && personaPaths.contains { fm.fileExists(atPath: $0.path) }
-            // `hasPartialPersonaState` (and therefore `resetRequired`) requires
-            // NO completion anchor, so the two states can never both be true.
             let profileRepairRequired = pending == nil
                 && hasCompletionAnchor
                 && !fm.fileExists(atPath: profileJSONPath.path)
@@ -67,7 +60,10 @@ public struct SwiftNativeOnboardingClient: Sendable {
             } else if hasExisting && !profileRepairRequired && !hasPartialPersonaState {
                 do { currentName = try PersonaCompiler.compileProfile(dataRoot: dataRoot).name }
                 catch {
-                    profileUnreadable = "Setup could not read the saved profile: \(error.localizedDescription). The persona documents are intact. Repair \(profileJSONPath.path) on the Mac, then check again."
+                    profileUnreadable = """
+                        Setup could not read the saved profile: \(error.localizedDescription). The persona documents are intact. Repair \
+                        \(profileJSONPath.path) on the Mac, then check again.
+                        """
                 }
             }
             return OnboardingStartResult(
@@ -81,7 +77,6 @@ public struct SwiftNativeOnboardingClient: Sendable {
             )
         }
     }
-    /// The sole catalog for onboarding's six ability tiles.
     public static let abilityOverview: [AbilityOverviewEntry] = [
         AbilityOverviewEntry(
             id: "chat",

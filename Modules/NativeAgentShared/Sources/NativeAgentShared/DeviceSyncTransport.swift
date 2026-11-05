@@ -1,37 +1,38 @@
 import Foundation
 
-// Blueprint: | `DeviceSyncTransport.swift` | Shared role/message codecs, account/recovery outcomes and transport resolution; signed foreground/active-talk phone contact and shared receive/beat/window constants |
+// Blueprint: | `DeviceSyncTransport.swift` | Shared role/message codecs, checked transport and signed phone contact |
 
-/// A background recovery caller can bound reads without changing the transport
-/// operations. Foreground callers retain their ordinary per-operation budgets.
-public enum NADeviceSyncRecoveryBudget {
-    @TaskLocal public static var deadline: Date?
-    @TaskLocal public static var didApplyData: (@Sendable () -> Void)?
+/// A background recovery caller can bound reads without changing the transport operations. Foreground callers retain their ordinary per-operation
+/// budgets.
+public struct DeviceSyncRecovery: Sendable {
+    public let deadline: Date?
+    public let didApplyData: (@Sendable () -> Void)?
 
-    public static var hasTime: Bool {
+    public init(deadline: Date? = nil, didApplyData: (@Sendable () -> Void)? = nil) {
+        self.deadline = deadline
+        self.didApplyData = didApplyData
+    }
+
+    public var hasTime: Bool {
         !Task.isCancelled && (deadline.map { $0.timeIntervalSinceNow > 0 } ?? true)
     }
 
-    public static func seconds(upTo maximum: TimeInterval) -> TimeInterval {
+    public func seconds(upTo maximum: TimeInterval) -> TimeInterval {
         max(0, min(maximum, deadline?.timeIntervalSinceNow ?? maximum))
     }
 }
 
 // MARK: - Device role + direction
 
-/// Which physical side this transport instance runs on. Mirrors the two-sided
-/// `iCloudBridge` topology: the Mac app is `.mac`, the iOS companion is `.ios`.
 public enum NADeviceRole: String, Sendable, Codable, CaseIterable {
     case mac
     case ios
 
-    /// The direction of a message this role RECEIVES.
     public var inboundDirection: NAChatDirection {
         self == .mac ? .ios2mac : .mac2ios
     }
 }
 
-/// Direction of an `NAChatMessage` record, matching the design's field values.
 public enum NAChatDirection: String, Sendable, Codable {
     case mac2ios
     case ios2mac
@@ -40,29 +41,21 @@ public enum NAChatDirection: String, Sendable, Codable {
 // MARK: - CloudKit record schema (identifiers shared by every transport)
 
 public enum NADeviceSyncRecordType {
-    /// Chat message payloads. Record identity defaults to BridgeMessage.id.
     public static let chatMessage = "NAChatMessage"
-    /// Explicit user-visible notifications. Kept separate from chat so exactly
-    /// one CloudKit subscription projects each record into an APNS alert.
+    /// Explicit user-visible notifications. Kept separate from chat so exactly one CloudKit subscription projects each record into an APNS alert.
     public static let notification = "NANotification"
-    /// Pairing / device records (replaces the KVS pairing-secret plane).
     public static let pairingDevice = "NAPairingDevice"
-    /// Short status/progress records (replaces the KVS status keys).
     public static let status = "NAStatus"
 }
 
-/// The Mac's presence beat. The Mac publishes snapshots only when something
-/// changes, so a quiet Mac said nothing for minutes and the phone read that
-/// as unreachable. The Mac rewrites one record every `beat`; nothing pushes
-/// it, the phone reads it when it opens. The phone counts the Mac as here
-/// while the newest Mac record it has seen is younger than `phoneWindow`.
+/// A quiet Mac still needs a presence beat: unchanged snapshots say nothing about reachability. The phone reads the unpushed record on open and
+/// applies `phoneWindow` to the newest observed Mac record.
 public enum NAMacPresence {
     public static let beat: TimeInterval = 120
     public static let phoneWindow: TimeInterval = 300
 }
 
-/// Foreground or active-talk phone contact travels over the existing signed CloudKit status
-/// singleton, never as chat. Older Macs ignore an unobserved status key.
+/// Foreground or active-talk phone contact uses the signed CloudKit status singleton so contact never becomes chat.
 public enum NAPhoneForegroundPresence {
     public static let statusKey = "phone.foreground"
     public static let beat: TimeInterval = 30
@@ -77,8 +70,8 @@ public enum NAPhoneForegroundPresence {
         return String(decoding: try encoder.encode(message), as: UTF8.self)
     }
 
-    /// A missing, unreadable, unsigned or old beat says nothing about contact.
-    /// Server time limits freshness; the signed envelope binds it to this pair.
+    /// A missing, unreadable, unsigned or old beat says nothing about contact. Server time limits freshness; the signed envelope binds it to this
+    /// pair.
     public static func activityDate(value: String, writtenAt: Date?, secret: Data, now: Date) -> Date? {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -91,11 +84,7 @@ public enum NAPhoneForegroundPresence {
     }
 }
 
-/// Flat, CloudKit-queryable projection of a `BridgeMessage`.
-///
-/// `payloadJSON` is the authoritative copy of the encoded BridgeMessage; the
-/// scalar fields exist so CloudKit can filter (`direction`, `sessionId`,
-/// `createdAt`) and de-duplicate (`recordName`) without decoding the payload.
+/// `payloadJSON` owns the encoded message; scalar fields let CloudKit filter and deduplicate without decoding it.
 public struct NAChatMessageFields: Sendable, Equatable, Codable {
     public var recordName: String   // CKRecord.ID.recordName == message id
     public var direction: String    // mac2ios | ios2mac
@@ -141,13 +130,11 @@ public struct NAChatMessageFields: Sendable, Equatable, Codable {
 public enum NAChatMessageCodec {
     public static let recordIDMetadataKey = "cloudKitRecordID"
 
-    /// Conservative encoded-record ceiling below CloudKit's 1 MB record limit.
-    /// `payloadJSON` already includes base64 attachment expansion and the record
-    /// also duplicates a few query fields, so reserve 224 KiB for those fields
-    /// and CloudKit record overhead instead of relying on a server rejection.
+    /// Conservative encoded-record ceiling below CloudKit's 1 MB record limit. `payloadJSON` already includes base64 attachment expansion and the
+    /// record also duplicates a few query fields, so reserve 224 KiB for those fields and CloudKit record overhead instead of relying on a server
+    /// rejection.
     public static let maxCloudKitRecordValueBytes = 800 * 1024
-    /// Larger signed chat envelopes travel as encrypted assets, bounded below
-    /// CloudKit's asset ceiling. Individual files retain the shared chat cap.
+    /// Larger signed chat envelopes travel as encrypted assets, bounded below CloudKit's asset ceiling. Individual files retain the shared chat cap.
     public static let maxAssetPayloadBytes = 48 * 1024 * 1024
 
     public static func usesAsset(_ fields: NAChatMessageFields) -> Bool {
@@ -164,14 +151,11 @@ public enum NAChatMessageCodec {
             + 4_096
     }
 
-    /// Direction a message travels, derived from its sender. "mac" → mac2ios,
-    /// anything else (e.g. "ios") → ios2mac.
     public static func direction(forSender sender: String) -> NAChatDirection {
         sender.trimmingCharacters(in: .whitespaces).lowercased() == "mac" ? .mac2ios : .ios2mac
     }
 
-    /// Encode a BridgeMessage into flat record fields. The full message is
-    /// preserved verbatim in `payloadJSON` so decode is lossless.
+    /// Preserve the complete message in `payloadJSON`; scalar fields are only query projections.
     public static func encode(_ message: BridgeMessage) throws -> NAChatMessageFields {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -208,8 +192,7 @@ public enum NAChatMessageCodec {
         return fields
     }
 
-    /// Decode record fields back into a BridgeMessage. `payloadJSON` is
-    /// authoritative — the scalar fields are only a query projection.
+    /// Decode record fields back into a BridgeMessage. `payloadJSON` is authoritative — the scalar fields are only a query projection.
     public static func decode(_ fields: NAChatMessageFields) throws -> BridgeMessage {
         guard let data = fields.payloadJSON.data(using: .utf8) else {
             throw DeviceSyncError.underlying(message: "record \(fields.recordName) had non-UTF-8 payloadJSON")
@@ -219,10 +202,8 @@ public enum NAChatMessageCodec {
         return try decoder.decode(BridgeMessage.self, from: data)
     }
 
-    /// Exact replay proof for a stable CloudKit record id. A retry is accepted
-    /// as success only when the server's authoritative payload and direction
-    /// are equal after JSON key canonicalization; an id collision with different
-    /// content remains a conflict.
+    /// Exact replay proof for a stable CloudKit record id. A retry is accepted as success only when the server's authoritative payload and direction
+    /// are equal after JSON key canonicalization; an id collision with different content remains a conflict.
     public static func isExactIdempotentReplay(
         existingPayloadJSON: String?,
         existingDirection: String?,
@@ -257,7 +238,10 @@ public struct DeviceSyncAccountFailure: Error, LocalizedError, Sendable, Codable
     public let code: Int
     public let detail: String
 
-    public static let macMessage = "iCloud sign-in needs attention on this Mac (System Settings → Apple Account); phone messages can't arrive until it's fixed"
+    public static let macMessage = """
+        iCloud sign-in needs attention on this Mac (System Settings → Apple Account); \
+        phone messages can't arrive until it's fixed
+        """
     public static let phoneMessage = "iCloud sign-in needs attention on this iPhone"
 
     public var errorDescription: String? { detail }
@@ -344,8 +328,7 @@ public enum DeviceSyncTransportResolver {
     public static let envKey = "NATIVE_AGENT_DEVICE_SYNC"
     public static let infoKey = "NativeAgentDeviceSync"
 
-    /// The current transport must be explicitly configured. A missing, mistyped
-    /// or retired transport value never selects another data plane.
+    /// The current transport must be explicitly configured. A missing or invalid transport value never selects another data plane.
     public static func requireCloudKitConfiguration(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         infoValue: String? = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String

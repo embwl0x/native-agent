@@ -1,14 +1,12 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `ContextSelection.swift` | `ContextSelector.select` owns eligibility, mandatory coverage, memory touch/rest admission, quotas, deterministic reranking and packet receipts; `commonEligibilityFailure` is shared with expansion |
+// Blueprint: | `ContextSelection.swift` | `ContextSelector.select`, `commonEligibilityFailure`: eligibility, touch, rest, quotas and receipts |
 
 // MARK: - Deterministic hybrid selector
 
 public struct ContextSelector: Sendable {
     public let configuration = ContextSelectionConfiguration()
-    /// How far a memory must stand out to come to mind: what she is told
-    /// gets the ordinary bar; an ambient moment (something she read, something
-    /// that happened) only reminds her of what it singles out clearly.
+    /// Ambient moments require a higher standout bar than direct messages so incidental observations do not surface weak associations.
     public let memoryStandout: Double
 
     public init(memoryStandout: Double = ContextSelectionConfiguration.memoryStandoutDeviations) {
@@ -87,10 +85,7 @@ public struct ContextSelector: Sendable {
             )
         }
 
-        // Precovered sources are already present in the stable prompt. Keep
-        // their eligibility receipts, but do not spend per-turn ranking work
-        // on atoms that cannot become dynamic candidates. Explicit mandatory
-        // atoms remain scorable for complete receipts.
+        // Precovered sources need eligibility receipts but no dynamic ranking work; explicit mandatory atoms remain scorable for complete receipts.
         let scorable = eligible.filter {
             !need.precoveredSourceIDs.contains($0.draft.sourceID)
                 || mandatoryIDs.contains($0.draft.id)
@@ -135,9 +130,8 @@ public struct ContextSelector: Sendable {
             .filter { !need.precoveredSourceIDs.contains($0.draft.sourceID) }
             .filter { relevance(of: scores[$0.draft.id]) >= configuration.minimumRelevance }
             .sorted { rankedBefore($0, $1, scores: scores) }
-        // Memories need touch past the fixed standout floor in any reading, then rank by relevance × reachability.
-        // Recent service rests unless the message singles it out. Corrections share the rows;
-        // triggered scoped corrections are mandatory.
+        // Touch gates memory admission; relevance × reachability ranks it. Recent service rests unless singled out; triggered scoped corrections remain
+        // mandatory.
         let memoryKinds: Set<ContextAtomKind> = [.memory, .correction]
         let memoryTouch = memoryRelevance(
             scorable.filter { memoryKinds.contains($0.draft.kind) }, need: need, scores: baseScores
@@ -148,11 +142,10 @@ public struct ContextSelector: Sendable {
         let relevanceFloor = memoryStandout
         let restFloor = memoryStandout + 1
         func touched(_ atom: ContextStoredAtom) -> Bool {
-            // A relative floor is in standard deviations; a small population
-            // instead uses the ordinary model-scaled semantic contribution.
+            // A relative floor is in standard deviations; a small population instead uses the ordinary model-scaled semantic contribution.
             let floor = smallMemoryPopulation ? configuration.minimumRelevance : relevanceFloor
             if let relevance = relevanceByAtom[atom.draft.id], relevance >= floor { return true }
-            // Or her words: half the message, or the whole message as words.
+            // Lexical evidence requires half the message, or the complete message as words.
             guard let features = baseScores[atom.draft.id] else { return false }
             return features.messageCoverage >= 0.5 || (features.lexicalExact >= 1 && features.messageCoverage > 0)
         }
@@ -173,8 +166,7 @@ public struct ContextSelector: Sendable {
             if !rested {
                 let rank: Double
                 if smallMemoryPopulation {
-                    // Semantic scores use their own scale; a lexical-only touch
-                    // still needs a positive rank when no semantic score exists.
+                    // Semantic scores use their own scale; a lexical-only touch still needs a positive rank when no semantic score exists.
                     if let relevance, relevance > 0 {
                         rank = relevance
                     } else {
@@ -218,8 +210,7 @@ public struct ContextSelector: Sendable {
         var usedCharacters = mandatoryCharacters
         var sourceCounts: [ContextSourceID: Int] = [:]
         var kindCounts: [ContextAtomKind: Int] = [:]
-        // The memory rows are taken BEFORE the ordinary lane runs, so ops
-        // cannot crowd out what the message touched.
+        // Reserve memory rows before ordinary selection so operations cannot crowd out what the message touched.
         for atom in memoryPicks where selectedDynamicCount < configuration.maximumDynamicAtoms {
             let unit = SelectionUnit(stableKey: "atom:\(atom.draft.id.rawValue)", atoms: [atom])
             guard quotaAllows(
@@ -330,8 +321,7 @@ public struct ContextSelector: Sendable {
             }
         }
 
-        // Summaries and renderer-truncated bodies retain a route to the full
-        // atom. This adds at most one pointer per bounded selected item.
+        // Summaries and renderer-truncated bodies retain a route to the full atom. This adds at most one pointer per bounded selected item.
         var pointers: [ContextAtomPointer] = []
         var published: Set<ContextAtomID> = []
         for item in selectedItems where item.isExpandable(thresholdChars: need.packetAtomExpandThresholdChars) {
@@ -434,10 +424,16 @@ extension ContextSelector {
         if !need.authorization.allowedOrigins.contains(need.origin) { return (.originDenied, .originDenied(need.origin)) }
         if !need.authorization.allowedSourceIDs.contains(sourceID) { return (.permissionDenied, .sourcePermissionDenied(sourceID)) }
         if let allowed = need.authorization.allowedAtomIDs, !allowed.contains(id) { return (.permissionDenied, .atomPermissionDenied(id)) }
-        if !source.descriptor.permittedSurfaces.contains(need.surface) { return (.surfaceDenied, .sourceSurfaceDenied(source: sourceID, surface: need.surface)) }
+        if !source.descriptor.permittedSurfaces.contains(need.surface) {
+            return (.surfaceDenied, .sourceSurfaceDenied(source: sourceID, surface: need.surface))
+        }
         if !atom.draft.permittedSurfaces.contains(need.surface) { return (.surfaceDenied, .atomSurfaceDenied(atom: id, surface: need.surface)) }
-        if !need.authorization.allowedPrivacy.contains(source.descriptor.privacy) { return (.privacyDenied, .sourcePrivacyDenied(source: sourceID, privacy: source.descriptor.privacy)) }
-        if !need.authorization.allowedPrivacy.contains(atom.draft.privacy) { return (.privacyDenied, .atomPrivacyDenied(atom: id, privacy: atom.draft.privacy)) }
+        if !need.authorization.allowedPrivacy.contains(source.descriptor.privacy) {
+            return (.privacyDenied, .sourcePrivacyDenied(source: sourceID, privacy: source.descriptor.privacy))
+        }
+        if !need.authorization.allowedPrivacy.contains(atom.draft.privacy) {
+            return (.privacyDenied, .atomPrivacyDenied(atom: id, privacy: atom.draft.privacy))
+        }
         if atom.draft.injectionPolicy == .neverInject { return (.neverInject, .atomNotExpandable(policy: .neverInject)) }
         if source.descriptor.injectionPolicy == .neverInject { return (.neverInject, .sourceInjectionDenied(sourceID)) }
         if atom.draft.freshness.isExpired(at: need.evaluationTime) { return (.expired, .expired(id)) }

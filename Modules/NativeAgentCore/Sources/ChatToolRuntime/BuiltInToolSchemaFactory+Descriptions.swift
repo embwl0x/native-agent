@@ -1,8 +1,6 @@
 // Blueprint: | `BuiltInToolSchemaFactory+Descriptions.swift` | `BuiltInToolSchemaFactory`: extension |
 extension BuiltInToolSchemaFactory {
-    /// The tool description is load-bearing. It is the only thing that turns
-    /// "how do you feel?" into a PULL instead of an improvisation, so it says so
-    /// in as many words.
+    /// The description must direct inner-state questions to a pull; otherwise the model may improvise.
     static let innerStateToolDescription = """
         Read your recorded inner state before describing how you feel. Returns \
         fingerprint/subject; mood integral and disposition in words/numbers; \

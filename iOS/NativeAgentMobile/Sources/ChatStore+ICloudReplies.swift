@@ -1,9 +1,9 @@
 import SwiftUI
 import UIKit
 import NativeAgentShared
-// Blueprint: | `ChatStore+ICloudReplies.swift` | Signed correlation evidence acknowledges delivery before offscreen/terminal/sequence early returns; terminal receipts and snapshot settlement clear delivery uncertainty, preserving Error/Stop partial words; original and live incomplete endings stay incomplete, and omitted terminal kind never proves success |
+// Blueprint: | `ChatStore+ICloudReplies.swift` | Signed delivery evidence before early exits; shared terminal/snapshot settlement preserves partial words |
 
-/// Chat and cold Siri/Shortcuts waits interpret the same signed endings.
+/// Chat and cold intent waits must interpret signed endings identically.
 enum MobileChatTerminal: Equatable {
     case completed, failed, stopped, incomplete
 
@@ -19,12 +19,9 @@ enum MobileChatTerminal: Equatable {
 }
 
 extension ChatStore {
-    /// Dispatch signed Mac events; terminal receipts share one settlement path.
     func receiveICloudReply(_ msg: BridgeMessage) async {
         await restorationTask?.value
-        guard msg.sender == "mac" else { return }  // only accept Mac replies
-        // How a Steer ended: read by the turn that was working (its reply
-        // answers it), or given back, to run as its own message.
+        guard msg.sender == "mac" else { return }
         if let kind = msg.metadata?["kind"], kind == "steered" || kind == "steer_returned",
            let queued = queuedSends.first(where: { $0.id.uuidString == msg.correlationID }) {
             steeringQueuedIDs.remove(queued.id)
@@ -35,15 +32,15 @@ extension ChatStore {
                 return
             }
             queuedSends.removeAll { $0.id == queued.id }
-            // Read by another conversation's turn: its transcript carries it, never this one.
+            // A different conversation's turn carries its own transcript; do not insert it here.
             guard queueSessionKey(queued.sessionID) == queueSessionKey(selectedSessionID) else { return }
             var note = ChatMessage(role: .assistant, text: msg.text, awaitingMacTranscript: true, runId: msg.correlationID)
             note.completionState = "completed"
-            messages.append(contentsOf: [ChatMessage(id: queued.id, role: .user, text: queued.text, awaitingMacTranscript: true, runId: msg.correlationID), note])
+            messages.append(contentsOf: [ChatMessage(id: queued.id, role: .user, text: queued.text, awaitingMacTranscript: true, runId: msg.correlationID),
+                note])
             return
         }
-        // Verification belongs to the bridge. Apply its evidence before
-        // terminal, offscreen and sequence early returns can skip it.
+        // Apply bridge verification evidence before terminal, offscreen or sequence early returns can skip it.
         if let correlationID = msg.correlationID {
             noteEvidencedActivity(correlationID: correlationID, activity: nil)
         }
@@ -76,13 +73,23 @@ extension ChatStore {
         if let correlationID = msg.correlationID, resolvedICloudReplyIds.contains(correlationID) {
             return
         }
-        // Nonterminal events only update the conversation on screen.
-        if let incoming = Self.cleanSessionID(msg.sessionID),
-           let selected = Self.cleanSessionID(selectedSessionID), incoming != selected {
+        // Nonterminal events only update the conversation on screen, and live is now: a replayed live message for a turn already over (the
+        // records the phone re-reads at launch) never streams or appends an old reply again.
+        let live = msg.metadata?["live"] == "true"
+        let elsewhere = Self.cleanSessionID(msg.sessionID).map { incoming in
+            Self.cleanSessionID(selectedSessionID).map { $0 != incoming } ?? false
+        } ?? false
+        if elsewhere || (live && liveIsHistory(msg)) {
+            // The phone's own send that this live message ended still settles in its conversation, adding nothing.
+            if live, MobileChatTerminal.classify(kind) != nil, let run = msg.correlationID, let record = pendingExchanges[run] {
+                settlePendingReply(run, placeholderId: record.placeholderID)
+                receiveTerminalReply(msg, runID: run, placeholderID: record.placeholderID, sessionID: record.sessionID,
+                                     visibleEffects: false, live: true)
+            }
             return
         }
         acknowledgePublishedSession(msg.sessionID)
-        if msg.metadata?["live"] == "true" {
+        if live {
             receiveLiveTurn(msg)
         } else if ["progress", "notice", "tool_use", "tool_result"].contains(kind ?? "") {
             receiveICloudProgress(msg)
@@ -99,8 +106,7 @@ extension ChatStore {
         }
     }
 
-    /// Bridge receipts resolve their correlation and conversation once. A
-    /// detached exchange still settles even though its conversation is hidden.
+    /// Settle each correlation once even when its conversation is detached.
     private func receiveTerminalReply(_ msg: BridgeMessage) {
         let kind = msg.metadata?["kind"]
         let terminal = MobileChatTerminal.classify(kind) ?? .incomplete
@@ -108,7 +114,10 @@ extension ChatStore {
         let stopped = terminal == .stopped
         let incomplete = terminal == .incomplete
         guard let correlationID = msg.correlationID, !correlationID.isEmpty else {
-            errorBanner = "A Mac reply has no request identity, so it could not be matched. Pending exchanges are retained. Refresh this conversation to read the Mac's transcript."
+            errorBanner = """
+                A Mac reply has no request identity, so it could not be matched. Pending exchanges are retained. Refresh this conversation to read the Mac's \
+                transcript.
+                """
             return
         }
         let pendingId: String? = correlationID
@@ -142,17 +151,16 @@ extension ChatStore {
         if let pendingId { settlePendingReply(pendingId, placeholderId: placeholderId) }
         if !offscreen {
             if let pendingId {
-                onTalkReply?(pendingId, msg.text, true, failed ? Self.errorExplanation(msg) : stopped ? "Reply stopped. Listening to you." : incomplete ? msg.metadata?["status"] ?? "Reply ending is unconfirmed." : nil)
+                onTalkReply?(pendingId, msg.text, true, failed ? Self.errorExplanation(msg) : stopped ? "Reply stopped. Listening to you." : incomplete
+                    ? msg.metadata?["status"] ?? "Reply ending is unconfirmed." : nil)
             }
             if failed { errorBanner = msg.metadata?["errorDetail"].flatMap { $0.isEmpty ? nil : $0 } ?? msg.text }
             if stopped { errorBanner = "Stopped. Any partial reply has been kept." }
             if incomplete { errorBanner = msg.metadata?["status"] ?? "Reply ending is unconfirmed." }
             if !failed && !stopped && !incomplete {
                 onReply?(msg.text, pendingId)
-                if wasLate {
-                    requestScrollToBottom()
-                    SystemToastCenter.shared.push(info: "Reply arrived")
-                }
+                // A late reply is news, never a move: a reader away from the end sees Latest.
+                if wasLate { SystemToastCenter.shared.push(info: "Reply arrived") }
             }
         }
     }
@@ -197,8 +205,7 @@ extension ChatStore {
                 reply.failureDetail = failure
                 reply.completionState = state
             } else if failed || stopped || incomplete {
-                // The terminal may arrive before any streamed snapshot.
-                // Apply its accumulated words before retiring the correlation.
+                // Apply terminal words before retiring the correlation: the terminal can precede every streamed snapshot.
                 if hasPartialReply || incomplete { reply.text = msg.text }
                 Self.end(&reply, lifecycle: failed ? Self.errorExplanation(msg) : stopped ? "Stopped" : failure ?? "Reply ending is unconfirmed.", state: state)
             } else {
@@ -224,7 +231,6 @@ extension ChatStore {
         }
     }
 
-    /// Snapshot recovery and terminal bridge receipts share retirement.
     func settlePendingReply(_ pendingId: String, placeholderId: UUID?) {
         noteDeliveryAccepted(pendingId)
         markICloudReplyResolved(pendingId)
@@ -236,11 +242,19 @@ extension ChatStore {
         showsReplyWaitHint = false
     }
 
-    /// A turn another door (the Mac, Telegram) started in this conversation,
-    /// shown as it streams: the Mac sends its text so far under the turn's run
-    /// id, then the saved answer, failure sentence, or explicit cancellation. The
-    /// bubble awaits the Mac transcript like any reply, so the snapshot
-    /// settles it into the saved row.
+    /// How long a live message stays news. Streamed text is cumulative, so a turn still under way always has a fresher one.
+    static let liveIsNow: TimeInterval = 120
+
+    /// A turn this phone already shows, or its own send in flight, receives every live message. Any other live message is history once it
+    /// is older than `liveIsNow` or its conversation already holds the turn's saved reply: the transcript says what happened.
+    private func liveIsHistory(_ msg: BridgeMessage) -> Bool {
+        guard let run = msg.correlationID, liveTurnBubbles[run] == nil, pendingICloudPlaceholders[run] == nil else { return false }
+        if Date().timeIntervalSince(msg.timestamp) > Self.liveIsNow { return true }
+        guard let session = Self.cleanSessionID(msg.sessionID) else { return false }
+        return iCloudSyncEngine.shared.chatTranscripts[session]?.records.contains { $0.role == "assistant" && $0.runId == run } ?? false
+    }
+
+    /// Other doors stream by run ID; retain their bubble until the Mac transcript settles it into the saved row.
     private func receiveLiveTurn(_ msg: BridgeMessage) {
         guard let runId = msg.correlationID, !runId.isEmpty else { return }
         let kind = msg.metadata?["kind"]
@@ -252,6 +266,21 @@ extension ChatStore {
             setStreamingText(existingBubble, msg.text, correlationID: runId, sequence: seq, live: true)
             return
         }
+        if kind == "writing" {
+            // The agent's movement while a call's input streams is the bubble's live line until its words arrive.
+            let line = msg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { return }
+            let bubble = existingBubble ?? {
+                let reply = ChatMessage(role: .assistant, text: "", awaitingMacTranscript: true, runId: runId)
+                messages.append(reply)
+                liveTurnBubbles[runId] = reply.id
+                return reply.id
+            }()
+            streamingHintsByMessageId[bubble] = line
+            return
+        }
+        // Only an ending ends the turn; a kind this build does not know is a newer Mac's movement.
+        guard MobileChatTerminal.classify(kind) != nil else { return }
         settlePendingReply(runId, placeholderId: existingBubble)
         if kind == "cancelled" { errorBanner = "Stopped. Any partial reply has been kept." }
         let failure = kind == "error" ? msg.metadata?["errorDetail"] ?? msg.text : msg.metadata?["status"]
@@ -260,15 +289,13 @@ extension ChatStore {
                              sessionID: selectedSessionID, visibleEffects: true, live: true)
     }
 
-    /// The Mac says its transcript goes back further than the snapshot's
-    /// window, and no page here has reached the start yet.
+    /// Only the Mac can establish that history exists before the snapshot window.
     var canLoadOlderHistory: Bool {
         guard let session = Self.cleanSessionID(selectedSessionID) else { return false }
         return (iCloudSyncEngine.shared.chatTranscripts[session]?.hasOlder ?? pagedSessionsWithOlder.contains(session))
             && !historyExhaustedSessionIDs.contains(session)
     }
 
-    /// Older history the snapshot window leaves out, from the Mac on request.
     func loadOlderHistory() async {
         guard let session = Self.cleanSessionID(selectedSessionID), !isLoadingHistory else { return }
         let transcript = iCloudSyncEngine.shared.chatTranscripts[session]
@@ -285,7 +312,6 @@ extension ChatStore {
         }
     }
 
-    /// The whole text of a message the snapshot cut short.
     func loadWholeMessage(_ id: UUID) async {
         guard let session = Self.cleanSessionID(selectedSessionID), !isLoadingHistory else { return }
         isLoadingHistory = true
@@ -298,16 +324,8 @@ extension ChatStore {
     }
 
     func receiveICloudRejection(_ rejection: ICloudBridgeRejectedMessage) {
-        // Reply authentication failure says nothing about request execution.
-        // Keep observing the original identity; even its correlation is untrusted.
-        if rejection.reason.contains("signature") {
-            // Deduplicate signature-error banners in a bounded set while the bridge retains verification eligibility.
-            guard !surfacedSignatureRejectionIDs.contains(rejection.messageID) else { return }
-            surfacedSignatureRejectionIDs.insert(rejection.messageID)
-            if surfacedSignatureRejectionIDs.count > 200 { surfacedSignatureRejectionIDs.removeAll() }
-            errorBanner = "Could not verify one Mac reply. Check pairing; verification will retry when pairing changes."
-            return
-        }
+        // An unverified reply proves nothing about execution: the bridge retries it when pairing changes, never the person's banner.
+        if rejection.reason.contains("signature") { return }
         guard !pendingICloudPlaceholders.isEmpty else {
             errorBanner = rejection.userMessage
             return
@@ -347,13 +365,10 @@ extension ChatStore {
             placeholderText: "(Mac reply rejected — re-pair this iPhone with the Mac)",
             banner: rejection.userMessage
         )
-        // An unresumable rejection closes the durable observation.
         closePendingExchange(pendingId)
     }
 
-    /// An unsigned resync envelope is only delivered here after the bridge
-    /// durably installed a different KVS key. It authorizes observation only,
-    /// never a new request, session, or placeholder.
+    /// A durably replaced KVS key permits unsigned resync observation only; never create a request, session or placeholder.
     func receiveICloudResyncHint(_ hint: BridgeMessage, client: MacBridgeClient) {
         _ = hint
         guard !pendingICloudPlaceholders.isEmpty else { return }
@@ -387,10 +402,10 @@ extension ChatStore {
             messages[idx] = bubble
             noteEvidencedActivity(correlationID: correlationID,
                                   activity: activity ?? ToolActivityPresentation.progress(clean))
-            streamingHintsByMessageId.removeValue(forKey: placeholderId)
+            // The live line is the newest movement: this tool now, a later writing line after it.
+            streamingHintsByMessageId[placeholderId] = activity ?? ToolActivityPresentation.title(clean)
         } else {
-            // The Mac evidenced this activity; the waiting line ages from here
-            // instead of narrating the Mac from a local clock.
+            // Age the waiting line from evidenced Mac activity rather than inferring activity from the local clock.
             noteEvidencedActivity(correlationID: correlationID, activity: clean)
             streamingHintsByMessageId[placeholderId] = clean
         }
@@ -431,14 +446,13 @@ extension ChatStore {
             return hint
         }
         if showsReplyWaitHint {
-            // No evidenced activity to repeat — say only what this phone knows.
+            // Without evidenced activity, report only what this phone knows.
             return ChatWaitStatusPresentation.unacknowledged
         }
         return "Typing"
     }
 
-    /// A terminal receipt must retire both wait tasks together.  Keeping this
-    /// paired prevents a late timeout from contradicting a reply already shown.
+    /// Retire both wait tasks together so late timeout cannot contradict an already shown reply.
     func cancelReplyWaits(for pendingId: String) {
         pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
         if pendingICloudPlaceholders.isEmpty {
@@ -447,8 +461,7 @@ extension ChatStore {
         }
     }
 
-    /// Arm the silence watchdog without ending the pending exchange. A remote
-    /// terminal receipt, rather than elapsed time, settles the request.
+    /// Only a remote terminal settles the exchange; the silence watchdog changes status.
     func armTimeout(for pendingId: String, placeholderId: UUID) {
         pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
         let timeoutNs = iCloudReplyTimeoutSeconds * 1_000_000_000
@@ -483,8 +496,7 @@ extension ChatStore {
     private func fireTimeout(pendingId: String, placeholderId: UUID) {
         guard pendingICloudPlaceholders[pendingId] != nil else { return }
         notePendingExchangeSilent(correlationID: pendingId)
-        // Release the composer — the person can say something else while this
-        // request keeps being watched — but keep the bubble waiting.
+        // Release the composer so the user can speak again while the original bubble remains under observation.
         releaseLoading(for: placeholderId)
     }
 
@@ -537,9 +549,7 @@ extension ChatStore {
         messages[idx] = updated
     }
 
-    /// Ends a bubble the Mac did not finish. Her words stay exactly as they
-    /// arrived; what stopped or failed it is lifecycle evidence beside them,
-    /// as the Mac's own transcript keeps it.
+    /// Preserve partial words exactly; show Stop/failure as adjacent lifecycle evidence, matching the Mac transcript.
     func endPlaceholder(id placeholderId: UUID, lifecycle: String, state: String, awaitingMacTranscript: Bool = false) {
         guard let idx = messages.firstIndex(where: { $0.id == placeholderId }) else { return }
         streamingHintsByMessageId.removeValue(forKey: placeholderId)
@@ -550,7 +560,7 @@ extension ChatStore {
         messages[idx] = updated
     }
 
-    /// A bubble with no words yet has only the evidence to show.
+    /// An empty bubble can show lifecycle evidence only; do not invent reply text.
     static func end(_ message: inout ChatMessage, lifecycle: String, state: String) {
         message.completionState = state
         if message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

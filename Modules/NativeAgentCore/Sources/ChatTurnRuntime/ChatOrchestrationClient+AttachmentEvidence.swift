@@ -4,7 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Transcripts
-// Blueprint: | `ChatOrchestrationClient+AttachmentEvidence.swift` | `CodexCompletionTranscriptEvidence`: exact completion binding and saved attachment recovery; transcript/queue attachment writer and speech corrections |
+// Blueprint: | `ChatOrchestrationClient+AttachmentEvidence.swift` | `CodexCompletionTranscriptEvidence`; Exact completion and saved-attachment recovery |
 
 public enum CodexCompletionTranscriptEvidence {
     public enum RecoveryError: Error, Equatable {
@@ -80,13 +80,11 @@ public enum CodexCompletionTranscriptEvidence {
         return matches.first
     }
 
-    /// A saved user row as a restart recovers its turn.
     public struct SavedTurnInput: Sendable {
         public let runId: String
         public let content: String
         public let awaitingConsumption: Bool
-        /// Its attachments with their saved bytes (read only for input still
-        /// awaiting its turn), or why they cannot be read back whole.
+        /// Read saved attachment bytes only for input awaiting its turn; report why recovery cannot read them whole.
         public let attachments: Result<[MultimodalAttachment], any Error>
     }
 
@@ -111,9 +109,7 @@ public enum CodexCompletionTranscriptEvidence {
         }
     }
 
-    /// A saved user row's attachments as a resumed turn takes them: decoded,
-    /// each with its saved file's bytes. Every restart recovery of saved input
-    /// reads them here (a checkpointed turn, a contact message left queued).
+    /// All saved-input recovery shares this attachment reader so checkpoint and queued-message recovery use the same bytes.
     public static func savedAttachments(_ value: JSONValue?) throws -> [MultimodalAttachment] {
         var attachments = try decodeAttachments(value)
         for index in attachments.indices {
@@ -166,7 +162,7 @@ extension SwiftNativeChatOrchestrationClient {
         return path
     }
 
-    /// Pre-owner restore already selected the exact referenced attachment path.
+    /// Use the exact attachment path already selected by its restore owner.
     nonisolated static func persistAttachment(_ bytes: Data, to path: URL) throws {
         try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: path)
     }

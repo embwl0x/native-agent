@@ -4,9 +4,7 @@ import DeviceSync
 // Blueprint: | `AppToolNotificationInput.swift` | `NativeAgentNotificationDefaults`: `parseInput` |
 
 extension NativeAgentNotificationDefaults {
-    /// The one parser every notify entry point (chat shim, core bridge,
-    /// connector action) reads its title and body with, so they cannot drift
-    /// on the canonical message key or how they refuse.
+    /// All notification entry points share message keys and blank/missing refusals through this parser.
     public static func parseInput(
         _ input: [String: JSONValue],
         toolName: String

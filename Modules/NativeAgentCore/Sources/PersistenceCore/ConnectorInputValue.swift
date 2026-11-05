@@ -1,8 +1,7 @@
 import Foundation
 import Darwin
-// Blueprint: | `ConnectorInputValue.swift` | Connector input scalars and secret-free TransportAllowlist: typed canonical Slack auth.json policy and Telegram integer IDs shared by ingress and SecurityCenter; unreadable or malformed saved policy throws |
+// Blueprint: | `ConnectorInputValue.swift` | Checked transport scalars and allowlists; damaged authority throws. |
 
-/// Scalar conversion shared by action and request inputs.
 public enum ConnectorInputValue {
     public static func bool(_ raw: JSONValue?, default defaultValue: Bool) -> Bool {
         switch raw {
@@ -20,7 +19,6 @@ public enum ConnectorInputValue {
     }
 }
 
-/// Secret-free authority read shared by transport ingress and SecurityCenter.
 public struct TransportAllowlist: Sendable {
     public let chatIds: Set<String>
     public let userIds: Set<String>
@@ -50,7 +48,6 @@ public struct TransportAllowlist: Sendable {
         try slackPolicy(dataRoot: dataRoot).allowlist
     }
 
-    /// One checked metadata read for both ingress options and allowlist admission.
     public static func slackPolicy(dataRoot: URL) throws -> SlackPolicy {
         try slackPolicy(fields: read(slackMetadataPath(dataRoot: dataRoot), transport: "Slack"))
     }
@@ -63,8 +60,7 @@ public struct TransportAllowlist: Sendable {
         public let teamId: String?
     }
 
-    /// Missing options use the setup defaults; a present malformed value is
-    /// unavailable authority. Only the current writer's field names are read.
+    /// Only missing options use setup defaults; malformed saved values make authority unavailable.
     public static func slackPolicy(fields: [String: JSONValue]) throws -> SlackPolicy {
         func ids(_ key: String) throws -> Set<String> {
             guard let value = fields[key] else { return [] }
@@ -99,8 +95,7 @@ public struct TransportAllowlist: Sendable {
     }
 
     private static func read(_ path: URL, transport: String) throws -> [String: JSONValue] {
-        // Only a missing entry is empty. A dangling link or other unreadable
-        // saved policy must not admit a message.
+        // Only absence means empty policy; unreadable saved authority cannot admit messages.
         var metadata = stat()
         if lstat(path.path, &metadata) != 0 {
             guard errno == ENOENT else { throw failure(transport) }
@@ -108,8 +103,7 @@ public struct TransportAllowlist: Sendable {
         }
         guard metadata.st_mode & S_IFMT == S_IFREG else { throw failure(transport) }
         do {
-            // Authority keeps Slack's checked JSON semantics; the general
-            // persistence parser's non-finite-token repair is not admission.
+            // Authority keeps Slack's checked JSON semantics; the general persistence parser's non-finite-token repair is not admission.
             let decoded = try JSONSerialization.jsonObject(with: Data(contentsOf: path))
             guard case .object(let fields) = JSONValue(fromFoundation: decoded) else { throw failure(transport) }
             return fields

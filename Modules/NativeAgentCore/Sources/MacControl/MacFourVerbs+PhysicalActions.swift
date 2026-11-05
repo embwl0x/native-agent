@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacFourVerbs+PhysicalActions.swift` | `MacFourVerbs`: one physical tail for names and image points; point type clicks then types through focused-editor admission while preserving image/window identity |
+// Blueprint: | `MacFourVerbs+PhysicalActions.swift` | `MacFourVerbs`: Shared name/image gestures retain focus and capture identity |
 
 extension MacFourVerbs {
     enum PhysicalVerb: String, CaseIterable {
@@ -10,7 +10,7 @@ extension MacFourVerbs {
         case hold
         case key
         case move
-        /// A real double-click (click count 2 on both events) at the named thing.
+        /// Set click count on both events so the app receives a real double-click.
         case doubleClick = "double_click"
     }
 
@@ -28,8 +28,9 @@ extension MacFourVerbs {
         holding: String?,
         button: String?,
         attention: BurstAttention?,
-        /// A read already taken for this act; nil reads afresh.
-        carried: Sighting? = nil
+        /// Reuse a retained sight when supplied so an act cannot mix captures; nil explicitly requests a fresh read.
+        carried: Sighting? = nil,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         if verb == .hold, Self.keySpec(target) != nil, holding != nil {
             return MacFourVerbsReply(
@@ -38,20 +39,18 @@ extension MacFourVerbs {
                 detail: ["error": .string("nested_hold_not_supported")]
             )
         }
-        // Keys are physical but not on-screen targets. A key spec uses the same
-        // syntax as mac_keystroke: `w`, `space`, `cmd+s`, `shift+1`.
+        // Keys need no on-screen target, but retain the shared keystroke grammar so parsing cannot diverge across doors.
         if verb == .key || (verb == .hold && Self.keySpec(target) != nil) {
             let spec = Self.keySpec(target) ?? target.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !spec.isEmpty else {
                 return MacFourVerbsReply(ok: false, text: "Which key or chord should I use?")
             }
             let before: Sighting?
-            var observedPid = Self.requiredFrontPid
-            let sighted: Sighted = if let carried { .seen(carried) } else { await sight(part: nil) }
+            var observedPid = context.requiredFrontPid
+            let sighted: Sighted = if let carried { .seen(carried) } else { await sight(part: nil, turn: turn, context: context) }
             switch sighted {
             case .blind(let reply):
-                // The front app with every window closed still takes keys
-                // (cmd+n is how a window comes back).
+                // The front app with every window closed still takes keys (cmd+n is how a window comes back).
                 guard Self.string(reply.detail["error"]) == "no_frontmost_window" else { return reply }
                 before = nil
                 observedPid = observedPid ?? Self.int(Self.object(reply.detail["frontmost_app"])["pid"]).flatMap(Int32.init(exactly:))
@@ -63,21 +62,21 @@ extension MacFourVerbs {
             ]
             if let seconds { body["seconds"] = .double(seconds) }
             if let holding { body["holding"] = .string(holding) }
-            return await Self.$requiredFrontPid.withValue(observedPid) { await performHand(
+            return await context.holding(\.requiredFrontPid, observedPid) { context in await performHand(
                 body: body,
                 description: verb == .hold ? "Held \(target)." : "Pressed \(target).",
                 attention: attention,
                 before: before
-            ) }
+            , turn: turn, context: context) }
         }
 
         var before: Sighting
-        let sighted: Sighted = if let carried { .seen(carried) } else { await sight(part: nil) }
+        let sighted: Sighted = if let carried { .seen(carried) } else { await sight(part: nil, turn: turn, context: context) }
         switch sighted {
         case .blind(let reply): return reply
         case .seen(let seen): before = seen
         }
-        let acquisition = await reacquireSight(for: target, sighting: &before) {
+        let acquisition = await reacquireSight(for: target, sighting: &before, turn: turn, context: context) {
             if case .none = Self.resolve(target, among: $0) { return true }
             return false
         }
@@ -88,11 +87,9 @@ extension MacFourVerbs {
            // A cross-app destination resolves in its own anchored sight, not a refreshed source window.
            destinationApp == nil,
            let destination {
-            // A drag needs two current points. If only its moving destination
-            // dropped out, refresh the entire sight and resolve both ends
-            // again so an old source coordinate is never paired with a fresh
-            // destination.
-            let acquisition = await reacquireSight(for: destination, sighting: &before) {
+            // A drag needs two current points. If only its moving destination dropped out, refresh the entire sight and resolve both ends again so an old
+            // source coordinate is never paired with a fresh destination.
+            let acquisition = await reacquireSight(for: destination, sighting: &before, turn: turn, context: context) {
                 guard case .hit = Self.resolve(target, among: $0),
                       case .none = Self.resolve(destination, among: $0) else { return false }
                 return true
@@ -112,10 +109,8 @@ extension MacFourVerbs {
             return MacFourVerbsReply(ok: false, text: "\(Self.name(source)) "
                 + (source.enabled == false ? "is disabled." : "has no readable enabled state. Read the app again before acting.") + "\n" + before.render)
         }
-        // These are explicitly physical gestures, so a visible region is a
-        // valid pointer-hold target just as it is a drag target. Semantic
-        // clicks still require an inner object in actOnce; point/path safety
-        // and balanced release remain the same for every physical gesture.
+        // These are explicitly physical gestures, so a visible region is a valid pointer-hold target just as it is a drag target. Semantic clicks still require
+        // an inner object in actOnce; point/path safety and balanced release remain the same for every physical gesture.
         guard let sourceFrame = Self.visiblePortion(of: source.frame, within: before.visibleFrame) else {
             return MacFourVerbsReply(
                 ok: false,
@@ -149,7 +144,7 @@ extension MacFourVerbs {
                 button: button,
                 attention: attention,
                 before: before
-            )
+            , turn: turn, context: context)
         }
 
         var end: MacPointerPosition?
@@ -197,25 +192,21 @@ extension MacFourVerbs {
             attention: attention, physicalOnly: source.physicalOnly,
             pointerTarget: (verb == .hover || verb == .move) ? target : nil,
             receipt: reobservedAfterTransientMiss ? ["dynamic_reobserved": .bool(true)] : [:]
-        )
+        , turn: turn, context: context)
     }
 
-    /// The one physical tail, once both ends are screen points, for a named
-    /// act, a place on an image and a watch's frame alike: a drag's line clear
-    /// of password fields, both ends and the line clear of anything covering
-    /// the window, then the hand, with what it did said in words. A watch
-    /// passes the secret fields where they are now and `confirm: false`: its
-    /// stream is the observation, so no confirming look follows the hand.
+    /// Share one pointer tail for named, image and watch acts so password/obstruction checks and input gates cannot diverge. Watches own their observation
+    /// stream and suppress the extra confirming look.
     func performPointer(
         _ gesture: String, at start: MacPointerPosition, to end: MacPointerPosition?,
         saying source: String, destination: String?, before: Sighting, excluding excluded: [MacAXFrame] = [],
         seconds: Double?, holding: String?, button: String?, attention: BurstAttention?,
         physicalOnly: Bool = false, pointerTarget: String? = nil, receipt: [String: JSONValue] = [:],
         secrets: [MacAXFrame]? = nil, confirm: Bool = true, pressed: ActTarget? = nil, described: String? = nil,
-        imageFrame: String? = nil, text: String? = nil
+        imageFrame: String? = nil, text: String? = nil,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
-        // A refusal carries the receipt too: what already happened (a raise)
-        // stays on record when the pointer itself sends nothing.
+        // A refusal carries the receipt too: what already happened (a raise) stays on record when the pointer itself sends nothing.
         func refused(_ reply: MacFourVerbsReply) -> MacFourVerbsReply {
             MacFourVerbsReply(ok: false, text: reply.text, detail: reply.detail.merging(receipt) { current, _ in current })
         }
@@ -242,7 +233,7 @@ extension MacFourVerbs {
             body["to_y"] = .double(end.y)
         }
         if gesture == PhysicalVerb.drag.rawValue {
-            // A named drag always travels; 0 or an unstated pace is a quarter second (the declared shape).
+            // Named drags always travel; absent or zero pace selects the declared quarter-second duration.
             body["travel_seconds"] = .double(seconds.flatMap { $0 > 0 ? $0 : nil } ?? 0.24)
         } else if let seconds { body["seconds"] = .double(seconds) }
         if let holding { body["holding"] = .string(holding) }
@@ -267,20 +258,18 @@ extension MacFourVerbs {
             pointerTarget: pointerTarget,
             pressed: pressed,
             confirm: confirm
-        )
+        , turn: turn, context: context)
         var detail = reply.detail.merging(receipt) { _, new in new }
         if let button { detail["button"] = .string(button) }
         return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
     }
 
-    /// A place on an image she was handed: the image's own frame turns its
-    /// pixels into screen points, which must lie in the window in front; the hand
-    /// rechecks their capture identity at emission, then
-    /// the same physical tail as a named act. The receipt names the image and
-    /// the screen points used.
+    /// Convert image points using that capture's own frame, then recheck image/window identity at emission. Reuse the named-act physical tail and retain the
+    /// coordinates in the receipt.
     func performAtPlace(
         _ place: MacImagePlace, verb: String, text: String? = nil, seconds: Double?, holding: String?, button: String?,
-        before carried: Sighting?, attention: BurstAttention?
+        before carried: Sighting?, attention: BurstAttention?,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         func refused(_ words: String, _ error: String, screen: String? = nil) -> MacFourVerbsReply {
             MacFourVerbsReply(ok: false, text: words + " Nothing was sent." + (screen.map { "\n" + $0 } ?? ""),
@@ -292,8 +281,10 @@ extension MacFourVerbs {
                            "invalid_point_act")
         }
         if verb == "type", (text ?? "").isEmpty { return refused("Give the text to type at that point.", "missing_text") }
-        guard let frame = MacImageFrames.frame(place.image) else {
-            return refused(place.image.map { "I don't hold image \($0) (only this session's last few are kept); look again with screen pixels and point into that." }
+        guard let frame = MacImageFrames.frame(place.image, turn: turn) else {
+            return refused(place.image.map { """
+                I don't hold image \($0) (only this session's last few are kept); look again with screen pixels and point into that.
+                """ }
                 ?? "No image has been handed to me in this session yet; take screen with pixels:true first and point into it.", "unknown_image")
         }
         let geometry = frame.geometry
@@ -306,17 +297,16 @@ extension MacFourVerbs {
             return refused("That image has no capture identity; look again with pixels:true before pointing.",
                            MacLookFrameStore.ResolveFailure.staleFrame.rawValue)
         }
-        // Check before a new sight or containment refusal can hide the old
-        // image's drift. The hand checks again after all suspending work.
+        // Check before a new sight or containment refusal can hide the old image's drift. The hand checks again after all suspending work.
         for point in [start] + (end.map { [$0] } ?? []) {
-            if let failure = capture.refusal(at: point, now: Date()) {
+            if let failure = capture.refusal(at: point, now: Date(), context: context) {
                 return refused(failure.reason, failure.code)
             }
         }
         func spoken(_ point: MacPointerPosition) -> String { "screen point (\(Int(point.x.rounded())), \(Int(point.y.rounded())))" }
         let before: Sighting
         if let carried { before = carried } else {
-            switch await sight(part: nil) {
+            switch await sight(part: nil, turn: turn, context: context) {
             case .blind(let reply): return reply
             case .seen(let seen): before = seen
             }
@@ -325,7 +315,10 @@ extension MacFourVerbs {
             return refused("I can't tell where the window in front is, so I won't point into it.", "front_window_unknown", screen: before.render)
         }
         guard start.isInside(window), end?.isInside(window) != false else {
-            return refused("That lands at \(spoken(start))\(end.map { " to " + spoken($0) } ?? ""), outside the window in front (\(before.appName ?? "unknown")), where I haven't looked.",
+            return refused("""
+                That lands at \(spoken(start))\(end.map { " to " + spoken($0) } ?? ""), outside the window in front (\(before.appName ?? "unknown")), where I \
+                haven't looked.
+                """,
                            "point_outside_front_window", screen: before.render)
         }
         var receipt: [String: JSONValue] = ["image": .string(frame.id), "screen_point": start.json]
@@ -335,6 +328,6 @@ extension MacFourVerbs {
             before: before, seconds: seconds, holding: holding, button: button, attention: attention, receipt: receipt,
             described: verb == "type" ? "Clicked \(spoken(start)) and sent text to the editor that took focus." : nil,
             imageFrame: frame.id, text: text
-        )
+        , turn: turn, context: context)
     }
 }

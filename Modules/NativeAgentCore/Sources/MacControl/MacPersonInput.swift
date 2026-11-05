@@ -5,18 +5,14 @@ import PersistenceCore
 import CoreGraphics
 import Darwin
 #endif
-// Blueprint: | `MacPersonInput.swift` | `MacPersonInput` owns exact person/synthetic input provenance and Mac presence transitions consumed by PersonPresence and hardware safety; `observeReturn` arms the first physical return after phone departure even before Mac idle, without changing raw hardware presence; motor-fenced session activity permits capture resumption without Input Monitoring and never asserts presence; `NativeAgentMacEventIdentity`, `ScriptedInputSources` and `NativeAgentMotorEpoch` identify their input and motor output |
+// Blueprint: | `MacPersonInput.swift` | `MacPersonInput`, `observeReturn`, `NativeAgentMacEventIdentity`, `ScriptedInputSources`, `NativeAgentMotorEpoch` |
 
-/// Identifies input synthesized by NativeAgent itself.
-///
-/// The tag contains no user data. Person provenance is classified by poster PID
-/// in `MacPersonInput`, shared by the tap and attention observer.
+/// The tag contains no user data; shared poster-PID classification distinguishes person and synthetic input.
 public enum NativeAgentMacEventIdentity {
-    public static let sourceUserData: Int64 = 0x4E_41_54_49_56_45 // "NATIVE"
+    public static let sourceUserData: Int64 = 0x4E_41_54_49_56_45
 }
 
-/// While her script runs, the input it drives is hers, not the person's. A
-/// script can hide input from the tap; while it runs, unseen input is unknown.
+/// Scripts may hide synthetic input from the tap; unseen input stays unknown while they run.
 public enum ScriptedInputSources {
     private static let lock = NSLock()
     private nonisolated(unsafe) static var running = 0
@@ -31,9 +27,7 @@ public enum ScriptedInputSources {
 
 }
 
-/// Bounded, process-local provenance for UI changes caused by NativeAgent's
-/// own motor output. ActivityWatch consumes only this timestamp seam; it does
-/// not gain a scheduler, store, or dependency on an attention session.
+/// ActivityWatch consumes only motor timestamps, without acquiring a scheduler, store or attention-session dependency.
 public enum NativeAgentMotorEpoch {
     public static let defaultWindow: TimeInterval = 3
     private static let lock = NSLock()
@@ -60,8 +54,7 @@ public enum NativeAgentMotorEpoch {
         return uptime >= last && uptime - last <= window
     }
 
-    /// Age of the last agent motor event, `.infinity` when none. Comparing
-    /// it with system input age attributes activity at any sampling cadence.
+    /// Compare motor age with system input age so attribution works at any sampling cadence.
     public static func secondsSinceLastAgentMotorEvent(
         atUptime uptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> TimeInterval {
@@ -72,13 +65,12 @@ public enum NativeAgentMotorEpoch {
         return uptime - last
     }
 
-    /// Only HID-tap posts reset the idle clock; accessibility actions and
-    /// targeted posts must not hide the person's input when comparing ages.
+    /// Only HID-tap posts reset idle; AX and targeted posts must not conceal the person’s input.
     private nonisolated(unsafe) static var lastPostedHIDUptime = -Double.infinity
 
-    /// Call just before posting an event to the HID tap (`.cghidEventTap`).
+    /// Stamp before HID posting so idle attribution cannot race the event.
     public static func notePostedHIDEvent() {
-        MacPersonInput.noteHerPost(targeted: false)
+        MacPersonInput.noteAgentPost(targeted: false)
         let uptime = ProcessInfo.processInfo.systemUptime
         lock.lock()
         lastPostedHIDUptime = uptime
@@ -87,7 +79,6 @@ public enum NativeAgentMotorEpoch {
         PersonOnlyWindows.noteAgentMotor()
     }
 
-    /// Age of her last HID-tap post, `.infinity` when there has been none.
     static func secondsSinceLastPostedHIDEvent() -> TimeInterval {
         let uptime = ProcessInfo.processInfo.systemUptime
         lock.lock()
@@ -97,35 +88,17 @@ public enum NativeAgentMotorEpoch {
     }
 }
 
-/// The person's exact input and presence, independent of driver authority.
-/// Recent input can stop an effect; idle never authorizes foregrounding.
-///
-/// Idle clocks include synthetic events, so provenance uses poster PID:
-/// hardware input carries pid 0 or WindowServer's; her posts, scripts and
-/// helpers carry theirs. Targeted posts bypass the session tap and are
-/// stamped at their post site.
-///
-/// Unseen system input is the person's unless it predates the tap or her
-/// own post or script could be hidden; then person idle stays unknown until
-/// their own input is seen again.
-///
-/// Privacy: the listen-only tap reads only type, arrival time and poster PID.
-/// It retains timestamps for newest person, synthetic and unseen input,
-/// never key contents, modifiers or positions; nothing is written or sent.
+/// Recent person input can stop an effect; idle never authorizes foregrounding. Classify poster PIDs because system idle includes synthetic input; stamp
+/// targeted posts at emission since they bypass the tap. Unseen input stays unknown if it predates the tap or could be hidden synthetic input, until person
+/// input is seen again. Retain only event type, time and poster PID; never key contents, modifiers or positions, and never persist or send them.
 public enum MacPersonInput {
-    /// Typing and pointing leave gaps well under this; a chat message sent to
-    /// her is older than this by the time her call lands.
+    /// The window spans gaps in typing and pointing but ends before a submitted chat request reaches its call.
     public static let activeWindow: TimeInterval = 3
 
-    /// Her own post is noted just before it is posted, and input in the
-    /// person's own window a moment after it lands, so two ages this close
-    /// are the same input.
+    /// Treat near-equal ages as one event to account for stamping just before posting and just after arrival.
     static let ownEventTolerance: TimeInterval = 0.1
 
-    /// Seconds since the person's last input when that is under `activeWindow`;
-    /// nil when they are idle. Only the exact fact may say they are not at the
-    /// keys: while it is unknown, any recent input on the combined clock that
-    /// was not her own HID post is possibly theirs, and she waits.
+    /// Unknown person idle cannot prove absence; recent combined input not attributed to the agent requires waiting.
     public static func activeSecondsAgo() -> Double? {
         // While the person's own chat is up, only Stop hands the Mac back.
         guard !PersonOnlyWindows.isShowing else { return nil }
@@ -151,22 +124,17 @@ public enum MacPersonInput {
     private static let clock = NSLock()
     private nonisolated(unsafe) static var lastPerson = -Double.infinity
     private nonisolated(unsafe) static var lastSynthetic = -Double.infinity
-    /// The last moment the system was found to have input the tap never saw
-    /// and that may have been hers: the person's idle is unknown until they
-    /// are seen after it.
+    /// Possibly synthetic input missed by the tap makes person idle unknown until their next observed input.
     private nonisolated(unsafe) static var lastBlind = -Double.infinity
-    /// When the tap started: input before it was never its to see.
+    /// Input before tap startup cannot establish tap provenance.
     private nonisolated(unsafe) static var started = Double.infinity
     private nonisolated(unsafe) static var windowServer: pid_t = 0
     private nonisolated(unsafe) static var port: CFMachPort?
-    /// Whether the last transition said away. Only the person-input thread touches it.
+    /// Only the person-input thread touches this transition state.
     private nonisolated(unsafe) static var away = false
-    /// The latest settled transition, read under `clock`; input while here
-    /// changes its time only for an armed phone return. Unknown is no arrival.
+    /// Read settled transitions under `clock`; unknown input cannot invent arrival or advance time except for an armed phone return.
     private nonisolated(unsafe) static var presenceTransition: (here: Bool, since: Date)?
-    /// An evidenced phone departure awaits the next physical input even if
-    /// the Mac's own five-minute absence has not begun. This is an input wake,
-    /// not another here/away fact; only observed input can settle the return.
+    /// Arm a phone-evidenced return before Mac idle if needed; only observed physical input may settle it.
     private nonisolated(unsafe) static var returnAfter: Date?
     /// Due when the person would be away, set from the fact each time; never a poll.
     private nonisolated(unsafe) static var awayDue: CFRunLoopTimer?
@@ -176,23 +144,17 @@ public enum MacPersonInput {
     private nonisolated(unsafe) static var stopping = false
     private static let threadExit = DispatchGroup()
 
-    /// Posted once per transition, on the person-input thread: userInfo
-    /// `signal` is "person.away" (idle `awayAfter`) or "person.here" (their own
-    /// input again, including an armed phone return, never hers),
-    /// `idle_seconds` the fact's. PersonPresence supplies the combined reading.
+    /// Post each transition once on the input thread; only person input, including an armed phone return, may signal person.here.
     public static let presenceChanged = Notification.Name("NativeAgent.personPresence")
 
-    /// Whether the tap runs. Touched once at launch: macOS applies an Input
-    /// Monitoring grant at launch, so one made later waits for the next one
-    /// (the permission card says so).
+    /// Input Monitoring grants apply at launch, so later grants require another launch before the tap can run.
     private static let launchListening: Bool = listen()
     public static var listening: Bool {
         _ = launchListening
         return clock.withLock { port != nil }
     }
 
-    /// Terminal engine shutdown; closes input admission before retiring the
-    /// resources on their own run loop, then acknowledges the actual thread exit.
+    /// Close admission before retiring resources, then acknowledge the actual input-thread exit.
     public static func shutdown() async {
         #if canImport(CoreGraphics) && os(macOS)
         let retiring = clock.withLock {
@@ -201,8 +163,7 @@ public enum MacPersonInput {
             port = nil; awayDue = nil; inputSource = nil
             return resources
         }
-        // Admission is already closed. Retire OS resources without holding the
-        // timestamp lock that an already-entered input callback may need.
+        // Release the timestamp lock before resource retirement because an entered callback may need it.
         if let tap = retiring.0 { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
         if let timer = retiring.1 { CFRunLoopTimerInvalidate(timer) }
         if let source = retiring.2 { CFRunLoopSourceInvalidate(source) }
@@ -234,7 +195,7 @@ public enum MacPersonInput {
                                     .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
-            // Plus system-defined events (14: media keys), so those are accounted for too.
+            // Include system-defined media events so their input is attributed too.
             eventsOfInterest: types.reduce(CGEventMask(1) << 14) { $0 | CGEventMask(1) << $1.rawValue },
             callback: { _, type, event, _ in
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -297,7 +258,7 @@ public enum MacPersonInput {
     }
 
     #if canImport(CoreGraphics) && os(macOS)
-    /// Shared provenance for the tap and synchronous attention takeover.
+    /// The tap and synchronous takeover must classify provenance identically.
     static func isPerson(_ event: CGEvent) -> Bool {
         let pid = pid_t(truncatingIfNeeded: event.getIntegerValueField(.eventSourceUnixProcessID))
         if pid == 0 { return true }
@@ -318,9 +279,7 @@ public enum MacPersonInput {
         return person
     }
 
-    /// The fact's transition, posted once: away once the person has been idle
-    /// `awayAfter`, here again on their own input (also after an armed phone
-    /// departure). Then due when they would be away.
+    /// Settle away once at the idle deadline and here only on person input; then arm the next exact deadline.
     private static func settle() {
         clock.withLock { settleAgain = false }
         let fact = presence()
@@ -341,44 +300,37 @@ public enum MacPersonInput {
         }
         // Away, nothing is due until their own input says here.
         let wait = away ? 315_360_000 : awayAfter - min(fact?.seconds ?? idleAtLeast() ?? 0, awayAfter)
-        // The deadline is set under the same lock settleSoon takes: input noticed
-        // meanwhile is settled next, never overwritten by this pass (once, no loop).
+        // Use settleSoon’s lock so intervening input is settled next rather than overwritten.
         clock.withLock {
             awayDue.map { CFRunLoopTimerSetNextFireDate($0, CFAbsoluteTimeGetCurrent() + (settleAgain ? 0 : wait)) }
         }
     }
 
-    /// Input the system saw after everything the tap did: the person's, unless
-    /// it predates the tap or her own post or script may be what was hidden.
-    /// Under `clock`; true when it was the person's.
+    /// Under `clock`, unseen input is the person’s only when neither pre-tap nor possibly hidden synthetic provenance explains it.
     private static func markUnseen(now: Double) -> Bool {
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null)
         let input = now - idle
         guard idle.isFinite, input > max(lastPerson, lastSynthetic) + ownEventTolerance else { return false }
-        let hers = ScriptedInputSources.isRunning
+        let ownInput = ScriptedInputSources.isRunning
             || abs(idle - NativeAgentMotorEpoch.secondsSinceLastPostedHIDEvent()) <= ownEventTolerance
-        if input > started, !hers { lastPerson = input; return true }
+        if input > started, !ownInput { lastPerson = input; return true }
         lastBlind = now
         return false
     }
 
-    /// The person's input only a read saw (Secure Event Input hides it from the
-    /// tap): the presence transition is settled on the input thread, now,
-    /// through its own timer, so person.here and the next away deadline follow.
+    /// Secure Event Input can hide person input from the tap; settle read-observed input on the owner thread so transitions and deadlines follow.
     private static func settleSoon() {
         clock.withLock {
             settleAgain = true
             awayDue.map { CFRunLoopTimerSetNextFireDate($0, CFAbsoluteTimeGetCurrent()) }
         }
     }
-    /// A read saw their input since the running settle began; under `clock`.
+    /// Read-observed input after settlement began must be reconciled under `clock`.
     private nonisolated(unsafe) static var settleAgain = false
     #endif
 
-    /// Her own post, just before it goes out: input the tap missed is marked
-    /// first, so her post can't make it look seen. A targeted post never
-    /// passes the tap, so it is stamped hers here.
-    static func noteHerPost(targeted: Bool) {
+    /// Mark missed input before posting so synthetic output cannot make it appear seen; stamp targeted posts here because they bypass the tap.
+    static func noteAgentPost(targeted: Bool) {
         #if canImport(CoreGraphics) && os(macOS)
         guard listening else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -391,9 +343,7 @@ public enum MacPersonInput {
         #endif
     }
 
-    /// Seconds since the person's last input (nil while unknown: not seen
-    /// since launch or since missed input that may have been hers) and whose input was
-    /// newest ("person", "hers" or "unknown"). Nil when the tap cannot run.
+    /// No tap or unresolved provenance yields no person-idle number; retain whose input was newest.
     public static func idle() -> (seconds: Double?, lastInput: String)? {
         #if canImport(CoreGraphics) && os(macOS)
         guard listening, CGPreflightListenEventAccess() else { return nil }
@@ -402,7 +352,7 @@ public enum MacPersonInput {
             let seen = markUnseen(now: now)
             let newest = max(lastPerson, lastSynthetic)
             return (seen, (lastPerson > lastBlind ? now - lastPerson : nil,
-                           newest <= lastBlind ? "unknown" : lastSynthetic > lastPerson ? "hers" : "person"))
+                           newest <= lastBlind ? "unknown" : lastSynthetic > lastPerson ? "agent" : "person"))
         }
         if seen { settleSoon() }
         return idle
@@ -411,9 +361,7 @@ public enum MacPersonInput {
         #endif
     }
 
-    /// Seconds since anyone's input, hers included. The person has been idle
-    /// at least this long whatever the tap saw, so it can say away (never
-    /// here) while their own clock is unknown, e.g. after a launch.
+    /// Combined idle supplies an absence floor while person provenance is unknown; it can prove away, never here.
     public static func idleAtLeast() -> Double? {
         #if canImport(CoreGraphics) && os(macOS)
         let any = CGEventSource.secondsSinceLastEventType(
@@ -425,11 +373,8 @@ public enum MacPersonInput {
         #endif
     }
 
-    /// Session input newer than our last motor output by its attribution
-    /// window. Capture uses this in every permission state to resume its
-    /// metadata span after idle; it does not assert that the person is here.
-    /// Comparing ages keeps our input excluded even on a minute-long tick.
-    /// Unlike the person's exact clock, this read needs no Input Monitoring.
+    /// Motor-relative input age resumes capture metadata without asserting presence or requiring Input Monitoring. Compare ages so synthetic input remains
+    /// excluded even across a minute-long sampling interval.
     public static func sessionIdleAfterAgentMotor() -> Double? {
         idleAtLeast().flatMap { seconds in
             seconds + NativeAgentMotorEpoch.defaultWindow
@@ -437,11 +382,9 @@ public enum MacPersonInput {
         }
     }
 
-    /// Idle this long, the person is away.
     public static let awayAfter: TimeInterval = 300
 
-    /// Preserve the first physical return from a phone-evidenced absence.
-    /// Repeated reads cannot move an armed return or replay a settled one.
+    /// Repeated reads cannot move an armed phone return or replay a settled one.
     public static func observeReturn(after departure: Date) {
         #if canImport(CoreGraphics) && os(macOS)
         guard listening else { return }
@@ -452,23 +395,18 @@ public enum MacPersonInput {
             returnAfter = departure
             return true
         }
-        // Also catches input that arrived between reading the phone evidence
-        // and arming this wake; Secure Event Input follows settleSoon too.
+        // Reconcile input that arrived between reading phone evidence and arming the wake, including hidden secure input.
         if armed { settleSoon() }
         #endif
     }
 
-    /// The Mac input fact PersonPresence and hardware safety read:
-    /// here or away and seconds since the person's own input (hers never
-    /// counts). While their own clock is unknown, the floor nobody has touched
-    /// the Mac for still says away, never here; nil while unknown.
+    /// Presence excludes synthetic input; while provenance is unknown, combined idle may prove away but never here.
     public static func presence() -> (here: Bool, seconds: Double)? {
         let seconds = idle()?.seconds ?? idleAtLeast().flatMap { $0 >= awayAfter ? $0 : nil }
         return seconds.map { ($0 < awayAfter, $0) }
     }
 
-    /// The current presence only when its transition was settled by the input
-    /// owner. A read cannot invent an arrival or advance its timestamp.
+    /// Reads cannot invent arrivals or advance timestamps; only the input owner settles transitions.
     public static func presenceChange() -> (here: Bool, since: Date)? {
         guard let fact = presence() else { return nil }
         return clock.withLock {
@@ -477,7 +415,6 @@ public enum MacPersonInput {
         }
     }
 
-    /// `presence()` as an action carries it.
     public static var presenceDetail: JSONValue {
         guard let fact = presence() else {
             return .object(["here": .null, "idle_seconds": .null,
@@ -486,7 +423,7 @@ public enum MacPersonInput {
         return .object(["here": .bool(fact.here), "idle_seconds": .int(Int64(fact.seconds.rounded()))])
     }
 
-    /// `idle()` as a window read carries it: no number while it is unknown.
+    /// Unknown idle must remain absent in window reads.
     public static var idleDetail: [String: JSONValue] {
         guard let idle = idle() else {
             return ["permission": .string("input_monitoring_needed"), "last_input": .string("unknown")]

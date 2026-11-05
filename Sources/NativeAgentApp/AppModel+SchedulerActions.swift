@@ -54,7 +54,7 @@ extension AppModel {
         return feed
     }
 
-    /// The scheduler switch reflects the persisted job after every attempted change.
+    /// After each attempted change, the switch must reflect the persisted job.
     @MainActor
     func setSchedulerJobEnabled(id: String, enabled: Bool) async -> SchedulerJobToggleOutcome {
         do {
@@ -62,8 +62,7 @@ extension AppModel {
             await refreshSchedulerJobs()
             return .verified(job)
         } catch {
-            // Re-read regardless: the switch must show the store's truth, not
-            // the click's optimism.
+            // Re-read after mutation so the switch reflects storage rather than the click.
             await refreshSchedulerJobs()
             return .failed(UserFacingError.cause(error, action: "change that job"))
         }
@@ -87,7 +86,7 @@ extension AppModel {
     }
 
     @MainActor
-    func createWorkshopTask(title: String, objective: String) async -> NewDeskTaskOutcome {
+    func createDeskTask(title: String, objective: String) async -> NewDeskTaskOutcome {
         do {
             _ = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
             statusText = "Desk task created"

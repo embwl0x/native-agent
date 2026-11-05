@@ -9,37 +9,38 @@ import TrustCenter
 import Darwin
 import Darwin
 #endif
-// Blueprint: | `FileActionContext.swift` | File source, path authority and authenticated connector context; outgoing attachments use the existing Trust fence, one bounded verified descriptor and shared secret-content inspection |
+// Blueprint: | `FileActionContext.swift` | File path authority and connector context; Trust-fenced descriptor-bound attachments |
 let connectorReadFileDefaultMaxBytes = 200_000
-/// Compact default for long handoff markdown files, unless max_bytes is explicit.
+/// Keep long handoff markdown compact unless the caller explicitly requests max_bytes.
 let connectorReadFileHandoffDefaultMaxBytes = 12_000
 let connectorListDirMaxEntries = 200
 let connectorResultMaxChars = 30_000
-/// Senses request path + size through the existing read fences and verified
-/// descriptor. Ordinary file reads never bind this port.
+/// One file operation's read shape and admitted image continuation.
+public struct FileReadOptions: Sendable {
+    public var metadataOnly: Bool
+    public var imageSink: LocalToolImage.Sink?
+    public init(metadataOnly: Bool = false, imageSink: LocalToolImage.Sink? = nil) {
+        self.metadataOnly = metadataOnly; self.imageSink = imageSink
+    }
+}
+/// Senses reuse verified descriptors and read fences for metadata without binding ordinary file reads.
 public enum FileReadSourceMaterial {
-    @TaskLocal public static var metadataOnly = false
-    /// What files.read itself returns real content for: images and text, by
-    /// content. Anything else is foreign bytes to it, so a sense serves it.
+    /// Text and images are readable content; foreign bytes need a sense.
     public static func nativeReadSupported(path: String) -> Bool {
         let path = (path as NSString).expandingTildeInPath
         return VerifiedImageRead.isImagePath(URL(fileURLWithPath: path)) || !isBinary(path: path)
     }
-    /// Binary by content, never by extension: a NUL byte or invalid UTF-8 in
-    /// the first 8 KB (a scalar cut at the sample's end is not invalid).
+    /// Classify by content, never extension; a UTF-8 scalar cut at the 8 KB sample boundary is not invalid.
     public static func isBinary(path: String) -> Bool {
         let path = (path as NSString).expandingTildeInPath
-        // A document package (.pages, .numbers, .key, .rtfd) is foreign too.
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue { return true }
-        // Failed admission stays on the native route, whose reader reports
-        // the error. In particular, opening a pipe must never wait for a writer.
+        // Failed admission stays with the native error owner; opening a pipe must never wait for a writer.
         guard let handle = try? FileSystemActions.openRegularReadHandle(URL(fileURLWithPath: path)) else { return false }
         defer { try? handle.close() }
         return (try? isBinary(handle: handle)) ?? false
     }
-    /// Classify the admitted file without reopening its pathname or consuming
-    /// bytes from the subsequent read.
+    /// Classify the admitted descriptor without reopening its path or consuming the subsequent read.
     static func isBinary(handle: FileHandle) throws -> Bool {
         let offset = try handle.offset()
         try handle.seek(toOffset: 0)
@@ -70,36 +71,37 @@ let connectorSensitiveDataSubpaths: Set<String> = [
     "senses/ledger",
     "senses/news",
 ]
-// App-data reach excludes private stores.
 let connectorPartPrivateDataSubpaths = [
     "credentials", "connectors", "telegram/config.json", "slack/config.json",
     "mobile", "mobile_push", "notifications/push_tokens.json",
     "claude", "bridge-config",
 ]
-/// Connector context retains resolved roots and the call's file-access policy.
 public struct ConnectorActionContext: Sendable {
-    /// Resolution base for reads/repository paths + an always-allowed root.
+    public var turn: Turn?
+    public var readOptions: FileReadOptions
+    public var didOpenAppendHandle: (@Sendable () -> Void)?
     public var repoRoot: URL?
-    /// file_access dict: mode, sandbox, writableRoots, addDirs. Open-shape.
     public var fileAccess: [String: JSONValue]
-    /// data root used for the sensitive-path block + data/skills allowance.
     public var dataRoot: URL?
-    /// Explicit allowed roots beyond repo_root (persona root, workspace root).
     public var extraAllowedRoots: [URL]
-    /// Persona root (SOUL.md / USER.md / VOICE.md / GROWTH.md / AGENTS.md +
-    /// `skills/bodies/`). When nil, persona reads use defaultPersonaRoot for
-    /// the context's data root.
+    /// An absent explicit root resolves through defaultPersonaRoot for this context's data root.
     public var personaRoot: URL?
-    /// Workspace aliases in file reads and the root for `workspace_list`.
     public var workspaceRoot: URL?
-    let appDataWrite: Bool?
+    var appDataWrite: Bool? {
+        guard let reach = turn?.fileReach, let dataRoot,
+              reach.root.standardizedFileURL.resolvingSymlinksInPath().path == dataRoot.standardizedFileURL.resolvingSymlinksInPath().path else { return nil }
+        return reach.write
+    }
     public init(
         repoRoot: URL?,
         fileAccess: [String: JSONValue] = [:],
         dataRoot: URL? = nil,
         extraAllowedRoots: [URL] = [],
         personaRoot: URL? = nil,
-        workspaceRoot: URL? = nil
+        workspaceRoot: URL? = nil,
+        turn: Turn?,
+        readOptions: FileReadOptions = .init(),
+        didOpenAppendHandle: (@Sendable () -> Void)? = nil
     ) {
         let dataRoot = dataRoot.flatMap { $0.path.isEmpty ? nil : $0 }
         self.repoRoot = repoRoot.flatMap { $0.path.isEmpty ? nil : $0 }
@@ -108,10 +110,7 @@ public struct ConnectorActionContext: Sendable {
         self.extraAllowedRoots = extraAllowedRoots
         self.personaRoot = personaRoot.flatMap { $0.path.isEmpty ? nil : $0 }
         self.workspaceRoot = workspaceRoot.flatMap { $0.path.isEmpty ? nil : $0 }
-        if let reach = AbilityStore.fileReach, let dataRoot,
-           reach.root.standardizedFileURL.resolvingSymlinksInPath().path == dataRoot.standardizedFileURL.resolvingSymlinksInPath().path {
-            self.appDataWrite = reach.write
-        } else { self.appDataWrite = nil }
+        self.turn = turn; self.readOptions = readOptions; self.didOpenAppendHandle = didOpenAppendHandle
     }
     /// Dispatch roots stay in-process; only the file-access dictionary is JSON.
     public static func fromDispatch(_ ctx: DispatchContext) -> ConnectorActionContext {
@@ -122,23 +121,23 @@ public struct ConnectorActionContext: Sendable {
             fileAccess: fa,
             dataRoot: ctx.dataRoot,
             extraAllowedRoots: ctx.extraAllowedRoots,
-            workspaceRoot: ctx.workspaceRoot
+            workspaceRoot: ctx.workspaceRoot,
+            turn: ctx.turn, readOptions: ctx.fileReadOptions
         )
     }
 }
 /// Basic and Full Mac readers share the same sensitive-subtree fence.
-public func connectorPathIsSensitiveData(_ path: URL, dataRoot: URL) -> Bool {
+public func connectorPathIsSensitiveData(_ path: URL, dataRoot: URL, turn: Turn?) -> Bool {
     FileSystemActions.isSensitiveDataPath(
         path,
-        ConnectorActionContext(repoRoot: nil, dataRoot: dataRoot)
+        ConnectorActionContext(repoRoot: nil, dataRoot: dataRoot, turn: turn)
     )
 }
 extension SwiftNativeSecurityCenter {
-    /// One admitted descriptor supplies the exact bytes sent, never a second
-    /// pathname read after inspecting the content. No partial-file sends.
-    package static func outgoingAttachment(_ raw: String, dataRoot: URL, maximumBytes: Int) async throws -> (file: URL, bytes: Data) {
+    /// Send only complete bytes from the inspected descriptor; reopening the pathname could send different content.
+    package static func outgoingAttachment(_ raw: String, dataRoot: URL, maximumBytes: Int, turn: Turn?) async throws -> (file: URL, bytes: Data) {
         let file: URL
-        switch await fencedAttachment(raw, dataRoot: dataRoot) {
+        switch await fencedAttachment(raw, dataRoot: dataRoot, turn: turn) {
         case .success(let admitted): file = admitted
         case .failure(let refusal):
             throw ToolFailureError(refusal.detail, argumentPath: "files", effects: .none)
@@ -162,33 +161,33 @@ extension SwiftNativeSecurityCenter {
         catch is CancellationError { throw CancellationError() }
         catch { throw ToolFailureError("The attachment could not be read completely. Nothing was sent.", argumentPath: "files", effects: .none) }
         guard !bytes.isEmpty else {
-            throw ToolFailureError("An attachment is empty (possibly still being written). Nothing was sent; wait for the completed file.", argumentPath: "files", effects: .none)
+            throw ToolFailureError(
+                "An attachment is empty (possibly still being written). Nothing was sent; wait for the completed file.", argumentPath: "files", effects: .none)
         }
-        // Only complete, NUL-free UTF-8 is text. Binary still receives literal
-        // credential inspection, but incidental %HH bytes are not URL encoding.
+        // Inspect binary credentials literally; incidental %HH bytes cannot establish URL-encoded text.
         let text = bytes.contains(0) ? nil : String(data: bytes, encoding: .utf8)
         let unsafeContent = text.map { ContextSecretContentPolicy.redactedFragment($0) != $0 }
             ?? ContextSecretContentPolicy.containsLiteralSecretLikeContent(String(decoding: bytes, as: UTF8.self))
         guard !unsafeContent,
               ContextSecretContentPolicy.redactedFragment(file.lastPathComponent) == file.lastPathComponent else {
-            throw ToolFailureError("An attachment contains credential-shaped content or a secret-bearing filename. Nothing was sent; create a safe export without secrets.", argumentPath: "files", effects: .none)
+            throw ToolFailureError("""
+                An attachment contains credential-shaped content or a secret-bearing filename. Nothing was sent; create a safe export \
+                without secrets.
+                """, argumentPath: "files", effects: .none)
         }
         return (file, bytes)
     }
 
     public struct AttachmentRefusal: Error { public let reason: String; public let detail: String }
-    /// The fence `read_file` keeps, for a regular file the agent attaches: never a
-    /// sensitive store, in any posture; and inside a Trust workspace root
-    /// unless this Mac is in Full Mac. A relative path is read against her
-    /// workspace, as `read_file` reads it. make.add, the composer,
-    /// reply.attach and a resumed turn's reply all keep it.
-    public static func fencedAttachment(_ raw: String, dataRoot: URL) async -> Result<URL, AttachmentRefusal> {
+    /// Attachments share the read fence: never sensitive stores, and inside Trust roots unless Full Mac applies. Resolve relative paths against the workspace;
+    /// composer, make.add and resumed replies keep the same fence.
+    public static func fencedAttachment(_ raw: String, dataRoot: URL, turn: Turn?) async -> Result<URL, AttachmentRefusal> {
         let file = NativeAgentWorkspaceRoot.resolveFileMutationPath(raw, dataRoot: dataRoot)
         guard (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
             return .failure(.init(reason: "attachment_missing",
                 detail: "No regular file is at \(file.path). Check the path with app files.list, then try again."))
         }
-        guard !connectorPathIsSensitiveData(file, dataRoot: dataRoot) else {
+        guard !connectorPathIsSensitiveData(file, dataRoot: dataRoot, turn: turn) else {
             return .failure(.init(reason: "path_not_allowed", detail: FileSystemActions.sensitiveReadRefusal(file)))
         }
         guard let policy = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked() else {

@@ -9,11 +9,9 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `KnowledgeGraphPolicy.swift` | Knowledge Graph policy presentation and checked Memory Policy writes; mounted policy reads and enable/disable actions |
+// Blueprint: | `KnowledgeGraphPolicy.swift` | Checked Memory Policy reads/writes and enable/disable presentation |
 
-/// Presentation state for the Knowledge Graph opt-out action. A policy
-/// write is not a graph read: success means the canonical Memory Policy
-/// committed, even if the follow-up graph load later has no rows or fails.
+/// Only the canonical Memory Policy write proves policy success; a later graph load may be empty or fail independently.
 enum KnowledgeGraphEnableActionPresentation: Equatable {
     case idle
     case enabling
@@ -66,9 +64,7 @@ enum KnowledgeGraphEnableActionPresentation: Equatable {
     }
 }
 
-/// The policy operation is separate from graph loading: its durable success
-/// condition is the checked Memory Policy write. Keeping the action here lets
-/// the mounted page and non-UI callers share one outcome contract.
+/// Share the checked policy-write outcome between mounted and non-UI callers; graph loading is a separate operation.
 enum KnowledgeGraphEnableAction {
     @MainActor
     static func perform(using appModel: AppModel, enabled: Bool = true) async -> KnowledgeGraphEnableActionPresentation {
@@ -81,9 +77,7 @@ enum KnowledgeGraphEnableAction {
 }
 
 extension KnowledgeGraphView {
-    /// Policy authority is read separately from graph contents so unreadable
-    /// bytes cannot leave the mounted page indefinitely saying "Checking".
-    /// The enable action remains unavailable until this checked read succeeds.
+    /// Read policy authority independently so unreadable graph data cannot leave setup checking forever; enable requires the checked policy.
     func loadKnowledgeGraphPolicy() async -> Bool {
         if appModel.engine.trust.policy != nil {
             policyReadError = nil

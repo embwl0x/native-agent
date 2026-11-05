@@ -3,8 +3,8 @@ import PersistenceCore
 import NativeAgentShared
 // Blueprint: | `XAIOAuthCredentialStore.swift` | Locked xAI token storage, immutable Keychain references, refresh reads and sign-out cleanup |
 
-/// xAI credentials retain their locked metadata file; only immutable Keychain
-/// references are committed there. Token bytes are resolved only from the checked Keychain reference.
+/// xAI credentials retain their locked metadata file; only immutable Keychain references are committed there. Token bytes are resolved only from the
+/// checked Keychain reference.
 enum XAIOAuthCredentialStore {
     static let referenceField = "oauth_tokens_keychain_ref"
     private static let service = "NativeAgent.xai-oauth"
@@ -20,7 +20,8 @@ enum XAIOAuthCredentialStore {
     /// The caller validates and locks this metadata generation before resolving it.
     static func resolve(_ object: [String: Any], at path: URL) throws -> [String: Any] {
         guard object["tokens"] == nil, !secretFields.contains(where: { object[$0] != nil }) else {
-            throw ProviderRoutingError.configurationFailed("Saved xAI credentials contain plaintext tokens. Save the account through Providers to repair its Keychain storage.")
+            throw ProviderRoutingError.configurationFailed(
+                "Saved xAI credentials contain plaintext tokens. Save the account through Providers to repair its Keychain storage.")
         }
         guard let reference = object[referenceField] as? String else { return object }
         guard UUID(uuidString: reference) != nil,
@@ -76,11 +77,14 @@ enum XAIOAuthCredentialStore {
                         }
                     } else { state = "The credential metadata is absent." }
                 } catch {
-                    throw ProviderRoutingError.configurationFailed("xAI credential save failed: \(persistenceFailure). Committed reference could not be read: \(error.localizedDescription). Keychain items were retained; repair the saved account in Providers.")
+                    throw ProviderRoutingError.configurationFailed("""
+                        xAI credential save failed: \(persistenceFailure). Committed reference could not be read: \(error.localizedDescription). Keychain \
+                        items were retained; repair the saved account in Providers.
+                        """)
                 }
-                // Rotation may already be committed or may have consumed the
-                // preceding grant. Retain both items; never restore old authority.
-                throw ProviderRoutingError.configurationFailed("xAI credential save failed: \(persistenceFailure). \(state) Keychain items were retained; repair the saved account in Providers.")
+                // Rotation may already be committed or may have consumed the preceding grant. Retain both items; never restore old authority.
+                throw ProviderRoutingError.configurationFailed(
+                    "xAI credential save failed: \(persistenceFailure). \(state) Keychain items were retained; repair the saved account in Providers.")
             }
             if let oldReference, oldReference != reference {
                 do { try DeviceSecretKeychain.delete(service: service, account: oldReference) }

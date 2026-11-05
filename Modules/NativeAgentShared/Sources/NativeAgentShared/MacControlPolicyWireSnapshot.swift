@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `MacControlPolicyWireSnapshot.swift` | `MacControlPolicyWireSnapshot`: shared Codable/Hashable policy snapshot, decoding/defaults; TrustCenter retains policy authority |
+// Blueprint: | `MacControlPolicyWireSnapshot.swift` | `MacControlPolicyWireSnapshot`: policy projection; TrustCenter owns authority |
 
 /// Shared policy fields and shipped values for unset settings; TrustCenter retains authority.
 public struct MacControlPolicyWireSnapshot: Codable, Hashable, Sendable {

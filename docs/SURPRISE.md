@@ -124,7 +124,7 @@ turns can still exceed it and remain `unsure`.
 | After-turn reflection | 329 | One per turn. On 560 of 772 judged turns it moved something, nearly always a care (541) |
 | Tool rounds | 280 | 1.9 rounds per turn; 24 turns took 4 or more |
 | Keep | 94 | Deciding whether hand-done work becomes an ability: 44 on 10-28, 48 on 10-29, 2 on 10-30 |
-| Compaction | 54 | Context compaction |
+| Retired summary passes | 54 | Historical measurement; no conversation summary pass remains |
 
 Before S1, their expectation organs were nearly idle:
 The keep count was remeasured from the three retained daily trace files,
@@ -209,24 +209,28 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
    - Every eligible recorded turn is still reflected on. This replaces the
      phase-1 design of immediate reflection based on novel words.
 3. **Practice keeps what repeats (H3, as built).**
-   - The turn part offers a private keep after hand work or one call repeated
-     with the same input 3+ rounds. At its first private `model.call` with
-     purpose `keep`, the stem records the practice on its first meeting and
-     opens the keep on the second or a later meeting.
+   - After each tool round the stem meets the turn's hand work, or one call
+     repeated with the same input 3+ rounds. It records the practice on its
+     first meeting; on the second or a later meeting the round's last result
+     carries `practice`, once a turn, and their next `model.call` notes it.
    - The practice is the ordered tool/action ids of landed writes or
      irreversible non-ability calls, without argument values or incidental
      reads; if there is no such hand work, it is the single repeated call,
      counted once. Its `practice: ` line uses `FamiliarLines.firstMet` in
      the existing bounded `mind/familiar.bin`.
    - An active ability's current learned-use or validation route suppresses
-     the keep when it contains the practice ids in order. Declared reach
+     the note when it contains the practice ids in order. Declared reach
      proves no route. That encounter is still met.
    - `practice.keep` traces `practice`, `met: first|again` and `kept`;
      `kept` means admission of the keep call, not an ability save.
    - The gate is in `ChatOrchestration+StreamingToolLoop.swift`, before the
-     first keep request or its compaction; later rounds finish the admitted
+     first keep request; later rounds finish the admitted
      keep. The delivered reply and reflection retain their existing path.
      This replaces the unfamiliar whole-turn-signature gate. The nightly
+   - `practice.keep` traces `practice`, `met: first|again` and `noted`;
+     `noted` means the note was sent, not an ability save.
+   - The nerve is in `ChatOrchestration+StreamingToolLoop.swift`, after each
+     tool round; there is no private keep call after the reply. The nightly
      compiler and its ledger/tape writers are removed ([Habits H4](HABITS.md#h4--one-crystallizer)).
 4. **Woken work runs what it expects (design).**
    - An intention whose occurrences they have handled the same way with
@@ -246,9 +250,9 @@ Before the practice/read-ahead change, their expectation organs were nearly idle
 ## Their thinking on Today (S5, as built)
 
 Today gets one line: `Thinking: <x.x> model calls a turn today (week <y.y>)`.
-`TurnTraceThinkingReader` reads only today's and the preceding six daily
-`turn_traces/<yyyy-MM-dd>.jsonl` files, using the trace writer's calendar and
-root resolution. Calls are all `llm.call` rows except purpose `compaction`;
+`TurnTraceThinkingReader` reads the `llm.call` details of today and the preceding
+six days from the record (`experiences/experiences.sqlite`), using the trace
+writer's calendar and root resolution. Calls are all `llm.call` details;
 turns are distinct `turnId` values on calls whose payload purpose is `turn`.
 The week deduplicates turn ids across midnight. Each ratio divides summed
 calls by distinct turns; a zero denominator reads `unmeasured`.
@@ -295,7 +299,7 @@ nothing today.
 - Today shows 3.8 model calls a turn (week 4.3), about 540 calls a day.
 - The calls are: about 165 replies, 165 after-turn reflections (on Terra
   since 48a0bf6dd), 140 tool rounds, 45 keeps (now gated), and 27
-  compactions.
+  summary passes in that historical sample; those passes are removed.
 - **Reflection moved a care on 160 of 160 turns,** across 63 different
   cares. That is real work, but most of it is the steady movement of an
   ordinary exchange.
@@ -320,7 +324,7 @@ nothing today.
    - `AdaptiveMemoryFacts.runMemoryManager` keeps today's behavior for User's
      own turns: judged immediately unless the no-op claim has standing.
      Their turn means no peer `speaker`, not `standingAgent`, and
-     `conversationKind(sessionId)?.isHisConversation == true` (the existing
+     `conversationKind(sessionId)?.isPersonConversation == true` (the existing
      row-backed `SessionConversation.kind` lookup, including archives).
    - Every other recorded turn joins the existing deferred batch (due after
      45 minutes, up to 4 a call, every usable judgment still labelled).

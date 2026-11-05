@@ -6,7 +6,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `NativeCognitionRuntime+Rhythm.swift` | `NativeCognitionRuntime`: coalesced owner-stamp observations, presence/Workspace awake intervals, cold history fold, standing-time residual deadline and care-gated zero-charge felt/primed rhythm breaks; mind.rhythm satisfies the standing-time wait and returns actual admission counts; never a crossing, Reach offer or ResidentWake |
+// Blueprint: | `NativeCognitionRuntime+Rhythm.swift` | `NativeCognitionRuntime`. |
 
 struct RhythmRuntimeState: Sendable {
     var value: PersonRhythm?
@@ -41,12 +41,11 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
-    /// Existing presence source calls this, before it releases any carried work.
+    /// Release presence-carried work only after the presence edge reaches this owner.
     public func rhythmPresenceChanged(here: Bool) async {
         guard !isFlushedForTermination else { return }
         let at = now()
-        // Close the old state before changing it. Edges coalesce in the same
-        // actor; only the refresh does file I/O and no turn awaits that work.
+        // Close prior state before changing it; coalesce edges in the actor and keep refresh I/O off the turn path.
         do {
             try refreshRhythmInterval(at: at)
             rhythm.present = here
@@ -55,7 +54,7 @@ extension NativeCognitionRuntime {
         await rhythmChanged()
     }
 
-    /// Workspace didWake/willSleep are real edges, never sampled uptime.
+    /// Use workspace wake/sleep edges rather than sampled uptime.
     public func rhythmAwakeChanged(awake: Bool) async {
         guard !isFlushedForTermination else { return }
         do { try refreshRhythmInterval(at: now()) }
@@ -120,14 +119,14 @@ extension NativeCognitionRuntime {
 
     func considerRhythm(runNow: Bool = false, reply: MindClockReply? = nil) {
         guard !isFlushedForTermination, rhythm.refresh == nil else {
-            reply?(.init("held", "His day is already refreshing or the runtime is stopping.")); return
+            reply?(.init("held", "The person's day is already refreshing or the runtime is stopping.")); return
         }
         guard runNow || rhythm.dirty || rhythm.due.map({ $0 <= now() }) == true else { return }
         rhythm.dirty = false
         rhythm.refresh = Task { [weak self] in
             guard let self else { reply?(.init("unavailable", "The runtime was released.")); return }
             let result = await self.refreshRhythm(satisfyWait: runNow)
-            reply?(result)
+            if let reply { reply(result) } else { await self.beat(.rhythm, result) }
             await self.finishRhythmRefresh()
         }
     }
@@ -138,7 +137,7 @@ extension NativeCognitionRuntime {
     }
 
     private func refreshRhythm(satisfyWait: Bool = false) async -> MindClockResult {
-        guard !isFlushedForTermination, !Task.isCancelled else { return .init("held", "His day refresh stopped.") }
+        guard !isFlushedForTermination, !Task.isCancelled else { return .init("stopped", "The person's day refresh stopped.") }
         do {
             try refreshRhythmInterval(at: now())
             struct Stamp: Decodable { var at: Double; var key: String; var door: String? }
@@ -151,7 +150,7 @@ extension NativeCognitionRuntime {
                     rhythm.value?.lastTurnKey = stamp.key
                 }
             }
-            guard var value = rhythm.value else { return .init("unavailable", "His day has no readable rhythm.") }
+            guard var value = rhythm.value else { return .init("unavailable", "The person's day has no readable rhythm.") }
             let at = now(), calendar = Calendar.current, day = calendar.startOfDay(for: at)
             if rhythm.day != day || rhythm.zone != TimeZone.current.identifier {
                 rhythm.day = day
@@ -171,20 +170,20 @@ extension NativeCognitionRuntime {
                     keepRhythmBreak("starts", claim: claim, at: at, in: &value)
                 }
             }
-            // Publish the canonical value before any semantic/persistence await;
-            // arrivals during that await update it rather than an older copy.
+            // Publish canonical state before awaiting so reentrant arrivals update the current value.
             try value.save(dataRoot)
             rhythm.value = value
             var felt = 0
             for (id, pending) in value.pending.sorted(by: { $0.key < $1.key }) {
-                guard !isFlushedForTermination, !Task.isCancelled else { return .init("held", "His day stopped; remaining rhythm breaks stay pending.") }
-                let words = pending.words(person: HerScreen.names(dataRoot).person)
+                guard !isFlushedForTermination, !Task.isCancelled else {
+                    return .init("stopped", "The person's day stopped; remaining rhythm breaks stay pending.")
+                }
+                let words = pending.words(person: AgentScreen.names(dataRoot).person)
                 let event = CognitiveEvent(id: id, kind: .organismResolutionFelt,
-                    subject: .init(type: "person_rhythm", id: id, label: "his day"),
+                    subject: .init(type: "person_rhythm", id: id, label: "the person's day"),
                     sourceClass: .observed, occurredAt: pending.at, summary: words, importance: 0.6,
                     metadata: ["feltValence": .double(0), "feltArousal": .double(0.2), "resolutionKind": .string("rhythm")])
-                // Same felt admission as horizon resolutions: no live care, no fact.
-                // This is deliberately NOT cross(): no news release or ResidentWake.
+                // Without a live care, emit no fact; presence felt admission cannot release news or wake a resident turn.
                 if try await substrate.feelRhythmBreak(event) {
                     felt += 1
                     PrimedMoments.prime(dataRoot: dataRoot, line: words, source: "rhythm", now: pending.at)
@@ -195,20 +194,25 @@ extension NativeCognitionRuntime {
             try rhythm.value?.save(dataRoot)
             RepairOwed.settle(dataRoot, operation: "mind.rhythm",
                              evidence: .init(source: PersonRhythm.path(dataRoot).path, id: "\(at.timeIntervalSince1970)"))
-            return .init("refreshed", "His real awake and activity history was kept; \(felt) care-admitted rhythm breaks felt, \(value.pending.count) considered. No crossing or wake.", fields: [
+            return .init("refreshed",
+                """
+                    The person's real awake and activity history was kept; \(felt) care-admitted rhythm breaks felt, \(value.pending.count) considered. \
+                    No crossing or wake.
+                    """, fields: [
                 "felt": .int(Int64(felt)), "considered": .int(Int64(value.pending.count)),
                 "path": .string(PersonRhythm.path(dataRoot).path)
-            ])
+            ], yield: felt)
         } catch { reportRhythmFailure(error); return .init("unavailable", error.localizedDescription) }
     }
 
     private func reportRhythmFailure(_ error: Error) {
-        ModuleLog(category: "Cognition")("His day could not be kept: %@", error.localizedDescription)
-        RepairOwed.owe(dataRoot, id: "rhythm", kind: .run, operation: "mind.rhythm", owner: "His day",
-                      words: error.localizedDescription, tap: "Read mind/rhythm.json and its source history; repair the reported cause, preserving the evidence.")
+        ModuleLog(category: "Cognition")("The person's day could not be kept: %@", error.localizedDescription)
+        RepairOwed.owe(dataRoot, id: "rhythm", kind: .run, operation: "mind.rhythm", owner: "The person's day",
+                      words: error.localizedDescription,
+                          tap: "Read mind/rhythm.json and its source history; repair the reported cause, preserving the evidence.")
     }
 
-    /// Quit closes the real awake interval inside the existing sleep settlement.
+    /// Close the real awake interval within the shared sleep settlement.
     func settleRhythmForSleep() {
         guard var value = rhythm.value else { return }
         let at = now()

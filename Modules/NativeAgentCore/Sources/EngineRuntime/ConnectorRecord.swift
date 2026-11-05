@@ -5,7 +5,6 @@ import Connectors
 
 public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String
-    // Only identity is required; missing presentation fields keep their defaults.
     public var name: String = ""
     public var kind: String = ""
     public var description: String = ""
@@ -17,9 +16,7 @@ public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     public var actions: [String]?
     public var lastCheckedAt: String?
     public var updatedAt: String?
-    /// Socket Mode's separately persisted runtime evidence. This is not the
-    /// connector credential state: an unobserved/stale feed must remain visible
-    /// without disabling otherwise valid outbound Slack credentials.
+    /// Socket Mode evidence stays separate: a stale inbound feed must not disable valid outbound credentials.
     public var runtimeStatus: String?
     public var runtimeDetail: String?
     public var runtimeUpdatedAt: String?
@@ -30,7 +27,6 @@ public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
             && (id == "local_files" || ConnectorWizardSetupRoute.resolve(provider: id) != .unavailable)
     }
 
-    // Only id is required; missing fields decode to their defaults.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decode(String.self, forKey: .id)
@@ -64,8 +60,6 @@ public struct ConnectorActionRecord: Identifiable, Codable, Hashable, Sendable {
 }
 
 extension ConnectorActionRecord {
-    /// One record per connector action descriptor, its readiness overlaid
-    /// from the connector registry (native connectors read as active).
     public static func records(connectors: [ConnectorRecord]) -> [ConnectorActionRecord] {
         var byID: [String: ConnectorRecord] = [:]
         for connector in connectors {

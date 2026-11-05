@@ -1,23 +1,15 @@
 import Foundation
 
-// Blueprint: | `DreamNight.swift` | `DreamNight` and `DreamDiaryWeeks`: shared diary section/title/prose summary parsing and week grouping across all dream readers |
+// Blueprint: | `DreamNight.swift` | `DreamNight`, `DreamDiaryWeeks`. |
 
-/// One night of the diary, read the one way (`DreamCycleRunner` writes it):
-/// `# Dream — <date>`, then every later run of the same night as a
-/// `## Dreamt again — <yyyy-MM-dd HH:mm>` section. Each dream opens with
-/// `**<title>**`, then its summary, then `_Mood: <mood>_`.
-/// Readers and scheduler receipts name the latest dream through here.
+/// Share the runner's diary section shape so readers and receipts agree on the latest dream.
 public struct DreamNight: Sendable, Equatable {
     public struct Dream: Sendable, Equatable {
-        /// When a later run wrote it, as its heading names it; nil for the
-        /// night's first dream (the file's own time says when that was).
+        /// Use section time for later dreams; the first section relies on file time.
         public var dreamtAgainAt: String?
         public var title: String?
         public var mood: String?
-        /// The first real line: the title as written, or the opening words
-        /// of an entry without one.
         public var firstLine: String
-        /// First prose line, excluding headings, bold metadata, mood and lists.
         public var summary: String = ""
     }
 
@@ -68,13 +60,10 @@ public struct DreamNight: Sendable, Equatable {
 }
 
 extension DreamEntry {
-    /// This entry's night, read the one way.
     public var night: DreamNight { DreamNight(content ?? "") }
 }
 
-/// The diary read as history: this week, last week, then "Week of <d MMM>",
-/// newest week first (entries arrive newest-first and the grouping keeps that
-/// order). The Dreams page and `dream_diary_read` group with this one rule.
+/// Share calendar-week grouping between Dreams and dream_diary_read while preserving newest-first entry order.
 public enum DreamDiaryWeeks {
     public struct Week: Identifiable, Sendable {
         public let id: String

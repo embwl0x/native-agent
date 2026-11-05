@@ -3,13 +3,10 @@ import Foundation
 
 #if canImport(Compression)
 import Compression
-// Blueprint: | `MobileSnapshotStatus.swift` | `NAMobileSnapshotGroup` enum; `groups`; declares live phone snapshot inputs only: unread promotion_candidates.json is retired; training_proposals.json retains its active phone readers |
+// Blueprint: | `MobileSnapshotStatus.swift` | `NAMobileSnapshotGroup`, `groups`: live phone snapshot input declarations |
 #endif
 
-/// Rebuildable Mac-owned read projections carried through the existing
-/// CloudKit `NAStatus` transport. Public Developer ID builds cannot use
-/// CloudDocuments, so these bounded bundles preserve the established snapshot
-/// file contracts without inventing a second model or authority on iOS.
+/// Public Developer ID builds cannot use CloudDocuments; bounded CloudKit NAStatus bundles preserve snapshot contracts while authority remains Mac-owned.
 public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     case core
     case catalog
@@ -19,6 +16,9 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     case activity
     case advanced
     case work
+    /// Every page's face (`faces.json`: page id → PartFaceSnapshot). Never named in the snapshot ping: phones before it refuse a ping
+    /// naming a group they do not know (a faces-only change names core instead), so phones that know it fetch it with every ping.
+    case faces
 
     public var statusKey: String {
         "mobile_snapshot_\(rawValue)_v1"
@@ -42,12 +42,10 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "provider_sign_ins.json",
                 "model_preferences.json",
                 "approvals.json",
-                // How the surfaces are laid out (ui/layout.json); the phone's
-                // More reads its blocks under the layout's phone profile.
+                // How the surfaces are laid out (ui/layout.json); the phone's More reads its blocks under the layout's phone profile.
                 "ui_layout.json",
-                // Which groups the Mac could NOT rebuild this pass. Rides in
-                // .core because it describes every other group, including the
-                // heavyweight ones the phone may not refresh for hours.
+                // Which groups the Mac could NOT rebuild this pass. Rides in .core because it describes every other group, including the heavyweight ones
+                // the phone may not refresh for hours.
                 "snapshot_staleness.json",
             ]
         case .catalog:
@@ -60,19 +58,18 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "chat_transcripts.json",
             ]
         case .desk:
-            // desk_bounds.json rides with the rows it describes: the phone must
-            // never be in a position to guess what the bounds dropped.
-            // desk_details.json rides with the board too: the reading copies
-            // are only trustworthy beside the rows they belong to. The overview
-            // rides here only: it is built from the same Desk read as desk.json.
+            // desk_bounds.json rides with the rows it describes: the phone must never be in a position to guess what the bounds dropped. desk_details.json
+            // rides with the board too: the reading copies are only trustworthy beside the rows they belong to. The overview rides here only: it is built
+            // from the same Desk read as desk.json.
             ["desk.json", "desk_bounds.json", "desk_details.json", "work_overview.json"]
         case .scheduler:
             ["scheduler.json"]
         case .work:
             ["work_activity.json"]
+        case .faces:
+            ["faces.json"]
         case .activity:
             [
-                "workshop_tasks.json",
                 "memories.json",
                 "memory_proposals.json",
                 "training_proposals.json",
@@ -102,7 +99,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
         let known = [
             "desk": "Desk", "desk_bounds": "Desk", "desk_details": "Desk", "work_overview": "Desk",
             "scheduler": "Scheduler", "memories": "Memories", "inbox": "Inbox",
-            "approvals": "Approvals", "workshop_tasks": "Workshop", "work_activity": "Activity",
+            "approvals": "Approvals", "work_activity": "Activity",
             "providers": "Providers", "connectors": "Connectors", "health": "Health", "trust_policy": "Trust",
             "sessions": "Chat", "chat_sessions": "Chat", "chat_transcripts": "Chat",
             "pinned_chat_sessions": "Chat", "memory_proposals": "Memory proposals",

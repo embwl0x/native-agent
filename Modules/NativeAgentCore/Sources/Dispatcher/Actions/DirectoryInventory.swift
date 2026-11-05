@@ -71,7 +71,8 @@ extension FileSystemActions {
             return errResult("time_budget_seconds must be an integer from 1 to 20", code: "bad_input")
         }
         let deadline = started.advanced(by: .seconds(budget))
-        if sort == "size" && offset > 0 { return errResult("Narrow path for another size scan; size rankings cannot be paged across changing scans", code: "bad_input") }
+        if sort == "size" && offset > 0 { return errResult(
+            "Narrow path for another size scan; size rankings cannot be paged across changing scans", code: "bad_input") }
         let caseSensitive: Bool
         switch input["case_sensitive"] {
         case .bool(let value)?: caseSensitive = value
@@ -103,21 +104,16 @@ extension FileSystemActions {
         let exists = fm.fileExists(atPath: resolved.path, isDirectory: &isDir)
         if !exists { return errResult("Directory not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing") }
         if !isDir.boolValue { return errResult("Not a directory: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "file") }
-        // Parent dirent types avoid entering dormant child mounts. Unknown and
-        // symlink types display as files; listing must not follow them.
+        // Parent dirent types avoid entering dormant child mounts. Unknown and symlink types display as files; listing must not follow them.
         struct Entry {
             let name: String; let isFile: Bool; var modified: Date? = nil; var added: Date? = nil
             var bytes: Int64 = 0; var complete = false
-            /// The file's logical length when the listing stat read it; nil for folders and size scans.
             var length: Int64? = nil
         }
         var entries: [Entry] = []
         var namesComplete = true
         #if canImport(Darwin)
-        // Authorize, then list THAT directory: the walk re-opens each component
-        // O_DIRECTORY|O_NOFOLLOW from the root and the listing runs on the
-        // resulting descriptor via fdopendir, so a symlink swapped in after the
-        // sandbox check is refused rather than enumerated.
+        // Reopen each authorized component with O_DIRECTORY|O_NOFOLLOW and list its descriptor to refuse swapped-in symlinks.
         let directoryFD: Int32
         do { directoryFD = try VerifiedPath.open(resolved, flags: O_RDONLY | O_DIRECTORY) }
         catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code) }
@@ -144,14 +140,12 @@ extension FileSystemActions {
             }
             guard name != ".", name != ".." else { continue }
             var entry = Entry(name: name, isFile: pointer.pointee.d_type != UInt8(DT_DIR))
-            // Date sorts include directories such as app bundles; metadata only,
-            // without following links. The packed buffer starts after its length.
+            // Include directories in date sorts without following links; the packed buffer begins after its length.
             if sort != "size", pointer.pointee.d_type == UInt8(DT_REG)
                 || (["newest", "added"].contains(sort) && pointer.pointee.d_type == UInt8(DT_DIR)) {
                 var attrs = attrlist()
                 attrs.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
                 attrs.commonattr = UInt32(ATTR_CMN_MODTIME | ATTR_CMN_ADDEDTIME)
-                // A file's logical length rides on the same metadata call.
                 let isRegular = pointer.pointee.d_type == UInt8(DT_REG)
                 if isRegular { attrs.fileattr = UInt32(ATTR_FILE_DATALENGTH) }
                 var bytes = [UInt8](repeating: 0, count: 4 + 2 * MemoryLayout<timespec>.size + MemoryLayout<off_t>.size)
@@ -208,7 +202,7 @@ extension FileSystemActions {
         entries.sort { lhs, rhs in
             if sort == "size", lhs.bytes != rhs.bytes { return lhs.bytes > rhs.bytes }
             if sort == "newest" || sort == "added" {
-                // newest keeps "arrived most recently" (added, else modified); added is added only.
+                // newest tracks arrival via added then modified; added-only ordering must not substitute modified time.
                 let left = (sort == "added" ? lhs.added : lhs.added ?? lhs.modified) ?? .distantPast
                 let right = (sort == "added" ? rhs.added : rhs.added ?? rhs.modified) ?? .distantPast
                 if left != right { return left > right }
@@ -216,10 +210,10 @@ extension FileSystemActions {
             if lhs.isFile != rhs.isFile { return !lhs.isFile && rhs.isFile }
             return lhs.name < rhs.name
         }
-        // A stateless token binds continuation to this path, filter, ordering,
-        // and observed names/types. It says nothing about child file contents.
+        // A stateless token binds continuation to this path, filter, ordering, and observed names/types. It says nothing about child file contents.
         let fingerprintFields = [resolved.path, nameContains, caseSensitive ? "sensitive" : "insensitive", sort]
-            + entries.flatMap { [$0.name, $0.isFile ? "other" : "directory", String($0.modified?.timeIntervalSince1970 ?? 0), String($0.added?.timeIntervalSince1970 ?? 0)] }
+            + entries.flatMap { [$0.name, $0.isFile ? "other" : "directory", String(
+                $0.modified?.timeIntervalSince1970 ?? 0), String($0.added?.timeIntervalSince1970 ?? 0)] }
         let snapshot = SHA256.hash(data: Data(fingerprintFields.joined(separator: "\0").utf8))
             .map { String(format: "%02x", $0) }.joined()
         if !expectedSnapshot.isEmpty && expectedSnapshot != snapshot {
@@ -259,7 +253,11 @@ extension FileSystemActions {
             "snapshot": .string(snapshot),
             "truncated": .bool(hasMore),
             "has_more": .bool(hasMore),
-            "coverage": .string("Immediate children only; dates are read without following links. Date sorts include directory metadata. Link or unavailable dates are null and sort last. newest sorts by added_at, then modified_at when added_at is unknown; added sorts by added_at only. No recursion or file-content search."),
+            "coverage": .string("""
+                Immediate children only; dates are read without following links. Date sorts include directory metadata. Link or unavailable \
+                dates are null and sort last. newest sorts by added_at, then modified_at when added_at is unknown; added sorts by added_at \
+                only. No recursion or file-content search.
+                """),
         ]
         if sort == "size" {
             result["allocated_bytes"] = .int(entries.reduce(Int64(0)) { $0 + $1.bytes } + Int64(beforeStat.st_blocks) * 512)
@@ -271,7 +269,12 @@ extension FileSystemActions {
             result["listing_complete"] = .bool(namesComplete)
             result["partial_paths"] = .array(entries.filter { !$0.complete }.map { .string(resolved.appendingPathComponent($0.name).path) }
                 + (namesComplete && unchanged ? [] : [.string(resolved.path)]))
-            result["coverage"] = .string("Allocated bytes observed during this scan, including hidden entries; hard links count once. Incomplete sizes are lower bounds, never totals. Partial paths include budget exhaustion, unreadable/protected descendants, changed entries or other volumes. Links and other volumes are not traversed. Metadata I/O must return before the budget can be checked; rankings cover observed bytes only. Narrow path to examine a partial folder.")
+            result["coverage"] = .string("""
+                Allocated bytes observed during this scan, including hidden entries; hard links count once. Incomplete sizes are lower \
+                bounds, never totals. Partial paths include budget exhaustion, unreadable/protected descendants, changed entries or other \
+                volumes. Links and other volumes are not traversed. Metadata I/O must return before the budget can be checked; rankings \
+                cover observed bytes only. Narrow path to examine a partial folder.
+                """)
             result["time_budget_seconds"] = .int(Int64(budget))
         }
         if hasMore && sort != "size" {

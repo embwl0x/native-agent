@@ -9,10 +9,8 @@ import MemoryV2
 import NotificationInbox
 import Desk
 import StandingBots
-import WorkshopExecution
-import SwarmRuns
 import NativeAgentShared
-// Blueprint: | `AgentWorkspaceLocation.swift` | Navigation references, action and page values; `AgentWorkspaceDocument` binds shared evidence to its source fingerprint |
+// Blueprint: | `AgentWorkspaceLocation.swift` | `AgentWorkspaceDocument`: source-bound navigation evidence |
 
 /// References only; owners supply fresh reads and actions through the dispatcher and permission chain.
 indirect enum AgentWorkspaceLocation: Sendable, Equatable {
@@ -75,7 +73,6 @@ enum AgentWorkspaceAction: Sendable {
     case dismissArrival(String)
     case returnFromArrival
     case open(AgentWorkspaceLocation)
-    /// A window from the strip: a neighbour of the current one, never nested under it.
     indirect case window(AgentWorkspaceAction)
     case findWork
     case findDocument
@@ -114,7 +111,8 @@ struct AgentWorkspaceDocument: Sendable {
     var fingerprint: String
 
     static func evidence(_ value: JSONValue) -> (text: String, fingerprint: String)? {
-        guard ChatToolOutcome.hasReadEvidence(value),
+        let reply = ToolResult(value)
+        guard reply.hasReadEvidence(),
               let full = value.stringValue ?? value.objectValue?["content"]?.stringValue else { return nil }
         let row = value.objectValue
         let version = row?["version"]?.stringValue ?? row?["next"]?.objectValue?["version"]?.stringValue ?? ""
@@ -127,7 +125,8 @@ struct AgentWorkspaceDocument: Sendable {
         if case .page(let source, _) = location { return evidence(location: source, value: value) }
         guard case .record(let tool, let input, _) = location else { return nil }
         if tool == "read_file" || tool == "read_skill" { return evidence(value) }
-        guard case .object(let row) = value, ChatToolOutcome.hasReadEvidence(value) else { return nil }
+        let reply = ToolResult(value)
+        guard case .object(let row) = value, reply.hasReadEvidence() else { return nil }
         let content: String
         switch tool {
         case "recall_memory":

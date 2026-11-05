@@ -7,9 +7,8 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 import TrustCenter
-// Blueprint: | `StudioCanonTending.swift` | `StudioCanonTendingReport`, `StudioCanonTending`: cognition supplies single-flight admission; each approval card commits independently after a fresh cap/dedupe read; damaged saved cards fail only their own work with named gaps for other cards; staged ids and audit/staging causes survive failure without undoing cards or journal effects |
+// Blueprint: | `StudioCanonTending.swift` | `StudioCanonTendingReport`, `StudioCanonTending`: Commit cards independently; retain evidence. |
 
-/// One tending pass's evidence and proposals, returned for the caller's receipts.
 public struct StudioCanonTendingReport: Sendable, Equatable {
     public var evaluatedWorks: Int
     public var proposalsConsidered: Int
@@ -17,7 +16,6 @@ public struct StudioCanonTendingReport: Sendable, Equatable {
     public var duplicatesSkipped: Int
     public var pendingCapReached: Bool
     public var nextAt: Date?
-    /// The relation-provenance guard's verdict from the same pass.
     public var audit: StudioRelationAuditReport
     public var auditReadFailure: String? = nil
     public var auditPersistenceFailure: String? = nil
@@ -32,9 +30,9 @@ public struct StudioCanonTendingReport: Sendable, Equatable {
 }
 
 public enum StudioCanonTending {
-    /// Read journal, graph and pull evidence, project proposals and stage bounded cards.
-    /// Tending cannot decide membership or write journal entries or graph edges.
+    /// Tending stages proposals only; canon membership, journal entries and graph edges require their deciding owners.
     public static func run(
+        turn: Turn?, handsBack: Bool,
         dataRoot: URL,
         inbox: SwiftNativeApprovalInbox? = nil,
         now: Date = Date(),
@@ -66,7 +64,9 @@ public enum StudioCanonTending {
         do {
             try await recordAudit(audit, failure: auditReadFailure, dataRoot: dataRoot, now: now)
         }
-        catch { auditPersistenceFailure = "Studio relation audit persistence failed at \(auditHealthPath(dataRoot: dataRoot).path): \(error.localizedDescription)" }
+        catch { auditPersistenceFailure = """
+            Studio relation audit persistence failed at \(auditHealthPath(dataRoot: dataRoot).path): \(error.localizedDescription)
+            """ }
 
         do {
             let recall = try await store.recallPullCounts()
@@ -121,10 +121,13 @@ public enum StudioCanonTending {
                         stagingFailure = "Canon admission closed before staging \(draft.key); this and remaining proposals were not staged."
                         break
                     }
-                    let record = try await StudioCanonProposal.stage(draft, inbox: inbox)
+                    let record = try await StudioCanonProposal.stage(turn: turn, handsBack: handsBack, draft, inbox: inbox)
                     staged.append(record.id)
                 } catch {
-                    stagingFailure = "Studio canon staging stopped for \(draft.key): \(error.localizedDescription). Inspect existing approvals before repeating; the failed card's write outcome may be unconfirmed."
+                    stagingFailure = """
+                        Studio canon staging stopped for \(draft.key): \(error.localizedDescription). Inspect existing approvals before repeating; \
+                        the failed card's write outcome may be unconfirmed.
+                        """
                     break
                 }
             }
@@ -147,16 +150,14 @@ public enum StudioCanonTending {
         }
     }
 
-    /// Cognition's receipt links this local JSON audit; no Doctor content reader.
-    /// Off-disk backup only; no local backup/export/phone sync; PrivacyMap: studio.
+    /// The receipt links a local report without exposing Doctor content reads. Off-disk backup only; no local backup/export/phone sync; PrivacyMap: studio.
     public static func auditHealthPath(dataRoot: URL) -> URL {
         SwiftNativeStudioStore(dataRoot: dataRoot).studioRoot
             .appendingPathComponent("journal", isDirectory: true)
             .appendingPathComponent("relation_audit.json")
     }
 
-    /// Persist the report linked by cognition's receipt and log mismatches.
-    /// Never repair or block journal/recall work.
+    /// Report mismatches through cognition's receipt without repairing or blocking journal and recall work.
     public static func recordAudit(
         _ report: StudioRelationAuditReport,
         failure: String? = nil,
@@ -178,7 +179,7 @@ public enum StudioCanonTending {
         guard !report.isConsistent else { return }
         nativeLog(
             "[studio] RELATIONS INCONSISTENT — %d relation(s) on the journal have no graph edge "
-                + "citing them back. NOT repaired (a repair would invent a claim she never made). "
+                + "citing them back. NOT repaired (a repair would invent a claim the agent never made). "
                 + "First: %@",
             report.mismatches.count,
             report.mismatches.first.map { "\($0.entryID) \($0.relationKind) → \($0.toWork) (\($0.reason.rawValue))" }

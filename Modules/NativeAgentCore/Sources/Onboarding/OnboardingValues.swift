@@ -37,20 +37,12 @@ public struct OnboardingStartResult: Sendable, Equatable {
     public let abilityOverview: [AbilityOverviewEntry]
     /// A durable completion intent exists; only its exact identity may resume it.
     public let pendingRecovery: Bool
-    /// True when transaction-owned persona bytes exist without a canonical
-    /// identity anchor or resumable manifest. The only honest next step is an
-    /// explicit, backup-preserving reset; treating this as complete would hide
-    /// a broken first run, while treating it as fresh would dead-end submit.
+    /// True when transaction-owned persona bytes exist without a canonical identity anchor or resumable manifest. The only honest next step is an explicit,
+    /// backup-preserving reset; treating this as complete would hide a broken first run, while treating it as fresh would dead-end submit.
     public let resetRequired: Bool
-    /// True when onboarding really completed — the `.onboarded` sentinel — but
-    /// `<dataRoot>/memory/profile.json` is GONE. A lone SOUL.md is an
-    /// interrupted first run, not a completed one, and takes `resetRequired`.
-    /// Deliberately absence-only — a profile that exists but is malformed
-    /// carries bytes that must not be destroyed, and Doctor still names it.
+    /// Repair requires the completion sentinel and an absent profile. A lone SOUL.md requires reset; malformed profile bytes stay intact for Doctor.
     public let profileRepairRequired: Bool
-    /// A completed install whose profile.json is there but cannot be read: the
-    /// receipt (path, reason, lever). Neither repair nor reset may touch those
-    /// bytes; moving the file aside turns this into the absence repair lane.
+    /// An unreadable completed profile retains its path, cause and remedy; repair and reset must preserve its bytes.
     public let profileUnreadable: String?
     public var requiresPresentation: Bool {
         pendingRecovery || resetRequired || profileRepairRequired || profileUnreadable != nil || !hasExisting

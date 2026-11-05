@@ -29,7 +29,10 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
     public func sentence(location: String = "Mac chat or on your phone") -> String {
         switch self {
         case .approvalFiled: return "I haven’t run this; I filed an approval card you can use now in \(location)."
-        case .approvalUnavailable: return "I haven’t run this or filed an approval card because I can’t request approval here; ask me in Mac chat, on your phone, or in Telegram instead."
+        case .approvalUnavailable: return """
+            I haven’t run this or filed an approval card because I can’t request approval here; ask me in Mac chat, on your phone, or in Telegram \
+            instead.
+            """
         case .personDenied: return "I didn’t run this because you declined the approval request."
         case .blocked: return "I can’t run this because an access rule blocks it, and an approval cannot override that rule."
         case .approvalCanceled: return "I didn’t run this because the approval request was canceled."
@@ -59,7 +62,7 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
         } else {
             fields["detail"] = .string(sentence(location: location))
         }
-        // Queue steps wait for the card's decision before the follow-up returns them to her.
+        // Queue steps wait for the card's decision before the follow-up returns them to the agent.
         if self == .approvalFiled, case .string(let id)? = fields["approvalId"] {
             fields["then"] = .string("app {action:\"queue.add\", args:{text:\"…\", when:\"after_card \(id)\"}} "
                 + "keeps the step you will take once it is decided")
@@ -104,32 +107,28 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
 
 // MARK: - ApprovalFiler
 
-/// Narrow protocol for staging an approval request and awaiting the user's
-/// decision. The canonical approval actor owns durable records and decisions.
+/// The canonical approval actor owns durable records and decisions; dispatch depends only on this protocol.
 public protocol ApprovalFiler: Sendable {
-    /// Stage an approval request. Returns the new record's id.
     func fileApprovalRequest(
         toolName: String,
         surface: String,
         payload: JSONValue,
-        reason: String
+        reason: String,
+        turn: Turn
     ) async throws -> String
 
-    /// Read resolution for the given approval id when the filer supports waiting.
     func awaitResolution(id: String) async throws -> ApprovalDecision
 }
 
-/// Optional extension point for surfaces that cannot safely block their
-/// transport loop while waiting for a human decision. The filer still stages a
-/// durable approval request, but the dispatcher returns this tool result
-/// immediately instead of awaiting resolution in the current turn.
+/// Nonblocking transports return the durable request immediately so their loop can keep receiving the user's decision.
 public protocol NonBlockingApprovalFiler: ApprovalFiler {
     func pendingApprovalResult(
         id: String,
         toolName: String,
         surface: String,
         payload: JSONValue,
-        reason: String
+        reason: String,
+        turn: Turn
     ) async -> JSONValue
 }
 

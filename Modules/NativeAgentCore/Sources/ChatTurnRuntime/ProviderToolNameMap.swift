@@ -3,12 +3,7 @@ import NativeAgentCore
 
 // Blueprint: | `ProviderToolNameMap.swift` | `ProviderToolNameMap`: stable provider-safe tool aliases with reverse mapping to canonical dispatch names |
 
-/// Maps NativeAgent's internal tool names to provider-safe names.
-///
-/// Internal tool names may carry dots or dashes (`browser.read_text`).
-/// Some providers only accept a narrow
-/// `[A-Za-z0-9_]` name at the wire boundary, so the LLM sees aliases while
-/// dispatch still receives the original names.
+/// Provider-safe names admit only the wire's character set; map them back exactly so dispatch retains internal tool identity.
 struct ProviderToolNameMap: Sendable {
     let schemas: [LLMToolSchema]
     private let providerToInternal: [String: String]

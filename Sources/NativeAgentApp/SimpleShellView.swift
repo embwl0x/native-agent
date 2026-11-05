@@ -1,34 +1,31 @@
 import SwiftUI
 import EngineRuntime
-import SwarmRuns
 import AppKit
 import AppToolRuntime
 import Agents
 import NativeAgentCore
 import StandingBots
 import NativeAgentShared
-// Blueprint: | `SimpleShellView.swift` | Simple and Advanced shells select the engine's shared contact, helper and crew threads |
+// Blueprint: | `SimpleShellView.swift` | Simple and Advanced shells select the engine's shared contact and helper threads |
 
 typealias SimpleContact = AgentContactPresentation
 typealias SimpleFlight = AgentContactFlight
 
 typealias SimpleViewStore = ContactThreadReadouts
-typealias SimpleCrew = SwarmCrew
 
 extension EnvironmentValues {
-    /// app_page_screenshot's "simple_settings_menu": the settings menu drawn
-    /// open in place, since a popover is its own window and never draws offscreen.
+    /// Draw the settings menu in place for screenshots; separate popover windows do not render offscreen.
     @Entry var simpleSettingsMenuDrawnOpen = false
 }
 
 struct SimpleShellView: View {
-    enum Pane: Hashable { case agent, contact(String), helper(UUID), crew(String) }
+    enum Pane: Hashable { case agent, contact(String), helper(UUID) }
 
     @Environment(AppModel.self) private var appModel
     private var store: SimpleViewStore { appModel.engine.contactThreads }
     @State private var pane: Pane = .agent
 
-    /// Return to the agent's chat when the selected thread leaves the lists.
+    /// A removed thread must return selection to the resident chat.
     private var gone: some View {
         Color.clear.onAppear { pane = .agent }
     }
@@ -60,16 +57,11 @@ struct SimpleShellView: View {
                         SimpleHelperRuns(record: helper, store: store) { pane = .agent }
                             .id(helper.id)
                     } else { gone }
-                case .crew(let id):
-                    if let crew = store.crews.first(where: { $0.id == id }) {
-                        SimpleCrewThread(crew: crew)
-                            .id(crew.id)
-                    } else { gone }
                 }
             }
         }
         .onAppear { store.start() }
-        // An offscreen drawing waits for the first read, so the lists are there.
+        // Await the first list read so offscreen drawings include thread rows.
         .quietReadTask(live: false) {
             while !store.loaded, !Task.isCancelled { try? await Task.sleep(nanoseconds: 50_000_000) }
         }
@@ -77,7 +69,6 @@ struct SimpleShellView: View {
     }
 }
 
-/// Advanced shows the shared threads beside connection setup.
 struct AgentThreadsTab: View {
 
     @Environment(AppModel.self) private var appModel
@@ -101,16 +92,12 @@ struct AgentThreadsTab: View {
                     if let helper = store.helpers.first(where: { $0.id == id }) {
                         SimpleHelperRuns(record: helper, store: store, openChat: openChat).id(helper.id)
                     } else { Color.clear.onAppear { pane = .agent } }
-                case .crew(let id):
-                    if let crew = store.crews.first(where: { $0.id == id }) {
-                        SimpleCrewThread(crew: crew).id(crew.id)
-                    } else { Color.clear.onAppear { pane = .agent } }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .onAppear { store.start() }
-        // An offscreen drawing waits for the first read, so the lists are there.
+        // Await the first list read so offscreen drawings include thread rows.
         .quietReadTask(live: false) {
             while !store.loaded, !Task.isCancelled { try? await Task.sleep(nanoseconds: 50_000_000) }
         }

@@ -1,10 +1,9 @@
 import CryptoKit
 import Foundation
 
-// Blueprint: | `DeviceApprovalSignature.swift` | `DeviceApprovalSignature`: Ed25519 device identity and canonical approval-body verification; outer HMAC remains required |
+// Blueprint: | `DeviceApprovalSignature.swift` | `DeviceApprovalSignature`: device identity and approval verification; outer HMAC required |
 
-/// The device ID is the fingerprint of its Ed25519 public key. The outer
-/// transport HMAC covers this signature too; neither signature replaces it.
+/// The device ID is the fingerprint of its Ed25519 public key. The outer transport HMAC covers this signature too; neither signature replaces it.
 public enum DeviceApprovalSignature {
     public static func deviceID(publicKey: Data) -> String {
         SHA256.hash(data: publicKey).map { String(format: "%02x", $0) }.joined()

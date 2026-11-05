@@ -1,4 +1,3 @@
-// CognitiveSubstrate+Affect.swift
 
 import Foundation
 import NativeAgentCore
@@ -6,8 +5,7 @@ import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Affect.swift` | `CognitiveSubstrate`: `canonicalAffectProjection`, `decayAffectInMemory`, `applyAffectFromEvent` |
 
 extension CognitiveSubstrate {
-    /// One fixed-time affect projection for sibling organs. Warmth and pressure
-    /// must cross together so the organism cannot observe two decay epochs.
+    /// One fixed-time affect projection for sibling organs. Warmth and pressure must cross together so the organism cannot observe two decay epochs.
     public func canonicalAffectProjection(at fixedAt: Date) -> CognitiveAffectState? {
         guard configuration.enabled else { return nil }
         return projectedAffect(at: fixedAt)
@@ -30,19 +28,11 @@ extension CognitiveSubstrate {
     ) -> CognitiveAffectState {
         guard configuration.enabled,
               event.turnKind.contributesToLivedState else { return affect }
-        // An event whose OWNER measured its feeling takes no additional flat
-        // per-kind delta: the per-kind arms below are inferences for events that
-        // arrived without one, and applying both would stack an inferred delta
-        // on a measured one. Byte-identical for `.organismResolutionFelt`, which
-        // already `break`s below for exactly this reason; what it adds is the
-        // same guarantee for the studio journal, where the agent's own
-        // requirement is that the delta come from the ENTRY and never from the
-        // act of filing one.
+        // Measured feeling takes no inferred per-kind delta; applying both would count one experience twice.
         guard !event.carriesMeasuredFeltValence else { return affect }
         let now = dependencies.now()
-        // Settle elapsed quiet time on a copy before folding in the new event.
-        // This keeps the merge boundary correct even when no maintenance tick
-        // occurred during the gap; the projection itself never mutates state.
+        // Settle elapsed quiet time on a copy before folding in the new event. This keeps the merge boundary correct even when no maintenance tick occurred
+        // during the gap; the projection itself never mutates state.
         var next = projectedAffect(at: now)
         let importance = event.importance
         switch event.kind {
@@ -56,11 +46,7 @@ extension CognitiveSubstrate {
         case .toolCancelled:
             break
         case .providerVitalsShift:
-            // Graded sibling of `.providerFailure`. The somatic/organism path is
-            // the primary consequence (chemistry → mood → capsule); if a shift is
-            // ever folded into affect too, a worsening band lifts arousal/
-            // uncertainty in proportion to its importance (sluggish < degraded)
-            // and a recovery eases uncertainty. Direction travels in metadata.
+            // Body chemistry owns provider shifts; metadata preserves graded direction without adding a flat affect hit.
             if case .string("recovering")? = event.metadata[CognitiveSomaticSignals.vitalsDirectionMetadataKey] {
                 next.uncertainty = saturatingApproach(next.uncertainty, -0.1)
             } else {
@@ -68,8 +54,7 @@ extension CognitiveSubstrate {
                 next.uncertainty = saturatingApproach(next.uncertainty, 0.2 + importance * 0.15)
             }
         case .organismResolutionFelt:
-            // The organism's chemistry already carries this exhale (Wave A1);
-            // the substrate remembers it as a NODE, not a second affect hit.
+            // Body chemistry already carries the resolution; retaining its node must not apply a second affect hit.
             break
         case .userCorrection:
             next.arousal = saturatingApproach(next.arousal, 0.15)
@@ -81,12 +66,7 @@ extension CognitiveSubstrate {
             next.taskPressure = saturatingApproach(next.taskPressure, -0.15)
         case .userMessageReceived:
             next.arousal = saturatingApproach(next.arousal, 0.05 + importance * 0.07)
-            // Affect-warmth is ADDITIVE to Agent's persona, which is already naturally warm
-            // with User. There is no flat per-message base, so the affect layer rises only on
-            // genuine warmth in the exchange and eases back down during focused work (just
-            // decay, no boost) — a modulation on top of her baseline, never the whole of it.
-            // This lets her get crisp and businesslike heads-down while staying fundamentally
-            // warm via the persona; genuine warm/affectionate moments still lift it high.
+            // Warmth modulates the persona baseline only for received warmth; focused work decays that modulation without erasing the baseline.
             next.socialWarmth = saturatingApproach(next.socialWarmth, precomputedWarmthBoost)
             next.taskPressure = saturatingApproach(next.taskPressure, importance * 0.06)
             // Conversational appraisal moves felt signals for good and bad exchanges; dismissal can make warmth negative.
@@ -99,11 +79,7 @@ extension CognitiveSubstrate {
             }
         case .assistantTurnCompleted:
             next.taskPressure = saturatingApproach(next.taskPressure, -0.1)
-            // NO warmth boost from her own reply. Agent is warm by persona, so every
-            // completion carries warm tokens — boosting off her own output is a
-            // self-reinforcing ratchet that pegged warmth at "deeply warm" all day.
-            // Relational warmth tracks USER's warmth toward her (userMessageReceived),
-            // not her own routine voice; between genuine warm moments, warmth eases.
+            // Only received warmth moves relational warmth; learning from the assistant's routine voice would create a self-reinforcing ratchet.
         case .appWake:
             next.arousal = saturatingApproach(next.arousal, 0.05)
         case .appSleep:
@@ -112,43 +88,28 @@ extension CognitiveSubstrate {
         }
         // Re-feel and dream residue share this await-free state update.
         next = refelt(next, for: event, at: now)
-        // RESIDUE (item 7). The night colors the first turns after waking.
         next = colored(next, byResidueAt: now)
         affect = next
         if event.kind == .assistantTurnCompleted {
-            // One accepted turn spent. Counted on HER completed turn (the same
-            // boundary the Sound cadence counts), so a residue lasts two real
-            // exchanges rather than two events.
+            // Spend residue on completed exchanges, not individual events, so it lasts two real turns.
             consumeDreamResidueTurn(at: now)
         }
-        // Persistence is intentionally NOT here — this function must stay synchronous so
-        // callers can apply affect and stamp a node tag in one await-free segment. The
-        // affect artifact is persisted by the async caller (updateAffectFromEvent, or
-        // ingest after it stamps the tag).
+        // Keep affect and its node tag in one await-free segment; the async caller persists them afterward.
         return next
     }
 
     // MARK: - Re-feeling a remembered feeling
 
-    /// The strongest nudge one re-touched memory may apply to current affect.
-    /// Small by design: recall COLORS the present, it does not replace it.
+    /// The strongest nudge one re-touched memory may apply to current affect. Small by design: recall COLORS the present, it does not replace it.
     static let refeelNudge = 0.08
-    /// One nudge per node per hour. A memory re-served three times in a turn is
-    /// one act of remembering, not three feelings.
+    /// One nudge per node per hour. A memory re-served three times in a turn is one act of remembering, not three feelings.
     static let refeelRefractory: TimeInterval = 60 * 60
     /// A tag this flat is not a feeling worth re-feeling.
     static let refeelValenceFloor = 0.12
     /// How many re-touched nodes may contribute to one turn.
     static let refeelNodesPerTurn = 2
 
-    /// Nudge current affect toward the feeling of the memories this turn
-    /// actually pulled in. Saturating (the affect layer's own law), bounded, and
-    /// rate-limited per node.
-    ///
-    /// Deliberately NOT a mood write and NOT a re-stamp: the node's own tag is
-    /// untouched, so re-feeling cannot ratchet a memory warmer every time it is
-    /// recalled (the reconsolidation asymmetry already owns that lane, and only
-    /// on genuine re-encounter).
+    /// Recall nudges only present affect, bounded per node; re-stamping the memory would ratchet its feeling on every recall.
     private func refelt(
         _ state: CognitiveAffectState,
         for event: CognitiveEvent,
@@ -167,10 +128,7 @@ extension CognitiveSubstrate {
             guard !ids.isEmpty,
                   ids.contains(where: { served.contains($0) })
             else { continue }
-            // ONE act of remembering, not two feelings: the refractory is
-            // keyed by the RECORD as well as the node, because every recall
-            // turn mints a fresh node naming the same record, and a per-node
-            // key let the same memory move her again sixty seconds later.
+            // Key the refractory by record and node: recalled records can receive fresh node identities on each turn.
             let servedHere = ids.filter { served.contains($0) }
             if let last = lastRefeltAt[node.id],
                now.timeIntervalSince(last) < Self.refeelRefractory { continue }
@@ -204,7 +162,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// Decode metadata record ids once for events and nodes, preserving first-seen order.
+    /// Preserve first-seen record order so event and node decoding agree.
     static func memoryRecordIDs(fromEventMetadata metadata: [String: JSONValue]) -> [String] {
         var ids: [String] = []
         if case .array(let values)? = metadata["memoryRecordIds"] {
@@ -238,8 +196,7 @@ extension CognitiveSubstrate {
         return next
     }
 
-    /// Stamp measured feeling as given; otherwise combine the exact post-event
-    /// affect with care-weighted meaning and the caller's gated appraisal.
+    /// Stamp measured feeling as given; otherwise combine the exact post-event affect with care-weighted meaning and the caller's gated appraisal.
     func emotionTag(
         for event: CognitiveEvent,
         affect: CognitiveAffectState,
@@ -270,8 +227,7 @@ extension CognitiveSubstrate {
             ? affectTerm * (1 - min(0.5, meaning * 1.4))
             : affectTerm
         var pierced = dampedAffectTerm + meaning
-        // Received affection may be muted but cannot become a wound;
-        // the floor follows the speaker's relational weight.
+        // Received affection may be muted but cannot become a wound; the floor follows the speaker's relational weight.
         if appraisal.affection {
             pierced = max(pierced, -0.12 * appraisal.affectionWeight.clamped01())
         }
@@ -298,13 +254,9 @@ extension CognitiveSubstrate {
         lastWarmPresenceAt = dateValue(object["lastWarmPresenceAt"])
     }
 
-    /// Per-axis decay half-lives. Arousal (alertness/energy) fades on a minutes scale;
-    /// social warmth lingers for hours. This "honest decay" gives each axis real dynamic
-    /// range across a day instead of one shared 1h half-life that blurred fast and slow
-    /// feelings together and let active conversation peg every axis at the ceiling.
+    /// Arousal fades over minutes and warmth over hours so alertness can settle without losing relational continuity.
 
-    /// Decay an affect state to `now` using per-axis half-lives. Centralizes the decay
-    /// math used by the pure live projection and persisted checkpoints.
+    /// Decay an affect state to `now` using per-axis half-lives. Centralizes the decay math used by the pure live projection and persisted checkpoints.
     private func decayedAffect(
         _ state: CognitiveAffectState,
         to now: Date,
@@ -328,11 +280,7 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// Saturating update toward the [0,1] bounds. A positive delta moves `value` a
-    /// fraction of its remaining headroom toward 1; a negative delta moves it a fraction
-    /// of the way toward 0. Unlike add-then-clamp, a high value resists further saturation,
-    /// so an axis under sustained input settles below the ceiling with headroom to still
-    /// register a stronger moment — and decay can always pull it back down.
+    /// Use remaining headroom so sustained input settles below the ceiling while stronger moments can still register.
     private func saturatingApproach(_ value: Double, _ delta: Double) -> Double {
         let v = (value).clamped01()
         if delta >= 0 {
@@ -342,22 +290,17 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// "Away" threshold: once User has been quiet this long, ambient presence applies.
+    /// Quiet must last this long before ambient presence applies.
     private static let ambientPresenceGap: TimeInterval = 30 * 60
-    /// The quiet-but-present warmth floor held during his absence.
+    /// Hold a quiet-presence floor during the user's absence.
     private static let ambientPresenceWarmthBase: Double = 0.18
     /// The floor itself fades over a long absence so it never becomes permanent fake warmth.
     private static let ambientPresenceFloorHalfLife: TimeInterval = 12 * 60 * 60
-    /// The former five-minute maintenance pass eased pressure and uncertainty by
-    /// 5% per pass after the quiet boundary. Express the same response as elapsed
-    /// time so reading at 31 minutes or four hours does not depend on how many
-    /// scheduler ticks happened to run. `0.95` every five minutes is an
-    /// approximately 67.56-minute half-life.
+    /// Elapsed quiet time determines calm independently of scheduler ticks: 0.95 per five minutes is a 67.56-minute half-life.
     private static let ambientQuietCalmingHalfLife: TimeInterval =
         (5 * 60) * log(0.5) / log(0.95)
 
-    /// Pure read-time affect at an explicit instant. Canonical persistence keeps
-    /// the last materialized anchor; callers observe analytic decay, ambient calm,
+    /// Pure read-time affect at an explicit instant. Canonical persistence keeps the last materialized anchor; callers observe analytic decay, ambient calm,
     /// and the warm-presence floor without advancing that anchor or writing.
     func projectedAffect(
         at now: Date,
@@ -370,9 +313,8 @@ extension CognitiveSubstrate {
         let quietBoundary = lastPresence.addingTimeInterval(Self.ambientPresenceGap)
         guard now >= quietBoundary else { return next }
 
-        // Apply only the quiet interval not already materialized in `source`.
-        // A later maintenance/shutdown checkpoint can therefore persist this
-        // projection and a subsequent read will continue from that exact anchor.
+        // Apply only the quiet interval not already materialized in `source`. A later maintenance/shutdown checkpoint can therefore persist this projection and
+        // a subsequent read will continue from that exact anchor.
         let quietAnchor = max(source.updatedAt, quietBoundary)
         let quietElapsed = max(0, now.timeIntervalSince(quietAnchor))
         if quietElapsed > 0 {

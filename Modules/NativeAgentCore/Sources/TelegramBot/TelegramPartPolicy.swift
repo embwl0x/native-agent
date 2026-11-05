@@ -1,9 +1,11 @@
 import AuthoredCapabilities
 import Foundation
+import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramPartPolicy.swift` | Telegram's originating-door typed part calls use the canonical turn envelope, not a separate origin identity; telegram-model-picker.js interprets requests and draws menus; native code supplies checked choices, authenticates callback identities, validates returned buttons and retains canonical routing writes |
+// Blueprint: | `TelegramPartPolicy.swift` | Parts draw checked choices; native code owns callback admission and routing writes |
+// Use the originating door's canonical turn envelope; a separate origin would split authority.
 
-public typealias TelegramPartCall = @Sendable (_ id: String, _ input: JSONValue) async -> PartCallResult<JSONValue>
+public typealias TelegramPartCall = @Sendable (_ id: String, _ input: JSONValue, _ turn: Turn) async -> PartCallResult<JSONValue>
 
 struct TelegramModelPickerDecision: Codable, Sendable {
     struct Selection: Codable, Sendable { let providerId: String?; let modelId: String }
@@ -14,22 +16,21 @@ struct TelegramModelPickerDecision: Codable, Sendable {
 }
 
 extension SwiftNativeTelegramBot {
-    func callTelegramPart<Value: Decodable & Sendable>(_ id: String, input: JSONValue,
+    func callTelegramPart<Value: Decodable & Sendable>(_ id: String, input: JSONValue, turn: Turn,
         as type: Value.Type = Value.self) async throws -> Value {
         guard let partCall else {
             throw PartCallError(code: "unavailable", message: "The originating Telegram app door is not bound.")
         }
-        switch await partCall(id, input) {
+        switch await partCall(id, input, turn) {
         case .success(let value):
             return try JSONDecoder().decode(type, from: value.serializedData(pretty: false))
         case .failure(let error): throw error
         }
     }
 
-    /// Callback identities are made here from checked routing choices. The part
-    /// can arrange their buttons, but cannot introduce another callback action.
+    /// Callback identities are made here from checked routing choices. The part can arrange their buttons, but cannot introduce another callback action.
     func modelPicker(_ op: String, menu: TelegramModelMenu?, args: [String] = [],
-        providerId: String? = nil, modelId: String? = nil) async throws -> TelegramModelPickerDecision {
+        providerId: String? = nil, modelId: String? = nil, turn: Turn) async throws -> TelegramModelPickerDecision {
         let packet: JSONValue = menu.map { menu in .object([
             "surface": .string(menu.surface), "currentModel": .string(menu.currentModel),
             "currentProvider": .string(menu.currentProvider),
@@ -54,7 +55,7 @@ extension SwiftNativeTelegramBot {
             "current": .object(["status": .string(current == nil ? "unavailable" : "available"),
                 "model": current.map { .string($0.currentModel) } ?? .null,
                 "provider": current.map { .string($0.currentProvider) } ?? .null])
-        ]))
+        ]), turn: turn)
         if op == "command", decision.reply?.isEmpty != false {
             throw PartCallError(code: "bad_result", message: "The model picker returned no command reply.")
         }
@@ -62,8 +63,8 @@ extension SwiftNativeTelegramBot {
     }
 
     func modelPickerPresentation(_ op: String, menu: TelegramModelMenu,
-        providerId: String? = nil, modelId: String? = nil) async throws -> (text: String, markup: JSONValue) {
-        let decision = try await modelPicker(op, menu: menu, providerId: providerId, modelId: modelId)
+        providerId: String? = nil, modelId: String? = nil, turn: Turn) async throws -> (text: String, markup: JSONValue) {
+        let decision = try await modelPicker(op, menu: menu, providerId: providerId, modelId: modelId, turn: turn)
         guard let text = decision.text, !text.isEmpty, text.count <= 4_096,
               case .object(let markup)? = decision.markup,
               Set(markup.keys) == ["inline_keyboard"],

@@ -30,13 +30,11 @@ public enum OrganismChemistry {
 
         switch signal.kind {
         case .userSpoke:
-            // Chat valence belongs to substrate appraisal; canonical affect
-            // reaches warmth and ambient tenderness through `applyBodySchema`.
+            // Chat valence belongs to substrate appraisal; canonical affect reaches warmth and ambient tenderness through `applyBodySchema`.
             next.curiosity = raise(next.curiosity, by: 0.04 * i)
         case .assistantSpoke:
-            // Producing language is not evidence of success, coherence, or
-            // confidence. Verified provider/tool/motor outcomes supply those
-            // deltas through their own exact signals.
+            // Producing language is not evidence of success, coherence, or confidence. Verified provider/tool/motor outcomes supply those deltas through their
+            // own exact signals.
             break
         case .correctionReceived:
             next.vigilance = raise(
@@ -152,9 +150,12 @@ public enum OrganismChemistry {
             body.macAwake = false
             next.urgency = lower(next.urgency, by: 0.06 * i)
         case .horizonRefresh:
-            // Calendar refresh changes horizon rows; anticipation colors only
-            // projected chemistry through `OrganismProspectiveAffect.modulate`.
+            // Calendar refresh changes horizon rows; anticipation colors only projected chemistry through `OrganismProspectiveAffect.modulate`.
             break
+        case .organDeviated:
+            // An organ off its record unsettles; it names no hands, provider, memory or dream path, so body facts stay as their own signals left them.
+            next.vigilance = raise(next.vigilance, by: 0.08 * i)
+            next.coherence = lower(next.coherence, by: 0.04 * i)
         case .resourcePressureChanged:
             body.resourcePressureReading = nil
             body.resourcePressure = OrganismResourcePressure.from(metadata: signal.metadata) ?? body.resourcePressure
@@ -172,8 +173,7 @@ public enum OrganismChemistry {
         raise(tenderness, by: OrganismCaringEvent.dose)
     }
 
-    /// Only `.correctionReceived` gets tenderness relief, capped at 25% of its
-    /// vigilance raise; tool, provider, verification and safety vigilance stay intact.
+    /// Only `.correctionReceived` gets tenderness relief, capped at 25% of its vigilance raise; tool, provider, verification and safety vigilance stay intact.
     public static let tendernessGuardRelief = 0.25
 
     static func relationalVigilanceRaise(
@@ -215,8 +215,7 @@ public enum OrganismChemistry {
     ) -> ChemicalState {
         var next = state
 
-        // The compatibility Bool maps unknown provider evidence to false;
-        // typed evidence keeps unknown from counting as failure or recovery.
+        // Typed provider evidence preserves unknown; its Boolean projection alone cannot establish failure or recovery.
         let previousProviderHealth = observedProviderHealth(previousBody)
         let nextProviderHealth = observedProviderHealth(nextBody)
         if nextProviderHealth == false, previousProviderHealth != false {
@@ -268,16 +267,13 @@ public enum OrganismChemistry {
         return next
     }
 
-    /// Memory brittleness requires current typed evidence; the persisted Bool
-    /// alone cannot establish failure. Unknown withholds both alarm and health.
+    /// Memory brittleness requires current typed evidence; the persisted Bool alone cannot establish failure. Unknown withholds both alarm and health.
     static let memoryBeliefUncertaintyCeiling = 0.25
     static let memoryBeliefFreshnessFloor = 0.5
 
     static func observedMemoryHealth(_ body: BodySchema) -> Bool? {
         guard let reading = body.memoryIntegrityReading else {
-            // No typed evidence in hand: `true` is the schema's own default and
-            // is safe to believe (it asserts nothing in the prompt); `false`
-            // could be a value carried across a restart, so it does not speak.
+            // Absent typed evidence cannot support a persisted failure claim; the schema's true default adds no prompt assertion.
             return body.memoryHealthy ? true : nil
         }
         switch reading.category {
@@ -286,13 +282,10 @@ public enum OrganismChemistry {
         case .unknown:
             return nil
         case .unavailable:
-            // Exact: the store is not there. That is present-tense evidence and
-            // it must still be able to speak.
+            // A missing store is current evidence and may name its failure.
             return false
         case .degraded:
-            // A maintenance failure is real, but a maintenance failure whose
-            // evidence has aged out or arrived uncertain is not a present-tense
-            // brittleness claim.
+            // A maintenance failure may speak only while its evidence remains current and certain.
             if reading.metrics.uncertainty >= memoryBeliefUncertaintyCeiling { return nil }
             if reading.metrics.freshness < memoryBeliefFreshnessFloor { return nil }
             return false
@@ -336,15 +329,12 @@ public enum OrganismChemistry {
         if observedMemoryHealth(bodySchema) == false {
             return "- Body: memory field feels brittle; lean on current context."
         }
-        // Positive/steady region — compose from the strongest one or two felt
-        // dimensions with intensity gradation, so a held mood reads with texture
-        // instead of one frozen sentence. (The stress lines above stay first-match:
-        // their exact phrasing IS the behavioral signal and must not blur.)
+        // Blend the strongest positive dimensions for texture; stress stays first-match because its exact words carry behavioral meaning.
         return positiveBodyLine(chemicalState, tenderNamed: tenderNamed)
     }
 
-    /// At fatigue >= 0.24, name tiredness once, preferring night near the trough.
-    /// Keep phrases free of digits and implementation terms for the capsule sanitizer.
+    /// At fatigue >= 0.24, name tiredness once, preferring night near the trough. Keep phrases free of digits and implementation terms for the capsule
+    /// sanitizer.
     static func fatigueBodyLine(
         _ fatigue: Double,
         diurnal: OrganismDiurnalRead?
@@ -359,10 +349,7 @@ public enum OrganismChemistry {
         return "- Body: a long day; it's starting to show."
     }
 
-    /// Calm/positive "- Body:" line: rank the active felt dimensions, phrase the
-    /// strongest one or two with low/mid/high intensity gradation, blend the top
-    /// two. Deterministic (ties break on phrase). Nil when nothing is felt
-    /// strongly enough to be worth saying.
+    /// Rank positive felt phrases deterministically and speak at most two; faint state remains silent.
     static func positiveBodyLine(_ c: ChemicalState, tenderNamed: Bool = true) -> String? {
         func band(_ v: Double, _ low: String, _ mid: String, _ high: String) -> String {
             v >= 0.6 ? high : (v >= 0.4 ? mid : low)
@@ -384,8 +371,7 @@ public enum OrganismChemistry {
             felt.append((c.agency, band(c.agency, "ready to move", "leaning into the work", "driving hard")))
         }
         if c.coherence >= 0.65 && c.confidence >= 0.62 {
-            // Only fires at high coherence+confidence, so band() would always pick
-            // "high"; grade within the gated range instead.
+            // Only fires at high coherence+confidence, so band() would always pick "high"; grade within the gated range instead.
             let s = min(c.coherence, c.confidence)
             felt.append((s, s >= 0.80 ? "clear and sure" : "settled and clear"))
         }
@@ -397,18 +383,15 @@ public enum OrganismChemistry {
         return "- Body: \(lead.phrase)."
     }
 
-    /// Positive raises scale by remaining headroom / `axisHighRail`; `lower`
-    /// mirrors this against the floor by scaling positive decreases by the current value.
+    /// Use remaining headroom for positive raises and current value for decreases so neither rail traps the axis.
     public static func raise(_ current: Double, by amount: Double) -> Double {
-        // A non-positive "raise" is a plain add (a negative amount lowers);
-        // only the positive branch saturates toward the ceiling.
+        // A non-positive "raise" is a plain add (a negative amount lowers); only the positive branch saturates toward the ceiling.
         guard amount > 0 else { return (current + amount).clamped01() }
         let headroom = max(0, axisHighRail - current.clamped01()) / axisHighRail
         return min(axisHighRail, (current + amount * headroom).clamped01())
     }
 
-    /// The most any raised axis may hold. Below it there is always somewhere
-    /// left to go, which is what makes the next success mean something.
+    /// Saturate below the ceiling so a later success still has room to matter.
     public static let axisHighRail = 0.94
 
     static func lower(_ current: Double, by amount: Double) -> Double {
@@ -416,9 +399,7 @@ public enum OrganismChemistry {
         return (current - amount * current.clamped01()).clamped01()
     }
 
-    /// `applyBodySchema` integrates canonical `socialWarmth` at or above this gate over
-    /// elapsed crossing time, never read count: approach = 1 - exp(-window / tau),
-    /// with a 45-minute fill constant and at most one hour integrated per crossing.
+    /// Integrate canonical warmth over elapsed crossings, never read count; use a 45-minute fill constant and cap each crossing at one hour.
     static let tendernessWarmthGate = 0.45
     static let tendernessTimeConstant: TimeInterval = 45 * 60
     static let maximumTendernessIntegrationWindow: TimeInterval = 60 * 60
@@ -442,29 +423,26 @@ public enum OrganismChemistry {
         return (clamped + (target - clamped) * approach).clamped01()
     }
 
-    /// `OrganismPersistentState.decayed` alone spends tenderness's three-day
-    /// wall-clock half-life, shared by live settling and cold-start load regardless of traffic.
+    /// `OrganismPersistentState.decayed` alone spends tenderness's three-day wall-clock half-life, shared by live settling and cold-start load regardless of
+    /// traffic.
     public static let tendernessHalfLife: TimeInterval = 3 * 24 * 3_600
 
     /// Per-signal ceiling on the share of the gap to rest that settling may spend.
     public static let perSignalSettleRate = 0.006
 
-    /// Hourly settling ceiling at any density: alone, ln(2)/0.20 ~= 3.47 h;
-    /// with persistence's 0.78^h / 0.92^h decay, holds are ~93 / ~147 minutes,
-    /// both above the affect layer's 90-minute socialWarmth hold.
+    /// Hourly settling ceiling at any density: alone, ln(2)/0.20 ~= 3.47 h; with persistence's 0.78^h / 0.92^h decay, holds are ~93 / ~147 minutes, both above
+    /// the affect layer's 90-minute socialWarmth hold.
     public static let maximumSettlePerHour = 0.20
 
-    /// min(per-signal ceiling, hourly ceiling * elapsed hours); nil uses the
-    /// per-signal ceiling without a density claim. The kernel supplies local ingestion gaps.
+    /// Bound settling by per-signal and hourly shares; without elapsed evidence make no density claim.
     static func settleRate(forElapsed elapsed: TimeInterval?) -> Double {
         guard let elapsed else { return perSignalSettleRate }
         let hours = max(0, elapsed) / 3_600
         return min(perSignalSettleRate, maximumSettlePerHour * hours)
     }
 
-    /// Resting values are `ChemicalState.neutral`'s — the same targets the
-    /// wall-clock decay already relaxes toward (zero for the transient axes,
-    /// 0.5 for coherence and confidence). One law, two clocks.
+    /// Resting values are `ChemicalState.neutral`'s — the same targets the wall-clock decay already relaxes toward (zero for the transient axes, 0.5 for
+    /// coherence and confidence). One law, two clocks.
     static func settled(
         _ state: ChemicalState,
         rate: Double = perSignalSettleRate
@@ -490,8 +468,7 @@ public enum OrganismChemistry {
 
     // MARK: - Fatigue
 
-    // Work accrual saturates through `raise`; fatigue is a feeling, never a
-    // posture, tool-strategy or loop-budget gate.
+    // Work accrual saturates through `raise`; fatigue is a feeling, never a posture, tool-strategy or loop-budget gate.
 
     /// Base fatigue share per admitted work signal, before weight and intensity.
     public static let perSignalFatigueAccrual = 0.0015
@@ -506,7 +483,7 @@ public enum OrganismChemistry {
     static func fatigueWorkWeight(_ kind: SomaticSignalKind) -> Double {
         switch kind {
         case .userSpoke, .assistantSpoke:
-            // An accepted turn, both halves of it.
+            // Both halves of an accepted turn count as work.
             return 1.0
         case .toolStarted:
             return 0.5
@@ -524,8 +501,7 @@ public enum OrganismChemistry {
         }
     }
 
-    /// min(weight * clamped intensity * base share, hourly cap * elapsed hours);
-    /// nil elapsed uses the signal share without a density claim.
+    /// min(weight * clamped intensity * base share, hourly cap * elapsed hours); nil elapsed uses the signal share without a density claim.
     static func fatigueAccrual(
         kind: SomaticSignalKind,
         intensity: Double,
@@ -539,8 +515,7 @@ public enum OrganismChemistry {
         return min(share, maximumFatigueAccrualPerHour * hours)
     }
 
-    // The kernel accrues wakefulness only across live elapsed time, regardless
-    // of quiet hours, and resets the separately tracked share on dream completion.
+    // The kernel accrues wakefulness only across live elapsed time, regardless of quiet hours, and resets the separately tracked share on dream completion.
 
     /// Fatigue per wall-hour awake, before the share cap and quiet relaxation.
     public static let wakefulnessAccrualPerHour = 0.012
@@ -549,11 +524,7 @@ public enum OrganismChemistry {
     /// Gaps of seven hours or more accrue nothing and only relax; shorter quiet gaps count as awake.
     public static let restGap: TimeInterval = 7 * 3_600
 
-    /// The wakefulness share after `elapsed` of continuous wakefulness: relax
-    /// first on the shared quiet half-life, then accrue, then cap. Pure —
-    /// returns both the new share and the amount to add to the total, so the
-    /// caller can keep the two in step without the share ever double-counting
-    /// its own relaxation.
+    /// Relax wakefulness share before accruing and capping; return share plus delta so the total cannot double-count relaxation.
     public static func wakefulness(
         _ share: Double,
         elapsed: TimeInterval
@@ -595,7 +566,7 @@ public enum OrganismCircadian {
     /// Hard cap on the curiosity lean the curve applies. ≤ 0.15 by contract.
     public static let curiosityAmplitude = 0.09
 
-    /// Fractional local hour in the Mac's current time zone.
+    /// Local fractional hour follows the Mac's current zone.
     static func localHour(_ date: Date) -> Double {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .autoupdatingCurrent
@@ -606,20 +577,18 @@ public enum OrganismCircadian {
         return hour + minute / 60 + second / 3_600
     }
 
-    /// The hour the body bottoms out: the midpoint of the declared quiet window
-    /// (wrap-aware — 23→7 gives 3 AM).
+    /// The hour the body bottoms out: the midpoint of the declared quiet window (wrap-aware — 23→7 gives 3 AM).
     static func troughHour(_ clock: OrganismDiurnalClock) -> Double {
         let start = clock.quietStartHour, end = clock.quietEndHour
         let span = start < end ? Double(end - start) : Double(24 - start + end)
         return (Double(start) + span / 2).truncatingRemainder(dividingBy: 24)
     }
 
-    /// The read. −1 at the trough, +1 twelve hours later; phase and nightliness
-    /// alongside it. Pure.
+    /// Project phase and nightliness without mutating state; trough is −1 and the opposite peak is +1.
     public static func read(at date: Date, clock: OrganismDiurnalClock) -> OrganismDiurnalRead {
         let hour = localHour(date)
         let phase = (hour / 24).truncatingRemainder(dividingBy: 1)
-        // Signed distance from the trough, wrapped into [−12, 12).
+        // Wrap trough distance into [−12, 12).
         var offset = hour - troughHour(clock)
         offset = offset.truncatingRemainder(dividingBy: 24)
         if offset < -12 { offset += 24 }
@@ -634,11 +603,8 @@ public enum OrganismCircadian {
         )
     }
 
-    /// Apply the curiosity half to a PROJECTED chemistry, and return the read
-    /// that describes what was applied. Nil clock → unchanged state, nil read.
-    ///
-    /// The negative arm applies in full (3 AM dulls a curious body); the
-    /// positive arm scales by the current value, so 0 stays 0.
+    /// Modulate only projected curiosity: negative clock lean applies fully, positive lean scales existing curiosity so silence stays silent; no clock changes
+    /// nothing.
     public static func modulate(
         _ state: ChemicalState,
         at date: Date,

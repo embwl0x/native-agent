@@ -5,13 +5,13 @@ import TrustCenter
 import Dispatcher
 import Browser
 import TrustPersistence
-// Blueprint: | `NativeActionRoutes.swift` | `NativeActionRoutes` enum; `runNativeAction`, `swiftNativeActionRecords`; native receipts use Browser's shared path and appendPathOwnedJSONL retention |
+// Blueprint: | `NativeActionRoutes.swift` | `NativeActionRoutes`, `runNativeAction`, `swiftNativeActionRecords`; canonical native receipts |
 
 public enum NativeActionRoutes {
-    /// `dataRoot` nil keeps the established persona/workspace resolver; only
-    /// an explicit isolated root overrides those reads.
+    /// Only explicit dataRoot overrides persona/workspace resolution; nil preserves the shared resolver.
     public static func runNativeAction(
-        id: String, dryRun: Bool, input: [String: Any], dataRoot: URL?, browser: BrowserActionRoutes
+        id: String, dryRun: Bool, input: [String: Any], dataRoot: URL?, browser: BrowserActionRoutes,
+        turn: Turn?, execution: AppActionExecution
     ) async throws -> NativeActionReceipt {
         let actionId = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !actionId.isEmpty else {
@@ -31,14 +31,15 @@ public enum NativeActionRoutes {
         if actionId.hasPrefix("browser.") {
             return try await browser.runBrowserNativeAction(
                 action: action, dryRun: dryRun, input: input,
-                dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
+                dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot(), imageSink: execution.localImageSink,
+                retainRead: execution.retainBrowserRead
             )
         }
         let result = try await NativeActionDispatch.dispatchNativeAction(
             tool: actionId,
             input: NativeActionWire.jsonValueBody(input),
             dryRun: dryRun,
-            dataRoot: dataRoot
+            dataRoot: dataRoot, turn: turn, deadlines: execution.deadlines
         )
         return try await Self.appendNativeActionReceipt(
             action: action,

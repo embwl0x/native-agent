@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentChromeRelayCore
 import PersistenceCore
 
-// Blueprint: | `main.swift` | Chrome relay executable: authenticated browser/app handshake and opaque bounded native-message forwarding over the private socket |
+// Blueprint: | `main.swift` | Authenticated Chrome relay; bounded native-message forwarding over the private socket |
 
 private enum RelayError: Error, LocalizedError {
     case socketPathMustBeAbsolute
@@ -93,7 +93,6 @@ private func defaultSocketPath() -> String {
     InstallPaths.current.chromeSocket.path
 }
 
-/// The app's per-launch 0600 secret authenticates the relay's first frame.
 private func handshakeToken(socketPath: String) -> String? {
     guard let raw = try? String(
         contentsOfFile: ChromeHostIdentity.tokenPath(forSocketPath: socketPath),
@@ -113,7 +112,6 @@ private func handshakeFrame(
     return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
-/// The app's acknowledgement identifies the listener that accepted this greeting.
 private func readHelloAck(descriptor: Int32) throws -> String {
     let frame: Data
     do {
@@ -138,10 +136,7 @@ private func readHelloAck(descriptor: Int32) throws -> String {
     return generation
 }
 
-/// Dial the app and complete the greeting. A refused connection is retried ONCE
-/// and only when the secret on disk has changed since we read it — that is the
-/// signal that the app relaunched under us, and the new listener is reachable
-/// at the same path. Any other refusal is real and is reported.
+/// Retry a refused connection once only if a changed secret proves the app relaunched; report every other refusal.
 private func connectAndGreet(
     socketPath: String,
     parentEvidence: ChromeHostIdentity.ParentEvidence
@@ -149,15 +144,10 @@ private func connectAndGreet(
     var attempt = 0
     while true {
         attempt += 1
-        // Read the secret BEFORE dialing. The app writes the token and only
-        // then binds the socket, so the token on disk when we dial belongs to
-        // the listener we are about to reach. Reading it after connecting let
-        // an overlapping app launch hand us its successor's secret, which the
-        // listener we were actually talking to had never minted.
+        // Read the secret before dialing: it is written before the socket binds, so a later read could name a successor listener.
         let token = handshakeToken(socketPath: socketPath)
         let descriptor = try connectUnixSocket(path: socketPath)
-        // Validate and connect before requiring credentials so path and socket
-        // failures retain their specific diagnostics, even without a token.
+        // Connect before requiring credentials so socket failures retain their diagnostics even without a token.
         guard let token else {
             Darwin.close(descriptor)
             throw RelayError.missingCredential
@@ -272,7 +262,6 @@ private func run() throws {
         } catch { diagnostic("Could not save Chrome relay refusal: \(error.localizedDescription)") }
         throw error
     }
-    // The listener this relay reached, to tell later whether it is gone.
     let acceptedListener = ChromeHostIdentity.FileIdentity(path: socketPath)
     var peer: pid_t = 0
     var peerSize = socklen_t(MemoryLayout<pid_t>.size)
@@ -314,7 +303,6 @@ private func run() throws {
 
     completion.semaphore.wait()
     _ = Darwin.shutdown(socketDescriptor, SHUT_RDWR)
-    // An exiting app's replacement listener reconnects on Chrome's existing pipes.
     if browserPID > 1, getppid() == browserPID,
        let stale = goneListener(path: socketPath, accepted: acceptedListener, appPID: appPID) {
         var on: Int32 = 1
@@ -331,9 +319,7 @@ private func run() throws {
     }
 }
 
-/// Nil while the app this relay reached still listens (it only replaced this
-/// connection). Otherwise the socket file it left behind after a crash, which
-/// the next listener replaces; `.some(nil)` when nothing was left.
+/// Nil while the reached app still listens; otherwise identifies its stale socket, with `.some(nil)` when no file remains.
 private func goneListener(path: String, accepted: ChromeHostIdentity.FileIdentity?, appPID: pid_t?) -> ChromeHostIdentity.FileIdentity?? {
     guard let current = ChromeHostIdentity.FileIdentity(path: path) else { return .some(nil) }
     guard current == accepted else { return .some(nil) }
@@ -351,9 +337,7 @@ private func goneListener(path: String, accepted: ChromeHostIdentity.FileIdentit
     } catch { return nil }
 }
 
-/// Blocks until a socket other than `stale` exists at `path`; false if its
-/// directory goes away. Directory events, no timer: the app writes its token
-/// and binds its socket there.
+/// Directory events follow token/socket publication without polling; stop waiting if the directory disappears.
 private func awaitSocket(path: String, replacing stale: ChromeHostIdentity.FileIdentity?) -> Bool {
     let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
     let descriptor = open(directory, O_EVTONLY | O_CLOEXEC)

@@ -10,10 +10,7 @@ public struct ConnectorActionRegistry: Codable, Hashable, Sendable {
     public var latestReceipt: ConnectorActionReceipt?
     public var createdAt: String?
 
-    /// The static connector action manifest with the same non-secret
-    /// readiness overlay the connector list uses, and the newest of its last
-    /// 50 receipts. A failed connector read propagates: it is a read failure,
-    /// not an unavailable registry.
+    /// Share connector-list readiness; propagate failed reads rather than claiming an unavailable registry.
     public static func read(dataRoot: URL, platform: AppConnectorStatusPlatform) async throws -> ConnectorActionRegistry {
         let connectors = try await ConnectorReadiness.readConnectorRecords(
             root: dataRoot, platform: platform
@@ -39,8 +36,6 @@ public struct ConnectorActionRegistry: Codable, Hashable, Sendable {
 }
 
 extension ConnectorActionRecord {
-    /// Each action's capability status for TrustCenter: active when its
-    /// connector is ready, else the connector's state or needs_setup.
     public static func checkedStatuses(root: URL, platform: AppConnectorStatusPlatform) async throws -> [String: String] {
         let connectors = try await ConnectorReadiness.readConnectorRecords(
             root: root, platform: platform

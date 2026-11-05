@@ -36,8 +36,7 @@ enum NativeAgentTheme {
 
 // MARK: - Brand palette — teal identity
 enum NativeAgentBrand {
-    /// Vibrant cyan-500 — primary accent: icons, tints, borders, indicators.
     static let accent       = Color(hex: 0x06B6D4)
-    /// Deep cyan-700 — gradient end for filled surfaces; keeps white text readable.
+    /// Deep cyan-700 keeps white text readable at the filled gradient's end.
     static let accentDeep   = Color(hex: 0x0E7490)
 }

@@ -5,17 +5,12 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SenseNewsBoard.swift` | Durable bounded unread/recent news, deduplication, acknowledgement, storage failures and care crossing; post/keep accept only after checked persistence, preserving prior news on failure |
-/// The latest news from live senses. The runner posts; her context and the
-/// surfaces read. Bounded: older news falls off.
+// Blueprint: | `SenseNewsBoard.swift` | Bounded deduplicated news and care crossing; checked persistence precedes publication |
 public actor SenseNewsBoard {
     public static let shared = SenseNewsBoard()
     public static let presentationDidChange = Notification.Name("NativeAgent.sensePresentationDidChange")
     public static let capacity = 200
-    /// How long news she has read is remembered, so a repeat is not news
-    /// again, and how old a post may be to count as news. Unread news lives
-    /// until her next turn reads it; capacity and newest-per-corner
-    /// replacement still bound it. No timer.
+    /// Retain acknowledged news to suppress repeats; unread news waits for the next turn, bounded by capacity and newest-per-corner replacement.
     public static let maximumAge: TimeInterval = 60 * 60
     private var items: [SenseNews] = []
     private var recent: [SenseNews] = []
@@ -26,8 +21,7 @@ public actor SenseNewsBoard {
     private struct Saved: Codable {
         var schema = 1
         var items: [SenseNews]
-        // Includes acknowledged notices: delivery must not renew their unread
-        // status when a restored watcher sends the same source change again.
+        // Keep acknowledged identities so restored watchers cannot renew unread status for the same change.
         var recent: [SenseNews]
         var histories: [UUID: History]
     }
@@ -40,8 +34,7 @@ public actor SenseNewsBoard {
     private var storageBlocked = false
     private var storageNotice: SenseNews?
     public private(set) var storageFailure: String?
-    /// Bind before live readers start. Only a missing file means an empty
-    /// board; damaged bytes are preserved and the failure remains visible.
+    /// Bind before readers start; only missing files mean an empty board, while damaged bytes must remain visible and preserved.
     @discardableResult
     public func configure(dataRoot: URL) -> Bool {
         guard storageURL == nil || storageBlocked else { return true }
@@ -82,8 +75,7 @@ public actor SenseNewsBoard {
                     throw storageError("Private news store has invalid bounds or schema.")
                 }
                 try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-                // Installation owns the binding before watches start. Preserve
-                // any startup notice already buffered by a source owner.
+                // Bind before watches start without losing source-owned startup notices.
                 let buffered = items
                 items = saved.items
                 recent = saved.recent
@@ -98,8 +90,7 @@ public actor SenseNewsBoard {
                 throw storageError("Private news store is unreadable.")
             }
             prune(save: false)
-            // Only this checked reopen may release a blocked binding. A
-            // later failed write is refused and leaves the store blocked.
+            // Only a checked reopen may unblock storage; later failed writes leave it blocked.
             storageBlocked = false
             try persist()
             return true
@@ -115,8 +106,7 @@ public actor SenseNewsBoard {
         NotificationCenter.default.post(name: Self.presentationDidChange, object: nil)
     }
     public func interactiveView() -> SenseInteractiveView? { view }
-    /// News waits here for her next turn; news that touches a care also asks
-    /// for one wake naming it, without quoting the news (it is on this board).
+    /// Keep news for the next turn; care wakes name it without duplicating its text.
     @discardableResult
     public func post(_ news: SenseNews) async -> Bool {
         guard !Task.isCancelled else { return false }
@@ -133,15 +123,13 @@ public actor SenseNewsBoard {
         await published(news)
         guard let fresh, let crossing = SensesHub.shared.crossing else { return storageURL != nil }
         let watch = "sense:" + fresh.senseID + ":v\(fresh.version):" + (fresh.observationID ?? Self.identity(fresh.address))
-        // The existing care-rest ledger and wake thread receive the observation
-        // and source change identity: only new changes end this watch's rest.
+        // Only new source change identities may end this watch's care rest.
         let changedWatch = watch + ":change:" + (fresh.changeID ?? Self.identity(fresh.summary))
         _ = await crossing.cross(fresh.summary, watch: changedWatch, reason: "what your senses noticed",
             id: watch + ":" + fresh.id.uuidString, says: fresh.senseID + ": news at " + Self.updateLine(fresh.address), agent: nil)
         return storageURL != nil
     }
-    /// A part's line already weighed against her cares that woke nothing: it
-    /// waits here for her next turn.
+    /// Keep already-weighed lines for the next turn without weighing them again.
     @discardableResult
     public func keep(_ news: SenseNews) async -> Bool {
         guard !Task.isCancelled else { return false }
@@ -162,14 +150,12 @@ public actor SenseNewsBoard {
             namespace: "sense-news", stableID: news.senseID, operation: .changed,
             reason: "sense_news_posted", occurredAt: news.at))
     }
-    /// The news as kept, or nil when it was a repeat or too old.
+    /// Nil means the news was a repeat or too old to retain.
     @discardableResult
     private func postCurrent(_ news: SenseNews) throws -> SenseNews? {
-        // Sanitize every visible field before history prefixes or clipping.
-        // Source-owned observation/change identities remain exact and private.
+        // Sanitize visible fields before clipping while retaining exact private observation/change identities.
         var news = news
-        // Exact source identities are private hashes, not clipped addresses or
-        // summaries. This keeps both deduplication and storage bounded.
+        // Use private hashes for exact source identities so deduplication and storage stay bounded.
         news.observationID = Self.identity(news.observationID ?? news.address)
         news.changeID = Self.identity(news.changeID ?? news.summary)
         news.senseID = ContextSecretContentPolicy.redactedFragment(news.senseID)
@@ -181,7 +167,7 @@ public actor SenseNewsBoard {
             $0.senseID == news.senseID && $0.version == news.version
                 && ($0.observationID ?? $0.address) == (news.observationID ?? news.address)
         }
-        // Repeated notices do not renew an old notice's age or unread status.
+        // Repeats must not renew age or unread status.
         guard !recent.contains(where: { sameCorner($0) && ($0.changeID ?? $0.summary) == (news.changeID ?? news.summary) }) else { return nil }
         recent.removeAll(where: sameCorner)
         recent.append(news)
@@ -201,8 +187,7 @@ public actor SenseNewsBoard {
                 + (omitted > 0 ? "\n\(omitted) older updates omitted." : "")
         }
         combined.summary = ContextSecretContentPolicy.redactedFragment(combined.summary)
-        // Keep the latest notice per corner; individual DOM/file edges cannot
-        // occupy the board or starve another corner.
+        // Keep only the latest notice per corner so rapid source edges cannot starve other corners.
         items.removeAll(where: sameCorner)
         items.append(combined)
         if items.count > Self.capacity { items.removeFirst(items.count - Self.capacity) }
@@ -214,16 +199,14 @@ public actor SenseNewsBoard {
         let ordered = items.sorted { $0.at > $1.at }
         return Array(((storageNotice.map { [$0] } ?? []) + ordered).prefix(max(0, limit)))
     }
-    /// Acknowledge immutable notices only after provider output proves the
-    /// packet was served. A newer event at the same address survives this ack.
+    /// Acknowledge immutable notices only after provider output proves delivery; newer events at the same address must survive.
     public func acknowledge(_ ids: Set<UUID>) async {
         defer { NotificationCenter.default.post(name: Self.presentationDidChange, object: nil) }
         let previousItems = items
         let previousHistories = histories
         items.removeAll { ids.contains($0.id) }
         retainHistories()
-        // Publish removal only after its durable receipt. Failed delivery
-        // bookkeeping is shown explicitly instead of promising restart safety.
+        // Persist removal before publication; failed bookkeeping cannot promise restart safety.
         do { try persist() } catch {
             items = previousItems
             histories = previousHistories
@@ -286,6 +269,8 @@ public actor SenseNewsBoard {
         }
         storageFailure = message
         storageNotice = SenseNews(senseID: "sense-news", version: 1, address: "senses:news",
-            summary: "Unread news persistence unavailable: \(message) Pending news may be lost after restart. raw view · private news storage is unavailable.", at: Date())
+            summary: """
+                Unread news persistence unavailable: \(message) Pending news may be lost after restart. raw view · private news storage is unavailable.
+                """, at: Date())
     }
 }

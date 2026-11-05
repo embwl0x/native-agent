@@ -4,7 +4,7 @@ import NativeAgentChromeRelayCore
 import PersistenceCore
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `ChromeControlHandshake.swift` | `ChromeControlHandshake`: private per-listener token, registered relay executable/signer and browser-parent authentication with original checked failure/status, bounded hello framing, accepted browser PID and listener-generation acknowledgement |
+// Blueprint: | `ChromeControlHandshake.swift` | `ChromeControlHandshake`; Authenticated relay identity and bounded hello. |
 
 /// Only an authenticated registered relay may replace the live channel.
 enum ChromeControlHandshake {
@@ -27,14 +27,8 @@ enum ChromeControlHandshake {
         return pid
     }
 
-    /// The whole proof for one accepted connection, run on the accept task.
-    ///
-    /// `expecting` contains this app's symlink-resolved relay executable paths.
-    /// Registration administration never relaxes the connection identity proof.
-    ///
-    /// Order matters. The peer's executable is settled first: it costs one
-    /// getsockopt and needs no cooperation from the caller, so an impostor
-    /// never gets to hold the accept task for the hello's whole budget.
+    /// `expecting` holds symlink-resolved relay paths; registration administration cannot relax identity proof. Check the executable before reading hello so an
+    /// impostor cannot consume the handshake budget.
     static func validateConnection(
         descriptor: Int32, expecting: Set<String>, token: String
     ) throws -> pid_t? {
@@ -58,9 +52,7 @@ enum ChromeControlHandshake {
             nativeLog("[NativeAgent] Chrome control refused a relay whose parent could not be read.")
             throw ChromeControlRuntimeError.handshakeRejected("the relay's parent process could not be read.")
         }
-        // Both app and relay require a browser-launched native messaging host.
-        // A relay reparented to launchd proves its browser parent at launch.
-        // Otherwise preserve the exact live Security check/status on refusal.
+        // Require a browser-launched host; reparented relays attest launch identity, while live checks preserve exact Security failures.
         if parent != 1 {
             do { _ = try ChromeHostIdentity.checkedBrowserSigningIdentifier(forProcess: parent) }
             catch { throw ChromeControlRuntimeError.handshakeRejected(error.localizedDescription) }

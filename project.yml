@@ -118,48 +118,14 @@ targets:
       OTHER_SWIFT_FLAGS: -parse-as-library
 
   # Owns the resource-bundle list shared with SwiftPM (AgentBridgeRuntime
-  # looks up wake helpers by this bundle name).
+  # looks up bundled helpers by this bundle name).
   NativeAgent_NativeAgentApp:
     type: bundle
     platform: macOS
     sources:
       - path: docs/data-bounds.md
         buildPhase: resources
-      - path: script/codex_thread_wakeup.js
-        buildPhase: resources
       - path: script/chatgpt_dot_ipc.js
-        buildPhase: resources
-      - path: script/codex_wake_daemon_probe.js
-        buildPhase: resources
-      - path: script/codex_wake_execution_policy.js
-        buildPhase: resources
-      - path: script/codex_wake_prompt.js
-        buildPhase: resources
-      - path: script/codex_wake_request_params.js
-        buildPhase: resources
-      - path: script/codex_wake_rpc.js
-        buildPhase: resources
-      - path: script/codex_wake_thread_state.js
-        buildPhase: resources
-      - path: script/codex_wake_inbox_projection.js
-        buildPhase: resources
-      - path: script/codex_wake_lane_identity.js
-        buildPhase: resources
-      - path: script/codex_wake_heartbeat.js
-        buildPhase: resources
-      - path: script/wake_worker_common.js
-        buildPhase: resources
-      - path: script/wake_queue_admission.js
-        buildPhase: resources
-      - path: script/wake_turn_observation.js
-        buildPhase: resources
-      - path: script/wake_reply_delivery.js
-        buildPhase: resources
-      - path: script/wake_recovery.js
-        buildPhase: resources
-      - path: script/codex_turn_result.js
-        buildPhase: resources
-      - path: script/omp_thread_wakeup.js
         buildPhase: resources
     settings:
       GENERATE_INFOPLIST_FILE: YES
@@ -244,7 +210,6 @@ targets:
           - Senses
           - TurnTrace
           - Transcripts
-          - Procedures
           - BackgroundLoops
           - BackgroundWork
           - DoctorChecks
@@ -254,7 +219,6 @@ targets:
           - SchedulerExecution
           - StandingBots
           - SwarmRuns
-          - WorkshopExecution
           - NotificationInbox
           - Research
           - SystemOps

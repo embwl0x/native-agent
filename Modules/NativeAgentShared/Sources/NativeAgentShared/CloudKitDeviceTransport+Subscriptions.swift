@@ -3,7 +3,7 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport+Subscriptions.swift` | Keyless visible ordinary-notification subscription, silent signed-result/chat wakes and exact registration reconciliation |
+// Blueprint: | `CloudKitDeviceTransport+Subscriptions.swift` | Visible alerts, silent chat/results and exact registration proof |
 
 extension CloudKitDeviceTransport {
     // MARK: subscriptions (ordinary alerts and silent cross-device triggers)
@@ -16,8 +16,8 @@ extension CloudKitDeviceTransport {
         )
     }
 
-    /// CloudKit builds the alert from the record even without app execution.
-    /// Requested results are chat records, so they cannot match this subscription.
+    /// CloudKit builds the alert from the record even without app execution. Requested results are chat records, so they cannot match this
+    /// subscription.
     func subscribeToVisibleNotifications() async throws {
         do {
             try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.subscribeToVisibleNotifications", onFailure: accountFailureReporter) {
@@ -32,9 +32,8 @@ extension CloudKitDeviceTransport {
     static func makeVisibleNotificationSubscription() -> CKQuerySubscription {
         let sub = CKQuerySubscription(
             recordType: NADeviceSyncRecordType.notification,
-            // Only notification envelopes carry a direction in this family.
-            // Presence shares the type but has no direction or alert fields.
-            // direction is queryable in Production; kind/title/eventId are not.
+            // Only notification envelopes carry a direction in this family. Presence shares the type but has no direction or alert fields. direction
+            // is queryable in Production; kind/title/eventId are not.
             predicate: NSPredicate(format: "direction == %@", NAChatDirection.mac2ios.rawValue),
             subscriptionID: DeviceCloudKitSubscriptionID.visibleNotifications,
             options: [.firesOnRecordCreation]
@@ -47,8 +46,7 @@ extension CloudKitDeviceTransport {
         info.titleLocalizationKey = "NATIVEAGENT_CLOUDKIT_NOTIFICATION_TITLE_FORMAT"
         info.titleLocalizationArgs = ["notificationTitle"]
         info.soundName = "default"
-        // CloudKit permits three desired keys. Title/body use localization args;
-        // routing can read the exact envelope in the notification extension.
+        // CloudKit permits three desired keys. Title/body use localization args; routing can read the exact envelope in the notification extension.
         info.desiredKeys = [
             "notificationScreen",
             "notificationEventId",
@@ -59,9 +57,8 @@ extension CloudKitDeviceTransport {
         return sub
     }
 
-    /// Durable silent-push subscription for the peer's pairing writes. Same broad
-    /// value:true predicate as the chat subscription (no queryable-field/index
-    /// dependency); drainPairing() filters to the peer's record locally.
+    /// Durable silent-push subscription for the peer's pairing writes. Same broad value:true predicate as the chat subscription (no
+    /// queryable-field/index dependency); drainPairing() filters to the peer's record locally.
     public func subscribeToPairingChanges() async throws {
         try await registerBroadSubscription(
             recordType: NADeviceSyncRecordType.pairingDevice,
@@ -70,7 +67,6 @@ extension CloudKitDeviceTransport {
         )
     }
 
-    /// Durable silent-push subscription for the peer's status writes.
     public func subscribeToStatusChanges() async throws {
         try await registerBroadSubscription(
             recordType: NADeviceSyncRecordType.status,
@@ -79,9 +75,7 @@ extension CloudKitDeviceTransport {
         )
     }
 
-    /// Shared broad-subscription registration (value:true predicate,
-    /// shouldSendContentAvailable). Fails loud — the caller NSLogs; nothing is
-    /// swallowed with try?. Treats "already exists" as success (durable).
+    /// Broad subscriptions avoid query-index dependencies; registration failures remain visible to the caller.
     private func registerBroadSubscription(
         recordType: String,
         subscriptionID: String,
@@ -97,7 +91,7 @@ extension CloudKitDeviceTransport {
                     options: [.firesOnRecordCreation, .firesOnRecordUpdate]
                 )
                 let info = CKSubscription.NotificationInfo()
-                info.shouldSendContentAvailable = true  // silent push
+                info.shouldSendContentAvailable = true
                 sub.notificationInfo = info
                 try await self.ensureSubscription(sub, id: subscriptionID)
             }
@@ -126,6 +120,9 @@ extension CloudKitDeviceTransport {
                 == (subscription as? CKQuerySubscription)?.zoneID
             devicePushLog.notice("Subscription repair role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public) zoneMatches=\(zoneMatches)")
             nativeLog("[ck-device] repairing stale subscription shape for \(id)")
+            // A subscription is replaced, never overwritten: CloudKit refuses a changed shape saved over a live id.
+            do { _ = try await database.deleteSubscription(withID: id) }
+            catch let error as CKError where error.code == .unknownItem {}
         } catch let error as CKError where error.code == .unknownItem {
             // Absent is the only state that authorizes a create attempt.
         } catch {
@@ -161,8 +158,7 @@ extension CloudKitDeviceTransport {
               let existingQuery = existing as? CKQuerySubscription,
               let expectedQuery = expected as? CKQuerySubscription,
               existingQuery.recordType == expectedQuery.recordType,
-              // Sends use the default zone. A stale custom-zone subscription
-              // must not pass verification against our unscoped query.
+              // Sends use the default zone. A stale custom-zone subscription must not pass verification against our unscoped query.
               existingQuery.zoneID == expectedQuery.zoneID,
               existingQuery.predicate.predicateFormat == expectedQuery.predicate.predicateFormat,
               existingQuery.querySubscriptionOptions == expectedQuery.querySubscriptionOptions

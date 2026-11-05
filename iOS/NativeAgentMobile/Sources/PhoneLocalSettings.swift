@@ -1,26 +1,29 @@
 import Foundation
 import NativeAgentShared
 
-// Blueprint: | `PhoneLocalSettings.swift` | Phone-local setting descriptors compose owner-declared controls; signed requests read current owners and use the phone's existing consent sheet for raises |
+// Blueprint: | `PhoneLocalSettings.swift` | Owner-declared local controls; signed requests read current owners and use consent sheets for raises |
 
+/// The phone serves a signed PhoneRequest, not the Mac's in-process Turn.
+/// Every setting effect carries that request's admission, or an explicit local UI act.
 @MainActor
-enum PhoneSettingWrite {
+enum PhoneSettingWrite: Sendable {
+    case person
+    case request(Admission)
+
     struct Admission: Sendable {
         let pairing: String
         let expiresAt: Date
         let approved: Bool
         let stillAuthorized: @MainActor @Sendable () -> Bool
     }
-    @TaskLocal static var current: Admission?
-
-    /// Rechecked inside asynchronous owners, after any queued person change.
-    /// A card approves this request, never a different request or pairing.
-    static func check(raising: Bool = false) throws {
-        guard let admission = current else { return } // Direct phone UI is the person's own act.
+    /// Recheck after queued user changes: consent applies only to this request and pairing.
+    func check(raising: Bool = false) throws {
+        guard case .request(let admission) = self else { return }
         guard admission.expiresAt > Date(),
               admission.stillAuthorized(),
               admission.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else {
-            throw PhoneLocalSetting.failure("The phone request ended, expired or pairing changed before this effect. Read the current setting before another change.")
+            throw PhoneLocalSetting.failure(
+                "The phone request ended, expired or pairing changed before this effect. Read the current setting before another change.")
         }
         guard !raising || admission.approved else {
             throw PhoneLocalSetting.failure("This now raises phone sharing authority. Ask again so the phone can show its approval sheet.")
@@ -28,8 +31,7 @@ enum PhoneSettingWrite {
     }
 }
 
-/// The declaration lives beside each control's owner. This composition stores
-/// no values: every read and write reaches that owner on the phone.
+/// Keep declarations beside owners; composition must read/write them without caching setting values.
 @MainActor
 struct PhoneLocalSetting {
     let id: String
@@ -39,7 +41,7 @@ struct PhoneLocalSetting {
     let read: () throws -> String
     /// A collection owner must be readable before an absent child can be judged.
     var ownsChildSettings = false
-    var write: ((String) async throws -> Void)?
+    var write: ((String, PhoneSettingWrite) async throws -> Void)?
     var approval: (String) throws -> Bool = { _ in false }
 
     func row() -> MobileAppSetting {
@@ -91,21 +93,22 @@ enum PhoneLocalSettings {
 
     static func perform(_ request: PhoneRequest, approved: Bool, pairing: String,
                         stillAuthorized: @escaping @MainActor @Sendable () -> Bool) async throws -> [String: String] {
-        return try await PhoneSettingWrite.$current.withValue(.init(pairing: pairing, expiresAt: request.expiresAt,
-                                                                  approved: approved, stillAuthorized: stillAuthorized)) {
+        let authority = PhoneSettingWrite.request(.init(pairing: pairing, expiresAt: request.expiresAt,
+            approved: approved, stillAuthorized: stillAuthorized))
         let controls = await controls()
-        try PhoneSettingWrite.check()
+        try authority.check()
         guard let id = request.params["id"] else {
             guard request.kind == .settingsRead else { throw PhoneLocalSetting.failure("Name the phone setting.") }
             return ["settings": String(decoding: try JSONEncoder().encode(controls.map { $0.row() }), as: UTF8.self)]
         }
         let control = try Self.control(id: id, among: controls)
         if request.kind == .settingsWrite {
-            guard let value = request.params["value"], let write = control.write else { throw PhoneLocalSetting.failure("This control is read only. Use its named Settings page.") }
-            try PhoneSettingWrite.check(raising: control.approval(value))
-            try await write(value)
+            guard let value = request.params["value"], let write = control.write else {
+                throw PhoneLocalSetting.failure("This control is read only. Use its named Settings page.")
+            }
+            try authority.check(raising: control.approval(value))
+            try await write(value, authority)
         }
         return ["setting": String(decoding: try JSONEncoder().encode(control.row()), as: UTF8.self)]
-        }
     }
 }

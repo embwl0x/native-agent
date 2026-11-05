@@ -16,7 +16,6 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
 // Blueprint: | `ChatHistoryProjection.swift` | Persisted row and explicit receipt projection; ordinary turn recall never injects tool metadata |
 
 /// One transcript line as history search reads it; `ChatHistoryIndex` keeps it by the line's bytes.
@@ -27,9 +26,7 @@ struct ChatHistorySearchRow: Sendable {
     var role: String?
     var runId: String?
     var messageId: String?
-    /// `createdAt`, else `timestamp`.
     var timestamp: String?
-    /// A conversation row's stored words (`content`, else `text`).
     var rawContent: String?
     var content: String
     var searchable: String
@@ -40,9 +37,8 @@ struct ChatHistorySearchRow: Sendable {
     var peer: String?
     var tool: String?
     var displayPrefix: String
-    /// As the canonical transcript reader sees the line: 0 not JSON, 1 JSON it rejects (not an object, or no string role and words), 2 a message.
     var shape = 0
-    /// The writer marked the row machinery (card copy, a failure row, a notice, a compaction summary): `CognitiveMechanicalRowKind.marksMechanicalRow`.
+    /// Use the canonical mechanical-row stamp so card copies, failures, notices and summaries stay out of conversation recall.
     var mechanical = false
 
     var isToolRow: Bool { role?.lowercased() == "tool" }
@@ -50,7 +46,7 @@ struct ChatHistorySearchRow: Sendable {
 
 extension SwiftToolDispatcher {
     /// One parse yields a row and its explicit receipt lane; bump ChatHistoryIndex.projector when projection semantics change.
-    static func chatHistorySearchRow(_ line: String) -> (row: ChatHistorySearchRow, receipt: ChatHistorySearchRow?) {
+    static func chatHistorySearchRow(_ line: String, catalog: [String: AppActionBinding]) -> (row: ChatHistorySearchRow, receipt: ChatHistorySearchRow?) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         let decoded = SessionHistoryReader.decodeRow(line)
         guard case .object(let obj)? = decoded.value else {
@@ -88,7 +84,7 @@ extension SwiftToolDispatcher {
         }
         guard role == "tool" else { return (project(words ?? ""), nil) }
         // Receipt metadata is an explicit evidence lane, never conversation recall.
-        var receipt = project(persistedToolReceiptText(row: obj, metadata: metadata))
+        var receipt = project(persistedToolReceiptText(row: obj, metadata: metadata, catalog: catalog))
         receipt.instant = instant
         receipt.peer = persistedHistoryPeer(role: role, row: obj, metadata: metadata)
         return (project(""), receipt)
@@ -102,7 +98,7 @@ extension SwiftToolDispatcher {
     }
 
     /// A narrow projection owned by explicit history tools. Do not teach the ordinary history reader to inject tool metadata into every new turn.
-    static func persistedToolReceiptText(row: [String: JSONValue], metadata: [String: JSONValue]) -> String {
+    static func persistedToolReceiptText(row: [String: JSONValue], metadata: [String: JSONValue], catalog: [String: AppActionBinding]? = nil) -> String {
         func value(_ key: String) -> JSONValue? { metadata[key] }
         func serialized(_ value: JSONValue?) -> String? {
             guard let value, value != .null else { return nil }
@@ -118,21 +114,22 @@ extension SwiftToolDispatcher {
             return String(redacted.prefix(maximum)) + "\n[receipt field truncated in history projection]"
         }
         var receipt: [String: JSONValue] = ["toolName": .string(bounded(toolName, maximum: 200))]
+        // Index batches supply their catalog; a standalone receipt has no batch scope.
         if let input = serialized(value("inputJSON")) {
             receipt["inputJSON"] = .string(bounded(
-                ChatToolJSONRedaction.injectionRedactedArgJSON(tool: toolName, json: input), maximum: 5_000
+                ChatToolJSONRedaction.injectionRedactedArgJSON(tool: toolName, json: input, turn: nil, catalog: catalog), maximum: 5_000
             ))
         }
         let result = serialized(value("resultSummary"))
             ?? serialized(row["content"]) ?? ""
-        // Preserve a clipped JSON string as a string. Parsing a surviving prefix into a fresh success envelope would invent missing evidence. An app call of a folded action is redacted as the tool it ran.
+        // Clipped JSON remains a string: parsing its surviving prefix would invent evidence. Redact folded app calls as the tool they ran.
         let ran = ToolNameAliases.shown(toolName, inputJSON: serialized(value("inputJSON"))).name
         receipt["resultSummary"] = .string(bounded(
-            ChatToolJSONRedaction.redactedResultJSON(tool: ran, json: result), maximum: 10_000
+            ChatToolJSONRedaction.redactedResultJSON(tool: ran, json: result, turn: nil, catalog: catalog), maximum: 10_000
         ))
         if let body = serialized(value("resultBody")) {
             receipt["resultBody"] = .string(bounded(
-                ChatToolJSONRedaction.redactedResultJSON(tool: ran, json: body), maximum: 10_000
+                ChatToolJSONRedaction.redactedResultJSON(tool: ran, json: body, turn: nil, catalog: catalog), maximum: 10_000
             ))
         }
         for key in ["resultClass", "resultStatus", "resultReturnedID", "resultEffects", "status", "ok"] {
@@ -157,16 +154,13 @@ extension SwiftToolDispatcher {
         return (try? JSONValue.object(receipt).serialize(pretty: false)) ?? "[unreadable persisted tool receipt]"
     }
 
-    /// Search relevance still uses the original content. Recorded provenance is display-only, shared with ordinary history and compaction, and never grants a bridge request or an interrupted answer additional authority.
+    /// Provenance affects display only, never search relevance or authority for bridge requests and interrupted replies.
     package static func chatHistoryDisplayEvidence(
         _ content: String, role: String, row: [String: JSONValue], decodedMetadata: [String: JSONValue]? = nil
     ) -> String {
         let metadata: [String: JSONValue]?
         if case .object(let value)? = row["metadata"] { metadata = value }
         else { metadata = nil }
-        if case .string(let kind)? = metadata?["kind"], kind.lowercased() == "compaction_summary" {
-            return content
-        }
         return ChatTranscriptEvidenceRendering.displayContent(
             content,
             originLabel: role == "user"
@@ -186,7 +180,6 @@ extension SwiftToolDispatcher {
         return unique.isEmpty ? nil : unique.joined(separator: "\n")
     }
 
-    /// The sources a tool receipt's own result labels, or its routed contact.
     private static func toolReceiptSources(row: [String: JSONValue], metadata: [String: JSONValue]) -> [String] {
         let tool = (metadata["toolName"])?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? ""
         let storedInput = metadata["inputJSON"]
@@ -217,7 +210,7 @@ extension SwiftToolDispatcher {
         return []
     }
 
-    /// A history row's evidence fields, retaining the speakers' attribution.
+    /// Retain speaker attribution on historical evidence.
     package static func historyEvidence(_ peer: String?, words: String, dataRoot: URL) -> [String: JSONValue] {
         let principals = (peer ?? "").split(separator: "\n").map(String.init)
         guard let speaker = principals.first else { return [:] }
@@ -256,24 +249,6 @@ extension SwiftToolDispatcher {
         return envelope?.verifiedUserId ?? "unknown"
     }
 
-    package static func consumePersistedHistoryEvidence(_ value: JSONValue) {
-        switch value {
-        case .object(let fields):
-            // Reopening retained evidence marks its speaker, never its recorded steering.
-            if case .string(let peer)? = fields["agent"],
-               fields["untrusted_remote_data"] == .bool(true) || fields["steered_by"] != nil {
-                let line = (fields["preview"] ?? fields["excerpt"] ?? fields["text"])?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? ""
-                ContactThread.consume(.init(text: line, stamp: .init(source: peer, steeredBy: [], contact: true)),
-                    mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
-            }
-            for child in fields.values { consumePersistedHistoryEvidence(child) }
-        case .array(let values):
-            for child in values { consumePersistedHistoryEvidence(child) }
-        default: break
-        }
-    }
-
-    /// Only the explicitly invoked history tool asks for this material. No background digest, cross-session scan, or work reminder is injected.
     static func continuityNeighbors(
         rows: [ChatHistorySearchRow], startIndex: Int, index: Int, roleFilter: String?, authorFilter: String?, sessionId: String,
         excludingRunID: String?, dataRoot: URL

@@ -4,10 +4,9 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentConversationView.swift` | `AgentConversationView` owns receipt and named-conversation rendering: `read`, `view`, `conversationPresentation`, `compact`, `queueProjection`, `withQueue`, `withLive`, `codingReply`, `expiringReply`; history selection stays with the session caller; `dotReply` projects Dot's existing half-hour wait from its stored send time for UI and contact reads. `claudeWorklogTail` is the shared checked bounded continuity/worklog reader (a malformed row fails the feed with its source); `claudeWorklog` exposes recent recorded work for contact reads and the read-only app action. |
+// Blueprint: | `AgentConversationView.swift` | `AgentConversationView`, `read`, `view`, `conversationPresentation`, `compact`, `queueProjection`, `withQueue`, `withLive`, `expiringReply`, `dotReply`, `claudeWorklogTail`, `claudeWorklog` |
 
-/// Receipt and named-conversation presentation over already-authorized reads.
-/// The session owns dispatch, waits, queues and state transitions.
+/// Presentation consumes authorized reads; session state transitions remain with the session owner.
 public enum AgentConversationView {
     public static let claudeWorklogURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/state/claude-worklog.jsonl")
@@ -30,7 +29,10 @@ public enum AgentConversationView {
                 throw ToolFailureError("Worklog tail row \(index + 1) in \(url.path) is malformed: \(error.localizedDescription). This read is incomplete.",
                     effects: .none, owner: url.path, code: "agent_worklog_incomplete",
                     instruction: ToolFailureError.fileRepairInstruction(url,
-                        shape: "Each nonblank worklog row must be a UTF-8 JSON object with an ISO 8601 ts, nonempty kind and text summary. Preserve the malformed source while repairing it."))
+                        shape: """
+                            Each nonblank worklog row must be a UTF-8 JSON object with an ISO 8601 ts, nonempty kind and text summary. Preserve the \
+                            malformed source while repairing it.
+                            """))
             }
         }
         return rows
@@ -71,7 +73,10 @@ public enum AgentConversationView {
                 ? Repair.remedy(owner: claudeWorklogURL.path + ": owner read permission", nextCall: .object([
                     "tool": .string("app"), "input": .object(["action": .string("shell.run"), "args": .object(["cmd": .string(command)])])]), tap: nil)
                 : .object(["kind": .string("inspect"),
-                    "instruction": .string("Inspect the path with next_call to identify the failed read's cause. If macOS denies access, the person must grant it in System Settings > Privacy & Security > Full Disk Access > NativeAgent switch. Inspection alone changes nothing."),
+                    "instruction": .string("""
+                        Inspect the path with next_call to identify the failed read's cause. If macOS denies access, the person must grant it in \
+                        System Settings > Privacy & Security > Full Disk Access > NativeAgent switch. Inspection alone changes nothing.
+                        """),
                     "next_call": .object(["tool": .string("app"),
                         "input": .object(["action": .string("files.info"), "args": .object(["path": .string(claudeWorklogURL.path)])])])])
             return .object(["status": .string("unavailable"), "effects": .string("none"),
@@ -95,8 +100,7 @@ public enum AgentConversationView {
             "detail": .string(entries.isEmpty ? "No recent worklog entries match this read." : "Claude's recorded work; not independently verified.")])
     }
 
-    /// A reply is awaited only while his transport can carry one: inbound
-    /// only, her retained conversation is read as it is, nothing pending.
+    /// Inbound-only transport cannot owe an outbound reply; show retained conversation without pending state.
     public static func dotReply(_ receipt: JSONValue, sentAt: Date?) -> JSONValue {
         guard let sentAt, ChatGPTDotIPCTransport.available, case .object(var fields) = receipt else { return receipt }
         fields["status"] = .string("waiting")
@@ -108,12 +112,14 @@ public enum AgentConversationView {
         guard case .object(var fields) = receipt, fields["reply"] == nil, fields["answer"] == nil,
               fields["terminal"] != .bool(true), fields["completed"] != .bool(true),
               case .string(let status)? = fields["status"],
-              ["sending", "waiting", "enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending", "delivered_live", "delivery_unknown", "outcome_unknown", "no_reply"].contains(status),
+              ["sending", "waiting", "enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending",
+                  "delivery_unknown", "outcome_unknown", "no_reply"].contains(status),
               case .string(let stamp)? = fields["reply_deadline"],
               let deadline = ISO8601DateFormatter().date(from: stamp), deadline <= Date() else { return receipt }
         if fields["reply_observation"] == .string("running") {
             fields["status"] = .string("no_reply_expired"); fields["reply_state"] = .string("no_reply_expired")
-            fields["detail"] = .string("The reply deadline has elapsed; local observation is settling. No finished answer has been confirmed; nothing was resent.")
+            fields["detail"] = .string(
+                "The reply deadline has elapsed; local observation is settling. No finished answer has been confirmed; nothing was resent.")
             return .object(fields)
         }
         fields["status"] = .string("no_reply_expired")
@@ -125,13 +131,12 @@ public enum AgentConversationView {
         return .object(fields)
     }
 
-    /// Queued follow-ups read as queued, reserved/sending or held with why; nil when none are saved.
     static func queueProjection(_ row: AgentConversationRecord?) -> JSONValue? {
         guard let row, let queued = row.queued, !queued.isEmpty else { return nil }
         return .array(queued.map { item in
             // Only a saved hold reads as held; launch resumes a queue that has no sender.
             let going = item.id == row.queueReservation
-            return .object(["id": .string(item.id), "text": .string(HerScreen.clip(item.text, 400)),
+            return .object(["id": .string(item.id), "text": .string(AgentScreen.clip(item.text, 400)),
                 "queued_at": .string(ISO8601DateFormatter().string(from: item.queuedAt)),
                 "by_person": .bool(item.byPerson == true),
                 "state": .string(item.held == DataRootLife.stoppedReason ? "stopped" : item.held != nil ? "held" : going ? "sending" : "queued"),
@@ -140,14 +145,13 @@ public enum AgentConversationView {
         })
     }
 
-    /// A lane's own read (built-in thread, bot shelf) with the saved queue added.
     static func withQueue(_ result: JSONValue, row: AgentConversationRecord?) -> JSONValue {
         guard let queued = queueProjection(row), case .object(var fields) = result else { return result }
         fields["queued"] = queued
         return .object(fields)
     }
 
-    /// Keep the exchange and a thread summary; remove retained history from compact results.
+    /// Compact results keep the exchange and summary without duplicating retained history.
     static func compact(_ result: JSONValue, row: AgentConversationRecord?) -> JSONValue {
         guard let row, case .object(var fields) = result else { return result }
         fields.removeValue(forKey: "session_history")
@@ -176,7 +180,8 @@ public enum AgentConversationView {
         let owner = row.agent.hasPrefix("peer:") ? String(row.agent.dropFirst(5)) : row.agent
         let identity = AgentContactIdentity(contacts: peers)
         let history = !details && includeHistory
-        let lines: Result<[ContactThread.Line], Error>? = history ? Result { try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity) } : nil
+        let lines: Result<[ContactThread.Line], Error>? = history ? Result { try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner,
+            identity: identity) } : nil
         var result = details ? receipt : conversationPresentation(row, transport: peer?.transport, prefix: read ? "last_send_" : "")
         if history {
             result = AgentConversationHistoryView.adding(to: result, agent: row.agent, name: row.name,
@@ -212,7 +217,8 @@ public enum AgentConversationView {
         let liveText: String? = if case .object(let live)? = shown["live"], live["untrusted_remote_data"] == .bool(true) {
             AgentConversationSession.string(live["partial_reply"]) ?? AgentConversationSession.string(live["partial_text"]) ?? ""
         } else { nil }
-        if let reply = AgentConversationSession.string(shown["reply"]) ?? liveText ?? (shown["untrusted_remote_data"] == .bool(true) && shown["session_history"] == nil ? "" : nil) {
+        if let reply = AgentConversationSession.string(shown["reply"]) ?? liveText ?? (shown["untrusted_remote_data"] == .bool(true)
+            && shown["session_history"] == nil ? "" : nil) {
             let transcript = (try? (lines ?? Result { try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity) }).get()) ?? []
             let answered = transcript.last(where: { !$0.mine && $0.answers == row.operationID })
                 ?? ContactThread.Line(text: reply, stamp: row.cachedReplyStamp)
@@ -221,7 +227,6 @@ public enum AgentConversationView {
         return result
     }
 
-    /// What the agent is doing on the unsettled send, when it is still on it.
     static func withLive(_ result: JSONValue, row: AgentConversationRecord?, dataRoot: URL) -> JSONValue {
         guard let row, case .object(var fields) = result else { return result }
         let current: AgentConversationLive?
@@ -245,12 +250,12 @@ public enum AgentConversationView {
         let receipt = row.receipt ?? .object(["status": .string("unknown")])
         guard case .object(let root) = receipt else { return receipt }
         let value = row.sendEvidence
-        let handOff = AgentConversationSession.liveHandOff(row), handOffSettled = handOff && AgentConversationSession.settled(row)
         let status = row.sendStatus
-        // An unavailable continuation means the session behind this name is gone.
-        let deadThread = (AgentConversationSession.string(value["reason"]) ?? AgentConversationSession.string(value["execution_error"])) == "continuation_unavailable"
-        // can_reply means a new message goes now; otherwise say when. A new send supersedes terminal attention.
-        var canReply = (!["sending", "waiting"].contains(row.phase) || (row.phase == "waiting" && handOffSettled))
+        // Unavailable continuation means its backing session is gone.
+        let deadThread = (AgentConversationSession.string(value["reason"]) ?? AgentConversationSession.string(
+            value["execution_error"])) == "continuation_unavailable"
+        // Terminal attention can be superseded; otherwise explain when a new send can proceed.
+        var canReply = !["sending", "waiting"].contains(row.phase)
         var replyDetail: String?
         if row.queued?.contains(where: { $0.waitingForMac == true }) == true {
             canReply = false
@@ -265,7 +270,10 @@ public enum AgentConversationView {
             replyDetail = "After the person decides on the approval for the previous message; a message sent now waits in the queue and goes by itself then."
         } else if AgentConversationSession.unsettledAttention(row) {
             canReply = false
-            replyDetail = "After the previous message's outcome is known (it may still be running) or agent_cancel releases it; a message sent now waits in the queue and goes by itself then."
+            replyDetail = """
+                After the previous message's outcome is known (it may still be running) or agent_cancel releases it; a message sent now waits in \
+                the queue and goes by itself then.
+                """
         } else if row.phase == "attention", value["sent"] == .bool(false) || root["sent"] == .bool(false) {
             replyDetail = "The last message did not go out (\(status)); a new message tries \(row.name) again."
         }
@@ -281,52 +289,46 @@ public enum AgentConversationView {
                 "agent": .string(row.name), "conversation": .string(row.label), "text": .string("<your next message>")])])
         }
         if let conversation = row.conversationID, conversation != row.label, !row.agent.hasPrefix("bot:") {
-            // Desktop chat titles are separate from her conversation label.
+            // Desktop titles and local conversation labels are separate identities.
             result[transport == .desktopChat ? "app_chat_title" : "conversation_id"] = .string(conversation)
         }
         if AgentConversationSession.backgroundSend(row) {
             result["state"] = .string("working")
-            // A new remote session may not have supplied its ID yet.
+            // A new remote session may not yet have supplied its ID.
             result["conversation_id"] = row.conversationID.map(JSONValue.string) ?? .null
         }
         if let current = row.exchanges?.last(where: { $0.id == row.operationID }) {
             lastSend.merge(current.timing) { _, timing in timing }
         }
-        if root["jobs"] != nil {
-            let original = codingReply(value)
-            if let text = original.text {
-                result["reply"] = .string(text)
-                result["reply_truncated"] = .bool(original.truncated)
-                lastSend["reply_state"] = .string("reply_received")
-            } else {
-                lastSend["reply_state"] = .string("no_reply_observed")
-                if (value["run_status"] ?? value["status"]) == .string("delivered_live") {
-                    lastSend["detail"] = .string("Waiting in \(row.name)'s inbox until its next turn; no one is answering yet.")
-                } else if row.phase == "ready" {
-                    lastSend["detail"] = .string("This saved record has delivery status but no original answer text. No message was resent.")
-                }
-            }
-        } else if let text = reply(value) { result["reply"] = .string(text) }
-        for key in ["untrusted_remote_data", "source_availability", "read_error", "retention_error", "reply_truncated", "reply_location", "receipt_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages"] {
+        if let text = reply(value) { result["reply"] = .string(text) }
+        for key in ["untrusted_remote_data", "source_availability", "read_error", "retention_error", "reply_truncated", "reply_location",
+            "receipt_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages"] {
             if let field = value[key] ?? root[key] { result[key] = field }
         }
-        for key in ["reply_state", "reply_deadline", "automatic_resend", "read", "execution", "completed", "terminal", "needs_input", "needs_authentication", "sent", "delivery", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "healed", "repair", "remedy", "harness_item", "delivered", "delivered_at"] {
+        for key in ["reply_state", "reply_deadline", "automatic_resend", "read", "execution", "completed", "terminal", "needs_input",
+            "needs_authentication", "sent", "delivery", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "healed",
+                "repair", "remedy", "harness_item", "delivered", "delivered_at"] {
             if let field = value[key] ?? root[key] { lastSend[key] = field }
         }
         if row.phase != "sending", row.sendFailed { lastSend["delivery"] = .string("failed") }
-        // delegation_status.detail selects a format ("full"); it does not explain the exchange.
-        if root["jobs"] == nil, let detail = value["detail"] { lastSend["detail"] = detail }
-        if row.phase == "waiting", handOff {
-            lastSend["detail"] = .string("Waiting in \(row.name)'s inbox until its next turn; no one is answering yet."
-                + (handOffSettled ? " A new message can go now." : " A new message can go once \(row.name) answers."))
-        } else if row.phase == "waiting" {
+        if let detail = value["detail"] { lastSend["detail"] = detail }
+        if row.phase == "waiting" {
             let automatic = row.automaticRead || row.readInput != nil
             lastSend["detail"] = .string(transport == .desktop
-                ? "\(row.name) is answering in its own chat; the answer is read from there and lands on this exchange by itself (within three minutes). Do not resend this message."
+                ? """
+                    \(row.name) is answering in its own chat; the answer is read from there and lands on this exchange by itself (within three \
+                    minutes). Do not resend this message.
+                    """
                 : AgentConversationSession.backgroundSend(row)
                 ? root["delivery"] == .string("unconfirmed")
-                    ? "The connection or send is still running; delivery to \(row.name) is unconfirmed. This operation will bring its outcome here; do not resend this message."
-                    : "\(row.name) is working on it. Its reply comes to you as a turn by itself when it lands (wait on this conversation returns it instead); do not resend this message."
+                    ? """
+                        The connection or send is still running; delivery to \(row.name) is unconfirmed. This operation will bring its outcome \
+                        here; do not resend this message.
+                        """
+                    : """
+                        \(row.name) is working on it. Its reply comes to you as a turn by itself when it lands (wait on this conversation returns \
+                        it instead); do not resend this message.
+                        """
                 : automatic
                 ? "Waiting for \(row.name). NativeAgent will bring the answer back; no repeated checks or resend needed."
                 : "Waiting for \(row.name)'s configured return connection. Do not resend this message.")
@@ -335,7 +337,10 @@ public enum AgentConversationView {
         }
         if row.phase == "attention", let detail = row.deliveryState { lastSend["detail"] = .string(detail) }
         if row.phase == "attention", deadThread {
-            lastSend["detail"] = .string("“\(row.label)” points at a \(row.name) conversation whose session no longer exists, so no work started and nothing was sent on. Start a new conversation (new_conversation: true) to ask again.")
+            lastSend["detail"] = .string("""
+                “\(row.label)” points at a \(row.name) conversation whose session no longer exists, so no work started and nothing was sent on. \
+                Start a new conversation (new_conversation: true) to ask again.
+                """)
         }
         if row.phase == "sending" {
             // The retained receipt routes task resumption until dispatch settles; its answer is not this turn's.
@@ -349,12 +354,13 @@ public enum AgentConversationView {
            stop.state != "cannot_stop" || ["sending", "waiting"].contains(row.phase) {
             result["stop"] = .object(["state": .string(stop.state), "detail": .string(stop.detail),
                                       "at": .string(ISO8601DateFormatter().string(from: stop.at))])
-            if stop.state == "stopped" { result["status"] = .string("cancelled"); lastSend["status"] = .string("cancelled"); lastSend["detail"] = .string(stop.detail) }
+            if stop.state == "stopped" { result["status"] = .string("cancelled"); lastSend["status"] = .string(
+                "cancelled"); lastSend["detail"] = .string(stop.detail) }
         }
         if let queued = queueProjection(row) { result["queued"] = queued }
         if ["sending", "waiting"].contains(row.phase), case .string(let detail)? = lastSend["detail"] {
             let cancel = [.desktop, .desktopChat].contains(transport) ? "."
-                : handOff || transport == .grokBot ? "; agent_cancel stops waiting on it." : "; agent_cancel stops it."
+                : transport == .grokBot ? "; agent_cancel stops waiting on it." : "; agent_cancel stops it."
             lastSend["detail"] = .string(detail + " A follow-up queues behind it" + cancel)
         }
         // Prefix outcome and timing together so neither describes the read showing this retained send.
@@ -364,7 +370,8 @@ public enum AgentConversationView {
     }
 
     static func reply(_ row: [String: JSONValue]) -> String? {
-        AgentConversationSession.string(row["reply"]) ?? AgentConversationSession.string(row["answer"]) ?? codingReply(row).text ?? AgentConversationSession.string(row["findings"])
+        AgentConversationSession.string(row["reply"]) ?? AgentConversationSession.string(row["answer"])
+            ?? AgentConversationSession.string(row["findings"])
     }
 
     public static func read(_ receipt: JSONValue, agent: String, input: [String: JSONValue]) -> JSONValue {
@@ -373,9 +380,7 @@ public enum AgentConversationView {
         if raw["status"] == .string("requires_interaction") || raw["error"] != nil { return receipt }
         let rows: [[String: JSONValue]]
         let kind: String
-        if case .array(let values)? = raw["jobs"] {
-            rows = values.compactMap(\.objectValue); kind = "coding"
-        } else if case .array(let values)? = raw["entries"] {
+        if case .array(let values)? = raw["entries"] {
             rows = values.compactMap(\.objectValue); kind = "bot_preview"
         } else if agent.hasPrefix("bot:") {
             rows = [raw]; kind = "bot"
@@ -389,7 +394,8 @@ public enum AgentConversationView {
             "meaning": .string("Agent replies with recorded progress; their work is not independently verified."),
             "order": .string(rows.count > 1 ? "newest_first" : "single_exchange")
         ]
-        for key in ["source_availability", "has_more", "next_offset", "nextCursor", "truncated", "coverage", "conversation_id", "message_id", "task_id", "completed", "terminal", "untrusted_remote_data", "detail", "read_with"] {
+        for key in ["source_availability", "has_more", "next_offset", "nextCursor", "truncated", "coverage", "conversation_id", "message_id",
+            "task_id", "completed", "terminal", "untrusted_remote_data", "detail", "read_with"] {
             if let value = raw[key] { result[key] = value }
         }
         var exact = input.filter { !["session_id", "__session_id", "details"].contains($0.key) }
@@ -412,50 +418,40 @@ public enum AgentConversationView {
         let evidence = row["remote_evidence"]?.objectValue ?? row
         let body: String?
         switch kind {
-        case "coding": body = codingReply(row).text
         case "bot": body = row["reply"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? row["findings"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
         case "bot_preview": body = row["headline"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
         default: body = row["reply"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? evidence["reply"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
         }
         let conversation: String?
         if agent.hasPrefix("bot:") { conversation = agent }
-        else {
-            // Codex's builder owner accepts codex:<thread>, not the bare
-            // executor thread ID. Other agents have different identity rules.
-            let codex = agent == "codex" ? row["thread_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).map { "codex:" + $0 } : nil
-            conversation = row["conversation_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? codex
-        }
-        let message = row["matched_message_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? row["message_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
+        else { conversation = row["conversation_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) }
+        let message = row["matched_message_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? row["message_id"]?.stringValue.flatMap({ $0.isEmpty
+            ? nil : $0 }) ?? row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
         let task = row["task_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
         var value: [String: JSONValue] = [
             "from": .string(row["agent_name"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? agent),
-            "reply_state": body == nil ? row["reply_state"] ?? .string("no_reply_observed") : .string(kind == "bot_preview" ? "preview_only" : "reply_received"),
+            "reply_state": body == nil ? row["reply_state"] ?? .string("no_reply_observed") : .string(kind == "bot_preview" ? "preview_only"
+                : "reply_received"),
             "execution_state": evidence["original_status"] ?? row["run_status"] ?? row["status"] ?? row["state"] ?? .string("unknown")
         ]
-        // Her side of the exchange first, so a thread reads as ask and answer.
+        // Show the ask before its answer so the thread reads in conversational order.
         if let ask = row["request_text_head"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) { value["you_asked"] = .string(ask) }
         if let body {
             value["text"] = .string(body)
-            value["text_kind"] = .string(kind == "bot_preview" ? "headline" : kind == "coding" && codingReply(row).truncated ? "retained_excerpt" : "reply")
+            value["text_kind"] = .string(kind == "bot_preview" ? "headline" : "reply")
         }
-        for key in ["topic_slug", "created_at", "completed_at", "runAt", "delivery_outcome", "execution_error", "recovery_note", "needs_input", "needs_authentication", "artifacts"] {
+        for key in ["topic_slug", "created_at", "completed_at", "runAt", "delivery_outcome", "execution_error", "recovery_note", "needs_input",
+            "needs_authentication", "artifacts"] {
             if let field = row[key] { value[key] = field }
         }
         for key in ["has_more", "next_offset", "coverage", "original_outcome", "evidence"] {
             if let field = evidence[key] { value[key] = field }
         }
-        if kind == "coding", body != nil {
-            value["reply_truncated"] = .bool(codingReply(row).truncated)
-            if codingReply(row).truncated {
-                value["text_coverage"] = .string("Retained excerpt; later answer text may be omitted.")
-            }
-        } else if kind == "coding" {
-            if let note = row["completion_text_head"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) { value["delivery_note"] = .string(note) }
-        }
         if let message { value["message_id"] = .string(message) }
         if let conversation { value["conversation_id"] = .string(conversation) }
         if let task { value["task_id"] = .string(task) }
-        if let locator = AgentConversationRouting.readLocator(agent: agent, message: message.map(JSONValue.string), conversation: conversation.map(JSONValue.string), task: task.map(JSONValue.string)) {
+        if let locator = AgentConversationRouting.readLocator(agent: agent, message: message.map(JSONValue.string), conversation: conversation.map(
+            JSONValue.string), task: task.map(JSONValue.string)) {
             value["read_with"] = locator
             if evidence["has_more"] == .bool(true), let offset = evidence["next_offset"],
                case .object(let action) = locator, case .object(var next)? = action["input"] {
@@ -465,8 +461,7 @@ public enum AgentConversationView {
         }
         if let conversation {
             var target: [String: JSONValue] = ["agent": .string(agent), "conversation_id": .string(conversation)]
-            // A2A 0.3 native ingress does not support task resumption. A new
-            // message in the same context works for all supported adapters.
+            // A2A 0.3 native ingress does not support task resumption. A new message in the same context works for all supported adapters.
             target["text"] = .string("<your next message>")
             if row["needs_input"] == .bool(true), let task { target["task_id"] = .string(task) }
             value["reply_with"] = call("agent_message", target)
@@ -476,18 +471,6 @@ public enum AgentConversationView {
         return .object(value)
     }
 
-    /// Only original executor fields may become an answer. A delivery summary
-    /// or stderr remains diagnostic even when the transport says completed.
-    static func codingReply(_ row: [String: JSONValue]) -> (text: String?, truncated: Bool) {
-        if let value = row["agent_reply_text"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) {
-            return (value, row["agent_reply_truncated"] != .bool(false))
-        }
-        // A head is complete unless DelegationStatusProjector.head marks its cut with "…".
-        if let value = row["agent_reply_text_head"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) { return (value, value.hasSuffix("…")) }
-        if ["reply_job", "retained_reply_job"].contains(row["record_kind"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? ""),
-           let value = row["completion_text_head"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) { return (value, value.hasSuffix("…")) }
-        return (nil, false)
-    }
     private static func call(_ tool: String, _ input: [String: JSONValue]) -> JSONValue {
         .object(["tool": .string(tool), "input": .object(input)])
     }

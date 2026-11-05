@@ -1,10 +1,11 @@
 import Foundation
+import Experiences
 import AttentionRouting
 import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
-// Blueprint: | `SchedulerDueJobRunner+ProactiveScan.swift` | `SchedulerDueJobRunner`: `surfaceProactiveScan` |
+// Blueprint: | `SchedulerDueJobRunner+ProactiveScan.swift` | Proactive matters refer to their source experiences |
 
 extension SchedulerDueJobRunner {
     struct ProactiveScanSurfaceResult: Sendable {
@@ -21,19 +22,15 @@ extension SchedulerDueJobRunner {
         var itemIds: [String] = []
         for opportunity in scan.surfaced {
             let itemId = "proactive-\(UUID().uuidString.lowercased())"
-            try await appendNotificationInbox(
-                title: opportunity.title,
-                message: opportunity.summary,
-                source: opportunity.source,
-                severity: opportunity.severity,
-                jobId: job.id,
-                itemId: itemId,
-                relatedPaths: opportunity.relatedPaths,
-                relatedGroups: opportunity.relatedGroups,
-                detail: opportunity.detail,
-                actions: NativeAgentScheduledProactiveScan.inboxActions(for: opportunity),
-                notifyPhone: true
-            )
+            let actions = try NativeAgentScheduledProactiveScan.inboxActions(for: opportunity).map { value -> PartFace.Action in
+                let row = try JSONRow(value)
+                return .init(id: try row.string("id"), label: try row.string("label"))
+            }
+            try await tellScheduledMatter(Matter(id: itemId,
+                form: opportunity.severity == "actionable" ? .ask : .words, from: opportunity.source,
+                title: opportunity.title, summary: opportunity.summary, words: opportunity.detail, choices: actions,
+                evidence: opportunity.relatedMatters.map { .init(source: "experiences/experiences.sqlite", id: $0) },
+                artifacts: opportunity.relatedPaths.map { .init(source: Matter.files, id: $0) }), reach: .person(from: nil))
             itemIds.append(itemId)
         }
         return ProactiveScanSurfaceResult(

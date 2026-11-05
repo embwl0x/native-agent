@@ -4,11 +4,10 @@ import os
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `RunawayOutputDetector.swift` | `RunawayOutputDetector`: streamed tool/prose boundaries, complete-call retention and read/action classification through parser/registry owners; one preview-suppressed, request/adapter-rooted, redacted cutoff diagnostic writer |
+// Blueprint: | `RunawayOutputDetector.swift` | `RunawayOutputDetector`: complete-call retention and redacted cuts |
 
-/// Correctness boundaries retain complete calls before a repeated action or
-/// fabricated result. Text after a boundary is withheld; the turn continues
-/// with the retained calls and the boundary reason.
+/// Correctness boundaries retain complete calls before a repeated action or fabricated result. Text after a boundary is withheld; the turn continues with
+/// the retained calls and the boundary reason.
 public struct RunawayOutputDetector: Sendable {
     static let fabricatedHeader = "NativeAgent tool result #"
 
@@ -17,34 +16,33 @@ public struct RunawayOutputDetector: Sendable {
     public private(set) var toolBoundaryReason: LLMToolBoundaryReason?
     private let endsAtToolBoundary: Bool
     private let diagnosticDataRoot: URL?
+    private let call: LLMCall
     private var blockCursor = 0
     private var openBlock: (start: Int, close: String)?
     private var lastSignature: String?
     private var blockSignatures: [String: Int] = [:]
     private var blockCount = 0
 
-    /// Classification receives the complete block so the parser and registry
-    /// owners can distinguish reads from actions without a second XML parser.
-    public static func registerReadOnlyCalls(_ classify: @escaping @Sendable (String) -> Bool) {
+    /// Classification receives the complete block so the parser and registry owners can distinguish reads from actions without a second XML parser.
+    public static func registerReadOnlyCalls(_ classify: @escaping @Sendable (String, Turn?) -> Bool) {
         let box = Classifier(classify)
         readOnlyCalls.withLock { $0 = box }
     }
-    // Boxed: a closure read back through withLock's inout state gains a
-    // reabstraction thunk on every read and eventually overflows the stack.
+    // Boxed: a closure read back through withLock's inout state gains a reabstraction thunk on every read and eventually overflows the stack.
     private final class Classifier<Input>: Sendable {
-        let call: @Sendable (Input) -> Bool
-        init(_ call: @escaping @Sendable (Input) -> Bool) { self.call = call }
+        let call: @Sendable (Input, Turn?) -> Bool
+        init(_ call: @escaping @Sendable (Input, Turn?) -> Bool) { self.call = call }
     }
     private static let readOnlyCalls = OSAllocatedUnfairLock<Classifier<String>?>(initialState: nil)
 
-    public static func registerAppReadOnlyCalls(_ classify: @escaping @Sendable ([String: JSONValue]) -> Bool) {
+    public static func registerAppReadOnlyCalls(_ classify: @escaping @Sendable ([String: JSONValue], Turn?) -> Bool) {
         let box = Classifier(classify)
         appReadOnlyCalls.withLock { $0 = box }
     }
     private static let appReadOnlyCalls = OSAllocatedUnfairLock<Classifier<[String: JSONValue]>?>(initialState: nil)
 
-    public static func isAppReadOnly(_ input: [String: JSONValue]) -> Bool {
-        appReadOnlyCalls.withLock { $0 }?.call(input) ?? false
+    public static func isAppReadOnly(_ input: [String: JSONValue], turn: Turn?) -> Bool {
+        appReadOnlyCalls.withLock { $0 }?.call(input, turn) ?? false
     }
     private var lastBlockEnd = 0
     /// Where the text after the last complete call starts being checked.
@@ -62,9 +60,10 @@ public struct RunawayOutputDetector: Sendable {
     private var fenceStarts: [Int] = []
     private var firstHeader: Int?
 
-    public init(endsAtToolBoundary: Bool = false, diagnosticDataRoot: URL? = nil) {
+    public init(endsAtToolBoundary: Bool = false, diagnosticDataRoot: URL? = nil, call: LLMCall) {
         self.endsAtToolBoundary = endsAtToolBoundary
         self.diagnosticDataRoot = diagnosticDataRoot
+        self.call = call
     }
 
     /// Feed one text delta; true when a correctness boundary ends the stream.
@@ -126,7 +125,7 @@ public struct RunawayOutputDetector: Sendable {
                 }
                 let copies = blockSignatures[signature, default: 0] + 1
                 blockSignatures[signature] = copies
-                if copies > 1, !Self.isReadOnly(signature) {
+                if copies > 1, !Self.isReadOnly(signature, turn: call.turn) {
                     return setToolBoundary(.repeatedAction, "tool action repeated", at: lastBlockEnd)
                 }
                 if copies >= 3 {
@@ -140,8 +139,7 @@ public struct RunawayOutputDetector: Sendable {
                 committed += block
                 released = end
             } else {
-                // After a complete call, invented results or over-budget prose end the reply for dispatch.
-                // Short narration between calls remains admitted.
+                // After a complete call, invented results or over-budget prose end the reply for dispatch. Short narration between calls remains admitted.
                 if blockCount > 0, let why = gapAfterCall() {
                     return setToolBoundary(why.kind, why.detail, at: lastBlockEnd)
                 }
@@ -166,10 +164,21 @@ public struct RunawayOutputDetector: Sendable {
         }
     }
 
-    /// A complete `<invoke name=…>` / `<tool_use name=…>` block is a read by
-    /// the registered classification; no classification means an action.
-    static func isReadOnly(_ block: String) -> Bool {
-        readOnlyCalls.withLock { $0 }?.call(block) ?? false
+    /// The call being written, once its opening tag names it; its input is the bytes after that tag.
+    public var openCall: LLMStreamCallInput? {
+        guard let open = openBlock,
+              let tagEnd = bytes[open.start...].firstIndex(of: UInt8(ascii: ">")) else { return nil }
+        let tag = String(decoding: bytes[open.start..<tagEnd], as: UTF8.self)
+        guard let quote = tag.range(of: "name=\""),
+              let close = tag[quote.upperBound...].firstIndex(of: "\"") else { return nil }
+        let name = String(tag[quote.upperBound..<close])
+        guard !name.isEmpty, name.count <= 120 else { return nil }
+        return LLMStreamCallInput(name: name, input: bytes[(tagEnd + 1)...])
+    }
+
+    /// A complete `<invoke name=…>` / `<tool_use name=…>` block is a read by the registered classification; no classification means an action.
+    static func isReadOnly(_ block: String, turn: Turn?) -> Bool {
+        readOnlyCalls.withLock { $0 }?.call(block, turn) ?? false
     }
 
     static let fabricatedResultMarkers = ["<system>", "<function_results", "<tool_result", "Tool ran without output",
@@ -187,8 +196,7 @@ public struct RunawayOutputDetector: Sendable {
         return nil
     }
 
-    /// First `needle` in `bytes` at or after `from`; with `tag`, only where the
-    /// next byte is whitespace or `>` (and known), so `<invoker` is not a block.
+    /// First `needle` in `bytes` at or after `from`; with `tag`, only where the next byte is whitespace or `>` (and known), so `<invoker` is not a block.
     private static func find(_ needle: String, in bytes: [UInt8], from: Int, tag: Bool = false) -> Int? {
         let n = Array(needle.utf8)
         var i = max(0, from)
@@ -211,12 +219,11 @@ public struct RunawayOutputDetector: Sendable {
         reason = "tool_marker_boundary: \(why)"
         Logger(subsystem: "NativeAgent", category: "Cutoff")
             .error("tool_marker_boundary: \(why, privacy: .public) chars=\(chars, privacy: .public) end=\(end, privacy: .public)B")
-        Self.writeDiagnostic(text, reason: reason ?? "tool_marker_boundary", dataRoot: diagnosticDataRoot)
+        Self.writeDiagnostic(text, reason: reason ?? "tool_marker_boundary", dataRoot: diagnosticDataRoot, call: call)
         return true
     }
 
-    /// Prose can stream; a possible call opener and everything inside it stay
-    /// here until its closing tag commits the frame. Gaps after calls wait too.
+    /// Prose can stream; a possible call opener and everything inside it stay here until its closing tag commits the frame. Gaps after calls wait too.
     private var proseEnd: Int {
         let markers = ["<invoke", "<tool_use", "<function_calls>", "</function_calls>", Self.fabricatedHeader]
         let held = stride(from: min(Self.fabricatedHeader.utf8.count, bytes.count), to: 0, by: -1).first { length in
@@ -234,8 +241,7 @@ public struct RunawayOutputDetector: Sendable {
     private mutating func commitProse(through end: Int) {
         let end = min(end, firstHeader ?? end)
         guard end > released else { return }
-        // Containers frame a batch on the wire, not a call. Strip them only
-        // between calls; parameter bytes and quoted examples stay untouched.
+        // Containers frame a batch on the wire, not a call. Strip them only between calls; parameter bytes and quoted examples stay untouched.
         var cursor = released
         while let start = Self.find("<", in: bytes, from: cursor), start < end {
             committed += String(decoding: bytes[cursor..<start], as: UTF8.self)
@@ -275,11 +281,11 @@ public struct RunawayOutputDetector: Sendable {
     private static let diagnosticLock = OSAllocatedUnfairLock(initialState: ())
 
     @discardableResult
-    public static func writeDiagnostic(_ raw: String, reason: String, dataRoot: URL? = nil) -> Result<URL?, Error> {
+    public static func writeDiagnostic(_ raw: String, reason: String, dataRoot: URL? = nil, call: LLMCall) -> Result<URL?, Error> {
         // Preview has no durable effects, including retention pruning.
-        guard !LLMCallContext.preview else { return .success(nil) }
+        guard !call.preview else { return .success(nil) }
         return diagnosticLock.withLock { _ in
-            do { return .success(try writeDiagnosticLocked(raw, reason: reason, dataRoot: dataRoot)) }
+            do { return .success(try writeDiagnosticLocked(raw, reason: reason, dataRoot: dataRoot, call: call)) }
             catch {
                 Logger(subsystem: "NativeAgent", category: "Cutoff").error("Could not save cutoff: \(error.localizedDescription, privacy: .public)")
                 return .failure(error)
@@ -287,14 +293,13 @@ public struct RunawayOutputDetector: Sendable {
         }
     }
 
-    private static func writeDiagnosticLocked(_ raw: String, reason: String, dataRoot: URL?) throws -> URL {
-        let dir = (LLMCallContext.traceDataRootOverride ?? dataRoot ?? PersistenceCore.defaultDataRoot())
+    private static func writeDiagnosticLocked(_ raw: String, reason: String, dataRoot: URL?, call: LLMCall) throws -> URL {
+        let dir = (call.traceDataRoot ?? dataRoot ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("diagnostics/cutoffs", isDirectory: true)
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
-        let name = (TurnTraceContext.turnId?.filter { $0.isLetter || $0.isNumber || $0 == "-" })
+        let name = (call.turn?.id.filter { $0.isLetter || $0.isNumber || $0 == "-" })
             .flatMap { $0.isEmpty ? nil : $0 } ?? "\(stamp)"
-        // A turn can trip more than once (a boundary each round); a later dump
-        // must not overwrite the first (turn d48a7f96: 6 trips, 1 file).
+        // Each round can trip a boundary; later diagnostics must not overwrite earlier evidence from the same turn.
         var file = dir.appendingPathComponent("\(name).txt")
         if FileManager.default.fileExists(atPath: file.path) {
             file = dir.appendingPathComponent("\(name)-\(UUID().uuidString).txt")

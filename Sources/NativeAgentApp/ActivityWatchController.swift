@@ -1,10 +1,9 @@
 import AttentionRouting
 import ActivityWatch
 
-// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`: app-side watcher binding and sensitive-detail-free issue notifications; Trust Center retains issue detail |
+// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`: Capture watch binding and privacy-safe issue notifications |
 
-/// The notification omits sensitive bundle IDs, paths and storage errors;
-/// the retained issue in Trust Center remains the detail authority.
+/// Omit sensitive IDs, paths and errors from notifications; Trust Center retains issue detail.
 enum ActivityCaptureIssueNotificationPresentation {
     static func notification(for issue: ActivityCaptureIssue) -> (title: String, body: String)? {
         guard issue.severity == .critical else { return nil }
@@ -22,7 +21,7 @@ extension ActivityWatchController {
         criticalIssueNotifier: { issue in
             guard let notification = ActivityCaptureIssueNotificationPresentation.notification(for: issue) else { return }
             NativeAgentNotifications.post(title: notification.title, body: notification.body,
-                userInfo: ["eventId": issue.id.uuidString, NativeAgentNotificationRoute.pageKey: "trust/features"])
+                userInfo: ["eventId": issue.id.uuidString, NativeAgentNotificationRoute.pageKey: "trust/features"], deadline: nil)
         }
     )
 }

@@ -6,7 +6,6 @@ import CryptoKit
 package enum VerifiedPath {
 
     package enum Failure: Error {
-        /// A component of the checked path is a symlink now. Fail closed.
         case symlinkComponent(String)
         case notFound
         case posix(Int32)
@@ -31,8 +30,7 @@ package enum VerifiedPath {
         }
     }
 
-    /// A descriptor for the verified parent directory plus the final path
-    /// component. Every mutation and open is performed relative to `fd`.
+    /// Perform every mutation relative to the verified parent descriptor so path replacement cannot redirect it.
     package struct Parent {
         package let fd: Int32
         package let name: String
@@ -46,9 +44,7 @@ package enum VerifiedPath {
 
     #if canImport(Darwin)
 
-    /// `O_NOFOLLOW` reports a symlink component as `ELOOP` or, for an
-    /// intermediate one, `ENOTDIR`. Ask the kernel which it was so the fence
-    /// says "this component became a symlink" rather than "not found".
+    /// O_NOFOLLOW reports intermediate symlinks as ENOTDIR; ask the kernel so the refusal names the actual symlink fence.
     private static func classify(_ code: Int32, at fd: Int32, component: String) -> Failure {
         var metadata = stat()
         if fstatat(fd, component, &metadata, AT_SYMLINK_NOFOLLOW) == 0,
@@ -77,8 +73,7 @@ package enum VerifiedPath {
         return path
     }
 
-    /// Walk parents from / without symlinks; create missing components with mkdirat on the verified parent,
-    /// then reopen O_NOFOLLOW so a racing swap fails instead of redirecting the walk.
+    /// Create missing parents relative to verified descriptors, then reopen O_NOFOLLOW so a racing swap cannot redirect the walk.
     package static func openParent(of url: URL, createIntermediates: Bool = false) throws -> Parent {
         let components = walkPath(url).split(separator: "/").map(String.init)
         guard let final = components.last else { throw Failure.notFound }
@@ -89,8 +84,7 @@ package enum VerifiedPath {
             if next < 0, createIntermediates, errno == ENOENT {
                 do { try Task.checkCancellation() }
                 catch { _ = Darwin.close(fd); throw error }
-                // EEXIST: someone else made it in the gap — reopen and let the
-                // O_NOFOLLOW reopen judge whatever is there now.
+                // After EEXIST, O_NOFOLLOW must judge the entry that won the creation race.
                 if mkdirat(fd, component, 0o755) != 0, errno != EEXIST {
                     let failure = Failure.posix(errno)
                     _ = Darwin.close(fd)
@@ -109,15 +103,13 @@ package enum VerifiedPath {
         return Parent(fd: fd, name: final)
     }
 
-    /// Open the final component relative to the verified parent, never
-    /// following it.
+    /// Open relative to the verified parent without following the final component.
     package static func openFinal(_ parent: Parent, flags: Int32, mode: mode_t = 0) throws -> Int32 {
         let fd = openat(parent.fd, parent.name, flags | O_NOFOLLOW | O_CLOEXEC, mode)
         guard fd >= 0 else { throw classify(errno, at: parent.fd, component: parent.name) }
         return fd
     }
 
-    /// Walk + open in one step, for callers that do not need the parent after.
     package static func open(_ url: URL, flags: Int32, mode: mode_t = 0) throws -> Int32 {
         if url.standardizedFileURL.path == "/" {
             let fd = Darwin.open("/", flags | O_NOFOLLOW | O_CLOEXEC, mode)
@@ -129,8 +121,7 @@ package enum VerifiedPath {
         return try openFinal(parent, flags: flags, mode: mode)
     }
 
-    /// Prove that no component of `url` is a symlink right now. Used by the one
-    /// consumer that must pass a pathname to an external process.
+    /// External-process callers need current path proof because they cannot pass descriptor-relative authority.
     package static func confirmNoSymlink(_ url: URL) throws {
         let fd = try open(url, flags: O_RDONLY | O_NONBLOCK)
         _ = Darwin.close(fd)
@@ -159,7 +150,8 @@ package enum VerifiedPath {
             let sourceFD = try openFinal(from, flags: O_RDONLY | O_NONBLOCK)
             defer { _ = Darwin.close(sourceFD) }
             guard fstat(sourceFD, &metadata) == 0, metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
-                throw CocoaError(.fileReadUnsupportedScheme, userInfo: [NSLocalizedDescriptionKey: "Copy requires a regular file. Folder copies are not supported."])
+                throw CocoaError(.fileReadUnsupportedScheme,
+                    userInfo: [NSLocalizedDescriptionKey: "Copy requires a regular file. Folder copies are not supported."])
             }
             let temporary = ".\(UUID().uuidString).copy"
             let targetFD = openat(to.fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)

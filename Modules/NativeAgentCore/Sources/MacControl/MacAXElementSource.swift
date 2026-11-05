@@ -17,128 +17,97 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacAXElementSource.swift` | Read-only source contracts; checked attributes/count/children preserve unavailable reads through the shared walker; focus binds to elements in the supplied observation |
-/// because a half-readable tree is still useful perception.
+// Blueprint: | `MacAXElementSource.swift` | Read-only AX contracts preserve gaps and observation-bound focus |
+/// Keep partially readable trees useful without treating gaps as absence.
 public protocol MacAXElementSource: Sendable {
-    /// `AXIsProcessTrusted()` in production.
     func isTrusted() -> Bool
     func frontmostApp() -> MacAXAppInfo?
-    /// Frontmost (focused, else main, else first) window of the frontmost app.
-    func frontmostWindowRoot() -> MacAXElementRef?
-    /// Whether global wheel input at this point still lands in the captured
-    /// container. Live AX handles are reminted, so compare underlying elements.
-    func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool
-    /// Window choice in the named process, or nil; identity checks re-read the frame's app.
-    /// The default frontmost root represents a single-tree source.
-    func windowRoot(pid: Int32) -> MacAXElementRef?
-    /// Every window in `AXWindows` order with composite identity, so acts can re-read the captured window.
-    /// Default: `windowRoot(pid:)` at index 0 for a single-tree source.
-    func windowRoots(pid: Int32) -> [MacAXWindowHandle]
+    func frontmostWindowRoot(context: MacOperationContext) -> MacAXElementRef?
+    /// Whether global wheel input at this point still lands in the captured container. Live AX handles are reminted, so compare underlying elements.
+    func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32, context: MacOperationContext) -> Bool
+    /// Window choice in the named process, or nil; identity checks re-read the frame's app. The default frontmost root represents a single-tree source.
+    func windowRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef?
+    /// Preserve AXWindows order and composite identities so acts can re-read the captured window; single-tree sources expose index zero.
+    func windowRoots(pid: Int32, context: MacOperationContext) -> [MacAXWindowHandle]
     /// Named-process metadata; the default answers only for the frontmost pid, otherwise nil.
     func appInfo(pid: Int32) -> MacAXAppInfo?
-    /// Enumerate running UI apps without activating, launching or quitting them.
-    /// The default reports only the frontmost app for a single-tree source.
+    /// App enumeration must leave launch, activation and quit state untouched; single-tree sources expose only their frontmost app.
     func runningApps() -> [MacAXAppInfo]
-    /// The app's `AXMenuBar` element, or nil when it has
-    /// none. Its own member rather than a role the ordinary walk may reach:
-    /// every window walk in this module DELIBERATELY refuses to descend into a
-    /// menu bar (400 items would eat the node budget on every look), and this
-    /// keeps that refusal intact while giving the menu organ its one door.
-    ///
-    /// Default nil — a synthetic source has no menu bar unless it says it does,
-    /// and "no menu bar" is a truthful answer that the organ reports in words.
-    func menuBarRoot(pid: Int32) -> MacAXElementRef?
-    /// Currently open native menus belonging to this frontmost app. They can
-    /// be application siblings, not descendants of its document window.
-    /// These roots are never window-relative action addresses.
-    func transientMenuRoots(pid: Int32) -> [MacAXElementRef]
-    func attributes(of ref: MacAXElementRef) -> MacAXAttributes?
-    func checkedAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes
-    /// Only what the desktop capture's secret mask reads: role, subrole,
-    /// title, value, frame and actions, without the display-only reads.
-    /// Default: the full attribute read.
-    func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes?
-    func checkedMaskingAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes
-    /// Writable action attributes, queried only for selected screen marks.
-    func settableAttributes(of ref: MacAXElementRef) -> [String]
-    func children(of ref: MacAXElementRef) -> [MacAXElementRef]
-    /// Child count WITHOUT materializing the array. Default falls back to
-    /// `children(of:).count`; the live source uses the ranged AX count API so a
-    /// pathological node (100k children) can't force a huge bridge just to be
-    /// counted at the depth cap. nil = the
-    /// app did not answer: unknown, never an empty subtree.
-    func childCount(of ref: MacAXElementRef) -> Int?
-    func checkedChildCount(of ref: MacAXElementRef) throws -> Int
-    /// At most `limit` children. Default prefixes `children(of:)`; the live
-    /// source uses `AXUIElementCopyAttributeValues` ranged fetch so the whole
-    /// child array is never bridged when only a bounded slice can still fit
-    /// under the node cap.
-    func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef]
-    func checkedChildren(of ref: MacAXElementRef, limit: Int) throws -> [MacAXElementRef]
-    /// The child-index path of the app's focused element, relative to the same
-    /// window root `frontmostWindowRoot()` returns — or nil when this source
-    /// CANNOT TELL. The default is nil for exactly that reason: a source that
-    /// has no notion of focus must report absence, never a guess (the
-    /// perception compiler reports "focus: unknown" rather than naming "the
-    /// first text field", which is how a look starts lying about the cursor).
-    /// Read-only like every other member here.
-    func focusedElementPath() -> [Int]?
-    /// Focus path anchored to a root the caller ALREADY WALKED: nil when the
-    /// focused element is not under that root (focus moved to another window
-    /// between the walk and this call). Default defers to `focusedElementPath()`
-    /// for sources with a single tree (synthetic/test sources).
-    func focusedElementPath(relativeTo root: MacAXElementRef?) -> [Int]?
+    /// Read the menu bar separately: window walks exclude it so hundreds of menu items cannot consume every look's node budget. Sources without menus report
+    /// nil.
+    func menuBarRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef?
+    /// Currently open native menus belonging to this frontmost app. They can be application siblings, not descendants of its document window. These roots are
+    /// never window-relative action addresses.
+    func transientMenuRoots(pid: Int32, context: MacOperationContext) -> [MacAXElementRef]
+    func attributes(of ref: MacAXElementRef, context: MacOperationContext) -> MacAXAttributes?
+    func checkedAttributes(of ref: MacAXElementRef, context: MacOperationContext) throws -> MacAXAttributes
+    /// Secret-mask reads need role, subrole, title, value, frame and actions; display-only reads add no masking evidence.
+    func maskingAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> MacAXAttributes?
+    func checkedMaskingAttributes(of ref: MacAXElementRef, context: MacOperationContext) throws -> MacAXAttributes
+    /// Query writability only for selected marks to bound AX work.
+    func settableAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> [String]
+    func children(of ref: MacAXElementRef, context: MacOperationContext) -> [MacAXElementRef]
+    /// Use ranged child counts to avoid materializing huge arrays at the depth cap. Nil is an unanswered read, never an empty subtree.
+    func childCount(of ref: MacAXElementRef, context: MacOperationContext) -> Int?
+    func checkedChildCount(of ref: MacAXElementRef, context: MacOperationContext) throws -> Int
+    /// Ranged child fetches avoid bridging children that cannot fit under the node cap.
+    func children(of ref: MacAXElementRef, limit: Int, context: MacOperationContext) -> [MacAXElementRef]
+    func checkedChildren(of ref: MacAXElementRef, limit: Int, context: MacOperationContext) throws -> [MacAXElementRef]
+    /// Focus paths share the window root's child ordering; unknown focus remains nil rather than guessing an editor.
+    func focusedElementPath(context: MacOperationContext) -> [Int]?
+    /// Anchor focus to the root already walked; focus outside it is unknown. Single-tree sources use their sole focus path.
+    func focusedElementPath(relativeTo root: MacAXElementRef?, context: MacOperationContext) -> [Int]?
     /// Focus is an element in this observation, using its actual child ordering.
-    func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo root: MacAXElementRef) -> [Int]?
-    /// The underlying element's identity, so one walk
-    /// never reads the same element twice through two parents. nil = cannot
-    /// tell (synthetic sources), which dedupes nothing.
+    func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo root: MacAXElementRef, context: MacOperationContext) -> [Int]?
+    /// Deduplicate by native identity so multiple parents cannot make one walk read an element twice; unknown identity deduplicates nothing.
     func elementHash(_ ref: MacAXElementRef) -> Int?
     func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool
 }
 public extension MacAXElementSource {
-    func checkedMaskingAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
-        guard let value = maskingAttributes(of: ref) else {
+    func checkedMaskingAttributes(of ref: MacAXElementRef, context: MacOperationContext) throws -> MacAXAttributes {
+        guard let value = maskingAttributes(of: ref, context: context) else {
             throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility masking attributes are unavailable.")
         }
         return value
     }
-    func checkedChildCount(of ref: MacAXElementRef) throws -> Int {
-        guard let count = childCount(of: ref) else {
+    func checkedChildCount(of ref: MacAXElementRef, context: MacOperationContext) throws -> Int {
+        guard let count = childCount(of: ref, context: context) else {
             throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility child count is unavailable.")
         }
         return count
     }
-    func checkedChildren(of ref: MacAXElementRef, limit: Int) throws -> [MacAXElementRef] { children(of: ref, limit: limit) }
-    func checkedAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
-        guard let value = attributes(of: ref) else {
+    func checkedChildren(of ref: MacAXElementRef, limit: Int, context: MacOperationContext) throws -> [MacAXElementRef] { children(of: ref, limit: limit,
+        context: context) }
+    func checkedAttributes(of ref: MacAXElementRef, context: MacOperationContext) throws -> MacAXAttributes {
+        guard let value = attributes(of: ref, context: context) else {
             throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility element attributes are unavailable.")
         }
         return value
     }
-    func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes? { attributes(of: ref) }
-    func settableAttributes(of ref: MacAXElementRef) -> [String] { [] }
+    func maskingAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> MacAXAttributes? { attributes(of: ref, context: context) }
+    func settableAttributes(of ref: MacAXElementRef, context: MacOperationContext) -> [String] { [] }
     func elementHash(_ ref: MacAXElementRef) -> Int? { nil }
     func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool { lhs == rhs }
-    func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
-        frontmostApp()?.processIdentifier == pid && frontmostWindowRoot() == window
-            && attributes(of: container)?.frame == frame
+    func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32,
+        context: MacOperationContext) -> Bool {
+        frontmostApp()?.processIdentifier == pid && frontmostWindowRoot(context: context) == window
+            && attributes(of: container, context: context)?.frame == frame
     }
-    func transientMenuRoots(pid: Int32) -> [MacAXElementRef] { [] }
-    func childCount(of ref: MacAXElementRef) -> Int? { children(of: ref).count }
-    func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef] {
-        limit <= 0 ? [] : Array(children(of: ref).prefix(limit))
+    func transientMenuRoots(pid: Int32, context: MacOperationContext) -> [MacAXElementRef] { [] }
+    func childCount(of ref: MacAXElementRef, context: MacOperationContext) -> Int? { children(of: ref, context: context).count }
+    func children(of ref: MacAXElementRef, limit: Int, context: MacOperationContext) -> [MacAXElementRef] {
+        limit <= 0 ? [] : Array(children(of: ref, context: context).prefix(limit))
     }
-    func focusedElementPath() -> [Int]? { nil }
-    func focusedElementPath(relativeTo root: MacAXElementRef?) -> [Int]? { focusedElementPath() }
-    func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo root: MacAXElementRef) -> [Int]? {
-        guard let path = focusedElementPath(relativeTo: root), snapshot.nodes.contains(where: { $0.path == path }) else { return nil }
+    func focusedElementPath(context: MacOperationContext) -> [Int]? { nil }
+    func focusedElementPath(relativeTo root: MacAXElementRef?, context: MacOperationContext) -> [Int]? { focusedElementPath(context: context) }
+    func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo root: MacAXElementRef, context: MacOperationContext) -> [Int]? {
+        guard let path = focusedElementPath(relativeTo: root, context: context), snapshot.nodes.contains(where: { $0.path == path }) else { return nil }
         return path
     }
-    func windowRoot(pid: Int32) -> MacAXElementRef? { frontmostWindowRoot() }
-    func windowRoots(pid: Int32) -> [MacAXWindowHandle] {
-        guard let root = windowRoot(pid: pid) else { return [] }
-        let attributes = attributes(of: root)
+    func windowRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef? { frontmostWindowRoot(context: context) }
+    func windowRoots(pid: Int32, context: MacOperationContext) -> [MacAXWindowHandle] {
+        guard let root = windowRoot(pid: pid, context: context) else { return [] }
+        let attributes = attributes(of: root, context: context)
         return [MacAXWindowHandle(
             ref: root,
             identity: MacAXWindowIdentity(
@@ -157,5 +126,5 @@ public extension MacAXElementSource {
         return app
     }
     func runningApps() -> [MacAXAppInfo] { [frontmostApp()].compactMap { $0 } }
-    func menuBarRoot(pid: Int32) -> MacAXElementRef? { nil }
+    func menuBarRoot(pid: Int32, context: MacOperationContext) -> MacAXElementRef? { nil }
 }

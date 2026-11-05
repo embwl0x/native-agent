@@ -3,9 +3,7 @@ import Foundation
 
 // MARK: - Active browser run ownership
 
-/// Closes the short interval between canonical `running` persistence and the
-/// WebKit task becoming cancellable. A cancel that arrives before attachment
-/// is remembered and applied immediately when the exact task is installed.
+/// Remember cancellation between running persistence and WebKit task attachment so the exact task is cancelled on arrival.
 @MainActor
 public final class BrowserRunCancellationLatch {
     public nonisolated init() {}
@@ -28,11 +26,8 @@ public final class BrowserRunCancellationLatch {
     }
 }
 
-/// Process-local owner for live visible-browser work. Canonical lifecycle still
-/// lives in Browser/runs.json; this registry exists only so a persisted cancel
-/// can target the exact in-flight Task and WebKit navigation before a late
-/// capture or success receipt is produced. Tokens prevent stale defer cleanup
-/// from unregistering a newer run that reused the same id.
+/// Durable lifecycle stays in runs.json; this registry targets only the live task and navigation. Tokens prevent stale cleanup from unregistering a newer run
+/// with the same id.
 @MainActor
 public final class BrowserActiveRunRegistry {
     public static let shared = BrowserActiveRunRegistry()

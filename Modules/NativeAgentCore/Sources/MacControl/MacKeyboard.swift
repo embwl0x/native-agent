@@ -18,7 +18,7 @@ import AppKit
 import Carbon
 #endif
 
-// Blueprint: | `MacKeyboard.swift` | `MacKeyModifiers`, `MacKeyChord`, `MacKeySyntax`, `MacKeyEvent` and `MacSecureEventInput`: keyboard grammar, layout resolution, literal text limits and secure-input evidence |
+// Blueprint: | `MacKeyboard.swift` | `MacKeyModifiers`, `MacKeyChord`, `MacKeySyntax`, `MacKeyEvent`, `MacSecureEventInput`: Layout and secure-input rules |
 
 // MARK: - Key modifiers
 
@@ -32,7 +32,7 @@ public struct MacKeyModifiers: OptionSet, Sendable, Hashable {
     public static let control  = MacKeyModifiers(rawValue: 1 << 3)
     public static let function = MacKeyModifiers(rawValue: 1 << 4)
 
-    /// Stable, sorted slugs for payloads and test assertions.
+    /// Stable sorted slugs keep payload ordering deterministic.
     public var slugs: [String] {
         var out: [String] = []
         if contains(.command) { out.append("cmd") }
@@ -46,11 +46,10 @@ public struct MacKeyModifiers: OptionSet, Sendable, Hashable {
 
 // MARK: - Key syntax
 
-/// One resolved chord: zero or more modifiers plus exactly one virtual keycode.
 public struct MacKeyChord: Sendable, Equatable {
     public let modifiers: MacKeyModifiers
     public let keyCode: UInt16
-    /// The token as written, kept for honest echo in the result payload.
+    /// Keep the written token so results echo the actual request.
     public let source: String
 
     public init(modifiers: MacKeyModifiers, keyCode: UInt16, source: String) {
@@ -91,7 +90,10 @@ public enum MacKeySyntaxError: Error, Equatable, LocalizedError {
         case .unknownKey(let key, let chord):
             // Explain modifier-only input with the accepted chord/holding syntax.
             if MacKeySyntax.modifier(key.lowercased()) != nil {
-                return "invalid_keystroke_syntax: \"\(key)\" is a modifier, not a key; put it in `holding` with the key it modifies, or write a chord such as \(key.lowercased())+tab"
+                return """
+                    invalid_keystroke_syntax: \"\(key)\" is a modifier, not a key; put it in `holding` with the key it modifies, or write a chord such as \
+                    \(key.lowercased())+tab
+                    """
             }
             return "invalid_keystroke_syntax: unknown key \"\(key)\" in \"\(chord)\""
         case .keyCodeOutOfRange(let raw):
@@ -104,27 +106,8 @@ public enum MacKeySyntaxError: Error, Equatable, LocalizedError {
     }
 }
 
-/// Human key syntax → virtual keycodes.
-///
-/// GRAMMAR (characters resolve through the current keyboard layout; `key:`
-/// and `code:` explicitly address a physical virtual key):
-///
-///     spec   := chord ( WHITESPACE+ chord )*        ; a sequence, run in order
-///     chord  := ( modifier "+" )* key
-///     modifier := cmd | command | meta | super
-///                | shift
-///                | opt | option | alt
-///                | ctrl | control
-///                | fn | function
-///     key    := named | character | raw
-///     named  := return|enter|tab|escape|esc|space|delete|backspace
-///             | forward_delete|del|home|end|pageup|pagedown|up|down|left|right
-///             | capslock|help|plus|f1…f20
-///     character := any single character on the active layout; an UPPERCASE letter
-///                  or a shifted glyph ("!", "?", ":") implies `shift`
-///     raw    := ("key:"|"code:") 0…127        ; escape hatch for exotic keys
-///
-/// Examples: `cmd+shift+4`, `return`, `cmd+a cmd+c`, `ctrl+opt+left`, `key:96`.
+/// Characters use the active layout; `key:` and `code:` explicitly address physical keys. Chords run sequentially; uppercase letters and shifted glyphs imply
+/// Shift.
 public enum MacKeySyntax {
     /// Hard cap: a single keystroke call cannot emit an unbounded chord storm.
     public static let maxChords = 64
@@ -154,9 +137,7 @@ public enum MacKeySyntax {
     /// Resolve a glyph in one stroke; dead-key sequences are not key chords.
     private static func characterKey(_ glyph: String, command: Bool) -> (UInt16, MacKeyModifiers)? {
         #if canImport(Carbon) && os(macOS)
-        // The input-source manager asserts the main queue (10-31: her typing in
-        // Calculator from a hand's thread crashed the app), so the layout's bytes
-        // are copied there and translated here.
+        // The input-source manager requires the main queue; copy layout bytes there before translating off-queue.
         let read = { () -> (Data, UInt8)? in
             guard let retained = TISCopyCurrentKeyboardLayoutInputSource() else { return nil }
             let source = retained.takeRetainedValue()
@@ -199,7 +180,6 @@ public enum MacKeySyntax {
         }
     }
 
-    /// Resolve a key token to `(keyCode, impliedModifiers)`.
     static func key(_ token: String, chord: String, modifiers: MacKeyModifiers = []) throws -> (UInt16, MacKeyModifiers) {
         let lower = token.lowercased()
         if let code = namedKeys[lower] {
@@ -216,16 +196,14 @@ public enum MacKeySyntax {
         if token.count == 1, let resolved = characterKey(token, command: modifiers.contains(.command)) {
             return resolved
         }
-        // A bare modifier ("shift" on its own, e.g. a screensaver nudge) is its own key.
+        // A bare modifier can itself be a key, as for a screensaver nudge.
         let modifierKeys: [String: UInt16] = ["shift": 56, "cmd": 55, "command": 55, "opt": 58,
                                               "option": 58, "alt": 58, "ctrl": 59, "control": 59]
         if let code = modifierKeys[lower] { return (code, []) }
         throw MacKeySyntaxError.unknownKey(token, chord: chord)
     }
 
-    /// Parse a whitespace-separated chord sequence. Throws on ANY malformed
-    /// input — a partially understood keystroke spec must never be executed,
-    /// because "the part I understood" can itself be a destructive shortcut.
+    /// Reject malformed sequences whole: executing a partially understood shortcut can be destructive.
     public static func parseChords(_ spec: String, modifiers heldModifiers: MacKeyModifiers = []) throws -> [MacKeyChord] {
         let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw MacKeySyntaxError.empty }
@@ -266,9 +244,7 @@ public enum MacKeySyntax {
         return chords
     }
 
-    /// A held set is simultaneous, unlike the ordinary sequential key syntax.
-    /// Keep the same chord grammar, including bare modifiers, and deduplicate
-    /// physical keys so every press has exactly one release.
+    /// Held keys are simultaneous; deduplicate physical keys so each press has exactly one release.
     public static func parseHeldKeys(_ spec: String) throws -> (modifiers: MacKeyModifiers, keys: [UInt16]) {
         let tokens = spec.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         guard !tokens.isEmpty else { throw MacKeySyntaxError.empty }
@@ -277,8 +253,7 @@ public enum MacKeySyntax {
         }
         var modifiers: MacKeyModifiers = []
         var keys: [UInt16] = []
-        // The whole held set applies to character resolution, including layouts
-        // whose Command mapping differs from their ordinary character mapping.
+        // Resolve characters against all held modifiers because some layouts change their Command mapping.
         for token in tokens {
             if let held = modifier(token.lowercased()) { modifiers.formUnion(held) }
         }
@@ -295,9 +270,7 @@ public enum MacKeySyntax {
         return (modifiers, keys)
     }
 
-    /// Validate literal text for the `text:` path. Unicode is emitted through
-    /// `keyboardSetUnicodeString`, so no keycode table is involved and any
-    /// layout works — the only limit is length.
+    /// Unicode emission bypasses layout keycodes; only the per-call length bound applies.
     public static func validateText(_ text: String) throws -> String {
         guard !text.isEmpty else { throw MacKeySyntaxError.empty }
         guard text.count <= maxTextCharacters else {
@@ -313,8 +286,7 @@ public struct MacKeyEvent: Sendable, Equatable {
     public let keyCode: UInt16
     public let down: Bool
     public let modifiers: MacKeyModifiers
-    /// When non-nil the event carries this text verbatim via
-    /// `CGEvent.keyboardSetUnicodeString` — the layout-independent typing path.
+    /// Unicode text travels verbatim without depending on keyboard layout.
     public let unicodeText: String?
 
     public init(keyCode: UInt16, down: Bool, modifiers: MacKeyModifiers = [], unicodeText: String? = nil) {
@@ -325,9 +297,7 @@ public struct MacKeyEvent: Sendable, Equatable {
     }
 }
 
-/// The live probe. Carbon's `IsSecureEventInputEnabled()` is the only public
-/// answer macOS gives, and it is a global: it reports that SOME process has
-/// secure input on, never which one.
+/// Carbon’s secure-input probe is global and cannot identify the process that enabled it.
 public enum MacSecureEventInput {
     public static func isEnabled() -> Bool {
         #if canImport(Carbon) && os(macOS)

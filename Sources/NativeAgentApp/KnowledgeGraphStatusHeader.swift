@@ -6,16 +6,12 @@ import CloudKit
 import DeviceSync
 // Blueprint: | `KnowledgeGraphStatusHeader.swift` | `KGNativeStackHeader`: renders the engine memory diagnostics and graph counts |
 
-// The header receives entity/edge counts from the canonical checked graph read.
-// It must never substitute MemoryV2 row count or legacy JSON mtime for graph
-// truth once memory.sqlite is authoritative.
+// Only the canonical checked graph read establishes entity/edge counts; other memory counts and file timestamps are not graph evidence.
 struct KGNativeStackHeader: View {
     let memory: MemoryFacade
     let totalEntities: Int?
     let totalEdges: Int?
     var body: some View {
-        // A row inside the alive group card: no material strip of its own,
-        // and shell inks (the system tertiary fails on the haze).
         HStack(spacing: 12) {
             Text(totalEntities.map { "\($0) entities" } ?? "Entities unavailable").font(.caption.weight(.semibold))
             Text("·").foregroundStyle(NativeAgentShell.secondary)

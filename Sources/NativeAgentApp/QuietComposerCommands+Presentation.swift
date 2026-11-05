@@ -119,7 +119,7 @@ extension QuietComposerCommands {
                            "\(mode.capitalized) view is on screen and has no Work pane, so nothing was opened.")
         }
         WorkPaneState.shared.agentShow(tab)
-        // The pane lives on Chat; on another page User sees it when he goes back.
+        // The pane belongs to Chat, so changing it must not force navigation from another page.
         let onChat = ApplicationLifetime.shared.currentPage?.item == .chat
         return .done("Work pane", "The Work pane is open on \(key)"
             + (onChat ? "." : ", but the person is on another page; they see it when they go back to Chat."))
@@ -132,11 +132,8 @@ extension QuietComposerCommands {
     static let tabs: [String: (page: SidebarItem, tab: String)] = [
         "knowledge": (.memories, "knowledge"), "minds": (.personality, "minds"),
         "dreams": (.personality, "dreams"), "agents": (.connectors, "agents"),
-        "doctor": (.diagnostics, DiagnosticsView.DiagnosticsMode.doctor.rawValue),
-        "status": (.diagnostics, DiagnosticsView.DiagnosticsMode.status.rawValue),
-        "runs": (.diagnostics, DiagnosticsView.DiagnosticsMode.runs.rawValue),
-        "cognition": (.diagnostics, DiagnosticsView.DiagnosticsMode.cognition.rawValue),
-        "inspector": (.diagnostics, DiagnosticsView.DiagnosticsMode.inspector.rawValue),
+        "cognition": (.diagnostics, "Cognition"),
+        "inspector": (.diagnostics, "Inspector"),
         "skills": (.diagnostics, "skills"), "tools": (.diagnostics, "tools"),
         "trust_access": (.trust, TrustTab.access.rawValue),
         "trust_features": (.trust, TrustTab.features.rawValue),
@@ -154,7 +151,13 @@ extension QuietComposerCommands {
         let shown: SidebarItem
         var tab: String?
         var title = key
-        if let section = sheets[key] {
+        if key == "inbox" {
+            guard item.isEmpty || item == "earlier" else {
+                return .refuse("Inbox", "unknown_item", "Inbox opens the current reading or earlier matters.")
+            }
+            destination = item == "earlier" ? .sidebar(.inboxPolicy) : .activity(.inbox)
+            shown = item == "earlier" ? .inboxPolicy : .activity
+        } else if let section = sheets[key] {
             destination = .activity(section)
             shown = section == .memoryProposals ? .memories : .activity
         } else if let home = tabs[key] {
@@ -168,14 +171,30 @@ extension QuietComposerCommands {
                 "rail", "unknown_page",
                 "No page is called that. The pages are: " + QuietPages.ids.joined(separator: ", ")
                 + ". Inside them: " + (Array(sheets.keys) + Array(tabs.keys)).sorted().joined(separator: ", ")
-                + ". Value desk with a Desk item's handle in choice opens that item."
+                + ". item opens one of the page's own tabs, or a Desk item's handle on page desk."
             )
         }
-        let handle = item.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !handle.isEmpty {
-            guard shown == .desk else {
-                return .refuse("Desk item", "item_needs_desk", "choice opens a Desk item, so pass value desk with it.")
+        let handle = key == "inbox" ? "" : item.trimmingCharacters(in: .whitespacesAndNewlines)
+        let memoryTarget = shown == .memories ? MemoriesFaceTarget(row: handle) : nil
+        // An item opens a page's tab, a Memories row, a Diagnostics run, or a Desk item by handle.
+        var opened: String?
+        var diagnosticsRun: String?
+        if let memoryTarget {
+            opened = memoryTarget.row
+            tab = "memories"
+        } else if !handle.isEmpty, shown == .diagnostics, appModel.engine.runs.rows.contains(where: { $0.id == handle }) {
+            (tab, opened, diagnosticsRun) = ("diagnostics", "Run details", handle)
+        } else if !handle.isEmpty, shown != .desk {
+            let pageTabs = ShellRailTab.all(appModel.engine.layout.availability).first { $0.page == shown }?.tabs ?? []
+            guard let match = pageTabs.first(where: {
+                $0.key.caseInsensitiveCompare(handle) == .orderedSame || $0.title.caseInsensitiveCompare(handle) == .orderedSame
+            }) else {
+                return .refuse("rail", "unknown_item", pageTabs.isEmpty
+                    ? "The \(title) page has no tabs, so item \(handle) opens nothing there; nothing was opened. On page desk, item is a Desk item's handle."
+                    : "The \(title) page has no item \(handle); nothing was opened. Its items: \(pageTabs.map(\.key).joined(separator: ", ")).")
             }
+            (tab, opened) = (match.key, match.title)
+        } else if !handle.isEmpty {
             do {
                 guard try await appModel.engine.desk.store.liveState().items.contains(where: { $0.handle == handle }) else {
                     return .refuse("Desk item", "unknown_desk_item", "No Desk item has the handle \(handle). app desk.read lists the handles.")
@@ -193,13 +212,16 @@ extension QuietComposerCommands {
             )
         }
         if let tab { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(shown)) }
-        if !handle.isEmpty { appModel.pendingDeskHandle = handle }
+        if key == "inbox", item == "earlier" { InboxHistoryNavigation.shared.isPresented = true }
+        if let memoryTarget { appModel.pendingMemoryFaceTarget = memoryTarget }
+        if let diagnosticsRun { appModel.diagnosticsRunID = diagnosticsRun }
+        if shown == .desk, !handle.isEmpty { appModel.pendingDeskHandle = handle }
         guard coordinator.currentPage?.item == shown else {
             return .refuse("rail", "page_not_shown", "The window has not switched to \(title).", effects: .unknown)
         }
         return .done(
             "rail row \"\(title)\"",
-            "The window is now showing \(title)" + (handle.isEmpty ? "" : ", opening Desk item \(handle)")
+            "The window is now showing \(title)" + (opened.map { " on its \($0) tab" } ?? (handle.isEmpty ? "" : ", opening Desk item \(handle)"))
                 + (leftOtherView ? ", in Advanced view." : ".")
         )
     }
@@ -267,7 +289,9 @@ extension AppModel: QuietComposerCommandPort {
         let projection = await engine.providers.refreshSession(sessionID)
         let routing = QuietComposerCommands.Routing(appModel: self, sessionID: sessionID)
         var body: [String: JSONValue] = [
-            "provider": .string(routing.routeChoice?.provider ?? ""), "model": .string(routing.routeChoice?.model ?? ""), "model_word": .string(routing.modelWord),
+            "provider": .string(routing.routeChoice?.provider ?? ""),
+            "model": .string(routing.routeChoice?.model ?? ""),
+            "model_word": .string(routing.modelWord),
             "think": .string(routing.routeChoice?.reasoningEffort ?? ""), "think_word": .string(routing.effortWord),
             "think_choices": .array(routing.efforts.map { .string($0.id) }), "fast": .bool(routing.fastIsOn),
             "trust_word": .string(routing.trustWord), "persona": .string(chatPersona),
@@ -279,13 +303,10 @@ extension AppModel: QuietComposerCommandPort {
             if let percent = Int64(exactly: usage.percent.rounded()) {
                 body["ring_percent"] = .int(percent)
             } else {
-                // Quiet composer readers accept text as well as integers.
                 body["ring_percent"] = .string(String(format: "%.0f", usage.percent.rounded()))
             }
             body["context_used_tokens"] = .int(Int64(status.used_tokens))
             body["context_budget_tokens"] = .int(Int64(status.budget))
-            body["context_compact_at_percent"] = .string(ContextFillPresentation.compactionPercent(status))
-            body["context_compact_at_tokens"] = .int(Int64(status.auto_compact_threshold))
             body["context_measurement_source"] = status.context_mode.map(JSONValue.string) ?? .null
         }
         return body

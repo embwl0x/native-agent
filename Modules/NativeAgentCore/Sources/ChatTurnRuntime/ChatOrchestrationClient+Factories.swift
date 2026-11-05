@@ -10,25 +10,20 @@ import ProviderRouting
 import TrustCenter
 import ToolRegistry
 
-
 import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
 import Context
-// Blueprint: | `ChatOrchestrationClient+Factories.swift` | `makeChatOrchestrationClient`, `makeGatedToolDispatchClient`: ExpansionDispatcher → CanonicalToolNameDispatcher → optional ChatToolDispatchTracer → PeerDataTaintDispatcher → AutonomyGatedDispatcher → FileAccessGatedDispatcher → injected tools; factory shares its clock with engine and chat client and uses ProviderRouting's canonical provider assembly |
+import ChatToolRuntime
+// Blueprint: | `ChatOrchestrationClient+Factories.swift` | `makeChatOrchestrationClient`; `makeGatedToolDispatchClient`; Shared canonical gated construction |
 
 // MARK: - Factory
 
-/// Convenience overload for app shells that need to add app-owned tools while
-/// reusing the production persona/router/trust/LLM/memory wiring.
-/// `providersRoot` selects routing and credentials; credential writes are token refreshes only.
-/// Without it, routing uses `dataRoot` and adapters retain their default credential selection.
-/// Routing overrides are read/write targets, including transactions in their directories;
-/// nil uses `providers/active.json` and `providers/surfaces.json` under the routing root.
-/// All other state stays on `dataRoot`; nondefault roots isolate persona and memory owners.
-/// The injected `clock` is shared by the engine and client; its default is `Date()`.
+/// Routing and credentials use `providersRoot`; all other state uses `dataRoot` to preserve isolation.
+/// Credential writes refresh tokens only. Nil overrides use canonical routing paths and adapter credential selection.
+/// The engine and client share the injected clock.
 public func makeChatOrchestrationClient(
     tools: any ToolDispatchClient,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -93,10 +88,6 @@ public func makeChatOrchestrationClient(
     )
 }
 
-/// No-arg form — auto-constructs sensible SwiftNative defaults
-/// (persona/router/trust on `PersistenceCore.defaultDataRoot()`, the real
-/// SwiftNativeLLMClient with the provider adapters, and the minimal
-/// SwiftToolDispatcher).
 public func makeChatOrchestrationClient(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     cognitiveRuntime: (any CognitiveRuntimeProviding)? = nil,
@@ -115,25 +106,10 @@ public func makeChatOrchestrationClient(
     )
 }
 
-/// Build the same gated tool dispatch chain that `SwiftNativeChatOrchestrationClient.chat`
-/// constructs per-turn (expansion → canonical name → optional trace/peer taint → autonomy
-/// → file access → real tools), for
-/// use by non-chat surfaces (e.g. ClaudeBridge HTTP /claude/tool) that
-/// would otherwise bypass Trust Center deny/confirm decisions and persona
-/// write-guards.
-///
-/// - `fileAccess`: same values as `ChatOrchestrationClient.chat(..., fileAccess:)`
-///   — invalid modes are refused; `none` refuses pathful `read` and prevents
-///   downstream screen reads from opening inferred files. The mode travels
-///   downstream; this wrapper does not impose a general read-only write block.
-/// - `approvalFiler`: pass nil to make CONFIRM-tier tools fail closed (no
-///   human-in-the-loop). Pass a wired filer to allow async approvals.
-/// - `dataRoot`: exact root used when this factory constructs its default
-///   TrustCenter, peer naming, approval inbox, security and trace stores.
-/// - `verifiedSessionId`: optional session id used by SecurityCenter for
-///   origin attribution; pass nil for stateless callers.
-/// - `approvedReplay`: exact approval evidence for a resolved chat-tool replay.
-///   It satisfies only a matching persona confirmation; hard gates still run.
+/// Non-chat surfaces use the same gated chain so they cannot bypass Trust or persona guards.
+/// Invalid file modes refuse; `none` blocks pathful reads and inferred file opens without imposing a general write block.
+/// A missing approval filer fails closed. The exact data root owns Trust, peer naming, approvals, security and traces.
+/// Verified session identity attributes origin; approved replay satisfies only its matching confirmation, never hard gates.
 public func makeGatedToolDispatchClient(
     tools: any ToolDispatchClient,
     fileAccess: String = "read_only",
@@ -142,7 +118,8 @@ public func makeGatedToolDispatchClient(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     verifiedSessionId: String? = nil,
     approvedReplay: ApprovedChatToolReplay? = nil,
-    tracePeerTurn: Bool = false
+    tracePeerTurn: Bool = false,
+    work: ChatTurnWork = .init()
 ) -> any ToolDispatchClient {
     let gate = AutonomyGate(approvalFiler: approvalFiler)
     let fileAccessGated = FileAccessGatedDispatcher(inner: tools, fileAccess: fileAccess)
@@ -160,7 +137,7 @@ public func makeGatedToolDispatchClient(
         approvedReplayVerifier: ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot, canonicalTool: CanonicalToolNameDispatcher.canonical),
         // The peer directory supplies display names only, never authority.
         peerDirectoryDataRoot: dataRoot,
-        fileAccess: fileAccess
+        fileAccess: fileAccess, work: work
     )
     // Provenance policy also binds approved replays and carried work, even
     // when those dispatch chains do not record a chat trace.
@@ -171,9 +148,8 @@ public func makeGatedToolDispatchClient(
     // Every surface resolves saved peer names from this same root.
     let canonical = CanonicalToolNameDispatcher(inner: dispatcher, peerDataRoot: dataRoot,
         conversationScope: verifiedSessionId)
-    // Outermost: a mind's call returns carrying what its own practice looks
-    // at next (`Expansion`); calls made inside a call re-enter below it.
-    return ExpansionDispatcher(inner: canonical, dataRoot: dataRoot, session: verifiedSessionId)
+    // Expansion owns outer practice feedback; nested calls re-enter below it.
+    return ExpansionDispatcher(inner: canonical, dataRoot: dataRoot, session: verifiedSessionId, work: work)
 }
 
 /// Recall uses the root's canonical SQLite owner and managed embedder; unavailable stores remain fail-closed.

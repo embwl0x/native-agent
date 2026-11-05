@@ -7,10 +7,9 @@ import TelegramBot
 import AppToolRuntime
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `EngineTelegram.swift` | `TelegramFacade.loadStatus` consumes one checked configuration/credential result and checked routing with distinct unavailable causes; `load` adds checked diagnostic feeds; `refresh` alone publishes through `LatestRead`, including diagnostic-clear readback; credential badges read TelegramPresentationSnapshot.tokenConfigured directly |
+// Blueprint: | `EngineTelegram.swift` | `TelegramFacade.loadStatus`, `load`, `refresh`, `LatestRead`; Checked transport and diagnostic publication |
 
-/// Mounted Telegram management state. The core owns configuration and transport
-/// status; the facade adds bounded diagnostic feeds and the app's routing pick.
+/// Core owns Telegram config and transport; this projection adds bounded diagnostics and routing selection.
 @MainActor
 @Observable
 public final class TelegramFacade {
@@ -71,8 +70,7 @@ public final class TelegramFacade {
                 routing = try await SwiftNativeProviderRouting(dataRoot: dataRoot)
                     .checkedRoutingSnapshot()
             }
-            // Ask the owner to validate the saved route, including a named
-            // group failure when Telegram inherits an unusable Chat pick.
+            // Validate through the route owner so unusable inherited Chat choices retain their named group failure.
             _ = try routing.routeAdmission(for: "telegram", choice: nil, inheritChat: false)
             telegramBrain = routing.preferences["telegram"]
         } catch LLMError.providerError(let issue) {

@@ -1,11 +1,9 @@
 import Foundation
 
-// Blueprint: | `ContextPreparedTurn+CameToMind.swift` | `cameToMind(by:embedding:excluding:limit:)`: ambient standout configured by `ambientStandoutDeviations`, conversation rest and canonical point-of-use verification on the turn's lease, minus what it already holds |
+// Blueprint: | `ContextPreparedTurn+CameToMind.swift` | `cameToMind(by:embedding:excluding:limit:)`, `ambientStandoutDeviations` |
 
 extension NeedSignal {
-    /// The same need, asked of a moment: what she just read or what just
-    /// happened, in place of the message. Her authorization, rest state and
-    /// embedding model stay the turn's; nothing else of the message rides along.
+    /// A moment replaces only the query: retain the turn's authorization, rest state and embedding model.
     func moment(_ text: String, embedding: ContextQueryEmbeddingValue, limit: Int) -> NeedSignal {
         NeedSignal(
             message: text,
@@ -36,9 +34,7 @@ public struct ContextAmbientRecallResult: Sendable {
 }
 
 extension ContextPreparedTurn {
-    /// What a moment brings to mind: the memories its words single out among
-    /// hers, by the turn's own rule, that this turn does not already hold.
-    /// Empty when nothing stands out; a moment owes her nothing.
+    /// Apply the turn's relevance rule without duplicating held memories; nothing standing out is a valid empty result.
     public func cameToMind(
         by text: String,
         embedding: ContextQueryEmbeddingValue,

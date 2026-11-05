@@ -5,7 +5,6 @@ import PersistenceCore
 import Desk
 import EngineRuntime
 import TriggerScheduler
-import WorkshopExecution
 import Cognition
 import BackgroundLoops
 import NativeAgentShared
@@ -19,7 +18,7 @@ import DeviceSync
 
 // Blueprint: | `PageSheetHost.swift` | Shared page sheet framing and focused Desk schedule/research sheets |
 
-/// The focused surfaces the page opens without duplicating their controls.
+/// Reuse page controls instead of duplicating them in focused sheets.
 enum DeskPageSheet: String, Identifiable {
     case schedule
     case research
@@ -48,7 +47,6 @@ struct DeskPageSheetHost: View {
     }
 }
 
-/// Shared title, Done button and full surface for page sheets.
 struct PageSheetHost<Content: View>: View {
     let title: String?
     let onDone: () -> Void

@@ -2,34 +2,35 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `AgentWorkspaceApps.swift` | `AgentWorkspaceApps` enum; `quickAction`, `project` |
 
-/// Views of the file, Mac and browser owners. This adapter performs no I/O,
-/// scans no prose for instructions and never interprets a page as a tool plan.
+/// Views of the file, Mac and browser owners. This adapter performs no I/O, scans no prose for instructions and never interprets a page as a tool plan.
 enum AgentWorkspaceApps {
     static let destinations: [AgentWorkspaceDestination] = [
-        .init(id: "computer", title: "Computer", summary: "Look at the Mac, select a current control, and act on it.", tool: "screen", input: ["structured": .bool(true)], tools: ["screen", "go", "act", "wait"]),
-        .init(id: "browser", title: "Browser", summary: "Your conversation's browser tab, with page controls ready to select.", tool: "browser.chrome_status", tools: ["browser.chrome_snapshot", "browser.chrome_navigate"]),
-        // The environment resolves this destination to the canonical workspace
-        // root. A relative dot can mean a source checkout on developer installs.
-        .init(id: "files", title: "Files", summary: "Browse the workspace and open its documents.", tool: "list_dir", input: ["path": .string("$workspace"), "max_entries": .int(12)], tools: ["list_dir", "read_file", "write_file"]),
-        .init(id: "create", title: "Create", summary: "Make a document, image or other artifact using available capabilities.", tool: nil, tools: ["write_file", "image_generate"]),
+        .init(id: "computer", title: "Computer", summary: "Look at the Mac, select a current control, and act on it.", tool: "screen", input: ["structured"
+            : .bool(true)], tools: ["screen", "go", "act", "wait"]),
+        .init(id: "browser", title: "Browser", summary: "Your conversation's browser tab, with page controls ready to select.", tool: "browser.chrome_status",
+            tools: ["browser.chrome_snapshot", "browser.chrome_navigate"]),
+        // The environment resolves this destination to the canonical workspace root. A relative dot can mean a source checkout on developer installs.
+        .init(id: "files", title: "Files", summary: "Browse the workspace and open its documents.", tool: "list_dir", input: ["path": .string("$workspace"),
+            "max_entries": .int(12)], tools: ["list_dir", "read_file", "write_file"]),
+        .init(id: "create", title: "Create", summary: "Make a document, image or other artifact using available capabilities.", tool: nil,
+            tools: ["write_file", "image_generate"]),
     ]
 
-    static let readTools: Set<String> = ["list_dir", "screen", "menu", "read", "browser.chrome_status", "browser.chrome_snapshot", "browser.read_text", "browser.read_links"]
+    static let readTools: Set<String> = ["list_dir", "screen", "menu", "read", "browser.chrome_status", "browser.chrome_snapshot", "browser.read_text",
+        "browser.read_links"]
 
-    /// Small, explicit controls for common actions. The underlying owner still
-    /// validates the supplied website and applies the normal conversation gates.
+    /// Small, explicit controls for common actions. The underlying owner still validates the supplied website and applies the normal conversation gates.
     static func quickAction(tool: String) -> AgentWorkspaceButton? {
         if tool == "browser.chrome_snapshot" {
             return readButton("Read my current tab", tool: tool,
                 input: ["max_nodes": .int(80), "max_text_chars": .int(10000)])
         }
         switch tool {
-        // The same words as the memory results page: recall and record (walk 4).
         case "commit_memory":
             return .init(label: "Record a memory", action: .configure(tool: tool, input: [:], title: "Record a memory"))
         case "contacts_create_or_update":
             return .init(label: "New contact", action: .configure(tool: tool, input: [:], title: "New contact"))
-        // research.read with the address as text, not an empty form (desk walk 4).
+        // Supply the selected address as research.read input instead of opening an empty form.
         case "read_page":
             return .init(label: "Read a web page privately, no tab", action: .perform(tool: tool, input: [:], title: "Web source",
                                                                                       textField: "url", isEffect: false), needsText: true)
@@ -107,8 +108,14 @@ enum AgentWorkspaceApps {
             row["window_state"] = .string("This app is in the background. Bring it forward to receive fresh actionable controls; reading did not steal focus.")
         }
         row["workspace_detail"] = .string(items.isEmpty
-            ? "No selectable accessibility controls were available in this observation. Use the natural screen or pixels for content the app does not publish as controls."
-            : "Select a control and its action. NativeAgent carries the exact observation binding; a changed target is refused and refreshed rather than guessed or clicked again.")
+            ? """
+                No selectable accessibility controls were available in this observation. Use the natural screen or pixels for content the app does not \
+                publish as controls.
+                """
+            : """
+                Select a control and its action. NativeAgent carries the exact observation binding; a changed target is refused and refreshed rather than \
+                guessed or clicked again.
+                """)
         let app = object(controls["app"] ?? .null)
         let appName = string(app["bundle_id"]) ?? string(app["name"]) ?? string(input["app"])
         var readInput: [String: JSONValue] = ["structured": .bool(true)]
@@ -116,7 +123,8 @@ enum AgentWorkspaceApps {
         if let part = input["part"] { readInput["part"] = part }
         var actions: [AgentWorkspaceButton] = [
             readButton("Look again", tool: "screen", input: readInput),
-            .init(label: "Go to an app or location", action: .perform(tool: "go", input: [:], title: "Go to an app or location", textField: "name", isEffect: true), needsText: true),
+            .init(label: "Go to an app or location", action: .perform(tool: "go", input: [:], title: "Go to an app or location", textField: "name",
+                isEffect: true), needsText: true),
             readButton("Read app menu", tool: "menu", input: appName.map { ["app": .string($0)] } ?? [:]),
             .init(label: "Act by name or on a visual region", action: .configure(tool: "act", input: [:], title: "Act on the screen")),
             readButton("Look at desktop pixels", tool: "screen", input: ["pixels": .bool(true)]),
@@ -136,7 +144,8 @@ enum AgentWorkspaceApps {
         guard envelope["ok"] == .bool(true), output["available"] == .bool(true),
               let appName = string(app["bundle_id"]) ?? string(app["name"]),
               case .array(let paths)? = output["paths"] else {
-            return .init(title: "Computer menu", content: result, items: [], actions: [readButton("Look again", tool: "screen", input: ["structured": .bool(true)])])
+            return .init(title: "Computer menu", content: result, items: [], actions: [readButton("Look again", tool: "screen", input: ["structured": .bool(
+                true)])])
         }
         let items: [AgentWorkspaceItem] = paths.prefix(80).compactMap { value in
             let item = object(value)
@@ -165,18 +174,19 @@ enum AgentWorkspaceApps {
             guard case .string(let entry) = value else { continue }
             let isDirectory = entry.hasSuffix("/")
             let name = isDirectory ? String(entry.dropLast()) : entry
-            // Immediate children only; never turn a display entry into an
-            // absolute path, traversal, or an injected subpath.
+            // Immediate children only; never turn a display entry into an absolute path, traversal, or an injected subpath.
             guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else { continue }
             let child = URL(fileURLWithPath: path, isDirectory: true).appendingPathComponent(name).path
             let tool = isDirectory ? "list_dir" : "read_file"
             let arguments: [String: JSONValue] = isDirectory
                 ? ["path": .string(child), "max_entries": .int(12)]
                 : ["path": .string(child), "max_bytes": .int(12000)]
-            items.append(.init(title: name, content: .object(["path": .string(child), "kind": .string(isDirectory ? "folder" : "file")]), actions: [readButton(isDirectory ? "Open folder" : "Open file", tool: tool, input: arguments, title: (isDirectory ? "Folder: " : "File: ") + name)]))
+            items.append(.init(title: name, content: .object(["path": .string(child), "kind": .string(isDirectory ? "folder" : "file")]), actions: [readButton(
+                isDirectory ? "Open folder" : "Open file", tool: tool, input: arguments, title: (isDirectory ? "Folder: " : "File: ") + name)]))
         }
         var actions: [AgentWorkspaceButton] = [
-            .init(label: "Find a filename in this folder", action: .perform(tool: "list_dir", input: ["path": .string(path), "max_entries": .int(12)], title: "Find a filename", textField: "name_contains", isEffect: false), needsText: true),
+            .init(label: "Find a filename in this folder", action: .perform(tool: "list_dir", input: ["path": .string(path), "max_entries": .int(12)],
+                title: "Find a filename", textField: "name_contains", isEffect: false), needsText: true),
             .init(label: "Create a file named…", action: .createFile(directory: path), needsText: true),
         ]
         if row["has_more"] == .bool(true), case .object(let next)? = row["next"],
@@ -200,8 +210,7 @@ enum AgentWorkspaceApps {
               let sequence = integer(row["userSequence"]), sequence >= 0,
               let tab = integer(row["tabId"]), tab >= 0,
               case .array(let nodes)? = row["nodes"] else {
-            // Recovery stays with the exact selected tab. Never fall back to
-            // whichever tab happens to be current after a refused/stale read.
+            // Recovery must retain the selected tab, even when its read is refused or stale.
             let retry: [AgentWorkspaceButton] = integer(input["tab_id"]).map { tab in
                 var arguments: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
                 if input["scope"] == .string("main_content") { arguments["scope"] = .string("main_content") }
@@ -216,14 +225,16 @@ enum AgentWorkspaceApps {
                   states["disabled"] == .bool(false), states["blockedByModal"] != .bool(true),
                   case .array(let available)? = node["actions"] else { continue }
             let number = id.hasPrefix("n") ? String(id.dropFirst()) : id
-            let bound: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence), "snapshot_id": .string(snapshot), "node_id": .string(number)]
+            let bound: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence), "snapshot_id": .string(snapshot), "node_id"
+                : .string(number)]
             let name = string(node["name"]) ?? string(node["text"]) ?? "Page control"
             var buttons: [AgentWorkspaceButton] = []
             if available.contains(.string("click")) {
                 buttons.append(.init(label: "Click", action: .perform(tool: "browser.chrome_click", input: bound, title: name, textField: nil, isEffect: true)))
             }
             if available.contains(.string("fill")), states["editable"] == .bool(true) {
-                buttons.append(.init(label: "Fill", action: .perform(tool: "browser.chrome_fill", input: bound, title: name, textField: "value", isEffect: true), needsText: true))
+                buttons.append(.init(label: "Fill", action: .perform(tool: "browser.chrome_fill", input: bound, title: name, textField: "value",
+                    isEffect: true), needsText: true))
             }
             if available.contains(.string("select")) {
                 buttons.append(.init(label: "Choose an option", action: .configure(tool: "browser.chrome_select", input: bound, title: name)))
@@ -231,9 +242,7 @@ enum AgentWorkspaceApps {
             if !buttons.isEmpty { items.append(.init(title: name, content: value, actions: buttons)) }
         }
         var metadata = row
-        // Keep reading content/ancestry without sending every actionable node
-        // twice. The full control record is already in its item; non-actionable
-        // text, containers and disabled controls remain reading evidence.
+        // Keep full controls only in their items to avoid duplicate output; non-actionable nodes remain reading evidence.
         let projectedIDs = Set(items.compactMap { string(object($0.content)["nodeId"]) })
         metadata["nodes"] = .array(nodes.filter { value in
             guard let id = string(object(value)["nodeId"]) else { return true }
@@ -242,7 +251,10 @@ enum AgentWorkspaceApps {
         metadata["workspace_actionable_count"] = .int(Int64(items.count))
         if object(row["rendering"] ?? .null)["loaded"] == .bool(false) {
             metadata["workspace_state"] = .string("loading")
-            metadata["workspace_detail"] = .string("This is the page observed while it is still loading. Read page again for more; opening the tab is not proof that search results or replies have finished loading.")
+            metadata["workspace_detail"] = .string("""
+                This is the page observed while it is still loading. Read page again for more; opening the tab is not proof that search results or replies \
+                have finished loading.
+                """)
         }
         var current: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
         let reading = object(row["reading"] ?? .null)
@@ -260,17 +272,18 @@ enum AgentWorkspaceApps {
             readingActions.append(readButton("Read main content", tool: "browser.chrome_snapshot", input: main))
         }
         let navigation: [String: JSONValue] = ["tab_id": .int(tab), "expected_user_sequence": .int(sequence)]
-        // Page scrolling deliberately omits node/snapshot IDs; the owner binds
-        // the exact tab and refuses a changed user sequence. These are effects
-        // even though they only move the viewport, so Back never scrolls again.
+        // Page scrolling deliberately omits node/snapshot IDs; the owner binds the exact tab and refuses a changed user sequence. These are effects even though
+        // they only move the viewport, so Back never scrolls again.
         let pageDown = navigation.merging(["delta_x": .int(0), "delta_y": .int(700)]) { _, new in new }
         let pageUp = navigation.merging(["delta_x": .int(0), "delta_y": .int(-700)]) { _, new in new }
         return .init(title: string(row["title"]) ?? "Browser page", content: .object(metadata), items: items, actions: readingActions + [
             readButton("Read page again", tool: "browser.chrome_snapshot", input: current),
-            .init(label: "Go to a website", action: .perform(tool: "browser.chrome_navigate", input: navigation, title: "Go to a website", textField: "url", isEffect: true), needsText: true),
+            .init(label: "Go to a website", action: .perform(tool: "browser.chrome_navigate", input: navigation, title: "Go to a website", textField: "url",
+                isEffect: true), needsText: true),
             .init(label: "Page down", action: .perform(tool: "browser.chrome_scroll", input: pageDown, title: "Page down", textField: nil, isEffect: true)),
             .init(label: "Page up", action: .perform(tool: "browser.chrome_scroll", input: pageUp, title: "Page up", textField: nil, isEffect: true)),
-            .init(label: "Scroll a precise amount or container", action: .configure(tool: "browser.chrome_scroll", input: navigation, title: "Scroll a precise amount or container")),
+            .init(label: "Scroll a precise amount or container", action: .configure(tool: "browser.chrome_scroll", input: navigation,
+                title: "Scroll a precise amount or container")),
         ])
     }
 
@@ -278,6 +291,7 @@ enum AgentWorkspaceApps {
         .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
     }
     private static func object(_ value: JSONValue) -> [String: JSONValue] { if case .object(let row) = value { return row }; return [:] }
-    private static func string(_ value: JSONValue?) -> String? { guard case .string(let text)? = value, !text.isEmpty, text.count <= 8192 else { return nil }; return text }
+    private static func string(_ value: JSONValue?) -> String? { guard case .string(let text)? = value, !text.isEmpty, text.count <= 8192 else { return nil };
+        return text }
     private static func integer(_ value: JSONValue?) -> Int64? { guard case .int(let number)? = value else { return nil }; return number }
 }

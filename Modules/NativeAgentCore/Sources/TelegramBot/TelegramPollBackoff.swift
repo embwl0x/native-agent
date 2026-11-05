@@ -1,5 +1,3 @@
-// Poll retries use a 1s base/60s cap; menu sync uses a 5s base/300s cap.
-// Both double with ±20% jitter clamped to the cap and reset on success.
 
 import Foundation
 import Darwin
@@ -7,7 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import BackgroundLoops
 
-// Blueprint: | `TelegramPollBackoff.swift` | `TelegramExponentialBackoff` and `TelegramErrorLog`: poll/menu failure cadence and locked bounded error-log rotation |
+// Blueprint: | `TelegramPollBackoff.swift` | `TelegramExponentialBackoff`, `TelegramErrorLog`: bounded locked rotation |
 
 // MARK: - TelegramExponentialBackoff
 
@@ -25,15 +23,11 @@ public actor TelegramExponentialBackoff {
         self.policy = LoopFailureBackoffPolicy(baseDelay: baseDelay, maxDelay: maxDelay)
     }
 
-    /// True when no failure window is open (never failed, or the deadline
-    /// from the last recorded failure has passed).
     public func shouldAttempt() -> Bool {
         guard let nextAttemptAt else { return true }
         return Date() >= nextAttemptAt
     }
 
-    /// Record one failed attempt; arms the next deadline and returns the
-    /// delay that was applied (post-jitter, post-clamp).
     @discardableResult
     public func recordFailure() -> TimeInterval {
         consecutiveFailures += 1
@@ -42,7 +36,6 @@ public actor TelegramExponentialBackoff {
         return delay
     }
 
-    /// One success resets the curve: counter to zero, no open window.
     public func recordSuccess() {
         consecutiveFailures = 0
         nextAttemptAt = nil

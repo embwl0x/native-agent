@@ -2,7 +2,7 @@ import Foundation
 import Experiences
 import PersistenceCore
 
-// Blueprint: | `CognitiveCare.swift` | Care stance, relationships, depth, optional stance-pressure and applied-gap-closure evidence and bounded lived story; merging unions retained history, birth identities and folded movement witnesses, with durable donor-to-survivor links |
+// Blueprint: | `CognitiveCare.swift` | Care stance, relationships, depth and bounded story; durable merge links retain movement evidence |
 /// A care holds stance, relationships, depth, open questions and lived story; charge is derived from the story.
 public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
     /// How deep it runs, which sets how long a feeling about it lasts.
@@ -18,7 +18,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
             }
         }
     }
-    /// What she thinks or wants about it. A care with a stance is an opinion.
+    /// A stance makes a care an opinion.
     public struct Stance: Sendable, Equatable, Codable {
         public var text: String
         public var because: String
@@ -38,22 +38,20 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
         public var to: Depth
         public init(from: Depth, to: Depth) { self.from = from; self.to = to }
     }
-    /// One time it moved her: a pointer to what really happened (`source`:
-    /// `exchange:<session>/<turn>` or a memory id), never a second copy of it.
+    /// One time it moved the agent: a pointer to what really happened (`source`: `exchange:<session>/<turn>` or a memory id), never a second copy of it.
     public struct Moment: Sendable, Equatable, Codable {
         public var at: Date
-        /// -1...1: away from or toward what she cares about.
+        /// -1...1: away from or toward what the agent cares about.
         public var moved: Double
         public var by: Mover
-        /// The person key when `by` is them.
         public var who: String?
         public var felt: String
         public var note: String
         public var source: String
         public var depthChange: DepthChange?
-        /// A proposed change, held as evidence until her night confirms it.
+        /// A proposed change, held as evidence until the agent's night confirms it.
         public var stancePressure: Stance?
-        /// This moment actually closed an open gap; absent in older stories.
+        /// Only an observed gap closure counts as evidence.
         public var closedGap: Bool?
 
         public init(at: Date, moved: Double, by: Mover, who: String? = nil, felt: String, note: String,
@@ -76,9 +74,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
         public var count: Int
         public var sumMoved: Double
         public var since: Date
-        /// Distinct local movement-day witnesses. Merges union these days;
-        /// future folding keeps that evidence. nil is a legacy fold with no
-        /// surviving evidence.
+        /// Merge and folding retain distinct movement days; nil carries no surviving evidence.
         public var movedDays: [Date]?
 
         public init(count: Int, sumMoved: Double, since: Date, movedDays: [Date]? = nil) {
@@ -107,7 +103,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
     }
     public var id: UUID
     public var about: String
-    /// Person keys it is held between; empty means hers alone.
+    /// Person keys it is held between; empty means the agent's alone.
     public var with: [String]
     public var depth: Depth
     public var stance: Stance?
@@ -118,19 +114,14 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
     public var origin: Origin
     public var createdAt: Date
     public var updatedAt: Date
-    /// When the night faded it (never moved within its depth's horizon). It
-    /// stays in the store and is not shown or read as live; an ordinarily
-    /// faded care comes back when touched. Merged donors follow their survivor.
+    /// When the night faded it (never moved within its depth's horizon). It stays in the store and is not shown or read as live; an ordinarily faded care comes
+    /// back when touched. Merged donors follow their survivor.
     public var fadedAt: Date?
-    /// A merged donor never revives independently; later moments and evidence
-    /// follow this care to its survivor (which may itself merge later).
+    /// A merged donor never revives independently; later moments and evidence follow this care to its survivor (which may itself merge later).
     public var mergedInto: UUID?
-    /// The fold seq of the last lived moment that moved this care. Stamped once
-    /// per moment after all of that moment's judgments are applied, and saved
-    /// in the care's own row. nil: none (or a row an older binary wrote).
+    /// Stamped once after all judgments for a moment apply; nil carries no recorded fold.
     public var lived: UInt64?
-    /// Stable moment/ordinal birth identities that moved this care by meaning.
-    /// Refolding follows the original target even after its words have changed.
+    /// Stable moment/ordinal birth identities that moved this care by meaning. Refolding follows the original target even after its words have changed.
     public var birthIDs: [UUID]?
 
     static func survivorID(for id: UUID, among cares: [UUID: Self]) -> UUID? {
@@ -140,10 +131,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
             guard let marker = care.story.last(where: {
                 $0.by == .her && $0.moved == 0 && $0.felt == "came together" && $0.note.hasPrefix("became part of ")
             }) else { return current }
-            // Before mergedInto, the donor named the survivor in this exact
-            // bounded note. Join it to the survivor's same-night merge entry,
-            // not merely another care whose words happen to match. Ambiguous
-            // or missing evidence cannot authorize undoing that merge.
+            // Match the donor's bounded note to the survivor's same-night entry; missing or ambiguous evidence cannot authorize undoing a merge.
             let survivors = cares.values.filter { candidate in
                 candidate.id != care.id && Set(candidate.with) == Set(care.with)
                     && marker.note == String("became part of \(candidate.about)".prefix(Self.noteCharacters))
@@ -167,10 +155,8 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
     public static let storyMovements = 24
     /// Notes get the same recent-history window, independently of movements.
     public static let storyNotes = storyMovements
-    /// Pressure keeps distinct proposals across days, so within-day volume
-    /// cannot consume the evidence needed for a life's 14-day span.
+    /// Pressure keeps distinct proposals across days, so within-day volume cannot consume the evidence needed for a life's 14-day span.
     public static let stancePressureDays = 24
-    /// The owner's person key.
     public static let ownerKey = "owner"
 
     public init(id: UUID, about: String, with: [String] = [], depth: Depth, stance: Stance? = nil,
@@ -195,9 +181,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
             sum + moment.moved * pow(0.5, max(0, now.timeIntervalSince(moment.at)) / halfLife)
         }
     }
-    /// Place one moment in time order (a backdated one goes where it
-    /// happened). Past the newest `storyMovements` movements the oldest folds
-    /// into `folded`; zero-movement notes have their own window and depth changes never fold.
+    /// Backdated movements retain time order; only movements beyond `storyMovements` fold. Notes have their own bound; depth changes never fold.
     public mutating func record(_ moment: Moment) {
         story.insert(moment, at: story.lastIndex(where: { $0.at <= moment.at }).map { $0 + 1 } ?? 0)
         updatedAt = max(updatedAt, moment.at)
@@ -208,8 +192,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
             let dates = (folded?.movedDays ?? []) + [gone.at]
             let days = Dictionary(dates.map { (calendar.startOfDay(for: $0), $0) },
                                   uniquingKeysWith: max).values.sorted()
-            // A lifetime tally saturates at its representable maximum; it is
-            // descriptive evidence, never a reason to stop recording a care.
+            // A lifetime tally saturates at its representable maximum; it is descriptive evidence, never a reason to stop recording a care.
             let count = folded?.count ?? 0
             folded = Folded(count: count < Int.max ? count + 1 : Int.max, sumMoved: (folded?.sumMoved ?? 0) + gone.moved,
                             since: min(folded?.since ?? gone.at, gone.at),
@@ -219,8 +202,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
               let oldest = story.firstIndex(where: { $0.depthChange == nil && $0.moved == 0 && $0.stancePressure == nil && $0.felt != "changed my mind" }) {
             story.remove(at: oldest)
         }
-        // Only exact same-day proposals are redundant. The dream, never this
-        // compactor, decides whether different proposals point the same way.
+        // Only exact same-day proposals are redundant. The dream, never this compactor, decides whether different proposals point the same way.
         let calendar = Calendar.current
         var daily: [Date: [Stance]] = [:]
         for index in story.indices.reversed() {
@@ -237,8 +219,7 @@ public struct CognitiveCare: Sendable, Equatable, Identifiable, Codable {
         }
     }
 
-    /// A merge loses no retained movement. Subsequent recording uses the normal
-    /// story bounds and folds movement days rather than discarding their evidence.
+    /// A merge loses no retained movement. Subsequent recording uses the normal story bounds and folds movement days rather than discarding their evidence.
     mutating func absorbHistory(of other: Self) {
         story = (story + other.story).sorted { $0.at < $1.at }
         if let incoming = other.folded {

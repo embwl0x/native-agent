@@ -20,11 +20,11 @@ import MultimodalTTS
 import SystemOps
 import TelegramBot
 import DeviceSync
-// Blueprint: | `AppModel+PanelRefresh.swift` | `AppModel`: per-panel `LatestRead` and freshness receipts; Activity and sidebar share one ordered badge read of engine-owned sources without claiming unrelated refreshes |
+// Blueprint: | `AppModel+PanelRefresh.swift` | `AppModel`, `LatestRead`: Ordered panel reads and shared activity badges |
 
 @MainActor
 extension AppModel {
-    // Per-panel LatestRead receipts identify failed endpoints while retaining other successful reads.
+    // Retain successful reads while per-panel LatestRead receipts identify failed endpoints.
     @MainActor
     @discardableResult
     func refreshForSidebarItem(_ item: SidebarItem) async -> PanelRefreshStatus {
@@ -45,13 +45,13 @@ extension AppModel {
         var failedEndpoints: [String] = []
         // Branches that perform no read must not claim refreshed data.
         var performedRead = true
-        /// Retain displayed values and record each unavailable endpoint.
+        /// Retain displayed values while recording unavailable endpoints.
         func fresh<T>(_ endpoint: String, _ value: T?) -> T? {
             if value == nil { failedEndpoints.append(endpoint) }
             return value
         }
 
-        // Navigation fetches page data; refreshAll and each health consumer own their health reads.
+        // Navigation fetches page data; health reads belong to refreshAll and each health consumer.
         switch item {
         case .chat:
             if !(await loadProvidersForChat()) { failedEndpoints.append("providers") }
@@ -59,15 +59,16 @@ extension AppModel {
             await reloadChatState()
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
             _ = fresh("personality", try? await persona.loadDocuments())
-            // Load the profile on Chat entry so every name comes from its owner.
+            // Load the profile on Chat entry so names come from their owner.
             if persona.profile == nil {
                 _ = fresh("personality profile", try? await persona.loadProfile())
                 teachMemoryHygieneName(previousName: previousName)
             }
-        case .desk, .bots:
-            // Nothing is read here, so nothing is said about freshness below.
+        case .bots:
+            if !(await engine.contactThreads.refreshHelpers()) { failedEndpoints.append("helpers") }
+        case .desk:
+            // No read means no freshness claim.
             performedRead = false
-            // DeskPageView, SchedulerView and ResearchView own their bounded reads.
             break
         case .memories, .knowledge:
             async let nextMemories = try? memory.refreshMemories()
@@ -86,8 +87,7 @@ extension AppModel {
             )
             _ = fresh("memories", memoryRows)
             if memoryRows != nil, let query = memory.searchQuery, query.count >= 3 {
-                // Even an unchanged newest-200 list can hide a changed older
-                // search hit. Ask the search owner again on every successful read.
+                // Even unchanged newest-200 rows can conceal a changed older search hit; refresh search after every successful read.
                 await memory.search(query: query)
             }
             _ = fresh("memory proposals", proposalRows)
@@ -98,7 +98,13 @@ extension AppModel {
         case .connectors:
             _ = fresh("connectors", try? await engine.connectors.refresh().get())
             _ = fresh("shared folders", try? await engine.connectors.refreshWorkspaces())
-        case .settings, .providers, .telegram, .inboxPolicy, .macIntegration:
+        case .providers:
+            switch await engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause) {
+            case .loaded(let settings):
+                if settings.catalogError != nil { failedEndpoints.append("model catalog") }
+            case .failed: failedEndpoints.append("providers")
+            }
+        case .settings, .telegram, .inboxPolicy, .macIntegration:
             async let nextConfig: Void? = try? RuntimeReadouts.configuration(engine: engine)
             async let nextTelegramStatus = try? engine.telegram.refresh(manager: backgroundLoopsManager)
             async let nextConnectors = try? engine.connectors.refresh().get()
@@ -113,62 +119,40 @@ extension AppModel {
         case .activity:
             let badgeReceipt = await refreshSidebarActivityBadge()
             failedEndpoints += badgeReceipt.failedEndpoints
-            // LatestRead is main-actor owned: read it here, not in an async let child task.
+            // Read main-actor-owned LatestRead here; an async let child cannot access it.
             let nextMisses = await missLessonsRead.read({ await MemoryRecoveryReadout.recentMisses(dataRoot: engine.dataRoot) }, publish: { rows in
                 if let rows { missLessons = rows }
             })
             _ = fresh("misses", nextMisses)
         case .capabilities:
-            async let nextSkills = try? toolStore.refreshSkills()
-            async let nextTools = try? toolStore.listAuthored()
-            async let nextApprovals = try? approvalStore.list()
             async let nextCatalog = engine.trust.refreshCapabilityCatalog()
             async let nextWorkflows: Void? = try? engine.desk.refreshWorkflows()
             async let nextNativePower = toolStore.refreshNativePower()
-            async let nextMemoryStatus = memory.refreshStatuses()
             async let nextHardening = engine.doctor.refreshHardening()
-            async let nextTraces: Void = engine.turns.refreshCapabilityTraces()
-            async let nextConnectorActionRegistry = try? engine.connectors.refreshActions()
-            async let nextGraph: Void = engine.memory.loadGraph()
-            let (
-                skillRows,
-                toolRows,
-                approvalRows,
-                connectorActionRegistryRow,
-                _
-            ) = await (
-                nextSkills,
-                nextTools,
-                nextApprovals,
-                nextConnectorActionRegistry,
-                nextGraph
-            )
-            let (_, workflowRead, _, _, _, _) = await (
-                nextCatalog, nextWorkflows, nextNativePower, nextMemoryStatus, nextHardening, nextTraces)
+            async let nextConnectorActions = try? engine.connectors.refreshActions()
+            async let nextTrust = try? engine.trust.load()
+            let (_, workflowRead, _, _, connectorRead, trustRead) = await (
+                nextCatalog, nextWorkflows, nextNativePower, nextHardening, nextConnectorActions, nextTrust)
             failedEndpoints += engine.trust.catalogRefresh?.failedEndpoints ?? []
-            _ = fresh("workflows", workflowRead)
             failedEndpoints += toolStore.nativePowerRefresh?.failedEndpoints ?? []
-            failedEndpoints += memory.statusRefresh?.failedEndpoints ?? []
             failedEndpoints += engine.doctor.hardeningRefresh?.failedEndpoints ?? []
-            _ = fresh("skills", skillRows)
-            _ = fresh("tools", toolRows)
-            _ = fresh("approvals", approvalRows)
-            _ = fresh("connector actions", connectorActionRegistryRow)
+            _ = fresh("workflows", workflowRead)
+            _ = fresh("connector actions", connectorRead)
+            _ = fresh("trust policy", trustRead)
+            await engine.pages.refresh(page: "capabilities")
         case .dreams:
-            // The Dreams tab fetches its diary itself; refresh the trust policy
-            // here so the REM toggle (trainingPolicy.rem_cycle_enabled) reflects
-            // current state on tab entry.
+            // Refresh Trust on Dreams entry so the REM switch reflects the saved policy; the tab owns its diary read.
             _ = fresh("trust policy", try? await engine.trust.load())
         case .cognition:
             performedRead = false
         case .skills:
             _ = fresh("skills", try? await toolStore.refreshSkills())
         case .diagnostics:
-            // Diagnostics reads Doctor's activity projection and the run ledger.
+            await refreshLiveDoctorCoverage()
+            await engine.refreshDiagnosticsLivingStatus()
             async let nextActivity: Void? = try? engine.doctor.refreshActivity()
             async let nextRuns = try? engine.runs.refresh(dataRoot: engine.dataRoot)
             async let nextWatchdog = engine.doctor.refreshWatchdog(manager: backgroundLoopsManager)
-            // Diagnostics owns the runtime health read.
             await engine.doctor.refreshHealth()
             let (activityRows, runRows, watchdogRow) = await (
                 nextActivity,
@@ -201,9 +185,7 @@ extension AppModel {
         case .tools:
             async let nextTools = try? toolStore.listAuthored()
             async let nextConnectorActions = try? engine.connectors.refreshActions()
-            // Tools renders the current catalog *and* its Full Mac lifecycle
-            // explanation. Refresh the Trust policy in the same pass so an
-            // expired/unreadable window is never flattened into "off".
+            // Refresh Trust with the tool catalog so an unavailable policy cannot render as off.
             async let nextTrustPolicy = try? engine.trust.load()
             let (toolRows, connectorRows, trustPolicyRow) = await (
                 nextTools,
@@ -217,7 +199,6 @@ extension AppModel {
                 failedEndpoints.append("tool catalog")
             }
         case .inspector:
-            // Turn Inspector owns live TurnTraceBus events and persisted turn_traces JSONL replay.
             performedRead = false
         }
         return (Self.nextRefreshStatus(previous: panelRefreshStatus[item],
@@ -225,7 +206,7 @@ extension AppModel {
         }, publish: { result in
         let (receipt, performedRead) = result
         panelRefreshStatus[item] = receipt
-        // Only Diagnostics reads runtime health; other pages report their own reads.
+        // Health belongs to Diagnostics; other pages report only their own reads.
         if item.normalized == .diagnostics {
             statusText = engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable"
         } else if !performedRead {
@@ -254,34 +235,32 @@ extension AppModel {
         )
     }
 
-    /// Store only changed failure lists for readers of `isStale`; panel timestamps remain live.
+    /// Only changed failure lists invalidate isStale readers; timestamps remain live.
     static func staleFlagOnlyStatusToStore(
         previous: PanelRefreshStatus?,
         failedEndpoints: [String],
         at now: Date
     ) -> PanelRefreshStatus? {
-        // Nil means loading, so the first receipt always publishes.
+        // Nil means loading, so the first receipt must publish.
         guard let previous else {
             return nextRefreshStatus(previous: nil, failedEndpoints: failedEndpoints, at: now)
         }
-        // A changed failure set is a changed outcome even while still stale.
+        // A changed failure set is a changed outcome even while stale.
         guard previous.failedEndpoints == failedEndpoints else {
             return nextRefreshStatus(previous: previous, failedEndpoints: failedEndpoints, at: now)
         }
         return nil
     }
 
-    /// One user-facing sentence naming what could not be reached and how old
-    /// the displayed data is, or nil when the last refresh was clean.
+    /// Name failed endpoints and retained-data age so stale values cannot imply a successful read.
     @MainActor
     func panelStaleNotice(for item: SidebarItem) -> String? {
         guard let status = panelRefreshStatus[item], status.isStale else { return nil }
-        // Endpoint names are internal vocabulary; the user-facing sentence
-        // stays plain (same rule as DetachedChatLoadFailureCopy).
+        // Translate internal endpoint names into plain user-facing vocabulary.
         guard let lastSuccess = status.lastSuccessAt else {
-            // The provider reads failing with none connected is that cause;
-            // anything else failed for its own reason, which is not named here.
-            return Set(status.failedEndpoints).isSubset(of: ["providers", "model catalog"]) && engine.providers.settings != nil && !engine.providers.hasReadyConnection
+            // Name missing providers only when that is the recorded cause; other failures retain their own scope.
+            return Set(status.failedEndpoints).isSubset(of: ["providers", "model catalog"]) && engine.providers.settings != nil
+                && !engine.providers.hasReadyConnection
                 ? "Nothing has loaded yet this session: no AI provider is connected. Connect one in Providers."
                 : "Nothing has loaded yet this session: the last read failed."
         }
@@ -289,8 +268,7 @@ extension AppModel {
         return "Showing data from \(age) — some information couldn't be refreshed."
     }
 
-    /// Coarse, dependency-free relative age. Deliberately vague: the point is
-    /// "this is not current", not a precise duration.
+    /// Coarse age communicates staleness without implying precise timing.
     static func approximateAgeDescription(since: Date, now: Date) -> String {
         let seconds = max(0, now.timeIntervalSince(since))
         if seconds < 60 { return "moments ago" }
@@ -317,7 +295,7 @@ extension AppModel {
             nextInbox,
             nextMemoryProposals
         )
-        // Approval, inbox and pending proposal reads publish through their owners.
+        // Approval, inbox and proposal reads must publish through their owners.
         var failed: [String] = []
         if approvalRows == nil { failed.append("approvals") }
         if inboxRows == nil { failed.append("inbox") }
@@ -335,7 +313,10 @@ extension AppModel {
             at: receipt.lastAttemptAt
         ) {
             sidebarActivityRefreshStatus = nextStatus
-            ModuleLog.app("[sidebar-activity] published attempt=\(receipt.lastAttemptAt.timeIntervalSince1970) failed_endpoints=\(receipt.failedEndpoints.joined(separator: ","))")
+            ModuleLog.app("""
+                [sidebar-activity] published attempt=\(receipt.lastAttemptAt.timeIntervalSince1970) \
+                failed_endpoints=\(receipt.failedEndpoints.joined(separator: ","))
+                """)
         }
         })
         await publishWorkStatus()

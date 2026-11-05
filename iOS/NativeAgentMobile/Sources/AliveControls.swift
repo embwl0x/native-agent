@@ -4,9 +4,7 @@ import NativeAgentShared
 import UIKit
 // Blueprint: | `AliveControls.swift` | Status lights, actions, search, glass controls and haze swatches |
 
-/// The agent's small light, always in the haze colour: steady when here, a
-/// stronger glow while working or while something waits on you (the Mac rule:
-/// "needs you" follows the haze), grey when the Mac cannot be reached.
+/// Reserve haze for presence, work and decisions; unreachable Macs use grey.
 struct AliveStatusDot: View {
     enum State { case here, working, waiting, away }
     let state: State
@@ -26,20 +24,8 @@ struct AliveStatusDot: View {
     }
 }
 
-/// "Working": a small pulsing dot in the haze colour.
-struct HazePulse: View {
-    @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        PulsingDot(color: HazeColor(stored: colorRaw).control(dark: colorScheme == .dark, labelled: false), size: 7)
-            .accessibilityHidden(true)
-    }
-}
-
 // MARK: - States and actions
 
-/// "Waiting on you": a haze dot sat on the first line's baseline.
 struct AliveWaitingDot: View {
     @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
     @Environment(\.colorScheme) private var colorScheme
@@ -55,7 +41,7 @@ struct AliveWaitingDot: View {
     }
 }
 
-/// Empty, unpaired, syncing: a serif line, one sentence, at most one way on.
+/// Empty, unpaired and syncing states offer at most one recovery action.
 struct AliveCalmState: View {
     let title: String
     let line: String
@@ -93,19 +79,17 @@ struct AliveCalmState: View {
 }
 
 extension View {
-    /// The one primary action: a capsule filled with the haze's deep shade,
-    /// where a white label clears 5:1.
+    /// The primary action uses the deep haze shade so its white label clears 5:1.
     func alivePrimaryButton() -> some View {
         buttonStyle(.borderedProminent).buttonBorderShape(.capsule).hazeTinted(labelled: true)
     }
 
-    /// Every other action: a quiet neutral capsule.
+    /// Keep secondary actions neutral so the primary action retains emphasis.
     func aliveSecondaryButton() -> some View {
         buttonStyle(.bordered).buttonBorderShape(.capsule).tint(AlivePalette.text)
     }
 }
 
-/// Buttons in a row at their own width; a column when they cannot fit.
 struct AliveActionRow<Content: View>: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     @ViewBuilder var content: () -> Content
@@ -124,15 +108,13 @@ struct AliveActionRow<Content: View>: View {
     }
 }
 
-/// A quiet track, the chosen side washed in the haze (its one job here is
-/// "selected").
+/// Reserve the haze wash for the selected segment.
 struct AliveSegmentedPicker<Value: Hashable>: View {
     @Binding var selection: Value
     let options: [Value]
     let title: (Value) -> String
 
     var body: some View {
-        // Use the native segmented control.
         Picker("", selection: $selection) {
             ForEach(options, id: \.self) { Text(title($0)).tag($0) }
         }
@@ -141,7 +123,7 @@ struct AliveSegmentedPicker<Value: Hashable>: View {
     }
 }
 
-/// The floating search: glass, because it is a control over the list.
+/// Floating search uses glass because it sits over content.
 struct AliveSearchField: View {
     let prompt: String
     @Binding var text: String
@@ -171,8 +153,7 @@ struct AliveSearchField: View {
     }
 }
 
-/// A page-level note under the header, in secondary text: what is true, and
-/// at most one quiet way on. The snapshot freshness note wears it.
+/// Page notes state one fact and offer at most one recovery action.
 struct AliveStatusNote: View {
     var systemImage = "clock"
     let text: String
@@ -197,7 +178,6 @@ struct AliveStatusNote: View {
     }
 }
 
-/// A page note's one way on, alone or under the note's sentence.
 struct AliveNoteAction: View {
     let title: String
     var hint: String? = nil
@@ -218,20 +198,17 @@ struct AliveNoteAction: View {
 // MARK: - Glass for floating controls
 
 extension View {
-    /// Liquid Glass on the functional layer only (composer, floating buttons).
-    /// Uses `.regular` glass, with opaque chrome for Reduce Transparency.
-    /// Never put this on content or on something already sitting on glass.
+    /// Glass belongs only to floating controls; Reduce Transparency needs opaque chrome. Never layer glass on content or glass.
     func aliveGlass<S: Shape>(in shape: S, interactive: Bool = false, tint: Color? = nil) -> some View {
         modifier(AliveGlass(shape: shape, interactive: interactive, tint: tint))
     }
 
-    /// Keep the navigation title for VoiceOver and the app switcher, but do
-    /// not draw it: the page's serif header says it.
+    /// Retain the navigation title for VoiceOver and the app switcher; the visible serif header already names the page.
     @ViewBuilder func aliveHiddenTitle() -> some View {
         toolbar(removing: .title)
     }
 
-    /// Tint ONE control with the chosen haze. Per control, never a page.
+    /// Apply haze tint per control so a page cannot tint unrelated content.
     func hazeTinted(labelled: Bool = false) -> some View { modifier(HazeControlTint(labelled: labelled)) }
 }
 
@@ -268,7 +245,6 @@ private struct HazeControlTint: ViewModifier {
     }
 }
 
-/// The seven haze swatches, the chosen one ringed. Same palette as the Mac.
 struct HazeSwatches: View {
     @MainActor static var settingControl: PhoneLocalSetting {
         PhoneLocalSetting(id: "phone.haze_color", label: "iPhone haze", type: "choice",
@@ -278,9 +254,9 @@ struct HazeSwatches: View {
                     throw PhoneLocalSetting.failure("The saved iPhone haze is invalid. Choose a haze in iPhone NativeAgent Settings.")
                 }
                 return raw
-            }, write: { raw in
+            }, write: { raw, authority in
                 guard HazeColor.allCases.contains(where: { $0.rawValue == raw }) else { throw PhoneLocalSetting.failure("Choose a listed haze.") }
-                try PhoneSettingWrite.check()
+                try authority.check()
                 UserDefaults.standard.set(raw, forKey: HazeColor.key)
             })
     }

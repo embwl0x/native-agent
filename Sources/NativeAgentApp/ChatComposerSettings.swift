@@ -16,7 +16,6 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `ChatComposerSettings.swift` | Native composer menus and context receipt: keyboard access and shared routing/actions |
 
-/// Composer controls share native menus and a context receipt.
 enum ChatComposerCard: String, Hashable, CaseIterable {
     case model, effort = "think", trust, context
 }
@@ -26,20 +25,16 @@ struct ComposerSessionRefresh: ViewModifier {
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     let sessionID: String
     var live = true
-    @AppStorage(ChatSessionAutocompactionConfig.contextWindowModeKey) private var windowMode = "model"
-    @AppStorage(ChatSessionAutocompactionConfig.defaultsKey) private var windowSize = 200_000
-    @AppStorage(ChatSessionAutocompactionConfig.compactionPercentKey) private var compactionPercent = ChatSessionAutocompactionConfig.defaultCompactionPercent
 
     func body(content: Content) -> some View {
-        content.quietReadTask(id: "\(sessionID):\(windowMode):\(windowSize):\(compactionPercent):\(live)") {
+        content.quietReadTask(id: "\(sessionID):\(live)") {
             if quietOffscreenRead { await appModel.engine.providers.refreshSession(sessionID) }
             else if live { await appModel.engine.providers.observeSession(sessionID) }
         }
     }
 }
 
-/// The three words on the composer row. Observes routing and policy here,
-/// never in the draft or transcript owner.
+/// Observe routing and policy here so changes do not invalidate draft or transcript owners.
 struct ChatComposerSettings: View {
     @Environment(AppModel.self) var appModel
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
@@ -48,9 +43,8 @@ struct ChatComposerSettings: View {
 
     private var routing: QuietComposerCommands.Routing { .init(appModel: appModel) }
 
-    /// Bumped by the draft when Tab should move into the words.
     var focusWordToken: Int
-    /// The hand-back shows only while it would do something.
+    /// Show hand-back only when it can act.
     @State private var handoffWouldChange = false
     @State private var handoffProblem: String?
     @AppStorage(ShotgunController.enabledKey) private var shotgunEnabled = true
@@ -61,8 +55,7 @@ struct ChatComposerSettings: View {
         self.focusWordToken = focusWordToken
     }
 
-    /// The local Tab ring. The window-wide order skips plain buttons, so the
-    /// three words walk themselves and hand Tab back at either end.
+    /// Walk the local Tab ring because window-wide ordering skips plain buttons; hand focus back at either end.
     private static let ring: [ChatComposerCard] = [.context, .model, .effort, .trust]
 
     var body: some View {
@@ -73,8 +66,7 @@ struct ChatComposerSettings: View {
                     .accessibilityLabel(handoffProblem)
                     .padding(.trailing, 12)
             }
-            // Only while it would change something: a Mac action wants the
-            // driver, User holds it, and the posture is below Full Mac.
+            // Offer hand-back only below Full Mac when a Mac action needs the driver held by the user.
             if handoffWouldChange {
                 Button("Let \(appModel.agentDisplayName) use the Mac") {
                     guard let generation = MacAttentionSessionStore.shared.userHandoffGeneration() else { return }
@@ -85,17 +77,20 @@ struct ChatComposerSettings: View {
                 .padding(.trailing, 12)
                 .help("Your mouse or keyboard took the Mac back. Control stays yours until you hand it back here.")
             }
-            // Shotgun moves this window aside while the agent drives the Mac.
+            // Move this window aside while the agent drives so it does not obstruct the target.
             Toggle("Shotgun", isOn: $shotgunEnabled)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .font(ShellType.label)
                 .foregroundStyle(NativeAgentShell.text.opacity(0.85))
-                .help("On: when I start driving the Mac, this window steps aside into Shotgun, a small chat you can keep typing in. Off: I work in the background and this window stays put. Its shortcut (Settings) or View ▸ Show Shotgun shows it either way.")
+                .help("""
+                    On: when I start driving the Mac, this window steps aside into Shotgun, a small chat you can keep typing in. Off: I work in the \
+                    background and this window stays put. Its shortcut (Settings) or View ▸ Show Shotgun shows it either way.
+                    """)
                 .accessibilityIdentifier("chat.composer.shotgun")
             Spacer(minLength: 0)
 
-            // Fast leads the trailing cluster to keep other controls fixed; bot Fast settings open Bots.
+            // Keep Fast first in the trailing cluster so other controls stay fixed.
             if routing.fastIsOn {
                 Button {
                     guard let presentation = routing.presentation else { return }
@@ -116,22 +111,19 @@ struct ChatComposerSettings: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.trailing, 10)
-                .help(routing.isBotConversation ? "Fast is on for this bot. Edit it in Bots." : "Fast is on. Click to turn it off.")
+                .help(routing.isBotConversation ? "Fast is on for this helper. Tell me in chat to change it." : "Fast is on. Click to turn it off.")
                 .accessibilityIdentifier("chat.composer.fast")
                 .accessibilityLabel("Fast is on")
-                .accessibilityHint(routing.isBotConversation ? "Opens Bots" : "Turns Fast off")
+                .accessibilityHint(routing.isBotConversation ? "Opens Helpers" : "Turns Fast off")
             }
 
-            // How full the context is, at a glance — and the receipt behind
-            // it: click the ring and the last turn's assembled context opens
-            // in a native popover above the ring.
+            // Keep the last assembled context receipt reachable from its usage ring.
             contextRing
 
             separator
 
             modelMenuWord
-            // At most 220, but no wider than the name: a greedy frame held
-            // the ring out in the middle of the bar.
+            // Cap width at the name and 220pt so the ring cannot drift into the middle of the bar.
             .frame(maxWidth: 220, alignment: .trailing)
             .fixedSize(horizontal: true, vertical: false)
 
@@ -141,8 +133,8 @@ struct ChatComposerSettings: View {
                 word(
                     .effort,
                     text: routing.effortWord,
-                    help: "This conversation uses its bot's own thinking level. Edit it in Bots.",
-                    accessibility: "Bot thinking: \(routing.effortWord). Edit in Bots",
+                    help: "This conversation uses its helper's thinking level. Tell me in chat to change it.",
+                    accessibility: "Helper thinking: \(routing.effortWord). Tell me in chat to change it",
                     identifier: "chat.composer.effort"
                 )
             } else {
@@ -163,7 +155,7 @@ struct ChatComposerSettings: View {
         .foregroundStyle(NativeAgentShell.text.opacity(0.85))
 
         .task { await appModel.loadProvidersForChat() }
-        // Re-read on every driver change, and when the posture moves.
+        // Re-read after driver or posture changes so hand-back availability remains current.
         .task(id: routing.activeTrustPreset) {
             for await _ in await MacAttentionSessionStore.shared.driverChanges() {
                 do {
@@ -186,7 +178,10 @@ struct ChatComposerSettings: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("I can read and change files anywhere, run commands, control your Mac, and move files or put them in the Trash. I can act on my own, and files are backed up before changes. macOS privacy permissions still apply. This stays active until you change Trust.")
+            Text("""
+                I can read and change files anywhere, run commands, control your Mac, and move files or put them in the Trash. I can act on my own, and \
+                files are backed up before changes. macOS privacy permissions still apply. This stays active until you change Trust.
+                """)
         }
         .alert("Trust could not be changed", isPresented: Binding(
             get: { cardState?.trustError != nil },
@@ -199,16 +194,8 @@ struct ChatComposerSettings: View {
 
     }
 
-    /// A setting rendered as the word that names it. Quiet at rest is less
-    /// decoration, never dimmer text (Agent's note 8): both states are at or
-    /// above `secondary`.
-    /// Width of the widest thinking label this model offers, measured with
-    /// the word's own font. Cheap: a handful of short strings per render.
-    ///
-    /// The size is the SCALED one, not the ramp's 13: measured at a fixed 13
-    /// while the words render larger, the reservation is too narrow and the
-    /// row moves under an open pane on every "Low" → "Medium" — the exact
-    /// thing this reservation exists to stop.
+    /// Keep both resting and active words at least secondary for contrast.
+    /// Reserve the widest label at its scaled font size so routing label changes cannot move the row beneath an open pane.
     private var widestEffortWordWidth: CGFloat? {
         let labels = routing.efforts.map(\.label)
         guard !labels.isEmpty else { return nil }
@@ -219,12 +206,12 @@ struct ChatComposerSettings: View {
             .map { ceil($0) }
     }
 
-    /// The live native menu or receipt belongs to this word.
+    /// Bind menus and receipts to their opening word.
     private func isActive(_ card: ChatComposerCard) -> Bool {
         cardState?.activePane == card
     }
 
-    /// Punctuation between two hit targets, not a control.
+    /// Punctuation separates hit targets without becoming a control.
     private var separator: some View {
         Text("·")
             .font(ShellType.label)
@@ -233,7 +220,7 @@ struct ChatComposerSettings: View {
             .accessibilityHidden(true)
     }
 
-    /// Mouse and keyboard open the same native context receipt.
+    /// Mouse and keyboard must open the same native receipt.
     private var contextRing: some View {
         Button {
             toggleContextPopover()
@@ -285,7 +272,7 @@ struct ChatComposerSettings: View {
         else { cardState?.open(.context) }
     }
 
-    /// The words hand Tab back to the window at either end.
+    /// Hand Tab back to the window at either end of the words.
     private func tab(_ card: ChatComposerCard, _ press: KeyPress) -> KeyPress.Result {
         let ring = ChatComposerSettings.ring
         guard let index = ring.firstIndex(of: card) else { return .ignored }
@@ -296,15 +283,15 @@ struct ChatComposerSettings: View {
         return .handled
     }
 
-    /// Native menu submenus own model navigation and placement.
+    /// Let native submenus own model navigation and placement.
     @ViewBuilder
     private var modelMenuWord: some View {
         if routing.isBotConversation {
             word(
                 .model,
                 text: routing.modelWord,
-                help: "This conversation uses its bot's own model. Edit it in Bots.",
-                accessibility: "Bot model. Edit in Bots",
+                help: "This conversation uses its helper's model. Tell me in chat to change it.",
+                accessibility: "Helper model. Tell me in chat to change it",
                 identifier: "chat.composer.model"
             )
         } else {
@@ -314,7 +301,6 @@ struct ChatComposerSettings: View {
         }
     }
 
-    /// A composer word that opens a native menu.
     private func menuWordLabel(_ text: String, minWidth: CGFloat? = nil) -> some View {
         Text(text)
             .font(ShellType.labelMedium)

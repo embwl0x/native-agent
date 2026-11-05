@@ -6,26 +6,14 @@ import PersistenceCore
 import ProviderRouting
 import NativeAgentShared
 
-// Blueprint: | `NativeCognitionRuntime+ProviderVitals.swift` | `NativeCognitionRuntime` provider interoception: passive vitals persistence, health-band transitions and graded somatic ingestion |
+// Blueprint: | `NativeCognitionRuntime+ProviderVitals.swift` | `NativeCognitionRuntime`. |
 
-// INTEROCEPTION — production wiring for the passive provider vitals organ.
-//
-// `observeProviderCall` (NativeCognitionRuntime+Events) feeds every actual
-// lifecycle event to `providerVitalsSensor`. When a provider crosses a health
-// band, the sensor returns a transition; here we mint the graded
-// `.providerVitalsShift` CognitiveEvent, run it through the SAME
-// `CognitiveSomaticSignals` the design specifies, and ingest the resulting
-// graded somatic signal — so sluggishness is FELT on the existing provider axis
-// (chemistry → mood → capsule), no new capsule slot.
-//
-// Provider health bands affect the body without posting inbox cards.
+// Route passive provider health transitions through the existing graded somatic path so felt sluggishness needs no new capsule slot.
+// Reuse actual lifecycle evidence without provider calls or inbox cards.
 
 extension NativeCognitionRuntime {
-    /// Bootstrap-owned restore. Snapshot age and row validity are enforced by
-    /// the sensor; a missing or stale file is a normal cold start. First
-    /// outputs come from the retained traces, which grow with her history, so
-    /// launch and her first turn never wait on that read.
-    /// A stream that starts before the read lands runs unmeasured.
+    /// The sensor validates snapshot age and rows; absent or stale snapshots start cold.
+    /// Load retained first-output traces without blocking launch or turns; streams remain unmeasured until publication.
     func restoreProviderVitalsSnapshot() async {
         do {
             _ = try await providerVitalsSensor.restoreSnapshot(dataRoot: dataRoot, now: now())
@@ -43,39 +31,29 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// The stream guard's read port: the sensor is a `let`, so no hop onto
-    /// this actor. Unmeasured until the launch read of first outputs lands.
+    /// The immutable sensor permits actor-free guard reads; evidence stays unmeasured until bootstrap publication.
     public nonisolated func firstOutputDeadline(provider: String, model: String,
                                                 streamKind: String?, requestBytes: Int) async -> FirstOutputDeadline {
         await providerVitalsSensor.firstOutputDeadline(provider: provider, model: model, streamKind: streamKind, requestBytes: requestBytes)
     }
 
-    /// Diagnostics: each provider's first outputs and cuts, as the guard sees them.
     public nonisolated func providerFirstOutputs() async -> String {
         await providerVitalsSensor.firstOutputReport()
     }
 
-    /// Termination-owned snapshot persistence (the ONLY disk write in the
-    /// organ; never on the observe path). Called from applicationWillTerminate.
+    /// Persist only at termination, never on the observation path.
     func persistProviderVitalsSnapshot() async {
         await providerVitalsSensor.persistSnapshot(dataRoot: dataRoot)
     }
 
-    /// Feed one lifecycle event to the sensor and route any band transition.
-    /// Actual diagnostic and bridge provider calls also contribute evidence.
-    ///
-    /// Turn-path budget: one in-memory sensor update; on the rare band
-    /// transition, one organism ingest (the same cost class as the existing
-    /// `.providerFailure` signal). NO disk I/O here.
+    /// Observe actual lifecycle calls in memory only; ingest a body signal solely on health-band transitions.
     func feedProviderVitals(_ event: LLMCallLifecycleEvent) async {
         if let transition = await providerVitalsSensor.ingest(lifecycle: event) {
             await ingestProviderVitalsTransition(transition)
         }
     }
 
-    /// Mint the graded CognitiveEvent, map it through the somatic adapter, and
-    /// ingest the resulting signal. Importance grades the felt intensity by band
-    /// (sluggish < degraded); a recovery reads as relief.
+    /// Map health bands through graded somatic evidence so degradation intensity and recovery relief share the existing body path.
     private func ingestProviderVitalsTransition(_ transition: ProviderVitalsTransition) async {
         let importance: Double
         switch (transition.direction, transition.to) {
@@ -111,8 +89,7 @@ extension NativeCognitionRuntime {
         )
 
         guard let signal = CognitiveSomaticSignals.signal(from: event, id: UUID()) else { return }
-        // Provider lifecycle is body evidence, not new semantic context — mirror
-        // the raw provider path: coalesced persistence.
+        // Lifecycle evidence is not semantic context; coalesce its persistence.
         await ingestPreparedOrganismSignal(
             signal, persistSynchronously: false
         )

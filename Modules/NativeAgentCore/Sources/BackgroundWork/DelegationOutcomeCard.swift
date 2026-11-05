@@ -5,11 +5,8 @@ import BackgroundLoops
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `DelegationOutcomeCard.swift` | One stable delegated-job inbox card and grounded resident wake text |
-/// One inbox card for one terminal delegated job.
 public struct DelegationOutcomeCard: Sendable, Equatable {
-    /// Stable inbox row id: `delegation-outcome:<source>:<jobId>`.
     public let cardId: String
-    /// `<source>:<jobId>` — the job's identity, stable across re-cards.
     public let jobKey: String
     public let source: String
     public let agent: String
@@ -25,23 +22,15 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
     /// A resolved card is written already-read: the condition it reported has
     /// cleared and the row exists only so the board stops asserting it.
     public var resolved: Bool = false
-    /// A failure delivered to her stays in the readout without pushing the person.
-    public var reachesHer = false
+    /// A failure delivered to the agent stays in the readout without pushing the person.
+    public var reachesAgent = false
 
-    public var severity: String { severityOverride ?? (reachesHer ? "info" : outcome.severity) }
+    public var severity: String { severityOverride ?? (reachesAgent ? "info" : outcome.severity) }
 
-    /// The replay-guard signature, carried in the card's `error_signature`
-    /// field so the existing sticky-card machinery applies. It names the
-    /// OUTCOME as well as the job: a re-card that upgrades a job (finished →
-    /// unconfirmed) must land as a fresh unread row and push, while a retry
-    /// of the SAME outcome (a cursor write that failed after the card landed)
-    /// must keep the user's status and never push twice. Legacy rows carry the
-    /// bare `jobKey`; the app-side upsert treats that as matching too.
+    /// Include outcome in the replay guard so escalation becomes unread while an identical retry preserves disposition.
     public var signature: String { "\(jobKey):\(outcome.rawValue)" }
 
-    /// Same field set and ordering conventions as `fileDiskHygieneNotice` /
-    /// `fileLoopFailureNotice` — an inbox reader must not need to know which
-    /// writer produced a row.
+    /// Shared inbox fields let readers ignore which owner wrote the row.
     public func toJSON() -> JSONValue {
         var actions: [JSONValue] = [
             .object(["id": .string("view"), "label": .string("View"),
@@ -71,7 +60,6 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             "related_paths": .array([]),
             "related_groups": .array([]),
             "actions": .array(actions),
-            // The replay guard, in the field the inbox already reads for it.
             "error_signature": .string(signature),
             "status": .string(resolved ? "read" : "unread"),
             "read_at": resolved ? .string(createdAt) : .null,
@@ -98,9 +86,6 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             reasonLine = "No unattended session was started, and this Mac could not be "
                 + "scanned for an open session, so whether a live session will read the "
                 + "inbox row is unknown. Nothing ran and nothing was interrupted."
-        case .succeeded where job.statusWord == "delivered_live":
-            title = "\(name) has it"
-            summary = "\(name) has it\(topicPhrase); the open session took the message"
         case .succeeded:
             title = "\(name) finished"
             summary = "\(name) finished\(topicPhrase)"
@@ -144,9 +129,7 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             detailLines.append("--- completion text (first \(head.count) characters on record) ---")
             detailLines.append(head)
         } else if outcome == .succeeded {
-            // Absence is normal and means DELIVERED — the claude runner nulls
-            // completionText once the handoff succeeds. Saying so stops the
-            // card reading as "finished with nothing to show for it".
+            // The runner clears completionText after confirmed handoff; preserve that delivery meaning.
             detailLines.append("")
             detailLines.append("No completion text is retained on the job record. That is "
                 + "normal for a delivered job — the runner clears the text once the "
@@ -165,13 +148,10 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             detail: detailLines.joined(separator: "\n"),
             createdAt: DelegationOutcomeCursor.formatISO(now)
         )
-        card.reachesHer = job.reachesHer
+        card.reachesAgent = job.reachesAgent
         return card
     }
-    /// An open delegated step whose existing bridge/job liveness verdict is
-    /// stalled. This is deliberately the same inbox row as the eventual
-    /// outcome: completion or recovery replaces the warning instead of
-    /// leaving a stale second card behind.
+    /// Reuse the eventual outcome’s row so recovery or completion replaces the warning.
     public static func makeStalled(
         from job: DelegationReadout, now: Date
     ) -> DelegationOutcomeCard? {
@@ -207,12 +187,10 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             detail: detail.joined(separator: "\n"),
             createdAt: DelegationOutcomeCursor.formatISO(now)
         )
-        card.reachesHer = job.reachesHer
+        card.reachesAgent = job.reachesAgent
         return card
     }
-    /// Clears a prior liveness warning when the same non-terminal job begins
-    /// advancing again. A terminal outcome uses `make(from:)` instead, so the
-    /// final result remains the visible row.
+    /// Recovery clears only nonterminal warnings; terminal results remain visible.
     public static func makeStallCleared(
         from job: DelegationReadout, now: Date
     ) -> DelegationOutcomeCard {
@@ -244,9 +222,8 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             resolved: true
         )
     }
-    /// Notify Agent once in the originating chat when work stalls or fails without a delivered answer.
-    /// Retries reuse the event; a later stall or worse outcome gets a new event.
-    /// Progress, clean finishes and failures already delivered to her produce no notice.
+    /// Notify the originating chat once when an answer is still owed; retries reuse the event.
+    /// A later stall or escalation is new; progress and delivered outcomes produce no notice.
     public static func residentNotice(
         from job: DelegationReadout, conversation: String
     ) -> (event: String, text: String)? {
@@ -279,9 +256,15 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             case .deliveryLost:
                 fact = "\(name) finished, but its reply never reached you: the bridge recorded the delivery as lost."
             case .unknown where job.statusWord == "delivered_inbox":
-                fact = "Your message is in \(name)'s inbox, but no session was started for it and this Mac could not be checked for an open one, so whether anything reads it is unknown."
+                fact = """
+                    Your message is in \(name)'s inbox, but no session was started for it and this Mac could not be checked for an open one, so whether \
+                    anything reads it is unknown.
+                    """
             case .unknown where job.deliveryOutcome == "blocked":
-                fact = "\(name)'s run ended (status \"\(job.statusWord ?? "unknown")\"), but handing its result back is blocked. Do not rerun it; the result is kept on its job record."
+                fact = """
+                    \(name)'s run ended (status \"\(job.statusWord ?? "unknown")\"), but handing its result back is blocked. Do not rerun it; the result is \
+                    kept on its job record.
+                    """
             default:
                 fact = "\(name) finished, but the bridge could not confirm its reply reached you: unverified, not lost."
             }

@@ -3,67 +3,46 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import NativeAgentCore
 import NativeAgentShared
-import NotificationInbox
 import PersistenceCore
-import TelegramBot
-import DeviceSync
 import Experiences
-import Transcripts
-// Blueprint: | `AttentionRouter+Policy.swift` | Pure class/origin route selection, urgency and checked quiet-hour policy; delivery preferences settle at ledger admission |
+import MacControl
+// Blueprint: | `AttentionRouter+Policy.swift` | The person's doors from the person's rulings (phone always, the thread it came from, the Mac while the person is at it); quiet hours |
 
 extension AttentionRouter {
-    /// The whole table, untouched by the switches — kept separate so the
-    /// routing rule stays a pure function of importance and origin.
-    public static func policy(
-        importance: AttentionImportance,
-        origin: AttentionOrigin? = nil
-    ) -> AttentionDelivery {
-        switch importance {
-        case .routineSuccess:
-            // Already in the rollup. Interrupting User to say a thing worked is
-            // the exact noise this router exists to remove.
-            return .none
-        case .requestedResult:
-            return .phone
-        case .informational:
-            // The morning brief and its kind: the phone, once. Not the surface
-            // he happens to be on — an informational delivery is something he
-            // reads when he chooses to, and its card is the durable receipt.
-            return .phone
-        case .ownerWaiting, .adverse:
-            // FIRST: the conversation this came from, when it is one she can
-            // answer into. A request about a piece of work belongs beside the
-            // work, in the thread where it was asked for — not as a decoupled
-            // phone push that makes the person go and find what it was about.
-            if let origin, origin.canReturnToConversation { return .conversation }
-            // Without a returnable conversation, send to his phone with Reply.
-            return .phone
+    /// The person's doors (`Door.person`), or the one door a pinned caller names.
+    public static func doors(_ reach: Reach) -> [Door] {
+        switch reach {
+        case .inbox:
+            return []
+        case .person(let origin):
+            return Door.person(thread: origin.flatMap(thread))
+        case .pinned(let delivery, let origin):
+            switch delivery {
+            case .phone: return [.phone]
+            case .mac: return [.mac]
+            case .telegram, .conversation: return [origin.flatMap(thread)].compactMap { $0 }
+            }
         }
     }
 
-    /// Adverse facts bypass our quiet-hours hold. Phone Focus still governs
-    /// ordinary CloudKit alert presentation.
-    public static func bypassesQuietHours(_ importance: AttentionImportance) -> Bool {
-        importance == .adverse
+    /// The thread a matter came from, when the body can answer there (Telegram, Slack); Mac and phone conversations are labels, not doors.
+    static func thread(_ origin: AttentionOrigin) -> Door? {
+        guard origin.canReturnToConversation, let place = origin.destinationId else { return nil }
+        switch origin.surface {
+        case .telegram: return .telegram(chat: place, thread: origin.threadId)
+        case .slack: return .slack(channel: place, thread: origin.threadId)
+        case .chat, .ios: return nil
+        }
     }
 
-    /// Other classes wait through quiet hours; accepted destinations clear on release.
-    public static func honorsQuietHours(_ importance: AttentionImportance) -> Bool {
-        !bypassesQuietHours(importance)
-    }
+    /// The person is at the Mac when their own input says so; unknown is not here (the phone still gets it).
+    public static func atMac() -> Bool { MacPersonInput.presence()?.here == true }
 
-    /// Confirmed absence releases delivery; unavailable preferences keep it held with repair owed.
-    public static func inQuietHours(
-        at date: Date,
-        dataRoot: URL,
-        calendar: Calendar = .current
-    ) -> Bool {
+    /// An unreadable window holds: no interruption is admitted on unknown preferences (checkedRead records the owner failure).
+    public static func inQuietHours(at date: Date, dataRoot: URL, calendar: Calendar = .current) -> Bool {
         do {
             guard let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot) else { return false }
             return window.contains(hour: calendar.component(.hour, from: date))
-        } catch {
-            // checkedRead records the owner failure; no interruption is admitted on unknown preferences.
-            return true
-        }
+        } catch { return true }
     }
 }

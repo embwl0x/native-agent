@@ -5,8 +5,7 @@ import ChatTurnRuntime
 import ChatSessionWork
 import ToolRegistry
 
-// Blueprint: | `DetachedChatPanelView.swift` | `DetachedChatPanelView`: session-bound transcript/composer, search, speech and attachment intake through shared chat owners |
-// Detached transcripts and sends stay bound to one session through shared chat owners.
+// Blueprint: | `DetachedChatPanelView.swift` | `DetachedChatPanelView`: session transcript/composer through shared owners |
 
 import SwiftUI
 import NativeAgentShared
@@ -22,15 +21,11 @@ struct DetachedChatPanelView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var didInitialLoad = false
-    // Scrolling up disarms follow; returning to the bottom re-arms it.
-    @State private var scrollCoordinator = ChatScrollFollow()
-    /// Room the transcript lends the floating turn card.
-    @State private var cardRoom = ChatTurnCardClearance()
-    /// The detached window is a real chat transcript, so it draws real cards.
-    /// It used to mount `ChatMessageListView` with no card source at all: a
-    /// request that raised "Connect GitHub" in a detached window showed a bare
-    /// tool row with nothing to tap, and the same conversation in the main
-    /// window showed the card. Window controls, shared transcript projection.
+    /// Find, Latest and the at-end signal for this panel's document.
+    @State private var transcriptHandle = TranscriptDocumentHandle()
+    /// The turn card's height over the document's end; the document keeps its last line above it.
+    @State private var turnCardHeight: CGFloat = 0
+    /// Read cards from the shared transcript so detached conversations expose the same actionable controls.
     @State private var inlineCards = InlineInteractionChatBinding()
     @State private var isCapturing = false
     @State private var isRetryingLoad = false
@@ -38,17 +33,11 @@ struct DetachedChatPanelView: View {
     @State private var voiceInput = VoiceInputCapture.forChat()
     @State private var voiceDraftBeforeListening = ""
     @State private var voiceDraftRevision: UInt64 = 0
-    /// Ending dictation invalidates pending starts and late transcripts.
+    /// Ending dictation must invalidate pending starts and late transcripts.
     @State private var voiceGeneration = 0
-    /// True only between a successful `startListening` and the next end.
     @State private var voiceAcceptsTranscript = false
     @FocusState private var inputFocused: Bool
-    @State private var transcriptSearch = MacChatTranscriptSearchController()
-    @State private var showTranscriptSearch = false
-    @State private var transcriptSearchFocusRequest: UInt = 0
-    /// Sends and screenshot sends return the transcript to its latest page.
-    @State private var transcriptLatestRequest = 0
-    /// Hold the send latch synchronously until acceptance returns to prevent duplicate drafts.
+    /// Hold the send latch synchronously across acceptance to prevent duplicate drafts.
     @State private var isSubmittingSend = false
 
     private var panelDraft: ChatComposerDraft { appModel.composerDraft(for: sessionId) }
@@ -94,58 +83,14 @@ struct DetachedChatPanelView: View {
         sessionPresentation.isAvailable
     }
 
-    /// The conversation's current name, or nil once it is gone.
     private var sessionTitle: String? {
         if case .available(let title) = sessionPresentation { return title }
         return nil
     }
 
     private var personaName: String {
-        // Her real name (persona profile), not the chatPersona style
-        // quick-switch which reads "Custom"/"AI".
+        // Use the canonical persona name; chatPersona names a style rather than the agent.
         appModel.agentDisplayName
-    }
-
-    private func openTranscriptSearch() {
-        showTranscriptSearch = true
-        transcriptSearchFocusRequest &+= 1
-        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId,
-                                      revision: appModel.engine.transcripts.structureVersion(for: sessionId))
-    }
-
-    private func closeTranscriptSearch() {
-        showTranscriptSearch = false
-    }
-
-    private func findNextTranscriptMatch() {
-        guard showTranscriptSearch else {
-            openTranscriptSearch()
-            return
-        }
-        _ = transcriptSearch.selectNext()
-    }
-
-    private func findPreviousTranscriptMatch() {
-        guard showTranscriptSearch else {
-            openTranscriptSearch()
-            return
-        }
-        _ = transcriptSearch.selectPrevious()
-    }
-
-    private func refreshTranscriptSearchIfPresented() {
-        guard showTranscriptSearch else { return }
-        transcriptSearch.replaceSource(messages: messages, sessionID: sessionId,
-                                      revision: appModel.engine.transcripts.structureVersion(for: sessionId))
-    }
-
-    private func refreshTranscriptSearchTailIfPresented() {
-        guard showTranscriptSearch else { return }
-        transcriptSearch.replaceLastMessage(
-            messages.last,
-            ordinal: messages.count - 1,
-            sessionID: sessionId
-        )
     }
 
     var body: some View {
@@ -156,25 +101,9 @@ struct DetachedChatPanelView: View {
                     .padding(.horizontal, 12)
             }
             messageScrollback
-                // Desk 658.11: the same shared live-turn card as the main window,
-                // keyed on THIS window's session. It floats over the transcript's
-                // live edge and borrows its room from the transcript's end, so it
-                // never resizes the scroll view (TurnCardRoom).
-                .overlay(alignment: .bottom) {
-                    TurnCardRoom(shows: TurnCardReadout.isVisible(
-                        appModel.engine.turns.lifecycle(for: sessionId),
-                        sessionId: sessionId,
-                        approvals: appModel.engine.approvals.records,
-                        parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst
-                    ), floor: 0, store: cardRoom) {
-                        MacChatTurnCardHost(
-                            sessionId: sessionId,
-                            onStop: { appModel.stopChatStream(sessionId: sessionId) }
-                        )
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 6)
-                    }
-                }
+                .preparesTranscriptGroups(sessionId)
+                // The shared turn card floats over the document's end; its height is the document's bottom inset.
+                .overlay(alignment: .bottom) { turnCard }
             Divider()
             inputBar
                 .disabled(!sessionIsAvailable)
@@ -184,31 +113,23 @@ struct DetachedChatPanelView: View {
             handleDrop($0)
             return true
         }))
-        // Fluid glass: the main window's sheet and haze, not an opaque
-        // window fill. The haze follows this window's own conversation.
         .background {
             ShellSheet().overlay { WindowHaze(sessionId: sessionId) }
         }
         .preferredColorScheme(AppearanceController.shared.colorScheme)
         .task(id: sessionId) {
-            // Load history into the per-session slot on first appearance.
-            // task(id:) re-fires if the panel is somehow rebound to a new
-            // session, but in practice sessionId is immutable per panel.
             guard !didInitialLoad else { return }
             didInitialLoad = true
             await appModel.loadDetachedSessionMessages(sessionId)
             await appModel.engine.transcripts.reclaimContinuations(for: sessionId)
             inputFocused = true
         }
-        // Telegram, Slack, iOS, bridge, and local turns all converge on the
-        // canonical transcript. Watch that exact file while this panel is
-        // mounted so every surface appears live without an idle refresh loop.
+        // Watch this session's canonical transcript so remote and local turns appear without idle polling.
         .task(id: "detached-transcript:\(sessionId)") {
             await appModel.engine.transcripts.watchChanges(sessionID: sessionId) {
                 await appModel.readDetachedTranscript(sessionId: sessionId)
             }
         }
-        // AppKit owns the titlebar; pass title changes to the window controller.
         .onChange(of: sessionTitle) { _, title in
             guard let title else { return }
             DetachedChatWindowController.shared.updateTitle(
@@ -216,20 +137,13 @@ struct DetachedChatPanelView: View {
                 title: title
             )
         }
-        // Coming BACK to this panel is the "the control closed" signal for the
-        // controls that are pages rather than sheets. Chat does this on its
-        // page-visibility change; a detached panel has no such change, so a
-        // card that sent the person to Trust or Providers stayed `running`
-        // here forever. Filtered to THIS panel's window: another window
-        // becoming key (Trust itself) must not verify a card the person is
-        // still working on.
+        // Reverify page-backed cards only when this panel regains focus; another window becoming key does not mean its control closed.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             guard (note.object as? DetachedChatPanel)?.sessionId == sessionId else { return }
             Task { await inlineCards.verifyOnReturn() }
         }
         .inlineCardSetup(inlineCards)
         .onDisappear {
-            // Closing the panel also cancels dictation awaiting permission.
             endPanelDictation()
         }
         .focusedSceneValue(\.chatCommandActions, ChatFocusedCommandActions(
@@ -237,107 +151,77 @@ struct DetachedChatPanelView: View {
             attach: attachFromClipboardOrPickFile,
             toggleVoice: toggleVoice,
             focusComposer: { inputFocused = true },
-            focusTranscriptSearch: openTranscriptSearch,
-            findNext: findNextTranscriptMatch,
-            findPrevious: findPreviousTranscriptMatch
+            focusTranscriptSearch: { transcriptHandle.showFind() },
+            findNext: { transcriptHandle.findNext() },
+            findPrevious: { transcriptHandle.findPrevious() }
         ))
     }
 
     // MARK: - Scrollback
 
+    /// The session as one document; a panel whose session is gone, empty or still loading shows that state instead.
+    @ViewBuilder
     private var messageScrollback: some View {
-        ScrollViewReader { proxy in
-            TranscriptScrollView(coordinator: scrollCoordinator) {
-                LazyVStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
+        if !sessionIsAvailable {
+            detachedSessionUnavailableState
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if messages.isEmpty {
+            detachedEmptyState
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            TranscriptDocumentView(
+                sessionID: sessionId,
+                groups: appModel.engine.transcripts.groups(for: sessionId),
+                cardsByRow: TranscriptReadout(messages: messages).cardsByRow,
+                exchanges: appModel.engine.contactThreads.otherRooms.filter { $0.sessionID != sessionId },
+                showsTrouble: ChatTurnFailure.read(messages) != nil,
+                streamingMessageID: appModel.engine.turns.streamingBubbleIds[sessionId],
+                bottomInset: turnCardHeight,
+                handle: transcriptHandle
+            )
+            .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
+                inlineCards.handle(card: card, action: action, appModel: appModel)
+            }
+            .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                VStack(alignment: .leading, spacing: 4) {
                     if loadPresentation == .stale {
                         Label("History refresh failed; showing last known messages.", systemImage: "exclamationmark.triangle.fill")
                             .font(NativeAgentFont.tag)
                             .foregroundStyle(.yellow)
                     }
-                    if !sessionIsAvailable {
-                        detachedSessionUnavailableState
-                            .frame(maxWidth: .infinity, minHeight: 220)
-                    } else if messages.isEmpty {
-                        detachedEmptyState
-                            .frame(maxWidth: .infinity, minHeight: 220)
-                    } else {
-                        // Reuse the main chat's grouped render path so tool
-                        // pills, approval cards, and bubbles look identical.
-                        ChatMessageListView(
-                            messages: messages,
-                            sessionId: sessionId,
-                            highlightedMessageID: showTranscriptSearch
-                                ? transcriptSearch.selectedMessageID
-                                : nil,
-                            latestRequest: transcriptLatestRequest
-                        )
-                        .safeAreaInset(edge: .top) {
-                            if case .unavailable(let reason) = appModel.engine.transcripts.transcriptReadStatus(for: sessionId) {
-                                Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                            }
-                        }
-                        .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
-                            inlineCards.handle(card: card, action: action, appModel: appModel)
-                        }
+                    if case .unavailable(let reason) = appModel.engine.transcripts.transcriptReadStatus(for: sessionId) {
+                        Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
                     }
-                    // Desk 658.11: the detached typing chip is retired. Turn
-                    // progress has exactly one surface now — MacChatTurnCardHost
-                    // above the composer — so this window and the main window
-                    // show the same one thing instead of stacking two.
-                    ChatTranscriptBottomAnchor(anchorID: detachedBottomAnchor, store: cardRoom, margin: 1)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 18)
-                .padding(.vertical, 14)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                // animateMacChatMutation drives bubble entrance; wholesale
-                // replacements stay instant without list-level animation.
-            }
-            // Anchor the initial transcript at the bottom and empty states at the top.
-            .modifier(DetachedScrollAnchorModifier(isEmpty: messages.isEmpty || !sessionIsAvailable))
-            .safeAreaInset(edge: .top, spacing: 0) {
-                if showTranscriptSearch {
-                    MacChatTranscriptSearchBar(
-                        controller: transcriptSearch,
-                        focusRequest: transcriptSearchFocusRequest,
-                        onDismiss: closeTranscriptSearch
-                    )
-                    .transition(
-                        reduceMotion ? NativeAgentMotion.fade : NativeAgentMotion.reveal(anchor: .top)
-                    )
-                }
-            }
-            .onChange(of: messages.count) {
-                if !showTranscriptSearch, scrollCoordinator.autoFollow {
-                    // Auto-follow jumps without animation; the bottom anchor already positions the viewport.
-                    proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
-                }
-            }
-            // Streaming publishes the tail row's box, which feeds the open search bar.
-            .followsStreamingTail(
-                messageID: messages.last?.id,
-                enabled: showTranscriptSearch,
-                onChanged: { refreshTranscriptSearchTailIfPresented() }
-            )
-            // Transcript mutations refresh search even when count and endpoint IDs stay unchanged.
-            .onChange(of: appModel.engine.transcripts.structureVersion(for: sessionId)) {
-                refreshTranscriptSearchIfPresented()
-            }
-            .onChange(of: transcriptSearch.selectionRevision) { _, _ in
-                guard showTranscriptSearch,
-                      let messageID = transcriptSearch.selectedMessageID
-                else { return }
-                scrollCoordinator.disarmFollow()
-                withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.quick,
-                    reduceMotion: reduceMotion
-                )) {
-                    proxy.scrollTo(
-                        MacChatTranscriptSearch.scrollTargetID(for: messageID),
-                        anchor: .center
-                    )
-                }
             }
         }
+    }
+
+    /// This session's turn card, faded in and out; its measured height (zero when hidden) is the document's bottom inset.
+    private var turnCard: some View {
+        let shows = TurnCardReadout.isVisible(
+            appModel.engine.turns.lifecycle(for: sessionId),
+            sessionId: sessionId,
+            approvals: appModel.engine.approvals.records,
+            parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst
+        )
+        return ZStack(alignment: .bottom) {
+            if shows {
+                MacChatTurnCardHost(
+                    sessionId: sessionId,
+                    onStop: { appModel.stopChatStream(sessionId: sessionId) }
+                )
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+                .fixedSize(horizontal: false, vertical: true)
+                .transition(NativeAgentMotion.fade)
+            }
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { turnCardHeight = $0 }
+        .animation(NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion), value: shows)
     }
 
     @ViewBuilder
@@ -347,7 +231,6 @@ struct DetachedChatPanelView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(.yellow)
-                // Show the failure and recovery before endpoint details.
                 Text("This conversation could not be loaded")
                     .font(NativeAgentFont.section)
                 Text(DetachedChatLoadFailureCopy.message)
@@ -455,8 +338,6 @@ struct DetachedChatPanelView: View {
                 }
             }
 
-            ChatQueuedTurnsView(sessionId: sessionId, isBusy: isBusy)
-
             if let toastMessage {
                 NoticePill(text: toastMessage)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -472,8 +353,6 @@ struct DetachedChatPanelView: View {
                 screenCaptureDisabled: !sessionIsAvailable || isBusy || isCapturing || !screenCaptureAllowed,
                 pendingAttachmentCount: pendingAttachments.count,
                 isRunning: isBusy,
-                hasQueuedTurns: !appModel.engine.turns.queued(for: sessionId).isEmpty,
-                isQueuePaused: appModel.engine.turns.isQueuePaused(sessionId),
                 sendAllowed: sessionIsAvailable && !isCapturing && !appModel.isSavingChatBrain,
                 inputFocused: $inputFocused,
                 onToggleVoice: toggleVoice,
@@ -483,7 +362,7 @@ struct DetachedChatPanelView: View {
                 onStop: { appModel.stopChatStream(sessionId: sessionId) },
                 onSend: send,
                 onTranscript: { newVal in
-                    // Only live dictation may write the recognizer's cumulative transcript.
+                    // Only live dictation may replace the draft with its cumulative transcript.
                     guard voiceAcceptsTranscript else { return }
                     if ChatTranscriptPresentation.hasVisibleText(newVal) {
                         panelDraft.dictate(composeVoiceDraft(newVal), revision: voiceDraftRevision)
@@ -509,12 +388,11 @@ struct DetachedChatPanelView: View {
         guard !appModel.isSavingChatBrain else { return }
         guard ensureSessionIsAvailable() else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Capture the draft and edit time so acceptance clears only what was sent.
+        // Capture draft identity and edit time so acceptance clears only what was sent.
         let sentDraft = panelDraft.text
         let sentDraftEditedAt = panelDraft.editedAt
         let attachments = pendingAttachments
         guard !isCapturing, (!text.isEmpty || !attachments.isEmpty) else { return }
-        // Commands name their supported surface; unknown command words say so.
         switch ChatSlashCommandRouting.decide(
             text: text,
             supportsDispatch: false
@@ -537,7 +415,7 @@ struct DetachedChatPanelView: View {
                 sessionId: sessionId
             )
             switch acceptance {
-            case .accepted, .queued:
+            case .accepted:
                 guard draft.trimmingCharacters(in: .whitespacesAndNewlines) == text,
                       pendingAttachments == attachments
                 else { return }
@@ -547,11 +425,8 @@ struct DetachedChatPanelView: View {
                     editedAt: sentDraftEditedAt
                 )
                 pendingAttachments = []
-                // An accepted send returns to the latest exchange and re-arms follow.
-                transcriptLatestRequest &+= 1
-                scrollCoordinator.forceFollow()
-                // The composer's words are gone; a still-running dictation
-                // would write the whole cumulative phrase straight back in.
+                transcriptHandle.goToLatest()
+                // Stop dictation after sending so its cumulative transcript cannot refill the cleared composer.
                 endPanelDictation()
             case .rejected(let message):
                 showToast(message)
@@ -559,7 +434,6 @@ struct DetachedChatPanelView: View {
         }
     }
 
-    /// Stop recognition without writing through the composer on send or close.
     private func endPanelDictation() {
         voiceGeneration &+= 1
         voiceAcceptsTranscript = false
@@ -613,7 +487,7 @@ struct DetachedChatPanelView: View {
         }
         guard ensureSessionIsAvailable() else { return }
         guard !isCapturing else { return }
-        // Screenshot sends share the send latch because admission suspends before marking the session busy.
+        // Share the send latch: screenshot admission suspends before the session is marked busy.
         guard !isSubmittingSend else { return }
         guard screenCaptureAllowed else {
             showToast("Enable screen capture in Trust → Features → Multimodal")
@@ -638,8 +512,7 @@ struct DetachedChatPanelView: View {
                 await appModel.startChatTurnForSession(prompt, attachments: attachments, sessionId: sessionId)
             }, accepted: { acceptedSessionId in
                 guard acceptedSessionId == sessionId else { return }
-                transcriptLatestRequest &+= 1
-                scrollCoordinator.forceFollow()
+                transcriptHandle.goToLatest()
                 if captured.clearIfUnchanged(appModel: appModel, draft: panelDraft, attachments: &pendingAttachments) {
                     endPanelDictation()
                 }
@@ -706,11 +579,7 @@ struct DetachedChatPanelView: View {
     }
 }
 
-private let detachedBottomAnchor = "detached-chat-bottom-anchor"
-
-/// Resolves the fixed destination of a mounted detached panel. The window can
-/// outlive a session deletion, so a missing row is an unavailable destination,
-/// never a generic chat named "Chat".
+/// A panel can outlive its session; a missing row is unavailable, never a generic Chat destination.
 enum DetachedChatSessionPresentation: Equatable {
     case available(title: String)
     case unavailable
@@ -732,13 +601,10 @@ enum DetachedChatSessionPresentation: Equatable {
     }
 }
 
-// Plain-English copy for the detached panel's load-failure state. Pure strings
-// so the wording is unit-testable; the view only decides where to put them.
+// Keep load-failure copy independent of the view's placement decisions.
 enum DetachedChatLoadFailureCopy {
     static let message = "Your messages are safe. Check your connection, then close this window and open the chat again."
 
-    /// The internal endpoint names, formatted as a secondary line. Nil when
-    /// there is nothing specific to name.
     static func technicalDetail(failedEndpoints: [String]) -> String? {
         let named = failedEndpoints.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         guard !named.isEmpty else { return nil }
@@ -746,22 +612,7 @@ enum DetachedChatLoadFailureCopy {
     }
 }
 
-// Scopes the scroll anchor to the initial offset so content-size changes
-// (hover timestamp, live resize reflow) never re-anchor the viewport; growth
-// is TranscriptScrollView's. The .alignment role keeps short conversations
-// sitting by the composer.
-private struct DetachedScrollAnchorModifier: ViewModifier {
-    let isEmpty: Bool
-
-    func body(content: Content) -> some View {
-        let anchor: UnitPoint = isEmpty ? .top : .bottom
-        content
-            .defaultScrollAnchor(anchor, for: .initialOffset)
-            .defaultScrollAnchor(anchor, for: .alignment)
-    }
-}
-
-/// Only the composer reads the draft, so keystrokes do not re-render the transcript.
+/// Only the composer reads the draft so keystrokes do not redraw the transcript.
 private struct DetachedChatComposer: View {
     let draft: ChatComposerDraft
     let sessionId: String
@@ -771,8 +622,6 @@ private struct DetachedChatComposer: View {
     let screenCaptureDisabled: Bool
     let pendingAttachmentCount: Int
     let isRunning: Bool
-    let hasQueuedTurns: Bool
-    let isQueuePaused: Bool
     let sendAllowed: Bool
     @FocusState.Binding var inputFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -791,8 +640,6 @@ private struct DetachedChatComposer: View {
             screenCaptureDisabled: screenCaptureDisabled,
             pendingAttachmentCount: pendingAttachmentCount,
             isRunning: isRunning,
-            hasQueuedTurns: hasQueuedTurns,
-            isQueuePaused: isQueuePaused,
             canSend: sendAllowed
                 && (ChatTranscriptPresentation.hasVisibleText(draft.text) || pendingAttachmentCount > 0),
             onToggleVoice: onToggleVoice,

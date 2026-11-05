@@ -13,15 +13,11 @@ extension ChatStore {
         locallyCreatedSessionID: String? = nil,
         explicitlySelectedSessionID: String? = nil
     ) -> Bool {
-        // Without a known main-session identity we cannot distinguish a Mac
-        // pin from the phone's still-being-adopted main chat. Wait for that
-        // authority instead of resetting an iOS-created session to nil.
+        // Wait for Mac main-session identity before classifying pins; an unadopted phone-created chat must not reset to nil.
         guard let selected = cleanSessionID(selectedSessionID),
               let main = cleanSessionID(mainSessionID),
               selected != main else { return false }
-        // A new iPhone chat is born locally and can legitimately be absent
-        // from one or more Mac snapshots. Never classify that publication gap
-        // as an externally removed pinned chat.
+        // A new local phone chat can be absent from Mac snapshots; publication gaps do not prove removal.
         if selected == cleanSessionID(locallyCreatedSessionID) { return false }
         // Explicitly opened conversations survive absence from the Mac's pinned snapshot.
         if selected == cleanSessionID(explicitlySelectedSessionID) { return false }
@@ -39,8 +35,7 @@ extension ChatStore {
             loadTranscript: { [weak self] sessionID in
                 let read = await client.readChatTranscript(sessionID: sessionID)
                 guard read == .unavailable, let sessionID else { return read }
-                // Outside the Mac's published window: ask the Mac for the
-                // newest page instead of showing "Not here yet".
+                // Fetch the newest page when the session lies outside the Mac's published window.
                 let page = try await iCloudSyncEngine.shared.chatHistoryPage(sessionID: sessionID)
                 if page.hasOlder { self?.pagedSessionsWithOlder.insert(sessionID) }
                 return .published(page.messages, generation: nil)
@@ -64,11 +59,7 @@ extension ChatStore {
         )
     }
 
-    /// Start a fresh chat session from iOS. Generates a new client-side session
-    /// id; the Mac creates it as a `source: "ios"` session on the first message.
-    /// It is an explicit conversation; main continues to follow the Mac.
-    /// Mirrors loadSelectedSession's
-    /// in-flight reset so no stale stream/poll bleeds into the new session.
+    /// Fresh local sessions remain explicit while main follows the Mac; reset in-flight work so stale streams cannot enter the new chat.
     func startNewSession() {
         let freshSessionID = UUID().uuidString
         MobileChatSelectionIntent.selectSession(freshSessionID)
@@ -89,10 +80,8 @@ extension ChatStore {
         }
         showsReplyWaitHint = false
         errorBanner = nil
-        // The fresh session starts with an unlocked composer.
         isLoading = false
-        // Switch to the fresh id BEFORE clearing messages so the empty
-        // transcript never persists over the previous session.
+        // Switch identity before clearing messages so empty rows cannot persist over the previous conversation.
         markLocallyCreatedSession(freshSessionID)
         setSelectedSessionID(freshSessionID)
         messages = []
@@ -109,7 +98,6 @@ extension ChatStore {
     private func loadSelectedSession(
         loadTranscript: @escaping SessionTranscriptLoader
     ) {
-        // Every conversation change ends dictation at its owner.
         onTalkSessionChange?()
         onSessionChange?()
         sendTask?.cancel()
@@ -143,7 +131,6 @@ extension ChatStore {
                 self.restorePendingExchanges(for: loadingSessionID)
                 self.lastRefreshAt = Date()
             } catch is CancellationError {
-                // cancelSessionSwitch releases the gate; deferred cleanup is guarded by the switch generation.
             } catch {
                 guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
                 errorBanner = "Could not load this chat."

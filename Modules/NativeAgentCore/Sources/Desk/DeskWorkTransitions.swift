@@ -4,11 +4,9 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskWorkTransitions.swift` | Durable work creation, reservations, receipts and transitions; interrupted first scheduler migration reuses live retired job identity, refusing divergent open imports; queue updates check the named step's unchanged revision under the existing write lock, preserve origin and leave bound/dropped habit notes; idempotent notes can retain author and a delivery-snapshot boundary so identical later occurrences still leave their own note |
+// Blueprint: | `DeskWorkTransitions.swift` | Locked work creation, bounded reservations and idempotent receipts |
 extension SwiftNativeDeskStore {
-    /// Create an item. Generates a stable handle and assigns the next monotonic
-    /// alias among the parent's siblings — done UNDER THE FLOCK so two
-    /// concurrent creates can't collide on an alias. Returns the created item.
+    /// Allocate aliases under the flock so concurrent creates cannot collide.
     @discardableResult
     public func createItem(
         kind: DeskKind,
@@ -30,11 +28,8 @@ extension SwiftNativeDeskStore {
             reuseEquivalent: false
         ).item
     }
-    /// Idempotent owner-create path for conversational tools. Equivalence is
-    /// checked under the same flock as alias allocation and append, so two
-    /// agents asking for the same live sibling intent and kind cannot race into
-    /// two owners. Terminal history never blocks a new item; callers may explicitly
-    /// choose `createItem` when a same-named sibling is intentional.
+    /// Compare sibling intent under the allocation flock so concurrent asks cannot create duplicate owners.
+    /// Terminal history leaves room for new work; explicit creation can intentionally repeat a sibling name.
     public func createOrReuseEquivalentItem(
         kind: DeskKind,
         project: String,
@@ -55,10 +50,8 @@ extension SwiftNativeDeskStore {
             reuseEquivalent: true
         )
     }
-    /// Machine-filed work (origin system). `note`'s first line is the item's
-    /// key: repeats refresh the original item, preserving a closed or
-    /// person-owned finding. Lookup and writes share one flock transaction.
-    /// `reopen` explicitly reopens a closed item with that key.
+    /// Key system findings under one flock so refiling preserves closure and person ownership.
+    /// Reopening requires an explicit request.
     public func fileSystemItem(
         kind: DeskKind,
         project: String,
@@ -84,15 +77,17 @@ extension SwiftNativeDeskStore {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             var feed = try await readFeedUnlocked()
             var state = Self.compact(base: feed.base, feed.ops)
-            // Only interrupted first-migration filing retries reach this identity.
-            // Pending imports cannot be archived before that migration commits.
+            // Interrupted imports reuse job identity; pending work cannot archive before migration commits.
             if replacing == nil, let id = incoming.scheduledJobID,
                let item = state.items.first(where: { $0.step?.scheduledJobID == id }), let step = item.step {
                 if !item.status.isTerminal,
                    step.words != incoming.words || step.when != incoming.when || step.rhythm != incoming.rhythm
                     || step.until != incoming.until || step.say != incoming.say || step.clockStart != incoming.clockStart
                     || step.status != incoming.status {
-                    throw ToolFailureError("Scheduled intention \(id) changed before its migration committed. Reconcile its Desk step and source job before relaunching; no scheduler work was retired.", effects: .none)
+                    throw ToolFailureError("""
+                        Scheduled intention \(id) changed before its migration committed. Reconcile its Desk step and source job before \
+                        relaunching; no scheduler work was retired.
+                        """, effects: .none)
                 }
                 return (MyQueue.Entry(item: item, step: step), .reused)
             }
@@ -145,6 +140,7 @@ extension SwiftNativeDeskStore {
                 bodies.append(.setStatus(status: .todo, blockedReason: nil, waitingOn: nil,
                     progress: nil, assignee: nil, laneOf: nil))
             }
+            try DeskOp.requireComplete(bodies.map { DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: $0) })
             for body in bodies {
                 let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: body)
                 try Self.validateHierarchyTransition(op, in: state)
@@ -181,10 +177,7 @@ extension SwiftNativeDeskStore {
         return try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let priorState = Self.compact(base: feed.base, feed.ops)
-            // Resolve the parent's alias (if any) so a child alias nests under it.
-            // Validate against LIVE state — not just the create-op history — so a
-            // child can't be created under an archived/aged-out parent and then
-            // dangle as an orphan.
+            // Validate live parent state so a child cannot become orphaned under an archived parent.
             var parentAlias: String?
             if let parent {
                 guard let live = priorState.items.first(where: { $0.handle == parent }) else {
@@ -244,6 +237,7 @@ extension SwiftNativeDeskStore {
                     bodies.append(.updateTitle(title: nextTitle, summary: nextSummary, refs: nextRefs))
                 }
                 var (state, committedFeed) = (priorState, feed)
+                try DeskOp.requireComplete(bodies.map { DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: existing.handle, body: $0) })
                 for body in bodies {
                     let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs),
                         handle: existing.handle, body: body)
@@ -257,9 +251,7 @@ extension SwiftNativeDeskStore {
             }
             let alias = try Self.nextAlias(parentHandle: parent, parentAlias: parentAlias, base: feed.base, ops: feed.ops)
             let handle = DeskClock.newHandle()
-            // Generic creation carries no pursuit; openPursuit alone creates a pursuit with a validated dossier.
-            // MY QUEUE's agent-origin create is owned by addQueueStep; origin
-            // system only through fileSystemItem.
+            // Dedicated creation paths own pursuit evidence, queue provenance and system origin.
             let create = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: .createItem(
                 alias: alias, kind: kind, project: project, title: title, parent: parent, summary: summary,
                 assignee: assignee, laneOf: laneOf,
@@ -267,9 +259,10 @@ extension SwiftNativeDeskStore {
             ))
             try Self.validateHierarchyTransition(create, in: priorState)
             try Self.validatePursuitInvariants(create, in: priorState, viaGenericPath: true)
+            try DeskOp.requireComplete([create] + ((keyNote.map { [DeskOpBody.appendNote(text: $0)] } ?? []) + refs.map({ .addRef(ref: $0) }))
+                .map { DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: $0) })
             var (committedState, committedFeed) = try await appendAndRecompactUnlocked(create, feed: feed)
-            // Initial ownership belongs to the filing transaction, before a
-            // caller can close or reassign the newly created item.
+            // Assign ownership before another caller can close or reassign the new item.
             if let waitingOn, let created = committedState.items.first(where: { $0.handle == handle }) {
                 let op = DeskOp(ts: DeskClock.commitStamp(notBefore: committedFeed.maxCommittedTs), handle: handle,
                     body: .setStatus(status: created.status, blockedReason: nil, waitingOn: waitingOn,
@@ -299,8 +292,7 @@ extension SwiftNativeDeskStore {
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
     }
-    /// Creates an origin=agent, kind=project pursuit with required fields and valid non-friction-only evidence.
-    /// Validation and the two-open-pursuit cap run under the ops flock against replayed state.
+    /// Validate pursuit evidence and capacity under the same flock as creation.
     @discardableResult
     public func openPursuit(
         project: String,
@@ -323,8 +315,7 @@ extension SwiftNativeDeskStore {
             )
             let state = Self.compact(base: feed.base, feed.ops)
             try Self.validateHierarchyTransition(op, in: state)
-            // Not viaGenericPath — this IS the dedicated path; still fully gated
-            // on fields + dossier + the open-pursuit cap.
+            // Dedicated creation still enforces required fields, evidence and the open-pursuit cap.
             try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
             let after = try await appendAndRecompactUnlocked(op, feed: feed).state
             guard let created = after.items.first(where: { $0.handle == handle }) else {
@@ -333,7 +324,6 @@ extension SwiftNativeDeskStore {
             return created
         }
     }
-    /// Reserve the item execution record under its pursuit or owner-cadence limits.
     @discardableResult
     public func reserveWorkAttempt(
         _ handle: String,
@@ -362,55 +352,6 @@ extension SwiftNativeDeskStore {
             return attemptId
         }
     }
-    /// Settle the receipt and its status under one Desk lock. Recovery may
-    /// finish a receipt-only commit, but only while that exact revision is
-    /// current. A newer reservation or terminal decision keeps its status.
-    public func settleWorkshopSession(
-        _ handle: String,
-        reservationId: String,
-        receipt: String,
-        disposition: DeskWorkDisposition,
-        artifactRefs: [String],
-        outcomeSummary: String,
-        blockedReason: String?
-    ) async throws {
-        try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
-            var state = Self.compact(base: feed.base, feed.ops)
-            guard let item = state.items.first(where: { $0.handle == handle }) else {
-                throw DeskError.unknownHandle(handle)
-            }
-            guard let attempt = item.workAttempts.first(where: { $0.attemptId == reservationId }) else {
-                throw DeskError.unknownReservation(reservationId: reservationId, handle: handle)
-            }
-            var revision = attempt.completedAt
-            if revision == nil {
-                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle,
-                    body: .completeWorkAttempt(attemptId: reservationId, receipt: receipt,
-                        disposition: disposition, artifactRefs: Array(artifactRefs.prefix(16))))
-                try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-                (state, feed) = try await appendAndRecompactUnlocked(op, feed: feed)
-                revision = op.ts
-            }
-            guard let current = state.items.first(where: { $0.handle == handle }),
-                  !current.status.isTerminal, current.workAttempts.last?.attemptId == reservationId,
-                  current.updatedAt == revision else { return }
-            let body: DeskOpBody
-            if let blockedReason {
-                body = .setStatus(status: .blocked, blockedReason: blockedReason, waitingOn: nil,
-                                  progress: nil, assignee: nil, laneOf: nil)
-            } else if current.isPursuit, disposition == .abandon {
-                body = .closeItem(outcomeSummary: outcomeSummary, status: .canceled)
-            } else if current.isPursuit, disposition == .goalSatisfied,
-                      current.workAttempts.last?.disposition == .goalSatisfied {
-                body = .closeItem(outcomeSummary: outcomeSummary, status: .done)
-            } else { return }
-            let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: body)
-            try Self.validateHierarchyTransition(op, in: state)
-            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-        }
-    }
     @discardableResult
     public func handOffWorkReceipt(_ handle: String, reservationId: String) async throws -> DeskOp? {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -432,9 +373,7 @@ extension SwiftNativeDeskStore {
             return op
         }
     }
-    /// appendWorkReceipt — desk_work_log's store method. Append a plain work
-    /// receipt to a pursuit, or an ordinary item's note. The item's kind selects
-    /// the operation under the same store lock; an error never selects a second tool.
+    /// Select receipt or note by item kind under one lock; failure cannot select another tool.
     @discardableResult
     public func appendWorkReceipt(_ handle: String, receipt: String) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -487,8 +426,7 @@ extension SwiftNativeDeskStore {
         ))
     }
     @discardableResult
-    /// Admit a status change only for the caller's still-open revision. An
-    /// optional best-effort note commits under the same lock; its stamp is the new revision.
+    /// Match the caller's open revision; commit any note under the same lock and revision stamp.
     public func setStatusIfUnchanged(
         _ handle: String,
         expectedUpdatedAt: String,
@@ -525,20 +463,11 @@ extension SwiftNativeDeskStore {
         return ref
     }
     @discardableResult
-    public func updateRef(_ handle: String, refId: String, cachedFields: [String: JSONValue]) async throws -> DeskOp {
-        try await appendValidated(DeskOp(handle: handle, body: .updateRef(refId: refId, cachedFields: cachedFields)))
-    }
-    @discardableResult
     public func appendNote(_ handle: String, text: String, author: String = "system") async throws -> DeskOp {
         try await appendValidated(DeskOp(handle: handle, body: .appendNote(text: text, author: author)))
     }
-    /// End the waits an outside decision has answered, in one flock
-    /// transaction. `settlement` is asked about each open item as it stands
-    /// under the lock, so a close or a new blocker that landed first is never
-    /// overwritten; it returns the note to leave and the status to take, or nil.
-    /// The note is written once, so a crash between the two ops heals on the
-    /// next pass. An item the hierarchy refuses to move is left for Doctor's
-    /// terminal-parent check.
+    /// Settle waits under the flock so earlier closes or new blockers win.
+    /// Write notes once so partial commits heal without duplicate history; invalid hierarchy stays for explicit repair.
     @discardableResult
     public func settleWaits(
         _ settlement: @escaping @Sendable (DeskItem) -> (note: String, status: DeskStatus, blockedReason: String?)?
@@ -563,11 +492,8 @@ extension SwiftNativeDeskStore {
             return settled
         }
     }
-    /// Append a receipt exactly once, with the existence check and append in
-    /// the same flock transaction. Callers supply a stable machine marker at
-    /// the start of the note; retries after a crash or concurrent wakeup are a
-    /// durable no-op instead of duplicating user-visible history.
-    /// `after` limits deduplication to notes newer than that delivery snapshot.
+    /// Check and append markers under one flock so concurrent wakes cannot duplicate receipts.
+    /// Bound deduplication to the delivery snapshot so later occurrences retain their own note.
     @discardableResult
     public func appendNoteIfAbsent(
         _ handle: String,
@@ -593,8 +519,7 @@ extension SwiftNativeDeskStore {
             }
             guard !item.notes.contains(where: { note in
                 guard note.text.hasPrefix(normalizedMarker) else { return false }
-                // The same daily result is a new note; only a note kept after
-                // this delivery's snapshot can settle this occurrence.
+                // Identical daily content is a new occurrence; only notes after this snapshot can settle it.
                 if let cutoff { return DeskClock.parseISO(note.ts).map { $0 > cutoff } ?? false }
                 return true
             }) else {
@@ -609,11 +534,8 @@ extension SwiftNativeDeskStore {
             return op
         }
     }
-    /// Commit the user-facing Observatory veto as one replayable Desk op. A
-    /// note and terminal state must never be split across separate writes: on
-    /// relaunch the pursuit is either still open, or visibly canceled with its
-    /// rationale. Historical partial state is repaired by the same op, while
-    /// a completed veto is a durable no-op.
+    /// Commit veto, terminal state and rationale in one op so relaunch cannot expose a partial decision.
+    /// Completed vetoes remain durable no-ops.
     @discardableResult
     public func vetoPursuit(_ handle: String, note: String) async throws -> DeskOp? {
         let rationale = note.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -4,9 +4,8 @@ import NativeAgentCore
 import ProviderRouting
 #if canImport(CloudKit)
 import CloudKit
-// Blueprint: | `EngineRouteError.swift` | Engine route failures and shared UserFacingError interpretation; POSIX error codes compare at NSError's full integer width |
+// Blueprint: | `EngineRouteError.swift` | Plain failure remedies and full-width POSIX error interpretation |
 #endif
-// Remaining approval-transaction caller owns retirement of this error type.
 public enum DaemonError: Error, LocalizedError, Sendable {
     case notFound(String)
 
@@ -18,36 +17,27 @@ public enum DaemonError: Error, LocalizedError, Sendable {
 }
 
 
-/// The one place a caught error becomes words for a person: what failed and
-/// what to do, in one plain sentence. The raw description goes to the log,
-/// never to the main line — "Remember failed: The operation couldn't be
-/// completed. (NSCocoaErrorDomain error 640.)" tells nobody anything.
+/// Keep raw errors in logs; user-facing failures need a plain cause and remedy.
 public enum UserFacingError {
     private static let logger = ModuleLog(subsystem: "com.nativeagent.app", category: "user-facing-error")
 
-    /// "Couldn't <action>. <cause and what to do>" — `action` is a verb
-    /// phrase like "save that memory". The raw error is logged here.
     public static func message(_ error: Error, action: String) -> String {
         logger("\(action) failed: \(String(describing: error))", level: .error)
         return "Couldn't \(action). " + advice(for: error)
     }
 
-    /// The agent's copy of a plain failure line: the same line plus the raw
-    /// cause she needs to act, unless the line already says it.
+    /// Agent-facing failures also carry the raw cause needed to act, without repeating it.
     public static func forAgent(_ line: String, cause: String?) -> String {
         guard let cause, !cause.isEmpty, !line.contains(cause) else { return line }
         return "\(line) (cause: \(cause))"
     }
 
-    /// Just the cause and the fix, for a line that already says what failed
-    /// ("Research run failed: <this>"). The raw error is logged here.
     public static func cause(_ error: Error, action: String) -> String {
         logger("\(action) failed: \(String(describing: error))", level: .error)
         return advice(for: error)
     }
 
-    /// The same line for a failure that arrives as text rather than an Error
-    /// (a service's own reason string). The text goes to the log only.
+    /// Service reason strings stay in logs rather than raw user-facing copy.
     public static func message(detail: String, action: String) -> String {
         logger("\(action) failed: \(detail)", level: .error)
         return "Couldn't \(action). " + fallback
@@ -56,7 +46,6 @@ public enum UserFacingError {
     private static let fallback = "Something went wrong. Try again; if it keeps happening, the details are in the log."
 
     #if canImport(CloudKit)
-    /// An iCloud account status in words, never the enum case name.
     public static func iCloudAccount(_ status: CKAccountStatus) -> String {
         switch status {
         case .available: return iCloudSignedIn
@@ -70,11 +59,7 @@ public enum UserFacingError {
     #endif
     public static let iCloudSignedIn = "Signed in to iCloud"
 
-    /// A sentence the app wrote itself, shown as is: a Swift error type from
-    /// our own modules that describes itself (LocalizedError), or an NSError
-    /// in a NativeAgent domain that wraps nothing. System errors bridge to
-    /// NSError at runtime (URLError, CocoaError, CKError), so they never match
-    /// the first test; an NSError wrapping an underlying error carries raw text.
+    /// Use authored localized errors as written; system NSError bridges and wrapped underlying errors can contain raw diagnostic text.
     public static func ownSentence(_ error: Error) -> String? {
         let ns = error as NSError
         let typeName = String(reflecting: type(of: error))
@@ -91,13 +76,11 @@ public enum UserFacingError {
         return text
     }
 
-    /// Swift modules that are not ours (the toolchain and package dependencies).
     private static let foreignModules = [
         "Swift.", "Foundation.", "_", "GRDB.", "Sparkle.", "Yams.", "GRPC", "NIO", "Crypto.", "X509.", "SwiftASN1.",
         "Logging.", "SwiftProtobuf.", "Algorithms.", "AsyncAlgorithms.", "Collections.",
     ]
 
-    /// The cause and the fix, without the leading "Couldn't …".
     public static func advice(for error: Error) -> String {
         let ns = error as NSError
         #if canImport(CloudKit)

@@ -3,9 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `NativeRegistryEvaluation.swift` | `NativeRegistryEvaluation` enum; `appendBoundedRun` |
 
-/// Live target: improvements/gauntlet/runs.json, a bounded ImprovementGauntletRun
-/// array. Local backup includes it; production export and phone sync exclude it;
-/// support bundles include it and PrivacyMap lists improvements/.
+/// Bounded improvements/gauntlet/runs.json joins local backup and support bundles; production export and phone sync exclude it.
 public enum NativeRegistryEvaluation {
     public enum LedgerError: LocalizedError {
         case invalidRoot

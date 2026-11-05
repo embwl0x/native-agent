@@ -5,21 +5,17 @@ import PersistenceCore
 import AgentConversations
 import MacControl
 
-// Blueprint: | `NativeAgentA2AWire+Push.swift` | `AgentContactCallback` and `AgentContactPushConfig`: durable callback obligations, Keychain destination references and bounded push delivery |
+// Blueprint: | `NativeAgentA2AWire+Push.swift` | `AgentContactCallback`, `AgentContactPushConfig` |
 
-/// A registered callback as the durable task keeps it: only a reference to
-/// its Keychain account (the URL, which may carry a bearer secret, and its
-/// credentials live there), and what it still owes.
+/// Persist callback account references only; URLs and credentials may contain secrets and belong in Keychain.
 public struct AgentContactCallback: Codable, Sendable, Equatable {
     let account: String
-    /// The last task state the callback accepted.
     var delivered: String?
-    /// Why the newest update was not accepted after its attempts: owed.
+    /// Retain failed update causes as owed callback evidence.
     var failure: String?
 }
 
-/// The canonical 1.0 configuration. Its secrets are kept in Keychain from
-/// acceptance, so the callback outlives this process.
+/// Keep callback secrets durable in Keychain so accepted callbacks survive this process.
 struct AgentContactPushConfig: Codable, Sendable {
     struct Authentication: Codable, Sendable { let scheme: String; let credentials: String? }
     let id: String
@@ -68,7 +64,7 @@ struct AgentContactPushConfig: Codable, Sendable {
             scheme: authentication?.scheme, credentials: authentication?.credentials)), account: account)
     }
 
-    /// The callback a relaunched task resumes, read back from Keychain.
+    /// Relaunch resolves callbacks from their existing Keychain accounts.
     static func restored(_ callback: AgentContactCallback, id: String, taskId: String) throws -> Self {
         guard let data = try AgentPeerCredentials.readSecret(account: callback.account) else {
             throw AgentContactFailure(code: -32603, message: "The callback's Keychain destination is missing.")
@@ -80,8 +76,7 @@ struct AgentContactPushConfig: Codable, Sendable {
     static var invalid: AgentContactFailure { .init(code: -32602, message: "Invalid or unsafe push notification configuration") }
     private static func safeHeader(_ value: String) -> Bool { value.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value != 127 } }
 
-    /// Resolve once, reject the entire answer set if any address is unsafe, and
-    /// pin the selected address for the connection (including HTTPS SNI/verification).
+    /// Resolve once, reject the entire answer set if any address is unsafe, and pin the selected address for the connection (including HTTPS SNI/verification).
     typealias Destination = (host: String, port: Int, address: String)
 
     static func destination(_ raw: String) async throws -> Destination {
@@ -130,8 +125,7 @@ struct AgentContactPushConfig: Codable, Sendable {
             let n = UInt32(bigEndian: ipv4.s_addr)
             if n >> 24 == 127 { return true }
             if allowHTTP { return false }
-            // Public unicast only; in particular reject metadata, LAN, CGNAT,
-            // link-local, multicast and unspecified addresses.
+            // Public unicast only; in particular reject metadata, LAN, CGNAT, link-local, multicast and unspecified addresses.
             return n != 0xA83F8110 && n >> 24 != 0 && n >> 24 != 10 && n >> 16 != 0xA9FE && n >> 16 != 0xC0A8 &&
                 n >> 20 != 0xAC1 && n >> 22 != 0x191 && n >> 17 != 0x6309 && n >> 28 < 14 &&
                 n >> 8 != 0xC00000 && n >> 8 != 0xC00002 && n >> 8 != 0xC63364 && n >> 8 != 0xCB0071
@@ -140,8 +134,7 @@ struct AgentContactPushConfig: Codable, Sendable {
         guard inet_pton(AF_INET6, address, &ipv6) == 1 else { return false }
         let bytes = withUnsafeBytes(of: &ipv6) { Array($0) }
         if bytes.dropLast().allSatisfy({ $0 == 0 }) && bytes.last == 1 { return true }
-        // Only global IPv6 unicast. This also excludes mapped IPv4, ULA,
-        // link-local, multicast, unspecified and well-known NAT64 addresses.
+        // Only global IPv6 unicast. This also excludes mapped IPv4, ULA, link-local, multicast, unspecified and well-known NAT64 addresses.
         guard !allowHTTP, bytes[0] & 0xE0 == 0x20 else { return false }
         // Reject transition mechanisms that can tunnel to private IPv4.
         if bytes[0] == 0x20 && bytes[1] == 0x02 { return false }
@@ -149,10 +142,8 @@ struct AgentContactPushConfig: Codable, Sendable {
         return true
     }
 
-    /// curl is the OS-provided HTTP/TLS client. --resolve keeps TLS certificate
-    /// and SNI checks on the original hostname while preventing DNS rebinding.
-    /// No shell, user curlrc, proxy, redirect, credential argv, or response body.
-    /// True when the callback accepted it.
+    /// Pin DNS with --resolve while preserving hostname TLS checks. Exclude shell, user curlrc, proxies, redirects, credential argv and response bodies from
+    /// callback transport.
     func deliver(_ payload: Data) async -> Bool {
         for attempt in 0..<3 {
             guard !Task.isCancelled else { return false }
@@ -178,7 +169,8 @@ struct AgentContactPushConfig: Codable, Sendable {
             config += "data-binary = \(quoted(String(decoding: payload, as: UTF8.self)))\n"
             do {
                 let result = try await ProcessExecution().run(executable: "/usr/bin/curl",
-                    arguments: ["-q", "--globoff", "--config", "-", "--silent", "--noproxy", "*", "--proto", "=http,https", "--max-redirs", "0", "--connect-timeout", "3", "--max-time", "10", "--max-filesize", "1024", "--output", "/dev/null", "--write-out", "%{http_code}"],
+                    arguments: ["-q", "--globoff", "--config", "-", "--silent", "--noproxy", "*", "--proto", "=http,https", "--max-redirs", "0",
+                        "--connect-timeout", "3", "--max-time", "10", "--max-filesize", "1024", "--output", "/dev/null", "--write-out", "%{http_code}"],
                     currentDirectory: nil, environment: ["PATH": "/usr/bin:/bin"],
                     standardInput: Data(config.utf8), timeoutSeconds: 12, outputByteLimit: 1024)
                 if result.exitCode == 0, (200..<300).contains(Int(result.stdout) ?? 0) { return true }

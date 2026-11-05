@@ -7,16 +7,14 @@ import NativeAgentShared
 
 // Blueprint: | `ChatComposerInput.swift` | `ChatComposerInput`: draft-local text entry, slash menu, recipient chip and command-key handling |
 
-/// Draft reads stay inside the composer so keystrokes leave transcript and
-/// conversation rows untouched; `ChatView` owns focus and keyboard reach.
+/// Keep draft observation inside the composer so keystrokes do not invalidate transcript rows.
 struct ChatComposerInput: View {
     let draft: ChatComposerDraft
     let placeholder: String
     var isActive = true
-    /// "To: <agent>" before the field (Simple view); nil hides it.
     var recipient: String? = nil
     let voiceInput: VoiceInputCapture
-    /// Speech may only write into the conversation's composer where dictation started.
+    /// Dictation may write only to the conversation where it started.
     let voiceSessionId: String
     let activeSessionId: String
     let screenCaptureAllowed: Bool
@@ -24,11 +22,8 @@ struct ChatComposerInput: View {
     let pendingAttachmentCount: Int
     let hasPendingAttachments: Bool
     let isRunning: Bool
-    let hasQueuedTurns: Bool
-    let isQueuePaused: Bool
     let isCapturing: Bool
-    /// True while a model/provider/effort write is still landing. Send waits
-    /// for the canonical receipt so a turn cannot go out on the old routing.
+    /// Wait for the routing receipt before Send so a turn cannot use old provider settings.
     var isRoutingSaving: Bool = false
     @FocusState.Binding var inputFocused: Bool
     let onToggleVoice: () -> Void
@@ -40,14 +35,12 @@ struct ChatComposerInput: View {
     let onDrop: ([NSItemProvider]) -> Void
     let composeVoiceDraft: (String) -> Void
 
-    // The slash menu is composer-local state; nothing outside this view reads
-    // it, so it no longer invalidates the chat.
+    // Keep slash state local so filtering cannot invalidate the chat.
     @State private var showSlashMenu = false
     @State private var slashMenuHeight: CGFloat = 0
     @State private var slashFilter = ""
     @State private var selectedSlashCommandID: String?
-    /// Bumped when Tab leaves the draft: the composer's settings words are the
-    /// next stop, not the rail.
+    /// Tab hands focus to settings words before the rail.
     @State private var focusWordToken = 0
 
     private var canSend: Bool {
@@ -105,8 +98,6 @@ struct ChatComposerInput: View {
             screenCaptureDisabled: screenCaptureDisabled,
             pendingAttachmentCount: pendingAttachmentCount,
             isRunning: isRunning,
-            hasQueuedTurns: hasQueuedTurns,
-            isQueuePaused: isQueuePaused,
             canSend: canSend,
             onToggleVoice: onToggleVoice,
             onCaptureScreen: onCaptureScreen,
@@ -118,7 +109,6 @@ struct ChatComposerInput: View {
             showsConversationSettings: true,
             focusWordToken: focusWordToken
         ) {
-            // Simple view says who a message goes to, as contact threads do.
             HStack(alignment: .firstTextBaseline, spacing: 8) {
             if let recipient { ComposerRecipientChip(name: recipient) }
             TextField(
@@ -149,7 +139,7 @@ struct ChatComposerInput: View {
             .onSubmit { if canSend { onSend() } }
             .onPasteCommand(of: ChatAttachmentTypeResolver.attachmentContentTypes, perform: onDrop)
             .onChange(of: voiceInput.transcript) { _, newVal in
-                // Dictation stays bound to its starting conversation.
+                // Keep dictation bound to its starting conversation.
                 guard voiceSessionId == activeSessionId else { return }
                 if ChatTranscriptPresentation.hasVisibleText(newVal) {
                     composeVoiceDraft(newVal)
@@ -178,7 +168,7 @@ struct ChatComposerInput: View {
                     slashFilter = ""
                 }
             }
-            // An in-window overlay keeps keyboard focus in the field while the menu filters.
+            // Use an in-window overlay so filtering preserves field focus.
             .overlay(alignment: .topLeading) {
                 if showSlashMenu {
                     SlashCommandMenu(filter: slashFilter, selectedCommand: selectedSlashCommand?.id,
@@ -188,7 +178,7 @@ struct ChatComposerInput: View {
                     .fixedSize()
                     .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { slashMenuHeight = $0 }
-                    // Keep the menu above the box, clear of the draft.
+                    // Keep suggestions above the box so they do not obscure the draft.
                     .offset(y: -(slashMenuHeight + 22))
                     .zIndex(10)
                 }
@@ -198,7 +188,6 @@ struct ChatComposerInput: View {
     }
 }
 
-/// The "To:" chip Simple view's composers lead with.
 struct ComposerRecipientChip: View {
     let name: String
     var body: some View {
@@ -210,5 +199,13 @@ struct ComposerRecipientChip: View {
             .padding(.vertical, 3)
             .background(NativeAgentShell.softFill, in: Capsule())
             .fixedSize()
+    }
+}
+
+// MARK: - Visible text
+
+enum ChatTranscriptPresentation {
+    static func hasVisibleText(_ text: some StringProtocol) -> Bool {
+        text.contains { !$0.isWhitespace }
     }
 }

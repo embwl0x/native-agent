@@ -5,7 +5,7 @@ import MacControl
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `MacPhoneRequestChannel.swift` | `MacPhoneRequestChannel`: every phone request checks notify_mobile Write at send admission through MacIntegrationPermissionStore; one bounded authenticated waiter; timeout retires waiting while send ownership drains to actual exit |
+// Blueprint: | `MacPhoneRequestChannel.swift` | `MacPhoneRequestChannel`; Authenticated bounded wait; sends own exclusion. |
 
 /// One bounded waiter per request; authenticated bridge delivery settles it.
 @MainActor
@@ -17,44 +17,50 @@ public final class MacPhoneRequestChannel {
         var result: Result<BridgeMessage, Error>?
     }
     private var pending: [String: Pending] = [:]
-    /// Timeout/cancel retires the waiter, but the send owns exclusion until
-    /// its actual exit: cancellation cannot prove CloudKit did not deliver it.
+    /// Timeout ends waiting, not send exclusion; cancellation cannot prove CloudKit did not deliver.
     private var sendTask: Task<Void, Never>?
     private var sendFinished: ScopedWaiter?
     var hasPendingRequest: Bool { !pending.isEmpty }
 
     init(bridge: iCloudBridge) { self.bridge = bridge }
 
-    public func request(_ request: PhoneRequest) async throws -> BridgeMessage {
+    public func request(_ request: PhoneRequest, deadline: ContinuousClock.Instant?) async throws -> BridgeMessage {
         guard let bridge, bridge.usesCloudKitDeviceTransport else { throw DeviceSyncError.notConfigured }
         guard pending.isEmpty else {
             throw DeviceSyncError.underlying(message: "Another phone request is waiting. Let it finish first.")
         }
         if let finished = sendFinished {
             let ceiling = ContinuousClock.now.advanced(by: .seconds(min(3, max(0, request.expiresAt.timeIntervalSinceNow))))
-            await TaskWaitDeadline.$current.withValue(min(TaskWaitDeadline.current ?? ceiling, ceiling)) {
-                await finished.park()
-            }
+            await finished.park(budget: .init(deadline: deadline.map { min($0, ceiling) } ?? ceiling))
         }
         try Task.checkCancellation()
         guard pending.isEmpty, sendTask == nil, request.expiresAt > Date() else {
-            throw DeviceSyncError.underlying(message: "The preceding phone request is still settling, or this request expired while waiting. Its send was not cancelled. Read the setting before another change.")
+            throw DeviceSyncError.underlying(
+                message: """
+                    The preceding phone request is still settling, or this request expired while waiting. Its send was not cancelled. Read the setting \
+                    before another change.
+                    """)
         }
         let seconds = Int(request.expiresAt.timeIntervalSinceNow.rounded())
         try Task.checkCancellation()
         let text = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
         let response = Pending()
-        let deadline = Task { [weak self] in
+        let expiryTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(max(0, request.expiresAt.timeIntervalSinceNow))) }
             catch { return }
             // The Mac knows only when it last heard from the phone, not whether it is listening.
             let heard: String
             do {
                 let contact = try SignedPeerEvidenceStore.load(dataRoot: PersistenceCore.defaultDataRoot())?.contactAt
-                heard = contact.map { "it was last heard from at \(ISO8601DateFormatter().string(from: $0)), \(Int(-$0.timeIntervalSinceNow / 60)) minutes ago" }
+                heard = contact.map { """
+                    it was last heard from at \(ISO8601DateFormatter().string(from: $0)), \(Int(-$0.timeIntervalSinceNow / 60)) minutes ago
+                    """ }
                     ?? "it has not been heard from on this Mac"
             } catch {
-                heard = "its saved contact evidence is unavailable: \(error.localizedDescription). Repair mobile/signed_peer_evidence.json, preserving its contents"
+                heard = """
+                    its saved contact evidence is unavailable: \(error.localizedDescription). Repair mobile/signed_peer_evidence.json, preserving its \
+                    contents
+                    """
             }
             self?.finish(request.id, result: .failure(DeviceSyncError.underlying(
                 message: "The phone has not answered in \(seconds) s; \(heard). "
@@ -63,15 +69,14 @@ public final class MacPhoneRequestChannel {
                         : "If NativeAgent is open on the phone, ask again; or give a place.")
             )))
         }
-        response.deadline = deadline
+        response.deadline = expiryTask
         pending[request.id] = response
         let finished = ScopedWaiter()
         sendFinished = finished
         sendTask = Task { [weak self] in
             defer { self?.sendTask = nil; self?.sendFinished = nil; finished.resume() }
             do {
-                // All phone-reaching requests, including settings reads, use
-                // the same Write authority as phone.request's dispatch gate.
+                // Every phone-reaching request needs the same Write authority, including settings reads.
                 let integration = MacIntegrationID.notifyMobile
                 let name = MacIntegrationID.displayName(for: integration)
                 let tap = "Trust > Mac > Apps and features > \(name) > Write"
@@ -86,7 +91,7 @@ public final class MacPhoneRequestChannel {
                     metadata: ["kind": PhoneRequest.messageKind], messageID: request.id)
             } catch { self?.finish(request.id, result: .failure(error)) }
         }
-        await response.done.park()
+        await response.done.park(budget: .init(deadline: deadline))
         if pending[request.id] === response {
             finish(request.id, result: .failure(CancellationError()))
         }
@@ -99,8 +104,7 @@ public final class MacPhoneRequestChannel {
         finish(result.requestID, result: .success(message))
     }
 
-    /// Passive transport teardown ends the wait once, with no claim that a
-    /// cancelled send had no effect. The send's retained slot drains separately.
+    /// Teardown settles the waiter once without claiming no effect; the retained send drains separately.
     func stop() {
         for id in Array(pending.keys) {
             finish(id, result: .failure(DeviceSyncError.underlying(

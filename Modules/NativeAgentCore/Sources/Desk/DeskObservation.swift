@@ -2,10 +2,8 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `DeskObservation.swift` | `DeskObservationEvaluator`: note-free material fingerprints for HarnessQueue |
 
-/// The surviving read helpers; no observation pass or mutation lives here.
 public enum DeskObservationEvaluator {
-    /// The item's substance, order-stable and note-free. Keep its existing
-    /// representation so retained HarnessQueue evidence keeps the same identity.
+    /// Keep fingerprints order-stable and note-free so retained evidence preserves its identity.
     public static func materialFingerprint(_ item: DeskItem) -> String {
         let refs = Set(item.refs.compactMap { ref -> String? in
             switch ref.kind {

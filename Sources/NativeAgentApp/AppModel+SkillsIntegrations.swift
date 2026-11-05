@@ -12,7 +12,14 @@ import DoctorChecks
 import Research
 import TelegramBot
 import Connectors
-// Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`: built-in skill guidance and part Keep/off-switch; toolbar Tools refresh and inbox actions; workspace creation, SearXNG autodetection and projection readback, Telegram settings/log actions and Doctor commands; `refreshTelegramSettingsDraft` captures and merges untouched form fields through one newest-started `LatestRead.refreshDraft` owner; connector updates verify through `engine.connectors.update` |
+import ChatTurnRuntime
+import ChatTurnContracts
+// Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`, `refreshTelegramSettingsDraft`, `LatestRead.refreshDraft`, `engine.connectors.update`: UI |
+
+enum ConnectorUpdateOutcome: Equatable {
+    case verified(ConnectorRecord)
+    case failed(String)
+}
 
 struct TelegramSettingsDraftSnapshot: Equatable {
     var enabled: Bool
@@ -30,7 +37,7 @@ extension AppModel {
 
 @MainActor
 extension AppModel {
-    /// Newest-started reads rebase only untouched clean fields; user edits remain drafts.
+    /// Rebase only untouched clean fields from newest-started reads; user edits remain drafts.
     func refreshTelegramSettingsDraft<Value>(
         _ load: () async -> Value,
         snapshot: (Value) -> TelegramSettingsDraftSnapshot?,
@@ -83,7 +90,7 @@ extension AppModel {
 
     @MainActor
     func promoteTool(_ tool: ToolRecord) async {
-        if let refusal = engine.tools.keepRefusal(tool) {
+        if let refusal = engine.tools.keepRefusal(tool, turn: nil) {
             recordToolOperationStatus("Keeping unavailable: \(refusal)", outcome: .failed)
             return
         }
@@ -101,24 +108,6 @@ extension AppModel {
             recordToolOperationStatus("Ability kept", outcome: .succeeded)
         } catch {
             recordToolOperationStatus(UserFacingError.message(error, action: "keep that ability"), outcome: .failed, cause: error)
-        }
-    }
-
-    @MainActor
-    func addWorkspaceWithReceipt(name: String, path: String, writable: Bool) async -> WorkspaceAddOutcome {
-        do {
-            let result = try await engine.connectors.addWorkspace(name: name, path: path, writable: writable)
-            guard result.verified else {
-                let detail = "The workspace registry did not confirm the saved workspace."
-                statusText = "Workspace add failed: \(detail)"
-                return .failed(detail)
-            }
-            statusText = "Workspace added and verified"
-            return .verified(result.added)
-        } catch {
-            let detail = UserFacingError.cause(error, action: "add that workspace")
-            setFailureStatus("Couldn't add that workspace. " + detail, cause: error)
-            return .failed(detail)
         }
     }
 
@@ -206,13 +195,19 @@ extension AppModel {
                 model: submittedModel,
                 reasoningEffort: normalizedEffort,
                 enabled: submittedEnabled,
-                restartPollLoop: { [backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager) }
+                restartPollLoop: { [backgroundLoopsManager] in
+                    _ = await NativeAgentEngine.restartBackgroundLoop(
+                        id: "telegram_poll",
+                        manager: backgroundLoopsManager
+                    )
+                }
             )
             if telegramToken == submittedToken { telegramToken = "" }
             await refreshAll()
             if pendingTelegramModel == submittedModel { pendingTelegramModel = nil }
             if pendingTelegramReasoningEffort == normalizedEffort { pendingTelegramReasoningEffort = nil }
-            statusText = engine.telegram.status?.tokenConfigured == true ? "Telegram settings saved" : "Telegram settings saved. Add a bot token to enable Telegram."
+            statusText = engine.telegram.status?.tokenConfigured == true ? "Telegram settings saved"
+                : "Telegram settings saved. Add a bot token to enable Telegram."
             let outcome = TelegramSettingsSaveOutcome.saved(
                 tokenConfigured: engine.telegram.status?.tokenConfigured == true,
                 enabled: submittedEnabled,
@@ -230,14 +225,18 @@ extension AppModel {
     }
 
     @MainActor
-    /// `restartPollLoop` false: the caller restarts it (the door's
-    /// telegram.disconnect, which may run inside a Telegram turn the restart awaits).
+    /// Let a Telegram caller defer poll restart because shutdown waits for its own turn too.
     func clearTelegramToken(restartPollLoop: Bool = true) async -> AppMutationResult {
         isSavingTelegram = true
         statusText = "Clearing Telegram bot token..."
         defer { isSavingTelegram = false }
         let restart: (@Sendable () async -> Bool)? = restartPollLoop
-            ? { @Sendable [backgroundLoopsManager] in await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager).didRestart }
+            ? { @Sendable [backgroundLoopsManager] in
+                await NativeAgentEngine.restartBackgroundLoop(
+                    id: "telegram_poll",
+                    manager: backgroundLoopsManager
+                ).didRestart
+            }
             : nil
         let submittedToken = telegramToken
         do {
@@ -321,16 +320,17 @@ extension AppModel {
 
     @MainActor
     @discardableResult
-    func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic, checkID: String? = nil) async -> DoctorFacade.RunOutcome {
-        // Show in-flight state and reject concurrent Doctor invocations.
+    func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic, checkID: String? = nil, turn: Turn? = nil) async -> DoctorFacade.RunOutcome {
+        // Reject concurrent Doctor invocations while exposing the in-flight state.
         let doctor = engine.doctor
         guard doctor.admitRun() else {
             return .unavailable("Health checks are already running.")
         }
         statusText = repair ? "Running repair…" : "Running health checks…"
         do {
-            var report = try await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
-                .runtime.runDoctor(repair: repair, repairScope: repairScope, checkID: checkID)
+            let port = AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
+            var report = try await EngineDoctorRuntime(dataRoot: engine.dataRoot, port: port, turn: turn)
+                .runDoctor(repair: repair, repairScope: repairScope, checkID: checkID)
             let buttonRepair: Bool
             if case .button = repairScope {
                 buttonRepair = repair && (checkID == "status.desk_attention" || (checkID == nil && doctor.report?.checks.contains {
@@ -339,7 +339,13 @@ extension AppModel {
             } else {
                 buttonRepair = false
             }
-            let status = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: buttonRepair, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail)
+            let status = await DoctorFacade.statusChecks(
+                dataRoot: engine.dataRoot,
+                approvals: engine.approvals,
+                repairDesk: buttonRepair,
+                stuckReason: DeskPageContent.stuckReason,
+                safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail
+            )
             report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(report, liveChecks: status.checks)
             report.repaired = report.repaired || status.repaired
             report.checks = await DoctorReadout.repairProjection(report.checks, dataRoot: engine.dataRoot)
@@ -360,16 +366,20 @@ extension AppModel {
         }
     }
 
-    /// Reconcile the cheap live-owner rows in an existing Doctor report.
-    /// This avoids preserving a recovered Telegram/provider/tool condition in
-    /// the toolbar while also avoiding a second full Doctor run on tab entry.
+    /// Reconcile cheap live-owner rows so recovered conditions do not persist in the toolbar or require another full Doctor run.
     @MainActor
     func refreshLiveDoctorCoverage() async {
         guard let current = engine.doctor.report else { return }
         _ = await engine.doctor.reportRead.read({
         let liveChecks = await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
             .runtime.liveDoctorCoverageChecks()
-        let statusChecks = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: false, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail).checks
+        let statusChecks = await DoctorFacade.statusChecks(
+            dataRoot: engine.dataRoot,
+            approvals: engine.approvals,
+            repairDesk: false,
+            stuckReason: DeskPageContent.stuckReason,
+            safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail
+        ).checks
         var refreshed = EngineDoctorRuntime<AppDoctorPort>.mergeReport(current, liveChecks: liveChecks + statusChecks)
         refreshed.checks = await DoctorReadout.repairProjection(refreshed.checks, dataRoot: engine.dataRoot)
         refreshed.status = DoctorReadout.doctorRollup(refreshed.checks.map(\.status))
@@ -412,6 +422,10 @@ extension AppModel {
 
     // MARK: Integrations / inbox
     func inboxAction(_ id: String, action: String) async throws {
-        try await InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot, effects: AppInboxCardActionEffects(inbox: engine.inbox))
+        // A native button starts this act; no running agent turn belongs to the tap.
+        let turn = TurnRequest(message: "", sessionID: nil, surface: "native_actions",
+            envelope: TurnEnvelope.personOnMac("mac_ui:inbox." + action, surface: "native_actions")).turn()
+        try await InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot, turn: turn,
+            effects: AppInboxCardActionEffects(inbox: engine.inbox))
     }
 }

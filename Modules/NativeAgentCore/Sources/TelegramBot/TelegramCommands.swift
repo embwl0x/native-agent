@@ -11,7 +11,7 @@ import MemoryV2
 import DeviceSync
 import NotificationInbox
 
-// Blueprint: | `TelegramCommands.swift` | Telegram command identities, aliases, menu visibility, slash parsing and bot dispatch for the destination's conversation |
+// Blueprint: | `TelegramCommands.swift` | Command identities, parsing and dispatch into the destination conversation |
 
 public struct TelegramBotCommand: Sendable, Codable, Equatable {
     public let command: String
@@ -27,7 +27,6 @@ public enum TelegramSlashCommand: String, Sendable, Codable, Equatable {
     case status
     case new
     case session
-    case compact
     case stop
     case retry
     case sessions
@@ -107,7 +106,6 @@ public enum TelegramCommandRegistry {
         .init(name: "deny", aliases: ["denied", "reject", "rejected"], args: "<id>", handler: .deny),
         .init(name: "help", aliases: ["h"], handler: .help),
 
-        // Hidden commands remain dispatchable.
         .init(name: "status", aliases: ["stats"], handler: .status, showInMenu: false),
         .init(name: "model", args: "[number|provider model]", handler: .model, showInMenu: false),
         .init(name: "sessions", aliases: ["recent"], handler: .sessions, showInMenu: false),
@@ -122,7 +120,6 @@ public enum TelegramCommandRegistry {
         .init(name: "scratch", args: "<key> <value>", handler: .scratch, showInMenu: false),
         .init(name: "tools", handler: .tools, showInMenu: false),
         .init(name: "session", args: "status|new|reset", handler: .session, showInMenu: false),
-        .init(name: "compact", handler: .compact, showInMenu: false),
         .init(name: "restart", args: "[reason]", handler: .restart, showInMenu: false),
     ]
 
@@ -150,7 +147,6 @@ public enum TelegramCommandRegistry {
         )
     }
 
-    /// The slash command's `@bot` suffix, or nil when it names no bot.
     public static func addressedBotUsername(text raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("/") else { return nil }
@@ -179,7 +175,8 @@ extension SwiftNativeTelegramBot {
         _ command: TelegramParsedSlashCommand,
         destination: TelegramDestination,
         fromUserId: Int? = nil,
-        chatType: String? = nil
+        chatType: String? = nil,
+        turn: Turn
     ) async throws -> TelegramSlashDispatchOutcome {
         let args = command.args
         let deps = completenessDeps
@@ -210,18 +207,6 @@ extension SwiftNativeTelegramBot {
             return "Started new Telegram conversation: \(sessionId)"
         case .session:
             return try await dispatchSessionCommand(args: args, destination: destination)
-        case .compact:
-            guard let compactionHandler else { return "Compaction is unavailable here." }
-            let sessionId = try await TelegramSessionStore(dataRoot: dataRoot).activeSessionId(destination: destination)
-            do {
-                let result = try await compactionHandler(sessionId)
-                if result.compacted {
-                    return "Compacted Telegram conversation \(result.sessionId): \(result.messagesBefore) -> \(result.messagesAfter) messages."
-                }
-                return "Telegram conversation \(result.sessionId) not compacted: \(result.reason)."
-            } catch {
-                return "Telegram conversation \(sessionId) not compacted: \(error.localizedDescription)."
-            }
         case .stop:
             return "No Telegram turn is running for this chat."
         case .retry:
@@ -257,7 +242,7 @@ extension SwiftNativeTelegramBot {
             let saved = try await store.setPersona(destination: destination, persona: persona)
             return "Persona set to \(saved) for all conversations."
         case .remember, .note:
-            return await memoryCommandReply(command: command.definition.name, args: args)
+            return await memoryCommandReply(command: command.definition.name, args: args, turn: turn)
         case .scratch:
             guard let key = args.first else { return "/scratch requires <key> <value>" }
             let value = args.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -280,7 +265,7 @@ extension SwiftNativeTelegramBot {
             guard let routing = deps?.routing else { return nil }
             let menu = try await routing.modelMenuForSurface(surface)
             let decision: TelegramModelPickerDecision
-            do { decision = try await modelPicker("command", menu: menu, args: args) }
+            do { decision = try await modelPicker("command", menu: menu, args: args, turn: turn) }
             catch { return "Telegram model picker failed: \(error.localizedDescription)" }
             do {
                 if let selection = decision.selection {
@@ -288,7 +273,7 @@ extension SwiftNativeTelegramBot {
                     try await routing.saveModelSelection(
                         surface: surface,
                         provider: selection.providerId,
-                        model: selection.modelId
+                        model: selection.modelId, turn: turn
                     )
                 }
                 return [decision.reply, menu.catalogIssues.isEmpty ? nil : menu.catalogIssues].compactMap { $0 }.joined(separator: "\n")
@@ -313,7 +298,7 @@ extension SwiftNativeTelegramBot {
             }
             let effort = arg.lowercased()
             do {
-                try await routing.saveModelConfig(surface: surface, key: "reasoning_effort", value: effort)
+                try await routing.saveModelConfig(surface: surface, key: "reasoning_effort", value: effort, turn: turn)
                 return "Think set to \(effort)"
             } catch {
                 return "think_save_failed: \(error.localizedDescription). Open Providers → Chat to check the saved Think level."
@@ -333,7 +318,7 @@ extension SwiftNativeTelegramBot {
             }
             let tier = arg == "on" ? "priority" : "default"
             do {
-                try await routing.saveModelConfig(surface: surface, key: "service_tier", value: tier)
+                try await routing.saveModelConfig(surface: surface, key: "service_tier", value: tier, turn: turn)
                 return "Fast mode \(arg == "on" ? "enabled" : "disabled") for Telegram."
             } catch {
                 return "Failed to set Fast mode: \(error.localizedDescription)"

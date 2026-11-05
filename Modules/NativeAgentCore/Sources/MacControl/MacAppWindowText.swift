@@ -5,14 +5,13 @@ import NativeAgentCore
 #if canImport(Vision) && canImport(ApplicationServices)
 import Vision
 import ApplicationServices
-// Blueprint: | `MacAppWindowText.swift` | `MacAppWindowText` enum; one positional-redacting on-device recognizer for current app-window capture and ephemeral whole-window shots before text-only retention |
+// Blueprint: | `MacAppWindowText.swift` | `MacAppWindowText`: On-device window OCR; retain only redacted text/positions |
 #endif
 
-/// The independent app view is text recognized on-device from that window's
-/// own pixels. This never captures the desktop, launches or activates an app.
+/// Read only the named window's pixels so background text recognition cannot capture unrelated desktop content or change focus.
 public enum MacAppWindowText {
-    public static func read(bundleID: String, window: JSONValue?) async throws -> (rows: JSONValue, text: String) {
-        if MacObservationMode.current == .passive, try MacScreenLock.isCovered() {
+    public static func read(bundleID: String, window: JSONValue?, context: MacOperationContext) async throws -> (rows: JSONValue, text: String) {
+        if context.observationMode == .passive, try MacScreenLock.isCovered() {
             throw SenseFailure(code: "source_unavailable", message: MacScreenLock.passiveReply)
         }
         #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
@@ -26,12 +25,12 @@ public enum MacAppWindowText {
         let frame = MacAXFrame(x: x, y: y, w: w, h: h)
         let identity = MacAXWindowIdentity(pid: app.processIdentifier, index: nil, role: role,
             subrole: string(anchor["subrole"]), title: string(anchor["title"]), frame: frame)
-        let candidates = source.windowRoots(pid: app.processIdentifier)
+        let candidates = source.windowRoots(pid: app.processIdentifier, context: context)
         guard case .matched(let selected, _) = MacAXWindowIdentity.match(identity, among: candidates.map { (handle: $0, identity: $0.identity) }),
-              let node = source.attributes(of: selected.ref), node.frame == frame, node.title == identity.title else {
+              let node = source.attributes(of: selected.ref, context: context), node.frame == frame, node.title == identity.title else {
             throw SenseFailure(code: "source_unavailable", message: "The AX window changed before its independent text view could be captured.")
         }
-        let capture = await defaultMacScreenCaptureSource().capture(window: identity)
+        let capture = await defaultMacScreenCaptureSource().capture(window: identity, context: context)
         try Task.checkCancellation()
         let shot: MacScreenShot
         switch capture {
@@ -40,11 +39,12 @@ public enum MacAppWindowText {
             throw SenseFailure(code: failure.rawValue, message: failure.localizedDescription, remedy: failure.remedy(app: bundleID))
         }
         guard let image = shot.cgImage else {
-            throw SenseFailure(code: "image_encode_failed", message: "The captured window has no image for text recognition.", remedy: MacScreenCaptureFailure.encodeFailed.remedy(app: bundleID))
+            throw SenseFailure(code: "image_encode_failed", message: "The captured window has no image for text recognition.",
+                remedy: MacScreenCaptureFailure.encodeFailed.remedy(app: bundleID))
         }
         let recognized = try await recognize(image: image)
         guard source.runningApps().contains(where: { $0.processIdentifier == app.processIdentifier && $0.bundleIdentifier == bundleID }),
-              let current = source.attributes(of: selected.ref), current.frame == frame, current.title == node.title else {
+              let current = source.attributes(of: selected.ref, context: context), current.frame == frame, current.title == node.title else {
             throw SenseFailure(code: "source_unavailable", message: "The app window changed during text recognition; this material was discarded.")
         }
         return material(recognized, geometry: MacScreenViewGeometry(shot: shot))
@@ -53,8 +53,7 @@ public enum MacAppWindowText {
         #endif
     }
 
-    /// Recognize the read's ephemeral capture before retaining any material.
-    /// Only redacted text and positions may leave this boundary.
+    /// Recognize the read's ephemeral capture before retaining any material. Only redacted text and positions may leave this boundary.
     public static func readCaptured(_ shot: MacScreenShot) async throws -> (rows: JSONValue, text: String) {
         #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
         let bounds = shot.bounds
@@ -126,8 +125,7 @@ public enum MacAppWindowText {
 }
 
 #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
-/// VNRequest explicitly supports cancellation from another thread while its
-/// synchronous image handler is running.
+/// VNRequest explicitly supports cancellation from another thread while its synchronous image handler is running.
 private final class WindowTextRecognition: @unchecked Sendable {
     private let request: VNRecognizeTextRequest
     init(request: VNRecognizeTextRequest) { self.request = request }

@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ApprovalRequest.swift` | ApprovalRequest: shared consent outcomes, execution evidence and exact chat provenance; approval authority remains Mac-owned |
+// Blueprint: | `ApprovalRequest.swift` | Mac-owned consent, execution evidence and exact chat provenance |
 
 public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     /// Consent is distinct from execution; unreadable decisions never offer consent.
@@ -34,8 +34,7 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     public var payloadPreview: String?
     public var localOnly: Bool?
     public var remoteResolvable: Bool?
-    /// Canonical inbox `origin.sessionId` for `chat_tool_approval`; nil for other kinds.
-    /// Surfaces match the current conversation without opening another approval store.
+    /// Match the current conversation through canonical inbox `origin.sessionId`, without another approval store.
     public var chatOriginSessionId: String?
     /// The Mac turn projection's exact selected turn; nil without established provenance.
     public var chatOriginTurnId: String? = nil

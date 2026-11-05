@@ -22,9 +22,7 @@ extension NativeOAuthFlow {
         func ids(_ raw: String) -> [String] {
             raw.split { $0 == "," || $0 == ";" || $0.isWhitespace }.map(String.init)
         }
-        /// Telegram's page saves a token and an allowlist, then sends a test
-        /// reply. The card does the same, with Telegram's `getMe` first so a token
-        /// Telegram does not know is never saved.
+        /// Verify with getMe before saving so an unknown token cannot enter the connection registry.
         func saveTelegram(token: String, chatID: String) async -> InlineSetupOutcome {
             if let problem = validateTelegramToken(token) {
                 return InlineSetupOutcome(error: problem)

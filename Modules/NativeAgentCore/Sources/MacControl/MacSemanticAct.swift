@@ -13,7 +13,7 @@ import Senses
 import os
 import CoreText
 import ScreenCaptureKit
-// Blueprint: | `MacSemanticAct.swift` | `MacFourVerbs.actOnce`: one semantic transaction; chords remain keys, focus typing and image-point typing use the physical owner, bare scroll resolves current content |
+// Blueprint: | `MacSemanticAct.swift` | `MacFourVerbs.actOnce`: Fresh-name transactions preserve key intent, focus typing and current-content scroll |
 extension MacFourVerbs {
     func actOnce(
         verb rawVerb: String,
@@ -29,21 +29,18 @@ extension MacFourVerbs {
         attention: BurstAttention?,
         /// Every look in a background act reads the named app's window without raising it.
         app: String? = nil,
-        /// After a `front:true` raise: the pid that must be in front, or the
-        /// act refuses rather than land in whatever took the front instead.
+        /// After a `front:true` raise: the pid that must be in front, or the act refuses rather than land in whatever took the front instead.
         expect: FrontExpectation? = nil,
-        /// Batched steps: hands the post-act read to the next step.
+        /// Carry the post-act read into the next batch step to avoid duplicate observation.
         carry: SightCarry? = nil,
-        /// A batch's next step presses return or enter on what this one types.
+        /// A following submit key changes how this step’s typing must be delivered.
         commitFollows: Bool = false,
-        /// False for an optional step ("Replace?"): a miss skips it, so the
-        /// menus are not asked where its name lives.
+        /// Optional misses skip without menu discovery because the caller did not require that control.
         menus: Bool = true,
-        /// One-call recovery pins its second attempt to this first sighting.
-        /// A place on an image instead of a name: the hand goes there.
-        place: MacImagePlace? = nil
+        /// Pin recovery to the first sighting; delivered-image points go through the hand.
+        place: MacImagePlace? = nil,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
-        // "right_click" / "secondary_click" is a click with the right button.
         let rawButton = Self.isRightClick(rawVerb) ? "right" : rawButton
         let parsedVerb = Self.parseVerb(rawVerb)
         var verbName = parsedVerb.0
@@ -53,14 +50,13 @@ extension MacFourVerbs {
                 text: "Append requires type and a named text target; nothing was typed.",
                 detail: ["error": .string("append_requires_named_type")])
         }
-        // "press" is how people say both: a key or chord → key, a name → click.
+        // Press syntax must distinguish keyboard chords from named controls.
         if verbName == "press" { verbName = Self.pressMeansKey(target) ? "key" : "click" }
         // Key requests may carry the chord in text; background typing with an empty target uses the focused field.
         let target = verbName == "key" && (try? MacKeySyntax.parseChords(Self.keySpec(target) ?? target)) == nil
             && text.map(Self.pressMeansKey) == true ? text ?? target
             : target
-        /// The escalation ladder's middle rung, in words: nothing was touched,
-        /// here is why the front is needed, and how to ask for it.
+        /// When the front is required, explain the untouched state and how the caller can request it.
         func needsFront(_ reason: String, screen: String? = nil, delivered: Bool = false) -> MacFourVerbsReply {
             let name = app ?? "that app"
             let touched = delivered
@@ -121,8 +117,7 @@ extension MacFourVerbs {
                 detail: ["error": .string("invalid_scroll_amount")])
         }
         let normalizedButton = rawButton?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // Some tool bindings require every declared field. An explicit auto
-        // value preserves ordinary semantic/key/hover actions in those bindings.
+        // Explicit auto preserves ordinary verbs in tool bindings that require every declared field.
         let button = normalizedButton == "auto" ? nil : normalizedButton
         if let button {
             guard MacMouseButton(rawValue: button) != nil,
@@ -136,9 +131,9 @@ extension MacFourVerbs {
             }
         }
         if let place {
-            let reply = await Self.$requiredFrontPid.withValue(expect?.pid) {
-                await performAtPlace(place, verb: verbName, text: text, seconds: seconds, holding: holding, button: button,
-                                     before: carry?.take(), attention: attention)
+            let reply = await context.holding(\.requiredFrontPid, expect?.pid) {
+                context in await performAtPlace(place, verb: verbName, text: text, seconds: seconds, holding: holding, button: button,
+                                     before: carry?.take(), attention: attention, turn: turn, context: context)
             }
             return Self.frontChangedWords(reply, verbName: verbName)
         }
@@ -151,14 +146,11 @@ extension MacFourVerbs {
             if hint == "right" || hint.contains("scroll right") { return .right }
             return parsedDirection
         }()
-        // A requested chord is keyboard input. Menu discovery cannot change
-        // its meaning or make duplicate menu titles an ambiguity in a key.
+        // Menu discovery cannot reinterpret a requested keyboard chord or make it ambiguous.
         if let physical = PhysicalVerb(rawValue: verbName) {
-            // A real key or pointer reaches whatever is in front: after a
-            // front:true raise the hand refuses, at the moment of posting,
-            // when the front is no longer that app (User switched mid-act).
-            let reply = await Self.$requiredFrontPid.withValue(expect?.pid) {
-                await performPhysical(
+            // After raising, every posted event still requires that app in front so intervening person input cannot redirect it.
+            let reply = await context.holding(\.requiredFrontPid, expect?.pid) {
+                context in await performPhysical(
                     physical,
                     target: target,
                     destination: destination,
@@ -168,7 +160,7 @@ extension MacFourVerbs {
                     button: button,
                     attention: attention,
                     carried: carry?.take()
-                )
+                , turn: turn, context: context)
             }
             return Self.frontChangedWords(reply, verbName: verbName)
         }
@@ -188,13 +180,13 @@ extension MacFourVerbs {
                 detail: ["error": .string("missing_text")]
             )
         }
-        // No target: type into whatever has focus, as a person does.
+        // Targetless typing follows actual keyboard focus.
         if verb == .type, target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let text {
             if app != nil { return needsFront("typing at keyboard focus needs the app in front") }
             var before = carry?.take()
             var windowlessPid: Int32?
             if before == nil {
-                switch await sight(part: nil) {
+                switch await sight(part: nil, turn: turn, context: context) {
                 case .seen(let hit): before = hit
                 case .blind(let reply):
                     guard Self.string(reply.detail["error"]) == "no_frontmost_window" else { return reply }
@@ -202,50 +194,44 @@ extension MacFourVerbs {
                 }
             }
             return await typeKeystrokes(text, into: "whatever has focus", before: before, frontPid: windowlessPid,
-                                        expect: expect, attention: attention)
+                                        expect: expect, attention: attention, turn: turn, context: context)
         }
-        // a. A FRESH percept. Never a stored one: resolution happens against the
-        //    screen as it is at the moment of acting, which is the entire reason
-        //    `frame_id` can leave her hands.
+        // Resolve names against current perception rather than stored frames.
         var sighting: Sighting
         if let carried = carry?.take() {
-            // A batched step: the previous step's post-act read IS this step's
-            // fresh pre-read — the window is not read twice.
+            // The previous post-act read is the next step’s fresh baseline; do not read the window twice.
             sighting = carried
         } else {
-            // `seek`: a web page can bury the control past the walk's caps; the
-            // look then searches deeper for this name and frames it.
-            switch await sight(part: nil, app: app, seek: verb == .scroll || Self.isMenuPath(target) ? nil : target) {
+            // Seek expands bounded discovery for controls hidden beyond the ordinary walk cap.
+            switch await sight(part: nil, app: app, seek: verb == .scroll || Self.isMenuPath(target) ? nil : target, turn: turn, context: context) {
             case .blind(let reply):
                 if mode == .replace, reply.detail["status"] == .string("in_process_route") {
                     return Self.ownAppRoute(verb: rawVerb, target: target, text: text)
                 }
                 if app == nil, Self.isMenuPath(target), [.click, .open, .select, .toggle].contains(verb),
                    Self.string(reply.detail["error"]) == "no_frontmost_window" {
-                    return await menuPressNoWindow(target, frontPid: expect?.pid)
+                    return await menuPressNoWindow(target, frontPid: expect?.pid, turn: turn, context: context)
                 }
                 return reply
             case .seen(let hit): sighting = hit
             }
         }
-        // After a `front:true` raise the front must be THAT process AND that
-        // window (by its rect) — another window of the same app is refused.
+        // After raising, require both pid and window geometry so a same-app sibling cannot receive input.
         if let expect, sighting.pid != expect.pid
             || (expect.frame != nil && !MacAXWindowIdentity.rectsMatch(expect.frame, sighting.windowFrame)) {
             return MacFourVerbsReply(
                 ok: false,
                 text: "The front window changed before I could act (front_window_changed), so I haven't touched anything.\n"
                     + sighting.render,
-                // Another app took the front (User, mostly): his choice stands, nothing is put back over it.
+                // Respect the person’s app switch; never cover it by restoring the agent’s target.
                 detail: ["error": .string(sighting.pid != expect.pid ? "owner_changed_apps" : "front_window_changed")]
             )
         }
-        // An explicit menu path goes straight to the menu organ.
+        // Explicit menu paths need no fuzzy control discovery.
         if Self.isMenuPath(target),
-           let menu = await menuCommandReply(target, verb: verb, app: app, seen: sighting) {
+           let menu = await menuCommandReply(target, verb: verb, app: app, seen: sighting, turn: turn, context: context) {
             return menu
         }
-        // b. RESOLVE BY NAME.
         let scrollViewport = sighting.visibleFrame ?? sighting.windowFrame
         func resolve(_ targets: [ActTarget]) -> Resolution {
             verb == .scroll ? Self.resolveScrollTarget(target, among: targets, viewport: scrollViewport)
@@ -254,7 +240,7 @@ extension MacFourVerbs {
         var acquisitionSamples = 0
         // Motion sampling reads the FRONT screen; a background act never uses it.
         if app == nil {
-            let acquisition = await reacquireSight(for: target, sighting: &sighting) {
+            let acquisition = await reacquireSight(for: target, sighting: &sighting, turn: turn, context: context) {
                 if case .none = resolve($0) { return true }
                 return false
             }
@@ -264,15 +250,12 @@ extension MacFourVerbs {
         let reobservedAfterTransientMiss = acquisitionSamples > 0
         var resolution = resolve(sighting.targets)
         if app == nil, verb == .click || verb == .open {
-            // A model round trip can leave only one usable motion sample.
-            // Acquire at most two more, inside this act, and always resolve
-            // again against the newest evidence. No click is sent while the
-            // target is absent/ambiguous, and no remembered point is reused.
+            // Allow at most two fresh motion samples, then resolve again; absent or ambiguous targets cannot use remembered points.
             let sampledApp = sighting.bundleIdentifier ?? sighting.appName
             for _ in 0..<max(0, 2 - acquisitionSamples) {
                 guard case .hit(let candidate) = resolution,
                       candidate.physicalOnly, candidate.motionUncertain else { break }
-                switch await sight(part: nil) {
+                switch await sight(part: nil, turn: turn, context: context) {
                 case .blind(let reply): return reply
                 case .seen(let refreshed):
                     guard (refreshed.bundleIdentifier ?? refreshed.appName) == sampledApp else {
@@ -313,7 +296,7 @@ extension MacFourVerbs {
             if app != nil { return needsFront("typing where the keyboard focus is takes real keystrokes", screen: sighting.render) }
             let focused = sighting.targets.first { !$0.isSupplemental && $0.sourceAXPath == sighting.focusPath }
             return await typeKeystrokes(text, into: focused.map(Self.name) ?? "the focused element",
-                                        before: sighting, expect: expect, attention: attention)
+                                        before: sighting, expect: expect, attention: attention, turn: turn, context: context)
         }
         switch resolution {
         case .none(let nearest):
@@ -325,11 +308,9 @@ extension MacFourVerbs {
             } else {
                 line += " Nothing here is named at all — the screen below is everything I can read."
             }
-            let hint = menus ? await menuHint(target, verb: verb, app: app ?? sighting.appName) : MenuHint()
+            let hint = menus ? await menuHint(target, verb: verb, app: app ?? sighting.appName, turn: turn, context: context) : MenuHint()
             line += hint.text
-            // A window that names (almost) nothing is not a real miss: the
-            // control may be right there, only invisible to accessibility.
-            // Say the next step now instead of leaving her to guess.
+            // Sparse AX can hide a visible target; explain the available next step rather than claiming it absent.
             let named = sighting.targets.filter { candidate in
                 !(candidate.label ?? "").isEmpty && !["window", "web area"].contains(candidate.kind)
             }
@@ -349,7 +330,7 @@ extension MacFourVerbs {
             )
 
         case .ambiguous(let candidates):
-            // The reply IS the question. Nothing is acted on.
+            // Ambiguity returns a question without acting.
             let listed = candidates.map { candidate -> String in
                 Self.recoveryName(candidate) + " (\(candidate.kind))"
             }
@@ -379,7 +360,7 @@ extension MacFourVerbs {
         case .hit(let candidate):
             // The resolved target must answer to the name before the act is admitted.
             if !candidate.regionOnly, !bareFieldHit, !(verb == .scroll && target.isEmpty), !Self.answers(target, candidate) {
-                let hint = menus ? await menuHint(target, verb: verb, app: app ?? sighting.appName) : MenuHint()
+                let hint = menus ? await menuHint(target, verb: verb, app: app ?? sighting.appName, turn: turn, context: context) : MenuHint()
                 return MacFourVerbsReply(
                     ok: false,
                     text: "Nothing here answers to \"\(target)\" exactly — the closest is \(Self.name(candidate)), "
@@ -388,8 +369,7 @@ extension MacFourVerbs {
                              "nearest": .array([.string(Self.recoveryName(candidate))])]) { _, new in new }
                 )
             }
-            // "Delete" must never press "Delete All": a name that only appears
-            // inside longer labels is answered with those labels, not acted on.
+            // Containment cannot authorize a commit: Delete must not press Delete All.
             if Self.committingVerbs.contains(verb), !candidate.regionOnly, !bareFieldHit,
                !Self.answers(target, candidate, exact: true) {
                 let containing = sighting.targets.filter { $0 == candidate || Self.containsName(Self.askedName(target), $0) }
@@ -402,7 +382,7 @@ extension MacFourVerbs {
                              "candidates": .array(containing.map(Self.candidateDetail))]
                 )
             }
-            if Self.nativeSurfaceApp != nil, let label = Self.nativeSurfaceLabel, candidate.label != label {
+            if context.nativeSurfaceApp != nil, let label = context.nativeSurfaceLabel, candidate.label != label {
                 return MacFourVerbsReply(ok: false,
                     text: "The selected native surface changed before I could act. I haven't touched it; read the screen again.\n" + sighting.render,
                     detail: ["error": .string("native_surface_changed")])
@@ -415,7 +395,8 @@ extension MacFourVerbs {
             }
             guard candidate.enabled == true else {
                 return MacFourVerbsReply(
-                    ok: false, text: "\(Self.name(candidate)) is disabled. Nothing was touched. Inspect this app for the prerequisite that enables it.\n" + sighting.render,
+                    ok: false, text: "\(Self.name(candidate)) is disabled. Nothing was touched. Inspect this app for the prerequisite that enables it.\n"
+                        + sighting.render,
                     detail: ["error": .string("target_disabled"), "target": .string(target), "effects": .string("none"),
                         "remedy": Self.inspectAppRemedy(app ?? sighting.appName,
                             instruction: "Inspect this app for the prerequisite that enables the control; do not press it while disabled.")]
@@ -424,7 +405,10 @@ extension MacFourVerbs {
             if candidate.regionOnly, verb != .scroll {
                 return MacFourVerbsReply(
                     ok: false,
-                    text: "\(Self.name(candidate)) is a region, not a control. I can scroll it; name a visible thing inside it to click, open, type, select, toggle, or dismiss.",
+                    text: """
+                        \(Self.name(candidate)) is a region, not a control. I can scroll it; name a visible thing inside it to click, open, type, select, \
+                        toggle, or dismiss.
+                        """,
                     detail: ["error": .string("region_needs_inner_target")]
                 )
             }
@@ -432,7 +416,10 @@ extension MacFourVerbs {
                ![MacActVerb.click, .open, .scroll].contains(verb) {
                 return MacFourVerbsReply(
                     ok: false,
-                    text: "\(Self.name(candidate)) is an unlabeled visual region, so I can physically click, open, scroll, move, hover, hold, or drag there without pretending I know its semantic role.",
+                    text: """
+                        \(Self.name(candidate)) is an unlabeled visual region, so I can physically click, open, scroll, move, hover, hold, or drag there \
+                        without pretending I know its semantic role.
+                        """,
                     detail: ["error": .string("visual_region_needs_physical_action")]
                 )
             }
@@ -441,16 +428,13 @@ extension MacFourVerbs {
                     text: "Append requires an accessibility text target whose contents and end position can be verified; nothing was typed.",
                     detail: ["error": .string("append_target_unverifiable")])
             }
-            // Scroll routes emit directional wheel input; containers and explicit
-            // amounts use the hand aimed at the named region.
+            // Wheel input needs the named region’s aim; containers and explicit amounts retain the physical route.
             let physicalScroll = verb == .scroll
                 && (target.isEmpty || amount > 0 || direction.isHorizontal || Self.physicalScrollKinds.contains(candidate.kind))
                 && (amount > 0 || direction.isHorizontal || candidate.kind == "web area" || candidate.frame != nil)
-            // Background: only the app's own accessibility actions run in the
-            // back. A pixel-found target or a wheel gesture is window-server
-            // input, so it asks for the front instead of taking it.
+            // Only AX actions can run in the background; pixel targets and wheel input require explicit front permission.
             if app != nil, physicalScroll || candidate.isSupplemental,
-               !(Self.nativeSurfaceApp == app && sighting.isFront) {
+               !(context.nativeSurfaceApp == app && sighting.isFront) {
                 return needsFront(
                     physicalScroll
                         ? "scrolling it needs the wheel over the window"
@@ -469,11 +453,9 @@ extension MacFourVerbs {
                     holding: holding,
                     attention: attention,
                     before: sighting
-                )
+                , turn: turn, context: context)
             }
-            // The last evidenced route for this exact control is a hypothesis.
-            // Background presses still try Accessibility; a pointer belief
-            // never refuses an action that may work through AX.
+            // A remembered pointer route is only a hypothesis; background presses must still try the app’s AX handler.
             var learnedPointer = false
             let pointerHypothesis: Bool
             do {
@@ -495,8 +477,8 @@ extension MacFourVerbs {
                     )
                 }
                 // Every pointer event reaches only the app it was aimed at.
-                let reply = await Self.$requiredFrontPid.withValue(Self.requiredFrontPid ?? sighting.pid) {
-                    await performSupplementalSemantic(
+                let reply = await context.holding(\.requiredFrontPid, context.requiredFrontPid ?? sighting.pid) {
+                    context in await performSupplementalSemantic(
                         verb,
                         direction: direction,
                         scrollAmount: amount,
@@ -507,7 +489,7 @@ extension MacFourVerbs {
                         button: pressButton,
                         attention: attention,
                         before: sighting
-                    )
+                    , turn: turn, context: context)
                 }
                 guard verb == .click, holding == nil, pressButton == "left" else { return reply }
                 do { try await learnRoute(pointer: true, pressed: candidate, reply: reply, in: sighting) }
@@ -530,21 +512,17 @@ extension MacFourVerbs {
                     holding: holding,
                     attention: attention,
                     before: sighting
-                )
+                , turn: turn, context: context)
                 guard reobservedAfterTransientMiss else { return reply }
                 var detail = reply.detail
                 detail["dynamic_reobserved"] = .bool(true)
                 return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
             }
-            // Select on a popup means choose an item in it, verified by its
-            // value — pressing it only opens the menu.
+            // Popup selection needs a verified value change; pressing alone merely opens its menu.
             if verb == .select, app == nil, candidate.kind == "popup" {
-                return await selectInPopup(candidate, option: text ?? target, before: sighting, attention: attention)
+                return await selectInPopup(candidate, option: text ?? target, before: sighting, attention: attention, turn: turn, context: context)
             }
-            // c. DRIVE THE EXISTING ACT PATH. The handle and the frame id are
-            //    OURS — they are read off the look we just took and never
-            //    appear in the reply. Raise/focus setup, the observer, the
-            //    diff and every gate are the closed loop's, unchanged.
+            // Use the fresh look’s internal frame and handle through the existing closed loop so admission and effect verification stay shared.
             var body: [String: JSONValue] = [
                 "verb": .string(verb.rawValue),
                 "handle": .string(candidate.handle),
@@ -553,9 +531,7 @@ extension MacFourVerbs {
             if let text { body["text"] = .string(text) }
             if verb == .type { body["mode"] = .string(mode.rawValue) }
             if verb == .scroll { body["direction"] = .string(direction.rawValue) }
-            // A search field, or a field a return will submit, runs the app's
-            // action only on real typing: a value set through accessibility
-            // sits in the field and the search never fires.
+            // Search and submit fields need real typing; setting an AX value alone may leave their action unfired.
             if verb == .type, Self.keystrokeEditableKinds.contains(candidate.kind),
                commitFollows || Self.searchLike(candidate) {
                 if app != nil {
@@ -567,21 +543,20 @@ extension MacFourVerbs {
             Self.addAttention(attention, to: &body)
 
             let result: MacControlResult
-            // The action owner's post-effect read, carried to the reply look.
             let postRead = MacSightCaptureBinding(frameID: UUID().uuidString)
             do {
-                result = try await MacSightCaptureBinding.$current.withValue(postRead) {
-                    try await host.dispatch(action: "act", body: body)
+                result = try await context.holding(\.capture, postRead) { context in
+                    try await host.dispatch(action: "act", body: body, turn: turn, context: context)
                 }
             } catch {
                 return Self.unknownActionReply(error, operation: "\(verb.rawValue) \(Self.name(candidate))", app: app ?? sighting.appName)
             }
             let output = Self.object(result.output)
 
-            // d. THE REPLY, IN WORDS — then the fresh screen.
             guard result.ok else {
-                let mechanism = Self.string(output["status_note"]) ?? Self.string(output["guidance"]) ?? Self.string(output["detail"]) ?? Self.string(output["message"]) ?? Self.refusalWords(result.error ?? "unknown")
-                let after = await sight(part: nil, app: app, observed: postRead)
+                let mechanism = Self.string(output["status_note"]) ?? Self.string(output["guidance"]) ?? Self.string(output["detail"]) ?? Self.string(
+                    output["message"]) ?? Self.refusalWords(result.error ?? "unknown")
+                let after = await sight(part: nil, app: app, observed: postRead, turn: turn, context: context)
                 if result.error == "needs_front" {
                     var screen: String?
                     if case .seen(let hit) = after { screen = hit.render }
@@ -614,14 +589,12 @@ extension MacFourVerbs {
                 return reply
             }
             var effect = Self.effectWords(output: output)
-            let after = await sight(part: nil, app: app, observed: postRead)
+            let after = await sight(part: nil, app: app, observed: postRead, turn: turn, context: context)
             if case .seen(let hit) = after { carry?.last = hit }
             if case .seen(let hit) = after, hit.place != sighting.place {
                 effect = EffectWords(sentence: effect.sentence + " The window is now \(hit.place).", status: effect.status)
             }
-            // Name the element the app ACTUALLY acted on, not the address she
-            // used for it: `type row 1` lands in a text area, and a field's
-            // label may be its content, so an editable one is named by place.
+            // Name the actual acted element rather than the caller’s alias; editable content-derived labels need place names.
             let acted = Self.object(Self.object(Self.object(output["effect"])["acted_element"])["before"])
             let actedKind = Self.string(acted["role"]).map { MacScreenRender.kindName(role: $0) }
             let dismissPressed = Self.string(Self.object(output["dismiss_target"])["label"])
@@ -667,19 +640,14 @@ extension MacFourVerbs {
             detail["matched"] = .string(matchedName)
             detail["status"] = .string(effect.status)
             detail["dynamic_reobserved"] = .bool(reobservedAfterTransientMiss)
-            // "Satisfied" means the INTENDED control was hit. The element the
-            // app acted on must answer to the name asked; a dismiss press must be the
-            // named control or a Cancel/Close/Done/OK (the lower layer keeps it
-            // to the named thing's own modal).
+            // Satisfaction requires the intended control: exact handle identity or the named control’s own modal-dismiss action.
             let wrongLabel: String? = {
                 if verb == .dismiss {
                     guard let pressed = dismissPressed, !answersLabel(pressed),
                           !MacActClosedLoop.dismissLabels.contains(pressed.lowercased()) else { return nil }
                     return pressed
                 }
-                // The element acted on IS the handle that was resolved (the
-                // loop re-checked its identity): a page that renamed it for
-                // reading ("(unnamed button)", a row identity) is not a miss.
+                // The revalidated handle establishes identity even when the page supplied an alternate reading name.
                 if Self.string(Self.object(Self.object(output["effect"])["acted_element"])["handle"]) == candidate.handle { return nil }
                 guard let actedLabel = Self.string(acted["label"]), !answersLabel(actedLabel) else { return nil }
                 return actedLabel
@@ -717,10 +685,9 @@ extension MacFourVerbs {
             if effect.status == "acted_mismatch" {
                 return MacFourVerbsReply(ok: false, text: line, detail: detail)
             }
-            // Verified, and the element acted on answered the name: remember
-            // where it lives (or refresh it).
+            // Remember location only after verification and agreement with the requested name.
             if effect.status == "acted", [MacActVerb.click, .open, .select, .toggle].contains(verb) {
-                do { try await rememberVerified(target, candidate, in: sighting) }
+                do { try await rememberVerified(target, candidate, in: sighting, turn: turn, context: context) }
                 catch {
                     detail["app_map_error"] = .string(error.localizedDescription)
                     line += "\nApp-map learning failed: " + error.localizedDescription
@@ -730,5 +697,5 @@ extension MacFourVerbs {
             return reply
         }
     }
-    /// A hand refused because another app took the front mid-act, in words.
+    /// Explain when an intervening app switch refused the hand.
 }

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveModels.swift` | `CognitiveNode`, snapshots and `CognitiveFrozenRead`: source/subject identity, bounded emotional tags, association edges and persistence health values |
+// Blueprint: | `CognitiveModels.swift` | `CognitiveNode`, snapshots and `CognitiveFrozenRead`: bounded state and health |
 
 public enum CognitiveSourceClass: String, Codable, Sendable, Equatable, CaseIterable {
     case observed
@@ -21,8 +21,7 @@ public enum CognitiveNodeKind: String, Sendable, Equatable, CaseIterable {
     case correction
     case providerHealth
     case appLifecycle
-    /// Round 3 Wave A2 — bodily resolutions (relief/disappointment) with the
-    /// resolved path as aboutness. Additive wire string; felt-tissue eligible.
+    /// Felt resolutions name their resolved path so body feelings retain aboutness.
     case feltResolution
 }
 
@@ -61,8 +60,7 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
     private var _emotionalValence: Double
     private var _emotionalArousal: Double
     private var _emotionalWarmth: Double
-    /// The fold seq of the last lived moment that stamped or reconsolidated
-    /// this node's feeling (`lived_seq`, migration v9). nil: none.
+    /// The last moment that stamped or reconsolidated this feeling; nil carries no fold evidence.
     public var livedSeq: UInt64? = nil
 
     /// How positive/negative the moment felt. −1 (aversive) … +1 (positive), 0 neutral.
@@ -165,55 +163,39 @@ public struct CognitiveSubstrateSnapshot: Sendable, Equatable {
     }
 }
 
-/// Presentation-only state frozen by value with a cognition epoch.
-/// This is not durable cognition: it only prevents previews or failed provider
-/// calls from consuming cadence or continuity state.
+/// Presentation-only state frozen by value with a cognition epoch. This is not durable cognition: it only prevents previews or failed provider calls from
+/// consuming cadence or continuity state.
 public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     public var fingerprintFamily: String?
     public var fingerprintCount: Int
     public var fingerprintLastSurfacedAt: Date?
-    /// The opening of a gap whose Since line lost the one slot: still owed
-    /// on User's next turn, whatever his turns since.
+    /// A gap cue that lost its slot remains owed on the user's next turn.
     public var owedSinceGap: Date?
     public var lastSessionBridgeAt: Date?
-    /// The worn-token SET the rut nudge last spoke for, and when. The nudge is
-    /// change-driven, so it needs to remember what it already said rather than
-    /// re-deriving "a rut exists" every turn.
+    /// Retain the last spoken rut set so change-driven nudges distinguish new forms from repetition.
     public var soundRutSignature: String?
     public var soundRutLastSurfacedAt: Date?
-    /// Accepted live capsules since the rut nudge last spoke. Counted rather
-    /// than timed so a burst of turns inside one minute cannot re-fire it.
+    /// Accepted live capsules since the rut nudge last spoke. Counted rather than timed so a burst of turns inside one minute cannot re-fire it.
     public var soundRutTurnsSinceSurfaced: Int
-    /// The one early repeat (she fed the rut again after it was named) has
-    /// been spent for the current signature; a new signature re-arms it.
+    /// One early repeat is allowed per signature; a new signature re-arms it.
     public var soundRutEarlyRepeatSpent: Bool
-    /// Accepted capsules carrying the allowed contradicting second word, and
-    /// when it last appeared. These measure presentation without gating it.
+    /// Accepted capsules carrying the allowed contradicting second word, and when it last appeared. These measure presentation without gating it.
     public var ambivalenceCount: Int
     public var lastAmbivalenceAt: Date?
-    /// When the unbidden-recall line last spoke, and
-    /// how many accepted turns ago — the two halves of "at most once every
-    /// `remindedOfMinTurns` turns". `nil` last-surfaced means it has never
-    /// spoken, which is eligible.
+    /// When the unbidden-recall line last spoke, and how many accepted turns ago — the two halves of "at most once every `remindedOfMinTurns` turns". `nil`
+    /// last-surfaced means it has never spoken, which is eligible.
     public var remindedOfLastSurfacedAt: Date?
-    /// Accepted live turns since the line last spoke. Free-running (advanced by
-    /// the substrate's own accepted-turn tick), exactly like the Sound rut
-    /// counter, so a stretch of empty capsules cannot freeze the cadence.
+    /// Accepted live turns since the line last spoke. Free-running (advanced by the substrate's own accepted-turn tick), exactly like the Sound rut counter, so
+    /// a stretch of empty capsules cannot freeze the cadence.
     public var remindedOfTurnsSinceSurfaced: Int
-    /// Moment ids this path has already put in front of her, and when. A memory
-    /// that arrived sideways yesterday arriving sideways again today is not a
-    /// second unbidden recall, it is a loop. Bounded by
-    /// `remindedOfLedgerCapacity`; ids only, never text.
+    /// Bounded moment ids prevent repeated sideways recall from becoming a loop; text is never retained.
     public var remindedOfSurfaced: [String: Date]
-    /// Dream residue phrase id → when it surfaced. The newest
-    /// stamp is the line's cooldown; a phrase never surfaces twice in a
-    /// diary's life. Ids only, never text.
+    /// Dream residue phrase id → when it surfaced. The newest stamp is the line's cooldown; a phrase never surfaces twice in a diary's life. Ids only, never
+    /// text.
     public var dreamThemeSurfaced: [String: Date]
-    /// Care id → when she last meant to bring it up. It rests
-    /// 12 h unless it moved again since. Ids only, never text.
+    /// Care id → when the agent last meant to bring it up. It rests 12 h unless it moved again since. Ids only, never text.
     public var careReleased: [String: Date]
-    /// Care id → when its plain "On your mind" line showed and how many
-    /// accepted turns it still rests. Ids only, never text.
+    /// Care id → when its plain "On your mind" line showed and how many accepted turns it still rests. Ids only, never text.
     public var careLineRest: [String: CareLineRest]
 
     public struct CareLineRest: Sendable, Equatable {
@@ -266,8 +248,7 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     }
 }
 
-/// A fixed-time read that settles a copy of the continuity field. The live
-/// actor's decay anchors, capacity, dirty state, and persistence are untouched.
+/// A fixed-time read that settles a copy of the continuity field. The live actor's decay anchors, capacity, dirty state, and persistence are untouched.
 public struct CognitiveFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
     public let mindEpoch: UInt64

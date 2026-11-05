@@ -3,18 +3,15 @@ import Experiences
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import NotificationInbox
 import Privacy
 import ChatToolRuntime
-// Blueprint: | `InlineInteractionDelivery.swift` | Inbox pointers and inline-card delivery; BackgroundLoops owns observation and cancellation; `settle` releases its notification token and joins the retained recovery scan |
+// Blueprint: | `InlineInteractionDelivery.swift` | Transcript-owned asks file one matter with origin doors; inbox pointers read ForPerson |
 
-/// Inbox rows are pointers. The originating transcript still owns the card,
-/// its revision, verification and continuation, on every surface.
+/// Inbox rows are pointers. The originating transcript still owns the card, its revision, verification and continuation, on every surface.
 public enum InlineInteractionDelivery {
     public static let source = "interaction"
 
-    /// Only DeviceSync's authenticated paired-phone action calls this entry.
-    /// Secrets arrive encrypted; the transcript still owns revision and settlement.
+    /// Only DeviceSync's authenticated paired-phone action calls this entry. Secrets arrive encrypted; the transcript still owns revision and settlement.
     @MainActor
     public static func answer(payload: [String: String], actionID: String, clientID: String, dataRoot: URL,
         controls: @MainActor () -> (any InlineInteractionControlPort)?
@@ -29,11 +26,12 @@ public enum InlineInteractionDelivery {
               payload.count <= 12, payload.values.allSatisfy({ $0.utf8.count <= 16_384 }),
               let card = try await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: dataRoot),
               card.revision == revision else {
-            throw NSError(domain: "InteractionCard", code: 4, userInfo: [NSLocalizedDescriptionKey: "This card changed. Refresh the conversation and try again."])
+            throw NSError(domain: "InteractionCard", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "This card changed. Refresh the conversation and try again."])
         }
         if action == "decline" {
             let settled = try await InlineInteractionResolver.decline(id: id, sessionID: session,
-                expectedRevision: revision, dataRoot: dataRoot)
+                expectedRevision: revision, turn: nil, dataRoot: dataRoot)
             return ["status": "ok", "ok": "true", "state": settled.state.name]
         }
         if action == "verify" {
@@ -42,7 +40,7 @@ public enum InlineInteractionDelivery {
                 id: id, sessionID: session, expectedRevision: revision, dataRoot: dataRoot)
             let settled = try await InlineInteractionResolver.complete(id: id, sessionID: session,
                 selection: selection, scope: card.kind == .modelChoice ? .persistent : nil,
-                expectedRevision: checked.revision, dataRoot: dataRoot)
+                expectedRevision: checked.revision, turn: nil, dataRoot: dataRoot)
             return ["status": settled.state.failureReason == nil ? "ok" : "error",
                     "ok": settled.state.failureReason == nil ? "true" : "false", "state": settled.state.name,
                     "message": settled.state.failureReason ?? settled.state.outcome?.summary ?? ""]
@@ -88,7 +86,7 @@ public enum InlineInteractionDelivery {
             phone: (actionID, clientID))
         let settled = try await InlineInteractionResolver.complete(id: id, sessionID: session,
             selection: payload["choice"] ?? card.target, scope: card.kind == .modelChoice ? scope : nil,
-            expectedRevision: running.revision, setupError: effect.error, note: effect.note, dataRoot: dataRoot)
+            expectedRevision: running.revision, setupError: effect.error, note: effect.note, turn: nil, dataRoot: dataRoot)
         return ["status": settled.state.failureReason == nil ? "ok" : "error",
                 "ok": settled.state.failureReason == nil ? "true" : "false", "state": settled.state.name,
                 "message": settled.state.failureReason ?? settled.state.outcome?.summary ?? ""]
@@ -112,8 +110,7 @@ public enum InlineInteractionDelivery {
     }
 
     public static func pointer(id: String, dataRoot: URL) async throws -> Pointer {
-        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        guard let item = try await inbox.item(id: id) else {
+        guard let item = try await ForPerson.at(dataRoot).inbox().first(where: { $0.id == id }) else {
             throw NSError(domain: "InteractionCard", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
             ])
@@ -124,8 +121,7 @@ public enum InlineInteractionDelivery {
     @MainActor
     public static func observe(dataRoot root: URL = PersistenceCore.defaultDataRoot()) async {
         guard !Task.isCancelled else { return }
-        // Register before recovery so an arrival racing the initial read is
-        // buffered. Notifications carry IDs only, never authority or secrets.
+        // Register before recovery so an arrival racing the initial read is buffered. Notifications carry IDs only, never authority or secrets.
         let (changes, continuation) = AsyncStream<String>.makeStream()
         nonisolated(unsafe) let token = NotificationCenter.default.addObserver(
             forName: InlineInteractionWire.changedNotification, object: nil, queue: nil
@@ -133,10 +129,7 @@ public enum InlineInteractionDelivery {
             if let session = notification.object as? String { continuation.yield(session) }
         }
         continuation.onTermination = { _ in NotificationCenter.default.removeObserver(token) }
-        // Recover delivery pointers from durable cards after a relaunch. This
-        // is one pass, not a polling scan; subsequent reads target one session.
-        // Only transcripts whose bytes hold an interaction row are parsed: the
-        // rest have no card to recover, and parsing every one held the launch.
+        // Recover once after launch, parsing only transcripts with interaction rows to bound launch work.
         let recovery = Task.detached(priority: .utility) {
             let directory = root.appendingPathComponent("chat/messages", isDirectory: true)
             let marker = Data(InlineInteractionWire.transcriptKind.utf8)
@@ -184,99 +177,28 @@ public enum InlineInteractionDelivery {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID else { return }
         let result = await InlineInteractionResolver.checkedInteractionsByRow(sessionID: sessionID, dataRoot: dataRoot)
         guard !Task.isCancelled, case .success(let pairs) = result, !pairs.isEmpty else { return }
-        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        let activeIDs: Set<String>
-        do {
-            activeIDs = Set(try await inbox.rows().compactMap { value in
-                guard case .object(let row) = value,
-                      row["source"] == .string(source),
-                      row["status"] != .string("archived"),
-                      case .string(let id)? = row["id"] else { return nil }
-                return id
-            })
-        } catch {
-            nativeLog("[interaction-notification] inbox read failed: %@", error.localizedDescription)
-            return
-        }
         guard !Task.isCancelled else { return }
         var changed = false
-        let owed = Set(((try? await ExperienceStore.at(dataRoot).open()) ?? []).map(\.id))
         for pair in pairs {
             guard !Task.isCancelled else { return }
-            let card = pair.interaction
-            let id = "interaction:\(card.id)"
-            // The card is a decision the person owes her, under the id she is
-            // shown: one experience, read by a wait like any other. A failed
-            // setup can be tried again on the same card, so it stays owed.
-            let open = card.state.isOpen || card.state.failureReason != nil
-            if !card.state.isUnknown, open || owed.contains(id) {
-                let phase: Owed.Phase = switch card.state {
-                case .pending, .running, .failed: .owed
-                case .superseded: .letGo(.cancelled)
-                default: .accepted
-                }
-                Owed.record(dataRoot, id: id, kind: .decision, key: "decide", to: "person", phase: phase,
-                            evidence: [.init(source: "chat/messages/" + sessionID, id: card.id)], born: open)
+            if case .superseded = pair.interaction.state {
+                do { try await ForPerson.at(dataRoot).answered("interaction:" + pair.interaction.id, evidence: nil, letGo: .expired) }
+                catch { nativeLog("[interaction-notification] supersession settlement failed: %@", error.localizedDescription) }
+            } else {
+                InlineInteractionResolver.reconcileDecision(pair.interaction, sessionID: sessionID, dataRoot: dataRoot)
             }
+            // The pointer follows the card the person sees: its owner-verified state and the card's own rule.
+            let card = await InlineInteractionResolver.liveProjection(pair.interaction, dataRoot: dataRoot)
+            let needs = InlineCards.model(card, descriptor: InlineInteractionResolver.descriptor(for: card, dataRoot: dataRoot)).needsAttention
             do {
-                guard card.state.isOpen || card.state.failureReason != nil else {
-                    guard activeIDs.contains(id) else { continue }
-                    changed = try await inbox.updateStatus(id: id, status: "archived",
-                        readAt: ISO8601DateFormatter().string(from: Date())) || changed
-                    continue
-                }
-                let title = NativeAppSecretRedactor.redactText(card.title)
-                let body = NativeAppSecretRedactor.redactText(card.why)
-                let choices: [JSONValue] = card.kind == .choose ? card.options.enumerated().map { index, option in
-                    .object(["id": .string("interaction_choice_\(index)"), "label": .string(option.label)])
-                } : []
-                // Her resident wake's card files now; its push and banner wait
-                // for the person's quiet hours to end (AttentionRouter.releaseHeld).
-                let held = InlineInteractionResolver.platform.residentWakeHeld(sessionID: sessionID, dataRoot: dataRoot)
-                var row: [String: JSONValue] = [
-                    "id": .string(id), "source": .string(source),
-                    "created_at": .string(ISO8601DateFormatter().string(from: card.createdAt)),
-                    "severity": .string("actionable"), "status": .string("unread"),
-                    "title": .string(title), "summary": .string(body),
-                    "interaction_session_id": .string(sessionID), "interaction_id": .string(card.id),
-                    "presentation": InboxSourcePresentation(icon: "hand.raised.fill", badge: "REQUEST",
-                        words: "Asking you", actLabel: nil).row,
-                    "actions": .array(choices + [
-                        .object(["id": .string("act"), "label": .string("Open request")]),
-                        .object(["id": .string("reject"), "label": .string("Not now")]),
-                    ]),
-                ]
-                if notify {
-                    row["held_delivery"] = .array(held ? [.string("phone"), .string("mac")] : [.string("phone")])
-                    row["held_event_id"] = .string(id)
-                    row["held_reason"] = .string(body)
-                    row["held_importance"] = .string("owner_waiting")
-                    row["held_pinned_to"] = .string("phone")
-                    row["held_user_info"] = .object(["screen": .string("inbox"), "source": .string(source), "itemId": .string(id)])
-                }
-                let inserted = try await inbox.appendUnique(.object(row), id: id)
+                guard needs, !card.state.isUnknown else { continue }
+                let filed = try await InlineInteractionResolver.fileMatter(card, sessionID: sessionID, dataRoot: dataRoot)
                 guard !Task.isCancelled else { return }
-                changed = inserted || changed
-                // The note's claim permits another delivery attempt without
-                // duplicating a mirror outside its originating conversation.
+                changed = filed == .born || filed == .refreshed || changed
                 if case .posted = await ApprovalChatCards.postInteraction(
-                    card, sessionID: sessionID, dataRoot: dataRoot,
-                    telegram: InlineInteractionResolver.platform.telegramApprovalFiler, quiet: held || !notify) {
+                    card, sessionID: sessionID, dataRoot: dataRoot) {
                     changed = true
                 }
-                guard !Task.isCancelled else { return }
-                guard inserted, notify, !held else { continue }
-                do {
-                    try await InlineInteractionResolver.platform.routeInteractionAttention(
-                        id: id, title: title, body: body
-                    )
-                } catch {
-                    nativeLog("[interaction-notification] push failed: %@", error.localizedDescription)
-                }
-                guard !Task.isCancelled else { return }
-                await InlineInteractionResolver.platform.postInteractionBanner(
-                    title: title, body: body, sessionID: sessionID
-                )
             } catch {
                 nativeLog("[interaction-notification] delivery failed: %@", error.localizedDescription)
             }
@@ -286,10 +208,9 @@ public enum InlineInteractionDelivery {
         if notify, !Task.isCancelled { await InlineInteractionResolver.platform.writeInteractionSnapshots() }
     }
 
-    /// The same signed inbox-action transport the phone already uses. Opening
-    /// a Mac-owned permission/OAuth control never pretends to grant access.
+    /// The same signed inbox-action transport the phone already uses. Opening a Mac-owned permission/OAuth control never pretends to grant access.
     @MainActor
-    public static func act(id: String, action: String, dataRoot: URL, quiet: Bool = false,
+    public static func act(id: String, action: String, dataRoot: URL, quiet: Bool = false, turn: Turn?,
         open: @MainActor (Pointer) async throws -> Void
     ) async throws {
         let pointer = try await pointer(id: id, dataRoot: dataRoot)
@@ -298,12 +219,16 @@ public enum InlineInteractionDelivery {
            let card = try await InlineInteractionResolver.interaction(id: pointer.interactionID,
                 sessionID: pointer.sessionID, dataRoot: dataRoot),
            card.kind == .choose, card.options.indices.contains(index) {
-            // `quiet` is the agent's inbox.act; the phone's signed tap is User's.
+            // Quiet inbox actions are agent-initiated; a signed phone tap carries the person's authority.
             _ = try await InlineInteractionResolver.complete(id: card.id, sessionID: pointer.sessionID,
-                selection: card.options[index].id, expectedRevision: card.revision, byAgent: quiet, dataRoot: dataRoot)
+                selection: card.options[index].id, expectedRevision: card.revision, byAgent: quiet, turn: turn, dataRoot: dataRoot)
         } else if action == "reject" || action == "deny" {
-            _ = try await InlineInteractionResolver.decline(id: pointer.interactionID,
-                sessionID: pointer.sessionID, resume: !quiet, dataRoot: dataRoot)
+            let card = try await InlineInteractionResolver.require(id: pointer.interactionID,
+                sessionID: pointer.sessionID, dataRoot: dataRoot)
+            // A previous decline may have saved while its inbox disposition failed. Reconcile that disposition without replaying continuation.
+            if case .declined = card.state { return }
+            _ = try await InlineInteractionResolver.decline(id: card.id, sessionID: pointer.sessionID,
+                expectedRevision: card.revision, resume: !quiet, turn: turn, dataRoot: dataRoot)
         } else if action == "act" {
             try await open(pointer)
         } else {

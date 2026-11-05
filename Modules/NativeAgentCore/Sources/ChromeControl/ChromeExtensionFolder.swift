@@ -4,7 +4,7 @@ import NativeAgentCore
 import MacControl
 import TrustCenter
 import NativeAgentShared
-// Blueprint: | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder` enum; executable-closure completeness through ChromeExtensionFiles, staged replacement and registered-host refresh; incomplete bundles and copy failures name the defect and person recovery step, never a coding request |
+// Blueprint: | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder`; Checked staged setup and registered-host refresh. |
 
 public enum ChromeExtensionFolder {
     public static var bundled: URL? {
@@ -27,7 +27,10 @@ public enum ChromeExtensionFolder {
         guard let bundled, isComplete(bundled) else {
             throw ToolFailureError("The bundled Chrome extension is incomplete.", effects: .none,
                 owner: "NativeAgent app bundle / NativeAgentChrome",
-                instruction: "Tell the person: this copy of NativeAgent has an incomplete bundled Chrome extension. Preserve saved data and all Trust and macOS grants.")
+                instruction: """
+                    Tell the person: this copy of NativeAgent has an incomplete bundled Chrome extension. Preserve saved data and all Trust and macOS \
+                    grants.
+                    """)
         }
         let fm = FileManager.default
         let destination = visible
@@ -46,13 +49,14 @@ public enum ChromeExtensionFolder {
             try? fm.removeItem(at: staging)
             throw ToolFailureError("Could not copy the Chrome extension: \(error.localizedDescription)", effects: .none,
                 owner: destination.path,
-                instruction: "Ask the person to repair file access from \(bundled.path) to \(destination.path), preserving existing bytes and all Trust and macOS grants; then run chrome.setup.")
+                instruction: """
+                    Ask the person to repair file access from \(bundled.path) to \(destination.path), preserving existing bytes and all Trust and macOS \
+                    grants; then run chrome.setup.
+                    """)
         }
     }
 
-    /// At launch: only refresh a copy the person already set up, so an app
-    /// update reaches Chrome. Never creates the folder unasked. Both shipped
-    /// installs share this folder, so only Chrome's registered host refreshes it.
+    /// Refresh only a person-approved copy; shared installs let only Chrome's registered host update it.
     public static func refreshIfPresent() {
         guard FileManager.default.fileExists(atPath: visible.path),
               ChromeNativeHostRegistration.ownsOrUnclaimed() else { return }
@@ -61,7 +65,8 @@ public enum ChromeExtensionFolder {
     }
 
     /// Setup uses the same hands and permission law as an ordinary Mac act.
-    public static func setUp(chrome: ChromeControlRuntime, dataRoot: URL, origin: SecurityOriginContext) async throws -> URL {
+    public static func setUp(chrome: ChromeControlRuntime, dataRoot: URL, origin: SecurityOriginContext, turn: Turn,
+        context: MacOperationContext) async throws -> URL {
         func require(_ reply: MacFourVerbsReply) throws {
             guard !reply.ok else { return }
             let remedy: [String: JSONValue] = if case .object(let value)? = reply.detail["remedy"] { value } else { [:] }
@@ -73,26 +78,26 @@ public enum ChromeExtensionFolder {
                 nextCall: try next.serialize(pretty: false), tap: tap,
                 personDecides: remedy["kind"] == .string("person_decides"))
         }
-        await chrome.reconcilePolicy()
-        var status = await chrome.setupConnectionStatus()
+        await chrome.reconcilePolicy( context: context)
+        var status = await chrome.setupConnectionStatus( context: context)
         try require(.init(ok: status.enabled, text: "Chrome control is off or unavailable in Trust.",
             detail: ["remedy": status.diagnostics["remedy"] ?? .null, "effects": .string("none")]))
         let folder = try prepare()
         // Copying can replace same-version bytes. Observe after that write.
-        status = await chrome.setupConnectionStatus(fresh: true)
+        status = await chrome.setupConnectionStatus(fresh: true, context: context)
         if status.state == .connected, status.diagnostics["extension_path"] == .string(folder.path),
            status.diagnostics["extension_code_matches_folder"] == .bool(true) { return folder }
-        let current = MacDriverContext.binding
+        let current = context.driver
         let driver: MacDriverBinding
         if let current { driver = current }
         else { driver = try await MacAttentionSessionStore.shared.bindDriver() }
-        return try await MacDriverContext.$binding.withValue(driver) {
+        return try await context.holding(\.driver, driver) { context in
             defer { if current == nil { driver.cancel() } }
             let hands = MacFourVerbs(host: makeMacControl(
                 policyProvider: TrustCenterMacControlPolicyProvider(dataRoot: dataRoot, operatorOrigin: origin),
-                auditAppendPath: MacControlActionRoutes.auditPath(dataRoot: dataRoot)))
+                auditDataRoot: dataRoot))
             func developerMode() async throws -> [String] {
-                let seen = await hands.screen(app: "com.google.Chrome", structured: true)
+                let seen = await hands.screen(app: "com.google.Chrome", structured: true, turn: turn, context: context)
                 try require(seen)
                 let rows: [JSONValue] = if case .object(let controls)? = seen.detail["controls"],
                     case .array(let rows)? = controls["affordances"] { rows } else { [] }
@@ -102,13 +107,12 @@ public enum ChromeExtensionFolder {
                     return state
                 }
             }
-            try require(await hands.go("com.google.Chrome", front: true))
+            try require(await hands.go("com.google.Chrome", front: true, turn: turn, context: context))
             var toggles = try await developerMode()
-            // Open the page only when it isn't already showing: an open
-            // Extensions window also lists itself under Window.
+            // The Extensions window lists itself under Window; avoid opening a duplicate.
             if toggles.isEmpty {
-                try require(await hands.act(verb: "click", target: "Window > Extensions", app: "com.google.Chrome"))
-                try require(await hands.wait(until: "Developer mode", seconds: 15))
+                try require(await hands.act(verb: "click", target: "Window > Extensions", app: "com.google.Chrome", turn: turn, context: context))
+                try require(await hands.wait(until: "Developer mode", seconds: 15, turn: turn, context: context))
                 toggles = try await developerMode()
             }
             guard toggles.count == 1, let state = toggles.first,
@@ -118,17 +122,17 @@ public enum ChromeExtensionFolder {
                         "action": .string("mac.look"), "args": .object(["app": .string("com.google.Chrome")])]))
             }
             if state == "unchecked" || state == "off" {
-                try require(await hands.act(verb: "click", target: "Developer mode", app: "com.google.Chrome"))
+                try require(await hands.act(verb: "click", target: "Developer mode", app: "com.google.Chrome", turn: turn, context: context))
             }
-            try require(await hands.act(verb: "click", target: "Load unpacked", app: "com.google.Chrome"))
+            try require(await hands.act(verb: "click", target: "Load unpacked", app: "com.google.Chrome", turn: turn, context: context))
             try require(await hands.act(verb: "key", target: "", app: "com.google.Chrome", steps: [
                 .init(verb: "key", target: "cmd+shift+g"),
                 .init(verb: "type", target: "focused field", text: folder.path),
                 .init(verb: "key", target: "return"),
-            ]))
+            ], turn: turn, context: context))
             let selectedAt = Date()
-            try require(await hands.act(verb: "click", target: "Select", app: "com.google.Chrome"))
-            try await chrome.verifySetup(since: selectedAt)
+            try require(await hands.act(verb: "click", target: "Select", app: "com.google.Chrome", turn: turn, context: context))
+            try await chrome.verifySetup(since: selectedAt, context: context)
             return folder
         }
     }

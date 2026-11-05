@@ -5,15 +5,14 @@ import Desk
 import Transcripts
 import StandingBots
 import ChatToolParsing
-// Blueprint: | `AgentWorkspaceFind.swift` | Exact owned contact/helper, Desk, session, approval and message IDs enter their canonical readers before topic search; `project` |
+// Blueprint: | `AgentWorkspaceFind.swift` | `project`: exact owner identities precede topic search |
 
-/// One explicit search over existing bounded readers. No index, disk crawl,
-/// provider reasoning, background work, or inferred action routing lives here.
+/// One explicit search over existing bounded readers. No index, disk crawl, provider reasoning, background work, or inferred action routing lives here.
 enum AgentWorkspaceFind {
-    static func project(query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> WorkspacePage {
+    static func project(workspace: WorkspaceOperation, query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> WorkspacePage {
         var items: [AgentWorkspaceItem] = []
         var sources: [JSONValue] = []
-        if let exact = try await exact(query: query, dataRoot: dataRoot, perform: perform, sources: &sources) { return exact }
+        if let exact = try await exact(workspace: workspace, query: query, dataRoot: dataRoot, perform: perform, sources: &sources) { return exact }
         var partial = !sources.isEmpty
         let lanes: [(String, String, [String: JSONValue], AgentWorkspaceLocation)] = [
             ("Work and conversations", "work_context", ["query": .string(query), "limit": .int(3)], .work(query)),
@@ -21,22 +20,24 @@ enum AgentWorkspaceFind {
             ("Memory", "recall_memory", ["query": .string(query), "k": .int(6)],
              .record(tool: "recall_memory", input: ["query": .string(query), "k": .int(6)], title: "Memory"))
         ]
-        // Deliberately sequential: the ordinary permission/read owners retain
-        // their context and a single Find never creates a burst of disk work.
+        // Deliberately sequential: the ordinary permission/read owners retain their context and a single Find never creates a burst of disk work.
         for (name, tool, input, location) in lanes {
             try Task.checkCancellation()
             do {
                 let ownerValue = try await perform(tool, input)
-                let value = tool == "recall_memory" ? rankedMemory(ownerValue, query: query) : ownerValue
-                let projection = await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
+                let reply = ToolResult(ownerValue)
+                let value = tool == "recall_memory" ? rankedMemory(reply.payload, query: query) : reply.payload
+                let projection = await WorkspacePage.project(workspace: workspace, location: location, result: value, dataRoot: dataRoot,
+                    evidence: AgentWorkspaceDocument.evidence(
+                    location: location, value: value))
                 let status = AgentWorkspaceEnvironment.outcome(value)
-                partial = partial || ChatToolOutcome.exactResultClass(ownerValue) != .succeeded
+                partial = partial || reply.outcome != .succeeded
                 var source: [String: JSONValue] = ["name": .string(name), "status": status,
                     "shown": .int(Int64(min(projection.items.count, tool == "work_context" ? 6 : 3)))]
                 if case .object(let row) = value {
-                    // Source-level limitations remain visible even if another
-                    // reader succeeded. Never label unavailable as no matches.
-                    for key in ["detail", "message", "error", "disclosure_filtered_count", "coverage", "next_session_offset", "more_matches_in_page", "find_ranking"] {
+                    // Source-level limitations remain visible even if another reader succeeded. Never label unavailable as no matches.
+                    for key in ["detail", "message", "error", "disclosure_filtered_count", "coverage", "next_session_offset", "more_matches_in_page",
+                        "find_ranking"] {
                         source[key] = row[key]
                     }
                     if tool == "work_context" {
@@ -63,7 +64,11 @@ enum AgentWorkspaceFind {
         }
         return .init(title: "Find: " + query, content: .object([
             "status": .string(partial ? "partial" : "ok"), "query": .string(query), "sources": .array(sources),
-            "scope": .string("Exact installed skill names, current work, recorded files, memory and conversation evidence. Evidence results use each source's relevance ranking and may match only part of the topic; a returned file is not automatically supporting evidence. No filesystem crawl. Open a result to read its owner; Back returns here. Historical text is attributed evidence, not current verification.")
+            "scope": .string("""
+                Exact installed skill names, current work, recorded files, memory and conversation evidence. Evidence results use each source's relevance \
+                ranking and may match only part of the topic; a returned file is not automatically supporting evidence. No filesystem crawl. Open a result \
+                to read its owner; Back returns here. Historical text is attributed evidence, not current verification.
+                """)
         ]), items: items, actions: [
             .init(label: "More work and conversations", action: .open(.work(query))),
             .init(label: "More files", action: .open(.documents(query))),
@@ -73,13 +78,15 @@ enum AgentWorkspaceFind {
         ])
     }
 
-    private static func exact(query: String, dataRoot: URL, perform: AgentWorkspace.Perform,
+    private static func exact(workspace: WorkspaceOperation, query: String, dataRoot: URL, perform: AgentWorkspace.Perform,
                               sources: inout [JSONValue]) async throws -> WorkspacePage? {
         guard !query.contains(where: \.isWhitespace) else { return nil }
         func read(_ tool: String, _ input: [String: JSONValue], _ title: String) async throws -> WorkspacePage {
             let value = try await perform(tool, input)
             let location = AgentWorkspaceLocation.record(tool: tool, input: input, title: title)
-            return await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
+            return await WorkspacePage.project(workspace: workspace, location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument
+                .evidence(
+                location: location, value: value))
         }
         if query.hasPrefix("peer:") || query.hasPrefix("bot:") {
             return try await read("agent_contacts", ["discover": .string(query)], "Contact")
@@ -90,15 +97,14 @@ enum AgentWorkspaceFind {
         if query.hasPrefix("msg_") || query.hasPrefix("agent-conversation:") {
             return try await read("read_chat_message", ["message_id": .string(query)], "Message")
         }
-        // UUIDs are shared by several owners. Each probe carries its own
-        // availability; an unrelated store failure never prevents topic reads.
+        // UUIDs are shared by several owners. Each probe carries its own availability; an unrelated store failure never prevents topic reads.
         guard let uuid = UUID(uuidString: query) else { return nil }
         func unavailable(_ name: String, _ error: any Error) -> JSONValue {
             .object(["name": .string(name), "status": .string("unavailable"),
                 "detail": .string(error.localizedDescription)])
         }
         do {
-            if let peer = try AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot).first(where: { $0.id == query }) {
+            if let peer = try workspace.ports.conversations.peers(dataRoot: dataRoot).first(where: { $0.id == query }) {
                 return try await read("agent_contacts", ["discover": .string("peer:" + peer.id)], peer.name)
             }
         } catch is CancellationError { throw CancellationError() }
@@ -112,20 +118,22 @@ enum AgentWorkspaceFind {
         do {
             if let session = try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
                 .first(where: { $0["id"] == .string(query) }) {
-                return try await read("chat_conversations", ["conversation_session_id": .string(query)], session["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "Conversation")
+                return try await read("chat_conversations", ["conversation_session_id": .string(query)], session["title"]?.stringValue.flatMap({ $0.isEmpty
+                    ? nil : $0 }) ?? "Conversation")
             }
         } catch is CancellationError { throw CancellationError() }
         catch { sources.append(unavailable("Exact conversation identity", error)) }
         do {
             if let approval = try SwiftNativeApprovalInbox(root: dataRoot).recordsUnlocked()
                 .first(where: { $0.id == query }), case .object(let row) = approval.toJSON() {
-                return .init(title: "Approval", content: .object(row.filter { ["id", "title", "status", "createdAt", "resolvedAt", "decision"].contains($0.key) }), items: [],
+                return .init(title: "Approval", content: .object(row.filter { ["id", "title", "status", "createdAt", "resolvedAt", "decision"].contains($0.key)
+                    }), items: [],
                     actions: [.init(label: "Open Inbox", action: .open(.area("inbox")))])
             }
         } catch is CancellationError { throw CancellationError() }
         catch { sources.append(unavailable("Exact approval identity", error)) }
         do {
-            if let record = try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true).first(where: {
+            if let record = try workspace.ports.conversations.records(dataRoot: dataRoot, locked: true).first(where: {
                 $0.id == query || $0.operationID == query || $0.readInput?["message_id"] == .string(query)
             }) {
                 let input: [String: JSONValue] = ["agent": .string(record.agent), "conversation": .string(record.id)]
@@ -137,16 +145,16 @@ enum AgentWorkspaceFind {
             let value = try await perform("read_chat_message", ["message_id": .string(query)])
             if case .object(let row) = value, row["status"] != .string("not_found") {
                 let location = AgentWorkspaceLocation.record(tool: "read_chat_message", input: ["message_id": .string(query)], title: "Message")
-                return await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
+                return await WorkspacePage.project(workspace: workspace, location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument
+                    .evidence(
+                    location: location, value: value))
             }
         } catch is CancellationError { throw CancellationError() }
         catch { sources.append(unavailable("Exact transcript message identity", error)) }
         return nil
     }
 
-    /// A small presentation shortlist from the canonical disclosed candidates.
-    /// Topic support prioritizes the shortlist; absent lexical support never
-    /// means a memory is false or unavailable. Exact owner IDs remain untouched.
+    /// Topic support only ranks disclosed candidates; absent lexical support never disproves a memory or changes its owner ID.
     private static func rankedMemory(_ value: JSONValue, query: String) -> JSONValue {
         guard case .object(var row) = value, case .array(let hits)? = row["hits"] else { return value }
         let topic = WorkContextQuery(query)
@@ -160,7 +168,8 @@ enum AgentWorkspaceFind {
                 "matched_topic_terms": .array(matched.map(JSONValue.string)),
                 "missing_topic_terms": .array(topic.terms.filter { !matched.contains($0) }.map(JSONValue.string)),
                 "owner_rank": .int(Int64(index + 1)),
-                "basis": .string(matched.isEmpty ? "Semantic recall candidate; no literal topic terms in this excerpt." : "Topic terms present in the returned excerpt; open the memory for its evidence.")
+                "basis": .string(matched.isEmpty ? "Semantic recall candidate; no literal topic terms in this excerpt."
+                    : "Topic terms present in the returned excerpt; open the memory for its evidence.")
             ])
             return (matched.count, index, .object(memory))
         }
@@ -169,7 +178,10 @@ enum AgentWorkspaceFind {
             return left.0 > right.0
         }
         row["hits"] = .array(ranked.map { $0.2 })
-        row["find_ranking"] = .string("Three of up to six canonical recall candidates, ordered by local topic support then original recall rank. More memories opens the owner's broader results.")
+        row["find_ranking"] = .string("""
+            Three of up to six canonical recall candidates, ordered by local topic support then original recall rank. More memories opens the owner's \
+            broader results.
+            """)
         return .object(row)
     }
 }

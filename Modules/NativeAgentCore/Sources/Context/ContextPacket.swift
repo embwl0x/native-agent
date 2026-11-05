@@ -30,19 +30,11 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
     public let representation: ContextPacketRepresentation
     public let mandatory: Bool
     public let characterCount: Int
-    /// The atom's `deterministicSummary` (the `summary` column of
-    /// `context_atom_versions`), carried alongside the body so a renderer can
-    /// lead with the RULE and leave the story behind a pointer without a second
-    /// store read. Nil when the compiler produced no summary for this atom.
-    /// Empty/whitespace summaries are normalized to nil here so every reader
-    /// gets one answer to "is there a lead".
+    /// Carry the summary with its body so renderers can lead with the rule without a second store read; normalize blank summaries to nil for all readers.
     public let summary: String?
-    /// When the memory this atom carries was recorded, so the renderer can lead
-    /// with its age instead of handing every memory over as equally present.
-    /// Memory atoms only; nil where the source has no recorded timestamp.
+    /// Only a memory's recorded timestamp supports an age tag; missing source time claims no age.
     public let recordedAt: Date?
-    /// How the memory came to be known (`verified` / `told by X` / `inferred`),
-    /// when the source record says; nil when that evidence is unavailable.
+    /// Render provenance only when the source record supplies evidence.
     public let provenance: ContextMemoryProvenance?
     /// Untrusted sources of the selected text, retained from its exact atom.
     public let untrustedSources: [String]?
@@ -68,9 +60,7 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
         self.provenance = provenance
         self.untrustedSources = untrustedSources
     }
-    /// The item as built from the atom it came from: identical to the
-    /// designated init, plus the memory facts the renderer needs and only the
-    /// atom knows (its recorded time and provenance).
+    /// Carry recorded time and provenance from the same atom as the text.
     public init(
         atom: ContextStoredAtom,
         generationID: Int64,
@@ -127,8 +117,7 @@ extension ContextPacketItem {
                 tokenStart = next
             } else if character == "." || character == "!" || character == "?" {
                 let endsToken = next == window.endIndex || window[next].isWhitespace
-                // A scheme anywhere in the token this terminator closes means
-                // the terminator is punctuation the URL may own.
+                // A scheme in the token means its terminator may belong to the URL.
                 let tokenIsURL = window[tokenStart..<next].contains("://")
                 if endsToken, !insideCodeSpan, !tokenIsURL {
                     lastSentenceBoundary = next
@@ -157,8 +146,7 @@ public struct ContextPacket: Codable, Equatable, Sendable {
     public let degradedSources: [ContextDegradedSourceNotice]
     /// Selection-time accounting, retained when verification excludes items.
     public let budget: ContextBudgetUsage
-    /// Original selection evidence; outcome feedback retains these IDs while
-    /// serve feedback credits only the verified delivered items.
+    /// Original selection evidence; outcome feedback retains these IDs while serve feedback credits only the verified delivered items.
     public let receipt: ContextSelectionReceipt
 
     public var characterCount: Int { budget.usedCharacters }

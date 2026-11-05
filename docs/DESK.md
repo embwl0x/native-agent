@@ -80,7 +80,7 @@ task's events (`next_offset` is null on the final page). The workspace offers
 preserving the task, page size, and finished-work filter.
 Archive and shared-ledger histories decode every record and link, or expose
 that history as unavailable with its cause and repair. The shared ledger's
-current actors are `claude`, `assistant`, `codex` and `user`; its compaction
+actor is `agent`, `user` or one saved contact as `peer:<id>`; its compaction
 base requires its recorded operation count.
 
 The `task-ledger` CLI parses every option, including `--data-root`, before
@@ -94,8 +94,9 @@ Bare defer days include the named day. Snooze choices therefore say
 **Through tomorrow** and **Through [date]**, resuming at the following local
 midnight; a full timestamp keeps its exact instant.
 
-`summary` is the word on both `desk.add` and `desk.close`; the previous
-`outcome_summary` spelling is refused. Wait explanations use `note`.
+`desk.add` takes an optional `summary`. `desk.close` takes `reason`, the same word
+`queue.done` and `queue.drop` take; `summary` and `outcome_summary` are refused
+there. Wait explanations use `note`.
 
 `desk.wait {handle, on:"User", note?}` puts an item in **waiting on User** in
 one call. `on:"owner"` names the owner without needing their name.
@@ -128,25 +129,19 @@ For a four-call work record (using the handle returned by the first call):
 1. `desk.add {kind:"plan", project:"Example", title:"Review the draft", summary:"Two review steps"}`
 2. `desk.note {handle, text:"1. Read the draft.\n2. Record the requested changes."}`
 3. `desk.wait {handle, on:"User", note:"Awaiting the decision"}`
-4. `desk.close {handle, summary:"User asked to close this record"}`
+4. `desk.close {handle, reason:"User asked to close this record"}`
 
 These are action argument shapes for `app {action:"desk.…", args:{…}}`.
 Recorded notes and summaries are records, not proof of external work.
 
-Workshop reads retain complete, partial, absent or unavailable evidence and
-continue to the next step without requiring `optional`. A failed read does not
-satisfy required evidence; the next step decides from the retained receipt.
-The action's read contract applies even when Trust assigns a different permission class.
-Admission, Trust and approval gates still apply before a call runs.
-Cancellation, failed effects and unresolved effects stop traversal; outcome
-details name the resolved tool.
-
-`WorkshopDeskReceiptBridge` maps successful execution to `done`, retaining unverified
-or missing verification in the summary and receipt. Failed declared postconditions
-block on `domain verification`; canceled/stopped executions become `canceled`,
-and other execution failures block.
-Work-session disposition settlement separately closes pursuits as `done` for retained
-`goalSatisfied` or `canceled` for `abandon`, under its existing revision and latest-attempt guards.
-`WorkshopExecutionRecord` owns execution terminality and success, including historical
-spellings. File writes verify by bounded byte read-back, commands by exit/timeout evidence,
-and reads by saved complete/partial coverage. Declared output phrases are exact postconditions.
+A task the person starts (the Mac's new-task sheet, the phone's
+`submitDeskTask`, the Shortcuts intent) creates a Desk item and starts a
+[line of theirs](agent-communication.md#jobs) with `desk:` set to that item
+(`NativeAgentEngine.submitDeskTask`, `EngineRuntime/EngineDesk.swift`). The
+line's ending wakes their own work conversation, where they settles the item
+themselves.
+A job that carries a Desk item is that item's movement: Desk activity, the live
+strip, the widget's **Working on…** line and the phone's `desk.json` evidence
+come from their jobs (`DeskMovementPresentation.evidence`,
+`EngineRuntime/DeskActivityPresentation.swift`), and the Work overview's
+execution rows are their jobs.

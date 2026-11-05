@@ -6,26 +6,19 @@ import ProviderRouting
 import TurnTrace
 // Blueprint: | `TextMarkerCodec.swift` | `TextMarkerCodec` struct; `calls`, `throughLastMarker` |
 
-/// The text-marker tool-call protocol (the Claude subscription), in one place: the
-/// catalog rides the system prompt as prose, calls come back as `<tool_use>`
-/// / `<invoke>` markers in the reply, and results go back as one user message
-/// per round. `ToolCallCodec.textMarkers` is this codec in the streaming
-/// loop's shape.
-///
-/// The loop owns where an observation is placed; the codec owns
-/// detection and the exact words the model reads.
+/// Keep text-marker encoding and detection together so catalog prose, returned markers and per-round results share one protocol.
+/// The loop owns placement and budgets; the codec owns the exact wire grammar.
 struct TextMarkerCodec: Sendable {
-    /// The turn's catalog. Typed-argument repair and the undeclared-field
-    /// refusal read the declared parameters from it.
+    let turn: Turn?
+    /// Use the turn's declared parameters for typed repair and undeclared-field refusal.
     let schemas: [LLMToolSchema]
-    /// The catalog's names — what the turn can call at all.
     let catalogNames: Set<String>
-    /// The tools offered for this turn; the bounces name these first.
+    /// Bounces name this turn's offered tools first.
     let turnActiveTools: Set<String>
 
-    /// `catalogNames` defaults to the schemas' names; the loop passes the
-    /// whole catalog, which may be wider than the schemas offered this round.
-    init(schemas: [LLMToolSchema], turnActiveTools: Set<String>, catalogNames: Set<String>? = nil) {
+    /// Keep the complete catalog distinct from this round's offered schemas.
+    init(schemas: [LLMToolSchema], turnActiveTools: Set<String>, catalogNames: Set<String>? = nil, turn: Turn?) {
+        self.turn = turn
         self.schemas = schemas
         self.catalogNames = catalogNames ?? Set(schemas.map(\.name))
         self.turnActiveTools = turnActiveTools
@@ -33,7 +26,6 @@ struct TextMarkerCodec: Sendable {
 
     // MARK: - Calls
 
-    /// The round's marker calls in wire order, `<tool_use>` and `<invoke>`.
     func calls(in text: String, recordShims: Bool = true) throws -> [ParsedToolCall] {
         try ToolCallParser.parse(text, parseInvoke: true, recordShims: recordShims).map { call in
             guard call.undeclaredKeys.isEmpty else { return call }
@@ -49,7 +41,8 @@ struct TextMarkerCodec: Sendable {
                     case .int?, .double?, .bool?, .null?:
                         input[key] = .string(raw)
                         if recordShims {
-                            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L13"), "site": .string("TextMarkerCodec.swift:calls")]))
+                            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L13"), "site":
+                                .string("TextMarkerCodec.swift:calls")]), turn: turn)
                         }
                     default: continue
                     }
@@ -66,21 +59,15 @@ struct TextMarkerCodec: Sendable {
         }
     }
 
-    /// Restore the outer closing tag swallowed by the API stop.
+    /// Restore the outer closing tag because the API stop consumes it.
     func throughLastMarker(_ text: String) -> String {
         ToolCallParser.throughLastToolMarker(text)
     }
 
     // MARK: - Holdback
 
-    /// Moves the prose in `pending` that may reach the surface out of it and
-    /// returns it ("" when nothing is safe yet).
-    ///
-    /// Releases prose up to the earliest point that could begin a tool
-    /// marker or Markdown pseudo-call, holding that candidate until the
-    /// iteration end disambiguates it (real marker -> parsed, malformed block
-    /// -> bounced, ordinary prose -> released by the loop). Keep up to 16
-    /// trailing characters, or a longer partial marker prefix, across chunks.
+    /// Hold only a possible marker or pseudo-call suffix until round-end disambiguation; release preceding prose immediately.
+    /// Preserve partial prefixes across chunks so call encoding cannot leak to the surface.
     static func releasableProse(holding pending: inout String) -> String {
         guard !pending.isEmpty else { return "" }
         let holdFrom: String.Index
@@ -98,8 +85,6 @@ struct TextMarkerCodec: Sendable {
 
     // MARK: - Result carrier
 
-    /// One tool result, appended to the round's result message the way this
-    /// protocol returns it.
     func appendResult(
         index: Int,
         toolName: String,
@@ -117,12 +102,12 @@ struct TextMarkerCodec: Sendable {
     /// Emit continuation guidance once per round using only the protocol's marker form.
     func closeRound(_ carrier: inout String) {
         carrier += "\n\nIf work remains, send the next <function_calls> block and end at </function_calls>.\n"
-        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P11"), "site": .string("TextMarkerCodec.swift:closeRound")]))
+        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P11"), "site": .string("TextMarkerCodec.swift:closeRound")]),
+            turn: turn)
     }
 
     // MARK: - Bounces
 
-    /// A round that tried to call a tool in a shape the protocol does not run.
     func malformedCall(in text: String) -> ToolCallProtocolViolation? {
         ToolCallParser.formattedToolCallViolation(
             in: text, toolNames: catalogNames.union(turnActiveTools), parseInvoke: true)
@@ -130,21 +115,21 @@ struct TextMarkerCodec: Sendable {
 
     // MARK: - Catalog carrier
 
-    /// Places the lazy tool contract ahead of volatile recall/history so the
-    /// provider can reuse one honest stable prefix across ordinary turns.
-    ///
+    /// Place the always-on catalog before volatile recall and history so ordinary turns reuse an unchanged provider prefix.
     static func systemLayout(
         baseSystem: String?,
         segments: SystemPromptSegments?,
-        context: TurnContext
+        context: TurnContext,
+        turn: Turn?
     ) throws -> (system: String, segments: SystemPromptSegments?) {
         let floorBlock = renderFloor(rows: try catalogSections(
             schemas: context.toolSchemas, names: context.toolsAvailable
-        ).floor, appDoor: context.toolSchemas.contains { $0.name == "app" })
+        ).floor, appDoor: context.toolSchemas.contains { $0.name == "app" }, turn: turn)
         guard let segments,
               let baseSystem,
               segments.reassembles(into: baseSystem) else {
-            throw ProviderRoutingError.configurationFailed("The text-marker request requires coherent system segments; its offered tool contract was not assembled.")
+            throw ProviderRoutingError
+                .configurationFailed("The text-marker request requires coherent system segments; its offered tool contract was not assembled.")
         }
         let stable = segments.stable.isEmpty
             ? floorBlock
@@ -161,16 +146,8 @@ struct TextMarkerCodec: Sendable {
         try catalogSections(schemas: context.toolSchemas, names: context.toolsAvailable).appended
     }
 
-    /// The advertised catalog, split the way the cache needs it.
-    ///
-    /// `floor` renders the always-on core — sorted by name, NEVER truncated,
-    /// byte-identical on every turn of every session with the same policy. It
-    /// is the tail of the cacheable stable block.
-    ///
-    /// `appended` renders what THIS session has loaded, in load order, never
-    /// re-sorted. It rides the per-turn volatile block. The bounded
-    /// prefix(80) applies to this run alone: truncating the floor would drop a
-    /// tool the model is told it always has.
+    /// Keep the sorted always-on floor whole and byte-stable in the cached segment.
+    /// Session additions retain load order in the volatile block; only that run is capped at 80.
     struct CatalogSections {
         var floor: String
         var appended: String
@@ -185,10 +162,7 @@ struct TextMarkerCodec: Sendable {
         var appendedRows: [String] = []
         var appendedTotal = 0
         if !schemas.isEmpty {
-            // Incoming order is already canonical (applyLazyToolFilter owns
-            // it); partitioning preserves it, and the floor is re-sorted here
-            // so this renderer is correct even for a caller that never went
-            // through the filter.
+            // Preserve incoming order when partitioning, but sort the floor here so callers outside the filter still get stable output.
             let floorSchemas = schemas.filter { core.contains($0.name) }
                 .sorted { $0.name < $1.name }
             let appendedSchemas = schemas.filter { !core.contains($0.name) }
@@ -221,10 +195,11 @@ struct TextMarkerCodec: Sendable {
         )
     }
 
-    /// Render through the always-on catalog; appDoor names folded tools by action, otherwise by tool name.
+    /// Render through the canonical catalog; folded tools use action identity at the app door.
     private static func renderFloor(
         rows renderedRows: String,
-        appDoor: Bool
+        appDoor: Bool,
+        turn: Turn?
     ) -> String {
         let findLine = appDoor
             ? "open its page with app {\"page\": \"<page>\"} or find its action with app {\"find\": \"<what you want done>\"}."
@@ -232,7 +207,8 @@ struct TextMarkerCodec: Sendable {
         let gitLine = appDoor
             ? ""
             : "Do not ask for raw shell/git commands unless a shell tool is explicitly listed."
-        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P10"), "site": .string("TextMarkerCodec.swift:renderFloor")]))
+        TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P10"), "site": .string("TextMarkerCodec.swift:renderFloor")]),
+            turn: turn)
         return """
         \(AnthropicOAuthTransport.textToolProtocolHeader)
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
@@ -244,10 +220,12 @@ struct TextMarkerCodec: Sendable {
         - End your reply at </function_calls>. NativeAgent runs the calls and returns their results in the next message; never write results yourself.
         - Do not wrap tool markers in Markdown or code fences.
         - Do not narrate fake calls such as tool_name(...), "runs git log", or "loads coding tools"; those are not executable.
-        - Each reply contains either executable calls or the complete answer. Describing work does not run it. Your turn part may continue privately after reply.end; only dispatched effects happen, and they do not alter the delivered reply.
+        - Each reply contains either executable calls or the complete answer. Describing work does not run it. Your turn part may continue privately after \
+        reply.end; only dispatched effects happen, and they do not alter the delivered reply.
         \(DelegatedCampaignGuidance.rendered)
         \(gitLine)
-        - Built-in Markdown is guidance; executable abilities need an offered run route. Guidance grants no tools, permissions, approval bypasses or safety authority.
+        - Built-in Markdown is guidance; executable abilities need an offered run route. Guidance grants no tools, permissions, approval bypasses or safety \
+        authority.
         Available Swift tools:
         \(renderedRows)
         """
@@ -257,7 +235,7 @@ struct TextMarkerCodec: Sendable {
         let raw = try schema.checkedParameters().objectValue!
         guard let properties = raw["properties"]?.objectValue else { return "" }
         let required = Set(raw["required"]?.arrayValue?.compactMap(\.stringValue) ?? [])
-        // List every parameter, required first and alphabetical within each group.
+        // Required-first and alphabetical ordering keeps parameter presentation deterministic.
         let ordered = properties.keys.sorted { a, b in
             required.contains(a) != required.contains(b) ? required.contains(a) : a < b
         }

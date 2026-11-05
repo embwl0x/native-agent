@@ -1,18 +1,11 @@
 import Foundation
 import GRDB
 import PersistenceCore
-// Blueprint: | `KnowledgeGraph+CanonicalRebuild.swift` | `SwiftNativeKnowledgeGraphIndexer`: `rebuildMemoryDerivedGraphFromCanonicalStore`, `reconcileMemoryIndexFingerprints` |
+// Blueprint: | `KnowledgeGraph+CanonicalRebuild.swift` | `SwiftNativeKnowledgeGraphIndexer`, `rebuildMemoryDerivedGraphFromCanonicalStore`, `reconcileMemoryIndexFingerprints` |
 
 extension SwiftNativeKnowledgeGraphIndexer {
-    /// Rebuild every MemoryV2-owned KG row from the canonical `memories` table
-    /// in one database write transaction. It removes additive claims from changed
-    /// facts, preserves independently owned entities without the indexer provenance
-    /// stamp, and snapshots canonical rows under the same SQLite write lock so
-    /// a concurrent memory mutation lands either before the rebuild snapshot or
-    /// afterward through its ordinary indexing hook — never in a lost window.
-    ///
-    /// With production off, retire owned rows without rederiving them. The
-    /// reconciler supplies one checked mode for the complete transaction.
+    /// Rebuild MemoryV2-owned rows and snapshot canonical memories under one SQLite write lock so concurrent writes cannot fall between snapshot and indexing.
+    /// Preserve independently owned entities; when production is off, retire owned rows without rederiving them using one checked mode.
     public func rebuildMemoryDerivedGraphFromCanonicalStore(
         producing: Bool = true
     ) async throws -> KnowledgeGraphMemoryRebuildReport {
@@ -25,8 +18,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     ) async throws -> KnowledgeGraphMemoryRebuildReport {
         let dbPool = try await pool()
         return try await dbPool.write { db in
-            // A cold write awaiting admission (MemoryV2's `admission_pending`)
-            // is not a fact until its vector lands; its landing re-indexes it.
+            // A cold write awaiting admission (MemoryV2's `admission_pending`) is not a fact until its vector lands; its landing re-indexes it.
             let rows = try Row.fetchAll(db, sql: """
                 SELECT id, content, source, status, created_at, updated_at,
                        metadata_json, valid_from, valid_to
@@ -43,8 +35,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             let ownedIndexerPlaceholders = Self.ownedIndexerVersions
                 .map { _ in "?" }
                 .joined(separator: ", ")
-            // Clear memory-derived summaries on foreign-owned entities before
-            // surviving facts rederive them, including when production is off.
+            // Clear memory-derived summaries on foreign-owned entities before surviving facts rederive them, including when production is off.
             try db.execute(sql: """
                 UPDATE kg_entities SET summary = NULL,
                     metadata_json = json_remove(metadata_json,
@@ -129,9 +120,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// Check the complete canonical fingerprint set, including existing rows.
-    /// Drift rebuilds under the canonical write lock so stale derived claims
-    /// are removed as well as missing ones restored.
+    /// Check the complete canonical fingerprint set, including existing rows. Drift rebuilds under the canonical write lock so stale derived claims are removed
+    /// as well as missing ones restored.
     @discardableResult
     public func reconcileMemoryIndexFingerprints() async throws -> Int {
         let identity = try resolvedExtractionIdentity()
@@ -164,7 +154,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity).factsIndexed
     }
 
-    /// Projection stamps identify the rows rebuilt from MemoryV2.
     private static let ownedIndexerVersions = [indexVersion]
 
 }

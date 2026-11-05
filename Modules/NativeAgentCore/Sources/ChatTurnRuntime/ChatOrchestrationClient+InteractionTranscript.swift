@@ -15,17 +15,13 @@ import ChatToolRuntime
 import ChatTurnContracts
 import ChatToolParsing
 import ToolRegistry
-// Blueprint: | `ChatOrchestrationClient+InteractionTranscript.swift` | `SwiftNativeChatOrchestrationClient`: tool/approval/card rows, same-row CAS and exact replay witnesses; one locked append reuses open asks by tool and subject within a conversation; shared receipt redaction policy |
+// Blueprint: | `ChatOrchestrationClient+InteractionTranscript.swift` | `SwiftNativeChatOrchestrationClient`; Locked card deduplication and redacted receipts |
 
 extension SwiftNativeChatOrchestrationClient {
-    /// Tool results are live-turn data, not durable context. Persist only a
-    /// bounded, redacted receipt so tool_catalog/read_file/bash outputs cannot
-    /// inflate every future transcript read. The full value remains available
-    /// to the provider during the tool loop that produced it.
+    /// Persist bounded redacted receipts so large tool output cannot inflate future history; the live provider still gets the full result.
     private static let persistedToolInputMaximumCharacters = 4_000
     private static let persistedToolResultMaximumCharacters = 8_000
 
-    /// Persist a tool dispatch as the transcript's tool pill.
     func appendToolMessage(
         sessionId: String,
         runId: String?,
@@ -36,20 +32,24 @@ extension SwiftNativeChatOrchestrationClient {
         result: JSONValue,
         ok: Bool,
         cognitiveResult: ChatToolOutcome.CognitiveResult? = nil,
-        source: String = "app"
+        source: String,
+        turn: Turn
     ) async throws {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
         }
         let messageSource = ChatThreadKind.normalizedSource(source)
+        // The row records a source; envelopes and peer checks speak surfaces, so cross once here.
+        let messageSurface = ChatThreadKind.surface(transcriptSource: messageSource)
         let originalResult = result
+        let reply = ToolResult(originalResult)
         let inputJSON = try input.serialize(pretty: false)
         let safeInputJSON = Self.boundedRedactedToolReceipt(
-            try MacInjectionArgRedaction.redactedPayload(tool: toolName, payload: input).serialize(pretty: false),
+            try MacInjectionArgRedaction.redactedPayload(tool: toolName, payload: input, turn: turn).serialize(pretty: false),
             maximumCharacters: Self.persistedToolInputMaximumCharacters, label: "tool input")
         let ranTool = ranCall?.tool ?? ToolNameAliases.shown(toolName, input: input).name
         let safeResult = MacInjectionResultRedaction.redacted(tool: ranTool,
-            result: MacScreenViewResultRedaction.redacted(tool: ranTool, result: result))
+            result: MacScreenViewResultRedaction.redacted(tool: ranTool, result: result), turn: turn)
         let safeResultJSON = try safeResult.serialize(pretty: false)
         let safeResultSummary = PersistedToolReceipt.project(tool: ranTool, value: safeResult, json: safeResultJSON,
             maximumCharacters: Self.persistedToolResultMaximumCharacters)
@@ -59,7 +59,8 @@ extension SwiftNativeChatOrchestrationClient {
         let canonicalToolRisk = SwiftNativeSecurityCenter.canonicalToolRisk(
             tool: toolName,
             input: canonicalRiskInput,
-            dataRoot: dataRoot
+            dataRoot: dataRoot,
+            turn: turn
         )
         let path = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
@@ -78,9 +79,7 @@ extension SwiftNativeChatOrchestrationClient {
         ]
         if let runId { record["runId"] = .string(runId) }
         let pendingApprovalID = ChatTranscriptToolMessageKind.pendingApprovalID(in: originalResult)
-        // The approval card's own text lives on the row it is drawn from. Only
-        // an approval row gets one; every other tool receipt keeps its empty
-        // content exactly as before.
+        // Only approval rows carry the card's own display text; other receipt content remains empty.
         if pendingApprovalID != nil,
            let asked = ChatTranscriptToolMessageKind.pendingApprovalReason(in: originalResult) {
             record["content"] = .string(asked)
@@ -89,7 +88,7 @@ extension SwiftNativeChatOrchestrationClient {
         let requestedInteraction = InlineInteractionNeed.interaction(in: originalResult)
         let raisedInteraction = requestedInteraction.map { Self.scrubbedCardDisplay($0) }
         var stampedInteraction: InlineInteraction?
-        let origin = TurnEnvelope.current(surface: messageSource)
+        let origin = TurnEnvelope.current(turn: turn, surface: messageSurface)
         var metadata: [String: JSONValue] = [
             "kind": .string(
                 raisedInteraction != nil
@@ -110,14 +109,14 @@ extension SwiftNativeChatOrchestrationClient {
         // These are returned values, never the transcript's own id or runId.
         if let ranCall {
             let raw = try JSONValue.object(ranCall.input).serialize(pretty: false)
-            let safe = Self.redactedPersistedToolInput(tool: ranCall.tool, json: raw)
+            let safe = Self.redactedPersistedToolInput(tool: ranCall.tool, json: raw, turn: turn)
             metadata["ranCall"] = .object(["tool": .string(ranCall.tool),
                 "input": try JSONValue.parse(Data(safe.utf8))])
         }
         // What its generations made, a list's and a script's included, kept before the body is bounded.
         let generated = ChatGeneratedImageArtifacts.generatedImages(ranTool, ranCall?.input ?? canonicalRiskInput, originalResult)
         if !generated.isEmpty { metadata["generatedImages"] = .array(generated) }
-        // What it landed, kept before the body is bounded: a resumed turn still knows her hand.
+        // What it landed, kept before the body is bounded: a resumed turn still knows the agent's hand.
         if let landed = SwiftNativeTurnEngine.landedEffect(originalResult) { metadata["landedEffect"] = .string(landed) }
         if let id = ChatTranscriptEvidenceRendering.returnedIdentifier(originalResult) {
             metadata["resultReturnedID"] = .string(ChatSecretRedactor.redactText(id))
@@ -138,7 +137,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
         var evidence = ChatTranscriptEvidenceRendering.receiptEvidence(call: call, result: safeResult)
         if call == "app script", case .object(var fields) = evidence {
-            fields["peer_sources"] = .array((PeerDataTaint.current?.checkpointSources ?? [])
+            fields["peer_sources"] = .array((turn.peerSteering?.checkpointSources ?? [])
                 .map { .string(ChatSecretRedactor.redactText($0)) })
             evidence = .object(ChatTranscriptEvidenceRendering.restoringReceiptBoundaries(fields))
         }
@@ -153,16 +152,15 @@ extension SwiftNativeChatOrchestrationClient {
                 stamped.continuation = try InlineInteraction.Continuation.stamped(
                     for: stamped, sessionID: sessionId, originRunId: runId,
                     toolName: toolName,
-                    // app card.request is request_interaction: the card is
-                    // the turn's own question, so the turn continues.
+                    // A requested interaction is the turn's own question, so it must not stop the turn as an external approval.
                     toolArgumentsJSON: ranTool == InlineInteractionWire.toolName
                         ? nil
                         : exactArguments,
                     mode: ranTool == InlineInteractionWire.toolName
                         ? .continueTurn
                         : .retryBlockedTool,
-                    peerSurface: messageSource, originEnvelope: origin, dataRoot: dataRoot
-                )
+                    peerSurface: messageSurface, originEnvelope: origin, dataRoot: dataRoot,
+                 turn: turn)
             }
             if let encoded = InlineInteractionNeed.encode(stamped) {
                 metadata[InlineInteractionWire.metadataKey] = encoded
@@ -176,17 +174,11 @@ extension SwiftNativeChatOrchestrationClient {
             // transition to a settled tool receipt.
             metadata["approvalId"] = .string(pendingApprovalID)
         }
-        // Preserve only the existing classifier's exact outcome tag before
-        // receipt clipping/redaction can remove the envelope's status. `ok`
-        // remains transport success; no-status legacy results stay unchanged.
+        // Preserve the classifier's exact status before clipping or redaction removes it; transport success alone proves no completion.
         if case .object(let object) = originalResult,
            case .string(let recordedStatus)? = object["status"] {
-            metadata["resultClass"] = .string(ChatToolOutcome.exactResultClass(originalResult).rawValue)
-            // The class alone cannot tell "queued" from "accepted" from
-            // "running" — they all collapse to `.unknown`, which the renderer
-            // then reported as "completion unconfirmed" even when the envelope
-            // plainly said what state the work reached. Keep the exact word
-            // beside the class so the receipt can say what is actually known.
+            metadata["resultClass"] = .string(reply.outcome.rawValue)
+            // Retain the exact state beside its class: queued, accepted and running all classify as unknown but carry distinct evidence.
             metadata["resultStatus"] = .string(recordedStatus)
         }
         record["metadata"] = .object(metadata)
@@ -302,12 +294,13 @@ extension SwiftNativeChatOrchestrationClient {
                 metadata[InlineInteractionWire.metadataKey] = encoded
             }
             let envelope = inlineInteractionReceiptEnvelope(interaction)
+            let reply = ToolResult(envelope)
             metadata["resultSummary"] = .string(
-                try envelope.serialize(pretty: false)
+                try reply.payload.serialize(pretty: false)
             )
             metadata["resultStatus"] = .string(interaction.state.name)
             metadata["resultClass"] = .string(
-                ChatToolOutcome.exactResultClass(envelope).rawValue
+                reply.outcome.rawValue
             )
             if let summary = interaction.state.outcome?.summary, !summary.isEmpty {
                 metadata["resultBody"] = .string(summary)
@@ -354,16 +347,14 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
-    /// One open ask per conversation, originating tool and subject. The
-    /// duplicate check and append share the transcript lock, so simultaneous
-    /// re-asks return the same card without a second mirror or prompt.
-    /// Transcript JSONL is locally backed up, excluded from production export,
-    /// projected to the phone and listed by PrivacyMap's chat category.
+    /// Deduplicate open asks under the transcript lock so simultaneous repeats cannot create a second card.
+    /// Transcript JSONL stays locally backed up, excluded from public export and projected through the chat privacy category.
     package static func fileInlineInteraction(
         _ interaction: InlineInteraction, sessionID: String, resumeText: String? = nil,
         resumable: Bool = true, toolName: String? = nil, toolArgumentsJSON: String? = nil,
         toolCallId: String? = nil, requestingTool: String? = nil,
-        origin: TurnEnvelope, dataRoot: URL
+        origin: TurnEnvelope, dataRoot: URL,
+        turn: Turn
     ) async throws -> InlineInteraction {
         guard let safeSession = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
@@ -371,11 +362,11 @@ extension SwiftNativeChatOrchestrationClient {
         var stamped = scrubbedCardDisplay(interaction)
         if stamped.continuation == nil {
             stamped.continuation = try InlineInteraction.Continuation.stamped(
-                for: stamped, sessionID: sessionID, originRunId: ChatTurnExecution.current?.historyRunID, toolCallId: toolCallId,
+                for: stamped, sessionID: sessionID, originRunId: turn.run, toolCallId: toolCallId,
                 toolName: toolName, toolArgumentsJSON: toolArgumentsJSON,
                 mode: toolName == nil ? .continueTurn : .retryBlockedTool,
                 state: resumable ? .waiting : .invalidated, resumeText: resumeText,
-                peerSurface: origin.surface, originEnvelope: origin, dataRoot: dataRoot)
+                peerSurface: origin.surface, originEnvelope: origin, dataRoot: dataRoot, turn: turn)
         }
         guard let encoded = InlineInteractionNeed.encode(stamped) else {
             throw ChatOrchestrationError.underlying("The interaction card could not be encoded; no card was filed.")
@@ -394,7 +385,8 @@ extension SwiftNativeChatOrchestrationClient {
             "id": .string(UUID().uuidString.lowercased()), "sessionId": .string(sessionID),
             "role": .string("tool"), "content": .string(""),
             "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
-            "source": .string(origin.surface), "runId": .string(stamped.continuation?.resumeRunId ?? stamped.id),
+            "source": .string(ChatThreadKind.transcriptSource(surface: origin.surface)),
+            "runId": .string(stamped.continuation?.resumeRunId ?? stamped.id),
             "metadata": .object(metadata),
         ])
         let path = dataRoot.appendingPathComponent("chat/messages/\(safeSession).jsonl")
@@ -424,7 +416,6 @@ extension SwiftNativeChatOrchestrationClient {
                     guard case .object(var receipt) = row,
                           case .object(var metadata)? = receipt["metadata"],
                           metadata["toolInvocationId"] != nil else { return }
-                    // Keep the dispatch receipt without minting another card.
                     metadata["kind"] = .string(ChatTranscriptToolMessageKind.toolUse)
                     metadata.removeValue(forKey: InlineInteractionWire.metadataKey)
                     metadata["interactionId"] = .string(card.id)
@@ -446,7 +437,10 @@ extension SwiftNativeChatOrchestrationClient {
                             operation: operation, owner: path.path + " row " + rowID,
                             words: "Saved interaction row \(rowID) is unreadable and was skipped when matching asks: \(error.localizedDescription)",
                             tap: ToolFailureError.fileRepairInstruction(path,
-                                shape: "Repair only interaction row \(rowID)'s payload to the current InlineInteraction contract, retaining its actual identity and continuation."))
+                                shape: """
+                                    Repair only interaction row \(rowID)'s payload to the current InlineInteraction contract, retaining its actual \
+                                    identity and continuation.
+                                    """))
                         continue
                     }
                     if card.id == incoming.id {
@@ -501,9 +495,9 @@ extension SwiftNativeChatOrchestrationClient {
 
     /// Transcripts and card continuations strip tool injection/screenshots, then redact secrets and bound receipts.
     public nonisolated static func redactedPersistedToolResult(
-        tool: String, json: String
+        tool: String, json: String, turn: Turn?
     ) -> String {
-        let safeResult = ChatToolJSONRedaction.redactedResultJSON(tool: tool, json: json)
+        let safeResult = ChatToolJSONRedaction.redactedResultJSON(tool: tool, json: json, turn: turn)
         if let value = try? JSONValue.parse(Data(safeResult.utf8)),
            let receipt = PersistedToolReceipt.project(
             tool: tool, value: value, json: safeResult, maximumCharacters: persistedToolResultMaximumCharacters
@@ -517,9 +511,9 @@ extension SwiftNativeChatOrchestrationClient {
 
     /// The same for a tool's ARGUMENTS: typed secrets by tool, then the
     /// secret redactor and the input cap. Also what a Desk checkpoint keeps.
-    public nonisolated static func redactedPersistedToolInput(tool: String, json: String) -> String {
+    public nonisolated static func redactedPersistedToolInput(tool: String, json: String, turn: Turn?) -> String {
         boundedRedactedToolReceipt(
-            ChatToolJSONRedaction.injectionRedactedArgJSON(tool: tool, json: json),
+            ChatToolJSONRedaction.injectionRedactedArgJSON(tool: tool, json: json, turn: turn),
             maximumCharacters: persistedToolInputMaximumCharacters,
             label: "tool input"
         )

@@ -7,27 +7,13 @@ import MacControl
 // Blueprint: | `SwiftToolDispatcher+InlineInteraction.swift` | `SwiftToolDispatcher`: `impl_request_interaction` |
 
 extension SwiftToolDispatcher {
-    /// Agent raising a need HERSELF, before hitting a wall.
-    ///
-    /// The boundaries raise needs when a tool is already blocked. This is the
-    /// other direction: she can see from the request that she is about to be
-    /// blocked ("can you see my GitHub?") and ask for the one thing that
-    /// unblocks it, instead of making a failing call first so that the failure
-    /// can produce a card.
-    ///
-    /// What she supplies is deliberately thin: a kind, a canonical ID, and the
-    /// prose. Everything that could become an ACTION — the control that opens,
-    /// where it can run, whether it is available at all — comes from the
-    /// registry. She cannot invent a button, name a URL, point at a settings
-    /// path, or widen what a grant covers. An unknown kind or an ID with no
-    /// control returns a plain failure, so an unsupported ask reads as
-    /// unsupported rather than as a card that does nothing.
-    func impl_request_interaction(input: [String: JSONValue]) async -> JSONValue {
-        await Self.requestedInteraction(input: input, dataRoot: dataRoot)
+    /// A predicted need may raise a card before a failing call. The registry alone supplies controls, locations and grant scope; unknown controls fail plainly.
+    func impl_request_interaction(invocation: ChatToolInvocation, input: [String: JSONValue]) async -> JSONValue {
+        await Self.requestedInteraction(invocation: invocation, input: input, dataRoot: dataRoot)
     }
 
     /// Build and validate the request without filing a card, for dispatch and preview.
-    public static func requestedInteraction(input: [String: JSONValue], dataRoot: URL) async -> JSONValue {
+    public static func requestedInteraction(invocation: ChatToolInvocation, input: [String: JSONValue], dataRoot: URL) async -> JSONValue {
         func text(_ keys: String...) -> String? {
             for key in keys {
                 if case .string(let value)? = input[key] {
@@ -55,7 +41,10 @@ extension SwiftToolDispatcher {
                 accepted = "A nonblank string saying what happens if the person declines."
             case "missing_target":
                 path = "$.target"
-                accepted = "A canonical ID supported by the selected kind in request_interaction. Inspect its tool contract; do not invent an ID or widen permission."
+                accepted = """
+                    A canonical ID supported by the selected kind in request_interaction. Inspect its tool contract; do not invent an ID or \
+                    widen permission.
+                    """
             case "invalid_mode":
                 path = "$.mode"
                 accepted = "read, write or read_write"
@@ -84,7 +73,7 @@ extension SwiftToolDispatcher {
         guard let why = text("why", "reason", "message") else {
             return failed("missing_why", "Say in one sentence why this is needed.")
         }
-        let target = text("target", rawKind) ?? (kind == .permission ? text("capability").map { AppleScriptExecution.automationTarget($0) == nil ? "privacy:" + $0 : $0 } : nil) ?? ""
+        let target = text("target", rawKind) ?? ""
         // Every decline states its consequence, using the caller's words or the registry's default.
         let declineConsequence = text("decline_consequence", "consequence")
 
@@ -130,11 +119,9 @@ extension SwiftToolDispatcher {
                 }
             }
             let access = text("mode", "access").flatMap { InlineInteraction.AccessMode(rawValue: $0) }
-            // A chain she can predict is ONE ask. Extra capabilities are
-            // canonical ids from the Mac list; anything the registry does not
-            // know renders unavailable rather than granting something vague.
+            // Group predictable capabilities into one ask; unknown canonical ids stay unavailable.
             var capabilities = target.isEmpty ? [] : [target]
-            if case .array(let extra)? = input["also_needed"] ?? input["additional_targets"] {
+            if case .array(let extra)? = input["also_needed"] {
                 capabilities += extra.compactMap {
                     if case .string(let value) = $0 { return value }
                     return nil
@@ -168,7 +155,15 @@ extension SwiftToolDispatcher {
                         effects: .none, owner: file.path,
                         code: "permission_settings_unavailable",
                         instruction: ToolFailureError.fileRepairInstruction(file,
-                            shape: "The store is a JSON object: known integration entries are objects and any saved read/write axis must be Boolean; _operatorOverrides holds explicit per-axis choices and _mutationReceipts is an array of provenance receipts. Preserve all entries, grants, revocations and receipts; never invent a value, fill an absent axis or grant a missing permission.") + " Repair the saved permission store from its retained bytes before requesting access; preserve the owner's choices."),
+                            shape: """
+                                The store is a JSON object: known integration entries are objects and any saved read/write axis must be Boolean; \
+                                _operatorOverrides holds explicit per-axis choices and _mutationReceipts is an array of provenance receipts. \
+                                Preserve all entries, grants, revocations and receipts; never invent a value, fill an absent axis or grant a \
+                                missing permission.
+                                """) + """
+                                 Repair the saved permission store from its retained bytes before requesting access; preserve the owner's \
+                                choices.
+                                """),
                         tool: InlineInteractionWire.toolName)
                 }
             }
@@ -230,32 +225,41 @@ extension SwiftToolDispatcher {
             guard Keyring.validName(name), !(hosts.isEmpty && programs.isEmpty),
                   hosts.count == list("hosts").count, programs.count == list("programs").count else {
                 return failed("missing_target", "A secret is target secret:<name> (lowercase letters, digits, . _ -) with where it may go: "
-                    + "hosts [\"api.example.com\"] a request may carry it to and/or programs [\"npx\"] (a name on the login PATH or an executable's path) it may be handed to.")
+                    + """
+                        hosts [\"api.example.com\"] a request may carry it to and/or programs [\"npx\"] (a name on the login PATH or an \
+                        executable's path) it may be handed to.
+                        """)
             }
             var signIn: InlineInteraction.SecretAsk.SignIn?
             if case .object(let fields)? = input["sign_in"] {
                 let given = JSONValue.object(fields).stringFields
                 guard fields["client_secret"] == nil else {
-                    return failed("missing_target", "A client secret never goes through you: leave it out, and the person types it on the card if the service issued one.")
+                    return failed("missing_target",
+                        "A client secret never goes through you: leave it out, and the person types it on the card if the service issued one.")
                 }
                 // The card shows each address's host, and the flow goes to exactly those.
                 guard (given["authorize"] == nil) != (given["device"] == nil), let token = given["token"], let client = given["client_id"],
-                      [given["authorize"], given["device"], token].allSatisfy({ $0.map { URL(string: $0)?.scheme == "https" && URL(string: $0)?.host?.isEmpty == false } ?? true }) else {
-                    return failed("missing_target", "sign_in takes authorize (or device, for a device sign-in), token and client_id (https addresses and the service's client id), "
+                      [given["authorize"], given["device"], token].allSatisfy({
+                          $0.map { URL(string: $0)?.scheme == "https" && URL(string: $0)?.host?.isEmpty == false } ?? true }) else {
+                    return failed("missing_target", """
+                        sign_in takes authorize (or device, for a device sign-in), token and client_id (https addresses and the service's client \
+                        id),\u{20}
+                        """
                         + "and optionally scopes, redirect (a registered http://127.0.0.1:<port>/<path>) and client_auth.")
                 }
                 guard [nil, "body", "basic"].contains(given["client_auth"]) else {
                     return failed("missing_target", "client_auth is body (the default) or basic.")
                 }
-                signIn = .init(authorize: given["authorize"], device: given["device"], token: token, clientID: client, scopes: given["scopes"], redirect: given["redirect"],
+                signIn = .init(authorize: given["authorize"], device: given["device"], token: token, clientID: client, scopes: given["scopes"],
+                    redirect: given["redirect"],
                                clientAuth: given["client_auth"] == "basic" ? "basic" : nil)
             }
             let kept: Keyring.Entry?
             do { kept = try Keyring.entry(name) } catch {
                 return failed("unavailable", "The keyring could not be read, so whether \(name) is kept is unknown. Try again.")
             }
-            // The card shows the whole grant, which is kept exactly: where it already goes stays on it, unless
-            // only:true narrows it to what she named, and then the card says what stops.
+            // The card shows the whole grant, which is kept exactly: where it already goes stays on it, unless only:true narrows it to what the agent named,
+            // and then the card says what stops.
             let keptHosts = kept?.hosts ?? [], keptPrograms = kept?.programs.map(\.path) ?? []
             let only = input["only"] == .bool(true)
             let stops = only ? keptHosts.filter { !hosts.contains($0) } + keptPrograms.filter { !programs.contains($0) }.map { "program " + $0 } : []
@@ -267,7 +271,8 @@ extension SwiftToolDispatcher {
                         + "If it stopped working (expired, revoked) or the person wants a new one, ask again with replace:true.")])
             }
             interaction = InlineInteractionRegistry.secret(name, ask: .init(hosts: only ? hosts : hosts + keptHosts.filter { !hosts.contains($0) },
-                                                                            programs: only ? programs : programs + keptPrograms.filter { !programs.contains($0) },
+                                                                            programs: only ? programs : programs + keptPrograms
+                                                                                .filter { !programs.contains($0) },
                                                                             signIn: signIn, stops: stops),
                                                            why: why, declineConsequence: declineConsequence)
         case .apiKey:
@@ -305,12 +310,7 @@ extension SwiftToolDispatcher {
                 "There is no control in this app for \(target.isEmpty ? rawKind : target)."
             )
         }
-        // Last gate: a descriptor with no executable control must not become a
-        // card with a dead button.
-        // The WHOLE chain, because the whole chain is what one tap grants: an
-        // additional target this build does not know — or one the current
-        // posture forbids — has to be refused HERE, at the raise, not
-        // discovered after the person has already tapped.
+        // Validate every target before raising the card: one tap grants the whole chain, so an unavailable control would make approval false.
         let descriptor = InlineInteractionRegistry.descriptor(
             kind: interaction.kind,
             target: interaction.target,
@@ -323,7 +323,7 @@ extension SwiftToolDispatcher {
                 descriptor.unavailableReason ?? "No control for \(interaction.target)."
             )
         }
-        let result = InlineInteractionNeed.envelope(interaction)
+        let result = InlineInteractionNeed.envelope(invocation: invocation, interaction)
         if kind == .permission, case .object(var fields) = result {
             if !automation.isEmpty { fields["automation"] = .array(automation) }
             return .object(fields)

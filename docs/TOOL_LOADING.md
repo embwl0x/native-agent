@@ -32,8 +32,11 @@ For actions, `preview:true` reports proposed effects without performing them.
 Native preflight checks policy and selected targets; authored preview runs live
 reads with writes previewed; resume preview only inspects stopped work.
 `expected_version` can guard against a page changing after it was read.
-Unknown keys, invalid arguments and stale versions refuse with a remedy. The
-door's missing or invalid action-argument refusals include its `args_schema`
+The door carries what the app knows: a name the action does not take binds to
+the one missing argument it fits and the result says so in `argument_notes`
+(`took \`ref\` as \`atom_id\``); otherwise unknown keys, invalid arguments and
+stale versions refuse with a remedy. The door's missing or invalid
+action-argument refusals include its `args_schema`, the names it `accepted`
 and an example call. An unknown action's `nearest` suggestions use the named
 page's own actions first; `actions` is the top-level batch argument, while
 `{page, item:"actions"}` reads a page's action list. A failed read's default
@@ -243,21 +246,16 @@ fixed executor arguments before the native call is admitted.
 Contact reads retain unavailable state and its cause; a failed peer read never
 becomes an empty directory or an old contact binding. If an effect committed
 before a fresh projection failed, its receipt keeps that committed effect and
-marks the projection unavailable. Bridge command sends require explicit
-`conversation_mode:"new"` or `"resume"`; reading or decoding a selected OMP
-conversation must succeed before sending. A declared reply file that cannot
+marks the projection unavailable. A declared reply file that cannot
 be read reports that failure with the command evidence and repair; stdout
 never stands in for its promised reply.
-Swarm worker rows use `agents` and `access`; inherited provenance uses
-`requestedBy`. Missing Work Think catalog evidence refuses fan-out rather
-than selecting an assumed reasoning level.
 
 Internal executors and saved Trust keys still exist where actions need them.
 A folded action re-enters the gated dispatcher under its underlying tool name;
 home likewise re-enters its internal executor. Saved blocks and domain gates
 continue to apply. Internal names are not additional tools offered to Agent.
 
-Workshop, studio-wander, swarm and bridge execution paths can have their own
+Studio-wander and bridge execution paths can have their own
 declared tool lists. Their internal dispatch contracts do not enlarge the
 ordinary chat request. The Tools UI reads the manifest rather than calling a
 discovery tool. The manifest reports `always_on_tools` and each schema's
@@ -265,8 +263,7 @@ discovery tool. The manifest reports `always_on_tools` and each schema's
 Catalog/schema and result-section encoding errors surface with their owner;
 there is no invented empty contract or empty successful result. Inline model
 choices require the offered `provider::model` option ID; a bare model is not a
-provider selection. Workshop's sole file-copy operation is
-`copy_workspace_file`; there is no manual compatibility procedure selector.
+provider selection.
 
 ## Extending their reach
 
@@ -340,6 +337,13 @@ agent turns, macOS privacy resets and irreversible deletes retain their cards.
 Home may be read;
 use named actions for its items. Secret arguments still require a single action.
 
+`setting.set` takes `setting`, `value` and optional `because`. Their mind's
+Settings rows say they are theirs to set both ways; they need no quoted request
+or Trust posture. For other settings on model turns below Full Mac, `because`
+still quotes at least three words of the person's or trusted agent's request,
+unless restoring their previous change. Trust rows retain their existing
+owner-only, Full Mac and lower-only checks.
+
 `OwnedProgramRunner` owns source, read and action limits and the shared progress clock: a renewable 60-second no-progress window by default, excluding host waits.
 Its receipt retains completed effects if a later step fails; a script is not
 an atomic transaction or a rollback mechanism.
@@ -378,39 +382,21 @@ oversized structured sections expand through their named child paths.
 names the provider/model/surface/effort route from the admitted turn only.
 Outside an admitted turn its route is unavailable; it never infers a provider
 from model spelling. ProviderRouting's verified model catalog supplies the
-native window; Settings → Context window may lower it with a Custom cap.
-Settings > Context window > Compact at sets the trigger percentage for every
-model (whole 30–95%, default 85%). `setting.get` / `setting.set` with
-`chat.compaction_percent` reads or writes that same value, in either direction
-at the person's request; get includes detected/effective windows, the adapter-owned wire output allowance
-and effective trigger tokens.
-Invalid saved percentages visibly fail. The effective trigger is
-min(configured percent × window, window − request output allowance); completed
-folds pursue min(configured percent × window × 55/85, window − that allowance).
-Aging and the ring use that same effective trigger. The ring shows the last
-matching provider receipt's observed input tokens against the detected window;
-without either measurement its readout is unavailable. Transcript and other-input
-token shares remain unknown when not measured. Compaction sizes the next request
-using the actual request builder's final character count, calibrated by the
-last matching provider request's characters/input tokens. Regenerate and replay
-omissions stay with that builder; measurement never subtracts stored rows.
-Saved-plan sizing clears the completed turn's run/question cuts, includes its
-answer and replayable tool receipts, and replays saved user words once.
-Before a matching receipt and saved plan exist, manual compaction and
-aging use a labelled rendered-history estimate; automatic aging waits for
-built-request evidence before starting a fold. Only recollection folds move
-the replayed head; no character-budget or row-count cutoff drops old turns.
-Unavailable recollection stops preparation, and measured over-window requests
-refuse before send. See [context compaction](TURN_RESILIENCE.md#8-context-compaction);
-effort is routing context, not another window multiplier.
+native window. That model-default window is never reduced by a custom cap or
+an early compaction percentage. The composer ring reports the last matching
+provider request's observed input; missing usage/window measurements remain
+unavailable. The [conversation context contract](conversation-context-history.md)
+owns verbatim replay, stateless whole-turn checkpoints in half-budget jumps at
+the bound, exact sent-context accounting and retained tool-result pointers.
+There is no compact command or compaction setting. Effort is routing context,
+not a window multiplier.
 
 Presentation preserves each source's availability. Quiet pages name a failed or
 not-yet-read source with a repair issue instead of current counts. Complete
 transcript, activity and capability reads refuse rejected records; part names
 use the shared [Parts read schema](../Modules/NativeAgentCore/Sources/AuthoredCapabilities/Parts.swift)
 across the Tools page, phone catalog and capability inventory, retaining name
-damage on its unavailable row while siblings publish. Workshop
-receipts report unavailable when their recent window contains damaged rows.
+damage on its unavailable row while siblings publish.
 Attachment metadata uses the shared codec: identity/type are required, recorded
 byte counts must be nonnegative integers, and absent optional evidence stays
 absent. Tool groups use only the catalog's checked registry-supplied bucket.
@@ -472,7 +458,7 @@ the transcript owner saves a permission card or reuses the open card for that
 capability, including simultaneous requests and cards indexed from other
 conversations. The original result and effect evidence remain intact, with
 `permission_card` naming the saved card and saying it is up for their person
-(from `HerScreen.names`). Filing failures and requests without an originating
+(from `AgentScreen.names`). Filing failures and requests without an originating
 conversation report that no card was filed. Previews, cancelled calls and
 hand-back-only runs file nothing. This removes the model's extra permission
 request step; it does not retry the blocked work or grant access. Only the

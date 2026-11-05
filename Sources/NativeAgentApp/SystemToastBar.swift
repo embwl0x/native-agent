@@ -4,9 +4,7 @@ import SwiftUI
 
 // Blueprint: | `SystemToastBar.swift` | platform notice rendering and room-scoped positioning; values, queue and timers belong to NativeAgentShared |
 
-/// Where the chat room wants the notice lane: just under its pinned chrome,
-/// carrying the room's own turn notices. Published only while the chat is in
-/// front; with no room the lane sits at the top of the page.
+/// Bind placement to the visible room so hidden chat notices cannot appear on another page.
 struct NoticeLaneRoom {
     let anchor: Anchor<CGRect>
     let notices: SystemToastCenter
@@ -20,9 +18,7 @@ struct NoticeLaneRoomKey: PreferenceKey {
     }
 }
 
-/// Fluid glass A2: the one notice lane. App-wide toasts and the open room's
-/// turn notices stack in one column of glass capsules; each center keeps its
-/// own durations by severity.
+/// Share one notice column while each owner retains its severity-based durations.
 struct NoticeLane: View {
     let centers: [SystemToastCenter]
 
@@ -33,7 +29,7 @@ struct NoticeLane: View {
                     NoticeLaneColumn(center: centers[index])
                 }
             }
-            // Capsules hug their words up to this; the cap is the lane's.
+            // Cap capsule width to keep long notices within the lane.
             .frame(maxWidth: 520)
         }
         .padding(.horizontal, NativeAgentSpacing.lg)
@@ -47,7 +43,7 @@ private struct NoticeLaneColumn: View {
     @ObservedObject var center: SystemToastCenter
 
     var body: some View {
-        // Show the newest notices; dismissal timers start on push.
+        // Timers start on push, so show newest notices first.
         VStack(spacing: NativeAgentSpacing.sm) {
             ForEach(center.queue.suffix(Self.maxVisible)) { toast in
                 NoticePill(text: toast.text, kind: toast.kind) {
@@ -60,8 +56,6 @@ private struct NoticeLaneColumn: View {
     }
 }
 
-/// The one notice style: a glass capsule. The lane gives it a kind and a
-/// dismiss; the composer and bubble text toasts use it bare.
 struct NoticePill: View {
     let text: String
     var kind: SystemToast.Kind? = nil

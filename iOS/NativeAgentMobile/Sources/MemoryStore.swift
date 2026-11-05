@@ -43,7 +43,6 @@ final class MemoryStore: ObservableObject {
         }
     }
 
-    /// The sync owner adopts the Mac's confirmed memory and proposal readback.
     @discardableResult
     func performMemoryProposalDecision(
         _ proposal: MemoryProposalRecord,
@@ -71,19 +70,4 @@ final class MemoryStore: ObservableObject {
         }
     }
 
-    func deleteMemory(_ memory: MemoryRecord) {
-        guard !deletingMemoryIDs.contains(memory.id) else { return }
-        error = nil
-        deletingMemoryIDs.insert(memory.id)
-
-        Task {
-            do {
-                try await iCloudSyncEngine.shared.deleteMemory(id: memory.id)
-            } catch {
-                self.error = error.localizedDescription
-                await refresh(preservingActionError: true)
-            }
-            self.deletingMemoryIDs.remove(memory.id)
-        }
-    }
 }

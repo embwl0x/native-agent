@@ -53,7 +53,10 @@ extension TelegramPollLoop {
             if state == "not determined" {
                 return "voice_permission_required: \(cause). In Telegram setup, choose Set up Telegram voice and approve Speech Recognition."
             }
-            return "voice_permission_denied: \(cause). Allow NativeAgent in System Settings → Privacy & Security → Speech Recognition; a restricted grant needs the Mac administrator."
+            return """
+                voice_permission_denied: \(cause). Allow NativeAgent in System Settings → Privacy & Security → Speech Recognition; \
+                a restricted grant needs the Mac administrator.
+                """
         case TelegramVoiceTranscriptionError.speechUnavailable:
             return "voice_speech_unavailable: \(cause). Check the recognition language and service availability in macOS Dictation settings."
         case TelegramVoiceTranscriptionError.conversionFailed:

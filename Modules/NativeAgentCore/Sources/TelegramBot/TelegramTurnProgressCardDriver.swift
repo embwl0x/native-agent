@@ -4,16 +4,14 @@ import PersistenceCore
 import TurnTrace
 import ChatTurnRuntime
 
-// Blueprint: | `TelegramTurnProgressCardDriver.swift` | `TelegramTurnProgressCardDriver`: one acknowledged lifecycle message per accepted turn; terminal waiters resolve only after identity persistence; terminal repair belongs to the delivery ledger |
+// Blueprint: | `TelegramTurnProgressCardDriver.swift` | `TelegramTurnProgressCardDriver`: persist terminal identity before release |
 
 struct TelegramTurnProgressCardDriverSnapshot: Sendable, Equatable {
     let state: TelegramTurnPresentationState
     let messageId: Int?
 }
 
-/// Owns the single ordinary Telegram message used to present one accepted
-/// turn's lifecycle. Its heartbeat coalesces transient misses while active;
-/// the ledger owns terminal delivery repair.
+/// Coalesce transient active-card misses; the ledger owns terminal delivery repair.
 actor TelegramTurnProgressCardDriver {
     typealias SendCard = @Sendable (
         _ token: String,
@@ -97,8 +95,7 @@ actor TelegramTurnProgressCardDriver {
         self.state = TurnPresentationReducer.initialState(at: Date())
     }
 
-    /// Sends the acknowledged card exactly once. A failed first send is final
-    /// for this card: later progress never creates a replacement message.
+    /// Sends the acknowledged card exactly once. A failed first send is final for this card: later progress never creates a replacement message.
     func start() async {
         guard !closed, !initialSendAttempted else { return }
         initialSendAttempted = true
@@ -198,15 +195,12 @@ actor TelegramTurnProgressCardDriver {
         state = next
         if state.isTerminal {
             detailsVisible = false
-            // Let an edit already on the wire finish; terminal repair belongs
-            // to the ledger after this turn releases its driver.
+            // Let an edit already on the wire finish; terminal repair belongs to the ledger after this turn releases its driver.
             let terminal = terminalTextTask(at: Date())
             let now = Date()
             let terminalText = await settle { await terminal.value }
             guard await persistIdentity(at: now, terminalText: terminalText) else {
-                // Without durable terminal evidence a restart must be allowed
-                // to settle the old active identity as outcome-unknown. Do not
-                // paint an unrepairable terminal card over that evidence.
+                // Preserve active identity until terminal evidence is durable so restart can repair uncertainty.
                 transportFailed = true
                 resolveTerminalWaiters(nil)
                 untrackedCardSettlementRequested = true
@@ -223,7 +217,6 @@ actor TelegramTurnProgressCardDriver {
         await progressFlushTask?.value
     }
 
-    /// Refresh elapsed/stall presentation while the turn is active.
     @discardableResult
     func heartbeat() async -> Bool {
         guard !closed, !state.isTerminal, !transportFailed, messageId != nil else {
@@ -287,8 +280,7 @@ actor TelegramTurnProgressCardDriver {
         heartbeatTask?.cancel()
     }
 
-    /// The turn releases its card only after its remaining wire/projection
-    /// work settles. Closing the derived face also drains version refreshes.
+    /// The turn releases its card only after its remaining wire/projection work settles. Closing the derived face also drains version refreshes.
     func close() async {
         closed = true
         if terminalIdentityPersisted == nil { resolveTerminalWaiters(nil) }
@@ -327,14 +319,11 @@ actor TelegramTurnProgressCardDriver {
         guard !transportFailed, !state.isTerminal || terminalIdentityPersisted == true else { return }
         let renderedState = state
         let renderedReplySettled = replyTextSettled
-        // Whether THIS text is the terminal card, captured with the render:
-        // the state can move to terminal while an earlier edit is in flight,
-        // and that edit's text is not the terminal one.
+        // Capture terminal identity with rendered text: state may become terminal while an earlier edit is in flight.
         let renderedIsTerminal = renderedState.isTerminal
         let rendered = await renderedText(at: now)
         guard rendered != lastRenderedText
                 || (renderedIsTerminal && renderedState.phase == .completed) else {
-            // The card already shows this text, terminal text included.
             await removeTerminalLedgerRow(ifSentTerminal: renderedIsTerminal)
             return
         }

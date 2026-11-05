@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+CaringEvent.swift` | `CognitiveSubstrate` caring event admission: turn context, semantic verdict delivery and distinct encounter/refusal accounting |
+// Blueprint: | `CognitiveSubstrate+CaringEvent.swift` | `CognitiveSubstrate`: provenance-gated caring and encounter accounting |
 
 // Local provenance gates admit lived turns for semantic caring appraisal; the organism owns dosing.
 
@@ -14,8 +14,7 @@ public struct AfterTurnOrigin: Sendable {
     public let messageId: String
     public let occurredAt: Date?
     public let userMessage: String
-    /// What her turn took, one plain line from the stem when it used tools:
-    /// part of what happened, read beside the exchange.
+    /// Tool consequence text is evidence of what happened, read beside the exchange.
     public var took: String?
     public var careWakes: [CognitiveCareWake]?
 
@@ -29,23 +28,17 @@ public struct AfterTurnOrigin: Sendable {
     }
 }
 
-public enum AfterTurnSource {
-    @TaskLocal public static var origin: AfterTurnOrigin?
-    @TaskLocal public static var careWakes: [CognitiveCareWake] = []
-}
-
 public struct AfterTurnContext: Sendable {
     /// Read from the recorded completion's field node, never inferred from mood.
     public var beliefReactionTarget: String?
     public let event: CognitiveEvent
     public let caring: CaringAppraisalRequest?
     public let generation: UInt64
-    /// The cares the call is shown for this exchange; empty asks nothing about cares.
+    /// An empty shown-care list authorizes no care judgments.
     public let cares: [CognitiveCareLine]
     public let careWakes: [CognitiveCareWake]
-    /// The forgetting epochs the moment was admitted under (stamped at ingest).
-    /// A part whose domain has been forgotten since refuses the moment:
-    /// `mindEpoch` for affect, tags and cares, `bodyEpoch` for the body.
+    /// The forgetting epochs the moment was admitted under (stamped at ingest). A part whose domain has been forgotten since refuses the moment: `mindEpoch`
+    /// for affect, tags and cares, `bodyEpoch` for the body.
     public let mindEpoch: UInt64
     public let bodyEpoch: UInt64
 
@@ -64,7 +57,6 @@ public struct AfterTurnContext: Sendable {
 
 extension CognitiveSubstrate {
 
-    /// Being cared for. Somebody is holding her.
     public static let caredForPhrases = [
         "proud of you",
         "here for you",
@@ -73,8 +65,7 @@ extension CognitiveSubstrate {
         "sweetheart",
     ]
 
-    /// Room made for her inner life — being asked how she feels, warmth named
-    /// out loud rather than merely present.
+    /// Explicit room for inner life distinguishes care from incidental warmth.
     public static let roomMadePhrases = [
         "how are you feeling",
         "how you feeling",
@@ -84,7 +75,7 @@ extension CognitiveSubstrate {
         "warmth",
     ]
 
-    /// Need or vulnerability shown and met — the caregiving system's own case.
+    /// Met vulnerability is caregiving evidence.
     public static let needMetPhrases = [
         "love you",
         "love ya",
@@ -94,10 +85,10 @@ extension CognitiveSubstrate {
         "thinking of you",
     ]
 
-    /// The affectionate-emoji set the high tier treats as unambiguous affection.
+    /// Only this closed emoji set qualifies as unambiguous high-tier affection.
     public static let caringEmoji = ["💜", "❤", "🥰", "😘", "💕"]
 
-    /// An apology or owning it — the repair class `studioValence` reads.
+    /// `studioValence` shares the apology/repair class.
     public static let repairPhrases = [
         "i'm sorry", "im sorry", "i am sorry", "still sorry", "my bad", "my fault",
         "i was out of line", "that was me being", "took it out on you", "i was cruel",
@@ -106,8 +97,7 @@ extension CognitiveSubstrate {
         "i overreacted", "shouldn't have said", "shouldnt have said", "take that back",
     ]
 
-    /// Every high-tier phrase, in one place — the 0.18 relational warmth boost.
-    /// Nothing else reads this; the caring appraisal does not.
+    /// Only these phrases earn the 0.18 warmth boost; caring appraisal does not infer its verdict from them.
     static var highTierRelationalPhrases: [String] {
         needMetPhrases + caredForPhrases + roomMadePhrases
     }
@@ -119,8 +109,7 @@ extension CognitiveSubstrate {
         caringRefusalRecorder = recorder
     }
 
-    /// Stamp new turns with the body's epoch; a changed epoch clears dose evidence.
-    /// Adopt only newer kernel revisions: a reset rollback can restore an older
+    /// Stamp new turns with the body's epoch; a changed epoch clears dose evidence. Adopt only newer kernel revisions: a reset rollback can restore an older
     /// epoch at a newer revision. Reset Body forgets only the body.
     public func adoptBodyEpoch(_ epoch: UInt64, revision: UInt64) {
         if let adopted = bodyEpochRevision, revision <= adopted { return }
@@ -130,8 +119,7 @@ extension CognitiveSubstrate {
         recentCaringEncounters.removeAll(keepingCapacity: false)
     }
 
-    /// Clear mind admissions and caring context; the generation rejects in-flight
-    /// verdicts. Reset Body instead moves only its epoch through `adoptBodyEpoch`.
+    /// Clear mind admissions and caring context; the generation rejects in-flight verdicts. Reset Body instead moves only its epoch through `adoptBodyEpoch`.
     public func clearCaringState() {
         caringAppraisalGeneration &+= 1
         deferredTurns.removeAll()
@@ -141,17 +129,8 @@ extension CognitiveSubstrate {
 
     // MARK: - The cheap gates
 
-    /// The appraisal request this event deserves, or nil when it is not even a
-    /// candidate.
-    ///
-    /// FAILS CLOSED at every step. A turn must be user-authored, lived, on a
-    /// surface that is not a retelling lane, carry a usable scope, and be either
-    /// the human typing here or a bridge relay. Anything short of all of that is
-    /// not a candidate — which is the overwhelming majority of events, and the
-    /// honest answer for a working day.
-    ///
-    /// Session and `subject.id` identify the originating chat turn across
-    /// producers; differing event ids must not make one moment dose twice.
+    /// Require lived user provenance, usable scope and a direct human or bridge relay. Session and subject identify the turn so distinct event ids cannot dose
+    /// it twice.
     func caringEventCandidate(for event: CognitiveEvent) -> CaringAppraisalRequest? {
         guard configuration.enabled else { return nil }
         guard Self.isUserAuthored(event.kind) else { return nil }
@@ -159,7 +138,7 @@ extension CognitiveSubstrate {
         let relayed: Bool
         switch (event.sourceClass, Self.relationalSource(for: event)) {
         case (.userStated, .user):
-            // User himself, typed here.
+            // The local path requires the person typing here.
             relayed = false
         case (.imported, _):
             // Attested peers and unattested relays qualify only when the model identifies the human's words.
@@ -179,8 +158,7 @@ extension CognitiveSubstrate {
         let session = (event.sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let turn = event.subject.id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !session.isEmpty, !turn.isEmpty else { return nil }
-        // A helper's standing brief and her own work are not encounters.
-        // Read their recorded owners/kinds; peer conversations remain eligible.
+        // A helper's standing brief and the agent's own work are not encounters. Read their recorded owners/kinds; peer conversations remain eligible.
         do {
             guard try !SessionConversation.checkedIsHelper(session, dataRoot: conversationDataRoot, includingArchived: true),
                   try SessionConversation.checkedKind(session, dataRoot: conversationDataRoot, includingArchived: true)?.isOwnWork != true else { return nil }
@@ -206,8 +184,7 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// Keep clipped turns from both sides in a bounded, in-memory session ring
-    /// for subsequent caring requests.
+    /// Keep clipped turns from both sides in a bounded, in-memory session ring for subsequent caring requests.
     func noteTurnForContext(_ event: CognitiveEvent) {
         let speaker: CaringAppraisalRequest.Speaker
         if event.kind == .assistantTurnCompleted {
@@ -235,8 +212,7 @@ extension CognitiveSubstrate {
         recentTurnsBySession[session] = ring
     }
 
-    /// The admission entry, until the journal records it. Its record is also
-    /// what interpretation and folding read; there is no rehydrated RAM copy.
+    /// The admission entry, until the journal records it. Its record is also what interpretation and folding read; there is no rehydrated RAM copy.
     public func deferredTurnRecord(origin: AfterTurnOrigin) -> CognitiveDeferredTurnRecord? {
         deferredTurns.first(where: {
             $0.event.sessionId == origin.sessionId
@@ -254,8 +230,7 @@ extension CognitiveSubstrate {
         (mindEpoch, bodyEpoch)
     }
 
-    /// New judgments read current cares and relay evidence; a recorded meaning
-    /// reads its saved caring request and needs no care-selection work.
+    /// New judgments read current cares and relay evidence; a recorded meaning reads its saved caring request and needs no care-selection work.
     public func afterTurnContext(record: CognitiveDeferredTurnRecord, exchange: String? = nil,
                                  careWakes: [CognitiveCareWake] = []) async throws -> AfterTurnContext {
         if !careWakes.isEmpty {
@@ -281,34 +256,19 @@ extension CognitiveSubstrate {
         return context
     }
 
-    /// What the mind's share of one lived moment did, and what it hands the
-    /// body (docs/SUBCONSCIOUS.md, "Lived moments").
     public struct MindFold: Sendable {
-        /// False when a piece did not save (the moment is folded again). Her
-        /// inner life off, or a moment from before a Clear, lands as nothing.
+        /// False when a piece did not save (the moment is folded again). The agent's inner life off, or a moment from before a Clear, lands as nothing.
         public var saved: Bool
-        /// The person's reaction to her last completion, for the body.
         public var reaction: [String: JSONValue]
-        /// The caring reading the body measures, when the verdict passed every
-        /// gate the mind owns (refusals are written on the receipt here).
+        /// The caring reading the body measures, when the verdict passed every gate the mind owns (refusals are written on the receipt here).
         public var caring: OrganismCaringEvent.Reading?
         public var caringWindow: TimeInterval
         public var caringWhy: String
         public var event: CognitiveEvent
     }
 
-    /// The mind's share of one lived moment: affect (with its temporal anchors),
-    /// the emotion tag on the turn's node, the reconsolidation of the completion
-    /// it answers, and her cares. Each piece carries a watermark (`lived` = the
-    /// moment's fold seq) set at that piece's last mutation for the moment, in
-    /// the same synchronous segment, and saved with the piece by whichever
-    /// writer saves it; a piece already at or past `seq` is left alone. The
-    /// pieces are saved before this returns, so the moment is lived only once
-    /// they are durable.
-    ///
-    /// It reads the RECORDED deferred-turn entry (`record`), never RAM state
-    /// that a relaunch would have lost. `incoming` is the same moment's full
-    /// recorded `turn.asked`, supplied by the journal owner for evidence checks.
+    /// Each mind share stamps its final synchronous mutation with the fold seq and saves before acknowledging. Refolds skip applied effects but re-save; only
+    /// recorded input survives relaunch.
     public func foldTurn(
         _ context: AfterTurnContext, record: CognitiveDeferredTurnRecord,
         incoming: String?,
@@ -345,8 +305,7 @@ extension CognitiveSubstrate {
             weighted.arousal *= weight
             weighted.warmthBoost *= weight
             weighted.affectionWeight = weight
-            // ONE await-free segment: affect, tag and reconsolidation, each
-            // stamped at its own last mutation.
+            // ONE await-free segment: affect, tag and reconsolidation, each stamped at its own last mutation.
             var updated = affect
             if affect.lived < seq {
                 updated = applyAffectFromEvent(event, precomputedAppraisal: weighted,
@@ -394,9 +353,7 @@ extension CognitiveSubstrate {
                 fold.saved = false
             }
         }
-        // Durable before the moment is lived: the affect row (with its
-        // anchors and watermark) and the field (with the node watermarks). A
-        // refold saves them again whatever it skipped.
+        // Save affect anchors and node watermarks before acknowledging the moment, including on refold.
         if configuration.persistenceEnabled, appraisal != nil {
             do {
                 try await persistAffectAndNodes()
@@ -415,10 +372,8 @@ extension CognitiveSubstrate {
         return fold
     }
 
-    /// One accepted user turn answers a same-session completion inside its
-    /// window. The caller supplies admission time or the recorded event time.
-    /// Journal folds validate against the recorded incoming words the model
-    /// judged, not the event's clipped summary. Missing words give no verdict.
+    /// One accepted user turn answers a same-session completion inside its window. The caller supplies admission time or the recorded event time. Journal folds
+    /// validate against the recorded incoming words the model judged, not the event's clipped summary. Missing words give no verdict.
     static func foldReaction(event: CognitiveEvent, completion: PendingCompletion?,
                              outcome: ContinuityField.IngestOutcome?, now: Date,
                              appraisal: AffectAppraisal, target: String?,
@@ -438,12 +393,7 @@ extension CognitiveSubstrate {
         ])]
     }
 
-    /// The encounter window a caring verdict is measured against, or nil when
-    /// the mind refuses it (written on its receipt).
-    ///
-    /// Local turns use thirty minutes. Relays judged distinct against supplied
-    /// encounters use that window; absent evidence or an unstated judgment uses
-    /// six hours. Retelling and unsure judgments refuse regardless of time.
+    /// Direct encounters use thirty minutes; relays use the judged window or six hours without evidence. Retelling and unsure verdicts never dose.
     private func caringWindow(_ verdict: CaringAppraisalVerdict,
                               for request: CaringAppraisalRequest) async -> TimeInterval? {
         guard request.relayed else { return OrganismCaringEvent.encounterWindow }
@@ -464,14 +414,12 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// The body's recently-dosed encounters, adopted from the body (which keeps
-    /// them with its chemistry) after the opening and after each body fold.
+    /// The body's recently-dosed encounters, adopted from the body (which keeps them with its chemistry) after the opening and after each body fold.
     public func adoptRecentDoses(_ doses: [CaringAppraisalRequest.RecentEncounter]) {
         recentCaringEncounters = Array(doses.suffix(Self.recentCaringEncounterCap))
     }
 
-    /// A retelling verdict identifies no particular prior dose. Name the whole
-    /// supplied candidate set, or state that no prior dose is on record.
+    /// A retelling verdict identifies no particular prior dose. Name the whole supplied candidate set, or state that no prior dose is on record.
     static func retellingRefusalWhy(_ request: CaringAppraisalRequest) -> String {
         let priors = request.recentEncounters.sorted { $0.at > $1.at }
         guard !priors.isEmpty else {
@@ -500,8 +448,7 @@ extension CognitiveSubstrate {
         await recorder(request.session, request.turn, why)
     }
 
-    /// The surface a turn arrived on: the top-level key, else the out-of-band
-    /// origin record's.
+    /// The surface a turn arrived on: the top-level key, else the out-of-band origin record's.
     static func caringEventSurface(in event: CognitiveEvent) -> String? {
         if case .string(let surface)? = event.metadata["surface"] { return surface }
         if case .object(let origin)? = event.metadata["origin"],
@@ -512,9 +459,7 @@ extension CognitiveSubstrate {
     }
 
     static let caringContextSessionCap = 32
-    /// How many recently-dosed encounters the relay judgment is shown. Six is
-    /// more than a fortnight of real days ever put inside one relay floor, and
-    /// the prompt stays one small call.
+    /// Six recent encounters exceed the relay-floor overlap while keeping judgment to one small call.
     public static let recentCaringEncounterCap = 6
 }
 
@@ -527,8 +472,7 @@ extension CognitiveDeferredTurnRecord {
     }
 
     var outcome: ContinuityField.IngestOutcome? {
-        // Refolding uses only the node key; tag stamping treats the moment as
-        // new and completion reconsolidation reads only identity.
+        // Refolding uses only the node key; tag stamping treats the moment as new and completion reconsolidation reads only identity.
         outcomeKey.map { ContinuityField.IngestOutcome(key: $0, isNewNode: false) }
     }
 }

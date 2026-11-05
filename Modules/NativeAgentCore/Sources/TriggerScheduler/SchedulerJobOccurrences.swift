@@ -6,11 +6,10 @@ import PersistenceCore
 import Privacy
 import os
 import TrustCenter
-import WorkshopExecution
 import Experiences
 import NotificationInbox
 import Darwin
-// Blueprint: | `SchedulerJobOccurrences.swift` | SwiftNativeTriggerScheduler life-stamped job occurrence claims, settlement, pruning and default-cycle row updates; claim preparation leaves retired intention evidence untouched |
+// Blueprint: | `SchedulerJobOccurrences.swift` | Life-stamped occurrence claims, settlement and pruning |
 
 extension SwiftNativeTriggerScheduler {
     public struct DueJob: Sendable {
@@ -20,8 +19,7 @@ extension SwiftNativeTriggerScheduler {
         public let payload: [String: JSONValue]
         public let row: JSONValue
         public let dueEpoch: Double
-        /// Stable identity for exactly one scheduled occurrence. This key is
-        /// persisted before any effect and survives process restart.
+        /// Stable identity for exactly one scheduled occurrence. This key is persisted before any effect and survives process restart.
         public let occurrenceKey: String
 
         public init(
@@ -55,8 +53,7 @@ extension SwiftNativeTriggerScheduler {
             let digest = SHA256.hash(data: Data(canonical.utf8))
                 .map { String(format: "%02x", $0) }
                 .joined()
-            // 74 bytes: safely inside downstream 128-byte idempotency limits,
-            // even when a repaired legacy job carries an unusually long id.
+            // 74 bytes stays inside downstream 128-byte idempotency limits even for unusually long saved job IDs.
             return "scheduler.\(digest)"
         }
     }
@@ -108,8 +105,7 @@ extension SwiftNativeTriggerScheduler {
         }
     }
 
-    /// Claim the first selected occurrence under the jobs lock, before effects.
-    /// Same-life restart claims need reconciliation; another life's are stopped.
+    /// Claim the first selected occurrence under the jobs lock, before effects. Same-life restart claims need reconciliation; another life's are stopped.
     public func claimDueJobs(
         now: Date,
         select: @Sendable ([JSONValue]) throws -> [DueJob]
@@ -118,8 +114,7 @@ extension SwiftNativeTriggerScheduler {
             let life = try DataRootLife.current(in: root)
             for index in rows.indices {
                 guard case .object(var object) = rows[index] else { continue }
-                // Retired intention definitions keep their saved occurrence
-                // evidence for the stopped-record notice, never claim preparation.
+                // Non-runnable intention rows retain evidence for the stopped notice; they never prepare a claim.
                 guard !["notify", "turn", "workshop"].contains(SchedulerJobRuntime.string(object["kind"])?.lowercased() ?? "notify") else { continue }
                 let rowChanged = Self.rearmFutureOneShot(&object, now: now, life: life)
                 guard rowChanged else { continue }
@@ -164,9 +159,8 @@ extension SwiftNativeTriggerScheduler {
                     continue
                 }
 
-                // A recurring job settles each occurrence once; it moves past a
-                // settled key instead of claiming it again. (A one-shot's resume
-                // reruns its one occurrence on purpose.)
+                // A recurring job settles each occurrence once; it moves past a settled key instead of claiming it again. (A one-shot's resume reruns its one
+                // occurrence on purpose.)
                 if !SchedulerJobRuntime.bool(object["oneShot"], default: false),
                    SchedulerJobRuntime.string(object["lastOccurrenceKey"]) == job.occurrenceKey {
                     if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(
@@ -210,8 +204,7 @@ extension SwiftNativeTriggerScheduler {
               let claimedAt = SchedulerJobRuntime.string(claim["claimedAt"]).flatMap(NativeTimestampFormat.parseISO8601FractionalFirst),
               let claimedDue = SchedulerJobRuntime.epoch(from: claim["dueEpoch"]),
               claimedDue.isFinite,
-              // A rewind cannot make a due-time claim evidence of non-execution.
-              // Round up to avoid mistaking the stored dueEpoch's rounding for it.
+              // A rewind cannot make a due-time claim evidence of non-execution. Round up to avoid mistaking the stored dueEpoch's rounding for it.
               claimedDue > claimedAt.timeIntervalSince1970.rounded(.up),
               let due = SchedulerJobRuntime.epoch(from: object["nextRunAt"])
                 ?? SchedulerJobRuntime.epoch(from: object["nextRunAtEpoch"]),
@@ -285,7 +278,10 @@ extension SwiftNativeTriggerScheduler {
                 guard case .object(let active)? = obj["activeOccurrence"],
                       SchedulerJobRuntime.string(active["key"]) == occurrenceKey else {
                     throw NSError(domain: "NativeAgentScheduler", code: -409, userInfo: [
-                        NSLocalizedDescriptionKey: "scheduler_claim_changed: Claim changed before settlement: \(occurrenceKey). Effects may have occurred; inspect scheduler/jobs.json and the delivery receipts before resuming this scheduled Desk task."
+                        NSLocalizedDescriptionKey: """
+                            scheduler_claim_changed: Claim changed before settlement: \(occurrenceKey). Effects may have occurred; inspect \
+                            scheduler/jobs.json and the delivery receipts before resuming this scheduled Desk task.
+                            """
                     ])
                 }
                 found = true
@@ -319,7 +315,7 @@ extension SwiftNativeTriggerScheduler {
                     obj["disabledReason"] = .string("could not compute next scheduled run")
                 }
                 obj["lastOccurrenceKey"] = .string(occurrenceKey)
-                // A watch keeps the rows its read saw on its own row, for the next read to compare.
+                // Retain exactly the rows observed so the next watch read can compare them.
                 if let seen { obj["lastSeen"] = .array(seen.map(JSONValue.string)) }
                 obj.removeValue(forKey: "activeOccurrence")
                 rows[idx] = .object(obj)
@@ -327,15 +323,17 @@ extension SwiftNativeTriggerScheduler {
             }
             guard found else {
                 throw NSError(domain: "NativeAgentScheduler", code: -404, userInfo: [
-                    NSLocalizedDescriptionKey: "scheduler_job_missing: Scheduled Desk task \(jobId) disappeared before settlement. Effects may have occurred; inspect scheduler/jobs.json and the delivery receipts before recreating it."
+                    NSLocalizedDescriptionKey: """
+                        scheduler_job_missing: Scheduled Desk task \(jobId) disappeared before settlement. Effects may have occurred; inspect \
+                        scheduler/jobs.json and the delivery receipts before recreating it.
+                        """
                 ])
             }
         }
 
     }
 
-    /// Record retirement durably before removing rows under the jobs lock;
-    /// a kept row the selection changed (paused) is written too.
+    /// Remove retired rows under the jobs lock; a kept row the selection changed (paused) is written too.
     @discardableResult
     public func pruneJobs(
         select: @Sendable ([JSONValue]) -> (rows: [JSONValue], retired: [JSONValue])
@@ -344,10 +342,6 @@ extension SwiftNativeTriggerScheduler {
             let rows = try Self.readJobsChecked(at: jobsPath)
             let result = select(rows)
             guard !result.retired.isEmpty || result.rows != rows else { return 0 }
-            if !result.retired.isEmpty {
-                try await SwiftNativePersistenceCore.appendJSONLDurable(result.retired, to: jobsPath.deletingLastPathComponent()
-                    .appendingPathComponent("retired.jsonl"))
-            }
             try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(SwiftNativeTriggerScheduler.jobsDataForWrite(result.rows), to: jobsPath)
             return result.retired.count
         }

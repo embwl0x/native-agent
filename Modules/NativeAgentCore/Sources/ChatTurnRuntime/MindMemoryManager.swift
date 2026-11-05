@@ -11,7 +11,7 @@ import DreamREMCycle
 // Blueprint: | `MindMemoryManager.swift` | `MindMemoryJudgment` struct; `predictionModelKey` (the record's key for the model the judgment runs on, read without changing the request; the interpretation reports the same model), `interpret` (with cares when shown and optional reply-grounded promises), `interpretBatch` (owed turns in one call, the same parser and rules once, one section per turn; a missing section stays owed), `appraiseCares`, `relevantRecallIDs`; incremental ranked evidence and catalog-budgeted relevance batches; `AfterTurnMemoryFailure` preserves output limits, request rejections and refusals with distinct recovery |
 
 public struct MindMemoryJudgment: MemoryManaging {
-    private let makeLLMClient: @Sendable () -> any LLMClient
+    private let makeLLMClient: @Sendable (PrivateWorkContextAssembly) -> any LLMClient
     private let relevanceCache = RecallJudgmentCache()
 
     private struct RecallRoute: Sendable, Equatable {
@@ -56,7 +56,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
-    public init(makeLLMClient: @escaping @Sendable () -> any LLMClient) {
+    public init(makeLLMClient: @escaping @Sendable (PrivateWorkContextAssembly) -> any LLMClient) {
         self.makeLLMClient = makeLLMClient
     }
 
@@ -84,7 +84,10 @@ public struct MindMemoryJudgment: MemoryManaging {
     }
 
     /// Recovery follows the failed judgment, not a diagnosis inferred from its prose.
-    private static let recallEncodingRecovery = "The recall query and evidence could not be encoded as JSON: a NativeAgent defect in this turn's input, not your memories or the model. This turn's recall judgment could not run; tell the person if it repeats. Changing the selected model cannot fix it."
+    private static let recallEncodingRecovery = """
+        The recall query and evidence could not be encoded as JSON: a NativeAgent defect in this turn's input, not your memories or the model. This \
+        turn's recall judgment could not run; tell the person if it repeats. Changing the selected model cannot fix it.
+        """
 
     private static func judgmentRecovery(_ reason: AfterTurnMemoryFailure.Reason, surface: String, detail: String? = nil) -> String {
         let group = (ProviderSurfaceGroups.group(for: surface) ?? ProviderSurfaceGroups.chat).id
@@ -96,25 +99,43 @@ public struct MindMemoryJudgment: MemoryManaging {
             fix = "The judgment was cancelled. Leave it stopped; no settings repair is indicated."
         case .invalidJSON, .missingSections, .invalidCaring, .invalidAffect, .invalidMemories, .invalidCares,
              .invalidProviderResponse:
-            fix = "The judgment did not return its required JSON shape (\(reason.rawValue)); do not treat it as an empty judgment. Inspect the selected model with \(model); repair its structured response before relying on another pass."
+            fix = """
+                The judgment did not return its required JSON shape (\(reason.rawValue)); do not treat it as an empty judgment. Inspect the selected \
+                model with \(model); repair its structured response before relying on another pass.
+                """
         case .contextTooLong:
-            fix = "The judgment input exceeds the selected model's window. Shorten the query or select a larger-window model through \(model); repeating the same input will not fix it."
+            fix = """
+                The judgment input exceeds the selected model's window. Shorten the query or select a larger-window model through \(model); repeating \
+                the same input will not fix it.
+                """
         case .authExpired, .codexCLISessionExpired:
-            fix = "The judgment account needs sign-in. Read \(account) to identify the account, then reconnect it in Providers → Accounts & API keys."
+            fix = "The judgment account needs sign-in. Read \(account), then reconnect it in Providers → Accounts using Add key or Sign in."
         case .routingUnavailable:
             fix = "The saved judgment route is unavailable. Read \(account) and repair the reported routing error before another pass."
         case .modelUnavailable:
             fix = "The selected judgment model is unavailable. Read \(model) and select a model served by its account."
         case .trustUnavailable:
-            fix = "The saved Trust policy could not be read or validated. Preserve its bytes and repair Trust before another judgment; a model change cannot repair authority storage."
+            fix = """
+                The saved Trust policy could not be read or validated. Preserve its bytes and repair Trust before another judgment; a model change \
+                cannot repair authority storage.
+                """
         case .network:
             fix = "The judgment connection failed. Restore network access before requesting another pass; \(account) identifies its provider."
         case .rateLimited, .overloaded, .deadline:
-            fix = "The provider could not complete this judgment (\(reason.rawValue)). Leave the result unresolved; \(model) shows the model choice if a different supported route is needed."
+            fix = """
+                The provider could not complete this judgment (\(reason.rawValue)). Leave the result unresolved; \(model) shows the model choice if a \
+                different supported route is needed.
+                """
         case .refused:
-            fix = "The provider refused this judgment. Leave it unresolved; offer an allowed alternative or stop, without rephrasing or splitting to bypass refusal."
+            fix = """
+                The provider refused this judgment. Leave it unresolved; offer an allowed alternative or stop, without rephrasing or splitting to \
+                bypass refusal.
+                """
         case .outputLimit:
-            fix = "The judgment reached its output limit. Leave it unresolved; reduce the judgment input or use a model with a larger output allowance before another pass."
+            fix = """
+                The judgment reached its output limit. Leave it unresolved; reduce the judgment input or use a model with a larger output allowance \
+                before another pass.
+                """
         case .requestRejected:
             fix = "The provider rejected this judgment request. Leave it unresolved; correct the reported request error before another pass."
         case .provider:
@@ -151,12 +172,13 @@ public struct MindMemoryJudgment: MemoryManaging {
             return .failure(.init(reason: catalog.catalogFailure == nil ? .modelUnavailable : .provider,
                 recovery: catalog.catalogFailure.map {
                     "The \(provider) catalog request failed: \($0). Refresh that provider's models in Settings, then retry this query."
-                } ?? "\(provider)'s model list has no context window for \(model). Refresh that provider's models in Settings or choose a listed model, then retry this query.",
+                } ?? """
+                    \(provider)'s model list has no context window for \(model). Refresh that provider's models in Settings or choose a listed model, \
+                    then retry this query.
+                    """,
                 model: model, surface: surface))
         }
-        // UTF-8 bytes conservatively bound tokens without assuming a tokenizer.
-        // Leave half the context for reasoning/output and reserve instructions
-        // and message framing before packing serialized evidence.
+        // UTF-8 bytes conservatively bound tokens; reserve framing and instructions and leave half the window for reasoning and output.
         let payloadByteCap = contextLength / 2 - Self.relevanceEnvelopeByteReserve
         let route = RecallRoute(snapshot: snapshot, surface: surface,
             admission: admission, payloadByteCap: payloadByteCap)
@@ -357,7 +379,7 @@ public struct MindMemoryJudgment: MemoryManaging {
             "payload_byte_cap": .int(Int64(payloadByteCap)),
             "provider_total_ms": .double(providerTotalMilliseconds), "judged_pages": .int(Int64(judgedPages)),
         ]
-        TurnTraceBus.fireFromContext(kind: "memory.recall.relevance", surface: surface, payload: .object(timings))
+        TurnTraceBus.fireFromContext(kind: "memory.recall.relevance", surface: surface, payload: .object(timings), turn: nil)
         let detail = timings.sorted { $0.key < $1.key }.map { key, value in
             switch value {
             case .double(let value): return "\(key)=\(Int(value))"
@@ -375,8 +397,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
-    // Keep evidence paging independent of prompt wording: preserve the established
-    // 819-byte instruction plus 128-byte framing allowance when shortening copy.
+    // Preserve the 819-byte instruction and 128-byte framing allowances independently of prompt wording.
     private static let relevanceEnvelopeByteReserve = 947
 
     private static var relevanceSystem: String {
@@ -395,13 +416,11 @@ public struct MindMemoryJudgment: MemoryManaging {
         guard prompt.utf8.count <= route.payloadByteCap else { return failed(.contextTooLong) }
         let response: String
         do {
-            response = try await ConversationPrefixTelemetry.withUnmeasuredRequestShape {
-                try await route.admission.withModelContext {
-                    try await PrivateWorkContextAssembly.$current.withValue(.taskOnly) {
-                        try await makeLLMClient().complete(prompt: prompt, system: Self.relevanceSystem, model: model, surface: surface, purpose: "recall_judge", tools: nil)
-                    }
-                }
-            }
+            var call = LLMCall(turn: nil, surface: surface, purpose: "recall_judge")
+            call.admission = try route.admission.modelAdmission
+        response = try await makeLLMClient(.taskOnly).complete(
+                prompt: prompt, system: Self.relevanceSystem, model: model, tools: nil,
+                call: call)
         } catch {
             let failure = ProviderFailure.classify(error)
             return .failure(.init(reason: Self.reason(error, cause: failure),
@@ -416,7 +435,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         return .success(Set(ids.compactMap { Int($0).map { candidates[$0].key } }))
     }
 
-    /// The Memory provider row, as every after-turn judgment reaches it.
+    /// Use the Memory provider row for every after-turn judgment.
     private struct JudgmentRoute: Sendable {
         let surface: String
         let admission: TurnRouteAdmission
@@ -428,40 +447,41 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
-    /// The record's key for the model this turn's judgment would run on (the
-    /// same key its interpretation reports). nil: no model resolves, so no
-    /// prediction stands on an unknown judge.
+    /// Only a resolved judgment model can supply a prediction key; unknown judges establish no standing.
     public func predictionModelKey() async -> String? {
         guard let route = try? await Self.judgmentRoute() else { return nil }
         let judging = route.model
         return AfterTurnInterpretation.judgingKey(surface: route.surface, model: judging)
     }
 
+    /// The account is the route's provider id, so switching accounts for the same model changes the key.
+    public func judgmentRouteKey() async -> String? {
+        guard let route = try? await Self.judgmentRoute() else { return nil }
+        return [route.surface, route.admission.providerId ?? "", route.model].joined(separator: "\u{0}")
+    }
+
     private static func judgmentRoute() async throws -> JudgmentRoute {
         let snapshot = try await SwiftNativeProviderRouting().checkedRoutingSnapshot()
         let surface = snapshot.pinnedModels["memory"] != nil || snapshot.activeProviders["memory"] != nil ? "memory" : "chat"
-        // The memory surface's own pick, never the turn's: the model User set for
-        // memory is the one it runs on (User 10-30; it had inherited the chat
-        // turn's model on 167 of 169 judgments).
+        // Use Memory's saved provider choice independently of the active chat turn.
         return try JudgmentRoute(surface: surface, admission: snapshot.routeAdmission(
-            for: surface, choice: nil, inheritingCall: surface == "chat"))
+            for: surface, choice: nil, inheritChat: surface == "chat"))
     }
 
     /// Stop interrupts unfinished provider work. A returned reply belongs to
     /// settlement, even when cancellation arrives with that reply.
     private func judgedText(prompt: String, system: String, purpose: String,
-                            route: JudgmentRoute) async throws -> String {
+                            route: JudgmentRoute, call heldCall: LLMCall? = nil) async throws -> String {
         let text: String
         do {
             try Task.checkCancellation()
-            text = try await ConversationPrefixTelemetry.withUnmeasuredRequestShape {
-                try await route.admission.withModelContext {
-                    try await PrivateWorkContextAssembly.$current.withValue(.taskOnly) {
-                        try await makeLLMClient().complete(prompt: prompt, system: system, model: route.model,
-                            surface: route.surface, purpose: purpose, tools: nil)
-                    }
-                }
-            }
+            var call = heldCall ?? LLMCall(turn: nil, surface: route.surface, purpose: purpose)
+            call.surface = route.surface
+            call.purpose = purpose
+            call.admission = try route.admission.modelAdmission
+        text = try await makeLLMClient(.taskOnly).complete(
+                prompt: prompt, system: system, model: route.model, tools: nil,
+                call: call)
         } catch {
             let cause = ProviderFailure.classify(error)
             throw route.failed(Self.reason(error, cause: cause), recovery: ProviderFailure.diagnosticDescription(error))
@@ -483,13 +503,13 @@ public struct MindMemoryJudgment: MemoryManaging {
     }
 
     public func interpret(_ request: MemoryManagerRequest, context: AfterTurnContext?,
-                          factsEnabled: Bool) async throws -> AfterTurnInterpretation? {
+                          factsEnabled: Bool, call: LLMCall) async throws -> AfterTurnInterpretation? {
         guard !request.userMessage.isEmpty else { return nil }
         let route = try await Self.judgmentRoute()
         let prompt = try Self.prompt(request, context: context, factsEnabled: factsEnabled)
         let system = try completionPolicy("turn-interpretation", section: "system")
         let text = try await judgedText(prompt: prompt, system: system,
-            purpose: LLMCallContext.purpose == "memory_held" ? "memory_held" : "memory_interpret", route: route)
+            purpose: call.purpose == "memory_held" ? "memory_held" : "memory_interpret", route: route, call: call)
         return try await Self.settledObject(text: text, route: route) { object in
             try Self.parseInterpretation(object, request: request, context: context, route: route)
         }
@@ -527,10 +547,7 @@ public struct MindMemoryJudgment: MemoryManaging {
                                        appAuthored: request.appAuthored, model: route.model, surface: route.surface)
     }
 
-    /// SEVERAL OWED EXCHANGES, ONE CALL (docs/COGNITION_WIRING.md, "Deferral").
-    /// The rules once, then each exchange's own request under its id;
-    /// the reply has one section per id. A section that is missing, malformed,
-    /// or whose id appears twice is nil: that row stays owed (no guess).
+    /// Batch exchanges under their exact IDs; missing, malformed or duplicate sections leave only their own rows owed.
     public func interpretBatch(_ inputs: [MemoryBatchInput]) async throws -> [AfterTurnInterpretation?] {
         guard !inputs.isEmpty, inputs.count <= MemoryManagerLane.batchLimit else { throw AfterTurnInterpretationFailure.envelope }
         let route = try await Self.judgmentRoute()
@@ -547,26 +564,35 @@ public struct MindMemoryJudgment: MemoryManaging {
             guard let replies = object["turns"] as? [Any] else { throw route.failed(.missingSections) }
             // Every repeated id is ambiguous, even if one section is malformed.
             let sections = Dictionary(grouping: replies.compactMap { element -> (id: String, value: Any)? in
-                guard let reply = element as? [String: Any], let id = reply["id"] as? String else { return nil }
+                // The id is the exchange's number, however the reply spells it ("0" or 0).
+                guard let reply = element as? [String: Any],
+                      let id = (reply["id"] as? String) ?? (reply["id"] as? NSNumber).flatMap({ Int(exactly: $0.doubleValue) }).map(String.init)
+                else { return nil }
                 return (id, reply["interpretation"] ?? NSNull())
             }, by: \.id)
             return inputs.enumerated().map { index, input in
                 guard let matches = sections[String(index)], matches.count == 1,
-                      let value = matches.first?.value as? [String: Any] else { return nil }
+                      let value = matches.first?.value as? [String: Any] else {
+                    // Say what came back instead, so a missing section names its cause.
+                    TurnTraceBus.fireFromContext(kind: "memory.interpretation.missing", payload: .object([
+                        "batch_index": .int(Int64(index)), "sections": .int(Int64(replies.count)),
+                        "returned_ids": .array(replies.map { .string(String(describing: ($0 as? [String: Any])?["id"] ?? "none")) }),
+                    ]), turn: nil)
+                    return nil
+                }
                 do { return try Self.parseInterpretation(value, request: input.request, context: input.context, route: route) }
                 catch {
                     let cause = (error as? AfterTurnMemoryFailure)?.recovery ?? String(describing: error)
                     TurnTraceBus.fireFromContext(kind: "memory.interpretation.refused", payload: .object([
                         "batch_index": .int(Int64(index)), "cause": .string(cause),
-                    ]))
+                    ]), turn: nil)
                     return nil // Only this section stays owed; usable siblings proceed.
                 }
             }
         }
     }
 
-    /// The cares section alone, over one stretch of a conversation she lived:
-    /// the once-only reading of her recent life. Same section, same parse.
+    /// Use the same cares parser for one contiguous conversation stretch so its once-only reading stays consistent.
     public func appraiseCares(conversation: String, speaker: String,
                               shown: [CognitiveCareLine]) async throws -> [CognitiveCareJudgment] {
         guard !shown.isEmpty else { return [] }
@@ -587,8 +613,7 @@ public struct MindMemoryJudgment: MemoryManaging {
         }
     }
 
-    /// Her cares as data, then what to say about them. Empty when no care is
-    /// shown, which leaves every other section's prompt exactly as it was.
+    /// Absent cares leave other prompt sections unchanged; present cares are data, followed by their interpretation guidance.
     static func caresSection(_ shown: [CognitiveCareLine], careWake: Bool = false) throws -> String {
         guard !shown.isEmpty else { return "" }
         return try completionPolicy("turn-interpretation", section: careWake ? "care-wake-cares" : "cares", arguments: [
@@ -598,7 +623,7 @@ public struct MindMemoryJudgment: MemoryManaging {
 
     static let caresShape = #""cares":[{"care":"c2|new","about":null,"between":false,"moved":0.0,"by":"them|her|world","felt":"...","note":"...","open":null,"closes":false,"stance":null or {"text":"...","because":"...","wouldChangeMind":"..."}}]"#
 
-    /// The interpretation rules, shared by the one-turn prompt and once per batch.
+    /// Share interpretation rules between single-turn and batch prompts.
     static var interpretationRules: String {
         get throws { try completionPolicy("turn-interpretation", section: "rules") }
     }
@@ -619,7 +644,8 @@ public struct MindMemoryJudgment: MemoryManaging {
         let exchangeTime = request.occurredAt ?? context?.event.occurredAt ?? Date()
         return try completionPolicy("turn-interpretation", section: "prompt", arguments: [
             request.personName ?? "the person",
-            request.appAuthored ? completionPolicy("turn-interpretation", section: "app-authored") : request.standingAgent ? completionPolicy("turn-interpretation", section: "standing-agent") : ".",
+            request.appAuthored ? completionPolicy("turn-interpretation", section: "app-authored") : request.standingAgent
+                ? completionPolicy("turn-interpretation", section: "standing-agent") : ".",
             String(factsEnabled),
             clock.string(from: exchangeTime),
             TimeZone.current.identifier,

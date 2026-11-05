@@ -1,14 +1,9 @@
 import Darwin
 import Foundation
 
-// Blueprint: | `CheckedFixedSizeSecretFile.swift` | `CheckedFixedSizeSecretFile`: exact regular 0600 secret bytes, missing-only creation and byte-preserving invalid-state failure; caller owns authority lifecycle |
+// Blueprint: | `CheckedFixedSizeSecretFile.swift` | `CheckedFixedSizeSecretFile`; Missing-only creation; invalid bytes preserved. |
 
-/// Mechanical storage for a fixed-size local secret.
-///
-/// This type deliberately owns no authority domain and no secret lifecycle.
-/// Callers retain those decisions. It only enforces the persistence invariant
-/// shared by local authority files: missing state may bootstrap once, while
-/// existing invalid state is unavailable and is never repaired or replaced.
+/// Callers own authority lifecycle; only missing state may bootstrap, and existing invalid bytes remain unavailable and untouched.
 public enum CheckedFixedSizeSecretFile {
     public struct Unavailable: Error, LocalizedError, Sendable {
         public let path: String
@@ -24,10 +19,7 @@ public enum CheckedFixedSizeSecretFile {
         }
     }
 
-    /// Load an exact regular 0600 file, or durably create it when and only when
-    /// the target is missing. Creation and reads serialize on a sidecar flock.
-    /// The newly-created bytes are fsync'd, permission-checked, and read back
-    /// from the same descriptor before they may leave this function.
+    /// Serialize missing-only creation and exact reads; fsync, permission-check and read back the same descriptor before publication.
     public static func loadOrCreate(
         at url: URL,
         byteCount: Int,
@@ -67,12 +59,7 @@ public enum CheckedFixedSizeSecretFile {
         }
     }
 
-    /// Read an exact regular 0600 file if — and only if — it already exists.
-    ///
-    /// Nothing is created, so a caller that must not bring authority into
-    /// being (an offscreen read of a page) can still show what is really
-    /// there. Missing state answers `nil`; existing invalid state is
-    /// unavailable exactly as it is for `loadOrCreate`.
+    /// Read without creating authority for display-only callers; missing is nil, while existing invalid state remains unavailable.
     public static func peekExisting(at url: URL, byteCount: Int) throws -> Data? {
         guard byteCount > 0 else {
             throw Unavailable(path: url.path, detail: "expected byte count must be positive")
@@ -138,8 +125,7 @@ public enum CheckedFixedSizeSecretFile {
             0o600
         )
         guard fd >= 0 else {
-            // A non-cooperating creator may have won after our missing-state
-            // check. Never overwrite it; validate it as existing authority.
+            // A racing creator owns existing authority; validate it without overwriting.
             if errno == EEXIST {
                 return try readAndVerify(at: url, byteCount: secret.count)
             }
@@ -183,8 +169,7 @@ public enum CheckedFixedSizeSecretFile {
                 throw Unavailable(path: url.path, detail: "generated state failed durable read-back verification")
             }
 
-            // Persist the directory entry as well as the file contents before
-            // returning bytes that callers may publish or use for signatures.
+            // Persist the directory entry as well as the file contents before returning bytes that callers may publish or use for signatures.
             let directoryFD = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
             guard directoryFD >= 0 else {
                 throw unavailable(url, operation: "open secret directory for sync", code: errno)

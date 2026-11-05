@@ -15,39 +15,31 @@ import ToolRegistry
 import SystemOps
 import Cognition
 import ProviderRouting
-// Blueprint: | `EngineDoctor.swift` | DoctorFacade owns report evidence, latest-run availability across retained/partially refreshed reports, rooted checked current-route issues, tool health receipts, loop verdicts and DoctorPlainCopy summary/issue rows; rooted weekly digest/error, activity, hardening/exports, gauntlet, health card, liveness, watchdog and live report refresh publish through LatestRead; completed reports and committed exports use write. RuntimeHealth is liveness metadata; lifecycle facts remain manager-owned; run history belongs to engine.runs. |
+// Blueprint: | `EngineDoctor.swift` | Shared report availability, route health, liveness and checked publication |
 
-/// `NativeAgentEngine.doctor`: Doctor, this runtime's health and the
-/// background-loop watchdog for one data root, in core types. Diagnostics,
-/// Status, the health pill, the menu line, Setup and Support Snapshot render
-/// this state; the health read is nonisolated so the phone lane uses the same
-/// owner. `EngineDoctorRuntime` interprets live owners and selects repairs;
-/// the app's Doctor port supplies platform observations and callbacks.
+/// Share one root’s health state across surfaces, including nonisolated phone reads; native ports observe while `EngineDoctorRuntime` interprets and
+/// admits repairs.
 @MainActor
 @Observable
 public final class DoctorFacade {
     /// A completed Doctor run produces a report, not proof that repairs succeeded.
     public enum RunOutcome: Equatable {
-        /// No report: another run held the lock, or the run threw.
+        /// No report may mean held admission or a thrown run; it does not prove health.
         case unavailable(String)
-        /// A report came back. `failingChecks` are its `status == fail|error`
-        /// rows — the run completing says nothing about them.
+        /// Run completion does not mean its `fail` or `error` rows passed.
         case completed(status: String, failingChecks: [CheckResult])
 
-        /// True when the run produces a report.
         public var didRun: Bool {
             if case .completed = self { return true }
             return false
         }
 
-        /// Onboarding's offline subset: every `live.*` row is excluded,
-        /// including app-owned memory/cognition and optional integrations.
+        /// Exclude every `live.*` row from offline onboarding, including app-owned state and optional integrations.
         public var failingScaffoldChecks: [CheckResult] {
             guard case .completed(_, let failing) = self else { return [] }
             return failing.filter { !$0.checkID.hasPrefix("live.") }
         }
 
-        /// One line naming what to fix, for a user-facing surface.
         public var failureDetail: String {
             switch self {
             case .unavailable(let reason):
@@ -62,6 +54,9 @@ public final class DoctorFacade {
 
     public nonisolated let dataRoot: URL
 
+    @ObservationIgnored var diagnosticsDidChange: (@MainActor () -> Void)?
+    @ObservationIgnored var faceAction: (@MainActor (String, String?) async throws -> String?)?
+
     public private(set) var activityEvents: [ActivityEvent] = []
     public private(set) var activityRefresh: PanelRefreshStatus?
     public private(set) var productionHardening: ProductionHardeningSummary?
@@ -69,18 +64,20 @@ public final class DoctorFacade {
     public private(set) var latestImprovementGauntletRun: ImprovementGauntletRun?
     public private(set) var improvementGauntletRunCount = 0
     public private(set) var hardeningRefresh: PanelRefreshStatus?
+    public internal(set) var improvementRunStartedAt: Date?
+    public internal(set) var improvementRunError: String?
+    public internal(set) var productionExportWork: (support: Bool, startedAt: Date)?
+    public internal(set) var productionExportFailure: (support: Bool, detail: String)?
+    @ObservationIgnored var capabilitiesDidChange: (@MainActor @Sendable () async -> Void)?
     @ObservationIgnored private let activityRead = LatestRead()
     @ObservationIgnored private let hardeningRead = LatestRead()
 
-    /// The last Doctor report, as of the last run or live-row refresh.
-    public var report: DoctorReport?
+    public var report: DoctorReport? { didSet { diagnosticsDidChange?() } }
     @ObservationIgnored public let reportRead = LatestRead()
-    /// A run is in flight: the Run button, the pill and Support Snapshot wait.
+    /// Surfaces must wait while a run is in flight.
     public var isRunning = false
     public var runStartedAt: Date?
-    /// When the run that produced `report` completed. It stays through the
-    /// next run, so a page read mid-run names the report it shows (Support
-    /// Snapshot is refused while `isRunning`), and clears if that run fails.
+    /// Retain the displayed report’s completion stamp during a new run; clear it on failure so stale evidence cannot appear current.
     public var reportCompletedAt: Date?
     /// A failed full run remains unavailable through partial live-row refreshes.
     public private(set) var latestRunFailure: String?
@@ -88,27 +85,24 @@ public final class DoctorFacade {
         if isRunning { return "A Doctor run is in progress; retained checks are not current until it finishes." }
         return latestRunFailure
     }
-    /// Runtime liveness metadata, as of the last probe.
     public var health: RuntimeHealth?
     @ObservationIgnored private let healthRead = LatestRead()
 
     @discardableResult
     public func refreshHealth() async -> RuntimeHealth {
-        await healthRead.read({ readHealth() }, publish: { health = $0 })
+        await healthRead.read({ readHealth() }, publish: { health = $0; diagnosticsDidChange?() })
     }
-    /// The background-loop watchdog, as of the last read.
     public var watchdog: WatchdogStatus?
-    /// The health pill's card, as of the last read.
     public var healthCard: HealthCard?
     @ObservationIgnored public let healthCardRead = LatestRead()
     @ObservationIgnored private let watchdogRead = LatestRead()
 
     @discardableResult
     public func refreshWatchdog(manager: BackgroundLoopLifetimes = .shared) async -> WatchdogStatus {
-        await watchdogRead.read({ await readWatchdog(manager: manager) }, publish: { watchdog = $0 })
+        await watchdogRead.read({ await readWatchdog(manager: manager) }, publish: { watchdog = $0; diagnosticsDidChange?() })
     }
-    /// The verdicts from the same evidence as the report's background-loop row.
-    public var loopVerdicts: [LoopHealthVerdict] = []
+    /// Derive verdicts from the report’s same background-loop evidence.
+    public var loopVerdicts: [LoopHealthVerdict] = [] { didSet { diagnosticsDidChange?() } }
 
     public func refreshActivity() async throws {
         let result: Result<[ActivityEvent], Error> = await activityRead.read({
@@ -122,12 +116,14 @@ public final class DoctorFacade {
             case .failure:
                 activityRefresh = PanelRefreshStatus(lastAttemptAt: Date(), lastSuccessAt: activityRefresh?.lastSuccessAt, failedEndpoints: ["activity"])
             }
+            diagnosticsDidChange?()
         })
         _ = try result.get()
     }
 
-    public func recordProductionExports(_ verified: [ProductionExport]) {
+    public func recordProductionExports(_ verified: [ProductionExport]) async {
         hardeningRead.write { productionExports = verified }
+        await capabilitiesDidChange?()
     }
 
     public func refreshHardening() async -> [(endpoint: String, label: String, error: Error)] {
@@ -153,6 +149,7 @@ public final class DoctorFacade {
             hardeningRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
                 lastSuccessAt: read.3.isEmpty ? Date() : hardeningRefresh?.lastSuccessAt, failedEndpoints: read.3.map { $0.endpoint })
         })
+        await capabilitiesDidChange?()
         return read.3
     }
 
@@ -196,20 +193,16 @@ public final class DoctorFacade {
         self.dataRoot = dataRoot
     }
 
-    /// Admission for every Doctor run on this root — Run, Repair, onboarding
-    /// and the automatic passes — so two never overlap and a click during a
-    /// pass is told so.
+    /// All run sources share admission so overlapping runs cannot occur.
     public func admitRun() -> Bool {
         guard !isRunning else { return false }
         isRunning = true
         runStartedAt = Date()
+        diagnosticsDidChange?()
         return true
     }
 
-    /// Completion: the report a finished run produced lands with its stamp;
-    /// a run that threw or was cancelled leaves the last report standing but
-    /// clears its stamp, so nothing (Support Snapshot's reuse) takes that
-    /// rollup as current after a newer run failed to confirm it.
+    /// A failed or cancelled run retains prior report rows but clears their stamp so Support Snapshot cannot reuse them as current.
     public func finishRun(_ finished: DoctorReport?, failure: String? = nil) {
         reportRead.write {
         if let finished { report = finished }
@@ -220,9 +213,10 @@ public final class DoctorFacade {
         }
         isRunning = false
         runStartedAt = nil
+        diagnosticsDidChange?()
     }
 
-    public func toolStatusEnvelope() async throws -> JSONValue {
+    public func toolStatusEnvelope(turn: Turn) async throws -> JSONValue {
         guard let report else {
             if let latestRunFailure, !isRunning {
                 return AppToolExecutor.failure("doctor_unavailable", latestRunFailure)
@@ -234,7 +228,7 @@ public final class DoctorFacade {
         let completedAt = reportCompletedAt
         let runningSince = runStartedAt
         let reportIssue = reportAvailabilityIssue
-        let surface = ChatTurnRuntimeContext.current?.surface ?? "chat"
+        let surface = turn.runtime?.surface ?? turn.envelope?.surface ?? "chat"
         let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
         let activeProviderID: String?
         let activeProvider: ProviderInfo?
@@ -242,7 +236,7 @@ public final class DoctorFacade {
         do {
             let snapshot = try await router.checkedProviderSnapshot()
             let providers = try ProvidersFacade.connections(from: snapshot)
-            activeProviderID = ChatTurnRuntimeContext.current?.providerID
+            activeProviderID = turn.runtime?.providerID ?? turn.admission?.provider
                 ?? ProviderRoutingSurfaceLookup.value(snapshot.routing.activeProviders, surface)
             activeProvider = activeProviderID.flatMap { providerID in
                 providers.first(where: { $0.provider_id == providerID })
@@ -288,20 +282,12 @@ public final class DoctorFacade {
             }
             return JSONValue.object(row)
         }
-        // The path is what a chat turn on this surface waits on: the provider
-        // that answers it (live.providers), the memory store it recalls from
-        // (live.memory), the prompt prefix it is sent with
-        // (prompt_prefix_health) and the local bridges a bridge turn arrives
-        // through (live.bridges). Every other row is real but serves something
-        // else (a connector, a loop, a backup), so it shows in `status` and in
-        // its row, never as a broken path. Credential eligibility alone cannot
-        // prove a provider warning concerns another account or a working model.
+        // Only provider, memory, prompt and ingress-bridge faults block the chat path. Credential eligibility alone cannot prove a provider warning concerns
+        // another account or working model.
         let pathIDs: Set<String> = ["live.providers", "live.memory", "prompt_prefix_health", "live.bridges"]
         let pathChecks = report.checks.filter { check in
             guard pathIDs.contains(check.checkID) else { return false }
-            // Only the credential-owner reading names exactly which accounts
-            // its warning concerns; active-model and probe warnings lack this
-            // evidence and must stay on the path even with eligible credentials.
+            // Only credential-owner warnings name affected accounts; model and probe warnings remain on the path despite eligible credentials.
             if check.checkID == "live.providers", check.status.lowercased() == "warn",
                activeProvider?.auth_status.eligible == true, let activeProviderID,
                let source = check.source, source.hasPrefix("Providers accounts: ") {
@@ -321,16 +307,22 @@ public final class DoctorFacade {
                 ? DoctorReadout.doctorRollup(pathChecks.map(\.status)) : "unavailable"),
             "active_path_check_ids": .array(pathChecks.map { .string($0.id) }),
             "active_provider_id": activeProviderID.map(JSONValue.string) ?? .null,
-            // The receipt's own word (ready, saved, failed, rejected, needs_*).
             "active_provider_status": .string(routeIssue == nil ? activeProvider?.auth_status.state ?? "unknown" : "unavailable"),
             "current_route_issue": routeIssue ?? .null,
-            "status_scope_note": .string("status requires a completed latest run and readable current routing, then rolls up every check; report_status describes the retained checks; active_path_status covers the checks a chat turn here depends on (active_path_check_ids). Off and not needed are non-fault states; unmeasured and unknown checks cannot establish health."),
+            "status_scope_note": .string("""
+                status requires a completed latest run and readable current routing, then rolls up every check; report_status describes the retained \
+                checks; active_path_status covers the checks a chat turn here depends on (active_path_check_ids). Off and not needed are non-fault \
+                states; unmeasured and unknown checks cannot establish health.
+                """),
             "repaired": .bool(report.repaired),
             "check_count": .int(Int64(checks.count)),
             "checks": .array(checks),
         ]
         if let runningSince {
-            envelope["run_in_progress"] = .string("A Doctor run started at \(NativeTimestampFormat.plainZulu(runningSince)) is in progress; this report is from before it and is not current until it finishes.")
+            envelope["run_in_progress"] = .string("""
+                A Doctor run started at \(NativeTimestampFormat.plainZulu(runningSince)) is in progress; this report is from before it and is not \
+                current until it finishes.
+                """)
         }
         if activeProvider?.auth_status.eligible == false, let activeProviderID {
             let target = InlineInteractionRegistry.canonicalProviderID(activeProviderID)
@@ -339,13 +331,12 @@ public final class DoctorFacade {
         return .object(envelope)
     }
 
-    /// Doctor details fit the limit, prefer a word boundary, and mark truncation with an ellipsis.
+    /// Prefer word boundaries and mark truncation within the detail budget.
     private func boundedDoctorDetail(_ detail: String, limit: Int = 600) -> String {
         guard detail.count > limit else { return detail }
         let ellipsis = "…"
         let head = detail.prefix(limit - ellipsis.count)
-        // Only honour a boundary in the last part of the budget — one very long
-        // unbroken token must not shrink the detail to a few words.
+        // Use only a late word boundary so a long token cannot collapse the detail to a few words.
         if let boundary = head.lastIndex(where: { $0 == " " || $0.isNewline }),
            head.distance(from: head.startIndex, to: boundary) > head.count / 2 {
             let trimmed = head[..<boundary]
@@ -355,11 +346,10 @@ public final class DoctorFacade {
         return String(head) + ellipsis
     }
 
-    /// Lazily initialized by the first health read, not stamped at process launch.
+    /// Begin liveness timing at the first health read, never process launch.
     private nonisolated static let firstHealthReadAt = Date()
 
-    /// `ok` means this in-process read answered, not that Doctor passed.
-    /// `uptimeSeconds` measures elapsed time since the first health read.
+    /// `ok` proves this read answered, not Doctor health; uptime starts at the first health read.
     public nonisolated func readHealth() -> RuntimeHealth {
         RuntimeHealth(
             ok: true,
@@ -378,11 +368,10 @@ public final class DoctorFacade {
         do {
             loopHealth = DoctorLoopHealth.doctorCheck(
                 observations: loopStatuses,
-                recentFailureDates: try DoctorLoopHealth.recentFailureDates(
-                    receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")),
+                recentFailureDates: try await DoctorLoopHealth.recentFailureDates(dataRoot: dataRoot),
                 now: Date())
         } catch {
-            loopHealth = CheckResult(source: "logs/background_loop_failures.jsonl",
+            loopHealth = CheckResult(source: "Loop failure details",
                 id: "background_loops", title: "Background loops", status: "fail",
                 detail: "Loop failure history is unavailable: \(error.localizedDescription)")
         }
@@ -417,7 +406,6 @@ public final class DoctorFacade {
                 ? (loopHealth.status == "ok" ? "Swift background loops are running in NativeAgent.app." : loopHealth.detail)
                 : "Swift background loops are not running.",
             runningImprovements: loopStatuses.filter { $0.executing && $0.name == "self_improvement_sweep" }.count,
-            runningExecutions: loopStatuses.filter { $0.executing && ["mission_executor", "workshop_pump"].contains($0.name) }.count,
             lastActivity: lastActivity,
             repairAvailable: loopStatuses.contains { $0.lastError != nil },
             extras: .object([
@@ -431,8 +419,6 @@ public final class DoctorFacade {
     }
 }
 
-/// One Doctor pass: the worst-row rollup, whether a safe repair applied, and
-/// every row — core offline checks followed by the app's live-owner rows.
 public struct DoctorReport: Equatable, Sendable {
     public var status: String
     public var repaired: Bool
@@ -499,9 +485,7 @@ extension DoctorFacade {
         if let issue = reportAvailabilityIssue {
             return (.unknown, [("doctor.latest_run", "Health checks unavailable", issue, false)])
         }
-        // Prefer an explicit Doctor run. Before any run, reuse the health card that
-        // Chat already keeps current instead of launching a second full Doctor
-        // pass from this always-mounted toolbar control.
+        // Reuse the mounted health card until an explicit Doctor run; this toolbar must not launch a second full pass.
         func summarize(_ statuses: [String]) -> SystemHealthSummary {
             let buckets = statuses.map { DoctorPlainCopy.bucket(for: $0) }
             let failCount = buckets.filter { $0 == "failing" }.count

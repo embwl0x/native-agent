@@ -10,7 +10,7 @@ import PersistenceCore
 import ChatTurnRuntime
 import ChatTurnContracts
 import ChatSessionWork
-// Blueprint: | `ChatModels.swift` | `ChatMessage` reads metadata through the shared checked codec; decode-only inline cards travel with loaded message revisions and never re-encode onto transcript wire; Mac ImageIO generation fills Shared's optional attachment preview bytes with a 720px display decode; transport copies can omit previews before rejecting history; concrete Markdown export and clipboard formatting |
+// Blueprint: | `ChatModels.swift` | `ChatMessage`; Checked transcript codec, attachment previews and export |
 
 public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     public var id: String = UUID().uuidString
@@ -52,8 +52,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         self.metadata = metadata
     }
 
-    /// Canonical history is evidence: never invent a speaker, identity or time.
-    /// The facade retains the prior published transcript when this read fails.
+    /// Never invent canonical history; retain the prior published transcript if decoding fails.
     public init(row o: [String: JSONValue]) throws {
         let row = try JSONRow(.object(o))
         self.id = try row.string("id")
@@ -63,17 +62,15 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         let decodedRole = try row.string("role")
         guard !id.isEmpty, !createdAt.isEmpty, !decodedRole.isEmpty else {
             throw NSError(domain: "NativeAgent.ChatHistory", code: 422, userInfo: [
-                NSLocalizedDescriptionKey: "A saved message has an empty id, role or createdAt. Repair the original transcript row; its identity and authorship cannot be guessed."
+                NSLocalizedDescriptionKey: """
+                    A saved message has an empty id, role or createdAt. Repair the original transcript row; its identity and authorship cannot be guessed.
+                    """
             ])
         }
         self.runId = try row.optionalString("runId")
         self.source = try row.optionalString("source")
 
-        // Missing/null metadata is the normal historical shape. A PRESENT
-        // value of the wrong JSON type is different: silently turning it
-        // into nil would make a user/source=app row look human even though its
-        // provenance envelope was unreadable. Preserve that distinction with
-        // the same closed, non-rendered sentinel used for malformed `origin`.
+        // Malformed metadata must retain the closed provenance sentinel; treating it as absent could make an automated row look human.
         switch o["metadata"] {
         case nil, .null?:
             self.metadata = nil
@@ -90,17 +87,13 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         if self.metadata?.origin != nil, normalizedRole != "user" {
-            // Canonical writers put origin only on user rows. A contradictory
-            // or unreadable role must not suppress the warning and attribute
-            // the row to Agent, so fail closed toward the provenance-bearing
-            // user presentation.
+            // An unreadable role cannot hide provenance warnings or attribute the row to the agent.
             self.role = "user"
         } else {
             self.role = decodedRole
         }
     }
 
-    /// Encodable stays synthesized; decoding uses the same checked row owner.
     public init(from decoder: Decoder) throws {
         guard case .object(let o) = try JSONValue(from: decoder) else {
             throw DecodingError.typeMismatch(
@@ -113,27 +106,21 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 }
 
 extension ChatMessage {
-    /// A wake input she wrote to herself (what changed, what she carries):
-    /// hers, recorded for her, never the person's words. Her acts on the
-    /// person's behalf (a draft she sends for him) are not this.
-    public var isHerOwnTurnInput: Bool {
+    /// Self-authored wake inputs are never the person’s words, including when the agent also acts on their behalf.
+    public var isAgentOwnTurnInput: Bool {
         role == "user" && metadata?.origin?.agent == "self" && metadata?.origin?.authored == "agent"
             && metadata?.origin?.surface == ResidentWake.session
     }
 }
 
 extension ChatMessageMetadata {
-    /// Shared transcript vocabulary for an approval awaiting a human decision.
-    /// Producers must mint this value and transcript grouping/rendering must
-    /// consume it through `isPendingApproval`; a literal drift must never hide
-    /// an actionable card behind a collapsed tool summary.
+    /// Producers and renderers must share `isPendingApproval` vocabulary so actionable cards cannot hide in collapsed tool summaries.
     public static let approvalPendingKind = ChatTranscriptToolMessageKind.approvalPending
 
     public var isPendingApproval: Bool {
         kind == Self.approvalPendingKind
     }
-    /// In-memory failure metadata: `error` enables Retry; `userRowPersisted` prevents suppressing an unsaved user message.
-    /// Retry guards are excluded from CodingKeys and never written to the wire.
+    /// Keep retry guards off the wire; `userRowPersisted` prevents suppressing an unsaved user message.
     public static func syntheticError(
         _ message: String,
         userRowPersisted: Bool = true,
@@ -164,8 +151,7 @@ extension TranscriptAttachmentPreview {
 }
 
 extension TranscriptReadout {
-    /// Attachment files are refreshed outside the transcript-file cache: their
-    /// contents may change without changing the message's path or JSONL row.
+    /// Refresh attachments separately: their bytes may change without changing the transcript row or path.
     func attachmentPreviews() async -> Self {
         await Task.detached(priority: .userInitiated) {
             let rows = self.messages.map { original in
@@ -247,7 +233,8 @@ public enum ChatExport {
 
             let timestamp = fileTimestamp(exportedAt)
             let safeSessionId = safeFilesystemSessionId(sessionId)
-            let fileURL = downloadsDir.appendingPathComponent("\(InstallPaths.current.name("NativeAgent"))-chat-\(safeSessionId)-\(timestamp)-\(UUID().uuidString).md")
+            let fileURL = downloadsDir.appendingPathComponent(
+                "\(InstallPaths.current.name("NativeAgent"))-chat-\(safeSessionId)-\(timestamp)-\(UUID().uuidString).md")
             let assets = fileURL.deletingPathExtension().appendingPathExtension("assets")
             var imagePaths: [String: String] = [:]
             var unavailableImages: [String: String] = [:]
@@ -311,9 +298,7 @@ public enum ChatExport {
         return markdown
     }
 
-    /// Render one chat message as Markdown: role header, content, and compact
-    /// attachment references. Each block ends blank so consecutive messages
-    /// stay separated in exports and clipboard copies.
+    /// End each Markdown block blank so exported and copied messages remain separated.
     public static func messageMarkdown(
         _ message: ChatMessage, imagePaths: [String: String] = [:], unavailableImages: [String: String] = [:]
     ) -> String {

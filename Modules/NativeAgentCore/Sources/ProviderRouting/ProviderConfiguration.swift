@@ -7,8 +7,7 @@ import os
 // Blueprint: | `ProviderConfiguration.swift` | Byte-checked provider configuration decode under the writer's lock with fresh credential/readiness facts |
 
 extension SwiftNativeProviderRouting {
-    /// One `providers/<id>.json`, byte-checked under the SAME per-file lock `configureProvider` writes under. Its validated decode can be reused; resolved credentials are fresh. `object` nil with no `unreadable` reason means the file
-    /// simply is not there.
+    /// Read config bytes under the writer's lock. Reuse only validated decodes; credentials remain fresh and absent differs from unreadable.
     struct ProviderConfigRead {
         var object: [String: Any]?
         var unreadable: String?
@@ -17,7 +16,7 @@ extension SwiftNativeProviderRouting {
     struct ProviderConfigCache {
         var reads: [String: ProviderConfigRead] = [:]
         var readiness: [String: (ready: Bool, state: String, detail: String)] = [:]
-        /// The snapshot's one read of the provider checks.
+        /// All readiness branches share the snapshot's one checks read.
         var receipts: LLMProviderStatusFeed.Receipts?
     }
     nonisolated func readProviderConfig(_ providerId: String) -> ProviderConfigRead {
@@ -53,7 +52,8 @@ extension SwiftNativeProviderRouting {
                 }
                 // Resolve the Keychain reference under the config writer's lock so readiness and model settings share one credential generation.
                 guard object["api_key"] == nil else {
-                    throw ProviderRoutingError.configurationFailed("Provider \(trimmedId) has plaintext API-key bytes. Save its key in Providers to repair its storage.")
+                    throw ProviderRoutingError.configurationFailed(
+                        "Provider \(trimmedId) has plaintext API-key bytes. Save its key in Providers to repair its storage.")
                 }
                 if object[ProviderAPIKeyStore.referenceField] != nil {
                     let key = try LLMCredentialResolver.checkedAPIKey(providerConfigObject: object)
@@ -68,8 +68,7 @@ extension SwiftNativeProviderRouting {
             )
         }
     }
-    /// Fill the per-snapshot cache. Durable decodes reuse exact checked bytes; credentials, token expiry, PATH and receipt age are projected afresh. The set is the readiness probes plus every provider a surface names, so neither lane has
-    /// to read a file the other already read.
+    /// Pre-read every probe/surface config once; reuse checked bytes while credentials, expiry, PATH and receipt age stay fresh.
     nonisolated func providerConfigCache(
         for providerIds: Set<String>,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment

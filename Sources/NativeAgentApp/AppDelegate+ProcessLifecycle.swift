@@ -5,7 +5,7 @@ import AppKit
 import ServiceManagement
 import PersistenceCore
 import os
-// Blueprint: | `AppDelegate+ProcessLifecycle.swift` | `AppDelegate`: checked single-instance activation with a bounded wait and process re-read; launch failure alerts and installed-app login registration |
+// Blueprint: | `AppDelegate+ProcessLifecycle.swift` | `AppDelegate`: Single-instance checks, launch alerts and login registration |
 
 extension AppDelegate {
     @MainActor
@@ -31,8 +31,7 @@ extension AppDelegate {
             ModuleLog.app("[launch] existing instance accepted activation (pid=\(existingPID)); exiting duplicate")
             return false
         }
-        // A vanished process no longer owns the instance. Re-read the actual
-        // running apps, including a replacement that started during the wait.
+        // Re-read running apps after the wait because a replacement may have started while the original process vanished.
         let remaining = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
             .filter { $0.processIdentifier != currentPID && !$0.isTerminated }
         guard !remaining.isEmpty else {
@@ -54,7 +53,10 @@ extension AppDelegate {
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent cannot activate the existing app instance."
-        alert.informativeText = "\(detail) Running NativeAgent process IDs: \(pids.map { String($0) }.joined(separator: ", ")). This duplicate will exit. Open the existing NativeAgent window from the Dock or inspect those processes in Activity Monitor."
+        alert.informativeText = """
+            \(detail) Running NativeAgent process IDs: \(pids.map { String($0) }.joined(separator: ", ")). This duplicate will exit. Open the existing \
+            NativeAgent window from the Dock or inspect those processes in Activity Monitor.
+            """
         alert.alertStyle = .critical
         alert.runModal()
     }
@@ -77,15 +79,16 @@ extension AppDelegate {
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent could not safely finish the backup restore."
-        alert.informativeText = "NativeAgent stopped before opening live state. If recovery is incomplete, the preserved safety rollback will resume on the next launch. The details are in the log."
+        alert.informativeText = """
+            NativeAgent stopped before opening live state. If recovery is incomplete, the preserved safety rollback will resume on the next launch. The \
+            details are in the log.
+            """
         alert.alertStyle = .critical
         alert.runModal()
         NSApp.terminate(nil)
     }
 
-    /// Missing data/ or SOUL.md at launch. Continuing starts on the root the
-    /// alert names, so the person chooses that rather than finding an empty
-    /// agent. Returns true to continue.
+    /// Require a choice before continuing on the named root so missing data or SOUL.md cannot silently start an empty agent.
     @MainActor
     static func confirmLaunchWithMissingRoots(_ missing: [String]) -> Bool {
         ModuleLog.app("[paths] launch roots missing: %@", missing.joined(separator: " | "))
@@ -112,8 +115,7 @@ extension AppDelegate {
         }
     }
 
-    /// Register the app to launch at login. Uses SMAppService (modern,
-    /// sandboxable, replaces the old SMLoginItemSetEnabled API).
+    /// Use SMAppService for sandbox-compatible login registration.
     @MainActor
     static func registerLoginItemIfNeeded() async {
         let bundlePath = Bundle.main.bundlePath

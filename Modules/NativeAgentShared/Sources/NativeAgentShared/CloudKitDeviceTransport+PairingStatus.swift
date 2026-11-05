@@ -3,7 +3,7 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport+PairingStatus.swift` | Server-checked absent-slot pairing claims, deliberate pairing replacement, presence and serialized pairing-scoped status publication, acknowledgement and typed drain completion |
+// Blueprint: | `CloudKitDeviceTransport+PairingStatus.swift` | Account-slot claims, pairing, presence and serialized status delivery |
 
 extension CloudKitDeviceTransport {
     // MARK: pairing
@@ -11,7 +11,10 @@ extension CloudKitDeviceTransport {
     private static func pairingSecret(in record: CKRecord) throws -> Data {
         guard let hex = record["secretHex"] as? String,
               let secret = data(fromHex: hex), secret.count == 32 else {
-            throw DeviceSyncError.underlying(message: "The existing CloudKit pairing record has an unreadable key. Repair that pairing record before claiming this account; it has not been replaced.")
+            throw DeviceSyncError.underlying(message: """
+                The existing CloudKit pairing record has an unreadable key. Repair that pairing record before claiming this account; \
+                it has not been replaced.
+                """)
         }
         return secret
     }
@@ -46,13 +49,8 @@ extension CloudKitDeviceTransport {
         try await self.performModifyRecords(op)
     }
 
-    /// Every Mac on one Apple Account shares the account's Mac pairing record,
-    /// and the phone follows whichever key it holds. A Mac takes the record
-    /// only when it is free or already its own; another Mac's key stays until
-    /// the person moves the phone, which is `publishPairing`. While another Mac
-    /// holds it this transport neither reads the phone's records nor writes
-    /// any: the phone is that Mac's. Returns whether this Mac holds the
-    /// pairing, or nil when the record could not be read (nothing changes).
+    /// The account has one Mac pairing slot: claim only an absent or self-owned record. Another Mac keeps the phone until the person moves it with
+    /// `publishPairing`; an unreadable claim changes nothing.
     @discardableResult
     public func claimPairing(secret: Data) async -> Bool? {
         guard role == .mac, secret.count == 32 else { return nil }
@@ -74,8 +72,7 @@ extension CloudKitDeviceTransport {
         case .empty?:
             let owner: Data? = await withDeviceCKTimeout("CloudKitDeviceTransport.createPairingClaim", onFailure: accountFailureReporter) {
                 do {
-                    // A new record has no server change tag: this policy creates
-                    // only an absent slot, never replaces a concurrent winner.
+                    // A new record has no server change tag: this policy creates only an absent slot, never replaces a concurrent winner.
                     try await self.savePairing(secret: secret, policy: .ifServerRecordUnchanged)
                     nativeLog("[ck-device] pairing_claim created")
                     return secret
@@ -92,14 +89,12 @@ extension CloudKitDeviceTransport {
         }
     }
 
-    /// True while another Mac on this Apple Account holds the pairing.
     public var pairingHeldElsewhere: Bool {
         lock.lock(); defer { lock.unlock() }
         return pairingClaim == .elsewhere
     }
 
-    /// Whether this transport may read and write the phone's records: always
-    /// on the phone; on a Mac, only once it has read that it holds the pairing.
+    /// Whether this transport may read and write the phone's records: always on the phone; on a Mac, only once it has read that it holds the pairing.
     public var holdsPairing: Bool {
         lock.lock(); defer { lock.unlock() }
         return role != .mac || pairingClaim == .held
@@ -116,8 +111,7 @@ extension CloudKitDeviceTransport {
         return pairingPublications
     }
 
-    /// A publication that landed while the claim was reading is newer than
-    /// what the read saw, and already decided the answer.
+    /// A publication that landed while the claim was reading is newer than what the read saw, and already decided the answer.
     private func settleClaim(elsewhere: Bool, since publications: UInt64) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if pairingPublications == publications { pairingClaim = elsewhere ? .elsewhere : .held }
@@ -132,7 +126,7 @@ extension CloudKitDeviceTransport {
 
     public func observePairing(onChange: @escaping @Sendable (Data) async -> Bool) async {
         setPairingHandler(onChange)  // last registration wins (single forwarder)
-        // Register silent pushes, then drain any pairing material already published.
+        // Register pushes before draining so pairing changes cannot fall between the two.
         do {
             try await subscribeToPairingChanges()
         } catch {
@@ -141,28 +135,25 @@ extension CloudKitDeviceTransport {
         await drainPairing()
     }
 
-    // Read the peer pairing secret without changing the pairing publication claim.
-    public func peekPairingSecret() async -> Data? {
+    // Reading the peer secret must not change this Mac's publication claim.
+    public func peekPairingSecret(recovery: DeviceSyncRecovery = .init()) async -> Data? {
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
         let recordName = "pairing.\(peerRole.rawValue)"
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.peekPairingSecret", onFailure: accountFailureReporter) {
+        return await withDeviceCKTimeout("CloudKitDeviceTransport.peekPairingSecret", recovery: recovery, onFailure: accountFailureReporter) {
             let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
             return try Self.pairingSecret(in: record)
         }
     }
 
-    /// Pull the PEER's pairing singleton and offer it to the registered handler
-    /// on every drain. The record is the truth: the handler compares it with
-    /// the key it holds, so a key replaced by anything else is put back on the
-    /// next drain, not only when the record's date advances. Returns true when
-    /// the handler installed a different key.
+    /// Compare the peer record on every drain, regardless of its date, so a replaced local key is repaired. Return whether the handler installed a
+    /// different key.
     @discardableResult
-    public func drainPairing() async -> Bool {
-        guard NADeviceSyncRecoveryBudget.hasTime else { return false }
+    public func drainPairing(recovery: DeviceSyncRecovery = .init()) async -> Bool {
+        guard recovery.hasTime else { return false }
         guard let handler = loadPairingHandler(),
-              let secret = await peekPairingSecret(),
+              let secret = await peekPairingSecret(recovery: recovery),
               await handler(secret) else { return false }
-        NADeviceSyncRecoveryBudget.didApplyData?()
+        recovery.didApplyData?()
         return true
     }
 
@@ -181,8 +172,7 @@ extension CloudKitDeviceTransport {
         let recordType = NADeviceSyncRecordType.status
         let recordName = Self.statusRecordName(role: role, key: key, pairingSecret: pairingSecret)
         let updatedAt = NativeTimestampFormat.fractionalZulu(Date())
-        // The lane belongs to the actual CloudKit completion, not the caller's
-        // bounded wait. A timed-out write must settle before a successor starts.
+        // Serialization lasts until CloudKit completes, even when the caller's bounded wait has ended.
         do {
             try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 15, onFailure: accountFailureReporter) {
                 try await self.enqueueStatusWrite(key: key) {
@@ -194,8 +184,7 @@ extension CloudKitDeviceTransport {
                     ck["updatedAt"] = updatedAt as CKRecordValue
                     let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
                     op.savePolicy = .changedKeys
-                    // Utility permits discretionary deferral when the Mac app is
-                    // backgrounded; phone status has a bounded publication deadline.
+                    // Utility permits discretionary deferral when the Mac app is backgrounded; phone status has a bounded publication deadline.
                     op.qualityOfService = .userInitiated
                     try await self.performModifyRecords(op)
                 }
@@ -207,12 +196,8 @@ extension CloudKitDeviceTransport {
 
     // MARK: presence
 
-    /// One fixed record per pairing, updated in place. It rides the NANotification type
-    /// without a `direction`: the visible subscription requires mac2ios, so
-    /// neither creation nor an update alerts the phone. The incoming pull
-    /// also requires a direction and never returns it, and it is modified
-    /// every beat, so the retention sweep never reaches it. A type of its own
-    /// would need a production schema deploy.
+    /// Reuse the deployed notification schema without alerts: presence has no direction, so subscriptions and incoming pulls exclude it. Each beat
+    /// keeps it younger than the retention cutoff.
     private static func presenceRecordName(pairingSecret: Data) -> String {
         let identity = HMAC<SHA256>.authenticationCode(for: Data("NativeAgent.presence.identity.v1".utf8),
                                                      using: SymmetricKey(data: pairingSecret))
@@ -238,7 +223,7 @@ extension CloudKitDeviceTransport {
                     ck["payloadJSON"] = Data(signature).base64EncodedString() as CKRecordValue
                     let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
                     op.savePolicy = .changedKeys
-                    // Presence is liveness, never deferrable: utility infers discretionary, which the system holds back after a network flap.
+                    // Liveness cannot be discretionary: utility priority permits network recovery deferral.
                     op.qualityOfService = .userInitiated
                     try await self.performModifyRecords(op)
                 }
@@ -270,8 +255,7 @@ extension CloudKitDeviceTransport {
         try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, Error>) in
             lock.lock()
             defer { lock.unlock() }
-            // Keep one operation and the latest replacement. Each caller owns
-            // its result, including a value displaced before it reached the wire.
+            // Keep one operation and the latest replacement. Each caller owns its result, including a value displaced before it reached the wire.
             pendingStatusWrites.removeValue(forKey: key)?.completion.resume(
                 throwing: DeviceSyncError.transient(message: "CloudKit status write was superseded before sending."))
             pendingStatusWrites[key] = (work, completion)
@@ -296,44 +280,40 @@ extension CloudKitDeviceTransport {
     public func observeStatus(
         key: String,
         pairingSecret: @escaping @Sendable () async -> Data?,
-        onApply: @escaping @Sendable (String, Date?, Data) async -> Bool
+        onApply: @escaping @Sendable (String, Date?, Data, DeviceSyncRecovery) async -> Bool
     ) {
         setStatusHandler(key: key, DeviceStatusObserver(pairingSecret: pairingSecret, apply: onApply))
     }
 
-    /// Pull the PEER's current-pairing status. Dispatch each
-    /// to its handler iff newer than the last dispatched value (LWW by server
-    /// modificationDate, per key). Returns the number of new values accepted.
+    /// Server modification dates determine per-key freshness; dispatch only values newer than the last accepted value.
     @discardableResult
-    public func drainStatus() async -> Int {
-        (await drainStatusResult()).dispatchedCount
+    public func drainStatus(recovery: DeviceSyncRecovery = .init()) async -> Int {
+        (await drainStatusResult(recovery: recovery)).dispatchedCount
     }
 
-    /// Success means every observed key was read and accepted (or already
-    /// current). Missing data, failed handlers and skipped drains are not success.
-    public func drainStatusResult() async -> DeviceSyncDrainResult {
-        guard NADeviceSyncRecoveryBudget.hasTime, holdsPairing else { return .skipped(0) }
+    /// Success means every observed key was read and accepted (or already current). Missing data, failed handlers and skipped drains are not success.
+    public func drainStatusResult(recovery: DeviceSyncRecovery = .init()) async -> DeviceSyncDrainResult {
+        guard recovery.hasTime, holdsPairing else { return .skipped(0) }
         // Serialize status drains so an older handler cannot overwrite a newer value.
         guard beginStatusDrainOrCoalesce() else { return .skipped(0) }
         var total = 0
         var failure: DeviceSyncError?
         var skipped = false
         while true {
-            let result = await drainStatusBody()
+            let result = await drainStatusBody(recovery: recovery)
             total += result.dispatchedCount
             switch result {
             case .success: break
             case .failure(let error, _): failure = failure ?? error
             case .skipped: skipped = true
             }
-            if endStatusDrainOrContinue() { continue }
+            if endStatusDrainOrContinue(recovery: recovery) { continue }
             break
         }
         if let failure { return .failure(failure, dispatched: total) }
         return skipped ? .skipped(total) : .success(total)
     }
 
-    /// Acquire the single status-drain slot. Mirrors `beginDrainOrCoalesce`.
     private func beginStatusDrainOrCoalesce() -> Bool {
         lock.lock(); defer { lock.unlock() }
         if statusDrainInFlight { statusDrainAgain = true; return false }
@@ -341,24 +321,23 @@ extension CloudKitDeviceTransport {
         return true
     }
 
-    /// End a status-drain iteration. Mirrors `endDrainOrContinue`.
-    private func endStatusDrainOrContinue() -> Bool {
+    private func endStatusDrainOrContinue(recovery: DeviceSyncRecovery) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if statusDrainAgain && NADeviceSyncRecoveryBudget.hasTime { statusDrainAgain = false; return true }
+        if statusDrainAgain && recovery.hasTime { statusDrainAgain = false; return true }
         statusDrainAgain = false
         statusDrainInFlight = false
         return false
     }
 
-    /// The status-drain body — always run serialized by `drainStatus`.
-    private func drainStatusBody() async -> DeviceSyncDrainResult {
+    /// Only the serialized status drain may run this body.
+    private func drainStatusBody(recovery: DeviceSyncRecovery) async -> DeviceSyncDrainResult {
         let handlers = loadStatusHandlers()
         guard !handlers.isEmpty else { return .skipped(0) }
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
         var dispatched = 0
         var failure: DeviceSyncError?
         for (key, handler) in handlers {
-            guard NADeviceSyncRecoveryBudget.hasTime else { return .skipped(dispatched) }
+            guard recovery.hasTime else { return .skipped(dispatched) }
             guard let secret = await handler.pairingSecret(), secret.count == 32 else {
                 failure = failure ?? .notConfigured
                 continue
@@ -366,7 +345,8 @@ extension CloudKitDeviceTransport {
             let recordName = Self.statusRecordName(role: peerRole, key: key, pairingSecret: secret)
             let hit: PeerStatusHit
             do {
-                hit = try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.drainStatus", seconds: 3, onFailure: accountFailureReporter) {
+                hit = try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.drainStatus", seconds: 15, recovery: recovery,
+                    onFailure: accountFailureReporter) {
                     let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
                     guard record["key"] as? String == key,
                           record["role"] as? String == peerRole.rawValue,
@@ -386,16 +366,16 @@ extension CloudKitDeviceTransport {
                 continue
             }
             guard statusIsNewer(key: acknowledgement, hit.modDate) else { continue }
-            guard await handler.apply(hit.value, hit.modDate, secret),
+            guard await handler.apply(hit.value, hit.modDate, secret, recovery),
                   await handler.pairingSecret() == secret else {
                 failure = failure ?? .transient(message: "CloudKit status \(key) could not be applied.")
                 continue
             }
             commitStatusDate(key: acknowledgement, hit.modDate)
             dispatched += 1
-            NADeviceSyncRecoveryBudget.didApplyData?()
+            recovery.didApplyData?()
         }
-        guard NADeviceSyncRecoveryBudget.hasTime else { return .skipped(dispatched) }
+        guard recovery.hasTime else { return .skipped(dispatched) }
         if let failure { return .failure(failure, dispatched: dispatched) }
         return .success(dispatched)
     }

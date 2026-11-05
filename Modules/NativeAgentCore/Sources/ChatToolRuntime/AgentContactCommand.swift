@@ -1,4 +1,5 @@
 import AgentWorkspace
+import ChatToolParsing
 import AuthoredCapabilities
 #if canImport(AppKit)
 import AppKit
@@ -20,17 +21,16 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import TurnTrace
-// Blueprint: | `AgentContactCommand.swift` | Contact command execution through admitted transport; declared reply files are checked without stdout substitution, failed reads retain process/effect evidence, and current contact projection failure stays explicit at settlement |
+// Blueprint: | `AgentContactCommand.swift` | Keep launch, reply and delivery evidence distinct. |
 extension SwiftToolDispatcher {
-    func hostCommandRun(
+    func hostCommandRun(turn: Turn, invocation: ChatToolInvocation,
         row: AgentHostRow, contact: AgentPeerContact, message: String, session: String?,
         resuming: Bool = false, store: AgentPeerStore, surface: String, probe: Bool = false
     ) async throws -> JSONValue {
         guard let line = row.commandLine else { throw AgentCommunicationError.invalid("\(row.displayName) has no command line to run") }
         if let failure = row.installation.failure { throw failure }
-        // The recipe this send runs on, kept for its proof.
         let recipe = AgentRecipeStore.recipe(row.id)
-        if AgentRecipeStore.dryRun {
+        if invocation.dryRun {
             var result: [String: JSONValue] = ["status": .string("failed"), "dry_run": .bool(true),
                 "agent": .string("peer:" + contact.id), "transport": .string("mcpHost"), "host": .string(row.id),
                 "sent": .bool(false), "ran": .bool(false), "completed": .bool(false),
@@ -38,7 +38,9 @@ extension SwiftToolDispatcher {
                 "arguments": .array((resuming ? line.continuation : line.arguments).map(JSONValue.string)),
                 "checked": .array([.string("commandLine.executable"), .string("commandLine.arguments")])]
             guard let executable = row.resolveExecutable(line.executable) else {
-                result["detail"] = .string("\(row.displayName)'s readiness check failed: \(line.executable) could not be resolved to a runnable file; no prompt was sent.")
+                result["detail"] = .string("""
+                    \(row.displayName)'s readiness check failed: \(line.executable) could not be resolved to a runnable file; no prompt was sent.
+                    """)
                 return .object(result)
             }
             result["executable"] = .string(executable)
@@ -61,12 +63,13 @@ extension SwiftToolDispatcher {
             }
             return .object(result)
         }
-        let access = try await fullMacToolAccess(surface: surface)
+        let access = try await fullMacToolAccess(turn: turn, surface: surface)
         guard access.fileOpsAllowed else {
-            let refusal = builderFullMacRequired(tool: "agent_message")
+            let refusal = builderFullMacRequired(invocation: invocation, tool: "agent_message")
+            let reply = ToolResult(refusal)
             var value: [String: JSONValue] = [:]
             if case .object(let fields) = refusal { value = fields }
-            if value["status"] == .string("failed") {
+            if reply.said("failed"), reply.status == value["status"]?.stringValue {
                 value["status"] = .string("blocked_by_trust")
             }
             let mode = access.permissionLevel == "balanced" ? "Work mode" : "the current trust mode"
@@ -75,8 +78,14 @@ extension SwiftToolDispatcher {
             value["ran"] = .bool(false)
             value["completed"] = .bool(false)
             value["detail"] = .string(probe
-                ? "The entry is written, but I couldn't check the link in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer and say connect again, or use the connection from the other agent's side."
-                : "I didn't send the message in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer and ask me to send it again, or use the connection from the other agent's side.")
+                ? """
+                    The entry is written, but I couldn't check the link in \(mode) because running that agent here needs Builder or Full Mac; \
+                    switch in Trust or the composer and say connect again, or use the connection from the other agent's side.
+                    """
+                : """
+                    I didn't send the message in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer \
+                    and ask me to send it again, or use the connection from the other agent's side.
+                    """)
             if probe {
                 value["connection_check"] = .bool(true)
                 value["connection_reply_received"] = .bool(false)
@@ -93,7 +102,7 @@ extension SwiftToolDispatcher {
         }
         // Every command route reconciles its binding, including those without permission flags.
         let launch: DrivenAgentLaunch.Program
-        switch await Self.drivenAgentLaunch(surface: surface, contact: contact,
+        switch await Self.drivenAgentLaunch(turn: turn, surface: surface, contact: contact,
                                            name: row.displayName, dataRoot: dataRoot) {
         case .refused(let refusal): return refusal
         case .admitted(let program): launch = program
@@ -101,14 +110,15 @@ extension SwiftToolDispatcher {
         let executable = launch.executable
         let environment = try row.installation.launchEnvironment()
         if line.minimumVersion != nil {
-            // The approved program's receipt keeps the version it reported, read
-            // once when it was approved; the launch re-verifies those exact bytes.
+            // The approved program's receipt keeps the version it reported, read once when it was approved; the launch re-verifies those exact bytes.
             var reported = try Self.checkedPeerSnapshot(contact.id, store: store).contact.acpExecutable.flatMap { $0.path == executable ? $0.version : nil }
             if reported == nil {
                 reported = try await AgentACPExecutable.capture(path: executable).reported(environment: row.installation.launchEnvironment())
                 if let reported {
                     guard try store.approveExecutable(peerID: contact.id, path: executable, version: reported) else {
-                        return honest("unavailable", "The contact changed before its program's version could be recorded. Read agent.contacts before continuing; nothing ran.")
+                        return honest("unavailable", """
+                            The contact changed before its program's version could be recorded. Read agent.contacts before continuing; nothing ran.
+                            """)
                     }
                 }
             }
@@ -116,17 +126,15 @@ extension SwiftToolDispatcher {
         }
         let launchArguments = launch.arguments
         let conversationLabel: String
-        if let id = AgentConversationLiveContext.target?.recordID {
+        if let id = invocation.liveTarget?.recordID {
             guard let record = try AgentConversationStore(dataRoot: dataRoot).records().first(where: { $0.id == id }) else {
                 throw ToolFailureError("No saved record matches the active conversation identity. Read the contact's conversation before sending; nothing ran.",
-                    effects: .none, owner: "Agent conversations", instruction: "Open this contact's saved conversation and continue from its current identity.", recovery: .inspect)
+                    effects: .none, owner: "Agent conversations",
+                        instruction: "Open this contact's saved conversation and continue from its current identity.", recovery: .inspect)
             }
             conversationLabel = record.label
         } else { conversationLabel = "Main" }
-        // ONE directory per agent, inside the workspace the command runner
-        // already confines writes to. It was a fresh one per message until the
-        // Codex drive: Codex records every directory it runs in as a trusted
-        // project in its own settings, so each message left a line behind there.
+        // Reuse one workspace directory per agent because some CLIs persist every working directory as a trusted project.
         let workingDirectory = contact.hostWorkspace.map { URL(fileURLWithPath: $0) }
             ?? Self.builderWorkspaceRoot(dataRoot: dataRoot).appendingPathComponent("agent-bridge-runs/" + row.id)
         do {
@@ -150,15 +158,13 @@ extension SwiftToolDispatcher {
         let outgoing = probeNonce.map { AgentHostDirectory.probeText(appName: Self.appDisplayName, nonce: $0) } ?? message
         let argv = launchArguments + line.argv(message: outgoing, session: session, resuming: resuming,
                                                replyFilePath: replyFile) {
-            // Named on its side the way she knows it, so the person recognizes it there.
-            let her = PersonaCompiler.agentDisplayName(dataRoot: dataRoot)
-            return (["NativeAgent"] + (her == "NativeAgent" ? [] : [her]) + [conversationLabel]).joined(separator: " · ")
+            let agentName = PersonaCompiler.agentDisplayName(dataRoot: dataRoot)
+            return (["NativeAgent"] + (agentName == "NativeAgent" ? [] : [agentName]) + [conversationLabel]).joined(separator: " · ")
         }
-        // Retain bounded protocol output before the runner clips stdout for
-        // display; streaming events also reach the live view as they arrive.
+        // Retain bounded protocol output before the runner clips stdout for display; streaming events also reach the live view as they arrive.
         let (lines, linesIn) = AsyncStream<String>.makeStream()
-        let streamed: Task<String, Never>? = line.stream != nil || line.jsonResultReply ? Task { [line] in
-            let live = AgentConversationLiveContext.target
+        let streamed: Task<String, Never>? = line.stream != nil || line.jsonResultReply ? Task { [line, invocation] in
+            let live = invocation.liveTarget
             let hub = AgentConversationLiveHub.shared
             var whole = "", active = false, overflow = false
             var retainedBytes = 0
@@ -180,24 +186,21 @@ extension SwiftToolDispatcher {
             }
             return whole
         } : nil
-        // The runner closes stdin. Pass the approved executable and argv directly.
-        // The stdout handler's parameter and @Sendable-ness come from this
-        // annotation, not inference through the nil ternary branch; the yield
-        // result is intentionally discarded.
+        // Closed stdin prevents interactive waits. Explicit @Sendable annotation types the stdout closure across the nil branch; its yield result is discarded.
         let onStdoutLine: (@Sendable (String) -> Void)? = streamed == nil ? nil : { @Sendable in _ = linesIn.yield($0) }
         let outcome = await Self.runShellLikeProcess(
+            turn: turn,
             toolName: "agent_message", executable: executable,
             args: argv,
             cwd: workingDirectory.path, timeoutSeconds: line.timeoutSeconds,
             sourcePayloadForAudit: probe ? AgentHostDirectory.probeToken : nil, dataRoot: dataRoot,
-            // This app's own environment holds provider keys and the bridge
-            // token; another agent's command gets a scrubbed one instead. And
-            // nothing it backgrounds may outlive the run or its directory.
+            // Scrub peer environments to protect provider keys and bridge credentials; background work must not outlive its run or directory.
             environmentOverride: environment,
             closeStandardInput: true,
             reapDescendantsOnExit: true,
             onStdoutLine: onStdoutLine)
         return await settle {
+            let commandReply = ToolResult(outcome)
             defer {
                 try? FileManager.default.removeItem(at: replyDirectory)
                 if let probeNonce {
@@ -220,7 +223,10 @@ extension SwiftToolDispatcher {
                 truncated = response.utf8.count > 64 * 1024
                 reply = String(decoding: response.utf8.prefix(64 * 1024), as: UTF8.self)
                 if stdout == nil {
-                    replyFailure = ToolFailureError("\(row.displayName)'s declared JSON reply output was not captured. Its process result is retained; do not resend automatically.",
+                    replyFailure = ToolFailureError("""
+                        \(row.displayName)'s declared JSON reply output was not captured. Its process result is retained; do not resend \
+                        automatically.
+                        """,
                         effects: envelope["ran"] == .bool(true) ? .unknown : .none, owner: row.displayName + " command line",
                         code: "agent_reply_output_unavailable",
                         instruction: "Repair the command's output capture and reconcile this run before another send.", recovery: .reconcile)
@@ -229,15 +235,12 @@ extension SwiftToolDispatcher {
                 do {
                 let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: replyFile))
                 defer { try? handle.close() }
-                // Bounded at the READ, not after it: a reply file is written by
-                // another program and its size is that program's choice. Read
-                // one scalar beyond the cap so clipping cannot split valid UTF-8.
+                // Bound peer-controlled reply files while reading, retaining one extra scalar so clipping cannot split UTF-8.
                 let data = try handle.read(upToCount: 64 * 1024 + 4) ?? Data()
                 truncated = data.count > 64 * 1024
                 var decoded: String?
                 if truncated {
-                    // Every candidate contains all bytes inside the retained
-                    // bound. Invalid body bytes cannot disappear by clipping.
+                    // Every candidate contains all bytes inside the retained bound. Invalid body bytes cannot disappear by clipping.
                     for end in (64 * 1024)...min(data.count, 64 * 1024 + 3) where decoded == nil {
                         decoded = String(data: data.prefix(end), encoding: .utf8)
                     }
@@ -248,7 +251,10 @@ extension SwiftToolDispatcher {
                 while decoded.utf8.count > 64 * 1024 { decoded.removeLast() }
                 reply = decoded
                 } catch {
-                    replyFailure = ToolFailureError("\(row.displayName)'s declared reply file could not be read: \(error.localizedDescription). Its process result is retained; do not resend automatically.",
+                    replyFailure = ToolFailureError("""
+                        \(row.displayName)'s declared reply file could not be read: \(error.localizedDescription). Its process result is retained; \
+                        do not resend automatically.
+                        """,
                         effects: envelope["ran"] == .bool(true) ? .unknown : .none, owner: replyFile,
                         code: "agent_reply_file_unavailable",
                         instruction: "Repair the command recipe's reply-file output and reconcile this run before another send.", recovery: .reconcile)
@@ -259,20 +265,15 @@ extension SwiftToolDispatcher {
             }
             reply = reply.trimmingCharacters(in: .whitespacesAndNewlines)
             let ran = envelope["ran"] == .bool(true)
-            let commandSucceeded = envelope["status"] == .string("completed")
-            // THE ROUND TRIP, recorded where it happened: a message left and a
-            // reply came back. Nothing short of that promotes the contact — and
-            // the CONNECT PROBE is deliberately not counted as a reply arriving.
-            // What the probe asks to be proven is the ENTRY, so only the inbound
-            // request carrying this connection's key may promote it; the probe's
-            // own stdout is the command line talking, which proves nothing about
-            // the entry that was just written.
+            let commandSucceeded = commandReply.said("completed") && commandReply.status == envelope["status"]?.stringValue
+            let stopped = commandReply.said("stopped") && commandReply.status == envelope["status"]?.stringValue
+            // Only an actual reply proves a command route. A connection probe proves the inbound entry only through a request carrying its key, never stdout.
             let replied = commandSucceeded && parsed.failure == nil && replyFailure == nil && !reply.isEmpty
-            // A run she stopped says nothing about whether the contact works.
+            // A run the agent stopped says nothing about whether the contact works.
             let arrived: Bool?
             var evidenceFailure: String?
             do {
-                arrived = envelope["status"] == .string("stopped") ? false : try Self.recordHostConnectionOutcome(store: store, contact: contact, ran: ran,
+                arrived = stopped ? false : try Self.recordHostConnectionOutcome(store: store, contact: contact, ran: ran,
                     replied: replied, probe: probe, probeNonce: probeNonce,
                     executable: executable, workspace: workingDirectory.path, recipe: recipe)
             } catch {
@@ -299,12 +300,14 @@ extension SwiftToolDispatcher {
                     result["continuation_available"] = .bool(true)
                 } else {
                     result["continuation_available"] = .bool(false)
-                    result["continuation_detail"] = .string("The command did not confirm the expected conversation identity. Its reply is retained, but continuity is unverified. Do not resend automatically or silently start a replacement conversation.")
+                    result["continuation_detail"] = .string("""
+                        The command did not confirm the expected conversation identity. Its reply is retained, but continuity is unverified. Do not \
+                        resend automatically or silently start a replacement conversation.
+                        """)
                 }
             } else if let session { result["conversation_id"] = .string(session) }
             if probe {
-                // Omit connection-probe reply content and its taint so a successful check
-                // preserves the person's authority for subsequent requests in the same turn.
+                // Omit probe reply content and taint so connection checks preserve the person's authority for later requests in this turn.
                 result["reply"] = nil
                 result["reply_truncated"] = nil
                 result["untrusted_remote_data"] = nil
@@ -314,10 +317,13 @@ extension SwiftToolDispatcher {
                     result["detail"] = .string("No new answer arrived through the connection. The other app may need to restart before it can reply here.")
                 }
             }
-            if envelope["status"] == .string("stopped") {
-                // agent_cancel: interrupted at her request, not a failure of the contact.
+            if stopped {
+                // A requested interruption is not evidence that the contact failed.
                 result["status"] = .string("stopped")
-                result["detail"] = .string("Stopped at your request: \(row.displayName)'s run was interrupted. Anything it said before stopping is kept above; nothing was resent.")
+                result["detail"] = .string("""
+                    Stopped at your request: \(row.displayName)'s run was interrupted. Anything it said before stopping is kept above; nothing was \
+                    resent.
+                    """)
             } else if let replyFailure {
                 if case .object(let fields) = ChatToolOutcome.failure(error: replyFailure) {
                     result.merge(fields) { _, failure in failure }
@@ -333,7 +339,10 @@ extension SwiftToolDispatcher {
                         + (failure.utf8.count > 3 * 1024 ? "\n[diagnostic truncated]" : "")
                     let refusal = ToolFailureError("\(row.displayName)'s command failed: \(diagnostic). Do not resend automatically.",
                         effects: .unknown, owner: "\(row.displayName) command line",
-                        tap: "Terminal → run `\(line.executable)` once; sign in if requested and resolve its reported error before continuing this conversation")
+                        tap: """
+                            Terminal → run `\(line.executable)` once; sign in if requested and resolve its reported error before continuing this \
+                            conversation
+                            """)
                     if case .object(let fields) = ChatToolOutcome.failure(error: refusal) {
                         result.merge(fields) { _, failure in failure }
                     }

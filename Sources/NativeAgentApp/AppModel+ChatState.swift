@@ -5,30 +5,27 @@ import EngineRuntime
 import PersonaEngine
 import ChatTurnRuntime
 import ChatSessionWork
-// Blueprint: | `AppModel+ChatState.swift` | `AppModel`: checked profile reload through PersonaFacade, detached transcript reads, pinning and stale chat-state pruning |
+// Blueprint: | `AppModel+ChatState.swift` | `AppModel`: Checked profile and transcript reads, pinning and pruning |
 
 @MainActor
 extension AppModel {
-    /// Publish the profile from this root after launch or repair; a failed
-    /// read retains the owner's error and presentation marks identity unavailable.
+    /// Failed profile reads retain the owner's cause and mark identity unavailable.
     func reloadPersonality() async {
         let previousName = engine.persona.profile?.name
         do {
             try await engine.persona.loadProfile()
             teachMemoryHygieneName(previousName: previousName)
         } catch {
-            // PersonaFacade retains this checked read's cause for every identity surface.
         }
     }
 
-    /// Drop the cached messages for a deleted session.
     func pruneSessionChatState(_ sessionId: String) {
         engine.transcripts.removeMessages(for: sessionId)
         detachedChatRefreshStatus.removeValue(forKey: sessionId)
         engine.turns.runtime.pruneSessionState(sessionId)
     }
 
-    /// Prune unknown cached sessions, keeping live work and mounted panels.
+    /// Pruning must preserve live work and mounted panels.
     func pruneStaleSessionChatState(knownSessionIds: Set<String>) {
         let cached = engine.transcripts.loadedSessionIDs
             .union(detachedChatRefreshStatus.keys)
@@ -41,8 +38,7 @@ extension AppModel {
     }
 
     // MARK: - Detached chat windows
-    //
-    // Detached windows stream their fixed session without changing the main window's active session.
+    // Detached windows must stream their fixed session without changing the main window's active session.
 
     func loadDetachedSessionMessages(_ sessionId: String) async {
         await engine.loadDetachedSessionMessages(sessionId) { failures in
@@ -53,24 +49,18 @@ extension AppModel {
         }
     }
 
-    /// Add a session to the pinned-chat strip from outside ChatView (the
-    /// detached-window controller). The transcript owner publishes membership.
-    /// Idempotent — a session already pinned is left as-is.
+    /// Publish pin membership through the transcript owner so detached and main windows agree.
     @MainActor
     func pinChatSessionForDetachedWindow(_ sessionId: String) {
         guard !sessionId.isEmpty else { return }
         _ = try? engine.transcripts.pinSession(sessionId)
     }
 
-    /// Visible activity; the runtime sets retain ownership during a settled reply.
+    /// Runtime sets retain ownership while a reply settles.
     var isBusy: Bool { engine.turns.isBusy(activeChatSessionId) }
-    /// Whether the active chat should render its live response treatment.
     var isChatStreaming: Bool { engine.turns.isStreaming(activeChatSessionId) }
 
-    /// The exact runtime projection mounted by the "other sessions running"
-    /// banner. It excludes only the foreground session, preserves canonical
-    /// session-list order, and retains an unknown running id until the user can
-    /// stop it or a lifecycle path clears it.
+    /// Exclude only the foreground session and retain unknown running IDs so work remains stoppable.
     var otherRunningChatSessionIDs: [String] {
         OtherRunningChats.otherRunning(
             streamingSessionIDs: engine.turns.liveStreamingSessionIDs,
@@ -79,7 +69,7 @@ extension AppModel {
         )
     }
 
-    // Fix 2: chat draft and pending attachments keyed by sessionId so they survive tab changes
+    // Key drafts and attachments by session so tab changes preserve unsent work.
 }
 
 @MainActor
@@ -87,10 +77,7 @@ extension AppModel {
 
     // MARK: - Defaults-backed settings, kept live
 
-    /// Installs the single `UserDefaults.didChangeNotification` observer that
-    /// keeps the defaults-backed settings block in sync with disk. Without it
-    /// a write from the Claude bridge or another process left the running app
-    /// stale until relaunch. Idempotent; safe to call from every entry point.
+    /// Observe defaults changes once so bridge and external writes reach the running settings without a relaunch.
     func installDefaultsBackedSettingsObserver() {
         guard defaultsObserver == nil else { return }
         defaultsObserver = NotificationCenter.default.addObserver(
@@ -104,10 +91,7 @@ extension AppModel {
         }
     }
 
-    /// Re-reads exactly the block `AppModel.swift` reads once at construction
-    /// (`AppModel.swift`). Assignments
-    /// are value-guarded, and the whole pass is wrapped in a re-entrancy flag
-    /// so the UserDefaults write-back in each `didSet` cannot loop.
+    /// Guard assignments and suppress re-entry so UserDefaults write-backs in didSet cannot loop.
     func reloadDefaultsBackedSettings() {
         guard !reloadingDefaults else { return }
         reloadingDefaults = true

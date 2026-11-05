@@ -2,10 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `PersonRhythm.swift` | `PersonRhythm`: timestamp/door-only day evidence in one recorded time zone, 24 seven-day forgetting bins with old-zone aggregate retirement, 30-day starts, simultaneous standing claims and durable once-per-day break identities; no wake or care charge authority |
+// Blueprint: | `PersonRhythm.swift` | `PersonRhythm`: zone-bound daily evidence, standing claims and break identities |
 
-/// His day as she has lived it. Values are mutated only by the cognition actor.
-/// Daily contributions avoid counting a busy conversation as many independent days.
+/// Only cognition mutates lived day evidence; daily contributions prevent a busy conversation from counting as independent days.
 public struct PersonRhythm: Codable, Sendable {
     public struct Activity: Codable, Sendable {
         public var at: Date
@@ -55,9 +54,15 @@ public struct PersonRhythm: Codable, Sendable {
             let calendar = Calendar.current
             let minute = calendar.component(.hour, from: at) * 60 + calendar.component(.minute, from: at)
             if claim.kind == .quiet {
-                return "\(person) is up at \(PersonRhythm.time(minute, on: at)); he's usually quiet from \(PersonRhythm.time(claim.from * 60, on: at)) to \(PersonRhythm.time(claim.to * 60, on: at))."
+                return """
+                    \(person) is up at \(PersonRhythm.time(minute, on: at)); \(person) is usually quiet from \(PersonRhythm.time(claim.from * 60, on: at)) to \
+                    \(PersonRhythm.time(claim.to * 60, on: at)).
+                    """
             }
-            return "It's \(PersonRhythm.time(minute, on: at)) and I haven't heard from \(person) today; he's usually up by \(PersonRhythm.time(claim.to, on: at))."
+            return """
+                It's \(PersonRhythm.time(minute, on: at)) and I haven't heard from \(person) today; \(person) is usually up by \
+                \(PersonRhythm.time(claim.to, on: at)).
+                """
         }
     }
     public private(set) var bins = Array(repeating: Bin(), count: 24)
@@ -127,7 +132,7 @@ public struct PersonRhythm: Codable, Sendable {
             cursor = end
         }
     }
-    /// Historical silence is message silence on complete indexed days, not invented Mac uptime.
+    /// Only complete indexed days support message-silence evidence; silence cannot establish Mac uptime.
     public mutating func coldStart(_ rows: [Activity], at: Date) {
         for row in rows { activity(row) }
         let today = Calendar.current.startOfDay(for: at)
@@ -193,15 +198,13 @@ public struct PersonRhythm: Codable, Sendable {
         starts = days.filter { $0.completeStart }.compactMap { day in
             day.activity.filter { calendar.component(.hour, from: $0.at) >= quietEnd }.map(\.at).min()
         }.sorted()
-        // Only coarse candidates are checked: a quiet run and the observed upper
-        // bound of starts. Hour activity is offered after three weeks of days.
+        // Only coarse candidates are checked: a quiet run and the observed upper bound of starts. Hour activity is offered after three weeks of days.
         let activeCandidate = days.count >= 21 ? bins.indices.max(by: {
             bins[$0].active / max(1, bins[$0].observed) < bins[$1].active / max(1, bins[$1].observed)
         }) : nil
         let among = (run == nil ? 0 : 1) + (starts.isEmpty ? 0 : 1) + (activeCandidate == nil ? 0 : 1)
         func standing(_ hits: Int, _ tries: Int) -> Double? {
-            // A private, care-gated fact has half the cost of withholding a
-            // useful noticing. This standing buys attention only, never action.
+            // A private, care-gated fact has half the cost of withholding a useful noticing. This standing buys attention only, never action.
             let result = NativeAgentCore.Expectation.stands(hits: hits, tries: tries, cHit: 1, cMiss: 0.5, among: among)
             return result.stands ? result.lower : nil
         }

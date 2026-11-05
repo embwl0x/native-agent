@@ -17,7 +17,6 @@ import MacControl
 import UserNotifications
 // Blueprint: | `SystemPermissionPreflight.swift` | Observed OS grants, request admission and one capability vocabulary for permission cards |
 
-/// A macOS privacy (TCC) capability the app depends on.
 public enum SystemPermissionCapability: String, CaseIterable, Sendable {
     case speechRecognition
     case microphone
@@ -35,14 +34,14 @@ public enum SystemPermissionCapability: String, CaseIterable, Sendable {
     case camera
     case photos
 
-    /// The names `permissions.request` takes, read off this list so a new class is offered the day it exists.
+    /// Derive permission request names from the capability owner so new capabilities cannot be omitted.
     public static let requestable = allCases.filter { $0 != .automation }.map(\.rawValue).joined(separator: ", ")
 
     public var displayName: String {
         switch self {
         case .speechRecognition: return "Speech Recognition"
         case .microphone: return "Microphone"
-        case .accessibility: return "Accessibility"
+        case .accessibility: return MacFourVerbsReply.accessibilityGrantName
         case .location: return "Location Services"
         case .fullDiskAccess: return "Full Disk Access"
         case .screenRecording: return "Screen Recording"
@@ -101,7 +100,7 @@ public struct SystemPermissionSnapshot: Sendable, Equatable {
 }
 
 public enum SystemPermissionPreflight {
-    /// Posted by any permission source that learns of a change in-process (a Location answer); the card port re-checks its waiting cards on it.
+    /// In-process grant changes wake waiting cards so a Location answer can settle them.
     public static let permissionDidChange = MacIntegrationPermissionStore.didChange
     private static let logger = Logger(subsystem: "com.nativeagent.app", category: "permission-preflight")
 
@@ -111,7 +110,6 @@ public enum SystemPermissionPreflight {
 
     public static let settingsPanePrefix = "x-apple.systempreferences:com.apple.preference.security?"
 
-    /// Full System Settings deep link for a capability.
     public static func settingsURL(for capability: SystemPermissionCapability) -> URL? {
         if capability == .notifications {
             return URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
@@ -120,14 +118,14 @@ public enum SystemPermissionPreflight {
         return URL(string: settingsPanePrefix + anchor)
     }
 
-    /// A grant macOS hands a process only when it launches: System Settings itself offers "Quit & Reopen" for these.
+    /// A grant macOS hands a process only when it launches: System Settings itself offers "Quit & Reopen" for these. Accessibility takes effect live.
     public static let appliesAtLaunch: Set<SystemPermissionCapability> =
-        [.accessibility, .fullDiskAccess, .screenRecording, .inputMonitoring]
+        [.fullDiskAccess, .screenRecording, .inputMonitoring]
 
-    /// The launch-applied grants this process started with, read once at launch (the app touches it first thing).
+    /// Capture launch-applied grants before later probes can observe settings this process has not acquired.
     public static let grantedAtLaunch = Set(appliesAtLaunch.filter { status($0) == .granted })
 
-    /// The grants among a card's ids that macOS shows on now but this process started without: it has them only after it restarts, whatever its probe says now.
+    /// A launch-applied grant enabled after startup still requires a restart, regardless of its current probe.
     public static func awaitingLaunch(_ ids: [String]) -> [SystemPermissionCapability] {
         var seen: Set<SystemPermissionCapability> = []
         return ids.compactMap(cardSettingsCapability).filter {
@@ -171,23 +169,25 @@ public enum SystemPermissionPreflight {
         }
     }
 
-    public static func remedy(_ id: String, mode: InlineInteraction.AccessMode? = nil) -> JSONValue? {
+    /// The card target that asks for exactly this macOS grant. A bare name can also mean a Trust switch (accessibility, contacts…), so a grant is
+    /// privacy:<grant>, or applescript:<bundle_id> for one app's Automation.
+    public static func grantTarget(_ id: String) -> String? {
         guard let capability = cardSettingsCapability(id) else { return nil }
-        let target = AppleScriptExecution.automationTarget(id).map { "applescript:" + $0 }
-            ?? capability.rawValue
+        return AppleScriptExecution.automationTarget(id).map { "applescript:" + $0 } ?? "privacy:" + capability.rawValue
+    }
+
+    public static func remedy(_ id: String, mode: InlineInteraction.AccessMode? = nil) -> JSONValue? {
+        guard let capability = cardSettingsCapability(id), let target = grantTarget(id) else { return nil }
         let name = AppleScriptExecution.automationTarget(id).map { "Automation for " + $0 } ?? capability.displayName
         return MacFourVerbsReply.permissionRemedy(target, name: name, mode: mode)
     }
 
     // MARK: - Non-prompting reads
 
-    /// Reads the current TCC state. **MUST NEVER PROMPT.** Every call below is the query-only variant of its framework's API; the requesting variants (`SFSpeechRecognizer.requestAuthorization`, `CGRequestScreenCaptureAccess`,
-    /// `AXIsProcessTrustedWithOptions` with `kAXTrustedCheckOptionPrompt: true`, `AEDeterminePermissionToAutomateTarget(askUserIfNeeded: true)`) are deliberately absent. A prompt fired from a background context is not just invisible —
-    /// macOS resolves it to a hard `.denied` the user can never undo from inside the app, which is the exact bug this file exists to fix.
+    /// Status reads must never prompt: a background consent request can resolve denied without presenting a usable prompt.
     public static func status(_ capability: SystemPermissionCapability) -> SystemPermissionStatus {
         switch capability {
         case .speechRecognition:
-            // Class-level READ. Not requestAuthorization.
             switch SFSpeechRecognizer.authorizationStatus() {
             case .authorized: return .granted
             case .denied: return .denied
@@ -228,8 +228,7 @@ public enum SystemPermissionPreflight {
             @unknown default: return .unknown
             }
         case .accessibility:
-            // AXIsProcessTrusted() is the no-prompt form; the prompting form is AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt. AX exposes no notDetermined/restricted distinction — it is a boolean trust bit — so a non-
-            // trusted process reads as .denied.
+            // AX exposes only a boolean trust bit, so an untrusted process reads as denied without prompting.
             return AXIsProcessTrusted() ? .granted : .denied
         case .location:
             guard CLLocationManager.locationServicesEnabled() else { return .denied }
@@ -243,7 +242,7 @@ public enum SystemPermissionPreflight {
         case .fullDiskAccess:
             return MacMessagesHistory.hasAccess ? .granted : .denied
         case .screenRecording:
-            // CGPreflightScreenCaptureAccess is the preflight (no prompt); CGRequestScreenCaptureAccess is the prompting sibling.
+            // Preflight screen capture without invoking the prompting request API.
             return CGPreflightScreenCaptureAccess() ? .granted : .denied
         case .inputMonitoring:
             return CGPreflightListenEventAccess() ? .granted : .denied
@@ -261,8 +260,8 @@ public enum SystemPermissionPreflight {
             @unknown default: return .unknown
             }
         case .automation, .notifications:
-            // No CHEAP non-prompting read exists here. Automation: AEDeterminePermissionToAutomateTarget is per-target, requires the target app to be running, and the only variant that resolves a not-yet-determined grant is
-            // askUserIfNeeded:true — which prompts. MacIntegrationView owns that per-app probe. Notifications: UNUserNotificationCenter's settings read is async and requires a bundled, registered app.
+            // Automation needs a running target and may prompt; its per-app probe belongs to MacIntegrationView. Notifications require an async bundled-app
+            // read.
             return .unknown
         }
     }
@@ -274,8 +273,7 @@ public enum SystemPermissionPreflight {
         case .notDetermined: return .notDetermined
         case .fullAccess: return .granted
         case .writeOnly:
-            // NOT .granted. Write-only means the app may add events but cannot READ them, and every calendar/reminder capability this app surfaces (briefings, watch jobs, mac_calendar_list_upcoming) is a read. Reporting .granted here would
-            // show a green row while those reads keep failing — the same "looks fine, silently broken" shape this whole file exists to kill. MacPIMConnectorActions already treats write-only as not read-ready; match it.
+            // Write-only access cannot satisfy calendar reads; readiness must match the read boundary in MacPIMConnectorActions.
             return .denied
         @unknown default: return .unknown
         }
@@ -296,8 +294,7 @@ public enum SystemPermissionPreflight {
 
     // MARK: - Foreground acquisition
 
-    /// Bridges Speech's callback without inheriting the caller's actor.  `SFSpeechRecognizer.requestAuthorization` is invoked from the main actor so macOS can present its consent sheet, but TCC delivers the completion on an arbitrary
-    /// dispatch queue. Defining the continuation bridge as `nonisolated` is essential: otherwise Swift 6 actor inference makes the callback main-actor isolated and traps when TCC calls it off-main.
+    /// TCC delivers Speech completion on an arbitrary queue. Keep the callback nonisolated to avoid a Swift 6 actor-isolation trap.
     public nonisolated static func awaitSpeechAuthorization(
         using request: SpeechAuthorizationRequest = { completion in
             SFSpeechRecognizer.requestAuthorization(completion)
@@ -310,11 +307,8 @@ public enum SystemPermissionPreflight {
         }
     }
 
-    /// Fires the macOS Speech Recognition consent prompt — but ONLY from the main actor, and ONLY when the grant is still `.notDetermined`.  Why main-actor/foreground is not a style preference: `SFSpeechRecognizer.requestAuthorization`
-    /// from a headless context (a background poll loop, a detached utility task with no active app) cannot render its prompt. macOS does not queue it for later — it resolves the request `.denied` immediately, WITHOUT writing a real user
-    /// decision into the TCC database. The user is then stuck: the app looks denied, the system never asked, and no in-app button can re-ask, because TCC will not re-prompt a resolved grant. That is precisely how the Telegram voice-note
-    /// path bricked itself (`data/telegram/errors.jsonl`, context=voice_transcription, speechPermissionDenied("denied")).  Reading first is the other half of the guard: calling request on an already-denied grant is a silent no-op, so
-    /// callers must route those to System Settings instead of showing a button that appears to do nothing.
+    /// Request Speech only in the foreground on the main actor while not determined: headless requests can resolve denied without showing consent.
+    /// Already-denied grants require System Settings.
     @MainActor
     public static func requestSpeechRecognitionIfNotDetermined() async -> SystemPermissionStatus {
         let current = status(.speechRecognition)
@@ -343,7 +337,7 @@ public enum SystemPermissionPreflight {
 // MARK: - Setup cards
 
 extension SystemPermissionPreflight {
-    /// The first macOS switch still off for these ids, as the one sentence of what to click; nil when macOS has nothing against it.
+    /// Offer only the first switch still off so opening Settings does not hide an earlier required pane.
     public static func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String? {
         for id in ids {
             guard let gate = cardSettingsCapability(id) else { continue }
@@ -371,6 +365,52 @@ extension SystemPermissionPreflight {
             return "macOS hasn't allowed \(gate.displayName) yet. Return after turning it on; I'll continue."
         }
         return nil
+    }
+
+    /// The order a card walks its grants, least friction first: what macOS asks in-app (Automation targets included), then Accessibility, which takes
+    /// effect live, then the launch-applied grants one restart covers, Full Disk Access last. Ties keep the card's own order.
+    public static func frictionOrder(_ ids: [String]) -> [String] {
+        func rank(_ id: String) -> Int {
+            switch cardSettingsCapability(id) {
+            case .accessibility: return 1
+            case .screenRecording, .inputMonitoring: return 2
+            case .fullDiskAccess: return 3
+            default: return 0
+            }
+        }
+        return ids.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
+    }
+
+    /// What a card's grants wait on now, read live and never prompting: the first grant still off in friction order, else the one restart its
+    /// launch-applied grants need, else nothing. A grant macOS has not confirmed is still waited on.
+    public static func waitingOn(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> InlineInteraction.WaitingOn? {
+        for id in frictionOrder(ids) where cardSettingsCapability(id) != nil {
+            if await cardBlockReason([id], mode: mode) != nil { return .target(id) }
+        }
+        return awaitingLaunch(ids).isEmpty ? nil : .restart
+    }
+
+    /// The launch-applied grants on a card that this process did not launch with, in walk order: one restart is what makes them take effect.
+    public static func launchPending(_ ids: [String]) -> [SystemPermissionCapability] {
+        var seen: Set<SystemPermissionCapability> = []
+        return frictionOrder(ids).compactMap(cardSettingsCapability).filter {
+            appliesAtLaunch.contains($0) && !grantedAtLaunch.contains($0) && seen.insert($0).inserted
+        }
+    }
+
+    /// The walk has reached what one restart covers: the restart itself, or a launch-applied grant whose probe this process may not see until then.
+    public static func waitsForRestart(_ waiting: InlineInteraction.WaitingOn?) -> Bool {
+        switch waiting {
+        case .some(.restart): return true
+        case .some(.target(let id)): return cardSettingsCapability(id).map { appliesAtLaunch.contains($0) } ?? false
+        case nil: return false
+        }
+    }
+
+    /// Where the person turns a grant on, in System Settings' own names.
+    public static func settingsPath(_ capability: SystemPermissionCapability) -> String {
+        capability == .notifications ? "System Settings → Notifications → NativeAgent"
+            : "System Settings → Privacy & Security → \(capability.displayName)"
     }
 
     /// Only a real grant counts. A Calendar WRITE card is satisfied by macOS's write-only access as well as full access.

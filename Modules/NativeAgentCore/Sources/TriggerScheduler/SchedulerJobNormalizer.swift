@@ -5,13 +5,12 @@ import Privacy
 import os
 import NativeAgentCore
 import TrustCenter
-import WorkshopExecution
 import Experiences
 import NotificationInbox
 import Darwin
-// Blueprint: | `SchedulerJobNormalizer.swift` | Checked canonical job normalization; ProactiveScanArguments shares strict creation/update/execution admission, with unsupported input refused at its field |
+// Blueprint: | `SchedulerJobNormalizer.swift` | Strict job admission shared by creation, updates and execution |
 
-/// One checked argument shape at job creation, update, and scan execution.
+/// Shared admission prevents creation, updates and execution from disagreeing on argument shape.
 public struct ProactiveScanArguments: Sendable {
     public let reason: String
     public let limit: Int
@@ -68,7 +67,8 @@ public enum SchedulerJobNormalizer {
             payload = fields
         } else { payload = [:] }
         guard let kind = string(body["kind"]), allowedKinds.contains(kind) else {
-            throw TriggerSchedulerError.schedulerInvalid("Unsupported scheduled Desk task kind. Use queue.add {text, when, until?, say?} for intentions, check-ins and reminders.")
+            throw TriggerSchedulerError.schedulerInvalid(
+                "Unsupported scheduled Desk task kind. Use queue.add {text, when, until?, say?} for intentions, check-ins and reminders.")
         }
         if kind == "proactive_scan" {
             for key in ["reason", "limit", "surfaceLimit", "surface_limit", "staleDays", "stale_days", "sources"] where body[key] != nil {
@@ -84,7 +84,7 @@ public enum SchedulerJobNormalizer {
         if let enabled = body["enabled"], case .bool = enabled {} else if body["enabled"] != nil {
             throw TriggerSchedulerError.schedulerInvalid("enabled must be Boolean")
         }
-        // The public units meet here once. Saved rows always carry a schedule.
+        // Normalize public units once so every saved row carries a schedule.
         let supplied = ["in_minutes", "interval_seconds", "schedule"].filter { body[$0] != nil && body[$0] != .null }
         guard supplied.count == 1 else {
             throw TriggerSchedulerError.schedulerInvalid("Supply exactly one of schedule, in_minutes or interval_seconds")
@@ -128,7 +128,10 @@ public enum SchedulerJobNormalizer {
         for key in ["timezone", "tz"] {
             guard let zone = string(schedule.removeValue(forKey: key))?.trimmingCharacters(in: .whitespaces),
                   !["", "local", "system"].contains(zone.lowercased()) else { continue }
-            throw TriggerSchedulerError.schedulerInvalid("Schedules run on this Mac's local clock and follow it when it changes zone; remove \(key) \(zone). For one moment elsewhere, give an ISO-8601 time with its offset.")
+            throw TriggerSchedulerError.schedulerInvalid("""
+                Schedules run on this Mac's local clock and follow it when it changes zone; remove \(key) \(zone). For one moment elsewhere, give an ISO-8601 \
+                time with its offset.
+                """)
         }
         if typeLower == "every" {
             interval = try everyInterval(schedule)
@@ -154,7 +157,8 @@ public enum SchedulerJobNormalizer {
                 throw TriggerSchedulerError.schedulerInvalid("connector_action requires payload.actionId")
             }
             let input = payload["input"]?.objectValue ?? [:] // input is optional and checked above.
-            if let refusal = SwiftNativeTriggerScheduler.watchRefusal(action: actionId, input: input) {
+            // Validate the saved job's declaration; no execution turn has been admitted.
+            if let refusal = SwiftNativeTriggerScheduler.watchRefusal(action: actionId, input: input, turn: nil) {
                 throw TriggerSchedulerError.schedulerInvalid(refusal)
             }
             outPayload["input"] = .object(input)
@@ -192,8 +196,7 @@ public enum SchedulerJobNormalizer {
         if case .string(let text)? = value { return text }; return nil
     }
 
-    /// Current documented units may use numeric strings; booleans and fractions
-    /// are never integers. Absence is handled only by the field's own default.
+    /// Current documented units may use numeric strings; booleans and fractions are never integers. Absence is handled only by the field's own default.
     static func integer(_ value: JSONValue?) throws -> Int {
         switch value {
         case .int(let count)?:
@@ -284,7 +287,7 @@ public enum SchedulerJobNormalizer {
         }
     }
 
-    /// Empty weekday inputs are exactly null, "" or [].
+    /// Only null, empty text or an empty array mean no weekdays.
     static func isEmptyForWeekdays(_ v: JSONValue) -> Bool {
         switch v {
         case .null: return true
@@ -294,7 +297,6 @@ public enum SchedulerJobNormalizer {
         }
     }
 
-    /// Capitalize the display name's words.
     static func titleCased(_ s: String) -> String {
         s.split(separator: " ", omittingEmptySubsequences: false)
             .map { word -> String in
@@ -304,7 +306,7 @@ public enum SchedulerJobNormalizer {
             .joined(separator: " ")
     }
 
-    /// Stable numeric text for the canonical saved occurrence instant.
+    /// Stable numeric text preserves the saved occurrence instant.
     static func floatString(_ d: Double) -> String {
         if d.isFinite, d == d.rounded(), abs(d) < 1e16 {
             return String(format: "%.1f", d)
@@ -312,17 +314,14 @@ public enum SchedulerJobNormalizer {
         return String(d)
     }
 
-    /// ISO-8601 UTC with offset and millisecond precision.
     static func nowIso(_ date: Date) -> String {
         SwiftNativeTriggerScheduler.isoTimestamp(date)
     }
 
     // MARK: list_jobs nextRunAt decoration
 
-    /// Project timing through `SchedulerJobRuntime.scheduledEpoch`, then format
-    /// the epoch as ISO. Ambiguous wall-clock timing is nulled with a warning.
-    /// Omit the unmaintained duplicate timestamp; one-offs omit the interval.
-    /// Non-object rows and other metadata pass through.
+    /// Resolve timing through SchedulerJobRuntime; ambiguous wall-clock timing stays null with a warning. Keep one timestamp owner; one-offs omit irrelevant
+    /// intervals and unrelated metadata passes through.
     static func decorateNextRunAt(_ row: JSONValue) -> JSONValue {
         guard case .object(var d) = row else { return row }
         d.removeValue(forKey: "nextRunAtISO")
@@ -337,7 +336,7 @@ public enum SchedulerJobNormalizer {
                 d["nextRunAtEpoch"] = .null
             }
         }
-        // Older one-off and calendar rows retained the default hourly interval.
+        // One-offs have no interval; discard irrelevant default-hourly decoration.
         let calendarTypes: Set<String> = ["once", "hourly", "daily", "weekly", "monthly", "cron"]
         let scheduleType: String? = {
             guard case .object(let schedule)? = d["schedule"] else { return nil }
@@ -351,7 +350,6 @@ public enum SchedulerJobNormalizer {
         let epoch = floatEpochForDecoration(d["nextRunAt"])
         if let epoch {
             let iso = epochToDecorationISO(epoch)
-            // nextRunAtEpoch is a JSON number, including for integral epochs.
             d["nextRunAtEpoch"] = .double(epoch)
             d["nextRunAt"] = .string(iso)
         }
@@ -373,7 +371,6 @@ public enum SchedulerJobNormalizer {
         case .some(.double(let d)):
             return d.isFinite ? d : nil
         case .some(.bool):
-            // Boolean values are not valid saved timestamps.
             return nil
         case .some(.array), .some(.object):
             return nil

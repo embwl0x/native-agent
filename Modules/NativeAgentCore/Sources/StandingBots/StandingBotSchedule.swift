@@ -1,10 +1,9 @@
 import Foundation
 // Blueprint: | `StandingBotSchedule.swift` | `StandingBotSchedule` enum; `parse`, `words` |
 
-/// A deliberately small input language; the existing cadence owner validates
-/// and schedules its output. Unsupported prose never becomes a guessed cron.
+/// A small input language delegates validation to the cadence owner; unsupported prose cannot become guessed cron.
 public enum StandingBotSchedule {
-    /// Cron day-of-week order: 0 is Sunday.
+    /// Cron numbers weekdays from Sunday at zero.
     public static let weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
 
     public static func parse(_ input: String) throws -> BotCadence {
@@ -38,12 +37,10 @@ public enum StandingBotSchedule {
         let hour = Int(clock[0] - 48) * 10 + Int(clock[1] - 48)
         let minute = Int(clock[3] - 48) * 10 + Int(clock[4] - 48)
         guard hour < 24, minute < 60 else { throw invalid("Schedule time must be between 00:00 and 23:59") }
-        // The time follows the Mac wherever it is.
+        // Schedules follow the Mac's local civil clock.
         return .cron(expression: "\(minute) \(hour) * * \(days)")
     }
 
-    /// The words the Bots page shows ("Weekly", "Manual only"); the agent's
-    /// home screen says the same.
     public static func words(_ cadence: BotCadence) -> String {
         switch cadence {
         case .manual: return "Manual only"
@@ -53,7 +50,6 @@ public enum StandingBotSchedule {
                 : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \((seconds / 86400).formatted(.number.precision(.fractionLength(0)))) days"
                 : "Every \((seconds / 3600).formatted()) hours"
         case .cron:
-            // "Daily at 23:57", not the raw cron.
             let said = describe(cadence)
             return said.prefix(1).uppercased() + said.dropFirst()
         }
@@ -86,6 +82,9 @@ public enum StandingBotSchedule {
 
     private static func invalid(_ message: String) -> StandingBotsError { .invalidValue(message) }
     private static var unsupported: StandingBotsError {
-        invalid("Unsupported schedule. Use manual, every 30 minutes, every 2 hours, daily at 09:00, weekdays at 09:00, or weekly on monday at 09:00; use cadence for an explicit advanced cron.")
+        invalid("""
+            Unsupported schedule. Use manual, every 30 minutes, every 2 hours, daily at 09:00, weekdays at 09:00, or weekly on \
+            monday at 09:00; use cadence for an explicit advanced cron.
+            """)
     }
 }

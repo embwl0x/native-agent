@@ -7,8 +7,7 @@ public actor SomaticSignalBus {
     private var deliveredEventKeys: Set<String> = []
     private var deliveredEventKeyOrder: [String] = []
 
-    /// Matches the continuity field's bounded replay horizon. Oldest keys are
-    /// evicted in batches, keeping insertion amortized O(1) on the hot path.
+    /// Matches the continuity field's bounded replay horizon. Oldest keys are evicted in batches, keeping insertion amortized O(1) on the hot path.
     private static let maximumDeliveredEventKeys = 4_096
     private static let deliveredEventKeyEvictionBatch = 512
 
@@ -36,8 +35,7 @@ public actor SomaticSignalBus {
         ) else {
             return nil
         }
-        // Mark before the observer await so a reentrant replay cannot be
-        // delivered while the first observation is still being integrated.
+        // Mark before the observer await so a reentrant replay cannot be delivered while the first observation is still being integrated.
         deliveredEventKeys.insert(eventKey)
         rememberDeliveredEventKey(eventKey)
         await observer.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(signal.kind))

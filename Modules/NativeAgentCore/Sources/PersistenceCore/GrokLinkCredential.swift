@@ -2,8 +2,7 @@ import Foundation
 import Security
 // Blueprint: | `GrokLinkCredential.swift` | `GrokLinkCredential`, `GrokReplyInput` |
 
-/// Shared by the signed app and its signed local helper. Never serialize this
-/// value outside Keychain or expose it in a tool/approval projection.
+/// Shared by the signed app and its signed local helper. Never serialize this value outside Keychain or expose it in a tool/approval projection.
 public struct GrokLinkCredential: Codable, Sendable {
     public var descriptorPath: String
     public var replyToken: String

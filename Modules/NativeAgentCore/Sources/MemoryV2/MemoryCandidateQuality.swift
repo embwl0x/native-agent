@@ -1,9 +1,9 @@
 import Foundation
 
-// Blueprint: | `MemoryCandidateQuality.swift` | `MemoryCandidateQuality`: source-independent empty, transient-state and tool-noise screening; semantic eligibility belongs to interpretation |
+// Blueprint: | `MemoryCandidateQuality.swift` | `MemoryCandidateQuality`: source-independent shape gates |
 
 public enum MemoryCandidateQuality {
-    /// Rejects empty text, transient state and tool noise for every source, in that order.
+    /// Apply empty, transient-state and tool-noise rejection in that order for every source.
     public static func rejectionReason(text: String, source: String? = nil, kind: String? = nil) -> String? {
         let normalized = normalize(text)
         guard !normalized.isEmpty else { return "empty memory candidate" }

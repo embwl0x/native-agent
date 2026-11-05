@@ -2,24 +2,23 @@ import Foundation
 import Darwin
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`: contract ports for today's raw material, native pages and source-owned live-watch inventory; file changes carry checked membership, gated root absence or explicit unavailability, retain the same root/parent subscription through failed reads and absence, and rearm bounded membership only on source edges; public packageManifest owns package membership, symlink/type rejection and the 8,000 total-member bound, including watched directories, for watching, shared part/intention change identities and archive delivery; `SenseNativePages` owns readable Chrome places, bounded conversation/tab-scoped private continuation bindings, structural things/verbs and existing raw UTF-8 windows |
+// Blueprint: | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`, `SenseNativePages`: gated material, watches and bounded pages |
 
-/// Launch assembly supplies the existing, gated raw readers. Keeping the ports
-/// here avoids a dependency from Senses back into the door that consults it.
+/// These ports avoid a dependency from Senses back into the door that consults it.
 public protocol SenseNativePageSource: SenseSourceProvider {
-    func page(for corner: SenseCorner, address: String?) async throws -> NativePage
+    func page(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> NativePage
 }
 
 public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceWatchingProvider, SenseWatchReporting {
-    private let readMaterial: @Sendable (SenseCorner, String?) async throws -> SenseMaterial
-    private let readPage: @Sendable (SenseCorner, String?) async throws -> NativePage
-    private let readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseSourceChange>)?
+    private let readMaterial: @Sendable (SenseCorner, String?, SenseReadOperation) async throws -> SenseMaterial
+    private let readPage: @Sendable (SenseCorner, String?, SenseReadOperation) async throws -> NativePage
+    private let readChanges: (@Sendable (SenseCorner, String?, SenseReadOperation) async throws -> AsyncStream<SenseSourceChange>)?
     private let reportWatches: (@Sendable () async -> [SenseLiveWatch])?
 
     public init(
-        readMaterial: @escaping @Sendable (SenseCorner, String?) async throws -> SenseMaterial,
-        readPage: @escaping @Sendable (SenseCorner, String?) async throws -> NativePage,
-        readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseSourceChange>)? = nil,
+        readMaterial: @escaping @Sendable (SenseCorner, String?, SenseReadOperation) async throws -> SenseMaterial,
+        readPage: @escaping @Sendable (SenseCorner, String?, SenseReadOperation) async throws -> NativePage,
+        readChanges: (@Sendable (SenseCorner, String?, SenseReadOperation) async throws -> AsyncStream<SenseSourceChange>)? = nil,
         reportWatches: (@Sendable () async -> [SenseLiveWatch])? = nil
     ) {
         self.readMaterial = readMaterial
@@ -30,28 +29,26 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
 
     public func liveWatches() async -> [SenseLiveWatch] { await reportWatches?() ?? [] }
 
-    public func material(for corner: SenseCorner, address: String?) async throws -> SenseMaterial {
-        try await readMaterial(corner, address)
+    public func material(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> SenseMaterial {
+        try await readMaterial(corner, address, operation)
     }
 
-    public func page(for corner: SenseCorner, address: String?) async throws -> NativePage {
-        try await readPage(corner, address)
+    public func page(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> NativePage {
+        try await readPage(corner, address, operation)
     }
 
-    public func changes(for corner: SenseCorner, address: String?) async throws -> AsyncStream<SenseSourceChange> {
-        if case .site = corner, let readChanges { return try await readChanges(corner, address) }
+    public func changes(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> AsyncStream<SenseSourceChange> {
+        if case .site = corner, let readChanges { return try await readChanges(corner, address, operation) }
         if case .app = corner {
             guard let readChanges else {
                 throw SenseFailure(code: "source_unavailable", message: "This app corner has no accessibility event source.")
             }
-            return try await readChanges(corner, address)
+            return try await readChanges(corner, address, operation)
         }
         guard case .fileKind = corner, let address else {
             throw SenseFailure(code: "unsupported", message: "This corner has no event-backed source watch.")
         }
-        // DoorSource supplies a JSON read address; part wakes supply a path.
-        // Resolving identity does not admit a read: each source edge below still
-        // passes material's ordinary gates before exposing any membership.
+        // JSON read addresses and wake paths resolve to one identity; membership still requires material's read gates.
         let path: String
         if address.hasPrefix("{") {
             guard case .object(let fields) = try JSONValue.parse(Data(address.utf8)),
@@ -65,13 +62,11 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
             throw SenseFailure(code: "source_unavailable", message: "A file watch needs an absolute path.")
         }
         let root = URL(fileURLWithPath: path)
-        // Root/parent observation survives absence and unreadable membership.
-        // It is the same source subscription, never an EnginePartWake substitute.
+        // Keep the root/parent subscription alive through absence and unreadable membership.
         let paths = [root, root.deletingLastPathComponent()]
         let initial = FileChangeEvents(paths: paths, emitInitial: false)
         let pair = AsyncStream<SenseSourceChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        // Observation outlives the turn; it must not inherit its session,
-        // approvals, file grants or action callback.
+        // Observation outlives the turn, so it must inherit none of its session, approvals, file grants or action callback.
         let task = Task.detached(priority: .utility) {
             var events = initial
             var watched = Set(paths)
@@ -81,13 +76,15 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
                 pair.continuation.yield(.unavailable(failure))
             }
             guard await events.waitUntilArmed() else {
-                if !Task.isCancelled { await unavailable(SenseFailure(code: "source_unavailable", message: "File observation could not be armed for \(path).")) }
+                if !Task.isCancelled {
+                    await unavailable(SenseFailure(code: "source_unavailable", message: "File observation could not be armed for \(path)."))
+                }
                 return
             }
             guard !Task.isCancelled else { return }
             while !Task.isCancelled {
                 do {
-                    let material = try await self.material(for: corner, address: address)
+                    let material = try await self.material(for: corner, address: address, operation: operation)
                     guard case .file(let admittedPath, _, _) = material,
                           URL(fileURLWithPath: admittedPath).standardizedFileURL.path == root.standardizedFileURL.path else {
                         throw SenseFailure(code: "source_unavailable", message: "File observation must retain its requested path.")
@@ -102,8 +99,7 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
                         guard !Task.isCancelled else { next.cancel(); return }
                         events.cancel(); events = next; watched = Set(nextPaths)
                     }
-                    // Identity is checked only after read admission. Failure
-                    // retains the previous identity, never a guessed deletion.
+                    // Check identity only after read admission; a failed read cannot prove deletion.
                     let identity = try Self.fileIdentity(root)
                     pair.continuation.yield(.changed(material, files: identity))
                 } catch {
@@ -114,11 +110,15 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
                         await unavailable(error)
                     }
                 }
-                // No timer or reread after failure. A source edge is the only
-                // repair admission; no edge leaves the unavailable watch waiting.
+                // Only a source edge admits repair after failure; without one, the unavailable watch waits without a timer or reread.
                 var iterator = events.stream.makeAsyncIterator()
                 guard await iterator.next() != nil else {
-                    if !Task.isCancelled { await unavailable(SenseFailure(code: "source_unavailable", message: "File observation ended for \(path); a part/catalog change can register it again.")) }
+                    if !Task.isCancelled {
+                        await unavailable(SenseFailure(
+                            code: "source_unavailable",
+                            message: "File observation ended for \(path); a part/catalog change can register it again."
+                        ))
+                    }
                     return
                 }
             }
@@ -127,7 +127,7 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
         return pair.stream
     }
 
-    /// A watch that failed says why in the news before its events end.
+    /// Report failure in the news before ending the event stream.
     public static func postWatchFailure(_ error: Error, corner: SenseCorner, address: String, observationID: String?, what: String) async {
         do {
             guard let record = try await SensesHub.shared.registry?.sense(for: corner), record.status == .on else { return }
@@ -164,10 +164,12 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
         return result
     }
 
-    /// Watching and delivery share the 8,000-member bound, including directories
-    /// watched for changes. Only regular files are archived for the helper.
+    /// Watching and delivery share the 8,000-member bound, including watched directories; only regular files may be archived.
     public static func packageManifest(_ root: URL, symlinkMessage: String = "Sense document packages cannot contain symbolic links.",
-                                memberFailure: SenseFailure = SenseFailure(code: "input_limit", message: "Sense document package exceeds its member limit.")) throws -> [(url: URL, isFile: Bool)] {
+                                memberFailure: SenseFailure = SenseFailure(
+                                    code: "input_limit",
+                                    message: "Sense document package exceeds its member limit."
+                                )) throws -> [(url: URL, isFile: Bool)] {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
         var traversalFailed = false
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys),
@@ -195,8 +197,7 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
 }
 
 public enum SenseNativePages {
-    /// Public places carry the source's readable fragment. Structural paths
-    /// stay in captured material and are never encoded into an agent address.
+    /// Keep structural paths private in captured material; agent addresses carry only readable fragments.
     public static func chromeAddress(host: String, url: String, fragment: String? = nil) -> String {
         guard let parts = URLComponents(string: url) else { return "site:" + host.lowercased() }
         let base = "site:" + host.lowercased() + (parts.percentEncodedPath.isEmpty ? "/" : parts.percentEncodedPath)
@@ -211,8 +212,7 @@ public enum SenseNativePages {
     }
     private static let chromePlaces = ChromePlaces()
 
-    /// Continuations bind a page position, scoped to the served conversation
-    /// and tab. Recycling an element cannot delete the reading place.
+    /// Bind reading positions to the served conversation and tab so recycled elements cannot delete them.
     public static func chromeContinuation(_ page: [String: JSONValue], cursor: JSONValue, scope: String, alias: String? = nil) -> String? {
         guard case .object(let fields) = cursor, case .string(let url)? = page["url"],
               let host = URL(string: url)?.host, case .int(let tab)? = page["tabId"], tab >= 0,
@@ -230,7 +230,6 @@ public enum SenseNativePages {
             guard coordinates.count == 6 else { return nil }
             fragment = "view-\(frame)-" + coordinates.joined(separator: "_")
         } else {
-            // A following embedded frame starts at its current viewport.
             guard fields["textOffset"] == nil, fields["optionOffset"] == nil else { return nil }
             fragment = "view-\(frame)"
         }
@@ -240,8 +239,7 @@ public enum SenseNativePages {
         }
         let canonical = chromeAddress(host: host, url: url, fragment: fragment)
             + "?read=more" + (position.isEmpty ? "" : "&" + position.joined(separator: "&"))
-        // A grown view may retain the requested URL's spelling after a
-        // redirect. Bind its same page position to this exact captured tab.
+        // Bind redirects by captured tab and page position because grown views may retain the requested URL spelling.
         if let alias {
             guard alias.hasPrefix("site:" + host.lowercased() + "/"),
                   alias.split(separator: "#", maxSplits: 1).last == canonical.split(separator: "#", maxSplits: 1).last else { return nil }
@@ -270,13 +268,15 @@ public enum SenseNativePages {
         guard matches.count == 1, let match = matches.first else {
             throw SenseFailure(code: "invalid_address", message: matches.isEmpty
                 ? "This reading place is no longer available; read the page again. raw view · private Chrome reading-place bindings; no page was read."
-                : "This reading place belongs to more than one held tab; supply its tab_id. raw view · private Chrome reading-place bindings; no page was read.")
+                : """
+                    This reading place belongs to more than one held tab; supply its tab_id. raw view · private Chrome reading-place bindings; no page was \
+                    read.
+                    """)
         }
         return match.value.arguments
     }
 
-    /// Chrome things retain their structural sense address underneath the
-    /// compact row/verb display. No duplicate path catalog in the read envelope.
+    /// Retain structural sense addresses under the compact display without duplicating a path catalog in the envelope.
     public static func chromeThings(_ snapshot: JSONValue) throws -> [NativeThing] {
         func text(_ value: JSONValue?) -> String? { if case .string(let text)? = value { return text }; return nil }
         guard case .object(let page) = snapshot, let url = text(page["url"]),
@@ -285,7 +285,10 @@ public enum SenseNativePages {
             guard case .object(let node) = value, let fragment = text(node["addressFragment"]) else { return false }
             return !fragment.isEmpty
         }) else {
-            throw SenseFailure(code: "reader_update_required", message: "Chrome's reader has no readable places; extension 0.4.20 is required. raw view · the captured Chrome reader did not supply element places; no native page was served.")
+            throw SenseFailure(code: "reader_update_required", message: """
+                Chrome's reader has no readable places; extension 0.4.20 is required. raw view · the captured Chrome reader did not supply element places; \
+                no native page was served.
+                """)
         }
         return nodes.compactMap { value in
             guard case .object(let node) = value, let fragment = text(node["addressFragment"]) else { return nil }
@@ -331,9 +334,7 @@ public enum SenseNativePages {
         return result
     }
 
-    /// One cursor over the frozen screen representation. Things follow the
-    /// text window containing their inline address, so neither the text budget
-    /// nor the thing budget can lose or repeat a control on the next page.
+    /// Page text and things with one frozen cursor so neither budget can lose or repeat a control.
     private static func screenWindow(_ page: NativePage, arguments: [String: JSONValue]) throws -> NativePage {
         let bytes = Array(page.text.utf8)
         let offset: Int = if case .int(let n)? = arguments["__sense_text_offset"] { Int(exactly: n) ?? -1 } else { 0 }
@@ -365,8 +366,7 @@ public enum SenseNativePages {
         while end < bytes.count, bytes[end] & 0xc0 == 0x80 { end -= 1 }
         let pending = positions.filter { $0.start >= offset }
         if pending.count > 80 { end = min(end, max(offset, pending[80].line)) }
-        // Prefer a whole paragraph/control line, while still making progress
-        // through a single paragraph longer than the page's byte budget.
+        // Prefer whole lines but permit progress through paragraphs longer than the page budget.
         if end < bytes.count, let newline = bytes[offset..<end].lastIndex(of: 10), newline > offset {
             end = newline + 1
         }
@@ -391,9 +391,7 @@ public enum SenseNativePages {
                 result.folded.insert(servedSection + " (continued)", at: 0)
             }
             if result.folded.isEmpty { result.folded = ["Page content continued"] }
-            // Only the frozen identity and reading position cross this door;
-            // session/transport metadata and display options are not args for
-            // the producer's continuation call.
+            // Only frozen identity and reading position belong to continuation args; session, transport and display metadata do not.
             var next: [String: JSONValue] = [:]
             guard case .object(let identity) = try JSONValue.parse(Data(page.address.utf8)),
                   case .string(let frame)? = identity["__sense_screen_frame"] else {

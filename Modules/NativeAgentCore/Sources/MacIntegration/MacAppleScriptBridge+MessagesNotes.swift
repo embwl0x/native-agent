@@ -1,17 +1,16 @@
+import MacControl
 import Foundation
 import NativeAgentShared
 import AppKit
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `MacAppleScriptBridge+MessagesNotes.swift` | `MacAppleScriptBridge`: Messages history-owned completion and partial thread evidence, shared date/duration windows and sends; Notes reads with per-note/container gaps and shared-channel failures, single resolved creation destination, unknown-folder replies list folder names directly, and exact-note mutations preserve failed readback |
+// Blueprint: | `MacAppleScriptBridge+MessagesNotes.swift` | `MacAppleScriptBridge`: exact messages and Notes effects with read gaps |
 
 extension MacAppleScriptBridge {
     // MARK: MESSAGES
 
-    /// Reads Messages' chat.db read-only, newest first; chat guids are AppleScript send ids.
-    /// `query` matches people (name, number, email) or messages.
-    /// An exact selected chat exposes a bounded local history page.
-    public static func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Read chat.db without mutation; chat GUIDs retain their AppleScript send identity.
+    public static func messagesRecentThreads(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         let limit = try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 30)
         let threadID = input["thread_id"]?.scalarText
         guard input["unread_only"] == nil || input["unread_only"] == .bool(true) || input["unread_only"] == .bool(false),
@@ -40,7 +39,10 @@ extension MacAppleScriptBridge {
             guard threadID == nil, case .string(let raw) = value, let date = messagesSince(raw),
                   abs(date.timeIntervalSinceReferenceDate * 1_000_000_000) < Double(Int64.max) else {
                 return .object(["status": .string("failed"), "integration": .string("messages"), "effects": .string("none"),
-                    "message": .string("since takes local YYYY-MM-DD, ISO-8601 with a time zone, a positive duration such as 7d (m/h/d/w), or this week. Use it with a thread list or from_me, within the Messages date range.")])
+                    "message": .string("""
+                        since takes local YYYY-MM-DD, ISO-8601 with a time zone, a positive duration such as 7d (m/h/d/w), or this week. Use it with a thread \
+                        list or from_me, within the Messages date range.
+                        """)])
             }
             since = date
         } else {
@@ -62,9 +64,11 @@ extension MacAppleScriptBridge {
             guard threadID == nil, query == nil, input["unread_only"] == nil, input["sort"] == nil,
                   input["offset"] == nil else {
                 return .object(["status": .string("failed"), "integration": .string("messages"), "effects": .string("none"),
-                    "message": .string("from_me selects messages across all conversations. Omit thread_id, query, unread_only, sort and offset for this view.")])
+                    "message": .string("""
+                        from_me selects messages across all conversations. Omit thread_id, query, unread_only, sort and offset for this view.
+                        """)])
             }
-            let task = Task.detached(priority: .utility) { MacMessagesHistory.read(limit: limit, fromMe: fromMe, since: since) }
+            let task = Task.detached(priority: .utility) { MacMessagesHistory.read(limit: limit, fromMe: fromMe, since: since, context: context) }
             var result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
             try Task.checkCancellation()
             result["status"] = .string(result["history_status"] == .string("available") ? "completed" : "failed")
@@ -73,7 +77,8 @@ extension MacAppleScriptBridge {
             return .object(await MacContactsExecutor.naming(result))
         }
         let words = threadID == nil ? query : nil
-        let listTask = Task.detached(priority: .utility) { MacMessagesHistory.threads(words: words, threadID: threadID, unreadOnly: unreadOnly, oldestUnread: oldestUnread, since: since) }
+        let listTask = Task.detached(priority: .utility) { MacMessagesHistory.threads(words: words, threadID: threadID, unreadOnly: unreadOnly,
+            oldestUnread: oldestUnread, since: since, context: context) }
         let listing = await withTaskCancellationHandler { await listTask.value } onCancel: { listTask.cancel() }
         try Task.checkCancellation()
         guard case .array(let all)? = listing["threads"] else {
@@ -113,7 +118,9 @@ extension MacAppleScriptBridge {
                 ? "Oldest unread incoming message within since first (default: past 30 days)."
                 : "Newest conversation first, by its last message."),
             "history_status": .string("select_conversation"),
-            "history_note": .string("Open a conversation to read a bounded page of its local history. fields selects only the requested thread metadata or previews."),
+            "history_note": .string("""
+                Open a conversation to read a bounded page of its local history. fields selects only the requested thread metadata or previews.
+                """),
         ]
         if let since { result["since"] = .string(NativeTimestampFormat.plainZulu(since)) }
         if offset + page.count < rows.count { result["next_offset"] = .int(Int64(offset + page.count)) }
@@ -122,7 +129,7 @@ extension MacAppleScriptBridge {
         if let threadID {
             result["thread_id"] = .string(threadID)
             let historyTask = Task.detached(priority: .utility) {
-                MacMessagesHistory.read(threadID: threadID, limit: limit, before: before)
+                MacMessagesHistory.read(threadID: threadID, limit: limit, before: before, context: context)
             }
             let history = await withTaskCancellationHandler {
                 await historyTask.value
@@ -178,9 +185,8 @@ extension MacAppleScriptBridge {
         return ISO8601DateFormatter().date(from: value)
     }
 
-    /// Send to an explicit recipient, or an exact observed chat after checking
-    /// its current participants. Never reinterpret a chat identifier as a handle.
-    public static func messagesSend(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Send to an explicit recipient, or an exact observed chat after checking its current participants. Never reinterpret a chat identifier as a handle.
+    public static func messagesSend(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         let to = input["to"]?.scalarText
         let threadID = input["thread_id"]?.scalarText
         guard (to?.isEmpty == false) != (threadID?.isEmpty == false) else {
@@ -191,7 +197,9 @@ extension MacAppleScriptBridge {
         }
         if let to, !to.isEmpty, !to.contains("@"), !to.contains(where: \.isNumber) {
             return .object(["status": .string("failed"), "integration": .string("messages"), "reason": .string("recipient_is_a_name"),
-                "message": .string("\"\(to)\" is a name, not a phone number or email. Look it up with contacts_search, then send to that number. Nothing was sent.")])
+                "message": .string("""
+                    \"\(to)\" is a name, not a phone number or email. Look it up with contacts_search, then send to that number. Nothing was sent.
+                    """)])
         }
         let bodyAS = escapeForAppleScript(body)
         let source: String
@@ -232,9 +240,10 @@ extension MacAppleScriptBridge {
             """
         }
         do {
-            let outcome = try await runAppleScript(source, bundleID: "com.apple.MobileSMS")
+            let outcome = try await runAppleScript(source, bundleID: "com.apple.MobileSMS", context: context)
             guard outcome == "sent" else {
-                return failedEnvelope(integration: "messages", reason: outcome == "participants_changed" ? "participants_changed_read_thread_again" : "thread_not_found")
+                return failedEnvelope(integration: "messages", reason: outcome == "participants_changed" ? "participants_changed_read_thread_again"
+                    : "thread_not_found")
             }
             var result: [String: JSONValue] = ["status": .string("completed"), "action": .string("sent")]
             if let threadID, !threadID.isEmpty { result["thread_id"] = .string(threadID) }
@@ -249,15 +258,12 @@ extension MacAppleScriptBridge {
 
     // MARK: NOTES
 
-    /// List recent Apple Notes. Optional: "limit" (default 10, max 50).
-    /// Returns the same bounded record shape as `notesSearch`.
-    public static func notesListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        await notesRead(selection: "notes", limit: try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50), whole: false)
+    public static func notesListRecent(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
+        await notesRead(selection: "notes", limit: try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50), whole: false, context: context)
     }
 
-    /// Search Apple Notes by title/body; blank query lists recent notes, and
-    /// `title` (exact) or `id` reads a body page. Continuation requires `id`.
-    public static func notesSearch(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Continuation requires the exact note ID so paging cannot switch between identically titled notes.
+    public static func notesSearch(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         let limit = try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
         let id = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines)
         var offset = 0
@@ -270,23 +276,21 @@ extension MacAppleScriptBridge {
         }
         // A note's own id reads exactly that note, whatever else shares its title.
         if let id, !id.isEmpty {
-            return await notesRead(selection: "notes whose id is \"\(escapeForAppleScript(id))\"", limit: 1, whole: true, offset: offset)
+            return await notesRead(selection: "notes whose id is \"\(escapeForAppleScript(id))\"", limit: 1, whole: true, offset: offset, context: context)
         }
         if let title = input["title"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
-            return await notesRead(selection: "notes whose name is \"\(escapeForAppleScript(title))\"", limit: 1, whole: true)
+            return await notesRead(selection: "notes whose name is \"\(escapeForAppleScript(title))\"", limit: 1, whole: true, context: context)
         }
         guard let query = input["query"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
-            return await notesRead(selection: "notes", limit: limit, whole: false)
+            return await notesRead(selection: "notes", limit: limit, whole: false, context: context)
         }
         let q = escapeForAppleScript(query)
-        return await notesRead(selection: "notes whose (name contains \"\(q)\") or (body contains \"\(q)\")", limit: limit, whole: false)
+        return await notesRead(selection: "notes whose (name contains \"\(q)\") or (body contains \"\(q)\")", limit: limit, whole: false, context: context)
     }
 
-    /// JSON protects all fields. A first line matching the name (after trimming)
-    /// is elided before paging, with `title_line_elided` recording the omission.
-    /// Offsets and totals count stored UTF-16 units, including that title line;
-    /// page boundaries expand to whole composed characters so Unicode is never split.
-    private static func notesRead(selection: String, limit: Int, whole: Bool, offset: Int = 0) async -> JSONValue {
+    /// JSON protects all fields. A first line matching the name (after trimming) is elided before paging, with `title_line_elided` recording the omission.
+    /// Offsets and totals count stored UTF-16 units, including that title line; page boundaries expand to whole composed characters so Unicode is never split.
+    private static func notesRead(selection: String, limit: Int, whole: Bool, offset: Int = 0, context: MacOperationContext) async -> JSONValue {
         let source = """
         use framework "Foundation"
         use scripting additions
@@ -376,7 +380,8 @@ extension MacAppleScriptBridge {
                     if pageLength > 0 then set pageRange to fullBody's rangeOfComposedCharacterSequencesForRange:pageRange
                     set bp to (fullBody's substringWithRange:pageRange) as string
                     set nextOffset to (location of pageRange) + (|length| of pageRange)
-                    set row to current application's NSMutableDictionary's dictionaryWithObjects:{nm, bp, md, fd, nid, location of pageRange, bodyTotal} forKeys:{"name", bodyKey, "modified_at", "folder", "id", "body_offset", "body_total"}
+                    set row to current application's NSMutableDictionary's dictionaryWithObjects:{nm, bp, md, fd, nid, location of pageRange, bodyTotal} \
+        forKeys:{"name", bodyKey, "modified_at", "folder", "id", "body_offset", "body_total"}
                     row's setObject:(current application's NSNumber's numberWithBool:titleLineElided) forKey:"title_line_elided"
                     row's setObject:(current application's NSNumber's numberWithBool:(nextOffset < bodyTotal)) forKey:"truncated"
                     if nextOffset < bodyTotal then row's setObject:nextOffset forKey:"next_body_offset"
@@ -393,7 +398,7 @@ extension MacAppleScriptBridge {
         return (current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)) as string
         """
         do {
-            let raw = try await runAppleScript(source, bundleID: "com.apple.Notes")
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Notes", context: context)
             if let setup = readSetupEnvelope(raw: raw, integration: "notes") { return setup }
             if raw == "__NATIVEAGENT_NOTES_INVALID_OFFSET__" {
                 return failedEnvelope(integration: "notes", reason: "invalid_note_body_offset")
@@ -409,9 +414,11 @@ extension MacAppleScriptBridge {
                 "gaps": .array(gaps.map(JSONValue.string)), "total_is_complete": .bool(gaps.isEmpty),
             ]
             if total > Int64(notes.count) { result["message"] = .string("Showing \(notes.count) of \(total); narrow with query, or read one with title.") }
-            // Nothing by that title or id is an answer (count 0), not an error (drive wave 10-28).
+            // No matching title or ID is a successful empty read.
             if whole && notes.isEmpty && gaps.isEmpty { result["message"] = .string("No note has that title or id.") }
-            if !gaps.isEmpty { result["message"] = .string("Readable notes returned with named gaps. Missing notes and the complete match total are unknown; repair the reported Notes reads.") }
+            if !gaps.isEmpty { result["message"] = .string("""
+                Readable notes returned with named gaps. Missing notes and the complete match total are unknown; repair the reported Notes reads.
+                """) }
             return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "notes", app: app)
@@ -420,10 +427,7 @@ extension MacAppleScriptBridge {
         }
     }
 
-    /// Create a new note. Required: "title", "body". Optional: "folder"
-    /// (defaults to Notes' default account's default folder).
-    /// Returns: {status, action: "created", title}.
-    public static func notesCreate(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func notesCreate(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         guard let title = input["title"]?.scalarText, !title.isEmpty else {
             return failedEnvelope(integration: "notes", reason: "missing_title")
         }
@@ -458,7 +462,8 @@ extension MacAppleScriptBridge {
             set targetAccount to default account
             if targetAccount is missing value then error "Notes has no default account; choose its default account in Notes before creating a note."
             set targetFolder to default folder of targetAccount
-            if targetFolder is missing value then error "The default Notes account has no default folder; make that destination available in Notes before creating a note."
+            if targetFolder is missing value then error "The default Notes account has no default folder; make that destination available in Notes before \
+            creating a note."
             """
         }
         let source = """
@@ -473,7 +478,7 @@ extension MacAppleScriptBridge {
         end tell
         """
         do {
-            let raw = try await runAppleScript(source, bundleID: "com.apple.Notes")
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Notes", context: context)
             if let requestedFolder, folderWasRequested, raw.hasPrefix(Self.notesFolderMissingSentinel) {
                 let names = raw.dropFirst(Self.notesFolderMissingSentinel.count)
                     .components(separatedBy: "###")
@@ -489,8 +494,7 @@ extension MacAppleScriptBridge {
                     "available_folders": .array(names.map { .string($0) }),
                 ])
             }
-            // The new note's own id rides on the receipt: the next step reads
-            // or changes exactly it, no search needed (drive wave 10-28).
+            // Return the new note's own ID so later reads and mutations cannot select another note.
             guard raw.hasPrefix("created|"), raw.count > "created|".count else {
                 return .object(["status": .string("outcome_unknown"), "integration": .string("notes"),
                     "effects": .string("unknown"), "reason": .string("unexpected_note_create_result"),
@@ -511,8 +515,8 @@ extension MacAppleScriptBridge {
         }
     }
 
-    /// Select one exact note for an update or reversible deletion.
-    public static func notesModify(input: [String: JSONValue], deleting: Bool) async throws -> JSONValue {
+    /// Updates and reversible deletion require one exact note.
+    public static func notesModify(input: [String: JSONValue], deleting: Bool, context: MacOperationContext) async throws -> JSONValue {
         let noteID = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = input["title"]?.scalarText ?? ""
         guard !noteID.isEmpty || !title.isEmpty else {
@@ -528,12 +532,9 @@ extension MacAppleScriptBridge {
             return failedEnvelope(integration: "notes", reason: "body_and_append_mutually_exclusive")
         }
         let titleAS = escapeForAppleScript(title)
-        // Build the body-mutation statement (empty when neither body nor
-        // append was passed — rename-only path).
         let bodyStmt: String
-        // Notes derives its name from the first HTML line, so a body write
-        // keeps that line (read from the exact note by ID) unless the new body
-        // already starts with the note's name.
+        // Notes derives its name from the first HTML line, so a body write keeps that line (read from the exact note by ID) unless the new body already starts
+        // with the note's name.
         let titleHTMLStmt = """
                 set titleHTML to ""
                 repeat with titleCharacter in characters of ((name of targetNote) as text)
@@ -568,10 +569,8 @@ extension MacAppleScriptBridge {
             let appendAS = escapeForAppleScript(notesHTML(append.trimmingCharacters(in: .newlines)))
             bodyStmt = "set body of targetNote to ((body of targetNote) as string) & \"<div>\(appendAS)</div>\""
         } else {
-            // Rename-only path — no body mutation.
             bodyStmt = ""
         }
-        // Build the optional rename statement.
         let renameStmt: String
         if let newTitle = newTitle, !newTitle.isEmpty {
             let newTitleAS = escapeForAppleScript(newTitle)
@@ -600,7 +599,8 @@ extension MacAppleScriptBridge {
                     set finalName to (name of targetNote) as text
                     receipt's setObject:finalName forKey:"title"
                 on error errText number errNum
-                    set readback to current application's NSDictionary's dictionaryWithObjects:{"failed", errText, errNum} forKeys:{"status", "error", "error_code"}
+                    set readback to current application's NSDictionary's dictionaryWithObjects:{"failed", errText, errNum} forKeys:{"status", "error", \
+        "error_code"}
                     receipt's setObject:readback forKey:"readback"
                 end try
             end if
@@ -609,7 +609,7 @@ extension MacAppleScriptBridge {
         return (current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)) as string
         """
         do {
-            let raw = try await runAppleScript(source, bundleID: "com.apple.Notes").trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw = try await runAppleScript(source, bundleID: "com.apple.Notes", context: context).trimmingCharacters(in: .whitespacesAndNewlines)
             let parts = raw.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             if raw == "0" { return failedEnvelope(integration: "notes", reason: "no_matching_note") }
             // Ambiguous note titles leave all matches unchanged.
@@ -629,7 +629,10 @@ extension MacAppleScriptBridge {
                       case .string? = fields["error"], case .int? = fields["error_code"], result["title"] == nil else {
                     return notesMutationUnknown(input: input, deleting: deleting)
                 }
-                result["message"] = .string("The note was updated, but Notes could not read its resulting title. Read this exact id before relying on its current metadata; do not repeat the update.")
+                result["message"] = .string("""
+                    The note was updated, but Notes could not read its resulting title. Read this exact id before relying on its current metadata; do not \
+                    repeat the update.
+                    """)
             } else if case .string? = result["title"] {
                 // The name came from Notes, including a legitimately empty name.
             } else { return notesMutationUnknown(input: input, deleting: deleting) }

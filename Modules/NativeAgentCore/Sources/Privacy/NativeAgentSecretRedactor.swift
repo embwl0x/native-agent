@@ -2,10 +2,9 @@ import PersistenceCore
 import NativeAgentShared
 import CryptoKit
 import Foundation
-// Blueprint: | `NativeAgentSecretRedactor.swift` | Canonical credential text redaction and shared secret detection: exact script-input names, broader audit/card names, audit token/JWT scanning and recursive script-input paths |
+// Blueprint: | `NativeAgentSecretRedactor.swift` | Canonical credential recognition and redaction. |
 
-/// Canonical redaction contract for durable local receipts and activity feeds.
-/// Shared credential recognition retains digest-bearing receipt replacements.
+/// Canonical redaction contract for durable local receipts and activity feeds. Shared credential recognition retains digest-bearing receipt replacements.
 public enum NativeAgentSecretRedactor {
     public static func redactText(_ value: String) -> String {
         TurnSecretRedactor.redactText(value, patterns: TurnSecretRedactor.credentialPatterns, replacement: digestReplacement)
@@ -38,8 +37,6 @@ public enum NativeAgentSecretRedactor {
         return (common + extra).contains { use == .scriptInput ? key == $0 : key.contains($0) }
     }
 
-    /// The first place a script's input carries a key or token: a field
-    /// named as one, or a value shaped like one.
     public static func secretPath(_ value: JSONValue, at path: String = "input") -> String? {
         switch value {
         case .string(let text): return redactText(text) == text && !containsAuditSecret(text) ? nil : path
@@ -71,8 +68,7 @@ public enum NativeAgentSecretRedactor {
         return false
     }
 
-    /// Audit JWT candidates are bounded base64url triplets with JSON objects
-    /// for header and payload, so ordinary dotted paths cannot qualify.
+    /// Audit JWT candidates are bounded base64url triplets with JSON objects for header and payload, so ordinary dotted paths cannot qualify.
     private static func containsValidJWT(in value: String) -> Bool {
         let pattern = #"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }

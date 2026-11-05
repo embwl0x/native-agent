@@ -5,18 +5,17 @@ import PersistenceCore
 import TurnTrace
 import Transcripts
 import Synchronization
-// Blueprint: | `SessionHistoryReader.swift` | `SessionHistoryReader` actor; whole-transcript replay without a head cursor; exact-byte bounded prompt-row memo shares decoded immutable messages and lazy rendering across turns; exclusions read this turn's transcript; `messages`, `messagesWithStats`; damaged provenance withholds decoded messages through checked-history results; initialization leaves retired middle-index files untouched |
+// Blueprint: | `SessionHistoryReader.swift` | `SessionHistoryReader`, `messages`, `messagesWithStats`. |
 
 // MARK: - ChatMessage
 
 public struct ChatMessage: Sendable, Codable {
-    public let role: String           // 'user' | 'assistant' | 'system'
+    public let role: String
     public let content: String
-    public let timestamp: String      // ISO8601
+    public let timestamp: String
     public let extras: JSONValue?
 
-    // This memo belongs to these immutable fields, never a session, row id or
-    // file timestamp. Codable transports only the original four fields.
+    // Memoize only immutable row fields; Codable transports the original four fields without cached state.
     private let rendering = HistoryRenderingMemo()
     private enum CodingKeys: String, CodingKey { case role, content, timestamp, extras }
 
@@ -52,7 +51,7 @@ private final class HistoryRenderingMemo: Sendable {
 }
 
 extension ChatMessage {
-    /// The saved row is the only identity. Missing identity remains unavailable.
+    /// The saved row is the only identity; missing identity remains unavailable.
     package func historyIdentity() -> String? {
         if case .object(let record)? = extras,
            case .string(let id)? = record["id"], !id.isEmpty {
@@ -68,17 +67,13 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
     public let bytesRead: Int64
     public let linesRead: Int
     public let decodedCount: Int
-    /// Rows present in the sampled bytes that could not be decoded as JSON.
-    /// They remain on disk; this is visibility, never an automatic repair.
+    /// Undecodable rows remain on disk; diagnostics expose them without automatic repair.
     public let malformedRowCount: Int
-    /// Valid JSON rows that are not usable chat message objects.
     public let invalidShapeRowCount: Int
-    /// Exact selected line bytes, identified without retaining private speech in diagnostics.
+    /// Identify exact selected bytes without retaining private speech in diagnostics.
     public let damageEvidence: [String]
     public let returnedCount: Int
-    /// Rows skipped because they belong to the current run. This is
-    /// the number that separates "fresh session, nothing to load" from
-    /// "history existed and decoded to nothing" in the turn trace.
+    /// Count current-run exclusions separately so empty history cannot hide decoded rows intentionally skipped.
     public let excludedByRunId: Int
     public let truncated: Bool
     public let decodeCacheHits: Int
@@ -129,7 +124,11 @@ public struct SessionHistoryReadResult: Sendable {
     public func checkedMessages() throws -> [ChatMessage] {
         guard !["invalid_session_id", "read_failed", "invalid_encoding", "damaged_history"].contains(stats.mode),
               stats.malformedRowCount == 0, stats.invalidShapeRowCount == 0 else {
-            throw ChatSessionCompactionTranscriptError(errorDescription: "Conversation history is unavailable (\(stats.mode), \(stats.malformedRowCount) malformed rows, \(stats.invalidShapeRowCount) invalid message rows). \(stats.damageEvidence.joined(separator: "; ")). Repair the retained transcript before reading it.")
+            throw SessionTranscriptError(
+                errorDescription: """
+                    Conversation history is unavailable (\(stats.mode), \(stats.malformedRowCount) malformed rows, \(stats.invalidShapeRowCount) invalid \
+                    message rows). \(stats.damageEvidence.joined(separator: "; ")). Repair the retained transcript before reading it.
+                    """)
         }
         return messages
     }
@@ -145,13 +144,8 @@ private struct SessionHistoryLineReadResult: Sendable {
 
 // MARK: - SessionHistoryReader
 
-/// Reads chat session history from disk. Sessions live in
-/// a single JSON list at `data/chat/sessions.json` and
-/// per-session messages at `data/chat/messages/<id>.jsonl`.
 public actor SessionHistoryReader {
-    // A pure transform memo, shared even when a surface creates a fresh client.
-    // Exact UTF-8 keys include metadata, attachments and sent-context bytes.
-    // No file state is cached: each call still selects from its supplied read.
+    // Memoize pure transforms by exact UTF-8 input, never file state; every call selects from its supplied read.
     private static let promptRowMemo = Mutex<[Data: DecodedRow]>([:])
     private static let promptRowMemoMaximumBytes = 8 * 1024 * 1024
     private static let promptRowMemoMaximumRows = 2_048
@@ -159,21 +153,14 @@ public actor SessionHistoryReader {
     private static let relevanceSampleMaximumBytes = 96 * 1024
     private static let relevanceSampleWindowCount = 8
 
-    /// Shared so turn assembly resolves the model-window policy against
-    /// the same data root as the history reader.
+    /// Use the history reader's data root when resolving model-window policy.
     package nonisolated let dataRoot: URL
 
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
     }
 
-    /// Read messages for a session from `data/chat/messages/<id>.jsonl`.
-    /// Returns chronological order (oldest first). If `limit` is set, only
-    /// the LAST `limit` messages are returned (still in chronological order).
-    ///
-    /// `excludingRunId` is used by live chat turns after the user row has
-    /// already been persisted. It prevents the current turn from being rendered
-    /// as "prior" history inside the system prompt.
+    /// Read oldest-first, tail-bounded when requested; exclude the already-persisted current run so it cannot replay as prior history.
     public func messages(
         forSessionId id: String,
         limit: Int? = nil,
@@ -216,9 +203,7 @@ public actor SessionHistoryReader {
         let truncatedRead: Bool
         let mode: String
         if let limit, limit > 0, !strictEvidence {
-            // A bounded tail: only the bytes the selection needs, from the end.
-            // A file that will not open, seek or read whole is read_failed,
-            // never an empty tail.
+            // Read only the tail selection's bytes; failed open, seek or read remains read_failed, never an empty tail.
             let handle: FileHandle
             do { handle = try FileHandle(forReadingFrom: path) }
             catch let error as CocoaError where error.isFileAbsent {
@@ -304,11 +289,8 @@ public actor SessionHistoryReader {
         )
     }
 
-    /// Check provenance across the whole donor, retaining only a bounded tail.
-    /// A stale index cannot certify rows outside the prompt's sampled window.
-    /// Unreadable, damaged, or changing evidence throws; participant mismatch
-    /// or oversized rows disable handoff. The row limit is independent of the
-    /// retained tail budget and admits 40,000-character Unicode recollections.
+    /// Validate the whole donor because a stale index cannot certify rows outside the sampled prompt.
+    /// Unreadable, damaged or changing evidence throws; participant mismatch and oversized rows disable handoff.
     package nonisolated static func continuityMessages(
         forSessionId id: String,
         dataRoot: URL,
@@ -373,20 +355,17 @@ public actor SessionHistoryReader {
         return tail.map(\.message)
     }
 
-    /// The one read of a session's live transcript for a turn. Every prompt
-    /// selection below runs over these bytes, whether they come from here or
-    /// from the compactor's validated read of the same file this turn. nil:
-    /// no transcript, which selects as empty history. Invalid ids fail the read.
+    /// Select history from one transcript read, from the supplied bytes; absence is empty history, invalid IDs fail.
     public func transcriptBytes(forSessionId id: String) throws -> Data? {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
-            throw ChatSessionCompactionTranscriptError(errorDescription: "Conversation history has an invalid session id. Select a valid conversation before continuing.")
+            throw SessionTranscriptError(
+                errorDescription: "Conversation history has an invalid session id. Select a valid conversation before continuing.")
         }
         let path = dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")
         do { return try Data(contentsOf: path) } catch CocoaError.fileReadNoSuchFile { return nil }
     }
 
-    /// Replay reads the whole current transcript. Only its compaction owner
-    /// replaces old turns with recollection; no read limit can move the head.
+    /// Replay reads preserve every retained transcript row.
     public nonisolated func promptMessagesWithStats(
         transcript: Data?,
         excludingRunId: String? = nil,
@@ -421,11 +400,16 @@ public actor SessionHistoryReader {
             }
             return row
         }
-        // JSONL's LF is one byte, never inside a UTF-8 scalar. Avoid walking
-        // every grapheme of megabytes of unchanged text just to find rows.
-        // Preserve String's existing CR/CRLF segmentation when CR is present.
+        // Split JSONL on byte LF without walking every grapheme; preserve String's CR/CRLF segmentation when CR is present.
         guard let decodedTranscript = String(data: transcript, encoding: .utf8) else {
-            return (SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "invalid_encoding", sourceBytes: Int64(transcript.count), bytesRead: Int64(transcript.count))), nil)
+            return (SessionHistoryReadResult(
+                messages: [],
+                stats: SessionHistoryReadStats(
+                    mode: "invalid_encoding",
+                    sourceBytes: Int64(transcript.count),
+                    bytesRead: Int64(transcript.count)
+                )
+            ), nil)
         }
         let lines = decodedTranscript.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         let prompt = Self.selectionResult(
@@ -435,8 +419,7 @@ public actor SessionHistoryReader {
         let relevance = relevanceWhen(prompt) ? relevanceMessagesWithStats(
             size: transcript.count, excludingRunId: excludingRunId, decode: decode
         ) { transcript.subdata(in: (transcript.startIndex + $0)..<(transcript.startIndex + $0 + $1)) } : nil
-        // Late calls may replace the memo's working set, never transcript state.
-        // That can cost a miss, but cannot publish old history into a new read.
+        // Late memo updates affect only cache misses; they cannot publish stale transcript state.
         Self.promptRowMemo.withLock { $0 = retainedRows }
         let stats = prompt.stats
         let measured = SessionHistoryReadResult(messages: prompt.messages, stats: SessionHistoryReadStats(
@@ -450,12 +433,8 @@ public actor SessionHistoryReader {
         return (measured, relevance)
     }
 
-    /// Return bounded candidates for semantic "earlier session" ranking.
-    /// Small transcripts are cheap enough to decode exactly. Large transcripts
-    /// are sampled through fixed-size interior windows; exact older wording is
-    /// still available through the explicit search_chat_history tool. JSONL
-    /// remains authoritative and this projection owns no stale sidecar state.
-    /// From the file, reading only the windows it samples.
+    /// Bound semantic candidates with interior windows for large transcripts; explicit search still reaches exact older wording.
+    /// JSONL stays authoritative without a sidecar index.
     public func relevanceMessagesWithStats(
         forSessionId id: String,
         excludingRunId: String? = nil,
@@ -486,9 +465,7 @@ public actor SessionHistoryReader {
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeId).jsonl")
         let parent = path.resolvingSymlinksInPath().deletingLastPathComponent()
-        let compacted = path.lastPathComponent.hasPrefix("messages.compact.") && path.pathExtension == "jsonl"
-            && parent == dataRoot.appendingPathComponent("chat/sessions/\(safeId)").resolvingSymlinksInPath()
-        guard compacted || ["chat/messages", "chat/archive/messages", "chat/archive/originals"].contains(where: {
+        guard ["chat/messages", "chat/archive/messages"].contains(where: {
             parent == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath()
         }) else { throw CocoaError(.fileReadNoPermission) }
         return path
@@ -561,10 +538,7 @@ public actor SessionHistoryReader {
         )
     }
 
-    /// The last lines, read back from the end in 64 KB steps, each counted
-    /// once, until at least `minimumLineCount` complete rows or the byte
-    /// budget. `bytes(offset, count)` reads from bytes in hand or from the
-    /// file alike, so a tail never has to read the whole transcript.
+    /// Count tail lines once in bounded backward steps so selecting a tail never requires the whole transcript.
     private nonisolated static func tailLinesResult(
         size: Int,
         minimumLineCount: Int,
@@ -591,7 +565,8 @@ public actor SessionHistoryReader {
         var complete = chunks.reversed().reduce(into: Data(capacity: size - offset)) { $0.append($1) }
         if offset > 0, let newline = complete.firstIndex(of: 10) { complete.removeSubrange(...newline) }
         guard let text = String(data: complete, encoding: .utf8) else {
-            return SessionHistoryLineReadResult(lines: [], sourceBytes: Int64(size), bytesRead: Int64(size - offset), truncated: offset > 0, invalidEncoding: true)
+            return SessionHistoryLineReadResult(lines: [], sourceBytes: Int64(size), bytesRead: Int64(size - offset), truncated: offset > 0,
+                invalidEncoding: true)
         }
         var lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         if lines.count > minimumLineCount {
@@ -607,7 +582,8 @@ public actor SessionHistoryReader {
 
     private nonisolated static func allLinesResult(from data: Data) -> SessionHistoryLineReadResult {
         guard let text = String(data: data, encoding: .utf8) else {
-            return SessionHistoryLineReadResult(lines: [], sourceBytes: Int64(data.count), bytesRead: Int64(data.count), truncated: false, invalidEncoding: true)
+            return SessionHistoryLineReadResult(lines: [], sourceBytes: Int64(data.count), bytesRead: Int64(data.count), truncated: false,
+                invalidEncoding: true)
         }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         return SessionHistoryLineReadResult(
@@ -618,11 +594,7 @@ public actor SessionHistoryReader {
         )
     }
 
-    /// Samples complete JSONL rows from evenly spaced interior windows. Any
-    /// row crossing a window boundary is intentionally dropped rather than
-    /// parsed as corrupt. Giant tool rows therefore consume at most one fixed
-    /// window and cannot force the reader to chase their boundary. Only the
-    /// sampled windows are read, from the file or from bytes in hand alike.
+    /// Drop rows crossing sampled windows rather than calling them corrupt; giant tool rows cannot force boundary chasing.
     private nonisolated static func sampledLinesResult(
         size: Int,
         maximumBytes: Int,
@@ -687,7 +659,7 @@ public actor SessionHistoryReader {
         }
     }
 
-    /// Parse one row's canonical fields and raw-object context counts; preserve invalid JSON shapes.
+    /// Preserve invalid JSON shapes while parsing canonical fields and raw-object context counts.
     package nonisolated static func decodeRow(_ line: String) -> DecodedRow {
         let lineData = Data(line.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
         var statistics = (totalChars: 0, messageCount: 0)
@@ -773,4 +745,11 @@ public actor SessionHistoryReader {
         return false
     }
 
+}
+
+public extension Notification.Name {
+    /// Notify context readouts after a turn lands so they can refresh.
+    static let chatTurnCompleted = Notification.Name("chatTurnCompleted")
+    /// Transcript appends and rewrites invalidate projections; object identifies the session.
+    static let nativeAgentChatTranscriptDidChange = Notification.Name("NativeAgent.chatTranscriptDidChange")
 }

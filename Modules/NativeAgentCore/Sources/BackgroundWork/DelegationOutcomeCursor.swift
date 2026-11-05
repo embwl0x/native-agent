@@ -11,14 +11,9 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         /// Exact handled job ids, retained while receipts can reappear.
         public var cardedIDs: Set<String>
         public var deliveryReceiptVersions: [String: String] = [:]
-        /// The outcome each id was carded UNDER (raw `DelegationOutcome`), so a
-        /// job that later presents a more alarming outcome is carded again.
-        /// Ids recorded before this field existed have no entry and never
-        /// re-card — the cursor cannot prove what their card said.
+        /// Recorded outcome enables escalation; without it the cursor cannot prove the card’s severity.
         public var cardedOutcomes: [String: String]
-        /// Open jobs whose stalled liveness warning has landed. Unlike
-        /// terminal outcome ids, these are removed after a proven recovery so
-        /// a later stall can speak again.
+        /// Remove recovered stalls so a later stall can speak again; terminal identities stay settled.
         public var announcedStallIDs: [String]
 
         public init(cardedIDs: Set<String> = [],
@@ -29,7 +24,6 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
             self.announcedStallIDs = announcedStallIDs
         }
     }
-    /// Keyed by store source id (for example "claude", "codex", or "omp").
     public var stores: [String: StoreCursor]
     public init(stores: [String: StoreCursor] = [:]) {
         self.stores = stores
@@ -47,7 +41,6 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         if let deliveryReceiptVersion { stores[source, default: StoreCursor()].deliveryReceiptVersions[id] = deliveryReceiptVersion }
         if let outcome { stores[source, default: StoreCursor()].cardedOutcomes[id] = outcome.rawValue }
     }
-    /// The outcome `id` was carded under, when the cursor recorded one.
     public func cardedOutcome(source: String, id: String) -> DelegationOutcome? {
         store(source).cardedOutcomes[id].flatMap(DelegationOutcome.init(rawValue:))
     }
@@ -67,7 +60,7 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         cursor.announcedStallIDs.removeAll { $0 == id }
         stores[source] = cursor
     }
-    // Codable synthesis would silently rename the keys if a field is renamed).
+    // Keep persisted wire keys explicit so property renames cannot silently change storage.
 
     public static func load(from url: URL) throws -> DelegationOutcomeCursor? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
@@ -132,13 +125,11 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
             "stores": .object(stores),
         ])
     }
-    /// Atomic write — a torn cursor would either re-card everything or skip a
-    /// window, and both are user-visible.
+    /// Atomic writes prevent torn cursors from skipping outcomes or repeating every card.
     public func write(to url: URL) throws {
         try SwiftNativePersistenceCore.writeDataAtomicDurable(toJSON().serializedData(pretty: false), to: url)
     }
-    /// Both bridge writers emit `new Date().toISOString()`; the no-fraction
-    /// variant is the fallback for hand-edited or older records.
+    /// Accept ISO instants with or without fractional seconds.
     public static func parseISO(_ iso: String?) -> Date? {
         guard let iso, !iso.isEmpty else { return nil }
         return NativeTimestampFormat.parseISO8601FractionalFirst(iso)

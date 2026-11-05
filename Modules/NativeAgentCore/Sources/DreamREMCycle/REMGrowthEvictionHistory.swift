@@ -1,60 +1,33 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `REMGrowthEvictionHistory.swift` | `REMGrowthEvictionHistory`: durable original approved-growth eviction records, proposal references and pending reconciliation |
+// Blueprint: | `REMGrowthEvictionHistory.swift` | `REMGrowthEvictionHistory`. |
 
 // MARK: - GROWTH eviction history (item 5)
-//
-// GROWTH.md eviction used to be a one-way door: the oldest ~5,000 characters of
-// her own approved growth were distilled to a <=400-character summary and the
-// original was deleted. The summary is a compression of something she agreed
-// to; the words themselves were gone, and with them any way to ask what the
-// compressed node actually came from.
-//
-// SAME SHAPE AS THE STUDIO JOURNAL AMENDMENT (`studio/journal/amendments.jsonl`,
-// StudioStore.swift): an append-only sidecar beside the store, never a rewrite,
-// with the ORIGINAL kept visible next to what now stands. Here the compressed
-// KG node is what stands and this file is the original, expandable behind it —
-// keyed by the SAME id the node carries, which is how the node points at it.
-//
-// OUTSIDE ACTIVE PERSONA CONTEXT, deliberately: this lives under the DATA root,
-// never under the persona root, so it cannot be re-read into GROWTH.md and
-// cannot reach the compiled persona packet. The eviction exists to reclaim
-// prompt budget — retaining the passage must not hand the budget back.
+// Retain exact evicted writing beside its compressed graph node under the same identity so the summary remains expandable.
+// Keep history outside the persona root so retention cannot return reclaimed prompt weight.
 
-/// Where one history row stands. The record is written BEFORE the KG insert
-/// and the GROWTH splice (fail-closed retention: the passage must be on disk
-/// before anything can destroy it), so at write time the eviction has not
-/// happened yet and the row must not claim it did.
+/// Write retention before graph insertion and GROWTH removal; pending history cannot claim eviction.
 public enum REMGrowthEvictionState: String, Sendable, Codable, Equatable {
-    /// Passage retained, eviction NOT yet performed. If the pass dies here,
-    /// GROWTH.md still holds the text and this row is the only trace.
+    /// Pending means retained only; the source may still be in GROWTH.
     case pending
-    /// The splice succeeded: the passage really did leave GROWTH.md.
+    /// Committed certifies a successful splice.
     case committed
 }
 
-/// One evicted GROWTH.md passage, kept whole.
 public struct REMGrowthEvictionRecord: Sendable, Codable, Equatable {
-    /// The compressed node's id (`growth_<sha256 of the passage>`). The node and
-    /// this record share it — that identity IS the pointer.
+    /// Share the exact source-hash identity between compressed node and retained passage so it serves as the expansion pointer.
     public var id: String
     public var evictedAt: String
-    /// The compressed node's summary — what stands in GROWTH's place.
     public var summary: String
-    /// THE EXACT EVICTED PASSAGE, byte for byte as it left GROWTH.md.
+    /// Preserve the evicted passage byte-for-byte.
     public var passage: String
     public var sourceLines: Int
-    /// The approved proposals whose text is in this passage: where the evicted
-    /// growth came from, so the history expands into its own provenance.
+    /// Keep originating approval IDs so retained growth remains traceable to its authorization.
     public var proposalRefs: [REMGrowthEvictionProposalRef]
-    /// `pending` while only retention has happened; `committed` once the
-    /// GROWTH splice succeeded. Unknown state cannot certify a splice.
+    /// Unknown state cannot certify removal; only committed history can.
     public var state: REMGrowthEvictionState
-    /// Set on a `committed` row that was written by RECONCILIATION rather than
-    /// by the pass that did the splice: the passage is demonstrably gone from
-    /// GROWTH.md, but the process died before it could say so. Marks the row as
-    /// inferred after the fact, never as observed.
+    /// Mark reconciliation explicitly so inferred interrupted completion cannot masquerade as directly observed splice.
     public var reconciled: Bool?
 
     public init(
@@ -77,18 +50,15 @@ public struct REMGrowthEvictionRecord: Sendable, Codable, Equatable {
         self.reconciled = reconciled
     }
 
-    /// True only for an observed or corroborated commit. A pending row with no
-    /// committed row after it means the passage is RETAINED, NOT EVICTED.
+    /// Pending alone means retention, never eviction; require observed or corroborated commit.
     public var isCommitted: Bool { state == .committed }
 }
 
-/// The approval this stretch of GROWTH entered by.
 public struct REMGrowthEvictionProposalRef: Sendable, Codable, Equatable {
     public var proposalId: String
     public var targetDoc: String
     public var createdAt: String
     public var approvalId: String?
-    /// The dream dates the proposal cited when it was drafted.
     public var evidenceDates: [String]
 
     public init(
@@ -106,8 +76,7 @@ public struct REMGrowthEvictionProposalRef: Sendable, Codable, Equatable {
     }
 }
 
-/// Append-only store at `<dataRoot>/growth_history/evictions.jsonl`.
-/// One JSON object per line, flock'd on write, id-deduped.
+/// Append and deduplicate under the file lock so retained history remains ordered and durable.
 public enum REMGrowthEvictionHistory {
     public static func fileURL(dataRoot: URL) -> URL {
         dataRoot
@@ -115,17 +84,13 @@ public enum REMGrowthEvictionHistory {
             .appendingPathComponent("evictions.jsonl")
     }
 
-    /// The pointer a compressed node carries so a reader can find the original.
-    /// Bounded, and stable across passes because the id is the passage hash.
+    /// Use a bounded source-hash pointer so expansion identity remains stable across retries.
     public static func pointer(id: String) -> String {
         "(full passage retained: growth_history/evictions.jsonl#\(id))"
     }
 
-    /// Append one record. Re-appending the same id AND state is a no-op, so a
-    /// pass that wrote the history and then failed at the KG merge retries
-    /// cleanly — while the later `committed` row for that same id still lands.
-    /// THROWS on any write failure — the caller must not splice GROWTH.md
-    /// unless the passage is safely on disk.
+    /// Deduplicate by ID and state so failed merges can retry while later commit records still append.
+    /// Any failed retention write must prevent destructive GROWTH splice.
     public static func append(
         _ record: REMGrowthEvictionRecord,
         dataRoot: URL
@@ -141,38 +106,19 @@ public enum REMGrowthEvictionHistory {
         }
     }
 
-    /// Every retained passage, oldest first. Integrity failures block dependent
-    /// decisions and preserve all source bytes for repair.
+    /// Integrity failures block dependent decisions while preserving source bytes for repair.
     public static func loadAll(dataRoot: URL) throws -> [REMGrowthEvictionRecord] {
         try read(fileURL(dataRoot: dataRoot))
     }
 
-    /// The passage behind one compressed node — what "expand" reads. Returns
-    /// the row whatever its state: a retained-but-not-evicted passage is still
-    /// the passage.
+    /// Expansion returns retained writing regardless of eviction state.
     public static func record(id: String, dataRoot: URL) throws -> REMGrowthEvictionRecord? {
         try loadAll(dataRoot: dataRoot).last { $0.id == id }
     }
 
-    /// REPAIR THE INTERRUPTED SPLICE. The passage leaves GROWTH.md before the
-    /// `committed` row is appended, so a crash (or a failed append) between the
-    /// two leaves an id whose only row says `pending` while the text is already
-    /// gone — a permanent under-claim that no later pass fixed, because eviction
-    /// returns early whenever the file is under the cap.
-    ///
-    /// Run on every REM pass with the CURRENT GROWTH.md body: a pending id with
-    /// no committed row whose exact passage is no longer in that body gets its
-    /// `committed` row appended, marked `reconciled`. A passage still present is
-    /// left alone — that is the retained-not-evicted case the state exists for.
-    /// Returns the number of rows repaired.
-    ///
-    /// ABSENCE FROM THE BODY IS NOT PROOF ON ITS OWN. "Not in this string" is
-    /// also what an empty or truncated read looks like, and that would mark
-    /// EVERY pending row committed in one pass — a permanent false record.
-    /// `kgNodeExists` is the corroborating witness: the distilled node carries
-    /// the same id, and the splice only ever runs after the KG merge, so a
-    /// missing passage WITH its node present is a real interrupted splice.
-    /// Without the node, the row stays pending.
+    /// Reconcile pending history on every pass before size checks can skip repair.
+    /// A missing passage alone cannot prove eviction; require the matching graph node as independent corroboration.
+    /// Keep present passages and uncorroborated absence pending; mark proven interrupted splices reconciled.
     @discardableResult
     public static func reconcilePending(
         growthBody: String,
@@ -220,7 +166,11 @@ public enum REMGrowthEvictionHistory {
         return try data.split(separator: 0x0A).enumerated().map { index, line in
             do { return try decoder.decode(REMGrowthEvictionRecord.self, from: Data(line)) }
             catch {
-                throw PersistenceCoreError.ioFailure("GROWTH eviction history row \(index + 1) at \(url.path) is unreadable: \(error.localizedDescription). Preserve and repair the ledger before retrying")
+                throw PersistenceCoreError.ioFailure(
+                    """
+                        GROWTH eviction history row \(index + 1) at \(url.path) is unreadable: \(error.localizedDescription). Preserve and repair the ledger \
+                        before retrying
+                        """)
             }
         }
     }

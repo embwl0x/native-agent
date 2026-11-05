@@ -273,8 +273,7 @@ public struct MemoryIntegrityReading: Codable, Sendable, Equatable {
         evidence: [BodyEvidenceReference]
     ) {
         let estimate = storeAvailable ? (maintenanceSucceeded == false ? 0.25 : 1) : 0
-        // A successful canonical read proves readability, not successful
-        // maintenance. Presence alone supplies neither proof.
+        // A successful canonical read proves readability, not successful maintenance. Presence alone supplies neither proof.
         let uncertainty = storeAvailable && maintenanceSucceeded == nil ? 1.0 : 0
         self.metrics = BodyBeliefMetrics(
             generatedAt: generatedAt,
@@ -505,7 +504,7 @@ public struct ResourcePressureReading: Codable, Sendable, Equatable {
         thermalPressure: OrganismResourcePressure,
         evidence: [BodyEvidenceReference]
     ) {
-        // Heat alone sets resource pressure; Low Power Mode never changes her work.
+        // Only heat changes resource pressure; Low Power Mode does not budget work.
         self.thermalPressure = thermalPressure
         self.category = thermalPressure
         self.metrics = BodyBeliefMetrics(

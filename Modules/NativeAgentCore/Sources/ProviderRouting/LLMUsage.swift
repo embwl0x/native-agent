@@ -6,16 +6,11 @@ import TurnTrace
 // Blueprint: | `LLMUsage.swift` | Provider usage parsing, counter semantics, streaming accumulation and saturating logical input totals |
 
 // MARK: - LLMUsage
-//
-// Field names are Anthropic-canonical; the OpenAI parsers map equivalents:
-//   - Responses API: input_tokens / output_tokens /
-//     input_tokens_details.cached_tokens → cacheReadInputTokens
-//   - Chat Completions: prompt_tokens / completion_tokens /
-//     prompt_tokens_details.cached_tokens → cacheReadInputTokens
-// OpenAI write counters are subsets of input, distinct from Anthropic's additive creation count.
+// Field names are Anthropic-canonical; the OpenAI parsers map equivalents:   - Responses API: input_tokens / output_tokens /
+// input_tokens_details.cached_tokens → cacheReadInputTokens   - Chat Completions: prompt_tokens / completion_tokens /
+// prompt_tokens_details.cached_tokens → cacheReadInputTokens OpenAI write counters are subsets of input, distinct from Anthropic's additive creation count.
 public struct LLMUsage: Sendable, Equatable {
-    /// Set by the wire parser and retained in receipts: Anthropic counters
-    /// are disjoint on every host.
+    /// Set by the wire parser and retained in receipts: Anthropic counters are disjoint on every host.
     public var additiveInputCounters: Bool
     public var inputTokens: Int?
     public var outputTokens: Int?
@@ -57,12 +52,7 @@ public struct LLMUsage: Sendable, Equatable {
         return provider.lowercased().contains("anthropic")
     }
 
-    /// Logical input occupancy for one provider request.
-    ///
-    /// Anthropic reports uncached, cache-read, and cache-created input as
-    /// disjoint counters. OpenAI-compatible APIs report `inputTokens` as the
-    /// total and expose cached tokens only as a subset, so adding that subset
-    /// would double-count it.
+    /// Anthropic counters are disjoint; OpenAI cached tokens are a subset of input, so adding them would double-count occupancy.
     public func logicalInputTokens(provider: String) -> Int? {
         guard let inputTokens, inputTokens >= 0 else { return nil }
         if additiveInputCounters {
@@ -83,8 +73,6 @@ public struct LLMUsage: Sendable, Equatable {
         return nil
     }
 
-    /// Anthropic Messages API `usage` object (non-streaming response body,
-    /// or streaming `message_start.message.usage` / `message_delta.usage`).
     public static func fromAnthropic(_ obj: [String: Any]?) -> LLMUsage {
         guard let obj else { return LLMUsage() }
         return LLMUsage(
@@ -96,8 +84,6 @@ public struct LLMUsage: Sendable, Equatable {
         )
     }
 
-    /// OpenAI Responses API `response.usage` (arrives on the
-    /// `response.completed` SSE event).
     public static func fromOpenAIResponses(_ obj: [String: Any]?) -> LLMUsage {
         guard let obj else { return LLMUsage() }
         let details = obj["input_tokens_details"] as? [String: Any]
@@ -112,7 +98,6 @@ public struct LLMUsage: Sendable, Equatable {
         )
     }
 
-    /// OpenAI Chat Completions `usage` (api-key adapter, non-streaming).
     public static func fromOpenAIChatCompletions(_ obj: [String: Any]?) -> LLMUsage {
         guard let obj else { return LLMUsage() }
         let details = obj["prompt_tokens_details"] as? [String: Any]
@@ -124,9 +109,8 @@ public struct LLMUsage: Sendable, Equatable {
         )
     }
 
-    /// Streaming accumulator: Anthropic splits usage across `message_start`
-    /// (input + cache fields) and `message_delta` (output_tokens). Later
-    /// non-nil fields win; nil never clobbers a captured value.
+    /// Streaming accumulator: Anthropic splits usage across `message_start` (input + cache fields) and `message_delta` (output_tokens). Later non-nil
+    /// fields win; nil never clobbers a captured value.
     public mutating func merge(_ other: LLMUsage) {
         additiveInputCounters = additiveInputCounters || other.additiveInputCounters
         if let v = other.inputTokens { inputTokens = v }

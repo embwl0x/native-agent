@@ -9,25 +9,42 @@ import NativeAgentShared
 import TrustCenter
 import PersonaEngine
 import Privacy
+import MacControl
 // Blueprint: | `Parts.swift` | PartError and executable Parts access over the shared part reader; shared store access and JSON values |
 
 public enum PartError: Error, LocalizedError {
     case invalid(String)
     case notFound(String)
-    /// The version was staged by this call (committed: the write returned; else the write was attempted and may be on disk) and the call
-    /// did not complete.
+    /// The version was staged by this call (committed: the write returned; else the write was attempted and may be on disk) and the call did not complete.
     case stagedButFailed(digest: String, committed: Bool, why: String)
 
     public var errorDescription: String? {
         switch self {
         case .invalid(let why): return why
-        case .notFound(let name): return "No ability has id or name \(name). Use app {action:\"ability.list\"} to choose an exact id, or ability.save to create one."
+        case .notFound(
+            let name): return "No ability has id or name \(name). Use app {action:\"ability.list\"} to choose an exact id, or ability.save to create one."
         case .stagedButFailed(_, let committed, let why): return "\(committed ? "staged" : "staging attempted"), the call did not complete: \(why)"
         }
     }
 }
 
 extension Parts {
+    /// Dependencies supplied by the originating door, held through every run.
+    public struct Invocation: Sendable {
+        public let host: (any OwnedProgramToolHost)?
+        public var execution: OwnedProgramExecution
+        public let arrived: (@Sendable () -> Arrival?)?
+        public let progressed: (@Sendable () -> Void)?
+        public let openScreenWatch: (@Sendable (MacScreenWatch.Request, Bool) async throws -> MacScreenWatch)?
+        public init(host: (any OwnedProgramToolHost)?, execution: OwnedProgramExecution,
+                    arrived: (@Sendable () -> Arrival?)? = nil,
+                    progressed: (@Sendable () -> Void)? = nil,
+                    openScreenWatch: (@Sendable (MacScreenWatch.Request, Bool) async throws -> MacScreenWatch)? = nil) {
+            self.host = host; self.execution = execution; self.arrived = arrived
+            self.openScreenWatch = openScreenWatch
+            self.progressed = progressed
+        }
+    }
     var store: OwnedProgramStore { OwnedProgramStore(root: root.appendingPathComponent("abilities")) }
     var abilities: AbilityStore { AbilityStore(dataRoot: root) }
 

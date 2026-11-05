@@ -1,13 +1,10 @@
 import Foundation
 import NativeAgentCore
 import MacControl
-// Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` captures nodes and associations from one copied field and the shared person-presence line at the frozen instant |
+// Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` from copied fields |
 
 extension CognitiveSubstrate {
-    /// Build a workspace from the exact field settlement already owned by the
-    /// caller. A microcycle uses this once-settled node set for both selection
-    /// and durability, avoiding a second full 256-node decay/sort at the same
-    /// timestamp without changing canonical state.
+    /// Use the caller's once-settled field for selection and durability so a second decay/sort cannot diverge at the same timestamp.
     func workspaceSnapshot(
         at now: Date,
         settledNodes: [CognitiveNode]
@@ -29,16 +26,14 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// Settle one copied continuity field at an explicit timestamp. The
-    /// resulting snapshot/workspace may be rendered into a frozen provider
-    /// packet without advancing the live field's decay anchors.
+    /// Settle one copied continuity field at an explicit timestamp. The resulting snapshot/workspace may be rendered into a frozen provider packet without
+    /// advancing the live field's decay anchors.
     public func frozenRead(at fixedAt: Date) -> CognitiveFrozenRead {
         let frozenConfiguration = configuration
         let frozenDynamics = dynamics
         let fixedAffect = projectedAffect(at: fixedAt, dynamics: frozenDynamics)
         let fixedMood = derivedMood(at: fixedAt, dynamics: frozenDynamics, affect: fixedAffect)
-        // Sound selection must happen after the capsule has derived this turn's
-        // actual felt mode/valence. Capture its immutable inputs here instead of
+        // Sound selection must happen after the capsule has derived this turn's actual felt mode/valence. Capture its immutable inputs here instead of
         // preselecting with nil/default register values.
         let frozenSoundLandingScores = soundLandingScoreSnapshot()
         let frozenPresentationState = capsulePresentationState
@@ -102,7 +97,7 @@ extension CognitiveSubstrate {
         mood: CognitiveMoodReading,
         affect currentAffect: CognitiveAffectState
     ) -> CognitiveWorkspaceSnapshot {
-        // Classify and score candidates before materializing selected reasons.
+        // Classify and score before selecting so reasons describe the actual ranking.
         let scored = nodes.filter { workspaceEligible($0) }.map { node in
             (
                 node: node,
@@ -294,8 +289,7 @@ extension CognitiveSubstrate {
         case .system: turnKindMultiplier = 0.5
         case .debug: turnKindMultiplier = 0.05
         case .verification: turnKindMultiplier = 0.18
-        // Card copy is real product text and stays findable, but it is
-        // boilerplate she emitted, not something she has to think about.
+        // Card copy is real product text and stays findable, but it is boilerplate the agent emitted, not something to think about.
         case .mechanical: turnKindMultiplier = 0.1
         }
         return (base * turnKindMultiplier).clamped01()
@@ -314,7 +308,7 @@ extension CognitiveSubstrate {
         if turnKind != .live { reasons.append("turn-\(turnKind.rawValue)") }
         if configuration.enabled && currentAffect.taskPressure > 0.4 { reasons.append("task-pressure") }
         if associatedNodeIds.contains(node.id) { reasons.append("spreading-activation") }
-        // Name meaningful mood-congruent contributions in the provenance.
+        // Only meaningful mood congruence earns a provenance reason.
         if moodCongruence(for: node, mood: mood) > Self.moodCongruenceReasonThreshold {
             reasons.append("mood-congruent")
         }

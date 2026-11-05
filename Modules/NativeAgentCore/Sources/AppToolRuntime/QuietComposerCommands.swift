@@ -9,7 +9,7 @@ import PersistenceCore
 import ProviderRouting
 import TrustCenter
 
-// Blueprint: | `QuietComposerCommands.swift` | `QuietComposerCommands`: draft/model/effort/persona/speech commands through composer ports; preview and execution share admission fences |
+// Blueprint: | `QuietComposerCommands.swift` | `QuietComposerCommands`; Composer commands share preview and execution fences |
 
 public protocol QuietComposerModel: Identifiable where ID == String {
     var displayName: String { get }
@@ -58,13 +58,13 @@ public enum QuietComposerCommands {
     ]
 
     @MainActor
-    public static func state<Host: QuietComposerCommandPort>(appModel: Host, sessionId: String = "") async -> [String: JSONValue] {
+    public static func state<Host: QuietComposerCommandPort>(appModel: Host, sessionId: String = "", turn: Turn?) async -> [String: JSONValue] {
         var sessionID = appModel.activeChatSessionId
         if !sessionId.isEmpty {
-            switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel) {
+            switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn) {
             case .success(let found): sessionID = found.id
             case .failure(let refusal):
-                // The resolver's own why; a name no conversation has is not_found.
+                // Keep the resolver's cause; unknown conversation names return not_found.
                 var fields: [String: JSONValue] = if case .object(let fields) = refusal.json { fields } else { [:] }
                 if fields["reason"] == .string("unknown_session") { fields["status"] = .string("not_found") }
                 fields["effects"] = .string("none")
@@ -76,13 +76,10 @@ public enum QuietComposerCommands {
             "conversation": .string(sessionID),
             "on_screen": .bool(sessionID == appModel.activeChatSessionId),
             "busy": .bool(QuietChatSessionCommands.isRunning(sessionID, appModel)),
-            "queued": .array(QuietChatSessionCommands.queuedRows(sessionID, appModel)),
-            "queue_paused": .bool(appModel.macChatTurns.pausedQueueSessions.contains(sessionID)),
             "attachments": .array((appModel.chatPendingAttachments[sessionID] ?? []).map { .string($0.name ?? $0.type) }),
             "draft": .string(draft),
             "draft_characters": .int(Int64(draft.count)),
         ]
-        if let reason = QuietChatSessionCommands.queuePauseReason(sessionID, appModel) { body["queue_paused_reason"] = .string(reason) }
         let presentation = await appModel.quietComposerPresentationState(sessionID: sessionID)
         body.merge(presentation) { _, field in field }
         return body
@@ -91,7 +88,7 @@ public enum QuietComposerCommands {
     /// The same effect-free fences admit both preview and execution.
     @MainActor
     public static func fence<Host: QuietComposerCommandPort>(
-        verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String, appModel: Host
+        verb: String, value: String, sessionId: String, reachesUser: Bool, turnSessionId: String, appModel: Host, turn: Turn
     ) -> (session: String, refusal: Outcome?) {
         if !reachesUser, usersScreenVerbs.contains(verb) {
             return ("", .refuse(
@@ -109,7 +106,7 @@ public enum QuietComposerCommands {
         }
         switch verb {
         case "show_pane":
-            // User closing the pane wins for the rest of that turn.
+            // The user's pane closure wins for the remainder of the turn.
             let turnID = appModel.macChatTurns.activeTurnIDsBySession[turnSessionId]
             if appModel.quietComposerPaneClosed(turnID: turnID) {
                 return ("", .refuse("Work pane", "owner_closed_pane", "The person closed the Work pane this turn, so it stays closed."))
@@ -119,7 +116,7 @@ public enum QuietComposerCommands {
             let element = verb == "send" ? "send button" : "composer draft"
             var sessionID = appModel.activeChatSessionId
             if !sessionId.isEmpty {
-                switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel) {
+                switch QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn) {
                 case .success(let found): sessionID = found.id
                 case .failure:
                     return ("", .refuse(
@@ -128,9 +125,7 @@ public enum QuietComposerCommands {
                     ))
                 }
             }
-            // A conversation User is in holds HIS draft and files: unless the
-            // turn reaches him, she sends her own words there and leaves his
-            // box alone.
+            // User conversations own their drafts/files; turns without user reach send agent text without changing the user's composer.
             if !reachesUser, QuietChatSessionCommands.userIsIn(sessionID, appModel),
                verb == "set_draft" || value.isEmpty {
                 return (sessionID, .refuse(
@@ -141,12 +136,10 @@ public enum QuietComposerCommands {
             }
             return (sessionID, nil)
         case "write_scratch":
-            // The asking turn's own conversation (the one scratchpad_read
-            // reads), or the one she named. A conversation User is in is his,
-            // as his draft is, unless the turn reaches him.
+            // Scratchpad and explicit session resolution must retain user draft ownership unless the turn reaches the user.
             var sessionID = turnSessionId
             if !sessionId.isEmpty {
-                guard case .success(let found) = QuietChatSessionCommands.resolve(sessionId, appModel: appModel) else {
+                guard case .success(let found) = QuietChatSessionCommands.resolve(sessionId, appModel: appModel, turn: turn) else {
                     return ("", .refuse("/scratch", "unknown_session",
                                         "No open conversation has that id or title. chat.list lists them with their ids."))
                 }
@@ -171,10 +164,10 @@ public enum QuietComposerCommands {
     public static func run<Host: QuietComposerCommandPort>(
         verb: String, value: String, choice: String,
         sessionId: String = "", attachments: [URL] = [], reachesUser: Bool = false,
-        turnSessionId: String = "", appModel: Host
+        turnSessionId: String = "", appModel: Host, turn: Turn
     ) async -> Outcome {
         let fenced = fence(verb: verb, value: value, sessionId: sessionId, reachesUser: reachesUser,
-                           turnSessionId: turnSessionId, appModel: appModel)
+                           turnSessionId: turnSessionId, appModel: appModel, turn: turn)
         if let refusal = fenced.refusal { return refusal }
         let sessionID = fenced.session
         switch verb {
@@ -195,10 +188,9 @@ public enum QuietComposerCommands {
                     return .refuse("attach button", "attachment_refused", refusal.message + " Nothing was changed.")
                 }
             }
-            // File intake suspends. Ownership and the exact draft being
-            // changed must still hold in this synchronous mutation step.
+            // File intake suspends. Ownership and the exact draft being changed must still hold in this synchronous mutation step.
             let current = fence(verb: verb, value: value, sessionId: sessionID, reachesUser: reachesUser,
-                                turnSessionId: turnSessionId, appModel: appModel)
+                                turnSessionId: turnSessionId, appModel: appModel, turn: turn)
             if let refusal = current.refusal { return refusal }
             if current.session != sessionID || ((verb == "set_draft" || value.isEmpty)
                 && (appModel.quietComposerDraftRevision(sessionID) != revision
@@ -208,13 +200,15 @@ public enum QuietComposerCommands {
                                "The conversation or draft changed while attachments were being read. Nothing was changed.")
             }
             return verb == "send"
-                ? await send(value, sessionID: sessionID, files: files, appModel: appModel)
+                ? await send(value, sessionID: sessionID, files: files, appModel: appModel, turn: turn)
                 : setDraft(value, sessionID: sessionID, files: files, appModel: appModel)
         case "set_model", "set_think", "set_fast":
             // Bot conversations use their own route, so the global tuple cannot change it.
             let helper: Bool
             do { helper = try SessionConversation.checkedIsHelper(appModel.activeChatSessionId) }
-            catch { return .refuse("model card", "conversation_unavailable", "The conversation's owner could not be read: \(error.localizedDescription). Repair the saved session index before changing its model.") }
+            catch { return .refuse("model card", "conversation_unavailable", """
+                The conversation's owner could not be read: \(error.localizedDescription). Repair the saved session index before changing its model.
+                """) }
             if helper {
                 return .refuse(
                     verb == "set_think" ? "think card" : "model card",
@@ -265,11 +259,11 @@ public enum QuietComposerCommands {
         )
     }
 
-    /// Shared admission owns queueing; only accepted snapshots are cleared.
+    /// Shared admission owns arrivals while the agent works; only accepted snapshots are cleared.
     @MainActor
     private static func send<Host: QuietComposerCommandPort>(
         _ value: String, sessionID: String,
-        files: [NativeAgentShared.MultimodalAttachment], appModel: Host
+        files: [NativeAgentShared.MultimodalAttachment], appModel: Host, turn: Turn
     ) async -> Outcome {
         guard !sessionID.isEmpty else {
             return .refuse("send button", "no_conversation", "No conversation is open.")
@@ -288,30 +282,27 @@ public enum QuietComposerCommands {
         }
         let editedAt = Date()
         let all = staged + files
-        let steer = PeerDataTaint.carried(
-            peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: ChatToolSessionContext.envelope?.surface ?? "chat"),
-            peerID: ChatToolSessionContext.envelope?.verifiedUserId
+        let steer = PeerDataTaint.carried(turn: turn,
+            peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: turn.envelope?.surface ?? "chat"),
+            peerID: turn.envelope?.verifiedUserId
         )
         var origin = QuietChatSessionCommands.agentOrigin
         origin.peerSources = steer.sources
         origin.elevatedPeerSources = steer.elevated
-        let acceptance = await Task.detached { [appModel, message, all, sessionID, origin] in
-            await startAgentTurn(message, attachments: all, sessionID: sessionID, origin: origin, appModel: appModel)
+        let acceptance = await Task.detached { [appModel, message, all, sessionID, origin, turn] in
+            await startAgentTurn(message, attachments: all, sessionID: sessionID, origin: origin, appModel: appModel, turn: turn)
         }.value
         switch acceptance {
-        case .accepted(let accepted), .queued(let accepted, _):
+        case .accepted(let accepted):
             if fromDraft {
                 appModel.clearQuietAcceptedDraft(message, sessionID: accepted, editedAt: editedAt)
             }
             let sent = Set(staged.map(\.id))
             appModel.chatPendingAttachments[sessionID]?.removeAll { sent.contains($0.id) }
-            if case .queued = acceptance {
-                return .done("send button", "Queued in \(accepted): it runs after the reply in progress.")
-            }
             return .done("send button", "Sent into \(accepted).")
         case .rejected(let message):
             return reconcileFailure("send button", "send_rejected", message,
-                instruction: "Read the conversation and its queue to resolve this rejection before sending again.",
+                instruction: "Read the conversation to resolve this rejection before sending again.",
                 next: ["page": .string("chat"), "item": .string(sessionID)], effects: .none)
         }
     }
@@ -320,12 +311,12 @@ public enum QuietComposerCommands {
     @MainActor
     private static func startAgentTurn<Host: QuietComposerCommandPort>(
         _ message: String, attachments: [NativeAgentShared.MultimodalAttachment],
-        sessionID: String, origin: ChatMessageOrigin, appModel: Host
+        sessionID: String, origin: ChatMessageOrigin, appModel: Host, turn: Turn
     ) async -> MacChatTurnAcceptance {
         await appModel.startChatTurn(
             message, attachments: attachments, sessionId: sessionID,
             hideUserBubble: false, requireActiveSession: false,
-            origin: origin
+            origin: origin, parent: turn
         ).acceptance
     }
 
@@ -392,7 +383,7 @@ public enum QuietComposerCommands {
                 "model pane row \"\(item.displayName)\" under \(group.provider)", "model_write_failed", failure,
                 instruction: "Read the saved Chat model selection and resolve the save error before changing it again.", next: ["page": .string("providers")])
         }
-        // The CANONICAL tuple, read back after it landed — not what was asked.
+        // Receipt the canonical landed tuple, not merely the requested selection.
         let after = "\(appModel.chatProvider) · \(appModel.chatModel)"
         return .done(
             "model pane row \"\(item.displayName)\" under \(group.provider)",
@@ -448,7 +439,9 @@ public enum QuietComposerCommands {
         }
         if let failure = await appModel.startQuietSpeech(text) {
             return reconcileFailure("read aloud", "speak_failed", failure,
-                instruction: "Check playback and the reported speech error before speaking again; completion is unverified.", next: ["page": .string("settings")])
+                instruction: """
+                    Check playback and the reported speech error before speaking again; completion is unverified.
+                    """, next: ["page": .string("settings")])
         }
         return .done("read aloud", "Started reading \(text.count) characters aloud. Playback completion is not confirmed.", status: "started")
     }

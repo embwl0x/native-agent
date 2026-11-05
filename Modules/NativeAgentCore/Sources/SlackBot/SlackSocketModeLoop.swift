@@ -3,17 +3,15 @@ import NativeAgentShared
 import BackgroundLoops
 import PersistenceCore
 import os
-// Blueprint: | `SlackSocketModeLoop.swift` | `SlackSocketModeLoop` state, `tick`, `tickOutcome`, socket lifetime and ingress; session cancellation closes pending receives and drains passive work while journal-owned accepted handlers continue |
+// Blueprint: | `SlackSocketModeLoop.swift` | `SlackSocketModeLoop`, `tick`, `tickOutcome`: socket lifetime independent of accepted handlers |
 
 enum SlackSocketSessionClosure: Error, Sendable, Equatable {
     case disconnect(reason: String)
 }
 
 public struct SlackSocketModeLoop: LoopRunner {
-    @TaskLocal static var deferAfterHandling: (@Sendable (@escaping @Sendable () async -> Void) async -> Void)?
-
     public let loopId = "slack_socket_mode"
-    public let interval: TimeInterval
+    public let wake: OrganWake
     public var tickTimeoutOverride: TimeInterval? { 3_900 }
 
     // Recycle healthy socket sessions before the tick watchdog's hang deadline.
@@ -30,12 +28,9 @@ public struct SlackSocketModeLoop: LoopRunner {
     )
 
     static let shortLivedSessionFloor: TimeInterval = 30
-    /// How long a socket-mode ping may wait for its pong before the wait is
-    /// abandoned. Well inside the 25 s ping interval, so a dead socket is
-    /// declared dead on the tick that found it rather than at the next one.
+    /// Stay inside the 25 s ping interval so a dead socket is detected on the same tick.
     static let pingResponseDeadline: TimeInterval = 10
 
-    /// Reconnect spacing for sessions that end without failure backoff.
     static let defaultReconnectInterval: TimeInterval = 15
 
     init(
@@ -48,7 +43,7 @@ public struct SlackSocketModeLoop: LoopRunner {
     ) {
         self.config = config
         self.dataRoot = dataRoot
-        self.interval = interval
+        self.wake = .every(interval)
         self.session = session
         self.progressChatHandler = progressChatHandler
         self.botEventIntake = botEventIntake
@@ -61,8 +56,7 @@ public struct SlackSocketModeLoop: LoopRunner {
 
     public func tickOutcome() async -> LoopTickOutcome {
         guard config.enabled else { return .off("Socket Mode off") }
-        // Recovery only hands each saved accepted message its own lifetime,
-        // as a new one gets; the socket session never waits on or cancels it.
+        // Recovery only hands each saved accepted message its own lifetime, as a new one gets; the socket session never waits on or cancels it.
         do { try await reconcileSavedReplies() }
         catch { await recordError(context: "inbound_recovery", error: error) }
         guard !Task.isCancelled else { return .skipped(reason: "Slack socket mode canceled") }
@@ -167,8 +161,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         let pingTask = Task {
             await pingUntilCancelled(socket: socket)
         }
-        // Every exit path drains the session's own ping;
-        // accepted turns are not the session's and keep running.
+        // Every exit path drains the session's own ping; accepted turns are not the session's and keep running.
         do {
             try await withTaskCancellationHandler {
                 try Task.checkCancellation()
@@ -239,18 +232,15 @@ public struct SlackSocketModeLoop: LoopRunner {
                     await recordIgnoredEnvelope(parsed.detail)
                     continue
                 }
-                // Slack treats ACK as ownership transfer. Persist the complete
-                // admitted message first so a crash after ACK can recover it.
-                // If the journal is unavailable or saturated, leave the
-                // envelope unacknowledged and let Slack retain/redeliver it.
+                // Slack treats ACK as ownership transfer. Persist the complete admitted message first so a crash after ACK can recover it. If the journal is
+                // unavailable or saturated, leave the envelope unacknowledged and let Slack retain/redeliver it.
                 let claim = try await claimInboundBeforeAcknowledging(inbound) {
                     if let envelopeId {
                         try await acknowledge(envelopeId: envelopeId, socket: socket)
                     }
                 }
                 if claim == .alreadyDelivered { continue }
-                // Socket handling stays concurrent (the receive loop must keep
-                // acking envelopes), but it is tracked — see spawnInboundHandling.
+                // Track concurrent handlers while the receive loop keeps acknowledging envelopes.
                 await spawnInboundHandling(inbound)
             }
         }

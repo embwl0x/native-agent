@@ -3,7 +3,7 @@ import CoreGraphics
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `MacFourVerbs+Observation.swift` | `MacFourVerbs`: `screen`, `observedReply`; self-window looks hand off to mounted `visible`, naming the person's app behind their (`appBehindMe`); observed and blind replies preserve failed effect verdicts and confirmed window/process removal across app changes |
+// Blueprint: | `MacFourVerbs+Observation.swift` | `MacFourVerbs`, `screen`, `observedReply`, `visible`, `appBehindMe` |
 
 extension MacFourVerbs {
     // MARK: 1 — EYES
@@ -24,22 +24,20 @@ extension MacFourVerbs {
             + (omitted > 0 ? " (+\(omitted) more)" : "") + "\n"
     }
 
-    /// Render a fresh look with stable ordinals; zoom includes the named section or filters controls without renumbering.
-    public func screen(part: String? = nil, app: String? = nil, structured: Bool = false) async -> MacFourVerbsReply {
-        // The menu bar belongs to the app, not the window, so the window read
-        // never spends its budget there; `part: menu` reads it on purpose.
+    /// Keep stable ordinals through zoom so the same printed address cannot silently retarget a control.
+    public func screen(part: String? = nil, app: String? = nil, structured: Bool = false, turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply {
+        // The menu bar belongs to the app, not the window, so the window read never spends its budget there; `part: menu` reads it on purpose.
         if let part, ["menu", "menus", "menu bar"].contains(Self.normalize(part)) {
             var body: [String: JSONValue] = [:]
             if let app { body["app"] = .string(app) }
             let result: MacControlResult
-            do { result = try await host.dispatch(action: "menu", body: body) } catch {
+            do { result = try await host.dispatch(action: "menu", body: body, turn: turn, context: context) } catch {
                 return MacFourVerbsReply(ok: false, text: "I couldn't read that app's menu bar: \(error).",
                                          detail: ["error": .string("menu_unavailable"), "message": .string("\(error)")])
             }
             guard result.ok else {
                 if result.error == "app_not_running", let app {
-                    // The menu reader keeps its strict target precondition;
-                    // through look, a stopped app is an observation of absence.
+                    // The menu reader keeps its strict target precondition; through look, a stopped app is an observation of absence.
                     let message = Self.string(Self.object(result.output)["message"]) ?? "\(app) is not running."
                     return MacFourVerbsReply(ok: true, text: message + " Nothing was launched or opened.",
                         detail: ["status": .string("ok"), "app": .string(app), "running": .bool(false)])
@@ -65,7 +63,7 @@ extension MacFourVerbs {
                 detail: ["menu_items": .int(Int64(rows.count))]
             )
         }
-        switch await sight(part: part, app: app, requiresWindow: false) {
+        switch await sight(part: part, app: app, requiresWindow: false, turn: turn, context: context) {
         case .blind(let reply):
             return reply
         case .seen(let sighting):
@@ -97,10 +95,11 @@ extension MacFourVerbs {
         before: Sighting?,
         afterPart: String? = nil,
         pointerTarget: String? = nil,
-        /// A pointer press: judged by `MacActClosedLoop.pressEvidence`.
-        pressed: ActTarget? = nil
+        /// Use the shared press judge so pointer and semantic actions require the same target-owned effect evidence.
+        pressed: ActTarget? = nil,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
-        switch await sight(part: afterPart) {
+        switch await sight(part: afterPart, turn: turn, context: context) {
         case .blind(let reply):
             let output = Self.object(result.output)
             return MacFourVerbsReply(
@@ -115,8 +114,7 @@ extension MacFourVerbs {
             let mechanism = Self.object(result.output)
             var detail = Self.operationDetail(result)
             detail["observed_after"] = .bool(true)
-            // The fresh screen is a witness only. Verification comes from
-            // the declared effect's AX readback, never a render or pixel delta.
+            // The fresh screen is a witness only. Verification comes from the declared effect's AX readback, never a render or pixel delta.
             detail["screen_changed"] = before.map { .bool($0.effectRender != after.effectRender) } ?? .null
             var verdict: MacActClosedLoop.ActClassification?
             if let pointerTarget, let before {
@@ -130,7 +128,7 @@ extension MacFourVerbs {
                 detail["pointer_on_target"] = inside.map(JSONValue.bool) ?? .null
             } else if let pressed, let before, mechanism["verified"] != .bool(true) {
                 verdict = await Self.pressVerdict(pressed, before: before, after: after) {
-                    if case .seen(let again) = await sight(part: afterPart) { return again.percept }
+                    if case .seen(let again) = await sight(part: afterPart, turn: turn, context: context) { return again.percept }
                     return nil
                 }
             }
@@ -148,10 +146,8 @@ extension MacFourVerbs {
         }
     }
 
-    /// Pointer and AX presses declare the same surface effect, judged from AX.
-    /// Only target-linked content counts; an unrelated screen delta cannot
-    /// prove the press. A target-linked readout also has to read the same again:
-    /// when it is the only evidence, the screen is looked at once more.
+    /// Pointer and AX presses declare the same surface effect, judged from AX. Only target-linked content counts; an unrelated screen delta cannot prove the
+    /// press. A target-linked readout also has to read the same again: when it is the only evidence, the screen is looked at once more.
     static func pressVerdict(
         _ pressed: ActTarget, before: Sighting, after: Sighting, again: () async -> MacLookPercept?
     ) async -> MacActClosedLoop.ActClassification {
@@ -184,12 +180,8 @@ extension MacFourVerbs {
 
     // MARK: - One sighting
 
-    /// Everything ONE verb call needs from ONE look: the render she reads, the
-    /// resolvable targets behind it, and the bookkeeping (frame id, handles)
-    /// that stays on this side of the wall. Scratch for the duration of a single
-    /// call — never stored, never carried across calls.
-    /// A blind result has no window targets. For a look, a stopped or
-    /// windowless app is still a successful observation; acts require a window.
+    /// Keep one call's render and target bookkeeping together without persisting handles across calls. Windowless looks remain valid observations; acts still
+    /// require a window.
     enum Sighted {
         case seen(Sighting)
         case blind(MacFourVerbsReply)
@@ -197,8 +189,7 @@ extension MacFourVerbs {
 
     struct Sighting {
         let render: String
-        /// The screen's content alone — no running-apps, Act or provenance line,
-        /// no frame id — so `wait` matches and compares what the app shows.
+        /// Match waits against screen content only; app lists, provenance and frame IDs are not app-state changes.
         let effectRender: String
         let pointer: MacPointerPosition?
         let place: String
@@ -214,45 +205,39 @@ extension MacFourVerbs {
         let targets: [ActTarget]
         let frameId: String
         let zoomNote: String?
-        /// Already-redacted canonical handles, used by the workspace to bind
-        /// selections. Normal prose screen calls do not emit this extra data.
+        /// Already-redacted canonical handles, used by the workspace to bind selections. Normal prose screen calls do not emit this extra data.
         let controls: JSONValue
         let detail: [String: JSONValue]
-        /// Window kind used as the app-map key.
+        /// Use window kind for map identity so content titles cannot enter its key.
         var windowKind: String? = nil
-        /// Where keyboard focus is in this read (same paths as targets' sourceAXPath).
+        /// Focus shares target sourceAXPath ordering so it names an element in this same observation.
         var focusPath: [Int]? = nil
-        /// Handles of the editable fields in this read ("text" alone also covers labels).
+        /// Track editability explicitly because the rendered text kind also includes noneditable labels.
         var editableHandles: Set<String> = []
         /// Keyboard focus may be (or is) a password field. Unknown counts as secure.
         var focusSecure: Bool = true
-        /// Other apps' windows over this one, in screen points: a hand landing
-        /// on one would reach that app, so no physical act ends or passes there.
+        /// Other apps' windows over this one, in screen points: a hand landing on one would reach that app, so no physical act ends or passes there.
         var obstructions: [MacAXFrame] = []
-        /// The look this sighting was read from, so a pointer press is judged
-        /// by the same evidence as an accessibility one.
+        /// The look this sighting was read from, so a pointer press is judged by the same evidence as an accessibility one.
         var percept: MacLookPercept? = nil
     }
 
-    /// A resolvable thing on the screen. `label` is the DISPLAY text — what the
-    /// renderer printed — so anything redaction withheld cannot be named.
+    /// A resolvable thing on the screen. `label` is the DISPLAY text — what the renderer printed — so anything redaction withheld cannot be named.
     struct ActTarget: Equatable {
         var actions: [String]
         let settableAttributes: [String]
         let sourceAXPath: [Int]?
         let handle: String
         var label: String?
-        /// Additional exact natural names for this SAME target. These never
-        /// create a second address or carry a second handle; they let transient
-        /// state such as keyboard focus name the element already in the model.
+        /// Additional exact natural names for this SAME target. These never create a second address or carry a second handle; they let transient state such as
+        /// keyboard focus name the element already in the model.
         var aliases: [String]
         let kind: String
         let secret: Bool
-        /// The content-row ordinal the render printed.
+        /// Use the ordinal printed by the renderer so selection cannot address another content row.
         let ordinal: Int?
-        /// A stable one-based ordinal within this target's visible kind. This
-        /// is how repeated unnamed controls remain addressable as `button 2`
-        /// without pretending that one of them is uniquely named.
+        /// A stable one-based ordinal within this target's visible kind. This is how repeated unnamed controls remain addressable as `button 2` without
+        /// pretending that one of them is uniquely named.
         let roleOrdinal: Int?
         let enabled: Bool?
         let frame: MacAXFrame?
@@ -263,15 +248,11 @@ extension MacFourVerbs {
         let regionOnly: Bool
         let physicalOnly: Bool
         let motionUncertain: Bool
-        /// An editable field's placeholder: a name it answers to after every
-        /// exact label on the screen (Maps' "Apple Maps" field reads "Search Maps").
+        /// Placeholders name fields only after exact screen labels so a secondary name cannot hide a visible target.
         var placeholder: String? = nil
 
-        // A semantic look handle remains the preferred semantic route even
-        // after fusion enriches it with a physical frame/mark. Only a target
-        // that has no look handle is supplemental-only. This keeps the closed
-        // loop's destination/read-back verification while giving the same
-        // target a physical point for hover, drag, hold, and movement.
+        // Keep the semantic handle after fusion so destination/readback verification survives physical enrichment. Frame/mark evidence adds gestures without
+        // creating another semantic address.
         var isSupplemental: Bool { handle.isEmpty }
 
         init(
@@ -337,15 +318,16 @@ extension MacFourVerbs {
                 input = ["action": .string("chat.open_card"), "args": .object(["card": .string(card)])]
             }
         }
-        // A look with no app named, while her own app is in front, reads her
-        // own page; the person's app behind her is named so she can look past
-        // herself without guessing which app that is.
+        // Self-front looks read the agent's own page and name the person's app behind it so callers can look past the app without guessing.
         let behind = verb == nil ? Self.appBehindMe().map {
             "NativeAgent (me) is in front; the person's app behind me is \($0): mac.look {app:\"\($0)\"} reads it, with pixels:true for its picture."
         } : nil
         return MacFourVerbsReply(
             ok: false,
-            text: "This is my own app. Use app with the input in next_action to \(executable ? "work in process" : "inspect its available controls; this gesture has no in-process equivalent").",
+            text: """
+                This is my own app. Use app with the input in next_action to \
+                \(executable ? "work in process" : "inspect its available controls; this gesture has no in-process equivalent").
+                """,
             detail: ["status": .string("in_process_route"),
                      "execute_in_process": .bool(executable),
                      "behind": behind.map(JSONValue.string) ?? .null,
@@ -353,9 +335,7 @@ extension MacFourVerbs {
         )
     }
 
-    /// The owner of the topmost on-screen window that is not NativeAgent's own:
-    /// what the person sees behind her window. Owner names need no screen
-    /// recording grant; nil when nothing else is on screen.
+    /// Use topmost nonself window ownership to name the app behind; owner names need no Screen Recording grant, and no window stays nil.
     static func appBehindMe() -> String? {
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return nil }
@@ -374,8 +354,7 @@ extension MacFourVerbs {
     func reacquireSight(
         for target: String,
         sighting: inout Sighting,
-        whileMissing: ([ActTarget]) -> Bool
-    ) async -> (reply: MacFourVerbsReply?, samples: Int) {
+        turn: Turn, context: MacOperationContext, whileMissing: ([ActTarget]) -> Bool) async -> (reply: MacFourVerbsReply?, samples: Int) {
         guard Self.isPotentialDynamicVisualReference(target) else { return (nil, 0) }
         let temporal = Self.hasTemporalQualifier(target)
         let sampledApp = sighting.bundleIdentifier ?? sighting.appName
@@ -384,7 +363,7 @@ extension MacFourVerbs {
         for sample in 0..<(temporal ? 3 : 1) {
             guard whileMissing(sighting.targets) else { break }
             if sample == 2, !Self.canConfirmTemporalTurn(target, previous: previousTargets, current: sighting.targets) { break }
-            switch await resampleSight(temporal: temporal, expectedApp: sampledApp) {
+            switch await resampleSight(temporal: temporal, expectedApp: sampledApp, turn: turn, context: context) {
             case .blind(let reply): return (reply, samples)
             case .seen(let refreshed):
                 previousTargets = sighting.targets
@@ -395,9 +374,9 @@ extension MacFourVerbs {
         return (nil, samples)
     }
 
-    func resampleSight(temporal: Bool, expectedApp: String?) async -> Sighted {
+    func resampleSight(temporal: Bool, expectedApp: String?, turn: Turn, context: MacOperationContext) async -> Sighted {
         if temporal { await clock.sleep(seconds: 0.06) }
-        let observed = await sight(part: nil)
+        let observed = await sight(part: nil, turn: turn, context: context)
         if case .seen(let refreshed) = observed,
            (refreshed.bundleIdentifier ?? refreshed.appName) != expectedApp {
             return .blind(Self.motionAppChangedReply(screen: refreshed.render))
@@ -410,6 +389,5 @@ extension MacFourVerbs {
             text: "The foreground app changed while I was observing motion. I haven't sent input.\n" + screen,
             detail: ["error": .string("motion_sampling_app_changed")])
     }
-
 
 }

@@ -1,9 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Dispatcher
 // Blueprint: | `BrowserRouteEffects.swift` | visible browser port; shared begin/finish/cancel lifecycle over BrowserActiveRunRegistry |
 
-/// Physical browser work and app integration; route decisions belong to Browser.
 public protocol BrowserRouteEffects: Sendable {
     @MainActor func acquireBrowser(runID: String) throws
     @MainActor func releaseBrowser(runID: String)
@@ -17,7 +17,7 @@ public protocol BrowserRouteEffects: Sendable {
     @MainActor func finishNavigation(runID: String, token: UUID)
     func cancelNavigation(runID: String) async
     func observeMotorAction(_ model: MotorActionReadModel) async
-    func showProducedImage(at path: URL, name: String) -> (shown: Bool, note: String)
+    func showProducedImage(at path: URL, name: String, sink: LocalToolImage.Sink?) -> (shown: Bool, note: String)
     func appendNativeActionReceipt(action: NativeActionRecord, status: String, dryRun: Bool, output: JSONValue,
                                    dataRoot: URL) async throws -> NativeActionReceipt
 }
@@ -49,7 +49,6 @@ public struct BrowserVisibleCapture: Sendable {
     public var textChars: Int?
     public var links: [BrowserLink]?
     public var screenshot: Data?
-    /// Evidence a read was asked for and did not return, with its cause.
     public var readFailures: [String: String]
     public init(url: URL, nav: BrowserNavigationResult, text: String?, textChars: Int?, links: [BrowserLink]?, screenshot: Data?,
                 readFailures: [String: String] = [:]) {
@@ -79,8 +78,7 @@ extension BrowserRouteEffects {
                     dataRoot: dataRoot
                 )
             }
-            // Creating and attaching are one non-suspending MainActor turn, so
-            // WebKit cannot begin between task creation and cancellation hookup.
+            // Create and attach in one non-suspending MainActor turn so WebKit cannot start before cancellation hookup.
             cancellationLatch.install {
                 task.cancel()
                 cancelVisibleNavigation(runID: runID)

@@ -35,6 +35,8 @@ public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterabl
     case resourcePressureChanged
     /// Horizon refresh changes prediction rows only, without chemistry, body facts, field associations or intrinsic valence.
     case horizonRefresh
+    /// One of the agent's organs broke from its record (missed, failed, stuck or off record), felt once at its onset and again as it grows.
+    case organDeviated
 }
 
 public struct SomaticSignal: Codable, Sendable, Equatable, Identifiable {
@@ -77,9 +79,7 @@ public struct SomaticSignal: Codable, Sendable, Equatable, Identifiable {
         for key in metadata.keys.sorted().prefix(bounds.maximumKeys) {
             let cleanKey = String(key.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
             guard !cleanKey.isEmpty else { continue }
-            // Routed through the shared JSONValueBounding (audit C9) — same
-            // redaction + depth-cap this organism path already applied, now the
-            // single source the substrate/continuity-field paths share too.
+            // Share metadata redaction and depth bounds across organism, substrate and continuity paths.
             out[cleanKey] = JSONValueBounding.bounded(
                 metadata[key] ?? .null,
                 bounds: bounds,
@@ -171,15 +171,11 @@ public struct BodySchema: Codable, Sendable, Equatable {
     public var macAwake: Bool
     public var iPhoneReachable: Bool
     public var providersHealthy: Bool
-    /// Exact configured/credential availability, deliberately distinct from
-    /// the evidence-derived `providersHealthy` compatibility projection.
+    /// Configuration availability is exact; path health remains an evidence-derived projection.
     public var providersAvailable: Bool
-    /// Typed, uncertainty-bearing read projection when a provider evidence
-    /// assembler supplied one. Nil preserves compatibility with legacy exact
-    /// body samples; this never becomes provider-selection authority.
+    /// Typed provider reads carry uncertainty; absent reads retain exact body-sample fields without granting provider-selection authority.
     public var providerPathBelief: ProviderPathEstimate?
-    /// Transient domain-owned reads. They are rebuilt from canonical evidence
-    /// after restart and intentionally omitted from organism persistence.
+    /// Transient domain-owned reads. They are rebuilt from canonical evidence after restart and intentionally omitted from organism persistence.
     public var peerPresenceBelief: PeerPresenceBelief?
     public var notificationDeliveryBelief: NotificationDeliveryBelief?
     public var memoryIntegrityReading: MemoryIntegrityReading?
@@ -237,9 +233,7 @@ public struct BodySchema: Codable, Sendable, Equatable {
 
     public static let neutral = BodySchema()
 
-    /// Typed read metadata is observational and must not make an otherwise
-    /// neutral organism projection look active. Only compatibility state that
-    /// can shape posture/capsule/compute participates in this check.
+    /// Observational typed metadata alone cannot make a neutral projection active.
     public var compatibilityIsNeutral: Bool {
         macAwake
             && !iPhoneReachable
@@ -253,10 +247,7 @@ public struct BodySchema: Codable, Sendable, Equatable {
             && resourcePressure == .nominal
     }
 
-    /// Typed beliefs/readings are transient projections and intentionally
-    /// excluded from persistence. Exact compatibility facts survive restart;
-    /// every uncertain domain read must be rebuilt from its canonical evidence
-    /// under the injected data root.
+    /// Persist exact body facts only; rebuild uncertain domain reads from their canonical owners after restart.
     private enum CodingKeys: String, CodingKey {
         case macAwake, iPhoneReachable, providersHealthy, providersAvailable, memoryHealthy
         case dreamHealthy, toolHandsAvailable, approvalChannelsOpen
@@ -310,9 +301,7 @@ public struct OrganismReadout: Sendable, Equatable {
         self.diurnal = diurnal
     }
 
-    /// Deliberately unchanged by `diurnal`: what time of day it is, on its own,
-    /// is not a feeling. A projection whose chemistry the curve did not move
-    /// stays neutral and stays silent (design law 4).
+    /// A clock alone is not a feeling; unchanged chemistry remains neutral and silent.
     public var isNeutral: Bool {
         bodyLine == nil && chemicalState.isNeutral && bodySchema.compatibilityIsNeutral
     }
@@ -361,8 +350,7 @@ public struct OrganismSnapshot: Sendable, Equatable {
     }
 }
 
-/// Fixed-time projection, posture and horizon from copied continuity.
-/// Nonpersistent and advisory; reading never mutates the live kernel.
+/// Fixed-time projection, posture and horizon from copied continuity. Nonpersistent and advisory; reading never mutates the live kernel.
 public struct OrganismFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
     public let snapshot: OrganismSnapshot
@@ -406,14 +394,11 @@ public struct OrganismConfiguration: Sendable, Equatable {
 }
 
 // MARK: - The body's clock
-// The clock shares user_prefs.json quiet_hours with the turn engine; no window means no clock.
-// OrganismDiurnalRead carries the phase and bounded offsets through the existing body readout.
+// Shared quiet_hours supplies the only diurnal window; without it there is no clock.
 
-/// The user's day, as the body knows it: two integers, read on the Mac's
-/// local clock wherever it is (User 10-21) — no zone is held.
+/// Interpret the user's declared day in the Mac's current local zone; never retain a separate zone.
 public struct OrganismDiurnalClock: Sendable, Equatable {
-    /// The declared quiet window in LOCAL wall-clock hours; `start > end` wraps
-    /// midnight. Only a complete, nondegenerate window supplies a clock.
+    /// The declared quiet window in LOCAL wall-clock hours; `start > end` wraps midnight. Only a complete, nondegenerate window supplies a clock.
     public let quietStartHour: Int
     public let quietEndHour: Int
 
@@ -429,26 +414,8 @@ public struct OrganismDiurnalClock: Sendable, Equatable {
 
 }
 
-/// What time it FEELS like — the bounded read the felt layer consumes.
-///
-/// DOCUMENTED FIELDS FOR THE FINGERPRINT BUILDER (`+FeltFingerprint`/`+Capsule`,
-/// another fence — this side only publishes):
-///   • `timeOfDayPhase` — 0…1 through the user's local day. 0 = local midnight,
-///     0.25 = 6 AM, 0.5 = local noon, 0.75 = 6 PM. Nil-free and always present
-///     when a configured quiet window supplies a clock.
-///   • `nightliness` — 0…1, how deep into the night the trough says we are
-///     (1 at the trough itself, 0 twelve hours later). This is the "it's late
-///     and it shows" gate.
-///   • `arousalOffset` — the SIGNED, bounded (±`OrganismCircadian.arousalAmplitude`)
-///     offset the curve wants added to the felt fingerprint's arousal axis.
-///     CONSUMER LAW: add it, then clamp — and never let it manufacture arousal
-///     out of silence (a positive offset on an otherwise-still body is the
-///     afternoon, not a feeling). The organism applies the curiosity half
-///     itself; arousal is not an organism axis, which is why it is published
-///     rather than applied here.
-///   • `curiosityOffset` — the offset ALREADY applied to the projected
-///     chemistry's curiosity. Published for observability/parity, not for the
-///     consumer to apply a second time.
+/// The clock publishes local phase (0 midnight, 0.5 noon) and nightliness (1 trough, 0 peak). Consumers add/clamp arousal offset without creating arousal from
+/// silence; curiosity offset is already applied and must not be applied twice.
 public struct OrganismDiurnalRead: Sendable, Equatable, Codable {
     public var timeOfDayPhase: Double
     public var nightliness: Double

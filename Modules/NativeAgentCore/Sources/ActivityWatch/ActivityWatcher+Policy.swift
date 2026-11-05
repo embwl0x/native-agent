@@ -3,12 +3,10 @@ import Foundation
 import AppKit
 import ApplicationServices
 import NativeAgentCore
-// Blueprint: | `ActivityWatcher+Policy.swift` | The same watcher's queued policy updates, tightening-only external policy reads and capture-ordered purge/wipe requests; policy reaches the engine before capture and deletion follows every older store write |
+// Blueprint: | `ActivityWatcher+Policy.swift` | Capture-thread policy and purge ordering; external policy may tighten only; deletion follows older writes |
 
 extension ActivityWatcher {
-    /// Apply policy on the capture thread before later events: disabling closes
-    /// the span and removes sources, enabling installs them, and exclusion edits
-    /// let the engine emit retro-close commands. UI callers never wait on AX.
+    /// Apply policy on the capture thread before later events; UI callers must never block on AX.
     public func updatePolicy(_ policy: ActivityPolicy) {
         lock.lock()
         let wasEnabled = _captureEnabled && _policyAvailable
@@ -34,16 +32,13 @@ extension ActivityWatcher {
 
         switch (wasEnabled || installed, policy.captureEnabled) {
         case (_, false):
-            // OFF. Push the policy into the engine first so the open span is
-            // closed under a policy that forbids capture (the engine's
-            // updatePolicy emits the close), then remove every event source.
+            // Close under the disabled policy before removing event sources.
             if installed {
                 applyPolicyOnCaptureThread()
                 Task { [weak self] in await self?.stopForPolicyDisable(generation: generation) }
             }
         case (false, true):
-            // ON, from cold. Startup reads the latest policy on its own thread
-            // before the first activation.
+            // Cold startup must read the latest policy before its first activation.
             if stopPending {
                 applyPolicyOnCaptureThread()
             } else {
@@ -58,9 +53,7 @@ extension ActivityWatcher {
         }
     }
 
-    /// Fence capture immediately without replacing the last checked consent.
-    /// Teardown uses the same lifecycle as a requested disable; a later checked
-    /// policy update may restart only after the old pump actually settles.
+    /// Fence capture without overwriting consent; restart only after the prior pump actually settles.
     public func policyUnavailable() async {
         withLock { _policyAvailable = false }
         _ = await requestStop()
@@ -72,23 +65,20 @@ extension ActivityWatcher {
     ) -> ActivityPolicy? {
         // Disabling is always allowed, whatever else the file says.
         guard polled.captureEnabled else { return polled }
-        // An out-of-band write may never ENABLE capture. Only the Trust Center
-        // path (a direct `updatePolicy`) can do that.
+        // Only the direct Trust Center path may enable capture; external writes can only tighten it.
         guard currentlyEnabled, current.captureEnabled else { return nil }
 
         var safe = polled
         safe.captureEnabled = true
-        // Never drop below the exclusions already in force.
+        // Keep all existing exclusions when applying an external policy.
         safe.excludedBundleIDs = polled.excludedBundleIDs.union(current.excludedBundleIDs)
-        // false → true is loosening, so it is refused; true → false is tightening.
         safe.captureTitles = polled.captureTitles && current.captureTitles
         safe.browserTitlesEnabled = polled.browserTitlesEnabled && current.browserTitlesEnabled
-        // Model-provider access is a separate explicit consent. A file change
-        // can turn it off, never on.
+        // Model-provider access requires separate explicit consent; external changes may only turn it off.
         safe.allowModelAccess = polled.allowModelAccess && current.allowModelAccess
-        // The one flag whose TRUE is the private setting: it can only go on.
+        // This flag enables privacy, so an external change may only turn it on.
         safe.appNameOnlyMode = polled.appNameOnlyMode || current.appNameOnlyMode
-        // Keeping data for longer is loosening; keeping it for less is not.
+        // External changes may shorten retention, never lengthen it.
         safe.retentionDays = min(polled.retentionDays, current.retentionDays)
         return safe
     }
@@ -105,8 +95,7 @@ extension ActivityWatcher {
         else { onCaptureThread(apply) }
     }
 
-    /// Apply the exclusion before placing its purge behind every older write.
-    /// The controller holds its policy-mutation slot until this completes.
+    /// Hold the controller’s policy slot until the applied exclusion and all older writes precede its purge.
     public func purgeExcluded(bundleID: String) async throws -> Int {
         try await withCheckedThrowingContinuation { completion in
             let handoff = onCaptureThread {
@@ -116,8 +105,7 @@ extension ActivityWatcher {
             }
             if handoff.accepted { return }
 
-            // No capture thread can enqueue more writes. Join any old pump
-            // before purging directly, including during shutdown's drain.
+            // Join the old pump before direct purging so no accepted write can outlive deletion.
             Task {
                 await handoff.drainingPump?.value
                 do { completion.resume(returning: try await store.purge(bundleID: bundleID)) }

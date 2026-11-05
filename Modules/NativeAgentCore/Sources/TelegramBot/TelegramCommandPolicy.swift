@@ -2,11 +2,10 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramCommandPolicy.swift` | telegram-commands.js projects menu/help over native command identities through L0 PartFaces and prepares memory reply words before the native write; reserved Stop/approval controls, canonical memory provenance, storage and awaited reply settlement remain native; menu synchronization keys on the selected part version |
+// Blueprint: | `TelegramCommandPolicy.swift` | Parts author menu/help words; native code owns reserved controls, provenance and writes |
 
 extension SwiftNativeTelegramBot {
-    /// The native registry supplies executable names/usage; the face authors
-    /// their words. Reserved controls cannot be removed or replaced by a part.
+    /// The native registry supplies executable names/usage; the face authors their words. Reserved controls cannot be removed or replaced by a part.
     func commandProjection() async throws -> (commands: [TelegramBotCommand], help: String, version: String) {
         let owner: Task<PartFaces, Never>
         if let commandFaces { owner = commandFaces }
@@ -47,23 +46,22 @@ extension SwiftNativeTelegramBot {
         if let owner { await settle { await owner.value.close() } }
     }
 
-    func memoryCommandReply(command: String, args: [String]) async -> String {
+    func memoryCommandReply(command: String, args: [String], turn: Turn) async -> String {
         let words: MemoryCommandWords
         do {
             words = try await callTelegramPart("telegram-commands", input: .object([
                 "op": .string("memory"), "command": .string(command)
-            ]))
+            ]), turn: turn)
         } catch { return "Telegram commands part unavailable: \(error.localizedDescription)" }
         let text = args.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return words.requiresText }
         guard let memory = completenessDeps?.memory else { return words.unavailable }
-        // All authored wording is prepared before the canonical write. A part
-        // failure cannot turn a committed memory into another write attempt.
+        // All authored wording is prepared before the canonical write. A part failure cannot turn a committed memory into another write attempt.
         do {
             try Task.checkCancellation()
             let id = command == "remember"
-                ? try await memory.remember(text: text, source: "telegram:/remember")
-                : try await memory.note(text: text, kind: "telegram_note", source: "telegram:/note")
+                ? try await memory.remember(text: text, source: "telegram:/remember", turn: turn)
+                : try await memory.note(text: text, kind: "telegram_note", source: "telegram:/note", turn: turn)
             return words.success + id
         } catch { return words.failure + error.localizedDescription }
     }

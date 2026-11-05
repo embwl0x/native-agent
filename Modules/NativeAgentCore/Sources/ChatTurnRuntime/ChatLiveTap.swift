@@ -2,16 +2,12 @@ import Foundation
 import os
 // Blueprint: | `ChatLiveTap.swift` | `ChatLiveTap` enum; `observe` (every turn's deltas and saved answer, for the phone) |
 
-/// Every turn's text as it streams, whichever door started it. Device sync
-/// observes it so the phone can watch a turn in its conversation that it did
-/// not start. The observer must return at once: it runs inside the turn.
+/// Device sync observes every turn so the phone can watch work started elsewhere. Observers run inside the turn and must return at once.
 public enum ChatLiveTap {
     public enum Kind: Sendable {
-        /// Provider text, in order.
         case delta(String)
         case answered(String)
-        /// Saved text of a turn that stopped short; `status` is the turn's own
-        /// runtime status ("stopped", "interrupted", "waiting on you").
+        /// The status comes from the runtime, so retained output preserves the turn's actual outcome.
         case incomplete(String, status: String)
         case failed(String)
         case cancelled
@@ -28,9 +24,7 @@ public enum ChatLiveTap {
 
     public typealias Observer = @Sendable (Event) -> Void
 
-    // Boxed: a closure read back through withLock's inout state is re-wrapped
-    // in a reabstraction thunk on every read; 2,000 deltas overflowed a turn's
-    // stack (10-07 SIGBUS crashes).
+    // Box the closure: withLock's inout read otherwise adds a reabstraction thunk per delta and can overflow the stack.
     private final class Box: Sendable {
         let call: Observer
         init(_ call: @escaping Observer) { self.call = call }

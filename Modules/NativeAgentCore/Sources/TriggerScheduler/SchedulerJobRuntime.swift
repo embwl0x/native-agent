@@ -1,13 +1,9 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `SchedulerJobRuntime.swift` | `SchedulerJobRuntime`: shared civil schedule math and next occurrences; timezone changes cannot mint another civil occurrence |
+// Blueprint: | `SchedulerJobRuntime.swift` | `SchedulerJobRuntime`: Civil timing prevents duplicate occurrences across zones |
 
-/// Runtime helpers for the app-owned scheduled-job loop.
-///
-/// The create/list/cancel surface lives in `SchedulerJobs.swift`; this file
-/// exposes the minimum schedule math the Mac app needs to advance due jobs
-/// without duplicating the normalizer's daily/weekly/monthly/cron parser.
+/// Share schedule arithmetic with the job normalizer so the app loop cannot duplicate its calendar parser.
 public enum SchedulerJobRuntime {
     /// Today's matching civil minute, or nil on a day that skips it.
     static func dailyOccurrence(_ schedule: [String: JSONValue], on date: Date) -> Date? {
@@ -51,8 +47,7 @@ public enum SchedulerJobRuntime {
         string(job["nextWallClockOccurrence"])
     }
 
-    /// Claims keep their saved instant.
-    /// Other wall-clock work resolves its civil identity in the current zone.
+    /// Claims keep their saved instant. Other wall-clock work resolves its civil identity in the current zone.
     public static func scheduledEpoch(for job: [String: JSONValue]) -> Double? {
         let saved = epoch(from: job["nextRunAt"]) ?? epoch(from: job["nextRunAtEpoch"])
         guard job["activeOccurrence"] == nil,
@@ -101,8 +96,7 @@ public enum SchedulerJobRuntime {
         return try SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: afterEpoch, now: now)
     }
 
-    /// Past `now` and past the minute `dueEpoch` claimed: in a fall-back hour a
-    /// run finishing at the second 01:01 must not be handed the second 01:59.
+    /// Past `now` and past the minute `dueEpoch` claimed: in a fall-back hour a run finishing at the second 01:01 must not be handed the second 01:59.
     public static func nextRunEpochAfterNow(
         for job: JSONValue,
         beyond dueEpoch: Double? = nil,

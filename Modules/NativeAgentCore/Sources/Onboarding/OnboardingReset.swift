@@ -30,8 +30,8 @@ extension SwiftNativeOnboardingClient {
     var resetTransactionManifestPath: URL {
         dataRoot.appendingPathComponent(Self.pendingResetTransactionRelativePath)
     }
-    /// Record exact bytes and marker hashes; publish and verify backups before removing matching sources.
-    /// Clear completion evidence next and reset intent last; restarts resume the same intent.
+    /// Record exact bytes and marker hashes; publish and verify backups before removing matching sources. Clear completion evidence next and reset intent last;
+    /// restarts resume the same intent.
     public func resetOnboarding(confirm: Bool) async throws -> OnboardingResetResult {
         if !confirm {
             return OnboardingResetResult(ok: false, error: "confirmation_required")

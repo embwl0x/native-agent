@@ -4,20 +4,20 @@ import NativeAgentShared
 import Connectors
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `EngineConnectors.swift` | ConnectorReadiness workspace/action reads publish through LatestRead; committed workspace additions publish their own checked result through write; native connector execution supplies its engine root and originating `ToolsFacade.withPartDoor` before calling the domain; no second connector facade or account snapshot. |
+import ChatTurnContracts
+// Blueprint: | `EngineConnectors.swift` | `ToolsFacade.withPartDoor`; Checked connector reads and rooted gated execution |
 
 extension NativeAgentEngine {
-    /// Native connector entry; turns already carry their own door.
     public func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:],
         origin: String, platform: any ConnectorActionPlatform) async throws -> ConnectorActionReceipt {
-        try await tools.withPartDoor(envelope: .native(origin)) {
+        try await tools.withPartDoor(envelope: .personOnMac(origin)) { door in
             try await ConnectorActions(platform: platform).runConnectorAction(
-                id: id, dryRun: dryRun, input: input, dataRoot: self.dataRoot)
+                id: id, dryRun: dryRun, input: input, dataRoot: self.dataRoot, turn: door.turn)
         }
     }
 }
 
-/// Workspace and action reads share the engine's connector owner.
+/// Workspace and action reads share the engine’s connector owner.
 @MainActor
 extension ConnectorReadiness {
     @discardableResult
@@ -31,6 +31,7 @@ extension ConnectorReadiness {
             case .failure(let error): workspacesReadError = error.localizedDescription
             }
         })
+        await refreshFace()
         return try result.get()
     }
 
@@ -45,16 +46,19 @@ extension ConnectorReadiness {
             case .failure(let error): actionsReadError = error.localizedDescription
             }
         })
+        await capabilitiesDidChange?()
         return try result.get()
     }
 
-    public func addWorkspace(name: String, path: String, writable: Bool) async throws -> (added: WorkspaceRecord, refreshed: [WorkspaceRecord], verified: Bool) {
+    public func addWorkspace(name: String, path: String, writable: Bool) async throws -> (added: WorkspaceRecord, refreshed: [WorkspaceRecord],
+        verified: Bool) {
         let result = try await ConnectorRegistryActions.addWorkspace(name: name, path: path,
             permissions: writable ? ["read", "write"] : ["read"], root: root)
         workspacesRead.write {
             workspaceSnapshot = result.refreshed
             workspacesReadError = nil
         }
+        await refreshFace()
         return result
     }
 

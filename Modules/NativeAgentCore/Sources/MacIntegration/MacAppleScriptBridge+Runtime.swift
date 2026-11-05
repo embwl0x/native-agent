@@ -4,17 +4,17 @@ import NativeAgentShared
 import MacControl
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`: delegates `runAppleScript` to MacControl, skill hand-back and integration envelopes; `deniedEnvelope`; Music recipe/parsers live in the editable `Resources/abilities/music-library.js` and `music.js` seeds, called through L0 `Parts.call` by MacIntegrationDeliveryActions; the playback receipt and effects survive failed readback as a separate `now_playing` fact; metadata uses checked typed lists, and Music's case-insensitive exact title/artist query counts all matches before limiting refusal examples |
+// Blueprint: | `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`, `runAppleScript`, `deniedEnvelope`, `Resources/abilities/music-library.js`, `music.js`, `Parts.call`, `now_playing`: shared script envelopes and Music parts |
 
 extension MacAppleScriptBridge {
     // MARK: - AppleScript invocation
 
     typealias AppleScriptError = AppleScriptExecution.AppleScriptError
 
-    static func runAppleScript(_ source: String, bundleID: String) async throws -> String {
-        do { return try await AppleScriptExecution.runIntegrationScript(source, bundleID: bundleID) }
+    static func runAppleScript(_ source: String, bundleID: String, context: MacOperationContext) async throws -> String {
+        do { return try await AppleScriptExecution.runIntegrationScript(source, bundleID: bundleID, context: context) }
         catch let AppleScriptError.permissionDenied(app) {
-            if SkillRunContext.handsBack { throw SkillRunContext.HandBack("Automation of \(app)") }
+            if context.handsBack { throw SkillRunContext.HandBack("Automation of \(app)") }
             throw AppleScriptError.permissionDenied(app: app)
         }
     }
@@ -78,11 +78,9 @@ extension MacAppleScriptBridge {
 
     static let mailNotConfiguredSentinel = "__NATIVEAGENT_MAIL_NOT_CONFIGURED__"
     static let notesNotConfiguredSentinel = "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
-    /// Missing requested Notes folder, followed by the available folder names.
     static let notesFolderMissingSentinel = "__NATIVEAGENT_NOTES_FOLDER_MISSING__"
 
-    /// Converts only explicit setup sentinels. An empty script result remains
-    /// a legitimate zero-result read and TCC errors stay owned by the caller's
+    /// Converts only explicit setup sentinels. An empty script result remains a legitimate zero-result read and TCC errors stay owned by the caller's
     /// denied/error catches.
     static func readSetupEnvelope(raw: String, integration: String) -> JSONValue? {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -118,7 +116,9 @@ extension MacAppleScriptBridge {
             value = nil
         }
         guard let value else { throw NSError(domain: "NativeAgentInput", code: -400,
-            userInfo: [NSLocalizedDescriptionKey: "A supplied numeric limit, offset or duration is not an integer. Correct the argument; defaults apply only when omitted."]) }
+            userInfo: [NSLocalizedDescriptionKey: """
+                A supplied numeric limit, offset or duration is not an integer. Correct the argument; defaults apply only when omitted.
+                """]) }
         return Swift.max(min, Swift.min(max, value))
     }
 
@@ -135,7 +135,7 @@ extension MacAppleScriptBridge {
 
     // MARK: - AppleScript string escaping
 
-    /// Escapes backslashes, then quotes, then CR/LF so approved line breaks survive safely.
+    /// Escape backslashes before quotes and line breaks so approved text remains literal AppleScript content.
     static func escapeForAppleScript(_ s: String) -> String {
         var out = s.replacingOccurrences(of: "\\", with: "\\\\")
         out = out.replacingOccurrences(of: "\"", with: "\\\"")
@@ -150,7 +150,8 @@ extension MacAppleScriptBridge {
     /// Converts supported AppleScript date spellings to ISO-8601; unsupported dates remain a read failure.
     static func normalizeAppleScriptDate(_ raw: String) throws -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { throw NSError(domain: "NativeAgentDate", code: -1, userInfo: [NSLocalizedDescriptionKey: "AppleScript returned no date. Read the source again."]) }
+        if trimmed.isEmpty { throw NSError(domain: "NativeAgentDate", code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "AppleScript returned no date. Read the source again."]) }
         let formats = [
             "EEEE, MMMM d, yyyy 'at' h:mm:ss a",
             "EEEE, MMMM d, yyyy 'at' HH:mm:ss",
@@ -166,7 +167,9 @@ extension MacAppleScriptBridge {
                 return NativeTimestampFormat.plainZulu(d)
             }
         }
-        throw NSError(domain: "NativeAgentDate", code: -1, userInfo: [NSLocalizedDescriptionKey: "AppleScript returned an unsupported localized date. Repair the source date adapter before reading it again."])
+        throw NSError(domain: "NativeAgentDate", code: -1, userInfo: [NSLocalizedDescriptionKey: """
+            AppleScript returned an unsupported localized date. Repair the source date adapter before reading it again.
+            """])
     }
 
     static func parseNoteRecords(_ raw: String) throws -> (total: Int64, notes: [JSONValue], gaps: [String]) {

@@ -14,7 +14,7 @@ import ProviderRouting
 import CryptoKit
 import SQLite3
 import Experiences
-// Blueprint: | `AgentContactTaskCallbacks.swift` | Persisted callback delivery and recovery; launch backlog failures retain named repair and unavailable admission rather than complete restoration; conversation recovery failures stay scoped; Keychain restoration faults retain their cause without accepting the update, with two bounded retries before the next read or activation retries again |
+// Blueprint: | `AgentContactTaskCallbacks.swift` | Durable callbacks retain per-task recovery debt. |
 extension AgentContactTasks {
     func push(operation: String, owner: String, parameters: JSONValue) async throws -> JSONValue {
         guard let params = parameters.foundationObject as? [String: Any],
@@ -76,8 +76,7 @@ extension AgentContactTasks {
     func notifyPush(_ task: AgentContactTask, only owed: Set<String>? = nil) {
         guard bridgeIsActive, (try? DataRootLife.isCurrent(task.lifeID, in: dataRoot)) == true else { return }
         guard let configs = pushConfigs[task.id]?.filter({ owed?.contains($0.key) ?? true }), !configs.isEmpty else { return }
-        // A status event contains only the protocol locator and state. Peers fetch
-        // artifacts through their authenticated task API instead of webhook copies.
+        // Callbacks carry locators and state only; artifacts require the peer’s authenticated task API.
         let event: [String: Any] = ["taskId": task.id, "contextId": task.context,
                                    "status": ["state": task.state.rawValue]]
         guard let canonical = try? NativeAgentA2AWire.project(event, version: "1.0"),
@@ -103,14 +102,10 @@ extension AgentContactTasks {
             })
         }
     }
-    /// The callback's outcome is part of the durable task: accepted, or an
-    /// owed failure with its cause that a relaunch delivers again. Once a
-    /// terminal update is accepted the callback's secret is no longer needed.
+    /// Persist callback outcomes so owed failures survive relaunch; retire secrets only after accepted terminal updates.
     private func recordCallback(_ sent: AgentContactTask, config: AgentContactPushConfig, accepted: Bool) {
         do {
-            // Eviction does not make the sent snapshot current again. Patch the
-            // retained task under this actor, preserving its reply and outcome.
-            // The live record first; a reread (which can recover and push again) only once evicted.
+            // Eviction cannot make a sent snapshot current; patch the live record before any reread that could restore callbacks.
             var task = try records[sent.id]?.task ?? get(sent.id, owner: sent.owner)
             guard var callback = task.callbacks?[config.id], callback.account == config.account else { return }
             if accepted { callback.delivered = sent.state.rawValue }
@@ -130,8 +125,7 @@ extension AgentContactTasks {
         try retain(task)
         records[taskID]?.task = task
     }
-    /// A task read back from disk resumes its callbacks, and any whose last
-    /// accepted update is not the task's state is owed it again.
+    /// Resume callbacks only when the task’s durable state is newer than its accepted update.
     func restoreCallbacks(_ task: AgentContactTask) {
         var owed: Set<String> = []
         guard bridgeIsActive, (try? DataRootLife.isCurrent(task.lifeID, in: dataRoot)) == true else { return }
@@ -194,25 +188,23 @@ extension AgentContactTasks {
             }
         })
     }
-    /// Owed terminal callbacks remain here even when no live record holds them.
-    /// Activation and launch recovery read the same persisted task set.
+    /// Owed terminal callbacks survive eviction and share the same persisted recovery set.
     func retainedTasksAwaitingRecovery() throws -> [AgentContactTask] {
         let tasks = try retainedTasks(requireComplete: true)
         guard let life = tasks.isEmpty ? nil : try DataRootLife.current(in: dataRoot) else { return [] }
         return tasks.filter { DataRootLife.life(of: $0.lifeID) == life && (!$0.state.terminal || $0.owesCallbacks) }
     }
-    /// At launch: every retained task whose callback is still owed an update
-    /// gets it, and every one still open recovers without waiting for its peer.
-    /// The turns a restart left in each conversation (queued, or interrupted
-    /// with a checkpoint) go back into its admission in the order they were
-    /// said there, before anything new is admitted; a queued one runs from its
-    /// saved input. One strict read of each conversation supplies both.
+    /// Restore each conversation’s queued or checkpointed turns in order before admitting new input. One strict conversation read supplies both task recovery
+    /// and backlog admission.
     public func redeliverOwedCallbacks() async {
         let open: [AgentContactTask]
         let source = dataRoot.appendingPathComponent("agents/a2a-receipts/outcomes.sqlite").path
         do { open = try retainedTasksAwaitingRecovery() }
         catch {
-            let detail = "Contact backlog restoration could not read \(source): \(error.localizedDescription). Repair this retained task store, then restart recovery; do not resend accepted messages."
+            let detail = """
+                Contact backlog restoration could not read \(source): \(error.localizedDescription). Repair this retained task store, then restart \
+                recovery; do not resend accepted messages.
+                """
             RepairOwed.owe(dataRoot, id: "contact-backlog", kind: .message, operation: "contact.backlog.restore",
                 owner: source, words: detail, lever: "Repair the named retained task store and restart NativeAgent to resume recovery.")
             await TurnAdmission.shared.restorationFailed(detail)
@@ -227,7 +219,10 @@ extension AgentContactTasks {
             do { inputs = try await CodexCompletionTranscriptEvidence.savedTurnInputs(dataRoot: dataRoot, sessionId: session) }
             catch {
                 let transcript = dataRoot.appendingPathComponent("chat/messages/\(session).jsonl").path
-                let detail = "Contact backlog restoration could not read \(transcript): \(error.localizedDescription). Repair this conversation and restart recovery; do not resend its messages."
+                let detail = """
+                    Contact backlog restoration could not read \(transcript): \(error.localizedDescription). Repair this conversation and restart \
+                    recovery; do not resend its messages.
+                    """
                 RepairOwed.owe(dataRoot, id: session, kind: .message, operation: "contact.backlog.restore:" + session,
                     owner: transcript, words: detail, lever: "Repair the named conversation transcript and restart NativeAgent.")
                 await TurnAdmission.shared.restorationFailed(detail, sessionID: session)
@@ -249,9 +244,13 @@ extension AgentContactTasks {
                 }
             } catch {
                 let transcript = dataRoot.appendingPathComponent("chat/messages/\(session).jsonl").path
-                let detail = "Contact backlog restoration could not recover \(transcript): \(error.localizedDescription). Repair the exact queued input, then restart recovery; nothing was resent."
+                let detail = """
+                    Contact backlog restoration could not recover \(transcript): \(error.localizedDescription). Repair the exact queued input, then \
+                    restart recovery; nothing was resent.
+                    """
                 RepairOwed.owe(dataRoot, id: session, kind: .message, operation: "contact.backlog.restore:" + session,
-                    owner: transcript, words: detail, lever: "Repair the queued sender, transcript or attachment named by this failure, then restart NativeAgent.")
+                    owner: transcript, words: detail,
+                        lever: "Repair the queued sender, transcript or attachment named by this failure, then restart NativeAgent.")
                 await TurnAdmission.shared.restorationFailed(detail, sessionID: session)
                 unavailableSessions.insert(session)
                 continue
@@ -263,9 +262,9 @@ extension AgentContactTasks {
             backlog += said
         }
         launchRecovered = true
-        // Every backlog is back: contact conversations admit new turns behind it.
+        // Admit new contact turns only after every backlog is restored.
         await TurnAdmission.shared.restorationComplete()
-        // A task read before this point holds a placeholder: read it again now.
+        // Reread placeholders after backlog admission opens.
         for (id, record) in records where record.worker == nil && record.task.detail == Self.recovering {
             records.removeValue(forKey: id); order.removeAll { $0 == id }
         }
@@ -277,7 +276,7 @@ extension AgentContactTasks {
                     lever: "Repair this task's exact retained receipt or transcript and read it again; do not resend the work.")
             }
         }
-        // A restored run nothing resumes gives up its place.
+        // A restored run that cannot resume must release its admission place.
         for task in backlog where !resuming.contains(task.id) {
             await TurnAdmission.shared.withdraw(sessionID: task.canonicalSession!, runID: task.canonicalRunID!)
         }

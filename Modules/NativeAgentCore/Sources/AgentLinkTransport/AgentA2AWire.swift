@@ -1,12 +1,10 @@
 import Foundation
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `AgentA2AWire.swift` | `AgentA2AWire` enum; `selectInterface`, `messageRequest`; admitted outgoing file parts share the versioned part encoder on every binding |
+// Blueprint: | `AgentA2AWire.swift` | `AgentA2AWire`, `selectInterface`, `messageRequest`; One versioned part encoder. |
 
-/// A2A 1.0 and 0.3 wire projection. Endpoints, parts and metadata remain
-/// untrusted data; the transport must authorize the destination and credentials.
+/// Peers supply untrusted endpoints, parts and metadata; transport must authorize destinations and credentials.
 public enum AgentA2AWire {
-    /// Every version/binding pair `selectInterface` accepts, as a peer's owner reads it.
     public static let spoken = "A2A 0.3 JSONRPC or A2A 1.0 JSONRPC, HTTP+JSON or GRPC"
     public struct Interface: Sendable, Equatable {
         public let endpoint: URL
@@ -59,8 +57,7 @@ public enum AgentA2AWire {
         public let artifacts: [JSONValue]
         public let state: String
         public let terminal: Bool
-        /// True only for an explicitly completed task. A message is a reply,
-        /// not evidence that a delegated action has completed.
+        /// A message is a reply, never proof that delegated work completed.
         public let completed: Bool
         public let needsInput: Bool
         public let needsAuthentication: Bool
@@ -110,7 +107,7 @@ public enum AgentA2AWire {
             candidates = try array(supported, "supportedInterfaces").map { try object($0, "interface") }
         } else {
             let version = try requiredString(card["protocolVersion"], "protocolVersion")
-            guard canonicalVersion(version) == "0.3" else { throw WireError.unsupported("legacy card protocol \(version)") }
+            guard canonicalVersion(version) == "0.3" else { throw WireError.unsupported("a card without supportedInterfaces declares protocol \(version)") }
             candidates.append(["url": card["url"] ?? .null, "protocolVersion": .string(version),
                                "protocolBinding": card["preferredTransport"] ?? .string("JSONRPC")])
             for item in try array(card["additionalInterfaces"], "additionalInterfaces") {
@@ -131,9 +128,7 @@ public enum AgentA2AWire {
                   url.user == nil, url.password == nil, url.fragment == nil else {
                 throw WireError.invalid("interface requires an absolute HTTP(S) URL without embedded credentials or fragment")
             }
-            // Local servers commonly publish "localhost" even when their card
-            // was fetched by literal address. Keep that interface on the exact
-            // loopback address that answered; never resolve the hostname.
+            // Keep declared localhost on the literal loopback address that answered; never resolve it.
             if url.host?.lowercased() == "localhost",
                ["127.0.0.1", "::1", "[::1]"].contains(cardURL.host ?? ""),
                url.scheme == cardURL.scheme, (url.port == cardURL.port || binding == "GRPC"),
@@ -157,15 +152,15 @@ public enum AgentA2AWire {
         guard !streaming || interface.streaming else { throw WireError.unsupported("streaming was not offered") }
         _ = try requiredString(.string(messageID), "messageId")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WireError.invalid("empty message") }
-        let legacy = interface.version == "0.3"
+        let v03 = interface.version == "0.3"
         let parts: [JSONValue] = [.object(["text": .string(text)])] + fileParts
-        var message: [String: JSONValue] = ["messageId": .string(messageID), "role": .string(legacy ? "user" : "ROLE_USER"),
+        var message: [String: JSONValue] = ["messageId": .string(messageID), "role": .string(v03 ? "user" : "ROLE_USER"),
             "parts": .array(try parts.map { try wirePart($0, version: interface.version) })]
-        if legacy { message["kind"] = .string("message") }
+        if v03 { message["kind"] = .string("message") }
         if let contextID { message["contextId"] = .string(try requiredString(.string(contextID), "contextId")) }
         if let taskID { message["taskId"] = .string(try requiredString(.string(taskID), "taskId")) }
         var params: [String: JSONValue] = ["message": .object(message)]
-        if !streaming { params["configuration"] = .object(legacy ? ["blocking": .bool(false)] : ["returnImmediately": .bool(true)]) }
+        if !streaming { params["configuration"] = .object(v03 ? ["blocking": .bool(false)] : ["returnImmediately": .bool(true)]) }
         if let pushConfiguration {
             try validatePushConfiguration(pushConfiguration, interface: interface)
             var configuration = (try? object(params["configuration"] ?? .object([:]), "configuration")) ?? [:]
@@ -173,7 +168,7 @@ public enum AgentA2AWire {
             params["configuration"] = .object(configuration)
         }
         if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
-        let method = streaming ? (legacy ? "message/stream" : "SendStreamingMessage") : (legacy ? "message/send" : "SendMessage")
+        let method = streaming ? (v03 ? "message/stream" : "SendStreamingMessage") : (v03 ? "message/send" : "SendMessage")
         return try request(interface: interface, method: method, params: params,
                            requestID: requestID ?? messageID, path: { streaming ? "/message:stream" : "/message:send" })
     }
@@ -251,9 +246,9 @@ public enum AgentA2AWire {
                                          expectedRequestID: String? = nil, expectedTaskID: String? = nil) throws -> Result {
         try validate(interface)
         var payload = try object(operationResult(value, interface: interface, requestID: expectedRequestID), "response")
-        let legacy = interface.version == "0.3"
+        let v03 = interface.version == "0.3"
         let kind: String
-        if legacy { kind = try requiredString(payload["kind"], "result kind") }
+        if v03 { kind = try requiredString(payload["kind"], "result kind") }
         else if payload["task"] != nil || payload["message"] != nil {
             guard (payload["task"] != nil) != (payload["message"] != nil) else { throw WireError.invalid("ambiguous send response") }
             kind = payload["task"] != nil ? "task" : "message"
@@ -268,7 +263,7 @@ public enum AgentA2AWire {
         var state = "reply"
         var failure: ProviderFailure.Report?
         if kind == "message" {
-            messageID = try validateMessage(payload, legacy: legacy)
+            messageID = try validateMessage(payload, v03: v03)
             failure = try providerFailure(payload)
             taskID = try optionalString(payload["taskId"], "taskId")
             parts = try array(payload["parts"], "message parts", required: true)
@@ -279,7 +274,7 @@ public enum AgentA2AWire {
             state = try canonicalState(wireState, version: interface.version)
             if let message = status["message"] {
                 let message = try object(message, "status message")
-                messageID = try validateMessage(message, legacy: legacy)
+                messageID = try validateMessage(message, v03: v03)
                 failure = try providerFailure(message)
                 parts = try array(message["parts"], "status message parts", required: true)
             }
@@ -288,11 +283,11 @@ public enum AgentA2AWire {
                 let artifact = try object(artifact, "artifact")
                 _ = try requiredString(artifact["artifactId"], "artifact ID")
                 let artifactParts = try array(artifact["parts"], "artifact parts", required: true)
-                try validateParts(artifactParts, legacy: legacy)
+                try validateParts(artifactParts, v03: v03)
             }
         } else { throw WireError.invalid("unsupported response kind \(kind)") }
         if let expectedTaskID, taskID != expectedTaskID { throw WireError.invalid("task identity mismatch") }
-        try validateParts(parts, legacy: legacy)
+        try validateParts(parts, v03: v03)
         let outputParts = parts + artifacts.flatMap { item -> [JSONValue] in
             guard case .object(let object) = item, case .array(let parts)? = object["parts"] else { return [] }; return parts
         }
@@ -316,14 +311,14 @@ public enum AgentA2AWire {
         }
     }
 
-    private static func validateMessage(_ message: [String: JSONValue], legacy: Bool) throws -> String {
-        if legacy && message["kind"] != .string("message") { throw WireError.invalid("message kind") }
-        guard message["role"] == .string(legacy ? "agent" : "ROLE_AGENT") else { throw WireError.invalid("peer message role") }
+    private static func validateMessage(_ message: [String: JSONValue], v03: Bool) throws -> String {
+        if v03 && message["kind"] != .string("message") { throw WireError.invalid("message kind") }
+        guard message["role"] == .string(v03 ? "agent" : "ROLE_AGENT") else { throw WireError.invalid("peer message role") }
         return try requiredString(message["messageId"], "message ID")
     }
-    private static func validateParts(_ parts: [JSONValue], legacy: Bool) throws {
+    private static func validateParts(_ parts: [JSONValue], v03: Bool) throws {
         for part in parts {
-            _ = try canonicalPart(part, version: legacy ? "0.3" : "1.0")
+            _ = try canonicalPart(part, version: v03 ? "0.3" : "1.0")
         }
     }
     package static func canonicalVersion(_ version: String) -> String? {
@@ -333,7 +328,8 @@ public enum AgentA2AWire {
         return ["1.0", "0.3"].contains(pair) ? pair : nil
     }
     private static func validate(_ interface: Interface) throws {
-        guard ["1.0", "0.3"].contains(interface.version), interface.binding == "JSONRPC" || (interface.version == "1.0" && ["HTTP+JSON", "GRPC"].contains(interface.binding)) else { throw WireError.unsupported("version/binding") }
+        guard ["1.0", "0.3"].contains(interface.version), interface.binding == "JSONRPC" || (interface.version == "1.0" && ["HTTP+JSON",
+            "GRPC"].contains(interface.binding)) else { throw WireError.unsupported("version/binding") }
     }
     private static func object(_ value: JSONValue, _ name: String) throws -> [String: JSONValue] {
         guard case .object(let object) = value else { throw WireError.invalid("\(name) must be an object") }; return object
@@ -343,7 +339,8 @@ public enum AgentA2AWire {
         guard case .array(let array) = value else { throw WireError.invalid("\(name) must be an array") }; return array
     }
     private static func requiredString(_ value: JSONValue?, _ name: String) throws -> String {
-        guard case .string(let text)? = value, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WireError.invalid("missing or invalid \(name)") }; return text
+        guard case .string(let text)? = value,
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WireError.invalid("missing or invalid \(name)") }; return text
     }
     private static func optionalString(_ value: JSONValue?, _ name: String) throws -> String? {
         guard let value else { return nil }; return try requiredString(value, name)

@@ -6,57 +6,50 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Desk
-// Blueprint: | `CognitionHost.swift` | Native cognition reach: engine-owned day perception, phone notification target count, pure readout faces and carried habit calls through the part-wake self door; domain facts and canonical commits remain outside editable code |
+import DreamREMCycle
+// Blueprint: | `CognitionHost.swift` | CognitionHost owner. |
 
-/// Concrete tool and chat clients composed by the app for a Studio hour.
 public protocol StudioWanderClientPort: Sendable {
     func toolDispatchClient() -> any ToolDispatchClient
     func chatClient(tools: any ToolDispatchClient) -> SwiftNativeChatOrchestrationClient
 }
 
-/// The single background-work slot a reflection shares with the Workshop.
+/// Reflection and Workshop share one background-work slot.
 public protocol BackgroundWorkLeasing: Sendable {
     func tryAcquire(holder: String, window: String) async -> Bool
     @discardableResult
     func releaseUnused(holder: String, window: String) async -> Bool
+    /// Who claimed `window` and when, so a refused claim names what holds the slot; throws when the lease cannot be read.
+    func claim(window: String) async throws -> (holder: String, acquiredAt: String)?
 }
 
-/// What the resident mind reaches that the app still owns: the attention
-/// router and device sync, the Workshop's lease and pursuit score, the
-/// background LLM client and trust gate, the dream action, the scheduler's
-/// jobs file, morning briefs and her Studio hour.
+/// Keep app-owned dependencies behind this host boundary so cognition can use them without owning their implementations.
 public protocol CognitionHost: Sendable {
-    /// Canonical Telegram identity, without coupling cognition/history to the transport module.
+    /// Share canonical Telegram identity without coupling cognition/history to transport.
     func telegramOwnerUserId(dataRoot: URL) throws -> Int64?
-    /// The clock changed (also once at launch); the engine brings today's
-    /// date and already-permitted calendar titles through the same crossing.
+    /// Bring permitted clock and calendar evidence through the same crossing at launch and on clock changes.
     func perceiveDay(dataRoot: URL) async
     func phoneNotificationTargetCount(dataRoot: URL) async throws -> Int
     func readoutFace(id: String, input: JSONValue, version: String, dataRoot: URL) async -> PartCallResult<PartFace>
-    /// The user's declared quiet hours, as the attention router reads them.
     func inQuietHours(at date: Date, dataRoot: URL) -> Bool
-    /// Routes one informational shoulder tap; the delivery it knocked by, or
-    /// nil when routing did not knock (no delivery, or already delivered).
+    /// Return the route for confirmed delivery; nil leaves delivery unconfirmed here.
     func deliverShoulderTap(
         eventId: String, title: String, body: String, reason: String,
-        userInfo: [String: String], at date: Date
+        userInfo: [String: String], at date: Date, turn: Turn?
     ) async throws -> String?
-    /// Publishes the Mac's snapshots to the phone.
-    /// The shared background LLM client; nil cognition binds the root's own owner.
-    func backgroundLLMClient(dataRoot: URL, cognition: NativeCognitionRuntime?) -> any LLMClient
-    /// Workshop's autonomy gate for unattended work.
+    /// Bind the root's cognition and the operation's explicit persona assembly to its background client.
+    func backgroundLLMClient(dataRoot: URL, cognition: NativeCognitionRuntime?, assembly: PrivateWorkContextAssembly) -> any LLMClient
     func unattendedWorkAllowed(dataRoot: URL) async -> Bool
     func backgroundWorkLease(dataRoot: URL) -> any BackgroundWorkLeasing
     func backgroundWorkWindow(_ date: Date) -> String
-    /// The Workshop pump's choice score for one pursuit, nil when not a pursuit.
+    /// When the window holding `date` ends: the next background slot opens then.
+    func backgroundWorkWindowEnd(_ date: Date) -> Date
     func pursuitChoiceTotal(for item: DeskItem, now: Date) -> Double?
-    /// The scheduler runner's checked read of its jobs file.
     func schedulerJobRows(at path: URL) throws -> [JSONValue]
     func archiveSupersededMorningBriefs(dataRoot: URL) async
-    /// The platform-backed clients her Core-owned Studio hour calls.
     func studioWanderClient(dataRoot: URL, usesLiveAppBody: Bool) -> any StudioWanderClientPort
-    /// Native source selection enters the engine's ordinary originating door.
+    /// Native source selection uses the engine's ordinary originating door.
     func callReadPart(id: String, input: JSONValue, actions: Set<String>, dataRoot: URL, origin: String) async throws -> JSONValue
-    /// A carried habit uses the same originating, gated door as a part wake.
+    /// Carried habits use the same originating Trust gate as part wakes.
     func runCarriedAction(_ step: DeskStep, handle: String, dataRoot: URL) async -> JSONValue
 }

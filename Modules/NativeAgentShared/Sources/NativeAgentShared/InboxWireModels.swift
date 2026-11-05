@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `InboxWireModels.swift` | Shared inbox rows and `InboxActionVocabulary`: checked action routing and native operation set, the inbox's own read/archive/dismiss verbs on every card, broader signed-wire recognition; `view` remains phone-local |
+// Blueprint: | `InboxWireModels.swift` | Inbox rows and `InboxActionVocabulary`: signed actions; `view` stays phone-local |
 
 /// The signed Mac inbox route's vocabulary, also used by phone controls.
 public enum InboxActionVocabulary {
@@ -14,9 +14,8 @@ public enum InboxActionVocabulary {
         InboxActionRecord(id: "dismiss", label: "Dismiss", description: "Dismiss this item"),
     ]
 
-    /// A card's actions: its declared ones, then the inbox's own verbs it lacks. A card
-    /// linked to an approval is settled by that approval, so it gains only "read": archiving
-    /// or dismissing it would leave the approval pending with no card.
+    /// A card's actions: its declared ones, then the inbox's own verbs it lacks. A card linked to an approval is settled by that approval, so it
+    /// gains only "read": archiving or dismissing it would leave the approval pending with no card.
     public static func actions(declared: [InboxActionRecord], approvalLinked: Bool) -> [InboxActionRecord] {
         let declaredIDs = Set(declared.map { normalizedAction($0.id) })
         return declared + inboxVerbs.filter {
@@ -117,7 +116,7 @@ public struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
     public let actions: [InboxActionRecord]
     public var status: String
     public let read_at: String?
-    /// The conversation a card raised elsewhere was mirrored into for User.
+    /// Mirror destination is distinct from the original card's conversation.
     public var chat_session_id: String? = nil
     /// The original card's session and identity, separate from its mirror destination.
     public let interaction_session_id: String?

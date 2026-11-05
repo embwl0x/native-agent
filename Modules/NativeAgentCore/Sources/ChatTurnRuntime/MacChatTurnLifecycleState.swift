@@ -39,7 +39,7 @@ import Speech
 import AVFoundation
 import AppKit
 import CoreGraphics
-// Blueprint: | `MacChatTurnLifecycleState.swift` | Lifecycle state, input, terminal evidence and reducer; `MacChatPersistedTurnLifecycle` validates the payload-free durable projection |
+// Blueprint: | `MacChatTurnLifecycleState.swift` | `MacChatPersistedTurnLifecycle`; Payload-free lifecycle state and terminal proof |
 
 /// Closed, payload-free terminal evidence; retains no provider, tool or transport bodies.
 public enum MacChatTurnTerminalEvidence: String, Codable, Sendable, Equatable {
@@ -97,6 +97,8 @@ public struct MacChatTurnLifecycleInput: Sendable, Equatable {
         case working(action: String?)
         case activity(MacChatTurnActivity)
         case streamProgress(accumulatedUTF16Length: Int)
+        /// Streamed bytes that are not words yet; the call when one is being written.
+        case moved(TurnCallWriting?)
         case replyTextSettled(Bool)
         case retrying(action: String?)
         case waiting(action: String?)
@@ -168,6 +170,10 @@ public enum MacChatTurnLifecycleReducer {
                 accumulatedUTF16Length: accumulatedUTF16Length,
                 at: input.occurredAt
             )
+        case .moved(let writing):
+            nextReplyTextSettled = state.replyTextSettled
+            nextPresentation = TurnPresentationReducer.recordMovement(
+                state.presentation, writing: writing, at: input.occurredAt, additionalRedactor: additionalRedactor)
         case .retrying(let action):
             nextPresentation = lifecycle(
                 state.presentation,

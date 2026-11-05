@@ -4,8 +4,7 @@ import PersistenceCore
 // Blueprint: | `MacFourVerbs+PerceptionSupport.swift` | `MacFourVerbs`: shared rendering/targeting `partition` and `supplementalDuplicateIndex` |
 
 extension MacFourVerbs {
-    /// The one row/control split consumed by rendering and targeting, so a
-    /// printed ordinal always names the same affordance.
+    /// The one row/control split consumed by rendering and targeting, so a printed ordinal always names the same affordance.
     static func partition(
         _ percept: MacLookPercept
     ) -> (rows: [MacLookAffordance], controls: [MacLookAffordance]) {
@@ -28,11 +27,9 @@ extension MacFourVerbs {
         return (rows, controls)
     }
 
-    /// Fuse only one supported identity. An AX path is capture-local: labels
-    /// and available geometry must still agree so a reordered tree cannot
-    /// donate a different control's physical mark to an old semantic handle.
-    /// A matching row/cell and its contained filename may share the named item,
-    /// without sharing marks; separate rows and interactive descendants cannot.
+    /// Fuse only one supported identity. An AX path is capture-local: labels and available geometry must still agree so a reordered tree cannot donate a
+    /// different control's physical mark to an old semantic handle. A matching row/cell and its contained filename may share the named item, without sharing
+    /// marks; separate rows and interactive descendants cannot.
     static func supplementalDuplicateIndex(
         _ candidate: MacFourVerbsSupplementalTarget, among targets: [ActTarget]
     ) -> Int? {
@@ -62,8 +59,7 @@ extension MacFourVerbs {
                 guard path == existingPath, !incompatibleLabel else { return false }
                 return existing.frame.map { framesOverlap(candidate.frame, $0) } ?? sameLabel
             }
-            // Named moving pixel regions can overlap by design. Their live
-            // names, not geometric containment, identify the region.
+            // Named moving pixel regions can overlap by design. Their live names, not geometric containment, identify the region.
             if candidate.physicalOnly || existing.physicalOnly { return sameLabel }
             guard !incompatibleLabel else { return false }
             if let frame = existing.frame { return framesOverlap(candidate.frame, frame) }
@@ -83,7 +79,6 @@ extension MacFourVerbs {
         let smaller = min(lhs.w * lhs.h, rhs.w * rhs.h)
         return smaller > 0 && intersection / smaller >= 0.65
     }
-
 
     // MARK: - JSON primitives
 

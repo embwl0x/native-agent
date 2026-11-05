@@ -1,11 +1,10 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `SwiftToolDispatcher+SubprocessSupport.swift` | `SubprocessWork` owns launch admission, the exact before-exec process group, execution timeout and checked terminal observation; retained observation ends only its wait, while explicit abort addresses the exact audit-path owner; `settle` retains captured output/audit and releases resources once; shared bounded invoke/image pipe capture |
+// Blueprint: | `SwiftToolDispatcher+SubprocessSupport.swift` | `SubprocessWork`, `settle`; one process owner; bounded observation; output/audit settlement |
 
 extension SwiftToolDispatcher {
-    /// Bounded pipe capture shared by builder and image subprocess adapters.
-    /// Final drain must not wait for a descendant that inherited a write FD.
+    /// Bounded pipe capture shared by builder and image subprocess adapters. Final drain must not wait for a descendant that inherited a write FD.
     final class InvokeOutputCapture: @unchecked Sendable {
         private let stdoutBuffer: BoundedBuffer
         private let stderrBuffer: BoundedBuffer
@@ -68,9 +67,8 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// One effect owner, one settlement. Launch and Stop share admission;
-    /// Stop freezes the tree before killing it, leaving no grace in which it
-    /// can fork work. Only physical exit releases the waiter to settlement.
+    /// One effect owner, one settlement. Launch and Stop share admission; Stop freezes the tree before killing it, leaving no grace in which it can fork work.
+    /// Only physical exit releases the waiter to settlement.
     final class SubprocessWork: @unchecked Sendable {
         private final class Retained: @unchecked Sendable {
             let lock = NSLock()
@@ -78,8 +76,7 @@ extension SwiftToolDispatcher {
         }
         private static let retention = Retained()
 
-        /// Only live owners are retained; terminal evidence belongs to the
-        /// adapter's audit. The key is its exact per-root audit path.
+        /// Only live owners are retained; terminal evidence belongs to the adapter's audit. The key is its exact per-root audit path.
         static func retained(at key: String) -> SubprocessWork? {
             retention.lock.withLock { retention.owners[key] }
         }
@@ -95,9 +92,8 @@ extension SwiftToolDispatcher {
             var value: T? { lock.withLock { result } }
         }
 
-        /// Admission outlives this observer. Expiry, inherited call deadline
-        /// and caller cancellation release only the wait. Explicit abort uses
-        /// this retained owner's stop(); execution keeps its own ceiling.
+        /// Admission outlives this observer. Expiry, inherited call deadline and caller cancellation release only the wait. Explicit abort uses this retained
+        /// owner's stop(); execution keeps its own ceiling.
         func observe<T: Sendable>(key: String, waitSeconds: Int, executionTimeoutSeconds: Int,
                                   pending: T, settlement: @escaping @Sendable (Exit) async -> T) async -> T {
             let observed = ObservedResult<T>()
@@ -184,8 +180,7 @@ extension SwiftToolDispatcher {
                     }
                 }
                 return await settle { [self] in
-                    // The effect has exited; its owner alone now holds the
-                    // immutable tree, output and terminal record.
+                    // The effect has exited; its owner alone now holds the immutable tree, output and terminal record.
                     process.terminationHandler = nil
                     return await settlement(Exit(
                         code: tree == nil ? 127 : process.terminationStatus,
@@ -197,7 +192,6 @@ extension SwiftToolDispatcher {
         }
     }
 
-    // Bounded thread-safe Data accumulator for subprocess pipe capture.
     final class BoundedBuffer: @unchecked Sendable {
         private let lock = NSLock()
         private var head = Data()
@@ -205,7 +199,6 @@ extension SwiftToolDispatcher {
         private var tailStart = 0
         private let cap: Int
         private var _truncated = false
-        /// Each complete line as it arrives, called outside the lock.
         private let onLine: (@Sendable (String) -> Void)?
         private var pendingLine = Data()
         private var discardingLine = false
@@ -213,7 +206,6 @@ extension SwiftToolDispatcher {
         func append(_ chunk: Data) {
             for line in store(chunk) { onLine?(line) }
         }
-        /// The last line, when the output did not end with a newline.
         func finishLines() {
             lock.lock()
             let rest = pendingLine
@@ -281,15 +273,8 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Head+tail preserving truncation for tool output that lands in the model's
-    /// context. Build/test/shell FAILURES put the lines that matter (compiler
-    /// errors, "N tests failed", exit status) at the END of the stream — a
-    /// head-only `.prefix(cap)` keeps the leading progress noise and DROPS those
-    /// trailing errors, blinding the agent to WHY a build failed. This keeps the
-    /// first `headBudget` and last `tailBudget` characters with an explicit
-    /// elision marker between, so the first (often root-cause) error AND the
-    /// final summary both survive. Total kept ≈ headBudget + tailBudget.
-    /// Returns (text, wasTruncated).
+    /// Keep head and tail so both initial errors and terminal summaries survive bounded tool output. An explicit elision marker discloses the cut; head-only
+    /// truncation can hide the cause of failure.
     static func headTailPreserve(
         _ text: String,
         headBudget: Int,

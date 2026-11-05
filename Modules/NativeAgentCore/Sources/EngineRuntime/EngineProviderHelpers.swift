@@ -6,7 +6,7 @@ import NativeAgentShared
 import PersistenceCore
 import Foundation
 import ProviderRouting
-// Blueprint: | `EngineProviderHelpers.swift` | ProvidersFacade checked settings refresh, credential/OAuth verdicts, model grouping, eligibility, snapshot-owned model/account inheritance, auth normalization and quiet provider policy; routing-derived selections share SettingsSnapshot. LatestRead orders settings and failures; committed routing publishes through write and retires prior session reads before checked session refresh. |
+// Blueprint: | `EngineProviderHelpers.swift` | Checked account contracts, inheritance and committed routing publication |
 @MainActor
 extension ProvidersFacade {
     public struct SettingsSnapshot: Sendable {
@@ -28,7 +28,15 @@ extension ProvidersFacade {
     }
 
     public func refreshSettings(refreshCatalog: Bool, cause: (Error, String) -> String) async -> SettingsRefreshOutcome {
-        defer { if !refreshCatalog { refreshAccountModelsInBackground() } }
+        if refreshCatalog {
+            guard catalogRefreshStarted == nil else { return .failed("The model catalog is already being refreshed.") }
+            catalogRefreshStarted = Date()
+            refreshFace()
+        }
+        defer {
+            if refreshCatalog { catalogRefreshStarted = nil; refreshFace() }
+            else { refreshAccountModelsInBackground() }
+        }
         return await settingsReads.read {
             await readSettings(refreshCatalog: refreshCatalog, cause: cause)
         } publish: { outcome in
@@ -167,10 +175,9 @@ extension ProvidersFacade {
         public let supportedReasoningEfforts: [String]
         public let reasoningCapabilitiesKnown: Bool
         public let supportsFast: Bool
-        public let isUnavailable: Bool
 
         public init(id: String, name: String, defaultReasoningEffort: String,
-                    supportedReasoningEfforts: [String], supportsFast: Bool, isUnavailable: Bool,
+                    supportedReasoningEfforts: [String], supportsFast: Bool,
                     reasoningCapabilitiesKnown: Bool) {
             self.id = id
             self.name = name
@@ -178,13 +185,11 @@ extension ProvidersFacade {
             self.supportedReasoningEfforts = supportedReasoningEfforts
             self.reasoningCapabilitiesKnown = reasoningCapabilitiesKnown
             self.supportsFast = supportsFast
-            self.isUnavailable = isUnavailable
         }
     }
 
     public nonisolated static func modelsForProvider(_ providerId: String, providers: [ProviderInfo]) -> [SurfaceModelChoice] {
-        // This account's descriptor is the capability owner. A missing
-        // account/catalog cannot borrow another transport's model contracts.
+        // Read capabilities from this account’s descriptor; absence cannot borrow another transport’s contracts.
         guard let provider = providers.first(where: { $0.provider_id == providerId }) else { return [] }
         return provider.models.map {
             SurfaceModelChoice(
@@ -193,22 +198,18 @@ extension ProvidersFacade {
                 defaultReasoningEffort: $0.default_reasoning_effort ?? "",
                 supportedReasoningEfforts: $0.supported_reasoning_efforts ?? [],
                 supportsFast: $0.supports_fast == true,
-                isUnavailable: false,
                 reasoningCapabilitiesKnown: $0.supported_reasoning_efforts != nil
             )
         }
     }
 
-    /// Providers whose catalogue is fetched rather than compiled in. Their
-    /// `models` list can be empty or last-known when no live catalogue could
-    /// be loaded, so its silence about a model is not evidence of anything.
+    /// Fetched catalogs may be empty or last-known, so missing model entries alone prove nothing.
     private nonisolated static let dynamicCatalogProviders: Set<String> = ["openrouter", "moonshot"]
 
-    /// Absence requires this provider's complete, fresh catalog or compiled-in
-    /// list. Moonshot cannot prove completeness; unknown choices stay visible.
+    /// Only a complete fresh or compiled-in catalog proves absence; Moonshot completeness is unknown, so retain unknown choices.
     private nonisolated static func savedModelIsKnownAbsent(providerId: String, model: String, providers: [ProviderInfo], dataRoot: URL) -> Bool {
         if providerId == "openrouter" {
-            // Availability belongs to this settings read's data root.
+            // Scope availability to this settings read’s root.
             return OpenRouterModelCatalog.cachedAvailability(
                 of: model,
                 dataRoot: dataRoot
@@ -225,42 +226,11 @@ extension ProvidersFacade {
 }
 
 extension ProvidersFacade {
-    public nonisolated static func reconciledBrainForProvider(providerId: String, model: String, reasoningEffort: String?, fastMode: Bool, providers: [ProviderInfo]) -> ProviderTurnChoice? {
-        let choices = ProvidersFacade.modelsForProvider(providerId, providers: providers)
-        guard let choice = choices.first(where: { $0.id == model }),
-              choice.reasoningCapabilitiesKnown else { return nil }
-        let effort = ProviderRouting.normalizedReasoningEffort(
-            preferred: choice.defaultReasoningEffort,
-            selected: reasoningEffort ?? choice.defaultReasoningEffort
-        )
-        return ProviderTurnChoice(
-            provider: providerId,
-            model: choice.id,
-            reasoningEffort: effort,
-            fast: fastMode
-        )
-    }
-
-
-    public nonisolated static func explicitSurfaces(in routing: ProviderRoutingSnapshot) -> Set<String> {
-        routing.modelOverrideSurfaces
-    }
-
-    public nonisolated static func pickerProviders(_ providers: [ProviderInfo], selections: [String: ProviderTurnChoice]) -> [ProviderInfo] {
-        let activeIds = Set(selections.values.map(\.provider))
-        return providers.filter { $0.provider_id == "codex" || $0.auth_status.eligible
-            || activeIds.contains($0.provider_id) }
-    }
-}
-
-extension ProvidersFacade {
     private nonisolated static let emptySelection = ProviderTurnChoice(provider: "codex", model: "", reasoningEffort: "", fast: false)
 
-    /// The surface a group's row reads from: the most common choice among its
-    /// surfaces, ties going to the group's first surface — so the Chat group
-    /// keeps speaking for `chat`.
+    /// Use the most common group choice with first-surface tie breaking; Chat remains its own root.
     public nonisolated static func leadSurface(_ group: ProviderSurfaceGroup, selections: [String: ProviderTurnChoice]) -> String {
-        // Chat is the root the others inherit from, so its group always shows Chat's own choice.
+        // Chat is the inheritance root, so its group shows Chat’s choice.
         if group.surfaces.contains("chat") { return "chat" }
         guard var lead = group.surfaces.first else { return "chat" }
         var counts: [ProviderTurnChoice: Int] = [:]
@@ -273,17 +243,16 @@ extension ProvidersFacade {
         return lead
     }
 
-    /// Independent effort does not make an inheriting group mixed. Only a
-    /// model/account override makes its members' saved choices relevant here.
-    public nonisolated static func groupIsMixed(_ group: ProviderSurfaceGroup, selections: [String: ProviderTurnChoice], explicitSurfaces: Set<String>) -> Bool {
+    /// Only model/account overrides make inheriting groups mixed; independent effort does not.
+    public nonisolated static func groupIsMixed(_ group: ProviderSurfaceGroup, selections: [String: ProviderTurnChoice],
+        explicitSurfaces: Set<String>) -> Bool {
         guard groupHasOverride(group, explicitSurfaces: explicitSurfaces), let first = group.surfaces.first.map({ selections[$0] ?? emptySelection }) else {
             return false
         }
         return group.surfaces.dropFirst().contains { (selections[$0] ?? emptySelection) != first }
     }
 
-    /// Whether the group holds its own model/account choice.
-    /// `chat` is the root everything else inherits from and never clears.
+    /// Chat is the inheritance root and never clears its own route.
     public nonisolated static func groupHasOverride(_ group: ProviderSurfaceGroup, explicitSurfaces: Set<String>) -> Bool {
         group.surfaces.contains { $0 != "chat" && explicitSurfaces.contains($0) }
     }
@@ -335,11 +304,13 @@ extension ProvidersFacade {
         } ?? []
     }
 
-    public nonisolated static func reasoningOptions(from catalog: ModelCatalogResponse?, providers: [ProviderInfo], providerID: String, model: String) -> [ReasoningEffortOption] {
+    public nonisolated static func reasoningOptions(from catalog: ModelCatalogResponse?, providers: [ProviderInfo], providerID: String,
+        model: String) -> [ReasoningEffortOption] {
         reasoningOptions(from: catalog, selectedModel: providerModels(providers: providers, providerID: providerID).first { $0.id == model })
     }
 
-    public nonisolated static func normalizedReasoningEffort(from catalog: ModelCatalogResponse?, providers: [ProviderInfo], providerID: String, model: String, selected: String) -> String {
+    public nonisolated static func normalizedReasoningEffort(from catalog: ModelCatalogResponse?, providers: [ProviderInfo], providerID: String, model: String,
+        selected: String) -> String {
         let selectedModel = providerModels(providers: providers, providerID: providerID).first { $0.id == model }
         guard selectedModel?.supportedReasoningEfforts != nil else { return selected }
         return ProviderRouting.normalizedReasoningEffort(
@@ -359,8 +330,7 @@ public struct ChatComposerModelGroup: Identifiable {
         if previousConnections == connections, previousCatalog == catalog, previousProvider == providerID {
             return previousGroups
         }
-        // One pass over the catalog, not one search per model: this runs on
-        // every hover and OpenRouter alone is hundreds of rows (User 09-27).
+        // Index the catalog once per hover; large providers make per-model searches expensive.
         var catalogById: [String: ModelCatalogItem] = [:]
         for model in catalog?.models ?? [] where catalogById[model.id] == nil {
             catalogById[model.id] = model
@@ -372,7 +342,6 @@ public struct ChatComposerModelGroup: Identifiable {
                     || $0.provider_id == providerID
             }
             .sorted { lhs, rhs in
-                // The provider in use leads; the rest are alphabetical.
                 if (lhs.provider_id == providerID) != (rhs.provider_id == providerID) {
                     return lhs.provider_id == providerID
                 }
@@ -381,9 +350,7 @@ public struct ChatComposerModelGroup: Identifiable {
             .compactMap { provider in
                 let models = provider.models.map { item in
                     let catalogModel = catalogById[item.id]
-                    // Provider-scoped capabilities stay authoritative: the
-                    // global catalog holds duplicate ids for transports with
-                    // different contracts.
+                    // Provider-scoped capability contracts are authoritative because transports can share model ids with different contracts.
                     return ModelCatalogItem(
                         id: item.id,
                         displayName: item.name,
@@ -417,8 +384,7 @@ public struct ChatComposerModelGroup: Identifiable {
         self.models = models
     }
 
-    /// A provider whose models are "company/model" and too many for one list
-    /// opens to its companies first (OpenRouter: ~460 models, 63 companies).
+    /// Group large company/model catalogs by company so the picker stays navigable.
     @MainActor private static var vendorInput: [ModelCatalogItem] = []
     @MainActor private static var vendorOutput: [Self]?
 
@@ -449,14 +415,11 @@ public struct ChatComposerModelGroup: Identifiable {
 
 // MARK: - provider
 
-/// The `provider` tool over the Providers page's own calls: the account list,
-/// the account sheet's Test the connection, the page's Refresh, and the
-/// sheet's Save with only "Model it falls back to" changed — no key, and the
-/// sign-in method the sheet itself would keep.
+/// Provider actions share page operations while preserving the saved sign-in method and keeping keys out of results.
 extension ProvidersFacade {
     @MainActor
     public static func runQuietProvider(
-        verb: String, input: [String: JSONValue], dataRoot: URL,
+        verb: String, input: [String: JSONValue], dataRoot: URL, turn: Turn,
         refresh: () async -> (accounts: [ProviderInfo], failure: String?),
         list: () async throws -> [ProviderInfo],
         test: (String) async throws -> NativeAgentShared.ProviderTestResult,
@@ -497,7 +460,8 @@ extension ProvidersFacade {
         case "test":
             let result: NativeAgentShared.ProviderTestResult
             do { result = try await test(id) } catch {
-                return AppToolExecutor.failure("test_failed", "The test of \(name) could not run: \(error.localizedDescription)." + retry, extra: ["effects": .string("unknown")])
+                return AppToolExecutor.failure("test_failed", "The test of \(name) could not run: \(error.localizedDescription)." + retry,
+                    extra: ["effects": .string("unknown")])
             }
             let works = result.tested && result.status == "ok"
             let problem = NativeAppSecretRedactor.redactText(result.error ?? result.detail ?? result.status)
@@ -532,18 +496,22 @@ extension ProvidersFacade {
                     (model.isEmpty ? "Pass model" : "\(model) is not a model \(name) offers")
                         + ". It takes one of: \(offered.joined(separator: ", ")).")
             }
-            // The sheet's own picker state: the saved sign-in method, kept.
+            // Preserve the sheet’s saved sign-in method.
             let mode = authMode(account)
             guard mode.canSave else {
                 return AppToolExecutor.failure(
                     "sign_in_method_unclear",
-                    "\(name)'s saved sign-in method isn't one its sheet can keep, so nothing was changed. That's the owner's: ask them to open \(name) in Providers.")
+                    """
+                        \(name)'s saved sign-in method isn't one its sheet can keep, so nothing was changed. That's the owner's: ask them to open \(name) in \
+                        Providers.
+                        """)
             }
             let old = account.default_model ?? ""
             do {
                 try await configure(id, mode.selectedMode, model)
             } catch {
-                return AppToolExecutor.failure("save_failed", "\(name)'s fallback model was not saved: \(error.localizedDescription)." + retry, extra: ["effects": .string("unknown")])
+                return AppToolExecutor.failure("save_failed", "\(name)'s fallback model was not saved: \(error.localizedDescription)." + retry,
+                    extra: ["effects": .string("unknown")])
             }
             await reload()
             return .object([
@@ -552,15 +520,14 @@ extension ProvidersFacade {
                 "detail": .string("\(name) now falls back to \(model) wherever no other model is chosen for it."),
             ])
         case "disconnect":
-            // The sheet's Remove the key. User's below Full Mac; the door
-            // refuses it there.
+            // Credential removal requires Full Mac at this door.
             let outcome = await disconnect(id)
             guard outcome.ok else {
                 return AppToolExecutor.failure("disconnect_failed",
                     "\(outcome.detail) app {page:\"providers\"} shows where \(name) stands.",
                     extra: ["provider": .string(id), "effects": .string("unknown")])
             }
-            HarnessDecidedRow.post(requester: "Full Mac", tool: "provider.disconnect \(id)",
+            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "provider.disconnect \(id)",
                                    sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: dataRoot)
             return .object(["status": .string("ok"), "provider": .string(id), "changed": .bool(true),
@@ -570,8 +537,7 @@ extension ProvidersFacade {
         }
     }
 
-    /// The account as its line on the page reads: eligible, and the row's own
-    /// words for how far its key is proven (saved, checked, rejected, could not check).
+    /// Share the page row’s eligibility and credential-proof wording.
     private static func quietProviderRow(_ account: ProviderInfo) -> JSONValue {
         var row: [String: JSONValue] = [
             "id": .string(account.provider_id),

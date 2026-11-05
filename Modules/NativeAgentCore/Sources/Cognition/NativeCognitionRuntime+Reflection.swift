@@ -10,8 +10,9 @@ import MemoryV2
 import PersistenceCore
 import Desk
 import ProviderRouting
+import ChatTurnContracts
 
-// Blueprint: | `NativeCognitionRuntime+Reflection.swift` | `NativeCognitionRuntime` reflection: dream-journal checked completion, REM-triggered single-flight reflection, budget admission, durable result settlement and pursuit proposals |
+// Blueprint: | `NativeCognitionRuntime+Reflection.swift` | `NativeCognitionRuntime`. |
 
 private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConvertible {
     case compileFailed(String)
@@ -28,12 +29,10 @@ private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConve
 }
 
 extension NativeCognitionRuntime {
-    /// A dream's reflection: a judgment, or settled without one (reflection off,
-    /// or the night left nothing unresolved to reflect on). Budget and in-flight refusals stay owed.
+    /// Budget and in-flight refusals keep dream reflection owed; disabled or unnecessary reflection may settle without judgment.
     public enum DreamReflection: Sendable { case judged(CognitiveReflectionReceipt), skipped(String) }
 
-    /// Produce once, integrate later. The provider receipt is durable before
-    /// returning to the dream journal; recovery finds it by this exact reason.
+    /// Persist the provider receipt before returning; exact reason identity lets recovery integrate without another production call.
     public func produceDreamReflection(id: UUID, material: [String: CognitiveReflectionCause]) async throws -> DreamReflection {
         await bootstrap()
         guard usesLiveAppBody, !isFlushedForTermination, !Task.isCancelled else {
@@ -60,11 +59,10 @@ extension NativeCognitionRuntime {
             throw PersistenceCoreError.ioFailure("dream reflection awaits replay: \(detail)")
         }
         let outcome = await runReflectionIfDue(
-            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self),
+            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self, assembly: .suppliedPersona),
             reason: reason, material: material, demand: .spontaneous, retainForDream: true)
         await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
-        // Even a persistence failure retains the produced receipt in the owner.
-        // Never filter it out because its care or mood steps remain owed.
+        // Retain produced receipts even when care or mood settlement remains owed.
         if let receipt = await substrate.reflectionReceiptSnapshot().first(where: {
             $0.request.reason == reason && !$0.cancelled && $0.judgment != nil
         }) {
@@ -75,6 +73,9 @@ extension NativeCognitionRuntime {
         case .failed(let error): throw PersistenceCoreError.ioFailure("dream reflection failed: \(error)")
         case .skipped(let reason, _) where reason == CognitiveSubstrate.reflectionRefusalDisabled
             || reason == CognitiveSubstrate.reflectionRefusalLoadBelowThreshold: return .skipped(reason)
+        // A held slot keeps the reflection owed as busy, not failed.
+        case .skipped(let reason, _) where reason.hasPrefix(LoopTickOutcome.busyPrefix):
+            throw DreamBusy(String(reason.dropFirst(LoopTickOutcome.busyPrefix.count)))
         case .skipped(let reason, _): throw PersistenceCoreError.ioFailure("dream reflection remains owed: \(reason)")
         case .completed: throw PersistenceCoreError.ioFailure("dream reflection returned no judgment receipt")
         }
@@ -97,11 +98,8 @@ extension NativeCognitionRuntime {
         return await substrate.reflectionReceiptSnapshot().first { $0.id == receipt.id }?.integrationSkipped
     }
 
-    /// Reflection follows the committed dream/REM replay. Each caller retains its
-    /// committed material while awaiting the existing single-flight owner.
-    /// Budget/enabled/reservation gating stays inside `runReflectionIfDue`;
-    /// this path adds no new unattended-LLM authority. Gated to the live app
-    /// body so alternate-root runtimes never fire provider work.
+    /// Reflect only after committed dream/REM replay, retaining source material while joining the existing single flight.
+    /// Keep admission inside runReflectionIfDue and provider work restricted to the live app body.
     func scheduleEventDrivenReflection(reason: String, material: [String: CognitiveReflectionCause]) async {
         while let task = reflectionEventTask {
             await task.value
@@ -118,7 +116,7 @@ extension NativeCognitionRuntime {
         defer { reflectionEventTask = nil }
         guard !isFlushedForTermination, !Task.isCancelled else { return }
         let outcome = await runReflectionIfDue(
-            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self),
+            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self, assembly: .suppliedPersona),
             reason: reason,
             material: material,
             demand: .spontaneous
@@ -126,9 +124,8 @@ extension NativeCognitionRuntime {
         await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
     }
 
-    /// `demand` decides what the call has to earn. `.spontaneous` (the loops and
-    /// the commit signal) must clear unresolved load; `.requested` — an explicit
-    /// call — only has to fit under the rolling cost ceiling.
+    /// Spontaneous reflection requires unresolved load; explicit requests need only fit the rolling cost ceiling.
+    /// The injected client uses supplied-persona assembly: this owner compiles the reflection system itself.
     @discardableResult
     public func runReflectionIfDue(
         llm: any LLMClient,
@@ -139,16 +136,23 @@ extension NativeCognitionRuntime {
         retainForDream: Bool = false
     ) async -> LoopTickOutcome {
         await bootstrap()
-        if let bootstrapFailure { return .failed(error: bootstrapFailure) }
-        if let providerRoutingFailure { return .failed(error: providerRoutingFailure) }
+        if let bootstrapFailure { return Self.beatReflection(.failed(error: bootstrapFailure)) }
+        if let providerRoutingFailure { return Self.beatReflection(.failed(error: providerRoutingFailure)) }
         let request: CognitiveReflectionRequest
-        // Take the lease BEFORE planning: planning sets the in-flight
-        // reservation, and a lease refusal after it would strand that
-        // reservation and refuse every reflection until it expires.
+        // Acquire the lease before planning so refusal cannot strand an in-flight reservation.
         let lease = host.backgroundWorkLease(dataRoot: dataRoot)
-        let window = host.backgroundWorkWindow(Date())
+        let now = Date()
+        let window = host.backgroundWorkWindow(now)
         guard await lease.tryAcquire(holder: "reflection", window: window) else {
-            return .skipped(reason: "background work lease held")
+            // A claimed slot is busy and names its holder and the next slot; a lease that cannot be read is a failure, never a hold.
+            let held: (holder: String, acquiredAt: String)?
+            do { held = try await lease.claim(window: window) }
+            catch { return Self.beatReflection(.failed(error: "the background work lease could not be read: \(error.localizedDescription)")) }
+            guard let held else {
+                return Self.beatReflection(.failed(error: "the background work lease refused window \(window), but no claim on it was read"))
+            }
+            let opens = NativeTimestampFormat.plainZulu(host.backgroundWorkWindowEnd(now))
+            return Self.beatReflection(.busy("\(held.holder) took this two-hour background slot at \(held.acquiredAt); the next slot opens at \(opens)"))
         }
         switch await substrate.planReflectionChecked(
             reason: reason,
@@ -159,30 +163,55 @@ extension NativeCognitionRuntime {
         case .admitted(let planned):
             request = planned
         case .refused(let admission):
-            // Honest skip: which fence stopped it, and the load reading behind it.
+            // Record the refusing gate and its load evidence.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
-            return .skipped(reason: admission.reason == CognitiveSubstrate.reflectionRefusalDisabled
+            let refused = LoopTickOutcome.skipped(reason: admission.reason == CognitiveSubstrate.reflectionRefusalDisabled
                 ? LoopTickOutcome.offPrefix + "reflection disabled" : admission.detail)
+            // Too little unresolved load is a pass that found nothing to reflect on, not a hold.
+            if admission.reason == CognitiveSubstrate.reflectionRefusalLoadBelowThreshold {
+                OrganJudge.beat(Self.reflectionOrgan, .nothing, note: admission.detail, cadence: Self.substrateClockCadence)
+                return refused
+            }
+            return Self.beatReflection(refused)
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm, retainForDream: retainForDream)
         if case .skipped(let why, _) = reflectionOutcome, why != "reflection cancelled" {
-            // Routing refused before any provider work; return the unused slot.
-            // A cancellation came after the provider call began: the slot is spent.
+            // Return the unused slot if routing refused before provider work; cancellation after dispatch spends it.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
         }
         publishRuntimeChange(reason: "reflection:finished")
+        Self.beatReflection(reflectionOutcome)
         if case .completed = reflectionOutcome, !retainForDream, !Task.isCancelled, !isFlushedForTermination {
             await proposePursuitFromReflectionIfEligible(reason: reason)
         }
         return reflectionOutcome
     }
 
+    static let reflectionOrgan = "cognition_reflection"
+
+    /// Every reflection path (its daily loop, replay's event, the dream) is judged in `runReflectionIfDue`, so the organ beats there once per pass.
+    @discardableResult
+    private static func beatReflection(_ outcome: LoopTickOutcome) -> LoopTickOutcome {
+        OrganJudge.beat(reflectionOrgan, tick: outcome, cadence: substrateClockCadence)
+        return outcome
+    }
+
+    /// The proposer is judged after each completed reflection: off without unattended work, failed when the Desk will not read or take the pursuit.
     private func proposePursuitFromReflectionIfEligible(reason: String) async {
-        guard !Task.isCancelled, !isFlushedForTermination,
-              await host.unattendedWorkAllowed(dataRoot: dataRoot) else { return }
+        let organ = "pursuit_proposer"
+        guard !Task.isCancelled, !isFlushedForTermination else { return }
+        guard await host.unattendedWorkAllowed(dataRoot: dataRoot) else {
+            OrganJudge.beatOff(organ, because: "unattended work is not allowed")
+            return
+        }
         let cares = await substrate.caresPressing(for: CognitiveCare.ownerKey, at: Date()).map(\.care)
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        guard let state = try? await store.liveState() else { return }
+        let state: DeskState
+        do { state = try await store.liveState() }
+        catch {
+            OrganJudge.beat(organ, .failed, note: "the Desk could not be read: " + error.localizedDescription)
+            return
+        }
         let open = state.items.filter { $0.isPursuit && !$0.status.isTerminal }
         let citations = state.items.filter { $0.isPursuit && $0.origin == .agent }.flatMap {
             $0.pursuit?.evidence.citations ?? []
@@ -192,7 +221,10 @@ extension NativeCognitionRuntime {
             return nil
         })
         guard let proposal = AutonomousPursuitProposer.propose(
-            cares: cares, openAgentPursuitCount: open.count, citedCareIds: cited) else { return }
+            cares: cares, openAgentPursuitCount: open.count, citedCareIds: cited) else {
+            OrganJudge.beat(organ, .nothing, note: "no care called for a new pursuit (\(open.count) open)")
+            return
+        }
         do {
             guard !Task.isCancelled, !isFlushedForTermination else { return }
             let item = try await store.openPursuit(
@@ -205,7 +237,9 @@ extension NativeCognitionRuntime {
                 "rationale": .string(proposal.rationale), "reason": .string(reason),
                 "origin": .string(DeskOrigin.agent.rawValue),
             ]))
+            OrganJudge.beat(organ, .worked, note: "opened a pursuit: " + proposal.title, yield: 1)
         } catch {
+            OrganJudge.beat(organ, .failed, note: "the pursuit was not opened: " + error.localizedDescription)
             await substrate.recordReceipt(kind: "workshop.pursuit_proposal_refused", payload: .object([
                 "careId": .string(proposal.citedCareId), "error": .string(String(describing: error)),
                 "reason": .string(reason),
@@ -260,7 +294,7 @@ extension NativeCognitionRuntime {
         }
         let outcome = await executeReflection(
             request: request,
-            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self),
+            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self, assembly: .suppliedPersona),
             retainForDream: false
         )
         publishRuntimeChange(reason: "reflection:manual_finished")
@@ -274,7 +308,7 @@ extension NativeCognitionRuntime {
         retainForDream: Bool
     ) async -> LoopTickOutcome {
         let result: CognitiveReflectionJudgment
-        // Bind one checked route for execution and receipt attribution.
+        // Bind one checked route for both execution and receipt attribution.
         var plannedRequest = request
         let route: TurnRouteAdmission
         do {
@@ -292,7 +326,10 @@ extension NativeCognitionRuntime {
             route = try snapshot.routeAdmission(for: request.surface, choice: nil, inheritChat: false)
             plannedRequest.model = route.modelId
             plannedRequest.provider = route.providerId ?? ""
-            plannedRequest.reasoningEffort = route.reasoningEffort
+            guard let effort = route.reasoningEffort else {
+                throw ProviderRoutingError.configurationFailed("Reflection's admitted Think level is unavailable.")
+            }
+            plannedRequest.reasoningEffort = effort
         } catch {
             await substrate.releaseReflectionReservation(request: request)
             await substrate.recordReceipt(
@@ -307,16 +344,16 @@ extension NativeCognitionRuntime {
         let request = plannedRequest
         do {
             let system = try await cognitiveReflectionSystemPrompt(surface: request.surface)
-            let raw = try await PrivateWorkContextAssembly.$current.withValue(.suppliedPersona) {
-                try await route.withModelContext {
-                    try await llm.complete(
-                        prompt: request.prompt,
-                        system: system,
-                        model: nil,
-                        surface: request.surface, purpose: "reflection", tools: nil
-                    )
-                }
+            guard let provider = route.providerId, !provider.isEmpty else {
+                throw ProviderRoutingError.configurationFailed("The reflection provider is unavailable.")
             }
+            let turn = Turn().with(\.envelope, TurnEnvelope.native("reflection", surface: request.surface))
+                .with(\.admission, ModelAdmission(provider: provider, model: route.modelId,
+                    reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier))
+            let call = LLMCall(turn: turn, surface: request.surface, purpose: "reflection")
+            let raw = try await llm.complete(
+                prompt: request.prompt, system: system, model: nil,
+                tools: nil, call: call)
             result = try JSONDecoder().decode(CognitiveReflectionJudgment.self, from: Data(raw.utf8))
             try result.validate(material: request.material, cares: request.cares)
         } catch let error as CognitiveReflectionPersonaError {
@@ -388,7 +425,7 @@ extension NativeCognitionRuntime {
         judgment: CognitiveReflectionJudgment?, cancelled: Bool, retainForDream: Bool,
         rejection: String, persistenceFailure: String
     ) async -> LoopTickOutcome? {
-        // Internal reflection mutations use the same coalesced settlement as sensory input.
+        // Use sensory input's coalesced settlement for internal reflection mutations.
         defer { scheduleDirtyMicrocycle(reason: "reflection_result") }
         guard let receipt = await substrate.recordReflectionResult(
             request: request,
@@ -402,7 +439,7 @@ extension NativeCognitionRuntime {
             try await substrate.checkpointReflectionResultChecked(receipt)
             if !retainForDream { try await substrate.persistReflectionResultChecked(receipt) }
         } catch {
-            // The retained judgment and each pending effect survive failure.
+            // Preserve retained judgment and pending effects across failure.
             return .failed(error: "\(persistenceFailure): \(error.localizedDescription)")
         }
         return nil

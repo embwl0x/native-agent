@@ -1,3 +1,4 @@
+import AgentConversations
 import Foundation
 import Cognition
 import OSLog
@@ -6,8 +7,7 @@ import StandingBots
 import NativeAgentShared
 import Desk
 import TriggerScheduler
-import WorkshopExecution
-// Blueprint: | `WorkStatusPublication.swift` | Per-AppModel MainActor publication: one board read, coalesced requests, needs-owner push evaluation and change-suppressed widget status; unavailable identity withholds only the widget publication |
+// Blueprint: | `WorkStatusPublication.swift` | Coalesced board publication for attention and widget; unknown identity withholds its name |
 @MainActor
 public final class WorkStatusPublication {
     private var widgetContainerUnavailableLogged = false
@@ -15,8 +15,7 @@ public final class WorkStatusPublication {
     private var workStatusDirty = false
     public init() {}
 
-    /// One frozen Desk read runs the needs-you push and feeds the widget.
-    /// Desk writes, refreshes and turn activity publish changes without polling.
+    /// Share a frozen Desk read between needs-you push and widget; publish on owner changes without polling.
     public func publishWorkStatus(engine: NativeAgentEngine, displayName: @MainActor () -> String,
                                   reloadWidget: @escaping @Sendable () -> Void) async {
         guard !workStatusInFlight else { workStatusDirty = true; return }
@@ -35,8 +34,7 @@ public final class WorkStatusPublication {
     @available(macOS 27, *)
     private func publishWidgetStatus(_ board: DeskBoardRead, engine: NativeAgentEngine, name: String,
                                      waiting: Int?, reload: @escaping @Sendable () -> Void) async {
-        // Loading/unavailable identity has no name to publish. Profile refresh
-        // will publish again; Desk and needs-you evaluation above still proceed.
+        // Unknown identity publishes no name; profile refresh retries while Desk and attention evaluation proceed.
         guard !name.isEmpty else { return }
         guard !widgetContainerUnavailableLogged else { return }
         let busy = engine.turns.visiblyWorkingSessionIDs
@@ -56,31 +54,31 @@ public final class WorkStatusPublication {
             var activityExpiresAt: Date?
             if let count = waiting {
                 let desk = board.items
-                let executions = board.executions
+                let jobs = board.agentJobs.items
                 let now = Date()
                 let active = busy.filter { id in
                     guard let movement = movements[id],
                           [.working, .tool, .delegation, .retrying].contains(movement.phase) else { return false }
                     return movement.lastMovementAt <= now && now.timeIntervalSince(movement.lastMovementAt) < DeskActivityState.movementWindow
                 }
-                let evidence = DeskMovementPresentation.evidence(executions.items)
-                // Read each item's activity only when the status chain reaches it.
+                let evidence = DeskMovementPresentation.evidence(jobs)
+                // Read activity only when the status chain reaches its item.
                 lazy var activities = desk.map { ($0, DeskMovementPresentation.activity($0, evidence: evidence[$0.handle], now: now)) }
-                let work = executions.items.filter({
-                    DeskActivityState.execution(.init(deskHandle: $0.deskHandle, status: $0.status, updatedAt: $0.updatedAt, lastMovementAt: $0.lastMovementAt), now: now) == .working
-                }).max(by: { ($0.lastMovementAt ?? "") < ($1.lastMovementAt ?? "") })
+                let work = jobs.filter({
+                    DeskActivityState.execution(DeskMovementPresentation.evidence(of: $0), now: now) == .working
+                }).max(by: { $0.updatedAt < $1.updatedAt })
                 if let latest = active.compactMap({ id -> (id: String, movement: Date)? in
                     guard let movement = movements[id]?.lastMovementAt else { return nil }
                     return (id, movement)
                 }).max(by: { $0.movement < $1.movement }),
-                   latest.movement >= (DeskActivityState.movementDate(work?.lastMovementAt) ?? .distantPast) {
+                   latest.movement >= (work?.updatedAt ?? .distantPast) {
                     status = replying.contains(latest.id) ? "Replying…" : "Thinking…"
                     activityExpiresAt = latest.movement.addingTimeInterval(DeskActivityState.movementWindow)
                 } else if count > 0 {
                     status = "Waiting on you"
                 } else if let work {
-                    status = "Working on \(work.title)"
-                    activityExpiresAt = DeskActivityState.movementDate(work.lastMovementAt)?.addingTimeInterval(DeskActivityState.movementWindow)
+                    status = "Working on \(work.brief.split(whereSeparator: \.isNewline).first.map(String.init) ?? work.brief)"
+                    activityExpiresAt = work.updatedAt.addingTimeInterval(DeskActivityState.movementWindow)
                 } else if !busy.isEmpty {
                     status = "Activity unconfirmed"
                 } else if activities.contains(where: { $0.1 == .stale }) {
@@ -113,8 +111,9 @@ public final class WorkStatusPublication {
                             return false
                         }
                     } catch {
-                        // This projection is disposable; repair it from the checked owners.
-                        Logger(subsystem: "NativeAgent", category: "Widget").error("Replacing unreadable status projection: \(error.localizedDescription, privacy: .public)")
+                        // Repair disposable projections from checked owners.
+                        Logger(subsystem: "NativeAgent", category: "Widget").error(
+                            "Replacing unreadable status projection: \(error.localizedDescription, privacy: .public)")
                     }
                 }
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(snapshot), to: url)

@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ContextFlowModels.swift` | ContextFlow value vocabulary: source/atom identity, authority, privacy, injection policy and immutable generation records |
+// Blueprint: | `ContextFlowModels.swift` | Context identities, policy and immutable generations |
 
 // MARK: - Stable identifiers
 
@@ -66,27 +66,20 @@ public enum ContextStableID {
 public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Comparable {
     public let rawValue: String
 
-    /// P2-3: `missions` was the Workshop surface's wire id through 0.3.7 and is
-    /// still stored in `context.db`'s `permitted_surfaces_json`. Folding it here
-    /// — the single construction point, which `Codable` synthesis also routes
-    /// through — means an atom persisted with `missions` and a request minted
-    /// with `workshop` still compare equal. Without the fold the two
-    /// vocabularies never intersect and every Workshop context read returns
-    /// zero atoms, silently.
+    /// Normalize surface IDs at construction, including decoding, so persisted and requested IDs intersect.
     public init(rawValue: String) {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalized.isEmpty { self.rawValue = "unknown"; return }
-        // Peer turns use the bridge context kernel.
-        if normalized == "agent-bridge" || normalized == "agent_bridge" {
+        if normalized == "agent-bridge" {
             self.rawValue = "bridge"
             return
         }
-        // Studio Wander uses the workshop kernel and local-private sources; routing stays `studio_wander`.
+        // Studio Wander shares the workshop kernel and local-private sources while retaining its `studio_wander` route.
         if normalized == "studio_wander" {
             self.rawValue = WorkshopSurfaceVocabulary.canonical
             return
         }
-        self.rawValue = WorkshopSurfaceVocabulary.canonicalSurface(normalized)
+        self.rawValue = normalized
     }
 
     public static let chat = ContextSurface(rawValue: "chat")
@@ -95,7 +88,7 @@ public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Com
     public static let slack = ContextSurface(rawValue: "slack")
     public static let workshop = ContextSurface(rawValue: WorkshopSurfaceVocabulary.canonical)
     public static let bridge = ContextSurface(rawValue: "bridge")
-    /// Standing bots use ordinary context under the agent's Trust.
+    /// Standing bots use the agent's Trust.
     public static let bot = ContextSurface(rawValue: "bot")
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
@@ -170,8 +163,7 @@ public enum ContextContentRole: String, Codable, CaseIterable, Sendable {
     case procedure
     case evidence
     case untrustedExternalData = "untrusted_external_data"
-    /// Phase 5 C3: a memory of what happened between them (moment,
-    /// relationship, a lesson's origin). Selected in its own lane — one or none.
+    /// Select at most one lived relationship memory independently of ordinary memory.
     case personal
 }
 
@@ -491,9 +483,7 @@ public struct ContextStorePruneResult: Codable, Equatable, Sendable {
         self.deletedSourceVersions = deletedSourceVersions
     }
 
-    /// Total rows deleted across every category. A5.5(b): used to decide whether
-    /// a follow-on VACUUM would reclaim anything (an all-zero prune freed no
-    /// pages, so a rewrite would be pure churn).
+    /// An all-zero prune frees no pages, so VACUUM would only rewrite the database.
     public var totalDeleted: Int {
         deletedGenerations + deletedAtomVersions + deletedSourceVersions
     }

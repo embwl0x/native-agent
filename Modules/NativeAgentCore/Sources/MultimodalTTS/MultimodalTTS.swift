@@ -1,7 +1,5 @@
-// OpenAI speech uses the caller's model, a 4096-scalar input cap and a
-// 60-second timeout. The unread remainder is reported with the raw audio.
-// SavedTrustPolicyAuthority denies before credential/network work unless
-// multimodalPolicy.tts_openai is enabled. LLMCredentialResolver owns keys.
+// OpenAI speech uses the caller's model, a 4096-scalar input cap and a 60-second timeout. The unread remainder is reported with the raw audio.
+// TrustCenter denies before credential/network work unless multimodalPolicy.tts_openai is enabled. LLMCredentialResolver owns keys.
 
 import Foundation
 import ProviderRouting
@@ -9,20 +7,13 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `MultimodalTTS.swift` | `MultimodalTTSError`, `SwiftOpenAITTSClient` |
 
-/// Typed failures retain diagnostic details while `LocalizedError` supplies
-/// plain messages for the read-aloud UI.
+/// Typed failures retain diagnostic details while `LocalizedError` supplies plain messages for the read-aloud UI.
 public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
-    /// Saved policy denies OpenAI speech (default off).
     case trustDenied
-    /// The configured OpenAI platform key could not be resolved.
     case notConfigured
-    /// HTTP 401: the key was rejected.
     case authRejected
-    /// A non-2xx HTTP status other than 401.
     case apiError(status: Int)
-    /// Transport failed or returned a non-HTTP response.
     case transport(message: String)
-    /// No text was supplied.
     case emptyText
     /// A route without a speech model refuses read-aloud without borrowing another provider's voice.
     case routeHasNoSpeech(route: String)
@@ -49,8 +40,6 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
     }
 }
 
-/// SwiftNative OpenAI TTS client. Calls https://api.openai.com/v1/audio/speech
-/// directly via URLSession, using the caller's model and the shared credential resolver.
 public final class SwiftOpenAITTSClient: Sendable {
     public static let ttsURL = URL(string: "https://api.openai.com/v1/audio/speech")!
     /// The caller supplies the speech model from its route's catalog entry.
@@ -68,8 +57,8 @@ public final class SwiftOpenAITTSClient: Sendable {
 
     /// Missing flags use the shipped default; damaged policies throw their cause.
     private func ttsOpenAIAllowed() throws -> Bool {
-        try SavedTrustPolicyAuthority.flag(
-            block: "multimodalPolicy", key: "tts_openai", default: false, dataRoot: dataRoot
+        try SwiftNativeTrustCenter(dataRoot: dataRoot).savedPolicyFlag(
+            block: "multimodalPolicy", key: "tts_openai", default: false
         )
     }
 
@@ -80,7 +69,6 @@ public final class SwiftOpenAITTSClient: Sendable {
 
         if text.isEmpty { throw MultimodalTTSError.emptyText }
 
-        // Resolve the platform key through the shared owner at this data root.
         guard let key = try LLMCredentialResolver.checkedAPIKey(
                 providerConfigFile: "openai.json",
                 dataRoot: dataRoot),
@@ -88,7 +76,7 @@ public final class SwiftOpenAITTSClient: Sendable {
             throw MultimodalTTSError.notConfigured
         }
 
-        // Truncate by Unicode scalar and report the remainder as unread.
+        // Count Unicode scalars so truncation matches the provider cap and leaves an explicit unread remainder.
         let truncated = String(String.UnicodeScalarView(text.unicodeScalars.prefix(SwiftOpenAITTSClient.maxInputChars)))
         let unread = max(0, text.unicodeScalars.count - SwiftOpenAITTSClient.maxInputChars)
 
@@ -112,7 +100,6 @@ public final class SwiftOpenAITTSClient: Sendable {
         do {
             (data, response) = try await URLSession.shared.data(for: req)
         } catch {
-            // Propagate cancellation cleanly (same convention as the ProviderRouting adapters).
             if error is CancellationError { throw CancellationError() }
             let nsError = error as NSError
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {

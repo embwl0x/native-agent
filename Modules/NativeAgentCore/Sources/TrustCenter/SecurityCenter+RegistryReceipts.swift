@@ -7,12 +7,7 @@ import PersistenceCore
 extension SwiftNativeSecurityCenter {
     static func receiptSummary(_ value: JSONValue) -> SecurityReceiptSummary? {
         guard case .object(let obj) = value else { return nil }
-        // A damaged receipt is evidence that is unavailable, not a mostly-empty
-        // receipt. Fabricating an id here made one corrupt row render as a new
-        // blank row on every refresh, which both hid the damage and churned the
-        // Security panel. Keep the projection fail-closed like the stores that
-        // produced it: every identity/display field must be present and
-        // non-blank before it becomes UI state.
+        // Require real nonblank receipt identity and display fields so damaged rows cannot become fabricated UI state.
         func required(_ key: String) -> String? {
             guard let value = obj[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !value.isEmpty else { return nil }

@@ -5,8 +5,7 @@ import PackageDescription
 let package = Package(
     name: "NativeAgent",
     platforms: [
-        // USER 2026-08-16: Liquid Glass floor — "no one is using mac os 14".
-        // Public DMG minimum rises with this; deliberate.
+        // Liquid Glass requires this platform floor; the public DMG minimum must match.
         .macOS("26.0")
     ],
     products: [
@@ -21,8 +20,7 @@ let package = Package(
         .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", exact: "2.4.1"),
         .package(
             url: "https://github.com/sparkle-project/Sparkle.git",
-            // 2.9.6 is the security floor: it fixes the installer path race
-            // in GHSA-3x7w-j75x-ppq5 (versions through 2.9.5 are affected).
+            // 2.9.6 is the security floor: it fixes the installer path race in GHSA-3x7w-j75x-ppq5 (versions through 2.9.5 are affected).
             from: "2.9.6"
         ),
         .package(path: "Modules/NativeAgentShared"),
@@ -37,7 +35,8 @@ let package = Package(
             path: "Sources/NativeAgentSenseHost",
             resources: [.copy("../../Resources/Senses")]
         ),
-        .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "PersistenceCore", package: "NativeAgentCore"), .product(name: "NativeAgentCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
+        .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "PersistenceCore", package: "NativeAgentCore"),
+            .product(name: "NativeAgentCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
         .executableTarget(
             name: "NativeAgentChromeRelay",
             dependencies: [
@@ -73,7 +72,6 @@ let package = Package(
                 .product(name: "Senses", package: "NativeAgentCore"),
                 .product(name: "TurnTrace", package: "NativeAgentCore"),
                 .product(name: "Transcripts", package: "NativeAgentCore"),
-                .product(name: "Procedures", package: "NativeAgentCore"),
                 .product(name: "BackgroundLoops", package: "NativeAgentCore"),
                 .product(name: "BackgroundWork", package: "NativeAgentCore"),
                 .product(name: "DoctorChecks", package: "NativeAgentCore"),
@@ -83,7 +81,6 @@ let package = Package(
                 .product(name: "SchedulerExecution", package: "NativeAgentCore"),
                 .product(name: "StandingBots", package: "NativeAgentCore"),
                 .product(name: "SwarmRuns", package: "NativeAgentCore"),
-                .product(name: "WorkshopExecution", package: "NativeAgentCore"),
                 .product(name: "NotificationInbox", package: "NativeAgentCore"),
                 .product(name: "Research", package: "NativeAgentCore"),
                 .product(name: "SystemOps", package: "NativeAgentCore"),
@@ -119,24 +116,7 @@ let package = Package(
             path: "Sources/NativeAgentApp",
             resources: [
                 .copy("../../docs/data-bounds.md"),
-                .copy("../../script/codex_thread_wakeup.js"),
                 .copy("../../script/chatgpt_dot_ipc.js"),
-                .copy("../../script/codex_wake_daemon_probe.js"),
-                .copy("../../script/codex_wake_execution_policy.js"),
-                .copy("../../script/codex_wake_prompt.js"),
-                .copy("../../script/codex_wake_request_params.js"),
-                .copy("../../script/codex_wake_rpc.js"),
-                .copy("../../script/codex_wake_thread_state.js"),
-                .copy("../../script/codex_wake_inbox_projection.js"),
-                .copy("../../script/codex_wake_lane_identity.js"),
-                .copy("../../script/codex_wake_heartbeat.js"),
-                .copy("../../script/wake_worker_common.js"),
-                .copy("../../script/wake_queue_admission.js"),
-                .copy("../../script/wake_turn_observation.js"),
-                .copy("../../script/wake_reply_delivery.js"),
-                .copy("../../script/wake_recovery.js"),
-                .copy("../../script/codex_turn_result.js"),
-                .copy("../../script/omp_thread_wakeup.js"),
             ]
             // END generated app declarations
         )

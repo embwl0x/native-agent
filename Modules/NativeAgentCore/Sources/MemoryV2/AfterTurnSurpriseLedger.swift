@@ -4,24 +4,19 @@ import PersistenceCore
 import CognitiveSubstrate
 import NativeAgentShared
 
-// Blueprint: | `AfterTurnSurpriseLedger.swift` | `AfterTurnSurpriseLedger`: the agent's own labelled record of complete-channel interpretation outcomes (append-only, keyed by agent, memory model and detector version): stable precedent claims, deferred turns labelled when their batch judges them, measured provider and delay costs under shared `Expectation` standing, and a bounded dream reading of contradicted no-op predictions |
+// Blueprint: | `AfterTurnSurpriseLedger.swift` | `AfterTurnSurpriseLedger`, `Expectation`: labelled predictions and measured cost standing |
 
 public struct AfterTurnSurpriseObservation: Sendable, Equatable {
     public let check: AfterTurnMemorySurprise
     public let agreement: AfterTurnSurpriseAgreement
-    /// True when this turn was left owed (deferred) instead of interpreted now.
     public var deferred = false
 }
 
 public struct AfterTurnSurpriseAgreement: Sendable, Equatable {
-    /// Labelled or predicted turns in this scope.
     public let turns: Int
-    /// Turns predicted a complete no-op.
     public let wouldDefer: Int
-    /// Of those, turns whose interpretation changed ANY channel (memories,
-    /// affect, caring, cares, promises): a wrong prediction.
+    /// A change in any interpretation channel contradicts a complete-no-op prediction.
     public let changedOnPrediction: Int
-    /// Of those, turns not yet labelled by a complete judgment.
     public let incompletePredictions: Int
     public let ledgerReadable: Bool
 }
@@ -38,8 +33,7 @@ public struct AfterTurnChannelOutcome: Codable, Sendable, Equatable {
     public let complete: Bool
     public var nothingNew: Bool { complete && !facts && !affect && !caring && !cares && promises == false }
 
-    /// The label a judgment gives: did it keep or change a memory, move affect
-    /// beyond noise, judge a caring moment, move a care, or make a promise?
+    /// Any memory, affect, caring, care or promise change makes the complete judgment nonempty.
     public init(interpretation: AfterTurnInterpretation, factsAsked: Bool) {
         facts = interpretation.memories.contains { $0.action != .skip }
         affect = !interpretation.affect.isNoOp
@@ -65,8 +59,7 @@ public struct AfterTurnChannelOutcome: Codable, Sendable, Equatable {
 
 actor AfterTurnSurpriseLedger {
     static let shared = AfterTurnSurpriseLedger()
-    // Retained rows that never measured promises remain incomplete evidence.
-    // The reader preserves their unknown channel without rewriting the ledger.
+    // Retained rows that never measured promises remain incomplete evidence. The reader preserves their unknown channel without rewriting the ledger.
     static let version = 3
     struct Row: Codable, Sendable {
         let version: Int
@@ -91,10 +84,7 @@ actor AfterTurnSurpriseLedger {
     private var books: [String: Book] = [:]
     static func path(dataRoot: URL) -> URL { dataRoot.appendingPathComponent("memory/after_turn_surprise.jsonl") }
 
-    /// Reconstructed once per root, streaming fixed-size chunks. Rows of an
-    /// older version (count-only shadow labels) are kept on disk and never
-    /// grant standing; a corrupt row, or a current-version row that does not
-    /// decode, makes the record explicitly unreadable.
+    /// Stream bounded chunks on reconstruction. Count-only rows grant no standing; corrupt or undecodable current rows make the record unreadable.
     private func book(_ root: URL) -> Book {
         let path = Self.path(dataRoot: root)
         let key = path.standardizedFileURL.path
@@ -113,9 +103,7 @@ actor AfterTurnSurpriseLedger {
                                let header = (try? JSONSerialization.jsonObject(with: pending)) as? [String: Any],
                                let version = header["version"] as? Int {
                                 if version == Self.version {
-                                    // A current-version row that does not decode is
-                                    // missing evidence: nothing stands on an
-                                    // incomplete record.
+                                    // Undecodable current rows are missing evidence, never standing.
                                     if let row = try? JSONDecoder().decode(Row.self, from: pending) {
                                         Self.add(row, to: &book)
                                     } else { book.readable = false }
@@ -142,16 +130,13 @@ actor AfterTurnSurpriseLedger {
         // A settled label is final: a later attempt adds no second trial.
         if book.rows[row.id]?.channels?.complete == true { return }
         var row = row
-        // A label keeps the turn's ORIGINAL prediction: comparing a later
-        // judgment to memory written after the turn would leak the answer.
-        // Its scope stays the model that judged it.
+        // Keep the original prediction and judging model: comparing against memory written later would leak the answer. A label's vectors come from here.
         if let original = book.rows[row.id], row.channels != nil, original.check.at != nil {
             row.check = original.check.judged(by: row.check.scope?.model)
         }
         let changedLabel = row.check.verdict == .nothingNew ? row.channels?.nothingNew == false
             : row.check.verdict == .somethingNew && row.channels?.nothingNew == true
-        // Only an unlabelled-precedent turn or a contradicted prediction keeps
-        // its vectors as a new precedent.
+        // Only an unlabelled-precedent turn or a contradicted prediction keeps its vectors as a new precedent.
         if row.channels?.complete == true, row.check.rule != nil, !changedLabel {
             row.check = row.check.withoutVectors()
         }
@@ -205,10 +190,7 @@ actor AfterTurnSurpriseLedger {
             }
     }
 
-    /// 65,536 chunk pairs admits all 256 newest examples at 16 chunks per
-    /// side. The 10-30 retained ledger's median is 4 chunks, p90 is 9 (max 30);
-    /// the former 4,096 bound admitted only 4 per side at that population.
-    /// This bounds comparison work only, never the nomination or cost bars.
+    /// 65,536 chunk pairs admit all 256 newest examples at 16 chunks per side; bound comparison work without changing nomination or cost bars.
     private static let comparisonCap = 65_536
 
     func predict(dataRoot: URL, scope: AfterTurnMemorySurprise.Scope, epoch: String,
@@ -221,8 +203,7 @@ actor AfterTurnSurpriseLedger {
             .sorted { $0.at > $1.at }.prefix(256)
         let comparisons = examples.reduce(0) { $0 &+ ($1.check.vectors?.count ?? 0) }
         guard comparisons <= Self.comparisonCap / max(1, vectors.count) else { return .unsure("precedent_comparison_bound") }
-        // Every chunk on BOTH sides needs a counterpart. Similarity nominates;
-        // only the model's settled judgment labels the complete interpretation.
+        // Every chunk on BOTH sides needs a counterpart. Similarity nominates; only the model's settled judgment labels the complete interpretation.
         let ranked = examples.compactMap { row -> (Row, Double)? in
             guard let old = row.check.vectors, !old.isEmpty else { return nil }
             let forward = vectors.map { q in old.map { VectorMath.cosine(q, $0) }.max() ?? -1 }.min() ?? -1
@@ -235,39 +216,27 @@ actor AfterTurnSurpriseLedger {
            let standout = VectorMath.standout(ranked.map(\.1))[0],
            standout >= VectorMath.chanceBar(.action, among: ranked.count) {
             verdict = best.0.channels?.nothingNew == true ? .nothingNew : .somethingNew
-            // The labelled precedent is the claim. Its contrast population
-            // still decides nomination, but cannot reset this claim's trials.
+            // The labelled precedent is the claim. Its contrast population still decides nomination, but cannot reset this claim's trials.
             rule = AfterTurnMemorySurprise.fingerprint([best.0.id])
         }
-        // THE COST LAW, from this scope's own record. A trial is a turn this
-        // claim predicted a no-op and a complete judgment later labelled.
+        // Only complete judgments of turns this claim predicted as no-ops count as cost-law trials.
         let trials = all.filter { rule != nil && $0.check.rule == rule && $0.check.verdict == .nothingNew
             && $0.channels?.complete == true }
         let n = trials.count
         let hits = trials.filter { $0.channels?.nothingNew == true }.count
-        // c_hit: provider-service seconds a correct deferral saves the live
-        // path (the mean of this scope's direct, live judgments). The monotonic
-        // stopwatch surrounds only the judgment call, excluding folding and
-        // storage. Prediction-to-label wall time remains the separate delay.
+        // Measure c_hit from direct live judgment service time, excluding folding and storage; prediction-to-label wall time measures delay separately.
         let direct = all.filter { !$0.recovery && !$0.deferred && $0.providerSeconds > 0 }
         let hitCost = direct.isEmpty ? 0 : direct.reduce(0) { $0 + $1.providerSeconds } / Double(direct.count)
-        // c_miss: seconds a WRONG deferral keeps a required outcome waiting
-        // (from the prediction to its label; before any deferral exists, the
-        // live judgments' own delay measures it). A correct deferred no-op has
-        // no required outcome to delay.
+        // Measure c_miss as prediction-to-label delay of required outcomes; before deferral, use live judgment delay. Correct no-ops delay no outcome.
         let delays = all.compactMap { row -> Double? in
             guard let start = row.check.at, row.channels?.complete == true,
                   !row.deferred || row.channels?.nothingNew == false else { return nil }
             return max(0, row.at.timeIntervalSince(start))
         }
         let missCost = delays.max() ?? 0
-        // Defer only while the Wilson 95% lower bound of the claim's hit rate
-        // beats c_miss / (c_miss + c_hit). Assumptions, stated: future turns'
-        // outcomes are independent and resemble this scope's labelled past;
-        // future provider service and delay resemble the measured ones; the
-        // bound is per precedent claim and per look (repeated looks are not
-        // corrected for; every deferred turn is still judged in its batch and
-        // labels the claim). It is a cost estimate, never a guarantee.
+        // Defer only when the Wilson 95% lower hit-rate bound beats c_miss / (c_miss + c_hit). This assumes independent, representative outcomes and stable
+        // service/delay costs. Bounds are per claim and look, without repeated-look correction; every deferred turn is judged in its batch. This estimates
+        // cost, never guarantees it.
         let standing = Expectation.stands(hits: hits, tries: n,
             cHit: hitCost > 0 ? hitCost : nil, cMiss: missCost > 0 ? missCost : nil)
         return .init(verdict: verdict, reason: rule == nil ? "no_standing_precedent" : "labelled_precedent",
@@ -281,8 +250,7 @@ actor AfterTurnSurpriseLedger {
                 channels: AfterTurnChannelOutcome?, providerSeconds: Double,
                 failure: String?, judgedBy: String?) -> AfterTurnSurpriseObservation {
         var book = self.book(dataRoot)
-        // A LABEL'S SCOPE IS THE MODEL THAT JUDGED IT: a turn predicted for
-        // one model and judged by another never calibrates the first's claim.
+        // Only the model that judged a turn earns its calibration, regardless of the predicted model.
         var row = Row(version: Self.version, at: Date(), session: session, turn: turn, surface: surface,
             recovery: recovery, deferred: deferred,
             check: channels == nil ? check : check.judged(by: judgedBy), channels: channels,
@@ -304,18 +272,16 @@ actor AfterTurnSurpriseLedger {
         return .init(check: row.check, agreement: agreement(book, scope: row.check.scope), deferred: deferred)
     }
 
-    /// The label a batch judgment gives an owed turn: its original
-    /// prediction stays the one scored, and it keeps whether it was deferred.
-    /// An owed turn that was never deferred (a failed call, a quit) is
-    /// recovery, so its batch share never measures the live path's cost.
+    /// Score the original prediction of a judged turn and preserve deferral state. Recovery from failed calls or quits never measures live-path cost.
+    /// The label row stores no vectors: `add` reads them from the turn's prediction row, so a turn's vectors are written once.
     func label(dataRoot: URL, session: String, turn: String, surface: String,
-               channels: AfterTurnChannelOutcome?, providerSeconds: Double,
-               failure: String?, judgedBy: String?) -> AfterTurnSurpriseObservation {
+               channels: AfterTurnChannelOutcome, providerSeconds: Double,
+               judgedBy: String?) -> AfterTurnSurpriseObservation {
         let original = book(dataRoot).rows[session + "\u{0}" + turn]
         let deferred = original?.deferred ?? false
         return record(dataRoot: dataRoot, session: session, turn: turn, surface: surface, recovery: !deferred,
-                      deferred: deferred, check: original?.check ?? .unsure("label_without_prediction"),
-                      channels: channels, providerSeconds: providerSeconds, failure: failure,
+                      deferred: deferred, check: original?.check.withoutVectors() ?? .unsure("label_without_prediction"),
+                      channels: channels, providerSeconds: providerSeconds, failure: nil,
                       judgedBy: judgedBy)
     }
 
@@ -327,8 +293,7 @@ actor AfterTurnSurpriseLedger {
 }
 
 extension SwiftNativeMemoryV2 {
-    /// Read the ledger's final labels, retaining the original prediction and
-    /// counting a deferred turn once when its batch has actually judged it.
+    /// Read the ledger's final labels, retaining the original prediction and counting a deferred turn once when its batch has actually judged it.
     public static func afterTurnMissesForDream(dataRoot: URL, since: Date, through: Date) async throws -> [String] {
         try await AfterTurnSurpriseLedger.shared.dreamMisses(dataRoot: dataRoot, since: since, through: through)
     }

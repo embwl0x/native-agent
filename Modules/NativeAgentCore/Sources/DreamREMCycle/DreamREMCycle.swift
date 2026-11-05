@@ -8,15 +8,10 @@ import ProviderRouting
 import TrustCenter
 
 // MARK: - Subsystem #10: DreamREMCycle
-//
-// SwiftNative owns dream/REM reads and manual cycle execution.
-//
-// The Swift implementation reads dream diary files directly and runs the
-// manual dream/REM cycles through DreamCycleRunner and REMConsolidator.
 
 // MARK: - DreamEntry
 
-/// Dream diary wire keys are `date`, `filename`, `content`, `size` and `modified_at`; unknown fields ride in `extras`.
+/// Round-trip unknown diary fields through extras while keeping canonical wire keys.
 public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
     public var date: String
     public var filename: String?
@@ -25,7 +20,6 @@ public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
     public var modifiedAt: String?
     public var extras: JSONValue?
 
-    /// One entry per night.
     public var id: String { date }
 
     public init(
@@ -94,7 +88,7 @@ public enum DreamREMCycleError: Error, LocalizedError {
     case underlying(String)
     case remDecodeFailure(String)
     case oversizedConversationInput
-    /// A disabled cycle carries its stable error identifier and refusal detail.
+    /// Keep a stable disabled-cycle identifier with its refusal detail.
     case cycleDisabled(error: String, detail: String)
 
     public var errorDescription: String? {
@@ -108,32 +102,16 @@ public enum DreamREMCycleError: Error, LocalizedError {
 }
 
 // MARK: - DreamREMGate / DreamREMSchedule
-//
-// These helpers are pure Swift computation with NO LLM, NO file I/O, and NO
-// persona:
-//
-//   1. THE GATE — the dream and REM policy checks. Disabled cycles return
-//      `dream_cycle_disabled` / `rem_cycle_disabled` WITHOUT touching the LLM.
-//      Keeping the gate in Swift lets UI and manual runs explain why a run is
-//      blocked before launching a cycle.
-//
-//   2. THE SCHEDULE — shared local-clock times and diary date keys. The
-//      scheduler owns the next run; nightly dreams use the previous local day.
-//
-// The cycle body is Swift too: DreamCycleRunner owns dream synthesis and
-// dream_diary writes; REMConsolidator owns weekly REM distillation, proposal
-// staging, GROWTH.md cap/eviction, and archival.
+// Keep gates and schedule projection pure so callers can explain refusal before any cycle work.
+// The scheduler owns timing; runners own synthesis, staging, growth eviction and archival.
 
-/// The gates the dream/REM cycle consults from checked saved authority.
-/// Construct from the Trust policy the Swift app already decodes
-/// (`TrustTrainingPolicy` + `personalityPolicy.dream_cycle_enabled`). Defaults
-/// apply only when policy, block or key is genuinely absent.
+/// Use one checked saved authority snapshot; defaults apply only to genuinely absent policy fields.
 public struct DreamREMGatePolicy: Sendable, Equatable {
-    /// `trainingPolicy.dream_scheduler` — shipped default true.
+    /// The scheduler gate ships enabled.
     public var dreamScheduler: Bool
-    /// `personalityPolicy.dream_cycle_enabled` — default true.
+    /// The personality dream gate defaults enabled.
     public var dreamCycleEnabled: Bool
-    /// `trainingPolicy.rem_cycle_enabled` — default true.
+    /// The REM gate defaults enabled.
     public var remCycleEnabled: Bool
 
     public init(
@@ -146,39 +124,32 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
         self.remCycleEnabled = remCycleEnabled
     }
 
-    /// All three flags come from the same validated authority snapshot.
-    public init(authority: SavedTrustPolicyAuthority) throws {
+    /// Resolve all flags from the same validated authority snapshot.
+    public init(policy: [String: JSONValue]) throws {
         try self.init(
-            dreamScheduler: authority.flag(block: "trainingPolicy", key: "dream_scheduler", default: true),
-            dreamCycleEnabled: authority.flag(block: "personalityPolicy", key: "dream_cycle_enabled", default: true),
-            remCycleEnabled: authority.flag(block: "trainingPolicy", key: "rem_cycle_enabled", default: true)
+            dreamScheduler: SwiftNativeTrustCenter.policyFlag(policy, block: "trainingPolicy", key: "dream_scheduler", default: true),
+            dreamCycleEnabled: SwiftNativeTrustCenter.policyFlag(policy, block: "personalityPolicy", key: "dream_cycle_enabled", default: true),
+            remCycleEnabled: SwiftNativeTrustCenter.policyFlag(policy, block: "trainingPolicy", key: "rem_cycle_enabled", default: true)
         )
     }
 
-    /// Dream cycle runs only when both the scheduler and personality gates are on.
+    /// Require both scheduler and personality authority for dream execution.
     public var dreamEnabled: Bool { dreamScheduler && dreamCycleEnabled }
 
-    /// REM consolidation uses one default-on gate.
     public var remEnabled: Bool { remCycleEnabled }
 
-    /// User-facing details returned when a Swift pre-check blocks a run.
     public static let dreamDisabledDetail =
         "Enable the Dream cycle toggle in Dreams to run a dream cycle."
     public static let remDisabledDetail =
         "Enable the REM cycle toggle in Dreams to run REM consolidation."
 }
 
-/// Shared schedule values for the dream + REM loops. NO LLM, NO I/O.
-/// Nightly dreams run at 03:30 on the MACHINE's own clock and write the
-/// previous local calendar day's diary key.
+/// Use shared local-clock scheduling so nightly dreams name the preceding calendar day.
 public enum DreamREMSchedule {
-    /// Dream loop fire time.
     public static let dreamHour = 3
     public static let dreamMinute = 30
 
-    /// REM loop fire time. SINGLE SOURCE OF TRUTH — the App-side scheduler
-    /// (NativeAgentDreamCycleSchedule) forwards to these; do not duplicate the
-    /// literals there.
+    /// Keep REM timing here; app-side scheduling must forward rather than duplicate constants.
     public static let remHour = 4
     public static let remMinute = 30
 
@@ -188,7 +159,6 @@ public enum DreamREMSchedule {
         return cal
     }
 
-    /// `%Y-%m-%d` in the supplied calendar.
     public static func todayKey(
         now: Date = Date(),
         calendar: Calendar = .current
@@ -197,8 +167,7 @@ public enum DreamREMSchedule {
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
-    /// Nightly dream file stem. A 03:30 local run on June 17 writes the
-    /// June 16 diary entry because the dream reflects the previous day.
+    /// A nightly dream belongs to the preceding local day because it reflects the day that ended.
     public static func dreamEntryDateKey(
         now: Date = Date(),
         calendar: Calendar = localCalendar()
@@ -210,19 +179,12 @@ public enum DreamREMSchedule {
 
 // MARK: - FileBackedDreamDiary
 
-/// File-backed diary listing and by-date reads, including archived entries.
-/// No LLM, scheduler or persona is needed to read a dream.
-/// Markdown under dream_diary (including archive): backed up, excluded from
-/// production export and phone sync; PrivacyMap: dream_diary.
-///
-/// Browsing sorts all Markdown by filename descending, carries the full stem
-/// as `DreamEntry.date`, and includes archives. REM uses the discovered day
-/// prefix; theme cues select exact nightly filenames. By-date reads omit mtime.
+/// Read diary Markdown without models or scheduling; include archives in newest-first browsing.
+/// Backups include dream_diary; export and phone sync exclude it, with PrivacyMap/dream_diary ownership.
+/// Use nightly day prefixes for REM and exact filenames for theme cues.
 public struct FileBackedDreamDiary: Sendable {
     private let diaryDir: URL
-    // `FileManager` is not Sendable, so we use `FileManager.default` inline
-    // (it's safe for the read-only stat/read calls we make) rather than storing
-    // it on a Sendable struct.
+    // Do not store non-Sendable FileManager; use its default inline for read-only filesystem operations.
     private var fm: FileManager { .default }
 
     public init(dataRoot: URL) {
@@ -235,7 +197,7 @@ public struct FileBackedDreamDiary: Sendable {
     public struct DiaryFile: Sendable {
         public let name: String
         public let url: URL
-        /// Calendar day for a nightly filename; nil for other Markdown.
+        /// Non-nightly Markdown has no calendar-day identity.
         public let day: String?
         public var stem: String { (name as NSString).deletingPathExtension }
     }
@@ -244,13 +206,12 @@ public struct FileBackedDreamDiary: Sendable {
         let day = String(stem.prefix(10))
         guard day.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else { return nil }
         if stem == day { return day }
-        // DreamArchiver's live collision writer retains both copies as <day>_<UUID>.md.
+        // Include collision copies retained by the archive writer under day-plus-UUID names.
         guard stem.dropFirst(10).first == "_", UUID(uuidString: String(stem.dropFirst(11))) != nil else { return nil }
         return day
     }
 
-    /// Discovery only: callers choose active/history coverage and filename policy.
-    /// A date window uses local calendar days, like weekly REM.
+    /// Discovery cannot choose active/history coverage for callers; use local calendar days for window bounds.
     public func discover(
         in location: Location, matching filenames: Filenames,
         since: Date? = nil
@@ -267,7 +228,7 @@ public struct FileBackedDreamDiary: Sendable {
         }
     }
 
-    /// Read and stat once; callers decide whether missing metadata is acceptable.
+    /// Read and stat once so callers judge missing metadata against one observation.
     private func materialize(_ file: DiaryFile, date: String) throws -> DreamEntry {
         let text = try String(contentsOf: file.url, encoding: .utf8)
         let attrs = try fm.attributesOfItem(atPath: file.url.path)
@@ -276,7 +237,6 @@ public struct FileBackedDreamDiary: Sendable {
             modifiedAt: (attrs[.modificationDate] as? Date).map { ISO8601DateFormatter().string(from: $0) })
     }
 
-    /// REM reads active dated entries, oldest first, with the day prefix as identity.
     public func entriesSince(_ since: Date?) throws -> [DreamEntry] {
         try discover(in: .active, matching: .dated, since: since).map { file in
             try materialize(file, date: file.day!)
@@ -298,8 +258,7 @@ public struct FileBackedDreamDiary: Sendable {
     ) -> (files: [DiaryFile], storage: String) {
         var found: [DiaryFile] = []
         var storage = "readable"
-        // A directory that EXISTS but cannot be listed is a read failure, not
-        // an empty diary. A directory that is simply absent is the empty case.
+        // An unreadable existing directory is failure; only an absent directory is an empty diary.
         func names(in directory: URL) -> [String] {
             do { return try fm.contentsOfDirectory(atPath: directory.path) } catch {
                 if directory == diaryDir {
@@ -331,29 +290,26 @@ public struct FileBackedDreamDiary: Sendable {
         return (found, storage)
     }
 
-    /// A listing that distinguishes no dreams from an unreadable diary.
+    /// Distinguish empty diary from unreadable listing.
     public struct DiaryListing: Sendable {
         public let entries: [DreamEntry]
         public let totalEntries: Int
         public let storage: String
         public let activeFilenames: Set<String>
-        /// The diary (or an archive year) is there and could not be listed.
         public let storageUnreadable: Bool
-        /// Files that were listed but could not be read or stat'ed this pass.
         public let failures: [String: String]
         public var unreadableEntries: Int { failures.count }
 
         public var isComplete: Bool { !storageUnreadable && unreadableEntries == 0 }
     }
 
-    /// The same listing, with what it could not read carried out alongside it.
+    /// Carry unreadable items beside readable siblings.
     public func listEntriesChecked(limit: Int) -> DiaryListing {
         let clamped = max(1, limit)
         var unreadableDirectory = false
         let discovered = diaryFiles(in: .includingArchives, matching: .markdown) { directory, _ in
             if fm.fileExists(atPath: directory.path) { unreadableDirectory = true }
         }
-        // One filename sort orders the merged diary newest-first.
         let files = discovered.files
             .sorted { $0.name > $1.name }
             .prefix(clamped)
@@ -373,20 +329,19 @@ public struct FileBackedDreamDiary: Sendable {
             storageUnreadable: unreadableDirectory, failures: failures)
     }
 
-    /// Invalid keys and absent files are distinct; read/stat failures throw.
+    /// Keep invalid keys and absent files distinct; propagate read/stat failures.
     public enum ByDateResult: Sendable, Equatable {
         case badPath(storage: String)
         case notFound(storage: String)
         case entry(DreamEntry, archived: Bool)
     }
 
-    /// Read an active or archived entry by stem, omitting modification time.
     public func getEntryResult(_ dateKey: String) throws -> ByDateResult {
         func storage() -> String {
             diaryFiles(in: .active, matching: .markdown) { _, _ in }.storage
         }
         let trimmed = dateKey.trimmingCharacters(in: .whitespaces)
-        // A key is one path segment, confined to the diary and outside reserved names.
+        // Validate one nonreserved path segment before resolving a diary key.
         if trimmed.isEmpty { return .badPath(storage: storage()) }
         if ["diary", "today", "run"].contains(trimmed) { return .badPath(storage: storage()) }
         if trimmed.contains("/") || trimmed.contains("\\")
@@ -395,20 +350,21 @@ public struct FileBackedDreamDiary: Sendable {
             return .badPath(storage: storage())
         }
         var url = diaryDir.appendingPathComponent("\(trimmed).md")
-        // Both active and archived entries must stay strictly inside the diary.
+        // Confine active and archived entries strictly to the diary.
         let resolvedDir = diaryDir.standardizedFileURL.resolvingSymlinksInPath().path
         let resolvedFile = url.standardizedFileURL.resolvingSymlinksInPath().path
         guard let tail = NativeAgentWorkspaceRoot.relativePath(resolvedFile, under: resolvedDir), !tail.isEmpty else { return .badPath(storage: storage()) }
 
-        // Not in the top directory: weekly REM may have moved it to
-        // `archive/<year>/`. Same stem, same containment rules — the date key
-        // has already been proven to carry no separators.
+        // Archived entries use the same validated stem and containment rules as active entries.
         if !fm.fileExists(atPath: url.path) {
             let archived = diaryDir.appendingPathComponent("archive", isDirectory: true)
                 .appendingPathComponent(String(trimmed.prefix(4)), isDirectory: true)
                 .appendingPathComponent("\(trimmed).md")
             guard fm.fileExists(atPath: archived.path) else { return .notFound(storage: storage()) }
-            guard let tail = NativeAgentWorkspaceRoot.relativePath(archived.standardizedFileURL.resolvingSymlinksInPath().path, under: resolvedDir), !tail.isEmpty else {
+            guard let tail = NativeAgentWorkspaceRoot.relativePath(
+                archived.standardizedFileURL.resolvingSymlinksInPath().path,
+                under: resolvedDir
+            ), !tail.isEmpty else {
                 return .badPath(storage: storage())
             }
             url = archived
@@ -419,8 +375,7 @@ public struct FileBackedDreamDiary: Sendable {
         return .entry(entry, archived: url.deletingLastPathComponent() != diaryDir)
     }
 
-    /// Convenience: nil for badPath/notFound, the entry otherwise. Read errors
-    /// still propagate.
+    /// Return nil only for invalid path or absence; propagate read failures.
     public func getEntry(_ dateKey: String) throws -> DreamEntry? {
         switch try getEntryResult(dateKey) {
         case .badPath, .notFound: return nil
@@ -431,7 +386,7 @@ public struct FileBackedDreamDiary: Sendable {
 
 // MARK: - SwiftNative cycle runners
 
-/// Native dream/REM runners own policy admission; the facade preserves public errors.
+/// Runners own policy admission; preserve their errors at the facade.
 public actor SwiftNativeDreamREMCycle {
     private let dataRoot: URL
     private let dreamRunner: DreamCycleRunner
@@ -451,12 +406,11 @@ public actor SwiftNativeDreamREMCycle {
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) throws {
         self.dataRoot = dataRoot
-        let effectiveGate = try gate ?? DreamREMGatePolicy(authority: .read(dataRoot: dataRoot))
+        let effectiveGate = try gate ?? DreamREMGatePolicy(policy: SwiftNativeTrustCenter(dataRoot: dataRoot).loadSavedPolicyChecked())
         let llm = makeResidentProviderLLMClient(
             dataRoot: dataRoot, lifecycleObserver: lifecycleObserver, stallOnlyTransport: true)
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        // Both scheduler and manual paths carry memory, felt tone and the
-        // returning mood through these same runners.
+        // Manual and scheduled paths share memory, felt tone and mood wiring.
         self.dreamRunner = DreamCycleRunner(
             dataRoot: dataRoot,
             personaRoot: personaRoot,
@@ -470,7 +424,7 @@ public actor SwiftNativeDreamREMCycle {
             datedMoodSink: dreamMoodSink,
             gate: effectiveGate
         )
-        // The app wires the same approval stager for manual and scheduled REM.
+        // Manual and scheduled REM share the same approval stager.
         self.remConsolidator = REMConsolidator(
             dataRoot: dataRoot,
             personaRoot: personaRoot,
@@ -480,11 +434,10 @@ public actor SwiftNativeDreamREMCycle {
         )
     }
 
-    /// Manual and scheduled dreams share one gate, runner and dedupe; the trigger selects receipt and target day.
+    /// Share gate, runner and deduplication; only trigger provenance and target day differ.
     public func previewDream() async throws -> DreamReport {
         try requireLiveProviders()
-        // No lifecycle observer, owed repair, reservation, diary, mark, lesson,
-        // mood or care write. The runner owns assembly, generation and decode.
+        // Preview may assemble, generate and decode only; it cannot mutate lifecycle, journal, memory, mood or care state.
         return try await dreamRunner.runNightlyDreamCycle(trigger: .manual, preview: true)
     }
 
@@ -526,7 +479,7 @@ public actor SwiftNativeDreamREMCycle {
 
     public func runREM(force: Bool) async throws -> REMReport {
         try requireLiveProviders()
-        // Force bypasses the weekly marker, never the owner's policy gate.
+        // Force bypasses weekly freshness rather than policy admission.
         return try await remConsolidator.runWeeklyREM(force: force)
     }
 
@@ -540,13 +493,8 @@ public actor SwiftNativeDreamREMCycle {
 
 // MARK: - Factory
 
-// Native dream/REM factory. `gate` remains optional for callsites that already
-// computed policy; nil loads the persisted trust policy in-process.
-// `remStageApproval` lets the app pass its ApprovalInbox stager so manual REM
-// runs stage approvals the same way the background loop does.
-// `dreamMoodSink` threads through so a factory-built cycle that RUNS a dream
-// participates in the slow disposition layer (U2a) — without it, the default
-// no-op sink means the dream feels the day but the day never feels the dream.
+// Injected gates preserve checked caller authority; otherwise load saved policy.
+// Inject the same approval stager and mood sink so factory runs retain ordinary staging and body effects.
 public func makeDreamREMCycle(
     root: URL = PersistenceCore.defaultDataRoot(),
     gate: DreamREMGatePolicy? = nil,
@@ -560,4 +508,4 @@ public func makeDreamREMCycle(
         lifecycleObserver: lifecycleObserver)
 }
 import CognitiveSubstrate
-// Blueprint: | `DreamREMCycle.swift` | `FileBackedDreamDiary`: typed active/archive discovery and checked reads; `SwiftNativeDreamREMCycle` threads shared self/surprise/felt providers into real and preview dream generation; preview bypasses the facade's repair writes |
+// Blueprint: | `DreamREMCycle.swift` | `FileBackedDreamDiary`, `SwiftNativeDreamREMCycle`. |

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
-// Blueprint: | `StorageChecks.swift` | StorageCheck prepares only STORAGE_SUBDIRS and leaves retired directories and existing contents untouched; RuntimeJSONStoresCheck inspects owner state without mutation; OpLogHealthCheck measures feed readability and compaction |
+// Blueprint: | `StorageChecks.swift` | Canonical scaffold only; read-only owner inspection; checked feed readability and compaction |
 
 private enum DoctorJSONShape: Sendable {
     case object
@@ -30,7 +30,6 @@ private enum DoctorJSONInspection {
 
 }
 
-/// Canonical Swift runtime subdirectory tree created under `root`.
 let STORAGE_SUBDIRS: [String] = [
     "runs", "memory",
     "chat", "chat/messages", "chat/session_state",
@@ -43,7 +42,6 @@ let STORAGE_SUBDIRS: [String] = [
     "codex_home",
     "work_journal",
     "activity",
-    "workshop", "workshop/executions", "workshop/migrations",
     "trust",
     "backups",
     "release",
@@ -51,7 +49,6 @@ let STORAGE_SUBDIRS: [String] = [
     "abilities", "skills", "skills/runs",
     "tools",
     "workflows", "workflows/approvals",
-    "swarms",
     "research/lab",
     "traces",
     "catalog", "catalog/quarantine", "catalog/sources", "catalog/trust",
@@ -64,8 +61,6 @@ let STORAGE_SUBDIRS: [String] = [
     "production", "production/exports", "production/support",
 ]
 
-/// Creates the root and every entry in `STORAGE_SUBDIRS`. Throws on the first directory it cannot create — the caller maps that
-/// to status="fail".
 func ensureDirs(_ root: URL) throws {
     let fm = FileManager.default
     try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -75,8 +70,7 @@ func ensureDirs(_ root: URL) throws {
     }
 }
 
-/// Prepares the runtime scaffold and checks writability with a fresh probe. Retired directories and any existing contents are
-/// left for the operator.
+/// Probe scaffold writability without changing existing contents or unrelated directories.
 public struct StorageCheck: DoctorCheck {
     public let id: String = "storage"
     public let title: String = "App Storage"
@@ -113,13 +107,15 @@ public struct StorageCheck: DoctorCheck {
         }
     }
 
-    /// The person's controls when this user cannot create or read app data.
     static func accessStep(_ path: String) -> String {
-        "Free space in System Settings → General → Storage if the disk is full, or give this user read and write access to \(path) in Finder → Get Info → Sharing & Permissions."
+        """
+            Free space in System Settings → General → Storage if the disk is full, or give this user read and write access to \(path) in \
+            Finder → Get Info → Sharing & Permissions.
+            """
     }
 }
 
-/// Inspects existing runtime stores without creating or resetting their owners' state.
+/// Inspect stores without creating or resetting state; each owner decides how absence begins.
 public struct RuntimeJSONStoresCheck: DoctorCheck {
     public let id: String = "runtime_json_stores"
     public let title: String = "Runtime JSON Stores"
@@ -175,8 +171,7 @@ public struct RuntimeJSONStoresCheck: DoctorCheck {
     ]
 }
 
-/// Fail on unreadable or undecodable feeds; compaction must preserve rows this build cannot decode. Warn on excess growth or
-/// torn trailing rows; missing feeds are healthy fresh-install state.
+/// Preserve undecodable/newer feed rows during compaction; missing feeds can bootstrap, unreadable feeds cannot.
 public struct OpLogHealthCheck: DoctorCheck {
     public let id: String = "op_log_health"
     public let title: String = "Op-Log Health"
@@ -231,7 +226,10 @@ public struct OpLogHealthCheck: DoctorCheck {
                 detail: "An op-log feed is unreadable: \(detail)",
                 harm: "Saved work may be unreadable and its history will keep growing.",
                 human_action: ToolFailureError.fileRepairInstruction(file,
-                    shape: "This is an append-only JSONL operation feed for its saved work store. Preserve the original operation identities, ordering and payloads, including rows from newer versions."))
+                    shape: """
+                        This is an append-only JSONL operation feed for its saved work store. Preserve the original operation identities, ordering \
+                        and payloads, including rows from newer versions.
+                        """))
         }
         if warned {
             return CheckResult(source: "desk/desk_ops.jsonl",

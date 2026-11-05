@@ -4,6 +4,14 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.15 — one living app (2026-11-05)
+
+- Every page is one face the agent keeps current from launch, drawn the same on Mac and iPhone; the agent reads the page the person sees
+- One inbox in the agent's record: an alert reaches the phone, its conversation and the Mac (when present) once; an answer anywhere closes it everywhere; quiet hours hold all but what went wrong
+- A turn shows what it is writing and how much while a long step streams; a message sent during a turn is read by it; news wakes the agent at once
+- Faster and lighter: turn preparation about twice as fast; history served from the provider cache, so fresh input per turn fell to a fraction
+- iPhone: chat opens at the newest message in about two seconds; an unreadable record is set aside, never replayed; the phone's pages are the Mac's faces; phone approvals carry the paired phone's signature
+
 ## 0.6.14 — Mac and iPhone together (2026-11-02)
 
 - iPhone and Mac together: talk with your agent by voice from the iPhone in a call-style mode, with sentence-by-sentence speech and barge-in; hold to talk sends a voice note as text; replies stream to the phone as they are written, and the first words arrive in about three seconds instead of fifteen

@@ -5,7 +5,7 @@ import NativeAgentCore
 import FoundationModels
 #endif
 
-// Blueprint: | `MemoryV2+FoundationModels.swift` | `OnDeviceClassification`: shared category prompt and exact reply parser for on-device and remote kind labels |
+// Blueprint: | `MemoryV2+FoundationModels.swift` | `OnDeviceClassification`: exact category prompt and reply parsing |
 
 // MARK: - On-device classification of existing memory rows
 
@@ -13,15 +13,13 @@ public enum FoundationModelsError: Error, Sendable, Equatable {
     case unavailable
     case decodeFailed(String)
     case generationFailed(String)
-    /// `classify` got a model reply that matches none of the candidate
-    /// categories. The associated value retains the offending reply.
+    /// Retain the offending reply when classification matches no declared category.
     case classificationNoMatch(String)
 }
 
 public enum OnDeviceClassification {
 
-    /// True only on macOS 26+ with Apple Intelligence enabled and the
-    /// `FoundationModels` framework present at compile time.
+    /// True only on macOS 26+ with Apple Intelligence enabled and the `FoundationModels` framework present at compile time.
     public static var isAvailable: Bool {
         #if canImport(FoundationModels)
         if #available(macOS 26, *) {

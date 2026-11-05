@@ -4,27 +4,24 @@ import AppToolRuntime
 import NativeAgentCore
 import SwiftUI
 
-// Blueprint: | `ShotgunPointer.swift` | `AgentPointerOverlay`: noninteractive agent pointer presentation and fade lifecycle through Shotgun's nonisolated completion adapter, excluded from agent captures |
+// Blueprint: | `ShotgunPointer.swift` | `AgentPointerOverlay`: noninteractive pointer and fades; excluded from agent captures |
 
-// AgentPointerHold restores the person's cursor; this separate named pointer
-// glides to agent actions, pulses on clicks, and fades after inactivity or the
-// drive ends. It is noninteractive and excluded from agent captures.
+// Keep the agent pointer noninteractive and out of captures; AgentPointerHold restores the person's cursor.
 
 @MainActor
 final class AgentPointerOverlay {
     static let size = NSSize(width: 180, height: 44)
-    /// How long her pointer stays after her last pointer action.
     static let lingers: Duration = .seconds(3)
 
     private var panel: NSPanel?
     private let model = AgentPointerModel()
     private var fadeTask: Task<Void, Never>?
 
-    /// Her pointer action at `point` (CGEvent space).
+    /// Use CGEvent space so the overlay lands on the same screen coordinates as the action.
     func show(at point: CGPoint, pressed: Bool, name: String) {
         let panel = makePanel()
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-        // The tip of the drawn pointer sits at the panel's top-left.
+        // Align the drawn tip with the event point at the panel's top-left.
         let origin = NSPoint(x: point.x - 2, y: primaryHeight - point.y - Self.size.height + 2)
         model.name = name
         if pressed { model.presses &+= 1 }
@@ -50,7 +47,6 @@ final class AgentPointerOverlay {
         }
     }
 
-    /// Her pointer goes: a few seconds after her last action, or when the drive ends.
     func fade() {
         fadeTask?.cancel()
         fadeTask = nil
@@ -82,7 +78,7 @@ final class AgentPointerOverlay {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.animationBehavior = .none
-        panel.sharingType = .readOnly  // her captures skip it by number; a recording shows her pointer
+        panel.sharingType = .readOnly  // Exclude by window number only from agent captures; preserve human recordings.
         panel.contentView = NSHostingView(rootView: AgentPointerView(model: model))
         self.panel = panel
         return panel
@@ -100,14 +96,13 @@ private struct AgentPointerView: View {
     let model: AgentPointerModel
     @AppStorage(HazeColor.storageKey) private var hazeRaw = HazeColor.defaultValue.rawValue
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// True at rest (the ring has opened out and gone); a click restarts it.
+    /// Restart the ring for each click even when the prior pulse has finished.
     @State private var pulse = true
 
     var body: some View {
         let haze = HazeColor(stored: hazeRaw)
         HStack(alignment: .top, spacing: 2) {
             ZStack(alignment: .topLeading) {
-                // The click: one ring opening out from the tip.
                 Circle()
                     .stroke(haze.base.opacity(pulse ? 0 : 0.7), lineWidth: 2)
                     .frame(width: 26, height: 26)

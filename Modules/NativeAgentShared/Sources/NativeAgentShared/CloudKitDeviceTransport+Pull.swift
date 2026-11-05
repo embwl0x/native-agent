@@ -8,12 +8,9 @@ import OSLog
 extension CloudKitDeviceTransport {
     // MARK: pull (cursor-paginated)
 
-    /// The deployed container does not permit range predicates on either the
-    /// private `___modTime` field or our ISO-string `createdAt` field. Filter by
-    /// the indexed direction, sort newest-first by the server modificationDate
-    /// (the same clock as the watermark — see `pullPages`), and page until a
-    /// page crosses the durable server-date watermark. This keeps quiet polls
-    /// to one bounded page while still draining bursts larger than one page.
+    /// The deployed container does not permit range predicates on either the private `___modTime` field or our ISO-string `createdAt` field. Filter
+    /// by the indexed direction, sort newest-first by the server modificationDate (the same clock as the watermark — see `pullPages`), and page until
+    /// a page crosses the durable server-date watermark. This keeps quiet polls to one bounded page while still draining bursts larger than one page.
     static func makePullPredicate(inboundDirection: String) -> NSPredicate {
         NSPredicate(format: "direction == %@", inboundDirection)
     }
@@ -21,14 +18,16 @@ extension CloudKitDeviceTransport {
     func pull(
         recordType: String,
         since: Date?,
-        inboundDirection: String
+        inboundDirection: String,
+        recovery: DeviceSyncRecovery
     ) async throws -> DeviceCKPullResult {
         do {
-            return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull", onFailure: accountFailureReporter) {
+            return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull", recovery: recovery, onFailure: accountFailureReporter) {
                 return try await self.pullPages(
                     recordType: recordType,
                     since: since,
-                    inboundDirection: inboundDirection
+                    inboundDirection: inboundDirection,
+                    recovery: recovery
                 )
             }
         } catch is DeviceCKLandmineTimeout {
@@ -39,7 +38,8 @@ extension CloudKitDeviceTransport {
     private func pullPages(
         recordType: String,
         since: Date?,
-        inboundDirection: String
+        inboundDirection: String,
+        recovery: DeviceSyncRecovery
     ) async throws -> DeviceCKPullResult {
         let query = CKQuery(
             recordType: recordType,
@@ -54,11 +54,12 @@ extension CloudKitDeviceTransport {
         var nextCursor: CKQueryOperation.Cursor?
         var firstPage = true
 
+        let pageSizes = [1, 4, 16, 64, 200]
+        var pageIndex = 0
         repeat {
-            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
+            guard recovery.hasTime else { throw CancellationError() }
             let op: CKQueryOperation
             // Only the first query operation sets its sort; cursors carry subsequent ordering.
-            let carriesSortDescriptor = firstPage
             if firstPage {
                 op = CKQueryOperation(query: query); firstPage = false
             } else if let c = nextCursor {
@@ -67,10 +68,10 @@ extension CloudKitDeviceTransport {
                 break
             }
             op.qualityOfService = .userInitiated
-            // The container cannot filter by the watermark, so every poll's
-            // first page is fetched whole; a quiet poll's first page almost
-            // always reaches it. Keep that page small; a burst pages on at 200.
-            op.resultsLimit = carriesSortDescriptor ? 25 : 200
+            // The container cannot filter by the watermark, so pages grow fourfold from the newest record: a quiet poll reads one record and
+            // stops at the watermark, a poll with new records reads at most about four times what is new, and only a backlog pages on at 200.
+            op.resultsLimit = pageSizes[min(pageIndex, pageSizes.count - 1)]
+            pageIndex += 1
 
             let holder = DeviceCKPullPageHolder()
             op.recordMatchedBlock = { _, result in
@@ -79,8 +80,7 @@ extension CloudKitDeviceTransport {
                     holder.fail(error)
                 case .success(let ck):
                     holder.noteModificationDate(ck.recordID.recordName, ck.modificationDate)
-                    // Old records are paging evidence, not delivery candidates.
-                    // A previous pairing key must not be needed to pass them.
+                    // Old records are paging evidence, not delivery candidates. A previous pairing key must not be needed to pass them.
                     if let since, let date = ck.modificationDate, date <= since { return }
                     do {
                         let fields = NAChatMessageFields(
@@ -104,8 +104,11 @@ extension CloudKitDeviceTransport {
                 }
             }
 
-            // Return the page and cursor together without mutating captured traversal state.
-            let page = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [(fields: NAChatMessageFields, modDate: Date?)], payloadError: DeviceSyncError?, modificationDates: [Date?], cursor: CKQueryOperation.Cursor?), Error>) in
+            // Return traversal state rather than mutating captured state across the continuation.
+            let page = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [(fields: NAChatMessageFields, modDate: Date?)],
+                payloadError: DeviceSyncError?,
+                modificationDates: [Date?],
+                cursor: CKQueryOperation.Cursor?), Error>) in
                 op.queryResultBlock = { result in
                     switch result {
                     case .success(let cursor):
@@ -121,7 +124,7 @@ extension CloudKitDeviceTransport {
                 }
                 self.database.add(op)
             }
-            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
+            guard recovery.hasTime else { throw CancellationError() }
             combined.records.append(contentsOf: page.records)
             combined.payloadError = combined.payloadError ?? page.payloadError
             let crossedWatermark = Self.pullPageCrossesWatermark(

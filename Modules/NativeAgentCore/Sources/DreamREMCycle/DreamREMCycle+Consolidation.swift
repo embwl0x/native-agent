@@ -2,25 +2,19 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `DreamREMCycle+Consolidation.swift` | `REMConsolidator`: one explicitly routed GROWTH completion and proposal parsing with verbatim source-bound supporting passages and displaced alternatives |
+// Blueprint: | `DreamREMCycle+Consolidation.swift` | `REMConsolidator`. |
 
-/// One passage a candidate actually rests on: the verbatim words from ONE dream
-/// entry, bound to that entry's date and to the sources behind it. Not a
-/// paraphrase and not a date list — the text itself, so an approval can be read
-/// against what was written rather than against a claim about it.
+/// Bind verbatim support to its dream entry and source evidence so approval can inspect actual writing rather than a paraphrased claim.
 public struct REMSupportingPassage: Sendable, Codable, Equatable {
-    /// The diary entry's date — the date of the DREAM, not of the living.
+    /// Distinguish the dream's date from when its source material happened.
     public var dreamDate: String
-    /// Verbatim from that entry. A quote that is not in the entry is dropped
-    /// before it gets here.
+    /// Reject quotes absent from their named entry before constructing support.
     public var quote: String
-    /// The dates the material behind that entry actually HAPPENED on. Empty
-    /// when no lived dates were established: unavailable, and
-    /// labelled as such — never counted as support.
+    /// Unestablished lived dates remain unavailable rather than supporting recurrence.
     public var livedDates: [String]
-    /// The claim's row citations, grouped by exchange when known.
+    /// Group claim-bound citations by exchange only when known.
     public var sourceRefs: [String]
-    /// Only the claim-bound writer sets this; other citations are not claim support.
+    /// Only the claim-bound writer can attest support; unrelated citations cannot.
     public var claimBound: Bool
 
     public init(
@@ -38,24 +32,19 @@ public struct REMSupportingPassage: Sendable, Codable, Equatable {
     }
 }
 
-/// Repeated dreams about one lived occasion are labelled as dwelling, never recurrence or noise.
+/// Repeated dreams of one occasion are dwelling, never recurrence or noise.
 public enum REMSupportKind: String, Sendable, Codable, Equatable {
-    /// Two or more distinct experiences supporting the cited claims.
     case recurring
-    /// Dreamt on several nights, but all of it is one lived occasion. Kept,
-    /// labelled, and never counted as a pattern.
+    /// Keep repeated dreams of one occasion labelled without counting them as a pattern.
     case dweltOn = "dwelt_on"
-    /// The entries behind it carry no provenance, so whether it recurred is
-    /// NOT KNOWN. Said plainly instead of being read as support.
+    /// Absent provenance leaves recurrence unknown rather than supported.
     case provenanceUnavailable = "provenance_unavailable"
-    /// Not a dream: a correction recalled in nearly every conversation, which
-    /// the weekly sweep offers to GROWTH. Its one passage cites `memory:<id>`;
-    /// approving graduates that memory.
+    /// Correction graduation cites its canonical memory so approval can graduate the actual retained source.
     case standing
 }
 
 extension REMConsolidator {
-    /// Per-invocation output; decode failures keep the weekly pass owed for retry.
+    /// Decode failures keep the weekly pass owed for retry.
     struct Distillation: Sendable {
         var proposals: [REMProposalRow] = []
         var parseErrors: [String] = []
@@ -70,7 +59,7 @@ extension REMConsolidator {
         let quote: String
     }
 
-    /// The reply is one object: models reliably return objects, and a bare array has no room to grow.
+    /// Use an object reply because it supports reliable model output and future fields.
     private struct LLMProposalReply: Decodable { let proposals: [LLMProposalDTO] }
 
     private struct LLMProposalDTO: Decodable {
@@ -78,10 +67,8 @@ extension REMConsolidator {
         let proposalText: String
         let evidenceDates: [String]
         let confidence: Double
-        /// The words the candidate rests on, per dream entry. A proposal with
-        /// no supplied passage has no verifiable support.
+        /// A proposal without a supplied passage has no verifiable support.
         let supportingPassages: [LLMPassageDTO]?
-        /// What surprised her or changed, when she names it.
         let whatChanged: String?
         let replaced: REMReplacement?
 
@@ -125,8 +112,7 @@ extension REMConsolidator {
         for entry in entries {
             guard let content = entry.content else { continue }
             let sections = DreamEntryProvenance.readClaims(in: content, as: DreamEntryProvenance.self)
-            // The weekly owner selects readable sections before reaching this boundary.
-            // Refuse a bypass rather than letting damaged evidence become fewer claims.
+            // Refuse damaged-section bypasses rather than turning unreadable evidence into fewer claims.
             if let gap = sections.compactMap(\.unavailable).first {
                 throw PersistenceCoreError.ioFailure("dream_diary/\(entry.filename ?? entry.date): \(gap)")
             }
@@ -139,7 +125,7 @@ extension REMConsolidator {
         encoder.outputFormatting = [.sortedKeys]
         let entriesJSON = String(decoding: try encoder.encode(entries), as: UTF8.self)
 
-        // Reuse the system's exact GROWTH body only when it matches the target.
+        // Reuse exact live GROWTH only when it matches the target.
         let targetContext = try (system != nil && systemGrowthBody == growthBody
             ? completionPolicy("rem-proposal", section: "growth-context")
             : growthBody)
@@ -151,12 +137,13 @@ extension REMConsolidator {
             REMProposalStore.growthPassageBoundSentence,
             String(REMConstants._REM_PROPOSAL_TEXT_CAP)
         ])
+        let call = LLMCall(turn: nil, surface: surface, purpose: "rem")
         let raw = try await llm.complete(
-            prompt: prompt, system: system, model: model, surface: surface, purpose: "rem", tools: nil
+            prompt: prompt, system: system, model: model, tools: nil, call: call
         )
         let proposals = parseLLMResponse(raw, diagnostics: &diagnostics)
 
-        // Evidence dates must be YYYY-MM-DD dates from this call's frozen entry set.
+        // Accept evidence dates only from the call's frozen entry set.
         var kept: [REMProposalRow] = []
         for p in proposals {
             let bad = p.evidenceDates.contains { d in
@@ -168,9 +155,7 @@ extension REMConsolidator {
             }
             var bound = bindSupport(p, evidence: evidence, identities: identities, diagnostics: &diagnostics)
             if let replaced = p.replaced {
-                // Preserve exact source bytes, never the model's claim alone.
-                // GROWTH is a paragraph; a dream alternative is a verbatim
-                // passage in the named entry, with its actual file identity.
+                // Retain exact source bytes and actual file identity; the model's claim alone cannot establish displaced content.
                 if replaced.source == "GROWTH.md", !replaced.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    REMGrowthWriter.containsEntryParagraph(growthBody, replaced.text) {
                     bound.replaced = replaced
@@ -191,7 +176,7 @@ extension REMConsolidator {
         return diagnostics
     }
 
-    /// A claim carries matching same-night entries' own sources, never diary-wide inputs.
+    /// Use only matching same-night entries' sources for claim support.
     func bindSupport(_ proposal: REMProposalRow,
         evidence: [String: [(content: String, claims: [String: [String]])]],
         identities: [String: String], diagnostics: inout Distillation) -> REMProposalRow {
@@ -212,7 +197,7 @@ extension REMConsolidator {
             passages.append(REMSupportingPassage(
                 dreamDate: passage.dreamDate,
                 quote: quote,
-                // A lived date is a reference's own `@date` tail, never a fragment of its id.
+                // Use the source's own lived-date tail rather than guessing from an identifier.
                 livedDates: Array(Set(refs.compactMap { ref in
                     ref.split(separator: "@").last.map(String.init).flatMap { Self.isValidDate($0) ? $0 : nil }
                 })).sorted(),
@@ -271,8 +256,7 @@ extension REMConsolidator {
                     evidenceDates: dto.evidenceDates,
                     confidence: dto.confidence,
                     createdAt: createdAt,
-                    // Carried raw here; `bindSupport` is what verifies each
-                    // quote against the entry it names.
+                    // Keep raw quotes until bindSupport verifies them against their named entries.
                     supportingPassages: (dto.supportingPassages ?? []).map {
                         REMSupportingPassage(dreamDate: $0.date, quote: $0.quote)
                     },
@@ -292,7 +276,7 @@ extension REMConsolidator {
         guard normalizedTargetDoc(targetDoc) == "GROWTH.md" else { return "" }
         let text = raw.replacingOccurrences(of: "\r\n", with: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        // Validate the body shape; never extract or rewrite its meaning.
+        // Validate shape without extracting or rewriting meaning.
         guard text.range(of: #"(?m)^ {0,3}#{1,6}(?:[ \t]|$)"#, options: .regularExpression) == nil else { return "" }
         return text
     }
@@ -301,8 +285,7 @@ extension REMConsolidator {
         REMProposalStore.normalizedTargetDoc(targetDoc)
     }
 
-    /// One line, at most `whatChangedCap` characters, cut at a sentence or a
-    /// word; nil when there is nothing in it.
+    /// Cut at a sentence or word boundary; empty changed text remains absent.
     nonisolated static func normalizedWhatChanged(_ raw: String?) -> String? {
         let text = (raw ?? "").replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)

@@ -2,22 +2,24 @@ import AppToolRuntime
 import Cognition
 import Foundation
 import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 import ToolExecution
-// Blueprint: | `AppQuietToolHost+Mind.swift` | `AppQuietToolHost`: runMind wires real and preview dream callbacks separately; preview failures retain inert mind.run_now evidence; managePart |
+import Senses
+// Blueprint: | `AppQuietToolHost+Mind.swift` | `AppQuietToolHost`: Separate real and inert dream calls; part management |
 
 extension AppQuietToolHost {
     // MARK: - mind_run
 
-    func runMind(verb: String, input: [String: JSONValue]) async -> QuietMindOutcome {
+    func runMind(verb: String, input: [String: JSONValue], turn: Turn) async -> QuietMindOutcome {
         if verb == "trigger_fire" {
-            guard case .string(let surface)? = input["surface"], ["inbox", "workshop"].contains(surface),
+            guard case .string(let surface)? = input["surface"], surface == "inbox",
                   case .string(let name)? = input["name"], !name.isEmpty else {
-                return (false, "Pass surface (inbox or workshop) and name from the trigger's repair obligation.", [:])
+                return (false, "Pass surface inbox and name from the trigger's repair obligation.", [:])
             }
             let occurrence: String? = if case .string(let value)? = input["occurrence"] { value } else { nil }
             let result = await NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: appModel.engine.dataRoot)
-                .repairTrigger(surface: surface, name: name, occurrence: occurrence)
+                .repairTrigger(surface: surface, name: name, occurrence: occurrence, turn: turn)
             return (result.status == "fired", result.error ?? "Trigger \(name): \(result.status).", [:])
         }
         if verb == "rem", input["repair"] == .bool(true) {
@@ -26,14 +28,14 @@ extension AppQuietToolHost {
                 return (true, "REM staging checked under Trust and archival completed without generating new proposals.", [:])
             } catch { return (false, error.localizedDescription, [:]) }
         }
-        if verb == "misses" { return await AppToolExecutor.quietMindMisses(dataRoot: appModel.engine.dataRoot) }
+        if verb == "misses" { return await AppToolExecutor.quietMindMisses(dataRoot: appModel.engine.dataRoot, turn: turn) }
         return await AppToolExecutor.runQuietMind(
             verb: verb, input: input, runtime: NativeAgentEngine.liveCognition,
-            dataRoot: appModel.engine.dataRoot, remPolicy: trustPolicy,
+            dataRoot: appModel.engine.dataRoot, remPolicy: trustPolicy, turn: turn,
             dreamEnabled: { try await dreamEnabled() },
             runDream: {
-                let succeeded = await appModel.runDreamPassForDreams()
-                return (succeeded, appModel.statusForAgent, appModel.dreamError)
+                let run = await appModel.runDreamPassForDreams()
+                return (run.ok, appModel.statusForAgent, appModel.dreamError, run.busy)
             }, previewDream: {
                 do {
                     let result = try await NativeAgentEngine.previewDream(dataRoot: appModel.engine.dataRoot)
@@ -56,11 +58,11 @@ extension AppQuietToolHost {
 
     // MARK: - ability_manage
 
-    func managePart(verb: String, input: [String: JSONValue], steer: [String]) async -> QuietMindOutcome {
+    func managePart(verb: String, input: [String: JSONValue], steer: [String], turn: Turn,
+                    invocation: Parts.Invocation) async -> QuietMindOutcome {
         let outcome = await CapabilityLifecycleCommands(dataRootOverride: appModel.engine.dataRoot)
-            .managePart(verb: verb, input: input, steer: steer)
-        // The Tools page's own refresh, its catalog too, so a dropped tool leaves
-        // both lists; before the verb's status, which the refresh must not overwrite.
+            .managePart(verb: verb, input: input, steer: steer, turn: turn, invocation: invocation)
+        // Refresh both tool lists before publishing the verb's status so a dropped tool disappears without overwriting feedback.
         if outcome.refreshTools { _ = await appModel.refreshForSidebarItem(.tools) }
         if let status = outcome.toolStatus {
             appModel.recordToolOperationStatus(status.message, outcome: status.succeeded ? .succeeded : .failed)

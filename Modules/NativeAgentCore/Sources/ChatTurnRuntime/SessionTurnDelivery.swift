@@ -7,11 +7,10 @@ import ChatToolRuntime
 import TurnTrace
 import ToolRegistry
 import Experiences
-// Blueprint: | `SessionTurnDelivery.swift` | Root/session-owned live delivery: mounted recipients or the resident resolver; caller-result routes and queued peer/mechanical rows cannot hide the person's recorded destination; every turn attaches independently of its caller's observer; recipient leases cannot retire a newer mount; unproven destinations retain an exact-run RepairOwed delivery debt |
+// Blueprint: | `SessionTurnDelivery.swift` | Session-owned live delivery and exact-run repair debt |
 
-/// A surface owns delivery; a turn's caller can only add an observer. Mounted
-/// streams live with their consumer, while resident transports resolve a fresh
-/// recipient for a continuation from the turn's bound conversation route.
+/// The conversation owns its delivery destination; callers add observers only.
+/// Resolve fresh recipients for resident continuations, while mounted streams follow their consumer lifecycle.
 public enum SessionTurnDelivery {
     public struct Context: Sendable {
         public let dataRoot: URL
@@ -30,7 +29,7 @@ public enum SessionTurnDelivery {
         }
     }
 
-    public typealias Resolver = @Sendable (Context) async throws -> Recipient?
+    public typealias Resolver = @Sendable (Context, Turn) async throws -> Recipient?
     private final class ResolverBox: Sendable {
         let call: Resolver
         init(_ call: @escaping Resolver) { self.call = call }
@@ -64,8 +63,7 @@ public enum SessionTurnDelivery {
         }
     }
 
-    /// A transport's presentation adapter, with result names paired to the
-    /// exact action its app call displayed. This state belongs to one turn.
+    /// Pair presented results with the exact displayed action; this adapter's state belongs to one turn.
     public static func presentingTools(_ sink: @escaping TurnEventSink) -> TurnEventSink {
         let shown = ShownToolNames()
         return { event in
@@ -84,31 +82,28 @@ public enum SessionTurnDelivery {
         }
     }
 
-    static func open(dataRoot: URL, sessionID: String, runID: String, surface: String) async -> Recipient? {
+    static func open(dataRoot: URL, sessionID: String, runID: String, surface: String,turn: Turn) async -> Recipient? {
         let (mounted, resolver) = state.withLock {
             ($0.mounts[key(dataRoot, sessionID, runID)]?.recipient, $0.resolvers[dataRoot.standardizedFileURL.path])
         }
-        var route = ChatToolSessionContext.replyRoute ?? ChatToolSessionContext.envelope?.deliveryRoute
+        var route = turn.replyRoute ?? turn.envelope?.deliveryRoute
         let recipient: Recipient?
         var unavailable: String?
         do {
             if let mounted { recipient = mounted }
             else {
                 if route == nil || route?.surface == "caller-result" {
-                    // A caller's result route is not the person's destination.
-                    // The conversation owns that destination; Mac presentation
-                    // needs only its recorded local source, even when the latest
-                    // user-role row belongs to a bridge rather than the person.
+                    // Use the conversation's destination, never a caller's result route or an unrelated bridge-authored row.
                     route = try await HumanConversationReader.readForSessionDelivery(sessionID: sessionID, dataRoot: dataRoot)
                 }
                 if let route {
                     recipient = try await resolver?.call(Context(dataRoot: dataRoot, sessionID: sessionID, runID: runID,
-                        surface: route.surface, route: route))
+                        surface: route.surface, route: route), turn)
                 } else { recipient = nil }
             }
         }
         catch {
-            // Delivery unavailability must never discard her transcript or
+            // Delivery unavailability must never discard the agent's transcript or
             // prevent the turn. It is evidence of no live recipient, not a send verdict.
             recipient = nil
             unavailable = TurnTraceRedactor.redactText(String(describing: error))
@@ -120,21 +115,22 @@ public enum SessionTurnDelivery {
                     + (unavailable ?? "The recorded destination or its recipient is unavailable; the transcript remains saved."),
                 lever: "Recover the recorded human destination and deliver the saved answer for this exact run; do not invent a route or repeat its work.")
         }
-        if let turn = TurnTraceContext.turnId {
-            TurnTraceBus.fire(TurnTraceEvent(turnId: turn, kind: "turn.deliveryAttached",
+        do {
+                let turnID = turn.id
+            TurnTraceBus.fire(TurnTraceEvent(turnId: turnID, kind: "turn.deliveryAttached",
                 sessionId: sessionID, surface: route?.surface ?? surface, payload: .object([
                     "runId": .string(runID), "live": .bool(recipient != nil),
                     "recipient": .string(mounted != nil ? "mounted" : recipient != nil ? "resident" : "unavailable"),
                     "detail": unavailable.map(JSONValue.string) ?? .null
-                ])))
+                ]), turn: turn))
         }
         return recipient
     }
 
     static func withDelivery<T>(dataRoot: URL, sessionID: String, runID: String, surface: String,
-        observer: TurnEventSink?, isolation: isolated (any Actor)? = #isolation,
+        observer: TurnEventSink?, turn: Turn, isolation: isolated (any Actor)? = #isolation,
         operation: (@escaping TurnEventSink) async throws -> T) async rethrows -> T {
-        let recipient = await open(dataRoot: dataRoot, sessionID: sessionID, runID: runID, surface: surface)
+        let recipient = await open(dataRoot: dataRoot, sessionID: sessionID, runID: runID, surface: surface,turn: turn)
         let progress: TurnEventSink = { event in
             await recipient?.progress(event)
             await observer?(event)

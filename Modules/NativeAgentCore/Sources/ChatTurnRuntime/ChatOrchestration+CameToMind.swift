@@ -10,27 +10,36 @@ import AgentWorkspace
 import Experiences
 import NativeAgentCore
 
-// Blueprint: | `ChatOrchestration+CameToMind.swift` | `SwiftNativeTurnEngine.cameToMind(after:turn:held:sessionId:surface:)`: non-preview lines first met (`FamiliarLines`) form a moment; the recorder's dispatch predicate and ExpansionDispatcher's nested preview marker exclude proposals before familiarity and recall; memories join their conversation at most two a round and four a turn, traced as `mind.came_to_mind` |
+// Blueprint: | `ChatOrchestration+CameToMind.swift` | `SwiftNativeTurnEngine.cameToMind(after:turn:held:sessionId:surface:)`: non-preview lines first met (`FamiliarLines`) form a moment; the recorder's dispatch predicate and ExpansionDispatcher's nested preview marker exclude proposals before familiarity and recall; memories join the agent's conversation at most two a round and four a turn, traced as `mind.came_to_mind` |
 
 extension SwiftNativeTurnEngine {
-    private func familiarityFailure(_ error: Error, root: URL) -> String? {
+    private func familiarityFailure(_ error: Error, root: URL, turn: Turn) -> String? {
         let owner = root.appendingPathComponent("mind/familiar.bin")
         RepairOwed.owe(root, id: UUID().uuidString, kind: .run, operation: "mind.familiar", owner: owner.path,
             words: "Familiarity is unavailable: \(error.localizedDescription). No new familiarity was recorded; saved bytes are preserved.",
-            tap: ToolFailureError.fileRepairInstruction(owner, shape: "Preserve the sequence of complete eight-byte familiarity keys and restore read/write access."))
-        TurnTraceBus.fireFromContext(kind: "mind.familiarity_unavailable", payload: .object(["owner": .string(owner.path), "error": .string(error.localizedDescription)]))
+            tap: ToolFailureError.fileRepairInstruction(owner,
+                shape: "Preserve the sequence of complete eight-byte familiarity keys and restore read/write access."))
+        TurnTraceBus.fireFromContext(kind: "mind.familiarity_unavailable", payload: .object(["owner": .string(owner.path), "error": .string(error
+            .localizedDescription)]), turn: turn)
         return nil
     }
     /// A turn's whole allowance: enough to be reminded, never a second recall lane.
     static let cameToMindPerTurn = 4
     /// What a round's results said, as one moment of at most this many characters.
     static let momentCharacters = 1_500
-    /// How far into a round she reads for it: a long page's tail is never the
-    /// moment, and meeting all of it would crowd out what she knows by heart.
+    /// Read only the bounded head: a long result's tail would crowd out familiar context.
     static let momentReach = 6_000
 
-    /// The lines of words in what she read or wrote: a hash, a timestamp or a
-    /// path reminds no one of anything.
+    /// The agent's own app speaking (its actions, guides, labels, remedies) is the agent's body, not news:
+    /// in an app receipt the world is only what a call returned, its `result`.
+    static func world(in receipt: JSONValue) -> [JSONValue] {
+        guard case .object(let fields) = receipt else { return [] }
+        if let result = fields["result"] { return [result] }
+        if case .array(let receipts)? = fields["receipts"] { return receipts.flatMap(world(in:)) }
+        return []
+    }
+
+    /// Hashes, timestamps and paths cannot supply the words needed for a reminder.
     static func lines(_ values: some Sequence<JSONValue>) -> [String] {
         var lines: [String] = []
         var total = 0
@@ -66,33 +75,33 @@ extension SwiftNativeTurnEngine {
             + "]"
     }
 
-    /// What this round's results bring to mind that the turn does not already
-    /// hold, as words for her conversation; nil when nothing stands out.
     func cameToMind(
         after records: some Sequence<ToolDispatchRecord>,
-        turn: ContextPreparedTurn?,
+        preparedTurn: ContextPreparedTurn?, turn: Turn,
         held: inout Set<ContextAtomID>,
         sessionId: String?,
         surface: String
     ) async -> String? {
         let records = records.filter { !ChatToolDispatchTracer.isPreview(tool: $0.name, input: $0.input) }
         guard !records.isEmpty else { return nil }
-        // Her own words coming back in a receipt are already hers.
+        // The agent's own words coming back in a receipt are already the agent's.
         if let root = remPinsDataRoot {
             do { try FamiliarLines.firstMet(Self.lines(records.map { .object($0.input) }), dataRoot: root) }
-            catch { return familiarityFailure(error, root: root) }
+            catch { return familiarityFailure(error, root: root, turn: turn) }
         }
-        let read = records.map(\.result).filter { ChatToolOutcome.outputLooksSuccessful($0) }
-        return await cameToMind(lines: Self.lines(read), turn: turn, held: &held,
+        let read = records.filter {
+            let reply = ToolResult($0.result)
+            return ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome)
+        }
+            .flatMap { $0.name == "app" ? Self.world(in: $0.result) : [$0.result] }
+        return await cameToMind(lines: Self.lines(read), preparedTurn: preparedTurn, turn: turn, held: &held,
                                 sessionId: sessionId, surface: surface).map(Self.cameToMindNudge)
     }
 
-    /// What one moment brings to mind that the turn does not hold. Only the
-    /// lines she meets for the first time are the moment (`FamiliarLines`):
-    /// she gets used to the rest, whether or not anything has room.
+    /// Only newly met lines form the moment; familiarity advances even when no reminder fits.
     func cameToMind(
         lines: [String],
-        turn: ContextPreparedTurn?,
+        preparedTurn: ContextPreparedTurn?, turn: Turn,
         held: inout Set<ContextAtomID>,
         sessionId: String?,
         surface: String
@@ -101,7 +110,7 @@ extension SwiftNativeTurnEngine {
         let fresh: [String]
         do { fresh = try remPinsDataRoot.map({ try FamiliarLines.firstMet(lines, dataRoot: $0) }) ?? lines }
         catch {
-            if let root = remPinsDataRoot { _ = familiarityFailure(error, root: root) }
+            if let root = remPinsDataRoot { _ = familiarityFailure(error, root: root, turn: turn) }
             return nil
         }
         for line in fresh
@@ -109,17 +118,17 @@ extension SwiftNativeTurnEngine {
             moment += (moment.isEmpty ? "" : "\n") + line.prefix(Self.momentCharacters - moment.count)
         }
         let room = Self.cameToMindPerTurn - held.count
-        guard room > 0, let turn, let contextFlow else { return nil }
+        guard room > 0, let preparedTurn, let contextFlow else { return nil }
         guard moment.count >= 40 else { return nil }
         func report(_ status: String, _ detail: String) {
             TurnTraceBus.fireFromContext(kind: "mind.came_to_mind.read", sessionId: sessionId, surface: surface,
-                payload: .object(["status": .string(status), "detail": .string(detail)]))
+                payload: .object(["status": .string(status), "detail": .string(detail)]), turn: turn)
             if status == "unavailable", let root = remPinsDataRoot {
                 RepairOwed.owe(root, id: UUID().uuidString, kind: .run, operation: "mind.came_to_mind", owner: "context",
                     words: detail, nextCall: ToolFailureError.call("app", ["page": .string("mind")]))
             }
         }
-        guard let ticket = await contextFlow.beginQueryEmbedding(moment, ownWords: nil) else {
+        guard let ticket = await contextFlow.beginQueryEmbedding(moment, ownWords: nil, turn: turn) else {
             report("unavailable", "Ambient recollection has no embedding reader. Repair the context embedding owner.")
             return nil
         }
@@ -129,7 +138,7 @@ extension SwiftNativeTurnEngine {
             return nil
         }
         let read: ContextAmbientRecallResult
-        do { read = try await turn.cameToMind(by: moment, embedding: embedding, excluding: held, limit: min(2, room)) }
+        do { read = try await preparedTurn.cameToMind(by: moment, embedding: embedding, excluding: held, limit: min(2, room)) }
         catch {
             report("unavailable", "Ambient recollection selection failed: \(error.localizedDescription). Repair its context source.")
             return nil
@@ -138,8 +147,9 @@ extension SwiftNativeTurnEngine {
             report("unavailable", read.unavailable.map(\.reason).joined(separator: "; "))
         }
         let items = read.items
-        if read.unavailable.isEmpty, let root = remPinsDataRoot, let turnID = TurnTraceContext.turnId {
-            RepairOwed.settle(root, operation: "mind.came_to_mind", evidence: .init(source: "turn_traces", id: turnID))
+        if read.unavailable.isEmpty, let root = remPinsDataRoot {
+            let turnID = turn.id
+            RepairOwed.settle(root, operation: "mind.came_to_mind", evidence: .init(source: "experience", id: turnID))
         }
         guard !items.isEmpty else {
             if read.unavailable.isEmpty { report("no_match", "The checked ambient selection returned no matches.") }
@@ -153,23 +163,21 @@ extension SwiftNativeTurnEngine {
             payload: .object([
                 "moment": .string(String(moment.prefix(160))),
                 "memories": .array(items.map { .string($0.pointer.atomID.rawValue) }),
-            ])
+            ]), turn: turn
         )
         return items
     }
 
-    /// What happened since her last turn, and what it brought to mind, for the
-    /// first words she hears; nil when no primed moment touched anything.
     func primedSinceLastTurn(
         _ moments: [PrimedMoments.Moment],
-        turn: ContextPreparedTurn?,
+        preparedTurn: ContextPreparedTurn?, turn: Turn,
         held: inout Set<ContextAtomID>,
         sessionId: String?,
         surface: String
     ) async -> String? {
         var parts: [String] = []
         for moment in moments {
-            guard let items = await cameToMind(lines: Self.lines([.string(moment.line)]), turn: turn, held: &held,
+            guard let items = await cameToMind(lines: Self.lines([.string(moment.line)]), preparedTurn: preparedTurn, turn: turn, held: &held,
                                                sessionId: sessionId, surface: surface) else { continue }
             parts.append("\"" + String(moment.line.prefix(160)) + "\" (" + moment.source + ") brought to mind:\n"
                 + items.map { "- " + String(($0.summary ?? $0.text).prefix(280)) }.joined(separator: "\n"))

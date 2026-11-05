@@ -12,24 +12,26 @@ import CFNetwork
 import MacControl
 // Blueprint: | `SecretRedactor.swift` | Exact-secret insertion and whole/stream redaction formats shared by one admitted execution |
 
-/// Her text with each named placeholder replaced by its value; `url` percent-encodes the value for a URL.
+/// Insert only named placeholders; URL insertion percent-encodes the value.
 func insertingSecrets(_ text: String, _ values: [String: String], url: Bool = false) -> String {
     values.reduce(text) { text, entry in
         text.replacingOccurrences(of: "{{secret:\(entry.key)}}",
-            with: url ? entry.value.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? entry.value : entry.value)
+            with: url ? entry.value.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? entry.value
+                : entry.value)
     }
 }
 
-/// What she reads back, with every value inserted in this run replaced by `[secret:<name>]` in each form an insertion writes it: as written, URL-encoded, escaped inside a JSON string (ASCII or UTF-8, slashes escaped or not) and base64; in
-/// a header name, in any case. A program granted a value can still re-encode it some other way; its grant is the fence.
+/// Redact inserted values in plain, URL, JSON and base64 forms, including header names in any case. Re-encoding can evade matching, so destination grants
+/// remain the authority fence.
 struct SecretRedactor: Sendable {
     private(set) var values: [(name: String, bytes: Data)] = []
     init() {}
 
     mutating func add(_ values: [String: String]) {
         for (name, value) in values {
-            let quoted = (try? JSONValue.string(value).serializedData(pretty: false)).map { String(decoding: $0.dropFirst().dropLast(), as: UTF8.self) } ?? value
-            // The UTF-8 JSON string most services write: only quote, backslash and control characters escaped.
+            let quoted = (try? JSONValue.string(value).serializedData(pretty: false)).map { String(decoding: $0.dropFirst().dropLast(), as: UTF8.self) }
+                ?? value
+            // JSON services may escape only quotes, backslashes and control characters; redact that form too.
             let utf8 = value.unicodeScalars.map { scalar -> String in
                 switch scalar {
                 case "\"": "\\\""
@@ -56,7 +58,7 @@ struct SecretRedactor: Sendable {
 
     func callAsFunction(_ value: JSONValue) -> JSONValue { values.isEmpty ? value : value.mapStrings { self($0) } }
 
-    /// A header name, which HTTP does not case: lowercased, each value matched lowercased too.
+    /// HTTP header names are case-insensitive, so match secret forms without case.
     func name(_ text: String) -> String {
         values.reduce(text.lowercased()) { $0.replacingOccurrences(of: String(decoding: $1.bytes, as: UTF8.self).lowercased(), with: "[secret:\($1.name)]") }
     }
@@ -102,8 +104,7 @@ struct SecretStream: Sendable {
         return data.dropLast(hold)
     }
 
-    /// The same pass, with a UTF-8 character split across pieces held whole: only the start of a character that text before it can still complete; bytes that cannot become UTF-8 go out at once. A value the shown text began stays begun by
-    /// what of it went out.
+    /// Hold incomplete UTF-8 across pieces without losing a secret prefix already partly shown; invalid bytes do not wait for impossible completion.
     mutating func characters(_ piece: Data, end: Bool, _ redactor: SecretRedactor) -> Data {
         var data = pass(piece, end: end, redactor)
         if !end, let lead = data.suffix(4).lastIndex(where: { $0 & 0xC0 != 0x80 }), (0xC2...0xF4).contains(data[lead]) {

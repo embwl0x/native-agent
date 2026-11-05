@@ -4,13 +4,8 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `SwiftToolDispatcher+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` retain provenance on readback (a read steers nothing); `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
 
-// Curation shares the Memories page's owner calls and touches only the agent's own store.
-// Merges archive rows with duplicate_of/superseded_by; corrections demote with corrected_by.
-// memory.list status:archived exposes both; memory.rewrite restore restores through updateMemory.
-// memory.rewrite pinned uses MemoryFacade.setPinned's patch.
 
-/// What the app door's memory.list and memory.rewrite run, in process, over
-/// one store.
+/// Share the Memories page’s owner and store so curation cannot diverge across doors.
 public struct MemoryCuration: Sendable {
     static func missingMemoryFailure() -> ToolFailureError {
         ToolFailureError("No memory has that id.", effects: .none,
@@ -44,8 +39,7 @@ public struct MemoryCuration: Sendable {
         }
     }
 
-    /// The paging cursor carries its sort direction and the ordering key of
-    /// the last row handed out. Opaque to the caller; returned as `after_id`.
+    /// The paging cursor carries its sort direction and the ordering key of the last row handed out. Opaque to the caller; returned as `after_id`.
     static func curationCursor(sort: String, createdAt: String, id: String) -> String {
         "\(sort)|\(createdAt)|\(id)"
     }
@@ -67,8 +61,6 @@ public struct MemoryCuration: Sendable {
             "execution": .string("not_run"), "effects": .string("none")])
     }
 
-    /// Every active memory, newest first by default, in pages. The walk
-    /// starts at offset 0 and ends when `remaining` is 0.
     public func listMemories(input: [String: JSONValue], surface: String, persona: String?) async throws -> JSONValue {
         for key in ["sort", "status", "after_id"] {
             if let value = input[key], value != .null {
@@ -92,10 +84,16 @@ public struct MemoryCuration: Sendable {
         let cursor = afterID.flatMap { Self.curationCursorKey($0) }
         if afterID != nil {
             guard let cursor else {
-                return curationRefusal("after_id is a legacy or invalid cursor without a recognized sort direction. Restart memory.list without after_id and with offset 0, choosing newest_first or oldest_first in sort.")
+                return curationRefusal("""
+                    after_id is not a memory.list cursor: it lacks a recognized sort direction. Restart memory.list without after_id and with \
+                    offset 0, choosing newest_first or oldest_first in sort.
+                    """)
             }
             guard cursor.sort == sort else {
-                return curationRefusal("after_id was issued with sort \(cursor.sort). Retry with sort \(cursor.sort), or restart without after_id and with offset 0 to change direction.")
+                return curationRefusal("""
+                    after_id was issued with sort \(cursor.sort). Retry with sort \(cursor.sort), or restart without after_id and with offset 0 \
+                    to change direction.
+                    """)
             }
         }
         let listing: (records: [MemoryRecord], total: Int, nextOffset: Int)
@@ -126,16 +124,15 @@ public struct MemoryCuration: Sendable {
             if let source = record.sourceRunId { row["source"] = .string(source) }
             if record.pinned == true { row["pinned"] = .bool(true) }
             if status == "archived" {
-                // What retired it, in plain words, so a bad merge is visible.
-                // Where it is in its life: a corrected row still carries
-                // status active, which would read as current.
+                // Show retirement evidence: a corrected row can still have active status and otherwise read as current.
                 let corrected = MemoryLifecycle.normalized(record.lifecycle) == MemoryLifecycle.corrected
                 row["status"] = .string(corrected ? MemoryLifecycle.corrected : "archived")
                 if case .object(let meta)? = record.extras {
-                    if case .string(let v)? = meta["duplicate_of"] { row["merged_into"] = .string(v) }
-                    if case .string(let v)? = meta["superseded_by"] ?? meta["corrected_by"] { row["replaced_by"] = .string(v) }
-                    if case .string(let v)? = meta["superseded_by"] { row["superseded_by"] = .string(v) }
-                    if case .string(let v)? = meta["hygiene_archive_reason"] ?? meta["correction_reason"] { row["archived_because"] = .string(v) }
+                    if case .string(let v)? = meta["superseded_by"] {
+                        row["replaced_by"] = .string(v)
+                        row["superseded_by"] = .string(v)
+                    }
+                    if case .string(let v)? = meta["correction_reason"] { row["archived_because"] = .string(v) }
                 }
                 if let at = record.updatedAt { row["archived_at"] = .string(at) }
             }
@@ -222,10 +219,9 @@ public struct MemoryCuration: Sendable {
         return row
     }
 
-    /// Change one memory in one update: its text (same row, same id, same
-    /// provenance; the embedding is recomputed by the owner), its pin, and/or
-    /// restore it from archived to active.
-    public func rewriteMemory(input: [String: JSONValue], surface: String, persona: String?) async throws -> JSONValue {
+    /// Rewrite through the owner to preserve identity/provenance and recompute embeddings in one update.
+    public func rewriteMemory(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String,
+        persona: String?) async throws -> JSONValue {
         let row: MemoryRecord
         do { row = try await rewriteTarget(input: input, surface: surface, persona: persona) }
         catch {
@@ -238,7 +234,7 @@ public struct MemoryCuration: Sendable {
         let pinned = curationBool(input, "pinned")
         let restore = curationBool(input, "restore") == true
         var update: [String: JSONValue] = [:]
-        if case .object(let stamped)? = MemoryDataProvenance.stamping(.object(update)) { update = stamped }
+        if case .object(let stamped)? = MemoryDataProvenance.stamping(.object(update), turn: turn) { update = stamped }
         if let text { update["text"] = .string(text) }
         if let pinned { update["pinned"] = .bool(pinned) }
         if restore {
@@ -246,13 +242,13 @@ public struct MemoryCuration: Sendable {
             if !MemoryLifecycle.isRecallEligible(row.lifecycle) {
                 update["lifecycle"] = .string(MemoryLifecycle.confirmed)
             }
-            // Restore passes the text back through the gates a rewrite runs:
-            // re-embedded, and refused when it matches something forgotten or
-            // let go (an archived twin of a forgotten fact stays archived).
+            // Restore passes the text back through the gates a rewrite runs: re-embedded, and refused when it matches something forgotten or let go (an
+            // archived twin of a forgotten fact stays archived).
             if text == nil { update["text"] = .string(row.text) }
         }
         do {
-            let updated = try await memoryV2.updateMemory(id: row.id, update: .object(update))
+            let updated = try await memoryV2.updateMemory(id: row.id, update: .object(update),
+                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads))
             var result: [String: JSONValue] = [
                 "status": .string("ok"),
                 "id": .string(updated.id),
@@ -276,8 +272,7 @@ public struct MemoryCuration: Sendable {
 extension SwiftToolDispatcher {
     private var curation: MemoryCuration { MemoryCuration(memoryV2: memoryV2, dataRoot: dataRoot) }
 
-    /// Drop one memory for good. A tombstone keeps the same thing from being
-    /// re-proposed.
+    /// Drop one memory for good. A tombstone keeps the same thing from being re-proposed.
     func impl_forget_memory(input: [String: JSONValue]) async throws -> JSONValue {
         guard let id = curation.curationString(input, "id") else {
             return curation.curationRefusal("forget_memory needs the memory 'id' from app memory.list or recall_memory.")
@@ -293,9 +288,7 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Re-derive the knowledge graph from the memory store as it is now. The
-    /// pass to run once a curation is through: entities from rows that were
-    /// rewritten or forgotten do not linger.
+    /// Re-derive after curation so entities from rewritten or forgotten rows cannot linger.
     func impl_rebuild_knowledge_graph(input: [String: JSONValue]) async throws -> JSONValue {
         // Disabled graph and damaged Trust are distinct checked causes.
         if let failure = MemoryPolicyGate.knowledgeGraphFailure(dataRoot: dataRoot) {
@@ -319,10 +312,7 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// The Knowledge Graph page's "Sweep orphans…": entities whose source
-    /// memories are gone. No confirm_ids previews and removes nothing;
-    /// confirm_ids removes only when it is still exactly the live candidate
-    /// set, the same check the page's confirmation dialog makes.
+    /// Preview removes nothing; confirmation must still match the live orphan set the page would confirm.
     private func sweepKnowledgeGraphOrphans(input: [String: JSONValue]) async -> JSONValue {
         let actions = KnowledgeGraphMaintenanceActions(dataRoot: dataRoot)
         func candidateRows(_ candidates: [KnowledgeGraphGCCandidate]) -> JSONValue {
@@ -365,7 +355,10 @@ extension SwiftToolDispatcher {
             case let .previewDiverged(current):
                 return .object([
                     "status": .string("refused"),
-                    "reason": .string("The orphan set changed since the preview, so nothing was removed. Review these candidates and confirm again with exactly their ids."),
+                    "reason": .string("""
+                        The orphan set changed since the preview, so nothing was removed. Review these candidates and confirm again with exactly \
+                        their ids.
+                        """),
                     "candidates": candidateRows(current),
                     "count": .int(Int64(current.count)),
                 ])

@@ -3,10 +3,11 @@ import CryptoKit
 import UniformTypeIdentifiers
 import PersistenceCore
 import ChatToolRuntime
+import NativeAgentCore
+import ChatToolParsing
 // Blueprint: | `ChatWrittenFileArtifacts.swift` | `ChatWrittenFileArtifacts`: whole-file receipt selection and canonical recovery references |
 
-/// Whole-file write receipts shared by live delivery and canonical recovery,
-/// and what a turn left changed in the world.
+/// Live delivery and recovery share whole-file receipts so both report the same landed effects.
 public enum ChatWrittenFileArtifacts {
     public struct File {
         public let name: String
@@ -44,18 +45,11 @@ public enum ChatWrittenFileArtifacts {
         }
     }
 
-    /// What the turn left changed on disk, read as it closes: the files
-    /// modified since it started in each folder one of her own landed writes
-    /// put a file in (from its receipt, a part's or script's own calls
-    /// included; a shell call's is its directory), whoever wrote them, so the
-    /// render another app made beside her file is in it too. A folder counts only
-    /// where her file-read policy reaches, links resolved, and never her data
-    /// root; hidden files are no news. A folder too big to list, or one that
-    /// can't be read, says so. Newest first.
-    public static func world(from dispatches: [TurnEngineResult.ToolDispatchRecord], since: Date, dataRoot: URL) async -> JSONValue? {
+    /// Capture files changed since turn acceptance beside landed writes, including renders produced by other apps.
+    /// Admit only policy-reachable, resolved folders outside the data root; ignore hidden files and report unreadable or oversized folders.
+    public static func world(from dispatches: [TurnEngineResult.ToolDispatchRecord], since: Date, dataRoot: URL, turn: Turn) async -> JSONValue? {
         var folders: [String] = [], unlisted: [String] = []
         func landed(_ folder: String) { if !folders.contains(folder) { folders.append(folder) } }
-        /// A landed write's place: its file's folder, or a shell call's directory.
         func place(_ fields: [String: JSONValue]) -> Bool {
             if case .string(let path)? = fields["destination"] ?? fields["path"], path.hasPrefix("/") {
                 landed(URL(fileURLWithPath: path).deletingLastPathComponent().path)
@@ -65,26 +59,27 @@ public enum ChatWrittenFileArtifacts {
             landed(cwd)
             return true
         }
-        /// A receipt, a list's members, and a part or script run's own calls,
-        /// each from its own receipt; a run whose writes can't be placed says so.
+        /// Read each nested call's own receipt so unplaceable writes remain explicitly unknown.
         func collect(_ value: JSONValue) {
             guard case .object(let receipt) = value else { return }
             if case .array(let members)? = receipt["receipts"] { return members.forEach(collect) }
-            guard ChatToolOutcome.outputLooksSuccessful(value) || receipt["calls"] != nil, !ChatToolOutcome.isWaitingOnPerson(value),
+            let reply = ToolResult(value)
+            guard ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome) || receipt["calls"] != nil,
+                  !ChatToolOutcome.isWaitingOnPerson(reply.payload, verdict: reply.outcome),
                   receipt["status"] != .string("preview"), receipt["execution"] != .string("preview") else { return }
             if receipt["read_only"] == .bool(false), place(receipt) { return }
             let run = if case .string(let skill)? = receipt["skill"] { skill + " run" } else { "a script run" }
             guard case .array(let calls)? = receipt["calls"] else {
-                if receipt["run_id"] != nil, receipt["effects"] != .string("none") {
+                if receipt["run_id"] != nil, reply.effects != ToolFailureError.Effects.none {
                     unlisted.append(run)
                 }
                 return
             }
             for case .object(let row) in calls where row["status"] == .string("ok") && row["read_only"] == .bool(false) {
+                let reply = ToolResult(.object(row))
                 if case .object(let at)? = row["at"], place(at) { continue }
                 if case .object(let result)? = row["result"], place(result) { continue }
-                // A write with no place on its row: its effects don't say where.
-                if row["effects"] != .string("none"), !unlisted.contains(run) { unlisted.append(run) }
+                if reply.effects != ToolFailureError.Effects.none, !unlisted.contains(run) { unlisted.append(run) }
             }
         }
         for dispatch in dispatches where dispatch.ranCall.input["preview"] != .bool(true) { collect(dispatch.result) }
@@ -92,12 +87,11 @@ public enum ChatWrittenFileArtifacts {
         let own = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
         var changed: [(Date, JSONValue)] = [], notes: [JSONValue] = []
         func note(_ path: String, _ words: String) { notes.append(.object(["path": .string(path), "note": .string(words)])) }
-        // One budget for the whole capture: each folder opened, each raw entry
-        // read and each entry's metadata cost one; what it can't reach says so.
+        // One shared budget charges folder opens, raw entries and metadata reads; report every unreached portion.
         var budget = captureBudget
         for written in folders {
             guard budget > 0 else { note(written, "not listed: this turn's listing ran out of budget"); continue }
-            guard let folder = try? await policy.resolveTrustedFilePath(written),
+            guard let folder = try? await policy.resolveTrustedFilePath(turn: turn, written),
                   NativeAgentWorkspaceRoot.relativePath(folder.path, under: own) == nil else { continue }
             budget -= 1
             // The folder admitted, listed through its verified descriptor: no
@@ -143,6 +137,5 @@ public enum ChatWrittenFileArtifacts {
         return all.isEmpty ? nil : .array(all)
     }
 
-    /// What one turn's capture may spend: folders opened, raw entries read, metadata read.
     static let captureBudget = 2000
 }

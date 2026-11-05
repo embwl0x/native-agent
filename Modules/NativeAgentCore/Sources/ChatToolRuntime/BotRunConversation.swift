@@ -1,34 +1,36 @@
 import Foundation
+import ChatToolParsing
 import NativeAgentCore
 import PersistenceCore
 import StandingBots
 // Blueprint: | `BotRunConversation.swift` | `BotRunConversation` enum; `enqueueRequestedCheck`, `dispatch` |
 
-/// A return address for a deliberately requested check, not a bot scheduler or
-/// second conversation. The canonical queue and shelf remain execution truth.
+/// A return address for a deliberately requested check, not a bot scheduler or second conversation. The canonical queue and shelf remain execution truth.
 public enum BotRunConversation {
     typealias Dispatch = @Sendable (String, [String: JSONValue]) async throws -> JSONValue
 
-    /// Run once from a Helper control uses the same durable return owner as a
-    /// requested chat check. Scheduled occurrences never enter this boundary.
+    /// Explicit Helper runs share the durable return owner; scheduled occurrences must not enter this boundary.
     public static func enqueueRequestedCheck(botID: UUID, dataRoot: URL) async throws -> UUID {
         let bot = try BotDefinitionStore(dataRoot: dataRoot).get(botID)
-        let result = try await ChatToolSessionContext.withReplyRoute(.init(surface: "chat")) {
-            try await dispatch(input: ["id": .string(botID.uuidString)], surface: "chat",
+        let envelope = TurnEnvelope.native("requested-helper-check").withDeliveryRoute(.init(surface: "chat"))
+        let turn = Turn(session: bot.sessionID).with(\.envelope, envelope)
+        let invocation = ChatToolInvocation()
+        let result = try await dispatch(turn: turn, invocation: invocation, input: ["id": .string(botID.uuidString)], surface: "chat",
                                scope: bot.sessionID, dataRoot: dataRoot) { _, _ in
-                let receipt = try BotRunQueue(dataRoot: dataRoot).enqueue(bot: botID)
+                let receipt = try BotRunQueue(dataRoot: dataRoot).enqueue(bot: botID, scope: .init(ancestry: invocation.botAncestry))
                 return .object(["status": .string(receipt.accepted ? "queued" : "joined"), "id": .string(botID.uuidString),
                                 "requestId": .string(receipt.runID.uuidString)])
             }
-        }
         guard case .object(let fields) = result, fields["automatic_return"] == .bool(true),
               case .string(let raw)? = fields["requestId"], let requestID = UUID(uuidString: raw) else {
-            throw ToolFailureError("The requested check has no confirmed return address. Retained outcome: \(result). Inspect that operation before requesting it again.", effects: .unknown)
+            throw ToolFailureError("""
+                The requested check has no confirmed return address. Retained outcome: \(result). Inspect that operation before requesting it again.
+                """, effects: .unknown)
         }
         return requestID
     }
 
-    static func dispatch(input: [String: JSONValue], surface: String, scope: String,
+    static func dispatch(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String, scope: String,
                          dataRoot: URL, perform: Dispatch) async throws -> JSONValue {
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
         let bot: BotDefinition
@@ -48,7 +50,7 @@ public enum BotRunConversation {
             throw ToolFailureError(ChatToolOutcome.errorMessage(error), argumentPath: "$.id",
                 accepted: "id: a helper UUID or exact name from bot.list; optional question: a nonblank string.", effects: .none)
         }
-        guard !BotRunQueue.ancestry.contains(bot.id) else {
+        guard !invocation.botAncestry.contains(bot.id) else {
             throw ToolFailureError(BotRunQueue.alreadyExecutingWords, effects: .none)
         }
         let store = AgentConversationStore(dataRoot: dataRoot)
@@ -57,14 +59,19 @@ public enum BotRunConversation {
            ["sending", "waiting"].contains(old.phase) || old.deliveryState == "delivering" {
             if old.automaticRead {
                 guard case .string(let request)? = old.readInput?["message_id"], UUID(uuidString: request) != nil else {
-                    throw ToolFailureError("The earlier check has no exact run reference. Inspect the helper's saved work; no second check was queued.", effects: .none)
+                    throw ToolFailureError("""
+                        The earlier check has no exact run reference. Inspect the helper's saved work; no second check was queued.
+                        """, effects: .none)
                 }
                 return .object(["status": .string("joined"), "with": .string(bot.name),
                     "id": .string(bot.id.uuidString), "requestId": .string(request),
                     "automatic_return": .bool(true), "return_session": .string(old.scopeSessionID),
                     "read_with": .object(["action": .string("bot.reply"), "args": .object([
                         "id": .string(request), "bot_id": .string(bot.id.uuidString)])]),
-                    "detail": .string("Joined run \(request). Its result will return to conversation \(old.scopeSessionID) and be saved on the helper's shelf; no second check was queued.")])
+                    "detail": .string("""
+                        Joined run \(request). Its result will return to conversation \(old.scopeSessionID) and be saved on the helper's shelf; no \
+                        second check was queued.
+                        """)])
             }
             _ = try store.update(id: old.id, operationID: old.operationID) {
                 $0.phase = "attention"; $0.deliveryState = "interrupted"
@@ -72,9 +79,12 @@ public enum BotRunConversation {
                     "detail": .string("The earlier check's queue acknowledgement was interrupted. No run was repeated.")])
             }
             return .object(["status": .string("interrupted"), "with": .string(bot.name),
-                "detail": .string("The earlier check's queue acknowledgement was interrupted. Its result is not confirmed, and no new run was queued. Check the bot's saved work before requesting another check.")])
+                "detail": .string("""
+                    The earlier check's queue acknowledgement was interrupted. Its result is not confirmed, and no new run was queued. Check the \
+                    bot's saved work before requesting another check.
+                    """)])
         }
-        let replyRoute = ChatToolSessionContext.replyRoute.map { route in
+        let replyRoute = turn.replyRoute.map { route in
             ["surface": route.surface, "destinationId": route.destinationId,
              "threadId": route.threadId, "sourceKey": route.sourceKey,
              "replyTo": route.replyTo, "correlationId": route.correlationId].compactMapValues { $0 }
@@ -97,7 +107,9 @@ public enum BotRunConversation {
             }
             throw underlying
         }
-        guard case .object(var fields) = result, [JSONValue.string("queued"), .string("joined")].contains(fields["status"] ?? .null),
+        let reply = ToolResult(result)
+        guard case .object(var fields) = result, reply.status == fields["status"]?.stringValue,
+              reply.said("queued") || reply.said("joined"),
               case .string(let returnedBot)? = fields["id"], UUID(uuidString: returnedBot) == bot.id,
               case .string(let request)? = fields["requestId"], let requestID = UUID(uuidString: request) else {
             do {
@@ -118,18 +130,26 @@ public enum BotRunConversation {
             fields["with"] = .string(bot.name)
             fields["automatic_return"] = .bool(true)
             fields["return_session"] = .string(scope)
-            fields["detail"] = .string("\(fields["status"] == .string("joined") ? "Joined" : "Queued") run \(requestID.uuidString). Its result will return to conversation \(scope) and be saved on the helper's shelf; you can keep talking in the meantime.")
+            fields["detail"] = .string("""
+                \(reply.said("joined") ? "Joined" : "Queued") run \(requestID.uuidString). Its result will return to conversation \
+                \(scope) and be saved on the helper's shelf; you can keep talking in the meantime.
+                """)
         } catch {
             fields["automatic_return"] = .bool(false)
             fields["conversation_id"] = .string(row.id)
             fields["operation_id"] = .string(row.operationID)
             fields["bookkeeping_error"] = .string(ChatToolOutcome.errorMessage(error))
-            fields["detail"] = .string("The run was accepted, but its return address could not be saved. Read the exact saved result later; do not queue the check again.")
+            fields["detail"] = .string("""
+                The run was accepted, but its return address could not be saved. Read the exact saved result later; do not queue the check again.
+                """)
         }
         return .object(fields)
     }
 
     private static func bookkeepingFailure(rowID: String, operationID: String, outcome: JSONValue, error: Error) -> ToolFailureError {
-        ToolFailureError("Helper outcome: \(outcome). Conversation \(rowID), operation \(operationID) remains unsettled: \(ChatToolOutcome.errorMessage(error)). Inspect that operation; do not queue it again.", effects: .unknown)
+        ToolFailureError("""
+            Helper outcome: \(outcome). Conversation \(rowID), operation \(operationID) remains unsettled: \(ChatToolOutcome.errorMessage(error)). \
+            Inspect that operation; do not queue it again.
+            """, effects: .unknown)
     }
 }

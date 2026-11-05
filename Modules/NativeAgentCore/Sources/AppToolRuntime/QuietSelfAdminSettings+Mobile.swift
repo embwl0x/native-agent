@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
@@ -8,8 +9,7 @@ extension QuietSettings {
     @MainActor
     public static func mobileSettings(host: any QuietSettingsHost) async throws -> [MobileAppSetting] {
         var rows: [MobileAppSetting] = []
-        // Phone-local settings already live in its native controls. Do not echo
-        // a request to the phone while it is waiting for this Mac projection.
+        // Phone-local settings already live in its native controls. Do not echo a request to the phone while it is waiting for this Mac projection.
         for setting in try QuietSettings.all(host: host, snapshotBots: true) where !setting.id.hasPrefix("phone.") {
             try Task.checkCancellation()
             do {
@@ -27,7 +27,8 @@ extension QuietSettings {
     }
 
     @MainActor
-    public static func setMobileSetting(host: any QuietSettingsHost, id: String, value: String, actionID: String, clientID: String) async throws -> MobileAppSetting {
+    public static func setMobileSetting(host: any QuietSettingsHost, id: String, value: String, actionID: String,
+        clientID: String, turn: Turn) async throws -> MobileAppSetting {
         guard let setting = try QuietSettings.all(host: host).first(where: { $0.id == id }) else {
             throw QuietSettingError.badValue("No setting is called \(id). Refresh the settings list.")
         }
@@ -35,16 +36,13 @@ extension QuietSettings {
             throw QuietSettingError.badValue("\(setting.label) is changed on the Trust page.")
         }
         let wanted = try Self.jsonValue(value, kind: setting.kind, label: setting.label)
-        try await PhoneSettingChange.$current.withValue(PhoneSettingChange(actionID: actionID, clientID: clientID)) {
-            try await QuietSettings.$byOwner.withValue(true) {
-                try await write(host, wanted)
-            }
-        }
+        let admitted = turn.with(\.phoneSettingChange, PhoneSettingChange(actionID: actionID, clientID: clientID))
+            .with(\.settingByOwner, true)
+        try await write(host, wanted, QuietSettingWrite(turn: admitted, detail: QuietWriteDetail()))
         return try await Self.row(setting, host: host)
     }
 
-    /// Every row with a setter, except Trust: its posture and the switches
-    /// that raise it stay with the Trust editor.
+    /// Trust posture and access-raising switches stay with the Trust editor.
     private static func writable(_ setting: QuietSetting) -> Bool {
         setting.write != nil && !setting.ownerOnly && !setting.fullMacOnly && setting.page != "trust"
     }
@@ -86,10 +84,8 @@ extension QuietSettings {
     }
 }
 
-/// The signed phone action a setting write is running for, so a row whose
-/// store keeps a provenance receipt records the phone, not the Mac.
+/// Signed phone actions retain phone provenance in store receipts rather than claiming a Mac action.
 public struct PhoneSettingChange: Sendable {
-    @TaskLocal public static var current: PhoneSettingChange?
     public let actionID: String
     public let clientID: String
 }

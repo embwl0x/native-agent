@@ -2,36 +2,25 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustCenter+Defaults.swift` | Canonical Trust/Mac schema, using immutable MacControlPolicyWireSnapshot scalar defaults shared with typed and phone reads |
+// Blueprint: | `TrustCenter+Defaults.swift` | Canonical scalar defaults shared with typed and phone reads. |
 
 extension SwiftNativeTrustCenter {
-    /// Default trust policy for the Swift runtime. Saved policy values are
-    /// merged over this shape by `loadTrustPolicyChecked()`.
+    /// Saved values merge over this canonical shape so readers share defaults.
     public nonisolated func defaultTrustPolicy() -> [String: JSONValue] {
         var policy: [String: JSONValue] = [:]
         policy["permissionLevel"] = .string("balanced")
         // Access-mode display/preset projection; PermissionLaw decides each call.
         policy["autonomyDefault"] = .string("supervised")
-        // `enableAutonomy` is deliberately NOT here. This shape is the merge
-        // base for EVERY saved policy, so a default true would silently grant
-        // unattended work to an older strict policy that predates the key.
-        // The fresh-install grant lives in `freshInstallTrustPolicyAdditions`,
-        // applied when the file is absent or contains an empty object.
-        // Read-time default when absent on disk; patching does not stamp edits.
+        // Autonomy additions apply only to proven fresh installs; putting them in the merge base would grant existing policies.
         policy["updatedAt"] = .string(Self.isoTimestamp(clock()))
         policy["appDataRoot"] = .string(dataRoot.path)
-        // The Mac and phone share the current workshopPolicy key.
-        policy[WorkshopPolicyBlockVocabulary.wireKey] = .object([
-            "enabled": .bool(true),
-        ])
         policy["filePolicy"] = .object([
             "workspaceRoots": .array(TrustCenterDefaultWorkspaceRoots.defaultRootPaths(dataRoot: dataRoot).map { .string($0) }),
             "requireBackupBeforeWrite": .bool(true),
             "outsideWorkspaceDefault": .string("deny"),
         ])
         policy["chromeControlPolicy"] = .object([
-            // Real Chrome carries the user's authenticated browsing session.
-            // A fresh install must expose no socket and accept no traffic.
+            // Real Chrome carries the user's authenticated browsing session. A fresh install must expose no socket and accept no traffic.
             "enabled": .bool(false),
         ])
         policy["multimodalPolicy"] = .object([
@@ -44,25 +33,19 @@ extension SwiftNativeTrustCenter {
         ])
         policy["trainingPolicy"] = .object([
             "dream_scheduler": .bool(true),
-            // Normalization gives every dream reader the same REM gate.
+            // Shared normalization keeps every dream reader on the same REM gate.
             "rem_cycle_enabled": .bool(true),
         ])
         policy["personalityPolicy"] = .object([
-            // Second half of the dream gate with trainingPolicy.dream_scheduler.
+            // REM also requires the scheduler gate.
             "dream_cycle_enabled": .bool(true),
         ])
         policy["memoryPolicy"] = .object([
             "cross_session_recall": .bool(true),
             "knowledge_graph_enabled": .bool(true),
-            "adaptive_promotion": .bool(true),
+            "adaptive_promotion": .bool(TrustMemoryPolicy.adaptivePromotionDefault),
             "vault_enabled": .bool(true),
             "vault_require_encryption": .bool(true),
-        ])
-        policy["swarmPolicy"] = .object([
-            "enabled": .bool(true),
-            "maxAgents": .int(20),
-            "maxParallel": .int(6),
-            "storeReceipts": .bool(true),
         ])
         policy["inboxPolicy"] = .object(["enabled": .bool(true)])
         policy["macControlPolicy"] = .object(Self.defaultMacControlPolicy)

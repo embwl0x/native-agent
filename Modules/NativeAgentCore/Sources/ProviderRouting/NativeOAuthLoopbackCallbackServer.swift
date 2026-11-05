@@ -1,7 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
-// Blueprint: | `NativeOAuthLoopbackCallbackServer.swift` | shared ChatGPT/xAI loopback callback socket lifecycle; one admitted wait (concurrent waits reject before installing cancellation or timeout), bounded blocking clients on Dispatch, protocol-specific response shape, state validation and exactly-once completion; browser opening stays in the owning session |
+// Blueprint: | `NativeOAuthLoopbackCallbackServer.swift` | one bounded wait; blocking I/O on Dispatch |
 
 public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
     public let redirectURI: URL
@@ -106,10 +106,8 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
               let nanoseconds = UInt64(exactly: (max(timeoutSeconds, 1) * 1_000_000_000).rounded(.up)) else {
             throw OAuthLoopbackCallbackError.invalidTimeout
         }
-        // Claim the whole wait, including its timeout/cancellation handler.
-        // A rejected second caller must not finish the first caller's listener.
-        // An already-canceled first caller still installs that handler so it
-        // retires the listener it just claimed.
+        // Claim the whole wait, including its timeout/cancellation handler. A rejected second caller must not finish the first caller's listener. An
+        // already-canceled first caller still installs that handler so it retires the listener it just claimed.
         try lock.withLock {
             guard !didFinish else { throw OAuthLoopbackCallbackError.canceled }
             guard !waitStarted else { throw OAuthLoopbackCallbackError.alreadyWaiting }
@@ -148,8 +146,7 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             }
             continuation = cont
             workerStarted = true
-            // Blocking sockets belong to Dispatch, never Swift's cooperative
-            // executor (which must remain free to deliver the timeout).
+            // Blocking sockets belong to Dispatch, never Swift's cooperative executor (which must remain free to deliver the timeout).
             DispatchQueue.global(qos: .userInitiated).async { [self] in
                 acceptRequests(expectedState: expectedState)
             }
@@ -158,8 +155,7 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
     }
 
     private func acceptRequests(expectedState: String) {
-        // Keep the descriptor reserved until the worker can no longer enter
-        // accept(), including cancellation before this worker starts running.
+        // Keep the descriptor reserved until the worker can no longer enter accept(), including cancellation before this worker starts running.
         defer { Darwin.close(fd) }
         while true {
             var addr = sockaddr()
@@ -175,8 +171,7 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
                 Darwin.close(client)
                 return
             }
-            // Reserve before dispatch; slow local clients cannot grow an
-            // unbounded collection of blocking readers or queued work items.
+            // Reserve before dispatch; slow local clients cannot grow an unbounded collection of blocking readers or queued work items.
             guard activeClients.count < (openAIFlow ? 4 : 1) else {
                 lock.unlock()
                 Darwin.close(client)
@@ -212,8 +207,7 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         var buffer = [UInt8](repeating: 0, count: openAIFlow ? 16 * 1024 : limit)
         var requestBytes = Data()
         let lineEnd = Data([13, 10])
-        // TCP does not preserve request boundaries. Accumulate the request
-        // line within the existing byte cap; cancellation shuts down the read.
+        // TCP does not preserve request boundaries. Accumulate the request line within the existing byte cap; cancellation shuts down the read.
         while requestBytes.range(of: lineEnd) == nil, requestBytes.count < limit {
             let count = Darwin.recv(client, &buffer, min(buffer.count, limit - requestBytes.count), 0)
             if count < 0, errno == EINTR { continue }
@@ -260,8 +254,7 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         didFinish = true
         let cont = continuation
         continuation = nil
-        // The worker owns close; shutdown interrupts an accepted socket's
-        // blocking read/write without racing descriptor reuse.
+        // The worker owns close; shutdown interrupts an accepted socket's blocking read/write without racing descriptor reuse.
         for client in activeClients { Darwin.shutdown(client, SHUT_RDWR) }
         Darwin.shutdown(fd, SHUT_RDWR)
         if !workerStarted { Darwin.close(fd) }
@@ -294,7 +287,10 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             }
         } else {
             html = url.map { "<html><body>\(callbackPageMessage($0))</body></html>" }
-                ?? "<html><body>This request was not accepted. The NativeAgent \(displayName) sign-in listener is still waiting for the browser callback.</body></html>"
+                ?? """
+                    <html><body>This request was not accepted. The NativeAgent \(displayName) sign-in listener is still waiting for the browser \
+                    callback.</body></html>
+                    """
             status = url == nil ? "400 Bad Request" : "200 OK"
         }
         let response = """

@@ -3,9 +3,7 @@ import MemoryV2
 import NativeAgentShared
 // Blueprint: | `KnowledgeGraphRows.swift` | Entity rows and detail render `MemoryFacade.graphSnapshot`, without separate neighborhood reads |
 
-// ---------------------------------------------------------------------------
 // MARK: - Entity row
-// ---------------------------------------------------------------------------
 
 struct KGEntityRow: View {
     let entity: KnowledgeGraphEntity
@@ -50,9 +48,7 @@ struct KGEntityRow: View {
     }
 }
 
-// ---------------------------------------------------------------------------
 // MARK: - Entity detail
-// ---------------------------------------------------------------------------
 
 struct KGEntityDetailView: View {
     let entity: KnowledgeGraphEntity
@@ -64,8 +60,6 @@ struct KGEntityDetailView: View {
         let neighbors = memory.neighborhood(entityID: entity.id)
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-                // Header: the kit's card (content, so a fill — never glass);
-                // the entity type's colour stays on its icon and name.
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                     HStack(spacing: NativeAgentSpacing.sm) {
                         Image(systemName: knowledgeGraphTypeSymbols[entity.type] ?? "circle")
@@ -98,7 +92,6 @@ struct KGEntityDetailView: View {
                 .padding(NativeAgentLayout.cardPadding)
                 .aliveCard()
 
-                // Edges / neighbors
                 let relationshipState = KnowledgeGraphPresentation.entityDetailRelationships(
                     isLoading: memory.graphLoading,
                     error: memory.graphLoadError,
@@ -226,8 +219,7 @@ extension KnowledgeGraphPresentation {
         return words.prefix(1).uppercased() + words.dropFirst()
     }
 
-    /// Relationship navigation uses the same filtered selection boundary as
-    /// the list and canvas; it never silently clears filters to reveal a node.
+    /// Relationship navigation uses the same filtered selection boundary as the list and canvas; it never silently clears filters to reveal a node.
     static func relationshipNavigationDestination(
         edge: KnowledgeGraphEdge,
         rootID: String,

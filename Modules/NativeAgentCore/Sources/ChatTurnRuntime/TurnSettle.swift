@@ -2,28 +2,27 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import CognitiveSubstrate
+import AgentConversations
 // Blueprint: | `TurnSettle.swift` | `TurnSettle` enum; `requestedResultIntent`, `takeStreamSuffix`, `transcriptRow` |
 
-/// The settle stage a turn ends through, on every lane: whether it ends
-/// waiting on a card, the terminal it gets then, the sentence the transport
-/// needs that no delta carried, and the row the transcript keeps — which is
-/// also what memory promotion reads, so the two never disagree.
+/// Every turn settles waiting state, terminal truth, transport prose and transcript through one owner so delivery and memory agree.
 enum TurnSettle {
     /// The obligation rides on the result's own durable row. Delivery readers
     /// can retry it without asking the provider or replaying any tool.
     static func requestedResultIntent(
         message: String, result: TurnEngineResult,
         sessionID: String, runID: String, surface: String,
-        resumedRequest: Bool
+        resumedRequest: Bool,
+        turn: Turn
     ) -> JSONValue? {
         guard result.completionState == .completed,
-              ChatTurnExecution.current?.waitingForInteraction != true,
-              ChatTurnExecution.transcriptRowKind == nil else { return nil }
-        let completion = ChatPersistenceContext.codexCompletionBinding
+              turn.execution?.waitingForInteraction != true,
+              turn.execution?.transcriptRowKind == nil else { return nil }
+        let completion = turn.rows.codexCompletion
         guard completion?.isTerminalCompletion != false else { return nil }
-        let origin = ChatPersistenceContext.originProvenance
+        let origin = turn.origin
         guard completion != nil || origin?.authored != .agent else { return nil }
-        // Finding an action (app {find}) or expanding context is not work.
+        // Discovery and context expansion alone cannot satisfy requested work.
         let meaningfulTools = result.toolDispatches.filter {
             $0.ranCall.tool != "context_expand"
                 && !($0.name == "app" && $0.input["find"] != nil && $0.input["action"] == nil)
@@ -37,13 +36,15 @@ enum TurnSettle {
         if meaningfulTools.contains(where: { dispatch in
             let ran = dispatch.ranCall.tool
             let input = dispatch.ranCall.input
-            guard ["agent_message", "codex_message", "claude_message", "omp_message", "bot_run_once"].contains(ran),
+            // A job the agent gave another agent settles by waking the context that commissioned it.
+            if ran == "app", input["action"] == .string("agent.job"), case .object(let fields) = dispatch.result {
+                return ["working", "needs_you"].contains(fields["state"]?.stringValue ?? "")
+            }
+            guard ["agent_message", "bot_run_once"].contains(ran),
                   case .object(let fields) = dispatch.result else { return false }
             // A one-way note completes when sent: its contract deliberately
             // creates no returning turn to own this obligation later.
-            if input["completion_mode"] == .string("receipt_only") ||
-                fields["completionMode"] == .string("receipt_only") ||
-                input["expects_reply"] == .bool(false) ||
+            if input["expects_reply"] == .bool(false) ||
                 fields["automatic_return"] == .bool(false) { return false }
             if ran == "agent_message", case .string(let state)? = fields["state"] {
                 return ["waiting", "sending", "working"].contains(state)
@@ -57,8 +58,8 @@ enum TurnSettle {
                 ["accepted", "enqueued", "queued", "joined", "running", "working", "in_progress", "waiting", "pending", "submitted", "delivering"].contains($0)
             }
         }) { return nil }
-        let route = ChatToolSessionContext.replyRoute?.surface ?? surface
-        guard route != "caller-result" else { return nil }
+        let route = turn.replyRoute?.surface ?? surface
+        guard route != "caller-result", route != AgentConversationStore.heldReplySurface else { return nil }
         return .object([
             "eventId": .string("requested-result:" + (completion?.deliveryId ?? runID)),
             "sessionId": .string(sessionID), "runId": .string(runID),
@@ -66,23 +67,19 @@ enum TurnSettle {
         ])
     }
 
-    /// Take the synthesized card prose once, for progress inside the execution scope.
-    static func takeStreamSuffix() -> String? {
-        guard let suffix = ChatTurnExecution.takeStreamSuffix(), !suffix.isEmpty else { return nil }
+    /// Consume synthesized card prose once inside the progress execution scope.
+    static func takeStreamSuffix(turn: Turn) -> String? {
+        guard let suffix = turn.execution?.takeStreamSuffix(), !suffix.isEmpty else { return nil }
         return suffix
     }
 
-    /// What the conversation keeps for a turn whose transport reply is
-    /// `reply`, and the row's provenance. Identical to `reply` unless the
-    /// turn ended waiting on a card: then it is the card lane's one sentence
-    /// (the card beneath carries the rest; the long compat sentence is the
-    /// transport's, not the conversation's), stamped `.cardLane` when the
-    /// model wrote none of it.
-    static func transcriptRow(for reply: String) -> (text: String, mechanicalRow: CognitiveMechanicalRowKind?) {
-        let text = ChatTurnExecution.transcriptReply(reply)
+    /// Persist the card-lane sentence for waiting turns; expanded text belongs only to transport.
+    /// Stamp synthesized-only rows as mechanical so memory never mistakes card copy for model-authored prose.
+    static func transcriptRow(for reply: String, turn: Turn) -> (text: String, mechanicalRow: CognitiveMechanicalRowKind?) {
+        let text = turn.execution?.transcriptReply(reply) ?? reply
         return (
             text,
-            ChatTurnExecution.transcriptReplyIsCardLane ? .cardLane : ChatTurnExecution.transcriptRowKind
+            turn.execution?.transcriptReplyIsCardLane == true ? .cardLane : turn.execution?.transcriptRowKind
         )
     }
 }

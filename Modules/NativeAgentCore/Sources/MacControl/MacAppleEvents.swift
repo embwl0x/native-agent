@@ -16,7 +16,7 @@ import OSAKit
 import os
 #endif
 
-// Blueprint: | `MacAppleEvents.swift` | AppleScriptExecution: declared app targets, per-event read-only and integration Write-switch enforcement; shared ownership supplies Automation identities; bounded OSA sends and exact Music playback settlement; fixed system-volume subprocess recipe (Now Playing identity reads belong to MacMediaTarget) |
+// Blueprint: | `MacAppleEvents.swift` | Native OSA: per-event target/Write checks, bounded replies, playback settlement and volume recipe |
 
 public final class AppleScriptExecution: Sendable {
     public init() {}
@@ -39,27 +39,33 @@ public final class AppleScriptExecution: Sendable {
 
     public static func checkAppScript(_ args: [String: JSONValue]) throws {
         guard let script = args["script"] else {
-            if args["seconds"] != nil || args["track_id"] != nil { throw SenseFailure(code: "bad_input", message: "Music seconds and track_id require a playback script.") }
+            if args["seconds"] != nil || args["track_id"] != nil { throw SenseFailure(code: "bad_input",
+                message: "Music seconds and track_id require a playback script.") }
             return
         }
         guard case .string(let source) = script, !source.isEmpty,
               Set(args.keys).isSubset(of: ["bundle_id", "script", "launch", "read_only", "seconds", "track_id"]),
               args["launch"] == nil || args["launch"] == .bool(true) || args["launch"] == .bool(false),
               args["read_only"] == nil || args["read_only"] == .bool(true) || args["read_only"] == .bool(false) else {
-            throw SenseFailure(code: "bad_input", message: "Pass {bundle_id,script,launch?,read_only?} with an AppleScript body for the declared app; launch:false never opens it; read_only:true refuses every modifying event.")
+            throw SenseFailure(code: "bad_input", message: """
+                Pass {bundle_id,script,launch?,read_only?} with an AppleScript body for the declared app; launch:false never opens it; read_only:true refuses \
+                every modifying event.
+                """)
         }
         if let seconds = args["seconds"] {
             guard args["bundle_id"] == .string("com.apple.Music"), args["read_only"] == .bool(false),
                   case .int(let duration) = seconds, (1...30).contains(duration),
                   case .string(let trackID)? = args["track_id"],
                   trackID.range(of: "^[0-9A-Fa-f]{16}$", options: .regularExpression) != nil else {
-                throw SenseFailure(code: "bad_input", message: "Only a Music playback script takes seconds (integer 1–30), with read_only:false and track_id (the selected song's 16-digit hex persistent ID).")
+                throw SenseFailure(code: "bad_input", message: """
+                    Only a Music playback script takes seconds (integer 1–30), with read_only:false and track_id (the selected song's 16-digit hex \
+                    persistent ID).
+                    """)
             }
         } else if args["track_id"] != nil {
             throw SenseFailure(code: "bad_input", message: "A Music track_id accompanies seconds only.")
         }
-        // Validate syntax that can change the execution environment, not app
-        // commands. Strings/comments are data; quoted identifiers remain code.
+        // Validate syntax that can change the execution environment, not app commands. Strings/comments are data; quoted identifiers remain code.
         let characters = Array(source)
         var index = 0, depth = 0, quoted = false, code = ""
         while index < characters.count {
@@ -85,7 +91,10 @@ public final class AppleScriptExecution: Sendable {
         let currentApp = words.indices.contains { words[$0] == "current" && ["app", "application"].contains(words.dropFirst($0 + 1).first ?? "") }
         guard !words.contains("use"), !importsTerms, !words.contains("script"),
               !tellsApp, !currentApp, !words.contains("me"), !words.contains("my"), !code.contains("«") else {
-            throw SenseFailure(code: "undeclared_target", message: "The runner owns the script environment and app target. Resource imports (use / using terms from), script objects (including load script / run script), explicit app tells, self references and raw code terms are refused.")
+            throw SenseFailure(code: "undeclared_target", message: """
+                The runner owns the script environment and app target. Resource imports (use / using terms from), script objects (including load script / run \
+                script), explicit app tells, self references and raw code terms are refused.
+                """)
         }
         var tells = 0
         let lines = code.replacingOccurrences(of: "¬[ \\t]*[\\r\\n]+", with: " ", options: .regularExpression)
@@ -96,7 +105,8 @@ public final class AppleScriptExecution: Sendable {
                 else if !tokens.dropFirst(index + 1).contains("to") { tells += 1 }
             }
             guard tells >= 0, tokens != ["end"] else {
-                throw SenseFailure(code: "undeclared_target", message: "The script body must not close the runner's app tell. Use explicit end statements for its own blocks.")
+                throw SenseFailure(code: "undeclared_target",
+                    message: "The script body must not close the runner's app tell. Use explicit end statements for its own blocks.")
             }
         }
     }
@@ -109,14 +119,13 @@ public final class AppleScriptExecution: Sendable {
         }
         let pid: pid_t?
         do {
-            // A stopped target cannot present consent. Only the owner's ask
-            // opens it, without activating it, through the execution owner.
+            // A stopped target cannot present consent. Only the owner's ask opens it, without activating it, through the execution owner.
             pid = ask ? try await appProcess(at: url) : await MainActor.run { runningApp(at: url)?.processIdentifier }
         } catch {
             return .object(["bundle_id": .string(bundleID), "app_path": .string(url.path),
                             "state": .string("unavailable"), "detail": .string(error.localizedDescription)])
         }
-        // The consent check waits like any Apple Event (ask:true can wait on the person): on the one queue.
+        // Consent can wait on the person; keep that wait on the shared Apple Event queue.
         return (try? await onAppleScriptQueue { _ in permission(bundleID: bundleID, url: url, pid: pid, ask: ask) })
             ?? .object(["bundle_id": .string(bundleID), "app_path": .string(url.path), "state": .string("unavailable"),
                         "detail": .string("The consent check was cancelled before it ran.")])
@@ -126,10 +135,9 @@ public final class AppleScriptExecution: Sendable {
     }
 
     #if canImport(AppKit)
-    // One serial queue owns OSA dictionary reads, consent, scripts and reply waits; queued cancellation sends nothing, running cancellation is checked at every event.
+    // One serial queue owns OSA/consent/reply work; queued cancellation sends nothing and running cancellation is checked per event.
     private static let appleScriptQueue = DispatchQueue(label: "NativeAgent.AppleScript", qos: .userInitiated)
-    // Playback commands, not reads, transfer ownership. A later play of the
-    // same song must not be stopped by an older bounded command's settlement.
+    // Playback commands, not reads, transfer ownership. A later play of the same song must not be stopped by an older bounded command's settlement.
     private static let musicPlaybackOwner = OSAllocatedUnfairLock<(pid: pid_t, token: UUID)?>(initialState: nil)
     private static let playbackCommands: Set<String> = ["Play", "Paus", "Stop", "PlPs", "Next", "Prev", "Back", "Resu", "Fast", "Rwnd"]
 
@@ -187,18 +195,18 @@ public final class AppleScriptExecution: Sendable {
     }
     #endif
 
-    /// App events stay in the app process; the isolated executor only supplies JSON.
-    public func callApp(_ arguments: JSONValue, targets: [String: String]) async throws -> JSONValue {
-        try await callApp(arguments, targets: targets, expectedMusicOwner: nil)
+    /// Keep app events in-process; the isolated executor supplies only JSON.
+    public func callApp(_ arguments: JSONValue, targets: [String: String], context: MacOperationContext) async throws -> JSONValue {
+        try await callApp(arguments, targets: targets, expectedMusicOwner: nil, context: context)
     }
 
-    private func callApp(_ arguments: JSONValue, targets: [String: String], expectedMusicOwner: UUID?) async throws -> JSONValue {
+    private func callApp(_ arguments: JSONValue, targets: [String: String], expectedMusicOwner: UUID?, context: MacOperationContext) async throws -> JSONValue {
         guard case .object(let args) = arguments, case .string(let bundleID)? = args["bundle_id"],
               let access = targets[bundleID], ["read", "write"].contains(access) else {
             throw SenseFailure(code: "undeclared_target", message: "Declare read or write reach for this app's bundle id.")
         }
         let read = AuthoredToolEffects.appReadOnly(args)
-        if !read, let refusal = MacAppActGate.refusal(bundleID: bundleID, throughAppleEvents: true) { throw refusal }
+        if !read, let refusal = MacAppActGate.refusal(bundleID: bundleID, throughAppleEvents: true, context: context) { throw refusal }
         guard access == "write" || read else {
             throw SenseFailure(code: "read_only", message: "A read-declared app refuses modifying or unclassified events.")
         }
@@ -230,7 +238,7 @@ public final class AppleScriptExecution: Sendable {
             pid = try await Self.appProcess(at: url)
         }
         let musicToken = bundleID == "com.apple.Music" ? UUID() : nil
-        let consentRoot = MacAppActGate.dataRoot
+        let consentRoot = context.dataRoot
         let response: JSONValue = try await Self.onAppleScriptQueue { cancelled in
             if let expectedMusicOwner, !Self.musicPlaybackOwner.withLock({ $0?.pid == pid && $0?.token == expectedMusicOwner }) {
                 return .object(["code": .int(0), "value": .string("playback_changed"), "effects": .string("none")])
@@ -243,7 +251,8 @@ public final class AppleScriptExecution: Sendable {
                 if case .string(let source)? = args["script"] {
                     let target = bundleID.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
                     let program = "use AppleScript version \"2.4\"\ntell application id \"\(target)\"\n\(source)\nend tell"
-                    value = try Self.scriptValue(program, pid: pid, authored: true, readOnly: read, cancelled: cancelled, musicToken: musicToken, consentRoot: consentRoot, effects: &effects)
+                    value = try Self.scriptValue(program, pid: pid, authored: true, readOnly: read, cancelled: cancelled, musicToken: musicToken,
+                        consentRoot: consentRoot, effects: &effects, context: context)
                 } else {
                     let event = NSAppleEventDescriptor.appleEvent(withEventClass: try Self.fourCode(args["event_class"]),
                         eventID: try Self.fourCode(args["event_id"]), targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
@@ -252,7 +261,7 @@ public final class AppleScriptExecution: Sendable {
                         guard case .object(let parameters) = value else { throw Self.badEvent() }
                         for (key, value) in parameters { event.setParam(try Self.descriptor(value), forKeyword: try Self.fourCode(.string(key))) }
                     }
-                    // Bound each reply with the Apple Event Manager's standard timeout.
+                    // Bound replies with the Apple Event Manager timeout so an unresponsive app cannot wait forever.
                     let options: NSAppleEventDescriptor.SendOptions = [.waitForReply, .neverInteract,
                         .init(rawValue: UInt(kAEDoNotPromptForUserConsent))]
                     // A cancel that arrived during the preflight stops the event before it is sent.
@@ -264,7 +273,7 @@ public final class AppleScriptExecution: Sendable {
                        Self.playbackCommands.contains(args["event_id"]?.stringValue ?? "") {
                         Self.musicPlaybackOwner.withLock { $0 = (pid, musicToken) }
                     }
-                    if !read, let refusal = MacAppActGate.refusal(pid: pid, throughAppleEvents: true, dataRoot: consentRoot) { throw refusal }
+                    if !read, let refusal = MacAppActGate.refusal(pid: pid, throughAppleEvents: true, dataRoot: consentRoot, context: context) { throw refusal }
                     let reply = try event.sendEvent(options: options, timeout: TimeInterval(kAEDefaultTimeout))
                     let code = reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value ?? 0
                     guard code == 0 else {
@@ -283,14 +292,16 @@ public final class AppleScriptExecution: Sendable {
                 fields["effects"] = effects.map(JSONValue.string) ?? .string("none")
                 return .object(fields)
             } catch {
-                let error = Self.appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent) as NSError
+                let error = Self.appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent, context: context) as NSError
                 let code = error.userInfo["apple_event_code"] as? Int ?? error.code
                 var failed: [String: JSONValue] = ["bundle_id": .string(bundleID), "app_path": .string(url.path), "read_only": .bool(read),
                     "code": .int(Int64(code)), "state": .string(error.userInfo["state"] as? String
                         ?? (code == -1744 ? "needs_consent" : code == -1743 ? "denied" : "failed")),
                     "message": .string(error.localizedDescription),
                     "detail": .string(error.userInfo["state"] != nil ? error.localizedDescription
-                        : code == -1743 ? "Automation was denied by the owner; only the owner can change it in System Settings › Privacy & Security › Automation."
+                        : code == -1743 ? """
+                            Automation was denied by the owner; only the owner can change it in System Settings › Privacy & Security › Automation.
+                            """
                         : error.localizedDescription)]
                 failed["effects"] = effects.map(JSONValue.string)
                 if error.userInfo["state"] == nil, [-1743, -1744].contains(code) {
@@ -304,14 +315,14 @@ public final class AppleScriptExecution: Sendable {
         let value = played["value"]?.stringValue ?? ""
         let started = played["code"] == .int(0) && value == "ok|||" + (args["track_id"]?.stringValue ?? "")
         guard started || ["occurred", "partial", "unknown"].contains(played["effects"]?.stringValue ?? "") else { return response }
-        // This bounded native call owns the Music player until settlement;
-        // neither the part nor her turn keeps a timer or a future stop job.
-        // A different track belongs to whoever took over, so leave it alone.
+        // This bounded native call owns the Music player until settlement; neither the part nor the agent's turn keeps a timer or a future stop job. A
+        // different track belongs to whoever took over, so leave it alone.
         let trackID = args["track_id"]?.stringValue ?? ""
         var cancelled = false
         do { if started { try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000) } }
         catch { cancelled = true }
         let stop = await settle { () -> JSONValue in
+            let context = context.settling()
             do {
                 guard await MainActor.run(body: { Self.runningApp(at: url)?.processIdentifier }) == pid else {
                     return .object(["code": .int(0), "value": .string("player_exited"), "effects": .string("none")])
@@ -324,7 +335,7 @@ public final class AppleScriptExecution: Sendable {
                     stop
                     return "stopped"
                     """)
-                ]), targets: targets, expectedMusicOwner: musicToken)
+                ]), targets: targets, expectedMusicOwner: musicToken, context: context)
             } catch {
                 return .object(["state": .string("failed"), "effects": .string("unknown"), "message": .string(error.localizedDescription)])
             }
@@ -348,9 +359,9 @@ public final class AppleScriptExecution: Sendable {
     }
 
     #if canImport(AppKit)
-    public static func runIntegrationScript(_ source: String, bundleID: String) async throws -> String {
+    public static func runIntegrationScript(_ source: String, bundleID: String, context: MacOperationContext) async throws -> String {
         try Task.checkCancellation()
-        let consentRoot = MacAppActGate.dataRoot
+        let consentRoot = context.dataRoot
         guard let url = await MainActor.run(body: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) }) else {
             throw NSError(domain: "NativeAgentAppleEvent", code: -600,
                           userInfo: [NSLocalizedDescriptionKey: "No installed app resolves \(bundleID)."])
@@ -370,11 +381,12 @@ public final class AppleScriptExecution: Sendable {
             let value: NSAppleEventDescriptor
             var effects: String?
             do { value = try scriptValue(program, pid: pid, authored: false, cancelled: cancelled,
-                                         musicToken: bundleID == "com.apple.Music" ? UUID() : nil, consentRoot: consentRoot, effects: &effects) }
+                                         musicToken: bundleID == "com.apple.Music" ? UUID() : nil, consentRoot: consentRoot, effects: &effects,
+                                             context: context) }
             catch AppleScriptError.permissionDenied {
                 throw AppleScriptError.permissionDenied(app: url.deletingPathExtension().lastPathComponent)
             }
-            catch { throw appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent) }
+            catch { throw appError(error, pid: pid, app: url.deletingPathExtension().lastPathComponent, context: context) }
             guard let text = value.stringValue else {
                 throw NSError(domain: "NativeAgentAppleScript", code: -1700,
                               userInfo: [NSLocalizedDescriptionKey: "The integration script did not return text."])
@@ -383,15 +395,15 @@ public final class AppleScriptExecution: Sendable {
         }
     }
 
-    private static func appError(_ error: Error, pid: pid_t, app: String) -> Error {
+    private static func appError(_ error: Error, pid: pid_t, app: String, context: MacOperationContext) -> Error {
         let ns = error as NSError
         guard (ns.userInfo["apple_event_code"] as? Int ?? ns.code) == -1712 else { return error }
         var state = "app_timeout"
-        let observation = MacAXLimits.$readDeadline.withValue(Date().addingTimeInterval(MacAXLimits.readSeconds)) {
-            let source = SystemMacAXElementSource()
+        let observation = context.holding(\.readDeadline, Date().addingTimeInterval(MacAXLimits.readSeconds)) {
+            context in let source = SystemMacAXElementSource()
             guard source.isTrusted() else { return "Accessibility permission is unavailable, so a dialog could not be checked." }
-            for window in source.windowRoots(pid: pid) {
-                let snapshot = MacAccessibilityReader.walk(source: source, root: window.ref)
+            for window in source.windowRoots(pid: pid, context: context) {
+                let snapshot = MacAccessibilityReader.walk(source: source, root: window.ref, context: context)
                 if let dialog = snapshot.nodes.first(where: {
                     MacPerceptionCompiler.modalSubroles.contains($0.attributes.role)
                         || MacPerceptionCompiler.modalSubroles.contains($0.attributes.subrole ?? "")
@@ -412,20 +424,23 @@ public final class AppleScriptExecution: Sendable {
         return NSError(domain: ns.domain, code: ns.code, userInfo: info)
     }
 
-    /// `effects` is what the script's events did: none when it sent only reads,
-    /// occurred when the app accepted another event, unknown when the app answered one with an error.
-    private static func scriptValue(_ source: String, pid: pid_t, authored: Bool, readOnly: Bool = false, cancelled: OSAllocatedUnfairLock<Bool>, musicToken: UUID? = nil,
+    /// `effects` is what the script's events did: none when it sent only reads, occurred when the app accepted another event, unknown when the app answered one
+    /// with an error.
+    private static func scriptValue(_ source: String, pid: pid_t, authored: Bool, readOnly: Bool = false, cancelled: OSAllocatedUnfairLock<Bool>,
+        musicToken: UUID? = nil,
                                     consentRoot: URL,
-                                    effects: inout String?) throws -> NSAppleEventDescriptor {
+                                    effects: inout String?, context: MacOperationContext) throws -> NSAppleEventDescriptor {
         guard let language = OSALanguage(forName: "AppleScript") else {
             throw SenseFailure(code: "unavailable", message: "AppleScript language is unavailable.")
         }
         let instance = OSALanguageInstance(language: language)
-        typealias Target = (pid: pid_t, authored: Bool, readOnly: Bool, refused: Bool, refusedRead: Bool, wrote: Bool, attempted: Bool, cancelled: OSAllocatedUnfairLock<Bool>, musicToken: UUID?, consentRoot: URL, appRefusal: MacAppActRefusal?, deadline: Date)
-        var target: Target = (pid, authored, readOnly, false, false, false, false, cancelled, musicToken, consentRoot, nil, Date().addingTimeInterval(30))
+        typealias Target = (pid: pid_t, authored: Bool, readOnly: Bool, refused: Bool, refusedRead: Bool, wrote: Bool, attempted: Bool,
+            cancelled: OSAllocatedUnfairLock<Bool>, musicToken: UUID?, consentRoot: URL, appRefusal: MacAppActRefusal?, deadline: Date,
+                context: MacOperationContext)
+        var target: Target = (pid, authored, readOnly, false, false, false, false, cancelled, musicToken, consentRoot, nil, Date().addingTimeInterval(30),
+            context)
         return try withUnsafeMutablePointer(to: &target) { pointer in
-            // A private component confines even computed targets and nested tells;
-            // every send keeps the raw primitive's consent, interaction and reply policy,
+            // A private component confines even computed targets and nested tells; every send keeps the raw primitive's consent, interaction and reply policy,
             // and the reply wait the script itself declared (`with timeout`, else the default).
             let sendCode = OSASetSendProc(instance.componentInstance, { event, reply, _, _, timeout, _, _, refCon in
                 guard let event, let reply, let refCon else { return OSErr(-50) }
@@ -451,7 +466,8 @@ public final class AppleScriptExecution: Sendable {
                     return OSErr(-1743)
                 }
                 if !read {
-                    let refusal = MacAppActGate.refusal(pid: pid, throughAppleEvents: true, dataRoot: target.pointee.consentRoot)
+                    let refusal = MacAppActGate.refusal(pid: pid, throughAppleEvents: true, dataRoot: target.pointee.consentRoot,
+                        context: target.pointee.context)
                     if let refusal {
                         target.pointee.appRefusal = refusal
                         return OSErr(-1743)
@@ -464,8 +480,8 @@ public final class AppleScriptExecution: Sendable {
                 let remainingTicks = max(1, Int(target.pointee.deadline.timeIntervalSinceNow * 60))
                 let sent = OSErr(AESendMessage(event, reply, AESendMode(kAEWaitReply | kAENeverInteract | kAEDoNotPromptForUserConsent),
                                                min(timeout > 0 ? Int(timeout) : remainingTicks, remainingTicks)))
-                // Another event wrote only when the app accepted it; an error reply or failed send leaves it
-                // unconfirmed. One macOS refused for want of consent never reached the app.
+                // Another event wrote only when the app accepted it; an error reply or failed send leaves it unconfirmed. One macOS refused for want of consent
+                // never reached the app.
                 if !read, ![-1743, -1744].contains(sent) {
                     var number: Int32 = 0
                     let errorReply = AEGetParamPtr(reply, keyErrorNumber, typeSInt32, nil, &number, MemoryLayout<Int32>.size, &size) == noErr && number != 0
@@ -487,8 +503,7 @@ public final class AppleScriptExecution: Sendable {
                 throw NSError(domain: "NativeAgentAppleEvent", code: Int(sendCode == 0 ? activeCode : sendCode),
                               userInfo: [NSLocalizedDescriptionKey: "AppleScript target enforcement could not be configured."])
             }
-            // AppleScript Language Guide, use (scripting additions): any use
-            // disables OSAX unless use/using terms from explicitly enables it.
+            // AppleScript Language Guide, use (scripting additions): any use disables OSAX unless use/using terms from explicitly enables it.
             // https://developer.apple.com/library/archive/documentation/AppleScript/Conceptual/AppleScriptLangGuide/reference/ASLR_control_statements.html
             let script = OSAScript(source: source, from: nil, languageInstance: instance, using: [])
             var error: NSDictionary?
@@ -525,7 +540,10 @@ public final class AppleScriptExecution: Sendable {
     }
 
     private static func badEvent() -> SenseFailure {
-        SenseFailure(code: "bad_input", message: "Use four-character event codes and JSON descriptors: string, bool, int, double, list, or {type}, {enum}, {ordinal}, {record}, {object:{want,form,seld,from}}. ordinal must be \"all \", \"firs\", \"last\", \"midd\" or \"any \" (including spaces).")
+        SenseFailure(code: "bad_input", message: """
+            Use four-character event codes and JSON descriptors: string, bool, int, double, list, or {type}, {enum}, {ordinal}, {record}, \
+            {object:{want,form,seld,from}}. ordinal must be \"all \", \"firs\", \"last\", \"midd\" or \"any \" (including spaces).
+            """)
     }
 
     private static func fourCode(_ value: JSONValue?) throws -> OSType {
@@ -610,8 +628,7 @@ public final class AppleScriptExecution: Sendable {
         String(decoding: [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: code >> $0) }, as: UTF8.self)
     }
     #endif
-    /// Only the fixed system-volume recipe calls this subprocess exit. App
-    /// scripts use callApp and its native, per-event target enforcement.
+    /// Only the fixed system-volume recipe calls this subprocess exit. App scripts use callApp and its native, per-event target enforcement.
     package func runSystemVolume(script: String) async throws -> String {
         #if canImport(AppKit)
         let result = try await ProcessExecution().run(
@@ -633,10 +650,9 @@ public final class AppleScriptExecution: Sendable {
 }
 
 extension AppleScriptExecution {
-    /// Automation consent is per target application.
     public static let automationTargetApps = ["Mail", "Messages", "Notes", "Music"]
 
-    /// Automation targets are identified by bundle ID, independently of their display names.
+    /// Use bundle IDs for Automation targets so display-name changes cannot redirect consent.
     public static let automationTargetBundleIDs: [String: String] = Dictionary(uniqueKeysWithValues:
         [MacIntegrationID.mail, MacIntegrationID.messages, MacIntegrationID.notes, MacIntegrationID.music].compactMap { id in
             MacIntegrationID.appBundleIDs(for: id).first.map { (MacIntegrationID.displayName(for: id), $0) }

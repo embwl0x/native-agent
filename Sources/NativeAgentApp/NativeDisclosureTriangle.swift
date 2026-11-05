@@ -3,7 +3,6 @@ import SwiftUI
 
 // Blueprint: | `NativeDisclosureTriangle.swift` | `NativeDisclosureTriangle`: AppKit disclosure button bridge sharing the row's expansion binding |
 
-/// Native disclosure button folds rows in place while retaining their layout.
 struct NativeDisclosureTriangle: NSViewRepresentable {
     var isOpen: Bool
     var accessibilityLabel: String

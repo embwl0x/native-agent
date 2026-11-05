@@ -1,10 +1,9 @@
 import Foundation
 import WebKit
-// Blueprint: | `BrowserActionRoutes+DOM.swift` | DOM mutation/readiness reads with one 3750ms script deadline and event cleanup; the visible adapter owns native interruption and bounds; result decoding and browser errors preserve unknown outcomes |
+// Blueprint: | `BrowserActionRoutes+DOM.swift` | DOM reads use one 3750ms deadline; cleanup and decoding preserve unknown outcomes |
 
 extension BrowserActionRoutes {
-    /// Evaluated with callAsyncJavaScript in the app's isolated content world.
-    /// One observer owns readiness, event cleanup and the 3750ms script deadline.
+    /// Isolated-world readiness shares one observer, cleanup boundary and 3750ms deadline.
     private static func domReadScript(read: String, ready: String) -> String {
         """
         return await new Promise((resolve, reject) => {
@@ -38,20 +37,14 @@ extension BrowserActionRoutes {
         """
     }
 
-    // N9 fix: JSON-encode every interpolated value so crafted selectors or text
-    // containing quotes, backslashes, or other JS metacharacters cannot inject
-    // arbitrary JavaScript.  JSONSerialization produces a properly escaped JS
-    // string literal including the surrounding double-quotes.
+    // JSON-encode interpolated values so selector or text metacharacters cannot inject JavaScript.
     private static func jsStringLiteral(_ s: String) throws -> String {
-        // A JavaScript string literal is a JSON *fragment*, not an object or
-        // array.  Without `.fragmentsAllowed`, Foundation raises an Objective-C
-        // exception for ordinary selector/text input before Swift can handle it.
+        // Foundation requires fragmentsAllowed for scalar strings or raises an Objective-C exception before Swift can catch it.
         let data = try JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed])
         return String(decoding: data, as: UTF8.self)
     }
 
     @MainActor public static func click(selector: String, runJS: @MainActor (String) async throws -> Any?) async throws {
-        // N9 fix: use JSON-encoded selector literal to prevent JS injection.
         let jsSel = try Self.jsStringLiteral(selector)
         _ = try await runJS("document.querySelector(\(jsSel)).click()")
     }
@@ -64,9 +57,7 @@ extension BrowserActionRoutes {
         }
     }
 
-    /// WebKit's localized description hides the script's outcome explanation.
-    /// Keep that bounded detail for the caller, without reclassifying transport
-    /// failures or cancellation as a DOM rejection.
+    /// Keep the script's bounded explanation: WebKit hides it in localizedDescription; transport failures stay distinct.
     public static func fillFailure(_ error: Error) -> Error {
         let failure = error as NSError
         guard failure.domain == WKError.errorDomain,
@@ -76,10 +67,8 @@ extension BrowserActionRoutes {
         return BrowserError.fillFailed(String(message.prefix(1024)))
     }
 
-    /// Success means this immediate DOM readback matched, not that a framework
-    /// persisted the edit or a later page update cannot undo it.
+    /// Immediate DOM readback cannot prove framework persistence or prevent later page updates.
     public static func fillScript(selector: String, text: String) throws -> String {
-        // N9 fix: use JSON-encoded selector and text literals to prevent JS injection.
         let jsSel = try jsStringLiteral(selector)
         let jsText = try jsStringLiteral(text)
         return """
@@ -142,12 +131,10 @@ public enum BrowserError: LocalizedError {
     case screenshotFailed
     case badRequest(String)
     case fillFailed(String)
-    /// C7 fix: returned when navigate is called while another navigation is in progress.
     case busy
     case timeout
     case outcomeUnknown
     case contentProcessTerminated
-    /// C7 fix (N8): returned when the current page's URL scheme is not http/https.
     case unsafeScheme(String)
 
     public var errorDescription: String? {
@@ -157,9 +144,17 @@ public enum BrowserError: LocalizedError {
         case .badRequest(let msg): return "Bad request: \(msg)"
         case .fillFailed(let detail): return "Browser fill failed: \(detail)"
         case .busy: return "Browser is busy with another navigation — try again shortly"
-        case .timeout: return "Browser operation exceeded its native deadline; its outcome is unknown. The page was retired; open it explicitly before further use."
-        case .outcomeUnknown: return "Browser operation was interrupted after dispatch; its outcome is unknown. The page was retired; open it explicitly before further use."
-        case .contentProcessTerminated: return "Browser content process terminated; its outcome is unknown. The page was retired; open it explicitly before further use."
+        case .timeout: return """
+            Browser operation exceeded its native deadline; its outcome is unknown. The page was retired; open it explicitly before \
+            further use.
+            """
+        case .outcomeUnknown: return """
+            Browser operation was interrupted after dispatch; its outcome is unknown. The page was retired; open it explicitly before \
+            further use.
+            """
+        case .contentProcessTerminated: return """
+            Browser content process terminated; its outcome is unknown. The page was retired; open it explicitly before further use.
+            """
         case .unsafeScheme(let scheme): return "Current page scheme '\(scheme)' is not allowed; only http/https are permitted"
         }
     }

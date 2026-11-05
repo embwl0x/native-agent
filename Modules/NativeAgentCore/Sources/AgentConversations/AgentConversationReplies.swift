@@ -12,8 +12,11 @@ import TurnTrace
 // Blueprint: | `AgentConversationReplies.swift` | Locked retained-answer delivery, inline waits and reply settlement on the existing conversation store |
 
 extension AgentConversationStore {
-    /// A contact's answer that settled in this write goes into the contact's own session, unless her turn carries it there (being handed over, or handed over by a turn already). There it is an arrival for her too (ResidentWake), unless it
-    /// came as a turn or is the person's own send. `from`/`steeredBy`: the stamp of who said the reply, as its transport attested it.
+    /// Contact news waits in the shared held owner, independently of any caller's open task.
+    public static let heldReplySurface = "agent-held"
+
+    /// Store settled replies in the contact session unless handover already carries them there. Preserve the transport-attested speaker and steering stamp;
+    /// person-initiated sends must not wake the agent.
     func noteReplies(was before: AgentConversationRecord, now row: AgentConversationRecord, wake: Bool = true,
                              from: String, steeredBy: [String] = [], answer: (id: String, text: String)? = nil,
                              retained: String? = nil) {
@@ -34,7 +37,7 @@ extension AgentConversationStore {
                 if !source.1 {
                     let entry = ContactThread.Entry.reply(owner: String(row.agent.dropFirst(5)), name: row.name,
                         text: source.0, replyID: "agent-conversation:" + exchange.id, at: at, from: from, steeredBy: steeredBy)
-                    // Its own task, carrying none of the writer's turn with it.
+                    // Detach from the writer’s turn context.
                     Task.detached { await ContactThread.write(entry, dataRoot: root) }
                 }
             }
@@ -65,13 +68,11 @@ extension AgentConversationStore {
         }
     }
 
-    /// The bridge's actual inbound message, before starting another turn. An explicit reply names its send; a pull host answers the sole delivered held send in the conversation it was given. The call that first drains that send cannot
-    /// answer it: its exchange is still `delivering`. Claim and deadline release share this lock; only the winner delivers. The bridge records its receipt before save publishes the answer to the waiter. An already claimed answer does not
-    /// write that receipt again.
+    /// Claim replies by exact send, or the sole delivered held send in the named conversation. The draining call cannot answer its still-delivering exchange.
+    /// Claim and deadline release share one lock.
     public func offerBridgeReplyToInlineWait(agent: String, messageID: String? = nil,
                                              conversationID: String? = nil, text: String,
-                                             from: String, steeredBy: [String],
-                                             recordReply: () throws -> Void = {}) throws -> Bool {
+                                             from: String, steeredBy: [String]) throws -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         return try locked {
@@ -89,7 +90,6 @@ extension AgentConversationStore {
             let receipt: [String: JSONValue] = if case .object(let fields)? = before.receipt { fields } else { [:] }
             if before.shownInline == before.operationID + ":ready",
                AgentConversationExchange.answer(receipt).text == text {
-                try recordReply()
                 return true
             }
             guard AgentConversationRunning.shared.watched(before.id),
@@ -97,7 +97,6 @@ extension AgentConversationStore {
             try answer(&rows[index], text: text, from: from, steeredBy: steeredBy)
             rows[index].shownInline = before.operationID + ":ready"
             rows[index].deliveryState = nil
-            try recordReply()
             try save(rows)
             noteReplies(was: before, now: rows[index], wake: false, from: from,
                         steeredBy: steeredBy, answer: (before.operationID, text))
@@ -105,7 +104,84 @@ extension AgentConversationStore {
         }
     }
 
-    /// One message of hers held for a contact that pulls (an MCP host with no command line): it goes out in the result of that host's next call.
+    /// A saved send can be held without a live turn. The transcript owns its payload; repeats never write another exchange.
+    public func holdReply(peer: AgentPeerContact, session: String, sendID: String, text: String) throws {
+        guard session.hasPrefix(ContactThread.prefix(owner: peer.id)), UUID(uuidString: sendID) != nil else {
+            throw Failure(message: "The held answer does not name this contact's conversation and send identity.")
+        }
+        try Self.validateHeldText(text)
+        try locked {
+            var rows = try load()
+            let agent = "peer:" + peer.id
+            let existing = rows.filter { (($0.exchanges ?? []) + ($0.releasing ?? [])).contains { $0.id == sendID } }
+            if !existing.isEmpty {
+                guard existing.count == 1, existing[0].agent == agent else {
+                    throw Failure(message: "The held answer's exchange identity is ambiguous; repair its saved record.")
+                }
+                return
+            }
+            let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+            let messages = try ContactThread.lines(dataRoot: root, owner: peer.id).filter { $0.sendID == sendID && $0.mine }
+            guard messages.count == 1, let message = messages.first, try Self.heldText(message) == text else {
+                throw Failure(message: "The held answer has no unique matching contact send row; repair its transcript.")
+            }
+            // Pruning publishes an exchange's terminal state on this very send row before releasing its journal entry.
+            if message.sendState != nil { return }
+            let conversation = "mcp-" + peer.id
+            guard rows.count < 512 else { throw Failure(message: "The saved conversation limit has been reached; the answer stays saved.") }
+            var row = AgentConversationRecord(id: sendID, scopeSessionID: session, agent: agent, name: peer.name,
+                label: "News " + String(sendID.prefix(8)), conversationID: conversation, phase: "ready", operationID: sendID, updatedAt: message.at,
+                sourceSurface: "agent-bridge", operationStartedAt: message.at, expectsReply: false)
+            let life = try DataRootLife.current(in: root)
+            var exchange = AgentConversationExchange.started(operationID: sendID, at: message.at, message: text)
+            exchange.lifeID = life
+            exchange.phase = "ready"; exchange.status = "held"
+            row.exchanges = try AgentConversationExchange.bounded([exchange], file: fileURL)
+            row.updatedAt = Date()
+            row.lifeID = life
+            row.peerRouteFingerprint = Self.routeFingerprint(peer)
+            row.receipt = .object(["status": .string("held"), "conversation_id": .string(conversation), "delivered": .bool(false)])
+            rows.append(row)
+            try save(rows)
+        }
+    }
+
+    package static func validateHeldText(_ text: String) throws {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw Failure(message: "The answer has no words or files to hold; nothing was held.")
+        }
+        guard text.utf8.count <= AgentConversationExchange.textLimit else {
+            throw Failure(message: "Nothing was held: a contact's held message keeps at most \(AgentConversationExchange.textLimit / 1024) KiB. "
+                + "The answer was not truncated.")
+        }
+    }
+
+    package static func heldText(_ message: ContactThread.Line) throws -> String {
+        var text = message.text
+        if let boundary = message.metadata["workingCommentaryChars"] {
+            guard case .int(let cut) = boundary, let count = Int(exactly: cut), count >= 0, count <= text.count else {
+                throw Failure(message: "The held answer's commentary boundary is unreadable; repair its saved row.")
+            }
+            text = String(text.dropFirst(count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        var paths: [String] = []
+        if let value = message.metadata["attachments"] {
+            guard case .array(let files) = value else { throw Failure(message: "The held answer's saved attachments are unreadable.") }
+            paths = try files.map { file in
+                guard case .object(let fields) = file, let path = fields["path"]?.stringValue, !path.isEmpty else {
+                    throw Failure(message: "A held answer attachment has no saved file reference; restore it before delivery.")
+                }
+                return path
+            }
+        }
+        return heldText(text, filePaths: paths)
+    }
+
+    package static func heldText(_ text: String, filePaths: [String]) -> String {
+        filePaths.isEmpty ? text : text + "\n\nFiles:\n" + filePaths.joined(separator: "\n")
+    }
+
+    /// Pull-host messages leave only through that host’s next call.
     public struct Held: Sendable {
         public let row: String
         public let exchange: String
@@ -114,8 +190,8 @@ extension AgentConversationStore {
         public let conversation: String?
     }
 
-    /// THE DRAIN, one serialized step: the held messages for `agent`, oldest first, as many as `fits` allows, each marked delivering in the same write, so no other call sees what this one took. `remaining` is how many still wait. A claim
-    /// from before this process (it quit mid-response) is held again: its response was never written.
+    /// Claim held messages oldest-first in one serialized write so concurrent drains cannot take the same message. A claim interrupted before its response was
+    /// written remains held.
     public func takeHeld(agent: String, fits: ([Held]) -> Bool) throws -> (taken: [Held], remaining: Int) {
         try locked {
             var rows = try load()
@@ -123,8 +199,7 @@ extension AgentConversationStore {
                 exchange.status == "held"
                     || exchange.status == "delivering" && (exchange.settledAt ?? .distantPast) < AbandonedTurnReconciler.processEpoch
             }
-            // The canonical contact transcript owns the accepted message. The
-            // exchange's bounded prompt is presentation only, never payload.
+            // The canonical contact transcript owns the accepted message. The exchange's bounded prompt is presentation only, never payload.
             let pending = rows.filter { $0.agent == agent && ($0.exchanges ?? []).contains(where: waiting) }
             guard !pending.isEmpty else { return ([], 0) }
             guard agent.hasPrefix("peer:") else { throw Failure(message: "A held send requires its exact contact identity.") }
@@ -134,15 +209,20 @@ extension AgentConversationStore {
                 try (row.exchanges ?? []).filter(waiting).map { exchange in
                     let messages = lines.filter { $0.sendID == exchange.id && $0.mine }
                     guard messages.count == 1, let message = messages.first else {
-                        throw Failure(message: "Held message \(exchange.id) has no unique canonical payload; repair its contact transcript before delivery. Nothing was drained.")
+                        throw Failure(message: """
+                            Held message \(exchange.id) has no unique canonical payload; repair its contact transcript before delivery. Nothing was \
+                            drained.
+                            """)
                     }
-                    return Held(row: row.id, exchange: exchange.id, at: exchange.sentAt, text: message.text, conversation: row.conversationID)
+                    return Held(row: row.id, exchange: exchange.id, at: exchange.sentAt,
+                        text: try Self.heldText(message), conversation: row.conversationID)
                 }
             }.sorted { $0.at < $1.at }
             var taken: [Held] = []
             for item in all {
                 guard fits(taken + [item]) else {
-                    if taken.isEmpty { throw Failure(message: "Held message \(item.exchange) exceeds this host's response capacity. It remains held in full; nothing was drained.") }
+                    if taken.isEmpty { throw Failure(
+                        message: "Held message \(item.exchange) exceeds this host's response capacity. It remains held in full; nothing was drained.") }
                     break
                 }
                 taken.append(item)
@@ -158,7 +238,37 @@ extension AgentConversationStore {
         }
     }
 
-    /// Settles what `takeHeld` handed out, once: delivered when the response carrying them was written, held again when it was not. Anything already settled is left as it is, so a late second word changes nothing.
+    /// What one door call carries out to a contact: the held messages it took, how many still wait, and how it settles them once its response is
+    /// written or fails. Every agent door drains through this one owner; a door never keeps its own held list.
+    public struct HeldDrain: Sendable {
+        public let taken: [Held]
+        public let remaining: Int
+        public let settle: @Sendable (_ written: Bool) -> Void
+        public static let nothing = HeldDrain(taken: [], remaining: 0, settle: { _ in })
+    }
+
+    /// Drain what is held for one contact (`peer`, the contact's id without its `peer:` prefix) into the response a door is about to write. The door
+    /// calls `settle` with whether that response was written; a settlement that fails owes repair and never resends.
+    public func drainHeld(peer: String, name: String, via door: String, fits: ([Held]) -> Bool) throws -> HeldDrain {
+        let held = try takeHeld(agent: "peer:" + peer, fits: fits)
+        guard !held.taken.isEmpty else { return HeldDrain(taken: [], remaining: held.remaining, settle: { _ in }) }
+        let taken = held.taken
+        let dataRoot = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        let file = fileURL
+        let settle: @Sendable (Bool) -> Void = { written in
+            do { try AgentConversationStore(dataRoot: dataRoot).settleHeld(taken, written: written, to: name, via: door) }
+            catch {
+                let words = "Held message settlement failed: " + error.localizedDescription
+                    + "; response written: \(written); exchanges: " + taken.map(\.exchange).joined(separator: ", ")
+                RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message, operation: "agent.held.settle:" + peer, owner: file.path,
+                    words: words, lever: "Repair the saved delivery transition against its original response outcome before any resend.",
+                    nextCall: ToolFailureError.call("app", ["action": .string("agent.read"), "args": .object(["agent": .string("peer:" + peer)])]))
+            }
+        }
+        return HeldDrain(taken: taken, remaining: held.remaining, settle: settle)
+    }
+
+    /// Only a written response proves held-message delivery; settlement is idempotent against late callbacks.
     public func settleHeld(_ taken: [Held], written: Bool, to name: String, via tool: String) throws {
         guard !taken.isEmpty else { return }
         let now = Date()
@@ -174,13 +284,14 @@ extension AgentConversationStore {
                 receipt?["delivered"] = .bool(true)
                 receipt?["accepted"] = .bool(true)
                 receipt?["delivered_at"] = .string(ISO8601DateFormatter().string(from: now))
-                receipt?["detail"] = .string("Delivered to \(name) at \(clock.string(from: now)), in the result of its \(tool) call. Its answer comes as a message of its own.")
+                receipt?["detail"] = .string(
+                    "Delivered to \(name) at \(clock.string(from: now)), in the result of its \(tool) call. Its answer comes as a message of its own.")
             }
             if written {
                 for item in taken {
                     guard let i = rows.firstIndex(where: { $0.id == item.row }),
                           rows[i].exchanges?.contains(where: { $0.id == item.exchange && $0.status == "delivered" }) == true else { continue }
-                    // Taken by the host: that message's "accept" is kept (its answer comes as its own message).
+                    // Keep acceptance after the host takes the message; its answer arrives separately.
                     var accepted = Experience.Obligation(to: "agent:" + rows[i].agent)
                     accepted.phase = .accepted
                     accepted.evidence = .init(source: "agents/conversations", id: rows[i].id)
@@ -192,7 +303,7 @@ extension AgentConversationStore {
         }
     }
 
-    /// One edit to each named exchange still in the state `from` accepts, and to the conversation's receipt when it is the current send (whose exchange mirrors that receipt).
+    /// Update only exchanges in the expected state; mirror the current send’s receipt in the same edit.
     private static func mark(_ items: [Held], in rows: inout [AgentConversationRecord],
                              from: (AgentConversationExchange) -> Bool,
                              _ edit: (inout AgentConversationExchange, inout [String: JSONValue]?) -> Void) {
@@ -210,13 +321,14 @@ extension AgentConversationStore {
         }
     }
 
-    /// The accepted message id of the send waiting in exactly this conversation, for an answer that names the conversation, not the message.
     public func waitingMessage(agent: String, conversationID: String) throws -> String? {
         let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
-        return try records().filter { identity.canonical($0.agent) == identity.canonical(agent) && $0.phase == "waiting" && $0.conversationID == conversationID }
+        return try records().filter { identity.canonical($0.agent) == identity.canonical(agent) && $0.phase == "waiting"
+            && $0.conversationID == conversationID }
             .map { row -> (row: AgentConversationRecord, started: Date) in
                 guard let started = row.operationStartedAt else {
-                    throw Failure(message: "Conversation \(row.id) has no operation start time; repair its retained evidence before selecting a waiting message.")
+                    throw Failure(
+                        message: "Conversation \(row.id) has no operation start time; repair its retained evidence before selecting a waiting message.")
                 }
                 return (row, started)
             }
@@ -224,9 +336,8 @@ extension AgentConversationStore {
             .flatMap { if case .string(let id)? = $0.row.readInput?["message_id"], !id.isEmpty { id } else { nil } }
     }
 
-    /// A contact's answer that came as a message of its own (Claude over the bridge) settles the send it names by its exact accepted message id, and only that one, through whichever of her doors it went; an answer naming nothing settles
-    /// nothing. Returns whether a waiting send was settled. `landedIn`: the chat the answer itself arrived in; in the contact's own session it is already there. `from`/`steeredBy`: the answering turn's own stamp (its door, and the peers
-    /// that steered it), carried onto any copy verbatim.
+    /// An unsolicited bridge answer settles only the exact accepted message it names. Avoid copying an answer already in the contact’s session; preserve its
+    /// attested speaker and steering stamp verbatim.
     @discardableResult public func settleReply(agent: String, messageID: String, text: String,
                                                landedIn: String? = nil, from: String, steeredBy: [String]) throws -> Bool {
         let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
@@ -250,14 +361,8 @@ extension AgentConversationStore {
 
     func answer(_ row: inout AgentConversationRecord, text: String, from: String, steeredBy: [String]) throws {
         var receipt: [String: JSONValue] = if case .object(let fields)? = row.receipt { fields } else { [:] }
-        if case .array(var jobs)? = receipt["jobs"], jobs.count == 1, case .object(var job) = jobs[0] {
-            job["agent_reply_text"] = .string(text)
-            job["agent_reply_truncated"] = .bool(false)
-            jobs[0] = .object(job); receipt["jobs"] = .array(jobs)
-        } else {
-            receipt["reply"] = .string(text)
-            receipt["status"] = .string("answered")
-        }
+        receipt["reply"] = .string(text)
+        receipt["status"] = .string("answered")
         receipt["reply_from"] = .string(from)
         receipt["reply_steered_by"] = .array(steeredBy.map(JSONValue.string))
         row.receipt = Self.cacheReceipt(.object(receipt))
@@ -267,47 +372,8 @@ extension AgentConversationStore {
         try Self.absorbExchange(into: &row, file: fileURL)
     }
 
-    /// Project already-read terminal owner evidence into waiting bookmarks. The existing delegation event runner supplies one complete snapshot; this never reads another store, sends, selects, or creates a conversation.
-    @discardableResult public func reconcileDelegationReplies(_ jobs: [DelegationReadout]) throws -> Int {
-        try locked {
-            var rows = try load()
-            var changed = 0
-            var before: [(Int, AgentConversationRecord)] = []
-            for index in rows.indices {
-                let row = rows[index]
-                guard ["waiting", "attention"].contains(row.phase), !row.automaticRead,
-                      let lane = try AgentConversationDelivery.lane(for: row.agent, dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()),
-                      row.readInput?["agent"] == .string(row.agent),
-                      case .string(let messageID)? = row.readInput?["message_id"],
-                      !messageID.isEmpty else { continue }
-                // Match the accepted message, never an internal job ID, topic or newest record. Ambiguous retained/delivery evidence stays with its owner for an explicit read.
-                let matches = jobs.filter { $0.agent == lane && $0.acceptedMessageIDs.contains(messageID) }
-                guard matches.count == 1, let job = matches.first,
-                      job.stallBasis == .terminal,
-                      case .object(var result) = job.toJSON(includeReplyText: true) else { continue }
-                result["matched_message_id"] = .string(messageID)
-                let receipt = JSONValue.object(["status": .string("ok"), "jobs": .array([.object(result)])])
-                var next = row
-                AgentConversationSession.absorb(receipt, into: &next)
-                // Only terminal transitions are written. In particular an unchanged/in-progress snapshot cannot self-trigger this file-watched runner, and a later read retains its full receipt. A live hand-off stays waiting (its answer is
-                // a chat); its receipt is written once.
-                guard (next.phase != "waiting" && next.phase != row.phase)
-                        || (AgentConversationSession.liveHandOff(next) && !AgentConversationSession.liveHandOff(row)) else { continue }
-                next.updatedAt = Date()
-                try Self.absorbExchange(into: &next, file: fileURL)
-                before.append((index, row))
-                rows[index] = next
-                changed += 1
-            }
-            if changed > 0 { try save(rows) }
-            // A lane's answer here came back as a turn (or to its caller).
-            for (index, row) in before { noteReplies(was: row, now: rows[index], wake: false, from: rows[index].agent) }
-            return changed
-        }
-    }
-
-    /// A built-in delegate's stall or bad outcome, for the send still owed an answer on it (its exact accepted message id), held for the continuation to tell her once in the chat it came from. A person's own send is theirs (their card says
-    /// it). The same event again is no new notice; a newer one with nothing to tell (it moved again, or finished) withdraws one still waiting to be told.
+    /// Notify the asking chat once for the exact send still owed an answer; a person’s own send remains theirs. Withdraw pending notices when newer evidence
+    /// clears the fault, and never duplicate unchanged notices.
     @discardableResult public func noteDelegationEvent(agent: String, messageIDs: [String],
                                                      notice: (AgentConversationRecord) -> AgentConversationNotice?) throws -> Int {
         try locked {
@@ -399,14 +465,7 @@ extension AgentConversationStore {
         var limit = AgentConversationExchange.textLimit
         while true {
             var remaining = 40 * 1024
-            var result = excerpt(root, textLimit: limit, remaining: &remaining)
-            if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] {
-                var bounded = excerpt(job, textLimit: limit, remaining: &remaining)
-                bounded["agent_reply_text"] = bounded.removeValue(forKey: "reply")
-                bounded["agent_reply_truncated"] = bounded.removeValue(forKey: "reply_truncated")
-                result["jobs"] = .array([.object(bounded)])
-                result.removeValue(forKey: "reply"); result.removeValue(forKey: "reply_truncated")
-            }
+            let result = excerpt(root, textLimit: limit, remaining: &remaining)
             let receipt = JSONValue.object(result)
             // JSON escaping can expand text well beyond its UTF-8 byte count.
             if limit == 0 || ((try? JSONEncoder().encode(receipt).count) ?? 0) <= 96 * 1024 { return receipt }

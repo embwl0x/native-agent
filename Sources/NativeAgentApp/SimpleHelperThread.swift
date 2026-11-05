@@ -8,11 +8,12 @@ import Agents
 import ChatSessionWork
 import AgentWorkspace
 import NativeAgentCore
+import ChatTurnContracts
 import PersistenceCore
 import ProviderRouting
 import AppKit
 import AppToolRuntime
-// Blueprint: | `SimpleHelperThread.swift` | SimpleHelperRuns shows helper history and messages, with shared read failures and retained-history status; accepted drafts send to the helper or the resident's chat |
+// Blueprint: | `SimpleHelperThread.swift` | Helper history and read failures; accepted drafts route to helper or resident chat |
 
 struct SimpleHelperRuns: View {
     let record: BotsShelfRecord
@@ -91,14 +92,13 @@ struct SimpleHelperRuns: View {
         }
     }
 
-    /// Message the helper in its own session without changing its standing brief.
+    /// Send in the helper session without changing its standing brief.
     private func send(_ text: String) async -> Bool {
         guard !inFlight, !store.waiting.contains(key) else {
             note = "\(name) is still answering. Send again once the reply is in."
             return false
         }
-        // The helper's conversation lives with the agent's current chat, as
-        // a contact's does, so her own asks and yours continue one thread.
+        // Keep resident and user asks in one thread under the current chat.
         let session = appModel.activeChatSessionId
         guard !session.isEmpty, appModel.engine.transcripts.sessions.contains(where: { $0.id == session }) else {
             note = "Chat is still starting. Nothing was sent."
@@ -110,11 +110,12 @@ struct SimpleHelperRuns: View {
         inFlight = true
         let agent = key
         defer { inFlight = false }
-        failure = await NativeAgentEngine.live.sendContactMessage(agent: agent, text: text, session: session, root: root)
+        let turn = Turn(session: session).with(\.envelope,
+            .personOnMac("mac_ui:contact.send"))
+        failure = await NativeAgentEngine.live.sendContactMessage(agent: agent, text: text, session: session, root: root, turn: turn)
         return failure == nil
     }
 
-    /// Ask the resident agent in her chat.
     private func askAgent(_ text: String) async -> Bool {
         let acceptance = await appModel.startActiveChatTurn("About \(name): \(text)",
                                                             expectedSessionId: appModel.activeChatSessionId)

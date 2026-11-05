@@ -4,25 +4,21 @@ import NativeAgentCore
 import NativeAgentShared
 import os
 import PersistenceCore
-// Blueprint: | `NativeOAuthFlow+Keyring.swift` | `Keyring`: `granted`, `grant`, `forget`, `values` — grant, removal and renewal of one secret on its one queue of the refresh queue registry; a renewal commits only onto the entry it read, and a successful grant or removal voids sign-ins begun before it; `NativeOAuthFlow`: `grantSecret` — the person's grant of a keyring secret, pasted or by a sign-in run from parameters they supplied (PKCE, loopback redirect, token redeemed and kept, never shown) |
+// Blueprint: | `NativeOAuthFlow+Keyring.swift` | `Keyring`, `granted`, `grant`, `forget`, `values`, `NativeOAuthFlow`, `grantSecret` |
 
-/// The keyring's use, owned here with every other sign-in and renewal: a
-/// value is read, checked against where its grant lets it go, renewed when
-/// a signed-in one expired, and committed, one secret at a time. Grant,
-/// replace, remove and renew of one secret all run on its one queue.
+/// Serialize each secret's grant, removal and renewal on one queue so read/check/refresh/commit cannot spend a grant twice.
 extension Keyring {
     private static let renewals = OAuthRefreshQueueRegistry()
-    /// Each grant or removal advances the name: an earlier sign-in cannot
-    /// overwrite a grant that finished while it was under way.
+    /// Each grant or removal advances the name: an earlier sign-in cannot overwrite a grant that finished while it was under way.
     private static let generations = OSAllocatedUnfairLock(initialState: [String: Int]())
 
     public static func generation(_ name: String) -> Int { generations.withLock { $0[name, default: 0] } }
 
-    /// What a device sign-in under way shows on its card: the code, and where to enter it.
+    /// Pending device grants expose only the code and verification destination.
     fileprivate static let signingIn = OSAllocatedUnfairLock(initialState: [String: String]())
     public static func signInNote(_ name: String) -> String? { signingIn.withLock { $0[name] } }
 
-    /// The person's removal, after anything already queued for the name.
+    /// Removal must follow operations already queued for that secret.
     public static func forget(_ name: String) async throws {
         try await renewals.queue(forKey: name).run {
             generations.withLock { $0[name, default: 0] += 1 }
@@ -30,8 +26,7 @@ extension Keyring {
         }
     }
 
-    /// Where a value is about to go: a host, or a running program as the
-    /// file it was launched from (its identity recorded at launch).
+    /// Program grants bind to executable identity recorded at launch, not just a path.
     public enum Destination: Sendable, CustomStringConvertible {
         case host(String), program(path: String, identity: String)
         public var description: String {
@@ -39,15 +34,14 @@ extension Keyring {
         }
     }
 
-    /// Why a value was not inserted. Its words never carry a value.
+    /// Refusal words must never carry the secret.
     public struct Refusal: LocalizedError, Sendable {
         public let code: String
         public let message: String
         public var errorDescription: String? { message }
     }
 
-    /// Whether a value is kept under `name` that may already go everywhere
-    /// asked: each host, and each program as the file it is now.
+    /// Every destination must match the secret's grant, including the current executable identity.
     public static func granted(_ name: String, hosts: [String], programs: [String]) -> Bool {
         guard let entry = try? entry(name) else { return false }
         return Set(hosts).isSubset(of: entry.hosts) && programs.allSatisfy { path in
@@ -55,10 +49,8 @@ extension Keyring {
         }
     }
 
-    /// The person's grant: the value, and exactly where the card said it may
-    /// go (each program bound to the executable's identity now), in place of
-    /// where it could before; refused when the name was granted or removed since
-    /// `generation` was read, or the card is no longer `open` (declined).
+    /// Bind grants to the destinations shown on the card. Refuse stale generations and closed cards so an earlier sign-in cannot overwrite a newer
+    /// decision.
     public static func grant(_ name: String, value: String, hosts: [String], programs: [String],
                              renewal: Renewal? = nil, account: String? = nil, generation: Int,
                              open: @escaping @Sendable () async -> Bool) async throws {
@@ -89,16 +81,8 @@ extension Keyring {
                              programs: bound.sorted { $0.path < $1.path }, renewal: renewal, at: Date(), account: account))
     }
 
-    /// The values to insert toward one destination, each with its grant
-    /// (when the person granted it: a renewal keeps it, a new grant does not);
-    /// refuses a name that is not kept or not granted there. A signed-in value
-    /// is renewed shortly before it expires, and when it is still the one
-    /// `rejected` names (its destination answered 401); `renewed` says a
-    /// rejected one was renewed here or by another run since, under the grant
-    /// in `grants`: one granted again meanwhile (another account, perhaps)
-    /// never says renewed, so a request is not sent again under it. Read,
-    /// check, renew and commit run as one step per secret, so two runs never
-    /// redeem one refresh token twice.
+    /// Read, destination check, renewal and commit share one queue per secret. Only the rejected credential's unchanged grant may authorize resend; a
+    /// concurrent new account never does.
     public static func values(_ names: [String], to destination: Destination, rejected: [String: String] = [:],
                               grants: [String: Date] = [:]) async throws -> (values: [String: String], grants: [String: Date], renewed: Bool) {
         var values: [String: String] = [:], granted: [String: Date] = [:], renewed = false, regranted = false
@@ -118,7 +102,10 @@ extension Keyring {
     private static func current(_ name: String, to destination: Destination, rejected: String?) async throws -> (value: String, renewed: Bool, grant: Date) {
         guard var entry = try entry(name) else {
             throw Refusal(code: "no_secret", message: "No secret named \(name) is kept. Ask the person once: app card.request "
-                + "{kind:\"api_key\", target:\"secret:\(name)\", hosts:[…] and/or programs:[…], why}; the value goes from their card to the keyring, never through you.")
+                + """
+                    {kind:\"api_key\", target:\"secret:\(name)\", hosts:[…] and/or programs:[…], why}; the value goes from their card to the keyring, \
+                    never through you.
+                    """)
         }
         let allowed = switch destination {
         case .host(let host): Keyring.host(host).map(entry.hosts.contains) == true
@@ -133,8 +120,8 @@ extension Keyring {
             throw Refusal(code: "permission_denied", message: "Secret \(name) is granted for \(line.isEmpty ? "nowhere" : line), not \(destination). "
                 + "Ask for it again naming \(destination); the card keeps where it already goes and adds this.")
         }
-        // A grant with no stated expiry (RFC 6749: expires_in omitted) is used until the
-        // provider rejects it; only a known, near expiry or a rejection renews it.
+        // A grant with no stated expiry (RFC 6749: expires_in omitted) is used until the provider rejects it; only a known, near expiry or a rejection
+        // renews it.
         guard let renewal = entry.renewal,
               renewal.expires.map({ $0 <= Date().addingTimeInterval(OAuthGrantOperations.renewalMargin) }) == true || rejected == entry.value else {
             return (entry.value, rejected.map { $0 != entry.value } ?? false, entry.at)
@@ -177,17 +164,14 @@ extension Keyring {
             : "the token endpoint gave no usable answer"
     }
 
-    /// The account a token answer is for: its OpenID token's subject, when
-    /// it carries one (taken from the token endpoint over TLS, OIDC 3.1.3.7),
-    /// with every credential of the sign-in cut from it, since she reads it.
+    /// TLS token-endpoint identity may name the account, but strip every credential before exposing the subject.
     static func account(_ tokens: [String: Any], hiding credentials: [String?]) -> String? {
         guard let subject = (tokens["id_token"] as? String).flatMap({ jwtPayload($0)?["sub"] as? String }) else { return nil }
         return (credentials + [tokens["access_token"] as? String, tokens["refresh_token"] as? String]).compactMap { $0 }
             .filter { !$0.isEmpty }.reduce(subject) { $0.replacingOccurrences(of: $1, with: "[secret]") }
     }
 
-    /// Only admitted provider evidence constructs renewal authority. A grant
-    /// without a refresh token is nonrenewable. Refresh responses may keep the
+    /// Only admitted provider evidence constructs renewal authority. A grant without a refresh token is nonrenewable. Refresh responses may keep the
     /// current renewal's refresh token by omitting a replacement (RFC 6749 §6).
     static func renewal(_ answer: OAuthGrantOperations.TokenResponse, token: String, clientID: String, clientSecret: String?,
                         clientAuth: String?) -> Renewal? {
@@ -198,12 +182,7 @@ extension Keyring {
 }
 
 extension NativeOAuthFlow {
-    /// The person's grant of a keyring secret: the value they pasted, or a
-    /// sign-in NativeAgent runs from the parameters she supplied as data (PKCE
-    /// through a loopback redirect, or a device sign-in whose code `shown`
-    /// puts on the card; the token is kept, never shown), with the client
-    /// secret the person typed, if any, kept only while its card is `open`.
-    /// Nil once kept, else the reason, carrying no value.
+    /// Keep sign-in tokens private and client secrets only while the card is open. PKCE/device sign-in parameters are data, and errors never carry values.
     @MainActor
     public static func grantSecret(_ name: String, ask: InlineInteraction.SecretAsk, pasted: String?,
                                    open: @escaping @Sendable () async -> Bool, shown: @MainActor () async -> Void) async -> String? {
@@ -214,7 +193,10 @@ extension NativeOAuthFlow {
         }
         let clientSecret = pasted.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         guard signIn.clientAuth != "basic" || clientSecret != nil else {
-            return "oauth_client_secret_missing: This sign-in requires HTTP Basic client authentication. Enter the service-issued client secret on this sign-in card."
+            return """
+                oauth_client_secret_missing: This sign-in requires HTTP Basic client authentication. Enter the service-issued client secret on this \
+                sign-in card.
+                """
         }
         func keep(_ tokens: [String: Any]) async -> String? {
             do {
@@ -237,14 +219,20 @@ extension NativeOAuthFlow {
         guard signIn.redirect == nil || given?.scheme == "http" && ["127.0.0.1", "localhost"].contains(given?.host ?? ""),
               let port = UInt16(exactly: given?.port ?? 0),
               var authorize = signIn.authorize.flatMap(URLComponents.init(string:)), authorize.scheme == "https" else {
-            return "oauth_sign_in_parameters_invalid: Sign-in requires an HTTPS authorize address and, if set, an HTTP loopback redirect. Correct sign_in.authorize and sign_in.redirect (http://127.0.0.1:<port>/<path>) in app card.request."
+            return """
+                oauth_sign_in_parameters_invalid: Sign-in requires an HTTPS authorize address and, if set, an HTTP loopback redirect. Correct \
+                sign_in.authorize and sign_in.redirect (http://127.0.0.1:<port>/<path>) in app card.request.
+                """
         }
         let server: NativeOAuthLoopbackCallbackServer
         do {
             server = try NativeOAuthLoopbackCallbackServer(preferredPort: port, path: given.map(\.path).flatMap { $0.isEmpty ? nil : $0 } ?? "/callback",
                                                            displayName: name)
         } catch {
-            return "oauth_listener_failed: Could not open the sign-in listener on port \(port): \(error.localizedDescription) Correct the reported socket problem or sign_in.redirect in app card.request before starting a new sign-in."
+            return """
+                oauth_listener_failed: Could not open the sign-in listener on port \(port): \(error.localizedDescription) Correct the reported socket \
+                problem or sign_in.redirect in app card.request before starting a new sign-in.
+                """
         }
         defer { server.cancel() }
         let redirect = signIn.redirect ?? server.redirectURI.absoluteString
@@ -255,7 +243,10 @@ extension NativeOAuthFlow {
             URLQueryItem(name: "code_challenge", value: pkce.challenge), URLQueryItem(name: "code_challenge_method", value: "S256"),
         ] + (signIn.scopes.map { [URLQueryItem(name: "scope", value: $0)] } ?? [])
         guard let url = authorize.url, NSWorkspace.shared.open(url) else {
-            return "oauth_browser_open_failed: macOS could not open the sign-in URL. Set a working default web browser in System Settings → Desktop & Dock → Default web browser, then choose Try again on the \(name) card."
+            return """
+                oauth_browser_open_failed: macOS could not open the sign-in URL. Set a working default web browser in System Settings → Desktop & Dock → \
+                Default web browser, then choose Try again on the \(name) card.
+                """
         }
         let code: String
         do {
@@ -266,24 +257,32 @@ extension NativeOAuthFlow {
                 return "oauth_callback_invalid: \(reason) Start a new sign-in with Try again on the \(name) card."
             }
         } catch OAuthLoopbackCallbackError.timedOut {
-            return "oauth_callback_timeout: No browser callback arrived within 300 seconds. Choose Try again on the \(name) card and finish browser sign-in within five minutes."
+            return """
+                oauth_callback_timeout: No browser callback arrived within 300 seconds. Choose Try again on the \(name) card and finish browser sign-in \
+                within five minutes.
+                """
         } catch OAuthLoopbackCallbackError.canceled {
             return "oauth_sign_in_cancelled: Sign-in was cancelled. Leave it stopped; no further action is needed."
         } catch is CancellationError {
             return "oauth_sign_in_cancelled: Sign-in was cancelled. Leave it stopped; no further action is needed."
-        } catch { return "oauth_callback_failed: \(error.localizedDescription) Inspect the callback failure before starting a new sign-in with Try again on the \(name) card." }
+        } catch { return """
+            oauth_callback_failed: \(error.localizedDescription) Inspect the callback failure before starting a new sign-in with Try again on the \(name) \
+            card.
+            """ }
         var form = ["grant_type": "authorization_code", "code": code, "redirect_uri": redirect,
                     "code_verifier": pkce.verifier, "client_id": signIn.clientID]
         form["client_secret"] = clientSecret
         let tokens: [String: Any]
         do { tokens = try await OAuthGrantOperations.postToken(signIn.token, form, basic: signIn.clientAuth == "basic") }
         catch let failure as ProviderFailure.Diagnostic { return failure.localizedDescription }
-        catch { return "oauth_token_exchange_failed: Browser approval finished, but sign-in is incomplete (\(Keyring.exchangeFailure(error))). Inspect sign_in.token and client authentication in app card.request before starting a new sign-in." }
+        catch { return """
+            oauth_token_exchange_failed: Browser approval finished, but sign-in is incomplete (\(Keyring.exchangeFailure(error))). Inspect sign_in.token \
+            and client authentication in app card.request before starting a new sign-in.
+            """ }
         return await keep(tokens)
     }
 
-    /// A device sign-in: its code and link on the card, the link opened for
-    /// the person, then the token endpoint asked until they approve there.
+    /// Show the verification code/link before waiting for remote approval.
     @MainActor
     private static func deviceSignIn(_ name: String, _ signIn: InlineInteraction.SecretAsk.SignIn, device: String, client: [String: String],
                                      shown: @MainActor () async -> Void) async throws -> [String: Any] {

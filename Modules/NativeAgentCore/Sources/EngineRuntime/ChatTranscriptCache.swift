@@ -19,7 +19,6 @@ import ChatToolParsing
 import SlackBot
 import TelegramBot
 import TriggerScheduler
-import WorkshopExecution
 import BackgroundLoops
 import AppToolRuntime
 import TrustCenter
@@ -60,7 +59,6 @@ import Experiences
 import CryptoKit
 import ActivityWatch
 import OSLog
-import Procedures
 import SchedulerExecution
 import Combine
 import UserNotifications
@@ -71,10 +69,9 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `ChatTranscriptCache.swift` | `ChatTranscriptCache`: file-identity disk revisions feed transcript messages, recollections and search; bounded shell opening/last-turn scans share the cache owner; context sizing belongs to SessionContextMeasurement |
+// Blueprint: | `ChatTranscriptCache.swift` | `ChatTranscriptCache`; One decoded disk revision shared by transcript readers |
 
-/// One decoded disk revision feeds messages, recollections, raw context counts
-/// and search; optimistic rows and rendering stay outside this cache.
+/// Share one decoded revision across readers; optimistic rows and rendering remain outside the disk cache.
 public actor ChatTranscriptCache {
     static let shared = ChatTranscriptCache()
 
@@ -120,9 +117,7 @@ public actor ChatTranscriptCache {
         }
         let root = path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let history = try await SessionHistoryReader(dataRoot: root).messagesWithStats(forSessionId: path.deletingPathExtension().lastPathComponent)
-        // A writer can advance the file while the asynchronous loader is
-        // running. Return that read under the existing selection semantics,
-        // but never certify it as the projection of a different revision.
+        // A writer may advance during the load; return this read without certifying a different revision.
         if let before, Self.identity(at: path) == before, history.stats.mode != "read_failed" {
             store(Entry(identity: before, history: history), for: key)
         }
@@ -144,9 +139,7 @@ public actor ChatTranscriptCache {
 
     private static func identity(at path: URL) -> SnapshotTailOpLog.FileStamp? {
         var info = stat()
-        // Do not cache missing paths, symlinks, nonregular entries or failed
-        // inspections. ctime catches same-size rewrites with restored mtime
-        // as well as permission changes; inode catches atomic replacement.
+        // Cache only inspected regular files. ctime catches restored-mtime rewrites and permission changes; inode catches replacement.
         guard lstat(path.path, &info) == 0,
               (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else { return nil }
         return SnapshotTailOpLog.FileStamp(info)

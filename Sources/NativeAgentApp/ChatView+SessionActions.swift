@@ -14,7 +14,7 @@ extension VoiceOutputController {
         )
     }
 
-    // Manual message playback is globally singular; auto-read has its mounted owner.
+    // Keep manual playback globally singular while auto-read retains its mounted owner.
     static let sharedMessagePlayback = forChat()
 }
 
@@ -31,13 +31,13 @@ extension ChatView {
         }
     }
 
-    /// Retry notices cover the reconnect backoff and replace the previous attempt.
+    /// Replace the prior retry notice through reconnect backoff so attempts do not stack.
     func pushChatTopNotice(_ text: String, kind: String) {
         guard kind == "provider_retry" else {
             turnNoticeToasts.push(info: text, autoDismissAfter: 6)
             return
         }
-        // One fixed id: each try replaces the last without clearing other notices.
+        // Use one fixed ID so retries replace only their own notice.
         turnNoticeToasts.push(SystemToast(kind: .info, text: text, autoDismissAfter: 30, id: Self.providerRetryNoticeID))
     }
 
@@ -46,9 +46,7 @@ extension ChatView {
     func primeAutoReadForCurrentSessionIfNeeded() {
         let sessionID = appModel.activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionID.isEmpty, !autoReadPrimedSessionIds.contains(sessionID) else { return }
-        // Prime only once per session. A later tab switch must retain its old
-        // cursor so an assistant reply that arrived while the tab was hidden
-        // still passes the gate exactly once when it becomes current again.
+        // Prime once per session so replies arriving behind another tab still pass the gate exactly once on return.
         lastAutoReadMessageIds[sessionID] = appModel.chatMessages
             .last(where: { $0.role == "assistant" })?.id
         autoReadPrimedSessionIds.insert(sessionID)
@@ -63,8 +61,7 @@ extension ChatView {
             lastMessage: appModel.chatMessages.last.map { ($0.id, $0.sessionId, $0.role, $0.content) },
             lastReadMessageID: lastAutoReadMessageIds[sessionID]
         ) else { return }
-        // Consume before dispatching the asynchronous voice request: a count,
-        // content, and busy-state update may all re-render this same reply.
+        // Consume before async playback because content, count and busy updates can re-render the same reply.
         lastAutoReadMessageIds[sessionID] = request.messageID
         Task {
             await voiceOutput.speak(
@@ -75,7 +72,6 @@ extension ChatView {
         }
     }
 
-    // Export session messages to ~/Downloads/NativeAgent-chat-<sid>-<ts>.md.
     func exportCurrentChatToDownloads() {
         let session = activeSession
         let sessionId = appModel.activeChatSessionId
@@ -102,20 +98,10 @@ extension ChatView {
     }
 }
 
-// Only ChatTurnCardInset reads this state; ChatView.body does not.
+// Keep inset observation out of ChatView.body so clearance changes affect only the pill.
 extension ChatTurnCardInset {
-    // chat-smoothness phase 4: one visibility truth for the floating live-turn
-    // card — the overlay, its animation, and the "Latest" button lift all key
-    // off this so they can never disagree.
-    //
-    // Desk 658.11: that truth is now the lifecycle owner's own projection, not
-    // `isBusy`. Session keying already fences other sessions' work, and a turn
-    // that ended without provable terminal evidence (including one repaired at
-    // relaunch) keeps its honest card instead of vanishing with the busy flag.
-    //
-    // Desk 658.12: approvals join that same truth. A turn that ended cleanly
-    // while its approval is still pending (or ended unproven) keeps the card,
-    // because that question has no other home in the transcript.
+    // Derive card visibility, animation and Latest clearance from the lifecycle owner so they cannot disagree.
+    // Keep unproven terminal work and pending approvals visible because their question has no other transcript home.
     var showThinkingRow: Bool {
         TurnCardReadout.isVisible(
             appModel.engine.turns.lifecycle(for: appModel.activeChatSessionId),

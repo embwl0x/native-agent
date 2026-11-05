@@ -5,15 +5,14 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
-// Blueprint: | `CognitionObservatoryView+Capsule.swift` | Observatory capsule/reflection panels and felt-mode gloss: read-only projection with no capsule text or behavior mutation |
+// Blueprint: | `CognitionObservatoryView+Capsule.swift` | Read-only capsule, reflection and felt-mode presentation |
 
 extension CognitionObservatoryView {
 
-    /// The read-only chip shows a dominant felt mode; absence means no single aboutness.
+    /// Absence of a dominant mode proves no single aboutness, not a missing capsule.
     @ViewBuilder
     private func feltModeChip(_ mode: CognitiveSubstrate.FeltMode) -> some View {
-        // Name the thing on screen: a bare "seeking" beside a capsule reads as a label
-        // for the capsule. "Felt mode · seeking" says whose state this is and what kind.
+        // Qualify the mode label so readers cannot mistake it for the capsule's title.
         Label("Felt mode · \(mode.rawValue) — \(Self.feltModeGloss(mode))", systemImage: "scope")
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -23,8 +22,7 @@ extension CognitionObservatoryView {
             .accessibilityLabel("Felt mode: \(mode.rawValue), \(Self.feltModeGloss(mode))")
     }
 
-    /// Plain-language gloss per mode — the chip has to mean something to a reader who
-    /// has never opened CognitiveSubstrate+FeltFingerprint.swift.
+    /// Explain felt modes without requiring knowledge of the substrate implementation.
     private static func feltModeGloss(_ mode: CognitiveSubstrate.FeltMode) -> String {
         switch mode {
         case .seeking:     return "reaching toward something"
@@ -44,9 +42,7 @@ extension CognitionObservatoryView {
     ) -> some View {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                 if let feltMode { feltModeChip(feltMode) }
-                // Provenance: is this the capsule Agent actually received last turn,
-                // or a synthetic stand-in shown before any chat injection? Without
-                // this caption the panel reads as frozen when chat is quiet.
+                // Distinguish the last injected capsule from a pre-injection projection so quiet chat cannot appear frozen.
                 if let info {
                     switch info.source {
                     case .liveInjected:
@@ -94,7 +90,10 @@ extension CognitionObservatoryView {
                     ForEach(Array(reflections.prefix(6)), id: \.id) { receipt in
                         let total = receipt.estimatedPromptTokens.addingReportingOverflow(receipt.estimatedResultTokens)
                         let tokens = total.overflow
-                            ? "total unavailable (prompt \(receipt.estimatedPromptTokens), result \(receipt.estimatedResultTokens); total exceeds integer range)"
+                            ? """
+                                total unavailable (prompt \(receipt.estimatedPromptTokens), result \(receipt.estimatedResultTokens); total exceeds integer \
+                                range)
+                                """
                             : String(total.partialValue)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(receipt.request.reason)
@@ -105,7 +104,10 @@ extension CognitionObservatoryView {
                             Text("\(receipt.request.model) via \(receipt.provider)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            Text("estimated tokens \(tokens), estimated cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), cares affected \(receipt.affectedCareIDs.count)")
+                            Text("""
+                                estimated tokens \(tokens), estimated cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), cares affected \
+                                \(receipt.affectedCareIDs.count)
+                                """)
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }

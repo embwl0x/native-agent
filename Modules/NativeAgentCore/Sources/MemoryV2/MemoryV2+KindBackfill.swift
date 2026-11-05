@@ -1,25 +1,14 @@
-// Kind backfill stages one approval card; only approval writes the proposed kinds through the store.
-// Kinds and decay rates belong to the agent and user.
-//
-// Backfill owns its stamp-file idempotence and pending-approval recovery
-// scan; card id == approval id so InboxView's approve/reject routes through
-// resolveApproval(id); `canceled` clears the stamp (re-stages next pass),
-// `denied` keeps it (a refused backfill is never re-proposed).
-//
-// Approval creation and pending scans are injected by the app layer.
-// The visible inbox CARD is written through LiveNotificationInbox;
-// the resolveApproval dispatch branch for `action` lives in the app
-// layer (NativeClient).
+// Only approval writes proposed kinds. Match card and approval IDs so inbox decisions reach the same owner. Stamp staging idempotently; cancellation permits
+// restaging, denial prevents reproposal. Inject approval creation and pending scans from the app; ForPerson owns the visible matter.
 
 import Foundation
 import Experiences
 import GRDB
 import NativeAgentCore
-import NotificationInbox
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `MemoryV2+KindBackfill.swift` | `MemoryKindBackfill`: approval-staged legacy row classifications and checked apply through canonical storage |
+// Blueprint: | `MemoryV2+KindBackfill.swift` | Approved canonical category writes; the approval is the one matter the person sees and its owner draws its face |
 
 /// Staging stamps: local backup/export and memory PrivacyMap, no phone sync.
 public enum MemoryKindBackfill {
@@ -27,18 +16,15 @@ public enum MemoryKindBackfill {
     /// A distinct action id keeps kind backfill separate from memory repair.
     public static let action = "memory.kind_backfill"
 
-    /// Payload discriminator.
     public static let payloadKindValue = "memory.kind_backfill.rows"
 
-    /// Stamp kind under <dataRoot>/memory/repairs/.
     public static let stampKind = "memory.kind_backfill"
 
     // MARK: - Row proposal
 
     public struct RowProposal: Sendable, Equatable {
         public let id: String
-        /// MemoryStorage.contentHash of the content at staging time — the
-        /// apply-time stale guard (content drift → skip, never overwrite).
+        /// MemoryStorage.contentHash of the content at staging time — the apply-time stale guard (content drift → skip, never overwrite).
         public let contentHash: String
         /// Sentence-clipped preview for the card; never written anywhere.
         public let contentPreview: String
@@ -54,9 +40,7 @@ public enum MemoryKindBackfill {
 
     // MARK: - Detection
 
-    /// Active rows the backfill may classify: no metadata.kind at all (the
-    /// legacy rows) or only the machine write-default stamp. Deliberate
-    /// kinds (caller/extractor/approved-backfill) are never re-proposed.
+    /// Only missing or machine-default kinds are classifiable; deliberate kinds must never be reproposed.
     public static func classifiableRows(storage: MemoryStorage) async throws -> [StoredMemory] {
         try await storage.listMemories(persona: nil, status: "active", limit: nil)
             .filter { MemoryKindStamp.isClassifiable($0.metadata) }
@@ -65,16 +49,13 @@ public enum MemoryKindBackfill {
 
     // MARK: - Classification
 
-    /// On-device classifier. Unavailability and nonmember replies throw.
-    /// `classify` below owns the complete-set failure contract.
+    /// Classifier unavailability and nonmember replies throw; complete-set classification owns failure scope.
     public static func foundationModelsClassifier(content: String, taxonomy: [String]) async throws -> String {
         try await OnDeviceClassification.classify(content: content, into: taxonomy)
     }
 
-    /// Classify the complete candidate set. A failed row keeps the whole
-    /// proposed classification owed; no damaged inference disappears from a card.
-    /// A row the classifier cannot label stays exactly as it is and is named; the
-    /// rest are proposed. Only a classifier that is unavailable fails the pass.
+    /// Classify the complete candidate set. A failed row keeps the whole proposed classification owed; no damaged inference disappears from a card. A row the
+    /// classifier cannot label stays exactly as it is and is named; the rest are proposed. Only a classifier that is unavailable fails the pass.
     public static func classify(
         rows: [StoredMemory],
         classifier: @Sendable (String, [String]) async throws -> String
@@ -105,16 +86,8 @@ public enum MemoryKindBackfill {
 
     // MARK: - Staging
 
-    /// Idempotent staging entry point. Returns the approval id when a card exists after
-    /// this call (fresh or reused), nil when there was nothing to stage or
-    /// staging failed (no stamp is written on failure — retried next pass).
-    ///
-    /// - createApproval: app-layer closure — creates the approval RECORD
-    ///   (SwiftNativeApprovalInbox.create) from a {title, action, risk,
-    ///   reason, payload} body and returns its id.
-    /// - listPendingBackfills: app-layer closure — pending approval records
-    ///   for `action` as (id, payload), for the crash-retry dedupe scan.
-    ///   A throw here fails CLOSED (stage nothing; next pass retries).
+    /// Reuse pending approvals before staging so interrupted stamp writes cannot duplicate cards. Write no stamp on failed staging; pending-scan failure stages
+    /// nothing and leaves later recovery possible.
     @discardableResult
     public static func stageIfNeeded(
         dataRoot: URL,
@@ -131,8 +104,7 @@ public enum MemoryKindBackfill {
             return nil
         }
 
-        // Crash-retry dedupe BEFORE doing any classification work: a prior
-        // launch may have created the approval but died before the stamp.
+        // Find prior approvals before classification so an interrupted stamp write cannot duplicate the card.
         let pending: [(id: String, payload: JSONValue)]
         do {
             pending = try await listPendingBackfills()
@@ -142,9 +114,7 @@ public enum MemoryKindBackfill {
             return nil
         }
         if let existing = pending.first(where: { payloadKind($0.payload) == payloadKindValue }) {
-            let rows = rowProposals(fromPayload: existing.payload)
             do {
-                try await ensureInboxCard(dataRoot: dataRoot, approvalId: existing.id, rows: rows)
                 try writeStamp(approvalId: existing.id, dataRoot: dataRoot)
                 return existing.id
             } catch {
@@ -154,7 +124,6 @@ public enum MemoryKindBackfill {
             }
         }
 
-        // Detect + classify. Detection failure (no sqlite yet) → skip.
         let rows: [RowProposal]
         let unclassified: [(id: String, reason: String)]
         do {
@@ -168,7 +137,7 @@ public enum MemoryKindBackfill {
         }
         guard !rows.isEmpty else { return nil }
 
-        let title = "Memory: classify \(rows.count) legacy memories into kinds"
+        let title = cardTitle(rows.count)
         let reason = "Approve to classify these memories with the proposed kinds through the normal memory write path. "
             + "Only kind metadata changes; content and embeddings stay intact. Replacement still requires explicit, "
             + "fingerprinted intent. Deny to leave every row as it is."
@@ -187,8 +156,6 @@ public enum MemoryKindBackfill {
                 try writeStamp(approvalId: approvalId, dataRoot: dataRoot)
                 return approvalId
             }
-            // Card failure leaves no stamp so an invisible backfill cannot block restaging.
-            try await ensureInboxCard(dataRoot: dataRoot, approvalId: approvalId, rows: rows)
             try writeStamp(approvalId: approvalId, dataRoot: dataRoot)
             return approvalId
         } catch {
@@ -196,6 +163,11 @@ public enum MemoryKindBackfill {
             oweFailure(error, dataRoot: dataRoot)
             return nil
         }
+    }
+
+    /// Rows carry a missing kind, the write-time default or an unsourced note; current writes still produce them.
+    static func cardTitle(_ count: Int) -> String {
+        "Memory: classify \(count) unclassified memories into kinds"
     }
 
     // MARK: - Payload codec
@@ -223,8 +195,7 @@ public enum MemoryKindBackfill {
         return kind
     }
 
-    /// Parse row proposals out of an approval payload — only what the
-    /// approved card actually carried is ever applied.
+    /// Apply only row proposals actually carried by the approved payload.
     public static func rowProposals(fromPayload payload: JSONValue) -> [RowProposal] {
         guard case .object(let obj) = payload,
               case .array(let rows)? = obj["rows"] else { return [] }
@@ -247,21 +218,12 @@ public enum MemoryKindBackfill {
     public struct ApplyOutcome: Sendable, Equatable {
         public var applied: [String] = []
         public var skippedStale: [String] = []
-        public var failed: [String: String] = [:]   // id → reason
+        public var failed: [String: String] = [:]
         public init() {}
     }
 
-    /// Write the approved kinds. Per-row guards:
-    ///   - row gone → failed;
-    ///   - content drifted since staging (hash mismatch) → skippedStale;
-    ///   - row no longer classifiable (a deliberate kind landed meanwhile)
-    ///     → skippedStale;
-    ///   - proposed kind not in the taxonomy → failed (never write junk).
-    /// Guards and metadata merge share one storage transaction; the usual
-    /// UserMD/Spotlight/KG hooks fire after it commits.
-    /// NOTE: applying bumps updated_at, so a row backfilled into a
-    /// decaying kind starts its decay clock at apply time — conservative
-    /// (decay fires later, never earlier; recall quality never reduced).
+    /// Validate target existence, staged content hash, classifiable kind and taxonomy inside one merge transaction. Missing or invalid rows fail; changed rows
+    /// skip as stale. Fire normal projections after commit. Applying updates the decay clock conservatively, never aging a row before approval.
     public static func apply(
         _ rows: [RowProposal],
         storage: MemoryStorage
@@ -279,54 +241,6 @@ public enum MemoryKindBackfill {
             }
         }
         return outcome
-    }
-
-    // MARK: - Inbox card
-
-    /// Card id == approval id (InboxView routes approve/reject through
-    /// inboxAction(id) → resolveApproval(id)). The live inbox owns the file.
-    static func ensureInboxCard(
-        dataRoot: URL,
-        approvalId: String,
-        rows: [RowProposal]
-    ) async throws {
-        // Per-kind counts for the summary line.
-        var counts: [String: Int] = [:]
-        for row in rows { counts[row.proposedKind, default: 0] += 1 }
-        let summary = counts.sorted { $0.value > $1.value }
-            .map { "\($0.key) ×\($0.value)" }
-            .joined(separator: ", ")
-        let detail = rows
-            .map { "Memory: \($0.contentPreview)\nProposed category: \($0.proposedKind)" }
-            .joined(separator: "\n\n")
-        let card: JSONValue = .object([
-            "id": .string(approvalId),
-            "created_at": .string(MemoryStorage.nowISO8601()),
-            "source": .string("memory_kind_backfill"),
-            "severity": .string("actionable"),
-            "title": .string("Memory: classify \(rows.count) legacy memories into kinds"),
-            "summary": .string(String("Proposed kinds: \(summary)".prefix(500))),
-            "detail": .string(detail),
-            "related_execution_id": .null,
-            "related_approval_id": .string(approvalId),
-            "related_paths": .array([
-                .string(dataRoot.appendingPathComponent("memory/memory.sqlite").path),
-            ]),
-            "related_groups": .array([]),
-            "actions": .array([
-                .object(["id": .string("view"), "label": .string("View"),
-                         "description": .string("See every row's proposed kind")]),
-                .object(["id": .string("approve"), "label": .string("Approve"),
-                         "description": .string("Stamp the listed kinds (metadata only)")]),
-                .object(["id": .string("reject"), "label": .string("Deny"),
-                         "description": .string("Leave every memory exactly as it is")]),
-                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                         "description": .string("Dismiss this card")]),
-            ]),
-            "status": .string("unread"),
-            "read_at": .null,
-        ])
-        try await LiveNotificationInbox.live(dataRoot: dataRoot).appendUnique(card, id: approvalId)
     }
 
     // MARK: - Stamps (idempotence + cancel-restage)
@@ -370,8 +284,7 @@ public enum MemoryKindBackfill {
             words: "Memory classification is still owed: \(error.localizedDescription). Repair the classifier or named store before staging the complete card.")
     }
 
-    /// Canceled decision (or a failed apply): clear the stamp so the next
-    /// pass re-detects and re-stages a fresh card.
+    /// Canceled decision (or a failed apply): clear the stamp so the next pass re-detects and re-stages a fresh card.
     public static func clearStamp(dataRoot: URL) {
         do { try FileManager.default.removeItem(at: stampPath(dataRoot: dataRoot)) }
         catch let error as CocoaError where error.code == .fileNoSuchFile { return }

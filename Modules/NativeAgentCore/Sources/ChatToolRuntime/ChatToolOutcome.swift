@@ -18,14 +18,17 @@ import TrustCenter
 import ChromeControl
 import Senses
 import StandingBots
-// Blueprint: | `ChatToolOutcome.swift` | `ChatToolOutcome` runtime extension: failure normalization, waiting/effect evidence, refusal interpretation, cognitive grading and repair operation identity; uses ChatToolParsing's exact result classification |
+import ChatToolParsing
+// Blueprint: | `ChatToolOutcome.swift` | `ChatToolOutcome`: Share exact classification; preserve effect and repair evidence. |
 
 /// Trace and persisted tool rows use the same success/failure classification.
 extension ChatToolOutcome {
-    /// Fill missing failure evidence at the result boundary; successes pass through unchanged.
-    public static func normalizedFailure(_ output: JSONValue, tool: String? = nil) -> JSONValue {
-        guard !outputLooksSuccessful(output), !isWaitingOnPerson(output),
-              !wasCancelled(output), !InlineInteractionNeed.isWaiting(output),
+    /// Normalize only failures so success payloads retain their original bytes.
+    public static func normalizedFailure(_ output: JSONValue, tool: String? = nil, throughAppDoor: Bool = false) -> JSONValue {
+        let reply = ToolResult(output)
+        guard !outputLooksSuccessful(reply.payload, verdict: reply.outcome),
+              !isWaitingApproval(reply.payload), !reply.isWaitingInteraction,
+              reply.outcome != .cancelled, !InlineInteractionNeed.isWaiting(reply.payload),
               case .object(var object) = output else { return output }
         func text(_ key: String) -> String? {
             guard case .string(let raw)? = object[key] else { return nil }
@@ -48,7 +51,6 @@ extension ChatToolOutcome {
             }
         }
         let oldReason = text("reason")
-        // The tool's own code, wherever it says one (a Mac verb's detail.error).
         let inner: String? = if case .object(let detail)? = object["detail"], case .string(let error)? = detail["error"] { error } else { nil }
         let genericCodes: Set<String> = ["failed", "error", "dispatch_error", "tool_failed"]
         let suppliedCodes = [text("failure_code"), text("error_code"), text("errorCode"), text("code")].compactMap { $0 }
@@ -56,8 +58,8 @@ extension ChatToolOutcome {
         let code = oldReason.flatMap { isCode($0) && !genericCodes.contains($0) ? $0 : nil }
             ?? (suppliedCodes + domainCodes).first { !genericCodes.contains($0) }
             ?? suppliedCodes.first ?? domainCodes.first ?? "tool_failed"
-        let candidates = ["message", "spoken", "text", "detail", "output", "error", "content", "result", "fix", "recovery_hint", "hint"].flatMap { explanations(object[$0]) }
-        // A process that failed says why on stderr and in its exit code.
+        let candidates = ["message", "spoken", "text", "detail", "output", "error", "content", "result", "fix", "recovery_hint",
+            "hint"].flatMap { explanations(object[$0]) }
         let exit = [object["exit_code"], object["exitCode"]].lazy.compactMap { value -> Int? in
             if case .int(let code)? = value { return Int(code) }
             if case .double(let code)? = value { return Int(exactly: code) }
@@ -91,7 +93,7 @@ extension ChatToolOutcome {
         if object["remedy"] == nil || object["remedy"] == .null {
             // Project the owner's lever; naming an action makes no lookup or replay a repair.
             object["remedy"] = nil
-            let door = AppDoorReentry.perform != nil
+            let door = throughAppDoor
             let argument = text("argument_path")
             let correction = effects == "none" && argument != nil
             let instruction = text("fix") ?? text("recovery_hint") ?? text("hint")
@@ -115,14 +117,14 @@ extension ChatToolOutcome {
     }
 
     /// Name a lever as its act; reads and restarts change no owner and settle no repair.
-    static func leverOperation(_ remedy: JSONValue?) throws -> String? {
+    static func leverOperation(_ remedy: JSONValue?, turn: Turn) throws -> String? {
         guard case .object(let fields)? = remedy, case .object(let call)? = fields["next_call"],
               case .string(let tool)? = call["tool"] else { return nil }
         let input: [String: JSONValue] = if case .object(let given)? = call["input"] { given } else { [:] }
         guard case .string(let action)? = input["action"], !action.isEmpty else {
             return tool == "app" ? nil : ToolNameAliases.appAction(tool) ?? tool
         }
-        guard !action.hasSuffix(".restart"), try AppActionBinding.action(input: input)?.read != true else { return nil }
+        guard !action.hasSuffix(".restart"), try AppActionBinding.action(input: input, turn: turn)?.read != true else { return nil }
         return repairOperation(action, input)
     }
 
@@ -188,73 +190,82 @@ extension ChatToolOutcome {
         case unknown
     }
 
-    /// The trace's failure/open/completed status projection.
     package static func statusWord(_ output: JSONValue, verdict: ExactResultClass? = nil) -> String {
-        let result = verdict ?? exactResultClass(output)
+        let reply = ToolResult(output)
+        let result = verdict ?? reply.outcome
         return result == .succeeded ? "ok" : result.isFailure ? "failed" : "unknown"
     }
 
     /// Exact classification owns failure shape; unknown is not failure except skipped calls or needs.
     package static func outputLooksSuccessful(_ output: JSONValue, verdict: ExactResultClass? = nil) -> Bool {
-        switch verdict ?? exactResultClass(output) {
+        let reply = ToolResult(output)
+        switch verdict ?? reply.outcome {
         case .failed, .refused, .timeout, .cancelled: return false
         case .succeeded: return true
         case .unknown:
             guard case .object(let object) = output, case .string(let status)? = object["status"] else { return true }
-            return !["skipped", "needs_input"].contains(status.lowercased())
+            // This predicate historically lowercases without trimming.
+            guard status.lowercased() == reply.status else { return true }
+            return !reply.said("skipped") && !reply.said("needs_input")
         }
     }
 
     /// A synthetic cancelled slot never ran and proves neither an effect nor a failure.
     public static func wasCancelled(_ output: JSONValue) -> Bool {
-        exactResultClass(output) == .cancelled
+        let reply = ToolResult(output)
+        return reply.outcome == .cancelled
     }
 
     /// Waiting approval is neither failure nor progress and cannot renew the turn budget.
     public static func isWaitingApproval(_ output: JSONValue) -> Bool {
+        let reply = ToolResult(output)
         guard case .object(let object) = output else { return false }
         if object["not_run_status"] == .string("approval_filed") { return true }
         if let result = object["result"], isWaitingApproval(result) { return true }
-        guard case .string(let raw)? = object["status"] else { return false }
-        let status = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return status == "waiting_approval"
-            || status == "awaiting_approval"
-            || status == "pending_approval"
+        guard case .string? = object["status"] else { return false }
+        return reply.said("waiting_approval")
+            || reply.said("awaiting_approval")
+            || reply.said("pending_approval")
     }
 
-    /// Either kind of wait: the turn is parked on a person, not on a model.
+    /// Parked waits must not be mistaken for model work.
     public static func isWaitingOnPerson(_ output: JSONValue, verdict: ExactResultClass? = nil) -> Bool {
-        isWaitingApproval(output) || isWaitingInteraction(output, verdict: verdict)
+        let reply = ToolResult(output)
+        // A supplied verdict still owns the waiting decision.
+        return isWaitingApproval(reply.payload)
+            || (verdict.map { isWaitingInteraction(reply.payload, verdict: $0) } ?? reply.isWaitingInteraction)
     }
 
     /// Held, unoffered, skipped and unrun cancelled calls prove neither progress nor effects.
     public static func neverRan(_ output: JSONValue) -> Bool {
+        let reply = ToolResult(output)
         guard case .object(let object) = output else { return false }
-        if case .string(let status)? = object["status"],
-           status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "skipped" {
+        if case .string? = object["status"],
+           reply.said("skipped") {
             return true
         }
         return object["execution"] == .string("not_run")
-            || (exactResultClass(output) == .cancelled && object["effects"] == .string("none"))
+            || (reply.outcome == .cancelled && reply.effects == ToolFailureError.Effects.none)
             || object["held_for_results"] == .bool(true) || object["not_offered"] == .bool(true)
     }
 
-    /// Decode current effect evidence and historical cancellation receipts.
+    /// Preserve effect evidence carried by cancellation receipts.
     public static func effectsUnknown(_ output: JSONValue) -> Bool {
+        let reply = ToolResult(output)
         guard case .object(let object) = output else { return false }
-        return object["effects"] == .string("unknown") || object["effects_unknown"] == .bool(true)
+        return reply.effects == .unknown || object["effects_unknown"] == .bool(true)
     }
 
     /// Canonical motor read models own consequences; their tool envelopes prove transport only.
     package static func cognitiveResult(tool: String, output: JSONValue) -> CognitiveResult {
-        let resultClass = exactResultClass(output)
+        let reply = ToolResult(output)
+        let resultClass = reply.outcome
         // Policy/input refusals remain audit failures without lowering tool confidence.
         if isDeterministicRefusal(output) {
             return .unknown
         }
         if hasCanonicalMotorOwner(tool) {
-            // An admitted owner's read model alone supplies consequences;
-            // before admission, exact failures still reach resident attention.
+            // An admitted owner's read model alone supplies consequences; before admission, exact failures still reach resident attention.
             guard canonicalMotorOwnerReference(tool: tool, output: output) == nil else {
                 return .unknown
             }
@@ -272,8 +283,7 @@ extension ChatToolOutcome {
         }
     }
 
-    /// Single-line receipt detail uses error-shaped fields, never result bodies;
-    /// secrets are redacted before the cap, and absent error fields yield nil.
+    /// Single-line receipt detail uses error-shaped fields, never result bodies; secrets are redacted before the cap, and absent error fields yield nil.
     package static let failureDetailLimit = 200
 
     package static func failureDetail(_ output: JSONValue) -> String? {
@@ -304,14 +314,15 @@ extension ChatToolOutcome {
         return boundedDetail(parts.joined(separator: " | "))
     }
 
-    /// Thrown-error variant: the error's description, same redaction + cap.
+    /// Thrown failures use the same redaction and cap as returned failures.
     package static func failureDetail(error: any Error) -> String {
         failureDetail(failure(error: error)) ?? "The tool failed."
     }
 
-    /// Receipt class names its evidence source; returned and thrown failures stay distinct.
+    /// Keep returned and thrown evidence distinct in receipt classification.
     package static func receiptFailureClass(_ output: JSONValue, verdict: ExactResultClass? = nil) -> String {
-        switch verdict ?? exactResultClass(output) {
+        let reply = ToolResult(output)
+        switch verdict ?? reply.outcome {
         case .cancelled: return "result_cancelled"
         case .timeout: return "result_timeout"
         case .failed, .refused: return "result_failed"
@@ -331,6 +342,7 @@ extension ChatToolOutcome {
     }
 
     private static func isDeterministicRefusal(_ output: JSONValue) -> Bool {
+        let reply = ToolResult(output)
         guard case .object(let object) = output else { return false }
         if case .bool(true)? = object["requires_approval"] ?? object["requiresApproval"] {
             return true
@@ -353,15 +365,14 @@ extension ChatToolOutcome {
             ]
             if neutralCodes.contains(code) { return true }
         }
-        if case .string(let rawStatus)? = object["status"] {
-            let status = rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if status == "awaiting_approval"
-                || status == "blocked"
-                || status == "pending_approval" {
+        if case .string? = object["status"] {
+            if reply.said("awaiting_approval")
+                || reply.said("blocked")
+                || reply.said("pending_approval") {
                 return true
             }
             // SecurityCenter denials carry authority evidence beside status=denied.
-            if status == "denied",
+            if reply.said("denied"),
                object["decision"] != nil
                 || object["reasons"] != nil
                 || object["capabilities"] != nil {

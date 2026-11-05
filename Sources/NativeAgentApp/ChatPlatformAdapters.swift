@@ -10,10 +10,9 @@ import PersistenceCore
 import ProviderRouting
 import TelegramBot
 
-// Blueprint: | `ChatPlatformAdapters.swift` | Chat platform adapters: attachment drops and scroll event bridges with mounted-page visibility |
+// Blueprint: | `ChatPlatformAdapters.swift` | Chat platform adapters: attachment drops with mounted-page visibility; Telegram allowlist presentation |
 
-/// The whole room accepts attachments, including its scrollback and composer.
-/// A neutral, stationary outline is also quiet with Reduce Motion enabled.
+/// Accept attachments across the room with a stationary outline so Reduce Motion remains quiet.
 struct ChatAttachmentDropTarget: ViewModifier {
     var isEnabled = true
     var contentTypes = ChatAttachmentTypeResolver.attachmentContentTypes
@@ -44,75 +43,6 @@ struct ChatAttachmentDropTarget: ViewModifier {
                         .transaction { $0.animation = nil }
                 }
             }
-    }
-}
-
-struct ScrollWheelCatcher: NSViewRepresentable {
-    /// Hidden chats keep their monitor installed but do not report scroll events.
-    var isActive: Bool = true
-    /// A left press inside the view, as its distance from the view's top.
-    var onPress: ((CGFloat) -> Void)? = nil
-    var onScroll: (CGFloat) -> Void
-
-    func makeNSView(context: Context) -> ScrollWheelNSView {
-        let view = ScrollWheelNSView()
-        view.onScroll = onScroll
-        view.onPress = onPress
-        view.isActive = isActive
-        return view
-    }
-
-    func updateNSView(_ nsView: ScrollWheelNSView, context: Context) {
-        nsView.onScroll = onScroll
-        nsView.onPress = onPress
-        nsView.isActive = isActive
-    }
-
-    static func dismantleNSView(_ nsView: ScrollWheelNSView, coordinator: ()) {
-        nsView.stopMonitoring()
-    }
-}
-
-final class ScrollWheelNSView: NSView {
-    var onScroll: ((CGFloat) -> Void)?
-    var onPress: ((CGFloat) -> Void)?
-    var isActive: Bool = true
-    nonisolated(unsafe) private var monitor: Any?
-
-    deinit {
-        if let monitor { NSEvent.removeMonitor(monitor) }
-    }
-
-    func stopMonitoring() {
-        removeMonitor()
-        onScroll = nil
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if window == nil {
-            removeMonitor()
-            return
-        }
-        guard monitor == nil else { return }
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .leftMouseDown]) { [weak self] event in
-            guard let self, self.isActive else { return event }
-            let point = self.convert(event.locationInWindow, from: nil)
-            guard event.window === self.window, self.bounds.contains(point) else { return event }
-            if event.type == .leftMouseDown {
-                self.onPress?(self.isFlipped ? point.y : self.bounds.height - point.y)
-            } else if abs(event.scrollingDeltaY) > 0.5 || abs(event.scrollingDeltaX) > 0.5 {
-                self.onScroll?(event.scrollingDeltaY)
-            }
-            return event
-        }
-    }
-
-    private func removeMonitor() {
-        if let monitor {
-            NSEvent.removeMonitor(monitor)
-            self.monitor = nil
-        }
     }
 }
 

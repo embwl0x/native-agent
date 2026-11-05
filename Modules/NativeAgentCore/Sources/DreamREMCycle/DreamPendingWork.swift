@@ -3,10 +3,9 @@ import NativeAgentCore
 import PersistenceCore
 import CognitiveSubstrate
 
-// Blueprint: | `DreamPendingWork.swift` | Durable per-section dream work journal: recoverable diary publication and independently acknowledged lessons, reflection, care and dated mood; checkpoints never edit evidence |
+// Blueprint: | `DreamPendingWork.swift` | DreamPendingWork owner. |
 
-/// Written before publishing the diary or running any effect. This is the only
-/// mutable progress record; diary evidence is never rewritten by checkpoints.
+/// Write progress before diary publication or effects; checkpoints cannot rewrite immutable diary evidence.
 struct DreamPendingWork: Codable, Sendable {
     static let identityPrefix = "<!-- dream-id "
     let id: UUID
@@ -20,14 +19,12 @@ struct DreamPendingWork: Codable, Sendable {
     var care: Care?
     var affect: Double?
     var studioEntries: [String]
-    /// The exact diary write and cutoff, owed until both have landed. Retaining
-    /// the write ahead of publication closes the two-file crash window.
+    /// Retain exact diary write and cutoff until both land to close the two-file crash window.
     var publication: Publication?
     var reflectionReceipt: CognitiveReflectionReceipt?
     var reflectionAcknowledgment: UUID?
     var completion: Completion?
-    /// Each terminal entry witnesses its own effect (or an explicitly off
-    /// owner). Pending inputs above remain the work, never a saved error.
+    /// Terminal entries require effect proof or an explicitly disabled owner; pending inputs remain work rather than saved errors.
     var completedSteps: [String: String]?
     var notes: [String: String]?
 
@@ -73,8 +70,7 @@ struct DreamPendingWork: Codable, Sendable {
             to: directory.appendingPathComponent(id.uuidString + ".json"))
     }
 
-    /// A transport of the existing care-night value, not another care authority.
-    /// All judgments and the exact shown revisions survive Stop/restart unchanged.
+    /// Transport retained care judgments and shown revisions unchanged across Stop/restart without creating another authority.
     struct Care: Codable, Sendable {
         struct Merge: Codable, Sendable {
             let keep: UUID?
@@ -126,10 +122,10 @@ struct DreamPendingWork: Codable, Sendable {
 }
 
 extension DreamCycleRunner {
-    /// Publication and progress share one per-section journal. A failed item
-    /// leaves its own payload owed while independent items and nights proceed.
-    func retryPendingWork(delivery: DreamEffectSink?) async -> (settled: Int, errors: [String], pendingPaths: Set<String>, discoveryUnavailable: Bool) {
-        guard !Task.isCancelled else { return (0, ["dream delivery remains pending after Stop"], [], false) }
+    /// Keep item payloads owed on failure while independent items and nights proceed through the same section journal.
+    func retryPendingWork(delivery: DreamEffectSink?) async
+        -> (settled: Int, lessonsSaved: Int, errors: [String], pendingPaths: Set<String>, discoveryUnavailable: Bool, busy: [String]) {
+        guard !Task.isCancelled else { return (0, 0, ["dream delivery remains pending after Stop"], [], false, []) }
         let directory = DreamPendingWork.directory(dataRoot)
         let files: [URL]
         do {
@@ -138,13 +134,14 @@ extension DreamCycleRunner {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             files = []
         } catch {
-            return (0, ["dream work discovery failed: \(error)"], [], true)
+            return (0, 0, ["dream work discovery failed: \(error)"], [], true, [])
         }
         var errors: [String] = []
+        var busy: [String] = []
         var pendingPaths: Set<String> = []
-        var settled = 0
+        var settled = 0, lessonsSaved = 0
         var publicationUnavailable = false
-        // Read before delivery so a damaged record cannot be silently replaced.
+        // Read before delivery so damaged records cannot be replaced silently.
         var records: [(URL, DreamPendingWork)] = []
         for file in files {
             do {
@@ -162,12 +159,11 @@ extension DreamCycleRunner {
                 records.append((file, work))
             } catch {
                 errors.append("\(file.path) settlement unavailable: \(error)")
-                // An unreadable journal might still owe publication.
+                // An unreadable journal may still owe publication.
                 publicationUnavailable = true
             }
         }
-        // Diary identities name their actual work record. Missing input is
-        // an owed repair; older prose never manufactures new obligations.
+        // Resolve work by actual diary identity; missing retained input owes repair and cannot be reconstructed from prose.
         let journalIDs = Set(records.map { $0.1.id })
         do {
             let diary = FileBackedDreamDiary(dataRoot: dataRoot)
@@ -215,6 +211,7 @@ extension DreamCycleRunner {
                     try work.save(in: dataRoot)
                 }
                 if offered > 0 { try work.save(in: dataRoot) }
+                lessonsSaved += offered - work.lessons.count
                 if offered > 0 {
                     do {
                         try await receiptSink("dream.lessons", .object([
@@ -223,8 +220,7 @@ extension DreamCycleRunner {
                             "failed": .int(Int64(work.lessons.count))]))
                     } catch { errors.append("\(file.path) lesson receipt failed: \(error)") }
                 }
-                // Failure notes never gate an attempt. Each sibling step gets
-                // its own attempt, unless Stop or the shared journal write fails.
+                // Failure notes cannot block another attempt; only Stop or shared-journal failure prevents sibling steps.
                 if let material = work.reflection {
                     try Task.checkCancellation()
                     do {
@@ -244,11 +240,15 @@ extension DreamCycleRunner {
                             throw PersistenceCoreError.ioFailure("reflection judgment returned without a receipt")
                         }
                         work.reflection = nil
+                    } catch let held as DreamBusy {
+                        // Busy keeps the judgment owed for the next run without failing this one.
+                        work.note("reflection.judgment", error: held)
+                        busy.append("reflection for \(work.date): \(held.words)")
                     } catch {
                         work.note("reflection.judgment", error: error)
                         errors.append("\(file.path) reflection judgment owed: \(error)")
                     }
-                    // The returned judgment is checkpointed BEFORE integration.
+                    // Checkpoint judgment before integration so no effect precedes its durable cause.
                     try work.save(in: dataRoot)
                 }
                 if let receipt = work.reflectionReceipt {
@@ -335,7 +335,7 @@ extension DreamCycleRunner {
                 errors.append("\(file.path) settlement unavailable: \(error)")
             }
         }
-        return (settled, errors, pendingPaths, publicationUnavailable)
+        return (settled, lessonsSaved, errors, pendingPaths, publicationUnavailable, busy)
     }
 
     private func deliver(_ effect: DreamEffect, work: DreamPendingWork, sink: DreamEffectSink?) async throws -> DreamEffectResult {
@@ -352,8 +352,7 @@ extension DreamCycleRunner {
         }
     }
 
-    /// Idempotent publication under the run reservation. If death came after
-    /// writing the diary, its immutable identity proves which write landed.
+    /// Use immutable diary identity to reconcile publication after interruption under the run reservation.
     func publishPendingDream(_ work: inout DreamPendingWork) throws {
         guard let publication = work.publication else { return }
         let path = dataRoot.appendingPathComponent("dream_diary/\(work.date).md")

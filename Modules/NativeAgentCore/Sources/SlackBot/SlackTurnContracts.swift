@@ -1,5 +1,6 @@
 import Foundation
 import ChatTurnRuntime
+import NativeAgentCore
 // Blueprint: | `SlackTurnContracts.swift` | `SlackInboundFile` struct |
 
 struct SlackInboundFile: Sendable, Codable, Equatable {
@@ -88,8 +89,7 @@ struct SlackInboundMessage: Sendable, Codable, Equatable {
         normalizedThreadTs ?? (opensReplyThread && !isDirectMessage ? threadAnchorTs : nil)
     }
 
-    /// The ts to thread an in-turn notice under when the message is not itself
-    /// in a thread: its own ts, which opens a thread on that message.
+    /// The ts to thread an in-turn notice under when the message is not itself in a thread: its own ts, which opens a thread on that message.
     var threadAnchorTs: String? {
         let trimmed = ts.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
@@ -105,13 +105,17 @@ struct SlackInboundMessage: Sendable, Codable, Equatable {
 struct SlackSocketModeReply: Sendable, Equatable {
     var text: String
     var attachments: [ChatTurnRuntime.MultimodalAttachment]
+    /// The agent's turn in progress read this message: that turn's reply in the thread answers it, so nothing of its own is posted.
+    var readBy: String?
 
     init(
         text: String,
-        attachments: [ChatTurnRuntime.MultimodalAttachment] = []
+        attachments: [ChatTurnRuntime.MultimodalAttachment] = [],
+        readBy: String? = nil
     ) {
         self.text = text
         self.attachments = attachments
+        self.readBy = readBy
     }
 }
 
@@ -119,11 +123,23 @@ struct SlackSocketModeReply: Sendable, Equatable {
 /// Visible prose and notices share the turn's progress lane.
 typealias SlackChatProgressSink = @Sendable (TurnStreamEvent) async -> Void
 
-/// Wakes standing bots on a message the runner accepted. The host
-/// owns the bot router and the autonomy switch it admits runs under.
+/// Wakes standing bots on a message the runner accepted. The host owns the bot router and the autonomy switch it admits runs under.
 public typealias SlackBotEventIntake = @Sendable (_ channelId: String, _ text: String, _ userId: String, _ eventId: String) async throws -> Void
 
 typealias SlackProgressChat = @Sendable (
     _ message: SlackInboundMessage,
-    _ sessionId: String
+    _ sessionId: String,
+    _ handler: SlackHandler
 ) async throws -> SlackSocketModeReply
+
+/// One accepted handler's turn and injected receipt-settlement dependency.
+public typealias SlackAfterHandling = @Sendable (@escaping @Sendable () async -> Void) async -> Void
+
+public struct SlackHandler: Sendable {
+    public let turn: Turn
+    public let deferAfterHandling: SlackAfterHandling?
+    public init(turn: Turn, deferAfterHandling: SlackAfterHandling?) {
+        self.turn = turn
+        self.deferAfterHandling = deferAfterHandling
+    }
+}

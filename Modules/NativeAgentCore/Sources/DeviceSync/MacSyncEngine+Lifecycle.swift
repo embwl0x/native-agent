@@ -9,11 +9,10 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Lifecycle.swift` | `MacSyncEngine`: `start`, `stop`; the selected transport supplies roots and ingress to one snapshot lifecycle; saved connector setup changes and receipt-ledger health edges rebuild the heavy snapshots |
+// Blueprint: | `MacSyncEngine+Lifecycle.swift` | `MacSyncEngine`, `start`, `stop`; Transport-selected roots; one snapshot lifecycle. |
 
 extension MacSyncEngine {
-    /// A repair attempt uses the mounted writer and transport; its next health
-    /// reading, not admission to the writer, proves the failed postcondition.
+    /// Writer admission cannot prove repair; only its next health reading proves the postcondition.
     public func repairPhoneSync() async -> String {
         guard isActive, snapshotDir != nil else {
             return "Phone sync is not active; no snapshot or presence was published."
@@ -44,9 +43,7 @@ extension MacSyncEngine {
             .joined(separator: " ")
     }
 
-    /// Every page and the presence beat as this Mac has them now, whatever
-    /// was last sent: another Mac may have written over them while it held
-    /// the phone, and unchanged files would otherwise never go out again.
+    /// Republish all pages and presence on reclaim because another Mac may have overwritten unchanged local projections.
     func republishPhonePages() async {
         guard isActive, let snapshotDir else { return }
         sync.bridge.invalidateMobileSnapshotPublication()
@@ -63,8 +60,7 @@ extension MacSyncEngine {
 
     // MARK: - Start
 
-    /// Drive supplies its Documents root; CloudKit uses a local snapshot cache.
-    /// Nil when it started (or was superseded); otherwise why it did not.
+    /// Drive and CloudKit supply different roots; nil means start succeeded or was superseded, never readiness.
     @discardableResult
     func start(docsURL driveDocsURL: URL? = nil) async -> String? {
         guard !Task.isCancelled else { return nil }
@@ -104,8 +100,7 @@ extension MacSyncEngine {
                 syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
                 return syncError
             }
-            // Same pairing fingerprint/path as the phone's cachedSnapshotDirectory.
-            // Unscoped snapshots are never copied into a new pairing.
+            // Match the phone's pairing-scoped cache so another pairing's snapshots cannot enter it.
             let fingerprint = SHA256.hash(data: secret).prefix(8)
                 .map { String(format: "%02x", $0) }.joined()
             snapshotDir = docsURL.appendingPathComponent(Folder.snapshots)
@@ -123,7 +118,6 @@ extension MacSyncEngine {
         isActive = true
 
         if driveDocsURL != nil {
-            // KVS observation for iOS-initiated inbox deposits.
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(kvsDidChange(_:)),
@@ -154,10 +148,8 @@ extension MacSyncEngine {
         startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
 
-        // Watch inbox for iOS-deposited action files
         if driveDocsURL != nil { startInboxQuery(docsURL: docsURL) }
 
-        // Immediate first snapshot, then one integrity pass on it.
         await writeSnapshots(forceHeavy: true)
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
         if driveDocsURL == nil, let snapshotDir {
@@ -179,7 +171,6 @@ extension MacSyncEngine {
         return nil
     }
 
-
     /// A folder that cannot be made is a start that did not happen.
     private func createDirectories(_ directories: [URL], generation: UInt64) async -> String? {
         let failure = await sync.storage.perform { () -> String? in
@@ -197,14 +188,12 @@ extension MacSyncEngine {
         snapshotLifecycleGeneration &+= 1
         isActive = false
         inboxProcessingQueued = false
-        // Do not cancel the processor's accepted action or active phone turns.
-        // Their owners settle them; generation checks close further admission.
+        // Passive stop closes admission by generation; accepted actions and turns retain their settlement owners.
         workActivityObservationTask?.cancel()
         workActivityObservationTask = nil
         stopLiveTurnRelay()
         workActivityPublicationTask?.cancel()
         // The snapshot writer keeps admission until its physical write ends.
-        workActivities.removeAll()
         activeDocsURL = nil
         snapshotIntegrityWatcher?.cancel()
         snapshotIntegrityWatcher = nil
@@ -229,6 +218,10 @@ extension MacSyncEngine {
             NotificationCenter.default.removeObserver(chatTranscriptDidChangeObserver)
             self.chatTranscriptDidChangeObserver = nil
         }
+        if let pageFacePublishedObserver {
+            NotificationCenter.default.removeObserver(pageFacePublishedObserver)
+            self.pageFacePublishedObserver = nil
+        }
         chatTranscriptSnapshotPublicationTask?.cancel()
         chatTranscriptSnapshotPublicationTask = nil
         chatSnapshotCoalescer.reset()
@@ -238,10 +231,7 @@ extension MacSyncEngine {
         snapshotWriteQueuedNeedsRepublish = false
         snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
-        // A stopped lifecycle must not retain a routable old container. Late
-        // work is already generation-gated; clearing these roots also makes a
-        // post-stop inbox/action call fail closed instead of writing to a
-        // superseded Drive or local-cache generation.
+        // Clear retired roots so post-stop calls cannot write to a superseded container, even beyond generation fences.
         snapshotDir = nil
         inboxDir = nil
         responsesDir = nil
@@ -272,11 +262,10 @@ extension MacSyncEngine {
         }
         guard isActive, generation == snapshotLifecycleGeneration else { watcher.cancel(); return }
         snapshotIntegrityWatcher = watcher
-        OrganPulse.record("snapshot_integrity", .skipped, note: "observing snapshot files")
+        OrganPulse.record("snapshot_integrity", .held, note: "observing snapshot files")
     }
 
-    /// One coalesced reconciliation, including its writes. The snapshot writer
-    /// wakes a queued observation at physical exit instead of racing its files.
+    /// The writer wakes queued reconciliation at physical exit so observers cannot race snapshot files.
     func requestSnapshotIntegrityPass(retrySkipped: Bool = false) {
         guard isActive else { return }
         snapshotIntegrityReconcileQueued = true
@@ -317,8 +306,7 @@ extension MacSyncEngine {
         } else {
             registration = nil
         }
-        // Start/stop registration changes stay ordered even while the manager
-        // drains a prior publication. Admission closed synchronously above.
+        // Keep registration changes ordered while a prior publication drains; admission is already closed.
         let previous = presenceBeatRegistrationTask
         let id = UUID()
         presenceBeatRegistrationID = id
@@ -363,10 +351,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Slow repair for a missed mutation edge or an externally modified
-    /// snapshot.  Normal publications remain event-driven; this pass merely
-    /// proves that every cached digest still matches the specific file iOS can
-    /// consume before allowing the writer to skip it.
+    /// Integrity repair verifies exact phone-readable files before cached digests may suppress event-driven publication.
     private func runSnapshotIntegrityPass(retrySkipped: Bool) async {
         guard isActive, let snapshotDir else { return }
         let lifecycleGeneration = snapshotLifecycleGeneration
@@ -415,11 +400,10 @@ extension MacSyncEngine {
         OrganPulse.record("snapshot_integrity", found: found.count, note: found.joined(separator: "; "),
                           cadence: nil)
         if report.requiresRepair {
-            syncError = "iPhone snapshot integrity check found \(report.integrityFailures.joined(separator: "; ")). Rebuilding the affected mobile snapshot groups."
-            // A mismatch can belong to a heavyweight group (catalog, graph,
-            // transcripts). A standard pass would retain that bad file forever,
-            // so the integrity owner explicitly rebuilds all
-            // active projections once.
+            syncError = """
+                iPhone snapshot integrity check found \(report.integrityFailures.joined(separator: "; ")). Rebuilding the affected mobile snapshot groups.
+                """
+            // Force heavy projections too; a light pass cannot repair their mismatched files.
             await writeSnapshots(forceHeavy: true)
         } else if retryChangedSkips {
             // Failed publications may have no cached digest left to reconcile.
@@ -442,8 +426,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Connectors are a heavy group, so a light pass never rereads them: a Mac
-    /// change to saved setup or a receipt-backed health edge rebuilds them.
+    /// Setup mutations and receipt health edges must request heavy connector rebuilds; light passes omit them.
     private func startConnectorsSnapshotObservation() async {
         connectorsSnapshotWatcher?.cancel()
         let root = PersistenceCore.defaultDataRoot()
@@ -477,7 +460,6 @@ extension MacSyncEngine {
         await writeSnapshots(forceHeavy: true)
     }
 
-    /// Install the completion-edge observer that feeds the bounded chat snapshot coalescer.
     func startChatTranscriptSnapshotObservation() {
         if let chatTurnCompletedObserver {
             NotificationCenter.default.removeObserver(chatTurnCompletedObserver)
@@ -504,18 +486,25 @@ extension MacSyncEngine {
                 self?.requestChatSnapshotPublication(includeTranscripts: true)
             }
         }
+        // A changed face rides the light work-activity pass, which carries faces like every pass. A pass refreshes every page itself, so a
+        // face that changes during one is already in it and asks for no other.
+        if let pageFacePublishedObserver {
+            NotificationCenter.default.removeObserver(pageFacePublishedObserver)
+        }
+        pageFacePublishedObserver = NotificationCenter.default.addObserver(forName: .pageFacePublished, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.snapshotWriteInFlight else { return }
+                self.requestWorkActivityPublication()
+            }
+        }
     }
 
-    /// Coalesces a burst of completion edges into one sessions + transcript
-    /// snapshot pass. It deliberately does not request the unrelated heavy
-    /// catalogs, graph, run, or provider projections.
+    /// Completion bursts rebuild only sessions and transcripts, avoiding unrelated heavyweight projections.
     public func requestChatTranscriptSnapshotPublication() {
         requestChatSnapshotPublication(includeTranscripts: true)
     }
 
-    /// One coalescer owns both transcript completions and session-index
-    /// mutations. A later transcript request upgrades an already-pending
-    /// sessions-only request without starting a second timer.
+    /// One coalescer upgrades pending session-only work when transcript demand arrives, avoiding a second timer.
     public func requestChatSnapshotPublication(includeTranscripts: Bool) {
         guard isActive else { return }
         let generation = snapshotLifecycleGeneration
@@ -553,9 +542,7 @@ extension MacSyncEngine {
             || change.reason == "residual_repair:completed"
     }
 
-    /// The directory watch precedes discovery; reconciliation adds exact
-    /// transaction files before reading them. Keep the old watch until the
-    /// replacement is armed so downloads and in-place changes cannot be lost.
+    /// Arm exact files before reads and retain the directory watch during discovery so downloads and in-place changes cannot be lost.
     @discardableResult
     func startArchiveRetentionWatcher(transactionDirectories: [URL] = []) async -> Bool {
         let generation = snapshotLifecycleGeneration
@@ -595,15 +582,13 @@ extension MacSyncEngine {
     }
 }
 
-/// Presence has no equivalent change event: a quiet Mac must keep proving it
-/// is here. BackgroundLoops owns exact beat/backoff deadlines plus a
-/// phone-window recovery check; the transport owns publication.
+/// Presence has no change event: BackgroundLoops owns beat, backoff and phone-window deadlines; transport owns publication.
 private struct MacSyncPresenceBeat: EventDeadlineLoopRunner {
     weak var engine: MacSyncEngine?
     let generation: UInt64
     let events: AsyncStream<Void>
     let loopId = "presence_beat"
-    var interval: TimeInterval { NAMacPresence.phoneWindow }
+    var wake: OrganWake { .every(NAMacPresence.phoneWindow) }
     func physiologyEvents() -> AsyncStream<Void> { events }
     func nextMeaningfulDeadline(after now: Date) async -> Date? {
         await engine?.presenceDeadline(after: now, generation: generation)

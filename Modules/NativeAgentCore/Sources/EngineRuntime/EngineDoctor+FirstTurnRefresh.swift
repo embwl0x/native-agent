@@ -5,11 +5,9 @@ import DoctorChecks
 import PersistenceCore
 import TurnTrace
 import ProviderRouting
-// Blueprint: | `EngineDoctor+FirstTurnRefresh.swift` | `DoctorFacade`: one launch refresh after a persisted terminal turn trace; retains its task and disarms both observation and refresh on launch stop |
+// Blueprint: | `EngineDoctor+FirstTurnRefresh.swift` | `DoctorFacade`; One launch refresh after durable terminal evidence |
 
-/// Refresh once per launch after a real terminal trace is persisted. Provider
-/// receipts and UI refresh notifications can arrive before a turn finishes;
-/// this trigger preserves the configured Doctor gate and completed-turn proof.
+/// Trigger once after a durable terminal trace, never early provider or UI events, preserving the configured Doctor gate.
 @MainActor
 extension DoctorFacade {
     private static var firstTurnObserver: NSObjectProtocol?
@@ -50,12 +48,10 @@ extension DoctorFacade {
 
     nonisolated private static func refreshFirstTurn(run: @escaping @Sendable () async -> LoopTickOutcome) async {
         guard !Task.isCancelled else { return }
-        // The completed turn's trace rows are persisted off the turn path;
-        // Doctor reads those files, so settle them first.
+        // Settle off-path traces before Doctor reads their files.
         await TurnTraceBus.shared.drainForProcessExit()
         guard !Task.isCancelled else { return }
-        // The assembled runner uses freshMeasurement so behavioural checks
-        // read this turn instead of replaying their launch memo.
+        // Use fresh measurements so checks observe this turn rather than the launch memo.
         let outcome = await run()
         guard !Task.isCancelled else { return }
         if case .failed(let error) = outcome {

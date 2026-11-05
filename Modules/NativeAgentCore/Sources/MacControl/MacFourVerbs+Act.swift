@@ -6,26 +6,20 @@ import Experiences
 import CryptoKit
 import NativeAgentShared
 import Senses
-// Blueprint: | `MacFourVerbs+Act.swift` | `MacFourVerbs`: `act`, `addAttention`; named acts inherit or establish the call deadline before queueing, with bounded repetition and semantic/physical effect receipts |
+// Blueprint: | `MacFourVerbs+Act.swift` | `MacFourVerbs`, `act`, `addAttention`: Deadline-bound named acts, repetition and effect receipts |
 
 extension MacFourVerbs {
     // MARK: 2 — HANDS
 
-    /// The core: perceive → resolve a NAME → act → say what changed → show the
-    /// fresh screen. All inside ONE call, so there is nothing for her to carry
-    /// between turns. A bounded repeat is still one natural act: every attempt
-    /// re-sees and re-resolves the named target, so a moving visual region is
-    /// followed rather than clicked at an old coordinate.
-    ///
-    /// Ambiguity is an ANSWER, not an error: two matches return the candidates
-    /// as a question and act on NOTHING.
+    /// Keep perception, name resolution and verification in one call so callers need no intermediate handles. Every bounded repeat re-resolves moving targets;
+    /// ambiguity returns candidates without acting.
     public func act(
         verb rawVerb: String,
         target: String,
         text: String? = nil,
         mode: MacTypeMode = .replace,
         to destination: String? = nil,
-        /// Destination app for `to`; nil keeps both drag endpoints in the same window.
+        /// An absent to_app keeps both drag endpoints in the same window.
         toApp destinationApp: String? = nil,
         seconds: Double? = nil,
         repeat requestedRepeat: Int? = nil,
@@ -33,16 +27,15 @@ extension MacFourVerbs {
         holding: String? = nil,
         button: String? = nil,
         scrollAmount: Int? = nil,
-        /// Act in the named running app's window without raising it; nil selects the ordinary frontmost act.
+        /// An absent app uses the frontmost window; named apps stay behind unless raising is explicitly admitted.
         app: String? = nil,
-        /// With `app`: bring it forward for this act, then put the person's
-        /// front app back. Requires an explicit foreground request from the task.
+        /// With `app`: bring it forward for this act, then put the person's front app back. Requires an explicit foreground request from the task.
         front: Bool = false,
-        /// Run an ordered batch in one call; when supplied, steps replace `verb` and `target`.
+        /// Steps replace verb/target so one call cannot select two conflicting act grammars.
         steps: [MacActStep] = [],
         again: Bool = false,
-        /// A place on an image instead of a target name.
-        place: MacImagePlace? = nil
+        place: MacImagePlace? = nil,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         if let seconds, !seconds.isFinite || !(0...10).contains(seconds) {
             return .init(ok: false, text: "seconds must be a finite number in 0...10; nothing was sent.",
@@ -52,45 +45,47 @@ extension MacFourVerbs {
             return .init(ok: false, text: "interval must be a finite nonnegative number; nothing was sent.",
                 detail: ["error": .string("invalid_interval"), "effects": .string("none")])
         }
-        if TaskWaitDeadline.current == nil {
+        if context.deadline == nil {
             do {
-                return try await TaskWaitDeadline.withDeadline(
-                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "act", body: [:]))
-                ) {
-                    await self.act(verb: rawVerb, target: target, text: text, mode: mode,
+                return try await OperationWaitBudget.withDeadline(
+                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "act", body: [:])),
+                  budget: context.waitBudget) { budget in
+                    let context = context.with(\.deadline, budget.deadline)
+                    return await self.act(verb: rawVerb, target: target, text: text, mode: mode,
                         to: destination, toApp: destinationApp, seconds: seconds,
                         repeat: requestedRepeat, interval: interval, holding: holding,
                         button: button, scrollAmount: scrollAmount, app: app, front: front,
-                        steps: steps, again: again, place: place)
+                        steps: steps, again: again, place: place, turn: turn, context: context)
                 }
             } catch {
                 return Self.interruptedActReply(error)
             }
         }
-        if let flowRoot, MacAppActGate.dataRoot != flowRoot {
-            return await MacAppActGate.$dataRoot.withValue(flowRoot) {
+        if let flowRoot, context.dataRoot != flowRoot {
+            return await context.holding(\.dataRoot, flowRoot) { context in
                 await act(verb: rawVerb, target: target, text: text, mode: mode, to: destination,
                     toApp: destinationApp, seconds: seconds, repeat: requestedRepeat, interval: interval,
                     holding: holding, button: button, scrollAmount: scrollAmount, app: app, front: front,
-                    steps: steps, again: again, place: place)
+                    steps: steps, again: again, place: place, turn: turn, context: context)
             }
         }
-        if !steps.isEmpty, MacLookFrameStore.batchFrames == nil {
+        if !steps.isEmpty, context.batchFrames == nil {
             var frames: [String: MacLookFrame] = [:]
             for id in Set(steps.compactMap(\.frameID)) {
-                if let frame = await MacLookFrameStore.shared.frame(frameId: id) { frames[id] = frame }
+                if let frame = await MacLookFrameStore.shared.frame(frameId: id, context: context) { frames[id] = frame }
             }
-            return await MacLookFrameStore.$batchFrames.withValue(frames) {
+            return await context.holding(\.batchFrames, frames) { context in
                 await act(verb: rawVerb, target: target, text: text, mode: mode, to: destination,
                     toApp: destinationApp, seconds: seconds, repeat: requestedRepeat, interval: interval,
                     holding: holding, button: button, scrollAmount: scrollAmount, app: app, front: front,
-                    steps: steps, again: again, place: place)
+                    steps: steps, again: again, place: place, turn: turn, context: context)
             }
         }
         let request: [String: JSONValue] = ["verb": .string(rawVerb), "app": app.map(JSONValue.string) ?? .null,
                                            "holding": holding.map(JSONValue.string) ?? .null]
         do {
-            if steps.isEmpty, let refusal = try await MacAppActGate.requestRefusal(tool: "act", input: request, dataRoot: MacAppActGate.dataRoot) {
+            if steps.isEmpty, let refusal = try await MacAppActGate.requestRefusal(tool: "act", input: request, dataRoot: context.dataRoot, turn: turn,
+                context: context) {
                 return MacFourVerbsReply(ok: false, text: refusal.message, detail: refusal.fields)
             }
         } catch {
@@ -110,7 +105,7 @@ extension MacFourVerbs {
                             "action": .string("mac.act"), "args": .object([
                                 "app": .string(app ?? target), "verb": .string("key"), "target": .string(holding)])])])])
             }
-            if MacDriverContext.binding == nil {
+            if context.driver == nil {
                 let binding: MacDriverBinding
                 do { binding = try await MacAttentionSessionStore.shared.bindDriver() }
                 catch {
@@ -121,22 +116,23 @@ extension MacFourVerbs {
                 }
                 return await withTaskCancellationHandler {
                     defer { binding.releaseHeldInputs() }
-                    return await MacDriverContext.$binding.withValue(binding) {
+                    return await context.holding(\.driver, binding) { context in
                         await act(verb: rawVerb, target: target, text: text, mode: mode,
                                   to: destination, toApp: destinationApp, seconds: seconds,
                                   repeat: requestedRepeat, interval: interval, holding: holding,
-                                  button: button, scrollAmount: scrollAmount, app: app, front: front, steps: steps, again: again, place: place)
+                                  button: button, scrollAmount: scrollAmount, app: app, front: front, steps: steps, again: again, place: place, turn: turn,
+                                      context: context)
                     }
                 } onCancel: { binding.cancel() }
             }
             // Acts serialize through app-map persistence before the next act starts.
-            guard await MacActSerial.shared.acquire() else {
+            guard await MacActSerial.shared.acquire(context: context) else {
                 return .init(ok: false, text: "The action was cancelled before it started.", detail: ["error": .string("cancelled")])
             }
-            await MacActSerial.shared.ownInputs(MacDriverContext.binding)
-            let acted: MacFourVerbsReply = await Self.$holdsActSerial.withValue(true) {
-            let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
-            if let continuation, let refusal = continuation.refusal() {
+            await MacActSerial.shared.ownInputs(context.driver)
+            let acted: MacFourVerbsReply = await context.holding(\.holdsActSerial, true) {
+            context in let continuation = turn.macContinuation.flatMap { $0.isPending ? $0 : nil }
+            if let continuation, let refusal = continuation.refusal(context: context) {
                 var detail: [String: JSONValue] = ["error": .string("continuation_unavailable")]
                 detail["remedy"] = continuation.refusalOutput(refusal)["remedy"]
                 return .init(ok: false, text: refusal, detail: detail)
@@ -144,24 +140,20 @@ extension MacFourVerbs {
             if let continuation, let app, let captured = continuation.app,
                app.caseInsensitiveCompare(captured.name) != .orderedSame,
                app.caseInsensitiveCompare(captured.bundleIdentifier ?? "") != .orderedSame {
-                return .init(ok: false, text: continuation.modelContext,
+                return .init(ok: false, text: continuation.modelContext(context: context),
                     detail: ["error": .string("continuation_target_mismatch")])
             }
             let anchor = (continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .flatMap { $0.isEmpty ? nil : $0 }
-            // The screen decides, not the flags: an app already in front is acted
-            // on in front (every event still requires its pid), and while Shotgun
-            // is up the person has handed her the screen, so an app behind is
-            // brought forward for the act. A native surface is never raised.
-            let mayRaise = front || (PersonOnlyWindows.isShowing && Self.nativeSurfaceApp == nil)
-            // Her stopped batch is continued by her next act in this chat when that
-            // act is a batch that starts with the steps that landed; any other act
-            // has moved the screen on, so the stopped batch is over.
+            // The screen decides, not the flags: an app already in front is acted on in front (every event still requires its pid), and while Shotgun is up the
+            // person has handed the agent the screen, so an app behind is brought forward for the act. A native surface is never raised.
+            let mayRaise = front || (PersonOnlyWindows.isShowing && context.nativeSurfaceApp == nil)
+            // Continue a stopped batch only when the next batch preserves landed prefixes; another act invalidates that continuity.
             var flow: ActFlow?
             if let root = flowRoot, let session = flowSession {
                 let scope = Self.actFlowScope(session)
-                // The app is the anchor, or the one in front when the batch runs there.
+                // Keep one app anchor for the batch so later steps cannot drift to unrelated foreground apps.
                 do {
                     flow = ActFlow(digests: try Self.actStepDigests(steps, app: anchor ?? NSWorkspace.shared.frontmostApplication?.bundleIdentifier))
                 } catch {
@@ -189,18 +181,18 @@ extension MacFourVerbs {
             }
             let run: ([MacActStep], String?, FrontExpectation?, Sighting?) async -> MacFourVerbsReply = { steps, anchorApp, expect, seen in
                 // In front, every hand event of this act requires that app's pid.
-                await Self.$requiredFrontPid.withValue(expect?.pid) { await Self.$foregroundRequested.withValue(mayRaise) {
-                    guard steps.isEmpty else { return await self.actSteps(steps, app: anchorApp, expect: expect, seen: seen, flow: flow) }
+                await context.holding(\.requiredFrontPid, expect?.pid) { context in await context.holding(\.foregroundRequested, mayRaise) { context in
+                    guard steps.isEmpty else { return await self.actSteps(steps, app: anchorApp, expect: expect, seen: seen, flow: flow, turn: turn,
+                        context: context) }
                     return await self.actCore(
                         verb: rawVerb, target: target, text: text, mode: mode, to: destination, toApp: destinationApp,
                         seconds: seconds, repeat: requestedRepeat, interval: interval, holding: holding,
                         button: button, scrollAmount: scrollAmount, app: anchorApp, expect: expect, seen: seen, place: place
-                    )
+                    , turn: turn, context: context)
                 } }
             }
             guard let anchor else { return Self.withUncertainActionOutcome(await run(steps, nil, nil, nil)) }
-            // A miss never touches the screen: the (first) thing to act on is
-            // resolved in the background read before anything is raised.
+            // A miss never touches the screen: the (first) thing to act on is resolved in the background read before anything is raised.
             let missBefore: ([MacActStep], Sighting?) async -> MacFourVerbsReply? = { steps, seen in
                 // Every verb is checked before anything is raised.
                 for (index, step) in (steps.isEmpty ? [MacActStep(verb: rawVerb, target: target)] : steps).enumerated() {
@@ -212,16 +204,15 @@ extension MacFourVerbs {
                     )
                 }
                 guard let seen else { return nil }
-                guard !steps.isEmpty else { return await self.missBeforeRaise(verb: rawVerb, target: target, in: seen) }
-                // The first step still to do; the kept ones are not looked for.
+                guard !steps.isEmpty else { return await self.missBeforeRaise(verb: rawVerb, target: target, in: seen, turn: turn, context: context) }
+                // Skip already-landed steps so continuation cannot duplicate their effects.
                 guard let at = steps.indices.first(where: { flow?.kept($0) != true }) else { return nil }
                 let first = steps[at]
                 // Exact selections resolve through the action owner, never as names.
                 if first.handle != nil || first.place != nil { return nil }
-                // An optional first step ("OK?") that isn't here is skipped once
-                // raised, like any optional step — it never stops the batch here.
+                // An optional first step ("OK?") that isn't here is skipped once raised, like any optional step — it never stops the batch here.
                 if first.target.hasSuffix("?"), first.target.count > 1 { return nil }
-                guard let miss = await self.missBeforeRaise(verb: first.verb, target: first.target, in: seen) else { return nil }
+                guard let miss = await self.missBeforeRaise(verb: first.verb, target: first.target, in: seen, turn: turn, context: context) else { return nil }
                 let reason = Self.string(miss.detail["error"]) ?? "no_match"
                 return MacFourVerbsReply(
                     ok: false,
@@ -237,9 +228,9 @@ extension MacFourVerbs {
                 app: anchor, seek: steps.first?.target ?? target, menuOrKey: menuOrKey, raise: mayRaise,
                 missBefore: { await missBefore(steps, $0) },
                 inBack: { await run(steps, anchor, nil, $0) }
-            ) { await run(steps, nil, $0, $1) }
+            , turn: turn, context: context) { await run(steps, nil, $0, $1) }
             if front, steps.isEmpty, reply.ok {
-                // What happened leads; the nudge follows it.
+                // Lead with observed effects so a suggested next step cannot obscure what already happened.
                 let lines = reply.text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
                 reply = MacFourVerbsReply(ok: true, text: ([String(lines[0]), Self.oneCallNudge] + lines.dropFirst().map(String.init))
                     .joined(separator: "\n"), detail: reply.detail)
@@ -270,7 +261,7 @@ extension MacFourVerbs {
                     detail: detail)
             }
         }()
-        if let refusal = MacDriverContext.binding?.takeAppActRefusal() {
+        if let refusal = context.driver?.takeAppActRefusal() {
             return MacFourVerbsReply(ok: false, text: refusal.message, detail: refusal.fields)
         }
         var detail = reply.detail
@@ -280,10 +271,13 @@ extension MacFourVerbs {
     }
 
     static func interruptedActReply(_ error: Error) -> MacFourVerbsReply {
-        let timedOut = error is TaskWaitDeadline.Exceeded
+        let timedOut = error is OperationWaitBudget.Exceeded
         return .init(ok: false,
             text: timedOut
-                ? "The action timed out and cancellation was requested. Earlier input or changes may have reached the app; completion was not verified. Inspect the app before another action."
+                ? """
+                    The action timed out and cancellation was requested. Earlier input or changes may have reached the app; completion was not verified. \
+                    Inspect the app before another action.
+                    """
                 : "The action was cancelled. Earlier input or changes may have reached the app; inspect it before another action.",
             detail: ["error": .string(timedOut ? "timed_out" : "cancelled"),
                 "timed_out": .bool(timedOut), "effects": .string("unknown"), "verification": .string("unverified")])
@@ -304,9 +298,10 @@ extension MacFourVerbs {
         scrollAmount: Int?,
         app: String?,
         expect: FrontExpectation?,
-        /// A read already taken of the window for this act (an app behind).
+        /// Reuse the act's retained background read so input resolves against one observation.
         seen: Sighting?,
-        place: MacImagePlace?
+        place: MacImagePlace?,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
         let requestedInput = requestedRepeat ?? 1
         let requested = max(1, requestedInput)
@@ -330,11 +325,11 @@ extension MacFourVerbs {
                 to: destination, toApp: destinationApp, seconds: seconds,
                 holding: holding, button: button, scrollAmount: scrollAmount,
                 attention: nil, app: app, expect: expect, carry: first, place: place
-            )
+            , turn: turn, context: context)
         }
 
         let attention: BurstAttention
-        switch await beginBurstAttention() {
+        switch await beginBurstAttention(turn: turn, context: context) {
         case .success(let lease): attention = lease
         case .failure(let message):
             return MacFourVerbsReply(
@@ -369,7 +364,7 @@ extension MacFourVerbs {
                 attention: attention,
                 app: app,
                 expect: expect
-            )
+            , turn: turn, context: context)
             finalReply = reply
             guard reply.ok else { break }
             completed += 1
@@ -388,19 +383,19 @@ extension MacFourVerbs {
         }
         let release = attention.owned ? await settlementDispatch(action: "attention", body: [
             "mode": .string("stop"), "session": .string(attention.session),
-        ]) : nil
+        ], turn: turn, context: context) : nil
 
         guard let finalReply else {
             return MacFourVerbsReply(
                 ok: false,
                 text: "The repeated act was cancelled before the first attempt.",
                 detail: ["error": .string("cancelled"),
-                         "attention_release": release?.toJSON() ?? .null]
+                         "attention_release": release?.toJSON(readContent: context.readContent) ?? .null]
             )
         }
         var detail = finalReply.detail
         if attention.owned {
-            detail["attention_release"] = release?.toJSON() ?? .object([
+            detail["attention_release"] = release?.toJSON(readContent: context.readContent) ?? .object([
                 "error": .string("attention_release_unavailable"), "session": .string(attention.session)])
         }
         detail["repeat_requested"] = .int(Int64(requested))
@@ -453,7 +448,7 @@ extension MacFourVerbs {
         )
     }
 
-    /// A failed act that may still have acted: input delivered, or an outcome it could not observe.
+    /// Input delivery without observable outcome stays uncertain because failure alone cannot prove no effect.
     static func outcomeUnknown(_ reply: MacFourVerbsReply) -> Bool {
         let status = string(reply.detail["status"])
         let state = string(reply.detail["operationState"])
@@ -491,7 +486,7 @@ extension MacFourVerbs {
         case failure(String)
     }
 
-    private func beginBurstAttention() async -> BurstAttentionStart {
+    private func beginBurstAttention(turn: Turn, context: MacOperationContext) async -> BurstAttentionStart {
         func lease(from result: MacControlResult, owned: Bool) -> BurstAttention? {
             guard result.ok else { return nil }
             let output = Self.object(result.output)
@@ -504,11 +499,11 @@ extension MacFourVerbs {
         }
 
         do {
-            let status = try await host.dispatch(action: "attention", body: ["mode": .string("status")])
+            let status = try await host.dispatch(action: "attention", body: ["mode": .string("status")], turn: turn, context: context)
             if Self.bool(Self.object(status.output)["active"]) == true {
                 guard let current = lease(from: status, owned: false) else {
                     return .failure(Self.bool(Self.object(Self.object(status.output)["attention"])["yield_required"]) == true
-                        ? MacAttentionSessionStore.driverRefusal
+                        ? MacAttentionSessionStore.driverRefusal(context: context)
                         : "The existing attention session needs a fresh observation first.")
                 }
                 return .success(current)
@@ -516,13 +511,14 @@ extension MacFourVerbs {
             let started = try await host.dispatch(action: "attention", body: [
                 "mode": .string("start"),
                 "duration_seconds": .int(Int64(Self.maximumActBurstSeconds)),
-            ])
+            ], turn: turn, context: context)
             guard let created = lease(from: started, owned: true) else {
                 var cause = Self.bool(Self.object(Self.object(started.output)["attention"])["yield_required"]) == true
-                    ? MacAttentionSessionStore.driverRefusal
+                    ? MacAttentionSessionStore.driverRefusal(context: context)
                     : "The Mac's bounded human-takeover observer did not become ready."
                 if let session = Self.string(Self.object(started.output)["requested_session"]) {
-                    let release = await settlementDispatch(action: "attention", body: ["mode": .string("stop"), "session": .string(session)])
+                    let release = await settlementDispatch(action: "attention", body: ["mode": .string("stop"), "session": .string(session)], turn: turn,
+                        context: context)
                     if release?.ok != true { cause += " Attention release failed: " + (release?.error ?? "no settlement result") }
                 }
                 return .failure(cause)

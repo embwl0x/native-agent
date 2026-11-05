@@ -2,15 +2,11 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+CaresNight.swift` | `CognitiveSubstrate` cares at night: bounded meaning clusters and stance/self/person evidence; checked resident care and self saves before acknowledgment, fade/deepen and life approval; previewCaresNight runs the same ordered answer/stance/merge transformations on a current owner copy without save or receipt, refusing unavailable state and changed epochs |
+// Blueprint: | `CognitiveSubstrate+CaresNight.swift` | `CognitiveSubstrate`: checked nightly care/self settlement and pure previews |
 
-// The night deepens what keeps moving her and lets go of what never does after the
-// dream commits. The only model in it is the dream she already has, which is
-// shown what moved her today and what has stayed open, and may answer that an
-// open care is settled or that she lets it go.
+// The committed dream is the only model judgment; the night applies its settlements and story-derived depth/fading.
 
-/// The night's cares: the block the dream is shown, the keys it names, and,
-/// once the dream committed, the lines it answered.
+/// Capture shown keys and revisions so delayed dream judgments address the evidence actually seen.
 public struct CognitiveCareNight: Sendable, Equatable {
     public var block: String
     /// When the owner captured this reading, independent of delayed delivery.
@@ -29,7 +25,6 @@ public struct CognitiveCareNight: Sendable, Equatable {
     public var traits: [CognitiveSelfKnowledge.Trait]
     public var story: [CognitiveSelfKnowledge.Story]
     public var people: [CognitiveSelfKnowledge.Person]
-    /// `dream_diary/<date>.md`: the entry the pass follows, the source of its moments.
     public var source: String
 
     public init(block: String, readAt: Date, keys: [String: CognitiveCare], answers: [String] = [], source: String = "",
@@ -59,22 +54,21 @@ public struct CognitiveCareNight: Sendable, Equatable {
 extension CognitiveSubstrate {
     public func carePreviewRefusal() -> String? {
         guard persistenceRestored, !restoreInFlight, !forgettingInFlight, !maintenanceRunInFlight else {
-            return "Her saved mind is unavailable or in a transition; preview cannot judge it yet."
+            return "The agent's saved mind is unavailable or in a transition; preview cannot judge it yet."
         }
         guard configuration.enabled else { return "Inner life is off." }
         return nil
     }
 
-    /// The owner-review card that takes a season care to life depth.
+    /// Only owner review may grant life depth.
     public static let careLifeApprovalAction = "care.life"
-    /// An open care unmoved this long, at lately or deeper, is stuck.
     static let careStuckAfter: TimeInterval = 7 * 86_400
     static let dreamMovedCares = 8
     static let dreamOpenCares = 5
     static let dreamMomentsPerCare = 3
     static let maximumCareStoryLines = 24
 
-    /// How long a care keeps without moving her before the night fades it.
+    /// Depth determines the unmoved horizon before fading.
     static func careFadeHorizon(_ depth: CognitiveCare.Depth) -> TimeInterval? {
         switch depth {
         case .now: return 2 * 86_400
@@ -86,26 +80,25 @@ extension CognitiveSubstrate {
 
     // MARK: - What the dream is shown
 
-    /// The cares that moved her in the last day, with their felt words and
-    /// notes, and her stuck open cares. nil when the inner life is off.
+    /// The dream sees recent movement and stuck gaps; disabled inner life contributes no block.
     public func careNightMaterial() async throws -> CognitiveCareNight? {
         guard configuration.enabled else { return nil }
         await waitForMaintenanceTransition()
         guard persistenceRestored, configuration.persistenceEnabled, !persistenceHealth.writesBlocked else {
-            throw CognitiveCareNotSaved(detail: "cognition/cognition.sqlite care evidence is unavailable: \(String(describing: persistenceHealth.failureDetail))")
+            throw CognitiveCareNotSaved(detail: """
+                cognition/cognition.sqlite care evidence is unavailable: \(String(describing: persistenceHealth.failureDetail))
+                """)
         }
         if selfKnowledgeReadFailure != nil { await restoreSelfKnowledge() }
         if carePeopleReadFailure != nil { await refreshCarePeople() }
         let generation = caringAppraisalGeneration
         let candidates = cares.values.filter { $0.fadedAt == nil }
-        // The same warm embedder and exact-text cache as careTouched; never load
-        // a second model for night. Cold or unreadable evidence stays owed.
+        // The same warm embedder and exact-text cache as careTouched; never load a second model for night. Cold or unreadable evidence stays owed.
         let vectors: [UUID: [Float]]
         do {
             if let first = candidates.first {
-                // Use this lookup's one epoch, never another lookup's cache
-                // publication after suspension. Cold is an unavailable reading.
-                guard let lookup = try await careVectorLookup(queries: [first.about], among: candidates) else {
+                // Use this lookup's one epoch, never another lookup's cache publication after suspension. Cold is an unavailable reading.
+                guard let lookup = try await careVectorLookup(queries: [first.about], among: candidates, turn: nil) else {
                     throw CognitiveCareNotSaved(detail: "the embedder is cold; care night evidence remains owed")
                 }
                 vectors = lookup.cares
@@ -168,8 +161,7 @@ extension CognitiveSubstrate {
         }
         if !clusters.isEmpty {
             lines.append("--- MAY BE ONE CARE (meaning nominations, not decisions) ---")
-            // 10-31: told "only what is truly the same thing", she kept eight chess
-            // cares apart as facets. A care is the thing; its sides are its story.
+            // A care names one thing; facets belong in its story rather than separate cares.
             lines.append("A care is one thing you care about; the sides of it live in its story. Merging keeps every story entry, "
                 + "movement and phrasing of the merged cares and lets the thing deepen as one. Merge cares that are one thing "
                 + "seen from different sides; keep apart cares that are about different things.")
@@ -180,7 +172,10 @@ extension CognitiveSubstrate {
                     lines.append("\(care.id.uuidString): \(Self.careLineText(care))")
                 }
             }
-            lines.append("You may add \"merge\": [{\"keep\": \"<care UUID>\", \"into_it\": [\"<other UUID>\"], \"why\": \"your reason\"}]. Use only members of one shown cluster. Omit keep to retain its oldest care. Leave merge out when they are different things.")
+            lines.append("""
+                You may add \"merge\": [{\"keep\": \"<care UUID>\", \"into_it\": [\"<other UUID>\"], \"why\": \"your reason\"}]. Use only members of one shown \
+                cluster. Omit keep to retain its oldest care. Leave merge out when they are different things.
+                """)
         }
         let pressured = live.filter { Self.careStancePressure($0).count >= 2 }
             .sorted { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString }
@@ -189,9 +184,16 @@ extension CognitiveSubstrate {
             lines.append("--- STANCE PRESSURE: \(care.id.uuidString): \(care.about) | held: \(care.stance?.text ?? "") ---")
             for (index, entry) in Self.careStancePressure(care).enumerated() {
                 guard let stance = entry.stancePressure else { continue }
-                lines.append("\(index + 1). \(NativeTimestampFormat.calendarDay(entry.at)): \(stance.text) | because: \(stance.because) | unless: \(stance.wouldChangeMind)")
+                lines.append("""
+                    \(index + 1). \(NativeTimestampFormat.calendarDay(entry.at)): \(stance.text) | because: \(stance.because) | unless: \
+                    \(stance.wouldChangeMind)
+                    """)
             }
-            lines.append("If entries point the same way and you confirm changing this stance, add \"stance_changes\": [{\"care\": \"<UUID>\", \"pressure\": [<entry numbers pointing the same way>], \"stance\": {\"text\": \"...\", \"because\": \"...\", \"unless\": \"...\"}}]. Evidence needs 2 distinct days, or for life 3 days spanning 14 days. Otherwise hold your stance. Leave the key out when nothing changes.")
+            lines.append("""
+                If entries point the same way and you confirm changing this stance, add \"stance_changes\": [{\"care\": \"<UUID>\", \"pressure\": [<entry \
+                numbers pointing the same way>], \"stance\": {\"text\": \"...\", \"because\": \"...\", \"unless\": \"...\"}}]. Evidence needs 2 distinct days, \
+                or for life 3 days spanning 14 days. Otherwise hold your stance. Leave the key out when nothing changes.
+                """)
         }
         let selfMaterial = selfNightMaterial(keys: &keys, live: Array(live))
         lines += selfMaterial.lines
@@ -202,10 +204,7 @@ extension CognitiveSubstrate {
 
     // MARK: - The night's pass
 
-    /// After the dream committed: its settle and let-go lines, then every live
-    /// care that is not life depth fades past its horizon or deepens by the
-    /// distinct local days it moved her. Returns the season cares ready for
-    /// life depth, which only the owner-review card grants.
+    /// Apply committed judgments, then story-derived fading/deepening; season-to-life depth still requires owner review.
     @discardableResult
     public func passCaresNight(_ night: CognitiveCareNight) async throws -> [CognitiveCare] {
         await waitForMaintenanceTransition()
@@ -216,8 +215,7 @@ extension CognitiveSubstrate {
         let calendar = Calendar.current
         var changed: [UUID] = []
         var settled = 0, letGo = 0, faded = 0, deepened = 0
-        // Every dream judgment checks the same pre-pass revision. This night's
-        // own gap/stance settlements do not make its other judgments stale.
+        // Every dream judgment checks the same pre-pass revision. This night's own gap/stance settlements do not make its other judgments stale.
         let original = cares
         _ = Self.applyCareAnswers(night, at: now, cares: &cares, changed: &changed, settled: &settled, letGo: &letGo)
         var stanceOutcomes: [JSONValue] = []
@@ -255,8 +253,7 @@ extension CognitiveSubstrate {
             }
         }
         if !changed.isEmpty { markDirty(at: now) }
-        // Revision checks can make a retry's judgments inert even though their
-        // resident revisions still owe a write. Save the owner's actual snapshot,
+        // Revision checks can make a retry's judgments inert even though their resident revisions still owe a write. Save the owner's actual snapshot,
         // including merged/faded rows, before acknowledging this night.
         if case .failure(let error) = await saveCares(Array(cares.keys), at: now) {
             await recordReceipt(kind: "cares.night_unsaved", payload: .object([
@@ -264,8 +261,8 @@ extension CognitiveSubstrate {
             ]))
             throw error
         }
-        // Her reading refers to the exact stories shown before this pass;
-        // tonight's new depth/stance entries become material for her next night.
+        // The agent's reading refers to the exact stories shown before this pass; tonight's new depth/stance entries become material for the agent's next
+        // night.
         try await settleSelfKnowledge(night, at: now)
         await recordReceipt(kind: "cares.night", payload: .object([
             "source": .string(night.source),
@@ -273,13 +270,11 @@ extension CognitiveSubstrate {
             "faded": .int(Int64(faded)), "deepened": .int(Int64(deepened)),
             "merged": .int(Int64(merged)), "stancesChanged": .int(Int64(stances)),
             "readyForLife": .array(ready.map { .string($0.id.uuidString) }),
-            // What the night was shown and what it chose, so a cluster left
-            // apart is visibly her choice, not an unshown one.
+            // Record shown choices so an intentionally separate cluster is distinguishable from an unseen one.
             "clustersShown": .array(night.clusters.map { ids in
                 .array(ids.map { id in .string(original[id].map { String($0.about.prefix(80)) } ?? id.uuidString) })
             }),
             "mergesChosen": .int(Int64(night.merges.count)),
-            // Each merge she proposed and what became of it, with her why.
             "merges": .array(mergeOutcomes), "mergesMalformed": .int(Int64(night.mergesMalformed)),
             "stancesProposed": .int(Int64(night.stanceChanges.count)),
             "stances": .array(stanceOutcomes),
@@ -287,14 +282,14 @@ extension CognitiveSubstrate {
         return ready
     }
 
-    /// The same ordered judgments as the committed night, on a value copy of
-    /// the current owner. No save, receipt, epoch change or self settlement.
+    /// The same ordered judgments as the committed night, on a value copy of the current owner. No save, receipt, epoch change or self settlement.
     public func previewCaresNight(_ night: CognitiveCareNight) -> JSONValue {
         if let why = carePreviewRefusal() {
             return .object(["outcome": .string("unavailable"), "why": .string(why)])
         }
         guard night.mindEpoch.map({ $0 == mindEpoch }) ?? true else {
-            return .object(["outcome": .string("unavailable"), "why": .string("Her mind changed epoch during generation; these judgments cannot apply.")])
+            return .object(["outcome": .string("unavailable"), "why":
+                .string("The agent's mind changed epoch during generation; these judgments cannot apply.")])
         }
         let original = cares, at = dependencies.now()
         var projected = original
@@ -309,8 +304,7 @@ extension CognitiveSubstrate {
             "wouldSettle": .int(Int64(settled)), "wouldLetGo": .int(Int64(letGo))])
     }
 
-    /// The life card was approved: the care becomes part of who she is. True
-    /// when life depth is saved, including on a retry; false when absent or unsaved.
+    /// A life-card approval is acknowledged only after life depth saves, including on retry.
     public func deepenCareToLife(_ id: UUID, source: String) async -> Bool {
         await waitForMaintenanceTransition()
         guard configuration.enabled, var care = cares[id] else { return false }
@@ -328,9 +322,8 @@ extension CognitiveSubstrate {
         return (try? await saveCares([id], at: now).get()) != nil
     }
 
-    // MARK: - Her story
+    // MARK: - The agent's story
 
-    /// Her depth changes and what her nights settled or let go, newest first.
     func careStoryLines() -> [String] {
         var lines: [(at: Date, text: String)] = []
         for care in cares.values {
@@ -355,7 +348,7 @@ extension CognitiveSubstrate {
             care.folded?.movedDays?.last ?? care.createdAt)
     }
 
-    /// The next depth its story has earned. Life is never earned here.
+    /// Story earns the next depth; life depth requires owner review.
     static func careEarnedDepth(_ depth: CognitiveCare.Depth, days: Int, span: Int) -> CognitiveCare.Depth? {
         switch depth {
         case .now where days >= 2 && span >= 0: return .lately
@@ -364,7 +357,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// `settled: <key>: <how>` or `let go: <key>`; nil for anything else.
+    /// Only the declared settle/let-go wire shapes are accepted.
     static func careNightAnswer(_ line: String) -> (key: String, how: String?)? {
         func clean(_ text: Substring) -> String {
             text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "[]")))

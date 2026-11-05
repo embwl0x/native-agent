@@ -3,23 +3,20 @@ import Synchronization
 import PersistenceCore
 import NativeAgentCore
 
-// Blueprint: | `FamiliarLines.swift` | `FamiliarLines`: habituation — every line that passes through a moment is met (the last 16,384, `mind/familiar.bin`); only a line they meets for the first time can bring something to mind, so the app's standing words and their own coming back stop reminding their |
+// Blueprint: | `FamiliarLines.swift` | `FamiliarLines`, `mind/familiar.bin`: first encounters alone prime recall |
+// Retain the last 16,384 encountered lines so habituation stays bounded.
 
-/// Habituation. What she has met before reminds her of nothing: the app's
-/// standing words (a receipt's label, a page's note) and her own words coming
-/// back repeat; what the world says does not. Numbers read as numbers, so
-/// "called in at 14:36" is the same line at 15:02. The last `keep` lines she
-/// met stay familiar.
+/// Habituate repeated app and self-authored words, never outside voices; normalize numbers so changing times do not defeat familiarity.
 public enum FamiliarLines {
     static let keep = 16_384
-    /// Per data root: each line's key and when she last met it.
+    /// Keep familiarity scoped to each data root.
     private static let met = Mutex<(roots: [String: [UInt64: UInt64]], tick: UInt64)>(([:], 0))
 
     static func url(_ dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent("mind/familiar.bin")
     }
 
-    /// The lines she meets for the first time, in order; all of them are met now.
+    /// Mark all encountered lines familiar, but return only first encounters.
     @discardableResult
     public static func firstMet(_ lines: some Sequence<String>, dataRoot: URL) throws -> [String] {
         do { return try met.withLock { state in
@@ -31,7 +28,7 @@ public enum FamiliarLines {
                 state.tick += 1
                 if seen.updateValue(state.tick, forKey: key(line)) == nil { fresh.append(line) }
             }
-            // Forgetting goes in a batch, not a sort per line.
+            // Batch forgetting to avoid sorting once per line.
             if seen.count > keep + keep / 8 {
                 for (key, _) in seen.sorted(by: { $0.value < $1.value }).prefix(seen.count - keep) {
                     seen.removeValue(forKey: key)
@@ -42,7 +39,8 @@ public enum FamiliarLines {
             return fresh
         } } catch {
             throw ToolFailureError("Familiarity could not be read or saved: \(error.localizedDescription). Saved keys were preserved.",
-                effects: .none, owner: url(dataRoot).path, instruction: "Preserve the complete eight-byte key sequence and repair its read/write access.", recovery: .repair)
+                effects: .none, owner: url(dataRoot).path, instruction: "Preserve the complete eight-byte key sequence and repair its read/write access.",
+                    recovery: .repair)
         }
     }
 
@@ -53,7 +51,7 @@ public enum FamiliarLines {
             .utf8.reduce(0xcbf2_9ce4_8422_2325) { ($0 ^ UInt64($1)) &* 0x100_0000_01b3 }
     }
 
-    /// Oldest first, as written.
+    /// Retain encounter order.
     private static func read(_ dataRoot: URL, tick: inout UInt64) throws -> [UInt64: UInt64] {
         let data: Data
         do { data = try Data(contentsOf: url(dataRoot)) }

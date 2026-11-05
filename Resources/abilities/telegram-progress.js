@@ -5,7 +5,7 @@
 */
 function run(input) { return face(input); }
 function face(input) {
-    const words = text => text.replace(/\b(?:invoke_claude|claude_message|invoke_codex|codex_message|omp_message|agent_swarm|Claude|Claude|Codex|OMP)\b/gi, "background work");
+    const words = text => text.replace(/\b(?:Claude|Codex)\b/gi, "background work");
     const duration = seconds => {
         const total = Math.max(0, Math.floor(seconds));
         if (total < 60) return total + "s";

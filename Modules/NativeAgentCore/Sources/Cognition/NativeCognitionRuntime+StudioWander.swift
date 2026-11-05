@@ -11,43 +11,16 @@ import PersonaEngine
 import ChatTurnContracts
 import ChatToolParsing
 import ToolRegistry
-// Blueprint: | `NativeCognitionRuntime+StudioWander.swift` | `NativeCognitionRuntime`: retained hour flight, checked admission and terminal settlement; mind.wander satisfies initial quiet/refractory waits through locked admission while new turn activity still ends access, returning the terminal receipt; installation, material composition and editable studio-intake invitations; hot-journal holes join sourceFailures and the unavailable-source receipt/intake packet |
+// Blueprint: | `NativeCognitionRuntime+StudioWander.swift` | `NativeCognitionRuntime`. |
 
-// MARK: - Her hour
-//
-// `StudioWanderLane` holds the law. This file holds the
-// organs: the installation read, the material composition, the one call, the
-// receipts and the trace.
-//
-// ── NO NEW TIMER, NO NEW BUDGET (NORTHSTAR clause 4) ────────────────────────
-// Called from `rescheduleResidualRepairDeadline`, which already runs on every
-// somatic signal, every deadline fire and every wake re-anchor, and already
-// holds a fresh residual reading. No loop id, no scheduler job, no watchdog. The
-// installation, conversation quiet and durable refractory decide admission.
-//
-// ── KILL SWITCH: THE LANE IS NOT INSTALLED ──────────────────────────────────
-// `StudioWanderState.shared.installation(for:)` is consulted before any state is
-// read. Off means `considerStudioWander` returns having touched nothing: no
-// state file, no material read, no receipt, no trace. There is no
-// "wander_skipped" record, because a lane that is not installed cannot skip.
-// An already-admitted hour still settles after either switch is turned off.
-//
-// ── CLAUSE 6: PUSH, NEVER PROMPT ────────────────────────────────────────────
-// Nothing this lane produces enters her next prompt. The hour is a turn of its
-// own; what survives it is what SHE wrote (a journal entry, by her own tool
-// call) plus one line of trace and a receipt. Nothing auto-appends.
-//
-// ── HONEST ENCOUNTERS ONLY ────────────────────────────────────────────────
-// The call runs with the ordinary tool loop at `read_only` file access, so the
-// browser/vision organs and the local file readers are hers to use and the write
-// tools are not. Nothing in this file fetches an artifact FOR her: if she cannot
-// actually receive the work, the encounter did not happen, and the outcome is
-// `no_artifact` — which never journals, because only she can journal.
+// MARK: - The wander hour
+// StudioWanderLane owns admission; this runtime composes sources, runs the turn and records settlement.
+// Use the existing residual deadline without another timer, budget or watchdog.
+// Resolve installation before any read; disabled hours leave no state, receipt or trace, while admitted hours still settle.
+// The hour adds nothing to later prompts except what the agent explicitly writes.
+// Permit only real artifact encounters and the agent's own journal; unavailable work cannot count as an encounter.
 
-/// Process-wide holder for the lane's non-durable state.
-///
-/// Installation and per-root claims live here; the runtime retains the actual
-/// flight so sleep can cancel work and join its settlement.
+/// Keep installation and per-root claims process-wide; retain flights in the runtime so sleep can join settlement.
 actor StudioWanderState {
     static let shared = StudioWanderState()
 
@@ -67,13 +40,12 @@ actor StudioWanderState {
         return resolved
     }
 
-    /// The Settings toggle re-resolves installation without a relaunch: turning
-    /// it off must UNINSTALL the lane, not leave a cached `.installed` behind.
+    /// Invalidate installation on Settings changes so disabling takes effect without relaunch.
     func invalidateInstallation(for dataRoot: URL) {
         installations[dataRoot.standardizedFileURL.path] = nil
     }
 
-    /// Single-flight claim. One hour at a time, per data root.
+    /// Allow one hour per data root at a time.
     func claim(_ dataRoot: URL) -> Bool {
         let key = dataRoot.standardizedFileURL.path
         guard !inFlight.contains(key) else { return false }
@@ -88,8 +60,7 @@ actor StudioWanderState {
 
     func attemptCount() -> UInt64 { attempts }
 
-    /// Change-only receipt suppression: "she is not due to wander" is true on nearly every
-    /// signal and must never be the loudest thing in the ledger.
+    /// Suppress unchanged not-due receipts so routine signals cannot dominate the ledger.
     func shouldRecord(_ key: String, for dataRoot: URL) -> Bool {
         let root = dataRoot.standardizedFileURL.path
         guard lastOutcome[root] != key else { return false }
@@ -101,20 +72,20 @@ actor StudioWanderState {
 
 extension NativeCognitionRuntime {
 
-    /// Called from the residual-repair reschedule.
     func considerStudioWander(runNow: Bool = false, reply: MindClockReply? = nil) {
         guard Self.studioWanderInstallationNow(dataRoot: dataRoot).isInstalled else {
             sourceWakes.wanderNextAt = nil
-            reply?(.init("held", "Her hour is not installed.")); return
+            if let reply { reply(.off("the hour is not installed")) } else { beat(.wander, .off("the hour is not installed")) }
+            return
         }
         if !runNow, let next = sourceWakes.wanderNextAt, next > now() { return }
         guard !isFlushedForTermination, studioWanderTask == nil else {
-            reply?(.init("held", "Her hour is running or the runtime is stopping.")); return
+            reply?(.init("held", "The wander hour is running or the runtime is stopping.")); return
         }
         studioWanderTask = Task { [weak self] in
             guard let self else { reply?(.init("unavailable", "The runtime was released.")); return }
             let result = await self.runStudioWanderIfDue(satisfyWait: runNow)
-            reply?(result)
+            if let reply { reply(result) } else { await self.beat(.wander, result) }
             await self.studioWanderFlightEnded()
         }
     }
@@ -131,14 +102,14 @@ extension NativeCognitionRuntime {
         let root = dataRoot
         let turnInFlight = liveTurnInFlight
         let at = now()
-        guard !Task.isCancelled, !isFlushedForTermination,
-              await Self.studioWanderIsInstalled(dataRoot: root) else { return .init("held", "Her hour is not installed or the runtime is stopping.") }
+        guard !Task.isCancelled, !isFlushedForTermination else { return .init("stopped", "The runtime is stopping.") }
+        guard await Self.studioWanderIsInstalled(dataRoot: root) else { return .off("the hour is not installed") }
         let lastWander: Date?
         do {
             lastWander = try await StudioWanderLane.loadState(dataRoot: root).lastWanderAt
         } catch {
             await recordStudioWanderPersistenceFailure(error)
-            return .init("unavailable", "Her hour state could not be read: " + error.localizedDescription)
+            return .init("unavailable", "The wander hour state could not be read: " + error.localizedDescription)
         }
         let lastActivity = await ChatTurnSteering.shared.turnActivityOrSeed(for: root, at: at)
         sourceWakes.wanderNextAt = StudioWanderLane.nextEligibility(
@@ -150,8 +121,9 @@ extension NativeCognitionRuntime {
             lastWanderAt: lastWander,
             satisfyWait: satisfyWait
         )
-        guard decision == .wander, !Task.isCancelled, !isFlushedForTermination else { return .init("held", decision.rawValue) }
-        guard await StudioWanderState.shared.claim(root) else { return .init("held", "Her hour is already claimed.") }
+        guard decision == .wander else { return .waiting(decision.rawValue) }
+        guard !Task.isCancelled, !isFlushedForTermination else { return .init("stopped", "The runtime is stopping.") }
+        guard await StudioWanderState.shared.claim(root) else { return .waiting("The hour is already claimed.") }
         let result = await runStudioWander(at: at, satisfyWait: satisfyWait)
         await settle { await StudioWanderState.shared.release(root) }
         do {
@@ -166,9 +138,7 @@ extension NativeCognitionRuntime {
         return result
     }
 
-    /// Installation, resolved once per data root and cached. Public-safe builds
-    /// before onboarding cannot install it at all; the switch defaults OFF
-    /// everywhere else.
+    /// Resolve installation per root; public pre-onboarding builds cannot admit hours.
     public static func studioWanderIsInstalled(dataRoot: URL) async -> Bool {
         await StudioWanderState.shared.installation(for: dataRoot) {
             studioWanderInstallationNow(dataRoot: dataRoot)
@@ -182,9 +152,7 @@ extension NativeCognitionRuntime {
                 forcedNeutral: NativeAgentPublicSafety.shouldForceNeutralOrganism(
                     dataRoot: dataRoot
                 ),
-                // The Subconscious master's own key. Spelled out because the
-                // runtime keeps it private; the Settings row this switch sits
-                // beside reads the same literal through @AppStorage.
+                // Match the private master preference's literal because Settings and runtime must read the same choice.
                 subconsciousEnabled: UserDefaults.standard
                     .object(forKey: "cognitiveSubstrateEnabled") == nil
                     || UserDefaults.standard.bool(forKey: "cognitiveSubstrateEnabled")
@@ -193,11 +161,12 @@ extension NativeCognitionRuntime {
 
     private func runStudioWander(at: Date, satisfyWait: Bool = false) async -> MindClockResult {
         let quietSatisfiedThrough: Date? = satisfyWait ? at : nil
-        guard await studioWanderStillEligible(quietSatisfiedThrough: quietSatisfiedThrough) else { return .init("held", "Her hour no longer passes live admission.") }
+        guard await studioWanderStillEligible(quietSatisfiedThrough: quietSatisfiedThrough) else { return .waiting(
+            "The wander hour no longer passes live admission.") }
         let root = dataRoot
 
         let (material, sourceFailures, offeredCares, careGeneration) = await composeStudioWanderMaterial()
-        // Report source failures; if no material remains, leave the refractory unconsumed.
+        // Report unreadable sources; no remaining material leaves refractory unconsumed.
         if !sourceFailures.isEmpty {
             await substrate.recordReceipt(kind: "studio.wander_source_unavailable", payload: .object([
                 "failures": .array(sourceFailures.map { .string($0) }),
@@ -205,9 +174,9 @@ extension NativeCognitionRuntime {
             ]))
             if material.isEmpty { return .init("unavailable", sourceFailures.joined(separator: "; ")) }
         }
-        guard await studioWanderStillEligible(quietSatisfiedThrough: quietSatisfiedThrough) else { return .init("held", "Her hour no longer passes live admission.") }
-        // Persist admission before tools can run. Provider failure may follow
-        // tool effects, so it is not permission to replay an unknown outcome.
+        guard await studioWanderStillEligible(quietSatisfiedThrough: quietSatisfiedThrough) else { return .waiting(
+            "The wander hour no longer passes live admission.") }
+        // Persist admission before tools run; later provider failure cannot authorize replay of unknown effects.
         let admittedAt = now()
         do { try await StudioWanderLane.beginHour(dataRoot: root, at: admittedAt, satisfyWait: satisfyWait) }
         catch { await recordStudioWanderPersistenceFailure(error); return .init("unavailable", error.localizedDescription) }
@@ -218,22 +187,9 @@ extension NativeCognitionRuntime {
                     providerCalls: 0, at: admittedAt)
             }
         }
-        // Her hour's witness admits only looking and her own journal, and records encounters.
-        //
-        // The narrowing is not decoration. `runEphemeralToolTurn` inherits the
-        // WHOLE catalog, and `fileAccess: read_only` stops file writes and
-        // shells but stops none of the things that reach the world: `act`/`go`
-        // move User's screen, `mail_send`/`messages_send`
-        // speak as him, `claude_message`/`codex_message`/
-        // `invoke_codex` wake other agents, `commit_memory` rewrites what she
-        // knows, the `desk_*` mutations edit his board, `workshop_submit` starts
-        // work. An unattended hour of her own must be able to LOOK and to WRITE
-        // IN HER OWN JOURNAL, and nothing else.
-        //
-        // `enforceAppAutonomy: false` matches every other client the app builds:
-        // the shared ChatOrchestration membrane resolves autonomy once, after
-        // SecurityCenter has authenticated the origin.
-        // A test-root runtime gets its own bodiless engine.
+        // The full tool catalog includes external effects that read-only file access does not gate.
+        // Narrow dispatch to looking and the agent's own journal; authenticate origin before shared autonomy admission.
+        // Alternate-root runtimes use their own bodiless engine.
         let engine = host.studioWanderClient(dataRoot: root, usesLiveAppBody: usesLiveAppBody)
         let witness = StudioWanderToolWitness(
             inner: engine.toolDispatchClient(),
@@ -242,22 +198,20 @@ extension NativeCognitionRuntime {
         let response: ChatTurnRuntime.ChatResponse
         do {
             let client = engine.chatClient(tools: witness)
-            response = try await LLMCallContext.$purpose.withValue("studio_wander") {
-            try await client.runEphemeralToolTurn(
+            let turn = Turn().with(\.envelope, TurnEnvelope.native("studio_wander", surface: Self.studioWanderSurface))
+            response = try await client.runEphemeralToolTurn(
                 message: StudioWanderLane.prompt(material),
-                // Reads and her own studio lane; no shell, no writes. The
-                // browser/vision organs and the local file readers are what an
-                // honest encounter is made of, and they are all reads.
+                // Allow browser, vision and local reads without shells or external writes.
                 fileAccess: "read_only",
                 surface: Self.studioWanderSurface,
                 providerAdmission: { [weak self] in
                     guard await self?.studioWanderStillEligible(quietSatisfiedThrough: quietSatisfiedThrough) == true else { throw CancellationError() }
-                }
+                },
+                purpose: "studio_wander",
+                turn: turn, work: ChatTurnWork()
             )
-            }
         } catch {
-            // Admission remains durable: a provider failure can occur after
-            // a journal write and must not silently replay the hour.
+            // Keep admission durable because provider failure may follow a committed journal write.
             let eligible = await studioWanderStillEligible(quietSatisfiedThrough: quietSatisfiedThrough)
             let stopped = Task.isCancelled || error is CancellationError || !eligible
             let failure = String(describing: error)
@@ -282,20 +236,13 @@ extension NativeCognitionRuntime {
                                    offeredCares: [UUID], careGeneration: UInt64) async -> MindClockResult {
         let root = dataRoot
 
-        // WHAT SHE ACTUALLY DID, read from the tools she actually CALLED —
-        // never from what the reply claims. "I looked at it" is an assertion; a
-        // dispatch is evidence, and this whole lane exists because the
-        // difference matters.
+        // Witness dispatched tools rather than trusting the reply's claim of an encounter.
         let line = Self.studioWanderLine(response.output)
         let outcome: StudioWanderLane.Outcome
         if seen.obtainedArtifact {
             outcome = .chose
         } else if seen.attemptedArtifact {
-            // She reached for the work and could not receive it. Her veto: the
-            // encounter did not happen. Note that this branch cannot coexist
-            // with a journal entry — `studio_journal` is hers alone to call and
-            // she was told not to write about a work she did not meet — but if
-            // one somehow exists it is HER entry and it is reported, not erased.
+            // Failure to receive the work is no_artifact; report any agent-authored journal entry without erasing it.
             outcome = .noArtifact
         } else {
             outcome = .declined
@@ -309,7 +256,7 @@ extension NativeCognitionRuntime {
             at: admittedAt,
             encounter: seen
         )
-        // Preserve questions from real encounters even if the switch changes after admission.
+        // Preserve real-encounter questions even when the switch changes after admission.
         if outcome == .chose, let question = Self.studioWanderQuestion(response.output) {
             var topic: String?
             if let journalEntryID,
@@ -326,13 +273,13 @@ extension NativeCognitionRuntime {
                 if !saved { throw CognitiveCareNotSaved(detail: "the hour's care generation is no longer current") }
             } catch {
                 await recordStudioWanderPersistenceFailure(error)
-                return .init("failed", "The hour ended as \(outcome.rawValue), but its wondering was not saved: \(error.localizedDescription)", fields: result.fields)
+                return .init("failed", "The hour ended as \(outcome.rawValue), but its wondering was not saved: \(error.localizedDescription)",
+                    fields: result.fields)
             }
         }
         return result
     }
 
-    /// Her `still wondering:` line, if she wrote one.
     static func studioWanderQuestion(_ output: String) -> String? {
         output.components(separatedBy: .newlines)
             .map { $0.replacingOccurrences(of: "**", with: "").trimmingCharacters(in: .whitespaces) }
@@ -341,9 +288,7 @@ extension NativeCognitionRuntime {
             .flatMap { $0.isEmpty ? nil : String($0.prefix(240)) }
     }
 
-    /// The question and the offered care it carries on, when her line names
-    /// one by its key ("still wondering: [w2] …"). Which care it belongs to is
-    /// hers to say; with no key it is a care of its own.
+    /// Let an explicit question key select the continued care; no key creates an independent care.
     static func studioWanderContinuing(_ question: String, offered: [UUID]) -> (question: String, care: UUID?) {
         guard question.hasPrefix("[w"), let close = question.firstIndex(of: "]"),
               let number = Int(question[question.index(question.startIndex, offsetBy: 2)..<close]),
@@ -353,11 +298,7 @@ extension NativeCognitionRuntime {
         return (rest.isEmpty ? question : rest, offered[number - 1])
     }
 
-    /// Advance the refractory, write the one-line trace, and record the receipt.
-    ///
-    /// The refractory advances on EVERY ended hour, decline included: the hour
-    /// was hers and she spent it. Nothing here counts, scores, or compares
-    /// outcomes across days.
+    /// Every admitted hour advances refractory, including a decline; trace and receipt record spending without scoring outcomes.
     private func finishStudioWander(
         outcome: StudioWanderLane.Outcome,
         line: String,
@@ -367,8 +308,7 @@ extension NativeCognitionRuntime {
         failure: String? = nil,
         encounter: StudioWanderToolWitness.Report? = nil
     ) async -> MindClockResult {
-        // Admission already happened. Switches and Stop end work, never this
-        // terminal record or its witnessed journal entry.
+        // Switches and Stop end admitted work, never its terminal record or witnessed journal entry.
         let entry = StudioWanderLane.TraceEntry(
             at: NativeTimestampFormat.sixDigitUTCOffset(at),
             outcome: outcome,
@@ -376,14 +316,14 @@ extension NativeCognitionRuntime {
             journalEntryID: journalEntryID
         )
         do { try await StudioWanderLane.recordEndedHour(dataRoot: dataRoot, entry: entry, at: at) }
-        catch { await recordStudioWanderPersistenceFailure(error); return .init("failed", "The hour ended as \(outcome.rawValue), but its terminal trace was not saved: \(error.localizedDescription)") }
-        // Each admitted hour owns a terminal receipt, even when two ended alike.
+        catch { await recordStudioWanderPersistenceFailure(error); return .init("failed",
+            "The hour ended as \(outcome.rawValue), but its terminal trace was not saved: \(error.localizedDescription)") }
+        // Every admitted hour owns a terminal receipt, including repeated outcomes.
         var payload: [String: JSONValue] = [
             "outcome": .string(outcome.rawValue),
             "line": .string(String(line.prefix(240))),
             "providerCalls": providerCalls.map { .int(Int64($0)) } ?? .null,
             "attempt": .int(Int64(await StudioWanderState.shared.attemptCount())),
-            // Said out loud so no reader has to infer it.
             "autoJournaled": .bool(false),
             "trace": .string(StudioWanderLane.statePath(dataRoot: dataRoot).path),
         ]
@@ -395,7 +335,8 @@ extension NativeCognitionRuntime {
         }
         await substrate.recordReceipt(kind: outcome.receiptKind, payload: .object(payload))
         publishRuntimeChange(reason: "studio:wander_\(outcome.rawValue)")
-        return .init(outcome.rawValue, failure ?? line, fields: payload)
+        // An hour that obtained its work produced an encounter; a decline or an unreceived work produced none.
+        return .init(outcome.rawValue, failure ?? line, fields: payload, yield: outcome == .chose ? 1 : 0)
     }
 
     private func recordStudioWanderPersistenceFailure(_ error: Error) async {
@@ -405,9 +346,8 @@ extension NativeCognitionRuntime {
         ]))
     }
 
-    /// Revalidate after preparation and again at each tool boundary. The
-    /// current run's refractory is already reserved, not a reason to reject
-    /// its continuation. Foreground activity ends this hour's tool access.
+    /// Revalidate after preparation and at tool boundaries; current-run refractory does not reject continuation.
+    /// Foreground activity ends unattended tool access.
     private func studioWanderStillEligible(quietSatisfiedThrough: Date? = nil) async -> Bool {
         let activity = await ChatTurnSteering.shared.turnActivityOrSeed(for: dataRoot, at: now())
         let installed = Self.studioWanderInstallationNow(dataRoot: dataRoot).isInstalled
@@ -420,21 +360,13 @@ extension NativeCognitionRuntime {
             ) == .wander
     }
 
-    /// HER OWN MATERIAL, and nothing invented.
-    ///
-    /// Four live sources, every one of them already hers: the questions her own
-    /// substrate left open, the consults User filed that the journal never
-    /// answered, the works the graph holds with nothing written about them, and
-    /// the titles she has been writing about lately. A source that cannot be
-    /// read contributes NOTHING — an empty field is a correct answer.
-    ///
+    /// Compose only canonical open cares, consults, graph works and recent writing.
     /// Report unreadable sources separately from genuinely empty material.
     private func composeStudioWanderMaterial() async -> (
         material: StudioWanderLane.Material, sourceFailures: [String], offeredCares: [UUID], careGeneration: UInt64
     ) {
         let store = SwiftNativeStudioStore(dataRoot: dataRoot)
         var sourceFailures: [String] = []
-        // Her own open cares, most pressing first.
         let (cares, careGeneration) = await substrate.caresForHour()
 
         var invitations: [StudioEncounterCandidate]
@@ -491,12 +423,7 @@ extension NativeCognitionRuntime {
             invitationLines = try JSONDecoder().decode([String].self, from: result.serializedData(pretty: false))
         } catch { sourceFailures.append("studio invitations: \(error.localizedDescription)") }
         let material = StudioWanderLane.Material(
-            // An invitation she cannot open is a tease. A consult User filed is
-            // named by its id, and `studio_consult_read` is the only way to see
-            // the artifact refs inside it — so the line carries the id, and the
-            // prompt names the tool. Without this she was being shown one-line
-            // summaries of works and asked to judge them, which is the
-            // description-only encounter her own rule forbids.
+            // Include consult IDs and their read action so the agent can receive actual artifact references rather than judge summaries alone.
             invitations: invitationLines,
             recentJournalTitles: Array(recentTitles),
             cares: cares.enumerated().map { "[w\($0.offset + 1)] \($0.element.about) — \($0.element.open ?? "")" }
@@ -504,14 +431,10 @@ extension NativeCognitionRuntime {
         return (material, sourceFailures, cares.map(\.id), careGeneration)
     }
 
-    /// Her hour has its own routing row: model and reasoning effort are chosen in
-    /// Providers beside `dream` and `cognition_reflection`, because whose model
-    /// she thinks with when nobody is watching is a real choice and not an
-    /// inherited default.
+    /// Keep the hour's model and effort explicit in Providers because unattended thought needs its own saved routing choice.
     public static let studioWanderSurface = "studio_wander"
 
-    /// Her closing line, bounded. Never rewritten, never summarized — the last
-    /// non-empty line of what she said, which is what the prompt asked her for.
+    /// Keep the agent's final nonempty line verbatim, bounded without rewriting or summarization.
     static func studioWanderLine(_ output: String) -> String {
         let line = output
             .components(separatedBy: .newlines)
@@ -524,9 +447,7 @@ extension NativeCognitionRuntime {
 }
 
 extension NativeCognitionRuntime {
-    /// Called by the Settings toggle. Installation is resolved once per data
-    /// root and cached, so flipping the switch has to drop that cache — turning
-    /// the lane OFF must uninstall it now, not at the next relaunch.
+    /// Drop installation cache on Settings changes so disabling uninstalls the hour immediately.
     public static func reloadStudioWanderInstallation(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {

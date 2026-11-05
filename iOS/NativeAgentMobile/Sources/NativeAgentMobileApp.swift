@@ -11,16 +11,12 @@ import CloudKit
 #endif
 
 extension Notification.Name {
-    /// Internal simulator/test hook. No public URL scheme can post this event;
-    /// only explicit process launch arguments reach it.
+    /// Restrict launch injection to process arguments; no public URL scheme may post it.
     static let nativeagentDeepLinkSend = Notification.Name("nativeagent.chat.send")
     static let nativeagentOpenActivity = Notification.Name("nativeagent.open.activity")
 }
 
-/// Process-local simulator hook for a single launch-injected chat turn. The
-/// pending value closes the observer-registration race: if the notification
-/// posts before ChatView mounts, the mounted chat still consumes the exact
-/// launch text once. This is not persisted and has no public URL route.
+/// Retain launch text in-process to close the observer-registration race; consume once, without persistence or public URL routing.
 @MainActor
 enum NativeAgentDeepLinkSendHook {
     private static var pendingText: String?
@@ -66,9 +62,7 @@ enum NativeAgentDeepLinkSendHook {
     }
 }
 
-/// Parses explicit simulator/device test switches without exposing a URL or
-/// notification route to production callers. Application lifecycle code owns
-/// the one-shot execution of the returned values.
+/// Only process arguments may supply launch hooks; lifecycle code owns one-shot execution.
 enum NativeAgentLaunchArgumentPresentation {
     struct TestNotification: Equatable {
         let title: String
@@ -105,7 +99,7 @@ struct NativeAgentNotificationLaunchIntent: Codable, Identifiable, Hashable {
     let taskID: String?
     private static let key = "NativeAgentMobile.pendingNotificationDestination"
     private static let allowedScreens: Set<String> = [
-        "activity", "approvals", "inbox", "chat", "memories", "desk", "skills", "more", "workshop",
+        "activity", "approvals", "inbox", "chat", "memories", "desk", "skills", "more",
         "mac_integration", "macintegration", "mac-integration",
     ]
 
@@ -116,7 +110,7 @@ struct NativeAgentNotificationLaunchIntent: Codable, Identifiable, Hashable {
         let screen = allowedScreens.contains(raw) ? raw : "activity"
         let session = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let intent = Self(screen: screen, sessionID: screen == "chat" ? session.flatMap { $0.isEmpty ? nil : $0 } : nil,
-                          taskID: ["desk", "workshop"].contains(screen) ? taskID.flatMap { $0.isEmpty ? nil : $0 } : nil)
+                          taskID: screen == "desk" ? taskID.flatMap { $0.isEmpty ? nil : $0 } : nil)
         UserDefaults.standard.set(try? JSONEncoder().encode(intent), forKey: key)
     }
 
@@ -155,8 +149,7 @@ enum ChatReplyNotificationPresentation {
         else { return false }
         guard let notifiedSessionID = ChatStore.cleanSessionID(keys.sessionID) else { return false }
         if notifiedSessionID == ChatStore.cleanSessionID(store.selectedSessionID) { return true }
-        // The first reply names the session the Mac just created while the
-        // visible pending exchange still has no assigned session.
+        // The first reply may assign a Mac-created session while the visible exchange is still sessionless.
         guard ChatStore.cleanSessionID(store.selectedSessionID) == nil else { return false }
         guard let correlationID = keys.correlationID else { return false }
         return store.pendingExchanges[correlationID].map {
@@ -172,7 +165,6 @@ struct NativeAgentMobileApp: App {
     @StateObject private var pairingStore = PairingStore()
     @StateObject private var bridgeClient = MacBridgeClient()
     @State private var chatStore = ChatStore.shared
-    // Observation controllers use @State and .environment.
     @State private var voiceInput = VoiceInputController()
     @StateObject private var voiceOutput = VoiceOutputController()
     private let notificationDelegate = NativeAgentNotificationDelegate()
@@ -192,8 +184,7 @@ struct NativeAgentMobileApp: App {
             }
             return true
         }
-        // A terminated process cannot own a call. Retire any old island on
-        // cold launch rather than pretending the microphone survived it.
+        // Cold launch must retire old call islands: a terminated process cannot own a microphone.
         Task { await TalkModeController.endTalkActivities(callID: nil) }
         ChatRuntimeControls.primeDeviceSourceKey()
         MobileNotificationRouting.register()
@@ -203,7 +194,7 @@ struct NativeAgentMobileApp: App {
         _pairingStore = StateObject(wrappedValue: pairing)
         iCloudBridge.shared.pairingStore = pairing
         iCloudSyncEngine.shared.pairingStore = pairing
-        // Location relaunches need their observer even without a visible scene.
+        // Install location observers even when relaunch has no visible scene.
         if pairing.usesICloudTransport { iCloudBridge.shared.setup() }
         PhonePlaces.shared.resume()
     }
@@ -227,8 +218,7 @@ struct NativeAgentMobileApp: App {
         let generation = UUID()
         foregroundRefreshID = generation
         foregroundRefreshPairing = pairing
-        // The Mac's beat is re-read on activation (iCloudBridge); until it
-        // lands, an old sighting reads as finding the Mac, not losing it.
+        // Await activation's presence read before treating an old Mac sighting as lost contact.
         bridgeClient.connectingStartedAt = Date()
         bridgeClient.refreshConnection()
         PhonePlaces.shared.resume()
@@ -257,7 +247,6 @@ struct NativeAgentMobileApp: App {
                         .environment(voiceInput)
                         .environmentObject(voiceOutput)
                         .onAppear {
-                            // Resume durable queued sends when the phone's network path returns.
                             bridgeClient.onNetworkPathRestored = { [weak chatStore = chatStore] in
                                 chatStore?.recoverQueuedSendTransport()
                                 PhoneTurnActivity.shared.resumeWorkActivities()
@@ -270,9 +259,8 @@ struct NativeAgentMobileApp: App {
                             checkLaunchArgsForTestSend()
                             checkLaunchArgsForTestNotification()
                             checkLaunchArgsForPairingSecret()
-                            // `scenePhase` can already be active by the time
-                            // this view mounts, so do not rely on its change
-                            // callback to refresh the initial foreground view.
+                            checkLaunchArgsForSnapshotFixture()
+                            // Refresh on mount because scenePhase may already be active and never emit an initial change.
                             refreshOnForeground()
                         }
                         .onChange(of: pairingStore.isICloudPaired) { _, _ in
@@ -300,31 +288,24 @@ struct NativeAgentMobileApp: App {
                         }
                 } else {
                     PairingView(onSkip: {
-                        // Persist skipping without clearing pairing credentials.
+                        // Persist the skip without deleting pairing credentials.
                         pairingSkipped = true
                         configureTransport()
                     }, onPaired: {
                         pairingSkipped = false
                         configureTransport()
-                        // Registration may have been deferred while this first
-                        // pairing screen was visible; retry it once signing is
-                        // available so silent CloudKit pushes can arrive.
+                        // Retry deferred push registration once signing exists so the first pairing screen cannot prevent silent CloudKit delivery.
                         configureNotifications()
                     })
                     .environmentObject(pairingStore)
                     .onAppear {
-                        // Fresh-install pairing starts iCloudBridge from
-                        // PairingView before configureTransport() can run. Bind
-                        // both canonical consumers first so an immediately
-                        // drained CloudKit pairing record can commit through
-                        // PairingStore instead of being held forever.
+                        // Bind canonical consumers before pairing starts the bridge so immediately drained pairing records can commit through PairingStore.
                         iCloudSyncEngine.shared.pairingStore = pairingStore
                         iCloudBridge.shared.pairingStore = pairingStore
                         checkLaunchArgsForPairingSecret()
                     }
                 }
             }
-            // Announce on launch and key changes; the Mac ignores repeats and re-lists removed phones as pending.
             .task { announcePhoneToMac() }
             .onChange(of: pairingStore.iCloudPairingSecret) { _, _ in announcePhoneToMac() }
             .preferredColorScheme(NativeAgentAppearance.resolved(appearanceRawValue).colorScheme)
@@ -356,10 +337,7 @@ struct NativeAgentMobileApp: App {
             return
         }
 
-        // @Sendable: `register` is captured by the UNUserNotificationCenter
-        // completion handlers below, which are themselves @Sendable. Hopping via
-        // `Task { @MainActor in }` rather than DispatchQueue.main.async keeps the
-        // MainActor-isolated UIApplication.shared access statically checked.
+        // Keep register @Sendable for notification callbacks; hop with a MainActor Task so UIApplication access stays statically checked.
         let register: @Sendable () -> Void = {
             Task { @MainActor in
                 UIApplication.shared.registerForRemoteNotifications()
@@ -391,17 +369,13 @@ struct NativeAgentMobileApp: App {
     // HMAC secret presence permits iCloud routing independently of the paired flag.
     private func configureTransport() {
         guard !pairingStore.isRepairingConnection else { return }
-        // Inject pairingStore into both iCloud surfaces so they can sign messages:
-        //   - iCloudSyncEngine: action channel (Mac control, Workshop, approvals)
-        //   - iCloudBridge:     chat channel (BridgeMessage)
+        // Inject one pairing owner into action and chat transports so both sign with authoritative material.
         iCloudSyncEngine.shared.pairingStore = pairingStore
         iCloudBridge.shared.pairingStore = pairingStore
-        // Pairing lets the client distinguish an unreachable Mac from an unpaired bridge.
         bridgeClient.pairingStore = pairingStore
         PhonePlaces.shared.resume()
         PhoneTurnActivity.shared.resumeWorkActivities()
-        // Use iCloud when either the paired flag is set OR the HMAC secret is present
-        // (the secret survives app reinstalls and Skip flows via Keychain).
+        // Route through iCloud when a paired flag or HMAC secret exists; Keychain survives reinstalls and Skip.
         if pairingStore.usesICloudTransport {
             bridgeClient.configureICloud()
         } else if pairingStore.connectionRepairPending {
@@ -411,17 +385,12 @@ struct NativeAgentMobileApp: App {
         }
     }
 
-    /// Explicit process-argument test hook. Pass
-    /// `-sendTestMessage "your text"` to `xcrun simctl launch`; production apps
-    /// cannot receive this from another app or a web page.
+    /// Only explicit -sendTestMessage launch arguments inject chat; apps and web pages cannot invoke it.
     private func checkLaunchArgsForTestSend() {
         NativeAgentDeepLinkSendHook.stageLaunchArguments(ProcessInfo.processInfo.arguments)
     }
 
-    /// Launch-args test hook for simulator pairing without iCloud sync.
-    /// Pass `-pairingSecretBase64 <base64>` to xcrun simctl launch — sim
-    /// can't sign into a real iCloud, so KVS auto-bootstrap never fires
-    /// there. PairingStore still owns the Keychain commit and checked readback.
+    /// Simulator launch pairing still commits through PairingStore with checked readback; simulator KVS cannot bootstrap from a real iCloud account.
     private func checkLaunchArgsForPairingSecret() {
         #if DEBUG
         let args = ProcessInfo.processInfo.arguments
@@ -439,8 +408,41 @@ struct NativeAgentMobileApp: App {
         #endif
     }
 
-    /// Launch-args test hook for physical-device notification verification.
-    /// Pass `-sendTestNotification` to schedule a local notification after 5 seconds.
+    /// Process-local fixture: a copy of the Mac's published snapshot files in Documents/fixture is read as if just delivered, so a real
+    /// conversation opens in the simulator without a paired account. Sends stay off: nothing here is paired.
+    private func checkLaunchArgsForSnapshotFixture() {
+        #if DEBUG
+        guard ProcessInfo.processInfo.arguments.contains("-snapshotFixture") else { return }
+        Task { @MainActor in
+            let sync = iCloudSyncEngine.shared
+            sync.snapshotDir = URL.documentsDirectory.appendingPathComponent("fixture", isDirectory: true)
+            for group in [NAMobileSnapshotGroup.core, .chat, .faces] { _ = await sync.refreshSnapshotGroup(group) }
+            // The conversation with the most of his own words is his main chat.
+            let main = sync.chatTranscripts.max { a, b in
+                a.value.messages.filter { $0.role == .user }.count < b.value.messages.filter { $0.role == .user }.count
+            }?.key
+            ChatStore.shared.setSelectedSessionID(main)
+            NSLog("[NativeAgentMobile] -snapshotFixture: read %d conversations, opened one of %d rows", sync.chatTranscripts.count,
+                  main.flatMap { sync.chatTranscripts[$0]?.messages.count } ?? 0)
+            // A launch's replay of retained live records: one finished turn whose saved reply is here, one older than the window.
+            guard ProcessInfo.processInfo.arguments.contains("-replayOldLive"), let main,
+                  let saved = sync.chatTranscripts[main]?.records.first(where: { $0.role == "assistant" && $0.runId != nil && !$0.content.isEmpty })
+            else { return }
+            let hourAgo = Date().addingTimeInterval(-3600)
+            for run in [saved.runId!, "replayed-older-run"] {
+                for seq in 1...12 {
+                    let text = String(saved.content.prefix(saved.content.count * seq / 12))
+                    await ChatStore.shared.receiveICloudReply(BridgeMessage.make(
+                        id: "live-\(run)-\(seq)", sender: "mac", text: text, sessionID: main, correlationID: run,
+                        metadata: ["live": "true", "kind": "text_delta", "seq": String(seq), "source": "mac"],
+                        timestamp: hourAgo.addingTimeInterval(Double(seq))))
+                }
+            }
+            NSLog("[NativeAgentMobile] -replayOldLive: replayed 24 old live deltas")
+        }
+        #endif
+    }
+
     private func checkLaunchArgsForTestNotification() {
         let args = ProcessInfo.processInfo.arguments
         guard !didScheduleTestNotificationLaunchArgument,
@@ -452,7 +454,8 @@ struct NativeAgentMobileApp: App {
             let granted = (try? await center.requestAuthorization(options: [.alert, .badge, .sound])) ?? false
             NSLog("[NativeAgentMobile] launch test notification authorization granted=%@", granted ? "true" : "false")
             let settings = await center.notificationSettings()
-            NSLog("[NativeAgentMobile] launch test notification settings authorization=%ld alert=%ld", settings.authorizationStatus.rawValue, settings.alertSetting.rawValue)
+            NSLog("[NativeAgentMobile] launch test notification settings authorization=%ld alert=%ld", settings.authorizationStatus.rawValue,
+                settings.alertSetting.rawValue)
             guard granted || settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return }
 
             let content = UNMutableNotificationContent()

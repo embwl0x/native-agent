@@ -5,7 +5,7 @@ import NativeAgentCore
 
 // MARK: - Persona template generator
 
-/// Shared creation seeds; onboarding and PersonaEngine own their writes.
+/// Share creation seeds while leaving writes with onboarding and PersonaEngine.
 package enum PersonaTemplates {
     package static let validTypes: Set<String> = ["female", "male", "ai"]
 
@@ -44,11 +44,7 @@ package enum PersonaTemplates {
     }
 
     // MARK: SOUL / VOICE seeds.
-    //
-    // A fresh install starts blank on purpose: the name header and nothing
-    // else. What the person says they want the agent to be is the first thing
-    // written under it, by the first conversation. No stance, no instincts,
-    // no dos and don'ts seeded on their behalf.
+    // Seed only the name header so the person's first conversation shapes identity without imposed stance or instructions.
 
     package static let soulTemplate: String = """
 # {{NAME}} Soul

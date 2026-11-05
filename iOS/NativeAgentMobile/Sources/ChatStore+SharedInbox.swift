@@ -2,8 +2,7 @@ import Foundation
 import NativeAgentShared
 
 extension ChatStore {
-    /// Retain the existing composer queue before deleting the extension's
-    /// handoff. Receipts cover a crash between checkpoint and file deletion.
+    /// Persist the queue before deleting the share handoff; receipts cover a crash between checkpoint and deletion.
     func importSharedItems(controls: ChatRuntimeControls) {
         sharedInboxControls = controls
         guard !isSwitchingSession, sharedInboxImportTask == nil, admitChatMutation() else { return }
@@ -26,7 +25,10 @@ extension ChatStore {
                     if !retainedReceipt {
                         if !queuedSends.contains(where: { $0.id == item.id }) {
                             guard let pairing = item.pairingFingerprint else {
-                                errorBanner = "This shared item has no saved pairing. It remains in the shared inbox; share it again after connecting this iPhone."
+                                errorBanner = """
+                                    This shared item has no saved pairing. It remains in the shared inbox; share it again after \
+                                    connecting this iPhone.
+                                    """
                                 continue
                             }
                             guard enqueueSend(QueuedChatSend(id: item.id, sessionID: selectedSessionID,
@@ -45,9 +47,7 @@ extension ChatStore {
                             throw error
                         }
                     }
-                    // A previous checkpoint may have reported a disk failure.
-                    // Keep both receipt and queue, and require a successful flush
-                    // before consuming its still-present handoff on a later entry.
+                    // Keep receipt, queue and handoff after checkpoint failure; consume the handoff only after a successful flush.
                     if retainedReceipt { try await storage.flush() }
                     try await Task.detached(priority: .utility) { try FileManager.default.removeItem(at: url) }.value
                     receipts.remove(item.id.uuidString)
@@ -74,8 +74,7 @@ extension ChatStore {
     func scheduleSharedInboxRetry() {
         guard sharedInboxControls != nil else { return }
         Task { @MainActor [weak self] in
-            // Finish the queue mutation (including a remove/reinsert promotion)
-            // before checking capacity or importing another handoff.
+            // Finish remove/reinsert promotions before checking capacity or importing the next handoff.
             await Task.yield()
             guard let self, let controls = self.sharedInboxControls,
                   self.queuedSendsForSelectedSession.count < QueuedChatSend.maxPerSession else { return }

@@ -5,51 +5,34 @@ import PersistenceCore
 import ImageIO
 import UniformTypeIdentifiers
 
-// Blueprint: | `LocalToolImage.swift` | `LocalToolImage`: turn-local admitted image continuation and bounded thumbnails, including every chrome.look spelling; pixels never enter durable JSON/transcript receipts |
+// Blueprint: | `LocalToolImage.swift` | `LocalToolImage`: explicitly supplied image sinks and bounded thumbnails; pixels never enter durable receipts |
 
-/// Pixels live only in the admitted tool call's model continuation, never in
-/// JSON tool results, transcript receipts, result paging, or tool notices.
+/// Pixels live only in the admitted tool call's model continuation, never in JSON tool results, transcript receipts, result paging, or tool notices.
 public enum LocalToolImage {
-    @TaskLocal public static var sink: Sink?
     public static let maximumBytes = 8 * 1024 * 1024
 
-    // Image producers deliver bounded thumbnails in the same tool continuation; JSON retains the full-size file path.
 
-    /// The images one round may deliver, across all its calls: eight, and
-    /// 32 MiB. Pixels the model has not answered are never released, so this
-    /// is what bounds a request; `boundConversation` releases to half of it.
+    /// Bound unanswered pixels to eight images and 32 MiB; conversation release goes to half to avoid repeated prefix rewrites.
     public static let roundImages = 8
     public static let roundBytes = 32 * 1024 * 1024
-    /// Said by every reader the round's budget turns away.
     public static let roundFull = "This round's images are full (\(roundImages) images or 32 MiB); read it next."
-    /// Long edge of a produced-image thumbnail. Half the verified reader's
-    /// 2048: a produced image is shown so the model can CHECK it (did it come
-    /// out, is it the right shape, is the text right), and 1024 JPEG is a
-    /// tenth of the bytes of 2048 PNG.
+    /// 1024 JPEG suffices for checking produced images at about one tenth the bytes of 2048 PNG.
     public static let producedThumbnailMaxPixelSize = 1024
-    /// Source file a producer may open. Generous — it is downscaled
-    /// immediately — but a 100 MB render is a file, not a look.
+    /// Downscale immediately; refuse sources above the ceiling so a large render stays a file rather than an unbounded look.
     public static let producedSourceMaximumBytes = 32 * 1024 * 1024
 
-    /// Tool names whose result may carry pixels: the reader the model points
-    /// at a file, plus every tool that MAKES an image file the model should
-    /// look at before it speaks about it. The dispatcher hands a sink to these
-    /// and to nothing else — a name absent here simply never mints pixels.
+    /// Only image readers and producers receive sinks; other tools cannot mint pixels.
     public static let pixelCapableTools: Set<String> = [
         "read_file",
         "screen",
-        // The app door's page.screenshot.
         "app",
         "image_generate",
         "browser.screenshot",
         "browser.chrome_look",
-        // Carries a `capture_screenshot` flag through the same capture.
         "browser.open_url",
     ]
 
-    /// What happened when a tool offered the model a file it just produced.
-    /// `note` is always tellable to the model; when `shown` is false it says
-    /// why the pixels are not there, so the model never claims to have looked.
+    /// A missing-pixels note stays model-readable so the response cannot claim an unseen image was inspected.
     public struct ProducedImage: Sendable {
         public let shown: Bool
         public let note: String
@@ -57,10 +40,8 @@ public enum LocalToolImage {
         public let height: Int?
     }
 
-    /// A tool that just WROTE `url` offers it to the model for this same turn.
-    /// No file gate is consulted and none is needed: the caller produced this
-    /// file itself, inside its own data root, in the turn that is returning it
-    public static func showProducedImage(at url: URL, name: String? = nil) -> ProducedImage {
+    /// The caller produced this file inside its own data root during this turn, so delivery needs no additional path gate.
+    public static func showProducedImage(at url: URL, name: String? = nil, sink: Sink?) -> ProducedImage {
         func skipped(_ reason: String) -> ProducedImage {
             ProducedImage(shown: false, note: reason, width: nil, height: nil)
         }
@@ -74,7 +55,10 @@ public enum LocalToolImage {
                 return skipped("Not shown inline: \(label) is not a readable file.")
             }
             guard size <= producedSourceMaximumBytes else {
-                return skipped("Not shown inline: \(label) is \(size / (1024 * 1024)) MB, over the \(producedSourceMaximumBytes / (1024 * 1024)) MB inline cap. Open the path above to see it.")
+                return skipped("""
+                    Not shown inline: \(label) is \(size / (1024 * 1024)) MB, over the \(producedSourceMaximumBytes / (1024 * 1024)) MB inline \
+                    cap. Open the path above to see it.
+                    """)
             }
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
             guard let thumbnail = thumbnail(data, maxPixelSize: producedThumbnailMaxPixelSize) else {
@@ -97,7 +81,10 @@ public enum LocalToolImage {
             }
             return ProducedImage(
                 shown: true,
-                note: "Shown below this tool result as a JPEG thumbnail, long edge \(producedThumbnailMaxPixelSize)px. The full-size file is at the path above.",
+                note: """
+                    Shown below this tool result as a JPEG thumbnail, long edge \(producedThumbnailMaxPixelSize)px. The full-size file is at the \
+                    path above.
+                    """,
                 width: thumbnail.pixels.width, height: thumbnail.pixels.height
             )
         } catch {
@@ -105,7 +92,6 @@ public enum LocalToolImage {
         }
     }
 
-    /// Oriented first-frame pixels and original source dimensions.
     static func thumbnail(
         _ data: Data, maxPixelSize: Int
     ) -> (pixels: CGImage, sourceWidth: Int, sourceHeight: Int)? {
@@ -123,12 +109,9 @@ public enum LocalToolImage {
         return (pixels, width, height)
     }
 
-    /// Bound the entire active conversation, not just one tool iteration.
-    /// Up to eight images stay for before/after comparisons. Replace old
-    /// pixels with an explicit reread notice; paired tool receipts stay intact.
-    /// A release rewrites the provider-cached turn from the oldest image it
-    /// touches, so it happens once at the cap, down to half: never one image
-    /// per round. Images the model has not answered yet are never released.
+    /// Bound the whole conversation while retaining up to eight images for comparisons and all paired receipts. Release to half the cap at once: each release
+    /// rewrites the cached prefix from the oldest touched image. Never release pixels the model has not answered; replace released images with an explicit
+    /// reread notice.
     public static func boundConversation(_ messages: inout [LLMMessage],
                                          maxImages: Int = roundImages, maxBytes: Int = roundBytes) {
         supersede(&messages)
@@ -150,7 +133,10 @@ public enum LocalToolImage {
                 if count < maxImages / 2, size <= maxBytes / 2 - bytes {
                     count += 1; bytes += size
                 } else {
-                    content[blockIndex] = .text("[Earlier image \(name.map(shown) ?? "attachment") released from visual context to bound this turn. Its pixels are no longer visible; reread the original file if needed.]")
+                    content[blockIndex] = .text("""
+                        [Earlier image \(name.map(shown) ?? "attachment") released from visual context to bound this turn. Its pixels are no longer \
+                        visible; reread the original file if needed.]
+                        """)
                     changed = true
                 }
             }
@@ -160,9 +146,7 @@ public enum LocalToolImage {
         }
     }
 
-    /// A screenshot's name: what it shows and when, for her to read, then a tag
-    /// of its exact source (the capture's own window and region key), so only a
-    /// newer shot of that same source stands in for it (`supersede`).
+    /// Source-tag screenshot names so only a newer capture of the same window and region can supersede its pixels.
     public static func screenshotName(of display: String, source: String, at date: Date = Date()) -> String {
         let clock = DateFormatter()
         clock.dateFormat = "HH:mm"
@@ -171,20 +155,15 @@ public enum LocalToolImage {
     }
     private static let sourceMark = " · source "
 
-    /// A name as she reads it: a screenshot's without its source tag.
     public static func shown(_ name: String) -> String {
         name.range(of: sourceMark, options: .backwards).map { String(name[..<$0.lowerBound]) } ?? name
     }
 
-    /// The names of the images whose pixels are still in `messages`.
     public static func imageNames(_ messages: [LLMMessage]) -> Set<String> {
         Set(messages.flatMap(\.content).compactMap { if case .image(_, _, let name?, _) = $0 { name } else { nil } })
     }
 
-    /// Only the newest screenshot of each source keeps its pixels: an earlier
-    /// one becomes a line naming it. The line never changes, so after the
-    /// first replacement the cached prefix stays the same; each later one
-    /// rewrites only from the shot it replaces, about one round back.
+    /// Replace superseded pixels with a stable label so each later screenshot rewrites only its own recent prefix.
     static func supersede(_ messages: inout [LLMMessage]) {
         func source(_ block: LLMContentBlock) -> (name: String, source: String)? {
             guard case .image(_, _, let name?, _) = block, name.hasPrefix("screenshot of "),
@@ -207,8 +186,7 @@ public enum LocalToolImage {
         }
     }
 
-    /// Responses adapters emit function outputs separately from image messages.
-    /// Never mix them in one message where an image fast path can drop outputs.
+    /// Keep Responses function outputs separate from images so an image fast path cannot drop tool outputs.
     public static func continuation(_ blocks: [LLMContentBlock]) -> [LLMMessage] {
         let images = blocks.filter { if case .image = $0 { return true }; return false }
         let results = blocks.filter { if case .image = $0 { return false }; return true }
@@ -217,12 +195,10 @@ public enum LocalToolImage {
         return messages
     }
 
-    /// One round's image budget, shared by every call's sink in that round.
     public final class Round: @unchecked Sendable {
         private let lock = NSLock()
         private var images = 0, bytes = 0
         public init() {}
-        /// Room for another image; one too large for what is left is refused by `take`.
         public var hasRoom: Bool {
             lock.lock(); defer { lock.unlock() }
             return images < roundImages && bytes < roundBytes
@@ -257,20 +233,14 @@ public enum LocalToolImage {
             lock.lock(); defer { lock.unlock() }
             closed = true
             defer { images = [] }
-            // A failed call shows nothing, so its images go back to the round.
             if !success { round.giveBack(images.count, taken) }
             return success ? images : []
         }
     }
 
-    /// Hand already-encoded PNG bytes to the model as a real image block.
-    ///
-    /// The same one-image-per-call sink the file reader uses, for pixels a tool
-    /// MADE rather than read: the caller owns the bytes, so there is no path to
-    /// authorize and no file to resolve. The size ceiling is the delivery
-    /// ceiling and is checked here rather than trusted from the caller.
+    /// Encoded produced pixels need no path authorization; enforce the delivery ceiling here rather than trust the caller.
     public static func deliverPNG(
-        _ data: Data, name: String, width: Int, height: Int, mediaType: String = "image/png"
+        _ data: Data, name: String, width: Int, height: Int, mediaType: String = "image/png", sink: Sink?
     ) -> JSONValue {
         func failure(_ reason: String) -> JSONValue {
             .object(["ok": .bool(false), "status": .string("failed"), "error": .string(reason)])

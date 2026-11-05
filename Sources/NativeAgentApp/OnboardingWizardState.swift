@@ -2,7 +2,7 @@ import EngineRuntime
 import Onboarding
 import NativeAgentShared
 import SwiftUI
-// Blueprint: | `OnboardingWizardState.swift` | OnboardingWizardState: local progress and name drafts; provider connections and Chat readiness derive from ProvidersFacade |
+// Blueprint: | `OnboardingWizardState.swift` | Local name/progress drafts; ProvidersFacade owns Chat readiness |
 
 @Observable
 @MainActor
@@ -11,15 +11,14 @@ final class OnboardingWizardState {
         case identity = 0
         case provider = 1
         case building = 2
-        /// Reached only by a profile repair; a fresh setup goes straight to
-        /// the greeting, which does the "ready" job.
+        /// Only profile repair needs a Done step; fresh setup finishes with the greeting.
         case done = 3
         case error = 4
         /// Missing-profile repair has its own action, without progress dots or shared navigation.
         case profileRepair = 5
     }
 
-    /// Drives both progress dots and the shared navigation gate.
+    /// One gate keeps progress dots and navigation in agreement.
     static let interactiveStepCount = 2
 
     var step: Step = .identity
@@ -33,7 +32,6 @@ final class OnboardingWizardState {
             else { savedAgentName = newValue }
         }
     }
-    /// Onboarding creates one AI persona.
     var personaType: String = "ai"
     var providers: [ProviderInfo] { draftOwner?.engine.providers.connections ?? [] }
     var providersLoading = false
@@ -87,16 +85,16 @@ final class OnboardingWizardState {
     var errorMessage: String?
     var pendingRecoveryNeedsReset = false
     var isLoading: Bool = false
-    /// A failed build cannot count existing persona bytes as successful completion.
+    /// Existing persona bytes do not prove a failed build completed.
     var buildFailed = false
 
-    /// Identity committed; retry scaffold repair without resetting those documents.
+    /// Scaffold retries must preserve the committed identity.
     var scaffoldRepairFailed = false
 
     /// Profile-only repair preserves persona documents and never re-arms the first-run welcome.
     var profileRepairOnly = false
 
-    /// A refused repair can re-read durable state without dismissing the sheet.
+    /// Keep the sheet open while a refused repair rechecks durable state.
     var profileRepairRecheckOffered = false
 
     private static let nameSuggestions = ["Aria", "Max", "Ada", "Soren", "Clio", "Zev", "Noa"]

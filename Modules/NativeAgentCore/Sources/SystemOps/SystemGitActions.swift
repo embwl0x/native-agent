@@ -1,7 +1,7 @@
 import Foundation
 // Blueprint: | `SystemGitActions.swift` | `SystemGitActions` enum; `processDetail` |
 
-/// Process receipt formatting; the host executes the process.
+/// Keep process effects in the host; shared formatting must not execute commands.
 public enum SystemGitActions {
     public static func processDetail(_ result: (status: Int32, stdout: String, stderr: String)) -> String {
         let output = [result.stdout, result.stderr]

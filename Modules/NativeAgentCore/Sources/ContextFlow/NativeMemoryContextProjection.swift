@@ -1,9 +1,10 @@
 import Context
+import NativeAgentCore
 import Foundation
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `NativeMemoryContextProjection.swift` | `MemoryContext`: canonical memory projection, including immutable untrusted-source entities and source hashes |
+// Blueprint: | `NativeMemoryContextProjection.swift` | `MemoryContext`: canonical records, immutable untrusted-source entities and hashes |
 
 private enum NativeMemoryContextProjectionLimits {
     static let maximumRecords = memoryStoredRowCap
@@ -12,7 +13,6 @@ private enum NativeMemoryContextProjectionLimits {
     static let maximumTagUTF8Bytes = 128
 }
 
-/// Attention's record-to-atom lookup for the current accepted generation.
 public final class MemoryAtomRecordIndex: @unchecked Sendable {
     private let lock = NSLock()
     private var recordToAtom: [String: ContextAtomID] = [:]
@@ -95,9 +95,7 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
         )
     }
 
-    /// The body never speaks a memory the database says is gone or tightened:
-    /// the chosen atoms' records are read by id, and any retired, newer than
-    /// the version compiled, or not disclosed on this surface is dropped.
+    /// Recheck chosen records so removed, tightened or newer memories cannot speak through stale atoms.
     func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
                 surface: ContextSurface) async -> ContextTurnExclusion {
         let locators = Dictionary(generation.sources.lazy.filter { $0.descriptor.owner == Self.owner }
@@ -129,7 +127,6 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
         }
     }
 
-    /// Active, recall-eligible, no newer than what was compiled, and disclosed here.
     static func speakable(_ record: MemoryV2.MemoryRecord?, compiledAt: Date, on surface: ContextSurface) -> Bool {
         guard let record, parseDate(record.createdAt) != nil, isActive(record), !pendingAdmission(record), MemoryLifecycle.isRecallEligible(record.lifecycle),
               let version = parseDate(record.updatedAt),
@@ -144,7 +141,6 @@ struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
         return extras[MemoryStorage.pendingAdmissionKey] == .bool(true)
     }
 
-    /// The record id the locator carries; nil for one compiled before it did.
     static func recordID(inLocator locator: String) -> String? {
         guard let range = locator.range(of: "/records/id:") else { return nil }
         return String(locator[range.upperBound...])
@@ -219,7 +215,6 @@ private extension MemoryContext {
             ? .explicitCorrection
             : (pinned ? .canonical : .inferred)
         let atomKind: ContextAtomKind = correction ? .correction : .memory
-        // What happened between them is marked as personal.
         let personal = !correction && Self.personalKinds.contains(
             (record.memoryKind ?? MemoryRecallScoring.kind(of: record.extras) ?? "").lowercased())
         let contentRole: ContextContentRole = personal ? .personal : .memory
@@ -247,10 +242,8 @@ private extension MemoryContext {
             guard !normalized.isEmpty else { return "shared" }
             return "personas/\(ContextStableID.digest(parts: [normalized]))"
         }()
-        // The record id rides the locator, so a turn can read the record back.
         let locator = "memory-v2/\(personaScope)/records/id:\(recordID)"
-        // Keep record/atom identity stable when disclosure scope changes:
-        // the locator carries persona scope, the source identity does not.
+        // Keep record/atom identity stable when disclosure scope changes: the locator carries persona scope, the source identity does not.
         let sourceID = ContextStableID.source(owner: owner, locator: "memory-v2/records/\(locatorDigest)")
         let descriptor = ContextSourceDescriptor(
             id: sourceID,
@@ -283,8 +276,7 @@ private extension MemoryContext {
             label: correction ? "explicit correction" : (pinned ? "pinned memory" : "adaptive memory")
         ))
         if case .array(let values)? = record.extras?.objectValue?["context_topics"] {
-            // Identity is read from this projection's injected root, through
-            // the profile cache that observes renames, never a default install.
+            // Identity is read from this projection's injected root, through the profile cache that observes renames, never a default install.
             let names = try MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory"))
             func topicKey(_ text: String) -> String {
                 text.lowercased().split { !$0.isLetter && !$0.isNumber }.joined(separator: " ")
@@ -330,8 +322,7 @@ private extension MemoryContext {
             canonicalJSONString(.object(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot))) ?? "",
         ] + (body == embeddingText ? [] : [embeddingText]))
 
-        // Canonical saves and epoch convergence own the vector; metadata
-        // changes can republish an atom without predicting its words again.
+        // Canonical saves and epoch convergence own the vector; metadata changes can republish an atom without predicting its words again.
         let embedding: ContextEmbedding?
         if let epoch = stored.embeddingEpoch, !epoch.isEmpty,
            let vector = stored.embedding, !vector.isEmpty, vector.allSatisfy(\.isFinite) {
@@ -370,10 +361,7 @@ private extension MemoryContext {
         )
     }
 
-    /// Memory kinds that are what happened between them: marked
-    /// `.personal`; they compete in the one memory lane like any memory. A
-    /// kept moment from the retired lane is an ordinary memory: what moved her
-    /// lives in her cares.
+    /// Personal events compete as ordinary memories in the shared memory budget; cares own what moved the agent.
     static let personalKinds: Set<String> = ["relationship", "lesson_origin"]
 
     static func isActive(_ record: MemoryV2.MemoryRecord) -> Bool {
@@ -419,17 +407,13 @@ private extension MemoryContext {
         return ContextMemoryProvenance(kind: kind, by: by)
     }
 
-    /// Dates are presentation evidence, not vector input; `valid_to` also
-    /// expires the atom (`prepare`).
-    /// Prefix them so the existing bounded context_expand prefix also retains
-    /// them. Reserve their bytes inside the existing body cap, never above it.
+    /// Dates are presentation evidence, not vector input; valid_to also expires atoms. Prefix dates inside the body cap so bounded expansion retains them
+    /// without adding bytes above the budget.
     static func presentationBody(
         _ text: String, record: MemoryV2.MemoryRecord, maximumUTF8Bytes: Int
     ) -> String {
         let warning = MemorySenseProvenance.warning(in: record.extras)
-        // Days, said once: the block's own note already says these are records,
-        // not live readings, so each memory carries only its dates (10-29: the
-        // long per-memory label was a third of the memory block).
+        // The block already labels records as historical; repeat only dates to preserve room for memory content.
         func day(_ raw: String?) -> String? {
             guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), value.utf8.count <= 64,
                   !NativeContextProjectionText.containsDisallowedControl(value), parseDate(value) != nil else { return nil }
@@ -453,8 +437,7 @@ private extension MemoryContext {
         let afterPrefix = maximumUTF8Bytes - prefixBytes
         guard afterPrefix > suffix.utf8.count else { return text }
         let available = afterPrefix - suffix.utf8.count
-        // A custom tiny budget must not discard the canonical fact merely
-        // because a complete date label cannot fit. Standard budget is 16 KiB.
+        // A custom tiny budget must not discard the canonical fact merely because a complete date label cannot fit. Standard budget is 16 KiB.
         guard available > 0 else { return text }
         var excerpt = ""
         var bytes = 0
@@ -487,13 +470,11 @@ private extension MemoryContext {
 
 }
 
-// Record lookup uses the projection's canonical identity normalization.
 extension MemoryContext {
     static func normalizedRecordID(_ value: String) -> String {
         normalizedID(value)
     }
 
-    /// Shared by the knowledge-graph projection too; trims projection input.
     static func parseDate(_ raw: String?) -> Date? {
         guard let raw else { return nil }
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)

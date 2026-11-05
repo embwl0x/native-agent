@@ -8,7 +8,7 @@ import TriggerScheduler
 enum NativeAgentDreamCycleSchedule {
     static let dreamHour = DreamREMSchedule.dreamHour
     static let dreamMinute = DreamREMSchedule.dreamMinute
-    // Forward to Core's single source of truth (DreamREMSchedule) — no literals here.
+    // Keep schedule literals in DreamREMSchedule so all callers share the same cycle boundary.
     static let remHour = DreamREMSchedule.remHour
     static let remMinute = DreamREMSchedule.remMinute
 

@@ -1,11 +1,10 @@
-// Shared HMAC secret for device validation and pairing display.
 import Foundation
 import CryptoKit
 import Security
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `PairingSecretManager.swift` | `PairingSecret`: checked device-only HMAC secret ownership, explicit rotation, existing-item reconciliation without generation and pairing material publication |
+// Blueprint: | `PairingSecretManager.swift` | `PairingSecret`; Device-only secret, explicit rotation and readback. |
 
 private enum PairingKVSPublishResult: Sendable {
     case skippedCurrent
@@ -24,9 +23,7 @@ public enum PairingSecret {
         PersistenceCore.defaultDataRoot().appendingPathComponent("icloud_pairing_secret.bin")
     }
 
-    /// Loads the exact device-only Keychain secret, or creates one when
-    /// and only when it is missing. Existing invalid state remains untouched
-    /// and makes pairing unavailable until the user deliberately repairs it.
+    /// Only missing Keychain state permits creation; invalid existing authority stays untouched until explicit repair.
     public static func loadOrGenerateSecret() throws -> Data {
         try loadOrGenerateSecret(at: secretURL)
     }
@@ -40,8 +37,7 @@ public enum PairingSecret {
         }
     }
 
-    /// Explicit Keychain rotation with checked readback. An accepted but
-    /// unverified write stays in place and requires exact-item reconciliation.
+    /// Accepted but unverified rotation stays committed and requires exact-item reconciliation.
     public static func rotateSecret() throws -> Data {
         try rotateSecret(at: secretURL)
     }
@@ -65,8 +61,7 @@ public enum PairingSecret {
         return Data(bytes)
     }
 
-    /// The existing Keychain secret, without generating authority.
-    /// Quiet page reads never mint pairing authority.
+    /// Quiet reads must never mint pairing authority.
     public static func existingSecretBase64() throws -> String? {
         try existingSecret(at: secretURL)?.base64EncodedString()
     }
@@ -88,9 +83,7 @@ public enum PairingSecret {
         }
     }
 
-    // Phase 14e-iCloud HMAC self-heal: monotonic pairing_secret_version stamped
-    // on every KVS publish. iOS uses it to detect when its cached secret has
-    // gone stale relative to the Mac's authoritative copy and re-fetches.
+    // Monotonic pairing_secret_version lets the phone detect stale cached authority and fetch the Mac's exact secret.
     private static let secretVersionKey = "NativeAgent.pairing.secretVersionLocal"
     private static let synchronizationCheckpointKey = "NativeAgent.pairing.synchronizationCheckpoint"
 
@@ -98,10 +91,7 @@ public enum PairingSecret {
         UserDefaults.standard.integer(forKey: secretVersionKey)
     }
 
-    /// Publish current HMAC secret to KVS, bumping the secretVersion stamp so
-    /// iOS can detect stale secrets and re-fetch. Always publishes (no skip)
-    /// when called from the signature-mismatch self-heal path — caller controls
-    /// when to bump.
+    /// Publish even during signature-mismatch repair; only the caller decides when secretVersion must advance.
     @discardableResult
     public static func publishMaterialToKVS(forceBumpVersion: Bool = false) async -> Bool {
         let secret: Data
@@ -122,8 +112,7 @@ public enum PairingSecret {
         guard secret.count == 32 else { return false }
         let secretB64 = secret.base64EncodedString()
         let secretDigest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
-        // KVS reads include unsynchronized local writes. Only a checkpoint
-        // recorded after synchronization proves this secret/version was sent.
+        // KVS reads include local unsynchronized writes; only a post-sync checkpoint proves publication.
         let result = await withCKTimeout("PairingSecret.publishMaterialToKVS") {
             let kvs = NSUbiquitousKeyValueStore.default
             let defaults = UserDefaults.standard

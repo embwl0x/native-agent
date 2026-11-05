@@ -8,10 +8,8 @@ import CoreGraphics
 #endif
 
 extension SwiftNativeMacControl {
-    /// A mark is a reference into the latest view, not injection authority.
-    /// Dispatch retains its policy and execution gates.
+    /// A mark is a reference into the latest view, not injection authority. Dispatch retains its policy and execution gates.
     private enum MarkResolution {
-        /// The call named no mark at all — the coordinate/path forms apply.
         case absent
         case resolved(MacScreenViewMark, MacScreenViewSnapshot)
         case refused(MacControlResult)
@@ -51,36 +49,33 @@ extension SwiftNativeMacControl {
         }
     }
 
-    /// Resolve only in the captured window. Only observed names establish
-    /// element identity; unnamed or unreadable marks need a fresh semantic target.
-    /// A row named by its own child text re-resolves by it.
+    /// Resolve only in the captured window. Only observed names establish element identity; unnamed or unreadable marks need a fresh semantic target. A row
+    /// named by its own child text re-resolves by it.
     private func liveMarkedTarget(
         _ mark: MacScreenViewMark,
-        snapshot: MacScreenViewSnapshot
+        snapshot: MacScreenViewSnapshot,
+        context: MacOperationContext
     ) throws -> MacAXActTarget? {
         guard let identity = snapshot.windowIdentity,
               identity.pid != getpid(),
-              accessibilitySource.frontmostApp()?.processIdentifier == identity.pid,
+              accessibilitySource(context: context).frontmostApp()?.processIdentifier == identity.pid,
               let label = mark.label, !label.isEmpty,
               ["title", "value", "descendant_text"].contains(mark.labelSource)
         else { return nil }
-        let windows = try accessibilityActSource.windows(pid: identity.pid)
+        let windows = try accessibilityActSource(context: context).windows(pid: identity.pid, context: context)
         guard case .matched(let window, _) = MacAXWindowIdentity.match(
             identity, among: windows.map { (handle: $0, identity: $0.identity) }
-        ), let focused = accessibilityActSource.focusedWindow(pid: identity.pid),
+        ), let focused = accessibilityActSource(context: context).focusedWindow(pid: identity.pid, context: context),
            focused.handle == window.handle,
-           let target = try accessibilityActSource.uniqueTarget(
+           let target = try accessibilityActSource(context: context).uniqueTarget(
                role: mark.role, label: label, labelSource: mark.labelSource, inWindow: window
-           ), target.enabled
+           , context: context), target.enabled
         else { return nil }
         return target
     }
 
-    /// `keystroke` — literal Unicode typing and/or key chords.
-    ///
-    /// `text` is typed first, then `keys`, so `{text:"hello", keys:"cmd+s"}`
-    /// reads in the order it happens. At least one must be present.
-    func handleKeystroke(_ body: [String: JSONValue]) async -> MacControlResult {
+    /// Type text before chords so combined input executes in the submitted order; at least one is required.
+    func handleKeystroke(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
         let rawText = body["text"]?.stringValue
         let rawKeys = body["keys"]?.stringValue
@@ -101,12 +96,11 @@ extension SwiftNativeMacControl {
                 chords = try MacKeySyntax.parseChords(rawKeys)
             }
         } catch {
-            // Parse failure is a 400, and NOTHING is emitted — a half-understood
-            // chord spec must never be partially executed.
+            // Parse failure is a 400, and NOTHING is emitted — a half-understood chord spec must never be partially executed.
             let message = (error as? MacKeySyntaxError)?.errorDescription ?? "\(error)"
             return injectionRefusal(action: "keystroke", error: message, status: 400)
         }
-        if let refusal = injectionPreconditions(action: "keystroke", requiresSink: true) {
+        if let refusal = injectionPreconditions(action: "keystroke", requiresSink: true, context: context) {
             return refusal
         }
         // Secure keyboard entry discards synthesized keys; refuse before posting rather than claiming they were typed.
@@ -121,7 +115,7 @@ extension SwiftNativeMacControl {
         }
 
         let plan = text.map { MacHandRepertoire.type(text: $0) } ?? []
-        let execution = await executeHand(plan + chords.flatMap(MacHandRepertoire.chord), action: "keystroke", body: body)
+        let execution = await executeHand(plan + chords.flatMap(MacHandRepertoire.chord), action: "keystroke", body: body, turn: turn, context: context)
         await screenViewStore.invalidate()
         if let refusal = execution.refusal { return refusal }
         return MacControlResult(
@@ -134,8 +128,7 @@ extension SwiftNativeMacControl {
                 "text_characters": .int(Int64(text?.count ?? 0)),
                 "chords": .array(chords.map { $0.toJSON() }),
                 "key_events": .int(Int64(execution.emitted)),
-                // The window server acknowledges nothing; we emitted events, we
-                // did not observe an effect.
+                // The window server acknowledges nothing; we emitted events, we did not observe an effect.
                 "verified": .bool(false),
             ]),
             error: nil,
@@ -143,12 +136,8 @@ extension SwiftNativeMacControl {
         )
     }
 
-    /// `click` — a click at a point, or a drag between two points.
-    ///
-    /// Drag form: `{from:{x,y}, to:{x,y}}` (also accepts flat
-    /// `from_x/from_y/to_x/to_y`). Point form: `{x, y}` plus optional
-    /// `button:"left"|"right"`, `count:1…3`, `double:true`.
-    func handleClick(_ body: [String: JSONValue]) async -> MacControlResult {
+    /// Point clicks and two-point drags share the same physical input owner and gates.
+    func handleClick(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
         // Marks retain the captured window; live geometry is resolved at injection.
         var markedTarget: MacScreenViewMark?
@@ -180,10 +169,12 @@ extension SwiftNativeMacControl {
 
         func point(_ key: String) -> (Double, Double)? {
             if case .object(let obj)? = body[key],
-               let x = obj["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = obj["y"]?.numberValue(coercingStrings: false, finiteOnly: true) {
+               let x = obj["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = obj["y"]?.numberValue(coercingStrings: false,
+                   finiteOnly: true) {
                 return (x, y)
             }
-            if let x = body["\(key)_x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body["\(key)_y"]?.numberValue(coercingStrings: false, finiteOnly: true) {
+            if let x = body["\(key)_x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body["\(key)_y"]?.numberValue(coercingStrings: false,
+                finiteOnly: true) {
                 return (x, y)
             }
             return nil
@@ -262,7 +253,8 @@ extension SwiftNativeMacControl {
                 "drag_steps": .int(Int64(steps)),
             ]
         } else {
-            guard let x = body["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body["y"]?.numberValue(coercingStrings: false, finiteOnly: true) else {
+            guard let x = body["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body["y"]?.numberValue(coercingStrings: false,
+                finiteOnly: true) else {
                 return injectionRefusal(
                     action: "click",
                     error: "missing required field: x,y (or from/to for a drag)",
@@ -281,24 +273,23 @@ extension SwiftNativeMacControl {
             ]
         }
 
-        if let refusal = injectionPreconditions(action: "click", requiresSink: true) {
+        if let refusal = injectionPreconditions(action: "click", requiresSink: true, context: context) {
             return refusal
         }
         var pressed = false
         var lastPosted: MacMouseEvent?
-        let execution = await executeHand(plan, action: "click", body: body) { step in
+        let execution = await executeHand(plan, action: "click", body: body, turn: turn, context: context) { step in
             guard case .mouse(var event) = step else { return nil }
             if let markedTarget, let markedSnapshot {
                 let x: Double
                 let y: Double
                 if event.phase == .up, pressed, let lastPosted {
-                    // Mouse-down may itself change the label or remove the
-                    // target. Finish that click at its accepted position.
+                    // Mouse-down may itself change the label or remove the target. Finish that click at its accepted position.
                     x = lastPosted.x
                     y = lastPosted.y
                 } else {
                     let live: MacAXActTarget?
-                    do { live = try liveMarkedTarget(markedTarget, snapshot: markedSnapshot) }
+                    do { live = try liveMarkedTarget(markedTarget, snapshot: markedSnapshot, context: context) }
                     catch { return injectionRefusal(action: "click", error: "ax_evidence_unavailable", status: 409,
                         extra: ["guidance": .string(error.localizedDescription)]) }
                     guard let target = live,
@@ -338,9 +329,8 @@ extension SwiftNativeMacControl {
         )
     }
 
-    /// `scroll` — wheel events, optionally after moving the pointer so the
-    /// scroll lands on the intended view rather than wherever the cursor sat.
-    func handleScroll(_ body: [String: JSONValue]) async -> MacControlResult {
+    /// Aim optional pointer moves before scrolling so wheel events reach the intended view.
+    func handleScroll(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
         let dy = body["dy"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
         let dx = body["dx"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
@@ -362,16 +352,17 @@ extension SwiftNativeMacControl {
             unit = parsed
         } else { unit = .line }
         let at: (Double, Double)? = {
-            guard let x = body["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body["y"]?.numberValue(coercingStrings: false, finiteOnly: true) else { return nil }
+            guard let x = body["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body["y"]?.numberValue(coercingStrings: false,
+                finiteOnly: true) else { return nil }
             return (x, y)
         }()
 
-        if let refusal = injectionPreconditions(action: "scroll", requiresSink: true) {
+        if let refusal = injectionPreconditions(action: "scroll", requiresSink: true, context: context) {
             return refusal
         }
         let plan = (at.map { [MacHandStep.mouse(MacMouseEvent(phase: .move, button: .left, x: $0.0, y: $0.1))] } ?? [])
             + MacHandRepertoire.scroll(dx: clampedX, dy: clampedY, unit: unit)
-        let execution = await executeHand(plan, action: "scroll", body: body)
+        let execution = await executeHand(plan, action: "scroll", body: body, turn: turn, context: context)
         await screenViewStore.invalidate()
         if let refusal = execution.refusal { return refusal }
 
@@ -396,11 +387,8 @@ extension SwiftNativeMacControl {
         )
     }
 
-    /// `ax_act` — THE semantic act. Target an element by the `path` that
-    /// `ax_tree`/`ax_find` handed out and run its own AX action, so the app
-    /// executes its real handler. Unreadable action names refuse with their
-    /// original evidence error; no pointer or keyboard action substitutes.
-    func handleAXAct(_ body: [String: JSONValue]) async -> MacControlResult {
+    /// Run the resolved element's advertised AX action. Unreadable action names retain their cause; pointer or keyboard input must never substitute.
+    func handleAXAct(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
         // Marks carry their captured window through to the actuator.
         var markedTarget: MacScreenViewMark?
@@ -416,9 +404,7 @@ extension SwiftNativeMacControl {
         let rawPath: [JSONValue]
         if let markedTarget {
             if let supplied = body["path"] {
-                // A mark AND a path in one call. Allowed only when they name
-                // the same element; otherwise two targets were named and there
-                // is no safe way to choose.
+                // A mark and path must name the same element; conflicting targets cannot be safely chosen between.
                 let literal: [Int]? = {
                     guard case .array(let entries) = supplied else { return nil }
                     var out: [Int] = []
@@ -483,16 +469,14 @@ extension SwiftNativeMacControl {
                 status: 400
             )
         }
-        if let refusal = injectionPreconditions(action: "ax_act", requiresSink: false) {
+        if let refusal = injectionPreconditions(action: "ax_act", requiresSink: false, context: context) {
             return refusal
         }
-        if let refusal = await attentionActionRefusal(action: "ax_act", body: body) {
+        if let refusal = await attentionActionRefusal(action: "ax_act", body: body, turn: turn, context: context) {
             return refusal
         }
-        // ax_act resolves against the FRONTMOST app; when that is ourselves
-        // the act source's own fence would refuse as path-not-found, but the
-        // reason belongs in the payload — same vocabulary as the read tools.
-        if accessibilitySource.frontmostApp()?.processIdentifier == getpid() {
+        // Refuse frontmost self-process AX acts with the same self-inspection cause as reads, before path lookup can obscure it.
+        if accessibilitySource(context: context).frontmostApp()?.processIdentifier == getpid() {
             return injectionRefusal(
                 action: "ax_act",
                 error: Self.selfInspectionError,
@@ -506,7 +490,7 @@ extension SwiftNativeMacControl {
         var resolvedTarget: MacAXActTarget?
         if let markedTarget, let markedSnapshot {
             let live: MacAXActTarget?
-            do { live = try liveMarkedTarget(markedTarget, snapshot: markedSnapshot) }
+            do { live = try liveMarkedTarget(markedTarget, snapshot: markedSnapshot, context: context) }
             catch { return injectionRefusal(action: "ax_act", error: "ax_evidence_unavailable", status: 409,
                 extra: ["guidance": .string(error.localizedDescription)]) }
             guard let target = live else {
@@ -515,8 +499,8 @@ extension SwiftNativeMacControl {
             resolvedTarget = target
         }
         let pathJSON = JSONValue.array(path.map { .int(Int64($0)) })
-        if resolvedTarget == nil, let app = accessibilitySource.frontmostApp() {
-            switch accessibilityActSource.resolve(path: path, inAppPid: app.processIdentifier) {
+        if resolvedTarget == nil, let app = accessibilitySource(context: context).frontmostApp() {
+            switch accessibilityActSource(context: context).resolve(path: path, inAppPid: app.processIdentifier, context: context) {
             case .resolved(let hit): resolvedTarget = hit
             case .unavailable(let detail):
                 return injectionRefusal(action: "ax_act", error: "ax_evidence_unavailable", status: 409,
@@ -534,14 +518,13 @@ extension SwiftNativeMacControl {
             )
         }
         let result = await MacAccessibilityActuator.act(
-            source: accessibilityActSource,
+            source: accessibilityActSource(context: context),
             target: target,
             action: requestedAction,
             value: value
-        )
+        , turn: turn, context: context)
         await screenViewStore.invalidate()
-        // Written/secure values use count+digest. Path-only calls lack the
-        // caption context needed to safely expose even an unwritten value.
+        // Written/secure values use count+digest. Path-only calls lack the caption context needed to safely expose even an unwritten value.
         let redactValue = (value?.isEmpty == false) || markedTarget == nil || markedTarget?.secret == true
             || markedTarget?.valueRedaction != nil
             || (markedTarget?.labelSource == "value" && markedTarget?.labelRedaction != nil)
@@ -576,10 +559,7 @@ extension SwiftNativeMacControl {
             "path": pathJSON,
             // Receipt fields retain the legend's contextual redaction.
             "element": elementReceipt(result.target),
-            // The post-state read is offered so the caller can CHECK
-            // whether the state changed; it is not itself a claim that it
-            // did (see `verificationState`). Its text lacks a fresh full
-            // caption context, so only count+digest can leave this read.
+            // Post-state is evidence, not verification. Without fresh caption context, its values leave only as count and digest.
             "post_state": result.postState.map {
                 elementReceipt($0, postState: true)
             } ?? .null,

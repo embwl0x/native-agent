@@ -10,7 +10,7 @@ import NativeAgentCore
 import MemoryV2
 import PersistenceCore
 
-// Blueprint: | `MacSyncEngine.swift` | Mac snapshot/inbox state, pairing write/verification phase and active chat tasks; scoped Stop is retained by the durable chat admission ledger; chat snapshots add read-only other-room exchanges beside canonical messages |
+// Blueprint: | `MacSyncEngine.swift` | Snapshot/inbox lifecycle state; durable scoped Stop and active phone turns. |
 
 // MARK: - MacSyncEngine
 
@@ -40,26 +40,19 @@ public final class MacSyncEngine: ObservableObject {
     var presenceBeatEvents: AsyncStream<Void>.Continuation?
     var presenceBeatDue: Date?
     var presenceBeatDelay = NAMacPresence.beat
-    /// Payload-free resident-state subscription. This closes the normal
-    /// cognition/organism -> iOS snapshot path; exact file observations and
-    /// explicit launch/repair reconciliation cover integrity.
+    /// Resident-state events own normal phone updates; exact files and launch/repair reconciliation protect integrity.
     var cognitionSnapshotObservationTask: Task<Void, Never>?
     var helpersSnapshotWatcher: FileChangeWatcher?
     var workActivityObservationTask: Task<Void, Never>?
     var workActivityPublicationTask: Task<Void, Never>?
-    var workActivities: [String: MobileWorkActivity] = [:]
-    /// Relays turns another door started in the anchored conversation.
     var liveTurnRelayTask: Task<Void, Never>?
-    /// Existing chat completion notifications drive one bounded transcript
-    /// projection pass. The short coalescer absorbs completion fan-out (for
-    /// example a bridge delivery plus its local refresh) without polling or
-    /// rebuilding the transcript for every notification.
+    /// Coalesce completion fan-out into one transcript pass without polling or rebuilding for each notification.
     var chatTurnCompletedObserver: NSObjectProtocol?
     /// Transcript rewrites outside turns feed the same snapshot coalescer as turn completions.
     var chatTranscriptDidChangeObserver: NSObjectProtocol?
+    var pageFacePublishedObserver: NSObjectProtocol?
     var chatTranscriptSnapshotPublicationTask: Task<Void, Never>?
     var chatSnapshotCoalescer = MacSyncChatSnapshotCoalescerState()
-    /// One exact archive-retention crossing, recalculated after each prune.
     var pruneDeadlineTask: Task<Void, Never>?
     var archiveRetentionRetryAfter: Date?
     var archiveRetentionWatcher: FileChangeWatcher?
@@ -73,8 +66,7 @@ public final class MacSyncEngine: ObservableObject {
     var snapshotWriteQueuedNeedsRepublish = false
     var snapshotWriteQueuedNeedsMemories = false
     var snapshotWriteQueuedNeedsChatTranscripts = false
-    /// Invalidates any snapshot pass suspended across stop/restart. A late pass
-    /// must never publish into a newly selected cache/container generation.
+    /// Generation fences stop late passes from publishing into a restarted cache or container.
     var snapshotLifecycleGeneration: UInt64 = 0
     /// Retained through accepted action settlement; stop closes the next admission.
     var inboxProcessingTask: Task<Void, Never>?
@@ -85,27 +77,27 @@ public final class MacSyncEngine: ObservableObject {
     var processedMsgIdsOrdered: [String] = []
 
     // Phone Stop cancels the registered task; the turn also reads its disk cancel flag.
-    /// What a remote Stop actually did to the session's in-flight chat task.
     public enum MacSyncChatCancelOutcome: String, Equatable {
         case cancelled
-        /// Leave the current run and disk markers untouched.
         case runMismatch
         case noActiveTask
     }
 
+    /// One phone message's outcome; `readBy` names the agent's turn in progress when that turn read it instead.
+    public typealias ICloudChatOutcome = (text: String, deltaSeq: Int, error: String?, toolEvents: Int,
+        attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?, readBy: String?)
+
     /// The turn's iOS correlation ID binds scoped Stop to its task within the session.
     struct ActiveChatTask {
-        let task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?), Never>
+        let task: Task<ICloudChatOutcome, Never>
         let runID: String?
     }
 
     var activeChatTasks: [String: ActiveChatTask] = [:]
-    // Stopping passive sync deliberately leaves these accepted human turns
-    // registered until their forwarder settles and unregisters the exact task.
-    // Remote Stop remains the separate explicit cancellation path.
+    // Passive stop keeps accepted turns registered until settlement; only explicit remote Stop cancels them.
 
     public func registerActiveChatTask(
-        _ task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?), Never>,
+        _ task: Task<ICloudChatOutcome, Never>,
         for sessionID: String,
         runID: String? = nil
     ) {
@@ -119,7 +111,7 @@ public final class MacSyncEngine: ObservableObject {
 
     public func unregisterActiveChatTask(
         for sessionID: String,
-        expecting task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?), Never>
+        expecting task: Task<ICloudChatOutcome, Never>
     ) {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -132,13 +124,15 @@ public final class MacSyncEngine: ObservableObject {
         activeChatTasks[sessionID]?.runID
     }
 
-    /// Cancel the session's in-flight chat task. `runIDs` are the runs the
-    /// caller believes it is stopping; when they name a run that is NOT the one
-    /// holding the session, nothing is cancelled and the caller is told so —
-    /// the stopped turn is already over and the current one is somebody else's.
+    /// The phone's Steers still waiting for the agent's turn, by conversation and run: Stop there settles them as stopped.
+    var waitingSteers: [String: [String: @Sendable () -> Void]] = [:]
+
+    /// Stop only the caller's named runs; a different run occupying the session must remain untouched.
+    /// A Stop in the conversation also stops the phone's Steers still waiting there, so none is sent again after it.
     public func cancelActiveChatTask(for sessionID: String, runIDs: [String] = []) -> MacSyncChatCancelOutcome {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noActiveTask }
+        for stop in (waitingSteers.removeValue(forKey: trimmed) ?? [:]).values { stop() }
         guard let entry = activeChatTasks[trimmed] else {
             // The action router durably retained this named Stop before task cancellation.
             guard !runIDs.isEmpty else { return .noActiveTask }

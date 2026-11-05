@@ -5,15 +5,10 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `NativeCognitionRuntime+Door.swift` | `NativeCognitionRuntime` opening and joined sleep settlement; the one lived-moment door records, prepares, folds, settles, prunes and imports held turns |
+// Blueprint: | `NativeCognitionRuntime+Door.swift` | `NativeCognitionRuntime`. |
 
-// HER LIFE HAS ONE DOOR (docs/SUBCONSCIOUS.md, "Lived moments").
-//
-// The runtime is the only owner that holds both her substrate and her body,
-// so it is the door. A settled turn is recorded here, owed, before its
-// interpretation is asked for: a quit, a crash or a failed model call then
-// loses nothing, because the journal row is the durable record of what is
-// still owed.
+// The runtime owns both substrate and body, making it the sole lived-moment entry.
+// Journal each settled turn as owed before interpretation so quit, crash or provider failure cannot lose it.
 
 extension NativeCognitionRuntime {
     public func bootstrap() async {
@@ -25,20 +20,14 @@ extension NativeCognitionRuntime {
     }
 
     private func bootstrapBody() async {
-        // Only the canonical-root runtime installs the process-wide journal sink.
-        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
-            // The sink is installed first so no entry is dropped, and every
-            // entry waits for the opening below: nothing reaches her before
-            // both owners have read her saved state.
-            await StudioJournalCognitiveBus.install { [weak self, substrate] entry in
-                await self?.bootstrap()
-                await substrate.ingestStudioJournalEntry(entry)
-            }
+        // Install this runtime's injected bus before restore; delivery joins this same bootstrap.
+        await studioJournalBus.install { [weak self, substrate] entry in
+            await self?.bootstrap()
+            await substrate.ingestStudioJournalEntry(entry)
         }
         startPursuitObservationIfNeeded()
         await refreshConfiguration()
-        // The restore, the body's restore and the refold of cut folds hold the
-        // door: no fold, Clear or Reset runs inside the opening.
+        // Restore and interrupted-fold recovery exclude folds, Clear and Reset until opening completes.
         await enterDoor()
         do {
             if let cognitiveStoreOpeningFailure {
@@ -53,11 +42,10 @@ extension NativeCognitionRuntime {
             )
         }
         await restoreOrganismContinuityIfAvailable()
-        // Turns admitted from the opening on carry the body's restored epoch,
-        // and relay judgment reads the doses the body kept.
+        // Admitted turns carry the restored body epoch; relay judgment reads retained doses.
         await syncBodyEpoch()
         await substrate.adoptRecentDoses(await organismKernel.recentDoses())
-        // A fold a crash cut is finished before ordinary admission opens.
+        // Finish interrupted folds before opening ordinary admission.
         await refoldCutMoments()
         leaveDoor()
         guard !isFlushedForTermination else { return }
@@ -77,9 +65,7 @@ extension NativeCognitionRuntime {
         await substrate.observe(wakeEvent)
         await somaticSignalBus.observe(wakeEvent)
         scheduleDirtyMicrocycle(reason: "app_wake_reconciliation")
-        // Bootstrap is her restored state, which every reader joins. The
-        // launch chores publish into that state on their own; no turn waits
-        // for a Desk replay, an inbox sweep or a trace read.
+        // Readers join restored bootstrap state; independent launch chores must not block turns.
         bootstrapChoresTask = Task { await self.bootstrapChores() }
     }
 
@@ -95,15 +81,11 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
         await rescheduleCognitionMaintenanceDeadline()
         publishRuntimeChange(reason: "bootstrap")
-        await moveMomentsIntoCaresOnce()
         guard !isFlushedForTermination, !Task.isCancelled else { return }
         await liveOwedMomentsAtWake()
     }
 
-    /// SLEEP (docs/STOP.md, docs/SUBCONSCIOUS.md "Lived moments"): one
-    /// joinable operation. Every caller (the async quit hold, the termination
-    /// drain) joins the same settlement; it runs through `settle {}`, so a
-    /// cancelled caller still waits for it, and its result says what landed.
+    /// All sleep callers join one settlement through settle so cancellation cannot abandon it; the result records what landed.
     public func sleep() async -> NativeCognitionSleepOutcome {
         if let sleepTask { return await sleepTask.value }
         isFlushedForTermination = true
@@ -115,10 +97,9 @@ extension NativeCognitionRuntime {
     }
 
     private func sleepSettlement() async -> NativeCognitionSleepOutcome {
-        // Latch shutdown so a delayed wake re-anchor
-        // cannot resurrect the deadline timers this flush is about to cancel.
+        // Latch shutdown so a delayed wake cannot resurrect cancelled deadlines.
         isFlushedForTermination = true
-        // Restore may finish during sleep, but cannot open new producers.
+        // Restore may finish during sleep but cannot open new producers.
         await bootstrapTask?.value
         sourceWakes.cancelObservations()
         let producers = [rhythm.observation, rhythm.refresh, bootstrapChoresTask, studioWanderTask,
@@ -129,7 +110,7 @@ extension NativeCognitionRuntime {
             sourceWakes.reachObservation, sourceWakes.clockObservation, sourceWakes.careObservation]
         for producer in producers { producer?.cancel() }
         for producer in producers { await producer?.value }
-        // Durable replay owns its exit. Sleep joins it without cancelling a commit.
+        // Join durable replay without cancelling its commit.
         await eventReplayTask?.value
         await replayTask?.value
         settleRhythmForSleep()
@@ -148,11 +129,8 @@ extension NativeCognitionRuntime {
         pursuitRefreshTask = nil
         residualDeadline.invalidate()
         cognitionDeadline.invalidate()
-        // Quiesce the two remaining unstructured re-arm sources. A
-        // 0.25s-debounced dirty microcycle or a pending replay retry could
-        // otherwise commit — and re-arm a deadline this flush just cancelled —
-        // AFTER the terminal snapshot below. The reschedule bodies also honor
-        // `isFlushedForTermination` so any survivor no-ops instead of re-arming.
+        // Quiesce dirty microcycles and replay retries before the terminal snapshot so they cannot commit or rearm afterward.
+        // Reschedule paths must also honor termination.
         microcycleTimer.cancel()
         replayRetryTask = nil
         reflectionEventTask = nil
@@ -167,35 +145,30 @@ extension NativeCognitionRuntime {
             summary: "NativeAgent app is terminating",
             importance: 0.35
         )
-        // Only an opened owner may save its state (docs/STOP.md).
+        // Only a successfully opened owner may save its state.
         guard bootstrapTask != nil else {
-            return NativeCognitionSleepOutcome(substrate: "not opened: nothing of hers was written",
-                                               body: "not opened: nothing of hers was written", unlivedMoments: nil)
+            return NativeCognitionSleepOutcome(substrate: "not opened: nothing of the agent's was written",
+                                               body: "not opened: nothing of the agent's was written", unlivedMoments: nil)
         }
-        // appSleep is the terminal transition, lived once, after the folds.
-        // Degraded open: a part whose restore failed saves nothing (its writes
-        // stay blocked) and says so; the part that restored still saves.
+        // Record appSleep once after folds; failed restores stay write-blocked while independently restored parts still save.
         var substrateResult = "saved"
         if bootstrapFailure == nil {
             await substrate.observe(sleepEvent)
             do { _ = try await substrate.runMaintenanceChecked(reason: "app termination") } catch {
                 substrateResult = "maintenance not saved: \(error)"
             }
-            // One checked final flush of affect AND nodes; the outcome is it.
+            // One checked final flush owns the affect and node outcome.
             do { try await substrate.persistAffectAndNodes() } catch {
                 substrateResult += "; checkpoint not saved: \(error)"
             }
         } else {
-            substrateResult = "not saved: her substrate's restore failed this session"
+            substrateResult = "not saved: the agent's substrate restore failed this session"
         }
         await somaticSignalBus.observe(sleepEvent)
         let bodySaved = await persistOrganismContinuity(reason: "app termination")
-        // Termination is the runtime-owned snapshot point for provider vitals.
-        // It follows lifecycle settlement so the final observed row
-        // cannot be excluded by an early snapshot.
+        // Snapshot provider vitals after lifecycle settlement so the final event cannot be omitted.
         await persistProviderVitalsSnapshot()
-        // What did not land is the journal's own unlived rows; the next wake
-        // lives them.
+        // Unlived journal rows remain owed for the next wake.
         let unlived = try? await cognitiveStore?.unlivedMomentCount()
         let outcome = NativeCognitionSleepOutcome(
             substrate: substrateResult,
@@ -208,7 +181,6 @@ extension NativeCognitionRuntime {
         return outcome
     }
 
-    /// The door as the interpretation owner reaches it.
     func livedMomentDoor() -> LivedMomentDoor {
         LivedMomentDoor(
             dataRoot: dataRoot,
@@ -226,9 +198,8 @@ extension NativeCognitionRuntime {
         )
     }
 
-    /// Record a settled turn as owed. Its identity is its origin (session +
-    /// incoming message), so a re-delivery records nothing new. Returns nil when
-    /// the journal cannot record it; no unrecorded turn can fold into her.
+    /// Journal identity follows session plus incoming message so redelivery cannot duplicate a moment.
+    /// Failure to record leaves repair owed; an unrecorded turn cannot fold.
     func recordOwedMoment(_ turn: CognitiveMomentTurn) async -> String? {
         await bootstrap()
         guard let messageId = turn.messageId, !messageId.isEmpty else { return nil }
@@ -248,8 +219,7 @@ extension NativeCognitionRuntime {
         else { admission = nil }
         let current = await substrate.forgettingEpochs()
         if turn.isCareWake {
-            // A care wake's own admission is its captured arrival and reply;
-            // it owes care reading, not an ordinary incoming-word appraisal.
+            // A care wake owes care reading from its captured arrival and reply, not an ordinary incoming-word appraisal.
             let event = CognitiveEvent(id: id, kind: .userMessageReceived,
                 subject: CognitiveSubjectReference(type: "turn", id: messageId),
                 sourceClass: .observed, occurredAt: turn.occurredAt ?? now(),
@@ -274,8 +244,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Read the recorded entry directly. Save the caring evidence the judgment
-    /// sees with that entry; the fold needs no separate sealed-request record.
+    /// Keep the judgment's caring evidence on its journal entry so the fold needs no second sealed-request store.
     func prepareMoment(_ id: String, origin: AfterTurnOrigin, reply: String) async -> AfterTurnContext? {
         await bootstrap()
         guard let cognitiveStore, var row = await readMoment(id),
@@ -307,10 +276,7 @@ extension NativeCognitionRuntime {
         return context
     }
 
-    /// The interpretation came back: written onto the row before any part of
-    /// her applies it. A quit or crash from here folds it at the next wake
-    /// without asking the model again.
-    /// True only when the meaning is durable; a fold begins only then.
+    /// Persist meaning before applying it so interrupted folds can resume without another model judgment.
     func markMomentMeant(_ id: String, meaning: JSONValue) async -> Bool {
         guard let cognitiveStore, var row = await readMoment(id) else { return false }
         if row.state == .meant { return row.meaning == meaning }
@@ -327,7 +293,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Settle a moment lived or refused (payloads dropped, identity kept).
+    /// Drop settled payloads but retain identity for deduplication.
     func settleMoment(_ id: String, as state: CognitiveMomentState, reason: String? = nil) async {
         if state == .lived {
             guard let row = await readMoment(id), row.state == .meant,
@@ -339,8 +305,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Moments of this life still owed or meant. A row from another life (a
-    /// backup restore began a new one) is refused on the way.
+    /// Refuse moments from another life so backup restoration cannot replay old effects into a new one.
     func unlivedMoments() async -> [CognitiveLivedMoment]? {
         await bootstrap()
         let life: String
@@ -356,28 +321,21 @@ extension NativeCognitionRuntime {
         return live
     }
 
-    /// THE FOLD (docs/SUBCONSCIOUS.md, "Lived moments"): one moment, once, in
-    /// the order the door folds it. The moment's fold seq is assigned (once; a
-    /// refold keeps it), the mind's share is lived by the substrate and the
-    /// body's whole share by the kernel in one call, each piece stamped with
-    /// the seq and saved. A refold leaves every piece already at the seq
-    /// alone. True when every piece landed (a piece its owner refuses, her
-    /// inner life or body off, lands as nothing); false leaves the row meant,
-    /// folded again. An unrecorded turn has no fold.
+    /// Assign each fold one sequence and apply it to substrate and body under the door; refolds skip pieces already stamped.
+    /// Only fully landed or owner-refused shares settle the row; incomplete shares remain meant for another fold.
+    /// Unrecorded turns cannot fold.
     func foldTurnMoment(_ context: AfterTurnContext, interpretation: AfterTurnInterpretation?,
                         momentID: String?) async -> Bool {
-        // Nothing changes her before she wakes.
+        // Nothing mutates the agent before wake completes.
         await bootstrap()
-        // THE DOOR IS THE HOLD: one fold at a time, exclusive with Clear,
-        // Reset Body and restore. The seq is allocated and every part applied
-        // inside it, so no other producer's seq can overtake this one.
+        // Serialize folds with Clear, Reset and restore so another sequence cannot overtake a partially applied fold.
         await enterDoor()
         defer { leaveDoor() }
         return await foldInsideDoor(context, interpretation: interpretation,
                                     momentID: momentID)
     }
 
-    /// Enter the door: wait while a fold, Clear, Reset Body or restore holds it.
+    /// Wait while a fold, Clear, Reset or restore owns the door.
     func enterDoor() async {
         while doorHeld {
             let done = doorDone
@@ -386,14 +344,14 @@ extension NativeCognitionRuntime {
         doorHeld = true
     }
 
-    /// Leave the door; every waiter re-checks it.
+    /// Waiters must recheck ownership after the door is released.
     func leaveDoor() {
         doorHeld = false
         doorDone.resume()
         doorDone = ScopedWaiter()
     }
 
-    /// The fold itself, for a caller that already holds the door.
+    /// The caller must already hold the door.
     func foldInsideDoor(_ context: AfterTurnContext, interpretation: AfterTurnInterpretation?,
                         momentID: String?) async -> Bool {
         guard let momentID, let cognitiveStore, let interpretation,
@@ -404,14 +362,13 @@ extension NativeCognitionRuntime {
             guard let assigned = try await cognitiveStore.beginFold(momentID) else { return false }
             seq = assigned
         } catch {
-            // The row stays meant until its once-only proof can be assigned.
+            // Keep the row meant until its once-only proof can be assigned.
             nativeLog("cognition: moment %@ fold not begun: %@", momentID, String(describing: error))
             return false
         }
-        // The caring receipt is a projection of the first fold; a refold never
-        // writes or relabels it.
+        // A caring receipt reflects the first fold; refolds cannot rewrite or relabel it.
         if row.foldSeq == nil, let request = context.caring {
-            await caringReceiptLog.record(request, model: interpretation.model,
+            await caringReceiptLog.record(request, heard: row.input?.turn?.turnId ?? "", model: interpretation.model,
                 surface: interpretation.surface, verdict: interpretation.caring)
         }
         let mind = await substrate.foldTurn(
@@ -425,8 +382,7 @@ extension NativeCognitionRuntime {
             enriched.metadata.merge(mind.reaction) { _, new in new }
             reaction = CognitiveSomaticSignals.signal(from: enriched, id: UUID())
         }
-        // A retained correction from the person raises confidence according to
-        // the recorded interpretation's correction decision.
+        // Use only the retained interpretation's correction decision to raise confidence from a person's correction.
         let corrected = context.careWakes.isEmpty && context.event.sourceClass != .imported && interpretation.memories.contains(where: {
             $0.kind == "correction" && $0.action != .skip && $0.confidence >= MemoryManagerLane.confidenceFloor
         })
@@ -444,9 +400,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// The body's whole share in one kernel call, saved. The caring receipt
-    /// learns what the body did; an already-lived share leaves it as the
-    /// first fold wrote it. False only when its save failed.
+    /// Save the body's whole share in one call; preserve first-fold receipt evidence on replay and report failed saves as incomplete.
     private func foldBody(_ fold: OrganismTurnFold) async -> Bool {
         guard !fold.isEmpty else { return true }
         let outcome = await organismKernel.foldTurn(fold)
@@ -479,11 +433,8 @@ extension NativeCognitionRuntime {
         return saved
     }
 
-    /// At the opening, before ordinary admission (the caller holds the door):
-    /// a fold that began and did not finish (a meant row with a fold seq) is
-    /// folded again from its record and meaning, before any newer fold can
-    /// stamp a piece past it. Pieces already at its seq are left alone; its
-    /// facts and `lived` are the interpretation owner's drain after the opening.
+    /// Recover interrupted sequenced folds before newer admission so later stamps cannot overtake unfinished pieces.
+    /// Skip pieces already at the sequence; the interpretation owner drains facts and lived settlement after opening.
     func refoldCutMoments() async {
         guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL,
               let life = try? DataRootLife.current(in: dataRoot) else { return }
@@ -504,14 +455,10 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// How long a SETTLED moment's identity is kept: long past any
-    /// re-delivery of the same message (a producer records at transcript
-    /// settlement, within seconds),
-    /// so the journal never grows forever. An unsettled row is kept however old.
+    /// Retain settled identity beyond redelivery while bounding journal growth; unsettled rows never expire.
     static let settledMomentRetention: TimeInterval = 30 * 24 * 60 * 60
 
-    /// At her wake, settled rows past retention are pruned, then what a quit,
-    /// crash or failed call left owed or meant is lived.
+    /// Prune only settled expired rows; owed and meant moments survive for wake recovery.
     func liveOwedMomentsAtWake() async {
         guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else { return }
         do {
@@ -522,22 +469,19 @@ extension NativeCognitionRuntime {
         await AdaptiveMemoryPromoter.shared.drainOwedMomentsAtWake()
     }
 
-    /// A turn the journal could not record cannot change her: it owes repair
-    /// (Doctor shows it, naming the turn and why), and the receipt is still
-    /// attempted.
+    /// An unrecorded turn cannot change the agent; retain a named repair obligation and still attempt its receipt.
     func noteMomentUnrecorded(_ id: String, why: String) async {
         nativeLog("cognition: lived moment %@ not recorded, not folded: %@", id, why)
         RepairOwed.owe(dataRoot, id: "cognition.moment.unrecorded:" + id, kind: .run,
             evidence: [.init(source: "lived_moments", id: id)],
             operation: "cognition.moment.unrecorded", owner: "cognition",
-            words: "A settled turn (\(id)) could not be recorded in her journal, so it has not changed her: \(String(why.prefix(240)))")
+            words: "A settled turn (\(id)) could not be recorded in the agent's journal, so it has not changed the agent: \(String(why.prefix(240)))")
         await substrate.recordReceipt(kind: "lived_moment.unrecorded", payload: .object([
             "moment": .string(id), "why": .string(String(why.prefix(240))),
         ]))
     }
 
-    /// A stored meaning must also decode as the interpretation owner's type.
-    /// Valid JSON with the wrong shape is damage, never an invitation to judge again.
+    /// Wrong-shaped stored meaning is damage, never permission to judge again.
     private func checkedMeaning(_ row: CognitiveLivedMoment) async throws -> CognitiveLivedMoment? {
         if let meaning = row.meaning, AdaptiveMemoryPromoter.decodedMeaning(meaning) == nil {
             try await cognitiveStore?.refuseUnreadableMoment(row.id, why: "meaning_json: invalid interpretation shape")
@@ -581,8 +525,7 @@ extension NativeCognitionRuntime {
     }
 }
 
-/// What her sleep settled: each part's final save, and how many moments the
-/// journal still holds unlived for the next wake (nil when it could not say).
+/// Report final saves and unlived journal count; nil means the count could not be read.
 public struct NativeCognitionSleepOutcome: Sendable, Equatable {
     public let substrate: String
     public let body: String

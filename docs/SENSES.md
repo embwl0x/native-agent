@@ -31,9 +31,11 @@ Senses owners, with the helper under [Sense Helper Boundary](ARCHITECTURE_BLUEPR
 `Sources/NativeAgentApp/SensesAssembly.swift`. Repository workflow and
 validation belong to [AGENTS.md](../AGENTS.md).
 
-Raw source callbacks re-enter the existing gates with the invoking turn's
-surface, verified session and file-access task locals; background reads borrow
-no chat session or write permission.
+Raw source callbacks re-enter the existing gates with the invoking `Turn` and
+explicit read operation, carrying its surface, verified session and file access.
+Each structured execution starts its own sense-read ledger; nested reads share
+that ledger through dispatch and after-turn memory. Background reads hold no
+turn, action callback, chat session or write permission.
 
 A named-app look can successfully observe absence: `status:"ok"`, `app:<name>`,
 `running:false`, or `running:true` with `windows:0` and cheaply readable `menus`.

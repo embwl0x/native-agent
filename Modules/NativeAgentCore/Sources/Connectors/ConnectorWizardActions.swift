@@ -3,21 +3,16 @@ import ProviderRouting
 import PersistenceCore
 import TrustCenter
 import ChatToolRuntime
-// Blueprint: | `ConnectorWizardActions.swift` | `ConnectorWizardSetupRoute`: the wizard's token route, read from the inline card registry; registry row read |
+// Blueprint: | `ConnectorWizardActions.swift` | `ConnectorWizardSetupRoute`: wizard and inline cards share the setup registry |
 
 public enum ConnectorWizardSetupRoute: Equatable, Sendable {
     case manualToken
     case unavailable
 
-    /// One table, in `InlineInteractionRegistry`. The wizard and the inline
-    /// card must never disagree about how an account is connected: a card that
-    /// offers a sign-in while the wizard wants a pasted token is a lie the
-    /// person only discovers after tapping. The registry answers which route
-    /// applies.
+    /// The inline registry also owns wizard routing so both surfaces offer the same way to connect.
     public static func resolve(provider: String) -> Self {
         let canonical = InlineInteractionRegistry.canonicalConnectorID(provider)
         switch InlineInteractionRegistry.connectorSetup(for: canonical) {
-        // Telegram has no wizard page; only Slack's token paste.
         case .manualToken where canonical == "slack": return .manualToken
         case .manualToken, .unavailable: return .unavailable
         }

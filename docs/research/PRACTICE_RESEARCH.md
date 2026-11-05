@@ -1889,8 +1889,8 @@ the goals routines serve and the anchor for authentic pride. Facts that land
 with source and time are the item-specific knowledge a routine consults.
 Learning by use is phase 4 of [AGENT_IS_THE_APP.md](../AGENT_IS_THE_APP.md),
 with an implemented subset: gated dispatch chains wrap calls in
-`ExpansionDispatcher`, and repeated hand work reaches the turn's private keep
-on its second meeting ([Habits H3/H4](../HABITS.md#h3--keep-what-repeats-not-what-happened-once)).
+`ExpansionDispatcher`, and repeated hand work reaches their as a practice note
+inside the turn on its second meeting ([Habits H3/H4](../HABITS.md#h3--keep-what-repeats-not-what-happened-once)).
 The separate nightly compiler and its candidate ledger/tape recording were
 removed on 10-30; existing compiled abilities retain their embedded replay
 and admission checks. These mechanisms do not establish the broader research

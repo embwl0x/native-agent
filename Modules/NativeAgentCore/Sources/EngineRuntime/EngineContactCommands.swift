@@ -1,6 +1,7 @@
 import ChatTurnRuntime
 import ApprovalTransactions
 import ChatTurnContracts
+import ChatToolRuntime
 import AgentConversations
 import AgentWorkspace
 import Foundation
@@ -10,31 +11,26 @@ import Cognition
 import ContextFlow
 import PersonaEngine
 import PersistenceCore
-// Blueprint: | `EngineContactCommands.swift` | Person-initiated sends and exact-record, original-scope Stop through engine dispatch; held-message withdrawal returns its checked canonical mutation; core bridge/A2A construction over the injected engine |
+// Blueprint: | `EngineContactCommands.swift` | Person-initiated sends, original-scope Stop and held-message withdrawal |
 
-/// The person's own message to a contact, from its thread: the same
-/// agent_message machinery the agent uses (peer resolution, transports,
-/// receipts, AgentConversationStore), through the same gated chain, marked as
-/// the person's by `PersonInitiatedSend`. This is the only place that mark is
-/// made, and only a composer click or Return reaches it.
+/// Only composer click or Return marks `PersonInitiatedSend`; person-authored sends still traverse the shared gated contact machinery.
 extension NativeAgentEngine {
-    /// Nil when the message went; otherwise why not, in plain words.
-    public func sendContactMessage(agent: String, text: String, session: String, root: URL, conversation: String? = nil) async -> String? {
+    public func sendContactMessage(agent: String, text: String, session: String, root: URL, conversation: String? = nil,
+                                   turn: Turn) async -> String? {
         let tools = toolDispatchClient(enforceAppAutonomy: false)
-        // No approval filer: nothing here can raise a card the thread can't show.
+        // No approval filer: this thread cannot show a raised card.
         let chain = makeGatedToolDispatchClient(tools: tools, fileAccess: "auto", dataRoot: root, verifiedSessionId: session)
         var input: [String: JSONValue] = ["agent": .string(agent), "text": .string(text)]
         if let conversation { input["conversation"] = .string(conversation) }
         let sendInput = input
+        // The composer or verified phone ingress owns the origin; a shared send never makes it local.
+        var turn = turn
+        turn.verifiedSessionID = session
+        turn.personInitiatedSend = PersonInitiatedSend(agent: agent, text: text)
         do {
-            let result = try await PersonInitiatedSend.$current.withValue(PersonInitiatedSend(agent: agent, text: text)) {
-                try await ChatToolSessionContext.$verifiedSessionId.withValue(session) {
-                    try await chain.dispatch(tool: "agent_message",
-                        input: sendInput, surface: "chat")
-                }
-            }
+            let result = try await chain.dispatch(tool: "agent_message", input: sendInput, surface: "chat", turn: turn, invocation: .init())
             guard case .object(let fields) = result else { return "Nothing came back from the send." }
-            // Queued behind the reply in progress: accepted, it goes by itself.
+            // Accepted follow-ups remain queued behind the in-flight reply.
             if fields["queued"] == .bool(true) { return nil }
             if fields["sent"] == .bool(true), fields["state"] != .string("attention") { return nil }
             if case .string(let detail)? = fields["detail"], !detail.isEmpty { return detail }
@@ -44,17 +40,16 @@ extension NativeAgentEngine {
         }
     }
 
-    /// The person's Stop on the reply in flight: `agent_cancel` through the
-    /// same chain. Nil when the thread recorded the stop (stopping, stopped,
-    /// released, cannot_stop or finished; shown from the record); otherwise why not.
+    /// Use the shared cancellation chain; return nil only when the thread records its stop outcome.
     public func stopContactMessage(agent: String, record: String, session: String, root: URL) async -> String? {
         let tools = toolDispatchClient(enforceAppAutonomy: false)
         let chain = makeGatedToolDispatchClient(tools: tools, fileAccess: "auto", dataRoot: root, verifiedSessionId: session)
+        var turn = Turn(session: session)
+        turn.envelope = .personOnMac("mac_ui:contact.stop")
+        turn.verifiedSessionID = session
         do {
-            let result = try await ChatToolSessionContext.$verifiedSessionId.withValue(session) {
-                try await chain.dispatch(tool: "agent_cancel",
-                    input: ["agent": .string(agent), "conversation": .string(record)], surface: "chat")
-            }
+            let result = try await chain.dispatch(tool: "agent_cancel",
+                input: ["agent": .string(agent), "conversation": .string(record)], surface: "chat", turn: turn, invocation: .init())
             guard case .object(let fields) = result else { return "Nothing came back from the stop." }
             if fields["stop_state"] != nil { return nil }
             if case .string(let detail)? = fields["detail"], !detail.isEmpty { return detail }
@@ -64,17 +59,18 @@ extension NativeAgentEngine {
         }
     }
 
-    /// Takes a held message off its thread once it has been sent again.
     @discardableResult
     public func withdrawContactMessage(_ item: String, record: String, root: URL) async throws -> AgentConversationRecord {
         try await Task.detached(priority: .userInitiated) {
             let store = AgentConversationStore(dataRoot: root)
             guard let row = try store.records().first(where: { $0.id == record }) else {
-                throw ToolFailureError("The held message's conversation is unavailable. Preserve its saved record and repair the conversation store.", effects: .none)
+                throw ToolFailureError("The held message's conversation is unavailable. Preserve its saved record and repair the conversation store.",
+                    effects: .none)
             }
             return try store.update(id: record, operationID: row.operationID, touch: false) {
                 if let queued = $0.queued?.first(where: { $0.id == item }), queued.held == nil {
-                    throw ToolFailureError("The old message is no longer held; its current state was preserved. Read the conversation before changing it.", effects: .none)
+                    throw ToolFailureError("The old message is no longer held; its current state was preserved. Read the conversation before changing it.",
+                        effects: .none)
                 }
                 $0.queued?.removeAll { $0.id == item && $0.held != nil }
                 if $0.queued?.isEmpty == true { $0.queued = nil }

@@ -6,12 +6,7 @@ import PersistenceCore
 import TrustCenter
 import MacControl
 import NativeAgentCore
-// Blueprint: | `ChromeControlRuntime.swift` | `ChromeControlRuntime`: one actor and stored state; authenticated listener/relay attach, authority, channel dispatch and connection streams; listener identities fence late work; transport stop retires passive observations, reconciliation rearms them and terminal stop closes admission/streams; only explicit tab.close removes tabs, shutdown/reload leave them open |
-
-// No origin is a transport-level caller, never permission for a Chrome effect.
-public enum ChromeControlInvocationContext {
-    @TaskLocal public static var origin: SecurityOriginContext? = nil
-}
+// Blueprint: | `ChromeControlRuntime.swift` | `ChromeControlRuntime`; Listener-fenced relay lifecycle and effect authority. |
 
 public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case disabled
@@ -40,8 +35,7 @@ public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatabl
         }
     }
 
-    /// Transport-owned evidence. Dispatched mutations use outcomeUnknown;
-    /// a missing connection cannot have read a page or emitted an action.
+    /// Transport-owned evidence. Dispatched mutations use outcomeUnknown; a missing connection cannot have read a page or emitted an action.
     public var failureEffects: ToolFailureError.Effects? {
         switch self {
         case .outcomeUnknown: .unknown
@@ -62,7 +56,6 @@ public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatabl
         case .invalidResponse: return "Chrome returned an invalid control response."
         case .requestTimedOut: return "Chrome did not answer before the control deadline."
         case .extensionRejected(let code, let message):
-            // Name the next call when the refusal has one.
             let next: String = switch code {
             case "tab_not_owned": " browser.chrome_navigate{url} opens a new tab in the NativeAgent group."
             case "tab_strip_locked": " Ask the person to finish the drag or restart Chrome; do not repeat the call."
@@ -72,7 +65,10 @@ public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatabl
             }
             return "Chrome refused the control request (\(code)): \(message)" + next
         case .outcomeUnknown(let action, let reason):
-            return "Chrome did not confirm \(action) after dispatch. \(reason) The action may have completed; do not automatically repeat it. Observe the page before retrying."
+            return """
+                Chrome did not confirm \(action) after dispatch. \(reason) The action may have completed; do not automatically repeat it. Observe the page \
+                before retrying.
+                """
         case .socketFailure(let code): return "Chrome control socket failed (errno \(code))."
         case .socketPathTooLong: return "Chrome control socket path is too long."
         case .relayUnavailable: return "The bundled NativeAgent Chrome relay is unavailable."
@@ -84,7 +80,7 @@ public enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatabl
 }
 
 public enum ChromeControlEffect: String, Sendable, CaseIterable {
-    // Existing protocol greeting, used by the transport only; no new app action.
+    // Transport greeting alone grants no app action.
     case attach
     case reloadExtension = "extension.reload"
     case closeTab = "tab.close"
@@ -130,7 +126,8 @@ public enum ChromeControlConnectionState: Sendable, Equatable {
 }
 
 public actor ChromeControlRuntime {
-    public typealias Authority = @Sendable () async throws -> Void
+    public static let connectionDidChange = Notification.Name("NativeAgent.chromeConnectionDidChange")
+    public typealias Authority = @Sendable (SecurityOriginContext?, Turn?) async throws -> Void
 
     private let authority: Authority
     var transportAuthorityFailure: (any Error)?
@@ -161,7 +158,6 @@ public actor ChromeControlRuntime {
     var rememberedTabIDs: [String: Int64] = [:]
     var conversationTabsStorageError: String?
     var groupTabs: [Int64: ChromeConversationTab] = [:]
-    // Diagnostic evidence for this app run, across relay/extension reconnects.
     var releasedTabs: [JSONValue] = []
     var busyConversations: Set<String> = []
     private var connectionObservers: [UUID: AsyncStream<ChromeControlConnectionState>.Continuation] = [:]
@@ -207,6 +203,7 @@ public actor ChromeControlRuntime {
         let state = connectionState
         BrowserConnectionMirror.set(connected: state == .connected)
         for observer in connectionObservers.values { observer.yield(state) }
+        NotificationCenter.default.post(name: Self.connectionDidChange, object: nil)
     }
 
     private func connectionEnded(installation: UInt64) {
@@ -235,12 +232,12 @@ public actor ChromeControlRuntime {
     public init(
         socketPath: String = ChromeControlRuntime.defaultSocketPath(),
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        // NativeAgentSecondaryInstall leaves the Mac's native-host registration with the primary install.
+        // Secondary installs must preserve the primary install's native-host registration.
         manageNativeHostRegistration: Bool = !UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall"),
         signatureFailureNote: @escaping @Sendable (String, String) async throws -> Void = { _, message in nativeLog("[NativeAgent] %@", message) },
-        authority: @escaping Authority = {
+        authority: @escaping Authority = { origin, turn in
             try await SwiftNativeTrustCenter(dataRoot: PersistenceCore.defaultDataRoot())
-                .authorizeChromeControlEffect(origin: ChromeControlInvocationContext.origin)
+                .authorizeChromeControlEffect(origin: origin, turn: turn)
         }
     ) {
         self.socketPath = socketPath
@@ -262,8 +259,8 @@ public actor ChromeControlRuntime {
         }
     }
 
-    func authorizeEffect() async throws {
-        do { try await authority() }
+    func authorizeEffect(origin: SecurityOriginContext?, turn: Turn?) async throws {
+        do { try await authority(origin, turn) }
         catch ChromeControlAuthorityError.disabled {
             throw ChromeControlRuntimeError.disabled
         } catch {
@@ -281,7 +278,7 @@ public actor ChromeControlRuntime {
         }
         let origin = SecurityOriginContext(surface: "chat", source: "chrome_transport", isRemote: false)
         do {
-            try await ChromeControlInvocationContext.$origin.withValue(origin) { try await authorizeEffect() }
+            try await authorizeEffect(origin: origin, turn: nil)
             guard !runtimeStopped else {
                 transportAuthorityFailure = ChromeControlRuntimeError.disconnected
                 return false
@@ -294,7 +291,7 @@ public actor ChromeControlRuntime {
         }
     }
 
-    public func reconcilePolicy() async {
+    public func reconcilePolicy( context: MacOperationContext) async {
         guard !runtimeStopped else { return }
         policyGeneration &+= 1
         let generation = policyGeneration
@@ -304,7 +301,7 @@ public actor ChromeControlRuntime {
             await stopLocked()
             guard generation == policyGeneration else { return }
             if let failure = transportAuthorityFailure as? ToolFailureError {
-                OrganPulse.record("chrome_relay", .skipped, note: failure.message)
+                OrganPulse.record("chrome_relay", .failed, note: failure.message)
             } else {
                 if manageNativeHostRegistration { try? ChromeNativeHostRegistration.uninstall() }
                 OrganPulse.recordOff("chrome_relay", because: "Chrome control is turned off")
@@ -312,9 +309,9 @@ public actor ChromeControlRuntime {
             return
         }
         do {
-            try startListenerIfNeeded()
+            try startListenerIfNeeded( context: context)
             if manageNativeHostRegistration { try ChromeNativeHostRegistration.install() }
-            readExtensionFiles()
+            readExtensionFiles( context: context)
             await observeBrowserLaunches()
             guard !runtimeStopped, generation == policyGeneration else { return }
             OrganPulse.record("chrome_relay", .worked, note: "listening")
@@ -324,35 +321,36 @@ public actor ChromeControlRuntime {
         }
     }
 
-    public func existingPageAddress(host: String, tabID: Int64? = nil) async throws -> [String: JSONValue] {
+    public func existingPageAddress(host: String, tabID: Int64? = nil, context: MacOperationContext) async throws -> [String: JSONValue] {
         guard await transportAvailable() else { throw transportAuthorityFailure! }
-        guard let channel = readyChannel else { throw await connectionFailure() }
+        guard let channel = readyChannel else { throw await connectionFailure( context: context) }
         return try await channel.existingPageAddress(host: host, tabID: tabID)
     }
 
-    public func pageChanges(host: String, tabID: Int64) async throws -> AsyncThrowingStream<JSONValue, Error> {
+    public func pageChanges(host: String, tabID: Int64, context: MacOperationContext) async throws -> AsyncThrowingStream<JSONValue, Error> {
         guard await transportAvailable() else { throw transportAuthorityFailure! }
-        guard let channel = readyChannel else { throw await connectionFailure() }
+        guard let channel = readyChannel else { throw await connectionFailure( context: context) }
         return try await channel.pageChanges(host: host, tabID: tabID)
     }
 
     func performOnChannel(
-        _ effect: ChromeControlEffect, payload: [String: JSONValue]
+        _ effect: ChromeControlEffect, payload: [String: JSONValue],
+        turn: Turn, context: MacOperationContext
     ) async throws -> (response: JSONValue, channel: ChromeControlChannel) {
-        if MacDriverContext.binding == nil {
+        if context.driver == nil {
             let binding = try await MacAttentionSessionStore.shared.bindDriver()
             return try await withTaskCancellationHandler {
-                try await MacDriverContext.$binding.withValue(binding) {
-                    try await performOnChannel(effect, payload: payload)
+                try await context.holding(\.driver, binding) { context in
+                    try await performOnChannel(effect, payload: payload, turn: turn, context: context)
                 }
             } onCancel: { binding.cancel() }
         }
         if effect.requiresEffectTimeAuthorization {
-            try await authorizeEffect()
+            try await authorizeEffect(origin: turn.chromeOrigin, turn: turn)
         }
-        if channel != nil, readyChannel == nil { throw await connectionFailure() }
-        guard let connection = readyChannel else { throw await connectionFailure() }
-        return (try await connection.request(action: effect, payload: payload), connection)
+        if channel != nil, readyChannel == nil { throw await connectionFailure( context: context) }
+        guard let connection = readyChannel else { throw await connectionFailure( context: context) }
+        return (try await connection.request(action: effect, payload: payload, context: context), connection)
     }
 
     public func stop() async {
@@ -365,8 +363,7 @@ public actor ChromeControlRuntime {
         await stopLocked()
     }
 
-    /// Registered before the handshake so `stopLocked` can reach the socket
-    /// while it is still being read. False means this listener is already gone.
+    /// Register before handshake so stop can reach a socket still being read; refuse a retired listener.
     private func beginHandshake(_ descriptor: Int32, generation: UInt64) -> Bool {
         guard generation == listenerGeneration else { return false }
         handshakingDescriptors[descriptor] = generation
@@ -379,7 +376,7 @@ public actor ChromeControlRuntime {
         await stopLocked()
     }
 
-    private func finishHandshake(_ descriptor: Int32, generation: UInt64, rejection: String?, browserPID: pid_t?) async {
+    private func finishHandshake(_ descriptor: Int32, generation: UInt64, rejection: String?, browserPID: pid_t?, context: MacOperationContext) async {
         guard handshakingDescriptors[descriptor] == generation else { return }
         handshakingDescriptors.removeValue(forKey: descriptor)
         guard generation == listenerGeneration else {
@@ -395,15 +392,14 @@ public actor ChromeControlRuntime {
         }
         facts.relayConnectedAt = Date()
         recordHandshake("relay_accepted")
-        await installAcceptedDescriptor(descriptor, generation: generation, browserPID: browserPID)
+        await installAcceptedDescriptor(descriptor, generation: generation, browserPID: browserPID, context: context)
     }
 
-    private func startListenerIfNeeded() throws {
+    private func startListenerIfNeeded( context: MacOperationContext) throws {
         // A stopped runtime never recreates its socket, credential or registration.
         guard !runtimeStopped else { throw ChromeControlRuntimeError.disconnected }
         guard listenerDescriptor < 0 else { return }
-        // Establish identity before publishing a listener or its credential,
-        // including secondary installs that do not administer registration.
+        // Establish identity before publishing the listener or credential, even without registration ownership.
         let expectedPeers = try expectedPeerExecutablePaths()
         let parent = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -416,8 +412,7 @@ public actor ChromeControlRuntime {
         let token = ChromeControlHandshake.mintToken()
         try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(token.utf8),
             to: URL(fileURLWithPath: ChromeHostIdentity.tokenPath(forSocketPath: socketPath)))
-        // Claimed the moment it is written, so a failure below still leaves
-        // teardown able to remove the file this call created.
+        // Claim the credential immediately so teardown can remove it if subsequent setup fails.
         tokenIdentity = ChromeHostIdentity.FileIdentity(path: ChromeHostIdentity.tokenPath(forSocketPath: socketPath))
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw ChromeControlRuntimeError.socketFailure(errno) }
@@ -474,13 +469,12 @@ public actor ChromeControlRuntime {
                         return (nil, browserPID)
                     } catch { return (error.localizedDescription, nil) }
                 }
-                await self.finishHandshake(accepted, generation: generation, rejection: outcome.rejection, browserPID: outcome.browserPID)
+                await self.finishHandshake(accepted, generation: generation, rejection: outcome.rejection, browserPID: outcome.browserPID, context: context)
             }
         }
     }
 
-    /// Connection identity belongs to the bundle, independently of which
-    /// install administers Chrome's native-host registration.
+    /// Bundle identity is independent of which install administers native-host registration.
     private func expectedPeerExecutablePaths() throws -> Set<String> {
         let relay = ChromeNativeHostRegistration.bundledRelayURL()
         guard FileManager.default.isExecutableFile(atPath: relay.path) else {
@@ -489,7 +483,7 @@ public actor ChromeControlRuntime {
         return [relay.resolvingSymlinksInPath().path]
     }
 
-    private func installAcceptedDescriptor(_ descriptor: Int32, generation: UInt64, browserPID: pid_t?) async {
+    private func installAcceptedDescriptor(_ descriptor: Int32, generation: UInt64, browserPID: pid_t?, context: MacOperationContext) async {
         guard generation == listenerGeneration,
               await transportAvailable(),
               listenerDescriptor >= 0 || !manageNativeHostRegistration,
@@ -523,10 +517,10 @@ public actor ChromeControlRuntime {
             Task { await self?.connectionEnded(installation: installation) }
         }
         connectingChannel = next
-        await next.start()
+        await next.start(context: context)
         do {
             // Only Chrome's attach greeting proves extension version and readiness.
-            let response = try await next.request(action: .attach, payload: [:])
+            let response = try await next.request(action: .attach, payload: [:], context: context)
             guard case .object(let envelope) = response, case .object(let result)? = envelope["result"],
                   result["hostId"] == .string("com.nativeagent.chrome"), result["protocolVersion"] == .int(1),
                   case .string(let version)? = result["extensionVersion"], !version.isEmpty,
@@ -553,7 +547,6 @@ public actor ChromeControlRuntime {
                 if case .string(let at)? = error["at"] { facts.extensionErrorAt = at }
             }
             facts.extensionVersion = version
-            // The extension's loaded-code digest; nil when unreported.
             facts.extensionCode = if case .string(let code)? = result["codeDigest"], code.count == 16,
                                      code.allSatisfy(\.isHexDigit) { code } else { nil }
             facts.extensionSeenAt = Date()
@@ -576,24 +569,31 @@ public actor ChromeControlRuntime {
         connectedBrowserPID = browserPID
         extensionConnectedThisRun = true
         publishConnectionState()
-        readExtensionFiles(fresh: true)
+        readExtensionFiles(fresh: true, context: context)
         if let attempt = extensionReload, attempt.pending, let version = facts.extensionVersion {
             let running = facts.extensionCode, folder = extensionFiles?.code
             if browserPID != attempt.browserPID || browserPID.flatMap({ ChromeHostIdentity.processBirthStamp($0) }) != attempt.browserBirthStamp {
                 finishExtensionReload(phase: "failed", after: version, folderCode: folder, reason: "The reconnect came from a different Chrome process.")
             } else if acceptedExtensionMatchesFolder == false {
                 finishExtensionReload(phase: "stale", after: version, afterCode: running, folderCode: folder,
-                    reason: "Reloaded, but the running version/code (\(version) / \(running ?? "unavailable")) does not match the registered folder at the shipped version (\(extensionFiles?.diskVersion ?? "unavailable") / \(folder ?? "unavailable"), shipped \(attempt.shipped), at \(attempt.path).")
+                    reason: """
+                        Reloaded, but the running version/code (\(version) / \(running ?? "unavailable")) does not match the registered folder at the \
+                        shipped version (\(extensionFiles?.diskVersion ?? "unavailable") / \(folder ?? "unavailable"), shipped \(attempt.shipped), at \
+                        \(attempt.path).
+                        """)
             } else if acceptedExtensionMatchesFolder == true, let running {
                 let evidence = "; running and folder code both report \(running) (before: \(attempt.beforeCode ?? "none reported"))"
                 finishExtensionReload(phase: "succeeded", after: version, afterCode: running, folderCode: folder,
                     reason: "Reload verified by the extension's accepted reconnect and running version" + evidence + ".")
             } else {
                 finishExtensionReload(phase: "failed", after: version, afterCode: running, folderCode: folder,
-                    reason: "Chrome reconnected, but running or folder code identity is unavailable. Check the extension files and reload explicitly; the installed code has not been verified.")
+                    reason: """
+                        Chrome reconnected, but running or folder code identity is unavailable. Check the extension files and reload explicitly; the \
+                        installed code has not been verified.
+                        """)
             }
         }
-        await reloadIfNeeded()
+        await reloadIfNeeded( context: context)
     }
 
     private func stopLocked() async {
@@ -614,7 +614,11 @@ public actor ChromeControlRuntime {
             waiter.done.resume()
         }
         if extensionReload?.pending == true {
-            finishExtensionReload(phase: "unconfirmed", reason: "Chrome transport stopped before the extension reload could be verified; its effect is unknown. Check chrome.status; no automatic retry.")
+            finishExtensionReload(
+                phase: "unconfirmed",
+                reason: """
+                    Chrome transport stopped before the extension reload could be verified; its effect is unknown. Check chrome.status; no automatic retry.
+                    """)
         }
         let existing = channel
         let existingConnecting = connectingChannel

@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `ChatStore+PendingExchanges.swift` | Durable reply observation and bounded send confirmation across session cancellation/relaunch; unknown delivery retains explicit Retry and late Chat/Talk replies, server/Mac evidence retires queued envelopes |
+// Blueprint: | `ChatStore+PendingExchanges.swift` | Durable bounded reply observation; unknown delivery retains exact retry and late replies |
 
 /// Waiting repeats only evidenced Mac activity and its age; silence is not failure.
 enum ChatWaitStatusPresentation {
@@ -32,7 +32,6 @@ enum ChatWaitStatusPresentation {
 /// Durable observation and request arguments; only a signed expiry permits "Send now".
 struct ChatPendingExchange: Codable, Equatable, Sendable {
     struct ExpiredRequest: Codable, Equatable, Sendable {
-        /// The sentence the Mac's signed refusal put in the bubble.
         let message: String
     }
 
@@ -46,23 +45,17 @@ struct ChatPendingExchange: Codable, Equatable, Sendable {
     var correlationID: String
     let sessionID: String?
     let placeholderID: UUID
-    /// Every admitted exchange retains its original request arguments.
+    /// Retain original arguments for every admitted exchange so observation and explicit retry preserve identity.
     var request: RetainedRequest
     var partialText: String
-    /// The last activity the Mac evidenced ("Mac received it", "…is thinking").
     var activity: String?
     var updatedAt: Date
-    /// True once any signed event for this correlation has crossed the bridge.
     var acknowledged: Bool
-    /// True when this phone stopped hearing anything for longer than the wait
-    /// window. A status word — not a verdict about the Mac.
+    /// Silence beyond the wait window is a phone status, never a verdict about the Mac.
     var isSilent: Bool
-    /// Non-nil once the Mac signed an expiry refusal for this request: the
-    /// exchange is no longer observable, and this is everything "Send now"
-    /// needs. Nothing here is ever sent without the person asking.
+    /// Only signed expiry authorizes a user-requested Send now; retain its refused request arguments.
     var expiredRequest: ExpiredRequest? = nil
-    /// Persist the observation limit before dispatch. Relaunch observes the
-    /// retained envelope within this limit; it never starts a fresh upload.
+    /// Persist the observation deadline before dispatch so relaunch observes the same envelope without uploading again.
     var deliveryConfirmationDeadline: Date? = nil
     var deliveryUnconfirmed: Bool = false
     /// Positive transport evidence; independent of Mac execution/reply.
@@ -99,7 +92,6 @@ extension ChatStore {
 
     // MARK: - The Mac's turn here
 
-    /// Unfinished runs in this conversation, across doors, drive Stop and the header.
     var activeTurnRunIDs: Set<String> {
         let session = Self.cleanSessionID(selectedSessionID)
         let handedOver = pendingExchanges.values.filter { $0.sessionID == session && !$0.isExpired }.map(\.correlationID)
@@ -110,8 +102,7 @@ extension ChatStore {
         return Set(handedOver).union(visible).union(queued).union(live)
     }
 
-    /// Nil when no turn is open; false while the Mac has not yet signed any
-    /// event for the phone's request.
+    /// Distinguish no open turn (nil) from a phone request with no signed Mac event (false).
     var activeTurnHeardByMac: Bool? {
         let runs = activeTurnRunIDs
         guard !runs.isEmpty else { return nil }
@@ -120,7 +111,6 @@ extension ChatStore {
 
     // MARK: - Lifecycle
 
-    /// Opens the durable record the moment a request leaves the composer.
     func openPendingExchange(
         correlationID: String,
         sessionID: String?,
@@ -146,18 +136,14 @@ extension ChatStore {
         showWaitStatus(correlationID: correlationID)
     }
 
-    /// The transport may name the run something other than the id this phone
-    /// minted. Move the record rather than leaving two.
+    /// Move the record if transport renames the run so one exchange never gains two owners.
     func renamePendingExchange(from oldID: String, to newID: String) {
         guard oldID != newID, var record = pendingExchanges.removeValue(forKey: oldID) else { return }
         record.correlationID = newID
         pendingExchanges[newID] = record
     }
 
-    /// The Mac signed a refusal because the request aged out unread. Record
-    /// that durably, with the retained request, so a session switch or a cold
-    /// launch still restores the "wasn't started · Send now" bubble instead of
-    /// resurrecting a streaming placeholder for a dead correlation.
+    /// Persist signed expiry with request arguments so relaunch/session changes restore Send now rather than a dead streaming placeholder.
     func markPendingExchangeExpired(
         correlationID: String,
         message: String
@@ -189,8 +175,7 @@ extension ChatStore {
         pendingExchanges[correlationID] = record
     }
 
-    /// Server acceptance and Mac receipt both retire the unsent queue copy;
-    /// the reply owner remains open until a terminal reply actually arrives.
+    /// Server acceptance retires the unsent copy; keep reply ownership open until a real terminal arrives.
     func noteDeliveryAccepted(_ correlationID: String) {
         queuedSends.removeAll { $0.id.uuidString == correlationID }
         guard var record = pendingExchanges[correlationID] else { return }
@@ -210,8 +195,7 @@ extension ChatStore {
         }
     }
 
-    /// Exhausting the observation window is uncertainty, never a failed send.
-    /// Retain both the exact retry envelope and the late-reply observation.
+    /// An exhausted observation window proves uncertainty only; retain the exact retry envelope and late-reply observation.
     func markDeliveryUnconfirmed(_ correlationID: String) {
         guard var record = pendingExchanges[correlationID], !record.acknowledged, !record.deliveryAccepted, !record.isExpired else { return }
         record.deliveryUnconfirmed = true
@@ -219,8 +203,7 @@ extension ChatStore {
         let canRetry = queuedSends.contains { $0.id.uuidString == correlationID && $0.preparedMessage != nil }
         let status = canRetry ? ChatWaitStatusPresentation.deliveryUnconfirmed
             : ChatWaitStatusPresentation.deliveryUnconfirmedWithoutRetry
-        // Automatic drains consult this exchange's durable uncertainty, not
-        // the transport-recovery pause that a successful inbox read clears.
+        // Automatic drains must use durable exchange uncertainty; successful reads can clear the unrelated transport-recovery pause.
         iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
         if let index = messages.firstIndex(where: { $0.id == record.placeholderID }) {
             messages[index].text = status
@@ -232,12 +215,10 @@ extension ChatStore {
             errorBanner = status
         }
         releaseLoading(for: record.placeholderID)
-        // No terminal Talk callback: uncertainty leaves this run open to its
-        // eventual delta/reply, just as it leaves Chat's observation open.
+        // Uncertainty leaves Talk open to late replies, so do not issue its terminal callback.
     }
 
-    /// Silence changes the status word. The partial answer, the bubble and the
-    /// observation all stay exactly where they are.
+    /// Silence may change status only; preserve partial words, bubble and observation.
     func notePendingExchangeSilent(correlationID: String) {
         guard var record = pendingExchanges[correlationID] else { return }
         record.isSilent = true
@@ -245,15 +226,12 @@ extension ChatStore {
         showWaitStatus(correlationID: correlationID)
     }
 
-    /// A terminal result — reply, error, cancel or session retirement — closes
-    /// the record. Nothing else does.
+    /// Only a terminal reply, error, cancel or session retirement closes the record.
     func closePendingExchange(_ correlationID: String) {
         iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
         pendingExchanges.removeValue(forKey: correlationID)
     }
 
-    /// Writes the current waiting sentence into the live hint line. Called on
-    /// each observation tick so the age in it stays honest.
     func showWaitStatus(correlationID: String) {
         guard let record = pendingExchanges[correlationID],
               let placeholderId = pendingICloudPlaceholders[correlationID]
@@ -263,7 +241,6 @@ extension ChatStore {
 
     // MARK: - Restore
 
-    /// Reattach unfinished exchanges with their partial answers and resume observation.
     @discardableResult
     func restorePendingExchanges(for sessionID: String?) -> [String] {
         let session = Self.cleanSessionID(sessionID)
@@ -320,8 +297,7 @@ extension ChatStore {
                 )
             }
             pendingICloudPlaceholders[record.correlationID] = record.placeholderID
-            // The record's own existence is the proof this turn never reached a
-            // terminal state, so a live reply for it is welcome again.
+            // The durable unfinished record permits a live reply to resume because no terminal state was reached.
             resolvedICloudReplyIds.remove(record.correlationID)
             timedOutPendingIds.removeValue(forKey: record.correlationID)
             showWaitStatus(correlationID: record.correlationID)
@@ -340,10 +316,7 @@ extension ChatStore {
         }
     }
 
-    /// An expired exchange is restored as what it actually is: a finished
-    /// bubble saying the request wasn't started, with the retained request put
-    /// back where "Send now" looks for it. Never streaming, never polled —
-    /// the correlation it names was refused and can never complete.
+    /// Restore signed expiry as a finished Send now bubble; its refused correlation must never stream or poll again.
     private func restoreExpiredExchange(
         _ record: ChatPendingExchange,
         retained: ChatPendingExchange.ExpiredRequest
@@ -370,8 +343,7 @@ extension ChatStore {
         timedOutPendingIds.removeValue(forKey: record.correlationID)
     }
 
-    /// Resumes observation of restored exchanges. Observation only: the signed
-    /// request already crossed the bridge and is never sent a second time.
+    /// Restoration observes the already dispatched request; never send it again.
     func resumeObservingPendingExchanges(using client: MacBridgeClient) {
         restorePendingExchanges(for: selectedSessionID)
         armReplyStatus()
@@ -383,8 +355,7 @@ extension ChatStore {
             guard !inFlightSendIDs.contains(record.correlationID),
                   let deadline = record.deliveryConfirmationDeadline else { continue }
             let queued = queuedSends.first(where: { $0.id.uuidString == record.correlationID })
-            // A different pairing cannot inspect the original peer's record,
-            // but its absence must not suspend the saved deadline forever.
+            // A changed pairing cannot inspect the old peer's record but must not extend its saved deadline.
             let message = queued.flatMap { canDeliverQueuedSend($0) ? $0.preparedMessage : nil }
             let correlation = record.correlationID
             inFlightSendIDs.insert(correlation)
@@ -396,8 +367,7 @@ extension ChatStore {
                         self.pendingExchanges[correlation]?.acknowledged == true
                     }
                 } else {
-                    // Missing local bytes cannot prove rejection or authorize
-                    // another write. Keep the original bounded observation.
+                    // Missing local bytes prove neither rejection nor permission to write again; retain bounded original observation.
                     do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
                     catch { return }
                     confirmed = pendingExchanges[correlation]?.acknowledged == true

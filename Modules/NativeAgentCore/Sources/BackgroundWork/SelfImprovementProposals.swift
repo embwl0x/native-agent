@@ -10,10 +10,9 @@ import Desk
 import ToolRegistry
 import BackgroundLoops
 import ProviderRouting
-// Blueprint: | `SelfImprovementProposals.swift` | Maintenance weekly-loop factory and existing staging closures; runtime approval cards bind exact reviewed code and finding identity; code findings enter the builder queue; standing lessons use REM; `SelfImprovementProposal` owns stable finding identity |
+// Blueprint: | `SelfImprovementProposals.swift` | `SelfImprovementProposal`; Exact approval code and stable finding identity |
 
 extension MaintenanceBackgroundWork {
-    /// Weekly analysis stages runtime findings for approval under the unattended-work gate.
     public func selfImprovementSwitchOn() -> Bool {
         // Enabled by default; the Self-Improvement and setup switches write this key.
         UserDefaults.standard.object(forKey: "selfImprovementEnabled") == nil
@@ -24,7 +23,7 @@ extension MaintenanceBackgroundWork {
     public func makeWeeklySelfImprovementLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         llm: any LLMClient,
-        workshopOutcomes: @escaping @Sendable () async throws -> String
+        jobOutcomes: @escaping @Sendable () async throws -> String
     ) -> WeeklySelfImprovementLoop {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         return WeeklySelfImprovementLoop(
@@ -33,7 +32,7 @@ extension MaintenanceBackgroundWork {
             isEnabled: {
                 guard selfImprovementSwitchOn() else { return false }
                 // The shared unattended-work gate owns authority while nobody is looking.
-                return await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
+                return await UnattendedWork.allowed(dataRoot: dataRoot)
             },
             stageProposal: { proposal in
                 var apply: [String: JSONValue] = ["op": .string(proposal.applyOp ?? ""),
@@ -100,7 +99,7 @@ extension MaintenanceBackgroundWork {
                     "payloadPreview": .string(preview),
                 ])
                 do {
-                    return try await inbox.create(body).id
+                    return try await inbox.create(body, turn: nil).id
                 } catch {
                     // Propagate staging failures so the pass fails and releases its weekly reservation.
                     FileHandle.standardError.write(Data(
@@ -108,8 +107,7 @@ extension MaintenanceBackgroundWork {
                     throw error
                 }
             },
-            // A code finding needs a code change: the harness queue holds it
-            // for the builder, once per finding, with this pass's digest.
+            // Code findings belong to the builder queue, deduped by finding with this pass’s digest.
             fileCodeFinding: { proposal in
                 let digest = dataRoot.appendingPathComponent("self_improvement/digests/\(NativeTimestampFormat.calendarDay(Date())).md")
                 try await HarnessQueue.file(HarnessFinding(
@@ -120,9 +118,8 @@ extension MaintenanceBackgroundWork {
                     source: .sweep
                 ), dataRoot: dataRoot)
             },
-            workshopOutcomes: workshopOutcomes,
-            // The sweep learns from itself: this week's misses by lesson against
-            // last week's, and what became of the previous pass's cards.
+            jobOutcomes: jobOutcomes,
+            // Compare lesson misses and card outcomes across passes so the analysis can learn from itself.
             learning: { previousCards in
                 var sections: [String] = []
                 let weeks = [MemoryRecoveryReadout.isoWeek(), MemoryRecoveryReadout.isoWeek(ago: 1)]
@@ -144,16 +141,14 @@ extension MaintenanceBackgroundWork {
                 let standing = try await Self.standingLessons(dataRoot: dataRoot)
                 return SelfImprovementLearning(signals: sections.joined(separator: "\n\n"), standing: standing)
             },
-            // REM stages standing lessons by memory and wording; tombstones
-            // keep denied or retired lines gone across memories.
+            // Wording tombstones keep denied corrections suppressed across memories.
             stageStandingLessons: { lines in
                 let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
                 let tombstones = REMTombstoneStore(dataRoot: dataRoot)
                 var proposals: [REMProposalRow] = []
                 for (id, line) in lines.sorted(by: { $0.key < $1.key }) {
                     guard let memory = try await storage.memory(id: id) else { continue }
-                    // One card per wording of the correction: an edited one
-                    // (its card goes stale) can be offered again.
+                    // Edited wording invalidates its old card and can be offered again.
                     let proposal = REMProposalRow(
                         id: "standing-\(id)-\(MemoryStorage.contentHash(memory.content).prefix(12))",
                         targetDoc: "GROWTH.md", proposalText: line, evidenceDates: [],
@@ -172,18 +167,14 @@ extension MaintenanceBackgroundWork {
     }
 }
 
-/// One improvement the weekly analyzer found. `runtime` proposals carry a
-/// safe, reversible `applyOp` and are staged for one-tap approval (approval
-/// runs the op); `code` proposals are report-only.
+/// Runtime proposals require explicit approval for their reversible operation; code proposals remain report-only.
 public struct SelfImprovementProposal: Sendable {
     public enum Kind: Sendable { case runtime, code }
     public let kind: Kind
     public let title: String
     public let evidence: String
     public let proposedChange: String
-    /// The applied-on-approval op. ONE of `WeeklySelfImprovementLoop.applyOps`.
-    /// Non-nil for every staged runtime proposal (guaranteed by parseResult),
-    /// nil for code/report findings.
+    /// Validation guarantees a supported operation for runtime proposals; code findings carry none.
     public let applyOp: String?
     public let applyTarget: String?
 

@@ -67,9 +67,7 @@ enum SharedChatInbox {
               item.attachments.allSatisfy({ $0.byteSize > 0 && $0.byteSize <= ChatAttachmentTypeResolver.fileByteLimit }) else {
             throw failure("This share is too large. Use less text or a smaller file.")
         }
-        // The codec counts escaped JSON/base64 and the duplicated text field.
-        // Reserve 16 KiB for controls, session identity and signing added by
-        // the app, which the extension does not know when saving the share.
+        // Reserve 16 KiB beyond encoded JSON/base64 for app-added controls, session identity and signing unknown to the extension.
         let envelope = BridgeMessage.make(
             id: item.id.uuidString, sender: "ios", text: item.text,
             metadata: ["shareEnvelopeReserve": String(repeating: "x", count: 16 * 1024)],

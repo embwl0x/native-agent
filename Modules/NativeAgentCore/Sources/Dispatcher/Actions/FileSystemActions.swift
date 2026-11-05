@@ -9,10 +9,8 @@ import TrustCenter
 import Darwin
 import Darwin
 #endif
-// Blueprint: | `FileSystemActions.swift` | `FileSystemActions` file operations and shared path/value functions; workspace mutation resolution, allowed roots and sensitive/private-store fences; `SwiftNativeSecurityCenter.fencedAttachment`; descriptor-bound byte windows, line queries/excerpts, guarded writes, transfers, Trash, metadata and budgeted directory sizes; `FileReadSourceMaterial` descriptor-only source port |
-//
-// File access follows allowed roots and the sensitive-path fence; verified
-// descriptors keep reads and mutations bound to the checked paths.
+// Blueprint: | `FileSystemActions.swift` | `FileSystemActions`; `SwiftNativeSecurityCenter.fencedAttachment`; `FileReadSourceMaterial` |
+// File access follows allowed roots and the sensitive-path fence; verified descriptors keep reads and mutations bound to the checked paths.
 package enum FileSystemActions {
     /// Connector reads retain their repository base and final-entry semantics.
     static func resolvePath(_ raw: String, repoRoot: URL?, workspaceRoot: URL? = nil, followFinalLink: Bool = true) -> URL {
@@ -20,14 +18,12 @@ package enum FileSystemActions {
             NativeAgentWorkspaceRoot.fileCandidate(raw, relativeTo: repoRoot ?? URL(fileURLWithPath: "."), workspaceRoot: workspaceRoot),
             followFinalLink: followFinalLink)
     }
-    /// Returns [] (sandbox disabled at this layer) when file_access mode == "full" OR sandbox ==
-    /// "danger-full-access". Otherwise repo_root + writableRoots + addDirs +
-    /// extraAllowedRoots + data/skills.
+    /// Full access removes the root sandbox at this layer; the sensitive-store fence still applies.
     static func allowedRoots(_ ctx: ConnectorActionContext, write: Bool = false) -> [URL] {
         let mode = (ctx.fileAccess["mode"]?.stringValue ?? "").lowercased()
         let sandbox = (ctx.fileAccess["sandbox"]?.stringValue ?? "").lowercased()
         if mode == "full" || sandbox == "danger-full-access" {
-            return []  // disable sandbox at this layer; sensitive-path block stays.
+            return []
         }
         var roots: [URL] = []
         func add(_ raw: URL) {
@@ -64,17 +60,15 @@ package enum FileSystemActions {
         let drPath = dataRoot.path.lowercased()
         let pPath = resolved.path.lowercased()
         guard var relStr = NativeAgentWorkspaceRoot.relativePath(pPath, under: drPath) else { return false }
-        // A local backup's payload (backups/<id>/data/…) is the data root again: what is fenced there is fenced in it.
+        // Backup payloads copy the data root, so they inherit its sensitive-store fence.
         if let payload = relStr.range(of: "^backups/[^/]+/data/", options: .regularExpression) { relStr.removeSubrange(payload) }
         if ctx.appDataWrite != nil,
            connectorPartPrivateDataSubpaths.contains(where: { NativeAgentWorkspaceRoot.relativePath(relStr, under: $0) != nil }) { return true }
         if connectorSensitiveDataSubpaths.contains(where: { NativeAgentWorkspaceRoot.relativePath(relStr, under: $0) != nil }) { return true }
-        // Kept MCP launch lines can carry a key.
+        // Stored MCP launch commands may contain credentials.
         if relStr == "mcp/servers.json" { return true }
         let parts = relStr.split(separator: "/").map(String.init)
-        // Credential files are fenced where they are actually written, not by
-        // basename anywhere: `<root>/research/config.json` and other plain
-        // config under the data root are not secrets and stay readable.
+        // Fence credentials by their writer-owned location; ordinary config elsewhere remains readable.
         if parts.count >= 2, parts[0] == "connectors",
            ["auth.json", "credential.json", "credentials.json"].contains(parts[parts.count - 1]) {
             return true
@@ -88,11 +82,10 @@ package enum FileSystemActions {
             if parts[0] == "memory", parts[1] == "vault" { return true }
         }
         if parts.count >= 2 && parts[0] == "nextgen" && parts[1] == "remote" { return true }
-        // *.bin directly under data root (pairing secrets etc.)
+        // Root-level .bin files hold pairing secrets.
         if parts.count == 1 && resolved.pathExtension.lowercased() == "bin" { return true }
         return false
     }
-    /// What files.read says for a sensitive store, wherever else that store is asked for.
     static func sensitiveReadRefusal(_ resolved: URL) -> String {
         "Path '\(resolved.path)' is under a sensitive data sub-tree (OAuth tokens, "
             + "pairing secrets, provider credentials, trust policy). "
@@ -109,13 +102,12 @@ package enum FileSystemActions {
         guard path.pathExtension.lowercased() == "md" else { return false }
         return path.deletingPathExtension().lastPathComponent.lowercased().contains("handoff")
     }
-    /// Null/empty values use the default; unparseable values signal bad_input.
+    /// Only absent or empty values use the default; malformed values remain bad_input.
     static func safeInt(_ value: JSONValue?, default def: Int) -> Int? {
         switch value ?? .null {
         case .null: return def
         case .int(let i): return Int(i)
-        // Preserve truncation toward zero for ordinary numeric inputs, but
-        // reject unrepresentable values instead of trapping the app process.
+        // Preserve numeric truncation toward zero but refuse unrepresentable values before they can trap.
         case .double(let d): return Int(exactly: d.rounded(.towardZero))
         case .string(let s):
             if s.isEmpty { return def }
@@ -140,7 +132,6 @@ package enum FileSystemActions {
     }
 }
 func isNull(_ v: JSONValue) -> Bool { if case .null = v { return true }; return false }
-/// Raw strings, scalar text with True/False/None spellings, or serialized containers.
 func jsonToStr(_ v: JSONValue) throws -> String {
     switch v {
     case .string(let s): return s
@@ -151,7 +142,6 @@ func jsonToStr(_ v: JSONValue) throws -> String {
     default: return try v.serialize(pretty: false)
     }
 }
-/// repr-ish rendering for error messages (`got <x>`). Best-effort.
 func jsonRepr(_ v: JSONValue?) -> String {
     guard let v else { return "None" }
     switch v {

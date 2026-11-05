@@ -3,13 +3,10 @@ import Foundation
 import PersistenceCore
 import ToolRegistry
 
-// Blueprint: | `ChatGeneratedImageArtifacts.swift` | `ChatGeneratedImageArtifacts`: reply attachment projection from actual generation receipts and explicit reply choices |
+// Blueprint: | `ChatGeneratedImageArtifacts.swift` | `ChatGeneratedImageArtifacts`; Receipt-backed reply images |
 
-/// The artifacts a reply carries: its face's, which every surface renders.
 public enum ChatGeneratedImageArtifacts {
-    /// What she chose, explicitly: every image her generation made in this
-    /// turn (from its receipts), and every image she attached to it with
-    /// `reply.attach` (`ReplyChoices`, in the order she chose them).
+    /// Use generation receipts and explicit reply choices so every surface renders the images selected for this reply.
     public static func attachments(
         from dispatches: [TurnEngineResult.ToolDispatchRecord],
         chosen: [String] = [],
@@ -17,7 +14,6 @@ public enum ChatGeneratedImageArtifacts {
     ) -> [MultimodalAttachment] {
         var out: [MultimodalAttachment] = []
         var seen: Set<String> = []
-        // app image.generate is image_generate too.
         let generated = dispatches.flatMap { generations($0.ranCall.tool, $0.ranCall.input, $0.result) }
             .flatMap { attachments(fromToolResult: $0, dataRoot: dataRoot) }
         for attachment in generated + chosen.compactMap({ attachment(URL(fileURLWithPath: $0)) })
@@ -27,13 +23,10 @@ public enum ChatGeneratedImageArtifacts {
         return out
     }
 
-    /// A call's generation receipts: its own, or each of its list's. An
-    /// `app {actions}` list pairs its entries with its receipts in order; a
-    /// call fanned out over a list of values ran its one tool for each; a
-    /// script's ledger names each call's action on its row.
+    /// Pair action-list receipts by order; fan-out and script ledgers retain each call's action identity.
     private static func generations(_ tool: String, _ input: [String: JSONValue], _ result: JSONValue) -> [JSONValue] {
         guard case .object(let fields) = result else { return [] }
-        // A saved receipt too big to keep whole carries them, kept before it was bounded.
+        // Preserve artifacts before bounding a saved receipt so recovery retains them.
         if let kept = fields["generatedImages"] { return [.object(["images": kept])] }
         if case .array(let calls)? = fields["calls"] {
             return calls.flatMap { row -> [JSONValue] in
@@ -54,8 +47,7 @@ public enum ChatGeneratedImageArtifacts {
         }
     }
 
-    /// Every image a call's generations made, in one list: what its saved
-    /// receipt keeps before it is bounded, so a resumed turn still has them.
+    /// Preserve all generated images before bounding the receipt so resumed turns retain them.
     public static func generatedImages(_ tool: String, _ input: [String: JSONValue], _ result: JSONValue) -> [JSONValue] {
         generations(tool, input, result).flatMap { generation -> [JSONValue] in
             guard case .object(let fields) = generation, case .array(let images)? = fields["images"] else { return [] }
@@ -92,14 +84,14 @@ public enum ChatGeneratedImageArtifacts {
                 name = nil
             }
             if let attachment = attachment(url, name: name,
-                    byteSize: imageObject["byteSize"]?.integerValue.flatMap(Int.init(exactly:)) ?? imageObject["byte_size"]?.integerValue.flatMap(Int.init(exactly:))) {
+                    byteSize: imageObject["byteSize"]?.integerValue.flatMap(Int.init(exactly:)) ?? imageObject["byte_size"]?.integerValue.flatMap(Int.init(
+                        exactly:))) {
                 out.append(attachment)
             }
         }
         return out
     }
 
-    /// An image file on disk as a reply attachment; nil for anything else.
     public static func attachment(_ url: URL, name: String? = nil, byteSize: Int? = nil) -> MultimodalAttachment? {
         guard FileManager.default.fileExists(atPath: url.path), let mime = imageMimeType(for: url) else { return nil }
         return MultimodalAttachment(
@@ -129,7 +121,7 @@ public enum ChatGeneratedImageArtifacts {
         (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
     }
 
-    /// From the whole path: two files of one name are two attachments.
+    /// Use the whole path so equal filenames remain distinct attachments.
     private static func stableAttachmentId(for url: URL) -> String {
         "image-" + SHA256.hash(data: Data(url.path.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
     }

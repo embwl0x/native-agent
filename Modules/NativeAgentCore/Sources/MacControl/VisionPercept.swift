@@ -2,32 +2,25 @@ import Foundation
 // Blueprint: | `VisionPercept.swift` | `VisionAffordanceRow`, `VisionReadoutRow`, `VisionRecognizedText`, `VisionPercept` |
 
 // MARK: - The emitted rows
-//
-// Vision rows retain provenance and per-attribute confidence for the shared
-// screen/target adapter.
+// Retain provenance and confidence per attribute so the shared adapter can weigh uncertain evidence.
 
 public struct VisionAffordanceRow: Sendable, Equatable {
     public let roleGuess: String
-    /// The OCR label, already redacted. nil when the region carried no text.
+    /// Labels are already redacted; missing text remains nil.
     public let label: VisionRedactedText?
     public let rect: VisionRect
     public let confidence: VisionConfidence
     public let state: VisionStateGuess
     public let evidence: [VisionEvidenceSource]
-    /// Non-nil ⇒ this row ABSTAINS: we will not claim it is separately
-    /// addressable. A first-class result, not an error.
+    /// Abstention is visible evidence that a row is not independently addressable, rather than an error to hide.
     public let ambiguous: String?
-    /// Irreversible-looking action. A caller must demand stronger
-    /// confirmation for these regardless of how good the other numbers look.
+    /// Irreversible-looking actions need stronger confirmation regardless of other confidence scores.
     public let destructiveRisk: Bool
     public let salience: Double
-    /// Pixel contrast against the sampled frame background. This describes
-    /// visual prominence without inventing a semantic role.
+    /// Background contrast measures prominence, never semantic role.
     public let visualContrast: Double?
-    /// Compact perceptual colour evidence such as yellow or blue. This never
-    /// names what the object means.
+    /// Colour names describe perception rather than object meaning.
     public let visualColor: String?
-    /// Conservative connected-component silhouette: `round` or `square`.
     public let visualShape: String?
 
     public init(
@@ -58,13 +51,10 @@ public struct VisionAffordanceRow: Sendable, Equatable {
         self.visualShape = visualShape
     }
 
-    /// The clear label, or nil when redaction withheld it / there was none.
     public var displayLabel: String? { label?.display }
 }
 
-/// A prominent standalone value — the pixel channel's readout. Same job as the
-/// AX lane's `MacLookReadout` (what the screen SAYS, as opposed to what it
-/// offers), ranked the same way: prominence first.
+/// Prominent standalone values are readouts, ranked like AX by what the screen says rather than offers.
 public struct VisionReadoutRow: Sendable, Equatable {
     public let handle: String
     public let text: VisionRedactedText
@@ -84,8 +74,7 @@ public struct VisionReadoutRow: Sendable, Equatable {
 public struct VisionRecognizedText: Sendable, Equatable {
     public let text: VisionRedactedText
     public let confidence: Double
-    /// Source-frame geometry retained for spatial fusion with nearby visual
-    /// evidence. Optional for synthetic callers that have text without a box.
+    /// Retain source geometry for fusion; text-only callers may lack boxes.
     public let rect: VisionRect?
 
     public init(text: VisionRedactedText, confidence: Double, rect: VisionRect? = nil) {
@@ -99,14 +88,13 @@ public struct VisionPercept: Sendable, Equatable {
     public let rows: [VisionAffordanceRow]
     public let readouts: [VisionReadoutRow]
     public let frameSize: VisionSize
-    /// Did the conditional tiling pass fire, and why / why not.
+    /// Report whether and why conditional tiling ran.
     public let textTiled: Bool
     public let textTilingReason: String
     public let recognizedStrings: Int
-    /// Every recognized string after source redaction, not only the subset
-    /// promoted to a row label or prominent standalone readout.
+    /// Keep all redacted recognition, not only the subset ranked into rows or readouts.
     public let recognizedText: [VisionRecognizedText]
-    /// Layer caps that bit. Never silent.
+    /// Report every layer cap so partial evidence cannot appear complete.
     public let notes: [String]
 
     public init(

@@ -1,8 +1,6 @@
 import SwiftUI
-// Blueprint: | `DictationComposer.swift` | While you dictate or record, every word you have said, full width above the controls (grows to a cap, then scrolls and follows the end), and the live mic waveform; each redraws on its own, not the chat |
+// Blueprint: | `DictationComposer.swift` | Capped full-width dictation and live waveform; redraw independently of chat |
 
-/// Everything said so far, at reading size. Grows with the words up to
-/// `maxHeight`, then scrolls and stays on the newest line.
 struct DictationTranscript: View {
     let input: VoiceInputController
     var maxHeight: CGFloat = 240
@@ -39,7 +37,6 @@ struct DictationTranscript: View {
     }
 }
 
-/// The live mic level as bars, newest on the right; empty slots are dots.
 struct DictationWaveform: View {
     let input: VoiceInputController
 
@@ -70,7 +67,7 @@ struct DictationWaveform: View {
 
 #if DEBUG
 extension VoiceInputController {
-    /// Screenshot fixture (-dictationSample): a long live transcript and a waveform; no audio, nothing sent.
+    /// Screenshot fixtures supply transcript and waveform without recording or sending audio.
     func showDictationSample() {
         guard ProcessInfo.processInfo.arguments.contains("-dictationSample"), !isListening else { return }
         isListening = true

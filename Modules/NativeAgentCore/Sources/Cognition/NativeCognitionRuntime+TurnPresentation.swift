@@ -16,15 +16,12 @@ import AuthoredCapabilities
 import NativeAgentShared
 import Studio
 import Transcripts
-// Blueprint: | `NativeCognitionRuntime+TurnPresentation.swift` | `NativeCognitionRuntime` fixed-time turn preparation and committed capsule/body-line presentation |
+// Blueprint: | `NativeCognitionRuntime+TurnPresentation.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
     private static let bodyLineRefreshInterval: TimeInterval = 20 * 60
 
-    /// The live turn seam is an actor-free read of the projection already
-    /// published by CognitiveSubstrate, OrganismKernel, and the Desk pursuit
-    /// projection. Bootstrap and owner I/O happen off this path; an early cold
-    /// turn may receive nil, but can never wait for those owners.
+    /// Read only published owner projections on the live turn path; cold turns may receive nil but never wait for bootstrap or I/O.
     public nonisolated func attentionSignals(at date: Date) async -> CognitiveAttentionSignals? {
         let trace = CognitiveAttentionTraceContext.recorder
         trace?.recordAdmission()
@@ -36,10 +33,8 @@ extension NativeCognitionRuntime {
     }
 
 
-    /// Ordinary chat reads cognition and organism at one fixed time after one
-    /// body refresh. It does not consume the surfaced-state window; the caller
-    /// commits that only at confirmed provider delivery.
-    public func prepareTurnProjection(_ request: CognitiveCapsuleRequest) async -> CognitionAtTurn {
+    /// Use one fixed-time body refresh without consuming cadence until confirmed provider delivery.
+    public func prepareTurnProjection(_ request: CognitiveCapsuleRequest, turn: Turn) async -> CognitionAtTurn {
         await bootstrap()
         let fixedAt = now()
         let bodySample = await organismBodySample(at: fixedAt)
@@ -58,7 +53,8 @@ extension NativeCognitionRuntime {
         )
         let preparedCapsule = await substrate.prepareFrozenCapsulePresentation(
             capsuleRequest,
-            at: fixedAt
+            at: fixedAt,
+            turn: turn
         )
         return CognitionAtTurn(
             fixedAt: fixedAt,
@@ -71,17 +67,18 @@ extension NativeCognitionRuntime {
 
     public func commitTurnProjection(
         _ projection: CognitionAtTurn,
-        request: CognitiveCapsuleRequest
+        request: CognitiveCapsuleRequest,
+        turn: Turn
     ) async {
         guard request.resolvedTurnKind == .live else { return }
-        // Clear shares this door, including the runtime's capsule/body-line mirror.
+        // Clear owns the same door and must clear capsule/body-line mirrors too.
         await enterDoor()
         defer { leaveDoor() }
         if request.mode == .inject, let presentationCommit = projection.capsulePresentationCommit {
-            guard await substrate.applyCapsulePresentationCommit(presentationCommit) else { return }
+            guard await substrate.applyCapsulePresentationCommit(presentationCommit, turn: turn) else { return }
         }
         if let capsule = projection.capsule {
-            // Mirror live capsules; only populated injections consume the body-line window.
+            // Only populated injections consume the body-line window; mirror live capsules independently.
             lastInjectedCapsule = (capsule, request.userMessage)
             if request.mode == .inject,
                let line = Self.bodyLine(inCapsuleDynamicContext: capsule.dynamicContext) {
@@ -90,7 +87,7 @@ extension NativeCognitionRuntime {
             }
         }
         guard request.mode == .inject else { return }
-        // Empty delivered turns advance cadence with a token; populated ones flush even without one.
+        // Empty delivered turns advance cadence with a token; populated injections flush even without one.
         if projection.capsule != nil || projection.capsulePresentationCommit != nil {
             await substrate.flushCommittedCapsulePresentation(at: projection.fixedAt)
         }
@@ -103,19 +100,12 @@ extension NativeCognitionRuntime {
         at fixedAt: Date
     ) -> CognitiveCapsuleRequest {
         var projection = initialProjection
-        // The horizon rides BEFORE the neutral-projection early return: it
-        // comes from the prediction ledger, not from chemistry, so a body with
-        // nothing to say is no reason for her to stop looking forward to
-        // Friday.
+        // Render horizon before neutral-body early return because prediction-ledger anticipation is independent of chemistry.
         var request = request
         request.toward = toward
         guard !projection.isNeutral else { return request }
-        // Suppress-when-unchanged: only for REAL injections (.inject). If the same
-        // line is still fresh, drop it so a held mood goes quiet instead of
-        // repeating for hours. Observatory/preview (.inspectOnly) always sees the
-        // true line and never touches the window. The surfaced-marker is set
-        // at delivery in commitTurnProjection, so a preview OR a nil capsule can't consume
-        // the window.
+        // Suppress unchanged lines only for real injections; inspections must show state without consuming cadence.
+        // Set the surfaced marker at confirmed delivery so previews or absent capsules cannot consume the window.
         if request.mode == .inject,
            let line = projection.bodyLine,
            line == lastInjectedBodyLine,

@@ -3,8 +3,7 @@ import NativeAgentShared
 // Blueprint: | `MacSyncActionRouter+Providers.swift` | `MacSyncActionRouter`: `configureEncryptedProvider`, `startProviderSignIn` |
 
 extension MacSyncActionRouter {
-    /// Phone input travels sealed; after HMAC and approved-phone verification,
-    /// Mac owners apply, store and verify plaintext and issue content-free receipts.
+    /// Only authenticated, approved-phone input reaches Mac plaintext owners; phone receipts must remain content-free.
     func configureEncryptedProvider(_ action: InboxAction) async -> [String: String] {
         do {
             guard action.payload.count == 1,
@@ -32,8 +31,7 @@ extension MacSyncActionRouter {
                     "message": verified ? "Key saved. Connection verified on Mac."
                         : "Key saved, but the Mac could not verify the connection. Check the key and try Test connection."]
         } catch {
-            // Provider/network errors can contain server-controlled text. Never
-            // forward them, decrypted input, or credential-owner errors to iCloud.
+            // Provider errors may contain server text or credentials; none may reach iCloud.
             return providerFailure("The Mac could not save and verify the provider credential.")
         }
     }

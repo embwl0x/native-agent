@@ -2,14 +2,13 @@ import Foundation
 import NativeAgentShared
 import EngineRuntime
 import DoctorChecks
-// Blueprint: | `AppModel+HealthEmbeddings.swift` | `AppModel`: `loadHealthCard`, `setHealthCardIfMeaningfullyChanged`; the Doctor owner's `LatestRead` orders health-card publication |
+// Blueprint: | `AppModel+HealthEmbeddings.swift` | `AppModel`, `loadHealthCard`, `setHealthCardIfMeaningfullyChanged`, `LatestRead`: Health publication |
 
 @MainActor
 extension AppModel {
     @MainActor
     func loadHealthCard() async {
         _ = await engine.doctor.healthCardRead.read({
-        // Failed health reads publish their error as the health verdict.
         let nextHealthCard: HealthCard
         do {
             nextHealthCard = try await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager).runtime.getHealthCard()
@@ -36,17 +35,13 @@ extension AppModel {
             _ = try await engine.approvals.list()
         } catch {
             guard !Task.isCancelled else { return }
-            // The facade keeps the last read and exposes its failure to
-            // every approval surface.
+            // The facade retains failure evidence for every approval surface.
             print("[NativeAgent] getApprovals failed: \(error)")
             setFailureStatus(error, action: "load approvals")
         }
     }
 
-    /// The live health poll intentionally runs while chat is visible, but its
-    /// `createdAt` timestamp is not rendered anywhere. Treating that timestamp
-    /// as UI state forced a complete health-surface layout every 15 seconds even
-    /// when every visible verdict was identical.
+    /// Ignore the unrendered createdAt timestamp so unchanged health verdicts do not trigger full surface layouts.
     @MainActor
     func setHealthCardIfMeaningfullyChanged(_ next: HealthCard) {
         let current = engine.doctor.healthCard

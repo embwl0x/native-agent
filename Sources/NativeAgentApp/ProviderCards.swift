@@ -55,10 +55,8 @@ struct ProviderNote: View {
     }
 }
 
-/// Account state uses a coloured word without a plate.
 struct ProviderStatusWord: View {
     let text: String
-    /// "ok", "warn" or "error", as the presentation types already spell it.
     let kind: String
 
     var body: some View {
@@ -68,7 +66,7 @@ struct ProviderStatusWord: View {
             .lineLimit(1)
     }
 
-    /// Unconfigured accounts have no state word and offer Set up.
+    /// Unconfigured accounts need Set up rather than a status claim.
     static func word(for state: String) -> (text: String, kind: String)? {
         switch state {
         case "ready": ("Ready", "ok")
@@ -82,7 +80,7 @@ struct ProviderStatusWord: View {
     private var color: Color {
         switch kind {
         case "ok": NativeAgentShell.calm
-        // Warnings and failures share the attention colour; their words distinguish them.
+        // Words distinguish warnings from failures without adding competing colours.
         case "warn", "error": NativeAgentShell.trouble
         default: NativeAgentShell.secondary
         }

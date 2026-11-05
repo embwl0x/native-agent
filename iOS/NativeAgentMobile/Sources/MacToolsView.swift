@@ -15,7 +15,7 @@ struct MacToolsView: View {
     @State private var isSendingNotif = false
     @State private var notifResult: MacNotificationSendPresentation.Feedback?
     @State private var volume: Double = MacVolumeControlPresentation.defaultTargetFraction
-    /// No target shows until one is picked; this is not a live volume gauge.
+    /// Do not show a volume target before selection or imply it is a live gauge.
     @State private var volumePicked = false
     @State private var isSettingVolume = false
     @State private var spotlightQuery = ""
@@ -43,7 +43,7 @@ struct MacToolsView: View {
         paired && MacToolsPrivilegePresentation.isAllowed(privilege, policy: macPolicy)
     }
 
-    /// Unpaired, the page's one reason says why; no per-card Trust hint.
+    /// Unpaired pages already explain unavailability; avoid per-card Trust hints.
     private func footer(_ privilege: PhoneMacControlAction, _ text: String?) -> String? {
         !paired ? nil : allowed(privilege) ? text : lockedText(privilege)
     }
@@ -88,7 +88,6 @@ struct MacToolsView: View {
             AliveFootnote(status, systemImage: "arrow.turn.down.right")
         }
 
-        // ── Notification ───────────────────────────────────────────
         AliveSection(
             "Send a notification",
             footer: footer(.notification, notifResult?.text)
@@ -111,7 +110,6 @@ struct MacToolsView: View {
             .aliveUnavailable(!allowed(.notification))
         }
 
-        // ── The Mac itself ─────────────────────────────────────────
         AliveSection(
             "The Mac",
             footer: footer(.volume, MacVolumeControlPresentation.currentVolumeDisclosure)
@@ -145,7 +143,6 @@ struct MacToolsView: View {
             .aliveUnavailable(!allowed(.volume))
         }
 
-        // ── Spotlight ──────────────────────────────────────────────
         AliveSection("Search the Mac", footer: footer(.spotlight, nil)) {
             HStack(spacing: 12) {
                 field("Spotlight", text: $spotlightQuery)
@@ -169,7 +166,6 @@ struct MacToolsView: View {
             }
         }
 
-        // ── Receipts ───────────────────────────────────────────────
         if !remoteActions.isEmpty {
             AliveSection("Recent on the Mac", footer: "Kept while this app stays open.") {
                 ForEach(Array(remoteActions.enumerated()), id: \.element.id) { index, action in
@@ -182,7 +178,6 @@ struct MacToolsView: View {
         }
     }
 
-    /// An input inside a card: no border of its own, the card is the field.
     private func field(_ prompt: String, text: Binding<String>) -> some View {
         TextField(prompt, text: text, prompt: Text(prompt).foregroundStyle(AlivePalette.secondary))
             .font(.body)
@@ -222,10 +217,7 @@ struct MacToolsView: View {
         }
     }
 
-    // A2: reusable inline reason for a policy-gated control. Appends the
-    // actionable Trust-tab hint so a disabled control isn't just dimmed — it
-    // says why it's off and where to turn it on. Matches the app's existing
-    // "Mac app's Trust tab" copy (see disabledEmptyState).
+    // Include the Trust remedy with each policy refusal so a dimmed control explains why and where to enable it.
     private func lockedText(_ privilege: PhoneMacControlAction) -> String {
         "\(MacToolsPrivilegePresentation.disabledDescription(for: privilege)) Enable in the Mac app's Trust tab."
     }
@@ -260,7 +252,6 @@ struct MacToolsView: View {
         await loadPolicy()
     }
 
-    // Every Mac action goes through iCloudSyncEngine.
 
     private func loadPolicy() async {
         #if DEBUG
@@ -274,9 +265,10 @@ struct MacToolsView: View {
     }
 
     #if DEBUG
-    /// `-designScreen mac-tools`: an open policy and two receipts, never sent anywhere.
+    /// Design fixtures expose policy and receipts without sending anything.
     private func loadDesignSample() {
-        sync.trustPolicy = TrustPolicy(macControlPolicy: MacControlPolicyWireSnapshot(enabled: true, systemControlAllowed: true, approvalRequiredFor: [], remoteFromIosAllowed: true))
+        sync.trustPolicy = TrustPolicy(macControlPolicy: MacControlPolicyWireSnapshot(enabled: true, systemControlAllowed: true, approvalRequiredFor: [],
+            remoteFromIosAllowed: true))
         hasLoadedPolicy = true
         guard remoteActionLedger.actions.isEmpty else { return }
         let volume = remoteActionLedger.start(.volume(40), title: "Set volume", subtitle: "40%")

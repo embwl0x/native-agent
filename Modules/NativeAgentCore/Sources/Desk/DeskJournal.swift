@@ -6,7 +6,6 @@ import NativeAgentCore
 import Synchronization
 // Blueprint: | `DeskJournal.swift` | Locked event feed append, integrity and compaction |
 extension SwiftNativeDeskStore {
-    /// Append and compact under the canonical feed lock.
     @discardableResult
     public func append(_ op: DeskOp) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -18,8 +17,7 @@ extension SwiftNativeDeskStore {
         }
         return op
     }
-    /// Validate a live item's mutation and stamp it under the ops lock.
-    /// Explicit todo starts another life's stopped continuation fresh.
+    /// Validate and stamp under the lock; explicit todo starts another life’s stopped work fresh.
     @discardableResult
     func appendValidated(_ op: DeskOp) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -64,14 +62,8 @@ extension SwiftNativeDeskStore {
             return stamped
         }
     }
-    /// Append one canonical op, reduce the state, then run the
-    /// end-of-transaction compaction check. The canonical truth is base+tail:
-    /// an op only ever leaves the tail by being folded into the base snapshot
-    /// first, so a live item can never vanish and a retired alias can never be
-    /// reused (the original "UNCAPPED" contract, now bounded by compaction).
-    /// The caller already holds the ops flock. Returns the committed state plus
-    /// the updated feed so multi-op transactions (reconcile) can continue from
-    /// a post-compaction view without re-reading the disk.
+    /// The caller holds the ops flock; fold tail ops into the base before removing them so items and aliases survive.
+    /// Return the post-compaction feed so multi-op transactions continue from the committed view.
     @discardableResult
     func appendAndRecompactUnlocked(
         _ op: DeskOp,
@@ -91,8 +83,7 @@ extension SwiftNativeDeskStore {
         }
         try await appendOpUnlocked(op)
         changeBus.emit(StoreChange(store: .desk, path: opsPath))
-        // Carry the same physical row accounting into the post-append feed.
-        // Functional reads admitted every retained row before reaching here.
+        // Carry physical row accounting forward because every retained row passed admission.
         var next = DeskFeed(
             base: feed.base, ops: feed.ops + [op],
             fileOpCount: feed.fileOpCount, integrity: feed.integrity
@@ -100,23 +91,18 @@ extension SwiftNativeDeskStore {
         next.noteAppendedRows(1)
         let state = Self.compact(base: next.base, next.ops)
         if let newBase = try await compactIfNeededUnlocked(state: state, feed: next) {
-            // Compaction ran ⇒ the gate passed ⇒ the rewritten feed is clean.
             next = DeskFeed(base: newBase, ops: [], fileOpCount: 0, integrity: .clean)
         }
         return (state, next)
     }
     func appendOpUnlocked(_ op: DeskOp) async throws {
-        let encoded = op.toJSON()
-        guard let decoded = DeskOp.fromJSON(encoded), decoded.toJSON() == encoded else {
-            throw DeskError.invalidOperation(token: op.op)
-        }
+        try DeskOp.requireComplete([op])
         // Reject projections read before or during the awaited write, even if it throws.
         Self.truthRevision.withLock { $0 += 1 }
         defer { Self.truthRevision.withLock { $0 += 1 } }
-        try await SwiftNativePersistenceCore.appendJSONLDurable(encoded, to: opsPath)
+        try await SwiftNativePersistenceCore.appendJSONLDurable(op.toJSON(), to: opsPath)
     }
-    /// A functional read is total over the retained feed. No rejected row can
-    /// disappear before alias allocation, finding lookup, mutation or compaction.
+    /// Require the complete retained feed before alias allocation, finding lookup, mutation or compaction.
     func readOpsWithIntegrityUnlocked() async throws -> (ops: [DeskOp], integrity: SnapshotTailOpLog.OpLogIntegrity) {
         let (raw, report) = try await SwiftNativePersistenceCore.readJSONLReporting(opsPath)
         guard report.malformedLineCount == 0, !report.trailingPartialLine else {
@@ -140,7 +126,6 @@ extension SwiftNativeDeskStore {
         SnapshotTailOpLog.noteIntegrity(integrity, feed: Self.logLabel, path: opsPath)
         return (ops, integrity)
     }
-    /// The Doctor surface reports undecodable rows and feed growth when compaction is blocked.
     public func opLogHealth() async throws -> SnapshotTailOpLog.OpLogHealth {
         let integrity = try await opLogIntegrity()
         return SnapshotTailOpLog.OpLogHealth(
@@ -152,11 +137,8 @@ extension SwiftNativeDeskStore {
             integrity: integrity
         )
     }
-    /// The readable counter behind the log line: what the desk's op-log feed
-    /// currently cannot decode. Nonzero integrity makes functional reads and
-    /// mutations unavailable; diagnostics still report the original evidence.
+    /// Diagnostics retain undecodable-row evidence while functional reads and mutations stay unavailable.
     public func opLogIntegrity() async throws -> SnapshotTailOpLog.OpLogIntegrity {
-        // Diagnostics count rejected rows without presenting a reduced Desk.
         let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(opsPath)
         return SnapshotTailOpLog.OpLogIntegrity(
             malformedLineCount: report.malformedLineCount,
@@ -164,15 +146,9 @@ extension SwiftNativeDeskStore {
             trailingPartialLine: report.trailingPartialLine,
             physicalRowCount: report.physicalLineCount)
     }
-    /// Reads the replayable feed: compaction base (if any) + the ops that
-    /// FOLLOW it. Ops are read FIRST, base second — a cross-process reader
-    /// racing a compaction then sees (old base, full ops), (new base, full
-    /// ops → prefix dropped below), or (new base, truncated ops); never the
-    /// state-losing (old base, truncated ops). The prefix drop also heals a
-    /// crash between base write and op-log truncate: the stale full op-log
-    /// simply replays as its post-base suffix. A base file that EXISTS but
-    /// does not decode throws — replaying from the tail alone would silently
-    /// blank every compacted item.
+    /// Read ops before the base so a compaction race cannot pair an old base with a truncated tail.
+    /// Prefix-drop prevents duplicate replay after a crash between base write and truncation.
+    /// An existing malformed base must fail because tail-only replay would lose compacted items.
     func readFeedUnlocked() async throws -> DeskFeed {
         let (ops, integrity) = try await readOpsWithIntegrityUnlocked()
         try Self.validateAliasDomain(base: nil, ops: ops)
@@ -180,7 +156,7 @@ extension SwiftNativeDeskStore {
         guard FileManager.default.fileExists(atPath: basePath.path) else {
             return DeskFeed(base: nil, ops: ops, fileOpCount: fileOpCount, integrity: integrity)
         }
-        // Read bytes directly to distinguish retryable I/O errors from parse/decode corruption.
+        // Keep retryable byte-read failures distinct from decoded corruption.
         guard let baseData = try? Data(contentsOf: basePath) else {
             throw DeskError.compactionBaseUnreadable(path: basePath.path)
         }
@@ -189,34 +165,27 @@ extension SwiftNativeDeskStore {
             throw DeskError.compactionBaseCorrupt(path: basePath.path)
         }
         try Self.validateAliasDomain(base: base, ops: ops)
-        // Keep only ops after lastCompactedOpId; an absent id leaves the tail unchanged.
+        // An absent compacted-op ID leaves the tail intact to avoid dropping unseen work.
         let tail = SnapshotTailOpLog.dropCompactedPrefix(
             ops, lastCompactedOpId: base.lastCompactedOpId, id: { $0.opId }
         )
         return DeskFeed(base: base, ops: tail, fileOpCount: fileOpCount, integrity: integrity)
     }
-    /// Snapshot+truncate once the op-log file crosses the threshold. The
-    /// caller holds the ops flock and passes the just-committed state plus the
-    /// POST-append feed (tail includes the ops just written). Base is written
-    /// atomically BEFORE the truncate; the replay prefix-drop makes the
-    /// in-between crash window safe (never lost, never double-applied).
-    /// Returns the new base when compaction ran, nil otherwise.
+    /// With the ops flock held, write the base atomically before truncation.
+    /// Replay prefix-drop makes a crash between them safe against loss and duplicate application.
     func compactIfNeededUnlocked(
         state: DeskState,
         feed: DeskFeed
     ) async throws -> DeskCompactionBase? {
-        // PHYSICAL rows, not decoded ops — see `DeskFeed.compactionRowCount`.
         guard feed.compactionRowCount >= opsCompactionThreshold else { return nil }
         // Refuse compaction before the last-op guard so even wholly undecodable feeds report without erasing rows.
         guard SnapshotTailOpLog.mayCompact(feed.integrity, feed: Self.logLabel, path: opsPath) else { return nil }
         guard let lastOpId = feed.ops.last?.opId, !lastOpId.isEmpty else { return nil }
         let liveHandles = Set(state.items.map(\.handle))
-        // Alias high-water survives per LIVE parent scope ("" = top level,
-        // always kept). An archived parent can never receive new children
-        // (createItem refuses an unknown handle), so its entry is dead weight.
+        // Keep alias high-water for live parents and top level so aliases are never reused.
         let aliasHighWater = Self.foldAliasHighWater(seed: feed.base?.aliasHighWater ?? [:], ops: feed.ops)
             .filter { $0.key.isEmpty || liveHandles.contains($0.key) }
-        // The reconcile repair only ever reopens LIVE items — prune the rest.
+        // Only live items can be reopened, so other repair targets need no retained entry.
         let lastNonTerminal = Self.foldLastNonTerminal(seed: feed.base?.lastNonTerminal ?? [:], ops: feed.ops)
             .filter { liveHandles.contains($0.key) }
         let base = DeskCompactionBase(
@@ -227,19 +196,13 @@ extension SwiftNativeDeskStore {
             compactedAt: DeskClock.nowISO(),
             compactedOpCount: feed.fileOpCount
         )
-        // Snapshot-BEFORE-truncate via the shared engine. Desk keeps an EMPTY
-        // tail: its canonical truth is base + ops-that-follow, and semantic reads
-        // take the flock (liveState), so no kept tail is needed for consistency.
+        // Locked reads and base-plus-following-ops replay require no retained tail.
         try await SnapshotTailOpLog.commitCompaction(
             baseJSON: base.toJSON(), tailRows: [],
             basePath: basePath, opsPath: opsPath
         )
         return base
     }
-    /// Fold create-op aliases into the per-parent high-water map:
-    /// top-level aliases parse as whole integers,
-    /// child aliases by their trailing component; open_pursuit creates draw
-    /// from the top-level sequence and count against it.
     static func foldAliasHighWater(seed: [String: Int], ops: [DeskOp]) -> [String: Int] {
         var highWater = seed
         func bump(_ key: String, seq: Int?) {
@@ -262,9 +225,6 @@ extension SwiftNativeDeskStore {
         }
         return highWater
     }
-    /// Fold "last recorded non-terminal status" per handle:
-    /// a create seeds `.watch`, a non-terminal
-    /// set_status records itself, everything else is ignored.
     static func foldLastNonTerminal(
         seed: [String: DeskNonTerminalRecord],
         ops: [DeskOp]
@@ -281,5 +241,16 @@ extension SwiftNativeDeskStore {
             }
         }
         return records
+    }
+}
+
+extension DeskOp {
+    /// The journal keeps only ops that read back as themselves. A transaction checks every op before it writes the first, so a refused op
+    /// never leaves its siblings half-written (a queue item without its step).
+    static func requireComplete(_ ops: [DeskOp]) throws {
+        for op in ops {
+            let encoded = op.toJSON()
+            guard let decoded = DeskOp.fromJSON(encoded), decoded.toJSON() == encoded else { throw DeskError.invalidOperation(token: op.op) }
+        }
     }
 }

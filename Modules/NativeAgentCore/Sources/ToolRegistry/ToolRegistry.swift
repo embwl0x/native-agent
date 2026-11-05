@@ -3,11 +3,10 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ToolRegistry.swift` | `ToolRecord` and AbilityStore's checked part-record projection through Parts' shared name schema: name damage is row-local; other missing required fields are omitted and invalid authored fields fail listing and dispatch discovery; `keepReview` and `reviewedKeepDigest` bind waiting or selected code to the review captured under the ability-store lock |
+// Blueprint: | `ToolRegistry.swift` | `ToolRecord`, `keepReview`, `reviewedKeepDigest`: checked records; version-bound review |
 
 // MARK: - Errors
 
-/// Errors raised by the tool registry.
 public enum ToolRegistryError: Error, LocalizedError {
     case invalidRequest(String)
     case registryUnreadable(reason: String)
@@ -67,8 +66,7 @@ public struct ToolRecord: Sendable, Equatable, Identifiable {
 
     public var language: String? { fields["language"]?.stringValue }
     public var candidateDigest: String? { fields["candidateDigest"]?.stringValue }
-    /// Review material and identity captured together by the ability-store read.
-    /// Never substitute a fresh catalog digest for the version a row displayed.
+    /// Capture review material with its exact stored identity; a fresh digest cannot substitute for the version displayed.
     public var keepReview: [String: JSONValue]? {
         guard let digest = candidateDigest ?? codeFingerprint, !digest.isEmpty,
               case .object(let review)? = extra("keepReview"),
@@ -85,10 +83,7 @@ public struct ToolRecord: Sendable, Equatable, Identifiable {
     }
 
 
-    /// The first authored field that does not read as the Tools page reads
-    /// it, or nil when every one does: `description` is required, the rest
-    /// may be absent or null but never of another type. A
-    /// record naming one is damaged authority, not a row to render.
+    /// Required descriptions and optional authored fields share the page's checked schema; malformed authority cannot render as a healthy row.
     public var authoredFieldProblem: String? {
         func isString(_ value: JSONValue) -> Bool { if case .string = value { return true }; return false }
         func isStrings(_ value: JSONValue) -> Bool {
@@ -97,8 +92,7 @@ public struct ToolRecord: Sendable, Equatable, Identifiable {
         }
         func isBool(_ value: JSONValue) -> Bool { if case .bool = value { return true }; return false }
         guard let description = extra("description"), isString(description) else { return "description" }
-        // Triggers are discovery phrases, not identity: a part found by its
-        // description needs none (the seed parts have none).
+        // Triggers are discovery phrases, not identity: a part found by its description needs none (the seed parts have none).
         let optional: [(String, (JSONValue) -> Bool)] = [
             ("triggers", isStrings),
             ("language", isString), ("entrypoint", isString), ("permissions", isStrings), ("actions", isStrings),
@@ -126,7 +120,7 @@ public actor SwiftNativeToolRegistry {
 
     public func listTools() async throws -> [ToolRecord] {
         let records = try AbilityStore(dataRoot: root).checkedToolRecords()
-        // Newest effective timestamp first; ties retain their on-disk order.
+        // Stable timestamp ties preserve on-disk order.
         func sortKey(_ r: ToolRecord) -> String {
             (r.updatedAt?.isEmpty == false ? r.updatedAt : nil) ?? r.createdAt
         }
@@ -146,22 +140,17 @@ public actor SwiftNativeToolRegistry {
 
     // MARK: ISO timestamp helper
 
-    /// Match Python's `now_iso()`: ISO-8601 with fractional seconds,
-    /// `+00:00` suffix (not `Z`). Same convention as
-    /// ApprovalInbox.
+    /// Use the shared fractional ISO convention with +00:00 so persisted timestamps match their consumers.
     public nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
 }
 
-/// The checked part-record projection shared by listing and dispatch discovery.
-/// Parts owns display names and row-local name damage. Other missing required
-/// fields are omitted; invalid authored fields fail the read.
+/// Listing and dispatch share the checked record projection; name damage stays row-local while invalid authored fields fail their read.
 extension AbilityStore {
     public func checkedToolRecords() throws -> [ToolRecord] {
         let items = try Parts(root: dataRoot).rows(kind: .part)
-        // Parts retains name damage as unavailable rows. The remaining checks
-        // below still require a complete execution record.
+        // Parts retains name damage as unavailable rows. The remaining checks below still require a complete execution record.
         return try items.enumerated().compactMap { index, item -> ToolRecord? in
             guard let record = ToolRecord(json: .object(item)) else {
                 var id = ""

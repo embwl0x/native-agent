@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ContinuationOnce.swift` | `ContinuationOnce`: one retained first outcome for single-consumer waits; winning resolution runs cancellation before any continuation resumes; typed cancellation waits honour Stop and the inherited tool-call deadline; CloudKit races preserve typed failures and caller-owned task policies; a write's deadline can end the wait without cancelling the write |
+// Blueprint: | `ContinuationOnce.swift` | `ContinuationOnce`: first outcome wins; typed Stop/deadline waits preserve writes |
 
 /// First outcome wins, including resolution before continuation installation.
 public final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
@@ -17,7 +17,6 @@ public final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
         lock.withLock { if case .waiting = state { return true }; return false }
     }
 
-    /// Returns whether installation admitted starting the work.
     @discardableResult
     public func install(_ continuation: CheckedContinuation<T, Never>) -> Bool {
         lock.lock()
@@ -37,8 +36,7 @@ public final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
         }
     }
 
-    /// Returns whether this resolution won. Cancellation runs outside the lock,
-    /// while installation still waits for it to finish before resuming.
+    /// Returns whether this resolution won. Cancellation runs outside the lock, while installation still waits for it to finish before resuming.
     @discardableResult
     public func resume(_ value: T, beforeResume: @Sendable () -> Void = {}) -> Bool {
         lock.lock()
@@ -58,14 +56,14 @@ public final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
         await withCheckedContinuation { _ = install($0) }
     }
 
-    /// A generic result has no invented cancellation value. The owner supplies
-    /// its existing typed cancellation path; both Stop and expiry use it.
+    /// A generic result has no invented cancellation value. The owner supplies its existing typed cancellation path; both Stop and expiry use it.
     public func wait(
+        budget: OperationWaitBudget = .init(),
         cancellingWith value: @autoclosure @escaping @Sendable () -> T,
         onCancel: @escaping @Sendable () -> Void = {}
     ) async -> T {
         let cancel: @Sendable () -> Void = { self.resume(value(), beforeResume: onCancel) }
-        let deadline = TaskWaitDeadline.arm(cancel)
+        let deadline = budget.arm(cancel)
         defer { deadline?.cancel() }
         return await withTaskCancellationHandler {
             await wait()
@@ -81,7 +79,7 @@ enum CloudKitTimeoutOutcome<T: Sendable>: Sendable {
 }
 
 extension ContinuationOnce {
-    // Diagnostics detach; transport inherits its recovery budget.
+    // Diagnostics detach; transport captures its explicit recovery value.
     func cloudKitRace<Value: Sendable>(
         workTask: Task<Void, Never>,
         timeoutNanoseconds: UInt64,
@@ -104,8 +102,7 @@ extension ContinuationOnce {
             }
             let first = await group.next()
             group.cancelAll()
-            // A deadline ends the wait. For a write it must not end the write:
-            // a cancelled upload is a message that never arrives (10-31).
+            // A write owns its completion: ending the wait must not cancel the upload.
             if case .timedOut? = first, !cancelWorkOnTimeout {} else { workTask.cancel() }
             self.resume(nil)
             return first ?? .cancelled

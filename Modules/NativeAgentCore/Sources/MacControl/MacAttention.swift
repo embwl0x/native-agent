@@ -10,7 +10,7 @@ import AppKit
 #if canImport(CoreGraphics) && os(macOS)
 import CoreGraphics
 #endif
-// Blueprint: | `MacAttention.swift` | `MacAttentionSessionStore` owns driver authority, synchronous physical takeover and optional bounded view sessions; `MacDriverBinding` owns held-input release, foreground/background authority and cancellation-independent settlement under the original driver generation; session stop/expiry leaves passive observation active, explicit handback revokes control |
+// Blueprint: | `MacAttention.swift` | `MacAttentionSessionStore`, `MacDriverBinding`: Driver takeover, view continuity and held-input settlement |
 
 public struct MacAttentionSnapshot: Sendable, Equatable {
     public let sessionId: String
@@ -73,22 +73,9 @@ public enum MacAttentionActionPermission: Sendable, Equatable {
     case refused(reason: String, current: MacAttentionSnapshot?)
 }
 
-/// Inherited by an act and all of its effects; observation cannot renew it.
-public enum MacDriverContext {
-    @TaskLocal public static var binding: MacDriverBinding?
-    /// The admitted action runs in an app in the back: it needs none of his
-    /// cursor, keys, focus or screen. Off unless the action said so.
-    @TaskLocal public static var background = false
-    @TaskLocal static var inputStartCount = 0
-    /// A watch's own binding keeps a pressed key down across its hands, until
-    /// its key-up, its end or the person's input releases it (MacScreenWatch).
-    @TaskLocal static var holdsAcrossCalls = false
-}
-
 public final class MacDriverBinding: @unchecked Sendable {
     public let generation: UInt64
     private let owner: MacAttentionSessionStore
-    /// She held the Mac when this act began.
     private let granted: Bool
     private let handback: UInt64
     private let lock = NSLock()
@@ -116,34 +103,32 @@ public final class MacDriverBinding: @unchecked Sendable {
         self.handback = handback
     }
 
-    private var stopped: Bool { lock.withLock { cancelled } || Task.isCancelled || TaskWaitDeadline.expired }
+    private func stopped(context: MacOperationContext) -> Bool { lock.withLock { cancelled } || Task.isCancelled || context.expired }
 
-    /// Her hands on his cursor, keys, focus or screen: his own input ends it.
-    public var allowsEmission: Bool {
-        guard !stopped else { return false }
+    /// Physical input ends foreground driver authority before the next event.
+    public func allowsEmission(context: MacOperationContext) -> Bool {
+        guard !stopped(context: context) else { return false }
         if owner.permitsDriver(generation) { return true }
         lock.withLock { yielded = true }
         return false
     }
 
-    /// Work that moves none of his cursor, keys, focus or screen — an
-    /// action admitted to run in an app in the back, her own Chrome tab —
-    /// goes on while he uses the Mac. Explicit handback ends it in every session.
-    public var allowsBackgroundEmission: Bool {
-        guard granted, !stopped else { return false }
+    /// Background actions use none of the person's cursor, keys, focus or screen and may continue during physical input; explicit handback revokes every
+    /// session.
+    public func allowsBackgroundEmission(context: MacOperationContext) -> Bool {
+        guard granted, !stopped(context: context) else { return false }
         if owner.permitsBackground(handback) { return true }
         lock.withLock { yielded = true }
         return false
     }
 
-    /// He took the Mac back explicitly since this act began.
     public var handedBack: Bool { !owner.permitsBackground(handback) }
 
-    /// The permission the admitted action needs: in the back, only hers.
-    public var allowsAction: Bool { MacDriverContext.background ? allowsBackgroundEmission : allowsEmission }
+    /// Background actions require background authority, independent of foreground takeover.
+    public func allowsAction(context: MacOperationContext) -> Bool { context.background ? allowsBackgroundEmission(context: context) : allowsEmission(
+        context: context) }
 
-    /// An effect that needed his cursor, keys, focus or screen was refused
-    /// because he took the Mac.
+    /// A takeover refusal applies only to effects requiring the person's cursor, keys, focus or screen.
     public var yieldedToPerson: Bool { lock.withLock { yielded } }
 
     var inputCount: Int {
@@ -152,11 +137,11 @@ public final class MacDriverBinding: @unchecked Sendable {
         return postedEvents
     }
 
-    func notePostedEvent() {
+    func notePostedEvent(turn: Turn) {
         lock.lock()
         postedEvents += 1
         lock.unlock()
-        MacWorkContinuation.current?.actionStarted()
+        turn.macContinuation?.actionStarted()
     }
 
     public func cancel() {
@@ -166,19 +151,18 @@ public final class MacDriverBinding: @unchecked Sendable {
         releaseHeldInputs()
     }
 
-    /// Releasing what the act held runs through `settle` with its own
-    /// cancellation lifetime. Keep the original authority: physical takeover,
-    /// explicit handback and shutdown still revoke this generation.
+    /// Releasing what the act held runs through `settle` with its own cancellation lifetime. Keep the original authority: physical takeover, explicit handback
+    /// and shutdown still revoke this generation.
     public func settlementBinding() -> MacDriverBinding {
         MacDriverBinding(owner: owner, generation: generation, granted: granted, handback: handback)
     }
 
-    func held(_ key: String, release: (@Sendable () -> Void)?) {
+    func held(_ key: String, context: MacOperationContext, release: (@Sendable () -> Void)?) {
         lock.lock()
         releases[key] = release
         lock.unlock()
         owner.trackHeldInputs(self)
-        if stopped || !owner.permitsDriver(generation) { releaseHeldInputs() }
+        if stopped(context: context) || !owner.permitsDriver(generation) { releaseHeldInputs() }
     }
 
     func releaseHeldInputs() {
@@ -190,14 +174,8 @@ public final class MacDriverBinding: @unchecked Sendable {
     }
 }
 
-/// The one ephemeral owner of driver authority and a bounded view session.
-///
-/// It stores no screenshots, text, key contents, history, or persona state.
-/// It holds the driver generation, current session token, coarse activity
-/// counters, and last fused-view id. Stop/expiry forgets the view session;
-/// only an explicit physical handoff can grant driver authority again.
-/// Passive driver observation deliberately outlives session stop/expiry: it
-/// protects ordinary acts without a view session. Only terminal shutdown ends it.
+/// Keep only ephemeral driver/session state, coarse activity and the fused-view ID; never screenshots, text or key contents. Stop/expiry clears view continuity
+/// while passive takeover observation survives until shutdown. Only explicit handoff grants driver authority again.
 public actor MacAttentionSessionStore {
     public static let shared = MacAttentionSessionStore(screenViewStore: .shared)
 
@@ -236,7 +214,7 @@ public actor MacAttentionSessionStore {
         var agentDriving = false
         var driverOpen = true
         var driverGeneration: UInt64 = 0
-        /// Moves only on "let me take over" or a hand-back Stop, never on input.
+        /// Input never advances the explicit handback generation; only handoff or hand-back Stop does.
         var handbackGeneration: UInt64 = 0
         weak var inputBinding: MacDriverBinding?
     }
@@ -283,8 +261,7 @@ public actor MacAttentionSessionStore {
         #endif
     }
 
-    /// Only the person's explicit UI handoff calls this, or a bind under the
-    /// Full Mac they granted; never a tool or view on its own.
+    /// Only the person's explicit UI handoff calls this, or a bind under the Full Mac they granted; never a tool or view on its own.
     public func giveAgentControl(userGeneration: UInt64) {
         ensureDriverObservation(eventSource: defaultMacAttentionEventSource())
         guard observation != nil else { return }
@@ -299,8 +276,7 @@ public actor MacAttentionSessionStore {
 
     public func bindDriver(eventSource: any MacAttentionEventSource = defaultMacAttentionEventSource()) async throws -> MacDriverBinding {
         ensureDriverObservation(eventSource: eventSource)
-        // Full Mac grants the next act; physical input revokes earlier bindings.
-        // Input during the policy read prevents reacquiring foreground control;
+        // Full Mac grants the next act; physical input revokes earlier bindings. Input during the policy read prevents reacquiring foreground control;
         // background authority remains granted.
         let generation = makeDriverBinding().generation
         var granted = currentDriverAllowed
@@ -311,9 +287,8 @@ public actor MacAttentionSessionStore {
         return makeDriverBinding(granted: granted)
     }
 
-    /// Whether the composer's hand-back would change anything now: a Mac
-    /// action has asked for the driver this run, the person holds it, and the
-    /// posture is below Full Mac. Full Mac can reacquire on its next action.
+    /// Whether the composer's hand-back would change anything now: a Mac action has asked for the driver this run, the person holds it, and the posture is
+    /// below Full Mac. Full Mac can reacquire on its next action.
     public func handoffWouldChange() async throws -> Bool {
         guard observation != nil, !currentDriverAllowed else { return false }
         return !(try await Self.savedFullMac())
@@ -322,12 +297,9 @@ public actor MacAttentionSessionStore {
     private static func savedFullMac() async throws -> Bool {
         do {
             let snapshot = try await SwiftNativeTrustCenter().loadAuthorizationSnapshotChecked()
-            guard let trust = MacControlPolicy.fromTrustPolicyObject(snapshot.policy).trustPolicy else {
-                throw SavedTrustPolicyAuthority.unavailable("Mac control Trust projection is missing.")
-            }
-            return MacControlGate.fullMacActive(trust)
+            return PermissionLaw.posture(snapshot.policy) == .fullMac
         } catch {
-            throw SavedTrustPolicyAuthority.unavailable(error.localizedDescription)
+            throw SwiftNativeTrustCenter.policyUnavailable(error.localizedDescription)
         }
     }
 
@@ -366,8 +338,7 @@ public actor MacAttentionSessionStore {
         let coalescer = MacAttentionEventCoalescer()
         #endif
         observation = eventSource.start { [weak self] activity in
-            // Revoke before hopping to the actor: a synchronous typing loop
-            // must see physical input even while this actor is occupied.
+            // Revoke before hopping to the actor: a synchronous typing loop must see physical input even while this actor is occupied.
             if activity.kind.isPhysicalUserInput { self?.takeUserControl() }
             #if canImport(AppKit) && canImport(CoreGraphics) && os(macOS)
             guard coalescer.shouldEmit(kind: activity.kind, atUptime: ProcessInfo.processInfo.systemUptime) else { return }
@@ -392,8 +363,7 @@ public actor MacAttentionSessionStore {
         }
     }
 
-    /// Terminal domain retirement, distinct from stopping a bounded view session.
-    /// The engine drain owns calling this; no later bind/start reopens admission.
+    /// Terminal domain retirement, distinct from stopping a bounded view session. The engine drain owns calling this; no later bind/start reopens admission.
     public func shutdown() async {
         guard !isShutDown else { return }
         isShutDown = true
@@ -411,7 +381,8 @@ public actor MacAttentionSessionStore {
     public func start(
         durationSeconds: Int,
         now: Date,
-        eventSource: any MacAttentionEventSource
+        eventSource: any MacAttentionEventSource,
+        context: MacOperationContext
     ) async -> MacAttentionSnapshot? {
         guard !isShutDown else { return nil }
         let startingDriverGeneration = makeDriverBinding().generation
@@ -434,12 +405,12 @@ public actor MacAttentionSessionStore {
             guard !Task.isCancelled else { return }
             await self?.expire(sessionId: id)
         }
-        return snapshot(timedOutWaiting: false)
+        return snapshot(timedOutWaiting: false, context: context)
     }
 
-    public func status(now: Date) async -> MacAttentionSnapshot? {
+    public func status(now: Date, context: MacOperationContext) async -> MacAttentionSnapshot? {
         await expireIfNeeded(now: now)
-        return snapshot(timedOutWaiting: false)
+        return snapshot(timedOutWaiting: false, context: context)
     }
 
     @discardableResult
@@ -464,28 +435,29 @@ public actor MacAttentionSessionStore {
         sessionId: String,
         after sequence: Int64,
         timeoutMilliseconds: Int,
-        now: Date
+        now: Date,
+        context: MacOperationContext
     ) async -> MacAttentionSnapshot? {
         await expireIfNeeded(now: now)
         guard session?.id == sessionId else { return nil }
         let waitMs = max(0, min(timeoutMilliseconds, Self.maximumWaitMilliseconds))
         var timedOut = false
         if session?.sequence ?? 0 <= sequence, waitMs > 0 {
-            timedOut = await suspendUntilActivity(after: sequence, timeoutMilliseconds: waitMs)
+            timedOut = await suspendUntilActivity(after: sequence, timeoutMilliseconds: waitMs, context: context)
         }
         await expireIfNeeded(now: Date())
         guard session?.id == sessionId else { return nil }
-        return snapshot(timedOutWaiting: timedOut)
+        return snapshot(timedOutWaiting: timedOut, context: context)
     }
 
-    /// Marks one freshly captured fused view as the scene observed after all
-    /// user activity up through `userSequence`.
+    /// A capture acknowledges only activity through userSequence so later input still invalidates it.
     public func observed(
         sessionId: String,
         viewId: String,
         sequence: Int64,
         userSequence: Int64,
-        now: Date
+        now: Date,
+        context: MacOperationContext
     ) async -> MacAttentionSnapshot? {
         await expireIfNeeded(now: now)
         guard var current = session, current.id == sessionId else { return nil }
@@ -493,36 +465,36 @@ public actor MacAttentionSessionStore {
         current.observedSequence = min(current.sequence, max(0, sequence))
         current.observedUserSequence = min(current.userSequence, max(0, userSequence))
         session = current
-        return snapshot(timedOutWaiting: false)
+        return snapshot(timedOutWaiting: false, context: context)
     }
 
-    /// Rechecked before every emitted motor event. This is the effect-time
-    /// human-takeover boundary, not merely a tool-entry check.
+    /// Rechecked before every emitted motor event. This is the effect-time human-takeover boundary, not merely a tool-entry check.
     public func permissionForAction(
         sessionId: String?,
         observedUserSequence: Int64?,
-        now: Date
+        now: Date,
+        context: MacOperationContext
     ) async -> MacAttentionActionPermission {
         await expireIfNeeded(now: now)
-        guard let binding = MacDriverContext.binding, binding.allowsAction else {
-            return .refused(reason: Self.driverRefusal, current: snapshot(timedOutWaiting: false))
+        guard let binding = context.driver, binding.allowsAction(context: context) else {
+            return .refused(reason: Self.driverRefusal(context: context), current: snapshot(timedOutWaiting: false, context: context))
         }
         guard let current = session else { return .allowed }
         guard sessionId == current.id else {
             return .refused(
                 reason: "attention_session_required: an explicit Mac attention session is active; "
                     + "act with its session and latest observed user sequence, or stop it",
-                current: snapshot(timedOutWaiting: false)!
+                current: snapshot(timedOutWaiting: false, context: context)!
             )
         }
-        // Work in the back never waits on his input (see MacDriverBinding).
-        if MacDriverContext.background { return .allowed }
+        // Background work never waits for physical input because it uses none of the person's input resources.
+        if context.background { return .allowed }
         if observedUserSequence != current.userSequence
             || current.observedUserSequence != current.userSequence {
             return .refused(
                 reason: "human_takeover: physical user input occurred after the agent's last fused view; "
                     + "yield until the person explicitly returns Mac control",
-                current: snapshot(timedOutWaiting: false)!
+                current: snapshot(timedOutWaiting: false, context: context)!
             )
         }
         guard current.observedSequence == current.sequence,
@@ -530,14 +502,13 @@ public actor MacAttentionSessionStore {
             return .refused(
                 reason: "scene_changed: the active app or screen changed after the agent's last fused view; "
                     + "call mac_attention next before acting again",
-                current: snapshot(timedOutWaiting: false)!
+                current: snapshot(timedOutWaiting: false, context: context)!
             )
         }
         return .allowed
     }
 
-    /// Driver revocation happened synchronously at the observer. This actor
-    /// projects the pulse into the current optional view session.
+    /// Driver revocation happened synchronously at the observer. This actor projects the pulse into the current optional view session.
     func record(_ activity: MacAttentionActivity) async {
         await screenViewStore.invalidate()
         guard var current = session else { return }
@@ -552,15 +523,14 @@ public actor MacAttentionSessionStore {
         current.lastActivity = activity
         session = current
 
-        // The frozen marks no longer describe the same scene. Physical input
-        // additionally invokes human takeover; app activation requires a
-        // refresh without falsely claiming the human caused it.
+        // The frozen marks no longer describe the same scene. Physical input additionally invokes human takeover; app activation requires a refresh without
+        // falsely claiming the human caused it.
         await screenViewStore.invalidate()
         guard session?.id == current.id else { return }
         resumeReadyWaiters(sequence: current.sequence)
     }
 
-    private func snapshot(timedOutWaiting: Bool) -> MacAttentionSnapshot? {
+    private func snapshot(timedOutWaiting: Bool, context: MacOperationContext) -> MacAttentionSnapshot? {
         guard let current = session else { return nil }
         let driver = makeDriverBinding()
         return MacAttentionSnapshot(
@@ -575,13 +545,12 @@ public actor MacAttentionSessionStore {
             lastActivity: current.lastActivity,
             latestViewId: current.latestViewId,
             timedOutWaiting: timedOutWaiting,
-            driverAllowed: driver.allowsEmission,
+            driverAllowed: driver.allowsEmission(context: context),
             driverGeneration: driver.generation
         )
     }
 
-    /// Returns true when the wait ended only because the deadline elapsed.
-    private func suspendUntilActivity(after sequence: Int64, timeoutMilliseconds: Int) async -> Bool {
+    private func suspendUntilActivity(after sequence: Int64, timeoutMilliseconds: Int, context: MacOperationContext) async -> Bool {
         let id = UUID()
         let before = session?.sequence ?? sequence
         if session != nil, (session?.sequence ?? 0) <= sequence {
@@ -592,7 +561,7 @@ public actor MacAttentionSessionStore {
                 await self?.resumeWaiter(id: id)
             }
             waiters[id] = Waiter(after: sequence, done: done, timeoutTask: timeoutTask)
-            await done.park()
+            await done.park(budget: context.waitBudget)
             resumeWaiter(id: id)
         }
         return (session?.sequence ?? before) <= sequence
@@ -636,15 +605,21 @@ public actor MacAttentionSessionStore {
     }
 
     public static let personUsingMac = "human_takeover: The person is using the Mac, so I held off. Nothing was sent."
-    /// A Mac action stopped by his input, or by an explicit handback.
-    public static var driverRefusal: String {
-        MacDriverContext.binding?.handedBack == true
-            ? "human_takeover: Mac control was explicitly handed back, so this action stopped. Earlier effects may have reached the app; inspect it before continuing. Return control to NativeAgent before another action."
-            : "human_takeover: the person took the Mac, so this action stopped. Let go: tell them where you stopped and leave the Mac to them. You continue when they press Resume in Shotgun or ask you to; an action before that would take it back from under their hands."
+    /// Keep physical takeover distinct from explicit handback so the refusal names its actual cause.
+    public static func driverRefusal(context: MacOperationContext) -> String {
+        context.driver?.handedBack == true
+            ? """
+                human_takeover: Mac control was explicitly handed back, so this action stopped. Earlier effects may have reached the app; inspect it before \
+                continuing. Return control to NativeAgent before another action.
+                """
+            : """
+                human_takeover: the person took the Mac, so this action stopped. Let go: tell them where you stopped and leave the Mac to them. You continue \
+                when they press Resume in Shotgun or ask you to; an action before that would take it back from under their hands.
+                """
     }
-    /// A message to a desktop app held off for the same reasons: nothing was sent.
-    public static var sendRefusal: String {
-        MacDriverContext.binding?.handedBack == true
+    /// Desktop-send refusals need their own wording because they can prove no message was sent.
+    public static func sendRefusal(context: MacOperationContext) -> String {
+        context.driver?.handedBack == true
             ? "human_takeover: Mac control was explicitly handed back. Return control to NativeAgent before continuing; nothing was sent."
             : personUsingMac
     }

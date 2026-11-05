@@ -10,10 +10,10 @@ import ChatTurnRuntime
 import PersistenceCore
 import ProviderRouting
 import OSLog
-// Blueprint: | `ICloudConnection.swift` | Checked CloudKit setup and account connection; push, wake and NetworkSense return events drain the one transport; unavailable registration is reported without a polling reader |
+// Blueprint: | `ICloudConnection.swift` | Checked CloudKit/account setup; push and lifecycle events own drains. |
 extension iCloudBridge {
     public func setup() {
-        // N10 fix: guard against repeat setup() calls stacking KVS observers.
+        // Idempotent setup prevents duplicate KVS observers.
         guard !isSetUp else { return }
         isSetUp = true
         if pairedPhonesSubscription == nil {
@@ -37,9 +37,7 @@ extension iCloudBridge {
         // Restore the persisted replay window before the first receive event.
         guard loadCKSeenIDs() else { return }
         recordCloudKitPushEvidence()
-        // CloudKit is independent of the ubiquity/Drive mount. Public
-        // Developer ID builds may have the CloudKit service without
-        // CloudDocuments; the required transport is entitlement-checked here.
+        // CloudKit can be entitled without CloudDocuments; validate its transport independently of the Drive mount.
         configureDeviceTransportIfAvailable()
         guard deviceTransport != nil else {
             available = false
@@ -97,8 +95,7 @@ extension iCloudBridge {
         for id in ids where seenMessageIDs.insert(id).inserted {
             seenMessageIDsOrdered.append(id)
         }
-        // CK-3c: also restore CK-consumed ids (UserDefaults) into the unified
-        // seen-set so a restart doesn't re-deliver a CloudKit message.
+        // Restore consumed CloudKit IDs before receiving so a restart cannot redeliver them.
         guard loadCKSeenIDs() else { return }
         trimSeenMessageIDsIfNeeded()
         let failure = await sync.engine.start(docsURL: docsURL)
@@ -106,7 +103,6 @@ extension iCloudBridge {
         available = failure == nil
         syncStatus = failure ?? "iCloud readiness not checked"
         doctorTransportHealth = failure.map { .unavailable($0) } ?? .unmeasured
-        // Start KVS change observation
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(kvsDidChange(_:)),
@@ -118,7 +114,6 @@ extension iCloudBridge {
         }
         // Teardown can retire this setup during the final KVS suspension too.
         guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
-        // Start NSMetadataQuery watching iOS outbox folder
         startMetadataQuery(docsURL: docsURL)
     }
     /// Publication reports acceptance of the requested groups, not readiness.
@@ -129,8 +124,7 @@ extension iCloudBridge {
             "CloudKit did not accept the phone's \($0.key.rawValue) snapshot: \($0.value.localizedDescription)"
         } ?? "CloudKit accepted the requested snapshots"
     }
-    /// Starts the checked CloudKit transport without depending on iCloud Drive.
-    /// The factory remains the sole entitlement guard; refusal closes setup.
+    /// The factory's entitlement guard must admit CloudKit without depending on a Drive mount.
     private func configureDeviceTransportIfAvailable() {
         guard deviceTransport == nil else { return }
         let transport: CloudKitDeviceTransport
@@ -161,7 +155,8 @@ extension iCloudBridge {
         transport.observeStatus(key: NAPhoneForegroundPresence.statusKey, pairingSecret: {
             guard let encoded = try? PairingSecret.existingSecretBase64() else { return nil }
             return Data(base64Encoded: encoded)
-        }) { [weak self] value, writtenAt, originatingPairing in
+        }) { [weak self] value, writtenAt, originatingPairing, _ in
+            // The Mac's presence read runs no push recovery: its recovery budget is the phone's.
             await self?.acceptPhoneForegroundPresence(value, writtenAt: writtenAt,
                 originatingPairing: originatingPairing, generation: generation) ?? false
         }
@@ -188,8 +183,7 @@ extension iCloudBridge {
             for await up in paths {
                 guard let self, !Task.isCancelled, self.isSetUp,
                       self.setupGeneration == generation else { return }
-                // The first value is a replay; later up edges are returns even
-                // if a busy drain coalesced the intervening offline value.
+                // The first value is replay; later up edges count even if a busy drain coalesced the offline edge.
                 let regained = receivedState && up
                 receivedState = true
                 if regained { _ = await self.drainDeviceTransport(trigger: .network) }
@@ -213,9 +207,7 @@ extension iCloudBridge {
     var deviceReceiveNote: String {
         cloudKitPushUnavailable ? "push unavailable — repair APNs registration; receive resumes on push or an explicit refresh" : ""
     }
-    /// A received push proves delivery across launches; an unannounced phone
-    /// message older than two eight-second re-signals disproves it. This local
-    /// scalar is separate from account failures, which a healthy pull clears.
+    /// Received push proves wake delivery; missing two eight-second re-signals disproves it, independently of account health.
     func recordCloudKitPushEvidence(received: Bool? = nil) {
         let url = sync.dataRoot.appendingPathComponent("icloud/chat_push_proof.json")
         do {
@@ -229,27 +221,27 @@ extension iCloudBridge {
             nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription)
         }
     }
-    /// The drain and the presence beat run only over the transport: without it
-    /// they are off, not overdue.
+    /// Drain and presence are off without a transport, never overdue.
     func recordTransportOrgansOff(_ reason: String) {
         for organ in ["icloud_drain", "presence_beat"] { OrganPulse.recordOff(organ, because: reason) }
     }
     /// Registration alone does not prove the subscription can wake this process.
     public func cloudKitPushRegistrationSucceeded() {
         Self.pushLog.notice("APNs registration succeeded")
-        // Registration alone cannot clear a failed subscription or prove an
-        // end-to-end wake. A received chat push below proves that path works.
+        // Registration cannot clear subscription failure; only a received chat push proves end-to-end wake.
     }
     public func cloudKitPushRegistrationFailed(_ error: Error) {
         Self.pushLog.error("APNs registration failed: \(error.localizedDescription, privacy: .private)")
         guard deviceTransport != nil else { return }
-        syncStatus = "CloudKit receive wake registration failed: \(error.localizedDescription). Repair APNs registration; open Connection to refresh explicitly."
+        syncStatus = """
+            CloudKit receive wake registration failed: \(error.localizedDescription). Repair APNs registration; open Connection to refresh explicitly.
+            """
         nativeLog("[iCloudBridge] CloudKit push unavailable; repair APNs registration to restore receive wakes")
         recordCloudKitPushUnavailable()
     }
     func recordCloudKitPushUnavailable() {
         cloudKitPushUnavailable = true
-        OrganPulse.record("icloud_drain", .skipped, note: deviceReceiveNote)
+        OrganPulse.record("icloud_drain", .held, note: deviceReceiveNote)
         recordCloudKitPushEvidence(received: false)
     }
     public func recognizesCloudKitRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {

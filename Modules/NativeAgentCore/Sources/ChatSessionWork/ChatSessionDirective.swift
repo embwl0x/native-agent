@@ -1,19 +1,16 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ChatSessionDirective.swift` | `ChatSessionDirective.recordURL` uses canonical session path validation; seven-day delivery eligibility leaves expired/delivered records on disk |
+// Blueprint: | `ChatSessionDirective.swift` | `ChatSessionDirective.recordURL`. |
 
-// One-shot instructions belong to their session's next accepted user turn.
-// One shot, like the note: stamped delivered after provider acceptance.
-// Expiry bounds delivery eligibility; existing records remain on disk.
-// Storage: local backup, data export and phone sync exclude these records;
-// off-disk backup includes them. PrivacyMap: context. No automatic deletion.
+// Deliver one-shot instructions only to the session's next accepted user turn; stamp delivery after provider acceptance.
+// Expiry bounds eligibility without deleting records.
+// Local backup, export and phone sync exclude directives; off-disk backup and PrivacyMap/context retain them.
 public struct ChatSessionDirectiveRecord: Codable, Equatable, Sendable {
     public var createdAt: String
     public var directive: String
     public var deliveredAt: String?
-    /// The claim the line is about, when it is about one. Kept after delivery:
-    /// it is what stops the same claim being raised a second time.
+    /// Retain the claim after delivery to prevent raising it twice.
     public var claimKey: String?
 
     public init(
@@ -31,7 +28,7 @@ public struct ChatSessionDirectiveRecord: Codable, Equatable, Sendable {
 
 public enum ChatSessionDirective {
 
-    /// Seven-day delivery window; expiry returns nil without changing the file.
+    /// Seven-day expiry ends eligibility without changing the file.
     public static let retentionSeconds: TimeInterval = 7 * 24 * 60 * 60
 
     public static func recordURL(dataRoot: URL, sessionID: String) -> URL? {
@@ -44,14 +41,13 @@ public enum ChatSessionDirective {
 
     public static func load(dataRoot: URL, sessionID: String) throws -> ChatSessionDirectiveRecord? {
         guard let url = recordURL(dataRoot: dataRoot, sessionID: sessionID) else {
-            throw ChatSessionCompactionTranscriptError(errorDescription: "The session directive has an invalid session identity.")
+            throw SessionTranscriptError(errorDescription: "The session directive has an invalid session identity.")
         }
         do {
             return try JSONDecoder().decode(ChatSessionDirectiveRecord.self, from: Data(contentsOf: url))
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
     }
 
-    /// The directive this session still owes its next turn, or nil.
     public static func pendingDirective(
         dataRoot: URL,
         sessionID: String,
@@ -63,7 +59,8 @@ public enum ChatSessionDirective {
         guard !directive.isEmpty else { return nil }
         let formatter = ISO8601DateFormatter()
         guard let created = formatter.date(from: record.createdAt) else {
-            throw ChatSessionCompactionTranscriptError(errorDescription: "The session directive's creation time is invalid. Repair the saved directive before delivery.")
+            throw SessionTranscriptError(
+                errorDescription: "The session directive's creation time is invalid. Repair the saved directive before delivery.")
         }
         if now.timeIntervalSince(created) > retentionSeconds {
             return nil
@@ -71,7 +68,7 @@ public enum ChatSessionDirective {
         return directive
     }
 
-    /// Idempotent durable settlement; an unavailable stamp remains owed.
+    /// Settlement is idempotent; an unavailable stamp remains owed.
     public static func markDelivered(
         dataRoot: URL,
         sessionID: String,

@@ -5,44 +5,18 @@ import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `NativeKnowledgeGraphContextProjection.swift` | `KnowledgeGraphContext`: rebuildable graph atoms, support and triggers with canonical-source verification; unreadable graph retains rebuild inputs with source-unavailable health, while selection/expansion reread graph hashes and withhold unverified relations |
+// Blueprint: | `NativeKnowledgeGraphContextProjection.swift` | `KnowledgeGraphContext`: bounded selectable graph atoms; canonical verification |
 
-/// The knowledge graph, made REACHABLE instead of dark.
-///
-/// Before this projection the graph had exactly one prompt path: the legacy
-/// recall lane's `related:` garnish, which needs a non-empty `ctx.recalled` —
-/// and an active ContextFlow turn leaves that empty by design. 663 entities and
-/// their typed edges therefore never reached a live turn.
-///
-/// The fix is clause 6, not clause 6's opposite: relations become first-class
-/// SELECTABLE atoms in the resident index, ranked by the same lexical/semantic
-/// selector as everything else, and pulled only when the message actually
-/// touches them. Nothing here is injected unconditionally — the atoms are
-/// `.adaptive`, they carry no `always` policy, and the `.relationship` kind cap
-/// in `ContextSelectionConfiguration` bounds how much of a packet they can ever
-/// take.
-///
-/// ── BOUNDS ───────────────────────────────────────────────────────────────────
-/// Three caps, all applied before anything is published:
-///   - per subject entity (`maximumRelationsPerEntity`), so the hub entity User
-///     touches most of the graph and cannot flood the index;
-///   - total (`maximumRelations`);
-///   - body shape: one short "A —works_on→ B" line, never a relation body.
-///
-/// ── FAILURE ──────────────────────────────────────────────────────────────────
-/// A missing graph is an empty graph. An unreadable one keeps the last good
-/// relations as rebuild inputs, reports their source failure, and withholds
-/// unverified relations at selection/expansion — a garnish must
-/// never be able to fail the whole context generation that also carries
-/// persona, memory and resident work.
+/// Keep relations selectable rather than always injected; adaptive policy and the relationship cap bound packet mass. Per-entity and total caps prevent hub
+/// entities from flooding the index; bodies stay short pointers to structure. An unreadable graph retains rebuild inputs but withholds unverified relations,
+/// leaving other context sources available. A missing graph starts empty; an unreadable graph cannot fail unrelated persona, memory or work context.
 struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.knowledge-graph"
     static let schemaVersion = "knowledge-graph-context-projection-v1"
     static let maximumRelations = 192
     static let maximumRelationsPerEntity = 4
 
-    /// Same tier the memory lane defaults to for a `local_private` record:
-    /// User's authenticated personal surfaces, never Slack.
+    /// Personal-surface disclosure keeps local-private graph relations off Slack.
     static let surfaces: Set<ContextSurface> = Set(
         MemoryRecordDisclosurePolicy.localPrivateSurfaces.map(ContextSurface.init(rawValue:))
     )
@@ -74,16 +48,13 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
         self.dataRoot = dataRoot
     }
 
-    /// A chosen edge is spoken only while the memory that last asserted it
-    /// is active, unchanged since compile, and disclosed on this surface; the
-    /// supporting records are read by id with the memory atoms' own rule.
+    /// Speak an edge only while its supporting memory is active, unchanged since compilation and disclosed on this surface.
     func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
                 surface: ContextSurface) async -> ContextTurnExclusion {
         let owned = Set(generation.sources.lazy.filter { $0.descriptor.owner == Self.owner }.map(\.descriptor.id))
         let relations = chosen.filter { owned.contains($0.draft.sourceID) }
         guard !relations.isEmpty else { return ContextTurnExclusion() }
-        // Supporting memories alone cannot confirm that the graph read worked.
-        // Reread the canonical graph for both selection and later expansion.
+        // Supporting memories cannot prove the graph is readable; selection and expansion must reread its canonical owner.
         let current: (sources: [ContextCompiledSource], failures: [ContextSourceID: String])
         do { current = Self.prepare(try await readRelations()) }
         catch {
@@ -128,8 +99,7 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
         return exclusion
     }
 
-    /// The edge's supporting memory, `id@version`, carried in every atom;
-    /// `none` marks a relation no memory asserted.
+    /// Carry id@version provenance; none marks a relation with no asserting memory.
     static let supportKind = "supporting_memory"
 
     func compiledProjection(
@@ -168,9 +138,7 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
 }
 
 extension KnowledgeGraphContext {
-    /// One source per subject entity, one atom per edge. Grouping this way lets
-    /// the selector's existing `maximumAtomsPerSource` bound keep a single
-    /// entity from owning the whole relationship budget of one packet.
+    /// Group by subject so maximumAtomsPerSource prevents one entity consuming the packet's relationship budget.
     static func prepare(_ relations: [KnowledgeGraphContextRelation]) -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
         let usable = relations.filter { relation in
             let body = self.body(relation)
@@ -216,9 +184,7 @@ extension KnowledgeGraphContext {
         return (sources, failures)
     }
 
-    /// The whole atom body. A relation is a pointer to structure, not a
-    /// document: anything longer would be a second memory block wearing the
-    /// graph's name.
+    /// Keep the body a short structural pointer so graph context cannot become a second memory block.
     static func body(_ relation: KnowledgeGraphContextRelation) -> String {
         let subject = NativeContextProjectionText.clean(relation.subject)
         let predicate = NativeContextProjectionText.clean(relation.predicate)
@@ -242,13 +208,7 @@ extension KnowledgeGraphContext {
             headingPath: [],
             blockAnchor: "kg-relation-" + edgeDigest
         )
-        // ONLY the two endpoints are selection keys, and they carry the kind
-        // `ContextCorrectionScope.relationshipEntityKind` — which is also what
-        // gates ELIGIBILITY, so an edge whose endpoints this message never
-        // named is excluded outright rather than left to rank low. The
-        // predicate is what the atom SAYS, never how it is found: admitting it
-        // here (or as a trigger) would let a generic "who owns what?" pull
-        // unrelated edges, which is prompt mass wearing reach's name.
+        // Only named endpoints establish eligibility; predicates would let generic questions pull unrelated edges.
         let entities = [ContextEntity(kind: supportKind, id: Self.support(relation), label: "")] + [
             ContextEntity(
                 kind: ContextCorrectionScope.relationshipEntityKind,
@@ -271,7 +231,8 @@ extension KnowledgeGraphContext {
             body: body,
             authority: .inferred,
             confidence: min(1, max(0, relation.weight)),
-            freshness: ContextFreshness(updatedAt: try NativeContextProjectionText.requiredDate(relation.lastSeen, owner: "graph \(relation.subjectID) lastSeen")),
+            freshness: ContextFreshness(
+                updatedAt: try NativeContextProjectionText.requiredDate(relation.lastSeen, owner: "graph \(relation.subjectID) lastSeen")),
             privacy: .localPrivate,
             permittedSurfaces: surfaces,
             injectionPolicy: .adaptive,
@@ -289,8 +250,7 @@ extension KnowledgeGraphContext {
         relation.memoryID.map { $0 + "@" + (relation.memoryVersion ?? "") } ?? "none"
     }
 
-    /// Endpoint names only — see the note on `entities`. The predicate is
-    /// deliberately absent.
+    /// Predicates never participate in selection; only endpoint names do.
     static func triggers(_ relation: KnowledgeGraphContextRelation) -> [String] {
         let text = [relation.subject, relation.object].joined(separator: " ")
         return NativeContextProjectionText.triggers(text)

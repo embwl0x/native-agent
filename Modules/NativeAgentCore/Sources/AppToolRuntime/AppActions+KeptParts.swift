@@ -25,22 +25,22 @@ import ChatTurnContracts
 import ChromeControl
 import StandingBots
 import Studio
-// Blueprint: | `AppActions+KeptParts.swift` | AppActions kept-part turn glance: newly kept, message-ranked, then unranked failed/recent rows; autonomous abilities collapse to a findable count, word-boundary descriptions and current-version failure reasons fit the existing budget; read-only rendering carries exact fresh stamps to provider-accepted delivery for conditional shown markers; marker save failures become readFailure repair notes through RepairOwed without failing provider output; counts-only inventory/ranking/state/render timing |
+// Blueprint: | `AppActions+KeptParts.swift` | Bounded kept-part glance |
 
 extension AppActions {
-    /// Newly kept, message matches, then failed and recent; autonomous parts have one findable count.
-    static func parts(_ message: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2) async -> PreparedWorkspaceGlance {
+    /// Autonomous parts collapse to one findable count so kept-part context stays bounded.
+    static func parts(_ message: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2,
+                      turn: Turn?) async -> PreparedWorkspaceGlance {
         var timings: [String: JSONValue] = [:]
         var readStart = DispatchTime.now().uptimeNanoseconds
         func measured(_ name: String) {
             let now = DispatchTime.now().uptimeNanoseconds
             timings[name] = .int(Int64((now - readStart) / 1_000_000)); readStart = now
         }
-        defer { TurnTraceBus.fireFromContext(kind: "context.parts.summary", payload: .object(["stageMs": .object(timings)])) }
-        /// What she calls to run it: its own action.
+        defer { TurnTraceBus.fireFromContext(kind: "context.parts.summary", payload: .object(["stageMs": .object(timings)]), turn: turn) }
         func call(_ action: AppAction) -> String? { action.authored ? action.id : nil }
         do {
-            let snapshot = try await inventory(dataRoot: dataRoot)
+            let snapshot = try await inventory(dataRoot: dataRoot, turn: turn)
             measured("inventory")
             let own = snapshot.actions.compactMap { action in call(action).map { ($0, action) } }
             if own.isEmpty {
@@ -52,7 +52,7 @@ extension AppActions {
             if message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 rankedActions = []
             } else {
-                let ranking = try await ranked(message, pages: pages, dataRoot: dataRoot, memory: memory, inventory: snapshot)
+                let ranking = try await ranked(message, pages: pages, dataRoot: dataRoot, memory: memory, inventory: snapshot, turn: turn)
                 rankedActions = ranking.actions
             }
             measured("ranking")
@@ -62,14 +62,12 @@ extension AppActions {
             let states = catalog.states
             let recent = Dictionary(uniqueKeysWithValues: states.compactMap { id, state in usedAt(state).map { (id, $0) } })
             let files = Dictionary(uniqueKeysWithValues: catalog.files.filter { $0.kind == .part }.map { ($0.id, $0) })
-            let kept = keptParts(Array(files.values), states: states)
             let clock = DateFormatter()
             clock.locale = Locale(identifier: "en_US_POSIX"); clock.dateFormat = "h:mm a"
             let failures = Dictionary(uniqueKeysWithValues: files.values.compactMap { file in
                 lastRunFailure(file, state: states[file.id], store: store, clock: clock).map { (file.id, $0) }
             })
             measured("states_kept")
-            func fresh(_ action: AppAction) -> KeptPart? { kept[action.tool] }
             func onItsOwn(_ action: AppAction) -> Bool {
                 guard let file = files[action.tool] else { return false }
                 return file.metadata["resident"] == .bool(true) || !(file.metadata["wake"]?.arrayValue ?? []).isEmpty
@@ -77,8 +75,6 @@ extension AppActions {
             let autonomous = own.filter { onItsOwn($0.1) }.count
             let ordered = own.enumerated().filter { !onItsOwn($0.element.1) }.sorted {
                 let left = $0.element, right = $1.element
-                let leftFresh = fresh(left.1) != nil, rightFresh = fresh(right.1) != nil
-                if leftFresh != rightFresh { return leftFresh }
                 let leftRank = rank[left.0] ?? .max, rightRank = rank[right.0] ?? .max
                 if leftRank != rightRank { return leftRank < rightRank }
                 if leftRank == .max {
@@ -90,7 +86,7 @@ extension AppActions {
                 }
                 return $0.offset < $1.offset
             }.map(\.element)
-            /// Its line: how to run it, how often she has, and, when every line has room, how to read its code.
+            /// Include source-read guidance only when every part line has room.
             func line(_ call: String, _ action: AppAction, reads: Bool) -> String {
                 var used = ""
                 if case .int(let count)? = states[action.tool]?.objectValue?["useCount"] {
@@ -98,45 +94,21 @@ extension AppActions {
                     if count == 1 { used = ", used once" }
                 }
                 let failed = failures[action.tool].map { ", " + $0 } ?? ""
-                return "- " + (fresh(action).map { $0.mark + ": " } ?? "") + call + used + (reads ? " (read: ability.read " + action.tool + ")" : "")
+                return "- " + call + used + (reads ? " (read: ability.read " + action.tool + ")" : "")
                     + failed + " — " + partDescription(firstSentence(action.schema?.description ?? action.label))
             }
-            var text = "Your abilities, newly kept first; best matches, then failed and recent:"
+            var text = "Your abilities, best matches first, then failed and recent:"
             let autonomousLine = autonomous > 0 ? "\n+\(autonomous) run on their own (find)" : ""
             let reads = ordered.reduce(text.count + autonomousLine.count) { $0 + 1 + line($1.0, $1.1, reads: true).count } <= 900
-            let lines = ordered.map { (fresh($0.1), line($0.0, $0.1, reads: reads)) }
-            var shown: [KeptPart] = []
-            for (count, (part, line)) in lines.enumerated() {
+            let lines = ordered.map { line($0.0, $0.1, reads: reads) }
+            for (count, line) in lines.enumerated() {
                 let more = count + 1 < lines.count ? "\n+\(lines.count - count - 1) more (find)" : ""
                 if text.count + 1 + line.count + autonomousLine.count + more.count > 900 { text += "\n+\(lines.count - count) more (find)"; break }
                 text += "\n" + line
-                if let part { shown.append(part) }
             }
             text += autonomousLine
             measured("render")
-            let rendered = text, stamps = shown, turn = TurnTraceContext.turnId
-            return PreparedWorkspaceGlance(rendered, delivered: { input in
-                guard input.contains(rendered), let turn, !stamps.isEmpty else { return }
-                do {
-                    try acknowledge(stamps, dataRoot, turn: turn)
-                    // Saving works again: any earlier marker repair is settled by this save.
-                    RepairOwed.settle(dataRoot, operation: "abilities.shown",
-                        evidence: .init(source: "abilities/state.json", id: turn))
-                } catch {
-                    let state = AbilityStore(dataRoot: dataRoot).root.appendingPathComponent("state.json")
-                    let failure = ToolFailureError("The delivered abilities were read, but saving their shown markers failed: \(error.localizedDescription) Some markers may already be saved; entries may appear new again. Preserve run accounting and keptAfter stamps when repairing abilities/state.json.",
-                        effects: .unknown, owner: state.path, code: "ability_shown_write_failed",
-                        instruction: ToolFailureError.fileRepairInstruction(state,
-                            shape: "Preserve run accounting and keptAfter stamps. Reconcile shown markers only from retained turn evidence; never invent markers, reset accounting or change ability authority."),
-                        recovery: .repair)
-                    let note = AgentWorkspacePorts.readFailure(failure, reason: "ability_shown_write_failed",
-                        remedy: failure.remedy())
-                    // The reply already exists. Keep its bookkeeping repair with
-                    // the existing owner, off the provider's success/failure path.
-                    RepairOwed.owe(dataRoot, id: "abilities-shown:" + turn, kind: .run,
-                        operation: "abilities.shown", owner: state.path, words: note)
-                }
-            })
+            return PreparedWorkspaceGlance(text)
         } catch {
             return PreparedWorkspaceGlance("Your abilities could not be read: " + AgentWorkspacePorts.readFailure(error,
                 reason: "ability_inventory_unavailable", remedy: Repair.remedy(owner: "ability inventory",
@@ -175,36 +147,5 @@ extension AppActions {
         let at = last["at"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601) ?? usedAt(state)
         let when = at.map { clock.string(from: $0) } ?? "(time unknown)"
         return "failed last run " + when + ": " + (reason.isEmpty ? outcome : reason)
-    }
-
-    /// A part her private moment after a turn kept or revised: its file, the stamp read, and how her parts fact marks it.
-    struct KeptPart: Sendable { let id: String; let stamp: [String: JSONValue]; let mark: String }
-
-    /// The kept parts by name, each new until a later turn delivers it once.
-    static func keptParts(_ files: [AbilityStore.File], states: [String: JSONValue]) -> [String: KeptPart] {
-        let turn = TurnTraceContext.turnId
-        let clock = DateFormatter()
-        clock.dateStyle = .none; clock.timeStyle = .short
-        var kept: [String: KeptPart] = [:]
-        for file in files {
-            guard case .object(let state)? = states[file.id], case .object(let stamp)? = state["keptAfter"],
-                  case .string(let keptTurn)? = stamp["turn"], keptTurn != turn,
-                  case .string(let iso)? = stamp["at"], let at = NativeTimestampFormat.parseISO8601(iso) else { continue }
-            if case .string(let shown)? = stamp["shown"], shown != turn { continue }
-            kept[file.id] = KeptPart(id: file.id, stamp: stamp, mark: "new — kept after your turn at " + clock.string(from: at))
-        }
-        return kept
-    }
-
-    /// This turn has shown these: each is marked only while its stamp is the one read, so a keep that landed since stays new.
-    static func acknowledge(_ parts: [KeptPart], _ dataRoot: URL, turn: String) throws {
-        let store = AbilityStore(dataRoot: dataRoot)
-        for part in parts where part.stamp["shown"] == nil {
-            try store.updateState(id: part.id) { fields in
-                guard case .object(let live)? = fields["keptAfter"], live["turn"] == part.stamp["turn"], live["at"] == part.stamp["at"],
-                      live["shown"] == nil else { return }
-                fields["keptAfter"] = .object(live.merging(["shown": .string(turn)]) { $1 })
-            }
-        }
     }
 }

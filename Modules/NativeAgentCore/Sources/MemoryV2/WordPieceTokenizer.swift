@@ -1,6 +1,4 @@
-// Pure-Swift WordPiece tokenizer for bge's BERT vocabulary.
-//
-// The vocabulary is resolved beside bge's embedding.json as vocab.txt.
+// Resolve WordPiece vocabulary beside bge's embedding.json so tokenization matches the model.
 
 import Foundation
 
@@ -57,7 +55,7 @@ public final class WordPieceTokenizer: Sendable {
         var ids: [Int] = []
         func appendWord(_ word: String) {
             guard !word.isEmpty else { return }
-            // Finish the word: an unmatched suffix replaces all its pieces with UNK.
+            // An unmatched suffix invalidates the whole word, replacing all pieces with UNK.
             let pieces = word.count > 100 ? [unkID] : wordpieceGreedy(word)
             ids.append(contentsOf: pieces.prefix(bodyMax + 1 - ids.count))
         }

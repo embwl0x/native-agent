@@ -6,14 +6,11 @@ import TrustCenter
 import ApplicationServices
 #endif
 
-// Blueprint: | `MacAXEffectObservation.swift` | `MacAXEffectObserverSource`, registration and collector: payload-free AX notifications, bounded signal waits and idempotent removal on the shared AX execution lane |
+// Blueprint: | `MacAXEffectObservation.swift` | `MacAXEffectObserverSource`: Payload-free signals; bounded waits and lane-owned cleanup |
 
 // MARK: - The effect-observer seam
 
-/// One AX notification, named only. NEVER any payload: a notification's
-/// userInfo can carry the changed VALUE (a password field's new contents on
-/// `AXValueChanged`), and this rides the turn trace, the operation store and
-/// the iOS/Telegram sync. The kind and the timestamp are the whole signal.
+/// Keep notifications payload-free: userInfo can contain passwords and the signal crosses traces, operation storage and device sync.
 public struct MacAXEffectNotification: Sendable, Equatable {
     public let kind: String
     public let at: Date
@@ -24,16 +21,14 @@ public struct MacAXEffectNotification: Sendable, Equatable {
     }
 }
 
-/// AX, attention and workspace registrations own idempotent `stop()` and deinitialization cleanup.
+/// Registrations must stop idempotently and release on deinitialization.
 public protocol MacAXEffectObservation: AnyObject, Sendable {
     func stop()
 }
 
-/// Observe the target process's named AX notifications; the live source registers on the main run loop.
+/// Live AX notifications require the main run loop.
 public protocol MacAXEffectObserverSource: Sendable {
-    /// Install an observer for `kinds` on `pid`. Returns nil when no observer
-    /// could be installed — which the caller must REPORT (`observed: false`
-    /// with a reason), never hide behind a silent "no effect".
+    /// An unavailable observer returns nil so callers report unobserved with a reason, never infer no effect.
     func install(
         pid: Int32,
         kinds: [String],
@@ -41,12 +36,9 @@ public protocol MacAXEffectObserverSource: Sendable {
     ) -> (any MacAXEffectObservation)?
 }
 
-
-/// Thread-safe sink for notifications arriving on the main run loop while the
-/// act waits off it.
+/// Notifications arrive on the main run loop while the act waits off it, so the sink must be thread-safe.
 public final class MacAXEffectCollector: @unchecked Sendable {
-    /// A pathological app can fire hundreds of notifications in 80 ms. Only the
-    /// first `hardCap` are retained; the count of the rest is still reported.
+    /// Cap retained events because apps can emit hundreds in milliseconds; still report the dropped count.
     public static let hardCap = 64
 
     private let lock = NSLock()
@@ -85,8 +77,7 @@ public final class MacAXEffectCollector: @unchecked Sendable {
         return fired
     }
 
-    /// One consumer per collector. Register before checking the latch so a
-    /// notification between the caller's read and its suspension is retained.
+    /// One consumer per collector. Register before checking the latch so a notification between the caller's read and its suspension is retained.
     func waitForSignal(seconds: Double) async -> Bool {
         let (events, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         lock.withLock {
@@ -138,8 +129,7 @@ public final class MacAXEffectCollector: @unchecked Sendable {
 
 #if canImport(ApplicationServices) && os(macOS)
 
-/// Box carried through the AX callback's `refcon`. Retained for the lifetime of
-/// the registration and released exactly once by `stop()`.
+/// The registration retains the callback refcon until stop releases it exactly once.
 private final class MacAXEffectObserverBox {
     let onNotification: @Sendable (MacAXEffectNotification) -> Void
     init(onNotification: @escaping @Sendable (MacAXEffectNotification) -> Void) {
@@ -170,9 +160,7 @@ private final class SystemMacAXEffectObservation: MacAXEffectObservation, @unche
         }
         stopped = true
         lock.unlock()
-        // Same execution lane every other AX transaction in this module uses:
-        // AX calls can synchronously enter the TARGET app's main-thread-isolated
-        // handlers, and removing a notification is an AX call like any other.
+        // AX removal can enter the target's main-thread handlers, so teardown uses the shared AX execution lane.
         MacAXExecutionLane.sync {
             for kind in kinds {
                 AXObserverRemoveNotification(observer, element, kind as CFString)
@@ -189,8 +177,7 @@ private final class SystemMacAXEffectObservation: MacAXEffectObservation, @unche
     deinit { stop() }
 }
 
-/// The real `AXObserver`, sourced on the MAIN run loop (which is where the AX
-/// framework delivers) and created/removed on `MacAXExecutionLane`.
+/// AX delivers on the main run loop; creation and removal stay on MacAXExecutionLane.
 public struct SystemMacAXEffectObserverSource: MacAXEffectObserverSource {
     public init() {}
 
@@ -218,9 +205,7 @@ public struct SystemMacAXEffectObserverSource: MacAXEffectObserverSource {
                     subscribed.append(kind)
                 }
             }
-            // Not one kind subscribed: there is nothing to remove and nothing
-            // to hear. Report the failure by returning nil rather than handing
-            // back a registration that can never fire.
+            // No subscribed kind means no working channel; return nil instead of an inert registration.
             guard !subscribed.isEmpty else {
                 Unmanaged<MacAXEffectObserverBox>.fromOpaque(refcon).release()
                 return nil
@@ -242,9 +227,7 @@ public struct SystemMacAXEffectObserverSource: MacAXEffectObserverSource {
 
 #endif
 
-/// Honest unavailability: installs nothing and says so by returning nil, so the
-/// act reports `observed: false, reason: "observer_unavailable"` instead of
-/// silently claiming the app produced no effect.
+/// Return nil so unsupported platforms report observer_unavailable rather than claim no effect.
 public struct UnavailableMacAXEffectObserverSource: MacAXEffectObserverSource {
     public init() {}
     public func install(

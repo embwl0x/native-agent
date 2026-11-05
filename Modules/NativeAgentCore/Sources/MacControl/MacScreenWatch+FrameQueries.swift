@@ -7,20 +7,20 @@ import Experiences
 import PersistenceCore
 import ScreenCaptureKit
 import Synchronization
-// Blueprint: | `MacScreenWatch+FrameQueries.swift` | `MacScreenWatch.read`: generation-bound pixel colour, mean, change and redacted text queries; admitted reads publish only while open under the same secret verdict |
+// Blueprint: | `MacScreenWatch+FrameQueries.swift` | `MacScreenWatch.read`: Exact-frame pixel/text queries require current watch and secret verdicts |
 
 extension MacScreenWatch {
-    /// Native answers about the newest frame, in its pixels: `{at:[x,y]}` its
-    /// exact colour, `{mean:[x,y,w,h]}` the mean colour and luminance,
-    /// `{changed:[x,y,w,h]}` the share of pixels that changed against the
-    /// frame before, `{text:[x,y,w,h]}` the text there, the whole frame read
-    /// on device and redacted as one picture. A frame a newer one replaced, or
-    /// of another watch, has expired; it is never answered by a newer one.
+    /// Queries inspect the exact newest frame; replaced or foreign frame ids expire rather than silently reading a newer picture. Recognize and
+    /// redact text across the whole frame before selecting a region so captions protect nearby values.
     public func read(watch: Int, seq: Int, queries: [JSONValue]) async throws -> JSONValue {
         guard admitOperation() else { throw over ?? CancellationError() }
         defer { finishOperation() }
         func bad() -> SenseFailure {
-            SenseFailure(code: "bad_input", message: "frame.read takes 1 to 1024 queries, each {at:[x,y]}, {mean:[x,y,w,h]}, {changed:[x,y,w,h]} or {text:[x,y,w,h]}, in this frame's pixels.")
+            SenseFailure(code: "bad_input",
+                message: """
+                    frame.read takes 1 to 1024 queries, each {at:[x,y]}, {mean:[x,y,w,h]}, {changed:[x,y,w,h]} or {text:[x,y,w,h]}, in this frame's \
+                    pixels.
+                    """)
         }
         guard await allowed() else { throw over ?? bad() }
         guard watch == generation, let (frame, painted) = lock.withLock({ newest.flatMap { $0.seq == seq ? ($0, verdict) : nil } }) else {
@@ -44,8 +44,7 @@ extension MacScreenWatch {
             let x0 = max(0, n[0]), y0 = max(0, n[1]), x1 = min(width, n[0] + n[2]), y1 = min(height, n[1] + n[3])
             guard x0 < x1, y0 < y1 else { throw bad() }
             if kind == "text" {
-                // Redaction judges a caption and its value together, so the whole
-                // frame is recognised once; only the lines inside the region return.
+                // Whole-frame recognition judges captions and values together before returning only the requested region.
                 if recognized == nil {
                     guard let provider = CGDataProvider(data: Data(frame.pixels) as CFData),
                           let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
@@ -70,7 +69,7 @@ extension MacScreenWatch {
                     if kind == "mean" {
                         sum.b += Int(frame.pixels[at]); sum.g += Int(frame.pixels[at + 1]); sum.r += Int(frame.pixels[at + 2])
                     } else if let prior = frame.prior,
-                              // A small threshold leaves encoder noise out.
+                              // Ignore small pixel differences caused by encoder noise.
                               max(abs(Int(frame.pixels[at]) - Int(prior[at])), abs(Int(frame.pixels[at + 1]) - Int(prior[at + 1])),
                                   abs(Int(frame.pixels[at + 2]) - Int(prior[at + 2]))) > 24 { changed += 1 }
                 }
@@ -84,8 +83,7 @@ extension MacScreenWatch {
                                         "l": .int(Int64((0.2126 * r + 0.7152 * g + 0.0722 * b).rounded()))]))
             }
         }
-        // Answered only while the watch is open and the secret fields it was
-        // painted under still stand; a newer frame arriving meanwhile is fine.
+        // Retain admission only while the watch and its secret verdicts remain valid; newer frame arrival alone is harmless.
         try Task.checkCancellation()
         guard lock.withLock({ () -> Bool in
             guard ended == nil, verdict == painted else { return false }

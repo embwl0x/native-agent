@@ -1,49 +1,45 @@
 import Foundation
 import MacIntegration
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceReadiness.swift` | `AgentWorkspaceReadiness` enum; `withSnapshot`, `filter` |
+// Blueprint: | `AgentWorkspaceReadiness.swift` | `AgentWorkspaceReadiness` enum; explicit operation permission evidence through `withSnapshot`, `filter` |
 
-/// Presentation evidence only. Actual execution always re-enters the normal
-/// tool admission chain. No background refresh, app launch or remote probe.
+/// Presentation evidence only. Actual execution always re-enters the normal tool admission chain. No background refresh, app launch or remote probe.
 package enum AgentWorkspaceReadiness {
     struct Snapshot: Sendable {
         let permissions: Result<MacIntegrationPermissionReadiness, Error>
     }
 
-    @TaskLocal static var snapshot: Snapshot?
-
-    /// Share one canonical permission read across the entire workspace action,
-    /// including Home and its final action filtering. Never cache revocations
-    /// across separate actions or write a second permission authority.
-    package static func withSnapshot<T: Sendable>(dataRoot: URL,
-        operation: @Sendable () async throws -> T) async rethrows -> T {
+    /// Share permission evidence within one action, never across actions where a grant may have been revoked.
+    package static func withSnapshot<T: Sendable>(workspace: WorkspaceOperation, dataRoot: URL,
+        operation: @Sendable (WorkspaceOperation) async throws -> T) async rethrows -> T {
         let permissions: Result<MacIntegrationPermissionReadiness, Error>
         do { permissions = .success(try await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()) }
         catch { permissions = .failure(error) }
-        return try await $snapshot.withValue(Snapshot(permissions: permissions), operation: operation)
+        var workspace = workspace
+        workspace.readiness = Snapshot(permissions: permissions)
+        return try await operation(workspace)
     }
 
-    static func allows(tool name: String) -> Bool {
-        guard let gate = AgentWorkspacePorts.current.tools.macIntegrationGate(name)
-            ?? AgentWorkspacePorts.current.tools.macIntegrationGate(name.replacingOccurrences(of: ".", with: "_")) else { return true }
-        guard case .success(let permissions)? = snapshot?.permissions else { return false }
+    static func allows(workspace: WorkspaceOperation, tool name: String) -> Bool {
+        guard let gate = workspace.ports.tools.macIntegrationAccess(name)
+            ?? workspace.ports.tools.macIntegrationAccess(name.replacingOccurrences(of: ".", with: "_")) else { return true }
+        guard case .success(let permissions)? = workspace.readiness?.permissions else { return false }
         return !(gate.mode == .read ? permissions.operatorReadOff : permissions.operatorWriteOff).contains(gate.integration)
     }
 
-    static func allows(_ action: AgentWorkspaceAction) -> Bool {
-        if case .window(let inner) = action { return allows(inner) }
-        return tool(action).map { allows(tool: $0) } ?? true
+    static func allows(workspace: WorkspaceOperation, _ action: AgentWorkspaceAction) -> Bool {
+        if case .window(let inner) = action { return allows(workspace: workspace, inner) }
+        return tool(action).map { allows(workspace: workspace, tool: $0) } ?? true
     }
 
-    /// Remove misleading active controls from every projected surface, including
-    /// Mail reply items and generic capability forms. This never grants access;
+    /// Remove misleading active controls from every projected surface, including Mail reply items and generic capability forms. This never grants access;
     /// changes after presentation are still enforced by the actual dispatcher.
-    static func filter(_ projection: WorkspacePage) -> WorkspacePage {
+    static func filter(workspace: WorkspaceOperation, _ projection: WorkspacePage) -> WorkspacePage {
         var result = projection
         var hidden = 0
         func buttons(_ buttons: [AgentWorkspaceButton]) -> [AgentWorkspaceButton] {
             buttons.filter { button in
-                let allowed = allows(button.action)
+                let allowed = allows(workspace: workspace, button.action)
                 if !allowed { hidden += 1 }
                 return allowed
             }
@@ -56,7 +52,7 @@ package enum AgentWorkspaceReadiness {
         }
         let permissions: MacIntegrationPermissionReadiness?
         let cause: String?
-        switch snapshot?.permissions {
+        switch workspace.readiness?.permissions {
         case .success(let value)?: permissions = value; cause = nil
         case .failure(let error)?: permissions = nil; cause = error.localizedDescription
         case nil: permissions = nil; cause = nil
@@ -69,7 +65,8 @@ package enum AgentWorkspaceReadiness {
                 ? "Mac permission settings could not be read. Integration actions are hidden until those settings are available."
                 : "Actions turned off by the operator are hidden. Existing drafts can still be kept or edited; no permission was changed.")
             if let cause {
-                content["permission_note"] = .string("Mac permission settings are unavailable: \(cause) Integration actions are hidden until the saved authority is repaired.")
+                content["permission_note"] = .string(
+                    "Mac permission settings are unavailable: \(cause) Integration actions are hidden until the saved authority is repaired.")
                 content["permission_remedy"] = Repair.why(owner: "security/mac_integration_permissions.json", tap: "Trust > Mac",
                     instruction: "Preserve the saved permission bytes and repair the authority before continuing.")
             }

@@ -2,7 +2,7 @@ import Foundation
 @preconcurrency import Speech
 @preconcurrency import AVFoundation
 
-// Blueprint: | `SpeechUtterance.swift` | `SpeechUtterance`: original audio/recognition evidence, submitted wording and compact uncertainty projection without rewriting hypotheses |
+// Blueprint: | `SpeechUtterance.swift` | `SpeechUtterance`: original recognition evidence and compact uncertainty |
 
 /// Recognition is evidence attached to the original audio, never a rewrite of it.
 public struct SpeechUtterance: Codable, Hashable, Sendable {
@@ -23,7 +23,7 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
         public init(text: String, segments: [Segment]) { self.text = text; self.segments = segments }
     }
     public let text: String
-    /// The person's submitted wording; recognition hypotheses remain original.
+    /// Submitted wording leaves original recognition hypotheses intact.
     public var correctedText: String?
     public var correctionReferences: [String]?
     public let isFinal: Bool
@@ -50,10 +50,7 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
 
     public var face: String { "Transcript: \(correctedText ?? text)" }
 
-    /// What she reads of a voice message: the transcript and the recognizer's
-    /// doubt (the words it was unsure of, with what else they may have been).
-    /// The full recognition record stays on the attachment; every word's
-    /// timing across every hypothesis was ~60K tokens for a one-minute note.
+    /// Expose transcript uncertainty compactly; per-word timing across every hypothesis makes ordinary voice context prohibitively large.
     public func evidence(audioReference: String) throws -> String {
         var lines = ["[Voice message · audio: \(self.audioReference ?? audioReference)]", face]
         if let correctedText, correctedText != text { lines.append("Recognized as: \(text)") }
@@ -65,8 +62,7 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
         return lines.joined(separator: "\n")
     }
 
-    /// One user-initiated capture. The attachment owner takes the bytes; abandoned
-    /// and failed captures remove their temporary audio when released.
+    /// One user-initiated capture. The attachment owner takes the bytes; abandoned and failed captures remove their temporary audio when released.
     public final class Recording: @unchecked Sendable {
         private let lock = NSLock()
         private let url: URL
@@ -94,8 +90,7 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
                 mime: "audio/x-caf", name: "voice.caf", byteSize: bytes.count, utterance: utterance)
         }
 
-        /// Borrow the closed original for compression without materializing raw
-        /// PCM/base64 in memory. Keep this Recording alive until export settles.
+        /// Borrow the closed original for compression without materializing raw PCM/base64 in memory. Keep this Recording alive until export settles.
         public func closeForExport() -> URL {
             lock.withLock { file = nil; return url }
         }

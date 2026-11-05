@@ -1,6 +1,4 @@
-// Projects accepted MemoryV2 facts into a conservative local entity set in
-// memory.sqlite kg_entities/kg_relationships. The `embedding_text` metadata
-// field is part of the shared search/tool payload contract.
+// Project accepted facts into canonical graph tables; `embedding_text` is part of the shared search/tool payload contract.
 
 import CryptoKit
 import Foundation
@@ -8,7 +6,7 @@ import NativeAgentShared
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `KnowledgeGraph+MemoryIndexing.swift` | `KnowledgeGraphMemoryFact`; ID-only canonical indexing and generation/mode-fenced projection reconciliation |
+// Blueprint: | `KnowledgeGraph+MemoryIndexing.swift` | `KnowledgeGraphMemoryFact`: canonical indexing and fenced reconciliation |
 
 public struct KnowledgeGraphMemoryFact: Sendable, Equatable {
     public var id: String
@@ -103,11 +101,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     /// Insert-only metadata_json provenance proves indexer ownership for GC; unstamped entities are never swept.
     static let createdByKey = "created_by_indexer"
 
-    /// Internal (not private): the GC extension lives in KnowledgeGraph+GC.swift.
+    /// Internal visibility lets GC share the indexer's ownership stamp.
     let sqlitePath: URL
-    /// Canonical onboarding identity source for the stable primary-user role
-    /// node. It is reread once per indexing/rebuild/GC operation so onboarding
-    /// and profile renames take effect without restarting, never once per fact.
+    /// Reread canonical onboarding identity once per operation, never per fact, so profile renames take effect without restart.
     private let explicitPrimaryUserName: String?
     private let primaryUserProfileURL: URL
 
@@ -120,9 +116,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     }
 
     public func reconcileProjectionIfNeeded(producing: Bool) async throws {
-        // A wake is not a certification that profile identity stayed unchanged.
-        // Check canonical fingerprints on every operation, including retained
-        // launch indexers, rather than trusting a prior memory-only generation.
+        // Check canonical fingerprints on every operation: retained indexers cannot assume profile identity stayed unchanged.
         projectionGeneration += 1
         if projectionProducing != producing {
             projectionProducing = producing
@@ -135,8 +129,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             } else {
                 _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: false)
             }
-            // A superseded startup rebuild can finish after retirement. Its
-            // completion must repair the current mode rather than certify it.
+            // A superseded startup rebuild can finish after retirement. Its completion must repair the current mode rather than certify it.
             reconciledProjectionGeneration = projectionGeneration == generation ? generation : nil
         }
     }
@@ -159,19 +152,17 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         let fingerprint: String
     }
 
-    /// One checked identity read for an indexing/reconciliation/GC operation.
     func resolvedExtractionIdentity() throws -> ExtractionIdentity {
         let profileNames = try Self.profileNames(profileURL: primaryUserProfileURL)
         let resolved = Self.primaryUserName(explicit: explicitPrimaryUserName, saved: profileNames.user)
-        // The agent's own name always identifies a person in her graph.
+        // Recognize the agent's own name as a person.
         let agent = profileNames.agent
         var people: [String] = []
         if !resolved.isEmpty, resolved.lowercased() != "the user" { people.append(resolved) }
         if let agent, !people.contains(where: { $0.lowercased() == agent.lowercased() }) {
             people.append(agent)
         }
-        // The builder agents the app itself delegates to (see the bridge
-        // lanes and `delegateName(forTool:)`): named peers, not places.
+        // App-delegated builders are named peers rather than places.
         for peer in Self.builtInPeerAgents where !people.contains(where: { $0.lowercased() == peer.lowercased() }) {
             people.append(peer)
         }
@@ -193,17 +184,14 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         _ id: String, producing: Bool = true
     ) async throws {
         let memoryID = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        // MemoryStorage orders the hooks; reconciliation owns retirement when
-        // production is disabled, so subsequent mutations have nothing to do.
+        // MemoryStorage orders the hooks; reconciliation owns retirement when production is disabled, so subsequent mutations have nothing to do.
         guard !memoryID.isEmpty, producing else { return }
         let dbPool = try await pool()
         let identity = try resolvedExtractionIdentity()
         do {
             try await dbPool.write { db in
-                // Hook payloads are wake hints, not authority. In the production
-                // database MemoryV2 and KG share this exact transaction domain,
-                // so re-read the canonical row now. A delayed update task that
-                // arrives after a delete can no longer resurrect stale entities.
+                // Hook payloads only wake the owner; reread canonical rows in the shared transaction domain so a delayed update cannot resurrect a deleted
+                // claim.
                 let canonicalFact = try Row.fetchOne(db, sql: """
                     SELECT id, content, source, status, lifecycle, created_at, updated_at,
                            metadata_json, valid_from, valid_to
@@ -224,10 +212,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 let content = canonicalFact.content
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let contentHash = Self.factFingerprint(canonicalFact, content: content, identity: identity)
-                // The hash check shares the upserts' write transaction. A
-                // changed hash cannot be incrementally overlaid: entities and
-                // edges from the old claim would survive. Escape the transaction and run
-                // an exact canonical rebuild instead.
+                // Check hashes inside the upsert transaction; changed claims require canonical rebuilding so old entities and edges cannot survive an overlay.
                 let existingHash = try String.fetchOne(
                     db,
                     sql: "SELECT content_hash FROM kg_memory_index WHERE memory_id = ?",
@@ -247,8 +232,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 )
             }
         } catch IndexingControl.requiresCanonicalRebuild {
-            // Eligibility can change while acquiring the rebuild transaction.
-            // Its canonical read decides removal; never carry an exclusion.
+            // Eligibility can change while acquiring the rebuild transaction. Its canonical read decides removal; never carry an exclusion.
             _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity)
         }
     }
@@ -331,9 +315,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             """, arguments: [memoryID, contentHash, now, indexVersion])
     }
 
-    /// One stable fact node per MemoryV2 row. Entity/edge extraction is still
-    /// useful, but this node is the source-backed meaning unit Agent can search
-    /// and then trace back to the exact memory row.
+    /// One source-backed fact node per memory row makes searchable meaning traceable to its exact canonical record.
     private static func upsertMemoryFactEntity(
         _ db: Database,
         memoryID: String,
@@ -388,10 +370,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         return id
     }
 
-    /// Stable graph identity for the source-backed node derived from one
-    /// canonical MemoryV2 row. The external memory id stays in node metadata;
-    /// this opaque graph id prevents arbitrary user ids from becoming graph
-    /// storage keys while allowing projections to prove they show that row.
+    /// Hash memory IDs into stable graph IDs so arbitrary user IDs cannot become graph keys; retain the external ID as projection evidence.
     public nonisolated static func memoryFactEntityID(for memoryID: String) -> String {
         "memfact_" + String(contentHash(memoryID).prefix(16))
     }
@@ -453,8 +432,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             """, arguments: [name, type]) {
             let id: String = try row.decode(forColumn: "id")
             var metadata = try metadataObject(row.decode(forColumn: "metadata_json"))
-            // indexActiveFact already updated this profile-backed hub. A name
-            // extracted from the fact must not overwrite it with fact content.
+            // indexActiveFact already updated this profile-backed hub. A name extracted from the fact must not overwrite it with fact content.
             if metadata["role"]?.stringValue == "primary_user" { return id }
             let count: Int64? = try row.decode(forColumn: "mention_count")
             let (nextCount, overflow) = (count ?? 0).addingReportingOverflow(1)

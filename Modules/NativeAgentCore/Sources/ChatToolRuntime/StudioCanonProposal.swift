@@ -7,19 +7,18 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 import TrustCenter
-// Blueprint: | `StudioCanonProposal.swift` | `StudioCanonProposal`: strict current approval payloads before resolution, application and dedupe; work identity scopes damaged-card failures and named gaps; pending cap, action/work and evidence-fingerprint dedupe; resolved cards append idempotently only with their seat and live-turn provenance |
+// Blueprint: | `StudioCanonProposal.swift` | `StudioCanonProposal`: Stage independently; only a trusted live seat decides canon. |
 
-/// The staged canon proposal: the card, its payload, and its landing.
 public enum StudioCanonProposal {
-    /// Distinct inbox action for canon execution and pending-card counts.
+    /// Use a distinct action so pending canon cards and their executor agree.
     public static let approvalAction = "studio.canon"
     public static let payloadSchema = "studio-canon-proposal.v1"
-    /// Bound on canon cards waiting for her decision.
     public static let pendingProposalCap = 4
 
-    /// File ONE card for one proposal. Never decides anything.
+    /// One proposal gets one card; staging cannot decide canon membership.
     @discardableResult
     public static func stage(
+        turn: Turn?, handsBack: Bool,
         _ draft: StudioCanonProposalDraft,
         inbox: SwiftNativeApprovalInbox
     ) async throws -> ApprovalRecord {
@@ -40,10 +39,10 @@ public enum StudioCanonProposal {
             // Canon cards cannot be resolved by a phone or sync peer.
             "remoteResolvable": .bool(false),
             "localOnly": .bool(true),
-            // Verbatim evidence lets her inspect the cited entries before deciding.
+            // Verbatim evidence lets the agent inspect the cited entries before deciding.
             "payloadPreview": .string(preview(draft)),
             "payload": binding(draft),
-        ]))
+        ]), turn: turn, handsBack: handsBack)
     }
 
     static func preview(_ draft: StudioCanonProposalDraft) -> String {
@@ -88,8 +87,8 @@ public enum StudioCanonProposal {
         ])
     }
 
-    /// Pending cards dedupe by action/work; settled cards dedupe by evidence fingerprint, allowing new evidence.
-    /// A damaged card blocks only its own work; unrelated or unidentifiable cards leave named gaps.
+    /// Pending cards dedupe by action/work; settled cards dedupe by evidence fingerprint, allowing new evidence. A damaged card blocks only its own work;
+    /// unrelated or unidentifiable cards leave named gaps.
     public static func isAlreadyFiled(
         draft: StudioCanonProposalDraft,
         records: [ApprovalRecord],
@@ -126,7 +125,10 @@ public enum StudioCanonProposal {
         ToolFailureError("Canon proposal \(record.id): saved payload field \(field) is missing or malformed. The card was preserved for reconciliation.",
             effects: .none, owner: "Studio canon proposal \(record.id)",
             code: "studio_canon_payload_unavailable", status: .failed,
-            instruction: "Inspect the existing approval's original payload and cited entries; repair only from that evidence before resolving. Do not invent missing evidence or stage a replacement decision.", recovery: .repair)
+            instruction: """
+                Inspect the existing approval's original payload and cited entries; repair only from that evidence before resolving. Do not invent \
+                missing evidence or stage a replacement decision.
+                """, recovery: .repair)
     }
 
     private static func savedWork(of record: ApprovalRecord) throws -> (title: String, creator: String?) {
@@ -151,7 +153,6 @@ public enum StudioCanonProposal {
         return value
     }
 
-    /// The card's own draft, read back for the resolve path.
     public static func draft(of record: ApprovalRecord) throws -> StudioCanonProposalDraft {
         func invalid(_ field: String) -> ToolFailureError {
             Self.invalid(field, record: record)
@@ -170,7 +171,8 @@ public enum StudioCanonProposal {
         guard let action = StudioCanonAction(rawValue: try string("canonAction")),
               let evidenceKind = StudioCanonEvidenceKind(rawValue: try string("evidenceKind")) else { throw invalid("canonAction/evidenceKind") }
         let work = try savedWork(of: record)
-        guard case .array(let values)? = payload["evidenceEntryIds"], values.count <= StudioCanonRow.maximumEvidenceEntryIDs else { throw invalid("evidenceEntryIds") }
+        guard case .array(let values)? = payload["evidenceEntryIds"],
+            values.count <= StudioCanonRow.maximumEvidenceEntryIDs else { throw invalid("evidenceEntryIds") }
         let entryIDs: [String] = try values.map {
             guard case .string(let id) = $0, !id.isEmpty else { throw invalid("evidenceEntryIds[]") }
             return id
@@ -191,15 +193,14 @@ public enum StudioCanonProposal {
     }
 
     public enum Outcome: Sendable, Equatable {
-        /// Approved by her seat: the canon row landed (or was already there).
+        /// Approval records a landed or already-present canon row.
         case applied(workTitle: String, action: StudioCanonAction, rowWritten: Bool)
-        /// Denied or canceled. Nothing written; the entries are untouched.
+        /// Denial and cancellation leave entries untouched.
         case declined(workTitle: String)
     }
 
-    /// Apply a resolved card only from her seat; owner decisions throw for annotation.
-    /// Provenance comes from `StudioCanonSeatGate` in her live turn and cannot be
-    /// reconstructed by an executor replay; `ApprovalExecution` refuses and annotates.
+    /// Apply a resolved card only from the agent's seat; owner decisions throw for annotation. Provenance comes from `StudioCanonSeatGate` in the agent's live
+    /// turn and cannot be reconstructed by an executor replay; `ApprovalExecution` refuses and annotates.
     public static func applyResolved(
         record: ApprovalRecord,
         dataRoot: URL,
@@ -216,7 +217,7 @@ public enum StudioCanonProposal {
         guard record.localOnly, !record.remoteResolvable else {
             throw StudioCanonError.approvalNotFromAgentSeat(record.decidedBy ?? "remote")
         }
-        // Only her agent seat may decide canon membership.
+        // Only the agent's seat may decide canon membership.
         guard StudioCanonSeat.isAgent(record.decidedBy) else {
             throw StudioCanonError.approvalNotFromAgentSeat(record.decidedBy ?? "unknown")
         }

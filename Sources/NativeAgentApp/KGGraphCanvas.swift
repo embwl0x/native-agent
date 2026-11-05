@@ -2,23 +2,8 @@ import SwiftUI
 import MemoryV2
 // Blueprint: | `KGGraphCanvas.swift` | `KGGraphCanvas` struct |
 
-// ---------------------------------------------------------------------------
 // MARK: - KGGraphCanvas — node-link force-directed graph
-// ---------------------------------------------------------------------------
-//
-// Hand-rolled spring-mass relaxation (Fruchterman-Reingold flavor): 10 fixed
-// iterations, k=50, O(n²) repulsion + O(|E|) attraction. We deliberately do
-// NOT pull in a graph-layout library — keep the dependency surface to what's
-// in SwiftUI Canvas. Positions are cached by node-and-edge signature so a
-// search filter that shrinks the displayed set doesn't re-shuffle everything,
-// while relationship changes still refresh the attraction layout.
-//
-// Selection is via DragGesture(minimumDistance:0) hit-test (Canvas has no
-// per-node tap hook) — `onEnded` checks the nearest node within hit radius.
-//
-// At >200 canonical nodes this canvas refuses layout with filters still
-// available in the parent, because the relaxation loop is
-// quadratic and the visual result gets meaningless.
+// Keep layout dependency-free with ten fixed relaxation rounds; Canvas needs gesture hit-testing because it has no per-node tap hook.
 
 struct KGGraphCanvas: View {
     let entities: [KnowledgeGraphEntity]
@@ -31,7 +16,6 @@ struct KGGraphCanvas: View {
     private let hitRadius: CGFloat = 22
 
     var body: some View {
-        // One canonical slice serves drawing, accessibility and layout inputs.
         let nodes = KGGraphCanvasLayout.canonicalEntities(entities)
         let links = KGGraphCanvasLayout.visibleEdges(edges, among: nodes)
         let signature = KGGraphCanvasLayout.signature(entities: nodes, edges: links)
@@ -153,15 +137,13 @@ struct KGGraphCanvas: View {
 
 }
 
-/// Only unique, named nodes and edges with visible endpoints influence layout.
 enum KGGraphCanvasLayout {
     static func compactLabel(_ name: String) -> String {
         let normalized = name.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         return normalized.count > 18 ? String(normalized.prefix(18)) + "…" : normalized
     }
 
-    /// At most forty candidates; selected nodes win, then stable ID order.
-    /// O(n²) rectangle checks remain bounded and run only during a draw.
+    /// Bound label checks to forty candidates because overlap detection is quadratic; selected nodes take priority.
     static func labelFrames(
         entities: [KnowledgeGraphEntity], positions: [String: CGPoint], in size: CGSize,
         selectedID: String?, nodeRadius: CGFloat
@@ -177,7 +159,6 @@ enum KGGraphCanvasLayout {
         for entity in ordered {
             guard let point = positions[entity.id] else { continue }
             let x = min(max(4, point.x - width / 2), size.width - width - 4)
-            // Try below, then above. Never cover another node to make room.
             for y in [point.y + nodeRadius + 6, point.y - nodeRadius - height - 6] {
                 let frame = CGRect(x: x, y: y, width: width, height: height)
                 guard frame.minY >= 2, frame.maxY <= size.height - 2 else { continue }
@@ -193,9 +174,7 @@ enum KGGraphCanvasLayout {
         return frames
     }
 
-    /// The force layout is quadratic in nodes. This limit belongs to the
-    /// canvas owner rather than only the parent picker, so a direct/future
-    /// canvas caller cannot accidentally start an unbounded layout pass.
+    /// Enforce the quadratic-layout cap in the canvas so direct callers cannot bypass it.
     static let maximumRenderableEntities = 200
 
     enum RenderSafety: Equatable {
@@ -232,9 +211,7 @@ enum KGGraphCanvasLayout {
         return "\(nodePart)#\(edgePart)"
     }
 
-    /// Fruchterman-Reingold-ish: deterministic initialization plus ten rounds
-    /// of repulsion and visible-edge attraction. The final clamp guarantees
-    /// every reported node center stays inside the drawable canvas.
+    /// Use deterministic initialization for stable layout; clamp final centers inside the drawable canvas.
     static func positions(
         entities: [KnowledgeGraphEntity],
         edges: [KnowledgeGraphEdge],

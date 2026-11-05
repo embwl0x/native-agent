@@ -22,8 +22,7 @@ struct AgentWorkspaceWorkReceipt: Sendable, Equatable, Codable {
     }
 }
 
-/// A work's navigation context, not a second task ledger or evidence store.
-/// Notes are explicitly authored by the agent; references reopen canonical owners.
+/// A work's navigation context, not a second task ledger or evidence store. Notes are explicitly authored by the agent; references reopen canonical owners.
 extension AgentWorkspaceNavigation {
     static func workReceiptKey(_ location: AgentWorkspaceLocation) -> String? {
         guard let identity = placeIdentity(location) else { return nil }
@@ -33,7 +32,10 @@ extension AgentWorkspaceNavigation {
     static func placeAction(_ location: AgentWorkspaceLocation, session: Session) -> JSONValue? {
         guard let key = workReceiptKey(location), let receipt = session.arrangement.placeActions[key],
               case .object(var value) = receipt.value else { return nil }
-        value["meaning"] = .string("Last observed action for this place, at the recorded time. This is not a new verification of its current contents or completion of the work's requirements.")
+        value["meaning"] = .string("""
+            Last observed action for this place, at the recorded time. This is not a new verification of its current contents or completion of the \
+            work's requirements.
+            """)
         return .object(value)
     }
 
@@ -48,10 +50,12 @@ extension AgentWorkspaceNavigation {
         session.arrangement.focusedWork = true
         session.arrangement.places = session.arrangement.keptPlaces
         session.arrangement.path = [.home, .workOverview]
-        if let anchor = session.arrangement.workAnchor, !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(anchor) }) {
+        if let anchor = session.arrangement.workAnchor, !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(anchor)
+            }) {
             session.arrangement.workAnchor = nil; session.arrangement.workTopic = nil
         }
-        if let document = session.document, !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(document.location) }) {
+        if let document = session.document, !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(document.location)
+            }) {
             session.document = nil
         }
         session.arrivalReturn = nil
@@ -62,7 +66,8 @@ extension AgentWorkspaceNavigation {
 
     func keepOpenedWorkSource(_ location: AgentWorkspaceLocation, value: JSONValue, key: String) {
         guard let session = sessions[key], session.arrangement.focusedWork else { return }
-        guard ChatToolOutcome.hasReadEvidence(value) else { return }
+        let reply = ToolResult(value)
+        guard reply.hasReadEvidence() else { return }
         let isSource: Bool
         switch location {
         case .record(let tool, let input, _):
@@ -70,8 +75,7 @@ extension AgentWorkspaceNavigation {
             case "read_file", "read_page", "read_skill", "read_chat_message", "shelf_entry", "browser.chrome_snapshot": isSource = true
             case "recall_memory": isSource = input["memory_id"] != nil
             case "desk_read": isSource = input["handle"] != nil
-            // Correspondence may be an unrelated interruption. Keep the window
-            // for returning, but attach it to the work only on explicit Keep.
+            // Correspondence may be an unrelated interruption. Keep the window for returning, but attach it to the work only on explicit Keep.
             case "chat_conversations", "mail_list_recent", "messages_recent_threads": isSource = false
             case "agent_read":
                 if case .string(let agent)? = input["agent"] { isSource = agent.hasPrefix("bot:") || input["conversation"] != nil }
@@ -82,7 +86,8 @@ extension AgentWorkspaceNavigation {
         }
         guard isSource, let place = Self.keepablePlace(location, session: session) else { return }
         if case .browserBookmark(let url, _, _) = place,
-           session.arrangement.keptPlaces.contains(where: { if case .browserBookmark(let keptURL, _, _) = $0 { return keptURL == url }; return false }) { return }
+           session.arrangement.keptPlaces.contains(where: { if case .browserBookmark(let keptURL, _, _) = $0 { return keptURL == url }; return false }) {
+               return }
         do { try keepWorkPlace(place, key: key) }
         catch { sessions[key]?.workLinkNotice = error.localizedDescription }
     }
@@ -92,7 +97,8 @@ extension AgentWorkspaceNavigation {
         guard let session = sessions[key], session.arrangement.selectedWorkspaceID != nil || session.arrangement.workNote != nil else { return }
         let owner: [String: JSONValue]
         if case .object(let fields) = receipt { owner = fields } else { return }
-        let status = ChatToolOutcome.exactResultClass(receipt).receipt.status
+        let reply = ToolResult(receipt)
+        let status = reply.outcome.receipt.status
         var observation = "No separate current readback was returned."
         if tool == "agent_message", case .string(let reply)? = owner["reply"], !reply.isEmpty {
             observation = "The peer's reply returned in this conversation; it is not independent verification of its work."
@@ -127,10 +133,7 @@ extension AgentWorkspaceNavigation {
         let recorded = AgentWorkspaceWorkReceipt(title: label.isEmpty ? "Action" : label, status: state.isEmpty ? "unknown" : state,
             readback: observation.replacingOccurrences(of: "\0", with: ""), observedAt: Date())
         sessions[key]?.arrangement.lastWorkAction = recorded
-        // Bind from the action's owner target, never the view that happened to
-        // be selected before dispatch. A conversation must not overwrite the
-        // document it discusses. Unknown/failed attempts replace old success
-        // for the same exact target, just as the overall last action does.
+        // Bind observations from the action's exact owner target; unrelated selection cannot overwrite it, and failed attempts replace stale success.
         var target = AgentWorkspaceEnvironment.readback(tool: tool, input: input)
         if tool == "agent_message", case .string(let agent)? = input["agent"] {
             var arguments: [String: JSONValue] = ["agent": .string(agent)]
@@ -145,10 +148,10 @@ extension AgentWorkspaceNavigation {
             target = location
         }
         if case .record("browser.chrome_snapshot", let arguments, _)? = target, let value {
-            // Navigation may have changed the URL on an existing tab. The
-            // final observation belongs to the fresh owner snapshot, never its
-            // previous tab-to-bookmark association.
-            guard case .object(let page) = value, ChatToolOutcome.hasReadEvidence(value), page["tabId"] == arguments["tab_id"],
+            let readback = ToolResult(value)
+            // Navigation may have changed the URL on an existing tab. The final observation belongs to the fresh owner snapshot, never its previous
+            // tab-to-bookmark association.
+            guard case .object(let page) = value, readback.hasReadEvidence(), page["tabId"] == arguments["tab_id"],
                   case .string(let url)? = page["url"], case .string(let title)? = page["title"] else { return }
             target = .browserBookmark(url: url, title: title.isEmpty ? url : title,
                 tabID: { if case .int(let id)? = page["tabId"] { return id }; return nil }())
@@ -165,8 +168,7 @@ extension AgentWorkspaceNavigation {
         }
         sessions[key]?.arrangement.placeActions = receipts
     }
-    /// A place she acted on: a window (drafts, pages acted in), or one with
-    /// an action receipt. A mere read is neither, so it is not offered Keep.
+    /// A place the agent acted on: a window (drafts, pages acted in), or one with an action receipt. A mere read is neither, so it is not offered Keep.
     static func actedOn(_ place: AgentWorkspaceLocation, session: Session) -> Bool {
         session.arrangement.places.contains { placeIdentity($0) == placeIdentity(place) }
             || workReceiptKey(place).map { session.arrangement.placeActions[$0] != nil } == true
@@ -176,8 +178,7 @@ extension AgentWorkspaceNavigation {
         if case .page(let source, _) = location { return keepablePlace(source, session: session) }
         if case .record("agent_read", let input, _) = location,
            ["conversation_id", "message_id", "task_id"].contains(where: { input[$0] != nil }) {
-            // The desktop's named-conversation serializer cannot retain these
-            // exact protocol selectors. Never replace an exact reply by latest.
+            // The desktop's named-conversation serializer cannot retain these exact protocol selectors. Never replace an exact reply by latest.
             return nil
         }
         let candidate = placeIdentity(location).flatMap { session.browserBookmarks[$0] } ?? location
@@ -198,7 +199,8 @@ extension AgentWorkspaceNavigation {
             session.arrangement.keptPlaces[index] = kept
         } else {
             guard session.arrangement.keptPlaces.count < 12 else {
-                throw DesktopFailure(message: "Twelve places are already kept with this work. Remove an unneeded reference before adding another; nothing was removed.")
+                throw DesktopFailure(
+                    message: "Twelve places are already kept with this work. Remove an unneeded reference before adding another; nothing was removed.")
             }
             session.arrangement.keptPlaces.append(kept)
         }
@@ -211,9 +213,7 @@ extension AgentWorkspaceNavigation {
         sessions[key]?.workLinkNotice = nil
     }
 
-    /// Sharing an explicitly selected source within named work carries its
-    /// conversation back to that work. This records the relation, never delivery
-    /// or review completion. Opening still asks the conversation's own reader.
+    /// Sharing records a relation, never delivery or review completion; opening still reads the conversation's owner.
     func attachWorkDiscussion(source: AgentWorkspaceLocation, conversation: AgentWorkspaceLocation, key: String) {
         guard var session = sessions[key], session.arrangement.selectedWorkspaceID != nil || session.arrangement.workNote != nil,
               let source = Self.keepablePlace(source, session: session) else { return }
@@ -221,10 +221,14 @@ extension AgentWorkspaceNavigation {
               case .string(let agent)? = input["agent"],
               agent.hasPrefix("bot:") || { if case .string(let label)? = input["conversation"] { return !label.isEmpty }; return false }(),
               let conversation = Self.keepablePlace(conversation, session: session) else {
-            if !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(source) }), session.arrangement.keptPlaces.count < 12 {
+            if !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(source) }), session.arrangement.keptPlaces
+                .count < 12 {
                 session.arrangement.keptPlaces.append(source)
             }
-            session.workLinkNotice = "The discussion could not be attached to an exact saved conversation. Its outcome remains with the conversation owner; no message was repeated."
+            session.workLinkNotice = """
+                The discussion could not be attached to an exact saved conversation. Its outcome remains with the conversation owner; no message was \
+                repeated.
+                """
             sessions[key] = session
             return
         }
@@ -232,7 +236,10 @@ extension AgentWorkspaceNavigation {
             !session.arrangement.keptPlaces.contains { Self.placeIdentity($0) == Self.placeIdentity(candidate) }
         }
         guard session.arrangement.keptPlaces.count + additions.count <= 12 else {
-            session.workLinkNotice = "The conversation remains in Open places. This work already has twelve kept references; remove one before keeping more. The message outcome is unchanged."
+            session.workLinkNotice = """
+                The conversation remains in Open places. This work already has twelve kept references; remove one before keeping more. The message outcome \
+                is unchanged.
+                """
             sessions[key] = session
             return
         }
@@ -256,7 +263,11 @@ extension AgentWorkspaceNavigation {
         var content: [String: JSONValue] = [
             "status": .string("ok"), "name": .string(name),
             "continuation_note": session.arrangement.workNote.map(JSONValue.string) ?? .null,
-            "meaning": .string("Your saved purpose, requirements and where you left off, with the places you kept beside it. The note is your account, not verified completion. References read current owner evidence when opened. A review arriving does not mean it was applied; saving a file does not satisfy the requirements by itself."),
+            "meaning": .string("""
+                Your saved purpose, requirements and where you left off, with the places you kept beside it. The note is your account, not verified \
+                completion. References read current owner evidence when opened. A review arriving does not mean it was applied; saving a file does not \
+                satisfy the requirements by itself.
+                """),
             "unfinished_drafts": .int(Int64(session.arrangement.drafts.count))
         ]
         if let issue = session.persistenceIssue { content["storage_attention"] = .string(issue) }
@@ -265,7 +276,8 @@ extension AgentWorkspaceNavigation {
         if let receipt = session.arrangement.lastWorkAction { content["last_action"] = receipt.value }
         var actions: [AgentWorkspaceButton] = [
             .init(label: session.arrangement.focusedWork ? "Keep new sources manually" : "Focus on these places", action: .focusWork),
-            .init(label: session.arrangement.workNote == nil ? "Remember what this work needs" : "Update where I left off", action: .updateWorkNote, needsText: true),
+            .init(label: session.arrangement.workNote == nil ? "Remember what this work needs" : "Update where I left off", action: .updateWorkNote,
+                needsText: true),
             .init(label: "Keep this workspace as…", action: .saveWorkspace, needsText: true),
             .init(label: "Saved workspaces", action: .open(.savedWorkspaces))
         ]
@@ -277,7 +289,8 @@ extension AgentWorkspaceNavigation {
         }
         // Include the current work anchor alongside retained places, as windows does.
         var items: [AgentWorkspaceItem] = []
-        if let anchor = session.arrangement.workAnchor, !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(anchor) }) {
+        if let anchor = session.arrangement.workAnchor, !session.arrangement.keptPlaces.contains(where: { Self.placeIdentity($0) == Self.placeIdentity(anchor)
+            }) {
             items.append(.init(title: anchor.title, content: .object(Self.placeRecognition(anchor).merging(
                 ["work_context": .string(session.arrangement.workTopic ?? "The work I'm on")]) { _, new in new }),
                 actions: [.init(label: "Open", action: .open(anchor))]))

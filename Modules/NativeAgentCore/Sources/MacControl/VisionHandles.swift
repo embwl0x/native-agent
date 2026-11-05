@@ -2,13 +2,10 @@ import Foundation
 import NativeAgentCore
 // Blueprint: | `VisionHandles.swift` | `VisionHandles` |
 
-// Pixel tokens identify readouts and detect affordance collisions using the
-// shared stable hash. Fingerprints contain role, redacted-safe label and
-// quantized frame-relative centre; changing size alone preserves the token.
+// Use shared stable hashing over safe labels, role and quantized centre; size changes alone must preserve tokens.
 
 public enum VisionHandles {
-    /// Buckets per axis. 16 × 16 over the frame — a redraw has to move a
-    /// control by ~6% of the window before its handle changes.
+    /// A 16-by-16 grid tolerates redraw movement under roughly six percent before changing a handle.
     public static let positionBuckets = 16
 
     public static func quantize(_ value: Double, over extent: Double) -> Int {
@@ -17,13 +14,10 @@ public enum VisionHandles {
         return Int(fraction * Double(positionBuckets))
     }
 
-    /// Letters kept from a label before it enters a fingerprint.
     public static let labelKeyLetters = 6
-    /// Digits kept from a label before it enters a fingerprint.
     public static let labelKeyDigits = 6
 
-    /// Prefix letters absorb OCR tail noise; separate digits distinguish rows.
-    /// Pixels cannot distinguish a title from a value, so changing digits changes the token.
+    /// Prefix letters absorb OCR tail noise while separate digits distinguish rows; pixels cannot separate title from changing value.
     public static func labelKey(_ label: String?) -> String {
         guard let label, !label.isEmpty else { return "" }
         let lowered = label.lowercased()
@@ -32,7 +26,7 @@ public enum VisionHandles {
         return "\(letters)#\(digits)"
     }
 
-    /// The pre-hash string; secrets never enter the label component.
+    /// Secret text must never enter the fingerprint.
     public static func fingerprint(
         roleGuess: String,
         label: String?,

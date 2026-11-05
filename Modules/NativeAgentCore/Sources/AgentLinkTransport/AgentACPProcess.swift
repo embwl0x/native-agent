@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `AgentACPProcess.swift` | `AgentACPProcess` verifies approval then uses `OwnedProcessGroup` for before-exec containment, one group-only TERM/KILL settlement, checked termination and retained leader reap |
+// Blueprint: | `AgentACPProcess.swift` | `AgentACPProcess`, `OwnedProcessGroup`; Verified, group-contained launch and settlement. |
 
 public enum AgentACPProcess {
     static func spawn(executable: String, arguments: [String], directory: URL,
@@ -20,7 +20,7 @@ public enum AgentACPProcess {
 
     @discardableResult static func finish(_ pid: pid_t, snapshot: ProcessTreeSnapshot? = nil,
                        grace: Duration = .milliseconds(200)) async -> String? {
-        guard pid > 0 else { return nil } // No child was launched.
+        guard pid > 0 else { return nil }
         guard let owner = OwnedProcessGroup.owner(pid), owner.identity == snapshot?.groupOwnerID else {
             return "ACP process group \(pid) has no retained child owner. Termination is unconfirmed; no process was signalled."
         }

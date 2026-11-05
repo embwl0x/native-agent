@@ -1,17 +1,9 @@
 import Foundation
 import Dispatcher
 import NativeAgentCore
-// Blueprint: | `GitHubCommandCheckoutResolver.swift` | Explicit repository selection requires exactly one remote-verified checkout; ambiguity lists candidates, directory/stat/remote read failures stop selection, and checked no-match returns no checkout |
+// Blueprint: | `GitHubCommandCheckoutResolver.swift` | Match exact repository remotes; refuse ambiguity and read failures. |
 
-// Trusted repository-checkout resolution for explicit codex_message repository
-// selection.
-//
-// The trust anchor is the remote, not the name. A caller names an owner/name
-// GitHub repository -- never a filesystem path -- and this resolver only
-// accepts a local directory whose own `git remote -v` actually points at that
-// repository. A directory that merely has a matching folder name resolves to
-// nil, so a model cannot steer execution at an arbitrary root by choosing a
-// suggestive repository string.
+// Match the repository remote, never its directory name: an owner/name selector must not steer execution to an arbitrary filesystem root.
 
 enum GitHubCommandCheckoutResolver {
     static func resolve(
@@ -32,7 +24,10 @@ enum GitHubCommandCheckoutResolver {
             })
         }
         guard matches.count <= 1 else {
-            throw ToolFailureError("More than one checkout matches \(repository). Select working_directory explicitly: \(matches.map(\.path).sorted().joined(separator: ", ")). No checkout was selected and no work started.",
+            throw ToolFailureError("""
+                More than one checkout matches \(repository). Select working_directory explicitly: \
+                \(matches.map(\.path).sorted().joined(separator: ", ")). No checkout was selected and no work started.
+                """,
                 argumentPath: "$.repository", effects: .none, code: "repository_checkout_ambiguous",
                 instruction: "Pass the exact intended checkout as working_directory.")
         }
@@ -112,7 +107,10 @@ enum GitHubCommandCheckoutResolver {
         )
         guard result.launched, !result.timedOut, !result.captureReadFailed,
               result.status == 0 else {
-            throw unavailable(directory, cause: "git remote -v: launched=\(result.launched), timedOut=\(result.timedOut), captureReadFailed=\(result.captureReadFailed), exit=\(result.status)")
+            throw unavailable(directory, cause: """
+                git remote -v: launched=\(result.launched), timedOut=\(result.timedOut), captureReadFailed=\(result.captureReadFailed), \
+                exit=\(result.status)
+                """)
         }
         return result.stdout
     }

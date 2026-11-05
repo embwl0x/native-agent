@@ -4,37 +4,35 @@ import Experiences
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | Frozen REM timeline and decoded disposition transitions; `growthWeek`/`growthWeekLines` share the owned `growth-week.js` face, retaining its detail in agent reads. Readout grouping, titles, reasons, alternatives, ordering, cap and undertone prose are removed from Swift; canonical timeline source titles stay in Replay for its other consumers. |
+// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | `growthWeek`/`growthWeekLines`: frozen evidence for `growth-week.js` |
 
 public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
-    /// Formed and still waiting on an answer. Never counts as a change she made.
+    /// An unanswered proposal is not a change.
     case proposed
-    /// She adopted it herself. A weaker lean than `approved`, and named apart
-    /// from it everywhere, because nobody signed it.
+    /// Adoption is self-directed, never reported as person-approved.
     case held
-    /// The person signed it.
+    /// Approval requires the person's decision.
     case approved
-    /// She let it go on purpose.
+    /// Release requires an explicit decision.
     case letGo
-    /// The person declined it.
+    /// Decline requires the person's decision.
     case declined
-    /// A proposal that aged out unanswered. Not released, not adopted, and not
-    /// dressed up as either.
+    /// Expiry is unanswered, never release or adoption.
     case expiredUnresolved
     case unavailable
-    /// A replay pass runs without proposing or resolving a lesson.
+    /// Replay alone attests no proposal or resolution.
     case replayed
 
 }
 
 public struct CognitiveDispositionTransition: Sendable, Equatable {
     public var before: Double
-    /// After time was accounted for and nothing else — the fade.
+    /// Decay records elapsed time alone.
     public var afterDecay: Double
-    /// After the experience was added — the move.
+    /// Movement records the added experience.
     public var afterContribution: Double
     public var at: Date
-    /// What contributed: the reflection or the dream night.
+    /// Source identity distinguishes reflection from dream contribution.
     public var source: String
 
     public init(before: Double, afterDecay: Double, afterContribution: Double, at: Date, source: String) {
@@ -57,7 +55,7 @@ public struct CognitiveDispositionTransition: Sendable, Equatable {
 }
 
 
-/// One shared authored face, including the stem's availability evidence.
+/// One authored face includes the stem's availability evidence.
 public struct CognitiveGrowthWeek: Sendable, Equatable {
     public let projection: PartFaceSnapshot
     public var lines: [String] {
@@ -113,8 +111,7 @@ extension CognitiveSubstrate {
     }
 
 
-    /// Captured before suspension: disposition numbers and revision evidence
-    /// cannot come from a different read than this timeline packet.
+    /// Captured before suspension: disposition numbers and revision evidence cannot come from a different read than this timeline packet.
     public func growthWeek(at now: Date? = nil) async -> CognitiveGrowthWeek {
         await growthWeek(input: growthWeekInput(at: now ?? dependencies.now()))
     }
@@ -129,7 +126,8 @@ extension CognitiveSubstrate {
         await growthWeek(from: timeline, transitions: dispositionTransitions, at: now ?? dependencies.now())
     }
 
-    private func growthWeek(from timeline: [CognitiveDevelopmentalTimelineEvent], transitions: [CognitiveDispositionTransition], at end: Date) async -> CognitiveGrowthWeek {
+    private func growthWeek(from timeline: [CognitiveDevelopmentalTimelineEvent], transitions: [CognitiveDispositionTransition],
+        at end: Date) async -> CognitiveGrowthWeek {
         let start = end.addingTimeInterval(-7 * 24 * 60 * 60)
         let events: [JSONValue] = timeline.filter { $0.occurredAt >= start && $0.occurredAt <= end }.map { event in
             .object([
@@ -140,8 +138,7 @@ extension CognitiveSubstrate {
                 "outcome": Self.growthOutcome(of: event).map { .string($0.rawValue) } ?? .null,
             ])
         }
-        // Unicode character boundaries are a native text primitive, not a
-        // clipping policy. JS chooses limits without splitting a Mac character.
+        // Unicode character boundaries are a native text primitive, not a clipping policy. JS chooses limits without splitting a Mac character.
         let texts = timeline.flatMap { [$0.title,$0.summary] }
         var characterSet = Set<String>()
         for text in texts {

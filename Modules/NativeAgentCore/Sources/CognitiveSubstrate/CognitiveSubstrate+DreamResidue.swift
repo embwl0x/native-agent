@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+DreamResidue.swift` | `CognitiveSubstrate` dream contribution: single-flight integration, durable cross-night disposition/residue claims, residue minting, consumption and persistence; `CognitiveDreamResidue` |
+// Blueprint: | `CognitiveSubstrate+DreamResidue.swift` | `CognitiveSubstrate`, `CognitiveDreamResidue`: durable night claims |
 
 extension CognitiveSubstrate {
     /// Persist explicit dream tone through night claims, disposition decay and residue, without classifying prose.
@@ -53,7 +53,7 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// How many accepted turns the night colors.
+    /// Spend residue across accepted exchanges rather than individual events.
     static let dreamResidueTurns = 2
     /// A small saturating affect delta colors the waking room without overriding it.
     static let dreamResidueLean = 0.07
@@ -97,7 +97,7 @@ extension CognitiveSubstrate {
             ),
             sourceClass: .selfReported,
             occurredAt: now,
-            // Deliberately empty: a residue has no story.
+            // Residue carries feeling without story text.
             summary: "",
             importance: min(1, 0.35 + abs(valence)),
             // Live state keeps the night in mood; `.appWake` otherwise defaults to system traffic.
@@ -182,7 +182,7 @@ extension CognitiveSubstrate {
 
 /// The night's leftover mood carries a feeling, timestamp and turn budget, never story text.
 public struct CognitiveDreamResidue: Sendable, Equatable {
-    /// −1…1, her explicit dream affect scaled down. It colors; it never leads.
+    /// −1…1, the agent's explicit dream affect scaled down. It colors; it never leads.
     public var valence: Double
     public var mintedAt: Date
     /// Accepted turns still owed the lean; zero removes the residue rather than decaying it.

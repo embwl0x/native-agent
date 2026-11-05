@@ -6,41 +6,28 @@ import DoctorChecks
 import PersistenceCore
 import Desk
 import ApprovalInbox
-import WorkshopExecution
 import AgentWorkspace
 import NotificationInbox
 import Privacy
 import Cognition
 // Blueprint: | `HeartbeatLoop.swift` | Event/deadline heartbeat checklist lifetime and per-condition notice settlement; missing checklist claims no health |
-/// Reads the `HEARTBEAT.md` checklist and surfaces the assessment's
-/// per-condition alert. Healthy assessments make no notice.
-///
-/// Design notes:
-/// - Honest missing-checklist contract: no `HEARTBEAT.md` is NOT "healthy" —
-///   it's a no-op that logs and returns, never a fabricated all-clear (the
-///   loop has nothing to check against, so it asserts nothing).
-/// - tick() is non-throwing by LoopRunner contract — every error is caught
-///   and surfaced via stderr.
+/// Missing checklist proves no health; a healthy assessment needs no notice.
+/// The nonthrowing LoopRunner contract requires errors to surface as outcomes.
 public struct HeartbeatLoop: EventDeadlineLoopRunner {
     public let loopId: String = "heartbeat"
-    public let interval: TimeInterval
+    public let wake: OrganWake
     private let configurationError: String?
-    /// Twice-daily missed-event integrity sweep. Normal assessments follow
+    /// Twice-daily health rhythm. Additional assessments follow
     /// input invalidations and their age deadlines; urgent faults also reach Doctor.
     public static let defaultInterval: TimeInterval = 12 * 60 * 60
 
     private let events: @Sendable () -> AsyncStream<Void>
     private let nextDeadline: @Sendable (Date) async -> Date?
 
-    /// Reads the `HEARTBEAT.md` checklist (persona dir). Returns nil when the
-    /// file is absent — the honest no-op trigger.
+    /// Absence supplies no checklist and therefore authorizes no health verdict.
     private let loadChecklist: @Sendable () throws -> String?
-    /// Gathers the compact live signal assessment (stuck
-    /// Workshop executions / Full-Mac expiry / Doctor / error bursts).
     private let gatherAssessment: @Sendable () async -> HeartbeatAssessment
-    /// Surfaces a non-OK heartbeat notice to the user (notice / inbox card).
-    /// The owning factory wires it to the durable inbox.
-    /// Inbox write errors propagate so the tick records a failed outcome.
+    /// Inbox write errors must propagate so the tick cannot claim a notice landed.
     private let surfaceNotice: @Sendable (HeartbeatNotice) async throws -> Void
 
     public init(
@@ -54,7 +41,7 @@ public struct HeartbeatLoop: EventDeadlineLoopRunner {
         gatherAssessment: @escaping @Sendable () async -> HeartbeatAssessment,
         surfaceNotice: @escaping @Sendable (HeartbeatNotice) async throws -> Void
     ) {
-        self.interval = interval
+        self.wake = .every(interval)
         self.configurationError = configurationError
         self.events = events
         self.nextDeadline = nextDeadline
@@ -73,10 +60,7 @@ public struct HeartbeatLoop: EventDeadlineLoopRunner {
         catch { return .failed(error: "Heartbeat checklist unavailable: \(error.localizedDescription). Repair HEARTBEAT.md before retrying.") }
         guard let checklist = loaded?.trimmingCharacters(in: .whitespacesAndNewlines),
               !checklist.isEmpty else {
-            // Missing (or empty) HEARTBEAT.md = honest no-op. We have nothing
-            // to check against; asserting "healthy" here would be a fabricated
-            // all-clear (the exact failure mode the silent-OK contract exists
-            // to prevent). Log and return — never surface, never claim health.
+            // No checklist means nothing was checked; never manufacture an all-clear.
             FileHandle.standardError.write(Data(
                 "HeartbeatLoop: no HEARTBEAT.md checklist — skipping (no-op, not healthy)\n".utf8))
             return .off("HEARTBEAT.md missing or empty")
@@ -85,8 +69,7 @@ public struct HeartbeatLoop: EventDeadlineLoopRunner {
         if assessment.deterministicOK {
             return .completed(result: "deterministic heartbeat healthy")
         }
-        // Scheduler allows timed-out ticks to keep running until they observe
-        // cancellation — never emit a user-visible card after cancel/restart.
+        // Timed-out ticks may still be unwinding; cancellation must prevent a post-restart card.
         if Task.isCancelled { return .skipped(reason: "canceled") }
         do {
             try await surfaceNotice(HeartbeatNotice(
@@ -95,9 +78,7 @@ public struct HeartbeatLoop: EventDeadlineLoopRunner {
                 actions: assessment.actions
             ))
         } catch {
-            // The inbox write did not land — do NOT claim the notice surfaced.
-            // Returning .failed trips the manager's failure-receipt net so the
-            // dropped card is recorded instead of silently lost.
+            // A failed outcome records the dropped card; never claim failed inbox delivery surfaced.
             FileHandle.standardError.write(Data(
                 "HeartbeatLoop: notice staging failed: \(error)\n".utf8))
             return .failed(error: "heartbeat notice staging: \(SwiftNativeLoopScheduler.describeLoopError(error))")

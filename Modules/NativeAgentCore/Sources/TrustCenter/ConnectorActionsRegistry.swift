@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ConnectorActionsRegistry.swift` | `ConnectorActionDescriptor` and `connectorActionDescriptors`: static connector action/schema inventory; live authentication decoration belongs elsewhere |
+// Blueprint: | `ConnectorActionsRegistry.swift` | `ConnectorActionDescriptor`, `connectorActionDescriptors`; Static schemas. |
 
 // MARK: - Static connector action descriptors
 
@@ -104,7 +104,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mobile.notify", connectorId: "mobile", connector: "mobile",
             name: "iPhone Push Notification",
-            description: "Send the user a real APNS push notification on the paired iPhone when attention is useful. Check readiness on app {page:\"pairing\"}; do not inspect raw APNS config files.",
+            description: """
+                Send the user a real APNS push notification on the paired iPhone when attention is useful. Check readiness on app {page:\"pairing\"}; \
+                do not inspect raw APNS config files.
+                """,
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "notifications",
             statusEndpoint: "/v1/mobile/push/status",
@@ -117,7 +120,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "codex.work_journal", connectorId: "codex_work", connector: "codex_work",
             name: "Codex Work Journal",
-            description: "Scan registered workspaces and immediate ~/Projects repositories for recent Codex work: git commits, dirty status, and handoff summaries. Use this to keep a daily cross-project work log. Does not read .env files or crawl arbitrary folders.",
+            description: """
+                Scan registered workspaces and immediate ~/Projects repositories for recent Codex work: git commits, dirty status, and handoff \
+                summaries. Use this to keep a daily cross-project work log. Does not read .env files or crawl arbitrary folders.
+                """,
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "work_journal",
             statusEndpoint: "/v1/codex/work_journal",
@@ -137,7 +143,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "codex.handoff", connectorId: "codex_handoff", connector: "codex_handoff",
             name: "Codex Handoff",
-            description: "Read Codex's human-written cross-project markdown handoff for the assistant. Read-only; use this when the assistant needs to know what Codex has done across any project, or schedule it through connector_action. Does not write the handoff and does not read secrets.",
+            description: """
+                Read Codex's human-written cross-project markdown handoff for the assistant. Read-only; use this when the assistant needs to know \
+                what Codex has done across any project, or schedule it through connector_action. Does not write the handoff and does not read secrets.
+                """,
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "work_journal",
             statusEndpoint: "/v1/codex/handoff",
@@ -151,7 +160,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "scheduler.schedule_job", connectorId: "scheduler", connector: "scheduler",
             name: "Schedule Body Rhythm",
-            description: "Create one-shot or recurring body rhythms on once/every/hourly/daily/weekly/monthly/cron schedules. Intentions, check-ins and reminders use queue.add {text, when, until?, say?}.",
+            description: """
+                Create one-shot or recurring body rhythms on once/every/hourly/daily/weekly/monthly/cron schedules. Intentions, check-ins and \
+                reminders use queue.add {text, when, until?, say?}.
+                """,
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
             inputSchema: schema([
@@ -167,18 +179,28 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ])),
                 ("schedule", .object([
                     "type": .string("object"),
-                    "description": .string("Schedule spec: {type:'once', run_at}, {type:'every', seconds/minutes/hours/days}, {type:'hourly', minute}, {type:'daily', at:'HH:MM'}, {type:'weekly', weekdays:['mon'], at:'HH:MM'}, {type:'monthly', day:1, at:'HH:MM'}, or {type:'cron', expression:'*/15 9-17 * * mon-fri'}."),
+                    "description": .string("""
+                        Schedule spec: {type:'once', run_at}, {type:'every', seconds/minutes/hours/days}, {type:'hourly', minute}, {type:'daily', \
+                        at:'HH:MM'}, {type:'weekly', weekdays:['mon'], at:'HH:MM'}, {type:'monthly', day:1, at:'HH:MM'}, or {type:'cron', \
+                        expression:'*/15 9-17 * * mon-fri'}.
+                        """),
                 ])),
                 ("payload", .object([
                     "type": .string("object"),
-                    "description": .string("Rhythm payload. connector_action: actionId/input. dream/rem: objective. part: part/signal (schedule:<cron>). proactive_scan: reason/limit/surfaceLimit. For fixed reminder words use queue.add with say."),
+                    "description": .string("""
+                        Rhythm payload. connector_action: actionId/input. dream/rem: objective. part: part/signal (schedule:<cron>). proactive_scan: \
+                        reason/limit/surfaceLimit. For fixed reminder words use queue.add with say.
+                        """),
                 ])),
             ], required: ["name", "kind", "schedule"])
         ),
         ConnectorActionDescriptor(
             id: "scheduler.create_job", connectorId: "scheduler", connector: "scheduler",
             name: "Create Body Rhythm",
-            description: "Create a recurring or one-shot body rhythm for connector reads, parts, dreams, REM, benchmarks or proactive scans. Intentions, check-ins and reminders use queue.add {text, when, until?, say?}.",
+            description: """
+                Create a recurring or one-shot body rhythm for connector reads, parts, dreams, REM, benchmarks or proactive scans. Intentions, \
+                check-ins and reminders use queue.add {text, when, until?, say?}.
+                """,
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
             inputSchema: schema([
@@ -197,7 +219,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("one_shot", prop("boolean")),
                 ("payload", .object([
                     "type": .string("object"),
-                    "description": .string("For connector_action: actionId/input. For dream/rem: objective. For part: part/signal (schedule:<cron>). For proactive_scan: reason/limit/surfaceLimit. Intentions use queue.add."),
+                    "description": .string("""
+                        For connector_action: actionId/input. For dream/rem: objective. For part: part/signal (schedule:<cron>). For proactive_scan: \
+                        reason/limit/surfaceLimit. Intentions use queue.add.
+                        """),
                 ])),
             ], required: ["name", "kind"])
         ),
@@ -222,7 +247,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac_assistant.watch_templates", connectorId: "mac_assistant", connector: "mac_assistant",
             name: "Mac Assistant Watch Templates",
-            description: "Return access readiness and scheduler payload templates for email, calendar, reminders, Mac notifications, and iPhone watch receipts. Read-only; never creates jobs.",
+            description: """
+                Return access readiness and scheduler payload templates for email, calendar, reminders, Mac notifications, and iPhone watch receipts. \
+                Read-only; never creates jobs.
+                """,
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "assistant_setup",
             inputSchema: emptySchema()
@@ -254,7 +282,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.reminders_list_due_today", connectorId: "mac", connector: "mac",
             name: "Mac Reminders Due Today",
-            description: "Read Reminders.app items in today and overdue parts, each with its full count and independently capped reminders/has_more, plus total and summary. Read-only and scheduleable.",
+            description: """
+                Read Reminders.app items in today and overdue parts, each with its full count and independently capped reminders/has_more, plus total \
+                and summary. Read-only and scheduleable.
+                """,
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "mac_pim",
             inputSchema: schema([
@@ -301,7 +332,10 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.contacts_search", connectorId: "mac", connector: "mac",
             name: "Mac Contacts Search",
-            description: "Search Contacts.app with query: @ selects email, phone-shaped text selects phone, otherwise name. The selected lookup runs once. Read-only.",
+            description: """
+                Search Contacts.app with query: @ selects email, phone-shaped text selects phone, otherwise name. The selected lookup runs once. \
+                Read-only.
+                """,
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "mac_pim",
             inputSchema: schema([

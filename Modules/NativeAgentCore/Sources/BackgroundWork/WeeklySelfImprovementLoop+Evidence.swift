@@ -1,3 +1,4 @@
+import Desk
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -8,19 +9,19 @@ import MemoryV2
 import DreamREMCycle
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `WeeklySelfImprovementLoop+Evidence.swift` | Weekly chat, live error-feed and Doctor evidence; deterministic conversation sampling weighted by caring receipts; `SelfImprovementLearning`, prior-card outcomes and standing-lesson recurrence |
+import Experiences
+// Blueprint: | `WeeklySelfImprovementLoop+Evidence.swift` | `SelfImprovementLearning`; Bounded usage and prior-card evidence |
 
 extension WeeklySelfImprovementLoop {
-    /// Reads a week of real usage into a compact, LLM-readable summary.
-    func gatherSignals(now: Date) throws -> String {
-        let weekAgo = now.addingTimeInterval(-interval)
+    func gatherSignals(now: Date) async throws -> String {
+        let weekAgo = now.addingTimeInterval(-period)
         let fm = FileManager.default
         var sections: [String] = []
 
-        // Sample chat by day and session first, then feeling weight, with deterministic ordering.
+        // Day/session coverage precedes feeling weight so a busy conversation cannot crowd out the week.
         let messagesDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
-        let feltWeights = try Self.feltWeights(dataRoot: dataRoot)
+        let feltWeights = try await Self.feltWeights(dataRoot: dataRoot)
         var candidates: [SampledUserMessage] = []
         var totalMessages = 0
         var sessionCount = 0
@@ -67,15 +68,14 @@ extension WeeklySelfImprovementLoop {
             String(totalMessages), String(sessionCount),
             userMessages.isEmpty ? "(none)" : userMessages.map { "- \($0)" }.joined(separator: "\n")]))
 
-        // 2. Errors logged this week.
         for feed in ErrorFeeds.errorFeeds {
             sections.append(try Self.recentLines(
                 at: feed.url(dataRoot: dataRoot),
                 since: weekAgo, label: "\(feed.label) error log (last 7 days)", limit: 30
             ))
         }
+        sections.append(try await Self.recentLoopFailures(dataRoot: dataRoot, since: weekAgo, limit: 30))
 
-        // 3. Doctor health.
         let doctorPath = dataRoot.appendingPathComponent("doctor", isDirectory: true)
             .appendingPathComponent("latest.json")
         if let text = try Self.optionalText(at: doctorPath) {
@@ -97,24 +97,22 @@ extension WeeklySelfImprovementLoop {
         guard row["role"] as? String == "user" else { return false }
         if row["metadata"] != nil, !(row["metadata"] is [String: Any]) { return false }
         let metadata = row["metadata"] as? [String: Any] ?? [:]
-        guard metadata["mechanicalKind"] == nil,
-              metadata["kind"] as? String != "compaction_summary" else { return false }
+        guard metadata["mechanicalKind"] == nil else { return false }
         if let kind = metadata["turnKind"] as? String, kind != "live" { return false }
-        let humanSurfaces = ["app", "chat", "mac", "default", "telegram", "slack", "ios", "iphone", "mobile", "icloud"]
         for key in ["origin", "envelope"] {
             if let recorded = metadata[key] {
                 guard let provenance = recorded as? [String: Any], provenance["agent"] == nil,
                       let surface = provenance["surface"] as? String,
-                      humanSurfaces.contains(surface) else { return false }
-                if key == "origin", ["app", "chat", "mac", "default"].contains(surface) { return false }
+                      MyQueue.Door(rawValue: surface) != nil else { return false }
+                if key == "origin", surface == "chat" { return false }
             }
         }
+        // The row records a source; it counts when the surface it arrived on is a human one.
         guard let source = row["source"] as? String else { return false }
-        return humanSurfaces.contains(source)
+        return MyQueue.Door(rawValue: ChatThreadKind.surface(transcriptSource: source)) != nil
     }
 
-    /// One user turn inside the week's window, carrying the ids that make it
-    /// citable back to the conversation it came from.
+    /// Retain source identities so sampled evidence remains citable.
     struct SampledUserMessage: Sendable {
         let at: Date
         let day: String
@@ -123,26 +121,23 @@ extension WeeklySelfImprovementLoop {
         let content: String
         let weight: Double
 
-        /// The prompt line names the source turn as evidence.
         var line: String {
             let source = messageId.isEmpty ? sessionId : "\(sessionId):\(messageId)"
             return "[\(day) \(source)] \(content)"
         }
     }
 
-    /// Caring receipts in `cognition/caring_appraisals.jsonl` key each user turn
-    /// by session and message id. Repairs weigh three, landed outcomes one;
-    /// none and failure rows contribute nothing. Absence is fresh history;
-    /// unreadable existing evidence fails the pass.
-    static func feltWeights(dataRoot: URL) throws -> [String: Double] {
-        let url = dataRoot.appendingPathComponent("cognition", isDirectory: true)
-            .appendingPathComponent("caring_appraisals.jsonl")
-        guard let text = try optionalText(at: url) else { return [:] }
+    /// Repairs weigh three and landed outcomes one; absent appraisals add no weight. Each `caring.appraisal` detail's row names its
+    /// cognitive subject (`session:message`) in `turn`. Existing unreadable evidence fails the pass rather than becoming empty history.
+    static func feltWeights(dataRoot: URL) async throws -> [String: Double] {
+        let record = dataRoot.appendingPathComponent("experiences/experiences.sqlite")
+        let appraisals: [ExperienceStore.Detail]
+        do { appraisals = try await ExperienceStore.at(dataRoot).details(.init(kinds: ["caring.appraisal"])) }
+        catch { throw sourceError(record, error.localizedDescription) }
         var weights: [String: Double] = [:]
-        for line in text.split(separator: "\n") {
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw sourceError(url, "malformed appraisal row")
+        for appraisal in appraisals {
+            guard let obj = try? JSONSerialization.jsonObject(with: appraisal.row) as? [String: Any] else {
+                throw sourceError(record, "malformed caring.appraisal detail \(appraisal.seq)")
             }
             guard let turn = (obj["turn"] as? String)?
                       .trimmingCharacters(in: .whitespacesAndNewlines), !turn.isEmpty,
@@ -156,8 +151,7 @@ extension WeeklySelfImprovementLoop {
             default: continue
             }
             weights[turn] = max(weights[turn] ?? 0, weight)
-            // Also bare-keyed: a receipt may carry the message id alone, the
-            // same dual keying the dream's felt index uses.
+            // Some receipts identify only the message; share the dream felt index’s dual keying.
             if let messageId = turn.split(separator: ":").last, !messageId.isEmpty {
                 weights[String(messageId)] = max(weights[String(messageId)] ?? 0, weight)
             }
@@ -170,9 +164,7 @@ extension WeeklySelfImprovementLoop {
         return weights["\(sessionId):\(messageId)"] ?? weights[messageId] ?? 0
     }
 
-    /// Cover day/session buckets newest-active first, choosing their most-felt
-    /// turn; fill the remaining budget by feeling weight, breaking ties toward
-    /// recent turns. Restore chronological order for the analyst.
+    /// Cover newest-active day/session buckets before filling by feeling weight; restore chronology for analysis.
     static func sampleUserMessages(
         _ all: [SampledUserMessage], limit: Int
     ) -> [SampledUserMessage] {
@@ -191,7 +183,6 @@ extension WeeklySelfImprovementLoop {
             indices.reduce(Date.distantPast) { max($0, all[$1].at) }
         }
         var taken = Set<Int>()
-        // PHASE 1 — reach.
         let bucketOrder = buckets.keys.sorted { lhs, rhs in
             let lat = bucketTimes[lhs] ?? .distantPast
             let rat = bucketTimes[rhs] ?? .distantPast
@@ -203,7 +194,6 @@ extension WeeklySelfImprovementLoop {
             guard let best = buckets[key]?.min(by: moreMeaningful) else { continue }
             taken.insert(best)
         }
-        // PHASE 2 — meaning.
         for index in all.indices.sorted(by: moreMeaningful) {
             if taken.count >= limit { break }
             taken.insert(index)
@@ -214,9 +204,7 @@ extension WeeklySelfImprovementLoop {
         }.map { all[$0] }
     }
 
-    /// Tail of a JSONL log, keeping rows whose `createdAt`/`ts` is within the
-    /// window (rows without a parseable timestamp are kept — better noisy than
-    /// silently dropped).
+    /// Keep rows with unknown timestamps so parsing uncertainty cannot silently discard evidence.
     private static func recentLines(
         at url: URL, since: Date, label: String, limit: Int
     ) throws -> String {
@@ -240,6 +228,18 @@ extension WeeklySelfImprovementLoop {
         return "## \(label)\n\(kept.isEmpty ? "(none)" : kept.reversed().joined(separator: "\n"))"
     }
 
+    /// One line per loop failure incident whose last occurrence is in the window, newest `limit`, oldest first, as the incident row it is.
+    private static func recentLoopFailures(dataRoot: URL, since: Date, limit: Int) async throws -> String {
+        let label = "## \(ErrorFeeds.loopFailureLabel) error log (last 7 days)"
+        let incidents: [LoopFailureReceipts.Incident]
+        do { incidents = try await LoopFailureReceipts.incidents(dataRoot: dataRoot) }
+        catch { throw sourceError(dataRoot.appendingPathComponent("experiences/experiences.sqlite"), error.localizedDescription) }
+        let kept = try incidents.filter { $0.lastAt >= since }.sorted { $0.lastAt > $1.lastAt }.prefix(limit).reversed().map {
+            TurnSecretRedactor.redactText(String(decoding: try $0.row.serializedData(pretty: false), as: UTF8.self)).prefix(280).description
+        }
+        return label + "\n" + (kept.isEmpty ? "(none)" : kept.joined(separator: "\n"))
+    }
+
     private static func optionalText(at url: URL) throws -> String? {
         do { return try String(contentsOf: url, encoding: .utf8) }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
@@ -252,8 +252,6 @@ extension WeeklySelfImprovementLoop {
     }
 }
 
-/// What a weekly pass learns from: prompt sections already rendered, and the
-/// standing corrections it may graduate (memory id → text).
 public struct SelfImprovementLearning: Sendable {
     public var signals: String
     public var standing: [String: String]
@@ -265,9 +263,7 @@ public struct SelfImprovementLearning: Sendable {
 }
 
 extension MaintenanceBackgroundWork {
-    /// The previous pass's cards, by the ids its digest recorded — its
-    /// one-tap proposals (`approval:`) and its standing lessons (`rem:`) — and
-    /// what became of each, its execution receipt included.
+    /// Digest-recorded card ids bind follow-up to exact proposals and execution receipts.
     static func passOutcomes(cards: [String], inbox: SwiftNativeApprovalInbox, dataRoot: URL) async throws -> String {
         let rem = try REMProposalStore(dataRoot: dataRoot).loadAllStrictly()
         var lines: [String] = []
@@ -298,10 +294,8 @@ extension MaintenanceBackgroundWork {
         return "## The last pass: its proposals and what became of them\n" + (lines.isEmpty ? "(none recorded)" : lines.joined(separator: "\n"))
     }
 
-    /// A standing correction recurs in at least two independent conversations,
-    /// covers half the observed turns in each, and covers two thirds of the
-    /// week's conversations. Every context-building conversation counts in the
-    /// denominator, including those with no recalls; no installation-volume floor.
+    /// Recurrence needs two conversations, half their turns and two thirds of all weekly conversations.
+    /// Conversations without recalls still count; installation volume cannot change the threshold.
     static func standingLessons(dataRoot: URL, now: Date = Date()) async throws -> [String: String] {
         let events = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
             .read(now: now, since: now.addingTimeInterval(-7 * 86_400)).events

@@ -4,7 +4,6 @@ import StandingBots
 import NativeAgentShared
 import Foundation
 import EngineRuntime
-import SwarmRuns
 import Agents
 import ChatSessionWork
 import AgentWorkspace
@@ -12,9 +11,9 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import AppToolRuntime
-// Blueprint: | `SimpleSidebar.swift` | Shared contact/helper/crew sidebar and Simple settings menu retain engine projections and native navigation; unavailable crew receipts name the evidence gap without inventing worker counts |
+// Blueprint: | `SimpleSidebar.swift` | Engine contact and helper rows and shared settings |
 
-/// Settings shares update, colour, warmth and view-mode preferences with Advanced.
+/// Share preferences with Advanced so changing presentation does not fork settings.
 private struct SimpleSettingsMenuItems: View {
     @AppStorage(MoodTintPreference.key) private var warmth = true
     @AppStorage(SimpleViewMode.key) private var viewMode = ""
@@ -51,7 +50,7 @@ private struct SimpleSettingsMenuItems: View {
         }
     }
 
-    /// A filled circle in the haze colour; menus draw template images grey.
+    /// Use a filled colour image because menus render template images grey.
     static func swatch(_ color: HazeColor) -> NSImage {
         let image = NSImage(size: NSSize(width: 12, height: 12), flipped: false) { rect in
             NSColor(color.base).setFill()
@@ -63,8 +62,6 @@ private struct SimpleSettingsMenuItems: View {
     }
 }
 
-/// Home-ordered agent and helper rows share the room, separated by a hairline.
-/// Advanced replaces the agent card with Connections and omits Simple settings.
 struct SimpleSidebar: View {
     let store: SimpleViewStore
     @Binding var pane: SimpleShellView.Pane
@@ -74,8 +71,7 @@ struct SimpleSidebar: View {
     @Environment(\.layoutProfile) private var layoutProfile
     @Environment(\.simpleSettingsMenuDrawnOpen) private var settingsMenuDrawnOpen
     @State private var showQuiet = false
-    @State private var showCrews = false
-    /// Relative times refresh on appearance, activation, helper changes and hover.
+    /// Refresh relative times on user activity and owner changes instead of polling.
     @State private var now = Date()
 
     static let width: CGFloat = 280
@@ -85,11 +81,10 @@ struct SimpleSidebar: View {
     private var agentName: String { AgentVoice(name: appModel.agentDisplayName).name }
 
     var body: some View {
-        // Talked to, newest first; the rest fold at the end.
+        // Fold untouched contacts after recent ones so active conversations remain reachable.
         let contacts = store.contacts
         let talked = contacts.filter { !isQuiet($0) }
         let unheard = contacts.filter(isQuiet)
-        // Native selection, keys and folds; the home card uses its own quiet wash.
         List(selection: Binding<SimpleShellView.Pane?>(get: { pane == .agent && !embedded ? nil : pane },
                                                        set: { if let next = $0 { pane = next } })) {
             ConversationReadNotice(detail: appModel.engine.transcripts.navigationReadIssue)
@@ -110,7 +105,6 @@ struct SimpleSidebar: View {
             .selectionDisabled()
                 .padding(.bottom, Self.sectionGap)
             }
-            // Her home's people and helpers, in its order: the two sections.
             SurfaceLayoutContent(appModel.engine.layout.availability) { layout in
             ForEach(layout.contentNames("home", profile: layoutProfile).filter { ["people", "helpers"].contains($0) },
                     id: \.self) { block in
@@ -120,8 +114,7 @@ struct SimpleSidebar: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
-        // The list starts below the title strip, so no row ever scrolls up
-        // under the traffic lights; its first row sits 12 lower still.
+        // Inset below the title strip so rows cannot scroll beneath the traffic lights.
         .contentMargins(.top, 12, for: .scrollContent)
         .padding(.top, embedded ? 0 : NativeAgentShellLayout.titleBarInset)
         .scrollIndicators(.never)
@@ -130,7 +123,6 @@ struct SimpleSidebar: View {
         .padding(.leading, embedded ? 0 : NativeAgentShellLayout.railPlateInset)
         .frame(width: Self.width + (embedded ? 0 : NativeAgentShellLayout.railPlateInset))
         .frame(maxHeight: .infinity)
-        // One hairline parts the sidebar from chat; only the agent card uses glass.
         .overlay(alignment: .trailing) {
             Rectangle().fill(NativeAgentShell.hairline).frame(width: 1).allowsHitTesting(false)
         }
@@ -163,9 +155,8 @@ struct SimpleSidebar: View {
 
     private var helpersSection: some View {
         Section {
-            // Running and unknown crews stay here until their owner settles them.
-            ForEach(store.crews.filter { $0.liveness != .settled }) { crewRow($0) }
-            if store.loaded && store.helpers.isEmpty {
+            if let error = store.helpersRefreshError { quiet(error) }
+            if store.helpersLoaded && store.helpersRefreshError == nil && store.helpers.isEmpty {
                 quiet("None yet. Ask \(agentName) to make one.")
             }
             ForEach(store.helpers) { helper in
@@ -180,22 +171,12 @@ struct SimpleSidebar: View {
                 }
                 .accessibilityLabel("\(helper.definition.name), \(working ? "working now, " : "")\(timing)")
             }
-            let finished = store.crews.filter { $0.liveness == .settled }
-            if !finished.isEmpty {
-                DisclosureGroup(isExpanded: $showCrews) {
-                    ForEach(finished) { crewRow($0) }
-                } label: {
-                    foldLabel("Recent crews", count: finished.count)
-                }
-            }
         } header: {
             sectionTitle("Helpers", "Bots I made that can do real work for you. Talk to any of them here.")
         }
     }
 
-    /// The gear opens settings upward from the sidebar's foot.
     private var settingsRow: some View {
-        // Native settings menu.
         HStack(spacing: 0) {
             Menu {
                 SimpleSettingsMenuItems()
@@ -217,7 +198,7 @@ struct SimpleSidebar: View {
         .padding(.leading, NativeAgentShellLayout.railWordInset)
         .frame(height: 32)
         .padding(.bottom, 8)
-        // Fade rows under settings over 16pt while keeping the last row scrollable.
+        // Fade beneath pinned settings without making the last row unreachable.
         .padding(.top, 16)
         .background {
             VStack(spacing: 0) {
@@ -251,24 +232,6 @@ struct SimpleSidebar: View {
             .accessibilityLabel("\(title), \(count)")
     }
 
-    /// "Working now · <task> · 3 workers" while it runs; the task and how it
-    /// went once it has finished.
-    private func crewRow(_ crew: SimpleCrew) -> some View {
-        let selected = pane == .crew(crew.id)
-        let workers = crew.receiptUnavailable != nil ? "worker count unavailable"
-            : crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
-        let name = crew.receiptUnavailable != nil ? "Receipt unavailable"
-            : crew.liveness == .unknown ? "Liveness unknown" : crew.live ? "Working now" : crew.task
-        let line = crew.liveness != .settled ? "\(crew.task) · \(workers)" : "\(SimpleCrewThread.outcome(crew)) · \(workers)"
-        return row(.crew(crew.id)) {
-            HStack(spacing: 10) {
-                SimpleClockTile(size: 30, symbol: "person.3", working: crew.live)
-                rowText(name, line, selected: selected)
-            }
-        }
-        .accessibilityLabel("\(name), \(line)")
-    }
-
     private func isQuiet(_ contact: SimpleContact) -> Bool {
         contact.lastActivityAt == nil && (store.lines[contact.id] ?? []).isEmpty && !store.waiting.contains(contact.id)
             && store.status[contact.id] == nil && store.flight(for: contact.id) == nil && contact.health?.problem == nil
@@ -277,8 +240,7 @@ struct SimpleSidebar: View {
 
     private func contactRow(_ contact: SimpleContact) -> some View {
         let selected = pane == .contact(contact.id)
-        // Lead with how it is connected, so two contacts behind one app's
-        // icon ("Grok", "Grok Bot") read as the two things they are.
+        // Lead with the connection so contacts sharing an app icon remain distinguishable.
         let line = [contact.link?.words, lastLine(contact)].compactMap { $0 }.joined(separator: " · ")
         return row(.contact(contact.id)) {
             HStack(spacing: 10) {
@@ -286,7 +248,6 @@ struct SimpleSidebar: View {
                 rowText(contact.name, line, selected: selected)
             }
         }
-        // Working with her: the whole row wears the moving rim.
         .background {
             if store.waiting.contains(contact.id) || store.flight(for: contact.id)?.working == true {
                 WorkingRim(cornerRadius: 10).padding(.horizontal, -6).padding(.vertical, 1)
@@ -307,7 +268,6 @@ struct SimpleSidebar: View {
         .lineLimit(1)
     }
 
-    /// "Daily at 09:00 · last ran 2 hr. ago", or "Paused".
     static func timing(_ helper: BotsShelfRecord, now: Date = Date()) -> String {
         if helper.definition.paused { return "Paused" }
         guard let last = helper.entries.map(\.runAt).max() else { return helper.cadence }
@@ -323,8 +283,7 @@ struct SimpleSidebar: View {
         guard let last = latest else {
             return word ?? (contact.lastActivityAt == nil ? "No messages yet" : "No retained messages")
         }
-        // When the thread last moved, never a quote: a reply of "ok" or a
-        // probe's output reads like a status and is not one. The words are in the thread.
+        // Show when the thread moved; a quoted reply or probe output can be mistaken for status.
         let ago = RelativeDateTimeFormatter()
         ago.unitsStyle = .short
         // A line whose time is unreadable still says what moved, without inventing when.
@@ -333,7 +292,7 @@ struct SimpleSidebar: View {
         return word.map { "\($0) · \(when)" } ?? when.prefix(1).uppercased() + when.dropFirst()
     }
 
-    /// A section title and description distinguish agents from helpers.
+    /// Distinguish agents from helpers with both a section title and description.
     private func sectionTitle(_ title: String, _ line: String) -> some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(title)

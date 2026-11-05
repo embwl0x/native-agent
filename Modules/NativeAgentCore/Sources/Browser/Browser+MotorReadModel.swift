@@ -3,12 +3,9 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `Browser+MotorReadModel.swift` | `SwiftNativeBrowserClient.motorActionReadModel`: payload-free projection from canonical runs only; Browser retains outcome and effect authority |
+// Blueprint: | `Browser+MotorReadModel.swift` | `SwiftNativeBrowserClient.motorActionReadModel`: canonical payload-free projection |
 
-/// Fail-loud errors for the Browser shared-motor projection. The projection
-/// reads only the canonical `runs.json`; derived receipts are deliberately not
-/// a recovery source because an older receipt must never manufacture a terminal
-/// outcome over a newer owner row.
+/// Only canonical runs can establish outcome; an older derived receipt cannot override a newer owner row.
 public enum BrowserMotorReadModelError: Error, Sendable, Equatable {
     case invalidRunsDocument
     case invalidMatchingRun
@@ -19,11 +16,7 @@ public enum BrowserMotorReadModelError: Error, Sendable, Equatable {
 }
 
 extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
-    /// Read-only, payload-free projection over one canonical Browser run.
-    ///
-    /// Browser remains the sole owner of navigation, approval, cancellation,
-    /// and persistence. This adapter performs no write and exposes no URL,
-    /// domain, capture path, approval payload, or receipt body.
+    /// Browser retains effect authority; this read-only projection exposes no URL, capture or approval payload.
     public func motorActionReadModel(actionId: String) async throws -> MotorActionReadModel? {
         let runID = actionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !runID.isEmpty else { return nil }
@@ -83,8 +76,7 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
                 verification = .satisfied
                 expectedEvidence = nil
             } else {
-                // A successful page effect is not a navigation observation.
-                // Preserve terminality without inventing navigation proof.
+                // A page effect can be terminal without proving navigation.
                 verification = .unverified
                 expectedEvidence = "browser_navigation_receipt"
             }
@@ -130,8 +122,7 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
         )
     }
 
-    /// Each current state has one writer-owned timestamp; missing evidence is
-    /// an unavailable projection, never a substitute timestamp.
+    /// Require the current state's writer-owned timestamp; missing evidence cannot supply one.
     private func canonicalMotorTimestamp(run: [String: JSONValue], status: String) throws -> String {
         let key: String
         switch status {

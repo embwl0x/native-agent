@@ -5,9 +5,9 @@ import GRPCNIOTransportHTTP2TransportServices
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `NativeAgentA2AGRPCListener.swift` | gRPC loopback listener generation and endpoint publication; stop closes publication and retains the serving worker through graceful drain, excluding restart until actual exit |
+// Blueprint: | `NativeAgentA2AGRPCListener.swift` | Retain listener ownership through graceful drain. |
 
-/// The third A2A wire listener. All task ownership and execution stays in AgentContactTasks.
+/// gRPC projects the same retained task owner; listeners must not own execution.
 public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
     private let dataRoot: @Sendable () -> URL
     private let endpoint: @Sendable (UInt16?) -> AgentContactA2AEndpoint
@@ -82,8 +82,7 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
             stopping = true
             if let server { server.beginGracefulShutdown() }
             else { worker?.cancel() }
-            // Keep the worker and server owned until serve() has actually
-            // drained. start() cannot admit another listener in the meantime.
+            // Keep the worker and server owned until serve() has actually drained. start() cannot admit another listener in the meantime.
             boundPort = nil
             try? FileManager.default.removeItem(at: descriptorURL)
         }

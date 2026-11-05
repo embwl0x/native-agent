@@ -5,24 +5,17 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `ApprovalInbox.swift` | `SwiftNativeApprovalInbox`; canonical checked authority storage and decision/grant facts; recordsUnlocked/list share the originating DataRootLife projection for execution and chat continuation. Old approved but unexecuted work reads stopped/restored without changing the grant or settled outcomes; resolution stamps new work; raw offline validation remains side effect free |
+// Blueprint: | `ApprovalInbox.swift` | Checked approval authority; its decision experience is born as a matter with its doors, then only appended |
 
-// Surface identity belongs to ConversationSurfaceProfile.
 
 // MARK: - Errors
 
 public enum ApprovalInboxError: Error, Equatable, LocalizedError {
-    /// Approval id was not found in the queue.
     case notFound(String)
-    /// Tried to resolve an approval that's already in a terminal state.
     case alreadyResolved(id: String, status: String)
-    /// JSON serialization or shape mismatch.
     case malformedResponse(String)
-    /// Authoritative approval or effect-spend storage could not be read.
     case unavailable(underlying: String)
-    /// The decision origin is not permitted to resolve this exact row.
     case resolutionNotAuthorized(id: String, reason: String)
-    /// The row cap is exceeded and no settled terminal history can be evicted.
     case queueFull(pending: Int, cap: Int)
 
     public var errorDescription: String? {
@@ -32,14 +25,14 @@ public enum ApprovalInboxError: Error, Equatable, LocalizedError {
         case .malformedResponse(let detail): "Approval storage is malformed: \(detail). Repair the retained approval store before continuing."
         case .unavailable(let detail): "Approval storage is unavailable: \(detail). Restore access to the approval store before continuing."
         case .resolutionNotAuthorized(_, let reason): reason
-        case .queueFull(let pending, let cap): "Approval queue is full (\(pending) retained requests, limit \(cap)). Settle outstanding requests before filing another."
+        case .queueFull(let pending,
+            let cap): "Approval queue is full (\(pending) retained requests, limit \(cap)). Settle outstanding requests before filing another."
         }
     }
 }
 
 public extension SwiftNativeApprovalInbox {
-    /// Local decision convenience. Remote adapters must use
-    /// the typed provenance overload and cannot enter through this label.
+    /// Local decision convenience. Remote adapters must use the typed provenance overload and cannot enter through this label.
     @discardableResult
     func resolve(
         _ id: String,
@@ -53,23 +46,12 @@ public extension SwiftNativeApprovalInbox {
         )
     }
 }
-/// File-backed implementation. Reads/writes
-/// `<root>/workflows/approvals/requests.json` via PersistenceCore for
-/// atomic, 0600, sorted-keys, UTF-8 IO.
-/// Local backup and export include this checked array; phone sync projects
-/// approvals, and PrivacyMap lists Approvals. Legacy approvals/requests.json
-/// and its completed-import requests.json.migrated archive are excluded from
-/// backup/export/raw sync and listed under Legacy Approvals.
-///
-/// Every mutation holds PersistenceCore's file lock across read, change and
-/// write, including mutations through another inbox instance.
+/// PersistenceCore supplies atomic private storage; every inbox instance shares its file lock.
 public actor SwiftNativeApprovalInbox {
-    // Module-internal (not private) so `ApprovalInbox+InjectionSpend.swift`
-    // can build the durable spend marker against the same root/persistence.
+    // Module visibility lets injection spends use the same root and persistence owner.
     let root: URL
-    /// These actions retain local-only flags regardless of caller input.
-    /// Paired iPhone and bound owner-DM decisions follow
-    /// `validateResolutionAuthority`; executable review still requires Mac/phone.
+    /// These actions retain local-only flags regardless of caller input. Paired iPhone and bound owner-DM decisions follow `validateResolutionAuthority`;
+    /// executable review still requires Mac/phone.
     nonisolated static let hardLocalOnlyActions: Set<String> = [
         "agent.acp.permission",
         "backup_restore",
@@ -80,28 +62,20 @@ public actor SwiftNativeApprovalInbox {
         "improvement.promote",
         "improvement.revert",
         "autonomy.promote",
-        SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
     ]
-    /// Owner reviews allow paired-phone and bound owner-DM decisions, except
-    /// executable reviews. `validateResolutionAuthority` owns that rule.
+    /// Owner reviews allow paired-phone and bound owner-DM decisions, except executable reviews. `validateResolutionAuthority` owns that rule.
     public nonisolated static let ownerReviewActions: Set<String> = [
         "self_improvement.apply",
         "rem.proposal",
-        // A care becoming part of who she is (life depth), from her night.
         "care.life",
         "memory.kind_backfill",
-        // User's own Install of a skill script, bound to its exact digest.
         SwiftNativeApprovalInbox.skillScriptInstallAction,
     ]
-    /// - root: the canonical data root. The approvals
-    ///   file lives at `<root>/workflows/approvals/requests.json`.
     public init(root: URL) {
         self.root = root
     }
-    /// Canonical approval storage path.
     public nonisolated var approvalsPath: URL { Self.approvalsPath(root: root) }
-    /// Pending requests, read-only and without the lock, for a glance that
-    /// must not wait; a file caught mid-write fails its check and throws.
+    /// Pending requests, read-only and without the lock, for a glance that must not wait; a file caught mid-write fails its check and throws.
     public nonisolated func pendingUnlocked() throws -> [ApprovalRecord] {
         try recordsUnlocked().filter { $0.status == "pending" }
     }
@@ -111,8 +85,7 @@ public actor SwiftNativeApprovalInbox {
     public nonisolated func recordsUnlocked() throws -> [ApprovalRecord] {
         try readContinuations(Self.loadApprovalRowsChecked(at: approvalsPath).compactMap(ApprovalRecord.init(json:)))
     }
-    /// A conversation releases its wait only after a checked decision, and
-    /// an approved action's execution receipt. Missing identity is repair work.
+    /// A conversation releases its wait only after a checked decision, and an approved action's execution receipt. Missing identity is repair work.
     public nonisolated func decisionSettledUnlocked(_ id: String) throws -> Bool {
         guard let record = try recordsUnlocked().first(where: { $0.id == id }) else {
             throw ApprovalInboxError.notFound(id)
@@ -124,16 +97,13 @@ public actor SwiftNativeApprovalInbox {
         let items = try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
             try Self.loadApprovalRowsChecked(at: approvalsPath)
         }
-        // `loadApprovalRowsChecked` validates every row before returning, so
-        // compactMap cannot hide a corrupt record as a shorter healthy queue.
+        // Checked loading validates every row before compactMap can discard malformed evidence.
         let records = try readContinuations(items.compactMap(ApprovalRecord.init(json:)))
         let sorted = records.sorted { lhs, rhs in
-            // Newest saved creation timestamp first.
             lhs.createdAt > rhs.createdAt
         }
         return sorted.filter { record in
             if let s = filter.status, record.status != s { return false }
-            // Persisted and requested action names match through the same vocabulary.
             if let a = filter.action, !ExecutionEventVocabulary.matches(record.action, a) {
                 return false
             }
@@ -148,17 +118,20 @@ public actor SwiftNativeApprovalInbox {
         return match
     }
     @discardableResult
-    public func create(_ body: JSONValue) async throws -> ApprovalRecord {
-        try await createOrTouchPending(body, matchesPending: { _ in false }).record
+    public func create(_ body: JSONValue, turn: Turn?, handsBack: Bool = false) async throws -> ApprovalRecord {
+        try await createOrTouchPending(body, turn: turn, handsBack: handsBack, matchesPending: { _ in false }).record
     }
     /// Matches pending payloads or creates under one lock; matches stamp `lastRequestedAt`.
     @discardableResult
     public func createOrTouchPending(
         _ body: JSONValue,
+        turn: Turn?,
+        handsBack: Bool = false,
         matchesPending: @escaping @Sendable (JSONValue) -> Bool
     ) async throws -> (record: ApprovalRecord, created: Bool) {
         let outcome = try await Self._createOrTouchPendingImpl(
             body: body,
+            turn: turn, handsBack: handsBack,
             lifeID: try DataRootLife.current(in: root),
             matchesPending: matchesPending,
             approvalsPath: approvalsPath,
@@ -167,30 +140,32 @@ public actor SwiftNativeApprovalInbox {
         if outcome.created {
             ApprovalLifecycleBus.fire(.init(phase: .requested, record: outcome.record))
         }
-        // A touched card is born too: births are idempotent, so this mends a gap.
-        recordFiled(outcome.record, expired: outcome.expired)
+        // Idempotent births repair missing experience even when an existing card is touched.
+        await recordFiled(outcome.record, expired: outcome.expired)
         return (outcome.record, outcome.created)
     }
-    /// Id-only birth keeps E0 records readable; cause and face append after it.
-    static func filed(_ id: String) -> Experience {
-        Experience(id: id, kind: .decision, evidence: [.init(source: "workflows/approvals/requests.json", id: id)],
-                   addressedTo: ["person"], owes: ["decide": .init(to: "person")])
-    }
     /// Recorded after the approvals lock is released. Cards this write aged out let theirs go.
-    private func recordFiled(_ record: ApprovalRecord, expired: [ApprovalRecord]) {
-        recordProjection(record)
+    private func recordFiled(_ record: ApprovalRecord, expired: [ApprovalRecord]) async {
+        await recordProjection(record).value
         for expired in expired {
-            recordProjection(expired)
+            await recordProjection(expired).value
             ApprovalLifecycleBus.fire(.init(phase: .resolved, record: expired))
         }
     }
-    private func recordProjection(_ record: ApprovalRecord) {
-        ExperienceStore.record(root, record.id) { store in
+    @discardableResult
+    private func recordProjection(_ record: ApprovalRecord) -> Task<Void, Never> {
+        let projection = ExperienceStore.record(root, record.id) { store in
             try await Self.project(record, into: store)
         }
-        // Later answers settle with the decision; the first rides its continuation.
-        // Without a decision, the inbox lets go of every answer it held.
-        guard record.status != "pending", case .object(let payload) = record.payload else { return }
+        if record.status != "pending", record.decision == nil {
+            let root = root
+            Task {
+                do { try await ForPerson.at(root).answered(record.id, evidence: nil, letGo: .expired) }
+                catch { nativeLog("[approvals] expiry settlement failed for \(record.id): \(error)") }
+            }
+        }
+        // Later answers settle with the decision; the first rides its continuation. Without a decision, the inbox lets go of every answer it held.
+        guard record.status != "pending", case .object(let payload) = record.payload else { return projection }
         var heards: [JSONValue] = if case .array(let waiting)? = payload["waitingHeards"] { waiting } else { [] }
         if record.decision == nil, case .object(let origin)? = payload["origin"],
            case .string(let heard)? = origin["answerExperienceID"], !heards.contains(.string(heard)) {
@@ -205,9 +180,9 @@ public actor SwiftNativeApprovalInbox {
                 try await store.append([settle], to: heard)
             }
         }
+        return projection
     }
-    /// The durable domain row is the decision's source, not its advisory copy.
-    /// Reads are projections only; a failed experience write cannot hold a turn.
+    /// The durable domain row is the decision's source, not its advisory copy. Reads are projections only; a failed experience write cannot hold a turn.
     public func decisionsForREM() async throws -> [String: Experience] {
         let records = try await list(filter: ApprovalFilter(action: "rem.proposal"))
         var decisions: [String: Experience] = [:]
@@ -221,7 +196,11 @@ public actor SwiftNativeApprovalInbox {
     }
     private static func project(_ record: ApprovalRecord, into store: ExperienceStore) async throws {
         let projection = record.decisionExperience
-        try await store.begin(Self.filed(record.id))
+        if try await store.experience(record.id) == nil {
+            var born = record.matter.born(doors: record.isAgentsOwnDecision ? [] : try record.personDoors)
+            if record.isAgentsOwnDecision { born.addressedTo = [] }
+            try await store.begin(born)
+        }
         var changes = projection.cause.map(ExperienceStore.Change.cause)
         if let face = projection.face { changes.append(.face(face)) }
         changes += projection.claims.map(ExperienceStore.Change.claim)
@@ -233,7 +212,7 @@ public actor SwiftNativeApprovalInbox {
         }
         try await store.append(changes, to: record.id)
     }
-    /// Pending rows a capped write no longer holds as pending: aging is the only way out.
+    /// Aging is the only way a capped write may drop pending work.
     static func expired(from before: [JSONValue], to after: [JSONValue]) -> [ApprovalRecord] {
         let pending = Set(after.compactMap { ApprovalRecord(json: $0) }.filter { $0.status == "pending" }.map(\.id))
         return before.compactMap { row in
@@ -245,6 +224,8 @@ public actor SwiftNativeApprovalInbox {
     }
     private static func _createOrTouchPendingImpl(
         body: JSONValue,
+        turn: Turn?,
+        handsBack: Bool,
         lifeID: String,
         matchesPending: @Sendable (JSONValue) -> Bool,
         approvalsPath: URL,
@@ -275,15 +256,14 @@ public actor SwiftNativeApprovalInbox {
             try await SwiftNativePersistenceCore.writeJSON(.array(items), to: approvalsPath)
             return (touched, false, [])
         }
-        let approval = try Self.makeApprovalRecord(body: body, now: now)
+        let approval = try Self.makeApprovalRecord(body: body, now: now, turn: turn, handsBack: handsBack)
         items.insert(approval.toJSON(forStorage: true), at: 0)
         let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now, lifeID: lifeID)
         try await SwiftNativePersistenceCore.writeJSON(.array(capped), to: approvalsPath)
         return (approval, true, Self.expired(from: items, to: capped))
       }
     }
-    /// Resolve with a typed authority origin. Remote authorization is checked
-    /// against the same row generation inside the same file lock as the write.
+    /// Resolve with a typed authority origin. Remote authorization is checked against the same row generation inside the same file lock as the write.
     @discardableResult
     public func resolve(
         _ id: String,
@@ -299,15 +279,13 @@ public actor SwiftNativeApprovalInbox {
             now: Date()
         )
         ApprovalLifecycleBus.fire(.init(phase: .resolved, record: record))
-        // The inbox holding the decision is the person's durable acceptance; the
-        // birth goes first in case this resolver got there before the filer.
-        recordProjection(record)
+        // The inbox holding the decision is the person's durable acceptance; the birth goes first in case this resolver got there before the filer.
+        await recordProjection(record).value
         return record
     }
-    /// Constructs every new record's ID, clamped strings and authority flags without file I/O.
-    private static func makeApprovalRecord(body: JSONValue, now: Date) throws -> ApprovalRecord {
-        // Validation cannot file an approval.
-        if SkillRunContext.handsBack { throw SkillRunContext.HandBack("an approval") }
+    /// Construct without file I/O so validation cannot file an approval.
+    private static func makeApprovalRecord(body: JSONValue, now: Date, turn: Turn?, handsBack: Bool) throws -> ApprovalRecord {
+        if handsBack { throw SkillRunContext.HandBack("an approval") }
         let bodyObj: [String: JSONValue]
         if case .object(let obj) = body {
             bodyObj = obj
@@ -320,7 +298,6 @@ public actor SwiftNativeApprovalInbox {
         } else {
             payload = .object([:])
         }
-        // A nonblank caller preview takes precedence over serialized payload.
         let rawPayloadPreview: String
         if case .string(let s)? = bodyObj["payloadPreview"],
            !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -328,7 +305,7 @@ public actor SwiftNativeApprovalInbox {
         } else {
             rawPayloadPreview = (try? payload.serialize(pretty: false)) ?? ""
         }
-        if let id = SkillRunContext.hostCallID, case .object(var fields) = payload {
+        if let id = turn?.hostCallID, case .object(var fields) = payload {
             fields["hostCallID"] = .string(id.uuidString)
             payload = .object(fields)
         }
@@ -340,9 +317,8 @@ public actor SwiftNativeApprovalInbox {
             throw ApprovalInboxError.malformedResponse("the script is too long to show whole on the card")
         }
         let payloadPreview = String(rawPayloadPreview.prefix(previewLimit))
-        // Remote resolution is authority: hard-local actions ignore caller
-        // overrides. Otherwise honor only a literal JSON Boolean; missing or
-        // malformed flags default to false unless the action is remote-safe.
+        // Remote resolution is authority: hard-local actions ignore caller overrides. Otherwise honor only a literal JSON Boolean; missing or malformed flags
+        // default to false unless the action is remote-safe.
         let isHardLocalOnly = Self.hardLocalOnlyActions.contains(action)
         let isOwnerReview = Self.ownerReviewActions.contains(action)
         let declaredRemoteResolvable = Self.strictBool(bodyObj["remoteResolvable"])
@@ -374,7 +350,7 @@ public actor SwiftNativeApprovalInbox {
         let stamp = isoTimestamp(now)
         var approval = ApprovalRecord(
             id: UUID().uuidString.lowercased(),
-            title: codepointPrefix(SkillRunContext.requester.map {
+            title: codepointPrefix(turn?.requester.map {
                 let verb = ToolActivityPresentation.title(action)
                 return "\($0) wants to \(verb.prefix(1).lowercased())\(verb.dropFirst())"
             } ?? strip(pyStr(bodyObj["title"], fallback: "Approval required")), 160),
@@ -390,7 +366,7 @@ public actor SwiftNativeApprovalInbox {
             remoteResolvable: remoteResolvable,
             localOnly: localOnly
         )
-        approval.cause = Experience.currentAct
+        approval.cause = turn?.id
         guard !Self.strip(approval.action).isEmpty, !Self.strip(approval.title).isEmpty else {
             throw ApprovalInboxError.malformedResponse("approval title and action must be nonblank")
         }
@@ -484,12 +460,10 @@ public actor SwiftNativeApprovalInbox {
         let settled = try readContinuations([record])[0]
         await ApprovalLifecycleBus.shared.publish(.init(phase: .executed, record: settled,
             result: result ?? executedAction))
-        recordProjection(settled)
+        await recordProjection(settled).value
         return settled
     }
-    /// Claim or complete the reporting turn independently of deletable chat history.
-    /// Execution annotations may heal an outcome without replacing this state.
-    /// Approval storage uses PersistenceCore's canonical data root.
+    /// Reporting claims survive deletable chat history and outcome healing.
     public nonisolated static func defaultDataRoot() -> URL {
         PersistenceCore.defaultDataRoot()
     }

@@ -5,17 +5,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityStore.swift` | per-root parsed accounting and redacted projections reuse exact lstat identities under the store lock, successful durable writes warm the state memo, and public identity supplies the same current-version key to run readers; The bundled seed catalog owns shipped-id and native- reservations for new parts in Parts.save and for installation; all-kind registry rows carry kind and version, including recordless turns, and senses expose record-owned version/reach/mode without ability wake/residency; one throwing current partHeader normalizer/catalog for abilities, senses and reserved turns: reach/wake/face/resident/learned/choices, the `signalled` notification sources post and each part's `wakes`, current reach declarations and one 512 KB source limit; invocation-scoped file reach binds declared read/write approval to the part's own data root; current/prev/next lifecycle, shared ID normalization and all-slot name/identity occupancy for create-only saves, store-locked seed installation verifies the installed candidate and seal through the executable owner, compares the full authored/sealed identity excluding installation bookkeeping, retains the displaced untouched seed as previous, preserves authored versions and occupied other slots on first install, and carries the installed off switch forward, notebook schema and read/write/delete under the same lock (16 KiB/value, 64 KiB/notebook), independent versioned outcomes/read counts in state.json with exact-file read recovery and the captured restore digest retained in the remedy instruction, including native/bundled reads without executable files, without source rewrites, bounded recent exact-input/reached-call outcomes with call labels redacted before persistence, retained accounting redacted on projection, input previews and version run totals and recent per-use model rounds (`recordRounds`) projected as learned.use from ordinary gated execution (no rehearsal/preview/replay competence credit), scoped rehearsal evidence distinguished from bundled admission and from a tape replay of recorded practice (`replayed`, kind `tape_replay` with its coverage) and projected separately for current and proposed versions, operation-scoped repair owed through Experiences with source-filled native authoring calls for their abilities/senses, source reads and a person-directed defect for reserved turns, and no automatic swap-back; damaged-source recovery preserves fileRepairInstruction; unique ids, owner-off/peer-authoring guards and change invalidation; Exact reach-capability action definitions exclude Photos from file reach; the bundled seed catalog owns shipped-id and native- reservations for new parts in Parts.save and for installation |
-/// Files are the catalog; accounting and notebooks are separate. Abilities,
-/// including retained archives, are backed up/exported with credential exclusions
-/// off disk; phone sync is eligible metadata only. PrivacyMap lists abilities.
+// Blueprint: | `AbilityStore.swift` | `signalled`, `wakes`, `recordRounds`, `replayed`, `tape_replay`; sealed lifecycle, state and notebooks |
+/// Catalog files and separate accounting/notebooks share backup with credential exclusions; phone sync carries eligible metadata only.
 public struct AbilityStore: Sendable {
-    @TaskLocal public static var fileReach: (root: URL, write: Bool)?
-    /// Her private moment after a turn's reply: a part it writes is stamped
-    /// `keptAfter` {turn, at} in its record, so her next turn hears of it.
-    @TaskLocal public static var keeping: (turn: String, at: Date)?
-    public static func fileReachAllows(_ path: URL, write: Bool = false) -> Bool {
-        guard let reach = fileReach, !write || reach.write else { return false }
+    public static func fileReachAllows(_ path: URL, write: Bool = false, turn: Turn?) -> Bool {
+        guard let reach = turn?.fileReach, !write || reach.write else { return false }
         let root = reach.root.standardizedFileURL.resolvingSymlinksInPath().path
         let target = path.standardizedFileURL.resolvingSymlinksInPath().path
         return NativeAgentWorkspaceRoot.relativePath(target, under: root) != nil
@@ -27,11 +21,11 @@ public struct AbilityStore: Sendable {
     /// Each root keeps only its latest successful reading, checked by lstat on every read.
     nonisolated(unsafe) static var stateMemo: [String: (revision: String, rows: [String: JSONValue])] = [:]
     nonisolated(unsafe) static var redactedAccounting: [String: (revision: String, rows: [String: JSONValue])] = [:]
-    /// Roots whose parents this store operation already walked; cleared when the outermost operation ends.
+    /// Reuse walked parent roots only within the outermost store operation.
     nonisolated(unsafe) private static var walked: Set<String> = []
     nonisolated(unsafe) private static var depth = 0
     static let statistics: Set<String> = ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun",
-        "lastCleanVersion", "runs", "corrections", "unavailableReason", "keptAfter"]
+        "lastCleanVersion", "runs", "corrections", "unavailableReason"]
     static let obsolete: Set<String> = ["versionOwners", "bodyPath", "activePath", "proposalPath", "quarantinePath",
         "rollbackCounterparts", "versionValidation", "builtIn", "registryPath", "sourceRoot", "versions", "previousVersion",
         "failuresInARow", "lastCleanDigest", "seeded", "validation_evidence", "candidate_validation_evidence", "candidateReview", "keepReview"]
@@ -60,7 +54,7 @@ public struct AbilityStore: Sendable {
         "\(info.st_dev):\(info.st_ino):\(info.st_size):\(info.st_mode):"
             + "\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
     }
-    /// Sources call this once they have done their own work; it never runs anything itself.
+    /// Change notifications only announce completed source work; they never run parts.
     public func signal(_ name: String, part: String? = nil, _ payload: [String: JSONValue] = [:]) {
         var info: [String: Any] = ["signal": name, "payload": payload]
         info["part"] = part
@@ -75,8 +69,7 @@ public struct AbilityStore: Sendable {
     }
     public func path(id: String, slot: Slot = .current, pathExtension: String = "js") throws -> URL {
         let url = root.appendingPathComponent(try Self.fileName(id: id, slot: slot, pathExtension: pathExtension))
-        // The root and its parents do not change within one store operation:
-        // walked once per operation, the file itself every time.
+        // The root and its parents do not change within one store operation: walked once per operation, the file itself every time.
         try Self.withLock {
             try Self.checkItem(url)
             if !Self.walked.contains(root.path) { try Self.checkPath(root); Self.walked.insert(root.path) }
@@ -91,17 +84,15 @@ public struct AbilityStore: Sendable {
         let suffix = slot == .current ? "" : slot == .previous ? ".prev" : ".next"
         return id + suffix + "." + pathExtension
     }
-    /// Checked canonical file read; never adopts a retired registry layout.
     public func read(id: String, slot: Slot = .current) throws -> File? {
         try Self.withLock {
             return try readFile(id: id, slot: slot)
         }
     }
-    /// Checked canonical file inventory.
     public func files(kind: Kind? = nil, includeProposals: Bool = true) throws -> [File] {
         try selectedFiles(retainedFiles(), kind: kind, includeProposals: includeProposals)
     }
-    /// Every retained slot that reads, checked once in the same inventory walk; damaged files are `inventory().damaged`.
+    /// One inventory walk checks all retained slots; damaged files remain visible through inventory().damaged.
     public func retainedFiles() throws -> [(file: File, slot: Slot)] {
         try inventory().files
     }
@@ -115,11 +106,11 @@ public struct AbilityStore: Sendable {
         return (selected + proposed).map(\.file).filter { kind == nil || $0.kind == kind }.sorted { $0.id < $1.id }
     }
     /// `writing` runs at the write boundary: anything thrown before it left the disk untouched.
-    public func write(_ file: File, slot: Slot = .current, writing: () -> Void = {}) throws {
+    public func write(_ file: File, slot: Slot = .current, turn: Turn?, writing: () -> Void = {}) throws {
         try Self.withLock {
-            try CapabilityLifecycle.requireWrite()
+            try CapabilityLifecycle.requireWrite(turn: turn)
             let siblings = try allFiles().files.filter { $0.file.id.lowercased() == file.id.lowercased() }
-            // A taken id names the part of hers that has it, and how to change that part instead.
+            // A taken id must point to its current part rather than silently replace it.
             if let owner = siblings.map(\.file).first(where: { $0.id != file.id || $0.kind != file.kind }) {
                 let record = owner.record
                 let name = record["name"]?.stringValue ?? owner.id
@@ -151,7 +142,7 @@ public struct AbilityStore: Sendable {
             }
         }
     }
-    /// The shipped catalog owns reserved names; future seeds use native-.
+    /// The shipped catalog reserves its ids; native- reserves names for future seeds.
     public static func seedCatalog(resources: URL = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")) throws -> [URL] {
         try FileManager.default.contentsOfDirectory(at: resources.appendingPathComponent("abilities"),
             includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).filter { $0.pathExtension == "js" }
@@ -161,10 +152,7 @@ public struct AbilityStore: Sendable {
         for url in try seedCatalog() where try decode(url).id == id { return id }
         return nil
     }
-    /// A bundled seed lands once; after that it follows the bundle only while
-    /// it is still the seed (her edit, a version of her own, is hers to keep).
-    /// A changed seed retains the installed one as previous. Its complete
-    /// authored/sealed identity, not just its body, decides whether it changed.
+    /// Update bundled seeds only while their complete authored/sealed identity is untouched; retain displaced seeds as previous.
     package func isCurrentSeed(_ file: File) throws -> Bool {
         try Self.withLock {
             guard let current = try readFile(id: file.id, slot: .current), Self.isSeed(current) else { return false }
@@ -172,19 +160,18 @@ public struct AbilityStore: Sendable {
         }
     }
 
-    package func installSeed(_ file: File, checkingSeed: (File) throws -> Void) throws {
+    package func installSeed(_ file: File, turn: Turn?, checkingSeed: (File) throws -> Void) throws {
         try Self.withLock {
             guard let current = try readFile(id: file.id, slot: .current) else {
                 guard try !contains(id: file.id) else { return }
-                try write(file)
+                try write(file, turn: turn)
                 return
             }
             guard Self.isSeed(current) else { return }
-            // The executable owner checks its candidate and seal under this same
-            // selection lock: changed authored bytes never become replaceable seeds.
+            // The executable owner checks its candidate and seal under this same selection lock: changed authored bytes never become replaceable seeds.
             try checkingSeed(current)
             guard Self.seedIdentity(current) != Self.seedIdentity(file) else { return }
-            try CapabilityLifecycle.requireWrite()
+            try CapabilityLifecycle.requireWrite(turn: turn)
             // Off is the ability's, not the bundle version's: it stays off, by whoever switched it.
             var file = file
             if var record = file.metadata["record"]?.objectValue, let before = current.metadata["record"]?.objectValue,
@@ -193,11 +180,10 @@ public struct AbilityStore: Sendable {
                 file.metadata["record"] = .object(record)
             }
             try writeFile(current, slot: .previous)
-            try write(file)
+            try write(file, turn: turn)
         }
     }
-    /// Admission and installation bookkeeping are not authored inputs. The
-    /// candidate still includes the full manifest, program and dependency shapes.
+    /// Exclude admission and installation bookkeeping from authored identity; manifests, programs and dependencies remain sealed inputs.
     private static func seedIdentity(_ file: File) -> JSONValue {
         let installed: Set<String> = ["status", "createdAt", "updatedAt", "promotedAt", "enabledAt",
             "disabledBy", "disabledReason", "activePath", "admission", "codeFingerprint"]
@@ -207,13 +193,13 @@ public struct AbilityStore: Sendable {
             "record": .object(Self.storedRecord(file.record, kind: file.kind).filter { !installed.contains($0.key) })
         ])
     }
-    /// Still the bundle's own seed: its proof was sealed as one, never replaced by her hand.
+    /// Only sealed bundle-owned proofs identify replaceable seeds; authored edits must survive installation.
     public static func isSeed(_ file: File) -> Bool {
         file.metadata["proof"]?.objectValue?["domain"] == .string("owned-program-seed")
     }
-    public func remove(id: String, slot: Slot) throws {
+    public func remove(id: String, slot: Slot, turn: Turn?) throws {
         try Self.withLock {
-            try CapabilityLifecycle.requireWrite()
+            try CapabilityLifecycle.requireWrite(turn: turn)
             for ext in ["js", "md"] {
                 let url = try path(id: id, slot: slot, pathExtension: ext)
                 if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
@@ -222,28 +208,27 @@ public struct AbilityStore: Sendable {
             if slot == .current { NotificationCenter.default.post(name: Self.didChange, object: root.appendingPathComponent(id).path) }
         }
     }
-    public func remove(id: String, ownerAuthorized: Bool = false, preview: Bool = false) throws {
+    public func remove(id: String, ownerAuthorized: Bool = false, preview: Bool = false, turn: Turn?) throws {
         try Self.withLock {
             if let file = try readFile(id: id, slot: .current) ?? readFile(id: id, slot: .next),
                let row = file.metadata["record"]?.objectValue {
-                _ = try CapabilityLifecycle.preservingOwnerOff(row, before: row, ownerAuthorized: ownerAuthorized, enabling: true, preview: preview)
+                _ = try CapabilityLifecycle.preservingOwnerOff(row, before: row, ownerAuthorized: ownerAuthorized, enabling: true, preview: preview, turn: turn)
             }
             if preview { return }
-            try CapabilityLifecycle.requireWrite()
-            // Its notebook (host.state) goes with it: a new ability under this id starts blank.
-            // Never through a link, checked before anything is removed.
+            try CapabilityLifecycle.requireWrite(turn: turn)
+            // Its notebook (host.state) goes with it: a new ability under this id starts blank. Never through a link, checked before anything is removed.
             let notebook = Self.notebookPath(dataRoot: dataRoot, id: id)
             try Self.checkPath(notebook)
-            for slot in Slot.allCases { try remove(id: id, slot: slot) }
+            for slot in Slot.allCases { try remove(id: id, slot: slot, turn: turn) }
             var stats = try readState(); stats.removeValue(forKey: id)
             try writeState(stats)
             if FileManager.default.fileExists(atPath: notebook.path) { try FileManager.default.removeItem(at: notebook) }
         }
     }
-    /// Reserved for recovery of her throwing turn program, never a capability action.
-    public func swap(id: String) throws {
+    /// Reserved for recovery of the agent's throwing turn program, never a capability action.
+    public func swap(id: String, turn: Turn?) throws {
         try Self.withLock {
-            try CapabilityLifecycle.requireWrite()
+            try CapabilityLifecycle.requireWrite(turn: turn)
             guard let current = try readFile(id: id, slot: .current), var previous = try readFile(id: id, slot: .previous) else {
                 throw Self.failure("No previous version for \(id).")
             }
@@ -253,7 +238,7 @@ public struct AbilityStore: Sendable {
             var restored: [String: JSONValue]? = nil
             let before = current.record
             if CapabilityLifecycle.requiresOwnerToEnable(before) {
-                restored = try CapabilityLifecycle.preservingOwnerOff(restored ?? previous.record, before: before)
+                restored = try CapabilityLifecycle.preservingOwnerOff(restored ?? previous.record, before: before, turn: turn)
             }
             if let restored {
                 previous.metadata["record"] = .object(Self.storedRecord(restored, kind: previous.kind).filter { !Self.pending.contains($0.key) })
@@ -271,21 +256,22 @@ public struct AbilityStore: Sendable {
             NotificationCenter.default.post(name: Self.didChange, object: root.appendingPathComponent(id).path)
         }
     }
-    /// The same selected-version identity used by accounting and its readers.
+    /// Accounting and readers share the selected-version identity.
     public func identity(_ file: File) -> String? {
         if file.kind == .turn { return file.bodyDigest }
         return file.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"]?.stringValue
             ?? file.metadata["record"]?.objectValue?["codeFingerprint"]?.stringValue
             ?? (file.kind == .sense ? file.record["version"]?.integer.map(String.init) : nil)
     }
-    public func restoreState(_ state: JSONValue, expectedDigest: String) throws -> URL {
+    public func restoreState(_ state: JSONValue, expectedDigest: String, turn: Turn?) throws -> URL {
         try Self.withLock {
-            try CapabilityLifecycle.requireWrite()
+            try CapabilityLifecycle.requireWrite(turn: turn)
             let url = root.appendingPathComponent("state.json")
             try Self.checkPath(url)
             let original = try Data(contentsOf: url)
             guard SHA256.hash(data: original).map({ String(format: "%02x", $0) }).joined() == expectedDigest else {
-                throw ToolFailureError("Ability run state changed. Read abilities/state.json again before restoring it.", argumentPath: "expected_digest", effects: .none)
+                throw ToolFailureError("Ability run state changed. Read abilities/state.json again before restoring it.", argumentPath: "expected_digest",
+                    effects: .none)
             }
             if (try? Self.decodeState(original)) != nil {
                 throw ToolFailureError("Ability run state is readable; nothing was restored.", argumentPath: "state", effects: .none)
@@ -297,13 +283,15 @@ public struct AbilityStore: Sendable {
             catch { throw ToolFailureError("state must contain recovered accounting rows, including pending work.", argumentPath: "state", effects: .none) }
             if case .object(let readable)? = try? JSONValue.parse(original) {
                 for (id, row) in readable where (try? Self.validateCounters([id: row])) != nil && restored[id] != row {
-                    throw ToolFailureError("Preserve readable accounting rows unchanged; only repair damaged rows.", argumentPath: "state.\(id)", effects: .none)
+                    throw ToolFailureError("Preserve readable accounting rows unchanged; only repair damaged rows.", argumentPath: "state.\(id)",
+                        effects: .none)
                 }
             }
             for (id, value) in restored {
                 _ = try path(id: id)
                 guard let row = value.objectValue, Set(row.keys).isSubset(of: Self.statistics) else {
-                    throw ToolFailureError("Restore only accounting fields; authority remains in each ability file.", argumentPath: "state.\(id)", effects: .none)
+                    throw ToolFailureError("Restore only accounting fields; authority remains in each ability file.", argumentPath: "state.\(id)",
+                        effects: .none)
                 }
             }
             let archive = root.appendingPathComponent(".state-damaged-\(UUID().uuidString).json")
@@ -344,7 +332,7 @@ public struct AbilityStore: Sendable {
                 + "Do not invent disabledBy, change an owner off-switch, grant peer authority, enable a part, select another version "
                 + "or delete retained material; if missing content or authority cannot be established, preserve it and name the missing evidence."))
     }
-    /// Her authoring door, filled from the retained part; reserved turns only read their source.
+    /// Authoring recovery uses retained source; reserved turns expose reads only.
     public func repairCall(_ file: File) throws -> String {
         let record = file.record
         var args = file.part
@@ -352,15 +340,17 @@ public struct AbilityStore: Sendable {
         switch file.kind {
         case .part:
             action = "ability.save"
-            // A revision restates only what changes: its code; the rest carries over.
+            // Revisions carry unchanged fields forward so code-only edits preserve their declarations.
             args.merge(["id": .string(file.id), "description": record["description"] ?? .string(file.id),
                 "code": .string(file.body)]) { _, new in new }
         case .sense:
             let corner = record["corner"]?.objectValue ?? [:]
-            let place = [("app", "bundleID", "app"), ("fileKind", "_0", "file"), ("site", "host", "site"), ("stream", "id", "stream"), ("need", "id", "need")].compactMap { kind, field, prefix in
+            let place = [("app", "bundleID", "app"), ("fileKind", "_0", "file"), ("site", "host", "site"), ("stream", "id", "stream"), ("need", "id", "need")]
+                .compactMap { kind, field, prefix in
                 corner[kind]?.objectValue?[field]?.stringValue.map { prefix + ":" + $0 }
             }.first
-            guard let place else { throw repairFailure(source: root.appendingPathComponent(file.id + "." + file.pathExtension), detail: "Sense corner is missing or unreadable.") }
+            guard let place else { throw repairFailure(source: root.appendingPathComponent(file.id + "." + file.pathExtension),
+                detail: "Sense corner is missing or unreadable.") }
             action = "sense.make"
             args["code"] = .string(file.body); args["place"] = .string(place)
         case .turn:
@@ -370,9 +360,7 @@ public struct AbilityStore: Sendable {
         }
         return ToolFailureError.call("app", ["action": .string(action), "args": .object(args)])
     }
-    /// Notebook schema and mutations share the ability deletion lock. Local and
-    /// off-disk backup include notebooks except news/ledger; export/sharing/sync
-    /// exclude them. PrivacyMap lists senses; lifecycle accounting stays separate.
+    /// Notebook mutations share the deletion lock; backup includes notebooks except news/ledger, while export/sharing/sync exclude them.
     package static let notebookValueBytes = 16_384
     package static func notebookPath(dataRoot: URL, id: String) -> URL {
         dataRoot.appendingPathComponent("senses/\(id)/state.json")

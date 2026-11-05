@@ -4,9 +4,9 @@ import Darwin
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSelfKnowledge.swift` | Dream-authored, evidence-linked traits, self story and person lines in bounded atomic mind/self.json; evidence follows merged-care survivors; substrate owns cached reads, epoch rejection, care-person identity and capture-ordered checked nightly settlement |
+// Blueprint: | `CognitiveSelfKnowledge.swift` | Evidence-linked nightly self reading; cached, epoch-checked atomic mind/self.json |
 
-/// Her night's reading of her own care stories, never a second persona or fact store.
+/// The agent's night reading of its own care stories, never a second persona or fact store.
 public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
     public struct Trait: Codable, Sendable, Equatable {
         public var when: String
@@ -47,14 +47,12 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
     public static let maximumPeople = 128
     public var version = 1
     public var mindEpoch: UInt64
-    /// The committed diary this reading came from, and the time it settled.
     public var night: String
     public var writtenAt: Date
     public var traits: [Trait]
     public var story: [Story]
     public var people: [Person]
-    /// Capture order belongs to the reading, never to its later save. Nil only
-    /// in retained installed self files written before capture order was stored.
+    /// Capture order belongs to the reading, never its later save; nil provides no ordering evidence.
     public var readAt: Date? = nil
 
     public static func path(_ root: URL) -> URL { root.appendingPathComponent("mind/self.json") }
@@ -72,8 +70,7 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
         return refs.count == raw.count && Set(refs).count == refs.count ? refs : nil
     }
 
-    /// A story reference survives insertion/reordering and identifies the exact
-    /// captured entry, including its source and change, rather than an array index.
+    /// A story reference survives insertion/reordering and identifies the exact captured entry, including its source and change, rather than an array index.
     static func reference(_ moment: CognitiveCare.Moment, in care: UUID) -> String? {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -86,8 +83,7 @@ public struct CognitiveSelfKnowledge: Codable, Sendable, Equatable {
         UUID(uuidString: String(reference.split(separator: "/").first ?? ""))
     }
 
-    /// History is unioned at merge, so its exact entry digest stays the same;
-    /// only the care that holds that evidence changes, through every merge.
+    /// History is unioned at merge, so its exact entry digest stays the same; only the care that holds that evidence changes, through every merge.
     static func survivorReference(_ reference: String, among cares: [UUID: CognitiveCare]) -> String? {
         guard let id = careID(for: reference), let survivor = CognitiveCare.survivorID(for: id, among: cares) else { return nil }
         let suffix = reference.firstIndex(of: "/").map { String(reference[$0...]) } ?? ""
@@ -228,7 +224,6 @@ extension CognitiveSubstrate {
                 if let readAt = current.readAt {
                     saving = readAt >= night.readAt ? current : value
                 } else if current.night > night.source {
-                    // Retained self files identify their committed diary day.
                     saving = current
                 } else if current.night < night.source || current.writtenAt < night.readAt {
                     saving = value
@@ -238,8 +233,7 @@ extension CognitiveSubstrate {
             } else {
                 saving = value
             }
-            // Even an obsolete delivery saves the current owner before it is
-            // acknowledged: a read alone cannot retire an older write debt.
+            // Save the current owner before acknowledging an obsolete delivery: a read cannot retire write debt.
             try saving.save(conversationDataRoot)
             selfKnowledge = saving
             cacheSelfPeople()
@@ -254,9 +248,8 @@ extension CognitiveSubstrate {
         }, uniquingKeysWith: { first, _ in first })
     }
 
-    /// Extends the care block of the existing dream, never a second model pass.
-    /// The bounded window is explicit; old folded movements have no person
-    /// attribution and must not be presented as measured relationship evidence.
+    /// Extends the care block of the existing dream, never a second model pass. The bounded window is explicit; old folded movements have no person attribution
+    /// and must not be presented as measured relationship evidence.
     func selfNightMaterial(keys: inout [String: CognitiveCare], live: [CognitiveCare])
         -> (lines: [String], storyRefs: Set<String>, changeRefs: Set<String>, people: Set<String>) {
         var lines: [String] = [], storyRefs = Set<String>(), changeRefs = Set<String>(), people = Set<String>()
@@ -284,17 +277,23 @@ extension CognitiveSubstrate {
                 : String(format: "%.3f", Double(max(toward, away)) / Double(movements.count))
             let name = person == CognitiveCare.ownerKey ? (checkedUserName() ?? "saved name unavailable") : person
             let shown = Array(held.prefix(8))
-            let line = "Person \(person) (\(name)): \(movements.count) movements: toward \(toward), away \(away); predictability (dominant direction share): \(predictability). Newest \(shown.count) of \(held.count) cares held with them:\n"
+            let line = """
+                Person \(person) (\(name)): \(movements.count) movements: toward \(toward), away \(away); predictability (dominant direction share): \
+                \(predictability). Newest \(shown.count) of \(held.count) cares held with them:\n
+                """
                 + shown.map { "\($0.id.uuidString): \(Self.careLineText($0))" }.joined(separator: "\n")
             guard append(line) else { continue }
             people.insert(person)
             shown.forEach(include)
         }
-        lines.append("You may return \"people\": [{\"person\": \"<exact shown person key>\", \"line\": \"<one line in your own words, at most 280 characters, about who they are to you>\"}]. Only the person you are with will be on your mind in a turn. Predictability describes direction, not goodness or authority. No evidence is unknown, not distrust.")
+        lines.append("""
+            You may return \"people\": [{\"person\": \"<exact shown person key>\", \"line\": \"<one line in your own words, at most 280 characters, about who \
+            they are to you>\"}]. Only the person you are with will be on your mind in a turn. Predictability describes direction, not goodness or authority. \
+            No evidence is unknown, not distrust.
+            """)
         remaining += 16_000
 
-        // Include recent changes even when that care was quiet today. They are
-        // actual prior depth/stance entries, never predictions of tonight's pass.
+        // Include recent changes even when that care was quiet today. They are actual prior depth/stance entries, never predictions of tonight's pass.
         let changed = cares.values.filter { $0.story.contains { $0.depthChange != nil || $0.felt == "changed my mind" } }
             .sorted { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString < $1.id.uuidString }
         var candidates = Array(keys.values)
@@ -309,16 +308,24 @@ extension CognitiveSubstrate {
                 guard let ref = CognitiveSelfKnowledge.reference(moment, in: care.id) else { continue }
                 let change = moment.depthChange != nil || moment.felt == "changed my mind"
                 let depth = moment.depthChange.map { " | depth: \($0.from.rawValue) → \($0.to.rawValue)" } ?? ""
-                rows.append((ref, "\(ref): \(NativeTimestampFormat.calendarDay(moment.at)) | \(moment.by.rawValue)\(moment.who.map { " (\($0))" } ?? "") | moved \(moment.moved) | \(moment.felt): \(moment.note)\(depth)", change))
+                rows.append((ref, """
+                    \(ref): \(NativeTimestampFormat.calendarDay(moment.at)) | \(moment.by.rawValue)\(moment.who.map { " (\($0))" } ?? "") | moved \
+                    \(moment.moved) | \(moment.felt): \(moment.note)\(depth)
+                    """, change))
             }
             guard !rows.isEmpty, append("\(care.id.uuidString): \(Self.careLineText(care))\n" + rows.map(\.line).joined(separator: "\n")) else { continue }
             include(care)
             storyRefs.formUnion(rows.map(\.reference))
             changeRefs.formUnion(rows.filter(\.change).map(\.reference))
         }
-        // Instructions remain outside the material budget so a full window
-        // cannot remove the schema or imply that omitted evidence was shown.
-        lines.append("You may return \"traits\": at most 5 {\"when\": \"<condition, at most 120 characters>\", \"i_tend_to\": \"<your tendency, at most 160 characters>\", \"shown_by\": [\"<shown care UUID or exact story reference>\"]}. Read them afresh tonight: a trait the shown stories no longer support drops. Never invent adjectives or evidence. You may also return \"story\": at most 5 {\"line\": \"<one line in your voice, at most 400 characters, telling how you changed>\", \"shown_by\": [\"<exact depth-change or changed-my-mind story reference>\"]}. Each shown_by has 1–8 references. These optional fields replace your previous night's reading; omit or use [] when there is nothing supported to say.")
+        // Instructions remain outside the material budget so a full window cannot remove the schema or imply that omitted evidence was shown.
+        lines.append("""
+            You may return \"traits\": at most 5 {\"when\": \"<condition, at most 120 characters>\", \"i_tend_to\": \"<your tendency, at most 160 \
+            characters>\", \"shown_by\": [\"<shown care UUID or exact story reference>\"]}. Read them afresh tonight: a trait the shown stories no longer \
+            support drops. Never invent adjectives or evidence. You may also return \"story\": at most 5 {\"line\": \"<one line in your voice, at most 400 \
+            characters, telling how you changed>\", \"shown_by\": [\"<exact depth-change or changed-my-mind story reference>\"]}. Each shown_by has 1–8 \
+            references. These optional fields replace your previous night's reading; omit or use [] when there is nothing supported to say.
+            """)
         return (lines, storyRefs, changeRefs, people)
     }
 }

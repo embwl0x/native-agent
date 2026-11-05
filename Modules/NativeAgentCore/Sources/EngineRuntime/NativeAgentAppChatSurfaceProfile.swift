@@ -1,8 +1,7 @@
 import Foundation
 // Blueprint: | `NativeAgentAppChatSurfaceProfile.swift` | `NativeAgentAppChatSurfaceProfile` enum |
 
-/// Canonical construction policy for every production chat execution surface.
-/// Authority remains with SecurityCenter, TrustCenter, and the gated dispatcher.
+/// Share construction policy across production surfaces; SecurityCenter, TrustCenter and the gated dispatcher retain authority.
 public enum NativeAgentAppChatSurfaceProfile: String, CaseIterable, Sendable {
     case mac
     case slack
@@ -11,7 +10,6 @@ public enum NativeAgentAppChatSurfaceProfile: String, CaseIterable, Sendable {
     case bridge
     case background
 
-    /// Scheduled/internal turns may use already-authorized read paths, but they
-    /// must not manufacture a new approval request without a user at the trigger.
+    /// Internal turns cannot manufacture approval requests without a user at the trigger.
     public var filesApprovalsByDefault: Bool { self != .background }
 }

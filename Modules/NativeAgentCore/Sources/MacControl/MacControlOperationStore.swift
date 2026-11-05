@@ -7,14 +7,10 @@ import Synchronization
 import CryptoKit
 #endif
 
-// Blueprint: | `MacControlOperationStore.swift` | `MacControlOperationStore`: canonical payload-free lifecycle, owner-scoped launch recovery admission, cancellation settlement and motor projection |
+// Blueprint: | `MacControlOperationStore.swift` | `MacControlOperationStore`: Payload-free lifecycle, recovery admission and cancellation |
 
-/// Canonical, payload-free lifecycle state for one Mac Control operation.
-///
-/// The action body, shell text, file contents, and application content never
-/// enter this store. Domain audit logs may retain their separately bounded
-/// evidence, but this store alone owns whether an operation was accepted,
-/// started, cancelled, timed out, or completed.
+/// Keep operation lifecycle payload-free so shell text, file data and app contents cannot enter durable replay records. Domain audit evidence retains its own
+/// bounds.
 public enum MacControlOperationState: String, Codable, Sendable, CaseIterable {
     case accepted
     case started
@@ -40,9 +36,7 @@ public enum MacControlOperationState: String, Codable, Sendable, CaseIterable {
 public struct MacControlOperationRecord: Codable, Sendable, Equatable {
     public let operationId: String
     public let action: String
-    /// SHA-256 over the canonical action + request body with operation identity
-    /// removed. This binds an idempotency key to one exact intent without
-    /// retaining shell text, file content, notification text, or other payload.
+    /// Hash canonical action/body without operation identity to bind idempotency to exact intent without retaining user payload.
     public let requestDigest: String
     public var state: MacControlOperationState
     public let acceptedAt: Date
@@ -52,8 +46,7 @@ public struct MacControlOperationRecord: Codable, Sendable, Equatable {
     public var terminalAt: Date?
     public var verification: MotorVerificationState
     public var expectedNextEvidence: String?
-    /// Bounded machine outcome such as `exit_1`, `policy_refused`, or
-    /// `restart_interrupted`. Never user/application payload.
+    /// Bounded machine outcome such as `exit_1`, `policy_refused`, or `restart_interrupted`. Never user/application payload.
     public var outcomeCode: String?
 
     public init(
@@ -103,25 +96,42 @@ public enum MacControlOperationStoreError: Error, Sendable, Equatable, Localized
     public var errorDescription: String? {
         switch self {
         case .invalidOperationId: return "invalid_operation_id: Use operation_id with 1–128 UTF-8 bytes: letters, numbers, dot, underscore, colon or hyphen."
-        case .corruptStore: return "mac_operation_store_corrupt: Repair mac_control/operations.json under the app data root, preserving the original bytes. Inspect affected apps with mac.look before any further action; prior effects are not established by this error."
-        case .operationNotFound: return "mac_operation_not_found: No record exists for this operation_id. Check the identity from its original receipt; inspect the affected app with mac.look before creating new work."
-        case .actionMismatch: return "operation_action_mismatch: This operation_id belongs to another action. Use the original receipt to reconcile that action before assigning a new operation_id to different work."
-        case .requestMismatch: return "operation_request_mismatch: This operation_id belongs to another request. Reconcile the original receipt before assigning a new operation_id to changed args."
+        case .corruptStore: return """
+            mac_operation_store_corrupt: Repair mac_control/operations.json under the app data root, preserving the original bytes. Inspect affected apps \
+            with mac.look before any further action; prior effects are not established by this error.
+            """
+        case .operationNotFound: return """
+            mac_operation_not_found: No record exists for this operation_id. Check the identity from its original receipt; inspect the affected app with \
+            mac.look before creating new work.
+            """
+        case .actionMismatch: return """
+            operation_action_mismatch: This operation_id belongs to another action. Use the original receipt to reconcile that action before assigning a new \
+            operation_id to different work.
+            """
+        case .requestMismatch: return """
+            operation_request_mismatch: This operation_id belongs to another request. Reconcile the original receipt before assigning a new operation_id to \
+            changed args.
+            """
         case .recoveryUnavailable(let cause):
-            return "mac_operation_recovery_unavailable: Mac actions are unavailable: \(cause). Preserve and repair mac_control/operations.json under the app data root, inspect affected apps with mac.look to reconcile unknown effects, then restart NativeAgent to recover. Looking and other surfaces remain available; do not repeat an uncertain action."
+            return """
+                mac_operation_recovery_unavailable: Mac actions are unavailable: \(cause). Preserve and repair mac_control/operations.json under the app data \
+                root, inspect affected apps with mac.look to reconcile unknown effects, then restart NativeAgent to recover. Looking and other surfaces \
+                remain available; do not repeat an uncertain action.
+                """
         case .illegalTransition(let from, let to):
-            return "illegal_mac_operation_transition: \(from.rawValue) -> \(to.rawValue). Preserve the existing record in mac_control/operations.json and inspect the affected app with mac.look; do not replay the action to repair its lifecycle."
+            return """
+                illegal_mac_operation_transition: \(from.rawValue) -> \(to.rawValue). Preserve the existing record in mac_control/operations.json and inspect \
+                the affected app with mac.look; do not replay the action to repair its lifecycle.
+                """
         }
     }
 }
 
-/// Durable compare-and-set owner shared by Core Mac Control and the app bridge.
-/// Every mutation rereads under the cross-process flock, so a second process or
-/// a second actor instance cannot race a duplicate side effect into existence.
+/// Durable compare-and-set owner shared by Core Mac Control and the app bridge. Every mutation rereads under the cross-process flock, so a second process or a
+/// second actor instance cannot race a duplicate side effect into existence.
 public actor MacControlOperationStore: MotorActionReadModelProviding {
     public static let maxRetainedOperations = 500
-    // Shared by every client of this canonical path, not by one actor instance.
-    // Absence means launch recovery has not completed, never permission to act.
+    // Shared by every client of this canonical path, not by one actor instance. Absence means launch recovery has not completed, never permission to act.
     private enum Recovery: Sendable { case ready, unavailable(String) }
     private static let recovery = Mutex<[URL: Recovery]>([:])
 
@@ -202,7 +212,10 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         if let issue = recoveryIssue {
             throw ToolFailureError(issue, effects: .none, owner: "mac_operation_recovery",
                 code: "mac_operation_recovery_unavailable", status: .refused,
-                instruction: "Preserve and repair mac_control/operations.json, inspect affected apps with mac.look to reconcile unknown effects, then restart NativeAgent.", recovery: .repair)
+                instruction: """
+                    Preserve and repair mac_control/operations.json, inspect affected apps with mac.look to reconcile unknown effects, then restart \
+                    NativeAgent.
+                    """, recovery: .repair)
         }
         return try await mutate { snapshot in
             if let existing = snapshot.operations.first(where: { $0.operationId == operationId }) {
@@ -251,8 +264,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             let cancelledBeforeStart = acknowledgePreStartCancellation
                 && current.state == .cancelRequested && current.startedAt == nil
             let next = cancelledBeforeStart ? MacControlOperationState.cancelAcknowledged : next
-            // Only the original body's actual-exit settlement can replace a
-            // reporting wait's unknown effect. Restart uncertainty stays final.
+            // Only the original body's actual-exit settlement can replace a reporting wait's unknown effect. Restart uncertainty stays final.
             let settlesWait = settlingActualExit && current.state == .outcomeUnknown
                 && current.terminalAt == nil
                 && [.completed, .failed, .timedOut, .cancelAcknowledged, .outcomeUnknown].contains(next)
@@ -302,9 +314,8 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         return snapshot.operations.first { $0.operationId == operationId }
     }
 
-    /// Register before reading: every durable writer, including another store
-    /// instance or process, wakes settlement. The caller owns the grace, not
-    /// the lifetime of the still-running execution.
+    /// Register before reading: every durable writer, including another store instance or process, wakes settlement. The caller owns the grace, not the
+    /// lifetime of the still-running execution.
     func waitForCancellationSettlement(operationId: String, until deadline: ContinuousClock.Instant) async throws -> MacControlOperationRecord? {
         let changes = FileChangeEvents(paths: [path])
         defer { changes.cancel() }
@@ -327,9 +338,8 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         }
     }
 
-    /// On restart no process can still be owned by the prior app instance.
-    /// Mark interrupted rows terminal rather than silently replaying them.
-    /// Whole-store recovery is for app startup; a rebound bridge scopes its action.
+    /// Restart cannot retain prior-process execution ownership. Mark interrupted rows terminal without replay; full startup recovery and action-scoped bridge
+    /// recovery keep distinct scopes.
     @discardableResult
     public func recoverInterruptedOperations(action: String? = nil) async throws -> Int {
         do {
@@ -339,11 +349,9 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
                 for index in snapshot.operations.indices where !snapshot.operations[index].state.isTerminal || snapshot.operations[index].terminalAt == nil {
                     if let action, snapshot.operations[index].action != action { continue }
                     let priorState = snapshot.operations[index].state
-                    // `accepted` is durably recorded before execution begins, so
-                    // an interruption there proves no effect started. Once the
-                    // operation reached `started` (or cancellation raced it), a
-                    // restart cannot honestly infer whether the external effect
-                    // happened. Preserve that ambiguity and forbid blind replay.
+                    // `accepted` is durably recorded before execution begins, so an interruption there proves no effect started. Once the operation reached
+                    // `started` (or cancellation raced it), a restart cannot honestly infer whether the external effect happened. Preserve that ambiguity and
+                    // forbid blind replay.
                     let effectMayHaveStarted = priorState == .started
                         || priorState == .cancelRequested || priorState == .outcomeUnknown
                     snapshot.operations[index].state = effectMayHaveStarted
@@ -455,8 +463,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
 
     private static func bound(_ operations: inout [MacControlOperationRecord]) {
         guard operations.count > maxRetainedOperations else { return }
-        // Never evict an active operation. Keep newest terminal rows up to the
-        // cap in addition to every active row.
+        // Never evict an active operation. Keep newest terminal rows up to the cap in addition to every active row.
         let active = operations.filter { !$0.state.isTerminal || $0.terminalAt == nil }
         let terminalBudget = max(0, maxRetainedOperations - active.count)
         operations = active + Array(operations.filter { $0.state.isTerminal && $0.terminalAt != nil }.prefix(terminalBudget))

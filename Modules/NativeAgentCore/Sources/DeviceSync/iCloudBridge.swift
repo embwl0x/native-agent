@@ -10,12 +10,10 @@ import ChatTurnRuntime
 import PersistenceCore
 import ProviderRouting
 import OSLog
-// Blueprint: | `iCloudBridge.swift` | Owns ChatRecord admission, reply binding, recovery, durable mutation and terminal retention interpretation for icloud/chat_transactions; rejected CloudKit envelopes have no local journal/quarantine copy. Receive is push and lifecycle-event driven; registration failure reports unavailable wakes with no timed alternate reader |
-// BridgeMessage, BridgeError, and all HMAC helpers are now in NativeAgentShared.
+// Blueprint: | `iCloudBridge.swift` | Canonical chat ledger; push/lifecycle receives never select a timed alternate reader. |
 typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
 typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
-/// One serial authentication owner per bridge. No suspension inside a check;
-/// cancellation checks can still run while delivery awaits a chat's reply.
+/// Serial checks never suspend; cancellation can still run while delivery awaits a chat reply.
 @MainActor
 public final class iCloudBridge: ObservableObject {
     static let pushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "push")
@@ -39,46 +37,39 @@ public final class iCloudBridge: ObservableObject {
     }
     var accountFailureGeneration: UInt64 = 0
     var accountFailureReadError: String? { didSet { refreshPhoneConnection() } }
-    /// Another Mac on this Apple Account holds the phone's pairing; this Mac
-    /// stays quiet toward the phone until the person moves it here.
+    /// Another Mac's pairing suppresses phone writes until the person explicitly moves it here.
     @Published public internal(set) var phonePairedElsewhere = false {
         didSet { refreshPhoneConnection() }
     }
-    /// Whether this Mac has read its claim on the account's pairing since
-    /// setup. Until it has, it writes nothing the phone reads as the Mac's.
+    /// Read the account claim before publishing anything the phone could treat as this Mac's.
     var phonePairingSettled = false {
         didSet { refreshPhoneConnection() }
     }
-    /// The phone's connection as this Mac knows it: pairing, transport and the
-    /// last accepted exchange, each with its owner. Connectors › iPhone and
-    /// Doctor say where the connection stands through this one value.
+    /// Connectors and Doctor must share the owners' pairing, transport and accepted-contact evidence.
     @Published public internal(set) var phoneConnection = NAPhoneConnection(
         pairing: .init(.waiting, "Checking this Mac's pairing."),
         transport: .init(.waiting, "iCloud is not checked yet."),
         exchange: .init(.waiting, "No message from your iPhone yet."))
-    /// Why this build has no CloudKit transport, when it was meant to.
+    /// Every surface reads this one standing: connected once the phone has spoken over the shared key, able to approve once its device key is paired.
+    @Published public internal(set) var phoneStanding = NAPhoneStanding(connected: nil, waiting: 0, approvers: 0)
     var transportRefusal: NAPhoneConnection.Fact? { didSet { refreshPhoneConnection() } }
     var pairingKeyUnreadable = false { didSet { refreshPhoneConnection() } }
-    /// When the phone was last there, from a message this Mac accepted.
     var lastPhoneContactAt: Date? { didSet { refreshPhoneConnection() } }
     var phoneContactReadFailure: String? { didSet { refreshPhoneConnection() } }
-    /// When this Mac last turned away a phone message signed with another key.
     var lastPhoneRejectedAt: Date? { didSet { refreshPhoneConnection() } }
     var pairedPhonesSubscription: AnyCancellable?
     var phonePairingRecheckDue = false
-    /// This Mac speaks to the phone: it holds the account's pairing.
     var speaksToPhone: Bool { deviceTransport != nil && phonePairingSettled && !phonePairedElsewhere }
     nonisolated static let pairedElsewhereStatus =
         "Your iPhone is paired with another Mac (or an earlier install) on this Apple Account. Choose Use my iPhone with this Mac to move it here."
-    /// This install changed its key and the account's pairing record has not
-    /// taken it yet: owed, not lost. Per data root, like the key itself.
+    /// A local key change stays owed until the account accepts it; per-root authority is not lost meanwhile.
     var pairingPublicationOwedKey: String {
         let root = SHA256.hash(data: Data(sync.dataRoot.standardizedFileURL.path.utf8))
         return "NativeAgent.pairing.cloudKitPublicationOwed.v1." + root.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
     var driveURL: URL?
     var metadataQuery: NSMetadataQuery?
-    var messageHandler: ((BridgeMessage) async -> Bool)?
+    var messageHandler: ((BridgeMessage, ICloudPhoneRoute) async -> Bool)?
     // Only the entitlement-checked resolver installs this CloudKit transport.
     var deviceTransport: CloudKitDeviceTransport?
     var doctorTransportHealth: ICloudBridgeHealthSnapshot.Health = .unmeasured {
@@ -105,38 +96,26 @@ public final class iCloudBridge: ObservableObject {
     var deviceNetworkChanges: Task<Void, Never>?
     // Retention has its own single-flight slot beside the delivery drain.
     var deviceRetentionSweepTask: Task<Void, Never>?
-    /// Last successfully published deterministic provider projection. Repeated
-    /// UI refreshes often discover identical state; skip those CloudKit writes.
+    /// Deterministic projection equality suppresses redundant CloudKit writes from repeated UI refreshes.
     var lastPublishedProviderCatalogStatus: (pairing: Data, value: String)?
-    // One owner spans the read and send. Callers join it and queue a fresh read,
-    // including a return to the cached selection while a different send awaits.
+    // Retain one read/send owner; queue fresh reads even when a caller returns to the cached selection mid-send.
     var providerCatalogPublicationTask: Task<Bool, Never>?
     var providerCatalogPublicationQueued = false
     var lastPublishedMobileSnapshotStatus: [NAMobileSnapshotGroup: (pairing: Data, value: String)] = [:]
-    // Insertion-ordered message identities remain bounded across launches.
     var seenMessageIDs: Set<String> = []
     var seenMessageIDsOrdered: [String] = []
-    // N-mem fix: the on-disk processed-ids file is capped at `seenMessageIDsCap`
-    // via .suffix() but the in-memory Set only ever .insert()d → unbounded
-    // memory growth over a long-running session. Cap memory the same way so
-    // memory and disk stay consistent (both insertion-ordered, oldest evicted).
-    // nonisolated: an immutable Sendable constant read by the nonisolated static
-    // saveProcessedMessageIDs off-main helper; no actor isolation needed.
+    // Bound disk and memory by the same insertion order to prevent unbounded replay-set growth. Immutable Sendable limits are nonisolated for off-main
+    // persistence.
     nonisolated static let seenMessageIDsCap = 2000
     var inFlightIncomingMessageIDs: Set<String> = []
     var inFlightReplyIDs: Set<String> = []
     var setupTask: Task<Void, Never>?
-    // Monotonic token: bumped on every setup()/tearDown() so a stale off-main
-    // container resolve that completes late can't re-register observers / start
-    // the query for a superseded setup (it checks generation before applying).
+    // Lifecycle identity prevents a late container resolve from rearming a superseded setup.
     var setupGeneration: Int = 0
-    /// CloudKitDeviceTransport currently has last-registration-wins observation but
-    /// no cancellation token. Keep the callback itself lifecycle-gated so a
-    /// retained transport cannot route work after this bridge has torn down.
+    /// The transport has no observer cancellation token, so gate its retained last-writer-wins callback by lifecycle.
     var incomingObserverGeneration: UInt64 = 0
     var incomingObserverTask: Task<Void, Never>?
-    /// Controls remain owned here until their signed publication and receipt land.
-    /// This also retains the original envelope while ledger storage is unavailable.
+    /// Controls remain owned here until their signed publication and receipt land. This also retains the original envelope while ledger storage is unavailable.
     var pendingControlPublications: [String: BridgeMessage] = [:]
     /// Fair selection among owed outcomes; never evidence about delivery.
     var controlPublicationCursor = ""
@@ -145,24 +124,15 @@ public final class iCloudBridge: ObservableObject {
     var transportSetupTaskID = UUID()
     var outboxScanTask: Task<Void, Never>?
     var outboxScanQueued = false
-    /// Each admitted Drive backlog owns its settlement; teardown closes its
-    /// next dispatch without cancelling the human turn already underway.
+    /// Teardown closes backlog dispatch without cancelling accepted human turns; each owner still settles.
     var outboxBacklogTasks: [UUID: Task<Void, Never>] = [:]
-    /// Makes a cancelled/retired detached scan unable to clear or replay work
-    /// belonging to a newer bridge lifecycle.
+    /// Retired scans cannot clear or replay work belonging to a newer lifecycle.
     var outboxScanGeneration: UInt64 = 0
-    // N10 fix: idempotency guard — track whether setup() has already run so
-    // repeat calls don't stack additional KVS observers (each call added a
-    // new addObserver which fired the handler multiple times per external change).
+    // Idempotent setup prevents stacked observers from delivering each KVS change multiple times.
     var isSetUp: Bool = false
     let incomingVerifier = ICloudIncomingVerifier()
     var deliveryNudgeQueue: ICloudDeliveryNudgeQueue?
     var messageNudgeSender: ICloudConflatedSender?
-    // Drive folder layout
-    // <container>/Documents/outbox/mac/   — Mac writes here
-    // <container>/Documents/outbox/ios/   — iOS writes here
-    // <container>/Documents/processing/   — Mac claimed but has not acked yet
-    // <container>/Documents/processed/    — read messages moved here (archive)
     init(sync: DeviceSync) {
         self.sync = sync
         let url = ICloudSyncStatePaths.accountFailure(dataRoot: sync.dataRoot)
@@ -182,7 +152,10 @@ public final class iCloudBridge: ObservableObject {
                     syncStatus = DeviceSyncAccountFailure.macMessage
                 }
             case .failure(let error):
-                let message = "Saved iCloud account status could not be read (\(error.localizedDescription)); restore access to icloud/account_failure.json and check Connection."
+                let message = """
+                    Saved iCloud account status could not be read (\(error.localizedDescription)); restore access to icloud/account_failure.json and check \
+                    Connection.
+                    """
                 accountFailureReadError = message
                 syncStatus = message
                 doctorTransportHealth = .unavailable(message)
@@ -225,8 +198,7 @@ public final class iCloudBridge: ObservableObject {
         }
     }
     func recordSendResult(operation: String, error: Error? = nil) async {
-        // A Mac whose phone is paired elsewhere says so once, as its receive
-        // health; each refused write is that same fact, not a send failure.
+        // A pairing held elsewhere is one receive-health fact, not a new send failure on every refused write.
         if case .pairedElsewhere? = error as? DeviceSyncError { return }
         doctorSendMeasured = true
         // A transient no is its retry's to answer: unmeasured until the retry meets it too.
@@ -237,7 +209,6 @@ public final class iCloudBridge: ObservableObject {
         }
         if error == nil { onTransportSucceeded?() }
     }
-    // Bound seen message IDs by insertion order, evicting the oldest first.
     func recordSeenMessageID(_ id: String) {
         guard !seenMessageIDs.contains(id) else { return }
         seenMessageIDs.insert(id)
@@ -250,11 +221,8 @@ public final class iCloudBridge: ObservableObject {
             seenMessageIDs.remove(oldest)
         }
     }
-    // CK-3c: CK-consumed ids persist to UserDefaults — synchronous, ordered on
-    // the main actor, atomic — so a restart within the transport cursor's 30s
-    // re-pull window doesn't re-deliver a CK message. Separate key from the Drive
-    // path's file store; both feed the unified in-memory seen-set on setup.
-    // Mirrors the iOS bridge (which already persists its seen-set to UserDefaults).
+    // Synchronous MainActor persistence prevents replay inside CloudKit's 30-second repull window. CloudKit and Drive stores remain separate but restore into
+    // the same insertion-ordered set.
     private static let ckProcessedIDsDefaultsKey = "NativeAgent.iCloud.ckProcessedIDs.v1"
     func persistCKSeenIDs() {
         ICloudSeenIDDefaultsStore.save(
@@ -272,7 +240,10 @@ public final class iCloudBridge: ObservableObject {
                 key: Self.ckProcessedIDsDefaultsKey, cap: Self.seenMessageIDsCap)
         } catch {
             available = false
-            syncStatus = "The phone message replay window could not be read. Restore NativeAgent.iCloud.ckProcessedIDs.v1 in this app's preferences, then reconnect the phone."
+            syncStatus = """
+                The phone message replay window could not be read. Restore NativeAgent.iCloud.ckProcessedIDs.v1 in this app's preferences, then reconnect \
+                the phone.
+                """
             doctorTransportHealth = .unavailable(syncStatus)
             return false
         }
@@ -302,8 +273,7 @@ public final class iCloudBridge: ObservableObject {
         // Close request admission before settling waiters or draining sends.
         isSetUp = false
         phoneRequests.stop()
-        // Cancel + invalidate any in-flight container resolve so a late
-        // applyContainerResult can't re-register observers after teardown.
+        // Invalidate in-flight resolution before teardown so a late result cannot rearm observers.
         setupTask?.cancel()
         setupTask = nil
         setupGeneration += 1
@@ -312,8 +282,7 @@ public final class iCloudBridge: ObservableObject {
         transportSetupTask?.cancel()
         outboxScanGeneration &+= 1
         outboxScanTask?.cancel()
-        // The scanner keeps its slot until physical file work returns. Backlog
-        // owners finish their accepted turn, then the lifecycle fence retires them.
+        // Retain the scanner slot until physical file work exits; backlog owners settle before lifecycle retirement.
         outboxScanQueued = false
         metadataQuery?.stop()
         metadataQuery = nil
@@ -331,8 +300,7 @@ public final class iCloudBridge: ObservableObject {
         phonePairedElsewhere = false
         phonePairingRecheckDue = false
         lastPublishedProviderCatalogStatus = nil
-        // Keep the owner until its awaited send returns; a new setup queues
-        // behind it instead of overlapping the retired lifecycle's publication.
+        // Keep send ownership through actual exit so new setup cannot overlap an earlier lifecycle's publication.
         providerCatalogPublicationQueued = false
         lastPublishedMobileSnapshotStatus = [:]
         // The drain and retention handles keep exclusion until actual exit.
@@ -347,11 +315,8 @@ public final class iCloudBridge: ObservableObject {
             Task { await sender.finish() }
             messageNudgeSender = nil
         }
-        // N8 fix (R16): reset isSetUp so a subsequent setup() call can succeed.
-        // Without this, tearDown() left isSetUp=true and setup() returned early
-        // at the guard-!isSetUp check, leaving the bridge permanently stopped.
+        // Clear setup ownership so teardown cannot leave all future setup calls permanently refused.
         isSetUp = false
         sync.engine.stop()
     }
 }
-// BridgeError is now in NativeAgentShared.

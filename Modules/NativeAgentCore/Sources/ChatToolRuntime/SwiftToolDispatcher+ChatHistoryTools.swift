@@ -16,8 +16,7 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+ChatHistoryTools.swift` | One explicit history search scope and ranking; coverage includes unresolved scope, parse validity and cached structure; chronological digests retain true first/last instants |
+// Blueprint: | `SwiftToolDispatcher+ChatHistoryTools.swift` | Scoped history ranking; coverage gaps and chronological digests |
 
 
 struct ChatHistorySessionMetadata: Sendable {
@@ -64,9 +63,8 @@ extension SwiftToolDispatcher {
                 throw AutonomyGateError.toolDenied(reason: "Chat history scope must be all_sessions, current_session, or previous_session.")
             }
         }()
-        // A resolved previous session is complete without a query; empty queries admit every row at score zero and sort by recency.
+        // An empty query lists the resolved scope by recency rather than excluding its rows.
         let wholeSession = scope == "previous_session"
-        // Likewise a session or time window with no query lists that window.
         let window = wholeSession || ["session_id", "after", "before", "since"].contains {
             !(input[$0]?.stringValue ?? "").trimmingCharacters(in: .whitespaces).isEmpty
         }
@@ -78,7 +76,7 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty chat-history search query")
         }
         let requestedLimit = Self.jsonInt(input["limit"]) ?? 8
-        // A 25-snippet response regularly exceeded 18 KB in live turns and encouraged a second broad search before the model had digested the first one. Keep a compact page while preserving complete recall via offset pagination.
+        // Compact pages leave room to digest each result; offset pagination preserves complete recall.
         let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
         let mode = (input["mode"]?.stringValue ?? "hybrid")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -114,7 +112,6 @@ extension SwiftToolDispatcher {
                 }
                 return Date().addingTimeInterval(-amount * seconds)
             }
-            // A bare day means its local midnight.
             let day = ISO8601DateFormatter()
             day.formatOptions = [.withFullDate]
             day.timeZone = .current
@@ -172,7 +169,7 @@ extension SwiftToolDispatcher {
                 var runTools: [String: Set<String>] = [:]
                 for (messageIndex, row) in rows.enumerated() {
                     if !row.valid, row.identity.isEmpty { continue }
-                    // Shape is already retained by the index, including its existing cache: an object without role/content is not evidence that this transcript was completely searched.
+                    // An indexed object without role/content cannot prove that its transcript was completely searched.
                     guard row.valid, row.shape == 2 else {
                         malformedRows.insert("\(sessionId):\(messageIndex)")
                         continue
@@ -191,7 +188,7 @@ extension SwiftToolDispatcher {
                     }
                     let author = row.author
                     if let authorFilter, !authorFilter.isEmpty, author?.lowercased() != authorFilter { continue }
-                    // Receipt metadata is an explicit evidence lane, never extra material injected into ordinary conversation recall.
+                    // Receipt metadata stays outside ordinary conversation recall.
                     if role == "tool", roleFilter != "tool" { continue }
                     let content = row.content
                     guard !content.isEmpty else { continue }
@@ -201,7 +198,7 @@ extension SwiftToolDispatcher {
                         if let after, instant <= after { continue }
                     }
                     let searchable = row.searchable
-                    // Optional composition-level relevance policy. Work recall must not match unrelated rows merely because their broad session title happens to name the same project.
+                    // A broad session title must not make unrelated work rows relevant.
                     let workScore = workContextQuery.map { $0.score(searchable) }
                     if let workScore, workScore == 0 { continue }
                     let score = workScore.map(Double.init) ?? chatHistoryScore(
@@ -255,11 +252,11 @@ extension SwiftToolDispatcher {
         let phase: String
         var resolvedPreviousSessionId: String? = nil
         if let sessionFilter, !sessionFilter.isEmpty {
-            // An explicit id stays the most specific instruction there is.
+            // An explicit id takes precedence over inferred scope.
             selected = scan(try files(forSessionId: sessionFilter))
             phase = "explicit_session"
         } else if wholeSession {
-            // Resolved through the SAME surface-scoped, bridge-excluding resolver the /new anchor used, so the session this opens is always the session the anchor named — which is why the anchor never has to carry a UUID.
+            // Share the surface-scoped, bridge-excluding /new resolver so the anchor needs no UUID.
             if let currentSessionId, !currentSessionId.isEmpty,
                let prior = try PriorChatSession.latest(
                    excluding: currentSessionId, dataRoot: dataRoot
@@ -299,7 +296,7 @@ extension SwiftToolDispatcher {
             case (nil, _?): return false
             default: break
             }
-            // Equal instants (or absent dates) still need repeatable paging. Within a transcript, canonical row order is the final recency evidence; different sessions get a stable identity tie-break.
+            // Equal or absent dates need stable paging: canonical row order within a transcript, then session identity.
             if lhs.sessionId != rhs.sessionId { return lhs.sessionId < rhs.sessionId }
             return sort == "oldest" ? lhs.messageIndex < rhs.messageIndex : lhs.messageIndex > rhs.messageIndex
         }
@@ -437,12 +434,19 @@ extension SwiftToolDispatcher {
             response["receipt_coverage"] = .string(Self.toolReceiptCoverage)
         }
         if workContextQuery != nil {
-            response["selection_policy"] = .string("Prefer matching turns with recorded activity outside history lookup, newest within each tier; retain the newest matching context and one excerpt per known run. Tool activity is a retrieval hint, not proof of success. Ordinary history search remains available for every matching row.")
+            response["selection_policy"] = .string("""
+                Prefer matching turns with recorded activity outside history lookup, newest within each tier; retain the newest matching context \
+                and one excerpt per known run. Tool activity is a retrieval hint, not proof of success. Ordinary history search remains \
+                available for every matching row.
+                """)
         }
         if before != nil { response["before"] = input["before"] }
         if after != nil { response["after"] = input["after"] }
         if before == nil, after == nil, let days = Self.chatHistoryQueryDays(query) {
-            response["date_query_note"] = .string("Dates in query text do not filter results. Use after/before with no query to read a local-day digest. A month/day without a year uses the current local year.")
+            response["date_query_note"] = .string("""
+                Dates in query text do not filter results. Use after/before with no query to read a local-day digest. A month/day without a year \
+                uses the current local year.
+                """)
             if days.count == 1, let day = days.first,
                let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: day) {
                 let formatter = DateFormatter()
@@ -459,10 +463,14 @@ extension SwiftToolDispatcher {
         }
         if let authorFilter, !authorFilter.isEmpty { response["author"] = .string(authorFilter) }
         if sort != "relevance", !exactMode, !query.isEmpty {
-            response["search_hint"] = .string("Chronological sorting includes partial word matches in hybrid/continuity mode. Use mode: exact to find the whole query phrase.")
+            response["search_hint"] = .string(
+                "Chronological sorting includes partial word matches in hybrid/continuity mode. Use mode: exact to find the whole query phrase.")
         }
         if scopeResolutionFailed || listingFailed || !unreadableSessions.isEmpty || !malformedRows.isEmpty || !undatedMatches.isEmpty {
-            response["coverage_note"] = .string("Some evidence could not be searched or dated. Missing results do not establish absence; coverage applies only to the reported search scope.")
+            response["coverage_note"] = .string("""
+                Some evidence could not be searched or dated. Missing results do not establish absence; coverage applies only to the reported \
+                search scope.
+                """)
         }
         if offset + out.count < selectableCount {
             response["next_offset"] = .int(Int64(offset + out.count))
@@ -480,7 +488,10 @@ extension SwiftToolDispatcher {
         return .object(response)
     }
 
-    static let toolReceiptCoverage = "Historical persisted receipt, potentially redacted or truncated; not the full original result or a fresh source read. Paging expands only the retained receipt."
+    static let toolReceiptCoverage = """
+        Historical persisted receipt, potentially redacted or truncated; not the full original result or a fresh source read. Paging expands \
+        only the retained receipt.
+        """
 
     func readChatHistorySessionMetadata() throws -> [String: ChatHistorySessionMetadata] {
         let path = dataRoot

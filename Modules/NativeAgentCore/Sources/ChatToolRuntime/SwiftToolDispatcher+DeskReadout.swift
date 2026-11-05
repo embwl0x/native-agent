@@ -18,15 +18,13 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher+DeskReadout.swift` | `SwiftToolDispatcher`: live and archive Desk reading through the existing store; canonical row paging retains all fields independent of sort and carries archive continuations; query reaches a queued step by its words |
+// Blueprint: | `SwiftToolDispatcher+DeskReadout.swift` | `SwiftToolDispatcher`; canonical live/archive paging |
 
 extension SwiftToolDispatcher {
-    /// Page the live Desk or search by handle/alias/text, optionally including archived records.
     func impl_desk_read(input: [String: JSONValue]) async throws -> JSONValue {
         try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["desk_read"]).deskSchemas().compactMap { $0 }.first)
         let store = deskStore()
         let state = try await store.liveState()
-        // MY QUEUE is on her home and remains reachable by handle or query.
         for key in ["handle", "query", "sort", "updated_on"] where input[key] != nil {
             guard case .string? = input[key] else {
                 throw ToolFailureError("\(key) must be a string.", argumentPath: "$.\(key)", effects: .none, code: "invalid_input")
@@ -34,7 +32,8 @@ extension SwiftToolDispatcher {
         }
         for key in ["limit", "offset", "notes_offset", "refs_offset", "detail_offset", "archived_offset"] where input[key] != nil {
             guard let value = Self.jsonInt(input[key]), value >= (key == "limit" ? 1 : 0), value <= (key == "limit" ? 100 : 1_000_000) else {
-                throw ToolFailureError("\(key) must be an integer in \(key == "limit" ? "1…100" : "0…1000000").", argumentPath: "$.\(key)", effects: .none, code: "invalid_input")
+                throw ToolFailureError("\(key) must be an integer in \(key == "limit" ? "1…100" : "0…1000000").", argumentPath: "$.\(key)",
+                    effects: .none, code: "invalid_input")
             }
         }
         if let sort = optionalString(input, "sort"), !["stale", "recent"].contains(sort) {
@@ -57,7 +56,8 @@ extension SwiftToolDispatcher {
             formatter.dateFormat = "yyyy-MM-dd"
             guard let date = updatedOn == "today" ? Date() : formatter.date(from: updatedOn),
                   updatedOn == "today" || formatter.string(from: date) == updatedOn else {
-                throw ToolFailureError("updated_on must be today or YYYY-MM-DD in the Mac's local timezone.", argumentPath: "$.updated_on", effects: .none, code: "invalid_input")
+                throw ToolFailureError("updated_on must be today or YYYY-MM-DD in the Mac's local timezone.", argumentPath: "$.updated_on",
+                    effects: .none, code: "invalid_input")
             }
             day = Calendar.current.dateInterval(of: .day, for: date)
         } else { day = nil }
@@ -67,7 +67,8 @@ extension SwiftToolDispatcher {
             return date >= day.start && date < day.end
         }
         guard handle?.isEmpty != false || query?.isEmpty != false else {
-            throw ToolFailureError("Use handle for one exact item or query for text search, not both.", argumentPath: "$.query", effects: .none, code: "invalid_input")
+            throw ToolFailureError("Use handle for one exact item or query for text search, not both.", argumentPath: "$.query", effects: .none,
+                code: "invalid_input")
         }
 
         let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
@@ -81,7 +82,8 @@ extension SwiftToolDispatcher {
         if let handle, !handle.isEmpty {
             let exact = try Self.deskMatches(handle, in: state)
             if exact.isEmpty, !includeArchived {
-                throw ToolFailureError("No live item has handle '\(handle)'; desk.read lists the current handles.", argumentPath: "$.handle", effects: .none, code: "invalid_input")
+                throw ToolFailureError("No live item has handle '\(handle)'; desk.read lists the current handles.", argumentPath: "$.handle",
+                    effects: .none, code: "invalid_input")
             }
             rawMatches = exact.filter { matchesDate($0.updatedAt) }
         } else if query?.isEmpty == false || day != nil {
@@ -119,7 +121,8 @@ extension SwiftToolDispatcher {
                 "limit": .int(Int64(limit)), "offset": .int(Int64(offset)), "has_more": .bool(offset + shown.count < archived.count),
             ])
             if offset + shown.count < archived.count {
-                var args: [String: JSONValue] = ["include_archived": .bool(true), "archived_offset": .int(Int64(offset + shown.count)), "limit": .int(Int64(limit))]
+                var args: [String: JSONValue] = ["include_archived": .bool(true), "archived_offset": .int(Int64(offset + shown.count)),
+                    "limit": .int(Int64(limit))]
                 if let handle, !handle.isEmpty { args["handle"] = .string(handle) }
                 if let query, !query.isEmpty { args["query"] = .string(query) }
                 args["updated_on"] = input["updated_on"]

@@ -1,9 +1,8 @@
 import Foundation
-// Blueprint: | `VisionFourVerbAdapter.swift` | `VisionPercept.fourVerbSupplement`: additive screen contents, controls, values and physical targets with provenance and abstention |
+// Blueprint: | `VisionFourVerbAdapter.swift` | `VisionPercept.fourVerbSupplement`: Additive physical evidence retains provenance and abstention |
 
 extension VisionPercept {
-    /// Uncertain, overlapping or destructive-looking evidence stays visible
-    /// with an abstain reason and cannot become an act target.
+    /// Abstaining evidence stays visible but cannot become an act target.
     public func fourVerbSupplement(
         geometry: MacScreenViewGeometry,
         viewId: String? = nil,
@@ -53,8 +52,7 @@ extension VisionPercept {
             recognizedText: recognizedText
         )
 
-        // A pixel compiler can find dozens of decorative fragments. Publish a
-        // small ranked physical vocabulary, not a wall of coordinate aliases.
+        // Bound and rank physical vocabulary so decorative pixel fragments cannot overwhelm action discovery.
         let spatialIndexes = Set(physicalRows.eligible
             .map { (offset: $0, element: perceivedRows[$0]) }
             .sorted { lhs, rhs in
@@ -75,10 +73,7 @@ extension VisionPercept {
                 continue
             }
             let kind = MacScreenRender.kindName(role: row.roleGuess)
-            // OCR occasionally binds a lone list/detection marker to an
-            // otherwise uncertain visual fragment. The same glyph is already
-            // rejected from readouts and recognized-text values; do not let a
-            // row-label path resurrect it as an apparent object.
+            // Reject isolated OCR markers in row labels too, or that route could resurrect glyphs already excluded from readouts.
             let labelText: MacScreenText? = {
                 guard let label = screenText(row.label) else { return nil }
                 guard let display = label.display,
@@ -94,17 +89,12 @@ extension VisionPercept {
                 guard let flag else { return nil }
                 return "\(flag.value ? positive : negative) guess \(Int((flag.confidence * 100).rounded()))%"
             }
-            // Saliency can pin a bounded, prominent place while honestly
-            // knowing nothing about its semantic role. Publish that place as
-            // a numbered physical region, never as an invented button.
+            // Saliency supplies a prominent physical place, never an invented semantic button.
             let spatiallyAddressable = reason != nil && spatialIndexes.contains(rowIndex)
             let renderedConfidence = spatiallyAddressable
                 ? Self.physicalPointConfidence(row)
                 : row.confidence.target
-            // A substantial muted region can be valuable scene/tracking
-            // evidence before it is reliable enough to aim at. Keep the
-            // numbered object visible, but require the same confidence floor
-            // used by short occlusion memory before publishing a motor target.
+            // Muted regions may remain scene evidence below motor confidence; publish targets only at the tracking confidence floor.
             let motorAddressable = spatiallyAddressable && renderedConfidence >= 0.25
             let spatialLabel: MacScreenText? = {
                 guard spatiallyAddressable else { return nil }
@@ -145,10 +135,7 @@ extension VisionPercept {
                     + (motion.map { [$0] } ?? [])
                 return facts.map { MacScreenText($0, redacted: .string($0)) }
             }()
-            // A spatial fallback is a region even when the role guess says
-            // checkbox/button. Rendering that uncertain guess as a control
-            // both invents semantics and pushes the region behind rich AX
-            // chrome under the control cap.
+            // Uncertain spatial regions must not become semantic controls or lose their content budget behind AX chrome.
             let isControl = !spatiallyAddressable
                 && MacPerceptionCompiler.controlRoles.contains(row.roleGuess)
             if isControl {
@@ -269,9 +256,7 @@ extension VisionPercept {
                     let otherBase = nearest.visualColor.map { "\($0) object" }
                         ?? nearest.visualShape.map { "\($0) object" }
                     if let otherBase {
-                        // The same measured relation must accept the natural
-                        // shape nouns published for both participants. These
-                        // stay private aliases; no new relation is inferred.
+                        // Private relation aliases accept both participants’ measured shape nouns without inventing another relation.
                         for subject in [base] + naturalBases {
                             for object in [otherBase] + Self.naturalShapeNames(nearest) {
                                 aliases.append("\(subject) \(relation) \(object)")
@@ -337,9 +322,7 @@ extension VisionPercept {
                 rows: contentRows
             ))
         }
-        // The captured image's own extent is exact even when OCR finds no
-        // rows—the common canvas/game/video case. Row confidence describes
-        // objects inside it, not whether the visual surface itself exists.
+        // Captured image extent remains exact on canvases without OCR; object confidence cannot erase the observed surface.
         let canvasConfidence = 1.0
         let fullCanvasRect = VisionRect(x: 0, y: 0, w: frameSize.width, h: frameSize.height)
         let canvasFrame = globalRegionOfInterest ?? geometry.screenRect(fullCanvasRect)
@@ -392,9 +375,7 @@ extension VisionPercept {
                 provenance: .vision(recognized.confidence)
             ))
         }
-        // Only HUD/readout/OCR values may prove that an action had a visible
-        // effect. Occlusion memory and scene relations naturally change while
-        // objects move, even when an input did nothing.
+        // Only observed HUD, readout and OCR values prove effects; motion changes relations even when input did nothing.
         let effectValueTexts = indicatorRender.effectValueTexts
             + values.dropFirst(indicatorRender.values.count).compactMap(\.text.display)
         for occluded in liveOccludedRegions.prefix(max(0, 16 - values.count)) {
@@ -403,7 +384,10 @@ extension VisionPercept {
                 .joined(separator: " ")
             let prefix = appearance.isEmpty ? "" : "\(appearance) "
             let frameWord = occluded.missedFrames == 1 ? "frame" : "frames"
-            var text = "\(prefix)visual region \(occluded.id) temporarily not visible; last seen at \(occluded.lastCenterXPercent)%,\(occluded.lastCenterYPercent)% (\(occluded.missedFrames) \(frameWord) ago)"
+            var text = """
+                \(prefix)visual region \(occluded.id) temporarily not visible; last seen at \(occluded.lastCenterXPercent)%,\(occluded.lastCenterYPercent)% \
+                (\(occluded.missedFrames) \(frameWord) ago)
+                """
             if let x = occluded.expectedCenterXPercent,
                let y = occluded.expectedCenterYPercent {
                 text += "; expected near \(x)%,\(y)% if motion continued"

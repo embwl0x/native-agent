@@ -2,18 +2,19 @@ import ChatTurnContracts
 import CognitiveSubstrate
 import Desk
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
 import TurnTrace
 
-// Blueprint: | `AdaptiveMemoryPromises.swift` | `AdaptiveMemoryPromoter.applyPromises`: live and batch meanings file reply-grounded MY QUEUE steps under the settled turn's recorded steer, principal, session and envelope; explicit filings deduplicate each matching promise only within that turn's recorded incoming/reply window; Desk owns dedup and inferred cap; full skips are traced, persistence failures leave meaning unsettled |
+// Blueprint: | `AdaptiveMemoryPromises.swift` | `AdaptiveMemoryPromoter.applyPromises`: reply-grounded promises under recorded turn authority |
 
 extension AdaptiveMemoryPromoter {
-    /// The same application path for a live judgment and a batch's saved meaning.
-    /// No ambient reflection task or later conversation may lend a promise its origin.
+    /// The same application path for a live judgment and a batch's saved meaning. No ambient reflection task or later conversation may lend a promise its
+    /// origin.
     func applyPromises(_ interpretation: AfterTurnInterpretation, turn: CognitiveMomentTurn?,
-                       momentID: String, dataRoot: URL) async -> Bool {
+                       momentID: String, dataRoot: URL, heldTurn: Turn) async -> Bool {
         guard !interpretation.promises.isEmpty else { return true }
         guard let turn else {
             nativeLog("MemoryV2: promises in moment %@ have no recorded turn; left meant", momentID)
@@ -30,8 +31,7 @@ extension AdaptiveMemoryPromoter {
         }
         let envelope = TurnEnvelope.fromPersistedMetadata(turn.envelope)
         var sources = turn.carriedSources ?? turn.sourceCheckpoint ?? [PeerDataTaint.unrecorded]
-        // Older inputs predate the exact carried checkpoint. Their recorded
-        // bridge identity contributes the same source as queue.add on that turn.
+        // Without a carried checkpoint, recorded bridge identity supplies queue.add's same-turn source.
         if turn.carriedSources == nil, PeerTurnEffectPolicy.isPeerBridge(surface: turn.surface) {
             if let id = envelope?.verifiedUserId {
                 let peer = "peer:" + id
@@ -45,10 +45,9 @@ extension AdaptiveMemoryPromoter {
             TurnTraceBus.fire(TurnTraceEvent(turnId: turn.turnId ?? momentID, kind: "memory.promise",
                 sessionId: turn.sessionId, surface: turn.surface,
                 destinationId: envelope?.replyRoute.destinationId, threadId: envelope?.replyRoute.threadId,
-                payload: .object(payload)))
+                payload: .object(payload), turn: heldTurn))
         }
-        // Only this turn's explicit filings can explain one of its promises.
-        // Older moments without a recorded reply boundary suppress nothing.
+        // Only this turn's explicit filings can explain one of its promises. Older moments without a recorded reply boundary suppress nothing.
         var filed: [MyQueue.Entry] = []
         if let start = turn.occurredAt, let end = turn.repliedAt, start <= end {
             do {

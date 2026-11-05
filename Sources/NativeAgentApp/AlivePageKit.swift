@@ -2,7 +2,7 @@ import NativeAgentShared
 import AppToolRuntime
 
 // Blueprint: | `AlivePageKit.swift` | Alive page components: shared glass metrics/palette, headers, cards, pills, progress and flow layout for Today/Desk |
-// Cards share house glass over the window's single haze; text uses primary or secondary ink, never tertiary.
+// Cards share glass over one haze; tertiary ink lacks sufficient contrast.
 
 import AppKit
 import SwiftUI
@@ -16,14 +16,11 @@ enum AliveMetrics {
 }
 
 enum AlivePalette {
-    /// Inner top light on a card: 12% white in dark; in light, white is the
-    /// only thing that reads as light on a pale card.
+    /// White is the only highlight that reads as light on a pale card.
     static let highlight = adaptive(dark: NSColor.white.withAlphaComponent(0.12),
                                     light: NSColor.white.withAlphaComponent(0.7))
-    /// The card's rim: 5% white in dark, a faint ink line in light.
     static let rim = adaptive(dark: NSColor.white.withAlphaComponent(0.05),
                               light: NSColor.black.withAlphaComponent(0.06))
-    /// Row dividers inside a group card.
     static let divider = Color(nsColor: .separatorColor)
 
     private static func adaptive(dark: NSColor, light: NSColor) -> Color {
@@ -35,9 +32,7 @@ enum AlivePalette {
 
 // MARK: - Header and labels
 
-/// The page's door: a serif word and one sentence under it. The sentence is
-/// said only once the page has read its data, but its line is always held,
-/// so nothing below jumps when it arrives.
+/// Hold the header sentence's line while data loads so content below does not jump.
 struct AlivePageHeader: View {
     let title: String
     var line: String? = nil
@@ -62,9 +57,7 @@ struct AlivePageHeader: View {
     }
 }
 
-/// A framed page's header sentence, handed up from the page's content to the
-/// frame that draws the header (`ShellPageFrame(alive: true)`). Nil text is
-/// "not loaded yet": the line is held, not said.
+/// Nil means not loaded: reserve the header line without inventing a sentence.
 struct AlivePageLine: Equatable {
     var text: String?
     var id: String?
@@ -83,8 +76,7 @@ extension View {
     }
 }
 
-/// Section label. Full secondary, not the mockup's 50%: at half strength it
-/// measured 3.4:1 on the bare dark room and ≈2.5:1 at the haze peak.
+/// Use full secondary ink: half strength measures 3.4:1 in the dark room and about 2.5:1 at the haze peak.
 struct AliveEyebrow: View {
     let title: String
     init(_ title: String) { self.title = title }
@@ -102,7 +94,6 @@ struct AliveEyebrow: View {
 // MARK: - Cards
 
 extension View {
-    /// The house glass and a bounded teal edge when something is waiting.
     func aliveCard(waiting: Bool = false, radius: CGFloat = AliveMetrics.cardRadius) -> some View {
         modifier(AliveCardSurface(waiting: waiting, radius: radius))
     }
@@ -119,13 +110,10 @@ private struct AliveCardSurface: ViewModifier {
         content
             .background {
                 ZStack(alignment: .top) {
-                    // Reduce Transparency asks for MORE opacity: the opaque
-                    // card the page wore before.
+                    // Reduce Transparency requires an opaque card.
                     if reduceTransparency || quietOffscreenRead { shape.fill(TodayPalette.cardFill) }
                     if waiting {
-                        // A top edge, never a fill: at most 60pt and at most
-                        // half the card, so a one-row card keeps the same
-                        // edge a tall one wears.
+                        // Cap the edge at 60pt and half the card height so short and tall cards share the same treatment.
                         GeometryReader { proxy in
                             LinearGradient(
                                 colors: [NativeAgentShell.needsYou.opacity(0.10), .clear],
@@ -146,8 +134,7 @@ private struct AliveCardSurface: ViewModifier {
     }
 }
 
-/// ONE card holding several rows, hairlines between them. Each row gets the
-/// card's inset; the rows themselves carry no chrome.
+/// Rows share one card so they do not stack chrome.
 struct AliveGroupCard<Content: View>: View {
     var waiting: Bool
     var lazy: Bool
@@ -191,7 +178,6 @@ struct AliveGroupCard<Content: View>: View {
 
 // MARK: - Progress
 
-/// The haze's deep and base shades, for progress fills.
 private struct HazeShades {
     let deep: Color
     let base: Color
@@ -202,7 +188,6 @@ private struct HazeShades {
     }
 }
 
-/// A thin bar and "3 of 8" beside it.
 struct AliveProgressBar: View {
     let done: Int
     let total: Int
@@ -235,7 +220,7 @@ struct AliveProgressBar: View {
 
 // MARK: - Small marks
 
-/// Teal means "waiting on you" and nothing else.
+/// Teal means waiting on the user.
 struct AliveWaitingDot: View {
     var body: some View {
         Circle()
@@ -246,7 +231,6 @@ struct AliveWaitingDot: View {
     }
 }
 
-/// A capsule chip on the card fill.
 struct AlivePill: View {
     let text: String
     var leading: String? = nil
@@ -274,7 +258,6 @@ struct AlivePill: View {
     }
 }
 
-/// Left-aligned wrapping flow, for pills and the Desk's count line.
 struct AliveFlow: Layout {
     var spacing: CGFloat = 8
     var lineSpacing: CGFloat = 8

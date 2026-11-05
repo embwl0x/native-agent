@@ -3,7 +3,7 @@ import PersistenceCore
 import Desk
 import CognitiveSubstrate
 
-// Blueprint: | `AutonomousPursuitProposer.swift` | `AutonomousPursuitProposer`: at most one reflection pursuit from a live non-seed life-depth care with a stance; life approval, Desk cap and citation dedup guard admission |
+// Blueprint: | `AutonomousPursuitProposer.swift` | `AutonomousPursuitProposer`. |
 
 public struct PursuitProposal: Sendable, Equatable {
     public let project: String
@@ -15,8 +15,7 @@ public struct PursuitProposal: Sendable, Equatable {
 }
 
 public enum AutonomousPursuitProposer {
-    /// A reflection can form a stance, but cannot take a care to life depth.
-    /// That approval is the pre-existing evidence this route requires.
+    /// Reflection cannot take a care to life depth without existing approval evidence.
     public static func propose(
         cares: [CognitiveCare], openAgentPursuitCount: Int, citedCareIds: Set<String>
     ) -> PursuitProposal? {

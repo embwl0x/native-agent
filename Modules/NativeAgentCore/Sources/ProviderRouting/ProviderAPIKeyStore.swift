@@ -2,9 +2,8 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `ProviderAPIKeyStore.swift` | Provider reference/string validation; byte insertion, readback and deletion delegate to DeviceSecretKeychain |
 
-/// ProviderRouting owns the config reference and this device-only Keychain
-/// item. Immutable references keep the old config usable until its replacement
-/// is committed. No credential bytes are written to provider JSON.
+/// ProviderRouting owns the config reference and this device-only Keychain item. Immutable references keep the old config usable until its replacement is
+/// committed. No credential bytes are written to provider JSON.
 public enum ProviderAPIKeyStore {
     public static let referenceField = "api_key_keychain_ref"
     private static let service = "NativeAgent.provider-api-key"

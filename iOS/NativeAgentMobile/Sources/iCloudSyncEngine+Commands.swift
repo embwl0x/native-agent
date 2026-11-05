@@ -7,77 +7,7 @@ import NativeAgentShared
 extension iCloudSyncEngine {
     // MARK: - Higher-level mutation helpers
 
-    @discardableResult
-    func createDeskItem(
-        kind: String, project: String, title: String, summary: String?,
-        submission: InboxAction? = nil, intentionalNewRequest: Bool = false
-    ) async throws -> [String: String] {
-        var payload = ["kind": kind, "project": project, "title": title]
-        if let summary, !summary.isEmpty { payload["summary"] = summary }
-        return try requireSuccessfulActionResponse(await sendActionAndWait(
-            submission ?? .make(action: "createDeskItem", payload: payload),
-            intentionalNewRequest: intentionalNewRequest || submission == nil
-        ))
-    }
-
-    @discardableResult
-    func setDeskItemStatus(handle: String, status: String) async throws -> [String: String] {
-        try requireSuccessfulActionResponse(await sendActionAndWait(
-            .make(action: "setDeskItemStatus", payload: ["handle": handle, "status": status])
-        ))
-    }
-
-    /// `submission` carries an identity this phone already retained durably, so
-    /// a note written away from the Mac is delivered as the SAME signed action
-    /// when the app comes back — never as a second note.
-    @discardableResult
-    func appendDeskItemNote(
-        handle: String,
-        text: String,
-        submission: InboxAction? = nil,
-        intentionalNewRequest: Bool = false
-    ) async throws -> [String: String] {
-        let action = submission
-            ?? .make(action: "appendDeskItemNote", payload: ["handle": handle, "text": text])
-        return try requireSuccessfulActionResponse(await sendActionAndWait(
-            action,
-            intentionalNewRequest: intentionalNewRequest || submission == nil
-        ))
-    }
-
-    // Workshop waits on its original identity; a refusal never submits another task.
-    @discardableResult
-    func submitWorkshopTask(
-        title: String, objective: String,
-        submission: InboxAction? = nil,
-        intentionalNewRequest: Bool = false,
-        onRefusal: (() -> Void)? = nil
-    ) async throws -> String {
-        let action = submission ?? InboxAction.make(action: "submitWorkshopTask", payload: [
-            "title": title, "objective": objective
-        ])
-        // Fresh submissions bypass payload recovery; retained retries do not.
-        let response = try await sendActionAndWait(
-            action, intentionalNewRequest: intentionalNewRequest || submission == nil
-        )
-        if response["applied"] == "false" || response["status"] == "orphaned"
-            || ["device_not_verified",
-                "expired_before_execution", "timestamp_invalid", "invalid_action"].contains(response["code"] ?? "") {
-            onRefusal?()
-        }
-        let result = try requireSuccessfulActionResponse(response)
-        return result["result"] ?? result["status"] ?? "submitted"
-    }
-
-    // Approval decisions await the original signed request.
-
-    @discardableResult
-    func decideWorkshopStep(executionId: String, stepId: String, approve: Bool) async throws -> [String: String] {
-        let action = InboxAction.make(action: approve ? "approveStep" : "rejectStep", payload: [
-            "executionId": executionId, "stepId": stepId
-        ])
-        return try requireSuccessfulActionResponse(await sendDecisionActionAndWait(action))
-    }
+    // A Desk task waits on its original identity; a refusal never submits another task.
 
     @discardableResult
     func approveApproval(id: String) async throws -> [String: String] {
@@ -98,7 +28,7 @@ extension iCloudSyncEngine {
     }
 
     private func adoptApprovalResponse(_ response: [String: String]) throws -> [String: String] {
-        // The decision can settle even when its execution fails.
+        // Approval decision settlement is independent of execution success.
         if let json = response["approvalJSON"], let id = response["approvalId"],
            let revision = response["approvalReadbackRevision"].flatMap(Double.init) {
             let row = try JSONDecoder().decode(ApprovalRequest?.self, from: Data(json.utf8))
@@ -121,12 +51,6 @@ extension iCloudSyncEngine {
     func rejectMemoryProposal(proposalId: String) async throws -> [String: String] {
         let action = InboxAction.make(action: "rejectMemoryProposal", payload: ["proposalId": proposalId])
         return try adoptMemoryResponse(await sendDecisionActionAndWait(action))
-    }
-
-    @discardableResult
-    func deleteMemory(id: String) async throws -> [String: String] {
-        let action = InboxAction.make(action: "deleteMemory", payload: ["memoryId": id])
-        return try adoptMemoryResponse(await sendActionAndWait(action))
     }
 
     private func adoptMemoryResponse(_ response: [String: String]) throws -> [String: String] {
@@ -167,10 +91,18 @@ extension iCloudSyncEngine {
         return try adoptApprovalResponse(response)
     }
 
+    /// A face row's action, answered by the page's owner on the Mac: its words, or its refusal thrown.
+    func faceAction(page: String, row: String, action: String, value: String?) async throws -> String? {
+        var payload = ["page": page, "row": row, "action": action]
+        if let value { payload["value"] = value }
+        let response = try await sendActionAndWait(InboxAction.make(action: "faceAction", payload: payload))
+        return try requireSuccessfulActionResponse(response)["message"]
+    }
+
     @discardableResult
     func registerPushToken(token: String, environment: String, bundleId: String, deviceId: String = "ios") async throws -> [String: String] {
         let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Throw on invalid tokens so the caller's registration-freshness cache cannot advance.
+        // Reject invalid tokens before registration freshness can advance.
         guard !cleanToken.isEmpty else {
             throw SyncError.unsupported("Missing APNS device token")
         }
@@ -184,7 +116,7 @@ extension iCloudSyncEngine {
     }
 
     // MARK: - Mac Control (iOS → Mac remote actions)
-    // The Mac enforces control authority; these actions use the signed retry boundary.
+    // Mac authority checks own control admission; all actions retain signed retry identity.
     private func macControlResult(_ action: InboxAction, pollTimeoutSeconds: Double = 120) async throws -> String {
         let raw = try await sendActionAndWait(action, pollTimeoutSeconds: pollTimeoutSeconds)
         let result = try requireSuccessfulActionResponse(
@@ -200,14 +132,12 @@ extension iCloudSyncEngine {
         try await macControlResult(InboxAction.make(action: "mac_control", payload: action.payload(arguments)))
     }
 
-    /// Post a macOS notification on the Mac.
     func macNotify(title: String, message: String, sound: String? = nil) async throws -> String {
         var arguments = ["title": title, "message": message]
         if let sound { arguments["sound"] = sound }
         return try await sendMacControl(.notification, arguments: arguments)
     }
 
-    /// Set Mac output volume (0–100) through its native volume executor.
     func macSetVolume(percent: Int) async throws -> String {
         guard MacVolumeControlPresentation.isValid(percent: percent) else {
             throw SyncError.unsupported("Volume must be between 0% and 100%.")
@@ -215,7 +145,6 @@ extension iCloudSyncEngine {
         return try await sendMacControl(.volume, arguments: ["value": "\(percent)"])
     }
 
-    /// Run a Spotlight search on the Mac and return its JSON results object.
     func macSpotlight(query: String, hoursAhead: Int? = nil, limit: Int? = nil) async throws -> String {
         var arguments = ["query": query]
         if let hoursAhead { arguments["hours_ahead"] = "\(hoursAhead)" }
@@ -254,49 +183,7 @@ extension iCloudSyncEngine {
             intentionalNewRequest: true, pollTimeoutSeconds: 90))
     }
 
-    /// Encrypt before any transport persistence. Only the Mac credential owner
-    /// receives plaintext; replies contain verified state, never provider output.
-    @discardableResult
-    func configureProvider(providerId: String, apiKey: String) async throws -> ProviderActionFeedback {
-        guard let secret = pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
-        var action = InboxAction.make(action: "configure_provider_secret", payload: [:])
-        action.payload = [SecretActionEnvelope.field: try SecretActionEnvelope.seal(
-            ["providerId": providerId, "api_key": apiKey], secret: secret,
-            actionID: action.msgId, actionName: action.action
-        )]
-        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
-            action, intentionalNewRequest: true, pollTimeoutSeconds: 90
-        ))
-        guard result["provider_id"] == providerId,
-              ["verified", "unverified"].contains(result["connection_state"] ?? "") else {
-            throw SyncError.persistence("The Mac did not return a verified provider receipt.")
-        }
-        let verified = result["connection_state"] == "verified"
-        return ProviderActionFeedback(text: result["message"] ?? (verified ? "Connection verified on Mac." : "Connection not verified."),
-                                      failed: !verified)
-    }
-
-    /// The short start receipt identifies the exact flow to observe in snapshots.
-    func startProviderSignIn(providerId: String) async throws -> String {
-        let action = InboxAction.make(action: "start_provider_sign_in", payload: ["providerId": providerId])
-        let result = try requireSuccessfulActionResponse(await sendActionAndWait(action))
-        guard result["provider_id"] == providerId, result["connection_state"] == "pending",
-              let requestID = result["request_id"], UUID(uuidString: requestID) != nil else {
-            throw SyncError.persistence("The Mac did not confirm the sign-in request.")
-        }
-        return requestID
-    }
-
-    /// Run a connection test for a provider on the Mac. Result arrives in responses/<msgId>.json.
-    @discardableResult
-    func testProvider(providerId: String) async throws -> String {
-        let action = InboxAction.make(action: "test_provider", payload: ["providerId": providerId])
-        let result = try requireSuccessfulActionResponse(await sendActionAndWait(action))
-        return result["result"] ?? result["status"] ?? ""
-    }
-
-    /// Atomically commit the complete execution tuple to the Mac-owned
-    /// ProviderRouting transaction. Chat metadata is not routing authority.
+    /// Commit the full tuple atomically through ProviderRouting; Chat metadata is not routing authority.
     func configureSurfaceSelection(
         surface: String,
         providerId: String,
@@ -341,55 +228,6 @@ extension iCloudSyncEngine {
         }
     }
 
-    func setConnectorEnabled(id: String, enabled: Bool) async throws -> MobileConnectorSnapshot {
-        try await connectorMutation(action: "set_connector_enabled", id: id, enabled: enabled)
-    }
-
-    func disconnectConnector(id: String) async throws -> MobileConnectorSnapshot {
-        try await connectorMutation(action: "disconnect_connector", id: id, enabled: nil)
-    }
-
-    private func connectorMutation(action: String, id: String, enabled: Bool?) async throws -> MobileConnectorSnapshot {
-        let lifecycle = lifecycleGeneration
-        var payload = ["id": id]
-        if let enabled { payload["enabled"] = String(enabled) }
-        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
-            InboxAction.make(action: action, payload: payload)
-        ))
-        guard let json = result["connector"],
-              let row = try? JSONDecoder().decode(MobileConnectorSnapshot.self, from: Data(json.utf8)),
-              row.id == id, row.enabled == (enabled ?? false),
-              row.canToggle != nil, row.canDisconnect != nil, row.supportsSetup != nil,
-              enabled != nil || row.authState == "not_connected" else {
-            throw SyncError.persistence("The Mac did not return confirmed connector settings. Refresh before trying again.")
-        }
-        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
-        applyConnectorSnapshot(connectors.filter { $0.id != id } + [row])
-        return row
-    }
-
-    /// Mutate Mac integration authority through the signed action ledger and
-    /// return the canonical read-back tuple from the Mac owner.
-    func setTrustPolicy(_ request: MobileTrustAction) async throws -> TrustPolicy {
-        guard MobileTrustAction(payload: request.payload) != nil else {
-            throw SyncError.unsupported("Invalid or unconfirmed trust change.")
-        }
-        let lifecycle = lifecycleGeneration
-        let action = InboxAction.make(action: "set_trust_policy", payload: request.payload)
-        let result = try requireSuccessfulActionResponse(await sendActionAndWait(action))
-        guard let raw = result["policy"],
-              let recovered = try? JSONDecoder().decode(TrustPolicy.self, from: Data(raw.utf8)),
-              recovered.permissionLevel != nil, recovered.autonomyDefault != nil,
-              recovered.effectiveRequireBackups != nil, recovered.effectiveOutsideDefault != nil,
-              recovered.developerMode != nil else {
-            throw SyncError.persistence("Mac did not return the saved trust policy. Refresh Trust before trying again.")
-        }
-        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
-        trustRead.write { trustPolicy = recovered }
-        return recovered
-    }
-
-    /// The Mac's settings page, every row as the Mac reads it.
     func refreshAppSettings() async {
         guard !appSettingsLoading, appSettingsSaving.isEmpty else { return }
         appSettingsLoading = true
@@ -406,7 +244,7 @@ extension iCloudSyncEngine {
         } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "The Mac's settings could not be read: \(error.localizedDescription)" } }
     }
 
-    /// One setting, set through the Mac page's own control; adopts its read-back.
+    /// Adopt settings only through the owning Mac control's readback.
     func setAppSetting(_ setting: MobileAppSetting, to value: String) async {
         guard setting.writable, setting.unavailableReason == nil, let currentValue = setting.value,
               !appSettingsSaving.contains(setting.id), value != currentValue else { return }
@@ -422,27 +260,6 @@ extension iCloudSyncEngine {
             if let index = appSettingRows.firstIndex(where: { $0.id == row.id }) { appSettingsRead.write { appSettingRows[index] = row } }
             appSettingsFailure = nil
         } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "\(setting.label) could not be confirmed: \(error.localizedDescription)" } }
-    }
-
-    func helperAction(_ name: String, payload: [String: String]) async throws -> (MobileHelperEdit, [String: String]) {
-        let lifecycle = lifecycleGeneration
-        let result = try requireSuccessfulActionResponse(await sendActionAndWait(.make(action: name, payload: payload)))
-        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
-        guard let raw = result["helper"] else { throw SyncError.persistence("The Mac did not return the saved helper.") }
-        let helper = try JSONDecoder().decode(MobileHelperEdit.self, from: Data(raw.utf8))
-        if let id = helper.id, (helper.revision ?? 0) >= max(helperDetails[id]?.revision ?? 0,
-            helpersSnapshot?.helpers.first(where: { $0.id == id })?.revision ?? 0) {
-            helperDetails[id] = helper
-        }
-        // Accept the action receipt independently of the broader refresh.
-        do {
-            guard let rawSnapshot = result["helpers_snapshot"] else { throw SyncError.persistence("The Mac did not return the helper status.") }
-            applyHelpersSnapshot(try JSONDecoder().decode(MobileHelpersSnapshot.self, from: Data(rawSnapshot.utf8)))
-            staleSnapshotGroups["helpers_agents"] = nil
-        } catch {
-            staleSnapshotGroups["helpers_agents"] = result["helpers_snapshot_error"] ?? error.localizedDescription
-        }
-        return (helper, result)
     }
 
     func agentThreadAction(id: String, text: String? = nil, sessionID: String? = nil) async throws -> MobileAgentThread {
@@ -502,4 +319,11 @@ extension iCloudSyncEngine {
         }
         return job
     }
+}
+
+/// The Mac's reply to a Desk task: the item it opened and the agent's line that carries it.
+struct MobileDeskTaskStart: Sendable, Equatable {
+    let deskHandle: String
+    let deskAlias: String
+    let job: String
 }

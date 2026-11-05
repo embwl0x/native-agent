@@ -5,7 +5,7 @@ import Observation
 import Speech
 import UIKit
 import NativeAgentShared
-// Blueprint: | `TalkModeController.swift` | One session-bound hands-free conversation: permission/start deadlines, timed endpointing, streaming sentence speech, barge-in and exact audio/activity settlement |
+// Blueprint: | `TalkModeController.swift` | Session-bound hands-free talk; bounded startup, timed endpointing, speech, barge-in and settlement |
 
 @MainActor @Observable
 final class TalkModeController: NSObject {
@@ -44,10 +44,8 @@ final class TalkModeController: NSObject {
     @ObservationIgnored private var segments: [Double: [SpeechUtterance.Hypothesis.Segment]] = [:]
     @ObservationIgnored private var audioTime: Double = 0
     @ObservationIgnored private var sentThrough: Double = 0
-    /// The end of the last sent turn's words, on the recognizer's own clock: a
-    /// result for a region starting before it settles that turn, never the next.
+    /// Recognizer time fences sent turns: a result starting before the last sent word end settles that turn, never the next.
     @ObservationIgnored private var submittedThrough: Double = 0
-    /// Regions whose latest result is still a volatile draft.
     @ObservationIgnored private var volatileRegions: Set<Double> = []
     @ObservationIgnored private var lastLoudTime: Double = 0
     @ObservationIgnored private var heardSpeech = false
@@ -74,8 +72,10 @@ final class TalkModeController: NSObject {
                 }
             })
         }
-        observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
-            guard (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue else { return }
+        observers.append(NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
+            queue: .main) { [weak self] note in
+            guard (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) == AVAudioSession.RouteChangeReason.oldDeviceUnavailable
+                .rawValue else { return }
             Task { @MainActor in
                 guard let self, self.isActive else { return }
                 self.end(reason: "The microphone or headphones disconnected. Start talk again on the new audio route.")
@@ -108,13 +108,16 @@ final class TalkModeController: NSObject {
                 try MobileIntentRuntime.prepare()
                 await iCloudSyncEngine.shared.refreshLightweightSnapshots()
                 try checkStarting(id)
-                guard !ChatStore.shared.isSwitchingSession else { throw MobileTalkAudio.failure("Wait for the conversation to finish opening, then start talk.") }
+                guard !ChatStore.shared.isSwitchingSession else {
+                    throw MobileTalkAudio.failure("Wait for the conversation to finish opening, then start talk.")
+                }
                 let authorization = await VoiceInputController.requestSpeechAuthorization()
                 try checkStarting(id)
-                guard authorization == .authorized else { throw MobileTalkAudio.failure(VoiceInputAuthorizationPresentation.speechFailureMessage(for: authorization)) }
+                guard authorization == .authorized else {
+                    throw MobileTalkAudio.failure(VoiceInputAuthorizationPresentation.speechFailureMessage(for: authorization))
+                }
                 guard await AVAudioApplication.requestRecordPermission() else { throw MobileTalkAudio.failure(VoicePresentation.deniedMicrophoneMessage()) }
                 try checkStarting(id)
-                // Read the Mac's preference now, and again for each sentence.
                 _ = try Self.preferredVoice()
                 if ChatStore.shared.selectedSessionID == nil {
                     ChatStore.shared.setSelectedSessionID(MobileIntentRuntime.phoneConversationID)
@@ -133,7 +136,7 @@ final class TalkModeController: NSObject {
                 let names = [agentName, iCloudSyncEngine.shared.personality?.userName ?? ""].filter { !$0.isEmpty }
                 try await MobileDictation.shared.prepareForTalk()
                 try checkStarting(id)
-                // The only haptic before opening the microphone.
+                // Emit the start haptic before opening capture so the microphone cannot record it.
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 try await audio.start(names: names, onLevel: { [weak self] level, time in
                     Task { @MainActor in guard self?.callID == id else { return }; self?.receiveLevel(level, time: time) }
@@ -156,8 +159,7 @@ final class TalkModeController: NSObject {
                 deadline?.cancel()
                 status = iCloudSyncEngine.shared.voicePreference?.quiet == true ? "Listening · Quiet mode: captions only" : "Listening"
                 updateActivity(start: true)
-                // Existing receive/presence owner stays awake only for this
-                // active audio session when the scene leaves the foreground.
+                // Keep the receive/presence owner awake in background only for this active audio session.
                 iCloudBridge.shared.startForegroundReceiving()
             } catch {
                 guard callID == id else { return }
@@ -177,11 +179,15 @@ final class TalkModeController: NSObject {
         }
         if preference.quiet { return nil }
         guard let identifier = preference.nativeIdentifier, let name = preference.nativeName, let language = preference.nativeLanguage else {
-            throw MobileTalkAudio.failure("The Mac’s voice preference does not name an available Apple voice. Choose an installed voice on the Mac and sync again.")
+            throw MobileTalkAudio.failure(
+                "The Mac’s voice preference does not name an available Apple voice. Choose an installed voice on the Mac and sync again.")
         }
         guard let voice = AVSpeechSynthesisVoice(identifier: identifier)
             ?? AVSpeechSynthesisVoice.speechVoices().first(where: { $0.name == name && $0.language == language }) else {
-            throw MobileTalkAudio.failure("The Mac’s voice “\(name)” is not installed on this iPhone. Download that voice in iPhone Settings → Accessibility → Read & Speak → Voices, then start talk again.")
+            throw MobileTalkAudio.failure("""
+                The Mac’s voice “\(name)” is not installed on this iPhone. Download that voice in iPhone Settings → \
+                Accessibility → Read & Speak → Voices, then start talk again.
+                """)
         }
         return voice
     }
@@ -194,8 +200,7 @@ final class TalkModeController: NSObject {
             nextActivityRefresh = time + 30
             updateActivity()
         }
-        // Voice-processed PCM, not the playback signal. SpeechDetector and
-        // recognized words admit a turn; mere room noise never submits one.
+        // Admit turns from voice-processed PCM, detected speech and words; room noise alone cannot submit.
         if !isMuted, level > 0.008 {
             lastLoudTime = time
             if heardSpeech, !isFinalizing { armEndpoint() }
@@ -207,10 +212,7 @@ final class TalkModeController: NSObject {
         let incoming = utterance.hypotheses.first?.segments ?? []
         let fresh = incoming.filter { $0.timestamp + $0.duration > sentThrough + 0.001 }
         guard !fresh.isEmpty else { return }
-        // A result replaces its own audio region and any later draft; regions
-        // settled before it stay. The recognizer's region start names it, not
-        // its first word's time: a settled word can start a hair after its
-        // draft, which kept both (User 11-01: "HeyHey").
+        // Replace by recognizer region start, not first-word time: final word timing can shift and otherwise duplicate its draft.
         segments = segments.filter { $0.key < region }
         segments[region] = fresh
         volatileRegions = volatileRegions.filter { $0 < region }
@@ -240,10 +242,7 @@ final class TalkModeController: NSObject {
         }
     }
 
-    /// The recognizer settles its own words at a pause; the call never forces
-    /// it to. Forcing it ended SpeechAnalyzer (User 11-01: every RecogRejected
-    /// followed a forced finalize). A draft still volatile at the endpoint is
-    /// sent when its final arrives (receiveWords), or as heard after two seconds.
+    /// Forced finalization ends SpeechAnalyzer; wait for a volatile draft's final result or send it as heard after two seconds.
     private func finalizeTurn() {
         guard !isFinalizing else { return }
         guard !volatileRegions.isEmpty else {
@@ -266,14 +265,13 @@ final class TalkModeController: NSObject {
         endpoint?.cancel()
         isFinalizing = false
         let text = currentWords
-        // The recognizer's next region starts at or after this turn's last word.
         let through = segments.values.flatMap { $0 }.map { $0.timestamp + $0.duration }.max() ?? sentThrough
-        // Settled regions are this turn's; a draft sent unsettled stays open,
-        // and its later results keep only words after the ones sent.
+        // Retire settled regions only; late results for a sent draft must retain just words beyond the sent turn.
         sentThrough = max(audioTime, through); submittedThrough = volatileRegions.min() ?? through
         segments = [:]; heardSpeech = false; volatileRegions = []
         guard !text.isEmpty else { status = "No words recognized · Listening"; return }
-        guard let client, ChatStore.shared.selectedSessionID == sessionID else { end(reason: "The conversation changed before your words could be sent."); return }
+        guard let client,
+            ChatStore.shared.selectedSessionID == sessionID else { end(reason: "The conversation changed before your words could be sent."); return }
         let store = ChatStore.shared
         let before = Set(store.queuedSends.map(\.id))
         guard store.send(text: text, client: client, controls: controls, emitHaptic: false) else {
@@ -312,8 +310,7 @@ final class TalkModeController: NSObject {
         if text.hasPrefix(reply.consumed) {
             consumedEnd = text.index(text.startIndex, offsetBy: reply.consumed.count)
         } else if terminal {
-            // Final assembly trims round edges and inserts paragraph seams.
-            // Keep queued speech when only that whitespace changed.
+            // Keep queued speech when final assembly changes only edge whitespace or paragraph seams.
             consumedEnd = Self.consumedPrefixEnd(in: text, matching: reply.consumed)
         } else {
             consumedEnd = nil
@@ -384,7 +381,7 @@ final class TalkModeController: NSObject {
         let session = sessionID
         Task {
             do { try await client.cancelChat(sessionID: session, runIDs: activeRuns) }
-            catch { self.error = "Her voice stopped. The Mac has not confirmed stopping its reply: \(error.localizedDescription)" }
+            catch { self.error = "The agent's voice stopped. The Mac has not confirmed stopping its reply: \(error.localizedDescription)" }
         }
     }
 
@@ -422,8 +419,7 @@ final class TalkModeController: NSObject {
         retainOutstandingRuns()
         ChatStore.shared.onTalkReply = nil; ChatStore.shared.onTalkSessionChange = nil
         ChatStore.shared.onTalkRunRenamed = nil
-        // Leave accepted messages and Mac work in their ordinary chat owner.
-        // End closes this call's ears and voice; it does not cancel User's work.
+        // End closes this call's input/output; accepted messages and Mac work remain with Chat.
         activityUpdate?.cancel()
         let endingCallID = activity?.attributes.callID; activity = nil
         Task {
@@ -454,8 +450,7 @@ final class TalkModeController: NSObject {
         }
     }
 
-    // Activities are looked up by id inside concurrent helpers, never sent across
-    // isolation (the PhoneTurnActivity pattern; Activity is not Sendable).
+    // Activity is not Sendable; look it up by ID inside concurrent helpers instead of crossing isolation.
     @concurrent nonisolated static func endTalkActivities(callID: String?) async {
         for activity in Activity<PhoneTalkAttributes>.activities where callID == nil || activity.attributes.callID == callID {
             await activity.end(ActivityContent(state: .init(muted: true, status: "Ended"), staleDate: nil), dismissalPolicy: .immediate)
@@ -470,8 +465,7 @@ final class TalkModeController: NSObject {
 
     func acceptsCommand(callID: String) -> Bool { isActive && self.callID?.uuidString == callID }
 
-    /// A late call reply stays text-only after End even if ordinary chat's
-    /// read-aloud toggle is on. Run identity, not matching text, owns that choice.
+    /// Use run identity to keep late call replies text-only after End, even when Chat read-aloud is enabled.
     func consumeEndedReply(_ run: String?) -> Bool {
         guard let run, runs[run] != nil else { return false }
         if !isActive { runs.removeValue(forKey: run) }

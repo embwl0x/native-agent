@@ -3,9 +3,7 @@ import Foundation
 
 // MARK: - REMPin (chat-turn injection shape)
 
-/// One latest-approved REM proposal, surfaced into every chat turn's system
-/// prompt as "Recent REM-approved persona drift". Public so the chat
-/// orchestrator can decode the pins.json index.
+/// Share the public pin shape so chat can decode approved drift without owning consolidation.
 public struct REMPin: Sendable, Codable, Equatable {
     public var id: String
     public var text: String
@@ -20,9 +18,7 @@ public struct REMPin: Sendable, Codable, Equatable {
 
 // MARK: - REMPinsReader
 
-/// Mtime-cached reader for the rem_pins.json index emitted by REMConsolidator.
-/// Lives in DreamREMCycle so ChatTurnRuntime can depend on it without
-/// pulling the whole consolidation pipeline.
+/// Keep pin reading in DreamREMCycle so turn runtime need not import the consolidation pipeline.
 public enum REMPinsReader {
     public enum ReadError: Error, LocalizedError {
         case unavailable(URL, Error)
@@ -35,28 +31,21 @@ public enum REMPinsReader {
         }
     }
 
-    /// Only a missing file is an empty index. Existing unreadable or invalid
-    /// bytes are unavailable; no stale pins replace the owning file.
+    /// Only missing storage is empty; unreadable pins cannot reuse stale cached authority.
     public static func read(dataRoot: URL) throws -> [String: [REMPin]] {
         let url = dataRoot.appendingPathComponent("rem_pins.json")
         return try REMPinsDecodedCache.shared.read(url: url)
     }
 
-    /// Flatten the per-target pins into the chat-turn injection lines.
-    /// Returns at most `latestN` pins overall (default 3), newest first by
-    /// createdAt. Empty input → empty array → no injection.
+    /// Bound newest-first pins across all targets so injection has one global limit.
     public static func latest(_ index: [String: [REMPin]], latestN: Int = 3) -> [REMPin] {
-        // Sort target keys so timestamp ties keep a stable cached prefix across launches.
+        // Sort target keys so timestamp ties preserve cached prefix bytes across launches.
         let all = index.keys.sorted().flatMap { index[$0] ?? [] }
         return Array(all.sorted { $0.createdAt > $1.createdAt }.prefix(latestN))
     }
 }
 
-/// Process-local decoded cache keyed by canonical path and file mtime.
-///
-/// Every read still stats the exact file, so removal and atomic replacement are
-/// visible on the next turn. Failures invalidate the cache and propagate;
-/// only a successful decode is cached.
+/// Stat every read to observe removal and replacement; cache only successful decodes and invalidate on failure.
 private final class REMPinsDecodedCache: @unchecked Sendable {
     static let shared = REMPinsDecodedCache()
 
@@ -73,7 +62,7 @@ private final class REMPinsDecodedCache: @unchecked Sendable {
         defer { lock.unlock() }
 
         do {
-            // Retry once if a writer replaces the file between stat and read.
+            // Retry once only when atomic replacement invalidates the stat/read identity.
             for _ in 0..<2 {
                 let modifiedAt = try modificationDate(url)
                 if let entry = entries[key], entry.modifiedAt == modifiedAt {

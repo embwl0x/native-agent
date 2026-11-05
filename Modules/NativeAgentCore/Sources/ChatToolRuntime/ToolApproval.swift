@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import ChatTurnContracts
 import AgentWorkspace
 import ChatToolParsing
 import Foundation
@@ -24,15 +25,11 @@ import TurnTrace
 /// Reject unavailable tools and malformed arguments before filing an approval card.
 public protocol PreApprovalToolValidating: Sendable {
     func preApprovalRefusal(
+        turn: Turn, invocation: ChatToolInvocation,
         tool: String, input: [String: JSONValue], surface: String
     ) async -> JSONValue?
 
-    /// The words the person should read on the card for THIS call, when the
-    /// generic "autonomy=confirm" reason cannot say what is about to happen.
-    /// A setup that writes into another program's settings has to disclose the
-    /// exact file, the exact entry and the exact access before anyone presses
-    /// anything, and only the implementation knows those. Nil keeps the
-    /// caller's own reason, which is every existing tool.
+    /// Only the implementation knows the exact setup file, entry and access; disclose these before approval. Nil preserves the caller’s reason.
     func approvalCardReason(
         tool: String, input: [String: JSONValue], surface: String
     ) async -> String?
@@ -42,75 +39,96 @@ public extension PreApprovalToolValidating {
         tool: String, input: [String: JSONValue], surface: String
     ) async -> String? { nil }
 }
+public extension ToolDispatchClient {
+    /// A call with no binding gets the door's refusal before consent; an unreadable catalog proves no absence.
+    func unrecognizedAppActionRefusal(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+                                      invocation: ChatToolInvocation) async -> JSONValue? {
+        guard tool == "app", case .string(let action)? = input["action"],
+              !action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, AppActionBinding.isRegistered else { return nil }
+        do {
+            guard try AppActionBinding.action(input: input, turn: turn) == nil else { return nil }
+        } catch {
+            // Consent's existing checked read reports this failure; no missing action was established here.
+            return nil
+        }
+        guard let validating = self as? any PreApprovalToolValidating else { return nil }
+        var call = input
+        // Argument preflight supplies its own preview, including when the original call was already a preview. An unknown action has no target, so
+        // its arguments cannot draw a Mac app or switch refusal in place of the door's own answer.
+        call.removeValue(forKey: "preview")
+        call.removeValue(forKey: "args")
+        guard let refusal = await validating.preApprovalRefusal(turn: turn, invocation: invocation,
+            tool: tool, input: call, surface: surface) else { return nil }
+        guard input["preview"] != .bool(true), case .object(var fields) = refusal else { return refusal }
+        // These fields describe the argument preflight, not the call that was refused.
+        for key in ["execution", "would_card", "approver"] { fields.removeValue(forKey: key) }
+        return ChatToolOutcome.refusedBeforeRunning(.object(fields))
+    }
+}
 extension SwiftToolDispatcher: PreApprovalToolValidating {
-    /// Everything that must be true before a tool call is worth a person's
-    /// attention: its arguments are ones the
-    /// implementation will accept. Returns the tool error to hand back to the
-    /// model, or nil to go on and file the approval.
+    /// Refuse arguments the implementation cannot accept before spending the person’s attention on approval.
     public func preApprovalRefusal(
+        turn: Turn, invocation: ChatToolInvocation,
         tool requestedTool: String, input rawInput: [String: JSONValue], surface: String
     ) async -> JSONValue? {
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        let input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
+        let input = ChatToolSessionInjection.apply(turn: turn, toolName: tool, input: rawInput)
         do {
-            if let refusal = try await MacAppActGate.requestRefusal(tool: tool, input: input, dataRoot: dataRoot) {
+            if let refusal = try await MacAppActGate.requestRefusal(tool: tool, input: input, dataRoot: dataRoot, turn: turn,
+                context: invocation.macContext(dataRoot: dataRoot)) {
                 return .object(refusal.fields)
             }
         } catch { return ChatToolOutcome.failure(error: error, effects: .none) }
-        // A switch User turned off is admission, not an inside check: a preview
-        // refuses exactly what the act would.
-        if let gate = MacIntegrationGates.byTool[tool] {
+        // Check the user’s disabled switch at admission so preview refuses the same call as execution.
+        if let gate = Self.macIntegrationAccess(forTool: tool) {
             do {
                 if let refusal = try await Self.switchRefusal(integration: gate.integration, mode: gate.mode,
                                                               store: macIntegrationPermissionStore) { return refusal }
             } catch { return ChatToolOutcome.failure(error: error, effects: .none) }
         }
-        if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
+        if let refusal = await argumentRefusal(tool: tool, input: input, turn: turn) { return refusal }
         if tool == "studio_canon_resolve",
-           case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
+           case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(turn: turn, dispatchSurface: surface) {
             return .object(["status": .string("refused"), "refusal": .string(refusal.rawValue),
                 "reason": .string("\(tool): \(refusal.spoken). It is done from inside your own conversation, in your own turn.")])
         }
         if tool == "studio_shelf_set" {
-            let result = await impl_studio_shelf(input: input, surface: surface, set: true, preview: true)
-            if case .object(let fields) = result, fields["status"] != .string("would") { return result }
+            let result = await impl_studio_shelf(turn: turn, input: input, surface: surface, set: true, preview: true)
+            let reply = ToolResult(result)
+            if case .object(let fields) = result,
+               !(reply.said("would") && reply.status == fields["status"]?.stringValue) { return reply.payload }
         }
         if let refusal = agentHostSetupRefusal(tool: tool, input: input) { return refusal }
         if let refusal = await standingBotsArgumentRefusal(tool: tool, input: input) { return refusal }
-        // Unavailable Mac-control categories answer before approval admission,
-        // using the tool's same Full Mac and surface-trigger access verdict.
+        // Unavailable Mac-control categories answer before approval admission, using the tool's same Full Mac and surface-trigger access verdict.
         if Self.screenControlToolNames.contains(tool) || Self.fileAccessGatedToolNames.contains(tool) {
             do {
-                let access = try await fullMacToolAccess(surface: surface)
+                let access = try await fullMacToolAccess(turn: turn, surface: surface)
                 if Self.screenControlToolNames.contains(tool), !access.accessibilityAllowed,
-                   let need = macControlCategoryNeedEnvelope(
+                   let need = macControlCategoryNeedEnvelope(invocation: invocation,
                        categories: ["accessibility"], mode: Self.screenControlReadToolNames.contains(tool) ? .read : .write,
                        why: "Screen control lets me read and control apps on your Mac.") {
                     return need
                 }
                 if Self.fileAccessGatedToolNames.contains(tool), !access.fileOpsAllowed {
-                    return builderFullMacRequired(tool: tool, input: input)
+                    return builderFullMacRequired(invocation: invocation, tool: tool, input: input)
                 }
             } catch { return ChatToolOutcome.failure(error: error) }
         }
         return nil
     }
-    /// Every chat tool whose own gate is `builderFullMacRequired` whatever
-    /// its input (dispatch: shell, bash, git, apply_patch, the build and
-    /// remote-node tools, install and restart).
+    /// Every chat tool whose own gate is `builderFullMacRequired` whatever its input (dispatch: shell, bash, git, apply_patch, the build and remote-node tools,
+    /// install and restart).
     static let fileAccessGatedToolNames: Set<String> = ["shell", "bash", "git", "apply_patch", "swift_build", "swift_test",
         "remote_node_list", "remote_node_execute", "install_app", "restart_app"]
 
-    /// Every chat tool whose own gate needs the accessibility category, and
-    /// those of them that only read. A part's hands on its watch are act's.
+    /// Every chat tool whose own gate needs the accessibility category, and those of them that only read. A part's hands on its watch are act's.
     static let screenControlReadToolNames = Set(fullMacAccessibilityReadToolNames + macMenuReadToolNames
         + macClipboardReadToolNames + macReadToolNames)
     static let screenControlToolNames = screenControlReadToolNames.union(["act", "go"] + fullMacAccessibilityInjectionToolNames
         + macClipboardWriteToolNames + macMenuPressToolNames).union(AuthoredToolEffects.handOperations)
 
-    /// Connect-by-name, before a card exists. An agent this build has no row
-    /// for, or one that is not installed, is a certain "no" — the person should
-    /// never be asked to approve a setup that was always going to fail.
+    /// Refuse unsupported or uninstalled agents before asking the person to approve a setup that cannot work.
     private func agentHostSetupRefusal(tool: String, input: [String: JSONValue]) -> JSONValue? {
         guard let proposal = agentHostProposal(tool: tool, input: input) else { return nil }
         switch proposal {
@@ -130,8 +148,7 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
                             "detail": .string(error.localizedDescription)])
         }
     }
-    /// Nil unless this really is an `agent_connect` with a name and nothing
-    /// else — the by-name setup path and no other shape of the call.
+    /// Nil unless this really is an `agent_connect` with a name and nothing else — the by-name setup path and no other shape of the call.
     private func agentHostProposal(tool: String, input: [String: JSONValue])
         -> Result<AgentHostConnection.Proposal, any Error>? {
         guard usesCanonicalBody, AgentHostConnection.isNamedConnect(tool: tool, input: input),
@@ -140,29 +157,29 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         if case .string(let path)? = input["working_directory"] { folder = path } else { folder = nil }
         let workspace: String?
         if case .string(let value)? = input["workspace"] { workspace = value } else { workspace = nil }
-        do { return .success(try AgentHostConnection.propose(name: name, store: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot, workspace: workspace, workingDirectory: folder)) }
+        do { return .success(try AgentHostConnection.propose(name: name, store: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot,
+            workspace: workspace, workingDirectory: folder)) }
         catch { return .failure(error) }
     }
-    /// ONE approval card covers the disclosed setup and nothing else, in the
-    /// words `AgentHostConnection.cardText` writes.
+    /// ONE approval card covers the disclosed setup and nothing else, in the words `AgentHostConnection.cardText` writes.
     public func approvalCardReason(
         tool requestedTool: String, input: [String: JSONValue], surface: String
     ) async -> String? {
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        // ACP's live connect card binds the exact resolved executable; its
-        // version is read only after approval. It is also required when ordinary tool trust allows.
+        // ACP's live connect card binds the exact resolved executable; its version is read only after approval. It is also required when ordinary tool trust
+        // allows.
         if tool == "agent_connect", case .string(let name)? = input["name"],
            AgentHostDirectory.row(named: name)?.acp != nil { return nil }
         if let sentence = standingBotApprovalReason(tool: tool, input: input) {
             return sentence
         }
-        // Reconnect can add or reconcile messaging allowances too; an existing
-        // contact still needs the same setup disclosure on its approval card.
+        // Reconnect can add or reconcile messaging allowances too; an existing contact still needs the same setup disclosure on its approval card.
         guard let proposed = agentHostProposal(tool: tool, input: input) else { return nil }
         let proposalValue: AgentHostConnection.Proposal
         switch proposed {
         case .success(let value): proposalValue = value
-        case .failure(let error): return "This connection's setup is unavailable: \(error.localizedDescription). Repair that cause before approving this connection."
+        case .failure(
+            let error): return "This connection's setup is unavailable: \(error.localizedDescription). Repair that cause before approving this connection."
         }
         var proposal = proposalValue
         // The approved replay carries this exact observation, not a later PATH lookup.
@@ -170,7 +187,7 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         else { proposal.executablePath = nil }
         return AgentHostConnection.cardText(proposal, appName: Self.appDisplayName, agentName: PersonaCompiler.agentDisplayName())
     }
-    /// The product's own name for the card's title. Not a persona name.
+    /// Use the product’s name for approval titles, independent of persona identity.
     public static var appDisplayName: String {
         let bundle = Bundle.main
         let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)

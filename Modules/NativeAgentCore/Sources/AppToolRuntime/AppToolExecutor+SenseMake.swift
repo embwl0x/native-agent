@@ -8,11 +8,11 @@ import PersistenceCore
 import Senses
 import TrustCenter
 
-// Blueprint: | `AppToolExecutor+SenseMake.swift` | `AppToolExecutor` sense authoring: captured admitted material, explicit authorable corner/refusal scope, most-recent or explicitly selected read, phase timing, preview/keep lifecycle and owner-off authority without re-reading the source |
+// Blueprint: | `AppToolExecutor+SenseMake.swift` | `AppToolExecutor`; Author captured material under owner-off authority |
 
 extension AppToolExecutor {
     @MainActor
-    func runSenseLifecycle(input: [String: JSONValue]) async throws -> JSONValue {
+    func runSenseLifecycle(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue {
         guard let registry = SensesHub.shared.registry,
               let id = input["sense_id"]?.scalarText, let verb = input["verb"]?.scalarText else {
             return Self.failure("sense_unavailable", "Read Senses for the sense's current identity.")
@@ -43,14 +43,14 @@ extension AppToolExecutor {
         }
         let record: SenseRecord
         switch verb {
-        // Her turn (a trusted agent's included) is never the owner's: what he switched off is his to drop or turn on.
+        // Agent turns, including trusted peers, cannot override a user's off switch.
         case "drop":
-            do { record = try await registry.drop(id: id, version: current.version, preview: preview) }
+            do { record = try await registry.drop(id: id, version: current.version, preview: preview, turn: turn) }
             catch let refusal as SenseFailure where refusal.code == "owners_call" { return Self.failure(refusal.code, refusal.message) }
-        case "quarantine": record = try await registry.setStatus(id: id, version: current.version, status: .off, preview: preview)
+        case "quarantine": record = try await registry.setStatus(id: id, version: current.version, status: .off, preview: preview, turn: turn)
         case "restore":
             do {
-                record = try await registry.setStatus(id: id, version: current.version, status: .on, preview: preview)
+                record = try await registry.setStatus(id: id, version: current.version, status: .on, preview: preview, turn: turn)
             } catch let refusal as SenseFailure where refusal.code == "owners_call" {
                 return Self.failure(refusal.code, refusal.message)
             } catch let refusal as NSError where refusal.domain == "CapabilityLifecycle" {
@@ -60,7 +60,8 @@ extension AppToolExecutor {
         }
         if verb == "drop" {
             return .object(["status": .string(preview ? "would" : "ok"), "effects": .string(preview ? "none" : "occurred"),
-                            "detail": .string(preview ? "Would delete \(id)'s ability files and run statistics." : "\(id)'s ability files and run statistics were deleted.")])
+                            "detail": .string(preview ? "Would delete \(id)'s ability files and run statistics."
+                                : "\(id)'s ability files and run statistics were deleted.")])
         }
         if preview {
             return .object(["status": .string("would"), "effects": .string("none"),
@@ -71,15 +72,12 @@ extension AppToolExecutor {
                         "sense": try .fromEncodable(record)])
     }
 
-    /// Her own fix for a place, made in her turn: run her sense.js on the place
-    /// she just read and show the page it gives. keep makes it how that place
-    /// reads from now on. She judges the page; the sandboxed host and
-    /// redaction stay what they always are.
+    /// Sense authoring uses admitted captured material; keeping changes future reads without relaxing sandbox or redaction.
     @MainActor
-    func runSenseMake(input: [String: JSONValue]) async -> JSONValue {
+    func runSenseMake(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
         let started = ContinuousClock.now
         var timing: [String: JSONValue] = [:]
-        let result = await makeSense(input: input, timing: &timing)
+        let result = await makeSense(input: input, timing: &timing, turn: turn, execution: execution)
         timing["total_ms"] = .double(Self.senseMilliseconds(since: started))
         var receipt = result.objectValue ?? [:]
         receipt["timing"] = .object(timing)
@@ -91,28 +89,34 @@ extension AppToolExecutor {
         return Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
     }
 
-    private static let senseMakingScope = "A sense is for a Mac app, a live Chrome site, or a foreign file format (including binary) whose read captures material. Plain text uses files.read; a web page is read with read_page (app web.read). Folder watches are not sense.make corners."
+    private static let senseMakingScope = """
+        A sense is for a Mac app, a live Chrome site, or a foreign file format (including binary) whose read captures material. Plain text uses files.read; a \
+        web page is read with read_page (app web.read). Folder watches are not sense.make corners.
+        """
 
     @MainActor
-    private func makeSense(input: [String: JSONValue], timing: inout [String: JSONValue]) async -> JSONValue {
+    private func makeSense(input: [String: JSONValue], timing: inout [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
         guard let registry = SensesHub.shared.registry, let runner = SensesHub.shared.runner else {
             return Self.failure("senses_unavailable", "Senses are not running.")
         }
         let kit = Bundle.main.resourceURL?.appendingPathComponent("Senses").path ?? "NativeAgent.app/Contents/Resources/Senses"
         let showMaterial = input["show"]?.scalarText == "material"
         let code = input["code"]?.scalarText ?? ""
-        let scope = ChatToolSessionContext.verifiedSessionId ?? ""
+        let scope = turn.verifiedSessionID ?? ""
         if input["trial_id"] != nil || input["digest"] != nil {
             guard let trial = input["trial_id"]?.scalarText, let digest = input["digest"]?.scalarText,
                   input["keep"] == .bool(true), !scope.isEmpty,
                   (["code", "place", "why", "show", "apps"] + Array(AbilityStore.partKeys)).allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
-                return Self.failure("invalid_args", "Keep with trial_id, digest and keep:true in the conversation that tried it. Omit code, place, why, show, apps and ability headers; use a new trial to revise the candidate.")
+                return Self.failure("invalid_args", """
+                    Keep with trial_id, digest and keep:true in the conversation that tried it. Omit code, place, why, show, apps and ability headers; use a \
+                    new trial to revise the candidate.
+                    """)
             }
             do {
                 let started = ContinuousClock.now
                 let candidate = try registry.programs.load(id: trial, digest: digest)
                 let key = try await SwiftNativeManifestSigner(dataRoot: registry.root.deletingLastPathComponent()).loadOrCreateSigningKey()
-                let (published, page) = try await registry.keep(candidate, key: key, scope: scope)
+                let (published, page) = try await registry.keep(candidate, key: key, scope: scope, turn: turn)
                 timing["write_ms"] = .double(Self.senseMilliseconds(since: started))
                 SenseDoorViews.shared.forget(corner: published.corner, scope: scope)
                 return .object(["status": .string("kept"), "place": .string(published.corner.key),
@@ -136,9 +140,15 @@ extension AppToolExecutor {
         }
         guard let view = views.last else {
             if let place, let scheme = URL(string: place)?.scheme, ["https", "http"].contains(scheme.lowercased()) {
-                return Self.failure("no_material", "A web page is read with read_page; a sense is for a Mac app, a live Chrome site, or a foreign file format. Plain text uses files.read. Read a live Chrome site with chrome.snapshot before making its sense.")
+                return Self.failure("no_material", """
+                    A web page is read with read_page; a sense is for a Mac app, a live Chrome site, or a foreign file format. Plain text uses files.read. \
+                    Read a live Chrome site with chrome.snapshot before making its sense.
+                    """)
             }
-            return Self.failure("no_place", Self.senseMakingScope + " Read the place first in this conversation with mac.look, chrome.snapshot or files.read, then make its sense; files.list does not capture sense material.")
+            return Self.failure("no_place", Self.senseMakingScope + """
+                 Read the place first in this conversation with mac.look, chrome.snapshot or files.read, then make its sense; files.list does not capture \
+                sense material.
+                """)
         }
         if !showMaterial, let refusal = view.growthRefusal {
             return ChatToolOutcome.failure(error: AutonomyGateError.toolDenied(reason: refusal), tool: "app")
@@ -149,14 +159,17 @@ extension AppToolExecutor {
         guard let material = view.capturedMaterial else {
             let alternative: String = if case .fileKind = corner { "Plain text is read with files.read; " }
                 else { "A web page is read with read_page; " }
-            return Self.failure("no_material", alternative + "a sense is for a Mac app, a live Chrome site, or a foreign file format (including binary). This read captured no material. Plain text uses files.read; web pages use read_page (app web.read); live Chrome sites use chrome.snapshot before sense.make.")
+            return Self.failure("no_material", alternative + """
+                a sense is for a Mac app, a live Chrome site, or a foreign file format (including binary). This read captured no material. Plain text uses \
+                files.read; web pages use read_page (app web.read); live Chrome sites use chrome.snapshot before sense.make.
+                """)
         }
         switch corner {
         case .app, .site, .fileKind: break
         case .stream, .need: return Self.failure("unsupported_corner", Self.senseMakingScope)
         }
         if showMaterial {
-            // Exactly what sense.source.read() hands her code (file bytes stay on-device).
+            // Use exactly sense.source.read() material; file bytes must stay on-device.
             let shape: JSONValue = switch material {
             case .accessibility(let tree): .object(["kind": .string("accessibility"), "tree": tree])
             case .file(let path, let bytes, _): .object(["kind": .string("file"), "path": .string(path), "bytes": .int(Int64(bytes)),
@@ -167,12 +180,15 @@ extension AppToolExecutor {
             return .object(["status": .string("material"), "place": .string(corner.key), "kit": .string(kit), "material": shape])
         }
         guard !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return Self.failure("invalid_args", Self.senseMakingScope + " code is the complete sense.js: define read(request) and publish a page from sense.source.read(). show:\"material\" returns the captured material.",
+            return Self.failure("invalid_args", Self.senseMakingScope + """
+                 code is the complete sense.js: define read(request) and publish a page from sense.source.read(). show:\"material\" returns the captured \
+                material.
+                """,
                                 extra: ["kit": .string(kit)])
         }
         var identity: [String: JSONValue] = ["place": .string(view.page.address)]
         do {
-            // A place she already made keeps its id and gains a version.
+            // Existing places keep their identity while gaining a version.
             let existing = try await registry.allChecked().first { $0.corner == corner && $0.origin != .builtIn && $0.language == .javascript }
             let id: String
             if let existing { id = existing.id } else { id = Self.placeID(corner) }
@@ -190,23 +206,23 @@ extension AppToolExecutor {
                 return Self.failure("invalid_reach", "The part header has no reach declaration; nothing was staged.")
             }
             record.reach = try JSONDecoder().decode(SenseReach.self, from: declaredReach.serializedData(pretty: false))
-            record.grownBecause = input["why"]?.scalarText ?? "the agent made it in her turn"
+            record.grownBecause = input["why"]?.scalarText ?? "the agent made it in its turn"
             guard !scope.isEmpty else { return Self.failure("no_conversation", "Run sense.make in a chat conversation to retain this trial.") }
             let validateStarted = ContinuousClock.now
-            let candidate = try await registry.candidate(record, codeFiles: ["sense.js": Data(code.utf8)], scope: scope, header: part)
+            let candidate = try await registry.candidate(record, codeFiles: ["sense.js": Data(code.utf8)], scope: scope, header: part, turn: turn)
             timing["validate_ms"] = .double(Self.senseMilliseconds(since: validateStarted))
             identity["digest"] = .string(candidate.digest)
             record = try FileSenseRegistry.record(candidate)
             identity["version"] = .int(Int64(record.version))
             let runStarted = ContinuousClock.now
             let outcome = await runner.run(record, request: .read(address: view.page.address),
-                                           source: CapturedSenseSource(corner: corner, material: material))
+                                           source: CapturedSenseSource(corner: corner, material: material), operation: execution.senseOperation(turn: turn))
             timing["run_ms"] = .double(Self.senseMilliseconds(since: runStarted))
             guard case .page(let page, let provenance) = outcome else {
                 let error: SenseFailure = if case .failed(let failure) = outcome { failure }
                     else { SenseFailure(code: "sense_no_page", message: "read() returned no page.") }
                 var failure = ChatToolOutcome.failure(error: error, tool: "app", effects: .unknown).objectValue ?? [:]
-                do { try registry.programs.discard(candidate) }
+                do { try registry.programs.discard(candidate, turn: turn) }
                 catch { failure["candidate_retention_failure"] = ChatToolOutcome.failure(error: error, tool: "app", effects: .unknown) }
                 failure["sense_id"] = .string(id); failure["version"] = .int(Int64(record.version))
                 failure["digest"] = .string(candidate.digest); failure["place"] = .string(view.page.address); failure["kit"] = .string(kit)
@@ -214,18 +230,21 @@ extension AppToolExecutor {
                     failure["remedy"] = Repair.remedy(owner: "sense \(id) version \(candidate.digest)",
                         nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("sense.make"),
                             "args": .object(["place": .string(view.page.address), "show": .string("material")])])]), tap: nil,
-                        instruction: "Read this place's captured material, revise sense.js and run a new sense.make trial. This candidate did not produce a page.")
+                        instruction: """
+                            Read this place's captured material, revise sense.js and run a new sense.make trial. This candidate did not produce a page.
+                            """)
                 }
                 return .object(failure)
             }
-            let shown = SenseDoor.render(page, provenance: provenance)
+            let shown = SenseDoor.render(page, provenance: provenance, readContent: execution.invocation.readContent)
             let proofStarted = ContinuousClock.now
             let key = try await SwiftNativeManifestSigner(dataRoot: registry.root.deletingLastPathComponent()).loadOrCreateSigningKey()
             do {
                 _ = try registry.programs.bind(candidate, receipts: [.object(["status": .string("ok"), "page": try .fromEncodable(page)])],
-                    key: key, captured: .array([.object(["input": .object(["address": .string(view.page.address)]), "expected": try .fromEncodable(page)])]))
+                    key: key, captured: .array([.object(["input": .object(["address": .string(view.page.address)]), "expected": try .fromEncodable(page)])]),
+                        turn: turn)
             } catch let bindingError {
-                do { try registry.programs.discard(candidate) }
+                do { try registry.programs.discard(candidate, turn: turn) }
                 catch { identity["candidate_retention_failure"] = ChatToolOutcome.failure(error: error, tool: "app", effects: .unknown) }
                 throw bindingError
             }
@@ -233,12 +252,14 @@ extension AppToolExecutor {
             guard keep else {
                 return .object(["status": .string("tried"), "place": .string(corner.key), "page": .string(shown),
                     "trial_id": .string(id), "digest": .string(candidate.digest),
-                    "trial_retention": .string("Available in this conversation until another candidate for this sense replaces it or its selected version changes."),
+                    "trial_retention": .string("""
+                        Available in this conversation until another candidate for this sense replaces it or its selected version changes.
+                        """),
                     "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("sense.make"),
                         "args": .object(["trial_id": .string(id), "digest": .string(candidate.digest), "keep": .bool(true)])])])])
             }
             let writeStarted = ContinuousClock.now
-            let (published, keptPage) = try await registry.keep(candidate, key: key, scope: scope)
+            let (published, keptPage) = try await registry.keep(candidate, key: key, scope: scope, turn: turn)
             timing["write_ms"] = .double(Self.senseMilliseconds(since: writeStarted))
             SenseDoorViews.shared.forget(corner: corner, scope: scope)
             return .object(["status": .string("kept"), "place": .string(corner.key), "sense_id": .string(published.id),
@@ -248,15 +269,14 @@ extension AppToolExecutor {
         } catch {
             var failure = Self.ownedFailure(error, code: "sense_make_failed", owner: "sense at \(view.page.address)",
                 instruction: "Read the captured material and the reported cause before revising this sense; its saved state is unverified.",
-                next: ["action": .string("sense.make"), "args": .object(["place": .string(view.page.address), "show": .string("material")])], effects: .unknown).objectValue ?? [:]
+                next: ["action": .string("sense.make"), "args": .object(["place": .string(view.page.address), "show": .string("material")])], effects: .unknown)
+                    .objectValue ?? [:]
             failure.merge(identity) { _, identity in identity }
             return .object(failure)
         }
     }
 
-    /// Named for its place and unique to it: site:en.wikipedia.org →
-    /// site-en-wikipedia-org-<6 hex of the full key>. Deterministic, so two
-    /// places never share an id and no reservation is needed.
+    /// Derive ids from the full place key so identity is deterministic without a separate reservation.
     private static func placeID(_ corner: SenseCorner) -> String {
         var slug = String(corner.key.lowercased().map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
         while slug.contains("--") { slug = slug.replacingOccurrences(of: "--", with: "-") }
@@ -266,11 +286,11 @@ extension AppToolExecutor {
     }
 }
 
-/// The material her read already admitted, for this place only.
+/// Only this place's already-admitted read material may reach authoring.
 private struct CapturedSenseSource: SenseSourceProvider {
     let corner: SenseCorner
     let material: SenseMaterial
-    func material(for corner: SenseCorner, address: String?) async throws -> SenseMaterial {
+    func material(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> SenseMaterial {
         guard corner == self.corner else { throw SenseFailure(code: "source_unavailable", message: "That place is outside this sense.") }
         return material
     }

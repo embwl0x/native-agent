@@ -6,7 +6,7 @@ import ProviderRouting
 import TrustCenter
 // Blueprint: | `QuietSettingsHost.swift` | Settings owner ports, mounted platform control declarations and asynchronous phone-owned control resolution |
 
-/// The settings page's observed values and existing UI write actions.
+/// Settings values and mutations share the page's observed state and UI actions.
 @MainActor
 public protocol QuietSettingsHost: AnyObject {
     var dataRootOverride: URL? { get }
@@ -21,11 +21,9 @@ public protocol QuietSettingsHost: AnyObject {
     var chatFileAccess: String { get }
     var chatProvider: String { get }
     var searchServiceURL: String { get }
-    /// Controls owned by the mounted app (for example its shortcut manager).
-    /// Declared beside those owners, then used by every settings reader/writer.
+    /// Controls owned by the mounted app (for example its shortcut manager). Declared beside those owners, then used by every settings reader/writer.
     var platformSettings: [QuietSetting] { get }
-    /// A phone owns its local controls. Resolve them through its signed request
-    /// channel; no Mac defaults or cached phone state stand in for its answer.
+    /// A phone owns its local controls. Resolve them through its signed request channel; no Mac defaults or cached phone state stand in for its answer.
     func phoneSetting(id: String) async throws -> QuietSetting?
 
     func saveChatBrainDefaultsFailure() async -> String?
@@ -56,37 +54,28 @@ public protocol QuietSettingsHost: AnyObject {
     func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?) async -> Bool
     func saveMemoryPolicy(crossSessionRecall: Bool) async
 
-    // The Settings page's live switches. Each stores its key AND tells the
-    // running app, which is what the page's own control does; a bare write to
-    // the key changed what the page showed and nothing else until relaunch.
-    /// The inner life as it ended up, and why when it is not running as asked.
+    // Live switches must both persist the key and notify the running app through their page-owned setters.
+    /// Report the effective inner life with a reason when the requested state did not take effect.
     func setInnerLifeEnabled(_ enabled: Bool) async -> (enabled: Bool, problem: String?)
     func setCognitionLane(_ lane: QuietCognitionLane, enabled: Bool) async
     func setReflectionBudget(_ budget: Int) async
     /// The mode in effect after the write, which setup or safety can hold off.
     func setContextFlowMode(_ mode: ContextFlowMode) async throws -> ContextFlowMode
     func setGlobalHotkeyEnabled(_ enabled: Bool)
-    /// Nil when saved; otherwise what was wrong with it.
     func savePersonalityName(_ name: String) async -> String?
     func saveSearchServiceURL(_ url: String) async throws
-    /// The URL found and saved, or a throw saying why none was.
-    func findSearchService() async throws -> String
+    func findSearchService(context: QuietSettingWrite) async throws -> String
     func inboxTriggers() async throws -> [QuietInboxTrigger]
     func setInboxTrigger(_ name: String, enabled: Bool) async throws
-    /// The lower-only switches whose state lives where only the app reaches
-    /// (Chrome, Pause everything, activity capture, Mac integration, Telegram,
-    /// Slack, connected agents), built with `QuietSettings.lowerOnly` and
-    /// `narrowOnly` so the direction rule stays here.
-    var lowerOnlyRows: [QuietSetting] { get throws }
+    /// Platform-owned lower-only rows retain Core's lowerOnly/narrowOnly direction rules.
+    func lowerOnlyRows(forPage page: String?) throws -> [QuietSetting]
 }
 
-/// The inner-life lanes the Settings page and the Cognition page switch one
-/// at a time, each through its own runtime setter.
+/// Each inner-life lane uses its own runtime setter, shared by Settings and Cognition.
 public enum QuietCognitionLane: Sendable {
     case capsule, background, reflection, organism
 }
 
-/// One proactive-inbox trigger as the Notifications page lists it.
 public struct QuietInboxTrigger: Sendable {
     public let name: String
     public let enabled: Bool
@@ -96,8 +85,7 @@ public struct QuietInboxTrigger: Sendable {
     }
 }
 
-/// One model an account offers, with the thinking levels it takes — the
-/// list the Providers page and the composer pick from.
+/// Providers and composer share each account's offered models and declared thinking levels.
 public struct QuietProviderModel: Sendable {
     public let id: String
     public let defaultEffort: String

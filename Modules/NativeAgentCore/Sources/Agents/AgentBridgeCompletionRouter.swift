@@ -6,11 +6,10 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `AgentBridgeCompletionRouter.swift` | Completion-route adapters and destination validation; saved let-go delivery stops at admission before asking-chat rows or dispatch; retained tasks own caller-result artifact idempotence under delivery admission; cancellation fences the append; `AgentBridgeCompletionRouter`: `validatedRoute`, `deliverAnswer` |
+// Blueprint: | `AgentBridgeCompletionRouter.swift` | `AgentBridgeCompletionRouter`, `validatedRoute`, `deliverAnswer` |
 
 extension AgentBridgeCompletionRoute {
-  /// The door a contact's send was asked from, for an answer from a turn
-  /// that ran in `turnSessionId`.
+  /// Keep the asking door distinct from the session where the completion turn runs.
   public init(asking row: AgentConversationRecord, turnSessionId: String) {
     let saved = row.replyRoute ?? [:]
     self.init(surface: saved["surface"] ?? row.sourceSurface, sessionId: row.scopeSessionID,
@@ -20,33 +19,7 @@ extension AgentBridgeCompletionRoute {
               requesterUserId: saved["requesterUserId"])
   }
 
-  public init(origin: [String: Any]?, sessionId: String?) {
-    func value(_ key: String) -> String? {
-      guard let raw = origin?[key] as? String else { return nil }
-      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-      return trimmed.isEmpty ? nil : trimmed
-    }
-    self.init(
-      // A completion route is durable authority, not a hint. Missing origin
-      // identity must remain missing so delivery fails before any side effect;
-      // silently treating corrupt/legacy data as local chat loses the result.
-      surface: value("surface") ?? "",
-      sessionId: sessionId,
-      destinationId: value("destinationId"),
-      threadId: value("threadId"),
-      sourceKey: value("sourceKey"),
-      replyTo: value("replyTo"),
-      correlationId: value("correlationId"),
-      requesterUserId: value("requesterUserId")
-    )
-  }
-
-  /// Preserve the immutable return route while Agent handles an asynchronous
-  /// builder completion. The completion itself still executes on the local
-  /// bridge/chat trust surface; this value carries delivery identity only, so
-  /// any follow-up `codex_message`/`claude_message` returns to the same
-  /// Telegram, Slack, or iOS conversation instead of silently degrading to a
-  /// Mac-only reply.
+  /// Preserve immutable delivery identity across asynchronous completion; it grants no execution authority.
   public var chatToolReplyRoute: ChatToolSessionContext.ReplyRoute {
     ChatToolSessionContext.ReplyRoute(
       surface: surface,
@@ -241,11 +214,9 @@ public enum AgentBridgeCompletionRouter {
   }
 
 
-  /// A contact's conversation runs her turn in its own session,
-  /// but when User asked from a chat at any door her answer reaches THAT chat:
-  /// a visible row in the chat that asked and the route's own delivery. Phone
-  /// rows wait for the native send verdict so a held answer stays unpublished.
+  /// Return contact-session answers to the original asking door; phone rows publish only after the native send verdict.
   public static func deliverAnswer(
+    turn: Turn,
     deliveryId: String,
     requestDigest: String,
     text: String,
@@ -256,12 +227,13 @@ public enum AgentBridgeCompletionRouter {
     lifecycle: CodexCompletionLifecycle,
     notifyRequestedResult: Bool = true
   ) async -> AgentBridgeCompletionDelivery {
-    return await deliver(deliveryId: deliveryId, requestDigest: requestDigest, text: text, attachments: attachments,
+    return await deliver(turn: turn, deliveryId: deliveryId, requestDigest: requestDigest, text: text, attachments: attachments,
                          route: route, sender: sender, lifecycle: lifecycle, notifyRequestedResult: notifyRequestedResult,
                          askingChatClient: client)
   }
 
   public static func deliver(
+    turn: Turn,
     deliveryId: String,
     requestDigest: String,
     text: String,
@@ -280,11 +252,20 @@ public enum AgentBridgeCompletionRouter {
     } catch {
       return lifecycleUnavailable(surface: surface, delivery: "none", reason: error.localizedDescription)
     }
-    if let askingChatClient, route.turnSessionId != nil, let asking = route.sessionId,
-       ["chat", "app", "mac"].contains(surface) {
+    if admission.response?.isSilentCompletion == true {
+      let result = AgentBridgeCompletionDelivery(status: "completed", surface: surface, delivery: "silence",
+        artifactCount: 0, attempts: 0, reason: nil)
+      do {
+        try await lifecycle.recordDelivery(result, deliveryId: deliveryId, requestDigest: requestDigest)
+        return result
+      } catch {
+        return lifecycleUnavailable(surface: surface, delivery: "silence", reason: error.localizedDescription)
+      }
+    }
+    if let askingChatClient, route.turnSessionId != nil, let asking = route.sessionId, surface == "chat" {
       do {
         try await askingChatClient.appendAnswerForAskingChat(sessionID: asking, text: text, attachments: attachments,
-                                                   surface: surface, deliveryID: deliveryId)
+                                                   surface: surface, deliveryID: deliveryId, turn: turn)
       } catch {
         return AgentBridgeCompletionDelivery(status: "failed_pre_dispatch", surface: surface, delivery: "asking_chat_row",
           artifactCount: 0, attempts: 0, reason: "asking_chat_row_failed:\(error.localizedDescription)")
@@ -333,8 +314,7 @@ public enum AgentBridgeCompletionRouter {
     if validatedRoute != .success(.callerResult), validatedRoute != .success(.ios) {
       await sender.refreshLocalChat(sessionId: route.sessionId)
     }
-    // A tool-authored reply to another human conversation is part of the
-    // enclosing turn's work. That turn owns the single result notification.
+    // A tool-authored reply to another human conversation is part of the enclosing turn's work. That turn owns the single result notification.
     if validatedRoute == .success(.local) {
       if notifyRequestedResult {
         do {
@@ -372,7 +352,7 @@ public enum AgentBridgeCompletionRouter {
           if validatedRoute == .success(.ios) {
             if route.turnSessionId != nil, let asking = route.sessionId, let askingChatClient {
               try await askingChatClient.appendAnswerForAskingChat(sessionID: asking, text: text, attachments: attachments,
-                                                                  surface: surface, deliveryID: deliveryId)
+                                                                  surface: surface, deliveryID: deliveryId, turn: turn)
             }
             await sender.refreshLocalChat(sessionId: route.sessionId)
           }

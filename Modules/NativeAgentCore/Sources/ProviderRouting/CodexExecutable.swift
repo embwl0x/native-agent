@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `CodexExecutable.swift` | `CodexExecutable`: inherited-first PATH and explicit-override executable selection shared by readiness and process execution |
+// Blueprint: | `CodexExecutable.swift` | `CodexExecutable`: shared executable selection |
 public enum CodexExecutable {
     static var executableSearchDirectories: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path

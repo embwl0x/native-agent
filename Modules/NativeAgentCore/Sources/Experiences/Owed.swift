@@ -1,23 +1,19 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `Owed.swift` | `Owed`: what they owes or is owed under the id its owner hands their (a reply's delivery id, a card's `interaction:<id>`), born owing one key and moved only by that owner at its persistence boundary, so desk.wait and repair.let_go read one experience |
+// Blueprint: | `Owed.swift` | Nonperson births and existing obligation settlements; person asks are born only through Matter |
 
-/// Something she owes or is owed, under the id its owner hands her (a reply's
-/// delivery id, a card's `interaction:<id>`): born owing `key` to `to` the
-/// first time its owner records it, then moved only by that owner, at its own
-/// persistence boundary. Any id she was shown is then one experience, so a
-/// wait (`desk.wait`) or a let-go reads it with no second store.
+/// Use the owner's shown ID as one experience; only that owner moves its obligation at its persistence boundary.
+/// Waits and let-go reads use the same record rather than another store.
 public enum Owed {
     public enum Phase: Sendable { case owed, accepted, letGo(ObligationPhase.LetGo) }
 
-    /// `born: false` only moves one already owed: a settled record from
-    /// before this owner projected is never born just to be closed.
+    /// Do not create a settled past obligation merely to close it; born false moves only existing debt.
     @discardableResult
     public static func record(_ root: URL, id: String, kind: Experience.Kind, key: String, to: String,
                               phase: Phase, evidence: [Experience.Ref], born: Bool = true) -> Task<Void, Never> {
         ExperienceStore.record(root, id) { store in
             if try await store.experience(id) == nil {
-                guard born else { return }
+                guard born, kind != .decision || to != ForPerson.person else { return }
                 var fresh = Experience(id: id, kind: kind, evidence: evidence, owes: [key: .init(to: to)])
                 fresh.addressedTo = [to]
                 try await store.begin(fresh)

@@ -1,135 +1,68 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import NotificationInbox
+import Experiences
 import PersistenceCore
-// Blueprint: | `TriggerNotificationInbox.swift` | `TriggerNotificationInbox`: proactive identity matcher, checked locked mirror, `archiveSupersededMorningBriefs` |
+// Blueprint: | `TriggerNotificationInbox.swift` | Trigger acceptance tells one matter with its doors; duplicates and superseded briefs read ForPerson |
 
-/// The host publishes the inbox snapshot through its paired-device transport.
 public protocol TriggerSnapshotDeliveryPort: Sendable {
     func writeSnapshots() async
 }
 
 public enum TriggerNotificationInbox {
-    /// Accept one normalized card under the inbox owner's duplicate-check lock.
-    /// A returned id identifies the durable equivalent card; nil means appended.
+    /// A repeated occurrence is the same happening, including after the person handled it; a repeated open face is not another notice.
     public static func accept(_ note: TriggerNotification, notify: Bool, dataRoot: URL) async throws -> String? {
-        guard case .object(var cardObj) = note.item, !note.itemId.isEmpty else {
-            throw TriggerSchedulerError.invalidRequest("inbox item missing id")
+        let matter = try matter(note)
+        let forPerson = ForPerson.at(dataRoot)
+        let matters = try await forPerson.matters()
+        let occurrence = try JSONRow(note.item).optionalString("trigger_occurrence")
+        if let occurrence, let prior = matters.first(where: {
+            $0.face?.from == note.source && $0.evidence.contains(.init(source: note.source, id: occurrence))
+        }) { return prior.id }
+        if let prior = matters.first(where: {
+            guard $0.face?.from == note.source, ForPerson.reading($0) == .unread || ForPerson.reading($0) == .read,
+                  $0.face?.row?.title == matter.title, $0.face?.row?.detail == matter.summary,
+                  let at = NativeTimestampFormat.parseISO8601FractionalFirst($0.at) else { return false }
+            return Date().timeIntervalSince(at) <= 7 * 86_400
+        }) { return prior.id }
+        let filed = try await forPerson.tell(matter, doors: notify ? Door.person(thread: nil) : [])
+        if note.source == "trigger:morning_brief" { await archiveSupersededMorningBriefs(dataRoot: dataRoot) }
+        return filed == .born ? nil : matter.id
+    }
+
+    public static func matter(_ note: TriggerNotification) throws -> Matter {
+        guard !note.itemId.isEmpty else { throw TriggerSchedulerError.invalidRequest("inbox item missing id") }
+        let row = try JSONRow(note.item)
+        guard try row.string("id") == note.itemId else { throw JSONRow.Malformed.field("id") }
+        let severity = try row.string("severity")
+        let authored = try row.optional("actions") { value -> [JSONValue]? in
+            if case .array(let actions) = value { return actions }; return nil
         }
-        if notify {
-            cardObj["held_delivery"] = .array([.string("phone")])
-            cardObj["held_title"] = .string(note.title)
-            cardObj["held_body"] = .string(note.body)
-            cardObj["held_event_id"] = .string("trigger:\(note.itemId)")
-            cardObj["held_reason"] = .string(note.body)
-            cardObj["held_importance"] = .string(note.ownerWaiting ? "owner_waiting" : "informational")
-            cardObj["held_user_info"] = .object([
-                "screen": .string(note.screen), "source": .string(note.source), "urgency": .string(note.urgency),
-                "itemId": .string(note.itemId), "trigger": .string(note.triggerName),
-            ])
+        let choices = try (authored ?? []).map { action -> PartFace.Action in
+            let value = try JSONRow(action)
+            return .init(id: try value.string("id"), label: try value.string("label"))
         }
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        // Normalize the card to the notifications-store shape.
-        if cardObj["created_at"] == nil { cardObj["created_at"] = .string(NativeTimestampFormat.fractionalZulu(Date())) }
-        if cardObj["status"] == nil { cardObj["status"] = .string("unread") }
-        if cardObj["read_at"] == nil { cardObj["read_at"] = .null }
-        if cardObj["actions"] == nil {
-            cardObj["actions"] = .array([
-                .object(["id": .string("view"), "label": .string("View"),
-                         "description": .string("See full detail")]),
-                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                         "description": .string("Dismiss this card")]),
-            ])
-        }
-        let normalizedObj = cardObj
-        let normalized: JSONValue = .object(normalizedObj)
-        let existingId = try await LiveNotificationInbox(path: inboxPath)
-            .appendUnlessDuplicate(normalized) { rows in
-                activeDuplicateId(for: normalizedObj, rows: rows)
-            }
-        if existingId == nil, normalizedObj["source"] == .string("trigger:morning_brief") {
-            await archiveSupersededMorningBriefs(dataRoot: dataRoot)
-        }
-        return existingId
+        let paths = try (row.optionalStrings("related_paths") ?? []).map { Experience.Ref(source: Matter.files, id: $0) }
+        let occurrence = try row.optionalString("trigger_occurrence")
+        let summary = try row.optionalString("summary") ?? note.body
+        return Matter(id: note.itemId,
+            form: severity == "critical" ? .wentWrong : note.ownerWaiting || severity == "actionable" ? .ask : .words,
+            from: note.source, title: note.title, summary: summary,
+            words: try row.optionalString("detail") ?? summary,
+            choices: choices, evidence: occurrence.map { [.init(source: note.source, id: $0)] } ?? [], artifacts: paths)
     }
 
-    static func activeDuplicateId(for candidate: [String: JSONValue], rows: [JSONValue]) -> String? {
-        if let occurrence = candidate["trigger_occurrence"],
-           let prior = rows.last(where: { $0.objectValue?["source"] == candidate["source"]
-               && $0.objectValue?["trigger_occurrence"] == occurrence }),
-           let id = string(prior.objectValue?["id"]) { return id }
-        guard let candidateKey = duplicateKey(candidate), shouldDedupeSource(candidateKey.source) else { return nil }
-        let candidateCreatedAt = parseInboxDate(string(candidate["created_at"]))
-        // Last-write-wins per id keeps dismissed revisions from matching an
-        // earlier active row. First-seen order preserves the existing choice.
-        var order: [String] = []
-        var latest: [String: JSONValue] = [:]
-        for row in rows {
-            guard case .object(let object) = row,
-                  let id = string(object["id"]), !id.isEmpty else { continue }
-            if latest[id] == nil { order.append(id) }
-            latest[id] = row
-        }
-        for id in order.reversed() {
-            guard case .object(let existing)? = latest[id],
-                  let existingKey = duplicateKey(existing), existingKey == candidateKey,
-                  activeStatus(for: existing) else { continue }
-            if let candidateCreatedAt,
-               let existingCreatedAt = parseInboxDate(string(existing["created_at"])),
-               candidateCreatedAt.timeIntervalSince(existingCreatedAt) > 7 * 24 * 60 * 60 { continue }
-            return id
-        }
-        return nil
-    }
-
-    private static func shouldDedupeSource(_ source: String) -> Bool {
-        let source = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return source == "idle_checkin" || source.hasPrefix("trigger:") || source.hasPrefix("proactive_autonomy:")
-    }
-
-    private static func duplicateKey(_ object: [String: JSONValue]) -> (source: String, title: String, summary: String)? {
-        guard let source = normalizedText(object["source"]), let title = normalizedText(object["title"]) else { return nil }
-        return (source, title, normalizedText(object["summary"]) ?? "")
-    }
-
-    private static func activeStatus(for item: [String: JSONValue]) -> Bool {
-        let status = (string(item["status"]) ?? "unread").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return status == "unread" || status == "read"
-    }
-
-    private static func normalizedText(_ value: JSONValue?) -> String? {
-        guard let value = string(value)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
-        return value.lowercased()
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let value)? = value else { return nil }
-        return value
-    }
-
-    private static func parseInboxDate(_ value: String?) -> Date? {
-        guard let value, !value.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(value)
-    }
-
-    /// Only the newest brief stays active; runs after each brief and once at launch.
-    public static func archiveSupersededMorningBriefs(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async {
+    /// Keep only the newest active brief, without reopening a brief the person already handled.
+    public static func archiveSupersededMorningBriefs(dataRoot: URL = PersistenceCore.defaultDataRoot()) async {
         do {
-            _ = try await LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
-                .archiveSupersededRows(
-                    source: "trigger:morning_brief",
-                    groupField: "source",
-                    readAt: NativeTimestampFormat.plainZulu(Date()),
-                    statusIsEligible: { $0 != "archived" && $0 != "dismissed" }
-                )
+            let forPerson = ForPerson.at(dataRoot)
+            let briefs = try await forPerson.matters().filter { $0.face?.from == "trigger:morning_brief" }
+            for old in briefs.dropFirst() where ForPerson.reading(old) == .unread || ForPerson.reading(old) == .read {
+                try await forPerson.answered(old.id, evidence: nil, letGo: .cancelled)
+                try await forPerson.putAway(old.id, .resolved)
+            }
         } catch {
-            nativeLog("trigger_mirror: morning brief reconciliation failed: %@", String(describing: error))
+            nativeLog("trigger_mirror: morning brief reconciliation failed: %@", error.localizedDescription)
         }
     }
-
 }

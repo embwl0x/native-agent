@@ -2,7 +2,7 @@ import Foundation
 // Blueprint: | `InspectorModels.swift` | Shared checked content-free Inspector turn summaries and mobile tool catalog rows |
 
 public struct TurnSummaryRecord: Identifiable, Codable, Hashable, Sendable {
-    public var id: String              // turnId
+    public var id: String              // The canonical turnId keeps projections correlated.
     public var surface: String?
     public var sessionId: String?
     public var startedAt: Date

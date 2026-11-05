@@ -3,10 +3,9 @@ import os
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `SessionConversation.swift` | `SessionConversation`: row-backed conversation kind for a session or id; creator source keys apply current declarations to historical transport rows on read; one index read can serve a whole batch, and one-id reads reuse each index parsed once per file stamp |
+// Blueprint: | `SessionConversation.swift` | `SessionConversation`: Row-backed kind and stamped index reads |
 
-/// A session's row says whose conversation it is. IDs are locators only.
-/// Reuse a loaded index for batch reads; this value owns no storage or cache.
+/// A session's row says whose conversation it is. IDs are locators only. Reuse a loaded index for batch reads; this value owns no storage or cache.
 public struct SessionConversation: Sendable {
     private let kinds: [String: ChatThreadKind]
     private let helperSessions: Set<String>
@@ -44,9 +43,7 @@ public struct SessionConversation: Sendable {
         sessionID.flatMap { kinds[$0] }
     }
 
-    /// Helper-only policies need the specific owner, beyond the common agent
-    /// kind. The helper creator's recorded owner identifies it; no ID
-    /// shape or new conversation kind is involved.
+    /// Read the helper creator's recorded owner; conversation kind alone cannot identify which helper owns it.
     public func isHelper(_ sessionID: String?) -> Bool {
         sessionID.map { helperSessions.contains($0) } ?? false
     }
@@ -72,14 +69,11 @@ public struct SessionConversation: Sendable {
         kind(threadKind: session.threadKind, source: session.source, sourceKey: session.sourceKey)
     }
 
-    /// The creator's current declaration decides when its key proves one.
-    /// Otherwise a recorded kind decides; `legacy` and a
-    /// row with none read the kind their source proves, so an older agent
-    /// thread recorded `legacy` is still a peer's (Trust and authorship).
+    /// Creator declarations outrank saved kind; unclassified rows require source evidence to preserve Trust and authorship.
     public static func kind(threadKind: String?, source: String?, sourceKey: String? = nil) -> ChatThreadKind {
         if let declared = ChatThreadKind.creatorDeclaration(source: source, sourceKey: sourceKey) { return declared }
-        if let recorded = ChatThreadKind.parse(threadKind), recorded != .legacy { return recorded }
-        return source.map(ChatThreadKind.inferred(fromSource:)) ?? .legacy
+        if let recorded = ChatThreadKind.parse(threadKind), recorded != .unclassified { return recorded }
+        return source.map(ChatThreadKind.inferred(fromSource:)) ?? .unclassified
     }
 
     /// No row or an unreadable index proves no kind. Never guess from the ID.
@@ -91,8 +85,7 @@ public struct SessionConversation: Sendable {
         return cold.kind(sessionID)
     }
 
-    // One-id questions run on every turn and every care event: each index is
-    // parsed once per write, keyed by its file stamp (any write moves it).
+    // One-id questions run on every turn and every care event: each index is parsed once per write, keyed by its file stamp (any write moves it).
     private static let parsed = OSAllocatedUnfairLock<[String: (stamp: SnapshotTailOpLog.FileStamp, value: SessionConversation)]>(initialState: [:])
 
     private static func hotIndex(_ dataRoot: URL) -> SessionConversation? {
@@ -115,8 +108,7 @@ public struct SessionConversation: Sendable {
         return value
     }
 
-    /// Only the session's owner calls this: declare a new row, or correct the
-    /// kind its older writer recorded. All other row fields stay with the index.
+    /// Only the session owner declares or corrects kind; all unrelated fields stay with the index.
     public static func declare(_ sessionID: String, kind: ChatThreadKind, title: String, source: String,
                                dataRoot: URL, createIfMissing: Bool = true) async throws {
         let path = dataRoot.appendingPathComponent("chat/sessions.json")

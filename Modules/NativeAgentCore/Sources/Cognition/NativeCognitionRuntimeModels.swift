@@ -6,7 +6,7 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `NativeCognitionRuntimeModels.swift` | `CognitiveObservatoryDetail` and runtime read models; shared affect validity and organism sample freshness/validity |
+// Blueprint: | `NativeCognitionRuntimeModels.swift` | `CognitiveObservatoryDetail`. |
 
 public struct CognitiveObservatoryDetail: Sendable {
     public var configuration: CognitiveConfiguration
@@ -16,19 +16,19 @@ public struct CognitiveObservatoryDetail: Sendable {
     public var associations: [CognitiveAssociationEdge]
     public var schemaProposals: [CognitiveSchemaProposal]
     public var developmentalTimeline: [CognitiveDevelopmentalTimelineEvent]
-    /// Seven-day timeline projection grouped by lesson or view; raw events remain its receipts.
+    /// Keep raw events as receipts behind the grouped timeline projection.
     public var growthWeek: CognitiveGrowthWeek
     public var reflections: [CognitiveReflectionReceipt]
-    /// Receipt evidence and its availability travel as one value.
+    /// Carry evidence and availability together.
     public var receiptRead: CognitiveReceiptRead
     public var organism: OrganismSnapshot
     public var capsulePreview: CognitiveCapsule?
     public var capsulePreviewInfo: CapsulePreviewInfo?
-    /// Read-only fingerprint aboutness; nil when cognition/affect is off or no mode dominates.
+    /// Absent or nondominant cognition has no fingerprint aboutness.
     public var feltMode: CognitiveSubstrate.FeltMode?
 }
 
-/// Doctor's bounded, mutation-free read of mounted state; no Observatory refresh.
+/// Doctor reads mounted state without mutation or an Observatory refresh.
 public struct CognitiveDoctorRead: Sendable {
     public let configuration: CognitiveConfiguration
     public let affect: CognitiveAffectState
@@ -40,17 +40,11 @@ public struct CognitiveDoctorRead: Sendable {
     public let capsulePreviewInfo: CapsulePreviewInfo?
 }
 
-/// Provenance for the Observatory's Capsule Preview: whether the shown capsule is
-/// the one Agent ACTUALLY received in her last live chat turn (mirrored at
-/// injection), or a synthetic inspect-only compile shown only before any chat
-/// injection this session. Lets the panel label what it's showing instead of
-/// reading like a frozen constant.
+/// Distinguish the last delivered capsule from a cold synthetic inspection so Observatory can label its actual provenance.
 public struct CapsulePreviewInfo: Sendable {
     public enum Source: Sendable { case liveInjected, synthetic }
     public var source: Source
-    /// The user message this capsule was built for (live injections only).
     public var userMessage: String?
-    /// When it was injected — the capsule's own compile time (live injections only).
     public var at: Date?
 }
 
@@ -118,10 +112,7 @@ enum OrganismDebugBodyOverrideError: Error, Sendable, CustomStringConvertible {
     }
 }
 
-/// The mutation receipt behind the Observatory's Settle and Reset controls.
-/// A body snapshot alone is not proof that a requested state made it to disk:
-/// callers must be able to distinguish a committed change from an in-memory
-/// change that was rolled back after the persistence barrier refused it.
+/// A snapshot cannot prove durable mutation; expose settlement receipts so callers distinguish committed state from failed persistence.
 public enum OrganismContinuityApplyStatus: String, Sendable, Equatable {
     case applied
     case organismDisabled = "organism_disabled"
@@ -142,11 +133,7 @@ struct OrganismDebugBodyOverride: Sendable {
 }
 
 
-/// Process-local counters for the event-driven dirty-settlement pilot. This is
-/// evidence only: it is not persisted into cognition, does not schedule work,
-/// and has no control authority. An external manual sampler can correlate the
-/// instance/process identity across real restarts without pretending the
-/// counter itself survived one.
+/// Process-local counters supply diagnostics only; they cannot persist into cognition, schedule work or grant authority.
 public struct CognitiveMicrocycleTelemetry: Sendable, Equatable {
     public let runtimeInstanceId: String
     public let processIdentifier: Int32

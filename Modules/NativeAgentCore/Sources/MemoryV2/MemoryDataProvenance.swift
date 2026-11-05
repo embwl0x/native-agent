@@ -3,10 +3,26 @@ import ChatTurnContracts
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance`: current source/evidence and turn stamps, time and word-fold helpers, source retention and display across writes, readbacks and prompt projections |
+import Senses
+// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance` stamps evidence; `MemoryWriteContext` holds the turn and sense-read owner |
 
-/// Stored untrusted content keeps its steer through duplicate saves and edits.
-/// Reading remains allowed; only subsequent effects use the turn's usual gates.
+/// One write's evidence owners. A caller outside any turn says so explicitly;
+/// a later database/settlement closure holds these same owners.
+public struct MemoryWriteContext: Sendable {
+    public let turn: Turn?
+    public let senseReads: SenseTurnReads?
+
+    public init(turn: Turn?, senseReads: SenseTurnReads?) {
+        self.turn = turn
+        self.senseReads = senseReads
+    }
+
+    func stamping(_ metadata: JSONValue?) throws -> JSONValue? {
+        MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(metadata, reads: senseReads), turn: turn)
+    }
+}
+
+/// Stored untrusted content keeps its steer through duplicate saves and edits. Reading remains allowed; only subsequent effects use the turn's usual gates.
 public enum MemoryDataProvenance {
     public static func presentation(_ text: String, metadata: JSONValue?, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> String {
         MemoryDisplayText.attributed(text, sources: sources(in: metadata, dataRoot: dataRoot))
@@ -21,8 +37,7 @@ public enum MemoryDataProvenance {
                 sources.append(source)
             }
         }
-        // An explicit empty checkpoint attests a clean write. Only older rows
-        // need their descriptive told provenance interpreted as a boundary.
+        // An explicit empty checkpoint attests a clean write; without one, interpret recorded speaker provenance as the boundary.
         if fields["peer_sources"] == nil, fields["provenance"] == .string("told"),
            case .string(let by)? = fields["provenance_by"], !by.isEmpty, !sources.contains(by) {
             do {
@@ -32,8 +47,7 @@ public enum MemoryDataProvenance {
                     if by.caseInsensitiveCompare(name) != .orderedSame { sources.append(by) }
                 } else { sources.append(by) }
             } catch {
-                // Unreadable identity cannot establish that these are the
-                // person's trusted words. Keep their actual named boundary.
+                // Unreadable identity cannot establish that these are the person's trusted words. Keep their actual named boundary.
                 sources.append(by)
                 nativeLog("Memory provenance identity unavailable; retaining named source %@: %@", by, error.localizedDescription)
             }
@@ -73,10 +87,12 @@ public enum MemoryDataProvenance {
         return .object(fields)
     }
 
-    public static func stamping(_ metadata: JSONValue?) -> JSONValue? {
-        var sources = PeerDataTaint.current?.checkpointSources ?? []
-        if ChatToolSessionContext.envelope?.surface.lowercased().replacingOccurrences(of: "_", with: "-") == "agent-bridge" {
-            let id = ChatToolSessionContext.envelope?.verifiedUserId
+    public static func stamping(_ metadata: JSONValue?, turn: Turn?) -> JSONValue? {
+        // No turn means no new attestation. Preserve existing provenance, including an unknown checkpoint.
+        guard let turn, turn.peerSteering != nil || turn.origin != nil || turn.envelope != nil else { return metadata }
+        var sources = turn.peerSteering?.checkpointSources ?? []
+        if turn.envelope?.surface == "agent-bridge" {
+            let id = turn.envelope?.verifiedUserId
             let peer = id.map { "peer:" + $0 } ?? "another agent"
             if (id == nil || !PeerDataTaint.ownerTrusts(peer)), !sources.contains(peer) { sources.append(peer) }
         }
@@ -97,9 +113,7 @@ public enum MemoryDataProvenance {
         surface == "studio_wander" ? "app" : peer ? "peer" : "user"
     }
 
-    /// Where a kept memory came from and when it became true, in the keys the
-    /// store lifts into `evidence_json`, `observed_at` and `valid_from`: the
-    /// exchange (session, message, turn), who spoke, and the supporting words.
+    /// Use the store's evidence and temporal keys so exchange, speaker and supporting words remain canonical.
     public static func sourceMetadata(sessionId: String?, messageId: String?, turnId: String?, at: Date,
                                       speaker: String, words: String?) -> [String: JSONValue] {
         var evidence: [String: JSONValue] = ["speaker": .string(speaker)]
@@ -112,11 +126,7 @@ public enum MemoryDataProvenance {
                 "valid_from": .string(at.ISO8601Format())]
     }
 
-    /// The turn a memory was kept in: turn, run and session ids, and the
-    /// transcript locator the recent_receipts strip renders (`history:` and the
-    /// id of the message that opened the turn) and when. Moments, standing
-    /// corrections and committed memories stamp it alike, so a correction knows
-    /// its miss — and a repeat that collapses into it keeps its own turn.
+    /// Stamp the exact kept turn and transcript locator across moments, corrections and committed memories so collapsed repeats retain their own origin.
     public static func turnMetadata(turnId: String?, origin: AfterTurnOrigin?) -> [String: JSONValue] {
         var meta: [String: JSONValue] = [:]
         if let turnId { meta["turn_id"] = .string(turnId) }
@@ -139,8 +149,7 @@ public enum MemoryDataProvenance {
         return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
-    /// Words only, single-spaced, lowercase: a copied span with a comma added
-    /// or a period dropped is still the same span.
+    /// Words only, single-spaced, lowercase: a copied span with a comma added or a period dropped is still the same span.
     static func wordFold(_ text: String) -> String {
         text.lowercased()
             .split { !$0.isLetter && !$0.isNumber }

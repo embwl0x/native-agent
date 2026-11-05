@@ -24,45 +24,42 @@ import ChromeControl
 import MemoryV2
 import StandingBots
 import TurnTrace
-// Blueprint: | `QuietSettings+Personality.swift` | QuietSettings dreams and name; name reads and writes require the loaded profile; dream controls require checked Trust |
+// Blueprint: | `QuietSettings+Personality.swift` | Profile-owned name and checked-Trust dream controls |
 
 extension QuietSettings {
     static let personalityRows: [QuietSetting] = {
         var rows: [QuietSetting] = []
-        // ── Personality / memories ──────────────────────────────────────────
         rows.append(defaultsBool(
             id: "personality.self_improvement", page: "settings",
             label: "Weekly self-improvement pass", key: "selfImprovementEnabled", defaultOn: true
-        ))
+        ).ownedByMind())
         rows.append(QuietSetting(
             id: "personality.dreams", page: "settings", label: "Dreams at night",
             kind: .boolean,
             note: "One switch over two policy gates (personalityPolicy.dream_cycle_enabled and "
                 + "trainingPolicy.dream_scheduler), which move together. The read-back is the "
                 + "composite, so it says whether dreams can actually run.",
-            requiresTrustPolicy: true,
             read: { appModel in .bool(try await appModel.dreamEnabled()) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Dreams at night")
                 guard await appModel.setDreamCycleEnabled(enabled) else {
                     throw QuietSettingError.unavailable(
                         appModel.dreamError ?? "The dream setting could not be saved.")
                 }
             }
-        ))
+        ).ownedByMind())
         rows.append(QuietSetting(
             id: "personality.rem_cycle", page: "settings",
             label: "Weekly dream consolidation", kind: .boolean,
-            requiresTrustPolicy: true,
-            read: { appModel in .bool(try loadedTrustPolicy(appModel, "Weekly dream consolidation").trainingPolicy?.rem_cycle_enabled ?? true) },
-            write: { appModel, value in
+            read: { host in .bool(try await readMindPolicy(host).trainingPolicy?.rem_cycle_enabled ?? true) },
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Weekly dream consolidation")
                 guard await appModel.setRemCycleEnabled(enabled) else {
                     throw QuietSettingError.unavailable(
                         appModel.dreamError ?? "The weekly consolidation setting could not be saved.")
                 }
             }
-        ))
+        ).ownedByMind())
         rows.append(QuietSetting(
             id: "personality.rem_approval_mode", page: "personality",
             label: "REM approval", kind: .text,
@@ -91,7 +88,7 @@ extension QuietSettings {
         kind: .text,
         note: "The name the app shows and the agent goes by. A generic label is refused.",
         read: { appModel in .string(try loadedPersonality(appModel).name) },
-        write: { appModel, value in
+        write: { appModel, value, context in
             _ = try loadedPersonality(appModel)
             let name = try stringValue(value, "Name")
             if let problem = await appModel.savePersonalityName(name) {
@@ -103,10 +100,14 @@ extension QuietSettings {
     @MainActor
     private static func loadedPersonality(_ host: any QuietSettingsHost) throws -> PersonalityProfile {
         if let problem = host.personalityError {
-            throw QuietSettingError.unavailable("Personality is unavailable: \(problem). Open Personality and repair its reported profile error before reading or changing the name.")
+            throw QuietSettingError.unavailable("""
+                Personality is unavailable: \(problem). Open Personality and repair its reported profile error before reading or changing the name.
+                """)
         }
         guard let profile = host.personality else {
-            throw QuietSettingError.unavailable("Personality is unavailable. Open Personality and repair its reported profile error before reading or changing the name.")
+            throw QuietSettingError.unavailable("""
+                Personality is unavailable. Open Personality and repair its reported profile error before reading or changing the name.
+                """)
         }
         return profile
     }

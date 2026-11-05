@@ -8,8 +8,7 @@ extension AgentWorkspaceNavigation {
         placeIdentity(place).map { "window:place:" + SHA256.hash(data: Data($0.utf8)).map { String(format: "%02x", $0) }.joined() }
     }
 
-    /// Title one recognized window set without exposing routing handles.
-    /// Ordering by resident identity keeps labels stable across recency changes.
+    /// Title one recognized window set without exposing routing handles. Ordering by resident identity keeps labels stable across recency changes.
     static func windowTitle(_ session: Session) -> [(place: AgentWorkspaceLocation, title: String)] {
         let places = recognizedPlaces(session)
         let displays = places.map { placeIdentity($0).flatMap { session.browserBookmarks[$0] } ?? $0 }
@@ -27,8 +26,7 @@ extension AgentWorkspaceNavigation {
         }
         return zip(places, titles).map { (place: $0.0, title: $0.1) }
     }
-    /// Explicitly selecting an app window brings that app forward through the
-    /// normal Mac owner. Refresh/Back/restoration remain observations only.
+    /// Explicitly selecting an app window brings that app forward through the normal Mac owner. Refresh/Back/restoration remain observations only.
     static func windowAction(_ place: AgentWorkspaceLocation) -> AgentWorkspaceAction {
         if case .browserBookmark(_, let title, let tabID) = place, let tabID {
             return .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tabID),
@@ -39,8 +37,7 @@ extension AgentWorkspaceNavigation {
         }
         return .open(place)
     }
-    /// The strip's selection for a window or place named exactly (any case).
-    /// Several same-named windows open none; the query falls through to Find.
+    /// Ambiguous window names must reach Find without selecting a window.
     func window(named query: String, key: String) -> AgentWorkspaceAction? {
         guard let session = sessions[key] else { return nil }
         let name = query.lowercased()
@@ -54,15 +51,13 @@ extension AgentWorkspaceNavigation {
         if let place = places.first { return .window(Self.windowAction(place.place)) }
         return AgentWorkspaceEnvironment.destinations.first { $0.title.lowercased() == name }.map { .open(.area($0.id)) }
     }
-    /// The windows this chat holds (drafts, the work she returns to, pages
-    /// she acted in), unfinished first: home's OPEN line.
+    /// Show unfinished windows first so work remains reachable from Home.
     func openWindowTitles(key: String) -> [String] {
         guard let session = sessions[key] else { return [] }
         return Self.windowTitle(session).map(\.title)
     }
 
-    /// Recognition uses only this chat's bounded resident references. Listing
-    /// does not read transcripts, acknowledge arrivals, or refresh owner state.
+    /// Recognition uses only this chat's bounded resident references. Listing does not read transcripts, acknowledge arrivals, or refresh owner state.
     func recognizedOpenPlaces(key: String) -> WorkspacePage {
         let session = sessions[key] ?? Session()
         let windows = Self.windowTitle(session)
@@ -97,7 +92,10 @@ extension AgentWorkspaceNavigation {
         }
         return .init(title: "Open places", content: .object([
             "status": .string("ok"), "groups": .array(counts),
-            "message": .string("Unfinished work first, then your return point and recent places. These are saved references; opening reads current evidence. Closing a place leaves its owner unchanged. Discarding a draft removes its entered work.")
+            "message": .string("""
+                Unfinished work first, then your return point and recent places. These are saved references; opening reads current evidence. Closing a \
+                place leaves its owner unchanged. Discarding a draft removes its entered work.
+                """)
         ]), items: items, actions: [])
     }
 

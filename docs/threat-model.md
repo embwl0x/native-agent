@@ -45,6 +45,18 @@ can obtain its bearer token; the peer descriptor contains only the URL.
   checks the approved record, tool, surface, exact input and prior execution.
 - **Corrupt authority treated as empty:** saved Trust policy and ApprovalInbox
   use checked reads. Missing state and unreadable/malformed state are distinct.
+- **Disabled Mac integration bypass:** each built-in tool schema declares its
+  integration and read/write axis. Approval, preview, execution and discovery
+  read that declaration against `MacIntegrationPermissionStore`; disabled
+  switches still refuse before a card. The separate hands gate resolves the
+  real target app. Saving a Mail attachment requires Mail Read, with the file
+  write governed by FileAccess.
+- **Missing actions reported as consent blocks:** shared turn and direct app
+  dispatch ask the door to refuse an unrecognized action before evaluating or
+  recording consent. Its refusal keeps the nearest real actions and discovery
+  call. Unknown batch entries reach that same door individually; catalog read
+  failures retain the checked failure path, and recognized actions keep their
+  existing consent decisions.
 - **Sensitive file access and protected-path mutations:** file tools deny
   sensitive credential, trust, pairing and token paths. File/Mac-control
   mutations retain the protected-system-path floor under Full Mac, enforced
@@ -97,10 +109,34 @@ Approvals live at `<dataRoot>/workflows/approvals/requests.json`.
 `ApprovalInbox` owns durable decisions; a visible card alone is not permission
 to execute. Executors still validate the requested action.
 
+The composed dispatcher carries the outer consent decision, bound to the exact
+tool, arguments, surface, turn and verified session, instead of evaluating and
+recording it again inside the app dispatcher. Changed calls refuse that binding;
+nested calls receive their own decision. Direct dispatch retains its own admission.
+The membrane refreshes hard blocks after a waiting card is answered, so approval
+cannot carry policy from before the wait into execution.
+TrustCenter owns the checked policy reader for authorization and synchronous saved
+flag consumers. MacControl retains that policy and reads `PermissionLaw.posture`,
+without a second posture model. Its one policy provider serves admitted snapshots
+and raw routes; raw routes still require their command and kill-switch checks.
+
 For admitted operator turns, Full Mac answers ordinary per-call approval
 requests. Explicit blocks and hard security checks remain effective.
 macOS privacy permission resets still ask the owner; a turn an untrusted agent
 started keeps its one card, as above.
+
+Switches over their own mind live in Settings and are theirs in both directions:
+cross-conversation recall, the knowledge graph, adaptive promotion, semantic
+memory, inner life and reflection, their hour, weekly self-improvement, dreams
+and REM, image understanding, PDF/DOCX reading preferences and context flow.
+`setting.set` needs neither a quoted request nor a Trust posture for these
+rows. Their saved fields stay in their existing owners; unreadable saved
+policy remains an error. Absent adaptive promotion defaults to enabled in
+both the runtime gate and the setting. DOCX attachments remain unsupported;
+the saved preference does not claim an ingestion path.
+Screen capture, cloud voice and image generation remain Trust controls with
+their existing grant rules. REM proposals still require approval before
+changing memory or growth; disclosure and the keep gate are unchanged.
 
 ## Secret Storage
 

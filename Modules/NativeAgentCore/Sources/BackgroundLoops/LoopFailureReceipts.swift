@@ -2,7 +2,8 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `LoopFailureReceipts.swift` | SwiftNativeLoopScheduler failure classification, coalesced durable receipts and result accounting |
+import Experiences
+// Blueprint: | `LoopFailureReceipts.swift` | Loop failure occurrence details, read-time incident folding, classification and result accounting |
 
 internal struct FailureReceiptIncident: Sendable {
     let loopId: String
@@ -33,30 +34,76 @@ internal struct FailureReceiptIncident: Sendable {
         ])
     }
 
-    func coalescing(_ next: FailureReceiptIncident) -> FailureReceiptIncident {
-        FailureReceiptIncident(
-            loopId: loopId,
-            error: error,
-            firstAt: firstAt,
-            lastAt: next.lastAt,
-            occurrences: occurrences + next.occurrences
-        )
+}
+
+/// Each occurrence keeps its own time. Incident identity joins only the same uninterrupted trailing failure streak.
+public enum LoopFailureReceipts {
+    public static let didWrite = Notification.Name("NativeAgent.loopFailureDidWrite")
+    public struct Occurrence: Sendable {
+        public let id: String
+        public let loopId: String
+        public let error: String
+        public let at: Date
     }
 
+    public struct Incident: Sendable {
+        public let id: String
+        public let loopId: String
+        public let error: String
+        public let dates: [Date]
+        public var firstAt: Date { dates[0] }
+        public var lastAt: Date { dates[dates.count - 1] }
+        public var row: JSONValue {
+            FailureReceiptIncident(loopId: loopId, error: error,
+                firstAt: NativeTimestampFormat.plainZulu(firstAt), lastAt: NativeTimestampFormat.plainZulu(lastAt),
+                occurrences: dates.count).toJSON(id: id)
+        }
+    }
+
+    /// No source means no recorded occurrences. Unreadable evidence throws; it is never an empty, clean history.
+    public static func occurrences(dataRoot: URL) async throws -> [Occurrence] {
+        try await ExperienceStore.at(dataRoot).details(.init(kinds: ["loop.failure"])).map { detail in
+            guard case .object(let row) = try JSONValue.parse(detail.row),
+                  let id = row["id"]?.stringValue, !id.isEmpty,
+                  let loopId = row["loopId"]?.stringValue, detail.subject == "loop:" + loopId,
+                  let error = row["error"]?.stringValue,
+                  row["kind"] == .string("background_loop.failure"), row["status"] == .string("failed"),
+                  row["occurrences"]?.exactIntegerValue == 1,
+                  let stamp = row["lastAt"]?.stringValue, let at = NativeTimestampFormat.parseISO8601(stamp),
+                  row["firstAt"] == .string(stamp), row["createdAt"] == .string(stamp) else {
+                throw PersistenceCoreError.ioFailure("Loop failure detail \(detail.seq) is unreadable; repair the record before judging loop health")
+            }
+            return Occurrence(id: id, loopId: loopId, error: error, at: at)
+        }
+    }
+
+    public static func incidents(dataRoot: URL, limit: Int? = nil) async throws -> [Incident] {
+        let occurrences = try await occurrences(dataRoot: dataRoot)
+        var order: [String] = [], byId: [String: [Occurrence]] = [:]
+        for occurrence in occurrences {
+            if byId[occurrence.id] == nil { order.append(occurrence.id) }
+            byId[occurrence.id, default: []].append(occurrence)
+        }
+        return try order.suffix(limit.map { max(0, $0) } ?? order.count).map { id in
+            let entries = byId[id]!
+            let first = entries[0]
+            guard entries.allSatisfy({ $0.loopId == first.loopId && $0.error == first.error }) else {
+                throw PersistenceCoreError.ioFailure("Loop failure incident \(id) has conflicting identities in the record")
+            }
+            return Incident(id: id, loopId: first.loopId, error: first.error, dates: entries.map(\.at).sorted())
+        }
+    }
 }
 
 
 extension SwiftNativeLoopScheduler {
 
-    /// Last written incident; coalescing rechecks these exact bytes against the locked feed tail.
+    /// Only incident identity is retained; occurrence evidence is owned by the record.
     internal struct LastFailureReceipt: Sendable {
-        let incident: FailureReceiptIncident
         let id: String
-        let bytes: Data
+        let loopId: String
+        let error: String
     }
-
-    /// Amortize the line cap so small appends do not read and rewrite the feed.
-    private static let failureReceiptTrimTriggerBytes = 1024 * 1024
 
     /// Offline errors mint no receipt, streak or push; plain timeouts remain failures.
     static func isOfflineError(_ error: String) -> Bool {
@@ -90,7 +137,7 @@ extension SwiftNativeLoopScheduler {
         return e.range(of: #"(server status|http) 5\d\d"#, options: .regularExpression) != nil
     }
 
-    /// Every error description names a cause, including errors with empty localized text.
+    /// Even an empty localized description must retain a named failure cause.
     package static func describeLoopError(_ error: any Error) -> String {
         let described = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         if !described.isEmpty { return described }
@@ -98,96 +145,43 @@ extension SwiftNativeLoopScheduler {
         return "\(type(of: error)) (\(ns.domain) code \(ns.code))"
     }
 
-    /// Coalescing uses the in-memory streak and last written row. Repeats
-    /// rewrite only the trailing line; new incidents use the shared capped
-    /// append, retaining one coalesced row per incident.
+    /// Write each occurrence once; readers fold an incident without rewriting its earlier evidence.
     internal func appendFailureReceipt(loopId: String, error: String) async {
-        guard let failureReceiptsPath else { return }
         guard !Self.isOfflineError(error) else { return }
         let trimmed = error.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedError = trimmed.isEmpty
             ? "unspecified failure (empty error description)"
             : String(trimmed.prefix(2_000))
-        let now = NativeTimestampFormat.plainZulu(clock())
+        let at = clock()
+        let now = NativeTimestampFormat.plainZulu(at)
         let incident = FailureReceiptIncident(
             loopId: loopId,
             error: boundedError,
             firstAt: now,
             lastAt: now
         )
-        // Coalesce only a matching last receipt while this loop is mid-streak.
+        // Coalesce only a matching trailing receipt while this loop is in the same failure streak.
         let coalesceTarget: LastFailureReceipt? = {
             guard (consecutiveFailures[loopId] ?? 0) > 0,
                   let last = lastFailureReceipt,
-                  last.incident.loopId == loopId,
-                  last.incident.error == boundedError else { return nil }
+                  last.loopId == loopId,
+                  last.error == boundedError else { return nil }
             return last
         }()
-        let path = failureReceiptsPath
+        let id = coalesceTarget?.id ?? UUID().uuidString.lowercased()
         do {
-            let written: LastFailureReceipt? = try await SwiftNativePersistenceCore.withFileLock(path) {
-                if let target = coalesceTarget {
-                    let merged = target.incident.coalescing(incident)
-                    let row = merged.toJSON(id: target.id)
-                    if let bytes = try? SwiftNativePersistenceCore.serializeJSONL([row]),
-                       Self.replaceTrailingLine(target.bytes, with: bytes, at: path) {
-                        return LastFailureReceipt(incident: merged, id: target.id, bytes: bytes)
-                    }
-                    // The tail is not ours any more (another process appended,
-                    // or the feed was trimmed): fall through and append.
-                }
-                let id = UUID().uuidString.lowercased()
-                let row = incident.toJSON(id: id)
-                try await appendJSONLCapped(
-                    row,
-                    to: path,
-                    maxLines: JSONLLineCaps.backgroundLoopFailures,
-                    logLabel: "BackgroundLoops.failures",
-                    trimWhenBytesExceed: Self.failureReceiptTrimTriggerBytes,
-                    durable: true
-                )
-                guard let bytes = try? SwiftNativePersistenceCore.serializeJSONL([row]) else { return nil }
-                return LastFailureReceipt(incident: incident, id: id, bytes: bytes)
-            }
-            lastFailureReceipt = written
+            try await ExperienceStore.at(dataRoot).note([
+                .init(source: "loops", at: at, subject: "loop:" + loopId, kind: "loop.failure", row: try incident.toJSON(id: id).serializedData(pretty: false))
+            ])
+            lastFailureReceipt = LastFailureReceipt(id: id, loopId: loopId, error: boundedError)
+            NotificationCenter.default.post(name: LoopFailureReceipts.didWrite, object: nil)
         } catch {
-            // The row may or may not have landed — forget the memo rather than
-            // coalescing the next failure into a line we cannot vouch for.
+            // An uncertain write invalidates the memo; never coalesce against bytes whose landing is unknown.
             lastFailureReceipt = nil
             FileHandle.standardError.write(Data(
                 "BackgroundLoops: failed to persist \(loopId) failure receipt: \(error)\n".utf8
             ))
         }
-    }
-
-    /// Rewrites ONLY the feed's trailing line, in place, and returns whether it
-    /// did. False means the tail is not the bytes we remember writing — another
-    /// process appended, or a trim moved the file — and the caller must append a
-    /// fresh row instead of clobbering someone else's receipt. The replacement
-    /// is written BEFORE the truncate so no interruption can leave the row
-    /// missing entirely. The caller holds the feed lock.
-    private static func replaceTrailingLine(
-        _ expected: Data, with replacement: Data, at path: URL
-    ) -> Bool {
-        guard !expected.isEmpty, !replacement.isEmpty else { return false }
-        guard let handle = try? FileHandle(forUpdating: path) else { return false }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd(), size >= UInt64(expected.count) else { return false }
-        let offset = size - UInt64(expected.count)
-        guard (try? handle.seek(toOffset: offset)) != nil,
-              let tail = try? handle.readToEnd(),
-              tail == expected else { return false }
-        do {
-            try handle.seek(toOffset: offset)
-            try handle.write(contentsOf: replacement)
-            try handle.truncate(atOffset: offset + UInt64(replacement.count))
-            // The append this replaces was fsync'd; the rewrite must not be the
-            // weak link.
-            try handle.synchronize()
-        } catch {
-            return false
-        }
-        return true
     }
 
     private func recordFailureOutcome(
@@ -210,9 +204,7 @@ extension SwiftNativeLoopScheduler {
         st.lastTickAt = now
         st.tickCount += 1
         st.lastResult = "failed"
-        if let reg = loops[loopId] {
-            st.nextTickAt = now.addingTimeInterval(reg.loop.interval)
-        }
+        st.nextTickAt = (loops[loopId]?.loop.wake.period).map { now.addingTimeInterval($0) }
         states[loopId] = st
         if advanceDurableRun {
             await recordDurableRun(loopId: loopId, at: now)
@@ -221,7 +213,7 @@ extension SwiftNativeLoopScheduler {
         await recordFailureOutcome(loopId: loopId, error: error)
     }
 
-    /// completedWork false preserves completion; cadence uses admitted start while work keeps its completion time.
+    /// Noncompleted work preserves completion; cadence uses admission time, while real work keeps its completion time.
     func recordResult(
         loopId: String, result: String, completedWork: Bool = true, startedAt: Date? = nil
     ) async {
@@ -235,9 +227,7 @@ extension SwiftNativeLoopScheduler {
         }
         st.lastTickAt = now
         st.tickCount += 1
-        if let reg = loops[loopId] {
-            st.nextTickAt = (startedAt ?? now).addingTimeInterval(reg.loop.interval)
-        }
+        st.nextTickAt = (loops[loopId]?.loop.wake.period).map { (startedAt ?? now).addingTimeInterval($0) }
         states[loopId] = st
         await recordDurableRun(loopId: loopId, at: startedAt ?? now)
         consecutiveFailures[loopId] = 0

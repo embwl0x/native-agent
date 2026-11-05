@@ -3,10 +3,9 @@ import CognitiveSubstrate
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MemoryV2+DueDateStamp.swift` | `MemoryDueDateStamp`: writer-named plan instants, shared horizon clock-relative labels and a date reader that excludes retired prose-extractor stamps |
+// Blueprint: | `MemoryV2+DueDateStamp.swift` | `MemoryDueDateStamp`: writer-named instants and horizon labels |
 
-/// The writer names a plan's instant; this boundary only labels and reads it.
-/// Memory prose is never evidence that something is planned for a moment.
+/// The writer names a plan's instant; this boundary only labels and reads it. Memory prose is never evidence that something is planned for a moment.
 public enum MemoryDueDateStamp {
     public static let dueAtKey = "due_at"
     public static let dueSourceKey = "due_source"
@@ -22,7 +21,7 @@ public enum MemoryDueDateStamp {
         return formatter.string(from: date)
     }
 
-    /// Retired prose-extractor stamps are not plans; leave stored rows intact.
+    /// Only writer-supplied instants establish a plan; unsupported stamps leave stored rows intact.
     public static func dueAt(in metadata: JSONValue?) -> Date? {
         guard case .object(let object)? = metadata,
               object[dueSourceKey] != .string("write_extractor_v1"),

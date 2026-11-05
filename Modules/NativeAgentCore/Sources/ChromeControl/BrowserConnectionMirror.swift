@@ -1,14 +1,20 @@
 import Foundation
 import os
 
-// Blueprint: | `BrowserConnectionMirror.swift` | `BrowserConnectionMirror`: last runtime-published Chrome connection state for synchronous home reads; nil remains unobserved |
+// Blueprint: | `BrowserConnectionMirror.swift` | `BrowserConnectionMirror`; Synchronous home reads; nil is unobserved. |
 
-/// The Chrome link's connection as the app's runtime last published it, so a
-/// reader (the agent's home screen) can say it without dispatching a tool.
-/// Nil until the runtime has said anything.
+/// Home reads the runtime's last publication without tool dispatch; nil means unobserved.
 public enum BrowserConnectionMirror {
     private static let value = OSAllocatedUnfairLock<Bool?>(initialState: nil)
 
-    public static func set(connected: Bool) { value.withLock { $0 = connected } }
+    public static let didChange = Notification.Name("NativeAgent.browserConnectionChanged")
+    public static func set(connected: Bool) {
+        let changed = value.withLock { previous in
+            guard previous != connected else { return false }
+            previous = connected
+            return true
+        }
+        if changed { NotificationCenter.default.post(name: didChange, object: nil) }
+    }
     public static var connected: Bool? { value.withLock { $0 } }
 }

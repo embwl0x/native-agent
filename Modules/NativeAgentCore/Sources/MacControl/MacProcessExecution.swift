@@ -17,7 +17,7 @@ import OSAKit
 import os
 #endif
 
-// Blueprint: | `MacProcessExecution.swift` | `ProcessExecution`, `ProcessRunResult`, `ProcessRunCancellation` and `ProcessRunIOFailure`: shared process launch, checked nonblocking stdin delivery and both capture streams, output-preserving cancellation/failure settlement, timeout escalation and spawn-owned process-group settlement; SSH and local callers use the same runner |
+// Blueprint: | `MacProcessExecution.swift` | `ProcessExecution`, `ProcessRunResult`, `ProcessRunCancellation`, `ProcessRunIOFailure`: Process lifecycle |
 
 public struct ProcessRunResult: Sendable, Equatable {
     public let exitCode: Int32
@@ -54,13 +54,15 @@ public struct ProcessRunCancellation: Error, Sendable, LocalizedError {
     public var errorDescription: String? { "Process cancelled after launch; captured output is retained in result." }
 }
 
-/// A launched process settled, but its protocol channels did not. Retain the
-/// real exit/output evidence; never turn an incomplete exchange into success.
+/// Retain real exit/output evidence when channels fail; incomplete exchange cannot establish success.
 public struct ProcessRunIOFailure: Error, Sendable, LocalizedError {
     public let result: ProcessRunResult
     public let channels: [String]
     public var errorDescription: String? {
-        "Subprocess exchange incomplete (\(channels.joined(separator: "; "))). Effects may have occurred; inspect the receiving system before repeating the command."
+        """
+            Subprocess exchange incomplete (\(channels.joined(separator: "; "))). Effects may have occurred; inspect the receiving system before repeating the \
+            command.
+            """
     }
 }
 
@@ -69,8 +71,7 @@ public final class ProcessExecution: Sendable {
 
     public init() {}
 
-    /// One nonblocking writer. Process settlement closes delivery even if a
-    /// descendant retains stdin without reading, so joining it cannot hang.
+    /// Close nonblocking stdin on settlement so descendants retaining the pipe cannot hang the join.
     private final class _InputDelivery: @unchecked Sendable {
         private let queue = DispatchQueue(label: "NativeAgent.process.stdin")
         private let handle: FileHandle
@@ -172,11 +173,7 @@ public final class ProcessExecution: Sendable {
         }
     }
 
-
-    /// Owns process-tree termination for timeout and parent Task cancellation.
-    /// Timeout gets a cooperative SIGTERM -> SIGKILL window; explicit user
-    /// cancellation SIGKILLs immediately so descendants cannot continue side
-    /// effects after cancellation has been acknowledged.
+    /// Timeout allows cooperative TERM then KILL; explicit cancellation kills immediately to stop descendant effects before acknowledgement.
     private final class _ProcessTermination: @unchecked Sendable {
         private let lock = NSLock()
         private let process: ManagedProcess
@@ -208,8 +205,7 @@ public final class ProcessExecution: Sendable {
                 let snapshot = process.groupSnapshot
                 if timedOut {
                     ProcessTreeReaper.signal(snapshot, signal: SIGTERM)
-                    // The established two-second TERM window ends on explicit
-                    // cancellation. Group failure never selects another signal path.
+                    // Explicit cancellation ends the TERM grace period; group failure cannot select another signal path.
                     if process.terminationError == nil {
                         _ = escalation.wait(timeout: .now() + .seconds(2))
                     }
@@ -247,9 +243,7 @@ public final class ProcessExecution: Sendable {
         var didTimeOut: Bool { lock.withLock { timeoutRequested } }
     }
 
-    /// Launch and cancellation share admission; cancellation before admission
-    /// cannot race a child into existence. The termination owner is attached
-    /// while that admission is held, before a cancellation can proceed.
+    /// Attach termination ownership under launch admission so cancellation cannot race a child into existence.
     private final class _ProcessLaunch: @unchecked Sendable {
         private let lock = NSLock()
         private var cancelled = false
@@ -313,11 +307,7 @@ public final class ProcessExecution: Sendable {
         )
     }
 
-    /// Shared event-driven subprocess seam for app and core callers that need
-    /// a working directory, an exact environment, or stdin. This remains the
-    /// same lifecycle owner as the instance entry point above: pipe
-    /// draining, cancellation, timeout escalation, and process-tree reaping
-    /// must not be reimplemented by each feature.
+    /// Share pipe draining, cancellation, timeout escalation and process-tree reaping across app and core callers.
     public func run(
         executable: String,
         arguments: [String],
@@ -328,7 +318,7 @@ public final class ProcessExecution: Sendable {
         outputByteLimit: Int? = nil,
         launchFailure: @Sendable (Error) -> Error = { MacControlError.ioFailure("Process.run() failed: \($0)") }
     ) async throws -> ProcessRunResult {
-        // Validate before launch, including Dispatch's nanosecond conversion.
+        // Validate before launch so invalid timeouts cannot overflow Dispatch’s nanosecond conversion.
         try Task.checkCancellation()
         let timeoutDeadline: DispatchTime?
         if let timeoutSeconds {

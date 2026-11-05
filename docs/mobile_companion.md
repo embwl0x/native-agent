@@ -9,25 +9,32 @@ brain. Agent's tool interface remains the single `app` tool:
 
 ## What the mobile app exposes
 
-The main tabs are **Chat**, **Activity**, **Desk**, **Settings**, and **More**.
-Settings opens with a System/Light/Dark switch; Places and the other settings
-remain on that page. Memories is behind More.
-More follows the phone's surface layout: Rooms holds Memories, Scheduler, Helpers, Agents,
-Desk tasks, Skills & Tools, Personality, Connectors and Trust; Setup opens Settings;
-Power user holds deeper views. Settings nests Telegram, Providers and Mac settings,
-including Mac Integration.
+The main tabs are **Chat**, **Today**, **Desk**, **Settings**, and **More**.
+A page the Mac publishes as a face (`faces.json`, read with every snapshot ping) is
+drawn by the shared `FaceView`: Today, the Desk, their home, Memories, Personality,
+Trust, Providers, Connectors, Capabilities, Helpers, Diagnostics and the Mac's settings
+under Settings. A row's link opens its place on the phone (a faced page or a
+saved run in the same stack; Chat, Today's queues, a card, the Desk or the browser
+through the shell), or says the place opens on the Mac; a row's action goes to the
+page's owner on the Mac as the signed `faceAction`, and its answer or refusal shows
+where the reader is, as the app's toast.
+Settings opens with a System/Light/Dark switch; this iPhone's own settings (appearance,
+connection, Places, senses, Live Activities) remain on that page beside the Mac's settings
+face. Memories is behind More; memory proposals are Today's "Memories to keep".
+More follows the phone's surface layout: Rooms holds their home, Memories, Scheduler, Helpers, Agents,
+Capabilities, Skills & Tools, Personality, Connectors and Trust; Setup opens Settings;
+Power user holds deeper views. Settings nests Telegram and Providers.
 More uses only the Mac's accepted layout. A missing or unreadable refresh retains
 that layout; an unreadable refresh reports its cause. Before the first usable delivery, More
 shows layout unavailable with connection recovery. The phone neither seeds nor
-repairs a Mac layout. Approvals, Inbox, memory proposals and Runs Log show an
-empty verdict only after their own snapshot has been read successfully; a late
-or missing first snapshot remains unavailable, with a reconnect/refresh remedy.
-Provider detail resolves its ID in the current shared provider catalog. An
-absent row has no credential or test controls, and a pairing change dismisses
-the detail instead of submitting against its captured provider.
-Mac settings shows a failed setting's read cause on that row while other
-settings remain available; [the settings projection contract](TOOL_LOADING.md)
-defines unavailable rows and required catalog failures.
+repairs a Mac layout. Approvals and notes are one Inbox, the Mac's Inbox face:
+Today's queues, approval and card links, notifications and a note's card in chat
+all open it, and its rows answer through the page's owner on the Mac (an
+approval with this phone's verified identity). Earlier's history opens on the
+Mac. Memory proposals show an empty verdict only after their own snapshot has
+been read successfully; a late or missing first snapshot remains unavailable,
+with a reconnect/refresh remedy.
+Providers carries no secret: adding a key or signing in raises the Mac's card.
 
 Self-Improvement points to the Mac; the phone has no training-proposal queue.
 Memory reviews and approval decisions remain on the phone, and Trust owns dream
@@ -40,9 +47,20 @@ and live bridge updates by row/run identity. Version checks read retained index
 rows without preparing conversation titles or navigation. Admitted live and phone replies
 share terminal and delta mutations; only visible replies produce UI effects.
 Snapshots and history use one concrete shared transport row, metadata and
-attachment values. Mac transcript metadata and phone projections use the shared
-checked `ChatMessageMetadata` codec. Its canonical tool keys are `tool_name`,
-`input`, `result_summary`, `result_status` and `approval_id`; retained Mac
+attachment values. In the snapshot's last 80 person-visible rows, each row also
+carries the Mac's reading of its seat, provenance, tool outcome, receipt or owed
+decision. Tool runs carry the presentation part's prepared headline on their
+first fold row and any prepared detail words on their rows. Missing or failed
+headline preparation leaves it absent for this snapshot and is retried on the
+next; an unchanged cached preparation failure is logged once. This additive
+face preserves older phones' tool events and interaction fields, and remains
+subject to the existing 2 MiB chat group budget. The phone draws its
+conversation from these rows, tool runs and asks included, through the same
+`TranscriptBuilder` as the Mac; a row without a face, and the phone's own sends
+and streaming reply, read plainly. Mac transcript metadata and
+phone projections use the shared checked `ChatMessageMetadata` codec. Its
+canonical tool keys are `tool_name`, `input`, `result_summary`, `result_status`
+and `approval_id`; retained Mac
 receipts with camel-case keys remain readable there until their records and
 writer move together. Invalid metadata makes that transcript read unavailable;
 unreadable origin/envelope values retain an explicit attribution gap.
@@ -55,8 +73,7 @@ retains that request for “Send now”. The saved form requires that request an
 the delivery flags; expiry-only historical decoding is removed. Queue entries
 require their acceptance pairing and explicit replacement-intent flag; optional
 envelopes, placeholders and assistant replacement IDs represent actual unsent
-or ordinary-message states. Pending Desk notes require their acceptance pairing
-and explicit rejection flag. Present unreadable saved values stay unavailable
+or ordinary-message states. Present unreadable saved values stay unavailable
 and byte-preserved: neither new sends, shared-item imports nor later persistence
 may replace a failed chat owner. Missing values are first use, not a failed read.
 It does not cache settled transcripts.
@@ -78,8 +95,6 @@ nonreceipt. A failed Stop wait says it is unconfirmed; late replies still land.
 Closing a pinned tab submits unpin once. An unconfirmed wait stays visible as
 uncertain while the retained action and published navigation remain authoritative;
 it never automatically submits a second unpin.
-Desk Add Note clears and dismisses only after its pending note has checkpointed.
-Missing pairing or unavailable storage refuses acceptance and retains the draft.
 Returned Steers keep their original run identity. The Mac's locked transcript
 append admits exactly one matching session/run/content user row for resident
 and helper chat; it reuses that row's origin instead of appending it again.
@@ -104,11 +119,8 @@ the abilities are gone.
 
 Guidance rows show their current name, description and built-in source, plus a
 body revision when supplied. Skills has no executable lifecycle filters,
-run counts or restore controls. Personality projects the saved identity and
-live traits; instructions belong to the canonical persona documents, rather
-than parallel profile essence/voice/directive/style fields.
-Invalid received traits show the raw value as unavailable, without a replacement
-percentage or bar. The canonical Mac profile owner rejects nonfinite values and
+run counts or restore controls.
+The canonical Mac profile owner rejects nonfinite values and
 values outside 0...1. Memory's account remedy reads the bridge's checked account
 failure; it does not run a second account query. Mac Memory/graph diagnostics
 call an optional diagnostic account probe; when disabled they say the account
@@ -125,9 +137,9 @@ unpaired phone asks to pair. Agent snippets stay in Chat, from the same
 tapping opens the contact conversation in a sheet.
 
 Settings shows the release version without the internal `-dev.<revision>.dirty`
-suffix. The full Mac version and recent push receipts live in More → Power user
-→ Status. Runs Log rows and Workshop tasks show bounded readable request summaries;
-raw prompts/requests remain behind disclosures in detail. Turn Inspector reads
+suffix. More → Power user → Diagnostics draws the Mac's diagnostics face, then this
+iPhone's recent push receipts, unverified Mac records and connection. A run row opens
+its saved detail, whose raw prompts/requests remain behind disclosures. Turn Inspector reads
 only timing/count summaries and carries no prompts.
 The [Share extension](ios-sharing.md) adds items from other apps to Chat.
 Native Shortcuts offer Ask, Remember, Approve, Status, Quick Ask and Talk; see
@@ -647,10 +659,8 @@ The shared sync banner is presentation only; overlapping actions never recover
 their error from it. Signature verification keeps its bounded wait/recovery path,
 and canonical readbacks precede rejection presentation.
 
-Owner-waiting Desk notifications seed their baseline only when
-`notify/needs_user_edge.json` is absent. An unreadable or invalid existing store
-reports unavailability, preserves its bytes and leaves the edge pending for a
-later evaluation after repair.
+A Desk item that waits on them is an ask addressed to them (`needs_user:<handle>:<digest>`), told once with their
+doors; when the item stops waiting or its question changes, its owner settles that ask.
 
 The text coalescer accumulates deltas and emits full-text replacements; final answers take precedence.
 The first nonempty delta is eligible immediately; later snapshots retain the
@@ -681,7 +691,7 @@ remain measurable limits, not a delivery guarantee.
 
 The Mac records payload-free `phone.pickup` (signed-envelope send time, Mac
 forwarder arrival and correlation) and `phone.deltaAccepted` (sequence accepted
-by CloudKit) in `turn_traces/<day>.jsonl`. The phone logs `[phone-pipe]` with the
+by CloudKit) as details in the record. The phone logs `[phone-pipe]` with the
 same correlation/sequence and write/receive times. These distinguish pickup,
 provider time and delivery for a real exchange; missing evidence remains
 unmeasured. Cross-device differences depend on clock alignment; envelopes
@@ -739,12 +749,23 @@ path; text deltas never schedule the Drive retry-nudge plan.
 
 The phone sends signed `NativeAgentShared.InboxAction` envelopes and waits for Mac responses.
 Current action payloads use `sessionId`, `runId`, `eventId`, `direction`,
-`deviceId`, `bundleId` and `executionId` where those fields apply. Workshop
-submission is `submitWorkshopTask`; selection names the `workshop` surface.
+`deviceId` and `bundleId` where those fields apply. A Desk task is
+`submitDeskTask`, which starts a line of theirs that carries it ([Desk](DESK.md)).
 Memory, approval and inbox actions name `memoryId`, `approvalId`, `itemId` and
 `actionId` respectively. Dispatch does not translate older action/key spellings
 or substitute another object's ID. Notification receipts require their explicit
 direction; Stop refuses unsupported payload fields before resolving any target.
+
+`faceAction` sends `{page, row, action, value?}` in that same signed envelope.
+The Mac passes the exact page and row ids, action id and optional string value
+through `DeviceSyncHost` to `engine.pages.act`; the page's owner answers it.
+A successful answer returns `status:ok`, `ok:true` and its words as `message`
+when it has any. A part refusal returns `status:error`, `ok:false` and the
+owner's `code` and `message`; a page without an action owner says it has
+"nothing a row can do". Missing or empty page, row or action fields are refused
+before dispatch. Buttons submit their action id; controls submit `action:set`,
+with `value:on` or `off` for a toggle, or the selected option id for a choice.
+Phones before faces never send this action.
 
 `MobileHelperEdit.fastIsSet` is a required Boolean in edits and receipts.
 The current phone writes true only when its pinned Fast control was submitted;
@@ -816,8 +837,7 @@ apply. Requests use CloudKit, one at a time, and expire after
 its wait; it does not prove the request was undelivered or undo a phone action.
 
 The Mac publishes separate snapshots for sessions, trust/providers, approvals,
-memory, skills, tools and other mobile views. Workshop rows cross the snapshot
-boundary as shared typed values; the Mac computes their approval state.
+memory, skills, tools and other mobile views.
 Each snapshot uses one whole-document decoder. Malformed rows, oversized data or
 failed acquisition report their exact source in snapshot health and retain the
 previous accepted data as unavailable; no survivor list becomes the snapshot.
@@ -826,7 +846,29 @@ For a damaged projection, ask the agent on the Mac to run
 `app {"action":"doctor.repair","args":{"check_id":"icloud_bridge_state"}}`.
 That existing repair reaches `MacSyncEngine.repairPhoneSync`, rebuilds and republishes
 phone views, and requires a later healthy reading to prove recovery.
-An oversized outgoing group fails that group without shedding files. Unreadable
+Each Mac snapshot publication pass also reads `engine.pages.snapshots` on the main
+actor and stages `faces.json`: a dictionary from page id to the shared
+`PartFaceSnapshot`, retaining its source epoch, availability, face, error and
+owed state. No second page model or epoch is kept by sync. An empty owner read
+stays an empty dictionary; it says nothing about removal or readiness.
+Failed or unavailable faces retain the owner's status and error.
+The file publishes alone in the `faces` group, CloudKit status
+`mobile_snapshot_faces_v1`. The Mac never names this group in the KVS ping:
+phones before faces ignore the new group and keep reading the existing files
+with their existing shapes. Phones that support faces fetch that group with
+each ping and observe its record.
+
+The off-main `MobileSnapshotBuilder` admits whole faces in page-id order against
+the shared codec's 800 KiB status and 8 MiB uncompressed envelope limits. A face
+that would exceed either bound is left out of `faces.json`; its page id and
+budget reason are named under `faces` in `icloud/snapshot_skips.json` and
+`snapshot_staleness.json`. The bounded file still publishes, including `{}`
+when every candidate is omitted. Omission never means the page was removed.
+A later pass with no omissions clears that skip; an encoding, write or
+publication failure retains its own cause through the same skip accounting.
+
+An oversized outgoing group fails that group without shedding files; faces
+are bounded individually before the group is published, as described above. Unreadable
 staleness bookkeeping stays preserved and unavailable. Chat replies use the
 bridge/transcript owners across lifecycle changes without a per-chat transport
 nudge or transcript backstop read.
@@ -851,7 +893,7 @@ source until physical completion, even after their caller stops waiting.
 lightweight and targeted readers share each snapshot's owner. The unreachable
 full-refresh branch and its exclusive bundle/loader and delivery flags are removed.
 Activity publishes Inbox and work overview
-once through the Inbox owner before queuing Workshop/Memory reads; push recovery records
+once through the Inbox owner before queuing Memory reads; push recovery records
 Inbox acceptance immediately. A narrow read cannot retire another snapshot's pending
 read. Every Trust reader (lightweight, Settings, provider controls and direct Trust)
 uses `trustRead`; confirmed Trust receipts and pairing invalidation publish through
@@ -886,6 +928,20 @@ Ordinary notifications use the keyless `NANotification.visible` CloudKit query
 subscription, with title/body built from the record even when iOS cannot run
 the app. No Apple developer account or provider key is required on the person's
 Mac. Their signed records are acknowledged without a second local alert.
+Every unpinned matter for them reaches their phone, its originating Telegram or
+Slack thread when present, and the Mac only while they are at it. Importance
+governs quiet-hours holding, not destination choice. The router retains a due
+informational notice or approval through quiet hours and releases it when they
+end; adverse notices bypass that hold. Delivery readouts name each destination,
+so a Mac banner or thread acceptance never proves phone receipt. Explicit
+phone-pinned calls still go only to the phone.
+Recovered interaction cards use that same phone-pinned ledger path. Approval
+alerts keep the chat-tool or live ACP origin, so Slack receives them in the
+asking thread. In Telegram the thread door is the filer's single approval
+prompt, settled from its saved per-chat receipt. The prompt in an asking
+Telegram turn goes immediately because they are already talking to them; its
+phone alert still follows the router's quiet-hours policy. A failed approval
+inbox-card write owes repair without withholding the approval's alert.
 The visible subscription requires the already-indexed `direction == mac2ios`,
 excluding presence records, which have no direction or alert envelope.
 Pairing/access pages and notification readiness use checked pairing authority:
@@ -953,6 +1009,6 @@ notice sticky. Severity defaults are 3/5/8/3 seconds.
 | iOS chat and share import | `iOS/NativeAgentMobile/Sources/ChatStore+*.swift` |
 | Voice-note capture and recognition | `VoiceInputController.swift`, `MobileSpeechAnalyzer.swift`, `ComposerVoiceMicrophone.swift` in iOS Sources |
 | Hands-free talk and voice | `TalkModeController.swift`, `MobileTalkAudio.swift`, `TalkModeView.swift`, `ChatStore+ReplyObservation.swift`; `LiveActivityShared/PhoneTalkAttributes.swift`, `LiveActivity/PhoneTalkWidget.swift`, `ControlSupport/MobileTalkRoute.swift` under iOS; `MultimodalTTS/MultimodalTTS+VoiceSelection.swift` owns Mac voice identity |
-| Shared voice-note presentation | `Modules/NativeAgentShared/Sources/NativeAgentShared/VoiceNoteBubble.swift`; phone `ChatBubbleViews.swift`, Mac `MessageBubble.swift` |
+| Shared voice-note presentation | `Modules/NativeAgentShared/Sources/NativeAgentShared/VoiceNoteBubble.swift`; phone `MobileTranscriptAttachments.swift`, Mac `MessageBubble.swift` |
 | Phone senses, setup and preferences | `iOS/NativeAgentMobile/Sources/PhonePlaces.swift`, `PhoneSenses.swift`, `PhoneBodyReadings.swift`; shared `PhonePlaceEvent.swift`, `PhoneSenseEvent.swift`; `AppToolRuntime/PhoneSensesGuide.swift` reads setup and exact steps on the pairing page |
 | Mac person presence and evidence | `MacControl/PersonPresence.swift`; `PersistenceCore/PhoneSenseHistory.swift`, `PhonePlaceHistory` in `PersistenceCore.swift`; admission in `DeviceSync/ICloudReceiving.swift` |

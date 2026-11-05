@@ -6,13 +6,12 @@ import MultimodalTTS
 import ScreenVision
 import UniformTypeIdentifiers
 
-// Blueprint: | `ChatClipboardAndAttachmentSupport.swift` | `ChatAttachmentTypeResolver` and `ChatClipboard`: shared dictation preparation, screenshot submission/reconciliation, drop/paste/picker intake and off-main image conversion |
+// Blueprint: | `ChatClipboardAndAttachmentSupport.swift` | `ChatAttachmentTypeResolver`, `ChatClipboard`: Shared intake; fenced dictation |
 
 extension NativeAgentShared.ChatAttachmentTypeResolver {
     static let attachmentContentTypes: [UTType] = [.fileURL, .image]
 
-    /// Surfaces keep their session/lifetime fence and publish the draft only
-    /// after permission returns to that same composer.
+    /// Fence permission returns to the originating composer before publishing its draft.
     @MainActor
     static func beginDictation(
         _ input: VoiceInputCapture, draft: ChatComposerDraft, isCurrent: () -> Bool,
@@ -59,7 +58,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
         }
     }
 
-    /// Mac turn admission stays with the caller's existing session route.
+    /// Keep turn admission on the caller's existing session route.
     @MainActor
     static func sendScreenshot(
         _ draft: ScreenshotDraft, canSubmit: () -> Bool,
@@ -78,7 +77,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
             let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "Look at this screenshot and tell me what you see." : draft.text
             switch await submit(prompt, draft.attachments + [attachment]) {
-            case .accepted(let sessionID), .queued(let sessionID, _): accepted(sessionID)
+            case .accepted(let sessionID): accepted(sessionID)
             case .rejected(let message): showToast(message)
             }
         } catch let error as NativeScreenCapture.CaptureError {
@@ -111,7 +110,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
         return true
     }
 
-    /// Each surface captures its destination before asynchronous intake starts.
+    /// Capture destinations before asynchronous intake so selection changes cannot redirect attachments.
     @MainActor
     static func attachFromClipboardOrPickFile(
         appendImage: @escaping @MainActor (MultimodalAttachment) -> Void,
@@ -149,7 +148,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
     @MainActor
     static func clipboardAttachmentProviders() -> [NSItemProvider] {
         (NSPasteboard.general.pasteboardItems ?? []).compactMap { item -> NSItemProvider? in
-            // Prefer the original file over its thumbnail representation.
+            // Prefer the original file so a thumbnail cannot replace the attachment.
             if let value = item.string(forType: .fileURL), let url = URL(string: value), url.isFileURL {
                 return NSItemProvider(item: url as NSURL, typeIdentifier: UTType.fileURL.identifier)
             }
@@ -159,8 +158,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
         }
     }
 
-    /// Drop, paste and the + button feed the same image decoder and local-file
-    /// intake. One representation per item prevents attaching Finder previews.
+    /// Decode one representation per item across drop, paste and picker so Finder previews cannot duplicate attachments.
     @MainActor
     static func attachProviders(
         _ providers: [NSItemProvider],
@@ -182,7 +180,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
                 }
             } else if let type = imageType(in: provider.registeredTypeIdentifiers) {
                 provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
-                    // Decoding TIFF and other image formats stays off the UI actor.
+                    // Keep image conversion off the UI actor to avoid blocking interaction.
                     Task.detached(priority: .utility) {
                         let result = imageAttachment(data, typeIdentifier: type)
                         await MainActor.run {
@@ -214,7 +212,7 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
         return panel.urls
     }
 
-    /// Capture the destination before metadata reads and conversion suspend.
+    /// Capture the destination before metadata and conversion suspend.
     @MainActor
     static func attachLocalFile(
         _ url: URL,

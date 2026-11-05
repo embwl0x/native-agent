@@ -4,18 +4,14 @@ import PersistenceCore
 import TurnTrace
 import NativeAgentShared
 
-// Blueprint: | `ToolNameAliases.swift` | `ToolNameAliases`: current internal-tool/action argument and schema projection owner across Trust, dispatch and receipts; pure prose folding memoized by exact input bytes under a lock, bounded to 4096 entries |
+// Blueprint: | `ToolNameAliases.swift` | `ToolNameAliases`: one public argument/schema projection |
 
 // MARK: - Tool-name aliases
 
-/// Current internal tool IDs and public app actions share one explicit binding map.
-///
-/// Spelling and argument translation grants no model visibility or catalog entries.
-/// `ProviderToolNameMap` owns provider-safe wire names at ingress.
+/// Internal IDs and public actions share one explicit binding map; translation grants no visibility or catalog membership. Provider ingress owns wire-safe
+/// names.
 public enum ToolNameAliases {
-    /// Internal tool name → app action id. Actions re-enter the named executor's gates.
-    /// Direct model calls run nothing and receive `foldedToolHint`.
-    /// Duplicate names log and keep their first entry without trapping.
+    /// Folded calls re-enter their executor's gates; direct model calls receive only a hint. Duplicate names log instead of trapping.
     public static let foldedTools: [String: String] = {
         var out: [String: String] = [:]
         for (tool, id) in foldedEntries.map({ ($0.key, $0.value) })
@@ -39,7 +35,6 @@ public enum ToolNameAliases {
         "desk_archive": "desk.archive", "desk_blocked_on": "desk.blocked_on", "desk_breakdown": "desk.breakdown",
         "desk_defer": "desk.defer", "desk_nag_control": "desk.nag", "desk_open_pursuit": "desk.open_pursuit",
         "desk_work_log": "desk.work_log", "task_ledger_post": "ledger.post", "task_ledger_list": "ledger.list",
-        "workshop_submit": "workshop.submit", "workshop_status": "workshop.status",
         "scheduler_list_jobs": "schedule.list", "scheduler_create_job": "schedule.create",
         "scheduler_update_job": "schedule.update", "scheduler_pause_job": "schedule.pause",
         "scheduler_resume_job": "schedule.resume", "scheduler_cancel_job": "schedule.cancel",
@@ -58,8 +53,6 @@ public enum ToolNameAliases {
         "studio_canon_resolve": "studio.canon_resolve", "dream_diary_read": "mind.dream_diary",
         "agent_contacts": "agent.contacts", "agent_message": "agent.message", "agent_read": "agent.read",
         "agent_connect": "agent.connect", "agent_cancel": "agent.cancel", "delegation_status": "agent.jobs",
-        "agent_swarm": "agent.swarm",
-        "codex_message": "codex.message", "invoke_codex": "codex.invoke", "omp_message": "omp.message",
         "mail_list_recent": "mail.recent", "mail_read_batch": "mail.read", "mail_search": "mail.search", "mail_senders": "mail.senders",
         "mail_save_attachment": "mail.save_attachment",
         "mail_triage_batch": "mail.triage", "mail_mark_read": "mail.mark_read", "mail_archive": "mail.archive",
@@ -79,7 +72,8 @@ public enum ToolNameAliases {
         "mac_notify": "notify.mac", "mobile_notify": "notify.phone", "phone_request": "phone.request",
         "image_generate": "image.generate",
         "read_file": "files.read", "list_dir": "files.list", "file_info": "files.info", "file_excerpt": "files.excerpt", "grep": "files.grep",
-        "write_file": "files.write", "move_file": "files.move", "copy_file": "files.copy", "trash_file": "files.trash", "apply_patch": "files.patch", "mac_spotlight_search": "files.spotlight",
+        "write_file": "files.write", "move_file": "files.move", "copy_file": "files.copy", "trash_file": "files.trash", "apply_patch": "files.patch",
+            "mac_spotlight_search": "files.spotlight",
         "shell": "shell.run", "bash": "shell.bash", "git": "git.run", "git_status": "git.status",
         "git_diff": "git.diff", "git_log": "git.log", "repo_dirty_summary": "git.summary",
         "swift_build": "swift.build", "swift_test": "swift.test",
@@ -105,9 +99,7 @@ public enum ToolNameAliases {
         "artifact_find": "artifact.find", "work_context": "work.context",
     ]
 
-    /// A folded tool's arguments the door names otherwise, tool → its own
-    /// name → the door's: one name per concept across `app` (limit is how
-    /// many, path is where, agent is who).
+    /// Rename only declared folded arguments so each concept keeps one name across app calls.
     public static let doorArgNames: [String: [String: String]] = [
         "list_dir": ["max_entries": "limit"], "grep": ["max_results": "limit"], "file_excerpt": ["max_lines": "limit"],
         "git_status": ["cwd": "path"], "git_log": ["cwd": "path"], "git_diff": ["cwd": "path", "path": "file"],
@@ -115,18 +107,15 @@ public enum ToolNameAliases {
         "agent_connect": ["name": "agent"],
     ]
 
-    /// A folded tool's input with its arguments by the door's names.
     public static func doorArgs(_ tool: String, _ input: [String: JSONValue], reportShim: Bool = false) -> [String: JSONValue] {
         renamed(input, doorArgNames[tool] ?? [:], reportShim: reportShim)
     }
 
-    /// Door args with the folded tool's own names.
     public static func hostArgs(_ tool: String, _ args: [String: JSONValue], reportShim: Bool = false) -> [String: JSONValue] {
         renamed(args, Dictionary(uniqueKeysWithValues: (doorArgNames[tool] ?? [:]).map { ($0.value, $0.key) }), reportShim: reportShim)
     }
 
-    /// Project the current executor schema, including its root form constraints.
-    /// Argument names change only at this object level, never inside its data.
+    /// Project the current executor schema, including its root form constraints. Argument names change only at this object level, never inside its data.
     public static func doorSchema(_ tool: String, _ schema: JSONValue) -> JSONValue {
         guard case .object(var fields) = schema else { return schema }
         let names = doorArgNames[tool] ?? [:]
@@ -177,45 +166,41 @@ public enum ToolNameAliases {
             } else if fields[key] != .null || result[name] == nil { result[name] = fields[key] }
         }
         if reportShim, result != fields {
-            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T05"), "site": .string("ToolNameAliases.swift:renamed")]))
+            // Pure name normalization holds no turn; this diagnostic uses trace-only correlation.
+            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T05"), "site": .string("ToolNameAliases.swift:renamed")]),
+                turn: nil)
         }
         return result
     }
 
-    /// Chrome's verbs on her own tab: `browser.chrome_<verb>` is `chrome.<verb>`.
+    /// Browser action translation stays tied to the explicit Chrome verb map.
     public static let chromeVerbs = ["close_tab", "navigate", "snapshot", "look", "click", "fill", "type", "select",
                               "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "media", "reload_extension"]
 
-    /// A tool she wrote, active in her registry, as the action that runs it:
-    /// `authored.<id>`, generated from the registry.
+    /// Only active authored registry entries produce runnable actions.
     public static func authoredAction(_ tool: String) -> String { "authored." + tool }
 
-    /// `authored.<id>` back to the tool's own id, its case kept.
+    /// Authored action decoding must preserve the registered ID's case.
     public static func authoredTool(_ id: String) -> String? {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.lowercased().hasPrefix("authored."), trimmed.count > 9 else { return nil }
         return String(trimmed.dropFirst(9))
     }
 
-    /// The action a folded tool is: its registry id.
     public static func appAction(_ tool: String) -> String? { foldedTools[tool] }
 
-    /// Policy lookup also resolves app-executor routes without making them folded tools.
+    /// Policy lookup resolves executor routes without granting folded-tool status.
     public static func appAction(_ tool: String, input: [String: JSONValue]) -> String? {
         let tool = canonical(tool)
         if let id = appAction(tool) { return id }
         return AppActionBinding.actionID(tool: tool, input: input)
     }
 
-    /// An action that only passes the call on to the tool it folds.
     public static func isFoldedAction(_ id: String) -> Bool {
         AppActionBinding.declaredBinding(id)?.folded == true
     }
 
-    /// The tool a call ran: an `app` call of a folded action is that tool,
-    /// and a home name that messages someone (`claude.say`), as item or
-    /// given as an action (the door opens it as the item), is agent_message,
-    /// so its send is held, owed and counted like one.
+    /// Home-message and folded app calls must retain the underlying tool identity so send holds, debts and accounting share one owner.
     public static func ranTool(_ name: String, input: [String: JSONValue]) -> String {
         ranCall(name, input: input).tool
     }
@@ -234,20 +219,18 @@ public enum ToolNameAliases {
         return (binding.tool, binding.arguments(args))
     }
 
-    /// The tools a call runs: each entry's of an `app {actions}` list, else its one.
+    /// Batch app calls expose every underlying tool for policy and accounting.
     public static func ranTools(_ name: String, input: [String: JSONValue]) -> [String] {
         guard name == "app", case .array(let entries)? = input["actions"], !entries.isEmpty else { return [ranTool(name, input: input)] }
         return entries.flatMap { if case .object(let call) = $0 { ranTools(name, input: call) } else { [name] } }
     }
 
-    /// The input a call ran with: a folded `app` action's args, by the tool's own names.
+    /// Receipts project folded arguments back to the executor's own names.
     public static func ranInput(_ name: String, input: [String: JSONValue]) -> [String: JSONValue] {
         ranCall(name, input: input).input
     }
 
-    /// A call as a person is shown it: a folded `app` action as the tool it
-    /// runs, any other `app` action by its id, each with its own args; a
-    /// page read and every other tool as they are.
+    /// Display folded actions by their executed tool identity while retaining each call's own arguments.
     public static func shown(_ name: String, input: JSONValue) -> (name: String, input: JSONValue) {
         guard name == "app", case .object(let fields) = input, case .string(let raw)? = fields["action"] else {
             return (name, input)
@@ -259,7 +242,6 @@ public enum ToolNameAliases {
         return (ran == name ? action : ran, fields["args"] ?? .object([:]))
     }
 
-    /// `shown` over a call's recorded input JSON.
     public static func shown(_ name: String, inputJSON: String?) -> (name: String, inputJSON: String?) {
         guard name == "app", let inputJSON, let value = try? JSONValue.parse(Data(inputJSON.utf8)) else {
             return (name, inputJSON)
@@ -269,7 +251,7 @@ public enum ToolNameAliases {
         return (call.name, (try? call.input.serialize(pretty: false)) ?? inputJSON)
     }
 
-    /// A current internal executor's call, presented through its app action.
+    /// Present internal executor calls through their declared public action.
     public static func appCall(_ name: String, input: [String: JSONValue]) -> [String: JSONValue]? {
         let args = input.filter { !$0.key.hasPrefix("__") }
         guard let id = appAction(name) else { return nil }
@@ -282,8 +264,7 @@ public enum ToolNameAliases {
         return "Use app " + String(decoding: data, as: UTF8.self) + " — {} is your home and every page."
     }
 
-    /// Text that names folded tools, with each name as its action id: a
-    /// folded tool's own description, read through the door.
+    /// Fold tool names in their own descriptions so discovery agrees with the public call surface.
     private static let proseLock = NSLock()
     nonisolated(unsafe) private static var proseByText: [Data: String] = [:]
 
@@ -308,17 +289,14 @@ public enum ToolNameAliases {
         return out
     }
 
-    /// Where a result names its next call: a pointer key, or the called
-    /// tool's own name (`shelf_entry: {tool: "shelf_entry", id}`).
+    /// Rewrite only declared next-call pointers, never arbitrary payload fields.
     static func isPointerKey(_ key: String) -> Bool {
         ["read_more", "next_call", "read_with", "read_context", "reply_with", "inspect_receipt", "read_locator",
          "parent_read", "next_read", "blocking_items", "read", "open_current_file"].contains(key)
             || key.hasSuffix("_invitation") || foldedTools[key] != nil
     }
 
-    /// Each next call a result names by a folded tool, under a pointer key,
-    /// as that tool's app call. Everything else is left as it is. Any tool's
-    /// result reaches her this way (`work_context` points at `desk_read`).
+    /// Next-call pointers must present folded tools as public app calls without rewriting unrelated result data.
     public static func appCallPointers(_ value: JSONValue) -> JSONValue {
         switch value {
         case .array(let items): return .array(items.map(appCallPointers))
@@ -330,8 +308,7 @@ public enum ToolNameAliases {
         }
     }
 
-    /// `{tool: <folded>, …}` → `{tool: "app", input: {action, args}}`; a
-    /// sentence beside the call (an invitation's message) stays beside it.
+    /// Preserve invitation prose beside the translated call.
     public static func appPointer(_ value: JSONValue) -> JSONValue {
         if case .array(let items) = value { return .array(items.map(appPointer)) }
         guard case .object(let fields) = value, case .string(let tool)? = fields["tool"],
@@ -343,12 +320,11 @@ public enum ToolNameAliases {
         return .object(prose.merging(["tool": .string("app"), "input": .object(call)]) { _, new in new })
     }
 
-    /// A result's own sentences, never what it read or saved.
+    /// Fold only the result's own sentences, never retrieved or saved content.
     public static let foldedProseKeys = ["detail", "message", "note", "hint", "instruction", "error", "reason", "fix",
                                          "content_note", "next_turn_note", "recovery_hint"]
 
-    /// A name that reads as a word (git, shell, screen, act) is left alone in
-    /// prose unless it is in backticks (`screen`).
+    /// Ordinary words remain prose unless explicitly backticked as tool names.
     private static let foldedNamePattern = try? NSRegularExpression(
         pattern: "(?<![A-Za-z0-9_./])(" + foldedTools.keys.filter { $0.contains("_") || $0.contains(".") }
             .sorted { $0.count > $1.count }.map(NSRegularExpression.escapedPattern).joined(separator: "|")
@@ -356,16 +332,14 @@ public enum ToolNameAliases {
             + "|(?<=`)(" + foldedTools.keys.filter { !$0.contains("_") && !$0.contains(".") }
             .sorted().map(NSRegularExpression.escapedPattern).joined(separator: "|") + ")(?=`)")
 
-    /// Whitespace normalization only. Unknown or retired IDs stay unknown.
+    /// Normalize whitespace only; unknown IDs must stay unknown.
     public static func canonical(_ name: String) -> String {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
 }
 
-/// One turn's tool events as a person is shown them (`ToolNameAliases.shown`).
-/// A result carries no input, so it takes the name its call was shown by:
-/// results arrive in the order their calls did, per name.
+/// Result events lack input, so inherit their displayed name from calls in per-name arrival order.
 public final class ShownToolNames: @unchecked Sendable {
     private let lock = NSLock()
     private var pending: [String: [(name: String, seq: Int)]] = [:]

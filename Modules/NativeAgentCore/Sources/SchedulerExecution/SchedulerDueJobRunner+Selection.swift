@@ -1,19 +1,18 @@
 import AuthoredCapabilities
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
 import DreamREMCycle
-// Blueprint: | `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: body-rhythm-only `nextMeaningfulDeadline`, `claimDueJob`, `dueJobs`, `ensureDefaultCycleJobs`; retired intention kinds cannot claim even after a racing restore; default cycle jobs and one `part` job per part and `schedule:` wake; default cycles match their canonical IDs |
+// Blueprint: | `SchedulerDueJobRunner+Selection.swift` | Canonical cycles and one backfilled dream matter from observed diary files |
 
 extension SchedulerDueJobRunner {
-    /// Earliest future `SchedulerJobRuntime.scheduledEpoch` crossing: unclaimed
-    /// civil work follows the current zone; active claims keep their
-    /// instant. Capped batches request a coalesced continuation; overdue,
-    /// unreadable or failed state waits for source/repair invalidation and the
-    /// slow missed-event integrity sweep, never a fabricated retry.
+    /// Earliest future `SchedulerJobRuntime.scheduledEpoch` crossing: unclaimed civil work follows the current zone; active claims keep their instant. Capped
+    /// batches request a coalesced continuation; overdue, unreadable or failed state waits for source/repair invalidation and the slow missed-event integrity
+    /// sweep, never a fabricated retry.
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
         let rows: [JSONValue]
         do { rows = try await schedulerJobs.jobRows() }
@@ -36,8 +35,7 @@ extension SchedulerDueJobRunner {
         return earliestFuture.map { Date(timeIntervalSince1970: $0) }
     }
 
-    /// Only a cap-exhausted, healthy pass reaches this projection. Selection is
-    /// the same as claiming, so malformed rows cannot create continuation churn.
+    /// Only a cap-exhausted, healthy pass reaches this projection. Selection is the same as claiming, so malformed rows cannot create continuation churn.
     func requestRemainingBatch(excludingJobIds: Set<String>) async {
         guard !Task.isCancelled, activityFeedError == nil else { return }
         do {
@@ -67,20 +65,16 @@ extension SchedulerDueJobRunner {
         var earliest: (row: JSONValue, fields: [String: JSONValue], id: String, epoch: Double)?
         for row in rows {
             guard case .object(let obj) = row else { continue }
-            // Retired intention kinds cannot acquire a claim, including a
-            // restore racing this pass's stopped-record reconciliation.
+            // Only supported rhythm kinds may claim, including during a racing restore.
             guard JobKind(rawValue: (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()) != nil else { continue }
             let active = obj["activeOccurrence"] != nil
             // A retained claim owes reconciliation even when future runs were cancelled.
             guard active || SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
             let nextEpoch = SchedulerJobRuntime.scheduledEpoch(for: obj)
             guard let nextEpoch, active || nextEpoch <= nowEpoch else { continue }
-            // A scheduled effect without durable job identity cannot acquire a
-            // stable occurrence claim or be settled safely. Job creation owns
-            // IDs; malformed legacy rows remain untouched for repair.
+            // A scheduled effect needs durable identity for claims and settlement; malformed rows remain untouched for repair.
             guard let id = SchedulerJobRuntime.string(obj["id"]), !id.isEmpty else { continue }
-            // Excluded BEFORE the cap, so a deferred row cannot consume the
-            // one-at-a-time claim slot that a later due job needs.
+            // Excluded BEFORE the cap, so a deferred row cannot consume the one-at-a-time claim slot that a later due job needs.
             guard !excludingJobIds.contains(id) else { continue }
             if earliest.map({ nextEpoch < $0.epoch }) ?? true {
                 earliest = (row, obj, id, nextEpoch)
@@ -96,12 +90,8 @@ extension SchedulerDueJobRunner {
                        row: earliest.row, dueEpoch: earliest.epoch)]
     }
 
-    /// - Parameter reactivateCancelled: when true, a user-cancelled nightly
-    ///   dream job (enabled=false + cancelledAt tombstone) is re-enabled and
-    ///   the tombstone stripped. Dream only: re-adding the nightly reflection
-    ///   says nothing about a weekly REM job someone cancelled. Only the EXPLICIT user re-enable action
-    ///   (AppModel.createDreamJob) passes true; the passive due-job bootstrap
-    ///   pass keeps false so a cancelled job is not silently resurrected.
+    /// Only explicit nightly-reflection re-enabling may clear its cancellation tombstone. Passive bootstrap preserves cancellation; re-enabling a dream never
+    /// re-enables weekly REM.
     public func ensureDefaultCycleJobs(now: Date, reactivateCancelled: Bool = false) async throws -> (repaired: [String], nightlyDream: JSONValue) {
         let runDateKey = NativeAgentDreamCycleSchedule.runDateKey(now)
         let dreamDateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(now)
@@ -119,8 +109,7 @@ extension SchedulerDueJobRunner {
                 minute: NativeAgentDreamCycleSchedule.remMinute
             )
 
-        // A part's `schedule:<cron>` wake is one job of its own, re-armed by
-        // the ordinary settlement. Unreadable abilities leave part jobs as they are.
+        // A part's `schedule:<cron>` wake is one job of its own, re-armed by the ordinary settlement. Unreadable abilities leave part jobs as they are.
         let wakes: [(id: String, part: String, signal: String)]?
         var inventoryFault: String?
         do {
@@ -209,7 +198,7 @@ extension SchedulerDueJobRunner {
 
     func backfillDreamReceiptIfNeeded(now: Date) async throws -> String? {
         let dateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(now)
-        guard !(try await notificationInboxContains(source: "dream_cycle", dateKey: dateKey)) else { return nil }
+        guard !(try await dreamMatterExists(dateKey: dateKey)) else { return nil }
         let entries = try Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey)
         guard !entries.isEmpty else { return nil }
 
@@ -221,24 +210,10 @@ extension SchedulerDueJobRunner {
                 ([entry.path, entry.title, entry.summary].filter { !$0.isEmpty }).joined(separator: "\n")
             }).joined(separator: "\n\n")
         let itemId = "dream-cycle-\(dateKey)-backfill"
-        try await appendNotificationInbox(
-            title: title,
-            message: message,
-            source: "dream_cycle",
-            severity: "important",
-            jobId: "nativeagent-nightly-dream",
-            itemId: itemId,
-            relatedPaths: paths,
-            presentation: Self.dreamCardPresentation
-        )
+        try await tellScheduledMatter(Matter(id: itemId, form: .done, from: "dream_cycle",
+            title: title, summary: String(message.prefix(500)), words: message, symbol: "moon.stars.fill", badge: "DREAM",
+            artifacts: paths.map { .init(source: Matter.files, id: $0) }), reach: .person(from: nil))
         _ = try await archiveOlderDreamInboxItems(keeping: itemId)
-        _ = await postCycleNotification(
-            title: title,
-            body: Self.notificationBody(message),
-            jobId: "nativeagent-nightly-dream",
-            source: "dream_cycle",
-            itemId: itemId
-        )
         return itemId
     }
 }

@@ -3,9 +3,10 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import CryptoKit
-// Blueprint: | `StudioStore.swift` | Append-only journal and corrections, consult and honest-encounter truth; timestamps use NativeTimestampFormat directly; `encounterIntakePage` exposes bounded neutral consult/corrected-history facts with a shared content digest, refuses unreadable/incomplete history and changed pages; `namedEncounterIntake` validates editable `Resources/abilities/studio-intake.js` selection against native encounter truth, retaining no Swift ordering or invitation prose; hot-journal reads carry usable entries and damaged/torn-line holes together |
+// Blueprint: | `StudioStore.swift` | `encounterIntakePage`, `namedEncounterIntake`, `Resources/abilities/studio-intake.js`: Append-only checked intake |
 
-// Studio owns aesthetic history and consults under studio/, separately from factual MemoryV2. Storage is persona-independent; the agent supplies her own judgments.
+// Studio owns aesthetic history and consults under studio/, separately from factual MemoryV2. Storage is persona-independent; the agent supplies its own
+// judgments.
 
 // MARK: - Store
 
@@ -19,24 +20,21 @@ public struct SwiftNativeStudioStore: Sendable {
         self.dataRoot = dataRoot
     }
 
-    /// `<dataRoot>/studio/`.
     public var studioRoot: URL {
         dataRoot.appendingPathComponent("studio", isDirectory: true)
     }
 
-    /// `<dataRoot>/studio/journal/journal.jsonl`.
     public var journalPath: URL {
         studioRoot
             .appendingPathComponent("journal", isDirectory: true)
             .appendingPathComponent("journal.jsonl")
     }
 
-    /// `<dataRoot>/studio/consults/`.
     public var consultsDirectory: URL {
         studioRoot.appendingPathComponent("consults", isDirectory: true)
     }
 
-    /// `<dataRoot>/studio/journal/journal_archive_<stamp>.jsonl` — uncapped, byte-exact overflow per trim. Archive before trimming; journalHistory reads this shelf together with the hot journal.
+    /// Archive byte-exact overflow before trimming; history reads archives and the hot journal together.
     public func journalArchivePath(now: Date = Date()) -> URL {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -47,7 +45,7 @@ public struct SwiftNativeStudioStore: Sendable {
             .appendingPathComponent("journal_archive_\(f.string(from: now)).jsonl")
     }
 
-    /// Every overflow archive on the shelf, oldest stamp first. The combined journal reader uses this inventory for recall, encounter intake and work history.
+    /// Inventory every archive so recall, intake and work history share complete journal coverage.
     public func journalArchivePaths() throws -> [URL] {
         let directory = studioRoot.appendingPathComponent("journal", isDirectory: true)
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
@@ -57,14 +55,13 @@ public struct SwiftNativeStudioStore: Sendable {
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    /// `<dataRoot>/studio/consults/<id>.json`, for an id that has already been validated by `validatedIdentifier`.
     public func consultPath(id: String) throws -> URL {
         consultsDirectory.appendingPathComponent("\(try Self.validatedIdentifier(id)).json")
     }
 
     // MARK: Identifiers
 
-    /// Studio ids are `<prefix>_<stamp>_<random>` and contain nothing that could escape the consults directory. Validated on the way in AND on the way out, because the read side takes an id straight from a model.
+    /// Validate IDs on write and read so model-supplied consult paths cannot escape the directory.
     static func validatedIdentifier(_ raw: String) throws -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_"))
@@ -76,7 +73,7 @@ public struct SwiftNativeStudioStore: Sendable {
         return trimmed
     }
 
-    /// A stable, sortable, filename-safe id: `<prefix>_<yyyyMMddTHHmmss>_<hex>`.
+    /// Sortable, filename-safe IDs keep arbitrary input out of paths.
     static func newIdentifier(prefix: String, now: Date = Date()) -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -90,7 +87,7 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Consults
 
-    /// File a consult. Writes the envelope and NOTHING else: no journal entry, no retrieval, no suggested verdict. Returns the stored envelope so the caller sees exactly what was persisted, including its id.
+    /// File only the consult envelope and return its stored bytes' value; filing must not imply a judgment or encounter.
     @discardableResult
     public func fileConsult(
         artifactRefs: [String],
@@ -110,7 +107,7 @@ public struct SwiftNativeStudioStore: Sendable {
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuestion.isEmpty else { throw StudioError.consultQuestionMissing }
         let trimmedDescription = description?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Without artifact refs, require an explicit description-only consult with a description.
+        // Without artifact refs, require an explicit description-only declaration and description.
         if refs.isEmpty {
             guard descriptionOnly else { throw StudioError.consultMissingDescriptionOnlyFlag }
             guard let trimmedDescription, !trimmedDescription.isEmpty else {
@@ -146,7 +143,6 @@ public struct SwiftNativeStudioStore: Sendable {
         return consults
     }
 
-    /// Read one consult envelope back, verbatim.
     public func readConsult(id: String) async throws -> StudioConsult {
         _ = try Self.validatedIdentifier(id)
         guard let consult = try await consultIfExists(id: id) else {
@@ -155,8 +151,7 @@ public struct SwiftNativeStudioStore: Sendable {
         return consult
     }
 
-    /// The consult an arbitrary reference NAMES, or nil when it names no consult at all — an origin ref is "whatever identifies the source", so a desk handle, a URL, or a project name is a legitimate ref that simply is not a consult id. A
-    /// ref that DOES resolve is returned whatever the entry claims its origin kind to be; a stored envelope that no longer decodes throws rather than passing as "not a consult".
+    /// Non-consult references legitimately return nil; a resolved consult returns regardless of declared origin kind, and corrupt storage throws.
     public func consultIfExists(id: String) async throws -> StudioConsult? {
         guard let path = try? consultPath(id: id),
               FileManager.default.fileExists(atPath: path.path) else { return nil }
@@ -169,8 +164,7 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Journal
 
-    /// Append ONE entry. There is deliberately no counterpart: no update, no delete, no rewrite. Revision happens through a later linked entry.  The append is DURABLE (F_FULLFSYNC before the descriptor closes) and runs through the path-
-    /// owned cap registry, so the journal cannot be grown by a writer that skipped retention — see `jsonlPathOwnedCapPolicy`.
+    /// Durable append under the path-owned cap preserves history; revisions are linked entries, never updates or deletions.
     @discardableResult
     public func appendJournalEntry(
         encounteredAt: String?,
@@ -232,8 +226,7 @@ public struct SwiftNativeStudioStore: Sendable {
             to: journalPath,
             logLabel: Self.logLabel,
             durable: true,
-            // ARCHIVE BEFORE TRIM. This hook runs inside the feed's flock and BEFORE the append, so a throw here means no append and no trim — a shelf that cannot be written is a reason to stop, never a reason to drop the oldest entries
-            // quietly.
+            // Archive under the same flock before appending or trimming; failed archival must preserve the oldest entries.
             beforePotentialLineCap: { try archiveJournalOverflowIfNeeded($0) }
         )
         return entry
@@ -250,7 +243,7 @@ public struct SwiftNativeStudioStore: Sendable {
         let directory = journalPath.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let archive = journalArchivePath(now: now)
-        // Raw BYTES, not re-serialized rows: the shelf has to hold exactly what the journal held, including a line this build could not decode.
+        // Preserve raw bytes, including rows this build cannot decode.
         var payload = Data()
         for line in doomed {
             payload.append(contentsOf: line.utf8)
@@ -261,7 +254,7 @@ public struct SwiftNativeStudioStore: Sendable {
               Self.logLabel, doomed.count, archive.lastPathComponent)
     }
 
-    /// Usable entries in append order, with the holes beside them. The journal is a curated life record — a few entries a week, not telemetry — so reading it whole is honest and cheap; `recall` is what bounds what a caller sees.
+    /// Read the curated journal whole so coverage holes accompany entries; recall bounds only the returned slice.
     public func readJournal() async throws -> (entries: [StudioJournalEntry], holes: [String]) {
         let read = try await rawJournalEntries(path: journalPath)
         return (await applyAmendments(read.entries), read.holes)
@@ -279,18 +272,16 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Amendments (0.4.14)
 
-    /// `<dataRoot>/studio/journal/amendments.jsonl` — one row per correction.  NOT in the path-owned cap registry, and deliberately so: a cap trims the oldest rows, and trimming a correction would restore a claim she has already admitted
-    /// is wrong. Like the trim receipts beside it, this file is written durably and never capped. It is tiny by construction — a correction is a rare deliberate act, not telemetry.
+    /// Never cap corrections: trimming one would resurrect a retracted claim. Keep this rare, deliberate log durable.
     public var journalAmendmentsPath: URL {
         studioRoot
             .appendingPathComponent("journal", isDirectory: true)
             .appendingPathComponent("amendments.jsonl")
     }
 
-    /// What a read of `amendments.jsonl` got, and whether it got all of it.
     public struct AmendmentsRead: Sendable, Equatable {
         public var amendments: [StudioAmendment]
-        /// The file exists and could NOT be read whole: a malformed line, or a row this build cannot decode, or the read itself failed. Which entry's correction was lost is unknowable, so this is a property of the read, not of one row.
+        /// Incomplete reads warn the whole slice because damaged bytes cannot identify which entry lost its correction.
         public var unreadable: Bool
         public init(amendments: [StudioAmendment], unreadable: Bool) {
             self.amendments = amendments
@@ -298,8 +289,7 @@ public struct SwiftNativeStudioStore: Sendable {
         }
     }
 
-    /// Every correction on file, append order, PLUS whether anything was lost. A row this build cannot decode is still skipped rather than thrown — an unreadable correction must not take the whole journal read down with it — but it is
-    /// REPORTED, because a dropped correction silently resurrects the claim she has already admitted is wrong.
+    /// Keep readable corrections and report damaged rows; losing one must not silently restore a retracted claim.
     public func readAmendmentsReporting() async throws -> AmendmentsRead {
         guard FileManager.default.fileExists(atPath: journalAmendmentsPath.path) else {
             return AmendmentsRead(amendments: [], unreadable: false)
@@ -315,11 +305,10 @@ public struct SwiftNativeStudioStore: Sendable {
         return AmendmentsRead(amendments: amendments, unreadable: unreadable)
     }
 
-    /// Project the corrections onto the entries they name. This is what makes "append-only on disk, corrected everywhere it is read" true at once: the journal line is untouched, and every consumer that reads through the store sees the
-    /// amendment attached to the entry.  An amendment naming an entry that is not in this slice is simply not attached here — it stays on file and attaches wherever that entry is read.
+    /// Attach amendments on every read without rewriting journal bytes; unmatched amendments remain available for other slices.
     func applyAmendments(_ entries: [StudioJournalEntry]) async -> [StudioJournalEntry] {
         guard !entries.isEmpty else { return entries }
-        // A read failure is NOT "no corrections". Swallowing it here is what let a damaged amendments file serve a corrected claim as if it stood.
+        // An unreadable amendments file cannot establish that a response still stands.
         let read: AmendmentsRead
         do { read = try await readAmendmentsReporting() }
         catch {
@@ -340,8 +329,7 @@ public struct SwiftNativeStudioStore: Sendable {
         }
     }
 
-    /// File ONE correction against an entry that already exists.  Nothing in `journal.jsonl` is read-modify-written: the entry is read to VALIDATE the correction (the entry exists; a superseded passage really is in its response, exactly
-    /// once), and then the amendment is appended to its own durable log. Returns the amendment and the entry as it now reads.
+    /// Validate the target and unique quoted passage, then durably append the correction without rewriting journal bytes.
     @discardableResult
     public func appendJournalAmendment(
         entryId: String,
@@ -367,7 +355,7 @@ public struct SwiftNativeStudioStore: Sendable {
                 guard let response = entry.response, !response.isEmpty else {
                     throw StudioError.amendmentEntryHasNoResponse(id)
                 }
-                // Verbatim, and unambiguous. A passage that is not there, or is there twice, would have the correction land somewhere she did not name — silent rewriting by another route.
+                // Require one exact match so the correction cannot land on words the agent did not name.
                 let occurrences = response.components(separatedBy: trimmed).count - 1
                 guard occurrences > 0 else { throw StudioError.amendmentPassageNotFound(trimmed) }
                 guard occurrences == 1 else { throw StudioError.amendmentPassageNotUnique(trimmed) }
@@ -435,7 +423,8 @@ public struct SwiftNativeStudioStore: Sendable {
         try await completeJournalHistory(for: "Journal entry lookup")
     }
 
-    /// Read archives and the hot journal under one flock, deduplicate, then project corrections. Report holes so callers cannot infer absence from incomplete history.
+    /// Read archives and the hot journal under one flock, deduplicate, then project corrections. Report holes so callers cannot infer absence from incomplete
+    /// history.
     public func journalHistory() async throws -> (entries: [StudioJournalEntry], holes: [String]) {
         try await SwiftNativePersistenceCore.withFileLock(journalPath) {
             let archive = await self.archivedJournalEntries()
@@ -459,9 +448,7 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Encounter intake
 
-    /// Every consult User left on the table that the journal never answered.  A candidate is a consult that (1) carries real artifact refs — so there IS a work to receive, the honest-encounter rule's whole point — and (2) has no journal
-    /// entry naming it, either by origin ref or by sharing one of its refs. Description-only consults are excluded outright: they can never become an encounter, so they can never become an invitation to one.  Read-only. Nothing here opens
-    /// a ref, and nothing here writes.
+    /// Only unanswered consults with real artifacts invite encounters; description-only intake cannot. Selection neither opens refs nor writes.
     public func namedEncounterIntake(limit: Int = 20,
         decide: @Sendable (JSONValue) async throws -> JSONValue) async throws -> [StudioEncounterCandidate] {
         let decision = try await decide(.object(["operation": .string("named"), "limit": .int(Int64(max(0, limit)))]))
@@ -485,8 +472,7 @@ public struct SwiftNativeStudioStore: Sendable {
         }
     }
 
-    /// Neutral, corrected history facts and consult facts, paged from one content epoch. A changed epoch refuses continuation; no mixed-history absence claim and no retained second store. Missing is empty; corrupt consults and incomplete
-    /// archive history throw, never disappear.
+    /// Bind pages to one content epoch to prevent mixed-history absence claims; corrupt consults or incomplete archive history throw.
     public func encounterIntakePage(kind: String, offset: Int, snapshot: String?) async throws -> JSONValue {
         let history = try await completeJournalHistory(for: "Which consults were never answered")
         let consults = try await listConsults()
@@ -517,14 +503,14 @@ public struct SwiftNativeStudioStore: Sendable {
             "next_offset": next < rows.count ? .int(Int64(next)) : .null])
     }
 
-    /// Identities answered anywhere in the complete journal history, including archives.
+    /// Include archives so an answered identity cannot become a new invitation.
     public func journaledWorkIdentities() async throws -> Set<String> {
         Set(try await completeJournalHistory(for: "Which works were never journaled").map {
             Self.journaledWorkIdentity(title: $0.work.title, creator: $0.work.creator)
         })
     }
 
-    /// Shared creator-sensitive work identity for journal and graph intake.
+    /// Journal and graph intake share creator-sensitive work identity.
     public static func journaledWorkIdentity(title: String, creator: String?) -> String {
         func fold(_ value: String) -> String {
             value.folding(
@@ -541,7 +527,7 @@ public struct SwiftNativeStudioStore: Sendable {
         return "\(foldedTitle.count)|\(foldedTitle)|\(foldedCreator.count)|\(foldedCreator)"
     }
 
-    /// Read-only search. Returns matching entries VERBATIM, newest first, capped by `query.limit`, with an explicit `hasMore`. No scoring, no ranking, and nothing calls this on the agent's behalf.
+    /// Return verbatim, newest-first matches with explicit remaining coverage; reading must not assign taste scores.
     public func recall(_ query: StudioRecallQuery) async throws -> StudioRecallResult {
         let (entries, holes) = try await journalHistory()
         let matches = entries.reversed().filter { Self.matches($0, query) }
@@ -580,14 +566,14 @@ public struct SwiftNativeStudioStore: Sendable {
             guard entry.relations.contains(where: { $0.entryId == relatedTo }) else { return false }
         }
         if let text = query.text, !text.isEmpty {
-            // Free text reads the whole entry, response included — the response is the point, so it must be searchable in its own words.
+            // Search response text too: its exact words are part of the entry's evidence.
             let haystack = [
                 entry.id, entry.work.title, entry.work.creator ?? "", entry.work.medium ?? "",
                 entry.response ?? "", entry.stance.reason ?? "",
                 entry.reception.how ?? "", entry.reception.wholeOrPart ?? "",
                 entry.tags.joined(separator: " "),
                 entry.artifactRefs.joined(separator: " "),
-                // Corrections are part of what the entry now says, so they are searchable in their own words too.
+                // Search corrections in their own words because they are part of the current entry.
                 entry.amendments.map { "\($0.reason) \($0.correction)" }.joined(separator: " "),
             ].joined(separator: " ")
             guard fold(haystack).contains(fold(text)) else { return false }

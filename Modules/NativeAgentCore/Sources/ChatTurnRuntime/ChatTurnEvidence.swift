@@ -95,20 +95,20 @@ public enum UserTurnStamp {
         }
     }
 
-    /// His latest verified turn (this one, while it runs).
     public static func last(dataRoot: URL) -> Date? {
         reportedRead(dataRoot).map { Date(timeIntervalSince1970: $0.at) }
     }
 
-    /// The verified turn before his latest: where a gap this turn closes opened.
+    /// The preceding verified user turn marks where this turn's gap opened.
     public static func previous(dataRoot: URL) -> Date? {
         reportedRead(dataRoot)?.previous.map { Date(timeIntervalSince1970: $0) }
     }
 }
 
-/// The answer fields of the existing Reach ledger, shared by its codec and the verified-turn boundary. All other offer fields pass through unchanged. The ledger lock also prevents a runtime snapshot from erasing a turn's proof.
+/// The verified-turn boundary and codec share Reach answer fields; preserve all other offer fields.
+/// Hold the ledger lock so runtime snapshots cannot erase durable turn evidence.
 package enum ReachAnswerSettlement {
-    /// A return within one day is the structural answer fact, not a judgment of the response's meaning. This is Reach's existing answer window.
+    /// The one-day window records a structural return, never a verdict on the reply's meaning.
     package static let window: TimeInterval = 24 * 3_600
 
     private static func url(_ root: URL) -> URL { root.appendingPathComponent("cognition/reach.json") }

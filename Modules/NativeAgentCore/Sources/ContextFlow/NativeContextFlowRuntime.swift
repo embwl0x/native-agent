@@ -7,9 +7,8 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import TurnTrace
-import WorkshopExecution
 import NativeAgentShared
-// Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime` actor; checked mode rejects invalid configuration at startup, mode/health reads and turn admission; ordered, joined lifecycle transitions; stop drains retained picker, observation and embedding bodies; picker publication checks, turn preparation and memory provenance |
+// Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime`: checked admission; joined lifecycle; drain and provenance |
 
 private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
     let memory: SwiftNativeMemoryV2
@@ -51,12 +50,10 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     var coordinator: ContextPreparation?
     var memoryRuntime: SwiftNativeMemoryV2?
     private let memoryPressureObserver: DispatchContextMemoryPressureObserver?
-    /// Payload-free Desk/Workshop invalidations make the coordinator reread canonical stores.
+    /// Payload-free Desk invalidations make the coordinator reread canonical stores.
     private var residentWorkObservationTask: Task<Void, Never>?
-    private var terminalResidentWorkRecordPaths: Set<String> = []
     enum LifecycleOperation { case start, stop, reload }
-    /// Reserve before suspension: identical transitions join, others follow;
-    /// reload owns teardown/replacement, and awaiting lends the caller's priority.
+    /// Reserve before suspension: identical transitions join, others follow; reload owns teardown/replacement, and awaiting lends the caller's priority.
     var lifecycle: (
         id: UUID, operation: LifecycleOperation,
         configuration: Result<NativeContextFlowConfiguration, NativeContextFlowStartupError>?, task: Task<Void, Never>
@@ -68,7 +65,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     static let maximumConcurrentSemanticQueries = 8
     static let retiredSemanticQueryCause = "memory search stopped before the query embedded"
     var semanticQueryTickets: [String: ContextQueryEmbeddingTicket] = [:]
-    /// Stop settles tickets immediately; retired predictions retain their slots until exit.
+    /// Stop ends ticket waits immediately; prediction bodies retain their slots until exit.
     var semanticQueryTasks: [UUID: Task<Void, Never>] = [:]
     var semanticQueryEpoch: UInt64 = 0
     private var startupFailedClosed = false
@@ -336,11 +333,10 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         catch { return .failure(NativeContextFlowStartupError(detail: error.localizedDescription)) }
     }
 
-    public func prepareContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
+    public func prepareContextTurn(_ request: ContextTurnRequest, turn: Turn) async throws -> ContextPreparedTurn {
         _ = try resolvedConfiguration().get()
         await start()
-        // The person's selection is applied by the build; the turn never
-        // waits on it, and an unpublished selection is the persona receipt below.
+        // The person's selection is applied by the build; the turn never waits on it, and an unpublished selection is the persona receipt below.
         requestPersonaPickerReconcile()
         guard let coordinator else {
             if let startupFailure { throw NativeContextFlowStartupError(detail: startupFailure) }
@@ -351,13 +347,14 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             || prepared.kernel.requestedPersonaOverride == normalizedPersonaOverride() else {
             throw ContextTurnPreparationError.personaSelectionUnavailable
         }
-        attachMemoryProvenance(to: prepared, surface: request.surface.rawValue)
+        attachMemoryProvenance(to: prepared, surface: request.surface.rawValue, turn: turn)
         return prepared
     }
 
     private func attachMemoryProvenance(
         to prepared: ContextPreparedTurn,
-        surface: String
+        surface: String,
+        turn: Turn
     ) {
         // Resolve provenance from this exact instance's leased generation.
         let resolution = NativeContextMemoryProvenance.attach(to: prepared)
@@ -379,7 +376,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
                     "resolvedMemoryAtomCount": .int(Int64(resolution.resolvedMemoryAtomCount)),
                     "unresolvedMemoryAtomCount": .int(Int64(resolution.unresolvedMemoryAtomCount)),
                     "provenanceIndexCount": .int(Int64(memoryProvenanceIndex.count)),
-                ])
+                ]), turn: turn
             )
         }
     }
@@ -451,61 +448,10 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         }
     }
 
-    private func residentWorkObservationPaths() -> [URL] {
-        let deskOps = dataRoot
-            .appendingPathComponent("desk", isDirectory: true)
-            .appendingPathComponent("desk_ops.jsonl")
-        let executionRoot = dataRoot
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent(
-            "executions",
-            isDirectory: true
-        )
-        // Exact paths avoid duplicate wakes; missing targets watch their nearest existing parent.
-        var paths = [deskOps, executionRoot]
-        var discoveredRecordPaths: Set<String> = []
-        if let directories = try? FileManager.default.contentsOfDirectory(
-            at: executionRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            for directory in directories {
-                let isDirectory = (try? directory.resourceValues(
-                    forKeys: [.isDirectoryKey]
-                ).isDirectory) ?? false
-                if isDirectory {
-                    // Watch the canonical record, or its directory until first creation.
-                    let record = ExecutionRecordFile.canonicalPath(in: directory)
-                    discoveredRecordPaths.insert(record.path)
-                    if terminalResidentWorkRecordPaths.contains(record.path) {
-                        continue
-                    }
-                    if Self.shouldObserveResidentWorkExecutionRecord(at: record) {
-                        paths.append(record)
-                    } else {
-                        terminalResidentWorkRecordPaths.insert(record.path)
-                    }
-                }
-            }
-        }
-        terminalResidentWorkRecordPaths.formIntersection(discoveredRecordPaths)
-        return paths
-    }
-
-    /// Terminal records are immutable after the locked status/verification write.
-    /// Keep missing, malformed and active records observed; the root discovers new directories.
-    nonisolated static func shouldObserveResidentWorkExecutionRecord(at url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let status = object["status"] as? String
-        else {
-            return true
-        }
-        return !WorkshopExecutionRecord.isTerminal(status)
-    }
-
+    /// The Desk's op log is resident work's one source.
     private func makeResidentWorkObservation() -> FileChangeEvents {
-        FileChangeEvents(paths: residentWorkObservationPaths(), emitInitial: false)
+        FileChangeEvents(paths: [dataRoot.appendingPathComponent("desk", isDirectory: true).appendingPathComponent("desk_ops.jsonl")],
+            emitInitial: false)
     }
 }
 

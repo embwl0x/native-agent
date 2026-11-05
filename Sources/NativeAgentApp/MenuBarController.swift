@@ -4,9 +4,6 @@ import Carbon.HIToolbox
 
 // Blueprint: | `MenuBarController.swift` | `GlobalHotkey`: Carbon summon registration and tap/hold push-to-talk state with cancellable voice lifecycle |
 
-/// Registers a global hotkey using Carbon's RegisterEventHotKey.
-/// Default: ⌘-⇧-J (configurable via AppStorage "globalHotkey").
-/// Tap = bring the main window forward. Hold >200ms = voice push-to-talk (wired to VoiceInputCapture).
 @MainActor
 final class GlobalHotkey: NSObject {
     enum RegistrationTransition: Equatable, Sendable {
@@ -21,14 +18,13 @@ final class GlobalHotkey: NSObject {
     private var voiceStartTask: Task<Void, Never>?
     private(set) var isRegistered = false
 
-    // The voice input callback — set by whoever cares (e.g. ChatView)
     var onVoiceStart: (() -> Void)?
     var onVoiceEnd: (() -> Void)?
     var onVoiceCancel: (() -> Void)?
     var onOpenWindow: (() -> Void)?
 
-    // Default: cmd(cmdKey=256) + shift(512) + j(keycode=38)
-    private let defaultKeyCode: UInt32 = 38      // kVK_ANSI_J
+    // Carbon uses modifier bits 256 + 512 and keycode 38 for the default Command-Shift-J.
+    private let defaultKeyCode: UInt32 = 38
     private let defaultModifiers: UInt32 = UInt32(cmdKey | shiftKey)
 
     private override init() { super.init() }
@@ -97,8 +93,7 @@ final class GlobalHotkey: NSObject {
             GetApplicationEventTarget(),
             { _, event, userData -> OSStatus in
                 guard let userData, let event else { return noErr }
-                // Shotgun's ⌥Space shares this event target; pass on any
-                // hot key that is not ⌘⇧J.
+                // Pass unrelated hot keys through because the other global shortcut shares this event target.
                 guard let id = hotKeyID(of: event), id.signature == fourCharCode("NASP"), id.id == 1 else {
                     return OSStatus(eventNotHandledErr)
                 }
@@ -170,7 +165,6 @@ struct GlobalHotkeyPressState: Sendable {
 
     mutating func keyUp() -> ReleaseAction? {
         guard pressToken != nil else { return nil }
-        // Activation has already passed the monotonic hold delay.
         let action: ReleaseAction = voiceHoldActive ? .endVoice : .openWindow
         cancel()
         return action
@@ -184,7 +178,6 @@ struct GlobalHotkeyPressState: Sendable {
 
 // MARK: - Four-char code helper
 
-/// The registered id of the hot key a Carbon hot-key event is for.
 func hotKeyID(of event: EventRef) -> EventHotKeyID? {
     var id = EventHotKeyID()
     let status = GetEventParameter(

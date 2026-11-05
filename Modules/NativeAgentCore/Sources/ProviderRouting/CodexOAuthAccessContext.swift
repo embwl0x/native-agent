@@ -5,8 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 // Blueprint: | `CodexOAuthAccessContext.swift` | Checked Codex OAuth access identity and stable re-sign-in-required exhaustion marker |
-/// Stable exhaustion marker for credentials that require signing in again.
-/// Routing surfaces this failure instead of switching to an API-key adapter.
+/// Credential exhaustion requires sign-in repair, never a switch to an API-key route.
 public let OpenAIOAuthDirectExhaustedMarker = "openai_oauth_direct_exhausted: re-sign-in required"
 
 public struct CodexOAuthAccessContext: Sendable, Equatable {

@@ -1,13 +1,12 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `ChatSessionRetention+PinnedChats.swift` | One durable ordered pin list for navigation, retention and phone publication; unreadable protection halts retention |
+// Blueprint: | `ChatSessionRetention+PinnedChats.swift` | Durable pins protect navigation and retention |
 
 extension ChatSessionRetention {
-    // Storage: pinned_session_ids.json owns the ordered Mac pin list.
-    // Local backup/data export exclude it; off-disk backup includes it. Phone
-    // pins project this same owner through the host. PrivacyMap: chat.
+    // Storage: pinned_session_ids.json owns the ordered Mac pin list. Local backup/data export exclude it; off-disk backup includes it. Phone pins project this
+    // same owner through the host. PrivacyMap: chat.
 
-    /// Distinguish a closed pin from invalid or already-unpinned requests.
+    /// A closed-pin result cannot imply that invalid or already-unpinned requests changed storage.
     public enum CloseResult: Equatable {
         case closed(encoded: String)
         case refusedInvalidSessionID

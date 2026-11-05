@@ -6,23 +6,19 @@ import os
 // Blueprint: | `Experience.swift` | `ExperienceStore`, the append-only owner per data root over `experiences/experiences.sqlite`; `begin`, `append`, `experience`, `open`, indexed open/recent `projection` and commit-fed `changes`. Shared `Experience`/`ObligationPhase` live in NativeAgentShared. Recording stays off reply paths; projection drains queued writes and reports persistence gaps; a write the law refuses is logged and never poisons reads. Turn owners record answer lifetimes and recover saved-answer settlements; conversation and shelf owners publish peer obligations and completed run identities |
 
 
-/// The experience owner for one data root: `experiences/experiences.sqlite`.
-/// `experience` holds each birth (its id, kind, time, born form and whether it
-/// still owes anything); `event` holds each `Change` appended after, in order,
-/// as itself. A birth and each append are one transaction, checked against the
-/// law inside it. A read is a primary-key lookup and its events; the open
-/// projection is `WHERE open`. Collection births and events share one read.
+/// Keep births and changes in one experience store, validating each transaction through the same law.
+/// Read collection births and ordered events together so projections use one observation.
 public actor ExperienceStore {
     public enum Change: Codable, Sendable, Equatable {
         case cause(String)
         case evidence(Experience.Ref)
         case face(Experience.Face)
         case claim(Experience.Claim)
-        /// Recorded once; a different second outcome is refused.
+        /// Record a terminal outcome once; refuse conflicting repetition.
         case outcome(Experience.Outcome)
         case progress(String)
         case obligation(key: String, phase: ObligationPhase, attempt: String? = nil, evidence: Experience.Ref? = nil)
-        /// Its owner gives up what is still owed; a settled obligation stays as it settled.
+        /// Giving up outstanding work cannot alter already-settled obligations.
         case letGo(key: String, reason: ObligationPhase.LetGo)
     }
 
@@ -50,8 +46,7 @@ public actor ExperienceStore {
     }
 
     private static let owners = OSAllocatedUnfairLock(initialState: [URL: ExperienceStore]())
-    /// Each experience's last queued write: writes to one experience land in the
-    /// order its owner asked for them, and never wait on another experience's.
+    /// Order writes per experience without making unrelated experiences wait.
     private static let pending = OSAllocatedUnfairLock(initialState: [String: (token: UUID, task: Task<Void, Never>)]())
     private static let log = ModuleLog(category: "Experiences")
 
@@ -69,11 +64,8 @@ public actor ExperienceStore {
         }
     }
 
-    /// Writes are records beside the real ones: queued per experience `id` in
-    /// the order asked, never retried. A write that fails to persist is a gap;
-    /// one the law refuses is only logged — the record stayed exact, so no read
-    /// is poisoned by it. Delivery and failure accounting join their own
-    /// writes before retiring the caller's work; recording never throws.
+    /// Queue records per experience without retry; persistence failures create gaps, while law refusals leave exact history intact.
+    /// Join recording and gap accounting before retiring work so recording itself never throws into the producing result.
     @discardableResult
     public static func record(_ dataRoot: URL, _ id: String,
                               _ write: @escaping @Sendable (ExperienceStore) async throws -> Void) -> Task<Void, Never> {
@@ -98,8 +90,10 @@ public actor ExperienceStore {
 
     private let path: URL
     private var opened: DatabasePool?
+    var detailsForgottenAt = Date.distantPast
     private var gap: String?
     private var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
+    private var addressees: [UUID: (to: String, continuation: AsyncStream<Experience>.Continuation)] = [:]
     public nonisolated static let processID = UUID().uuidString
 
     public func changes() -> AsyncStream<Void> {
@@ -112,6 +106,32 @@ public actor ExperienceStore {
     }
 
     private func removeObserver(_ id: UUID) { observers[id] = nil }
+
+    /// Every experience addressed to `to`, as it stands after each committed birth or change: what an owner reading "everything for the person" (or for
+    /// a conversation) keeps in memory, fed at the write instead of read back.
+    public func written(addressedTo to: String) -> AsyncStream<Experience> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .unbounded) { continuation in
+            addressees[id] = (to, continuation)
+            continuation.onTermination = { _ in Task { await self.removeAddressee(id) } }
+        }
+    }
+
+    private func removeAddressee(_ id: UUID) { addressees[id] = nil }
+    private func wrote(_ experience: Experience) {
+        for (to, continuation) in addressees.values where experience.addressedTo.contains(to) { continuation.yield(experience) }
+    }
+
+    /// The newest `limit` experiences addressed to `to` born after `after`, returned oldest first: the one launch read of an owner that then
+    /// follows `written`.
+    public func addressed(to: String, after: Date, limit: Int) throws -> [Experience] {
+        try database().read {
+            try Self.fold($0, matching: """
+                experience.id IN (SELECT experience.id FROM experience, json_each(experience.born, '$.addressedTo') AS addressee
+                                  WHERE addressee.value = ? AND experience.at > ? ORDER BY experience.at DESC LIMIT ?)
+                """, arguments: [to, NativeTimestampFormat.fractionalZulu(after), max(0, limit)], order: "experience.at, experience.rowid")
+        }
+    }
     private func changed() { for observer in observers.values { observer.yield(()) } }
     private func failed(_ error: Error) {
         guard gap != error.localizedDescription else { return }
@@ -123,30 +143,32 @@ public actor ExperienceStore {
         self.path = path
     }
 
-    /// Its owner writes it once. False when this exact experience already exists.
+    /// A repeated birth cannot create another experience.
     @discardableResult
     public func begin(_ new: Experience) throws -> Bool {
-        let inserted = try database().write { db in
+        let inserted = try database().write { db -> Experience? in
             if let born = try String.fetchOne(db, sql: "SELECT born FROM experience WHERE id = ?", arguments: [new.id]) {
                 var existing = try Self.decoder.decode(Experience.self, from: Data(born.utf8))
                 var proposed = new
                 (existing.at, proposed.at) = ("", "")
                 guard existing == proposed else { throw LawError.reused(new.id) }
-                return false
+                return nil
             }
             var born = new
             born.at = NativeTimestampFormat.fractionalZulu(Date())
             try db.execute(sql: "INSERT INTO experience (id, kind, at, born, open, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                            arguments: [born.id, born.kind.rawValue, born.at, try Self.json(born), born.isOpen, born.at])
-            return true
+            return born
         }
-        if inserted { changed() }
-        return inserted
+        guard let inserted else { return false }
+        changed()
+        wrote(inserted)
+        return true
     }
 
-    /// Everything after birth is one of these, checked against the law.
+    /// Validate every post-birth change through the same law.
     public func append(_ changes: [Change], to id: String) throws {
-        let moved = try database().write { db in
+        let moved = try database().write { db -> Experience? in
             guard var current = try Self.fold(db, matching: "experience.id = ?", arguments: [id]).first else { throw LawError.unknown(id) }
             let at = NativeTimestampFormat.fractionalZulu(Date())
             var moved = false
@@ -160,33 +182,53 @@ public actor ExperienceStore {
                                arguments: [id, at, try Self.json(change)])
                 moved = true
             }
-            if moved {
-                try db.execute(sql: "UPDATE experience SET open = ?, updated_at = ? WHERE id = ?", arguments: [current.isOpen, at, id])
-            }
-            return moved
+            guard moved else { return nil }
+            try db.execute(sql: "UPDATE experience SET open = ?, updated_at = ? WHERE id = ?", arguments: [current.isOpen, at, id])
+            return current
         }
-        if moved { changed() }
+        guard let moved else { return }
+        changed()
+        wrote(moved)
     }
 
-    /// Read by id.
     public func experience(_ id: String) throws -> Experience? {
         try database().read { try Self.fold($0, matching: "experience.id = ?", arguments: [id]).first }
     }
 
-    /// The experiences that still owe something, oldest first.
+    /// Synchronous recovery reads only committed records through the same fold, without creating or migrating a store.
+    public nonisolated func recordedExperience(_ id: String) throws -> Experience? {
+        do { _ = try FileManager.default.attributesOfItem(atPath: path.path) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        var config = Configuration()
+        config.readonly = true
+        config.busyMode = .timeout(2)
+        let reader = try DatabaseQueue(path: path.path, configuration: config)
+        return try reader.read { try Self.fold($0, matching: "experience.id = ?", arguments: [id]).first }
+    }
+
+    /// Experiences of these kinds born after `after`, oldest first: what happened since then.
+    public func born(kinds: [Experience.Kind], after: Date, limit: Int) throws -> [Experience] {
+        guard !kinds.isEmpty else { return [] }
+        let marks = Array(repeating: "?", count: kinds.count).joined(separator: ",")
+        var arguments = StatementArguments(kinds.map(\.rawValue))
+        arguments += [NativeTimestampFormat.fractionalZulu(after), max(0, limit)]
+        return try database().read {
+            try Self.fold($0, matching: "experience.id IN (SELECT id FROM experience WHERE kind IN (\(marks)) AND at > ? ORDER BY at LIMIT ?)",
+                          arguments: arguments, order: "experience.at, experience.rowid")
+        }
+    }
+
     public func open() throws -> [Experience] {
         try database().read { try Self.fold($0, matching: "experience.open", order: "experience.at, experience.rowid") }
     }
 
-    /// Every write queued for this store so far has landed or been logged as a
-    /// gap: an id an owner just handed out reads as its owner wrote it.
+    /// Drain queued writes before reading newly issued IDs so the owner observes its own recorded work.
     public func drained() async {
         let queued = Self.pending.withLock { tails in tails.filter { $0.key.hasPrefix(path.path + "#") }.map(\.value.task) }
         for write in queued { await write.value }
     }
 
-    /// A reader crosses every write queued for this store before publishing. Gaps
-    /// invalidate the projection, never the reply that produced the record.
+    /// A reader joins queued writes before publication; gaps invalidate projections without changing the producing reply.
     public func projection() async throws -> [Experience] {
         await drained()
         if let gap { throw NSError(domain: "Experiences", code: 1, userInfo: [NSLocalizedDescriptionKey: gap]) }
@@ -196,9 +238,10 @@ public actor ExperienceStore {
         }
     }
 
-    /// Replays through the same law that admitted each change; a row it cannot read is reported.
+    /// Replay through the admission law and report unreadable rows.
     private static func fold(_ db: Database, matching: String, arguments: StatementArguments = [],
                              order: String = "experience.id") throws -> [Experience] {
+        let decoder = JSONDecoder()
         var experiences: [Experience] = []
         for row in try Row.fetchAll(db, sql: """
             SELECT experience.id, born, updated_at, seq, event FROM experience
@@ -219,8 +262,7 @@ public actor ExperienceStore {
         return experiences
     }
 
-    /// The law, in one place: applies a change and says whether it moved
-    /// anything, or refuses what the law forbids.
+    /// Keep change admission and replay under one law.
     private static func apply(_ change: Change, to experience: inout Experience) throws -> Bool {
         let id = experience.id
         switch change {
@@ -261,9 +303,8 @@ public actor ExperienceStore {
         return true
     }
 
-    /// Opened on first use, the way MemoryV2 opens its store (WAL, a bounded
-    /// journal), in an owner-only folder so its sidecars are private from the first byte.
-    private func database() throws -> DatabasePool {
+    /// Create the bounded WAL store in an owner-only folder so sidecars stay private from their first byte.
+    func database() throws -> DatabasePool {
         if let opened { return opened }
         let newStore: Bool
         do {
@@ -277,7 +318,8 @@ public actor ExperienceStore {
         var config = Configuration()
         config.foreignKeysEnabled = true
         config.busyMode = .timeout(2)
-        config.prepareDatabase { db in try db.execute(sql: "PRAGMA journal_size_limit = 4194304") }
+        // A written terminal must survive a power loss before its turn's restart checkpoint goes.
+        config.prepareDatabase { db in try db.execute(sql: "PRAGMA journal_size_limit = 4194304; PRAGMA synchronous = FULL") }
         let pool = try DatabasePool(path: path.path, configuration: config)
         try pool.write { db in
             if try db.tableExists("experience") {
@@ -301,6 +343,7 @@ public actor ExperienceStore {
                     CREATE INDEX event_experience ON event(experience_id, seq);
                     """)
             }
+            try db.execute(sql: Self.detailSchema)
         }
         opened = pool
         return pool

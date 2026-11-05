@@ -7,7 +7,7 @@
 **An agent is a who. A who has doors. Every word to a who is owed until that who receives it.**
 
 - **Who.** One saved contact: a stable id, the name the person or they gave it, and the history between them. Nothing else establishes identity. A product name, a vendor, a host, a bridge route or a lane name never makes two contacts one, and never makes a contact anyone else. On a stranger's Mac, Claude Code is "Claude Code". On User's Mac, "Claude" is a who that they named, reached through Claude Code's and Claude Desktop's doors.
-- **Door.** One authenticated way to reach a who: a recipe route (MCP entry, ACP launch, inbox file, desktop chat, A2A endpoint, bot routine), its own credential, and the recipe's two declarations: how the door **wakes** its agent (none, open the app, run a command, start an ACP session) and what counts as **acceptance** (the agent read it through its door, answered, or acknowledged it). Joining several doors into one who is an explicit association written on the contact by the person or by them; there is no implicit one. Authority lives on a door: a call is elevated only when it authenticates with that door's own key and the person granted that door. Associating a new door with a trusted who grants it nothing. A door may instead be one of their own abilities (`ability` on the contact): a message runs it with the text, the contact, the exchange and the recent talk, and it answers as that contact with `agent.reply`, which settles the exchange as any route's answer does; the who, its thread, trust and replay claims stay the contact's.
+- **Door.** One authenticated way to reach a who: a recipe route (MCP entry, ACP launch, desktop chat, A2A endpoint, bot routine), its own credential, and the recipe's two declarations: how the door **wakes** its agent (none, open the app, run a command, start an ACP session) and what counts as **acceptance** (the agent read it through its door, answered, or acknowledged it). Joining several doors into one who is an explicit association written on the contact by the person or by them; there is no implicit one. Authority lives on a door: a call is elevated only when it authenticates with that door's own key and the person granted that door. Associating a new door with a trusted who grants it nothing. A door may instead be one of their own abilities (`ability` on the contact): a message runs it with the text, the contact, the exchange and the recent talk, and it answers as that contact with `agent.reply`, which settles the exchange as any route's answer does; the who, its thread, trust and replay claims stay the contact's.
 - **Owed until received.** A message is an experience that owes `accept` to its who. It settles when a door's acceptance evidence arrives; a send, a queue write or a launch never settles it. While it is owed, their home shows it as waiting on that who, with the lever: their next call (wake it through a door that can) or the person's exact tap (open that app) when no door can. A who with no door that can deliver says so with the owner (the recipe, the vendor) and what would change it.
 - **Found as it is.** A host is found the way the person's own Mac finds it: its app by bundle or markers, its command line through the person's own login PATH and the recipe's paths, resolved once into one installation binding that discovery, connect and launch share. Installation events settle together before comparing the candidate programs, bundle locations, app metadata and executables; unrelated directory changes keep the binding and do not scan running programs. Explicit discovery still refreshes immediately. An update keeps the who, its doors' keys, the person's grants and authored recipe changes; only owned configuration is rewritten.
   A supplied card URL is exact: failed resolution reports that URL instead of
@@ -36,6 +36,9 @@ transcripts. A disconnected contact keeps its own history even when another
 contact has the same display name. Room commands, including pagination, belong
 to the chat that displayed them; stable item names keep their item identities.
 The person's read-only Agent preview never replaces those command bindings.
+The background reply-read boundary marks its own gated dispatcher as an
+internal conversation read before the first page and retains that mark for
+every continuation page, so reading a reply cannot re-enter its presentation.
 Simple's contact composer sends the known contact and text through the engine's
 gated contact-send owner and shows its actual delivery state. Saved contacts use
 their peer identity; discovery candidates are rows without a saved contact.
@@ -58,37 +61,68 @@ Call an action with `app {"action":"agent.message","args":{...}}`.
 | `agent.read` | Read the conversation and retained reply: a successful read says `execution: executed`, `effect: none`, independently of the send it shows. Reply owners publish `retrieval_result_class`, `execution_result_class` and `execution_terminal`; terminal task snapshots remain readable when execution failed or was cancelled. An unknown name is `unknown_contact` with nearest contacts; a known contact never messaged is `no_history`. `details: true` exposes receipts. `wait_seconds` waits 1–300 seconds on a conversation by name or its retained exact reply IDs; it cannot be combined with history or listing filters. |
 | `agent.cancel` | Request a stop through the route's cancellation mechanism. A thread's Stop retains its exact record and original chat scope; an absent or moved record cannot select another conversation by label. The result distinguishes stopping, stopped, released and unsupported stops. `clear_queue: true` withdraws queued follow-ups. |
 | `agent.reply` | From the ability a contact is reached through, and only there: its answer lands in that contact's conversation and settles the exchange (the one named, else their newest message to it still unanswered); `done: false` shows progress. |
-| `agent.jobs` | Read the coding-helper job records; `message_id` selects exact accepted-message evidence. Missing evidence does not prove no execution. |
+| `agent.jobs` | List their jobs, their own lines (`agent: "self"`) among them, newest first, and read retained reply deliveries (owed, delivered, let go) for the chats and contacts that asked. Missing evidence does not prove no execution. |
 
-A scheduled Workshop step without a chat session sends, reads and waits on a
-saved contact in that contact's own conversation session.
+## Jobs
+
+`agent.job {agent, brief, instructions?, where?, reach?, done?, desk?}` gives another agent,
+or a line of the agent's own, a job. For as long as it lives, the job is a part the agent
+grows: a contact is an organ that brings its own model and its own sign-in, and the agent
+stays the speaker. No path picks, switches or escalates any model.
+
+`agent: "self"` is the same socket with the agent themselves as the power: a **line of them**. It
+is a turn of theirs in its own work conversation (an own-work session whose id is the job's, so
+the person's chat list does not show it), admitted through `TurnAdmission` like any turn, with
+the brief as the arriving message and the same turn part, tools, Trust and present: their breath
+reaches it each round and its words reach their other lines as their own work. `instructions`
+(self only) write who the line is, a researcher, a critic or a specialist; they stand in place
+of their persona text and nothing else changes. Without them the line is their. `where`, `reach`
+and a `done` command bound another agent and are refused for their own line; a `done` file or
+grep still judges it. A line carries the limits of the turn that started it, its peer steering
+and its file access, so neither a peer's words nor a narrower door reach their hands wider through
+a line of their own. An act that needs the person raises the same card their turn would, naming the
+line's conversation; answering it continues the line there. Several lines at once is a swarm: each
+runs side by side in its own conversation and each ending wakes the conversation that started
+it with the line's answer. A relaunch continues a working line in its own conversation. A
+helper bot is still its own mind and is not a line.
+
+| Action | Use |
+| --- | --- |
+| `agent.job` | Commission a job. `where: <repo>` cuts a worktree on branch `nativeagent/job-<token>`; the organ works there and never writes to the agent's checkout. `done` is the check the stem runs before the job is called done. `agent: "self"` starts a line of them, with `instructions` when they writes who it is. `desk` names the Desk item the job moves ([Desk](DESK.md)). |
+| `agent.read {job}` | Read the job: its beat (working, needs you, done, failed), its deliverable and the check's output. A line of their shows its `conversation`, `instructions` and its answer as their own words. |
+| `agent.cancel {job}` | Stop the job through its transport; a line of their stops its turn. |
+| `agent.apply {job}` | Merge a repo job's diff with the agent's own git call, gated by Trust; the commit carries `Assisted-by: <contact>:<model it reported>`. |
+| `agent.discard {job}` | Drop a repo job's worktree and branch. |
+
+What the agent commissions comes back as its own: the deliverable returns as the result of its
+own call and registers with native provenance plus "made by ‹who› for ‹job›". The organ's prose
+comes back labelled as its report. When a job settles it wakes the context that commissioned it.
+Each agent takes jobs through its own native headless door: Codex `app-server`, Claude Code
+`-p` stream-json, ACP and A2A. A worktree idle for seven days with no unique commits, no dirty
+or untracked files and no uncertain ownership may be retired when a new one is cut; its branch
+is kept, and the outcome is a `builder.worktree_retirement` turn-trace event.
 
 The workspace's **Connection details** opens the detailed contact read,
 preserving its doors, connection evidence and discovery details.
 
-A unique display name or exact reference identifies a contact: `codex`,
-`claude`, `omp`, `bot:<UUID>` or `peer:<UUID>`. Ambiguous names require a
+A unique display name or exact reference identifies a contact: its name,
+`bot:<UUID>` or `peer:<UUID>`. Ambiguous names require a
 choice. Optional `conversation` names a separate discussion on supported
 routes; `new_conversation: true` starts fresh. Bots keep one continuous session.
 A failed resume does not silently start another conversation.
 
-Bridge inbox admission deduplicates by durable message identity and recovers
-that identity's retained receipt. Identical words on the same topic with a new
-message identity are new work; text similarity and elapsed time cannot suppress
-the wake.
-Damaged Swift-owned OMP/Claude inbox admission storage remains byte-preserved
-and unavailable. A parseable subset cannot prove a message was never admitted;
-reconcile the message identity before repairing the record or sending again.
+A waiting exchange remains pending; sending or accepting a message does not make
+it an answer. A follow-up queues behind it until settlement or an explicit
+stop/release. Desktop and background reply watches belong to their sending
+process.
 
-Saved reply recovery isolates unreadable retained bridge jobs and logs their
-failure without changing their bytes. Contact decoding rejects unknown fields at every depth.
+Contact decoding rejects unknown fields at every depth.
 Bridge, human-reply and contact completion
 owners each reconcile independently under their existing delivery identities;
 one owner's failure is reported after the others have had their recovery pass.
 Continuation pre-run update failures retain `not_started` and their exact cause;
 once execution is entered, interruption remains uncertain. Completion delivery
-uses only its saved route; a missing route owes a named repair and never borrows
-a jobs-ledger origin. A missing approval holds and names only its own send;
+uses only its saved route; a missing route owes a named repair. A missing approval holds and names only its own send;
 unrelated launch queues continue. The finished October contact-history import
 and its marker dependency are removed after canonical transcript coverage was checked.
 
@@ -118,8 +152,6 @@ app {"action":"agent.message","args":{"agent":"Hermes","text":"What about the se
 app {"action":"agent.read","args":{"agent":"Hermes"}}
 ```
 
-The static options schema projects declared inbox recipes; the selected live door admits only its own keys and continuation options.
-
 ### Outgoing files
 
 `agent.message` takes `files: [{"path":"/absolute/path/report.pdf"}]`, the
@@ -131,7 +163,7 @@ send authority applies to the whole message and its file content.
 | --- | --- |
 | A2A 1.0 JSON-RPC, HTTP+JSON, gRPC; A2A 0.3 JSON-RPC | Up to four regular files, 8 MiB total. Checked bytes travel inline as versioned file parts, never as a local path or a URL the peer must fetch. |
 | MCP bridge hosts, including command and pull hosts and Dot | Text only in this adapter. Existing reply attachments do not establish outgoing file support. |
-| NativeAgent bridge, ACP, inboxes, helpers, contact abilities | Text only in these adapters. |
+| NativeAgent bridge, ACP, helpers, contact abilities | Text only in these adapters. |
 | Desktop and desktop-chat apps; Grok Bot | Text only in these adapters; file paste/attach is not implemented by their contact-send route. |
 
 Unsupported routes refuse the entire send before text is sent or a host is
@@ -154,7 +186,7 @@ the captured files' sizes and SHA-256 hashes; it describes attempted content,
 not delivery. The recipient's file observation is delivery proof. Existing
 wait limits, uncertain-outcome recovery and no-automatic-resend rules apply.
 
-Follow-ups keep their accepted send options, queue behind an answer in flight,
+Follow-ups queue behind an answer in flight,
 and send when it settles. Set
 `expects_reply: false` for an FYI that needs no answer. Supported pending replies
 are collected by the runtime; a missing acknowledgement is never a reason to
@@ -173,14 +205,13 @@ from its exchange: all unsettled keys release on failure, a confirmed delivery
 closes a send explicitly requiring no reply, and superseded sends settle from
 their retained exchange instead of remaining owed forever. Words such as
 "no reply needed" do not change the explicit `expects_reply` flag.
-Bridge replies retain the turn's terminal verdict, reply
-text/attachments and `completionDelivery` independently. Read receipts classify
+Bridge replies retain the turn's terminal verdict and reply
+text/attachments independently. Read receipts classify
 execution from that turn verdict; historical combined statuses decode at the read
 boundary. Reading a reply, finishing its turn and delivering it onward are separate facts.
 
 `agent.message` waits on the existing conversation-change signal, without
-polling a file. `AgentConversationDelivery.answersLive` admits live inbox readers,
-MCP hosts (including held messages), ACP, remote NativeAgent/A2A and desktop-chat
+polling a file. `AgentConversationDelivery.answersLive` admits MCP hosts (including held messages), ACP, remote NativeAgent/A2A and desktop-chat
 reply readers. A reply received within it returns `reply`, `replied_at` and
 `delivery: answered`, and is filed once in the contact's thread; it does not
 also start a delayed reply turn. Set `wait_seconds: 0` to send and continue.
@@ -194,18 +225,13 @@ A bridge reply names the accepted send, or answers the sole delivered held
 message in its returned conversation. That inbound arrival hands the answer
 to the active waiter under the conversation store's settlement lock and files
 it through the existing contact-thread owner, without starting another turn.
-An exact Claude inbox answer writes its linked reply receipt before the
-exchange is published to the waiter, so `agent.read(message_id:)` retains the
-answer returned inline. A repeated handoff does not append that receipt again;
-a recording failure is reported instead of returning an answered receipt.
 The call that first takes a held message cannot also answer it. If the waiter
 has released, the incoming reply follows its existing bridge-turn path.
 Replies carrying attachments retain that path too.
 Inline and delayed bridge answers share the store's answer mutation and receipt
 bound; transcript publication receives the complete answer in either path.
 
-Inbox doors without live readers (including Codex and OMP), Dot's inbound
-door, abilities and bots use their asynchronous path and report
+Dot's inbound door, abilities and bots use their asynchronous path and report
 `wait_ignored: lane_is_async`. Waiting never opens a host's window or claims a
 held message was sent. Explicit protocol-ID sends use the same
 bounded send owner and retain a separate conversation record for their exact
@@ -305,6 +331,10 @@ keeps the preceding receipt and undo, plus the prepared backup. A later receipt
 or cleanup failure is reported and needs inspection; it does not undo a saved
 configuration or prove the connection works.
 
+Each individual configuration edit owns a fresh replaced-install recorder,
+passed to its format splicer. One connection can edit several files without
+carrying a displaced helper's identity into another file's receipt.
+
 Existing connections adopt the new expected settings through the existing
 Connect/reconnect path, after recipes load and merge untouched seed fields.
 The settings check within `agent.verify` writes no host settings: an older Codex entry or missing Claude Code
@@ -346,8 +376,7 @@ and receipt detail all say `failed`, even if older executor progress says
 `running`. Delivery is claimed only from confirmed delivery evidence;
 transport acceptance alone remains unconfirmed. Older inconsistent records
 are projected on read, without rewriting their saved history.
-Default and named coding-helper reads use that record and contact history;
-`agent.jobs` reads the executor's diagnostic job listing separately.
+Default and named contact reads use that record and contact history.
 Reading a failed-send receipt with `details: true` is still a successful read:
 its `execution: executed` and `effect: none` describe that read; the retained
 error describes the send.
@@ -390,10 +419,10 @@ ahead of later follow-ups. Unknown input presence also waits, without claiming
 the person is using the Mac. The shared presence owner says away after five
 minutes without the person's input; that edge (or a driver change while away)
 asks the conversation's existing release drain to unhold it only with positive
-away evidence and a permitted driver. The resumed send clears the old task-local
-driver and obtains a fresh binding at the desktop route, through the normal
-permission chain. Startup uses the same path. A person-typed queued send is
-still held after a restart because their original send act does not carry over.
+away evidence and a permitted driver. The resumed send clears the driver on its
+explicit Mac operation and obtains a fresh binding at the desktop route,
+through the normal permission chain. Startup uses the same path. A person-typed
+queued send is still held after a restart because their original send act does not carry over.
 Explicit handback is distinguished from physical input and says to return
 control; it does not enter automatic retry. A held send expires into a visible
 nonautomatic hold at the existing one-day queue boundary, retaining its text;
@@ -438,7 +467,7 @@ availability. Bridge and contact replies use `ChatResponse.answerOnly` at the tu
 recorded commentary boundary; interim lines remain in the transcript. An absent
 boundary keeps the whole output; an invalid boundary or empty/whitespace-only
 suffix yields an empty answer. Attachments keep their existing destinations.
-Contact/helper and crew reads retain availability independently. An unreadable
+Contact and helper reads retain availability independently. An unreadable
 optimized read reports its actual error without running a second full reader.
 Helper thread reply times use recorded exchange settlement or `replied_at`;
 missing times display **Time unavailable** and supply no chronological evidence.
@@ -472,8 +501,7 @@ builder ingress writes the old message-reply log.
 
 A builder completion response reports the retained execution state, never a
 successful receipt read as successful execution; a failed task returns HTTP 409
-with `status: failed`. The wake delivery owner preserves that job's full answer
-outside the replay scan for repair instead of deleting it as delivered.
+with `status: failed`.
 A queued builder turn recovered after restart consumes
 its exact saved session/run and framed input, then uses the same contact-reply
 settlement as live ingress: recording the incoming reply and routing their answer
@@ -488,8 +516,7 @@ repair on that task; they do not start another turn.
 | `can send; replies aren't connected` | A send-only route; any answer needs an inbound path. |
 | `unavailable` | The route or required credentials are unavailable. |
 
-Built-in coding lanes also check local helper/runtime readiness. A connected
-contact is not proof that its latest task finished. A new authenticated inbound
+A connected contact is not proof that its latest task finished. A new authenticated inbound
 message clears an older unavailable mark on its credential-bound return door;
 ACP and desktop routes still require their own round trip. Request-file
 reconciliation reads Grok request records only for Grok Bot contacts; other
@@ -512,7 +539,7 @@ Completed contact exchanges that the person did not start appear in their
 Mac chat in time order, as compact reading copies opening the contact's thread.
 The phone carries the same rows beside its Mac transcript snapshot, in an
 additive `otherRooms` field; these rows never enter the person's session or
-become model chat messages. HerScreen's `doorLines` owns both this projection
+become model chat messages. AgentScreen's `doorLines` owns both this projection
 and the next person-started turn's elsewhere context: the newest five exchanges
 since their last reply there, with each side bounded to 600 characters. The same
 transcript index also feeds up to three helpers' newest replies into that
@@ -571,6 +598,36 @@ marked delivering until the whole selected batch commits. Conversation
 settlement and queued-work read failures retain the original operation outcome
 and exact storage debt in RepairOwed; the accepted send keeps its owner through
 actual exit and never runs again to repair bookkeeping.
+
+Held replies have one owner, `AgentConversationStore.drainHeld`, across contact
+doors. Native HTTP `/agent/message` and `/agent/reply`, MCP calls, and the
+Claude/Codex/OMP bridge's message and reply results carry `held_messages` and
+`held_remaining`. Each message contains `at`, `text` and `conversation_id`.
+A2A send/get responses carry `nativeagent.held_messages` and
+`nativeagent.held_remaining` in the returned task's `metadata`; streaming
+send/subscribe carries that metadata on its first event payload, across
+JSON-RPC, HTTP+JSON and gRPC. Empty batches omit these optional fields. A door
+without an authenticated principal peer ID drains nothing. A drain failure
+returns that call's error, leaving the messages held. Only a written JSON
+response or first stream event settles the batch as delivered; failed writes,
+encoding failures and cancellation before writing release it back to held.
+Later stream events do not repeat the batch. Delivery alone does not end the
+sender's wait for the contact's answer, regardless of the original transport.
+
+News that reaches a contact conversation after its turn ended runs in that
+conversation. `AgentContactHeldAnswer.hold` also accepts an answer without an
+open turn: it saves the send before appending a held exchange, under
+`AgentBridgeCompletionRouter.stableUUID(deliveryID)`. A resident arrival reuses
+its canonical completed assistant row as that send, preserving one visible
+answer and its completion evidence. Working commentary is excluded from the
+held payload; saved attachment paths accompany the answer. Empty payloads,
+missing file references and payloads over 8 KiB refuse with their reason and
+preserve the saved answer. Repeating the exchange identity writes nothing.
+The arrival's `agent-held` route never becomes a person-result notification.
+Completion is `completed` / `held_for_contact` once the held owner takes it;
+the exchange remains held until the contact's door writes it. Failed response
+writes keep it held, and a contact that never calls leaves it held. Recovery
+uses the same handoff and cannot replay the work or route it through a send.
 An asynchronous Grok desktop reply that cannot be saved owes repair under its
 original operation ID, retaining the terminal answer or partial reply and its
 observation evidence. A later successful settlement of that exact exchange

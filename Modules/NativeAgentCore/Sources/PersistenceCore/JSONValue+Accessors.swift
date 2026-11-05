@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 import Darwin
-// Blueprint: | `JSONValue+Accessors.swift` | JSONValue primitive accessors with explicit numeric coercion/finite policy; JSONKey and unknown-field Codable container operations |
+// Blueprint: | `JSONValue+Accessors.swift` | Explicit numeric coercion and unknown-field handling. |
 
 extension JSONValue {
     public var objectValue: [String: JSONValue]? { if case .object(let fields) = self { fields } else { nil } }

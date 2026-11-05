@@ -18,42 +18,14 @@ import CoreText
 import ScreenCaptureKit
 #endif
 // Blueprint: | `MacLookPercept.swift` | Immutable semantic percept, handle and readout vocabulary |
-//
-// One `MacAXTreeSnapshot` supplies glance (one line), look (structured handles),
-// and stare (the delegated `mac_ax_tree` payload); there is no second walker.
-// Unnamed controls remain addressable with explicit role ordinals.
-// Frames are pulled, single-slot per source, expire after 180 s and grant no authority.
-// Outbound text uses the same redaction as the view legend, including trace/persist/sync.
-/// A handle must survive re-layout and scrolling, which a child-index path does
-/// not: inserting one row above a button renumbers it. So identity is a
-/// FINGERPRINT — what the element IS and what it sits INSIDE — hashed to a
-/// short token:
-///
-///     ancestorChain > role/subrole/label
-///     ancestorChain = "AXWindow:Inbox|AXToolbar:|AXGroup:Reply"
-///
-/// Deliberately EXCLUDED from the fingerprint:
-///   • child indices — the thing that makes paths fragile.
-///   • VALUES — a text field whose contents change is still the same field.
-///     This is why the fingerprint's label component is the element's TITLE
-///     only, even when the percept DISPLAYS a value-derived label: a popup
-///     button that reads "Medium" then "Large" must keep one handle.
-///
-/// A retitle (Calculator's C → AC) DOES mint a new handle, and that is correct
-/// — the app renamed the control, which is a real change. Paths record observed
-/// topology; an unknown or drifted handle requires a fresh observation.
-///
-/// Repeated tokens carry an ordinal in document order: `h7k2q1`, `h7k2q1.2`.
-/// Grouping the ordinal by rendered TOKEN rather than by fingerprint also makes
-/// a hash collision between two different fingerprints harmless instead of a
-/// silent merge.
+// One AX snapshot supplies all grades so perception cannot disagree across walkers. Handles hash titles, roles and ancestors, excluding values and indices so
+// edits and scrolling preserve identity. Retitles mint new handles; document-order ordinals disambiguate siblings and hash collisions. Frames are pulled,
+// expire after 180 seconds and grant no authority; all output retains full-context redaction.
 public enum MacLookHandle {
     /// Token length in base36. 36^6 ≈ 2.2e9, against ≤60 affordances per frame.
     public static let tokenLength = 6
-    /// An ancestor's label contributes at most this many characters.
     public static let ancestorLabelChars = 24
-    /// Untitled content rows derive identity from contained text, so insertion preserves handles.
-    /// Controls exclude changing values; layout-only `AXGroup` text cannot name descendants.
+    /// Untitled rows use contained text to survive insertion; controls exclude changing values and layout-only groups cannot name descendants.
     public static let contentIdentityRoles: Set<String> = [
         "AXRow", "AXCell", "AXOutlineRow", "AXListItem",
     ]
@@ -67,9 +39,7 @@ public enum MacLookHandle {
         }
         return String(out.reversed())
     }
-    /// The fingerprint string, before hashing.
-    /// - Parameter contentName: the identity of a TITLE-LESS container, derived
-    ///   from contained text; appended only when present and the title is absent.
+    /// Only untitled containers use content identity; a title owns named identity.
     public static func fingerprint(
         role: String,
         subrole: String?,
@@ -84,10 +54,7 @@ public enum MacLookHandle {
         let content = title == nil ? (contentName.map { "#\($0)" } ?? "") : ""
         return "\(chain)>\(role)/\(subrole ?? "")/\(title ?? "")\(content)"
     }
-    /// The sentence a caller gets when a handle STILL had to fall back to a
-    /// document-order ordinal. Announced rather than hidden: an ordinal handle
-    /// is position-derived and shifts if the container reorders, which is worse
-    /// than `handle_drifted` precisely because it does not announce itself.
+    /// Disclose position-derived identity because reordering can silently move an ordinal handle.
     public static func ambiguityNote(ordinal: Int, total: Int) -> String {
         "ordinal:\(ordinal) of \(total) identical elements — position-derived, will shift "
             + "if the container reorders; re-look before acting on it"
@@ -95,8 +62,7 @@ public enum MacLookHandle {
     public static func token(fingerprint: String) -> String {
         base36(fnv1a64(fingerprint), length: tokenLength)
     }
-    /// `token` for the first element carrying it, `token.2`, `token.3`… for the
-    /// rest, in document order.
+    /// Document-order suffixes disambiguate repeated tokens.
     public static func rendered(token: String, ordinal: Int) -> String {
         ordinal <= 1 ? token : "\(token).\(ordinal)"
     }
@@ -113,17 +79,13 @@ public enum MacLookHandle {
         }
     }
 }
-/// One interactive thing she can act on. `path` records observed topology for
-/// live resolution; identity drift refuses the act and requires a fresh look.
+/// Paths preserve observed topology; identity drift refuses execution and requires a fresh look.
 public struct MacLookAffordance: Sendable, Equatable {
     public let handle: String
     public let role: String
     public let subrole: String?
     public let label: String
-    /// `title` (the app said so), `value` (the control shows its own contents,
-    /// e.g. a popup button), or `unlabeled`. The latter retains a real handle
-    /// and is rendered as a role ordinal rather than receiving an invented
-    /// name.
+    /// Unlabeled controls retain handles and role ordinals rather than invented names.
     public let labelSource: String
     public let value: String?
     public let secret: Bool
@@ -132,19 +94,13 @@ public struct MacLookAffordance: Sendable, Equatable {
     public let state: String?
     public let frame: MacAXFrame?
     public let path: [Int]
-    /// The label/value as the compiler already redacted them under the FULL
-    /// node context (standalone shape, the control's own caption, the
-    /// enclosing secret-naming group, and the caption beside/above it — the
-    /// same four tests `mac_view`'s legend and `mac_ax_tree` run). When set,
-    /// `toJSON` emits these verbatim; when nil (a hand-built affordance) it
-    /// uses the caption-less legend redaction.
+    /// Reuse full-context compiler redaction verbatim; hand-built affordances receive caption-less legend redaction.
     public let labelJSON: JSONValue?
     public let valueJSON: JSONValue?
     /// Indistinguishable siblings remain actionable, with position-derived identity stated explicitly.
     public let handleAmbiguity: String?
     public var handleAmbiguous: Bool { handleAmbiguity != nil }
-    /// An editable field's placeholder, a second name it answers to, and its
-    /// compile-time redaction verdict (same contract as `labelJSON`).
+    /// Placeholder aliases retain the same compile-time redaction as labels.
     public let placeholder: String?
     public let placeholderJSON: JSONValue?
     public init(
@@ -184,15 +140,11 @@ public struct MacLookAffordance: Sendable, Equatable {
         self.labelJSON = labelJSON
         self.valueJSON = valueJSON
     }
-    /// The label as a glance may print it: the clear text when redaction let
-    /// it through, nil when it was redacted (a glance never prints a digest).
+    /// Glances omit withheld labels; they never disclose a digest as prose.
     public var displayLabel: String? {
         MacPerceptionCompiler.displayText(label, json: labelJSON)
     }
-    /// Same redaction contract as a `mac_view` legend row: a secure field's
-    /// value is count+digest, everything else goes through the standalone shape
-    /// test with its own label as the caption — plus, when the compiler
-    /// supplied them, the enclosing-group and beside-caption tests.
+    /// Serialization shares legend secret handling and honors compiler-supplied group and nearby-caption context.
     public func toJSON(valueChars: Int = MacPerceptionCompiler.affordanceValueChars) -> JSONValue {
         var object: [String: JSONValue] = [
             "handle": .string(handle),
@@ -208,10 +160,7 @@ public struct MacLookAffordance: Sendable, Equatable {
             object["placeholder"] = placeholderJSON
                 ?? MacScreenViewTextRedaction.redactedLegendString(placeholder, valueChars: valueChars)
         }
-        // Coordinates remain implementation evidence for the four-verb fusion.
-        // Keeping the frame on
-        // the percept means an AX-named link/row cannot lose its physical point
-        // merely because the separately captured view omitted or capped it.
+        // Retain AX geometry so a separately capped view cannot strip a named target’s physical point.
         if let frame { object["frame"] = frame.toJSON() }
         if let value {
             object["value"] = secret
@@ -232,21 +181,16 @@ public struct MacLookAffordance: Sendable, Equatable {
         return .object(object)
     }
 }
-/// A read-only screen value with the shared node handle, path and compile-time redaction.
 public struct MacLookReadout: Sendable, Equatable {
-    /// nil only when the node was outside the handle pass (never in practice —
-    /// handles are minted for EVERY node); `path` records the observed topology.
+    /// Path records topology even when no handle was minted.
     public let handle: String?
     public let role: String
     public let text: String
-    /// `value` (the node published its contents) or `title` (the app named it).
     public let source: String
     public let path: [Int]
-    /// Inside the focused element's subtree, or a sibling of it — the readout
-    /// most likely to be the answer to what she just did.
+    /// Focused-subtree and sibling readouts are likely evidence of the act’s result.
     public let nearFocus: Bool
     public let inModal: Bool
-    /// The text as the compiler already redacted it under the FULL node context.
     public let textJSON: JSONValue?
     public let handleAmbiguity: String?
     public var handleAmbiguous: Bool { handleAmbiguity != nil }
@@ -271,8 +215,7 @@ public struct MacLookReadout: Sendable, Equatable {
         self.textJSON = textJSON
         self.handleAmbiguity = handleAmbiguity
     }
-    /// What the PROSE grade may print: the clear text when redaction let it
-    /// through, nil when it withheld it. A glance never prints a digest.
+    /// Prose prints only approved clear text, never a digest.
     public var displayText: String? {
         MacPerceptionCompiler.displayText(text, json: textJSON)
     }
@@ -294,18 +237,17 @@ public struct MacLookReadout: Sendable, Equatable {
         return .object(object)
     }
 }
-/// A structural region — what a human sees as "the toolbar", "the sidebar",
-/// "the list". She needs these to say WHERE something is without a tree.
+/// Landmarks let callers name structural regions without reading a tree.
 public struct MacLookLandmark: Sendable, Equatable {
     public let kind: String
     public let role: String
     public let label: String?
-    /// 1-based, matching the reader's own depth convention (the window is 1).
+    /// Depth matches the reader’s one-based convention.
     public let depth: Int
     public let path: [Int]
     public let frame: MacAXFrame?
     public let enabled: Bool?
-    /// Compiler-redacted label (full node context); nil ⇒ legend fallback.
+    /// Preserve full-context label redaction; absent compiler context uses the legend redactor.
     public let labelJSON: JSONValue?
     public init(
         kind: String,
@@ -341,7 +283,7 @@ public struct MacLookLandmark: Sendable, Equatable {
         return .object(object)
     }
 }
-/// The sheet/dialog gets its own glance line because it constrains the other controls.
+/// Modals constrain other controls and therefore need their own glance line.
 public struct MacLookModal: Sendable, Equatable {
     public let role: String
     public let subrole: String?
@@ -407,7 +349,6 @@ public struct MacLookFocus: Sendable, Equatable {
         return .object(object)
     }
 }
-/// The compiled percept. One object, three renderings.
 public struct MacLookPercept: Sendable, Equatable {
     public let app: MacAXAppInfo?
     public let windowTitle: String?
@@ -415,30 +356,23 @@ public struct MacLookPercept: Sendable, Equatable {
     public let modal: MacLookModal?
     public let landmarks: [MacLookLandmark]
     public let affordances: [MacLookAffordance]
-    /// Interactive elements with NO label, by role. The affordance rows retain
-    /// them; this is the matching census for compact projections.
+    /// Compact projections need the same unlabeled-control census as retained affordances.
     public let unlabeledByRole: [String: Int]
-    /// Interactive+labeled elements dropped by the affordance cap (before the
-    /// byte budget, which is applied at serialization time).
+    /// Count affordance-cap omissions separately from serialization’s byte-budget omissions.
     public let affordancesOmitted: Int
-    /// Every interactive element seen, labeled or not.
     public let interactiveCount: Int
     public let labeledCount: Int
-    // Passed straight through from the walk — the caller must be able to tell
-    // "there are no more buttons" from "the walk stopped early".
+    // Propagate truncation so absence cannot imply complete coverage.
     public let truncated: Bool
     public let truncationReasons: [String]
     public let skippedAtLeast: Int
     public let readFailures: [String]
-    /// Compiler-redacted window title (full node context); nil ⇒ legend fallback.
+    /// Preserve full-context title redaction; absent compiler context uses the legend redactor.
     public let windowTitleJSON: JSONValue?
-    /// The read-only values on the screen, ranked and capped.
     public let readouts: [MacLookReadout]
-    /// Readouts dropped by `maxReadouts` (before the byte budget).
+    /// Count readout-cap omissions before serialization applies its byte budget.
     public let readoutsOmitted: Int
-    /// How many of the emitted rows carry a position-derived
-    /// (ordinal) handle. Counted so the payload can say it ONCE instead of the
-    /// caller having to notice `.2` suffixes.
+    /// Count ordinal handles so position-derived identity is disclosed once per payload.
     public let ambiguousHandles: Int
     public init(
         app: MacAXAppInfo?,
@@ -479,14 +413,8 @@ public struct MacLookPercept: Sendable, Equatable {
         self.skippedAtLeast = skippedAtLeast
         self.windowTitleJSON = windowTitleJSON
     }
-    /// ONE line, hard-capped at `MacPerceptionCompiler.glanceMaxChars`.
-    ///
-    /// Every segment is the SAME redacted text the structured channel emits
-    /// (compiler-redacted under the full node context when available, the
-    /// standalone shape test otherwise) — a glance is a smaller channel, not
-    /// a laxer one; anything redaction withheld is simply absent here, never
-    /// printed as a digest.
-    /// - Parameter leading: the act's changed/added readout; `mac_look` keeps ranked ordering.
+    /// Glances are smaller with the same redaction: withheld text stays absent, never a digest. Acts may lead with changed readouts; plain looks preserve
+    /// ranked ordering.
     public func glanceLine(leading: MacLookReadout? = nil) -> String {
         var parts: [String] = []
         let appName = app?.name ?? "unknown app"
@@ -517,7 +445,7 @@ public struct MacLookPercept: Sendable, Equatable {
         let line = parts.joined(separator: " · ")
         return MacAccessibilityReader.truncate(line, to: MacPerceptionCompiler.glanceMaxChars)
     }
-    /// Fits the complete delivered envelope, reporting every omitted row.
+    /// Budget the complete envelope and account for every omitted row.
     public func lookJSON(
         byteBudget: Int = MacPerceptionCompiler.lookByteBudget,
         valueChars: Int = MacPerceptionCompiler.affordanceValueChars,
@@ -556,7 +484,7 @@ public struct MacLookPercept: Sendable, Equatable {
                 "truncation_reasons": .array(truncationReasons.map { .string($0) }),
                 "read_failures": .array(readFailures.map(JSONValue.string)),
                 "skipped_at_least": .int(Int64(skippedAtLeast)),
-                // Read-only values report the same omission accounting as controls.
+                // Readouts need the same omission accounting as controls.
                 "readouts": .array(readoutRows),
                 "readout_count": .int(Int64(readoutRows.count)),
                 "readouts_omitted": .int(Int64(readoutsOmitted + readoutsDropped)),

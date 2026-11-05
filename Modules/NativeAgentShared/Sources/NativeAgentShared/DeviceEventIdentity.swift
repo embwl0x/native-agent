@@ -18,8 +18,8 @@ public func nativeAgentNotificationCategories(approvalCategory: String, messageC
     ]
 }
 
-/// A semantic key owns one payload-free, 64-byte-safe ID across APNS, iCloud and
-/// local snapshots. Changing prose cannot create another alert for that event.
+/// A semantic key owns one payload-free, 64-byte-safe ID across APNS, iCloud and local snapshots. Changing prose cannot create another alert for that
+/// event.
 public enum NativeAgentDeviceEventIdentity {
     private static let canonicalHexCount = 64
 

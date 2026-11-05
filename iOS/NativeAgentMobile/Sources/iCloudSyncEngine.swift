@@ -1,4 +1,3 @@
-// Phone snapshot projection and signed action submission to MacSyncEngine.
 
 import CryptoKit
 import AppIntents
@@ -26,8 +25,7 @@ extension InboxAction {
     }
 }
 
-/// The Mac's capture revision travels with the bytes it describes. Phone
-/// request/arrival order is never the age of that snapshot.
+/// Snapshot age comes from the Mac's capture revision, never phone request/arrival order.
 struct MacSnapshotRead<Value: Decodable & Sendable>: Decodable, Sendable {
     let revision: Double
     let value: Value
@@ -35,10 +33,7 @@ struct MacSnapshotRead<Value: Decodable & Sendable>: Decodable, Sendable {
 
 // MARK: - iCloudSyncEngine
 
-/// The last agent name this phone heard, kept only for the pairing that
-/// delivered it. The key is a fingerprint of the pairing secret (a different
-/// Mac or Apple Account pairs with a different secret), never the secret.
-/// Unpaired, or paired to someone else, the name is dropped, not shown.
+/// Retain agent name only for its pairing fingerprint, never the secret; a changed pairing must not show another agent's name.
 enum AgentNameCache {
     private static let nameKey = SharedChatInbox.identityNameKey
     private static let pairingKey = SharedChatInbox.identityPairingKey
@@ -55,10 +50,7 @@ enum AgentNameCache {
         CommunicationNotification.remember(name: name, pairing: fingerprint)
     }
 
-    /// The remembered name when it belongs to this pairing. A different
-    /// pairing clears it. No secret in hand (unpaired, or the Keychain still
-    /// locked at launch) shows nothing and keeps it; `forget` runs when the
-    /// pairing is known to be gone.
+    /// Hide but retain name while key availability is unknown; forget only on checked pairing removal or change.
     static func name(pairing secret: Data?, defaults: UserDefaults? = SharedChatInbox.identityDefaults) -> String? {
         guard let defaults, let name = defaults.string(forKey: nameKey), let fingerprint = fingerprint(secret) else { return nil }
         guard defaults.string(forKey: pairingKey) == fingerprint else {
@@ -83,7 +75,6 @@ final class iCloudSyncEngine {
 
     // MARK: - Published snapshots
 
-    var workshopTasks: [WorkshopTaskRecord] = []
     var deskItems: [MobileDeskItem] = []
     var workOverview: WorkOverview?
     var schedulerSnapshot: MobileSchedulerSnapshot?
@@ -95,12 +86,8 @@ final class iCloudSyncEngine {
     var appSettingsFailure: String?
     var helperDetails: [UUID: MobileHelperEdit] = [:]
     var agentThreads: [String: MobileAgentThread] = [:]
-    /// What the Mac's Desk bounds dropped, as the Mac reported it. nil means no
-    /// report has arrived, never "nothing was dropped".
+    /// Missing Desk omission metadata means no report arrived, never that nothing was omitted.
     var deskBounds: MobileDeskProjectionReport?
-    /// Complete reading copies of the priority Desk items, carried
-    /// automatically beside the compact board so the text that matters can be
-    /// read away from the Mac. Keyed by Desk handle.
     var deskReadingCopies: [String: MobileDeskItemReadingCopy] = [:]
     var skills: [SkillManifestEntry] = []
     var tools: [MobileToolCatalogRecord] = []
@@ -110,14 +97,12 @@ final class iCloudSyncEngine {
     var snapshotReadRevisions: [String: Double] = [:]
     var recordReadbackRevisions: [String: [String: Double]] = [:]
     var trustPolicy: TrustPolicy?
-    // Mac personality.json decodes as the shared PersonalityProfile.
     private(set) var personality: PersonalityProfile?
     var voicePreference: MobileVoicePreference?
     private var personalityPairing: String?
     private var snapshotPairing: String?
 
-    /// Drive snapshots and local CloudKit bytes belong to one pairing. Never
-    /// adopt legacy, unscoped files when pairing changes or after relaunch.
+    /// Bind Drive and CloudKit cache bytes to one pairing; never adopt unscoped files across pairing changes or relaunch.
     static func cachedSnapshotDirectory(in directory: URL, pairing secret: Data?) -> URL {
         directory.appendingPathComponent("pairings", isDirectory: true)
             .appendingPathComponent(AgentNameCache.fingerprint(secret) ?? "unpaired", isDirectory: true)
@@ -148,7 +133,6 @@ final class iCloudSyncEngine {
         } else if let driveSnapshotRoot {
             snapshotDir = fingerprint == nil ? nil : Self.cachedSnapshotDirectory(in: driveSnapshotRoot, pairing: secret)
         }
-        workshopTasks = []
         deskItems = []
         workOverview = nil
         schedulerSnapshot = nil
@@ -195,7 +179,7 @@ final class iCloudSyncEngine {
         groupTransportDeliveryAt = Self.loadGroupDeliveryClocks(pairing: fingerprint)
         staleSnapshotGroups = [:]
         cloudKitCatchUpIncomplete = false
-        cloudKitCatchUpFailed = false
+        cloudKitCatchUpFailures = 0
         syncError = nil
         inboxSnapshotLoaded = false
         approvalsSnapshotLoaded = false
@@ -204,7 +188,6 @@ final class iCloudSyncEngine {
     }
     var sessions: [ChatSession] = []
     var helpersSnapshot: MobileHelpersSnapshot?
-    /// The Mac's layout (ui/layout.json, in the core snapshot); More draws its sections from it.
     var surfaceLayout: SurfaceLayoutAvailability?
     var sessionNavigation: ChatSessionNavigation?
     var pinnedChatSessions: [ChatSession] { sessionNavigation?.rows.filter(\.isPinned).map(\.session) ?? [] }
@@ -212,24 +195,22 @@ final class iCloudSyncEngine {
     var chatTranscripts: [String: PublishedTranscript] = [:]
     var health: RuntimeHealth?
     var organismLivingStatus: OrganismLivingStatusFile?
-    // Mac heavy snapshots publish the newest 50 runs in runs.json.
     var runs: [RunRecord] = []
     var runsSnapshotLoaded = false
     var connectors: [MobileConnectorSnapshot] = []
     var telegram: MobileTelegramSnapshot?
-    // MacSyncEngine publishes providers.json.
     var providers: [ProviderInfo] = []
     var providerSignIns: [String: [String: String]] = [:]
     var surfaceModels: [String: NAProviderSurfaceSelection] = [:]
     var surfaceModelRevisions: [String: Double] = [:]
     var approvals: [ApprovalRequest] = []
     var inboxItems: [InboxItemRecord] = []
-    // Read-only per-turn summaries from the Mac snapshot lane.
+    /// Every page's face as the Mac last published it, by page id.
+    var faces: [String: PartFaceSnapshot] = [:]
     var turnSummaries: TurnSummaryFile?
     var lastSyncAt: Date?
     var foregroundSnapshotGroup: NAMobileSnapshotGroup = .chat
-    /// Persisted delivery times by NAMobileSnapshotGroup.rawValue; each screen reads its own group.
-    /// lastSyncAt measures local cache reads, not transport delivery.
+    /// Track delivery by NAMobileSnapshotGroup.rawValue; lastSyncAt is only a local cache-read time.
     var groupTransportDeliveryAt: [String: Date] = [:]
 
     private static let groupDeliveryDefaultsKey = "na.sync.groupTransportDeliveryAt.v1"
@@ -243,8 +224,7 @@ final class iCloudSyncEngine {
         return stored
     }
 
-    /// The newest delivery across all groups — for connection-wide surfaces
-    /// only (Settings, Advanced), never for a screen that renders one group.
+    /// Use newest cross-group delivery only for connection-wide surfaces; individual screens need their own groups.
     var lastTransportDeliveryAt: Date? { groupTransportDeliveryAt.values.max() }
 
     func clearConnectionDeliveryHistory() {
@@ -253,8 +233,7 @@ final class iCloudSyncEngine {
         UserDefaults.standard.removeObject(forKey: Self.groupDeliveryPairingDefaultsKey)
     }
 
-    /// Record a real delivery of these groups. Call ONLY from the transport's
-    /// own arrival paths, and only for the groups whose read actually landed.
+    /// Renew delivery clocks only from transport arrival and only for groups whose read succeeded.
     func noteTransportDelivery(at date: Date = Date(), groups: Set<NAMobileSnapshotGroup>) {
         guard let pairing = AgentNameCache.fingerprint(pairingStore?.iCloudPairingSecret) else { return }
         for group in groups { groupTransportDeliveryAt[group.rawValue] = date }
@@ -262,12 +241,7 @@ final class iCloudSyncEngine {
         UserDefaults.standard.set(pairing, forKey: Self.groupDeliveryPairingDefaultsKey)
     }
 
-    /// The delivery age a screen may claim. `screenGroup` is the snapshot group
-    /// name a screen renders — the same vocabulary as `staleSnapshotGroups`
-    /// ("approvals", "inbox", "memory_proposals", "desk", "runs"…). A name that
-    /// maps to more than one delivery group takes the OLDEST of them: a screen
-    /// is only as fresh as its stalest input. nil — or a name this build cannot
-    /// map — falls back to the newest delivery across groups.
+    /// Use the oldest mapped input for screen freshness; unmapped/connection-wide callers use newest cross-group delivery.
     func transportDeliveryAt(screenGroup: String?) -> Date? {
         let groups = Self.deliveryGroups(forScreenGroup: screenGroup)
         guard !groups.isEmpty else { return lastTransportDeliveryAt }
@@ -279,21 +253,18 @@ final class iCloudSyncEngine {
         return oldest
     }
 
-    /// Screen group name → the transport groups that carry it. The Mac's
-    /// per-group names are its snapshot filenames without the extension.
     static func deliveryGroups(forScreenGroup name: String?) -> Set<NAMobileSnapshotGroup> {
         guard let name, !name.isEmpty else { return [] }
         return NAMobileSnapshotGroup.groups(containingAny: ["\(name).json"])
     }
     /// Group → reason the Mac could not rebuild it; these rows remain stale regardless of sync time.
     var staleSnapshotGroups: [String: String] = [:]
-    /// A requested or partial catch-up stays owed across coalesced drains.
-    /// Only a complete remote pull followed by a successful cache refresh clears it.
+    /// Coalesced/partial catch-up remains owed until a complete remote pull and successful cache refresh.
     var cloudKitCatchUpIncomplete = false
-    /// What the warning claims: a catch-up read finished and failed. A read that
-    /// merged into the 0.75 s foreground receive (skipped) or is still running is
-    /// owed work, not stale data (User 11-01: the warning kept popping up while chat worked).
-    var cloudKitCatchUpFailed = false
+    /// Warn only after catch-up reads fail twice running: one the next read heals is not the person's news,
+    /// and a running read or one merged into the 0.75 s foreground receive remains owed.
+    var cloudKitCatchUpFailures = 0
+    var cloudKitCatchUpFailed: Bool { cloudKitCatchUpFailures >= 2 }
     private var snapshotSyncError: String?
     var syncError: String? {
         get {
@@ -304,15 +275,10 @@ final class iCloudSyncEngine {
         set { snapshotSyncError = newValue }
     }
     var inboxSnapshotLoaded = false
-    /// Per-queue arrival, for the same reason the inbox flag exists: a
-    /// provider-catalog update alone sets `lastSyncAt`, so a shared timestamp
-    /// is not evidence that these queues were ever read. An empty array before
-    /// its own flag is set means "not arrived", never "clear".
+    /// Track queue arrival independently: provider updates advance lastSyncAt without proving empty queues were ever read.
     var approvalsSnapshotLoaded = false
     var memoryProposalsSnapshotLoaded = false
 
-    /// The configured name from the Mac; else the last one this phone heard;
-    /// the product name only before any name has ever been known.
     var agentDisplayName: String {
         let secret = pairingStore?.iCloudPairingSecret
         let lastKnown = AgentNameCache.name(pairing: secret)
@@ -337,7 +303,6 @@ final class iCloudSyncEngine {
     @ObservationIgnored let snapshotRead = LatestRead()
     @ObservationIgnored let trustRead = LatestRead()
     var snapshotHealth: [String: SnapshotReadHealth] = [:]
-    @ObservationIgnored let workshopRead = LatestRead()
     @ObservationIgnored let memoryRead = LatestRead()
     @ObservationIgnored let inboxRead = LatestRead()
     @ObservationIgnored let deskRead = LatestRead()
@@ -345,18 +310,14 @@ final class iCloudSyncEngine {
     @ObservationIgnored let transcriptsRead = LatestRead()
     @ObservationIgnored let sessionListRead = LatestRead()
     @ObservationIgnored let appSettingsRead = LatestRead()
-    /// Injected by the app after PairingStore is created. Used to sign outgoing inbox messages.
     var pairingStore: PairingStore? {
         didSet { invalidateSnapshots(pairing: pairingStore?.iCloudPairingSecret) }
     }
 
-    // The main actor serializes admission by transaction. Independent actions
-    // (especially Stop) can submit together; repair waits for all active sends.
+    // Serialize transaction admission on MainActor; independent actions including Stop may overlap, while repair waits for active sends.
     var sendingTransactions: Set<String> = []
 
-    // Transaction persistence is part of sendAction's acceptance boundary.
-    // Coordinated iCloud I/O is synchronous and can stall, so every ledger
-    // transition races a finite deadline before send ownership is released.
+    // Ledger persistence is part of send acceptance; bound synchronous coordinated-I/O waits before releasing send ownership.
     var transactionWriteTimeoutSeconds: TimeInterval = 5
 
     init(personality: PersonalityProfile? = nil) { self.personality = personality }
@@ -370,16 +331,12 @@ enum SyncError: LocalizedError {
     case timeout(String)
     case responseUnconfirmed(String)
     case persistence(String)
-    /// Submission conflicts with an active transaction or connection repair.
     case busy(String)
-    /// The signed request reached the Mac but its effect is still held by the
-    /// canonical approval owner. This is neither success nor a retryable
-    /// transport failure.
+    /// Pending canonical approval is neither success nor retryable transport failure.
     case approvalRequired(String, approvalID: String? = nil)
     case unsupported(String)
     case macRejected(String)
-    /// This submission was refused before dispatch. It does not settle any
-    /// earlier retained request; `.responseUnconfirmed` preserves that uncertainty.
+    /// Pre-dispatch refusal cannot settle an earlier retained request; responseUnconfirmed preserves its uncertainty.
     case sendFailed(String)
 
     var errorDescription: String? {

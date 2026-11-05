@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Research.swift` | `CognitiveSubstrate`: live workspace intervention and frozen Observatory summary; experiment metrics are retired |
+// Blueprint: | `CognitiveSubstrate+Research.swift` | `CognitiveSubstrate`: workspace intervention and frozen Observatory reads |
 
 extension CognitiveSubstrate {
     public func setAblation(_ key: String, enabled: Bool) async {

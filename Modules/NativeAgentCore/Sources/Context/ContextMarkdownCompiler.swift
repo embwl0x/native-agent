@@ -2,11 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersonaEngine
-// Blueprint: | `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`: bounded Markdown atom compilation and exact unchanged-source reuse; `triggerTokens` owns ordered trigger extraction with source-specific tokenization/filter/bound parameters; canonical source bytes are hashed and parsed unchanged |
-
-// Preserve the Context module's public policy name while readers/helpers use
-// the same owner before composing source fragments into derived text.
-public typealias ContextSecretContentPolicy = NativeAgentCore.ContextSecretContentPolicy
+// Blueprint: | `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`, `triggerTokens`: bounded Markdown atoms and source-specific triggers |
 
 public protocol ContextMarkdownEmbeddingProvider: Sendable {
     var modelFingerprint: String { get }
@@ -56,9 +52,8 @@ public enum ContextMarkdownCompilerError: Error, Equatable, Sendable, CustomStri
     }
 }
 
-/// A deterministic, local-only compiler for registered Markdown sources.
 public struct ContextMarkdownCompiler: Sendable {
-    /// Ordered, unique triggers; each projection supplies its token and bound rules.
+    /// Each projection supplies its trigger-token and bound rules.
     public static func triggerTokens(
         _ texts: [String], minimumLength: Int, maximumCount: Int,
         excluding stopwords: Set<String>, tokens: (String) -> [String],
@@ -295,8 +290,7 @@ extension ContextMarkdownCompiler {
         let contentRole: ContextContentRole
         let semanticBody: String
         let summary: String
-        /// Ordinary identity uses the semantic body; generated facts use the projection key.
-        /// Embedding reuse still requires the same semantic body.
+        /// Ordinary identity uses the semantic body; generated facts use the projection key. Embedding reuse still requires the same semantic body.
         let identityDigest: String
         let triggers: [String]
     }
@@ -332,8 +326,6 @@ extension ContextMarkdownCompiler {
         )
     }
 
-    /// Does this source own a generated USER.md projection whose autogen body
-    /// should be cut per bullet?
     private static func isGeneratedUserProjection(
         descriptor: ContextSourceDescriptor,
         documentName: String

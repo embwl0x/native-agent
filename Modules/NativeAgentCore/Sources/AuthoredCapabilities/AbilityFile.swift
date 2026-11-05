@@ -5,17 +5,14 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityFile.swift` | Canonical authored file, header, slot and reach representation; shared header argument schemas for saving abilities and making senses |
+// Blueprint: | `AbilityFile.swift` | Shared canonical part file, header, reach and argument schemas |
 extension AbilityStore {
     public enum Kind: String, CaseIterable, Sendable {
-        /// Authored abilities use `ability` in their headers.
         case part = "ability", sense, turn
     }
     public static let sourceLimit = 512 * 1024
     public static let didChange = Notification.Name("NativeAgent.abilityDidChange")
-    /// A wake source fired. The stem delivers it to each part whose `wake`
-    /// lists the name (only `part`, when one is named), as that run's input.
-    /// A payload carrying another agent's words names it as `agent`.
+    /// Wake delivery selects declared source names and optional target parts; peer-word payloads retain their agent provenance.
     public static let signalled = Notification.Name("NativeAgent.partSignalled")
     public static let partKeys: Set<String> = ["reach", "wake", "face", "resident", "learned", "choices"]
     private static let partActionPattern = "^[a-z][a-z0-9_]*[.][a-z][a-z0-9_.]*$"
@@ -31,13 +28,19 @@ extension AbilityStore {
                 "action": .object(["type": .string("string"), "pattern": .string(partActionPattern)]),
                 "projection": .object(["type": .string("boolean")])]), "required": .array([]), "additionalProperties": .bool(false)]),
             "wake": .object(["type": .string("array"), "items": .object(["type": .string("string")]),
-                "description": .string("Posted signals: schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away, person.here, network.down, network.up. Omit to inherit; [] clears.")]),
-            "resident": .object(["type": .string("boolean"), "description": .string("Retain JS and held resources across successful runs; default false, inherited on revision.")]),
-            "learned": .object(["description": .string("Any JSON retained as declared learned metadata; no shape is enforced and it earns no competence. Omit to inherit.")]),
+                "description": .string("""
+                    Posted signals: schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, \
+                    resumed, person.away, person.here, network.down, network.up. Omit to inherit; [] clears.
+                    """)]),
+            "resident": .object(["type": .string("boolean"), "description": .string(
+                "Retain JS and held resources across successful runs; default false, inherited on revision.")]),
+            "learned": .object(["description": .string("""
+                Any JSON retained as declared learned metadata; no shape is enforced and it earns no competence. Omit to inherit.
+                """)]),
             "choices": .object(["description": .string("Any JSON retained as reserved choices metadata; no shape is enforced. Omit to inherit.")])
         ]
     }()
-    /// Shared identity normalization below Parts.
+    /// Identity normalization is shared below Parts.
     public static func normalizedID(_ given: String) -> String {
         given.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             .replacingOccurrences(of: #"[^a-z0-9_-]+"#, with: "-", options: .regularExpression)
@@ -45,7 +48,8 @@ extension AbilityStore {
     }
     public static func isAbilityID(_ id: String) -> Bool { id.range(of: #"^[a-z][a-z0-9_-]{1,63}$"#, options: .regularExpression) != nil }
     public static func knownReach(_ name: String) -> Bool {
-        if ["app_data_read", "app_data_write", "network_localhost", "network_public", "network", "shell", "computer_files", "arbitrary_file_write", "model", "calendar", "reminders", "contacts", "screen.watch", "hands"].contains(name) { return true }
+        if ["app_data_read", "app_data_write", "network_localhost", "network_public", "network", "shell", "computer_files", "arbitrary_file_write", "model",
+            "calendar", "reminders", "contacts", "screen.watch", "hands"].contains(name) { return true }
         let pieces = name.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
         if pieces.count == 2, pieces[0] == "secret" { return Keyring.validName(String(pieces[1])) }
         return pieces.count == 2 && ["app_read", "app_write"].contains(pieces[0])
@@ -59,17 +63,18 @@ extension AbilityStore {
             "app_data_read": reads, "computer_files": reads,
             "app_data_write": files, "arbitrary_file_write": files,
             "calendar": ["calendar.upcoming", "calendar.calendars", "calendar.free_busy", "calendar.create", "calendar.modify", "calendar.delete"],
-            "reminders": ["reminders.due_today", "reminders.query", "reminders.lists", "reminders.read", "reminders.create", "reminders.update", "reminders.complete", "reminders.delete", "reminders.list_rename", "reminders.list_create"],
+            "reminders": ["reminders.due_today", "reminders.query", "reminders.lists", "reminders.read", "reminders.create", "reminders.update",
+                "reminders.complete", "reminders.delete", "reminders.list_rename", "reminders.list_create"],
             "contacts": ["contacts.search", "contacts.save", "contacts.delete"],
         ]
         return Set(capabilities.flatMap { actions[$0] ?? [] }).sorted()
     }
-    /// The same header for every part. Abilities consume reach.capabilities;
-    /// readPaths/hosts/apps serve senses. Reads and saves accept the same wakes.
+    /// All part kinds share a header; abilities use capabilities while senses use readPaths/hosts/apps, with shared wake admission.
     public static func partHeader(_ fields: [String: JSONValue]) throws -> [String: JSONValue] {
         var header = fields.filter { partKeys.contains($0.key) }
         let reach = header["reach"] ?? .object([:])
-        guard case .object(var scope) = reach else { throw headerFailure("reach", accepted: "{capabilities?: [string], readPaths?: [string], hosts?: [string], apps?: [string]}") }
+        guard case .object(var scope) = reach else { throw headerFailure("reach",
+            accepted: "{capabilities?: [string], readPaths?: [string], hosts?: [string], apps?: [string]}") }
         let reachKeys = Self.partArgumentSchemas["reach"]!.objectValue!["properties"]!.objectValue!.keys.sorted()
         for key in reachKeys {
             if scope[key] == nil { scope[key] = .array([]) }
@@ -77,10 +82,13 @@ extension AbilityStore {
                 throw headerFailure("reach.\(key)", accepted: "an array of nonempty strings")
             }
             if key == "capabilities", let invalid = values.compactMap(\.stringValue).first(where: { !knownReach($0) }) {
-                throw headerFailure("reach.capabilities", accepted: "known reach names; use app {find:\"ability.save\"} for declarations", detail: "Unknown reach name: \(invalid).")
+                throw headerFailure("reach.capabilities", accepted: "known reach names; use app {find:\"ability.save\"} for declarations",
+                    detail: "Unknown reach name: \(invalid).")
             }
         }
-        if let key = scope.keys.sorted().first(where: { !reachKeys.contains($0) }) { throw headerFailure("reach.\(key)", accepted: "capabilities, readPaths, hosts or apps", detail: "Unknown reach key: \(key). Remove it or use an accepted key.", code: "unknown_header_reach_key") }
+        if let key = scope.keys.sorted().first(where: { !reachKeys.contains($0) }) { throw headerFailure("reach.\(key)",
+            accepted: "capabilities, readPaths, hosts or apps", detail: "Unknown reach key: \(key). Remove it or use an accepted key.",
+            code: "unknown_header_reach_key") }
         header["reach"] = .object(scope)
         let wake = header["wake"] ?? .array([])
         guard case .array(let signals) = wake else { throw headerFailure("wake", accepted: "an array of signal-name strings") }
@@ -91,12 +99,17 @@ extension AbilityStore {
                 || ["schedule:", "file.changed:"].contains { prefix in
                     name.hasPrefix(prefix) && !name.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
-            guard valid else { throw headerFailure("wake", accepted: "schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away, person.here, network.down or network.up", detail: "Unknown wake name: \(name). Replace it with an accepted signal.") }
+            guard valid else { throw headerFailure("wake", accepted: """
+                schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away, \
+                person.here, network.down or network.up
+                """, detail: "Unknown wake name: \(name). Replace it with an accepted signal.") }
         }
         header["wake"] = wake
-        guard case .object(let face) = header["face"] ?? .object([:]) else { throw headerFailure("face", accepted: "{page?: string, action?: string, projection?: bool}") }
+        guard case .object(let face) = header["face"] ?? .object([:]) else { throw headerFailure("face",
+            accepted: "{page?: string, action?: string, projection?: bool}") }
         let faceKeys = Self.partArgumentSchemas["face"]!.objectValue!["properties"]!.objectValue!.keys
-        if let key = face.keys.sorted().first(where: { !faceKeys.contains($0) }) { throw headerFailure("face.\(key)", accepted: "page, action or projection", detail: "Unknown face key: \(key). Remove it or use an accepted key.", code: "unknown_header_face_key") }
+        if let key = face.keys.sorted().first(where: { !faceKeys.contains($0) }) { throw headerFailure("face.\(key)", accepted: "page, action or projection",
+            detail: "Unknown face key: \(key). Remove it or use an accepted key.", code: "unknown_header_face_key") }
         if let projection = face["projection"], projection != .bool(true), projection != .bool(false) {
             throw headerFailure("face.projection", accepted: "a Boolean; true declares function face(input)")
         }
@@ -105,7 +118,8 @@ extension AbilityStore {
         }
         if let page = face["page"] {
             guard case .string(let name) = page, AppDoorNames.partPages.contains(name) else {
-                throw headerFailure("face.page", accepted: AppDoorNames.partPages.sorted().joined(separator: ", "), detail: "Unknown face.page \(page). Select an accepted page.")
+                throw headerFailure("face.page", accepted: AppDoorNames.partPages.sorted().joined(separator: ", "),
+                    detail: "Unknown face.page \(page). Select an accepted page.")
             }
         }
         header["face"] = .object(face)
@@ -119,10 +133,7 @@ extension AbilityStore {
             code: code ?? "invalid_header_" + field.replacingOccurrences(of: ".", with: "_"), status: .refused,
             instruction: "Correct \(field) in this call or retained header to match accepted.", recovery: .correctArguments)
     }
-    /// A part's code as she reads it: whole when it fits one read, else in
-    /// pages that say where they are and how to go on, never a silent cut.
-    /// A page is sized so a read carrying two (a skill's selected and waiting
-    /// versions) stays inside one tool result, which is never re-cut.
+    /// Paginate with explicit continuation; each page must let two versions fit one tool result without a second cut.
     public static let sourcePageCharacters = 18_000
     public static func sourcePage(_ code: String, version: String, offset: Int, next: (Int) -> JSONValue) -> JSONValue {
         let from = min(max(0, offset), code.count)
@@ -140,7 +151,6 @@ extension AbilityStore {
         }
         return .object(page)
     }
-    /// A revised body: each {old, new} in turn replaces the one place its old occurs.
     public static func edited(_ body: String, _ edits: JSONValue) throws -> String {
         guard case .array(let list) = edits, !list.isEmpty else { throw failure("edits is a nonempty list of {old, new}.") }
         var text = body
@@ -207,14 +217,12 @@ extension AbilityStore {
                 $0 + ":" + ((try? (metadata[$0] ?? .null).serialize(pretty: false)) ?? "null")
             }.joined(separator: " ")
         }
-        /// What wakes it while it is on.
         public var wakes: [String] {
             let status = record["status"]?.stringValue
             guard kind == .part && status == "active" || kind == .sense && status == "on" else { return [] }
             return (metadata["wake"]?.arrayValue ?? []).compactMap(\.stringValue)
         }
-        /// The checked decoded file carries its digest; changing its body
-        /// refreshes it. Derived data does not change source-field equality.
+        /// The checked decoded file carries its digest; changing its body refreshes it. Derived data does not change source-field equality.
         private static func digest(_ body: String) -> String {
             SHA256.hash(data: Data(body.utf8)).map { String(format: "%02x", $0) }.joined()
         }

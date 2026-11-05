@@ -23,19 +23,13 @@ import os
 #endif
 // Blueprint: | `MacScreenViewBuilder.swift` | View and mark construction from captured geometry and accessibility |
 public enum MacScreenViewBuilder {
-    /// Hard ceilings. A 4K capture of a dense app can offer hundreds of
-    /// actionable elements and ~10 MB of pixels; either one alone would eat the
-    /// turn. A caller may lower these, never raise them.
+    /// Hard ceilings prevent dense controls or 4K pixels from consuming a turn; callers may lower them only.
     public static let hardMaxMarks = 60
     public static let hardMaxImageBytes = 600_000
-    /// The prose channel is capped too: a document window can expose thousands
-    /// of static-text nodes, and an unbounded dump would drown the legend it
-    /// exists to complete.
+    /// Bound prose so thousands of document text nodes cannot drown the legend.
     public static let hardMaxTextItems = 80
     public static let visualSurfaceRoles: Set<String> = ["AXImage", "AXCanvas"]
-    /// The largest real visual surface worth giving its own pixel budget.
-    /// Small icons are deliberately excluded: focusing them would discard the
-    /// surrounding UI while adding no useful canvas/game perception.
+    /// Only substantial visual surfaces earn a pixel budget; small-icon crops lose useful surrounding UI.
     public static func dominantVisualSurface(
         nodes: [MacAXNode],
         geometry: MacScreenViewGeometry,
@@ -44,10 +38,7 @@ public enum MacScreenViewBuilder {
         let captureArea = geometry.bounds.w * geometry.bounds.h
         guard captureArea > 0 else { return nil }
         return nodes.compactMap { node -> MacAXFrame? in
-            // WebKit can expose a painted canvas as a childless AXWebArea,
-            // not AXImage/AXCanvas. Browser chrome is not evidence that the
-            // page itself is readable. Inspect only this area's descendants;
-            // ordinary semantic pages keep their existing no-OCR path.
+            // WebKit may expose painted content as childless AXWebArea; inspect that subtree because browser chrome cannot prove readability.
             let emptyWebSurface = node.attributes.role == "AXWebArea"
                 && !nodes.contains { child in
                     guard child.path.count > node.path.count,
@@ -72,11 +63,7 @@ public enum MacScreenViewBuilder {
             return frame
         }.max { lhs, rhs in lhs.w * lhs.h < rhs.w * rhs.h }
     }
-    /// Nil means the accessibility read
-    /// carries the window and no pixels are attached. A reason means the
-    /// window is a canvas, a game, video, or an app that publishes almost
-    /// nothing, and one small image of it earns its bytes. Real AppKit
-    /// windows publish named controls or text and never reach a reason.
+    /// Deliver pixels only when sparse AX or a real visual surface makes one small image useful.
     public static func thinAccessibilityReason(
         accessibilityTrusted: Bool,
         marks: [JSONValue],
@@ -87,10 +74,7 @@ public enum MacScreenViewBuilder {
         sourceTextCharacters: Int
     ) -> String? {
         guard accessibilityTrusted else { return "no accessibility read" }
-        // A dominant AXImage/AXCanvas (or childless AXWebArea) is unreadable
-        // content even when its surrounding toolbar has plenty of words.
-        // Chromium renderer reads are retained by the caller; window-wide
-        // text counts can only grade windows without a dominant visual body.
+        // Dominant visual bodies remain unreadable despite verbose toolbars; window-wide text counts grade only windows without one.
         if (canvasFraction ?? 0) >= 0.5 { return "canvas" }
         if sourceTextCharacters >= 80 || sourceTextCount >= 4 { return nil }
         let visibleCharacters = texts.reduce(0) { total, value in
@@ -117,36 +101,27 @@ public enum MacScreenViewBuilder {
             if case .string(let text)? = item["text"] { return total + text.count }
             return total + 20
         }
-        // One meaningful thing per ~100k pt² (a 1400×900 window wants ~12),
-        // never fewer than four; any real paragraph of text is not thin.
+        // Require roughly one meaningful item per 100k square points, with at least four; real paragraphs are never thin.
         let floor = max(4, Int(windowArea / 100_000))
         guard named + texts.count < floor, characters < 80 else { return nil }
         if named == 0, texts.isEmpty { return roles.isEmpty ? "no controls or words" : "only unnamed groups" }
         return "few controls or words for its size"
     }
-    /// Roles that are worth a number even when the app advertises no AX action
-    /// for them. Two families:
-    ///   • CLICKABLE — the things a human would point at.
-    ///   • SCROLLABLE — the things a human would scroll; they are rarely
-    ///     "pressable" but `mac_scroll` needs somewhere to aim.
+    /// Clickable and scrollable roles need marks even without advertised AX actions so both pointing and wheel input have targets.
     public static let clickableRoles: Set<String> = [
         "AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton",
         "AXMenuItem", "AXMenuBarItem", "AXLink", "AXTextField", "AXTextArea",
         "AXSecureTextField", "AXSearchField", "AXComboBox", "AXSlider",
         "AXIncrementor", "AXStepper", "AXDisclosureTriangle", "AXTabButton",
         "AXToolbarButton", "AXColorWell", "AXSegmentedControl",
-        // Content rows are what a person points at in sidebars, outlines and
-        // lists even when the app advertises no AX action on the container.
+        // Source-list rows remain pointing targets even without container AX actions.
         "AXRow", "AXOutlineRow", "AXListItem",
     ]
     public static let scrollableRoles: Set<String> = [
         "AXScrollArea", "AXScrollBar", "AXTable", "AXOutline", "AXList",
         "AXWebArea", "AXCollection",
     ]
-    /// With `value`, a field whose displayed value is all mask glyphs IS a
-    /// password box whatever its role, subrole or label say: AppKit and WebKit
-    /// publish a secure field's value as bullets, so an unlabelled web
-    /// `<input type=password>` with no secure subrole is caught here.
+    /// Masked values identify secure fields even when WebKit omits their secure role or label.
     public static func isSecretField(role: String, subrole: String?, label: String?, value: String? = nil) -> Bool {
         if role == "AXSecureTextField" || subrole == "AXSecureTextField" { return true }
         if let shown = value?.trimmingCharacters(in: .whitespaces), !shown.isEmpty,
@@ -154,10 +129,7 @@ public enum MacScreenViewBuilder {
         guard let label = label?.lowercased(), !label.isEmpty else { return false }
         return MacScreenViewTextRedaction.secretFieldLabelTokens.contains { label.contains($0) }
     }
-    /// Is this element worth a number? Actionable (it advertises any AX action)
-    /// or structurally clickable/scrollable by role. Everything else — static
-    /// text, groups, decoration — stays unmarked so the picture does not turn
-    /// into confetti.
+    /// Mark actionable or structurally interactive elements only so decoration cannot overwhelm the picture.
     public static func isMarkable(_ attributes: MacAXAttributes) -> Bool {
         if !attributes.actions.isEmpty { return true }
         if clickableRoles.contains(attributes.role) { return true }
@@ -166,24 +138,18 @@ public enum MacScreenViewBuilder {
     }
     public struct Selection: Sendable, Equatable {
         public let marks: [MacScreenViewMark]
-        /// Markable elements dropped because the mark cap was reached.
         public let omitted: Int
-        /// Markable elements with no frame, or a frame entirely outside the
-        /// captured rect. Counted, never silently dropped.
+        /// Count missing-frame and off-capture omissions rather than silently dropping them.
         public let offscreen: Int
         public var truncated: Bool { omitted > 0 }
     }
-    /// Number the markable elements in READING ORDER — top-to-bottom in 8-point
-    /// row bands, then left-to-right inside a band, then document order. That
-    /// is how a human scans a GUI, so "the third button along the toolbar" is
-    /// the third number, and it is fully deterministic: two captures of an
-    /// unchanged screen produce the same numbering.
+    /// Eight-point row bands then horizontal and document order match reading order and keep unchanged-screen numbering deterministic.
     public static func select(
         nodes: [MacAXNode],
         geometry: MacScreenViewGeometry,
         maxMarks: Int = hardMaxMarks,
         settableAttributes: (MacAXNode) -> [String] = { _ in [] }
-    ) -> Selection {
+    , context: MacOperationContext) -> Selection {
         let cap = max(1, min(maxMarks, hardMaxMarks))
         var candidates: [(frame: MacAXFrame, node: MacAXNode)] = []
         var offscreen = 0
@@ -209,7 +175,7 @@ public enum MacScreenViewBuilder {
         let kept = candidates.prefix(cap)
         var marks: [MacScreenViewMark] = []
         marks.reserveCapacity(kept.count)
-        // Use the whole node set: enclosing groups need not be markable candidates.
+        // Enclosing secret groups need not be markable, so use the whole node set.
         let context = MacScreenViewTextRedaction.nodeSecretContext(nodes)
         let names = LabelIndex(nodes)
         for (index, candidate) in kept.enumerated() {
@@ -264,9 +230,7 @@ public enum MacScreenViewBuilder {
             offscreen: offscreen
         )
     }
-    /// Retain observed ownership when naming a numbered control.
-    /// Names come from the control or its owned descendants, never proximity.
-    /// Children are indexed once by parent path for bounded caption reads.
+    /// Names require observed ownership, never proximity; index children by parent path to bound caption reads.
     public struct LabelIndex: Sendable {
         let nodes: [MacAXNode]
         let children: [[Int]: [Int]]
@@ -286,17 +250,14 @@ public enum MacScreenViewBuilder {
         let nodes = index.nodes
         if node.attributes.labelUnreadable { return (nil, "unreadable") }
         if let title = node.attributes.title, !title.isEmpty { return (title, "title") }
-        // A popup button / checkbox often carries its meaning in its value.
+        // Popup and checkbox values may supply their meaning.
         if !isSecretField(role: node.attributes.role, subrole: node.attributes.subrole, label: nil),
            !scrollPositionRoles.contains(node.attributes.role),
            let value = node.attributes.value?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty, value.count <= 60 {
             return (value, "value")
         }
-        // Finder and many source-list controls name the ROW only through a
-        // child: AXRow > AXCell > AXStaticText("Screenshots"). Treat that text
-        // as the row's inferred name, bounded to the same two levels/three
-        // descendants as the look compiler's identity pass.
+        // Rows may be named only by static descendants; bound inference to the same two levels and three descendants as identity compilation.
         if MacLookHandle.contentIdentityRoles.contains(node.attributes.role) {
             var budget = 3
             func descendantText(path: [Int], depth: Int) -> String? {
@@ -318,19 +279,15 @@ public enum MacScreenViewBuilder {
         }
         return (nil, "none")
     }
-    /// A scroll bar and its thumb: their value is a position, not a name.
+    /// Scrollbar values are positions rather than names.
     static let scrollPositionRoles: Set<String> = ["AXScrollBar", "AXValueIndicator"]
-    /// Roles that carry readable prose rather than behaviour.
     public static let textRoles: Set<String> = [
         "AXStaticText", "AXHeading", "AXLabel", "AXValueIndicator",
     ]
     public struct VisibleText: Sendable, Equatable {
         public let text: String
         public let frame: MacAXFrame
-        /// Non-nil when this line was judged to be a secret shown as PROSE (an
-        /// on-screen 2FA code, a revealed API key, a masked password run). The
-        /// characters then never leave — see `toJSON()`. Set by
-        /// `MacScreenViewTextRedaction`, never by a caller.
+        /// Only the redaction owner may set a prose secret verdict; withheld characters must never serialize.
         public let redactionReason: String?
         public init(text: String, frame: MacAXFrame, redactionReason: String? = nil) {
             self.text = text
@@ -350,11 +307,7 @@ public enum MacScreenViewBuilder {
         public let items: [VisibleText]
         public let omitted: Int
     }
-    /// What the window SAYS, in reading order — the part of the screen that is
-    /// prose rather than controls. Without this the legend describes a set of
-    /// controls floating in a void; with it, the legend alone answers "what is
-    /// on screen and what does it say", which is the bar the image is not
-    /// supposed to be needed for.
+    /// Read prose alongside controls so the legend can describe the window without requiring an image.
     public static func visibleText(
         nodes: [MacAXNode],
         geometry: MacScreenViewGeometry,
@@ -370,8 +323,7 @@ public enum MacScreenViewBuilder {
             guard !text.isEmpty else { continue }
             guard let frame = node.attributes.frame, frame.w > 0, frame.h > 0,
                   geometry.intersects(frame) else { continue }
-            // Repeated boilerplate (a table's repeated column text) adds no
-            // information and eats the cap.
+            // Repeated boilerplate spends the cap without adding information.
             let key = "\(text)|\(frame.x.rounded(.towardZero))|\(frame.y.rounded(.towardZero))"
             guard seen.insert(key).inserted else { continue }
             candidates.append((frame, text, node.path))
@@ -394,13 +346,7 @@ public enum MacScreenViewBuilder {
             omitted: max(0, candidates.count - cap)
         )
     }
-    /// Fit the annotated image under a byte cap by stepping DOWN a fixed
-    /// resolution ladder, taking the first rung that fits.
-    ///
-    /// Honest by construction: when no rung fits, this returns nil and the
-    /// caller reports `image_exceeds_byte_cap` instead of shipping a truncated
-    /// or silently-absent image. The ladder is fixed (not a binary search) so
-    /// the same screen always produces the same bytes.
+    /// Use a fixed resolution ladder for deterministic byte fitting; if no rung fits, report image_exceeds_byte_cap.
     public static func fitImage(
         maxBytes: Int,
         ladder: [Double] = [1.0, 0.75, 0.5, 0.35, 0.25],

@@ -3,12 +3,10 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `NativeOAuthFlow.swift` | `NativeOAuthFlow` enum; `validateSignInDestination`, `startOAuthFlow`, Anthropic setup-token normalization/admission/write |
+// Blueprint: | `NativeOAuthFlow.swift` | `NativeOAuthFlow`, `validateSignInDestination`, `startOAuthFlow`: checked sign-in ownership |
 
 // MARK: - NativeOAuthFlow
-//
-// Swift-native OAuth entry points for provider sign-in, connector sign-in,
-// callback handling, token status, and persisted token files.
+// Provider and connector sign-in share one callback and persistence owner.
 
 public struct OAuthFlowResult: Sendable {
     public init(ok: Bool, error: String?) { self.ok = ok; self.error = error }
@@ -17,8 +15,7 @@ public struct OAuthFlowResult: Sendable {
 }
 
 public enum NativeOAuthFlow {
-    /// Save a pasted setup token; nil on success, else the reason. Shared with
-    /// the inline provider card, so both write the one shape.
+    /// Provider sheets and inline cards must save setup tokens in the same shape.
     public static func saveAnthropicSetupToken(_ raw: String) -> String? {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: " ", with: "")
@@ -35,7 +32,7 @@ public enum NativeOAuthFlow {
             let now = ISO8601DateFormatter().string(from: Date())
             let payload: [String: Any] = [
                 "access_token": t,
-                // The sign-in method is the sheet's (oauth); a setup token is how it was signed in.
+                // Setup tokens describe credential origin without changing the sheet's sign-in method.
                 "auth_mode": "oauth",
                 "saved_at": now,
             ]
@@ -48,9 +45,7 @@ public enum NativeOAuthFlow {
 
     static let signInAttempts = OAuthSignInAttempts()
 
-    /// Custom URL scheme registered in Info.plist and against each provider's
-    /// desktop client_id. ASWebAuthenticationSession intercepts navigation to
-    /// this scheme; the host segment selects the provider.
+    /// ASWebAuthenticationSession intercepts the registered scheme; its host selects the provider.
     public static let callbackURLScheme = "nativeagent"
 
     public static func validateSignInDestination(providerId: String, dataRoot: URL) throws {
@@ -68,17 +63,19 @@ public enum NativeOAuthFlow {
                 _ = try ProviderStateValidation.credential(at: path)
             }
         } catch {
-            // The checker, its reason and the lever: an absent file passes, so moving it aside clears the way.
+            // Only confirmed absence clears destination validation.
             throw ToolFailureError(
-                "Sign-in was not started: \(path.path) could not be read as a saved sign-in (\(error.localizedDescription)). Move that file aside on the Mac, then sign in again.",
+                """
+                    Sign-in was not started: \(path.path) could not be read as a saved sign-in (\(error.localizedDescription)). Move that file aside on \
+                    the Mac, then sign in again.
+                    """,
                 effects: .none, owner: path.path, tap: "Finder › \(path.path)", personDecides: true)
         }
     }
 
     // MARK: - Public entry
 
-    /// Drive a full PKCE OAuth flow end-to-end.
-    /// Returns when tokens have been persisted (or an error has been surfaced).
+    /// Sign-in returns only after persistence succeeds or its failure is surfaced.
     @MainActor
     public static func startOAuthFlow(
         platform: any NativeOAuthPlatformPort.Type,
@@ -112,7 +109,6 @@ public enum NativeOAuthFlow {
 
         let redirectURI = config.redirectURI
 
-        // Build authorization URL.
         let authURL: URL
         do { authURL = try config.buildAuthURL(
             redirectURI: redirectURI,
@@ -122,8 +118,7 @@ public enum NativeOAuthFlow {
             return OAuthFlowResult(ok: false, error: "Invalid authorization URL: \(error.localizedDescription)")
         }
 
-        // Run the in-process auth session. Throws on user-cancel / scheme
-        // mismatch / OS failure; returns the callback URL on success.
+        // OS session cancellation and callback failures must propagate.
         let callbackURL: URL
         do {
             callbackURL = try await platform.runAuthSession(
@@ -139,7 +134,6 @@ public enum NativeOAuthFlow {
                 error: "Auth session failed: \(error.localizedDescription)")
         }
 
-        // Parse and validate the callback URL.
         let code: String
         switch validateCallback(callbackURL, expectedState: state) {
         case .code(let validatedCode):
@@ -148,7 +142,6 @@ public enum NativeOAuthFlow {
             return OAuthFlowResult(ok: false, error: message)
         }
 
-        // Exchange the code for tokens.
         let tokens: [String: Any]
         do {
             tokens = try await config.exchangeCode(
@@ -162,7 +155,7 @@ public enum NativeOAuthFlow {
                 error: "Token exchange failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
-        // Persist tokens to disk in the shape the read-side adapters expect.
+        // Write the exact schema the selected adapter reads.
         do {
             try signInAttempts.commit(attempt) {
                 try config.persistTokens(tokens, root)

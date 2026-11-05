@@ -1,3 +1,4 @@
+import AgentConversations
 import Foundation
 import Cognition
 import OSLog
@@ -6,15 +7,12 @@ import StandingBots
 import NativeAgentShared
 import Desk
 import TriggerScheduler
-import WorkshopExecution
-// Blueprint: | `DeskActivityPresentation.swift` | Desk lane availability, movement evidence, live activity expiry, program-family eligibility and execution progress |
+// Blueprint: | `DeskActivityPresentation.swift` | Desk availability, movement and expiry; a job carrying an item is its movement |
 public enum DeskLaneState<Row: Sendable>: Sendable {
     case unavailable(String)
     case rows([Row])
     public static var maxReasonChars: Int { 240 }
-    /// Every failure notice on the Desk uses this cap. Keeping the truncation
-    /// at the state boundary makes an unreadable store visible without letting
-    /// an untrusted error string take over the board.
+    /// Bound untrusted errors at the state boundary so a store failure cannot take over the board.
     public static func boundedReason(_ reason: String) -> String {
         String(reason.prefix(maxReasonChars))
     }
@@ -26,37 +24,31 @@ public enum DeskLaneState<Row: Sendable>: Sendable {
         if case .unavailable(let reason) = self { return reason }
         return nil
     }
-    /// A throwing read: the error text IS the reason, bounded.
     public static func failed(_ error: any Error) -> DeskLaneState {
         .unavailable(boundedReason("\(error)"))
     }
 }
-extension DeskLaneState where Row == WorkshopExecutionRecord {
-    public static func classify(rows: [WorkshopExecutionRecord], root: URL) -> DeskLaneState {
-        if let failure = rows.first(where: { $0.id == "queue-unavailable" && $0.status == "unavailable" }),
-           case .object(let result) = failure.result, case .string(let detail)? = result["error"] {
-            var isDirectory: ObjCBool = false
-            let reason = FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory) && !isDirectory.boolValue
-                ? "execution root is not a directory" : detail
-            return .unavailable(boundedReason("Couldn't read the execution record(s) store — \(reason)"))
-        }
-        return .rows(rows)
-    }
-}
 public enum DeskMovementPresentation {
-    public static func evidence(_ executions: [WorkshopExecution.WorkshopExecutionRecord]) -> [String: DeskExecutionEvidence] {
-        let handled = executions.compactMap { row in row.deskHandle.map { ($0, row) } }
-        return Dictionary(grouping: handled, by: { $0.0 })
-            .compactMapValues { entries in
-                let rows = entries.map { $0.1 }
-                return rows.max { $0.updatedAt < $1.updatedAt }.map {
-                    DeskExecutionEvidence(deskHandle: $0.deskHandle, status: $0.status, updatedAt: $0.updatedAt, lastMovementAt: $0.lastMovementAt)
-                }
-            }
+    /// Each Desk item's newest job that carries it.
+    public static func evidence(_ jobs: [AgentJob]) -> [String: DeskExecutionEvidence] {
+        let carried = jobs.compactMap { job in job.desk.map { ($0, job) } }
+        return Dictionary(grouping: carried, by: { $0.0 })
+            .compactMapValues { entries in entries.map { $0.1 }.max { $0.updatedAt < $1.updatedAt }.map(evidence(of:)) }
+    }
+
+    /// A working job moves with its last event; one that needs the person waits on them.
+    public static func evidence(of job: AgentJob) -> DeskExecutionEvidence {
+        let at = NativeTimestampFormat.fractionalZulu(job.updatedAt)
+        let status = switch job.state {
+        case .working: "running"
+        case .needsYou: "blocked_on_approval"
+        default: job.state.rawValue
+        }
+        return DeskExecutionEvidence(deskHandle: job.desk, status: status, updatedAt: at, lastMovementAt: job.state == .working ? at : nil)
     }
     public static func activity(_ item: DeskItem, evidence: DeskExecutionEvidence?, now: Date) -> DeskActivityState {
         DeskActivityState.item(status: item.status.rawValue, kind: item.kind.rawValue,
-            deferred: item.deferUntil != nil, updatedAt: item.updatedAt, evidence: evidence, now: now)
+            deferred: DeskSequencing.isDeferred(item, now: now), updatedAt: item.updatedAt, evidence: evidence, now: now)
     }
 }
 public enum DeskLiveActivityPresentation {
@@ -90,9 +82,7 @@ public enum DeskLiveActivityPresentation {
         public let now: Date
         public let isStale: Bool
         public var asOfText: String { "as of \(DeskRelativeTimePresentation.text(for: generatedAt, now: now))" }
-        /// The next semantic boundary only: snapshot becomes stale or one
-        /// active row ages out. DeskFacade sleeps to this exact instant;
-        /// there is no periodic freshness timer.
+        /// Sleep to the next stale-snapshot or expired-row boundary instead of polling.
         public let nextRefreshAt: Date?
     }
     public enum State: Sendable, Equatable {
@@ -106,7 +96,7 @@ public enum DeskLiveActivityPresentation {
     }
     public static func make(
         deskItems: DeskLaneState<DeskItem>,
-        executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>,
+        jobs: DeskLaneState<AgentJob>,
         evidence: [String: DeskExecutionEvidence],
         generatedTs: String?,
         now: Date,
@@ -117,7 +107,7 @@ public enum DeskLiveActivityPresentation {
         if let reason = deskItems.unavailableReason {
             return .unavailable(reason)
         }
-        if let reason = executions.unavailableReason {
+        if let reason = jobs.unavailableReason {
             return .unavailable(reason)
         }
         let window = max(0, activeWindow)
@@ -135,8 +125,6 @@ public enum DeskLiveActivityPresentation {
             }
             return left.0.handle < right.0.handle
         }
-        // Blank slate and ordinary quiet state collapse completely, including
-        // a blank generatedTs from an empty canonical feed.
         guard !candidates.isEmpty else { return .quiet }
         guard let generatedTs,
               let generatedAt = DeskPage.parseTimestamp(generatedTs)
@@ -170,7 +158,7 @@ public enum DeskLiveActivityPresentation {
 }
 public enum DeskProgramFamilyPresentation {
     public static func workingParentIDs(from items: [DeskItem], evidence: [String: DeskExecutionEvidence], now: Date) -> Set<String> {
-        // Retain the first row for duplicate handles in the durable bytes.
+        // Duplicate durable handles retain their first row.
         let byHandle = items.reduce(into: [String: DeskItem]()) { result, item in
             if result[item.handle] == nil { result[item.handle] = item }
         }
@@ -191,12 +179,5 @@ public enum DeskProgramFamilyPresentation {
             else { return nil }
             return parent.handle
         })
-    }
-}
-public enum DeskExecutionPresentation {}
-extension DeskExecutionPresentation {
-    public static func progress(status: String, planCount: Int, completedCount: Int) -> String? {
-        guard status == "running", planCount > 0 else { return nil }
-        return "step \(min(max(completedCount, 0), planCount - 1) + 1) of \(planCount)"
     }
 }

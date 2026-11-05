@@ -33,7 +33,10 @@ extension SwiftNativeOnboardingClient {
             }
             guard let documents = await reload() else {
                 return .failed(
-                    "The persona was created, but its documents could not be reloaded to save your setup notes. Retry from the Personality page before editing anything else."
+                    """
+                        The persona was created, but its documents could not be reloaded to save your setup notes. Retry from the Personality page before \
+                        editing anything else.
+                        """
                 )
             }
             let trimmedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -43,8 +46,7 @@ extension SwiftNativeOnboardingClient {
                 return .created
             }
             let section = "\n\n## From setup\n" + trimmedNotes + "\n"
-            // Only the section crosses the suspension; the append owner reads
-            // the current SOUL under its write lock. The snapshot is for recovery only.
+            // Only the section crosses the suspension; the append owner reads the current SOUL under its write lock. The snapshot is for recovery only.
             guard await append(soul.id, section) else {
                 return .notesUnsaved(documentID: soul.id, draft: soul.content + section)
             }

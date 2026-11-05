@@ -5,9 +5,9 @@ import CryptoKit
 import AppIntents
 import SwiftUI
 import Observation
-// Blueprint: | `iCloudSyncEngine+SnapshotReading.swift` | Snapshot replica freshness, bounded checked acquisition, whole-document decoding and read-health reporting on iCloudSyncEngine |
+// Blueprint: | `iCloudSyncEngine+SnapshotReading.swift` | Replica freshness, bounded checked reads, whole-document decoding and read health |
 
-/// Health belongs to the read that produced it.
+/// Keep health with the read that produced it.
 enum SnapshotReadHealth: Equatable, Sendable {
     case fine
     case unreadable
@@ -19,11 +19,11 @@ enum SnapshotReadHealth: Equatable, Sendable {
     }
 }
 
-/// Nil health means acquisition did not finish; retain the accepted diagnostics.
+/// Unfinished acquisition has nil health; retain accepted diagnostics.
 typealias SnapshotReading<Value> = (value: Value?, health: SnapshotReadHealth?)
 
 extension Dictionary where Key == String, Value == SnapshotReadHealth {
-    /// Names damaged views and read failures; absent or still-arriving files report no damage.
+    /// Report damage only with read/decode evidence; absent or arriving files are not damaged.
     func damageSentence(for filenames: Set<String>? = nil) -> String? {
         let damaged = keys.sorted().filter { filenames?.contains($0) ?? true }
         guard !damaged.isEmpty else { return nil }
@@ -42,7 +42,7 @@ extension Dictionary where Key == String, Value == SnapshotReadHealth {
 }
 
 extension iCloudSyncEngine {
-    /// Data and diagnostics cross the owner's publication boundary together.
+    /// Publish data and diagnostics together through the owner's boundary.
     func acceptSnapshot<T>(_ read: SnapshotReading<T>, named filename: String) -> T? {
         if let state = read.health {
             if state == .fine { snapshotHealth.removeValue(forKey: filename) }
@@ -61,7 +61,10 @@ extension iCloudSyncEngine {
                 let decoder = JSONDecoder()
                 decoder.dateDecodingStrategy = .iso8601
                 do { return (try decoder.decode([T].self, from: data), .fine) }
-                catch { return (nil, .readFailed(reason: "The published snapshot is invalid: \(error.localizedDescription). Refresh rereads the received copy; ask your agent on the Mac to run doctor.repair for icloud_bridge_state.")) }
+                catch { return (nil, .readFailed(reason: """
+                    The published snapshot is invalid: \(error.localizedDescription). Refresh rereads the received copy; ask your agent on the Mac to run \
+                    doctor.repair for icloud_bridge_state.
+                    """)) }
             }
             return Task.isCancelled ? (nil, nil) : result
         } catch is CancellationError { return (nil, nil) }
@@ -91,11 +94,16 @@ extension iCloudSyncEngine {
         do {
             let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
             if let fileSize = attrs[.size] as? NSNumber, fileSize.uint64Value > UInt64(maxBytes) {
-                return (nil, .readFailed(reason: "The snapshot exceeds its \(maxBytes)-byte read limit. Ask your agent on the Mac to run doctor.repair for icloud_bridge_state; Refresh only rereads the received copy."))
+                return (nil, .readFailed(reason: """
+                    The snapshot exceeds its \(maxBytes)-byte read limit. Ask your agent on the Mac to run doctor.repair for icloud_bridge_state; Refresh \
+                    only rereads the received copy.
+                    """))
             }
         } catch {
             let failure = error as NSError
-            if failure.domain == NSCocoaErrorDomain && (failure.code == NSFileNoSuchFileError || failure.code == NSFileReadNoSuchFileError) { return (nil, nil) }
+            if failure.domain == NSCocoaErrorDomain && (failure.code == NSFileNoSuchFileError || failure.code == NSFileReadNoSuchFileError) {
+                return (nil, nil)
+            }
             return (nil, .readFailed(reason: error.localizedDescription))
         }
         let data: Data
@@ -105,12 +113,14 @@ extension iCloudSyncEngine {
         }
         if data.count > maxBytes {
             NSLog("[iCloudSync] skipping oversized snapshot %@ bytes=%d limit=%d", filename, data.count, maxBytes)
-            return (nil, .readFailed(reason: "The snapshot exceeds its \(maxBytes)-byte read limit. Ask your agent on the Mac to run doctor.repair for icloud_bridge_state; Refresh only rereads the received copy."))
+            return (nil, .readFailed(reason: """
+                The snapshot exceeds its \(maxBytes)-byte read limit. Ask your agent on the Mac to run doctor.repair for icloud_bridge_state; Refresh only \
+                rereads the received copy.
+                """))
         }
         return (data, .fine)
     }
 
-    /// Requests current iCloud bytes with a bounded, cancellation-aware wait.
     nonisolated static func awaitCurrentVersion(
         of url: URL,
         timeout: TimeInterval = 2.5
@@ -142,7 +152,7 @@ extension iCloudSyncEngine {
         return false
     }
 
-    /// iCloud replicas require a current version; local roots are authoritative at their URL.
+    /// Require current iCloud replicas; local roots are authoritative at their URL.
     nonisolated static func acceptsSnapshotReplica(
         isUbiquitous: Bool,
         hasCurrentVersion: Bool?
@@ -150,7 +160,7 @@ extension iCloudSyncEngine {
         !isUbiquitous || hasCurrentVersion == true
     }
 
-    /// Coordinated reads avoid torn bytes; failure preserves publication and reports its cause.
+    /// Coordinate reads to avoid torn bytes; failures preserve publication and report their cause.
     nonisolated static func coordinatedRead(_ url: URL, options: NSFileCoordinator.ReadingOptions = []) throws -> Data {
         try VolumeIO.requireReadyForReading(url)
         var coordError: NSError?
@@ -180,7 +190,6 @@ extension iCloudSyncEngine {
         }
     }
 
-    // Async loaders own cancellation-aware replica freshness and off-main coordinated reads.
     func loadSnapshotObjectAsync<T: Decodable & Sendable>(named filename: String, as type: T.Type = T.self) async -> SnapshotReading<T> {
         guard let snapshotDir else { return (nil, nil) }
         return await Self.loadSnapshotObjectOnly(named: filename, in: snapshotDir)

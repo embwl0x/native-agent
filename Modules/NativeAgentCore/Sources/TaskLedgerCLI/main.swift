@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 
-// Blueprint: | `main.swift` | `TaskLedgerCLI`: explicit ledger append/claim/list commands, one strict option parser before ledger access and shared or explicitly overridden data-root resolution |
+// Blueprint: | `main.swift` | `TaskLedgerCLI`: Strict ledger CLI and explicit data-root resolution |
 
 @main
 struct TaskLedgerCLI {
@@ -79,7 +79,7 @@ struct TaskLedgerCLI {
             return 64
         }
         guard let actor = actor(parsed.options["actor"]) else {
-            fputs("error: \(command) requires --actor claude|assistant|codex|user\n", stderr)
+            fputs("error: \(command) requires --actor agent|user|peer:<contact id>\n", stderr)
             return 64
         }
         let taskId: String
@@ -88,7 +88,8 @@ struct TaskLedgerCLI {
         } else if kind == .created {
             taskId = UUID().uuidString
         } else {
-            fputs(claiming ? "error: claim requires --task-id\n" : "error: --task-id is required for kind '\(kind.rawValue)' (only 'created' may omit it)\n", stderr)
+            fputs(claiming ? "error: claim requires --task-id\n" : "error: --task-id is required for kind '\(kind.rawValue)' (only 'created' may omit it)\n",
+                stderr)
             return 64
         }
         let event = TaskLedgerEvent(
@@ -236,7 +237,7 @@ struct TaskLedgerCLI {
           claim  --actor <actor> --task-id <id> [--title <title>] [--note <note>] [--ref <ref>...] [--force]
           list   [--task-id <id>] [--include-done] [--pretty]
 
-        actors: claude, assistant, codex, user
+        actors: agent, user, peer:<contact id from agent.contacts>
         kinds:  created, claimed, update, blocked, done, cancelled
         option values beginning with -- require equals, e.g. --note='--literal text'
         default data root: $NATIVE_AGENT_DATA_ROOT or NativeAgent's application data root

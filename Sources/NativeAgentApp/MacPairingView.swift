@@ -1,37 +1,33 @@
-// Mac-side iCloud pairing delivery and explicit key rotation.
 import SwiftUI
 import DeviceSync
 import NativeAgentShared
 
-// Blueprint: | `MacPairingView.swift` | `MacPairingView`: shared pairing assessment, checked iCloud delivery repair and explicit key rotation; no manual key transfer; offscreen reads never generate keys |
+// Blueprint: | `MacPairingView.swift` | `MacPairingView`: checked iCloud pairing; explicit rotation; quiet reads generate no keys |
 
 struct MacPairingView: View {
     @Environment(AppModel.self) private var appModel
     private var sync: SyncFacade { appModel.engine.sync }
-    // A quiet offscreen read checks existing authority without generating it.
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     private var pairingError: String? { sync.pairingError }
-    // S.3: confirmation before regenerate
     @State private var showRegenConfirm = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                Text("Open the Mac app and the companion app on your iPhone or iPad, using the same Apple Account on both devices. The pairing key arrives automatically through iCloud. Once it arrives, tap Connect on your phone or tablet.")
+                Text("""
+                    Open the Mac app and the companion app on your iPhone or iPad, using the same Apple Account on both devices. The pairing key arrives \
+                    automatically through iCloud. Once it arrives, tap Connect on your phone or tablet.
+                    """)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                // The operating requirement, said before he leaves the house:
-                // the phone is a window onto this Mac, not a second brain.
                 Text("I run on your Mac. Keep it awake with NativeAgent running for replies and actions from your phone.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("pairing.mac-dependence")
 
-                // The connection is three facts, never one: pairing, iCloud and
-                // the last accepted exchange, each with who can fix it and how.
                 VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
                     AliveEyebrow("Connection")
                     AliveGroupCard {
@@ -57,14 +53,16 @@ struct MacPairingView: View {
                     PairingNoticeCard(text: pairingError, systemImage: "exclamationmark.shield.fill")
                 }
 
-                // One phone follows one Mac. Another Mac on this Apple Account
-                // has it; moving it here is the person's act, not a launch's.
+                // One phone follows one Mac; moving it between Macs requires the person's action, never launch.
                 if sync.phonePairedElsewhere {
                     VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
                         AliveEyebrow("Your iPhone")
                         AliveGroupCard {
                             VStack(alignment: .leading, spacing: 12) {
-                                Text("Your iPhone is paired with another Mac (or an earlier install of NativeAgent) on this Apple Account. Moving it here disconnects it from that one.")
+                                Text("""
+                                    Your iPhone is paired with another Mac (or an earlier install of NativeAgent) on this Apple Account. Moving it here \
+                                    disconnects it from that one.
+                                    """)
                                     .font(ShellType.label)
                                     .foregroundStyle(NativeAgentShell.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -78,7 +76,6 @@ struct MacPairingView: View {
                     }
                 }
 
-                // One group card, a row per phone with its status pill.
                 VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
                     AliveEyebrow("Paired devices")
                     Text("Match the phone’s code before choosing Pair. Removing a phone stops it from deciding approvals.")
@@ -87,7 +84,7 @@ struct MacPairingView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     AliveGroupCard {
                         if sync.phones.filter({ $0.status != .removed }).isEmpty {
-                            Text("No phones paired yet. Open the companion app to request pairing.")
+                            Text(noPhoneLine)
                                 .font(ShellType.label)
                                 .foregroundStyle(NativeAgentShell.secondary)
                         }
@@ -103,9 +100,8 @@ struct MacPairingView: View {
                                         .textSelection(.enabled)
                                 }
                                 Spacer()
-                                // A pending phone is waiting on you: the teal's one job.
                                 ConnectorsStatusPill(
-                                    text: phone.status == .paired ? "Paired" : "Waiting",
+                                    text: phone.status == .paired ? "Can approve" : "Waiting",
                                     tone: phone.status == .paired ? NativeAgentShell.calm : NativeAgentShell.needsYou)
                                 if phone.status == .pending {
                                     Button("Pair") { Task { await sync.setStatus(.paired, id: phone.id) } }
@@ -121,7 +117,10 @@ struct MacPairingView: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     AliveEyebrow("Pairing delivery")
-                    Text("Use the same Apple Account on both devices and keep both apps online. The Connection facts above show what iCloud needs. After fixing it, check delivery here, then tap Check for Mac on your phone.")
+                    Text("""
+                        Use the same Apple Account on both devices and keep both apps online. The Connection facts above show what iCloud needs. After \
+                        fixing it, check delivery here, then tap Check for Mac on your phone.
+                        """)
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -135,7 +134,6 @@ struct MacPairingView: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     AliveEyebrow("Start over")
-                    // S.3: confirmation dialog before regenerate
                     Button(role: .destructive) { showRegenConfirm = true } label: {
                         Text("Regenerate the pairing key")
                             .font(ShellType.labelMedium)
@@ -149,7 +147,10 @@ struct MacPairingView: View {
                         Button("Regenerate", role: .destructive) { regenerateSecret() }
                         Button("Cancel", role: .cancel) {}
                     } message: {
-                        Text("The old key stops working immediately. Keep both apps open while iCloud delivers the new key to each paired iPhone and iPad. If delivery needs attention, follow the Connection facts and choose Check iCloud delivery.")
+                        Text("""
+                            The old key stops working immediately. Keep both apps open while iCloud delivers the new key to each paired iPhone and iPad. If \
+                            delivery needs attention, follow the Connection facts and choose Check iCloud delivery.
+                            """)
                     }
                     Text("The old key stops working the moment a new one is made.")
                         .font(ShellType.caption)
@@ -167,6 +168,16 @@ struct MacPairingView: View {
 
     // MARK: - Helpers
 
+    /// A phone that chats over the shared key is connected before it can approve, so an empty list never reads as "no phone".
+    private var noPhoneLine: String {
+        sync.standing?.connected == true
+            ? """
+                Your iPhone is connected over iCloud, but it hasn’t asked to pair. Open the companion app and tap Connect; it appears here for you to \
+                choose Pair.
+                """
+            : "No phone can approve yet. Open the companion app and tap Connect to request pairing."
+    }
+
     private func regenerateSecret() {
         Task { await sync.regenerateSecret() }
     }
@@ -174,17 +185,12 @@ struct MacPairingView: View {
 }
 
 // MARK: - Page kit
-//
-// Pairing notices and code values use the shared page kit.
 
-/// 13 monospaced, for a value that is a code. `ShellType` has no monospaced
-/// face, so this derives one from the token size rather than a literal.
+/// Derive monospaced code size from ShellType because that token has no monospaced face.
 private enum PairingType {
     static let code = Font.system(size: ShellType.labelSize, design: .monospaced)
 }
 
-/// One fact of the connection: what is true, its state, and the way on when
-/// someone has to act.
 private struct PairingFactRow: View {
     let label: String
     let fact: NAPhoneConnection.Fact
@@ -217,8 +223,6 @@ private struct PairingFactRow: View {
     }
 }
 
-/// Something the person has to know before they carry on: a card in the
-/// trouble colour, never a painted strip.
 private struct PairingNoticeCard: View {
     let text: String
     let systemImage: String

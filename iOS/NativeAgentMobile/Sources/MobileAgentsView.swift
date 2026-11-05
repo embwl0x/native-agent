@@ -1,7 +1,7 @@
 import SwiftUI
 import Foundation
 import NativeAgentShared
-// Blueprint: | `MobileAgentsView.swift` | Plain contact state/time rows and ID-resolved conversations; bounded request states and diagnostic disclosure retain shared readbacks, local drafts and submission state |
+// Blueprint: | `MobileAgentsView.swift` | Contact state/time and ID-resolved chats; bounded requests/diagnostics retain readbacks and drafts |
 
 struct MobileAgentsView: View {
     private let sync = iCloudSyncEngine.shared

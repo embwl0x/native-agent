@@ -6,7 +6,7 @@ import Observation
 import NativeAgentCore
 import NativeAgentShared
 import ProviderRouting
-// Blueprint: | `RuntimeReadProjection+Configuration.swift` | `RuntimeReadouts.Configuration`: publishes and returns its own saved SearXNG URL read; configuration reads use the engine projection and the provider owner's `LatestRead` for Codex authentication, while editors retain separate drafts |
+// Blueprint: | `RuntimeReadProjection+Configuration.swift` | `RuntimeReadouts.Configuration`, `LatestRead`; Checked saved configuration |
 
 extension RuntimeReadouts {
     @MainActor @Observable

@@ -3,10 +3,9 @@ import Speech
 import AVFoundation
 import CoreMedia
 import NativeAgentShared
-// Blueprint: | `MobileSpeechAnalyzer.swift` | On-device streaming recognition with name context and owned PCM conversion; talk consumes timed regions and SpeechDetector events without closing capture |
+// Blueprint: | `MobileSpeechAnalyzer.swift` | On-device timed recognition, name context and PCM conversion; detector events retain capture |
 
-/// Used only when this device and locale support SpeechTranscriber. A failure
-/// after admission is reported; it never secretly switches recognition engines.
+/// Admit only supported device/locale pairs; report admitted failures without switching recognition engines.
 @available(iOS 26.0, *)
 final class MobileSpeechAnalyzer: @unchecked Sendable {
     private let analyzer: SpeechAnalyzer
@@ -54,10 +53,7 @@ final class MobileSpeechAnalyzer: @unchecked Sendable {
         try await analyzer.prepareToAnalyze(in: format)
     }
 
-    /// Talk consumes timed segments, not a growing copy of the entire call.
-    /// Finalizing a turn does not finish the analyzer or close the microphone.
-    /// Each result comes with the start of the audio region it covers: a
-    /// volatile draft and the result that settles it share that start.
+    /// Timed segments bound call growth; draft and final results share their audio start, and turn finalization must not close capture.
     func startConversation(onResult: @escaping @Sendable (SpeechUtterance, Double) -> Void,
                            onSpeech: @escaping @Sendable (Bool, Double) -> Void,
                            onError: @escaping @Sendable (String) -> Void) {
@@ -130,7 +126,6 @@ final class MobileSpeechAnalyzer: @unchecked Sendable {
         await analyzer.cancelAndFinishNow()
     }
 
-    /// The shown reason is the framework's own words; the device log keeps its domain and code.
     private static func log(_ stage: String, _ error: Error) {
         let failure = error as NSError
         NSLog("[Talk] speech %@ stopped: %@ %ld %@", stage, failure.domain, failure.code, String(describing: failure.userInfo))

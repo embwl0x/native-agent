@@ -3,10 +3,10 @@ import CryptoKit
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `RequestPrefixReceipt.swift` | `RequestPrefixReceipt`: hashes exact encoded request byte slices without reserializing tools or exposing request text |
+// Blueprint: | `RequestPrefixReceipt.swift` | `RequestPrefixReceipt`: hash exact bytes without retaining prompt text |
 
-/// Hash slices of the encoded request, never a second serialization of its tools.
-/// No request text leaves this value. Turn/history facts stay in the turn receipt.
+/// Hash slices of the encoded request, never a second serialization of its tools. No request text leaves this value. Turn/history facts stay in the turn
+/// receipt.
 enum RequestPrefixReceipt {
     static func payload(_ data: Data, prefix: ConversationPrefixTelemetrySnapshot) throws -> [String: JSONValue] {
         let bytes = Array(data)
@@ -21,8 +21,7 @@ enum RequestPrefixReceipt {
         var stable: [Range<Int>] = []
         if let system = root["system"] {
             let blocks = try JSONByteScanner.elements(bytes, from: system.lowerBound)
-            // Anthropic's last system breakpoint ends the stable block. The
-            // following dynamic block is deliberately outside this measurement.
+            // Anthropic's last system breakpoint ends the stable block. The following dynamic block is deliberately outside this measurement.
             if let end = try blocks.lastIndex(where: { try members($0)["cache_control"] != nil }) {
                 stable = Array(blocks[...end])
             } else {
@@ -38,9 +37,8 @@ enum RequestPrefixReceipt {
         }
         let stableHash = digest(stable.map { Data(bytes[$0]) })
         let toolsHash = digest([tools])
-        // Each conversation item exactly as sent (Responses `input`, Messages
-        // `messages`), 12 hex each: the first one that differs between two
-        // turns is where a provider's cache stops matching.
+        // Each conversation item exactly as sent (Responses `input`, Messages `messages`), 12 hex each: the first one that differs between two turns is
+        // where a provider's cache stops matching.
         let items = try (root["input"] ?? root["messages"]).map {
             try JSONByteScanner.elements(bytes, from: $0.lowerBound)
         } ?? []

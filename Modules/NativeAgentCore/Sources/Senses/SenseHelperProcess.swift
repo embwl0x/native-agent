@@ -4,7 +4,7 @@ import CryptoKit
 import Darwin
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `SenseHelperProcess.swift` | Request and observation supervision over OwnedProgramProcess; pending work joins settlement before release, folds every returned action on success/interruption, and throws rejected news from the worker without self-joining termination; cancellation remains cancellation, checked file absence stays news, and app baseline/event comparison excludes frame and observer-coverage metadata |
+// Blueprint: | `SenseHelperProcess.swift` | Request and watch supervision; pending calls join settlement and receipts retain returned effects |
 
 actor SenseHelperProcess {
     private struct Pending {
@@ -22,7 +22,7 @@ actor SenseHelperProcess {
     private let notebook: URL
     private let scratch: URL
     private let limits: HelperSenseRunner.Limits
-    private let apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?
+    private let apps: (@Sendable (JSONValue, [String: String], SenseReadOperation) async throws -> JSONValue)?
     private let transport: OwnedProgramProcess
     private let onExit: @Sendable (SenseFailure?) async -> Void
     private let onSettled: @Sendable () async -> Void
@@ -51,7 +51,8 @@ actor SenseHelperProcess {
     private var idleHolds = 0
 
     init(record: SenseRecord, dataRoot: URL, script: String, notebook: URL, scratch: URL, helper: URL,
-         profile: String, limits: HelperSenseRunner.Limits, initialAddress: String?, apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?,
+         profile: String, limits: HelperSenseRunner.Limits, initialAddress: String?, apps: (@Sendable (JSONValue, [String: String],
+             SenseReadOperation) async throws -> JSONValue)?,
          onSourceChange: @escaping @Sendable () -> Void,
          onSettled: @escaping @Sendable () async -> Void,
          onExit: @escaping @Sendable (SenseFailure?) async -> Void) throws {
@@ -67,17 +68,17 @@ actor SenseHelperProcess {
 
     func startWatching(source: any SenseSourceProvider) async -> SenseOutcome {
         if watching { return .acted(.null, SenseProvenance(record: record)) }
-        return await request(.watch, source: source, perform: nil)
+        return await request(.watch, source: source, operation: .init(turn: nil, passive: true))
     }
 
     func requestFollowing(_ request: SenseRequest, source: any SenseSourceProvider,
-                          perform: SenseActionContext.Perform?) async -> (outcome: SenseOutcome, watchFailure: SenseFailure?, following: Bool) {
-        // The hold covers settlement and actor hops between the read and watch. It cannot suppress cancellation, stalls, crashes or explicit stops.
+                          operation: SenseReadOperation) async -> (outcome: SenseOutcome, watchFailure: SenseFailure?, following: Bool) {
+        // Hold across read/watch settlement and actor hops without suppressing cancellation, stalls, crashes or explicit stops.
         idleHolds += 1
-        let outcome = await self.request(request, source: source, perform: perform)
+        let outcome = await self.request(request, source: source, operation: operation)
         var watchFailure: SenseFailure?
         if case .page = outcome {
-            // Reads admit following; actions are never replayed by supervision.
+            // Only reads admit following; supervision must never replay actions.
             if case .failed(let failure) = await startWatching(source: source) { watchFailure = failure }
         }
         idleHolds -= 1
@@ -86,24 +87,27 @@ actor SenseHelperProcess {
     }
 
     func request(_ request: SenseRequest, source: any SenseSourceProvider,
-                 perform: SenseActionContext.Perform?,
+                 operation: SenseReadOperation,
                  changed: SenseMaterial? = nil) async -> SenseOutcome {
         let isEvent = if case .event = request { true } else { false }
-        if request == .watch || isEvent, !SensesHub.passiveObservation {
-            return await SensesHub.$passiveObservation.withValue(true) {
-                await self.request(request, source: source, perform: perform, changed: changed)
-            }
-        }
+        let operation = request == .watch || isEvent ? operation.observing() : operation
+        let perform = operation.perform
         while !stopped, pending != nil, !Task.isCancelled {
             let done = pendingDone
-            await done.park()
+            await done.park(budget: .init(deadline: operation.deadline))
+            if operation.deadline.map({ ContinuousClock.now >= $0 }) == true {
+                return .failed(SenseFailure(code: "timeout", message: "This sense call's wait ended before the previous call settled; it did not run."))
+            }
+        }
+        if operation.deadline.map({ ContinuousClock.now >= $0 }) == true {
+            return .failed(SenseFailure(code: "timeout", message: "This sense call's deadline ended before it could run."))
         }
         guard !stopped, !Task.isCancelled else {
             return .failed(SenseFailure(code: stopped ? "crashed" : "busy", message: "Sense helper is unavailable or already answering."))
         }
         if reader == nil { startReader() }
         if isSite, case .read = request {
-            // Every served read establishes the current source/tab. A prior subscription must not keep a closed tab or a turn's source alive.
+            // Bind every served read to its current source/tab so prior subscriptions cannot retain closed tabs or turn sources.
             resetSiteObservation()
         }
         nextID += 1
@@ -112,7 +116,7 @@ actor SenseHelperProcess {
             do {
                 let (stream, events) = AsyncThrowingStream<JSONValue, Error>.makeStream(bufferingPolicy: .bufferingOldest(128))
                 pending = Pending(id: id, events: events, stallWindow: limits.requestSeconds)
-                // Born in the requesting task, so its door calls retain that turn's TaskLocal Trust, origin, tool and cancellation context.
+                // The worker holds this operation's turn, action dependency and read captures through settlement.
                 let worker = Task<SenseOutcome, Never> {
                     do {
                         let address: String?
@@ -125,7 +129,7 @@ actor SenseHelperProcess {
                         if !isEvent {
                             let material: SenseMaterial
                             if let changed { material = changed }
-                            else { material = try await source.material(for: record.corner, address: address) }
+                            else { material = try await source.material(for: record.corner, address: address, operation: operation) }
                             try Task.checkCancellation()
                             if !isSite || request == .watch {
                                 sourceAddress = address
@@ -162,7 +166,6 @@ actor SenseHelperProcess {
                         }
                         transport.begin(id: id, kind: .sense, seconds: pending?.stallWindow ?? limits.requestSeconds)
                         var progress = SenseEntryProgress()
-                        // JS caches material at the request address (nil for watch/change/event).
                         let entryAddress = changed != nil || isEvent || request == .watch ? nil : address
                         var page: NativePage?
                         var acted: JSONValue?
@@ -186,7 +189,7 @@ actor SenseHelperProcess {
                             case "progress":
                                 let accepted: Bool
                                 if let readAddress = fields["readAddress"] {
-                                    // Only the supplied snapshot may be read locally without a source round trip.
+                                    // Only supplied snapshots permit local reads without a source round trip.
                                     let expected = entryAddress.map(JSONValue.string) ?? .null
                                     guard wire != .null,
                                           readAddress == expected, fields["n"] == nil else {
@@ -216,7 +219,7 @@ actor SenseHelperProcess {
                             case "source_read", "source_watch", "state_get", "state_set", "app_read":
                                 let waitStarted = try transport.suspend(id)
                                 do {
-                                    try await service(fields, source: source)
+                                    try await service(fields, source: source, operation: operation)
                                     if type == "source_read" {
                                         let readAddress = if case .string(let a)? = fields["address"] { a } else { entryAddress }
                                         if progress.read(address: readAddress) {
@@ -244,7 +247,7 @@ actor SenseHelperProcess {
                                 let waitStarted = try transport.suspend(id)
                                 do {
                                     acted = try await perform(verb, address, fields["args"] ?? .object([:]))
-                                    // Save the returned effect before observing cancellation or trying to write back to a stopped helper.
+                                    // Save returned effects before observing cancellation or writing to a stopped helper.
                                     if let acted { pending?.returnedActions.append(acted) }
                                     try Task.checkCancellation()
                                     try reply(fields, type: "act_reply", value: acted ?? .null, field: "result")
@@ -291,11 +294,11 @@ actor SenseHelperProcess {
                     }
                 }
                 pending?.worker = worker
-                // This retained owner joins the worker before its one terminal record, release and response. It never joins itself.
+                // Join the worker before terminal recording, release and response; this retained owner must never join itself.
                 let settlement = Task {
                     await settle {
                         let outcome = await worker.value
-                        return await self.finish(id, outcome)
+                        return await self.finish(id, outcome, turn: operation.turn)
                     }
                 }
                 pending?.settlement = settlement
@@ -316,8 +319,8 @@ actor SenseHelperProcess {
         await terminate(failure: nil, interruption: SenseFailure(code: "cancelled", message: "Sense request cancelled."))
     }
 
-    /// Called only by the joined worker's cancellation-independent settlement. A returned door receipt survives an interrupted sense without claiming that the helper finished interpreting it.
-    private func finish(_ id: Int, _ outcome: SenseOutcome) -> SenseOutcome {
+    /// Only joined, cancellation-independent settlement may retain door receipts after interruption without claiming completed interpretation.
+    private func finish(_ id: Int, _ outcome: SenseOutcome, turn: Turn?) -> SenseOutcome {
         guard let current = pending, current.id == id else { return outcome }
         pending = nil
         var outcome = current.interruption.map(SenseOutcome.failed) ?? outcome
@@ -326,7 +329,7 @@ actor SenseHelperProcess {
             switch outcome {
             case .failed(let failure):
                 fields = failure.failureEvidence()
-                // An interrupted helper may have dispatched a call that never answered.
+                // An interrupted helper may have dispatched a call whose outcome is still unknown.
                 fields["effects"] = .string("unknown")
             case .acted(let result, _):
                 fields = if case .object(let value) = result { value } else { ["result": result] }
@@ -346,9 +349,10 @@ actor SenseHelperProcess {
         case .acted(let result, _): receipt = result == .null ? .object(["status": .string("ok")]) : result
         case .page: receipt = .object(["status": .string("ok"), "read": .bool(true)])
         }
-        do { try AbilityStore(dataRoot: dataRoot).recordRun(id: record.id, version: record.candidateDigest ?? String(record.version), receipt: receipt) }
+        do { try AbilityStore(dataRoot: dataRoot).recordRun(id: record.id, version: record.candidateDigest ?? String(record.version), receipt: receipt,
+            turn: turn) }
         catch {
-            // recordRun owes the ledger's repair itself; the outcome keeps its own truth.
+            // recordRun owns ledger repair; its failure cannot replace the outcome's truth.
             switch outcome {
             case .acted(let result, let provenance):
                 var fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { ["result": result] }
@@ -375,7 +379,7 @@ actor SenseHelperProcess {
     func isFollowing() -> Bool { !stopped && watching && observation != nil }
 
     func stopIfIdle() async -> Bool {
-        // An event subscription is live work, even between source edges.
+        // Event subscriptions remain live work between source edges.
         guard pending == nil, idleHolds == 0, observation == nil else { return false }
         await terminate(failure: nil)
         return true
@@ -399,7 +403,7 @@ actor SenseHelperProcess {
         let termination = Task { [onExit] in
             await settle {
                 if let settlement { _ = await settlement.value }
-                // Transport reaps the process before removing its scratch directory.
+                // Reap the process before removing its scratch directory.
                 await onExit(failure)
             }
         }
@@ -416,7 +420,9 @@ actor SenseHelperProcess {
                 case .line(let data):
                     do {
                         let message = try JSONValue.parse(data)
-                        guard case .object(let fields) = message else { throw SenseFailure(code: "bad_output", message: "Sense helper sent a non-object message.") }
+                        guard case .object(let fields) = message else {
+                            throw SenseFailure(code: "bad_output", message: "Sense helper sent a non-object message.")
+                        }
                         replied = true
                         if let current = pending, fields["id"] == .int(Int64(current.id)) {
                             if fields["type"] == .string("failed") {
@@ -445,21 +451,23 @@ actor SenseHelperProcess {
     }
 
     private func readerFailed(_ failure: SenseFailure) async {
-        // Its requesting worker owns error attribution and settlement.
+        // The requesting worker owns error attribution and settlement.
         if let pending { pending.events.finish(throwing: failure) }
         else { await terminate(failure: failure) }
     }
 
-    private func service(_ fields: [String: JSONValue], source: any SenseSourceProvider) async throws {
+    private func service(_ fields: [String: JSONValue], source: any SenseSourceProvider, operation: SenseReadOperation) async throws {
         switch fields["type"] {
         case .string("app_read"):
             guard let apps else { throw SenseFailure(code: "unavailable", message: "App reading is not connected.") }
             let targets = Dictionary((record.reach.apps ?? []).map { ($0, "read") }, uniquingKeysWith: { first, _ in first })
-            let value = try await apps(fields["args"] ?? .null, targets)
+            let value = try await apps(fields["args"] ?? .null, targets, operation)
             try reply(fields, type: "app_reply", value: value, field: "result")
         case .string("source_read"):
             let corner = record.corner
-            guard fields["corner"] == .string(corner.key) else { throw SenseFailure(code: "source_denied", message: "Sense source must stay in its declared corner.") }
+            guard fields["corner"] == .string(corner.key) else {
+                throw SenseFailure(code: "source_denied", message: "Sense source must stay in its declared corner.")
+            }
             switch fields["address"] {
             case nil, .null, .string: break
             default: throw SenseFailure(code: "bad_output", message: "Sense source address must be a string or null.")
@@ -477,7 +485,7 @@ actor SenseHelperProcess {
                     throw SenseFailure(code: "source_denied", message: "Sense source must stay at its requested file or declared read reach.")
                 }
             }
-            let material = try await source.material(for: corner, address: address)
+            let material = try await source.material(for: corner, address: address, operation: operation)
             let wire = try await Self.materialWire(material, dataRoot: dataRoot, source: source)
             try Task.checkCancellation()
             try reply(fields, type: "source_reply", value: wire, field: "material")
@@ -497,14 +505,13 @@ actor SenseHelperProcess {
                 guard let provider = source as? any SenseSourceWatchingProvider else {
                     throw SenseFailure(code: "unsupported", message: "Sense source does not provide live change events.")
                 }
-                let changes = try await provider.changes(for: record.corner, address: sourceAddress)
+                let changes = try await provider.changes(for: record.corner, address: sourceAddress, operation: operation.observing())
                 try Task.checkCancellation()
                 guard !stopped else { throw CancellationError() }
                 let appObservation: JSONValue?
                 if case .app = record.corner {
-                    appObservation = try await SensesHub.$passiveObservation.withValue(true) {
-                        Self.appObservation(try await source.material(for: record.corner, address: sourceAddress))
-                    }
+                    appObservation = Self.appObservation(try await source.material(for: record.corner, address: sourceAddress,
+                        operation: operation.observing()))
                 } else { appObservation = nil }
                 try Task.checkCancellation()
                 guard !stopped else { throw CancellationError() }
@@ -512,7 +519,7 @@ actor SenseHelperProcess {
                 observedSource = source
                 let generation = UUID()
                 observationGeneration = generation
-                // Following outlives this read and inherits no turn's authority.
+                // Following outlives the read and must inherit no turn authority.
                 observation = Task.detached(priority: .utility) { [weak self] in
                     for await change in changes {
                         guard !Task.isCancelled else { break }
@@ -535,8 +542,7 @@ actor SenseHelperProcess {
     private func receiveChange(_ change: SenseSourceChange, generation: UUID) async {
         guard !stopped, !Task.isCancelled, generation == observationGeneration else { return }
         if case .absent = change {
-            // There are no bytes to hand the helper. Keep the source watch
-            // alive and report the checked absence on this sense's news.
+            // Checked absence supplies no helper bytes; retain the source watch and report absence through sense news.
             do {
                 try await postNews(SenseNews(senseID: record.id, version: record.version,
                     address: sourceAddress ?? record.corner.key,
@@ -601,10 +607,9 @@ actor SenseHelperProcess {
 
     private static func appObservation(_ material: SenseMaterial) -> JSONValue? {
         guard case .accessibility(.object(var fields)) = material else { return nil }
-        // A new selection frame is bookkeeping, not news from the world.
+        // Selection-frame changes are bookkeeping and must not become world news.
         fields.removeValue(forKey: "frame_id")
-        // Subscription coverage describes the observer, not app content. Both
-        // the initial read and event material compare the same content fields.
+        // Compare the same app content fields for baseline and events; subscription coverage belongs to the observer.
         fields.removeValue(forKey: "ax_watch_coverage")
         return .object(fields)
     }
@@ -623,14 +628,15 @@ actor SenseHelperProcess {
                   watching && observationGeneration == generation, let material = pendingChange else { return }
             pendingChange = nil
             let previousNews = newsGeneration
-            let outcome = await SenseActionContext.$perform.withValue(nil) {
-                await request(.watch, source: source, perform: nil, changed: material)
-            }
+            let outcome = await request(.watch, source: source, operation: .init(turn: nil, passive: true), changed: material)
             guard !stopped, !Task.isCancelled, observationGeneration == generation else { return }
             if case .failed(let failure) = outcome {
                 try await postNews(SenseNews(senseID: record.id, version: record.version,
                     address: sourceAddress ?? record.corner.key,
-                    summary: "Live change could not be read: \(ContextSecretContentPolicy.redactedFragment(failure.code)): \(ContextSecretContentPolicy.redactedFragment(failure.message))", at: Date()))
+                    summary: """
+                        Live change could not be read: \(ContextSecretContentPolicy.redactedFragment(failure.code)): \
+                        \(ContextSecretContentPolicy.redactedFragment(failure.message))
+                        """, at: Date()))
             } else if case .app = record.corner, newsGeneration == previousNews {
                 try await postNews(SenseNews(senseID: record.id, version: record.version,
                     address: sourceAddress ?? record.corner.key, summary: "App view changed.", at: Date()))

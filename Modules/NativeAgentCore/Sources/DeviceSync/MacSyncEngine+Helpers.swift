@@ -8,13 +8,11 @@ extension MacSyncEngine {
         helpersSnapshotWatcher?.cancel()
         let root = PersistenceCore.defaultDataRoot()
         let generation = snapshotLifecycleGeneration
-        // The layout rides here too: the phone's More follows a write at once.
+        // Publish layout with helpers so phone navigation follows the write immediately.
         let paths = ["bots/definitions", "bots/shelf-index.json", "bots/run-queue.json",
                      "agents/peers.json", "agents/conversations.json", "agents/grok-requests", "agents/conversation-live.json",
                      "ui/layout.json"]
-        let bridges = InstallPaths.current.bridgeConfigRoot(dataRoot: root)
-        let inboxes = ["claude", "codex", "omp"].compactMap { AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: bridges) }
-        let watcher = await FileChangeWatcher.armed(paths: paths.map { root.appendingPathComponent($0) } + inboxes) { [weak self] _ in
+        let watcher = await FileChangeWatcher.armed(paths: paths.map { root.appendingPathComponent($0) }) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
                 await self.writeSnapshots()

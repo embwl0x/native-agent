@@ -23,7 +23,8 @@ extension Parts {
               ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil,
               url.user == nil, url.password == nil, url.fragment == nil,
               args["method"] == nil || fields["method"] != nil else {
-            throw ToolPrimitiveBroker.inputFailure("invalid_fetch_url", field: "url/method", accepted: "an http(s) URL without credentials or a fragment, and an optional string method")
+            throw ToolPrimitiveBroker.inputFailure("invalid_fetch_url", field: "url/method",
+                accepted: "an http(s) URL without credentials or a fragment, and an optional string method")
         }
         let method = fields["method"]?.uppercased() ?? "GET"
         guard !method.isEmpty, method.utf8.allSatisfy({ (65...90).contains($0) }) else {
@@ -36,7 +37,8 @@ extension Parts {
                   entries.keys.allSatisfy({ !["host", "connection", "content-length", "transfer-encoding"].contains($0.lowercased())
                       && !$0.contains("\r") && !$0.contains("\n") }),
                   headers.stringFields.values.allSatisfy({ !$0.contains("\r") && !$0.contains("\n") }) else {
-                throw ToolPrimitiveBroker.inputFailure("invalid_http_headers", field: "headers", accepted: "an object of string values without CR/LF; omit Host, Connection, Content-Length and Transfer-Encoding")
+                throw ToolPrimitiveBroker.inputFailure("invalid_http_headers", field: "headers",
+                    accepted: "an object of string values without CR/LF; omit Host, Connection, Content-Length and Transfer-Encoding")
             }
             request.allHTTPHeaderFields = headers.stringFields
         }
@@ -50,16 +52,20 @@ extension Parts {
             }
         }
         guard (request.httpBody?.count ?? 0) <= 4 * 1024 * 1024, try JSONValue.object(args).serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
-            throw ToolPrimitiveBroker.inputFailure("fetch_input_limit", field: "body/arguments", accepted: "a body and complete fetch arguments each no larger than 4 MiB")
+            throw ToolPrimitiveBroker.inputFailure("fetch_input_limit", field: "body/arguments",
+                accepted: "a body and complete fetch arguments each no larger than 4 MiB")
         }
         return request
     }
 
-    /// The protocol reads names as they came; a name is redacted only as it is shown to her.
+    /// The protocol reads names as they came; a name is redacted only as it is shown to the agent.
     public static func fetchReply(status: Int, headers: [String: String], data: Data,
                                   name: (String) -> String = { $0 }, clean: (String) -> String) throws -> JSONValue {
         guard let body = String(data: data, encoding: .utf8) else {
-            throw SenseFailure(code: "http_body_encoding", message: "fetch response body is not UTF-8. Request UTF-8 from the service or read binary bytes through network.receive; inspect service state before another modifying request.")
+            throw SenseFailure(code: "http_body_encoding", message: """
+                fetch response body is not UTF-8. Request UTF-8 from the service or read binary bytes through network.receive; inspect service state \
+                before another modifying request.
+                """)
         }
         let safe = headers.reduce(into: [String: JSONValue]()) { result, entry in
             if !["set-cookie", "authorization", "proxy-authenticate"].contains(entry.key.lowercased()) {
@@ -68,7 +74,8 @@ extension Parts {
         }
         let result: JSONValue = .object(["status": .int(Int64(status)), "headers": .object(safe), "body": .string(clean(body))])
         guard try result.serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
-            throw SenseFailure(code: "output_limit", message: "The complete fetch result exceeds 4 MiB. Request a smaller page or range; inspect service state before another modifying request.")
+            throw SenseFailure(code: "output_limit",
+                message: "The complete fetch result exceeds 4 MiB. Request a smaller page or range; inspect service state before another modifying request.")
         }
         return result
     }

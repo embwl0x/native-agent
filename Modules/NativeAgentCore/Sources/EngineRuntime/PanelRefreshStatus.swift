@@ -2,13 +2,10 @@ import Foundation
 // Blueprint: | `PanelRefreshStatus.swift` | `PanelRefreshStatus` struct |
 
 public struct PanelRefreshStatus: Equatable, Sendable {
-    /// When the panel last attempted a refresh.
     public var lastAttemptAt: Date
-    /// When the panel last completed a refresh with *every* endpoint OK.
-    /// nil means it has never had a fully-successful refresh this run.
+    /// A full-success stamp requires every endpoint; nil preserves unknown readiness this run.
     public var lastSuccessAt: Date?
-    /// Endpoints that returned nil on the last attempt. Non-empty means at
-    /// least one value on screen is carried over from an earlier refresh.
+    /// Failed endpoints leave displayed values carried from prior refreshes.
     public var failedEndpoints: [String]
 
     public var isStale: Bool { !failedEndpoints.isEmpty }

@@ -1,9 +1,8 @@
 import Foundation
-// Blueprint: | `SelfImprovement+TrainingReads.swift` | `HarnessBenchmarkRun`, `HarnessBenchmarkCheck` models and benchmark execution returning its result without a duplicate receipt store; unused `evals/runs.json` reads/schema and `harness/benchmark/runs.jsonl` writes/retention are retired; retained files stay on disk, outside backup, export and phone sync, and appear in PrivacyMap |
+// Blueprint: | `SelfImprovement+TrainingReads.swift` | `HarnessBenchmarkRun`, `HarnessBenchmarkCheck`, `evals/runs.json`, `harness/benchmark/runs.jsonl` |
 
-// Retained evals/runs.json and harness/benchmark/runs.jsonl have no live
-// reader or writer. Leave them on disk, outside backup, export and phone
-// sync, and list them in PrivacyMap. Manual benchmarks return their result.
+// Keep retained evaluation artifacts on disk but outside backup, export and phone sync; PrivacyMap records them. Manual benchmarks return results
+// directly.
 public struct HarnessBenchmarkRun: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var name: String?
@@ -24,9 +23,7 @@ public struct HarnessBenchmarkCheck: Identifiable, Codable, Hashable, Sendable {
 }
 
 extension HarnessBenchmarkRun {
-    /// Validates the local Swift surfaces — tool manifest, embedding runtime,
-    /// Doctor — with no model call or persisted duplicate. A failed read is a failed check that
-    /// carries its actual error text.
+    /// Read native tool, embedding and Doctor surfaces without model calls or duplicate persistence; failed checks carry their actual cause.
     public static func run(
         authoredToolCount: () async throws -> Int,
         embeddingRuntimeAvailable: () async -> Bool,

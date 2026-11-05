@@ -3,7 +3,7 @@ import Foundation
 import GRDB
 import PersistenceCore
 
-// Blueprint: | `ContextSQLiteMaintenance.swift` | `ContextSQLiteStore` source degradation, ordered feedback persistence, health, pruning and vacuum on its single pool |
+// Blueprint: | `ContextSQLiteMaintenance.swift` | `ContextSQLiteStore`: feedback, health, pruning and vacuum |
 
 extension ContextSQLiteStore {
     public func markSourceDegraded(

@@ -10,15 +10,11 @@ import AppKit
 
 public enum NativeScreenCapture {
     private static func captureScreen() async throws -> CGImage {
-        // Preflight + request. CGRequestScreenCaptureAccess returns the
-        // CURRENT state on subsequent calls (it only triggers the prompt
-        // the first time), so it's safe to call here unconditionally if
-        // preflight is false.
+        // CGRequestScreenCaptureAccess returns current access after its first prompt, so a failed preflight can safely request it.
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
             throw CaptureError.permissionRequired
         }
 
-        // Discover displays. The spec asks for the *primary* (first) display.
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.current
@@ -27,32 +23,20 @@ public enum NativeScreenCapture {
             ModuleLog.app("%@", "[screen-capture] failed: \(reason)")
             throw CaptureError.captureFailed(reason)
         }
-        // Select the PRIMARY display strictly by CGMainDisplayID match —
-        // ScreenCaptureKit's display order is not guaranteed to put the
-        // primary first, especially in multi-monitor setups. If
-        // CGMainDisplayID() is not present in SCShareableContent (extremely
-        // unusual — would indicate a TCC/CG state mismatch), fail-closed
-        // with .noDisplay rather than silently capturing whatever display
-        // happens to be first in the list.
+        // ScreenCaptureKit display order is unspecified; match CGMainDisplayID and refuse a missing primary rather than capture another screen.
         let mainID = CGMainDisplayID()
         guard let display = content.displays.first(where: { $0.displayID == mainID }) else {
             throw CaptureError.noDisplay
         }
 
-        // Configure a one-shot screenshot. `pixelFormat` is set for parity
-        // with the spec; SCScreenshotManager returns a CGImage regardless of
-        // pixel-format hint (the hint matters for live SCStream feeds).
-        // Shotgun is the person's window; it never shows in her captures.
+        // The pixel-format hint affects live streams; SCScreenshotManager returns a CGImage regardless. Shotgun is the person's window; it never shows in the
+        // agent's captures.
         let filter = SCContentFilter(
             display: display,
             excludingWindows: content.windows.filter { PersonOnlyWindows.contains(number: Int($0.windowID)) }
         )
         let configuration = SCStreamConfiguration()
-        // SCDisplay.width/height are POINTS. Configuring the output size in
-        // points downsamples Retina displays to 1x; use the display mode's
-        // physical pixel dimensions so the capture is native-resolution.
-        // Consumers that need smaller transports (chat's 1600px bound)
-        // downscale on their side.
+        // SCDisplay dimensions are points; physical mode dimensions preserve Retina resolution. Transport consumers downscale as needed.
         guard let mode = CGDisplayCopyDisplayMode(mainID), mode.pixelWidth > 0, mode.pixelHeight > 0 else {
             throw CaptureError.geometryUnavailable
         }

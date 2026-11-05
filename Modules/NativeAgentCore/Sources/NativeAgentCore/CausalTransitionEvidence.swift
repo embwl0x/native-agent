@@ -1,14 +1,9 @@
 import CryptoKit
 import Foundation
 
-// Blueprint: | `CausalTransitionEvidence.swift` | `CausalTransitionEvidence`: immutable pre-transition assignment and evidence-class values; observational metadata grants no authority |
+// Blueprint: | `CausalTransitionEvidence.swift` | `CausalTransitionEvidence`: assignment evidence grants no authority |
 
-/// Immutable assignment captured before an observed transition begins.
-///
-/// This is evidence metadata, not authority. Production observational rows
-/// leave it nil. Generated and frozen-mind laboratories may bind it before a
-/// reducer runs so later evaluation can distinguish assigned interventions
-/// from correlations inferred after the outcome.
+/// Pre-transition assignment distinguishes intervention from later correlation; production observations carry no assignment authority.
 public struct CausalInterventionAssignment: Codable, Sendable, Equatable {
     public enum EvidenceClass: String, Codable, Sendable, Equatable {
         case generatedMechanism = "generated_mechanism"
@@ -21,8 +16,7 @@ public struct CausalInterventionAssignment: Codable, Sendable, Equatable {
     public let assignmentID: String
     public let intervention: String
     public let evidenceClass: EvidenceClass
-    /// Additive v2 design metadata. Legacy assignments intentionally decode
-    /// with nil values and cannot be upgraded into causal evidence by decode.
+    /// Missing design metadata stays nil; decoding cannot manufacture causal authority.
     public let experimentID: String?
     public let taskScenarioFamily: String?
     public let treatment: String?
@@ -33,16 +27,14 @@ public struct CausalInterventionAssignment: Codable, Sendable, Equatable {
     public let coverageFlags: [String]?
 }
 
-/// Authority class used by the causal model. It is deliberately derived from
-/// the immutable pre-outcome assignment rather than inferred from outcomes.
+/// Authority class used by the causal model. It is deliberately derived from the immutable pre-outcome assignment rather than inferred from outcomes.
 public enum CausalTransitionEvidenceClass: String, Codable, Sendable, Equatable, Hashable {
     case observational
     case controlledSynthetic = "controlled_synthetic"
     case controlledProduction = "controlled_production"
 }
 
-/// Small cross-domain read model for offline/shadow causal evaluation.
-/// Domain owners remain authoritative; this value cannot mutate or authorize.
+/// Small cross-domain read model for offline/shadow causal evaluation. Domain owners remain authoritative; this value cannot mutate or authorize.
 public struct CausalTransitionEvidence: Codable, Sendable, Equatable {
     public let domain: String
     public let operationId: String
@@ -54,9 +46,7 @@ public struct CausalTransitionEvidence: Codable, Sendable, Equatable {
     public let expectedNextEvidence: String?
     public let outcome: String
 
-    // Additive v2 trajectory/motor facts. Old v1 JSON rows decode with nil
-    // fields and therefore remain observational; no decoder migration can
-    // manufacture assignment authority for historical evidence.
+    // Missing trajectory facts remain observational; decoding cannot manufacture assignment authority.
     public let trajectoryID: String?
     public let parentOperationID: String?
     public let sequenceNumber: Int?
@@ -66,9 +56,8 @@ public struct CausalTransitionEvidence: Codable, Sendable, Equatable {
     public let deadlineClass: String?
     public let terminalClass: String?
     public let completenessClass: String?
-    /// Procedure-compilation facts are schema/identity metadata only. Domain
-    /// owners must never put parameter values, payloads, paths, or outputs in
-    /// these fields. Missing facts remain nil and make compilation abstain.
+    /// Procedure-compilation facts are schema/identity metadata only. Domain owners must never put parameter values, payloads, paths, or outputs in these
+    /// fields. Missing facts remain nil and make compilation abstain.
     public let taskFamily: String?
     public let inputClass: String?
     public let inputInstanceIdentity: String?
@@ -87,9 +76,8 @@ public struct CausalTransitionEvidence: Codable, Sendable, Equatable {
     public let toolCallCount: Int?
     public let providerCostMicros: Int?
     public let toolCostMicros: Int?
-    /// Count of frontier orchestration calls that an equivalent declarative
-    /// table can remove. This is deliberately distinct from provider calls
-    /// still required by an action and must be nil unless an owner proves it.
+    /// Count of frontier orchestration calls that an equivalent declarative table can remove. This is deliberately distinct from provider calls still required
+    /// by an action and must be nil unless an owner proves it.
     public let removableOrchestrationProviderCallCount: Int?
     public let interventionAssignment: CausalInterventionAssignment?
 
@@ -173,8 +161,7 @@ public struct CausalTransitionEvidence: Codable, Sendable, Equatable {
         self.interventionAssignment = interventionAssignment
     }
 
-    /// Historical rows and normal production observations never gain
-    /// intervention authority merely because they decode through the v2 type.
+    /// Decoding an observation never grants intervention authority.
     public var evidenceClass: CausalTransitionEvidenceClass {
         guard let assignment = interventionAssignment else { return .observational }
         switch assignment.evidenceClass {

@@ -4,7 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `MobileNotificationDeliveryReceipt.swift` | Keyless notification publication receipts name CloudKit ordinary alerts or signed-result readers, optional APNs wakes and unverified phone display |
+// Blueprint: | `MobileNotificationDeliveryReceipt.swift` | CloudKit alert/result receipts; optional APNs wakes never prove display. |
 public struct MobileNotificationDeliveryReceipt: Sendable {
     public let bridgeMessageID: String
     public let apnsReceipts: [SwiftNativeAPNSReceipt]
@@ -38,7 +38,8 @@ public struct MobileNotificationDeliveryReceipt: Sendable {
             "eventId": .string(eventID),
             "apnsAccepted": .bool(apnsReceipts.contains { $0.isSuccess }),
             "apnsPushType": .string("background"),
-            "apnsSemantics": .string("Optional APNS only wakes sync. No provider configuration is required; acceptance does not prove phone receipt or display."),
+            "apnsSemantics": .string(
+                "Optional APNS only wakes sync. No provider configuration is required; acceptance does not prove phone receipt or display."),
             "apnsReceipts": .array(apnsReceipts.map { $0.toJSON() }),
             "apnsErrors": .array(apnsErrors.map(JSONValue.string)),
             "lockScreenDisplayVerified": .bool(false),

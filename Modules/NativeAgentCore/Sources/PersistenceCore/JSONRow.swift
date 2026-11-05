@@ -1,10 +1,7 @@
 import Foundation
 // Blueprint: | `JSONRow.swift` | `JSONRow` checked stored-object reads; required/optional typed fields and named malformed-row errors |
 
-/// Checked reads of one stored JSON object row, for owners that hand out
-/// typed records without a byte round trip: a required field must be present
-/// with its type, an optional one may be absent or null, and a present field
-/// of the wrong type makes the row malformed.
+/// Required fields must exist with their type; optional fields may be absent/null, but wrong present types make the row malformed.
 public struct JSONRow {
     public enum Malformed: Error, LocalizedError {
         case notAnObject
@@ -38,7 +35,6 @@ public struct JSONRow {
     public func optionalInt(_ key: String) throws -> Int? {
         try optional(key) { $0.exactIntegerValue }
     }
-    /// Any value but null.
     public func optionalValue(_ key: String) -> JSONValue? {
         fields[key].flatMap { $0 == .null ? nil : $0 }
     }

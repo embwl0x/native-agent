@@ -11,8 +11,7 @@ import MemoryV2
 
 struct SelfImprovementView: View {
     @Environment(AppModel.self) private var appModel
-    // The switch. The weekly loop's gate reads this exact key from
-    // UserDefaults.standard (see makeWeeklySelfImprovementLoop).
+    // Share the weekly loop gate key so the switch and scheduler cannot disagree.
     @AppStorage("selfImprovementEnabled") private var enabled = true
 
     private var doctor: DoctorFacade { appModel.engine.doctor }
@@ -20,13 +19,9 @@ struct SelfImprovementView: View {
     @State private var runNote: String = ""
 
     var body: some View {
-        // Render-cost audit: same env-gated counter as `contentview.body`.
         RenderAudit.bump("selfimprovement.body")
         return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                // ── Misses ────────────────────────────────────────────────
-                // What she was corrected on, by lesson, this week against
-                // last: the growth metric. A row opens the conversation.
                 Text("Misses").font(.headline)
                 if appModel.missLessons.isEmpty {
                     Text(appModel.panelRefreshStatus[.activity]?.failedEndpoints.contains("misses") == true
@@ -58,7 +53,6 @@ struct SelfImprovementView: View {
                 }
                 Divider()
 
-                // ── The switch ────────────────────────────────────────────
                 Toggle(isOn: $enabled) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Weekly self-improvement").font(.headline)
@@ -75,7 +69,6 @@ struct SelfImprovementView: View {
                       systemImage: "checkmark.seal")
                     .font(.callout).foregroundStyle(.secondary)
 
-                // ── Manual run ────────────────────────────────────────────
                 HStack(spacing: 10) {
                     Button {
                         Task {
@@ -95,7 +88,6 @@ struct SelfImprovementView: View {
 
                 Divider()
 
-                // ── Latest digest ─────────────────────────────────────────
                 HStack {
                     Text("Latest digest").font(.headline)
                     Spacer()
@@ -126,9 +118,7 @@ struct SelfImprovementView: View {
         .task { await doctor.observeWeeklyDigest() }
     }
 
-    /// The Run now pass, shared with the agent's `mind_run self_improvement`.
-    /// Runs the live registered loop; digest reads follow the selected engine.
-    /// Nil outcome: the run never started.
+    /// Run the registered loop against the selected engine; nil means it never started.
     @MainActor
     static func runManually(appModel: AppModel) async -> (outcome: LoopTickOutcome?, note: String) {
         let result = await WeeklySelfImprovementLoop.runManually(dataRoot: NativeAgentEngine.live.dataRoot) {

@@ -1,16 +1,13 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacFourVerbs+Wait.swift` | `MacFourVerbs.wait`: required AX/app subscriptions prompt bounded screen reads; unavailable subscriptions refuse without coarse polling; text rechecks and settle reads retain the caller's deadline |
+// Blueprint: | `MacFourVerbs+Wait.swift` | `MacFourVerbs.wait`: Required AX/app signals, bounded text rechecks and settling within one deadline |
 
 extension MacFourVerbs {
     // MARK: 4 — PATIENCE
 
-    /// Signals prompt fresh observations. Without a text condition, two equal
-    /// reads end the wait — the app-level observer misses changes inside many
-    /// windows, so its quiet alone never settles. With a condition, only a
-    /// match in the screen's content can.
-    public func wait(until: String? = nil, seconds: Double? = nil) async -> MacFourVerbsReply {
+    /// Observer quiet misses in-window changes: settling needs two equal reads, while a text condition needs an observed match.
+    public func wait(until: String? = nil, seconds: Double? = nil, turn: Turn, context: MacOperationContext) async -> MacFourVerbsReply {
         let budget = min(max(seconds ?? Self.defaultWaitSeconds, 0), Self.maxWaitSeconds)
         let needle = until?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let waitingForText = needle?.isEmpty == false
@@ -31,17 +28,21 @@ extension MacFourVerbs {
         }
         func refusal(_ reply: MacFourVerbsReply) async -> MacFourVerbsReply {
             guard reply.detail["status"] == .string("in_process_route") else { return reply }
-            // A plain "wait N seconds" needs no screen to watch: just wait.
+            // Unconditional waits need no screen permission.
             if !waitingForText, seconds != nil {
                 let left = budget - elapsedNow()
                 if left > 0 { try? await Task.sleep(nanoseconds: UInt64(left * 1_000_000_000)) }
                 guard !Task.isCancelled else { return cancelled() }
-                return MacFourVerbsReply(ok: true, text: "Waited \(Self.seconds(elapsedNow())) (NativeAgent is in front, so there was no other screen to watch).",
-                                         detail: ["outcome": .string("waited"), "seconds": .double(elapsedNow())])
+                return MacFourVerbsReply(ok: true,
+                    text: "Waited \(Self.seconds(elapsedNow())) (NativeAgent is in front, so there was no other screen to watch).",
+                    detail: ["outcome": .string("waited"), "seconds": .double(elapsedNow())])
             }
             return MacFourVerbsReply(
                 ok: false,
-                text: "NativeAgent is in front, so wait cannot watch an external app. For a delay only, set seconds and omit until. Inspect NativeAgent with app {page:\"current\"}, or pass agent: name to wait for a contact's in-flight reply.",
+                text: """
+                    NativeAgent is in front, so wait cannot watch an external app. For a delay only, set seconds and omit until. Inspect NativeAgent with app \
+                    {page:\"current\"}, or pass agent: name to wait for a contact's in-flight reply.
+                    """,
                 detail: reply.detail.merging([
                     "status": .string("refused"), "reason": .string("self_screen_wait_unavailable"),
                     "error": .string("self_screen_wait_unavailable"), "effects": .string("none"),
@@ -67,9 +68,8 @@ extension MacFourVerbs {
             )
         }
 
-        // 1 — the baseline. One render, before anything is subscribed to.
         let first: Sighting
-        switch await sight(part: nil) {
+        switch await sight(part: nil, turn: turn, context: context) {
         case .blind(let reply): return await refusal(reply)
         case .seen(let seen): first = seen
         }
@@ -80,8 +80,7 @@ extension MacFourVerbs {
             return matched(first, elapsedNow())
         }
 
-        // 2 — subscribe. Installed only AFTER a look succeeded, so the gate has
-        // already run; removed on every exit, including a thrown cancellation.
+        // Subscribe only after a gated look succeeds; release subscriptions on every exit, including cancellation.
         var observedPID = first.pid
         var signals = MacWaitSignals(
             effects: effectObserverSource,
@@ -106,10 +105,8 @@ extension MacFourVerbs {
                 notBefore: lastRenderAt + Self.settleQuietSeconds
             )
             guard !Task.isCancelled else { return cancelled() }
-            // The budget ran out inside a short final window.
             if !fired, signals.isObserving, !waitingForText, window < Self.settleQuietSeconds { break }
-            // Refresh after a signal or the quiet/coarse polling interval.
-            switch await sight(part: nil) {
+            switch await sight(part: nil, turn: turn, context: context) {
             case .blind(let reply): return await refusal(reply)
             case .seen(let seen): last = seen
             }
@@ -119,7 +116,7 @@ extension MacFourVerbs {
             if let needle, !needle.isEmpty, last.effectRender.lowercased().contains(needle) {
                 return matched(last, elapsed)
             }
-            // An app switch replaces observation and resets the settling baseline.
+            // App switches invalidate both observation and the settling baseline.
             let needsReconciliation = last.pid != observedPID
             if needsReconciliation {
                 signals.stop()
@@ -128,7 +125,6 @@ extension MacFourVerbs {
                 if let failure = signals.installationFailure { return observationUnavailable(failure) }
             }
             if !waitingForText, !needsReconciliation, previous == last.effectRender {
-                // Two identical reads of the screen's content: it has settled.
                 return settled(last, elapsed)
             }
             previous = last.effectRender
@@ -145,8 +141,7 @@ extension MacFourVerbs {
         )
     }
 
-    /// A signal wakes the consumer directly; the capture-rate floor still
-    /// coalesces bursts without extending the caller's deadline.
+    /// Signals wake directly; the capture-rate floor coalesces bursts without extending the deadline.
     private func awaitSignal(
         _ signals: MacWaitSignals,
         window: Double,
@@ -162,9 +157,9 @@ extension MacFourVerbs {
 
     static let defaultWaitSeconds: Double = 10
     static let maxWaitSeconds: Double = 60
-    /// Capture-rate floor and quiet interval before a settling read.
+    /// Bound capture bursts and allow quiet before checking for settlement.
     static let settleQuietSeconds: Double = 0.5
-    /// Bounded content recheck for text conditions while observation is installed.
+    /// Text conditions need bounded rechecks even while observation is installed.
     static let textRecheckSeconds: Double = 5.0
 
 }

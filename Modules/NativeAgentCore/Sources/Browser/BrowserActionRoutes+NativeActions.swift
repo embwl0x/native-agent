@@ -1,14 +1,17 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `BrowserActionRoutes+NativeActions.swift` | `runBrowserNativeAction` and `stringInput`; open/read/screenshot previews return in memory before any receipt, capture or history command |
+import Dispatcher
+// Blueprint: | `BrowserActionRoutes+NativeActions.swift` | `runBrowserNativeAction` and `stringInput`; previews retain no artifacts |
 
 extension BrowserActionRoutes {
     public func runBrowserNativeAction(
         action: NativeActionRecord,
         dryRun: Bool,
         input: [String: Any],
-        dataRoot: URL
+        dataRoot: URL,
+        imageSink: LocalToolImage.Sink?,
+        retainRead: (@Sendable (BrowserVisibleCapture) -> Void)?
     ) async throws -> NativeActionReceipt {
         let jsonInput = try NativeActionWire.jsonValueBody(input)
         switch action.id {
@@ -30,11 +33,10 @@ extension BrowserActionRoutes {
                 dryRun: dryRun,
                 captureSource: captureSource,
                 captureScreenshot: captureScreenshot,
-                dataRoot: dataRoot
+                dataRoot: dataRoot,
+                imageSink: imageSink
             )
-            // Browser Core projects the one canonical terminal transition into
-            // the native-action receipt feed for both public aliases. Do not
-            // append a second app-owned receipt for browser.navigate.
+            // Core projects both aliases into one receipt; an app-owned append would duplicate browser.navigate.
             return NativeActionReceipt(
                 id: run.id,
                 actionId: action.id,
@@ -60,7 +62,7 @@ extension BrowserActionRoutes {
                 readLinks: action.id == "browser.read_links",
                 screenshot: action.id == "browser.screenshot"
             )
-            if action.id != "browser.screenshot" { Self.retainRead?(capture) }
+            if action.id != "browser.screenshot" { retainRead?(capture) }
             let receipt: [String: JSONValue]
             switch action.id {
             case "browser.read_text":
@@ -88,7 +90,8 @@ extension BrowserActionRoutes {
                     id: "browser-shot-\(UUID().uuidString.lowercased())",
                     url: capture.url,
                     png: png,
-                    dataRoot: dataRoot
+                    dataRoot: dataRoot,
+                    imageSink: imageSink
                 )
             }
             return try await effects.appendNativeActionReceipt(

@@ -5,7 +5,7 @@ import TrustCenter
 import AVFoundation
 import Observation
 import os
-// Blueprint: | `MultimodalTTS+VoiceSelection.swift` | Voice authority/routing, native/cloud playback and cancellation; VoicePreference resolves one Apple voice identity for Mac playback and the phone snapshot, plus quiet/name authority |
+// Blueprint: | `MultimodalTTS+VoiceSelection.swift` | one Trust-owned voice and cancellation |
 
 /// An unreadable Trust policy prevents read-aloud and reports why.
 public enum VoiceOutputModeResolution: Equatable {
@@ -20,10 +20,8 @@ public enum VoiceOutputModeSelection {
         trustPolicy.multimodalPolicy?.tts_openai == true ? .openAI : .localConfigured
     }
 
-    /// The policy as loaded. When none is loaded yet (first load still
-    /// pending, or an earlier load failed) this makes one checked read now
-    /// rather than guessing a voice: it answers with the policy, or with why
-    /// the policy could not be read.
+    /// The policy as loaded. When none is loaded yet (first load still pending, or an earlier load failed) this makes one checked read now rather than guessing
+    /// a voice: it answers with the policy, or with why the policy could not be read.
     @MainActor
     public static func resolve(
         policy: TrustPolicy?,
@@ -56,21 +54,12 @@ extension SwiftOpenAITTSClient {
     }
 }
 
-/// Read-aloud's voice and the one switch that guarantees silence.
-///
-/// `quiet` is deliberately enforced at `VoiceOutputController.speak`, the
-/// single door both routes go through, rather than at each caller: a promise
-/// of "no audio out" that depends on every future call site remembering to ask
-/// is not a promise. The tool that renders speech to a FILE is unaffected, and
-/// correctly so — it never opens an output device.
-///
-/// `name` is empty by default, which means the Mac's chosen system voice
-/// locally and the route's default voice in the cloud.
+/// Enforce quiet at the shared playback door so every route stays silent; file-only synthesis never opens an output device. An empty name selects the system or
+/// cloud default.
 public enum VoicePreference {
     public static let quietKey = "nativeagent.voice.quiet"
     public static let nameKey = "nativeagent.voice.name"
 
-    /// An unset cloud voice uses alloy.
     public static let cloudDefaultName = "alloy"
 
     public static func quiet(in defaults: UserDefaults = .standard) -> Bool {
@@ -82,8 +71,7 @@ public enum VoicePreference {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Resolve the captured selection once for playback or the phone snapshot.
-    /// Only an explicitly empty selection asks Apple for the system default.
+    /// Resolve the captured selection once for playback or the phone snapshot. Only an explicitly empty selection asks Apple for the system default.
     public static func nativeVoice(identifier: String) -> AVSpeechSynthesisVoice? {
         if identifier.isEmpty { return AVSpeechSynthesisVoice(language: nil) }
         return AVSpeechSynthesisVoice(identifier: identifier)
@@ -105,8 +93,7 @@ private enum OpenAIVoiceFailure {
         case MultimodalTTSError.notConfigured:
             return "OpenAI voice needs an API key in Settings → Providers → OpenAI. Nothing was read aloud."
         case MultimodalTTSError.routeHasNoSpeech:
-            // Chat's provider has no speech API at all. Say so plainly; never
-            // quietly call a different provider or another voice.
+            // Chat's provider has no speech API at all. Say so plainly; never quietly call a different provider or another voice.
             return "The provider Chat runs on has no cloud voice. Nothing was read aloud."
         default:
             return failureMessage(error, "read that aloud")
@@ -125,7 +112,7 @@ public final class VoiceOutputController: NSObject {
     private var synthesizer: AVSpeechSynthesizer?
     private var audioPlayer: AVAudioPlayer?
     private var pendingSynthesis: Task<(audio: Data, unread: Int), Error>?
-    // Bumped on every speak()/stop() so an in-flight speakOpenAI can detect it was superseded across its network await.
+    // Advance on speak and stop so a late network result cannot supersede newer playback.
     private var speechGeneration: Int = 0
     private let failureMessage: @Sendable (Error, String) -> String
     private let failureCause: @Sendable (Error, String) -> String
@@ -139,10 +126,8 @@ public final class VoiceOutputController: NSObject {
         super.init()
     }
 
-    /// SwiftUI may retain several controller state locations while chat
-    /// surfaces are rebuilt. A synthesizer carries system speech-service state,
-    /// so create it only for an actual local utterance instead of once per
-    /// mounted controller.
+    /// SwiftUI may retain several controller state locations while chat surfaces are rebuilt. A synthesizer carries system speech-service state, so create it
+    /// only for an actual local utterance instead of once per mounted controller.
     private func localSynthesizer() -> AVSpeechSynthesizer {
         if let synthesizer { return synthesizer }
         let created = AVSpeechSynthesizer()
@@ -151,10 +136,8 @@ public final class VoiceOutputController: NSObject {
         return created
     }
 
-    /// Speak on the route `trust`'s policy selects. A stop() or a newer
-    /// speak() while the policy is still being read wins: this request then
-    /// plays nothing (dictation stopping playback must not be undone by a
-    /// read that finishes after it).
+    /// Speak on the route `trust`'s policy selects. A stop() or a newer speak() while the policy is still being read wins: this request then plays nothing
+    /// (dictation stopping playback must not be undone by a read that finishes after it).
     public func speak(
         text: String,
         policy: TrustPolicy?,
@@ -169,8 +152,7 @@ public final class VoiceOutputController: NSObject {
         await speak(text: text, resolution: resolution, ownerID: ownerID)
     }
 
-    /// Speak on the route the Trust policy selects. An unreadable policy says
-    /// so on the owning surface and reads nothing.
+    /// Speak on the route the Trust policy selects. An unreadable policy says so on the owning surface and reads nothing.
     public func speak(
         text: String,
         resolution: VoiceOutputModeResolution,
@@ -238,19 +220,21 @@ public final class VoiceOutputController: NSObject {
         } else {
             let owner = speechOwnerID
             stop()
-            errorMessage = "The read-aloud voice \"\(chosenVoice.isEmpty ? "system default" : chosenVoice)\" is not on this Mac, so nothing was read aloud. Set chat.voice_name to an installed voice identifier, or leave it empty for the Mac's own voice."
+            errorMessage = """
+                The read-aloud voice \"\(chosenVoice.isEmpty ? "system default" : chosenVoice)\" is not on this Mac, so nothing was read aloud. Set \
+                chat.voice_name to an installed voice identifier, or leave it empty for the Mac's own voice.
+                """
             errorOwnerID = owner
             return
         }
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         localSynthesizer().speak(utterance)
-        // isSpeaking set to false by delegate when done
     }
 
     private func speakOpenAI(text: String) async {
-        // Snapshot the current generation; if stop()/speak() runs during the network await,
-        // it bumps speechGeneration and we must not clobber the new state when we resume.
+        // Snapshot the current generation; if stop()/speak() runs during the network await, it bumps speechGeneration and we must not clobber the new state
+        // when we resume.
         let generation = speechGeneration
         let synthesis = Task {
             try Task.checkCancellation()
@@ -261,11 +245,7 @@ public final class VoiceOutputController: NSObject {
             if generation == speechGeneration { pendingSynthesis = nil }
         }
         do {
-            // Swift-native TTS: direct URLSession POST to OpenAI's
-            // /v1/audio/speech through SwiftOpenAITTSClient. The key is
-            // resolved against PersistenceCore.defaultDataRoot(), so an
-            // installed .app bundle reads the app-owned provider config instead
-            // of a CWD-relative path.
+            // Resolve credentials against the app data root so installed playback never depends on the working directory.
             let (audioData, unread) = try await withTaskCancellationHandler {
                 try await synthesis.value
             } onCancel: {
@@ -286,7 +266,10 @@ public final class VoiceOutputController: NSObject {
             }
             isSpeaking = true
             if unread > 0 {
-                errorMessage = "Reading the first \(SwiftOpenAITTSClient.maxInputChars) characters aloud; the cloud voice takes no more in one request, so the last \(unread) will not be read."
+                errorMessage = """
+                    Reading the first \(SwiftOpenAITTSClient.maxInputChars) characters aloud; the cloud voice takes no more in one request, so the last \
+                    \(unread) will not be read.
+                    """
                 errorOwnerID = speechOwnerID
             }
         } catch {
@@ -366,7 +349,8 @@ extension VoiceOutputController: AVAudioPlayerDelegate {
 
     nonisolated public func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         let playerID = ObjectIdentifier(player)
-        if let error { Logger(subsystem: "com.nativeagent.app", category: "MultimodalTTS").error("[voice] audio decode failed: \(String(describing: error), privacy: .public)") }
+        if let error { Logger(subsystem: "com.nativeagent.app", category: "MultimodalTTS").error(
+            "[voice] audio decode failed: \(String(describing: error), privacy: .public)") }
         Task { @MainActor in
             self.finishPlayback(playerID: playerID, failure: "The audio couldn't be played.")
         }

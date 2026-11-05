@@ -1,9 +1,8 @@
 import Foundation
 // Blueprint: | `OrganismLivingDynamics.swift` | `OrganismAnalyticDecay` struct; `value` |
 
-/// Closed-form time law used by organism tissue that should change with wall
-/// time without waking on a polling cadence. The stored value remains an
-/// anchor; reads derive the present value.
+/// Closed-form time law used by organism tissue that should change with wall time without waking on a polling cadence. The stored value remains an anchor;
+/// reads derive the present value.
 public struct OrganismAnalyticDecay: Sendable, Equatable {
     public var valueAtAnchor: Double
     public var equilibrium: Double

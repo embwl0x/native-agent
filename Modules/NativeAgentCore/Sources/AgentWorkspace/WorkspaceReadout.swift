@@ -2,10 +2,10 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `WorkspaceReadout.swift` | Frozen workspace facts and exact native item/action bindings; typed `workspace-readout.js` decisions select existing keys and labels, never manufacture targets, permissions or source status; selected helper details retain native identity and content |
+// Blueprint: | `WorkspaceReadout.swift` | `workspace-readout.js`: native bindings and authority |
+// Part decisions select frozen opaque keys; native code retains item identity, content, permissions and actual source status.
 
-/// Parts select opaque source and action keys. Native identities, exact
-/// arguments, permissions and the actual read status never come back from JS.
+/// Parts select opaque source and action keys. Native identities, exact arguments, permissions and the actual read status never come back from JS.
 enum WorkspaceReadout {
     struct Action: Codable { let key: String; let label: String? }
     struct Item: Codable {
@@ -21,10 +21,10 @@ enum WorkspaceReadout {
         let actions: [Action]
     }
 
-    static func project(input: JSONValue, dataRoot: URL, items: [String: AgentWorkspaceItem],
+    static func project(workspace: WorkspaceOperation, input: JSONValue, dataRoot: URL, items: [String: AgentWorkspaceItem],
                         actions: [String: AgentWorkspaceButton], native: [String: JSONValue] = [:]) async -> WorkspacePage {
         do {
-            let value = try await AgentWorkspacePorts.current.tools.readout(input, dataRoot: dataRoot)
+            let value = try await workspace.ports.tools.readout(input, dataRoot: dataRoot)
             let decision = try JSONDecoder().decode(Decision.self, from: value.serializedData(pretty: false))
             func buttons(_ choices: [Action]) throws -> [AgentWorkspaceButton] {
                 try choices.map { choice in
@@ -58,7 +58,7 @@ enum WorkspaceReadout {
         }
     }
 
-    static func bots(input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> WorkspacePage {
+    static func bots(workspace: WorkspaceOperation, input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> WorkspacePage {
         let selected = input["id"]?.stringValue.flatMap(UUID.init(uuidString:)) != nil
         if result.objectValue?["bots"]?.arrayValue == nil {
             return .init(title:"My helpers",content:.object(["status":.string("unavailable"),"source":result]),items:[],actions:[])
@@ -100,7 +100,8 @@ enum WorkspaceReadout {
         var native = result.objectValue!
         native.removeValue(forKey:"bots")
         native["returned_count"] = .int(Int64(rows.count))
-        var projection = await project(input:.object(["mode":.string("bots"),"state":.string("available"),"selected":.bool(selected),"rows":.array(facts)]),
+        var projection = await project(workspace: workspace, input:.object(["mode":.string("bots"),"state":.string("available"),"selected":.bool(selected),
+            "rows":.array(facts)]),
             dataRoot:dataRoot,items:items,actions:actions,native:native)
         if selected, let item = projection.items.first {
             projection.title = item.title; projection.content = item.content

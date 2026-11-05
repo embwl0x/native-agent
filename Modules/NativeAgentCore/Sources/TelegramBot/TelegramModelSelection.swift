@@ -8,7 +8,7 @@ import DeviceSync
 import NotificationInbox
 import PersistenceCore
 
-// Blueprint: | `TelegramModelSelection.swift` | Account-scoped selection from one checked provider/routing snapshot and the provider owner's typed catalogs; exact provider identities, per-provider catalog causes and optional declared capabilities reach commands and menus without inference |
+// Blueprint: | `TelegramModelSelection.swift` | Use checked account-scoped catalogs; retain each provider's cause and declared capabilities |
 
 public struct TelegramProviderRoutingBridge: Sendable {
     let routing: SwiftNativeProviderRouting
@@ -17,7 +17,7 @@ public struct TelegramProviderRoutingBridge: Sendable {
         self.routing = routing
     }
 
-    public func saveModelConfig(surface: String, key: String, value: String) async throws {
+    public func saveModelConfig(surface: String, key: String, value: String, turn: Turn) async throws {
         var body: [String: JSONValue] = ["surface": .string(surface)]
         switch key {
         case "reasoning_effort", "reasoningEffort":
@@ -33,7 +33,7 @@ public struct TelegramProviderRoutingBridge: Sendable {
         _ = try await routing.saveModelConfig(.object(body))
     }
 
-    public func saveModelSelection(surface: String, provider: String?, model: String) async throws {
+    public func saveModelSelection(surface: String, provider: String?, model: String, turn: Turn) async throws {
         // Keep the surface's explicit account rather than guessing from the model name.
         let explicitProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
         let admittedProvider = explicitProvider?.isEmpty == false ? explicitProvider : nil
@@ -205,11 +205,12 @@ extension SwiftNativeTelegramBot {
     public func saveTelegramModelSelection(
         surface: String = "telegram",
         provider: String?,
-        model: String
+        model: String,
+        turn: Turn
     ) async throws {
         guard let routing = completenessDeps?.routing else {
             throw TelegramBotError.notConfigured
         }
-        try await routing.saveModelSelection(surface: surface, provider: provider, model: model)
+        try await routing.saveModelSelection(surface: surface, provider: provider, model: model, turn: turn)
     }
 }

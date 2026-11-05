@@ -3,17 +3,10 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `MacActReceiptRendering.swift` | `MacActReceiptRendering` enum; `actedReadout`, `actedElementJSON` |
 
-/// Pure rendering of the observed act effect; execution and verification stay
-/// with SwiftNativeMacControl and MacActClosedLoop.
+/// Keep rendering separate from execution and verification so receipts cannot invent a verdict.
 enum MacActReceiptRendering {
-    /// The readout THIS act moved: the first one that CHANGED, else the first
-    /// one it ADDED, else nil (nothing moved ⇒ the glance falls back to the
-    /// ranked readout, which is the honest description of a screen the act did
-    /// not change).
-    ///
-    /// Resolved back to the post-act percept's own `MacLookReadout` so the
-    /// glance prints COMPILE-TIME-redacted text — a diff row's text re-rendered
-    /// here would have no node context and could print what the look withheld.
+    /// Resolve changed/added readouts back to the post-act percept so glance text retains compile-time enclosing-caption redaction. Diff text alone lacks that
+    /// context.
     static func actedReadout(
         diff: MacActClosedLoop.EffectDiff,
         after: MacLookPercept
@@ -96,9 +89,7 @@ enum MacActReceiptRendering {
                     guard (child.attributes.title ?? child.attributes.value) != nil else {
                         return .string(child.attributes.role)
                     }
-                    // Fail closed: a node the map has no verdict for is a node
-                    // nothing judged in context, and the context-free second
-                    // opinion is the hole itself.
+                    // Missing contextual redaction must fail closed; a context-free second judgment cannot safely expose text.
                     return redactedText[child.path]
                         ?? MacInjectionResultRedaction.redactedSecret(
                             child.attributes.title ?? child.attributes.value ?? ""
@@ -131,20 +122,16 @@ enum MacActReceiptRendering {
             "affordances_removed_total": .int(Int64(diff.removedTotal)),
             "changed_total": .int(Int64(diff.changedTotal)),
             "focus_changed": .bool(diff.focusChanged),
-            // `window_changed` is backed by the emitted `change_reasons`.
             "window_changed": .bool(diff.windowChanged),
             "change_reasons": .array(diff.changeReasons.map { .string($0) }),
-            // …and when the two compiles ran under different bounds, the
-            // added/removed census is EXCLUDED from those reasons and the
-            // payload says so rather than dropping it silently.
+            // Exclude censuses under mismatched walk bounds and report that exclusion so caps cannot masquerade as changes.
             "diff_comparable": .bool(diff.diffComparable),
             // Include changed read-only values, even when affordances are unchanged.
             "readouts_changed": .array(diff.readoutsChanged.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
             "readouts_changed_total": .int(Int64(diff.readoutsChangedTotal)),
             "readouts_added_total": .int(Int64(diff.readoutsAddedTotal)),
             "readouts_removed_total": .int(Int64(diff.readoutsRemovedTotal)),
-            // The ROWS, not just the totals: `readouts_added_total: 2` does not
-            // contain "42", and that number was the whole reason she acted.
+            // Keep readout rows alongside totals so the receipt retains the value the act produced.
             "readouts_added": .array(diff.readoutsAdded.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
             "readouts_removed": .array(diff.readoutsRemoved.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
         ]

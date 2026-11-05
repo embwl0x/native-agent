@@ -1,10 +1,8 @@
 #!/usr/bin/env swift
 import Foundation
 
-// Scan-only copy: never changes the executable that is signed or distributed.
-// Swift ABI Mangling.rst defines symbolic references in compiler-owned typeref
-// metadata as a control byte plus a 4-byte relative or 8-byte absolute pointer.
-// Those numbers can coincidentally spell a name; they are not string literals.
+// Scan-only copy: never changes the executable that is signed or distributed. Swift ABI Mangling.rst defines symbolic references in compiler-owned typeref
+// metadata as a control byte plus a 4-byte relative or 8-byte absolute pointer. Those numbers can coincidentally spell a name; they are not string literals.
 enum ScanError: Error { case malformed(String) }
 
 func scanCopy(_ input: Data) throws -> Data {
@@ -28,7 +26,7 @@ func scanCopy(_ input: Data) throws -> Data {
             0xbfbafeca, 0xcafebabf].contains(magic) {
             throw ScanError.malformed("unsupported Mach-O architecture; no partial scan")
         }
-        return bytes // Shell scripts and existing non-Mach-O scanner fixtures.
+        return bytes // Non-Mach-O inputs have no symbolic-reference metadata to mask.
     }
     let count = Int(try integer(16, 4))
     let commandSize = Int(try integer(20, 4))
@@ -65,8 +63,7 @@ func scanCopy(_ input: Data) throws -> Data {
                         guard width < sectionEnd - cursor else {
                             throw ScanError.malformed("truncated symbolic reference")
                         }
-                        // NUL separators preserve offsets and prevent joining
-                        // the identifier fragments on either side of a pointer.
+                        // NUL separators preserve offsets and prevent joining the identifier fragments on either side of a pointer.
                         for position in (cursor + 1)...(cursor + width) { bytes[position] = 0 }
                     }
                     cursor += 1 + width
@@ -83,9 +80,8 @@ func scanCopy(_ input: Data) throws -> Data {
     return bytes
 }
 
-// The embedded signature (SuperBlob) holds CodeDirectories whose hash slots are
-// digests of every page; they change on each signing and can spell anything.
-// Only those slots are zeroed: the identifier, entitlements and CMS stay scanned.
+// The embedded signature (SuperBlob) holds CodeDirectories whose hash slots are digests of every page; they change on each signing and can spell anything. Only
+// those slots are zeroed: the identifier, entitlements and CMS stay scanned.
 func maskSignatureHashes(_ bytes: inout Data, at start: Int, length: Int) throws {
     func big(_ offset: Int) throws -> Int {
         guard offset >= start, offset <= start + length - 4 else { throw ScanError.malformed("code signature read out of bounds") }

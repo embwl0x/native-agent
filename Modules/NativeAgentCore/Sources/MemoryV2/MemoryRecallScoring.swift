@@ -2,31 +2,25 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryRecallScoring.swift` | `MemoryRecallScoring`: shared relevance candidate-window bound, timestamp delegation, decay, literal kind extraction and record correction classification; mutation exceptions require explicit correction kind |
+// Blueprint: | `MemoryRecallScoring.swift` | `MemoryRecallScoring`: candidate bounds, decay and explicit kinds |
 
 // MARK: - Semantics tunables
 
-/// Shared near-verbatim threshold for tombstones and semantic duplicates, which also require matching quantities and negations.
-/// Cosine cannot separate all bge paraphrases from contradictions; the memory manager judges claim identity.
+/// Shared near-verbatim threshold for tombstones and semantic duplicates, which also require matching quantities and negations. Cosine cannot separate all bge
+/// paraphrases from contradictions; the memory manager judges claim identity.
 public let memoryNearVerbatimSimilarity: Double = 0.96
 
-/// Kind-scoped recency decay: half-life in DAYS per kind.
-/// Shapes RANK only — never existence; disuse does not erase the record.
-/// Kinds absent from this table — identity/relationship/preference AND
-/// nil/legacy — are exempt (factor 1.0): decay only acts on data that carries
-/// the volatile-class kind signal.
-/// Explicit metadata can supply long-lived kinds outside `MemoryKindStamp.taxonomy`; those decay slowly too.
+/// Kind-specific half-lives affect rank, never existence. Kinds without a configured half-life retain factor 1.0; explicit long-lived kinds outside the
+/// taxonomy may decay slowly.
 public let memoryDecayHalfLifeDays: [String: Double] = [
     "volatile": 60, "project": 60, "operational": 60,
     "decision": 180, "note": 180, "incident": 180,
-    // Moment age decay reads updatedAt; recall changes only use_count and
-    // last_used_at, so access does not refresh this clock.
+    // Moment age decay reads updatedAt; recall changes only use_count and last_used_at, so access does not refresh this clock.
     "moment": 60,
 ]
 
-/// Recall relevance and decay mathematics.
 public enum MemoryRecallScoring {
-    /// One candidate-window rule for judgment and its paging receipt.
+    /// Share candidate-window limits between judgment and paging receipts.
     public static func relevanceCandidateLimit(topK: Int, count: Int) -> Int {
         let bounded = min(max(topK, 0), count)
         return bounded > count / 12 ? count : min(count, max(bounded * 12, 60))
@@ -41,13 +35,12 @@ public enum MemoryRecallScoring {
         return variance.squareRoot()
     }
 
-    /// Parse either ISO8601 variant the codebase writes (fractional + plain).
+    /// Accept both fractional and plain ISO8601 forms written by the owners.
     public static func parseTimestamp(_ s: String) -> Date? {
         NativeTimestampFormat.parseISO8601FractionalFirst(s)
     }
 
-    /// Multiplier in (0, 1]: pow(0.5, age/halfLife) for kinds with a configured
-    /// half-life; 1.0 (exempt) for everything else or unparseable timestamps.
+    /// Only configured kinds with readable timestamps decay; all others retain full relevance.
     public static func decayFactor(kind: String?, updatedAt: String, now: Date = Date()) -> Double {
         guard let kind, let halfLifeDays = memoryDecayHalfLifeDays[kind] else { return 1.0 }
         guard let updated = parseTimestamp(updatedAt) else { return 1.0 }
@@ -55,10 +48,7 @@ public enum MemoryRecallScoring {
         return pow(0.5, ageDays / halfLifeDays)
     }
 
-    /// Age is a bounded ranking preference, not evidence that an active fact
-    /// stopped being true. Keep at least 90% of relevance even after many
-    /// half-lives; lifecycle/supersession owns invalidation. Fresh near-ties
-    /// still win without burying an old direct answer under newer tangents.
+    /// Retain at least 90% relevance: age breaks near-ties but lifecycle and supersession alone invalidate facts.
     public static func recallRecencyFactor(kind: String?, updatedAt: String, now: Date = Date()) -> Double {
         0.9 + 0.1 * decayFactor(kind: kind, updatedAt: updatedAt, now: now)
     }
@@ -69,8 +59,7 @@ public enum MemoryRecallScoring {
         return k.isEmpty ? nil : k
     }
 
-    /// Mutation exceptions require the explicit kind, not projection-only tags
-    /// or historical correction metadata shapes.
+    /// Mutation exceptions require explicit kind, never derived tags or correction metadata.
     static func isExplicitCorrection(_ metadata: JSONValue?) -> Bool {
         kind(of: metadata) == "correction"
     }
@@ -110,7 +99,6 @@ public enum MemoryRecallScoring {
         }
     }
 
-    /// Raw BM25 over prepared terms and the caller's selected document cohort.
     package static func bm25Scores(
         queryTerms: [String],
         documents: [(termCounts: [String: Int], length: Int)],

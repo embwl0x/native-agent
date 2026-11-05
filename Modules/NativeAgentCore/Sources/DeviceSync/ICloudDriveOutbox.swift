@@ -55,7 +55,9 @@ extension iCloudBridge {
                 switch result {
                 case .success(let messages): scan = messages
                 case .failure(let error):
-                    self.syncStatus = "Retained Drive messages could not be read: \(error.localizedDescription). Restore the Drive folder's access before resuming them."
+                    self.syncStatus = """
+                        Retained Drive messages could not be read: \(error.localizedDescription). Restore the Drive folder's access before resuming them.
+                        """
                     return
                 }
                 if !scan.isEmpty {
@@ -117,7 +119,6 @@ extension iCloudBridge {
             .appendingPathComponent(DriveFolder.processed)
             .appendingPathComponent("ios_chat_processed_ids.json")
     }
-    // Persist the ordered message identities, oldest first.
     nonisolated static func loadProcessedMessageIDs(docsURL: URL) throws -> [String] {
         let url = processedMessageIDsURL(docsURL: docsURL)
         do { return try JSONDecoder().decode([String].self, from: VolumeIO.contents(of: url)) }
@@ -151,7 +152,10 @@ extension iCloudBridge {
             lastSyncAt = Date()
             syncStatus = "iPhone request processed"
         case .failure(let error):
-            syncStatus = "The iPhone request ran, but its Drive completion could not be retained: \(error.localizedDescription). Repair the processed-message store; do not repeat the request."
+            syncStatus = """
+                The iPhone request ran, but its Drive completion could not be retained: \(error.localizedDescription). Repair the processed-message store; \
+                do not repeat the request.
+                """
         }
     }
     nonisolated static func scanIosOutboxFiles(
@@ -213,8 +217,7 @@ extension iCloudBridge {
                 if fm.fileExists(atPath: claimed.path) {
                     do {
                         if try VolumeIO.contents(of: claimed) == data {
-                            // The authenticated bytes are already claimed. Its
-                            // handler (possibly queued) still owns that path.
+                            // The existing handler owns these authenticated claimed bytes, even while queued.
                             try fm.removeItem(at: fileURL)
                         } else {
                             nativeLog("[iCloudBridge] conflicting Drive claim preserved: %@", fileURL.lastPathComponent)
@@ -233,11 +236,7 @@ extension iCloudBridge {
                 }
             }
             guard admittedPaths.insert(currentURL).inserted else { continue }
-            // A metadata-query rescan can see the file while its first handler
-            // is still awaiting the model. Leave it claimed in `processing` so
-            // a transient handler failure remains retryable. Treating in-flight
-            // as already-seen used to move it to duplicate_*.done and could drop
-            // that retry permanently.
+            // Keep in-flight files claimed during rescans so a transient handler failure remains retryable.
             if inFlightMessageIDs.contains(msg.id) {
                 continue
             }

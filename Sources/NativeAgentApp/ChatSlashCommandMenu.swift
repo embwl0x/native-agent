@@ -7,7 +7,6 @@ struct SlashCommandMenu: View {
     var filter: String
     var selectedCommand: String?
     var onSelect: (String) -> Void
-    // Escape dismisses the popover.
     var onDismiss: (() -> Void)? = nil
 
     @MainActor
@@ -52,7 +51,7 @@ struct SlashCommandMenu: View {
                         }
                         .contentShape(Rectangle())
                     }
-                    // Plain, not borderless: borderless drew the rows dim on glass.
+                    // Use plain buttons because borderless styling dims rows on glass.
                     .buttonStyle(.plain)
                     .id(cmd.id)
                     .accessibilityAddTraits(selectedCommand == cmd.id ? [.isSelected] : [])
@@ -65,7 +64,7 @@ struct SlashCommandMenu: View {
         .onChange(of: selectedCommand, initial: true) { _, command in
             if let command { proxy.scrollTo(command) }
         }
-        // A hidden Escape button closes the slash-command popover.
+        // Keep Escape scoped to this popover through its hidden shortcut button.
         .background(
             Button("") { onDismiss?() }
                 .keyboardShortcut(.escape, modifiers: [])

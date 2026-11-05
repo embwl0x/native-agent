@@ -3,13 +3,11 @@ import UIKit
 import NativeAgentShared
 // Blueprint: | `AliveRoom.swift` | Phone room and chat-driven mood presenting the shared `HazeView` |
 
-// Three radial-gradient layers drift on the render server; state changes ramp tempo and weight.
-// Peak overlap stays within 0.44 alpha so room text retains its contrast.
+// Cap peak haze overlap at 0.44 alpha to preserve room text contrast.
 
 // MARK: - The room
 
-/// The room colour and the haze over it, edge to edge. Put it behind a screen
-/// whose own backgrounds are clear.
+/// Screen backgrounds must remain clear so the edge-to-edge room shows through.
 struct AliveRoom: View {
     var mood: HazeMood = .idle
     @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
@@ -31,8 +29,7 @@ struct AliveRoom: View {
     }
 }
 
-/// Reads the chat's turn state for the room's mood. Every input changes a few
-/// times per turn; the representable ignores anything that is not a change.
+/// Only changed turn inputs reach the representable, avoiding redundant room updates.
 struct AliveChatRoom: View {
     var store: ChatStore
 

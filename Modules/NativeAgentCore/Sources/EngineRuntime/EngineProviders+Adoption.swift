@@ -2,29 +2,17 @@ import Foundation
 import DeviceSync
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `EngineProviders+Adoption.swift` | Blank-surface adoption delegates to the routing transaction and publishes its committed snapshot through LatestRead.write; serialized chat-brain saves retain pending edits, while canonical selection derives from ProvidersFacade.settings. |
+// Blueprint: | `EngineProviders+Adoption.swift` | Transactional Chat adoption preserving intentional overrides and pending edits |
 
 extension ProvidersFacade {
-    /// After a provider is connected (especially the FIRST one, at onboarding),
-    /// Chat adopts it — and everything else follows Chat.
-    ///
-    /// So this writes ONE assignment (`chat`) instead of one per surface. Fifteen
-    /// identical assignments made Work and Memory and mind read **Explicit
-    /// override** on a fresh install when the person had overridden nothing; with
-    /// one, the page reads **All activities match Chat** and every lane resolves
-    /// through Chat's route. Stale assignments left by an older install (or by a
-    /// provider that is no longer connected) are CLEARED rather than repointed,
-    /// so they go back to following Chat too — a real override, made by a person
-    /// on the Providers page, is left exactly alone.
+    /// Write only Chat’s assignment so other groups inherit naturally; clear disconnected stale assignments while preserving deliberate user overrides.
     @MainActor
     public func adoptProviderForBlankSurfaces(
         _ providerId: String, dataRoot: URL,
         failure: (Error, String) -> Void
     ) async -> Bool {
         defer { Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() } }
-        // Only an eligible account can become Chat's inherited route.
-        // Saved assignments (without sole-account resolution) are re-read
-        // inside the picker's transaction. No stale per-surface clear follows.
+        // Adopt only eligible accounts and re-read saved assignments inside the transaction so stale state cannot clear overrides.
         let routing = SwiftNativeProviderRouting(
             dataRoot: dataRoot
         )

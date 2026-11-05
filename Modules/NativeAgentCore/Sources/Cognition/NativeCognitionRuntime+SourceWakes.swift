@@ -8,11 +8,9 @@ import NativeAgentShared
 import PersistenceCore
 import Desk
 import Senses
-// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | Runtime-owned source observations for canon, horizon, Reach, cares and quiet-hour preferences; launch and calendar-day/clock/time-zone invalidations ask the engine to perceive the local day; the crossing (`SenseCrossing`): a part's arrival or a sense's news that touches a care asks for one ResidentWake naming it, once per watch per care until the care rests; the same line releases open news intentions by the care law through system Desk notes, once per intention in 12 hours; registration precedes reads, renewed directory children remain watched, canon arms journal membership before enumerating input children and compares input stamps to ignore audit output and unchanged directory events, stop cancels observations, and the existing residual deadline owns source cooldown/eligibility/expiry boundaries |
+// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | `SenseCrossing`. |
 
-/// Source invalidations and their real time boundaries, owned by this runtime.
-/// No interval samples unchanged sources; the existing residual deadline owns
-/// cooldown, eligibility and expiry wakes.
+/// Use source invalidations and actual time boundaries on the existing residual deadline; quiet sources need no interval polling.
 struct CognitiveSourceWakes: Sendable {
     var canonObservation: Task<Void, Never>?
     var horizonObservation: Task<Void, Never>?
@@ -36,7 +34,7 @@ struct CognitiveSourceWakes: Sendable {
     var clockDirty = true
     var pursuitNextAt: Date?
     var wanderNextAt: Date?
-    /// Only concurrent writes are held here; the item's notes own news rest.
+    /// Keep only concurrent writes here; item notes own news rest.
     var newsReleasesInFlight: Set<String> = []
 
     func cancelObservations() {
@@ -79,8 +77,7 @@ extension NativeCognitionRuntime {
 
     private nonisolated static func canonSourceEvents(at root: URL) -> AsyncStream<Void> {
         let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        // Arm membership before enumerating children. An archive created while
-        // file watches bind remains buffered and renews those watches next.
+        // Observe membership before enumeration so archives created during watch binding remain buffered.
         let directory = FileChangeWatcher(paths: [root.appendingPathComponent("studio/journal")]) {
             [continuation = pair.continuation] _ in continuation.yield(())
         }
@@ -108,7 +105,6 @@ extension NativeCognitionRuntime {
         [SwiftNativeDeskStore(dataRoot: root).opsPath, SwiftNativeDeskStore(dataRoot: root).basePath]
             + ["user_prefs.json", "agents/peers.json", "cognition/user_turn.json", "cognition/reach.json", "memory/profile.json"]
                 .map { root.appendingPathComponent($0) }
-            + [defaultClaudeWorklog(), defaultCodexRecord()]
     }
 
     private nonisolated static func reachSourceEvents(at root: URL) -> AsyncStream<Void> {
@@ -145,8 +141,7 @@ extension NativeCognitionRuntime {
         let reachEvents: @Sendable () -> AsyncStream<Void> = {
             Self.reachSourceEvents(at: root)
         }
-        // Each observer marks readiness only after registration. Re-arm before
-        // each reread so newly created journal/job children are watched too.
+        // Mark readiness only after registration; rearm before reads so new children also receive watches.
         let clock = EventDeadlinePhysiology.storeAndFileEvents(paths: [preferences], notifications: [
             .NSCalendarDayChanged, .NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
             ProcessInfo.thermalStateDidChangeNotification
@@ -205,8 +200,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Registration and the terminal latch share one non-suspending actor
-    /// segment, including renewals after an observation await.
+    /// Keep registration and termination checks in one nonsuspending actor segment, including after observation awaits.
     private func admittedSourceEvents(_ make: @Sendable () -> AsyncStream<Void>) -> AsyncStream<Void>? {
         guard !isFlushedForTermination, !Task.isCancelled else { return nil }
         return make()
@@ -290,15 +284,12 @@ extension NativeCognitionRuntime {
     }
 }
 
-// What reaches her mind is a change that touches what she cares about
-// (docs/SUBCONSCIOUS.md, Cares). Owed work (carried promises, approvals, her
-// opened apps, Reach, agent messages) files its own arrivals. News intentions
-// meet their world moment here and join that same carried-work path.
+// Release care-relevant news through carried work; other owed work files its own arrivals.
 extension NativeCognitionRuntime: SenseCrossing {
     public func cross(_ line: String, watch: String, reason: String, id: String, says: String,
                       agent: String?) async -> SenseCrossed {
         guard !isFlushedForTermination else { return .unweighed }
-        // Whatever it weighs, the moment stays primed for her next turn.
+        // Keep the moment primed for the next turn regardless of its weight.
         PrimedMoments.prime(dataRoot: dataRoot, line: says.isEmpty ? line : says, source: watch)
         await releaseNewsIntentions(touchedBy: line, watch: watch)
         guard !isFlushedForTermination else { return .unweighed }
@@ -307,7 +298,7 @@ extension NativeCognitionRuntime: SenseCrossing {
         case .untouched: return .untouched
         case .touches(let care, resting: true): return .resting(care: care.about)
         case .touches(let care, resting: false):
-            // The watch's thread carries the hop rule, so a watch cannot keep waking her.
+            // Carry the hop rule on the watch thread so its own releases cannot wake it repeatedly.
             let wokeAt = now()
             guard ResidentWake.shared.request(dataRoot: dataRoot, reason: reason + " about " + care.about, items: [
                 .init(id: id, line: says, thread: watch, agent: agent, home: true, at: wokeAt, careID: care.id)
@@ -317,8 +308,7 @@ extension NativeCognitionRuntime: SenseCrossing {
         }
     }
 
-    /// The Desk story is both the release and its rest ledger. Her next note
-    /// consumes a release; another watch may release it before this one rests.
+    /// Keep release and rest in the Desk story; the next note consumes a release even if another watch produced it.
     private func releaseNewsIntentions(touchedBy line: String, watch: String) async {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         do {
@@ -338,8 +328,7 @@ extension NativeCognitionRuntime: SenseCrossing {
                 defer { sourceWakes.newsReleasesInFlight.remove(key) }
                 guard let weighed = entries.first(where: { $0.item.handle == handle }),
                       !isFlushedForTermination, !Task.isCancelled else { continue }
-                // A refile, closure, topic change and the topic's 12-hour rest
-                // are checked in the transaction that appends the release.
+                // Check identity, topic, closure and 12-hour rest in the release-append transaction.
                 if try await MyQueue.releaseNews(weighed, summary: String(line.prefix(160)) + " (" + watch + ")",
                     store: store, at: now(), rest: CognitiveSubstrate.careReleaseRest) { released = true }
             }

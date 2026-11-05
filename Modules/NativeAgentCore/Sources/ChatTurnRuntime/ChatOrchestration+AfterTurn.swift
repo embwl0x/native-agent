@@ -7,29 +7,23 @@ import CognitiveSubstrate
 import Senses
 import StandingBots
 import MemoryV2
-// Blueprint: | `ChatOrchestration+AfterTurn.swift` | `SwiftNativeTurnEngine`: owed memory recording and serialized retained interpretation; claimed wake cares join the settled reply's origin; predecessor tasks settle before current-handle cleanup |
+// Blueprint: | `ChatOrchestration+AfterTurn.swift` | `SwiftNativeTurnEngine`; Owed recording before retained interpretation |
 
 extension SwiftNativeTurnEngine {
-    // Settlement awaits the owed recording; only interpretation rides the
-    // retained, serialized tail. Replies do not wait on interpretation and no
-    // surface needs to drain it. Sleep joins accepted recordings; the journal
-    // owns every unfinished interpretation (docs/STOP.md).
+    // Settlement awaits recording; interpretation runs on a retained serial tail so replies do not wait for it.
+    // Sleep joins accepted recordings, and the journal retains unfinished interpretation.
     private struct PendingMemoryPromotion {
         let userMessage: String
         let assistantMessage: String
         let toolDispatches: [TurnEngineResult.ToolDispatchRecord]
         let sessionId: String?
         let surface: String
-        let origin: AfterTurnOrigin?
         let repliedAt: Date
-        let standingBot: BotDefinition?
-        let senseReads: SenseTurnReads?
-        /// The captured parent trace is rebound for recording and interpretation.
-        let turnId: String?
+        let turn: Turn
+        let work: ChatTurnWork
         let bus: TurnTraceBus?
     }
 
-    /// Capture recording on the turn's own answer-settlement handle.
     func deferMemoryPromotion(
         userMessage: String,
         assistantMessage: String,
@@ -37,40 +31,39 @@ extension SwiftNativeTurnEngine {
         sessionId: String?,
         surface: String,
         took: String? = nil,
-        afterReply held: AfterReply? = nil
-    ) -> AfterReply {
-        var origin = AfterTurnSource.origin
+        afterReply held: AfterReply? = nil,
+        turn: Turn,
+    work: ChatTurnWork) -> AfterReply {
+        var origin = turn.afterTurnOrigin
         origin?.took = took
-        if sessionId == ResidentWake.session, !AfterTurnSource.careWakes.isEmpty {
-            origin?.careWakes = AfterTurnSource.careWakes
+        if sessionId == ResidentWake.session, !turn.careWakes.isEmpty {
+            origin?.careWakes = turn.careWakes
         }
         let pending = PendingMemoryPromotion(
             userMessage: userMessage, assistantMessage: assistantMessage,
             toolDispatches: toolDispatches, sessionId: sessionId, surface: surface,
-            origin: origin, repliedAt: Date(), standingBot: StandingBotContinuity.currentBot,
-            senseReads: SenseTurnReads.current, turnId: TurnTraceContext.turnId, bus: TurnTraceContext.bus)
+            repliedAt: Date(), turn: turn.with(\.afterTurnOrigin, origin), work: work, bus: TurnTraceContext.bus)
         let held = held ?? afterReply {}
         held.beforeStart { await self.recordMemoryPromotion(pending) }
         return held
     }
 
-    /// Await owed recording; interpretation alone waits on the serialized tail.
     private func recordMemoryPromotion(_ pending: PendingMemoryPromotion) async {
-        // Rebind before recording and creating the interpretation task, which
-        // inherits these task locals from its settled parent turn.
+        let turn = pending.turn
+        let work = pending.work
+        // Only trace correlation is rebound; interpretation receives the saved turn and operation.
         await TurnTraceContext.$bus.withValue(pending.bus) {
-        await TurnTraceContext.$turnId.withValue(pending.turnId) {
-        await AfterTurnSource.$origin.withValue(pending.origin) {
-        await SenseTurnReads.$current.withValue(pending.senseReads) {
-        await StandingBotContinuity.$currentBot.withValue(pending.standingBot) {
+        await TurnTraceContext.$turnId.withValue(pending.turn.id) {
+        await holding(turn.with(\.afterTurnOrigin, pending.turn.afterTurnOrigin)) { turn in
+        await holding(work.with(\.senseReads, pending.work.senseReads)) { work in
+        await holding(turn.with(\.standingBot, pending.turn.standingBot)) { turn in
             await memoryPromoter?.recordOwedTurn(
                 userMessage: pending.userMessage,
                 assistantMessage: pending.assistantMessage,
                 sessionId: pending.sessionId ?? "swift-turn-engine",
                 surface: pending.surface,
-                standingAgentName: pending.standingBot?.name,
-                turnId: pending.turnId, repliedAt: pending.repliedAt
-            )
+                standingAgentName: pending.turn.standingBot?.name,
+                repliedAt: pending.repliedAt, turn: turn)
             let previous = deferredMemoryPromotion
             let id = UUID()
             deferredMemoryPromotionID = id
@@ -87,8 +80,8 @@ extension SwiftNativeTurnEngine {
                     assistantMessage: pending.assistantMessage,
                     toolDispatches: pending.toolDispatches,
                     sessionId: pending.sessionId,
-                    surface: pending.surface
-                )
+                    surface: pending.surface,
+                 turn: turn,work: work)
             }
         }
         }
@@ -102,8 +95,9 @@ extension SwiftNativeTurnEngine {
         assistantMessage: String,
         toolDispatches: [TurnEngineResult.ToolDispatchRecord] = [],
         sessionId: String?,
-        surface: String = "chat"
-    ) async {
+        surface: String = "chat",
+        turn: Turn,
+    work: ChatTurnWork) async {
         let startNs = DispatchTime.now().uptimeNanoseconds
         guard let memoryPromoter else {
             ContextStageTrace.emitStage(
@@ -118,7 +112,8 @@ extension SwiftNativeTurnEngine {
                 flags: [
                     "configured": false,
                     "outcomeReported": false,
-                ]
+                ],
+                turn: turn
             )
             return
         }
@@ -127,9 +122,8 @@ extension SwiftNativeTurnEngine {
             assistantMessage: assistantMessage,
             sessionId: sessionId ?? "swift-turn-engine",
             surface: surface,
-            standingAgentName: StandingBotContinuity.currentBot?.name,
-            turnId: TurnTraceContext.turnId
-        )
+            standingAgentName: turn.standingBot?.name,
+            turn: turn, senseReads: work.senseReads)
         ContextStageTrace.emitStage(
             name: .memoryPromotion,
             elapsedMs: Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
@@ -172,7 +166,8 @@ extension SwiftNativeTurnEngine {
                 "recoveryAction": observation.extraction.failure?.recovery ?? "none",
                 "memoryModel": observation.extraction.failure?.model ?? "unreported",
                 "memorySurface": observation.extraction.failure?.surface ?? "unreported",
-            ]
+            ],
+            turn: turn
         )
     }
 }

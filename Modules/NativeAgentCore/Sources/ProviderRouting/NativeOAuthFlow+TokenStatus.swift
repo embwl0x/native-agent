@@ -2,14 +2,14 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `NativeOAuthFlow+TokenStatus.swift` | Token clearing and badge projections of each adapter's credential verdict and effective expiry; Sendable sign-in/session-offer values travel in the checked provider snapshot; no independent readiness or credential-selection rules |
+// Blueprint: | `NativeOAuthFlow+TokenStatus.swift` | adapter-owned sign-in verdicts |
 
 extension NativeOAuthFlow {
     public enum CodexCLISessionOffer: Equatable, Sendable {
         case available(email: String?, alreadyDeclined: Bool)
         case unavailable(reason: String)
     }
-    /// Delete under the refresh path lock, returning false if locking or deletion fails.
+    /// Deletion failures must remain visible even when the credential lock cannot be acquired.
     private static func removeCredentialFile(at path: URL) -> Bool {
         do {
             return try CredentialFileLock.withLock(path) {
@@ -26,9 +26,7 @@ extension NativeOAuthFlow {
         }
     }
 
-    /// Disk-only sign-out: remove the provider's token file. Returns true only
-    /// when every credential file this provider owns is gone (or was already
-    /// absent) — a lock or delete failure is reported, not swallowed.
+    /// Sign-out succeeds only when every owned credential file is confirmed gone; lock and delete failures remain failures.
     public static func clearTokens(providerId: String, dataRoot: URL? = nil) -> Bool {
         let root = dataRoot ?? PersistenceCore.defaultDataRoot()
         return signInAttempts.clear(providerId: providerId, dataRoot: root) {
@@ -40,13 +38,13 @@ extension NativeOAuthFlow {
         let normalized = normalizedOAuthProviderId(providerId)
         switch providerId {
         case "openai_oauth_direct":
-            // Sign-out deletes only the selected root's app-owned credential.
+            // Sign-out may delete only this root's app-owned credential.
             let root = dataRoot ?? PersistenceCore.defaultDataRoot()
             var removed = true
             let path = openAIAppOwnedAuthPath(dataRoot: root)
             if !ChatGPTTransport.isUserCodexPath(path) {
                 if !removeCredentialFile(at: path) { removed = false }
-                // Codex children's access-only copy goes with the sign-in.
+                // Child credentials must disappear with the app sign-in.
                 do { try ChatGPTTransport.syncCodexChildCopy(from: path) } catch { removed = false }
             }
             // Sign-out revokes this root's CLI-session adoption while preserving the shared CLI file.
@@ -59,7 +57,7 @@ extension NativeOAuthFlow {
             return removeCredentialFile(at: anthropicTokenPath(dataRoot: dataRoot))
         default:
             guard normalized == "xai_oauth_direct" else { return false }
-            // Sign-out deletes only the selected root's app-owned credential.
+            // Sign-out may delete only this root's app-owned credential.
             do {
                 try XAIOAuthCredentialStore.remove(at: XAIOAuthTransport.tokenPath(
                     dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()))
@@ -124,7 +122,7 @@ extension NativeOAuthFlow {
         return "Signed in (expires in \(label))"
     }
 
-    /// Names an adopted shared CLI session and its account when known.
+    /// Shared-session offers name the account only when known.
     public static func openAIAdoptedCLISessionDetail(
         activeAuthPath: URL? = nil,
         sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome(),
@@ -152,10 +150,7 @@ extension NativeOAuthFlow {
         return "using your Codex CLI sign-in (~/.codex)"
     }
 
-    /// Best-effort account email from the auth blob's JWT claims. The OpenAI
-    /// id_token carries `email`; the access_token nests it under the
-    /// `https://api.openai.com/profile` claim. Display-only — never used for
-    /// authorization.
+    /// JWT email is display-only and must never authorize access.
     public static func openAIAccountEmail(at path: URL) -> String? {
         guard let data = try? Data(contentsOf: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
@@ -176,9 +171,7 @@ extension NativeOAuthFlow {
 
     // MARK: - Paths (shared with the read-side adapters)
 
-    /// App-owned ChatGPT auth WRITE target (`<dataRoot>/codex_home/auth.json`).
-    /// In-app sign-in and re-auth always write here — never to the shared
-    /// `~/.codex` session, which belongs to the Codex CLI.
+    /// App sign-in writes only app-owned auth; the shared CLI session belongs to the CLI.
     public static func openAIAppOwnedAuthPath(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL {
@@ -188,8 +181,7 @@ extension NativeOAuthFlow {
         )
     }
 
-    /// The adapter's runtime read selection, including process overrides for
-    /// the default root and confined CLI consent for alternate roots.
+    /// Status must use the adapter's selected root, overrides and consent rules.
     public static func openAIStatusAuthPath(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome()
@@ -204,10 +196,8 @@ extension NativeOAuthFlow {
             .appendingPathComponent("anthropic_oauth_direct.json")
     }
 
-    /// Persist the exact provider-file shape the Anthropic adapter reads. An
-    /// existing malformed credential file is authority evidence, not an empty
-    /// starting point: leave it byte-preserved and surface the failed OAuth
-    /// completion so Settings never claims a connection that cannot be read.
+    /// An unreadable credential is authority evidence, never an empty starting point; preserve it and fail sign-in rather than claim an unreadable
+    /// connection.
     public static func persistAnthropicOAuthTokens(
         _ tokens: [String: Any],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -287,8 +277,7 @@ extension NativeOAuthFlow {
         }
     }
 
-    /// Called only after the Providers UI's destructive confirmation. Core
-    /// byte-preserves and verifies the backup before removing the authority.
+    /// Called only after the Providers UI's destructive confirmation. Core byte-preserves and verifies the backup before removing the authority.
     public static func repairCodexCLISessionConsent(dataRoot: URL? = nil) throws -> URL {
         try ChatGPTTransport.backupAndResetCorruptCLIAdoptionConsent(dataRoot: dataRoot)
     }
@@ -301,20 +290,10 @@ extension NativeOAuthFlow {
         public let error: String?
     }
 
-    /// The person's control for signing a direct OAuth provider in again, named
-    /// as the Providers page shows it for the saved credential's state
-    /// (OAuthSignInPresentation reads the same `signInStatus`).
+    /// The Providers face sends sign-in through the account's protected connection card.
     public static func signInControl(providerID: String, dataRoot: URL) -> String? {
-        let button: (id: String, card: String, short: String)? = switch providerID {
-        case "openai_oauth_direct", "codex": ("openai_oauth_direct", "ChatGPT", "ChatGPT")
-        case "anthropic_oauth_direct": (providerID, "Anthropic", "Claude")
-        case "xai_oauth_direct": (providerID, "xAI", "xAI Grok")
-        default: nil
-        }
-        return button.map { button in
-            "Providers → Sign in, reconnect or add an account → " + button.card + " → "
-                + (signInStatus(providerID: button.id, dataRoot: dataRoot).isSignedIn ? "Re-authenticate " : "Sign in with ") + button.short
-        }
+        guard ["openai_oauth_direct", "codex", "anthropic_oauth_direct", "xai_oauth_direct"].contains(providerID) else { return nil }
+        return "Providers → Accounts → " + SwiftNativeProviderRouting.displayName(for: providerID) + " → Sign in"
     }
 
     public static func signInStatus(providerID: String, dataRoot: URL) -> SignInStatus {
@@ -328,7 +307,10 @@ extension NativeOAuthFlow {
             return SignInStatus(isSignedIn: false, detail: "No saved sign-in. Sign in through Providers.", error: nil)
         } catch {
             return SignInStatus(isSignedIn: false, detail: nil,
-                error: "\(providerID) credentials are unavailable: \(ProviderFailure.diagnosticDescription(error)). Repair the saved credential before reconnecting.")
+                error: """
+                    \(providerID) credentials are unavailable: \(ProviderFailure.diagnosticDescription(error)). Repair the saved credential before \
+                    reconnecting.
+                    """)
         }
     }
 

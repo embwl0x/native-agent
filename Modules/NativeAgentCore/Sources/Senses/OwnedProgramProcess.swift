@@ -4,7 +4,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `OwnedProgramProcess.swift` | Shared helper process framing, IO and deadlines |
-/// Pipe callbacks frame IO; the requesting task interprets and executes under its own Trust.
+/// Interpret pipe messages in the requesting task so host execution retains its Trust.
 final class OwnedProgramProcess: @unchecked Sendable {
     enum Event: Sendable { case line(Data), ended(String) }
     let events: AsyncStream<Event>
@@ -58,8 +58,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
             lock.lock(); stderr.append(data); stderr = Data(stderr.suffix(4_096)); lock.unlock()
             if data.isEmpty { handle.readabilityHandler = nil }
         }
-        // Keep the transport alive until the child is reaped, even if its
-        // runner has already retired the slot. Break the retain on real exit.
+        // Retain transport until the child is reaped, even after slot retirement; break the retain only on real exit.
         process.terminationHandler = { [self] process in
             process.terminationHandler = nil
             lock.lock()
@@ -75,7 +74,10 @@ final class OwnedProgramProcess: @unchecked Sendable {
                 stopping = true; execution = nil
             }
             lock.unlock()
-            sink.yield(.ended(process.terminationError ?? "Sense helper at \(helper.path) exited (\(process.terminationStatus)): \(tail) Tell the person about this NativeAgent helper failure; preserve its error output."))
+            sink.yield(.ended(process.terminationError ?? """
+                Sense helper at \(helper.path) exited (\(process.terminationStatus)): \(tail) Tell the person about this NativeAgent helper failure; \
+                preserve its error output.
+                """))
             sink.finish()
             lock.withLock { deadlineTask?.cancel(); resources?.cancel() }
             writeQueue.sync { closeWriter() }
@@ -94,8 +96,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
             writeSource = source
             try process.run()
             lock.lock(); tree = ProcessTreeReaper.snapshot(rootPID: pid)
-            // Process-tree RSS has no confirmed equivalent threshold event. Retain the
-            // one-second sample, owned and cancelled by this helper transport.
+            // Process-tree RSS has no equivalent threshold event; keep the helper-owned, cancellable one-second sample.
             if let memoryBytes, !stopping { resources = Task.detached(priority: .utility) { [weak self] in
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .seconds(1)) } catch { return }
@@ -112,7 +113,9 @@ final class OwnedProgramProcess: @unchecked Sendable {
                         var info = proc_taskinfo()
                         let size = Int32(MemoryLayout<proc_taskinfo>.size)
                         guard proc_pidinfo(identity.pid, PROC_PIDTASKINFO, 0, &info, size) == size else {
-                            self.fail(SenseFailure(code: "resource_unavailable", message: "Resource accounting for helper process \(identity.pid) is unavailable; its memory use is unknown."))
+                            self.fail(SenseFailure(code: "resource_unavailable", message: """
+                                Resource accounting for helper process \(identity.pid) is unavailable; its memory use is unknown.
+                                """))
                             return
                         }
                         memory += info.pti_resident_size; accounted = true
@@ -134,10 +137,12 @@ final class OwnedProgramProcess: @unchecked Sendable {
             errors.fileHandleForReading.readabilityHandler = nil
             writeQueue.sync { closeWriter() }
             sink.finish()
-            // Resource exhaustion passes; anything else needs a repair.
+            // Resource exhaustion must remain distinct from failures requiring repair.
             let cause = (error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError ?? error as NSError
             let busy = cause.domain == NSPOSIXErrorDomain && [EAGAIN, ENOMEM, EMFILE, ENFILE].contains(Int32(cause.code))
-            throw SenseFailure(code: busy ? "spawn_busy" : "spawn_failed", message: "Tell the person: NativeAgent's sense helper at \(helper.path) could not launch: \(error.localizedDescription)")
+            throw SenseFailure(code: busy ? "spawn_busy" : "spawn_failed", message: """
+                Tell the person: NativeAgent's sense helper at \(helper.path) could not launch: \(error.localizedDescription)
+                """)
         }
     }
     func send(_ message: JSONValue) throws {
@@ -279,8 +284,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
         stopping = true
         deadlineTask?.cancel(); resources?.cancel(); execution = nil
         sink.finish()
-        // Swift senses may have a compiler/runtime child. Freeze and kill the
-        // identity-checked tree, including observed descendants after a crash.
+        // Freeze and kill the identity-checked process tree because helpers may leave compiler/runtime descendants after a crash.
         let snapshot = ProcessTreeReaper.snapshot(rootPID: pid, retaining: tree)
         tree = ProcessTreeReaper.quiesceAndKill(snapshot)
         if let detail = process.terminationError {

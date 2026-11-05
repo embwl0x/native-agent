@@ -8,10 +8,7 @@ func _tgEncodeBotToken(_ token: String) -> String {
     return token.addingPercentEncoding(withAllowedCharacters: allowed) ?? token
 }
 
-/// Build a Telegram Bot API URL using URLComponents with canonical path-segment
-/// encoding (via `percentEncodedPath`) so the bot token and method never end up
-/// as raw reserved characters in the URL path. Optional query items are encoded
-/// by URLComponents as well.
+/// Use percentEncodedPath so reserved characters in tokens and methods cannot alter the API URL path.
 func _tgBuildBotURL(
     token: String,
     method: String,

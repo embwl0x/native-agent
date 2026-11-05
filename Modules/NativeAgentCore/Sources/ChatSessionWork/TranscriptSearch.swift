@@ -1,9 +1,7 @@
 import Foundation
 // Blueprint: | `TranscriptSearch.swift` | `TranscriptSearchDocument`, `TranscriptSearchResult`, `TranscriptSearchResponse`, `TranscriptSearch` |
 
-/// A rebuildable projection over an already loaded transcript.
-/// JSONL remains authoritative: this type writes no sidecar index and
-/// owns no session lifecycle.
+/// JSONL remains authoritative; this rebuildable projection owns no sidecar index or session lifecycle.
 public struct TranscriptSearchDocument: Sendable, Equatable {
     public let messageID: String
     public let ordinal: Int
@@ -37,10 +35,9 @@ public struct TranscriptSearchResponse: Sendable, Equatable {
 }
 
 public enum TranscriptSearch {
-    /// Query work is bounded before Foundation normalization or comparison.
+    /// Bound query work before Foundation normalization and comparison.
     public static let maximumQueryScalars = 256
-    /// Huge repetitive histories remain searchable without retaining an
-    /// unbounded navigation array. The exact total is still reported.
+    /// Bound navigation storage for repetitive histories while keeping an exact total.
     public static let maximumNavigableResults = 2_000
 
     public static func boundedInput(_ raw: String) -> String {
@@ -70,8 +67,7 @@ public enum TranscriptSearch {
         ) ?? TranscriptSearchResponse(query: boundedQuery(rawQuery), results: [], totalMatchCount: 0)
     }
 
-    /// The controller uses this form so a superseded query stops consuming CPU
-    /// instead of leaving an unstructured full-history scan behind it.
+    /// Stop superseded queries cooperatively so obsolete full-history scans cannot keep consuming CPU.
     public static func searchCancellable(
         query rawQuery: String,
         documents: [TranscriptSearchDocument],
@@ -89,8 +85,7 @@ public enum TranscriptSearch {
         let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
         let locale = Locale(identifier: "en_US_POSIX")
 
-        // Retain the newest bounded results, which are the useful ones in a
-        // conversation, but continue the scan so the total remains exact.
+        // Retain newest bounded matches while scanning the rest to report an exact total.
         for (scanIndex, document) in documents.reversed().enumerated() {
             if scanIndex.isMultiple(of: 64), shouldCancel() { return nil }
             guard document.content.range(of: query, options: options, locale: locale) != nil else {

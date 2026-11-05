@@ -3,51 +3,33 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ProactiveAssistantSpeech.swift` | `speakProactively` owns proactive transcript writes, claims, quota and destination reconciliation; Reach, chat.post and fixed intention words share reachOut, inbox Act uses morningBrief; intention speech bypasses the hourly quota |
+// Blueprint: | `ProactiveAssistantSpeech.swift` | `speakProactively`; Locked deduplicated speech; initiative quota |
 
-// One owner for assistant speech outside a user turn. Inbox-card Act uses
-// morningBrief/userRequested; Reach and app chat.post share reachOut/scheduled;
-// an intention's fixed words or turn speak as intention. Only scheduled waits
-// on the persisted hourly quota. All callers share the
-// durable idempotency claim and destination reconciliation: duplicates never
-// write again. Claim, reconciliation and append share one lock; only a
-// committed transcript row proves posting, and only clean absence permits recovery.
+// Every speech entry shares locked claims, destination reconciliation and append so duplicate attempts never write twice.
+// Only a committed transcript row proves posting; only clean absence permits recovery.
+// Scheduled initiative alone spends the hourly quota; explicit requests and intentions keep their own pacing.
 
-/// The exhaustive list of code paths allowed to speak unprompted.
-/// Adding a case here is the review gate for widening the seam.
+/// Keep unprompted speakers exhaustive so widening this boundary requires an explicit caller case.
 public enum ProactiveSpeechCaller: String, Sendable, CaseIterable, Equatable {
     case morningBrief = "morning_brief"
-    /// Her speech, from Reach, chat.post or a fixed-word intention. Scheduled
-    /// initiative shares the hourly quota; Reach also keeps its own gates.
+    /// Scheduled initiative shares the hourly quota; Reach retains its own gates.
     case reachOut = "reach_out"
 }
 
-/// Who asked for this message. Determines whether the hourly proactive quota
-/// applies — see property 2 in the file header.
+/// Authorship determines quota admission, independently of deduplication.
 public enum ProactiveSpeechInitiative: String, Sendable, Equatable {
-    /// A background lane speaking on its own initiative. Rate limited.
     case scheduled
-    /// User pressed a button that means "say this to me". Not rate limited,
-    /// still deduplicated.
+    /// An explicit user request bypasses the proactive quota but remains deduplicated.
     case userRequested
-    /// An intention's fixed words or own turn (or a scheduled job's): its
-    /// moment is its pacing, so it neither waits on nor spends the hourly quota (User 10-29:
-    /// the 4 PM check-in he set up was refused). Still deduplicated.
+    /// An intention's scheduled moment, or a watch's own signal, is its pacing, so it bypasses the hourly quota but remains deduplicated.
     case intention
 
-    /// Who asked for what this task says: bound around an intention's turn,
-    /// so everything that turn says is the intention's.
-    @TaskLocal public static var current: ProactiveSpeechInitiative = .scheduled
 }
 
-/// What a `speakProactively` attempt actually did. Never `Void` — a caller that
-/// can't tell "posted" from "suppressed" will eventually claim the former.
+/// Return a typed outcome so suppression cannot be mistaken for a posted message.
 public enum ProactiveSpeechOutcome: Sendable, Equatable {
-    /// A new assistant row is durably in the transcript.
     case posted(sessionId: String, messageRunId: String)
-    /// This caller already posted this exact key; nothing was written.
     case duplicate(sessionId: String)
-    /// Proactive quota not yet expired; nothing was written.
     case rateLimited(secondsRemaining: Int)
 
 }
@@ -66,12 +48,10 @@ public enum ProactiveSpeechError: Error, LocalizedError {
     }
 }
 
-/// Persisted limiter + idempotency state, one row per caller.
 struct ProactiveSpeechClaim: Sendable, Equatable {
-    /// Last UNPROMPTED post. nil when this caller has only ever been driven by
-    /// an explicit user action.
+    /// Only unprompted posts advance quota time; explicit requests leave it unchanged.
     var lastProactivePostAt: Date?
-    /// Recently used idempotency keys, oldest first, bounded by `recentKeyCap`.
+    /// Bound recent keys while preserving their oldest-first eviction order.
     var recentKeys: [String]
     /// Where each claimed message belongs, including an uncertain append.
     var destinations: [String: Destination]
@@ -84,7 +64,7 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
         }
     }
 
-    /// Bounded recent claims, shared by every entry point for this caller.
+    /// Share the same bounded claim history across every entry point for this caller.
     static let recentKeyCap = 16
 
     var jsonValue: JSONValue {
@@ -165,39 +145,32 @@ enum ProactiveSpeechState {
 
 extension SwiftNativeChatOrchestrationClient {
 
-    /// Minimum wall-clock gap between two PROACTIVE posts by the same caller.
-    /// Config constant, not a magic number at the call site.
+    /// Use one configured gap per caller so all proactive entry points share quota pacing.
     public static let proactiveSpeechMinimumIntervalSeconds: TimeInterval = 60 * 60
 
-    /// Stable idempotency key: a scope (e.g. the brief's day label) plus a
-    /// digest of the content. Identical content in the same scope is one post;
-    /// re-rendered content in the same scope is a different one.
+    /// Scope plus content digest deduplicates identical messages while permitting genuinely changed content in the same scope.
     public nonisolated static func proactiveSpeechIdempotencyKey(
         scope: String,
         content: String
     ) -> String {
-        // FNV-1a keeps the key short and stable without pulling a crypto digest
-        // into a path that has no adversary — this key never gates trust, only
-        // repetition.
+        // FNV-1a keeps nonadversarial deduplication keys short and stable; it never grants trust.
         let hash = fnv1a64(content.trimmingCharacters(in: .whitespacesAndNewlines))
         return "\(scope.trimmingCharacters(in: .whitespacesAndNewlines))#\(String(hash, radix: 16))"
     }
 
-    /// Post ONE assistant-authored message into `sessionId`. See the file
-    /// header for the three properties that keep this narrow.
-    ///
-    /// - Throws: `ChatOrchestrationError.emptyMessage` for blank content, and
-    ///   whatever `appendMessage` throws for a transcript/index failure. A throw
-    ///   means "not proven posted", never "proven not posted".
+    /// An append failure proves only that posting is unresolved; reconcile before any repeat.
+    /// Blank content and transcript/index failures propagate to the caller.
     @discardableResult
     public func speakProactively(
         content: String,
         caller: ProactiveSpeechCaller,
         idempotencyKey: String,
         sessionId: String,
-        initiative: ProactiveSpeechInitiative = .current,
-        persona: String? = nil
+        initiative: ProactiveSpeechInitiative? = nil,
+        persona: String? = nil,
+        turn: Turn
     ) async throws -> ProactiveSpeechOutcome {
+        let initiative = initiative ?? turn.speechInitiative
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw ChatOrchestrationError.emptyMessage }
         let resolvedSession = try Self.resolveSessionId(sessionId)
@@ -257,17 +230,15 @@ extension SwiftNativeChatOrchestrationClient {
                 // A notification belongs in the transcript, without claiming
                 // it was a moment the agent lived.
                 mechanicalRow: .attentionNotice,
-                proactiveSpeechIdempotencyKey: idempotencyKey
-            )
+                proactiveSpeechIdempotencyKey: idempotencyKey,
+             turn: turn)
             // Failures retain the pending claim. Its next attempt must prove
             // commitment or clean absence before doing anything else.
             return .posted(sessionId: destination.sessionId, messageRunId: destination.runId)
         }
     }
 
-    /// Exact offer scope, as stamped by this owner. A claim alone is not a
-    /// committed message. False proves absence only when the caller knows the
-    /// corresponding append has ended; otherwise it may still be in flight.
+    /// A claim does not prove posting. Absence is conclusive only after the corresponding append has ended.
     public static func proactiveSpeechCommitted(
         dataRoot: URL, caller: ProactiveSpeechCaller, idempotencyScope: String, sessionId: String
     ) async throws -> Bool {
@@ -288,7 +259,7 @@ extension SwiftNativeChatOrchestrationClient {
     ) async throws -> Bool {
         let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
         return try await SwiftNativePersistenceCore.withFileLock(path) {
-            // fileExists can hide an access error as absence.
+            // Use checked existence because fileExists can conceal access failure as absence.
             do {
                 _ = try FileManager.default.attributesOfItem(atPath: path.path)
             } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {

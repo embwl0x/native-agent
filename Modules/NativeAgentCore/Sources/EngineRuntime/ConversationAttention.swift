@@ -18,7 +18,6 @@ import ChatToolParsing
 import SlackBot
 import TelegramBot
 import TriggerScheduler
-import WorkshopExecution
 import BackgroundLoops
 import AppToolRuntime
 import TrustCenter
@@ -59,7 +58,6 @@ import Experiences
 import CryptoKit
 import ActivityWatch
 import OSLog
-import Procedures
 import SchedulerExecution
 import Darwin
 import Combine
@@ -71,7 +69,7 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `ConversationAttention.swift` | `MacChatUnreadSessions`: phone activity remains unread until its conversation opens; persisted unread IDs exclude the active conversation |
+// Blueprint: | `ConversationAttention.swift` | `MacChatUnreadSessions`; Phone activity remains unread until its chat opens |
 
 /// Phone activity in a background chat stays unread until that chat opens.
 @MainActor @Observable

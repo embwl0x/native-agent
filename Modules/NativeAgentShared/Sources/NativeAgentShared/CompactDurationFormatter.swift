@@ -2,13 +2,12 @@ import Foundation
 
 // Blueprint: | `CompactDurationFormatter.swift` | `CompactDurationFormatter.string`: shared rounded compact duration wording with finite/range admission |
 
-/// Compact duration wording shared by Mac and iOS presentation.
 public enum CompactDurationFormatter {
     public static func string(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "" }
         if seconds < 10 { return String(format: "%.1fs", seconds) }
-        // Round once, then branch — 59.5 must roll into "1m", not print "60s".
-        // Refuse durations outside Int's range instead of trapping during conversion.
+        // Round once, then branch — 59.5 must roll into "1m", not print "60s". Refuse durations outside Int's range instead of trapping during
+        // conversion.
         guard let total = Int(exactly: seconds.rounded()) else { return "" }
         if total < 60 { return "\(total)s" }
         if total < 3600 {

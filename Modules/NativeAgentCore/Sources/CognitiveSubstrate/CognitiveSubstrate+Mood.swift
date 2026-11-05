@@ -1,5 +1,4 @@
-// CognitiveSubstrate+Mood.swift
-// Mood derives at read time from recent emotional tags and affect; persisted disposition supplies a slow undertone.
+// Derive mood at read time; only the slower disposition undertone persists.
 
 import Foundation
 import NativeAgentCore
@@ -18,12 +17,11 @@ struct CognitiveDisposition: Sendable, Equatable {
     }
 }
 
-/// A read-time reading of Agent's slow background mood.
+/// Mood is a pure slow-background projection.
 public struct CognitiveMoodReading: Sendable, Equatable {
-    /// Integrated valence, −1 (heavy) … +1 (good).
+    /// Valence ranges from heavy (−1) to good (+1).
     public var valence: Double
-    /// How many tagged, recently-activated nodes fed the integral (0 → mood is the
-    /// current-affect proxy alone).
+    /// How many tagged, recently-activated nodes fed the integral (0 → mood is the current-affect proxy alone).
     public var basis: Int
 
     public init(valence: Double, basis: Int) {
@@ -44,33 +42,25 @@ extension CognitiveSubstrate {
     // MARK: - Disposition
     // Considered outcomes move disposition; daily decay feeds a small mood baseline without a second fast channel.
 
-    /// Weight of the disposition term inside derivedMood.
     static let dispositionMoodWeight = 0.15
     /// Mood-congruent recall: max score contribution (small — flavors, never dominates).
     static let moodCongruenceWeight: Double = 0.08
     /// Congruence only applies once mood has left the neutral band.
     static let moodCongruenceValenceThreshold: Double = 0.15
-    /// A congruence contribution above this earns the "mood-congruent" reason.
+    /// Only a meaningful congruence contribution earns its reason label.
     static let moodCongruenceReasonThreshold: Double = 0.04
 
-    /// Mood only colors her phrasing when it is genuinely STRONG…
+    /// Only strong mood may color phrasing.
     static let moodPhrasingValenceThreshold: Double = 0.3
 
-    /// Felt-day dream summary (see `feltDaySummary`): how many of the day's
-    /// strongest-felt nodes to name, the char ceiling on the whole summary, and
-    /// the per-node signal cap. All three live here so the ONE mood surface stays
-    /// the single tuning place for the feature.
+    /// Keep felt-day count and text bounds beside mood so one owner tunes the shared surface.
     static let feltDaySummaryMaxNodes: Int = 4
     static let feltDaySummaryMaxCharacters: Int = 600
     static let feltDaySummaryNodeSignalCharacters: Int = 90
-    /// Same id bound the dream's `(studio entry <id>)` citation uses, so one
-    /// entry reads identically on both surfaces.
+    /// Same id bound the dream's `(studio entry <id>)` citation uses, so one entry reads identically on both surfaces.
     static let feltDaySummaryStudioEntryIDCharacters: Int = 120
 
-    /// The studio seam's subject type for a filed journal entry
-    /// (`CognitiveSubstrate+StudioEvents.swift` mints it; `DreamCycleRunner`
-    /// reads the same pair). Kept as a literal here for the reason it is a
-    /// literal there: the seam publishes a wire contract, not a shared symbol.
+    /// `studio_journal` is a wire contract shared with studio event production and dream reads.
     static let studioEntrySubjectType = "studio_entry"
 
     /// The felt-day population, read without advancing decay or disclosing content.
@@ -82,20 +72,8 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// Read-time mood: recency-weighted (6h half-life) mean valence over field nodes
-    /// re-activated in the last 24h whose `feltDirection != nil`, blended with the
-    /// current-affect valence proxy (socialWarmth − 0.5·uncertainty −
-    /// 0.3·taskPressure, clamped). basis == 0 → mood is
-    /// the affect proxy alone.
-    ///
-    /// PURE: no persistence, no new stored state, no `await`, and NO field mutation —
-    /// it reads `field.peekNodes()` (non-mutating; `field.snapshot` is mutating decay
-    /// and must not be reached from a read). Tags and
-    /// `lastActivatedAt` only advance on real ingest re-activation — never on
-    /// workspace/capsule reads — so the recall bias below can NOT ratchet mood
-    /// through mere snapshots (no self-reinforcing feedback loop).
-    ///
-    /// Disabled cognition returns neutral mood.
+    /// Purely blend recent tagged valence with affect; read `peekNodes`, never mutating snapshots. Only real reactivation advances tags, preventing recall
+    /// feedback; disabled cognition stays neutral.
     func derivedMood(
         at now: Date,
         dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil,
@@ -150,8 +128,7 @@ extension CognitiveSubstrate {
     /// All disposition writers share capped, decaying, saturating nudges and proportional relaxation toward zero.
     static let dispositionHomeostasis = 0.12
 
-    /// A week of writes at four writers a day, and no more. The trail exists to
-    /// answer "what moved me this week"; anything older is not that question.
+    /// Bound the trail to one week at four writers per day so it answers only what moved this week.
     static let maximumDispositionTransitions = 28
 
     /// Returns true when nothing needs writing or the undertone is durable, false when persistence refuses it.
@@ -162,7 +139,7 @@ extension CognitiveSubstrate {
         dreamNight: String? = nil,
         // Each disposition writer names its source so experience remains distinguishable from decay.
         source: String = "experience",
-        // Only her own reflection and dream updates are undoable.
+        // Only the agent's own reflection and dream updates are undoable.
         undoable: Bool = false,
         reflectionRequest: CognitiveReflectionRequest? = nil
     ) async -> Bool {
@@ -202,8 +179,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// One synchronous disposition law, used inside each owner's transaction.
-    /// Callers retain and restore its value, claims and evidence on write failure.
+    /// One synchronous disposition law, used inside each owner's transaction. Callers retain and restore its value, claims and evidence on write failure.
     func integrateDispositionInMemory(
         tone: Double, at now: Date, dreamNight: String? = nil, source: String
     ) {
@@ -211,17 +187,12 @@ extension CognitiveSubstrate {
         let decayed = decayedDispositionValence(at: now)
         let cap = dynamics.dispositionValenceCap
         let relaxed = decayed * (1 - Self.dispositionHomeostasis)
-        // Headroom is measured along the NUDGE'S OWN direction: pushing further
-        // into the rail saturates, pulling back off it does not. A day that
-        // felt bad must be able to move her even when the last week felt good.
+        // Saturate in the nudge's own direction: moving off a positive rail must still register a bad day.
         let alongNudge = tone > 0 ? relaxed : -relaxed
         let headroom = cap > 0 ? min(1, max(0, 1 - max(0, alongNudge) / cap)) : 0
         let next = min(cap, max(-cap, relaxed + tone * dynamics.dispositionNudgeMagnitude * headroom))
         disposition = CognitiveDisposition(valence: next, updatedAt: now)
-        // THE THREE NUMBERS, IN THE SAME WRITE AS THE VALUE THEY EXPLAIN.
-        // `relaxed` is where time alone left her; `next` is where the
-        // experience left her. Their difference IS the contribution, so the
-        // readout never has to infer one from a pair of snapshots.
+        // Save relaxed, next and their exact contribution in the same write so readers never infer experience from unrelated snapshots.
         dispositionTransitions.append(CognitiveDispositionTransition(
             before: previousDisposition.valence,
             afterDecay: relaxed,
@@ -236,23 +207,14 @@ extension CognitiveSubstrate {
         if let dreamNight { dreamDispositionNights.insert(dreamNight) }
     }
 
-    /// Pattern tone from her own felt-resolution nodes.
-    /// Any path with ≥3 felt DISAPPOINTMENTS inside 48h reads −0.625 (which
-    /// the shared 0.08 nudge magnitude turns into −0.05); otherwise any path
-    /// with ≥3 felt RELIEFS reads +0.375 (+0.03 — the body learns the dread
-    /// was oversized). Disappointment outranks relief on a mixed 48h: a path
-    /// that keeps failing her deserves the undertone even if another path is
-    /// healing. Pure read; eviction of old nodes only ever UNDER-counts.
-    /// A qualifying resolution pattern: which (path, resolution-kind) crossed
-    /// the ≥3-in-48h threshold and the undertone it settles. `claimKey` is the
-    /// per-path/per-kind identity the once-per-day claim is keyed on.
+    /// Three same-kind resolutions per path in 48h earn a daily nudge: disappointment −0.05 outranks relief +0.03. Eviction may undercount, never invent
+    /// evidence.
     struct ResolutionPatternHit: Sendable, Equatable {
         let claimKey: String
         let tone: Double
     }
 
-    /// The day bucket a nudge is claimed under — a deterministic 86,400s bucket
-    /// (not a calendar day), so a restart on the same day sees the same key.
+    /// The day bucket a nudge is claimed under — a deterministic 86,400s bucket (not a calendar day), so a restart on the same day sees the same key.
     static func resolutionPatternDayKey(at now: Date) -> String {
         String(format: "%.0f", (now.timeIntervalSince1970 / 86_400).rounded(.towardZero) + 0)
     }
@@ -267,8 +229,7 @@ extension CognitiveSubstrate {
             guard now.timeIntervalSince(node.createdAt) <= window,
                   now.timeIntervalSince(node.createdAt) >= 0 else { continue }
             let path = node.subjectReference.label ?? node.subjectReference.id
-            // A path needs a moment newer than the previous tick to qualify.
-            // The caller also limits nudges to one per path/kind/day.
+            // A path needs a moment newer than the previous tick to qualify. The caller also limits nudges to one per path/kind/day.
             let isNew = previousTick.map { node.createdAt > $0 } ?? true
             if case .string(let kind)? = node.metadata["resolutionKind"] {
                 if kind == "disappointment" {
@@ -280,8 +241,7 @@ extension CognitiveSubstrate {
                 }
             }
         }
-        // Disappointment outranks relief: a path that keeps failing her earns
-        // the undertone even if another path is healing.
+        // Disappointment outranks relief: a path that keeps failing the agent earns the undertone even if another path is healing.
         if let path = disappointments.keys.sorted().first(where: {
             (disappointments[$0] ?? 0) >= 3 && disappointmentGrew.contains($0)
         }) {
@@ -324,7 +284,7 @@ extension CognitiveSubstrate {
         if case .array(let nights)? = object["dreamNights"] {
             dreamDispositionNights = Set(nights.compactMap(\.stringValue))
         }
-        // Historical rows without transitions retain an empty trail.
+        // Absent transition evidence leaves an empty trail.
         if case .array(let rows)? = object["transitions"] {
             var restored: [CognitiveDispositionTransition] = []
             for row in rows {
@@ -372,38 +332,20 @@ extension CognitiveSubstrate {
         return lhs.id.uuidString < rhs.id.uuidString
     }
 
-    /// Mood-congruent recall boost for a workspace node — the read-time bias by which a
-    /// node whose stored feeling matches her current mood surfaces a little more readily.
-    /// Returns zero for untagged nodes and neutral mood.
+    /// Mood-congruent recall boost for a workspace node — the read-time bias by which a node whose stored feeling matches the agent's current mood surfaces a
+    /// little more readily. Returns zero for untagged nodes and neutral mood.
     func moodCongruence(for node: CognitiveNode, mood: CognitiveMoodReading) -> Double {
         guard abs(mood.valence) >= Self.moodCongruenceValenceThreshold else { return 0 }
         guard node.feltDirection != nil else { return 0 }
         // Mood congruence requires sign agreement before closeness scales the boost.
         guard node.emotionalValence * mood.valence > 0 else { return 0 }
-        // Closeness in [0,1]: 1 when the node's valence equals mood's, 0 when maximally
-        // opposite (the two span −1…1, so the gap spans 0…2).
+        // Closeness in [0,1]: 1 when the node's valence equals mood's, 0 when maximally opposite (the two span −1…1, so the gap spans 0…2).
         let closeness = 1 - abs(node.emotionalValence - mood.valence) / 2
         return Self.moodCongruenceWeight * closeness
     }
 
-    /// One bounded, human-readable summary of what the last ~24h FELT like — for
-    /// the nightly dream prompt to COLOR ITS TONE (never to script it). Peer of
-    /// `derivedMood`, and just as PURE: `derivedMood(at:)` + `field.peekNodes()`
-    /// only — no persistence, no new stored state, no field mutation (peekNodes is
-    /// the non-mutating read; `snapshot` is decay and must never be reached from a
-    /// read — same rule derivedMood follows).
-    ///
-    /// Returns nil when nothing was felt (young/legacy field) or affect is
-    /// disabled, so the dream's felt section is OMITTED entirely rather than
-    /// emitted empty — feeling-silence stays silence, the capsule's neutral-path
-    /// principle. Content is the capsule's descriptive register (no
-    /// numbers-as-feelings beyond the felt-moment count): a mood-band line, then up
-    /// to `feltDaySummaryMaxNodes` of the last-24h felt nodes ranked by |valence|
-    /// then arousal, each rendered "<felt-direction word> — <capsule signal>".
-    ///
-    /// All eligible tags color the mood band. Named content is limited to live
-    /// conversation/correction nodes and studio pointers (title and entry id);
-    /// studio response text stays in its journal.
+    /// Pure felt-day reads color dream tone without scripting it; no feeling means no section. Name only live conversation/correction subjects and studio
+    /// pointers, never journal prose.
     public func feltDaySummary(at now: Date) async -> String? {
         guard configuration.enabled else { return nil }
 
@@ -414,10 +356,7 @@ extension CognitiveSubstrate {
         let mood = derivedMood(at: now)
         var lines: [String] = [feltMoodBandLine(mood: mood, feltCount: felt.count)]
 
-        // Only conversation-derived memories and studio journal entries may be
-        // NAMED (see the exposure note above): live conversationFocus/correction —
-        // the same material the dream's world half already contains — plus a live
-        // studio node, which is named by pointer, never by content.
+        // Name only live conversation/correction nodes and studio pointers to preserve the dream exposure boundary.
         let nameable = felt.filter { node in
             guard node.turnKind == .live else { return false }
             if node.kind == .conversationFocus || node.kind == .correction { return true }
@@ -429,9 +368,7 @@ extension CognitiveSubstrate {
         let ranked = nameable.sorted(by: Self.feltDayStronger)
         for node in ranked.prefix(Self.feltDaySummaryMaxNodes) {
             guard let word = node.feltDirection?.rawValue else { continue }
-            // A studio entry is named by its pointer — title + id — and its
-            // summary is never read here, so no journal content can reach the
-            // prompt through this line no matter what the seam writes.
+            // Use studio title and id only; journal prose must never reach the prompt here.
             if let entryID = CognitiveFeltOrigin(node: node).studioEntryID {
                 lines.append(feltStudioEntryLine(word: word, node: node, entryID: entryID))
                 continue
@@ -442,15 +379,11 @@ extension CognitiveSubstrate {
             lines.append("- \(word) — \(signal)")
         }
 
-        // Hard ceiling on the whole summary. The per-node cap keeps this well under
-        // the budget in practice; the prefix is a belt-and-suspenders guarantee.
+        // Enforce the total summary ceiling even when per-node bounds already fit.
         return String(lines.joined(separator: "\n").prefix(Self.feltDaySummaryMaxCharacters))
     }
 
-    /// One named line for a studio journal node: the work title when the node
-    /// carries one as its subject label, then the entry id in the dream's
-    /// citation form. Title-less nodes cite the id alone rather than going
-    /// looking for something to say — an id is a complete pointer.
+    /// A title-less studio entry cites its id alone; source content is not a substitute name.
     private func feltStudioEntryLine(word: String, node: CognitiveNode, entryID: String) -> String {
         let citation = "(studio entry "
             + bounded(entryID, maxCharacters: Self.feltDaySummaryStudioEntryIDCharacters) + ")"
@@ -461,9 +394,7 @@ extension CognitiveSubstrate {
         return "- \(word) — \(title) \(citation)"
     }
 
-    /// Mood-band phrasing for the felt-day summary — the capsule's good/heavy
-    /// language, graded across the mood bands, with the felt-moment count as the
-    /// ONLY quantity (the design's one allowed number-as-feeling).
+    /// Use capsule mood bands with felt-moment count as the only quantity, keeping measurements from posing as feelings.
     private func feltMoodBandLine(mood: CognitiveMoodReading, feltCount: Int) -> String {
         let band: String
         if mood.valence >= Self.moodPhrasingValenceThreshold {

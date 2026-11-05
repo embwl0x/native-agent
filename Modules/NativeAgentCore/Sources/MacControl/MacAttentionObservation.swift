@@ -21,14 +21,9 @@ import ScreenCaptureKit
 #endif
 // Blueprint: | `MacAttentionObservation.swift` | Bounded attention readout and observation continuity |
 extension SwiftNativeMacControl {
-    /// `mac_attention` — explicit, bounded continuity over `mac_view`.
-    ///
-    /// There is no frame loop and no model call here. Start installs passive
-    /// system-event observers for a bounded lifetime and takes one fused view.
-    /// Next sleeps on an event continuation (or its bounded deadline), then
-    /// takes exactly one more fused view. Stop tears the observers down and
-    /// invalidates the last attention-scene marks.
-    func handleAttention(_ body: [String: JSONValue]) async -> MacControlResult {
+    /// Wait on passive events or a bounded deadline, then capture once; no frame loop or model call drives continuity. Stop must remove observers and
+    /// invalidate retained marks.
+    func handleAttention(_ body: [String: JSONValue], context: MacOperationContext) async -> MacControlResult {
         let started = now()
         let mode = (body["mode"]?.stringValue ?? "status").lowercased()
         func result(
@@ -55,7 +50,7 @@ extension SwiftNativeMacControl {
                 durationSeconds: duration,
                 now: now(),
                 eventSource: attentionEventSource
-            ) else {
+            , context: context) else {
                 return result(
                     ok: false,
                     output: [
@@ -71,7 +66,7 @@ extension SwiftNativeMacControl {
                 pending: initial,
                 started: started,
                 status: "started"
-            )
+            , context: context)
         case "next":
             guard let sessionId = body["session"]?.stringValue, !sessionId.isEmpty else {
                 return result(
@@ -88,9 +83,9 @@ extension SwiftNativeMacControl {
                 after: after,
                 timeoutMilliseconds: waitMs,
                 now: now()
-            )
+            , context: context)
             if Task.isCancelled {
-                let actual = await attentionStore.status(now: now())
+                let actual = await attentionStore.status(now: now(), context: context)
                 return result(
                     ok: false,
                     output: ["active": .bool(actual != nil), "status": .string("cancelled"),
@@ -100,7 +95,7 @@ extension SwiftNativeMacControl {
                 )
             }
             guard let pending else {
-                let actual = await attentionStore.status(now: now())
+                let actual = await attentionStore.status(now: now(), context: context)
                 return result(
                     ok: false,
                     output: ["active": .bool(actual != nil), "status": .string(actual == nil ? "not_active" : "session_replaced"),
@@ -114,9 +109,9 @@ extension SwiftNativeMacControl {
                 pending: pending,
                 started: started,
                 status: pending.timedOutWaiting ? "refreshed" : "changed"
-            )
+            , context: context)
         case "status":
-            guard let current = await attentionStore.status(now: now()) else {
+            guard let current = await attentionStore.status(now: now(), context: context) else {
                 return result(ok: true, output: [
                     "active": .bool(false),
                     "status": .string("idle"),
@@ -132,7 +127,7 @@ extension SwiftNativeMacControl {
             ])
         case "stop":
             let wasActive = await attentionStore.stopAttentionSession(sessionId: body["session"]?.stringValue)
-            let current = await attentionStore.status(now: now())
+            let current = await attentionStore.status(now: now(), context: context)
             return result(ok: true, output: [
                 "active": .bool(current != nil),
                 "status": .string(wasActive ? "stopped" : current == nil ? "already_idle" : "session_replaced"),
@@ -151,9 +146,10 @@ extension SwiftNativeMacControl {
         body: [String: JSONValue],
         pending: MacAttentionSnapshot,
         started: Date,
-        status: String
+        status: String,
+        context: MacOperationContext
     ) async -> MacControlResult {
-        let view = await handleView(body)
+        let view = await handleView(body, context: context)
         guard case .object(var output) = view.output,
               case .string(let viewId)? = output["view"] else {
             var failure = view.output.objectValue ?? [:]
@@ -174,11 +170,10 @@ extension SwiftNativeMacControl {
             sequence: pending.sequence,
             userSequence: pending.userSequence,
             now: now()
-        ) else {
-            // Capture may outlive Stop, expiry, or replacement. The store owns
-            // continuity; this old capture cannot reactivate it or its marks.
+        , context: context) else {
+            // Capture may outlive Stop, expiry, or replacement. The store owns continuity; this old capture cannot reactivate it or its marks.
             await screenViewStore.invalidate()
-            let actual = await attentionStore.status(now: now())
+            let actual = await attentionStore.status(now: now(), context: context)
             output["active"] = .bool(actual != nil)
             output["status"] = .string(actual == nil ? "not_active" : "session_replaced")
             output["attention"] = actual?.toJSON() ?? .null
@@ -187,8 +182,7 @@ extension SwiftNativeMacControl {
                 error: "attention_session_not_active", durationMs: Int(now().timeIntervalSince(started) * 1000), httpStatus: 409)
         }
         if current.refreshRequired {
-            // Input raced the capture. Never leave its marks usable while the
-            // result truthfully says the agent must yield and look again.
+            // Input raced the capture. Never leave its marks usable while the result truthfully says the agent must yield and look again.
             await screenViewStore.invalidate()
         }
         output["status"] = .string(

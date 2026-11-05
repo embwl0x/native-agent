@@ -2,14 +2,12 @@ import NativeAgentShared
 import EngineRuntime
 import Onboarding
 import SwiftUI
-// Blueprint: | `OnboardingRecovery.swift` | OnboardingWizard durable-state recovery and ErrorStep; interrupted transactions resume through the onboarding owner |
+// Blueprint: | `OnboardingRecovery.swift` | Durable-state recovery; resume interrupted transactions through onboarding |
 
 extension OnboardingWizard {
     func loadOnboardingState() async {
         guard let appModel = setupModel() else { return }
-        // AppModel selects the onboarding owner for its own root.
         let resp: OnboardingStartResult
-        // A fresh start verdict clears the previous scaffold failure.
         state.scaffoldRepairFailed = false
         do {
             resp = try await appModel.engine.onboarding.startOnboarding()
@@ -42,9 +40,9 @@ extension OnboardingWizard {
             }
             return
         }
-        // Missing names require profile-only repair, preserving the existing persona.
+        // Missing names need only profile repair; preserve the existing persona.
         if disposition == .repairProfile {
-            // Rechecks preserve the names already entered.
+            // Rechecking must not discard entered names.
             if !state.profileRepairOnly {
                 state.prepareProfileRepair()
             }

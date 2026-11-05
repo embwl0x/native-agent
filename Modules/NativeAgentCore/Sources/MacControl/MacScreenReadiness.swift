@@ -20,34 +20,21 @@ import ApplicationServices
 import UserNotifications
 #endif
 
-// Blueprint: | `MacScreenReadiness.swift` | `MacSessionState`, its sources, `MacWakeGuard`, `MacScreenLock.wakeIfCovered` and `SwiftNativeMacControl.handleWake`: checked console/display readiness, bounded inert wake, focused-password evidence ordered through LatestRead and fused-view wake receipts |
+// Blueprint: | `MacScreenReadiness.swift` | `MacSessionState`, `MacWakeGuard`, `MacScreenLock.wakeIfCovered`, `SwiftNativeMacControl.handleWake`: Readiness |
 
 // MARK: - Login-session state
 
-/// A read-only snapshot of the login session and display, taken immediately
-/// before and immediately after a wake nudge.
-///
-/// The saver flag alone cannot distinguish a password prompt; only focused
-/// secure-field evidence supplies that diagnosis.
+/// Saver state alone cannot diagnose authentication; only focused secure-field evidence distinguishes a password prompt.
 public struct MacSessionState: Sendable, Equatable {
-    /// `CGSSessionScreenIsLocked` — true for a password lock AND for a plain
-    /// screensaver, with nothing in the session dictionary separating them.
-    /// True therefore means the saver/login layer is obstructing capture; it
-    /// does not prevent the inert nudge. See `MacWakeGuard`.
+    /// CGSSessionScreenIsLocked covers both locks and plain savers; it gates capture but permits the inert nudge.
     public let screenIsLocked: Bool
-    /// `kCGSSessionOnConsoleKey` — false when another user owns the display.
+    /// Another user’s console ownership forbids capture and input.
     public let onConsole: Bool
-    /// `CGDisplayIsAsleep(CGMainDisplayID())`.
     public let displayAsleep: Bool
-    /// False when the probe could not actually READ the login session —
-    /// `CGSessionCopyCurrentDictionary()` returned nil, or came back without the
-    /// keys this decision rests on. An unreadable session is not an unlocked
-    /// one, so the guard refuses on it before it looks at anything else.
+    /// Missing session evidence is unreadable, never unlocked; refuse before considering any permissive state.
     public let sessionReadable: Bool
     public let frontmostBundleID: String?
-    /// `CGEventSource.secondsSinceLastEventType` — the orthogonal observer.
-    /// A successful HID post resets it to ~0, so before/after readings are
-    /// EVIDENCE that the event landed rather than a claim that it was sent.
+    /// A HID post resets idle age, so before/after readings can establish delivery rather than mere submission.
     public let idleSeconds: Double?
     public let cursorX: Double?
     public let cursorY: Double?
@@ -72,7 +59,6 @@ public struct MacSessionState: Sendable, Equatable {
         self.cursorY = cursorY
     }
 
-    /// True when the screen was in a state a nudge could plausibly clear.
     public var obstructed: Bool {
         screenIsLocked || displayAsleep || frontmostBundleID == MacWakeGuard.loginWindowBundleID
     }
@@ -86,20 +72,18 @@ public struct MacSessionState: Sendable, Equatable {
             "session_readable": .bool(sessionReadable),
             "frontmost": frontmostBundleID.map { .string($0) } ?? .null,
             "idle_seconds": idleSeconds.map { .double(($0 * 10).rounded() / 10) } ?? .null,
-            // Observed coordinates let the receipt show pointer restoration.
+            // Observed positions let the receipt establish pointer restoration.
             "cursor_x": cursorX.map { .double(($0 * 10).rounded() / 10) } ?? .null,
             "cursor_y": cursorY.map { .double(($0 * 10).rounded() / 10) } ?? .null,
         ])
     }
 }
 
-/// One checked observation of session, display and pointer evidence.
 public protocol MacSessionStateSource: Sendable {
     func currentState() -> MacSessionState
 }
 
-/// Nudge only a readable console session. The inert move and bare Shift tap
-/// cannot authenticate; capture still refuses while the saver layer is up.
+/// Nudge only a readable console session; inert input cannot authenticate and capture still refuses while covered.
 public enum MacWakeGuard {
     public static let loginWindowBundleID = "com.apple.loginwindow"
 
@@ -118,18 +102,13 @@ public enum MacWakeGuard {
         "session_not_on_console: another login session owns the display, so a nudge from this "
         + "session would not reach it."
 
-    /// Readability and console ownership gate the inert wake sequence.
     public static func nudgeRefusalReason(for state: MacSessionState) -> String? {
         guard state.sessionReadable else { return sessionUnreadableRefusal }
         guard state.onConsole else { return notOnConsoleRefusal }
         return nil
     }
 
-    /// THE CAPTURE GUARD. Governs the screenshot, the marks, the legend and the
-    /// view id — everything that turns the screen into data. An obstructed
-    /// screen (the saver/login layer still up after the nudge) is never
-    /// photographed; that is the entire remaining safety line, and it needs no
-    /// lock vocabulary to hold.
+    /// The guard covers screenshot, marks, legend and view id; an obstructed screen must never become captured data.
     public static func captureRefusalReason(for state: MacSessionState) -> String? {
         guard state.sessionReadable else { return sessionUnreadableRefusal }
         guard state.onConsole else { return notOnConsoleRefusal }
@@ -138,10 +117,7 @@ public enum MacWakeGuard {
     }
 }
 
-/// Shared screen readiness for reads, acts, desktop sends and home's MAC line.
-/// `CGSSessionScreenIsLocked` also covers a passwordless saver, hiding app
-/// windows in both cases. The bounded wake names the remaining obstruction;
-/// the session flag alone never proves a password lock.
+/// All read, act, send and home paths share readiness; saver state alone never proves a password lock.
 public enum MacScreenLock {
     public static func personAway() -> Bool {
         MacPersonInput.presence()?.here == false
@@ -150,11 +126,12 @@ public enum MacScreenLock {
     public static let reply = "The screen is still covered, so I can't see or use the apps underneath."
     public static let passiveReply = "raw view · passive observation · screen covered; observation waits"
 
-    /// The same session/window evidence used by wake, without posting input.
+    /// Observe wake’s session/window evidence without posting input.
     public static func isCovered() throws -> Bool {
         let state = defaultMacSessionStateSource().currentState()
         guard state.sessionReadable else {
-            throw Covered(detail: "The macOS screen session could not be read. Read the screen again after restoring session access.", code: "screen_readiness_unavailable")
+            throw Covered(detail: "The macOS screen session could not be read. Read the screen again after restoring session access.",
+                code: "screen_readiness_unavailable")
         }
         return try state.screenIsLocked || loginWindowUp()
     }
@@ -162,15 +139,19 @@ public enum MacScreenLock {
     private static func loginWindowUp() throws -> Bool {
         #if canImport(CoreGraphics) && os(macOS)
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
-            throw Covered(detail: "The window server did not return its on-screen window inventory. Read the screen again after restoring window-server access.", code: "screen_readiness_unavailable")
+            throw Covered(
+                detail: "The window server did not return its on-screen window inventory. Read the screen again after restoring window-server access.",
+                code: "screen_readiness_unavailable")
         }
         for window in windows {
             guard let owner = window[kCGWindowOwnerName as String] as? String else {
-                throw Covered(detail: "An on-screen window has unreadable owner identity. Read the screen again before using the apps underneath.", code: "screen_readiness_unavailable")
+                throw Covered(detail: "An on-screen window has unreadable owner identity. Read the screen again before using the apps underneath.",
+                    code: "screen_readiness_unavailable")
             }
             guard owner == "loginwindow" else { continue }
             guard let layer = window[kCGWindowLayer as String] as? Int else {
-                throw Covered(detail: "The login window's layer could not be read. Read the screen again before using the apps underneath.", code: "screen_readiness_unavailable")
+                throw Covered(detail: "The login window's layer could not be read. Read the screen again before using the apps underneath.",
+                    code: "screen_readiness_unavailable")
             }
             if layer >= Int(CGWindowLevelForKey(.screenSaverWindow)) { return true }
         }
@@ -190,7 +171,6 @@ public enum MacScreenLock {
         defaultMacSessionStateSource().currentState().screenIsLocked
     }
 
-    /// What still covers the screen after `wakeIfCovered` gave up.
     public struct Covered: Error, Sendable {
         public let detail: String
         public let code: String
@@ -200,18 +180,17 @@ public enum MacScreenLock {
         }
     }
 
-    /// Automatic readiness retries twice; an explicit settle interval requests
-    /// one nudge even on an uncovered screen and returns its observed evidence.
+    /// Automatic readiness allows two nudges; explicit settling requests one even when uncovered, with observed evidence.
     @discardableResult
     @MainActor public static func wakeIfCovered(
         source: any MacSessionStateSource = defaultMacSessionStateSource(),
         before: MacSessionState? = nil, keyTap: Bool = true, settleMs: Int? = nil,
-        beforeInput: @Sendable () async throws -> Void = {}
-    ) async throws -> (before: MacSessionState, after: MacSessionState, mouseEvents: Int, keyEvents: Int) {
+        turn: Turn, context: MacOperationContext, beforeInput: @Sendable () async throws -> Void = {}) async throws -> (before: MacSessionState,
+            after: MacSessionState, mouseEvents: Int, keyEvents: Int) {
         let result: Result<(before: MacSessionState, after: MacSessionState, mouseEvents: Int, keyEvents: Int), Error> = await wakeReads.read {
             do {
-                return .success(try await performWakeIfCovered(source: source, before: before,
-                    keyTap: keyTap, settleMs: settleMs, beforeInput: beforeInput))
+                return .success(try await performWakeIfCovered(source: source, before: before, keyTap: keyTap, settleMs: settleMs, turn: turn,
+                    context: context, beforeInput: beforeInput))
             } catch { return .failure(error) }
         } publish: { result in
             wakeLock.withLock {
@@ -227,8 +206,9 @@ public enum MacScreenLock {
 
     private static func performWakeIfCovered(
         source: any MacSessionStateSource, before: MacSessionState?,
-        keyTap: Bool, settleMs: Int?, beforeInput: @Sendable () async throws -> Void
-    ) async throws -> (before: MacSessionState, after: MacSessionState, mouseEvents: Int, keyEvents: Int) {
+        keyTap: Bool, settleMs: Int?, turn: Turn, context: MacOperationContext,
+            beforeInput: @Sendable () async throws -> Void) async throws -> (before: MacSessionState, after: MacSessionState, mouseEvents: Int,
+            keyEvents: Int) {
         let before = before ?? source.currentState()
         if let reason = MacWakeGuard.nudgeRefusalReason(for: before) {
             throw Covered(detail: reason)
@@ -244,23 +224,23 @@ public enum MacScreenLock {
         func loginPasswordFocused() -> Bool {
             let system = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(system, 0.2)
-            guard let app = MacAXAttributeRead.copyElement(system, kAXFocusedApplicationAttribute) else { return false }
+            guard let app = MacAXAttributeRead.copyElement(system, kAXFocusedApplicationAttribute, context: context) else { return false }
             var pid: pid_t = 0
             guard AXUIElementGetPid(app, &pid) == .success,
                   NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == MacWakeGuard.loginWindowBundleID else { return false }
             AXUIElementSetMessagingTimeout(app, 0.2)
-            guard let field = MacAXAttributeRead.copyElement(app, kAXFocusedUIElementAttribute) else { return false }
-            return MacAXAttributeRead.copyString(field, kAXRoleAttribute) == kAXSecureTextFieldSubrole
-                || MacAXAttributeRead.copyString(field, kAXSubroleAttribute) == kAXSecureTextFieldSubrole
+            guard let field = MacAXAttributeRead.copyElement(app, kAXFocusedUIElementAttribute, context: context) else { return false }
+            return MacAXAttributeRead.copyString(field, kAXRoleAttribute, context: context) == kAXSecureTextFieldSubrole
+                || MacAXAttributeRead.copyString(field, kAXSubroleAttribute, context: context) == kAXSecureTextFieldSubrole
         }
         guard try settleMs != nil || covered() else { return (before, after, 0, 0) }
         guard AXIsProcessTrusted() else {
             throw Covered(detail: "Accessibility permission is required to wake the screensaver; no input was sent.")
         }
         let driver: MacDriverBinding
-        if let binding = MacDriverContext.binding { driver = binding }
+        if let binding = context.driver { driver = binding }
         else { driver = try await MacAttentionSessionStore.shared.bindDriver() }
-        let personActive = Covered(detail: MacAttentionSessionStore.driverRefusal, code: "human_takeover")
+        let personActive = Covered(detail: MacAttentionSessionStore.driverRefusal(context: context), code: "human_takeover")
         let inputUnavailable = Covered(detail: "I couldn't create the safe screensaver wake input.")
         for attempt in 0..<(settleMs == nil ? 2 : 1) {
             if attempt > 0 {
@@ -282,22 +262,22 @@ public enum MacScreenLock {
             for move in [move, back] {
                 try await beforeInput()
                 try Task.checkCancellation()
-                guard driver.allowsEmission, MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
+                guard driver.allowsEmission(context: context), MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
                 NativeAgentMotorEpoch.notePostedHIDEvent()
                 move.post(tap: .cghidEventTap)
-                driver.notePostedEvent()
+                driver.notePostedEvent(turn: turn)
                 mouseEvents += 1
             }
             if keyTap {
                 try await beforeInput()
                 try Task.checkCancellation()
-                guard driver.allowsEmission, MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
+                guard driver.allowsEmission(context: context), MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
                 // Once pressed, Shift is released without an interruptible gap.
                 for (key, down) in [(shiftDown, true), (shiftUp, false)] {
                     key.flags = down ? .maskShift : []
                     NativeAgentMotorEpoch.notePostedHIDEvent()
                     key.post(tap: .cghidEventTap)
-                    driver.notePostedEvent()
+                    driver.notePostedEvent(turn: turn)
                     keyEvents += 1
                 }
             }
@@ -314,8 +294,7 @@ public enum MacScreenLock {
             }
         }
         let loginWindow = try loginWindowUp()
-        // A focused secure field is positive authentication evidence;
-        // loginwindow alone also draws passwordless savers.
+        // Focused secure fields prove authentication UI; loginwindow alone may be a passwordless saver.
         let locked = loginWindow && !after.displayAsleep && loginPasswordFocused()
         throw Covered(detail: after.displayAsleep
             ? "The display stayed asleep after two wake nudges."
@@ -334,22 +313,21 @@ public enum MacScreenLock {
 extension SwiftNativeMacControl {
     // MARK: wake
 
-    /// The default settle wait between the nudge and the re-capture. The window
-    /// server needs a beat to tear the saver down; capturing at zero would
-    /// photograph the thing we just dismissed and report it as the screen.
+    /// Allow the window server time to dismiss the saver before recapturing, or the receipt may still describe the dismissed layer.
     static let wakeDefaultSettleMs = 700
     static let wakeMaxSettleMs = 3000
 
-    /// Nudge only a readable console session, recheck after settling, then return the
-    /// fresh fused view with observed wake and pointer-restoration evidence. The saver
-    /// flag gates capture, not the inert nudge; top-level view delivery retains redaction.
-    func handleWake(_ body: [String: JSONValue]) async -> MacControlResult {
+    /// Recheck after the bounded nudge and preserve observed wake, restoration and redaction evidence.
+    func handleWake(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
 
         let before = sessionStateSource.currentState()
         guard before.sessionReadable else {
             return injectionRefusal(action: "wake",
-                error: "session_state_unavailable: this build or this Mac would not report the login session, and an unreadable session is not an unlocked one, so it will not nudge blind",
+                error: """
+                    session_state_unavailable: this build or this Mac would not report the login session, and an unreadable session is not an unlocked one, so \
+                    it will not nudge blind
+                    """,
                 status: 503)
         }
 
@@ -363,13 +341,11 @@ extension SwiftNativeMacControl {
             )
         }
 
-        // The same TCC + sink preconditions every injection handler applies.
-        //    Without the Accessibility grant CGEventPost is swallowed by the
-        //    window server, and reporting "woken" would be a lie.
-        if let refusal = injectionPreconditions(action: "wake", requiresSink: true) {
+        // Without Accessibility, the window server swallows CGEventPost; enforce the same grant and sink gates as other input.
+        if let refusal = injectionPreconditions(action: "wake", requiresSink: true, context: context) {
             return refusal
         }
-        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+        if let refusal = await attentionActionRefusal(action: "wake", body: body, turn: turn, context: context) {
             return refusal
         }
 
@@ -389,8 +365,8 @@ extension SwiftNativeMacControl {
             let wake = try await MacScreenLock.wakeIfCovered(
                 source: sessionStateSource, before: before,
                 keyTap: body["key_tap"] != .bool(false), settleMs: settleMs
-            ) {
-                if let refusal = await self.attentionActionRefusal(action: "wake", body: body) {
+            , turn: turn, context: context) {
+                if let refusal = await self.attentionActionRefusal(action: "wake", body: body, turn: turn, context: context) {
                     throw WakeAttentionRefusal(result: refusal)
                 }
             }
@@ -441,13 +417,13 @@ extension SwiftNativeMacControl {
                 ]
             )
         }
-        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+        if let refusal = await attentionActionRefusal(action: "wake", body: body, turn: turn, context: context) {
             return refusal
         }
 
         let dismissed = !after.obstructed
-        let view = await handleView(body)
-        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
+        let view = await handleView(body, context: context)
+        if let refusal = await attentionActionRefusal(action: "wake", body: body, turn: turn, context: context) {
             await screenViewStore.invalidate()
             return refusal
         }
@@ -474,8 +450,7 @@ extension SwiftNativeMacControl {
                     + "settle_ms."
         )
         output["wake"] = .object(wake)
-        // `verified` is OBSERVED, not asserted: it is the post-nudge session
-        // re-read, which is what `verificationState` picks up.
+        // Verification must use the post-nudge session read rather than an asserted success.
         output["verified"] = .bool(dismissed)
         return MacControlResult(
             ok: view.ok,
@@ -489,14 +464,11 @@ extension SwiftNativeMacControl {
 
 #if canImport(CoreGraphics) && os(macOS)
 
-/// Live session probe.
 public struct SystemMacSessionStateSource: MacSessionStateSource {
     public init() {}
 
     public func currentState() -> MacSessionState {
-        // FAIL CLOSED. An unreadable session yields a state that the guard
-        // refuses on — locked, off-console, unreadable — never an empty
-        // dictionary whose defaults read as "unlocked and on console".
+        // Unreadable session state refuses closed; empty defaults must not fabricate an unlocked console.
         guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
               session["kCGSSessionOnConsoleKey"] != nil else {
             return MacSessionState(
@@ -512,10 +484,7 @@ public struct SystemMacSessionStateSource: MacSessionStateSource {
             if let value = session[key] as? Bool { return value }
             return def
         }
-        // Absent `CGSSessionScreenIsLocked` means "not locked" — macOS publishes
-        // the key while the lock/saver UI is up. The console key is not allowed
-        // to be absent at all: its absence made the dictionary unreadable above,
-        // rather than defaulting to a permissive `true`.
+        // macOS omits CGSSessionScreenIsLocked when uncovered, but the console key is required for a readable session.
         let locked = flag("CGSSessionScreenIsLocked", default: false)
         let onConsole = flag("kCGSSessionOnConsoleKey", default: false)
         var frontmost: String?
@@ -548,7 +517,7 @@ public struct SystemMacSessionStateSource: MacSessionStateSource {
 
 #endif
 
-/// Platform fallback: honest unavailability, never a fabricated "unlocked".
+/// Unsupported platforms report unavailability rather than a fabricated unlocked state.
 public struct UnavailableMacSessionStateSource: MacSessionStateSource {
     public init() {}
     public func currentState() -> MacSessionState {

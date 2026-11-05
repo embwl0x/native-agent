@@ -6,8 +6,6 @@ import PersistenceCore
 /// One bounded exchange. This layer never retries a potentially accepted send.
 public enum AgentPeerHTTP {
     public typealias LiveUpdateSink = @Sendable (AgentA2AStream.LiveUpdate) async -> Void
-    /// Encoded output parts, shared with the producer. Complete replies also
-    /// carry task/status metadata and retained completion artifacts.
     package static let maximumOutputBytes = 16_000_000
     public static let maximumResponseBytes = 32 * 1_024 * 1_024
     public struct Response: Sendable, Equatable {
@@ -135,8 +133,7 @@ public enum AgentPeerHTTP {
         !token.isEmpty && token.utf8.count <= 16_384 && token.unicodeScalars.allSatisfy { $0.value >= 0x21 && $0.value <= 0x7e }
     }
 
-    /// Redact the assembled snapshot and hold its trailing credential prefix.
-    /// Prefix matching is linear, including for the maximum allowed token size.
+    /// Hold trailing credential prefixes until redaction is possible; matching stays linear at the token-size bound.
     package static func redactLiveText(_ text: String, token: String?) -> String {
         guard let token, !token.isEmpty else { return text }
         let redacted = text.replacingOccurrences(of: token, with: "[redacted]")
@@ -169,8 +166,7 @@ public enum AgentPeerHTTP {
         private let streaming: Bool
         private var eventStream = false
         private var parser = SSEEventParser()
-        /// Complete frames enter the one accumulator and leave the buffer.
-        /// Stream framing and final artifact replacement do not add retained bytes.
+        /// Complete frames leave the buffer; framing and artifact replacement must not inflate retained bytes.
         private let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
         private var accumulator: AgentA2AStream.Accumulator?
 
@@ -263,8 +259,7 @@ public enum AgentPeerHTTP {
         }
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
             if streaming, eventStream, let status {
-                // Only blank-line-delimited events are evidence. A truncated tail
-                // and even a clean EOF do not establish task completion.
+                // Only complete blank-line-delimited events are evidence; neither truncation nor EOF proves completion.
                 finish(.success(Response(statusCode: status, json: nil,
                     receipt: accumulator?.receipt, interrupted: error != nil)))
                 return

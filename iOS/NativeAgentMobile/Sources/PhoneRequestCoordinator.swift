@@ -8,15 +8,12 @@ import ImageIO
 import UniformTypeIdentifiers
 import AVFoundation
 
-/// Durable acceptance precedes transport ACK; execution and result publication
-/// are separate so a retry never opens a second picker or repeats a location fix.
-/// CLLocationManager is created on the main run loop, which owns its callbacks.
+/// Persist acceptance before ACK; separate execution/publication to prevent repeated pickers or fixes. Main-run-loop location callbacks stay there.
 @MainActor
 final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhoneRequests()
     @Published private(set) var active: PhoneRequest?
-    /// Automatic settings reads/writes have no consent sheet. The retained
-    /// executing record, also used for recovery, is the sole execution truth.
+    /// Read the durable executing record for settings execution/recovery; do not mirror consent-free work in another latch.
     var presented: PhoneRequest? {
         guard let active else { return nil }
         if active.kind.isSettings, records.first(where: { $0.request.id == active.id })?.executing == true { return nil }
@@ -99,7 +96,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
 
     private func expireObsolete(pairing: String) {
         let obsolete = records.filter {
-            // Completed payloads get only a short delivery grace period.
+            // Bound delivery retention after completion with a short grace period.
             $0.pairing != pairing || $0.request.expiresAt.addingTimeInterval(300) <= Date()
                 || ($0.result == nil && $0.request.expiresAt <= Date())
         }
@@ -137,8 +134,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         } catch {
             errorMessage = "Could not accept phone request: \(error.localizedDescription)"
             ModuleLog(category: "PhoneRequest")("[PhoneRequest] Could not accept request %@: %@", message.id, error.localizedDescription)
-            // Malformed requests are terminal; valid requests remain eligible
-            // for transport redelivery until acceptance is durable.
+            // Malformed requests are terminal; valid redelivery remains eligible until acceptance is durable.
             return !validRequest
         }
     }
@@ -197,8 +193,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
     }
 
     func syncDidSucceed() {
-        // One bounded batch per recovery/success signal; our own sends must not
-        // recursively trigger publication. No collection is repeated here.
+        // Publish one bounded batch per recovery/success signal; own sends must not recurse or repeat collection.
         guard !publishing, !recoveryQueued, !loaded || !records.isEmpty else { return }
         recoveryQueued = true
         Task {
@@ -252,8 +247,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
             values: expired ? [:] : values, message: message)
         records[index].attachments = expired ? [] : attachments
         do { try await save() } catch {
-            // Keep the terminal outcome with its owner for owed settlement.
-            // A failed checkpoint cannot turn Cancel back into runnable work.
+            // Retain terminal outcomes for owed settlement; checkpoint failure must not make cancelled work runnable.
             errorMessage = "Could not save phone result: \(error.localizedDescription)"
             return
         }
@@ -321,8 +315,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         }
     }
 
-    /// Read the request journal itself: Cancel/expiry revokes future effects,
-    /// while a completed preference may finish its already-approved OS prompt.
+    /// Read the journal for revocation: Cancel/expiry blocks future effects while an already-approved OS prompt may finish.
     private func settingAuthorization(requestID: String, pairing: String) -> Bool {
         if let record = records.first(where: { $0.request.id == requestID }) {
             guard record.pairing == pairing else { return false }

@@ -6,17 +6,12 @@ import Context
 import CognitiveSubstrate
 import PersonaEngine
 import MemoryV2
-// Blueprint: | `ChatOrchestration+TurnReach.swift` | `SwiftNativeTurnEngine`: packet, recall and stable-persona rendering; memory selection explanation and exact delivered recall identities |
+// Blueprint: | `ChatOrchestration+TurnReach.swift` | `SwiftNativeTurnEngine`; Frozen packet rendering and exact delivery credit |
 
 extension SwiftNativeTurnEngine {
     // MARK: - Mind-into-circulation attention inputs
 
-    /// The `mind.why` record for the memory lane: the ranked `.memory`
-    /// candidates with their selection scores, the ones that made the packet
-    /// with their record ids and why each won (relevance: the message's touch
-    /// in standard deviations; reachability: her history of use), what the
-    /// message touched but rested, and the turn's signature. Nil when no
-    /// memory competed.
+    /// Record ranked candidates, selected IDs and selection reasons so `mind.why` explains the actual memory competition.
     static func memoryWhyPayload(_ turn: ContextPreparedTurn, message: String) -> JSONValue? {
         let memoryAtoms = Set(turn.generation.atoms.lazy.filter { $0.draft.kind == .memory }.map(\.draft.id))
         let scored = turn.packet.receipt.candidateScores
@@ -37,7 +32,6 @@ extension SwiftNativeTurnEngine {
             if let record = turn.memoryRecordID(for: candidate.atomID) {
                 fields["source"] = .string("memory:" + record)
             }
-            // What carried it: meaning, wording, attention and use.
             let f = candidate.features
             fields["cosine"] = r(f.semanticCosine)
             fields["words"] = r(f.lexicalExact + f.tokenOverlap + f.messageCoverage)
@@ -64,11 +58,8 @@ extension SwiftNativeTurnEngine {
         ])
     }
 
-    /// Render an atom whole, or as a safe lead with an expandable pointer.
-    /// Memories/corrections require a considered summary; other kinds may use sentence previews.
-    /// ContextSelector publishes each cut body's pointer in the same frozen generation.
-    /// Use the turn's selection threshold; zero renders every atom whole.
-    /// ContextMemoryLead uses the frozen clock for age/provenance; unstamped clocks add no age.
+    /// Cut memories and corrections only with a considered summary; other atoms may use sentence previews.
+    /// Publish each expansion pointer in the same frozen generation and use its frozen clock for age and provenance.
     nonisolated static func renderPacketAtom(
         _ item: ContextPacketItem,
         thresholdChars: Int,
@@ -76,7 +67,6 @@ extension SwiftNativeTurnEngine {
     ) -> String {
         let kind = item.pointer.kind.rawValue
         let text = item.text
-        /// `- [kind] (age) body [provenance] <expand marker>`
         func line(_ body: String, marker: String? = nil) -> String {
             let decorated = ContextMemoryLead.decorate(body, item: item, clock: clock)
             guard let marker else { return "- [\(kind)] \(decorated)" }
@@ -105,11 +95,7 @@ extension SwiftNativeTurnEngine {
         )
     }
 
-    /// Packet-truncation receipt counts, computed from the packet the model
-    /// actually received. `expandableAfterTruncation` is the honest one: it
-    /// counts truncated atoms that DO carry a published pointer, so a
-    /// truncation that lost its way to `context_expand` reads as a gap rather
-    /// than disappearing into the truncated count.
+    /// Count only published pointers as expandable so a truncated atom without a working expansion path remains a visible gap.
     nonisolated static func packetTruncationCounts(
         _ prepared: ContextPreparedTurn
     ) -> (truncatedAtoms: Int, leadChars: Int, expandableAfterTruncation: Int) {
@@ -154,9 +140,7 @@ extension SwiftNativeTurnEngine {
         }
         if !contextItems.isEmpty {
             let thresholdChars = prepared.need.packetAtomExpandThresholdChars
-            // ONE clock for the whole packet: the turn's own frozen evaluation
-            // time, in the user's local zone captured once here. Two memories
-            // rendered either side of local midnight must agree on "yesterday".
+            // Freeze one clock and local zone for the packet so memories agree on relative dates across midnight.
             let clock = ContextRenderClock.turn(prepared.need)
             let items = orderedItems
                 .map { renderPacketAtom($0, thresholdChars: thresholdChars, clock: clock) }
@@ -164,16 +148,16 @@ extension SwiftNativeTurnEngine {
             sections.append(
                 """
                 # Relevant context (derived from canonical local sources)
-                These records preserve evidence from when they were written; they are not automatically live readings. Recheck changing status, counts, health, availability, and claims labeled current/latest/live/present with their canonical owner before repeating them as current.
-                Operating agreements apply only to their stated subject and scope. Follow the current explicit decision; keep older incidents as history. Age, similarity and a memory's confidence do not expand authority. When a decision explicitly replaces a remembered rule, use memory.commit with supersedes or corrects so the old rule leaves automatic context without being erased.
+                These records preserve evidence from when they were written; they are not automatically live readings. Recheck changing status, counts, \
+                health, availability, and claims labeled current/latest/live/present with their canonical owner before repeating them as current.
+                Operating agreements apply only to their stated subject and scope. Follow the current explicit decision; keep older incidents as history. \
+                Age, similarity and a memory's confidence do not expand authority. When a decision explicitly replaces a remembered rule, use memory.commit \
+                with supersedes or corrects so the old rule leaves automatic context without being erased.
                 \(items)
                 """
             )
         }
-        // A truncated atom already carries its own `[context_expand <id> — N
-        // more chars]` marker on the line the model is reading, so re-listing
-        // it here would spend a second line to say the same thing. This section
-        // stays what it was: the atoms that are NOT in the packet at all.
+        // Truncated atoms already carry expansion pointers; list only omitted atoms here to avoid duplicate context.
         let selectedIDs = Set(prepared.packet.selectedItems.map(\.pointer.atomID))
         let lazyPointers = prepared.packet.expandablePointers.filter {
             !selectedIDs.contains($0.atomID)
@@ -251,19 +235,10 @@ extension SwiftNativeTurnEngine {
         return block + "\n" + related
     }
 
-    /// Hard ceiling on the `related:` line. One line, one turn, 400 characters —
-    /// the whole point of the feature is a cheap hint about what the recalled
-    /// memories connect to, and a hint that can grow without bound is just an
-    /// unbudgeted second memory block.
+    /// Cap related context at 400 characters so a connection hint cannot become an unbudgeted second memory block.
     nonisolated static let relatedEntitiesLineChars = 400
 
-    /// Render the single `related:` line, or nil when there is nothing to say.
-    ///
-    /// Names are appended whole: a truncated entity name is worse than a missing
-    /// one, because the model cannot tell "Agent" from "Agent's Telegram bridge"
-    /// cut at the apostrophe. The loop therefore stops at the last name that
-    /// fits rather than clipping mid-name. Inputs arrive recency-first, so what
-    /// survives the cap is the freshest end of the list.
+    /// Keep names whole: clipping can change which entity they identify. Recency-first input makes the newest complete names survive.
     nonisolated static func renderRelatedEntitiesLine(_ names: [String]) -> String? {
         guard !names.isEmpty else { return nil }
         let prefix = "related: "
@@ -277,9 +252,7 @@ extension SwiftNativeTurnEngine {
         return line == prefix ? nil : line
     }
 
-    /// Compact `[2026-07-14, preference]` provenance marker. Either half may be
-    /// absent (KG-fallback rows carry no timestamp; legacy rows carry no kind),
-    /// and an entirely empty marker is omitted rather than rendered as `[]`.
+    /// Omit absent timestamp or kind halves; an entirely absent provenance marker must not render as `[]`.
     nonisolated static func recalledMemoryMarker(_ hit: MemoryRecallHit) -> String {
         var parts: [String] = []
         if let day = recalledMemoryDay(hit.ts) { parts.append(day) }
@@ -288,8 +261,7 @@ extension SwiftNativeTurnEngine {
         return "[\(parts.joined(separator: ", "))]"
     }
 
-    /// `YYYY-MM-DD` prefix of an ISO-8601 stamp, or nil when the stamp is
-    /// missing or not actually ISO-shaped (never guess a date at the model).
+    /// Never guess dates from missing or malformed timestamps.
     private nonisolated static func recalledMemoryDay(_ ts: String?) -> String? {
         guard let ts else { return nil }
         let trimmed = ts.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -303,7 +275,6 @@ extension SwiftNativeTurnEngine {
         return day
     }
 
-    /// Memory kind ("preference", "fact", …) comes from extras.kind, then role when absent or blank.
     private nonisolated static func recalledMemoryKind(_ hit: MemoryRecallHit) -> String? {
         if case .object(let extras)? = hit.extras,
            case .string(let kind)? = extras["kind"] {
@@ -317,15 +288,11 @@ extension SwiftNativeTurnEngine {
         return nil
     }
 
-    /// Required documents outside the SOUL/VOICE kernel retain canonical order before surface guidance.
-    /// Prefix admission requires source provenance and surface permission; missing provenance is traced.
-    /// USER is projected under this turn's recall policy without changing its stored document.
-    /// Surface restrictions alone may vary the required-document prefix across surfaces.
+    /// Preserve canonical document order and require source provenance plus surface permission before prefix admission.
+    /// Project USER under the turn's recall policy without changing its stored document.
     struct StablePrefixPersonaDocuments {
         let included: [RequiredDocument]
-        /// Documents withheld because they could not PROVE a surface
-        /// permission, as distinct from documents whose source answered "no".
-        /// A non-empty value is a build/wiring fault, not a policy outcome.
+        /// Missing permission evidence is a wiring fault, distinct from an explicit source refusal.
         let unprovenDocumentIDs: [RequiredDocumentID]
     }
 
@@ -348,9 +315,6 @@ extension SwiftNativeTurnEngine {
         return .init(included: included, unprovenDocumentIDs: unproven)
     }
 
-    /// The persona prompt her turn part leads its stable segment with: the
-    /// compiled packet, the required documents the kernel does not carry, then
-    /// surface guidance.
     nonisolated static func renderPersonaPrompt(
         compiledPersonaPrompt: String,
         requiredDocuments: [RequiredDocument],

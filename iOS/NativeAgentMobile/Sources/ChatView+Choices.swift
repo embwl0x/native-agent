@@ -4,7 +4,7 @@ import Speech
 import PhotosUI
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+Choices.swift` | Mac-owned model configuration and chat option controls on ChatView; omits the unenforced No files choice |
+// Blueprint: | `ChatView+Choices.swift` | Mac-owned model configuration and ChatView option controls |
 
 extension ChatView {
     // Every model control reads the shared Mac-owned tuple, including receipts.
@@ -128,8 +128,6 @@ extension ChatView {
         .tint(AlivePalette.text)
     }
 
-    /// One row of the options card: what it is on the left, the current
-    /// choice on the right. The whole row opens its menu.
     private func controlPill(_ label: String, title: String) -> some View {
         HStack(spacing: 12) {
             Text(label)
@@ -227,8 +225,7 @@ extension ChatView {
     }
 
     private var fileAccessOptions: [(id: String, label: String, icon: String)] {
-        // `none` remains a recognized wire value, but the current file gate
-        // cannot enforce it for every file tool. Do not offer that promise.
+        // Do not offer `none`: the file gate cannot enforce that wire value across all file tools.
         ICloudChatFileAccessPolicy.Mode.allCases.compactMap { mode -> (id: String, label: String, icon: String)? in
             switch mode {
             case .auto: (mode.rawValue, "Auto", "wand.and.stars")
@@ -242,8 +239,7 @@ extension ChatView {
 
     private func modelLabel(_ id: String) -> String {
         guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            // No pick of its own yet: the Mac's Chat choice is what this turn
-            // will run on, and the phone says so rather than naming a model.
+            // Without an explicit pick, the Mac's Chat group owns resolution; do not invent a model name.
             return sync.providers.isEmpty ? "Waiting for the Mac's choice" : "Same as Mac"
         }
         return sync.providers
@@ -259,5 +255,13 @@ extension ChatView {
     private func fileAccessLabel(_ id: String) -> String {
         let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
         return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Unavailable file access"
+    }
+}
+
+/// A model's name as the person reads it: its published name, else its id.
+enum ProviderWords {
+    static func modelName(_ model: ProviderModelInfo) -> String {
+        let name = model.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? model.id : name
     }
 }

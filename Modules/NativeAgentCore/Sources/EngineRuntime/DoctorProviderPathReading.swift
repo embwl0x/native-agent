@@ -3,17 +3,18 @@ import ChatTurnContracts
 import DoctorChecks
 import ProviderRouting
 import NativeAgentShared
-// Blueprint: | `DoctorProviderPathReading.swift` | Doctor captures checked routing before one catalog read; returns path diagnosis and the same provider rows for coverage, preserving pending-selection faults |
+import NativeAgentCore
+// Blueprint: | `DoctorProviderPathReading.swift` | Capture route faults before catalog recovery |
 
 public enum DoctorProviderPathReading {
-    public static func read(dataRoot: URL) async throws -> (runtime: DoctorProviderRuntimeReading, providers: [ProviderInfo]) {
+    public static func read(dataRoot: URL, turn: Turn?) async throws -> (runtime: DoctorProviderRuntimeReading, providers: [ProviderInfo]) {
         let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
         // Capture routing faults before catalog discovery can recover a pending selection.
         let routingRead: Result<ProviderRoutingSnapshot, Error>
         do { routingRead = .success(try await router.checkedRoutingSnapshotReadOnly()) }
         catch { routingRead = .failure(error) }
         let providers = try await ProvidersFacade.connections(from: router.checkedProviderSnapshot())
-        let surface = ChatTurnRuntimeContext.current?.surface ?? "chat"
+        let surface = turn?.runtime?.surface ?? turn?.envelope?.surface ?? "chat"
         let routing: ProviderRoutingSnapshot
         do {
             routing = try routingRead.get()
@@ -28,19 +29,19 @@ public enum DoctorProviderPathReading {
         }).sorted()
         if !needsSignIn.isEmpty {
             let controls = providers.filter { needsSignIn.contains($0.provider_id) }.map {
-                "Providers → \($0.display_name) → " + ($0.auth_modes.contains("api_key") ? "API key" : "Sign in")
+                "Providers → Accounts → \($0.display_name) → " + ($0.auth_modes.contains("api_key") ? "Add key" : "Sign in")
             }.sorted()
             return (.configurationIssue(CheckResult(source: "Providers accounts: " + needsSignIn.joined(separator: ", "),
                 id: "live.providers", title: "Providers and OAuth", status: "warn",
                 detail: "Saved provider configuration retained; credentials unavailable",
-                harm: "She cannot answer through the affected saved provider configuration.",
+                harm: "The agent cannot answer through the affected saved provider configuration.",
                 human_action: controls.joined(separator: "; "), ask: .signIn
             )), providers)
         }
         if let notice = routing.unusablePickNotice(for: surface) {
             return (.unhealthy(notice), providers)
         }
-        guard let providerID = ChatTurnRuntimeContext.current?.providerID
+        guard let providerID = turn?.runtime?.providerID ?? turn?.admission?.provider
                 ?? ProviderRoutingSurfaceLookup.value(routing.activeProviders, surface) else {
             return (.unhealthy("No usable provider is configured for the active path."), providers)
         }

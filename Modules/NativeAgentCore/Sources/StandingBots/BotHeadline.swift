@@ -1,7 +1,6 @@
 import Foundation
 // Blueprint: | `BotHeadline.swift` | `BotHeadline` enum; `make`, `clipped` preserve whole-word reply headlines |
 
-/// Headlines use the first prose line without markdown; replies without prose have no headline.
 public enum BotHeadline {
     public static func make(from reply: String, cap: Int = 240) -> String {
         var fence: (mark: Character, length: Int)?
@@ -31,7 +30,6 @@ public enum BotHeadline {
         return ""
     }
 
-    /// Keep whole words at the requested display bound.
     public static func clipped(_ text: String, cap: Int = 240) -> String {
         guard cap > 0 else { return "" }
         guard text.count > cap else { return text }

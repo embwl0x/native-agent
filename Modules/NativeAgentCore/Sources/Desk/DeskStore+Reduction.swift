@@ -5,21 +5,13 @@ import PersistenceCore
 extension SwiftNativeDeskStore {
     // MARK: - Compaction (pure fold — rebuild MUST equal in-memory fold)
 
-    /// Fold the op stream into the live DeskState. Ops apply in FILE ORDER:
-    /// create_item seeds an item; later ops mutate by handle; archive_item
-    /// removes it from the live set. A mutation whose create aged out (orphan)
-    /// is tolerated (skipped). Items are returned in alias order — top-level by
-    /// numeric seq, each immediately followed by its children in child-seq order
-    /// (orphaned-parent live items appended last).
+    /// Apply ops in append order; orphan mutations cannot recreate archived items.
+    /// Retain orphaned-parent items so malformed hierarchy never loses live work.
     public static func compact(_ ops: [DeskOp]) -> DeskState {
         compact(base: nil, ops)
     }
 
-    /// Fold seeded from a compaction base: the base's items ARE the reduced
-    /// state through `lastCompactedOpId`, so the tail ops apply on top exactly
-    /// as if the compacted prefix had just been replayed. A tail mutation
-    /// targeting a handle the base no longer carries (archived before the
-    /// snapshot) is skipped by the same orphan tolerance as always.
+    /// Seed from the base and apply only its following tail so compacted work survives truncation.
     static func compact(base: DeskCompactionBase?, _ ops: [DeskOp]) -> DeskState {
         var byHandle: [String: DeskItem] = [:]
         var createOrder: [String] = []
@@ -48,7 +40,6 @@ extension SwiftNativeDeskStore {
                     accounting.chargeWorkSlot(handle: op.handle, day: attempt.day, id: attempt.attemptId)
                 }
             case let .openPursuit(alias, project, title, summary, pursuit, notify):
-                // Pursuit creation pins origin=.agent and kind=.project.
                 if byHandle[op.handle] == nil { createOrder.append(op.handle) }
                 byHandle[op.handle] = DeskItem(
                     handle: op.handle, alias: alias, parent: nil, kind: .project,
@@ -68,9 +59,7 @@ extension SwiftNativeDeskStore {
                 if let progress { item.progress = progress }
                 if let assignee { item.assignee = assignee }
                 if let laneOf { item.laneOf = laneOf }
-                // A terminal status reached via set_status (not close_item) still
-                // needs closedAt for archive eligibility. A non-terminal status
-                // re-opens the row, so clear any stale closedAt.
+                // Terminal status needs closedAt for archival; reopening clears that eligibility.
                 if status.isTerminal {
                     if item.closedAt == nil { item.closedAt = op.ts }
                 } else {
@@ -81,7 +70,6 @@ extension SwiftNativeDeskStore {
             case let .updateTitle(title, summary, refs):
                 guard var item = byHandle[op.handle] else { continue }
                 if let title, !title.isEmpty { item.title = title }
-                // Empty summary is a no-op, matching title updates and omitted empty strings on encode.
                 if let summary, !summary.isEmpty { item.summary = summary }
                 if let refs { item.refs = refs }
                 item.updatedAt = op.ts
@@ -90,13 +78,6 @@ extension SwiftNativeDeskStore {
                 guard var item = byHandle[op.handle] else { continue }
                 Self.appendRefCapped(&item, ref)
                 item.updatedAt = op.ts
-                byHandle[op.handle] = item
-            case let .updateRef(refId, cachedFields):
-                guard var item = byHandle[op.handle] else { continue }
-                if let idx = item.refs.firstIndex(where: { $0.refId == refId }) {
-                    item.refs[idx].kind = item.refs[idx].kind.applyingCachedFields(cachedFields)
-                    item.updatedAt = op.ts
-                }
                 byHandle[op.handle] = item
             case let .appendNote(text, author, releaseCondition):
                 guard var item = byHandle[op.handle] else { continue }
@@ -135,9 +116,7 @@ extension SwiftNativeDeskStore {
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .markNotified(at):
-                // Stamps notify.lastNotifiedAt ONLY — deliberately does NOT bump
-                // updatedAt, so a notification can't masquerade as a content
-                // change and re-trigger itself (notify-evaluator idempotency).
+                // Notifications cannot bump content revision and trigger another notification.
                 guard var item = byHandle[op.handle] else { continue }
                 item.notify.lastNotifiedAt = at
                 byHandle[op.handle] = item
@@ -187,10 +166,7 @@ extension SwiftNativeDeskStore {
                 }
                 byHandle[op.handle] = item
             case let .setBlockedOn(handles):
-                // Whole-set REPLACE, same orphan tolerance as every other
-                // mutation. Blockedness is DERIVED from this edge set on read
-                // (DeskSequencing) — no status op is written here, which is what
-                // makes the auto-unblock cascade need no writer at all.
+                // Replace dependency edges; readers derive unblocking without a second writer.
                 guard var item = byHandle[op.handle] else { continue }
                 item.blockedOn = handles
                 item.updatedAt = op.ts
@@ -252,18 +228,12 @@ extension SwiftNativeDeskStore {
         return DeskState(items: ordered, generatedTs: revision, workSlotsByDay: accounting.workSlotsByDay)
     }
 
-    /// Trailing numeric component of an alias ("2" -> 2, "2.10" -> 10). Defaults
-    /// to a large sentinel so a malformed alias sorts last (never crashes).
+    /// Malformed aliases sort last so authored state cannot crash rendering.
     static func aliasSeq(_ alias: String) -> Int {
         Int(alias.split(separator: ".").last.map(String.init) ?? "") ?? Int.max
     }
 
-    /// Order live items into render order via DEPTH-FIRST descent: each item is
-    /// immediately followed by its whole subtree (children, grandchildren, …),
-    /// siblings in child-seq order. Roots are the top-level items (parent nil)
-    /// plus orphans (parent not in the live set). A final pass appends anything
-    /// still unemitted (a parent cycle / unreachable node) so NO live item is
-    /// ever dropped from the materialized state.
+    /// Retain orphans and unreachable nodes so depth-first ordering cannot lose live work.
     static func orderByAlias(_ live: [DeskItem]) -> [DeskItem] {
         let liveHandles = Set(live.map { $0.handle })
         let byParent = Dictionary(grouping: live, by: { $0.parent ?? "" })
@@ -279,11 +249,11 @@ extension SwiftNativeDeskStore {
         }
 
         let roots = live.filter { item in
-            guard let parent = item.parent else { return true }   // top-level
-            return !liveHandles.contains(parent)                  // orphan
+            guard let parent = item.parent else { return true }
+            return !liveHandles.contains(parent)
         }
         emit(roots)
-        // Cycle / unreachable guard — never silently drop a live item.
+        // Preserve even cyclic or unreachable items.
         for item in live where !emitted.contains(item.handle) {
             result.append(item); emitted.insert(item.handle)
         }
@@ -307,19 +277,12 @@ extension SwiftNativeDeskStore {
 
     // MARK: - Per-item history caps (notes / refs)
 
-    /// Newest N notes retained per item. Notes are an append-only per-item log
-    /// (append_note, plus a receipt per completed work session / work_log), and
-    /// the WHOLE item tree is re-serialized + fsynced on every desk op AND baked
-    /// into the compaction base — so an uncapped note list makes the feed O(n²)
-    /// over its life, defeating the exact cost compaction exists to bound.
-    /// Readers only ever want the recent tail: the projection and Desk page read
-    /// `notes.last`, the Workshop panel reads them newest-first.
+    /// Cap notes because every op rewrites the item tree; unbounded history makes feed growth quadratic.
     public static let notesCap = 200
 
-    /// Max refs retained per item. Same write-amplification argument as notes.
+    /// Refs share the notes' write-amplification bound.
     public static let refsCap = 64
 
-    /// Append a note, evicting the OLDEST beyond `notesCap`.
     static func appendNoteCapped(_ item: inout DeskItem, _ note: DeskNote) {
         item.notes.append(note)
         if item.notes.count > notesCap {
@@ -327,13 +290,8 @@ extension SwiftNativeDeskStore {
         }
     }
 
-    /// Append a ref, evicting the LEAST IMPORTANT beyond `refsCap` — by the
-    /// model's own `DeskRefKind.priority` ranking (the same one liveRefs sorts
-    /// by), oldest-first among equals. Deliberately NOT a plain `suffix`: gh
-    /// pr/issue refs (priority 0/1) are an item's tracking IDENTITY —
-    /// GitHubProjectTracking matches and retires desk rows by them — so a
-    /// newest-N cap would silently orphan a tracked row behind a flood of
-    /// low-priority note/trace refs. Survivors keep insertion order.
+    /// Evict low-priority refs first because tracking references carry identity.
+    /// A newest-only cap could orphan tracked rows; survivors retain insertion order.
     static func appendRefCapped(_ item: inout DeskItem, _ ref: DeskRef) {
         item.refs.append(ref)
         guard item.refs.count > refsCap else { return }

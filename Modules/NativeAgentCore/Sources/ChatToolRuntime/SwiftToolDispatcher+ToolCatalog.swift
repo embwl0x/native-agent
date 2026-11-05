@@ -19,22 +19,17 @@ extension SwiftToolDispatcher {
         "app",
     ]
 
-    /// Read file/git executors. `ParallelToolDispatch` owns concurrency admission;
-    /// `git_diff` runs alone because working-tree diff can rewrite the index.
+    /// Read file/git executors. `ParallelToolDispatch` owns concurrency admission; `git_diff` runs alone because working-tree diff can rewrite the index.
     package static let fullMacReadOnlyFileToolNames: [String] = [
         "file_excerpt", "grep",
         "git_status", "git_diff", "git_log", "repo_dirty_summary",
     ]
 
-    /// The WRITE half of the Full-Mac file surface — mutates the filesystem.
     static let fullMacWriteFileToolNames: [String] = [
         "write_file", "move_file", "copy_file", "trash_file", "mac_screenshot_save", "mail_save_attachment",
     ]
 
-    /// Swift-implemented builder/file tools exposed only when Trust Center's
-    /// Full Mac mode is active and the matching MacControl category is enabled.
-    /// Composed from the two halves so gating, catalog membership and dispatch
-    /// routing keep covering exactly the same set they always did.
+    /// Share builder membership with dispatch so Full Mac and category gates cover exactly the advertised executors.
     package static let fullMacFileToolNames: [String] =
         fullMacReadOnlyFileToolNames + fullMacWriteFileToolNames
 
@@ -43,8 +38,7 @@ extension SwiftToolDispatcher {
     ]
 
 
-    /// Read-only Mac perception under the Accessibility category. `mac_view`
-    /// also reports the separate Screen Recording grant for its image.
+    /// Read-only Mac perception under the Accessibility category. `mac_view` also reports the separate Screen Recording grant for its image.
     static let fullMacAccessibilityReadToolNames: [String] = [
         "mac_view", "mac_attention",
         // mac_look shares the Accessibility read gate and needs no additional grant.
@@ -53,110 +47,58 @@ extension SwiftToolDispatcher {
         "screen", "wait",
     ]
 
-    /// The clipboard organ has its own read and write gates.
-    ///
-    ///   • It is not an accessibility READ — it walks no AX tree and needs no
-    ///     Accessibility TCC grant to answer.
-    ///   • It is not INJECTION — it posts no CGEvent and performs no AX action,
-    ///     so it must not carry the injection list's approval capability.
-    ///
-    /// Clipboard is separately reachable through the four-verb surface.
-    ///
-    /// GATE: both reads and writes require `accessibilityAllowed`, an ACTIVE Full Mac
-    /// window and the accessibility category, enforced again inside MacControl.
+    /// Clipboard needs its own read/write gates: it neither walks AX nor injects input. Both require accessibilityAllowed, active Full Mac and the
+    /// accessibility category, rechecked inside MacControl.
     static let macClipboardReadToolNames: [String] = ["clipboard_read"]
     static let macClipboardWriteToolNames: [String] = ["clipboard_write"]
     static let macClipboardToolNames: [String] =
         macClipboardReadToolNames + macClipboardWriteToolNames
 
-    /// `menu` is a bounded read-only walk
-    /// of `AXMenuBar` (no CGEvent, no AX action, it does not even open a menu),
-    /// while `menu_press` runs the app's own handler and clears the full
-    /// injection contract inside MacControl.
-    ///
-    /// Separate read/press lists preserve their admission and capability contracts.
+    /// Menu reads walk AXMenuBar without opening it; menu_press invokes a handler and needs injection admission.
     static let macMenuReadToolNames: [String] = ["menu"]
     static let macMenuPressToolNames: [String] = ["menu_press"]
     static let macMenuToolNames: [String] = macMenuReadToolNames + macMenuPressToolNames
 
-    /// fable51 item 33 — THE READ ORGAN. Its own list for the same reason the
-    /// two organs above have theirs: it is neither neighbour.
-    ///
-    ///   • It is not one of the accessibility READS. That list's contract is
-    ///     the bounded glance under `look`'s budgets, and this one deliberately
-    ///     is not bounded that way — it returns a whole document and lets the
-    ///     turn's existing spill pager carry it.
-    ///   • It is not INJECTION. It moves a viewport and puts it back; it
-    ///     presses, types and activates nothing, so it must not carry the
-    ///     injection list's approval capability.
-    ///
-    /// The separate list also keeps it OUT of `internalMacToolNames`: `read`
-    /// is a NEW organ for the four-verb surface to reach for, not a legacy
-    /// `mac_*` organ being retired.
-    ///
-    /// GATE: `accessibilityAllowed`, plus the file gate (`fileOpsAllowed`
-    /// and workspace file policy) for ANY filesystem route — a `path` the caller
-    /// names or one inferred from `AXDocument` (see `impl_mac_read_tool`).
+    /// Whole-document reads use spill paging rather than glance budgets and restore any viewport movement. They need accessibilityAllowed plus fileOpsAllowed
+    /// and workspace policy for explicit or AXDocument-derived paths. Keep them separate from injection: they press, type and activate nothing.
     static let macReadToolNames: [String] = ["read"]
 
     /// Local activity reads require capture and separate agent admission, checked at discovery and dispatch.
     static let activityQueryToolNames: [String] = ["activity_query"]
 
-    /// Injection tools synthesize input and drive other apps' UI.
-    /// They require a body-bound injection capability,
-    /// and are blocked under `fileAccess=read_only`. Standard modes obtain the
-    /// capability through approved replay; admitted Full Mac YOLO obtains it
-    /// directly for the checked call without a per-call prompt.
-    /// `mac_wake` is in this list rather than the read list even though
-    /// most of what it RETURNS is a `mac_view` result: it posts a HID mouse
-    /// move first, and the tier is decided by what a tool does, not by what it
-    /// hands back. Read tier for it would have been a bypass with a view-shaped
-    /// result stapled to it.
+    /// Injection requires a body-bound capability and refuses read_only access. Approved replay or checked Full Mac supplies it; mac_wake belongs here because
+    /// it posts HID input before reading.
     static let fullMacAccessibilityInjectionToolNames: [String] = [
         "mac_wake",
-        // Four verbs: `act` drives the closed loop (raise,
-        // gates, actuator, observer) addressed by NAME instead of handle;
-        // `go` activates/launches/opens — hands, so injection tier.
+        // act drives the closed loop; go launches or activates, so both require injection admission.
         "act", "go",
     ]
 
-    /// The four-verb surface routes to its OWN impl (see the dispatch switch:
-    /// its case precedes the read/injection list cases, so membership above
-    /// buys loading/visibility while routing lands here).
+    /// Four-verb membership controls visibility; earlier dispatch cases retain their composed execution owner.
     static let fourVerbToolNames: [String] = ["screen", "act", "go", "wait"]
 
-    /// The implementation organs retained for direct diagnostics and the Tools
-    /// UI, but removed from the conversational model surface. This one set is
-    /// the cutover boundary; prompt filters, same-turn loading, and stale-call
-    /// rejection all consult it instead of maintaining parallel exclusion
-    /// lists.
+    /// Share one internal-name set across prompts, visibility and stale-call refusal so conversational exclusions cannot drift.
     package static let internalMacToolNames: Set<String> = Set(fullMacAccessibilityReadToolNames
             + fullMacAccessibilityInjectionToolNames)
             .subtracting(fourVerbToolNames)
 
-    /// Ordinary turns carry the fixed app door. Internal executor names are
-    /// never made visible by the absence of a retired-name exclusion.
+    /// Ordinary turns carry only app; an absent exclusion never grants visibility to an internal executor.
     package static func isModelHidden(_ name: String) -> Bool {
         !alwaysOnCoreNames.contains(name)
     }
 
-    /// Keep the retained UI and studio tools out of the conversational catalog.
+    /// Retained UI and Studio executors must stay outside the conversational catalog.
     public static func modelVisibleCatalogToolNames(
         _ availableToolNames: Set<String>
     ) -> Set<String> {
         availableToolNames.intersection(alwaysOnCoreNames)
     }
 
-    /// Add the fixed app floor and exclude internal names from active tools.
     package static func normalModelToolNames(activeTools: Set<String>) -> Set<String> {
         alwaysOnCoreNames
     }
 
-    /// The advertised tool contract for one turn, split into the part that can
-    /// never move and the part that only ever grows.
-    ///
-    /// FLOOR is `alwaysOnCoreNames ∩ available`, sorted by name.
-    /// APPENDED preserves the incoming order of every other name.
+    /// Keep the always-on floor sorted and preserve incoming order for appended tools so advertised prefixes remain stable.
     package struct ToolContractOrdering: Sendable, Equatable {
         package let floor: [String]
         package let appended: [String]
@@ -168,11 +110,7 @@ extension SwiftToolDispatcher {
 
         package var advertised: [String] { floor + appended }
 
-        /// SHA-256 over the ordered advertised contract. Two consecutive turns
-        /// with the same fingerprint carry the same catalog rows in the same
-        /// order, so a cache miss between them cannot be blamed on the tool
-        /// contract. Membership AND order both feed the digest — reordering
-        /// alone breaks a prefix just as thoroughly as adding a row.
+        /// Hash ordered contracts: reordering alone breaks a cached prefix just as adding a row does.
         package var fingerprintSHA256: String {
             let text = floor.joined(separator: "\n")
                 + "\n\u{1F}\n"
@@ -183,8 +121,6 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Canonical advertised order for `names`: the floor sorted by name, then
-    /// everything else in incoming order.
     package static func canonicalToolOrder(_ names: some Sequence<String>) -> ToolContractOrdering {
         var seen = Set<String>()
         let ordered = names.filter { seen.insert($0).inserted }
@@ -200,37 +136,33 @@ extension SwiftToolDispatcher {
         "swift_build", "swift_test", "remote_node_execute",
     ]
 
-    // App lifecycle tools. Not general builder tools (no arbitrary Process
-    // args/cwd surface), but they share the builder tools' policy shape:
-    // schema lives in the includeFullMacFileTools block, dispatch gates on
-    // file_ops_allowed, and listAvailableTools() surfaces them under the same
-    // gate. Kept in a separate list so the tool catalog doesn't mislabel them
-    // "implemented_swift_builder_tools".
+    // Lifecycle tools share builder policy but keep a separate list so the catalog does not mislabel them as general builders.
     package static let fullMacRestartToolNames: [String] = [
         "restart_app", "install_app",
     ]
 
-    /// Names implemented by this dispatcher, including capability-gated
-    /// surfaces. Dynamic registry tools are catalog rows too, but are
-    /// intentionally not claimed here because this static dispatcher cannot
-    /// vouch for their registration lifecycle.
+    /// Static dispatch cannot vouch for dynamic registration lifecycles; claim only its own executor names.
     package static let nativeToolDescriptors: [String: ToolDescriptor] = Dictionary(uniqueKeysWithValues:
         BuiltInToolSchemaFactory(requestedNames: nil).schemas(
             includeFullMacFileTools: true, includeFullMacSystemTools: true,
             includeFullMacAccessibilityReadTools: true, includeFullMacAccessibilityInjectionTools: true,
             includeActivityQueryTool: true
-        ).map { ($0.name, ToolDescriptor(schema: $0, bucket: nativeBucket($0.name))) })
+        ).map { ($0.name, ToolDescriptor(schema: $0, bucket: nativeBucket($0))) })
 
     public static let catalogRegisteredToolNames = Set(nativeToolDescriptors.keys)
 
-    /// Returns nil deliberately for a name without an explicit reviewed
-    /// category. Callers must present that condition visibly instead of
-    /// treating an arbitrary runtime name as a reviewed category.
+    /// An unreviewed category stays nil and visible; never infer trust from an arbitrary runtime name.
     public static func catalogBucket(forRegisteredToolNamed name: String) -> ChatToolCatalogBucket? {
         nativeToolDescriptors[name]?.bucket
     }
 
-    private static func nativeBucket(_ name: String) -> ChatToolCatalogBucket {
+    /// Each built-in's own declaration supplies its integration, including before executor registration.
+    public static func macIntegrationAccess(forTool tool: String) -> MacIntegrationAccess? {
+        nativeToolDescriptors[ToolNameAliases.canonical(tool)]?.schema.macIntegration
+    }
+
+    private static func nativeBucket(_ schema: LLMToolSchema) -> ChatToolCatalogBucket {
+        let name = schema.name
         if Self.fullMacBuilderToolNames.contains(name)
             || Self.fullMacRestartToolNames.contains(name) {
             return .shell
@@ -247,7 +179,7 @@ extension SwiftToolDispatcher {
             || Self.macReadToolNames.contains(name) {
             return .macControl
         }
-        if MacIntegrationGates.byTool[name] != nil || name == "work_context" {
+        if schema.macIntegration != nil || name == "work_context" {
             return .macIntegration
         }
         return .core // Only the schema factory calls this classifier.

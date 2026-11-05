@@ -8,10 +8,7 @@ import PersistenceCore
 import TrustCenter
 
 // Blueprint: | `ToolOperationStatusReceipt.swift` | Bounded AppModel operation feedback; repeated results retain independent receipt identities |
-/// A result from a tool mutation that the Tools surface must keep visible.
-/// This is intentionally separate from the app-wide one-line `statusText`:
-/// repeated failures are separate observations even when their wording is
-/// identical, and an unmounted tab must not drop a result.
+/// Keep independent receipts outside global status so identical failures and unmounted tabs retain every outcome.
 struct ToolOperationStatusReceipt: Identifiable, Equatable, Sendable {
     enum Outcome: String, Equatable, Sendable {
         case succeeded
@@ -40,9 +37,7 @@ enum ToolsStatusFeed {
     }
 }
 extension AppModel {
-    /// Records every completed/failed Tools mutation independently of whether
-    /// the Tools tab is mounted. Keep `statusText` for existing global status
-    /// consumers, but never use its equality as the receipt identity.
+    /// Record each mutation regardless of mounting; statusText equality must not determine receipt identity.
     @MainActor
     func recordToolOperationStatus(
         _ message: String,

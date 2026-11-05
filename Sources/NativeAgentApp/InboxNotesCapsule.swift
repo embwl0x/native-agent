@@ -12,14 +12,12 @@ import AppKit
 import PersistenceCore
 import Desk
 import EngineRuntime
-import WorkshopExecution
 import Cognition
 import BackgroundLoops
 import ApprovalInbox
 
 // Blueprint: | `InboxNotesCapsule.swift` | Chat-header unread notes capsule, note selection and failed-read retries |
 
-/// One chat-header capsule opens unread notes newest first, with detail and actions.
 struct InboxNotesCapsule: View {
     let items: [InboxItemRecord]
     let onAction: @MainActor (String, String) async throws -> Void
@@ -33,7 +31,6 @@ struct InboxNotesCapsule: View {
     private static let rowHeight: CGFloat = 44
 
     var body: some View {
-        // Newest first: the inbox already lists that way.
         let unread = items.filter(\.isUnread)
         ZStack {
             if !unread.isEmpty || !failedReads.isEmpty {
@@ -80,7 +77,6 @@ struct InboxNotesCapsule: View {
                 Text("Updates")
                     .font(ShellType.labelSemibold)
                 Spacer()
-                // Marked read, they stay in Notifications; nothing is lost.
                 Button(failedReads.isEmpty ? "Mark all read" : "Retry failed") {
                     let ids = failedReads.isEmpty ? unread.map(\.id) : failedReads.keys.sorted()
                     isMarkingAll = true
@@ -103,7 +99,8 @@ struct InboxNotesCapsule: View {
             .padding(.vertical, 10)
             Divider()
             if !failedReads.isEmpty {
-                Text("\(failedReads.count) updates could not be marked read. " + failedReads.keys.sorted().compactMap { failedReads[$0] }.joined(separator: "\n"))
+                Text("\(failedReads.count) updates could not be marked read. "
+                    + failedReads.keys.sorted().compactMap { failedReads[$0] }.joined(separator: "\n"))
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.trouble)
                     .textSelection(.enabled)
@@ -114,7 +111,7 @@ struct InboxNotesCapsule: View {
                     ForEach(unread) { item in
                         Button {
                             showsList = false
-                            // Let the popover close before the sheet opens.
+                            // Close the popover before presenting the sheet.
                             DispatchQueue.main.async { selectedItem = item }
                         } label: {
                             HStack(spacing: 8) {

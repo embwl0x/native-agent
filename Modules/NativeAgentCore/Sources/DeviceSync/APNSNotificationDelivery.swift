@@ -4,7 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `APNSNotificationDelivery.swift` | SwiftNativeAPNSSender notification/work-activity delivery, transport-owned fan-out and checked capped unknown/final outcome receipts |
+// Blueprint: | `APNSNotificationDelivery.swift` | Transport-owned APNs fan-out, per-target receipts and confirmed token retirement. |
 extension SwiftNativeAPNSSender {
     func sendWorkActivity(
         _ row: MobileWorkActivity, event: String, token: String,
@@ -57,18 +57,14 @@ extension SwiftNativeAPNSSender {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> (receipts: [SwiftNativeAPNSReceipt], errors: [String]) {
         let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
-        var targets: [APNSTarget] = []
         do {
-            // Missing provider credentials are the normal public-install case.
-            // An existing unreadable/invalid configuration still reports its error.
+            // Public installs may lack provider credentials; malformed or unreadable configuration remains an error.
             guard let config = try APNSConfig.loadIfPresent(from: dataRoot) else { return ([], []) }
             let registrations = try await loadTokens(dataRoot: dataRoot, config: config)
-            targets = registrations.tokens.map { config.target(for: $0) }
+            let targets = registrations.tokens.map { config.target(for: $0) }
             guard !targets.isEmpty else {
                 let errors = registrations.errors + ["No APNS device tokens are registered with enough topic/environment metadata."]
-                do {
-                    return ([], try await recordOutcome(eventID: eventID, targets: targets, receipts: [], errors: errors, dataRoot: dataRoot))
-                } catch { return ([], errors + [error.localizedDescription]) }
+                return ([], errors)
             }
             let jwt = try providerToken(keyId: config.keyId, teamId: config.teamId, keyPath: config.keyPath)
             var eventUserInfo = userInfo
@@ -76,20 +72,12 @@ extension SwiftNativeAPNSSender {
             let pushUserInfo = eventUserInfo
             let admittedTargets = targets
             try Task.checkCancellation()
-            // Once admitted, the effect and its receipt belong to this task.
-            // Caller cancellation/deadline cannot cancel it; the wait joins the
-            // bounded transport rather than imposing a second write deadline.
+            // Admitted sends and receipts own their bounded transport; caller cancellation ends no write.
             return await Task.detached {
                 await self.deliverWake(targets: admittedTargets, jwt: jwt,
                     userInfo: pushUserInfo, eventID: eventID, registrationErrors: registrations.errors, dataRoot: dataRoot)
             }.value
-        } catch {
-            var errors = [error.localizedDescription]
-            do {
-                errors = try await recordOutcome(eventID: eventID, targets: targets, receipts: [], errors: errors, dataRoot: dataRoot)
-            } catch { errors.append(error.localizedDescription) }
-            return ([], errors)
-        }
+        } catch { return ([], [error.localizedDescription]) }
     }
 
     private struct WakeAttempt: Sendable {
@@ -112,13 +100,6 @@ extension SwiftNativeAPNSSender {
     private func deliverWake(targets: [APNSTarget], jwt: String, userInfo: [String: String],
                              eventID: String, registrationErrors: [String], dataRoot: URL) async -> (receipts: [SwiftNativeAPNSReceipt], errors: [String]) {
         let attempts = targets.map { WakeAttempt(target: $0) }
-        let pending = attempts.map { $0.receipt(status: "unknown") }
-        do {
-            // No external write without retained per-target uncertainty. A crash
-            // or a failed final receipt leaves these same APNs IDs unsettled.
-            try await recordOutcome(eventID: eventID, targets: targets, receipts: pending, errors: registrationErrors, dataRoot: dataRoot)
-        } catch { return ([], registrationErrors + [error.localizedDescription]) }
-
         let receipts = await withTaskGroup(of: SwiftNativeAPNSReceipt.self) { group in
             for attempt in attempts {
                 group.addTask {
@@ -129,21 +110,18 @@ extension SwiftNativeAPNSSender {
             for await receipt in group { receipts.append(receipt) }
             return receipts
         }
-        var errors = registrationErrors + receipts.compactMap(\.error)
-        do {
-            errors = try await recordOutcome(eventID: eventID, targets: targets, receipts: receipts, errors: errors, dataRoot: dataRoot)
-        } catch { errors.append(error.localizedDescription) }
+        let errors = await pruneUnregisteredTokens(
+            targets: targets, receipts: receipts, errors: registrationErrors + receipts.compactMap(\.error), dataRoot: dataRoot
+        )
         return (receipts, errors)
     }
-    /// Record each fan-out outcome; prune only tokens Apple retires with HTTP 410.
-    @discardableResult
-    private func recordOutcome(
-        eventID: String,
+    /// Prune only tokens Apple retires with HTTP 410; return transport and pruning errors to the caller.
+    private func pruneUnregisteredTokens(
         targets: [APNSTarget],
         receipts: [SwiftNativeAPNSReceipt],
         errors: [String],
         dataRoot: URL
-    ) async throws -> [String] {
+    ) async -> [String] {
         var errors = errors
         for receipt in receipts where receipt.httpStatus == 410 {
             // APNs stamps a 410 with when it last confirmed the token dead (ms).
@@ -161,28 +139,6 @@ extension SwiftNativeAPNSSender {
             } catch {
                 errors.append("Could not prune unregistered APNS token for \(receipt.deviceId): \(error.localizedDescription)")
             }
-        }
-        let row: JSONValue = .object([
-            "at": .string(ISO8601DateFormatter().string(from: Date())),
-            "eventId": .string(eventID),
-            "targets": .int(Int64(targets.count)),
-            "accepted": .int(Int64(receipts.filter(\.isSuccess).count)),
-            "receipts": .array(receipts.map { $0.toJSON() }),
-            "errors": .array(errors.map(JSONValue.string)),
-        ])
-        do {
-            try await appendJSONLCapped(
-                row,
-                to: dataRoot.appendingPathComponent("mobile_push/apns_outcomes.jsonl"),
-                maxLines: 500,
-                logLabel: "SwiftNativeAPNS.outcome",
-                durable: true
-            )
-        } catch {
-            throw NSError(domain: "NativeAgentAPNS", code: -7, userInfo: [
-                NSLocalizedDescriptionKey: "APNS outcome receipt remains unsettled for \(eventID): \(error.localizedDescription)",
-                NSUnderlyingErrorKey: error,
-            ])
         }
         return errors
     }

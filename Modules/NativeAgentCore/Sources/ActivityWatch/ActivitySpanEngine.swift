@@ -19,72 +19,46 @@ public struct SystemActivityClock: Sendable {
 
 // MARK: - Input vocabulary
 
-/// Everything that can move the span state machine.
 public enum ActivityInputEvent: Sendable, Equatable {
-    /// Frontmost app changed (or was seeded at start / after unlock).
     case activate(bundleId: String, appName: String, at: Double)
-    /// An AX focus notification on the observed app.
     case focusEvent(at: Double)
-    /// The frontmost window's title changed. `raw` is the UNREDACTED AX string
-    /// and this is the ONLY place one is ever accepted — it is redacted before
-    /// it can reach a span, and never logged.
+    /// Accept raw titles only here, redacting before they reach a span and never logging them.
     case titleChange(raw: String?, at: Double)
-    /// The idle deadline elapsed (the tick read `secondsSinceLastEventType`).
     case idle(at: Double)
     case lock(at: Double)
     case unlock(at: Double)
     case sleep(at: Double)
     case wake(at: Double)
-    /// The observed app quit, or the watcher is shutting down cleanly.
     case terminate(at: Double)
-    /// Required observation was lost; no later duration is supported by evidence.
+    /// Observation loss supplies no evidence for later duration.
     case observationUnavailable
-    /// The 60 s liveness tick with nothing else to report.
     case heartbeat(at: Double)
 }
 
-/// What the engine wants written. Deliberately mirrors `ActivitySpanStore`'s
-/// write API one-to-one so applying a command is mechanical.
+/// Mirror store commands one-to-one so the watcher only forwards effects.
 public enum ActivityStoreCommand: Sendable, Equatable {
     case open(ActivitySpan)
     case touch(id: String, at: Double)
     case heartbeat(id: String, at: Double)
-    /// The open span learned its INITIAL title. Updates the row in place — it is
-    /// explicitly NOT a window change, and must never split the span. See
-    /// `handleTitleChange` for why this case has to exist.
+    /// Set the initial title in place; learning it must not split the span.
     case retitle(id: String, titleRedacted: String?, at: Double)
     case close(id: String, reason: ActivityCloseReason, at: Double)
-    /// A prior process left rows open. Close them at their own `last_seen_at`.
+    /// Close abandoned rows at their own last observation, never at restart time.
     case reconcileAbandoned
 }
 
 // MARK: - The state machine
 
-/// The span state machine driven by the live watcher.
-///
-/// Invariants it exists to hold (build plan W1/W2/W3):
-///
-///  * every `open` has exactly one `close`, and `close_reason` says which path
-///    closed it — except a process crash, which emits none and is
-///    settled by `reconcileAbandoned` at next start;
-///  * lock and sleep CLOSE the open span at the boundary and write NOTHING
-///    until unlock/wake — while locked, AX returns plausible garbage (the P0
-///    blocker), so silence is the only honest output;
-///  * `last_seen_at` advances on EVERY processed event, not just the heartbeat;
-///  * monotonic-safe: no emitted timestamp is ever earlier than the previous
-///    one, so a backwards clock step or a sleep can neither invent nor rewind
-///    duration. A new span's start is floored at the last emitted close.
-///
-/// It is a value type with no I/O, no AX, and no AppKit — which is why it can
-/// be driven deterministically on a machine with a locked screen.
+/// Every open has one close; crash-abandoned rows settle at the next start.
+/// Lock and sleep close at the boundary; locked AX data is unreliable, so write nothing until unlock/wake.
+/// Every event advances last_seen_at; heartbeat alone is not sufficient.
+/// Floor timestamps at the last emitted close so clock steps cannot invent or rewind duration.
 public struct ActivitySpanEngine: Sendable {
-    /// Capture-thread view of the currently open span.
     public struct OpenSpan: Sendable, Equatable {
         public let id: String
         public let bundleId: String
         public let appName: String
-        /// `var`, because a span's first title lands ON the span rather than
-        /// splitting it (see `handleTitleChange`).
+        /// The first title settles on the span without splitting it.
         public var titleRedacted: String?
         /// Tracks whether the title is decided; nil is a legitimate settled value.
         public var titleSettled: Bool
@@ -94,9 +68,9 @@ public struct ActivitySpanEngine: Sendable {
 
     public private(set) var policy: ActivityPolicy
     public private(set) var openSpan: OpenSpan?
-    /// True while locked, asleep, or session-inactive. Nothing is written.
+    /// Locked, sleeping or inactive sessions must write nothing.
     public private(set) var isGated: Bool
-    /// Highest timestamp already emitted. The monotonic floor for everything.
+    /// Floor all emitted timestamps at the highest one already emitted.
     public private(set) var lastEmittedAt: Double
 
     private var lockedByLock = false
@@ -108,25 +82,18 @@ public struct ActivitySpanEngine: Sendable {
         self.lastEmittedAt = 0
     }
 
-    /// Swap the policy mid-flight (the user edited exclusions). If the app whose
-    /// span is open just became excluded, that span closes immediately — the
-    /// alternative is a row that keeps growing for an app the user just said to
-    /// stop watching.
+    /// A newly excluded app closes immediately so its row cannot keep growing after consent is withdrawn.
     public mutating func updatePolicy(_ next: ActivityPolicy, at: Double) -> [ActivityStoreCommand] {
         policy = next
         guard let span = openSpan else { return [] }
         if !next.allowsCapture(bundleID: span.bundleId) {
             return [closeCurrent(reason: .appChange, at: at)].compactMap { $0 }
         }
-        // Titles just got switched off for this app: drop the title by closing
-        // and reopening. Query-time filtering covers history; this covers now.
+        // Close and reopen to remove current title capture; query filtering separately protects history.
         if span.titleRedacted != nil, !next.allowsTitleCapture(bundleID: span.bundleId) {
             var commands: [ActivityStoreCommand] = []
             if let close = closeCurrent(reason: .windowChange, at: at) { commands.append(close) }
-            // The successor's title is DECIDED by the policy that just landed:
-            // it is nil, and it stays nil for as long as titles are off. A later
-            // title (titles re-enabled) is therefore a genuine window change,
-            // not this span learning its first title.
+            // Policy-disabled titles are settled nil; re-enabling then produces a real window change.
             commands.append(openNew(
                 bundleId: span.bundleId, appName: span.appName,
                 titleRedacted: nil, titleSettled: true, at: at
@@ -136,18 +103,16 @@ public struct ActivitySpanEngine: Sendable {
         return []
     }
 
-    /// CAPTURE-TIME gate, exposed so the live watcher can ask BEFORE it makes an
-    /// AX call. An excluded app's title is never read, not read-then-discarded.
+    /// Gate before AX; read-then-discard still reads excluded content.
     public func shouldCapture(bundleID: String) -> Bool {
         policy.allowsCapture(bundleID: bundleID)
     }
 
-    /// Same, for the title read specifically.
     public func shouldReadTitle(bundleID: String) -> Bool {
         policy.allowsTitleCapture(bundleID: bundleID)
     }
 
-    /// Startup: settle anything a prior process left open.
+    /// Settle rows left open by a prior process before observing new activity.
     public func startupReconcile() -> [ActivityStoreCommand] {
         [.reconcileAbandoned]
     }
@@ -181,9 +146,7 @@ public struct ActivitySpanEngine: Sendable {
         case .unlock(let at):
             lockedByLock = false
             isGated = lockedBySleep
-            // Deliberately opens NOTHING. The live watcher re-seeds from the
-            // frontmost app after unlock, which arrives as `.activate`. Guessing
-            // here would resurrect a span for an app that may no longer be front.
+            // Wait for a fresh activation after unlock; guessing could resurrect an app that is no longer frontmost.
             bump(at)
             return []
 
@@ -204,7 +167,7 @@ public struct ActivitySpanEngine: Sendable {
             guard !isGated, let span = openSpan else { return [] }
             let stamp = clamp(at)
             openSpan?.lastSeenAt = stamp
-            // Liveness only — a heartbeat must NOT inflate event_count.
+            // Heartbeats prove liveness, never additional human events.
             return [.heartbeat(id: span.id, at: stamp)]
         }
     }
@@ -212,25 +175,22 @@ public struct ActivitySpanEngine: Sendable {
     private mutating func handleActivate(
         bundleId: String, appName: String, at: Double
     ) -> [ActivityStoreCommand] {
-        // Nothing is written while locked or asleep. Not even a close: the span
-        // was already closed at the boundary.
+        // The boundary already closed the span; write nothing while locked or asleep.
         guard !isGated else { return [] }
 
-        // CAPTURE-TIME EXCLUSION. Checked before anything else touches this app.
+        // Reject excluded apps before any capture processing.
         guard policy.allowsCapture(bundleID: bundleId) else {
             return [closeCurrent(reason: .appChange, at: at)].compactMap { $0 }
         }
 
         if let span = openSpan, span.bundleId == bundleId {
-            // Re-activation of the same app is an event, not a new span.
+            // Same-app reactivation is an event, not a new span.
             return handleTouch(at: at)
         }
 
         var commands: [ActivityStoreCommand] = []
         if let close = closeCurrent(reason: .appChange, at: at) { commands.append(close) }
-        // Opened by an activation: the exclusion gate runs before any AX read,
-        // so this span does not know its title yet. The next title to arrive is
-        // its INITIAL title, whatever its value.
+        // Activation precedes permitted AX reads, so the next title settles the initial value in place.
         commands.append(openNew(
             bundleId: bundleId, appName: appName,
             titleRedacted: nil, titleSettled: false, at: at
@@ -248,17 +208,15 @@ public struct ActivitySpanEngine: Sendable {
     private mutating func handleTitleChange(raw: String?, at: Double) -> [ActivityStoreCommand] {
         guard !isGated, let span = openSpan else { return [] }
 
-        // Not allowed to keep the title for this app? Then the change is still
-        // evidence the human was doing something — record the event, drop the
-        // string. `raw` dies here having never touched a struct or a log.
+        // A disallowed title still proves an event; drop its string before any struct or log receives it.
         guard policy.allowsTitleCapture(bundleID: span.bundleId) else {
             return handleTouch(at: at)
         }
 
-        // REDACT AT THE SOURCE. Past this line no un-redacted title exists.
+        // No raw title may cross this source-redaction boundary.
         let redacted = ActivityTitleRedaction.redact(raw)
 
-        // An unsettled span learns its initial title in place, including nil.
+        // Nil is a legitimate settled initial title.
         if !span.titleSettled {
             let stamp = clamp(at)
             openSpan?.titleRedacted = redacted
@@ -271,10 +229,7 @@ public struct ActivitySpanEngine: Sendable {
 
         var commands: [ActivityStoreCommand] = []
         if let close = closeCurrent(reason: .windowChange, at: at) { commands.append(close) }
-        // The successor is born KNOWING its title — that is what the split was
-        // for — even when that title is nil (a window with no AX title, or one
-        // the redactor dropped). Marking it settled is what keeps the NEXT
-        // title change a split rather than an in-place stamp.
+        // A split successor already knows its title, including nil; later changes must split rather than stamp it.
         commands.append(openNew(
             bundleId: span.bundleId, appName: span.appName,
             titleRedacted: redacted, titleSettled: true, at: at
@@ -288,8 +243,7 @@ public struct ActivitySpanEngine: Sendable {
         bundleId: String, appName: String, titleRedacted: String?,
         titleSettled: Bool, at: Double
     ) -> ActivityStoreCommand {
-        // Floored at the last emitted timestamp: a backwards clock step must not
-        // let a new span start before the close that just happened.
+        // Floor the new start at the prior close so backwards clock steps cannot overlap spans.
         let start = clamp(at)
         let span = ActivitySpan(
             id: UUID().uuidString,
@@ -320,17 +274,13 @@ public struct ActivitySpanEngine: Sendable {
     ) -> ActivityStoreCommand? {
         guard let span = openSpan else { return nil }
         openSpan = nil
-        // Idle is discovered after its threshold, but ends at the last input,
-        // which can precede heartbeats already emitted for this span.
+        // Idle ends at the last input even if later heartbeats already advanced liveness.
         let stamp = reason == .idle || reason == .observationUnavailable
             ? max(span.startedAt, at) : clamp(at)
         return .close(id: span.id, reason: reason, at: stamp)
     }
 
-    /// The monotonic floor, except for retrospective idle closure. Other
-    /// emitted timestamps are non-decreasing no matter what the wall clock does.
-    /// A backwards step degenerates to a zero-length interval — never a negative
-    /// one, and never a fabricated positive one.
+    /// Except retrospective idle closure, floor emitted timestamps so backwards steps cannot fabricate duration.
     private mutating func clamp(_ at: Double) -> Double {
         var stamp = max(at, lastEmittedAt)
         if let span = openSpan { stamp = max(stamp, span.lastSeenAt) }
@@ -338,7 +288,7 @@ public struct ActivitySpanEngine: Sendable {
         return stamp
     }
 
-    /// Advance the floor without emitting anything (unlock/wake/crash).
+    /// Unlock, wake and crash recovery advance the floor without emitting activity.
     private mutating func bump(_ at: Double) {
         lastEmittedAt = max(lastEmittedAt, at)
     }

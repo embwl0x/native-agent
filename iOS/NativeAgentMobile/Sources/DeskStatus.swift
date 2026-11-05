@@ -4,9 +4,7 @@ import NativeAgentShared
 
 // MARK: - Desk words and marks (shared with Desk tasks)
 
-/// A status as a small mark: a breathing dot for what I'm doing now, a check
-/// for done, a filled dot for next, a ring for the rest. The word beside it
-/// carries the meaning; the mark is never coloured.
+/// Status words carry meaning; keep marks uncoloured so colour does not become a second status vocabulary.
 struct DeskStatusMark: View {
     let status: String
     var movementAt: String? = nil
@@ -36,7 +34,6 @@ struct DeskStatusMark: View {
     }
 }
 
-/// Plain words for Desk and task statuses.
 enum DeskStatusWords {
     static func word(for status: String) -> String {
         switch status.lowercased() {

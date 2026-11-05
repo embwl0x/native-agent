@@ -1,21 +1,14 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SchedulerDueJobRunner+Timeout.swift` | `SchedulerDueJobRunner`: `jobTimeoutSeconds`, `executeWithTimeout`; retains the actual body task and its returned result through stopped settlement |
+// Blueprint: | `SchedulerDueJobRunner+Timeout.swift` | `SchedulerDueJobRunner`, `jobTimeoutSeconds`, `executeWithTimeout` |
 
 // MARK: - Per-job timeouts
-//
-// A deadline requests cancellation; settlement joins the body before the
-// timeout receipt records its returned result and channel outcomes.
-// The enclosing managed-loop deadline bounds its caller while this body drains.
-//
-// FAIL LOUD, no retry: a timed-out job records status "error" with
-// failureKind == "job_timeout" and a stderr line — it is never silently retried
-// or swallowed.
+// A deadline requests cancellation; settlement joins the body before recording returned output and channels. The enclosing loop bounds its own wait; a
+// timed-out job stays an explicit job_timeout error and never reruns automatically.
 
 extension SchedulerDueJobRunner {
-    /// Per-job budget: 300s, or 1800s for long-running kinds. The enclosing
-    /// trigger-loop tick independently has a 1800s ceiling.
+    /// Per-job budget: 300s, or 1800s for long-running kinds. The enclosing trigger-loop tick independently has a 1800s ceiling.
     static let defaultJobTimeoutSeconds: Double = 300
     static let longJobTimeoutSeconds: Double = 1800
 
@@ -28,18 +21,11 @@ extension SchedulerDueJobRunner {
         }
     }
 
-    /// Run `execute(job:)` under the kind's deadline and return a JobResult.
-    /// Job errors and deadline expiry retain distinct error receipts.
-    ///
-    /// The race requests cancellation promptly. This method then joins actual
-    /// body exit before building a stopped result from its returned output and
-    /// receipts.
-    /// The manager may bound its own wait, but retains this body and prevents
-    /// another scheduled effect from overlapping it until settlement completes.
+    /// Keep job failure distinct from expiry. After requesting cancellation, join the body and retain its output and receipts; exclusion lasts through
+    /// settlement even if the manager stops waiting.
     func executeWithTimeout(job: DueJob) async -> JobResult {
         let seconds = Self.jobTimeoutSeconds(forKind: job.kind)
-        // The race selects the terminal reason; this task owns the actual body
-        // and keeps a result returned after cancellation wins that race.
+        // The race selects the terminal reason; this task owns the actual body and keeps a result returned after cancellation wins that race.
         let body = Task { [self] in
             try await execute(job: job)
         }

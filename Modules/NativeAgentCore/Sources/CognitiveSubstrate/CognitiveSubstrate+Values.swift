@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Values.swift` | `CognitiveSubstrate`: `metadataString`, `isConversationalPresenceStatement`, `isOperationalSubconsciousNoise` |
+// Blueprint: | `CognitiveSubstrate+Values.swift` | `CognitiveSubstrate` `metadataString` `isConversationalPresenceStatement` `isOperationalSubconsciousNoise` |
 
 extension CognitiveSubstrate {
     func metadataString(_ value: JSONValue?) -> String? {
@@ -11,7 +11,7 @@ extension CognitiveSubstrate {
     }
 
 
-    // The Desk owns task tracking when User asks; cognition does not extract commitments from conversation.
+    // The Desk owns requested tasks; cognition cannot extract commitments from conversation.
 
     func isConversationalPresenceStatement(_ lower: String) -> Bool {
         containsAny(lower, [
@@ -49,11 +49,7 @@ extension CognitiveSubstrate {
             "tool observation",
             "bridge-passthrough",
             "provider path is live",
-            // The microcycle's own pressure seed (+Workspace.swift). It is a
-            // runtime reading of uncertainty/task-pressure, not something she
-            // noticed — and because the text is byte-identical every cycle it
-            // held ~19 of 26 seed slots on the live install. Operational: never
-            // leads a capsule line or a shoulder tap.
+            // Runtime pressure is operational evidence, not a lived concern; it cannot lead a capsule cue or shoulder tap.
             "re-check high-pressure cognitive state",
         ])
     }
@@ -79,8 +75,7 @@ extension CognitiveSubstrate {
         ])
     }
 
-    /// Pure substring matching lets studio valence and relational warmth read
-    /// text without entering the actor.
+    /// Pure substring matching lets studio valence and relational warmth read text without entering the actor.
     nonisolated func containsAny(_ text: String, _ needles: [String]) -> Bool {
         needles.contains { text.contains($0) }
     }

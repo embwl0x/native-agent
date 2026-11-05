@@ -5,33 +5,21 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
-// Blueprint: | `ResidentWake.swift` | `ResidentWake`; one retained identity ledger for waking and accepted non-waking arrivals; declares its own session builder; care-bearing arrivals retain an optional care id for their reply's deferred reading; arrivals/claims stamp DataRootLife, restored work cannot wake or accept; retained habit receipts render as already_looked and forming suggestions ride their arrival; the existing ledger retains the latest 256 attempted habit occurrences and atomic carried-delivery settlement debts for bookkeeping-only launch/carried recovery |
+// Blueprint: | `ResidentWake.swift` | `ResidentWake`: one retained arrival and settlement ledger |
+// DataRootLife fences restored arrivals and claims from waking or acceptance.
+// Retain at most 256 attempted habit occurrences; carried-delivery debts settle bookkeeping only, without repeating effects.
 
-/// Her one way to be woken between turns. Something
-/// resolves (a reply lands with no turn of hers carrying it, a wake to another
-/// agent fails, an agent's local health goes bad or comes back) and becomes an
-/// arrival: kept here and on home at once. Only the wake is bounded:
-/// - one 60 s window from the first arrival gathers the rest into one wake;
-/// - a live turn of hers takes them at its next round; no second turn starts;
-/// - at most one wake every ten minutes: a wake is a whole turn, and anything
-///   later rides the next one or a live turn;
-/// - at most three wakes per thread until it rests an hour, so she and an
-///   agent cannot keep waking each other.
-/// Wakes wait for free time; AttentionRouter holds delivery to the person during quiet hours.
-/// No timer of its own: the delegation event runner reads `nextDeadline` and
-/// watches this ledger. Callers name a reason and the items; `reason` heads
-/// the wake ("what resolved").
+/// Arrivals are ready after their own declared hold. Cap each thread at three hops until an hour's rest to prevent wake loops, and keep arrivals visible
+/// on Home. Person delivery follows quiet-hour policy; the delegation runner watches the ledger and `nextDeadline`, so this owner adds no timer.
 package final class ResidentWake: @unchecked Sendable {
     package static let shared = ResidentWake()
-    /// Her own conversation for these wakes, never one of the person's chats.
+    /// Arrivals without a conversation have their own line; named arrivals return through that conversation's admission.
     package static let session = "resident-wake"
 
-    /// This owner corrects the older app/direct row before its next turn.
+    /// This owner normalizes its session's door before starting a turn.
     package static func openSession(dataRoot: URL) async throws {
         try await SessionConversation.declare(session, kind: .builder, title: "My work", source: "app", dataRoot: dataRoot)
     }
-    static let window: TimeInterval = 60
-    static let spacing: TimeInterval = 600
     static let maxHops = 3
     static let rest: TimeInterval = 3600
 
@@ -44,37 +32,34 @@ package final class ResidentWake: @unchecked Sendable {
         package var recoveredFrom: String?
         package var recovery: AgentLocalHealth?
         package var reason = ""
-        /// The care this arrival woke her about. Older arrivals carry none.
+        /// Keep the optional care binding so the reply can resume its owed reading.
         package var careID: UUID?
         /// A newer item on the same key replaces a pending one (one agent's health).
         package var key: String?
         /// Hop count: a wake carrying this thread is one hop.
         package var thread: String?
-        /// The stamp of the words the line quotes (a cached job reply's: the
-        /// route its ledger entry records); the turn carries its authority.
+        /// The stamp of the words the line quotes (a cached job reply's: the route its ledger entry records); the turn carries its authority.
         package var agent: String?
         package var filedAt: String?
         /// A promise waits for a change to this conversation's index row.
         package var routeWait: JSONValue?
         /// No other home line speaks of it, so home shows this one.
         package var home: Bool
-        /// It must still hold this long after arriving before it wakes her.
+        /// It must still hold this long after arriving before it wakes the agent.
         package var hold: TimeInterval
         package var at: Date
-        /// The conversation whose item or arrival this is: the wake carries its context.
+        /// This arrival's projected free-time deadline; every attempt rechecks its current condition and turn activity.
+        package var notBefore: Date?
+        /// The conversation this arrival belongs to. Helpers are not resident-turn targets.
         package var session: String?
         package var acceptedAt: Date?
         /// The carried item's material state when offered; notes are not material.
         package var materialFingerprint: String?
-        /// A prompt intention (clock, person or news). The historical `clock`
-        /// storage key stays readable; all prompt moments skip free-time quiet.
-        package var clock: Bool?
         /// A habit has already made this call; its wake starts from this receipt.
         package var habitReceipt: JSONValue?
         package var habitSuggestion: String?
 
-        /// Something she might share with the person. It wakes
-        /// her alone, never rides a live turn, and its reply is her message.
+        /// Shareable arrivals wake alone so their answer is the message, never context on another live turn.
         package var isReach: Bool { id.hasPrefix("reach:") }
 
         package var renderedLine: String {
@@ -105,12 +90,9 @@ package final class ResidentWake: @unchecked Sendable {
         var pending: [Item] = []
         /// Woken, taken or accepted without waking: dedupe and home under the existing retention policy.
         var recent: [Item] = []
-        var lastWake: Date?
         var hops: [String: Hop] = [:]
-        var notBefore: Date?
         var waitingForTurn: Bool?
-        /// Latest attempted occurrence per step, retained before execution so an
-        /// interrupted effect is handed to her, never automatically repeated.
+        /// Latest attempted occurrence per step, retained before execution so an interrupted effect is handed to the agent, never automatically repeated.
         var carriedRuns: [Item]?
         /// Delivered effects whose Desk notes/once-close still need keeping.
         var carriedSettlements: [CarriedSettlement]?
@@ -141,14 +123,13 @@ package final class ResidentWake: @unchecked Sendable {
             ledger.recent[index].state = "stopped"
             ledger.recent[index].reason = DataRootLife.stoppedReason
         }
-        if DataRootLife.life(of: ledger.lifeID) != life { ledger.notBefore = nil; ledger.waitingForTurn = nil; ledger.lifeID = life }
+        if DataRootLife.life(of: ledger.lifeID) != life { ledger.waitingForTurn = nil; ledger.lifeID = life }
         return ledger
     }
 
-    /// The edit's result once it is kept; nil when the ledger did not read or did not save.
+    /// Report an unkept edit as nil; unreadable or unwritable ledger state is not success.
     private func update<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> T? { kept(root, edit).flatMap { $0.saved ? $0.result : nil } }
 
-    /// `saved` is false when the changed ledger could not be written.
     func kept<T>(_ root: URL, _ edit: (inout Ledger) -> T) -> (result: T, saved: Bool)? {
         lock.withLock {
             var ledger: Ledger
@@ -168,10 +149,8 @@ package final class ResidentWake: @unchecked Sendable {
         }
     }
 
-    /// Keep these arrivals in the one identity ledger. A waking arrival goes
-    /// pending; one already accepted by its non-waking delivery owner goes
-    /// directly to recent, without adding a wake or another home line.
-    /// False when they could not be kept.
+    /// Keep these arrivals in the one identity ledger. A waking arrival goes pending; one already accepted by its non-waking delivery owner goes directly to
+    /// recent, without adding a wake or another home line. False when they could not be kept.
     @discardableResult
     package func request(dataRoot: URL, reason: String, items: [Item], waking: Bool = true) -> Bool {
         let life: String
@@ -197,13 +176,12 @@ package final class ResidentWake: @unchecked Sendable {
         }?.saved ?? false
     }
 
-    /// Whether this arrival is retained, pending or already hers.
     package static func knows(_ id: String, dataRoot: URL) -> Bool {
         guard let ledger = read(dataRoot) else { return false }
         return (ledger.pending + ledger.recent).contains { $0.id == id }
     }
 
-    /// Takes back a pending item on `key` that has not reached her (it flapped).
+    /// Retract pending items whose condition no longer holds.
     @discardableResult package func withdraw(dataRoot: URL, key: String) -> Bool {
         update(dataRoot) { ledger in
             let count = ledger.pending.count
@@ -212,9 +190,7 @@ package final class ResidentWake: @unchecked Sendable {
         } ?? false
     }
 
-    /// Takes back every arrival on `key`, pending or already hers: what
-    /// it said is no longer true, so its home line goes and a recurrence is a
-    /// new arrival.
+    /// Retract pending and accepted arrivals when their claim stops being true; a recurrence must be new.
     package func clear(dataRoot: URL, key: String) {
         _ = kept(dataRoot, { ledger in
             ledger.pending.removeAll { $0.key == key }
@@ -224,26 +200,25 @@ package final class ResidentWake: @unchecked Sendable {
 
     private static func due(_ ledger: Ledger) -> Date? {
         guard ledger.waitingForTurn != true else { return nil }
-        // A clock moment comes at its time; the spacing between wakes holds only
-        // the rest (10-31: three 9:00 moments queued, the check-in ran at 9:21).
-        let spaced = ledger.lastWake?.addingTimeInterval(spacing) ?? .distantPast
         return ledger.pending.filter({ $0.state != "stopped" && $0.routeWait == nil }).map { item in
-            let ready = item.at.addingTimeInterval(max(window, item.hold))
-            return item.clock == true ? ready : max(ready, spaced)
+            item.at.addingTimeInterval(item.hold)
         }.min()
     }
 
-    /// The loop's timer: arrivals and spacing, then the free law's last wait.
-    package func nextDeadline(dataRoot: URL) -> Date? {
+    /// The loop's deadline: each arrival's hold, then any declared free-time wait.
+    package func nextDeadline(dataRoot: URL, after now: Date) -> Date? {
         lock.withLock {
             guard let ledger = Self.read(dataRoot) else { return nil }
-            return Self.due(ledger).map { max($0, ledger.notBefore ?? .distantPast) }
+            return ledger.pending.filter {
+                $0.state != "stopped" && $0.routeWait == nil
+                    && (ledger.waitingForTurn != true || ($0.session != nil && $0.session != Self.session))
+            }.map {
+                max($0.at.addingTimeInterval($0.hold), $0.notBefore ?? .distantPast)
+            }.filter { $0 > now }.min()
         }
     }
 
-    /// Whether arrivals are due, apart from the stored wait: freedom is
-    /// recomputed by the caller's free law every time, so a wait written under
-    /// another process or another law never holds the door by itself.
+    /// Recompute freedom on every attempt; a stored wait from another process or law cannot hold the door by itself.
     package func arrivalsDue(dataRoot: URL) -> Date? {
         lock.withLock { Self.read(dataRoot).flatMap(Self.due) }
     }
@@ -254,26 +229,28 @@ package final class ResidentWake: @unchecked Sendable {
     }
 
     private static func readyItems(_ ledger: Ledger, now: Date) -> [Item] {
-        var ready = ledger.pending.filter { $0.state != "stopped" && $0.routeWait == nil && now.timeIntervalSince($0.at) >= $0.hold }
-        // A reach's reply is the message itself, so it wakes alone.
-        if ready.contains(where: { !$0.isReach }) { ready.removeAll(where: \.isReach) }
-        return ready
+        ledger.pending.filter { $0.state != "stopped" && $0.routeWait == nil && now.timeIntervalSince($0.at) >= $0.hold }
     }
 
-    /// The wake, when one is due and no turn of hers is running: its text,
-    /// every agent whose words it quotes, and its items. Taken items are hers
-    /// from here, once; a turn that fails is not rerun, and they stay on home.
-    package func claim(dataRoot: URL, now: Date = Date(), prepared: [Item]? = nil)
+    /// Take a due wake once, with every quoted peer; failed turns are not replayed and their items remain visible on Home.
+    package func claim(dataRoot: URL, now: Date = Date(), prepared: [Item]? = nil, conversation: String? = nil)
         -> (text: String, items: [Item])? {
         let claim = kept(dataRoot) { ledger -> (text: String, items: [Item])? in
-            guard let due = Self.due(ledger), due <= now else { return nil }
+            if let conversation {
+                // Another conversation's admission is independent of the resident line's open turn.
+                guard conversation != Self.session, let prepared, !prepared.isEmpty,
+                      prepared.allSatisfy({ $0.session == conversation }) else { return nil }
+            } else {
+                guard let due = Self.due(ledger), due <= now else { return nil }
+            }
             var ready = Self.readyItems(ledger, now: now)
             if let prepared {
                 // Preparation refreshes the payload, retaining the arrival identity.
                 guard prepared.allSatisfy({ item in ready.contains { $0.id == item.id } }) else { return nil }
                 ready = prepared
             }
-            ledger.notBefore = nil
+            // Choose after free-time preparation: a held carried step cannot hold Reach, whose reply must still be the message itself.
+            if ready.contains(where: { !$0.isReach }) { ready.removeAll(where: \.isReach) }
             ledger.pending.removeAll { item in ready.contains { $0.id == item.id } }
             ledger.recent += ready
             var wake: [Item] = []
@@ -295,19 +272,29 @@ package final class ResidentWake: @unchecked Sendable {
             }
             ledger.hops = ledger.hops.filter { now.timeIntervalSince($0.value.at) <= Self.rest }
             guard !wake.isEmpty else { return nil }
-            ledger.lastWake = now
             return (Self.text(wake, live: false), wake)
         }
         guard let claim, claim.saved else { return nil }
         return claim.result
     }
 
-    package func wait(dataRoot: URL, until: Date?) {
-        update(dataRoot) { $0.notBefore = until; $0.waitingForTurn = until == nil ? true : nil }
+    package func wait(dataRoot: URL, until: Date?, items: Set<String> = []) {
+        update(dataRoot) { ledger in
+            ledger.waitingForTurn = until == nil ? true : nil
+            for index in ledger.pending.indices where items.contains(ledger.pending[index].id) {
+                ledger.pending[index].notBefore = until
+            }
+        }
     }
 
     package func turnEnded(dataRoot: URL) {
-        update(dataRoot) { if $0.waitingForTurn == true { $0.waitingForTurn = nil } }
+        update(dataRoot) {
+            if $0.waitingForTurn == true { $0.waitingForTurn = nil }
+            // Free-time arrivals recheck the actual open windows on this edge, without a clock while a conversation stays open.
+            for index in $0.pending.indices where $0.pending[index].state != "stopped" && $0.pending[index].routeWait == nil {
+                $0.pending[index].notBefore = Date()
+            }
+        }
     }
 
     package static func routeRevision(rows: [[String: JSONValue]], session: String?) -> JSONValue {
@@ -318,7 +305,8 @@ package final class ResidentWake: @unchecked Sendable {
     package func waitForRoute(dataRoot: URL, key: String, revision: JSONValue) throws {
         guard kept(dataRoot, { ledger in
             guard let index = ledger.pending.firstIndex(where: { $0.key == key }),
-                  ((try? Self.routeRevision(rows: HumanConversationIndex.rows(dataRoot: dataRoot), session: ledger.pending[index].session)) ?? .null) == revision else { return }
+                  ((try? Self.routeRevision(rows: HumanConversationIndex.rows(dataRoot: dataRoot), session: ledger.pending[index].session))
+                      ?? .null) == revision else { return }
             ledger.pending[index].routeWait = revision
         })?.saved == true else { throw PersistenceCoreError.ioFailure("The promise's route wait could not be saved.") }
     }
@@ -337,14 +325,14 @@ package final class ResidentWake: @unchecked Sendable {
         }
     }
 
-    /// A live turn of hers takes what has arrived at its next round: one
-    /// brain, no second turn. Only arrivals quoting no agent: those wait for
-    /// the wake, so they never put a peer's taint on the person's own turn.
+    /// Unaddressed arrivals quoting no agent can join the agent's next round. Named arrivals belong to their conversation's admission;
+    /// peer words wait for a turn carrying their authority.
     package func take(dataRoot: URL, now: Date = Date()) -> (text: String, items: [Item])? {
         let taken = kept(dataRoot) { ledger -> (text: String, items: [Item])? in
             let ready = ledger.pending.filter {
                 $0.state != "stopped" && now.timeIntervalSince($0.at) >= $0.hold && $0.agent == nil && !$0.isReach
                     && $0.key?.hasPrefix("carry.") != true
+                    && ($0.session == nil || $0.session == Self.session)
             }
             guard !ready.isEmpty else { return nil }
             ledger.pending.removeAll { item in ready.contains { $0.id == item.id } }
@@ -376,7 +364,7 @@ package final class ResidentWake: @unchecked Sendable {
         return true
     }
 
-    package func accept(dataRoot: URL, id: String?) throws -> String {
+    package func accept(workspace: WorkspaceOperation, dataRoot: URL, id: String?) throws -> String {
         let ledger = try Self.checkedRead(dataRoot)
         let items = ledger.recent.filter { $0.state != "stopped" && $0.acceptedAt == nil && (id == nil || $0.id == id) }
         guard accept(dataRoot: dataRoot, items: items) else {
@@ -386,18 +374,17 @@ package final class ResidentWake: @unchecked Sendable {
         for item in items {
             if let peer = item.agent {
                 ContactThread.consume(.init(text: item.line, stamp: .init(source: peer, steeredBy: [], contact: true)),
-                    mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })
+                    mark: { peer, _ in workspace.ports.tools.markConsumed(peer: peer) })
             }
         }
         return items.isEmpty ? "No claimed arrivals await acceptance." : Self.text(items, live: true)
     }
 
-    /// Home's own lines: arrivals, pending or not, that no other line names;
-    /// and how many she was shown and has not accepted (MY QUEUE, not a repair).
-    static func homeItems(_ root: URL) -> (items: [Item], toAccept: Int) {
-        guard let ledger = read(root) else { return ([], 0) }
+    /// Home's own lines: arrivals, pending or not, that no other line names; and how many the agent was shown and has not accepted (MY QUEUE, not a repair).
+    static func homeItems(_ root: URL) throws -> (items: [Item], acceptable: Set<String>) {
+        let ledger = try checkedRead(root)
         return ((ledger.pending + ledger.recent).filter { $0.home || $0.acceptedAt == nil },
-                ledger.recent.filter { $0.state != "stopped" && $0.acceptedAt == nil }.count)
+                Set(ledger.recent.filter { $0.state != "stopped" && $0.acceptedAt == nil }.map(\.id)))
     }
 
     package static func text(_ items: [Item], live: Bool) -> String {

@@ -24,8 +24,6 @@ import DeviceSync
 
 @MainActor
 extension AppModel {
-    /// Guidance text to show in chat when no AI provider is usable at all;
-    /// `nil` when at least one provider looks connected.
     func missingProviderChatGuidance() -> String? {
         guard engine.providers.settings != nil, !engine.providers.hasReadyConnection else { return nil }
         return """
@@ -80,7 +78,7 @@ extension AppModel {
         }
     }
 
-    /// Refresh the engine's checked provider presentation for every door.
+    /// Every door must share the engine's checked provider presentation.
     @MainActor
     @discardableResult
     func loadProvidersForChat() async -> Bool {
@@ -100,9 +98,7 @@ extension AppModel {
         )
     }
     // MARK: Providers
-    /// The provider sheet's Remove the key, which provider.disconnect runs
-    /// too: the registry row, then the sign-in. `detail` is the sheet's status
-    /// line; `ok` false claims no removal.
+    /// Remove the registry row before sign-in; only a durable removal may claim success.
     func disconnectProvider(_ id: String) async -> (ok: Bool, detail: String, cause: String?) {
         do {
             let result = try await engine.providers.disconnectProvider(id)
@@ -125,7 +121,6 @@ extension ProvidersFacade.ChatBrainSaveResult {
         }
     }
 
-    /// What the agent's tool result says: the same line plus the raw cause.
     var agentMessage: String {
         if case .failed(_, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
         return userMessage

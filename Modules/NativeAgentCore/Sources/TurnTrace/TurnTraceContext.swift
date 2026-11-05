@@ -1,10 +1,8 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `TurnTraceContext.swift` | Request-scoped turn identity, origin, reply route and stable reply-row correlation |
+// Blueprint: | `TurnTraceContext.swift` | Trace-only correlation; reply-row identity is held on `Turn.replyRow` |
 
-/// Task-local turn identity and reply correlation, inherited by tasks created
-/// inside the binding. Unbound emitters retain standalone receipts with
-/// turnId "unknown"; context-based bus emission requires a bound turn.
+/// Trace correlation only. Decisions and writes read the explicit Turn instead.
 public enum TurnTraceContext {
     @TaskLocal public static var turnId: String?
     /// Native work keeps its receipts but is not a choice made by the mind.
@@ -12,19 +10,11 @@ public enum TurnTraceContext {
     /// Optional request-scoped bus; context emitters otherwise use `.shared`.
     @TaskLocal public static var bus: TurnTraceBus?
 
-    /// The reply route's conversation and thread, bound beside turnId so every
-    /// event captures them before detached persistence. Nil without a return route.
+    /// The reply route's conversation and thread, bound beside turnId so every event captures them before detached persistence. Nil without a return route.
     @TaskLocal public static var destinationId: String?
     @TaskLocal public static var threadId: String?
 
-    /// The row a surface is already drawing this turn's reply in. The turn's
-    /// answer is written under that id, so the reply the person watched arrive
-    /// is the row that stays: nothing is swapped out when it lands.
-    @TaskLocal public static var replyRow: ReplyRow?
-
-    /// One session's row for one turn. A writer adopts its id only for that
-    /// same turn in that same session: a helper called inside her turn writes
-    /// its own conversation, so it never takes her reply row's id.
+    /// Adopt reply identity only in its own session and turn so nested helper conversations cannot take the parent's row.
     public struct ReplyRow: Sendable, Equatable {
         public let turnId: String
         public let sessionId: String
@@ -40,8 +30,7 @@ public enum TurnTraceContext {
         }
     }
 
-    /// Mint a fresh UUID-based turn id. Lowercased to match the row-id
-    /// convention used across the trace writers.
+    /// Lowercase UUIDs to match trace row identity conventions.
     public static func mintTurnId() -> String {
         UUID().uuidString.lowercased()
     }

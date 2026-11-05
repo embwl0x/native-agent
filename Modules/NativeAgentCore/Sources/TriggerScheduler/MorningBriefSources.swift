@@ -4,12 +4,11 @@ import NativeAgentCore
 import PersistenceCore
 import Privacy
 import Desk
-import WorkshopExecution
 import NotificationInbox
-// Blueprint: | `MorningBriefSources.swift` | Frozen checked Desk, Workshop, inbox, session and bounded parsed/redacted worklog observations; only consumed fields enter the part, with native row validity and unavailable/empty distinctions; native local-day and date-label facts |
+import Experiences
+// Blueprint: | `MorningBriefSources.swift` | Checked brief sources; unread notes read ForPerson's in-memory inbox |
 
-/// The scheduler supplies checked observations, never a brief or model prompt.
-/// Each source says unavailable, ready (possibly empty), or unconfigured.
+/// The scheduler supplies checked observations, never a brief or model prompt. Each source says unavailable, ready (possibly empty), or unconfigured.
 public struct MorningBriefSources: Sendable {
     let root: URL
     let now: Date
@@ -34,7 +33,7 @@ public struct MorningBriefSources: Sendable {
             "operation": .string("brief"), "dayLabel": .string(formatter.string(from: now)),
             "now": .string(NativeTimestampFormat.fractionalUTCOffset(now)),
             "yesterday": .string(NativeTimestampFormat.fractionalUTCOffset(yesterday)),
-            "desk": await desk(), "worklog": worklog(), "workshop": await workshop(),
+            "desk": await desk(), "worklog": worklog(),
             "inbox": await inbox(),
             "sessions": jsonArray(root.appendingPathComponent("chat/sessions.json")),
         ])
@@ -45,19 +44,8 @@ public struct MorningBriefSources: Sendable {
             let state = try await SwiftNativeDeskStore(dataRoot: root).liveState()
             return .object(["state": .string("ready"),
                 "statuses": .array(state.items.map { .string($0.status.rawValue) }),
-                // Desk owns the projection's readiness and dependency truth.
+                // Read readiness and dependencies from Desk's owner.
                 "body": .string(NativeAppSecretRedactor.redactText(DeskPage.render(state, now: now)))])
-        } catch { return unavailable(error) }
-    }
-
-    private func workshop() async -> JSONValue {
-        do {
-            let rows = try await SwiftNativeWorkshopRunner(root: root)
-                .listWorkshopExecutions()
-            return checked(rows, fields: ["status", "completedAt", "completed_at", "updatedAt", "updated_at"]) { row in
-                guard case .string(let status)? = row["status"] else { return false }
-                return !status.isEmpty && status.lowercased() != "corrupt"
-            }
         } catch { return unavailable(error) }
     }
 
@@ -75,15 +63,13 @@ public struct MorningBriefSources: Sendable {
 
     private func inbox() async -> JSONValue {
         do {
-            let rows = try await LiveNotificationInbox.live(dataRoot: root).rows()
-            let items = try InboxItemRecord.latest(in: rows)
+            let items = try await ForPerson.at(root).inbox()
             return .object(["state": .string("ready"),
                 "unread": .int(Int64(items.filter { $0.status == "unread" }.count))])
         } catch { return unavailable(error) }
     }
 
-    /// Only parsed, redacted summary fields leave this native reader; neither
-    /// the private worklog's raw bytes nor unrelated fields enter her part.
+    /// Only parsed, redacted summary fields leave this native reader; neither the private worklog's raw bytes nor unrelated fields enter the agent's part.
     private func worklog() -> JSONValue {
         guard let worklogPath else { return .object(["state": .string("unconfigured")]) }
         do {
@@ -105,8 +91,7 @@ public struct MorningBriefSources: Sendable {
         catch { return unavailable(error) }
     }
 
-    /// Storage validity stays native. Unused fields, including card payloads,
-    /// never enter the part; readable rows may accompany unavailable evidence.
+    /// Storage validity stays native. Unused fields, including card payloads, never enter the part; readable rows may accompany unavailable evidence.
     private func checked(_ rows: [JSONValue], fields: Set<String>,
         valid: ([String: JSONValue]) -> Bool) -> JSONValue {
         var available = true

@@ -1,41 +1,31 @@
 import NativeAgentShared
-import Transcripts
 import Foundation
 import PersistenceCore
-// Blueprint: | `DeskCadence.swift` | Checked carried-step provenance and conditions, cadence and notification policies; optional fields follow the current writers' omission rules; invalid present values never become fresh defaults |
+// Blueprint: | `DeskCadence.swift` | Checked step provenance and cadence; malformed saved values cannot become defaults |
 
-/// Carried work's words, readiness, planned call and originating turn. An inferred step keeps its source sentence; every step keeps its peer steering.
+/// Inferred work keeps its source sentence; every step preserves peer steering.
 public struct DeskStep: Sendable, Equatable {
     public var lifeID: String?
     public var status: String?
     public var reason: String?
     public var words: String
-    /// `next_turn`, `own_turn`, `when_user_messages[ <door>]`, `after_card`, `at <ISO time>`, `every` (its `rhythm`); local date/time input normalizes to an absolute `at`.
     public var when: String
-    /// An intention's clock: a schedule in the scheduler's own grammar (daily, weekly, cron…), read by `IntentionClock`.
     public var rhythm: JSONValue?
-    /// First unconsumed clock occurrence carried from a retired scheduler job.
-    /// Unlike filedAt, this is a clock anchor, not the time she filed the step.
+    /// The carried clock anchor and job identity make interrupted imports idempotent.
     public var clockStart: String?
-    /// Retired scheduler identity: retries find this step even if it has closed.
     public var scheduledJobID: String?
-    /// When it is done: `at <ISO time>` ends it then; `standing` keeps a rhythm until dropped; other words are hers to check.
     public var until: String?
-    /// Fixed words for the person, said as they are when its moment comes.
     public var say: String?
     public var card: String?
-    /// A call through her ordinary door, {action, args?}; old strings mean {action: string}.
     public var action: JSONValue?
     public var source: String?
     public var peers: [String]
     public var elevated: [String]
-    /// The originating conversation: a wake that works it carries that conversation's context.
+    /// Resume with the originating conversation's context, never a later message's door.
     public var session: String?
-    /// `person`, `agent:<name>` or `self`; nil on older steps.
     public var origin: String?
-    /// When the current readiness condition was filed.
     public var filedAt: String?
-    /// The originating turn's durable envelope, never a later message's door.
+    /// Keep the originating turn's durable route so later messages cannot redirect carried work.
     public var replyRoute: JSONValue?
 
     public init(words: String, when: String, card: String? = nil, action: JSONValue? = nil, source: String? = nil,
@@ -57,13 +47,15 @@ public struct DeskStep: Sendable, Equatable {
         guard let words = obj["words"]?.stringValue, let when = obj["when"]?.stringValue,
               !when.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               MyQueue.When(when, card: obj["card"]?.stringValue) != nil,
-              DeskJSON.optionalStringsAreValid(obj, keys: ["card", "source", "session", "origin", "filedAt", "lifeID", "status", "reason", "until", "say", "clockStart", "scheduledJobID"]),
+              DeskJSON.optionalStringsAreValid(obj, keys: ["card", "source", "session", "origin", "filedAt", "lifeID", "status", "reason", "until", "say",
+                  "clockStart", "scheduledJobID"]),
               let peers = DeskJSON.strings(obj["peers"]),
               let elevated = DeskJSON.strings(obj["elevated"]) else { return nil }
         if let value = obj["replyRoute"] {
             guard case .object(let route) = value,
                   let surface = route["surface"]?.stringValue, !surface.isEmpty,
-                  route.values.allSatisfy({ $0.stringValue != nil }) else { return nil }
+                  // The route is TurnEnvelope.persistedMetadata(): text fields plus one Boolean, declaredRemote.
+                  route.allSatisfy({ $0.key == "declaredRemote" ? $0.value.boolValue != nil : $0.value.stringValue != nil }) else { return nil }
         }
         if let filed = obj["filedAt"]?.stringValue, DeskClock.parseISO(filed) == nil { return nil }
         if let value = obj["rhythm"], value.objectValue == nil { return nil }
@@ -83,7 +75,9 @@ public struct DeskStep: Sendable, Equatable {
 
     var fields: [String: JSONValue] {
         var obj: [String: JSONValue] = ["words": .string(words), "when": .string(when)]
-        for (key, value) in [("card", card), ("source", source), ("session", session), ("origin", origin), ("filedAt", filedAt), ("lifeID", lifeID), ("status", status), ("reason", reason), ("until", until), ("say", say), ("clockStart", clockStart), ("scheduledJobID", scheduledJobID)] {
+        for (key, value) in [("card", card), ("source", source), ("session", session), ("origin", origin), ("filedAt",
+            filedAt), ("lifeID", lifeID), ("status", status), ("reason", reason), ("until", until), ("say",
+            say), ("clockStart", clockStart), ("scheduledJobID", scheduledJobID)] {
             if let value, !value.isEmpty { obj[key] = .string(value) }
         }
         if !peers.isEmpty { obj["peers"] = .array(peers.map(JSONValue.string)) }
@@ -117,13 +111,8 @@ public struct DeskStep: Sendable, Equatable {
         scheduledJobID = previous.scheduledJobID
     }
 
-    public func owedToPerson(dataRoot: URL) -> Bool {
-        if let origin { return origin == "person" }
-        // Older steps recorded only their conversation, or an inferred promise.
-        let kind = SessionConversation.kind(session, dataRoot: dataRoot, includingArchived: true)
-        return source?.hasPrefix("Repeated work: ") != true
-            && kind?.isPeerConversation != true && kind?.isOwnWork != true && (session != nil || source != nil)
-    }
+    /// Every writer records who the step came from; the person's steps are the ones owed to them.
+    public var owedToPerson: Bool { origin == "person" }
 }
 
 // MARK: - Cadence / NotifyPolicy / Note
@@ -186,7 +175,7 @@ public struct Cadence: Sendable, Equatable {
 
 public struct NotifyPolicy: Sendable, Equatable {
     public var level: NotifyLevel
-    public var on: [String]               // state_change, blocked, done, explicit
+    public var on: [String]
     public var cooldown: String?
     public var lastNotifiedAt: String?
     public var notifyReason: String?

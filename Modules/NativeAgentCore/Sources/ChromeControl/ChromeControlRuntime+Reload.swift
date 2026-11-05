@@ -5,11 +5,10 @@ import PersistenceCore
 import NativeAgentCore
 import TrustCenter
 import MacControl
-// Blueprint: | `ChromeControlRuntime+Reload.swift` | `ChromeControlRuntime` reload members: one optional accepted running-code/folder-code comparison serves setup, current status and reload settlement at the shipped version; manifest/file observations and attempts, unavailable identity never matches, browser process identity and listener generation fence proof |
+// Blueprint: | `ChromeControlRuntime+Reload.swift` | `ChromeControlRuntime`; Accepted identity alone proves reload. |
 
 extension ChromeControlRuntime {
-    /// One current-code comparison for setup, status and reload settlement.
-    /// Nil means identity has not been observed, never a match or mismatch.
+    /// Setup, status and settlement share one comparison; unobserved identity proves neither match nor mismatch.
     var acceptedExtensionMatchesFolder: Bool? {
         guard readyChannel != nil, let files = extensionFiles,
               let version = facts.extensionVersion,
@@ -74,7 +73,8 @@ extension ChromeControlRuntime {
                 "running_code": facts.extensionCode.map(JSONValue.string) ?? .null,
                 "folder_code": files.code.map(JSONValue.string) ?? .null,
                 "reason": .string("The accepted extension's running code matches the registered folder at the shipped version."),
-                "provenance": .string("raw view · accepted Chrome extension greeting and registered folder code digest; previous reload attempts are last-seen history."),
+                "provenance": .string(
+                    "raw view · accepted Chrome extension greeting and registered folder code digest; previous reload attempts are last-seen history."),
             ])
         }
         // A stored successful reload is history, not proof of current code.
@@ -83,7 +83,7 @@ extension ChromeControlRuntime {
         return .null
     }
 
-    func readExtensionFiles(fresh: Bool = false) {
+    func readExtensionFiles(fresh: Bool = false, context: MacOperationContext) {
         // Content follows file events; permission-only changes need an access check.
         let access = Dictionary(uniqueKeysWithValues: extensionFilePaths.map {
             ($0, FileManager.default.isReadableFile(atPath: $0.path))
@@ -114,32 +114,31 @@ extension ChromeControlRuntime {
         extensionFileTask = Task { [weak self] in
             for await _ in events.stream {
                 guard !Task.isCancelled else { return }
-                await self?.extensionFilesChanged(events)
+                await self?.extensionFilesChanged(events, context: context)
             }
         }
         // The initial edge after FileChangeEvents arms closes the read-before-watch gap.
     }
 
-    private func extensionFilesChanged(_ events: FileChangeEvents) async {
+    private func extensionFilesChanged(_ events: FileChangeEvents, context: MacOperationContext) async {
         guard extensionFileEvents === events, !Task.isCancelled else { return }
-        readExtensionFiles(fresh: true)
+        readExtensionFiles(fresh: true, context: context)
         guard extensionFileEvents === events, !Task.isCancelled else { return }
-        await reloadIfNeeded()
+        await reloadIfNeeded( context: context)
     }
 
-    /// The explicit reversible verb can retry a failed/stale automatic attempt.
-    /// Completion follows accepted attach, never an elapsed reconnect timer.
-    public func reloadExtension(source: ReloadSource = .manual) async throws -> JSONValue {
-        try await authorizeEffect()
+    /// Explicit retry remains available; only an accepted attach completes reload.
+    public func reloadExtension(source: ReloadSource = .manual, turn: Turn, context: MacOperationContext) async throws -> JSONValue {
+        try await authorizeEffect(origin: turn.chromeOrigin, turn: turn)
         if extensionReload?.pending == true {
             let browsers = await Self.runningChromeProcesses()
             reconcileReloadBrowser(browsers)
         }
         if extensionReload?.pending != true {
-            readExtensionFiles()
+            readExtensionFiles( context: context)
             do {
-                guard let channel else { throw await connectionFailure() }
-                try await beginExtensionReload(on: channel, source: source)
+                guard let channel else { throw await connectionFailure( context: context) }
+                try await beginExtensionReload(on: channel, source: source, context: context)
             } catch {
                 return recordReloadPreflightFailure(error, source: source)
             }
@@ -149,7 +148,7 @@ extension ChromeControlRuntime {
         try Task.checkCancellation()
         let response = ReloadWait()
         reloadWaiters[waiter] = response
-        await response.done.park()
+        await response.done.park(budget: context.waitBudget)
         reloadWaiters.removeValue(forKey: waiter)
         guard let result = response.result else { throw CancellationError() }
         return try result.get()
@@ -164,8 +163,10 @@ extension ChromeControlRuntime {
             "after_version": .null, "shipped_version": extensionFiles.map { .string($0.shippedVersion) } ?? .null,
             "extension_path": extensionFiles.map { .string($0.path) } ?? .null,
             "completed_at": Self.dateJSON(Date()),
-            "reason": .string("Extension reload unavailable: \(error.localizedDescription). Call chrome.reload_extension after resolving this reason; no automatic retry."),
-            "provenance": .string("raw view · Chrome reload preflight, native connection and registered unpacked manifest; no reload was dispatched and no page was read."),
+            "reason": .string(
+                "Extension reload unavailable: \(error.localizedDescription). Call chrome.reload_extension after resolving this reason; no automatic retry."),
+            "provenance": .string(
+                "raw view · Chrome reload preflight, native connection and registered unpacked manifest; no reload was dispatched and no page was read."),
         ]
         if let failure = error as? ToolFailureError, let owner = failure.owner {
             fields["remedy"] = Repair.remedy(owner: owner,
@@ -184,7 +185,9 @@ extension ChromeControlRuntime {
 
     func extensionReloadFailed(id: String, reason: String) {
         guard extensionReload?.id == id else { return }
-        finishExtensionReload(phase: "failed", reason: "Extension reload failed: \(reason). Call chrome.reload_extension to try explicitly; no automatic retry.")
+        finishExtensionReload(
+            phase: "failed",
+            reason: "Extension reload failed: \(reason). Call chrome.reload_extension to try explicitly; no automatic retry.")
     }
 
     func finishExtensionReload(phase: String, after: String? = nil, afterCode: String? = nil, folderCode: String? = nil, reason: String? = nil) {
@@ -209,14 +212,14 @@ extension ChromeControlRuntime {
         }
     }
 
-    private func beginExtensionReload(on connection: ChromeControlChannel, source: ReloadSource) async throws {
+    private func beginExtensionReload(on connection: ChromeControlChannel, source: ReloadSource, context: MacOperationContext) async throws {
         guard extensionCanReload else {
             throw ToolFailureError("This Chrome extension needs to be loaded again.", effects: .none,
                 owner: "Chrome / extension reload protocol",
                 nextCall: ToolFailureError.call("app", ["action": .string("chrome.setup")]))
         }
         try ChromeExtensionFolder.prepare()
-        readExtensionFiles(fresh: true)
+        readExtensionFiles(fresh: true, context: context)
         guard let files = extensionFiles, let before = facts.extensionVersion,
               let pid = connectedBrowserPID, pid > 1,
               let birthStamp = ChromeHostIdentity.processBirthStamp(pid) else {
@@ -227,7 +230,9 @@ extension ChromeControlRuntime {
         }
         // Reload reads Chrome's registered folder, which must hold the shipped version.
         guard files.diskVersion == files.shippedVersion else {
-            throw ToolFailureError("Chrome's extension folder (\(files.path)) holds \(files.diskVersion), not the shipped \(files.shippedVersion). Load the current copy.", effects: .none,
+            throw ToolFailureError("""
+                Chrome's extension folder (\(files.path)) holds \(files.diskVersion), not the shipped \(files.shippedVersion). Load the current copy.
+                """, effects: .none,
                 owner: "Chrome / registered extension folder",
                 nextCall: ToolFailureError.call("app", ["action": .string("chrome.setup")]))
         }
@@ -249,7 +254,7 @@ extension ChromeControlRuntime {
             }
         }
         do {
-            let response = try await connection.request(action: .reloadExtension, payload: ["reloadId": .string(id)])
+            let response = try await connection.request(action: .reloadExtension, payload: ["reloadId": .string(id)], context: context)
             guard generation == listenerGeneration else { return }
             guard case .object(let envelope) = response, case .object(let result)? = envelope["result"],
                   result["reloadId"] == .string(id), result["beforeVersion"] == .string(before),
@@ -268,12 +273,16 @@ extension ChromeControlRuntime {
                 if case ChromeControlRuntimeError.outcomeUnknown = error, extensionReload?.pending == true {
                     // Lost acknowledgement/cancellation preserves the dispatched reload until reconnect/termination.
                     extensionReload?.phase = "awaiting_reconnect"
-                    extensionReload?.reason = "Reload dispatch is unconfirmed: \(error.localizedDescription). Awaiting an accepted reconnect; no automatic retry."
+                    extensionReload?.reason = """
+                        Reload dispatch is unconfirmed: \(error.localizedDescription). Awaiting an accepted reconnect; no automatic retry.
+                        """
                     // The pre-dispatch record preserves process and ID across later storage failures.
                     facts.extensionReload = extensionReload?.receipt
                     saveConnectionFacts()
                 } else {
-                    finishExtensionReload(phase: "failed", reason: "Extension reload failed: \(error.localizedDescription). Call chrome.reload_extension to try explicitly; no automatic retry.")
+                    finishExtensionReload(
+                        phase: "failed",
+                        reason: "Extension reload failed: \(error.localizedDescription). Call chrome.reload_extension to try explicitly; no automatic retry.")
                 }
             }
         }
@@ -281,22 +290,26 @@ extension ChromeControlRuntime {
 
     private func reconnectOverdue(_ id: String) {
         guard extensionReload?.id == id, extensionReload?.phase == "awaiting_reconnect" else { return }
-        finishExtensionReload(phase: "unconfirmed", reason: "The extension did not reconnect after the reload; its effect is unknown. Check chrome.status; no automatic retry.")
+        finishExtensionReload(
+            phase: "unconfirmed",
+            reason: "The extension did not reconnect after the reload; its effect is unknown. Check chrome.status; no automatic retry.")
     }
 
     func reconcileReloadBrowser(_ browsers: [pid_t]) {
         if let attempt = extensionReload, attempt.pending,
            !browsers.contains(attempt.browserPID) || ChromeHostIdentity.processBirthStamp(attempt.browserPID) != attempt.browserBirthStamp {
-            finishExtensionReload(phase: "failed", reason: "Chrome's browser process ended before the extension's reload could be verified. Call chrome.reload_extension after Chrome reconnects.")
+            finishExtensionReload(
+                phase: "failed",
+                reason: "Chrome's browser process ended before the extension's reload could be verified. Call chrome.reload_extension after Chrome reconnects.")
         }
     }
 
-    func reloadIfNeeded() async {
+    func reloadIfNeeded( context: MacOperationContext) async {
         if extensionReload?.pending != true, let next = channel, let files = extensionFiles, let running = facts.extensionVersion,
            ChromeExtensionFiles.isOlder(running, than: files.shippedVersion) {
             let pair = files.shippedVersion + "/" + running
             if await transportAvailable(), channel === next, automaticReloadPairs.insert(pair).inserted {
-                do { try await beginExtensionReload(on: next, source: .automatic) }
+                do { try await beginExtensionReload(on: next, source: .automatic, context: context) }
                 catch { _ = recordReloadPreflightFailure(error, source: .automatic) }
             }
         }

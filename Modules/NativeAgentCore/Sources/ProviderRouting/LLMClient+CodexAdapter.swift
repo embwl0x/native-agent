@@ -4,11 +4,10 @@ import Synchronization
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `LLMClient+CodexAdapter.swift` | `CodexProcess`: streaming and buffered Codex runners share strict per-pipe incremental UTF-8 decoding, retaining valid prefixes and raw invalid suffixes on failure; pins the shared credential resolver's path for account controls, child-home binding and preparation; never lets the CLI select another credential; NativeAgentCore's ProcessPipeDrain owns shared nonblocking pipe capture without an executor dependency |
+// Blueprint: | `LLMClient+CodexAdapter.swift` | `CodexProcess`: one process lifecycle; strict UTF-8 pipes |
 
-/// One strict decoder for each Codex pipe, shared by both runners. Only an
-/// incomplete scalar waits for another read. Invalid bytes and their entire
-/// suffix stay owned as raw evidence; valid text before them remains available.
+/// One strict decoder for each Codex pipe, shared by both runners. Only an incomplete scalar waits for another read. Invalid bytes and their entire suffix
+/// stay owned as raw evidence; valid text before them remains available.
 final class CodexUTF8Output: @unchecked Sendable {
     struct Snapshot: Sendable {
         let text: String
@@ -35,8 +34,7 @@ final class CodexUTF8Output: @unchecked Sendable {
                 default: invalid = true; width = 0
                 }
                 guard !invalid else { break }
-                // Validate available continuation bytes even on a split scalar;
-                // overlong encodings, surrogates and > U+10FFFF are invalid now.
+                // Validate available continuation bytes even on a split scalar; overlong encodings, surrogates and > U+10FFFF are invalid now.
                 for offset in 1..<width {
                     guard cursor + offset < pending.count else { break }
                     let byte = pending[cursor + offset]
@@ -65,8 +63,7 @@ final class CodexUTF8Output: @unchecked Sendable {
     }
 }
 
-/// The process has settled; valid prefixes and exact undecodable pipe bytes
-/// stay on this error. Neither diagnostic prose nor logs publish raw bytes.
+/// The process has settled; valid prefixes and exact undecodable pipe bytes stay on this error. Neither diagnostic prose nor logs publish raw bytes.
 struct CodexOutputEncodingFailure: Error, Sendable, LocalizedError, ProviderFailureWrapping {
     let stdout: CodexUTF8Output.Snapshot
     let stderr: CodexUTF8Output.Snapshot
@@ -74,7 +71,11 @@ struct CodexOutputEncodingFailure: Error, Sendable, LocalizedError, ProviderFail
     var providerWorkState: ProviderFailure.WorkState? { .outcomeUnknown }
     var errorDescription: String? { detail }
     private var detail: String {
-        "Codex output was not valid UTF-8: stdout retained \(stdout.text.utf8.count) valid bytes and \(stdout.undecodable.count) undecodable bytes; stderr retained \(stderr.text.utf8.count) valid bytes and \(stderr.undecodable.count) undecodable bytes. The reply is incomplete; inspect the Codex output encoding before another call."
+        """
+            Codex output was not valid UTF-8: stdout retained \(stdout.text.utf8.count) valid bytes and \(stdout.undecodable.count) undecodable bytes; \
+            stderr retained \(stderr.text.utf8.count) valid bytes and \(stderr.undecodable.count) undecodable bytes. The reply is incomplete; inspect the \
+            Codex output encoding before another call.
+            """
     }
 }
 
@@ -105,8 +106,7 @@ private final class CodexProcessShutdown: @unchecked Sendable {
         DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [stopped] in
             defer { stopped.leave() }
             ProcessTreeReaper.quiesceAndKill(tree)
-            // The runner's termination handler owns root exit observation and
-            // joins this escalation before draining and returning the result.
+            // The runner's termination handler owns root exit observation and joins this escalation before draining and returning the result.
         }
     }
 
@@ -114,7 +114,6 @@ private final class CodexProcessShutdown: @unchecked Sendable {
     func waitForStop() { stopped.wait() }
 }
 
-/// Result of a Codex CLI invocation (or any subprocess runner injected for tests).
 public struct CodexProcessResult: Sendable {
     public var exitCode: Int32
     public var stdout: String
@@ -128,12 +127,7 @@ public struct CodexProcessResult: Sendable {
     }
 }
 
-/// Mutable, thread-safe slot for a runner to publish its terminate-handle.
-/// `CodexProcess.complete()` wraps the runner call in
-/// `withTaskCancellationHandler` and, if the consumer cancels, invokes the
-/// terminator registered here so the Process is actually killed instead of
-/// continuing to run silently after the caller is gone.
-/// This terminator is STICKY — a fire() arriving before register() will trigger the handler the moment register() is called, closing the spawn-vs-register race.
+/// Cancellation is sticky: a fire before registration must terminate the child as soon as its handle arrives.
 public final class CodexTerminator: @unchecked Sendable {
     private let lock = NSLock()
     private var handler: (@Sendable () -> Void)?
@@ -144,10 +138,7 @@ public final class CodexTerminator: @unchecked Sendable {
         let shouldFireImmediately = fired
         handler = h
         lock.unlock()
-        // If fire() arrived before register(), run the handler now so the
-        // cancel signal is not silently dropped due to ordering. This closes
-        // the race where withTaskCancellationHandler's onCancel runs before
-        // the runner has spawned + registered the process terminator.
+        // Honor cancellation that arrived before the process registered its terminator.
         if shouldFireImmediately { h() }
     }
     public func fire() {
@@ -159,20 +150,16 @@ public final class CodexTerminator: @unchecked Sendable {
     }
 }
 
-/// Inputs handed to the runner. Tests inspect this to assert correct args/stdin.
-/// `terminator` is the runner's hook to publish a cancellation callback —
-/// runners that spawn a Process should call `terminator.register { proc.terminate() }`
-/// right after `proc.run()` so a cancelled consumer kills the process instead
-/// of letting it run to completion in the background.
+/// Register termination immediately after spawn so consumer cancellation cannot leave an unowned process running.
 public struct CodexProcessInvocation: Sendable {
     public var executable: String
     public var arguments: [String]
     public var stdin: String
     public var timeout: TimeInterval
     public var terminator: CodexTerminator
-    /// Optional full child-process environment. Rooted secondary runtimes use
-    /// this to bind CODEX_HOME/NATIVE_AGENT_DATA_ROOT instead of silently
-    /// reading the operator's personal Codex home.
+    public var lifetime: ProviderRequestLifetime
+    /// Optional full child-process environment. Rooted secondary runtimes use this to bind CODEX_HOME/NATIVE_AGENT_DATA_ROOT instead of silently reading
+    /// the operator's personal Codex home.
     public var environment: [String: String]?
     public init(
         executable: String,
@@ -180,7 +167,8 @@ public struct CodexProcessInvocation: Sendable {
         stdin: String,
         timeout: TimeInterval,
         terminator: CodexTerminator = CodexTerminator(),
-        environment: [String: String]? = nil
+        environment: [String: String]? = nil,
+        lifetime: ProviderRequestLifetime = ProviderRequestLifetime()
     ) {
         self.executable = executable
         self.arguments = arguments
@@ -188,6 +176,7 @@ public struct CodexProcessInvocation: Sendable {
         self.timeout = timeout
         self.terminator = terminator
         self.environment = environment
+        self.lifetime = lifetime
     }
 
     /// Spawn once, drain both pipes, and join shutdown before reporting exit.
@@ -287,34 +276,18 @@ public struct CodexProcessInvocation: Sendable {
     }
 }
 
-/// Subprocess runner closure type. Tests inject a mock; production uses the
-/// real-Process runner below.
 public typealias CodexProcessRunner = @Sendable (CodexProcessInvocation) async throws -> CodexProcessResult
 
-/// Streaming subprocess runner closure type. Yields each stdout chunk as a
-/// decoded UTF-8 string as the process emits it. Tests inject a mock that
-/// drives the continuation directly; production uses the real-Process runner
-/// below (which attaches a `readabilityHandler` to the stdout FileHandle).
-///
-/// Contract:
-///   - Each yielded String is one chunk of stdout, in order.
-///   - On exit 0: call `continuation.finish()`.
-///   - On non-zero exit / signal / timeout: call `continuation.finish(throwing:)`
-///     with an `LLMError.underlying` carrying stderr (or the timeout message).
-///   - On `continuation.onTermination` (consumer cancellation): the runner
-///     MUST terminate the spawned Process and detach the read handler.
+/// Yield stdout in order, finish after exit/drain, and propagate failures. Consumer termination must stop the child and detach its read handler.
 public typealias CodexStreamingProcessRunner = @Sendable (CodexProcessInvocation) -> AsyncThrowingStream<String, Error>
 
-/// Shells out to the `codex` CLI. Configurable bin + runner for tests.
-///
-/// Buffered and incremental callers share the invocation's process lifecycle.
-/// Incremental delivery follows the CLI's own stdout flushing cadence.
+/// Buffered and incremental callers share one process lifecycle; delivery follows the CLI's stdout flushing.
 public final class CodexProcess: LLMTransport {
     public static let toolWire = ProviderToolWire.unsupported
-    /// The CLI prompt is text: images are flattened away (`messagesPrompt`).
+    /// The CLI prompt is text-only, so image loss must be reported.
     public static let carriesImages = false
-    /// This transport sends no output-cap field.
-    public func requestOutputTokens(model: String) throws -> Int { 0 }
+    /// This transport has no output-cap field.
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
 
     public let providerId: String = "codex"
     private let codexBin: String?
@@ -341,26 +314,22 @@ public final class CodexProcess: LLMTransport {
     }
 
     /// NativeAgent tools never reach the CLI; its tool wire is unsupported.
-    public func complete(prompt: String, system: String?, model: String, tools: [LLMToolSchema]?) async throws -> String {
+    public func complete(prompt: String, system: String?, model: String, tools: [LLMToolSchema]?, call: LLMCall) async throws -> String {
         let authPath = resolvedAuthPath()
-        let args = try arguments(model: model, authPath: authPath)
+        let args = try arguments(model: model, authPath: authPath, call: call)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
             arguments: args,
             stdin: Self.composedPrompt(system: system, prompt: prompt),
-            timeout: LLMCallContext.wallOwned || ProviderStreamContext.stallOnly ? 0 : timeout,
+            timeout: call.wallOwned || call.lifetime.stallOnly ? 0 : timeout,
             terminator: terminator,
-            environment: childEnvironment(authPath: authPath)
+            environment: childEnvironment(authPath: authPath), lifetime: call.lifetime
         )
         try await Self.prepareCodexHome(authPath)
         let result: CodexProcessResult
         do {
-            // withTaskCancellationHandler propagates a cancelled consumer Task
-            // down into the spawned Process: when the consumer cancels (chat
-            // turn aborted, view dismissed, stream consumer's Task.cancel()),
-            // the registered terminator fires and kills the process instead of
-            // letting it run silently to completion.
+            // Consumer cancellation must stop the spawned process rather than leave it running after its owner exits.
             result = try await withTaskCancellationHandler(
                 operation: { [runner] in
                     let outcome: Result<CodexProcessResult, Error> = await settle {
@@ -372,21 +341,14 @@ public final class CodexProcess: LLMTransport {
                 onCancel: { terminator.fire() }
             )
         } catch is CancellationError {
-            // Cancellation propagates as CancellationError so structured-
-            // concurrency callers (e.g. SwiftNativeWorkshopRunner) can
-            // distinguish cancellation from a real process failure.
+            // Keep cancellation typed so structured callers cannot mistake it for process failure.
             throw CancellationError()
         } catch {
             throw mapTransportError(error, fallback: .underlying(message: "codex: \(error)"))
         }
-        // Cancellation may have landed during the runner await without the runner
-        // throwing CancellationError directly — the terminator fires, the process
-        // exits non-zero, and the runner returns a CodexProcessResult with that
-        // non-zero exitCode. Surface cancellation as CancellationError BEFORE
-        // misinterpreting the non-zero exit as a real LLMError.
+        // Cancellation can cause a nonzero exit without the runner throwing; check it before classifying a process failure.
         if Task.isCancelled {
-            // The runner has joined exit and both drains. Produced text is
-            // returned to the cancelled owner for its stopped settlement.
+            // The runner has joined exit and both drains. Produced text is returned to the cancelled owner for its stopped settlement.
             if !result.stdout.isEmpty { return result.stdout }
             throw CancellationError()
         }
@@ -394,7 +356,7 @@ public final class CodexProcess: LLMTransport {
             throw LLMError.underlying(message: "codex: timed out after \(Int(timeout))s")
         }
         if result.exitCode != 0 {
-            // CLI failure classification preserves a bounded diagnostic tail.
+            // Keep bounded CLI failure evidence for diagnosis.
             throw Self.classifyCodexFailure(
                 exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr)
         }
@@ -420,14 +382,14 @@ public final class CodexProcess: LLMTransport {
         return environment
     }
 
-    /// Preparation and execution share the credential pinned before dispatch.
+    /// Preparation and execution must use the same pinned credential.
     private static func prepareCodexHome(_ authPath: URL) async throws {
         try await ChatGPTTransport.prepareCodexChildHome(
             ChatGPTTransport.codexHomeForChild(authPath: authPath), authPath: authPath
         )
     }
 
-    /// Nonzero CLI exits use stdout/stderr signatures and retain a bounded diagnostic tail.
+    /// Classify nonzero exits from retained pipe evidence.
     static func classifyCodexFailure(exitCode: Int32, stdout: String, stderr: String) -> LLMError {
         let hay = (stderr + "\n" + stdout).lowercased()
         let detail = boundedCodexTail(stderr.isEmpty ? stdout : stderr)
@@ -461,9 +423,7 @@ public final class CodexProcess: LLMTransport {
         return .underlying(message: detail.isEmpty ? "codex exited \(exitCode)" : detail)
     }
 
-    /// Whole-phrase containment on an already-lowercased haystack: the phrase
-    /// must sit on alphanumeric boundaries, so "sign in" cannot fire inside
-    /// "design internals" and "auth error" cannot fire inside a longer word.
+    /// Require whole phrase boundaries so sign-in errors cannot match incidental text inside longer words.
     static func containsWholePhrase(_ phrase: String, in haystack: String) -> Bool {
         let escaped = NSRegularExpression.escapedPattern(for: phrase)
         guard let regex = try? NSRegularExpression(
@@ -475,21 +435,18 @@ public final class CodexProcess: LLMTransport {
         return regex.firstMatch(in: haystack, range: range) != nil
     }
 
-    /// Bounded tail of CLI failure text (last `max` chars, trimmed). Keeps the
-    /// tail because the actionable error line is usually at the END of a noisy
-    /// CLI stderr dump.
+    /// Retain the bounded diagnostic tail because actionable CLI errors usually appear last.
     static func boundedCodexTail(_ s: String, max: Int = 600) -> String {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.count <= max { return t }
         return "…" + String(t.suffix(max))
     }
 
-    /// Streams the same invocation as `complete()`, forwarding incremental
-    /// stdout and propagating consumer cancellation through its terminator.
+    /// Streaming shares the complete invocation's cancellation owner.
     public func stream(
         prompt: String,
         system: String?,
-        model: String
+        model: String, call: LLMCall
     ) -> AsyncThrowingStream<String, Error> {
         let authPath = resolvedAuthPath()
         let terminator = CodexTerminator()
@@ -499,14 +456,14 @@ public final class CodexProcess: LLMTransport {
                     var sawContent = false
                     do {
                         try Task.checkCancellation()
-                        let args = try arguments(model: model, authPath: authPath)
+                        let args = try arguments(model: model, authPath: authPath, call: call)
                         let invocation = CodexProcessInvocation(
                             executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
                             arguments: args,
                             stdin: Self.composedPrompt(system: system, prompt: prompt),
-                            timeout: LLMCallContext.wallOwned || ProviderStreamContext.stallOnly ? 0 : timeout,
+                            timeout: call.wallOwned || call.lifetime.stallOnly ? 0 : timeout,
                             terminator: terminator,
-                            environment: childEnvironment(authPath: authPath)
+                            environment: childEnvironment(authPath: authPath), lifetime: call.lifetime
                         )
                         try await Self.prepareCodexHome(authPath)
                         let upstream = streamingRunner(invocation)
@@ -537,7 +494,7 @@ public final class CodexProcess: LLMTransport {
                     terminator.fire()
                 }
             }
-            ProviderReplyWork.current?.own(task, stop: { terminator.fire() })
+            call.replyWork?.own(task, stop: { terminator.fire() })
             continuation.onTermination = { _ in
                 terminator.fire()
                 task.cancel()
@@ -547,25 +504,23 @@ public final class CodexProcess: LLMTransport {
 
     // MARK: - Buffered text-only messages contract
 
-    /// The conversation flattens into one role-prefixed prompt for the CLI's
-    /// stdin (tool blocks rendered as inline annotations). The CLI cannot see
-    /// images, so the model is told so and a trace row records the drop.
+    /// The CLI cannot see images; tell the model and record the drop while flattening tool blocks into the text prompt.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
-        let combined = try await messagesPrompt(messages, model: model)
-        return try await complete(prompt: combined, system: system, model: model, tools: tools)
+        let combined = try await messagesPrompt(messages, model: model, call: call)
+        return try await complete(prompt: combined, system: system, model: model, tools: tools, call: call)
     }
 
-    private func messagesPrompt(_ messages: [LLMMessage], model: String) async throws -> String {
+    private func messagesPrompt(_ messages: [LLMMessage], model: String, call: LLMCall) async throws -> String {
         let flattened = try llmCompatibilityPrompt(messages: messages) { role in
             role == .user ? "USER:" : "ASSISTANT:"
         }
         if flattened.imageCount > 0 {
-            await Self.emitVisionUnsupportedTrace(provider: providerId, model: model, imageCount: flattened.imageCount)
+            await Self.emitVisionUnsupportedTrace(provider: providerId, model: model, imageCount: flattened.imageCount, call: call)
         }
         return flattened.text
     }
@@ -575,13 +530,13 @@ public final class CodexProcess: LLMTransport {
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let prompt = try await messagesPrompt(messages, model: model)
-                    for try await chunk in stream(prompt: prompt, system: system, model: model) {
+                    let prompt = try await messagesPrompt(messages, model: model, call: call)
+                    for try await chunk in stream(prompt: prompt, system: system, model: model, call: call) {
                         try Task.checkCancellation()
                         continuation.yield(.textDelta(chunk))
                     }
@@ -591,34 +546,32 @@ public final class CodexProcess: LLMTransport {
                     continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
             }
-            ProviderReplyWork.current?.own(task, stop: {})
+            call.replyWork?.own(task, stop: {})
             continuation.onTermination = { _ in task.cancel() }
         }
     }
 
-    /// Tripwire row: an image attachment reached the CLI's flattened prompt
-    /// and got dropped. Mirrors `memory.commit` trace shape
-    /// (id/kind/title/status/payload/createdAt) and writes via the path-owned
-    /// appender to `<dataRoot>/traces/events.jsonl`.
+    /// Record dropped images in the path-owned trace so text-only transport loss remains visible.
     private static func emitVisionUnsupportedTrace(
         provider: String,
         model: String,
-        imageCount: Int
+        imageCount: Int, call: LLMCall
     ) async {
+        guard !call.preview else { return }
         let event = TurnTraceEvent(kind: "vision.attachment_unsupported",
             title: "vision_attachment_unsupported", status: "ok", payload: .object([
                 "provider": .string(provider),
                 "model": .string(model),
                 "imageCount": .int(Int64(imageCount)),
-            ]), createdAt: ISO8601DateFormatter().string(from: Date()))
-        await TurnTracePersistLane(dataRootOverride: LLMCallContext.traceDataRootOverride).append(event)
+            ]), createdAt: ISO8601DateFormatter().string(from: Date()),
+            turnId: call.turn?.id, sessionId: call.session, surface: call.surface, turn: call.turn)
+        await TurnTracePersistLane(dataRootOverride: call.traceDataRoot).append(event)
     }
 
-    /// Non-interactive exec accepts piped prompts from any app working directory and emits uncolored output.
-    private func arguments(model: String, authPath: URL) throws -> [String] {
-        // This transport is a model call. CLI tools would act outside the
-        // NativeAgent dispatcher, so its declared no-tools contract applies
-        // to the child too, independent of the person's CLI configuration.
+    /// Piped non-interactive prompts must work from any app working directory.
+    private func arguments(model: String, authPath: URL, call: LLMCall) throws -> [String] {
+        // This transport is a model call. CLI tools would act outside the NativeAgent dispatcher, so its declared no-tools contract applies to the child
+        // too, independent of the person's CLI configuration.
         var args: [String] = [
             "exec", "--color", "never", "--skip-git-repo-check",
             "--ignore-user-config", "--ignore-rules", "--strict-config",
@@ -634,24 +587,24 @@ public final class CodexProcess: LLMTransport {
         ] {
             args.append(contentsOf: ["--disable", feature])
         }
-        if ProviderStreamContext.stallOnly {
+        if call.lifetime.stallOnly {
             args.append(contentsOf: ["-c", "model_reasoning_summary=\"auto\""])
         }
         if let effort = try OpenAIExecutionControls.reasoningEffort(
             model: model,
-            requested: LLMCallContext.reasoningEffort,
+            requested: call.admission?.reasoningEffort,
             transport: .codexCLI,
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            oauthAuthURL: authPath
+            oauthAuthURL: authPath, preview: call.preview
         ) {
             args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(effort)\""])
         }
         if let tier = try OpenAIExecutionControls.serviceTier(
             model: model,
-            requested: LLMCallContext.serviceTier,
+            requested: call.admission?.serviceTier,
             transport: .codexCLI,
             dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
-            oauthAuthURL: authPath
+            oauthAuthURL: authPath, preview: call.preview
         ) {
             args.append(contentsOf: ["-c", "service_tier=\"\(tier)\""])
         }
@@ -659,7 +612,7 @@ public final class CodexProcess: LLMTransport {
         return args
     }
 
-    /// The system prompt travels over stdin because the CLI has no --system flag.
+    /// The CLI has no system flag, so send the system prompt over stdin.
     static func composedPrompt(system: String?, prompt: String) -> String {
         guard let system,
               !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -667,11 +620,10 @@ public final class CodexProcess: LLMTransport {
         return system + "\n\n" + prompt
     }
 
-    /// Incremental UTF-8 output over the invocation's process lifecycle.
     public static let defaultStreamingRunner: CodexStreamingProcessRunner = { inv in
         AsyncThrowingStream { continuation in
-            let activity = ProviderStreamContext.activity
-            let admitted = ProviderStreamContext.admitted
+            let activity = inv.lifetime.activity
+            let admitted = inv.lifetime.admitted
             let stdout = CodexUTF8Output(), stderr = CodexUTF8Output()
             continuation.onTermination = { _ in inv.terminator.fire() }
             do {
@@ -702,7 +654,6 @@ public final class CodexProcess: LLMTransport {
         }
     }
 
-    /// Buffered output over the same spawn, stop, deadline and drain operation.
     public static let defaultRunner: CodexProcessRunner = { inv in
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexProcessResult, Error>) in
             let stdout = CodexUTF8Output(), stderr = CodexUTF8Output()

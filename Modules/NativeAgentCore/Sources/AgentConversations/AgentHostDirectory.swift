@@ -4,34 +4,17 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `AgentHostDirectory.swift` | `AgentHostDirectory` enum; `bridgeDiscoveryDirectory`, `peerDescriptorDirectory`; `installation.evidence` is discovery/Connect/verify's one installation check; recipe `executables`, `discoveryWords`, `searchPaths`, `messagingPermissionsPath` and `messagingPermissionSyntax` own host discovery and scoped JSON messaging allowances; Codex's owned entry includes its server approval; desktop chat recipes may name a content region role, with Muse 9 using its web area and Side chats button |
+// Blueprint: | `AgentHostDirectory.swift` | `AgentHostDirectory`, `bridgeDiscoveryDirectory`, `peerDescriptorDirectory`, `installation.evidence`, `executables`, `discoveryWords`, `searchPaths`, `messagingPermissionsPath`, `messagingPermissionSyntax` |
 
-/// KNOWN AGENTS ARE DATA.
-///
-/// One row per agent host on this Mac: what it is called, how to see that it is
-/// installed, where it keeps its MCP servers, which FORMAT that file is, the
-/// entry it expects, and whether it has to be restarted to notice one. No
-/// routing code anywhere branches on a row's id — the writers below are chosen
-/// by `format`, and everything else on the row is text the card shows the
-/// person.
-///
-/// Rows are checked against vendor documentation and realistic isolated file
-/// fixtures. No personal settings are read during development. An unsupported
-/// host has no row, and the honest answer for a
-/// name that has no row is "I don't know how to set that one up yet" — never a
-/// guess at somebody else's configuration format.
-///
-/// A row is one host's recipe (`AgentRecipeStore`, agents/recipes/<id>.json):
-/// the table below only seeds those files.
+/// Host recipes own configuration and discovery data; the table only seeds them. Select writers by format, never host ID, and refuse unsupported configuration
+/// shapes rather than guessing.
 public struct AgentHostRow: Sendable, Equatable, Codable {
     public enum Format: String, Sendable, Equatable, Codable, CaseIterable {
-        /// `{ "mcpServers": { "<name>": { … } } }`
         case jsonMCPServers
         case jsonBareMCPServers
         case jsonContextServers
         case jsonServers
         case gooseYAML
-        /// `[mcp_servers.<name>]`
         case codexTOML
         /// Reply tools supplied to session/new; no settings file is edited.
         case sessionMCP
@@ -52,46 +35,36 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public let id: String
     public let displayName: String
     public let description: String
-    /// Matched case-insensitively, alongside `id` and `displayName`.
     public let aliases: [String]
     /// Program or application paths, never profile directories.
     public let installMarkers: [String]
     public var configPath: String
     public let format: Format
-    /// Whether the host must be restarted before the entry is live, and what
-    /// that means for the person, in one sentence for the card.
+    /// Disclose required restart steps without claiming they prove connection.
     public let restartRequired: Bool
     public let restartNote: String
-    /// The documentation this row's path and entry shape were checked against.
     public let documentation: String
     public var requiresWorkspace: Bool = false
     public var settingsSupported: Bool = true
     public var declaredRoute: Route? = nil
-    public var outboundRoute: String { route == .dotIPC ? "chatgpt-dot-ipc" : route == .desktopChat ? "desktop-chat" : route == .grokBot ? "grok-webhook" : acp == nil ? (commandLine == nil ? "none" : "command") : "acp" }
+    public var outboundRoute: String { route == .dotIPC ? "chatgpt-dot-ipc" : route == .desktopChat ? "desktop-chat" : route == .grokBot
+        ? "grok-webhook" : acp == nil ? (commandLine == nil ? "none" : "command") : "acp" }
     /// Launch Services finds applications outside the usual Applications folders too.
     public var bundleIDs: [String] = []
-    /// Only documented A2A listening ports belong here; neither current CLI
-    /// advertises one. An A2A contact's recipe carries its card's own.
+    /// Only documented listening ports belong in seeds; contacts retain their card’s own port.
     public var a2aPorts: [Int] = []
-    /// MCP settings files whose presence says this host is set up here.
-    /// Discovery only checks that they exist; it never reads them. Optional
-    /// so a recipe file written before it existed still reads (none).
+    /// Settings-file presence proves setup only; discovery must not read the file here.
     public var configPaths: [String]? = nil
-    /// The command-line half of this row, or nil when this host has none.
-    /// Absent means there is no way to push a message into it from here, and
-    /// the result says exactly that rather than reaching for its window.
+    /// An absent command route cannot be replaced by a guessed window route.
     public var commandLine: AgentHostCommandLine? = nil
     public var acp: AgentHostACP? = nil
-    /// An A2A contact's recipe (route a2a, keyed by the contact's id).
     public var a2a: A2A? = nil
-    /// Where its program is looked for, in order (`resolveExecutable`).
     public var searchPaths: [String] = []
     /// Additional program names used as installation evidence, never launched.
     public var executables: [String]? = nil
     public var discoveryWords: [String]? = nil
-    /// Host settings that allow only this connection's two messaging tools.
+    /// Messaging allowances must scope only this connection’s two tools.
     public var messagingPermissionsPath: String? = nil
-    /// How this host names and stores the connection's two messaging allowances.
     public var messagingPermissionSyntax: MessagingPermissionSyntax? = nil
     public enum MessagingPermissionSyntax: String, Sendable, Equatable, Codable, CaseIterable {
         case mcpCall, doubleUnderscore, toolDefaults
@@ -104,11 +77,10 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
             }
         }
     }
-    /// The window labels a desktop chat is driven by (`DesktopChatRoute`).
     public var desktopChat: DesktopChat? = nil
-    /// The labels Grok Bot's routine import is driven by.
     public var grokRoutine: GrokRoutine? = nil
-    public enum Route: String, Sendable, Codable, CaseIterable { case acp, a2a, dotIPC = "chatgpt-dot-ipc", grokBot = "grok-bot", desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
+    public enum Route: String, Sendable, Codable, CaseIterable { case acp, a2a, dotIPC = "chatgpt-dot-ipc", grokBot = "grok-bot",
+        desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
     public var route: Route { declaredRoute ?? (acp != nil ? .acp : commandLine != nil ? .commandLine : .mcpSettingsOnly) }
 
     public struct Installation: Sendable {
@@ -185,7 +157,8 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
             let markers = installMarkers.map(AgentHostDirectory.expand)
             let apps = bundleIDs.compactMap(Self.applicationURL)
                 + markers.filter { $0.hasSuffix(".app") && Self.isInstalledProgram($0) }.map { URL(fileURLWithPath: $0) }
-            let directories = (searchPaths + (acp?.environment["PATH"] ?? "").components(separatedBy: ":").filter { !$0.isEmpty }).map(AgentHostDirectory.expand) + markers.filter {
+            let directories = (searchPaths + (acp?.environment["PATH"] ?? "").components(separatedBy: ":").filter { !$0.isEmpty }).map(
+                AgentHostDirectory.expand) + markers.filter {
                 programNames.contains(URL(fileURLWithPath: $0).lastPathComponent)
             }.map { URL(fileURLWithPath: $0).deletingLastPathComponent().path }
             var environment: [String: String]
@@ -246,12 +219,12 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     var programNames: [String] { Array(Set((executables ?? []) + [acp?.executable, commandLine?.executable].compactMap { $0 })).sorted() }
 
     public var installationCheck: String {
-        installation.failure?.message ?? ("agents/recipes/\(id).json host: bundleIDs=\(bundleIDs), executables=\(programNames), installMarkers=\(installMarkers)"
+        installation.failure?.message ?? (
+            "agents/recipes/\(id).json host: bundleIDs=\(bundleIDs), executables=\(programNames), installMarkers=\(installMarkers)"
             + "; searchPaths=\(searchPaths). Install a declared program/app or correct these fields with agent.recipe_write, then agent.verify."
         )
     }
 
-    /// The named program, found in this recipe's program folders.
     public func resolveExecutable(_ name: String) -> String? {
         installation.executables[name]
     }
@@ -263,15 +236,12 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
 
     public var expandedConfigPath: String { AgentHostDirectory.expand(configPath) }
 
-    /// Every selector in one place: the labels the app's window exposes. When
-    /// the app changes them, its recipe changes; anything unmatched fails with
-    /// a plain blocker, never a guess. Verification never substitutes labels.
+    /// Recipes own exact window labels; unmatched selectors fail plainly and verification cannot guess replacements.
     public struct DesktopChat: Codable, Sendable, Equatable {
         public var newChat, backToMain, chatsButton, chatsPanel, log, composerCore: String
         public var userPrefix, assistantPrefix, userLabel, assistantMarker, stop: String
         public var unreadSuffix, actionsSuffix, current, currentValue: String
-        /// The first region of this AX role owns the chat controls and log.
-        /// Nil explicitly selects the whole native window.
+        /// A nil region explicitly selects the whole native window; otherwise the first matching region owns controls and log.
         public var contentRole: String? = nil
     }
 
@@ -298,34 +268,28 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
         public struct Dismissal: Codable, Sendable, Equatable {
             public var control: Control
             public var action: Step.Action
-            /// A menu disappears when an item is selected.
+            /// Selection dismisses the menu, so later actions cannot assume it remains open.
             public var ifPresent: Bool
         }
 
 
     }
 
-    /// Where an A2A contact's card is, its credential by reference only (the
-    /// contact's key name, never a value), and what the card offered when a
-    /// send or dry run last read it (`AgentPeerDiscovery.a2aCheck`): nil
-    /// until then. A send is held to `read`; a dry run learns a change into it.
+    /// Credentials stay references; sends enforce saved card evidence and only dry runs learn changes.
     public struct A2A: Codable, Sendable, Equatable {
         public var card: String
         public var credential: String?
         public var read: Card? = nil
 
-        /// Selected effective-card fields and digest, including an authenticated extended card; no raw card is retained.
-        /// Extensions are those it declares; required ones are not spoken here (`protocol_mismatch`).
+        /// Retain effective-card fields and digest without raw cards; required unsupported extensions are protocol mismatches.
         public struct Card: Codable, Sendable, Equatable {
             public var endpoint, version, binding: String
             public var tenant: String?
-            /// "<scheme name>: <its declaration>" for each scheme a requirement names; [] is none.
             public var auth: [String]
             public var streaming, pushNotifications, extendedCard: Bool
             public var skills, extensions: [String]
             public var digest: String
 
-            /// Every field two reads differ in, with both values.
             public static func drift(_ recorded: Card, _ now: Card) -> [String] {
                 guard case .object(let old)? = try? JSONValue.fromEncodable(recorded),
                       case .object(let new)? = try? JSONValue.fromEncodable(now) else { return [] }
@@ -339,23 +303,13 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
 }
 
 public enum AgentHostDirectory {
-    /// The name this app's entry carries in another agent's configuration. One
-    /// fixed product name, never a persona name, so a person reading their own
-    /// settings file can tell which app put it there.
+    /// Use a fixed product entry name so settings identify the app independently of its persona.
     public static var entryName: String { InstallPaths.current.agentHostEntryName() }
 
-    /// The environment variables the entry sets and `nativeagent-link` reads.
-    /// The secret is an ENVIRONMENT value and never a command-line argument:
-    /// arguments are world-readable in the process table.
+    /// Secrets belong in environment values because command-line arguments are world-readable in the process table.
     public static let peerIDVariable = "NATIVE_AGENT_PEER_ID"
     public static let peerSecretVariable = "NATIVE_AGENT_PEER_SECRET"
-    /// WHICH INSTALL THE ENTRY TALKS TO. Without it the link command falls back
-    /// to the machine-wide rendezvous, which belongs to whichever install owns
-    /// it — so an entry written by a second install, or by one on its own data
-    /// root, would hand this connection's key to an install that has never
-    /// heard of it. The entry therefore names THIS install's descriptor file
-    /// explicitly, owner included, so it keeps meaning the same thing if
-    /// ownership later changes. A path, not a secret.
+    /// Name this install’s descriptor explicitly so changing machine-wide ownership cannot redirect the connection’s key.
     public static let bridgeDescriptorVariable = "NATIVE_AGENT_BRIDGE_DESCRIPTOR"
 
     public static func bridgeDiscoveryDirectory(dataRoot: URL) -> URL {
@@ -372,17 +326,13 @@ public enum AgentHostDirectory {
         peerDescriptorDirectory(dataRoot: dataRoot).appendingPathComponent("bridge.json").path
     }
 
-    /// What the entry actually exposes, said plainly on the card. These are the
-    /// two tools `/agent/mcp` serves and nothing else.
+    /// Disclose exactly the two tools this entry serves.
     public static let accessSummary =
         "two tools, agent_message and agent_reply, over this Mac's loopback interface only. "
         + "These are messaging tools, not restrictions on what the other program can do itself. "
         + "This app applies its own permission settings when it handles a request."
 
-    // Restart notes describe reload steps, not proof that a saved entry is connected.
-    // The seed omits OpenCode because its published configuration contracts conflict.
-    /// THE SEED, and only that: `AgentRecipeStore` writes each row into
-    /// agents/recipes/<id>.json, and every reader takes `rows`, the recipes.
+    // Restart steps do not prove connection. Conflicting configuration contracts cannot seed a host. Readers use saved recipes; this table is only their seed.
     static let seed: [AgentHostRow] = [
         AgentHostRow(id: "omp", displayName: "OMP", description: "The local OMP bridge lane.",
             aliases: ["oh-my-pi"], installMarkers: [], configPath: "", format: .sessionMCP,
@@ -407,17 +357,15 @@ public enum AgentHostDirectory {
             restartRequired: false, restartNote: "Nothing to restart.",
             documentation: "https://muse.meta.com", settingsSupported: false,
             declaredRoute: .desktopChat, bundleIDs: ["com.meta.endo"], discoveryWords: ["muse", "endo"],
-            // The labels Muse's window exposes.
             desktopChat: .init(
-                newChat: "New side chat",            // button, and a new chat's title
-                backToMain: "Back to main chat",     // header button; the title follows it
-                chatsButton: "Side chats",           // Muse 9 navigation button
-                chatsPanel: "Side chats",            // AXLandmarkNavigation
+                newChat: "New side chat",            // The button label also names new chats.
+                backToMain: "Back to main chat",     // The chat title follows this header button.
+                chatsButton: "Side chats",
+                chatsPanel: "Side chats",
                 log: "Chat messages", composerCore: "Attach file Dictate a message",
                 userPrefix: "User message: ", assistantPrefix: "Assistant message: ",
                 userLabel: "You:", assistantMarker: "Copy response", stop: "Stop",
-                // Side-chat entries are labelled "<title> Unread updates" or
-                // "<title> 18m More thread actions"; the open one has aria-current=page.
+                // Side-chat list labels differ from the open item’s aria-current marker.
                 unreadSuffix: " Unread updates", actionsSuffix: " More thread actions",
                 current: "AXARIACurrent", currentValue: "page", contentRole: "AXWebArea")),
         AgentHostRow(
@@ -461,7 +409,7 @@ public enum AgentHostDirectory {
                 + "Codex restarts.",
             documentation: "https://learn.chatgpt.com/docs/extend/mcp?surface=cli",
             bundleIDs: ["com.openai.codex"], configPaths: ["~/.codex/config.toml"],
-            // Resume uses the CLI-minted thread.started UUID.
+            // Resume requires the CLI-minted thread.started UUID.
             commandLine: AgentHostCommandLine(
                 executable: "codex",
                 arguments: ["exec", "--json", "--skip-git-repo-check", "-o", AgentHostCommandLine.replyFilePlaceholder,
@@ -476,7 +424,8 @@ public enum AgentHostDirectory {
             discoveryWords: ["codex"]
         ),
         AgentHostRow(
-            id: "antigravity-cli", displayName: "Antigravity CLI", description: "Google's current terminal agent for Gemini with continuing conversations.", aliases: ["antigravity", "agy", "gemini"],
+            id: "antigravity-cli", displayName: "Antigravity CLI",
+                description: "Google's current terminal agent for Gemini with continuing conversations.", aliases: ["antigravity", "agy", "gemini"],
             installMarkers: [], configPath: "~/.gemini/config/mcp_config.json", format: .jsonMCPServers,
             restartRequired: false, restartNote: "Each message starts the CLI with the current connection settings and resumes the requested conversation.",
             documentation: "https://www.antigravity.google/docs/mcp",
@@ -511,9 +460,11 @@ public enum AgentHostDirectory {
             installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app"],
             configPath: "~/.cursor/mcp.json", format: .jsonMCPServers,
             restartRequired: true, restartNote: "Restart Cursor to load the new connection.",
-            documentation: "https://cursor.com/docs/mcp", bundleIDs: ["com.todesktop.230313mzl4w4u92"], configPaths: ["~/.cursor/mcp.json"], discoveryWords: ["cursor"]),
+            documentation: "https://cursor.com/docs/mcp", bundleIDs: ["com.todesktop.230313mzl4w4u92"], configPaths: ["~/.cursor/mcp.json"],
+                discoveryWords: ["cursor"]),
         AgentHostRow(
-            id: "cursor-workspace", displayName: "Cursor Workspace", description: "An AI coding assistant connected to one project folder.", aliases: ["cursor project"],
+            id: "cursor-workspace", displayName: "Cursor Workspace", description: "An AI coding assistant connected to one project folder.",
+                aliases: ["cursor project"],
             installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app"],
             configPath: ".cursor/mcp.json", format: .jsonMCPServers,
             restartRequired: true, restartNote: "Reopen the selected folder in Cursor to load the new connection.",
@@ -546,9 +497,7 @@ public enum AgentHostDirectory {
                               documentation: "https://block-goose.mintlify.app/advanced/acp-protocol",
                               permissionMode: "chat", referenceVersion: "1.51.0", environment: ["GOOSE_MODE": "chat"], protocolVersion: 1),
             discoveryWords: ["goose"]),
-        // Nous Research Hermes. Nothing of its own is written: the connection
-        // starts `hermes acp`, which runs the person's own Hermes with its
-        // memory, provider and model as they are.
+        // Run the person’s own ACP process without changing its memory, provider or model.
         AgentHostRow(
             id: "hermes", displayName: "Hermes", description: "A local agent with its own memory, tools and models.",
             aliases: ["hermes agent", "nous hermes"],
@@ -557,7 +506,7 @@ public enum AgentHostDirectory {
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
             settingsSupported: false, bundleIDs: ["com.nousresearch.hermes"],
-            // Hermes' default session mode asks before edits and supports continuing its sessions.
+            // The default ACP session mode asks before edits and supports continuation.
             acp: AgentHostACP(executable: "hermes", arguments: ["acp"],
                               documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
                               permissionMode: "default", referenceVersion: "0.21.3", protocolVersion: 1,
@@ -565,8 +514,7 @@ public enum AgentHostDirectory {
             discoveryWords: ["hermes"]),
     ]
 
-    /// An A2A contact's seed: its card, and its port when that is on this Mac
-    /// (the local scan looks there). What the card offers is read later.
+    /// Seed only card location and local scan port; read its offers later.
     static func seed(_ peer: AgentPeerContact) -> AgentHostRow {
         var row = AgentHostRow(id: peer.id, displayName: peer.name, description: "An agent reached over A2A at its card.",
             aliases: [], installMarkers: [], configPath: "", format: .sessionMCP,
@@ -577,15 +525,11 @@ public enum AgentHostDirectory {
         return row
     }
 
-    /// Every known agent host, as its recipe says now. An A2A contact's
-    /// recipe is its own, not a host to connect by name.
+    /// A contact’s A2A recipe cannot double as a host connected by name.
     public static var rows: [AgentHostRow] { AgentRecipeStore.rows.filter { $0.route != .a2a } }
 
-    /// THE PROBE THAT PROVES THE ROUND TRIP. Sent once at connect time to a
-    /// host that has a command line: it asks the other agent to answer through
-    /// the entry that was just written, and the contact becomes connected only
-    /// when that inbound request actually arrives carrying this connection's
-    /// key and the one-time nonce. The probe asks for nothing to be read, changed or run.
+    /// Only an inbound request with this connection’s key and one-time nonce proves the setup round trip. The fixed probe asks for no reads, changes or
+    /// execution.
     public static let probeToken = "bridge-handshake"
 
     public static func probeText(appName: String, nonce: String = probeToken) -> String {
@@ -595,8 +539,7 @@ public enum AgentHostDirectory {
 
     public static func row(named name: String) -> AgentHostRow? { named(name, in: rows) { $0 } }
 
-    /// THE ONE LOOKUP BY NAME: an exact id first, then a display name, then an
-    /// alias, so one host's alias never shadows another host's id.
+    /// Match exact IDs before display names and aliases so aliases cannot shadow another host’s identity.
     static func named<Item>(_ name: String, in items: [Item], _ host: (Item) -> AgentHostRow) -> Item? {
         let wanted = normalize(name)
         guard !wanted.isEmpty else { return nil }
@@ -605,14 +548,11 @@ public enum AgentHostDirectory {
             ?? items.first { host($0).aliases.contains { normalize($0) == wanted } }
     }
 
-    /// Every row, for an honest "I don't know that one" result.
     public static var knownNames: [String] { rows.map(\.displayName) }
 
     // MARK: - The entry, per format
 
-    /// The entry text spliced into a JSON host's `mcpServers` object. Authored
-    /// here rather than serialised from a dictionary so the key order on the
-    /// person's disk is stable and readable.
+    /// Author JSON entry order explicitly so the person’s settings stay stable and readable.
     public static func jsonEntry(command: String, peerID: String, secret: String,
                                  descriptorPath: String, format: AgentHostRow.Format = .jsonMCPServers) -> String {
         let entry = """
@@ -655,13 +595,15 @@ public enum AgentHostDirectory {
         """
     }
 
-    /// The `Changes:` line: exactly where, and exactly what, with the secret's
-    /// VALUE never in it.
+    /// Describe exact changes without disclosing secret values.
     public static func changesLine(row: AgentHostRow, command: String) -> String {
         let what = "One connection named \"\(entryName)\""
         return "\(what) in \(row.expandedConfigPath), running \(command) mcp. "
             + "Settings outside this connection are left byte for byte as they are. Each owned edit keeps a timestamped "
-            + "backup beside the file, replaced when that section next changes and removed on disconnect. Because the entry holds this connection's key, that file "
+            + """
+                backup beside the file, replaced when that section next changes and removed on disconnect. Because the entry holds this \
+                connection's key, that file\u{20}
+                """
             + "and its backup are made readable by you alone."
     }
 
@@ -683,9 +625,7 @@ public enum AgentHostDirectory {
             .replacingOccurrences(of: " ", with: "-")
     }
 
-    /// The installed `nativeagent-link`, beside this app's own executable. Nil
-    /// when it is not there, which is an honest refusal rather than an entry
-    /// pointing at a command that does not exist.
+    /// Refuse absent installed link commands instead of writing entries that point nowhere.
     public static func linkCommandPath() -> String? {
         guard let executable = Bundle.main.executableURL?.deletingLastPathComponent() else { return nil }
         let candidate = executable.appendingPathComponent("nativeagent-link").path

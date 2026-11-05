@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `HelperContact.swift` | Turn-local resident contact door for this install's helper; argument routing grants no authority and the actual send remains below the existing tool gates |
+// Blueprint: | `HelperContact.swift` |  |
 
 package enum HelperContact {
     package struct Door: Sendable {
@@ -12,15 +12,13 @@ package enum HelperContact {
             self.name = name; self.conversationID = conversationID; self.send = send
         }
     }
-    @TaskLocal package static var door: Door?
-
-    package static func matches(_ input: [String: JSONValue]) -> Bool {
-        guard let door, case .string(let name)? = input["agent"] else { return false }
+    package static func matches(conversation: AgentConversationContext, _ input: [String: JSONValue]) -> Bool {
+        guard let door = conversation.helperDoor, case .string(let name)? = input["agent"] else { return false }
         return name.caseInsensitiveCompare(door.name) == .orderedSame
     }
 
-    package static func message(_ input: [String: JSONValue]) async throws -> JSONValue? {
-        guard matches(input), let door else { return nil }
+    package static func message(conversation: AgentConversationContext, _ input: [String: JSONValue]) async throws -> JSONValue? {
+        guard matches(conversation: conversation, input), let door = conversation.helperDoor else { return nil }
         guard Set(input.keys).isSubset(of: ["agent", "text", "conversation_id", "session_id", "__session_id"]),
               input["conversation_id"] == nil || input["conversation_id"] == .string(door.conversationID),
               case .string(let text)? = input["text"], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

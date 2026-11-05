@@ -16,21 +16,27 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import StandingBots
+import ChatToolParsing
 
 import ChatTurnContracts
 import ChatSessionWork
 import AgentConversations
 // Blueprint: | `CanonicalToolNameDispatcher.swift` | `CanonicalToolNameDispatcher` class; `canonical`, `dispatch` |
 
-/// The `app` door's way back in: the canonical dispatcher binds it around an
-/// `app` call, and each call of a script re-enters the whole chain through it
-/// as its own `app` call.
-public enum AppDoorReentry {
-    public typealias Perform = @Sendable (String, [String: JSONValue]) async throws -> JSONValue
-    @TaskLocal public static var perform: Perform?
-    public typealias Validate = @Sendable (String, [String: JSONValue]) async -> JSONValue?
-    @TaskLocal public static var validate: Validate?
-    @TaskLocal public static var waitForInteraction: (@Sendable (InlineInteraction, String, [String: JSONValue]) async -> JSONValue)?
+/// Every app call re-enters the complete gated chain with the consumer's current
+/// turn and operation, including the enclosing receipt and door dependencies.
+public struct AppDoorReentry: Sendable {
+    public typealias Perform = @Sendable (String, [String: JSONValue], Turn, ChatToolInvocation) async throws -> JSONValue
+    public var perform: Perform
+    public typealias Validate = @Sendable (String, [String: JSONValue], Turn, ChatToolInvocation) async -> JSONValue?
+    public var validate: Validate
+    public var waitForInteraction: (@Sendable (InlineInteraction, String, [String: JSONValue]) async -> JSONValue)?
+    public init(perform: @escaping Perform, validate: @escaping Validate,
+                waitForInteraction: (@Sendable (InlineInteraction, String, [String: JSONValue]) async -> JSONValue)? = nil) {
+        self.perform = perform
+        self.validate = validate
+        self.waitForInteraction = waitForInteraction
+    }
 }
 
 /// Trims current executor names before every gate so policy judges the name that executes.
@@ -47,163 +53,140 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
     }
 
     /// Saved contacts and their explicit handles own their names.
-    private func namingSavedContact(_ tool: String, _ input: [String: JSONValue]) throws -> [String: JSONValue] {
-        try AgentConversationRouting.namingSavedContact(tool, input, dataRoot: peerDataRoot)
+    private func namingSavedContact(invocation: ChatToolInvocation, _ tool: String, _ input: [String: JSONValue]) throws -> [String: JSONValue] {
+        try AgentConversationRouting.namingSavedContact(conversation: invocation.conversation, tool, input, dataRoot: peerDataRoot)
     }
 
-    /// The same whitespace-only name admission the native dispatcher uses.
-    /// Unknown and retired names stay unknown; no alias resolves them.
+    /// Match the native dispatcher's whitespace-only admission; unknown names must not resolve through aliases.
     public static func canonical(_ name: String) -> String {
         ToolNameAliases.canonical(name)
     }
 
-    /// The door action an ingress call is: a dotted action name as itself, a
-    /// part's bare id as `authored.<id>`; nil for a native tool or an unknown name.
-    static func doorAction(_ tool: String) throws -> String? {
+    /// Map dotted ingress to its action identity and bare part IDs to authored.<id> so admission judges the executed door.
+    static func doorAction(_ tool: String, turn: Turn) throws -> String? {
         let trimmed = tool.trimmingCharacters(in: .whitespacesAndNewlines)
         let action = trimmed.lowercased()
         if action.contains(".") {
-            return try AppActionBinding.action(input: ["action": .string(action)]) != nil ? action : nil
+            return try AppActionBinding.action(input: ["action": .string(action)], turn: turn) != nil ? action : nil
         }
         guard !action.isEmpty, !SwiftToolDispatcher.nativeCanonicalToolNames.contains(action) else { return nil }
         let authored = ToolNameAliases.authoredAction(trimmed)
-        return try AppActionBinding.action(input: ["action": .string(authored)]) != nil ? authored : nil
+        return try AppActionBinding.action(input: ["action": .string(authored)], turn: turn) != nil ? authored : nil
     }
 
-    public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    public func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
         let input = input.filter { $0.key != "__authored_primitive" }
         let action = tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // Folded native calls already came through the door; translate only ingress.
-        // A part reached by its bare name from outside the door — an approved
-        // card's replay, a bridge's direct call — is the door call that runs it
-        // (`authored.<id>`), so its script has the chain to come back through
-        // and the card's exact call is what re-enters under the part's name.
-        if AppDoorReentry.perform == nil, AuthoredToolEffects.call?.tool != tool, let door = try Self.doorAction(tool) {
+        // Translate only ingress; folded native calls already crossed the app door. Bare-part replay must re-enter under its exact approved action and retain
+        // the dispatcher for nested script calls.
+        if invocation.appDoor?.perform == nil, invocation.authoredCall?.tool != tool, let door = try Self.doorAction(tool, turn: turn) {
             var call = input.filter { $0.key.hasPrefix("__") }
             call["action"] = .string(door)
             call["args"] = .object(input.filter { !$0.key.hasPrefix("__") })
-            return try await dispatch(tool: "app", input: call, surface: surface)
+            return try await dispatch(tool: "app", input: call, surface: surface, turn: turn, invocation: invocation)
         }
-        return try await AgentWorkspacePorts.$binding.withValue(ChatWorkspaceBinding.ports) {
-            try await dispatchWithWorkspacePorts(tool: tool, input: input, surface: surface)
-        }
+        return try await dispatchWithWorkspacePorts(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
     }
 
-    private func dispatchWithWorkspacePorts(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
-            let result = try await AgentRecipeStore.$dryRun.withValue(Self.canonical(tool) == "agent_message" && input["dry_run"] == .bool(true)) {
-                try await dispatchNormalized(tool: tool, input: input, surface: surface)
-            }
-            if !AgentConversationContext.isInternalRead, Self.canonical(tool) == "agent_read",
-               case .object(var fields) = result,
-               case .string(let agent)? = fields["agent_id"] ?? fields["agent"], let root = peerDataRoot, try AgentConversationDelivery.door(for: agent, dataRoot: root)?.liveReader == true {
-                fields["worklog"] = AgentConversationView.claudeWorklog()
-                return .object(fields)
-            }
-            return result
+    private func dispatchWithWorkspacePorts(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
+        let result = try await inner.withToolArguments(turn: turn, invocation: invocation, tool: Self.canonical(tool), input: input,
+            surface: surface) { input, invocation in
+            let invocation = invocation.with(\.dryRun, Self.canonical(tool) == "agent_message" && input["dry_run"] == .bool(true))
+            return try await dispatchNormalized(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         }
         // Only an explicit close removes a Chrome tab from the workspace.
         if case .object(let fields) = result,
            fields["tool"] == .string("browser.chrome_close_tab"), fields["tabClosed"] == .bool(true),
            case .int(let tab)? = fields["tabId"], let root = peerDataRoot,
-           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
+           let scope = turn.verifiedSessionID ?? conversationScope, !scope.isEmpty {
             await AgentWorkspaceNavigation.shared.forgetTab(tab: tab,
                 key: root.standardizedFileURL.path + "\u{0}" + scope)
         }
-        // Attach to structured owner results so every provider lane receives
-        // the same replayable receipt, without altering scalar/file contents,
-        // adding synthetic chat turns, or changing the cached prompt prefix.
-        // The person's own thread send has no agent reading its result, so it
-        // must not use up her arrival notices.
-        guard !AgentConversationContext.isInternalRead,
-              !AgentWorkspaceArrivals.insideWorkspaceDispatch, PersonInitiatedSend.current == nil,
+        // Attach replayable receipts only to structured results, preserving scalar/file bytes and the cached prefix. The person's own sends must not consume
+        // notices intended for the agent.
+        guard !invocation.internalRead,
+              !invocation.insideWorkspace, turn.personInitiatedSend == nil,
               case .object(var fields) = result,
               fields["workspace_arrivals"] == nil,
-              let notice = await AgentWorkspaceArrivals.pending(dataRoot: peerDataRoot,
-                scope: ChatToolSessionContext.verifiedSessionId ?? conversationScope) else { return result }
+              let notice = await AgentWorkspaceArrivals.pending(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
+                dataRoot: peerDataRoot, scope: turn.verifiedSessionID ?? conversationScope) else { return result }
         fields["workspace_arrivals"] = notice
         return .object(fields)
     }
 
-    private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // Admit `app` by its action profile, then re-enter the complete chain
-        // for each folded tool or script call. The reached name is active
-        // for that call only; the app door confers no authority on it.
+    private func dispatchNormalized(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
+        // Admit `app` by its action profile, then re-enter the complete chain for each folded tool or script call. The reached name is active for that call
+        // only; the app door confers no authority on it.
         if Self.canonical(tool) == "app" {
-            return try await AppDoorReentry.$validate.withValue({ name, arguments in
+            let door = AppDoorReentry(perform: { name, arguments, turn, invocation in
+                try await self.dispatch(tool: name, input: arguments, surface: surface,
+                    turn: turn.with(\.offeredTools, (turn.offeredTools ?? []).union([name])), invocation: invocation)
+            }, validate: { name, arguments, turn, invocation in
                 if let validating = self.inner as? any PreApprovalToolValidating {
-                    return await validating.preApprovalRefusal(tool: name, input: arguments, surface: surface)
+                    return await validating.preApprovalRefusal(turn: turn, invocation: invocation, tool: name, input: arguments, surface: surface)
                 }
-                return await (self.inner as? any PureToolArgumentValidating)?.argumentRefusal(tool: name, input: arguments)
-            }) {
-                try await AppDoorReentry.$perform.withValue({ name, arguments in
-                    try await LLMCallContext.$turnActiveTools.withValue((LLMCallContext.turnActiveTools ?? []).union([name])) {
-                        try await self.dispatch(tool: name, input: arguments, surface: surface)
-                    }
-                }) {
-                    try await dispatchExact(tool: tool, input: input, surface: surface)
-                }
-            }
+                return await (self.inner as? any PureToolArgumentValidating)?.argumentRefusal(tool: name, input: arguments, turn: turn)
+            }, waitForInteraction: invocation.appDoor?.waitForInteraction)
+            return try await dispatchExact(turn: turn, invocation: invocation.with(\.appDoor, door), tool: tool, input: input, surface: surface)
         }
         if Self.canonical(tool) == "workspace" {
             guard let root = peerDataRoot,
-                  let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty else {
-                throw ToolFailureError("Workspace needs a runtime-bound originating door. No action was performed. Call app {} through a verified turn or native owner's door; creating a transcript or supplying __session_id cannot bind this caller.",
+                  let scope = turn.verifiedSessionID ?? conversationScope, !scope.isEmpty else {
+                throw ToolFailureError("""
+                    Workspace needs a runtime-bound originating door. No action was performed. Call app {} through a verified turn or native \
+                    owner's door; creating a transcript or supplying __session_id cannot bind this caller.
+                    """,
                     argumentPath: "context", accepted: "a verified turn or native owner's tool chain", effects: .none,
                     nextCall: ToolFailureError.call("app"))
             }
-            // Admission to the facade is checked first. Each selected read or
-            // send then re-enters the SAME complete chain under its real name
-            // and complete arguments; workspace cannot confer its authority.
-            let admission = try await dispatchExact(tool: tool, input: input, surface: surface)
+            // Admission to the facade is checked first. Each selected read or send then re-enters the SAME complete chain under its real name and complete
+            // arguments; workspace cannot confer its authority.
+            let admission = try await dispatchExact(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
+            let reply = ToolResult(admission)
             guard case .object(let prepared) = admission,
-                  prepared["status"] == .string("prepared"),
+                  reply.said("prepared"), reply.status == prepared["status"]?.stringValue,
                   prepared["execution"] == .string("requires_workspace_runtime") else { return admission }
-            // Phase 3: workspace looks keep their own Mac frame slot.
-            let result = try await MacLookFrameStore.$source.withValue("workspace") {
-              try await AgentWorkspaceArrivals.$insideWorkspaceDispatch.withValue(true) {
-              try await AgentWorkspaceReadiness.withSnapshot(dataRoot: root) {
-              try await AgentWorkspace.dispatch(input: input, scope: scope, dataRoot: root,
-                catalog: { try await self.inner.listAvailableToolSchemas() }) { name, arguments in
-                // Her own app is never read through the workspace's Mac verbs.
-                if let refusal = await HerScreen.ownAppRefusal(tool: name, input: arguments) { return refusal }
+            // Workspace looks retain their own Mac frame slot.
+            let invocation = invocation.with(\.frameSource, "workspace").with(\.insideWorkspace, true)
+            let result = try await AgentWorkspaceReadiness.withSnapshot(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
+                dataRoot: root) { workspace in
+              try await AgentWorkspace.dispatch(workspace: workspace, input: input, scope: scope, dataRoot: root,
+                catalog: { try await self.inner.listAvailableToolSchemas(turn: turn, surface: surface) }) { name, arguments in
+                // The agent's own app is never read through the workspace's Mac verbs.
+                if let refusal = await AgentScreen.ownAppRefusal(tool: name, input: arguments) { return refusal }
                 let scoped = ChatToolSessionInjection.apply(toolName: name, input: arguments, sessionId: scope)
-                return try await self.dispatch(tool: name, input: scoped, surface: surface)
-              }
-              }
+                return try await self.dispatch(tool: name, input: scoped, surface: surface, turn: turn, invocation: invocation)
               }
             }
             return result
         }
-        // Translate the conversational facade before every admission owner.
-        // Both the facade policy and the actual executor policy remain visible.
-        // Dotted facade aliases are deliberately unsupported: this context has
-        // two policy identities, not three.
-        var input = try namingSavedContact(tool, input)
+        // Keep both facade and executor policy identities visible to admission; dotted aliases would introduce an unwanted third identity.
+        var input = try namingSavedContact(invocation: invocation, tool, input)
         if tool == "agent_message" {
-            try AgentMessageFiles.requireSupported(input, dataRoot: peerDataRoot)
+            try AgentMessageFiles.requireSupported(conversation: invocation.conversation, input, dataRoot: peerDataRoot)
             if try AgentMessageFiles.paths(input["files"]).isEmpty { input.removeValue(forKey: "files") }
         }
         if ["read_page", "browser.chrome_navigate", "browser_chrome_navigate"].contains(Self.canonical(tool)),
            case .string(let url)? = input["url"] { input["url"] = .string(SwiftToolDispatcher.withWebScheme(url)) }
         // Known hosts connect through agent_connect's gates and card before messaging.
-        if tool == "agent_message", !HelperContact.matches(input), PersonInitiatedSend.current == nil, !AgentRecipeStore.dryRun,
+        if tool == "agent_message", !HelperContact.matches(conversation: invocation.conversation, input), turn.personInitiatedSend == nil, !invocation.dryRun,
            case .string(let name)? = input["agent"], !name.contains(":"),
            let row = AgentHostDirectory.row(named: name), let root = peerDataRoot,
-           try AgentConversationDelivery.door(for: name, dataRoot: root) == nil,
-           // "Grok" while "Grok Bot" is saved means that contact, not a second route.
+           // Resolve shortened saved-contact names to that contact so a suffix cannot create a second route.
            !(try AgentPeerStore(dataRoot: root).list()).contains(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
-            return try await connectThenMessage(row: row, input: input, surface: surface)
+            return try await connectThenMessage(turn: turn, invocation: invocation, row: row, input: input, surface: surface)
         }
         if Self.canonical(tool) == "bot_run_once", let root = peerDataRoot,
-           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
-            return try await BotRunConversation.dispatch(input: input, surface: surface, scope: scope, dataRoot: root) { _, input in
-                try await self.dispatchExact(tool: tool, input: input, surface: surface)
+           let scope = turn.verifiedSessionID ?? conversationScope, !scope.isEmpty {
+            return try await BotRunConversation.dispatch(turn: turn, invocation: invocation, input: input, surface: surface, scope: scope,
+                dataRoot: root) { _, input in
+                try await self.dispatchExact(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
             }
         }
-        // Contact waits return conversation reads through agent_read's gates;
-        // wait_seconds adds no Full Mac gate. Screen waits retain wait's admission.
-        // Blank optional contact selectors are absent.
+        // Contact waits return conversation reads through agent_read's gates; wait_seconds adds no Full Mac gate. Screen waits retain wait's admission. Blank
+        // optional contact selectors are absent.
         func blank(_ value: JSONValue) -> Bool {
             if case .string(let text) = value { return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             return value == .null
@@ -217,66 +200,74 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
             throw ToolFailureError("wait_seconds must be an integer from 1 to 300.", argumentPath: "wait_seconds",
                                    accepted: "app {action:\"agent.read\",args:{agent:\"<contact>\",wait_seconds:60}}", effects: .none)
         }
-        if waitsOnRead, input.contains(where: { !blank($0.value) && !["agent", "conversation", "conversation_id", "message_id", "task_id", "details", "session_id", "__session_id"].contains($0.key) }) {
-            throw ToolFailureError("wait_seconds accepts only agent, conversation, conversation_id, message_id, task_id and details. Use max_chars or history/listing filters in a separate read without wait_seconds.",
+        if waitsOnRead, input.contains(where: { !blank($0.value) && !["agent", "conversation", "conversation_id", "message_id", "task_id", "details",
+            "session_id", "__session_id"].contains($0.key) }) {
+            throw ToolFailureError("""
+                wait_seconds accepts only agent, conversation, conversation_id, message_id, task_id and details. Use max_chars or history/listing \
+                filters in a separate read without wait_seconds.
+                """,
                                    argumentPath: "wait_seconds",
                                    accepted: "app {action:\"agent.read\",args:{agent:\"<contact>\",wait_seconds:60}}", effects: .none)
         }
         if (Self.canonical(tool) == "wait" && input["agent"] != nil) || waitsOnRead {
             guard let root = peerDataRoot,
-                  let scope = try ChatToolSessionContext.verifiedSessionId ?? conversationScope
+                  let scope = try turn.verifiedSessionID ?? conversationScope
                     ?? (waitsOnRead ? Self.contactSession(input, dataRoot: root) : nil), !scope.isEmpty else {
-                if waitsOnRead { throw AgentConversationStore.Failure(message: "wait_seconds needs this chat's conversation, which this call does not have. Nothing was read.") }
-                return try await dispatchExact(tool: tool, input: input, surface: surface)
+                if waitsOnRead { throw AgentConversationStore.Failure(message: """
+                    wait_seconds needs this chat's conversation, which this call does not have. Nothing was read.
+                    """) }
+                return try await dispatchExact(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
             }
-            var named = try namingSavedContact("agent_read", input)
+            var named = try namingSavedContact(invocation: invocation, "agent_read", input)
             if waitsOnRead { named["seconds"] = readWait }
-            return try await AgentConversationSession.waitForReply(input: named, scope: scope, dataRoot: root, admit: waitsOnRead) { tool, input in
-                try await self.dispatchNormalized(tool: tool, input: input, surface: surface)
+            return try await AgentConversationSession.waitForReply(turn: turn, mac: invocation.macContext(dataRoot: root),
+                conversation: invocation.conversation, input: named, scope: scope, dataRoot: root, admit: waitsOnRead) { tool, input, turn, conversation, mac in
+                try await self.dispatchNormalized(turn: turn, invocation: invocation.serving(conversation: conversation).serving(mac: mac),
+                    tool: tool, input: input, surface: surface)
             }
         }
-        // A repair's dry run is no exchange of hers: no thread, no record. A
-        // call no chat carries (a scheduled Workshop step) goes on in the
-        // contact's own session, where her side of that conversation lives.
-        if !AgentConversationContext.isInternalRead, !AgentRecipeStore.dryRun,
+        // Dry runs create no exchange or transcript; work without a chat uses the contact's own session.
+        if !invocation.internalRead, !invocation.dryRun,
            ["agent_message", "agent_read", "agent_cancel"].contains(tool), let root = peerDataRoot,
-           let scope = try ChatToolSessionContext.verifiedSessionId ?? conversationScope ?? Self.contactSession(input, dataRoot: root),
+           let scope = try turn.verifiedSessionID ?? conversationScope ?? Self.contactSession(input, dataRoot: root),
            !scope.isEmpty {
-            return try await AgentConversationSession.dispatch(tool: tool, input: input, surface: surface,
-                scope: scope, dataRoot: root) { tool, input in
-                    try await AgentConversationContext.$isInternalRead.withValue(true) {
-                        try await self.dispatch(tool: tool, input: input, surface: surface)
-                    }
+            return try await AgentConversationSession.dispatch(turn: turn, mac: invocation.macContext(dataRoot: root),
+                conversation: invocation.conversation, workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
+                tool: tool, input: input, surface: surface, scope: scope, dataRoot: root) { tool, input, turn, conversation, mac in
+                    // Everything the conversation dispatches is its own internal read or send: marked here, once, it reaches the contact's
+                    // transport and never re-enters this conversation (unmarked, a Grok details read recursed until the app pinned a core).
+                    try await self.dispatch(tool: tool, input: input, surface: surface, turn: turn,
+                        invocation: invocation.serving(conversation: conversation.internalRead).serving(mac: mac))
                 }
         }
-        return try await dispatchExact(tool: tool, input: input, surface: surface)
+        return try await dispatchExact(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
     }
 
-    /// The saved contact's own session (`ContactThread.session`); nil for anything else.
+    /// Only saved contacts may supply ContactThread.session; other routes have no contact-owned session.
     private static func contactSession(_ input: [String: JSONValue], dataRoot: URL) throws -> String? {
-        guard case .string(let named)? = input["agent"] else { return nil }
-        let agent = try AgentConversationDelivery.door(for: named, dataRoot: dataRoot)?.agent ?? named
+        guard case .string(let agent)? = input["agent"] else { return nil }
         return agent.hasPrefix("peer:") ? ContactThread.session(owner: String(agent.dropFirst(5))) : nil
     }
 
-    /// Connect by name, then send the message to the saved contact in the same
-    /// call. Not connected afterwards: the connect's own answer, and nothing sent.
-    private func connectThenMessage(row: AgentHostRow, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    /// Send only after connection succeeds; otherwise preserve the connection result without sending.
+    private func connectThenMessage(turn: Turn, invocation: ChatToolInvocation, row: AgentHostRow, input: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
         var request: [String: JSONValue] = ["name": .string(row.displayName)]
         for key in ["session_id", "__session_id"] { request[key] = input[key] }
         var connect: [String: JSONValue]
         do {
-            let result = try await dispatch(tool: "agent_connect", input: request, surface: surface)
+            let result = try await dispatch(tool: "agent_connect", input: request, surface: surface, turn: turn, invocation: invocation)
             if case .object(let fields) = result { connect = fields } else { connect = ["result": result] }
         } catch {
             connect = ["status": .string("failed"), "detail": .string(ChatToolOutcome.errorMessage(error))]
         }
-        // Send only to the contact this connect made or confirmed, never to
-        // another saved peer that happens to share a name.
+        // Send only to the contact this connect made or confirmed, never to another saved peer that happens to share a name.
+        let reply = ToolResult(.object(connect))
         var handle: String?
-        if case .string(let status)? = connect["status"], ["configured", "connected", "already_configured", "set up"].contains(status) {
+        if reply.status == connect["status"]?.stringValue,
+           ["configured", "connected", "already_configured", "set up"].contains(where: { reply.said($0) }) {
             if case .object(let contact)? = connect["contact"], case .string(let agent)? = contact["agent"] { handle = agent }
-            else if status == "set up", let root = peerDataRoot,
+            else if reply.said("set up"), let root = peerDataRoot,
                     let peer = (try AgentPeerStore(dataRoot: root).list()).first(where: {
                         $0.transport == .grokBot && $0.name.caseInsensitiveCompare(row.displayName) == .orderedSame }) {
                 handle = "peer:" + peer.id
@@ -289,7 +280,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
             return .object(connect)
         }
         named["agent"] = .string(handle)
-        var result = try await dispatchNormalized(tool: "agent_message", input: named, surface: surface)
+        var result = try await dispatchNormalized(turn: turn, invocation: invocation, tool: "agent_message", input: named, surface: surface)
         if case .object(var fields) = result {
             fields["connected_first"] = .object(["status": connect["status"] ?? .string("unknown"),
                                                  "detail": connect["detail"] ?? connect["state_detail"] ?? .null])
@@ -298,37 +289,38 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         return result
     }
 
-    private func dispatchExact(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    private func dispatchExact(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
         let route: AgentConversationRouting.Route?
-        do { route = try AgentConversationRouting.route(tool: tool, input: input, dataRoot: peerDataRoot) }
+        do { route = try AgentConversationRouting.route(conversation: invocation.conversation, tool: tool, input: input) }
         catch let error as AgentConversationRouting.InvalidRequest {
             throw ToolFailureError(error.message, argumentPath: "args",
                 accepted: tool == "agent_read"
                     ? "app {action:\"agent.read\",args:{agent:\"<contact>\",message_id:\"<receipt message_id>\"}}"
-                    : "app {action:\"agent.message\",args:{agent:\"<contact>\",text:\"<message>\"}}; options.timeout_seconds is OMP only", effects: .none)
+                    : "app {action:\"agent.message\",args:{agent:\"<contact>\",text:\"<message>\"}}", effects: .none)
         }
         if let route {
-            let result = try await inner.dispatch(tool: route.tool, input: route.input, surface: surface)
+            let result = try await inner.dispatch(tool: route.tool, input: route.input, surface: surface, turn: turn, invocation: invocation)
             return AgentConversationRouting.wrap(result: result, route: route, input: input)
         }
-        return try await inner.dispatch(tool: Self.canonical(tool), input: input, surface: surface)
+        return try await inner.dispatch(tool: Self.canonical(tool), input: input, surface: surface, turn: turn, invocation: invocation)
     }
 
-    public func listAvailableTools() async throws -> [String] {
-        try await inner.listAvailableTools()
+    public func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
+        try await inner.listAvailableTools(turn: turn, surface: surface)
     }
 
-    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas(named: names)
+    public func listAvailableToolSchemas(named names: Set<String>, turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: names, turn: turn, surface: surface)
     }
 
-    public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas()
+    public func listAvailableToolSchemas(turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(turn: turn, surface: surface)
     }
 }
 
 extension ApprovedChatToolReplay {
-    package func matches(
+    package func matches(turn: Turn,
         tool: String,
         surface: String,
         input: [String: JSONValue],
@@ -341,7 +333,7 @@ extension ApprovedChatToolReplay {
             && self.surface == surface
             && self.input == input
             && self.verifiedSessionID == verifiedSessionID
-            && verifiedChatID == ChatToolSessionContext.verifiedChatId
-            && verifiedUserID == ChatToolSessionContext.verifiedUserId
+            && verifiedChatID == turn.envelope?.verifiedChatId
+            && verifiedUserID == turn.envelope?.verifiedUserId
     }
 }

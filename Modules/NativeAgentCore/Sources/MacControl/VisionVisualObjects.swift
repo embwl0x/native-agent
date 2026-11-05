@@ -7,7 +7,7 @@ import PersistenceCore
 import ScreenCaptureKit
 import Senses
 import Synchronization
-// Blueprint: | `VisionVisualObjects.swift` | `VisionLiveRegionIdentity`, `VisionLiveOccludedRegion`; `VisionPercept`: physical admission, indicator values, shape aliases and spatial relations |
+// Blueprint: | `VisionVisualObjects.swift` | `VisionLiveRegionIdentity`, `VisionLiveOccludedRegion`, `VisionPercept`: Physical evidence and spatial relations |
 
 /// The live scene owns continuity and motion; the compiler owns region meaning.
 public struct VisionLiveRegionIdentity: Sendable, Equatable {

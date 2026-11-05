@@ -6,7 +6,7 @@ import TrustCenter
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupCapture.swift` | TrustBackupPersistence capture and export copying; canonical live persona, sequential local scopes, Make and memory/chat locks, read-only SQLite images; no whole-root transaction |
+// Blueprint: | `TrustBackupCapture.swift` | Locked scope capture and read-only SQLite; canonical live persona. |
 
 public enum TrustBackupPersistence {
     public static func createBackup(reason: String, dataRoot root: URL) async throws -> BackupRecord {
@@ -37,8 +37,7 @@ public enum TrustBackupPersistence {
                 path: backupDir.path,
                 createdAt: now
             )
-            // A backup is also the byte-preserving recovery path for damaged authority state. Creation proves containment and
-            // integrity; only a selected restore target must additionally prove that its authority payload is safe to install.
+            // Capture preserves damaged authority for recovery; containment and integrity precede restore-specific admission.
             _ = try Self.validateBackupSnapshot(
                 id: id,
                 dataRoot: root,
@@ -52,9 +51,7 @@ public enum TrustBackupPersistence {
         }
     }
 
-    /// Writes `<backupDir>/data` and its sealed `manifest.json`. Both forms carry the canonical live persona as `persona`.
-    /// `offDisk` leaves this Mac: the whole data root minus `offDiskExcludedPaths` and credentials, with every SQLite copy
-    /// out of WAL mode so it opens where it lands. The local scope is `backupRelativePaths`.
+    /// Local capture follows backupRelativePaths; off-disk capture excludes credentials and seals SQLite outside WAL mode.
     static func writeBackupSnapshot(
         id: String,
         reason: String,
@@ -77,7 +74,7 @@ public enum TrustBackupPersistence {
             }
             let children = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [])
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            // `<dataRoot>/persona` never shadows the live persona root copied above.
+            // The data-root persona path cannot shadow the canonical live persona.
             for child in children where child.lastPathComponent != "persona" {
                 copied += try await Self.copyOffDiskEntry(child, relative: child.lastPathComponent, into: dataDir, dataRoot: root)
             }
@@ -125,6 +122,7 @@ public enum TrustBackupPersistence {
         let links = try Self.takeBackupLinks(in: dataDir)
         // After the links are gone, so only staged regular files are opened.
         if offDisk {
+            try Self.dropRecordDetails(in: dataDir)
             try Self.convertSQLiteCopiesToRollbackJournal(in: dataDir)
         }
         let files = try Self.backupIntegrityFiles(in: dataDir)
@@ -149,8 +147,7 @@ public enum TrustBackupPersistence {
         return (scope, files)
     }
 
-    /// One read transaction over a possibly live database into a fresh file. Read-only: the backup never writes or checkpoints
-    /// live data.
+    /// Read one coherent live database transaction without writing or checkpointing its source.
     static func copyLiveSQLite(from source: URL, to destination: URL) throws {
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         var configuration = Configuration()
@@ -163,13 +160,11 @@ public enum TrustBackupPersistence {
         try sourceQueue.close()
     }
 
-    // Capture allowlist, never a deletion scope: restore replaces only validated `copied` members of the selected snapshot.
-    // Capture queue references before the attachment tree: the queue owner durably writes each
-    // attachment before publishing its lifecycle reference.
+    // Capture references before attachments because their owner durably writes attachments first. Restore replaces only validated captured members, never the
+    // entire allowlist.
     static let backupRelativePaths: [String] = [
         "trust",
         "memory",
-        "workshop",
         "chat/sessions.json",
         "chat/messages",
         "chat/session_state",
@@ -187,8 +182,6 @@ public enum TrustBackupPersistence {
         "capabilities",
         "graphs",
         "persona",
-        "mcp/servers.json",
-        "mcp/consent/ledger.json",
         "routing",
         "telegram",
         "dream_diary",
@@ -269,12 +262,12 @@ public enum TrustBackupPersistence {
         let fm = FileManager.default
         let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true,
-              ["workshop", "senses", "make"].contains(relative) else {
+              ["senses", "make"].contains(relative) else {
             try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.copyItem(at: source, to: destination)
             return
         }
-        if !["workshop", "senses"].contains(relative) {
+        if relative != "senses" {
             let lock = relative == "make" ? source : source.appendingPathComponent("ops.jsonl")
             try await SwiftNativePersistenceCore.withFileLock(lock) {
                 try await Self.copyLocalSnapshotDirectory(from: source, to: destination, relative: relative)
@@ -307,9 +300,8 @@ public enum TrustBackupPersistence {
         try fm.setAttributes([.posixPermissions: permissions], ofItemAtPath: destination.path)
     }
 
-    /// Copy one mutable file tree while holding the same per-file lock its writers use. Lock sidecars are synchronization
-    /// machinery, not state, and are never restored. Every SQLite database uses the read-only backup owner; no live storage
-    /// owner is opened. A link is kept as a link for the manifest (`takeBackupLinks`).
+    /// Copy under each writer's lock; sidecars are coordination, not restorable state. SQLite uses read-only backup without opening live storage owners; links
+    /// retain raw manifest targets.
     private static func copyLockedSnapshotItem(
         from source: URL,
         to destination: URL

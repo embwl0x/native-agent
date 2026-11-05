@@ -3,9 +3,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `IdentityAbilityChecks.swift` | PersonaEngineCheck uses the canonical compiler, including its checked-missing genesis boundary, and reports named unreadable documents/profile failures; AbilityFilesCheck reports file and seed-install failures |
+// Blueprint: | `IdentityAbilityChecks.swift` | Canonical persona compilation and checked genesis; named profile/ability/seed failures |
 
-/// Persona health uses the same compile owner as turn and context preparation.
+/// Use the turn/context compile owner so Doctor cannot invent a different persona-health verdict.
 public struct PersonaEngineCheck: RepairingDoctorCheck {
     public let id: String = "persona_engine"
     public let title: String = "Persona Engine 2.0"
@@ -29,7 +29,7 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                     title: title,
                     status: "fail",
                     detail: "Persona compiler failed: SOUL.md is absent from \(rootPath)",
-                    harm: "Her identity is missing from the conversation.",
+                    harm: "The agent's identity is missing from the conversation.",
                     repair: nil
                 )
             }
@@ -49,9 +49,15 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                         id: id,
                         title: title,
                         status: "fail",
-                        detail: "Onboarding completed on this Mac but the saved personality profile at \(profileURL.path) is unavailable: \(error.localizedDescription)",
-                        harm: "Her configured identity cannot be loaded reliably.",
-                        human_action: "Open Trust → Advanced → Backups, select a verified backup containing memory/profile.json, then choose Restore → Restore backup to recover the configured names.",
+                        detail: """
+                            Onboarding completed on this Mac but the saved personality profile at \(profileURL.path) is unavailable: \
+                            \(error.localizedDescription)
+                            """,
+                        harm: "The agent's configured identity cannot be loaded reliably.",
+                        human_action: """
+                            Open Trust → Advanced → Backups, select a verified backup containing memory/profile.json, then choose Restore → Restore \
+                            backup to recover the configured names.
+                            """,
                         ask: .permission
                     )
                 }
@@ -68,9 +74,13 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                 title: title,
                 status: "fail",
                 detail: "Persona compiler failed: \(error.localizedDescription)",
-                harm: "Her identity documents cannot be loaded.",
+                harm: "The agent's identity documents cannot be loaded.",
                 repair: nil,
-                human_action: "Preserve existing persona bytes and restore or repair the named unreadable document. Compilation creates checked-missing SOUL, VOICE, USER, GROWTH or AGENTS from their shared onboarding templates only after completed onboarding and a checked profile."
+                human_action: """
+                    Preserve existing persona bytes and restore or repair the named unreadable document. Compilation creates checked-missing \
+                    SOUL, VOICE, USER, GROWTH or AGENTS from their shared onboarding templates only after completed onboarding and a checked \
+                    profile.
+                    """
             )
         }
     }
@@ -99,8 +109,7 @@ public struct AbilityFilesCheck: DoctorCheck {
     public func run() async -> CheckResult {
         let installation = AbilityStore.withLock { Self.seedInstallations[root.standardizedFileURL.path] }
         if let failures = installation?.failures, !failures.isEmpty {
-            // Launch records "filename: error"; name each failed seed without turning an arbitrary error body into the check's
-            // prose.
+            // Name each failed seed from filename: error; arbitrary error bodies cannot become Doctor prose.
             let seeds = failures.compactMap { failure in
                 failure.range(of: ": ").map { String(failure[..<$0.lowerBound]) }
             }
@@ -108,7 +117,10 @@ public struct AbilityFilesCheck: DoctorCheck {
                 detail: "Bundled seed installation has \(failures.count) failure(s): "
                     + (seeds.isEmpty ? "the bundled ability directory could not be read" : seeds.joined(separator: ", ")) + ".",
                 harm: "Bundled parts could not be installed; their capabilities are unavailable.",
-                human_action: "Tell the person: NativeAgent could not install the named bundled parts; preserve existing parts and the reported installation errors.", owner: .builder)
+                human_action: """
+                    Tell the person: NativeAgent could not install the named bundled parts; preserve existing parts and the reported \
+                    installation errors.
+                    """, owner: .builder)
         }
         do {
             let inventory = try AbilityStore(dataRoot: root).inventory()
@@ -126,7 +138,7 @@ public struct AbilityFilesCheck: DoctorCheck {
             } ?? " Bundled seed installation has not been observed this launch."
             return CheckResult(source: "abilities/", id: id, title: title, status: "ok", detail: "\(files.count) ability files read successfully." + seeds)
         } catch {
-            // AbilityStore's own no names its file and lever; an unattributed one is the store's.
+            // Preserve the store owner's attributed file and remedy; unattributed failure belongs to the store.
             let failure = (error as? ToolFailureError).flatMap { $0.owner == nil ? nil : $0 }
                 ?? AbilityStore(dataRoot: root).repairFailure(source: root.appendingPathComponent("abilities"), detail: error.localizedDescription)
             return CheckResult(source: failure.owner, nextCall: failure.nextCall,

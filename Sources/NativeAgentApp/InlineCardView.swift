@@ -1,7 +1,6 @@
 import ApprovalTransactions
 import EngineRuntime
 import ChatToolRuntime
-import MacIntegration
 import NativeAgentShared
 import SwiftUI
 import AppKit
@@ -30,8 +29,6 @@ extension InlineCardKind {
 }
 
 extension InlineCardModel {
-    /// Which mark a terminal card wears. A failure is not a receipt, so it
-    /// never reaches here as one — see `InlineCardView`.
     var mark: InlineCardMark {
         switch state {
         case .settled: return .done
@@ -42,25 +39,18 @@ extension InlineCardModel {
     }
 }
 
-/// What the person did. Resolution belongs to the mechanism; the view only
-/// says which command was taken and with what.
 enum InlineCardAction: Sendable, Equatable {
-    /// The primary command, carrying whatever the card collected: `value` is
-    /// the first field, `values` every field by id.
+    /// Keep the first field in `value` and every field in `values` so the action receives the complete form.
     case primary(value: String?, choice: String?, values: [String: String] = [:])
-    /// The quiet "Open full setup" link.
     case fullSetup
-    /// The quiet secondary: "Not now", "Don't send", "Decide later".
     case secondary
-    /// Retry after a safe failure.
     case retry
-    /// Stop the work this card is showing.
     case stop
 }
 
 typealias InlineCardActionSink = @MainActor (InlineCardAction) -> Void
 
-/// Radio rows. Selecting a row never executes the choice — the primary does.
+/// Selecting a radio row must not execute it; only the primary command does.
 struct InlineCardChoiceList: View {
     let choices: [InlineCardChoice]
     @Binding var selection: String?
@@ -102,8 +92,7 @@ struct InlineCardChoiceList: View {
     }
 }
 
-/// A labelled field. A secret is typed into a `SecureField` and goes to the
-/// action closure, never into transcript content.
+/// Send secrets through the action closure, never transcript content.
 struct InlineCardSecretField: View {
     let field: InlineCardField
     @Binding var value: String
@@ -142,9 +131,6 @@ struct InlineCardSecretField: View {
 
 // MARK: - The model-driven card
 
-/// One card for one interaction, through every state it passes: ready, in
-/// flight, settled, declined, failed. It appears in place and settles in
-/// place — no bounce, no shimmer, and no modal anywhere.
 struct InlineCardView: View {
     let model: InlineCardModel
     let action: InlineCardActionSink
@@ -153,11 +139,7 @@ struct InlineCardView: View {
     @State private var selection: String?
     @State private var relaunchError: String?
 
-    /// A card that collects something keeps its controls while it submits: the
-    /// primary takes the spinner and the busy label ("Connecting…"), the quiet
-    /// secondary stays live, and the dimensions do not move. A card that is
-    /// merely showing work in flight has nothing to submit, so it gets the busy
-    /// line and its Stop instead.
+    /// Keep collected controls mounted during submission so values and dimensions survive while the primary shows busy.
     private var collectsInput: Bool {
         !model.fields.isEmpty || !model.choices.isEmpty
     }
@@ -166,7 +148,6 @@ struct InlineCardView: View {
         (fieldValues[field.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Nothing typed and a sign-in offered: the primary signs in.
     private var signsIn: Bool {
         model.signInLabel != nil && model.fields.allSatisfy { typed($0).isEmpty }
     }
@@ -174,7 +155,7 @@ struct InlineCardView: View {
     private var primaryEnabled: Bool {
         if !model.choices.isEmpty && selection == nil { return false }
         if signsIn { return true }
-        // Required fields stay visible and disable submission until filled.
+        // Keep required fields visible so incomplete input explains disabled submission.
         return model.fields.allSatisfy { $0.isOptional || !typed($0).isEmpty }
     }
 
@@ -182,14 +163,13 @@ struct InlineCardView: View {
         Binding(get: { fieldValues[id] ?? "" }, set: { fieldValues[id] = $0 })
     }
 
-    /// Every field the card shows, before its buttons in the key-view order.
     private var fieldRows: some View {
         ForEach(model.fields, id: \.id) { field in
             InlineCardSecretField(field: field, value: fieldBinding(field.id))
         }
     }
 
-    /// Values travel in the action, never in the transcript.
+    /// Form values travel in actions, never transcripts.
     private func submit() {
         var values: [String: String] = [:]
         for field in model.fields where !typed(field).isEmpty { values[field.id] = typed(field) }
@@ -200,8 +180,7 @@ struct InlineCardView: View {
     @ViewBuilder
     private var fullSetupLink: some View {
         if let label = model.fullSetupLabel {
-            // Secondary text, underlined: a link without system blue, which
-            // would be a second accent on the card.
+            // Underline secondary links without introducing a second accent colour.
             Button { action(.fullSetup) } label: {
                 Text(label).underline().foregroundStyle(NativeAgentShell.secondary)
             }
@@ -211,7 +190,6 @@ struct InlineCardView: View {
         }
     }
 
-    /// The primary names the selected choice's outcome, or the card's own.
     private var primaryLabel: String {
         if signsIn, let signIn = model.signInLabel { return signIn }
         if let picked = selection,
@@ -223,7 +201,6 @@ struct InlineCardView: View {
     }
 
     var body: some View {
-        // A card becomes its receipt in place without crossfading.
         switch model.state {
         case .pending, .running:
             liveCard.transition(.identity)
@@ -238,7 +215,6 @@ struct InlineCardView: View {
         }
     }
 
-    // A live card: the fill, the ask, the control, and what declining costs.
     private var liveCard: some View {
         InlineCard(symbol: model.kind.symbol,
                    symbolTint: NativeAgentShell.needsYou,
@@ -255,7 +231,6 @@ struct InlineCardView: View {
                 if model.state == .running && !collectsInput {
                     runningRow
                 } else {
-                    // What a running sign-in asks of the person (a device code) shows beside its fields too.
                     if model.state == .running, let note = model.busyNote { InlineCardBusyLine(text: note) }
                     InlineCardActions(
                         primary: model.state == .running
@@ -270,20 +245,19 @@ struct InlineCardView: View {
                     fullSetupLink
                 }
                 details
-                screenRecordingRelaunch
+                cardRestart
             }
         }
         .accessibilityIdentifier("inline-card.\(model.kind.rawValue)")
     }
 
+    /// The person's tap is the authority for this restart, under any Trust posture; the agent's own restart_app keeps its gate.
     @ViewBuilder
-    private var screenRecordingRelaunch: some View {
-        if (model.state == .running || model.state == .failed),
-           model.systemPermissions.contains(.screenRecording),
-           SystemPermissionPreflight.status(.screenRecording) != .granted {
-            Text("If you've allowed Screen Recording, relaunch to finish. Your work will continue.")
+    private var cardRestart: some View {
+        if let note = model.restartNote {
+            Text(note)
                 .font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
-            Button("Relaunch to finish") {
+            Button("Restart NativeAgent") {
                 AppRelaunch.relaunchApp(terminate: { AppDelegate.terminateForRestart() },
                     onSpawnFailure: { relaunchError = "Could not relaunch NativeAgent: \($0.localizedDescription)" })
             }
@@ -291,8 +265,6 @@ struct InlineCardView: View {
         }
     }
 
-    // Still, not shimmering: one indicator, the honest note beside it, and Stop
-    // wherever the owning operation supports it.
     private var runningRow: some View {
         HStack(spacing: NativeAgentSpacing.sm) {
             InlineCardBusyLine(text: model.busyNote ?? (model.busyLabel ?? "Working…"))
@@ -300,11 +272,14 @@ struct InlineCardView: View {
             if model.canStop {
                 InlineCardSecondaryButton(title: "Stop") { action(.stop) }
             }
+            // A permission card waiting on macOS can wait across a restart; the person can still leave the rest off.
+            if model.kind == .needsPermission {
+                InlineCardSecondaryButton(title: model.secondaryLabel) { action(.secondary) }
+            }
         }
     }
 
-    // A failure keeps the card — the entered values, the explanation, and a
-    // retry only when retrying is safe.
+    // Keep failed cards and entered values; offer retry only when safe.
     private var failedCard: some View {
         InlineCard(symbol: model.kind.symbol,
                    symbolTint: NativeAgentShell.trouble,
@@ -312,10 +287,7 @@ struct InlineCardView: View {
                    reason: model.outcomeMeta ?? model.why) {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                 fieldRows
-                // A failure keeps what the card COLLECTS, not just what was
-                // typed into it: a remount has no selection, so a failed
-                // choice card with no list has nothing to answer with and
-                // "Try again" submits nil for ever.
+                // Keep choices mounted on failure so retry cannot submit a lost selection.
                 if !model.choices.isEmpty {
                     InlineCardChoiceList(choices: model.choices, selection: $selection)
                 }
@@ -325,9 +297,7 @@ struct InlineCardView: View {
                         primaryEnabled: primaryEnabled,
                         secondary: model.secondaryLabel,
                         consequence: model.consequence,
-                        // A failure keeps what was typed, so the retry carries
-                        // it: a key the provider rejected is corrected in place
-                        // rather than re-entered from nothing.
+                        // Keep rejected input editable so retry uses the corrected value.
                         onPrimary: {
                             if collectsInput {
                                 submit()
@@ -340,7 +310,7 @@ struct InlineCardView: View {
                 }
                 fullSetupLink
                 details
-                screenRecordingRelaunch
+                cardRestart
             }
         }
         .accessibilityIdentifier("inline-card.\(model.kind.rawValue).failed")
@@ -351,7 +321,6 @@ struct InlineCardView: View {
                           outcome: model.outcome ?? model.title,
                           meta: model.outcomeMeta,
                           detailsLabel: model.detailsBody == nil ? nil : (model.detailsLabel ?? "Details"),
-                          // A decline is the quietest thing in the transcript.
                           quiet: model.state == .declined) {
             if let body = model.detailsBody {
                 Text(body)
@@ -382,7 +351,6 @@ struct InlineCardView: View {
         }
     }
 
-    /// Decision details explain the effect and duration, with persistence in the mechanics.
     @ViewBuilder
     private var details: some View {
         let note = model.persistenceNote

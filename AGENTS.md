@@ -56,6 +56,10 @@ is a defect to fix at once. First law: docs/NORTHSTAR.md.
 - **Stop cancels the work, never its settlement** ([docs/STOP.md](docs/STOP.md)):
   saving what was produced, the one terminal record and releasing what was held
   run through `settle { … }`, exactly once, however the work ended.
+- **A turn is held, never inherited** ([docs/ANATOMY_OF_A_TURN.md §1](docs/ANATOMY_OF_A_TURN.md#1-a-surface-admits-the-turn)):
+  one `Turn` value, made once at ingress and handed to everything that serves
+  it; an owner's per-turn state is a `TurnPart` on it. Task-locals carry only
+  the call stack's own facts: trace correlation and the locks it holds.
 - **One owner's snapshot reads through `LatestRead`.** A read returns what it
   read; publication moves forward only (an older read never replaces a newer
   snapshot, a committed write publishes through `write`). Never hand-roll a

@@ -5,7 +5,7 @@ import PersistenceCore
 import TriggerScheduler
 // Blueprint: | `StandingBotsDisk.swift` | `StandingBotsDisk` struct; `validatePath`, `locked` |
 
-/// Both stores share one short, synchronous cross-process transaction boundary.
+/// Share one synchronous cross-process boundary so definition and shelf transactions cannot interleave.
 struct StandingBotsDisk: Sendable {
     let root: URL
     private let dataRoot: URL
@@ -14,8 +14,7 @@ struct StandingBotsDisk: Sendable {
         root = self.dataRoot.appendingPathComponent("bots", isDirectory: true)
     }
 
-    /// Resolve the configured root once, but never follow links within bot storage,
-    /// including dangling links. All disk entry points share this boundary.
+    /// Resolve the root once, rejecting storage symlinks, including dangling links, on every disk path.
     func validatePath(_ path: URL) throws {
         guard let relative = NativeAgentWorkspaceRoot.relativePath(path.standardizedFileURL.path, under: dataRoot.path), !relative.isEmpty else {
             throw StandingBotsError.corruptStore("bot storage outside data root")
@@ -114,9 +113,7 @@ struct StandingBotsDisk: Sendable {
         }
     }
 
-    /// `due` is the occurrence a run claimed: its civil minute is spent, so a
-    /// fall-back hour never hands a daily 01:59 the second 01:59 (the
-    /// scheduler's `nextRunEpochAfterNow(beyond:)`).
+    /// Spend the claimed civil minute so a repeated DST hour cannot run the same daily occurrence twice.
     static func nextOccurrence(_ bot: BotDefinition, after date: Date,
                                lastRunAt: Date? = nil, beyond due: Date? = nil,
                                minimumInterval: TimeInterval? = nil) throws -> Date {
@@ -129,8 +126,7 @@ struct StandingBotsDisk: Sendable {
                 "type": .string("cron"), "expression": .string(expression)
             ])])
             do {
-                // Configuration time is not a run. Space cron occurrences only
-                // against a run that actually happened, including the floor itself.
+                // Apply the spacing floor to actual runs; configuration time cannot prove execution.
                 let after = max(date.timeIntervalSince1970,
                     lastRunAt.map { $0.addingTimeInterval(minimumInterval).timeIntervalSince1970.nextDown }
                         ?? date.timeIntervalSince1970)

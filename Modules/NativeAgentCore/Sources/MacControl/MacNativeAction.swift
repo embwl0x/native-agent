@@ -19,7 +19,7 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacNativeAction.swift` | Native acts through the existing text-editing and hand owners; exact double/right click and hover retain the resolved element and per-event key-window gate; canonical effect verification |
+// Blueprint: | `MacNativeAction.swift` | Native actions share text/hand owners, exact resolved targets, per-event focus checks and effect verification |
 
 extension SwiftNativeMacControl {
     func summarize(
@@ -56,9 +56,9 @@ extension SwiftNativeMacControl {
         direction: MacActScrollDirection,
         /// Background acts never raise; sites needing the front refuse `needs_front`, while typing addresses the app through AX or pid.
         background: Bool = false,
-        /// `type` as real keystrokes, never AXSetValue: a search field (or one
-        /// a return is about to submit) runs its action only on real typing.
-        keystrokes: Bool = false
+        /// Search and submit handlers need real typing; AXSetValue alone may not invoke them.
+        keystrokes: Bool = false,
+        turn: Turn, context: MacOperationContext
     ) async -> MacActPerformed? {
         var didActuate = false
         var axOutcomes: [JSONValue] = []
@@ -71,23 +71,23 @@ extension SwiftNativeMacControl {
 
         // Ledger every AX mutation before inspecting its return status: a failed reply does not prove no effect occurred.
         func ledgeredPerform(_ actTarget: MacAXActTarget, action: String) -> MacAXActOutcome {
-            let outcome = accessibilityActSource.perform(actTarget, action: action)
+            let outcome = accessibilityActSource(context: context).perform(actTarget, action: action, turn: turn, context: context)
             recordAXOutcome(outcome)
             if outcome.emissionAttempted { noteActuation(action) }
             return outcome
         }
         func ledgeredSetFocused(_ actTarget: MacAXActTarget) -> MacAXActOutcome {
-            let outcome = accessibilityActSource.setFocused(actTarget)
+            let outcome = accessibilityActSource(context: context).setFocused(actTarget, turn: turn, context: context)
             recordAXOutcome(outcome)
             if outcome.emissionAttempted { noteActuation("AXFocused") }
             return outcome
         }
         /// Read front/focus together and name both windows in a refusal.
         func liveKeyWindowRefusal() -> MacActClosedLoop.KeyWindowRefusal? {
-            let frontmost = accessibilitySource.frontmostApp()
-            let focused = accessibilityActSource.focusedWindow(pid: framePid)
+            let frontmost = accessibilitySource(context: context).frontmostApp()
+            let focused = accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context)
             let appWindowCount: Int?
-            do { appWindowCount = focused == nil ? try accessibilityActSource.windows(pid: framePid).count : nil }
+            do { appWindowCount = focused == nil ? try accessibilityActSource(context: context).windows(pid: framePid, context: context).count : nil }
             catch { return MacActClosedLoop.KeyWindowRefusal(reason: "window_evidence_unavailable", note: error.localizedDescription) }
             return MacActClosedLoop.keyWindowRefusal(
                 framePid: framePid,
@@ -97,16 +97,13 @@ extension SwiftNativeMacControl {
                 focusedWindowHandle: focused?.handle,
                 frameWindowTitle: actWindow.identity.title,
                 focusedWindowTitle: focused?.identity.title,
-                // Counted ONLY when the focused window could not be named —
-                // that is the single branch that consults it, and enumerating
-                // an app's windows is several AX round-trips at a gate that
-                // runs more than once per act.
+                // Count windows only when focus lacks identity; repeated enumeration would burden every emission gate.
                 appWindowCount: appWindowCount
             )
         }
 
         func refuseInput(_ requestedAction: String) -> MacActPerformed? {
-            if let refusal = MacWorkContinuation.current?.refusal() {
+            if let refusal = turn.macContinuation?.refusal(context: context) {
                 return MacActPerformed(ok: false, method: "none", requestedAction: requestedAction,
                     error: "continuation_unavailable", target: target,
                     postState: nil, actedHandle: handle, extra: ["guidance": .string(refusal)])
@@ -122,7 +119,7 @@ extension SwiftNativeMacControl {
                     requestedAction: requestedAction,
                     error: "needs_front",
                     target: target,
-                    postState: didActuate ? accessibilityActSource.reread(target) : nil,
+                    postState: didActuate ? accessibilityActSource(context: context).reread(target, context: context) : nil,
                     actedHandle: handle,
                     extra: [
                         "posted_events": .int(0),
@@ -140,14 +137,17 @@ extension SwiftNativeMacControl {
                     requestedAction: requestedAction,
                     error: nil,
                     target: target,
-                    postState: accessibilityActSource.reread(target),
+                    postState: accessibilityActSource(context: context).reread(target, context: context),
                     actedHandle: handle,
                     extra: [
                         "posted_events": .int(0),
                         "actuations_attempted": .array(actuationsAttempted.map { .string($0) }),
                         "key_window_changed_after_actuation": .bool(true),
                         "guidance": .string(
-                            "The Accessibility action was delivered, but this frame's window is no longer key or could not be confirmed key. No synthetic input was posted. Read effect for observed changes; the requested outcome remains unverified."
+                            """
+                                The Accessibility action was delivered, but this frame's window is no longer key or could not be confirmed key. No synthetic \
+                                input was posted. Read effect for observed changes; the requested outcome remains unverified.
+                                """
                         ),
                     ]
                 )
@@ -170,24 +170,23 @@ extension SwiftNativeMacControl {
         /// Semantic presses use only the app's advertised AXPress handler.
         func press(_ pressTarget: MacAXActTarget, actedHandle: String, extra: [String: JSONValue] = [:]) async -> MacActPerformed {
             let result = await MacAccessibilityActuator.act(
-                source: accessibilityActSource, target: pressTarget,
+                source: accessibilityActSource(context: context), target: pressTarget,
                 action: MacAccessibilityActuator.defaultAction, value: nil
-            )
+            , turn: turn, context: context)
             recordAXOutcome(result.outcome)
             if result.outcome.emissionAttempted { noteActuation(result.requestedAction) }
             return summarize(result, target: pressTarget, actedHandle: actedHandle, extra: extra, text: text)
         }
 
         let performed = await { () async -> MacActPerformed? in
-        if let refusal = MacWorkContinuation.current?.refusal() {
+        if let refusal = turn.macContinuation?.refusal(context: context) {
             return MacActPerformed(ok: false, method: "none", requestedAction: verb.rawValue,
                 error: "continuation_unavailable", target: target,
                 postState: nil, actedHandle: handle, extra: ["guidance": .string(refusal)])
         }
         switch verb {
         case .doubleClick, .rightClick, .hover:
-            // The handle's process/window/identity have already been resolved
-            // by handleAct. Keep that element through the physical emission.
+            // Keep the element already validated by handleAct through physical emission.
             guard target.enabled, eventSink.isAvailable else {
                 return MacActPerformed(ok: false, method: "none", requestedAction: verb.rawValue,
                     error: target.enabled ? "event_injection_unavailable" : "element_disabled",
@@ -200,7 +199,7 @@ extension SwiftNativeMacControl {
             let plan = verb == .hover ? MacHandRepertoire.hover(at: centre, dwellMs: 300)
                 : MacHandRepertoire.click(button: verb == .rightClick ? .right : .left,
                     at: centre, count: verb == .doubleClick ? 2 : 1)
-            let emission = await executeHand(plan, action: "act", body: body) { _ in
+            let emission = await executeHand(plan, action: "act", body: body, turn: turn, context: context) { _ in
                 if let refusal = refuseInput(verb.rawValue) {
                     return self.injectionRefusal(action: "act", error: refusal.error ?? "focus_moved")
                 }
@@ -209,16 +208,15 @@ extension SwiftNativeMacControl {
             return MacActPerformed(ok: emission.refusal == nil,
                 method: "cgevent_\(verb.rawValue)", requestedAction: verb.rawValue,
                 error: emission.refusal?.error, target: target,
-                postState: accessibilityActSource.reread(target), actedHandle: handle,
+                postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                 extra: ["posted_events": .int(Int64(emission.emitted))])
         case .focus:
             let outcome = ledgeredSetFocused(target)
             return MacActPerformed(ok: outcome == .performed, method: outcome == .performed ? "ax_focus" : "none",
                 requestedAction: "AXFocused", error: outcome == .performed ? nil : "focus_refused", target: target,
-                postState: accessibilityActSource.reread(target), actedHandle: handle)
+                postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle)
         case .click, .select, .toggle:
-            // Background: pressing something whose job is to open a menu would
-            // pop that menu over the person's screen. It needs the front.
+            // Opening a background menu would cover the person’s screen, so it requires the front.
             if background, ["AXMenuBarItem", "AXMenuButton", "AXPopUpButton"].contains(target.role) {
                 return MacActPerformed(
                     ok: false, method: "none", requestedAction: MacAccessibilityActuator.defaultAction,
@@ -237,30 +235,22 @@ extension SwiftNativeMacControl {
             guard target.actions.contains("AXOpen") else {
                 return MacActPerformed(ok: false, method: "none", requestedAction: "AXOpen",
                     error: "verb_not_supported_on_element", target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: ["posted_events": .int(0), "guidance": .string(
                         "This control does not advertise AXOpen. Inspect this app's controls and choose an observed supported action.")])
             }
             let outcome = ledgeredPerform(target, action: "AXOpen")
             return MacActPerformed(ok: outcome == .performed, method: "ax_action", requestedAction: "AXOpen",
                 error: outcome == .performed ? nil : "ax_open_outcome_unknown",
-                target: target, postState: accessibilityActSource.reread(target), actedHandle: handle)
+                target: target, postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle)
 
         case .type:
-            return await typeText(body: body, entry: entry, framePid: framePid, actWindow: actWindow,
-                target: target, handle: handle, text: text, typeMode: typeMode, background: background,
-                keystrokes: keystrokes, noteActuation: noteActuation, recordAXOutcome: recordAXOutcome, refuseInput: refuseInput,
-                ledgeredSetFocused: ledgeredSetFocused)
+            return await typeText(body: body, entry: entry, framePid: framePid, actWindow: actWindow, target: target, handle: handle, text: text,
+                typeMode: typeMode, background: background, keystrokes: keystrokes, noteActuation: noteActuation, recordAXOutcome: recordAXOutcome,
+                refuseInput: refuseInput, turn: turn, context: context, ledgeredSetFocused: ledgeredSetFocused)
 
         case .dismiss:
-            // The modal's OWN Cancel/Close/Dismiss/Done/OK button, found in the
-            // CURRENT frame and scoped by path prefix to the modal — a window
-            // behind a sheet often has its own "Close", and pressing that would
-            // act on the wrong surface entirely.
-            // The press must answer to what she named: the named control itself
-            // when it IS a Cancel/Close/Done/OK, else the dismiss button of the
-            // SAME modal the named thing sits in. "dismiss Delete" never presses
-            // some other modal's Cancel.
+            // Dismiss only the named control or its own modal’s dismiss button; a behind-sheet Close must never receive the press.
             let namedDismiss = MacActClosedLoop.normalizedLabel(entry.label).map {
                 MacActClosedLoop.dismissLabels.contains($0.lowercased())
             } ?? false
@@ -270,10 +260,10 @@ extension SwiftNativeMacControl {
                 return MacActClosedLoop.dismissTarget(in: frame)
             }()
             if let dismissEntry = sameModalDismiss,
-               case .resolved(let dismissTarget) = accessibilityActSource.resolve(
+               case .resolved(let dismissTarget) = accessibilityActSource(context: context).resolve(
                    path: dismissEntry.path,
                    inWindow: actWindow
-               ),
+               , context: context),
                MacActClosedLoop.driftReason(
                    expectedRole: dismissEntry.role,
                    expectedLabel: dismissEntry.label,
@@ -299,7 +289,7 @@ extension SwiftNativeMacControl {
             }
             return MacActPerformed(ok: false, method: "none", requestedAction: "dismiss",
                 error: "dismiss_target_unavailable", target: target,
-                postState: accessibilityActSource.reread(target), actedHandle: handle,
+                postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                 extra: ["posted_events": .int(0), "guidance": .string(
                     "The observed dismiss button is missing, unreadable or changed. Read this modal again before dismissing it.")])
 
@@ -312,31 +302,30 @@ extension SwiftNativeMacControl {
                     requestedAction: "scroll",
                     error: "event_injection_unavailable",
                     target: target,
-                    postState: accessibilityActSource.reread(target),
+                    postState: accessibilityActSource(context: context).reread(target, context: context),
                     actedHandle: handle
                 )
             }
             guard let centre = target.centre, centre.x.isFinite, centre.y.isFinite else {
                 return MacActPerformed(ok: false, method: "none", requestedAction: "scroll",
                     error: "target_geometry_unavailable", target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: ["posted_events": .int(0), "guidance": .string(
                         "This scroll target has no readable frame. Read its window again before scrolling it.")])
             }
             if let refusal = refuseInput("scroll") { return refusal }
-            // `down` moves the CONTENT up, which is what a human means by
-            // scrolling down. Three lines: one notch of a physical wheel.
+            // Scrolling down moves content up; three lines match one physical wheel notch.
             let deltaY: Int32 = direction == .down ? -3 : 3
             let plan = MacHandRepertoire.move(to: centre)
                 + MacHandRepertoire.scroll(dx: 0, dy: deltaY, unit: .line)
-            let emission = await executeHand(plan, action: "act", body: body)
+            let emission = await executeHand(plan, action: "act", body: body, turn: turn, context: context)
             return MacActPerformed(
                 ok: emission.refusal == nil,
                 method: "cgevent_scroll",
                 requestedAction: "scroll",
                 error: emission.refusal?.error,
                 target: target,
-                postState: accessibilityActSource.reread(target),
+                postState: accessibilityActSource(context: context).reread(target, context: context),
                 actedHandle: handle,
                 extra: [
                     "direction": .string(direction.rawValue),

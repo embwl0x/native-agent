@@ -7,10 +7,8 @@ import Observation
 import TurnTrace
 import SwiftUI
 
-// Blueprint: | `InspectorView.swift` | `InspectorView` and `TurnInspectorStore`: per-window live/replay selection over engine traces with separate requested/displayed date provenance |
+// Blueprint: | `InspectorView.swift` | `InspectorView`, `TurnInspectorStore`: window-owned replay/live trace provenance |
 
-// Engine trace evidence supplies live cards and replay; each window owns its
-// mode, selected replay date and presentation result.
 
 struct InspectorView: View {
     let feed: TurnInspectorFeed
@@ -126,9 +124,9 @@ struct InspectorView: View {
                 .foregroundStyle(NativeAgentShell.secondary)
             Text(store.mode == .live
                  ? "Waiting for a turn — send a message to watch it happen."
-                 : (store.replayReadIssue ?? (store.replayFileExists
+                 : (store.replayReadIssue ?? (store.replayHasEvidence
                     ? "No readable turns recorded for this date."
-                    : "Nothing was saved for this date.")))
+                    : "Nothing was recorded for this date.")))
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -158,7 +156,6 @@ private struct TurnCardView: View {
             }
         }
         .padding(NativeAgentSpacing.md)
-        // Content-layer cards use a fill without glass.
         .aliveCard(radius: NativeAgentRadius.panel)
     }
 
@@ -261,8 +258,7 @@ private struct EventRowView: View {
 }
 
 
-/// Requested replay dates and displayed evidence have separate provenance.
-/// A slow read may retain useful cards, but never relabel them as the new day.
+/// Keep requested and displayed dates separate so a slow replay read cannot relabel retained evidence.
 enum TurnInspectorReplayPresentation: Equatable {
     case loading(requested: Date, retained: Date?)
     case loaded(Date)
@@ -296,7 +292,6 @@ enum TurnInspectorReplayPresentation: Equatable {
     }
 }
 
-// Each window keeps its mode, replay selection and display filter.
 @MainActor
 @Observable
 final class TurnInspectorStore {
@@ -316,7 +311,7 @@ final class TurnInspectorStore {
     private(set) var replayDate = Date()
     private(set) var replaySkipped = 0
     private(set) var replayLoading = false
-    private(set) var replayFileExists = true
+    private(set) var replayHasEvidence = true
     private(set) var replayLoadedDate: Date?
     @ObservationIgnored private let replayRead = LatestRead()
     private(set) var replayReadIssue: String?
@@ -345,24 +340,24 @@ final class TurnInspectorStore {
 
     func clearLive() { clearBefore = Date() }
 
-    /// The engine returns grouped evidence; only this window's newest selection
-    /// may publish it, so overlapping replay dates cannot relabel old cards.
+    /// Only the newest window selection may publish grouped evidence, preventing overlapping reads from relabeling old cards.
     func loadReplay(for date: Date) async {
         guard let feed else { return }
         replayDate = date
         replayLoading = true
         replayReadFailure = nil
-        _ = await replayRead.read { () -> Result<(exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]), Error> in
+        typealias Replay = (hasEvidence: Bool, unreadable: Int, cards: [InspectorTurnCard])
+        _ = await replayRead.read { () -> Result<Replay, Error> in
             do { return Result.success(try await feed.loadReplay(for: date)) }
-            catch { return Result<(exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]), Error>.failure(error) }
+            catch { return Result<Replay, Error>.failure(error) }
         } publish: { result in
             switch result {
             case .success(let read):
                 replayReadFailure = nil
                 replayCards = read.cards
-                replayFileExists = read.exists
-                replaySkipped = read.report.malformedLineCount
-                replayReadIssue = read.report.trailingPartialLine ? "The final trace row is incomplete." : nil
+                replayHasEvidence = read.hasEvidence
+                replaySkipped = read.unreadable
+                replayReadIssue = nil
                 replayLoadedDate = date
             case .failure(let error):
                 replayReadIssue = error.localizedDescription

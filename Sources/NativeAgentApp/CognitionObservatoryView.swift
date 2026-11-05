@@ -6,12 +6,11 @@ import BackgroundLoops
 import TurnTrace
 import SwiftUI
 
-// Blueprint: | `CognitionObservatoryView.swift` | `CognitionObservatoryView`: live panel assembly, live dependency reads, override controls and persistence/feedback presentation |
+// Blueprint: | `CognitionObservatoryView.swift` | `CognitionObservatoryView`: Live panels, overrides and persistence feedback |
 
 enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
     case controls
     case contextFlow
-    case workshop
     case organism
     case loop
     case workspace
@@ -109,11 +108,11 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled)
                         Stepper("Reflections in 24 hours: \(reflectionBudget)", value: reflectionBudgetBinding, in: 0...8)
                             .disabled(!enabled || !reflectionEnabled)
-                        // One home per switch: the inner life, reflection and
-                        // moods are switched on Settings, and the master sets
-                        // ALL of these together; these are the Observatory
-                        // overrides that live only here.
-                        Text("An inner life, reflection and moods are switched in Settings \u{25B8} Inner life. Turning the inner life on or off there resets these too.")
+                        // Keep master switches in Settings and only Observatory overrides here so each control has one home.
+                        Text("""
+                            An inner life, reflection and moods are switched in Settings \u{25B8} Inner life. Turning the inner life on or off there resets \
+                            these too.
+                            """)
                             .font(.caption2)
                             .foregroundStyle(NativeAgentShell.secondary)
                         HStack(spacing: NativeAgentSpacing.sm) {
@@ -147,7 +146,10 @@ struct CognitionObservatoryView: View {
                                     case .persistenceFailed(let detail):
                                         dependencies.systemToasts.push(error: "Nothing was cleared; the state was kept: \(detail)")
                                     case .bodyPersistenceFailed:
-                                        dependencies.systemToasts.push(error: "Thinking state cleared. Body state cleared in memory, but was not saved; its previous state may return after a restart.")
+                                        dependencies.systemToasts.push(error: """
+                                            Thinking state cleared. Body state cleared in memory, but was not saved; its previous state may return after a \
+                                            restart.
+                                            """)
                                     }
                                     await refresh()
                                 }
@@ -185,7 +187,10 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled || !workspaceAblated)
                         }
                         if workspaceAblated {
-                            Label("The workspace is being left out — the thought summary and background thinking ignore it until it is included again.", systemImage: "eye.slash")
+                            Label("""
+                                The workspace is being left out — the thought summary and background thinking ignore it until it is \
+                                included again.
+                                """, systemImage: "eye.slash")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
                         }
@@ -211,22 +216,10 @@ struct CognitionObservatoryView: View {
                     ) {
                         ContextFlowObservatoryPanel(healthState: cognition.contextFlowHealth)
                     }
-                    // Workshop diagnostics use live store queries; owner controls live on Desk item rows.
-                    collapsible(
-                        .workshop,
-                        title: "Desk",
-                        systemImage: "hammer",
-                        tint: .purple,
-                        count: cognition.workshop?.model?.openPursuitCount,
-                        hint: cognition.workshop?.hint
-                    ) {
-                        WorkshopObservatoryPanel(snapshot: cognition.workshop)
-                    }
                     collapsible(.organism, title: "Body signals", systemImage: "waveform.path.ecg", tint: .green,
                                 hint: Self.organismHint(detail.organism)) {
                         organism(detail.organism)
                     }
-                    // Collapsed readout headers show whether their group has activity.
                     collapsible(.loop, title: "Loop activity", systemImage: "clock.arrow.circlepath", tint: .teal,
                                 count: CognitionLoopActivityPresentation.receiptCount(for: detail.receiptRead),
                                 hint: CognitionLoopActivityPresentation.collapsedHint(for: detail.receiptRead)) {
@@ -271,24 +264,20 @@ struct CognitionObservatoryView: View {
                     )
                 }
 
-                // The agent projection and raw all-items table belong here;
-                // the primary Desk keeps zero debug
-                // chrome. Both render the engine’s retained Desk revision.
+                // Keep raw diagnostics here while both surfaces read the engine's retained Desk revision.
                 DeskDebugPanels(
                     agentDisplayName: dependencies.agentDisplayName
                 )
             }
             .padding(NativeAgentSpacing.xl)
         }
-        // Diagnostics owns navigation; Controls carries Refresh.
-        .task(id: expandedPanels.contains(CognitionObservatoryPanelID.workshop.rawValue)) {
+        .task {
             let changes = await cognition.changes()
             // Subscribe before reading so changes during refresh are buffered.
             await refresh()
             for await _ in changes {
                 guard !Task.isCancelled else { return }
-                // The stream is buffering-newest, so a tool burst collapses
-                // while this read is in flight without a timer or idle wake.
+                // Buffer newest so tool bursts coalesce during reads without timers or idle wakes.
                 await refresh()
             }
         }
@@ -316,10 +305,7 @@ struct CognitionObservatoryView: View {
     }
 
     func refresh() async {
-        await cognition.refreshObservatory(
-            includeWorkshopReceipts: { expandedPanels.contains(CognitionObservatoryPanelID.workshop.rawValue) },
-            contextFlowHealthRead: dependencies.contextFlowHealth
-        )
+        await cognition.refreshObservatory(contextFlowHealthRead: dependencies.contextFlowHealth)
     }
 
     private func contextFlowHint(_ state: ContextFlowObservatoryHealthState) -> String {
@@ -336,9 +322,7 @@ struct CognitionObservatoryView: View {
 
     // MARK: - Collapsible panels
 
-    /// Comma-joined ids of the panels the user has opened — persisted so the tab
-    /// comes back the way they left it. Default (empty) = everything collapsed
-    /// to header rows.
+    /// Persist opened IDs so returning preserves disclosure state; empty means all collapsed.
     @AppStorage("cognitionObservatoryExpandedPanels") private var expandedPanelsRaw = ""
 
     private var expandedPanels: Set<String> {
@@ -353,9 +337,7 @@ struct CognitionObservatoryView: View {
         }
     }
 
-    /// Same card chrome as NativePanel, but the header row is the disclosure
-    /// control: count badge + a one-line hint while
-    /// collapsed, chevron flips on expand. Panel ids must not contain commas.
+    /// Panel IDs must not contain commas because disclosure state stores a comma-joined list.
     private func collapsible<Content: View>(
         _ id: CognitionObservatoryPanelID,
         title: String,
@@ -412,9 +394,7 @@ struct CognitionObservatoryView: View {
     }
 
     nonisolated static func organismHint(_ snapshot: OrganismSnapshot) -> String {
-        // Keep the compact disclosure hint source-compatible for saved/static
-        // snapshots; the opened body panel performs the real freshness check
-        // and withholds stale rows rather than pretending they are current.
+        // The compact hint is only a summary; the opened panel owns freshness checks and must withhold stale rows.
         CognitionObservatoryOrganismPresentation(
             snapshot: snapshot,
             now: snapshot.generatedAt
@@ -441,10 +421,7 @@ struct CognitionObservatoryView: View {
     }
 }
 
-/// Presentation policy for a collapsed Observatory disclosure row. The compact
-/// text is a status summary, not an unbounded diagnostic channel: preserve a
-/// real state, normalize malformed whitespace, and expose the same bounded
-/// summary to VoiceOver and the visible row.
+/// Bound the collapsed status summary and share it with VoiceOver so neither channel invents or hides state.
 enum CognitionObservatoryCollapsedRowPresentation {
     static let maximumVisibleHintCharacters = 96
 

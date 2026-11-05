@@ -7,12 +7,11 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import TurnTrace
-import WorkshopExecution
 import NativeAgentShared
-// Blueprint: | `NativeContextFlowRuntime+QueryEmbedding.swift` | `NativeContextFlowRuntime` query embeddings; complete checked reading batches, joined tickets, epoch-checked settlement and bounded cache; task ownership stays on the runtime actor |
+// Blueprint: | `NativeContextFlowRuntime+QueryEmbedding.swift` | `NativeContextFlowRuntime`: actor-owned joined embeddings and epoch-checked cache |
 
 extension NativeContextFlowRuntime {
-    public func beginQueryEmbedding(_ text: String, ownWords: String?) async -> ContextQueryEmbeddingTicket? {
+    public func beginQueryEmbedding(_ text: String, ownWords: String?, turn: Turn) async -> ContextQueryEmbeddingTicket? {
         let epoch = semanticQueryEpoch
         let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return nil }
@@ -58,16 +57,17 @@ extension NativeContextFlowRuntime {
             names = try MemoryRecallQueryExpansion.names(
                 storeDirectory: dataRoot.appendingPathComponent("memory", isDirectory: true))
         } catch {
-            return ContextQueryEmbeddingTicket(unavailable: "Saved identity is unreadable: \(error.localizedDescription). Repair memory/profile.json before name-aware recall.")
+            return ContextQueryEmbeddingTicket(
+                unavailable: "Saved identity is unreadable: \(error.localizedDescription). Repair memory/profile.json before name-aware recall.")
         }
-        let alternateQuery = ownWords == nil ? MemoryRecallQueryExpansion.rewriteIncoming(query, names: names) : nil
+        let alternateQuery = ownWords == nil ? MemoryRecallQueryExpansion.rewriteIncoming(query, names: names, turn: turn) : nil
         // A follow-up's own words and other voice share the further-readings batch.
         let own = ownWords.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { $0.isEmpty || $0 == query ? nil : $0 }
         if let own, own.utf8.count > 8 * 1_024 {
             return ContextQueryEmbeddingTicket(unavailable: "The follow-up's own words exceed the semantic reader's 8 KB bound.")
         }
-        let ownTexts = own.map { [$0] + (MemoryRecallQueryExpansion.rewriteIncoming($0, names: names).map { [$0] } ?? []) } ?? []
+        let ownTexts = own.map { [$0] + (MemoryRecallQueryExpansion.rewriteIncoming($0, names: names, turn: turn).map { [$0] } ?? []) } ?? []
         // Use the snapshot's vector-space identity without rereading backend/mode files.
         guard let embeddingEpoch = runtime.embeddingEpoch else {
             return ContextQueryEmbeddingTicket(unavailable: "the memory-search model named no vector space")

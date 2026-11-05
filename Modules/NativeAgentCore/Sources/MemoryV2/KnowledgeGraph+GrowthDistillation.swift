@@ -3,16 +3,8 @@ import GRDB
 // Blueprint: | `KnowledgeGraph+GrowthDistillation.swift` | Independent REM/GROWTH provenance through the canonical graph store |
 
 extension SwiftNativeKnowledgeGraphIndexer {
-    /// Store one REM GROWTH eviction in the authoritative SQLite graph.
-    ///
-    /// This is deliberately an operation on the existing KnowledgeGraph owner,
-    /// not a Dream/REM-side graph store. A stable caller-supplied id makes a
-    /// retry after a partial GROWTH-file commit an idempotent upsert.
-    /// Does a distilled GROWTH-eviction node with this id stand in the graph?
-    /// The eviction history uses it as the corroborating witness for an
-    /// interrupted splice: the node is written before the GROWTH.md rewrite,
-    /// so a passage missing from the file WITH its node present really was
-    /// evicted, while a missing passage and no node is an unreadable file.
+    /// Use the authoritative graph and a stable caller-supplied ID for idempotent eviction writes. Write the node before splicing GROWTH.md: only a
+    /// corroborating node proves a missing passage was evicted; without it, the file is unreadable.
     public func growthDistillationExists(id: String) async throws -> Bool {
         let boundedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !boundedID.isEmpty else { return false }

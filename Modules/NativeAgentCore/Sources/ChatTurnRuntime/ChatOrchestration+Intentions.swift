@@ -1,23 +1,24 @@
+import NativeAgentCore
 import AgentWorkspace
 import ChatTurnContracts
 import Desk
 import Foundation
 import NativeAgentShared
 import Transcripts
-// Blueprint: | `ChatOrchestration+Intentions.swift` | `SwiftNativeTurnEngine`: live MY QUEUE facts in each turn's packet, including body-signal moments; pending imports stay out, stopped imports name reconciliation evidence; six bounded intentions, clock-first, filtered by the originating person/self or peer |
+// Blueprint: | `ChatOrchestration+Intentions.swift` | `SwiftNativeTurnEngine`; Bounded live intentions from their owner |
 
 extension SwiftNativeTurnEngine {
-    /// What she carries, read from its owner for this turn. Trust elevation
+    /// What the agent carries, read from its owner for this turn. Trust elevation
     /// does not make a peer's conversation the person's conversation.
-    func intentionsContext(now: Date, sessionID: String?) async throws -> String {
+    func intentionsContext(now: Date, sessionID: String?, turn: Turn) async throws -> String {
         guard let dataRoot = remPinsDataRoot else { return "" }
-        let agent = [ChatPersistenceContext.originProvenance?.agent, ChatToolSessionContext.envelope?.agent]
+        let agent = [turn.origin?.agent, turn.envelope?.agent]
             .compactMap { $0 }.first { $0 != "self" }
-        let steering = (PeerDataTaint.current?.checkpointSources ?? []).map { PeerDataTaint.principal($0) }
-        let peerTurn = agent != nil || !steering.isEmpty || ChatPersistenceContext.originPrincipal.hasPrefix("agent:")
+        let steering = (turn.peerSteering?.checkpointSources ?? []).map { PeerDataTaint.principal($0) }
+        let peerTurn = agent != nil || !steering.isEmpty || turn.originPrincipal.hasPrefix("agent:")
             || SessionConversation.kind(sessionID, dataRoot: dataRoot)?.isPeerConversation == true
         // A peer is known by its verified id, never by the generic "agent" origin a reply turn carries.
-        let verified = peerTurn ? ChatToolSessionContext.envelope?.verifiedUserId.flatMap { $0.isEmpty ? nil : PeerDataTaint.principal($0) } : nil
+        let verified = peerTurn ? turn.envelope?.verifiedUserId.flatMap { $0.isEmpty ? nil : PeerDataTaint.principal($0) } : nil
         let peers = Set([verified].compactMap { $0 } + steering).subtracting([PeerDataTaint.principal("agent")])
         let state: DeskState
         do {
@@ -33,8 +34,7 @@ extension SwiftNativeTurnEngine {
                 guard let origin = entry.step.origin, origin.hasPrefix("agent:") else { return false }
                 return peers.contains(PeerDataTaint.principal(String(origin.dropFirst(6))))
             }
-            return entry.step.origin == "self" || entry.step.origin == "person"
-                || entry.owedToPerson(dataRoot: dataRoot)
+            return entry.step.origin == "self" || entry.owedToPerson
         }
         let format = DateFormatter()
         format.locale = Locale(identifier: "en_US_POSIX")
@@ -50,7 +50,7 @@ extension SwiftNativeTurnEngine {
                 return (entry, next.map { format.string(from: $0) } ?? "no next clock moment", next)
             case .at(let date): return (entry, ResidentWake.shown(date), date)
             case .afterCard(let card): return (entry, "after card " + card, nil)
-            case .userWrites(let door): return (entry, "when User writes" + (door.map { " on " + $0 } ?? ""), nil)
+            case .userWrites(let door): return (entry, "when User writes" + (door.map { " on " + $0.rawValue } ?? ""), nil)
             case .nextTurn: return (entry, "next turn", nil)
             case .ownTurn: return (entry, "my own turn", nil)
             case .quiet: return (entry, "when it is quiet", nil)
@@ -79,7 +79,7 @@ extension SwiftNativeTurnEngine {
             case .time(let date): until = ResidentWake.shown(date)
             case .words(let words): until = words
             }
-            // Its name rides with it, so what she is shown she can finish (queue.done id).
+            // Carry the item's name so the shown work can be finished with `queue.done`.
             return "- " + row.entry.name + " · " + Self.intentionLine(row.entry.step.words) + " · " + Self.intentionLine(row.moment)
                 + " · until " + Self.intentionLine(until)
         }

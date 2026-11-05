@@ -1,56 +1,36 @@
-// Activity previews use shared queue actions and WorkOverview's attention counts before list bounds.
 import SwiftUI
 import NativeAgentShared
 
-// Activity's current drill-in queue.
 enum ActivitySection: String, CaseIterable, Hashable {
-    case approvals
+    /// Approvals and notes are one Inbox, as on the Mac.
     case inbox
     case memoryProposals
     case selfImprovement
 }
 
-/// Activity's queue affordances. Attention counts arrive from the Mac overview.
 enum ActivityScreenPresentation {
-    enum SectionCountState: Equatable {
-        case unavailable
-        case clear
-        case pending(Int)
-    }
-
-    static func sectionCountState(for count: Int?) -> SectionCountState {
-        guard let count else { return .unavailable }
-        return count > 0 ? .pending(count) : .clear
-    }
-
-    /// Signed, paired iOS may decide owner cards regardless of origin or flags.
-    /// Studio canon belongs to Agent; the Mac enforces the same exception.
+    /// Signed paired phones may decide owner cards; studio canon remains the agent's, as enforced by the Mac.
     static func canDecideRemotely(action: String) -> Bool {
         action != "studio.canon"
     }
 
-    /// Notification-open suppression is consumed once. Leaving the latch set
-    /// after a cancelled appearance would otherwise skip the next real refresh.
+    /// Consume notification suppression once so a cancelled appearance cannot suppress the next refresh.
     static func shouldRefreshOnAppear(skipInitialRefresh: inout Bool) -> Bool {
         guard skipInitialRefresh else { return true }
         skipInitialRefresh = false
         return false
     }
 
-    /// A review request from another iOS surface must open the queue that can
-    /// actually resolve it, rather than merely switching to Activity's summary.
+    /// Open the queue that can resolve the review request; the Activity summary cannot decide it.
     static func activityDestination(for notificationScreen: String) -> ActivitySection? {
         switch notificationScreen.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "approvals": return .approvals
+        case "approvals", "inbox": return .inbox
         default: return nil
         }
     }
 }
 
-/// An action response and the next published snapshot arrive independently.
-/// Once the user has decided an inline memory proposal, retain that decision
-/// state until the row disappears from the Mac-owned snapshot so a stale row
-/// cannot invite a duplicate accept/reject action.
+/// Retain inline decisions until the Mac removes the row: action replies and snapshots arrive independently, risking duplicate decisions.
 enum InlineMemoryProposalDecisionPresentation {
     enum Decision: Equatable {
         case accept
@@ -96,76 +76,40 @@ enum InlineMemoryProposalDecisionPresentation {
 
 
 struct ActivityView: View {
-    @EnvironmentObject private var approvalsStore: ApprovalsStore
-    @EnvironmentObject private var inboxStore: InboxStore
     @StateObject private var memoryStore = MemoryStore()
     private let sync = iCloudSyncEngine.shared
     @Binding var skipInitialRefresh: Bool
     @Binding var navigationTarget: ActivitySection?
+    /// A card a link elsewhere asked to open.
+    @Binding var cardTarget: String?
 
     @State private var path = NavigationPath()
-    // Inbox previews open the item's detail sheet directly, without nesting navigation stacks.
-    @State private var inboxDetailItemID: String?
 
     init(
         skipInitialRefresh: Binding<Bool> = .constant(false),
-        navigationTarget: Binding<ActivitySection?> = .constant(nil)
+        navigationTarget: Binding<ActivitySection?> = .constant(nil),
+        cardTarget: Binding<String?> = .constant(nil)
     ) {
         self._skipInitialRefresh = skipInitialRefresh
         self._navigationTarget = navigationTarget
+        self._cardTarget = cardTarget
     }
 
     // MARK: - Pending slices
-
-    private var pendingInbox: [InboxItemRecord] {
-        MobileDesignSamples.rows(sync.inboxItems).filter {
-            let status = $0.status.lowercased()
-            return status == "unread" || status == "active"
-        }
-    }
 
     private var pendingMemoryProposals: [MemoryProposalRecord] {
         sync.memoryProposals.filter(\.isPending)
     }
 
-    /// Empty arrays before the first completed snapshot are an absence of
-    /// evidence, not proof that a section is clear. The engine's shared
-    /// `lastSyncAt` is not that evidence: a provider-catalog update alone sets
-    /// it, and the transport carries approvals, the inbox and the memory
-    /// proposals in different groups. So each section waits for ITS OWN queue
-    /// to arrive before zero is rendered as the distinct "Clear" state.
-    private var isDesignSample: Bool { MobileDesignSamples.screen != nil }
-
-    private var pendingApprovalsCount: Int? {
-        guard let overview = sync.workOverview, overview.unavailable.isEmpty,
-              let counts = overview.needsYouCounts else { return nil }
-        return counts[.approval] ?? 0
-    }
-
-    private var pendingInboxCount: Int? {
-        guard let overview = sync.workOverview, overview.unavailable.isEmpty,
-              let counts = overview.needsYouCounts else { return nil }
-        return counts[.inbox] ?? 0
-    }
-
-    private var pendingMemoryProposalsCount: Int? {
-        (sync.memoryProposalsSnapshotLoaded || isDesignSample) ? pendingMemoryProposals.count : nil
-    }
-
-    /// The page's one line, and the only place sync state is said.
-    private var headerLine: String {
-        sync.workOverview?.headline ?? "The overview is unavailable. Refresh from your Mac to read it."
-    }
+    /// Today as the Mac published it.
+    private var today: PartFace? { sync.faces["today"]?.face }
 
     // MARK: - Body
 
     var body: some View {
         NavigationStack(path: $path) {
-            AlivePage(title: "Activity", line: headerLine, style: .root) {
-                // The inboxes come first, always (User, 10-18: approvals sat a
-                // long scroll down, under work that only needs reading).
-                AliveSection("Everything") { queueRows }
-                MobileWorkOverviewView()
+            AlivePage(title: today?.title ?? "Today", line: today?.line, style: .root) {
+                MobileFaceRows(page: "today") { path.append($0) }
                 if !pendingMemoryProposals.isEmpty {
                     AliveSection("Other reviews", surface: .waiting) {
                         ForEach(Array(pendingMemoryProposals.prefix(2).enumerated()), id: \.element.id) { index, item in
@@ -175,22 +119,15 @@ struct ActivityView: View {
                     }
                 }
             }
-            // Render sync errors from existing sync and bridge state without polling.
             .macSyncErrorBanner()
+            .navigationDestination(for: FaceDestination.self) { $0.view }
             .navigationDestination(for: ActivitySection.self) { section in
-                // Destinations share Activity's NavigationStack and must not embed another.
+                // Destinations share Activity's NavigationStack; nesting another breaks navigation.
                 switch section {
-                case .approvals:
-                    ApprovalsView()
-                        .environmentObject(approvalsStore)
                 case .inbox:
-                    InboxView(embedInNavigationStack: false)
-                        .environmentObject(inboxStore)
+                    MobileFacePage(page: "inbox")
                 case .memoryProposals:
-                    MemoryView(
-                        initialSegment: .proposals,
-                        embedInNavigationStack: false
-                    )
+                    MemoryView(embedInNavigationStack: false)
                 case .selfImprovement:
                     AutonomyView()
                 }
@@ -207,24 +144,18 @@ struct ActivityView: View {
             .onChange(of: navigationTarget) { _, section in
                 openRequestedSection(section)
             }
+            .onChange(of: cardTarget, initial: true) { _, id in
+                // A card is a matter in the Inbox; the face reads it in place, with no selected row.
+                guard id != nil else { return }
+                openRequestedSection(.inbox)
+                cardTarget = nil
+            }
             .onAppear {
                 openRequestedSection(navigationTarget)
                 openDesignSampleScreen()
-            }
-            // Activity and Inbox share InboxDetailSheet for full item rendering.
-            .sheet(isPresented: Binding(get: { inboxDetailItemID != nil }, set: { if !$0 { inboxDetailItemID = nil } })) {
-                if let id = inboxDetailItemID {
-                InboxDetailSheet(
-                    itemID: id,
-                    onOpenGroup: { _ in
-                        // Group filtering only makes sense inside InboxView;
-                        // here we just close the sheet so the user can drill
-                        // through Activity → Inbox if they want that view.
-                        inboxDetailItemID = nil
-                    },
-                    onDone: { inboxDetailItemID = nil }
-                )
-                }
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("-todaySample") { sync.faces["today"] = Self.sampleToday }
+                #endif
             }
         }
     }
@@ -236,39 +167,47 @@ struct ActivityView: View {
         navigationTarget = nil
     }
 
-    /// Screenshot fixtures only (DEBUG `-designScreen`): open the queue or
-    /// sheet a design pass asked for, since a simulator cannot be tapped.
+    /// DEBUG screenshot routing opens otherwise untappable simulator destinations.
     private func openDesignSampleScreen() {
         switch MobileDesignSamples.screen {
-        case "approvals": openRequestedSection(.approvals)
-        case "inbox": openRequestedSection(.inbox)
-        case "inboxItem": inboxDetailItemID = pendingInbox.first?.id
+        case "approvals", "inbox", "inboxItem": openRequestedSection(.inbox)
         default: break
         }
     }
 
-    // MARK: - Pieces
-
-    @ViewBuilder
-    private var queueRows: some View {
-        ActivityQueueRow(section: .approvals, title: "Approvals",
-                         line: "What I'll do once you say yes", count: pendingApprovalsCount)
-        AliveDivider()
-        ActivityQueueRow(section: .inbox, title: "Inbox",
-                         line: "Notes that need you", count: pendingInboxCount)
-        AliveDivider()
-        ActivityQueueRow(section: .memoryProposals, title: "Memories to keep",
-                         line: "What I'd like to remember", count: pendingMemoryProposalsCount)
-        AliveDivider()
-        ActivityQueueRow(section: .selfImprovement, title: "Improvements",
-                         line: "Managed on your Mac", count: nil)
-    }
+    #if DEBUG
+    /// Process-local visual fixture: Today as the agent's ability writes it, with every section style it uses.
+    static let sampleToday = PartFaceSnapshot(part: "today", version: nil, sourceEpoch: 1, status: .ready, face: PartFace(
+        title: "Today", line: "A quiet morning so far; one thing waits on you.", sections: [
+            .init(id: "waiting:0", title: "Waiting for you", style: .list, rows: [
+                .init(id: "a1", title: "Add a calendar block", detail: "Tomorrow 9–11 AM, “Outline”", open: "approval:sample-approval"),
+                .init(id: "desk", title: "2 Desk items are waiting on you", open: "page:desk"),
+            ]),
+            .init(id: "did", title: "What I did", style: .timeline, rows: [
+                .init(id: "talked", title: "Talked about tomorrow's plan", detail: "Kept the afternoon open for a walk",
+                      at: "2026-11-04T15:02:00Z", open: "chat:main"),
+                .init(id: "kept", title: "Kept two memories", at: "2026-11-04T15:20:00Z"),
+                .init(id: "detail:kept:0", title: "You prefer quiet mornings", tone: .quiet),
+            ]),
+            .init(id: "ahead", title: "Ahead", style: .flow, rows: [
+                .init(id: "outline", title: "Outline at 9", open: "page:calendar"),
+                .init(id: "walk", title: "Walk after lunch"),
+            ]),
+            .init(id: "earlier:0", title: "Earlier", style: .values, rows: [
+                .init(id: "n1", title: "Notes from yesterday", value: "3", at: "2026-11-03T21:00:00Z", tone: .quiet),
+            ]),
+            .init(id: "queues", style: .flow, rows: [
+                .init(id: "approvals", title: "Approvals and past decisions", open: "page:today/approvals"),
+                .init(id: "inbox", title: "Every note I've left you", open: "page:today/inbox"),
+                .init(id: "self-improvement", title: "Self-improvement", open: "page:today/selfImprovement"),
+                .init(id: "rem", title: "REM Replay Lineage", open: "page:today/cognitionProposals"),
+            ]),
+        ]), error: nil, owed: false)
+    #endif
 }
 
 // MARK: - Waiting rows
 
-/// One row inside the "Waiting for you" card: the dot, what kind of thing it
-/// is, what it says, and the answers.
 private struct ActivityWaitingRow<Actions: View>: View {
     let kind: String
     let title: String
@@ -309,7 +248,6 @@ private struct ActivityWaitingRow<Actions: View>: View {
     }
 }
 
-/// Memory proposal with Remember / Skip, submitted through MemoryStore.
 private struct InlineMemoryProposalPreviewCard: View {
     let proposal: MemoryProposalRecord
     @ObservedObject var store: MemoryStore
@@ -365,41 +303,5 @@ private struct InlineMemoryProposalPreviewCard: View {
                 }
             }
         }
-    }
-}
-
-// MARK: - Queue row
-
-/// One row of the "Everything" card: the queue's name, one line, and how
-/// many wait there. While a queue has not arrived it says nothing; the page
-/// line already says the phone is still checking.
-private struct ActivityQueueRow: View {
-    let section: ActivitySection
-    let title: String
-    let line: String
-    let count: Int?
-
-    var body: some View {
-        NavigationLink(value: section) {
-            AliveRow(title, detail: line) {
-                switch ActivityScreenPresentation.sectionCountState(for: count) {
-                case .pending(let count):
-                    HStack(spacing: 7) {
-                        AliveWaitingDot()
-                        Text(count == 1 ? "1 waiting" : "\(count) waiting")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(AlivePalette.text)
-                    }
-                case .clear:
-                    Text("Clear")
-                        .font(.subheadline)
-                        .foregroundStyle(AlivePalette.secondary)
-                case .unavailable:
-                    EmptyView()
-                }
-                AliveChevron()
-            }
-        }
-        .aliveRowButtonStyle()
     }
 }

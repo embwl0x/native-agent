@@ -1,11 +1,11 @@
 import Foundation
+import Experiences
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `iCloudBridge+DeliveryReceipts.swift` | `iCloudBridge`: `appendChatDeliveryReceipt`, `appendActionResponseDeliveryReceipt`, `appendInboundSuccessReceipt` |
+// Blueprint: | `iCloudBridge+DeliveryReceipts.swift` | Signed phone receipts accept their matter's phone obligation at arrival; transport evidence journal |
 
 extension iCloudBridge {
-    /// The durable receipt seam for both CloudKit and Drive sends. Keeping the
-    /// Ephemeral phone presentation never enters the durable delivery journal.
+    /// Both transports share durable receipts; ephemeral phone presentation must never enter this journal.
     @discardableResult
     nonisolated static func appendChatDeliveryReceipt(
         _ message: BridgeMessage,
@@ -130,12 +130,12 @@ extension iCloudBridge {
             return false
         }
         let cleanEventID = eventID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard NativeAgentDeviceEventIdentity.isCanonical(cleanEventID) else {
+        guard !cleanEventID.isEmpty else {
             return false
         }
         let cleanChannel = String(channel.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
         let confirmedAt = ISO8601DateFormatter().string(from: Date())
-        let fallback: JSONValue = .object([
+        let receipt: JSONValue = .object([
             "at": .string(confirmedAt),
             "messageId": .null,
             "correlationId": .null,
@@ -145,7 +145,7 @@ extension iCloudBridge {
             "transport": .string("notification_receipt"),
             "status": .string(ChatDeliveryReceiptStatus.confirmedByPeer.rawValue),
             "deliveryConfirmed": .bool(true),
-            "signatureVerified": .bool(cleanDirection == "ios_to_mac"),
+            "signatureVerified": .bool(true),
             "kind": .string("notification"),
             "targetSourceKey": .null,
             "textPreview": .string(""),
@@ -156,7 +156,7 @@ extension iCloudBridge {
         ])
         do {
             let saved = try await upsertChatDeliveryReceipt(
-                appendRow: fallback,
+                appendRow: receipt,
                 match: ChatDeliveryReceiptMatch(
                     direction: cleanDirection,
                     eventID: cleanEventID
@@ -169,28 +169,20 @@ extension iCloudBridge {
                     "confirmedAt": .string(confirmedAt),
                     "confirmationChannel": .string(cleanChannel),
                     "kind": .string("notification"),
+                    "signatureVerified": .bool(true),
                 ],
                 dataRoot: dataRoot
             )
-            if saved, cleanDirection == "mac_to_ios" {
-                try await NotificationDeliveryLedger(dataRoot: dataRoot).confirmPhone([cleanEventID])
+            // A receipt names the phone's canonical event; a chat reply's receipt has no matter and settles nothing here.
+            if saved, cleanDirection == "mac_to_ios", let matter = try await ForPerson.at(dataRoot).matter(phoneEvent: cleanEventID) {
+                try await ForPerson.at(dataRoot).accepted(matter.id, .phone,
+                    evidence: .init(source: "icloud/chat_delivery_receipts.jsonl", id: cleanEventID))
             }
             return saved
         } catch {
             nativeLog("Phone notification receipt %@ remains unsettled: %@", cleanEventID, error.localizedDescription)
             return false
         }
-    }
-
-    /// The device-event ids the phone has signed as arrived (Mac → iOS): the
-    /// destination's acceptance. Unreadable evidence remains unavailable.
-    public nonisolated static func phoneConfirmedEventIDs(dataRoot: URL) throws -> Set<String> {
-        let rows = try loadChatDeliveryReceiptRows(path: chatDeliveryReceiptsURL(dataRoot: dataRoot))
-        return Set(rows.compactMap { fields in
-            fields["direction"] == .string("mac_to_ios")
-                && fields["status"] == .string(ChatDeliveryReceiptStatus.confirmedByPeer.rawValue)
-                ? fields["eventId"]?.stringValue : nil
-        })
     }
 
     nonisolated static func chatDeliveryReceiptsURL(dataRoot: URL) -> URL {
@@ -248,7 +240,6 @@ extension iCloudBridge {
                 return false
             }
             try saveChatDeliveryReceiptRows(rows, path: path)
-            // True means the receipt is durably persisted, whether updated or appended.
             return true
         }
     }

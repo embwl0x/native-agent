@@ -1,13 +1,9 @@
 import Foundation
 import PersistenceCore
 import ChatToolParsing
-// Blueprint: | `AgentWorkspaceActionReadback.swift` | `AgentWorkspaceActionReadback` enum; `dispatchEffect`, `followUp`. Computer readback retains the resolved recipient; unidentified recipients return unavailable rather than reading an unrelated foreground app. |
+// Blueprint: | `AgentWorkspaceActionReadback.swift` | `AgentWorkspaceActionReadback`, `dispatchEffect`, `followUp`: exact-recipient readback without replay |
 
-/// Completes an already-dispatched action with its owner's current view. This
-/// never repeats an effect, changes tabs, or replaces a receipt with a claim of
-/// success. Browser reads retain the exact tab; Computer reads obtain fresh
-/// bounded controls from the resolved recipient (never an unrelated foreground
-/// app), and Calendar/Reminders use their canonical bounded lists.
+/// Read back through the resolved owner without repeating effects or claiming settlement; retain exact tab and app targets.
 enum AgentWorkspaceActionReadback {
     struct Readback {
         let location: AgentWorkspaceLocation
@@ -31,15 +27,18 @@ enum AgentWorkspaceActionReadback {
         catch is CancellationError { throw CancellationError() }
         catch {
             guard browserEffects.contains(tool) || computerEffects.contains(tool) else { throw error }
-            // A thrown transport/refusal gives no portable settlement evidence.
-            // Keep it visible, never repeat the effect, and recover by reading.
+            // A thrown transport/refusal gives no portable settlement evidence. Keep it visible, never repeat the effect, and recover by reading.
             return .object(["status": .string("outcome_unknown"), "error": .string(error.localizedDescription),
-                "detail": .string("The action did not return a usable receipt. It was not repeated. A fresh view can show the current state; it does not prove this action completed.")])
+                "detail": .string("""
+                    The action did not return a usable receipt. It was not repeated. A fresh view can show the current state; it does not prove this action \
+                    completed.
+                    """)])
         }
     }
 
     static func followUp(tool: String, input: [String: JSONValue], receipt: JSONValue,
                          title: String, perform: AgentWorkspace.Perform) async throws -> Readback? {
+        let reply = ToolResult(receipt)
         let owner = object(receipt)
         let status = string(owner["status"])
         var source: AgentWorkspaceLocation?
@@ -47,9 +46,7 @@ enum AgentWorkspaceActionReadback {
         var failure = "The action returned, but its current result could not be read: "
         var caution = ". Reopen this source to read; do not repeat the action."
         if computerEffects.contains(tool) {
-            // Even a stale/refused selection returns a current, bounded set of
-            // choices. Never replay an action or turn its display name into a
-            // fallback target. A read is observation, not proof of settlement.
+            // Refused selections still need current choices; reads never prove settlement or authorize a guessed target.
             var arguments: [String: JSONValue] = ["structured": .bool(true)]
             let detail = object(owner["detail"] ?? .null)
             let output = object(owner["output"] ?? .null)
@@ -63,13 +60,16 @@ enum AgentWorkspaceActionReadback {
             let computer = AgentWorkspaceLocation.record(tool: "screen", input: arguments, title: "Computer")
             guard app != nil else {
                 return .init(location: computer, result: unavailable(receipt: receipt,
-                    detail: "The action did not identify its receiving app. Read the intended app explicitly; foreground state would not establish this action's destination. The action was not repeated."))
+                    detail: """
+                        The action did not identify its receiving app. Read the intended app explicitly; foreground state would not establish this action's \
+                        destination. The action was not repeated.
+                        """))
             }
             source = computer
             failure = "The current screen could not be read: "
             caution = ". The action was not repeated."
         } else if calendarReminderEffects.contains(tool), status == "completed",
-           owner["source"] == .string("eventkit"), ChatToolOutcome.exactResultClass(receipt) == .succeeded {
+           owner["source"] == .string("eventkit"), reply.outcome == .succeeded {
             caution = ". Do not repeat the change."
             if tool.hasPrefix("mac_reminders_"), tool != "mac_reminders_delete", let id = string(owner["reminderId"]) {
                 source = .record(tool: "mac_reminders_read", input: ["id": .string(id)], title: "Reminder")
@@ -80,12 +80,16 @@ enum AgentWorkspaceActionReadback {
                     source = .record(tool: reader, input: place.input, title: place.title)
                     failure = "The change completed, but its current list could not be read: "
                     scope = placeID == "calendar"
-                        ? "Upcoming events, within this reader's normal limit. The action receipt identifies the changed event; absence from this window does not mean the write failed."
+                        ? """
+                            Upcoming events, within this reader's normal limit. The action receipt identifies the changed event; absence from this window \
+                            does not mean the write failed.
+                            """
                         : "Incomplete reminders across all dates, within this reader's normal limit. Completed or deleted reminders may not appear here."
                 }
             }
-        } else if ChatToolOutcome.exactResultClass(receipt) == .succeeded,
-           ["write_file", "commit_memory", "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item", "bot_create", "bot_update", "bot_pause"].contains(tool) {
+        } else if reply.outcome == .succeeded,
+           ["write_file", "commit_memory", "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item", "bot_create", "bot_update",
+               "bot_pause"].contains(tool) {
             source = AgentWorkspaceEnvironment.readback(tool: tool, input: input)
             if tool == "bot_create", let id = string(owner["id"]), UUID(uuidString: id) != nil {
                 source = .record(tool: "bot_list", input: ["id": .string(id)], title: string(owner["name"]) ?? "Created helper")
@@ -122,9 +126,11 @@ enum AgentWorkspaceActionReadback {
                 if matches(fresh, tab: tab, sequence: integer(input["expected_user_sequence"])) {
                     return .init(location: source, result: attaching(fresh, receipt: receipt))
                 }
-                return .init(location: source, result: unavailable(receipt: receipt, detail: "The selected page is unavailable. Reopen it to read; no browser action was repeated.", observation: fresh))
+                return .init(location: source, result: unavailable(receipt: receipt,
+                    detail: "The selected page is unavailable. Reopen it to read; no browser action was repeated.", observation: fresh))
             } catch is CancellationError { throw CancellationError() }
-            catch { return .init(location: source, result: unavailable(receipt: receipt, detail: "Reading the selected page failed: " + error.localizedDescription + ". No browser action was repeated.")) }
+            catch { return .init(location: source, result: unavailable(receipt: receipt, detail: "Reading the selected page failed: " + error
+                .localizedDescription + ". No browser action was repeated.")) }
         }
         guard browserEffects.contains(tool), owner["ok"] != .bool(false), owner["error"] == nil,
               owner["error_code"] == nil else { return nil }
@@ -133,8 +139,7 @@ enum AgentWorkspaceActionReadback {
         let succeeded = outcome == "succeeded"
         guard succeeded,
               let tab = integer(owner["tabId"]) ?? integer(actionReceipt["tabId"]) ?? integer(input["tab_id"]) else { return nil }
-        // Navigation may open a new owned tab after User takes the old one.
-        // Other effects must retain the exact selected tab.
+        // Only navigation may open a new owned tab after user takeover; other effects retain the selected tab.
         if tool != "browser.chrome_navigate", let selected = integer(input["tab_id"]), selected != tab { return nil }
         let sequence = integer(owner["userSequence"]) ?? integer(actionReceipt["userSequence"]) ?? integer(input["expected_user_sequence"])
         var readInput: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)]
@@ -144,24 +149,23 @@ enum AgentWorkspaceActionReadback {
             var snapshot = try await perform("browser.chrome_snapshot", readInput)
             guard matches(snapshot, tab: tab, sequence: sequence) else {
                 return .init(location: location, result: unavailable(receipt: receipt,
-                    detail: "The action returned, but its exact page could not be read. Read this page again to continue; the action will not be repeated.", observation: snapshot))
+                    detail: "The action returned, but its exact page could not be read. Read this page again to continue; the action will not be repeated.",
+                        observation: snapshot))
             }
             let snapshotRow = object(snapshot)
             let reading = object(snapshotRow["reading"] ?? .null)
             let summary = object(snapshotRow["summary"] ?? .null)
             if reading["mainContentAvailable"] == .bool(true), reading["scope"] == .string("page"),
                case .array(let reasons)? = summary["truncationReasons"], reasons.contains(.string("node_limit")) {
-                // A visible navigation/sidebar may exhaust the same 80-node
-                // budget before the article. Ask the canonical owner for its
-                // advertised semantic content scope, never grow the budget or
-                // claim a bare HTTP title as article evidence.
+                // A sidebar can consume the 80-node budget before the article; use the owner's content scope without raising the budget.
                 readInput["scope"] = .string("main_content")
                 location = .record(tool: "browser.chrome_snapshot", input: readInput, title: title)
                 let content = try await perform("browser.chrome_snapshot", readInput)
                 guard matches(content, tab: tab, sequence: sequence),
                       object(object(content)["reading"] ?? .null)["scope"] == .string("main_content") else {
                     return .init(location: location, result: unavailable(receipt: receipt,
-                        detail: "The page's main content could not be read from the selected tab. Read this page again to continue; no action was repeated.", observation: content))
+                        detail: "The page's main content could not be read from the selected tab. Read this page again to continue; no action was repeated.",
+                            observation: content))
                 }
                 snapshot = content
             }
@@ -175,8 +179,9 @@ enum AgentWorkspaceActionReadback {
     }
 
     private static func matches(_ snapshot: JSONValue, tab: Int64, sequence: Int64?) -> Bool {
+        let reply = ToolResult(snapshot)
         let row = object(snapshot)
-        guard ChatToolOutcome.hasReadEvidence(snapshot),
+        guard reply.hasReadEvidence(),
               row["tabId"] == .int(tab), string(row["snapshotId"]) != nil,
               integer(row["tabId"]) != nil, case .array? = row["nodes"],
               let observed = integer(row["userSequence"]) else { return false }
@@ -198,6 +203,7 @@ enum AgentWorkspaceActionReadback {
     }
 
     private static func object(_ value: JSONValue) -> [String: JSONValue] { if case .object(let row) = value { return row }; return [:] }
-    private static func string(_ value: JSONValue?) -> String? { guard case .string(let text)? = value, !text.isEmpty, text.count <= 8192 else { return nil }; return text }
+    private static func string(_ value: JSONValue?) -> String? { guard case .string(let text)? = value, !text.isEmpty, text.count <= 8192 else { return nil };
+        return text }
     private static func integer(_ value: JSONValue?) -> Int64? { guard case .int(let value)? = value, value >= 0 else { return nil }; return value }
 }

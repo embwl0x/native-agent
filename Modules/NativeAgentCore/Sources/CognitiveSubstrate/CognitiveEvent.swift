@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `CognitiveEvent.swift` | `CognitiveEvent` and event/turn-kind vocabularies: typed cognition observations, mechanical-row classification and metadata signals |
+// Blueprint: | `CognitiveEvent.swift` | `CognitiveEvent`: typed observations, turn kinds and mechanical-row metadata |
 
 public enum CognitiveEventKind: String, Codable, Sendable, Equatable, CaseIterable {
     case userMessageReceived
@@ -12,18 +12,11 @@ public enum CognitiveEventKind: String, Codable, Sendable, Equatable, CaseIterab
     case toolCancelled
     case userCorrection
     case providerFailure
-    /// INTEROCEPTION (prerelease campaign): a provider crossed a health BAND
-    /// boundary (nominal ⇄ sluggish ⇄ degraded). The graded, continuous sibling
-    /// of `.providerFailure` — minted only on a band transition, never per call.
-    /// Direction/band travel in metadata; the somatic adapter reads them to
-    /// grade sluggishness vs relief.
+    /// Emitted only on provider health-band transitions; metadata carries band and direction so the body can distinguish sluggishness from relief.
     case providerVitalsShift
     case appWake
     case appSleep
-    /// Round 3 Wave A2 — a bodily resolution the organism felt strongly
-    /// enough to remember: relief (braced expectation landed fine) or earned
-    /// disappointment (counted-on expectation fell through), or a noticed break
-    /// in his day. Runtime-owned, care-gated; carries feltValence/feltArousal metadata.
+    /// Runtime-owned, care-gated felt resolutions carry measured valence and arousal rather than inferring them from event kind.
     case organismResolutionFelt
 
     var nodeKind: CognitiveNodeKind {
@@ -44,59 +37,24 @@ public enum CognitiveEventKind: String, Codable, Sendable, Equatable, CaseIterab
     }
 }
 
-/// Templated writers identify themselves by closed provenance; text matching must never exclude real prose.
-/// Raw values persist under `metadataKey` on both chat rows and cognitive events.
+/// Templated writers identify themselves by closed provenance; text matching must never exclude real prose. Raw values persist under `metadataKey` on both chat
+/// rows and cognitive events.
 public enum CognitiveMechanicalRowKind: String, Sendable, Equatable, CaseIterable {
-    /// The inline-interaction lane's stock sentence — the consequence copy said
-    /// in her voice when a connector is missing or a permission is refused.
-    /// This is also where the CONNECTOR FALLBACK text comes from: the card's own
-    /// `cardLaneProse`, spoken on a route that cannot draw the card.
+    /// Connector and permission consequence copy is mechanical, including `cardLaneProse` on surfaces without cards.
     case cardLane
-    /// A provider/transport failure recorded as an assistant row ("Chat error:
-    /// …"). The machine reporting that it broke, not her saying so.
+    /// A provider/transport failure recorded as an assistant row ("Chat error: …"). The machine reporting that it broke, not the agent saying so.
     case systemRow
-    /// Notification and attention boilerplate — a row the attention lane posts
-    /// so the person sees something happened.
     case attentionNotice
-    /// A bot's receipt or headline row, including history imported from the
-    /// shelf. The bot ran; she did not live it.
+    /// A bot's receipt or headline row, including history imported from the shelf. The bot ran; the agent did not live it.
     case botReceipt
-    /// Transport bookkeeping on a bridge-routed row — the wake/notice rows whose
-    /// whole content is the receipt header, with no words under it. Determined
-    /// structurally (the transcript renderer's own answer to "what did this row
-    /// say"), never by matching the header's wording.
+    /// Receipt-only bridge rows are identified structurally, never by header wording.
     case transportNotice
-    /// A compaction summary — the mechanical fold of older turns. Text about
-    /// turns, not a turn.
-    case compactionSummary
-
     public static let metadataKey = "mechanicalKind"
 
-    /// The row kinds already stamped on disk by writers that never knew about
-    /// this enum, read back so history is skipped without being re-scored.
-    /// `compaction_summary` is `ChatSessionRecollections.rowKind`.
-    static let legacyRowKindValues: Set<String> = ["compaction_summary"]
-
-    /// TRUE FOR A ROW NO APPRAISAL SHOULD READ AS A MOMENT SHE LIVED.
-    ///
-    /// Read off metadata and nothing else — never the summary text. Two
-    /// channels, in order:
-    ///
-    ///   1. `mechanicalKind` — stamped at the write seam by the writer itself.
-    ///      Every row written from now on.
-    ///   2. `kind` — the row-kind string writers were already stamping before
-    ///      this enum existed (`compaction_summary`). This is the READ-SIDE
-    ///      half of Agent's ruling: rows already on disk are skipped by what
-    ///      they carry, and NOTHING IS RE-SCORED — the affect already recorded
-    ///      on those nodes stands untouched. History stays as scored; it simply
-    ///      stops being read back as a moment.
+    /// Only provenance metadata excludes a row: `mechanicalKind`. Stored affect remains untouched; wording is never evidence.
     public static func marksMechanicalRow(_ metadata: [String: JSONValue]) -> Bool {
         if case .string(let raw)? = metadata[metadataKey],
            CognitiveMechanicalRowKind(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines)) != nil {
-            return true
-        }
-        if case .string(let raw)? = metadata["kind"],
-           legacyRowKindValues.contains(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
             return true
         }
         return false
@@ -111,10 +69,7 @@ public enum CognitiveTurnKind: String, Codable, Sendable, Equatable, CaseIterabl
     /// Templated product copy belongs in the transcript but never counts as a lived experience or diagnostic traffic.
     case mechanical
 
-    /// Whether this event is part of Agent's lived state rather than
-    /// diagnostic/verification traffic. Non-live events may remain available
-    /// for bounded audit and health evidence, but they must not change affect,
-    /// mood, relational presence, or somatic chemistry.
+    /// Diagnostic traffic may remain observable but must not change lived affect, mood, relational presence or body chemistry.
     public var contributesToLivedState: Bool {
         switch self {
         case .live, .system:
@@ -168,9 +123,8 @@ public struct CognitiveEvent: Codable, Sendable, Equatable {
             ?? defaultTurnKind
         var enrichedMetadata = metadata
         enrichedMetadata[CognitiveTurnKind.metadataKey] = .string(resolvedTurnKind.rawValue)
-        // Continuity nodes intentionally collapse several event kinds into one
-        // node kind. Preserve the closed event class so later appraisal never
-        // has to infer success/failure/cancellation from human-readable prose.
+        // Continuity nodes intentionally collapse several event kinds into one node kind. Preserve the closed event class so later appraisal never has to infer
+        // success/failure/cancellation from human-readable prose.
         enrichedMetadata["eventKind"] = .string(kind.rawValue)
 
         self.id = safeID

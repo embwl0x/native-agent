@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Maintenance.swift` | `CognitiveSubstrate`: microcycle settlement, maintenance deadlines and emotional consolidation |
 
-/// Mutation-free maintenance deadline; analytic reads need no checkpoint.
+/// Analytic reads do not need a maintenance checkpoint.
 public struct CognitiveMaintenanceOpportunity: Sendable, Equatable {
     public var generatedAt: Date
     public var dueReasons: [String]
@@ -26,9 +26,7 @@ extension CognitiveSubstrate {
     @discardableResult
     public func runMicrocycleChecked(reason: String) async throws -> CognitiveWorkspaceSnapshot? {
         await waitForMaintenanceTransition()
-        // The existing commit exclusion also single-flights microcycles. Hand
-        // ownership directly to a waiting caller so its dirty follow-up is not
-        // dropped and maintenance cannot enter between holders.
+        // Hand commit exclusion directly to waiters so dirty follow-ups cannot be dropped or interleaved with maintenance.
         if maintenanceCommitInFlight {
             let done = ScopedWaiter()
             microcycleWaiters.append(done)
@@ -47,20 +45,17 @@ extension CognitiveSubstrate {
         let settledAt = dependencies.now()
         let settledNodes = field.snapshot(at: settledAt, configuration: configuration)
         let workspace = workspaceSnapshot(at: settledAt, settledNodes: settledNodes)
-        // This cycle has consumed the dirty state represented by `workspace`.
-        // Clear before any awaiting persistence work: a concurrent event will
-        // set it again and must survive this cycle's completion.
+        // This cycle has consumed the dirty state represented by `workspace`. Clear before any awaiting persistence work: a concurrent event will set it again
+        // and must survive this cycle's completion.
         dirtySince = nil
         publishAttentionProjection(at: workspace.generatedAt)
         var flushedPresentation = false
         do {
             if configuration.persistenceEnabled {
-                // Resident sensory admission defers its per-event affect and
-                // node writes here. Affect, consumed residue, nodes, pruning
-                // and the receipt settle in one canonical SQLite transaction.
+                // Resident sensory admission defers its per-event affect and node writes here. Affect, consumed residue, nodes, pruning and the receipt settle
+                // in one canonical SQLite transaction.
                 var artifacts = affectCheckpoint(at: settledAt)
-                // The resident ingest's accepted-turn tick (and any unflushed
-                // cadence move) rides the same transaction.
+                // The resident ingest's accepted-turn tick (and any unflushed cadence move) rides the same transaction.
                 if capsulePresentationDirty {
                     capsulePresentationDirty = false
                     flushedPresentation = true
@@ -88,8 +83,7 @@ extension CognitiveSubstrate {
                     at: workspace.generatedAt
                 )
                 if flushedPresentation {
-                    // This transaction durably saved the same cadence ledger
-                    // as a direct flush; settle its existing stage too.
+                    // This transaction durably saved the same cadence ledger as a direct flush; settle its existing stage too.
                     await notingPersistence("capsule_presentation") { }
                 }
             }
@@ -104,20 +98,22 @@ extension CognitiveSubstrate {
     /// Overnight consolidation runs at most once per 20 hours on the maintenance cadence.
     static let emotionalConsolidationInterval: TimeInterval = 20 * 60 * 60
 
-    /// Pure, mutation-free deadline projection over the existing cognition
-    /// owners. Continuous decay is already analytic at every read. Maintenance
-    /// is due at the existing 20-hour emotional consolidation boundary.
+    /// Pure, mutation-free deadline projection over the existing cognition owners. Continuous decay is already analytic at every read. Maintenance is due at
+    /// the existing 20-hour emotional consolidation boundary.
     public func maintenanceOpportunity() -> CognitiveMaintenanceOpportunity {
         currentMaintenanceOpportunity(at: dependencies.now())
     }
 
+    /// What a maintenance pass found: off, not yet due, another pass holding it, or done. Not due is nothing to do; busy is held.
+    public enum MaintenanceRun: Sendable, Equatable { case disabled, notDue, busy, ran }
+
     @discardableResult
-    public func runMaintenanceChecked(reason: String, satisfyWait: Bool = false) async throws -> Bool {
-        guard configuration.enabled else { return false }
+    public func runMaintenanceChecked(reason: String, satisfyWait: Bool = false) async throws -> MaintenanceRun {
+        guard configuration.enabled else { return .disabled }
         // Maintenance and microcycles exclude each other across their commits.
-        guard !maintenanceRunInFlight, !maintenanceCommitInFlight else { return false }
+        guard !maintenanceRunInFlight, !maintenanceCommitInFlight else { return .busy }
         let now = dependencies.now()
-        guard satisfyWait || currentMaintenanceOpportunity(at: now).isDue else { return false }
+        guard satisfyWait || currentMaintenanceOpportunity(at: now).isDue else { return .notDue }
         beginMaintenanceTransition()
         defer { endMaintenanceTransition() }
         let previousField = field
@@ -128,8 +124,7 @@ extension CognitiveSubstrate {
         let previousPatternNudgeDay = resolutionPatternNudgeDay
         let initialDirtyRevision = dirtyRevision
 
-        // One checkpoint operation materializes the same full affect projection
-        // that live reads use (base decay + quiet calming + warm-presence floor).
+        // One checkpoint operation materializes the same full affect projection that live reads use (base decay + quiet calming + warm-presence floor).
         _ = decayAffectInMemory(to: now)
 
         var artifacts = affectCheckpoint(at: now)
@@ -151,7 +146,7 @@ extension CognitiveSubstrate {
             ])
         ))
 
-        guard configuration.persistenceEnabled else { return true }
+        guard configuration.persistenceEnabled else { return .ran }
         do {
             try await persistMaintenanceTransition(
                 nodes: nodes,
@@ -161,9 +156,8 @@ extension CognitiveSubstrate {
                 at: now
             )
         } catch {
-            // The SQLite transaction has already rolled back. Revert the
-            // bounded in-memory transition only when no reentrant live event
-            // changed that family while the store actor was committing.
+            // The SQLite transaction has already rolled back. Revert the bounded in-memory transition only when no reentrant live event changed that family
+            // while the store actor was committing.
             if dirtyRevision == initialDirtyRevision {
                 field = previousField
                 affect = previousAffect
@@ -178,7 +172,7 @@ extension CognitiveSubstrate {
             throw error
         }
         await notingPersistence("maintenance") { }
-        return true
+        return .ran
     }
 
     private func currentMaintenanceOpportunity(at now: Date) -> CognitiveMaintenanceOpportunity {
@@ -211,7 +205,7 @@ extension CognitiveSubstrate {
         var timelineEvents: [CognitiveDevelopmentalTimelineEvent]
     }
 
-    /// Consolidates arousal only every ~20h with affect enabled; zero-count sweeps omit timeline events.
+    /// Only enabled affect consolidates at the 20h boundary; no change means no timeline event.
     private func consolidateEmotionalArousalIfDueInMemory(
         reason: String,
         at now: Date,
@@ -225,15 +219,13 @@ extension CognitiveSubstrate {
         let previousTick = lastEmotionalConsolidationAt
         let counts = field.consolidateEmotionalArousal(at: now, configuration: configuration)
         lastEmotionalConsolidationAt = now
-        // Resolution patterns share disposition caps and day-scale decay;
-        // growth admits new evidence, with at most one nudge per path/kind/day.
+        // Resolution patterns share disposition caps and day-scale decay; growth admits new evidence, with at most one nudge per path/kind/day.
         var artifacts: [CognitiveArtifactWrite] = []
         let dayKey = Self.resolutionPatternDayKey(at: now)
         if let hit = resolutionPatternHit(at: now, newerThan: previousTick),
            resolutionPatternNudgeDay[hit.claimKey] != dayKey {
             integrateDispositionInMemory(tone: hit.tone, at: now, source: "resolution_pattern")
-            // Claim the day and drop every stale (prior-day) claim so the map
-            // stays a handful of entries at most.
+            // Claim the day and drop every stale (prior-day) claim so the map stays a handful of entries at most.
             resolutionPatternNudgeDay[hit.claimKey] = dayKey
             resolutionPatternNudgeDay = resolutionPatternNudgeDay.filter { $0.value == dayKey }
             artifacts.append(CognitiveArtifactWrite(
@@ -263,10 +255,10 @@ extension CognitiveSubstrate {
                 "calmed": .int(Int64(counts.calmed)),
             ])
         )]
-        // Record a replayRun timeline event only when consolidation moved something.
+        // Only actual consolidation earns a replay timeline event.
         var timelineEvents: [CognitiveDevelopmentalTimelineEvent] = []
         if counts.reinforced > 0 || counts.calmed > 0 {
-            // The summary's per-run date keeps timeline event IDs distinct across identical sweeps.
+            // Per-run dates keep equal consolidation summaries from colliding in timeline identity.
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.timeZone = .current

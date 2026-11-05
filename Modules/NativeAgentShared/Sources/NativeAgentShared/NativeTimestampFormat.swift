@@ -1,9 +1,8 @@
 import Foundation
 // Blueprint: | `NativeTimestampFormat.swift` | Locked wire timestamp formats and Foundation parsers; explicit precision, UTC suffixes and calendar-day zones |
 
-/// Existing wire formats stay distinct: changing precision or the UTC suffix
-/// can change stored bytes even when the represented instant is the same.
-/// One formatter per format for the process, only used under `lock`.
+/// Existing wire formats stay distinct: changing precision or the UTC suffix can change stored bytes even when the represented instant is the same. One
+/// formatter per format for the process, only used under `lock`.
 public enum NativeTimestampFormat {
     private static let lock = NSLock()
     // Only touched under `lock`.
@@ -43,15 +42,12 @@ public enum NativeTimestampFormat {
         microsecondUTCOffset(date, rounding: .down)
     }
 
-    /// The one microsecond `+00:00` builder. `rounding` turns the instant into
-    /// whole microseconds (`.down` truncates like Python's isoformat of a
-    /// datetime; `.toNearestOrEven` is `fromtimestamp`'s rounding), carrying
-    /// into the second; a zero fraction is omitted unless `alwaysFraction`.
+    /// The one microsecond `+00:00` builder. `rounding` turns the instant into whole microseconds (`.down` truncates like Python's isoformat of a datetime;
+    /// `.toNearestOrEven` is `fromtimestamp`'s rounding), carrying into the second; a zero fraction is omitted unless `alwaysFraction`.
     public static func microsecondUTCOffset(
         _ date: Date, rounding: FloatingPointRoundingRule, alwaysFraction: Bool = false
     ) -> String {
-        // The whole-second component and the micros are derived from ONE
-        // rounded value so they can never disagree at a boundary.
+        // The whole-second component and the micros are derived from ONE rounded value so they can never disagree at a boundary.
         let totalMicros = Int64((date.timeIntervalSince1970 * 1_000_000).rounded(rounding))
         // Floor pre-epoch seconds so the microsecond remainder stays in 0..<1e6.
         var wholeSeconds = totalMicros / 1_000_000

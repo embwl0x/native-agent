@@ -7,78 +7,38 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 
-// Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime` horizon expectations: Desk plans named and deduplicated by work title, unnamed memory plans by whole-second due instant, composed dated evidence and refresh deadlines; mind.horizon uses the retained refresh and reports complete/incomplete source kinds without inventing settlement |
+// Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime`. |
 
-// The runtime composes source evidence for the organism's forward register.
-//
-// The organism owns the register itself (`OrganismHorizonRegister`,
-// `OrganismPrediction.swift`): the rows, their bounds, the anticipation they
-// apply to the projected chemistry, and the reads. It cannot own the SOURCES,
-// because the things she is actually facing live in four stores the organism
-// has never heard of. That composition is this file, and it is deliberately the
-// whole of it: no source is invented here, and a store that cannot be read
-// contributes nothing rather than a placeholder.
-//
-// ── FOUR REAL SOURCES ────────────────────────────────────────────────────────
-//   (a) statedPlan    — a Desk item User parked until a date (`deferUntil`).
-//   (b) stagedApproval— an approval she staged that he has not walked through.
-//   (c) openQuestion  — her own completed turn with no reaction yet.
-//   (d) peerReply     — a delegated bridge job with no reply back.
-//
-// Desk plans keep their work titles as bounded canonical names; memory atoms
-// have no name and carry an empty label. Other labels are identifiers the store
-// already owns — a job id, an approval action, an agent name. No bodies cross.
-// The stores are read through their existing public read APIs and nothing is
-// written back to any of them.
-//
-// ── NO NEW TIMER, NO POLLING ─────────────────────────────────────────────────
-// Source invalidations and horizon eligibility/expiry boundaries coalesce behind
-// one retained refresh on the existing residual deadline, without a minimum interval.
-//
-// ── WHY THE MINT RIDES A SIGNAL ──────────────────────────────────────────────
-// The rows have to live in the prediction ledger, because that is what
-// `OrganismProspectiveAffect.modulate` reads when the kernel projects
-// chemistry, and the anticipation is the whole point. `OrganismKernel` owns
-// that ledger and takes exactly one kind of input — a `SomaticSignal` — so the
-// refresh is delivered as one, on `SomaticSignalKind.horizonRefresh`.
-//
-// A horizon refresh changes only the horizon: no chemistry, body fact, valence or associations.
+// Compose source evidence here while the organism owns its bounded register, prediction ledger and reads.
+// Use canonical Desk plans, staged approvals, unanswered completions and peer jobs; unavailable stores cannot invent placeholders.
+// Only bounded source names or identifiers cross, never bodies; source stores remain read-only.
+// Coalesce invalidations and real horizon boundaries on the existing residual deadline without polling.
+// Deliver horizonRefresh through the kernel's somatic input so anticipation updates its canonical ledger alone.
 
-/// The runtime's source state holds the re-entrancy latch and coalesced dirty
-/// bit. The horizon refresh's own somatic signal cannot dirty its sources.
+/// Keep reentrancy and coalesced dirtiness here; the refresh signal must not invalidate its own sources.
 extension NativeCognitionRuntime {
 
     // MARK: - Tuning (all in one place)
 
-    /// How long an approval sits before its horizon passes. Approvals carry no
-    /// expiry of their own (the inbox has no TTL), so this is the point at which
-    /// "he hasn't looked at it" becomes something she notices — not a deadline
-    /// imposed on him.
+    /// Approval age supplies an attention horizon because the inbox has no expiry; it imposes no deadline on the person.
     static let horizonApprovalWindow: TimeInterval = 24 * 60 * 60
-    /// How long a delegated peer job runs before she is WAITING on it rather
-    /// than merely expecting it.
     static let horizonPeerReplyWindow: TimeInterval = 30 * 60
-    /// Her valence GUESS per source — the sign that decides whether a horizon
-    /// lifts curiosity/warmth or raises vigilance, and how much. These are
-    /// judgments, not measurements, and they are small on purpose: the ceiling
-    /// on the whole register is 0.15 on any dimension.
+    /// Small per-source valence guesses guide anticipation, never claim measurement; the whole-register ceiling is 0.15 per dimension.
     static func horizonValenceGuess(for kind: OrganismHorizonSourceKind) -> Double {
         switch kind {
-        // A day she has been pointed at. Mild anticipation.
+        // A stated future day carries mild anticipation.
         case .statedPlan: return 0.25
-        // A gate she cannot open herself. Mild dread, not distress.
+        // An approval gate carries mild dread rather than distress.
         case .stagedApproval: return -0.20
-        // Something she said, still hanging. The lightest unease there is.
+        // An unanswered turn carries only light unease.
         case .openQuestion: return -0.15
-        // "Wondering if she'll write back."
         case .peerReply: return 0.20
         }
     }
 
     // MARK: - The hop from the residual-repair deadline
 
-    /// Called from `rescheduleResidualRepairDeadline`. Hands off to a
-    /// detached task so four disk reads never sit in front of signal ingestion.
+    /// Detach source reads from the residual deadline so disk work cannot delay signal ingestion.
     func considerHorizonExpectations(runNow: Bool = false, reply: MindClockReply? = nil) {
         guard !isFlushedForTermination, sourceWakes.horizonReady, horizonRefreshTask == nil else {
             reply?(.init("held", "Horizon sources are not ready, a refresh is running, or the runtime is stopping.")); return
@@ -88,7 +48,7 @@ extension NativeCognitionRuntime {
         horizonRefreshTask = Task { [weak self] in
             guard let self else { reply?(.init("unavailable", "The runtime was released.")); return }
             let result = await self.refreshHorizonExpectationsIfDue()
-            reply?(result)
+            if let reply { reply(result) } else { await self.beat(.horizon, result) }
             await self.finishHorizonRefresh()
         }
     }
@@ -98,11 +58,10 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
-    /// Source events coalesce behind the one retained refresh. Changes during
-    /// its reads keep the dirty bit for the next pass.
+    /// Retain one coalesced refresh; events during reads remain dirty for the next pass.
     @discardableResult
     func refreshHorizonExpectationsIfDue() async -> MindClockResult {
-        guard !isFlushedForTermination, !Task.isCancelled, !sourceWakes.horizonRunning else { return .init("held", "Horizon refresh is running or stopping.") }
+        guard !isFlushedForTermination, !Task.isCancelled, !sourceWakes.horizonRunning else { return .waiting("Horizon refresh is running or stopping.") }
         sourceWakes.horizonRunning = true
         sourceWakes.horizonDirty = false
         sourceWakes.horizonNextAt = nil
@@ -112,40 +71,29 @@ extension NativeCognitionRuntime {
 
     // MARK: - One refresh
 
-    /// Read the sources, announce whatever settled since last time, and hand the
-    /// complete current source set to the ledger.
-    ///
-    /// ORDER MATTERS. The settled rows are read from the ledger BEFORE the
-    /// refresh signal, because the refresh is what prunes them, and they are
-    /// ANNOUNCED before the signal is sent: a crash in between costs a repeat,
-    /// and a repeat is inert (the felt event's id is derived from the row and
-    /// its resolution instant, so the substrate's own duplicate guard drops it).
-    /// A crash the other way around would cost the moment entirely.
+    /// Announce settled ledger rows before refresh prunes them so a crash cannot lose their felt moment.
+    /// Deterministic IDs make a repeated announcement inert under the substrate's duplicate guard.
     @discardableResult
     func refreshHorizonExpectations() async -> MindClockResult {
         await bootstrap()
-        // A nil export is a disabled organism. Nothing to hold a horizon in.
+        // A disabled organism has no horizon ledger to refresh.
         guard let before = await organismKernel.exportPersistentState()?.predictionLedger else {
-            OrganPulse.recordOff("horizon_expectations", because: "organism disabled")
-            return .init("held", "The organism is disabled.")
+            return .off("the organism is disabled")
         }
         let at = now()
         let settled = OrganismHorizonRegister.settled(in: before)
         let open = OrganismHorizonRegister.open(in: before)
         let composed = await composeHorizonSources(at: at)
-        // Nothing open, nothing settled, nothing to expect: send no signal at
-        // all. This is the ordinary state of a quiet machine and it must stay
-        // free.
+        // With no open, settled or expected rows, send no signal so a quiet machine stays idle.
         let facing = !settled.isEmpty || !open.isEmpty || !composed.tokens.isEmpty
-        OrganPulse.record("horizon_expectations", facing ? .worked : .nothing,
-                          note: "\(open.count) open, \(settled.count) settled, \(composed.tokens.count) expected")
         let incomplete = OrganismHorizonSourceKind.allCases.map(\.rawValue).filter { !composed.completeKinds.contains($0) }
-        let result = MindClockResult(incomplete.isEmpty ? (facing ? "refreshed" : "nothing") : (facing ? "partial" : "unavailable"), "\(open.count) open, \(settled.count) settled, \(composed.tokens.count) expected; unreadable or truncated source kinds remain holding.", fields: [
+        let result = MindClockResult(incomplete.isEmpty ? (facing ? "refreshed" : "nothing") : (facing ? "partial" : "unavailable"),
+            "\(open.count) open, \(settled.count) settled, \(composed.tokens.count) expected; unreadable or truncated source kinds remain holding.", fields: [
             "open": .int(Int64(open.count)), "settled": .int(Int64(settled.count)),
             "expected": .int(Int64(composed.tokens.count)),
             "completeKinds": .array(composed.completeKinds.map(JSONValue.string)),
             "incompleteKinds": .array(incomplete.map(JSONValue.string))
-        ])
+        ], yield: open.count + settled.count + composed.tokens.count)
         guard facing else { return result }
 
         for row in settled {
@@ -155,16 +103,14 @@ extension NativeCognitionRuntime {
         await ingestOrganismSignal(
             kind: .horizonRefresh,
             sourceOrgan: OrganismHorizonRegister.sourceOrgan,
-            // The kind is already inert; zero says so a second time, and keeps
-            // the field's activation impulse at its floor.
+            // Keep activation at its floor because horizon refresh must remain chemically inert.
             intensity: 0,
             metadata: [
                 OrganismHorizonRegister.metadataKey: .array(composed.tokens.map(JSONValue.string)),
             ],
             persistSynchronously: false
         )
-        // The signal prunes announced rows, then expires due horizons without
-        // an outcome verdict. Keep one coalesced follow-up pass to feel waiting.
+        // Refresh prunes announced rows and expires horizons without verdicts; retain one coalesced follow-up to feel waiting.
         if let after = await organismKernel.exportPersistentState()?.predictionLedger,
            !OrganismHorizonRegister.settled(in: after).isEmpty {
             sourceWakes.horizonDirty = true
@@ -172,24 +118,15 @@ extension NativeCognitionRuntime {
         return result
     }
 
-    /// The frozen body's nearest horizon: a payload-free label, valence sign
-    /// and overdue flag. Nil is silence; the capsule owner picks the word.
+    /// Keep horizon labels payload-free; the capsule owner chooses presentation.
     public func towardRead() async -> OrganismTowardRead? {
         await organismKernel.frozenRead(at: now()).toward
     }
 
     // MARK: - Announcing a resolution
 
-    /// Turn one settled horizon row into a felt cognitive event.
-    ///
-    /// Three phrasings, because there are three ways a horizon ends and the
-    /// shared felt-resolution composer only knows two. `waiting` is the one this
-    /// lane exists for: the horizon passed and nothing answered it.
-    ///
-    /// `subject.label` is `OrganismHorizonRegister.resolutionPathLabel`, which is
-    /// what the stakes gate admits this family by
-    /// (`CognitiveSubstrate+AppraisalStakes.swift`). `subject.id` carries the
-    /// payload-free who/what.
+    /// Distinguish waiting from the other resolution states because expiry without a reply is not a verdict.
+    /// Use the register's resolution-path label for stakes admission and retain only opaque subject identity.
     private func announceHorizonResolution(_ row: OrganismPrediction, at date: Date) async {
         guard let horizon = row.horizon,
               let label = OrganismHorizonRegister.displayLabel(for: row, at: date) else { return }
@@ -211,16 +148,14 @@ extension NativeCognitionRuntime {
         case .expired:
             phase = "waiting"
             summary = "Still waiting on \(label). The moment came and went."
-            // Deliberately shallow. Waiting is not grief; it is the low,
-            // unfinished note a person carries when nothing answered.
+            // Keep waiting shallow because an unanswered expectation is not grief.
             feltValence = -0.18
             feltArousal = 0.2
         case .pending:
             return
         }
         let event = CognitiveEvent(
-            // Deterministic: one moment, one event, however many times this
-            // lane re-reads it. The substrate's duplicate guard does the rest.
+            // Derive IDs from the moment and resolution so repeated reads cannot create repeated felt events.
             id: "horizon:\(row.id):\(String(format: "%.0f", row.lastUpdatedAt.timeIntervalSince1970.rounded(.towardZero) + 0))",
             kind: .organismResolutionFelt,
             subject: CognitiveSubjectReference(
@@ -249,11 +184,7 @@ extension NativeCognitionRuntime {
 
     // MARK: - Composing the source set
 
-    /// One source kind's contribution: its rows, and whether the store behind
-    /// it could be read at all.
-    ///
-    /// Completeness is reported to the caller as source availability. It never
-    /// establishes a horizon's outcome.
+    /// Report source availability independently of rows; completeness cannot establish a horizon outcome.
     struct HorizonSourceReading: Sendable {
         let kind: OrganismHorizonSourceKind
         let rows: [(token: String, dueAt: Date)]
@@ -285,31 +216,16 @@ extension NativeCognitionRuntime {
         }
         let truncatedKinds = Set(rows.dropFirst(OrganismHorizonRegister.maximumOpen).map(\.kind.rawValue))
         return (
-            // Cut to the register's own cap, nearest first. Not a nicety:
-            // somatic metadata bounds arrays at
-            // `OrganismMetadataBounds.maximumArrayItems`, so an over-long set
-            // would be truncated in COMPOSITION order rather than by due time.
+            // Cap nearest-first before metadata bounds so truncation cannot choose sources by composition order instead of due time.
             rows.prefix(OrganismHorizonRegister.maximumOpen).map(\.token),
             readings.filter { $0.complete && !truncatedKinds.contains($0.kind.rawValue) }.map(\.kind.rawValue).sorted()
         )
     }
 
-    /// A source's own moment, reported honestly — never rewritten.
-    ///
-    /// This used to hand an already-passed source a fresh sixty-second horizon
-    /// so it could expire into `waiting`. That was a small lie with a real
-    /// consequence: a source first seen already-late is a stale read, not
-    /// something she spent any time looking toward, and minting an expectation
-    /// in order to break it a minute later manufactures an anticipation that
-    /// never existed. The ledger now takes an overdue time at face value — it
-    /// refreshes a row she already holds (which is how a genuinely late thing
-    /// becomes `waiting`) and opens no new one.
-    ///
-    /// The only rejections are horizons nobody would feel: further ahead than a
-    /// week, or further behind than one.
+    /// Preserve source time: already-late evidence cannot manufacture anticipation that never existed.
+    /// Refresh existing overdue horizons but open no new ones; reject only times outside the register's week.
     private func horizonDue(natural: Date, at now: Date) -> Date? {
-        // A source may enter or leave the existing seven-day window without a
-        // write. Keep those real boundaries, not a fifteen-minute sample.
+        // Keep exact seven-day eligibility boundaries because a source can enter or leave the window without a write.
         let width = OrganismHorizonRegister.maximumHorizon
         for boundary in [natural.addingTimeInterval(-width), natural, Self.afterInclusiveBoundary(natural.addingTimeInterval(width))] where boundary > now {
             sourceWakes.horizonNextAt = min(sourceWakes.horizonNextAt ?? boundary, boundary)
@@ -338,20 +254,11 @@ extension NativeCognitionRuntime {
         )
     }
 
-    /// (a) The user's stated plans. TWO feeds, one kind:
-    ///
-    ///   · Desk items he parked until a date (`deferUntil`);
-    ///   · memory atoms whose writer named a plan or commitment's moment
-    ///     (`due_at`); retired prose-extractor stamps are excluded by the reader.
-    ///
-    /// They share a kind because they are the same THING to her (a day she has
-    /// been pointed at), and completeness is therefore the AND of both reads: if
-    /// either store could not be read, the kind reports incomplete evidence.
+    /// Combine canonical Desk deferrals and memory due_at plans as one kind; completeness requires both source reads.
     private func statedPlanSources(at now: Date) async -> HorizonSourceReading {
         let desk = await deskDeferralSources(at: now)
         let atoms = await datedMemorySources(at: now)
-        // Each feed deduplicates by its source's identity before the shared cap:
-        // Desk work names and unnamed atoms' whole-second due instants.
+        // Deduplicate each feed by source identity before the shared cap: Desk names and unnamed atoms' whole-second due instants.
         return HorizonSourceReading(
             kind: .statedPlan,
             rows: desk.rows + atoms.rows,
@@ -359,15 +266,10 @@ extension NativeCognitionRuntime {
         )
     }
 
-    /// Memory atoms carrying a resolved `due_at` inside the register's week.
-    /// Atoms have no name: their empty label leaves time words to display reads,
-    /// never saved `due_label` or memory prose.
-    ///
-    /// This feed collapses atoms at the same whole-second instant into
-    /// one row. Equal words on different dates do not: Friday is one Friday.
+    /// Collapse unnamed memory plans by whole-second instant; labels stay empty so prose cannot masquerade as canonical names.
     private func datedMemorySources(at now: Date) async -> (rows: [(token: String, dueAt: Date)], complete: Bool) {
         guard let records = try? await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(kind: nil) else {
-            // The store could not be read. Not "every plan came round".
+            // An unreadable store cannot prove that every plan came round.
             return ([], false)
         }
         var seen: Set<String> = []
@@ -384,15 +286,12 @@ extension NativeCognitionRuntime {
         return (out, true)
     }
 
-    /// Desk items User parked until a date. `deferUntil` is the one field in
-    /// the system that means "this is for later, and later is a specific day".
-    /// The work's title is its name, independent of the day it is deferred to.
+    /// Use canonical Desk deferUntil for timing and the work title for identity, independently of the deferred day.
     private func deskDeferralSources(at now: Date) async -> (rows: [(token: String, dueAt: Date)], complete: Bool) {
         guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
             return ([], false)
         }
-        // A missing feed is unavailable source evidence, distinct from a read
-        // of an existing empty Desk. Neither establishes a horizon outcome.
+        // A missing feed is unavailable, distinct from an empty Desk; neither establishes a horizon outcome.
         guard deskFeedIsPresent else {
             return ([], false)
         }
@@ -415,27 +314,16 @@ extension NativeCognitionRuntime {
         return (out, true)
     }
 
-    /// Either half of the Desk's canonical feed being on disk means the store
-    /// has something real to replay: the op-log, or the compaction snapshot the
-    /// op-log replays from (a freshly compacted desk can legitimately have an
-    /// empty op-log). Neither present means the Desk has never been written on
-    /// this machine — at which point there is nothing to be waiting for either,
-    /// so refusing to vouch costs nothing and protects the case that matters.
-    ///
-    /// `nonisolated` because it genuinely is: it reads the immutable `dataRoot`
-    /// and asks the filesystem, and touches no actor state. That also lets the
-    /// app tests pin it directly without an actor hop, which is how the
-    /// isolation error that flagged this was found.
-    nonisolated var deskFeedIsPresent: Bool {  // internal: pinned by the app tests
+    /// Either the canonical op-log or its compaction snapshot establishes a written Desk; neither present leaves source evidence unavailable.
+    /// This filesystem read uses immutable dataRoot and touches no actor state.
+    nonisolated var deskFeedIsPresent: Bool {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         let manager = FileManager.default
         return manager.fileExists(atPath: store.opsPath.path)
             || manager.fileExists(atPath: store.basePath.path)
     }
 
-    /// (b) Approvals she staged and he has not walked through. The label is the
-    /// ACTION (`mission.step`, `memory.kind_backfill`) — the record's `title`
-    /// and `reason` are content and are never read here.
+    /// Use the approval action as its label; title and reason are content and cannot cross here.
     private func stagedApprovalSources(at now: Date) async -> HorizonSourceReading {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         guard let pending = try? await inbox.list(filter: .pending) else {
@@ -455,13 +343,9 @@ extension NativeCognitionRuntime {
         return HorizonSourceReading(kind: .stagedApproval, rows: out, complete: true)
     }
 
-    /// (c) Her own completed turn with nothing back yet. One row at most — the
-    /// substrate holds one slot — and its horizon is fixed at the moment the
-    /// slot OPENED, not at each read, so "he answered" and "it aged out" stay
-    /// distinguishable. See `CognitiveSubstrate.openCompletion(at:)`.
+    /// Keep the unanswered completion's horizon fixed at slot opening so a reply remains distinguishable from aging out.
     private func openQuestionSources(at now: Date) async -> HorizonSourceReading {
-        // This source is a slot inside the substrate actor. Its inventory is
-        // complete, but absence does not distinguish a reply from aging out.
+        // The substrate slot inventory is complete, but absence cannot distinguish reply from aging out.
         guard let open = await substrate.openCompletion(at: now),
               let token = token(
                   .openQuestion,
@@ -474,13 +358,10 @@ extension NativeCognitionRuntime {
         return HorizonSourceReading(kind: .openQuestion, rows: [token], complete: true)
     }
 
-    /// (e) A delegated bridge job with no reply back. The label is the bridge
-    /// SOURCE — `claude`, `codex` — so several jobs to the same peer collapse
-    /// into one thing she is waiting on, which is how a person holds it. The
-    /// topic slug and the completion text are content and are never read here.
+    /// Group delegated jobs by bridge source so multiple jobs to one peer form one expectation.
+    /// Topic slugs and completion text are content and cannot cross here.
     private func peerReplySources(at now: Date) -> HorizonSourceReading {
-        // Scoped to THIS install's bridge root: a copy that does not own the
-        // machine-wide rendezvous must not wait on another install's jobs.
+        // Scope jobs to this install's bridge root so another install's work cannot create expectations here.
         let projector = DelegationStatusProjector(
             configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot),
             dataRoot: dataRoot
@@ -502,8 +383,7 @@ extension NativeCognitionRuntime {
             seen.insert(peer)
             out.append(token)
         }
-        // Availability distinguishes an empty inventory from an unavailable
-        // read in the reply. Neither inventory state supplies an outcome.
+        // Separate empty inventory from unreadable evidence; neither supplies an outcome.
         return HorizonSourceReading(kind: .peerReply, rows: out, complete: read.allStoresReadable)
     }
 }

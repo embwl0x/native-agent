@@ -50,10 +50,8 @@ struct BubbleHoverBar: View {
 
     var body: some View {
         HStack(spacing: NativeAgentSpacing.xs) {
-            // Copy
             BubbleAction(icon: "doc.on.doc", help: "Copy text", action: onCopy)
 
-            // Regenerate — only on last assistant message
             if isAssistant && isLastAssistant {
                 BubbleAction(icon: "arrow.clockwise", help: "Regenerate", action: onRegenerate)
             }
@@ -85,7 +83,6 @@ private struct BubbleAction: View {
     }
 }
 
-/// Encode the canonical message for debug inspection, preserving wire shape and recorded origin.
 enum ChatMessageDebugJSON {
     static func text(for message: ChatMessage) throws -> String {
         let encoder = JSONEncoder()

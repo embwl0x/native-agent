@@ -100,7 +100,10 @@ struct ToolsView: View {
             catalogMessage(title: "No tools available", detail: "The tool list loaded, but there were no tools in it.")
         case .unavailable(let detail):
             catalogMessage(title: "The tool list could not be read", detail:
-                detail.map { "The tool catalog could not be read: \($0). Open Diagnostics → Health checks to inspect the cause; use Refresh after fixing it." }
+                detail.map { """
+                    The tool catalog could not be read: \($0). Open Diagnostics → Health checks to inspect the cause; \
+                    use Refresh after fixing it.
+                    """ }
                     ?? "No tool catalog loaded. Use Refresh to load it.")
         case let .available(catalog, bucketResult), let .stale(catalog, bucketResult, _):
             let detail: String? = if case let .stale(_, _, detail) = catalogState { detail } else { nil }
@@ -135,9 +138,7 @@ enum ToolsNavigation {
     }
 }
 
-/// The toolbar reports the outcome of its scoped refresh rather than treating
-/// a tap, or completion of only the side reads, as proof that the tool catalog
-/// itself was refreshed.
+/// Side-read completion cannot prove catalog refresh; report the scoped refresh outcome.
 enum ToolsRefreshPresentation {
     enum State: Equatable {
         case idle

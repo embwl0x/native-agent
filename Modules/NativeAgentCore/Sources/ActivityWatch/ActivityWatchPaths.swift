@@ -1,21 +1,11 @@
 import Foundation
 
-// Blueprint: | `ActivityWatchPaths.swift` | `ActivityWatchPaths`: one directory and file vocabulary for private ambient history, separate from activity event feeds |
+// Blueprint: | `ActivityWatchPaths.swift` | `ActivityWatchPaths`: private ambient history paths, separate from exported activity event feeds |
 
-/// The ONE place the watcher's on-disk home is named.
-///
-/// **Why it is not `<dataRoot>/activity/`** (which is what v0 used): that
-/// directory already belongs to a different, older feature — the app's activity
-/// *events* feed (`activity/events.jsonl`) and its runtime receipts. Support
-/// bundles select that feed; data exports do not.
-/// Ambient window history must stay outside that selected feed.
-///
-/// So the watcher gets its own directory, and that directory appears in NO
-/// backup, export, support-bundle, or iCloud/CloudKit snapshot list.
-/// `ActivitySpanStore` owns these local bytes; `PrivacyMap` classifies them as
-/// local-only and `TrustBackupOffDisk` excludes this directory from backup.
+/// Keep ambient window history outside activity/events.jsonl, which support bundles select.
+/// The directory is local-only: PrivacyMap and TrustBackupOffDisk exclude it from exports and backups.
 public enum ActivityWatchPaths {
-    /// Directory name under the data root. Deliberately NOT "activity".
+    /// Use a distinct directory so event-feed selection never includes ambient history.
     public static let directoryName = "activity_watch"
 
     public static func directory(dataRoot: URL) -> URL {

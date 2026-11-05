@@ -1,32 +1,6 @@
-// One initiative path shares worthwhile things at considerate times, without requiring a reply.
-//
-//   1. On device, from state she already has, a few CANDIDATES — each a thing,
-//      with its source and why it might be worth his time: a plan of User's
-//      coming due on the Desk, an open care of hers pressing to be said, an opinion she revised with its evidence, an
-//      interest she came back to with a better question, what a trusted
-//      builder shipped, a gentle dream association about him.
-//   2. TIMING GATES, all on device: his quiet hours, not while he is talking
-//      to her or working with Claude, one offer a day, eight hours apart, a
-//      subject once a week, nothing he has been around for since, nothing she
-//      rejected, and after a message he did not answer nothing more until he
-//      is back.
-//   3. One candidate that passes everything becomes one resident-wake turn of
-//      hers (her voice, her tools, her choice): she writes the message, or
-//      answers "pass". It goes to his conversation through the proactive
-//      speech seam (`.reachOut`). When that conversation is his Telegram DM
-//      it is sent there too and nothing knocks; otherwise one quiet knock to
-//      his phone points at it.
-//
-// Counters are housekeeping facts in one bounded file: when he last
-// took a turn, what she offered, sent or passed on, whether he took a turn
-// within a day after (a fact, never a score), whether it knocked. They feed
-// the timing above; no prompt ever reads them. Absence only ever makes a
-// moment considerate; it never makes a candidate.
-//
-// How it landed is the care's, not the ledger's: once a care's offer to his
-// own conversation is settled, the care that sent it gets one story entry by
-// him, welcomed or unanswered, written on device. A welcome care grows; an
-// unanswered one only keeps the fact (moved 0).
+// Share worthwhile source-backed things at considerate times without requiring a reply.
+// Use local timing gates and one resident wake; absence may permit timing but cannot create a candidate.
+// Keep pacing facts in the bounded ledger outside prompts; settled care outcomes belong to their care's story.
 
 import ChatTurnRuntime
 import AgentWorkspace
@@ -43,10 +17,9 @@ import Transcripts
 import TurnTrace
 import NativeAgentShared
 
-// Blueprint: | `NativeCognitionRuntime+Reach.swift` | `NativeCognitionRuntime` outreach execution, durable offer settlement, care landing and exact delivery deadlines; mind.reach satisfies only the scan wait in the retained flight and returns the real gate/offer result |
+// Blueprint: | `NativeCognitionRuntime+Reach.swift` | `NativeCognitionRuntime`. |
 
-/// Runtime-owned single flight and source-read limits. Memory only: the facts that
-/// must survive a restart are in the ledger.
+/// Keep only process-local flight state here; restart-surviving facts belong in the ledger.
 extension NativeCognitionRuntime {
 
     func withdrawReachIfDisabled() {
@@ -58,20 +31,28 @@ extension NativeCognitionRuntime {
             ledger.offers[index].outcome = "withheld"
             changed = true
         }
-        if changed { ledger.write(dataRoot) }
+        guard changed else { return }
+        let saved = ledger.write(dataRoot)
+        if let off = clockOffReason(explicit: false) {
+            OrganJudge.beatOff(MindClockVerb.reach.organ, because: off + (saved ? "; the pending offer was withdrawn"
+                : "; the pending offer was withdrawn but the ledger was not saved"))
+        }
     }
 
-    /// Rides `rescheduleResidualRepairDeadline`, where the shoulder tap rode:
-    /// no timer, no loop, no budget of its own.
+    /// Use the existing residual deadline rather than another timer or budget.
     func considerReach(runNow: Bool = false, reply: MindClockReply? = nil) {
+        if !isFlushedForTermination, let off = clockOffReason(explicit: false) {
+            if let reply { reply(.off(off)) } else { beat(.reach, .off(off)) }
+            return
+        }
         guard !isFlushedForTermination, sourceWakes.reachReady, reachEnabled, reachTask == nil else {
-            reply?(.init("held", "Reach is disabled, its sources are not ready, a pass is running, or the runtime is stopping.")); return
+            reply?(.init("held", "Reach sources are not ready, a pass is running, or the runtime is stopping.")); return
         }
         if let due = sourceWakes.reachNextAt, due <= now() { sourceWakes.reachDirty = true }
         guard runNow || sourceWakes.reachDirty else { return }
         reachTask = Task {
             let result = await self.runReachPass(satisfyWait: runNow)
-            reply?(result)
+            if let reply { reply(result) } else { await self.beat(.reach, result) }
             await self.finishReachPass()
         }
     }
@@ -81,36 +62,32 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
-    /// Claude's worklog is read only when `withClaude` is asked for.
-    private func reachTiming(at instant: Date, withClaude: Bool = false) async throws -> Reach.Timing {
-        let hasClaude = withClaude ? try AgentConversationDelivery.lane(for: "claude", dataRoot: dataRoot) != nil : false
-        return Reach.Timing(
+    private func reachTiming(at instant: Date) async throws -> Reach.Timing {
+        Reach.Timing(
             now: instant,
             quietHours: host.inQuietHours(at: instant, dataRoot: dataRoot),
             liveTurn: liveTurnInFlight,
-            lastUserTurn: UserTurnStamp.last(dataRoot: dataRoot),
-            lastClaude: hasClaude
-                ? try Self.claudeLastActivity(Self.defaultClaudeWorklog()) : nil)
+            lastUserTurn: UserTurnStamp.last(dataRoot: dataRoot))
     }
 
     private func runReachPass(satisfyWait: Bool = false) async -> MindClockResult {
-        // Consume this edge before any read. A newer invalidation delivered
-        // during an await belongs to the next pass, even if this read fails.
+        // Consume invalidation before awaiting reads so later edges survive even a failed pass.
         sourceWakes.reachDirty = false
         sourceWakes.reachNextAt = nil
         do { return try await runReachPassChecked(satisfyWait: satisfyWait) }
         catch {
             sourceWakes.reachNextAt = nil
             _ = Self.bodySourceFailure(error, source: "Reach source inventory", dataRoot: dataRoot)
-            return .init("unavailable", "Reach sources are unavailable: " + error.localizedDescription + ". Repair the named source; no subject or audience was substituted.")
+            return .init("unavailable", "Reach sources are unavailable: " + error.localizedDescription
+                + ". Repair the named source; no subject or audience was substituted.")
         }
     }
 
     private func runReachPassChecked(satisfyWait: Bool) async throws -> MindClockResult {
-        guard !isFlushedForTermination, !Task.isCancelled else { return .init("held", "Reach stopped.") }
-        guard reachEnabled else {
+        guard !isFlushedForTermination, !Task.isCancelled else { return .init("stopped", "Reach stopped.") }
+        if let off = clockOffReason(explicit: false) {
             withdrawReachIfDisabled()
-            return .init("held", "Reach is disabled.")
+            return .off(off)
         }
         let instant = now()
         let person = try Self.resolvedPerson(dataRoot: dataRoot)
@@ -121,58 +98,58 @@ extension NativeCognitionRuntime {
             return .init("unavailable", "Reach answer settlement was not kept: " + error.localizedDescription)
         }
         var timing = try await reachTiming(at: instant)
-        // Each read-modify-write of the ledger below is one synchronous
-        // segment on this actor: no await between the read and the write, so
-        // a delivery's `sending` row can never be overwritten by a stale copy.
+        // Keep ledger read-modify-write in one actor segment so stale state cannot overwrite a sending row.
         guard var ledger = ReachLedger.read(dataRoot) else { return .init("unavailable", "The Reach ledger could not be read.") }
         projectReachDeadline(timing: timing, ledger: ledger, candidates: [])
         var changed = false
-        // An offer still waiting for her wake whose moment has passed (he came
-        // back, quiet hours began) is taken back before it costs a turn.
-        if Reach.momentPassed(timing), let index = ledger.offers.lastIndex(where: { $0.outcome == "offered" }),
+        // Withdraw a pending offer when its considerate moment has passed, before spending a turn.
+        if let passed = Reach.momentPassed(timing), let index = ledger.offers.lastIndex(where: { $0.outcome == "offered" }),
            ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "reach") {
             ledger.offers[index].outcome = "withheld"
             changed = true
+            OrganJudge.beat(MindClockVerb.reach.organ, .held, note: "withdrew the pending offer: its moment passed (\(passed.rawValue))")
         }
         if changed, !ledger.write(dataRoot) { return .init("failed", "The withdrawn Reach offer was not saved.") }
         await landReachAnswers(ledger)
         let gate = Reach.timing(timing, ledger: ledger)
-        guard gate == .offer else { return .init("held", gate.rawValue) }
+        guard gate == .offer else { return .waiting(gate.rawValue) }
         if !satisfyWait, let last = sourceWakes.reachLastScanAt, instant.timeIntervalSince(last) < Reach.scanInterval {
             sourceWakes.reachNextAt = last.addingTimeInterval(Reach.scanInterval)
-            return .init("held", "Reach candidate reads are cooling down.")
+            return .waiting("Reach candidate reads are cooling down.")
         }
         sourceWakes.reachLastScanAt = instant
-        timing = try await reachTiming(at: instant, withClaude: true)
+        timing = try await reachTiming(at: instant)
         let rejected = await substrate.associationSuppressionSnapshot().map(\.source)
         let candidates = try await reachCandidates(at: instant)
         projectReachDeadline(timing: timing, ledger: ledger, candidates: candidates)
         guard candidates.contains(where: {
             Reach.decide($0, timing: timing, ledger: ledger, rejectedSources: rejected) == .offer
         }) else {
-            return .init("held", candidates.isEmpty ? "No current Reach candidate was available; no offer was made."
+            return .init("nothing", candidates.isEmpty ? "No current Reach candidate was available; no offer was made."
                 : "No candidate passed Reach policy.", fields: ["decisions": .array(candidates.map {
-                    .object(["subject": .string($0.subject), "outcome": .string(Reach.decide($0, timing: timing, ledger: ledger, rejectedSources: rejected).rawValue)])
+                    .object([
+                        "subject": .string($0.subject),
+                        "outcome": .string(Reach.decide($0, timing: timing, ledger: ledger, rejectedSources: rejected).rawValue)
+                    ])
                 })])
         }
-        guard reachEnabled else {
+        if let off = clockOffReason(explicit: false) {
             withdrawReachIfDisabled()
-            return .init("held", "Reach was disabled during its reads.")
+            return .off(off + " (switched off during its reads)")
         }
-        // Fresh read, decided and written in one segment.
-        guard !isFlushedForTermination, !Task.isCancelled else { return .init("held", "Reach stopped during its reads.") }
-        timing = try await reachTiming(at: now(), withClaude: true)
+        guard !isFlushedForTermination, !Task.isCancelled else { return .init("stopped", "Reach stopped during its reads.") }
+        timing = try await reachTiming(at: now())
         guard let fresh = ReachLedger.read(dataRoot) else { return .init("unavailable", "The fresh Reach ledger could not be read.") }
         ledger = fresh
         guard let pick = candidates.first(where: {
             Reach.decide($0, timing: timing, ledger: ledger, rejectedSources: rejected) == .offer
-        }) else { return .init("held", "No candidate passed the fresh Reach policy read.") }
+        }) else { return .init("nothing", "No candidate passed the fresh Reach policy read.") }
         let offer = ReachLedger.Offer(
             id: "reach:" + UUID().uuidString.lowercased(), subject: pick.subject, kind: pick.kind.name,
             source: pick.source, why: pick.why, offeredAt: instant, outcome: "offered", at: pick.at)
         ledger.offers.append(offer)
         guard ledger.write(dataRoot) else { return .init("failed", "The Reach offer was not saved.") }
-        // Keyed "reach": a newer offer would replace a pending one.
+        // A stable reach key lets a newer offer replace a pending one.
         let kept = ResidentWake.shared.request(dataRoot: dataRoot, reason: "something worth sharing", items: [.init(
             id: offer.id, line: Reach.wakeLine(pick, person: person),
             key: "reach", thread: "reach", at: instant)])
@@ -186,14 +163,13 @@ extension NativeCognitionRuntime {
         ])
     }
 
-    /// Reconcile uncertain offers without another attempt to speak.
+    /// Reconcile uncertain offers without attempting speech again.
     private func reconcileReachDeliveries() async {
         guard let snapshot = ReachLedger.read(dataRoot) else { return }
         for offer in snapshot.offers where offer.outcome == "sending" {
             guard let session = offer.session else { continue }
             do {
-                // Positive evidence is safe even while a delivery is in flight.
-                // Absence here cannot prove it will not append after this read.
+                // Positive append evidence may settle an in-flight delivery; absence cannot prove a later append will not land.
                 guard try await SwiftNativeChatOrchestrationClient.proactiveSpeechCommitted(
                     dataRoot: dataRoot, caller: .reachOut, idempotencyScope: offer.id, sessionId: session),
                       var fresh = ReachLedger.read(dataRoot),
@@ -206,8 +182,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Each settled answer lands once in its care. A failed care save is
-    /// retried from the offer's source identity, without another movement.
+    /// Retry failed care saves by source identity so a settled answer moves its care only once.
     private func landReachAnswers(_ ledger: ReachLedger) async {
         let person: String
         do { person = try Self.resolvedPerson(dataRoot: dataRoot) }
@@ -229,7 +204,7 @@ extension NativeCognitionRuntime {
                           offer.id, String(describing: error))
             }
         }
-        // One segment: these rows only, on a fresh read.
+        // Patch only these rows against a fresh read in one segment.
         guard !landed.isEmpty, var fresh = ReachLedger.read(dataRoot) else { return }
         for index in fresh.offers.indices where landed.contains(fresh.offers[index].id) {
             fresh.offers[index].landed = true
@@ -241,8 +216,7 @@ extension NativeCognitionRuntime {
         let quiet: TurnQuietHoursWindow?
         do { quiet = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot) }
         catch {
-            // No quiet-hour deadline is known. Its owner records repair owed;
-            // preference/clock invalidation will project the repaired window.
+            // Unknown quiet-hour boundaries remain repair owed; preference invalidation projects the repaired window.
             sourceWakes.reachNextAt = nil
             return
         }
@@ -263,31 +237,31 @@ extension NativeCognitionRuntime {
                 [$0.addingTimeInterval(Reach.minimumSpacing), Self.afterInclusiveBoundary($0.addingTimeInterval(Reach.answerWindow))]
             } ?? [])
         }
-        let pending = ledger.offers.contains { $0.outcome == "offered" || ($0.outcome == "sent" && $0.sentAt.map { $0.addingTimeInterval(Reach.answerWindow) >= at } == true) }
+        let pending = ledger.offers.contains {
+            $0.outcome == "offered"
+                || ($0.outcome == "sent" && $0.sentAt.map { $0.addingTimeInterval(Reach.answerWindow) >= at } == true)
+        }
         let current = relevant.contains { $0.at <= at } || plans.contains { $0 <= at }
         if pending || current {
             if let last = timing.lastUserTurn { boundaries.append(last.addingTimeInterval(Reach.activeWindow)) }
-            if let last = timing.lastClaude { boundaries.append(last.addingTimeInterval(Reach.activeWindow)) }
             if let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: at)) { boundaries.append(nextDay) }
             if let quiet {
                 for hour in [quiet.startHour, quiet.endHour] {
-                    if let next = Calendar.current.nextDate(after: at, matching: DateComponents(hour: hour, minute: 0, second: 0), matchingPolicy: .nextTime) { boundaries.append(next) }
+                    if let next = Calendar.current.nextDate(after: at, matching: DateComponents(hour: hour, minute: 0, second: 0),
+                        matchingPolicy: .nextTime) { boundaries.append(next) }
                 }
             }
         }
-        // A timing gate can defer the candidate read itself. Its eligibility
-        // boundary must survive even when no candidates have been read yet.
+        // Retain timing eligibility boundaries even when a gate defers candidate reads.
         let timingBoundary: Date? = switch Reach.timing(timing, ledger: ledger) {
         case .quietHours:
             quiet?.end(after: at)
         case .userActive:
             timing.lastUserTurn?.addingTimeInterval(Reach.activeWindow)
-        case .withClaude:
-            timing.lastClaude?.addingTimeInterval(Reach.activeWindow)
         case .dailyCap:
             timing.calendar.date(byAdding: .day, value: 1, to: timing.calendar.startOfDay(for: at))
         case .spacing:
-            ledger.offers.filter(\.mayHaveReachedHim).compactMap(\.sentAt).max()?.addingTimeInterval(Reach.minimumSpacing)
+            ledger.offers.filter(\.mayHaveReachedPerson).compactMap(\.sentAt).max()?.addingTimeInterval(Reach.minimumSpacing)
         case .offer, .awaitingUser, .subjectCooldown, .alreadySeen, .rejected, .stale:
             nil
         }
@@ -296,11 +270,9 @@ extension NativeCognitionRuntime {
         sourceWakes.reachNextAt = [sourceBoundary, timingBoundary].compactMap { $0 }.filter { $0 > at }.min()
     }
 
-    /// Her wake answered. A pass, or a gate that no longer holds, sends
-    /// nothing; otherwise her words go to his conversation, then one knock
-    /// (or his Telegram DM, with no knock).
+    /// Recheck gates before speech; deliver to the person's conversation and route only the necessary notification.
     public func deliverReach(
-        reply: String, itemID: String, turnID: String, chat: SwiftNativeChatOrchestrationClient
+        reply: String, itemID: String, turnID: String, chat: SwiftNativeChatOrchestrationClient, turn: Turn
     ) async {
         guard reachEnabled else {
             withdrawReachIfDisabled()
@@ -308,7 +280,7 @@ extension NativeCognitionRuntime {
         }
         let instant = now()
         let timing: Reach.Timing
-        do { timing = try await reachTiming(at: instant, withClaude: true) }
+        do { timing = try await reachTiming(at: instant) }
         catch { _ = Self.bodySourceFailure(error, source: "Reach delivery timing", dataRoot: dataRoot); return }
         let rejected = await substrate.associationSuppressionSnapshot().map(\.source)
         guard reachEnabled else {
@@ -317,10 +289,7 @@ extension NativeCognitionRuntime {
         }
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         let anchor = ConversationAnchor.currentSessionId(dataRoot: dataRoot)
-        // One segment: every gate again on delivery time, then a durable
-        // `sending` row BEFORE anything can reach him. A crash after delivery
-        // leaves that row, which pacing holds back for, so the no-reply gate
-        // can never reopen on a message he may have.
+        // Recheck gates and persist sending in one segment before delivery; an uncertain send must keep no-reply pacing closed.
         guard var ledger = ReachLedger.read(dataRoot) else { return }
         guard let index = ledger.offers.firstIndex(where: { $0.id == itemID && $0.outcome == "offered" }) else { return }
         if Reach.isDecline(text) {
@@ -344,16 +313,16 @@ extension NativeCognitionRuntime {
                 switch try await chat.speakProactively(
                     content: text, caller: .reachOut,
                     idempotencyKey: SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: itemID, content: text),
-                    sessionId: anchor, initiative: .scheduled) {
+                    sessionId: anchor, initiative: .scheduled, turn: turn) {
                 case .posted:
                     outcome = "sent"
-                    // Her words are in his conversation; one phone knock opens it with Reply.
+                    // The notification opens the already-written conversation rather than carrying another copy of the message.
                     if reachEnabled {
                         do {
                             knocked = try await host.deliverShoulderTap(
                                 eventId: itemID, title: PersonaCompiler.agentDisplayName(dataRoot: dataRoot),
                                 body: Reach.knockLine, reason: itemID,
-                                userInfo: ["screen": "chat", "source": "reach_out", "sessionId": anchor], at: instant) != nil
+                                userInfo: ["screen": "chat", "source": "reach_out", "sessionId": anchor], at: instant, turn: turn) != nil
                         } catch {
                             knockFailure = error.localizedDescription
                             await recordKnockFailure(error, eventID: itemID)
@@ -369,12 +338,10 @@ extension NativeCognitionRuntime {
                     outcome = "withheld"
                 }
             } catch is ProactiveSpeechError {
-                // An older claim has no established destination. Neither a
-                // duplicate claim nor its failed reconciliation proves absence.
+                // An older claim without a destination cannot establish non-delivery through duplication or failed reconciliation.
                 nativeLog("reach: claimed delivery still has no established destination")
             } catch {
-                // The append has ended. Only the speech owner's clean scan can
-                // establish non-delivery; an unreadable transcript stays open.
+                // Only the speech owner's clean scan after append termination can establish non-delivery; unreadable evidence stays open.
                 nativeLog("reach: delivery needs reconciliation: %@", error.localizedDescription)
                 do {
                     outcome = try await SwiftNativeChatOrchestrationClient.proactiveSpeechCommitted(
@@ -384,8 +351,7 @@ extension NativeCognitionRuntime {
                     nativeLog("reach: delivery still uncertain: %@", error.localizedDescription)
                 }
             }
-            // One segment again: patch this row only, on a fresh read. An
-            // unreadable ledger leaves the row `sending`: uncertain, not sent.
+            // Patch only this row from a fresh read; an unreadable ledger leaves sending uncertain.
             if let fresh = ReachLedger.read(dataRoot), let row = fresh.offers.firstIndex(where: { $0.id == itemID }) {
                 ledger = fresh
                 if ledger.offers[row].isSent { outcome = "sent" }
@@ -398,7 +364,6 @@ extension NativeCognitionRuntime {
                 offer = ledger.offers[row]
             }
         }
-        // mind.why: why she reached out (or did not), on the turn that wrote it.
         TurnTraceBus.fire(TurnTraceEvent(
             turnId: turnID, kind: "mind.why", sessionId: offer.session ?? ResidentWake.session, surface: "chat",
             payload: .object([
@@ -406,7 +371,7 @@ extension NativeCognitionRuntime {
                 "subject": .string(offer.subject), "kind": .string(offer.kind),
                 "source": .string(offer.source), "why": .string(offer.why),
                 "detail": .string("mind.reject with this subject as source stops it."),
-            ])))
+            ]), turn: turn))
         await substrate.recordReceipt(kind: "reach.\(offer.outcome)", payload: .object([
             "id": .string(offer.id), "subject": .string(offer.subject),
             "knocked": .bool(offer.knocked == true),
@@ -430,16 +395,13 @@ extension NativeCognitionRuntime {
         return name.isEmpty ? "the person" : name
     }
 
-    // MARK: - Candidates (on device, from state she already has)
+    // MARK: - Candidates (on device, from state the agent already has)
 
     func reachCandidates(at instant: Date) async throws -> [ReachCandidate] {
         var out: [ReachCandidate] = []
         let person = try Self.resolvedPerson(dataRoot: dataRoot)
 
-        // Only an open gap reaches out (including at life depth); a root's
-        // charge alone is feeling. The open care pressing hardest, held with
-        // him or hers alone: what she would bring up if they were talking.
-        // It happened when it last moved.
+        // Only an open care gap can supply outreach; a root's charge alone is feeling rather than something to say.
         if let top = await substrate.caresPressing(for: CognitiveCare.ownerKey, at: instant)
             .first(where: { $0.care.open != nil }),
            top.pressure >= CognitiveSubstrate.careReleasePressure,
@@ -451,13 +413,12 @@ extension NativeCognitionRuntime {
                 at: newest.at))
         }
 
-        // A plan of his on the Desk that just came due (parked until a day,
-        // within the last day). Items he asked to be pinged about already are.
+        // Offer only newly due Desk plans without a requested ping, avoiding duplicate reminders.
         do {
             let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
             for item in state.items where item.origin == .owner && item.status != .done && item.status != .canceled
                 && item.notify.level != .direct && item.notify.level != .urgent {
-                // A peer-steered item's words are the peer's: skipped.
+                // Skip peer-steered words because they do not carry the person's authority.
                 guard Reach.deskProvenanceTrusted(item, trusts: { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }),
                       let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
                       let until = DeskSequencing.parseDeferStamp(raw),
@@ -469,21 +430,7 @@ extension NativeCognitionRuntime {
             }
         }
 
-        // Outreach offers only what it read; an unreadable record offers nothing.
-        let news = Self.builderNews(dataRoot: dataRoot, unseenOnly: true)
-        guard news.unreadable.isEmpty else { throw PersistenceCoreError.ioFailure(news.unreadable.joined(separator: "; ")) }
-        let builders = news.builders
-        for builder in builders where PeerTrust.ownerTrusts(builder.lane, dataRoot: dataRoot) {
-            guard let newest = builder.shipped.filter({ $0.1.count >= 6 }).max(by: { $0.0 < $1.0 }) else { continue }
-            out.append(ReachCandidate(
-                kind: .shipped, subject: "ship:\(builder.lane):\(Reach.digest(newest.1))", source: "\(builder.name)'s record of its work",
-                why: try AgentConversationDelivery.door(for: builder.lane, dataRoot: dataRoot)?.liveReader == true
-                    ? "\(builder.name) shipped it during \(person)'s quiet hours, so he likely hasn't seen it; you could make it short and human"
-                    : "\(builder.name) works on its own, so \(person) may not have seen it; you could make it short and human",
-                text: "\(builder.name) shipped \"\(newest.1)\"", at: newest.0))
-        }
-
-        // A dream association, only about him and gentle, marked as a dream.
+        // Keep dream associations gentle, person-related and explicitly labelled as dreams.
         if let diary = try Self.livingDiary(dataRoot: dataRoot, now: instant) {
             let markdown = try String(contentsOf: diary.url, encoding: .utf8)
             for section in DreamClaim.read(in: markdown) {

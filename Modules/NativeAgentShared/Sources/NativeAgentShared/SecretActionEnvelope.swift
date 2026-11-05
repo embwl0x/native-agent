@@ -2,8 +2,7 @@ import CryptoKit
 import Foundation
 // Blueprint: | `SecretActionEnvelope.swift` | `SecretActionEnvelope`: shared seal/open wire contract for authenticated secret actions |
 
-/// Seal before persistence or transport. Only call open after transport and
-/// paired-device signature verification. Never put decrypted fields in receipts.
+/// Seal before persistence or transport. Only call open after transport and paired-device signature verification. Never put decrypted fields in receipts.
 public enum SecretActionEnvelope {
     public static let field = "sealed_payload"
     private static let label = "NativeAgent.iCloud.secret-action.v1"

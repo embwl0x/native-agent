@@ -7,7 +7,7 @@ import PersistenceCore
 import Privacy
 import MacIntegration
 import ToolExecution
-// Blueprint: | `LocalPIMConnectorActions+Calendar.swift` | Calendar CRUD with checked supplied text fields, event notes redacted before preview bounds and exclusive next-day boundaries on LocalPIMStore; the day perception's titles-only projection never reads location, notes or attendees |
+// Blueprint: | `LocalPIMConnectorActions+Calendar.swift` | Calendar CRUD on LocalPIMStore; exclusive day bounds; titles-only perception |
 
 extension LocalPIMConnectorActions {
     struct CalendarListWindow: Equatable, Sendable {
@@ -17,7 +17,7 @@ extension LocalPIMConnectorActions {
         let day: String?
     }
 
-    public static func calendarListUpcoming(input: [String: JSONValue], titlesOnly: Bool = false) async throws -> JSONValue {
+    public static func calendarListUpcoming(input: [String: JSONValue], titlesOnly: Bool = false, handsBack: Bool) async throws -> JSONValue {
         let window = try calendarListWindow(input: input)
         let store = LocalPIMStore()
         let granted = try await store.requestCalendarAccess(.read)
@@ -26,7 +26,7 @@ extension LocalPIMConnectorActions {
             return permissionEnvelope(
                 actionId: "mac.calendar_list_upcoming",
                 source: "calendar",
-                status: calendarAuthorizationState()
+                status: calendarAuthorizationState(), handsBack: handsBack
             )
         }
 
@@ -51,7 +51,7 @@ extension LocalPIMConnectorActions {
             "count": .int(Int64(events.count)),
             "events": .array(Array(events)),
         ]
-        // One window, said once: a day or range names itself; hours only when hours were the ask.
+        // Use hours only for an hours query; day/range headings already identify the window.
         if let day = window.day {
             payload["day"] = .string(day)
         } else {
@@ -77,7 +77,8 @@ extension LocalPIMConnectorActions {
                 let needle = name.lowercased()
                 return { $0.lowercased().contains(needle) }
             }
-            let rows = LocalPIMStore.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ -> [JSONValue] in
+            let rows = LocalPIMStore.withEvents(
+                start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ -> [JSONValue] in
                 return events
                     .filter { query.isEmpty || ($0.title ?? "").localizedCaseInsensitiveContains(query)
                         || (!titlesOnly && ($0.notes ?? "").localizedCaseInsensitiveContains(query)) }
@@ -92,10 +93,10 @@ extension LocalPIMConnectorActions {
         } onCancel: { read.cancel() }
     }
 
-    public static func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func calendarCalendars(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let store = LocalPIMStore()
         guard try await store.requestCalendarAccess(.read) else {
-            return permissionEnvelope(actionId: "mac.calendar_calendars", source: "calendar", status: calendarAuthorizationState())
+            return permissionEnvelope(actionId: "mac.calendar_calendars", source: "calendar", status: calendarAuthorizationState(), handsBack: handsBack)
         }
         return .object(["status": .string("completed"), "calendars": .array(store.calendars(for: .event).map {
             .object(["calendarId": .string($0.calendarIdentifier), "title": .string($0.title),
@@ -103,8 +104,7 @@ extension LocalPIMConnectorActions {
         })])
     }
 
-    public static func calendarFreeBusy(input: [String: JSONValue]) async throws -> JSONValue {
-        // calendar_ids omitted means every calendar on this Mac.
+    public static func calendarFreeBusy(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let values: [JSONValue]
         switch input["calendar_ids"] {
         case nil, .null?: values = []
@@ -114,11 +114,13 @@ extension LocalPIMConnectorActions {
         guard values.count <= 50, values.allSatisfy({ $0.scalarText?.isEmpty == false }),
               let start = parseInputDate(input["start"]), let end = parseInputDate(input["end"]),
               end > start, end.timeIntervalSince(start) <= 31 * 86_400 else {
-            return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("Provide a valid start/end window of at most 31 days, and optionally up to 50 exact calendar_ids (omit for all calendars).")])
+            return .object(["status": .string(
+                "failed"), "effects": .string("none"), "reason": .string(
+                "Provide a valid start/end window of at most 31 days, and optionally up to 50 exact calendar_ids (omit for all calendars).")])
         }
         let store = LocalPIMStore()
         guard try await store.requestCalendarAccess(.read) else {
-            return permissionEnvelope(actionId: "mac.calendar_free_busy", source: "calendar", status: calendarAuthorizationState())
+            return permissionEnvelope(actionId: "mac.calendar_free_busy", source: "calendar", status: calendarAuthorizationState(), handsBack: handsBack)
         }
         try Task.checkCancellation()
         let calendars = store.calendars(for: .event)
@@ -127,12 +129,16 @@ extension LocalPIMConnectorActions {
         let calendarIDs = values.isEmpty ? calendars.map(\.calendarIdentifier) : values.compactMap { $0.scalarText }.filter { seen.insert($0).inserted }
         let unknown = calendarIDs.filter { titles[$0] == nil }
         guard unknown.isEmpty else {
-            return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("Unknown calendar_id: \(unknown.joined(separator: ", ")). Omit calendar_ids to check every calendar.")])
+            return .object(["status": .string(
+                "failed"), "effects": .string("none"), "reason": .string(
+                "Unknown calendar_id: \(unknown.joined(separator: ", ")). Omit calendar_ids to check every calendar.")])
         }
         let read = Task.detached(priority: .userInitiated) { () throws -> [JSONValue] in
             try Task.checkCancellation()
-            return LocalPIMStore.withEvents(start: start, end: end, calendarIDs: calendarIDs, calendarMatches: nil) { events, observedCalendarIDs -> [JSONValue] in
-                let byCalendar = Dictionary(grouping: events.filter { $0.status != .canceled && $0.availability != .free }, by: { $0.calendar.calendarIdentifier })
+            return LocalPIMStore.withEvents(
+                start: start, end: end, calendarIDs: calendarIDs, calendarMatches: nil) { events, observedCalendarIDs -> [JSONValue] in
+                let byCalendar = Dictionary(
+                    grouping: events.filter { $0.status != .canceled && $0.availability != .free }, by: { $0.calendar.calendarIdentifier })
                 return calendarIDs.map { calendarID -> JSONValue in
                     let intervals = byCalendar[calendarID] ?? []
                     let unknown = !observedCalendarIDs.contains(calendarID)
@@ -150,17 +156,19 @@ extension LocalPIMConnectorActions {
         let rows = try await withTaskCancellationHandler {
             try await settle { await read.result }.get()
         } onCancel: { read.cancel() }
-        return .object(["status": .string("completed"), "scope": .string("local_events"), "start": .string(iso(start)), "end": .string(iso(end)), "timeZone": .string(TimeZone.current.identifier), "calendars": .array(rows)])
+        return .object(["status": .string(
+            "completed"), "scope": .string("local_events"), "start": .string(iso(start)), "end": .string(iso(end)), "timeZone": .string(TimeZone.current
+            .identifier), "calendars": .array(rows)])
     }
 
-    public static func calendarCreateEvent(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func calendarCreateEvent(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let store = LocalPIMStore()
         let granted = try await store.requestCalendarAccess(.write)
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.calendar_create_event",
                 source: "calendar",
-                status: calendarAuthorizationState(), mode: .write
+                status: calendarAuthorizationState(), mode: .write, handsBack: handsBack
             )
         }
 
@@ -213,12 +221,14 @@ extension LocalPIMConnectorActions {
             let calendars = isWriteOnly ? store.defaultCalendarForNewEvents.map { [$0] } ?? [] : store.calendars(for: .event)
             guard let matched = calendars.first(where: { $0.calendarIdentifier == calendarID }),
                   calendarName == nil || matched.title.caseInsensitiveCompare(calendarName!) == .orderedSame else {
-                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("calendar_id is unavailable or does not match calendar_name.")])
+                return .object(["status": .string(
+                    "failed"), "effects": .string("none"), "reason": .string("calendar_id is unavailable or does not match calendar_name.")])
             }
             pickedCalendar = matched
         } else if isWriteOnly {
             guard input["calendar_id"] == nil || input["calendar_id"] == .null else {
-                return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("calendar_id is unavailable or does not match calendar_name.")])
+                return .object(["status": .string(
+                    "failed"), "effects": .string("none"), "reason": .string("calendar_id is unavailable or does not match calendar_name.")])
             }
             if let calendarName, !calendarName.isEmpty {
                 return .object([
@@ -306,7 +316,7 @@ extension LocalPIMConnectorActions {
         var fields: [String] = []
     }
 
-    /// Resolve list-result and caller spellings once, for both pure parsing and execution.
+    /// Share argument normalization between pure parsing and execution.
     private static func calendarEventID(input: [String: JSONValue]) -> String? {
         for key in ["id", "event_id", "eventId"] {
             if let id = input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
@@ -367,8 +377,8 @@ extension LocalPIMConnectorActions {
         return arguments
     }
 
-    /// Modify only explicitly supplied fields on the exact event. Calendar membership is preserved; notes/location may be empty to clear them.
-    public static func calendarModifyEvent(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Preserve event membership and absent fields; explicit empty notes/location clears them.
+    public static func calendarModifyEvent(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let arguments: CalendarModifyArguments
         do { arguments = try calendarModifyArguments(input: input) }
         catch { return error.result }
@@ -379,7 +389,7 @@ extension LocalPIMConnectorActions {
             return permissionEnvelope(
                 actionId: "mac.calendar_modify_event",
                 source: "calendar",
-                status: calendarAuthorizationState()
+                status: calendarAuthorizationState(), handsBack: handsBack
             )
         }
 
@@ -422,7 +432,7 @@ extension LocalPIMConnectorActions {
         ])
     }
 
-    /// Preconditions deliberately precede permission prompting and mutation.
+    /// Reject invalid preconditions before prompting for access or mutating.
     static func calendarDeleteExpectation(input: [String: JSONValue]) throws(CalendarArgumentError) -> (id: String, title: String, start: Date) {
         guard let id = calendarEventID(input: input), let title = input["expected_title"]?.scalarText,
               let start = parseInputDate(input["expected_start"]) else {
@@ -437,7 +447,7 @@ extension LocalPIMConnectorActions {
         return (title ?? "") == expectedTitle && abs(start.timeIntervalSince(expectedStart)) < 1
     }
 
-    public static func calendarDeleteEvent(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func calendarDeleteEvent(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let actionId = "mac.calendar_delete_event"
         // Refusals before `remove` changed nothing; a failed remove reports itself.
         func failed(_ reason: String, effects: String = "none") -> JSONValue {
@@ -448,7 +458,7 @@ extension LocalPIMConnectorActions {
         catch { return error.result }
         let store = LocalPIMStore()
         guard try await store.requestCalendarAccess(.read) else {
-            return permissionEnvelope(actionId: actionId, source: "calendar", status: calendarAuthorizationState())
+            return permissionEnvelope(actionId: actionId, source: "calendar", status: calendarAuthorizationState(), handsBack: handsBack)
         }
         guard let event = store.event(withIdentifier: expected.id) else {
             return failed("event_not_found")
@@ -498,7 +508,6 @@ extension LocalPIMConnectorActions {
             return .object(row)
         }
         var obj: [String: JSONValue] = [
-            // Event identifiers let callers modify listed events.
             "id": .string(event.eventIdentifier ?? ""),
             "title": .string(NativeAppSecretRedactor.redactText(event.title ?? "(Untitled event)")),
             "calendar": .string(event.calendar.title),
@@ -524,13 +533,11 @@ extension LocalPIMConnectorActions {
         calendar: Calendar = .current
     ) throws -> CalendarListWindow {
         var input = input
-        // days:N spans the next N days; day names one calendar day.
         if input["range"] == nil, let days = input["days"]?.scalarText.flatMap({ Int($0) }), (1...30).contains(days) {
             input["range"] = .string("next \(days) days")
         }
         if let range = input["range"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             .replacingOccurrences(of: "_", with: " "), !range.isEmpty {
-            // Next week spans its calendar week.
             if range == "next week", let thisWeek = calendar.dateInterval(of: .weekOfYear, for: now),
                let next = calendar.dateInterval(of: .weekOfYear, for: thisWeek.end) {
                 return CalendarListWindow(start: next.start, end: next.end,

@@ -6,7 +6,7 @@ import AppKit
 #if canImport(CoreGraphics) && os(macOS)
 import CoreGraphics
 #endif
-// Blueprint: | `MacAttentionEvents.swift` | Passive attention activity and observation sources; AppKit monitors share person-input provenance and person-only-window exclusions, retain scene-change events and reduce keyboard events to pulses; pointer coalescing never delays synchronous takeover |
+// Blueprint: | `MacAttentionEvents.swift` | Passive input/scene events retain provenance; coalescing never delays synchronous takeover |
 
 public enum MacAttentionActivityKind: String, Sendable, Equatable, CaseIterable {
     case pointerMoved = "pointer_moved"
@@ -17,9 +17,8 @@ public enum MacAttentionActivityKind: String, Sendable, Equatable, CaseIterable 
     case keyboardActivity = "keyboard_activity"
     case appChanged = "app_changed"
 
-    /// App activation is useful scene-change evidence, but it can be caused by
-    /// NativeAgent's own click. Physical input is the only signal that invokes
-    /// the immediate human-takeover rule.
+    /// App activation is useful scene-change evidence, but it can be caused by NativeAgent's own click. Physical input is the only signal that invokes the
+    /// immediate human-takeover rule.
     var isPhysicalUserInput: Bool { self != .appChanged }
 }
 
@@ -42,8 +41,7 @@ public struct MacAttentionActivity: Sendable, Equatable {
     }
 }
 
-/// Passive event source; never suppresses, edits or records key contents.
-/// AppKit monitors and app-activation notifications supply system events.
+/// Passive event source; never suppresses, edits or records key contents. AppKit monitors and app-activation notifications supply system events.
 public protocol MacAttentionEventSource: Sendable {
     var isAvailable: Bool { get }
     func start(
@@ -118,10 +116,8 @@ final class MacAttentionEventCoalescer: @unchecked Sendable {
     }
 }
 
-/// Event-driven production observer. Driver ownership outlives a bounded
-/// view session; there is no timer, frame loop, or ambient
-/// persistence. Keyboard events are reduced to an activity pulse before they
-/// cross this seam — keycode, modifiers, and text are never retained.
+/// Event-driven production observer. Driver ownership outlives a bounded view session; there is no timer, frame loop, or ambient persistence. Keyboard events
+/// are reduced to an activity pulse before they cross this seam — keycode, modifiers, and text are never retained.
 public struct SystemMacAttentionEventSource: MacAttentionEventSource {
     public init() {}
     public var isAvailable: Bool { true }
@@ -139,8 +135,7 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
 
             func activity(from event: NSEvent) -> MacAttentionActivity? {
                 guard let input = event.cgEvent, MacPersonInput.isPerson(input) else { return nil }
-                // While the person's own chat is up, only Stop hands back
-                // control; otherwise physical input revokes it immediately.
+                // While the person's own chat is up, only Stop hands back control; otherwise physical input revokes it immediately.
                 if PersonOnlyWindows.isShowing {
                     PersonOnlyWindows.notePersonInput()
                     return nil

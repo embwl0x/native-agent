@@ -39,7 +39,7 @@ import Speech
 import AVFoundation
 import AppKit
 import CoreGraphics
-// Blueprint: | `MacChatTurnTranscriptProofReader.swift` | Bounded, symlink-refusing transcript proof with exact outcome correlation; terminal proof/error vocabulary and `MacChatTurnLifecycleRestartRepair` |
+// Blueprint: | `MacChatTurnTranscriptProofReader.swift` | `MacChatTurnLifecycleRestartRepair`; Bounded exact terminal proof |
 
 public enum MacChatTurnTranscriptTerminalProof: Sendable, Equatable {
     case completed
@@ -69,9 +69,14 @@ public actor MacChatTurnTranscriptProofReader {
         for identity: MacChatTurnIdentity
     ) async throws -> MacChatTurnTranscriptTerminalProof {
         let path = try Self.path(for: identity, dataRoot: dataRoot)
-        return try await SwiftNativePersistenceCore.withFileLock(path) {
+        let proof = try await SwiftNativePersistenceCore.withFileLock(path) {
             try Self.readLocked(path: path, identity: identity)
         }
+        guard proof == .absent else { return proof }
+        guard let heard = try await ExperienceStore.at(dataRoot).experience(identity.turnId),
+              let run = heard.evidence.first(where: { $0.source == "run" }) else { return .absent }
+        return try SwiftNativeChatOrchestrationClient.silentTurn(dataRoot: dataRoot, sessionId: identity.sessionId,
+            runId: run.id, turnId: identity.turnId) == nil ? .absent : .completed
     }
 
     private nonisolated static func path(for identity: MacChatTurnIdentity, dataRoot: URL) throws -> URL {
@@ -173,7 +178,7 @@ public actor MacChatTurnTranscriptProofReader {
                   receipt.turnID == identity.turnId,
                   receipt.messageID == rowMessageId,
                   receipt.sessionID == identity.sessionId,
-                  receipt.surface == rowSource else {
+                  receipt.surface == ChatThreadKind.surface(transcriptSource: rowSource) else {
                 throw MacChatTurnTranscriptProofReaderError.invalidEvidence
             }
             let partial = try strictBoolean(metadata["partial"])

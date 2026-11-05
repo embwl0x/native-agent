@@ -5,15 +5,13 @@ import PersistenceCore
 import ProviderRouting
 import Transcripts
 import TurnTrace
-// Blueprint: | `SessionContextMeasurement.swift` | One actual-request-builder sizing owner for foreground compaction and aging, with matching provider-observed input usage exposed separately for presentation; absent/model-switched receipts leave observed usage unavailable; sizing estimates stay explicitly labelled; damaged evidence throws |
+import ChatTurnContracts
+// Blueprint: | `SessionContextMeasurement.swift` | SessionContextMeasurement owner. |
 
-/// The real request builder supplies the numerator. Only the same provider
-/// request's characters/input tokens calibrate its token estimate. The selected
-/// adapter supplies the output allowance for both thresholds and final admission.
+/// Calibrate only from the same provider request's measured input; the selected adapter owns output allowance and admission.
 public struct SessionContextMeasurement: Sendable {
 
     public let tokens: Int
-    /// The matching provider's recorded input usage, never a rebuilt estimate.
     public let observedInputTokens: Int?
     public let outputTokens: Int
     public let requestCharacters: Int
@@ -26,49 +24,69 @@ public struct SessionContextMeasurement: Sendable {
     public var hasReceipt: Bool { source != "rendered_history_estimate" }
     let rowCharacters: [String: Int]
 
-    /// Ask the admitted request owner, including its instance overrides and
-    /// remaining turn budget. Unbound readouts use the same resident assembly.
-    static func outputAllowance(model: String, providerID: String?, dataRoot: URL) async throws -> Int {
+    /// Ask the admitted request owner for overrides and remaining budget; unbound readouts use the same resident assembly.
+    static func outputAllowance(model: String, providerID: String?, dataRoot: URL, call: LLMCall) async throws -> Int {
         guard let providerID, !providerID.isEmpty else {
             throw ProviderRoutingError.configurationFailed("The request's provider is unavailable; its output allowance cannot be measured.")
         }
-        let client = LLMCallContext.client ?? makeResidentProviderLLMClient(dataRoot: dataRoot)
-        return try await LLMCallContext.$admittedModel.withValue(model) {
-            try await LLMCallContext.$providerId.withValue(providerID) {
-                let output = try await client.requestOutputTokens(model: model, surface: LLMCallContext.surface ?? "chat")
-                guard output >= 0 else {
-                    throw ProviderRoutingError.configurationFailed("The request adapter reported an invalid output allowance.")
-                }
-                return output
+        // Readouts outside a turn have their own sizing act; a live request keeps its budget and client.
+        let client: any LLMClient
+        if let turn = call.turn {
+            guard let admitted = turn.client else {
+                throw ProviderRoutingError.configurationFailed("The turn's admitted model client is unavailable; its output allowance cannot be measured.")
             }
+            client = admitted
+        } else {
+            client = makeResidentProviderLLMClient(dataRoot: dataRoot)
         }
+        var sizingTurn = call.turn ?? Turn().with(\.envelope, TurnEnvelope.native("context_measurement", surface: call.surface))
+        sizingTurn.admission = ModelAdmission(provider: providerID, model: model,
+            reasoningEffort: call.admission?.reasoningEffort, serviceTier: call.admission?.serviceTier)
+        var sizingCall = call
+        sizingCall.turn = sizingTurn
+        let output = try await client.requestOutputTokens(model: model, call: sizingCall)
+        guard output >= 0 else {
+            throw ProviderRoutingError.configurationFailed("The request adapter reported an invalid output allowance.")
+        }
+        return output
     }
 
-    /// Last admission check on the exact request after folding and any late
-    /// additions. Uses the same receipt calibration as the ring and selector.
-    /// A request that still exceeds its detected room is refused, never cut.
+    public static func measure(_ request: SessionContextRequest, sessionId: String,
+                               model: String, providerID: String?, dataRoot: URL,
+                               windowTokens: Int, call: LLMCall) async throws -> Self {
+        try await read(rows: [], sessionId: sessionId, model: model, providerID: providerID,
+            dataRoot: dataRoot, windowTokens: windowTokens, call: call, requestBuilder: { _, _, _ in request })
+    }
+
+    /// Check the exact request after tail selection and late additions.
     public static func requireFits(_ request: SessionContextRequest, sessionId: String,
                                    model: String, providerID: String?, dataRoot: URL,
-                                   windowTokens: Int?) async throws {
+                                   windowTokens: Int?, call: LLMCall) async throws {
         guard let windowTokens, windowTokens > 0 else {
-            throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable. Refresh its catalog in Providers before sending this request.")
+            throw ProviderRoutingError.configurationFailed(
+                "The selected model's context window is unavailable. Refresh its catalog in Providers before sending this request.")
         }
         let measurement = try await read(rows: [], sessionId: sessionId, model: model,
-            providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens,
+            providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, call: call,
             requestBuilder: { _, _, _ in request })
         let (total, overflow) = measurement.tokens.addingReportingOverflow(measurement.outputTokens)
         let fits = !overflow && total <= windowTokens
         TurnTraceBus.fireFromContext(kind: "context.request.fit", sessionId: sessionId,
-            surface: LLMCallContext.surface, payload: .object([
+            surface: call.surface, payload: .object([
                 "status": .string(fits ? "ready" : "refused"),
                 "inputTokens": .int(Int64(measurement.tokens)),
                 "outputTokens": .int(Int64(measurement.outputTokens)),
                 "windowTokens": .int(Int64(windowTokens)),
                 "requestCharacters": .int(Int64(request.characters)),
                 "source": .string(measurement.source)
-            ]))
+            ]), turn: call.turn)
         guard fits else {
-            throw ToolFailureError("The built request still exceeds the selected model's context window after fitting (\(measurement.tokens) measured input + \(measurement.outputTokens) output allowance; \(windowTokens) available). This request was not sent; replay was not truncated. Reduce the current input or repair the blocked recollection before continuing.",
+            throw ToolFailureError(
+                """
+                    The built request still exceeds the selected model's context window after fitting (\(measurement.tokens) measured input + \
+                    \(measurement.outputTokens) output allowance; \(windowTokens) available). This request was not sent; replay was not truncated. Reduce the \
+                    current input or inspect its retained tool results before continuing.
+                    """,
                 effects: .none, owner: "chat/messages/\(sessionId).jsonl", code: "context_window_exceeded", status: .refused, recovery: .repair)
         }
     }
@@ -84,11 +102,11 @@ public struct SessionContextMeasurement: Sendable {
     }
 
     public static func read(sessionId: String, model: String, providerID: String?,
-                            dataRoot: URL, windowTokens: Int,
+                            dataRoot: URL, windowTokens: Int, call: LLMCall,
                             requestBuilder: SessionContextRequest.Builder? = nil) async throws -> Self {
         let rows = try await readRows(sessionId: sessionId, dataRoot: dataRoot)
         return try await read(rows: rows, sessionId: sessionId, model: model,
-                              providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, requestBuilder: requestBuilder)
+                              providerID: providerID, dataRoot: dataRoot, windowTokens: windowTokens, call: call, requestBuilder: requestBuilder)
     }
 
     static func readRows(sessionId: String, dataRoot: URL) async throws -> [JSONValue] {
@@ -101,7 +119,7 @@ public struct SessionContextMeasurement: Sendable {
     }
 
     static func read(rows: [JSONValue], sessionId: String, model: String, providerID: String?,
-                     dataRoot: URL, windowTokens: Int,
+                     dataRoot: URL, windowTokens: Int, call: LLMCall,
                      requestBuilder: SessionContextRequest.Builder? = nil) async throws -> Self {
         let path = dataRoot.appendingPathComponent("chat/session_state/\(sessionId)/provider_usage.json")
         let receipt: Receipt?
@@ -111,13 +129,13 @@ public struct SessionContextMeasurement: Sendable {
         if let receipt {
             guard receipt.lastRequestInputTokens >= 0,
                   receipt.requestCharacters.map({ $0 >= 0 }) != false else {
-                throw ProviderRoutingError.configurationFailed("The provider usage receipt at \(path.path) has invalid counts. Repair it before measuring context.")
+                throw ProviderRoutingError.configurationFailed(
+                    "The provider usage receipt at \(path.path) has invalid counts. Repair it before measuring context.")
             }
         }
         let ratio: Double
         let calibrated: Bool
-        // Calibration sizes a built request. Without a live builder or saved
-        // plan, rendered history uses its own explicitly estimated ratio.
+        // Without a live builder or saved plan, rendered history uses an explicitly estimated ratio rather than request calibration.
         if matching, let receipt, requestBuilder != nil || receipt.requestPlan != nil,
            receipt.lastRequestInputTokens > 0,
            let characters = receipt.requestCharacters, characters > 0 {
@@ -131,6 +149,7 @@ public struct SessionContextMeasurement: Sendable {
         let historyCharacters: Int
         let rowCharacters: [String: Int]
         let source: String
+        let output = try await outputAllowance(model: model, providerID: providerID, dataRoot: dataRoot, call: call)
         if let requestBuilder {
             let request = try await requestBuilder(rows, windowTokens, matching ? receipt?.requestPlan : nil)
             characters = request.characters
@@ -142,13 +161,14 @@ public struct SessionContextMeasurement: Sendable {
             guard plan.model.caseInsensitiveCompare(model) == .orderedSame, plan.provider == providerID else {
                 throw ProviderRoutingError.configurationFailed("The provider receipt and its request builder disagree on the selected route.")
             }
-            let request = try await plan.build(rows, sessionId: sessionId, dataRoot: dataRoot, windowTokens: windowTokens)
+            let request = try plan.build(rows, sessionId: sessionId, dataRoot: dataRoot,
+                windowTokens: windowTokens, outputTokens: output, charactersPerToken: ratio)
             characters = request.characters
             historyCharacters = request.historyCharacters
             rowCharacters = request.rowCharacters
             source = "provider_calibrated_request"
         } else {
-            let history = try rendered(rows, windowTokens: windowTokens)
+            let history = try rendered(rows, windowTokens: windowTokens, outputTokens: output)
             characters = history.characters
             historyCharacters = history.characters
             rowCharacters = history.rows
@@ -159,7 +179,6 @@ public struct SessionContextMeasurement: Sendable {
               let tokens = Int(exactly: value.rounded(.up)), tokens >= 0 else {
             throw ProviderRoutingError.configurationFailed("The built request size is not representable; repair its context measurement.")
         }
-        let output = try await outputAllowance(model: model, providerID: providerID, dataRoot: dataRoot)
         return Self(tokens: tokens, observedInputTokens: matching ? receipt?.lastRequestInputTokens : nil,
             outputTokens: output, requestCharacters: characters, renderedCharacters: historyCharacters, messageCount: rows.count,
             charactersPerToken: ratio, source: source,
@@ -168,7 +187,7 @@ public struct SessionContextMeasurement: Sendable {
             rowCharacters: rowCharacters)
     }
 
-    private static func rendered(_ rows: [JSONValue], windowTokens: Int) throws -> (characters: Int, rows: [String: Int]) {
+    private static func rendered(_ rows: [JSONValue], windowTokens: Int, outputTokens: Int) throws -> (characters: Int, rows: [String: Int]) {
         let latestUser = rows.lastIndex { $0.objectValue?["role"] == .string("user") }
         var unbounded = Set<String>()
         let renderables = try rows.enumerated().compactMap { index, row -> SessionHistoryPromptRenderer.Renderable? in
@@ -181,8 +200,7 @@ public struct SessionContextMeasurement: Sendable {
             let createdAt = try JSONRow(row).string("createdAt")
             let message = ChatMessage(role: role, content: content, timestamp: createdAt, extras: row)
             guard var rendered = SessionHistoryPromptRenderer.renderable(message) else { return nil }
-            // A new user's words are the current request, not a capped prior
-            // user row. Once sent, SentTurnContext owns their exact replay.
+            // Current user words are not capped prior history; SentTurnContext owns exact replay after sending.
             if role == "user", rendered.sentContext == nil,
                index == latestUser {
                 unbounded.insert(rendered.historyIdentity)
@@ -191,13 +209,18 @@ public struct SessionContextMeasurement: Sendable {
             return rendered
         }
         guard let admission = try SessionHistoryMessages.admission(renderables: renderables, historyLimit: 1,
-            windowTokens: windowTokens, unboundedUserIdentities: unbounded) else { return (0, [:]) }
-        let projected = SessionHistoryMessages.project(admission)
-        var byID: [String: Int] = [:]
-        for (row, body) in admission.renderables where projected.historyIdentities.contains(row.historyIdentity) {
-            byID[row.historyIdentity] = body.count + (row.sentContext?.block.count ?? 0)
+            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens), unboundedUserIdentities: unbounded) else { return (0, [:]) }
+        var projected = SessionHistoryMessages.project(admission)
+        let inputBudget = Double(max(0, windowTokens - outputTokens)) * ContextBudgetPolicy.transcriptCharactersPerToken
+        if Double(projected.characters) > inputBudget {
+            let tail = SessionHistoryTail(admission, rowCharacters: projected.rowCharacters)
+            let halfBudget = SessionHistoryTail.halfBudgetCharacters(windowTokens: windowTokens, outputTokens: outputTokens)
+            for checkpoint in tail.checkpoints(halfBudgetCharacters: halfBudget) {
+                projected = tail.project(after: checkpoint)
+                if Double(projected.characters) <= inputBudget { break }
+            }
         }
-        return (projected.characters, byID)
+        return (projected.characters, projected.rowCharacters)
     }
 
     func characters(in rows: [JSONValue]) -> Int {

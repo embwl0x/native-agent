@@ -1,18 +1,16 @@
 import Foundation
+import DeviceSync
+import Experiences
 import Synchronization
 import UserNotifications
 import NativeAgentCore
 import PersistenceCore
-import NotificationInbox
-import DeviceSync
 import NativeAgentShared
-// Blueprint: | `AttentionRouter+MacNotifications.swift` | Native banner claim and OS acknowledgement share the delivery ledger; retained operations outlive a five-second response deadline and settle once; shutdown closes admission without joining callbacks |
+// Blueprint: | `AttentionRouter+MacNotifications.swift` | Mac banners: UI-physics posts, and the Mac door's post whose OS callback settles its delivery |
 
-/// The identity a banner carries and what a click on it does. A click OPENS
-/// the item — it never approves, runs, or closes anything.
+/// Banner clicks only open the item; they never approve, run or close it.
 public enum NativeAgentNotificationRoute {
     public static let pageKey = "pageRoute"
-    /// userInfo key: the Desk handle a reminder is about.
     public static let deskHandleKey = "deskHandle"
 
     public static func deskHandle(in userInfo: [AnyHashable: Any]) -> String? {
@@ -46,7 +44,8 @@ extension NativeAgentNotifications {
                 alertSetting: string(settings.alertSetting),
                 soundSetting: string(settings.soundSetting),
                 badgeSetting: string(settings.badgeSetting),
-                error: authError ?? "NativeAgent does not have permission to show notifications. Open System Settings > Notifications > NativeAgent to allow them."
+                error: authError
+                    ?? "NativeAgent does not have permission to show notifications. Open System Settings > Notifications > NativeAgent to allow them."
             )
         }
 
@@ -94,151 +93,131 @@ extension NativeAgentNotifications {
 }
 
 public enum NativeAgentNotifications {
-    private static let delivery = Mutex<(stopped: Bool, posts: [UUID: Task<Void, Never>])>((false, [:]))
+    private static let soundEvidence = "macos/notification_sound"
+    private static let delivery = Mutex<(stopped: Bool, posts: [UUID: Task<Void, Never>], watch: Task<Void, Never>?)>((false, [:], nil))
 
-    /// Already accepted banners finish and retire at the OS callback, including
-    /// errors. Close admission immediately; never join the OS during shutdown.
+    /// The engine's one delivery watch lives until producer shutdown; OS posts keep their independent settlement.
+    public static func keepDeliveryWatch(_ task: Task<Void, Never>) {
+        delivery.withLock { state in
+            guard !state.stopped, state.watch == nil else { task.cancel(); return }
+            state.watch = task
+        }
+    }
+
+    /// Close admission without joining OS callbacks during shutdown; accepted banners settle at their callback.
     public static func shutdown() {
-        delivery.withLock { $0.stopped = true }
+        delivery.withLock { state in
+            state.stopped = true
+            state.watch?.cancel()
+            state.watch = nil
+        }
     }
 
-    /// Tool-authored messages can be answered. Bind the route at posting time,
-    /// never to whichever conversation happens to be visible when Reply lands.
-    /// Messages outside a turn own a new, retained notification conversation.
-    public static func postMessage(title: String, body: String, soundName: String? = nil) async -> NativeAgentNotificationPostResult {
-        return await postAndReport(
-            title: title, body: body,
-            userInfo: NativeAgentNotificationActions.messageRoute,
-            soundName: soundName
-        )
+    /// Bind reply routing when posting so a later visible conversation cannot receive another turn's answer.
+    public static func postMessage(title: String, body: String, soundName: String? = nil, router: AttentionRouter,
+                                   turn: Turn?, deadline: ContinuousClock.Instant?) async -> NativeAgentNotificationPostResult {
+        let id = "mac_notify:" + UUID().uuidString.lowercased()
+        guard !Task.isCancelled, deadline.map({ ContinuousClock.now < $0 }) != false else {
+            return .from(.notDelivered(reason: "The notification's admission deadline ended"), id: id)
+        }
+        let finished = ContinuationOnce<NativeAgentNotificationPostResult>()
+        let task = Task {
+            do {
+                let matter = Matter(id: id, form: .words, from: "mac_notify", title: title, summary: body,
+                    open: turn?.verifiedSessionID.map { "chat:" + $0 },
+                    evidence: soundName.map { [.init(source: soundEvidence, id: $0)] } ?? [])
+                let outcome = try await router.tell(matter, reach: .pinned(.mac, from: nil), turn: turn)
+                guard let verdict = outcome.destinationOutcomes["mac"] else {
+                    finished.resume(.from(.notDelivered(reason: "The matter has no Mac door"), id: id))
+                    return
+                }
+                finished.resume(.from(verdict, id: id, held: outcome.deferredForQuietHours))
+            } catch {
+                finished.resume(.from(.unknown(sent: false, reason: error.localizedDescription), id: id))
+            }
+        }
+        let ceiling = ContinuousClock.now.advanced(by: .seconds(5))
+        let until = deadline.map { min($0, ceiling) } ?? ceiling
+        return await finished.wait(budget: .init(deadline: until), cancellingWith: .from(.unknown(sent: false,
+            reason: "The matter's Mac delivery is still pending"), id: id),
+            onCancel: { if ContinuousClock.now < until { task.cancel() } })
     }
 
-    public static func post(title: String, body: String, userInfo: [String: String] = [:]) {
+    public static func post(title: String, body: String, userInfo: [String: String] = [:], deadline: ContinuousClock.Instant?) {
         delivery.withLock { state in
             guard !state.stopped else { return }
             let id = UUID()
             state.posts[id] = Task {
-                let result = await postAndReport(title: title, body: body, userInfo: userInfo)
+                let result = await postAndReport(title: title, body: body, userInfo: userInfo, deadline: deadline)
                 if let error = result.error { nativeLog("notification %@: %@", result.identifier, error) }
                 _ = delivery.withLock { $0.posts.removeValue(forKey: id) }
             }
         }
     }
 
-    /// `userInfo` rides with the banner so a click can land on the thing the
-    /// banner is about. Keys are plain strings; `NativeAgentNotificationRoute`
-    /// owns the ones this app reads back.
+    /// A banner on this Mac, as UI physics where the person just acted; anything for the person is told through the router and reaches the Mac as its door.
     public static func postAndReport(
         title: String,
         body: String,
         userInfo: [String: String] = [:],
-        soundName: String? = nil
+        soundName: String? = nil,
+        deadline: ContinuousClock.Instant?
     ) async -> NativeAgentNotificationPostResult {
-        guard !Task.isCancelled, delivery.withLock({ !$0.stopped }) else {
-            return NativeAgentNotificationPostResult(
-                identifier: UUID().uuidString, status: "cancelled", delivery: "engine_shutdown",
-                posted: false, visibleAlertsEnabled: false, authorizationStatus: "", alertSetting: "",
-                soundSetting: "", badgeSetting: "", error: CancellationError().localizedDescription)
-        }
-        let root = PersistenceCore.defaultDataRoot()
-        let event = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
-        do {
-            let ledger = NotificationDeliveryLedger(dataRoot: root)
-            let occurrence: NotificationOccurrence
-            if let card = userInfo["itemId"] {
-                let inbox = LiveNotificationInbox.live(dataRoot: root)
-                occurrence = try await SwiftNativePersistenceCore.withFileLock(inbox.path, waitingAtMost: 5) {
-                    guard let value = try await inbox.row(id: card), let row = value.objectValue,
-                          let currentTitle = (row["held_title"] ?? row["title"])?.stringValue,
-                          let currentBody = (row["held_body"] ?? row["summary"])?.stringValue,
-                          row["status"] != .string("archived"), row["status"] != .string("dismissed") else {
-                        throw ToolFailureError("The native notification's source card is settled or unavailable; nothing was posted.", effects: .none, owner: inbox.path.path)
-                    }
-                    // A card-bound post consumes its current committed intent,
-                    // never a stale caller snapshot identified by matching prose.
-                    let draft = try NotificationOccurrence(eventID: event + ":mac", cardID: card,
-                        title: currentTitle, body: currentBody, reason: currentBody, userInfo: userInfo,
-                        importance: AttentionImportance.ownerWaiting.rawValue, route: AttentionDelivery.none.rawValue,
-                        soundName: soundName, destinations: ["mac"], sourceRevision: try LiveNotificationInbox.notificationRevision(value))
-                    let id = try await ledger.retain(draft)
-                    guard let saved = try ledger.read().entries[id]?.occurrence else { throw CocoaError(.fileReadCorruptFile) }
-                    return saved
-                }
-            } else {
-                let draft = try NotificationOccurrence(eventID: event + ":mac", cardID: nil,
-                    title: title, body: body, reason: body, userInfo: userInfo,
-                    importance: AttentionImportance.ownerWaiting.rawValue, route: AttentionDelivery.none.rawValue,
-                    soundName: soundName, destinations: ["mac"])
-                let id = try await ledger.retain(draft)
-                guard let saved = try ledger.read().entries[id]?.occurrence else { throw CocoaError(.fileReadCorruptFile) }
-                occurrence = saved
-            }
-            if AttentionRouter.holdsResidentWake(session: userInfo[NativeAgentNotificationActions.sessionKey], dataRoot: root) {
-                if !NotificationChannelPreference.inApp() {
-                    _ = try await ledger.claim(occurrence.id, destination: "mac", suppressedBy: NotificationChannelPreference.inAppKey)
-                    guard let row = try ledger.read().entries[occurrence.id]?.rows["mac"] else { throw CocoaError(.fileReadCorruptFile) }
-                    return .fromLedger(row.outcome, id: occurrence.id)
-                }
-                try await LiveNotificationInbox.hold(dataRoot: root, title: title, body: body, ways: [],
-                    id: "held:" + occurrence.id, fields: ["notification_occurrence_id": .string(occurrence.id)])
-                return .fromLedger(.notDelivered(reason: "held for quiet hours"), id: occurrence.id, held: true)
-            }
-            return await deliverOccurrence(occurrence.id, dataRoot: root)
-        } catch {
-            return .fromLedger(.notDelivered(reason: error.localizedDescription), id: event)
-        }
+        await banner(title: title, body: body, userInfo: userInfo, soundName: soundName, identifier: UUID().uuidString.lowercased(),
+                     deadline: deadline)
     }
 
-    /// The only native banner dispatch boundary, used by direct posts and by
-    /// router release. Claim and acknowledgement belong to the SAME ledger row.
-    static func deliverOccurrence(_ id: String, dataRoot: URL) async -> NativeAgentNotificationPostResult {
+    /// One post, joined for at most five seconds; an OS callback that lands later is still the post's own (the router settles its door from it).
+    static func banner(title: String, body: String, userInfo: [String: String], soundName: String? = nil, identifier: String,
+                       dataRoot: URL = PersistenceCore.defaultDataRoot(),
+                       deadline outerDeadline: ContinuousClock.Instant? = nil) async -> NativeAgentNotificationPostResult {
         let finished = ContinuationOnce<NativeAgentNotificationPostResult>()
         let operation = UUID()
         let task: Task<Void, Never>? = delivery.withLock { state in
-            guard !state.stopped else { return nil }
+            guard !state.stopped, !Task.isCancelled else { return nil }
             let task = Task {
-                let result = await performDelivery(id, dataRoot: dataRoot)
+                var info = userInfo
+                info["eventId"] = info["eventId"] ?? identifier
+                if let session = info["sessionId"] { info[NativeAgentNotificationActions.sessionKey] = session }
+                if let handle = info["taskId"] { info[NativeAgentNotificationRoute.deskHandleKey] = handle }
+                if info["source"] == "mac_notify", info[NativeAgentNotificationActions.sessionKey] == nil {
+                    info[NativeAgentNotificationActions.newConversationKey] = "true"
+                }
+                var sound = soundName
+                if userInfo["eventId"] == identifier {
+                    do {
+                        guard let matter = try await ForPerson.at(dataRoot).matter(identifier) else { throw CocoaError(.fileReadNoSuchFile) }
+                        if let open = matter.face?.row?.open, open.hasPrefix("page:") {
+                            info[NativeAgentNotificationRoute.pageKey] = String(open.dropFirst(5))
+                        }
+                        if let requested = matter.evidence.first(where: { $0.source == soundEvidence }) { sound = requested.id }
+                    } catch {
+                        finished.resume(.from(.notDelivered(reason: error.localizedDescription), id: identifier))
+                        _ = delivery.withLock { $0.posts.removeValue(forKey: operation) }
+                        return
+                    }
+                }
+                let result = await postAccepted(title: title, body: body, userInfo: info, soundName: sound, identifier: identifier)
+                if result.posted, userInfo["eventId"] == identifier {
+                    await settle {
+                        do {
+                            try await ForPerson.at(dataRoot).accepted(identifier, .mac,
+                                evidence: .init(source: "macos/notifications", id: identifier))
+                        } catch { nativeLog("Mac banner %@ receipt unavailable: %@", identifier, error.localizedDescription) }
+                    }
+                }
                 finished.resume(result)
                 _ = delivery.withLock { $0.posts.removeValue(forKey: operation) }
             }
             state.posts[operation] = task
             return task
         }
-        guard let task else { return .fromLedger(.notDelivered(reason: "Engine shutdown; banner not admitted"), id: id) }
+        guard let task else { return .from(.notDelivered(reason: "Engine shutdown; banner not admitted"), id: identifier) }
         let ceiling = ContinuousClock.now.advanced(by: .seconds(5))
-        let deadline = TaskWaitDeadline.current.map { min($0, ceiling) } ?? ceiling
-        return await TaskWaitDeadline.$current.withValue(deadline) {
-            await finished.wait(cancellingWith: .fromLedger(.unknown(sent: false,
-                reason: "Native notification outcome is still pending; its original operation retains settlement"), id: id),
-                onCancel: { if !TaskWaitDeadline.expired { task.cancel() } })
-        }
-    }
-
-    private static func performDelivery(_ id: String, dataRoot: URL) async -> NativeAgentNotificationPostResult {
-        let ledger = NotificationDeliveryLedger(dataRoot: dataRoot)
-        do {
-            guard let entry = try ledger.read().entries[id] else { throw CocoaError(.fileReadCorruptFile) }
-            if let event = entry.occurrence.userInfo[memoryReviewEventKey],
-               UserDefaults.standard.string(forKey: memoryReviewEventKey) != event {
-                return .fromLedger(.notDelivered(reason: "Memory-review source changed before dispatch"), id: id)
-            }
-            let suppression = NotificationChannelPreference.inApp() ? nil : NotificationChannelPreference.inAppKey
-            guard let claim = try await ledger.claim(id, destination: "mac", suppressedBy: suppression) else {
-                guard let row = try ledger.read().entries[id]?.rows["mac"] else { throw CocoaError(.fileReadCorruptFile) }
-                return .fromLedger(row.outcome, id: id)
-            }
-            var info = claim.occurrence.userInfo
-            info["eventId"] = claim.occurrence.id
-            let posted = await postAccepted(title: claim.occurrence.title, body: claim.occurrence.body,
-                userInfo: info, soundName: claim.occurrence.soundName, identifier: claim.occurrence.id)
-            let saved: Result<Void, Error> = await settle {
-                do { try await ledger.finish(claim, outcome: posted.notificationOutcome); return .success(()) }
-                catch { return .failure(error) }
-            }
-            do { try saved.get() }
-            catch { return .fromLedger(.unknown(sent: posted.posted, reason: "OS outcome could not be retained: " + error.localizedDescription), id: id) }
-            return posted
-        } catch { return .fromLedger(.notDelivered(reason: error.localizedDescription), id: id) }
+        let deadline = outerDeadline.map { min($0, ceiling) } ?? ceiling
+        return await finished.wait(budget: .init(deadline: deadline), cancellingWith: .from(.unknown(sent: false,
+                reason: "Native notification outcome is still pending"), id: identifier),
+                onCancel: { if ContinuousClock.now < deadline { task.cancel() } })
     }
 
     public static func notificationSettings() async -> UNNotificationSettings {

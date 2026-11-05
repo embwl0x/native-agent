@@ -1,11 +1,9 @@
 import Context
 import Foundation
 
-// Blueprint: | `NativeContextMemoryProvenance.swift` | `NativeContextMemoryProvenance.attach`: advisory reverse lookup on the exact prepared-turn lease; misses never invent record identity |
+// Blueprint: | `NativeContextMemoryProvenance.swift` | `NativeContextMemoryProvenance.attach`: advisory lookup on the exact lease |
 
-/// Turn-local accounting for the reverse lookup from selected packet atoms to
-/// canonical MemoryV2 record identities. This is advisory diagnostics only:
-/// the packet stays identity-free and an index miss never invents provenance.
+/// Provenance is advisory: keep the packet identity-free and never invent a record identity for an index miss.
 struct NativeContextMemoryProvenanceResolution: Sendable, Equatable {
     let requestedMemoryAtomCount: Int
     let resolvedMemoryAtomCount: Int
@@ -16,10 +14,7 @@ struct NativeContextMemoryProvenanceResolution: Sendable, Equatable {
 }
 
 enum NativeContextMemoryProvenance {
-    /// Attaches to the exact prepared-turn instance that owns the generation
-    /// lease. Rewrapping would be unsafe because it could release the live
-    /// generation early; packet bytes and its receipt intentionally do not
-    /// change here.
+    /// Attach to the exact prepared-turn lease; rewrapping could release its live generation early.
     static func attach(
         to prepared: ContextPreparedTurn
     ) -> NativeContextMemoryProvenanceResolution {
@@ -32,8 +27,7 @@ enum NativeContextMemoryProvenance {
                 return nil
             }
         }
-        // The why receipt names every scored candidate's record; only the
-        // selected ones count as use.
+        // The why receipt includes all scored candidates; only selected records count as use.
         let requested = Set(memoryAtomIDs + packet.receipt.candidateScores.map(\.atomID))
         let records = Dictionary(prepared.generation.sources.compactMap { source -> (ContextSourceID, String)? in
             guard source.descriptor.owner == MemoryContext.owner,

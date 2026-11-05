@@ -2,11 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `FeatureSurfaceRecords.swift` | `FeatureSurfaceRecord` and `featureSurfaceRecords`: feature surface manifest and the app actions that reach each surface |
+// Blueprint: | `FeatureSurfaceRecords.swift` | `FeatureSurfaceRecord`, `featureSurfaceRecords`; Manifest reach. |
 
 // MARK: - Feature Surface Records
-//
-// Current feature surfaces and the app actions that reach them.
 
 public struct FeatureSurfaceRecord: Codable, Sendable, Equatable {
     public var id: String
@@ -60,13 +58,15 @@ extension FeatureSurfaceRecord {
     }
 }
 
-/// Build the feature-surface manifest with the supplied ISO8601 UTC timestamp.
 public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
     return [
         FeatureSurfaceRecord(
             sourceId: "mac_assistant_watch_setup",
             name: "Mac Assistant Watch Setup",
-            description: "Manifest-routed access map and scheduler templates for email, calendar, reminders, Mac notifications, and iPhone receipts. Rendering the surface does not create jobs.",
+            description: """
+                Manifest-routed access map and scheduler templates for email, calendar, reminders, Mac notifications, and iPhone receipts. Rendering \
+                the surface does not create jobs.
+                """,
             triggers: ["watch email", "watch calendar", "watch reminders", "monitor inbox", "assistant jobs", "mac assistant"],
             permissions: ["mac_control", "connector_read", "scheduler"],
             riskClass: "manifest_setup",
@@ -154,19 +154,26 @@ public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
             endpoints: []
         ),
         FeatureSurfaceRecord(
-            sourceId: "agent_swarm",
-            name: "Bounded Agent Swarm",
-            description: "Lazy-loaded temporary swarms for bug hunts, reviews, architecture checks, UI critique, research audits, and bounded parallel work. Workers default to read-only reasoning; the agent may opt selected workers into the ordinary TrustCenter-gated NativeAgent tool path. All workers and synthesis use the provider and model configured for Work. Up to 20 workers, bounded by policy.",
-            triggers: ["swarm", "subagent", "subagents", "multi-agent", "bug hunt", "parallel review", "review crew", "agent council"],
-            permissions: ["provider_oauth_or_key", "trust_center_inherited_tools"],
-            riskClass: "bounded_policy_gated",
+            sourceId: "own_lines",
+            name: "The Agent's Own Lines",
+            description: """
+                The agent's own lines on the job socket: agent.job with agent self runs a turn in its own work conversation, with the agent's tools, Trust \
+                and present; instructions make a line a researcher, critic or specialist in place of the agent's persona. Several at once run side by side, \
+                each ending as news where it started.
+                """,
+            triggers: ["swarm", "subagent", "subagents", "multi-agent", "bug hunt", "parallel review", "review crew", "agent council", "line"],
+            permissions: ["trust_center_inherited_tools"],
+            riskClass: "trust_gated",
             updatedAt: nowISO,
-            endpoints: ["app agent.swarm"]
+            endpoints: ["app agent.job"]
         ),
         FeatureSurfaceRecord(
             sourceId: "research_browser",
             name: "Research and Browser Runtime",
-            description: "SearXNG research, URL fetch/source capture, research lab receipts, and live browser actions governed by Trust permissions and approval requirements.",
+            description: """
+                SearXNG research, URL fetch/source capture, research lab receipts, and live browser actions governed by Trust permissions and \
+                approval requirements.
+                """,
             triggers: ["research", "search", "web", "browser", "source", "fetch"],
             permissions: ["network"],
             riskClass: "network_read",

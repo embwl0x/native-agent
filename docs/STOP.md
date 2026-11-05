@@ -22,10 +22,6 @@ Work in flight has two parts:
   (`Modules/NativeAgentCore/Sources/NativeAgentCore/Settle.swift`), which a
   cancelled caller still waits for.
 
-Workshop's ordinary and approved steps share one outcome commit: produced
-output and its receipt are saved before the status transition, cancellation
-wins, and traversal skips steps with durable completed outcomes.
-
 Inbound contact and builder tasks settle returned text and files even when
 Stop arrives at the return boundary. Cancellation selects the terminal state
 independently of produced output; a throwing cancellation recovers committed
@@ -68,14 +64,6 @@ experience's `finish` obligation. The timeout names that experience for later
 inspection; no response means unknown effects, never permission to resend.
 The [authored fetch contract](skill_manifest_spec.md#secret-insertion-and-redaction)
 owns the wait/transport limits and receipt path.
-
-An admitted `codex.invoke` likewise owns its execution separately from the
-caller's observation. Caller Stop and observation expiry end only the wait;
-the exact returned `run_id` with `abort:true`, or its independent execution
-ceiling, stops that subprocess. Actual exit still joins `settle` and retains
-captured output and its terminal audit. Missing owner or audit evidence is
-unknown, never permission to repeat the work. The invocation bounds and
-inspection contract live in [Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md#direct-invocation-owns-its-execution).
 
 A resident wake waiting for another call's busy slot parks through `ScopedWaiter`.
 Cancelling that wake releases and removes only its own parker, without stopping
@@ -259,9 +247,9 @@ and emits `tool.dispatch.settled` with the invocation/call IDs. A late receipt
 is evidence, not a replacement response or another dispatch. Missing completion
 stays unknown; Stop requests cancellation without asserting effects stopped.
 The active-work response clock still renews on progress and pauses for human
-waits, but supplies no downstream effect budget. Practice keep turns and
-Workshop sessions retain their `TurnBodyLifetime` cancellation/join behavior;
-`TurnDeadline` owns their response verdict separately.
+waits, but supplies no downstream effect budget. Practice keep turns retain
+their `TurnBodyLifetime` cancellation/join behavior; `TurnDeadline` owns their
+response verdict separately.
 
 Local Calendar and Reminders check cancellation at their EventKit save/remove
 boundary, including writes whose selection awaited an EventKit read.
@@ -270,17 +258,6 @@ Connector actions capture their returned output and append the receipt through
 `settle`, including waits for the receipt lock. A persistence failure reports
 the returned status and retains the redacted output in its recording error;
 it cannot claim that the action itself never ran.
-
-Canceling a Desk item also cancels its linked Workshop executions. The executor
-reads that canonical cancellation before claiming work and admitting each step;
-an in-flight step observes Desk changes, stops cooperatively, and saves its
-returned output and receipt before the execution settles as canceled.
-Workshop step deadlines likewise join the operation and retain its returned
-receipt. An effect's timeout fails and admits no following step; a read's
-timeout records unavailable coverage and continues without requiring `optional`.
-Workshop sessions retain and join their worker after deadline or Stop, then
-close artifact collection and write their one terminal receipt through `settle`.
-Returned and partial text stays in the durable session result and receipt feed.
 
 This is NORTHSTAR clause 2 (no theater) applied to Stop: every receipt records
 something that actually ran.

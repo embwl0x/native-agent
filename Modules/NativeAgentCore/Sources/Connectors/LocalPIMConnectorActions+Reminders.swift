@@ -7,7 +7,7 @@ import PersistenceCore
 import Privacy
 import MacIntegration
 import ToolExecution
-// Blueprint: | `LocalPIMConnectorActions+Reminders.swift` | Reminder CRUD, checked query flags, due-date splitting and paging on LocalPIMStore; notes redacted before preview bounds; failed list saves retain unknown effects and exact identity; exact identifiers never select by title after a miss; nil EventKit callbacks remain unavailable rather than zero counts |
+// Blueprint: | `LocalPIMConnectorActions+Reminders.swift` | Reminder CRUD; exact IDs; unknown saves and unavailable callbacks stay explicit |
 
 @MainActor
 private final class ReminderReadResult<Value: Sendable> {
@@ -16,11 +16,11 @@ private final class ReminderReadResult<Value: Sendable> {
 }
 
 extension LocalPIMConnectorActions {
-    /// The requesting root's part owns the local-day view; the query below remains the native permission, EventKit confinement and serialization boundary.
-    public static func remindersListDueToday(input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue {
+    /// The root's part owns day presentation; native code owns permission, EventKit confinement and serialization.
+    public static func remindersListDueToday(input: [String: JSONValue], dataRoot: URL, invocation: Parts.Invocation) async throws -> JSONValue {
         let packet: JSONValue = .object(["request": .object(input),
             "now": .string(iso(Date())), "timeZone": .string(TimeZone.current.identifier)])
-        switch await Parts(root: dataRoot).call(id: "due-reminders", input: packet, as: JSONValue.self) {
+        switch await Parts(root: dataRoot).call(id: "due-reminders", input: packet, invocation: invocation, as: JSONValue.self) {
         case .success(let value): return NativeAppSecretRedactor.redactValue(value)
         case .failure(let error):
             throw PartCallError(code: NativeAppSecretRedactor.redactText(error.code),
@@ -35,7 +35,7 @@ extension LocalPIMConnectorActions {
         )
     }
 
-    public static func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func remindersQuery(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let actionId = "mac.reminders_query"
         let flags: (undatedOnly: Bool, includeCompleted: Bool)
         do { flags = try remindersQueryFlags(input: input) }
@@ -50,11 +50,14 @@ extension LocalPIMConnectorActions {
               !(undatedOnly && (start != nil || end != nil || split != nil)),
               start == nil || end == nil || start! < end! else {
             return .object(["status": .string("failed"), "actionId": .string(actionId), "effects": .string("none"),
-                "reason": .string("Provide valid due_start/due_end/split_due_at with start before end; undated_only cannot be combined with a due range or split.")])
+                "reason": .string("""
+                    Provide valid due_start/due_end/split_due_at with start before end; undated_only cannot be combined with a due range or \
+                    split.
+                    """)])
         }
         let store = LocalPIMStore()
         guard try await store.requestReminderAccess() else {
-            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState(), handsBack: handsBack)
         }
         let includeCompleted = flags.includeCompleted
         let query = input["query"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -68,7 +71,7 @@ extension LocalPIMConnectorActions {
         let finish: @Sendable (JSONValue) -> Void = { value in
             Task { @MainActor in response.value = value; response.done.resume() }
         }
-        // Completed reminders are fetched too, so a query that only matches finished ones says so instead of reading as "nothing".
+        // Fetch completed reminders too so finished-only matches cannot masquerade as an empty list.
         store.fetchReminders(in: calendars, incompleteOnly: false) { reminders in
             guard let reminders else {
                 finish(.object(["status": .string("failed"), "effects": .string("none"), "actionId": .string(actionId),
@@ -109,10 +112,13 @@ extension LocalPIMConnectorActions {
             ]) { _, value in value }
             if completedHidden > 0 {
                 result["completed_hidden"] = .int(Int64(completedHidden))
-                result["hint"] = .string("\(completedHidden) completed reminder\(completedHidden == 1 ? "" : "s") also match\(completedHidden == 1 ? "es" : ""); include_completed:true shows them.")
+                result["hint"] = .string("""
+                    \(completedHidden) completed reminder\(completedHidden == 1 ? "" : "s") also match\(completedHidden == 1 ? "es" : ""); \
+                    include_completed:true shows them.
+                    """)
             }
             if let split {
-                // Both pages are slices of this fetch, never offsets from fresh reads.
+                // Slice both pages from this fetch so a concurrent change cannot shift their offsets.
                 result["before"] = .object(page(matching.filter {
                     guard let due = $0.dueDateComponents?.date else { return false }
                     return due < split
@@ -134,12 +140,12 @@ extension LocalPIMConnectorActions {
         return value
     }
 
-    /// Every reminder list with its open count: "which list has the most left" is one read, not an inference from each reminder's `list`.
-    public static func remindersLists(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Fetch each list's open count directly; individual reminder rows cannot establish totals.
+    public static func remindersLists(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let actionId = "mac.reminders_lists"
         let store = LocalPIMStore()
         guard try await store.requestReminderAccess() else {
-            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState(), handsBack: handsBack)
         }
         let lists = store.calendars(for: .reminder)
         let response = ReminderReadResult<[String: Int]>()
@@ -168,18 +174,20 @@ extension LocalPIMConnectorActions {
             })])
     }
 
-    public static func remindersRead(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func remindersRead(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let actionId = "mac.reminders_read"
         guard let id = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else {
-            return .object(["status": .string("failed"), "actionId": .string(actionId), "effects": .string("none"), "reason": .string("Provide an exact reminder id.")])
+            return .object(["status": .string(
+                "failed"), "actionId": .string(actionId), "effects": .string("none"), "reason": .string("Provide an exact reminder id.")])
         }
         let store = LocalPIMStore()
         guard try await store.requestReminderAccess() else {
-            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState(), handsBack: handsBack)
         }
         guard let reminder = store.reminder(withIdentifier: id) else {
-            // A shortened id never matches: say so, instead of "not found" alone.
-            let hint = id.count < 30 ? " Ids are the full identifier a query, read or create returned (36 characters or more); a shortened one never matches." : ""
+            // Distinguish a truncated identifier from a complete identifier that has no match.
+            let hint = id.count < 30
+                ? " Ids are the full identifier a query, read or create returned (36 characters or more); a shortened one never matches." : ""
             return .object(["status": .string("failed"), "actionId": .string(actionId), "effects": .string("none"),
                             "reason": .string("The exact reminder was not found." + hint)])
         }
@@ -238,20 +246,22 @@ extension LocalPIMConnectorActions {
         return arguments
     }
 
-    public static func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func remindersUpdate(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let actionId = "mac.reminders_update"
         let arguments: ReminderUpdateArguments
         do { arguments = try reminderUpdateArguments(input: input) }
         catch { return error.result }
         let store = LocalPIMStore()
         guard try await store.requestReminderAccess() else {
-            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState(), handsBack: handsBack)
         }
         guard let reminder = store.reminder(withIdentifier: arguments.id) else {
-            return .object(["status": .string("failed"), "effects": .string("none"), "actionId": .string(actionId), "reason": .string("The exact reminder was not found.")])
+            return .object(["status": .string(
+                "failed"), "effects": .string("none"), "actionId": .string(actionId), "reason": .string("The exact reminder was not found.")])
         }
         guard reminder.calendar.allowsContentModifications else {
-            return .object(["status": .string("failed"), "effects": .string("none"), "actionId": .string(actionId), "reason": .string("The reminder list is read-only.")])
+            return .object(["status": .string(
+                "failed"), "effects": .string("none"), "actionId": .string(actionId), "reason": .string("The reminder list is read-only.")])
         }
         if let title = arguments.title { reminder.title = title }
         if let notes = arguments.notes { reminder.notes = notes }
@@ -280,15 +290,15 @@ extension LocalPIMConnectorActions {
         ])
     }
 
-    public static func remindersListRename(input: [String: JSONValue]) async throws -> JSONValue {
-        try await remindersListWrite(input: input, rename: true)
+    public static func remindersListRename(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
+        try await remindersListWrite(input: input, rename: true, handsBack: handsBack)
     }
 
-    public static func remindersListCreate(input: [String: JSONValue]) async throws -> JSONValue {
-        try await remindersListWrite(input: input, rename: false)
+    public static func remindersListCreate(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
+        try await remindersListWrite(input: input, rename: false, handsBack: handsBack)
     }
 
-    public static func remindersListWrite(input: [String: JSONValue], rename: Bool) async throws -> JSONValue {
+    public static func remindersListWrite(input: [String: JSONValue], rename: Bool, handsBack: Bool) async throws -> JSONValue {
         let actionId = rename ? "reminders.list_rename" : "reminders.list_create"
         func failed(_ reason: String) -> JSONValue {
             .object(["status": .string("failed"), "actionId": .string(actionId), "effects": .string("none"), "reason": .string(reason)])
@@ -301,7 +311,7 @@ extension LocalPIMConnectorActions {
         if rename, (requested ?? "").isEmpty { return failed("The exact existing list name is required.") }
         let store = LocalPIMStore()
         guard try await store.requestReminderAccess() else {
-            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState(), handsBack: handsBack)
         }
         let lists = store.calendars(for: .reminder)
         func sameName(_ title: String, _ name: String) -> Bool {
@@ -353,14 +363,14 @@ extension LocalPIMConnectorActions {
         return .object(result)
     }
 
-    public static func remindersCreate(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func remindersCreate(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let store = LocalPIMStore()
         let granted = try await store.requestReminderAccess()
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_create",
                 source: "reminders",
-                status: reminderAuthorizationState()
+                status: reminderAuthorizationState(), handsBack: handsBack
             )
         }
 
@@ -387,7 +397,6 @@ extension LocalPIMConnectorActions {
         let listNameField = input["list_name"]
         let listName = listNameField?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        // Supplied list names must be nonempty.
         let listNameSupplied: Bool = {
             guard let listNameField else { return false }
             if case .null = listNameField { return false }
@@ -482,14 +491,14 @@ extension LocalPIMConnectorActions {
         return Calendar(identifier: .gregorian).dateComponents(fields, from: date)
     }
 
-    public static func remindersComplete(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func remindersComplete(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let store = LocalPIMStore()
         let granted = try await store.requestReminderAccess()
         guard granted else {
             return permissionEnvelope(
                 actionId: "mac.reminders_complete",
                 source: "reminders",
-                status: reminderAuthorizationState()
+                status: reminderAuthorizationState(), handsBack: handsBack
             )
         }
 
@@ -505,7 +514,7 @@ extension LocalPIMConnectorActions {
         }
         var found = id.isEmpty ? nil : store.reminder(withIdentifier: id)
         if id.isEmpty {
-            // By title among open reminders: exactly one exact match, never a containing one ("pay bill" must not complete "Do not pay bill").
+            // Require an exact open-title match: a containing title may express the opposite instruction.
             let wanted = title.lowercased()
             let open = try await openReminderTitles(store: store)
             let exact = open.filter { $0.title.lowercased() == wanted }
@@ -514,11 +523,13 @@ extension LocalPIMConnectorActions {
                 let names = near.prefix(5).map { "\"\($0.title)\"" }.joined(separator: ", ")
                 return failed(exact.count > 1
                     ? "\(exact.count) open reminders are titled \"\(title.isEmpty ? id : title)\"; give the id from mac_reminders_list_due_today."
-                    : "No open reminder is titled exactly \"\(title.isEmpty ? id : title)\"." + (near.isEmpty ? "" : " Close: \(names). Give one of those exactly."))
+                    : "No open reminder is titled exactly \"\(title.isEmpty ? id : title)\"." + (
+                        near.isEmpty ? "" : " Close: \(names). Give one of those exactly."))
             }
             found = store.reminder(withIdentifier: exact[0].id)
         }
-        guard let reminder = found else { return failed("That exact reminder could not be resolved. Read reminders again and use its current id; no reminder was completed.") }
+        guard let reminder = found else { return failed(
+            "That exact reminder could not be resolved. Read reminders again and use its current id; no reminder was completed.") }
 
         let completedAt = Date()
         reminder.isCompleted = true
@@ -554,7 +565,7 @@ extension LocalPIMConnectorActions {
         return (id, title)
     }
 
-    public static func remindersDelete(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func remindersDelete(input: [String: JSONValue], handsBack: Bool) async throws -> JSONValue {
         let actionId = "mac.reminders_delete"
         // Refusals before `remove` changed nothing; a failed remove reports itself below.
         func failed(_ reason: String, effects: String = "none") -> JSONValue {
@@ -565,7 +576,7 @@ extension LocalPIMConnectorActions {
         catch { return error.result }
         let store = LocalPIMStore()
         guard try await store.requestReminderAccess() else {
-            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
+            return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState(), handsBack: handsBack)
         }
         guard let reminder = store.reminder(withIdentifier: expected.id) else { return failed("reminder_not_found") }
         guard reminder.title == expected.title else {

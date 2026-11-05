@@ -6,8 +6,9 @@ import PersistenceCore
 import Desk
 import TriggerScheduler
 import NotificationInbox
+import Experiences
 import ApprovalInbox
-// Blueprint: | `NativeAgentScheduledProactiveScan.swift` | Proactive opportunities read checked inbox, scheduler, approval and Desk owners; ProactiveScanArguments owns admission and execution arguments, unavailable sources throw |
+// Blueprint: | `NativeAgentScheduledProactiveScan.swift` | Checked source opportunities; ProactiveScanArguments owns admission and execution |
 
 public enum NativeAgentScheduledProactiveScan {
     public struct Opportunity: Sendable, Equatable {
@@ -20,9 +21,8 @@ public enum NativeAgentScheduledProactiveScan {
         public let severity: String
         public let score: Double
         public let relatedPaths: [String]
-        /// Structured inbox groups are the wire for the Desk's Review Groups
-        /// control. They are not reconstructed from presentation prose.
-        public let relatedGroups: [JSONValue]
+        /// The record ids this digest stands on, without another inbox group store.
+        public let relatedMatters: [String]
 
         init(
             id: String,
@@ -34,7 +34,7 @@ public enum NativeAgentScheduledProactiveScan {
             severity: String,
             score: Double,
             relatedPaths: [String],
-            relatedGroups: [JSONValue] = []
+            relatedMatters: [String] = []
         ) {
             self.id = id
             self.kind = kind
@@ -45,7 +45,7 @@ public enum NativeAgentScheduledProactiveScan {
             self.severity = severity
             self.score = score
             self.relatedPaths = relatedPaths
-            self.relatedGroups = relatedGroups
+            self.relatedMatters = relatedMatters
         }
     }
 
@@ -72,13 +72,8 @@ public enum NativeAgentScheduledProactiveScan {
 
     // MARK: - W6/G5 — a project-shaped opportunity
 
-    /// Days a `now`/`next` Desk item may sit untouched before the scan asks
-    /// about it. Five is deliberately about a working week: shorter and it nags
-    /// on work that is simply in progress.
-    /// Desk items the scan is allowed to ask about. `now`/`next` only — these
-    /// are the statuses that CLAIM to be the current front of the work, so an
-    /// untouched one is a real question. `watch`/`todo` are backlog by
-    /// definition and asking about them would be nagging.
+    /// Five days gives active work about a working week before asking, avoiding progress-time nagging. Only now/next claim to be current work; watch/todo are
+    /// intentionally backlog.
     static let deskOpportunityStatuses: Set<DeskStatus> = [.now, .next]
 
     public static func evaluate(
@@ -93,10 +88,7 @@ public enum NativeAgentScheduledProactiveScan {
             return Result(scannedCount: 0, eligibleCount: 0, skippedAlreadySurfacedCount: 0, surfaced: [])
         }
 
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        let inboxRows = try await LiveNotificationInbox(path: inboxPath).rows()
+        let inboxRows = try await ForPerson.at(dataRoot).inbox()
         let schedulerRows = try await SwiftNativeTriggerScheduler(root: dataRoot).listJobs()
         let schedulerIssues = try schedulerRows.compactMap { row -> ScheduledJob? in
             let job = try ScheduledJob(row: row)
@@ -141,35 +133,31 @@ public enum NativeAgentScheduledProactiveScan {
     }
 
     private static func liveOpportunities(
-        inboxRows: [JSONValue],
+        inboxRows: [InboxItemRecord],
         schedulerIssues: [ScheduledJob],
         pendingApprovals: Int,
         dataRoot: URL
     ) throws -> [Opportunity] {
         var opportunities: [Opportunity] = []
 
-        let actionableInbox = try InboxItemRecord.latest(in: inboxRows).filter(\.isAttentionWorthyBacklogItem)
+        let actionableInbox = inboxRows.filter(\.isAttentionWorthyBacklogItem)
         if !actionableInbox.isEmpty {
             let id = stableID(kind: "inbox_digest", seed: "visible-unread-\(actionableInbox.count)")
             let memberIDs = actionableInbox.map(\.id)
-            let relatedGroups: [JSONValue] = memberIDs.isEmpty ? [] : [.object([
-                "id": .string("digest-actionable-\(id)"),
-                "title": .string("Actionable inbox items"),
-                "count": .int(Int64(memberIDs.count)),
-                "item_ids": .array(memberIDs.map(JSONValue.string)),
-                "source": .string("proactive_inbox_digest"),
-            ])]
             opportunities.append(Opportunity(
                 id: id,
                 kind: "inbox_digest",
                 title: "Review inbox blockers",
                 summary: "\(actionableInbox.count) actionable inbox item(s) are waiting for the user or assistant to handle.",
-                detail: "Current scan found \(actionableInbox.count) unresolved attention-worthy inbox item(s), excluding routine receipts and prior proactive scan cards.",
+                detail: """
+                    Current scan found \(actionableInbox.count) unresolved attention-worthy inbox item(s), excluding routine receipts and prior \
+                    proactive scan cards.
+                    """,
                 source: source(kind: "inbox_digest", id: id),
                 severity: actionableInbox.count >= 3 ? "actionable" : "important",
                 score: actionableInbox.count >= 3 ? 0.74 : 0.62,
-                relatedPaths: [dataRoot.appendingPathComponent("notifications/inbox.jsonl").path],
-                relatedGroups: relatedGroups
+                relatedPaths: [],
+                relatedMatters: memberIDs
             ))
         }
 
@@ -197,7 +185,10 @@ public enum NativeAgentScheduledProactiveScan {
                 id: id,
                 kind: "approval_backlog",
                 title: "Clear pending approvals",
-                summary: "\(pendingApprovals) approval request(s) are waiting. The assistant should avoid duplicate asks and surface the oldest meaningful blocker.",
+                summary: """
+                    \(pendingApprovals) approval request(s) are waiting. The assistant should avoid duplicate asks and surface the oldest \
+                    meaningful blocker.
+                    """,
                 detail: "Current scan found \(pendingApprovals) pending approval request(s).",
                 source: source(kind: "approval_backlog", id: id),
                 severity: "actionable",
@@ -211,18 +202,7 @@ public enum NativeAgentScheduledProactiveScan {
 
     // MARK: - G5: the first non-self-referential producer
 
-    /// A `now`/`next` Desk item that has not moved in `staleDays`.
-    ///
-    /// Every other kind this scan produces reads the app's own state files —
-    /// inbox.jsonl, jobs.json, requests.json — and asks User to tidy the app
-    /// that generated the card. This one reads his actual work and asks a
-    /// question only he can answer: the item claims to be the current front of
-    /// a project and nothing has happened to it for a week.
-    ///
-    /// Deliberately excluded: `deferUntil` items (parked ON PURPOSE — half of
-    /// Agent's "stale" complaints were these), terminal items, and pursuits
-    /// (agent-authored; asking User about the agent's own project is the exact
-    /// self-referential shape G5 is trying to leave behind).
+    /// Ask about stalled current work, excluding intentionally parked items, terminal work and agent-authored pursuits.
     static func deskOpportunities(
         items: [DeskItem],
         staleDays: Int,
@@ -233,9 +213,7 @@ public enum NativeAgentScheduledProactiveScan {
         return items.compactMap { item -> Opportunity? in
             guard deskOpportunityStatuses.contains(item.status), !item.status.isTerminal else { return nil }
             guard !item.isPursuit else { return nil }
-            // A parked item is not stale. `deferUntil` is either `yyyy-MM-dd` or
-            // a full ISO stamp; either way its presence means "not now, and
-            // that is intentional".
+            // A deferUntil stamp means the item is intentionally parked, regardless of its date format.
             guard (item.deferUntil ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             guard let updated = parseDeskInstant(item.updatedAt), updated < cutoff else { return nil }
 
@@ -246,16 +224,17 @@ public enum NativeAgentScheduledProactiveScan {
             let since = staleSinceLabel(updated, now: now)
             let days = max(staleDays, Int(now.timeIntervalSince(updated) / 86_400))
 
-            // Seeded on the handle AND the updatedAt stamp: the moment the item
-            // moves, the id changes, so a card for the OLD stall never
-            // resurrects and a genuinely re-stalled item gets a fresh one.
+            // Include updatedAt so movement retires a stall's identity and a later stall gets a fresh card.
             let id = stableID(kind: "desk_stale", seed: "\(item.handle)|\(item.updatedAt)")
             return Opportunity(
                 id: id,
                 kind: "desk_stale",
                 title: label,
                 summary: "\(label) hasn't moved since \(since) — still the right next thing?",
-                detail: "This item is marked \(item.status.rawValue) and its last update was \(item.updatedAt) (\(days) day(s) ago). If it is still the next thing, it needs a step; if it is not, it should move off now/next.",
+                detail: """
+                    This item is marked \(item.status.rawValue) and its last update was \(item.updatedAt) (\(days) day(s) ago). If it is still \
+                    the next thing, it needs a step; if it is not, it should move off now/next.
+                    """,
                 source: source(kind: "desk_stale", id: id),
                 severity: "important",
                 score: 0.66,
@@ -264,16 +243,14 @@ public enum NativeAgentScheduledProactiveScan {
         }
     }
 
-    /// Desk stamps are ISO-8601, sometimes with fractional seconds.
+    /// Desk stamps may include fractional seconds.
     static func parseDeskInstant(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
     }
 
-    /// "Tuesday" while the weekday is still unambiguous, an explicit date once
-    /// it is not. A card that says "hasn't moved since Tuesday" about something
-    /// three weeks old would be a small lie.
+    /// Use weekdays only while unambiguous; older stalls need an explicit date.
     static func staleSinceLabel(_ updated: Date, now: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -296,20 +273,11 @@ public enum NativeAgentScheduledProactiveScan {
         return order.compactMap { latest[$0] }
     }
 
-    private static func alreadySurfacedOpportunityIDs(_ rows: [JSONValue]) -> Set<String> {
-        var ids = Set<String>()
-        for row in rows {
-            guard case .object(let obj) = row,
-                  let source = nonEmptyString(obj["source"]),
-                  source.hasPrefix("proactive_autonomy:") else {
-                continue
-            }
-            let parts = source.split(separator: ":", omittingEmptySubsequences: false)
-            if let id = parts.last, !id.isEmpty {
-                ids.insert(String(id))
-            }
-        }
-        return ids
+    private static func alreadySurfacedOpportunityIDs(_ rows: [InboxItemRecord]) -> Set<String> {
+        Set(rows.compactMap { row in
+            guard row.source.hasPrefix("proactive_autonomy:") else { return nil }
+            return row.source.split(separator: ":", omittingEmptySubsequences: false).last.map(String.init)
+        })
     }
 
     private static func source(kind: String, id: String) -> String {

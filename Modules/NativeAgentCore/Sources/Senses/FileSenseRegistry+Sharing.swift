@@ -3,8 +3,7 @@ import PersistenceCore
 // Blueprint: | `FileSenseRegistry+Sharing.swift` | Approval-gated portable code/record export |
 
 extension FileSenseRegistry {
-    /// A single portable JSON bundle: metadata plus explicitly manifested source,
-    /// never a recursive copy of the sense directory or its notebook.
+    /// Export only explicitly manifested source and metadata; the directory and notebook are private.
     struct Bundle: Encodable, Sendable {
         var format = 1
         var record: SenseRecord
@@ -20,7 +19,7 @@ extension FileSenseRegistry {
             guard let names = version.files else { throw Self.failure("Sense source membership has not been checked.") }
             let files = try self.sourceFiles(version.record).filter { names.contains($0.key) }
             var record = version.record
-            // Local paths and usage history do not travel with code.
+            // Local paths and usage history must not travel with code.
             record.reach.readPaths = []
             record.uses = 0
             record.corrections = 0
@@ -40,9 +39,7 @@ extension FileSenseRegistry {
             }
             guard !FileManager.default.fileExists(atPath: target.path) else { throw Self.failure("Export destination already exists.") }
             _ = try Self.safeURL(target.lastPathComponent, under: target.deletingLastPathComponent())
-            // A hard link publishes the completed file atomically and refuses
-            // replacement. Foundation's atomic and withoutOverwriting write
-            // options cannot be combined.
+            // Hard links publish atomically without replacement; Foundation cannot combine atomic and withoutOverwriting options.
             let stage = target.deletingLastPathComponent().appendingPathComponent(".sense-export-\(UUID().uuidString)")
             do {
                 try bytes.write(to: stage, options: .withoutOverwriting)

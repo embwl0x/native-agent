@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `BotRunQueue.swift` | `BotRunQueue` owns durable requests, exact pre-execution refusals and writer claims; claim/refusal commits before queue removal; `enqueue`, `presence`, `refusal`; only per-helper daily reservations |
+// Blueprint: | `BotRunQueue.swift` | `BotRunQueue`; `enqueue`, `presence`, `refusal`: commit claim/refusal before removal; daily reservations |
 
 public struct BotRunReceipt: Sendable, Equatable {
     public let runID: UUID
@@ -9,17 +9,12 @@ public struct BotRunReceipt: Sendable, Equatable {
     public let reason: String
 }
 
-/// Who asked for a run. A manual Run once is the person asking and stays
-/// outside the unattended gates; an event-woken request is unattended provider
-/// spend, so the gates are read again where it is actually admitted — a request
-/// can wait behind other work, or survive a restart, long after the person
-/// turned Autonomy off or paused the bot.
+/// Manual requests carry the person's authority; unattended requests recheck gates after queue waits and restarts.
 public enum BotRunOrigin: String, Codable, Sendable {
     case manual, event
 }
 
-/// Transport identity travels in the same durable request as its event text.
-/// A nil source marks an event whose sender was not recorded.
+/// Keep sender identity with durable event input; nil means the sender was not recorded.
 public struct BotEventProvenance: Codable, Equatable, Sendable {
     public let source: BotEventSource?
     public let verifiedChatID: String?
@@ -37,18 +32,18 @@ public enum BotRunAdmissionError: String, Error {
     case paused, alreadyRunning = "already_running"
 }
 
-/// Durable local requests, consumed before work so an interrupted run is never
-/// replayed. All runners in this process share admission with tool callers.
+/// Consume before execution to prevent interrupted work replay; all callers share admission.
 public struct BotRunQueue: Sendable {
     public static let didChange = Notification.Name("StandingBots.scheduleDidChange")
-    public static let alreadyExecutingWords = "This helper is executing its standing job now. Complete the work and return its result in this turn; do not queue or wait on your own Run control."
+    public static let alreadyExecutingWords = """
+        This helper is executing its standing job now. Complete the work and return its result in this turn; do not queue or \
+        wait on your own Run control.
+        """
     private let disk: StandingBotsDisk
     private let dataRoot: URL
     private var path: URL { disk.root.appendingPathComponent("run-queue.json") }
 
-    /// One queued request. The event text that woke the bot travels ON the
-    /// request, in the same write, so it can only ever reach the run that
-    /// consumes this request — never a Run once or a scheduled occurrence of the same bot.
+    /// Commit event input with its request so it cannot reach another run of the same bot.
     struct QueuedRequest: Codable, Equatable {
         var runID: UUID
         var context: String? = nil
@@ -82,7 +77,10 @@ public struct BotRunQueue: Sendable {
         let settled = try shelf.rawEntryLocked(claim.requestID)
         if let settled, settled.botId != id { throw StandingBotsError.corruptStore("helper claim/result identity") }
         guard settled != nil || claim.executionAdmittedAt != nil else {
-            throw StandingBotsError.corruptStore("Helper request \(claim.requestID) lost its pre-execution admission outcome. Restore its refusal or execution evidence; no interrupted run was invented and nothing was replayed.")
+            throw StandingBotsError.corruptStore("""
+                Helper request \(claim.requestID) lost its pre-execution admission outcome. Restore its refusal or execution evidence; \
+                no interrupted run was invented and nothing was replayed.
+                """)
         }
         let detail = "Helper admission ended without a settled result. Effects are unknown; do not replay the request."
         var entry = ShelfEntry(id: claim.requestID, botId: id, briefVersion: claim.briefVersion,
@@ -91,6 +89,7 @@ public struct BotRunQueue: Sendable {
             uncertainties: [detail], runHealth: .partial, spend: ShelfSpend(tokens: nil, seconds: 0))
         entry.status = .interrupted
         entry.statusDetail = detail
+        entry.sessionID = BotDefinition.sessionID(for: id)
         if settled == nil { try shelf.appendLocked(entry) }
         if requests[id]?.runID == claim.requestID {
             requests.removeValue(forKey: id)
@@ -99,19 +98,11 @@ public struct BotRunQueue: Sendable {
         try FileManager.default.removeItem(at: path)
     }
 
-    // Serializes the short disk transaction and process-wide active claims.
+    // Serialize disk transactions with process-wide claims to prevent double admission.
     private final class Admission: @unchecked Sendable {
         let lock = NSLock()
         var active: [String: [UUID: (descriptor: Int32, done: ScopedWaiter)]] = [:]
     }
-
-    /// The bots whose runs are on this task's stack. Self-calls are refused
-    /// before admission; a nested call finding its target busy cannot wait.
-    /// This also prevents independently admitted runs from waiting on each
-    /// other when neither target appears in its caller's ancestry.
-    @TaskLocal public static var ancestry: Set<UUID> = []
-    @TaskLocal public static var eventProvenance: BotEventProvenance?
-    @TaskLocal public static var eventContext: String?
 
     public init(dataRoot: URL) {
         self.dataRoot = dataRoot.standardizedFileURL
@@ -120,12 +111,11 @@ public struct BotRunQueue: Sendable {
 
     private var rootKey: String { dataRoot.resolvingSymlinksInPath().path }
 
-    /// `context` is the event text that woke the bot, if any. It is the run's
-    /// input, never an instruction to the app.
+    /// Event context is run input, never authority to instruct the app.
     public func enqueue(bot id: UUID, context: String? = nil,
                         origin: BotRunOrigin = .manual,
-                        provenance: BotEventProvenance? = nil) throws -> BotRunReceipt {
-        guard !Self.ancestry.contains(id) else {
+                        provenance: BotEventProvenance? = nil, scope: BotRunScope) throws -> BotRunReceipt {
+        guard !scope.ancestry.contains(id) else {
             throw StandingBotsError.invalidValue(Self.alreadyExecutingWords)
         }
         let receipt: BotRunReceipt
@@ -159,8 +149,7 @@ public struct BotRunQueue: Sendable {
     /// Inside the store lock. Present bytes must be the current request map.
     private func readRequests() throws -> [UUID: QueuedRequest] {
         let saved = try disk.read([UUID: QueuedRequest].self, at: path) ?? [:]
-        // A refusal commits before queue removal. A crash between those writes
-        // must not leave positively refused work executable again.
+        // Commit refusals before removal so a crash cannot make refused work executable.
         return try saved.filter { try refusalUnlocked(bot: $0.key, requestID: $0.value.runID) == nil }
     }
 
@@ -195,6 +184,27 @@ public struct BotRunQueue: Sendable {
         return (Set(Self.admission.active[rootKey]?.keys.map { $0 } ?? []), Set(queued.keys))
     }
 
+    /// The shelf's active rows carry their writer admission time, never a guessed clock time from a view.
+    public func shelfRuns() throws -> (active: Set<UUID>, queued: Set<UUID>, started: [UUID: Date], issues: [UUID: String]) {
+        Self.admission.lock.lock()
+        defer { Self.admission.lock.unlock() }
+        let queued = try pending()
+        let active = Set(Self.admission.active[rootKey]?.keys.map { $0 } ?? [])
+        var started: [UUID: Date] = [:]
+        var issues: [UUID: String] = [:]
+        for id in active {
+            do {
+                guard let claim = try disk.read(Claim.self, at: claimRecord(id)) else {
+                    throw StandingBotsError.corruptStore("active helper start evidence unavailable")
+                }
+                started[id] = claim.admittedAt
+            } catch {
+                issues[id] = "This helper's start record is unavailable: \(error). Preserve and repair its run-claim.json."
+            }
+        }
+        return (active, Set(queued.keys), started, issues)
+    }
+
     public enum RequestPresence: Sendable { case queued, running, deadlineExceeded, absent }
 
     func markDeadlineExceeded(bot id: UUID, requestID: UUID) throws {
@@ -218,10 +228,7 @@ public struct BotRunQueue: Sendable {
         }
     }
 
-    /// Exact queue correlation, plus a conservative live-claim check. A live
-    /// writer may be settling the requested shelf row; absence is definitive
-    /// only once neither the exact queue entry nor any bot writer owns it.
-    /// This never starts, consumes or retries a run.
+    /// Absence is definitive only when neither the exact queue entry nor a live writer owns its settlement.
     public func presence(bot id: UUID, requestID: UUID) throws -> RequestPresence {
         Self.admission.lock.lock()
         defer { Self.admission.lock.unlock() }
@@ -254,14 +261,12 @@ public struct BotRunQueue: Sendable {
             var requests = try readRequests()
             if requests[bot]?.runID == requestID {
                 try recordRefusal(bot: bot, requestID: requestID, detail: detail)
-                // The event text is part of the request, so it goes with it.
                 requests.removeValue(forKey: bot)
                 try disk.write(requests, at: path)
             }
         }
     }
 
-    /// The claimed definition and the event text the claimed request carried.
     struct ClaimedRun {
         let runID: UUID
         let bot: BotDefinition
@@ -275,15 +280,17 @@ public struct BotRunQueue: Sendable {
         return run
     }
 
-    func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false) async throws -> ClaimedRun {
+    func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false, scope: BotRunScope) async throws -> ClaimedRun {
         // Waiting on a run this task is already inside can only ever time out.
-        guard !Self.ancestry.contains(id) else { throw BotRunAdmissionError.alreadyRunning }
+        guard !scope.ancestry.contains(id) else { throw BotRunAdmissionError.alreadyRunning }
         while true {
             try Task.checkCancellation()
             do { return try claim(bot: id, requestID: requestID, manual: manual) }
             catch BotRunAdmissionError.alreadyRunning {
-                guard Self.ancestry.isEmpty else {
-                    throw StandingBotsError.invalidValue("This helper is already running. A running helper cannot wait for another active helper; continue without waiting.")
+                guard scope.ancestry.isEmpty else {
+                    throw StandingBotsError.invalidValue("""
+                        This helper is already running. A running helper cannot wait for another active helper; continue without waiting.
+                        """)
                 }
                 // Select the execution under admission; finish may resolve it before parking.
                 guard let waiter = Self.admission.lock.withLock({ Self.admission.active[rootKey]?[id]?.done }) else {
@@ -304,9 +311,7 @@ public struct BotRunQueue: Sendable {
                   requests[id] == nil || manual || requests[id]?.runID == runID else {
                 throw BotRunAdmissionError.alreadyRunning
             }
-            // Never unlink this inode: flock is shared by every process and is
-            // released by the kernel on exit, including crashes. Unlike a timed
-            // lease, a slow live writer cannot lose ownership to a second run.
+            // Keep the flock inode stable: kernel-held ownership survives slow writers and releases on process exit.
             let claimPath = disk.root.appendingPathComponent(id.uuidString).appendingPathComponent("run.lock")
             try disk.validatePath(claimPath)
             try FileManager.default.createDirectory(at: claimPath.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -320,15 +325,13 @@ public struct BotRunQueue: Sendable {
             }
             try reconcileClaim(id, requests: &requests)
             let bot = try disk.definition(id).definition
-            // Claiming a queued request consumes it even if settings now reject
-            // it. A budget edit must not leave a request to replay later.
+            // Consume refused requests too, so a later settings edit cannot replay them.
             var context: String? = nil
             var provenance: BotEventProvenance? = nil
             if let runID, requests[id]?.runID != runID { throw BotRunAdmissionError.alreadyRunning }
             let admittedID = runID ?? UUID()
             if runID != nil {
-                // Read its input now; retain the durable request until its
-                // successor claim (or refusal) has committed.
+                // Retain the durable request until its successor claim or refusal commits.
                 let request = requests[id]
                 context = request?.context
                 if request?.isEvent == true {
@@ -353,9 +356,7 @@ public struct BotRunQueue: Sendable {
             try disk.write(Claim(requestID: admittedID, briefVersion: bot.briefVersion, admittedAt: Date()),
                            at: claimRecord(id))
             if runID != nil {
-                // A failed claim write leaves the request queued. A crash or
-                // queue-write failure after it leaves the exact claim for
-                // reconciliation; missing settlement never authorizes replay.
+                // Failed claim writes preserve the queue; later failures preserve the exact claim and never authorize replay.
                 requests.removeValue(forKey: id)
                 try disk.write(requests, at: path)
             }
@@ -365,8 +366,7 @@ public struct BotRunQueue: Sendable {
         }
     }
 
-    /// A positively refused pre-execution request has no unknown effects to
-    /// reconcile. Keep the writer lock until this exact claim is retired.
+    /// Keep the writer lock through exact pre-execution refusal settlement; no unknown effects need reconciliation.
     func retireUnstartedClaim(bot id: UUID, requestID: UUID, detail: String) throws {
         try disk.locked {
             guard let claim = try disk.read(Claim.self, at: claimRecord(id)), claim.requestID == requestID else {
@@ -390,8 +390,7 @@ public struct BotRunQueue: Sendable {
         guard row.botID == bot, row.requestID == requestID else { throw StandingBotsError.corruptStore("refused helper request identity") }
         return row.detail
     }
-    /// Positive pre-execution settlement, separate from execution history.
-    /// Missing evidence says nothing about whether the request ran.
+    /// Missing settlement evidence says nothing about execution; only a positive refusal can retire it.
     public func refusal(bot: UUID, requestID: UUID) throws -> String? {
         try disk.locked { try refusalUnlocked(bot: bot, requestID: requestID) }
     }
@@ -410,8 +409,7 @@ public struct BotRunQueue: Sendable {
         execution?.done.resume()
     }
 
-    /// One cross-process transaction before any effects. Existing unreadable
-    /// spend state throws rather than resetting this helper's allowance.
+    /// Cross-process spend admission precedes effects; unreadable state must not reset the allowance.
     func reserveDailySpend(tokens: Int, bot: UUID, ceiling: Int, at now: Date = Date()) throws {
         struct Spend: Codable { var day: Int; var tokens: Int }
         try disk.locked {

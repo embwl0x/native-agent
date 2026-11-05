@@ -44,7 +44,6 @@ public struct ContextCandidateScoreFeatures: Codable, Equatable, Sendable {
     public let recency: Double
     public let usefulness: Double
     public let decay: Double
-    /// Share of current message tokens covered (0…1).
     public let messageCoverage: Double
     public internal(set) var diversityBonus: Double
     public internal(set) var redundancyPenalty: Double

@@ -10,25 +10,24 @@ import NativeAgentShared
 import UserNotifications
 import Experiences
 import Senses
-// Blueprint: | `MacControl+TextEditing.swift` | `SwiftNativeMacControl.typeText`: selects AX value, selection insertion or explicit keys before text delivery; unsupported AX writers stop without substitution, focus must take without a click retry; append and continuation retain verified selection |
+// Blueprint: | `MacControl+TextEditing.swift` | `SwiftNativeMacControl.typeText`: One selected writer; checked focus/selection; no substitution |
 
 extension SwiftNativeMacControl {
-    /// Replace or append text through the same act ledger and live input gate.
+    /// Share the act ledger and live gate so text editing retains ordinary motor admission.
     func typeText(
         body: [String: JSONValue], entry: MacLookFrameEntry, framePid: Int32,
         actWindow: MacAXWindowRef, target: MacAXActTarget, handle: String,
         text: String?, typeMode: MacTypeMode, background: Bool, keystrokes: Bool,
         noteActuation: (String) -> Void, recordAXOutcome: (MacAXActOutcome) -> Void, refuseInput: (String) -> MacActPerformed?,
-        ledgeredSetFocused: (MacAXActTarget) -> MacAXActOutcome
-    ) async -> MacActPerformed? {
+        turn: Turn, context: MacOperationContext, ledgeredSetFocused: (MacAXActTarget) -> MacAXActOutcome) async -> MacActPerformed? {
         func ledgeredSetSelectedText(_ actTarget: MacAXActTarget, text: String) -> MacAXActOutcome {
-            let outcome = accessibilityActSource.setSelectedText(actTarget, text: text)
+            let outcome = accessibilityActSource(context: context).setSelectedText(actTarget, text: text, turn: turn, context: context)
             recordAXOutcome(outcome)
             if outcome.emissionAttempted { noteActuation("AXSelectedText") }
             return outcome
         }
         func ledgeredSetSelectedTextRange(_ actTarget: MacAXActTarget, range: NSRange) -> MacAXActOutcome {
-            let outcome = accessibilityActSource.setSelectedTextRange(actTarget, range: range)
+            let outcome = accessibilityActSource(context: context).setSelectedTextRange(actTarget, range: range, turn: turn, context: context)
             recordAXOutcome(outcome)
             if outcome.emissionAttempted { noteActuation("AXSelectedTextRange") }
             return outcome
@@ -39,11 +38,11 @@ extension SwiftNativeMacControl {
             target: MacAXActTarget
         ) async -> MacAccessibilityActuator.ActResult {
             let result = await MacAccessibilityActuator.act(
-                source: accessibilityActSource,
+                source: accessibilityActSource(context: context),
                 target: target,
                 action: action,
                 value: value
-            )
+            , turn: turn, context: context)
             recordAXOutcome(result.outcome)
             if result.outcome.emissionAttempted { noteActuation(result.requestedAction) }
             return result
@@ -58,17 +57,20 @@ extension SwiftNativeMacControl {
                 MacActPerformed(
                     ok: error == nil, method: method, requestedAction: "type",
                     error: error, target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: [
                         "mode": .string("append"),
                         "posted_events": .int(Int64(posted)),
                         "guidance": .string(error.map {
-                            "Append stopped: \($0). The whole value was not replaced. Inspect the target before retrying; insertion may be partial if input was delivered."
+                            """
+                                Append stopped: \($0). The whole value was not replaced. Inspect the target before retrying; insertion may be partial if \
+                                input was delivered.
+                                """
                         } ?? "Append input was delivered."),
                     ], expectedText: expected
                 )
             }
-            guard let before = accessibilityActSource.textInput(target) else {
+            guard let before = accessibilityActSource(context: context).textInput(target, context: context) else {
                 return result("append_text_or_selection_unreadable")
             }
             let end = NSRange(location: before.value.utf16.count, length: 0)
@@ -77,7 +79,7 @@ extension SwiftNativeMacControl {
                 let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
                 repeat {
                     guard !Task.isCancelled else { return false }
-                    if let input = accessibilityActSource.textInput(target), input.value == value,
+                    if let input = accessibilityActSource(context: context).textInput(target, context: context), input.value == value,
                        selection == nil || input.selection == selection { return true }
                     if ContinuousClock.now >= deadline { break }
                     do { try await Task.sleep(for: .milliseconds(25)) } catch { return false }
@@ -85,7 +87,7 @@ extension SwiftNativeMacControl {
                 return false
             }
             func atUnchangedEnd() -> Bool {
-                guard let input = accessibilityActSource.textInput(target) else { return false }
+                guard let input = accessibilityActSource(context: context).textInput(target, context: context) else { return false }
                 return input.value == before.value && input.selection == end
             }
             guard !Task.isCancelled else { return result("cancelled") }
@@ -113,7 +115,7 @@ extension SwiftNativeMacControl {
                 return result("append_end_position_failed")
             }
             // Only a preselected keystroke contract reaches the keyboard writer.
-            guard accessibilityActSource.textInput(target)?.value == before.value else {
+            guard accessibilityActSource(context: context).textInput(target, context: context)?.value == before.value else {
                 return result("append_target_changed")
             }
             if background {
@@ -129,23 +131,23 @@ extension SwiftNativeMacControl {
             _ = ledgeredSetFocused(target)
             func focusHolds() -> Bool {
                 !Task.isCancelled && !eventSink.secureKeyboardEntryActive
-                    && accessibilitySource.frontmostApp()?.processIdentifier == framePid
-                    && accessibilityActSource.focusedWindow(pid: framePid)?.handle == actWindow.handle
-                    && accessibilityActSource.isFocusedElement(target, pid: framePid)
+                    && accessibilitySource(context: context).frontmostApp()?.processIdentifier == framePid
+                    && accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context)?.handle == actWindow.handle
+                    && accessibilityActSource(context: context).isFocusedElement(target, pid: framePid, context: context)
             }
             guard focusHolds() else { return result("append_target_not_focused") }
             // One end-of-document chord, with a readback before any characters.
             method = "keystroke_injection"
             noteActuation("cmd+down")
             let positionedByKeys = await executeHand(MacHandRepertoire.chord(
-                MacKeyChord(modifiers: .command, keyCode: 0x7D, source: "cmd+down")), action: "act", body: body)
+                MacKeyChord(modifiers: .command, keyCode: 0x7D, source: "cmd+down")), action: "act", body: body, turn: turn, context: context)
             posted += positionedByKeys.emitted
             if let refusal = positionedByKeys.refusal { return result(refusal.error) }
             guard await waitForValue(before.value, selection: end), focusHolds(), atUnchangedEnd() else {
                 return result("append_end_not_verified")
             }
             noteActuation("type")
-            let typed = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body) { step in
+            let typed = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body, turn: turn, context: context) { step in
                 step.keyEvent?.down == true && !focusHolds()
                     ? self.injectionRefusal(action: "act", error: "append_focus_moved") : nil
             }
@@ -153,17 +155,15 @@ extension SwiftNativeMacControl {
             return result(typed.refusal?.error)
         }
 
-        /// Background typing selects one writer from the requested contract:
-        /// replace single-line values, insert at multiline selection, or explicit keys.
-        /// Unsupported operations stop with their own readback.
-        /// Pid-addressed keys require the act window and field to retain their app's focus.
+        /// Background typing selects one writer from the requested contract: replace single-line values, insert at multiline selection, or explicit keys.
+        /// Unsupported operations stop with their own readback. Pid-addressed keys require the act window and field to retain their app's focus.
         func typeInBackground(_ text: String) async -> MacActPerformed {
-            let expected = accessibilityActSource.textInput(target)?.inserting(text)
+            let expected = accessibilityActSource(context: context).textInput(target, context: context)?.inserting(text)
             func needsFront() -> MacActPerformed {
                 MacActPerformed(
                     ok: false, method: "none", requestedAction: "type",
                     error: "needs_front", target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: [
                         "posted_events": .int(0),
                         "needs_front_reason": .string(MacActClosedLoop.needsFrontReason("type")),
@@ -177,7 +177,7 @@ extension SwiftNativeMacControl {
                     return MacActPerformed(
                         ok: outcome == .performed, method: "ax_selected_text", requestedAction: "type",
                         error: outcome == .performed ? nil : "ax_selected_text_\(outcome.rawValue)",
-                        target: target, postState: accessibilityActSource.reread(target), actedHandle: handle,
+                        target: target, postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                         expectedText: expected
                     )
                 }
@@ -193,19 +193,19 @@ extension SwiftNativeMacControl {
                     extra: ["posted_events": .int(0), "guidance": .string(refusal.note)]
                 )
             }
-            /// The keys go to the pid, and the app routes them to ITS focus:
-            /// so the act window must be the app's focused window AND the
-            /// target field its focused element — re-asked before every key-down.
+            /// The keys go to the pid, and the app routes them to ITS focus: so the act window must be the app's focused window AND the target field its
+            /// focused element — re-asked before every key-down.
             func focusHolds() -> Bool {
-                guard !Task.isCancelled, MacDriverContext.binding?.allowsAction == true else { return false }
-                guard let focused = accessibilityActSource.focusedWindow(pid: framePid),
+                guard !Task.isCancelled, context.driver?.allowsAction(context: context) == true else { return false }
+                guard let focused = accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context),
                       focused.handle == actWindow.handle else { return false }
-                return accessibilityActSource.isFocusedElement(target, pid: framePid)
+                return accessibilityActSource(context: context).isFocusedElement(target, pid: framePid, context: context)
             }
             guard eventSink.isAvailable,
                   ledgeredSetFocused(target) == .performed,
                   focusHolds() else { return needsFront() }
-            let execution = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body, toPid: framePid) { step in
+            let execution = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body, toPid: framePid, turn: turn,
+                context: context) { step in
                 if step.keyEvent?.down == true {
                     if !focusHolds() {
                         return self.injectionRefusal(action: "act", error: "focus_moved")
@@ -218,24 +218,27 @@ extension SwiftNativeMacControl {
             if execution.refusal?.error == "focus_moved" {
                 return MacActPerformed(ok: false, method: "keystroke_to_pid", requestedAction: "type",
                     error: "focus_moved", target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: ["posted_events": .int(Int64(posted)), "characters_sent": .int(Int64(charactersSent)),
                         "text_character_count": .int(Int64(text.count)),
-                        "guidance": .string("focus moved off that field inside the app, so I stopped typing after \(charactersSent) of \(text.count) characters — check the screen below")])
+                        "guidance": .string("""
+                            focus moved off that field inside the app, so I stopped typing after \(charactersSent) of \(text.count) characters — check the \
+                            screen below
+                            """)])
             }
             guard posted > 0 else { return needsFront() }
             if execution.refusal != nil || charactersSent < text.count {
                 return MacActPerformed(
                     ok: false, method: "keystroke_to_pid", requestedAction: "type",
                     error: "keystroke_delivery_stopped", target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: ["posted_events": .int(Int64(posted)), "characters_sent": .int(Int64(charactersSent))]
                 )
             }
             return MacActPerformed(
                 ok: true, method: "keystroke_to_pid", requestedAction: "type",
                 error: nil, target: target,
-                postState: accessibilityActSource.reread(target), actedHandle: handle,
+                postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                 extra: ["posted_events": .int(Int64(posted)), "text_character_count": .int(Int64(text.count))],
                 expectedText: expected
             )
@@ -263,23 +266,23 @@ extension SwiftNativeMacControl {
         if typeMode == .append {
             return await appendText(text)
         }
-        if let continuation = MacWorkContinuation.current, continuation.isPending {
+        if let continuation = turn.macContinuation, continuation.isPending {
             var typingMethod = "ax_selected_text"
             var expected: String?
-            let inputStartCount = MacDriverContext.binding?.inputCount ?? 0
+            let inputStartCount = context.driver?.inputCount ?? 0
             func continuationResult(_ error: String?, delivered: Bool = false) -> MacActPerformed {
-                let posted = (MacDriverContext.binding?.inputCount ?? inputStartCount) - inputStartCount
+                let posted = (context.driver?.inputCount ?? inputStartCount) - inputStartCount
                 return MacActPerformed(ok: error == nil, method: delivered || posted > 0 ? typingMethod : "none",
                     requestedAction: "type", error: error, target: target,
-                    postState: delivered || posted > 0 ? accessibilityActSource.reread(target) : nil, actedHandle: handle,
+                    postState: delivered || posted > 0 ? accessibilityActSource(context: context).reread(target, context: context) : nil, actedHandle: handle,
                     extra: ["ax_delivered": .bool(delivered),
                             "posted_events": .int(Int64(posted))], expectedText: expected)
             }
             guard continuation.app?.processIdentifier == framePid,
                   continuation.focusPath == entry.path,
-                  let before = accessibilityActSource.textInput(target),
+                  let before = accessibilityActSource(context: context).textInput(target, context: context),
                   before.selection == continuation.selectionRange,
-                  continuation.refusal() == nil else {
+                  continuation.refusal(context: context) == nil else {
                 return continuationResult("stale_continuation_target")
             }
             expected = before.inserting(text)
@@ -293,19 +296,20 @@ extension SwiftNativeMacControl {
                 if !background, let refusal = refuseInput("type") {
                     return continuationResult(refusal.error ?? "focus_moved")
                 }
-                let execution = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body, toPid: background ? framePid : nil) { step in
+                let execution = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body, toPid: background ? framePid : nil, turn: turn,
+                    context: context) { step in
                     guard let event = step.keyEvent else { return nil }
                     if event.down {
                         guard !Task.isCancelled,
-                              MacDriverContext.binding?.allowsEmission == true,
+                              context.driver?.allowsEmission(context: context) == true,
                               !eventSink.secureKeyboardEntryActive,
-                              accessibilityActSource.focusedWindow(pid: framePid)?.handle == actWindow.handle,
-                              accessibilityActSource.isFocusedElement(target, pid: framePid) else {
+                              accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context)?.handle == actWindow.handle,
+                              accessibilityActSource(context: context).isFocusedElement(target, pid: framePid, context: context) else {
                             return self.injectionRefusal(action: "act", error: "focus_moved")
                         }
                         if continuation.isPending {
-                            guard continuation.refusal() == nil,
-                                  let current = accessibilityActSource.textInput(target),
+                            guard continuation.refusal(context: context) == nil,
+                                  let current = accessibilityActSource(context: context).textInput(target, context: context),
                                   current.value == before.value, current.selection == before.selection else {
                                 return self.injectionRefusal(action: "act", error: "stale_continuation_target")
                             }
@@ -331,12 +335,10 @@ extension SwiftNativeMacControl {
                 return continuationResult("continuation_insertion_outcome_unknown")
             }
         }
-        let beforeValueWrite = accessibilityActSource.reread(target)?.value
+        let beforeValueWrite = accessibilityActSource(context: context).reread(target, context: context)?.value
         var valueWrite: MacActPerformed?
         if background { valueWrite = await typeInBackground(text) }
-        // AXSetValue first: that is how you fill a field without
-        // simulating 40 keystrokes, and it cannot be intercepted by
-        // whatever else has focus. Not when real keystrokes were asked for.
+        // AXSetValue cannot be intercepted by another focused field; explicit keystroke requests still select the keyboard contract.
         else if !keystrokes {
             let result = await ledgeredActuatorAct(action: nil, value: text, target: target)
             valueWrite = summarize(result, target: target, actedHandle: handle, text: text)
@@ -352,16 +354,14 @@ extension SwiftNativeMacControl {
             let focusOutcome = ledgeredSetFocused(target)
             let focusMethod = focusOutcome == .performed ? "ax_focus" : "none"
             guard focusOutcome == .performed else {
-                // No focus, no honest keystroke target: typing now would land
-                // wherever the focus already was. Report instead of scattering
-                // text across the app.
+                // No focus, no honest keystroke target: typing now would land wherever the focus already was. Report instead of scattering text across the app.
                 return MacActPerformed(
                     ok: false,
                     method: "none",
                     requestedAction: "type",
                     error: "focus_not_settable",
                     target: target,
-                    postState: accessibilityActSource.reread(target),
+                    postState: accessibilityActSource(context: context).reread(target, context: context),
                     actedHandle: handle,
                     extra: ["focus_method": .string(focusMethod)]
                 )
@@ -373,7 +373,7 @@ extension SwiftNativeMacControl {
                     requestedAction: "type",
                     error: "event_injection_unavailable",
                     target: target,
-                    postState: accessibilityActSource.reread(target),
+                    postState: accessibilityActSource(context: context).reread(target, context: context),
                     actedHandle: handle,
                     extra: ["focus_method": .string(focusMethod)]
                 )
@@ -388,7 +388,7 @@ extension SwiftNativeMacControl {
                     requestedAction: "type",
                     error: refusal.reason,
                     target: target,
-                    postState: accessibilityActSource.reread(target),
+                    postState: accessibilityActSource(context: context).reread(target, context: context),
                     actedHandle: handle,
                     extra: [
                         "posted_events": .int(0),
@@ -401,16 +401,19 @@ extension SwiftNativeMacControl {
             func holdsFocus() -> Bool {
                 for attempt in 0..<12 {
                     if attempt > 0 { Thread.sleep(forTimeInterval: 0.025) }
-                    if accessibilityActSource.isFocusedElement(target, pid: framePid) { return true }
+                    if accessibilityActSource(context: context).isFocusedElement(target, pid: framePid, context: context) { return true }
                 }
                 return false
             }
             guard holdsFocus() else {
                 return MacActPerformed(ok: false, method: "ax_focus", requestedAction: "type",
                     error: "target_not_focused", target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: ["posted_events": .int(0), "focus_method": .string(focusMethod),
-                        "guidance": .string("Accessibility focus was accepted but this field did not acquire keyboard focus. Read the app again before typing; no keys were posted.")])
+                        "guidance": .string("""
+                            Accessibility focus was accepted but this field did not acquire keyboard focus. Read the app again before typing; no keys were \
+                            posted.
+                            """)])
             }
             if let refusal = refuseInput("type") { return refusal }
             // Select all only in single-line fields; document bodies retain their insertion selection.
@@ -418,34 +421,35 @@ extension SwiftNativeMacControl {
                 MacActPerformed(
                     ok: false, method: "keystroke_injection", requestedAction: "type",
                     error: error, target: target,
-                    postState: accessibilityActSource.reread(target), actedHandle: handle,
+                    postState: accessibilityActSource(context: context).reread(target, context: context), actedHandle: handle,
                     extra: ["focus_method": .string(focusMethod)]
                 )
             }
-            guard let focused = await waitForTextFocus(pid: framePid, target: target, clickPoint: nil) else {
+            guard let focused = await waitForTextFocus(pid: framePid, target: target, clickPoint: nil, context: context) else {
                 return typingFailure("text_editor_not_ready")
             }
-            let input = accessibilityActSource.textInput(focused)
+            let input = accessibilityActSource(context: context).textInput(focused, context: context)
             if let refusal = refuseInput("type") { return refusal }
             let replacesField = ["AXTextField", "AXComboBox", "AXSearchField"].contains(target.role)
             if replacesField {
                 guard let input else { return typingFailure("text_selection_not_ready") }
                 if input.selection != NSRange(location: 0, length: input.value.utf16.count) {
                     noteActuation("select_all")
-                    let emission = await executeHand(MacHandRepertoire.chord(MacKeyChord(modifiers: .command, keyCode: 0x00, source: "cmd+a")), action: "act", body: body)
+                    let emission = await executeHand(MacHandRepertoire.chord(MacKeyChord(modifiers: .command, keyCode: 0x00, source: "cmd+a")), action: "act",
+                        body: body, turn: turn, context: context)
                     if let refusal = emission.refusal { return typingFailure(refusal.error ?? "text_selection_not_ready") }
-                    guard await waitForTextInput(pid: framePid, target: input.target, selectedAll: true) != nil else {
+                    guard await waitForTextInput(pid: framePid, target: input.target, selectedAll: true, context: context) != nil else {
                         return typingFailure("text_selection_not_ready")
                     }
                 }
             }
             if let refusal = refuseInput("type") { return refusal }
             var typingRefusal: MacActPerformed?
-            let execution = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body) { step in
+            let execution = await executeHand(MacHandRepertoire.type(text: text), action: "act", body: body, turn: turn, context: context) { step in
                 guard let event = step.keyEvent else { return nil }
                 if event.down {
                     guard !Task.isCancelled,
-                          accessibilityActSource.isFocusedElement(focused, pid: framePid) else {
+                          accessibilityActSource(context: context).isFocusedElement(focused, pid: framePid, context: context) else {
                         return self.injectionRefusal(action: "act", error: "focus_moved")
                     }
                     if let refusal = refuseInput("type") {
@@ -464,7 +468,7 @@ extension SwiftNativeMacControl {
                 requestedAction: "type",
                 error: nil,
                 target: target,
-                postState: accessibilityActSource.reread(target),
+                postState: accessibilityActSource(context: context).reread(target, context: context),
                 actedHandle: handle,
                 extra: [
                     "focus_method": .string(focusMethod),

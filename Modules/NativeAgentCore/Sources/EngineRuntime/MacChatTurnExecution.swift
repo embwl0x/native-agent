@@ -22,7 +22,6 @@ import ChatToolParsing
 import SlackBot
 import TelegramBot
 import TriggerScheduler
-import WorkshopExecution
 import BackgroundLoops
 import AppToolRuntime
 import TrustCenter
@@ -59,7 +58,6 @@ import Experiences
 import CryptoKit
 import ActivityWatch
 import OSLog
-import Procedures
 import SchedulerExecution
 import Darwin
 import Combine
@@ -71,7 +69,7 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `MacChatTurnExecution.swift` | `NativeAgentEngine`: Mac turn streaming, checkpoint resume, clear/archive, retry and lifecycle activity use `TurnsFacade.runtime`; producer joins, transcript publication, settlement and queue release retain their order; `ChatTurnToolPlacement` places canonical tool rows before the live reply |
+// Blueprint: | `MacChatTurnExecution.swift` | `NativeAgentEngine`, `TurnsFacade.runtime`, `ChatTurnToolPlacement`; Ordered stream settlement |
 
 extension NativeAgentEngine {
     @MainActor
@@ -82,6 +80,7 @@ extension NativeAgentEngine {
         generation: Int,
         hideUserBubble: Bool,
         activityIdentity: MacChatTurnIdentity,
+        turn: Turn,
         port: Port,
         client: SwiftNativeChatOrchestrationClient,
         missingProviderGuidance: String?,
@@ -91,15 +90,12 @@ extension NativeAgentEngine {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         let requestSessionId = sessionId
-        let userContent = trimmed.isEmpty ? "(attached \(attachments.count) item(s))" : trimmed
+        let userContent = Self.macChatUserContent(trimmed, attachments: attachments)
         let bubbleId = UUID().uuidString
-        let userTurnId = UUID().uuidString
         // No-provider guidance precedes streaming cleanup because no turn ran.
         if let guidance = missingProviderGuidance {
-            var typedBubble = ChatMessage(sessionId: requestSessionId, role: "user", content: userContent)
-            typedBubble.id = userTurnId
-            port.animateMacChatMutation { transcripts.appendMessage(typedBubble, to: requestSessionId, leads: false) }
-            // Synthetic notices survive reload and retain their retry affordance.
+            showMacChatUserBubble(text, attachments: attachments, sessionId: requestSessionId, turn: turn, port: port, leads: false)
+            // Synthetic notices must survive reload with their retry affordance.
             let guidanceBubble = ChatMessage(
                 id: MacChatTurnRuntime.syntheticErrorIDPrefix + UUID().uuidString,
                 sessionId: requestSessionId,
@@ -115,7 +111,7 @@ extension NativeAgentEngine {
             await InlineInteractionResolver.raiseMissingChatProvider(
                 sessionID: requestSessionId, userContent: userContent,
                 hasAttachments: !attachments.isEmpty,
-                dataRoot: dataRoot
+                dataRoot: dataRoot, turn: turn
             )
             port.presentMacChatTurn(.status("No AI provider connected — connect one with Open Providers in the chat."))
             _ = await port.settleChatTurnLifecycle(
@@ -125,29 +121,10 @@ extension NativeAgentEngine {
             )
             return
         }
-        // Retain only the accepted local request and its preceding conversation
-        // row. If routing fails before the core writes the user, an unchanged
-        // canonical tail can prove that this request still needs persistence.
-        var originalUserBubble = ChatMessage(
-            id: userTurnId, sessionId: requestSessionId, role: "user", content: userContent
-        )
-        if let origin = ChatPersistenceContext.originProvenance {
-            var recorded = ChatMessageOriginMetadata(surface: origin.surface, agent: origin.agent)
-            recorded.authored = origin.authored?.rawValue
-            recorded.peerSources = PeerDataTaint.current?.checkpointSources ?? []
-            recorded.elevatedPeerSources = PeerDataTaint.current?.elevatedSources ?? []
-            var metadata = ChatMessageMetadata()
-            metadata.origin = recorded
-            metadata.envelope = ChatMessageOriginMetadata(surface: origin.surface, agent: origin.agent)
-            originalUserBubble.metadata = metadata
-        }
-
-        // A session switch restores the accepted prompt and its live reply.
         turns.streamingBubbleIds[requestSessionId] = bubbleId
         turns.streamingTexts[requestSessionId] = ""
-        // Optimistic rows belong to the request session, including detached views.
         if !hideUserBubble {
-            port.animateMacChatMutation { transcripts.appendMessage(originalUserBubble, to: requestSessionId) }
+            showMacChatUserBubble(text, attachments: attachments, sessionId: requestSessionId, turn: turn, port: port)
         }
         var streamingBubble = ChatMessage(sessionId: requestSessionId, role: "assistant", content: "")
         streamingBubble.id = bubbleId
@@ -163,16 +140,15 @@ extension NativeAgentEngine {
             turns.streamingBubbleIds[requestSessionId] = nil
         }
 
-        // The user row the screen already shows is the row the core saves (one id).
-        let execution = ChatPersistenceContext.$pinnedUserMessageID.withValue(hideUserBubble ? nil : userTurnId) {
-            ChatStreamExecution.macChatStream(
-                client: client, text: trimmed, attachments: attachments,
-                sessionId: requestSessionId, activityIdentity: activityIdentity, replyRowId: bubbleId,
-                hideUserBubble: hideUserBubble,
-                onScreenPreview: { [turns] in await turns.receiveScreenPreview($0, identity: activityIdentity) },
-                helperSession: { progress in self.standingBotSession(admitted: true, attachments: attachments, progress: progress) }, dataRoot: dataRoot
-            )
-        }
+        // The turn carries the displayed user row id to core persistence.
+        let execution = ChatStreamExecution.macChatStream(
+            client: client, text: trimmed, attachments: attachments,
+            sessionId: requestSessionId, activityIdentity: activityIdentity, replyRowId: bubbleId,
+            hideUserBubble: hideUserBubble,
+            onScreenPreview: { [turns] in await turns.receiveScreenPreview($0, identity: activityIdentity) },
+            helperSession: { progress, _ in self.standingBotSession(admitted: true, attachments: attachments, progress: progress) },
+            dataRoot: dataRoot, turn: turn
+        )
         let outcome: Result<Bool, any Error>
         var consumerWasCancelled = false
         do {
@@ -193,12 +169,12 @@ extension NativeAgentEngine {
                     port.animateMacChatMutation { transcripts.setWorkingCommentary(commentary, id: bubbleId, in: requestSessionId) }
                 }
             }
-            // Clear restore IDs before reload can reinject an empty bubble.
+            // Clear restore ids before reload can reinject an empty bubble.
             if streamProducedNoContent {
                 transcripts.removeMessage(id: bubbleId, from: requestSessionId)
                 turns.clearStreamingBubbleState(requestSessionId)
             }
-            // Wait for the settled reply's crossfade before reloading its saved row into the same bubble id.
+            // Wait for crossfade before reloading the saved reply under the same bubble id.
             if !streamProducedNoContent, turns.isReplyTextSettled(requestSessionId) {
                 await finishReplyPresentation()
             }
@@ -208,7 +184,7 @@ extension NativeAgentEngine {
                 execution: execution, sessionId: requestSessionId, generation: generation
             ) else { return }
             consumerWasCancelled = Task.isCancelled
-            // A reply that said nothing leaves; one that spoke settles into its saved partial (same row id).
+            // Discard silent replies; spoken replies settle into their saved partial under the same id.
             if transcripts.messages(for: requestSessionId).first(where: { $0.id == bubbleId })?.content
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
                 transcripts.removeMessage(id: bubbleId, from: requestSessionId)
@@ -217,7 +193,7 @@ extension NativeAgentEngine {
         }
         let settlement = await port.settleMacChatStream(identity: activityIdentity, result: await execution.waitForProducerTermination())
         let stopped = consumerWasCancelled || settlement.state?.presentation.phase == .canceled
-        // The turn is over: its rows settle into the store's own publication; nothing here re-reads the view.
+        // Settle through store publication rather than re-reading the view.
         transcripts.settleLive(requestSessionId)
         await Task { [self] in
         switch stopped ? nil : outcome {
@@ -249,9 +225,9 @@ extension NativeAgentEngine {
                             + (isRefusal ? " outcome unknown — inspect before retry." : ""),
                         metadata: metadata
                     )
-                    // A request the store never took is still on screen as its live row; the notice says so for Try again.
+                    // Keep unsaved requests visible with their retry notice.
                     if !hideUserBubble, let saved = try? await transcripts.loadMessages(sessionId: requestSessionId, cached: true),
-                       !saved.contains(where: { $0.id == originalUserBubble.id }) {
+                       !saved.contains(where: { $0.id == turn.rows.pinnedUserMessageID }) {
                         notice.metadata?.syntheticUserRowPersisted = false
                     }
                     port.animateMacChatMutation { transcripts.appendMessage(notice, to: requestSessionId, leads: false) }
@@ -265,13 +241,42 @@ extension NativeAgentEngine {
         }.value
     }
 
+    /// The person's optimistic row, scoped to its request session (detached views included) under the id its turn pins;
+    /// shown once, by whichever path shows it first, so an arrival that waited is never appended twice.
+    @MainActor
+    public func showMacChatUserBubble<Port: MacChatTurnPresentationPort>(
+        _ text: String, attachments: [NativeAgentShared.MultimodalAttachment], sessionId: String, turn: Turn, port: Port,
+        leads: Bool = true
+    ) {
+        guard let id = turn.rows.pinnedUserMessageID,
+              !transcripts.messages(for: sessionId).contains(where: { $0.id == id }) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var bubble = ChatMessage(id: id, sessionId: sessionId, role: "user", content: Self.macChatUserContent(trimmed, attachments: attachments))
+        if let origin = turn.origin {
+            var recorded = ChatMessageOriginMetadata(surface: origin.surface, agent: origin.agent)
+            recorded.authored = origin.authored?.rawValue
+            recorded.peerSources = turn.peerSteering?.checkpointSources ?? []
+            recorded.elevatedPeerSources = turn.peerSteering?.elevatedSources ?? []
+            var metadata = ChatMessageMetadata()
+            metadata.origin = recorded
+            metadata.envelope = ChatMessageOriginMetadata(surface: origin.surface, agent: origin.agent)
+            bubble.metadata = metadata
+        }
+        port.animateMacChatMutation { transcripts.appendMessage(bubble, to: sessionId, leads: leads) }
+    }
+
+    /// An attachments-only send still shows a row.
+    nonisolated static func macChatUserContent(_ trimmed: String, attachments: [NativeAgentShared.MultimodalAttachment]) -> String {
+        trimmed.isEmpty ? "(attached \(attachments.count) item(s))" : trimmed
+    }
+
 }
 
 extension NativeAgentEngine {
     @MainActor
     public func resumeMacChatTurn<Port: MacChatTurnPresentationPort>(_ checkpoint: TurnCheckpoint,
         port: Port,
-        operation: @escaping @Sendable () async throws -> Void) async throws {
+        operation: @escaping @Sendable (Turn) async throws -> Void) async throws {
         let macChatTurns = turns.runtime
         let session = checkpoint.sessionId
         let identity = MacChatTurnIdentity(sessionId: session, turnId: checkpoint.turnId)
@@ -283,21 +288,25 @@ extension NativeAgentEngine {
                 turns.streamingTexts[session] = nil
                 turns.streamingBubbleIds[session] = nil
                 turns.replyingSessions.remove(session)
-                // A send queued behind this reservation goes once it is released.
-                if macChatTurns.finishRuntime(sessionId: session, generation: generation) {
-                    Task { @MainActor in await port.drainNextQueuedChatTurnIfPossible(sessionId: session) }
-                }
+                _ = macChatTurns.finishRuntime(sessionId: session, generation: generation)
             }
         }
         await macChatTurns.pendingStopWrites[session]?.value
         let records = try await macChatTurns.lifecycleStore.records()
-        guard let state = records.first(where: { $0.identity == identity })?.restoredState(),
-              macChatTurns.taskGenerations[session] == generation else { throw MacChatTurnLifecycleStoreError.invalidRecord }
+        let state: MacChatTurnLifecycleState
+        if let restored = records.first(where: { $0.identity == identity })?.restoredState() { state = restored }
+        else {
+            // A send saved while the agent worked never began its lifecycle: it begins now, as its own turn.
+            guard await port.beginChatTurnLifecycle(identity: identity, generation: generation, at: Date()).persisted,
+                  let begun = macChatTurns.lifecycleBySession[session] else { throw MacChatTurnLifecycleStoreError.invalidRecord }
+            state = begun
+        }
+        guard macChatTurns.taskGenerations[session] == generation else { throw MacChatTurnLifecycleStoreError.invalidRecord }
         let rows = try await transcripts.loadMessages(sessionId: session)
         try Task.checkCancellation()
         guard macChatTurns.taskGenerations[session] == generation else { throw CancellationError() }
         let bubble = ChatMessage(sessionId: session, runId: checkpoint.runId)
-        // The resumed reply stands over its saved partials while it streams.
+        // Resumed streaming replies supersede their saved partials.
         transcripts.appendLive(bubble, to: session, replacing: Set(rows.filter { $0.runId == checkpoint.runId && $0.metadata?.partial == true }.map(\.id)))
         macChatTurns.activeTurnIDsBySession[session] = identity.turnId
         macChatTurns.lifecycleBySession[session] = state
@@ -305,18 +314,17 @@ extension NativeAgentEngine {
         turns.streamingBubbleIds[session] = bubble.id
 
         let events = AsyncThrowingStream<TurnStreamEvent, Error>.makeStream()
+        let turn = Turn(id: checkpoint.turnId, run: checkpoint.runId, session: session)
+            .with(\.replyStreamRendersCards, true)
+            .with(\.replyRow, .init(turnId: checkpoint.turnId, sessionId: session, messageId: bubble.id))
+            .with(\.screenPreview, { [turns] in await turns.receiveScreenPreview($0, identity: identity) })
         let producer = Task {
             let lease = SessionTurnDelivery.mount(dataRoot: dataRoot, sessionID: session, runID: checkpoint.runId,
                 recipient: .init(progress: { events.continuation.yield($0) }))
             defer { SessionTurnDelivery.unmount(dataRoot: dataRoot, sessionID: session, runID: checkpoint.runId, lease: lease) }
             defer { events.continuation.finish() }
-            do { try await ChatToolSessionContext.$replyStreamRendersCards.withValue(true) {
-                try await MacScreenPreviewBus.$publish.withValue({ [turns] in
-                    await turns.receiveScreenPreview($0, identity: identity)
-                }) {
-                    try await operation()
-                }
-            } } catch { events.continuation.finish(throwing: error); throw error }
+            do { try await operation(turn) }
+            catch { events.continuation.finish(throwing: error); throw error }
         }
         macChatTurns.tasks[session] = Task {
             _ = await withTaskCancellationHandler { await producer.result } onCancel: { producer.cancel() }
@@ -338,9 +346,8 @@ extension NativeAgentEngine {
         turns.streamingTexts[session] = nil
         turns.streamingBubbleIds[session] = nil
         turns.replyingSessions.remove(session)
-        let released = macChatTurns.finishRuntime(sessionId: session, generation: generation)
+        _ = macChatTurns.finishRuntime(sessionId: session, generation: generation)
         transcripts.settleLive(session)
-        if released { await port.drainNextQueuedChatTurnIfPossible(sessionId: session) }
         try outcome.get()
         _ = try rendered.get()
     }
@@ -372,11 +379,11 @@ public extension NativeAgentEngine {
     ) async throws -> Bool {
         guard try await transcripts.archive(id: sessionId) != nil else { return false }
         let runningTask = turns.runtime.tasks[sessionId]
-        // A reservation still reading admission (busy, no task yet) is stopped too.
+        // Stop must include busy reservations still awaiting admission.
         if runningTask != nil || turns.runtime.streamingSessions.contains(sessionId) || turns.runtime.busySessions.contains(sessionId) {
             port.stopChatStream(sessionId: sessionId)
         }
-        // Do not erase the reservation while its producer commits Stop proof.
+        // Retain reservations until their producer commits Stop proof.
         await runningTask?.value
         if runningTask == nil, turns.runtime.activeTurnIDsBySession[sessionId] == nil {
             turns.runtime.taskGenerations[sessionId] = nil
@@ -392,6 +399,7 @@ public extension NativeAgentEngine {
         port: any MacChatTurnPresentationPort,
         target: ChatMessage,
         sessionId: String,
+        parent: Turn?,
         syntheticPrefix: String,
         client: SwiftNativeChatOrchestrationClient,
         presentFailure: @escaping @MainActor (Error) -> Void,
@@ -424,37 +432,29 @@ public extension NativeAgentEngine {
             }
         ) else { return }
         let lifecycleIdentity = admission.identity
-        await port.runAdmittedMacChatRetry(admission, operation: { [self] in
+        let priorText = retrySnapshot.priorUserText
+        // A UI click is the person's local act; chat.regenerate invoked by
+        // another turn keeps that caller's held provenance, nil included.
+        let envelope: TurnEnvelope?
+        if let parent { envelope = parent.envelope }
+        else { envelope = .personOnMac("mac_ui:chat.regenerate") }
+        var retryTurn = TurnRequest(message: priorText, sessionID: sessionId, surface: "chat",
+            envelope: .some(envelope), origin: .some(retrySnapshot.priorUserOrigin),
+            replacementAssistantMessageID: .some(isSyntheticNotice ? nil : target.id))
+            .turn(id: lifecycleIdentity.turnId, parent: parent)
+        retryTurn.rows.replacementUserMessageID = retrySnapshot.userRowPersisted ? retrySnapshot.priorUserMessageId : nil
+        // Save unsaved questions under their displayed id.
+        retryTurn.rows.pinnedUserMessageID = retrySnapshot.userRowPersisted ? nil : retrySnapshot.priorUserMessageId
+        await port.runAdmittedMacChatRetry(admission, operation: { [self] retryTurn in
             turns.runtime.busySessions.insert(sessionId)
             defer { turns.runtime.busySessions.remove(sessionId) }
             let result: Result<ChatResponse, any Error>
             do {
-                let priorText = retrySnapshot.priorUserText
-                let reply = try await TurnTraceContext.$turnId.withValue(lifecycleIdentity.turnId) {
-                    try await TurnRequest(message: priorText, sessionID: sessionId, surface: "chat",
-                        envelope: .some(nil), verifiedSessionID: .some(nil), verifiedChatID: .some(nil),
-                        verifiedUserID: .some(nil), origin: .some(retrySnapshot.priorUserOrigin)).bind {
-                        try await ChatPersistenceContext.$replacementUserMessageID.withValue(
-                            retrySnapshot.userRowPersisted ? retrySnapshot.priorUserMessageId : nil
-                        ) {
-                        // An unsaved question is saved under the id it is shown with.
-                        try await ChatPersistenceContext.$pinnedUserMessageID.withValue(
-                            retrySnapshot.userRowPersisted ? nil : retrySnapshot.priorUserMessageId
-                        ) {
-                            try await TurnRequest(
-                                message: priorText, sessionID: sessionId,
-                                model: "", reasoningEffort: "", attachments: [], persona: nil, surface: "chat",
-                                suppressUserAppend: retrySnapshot.userRowPersisted,
-                                replacementAssistantMessageID: isSyntheticNotice ? nil : target.id
-                            ).bind {
-                                try await client.chatExecution(message: priorText, sessionId: sessionId,
-                                    model: "", reasoningEffort: "", fileAccess: "auto", attachments: [],
-                                    persona: nil, surface: "chat", suppressUserAppend: retrySnapshot.userRowPersisted,
-                                    progress: nil).response
-                            }
-                        }
-                        }
-                    }
+                let reply = try await TurnTraceContext.$turnId.withValue(retryTurn.id) {
+                    try await client.chatExecution(message: priorText, sessionId: sessionId,
+                        model: "", reasoningEffort: "", fileAccess: "auto", attachments: [],
+                        persona: nil, surface: "chat", suppressUserAppend: retrySnapshot.userRowPersisted,
+                        progress: nil, turn: retryTurn, serviceTier: nil).response
                 }
                 result = .success(reply)
             } catch {
@@ -463,7 +463,7 @@ public extension NativeAgentEngine {
             }
             let settlement = await port.settleMacChatStream(identity: lifecycleIdentity, result: result)
             transcripts.settleLive(sessionId)
-            // A retried notice, and the unsaved request it carried, leave once the retry's receipt is canonical.
+            // Remove retried notices and unsaved requests only after the retry receipt is canonical.
             if isSyntheticNotice, settlement.hasCanonicalReceipt {
                 transcripts.removeMessage(id: target.id, from: sessionId)
                 if !retrySnapshot.userRowPersisted { transcripts.removeMessage(id: retrySnapshot.priorUserMessageId, from: sessionId) }
@@ -490,13 +490,13 @@ public extension NativeAgentEngine {
                 }
             }
             return settlement.state?.presentation.phase == .completed
-        }, didComplete: didComplete)
+        }, didComplete: didComplete, turn: retryTurn)
     }
 }
 
 @MainActor
 public extension NativeAgentEngine {
-    /// Publish admitted stream frames through the per-session transcript owner.
+    /// Stream frames publish only through the per-session transcript owner.
     func consumeMacChatStream(
         _ stream: AsyncThrowingStream<TurnStreamEvent, Error>,
         port: any MacChatTurnPresentationPort,
@@ -512,10 +512,14 @@ public extension NativeAgentEngine {
             onTurnActivity: { [weak port] activity in
                 guard let port else { return }
                 await self.receiveChatTurnActivity(activity, port: port)
+            },
+            onMovement: { [weak port] writing in
+                guard let port else { return }
+                await self.receiveChatTurnMovement(writing, identity: activityIdentity, port: port)
             }
         ) { @MainActor [self, requestSessionId] snapshot, length, settled in
             try Task.checkCancellation()
-            // A superseded turn stops publishing; the post-stream guard returns.
+            // Superseded turns must stop publishing before the post-stream guard returns.
             guard turns.runtime.taskGenerations[requestSessionId] == generation else { return }
             turns.streamingTexts[requestSessionId] = snapshot
             if !snapshot.isEmpty, !turns.runtime.replyingSessions.contains(requestSessionId) {
@@ -540,8 +544,7 @@ public extension NativeAgentEngine {
 
 @MainActor
 extension NativeAgentEngine {
-    /// Existing notice and tool activity converges on the lifecycle reducer;
-    /// no second event bus or raw payload store is introduced.
+    /// Reduce notices and tool activity into the existing lifecycle without a second event bus or payload store.
     func receiveChatTurnActivity(_ activity: MacChatTurnActivity, port: any MacChatTurnPresentationPort) {
         guard port.applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
             identity: activity.identity,
@@ -550,6 +553,11 @@ extension NativeAgentEngine {
         )) != nil else { return }
 
         port.presentMacChatTurn(.activity(activity))
+    }
+
+    /// Streamed bytes move the card even before they are words; a writing call names itself there.
+    func receiveChatTurnMovement(_ writing: TurnCallWriting?, identity: MacChatTurnIdentity, port: any MacChatTurnPresentationPort) {
+        _ = port.applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(identity: identity, kind: .moved(writing), occurredAt: Date()))
     }
 
 }

@@ -11,11 +11,10 @@ import PersistenceCore
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `iCloudBridge+Pairing.swift` | Pairing claims reconcile owed key changes from the exact existing Keychain item before reopening signing; the Mac reading of phone connection facts |
+// Blueprint: | `iCloudBridge+Pairing.swift` | Exact-item reconciliation gates signing; account claims and phone connection facts. |
 
 extension iCloudBridge {
-    /// Publish the exact bytes returned by the atomic rotation transaction.
-    /// This avoids a second disk read becoming a different authority decision.
+    /// Publish atomic rotation readback directly so a second read cannot change the authority decision.
     @discardableResult
     public func publishPairingSecret(_ secret: Data) async -> Bool {
         let generation = setupGeneration
@@ -24,11 +23,8 @@ extension iCloudBridge {
         return true
     }
 
-    /// A key change is owed to the account's pairing record from before the
-    /// key changes until the record takes it, so no quit or claim in between
-    /// reads this install's own old key as another Mac's. Only a key change
-    /// owes: a move-here the person pressed that failed stays their error to
-    /// retry, never a standing claim.
+    /// Keep key publication owed until the account accepts it, so interrupted rotation cannot look like another Mac's claim. Failed person-requested moves
+    /// remain explicit errors, never standing claims.
     public func owePairingPublication(_ owed: Bool) {
         if owed {
             UserDefaults.standard.set(true, forKey: pairingPublicationOwedKey)
@@ -53,8 +49,7 @@ extension iCloudBridge {
         return secret
     }
 
-    /// The account's pairing record takes this Mac's key: the person's act or
-    /// this Mac's own key change. Landing settles anything owed.
+    /// Account acceptance of this Mac's key settles owed publication, regardless of who initiated it.
     private func publishPairing(_ secret: Data) async -> Bool {
         guard let deviceTransport else { return false }
         let published = await PairingSecret.publishMaterial(secret, to: deviceTransport)
@@ -64,10 +59,7 @@ extension iCloudBridge {
         return published
     }
 
-    /// The phone follows one Mac: whichever key the account's Mac pairing
-    /// record holds. Launch takes that record only when it is free or already
-    /// this Mac's. Another Mac keeps the phone until the person moves it here
-    /// (`usePhoneHere`), so launching a second Mac never takes the phone.
+    /// Claim only a free or self-held account record; another Mac keeps the phone until the person explicitly moves it here.
     public func claimPhonePairing() async {
         guard let transport = deviceTransport, sync.engine.pairingSecretRotation != .writing else { return }
         let generation = setupGeneration
@@ -97,7 +89,7 @@ extension iCloudBridge {
             }
         }
         guard generation == setupGeneration, let held else { return }
-        // The account answered; a stored account failure is no longer true.
+        // A successful account answer supersedes the stored account failure.
         if accountFailure != nil, accountGeneration == accountFailureGeneration { await clearAccountFailure() }
         if held {
             notePairingHeld()
@@ -106,7 +98,6 @@ extension iCloudBridge {
         }
     }
 
-    /// The person's act: move the phone to this Mac.
     @discardableResult
     public func usePhoneHere() async -> Bool {
         guard deviceTransport != nil, sync.engine.pairingSecretRotation != .writing else { return false }
@@ -121,9 +112,7 @@ extension iCloudBridge {
         }
     }
 
-    /// This Mac holds the pairing. Coming out of silence (launch, or another
-    /// Mac had the phone), everything it has for the phone goes out afresh:
-    /// the other Mac may have written over all of it.
+    /// Reclaim republishes all phone projections because another Mac may have overwritten them while this Mac was silent.
     private func notePairingHeld() {
         let wasSpeaking = speaksToPhone
         let wasElsewhere = phonePairedElsewhere
@@ -133,7 +122,6 @@ extension iCloudBridge {
         lastPublishedProviderCatalogStatus = nil
         lastPublishedMobileSnapshotStatus.removeAll()
         if wasElsewhere {
-            // The drain and the presence republish below record their own pulses.
             doctorTransportHealth = .unmeasured
         }
         Task.detached(priority: .utility) { await PairingSecret.publishMaterialToKVS() }
@@ -161,7 +149,24 @@ extension iCloudBridge {
         if contact > (lastPhoneContactAt ?? .distantPast) { lastPhoneContactAt = contact }
     }
 
+    /// Contact is the saved signed evidence; the shared key carries no device identity, so it says that a phone spoke, never which one.
+    /// Unreadable evidence is unknown, never silence.
+    func standing(of rows: [PairedPhoneStore.Phone]) -> NAPhoneStanding {
+        let live = rows.filter { $0.status != .removed }
+        let connected: Bool? = lastPhoneContactAt != nil ? true : phoneContactReadFailure != nil ? nil : false
+        return NAPhoneStanding(connected: connected, waiting: live.filter { $0.status == .pending }.count,
+                               approvers: live.filter { $0.status == .paired }.count)
+    }
+
+    /// The same standing from a checked read of paired_phones.json, for a verdict that must not rest on the published copy. Nil when it can't be read.
+    public func checkedPhoneStanding() async -> NAPhoneStanding? {
+        guard let rows = await sync.pairedPhones.checkedPhones() else { return nil }
+        return standing(of: rows)
+    }
+
     func refreshPhoneConnection() {
+        let current = standing(of: sync.pairedPhones.phones)
+        if current != phoneStanding { phoneStanding = current }
         let next = NAPhoneConnection(pairing: phonePairingFact, transport: phoneTransportFact, exchange: phoneExchangeFact)
         if next != phoneConnection { phoneConnection = next }
     }
@@ -180,19 +185,18 @@ extension iCloudBridge {
                          owner: .personOnMac,
                          lever: "Choose Connectors → iPhone → Use my iPhone with this Mac to disconnect it from the other Mac and connect it here.")
         }
-        let phones = sync.pairedPhones.phones.filter { $0.status != .removed }
-        if phones.contains(where: { $0.status == .pending }) {
-            return .init(.waiting, "An iPhone is waiting for you to pair it.", owner: .personOnMac,
+        if phoneStanding.waiting > 0 {
+            return .init(.waiting, phoneStanding.line, owner: .personOnMac,
                          lever: "Open Connectors → iPhone, match the code the iPhone shows, then choose Pair.")
         }
-        guard phones.contains(where: { $0.status == .paired }) else {
-            return .init(.waiting, "No iPhone is paired yet.", owner: .personOnPhone,
+        guard phoneStanding.canApprove else {
+            return .init(.waiting, phoneStanding.line, owner: .personOnPhone,
                          lever: "Open NativeAgent on your iPhone, signed in to this Apple Account, and tap Connect.")
         }
         if deviceTransport != nil, !phonePairingSettled {
             return .init(.waiting, "Paired; checking in iCloud that this Mac still holds the pairing.")
         }
-        return .init(.holds, "Paired with your iPhone.")
+        return .init(.holds, phoneStanding.line)
     }
 
     private var phoneTransportFact: NAPhoneConnection.Fact {
@@ -244,7 +248,10 @@ extension iCloudBridge {
         }
         if let rejected = lastPhoneRejectedAt, rejected > (lastPhoneContactAt ?? .distantPast) {
             return .init(.broken,
-                         "Turned away the iPhone's last message (\(rejected.formatted(date: .abbreviated, time: .shortened))): it was signed with a key this Mac does not hold.",
+                         """
+                             Turned away the iPhone's last message (\(rejected.formatted(date: .abbreviated, time: .shortened))): it was signed with a key \
+                             this Mac does not hold.
+                             """,
                          owner: .personOnPhone,
                          lever: "On the iPhone, open Settings › Connection and choose Pair with Mac.")
         }

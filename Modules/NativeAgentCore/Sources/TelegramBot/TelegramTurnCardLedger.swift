@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `TelegramTurnCardLedger.swift` | `TelegramTurnCardLedger` actor; one owner per canonical ledger path across poll-loop replacements serializes `upsert` and `remove`; `TelegramTurnCardRestartRepairer` owns one repair task and shutdown |
+// Blueprint: | `TelegramTurnCardLedger.swift` | `TelegramTurnCardLedger`, `upsert`, `remove`, `TelegramTurnCardRestartRepairer` |
 
 struct TelegramPersistedTurnCard: Sendable, Codable, Equatable {
     let turnId: UUID
@@ -34,9 +34,7 @@ enum TelegramTurnCardLedgerError: Error, Sendable, Equatable {
     case capacityExceeded(Int)
 }
 
-/// Bounded, actor-owned identity ledger shared across poll-loop replacements.
-/// It intentionally stores no prompt,
-/// action, delegate, reply, token, or provider content.
+/// Share bounded identity across loop replacements without retaining prompts, replies, tokens or provider content.
 actor TelegramTurnCardLedger {
     private static let ownerLock = NSLock()
     nonisolated(unsafe) private static var owners: [String: TelegramTurnCardLedger] = [:]
@@ -141,8 +139,7 @@ actor TelegramTurnCardLedger {
         return try currentRecords()
     }
 
-    // Actor isolation alone does not own the transaction while storage awaits.
-    // Readers participate too, including the initial load and cache publication.
+    // Actor isolation alone does not own the transaction while storage awaits. Readers participate too, including the initial load and cache publication.
     private func acquireStorage() async {
         if !storageOwned {
             storageOwned = true
@@ -175,9 +172,7 @@ struct TelegramTurnCardRepairResult: Sendable, Equatable {
     let failures: [String]
 }
 
-/// Repairs each identity once per process-owned poll-loop instance. A prior active card is
-/// edited in place to outcome-unknown and its controls are cleared. No new
-/// card is ever created and no completion is inferred.
+/// Repair interrupted cards in place as outcome-unknown; never create another card or infer completion.
 actor TelegramTurnCardRestartRepairer {
     typealias EditCard = @Sendable (
         _ token: String,
@@ -198,8 +193,7 @@ actor TelegramTurnCardRestartRepairer {
     private var attemptedCards: Set<UUID> = []
     private var repairTask: Task<Void, Never>?
     private var isShuttingDown = false
-    /// Cards this repair marked interrupted, by chat, so a recovered reply
-    /// resent into that chat can take its card away.
+    /// Cards this repair marked interrupted, by chat, so a recovered reply resent into that chat can take its card away.
     private var interruptedCards: [Int: [Int]] = [:]
 
     init(ledger: TelegramTurnCardLedger) {
@@ -221,8 +215,7 @@ actor TelegramTurnCardRestartRepairer {
         isShuttingDown = false
     }
 
-    /// Only when the chat has exactly one: with several, which card belongs
-    /// to the resent reply is unknown, so all of them stay.
+    /// Only when the chat has exactly one: with several, which card belongs to the resent reply is unknown, so all of them stay.
     func takeInterruptedCard(chatId: Int) -> Int? {
         guard let ids = interruptedCards[chatId], ids.count == 1 else { return nil }
         interruptedCards[chatId] = nil
@@ -246,7 +239,6 @@ actor TelegramTurnCardRestartRepairer {
             )
         }
 
-        // A missing message counts as a settled card edit.
         func edit(_ record: TelegramPersistedTurnCard, _ text: String) async throws {
             do {
                 try await editCard(
@@ -271,7 +263,6 @@ actor TelegramTurnCardRestartRepairer {
             guard !active, attemptedCards.insert(record.turnId).inserted else { continue }
             if record.phase.isTerminal {
                 do {
-                    // Delete completed cards once their replies land.
                     if record.phase == .completed {
                         do {
                             try await deleteCard(token, record.chatId, record.messageId)
@@ -294,9 +285,7 @@ actor TelegramTurnCardRestartRepairer {
                 interruptedCards[record.chatId, default: []].append(record.messageId)
                 repaired += 1
             } catch {
-                // Preserve the active identity for a future process start. An
-                // ambiguous edit may already have repaired the card, and the
-                // validator's not-modified handling makes that retry safe.
+                // Retain ambiguous repair identities for restart; the API's not-modified response makes repeated edits safe.
                 failures.append(safe(error))
             }
         }

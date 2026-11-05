@@ -4,24 +4,18 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `OwnedProgramRunner.swift` | source/version-bound idle opened turn programs with exclusive leases, retained evaluated bodies and realms, fresh per-call input/host journals, four-root retention and quit retirement; turn admission attempts once and reports resource_unavailable on spawn exhaustion; lazy proof-scoped helper reuse across fixtures and decision replays with fresh contexts and journals; Invocation-bound selection/dependency proof shared until canonical catalog revision changes; shared program execution, resident helper leases invalidated by canonical ability changes/removal, and what a resident ability holds (`holding`, one broker per resident life) kept in the same slot, selected under the store lock, surviving a failed run's dropped helper; busy-resident vacancy waits use ScopedWaiter and remove only their own parker on cancellation; retirement closes admission and retains teardown through completion before replacement publication, and terminal quit (`endResidents`) removes the catalog observer and drains teardown; helper-owned one-second process-tree RSS sampling remains because no equivalent threshold event is confirmed; fresh per-call authority/journal and resume freshness; host calls carry the part and its input in SkillRunContext; `host.state.get/set` for tools and skills reaches AbilityStore's notebook by part id (scratch for preview/validation); skill resume replays saved state results then persists new state operations normally, without renewing stalled execution; authored tools receive frozen home/workspace paths and their requesting data root; rooted file calls resolve app_data/workspace before the door and return the door's paged result unchanged; `ReadContent` collects owner-declared envelope projections and content dependencies, sharing normalization with replay argument comparisons without changing replies; a ledger row for a batch call carries its receipts' effects |
-/// One helper implementation, with isolated contexts. Sense subscriptions keep
-/// a process through their adapter; resident tools and skills retain the same
-/// transport between calls. Authority is supplied afresh on every run.
+// Blueprint: | `OwnedProgramRunner.swift` | `holding`, `endResidents`, `host.state.get/set`, `ReadContent`: resident leases, replay and receipts |
+/// Reuse helper transport with isolated contexts and fresh authority on every run.
 public struct OwnedProgramRunner: OwnedProgramRunning {
     public static let sourceLimit = AbilityStore.sourceLimit
-    /// Script action/read caps and default I/O bounds. Abilities bypass the
-    /// action/read caps; ability and turn I/O uses OwnedProgram's 4 MiB bounds.
+    /// Abilities bypass script action/read caps but retain OwnedProgram's 4 MiB I/O bounds.
     public static let actionLimit = 50
     public static let readLimit = 100
     public static let returnLimit = 16 * 1024
     public static let logLimit = 2 * 1024
     public static let inputLimit = 16 * 1024
     public static let stepLimit = 50
-    /// The selection and dependency proof belong to the invocation. Concurrent
-    /// calls share its refresh; a failed refresh stays failed until an owner changes.
-    /// Invocation cancellation cancels that flight; a retired generation can
-    /// never validate a newer revision, even if its refresh ignored cancellation.
+    /// Share dependency refresh within an invocation; failure lasts until owner change, and retired generations cannot validate newer revisions.
     public actor Binding {
         private var revision: [String]
         private var checked: Task<Void, Error>?
@@ -54,9 +48,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     private let sandboxProfile: SandboxProfile
     private static let residents = Residents()
     private static let turnHelpers = TurnHelpers()
-    /// Idle opened programs only. An active turn owns its lease exclusively; another
-    /// turn never waits for it. Source/version/limits must match exactly, and a
-    /// new call replaces input while retaining the evaluated body and realm.
+    /// Only idle programs may be pooled; active leases are exclusive and exact source, version and limits must match before reusing the body and realm.
     private final class TurnHelpers: @unchecked Sendable {
         private let lock = NSLock()
         private var closed = false
@@ -75,7 +67,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 lock.withLock {
                     guard !closed, process.isRunning, process.failure == nil else { process.stop(); return }
                     idle.removeValue(forKey: key)?.1.stop()
-                    // Bound retained helpers across data roots, never by age.
+                    // Bound retained helpers across roots without expiring them by age.
                     if idle.count >= 4, let first = idle.keys.sorted().first { idle.removeValue(forKey: first)?.1.stop() }
                     idle[key] = (program, process)
                 }
@@ -88,22 +80,21 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         private var closed = false
         private var observer: NSObjectProtocol?
         private var teardowns: [String: (id: UUID, task: Task<Void, Never>)] = [:]
-        /// One resident program: its helper while it has one, and what it
-        /// holds (an ability's programs and connections), which outlives a
-        /// helper a failed run dropped.
+        /// Resident holdings must outlive helpers dropped by failed runs.
         private struct Slot {
             let program: OwnedProgram
             var process: OwnedProgramProcess?
             var held: (value: AnyObject, end: @Sendable () async -> Void)?
             var busy = false
-            /// Stops its helper; returns what ends what it held.
             func stop() -> (@Sendable () async -> Void)? { process?.stop(); return held?.end }
         }
         private var slots: [String: Slot] = [:] {
-            didSet { for key in Array(vacancies.keys) where slots[key]?.busy != true && teardowns[key] == nil { vacancies.removeValue(forKey: key)?.forEach { $0.resume() } } }
+            didSet {
+                for key in Array(vacancies.keys) where slots[key]?.busy != true && teardowns[key] == nil {
+                    vacancies.removeValue(forKey: key)?.forEach { $0.resume() }
+                }
+            }
         }
-        /// The slots a wake was turned away from, busy with another call, and
-        /// the wakes waiting for one to free.
         private var turnedAway: Set<String> = []
         private var vacancies: [String: [ScopedWaiter]] = [:]
         init() {
@@ -112,7 +103,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 self.lock.withLock { self.retire(key) }
             }
         }
-        /// Under the pool lock: remove admission before starting retained teardown.
+        /// Under the pool lock, remove admission before starting retained teardown.
         private func retire(_ key: String) {
             guard let slot = slots[key] else { return }
             if let end = slot.stop() {
@@ -132,8 +123,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             try Task.checkCancellation()
             let key = store.root.appendingPathComponent(program.id).path
             while let flight = try AbilityStore.withLock({ () throws -> Task<Void, Never>? in
-                // Revalidate after every teardown await before retiring or
-                // publishing anything: a stale caller cannot retire its successor.
+                // Revalidate after teardown awaits so stale callers cannot retire or replace their successors.
                 try selected(store, program)
                 return try lock.withLock {
                     guard !closed else { throw CancellationError() }
@@ -148,7 +138,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         private func admit(_ key: String) throws {
             guard !closed, teardowns[key] == nil else { throw CancellationError() }
         }
-        /// Under the store's lock: only the selected version takes, or replaces, its slot.
+        /// Only the selected version may take or replace its slot under the store lock.
         private func selected(_ store: AbilityStore, _ program: OwnedProgram) throws {
             guard let selected = try store.read(id: program.id), selected.kind == .part,
                   selected.record["codeFingerprint"] == .string(program.version), selected.bodyDigest == program.digest,
@@ -175,14 +165,14 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             }
         }
         func turnAway(_ key: String) { lock.withLock { _ = turnedAway.insert(key) } }
-        func waitIfTurnedAway(_ key: String) async -> Bool {
+        func waitIfTurnedAway(_ key: String, deadline: ContinuousClock.Instant?) async -> Bool {
             guard lock.withLock({ turnedAway.remove(key) != nil }) else { return false }
             let vacancy = ScopedWaiter()
             lock.withLock {
                 if !closed && (slots[key]?.busy == true || teardowns[key] != nil) { vacancies[key, default: []].append(vacancy) }
                 else { vacancy.resume() }
             }
-            await vacancy.park()
+            await vacancy.park(budget: .init(deadline: deadline))
             lock.withLock {
                 vacancies[key]?.removeAll { $0 === vacancy }
                 if vacancies[key]?.isEmpty == true { vacancies.removeValue(forKey: key) }
@@ -203,14 +193,16 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             for flight in flights { await flight.value }
         }
         func take(_ store: AbilityStore, program: OwnedProgram, create: () throws -> OwnedProgramProcess) throws -> OwnedProgramProcess {
-            // Selection and lease publication share the mutation lock, in store/pool order.
+            // Selection and lease publication share the mutation lock in store/pool order.
             try AbilityStore.withLock {
                 try selected(store, program)
                 return try lock.withLock {
                     let key = store.root.appendingPathComponent(program.id).path
                     try admit(key)
                     if let slot = slots[key] {
-                        guard !slot.busy else { throw SenseFailure(code: "busy", message: "Resident ability \(program.id) is already running; wait for its call to finish.") }
+                        guard !slot.busy else {
+                            throw SenseFailure(code: "busy", message: "Resident ability \(program.id) is already running; wait for its call to finish.")
+                        }
                         if slot.program == program, let process = slot.process, process.isRunning, process.failure == nil {
                             slots[key]?.busy = true
                             return process
@@ -225,15 +217,16 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 }
             }
         }
-        /// A resumed run's lease: its slot busy for it as for a live run, so
-        /// the two never overlap on what it holds; its helper its own.
+        /// Resume takes the resident slot's exclusive lease so live calls cannot overlap its holdings.
         func lease(_ store: AbilityStore, program: OwnedProgram) throws -> String {
             try AbilityStore.withLock {
                 try selected(store, program)
                 return try lock.withLock {
                     let key = store.root.appendingPathComponent(program.id).path
                     try admit(key)
-                    guard slots[key]?.busy != true else { throw SenseFailure(code: "busy", message: "Resident ability \(program.id) is already running; wait for its call to finish.") }
+                    guard slots[key]?.busy != true else {
+                        throw SenseFailure(code: "busy", message: "Resident ability \(program.id) is already running; wait for its call to finish.")
+                    }
                     slots[key, default: Slot(program: program)].busy = true
                     return key
                 }
@@ -247,7 +240,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 guard slots[key]?.process === process else { return }
                 slots[key]?.busy = false
                 if keep { return }
-                // A failed run drops its helper and context; what it holds stays.
+                // A failed run drops its helper and context without releasing resident holdings.
                 process.stop(); slots[key]?.process = nil
                 if slots[key]?.held == nil { slots.removeValue(forKey: key) }
             }
@@ -263,10 +256,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 dataRoot: dataRoot, personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
         }
     }
-    /// One helper held by its caller across calls of one resident program (her
-    /// turn: every step of a turn in one process). Ordinary holds stop on
-    /// release; turn leases return healthy opened programs to the source-bound
-    /// idle pool. A failed call stops either kind.
+    /// Ordinary holds stop on release; healthy turn leases return to the source-bound idle pool. Any failed call stops its helper.
     public final class Held: @unchecked Sendable {
         fileprivate let process: OwnedProgramProcess
         public let reused: Bool
@@ -278,8 +268,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         deinit { if let release { release(process) } else { process.stop() } }
     }
     public func hold() throws -> Held { Held(try spawn()) }
-    /// One admission attempt, with no capacity wait or retry. The caller can
-    /// end an accepted turn even when helper resources never become available.
+    /// Attempt admission once without capacity waits so callers can end accepted turns even if helper resources never become available.
     public func holdTurn(_ program: OwnedProgram) throws -> Held {
         try Task.checkCancellation()
         guard program.kind == .turn, program.isResident else {
@@ -293,23 +282,15 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 remedy: failure.remedy)
         }
     }
-    /// What a resident program holds beside its helper (an ability's programs
-    /// and connections), in its resident slot: one for its resident life, made
-    /// on its first live run of the selected version and ended with the slot,
-    /// when its ability changes (off, a new version, dropped) or the app quits;
-    /// never by a run, a failed one included.
+    /// Keep holdings for the selected resident lifetime, ending only with selection changes or app quit, never with a completed or failed run.
     public static func holding<Held: AnyObject & Sendable>(_ program: OwnedProgram, dataRoot: URL, make: () -> Held,
                                                            end: @escaping @Sendable (Held) async -> Void) async throws -> Held {
         try await residents.holding(AbilityStore(dataRoot: dataRoot), program: program, make: make, end: end)
     }
-    /// The app is quitting: every resident helper ends, and what each held.
     public static func endResidents() async { turnHelpers.end(); await residents.end() }
-    /// Whether the wake that just ran ability `id` was turned away, its
-    /// resident slot busy with another call: if so, waits for release,
-    /// cancellation or the inherited deadline. Waking is no vacancy verdict;
-    /// the caller checks cancellation and revalidates admission.
-    public static func waitedForSlot(_ id: String, dataRoot: URL) async -> Bool {
-        await residents.waitIfTurnedAway(AbilityStore(dataRoot: dataRoot).root.appendingPathComponent(id).path)
+    /// Wait only for release, cancellation or the supplied deadline; wake is not proof of vacancy, so revalidate admission afterward.
+    public static func waitedForSlot(_ id: String, dataRoot: URL, deadline: ContinuousClock.Instant?) async -> Bool {
+        await residents.waitIfTurnedAway(AbilityStore(dataRoot: dataRoot).root.appendingPathComponent(id).path, deadline: deadline)
     }
     private func spawn() throws -> OwnedProgramProcess {
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("program-\(UUID().uuidString)")
@@ -318,29 +299,27 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         do { return try OwnedProgramProcess(helper: helperURL, profile: sandboxProfile(scratch), scratch: scratch) }
         catch { try? FileManager.default.removeItem(at: scratch); throw error }
     }
-    /// Stop kills the helper immediately and cancels its host work. The host's
-    /// actual terminal result still joins the journal before the receipt leaves;
-    /// it cannot resume the stopped helper or issue another effect.
+    /// Stop kills the helper and cancels host work; join the host's actual result into the journal before returning without resuming the helper.
     public func run(_ program: OwnedProgram, input: JSONValue? = nil, preview: Bool = false,
-                    replay: Replay? = nil, host: any OwnedProgramHostProfile) async -> JSONValue {
-        await run(program, input: input, preview: preview, replay: replay, host: host, held: nil)
+                    replay: Replay? = nil, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution) async -> JSONValue {
+        await run(program, input: input, preview: preview, replay: replay, host: host, execution: execution, held: nil)
     }
-    public func run(_ program: OwnedProgram, input: JSONValue, host: any OwnedProgramHostProfile, on held: Held) async -> JSONValue {
-        await run(program, input: input, preview: false, replay: nil, host: host, held: held)
+    public func run(_ program: OwnedProgram, input: JSONValue, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution,
+        on held: Held) async -> JSONValue {
+        await run(program, input: input, preview: false, replay: nil, host: host, execution: execution, held: held)
     }
-    /// One proof owns one helper, started only if a fixture actually runs.
-    /// Every fixture still gets a fresh journal and JavaScript context.
+    /// A proof may reuse its lazily opened helper, but every fixture needs a fresh journal and context.
     public func rehearsal() -> any OwnedProgramRunning { Rehearsal(runner: self) }
     private actor Rehearsal: OwnedProgramRunning {
         let runner: OwnedProgramRunner
         var held: Held?
         init(runner: OwnedProgramRunner) { self.runner = runner }
         func run(_ program: OwnedProgram, input: JSONValue?, preview: Bool,
-                 replay: Replay?, host: any OwnedProgramHostProfile) async -> JSONValue {
+                 replay: Replay?, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution) async -> JSONValue {
             do {
                 try Task.checkCancellation()
                 if held == nil { held = try runner.hold() }
-                return await runner.run(program, input: input, preview: preview, replay: replay, host: host, held: held)
+                return await runner.run(program, input: input, preview: preview, replay: replay, host: host, execution: execution, held: held)
             } catch {
                 let failure = error as? SenseFailure
                 return .object(["status": .string("failed"), "effects": .string("none"), "error": .object([
@@ -349,52 +328,57 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             }
         }
     }
-    /// What woke the part this run serves: its signal, time and payload. It
-    /// reaches the part as `input.wake`, beside its own declared input and past
-    /// every params check, and never reaches a part that part runs in turn.
-    @TaskLocal public static var wake: JSONValue?
-    /// Whether a run was turned away before any of it ran, its resident slot busy with another call.
     public static func turnedAway(_ receipt: JSONValue) -> Bool {
         guard case .object(let fields) = receipt, case .object(let error)? = fields["error"] else { return false }
         return error["reason"] == .string("busy") && error["origin"] == .string("runtime")
     }
     func run(_ program: OwnedProgram, input: JSONValue?, preview: Bool, replay: Replay?,
-                     host: any OwnedProgramHostProfile, held: Held?) async -> JSONValue {
-        if let wake = Self.wake, program.isPart {
+                     host: any OwnedProgramHostProfile, execution: OwnedProgramExecution, held: Held?) async -> JSONValue {
+        if let wake = execution.wake, program.isPart {
             var fields: [String: JSONValue] = if case .object(let fields)? = input { fields } else { [:] }
             fields["wake"] = wake
-            let receipt = await Self.$wake.withValue(nil) {
-                await run(program, input: .object(fields), preview: preview, replay: replay, host: host, held: held)
-            }
-            // A resume is no wake's delivery: none waits on its slot.
+            var next = execution
+            next.wake = nil
+            let receipt = await run(program, input: .object(fields), preview: preview, replay: replay, host: host, execution: next, held: held)
+            // Resume does not deliver a wake, so no wake waits on its slot.
             if replay == nil, Self.turnedAway(receipt) {
                 Self.residents.turnAway(AbilityStore(dataRoot: dataRoot).root.appendingPathComponent(program.id).path)
             }
             return receipt
         }
-        var receipt = await execute(program, input: input, preview: preview, replay: replay, host: host, held: held)
-        // An ad hoc app script is not a part: it leaves no evidence on any ability.
+        var receipt = await execute(program, input: input, preview: preview, replay: replay, host: host, execution: execution, held: held)
+        // Ad hoc scripts must not leave ability evidence because they are not parts.
         if !preview, program.kind != .script, program.entry != .face, !(host is OwnedProgramFixtures) {
-            let observed = OwnedProgramInvocation.dependencySnapshot
+            let observed = execution.dependencySnapshot
             receipt = await AbilityStore(dataRoot: dataRoot).settleRun(id: program.id, version: program.version,
                 receipt: receipt, input: replay == nil ? input : nil,
-                dependencySnapshot: observed?.id == program.id && observed?.version == program.version ? observed?.shapes : nil)
+                dependencySnapshot: observed?.id == program.id && observed?.version == program.version ? observed?.shapes : nil, turn: execution.turn)
         }
         return receipt
     }
     private func execute(_ program: OwnedProgram, input: JSONValue?, preview: Bool,
-                         replay: Replay?, host: any OwnedProgramHostProfile, held: Held?) async -> JSONValue {
+                         replay: Replay?, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution, held: Held?) async -> JSONValue {
         let actions = ActionTasks()
-        let receipt = await executeEffect(program, input: input, preview: preview, replay: replay, host: host, held: held, actions: actions)
-        // Child host calls own their settlement too. Stop can end the helper
-        // immediately, but its caller waits for those children before returning.
+        let receipt = await executeEffect(program, input: input, preview: preview, replay: replay, host: host, execution: execution, held: held,
+            actions: actions)
+        // Wait for child host settlement before returning even when Stop has already ended the helper.
         await settle { await actions.finish() }
         return receipt
     }
     private func executeEffect(_ program: OwnedProgram, input: JSONValue?, preview: Bool,
-                         replay: Replay?, host: any OwnedProgramHostProfile, held: Held?, actions: ActionTasks) async -> JSONValue {
+                         replay: Replay?, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution, held: Held?,
+                             actions: ActionTasks) async -> JSONValue {
+        let execution: OwnedProgramExecution = {
+            var held = execution
+            held.input = input; held.preview = preview
+            if var turn = held.turn {
+                turn.partID = program.id; turn.abilityID = program.isPart ? program.id : nil
+                held.turn = turn
+            }
+            return held
+        }()
         let journal = Journal(source: program.source, preview: preview, program: program,
-                              replay: replay, host: host, actionsInFlight: actions, notebookRoot: dataRoot, partID: program.id)
+                              replay: replay, host: host, execution: execution, actionsInFlight: actions, notebookRoot: dataRoot, partID: program.id)
         do {
             try program.validate()
             guard program.kind != .sense else {
@@ -414,18 +398,16 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             if program.isResident, !preview, held == nil, !(host is OwnedProgramFixtures) {
                 try await Self.residents.settle(store, program: program)
             }
-            // A resident ability's resume replays in a helper of its own, under its slot's lease.
+            // Resume must use its own helper under the resident slot's lease.
             let leased = program.isResident && replay != nil && !preview && held == nil && !(host is OwnedProgramFixtures)
                 ? try Self.residents.lease(store, program: program) : nil
             defer { if let leased { Self.residents.unlease(leased, program: program) } }
             let process: OwnedProgramProcess
             if let held { process = held.process }
-            // Only a resident program's run reaches the resident pool.
             else if resident { process = try Self.residents.take(store, program: program, create: spawn) }
             else { process = try spawn() }
             if host is OwnedProgramFixtures {
-                // A new process used to supply a fresh notebook on each pass;
-                // preserve that isolation while retaining the transport.
+                // Reset the notebook on each pass to preserve isolation while retaining transport.
                 journal.notebookRoot = process.scratch.appendingPathComponent(UUID().uuidString)
             } else if preview { journal.notebookRoot = process.scratch }
             var keep = false
@@ -443,11 +425,13 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     ]
                     if host is OwnedProgramFixtures { message["freshContext"] = .bool(true) }
                     if program.isPart {
-                        // The helper's own HOME is its run scratch; the person's home comes from here.
+                        // The helper's HOME is scratch; supply the person's home separately.
                         message["home"] = .string(FileManager.default.homeDirectoryForCurrentUser.path)
                         message["workspace"] = .string(try NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot).path)
                         message["dataRoot"] = .string(dataRoot.path)
-                        message["measurementSystem"] = .string(Locale.autoupdatingCurrent.measurementSystem == .us ? "us" : Locale.autoupdatingCurrent.measurementSystem == .metric ? "metric" : "other")
+                        message["measurementSystem"] = .string(Locale.autoupdatingCurrent.measurementSystem == .us
+                            ? "us"
+                            : Locale.autoupdatingCurrent.measurementSystem == .metric ? "metric" : "other")
                     }
                     if let input { message["input"] = input }
                     process.begin(id: 1, kind: program.kind, seconds: program.seconds, onFailure: { _ in actions.cancel() })
@@ -464,8 +448,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                             }
                             if type == "failed" {
                                 let failure = try JSONDecoder().decode(SenseFailure.self, from: JSONEncoder().encode(fields["failure"] ?? .null))
-                                // A reported failure explains the helper's exit;
-                                // a latched supervision failure still wins.
+                                // A latched supervision failure takes precedence over a helper's reported exit cause.
                                 let terminal = process.failure
                                 journal.fail(terminal?.code == "crashed" ? failure : terminal ?? failure)
                                 return journal.receipt()
@@ -499,19 +482,13 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                                 guard !["primitive", "state"].contains(kind) || program.isPart else {
                                     throw SenseFailure(code: "bad_output", message: "Only an ability reaches host primitives and host.state.")
                                 }
-                                // Host work is progress; only unaccompanied JS can stall.
+                                // Host work counts as progress; only unaccompanied JavaScript may stall.
                                 let waitStarted = try process.suspend(1)
                                 if program.kind == .turn, kind == "turn" {
-                                    reply = .string(try JSONValue.object(["ok": .bool(true), "value": try await host.reach(id)])
+                                    reply = .string(try JSONValue.object(["ok": .bool(true), "value": try await host.reach(id, execution: execution)])
                                         .serialize(pretty: false))
                                 } else {
-                                    reply = await SkillRunContext.$partID.withValue(program.id) {
-                                        await SkillRunContext.$ability.withValue(program.isPart ? program.id : nil) {
-                                            await SkillRunContext.$input.withValue(input) {
-                                                .string(await journal.call(kind: kind, id: id, args: args, line: Int(line)))
-                                            }
-                                        }
-                                    }
+                                    reply = .string(await journal.call(kind: kind, id: id, args: args, line: Int(line)))
                                 }
                                 try process.resume(1, since: waitStarted)
                             } else { throw SenseFailure(code: "bad_output", message: "Program called an API outside its host profile.") }
@@ -543,12 +520,13 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             "status": .string("failed"), "reason": .string("cancelled"), "not_run_status": .string("cancelled"),
             "detail": .string("The turn was stopped while this call was running."),
         ])
-        func perform(_ input: [String: JSONValue], host: any OwnedProgramHostProfile) async -> JSONValue {
-            await call { await host.perform(input) }
+        func perform(_ input: [String: JSONValue], host: any OwnedProgramHostProfile, execution: OwnedProgramExecution) async -> JSONValue {
+            await call { await host.perform(input, execution: execution) }
         }
-        func primitive(_ operation: String, arguments: JSONValue, preview: Bool, host: any OwnedProgramHostProfile) async -> JSONValue {
+        func primitive(_ operation: String, arguments: JSONValue, preview: Bool, host: any OwnedProgramHostProfile,
+            execution: OwnedProgramExecution) async -> JSONValue {
             await call {
-                do { return try await host.primitive(operation, arguments: arguments, preview: preview) }
+                do { return try await host.primitive(operation, arguments: arguments, preview: preview, execution: execution) }
                 catch {
                     let failure = (error as? SenseFailure) ?? SenseFailure(code: "failed", message: error.localizedDescription)
                     return .object(["status": .string("failed"), "reason": .string(failure.code),
@@ -579,8 +557,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 if let active { settling.append(active.task) }
                 return active?.task
             }
-            // Keep the continuation until its actual host result arrives. Its
-            // caller journals that result while the helper is already stopped.
+            // Keep the continuation until the host actually answers so its result can be journaled after the helper stops.
             action?.cancel()
         }
         func finish() async {
@@ -589,11 +566,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             for task in tasks { await task.value }
         }
     }
-    /// `unclear`: a strict run's receipt that is not a clear success
-    /// (`strictFault`). The script still gets the receipt; the ledger keeps
-    /// the doubt, and a write's effects are then unknown.
+    /// Unclear strict receipts remain visible to the script and retain unknown write effects in the ledger.
     enum Outcome { case ok, preview, failed, stop, unclear }
-    /// `strict` (a skill's run) is exact, by `strictFault`'s one rule.
     static func classify(_ receipt: JSONValue, strict: Bool = false, write: Bool = false,
                          host: any OwnedProgramHostProfile)
         -> (outcome: Outcome, reason: String, detail: String) {
@@ -613,15 +587,14 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             || host.evidence(fields["result"] ?? .null).waiting {
             return (.stop, waiting.isEmpty ? "waiting_on_user" : waiting, detail)
         }
-        // A preview that would refuse classifies as that refusal would.
         if fields["status"] == .string("preview") {
             let refused = text("would_refuse")
-            if fields["owner"] == .string("his") { return (.stop, refused.isEmpty ? "owners_call" : refused, detail) }
+            if fields["owner"] == .string("person") { return (.stop, refused.isEmpty ? "owners_call" : refused, detail) }
             if fields["would_card"] == .bool(true) { return (.stop, "would_card", detail) }
             return refused.isEmpty ? (.preview, "", detail) : (.failed, refused, detail)
         }
         if fields["status"] == .string("did_not_stick") { return (.failed, "did_not_stick", detail) }
-        // A card only User can answer, on the glass: nothing was answered.
+        // An unanswered on-screen card requires the person; it is not a completed decision.
         if fields["status"] == .string("needs_glass") { return (.stop, "needs_glass", String(text("reason").prefix(400))) }
         if evidence.successful {
             guard strict, let fault = strictFault(fields, write: write, host: host, outer: evidence) else { return (.ok, "", detail) }
@@ -630,11 +603,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         let reason = [text("reason"), text("failure_code")].first { !$0.isEmpty && !$0.contains(" ") } ?? "failed"
         return (host.floorReasons.contains(reason) ? .stop : .failed, reason, detail)
     }
-    /// A strict run's one rule, all the way down a receipt's `result`s. A
-    /// write is a success only when its receipt says terminal success, and
-    /// nothing under it says otherwise. A read may return any data, but no
-    /// failure, status that is not final, dry run, or unknown or partial
-    /// effects. Nil when it passes.
+    /// Judge strict success through every nested result: writes require terminal success, and reads reject failures, nonfinal status, previews and partial or
+    /// unknown effects.
     static func strictFault(_ fields: [String: JSONValue], write: Bool, host: any OwnedProgramHostProfile, outer: OwnedProgramReceiptEvidence) -> String? {
         for (depth, at) in resultChain(fields).enumerated() {
             let evidence = depth == 0 ? outer : host.evidence(.object(at))
@@ -656,20 +626,17 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         }
         return nil
     }
-    /// A receipt and every `result` inside it, outermost first.
     static func resultChain(_ fields: [String: JSONValue]) -> [[String: JSONValue]] {
         var chain = [fields]
         while case .object(let inner)? = chain.last?["result"] { chain.append(inner) }
         return chain
     }
-    /// A call's effects from its whole receipt: unknown, then partial, then
-    /// occurred outranks what an outer level said.
+    /// Aggregate nested effects with unknown over partial over occurred, regardless of the outer receipt.
     package static func effects(_ fields: [String: JSONValue]) -> JSONValue? {
         let said = resultChain(fields).map { text($0["effects"]) }.filter { !$0.isEmpty }
         return (["unknown", "partial", "occurred"].first(where: said.contains) ?? said.first).map(JSONValue.string)
     }
-    /// The real ids a call's receipt returned, whatever its size: the first
-    /// of each name, down through objects (never lists, never its own input).
+    /// Retain real ids through nested objects regardless of result size; lists and input echoes do not supply them.
     static func returnedIDs(_ receipt: JSONValue) -> [String: JSONValue] {
         let names = ["approval_id", "message_id", "run_id", "request_id", "id", "version", "page_version"]
         var found: [String: JSONValue] = [:]
@@ -696,11 +663,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         public let detail: String
         public init(reason: String, detail: String) { self.reason = reason; self.detail = detail }
     }
-    /// A stopped skill run, resumed: the script runs again from the top, and
-    /// each call the stopped run made is answered from `journal`, in order,
-    /// without running again; the one it stopped at (its decide, or the step
-    /// it handed back) returns `answer`. A call that differs from the
-    /// journal's stops the run there, before it runs.
+    /// Resume replays calls from the journal without executing them, answers the stop point, and refuses any divergent call before dispatch.
     public struct Replay: Sendable {
         public let journal: [JSONValue]
         public let answer: JSONValue
@@ -709,17 +672,13 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             self.journal = journal; self.answer = answer; self.recheckReads = recheckReads
         }
     }
-    /// A read's answer without its place in the run (n, line).
     static func readValue(_ out: String) -> JSONValue {
         guard case .object(var fields)? = try? JSONValue.parse(Data(out.utf8)) else { return .string(out) }
         for key in ["n", "line"] { fields.removeValue(forKey: key) }
         return fields["value"] ?? .object(fields)
     }
-    /// Result owners declare their volatile envelope here while a read runs.
-    /// The journal keeps the digest and projections for later argument comparisons;
-    /// the script still receives the whole result.
+    /// Use owner-declared volatile projections for journal comparisons while returning the complete result to the script.
     public final class ReadContent: @unchecked Sendable {
-        @TaskLocal public static var current: ReadContent?
         private let lock = NSLock()
         private var declarations: [(value: JSONValue, content: JSONValue)] = []
         private var dependencies: [JSONValue] = []
@@ -743,7 +702,6 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 }
             }
         }
-        /// One owner-declared projection for read content and replay arguments.
         func normalize(_ value: JSONValue) -> JSONValue {
             lock.withLock {
                 func project(_ value: JSONValue) -> JSONValue {
@@ -778,8 +736,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             return try JSONValue.array([content, .array(dependencies.map(normalize))]).digest
         }
     }
-    /// The versions a strict run's own calls returned, in order, from its
-    /// journal: each read's version and each write's page_version.
+    /// Read and write versions must come from the run's own ordered journal.
     public static func ownVersions(_ journal: [JSONValue]) -> [String] {
         journal.compactMap { entry -> String? in
             guard case .object(let fields) = entry, case .array(let call)? = fields["call"], let kind = call.first,
@@ -787,7 +744,6 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             return (kind == .string("read") ? value["version"] : value["page_version"])?.scalarText
         }
     }
-    /// What a journaled call reads or writes: its page, and the item it names.
     static func target(_ entry: JSONValue, host: any OwnedProgramHostProfile) throws -> (page: String, item: String?, write: Bool)? {
         guard case .object(let fields) = entry, case .array(let call)? = fields["call"], call.count > 2,
               case .string(let kind) = call[0], case .string(let id) = call[1], case .string(let raw) = call[2] else { return nil }
@@ -800,11 +756,9 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         guard let page = action.page == "*" ? lower(args["page"]) : action.page.lowercased() else { return nil }
         return (page, lower(args["handle"]) ?? lower(args["id"]) ?? lower(args["item"]), !action.readOnly(args))
     }
-    /// A version's page or page/item.
     public static func versionScope(_ version: String) -> String {
         version.split(separator: "@", maxSplits: 1).first.map(String.init) ?? version
     }
-    /// A read's answer, short: its version when it has one.
     static func brief(_ out: String) -> JSONValue {
         let value = readValue(out)
         if case .object(let fields) = value, let version = fields["version"] { return version }

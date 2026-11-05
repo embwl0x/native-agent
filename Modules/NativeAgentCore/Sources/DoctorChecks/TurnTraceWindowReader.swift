@@ -2,83 +2,52 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+import Experiences
 // Blueprint: | `TurnTraceWindowReader.swift` | Measurement-window policy and coverage through canonical TurnTrace framing |
 
-// MARK: - Bounded reader for the per-day turn-trace feed
-//
-// Shared by prefix health, subconscious vitals and model compensations. It
-// keeps their three measurement rules in one place:
-//
-//   1. BOUNDED. Daily storage is capped; Doctor tails each file to `budgetPerDay`
-//      bytes, drops an initial partial line and reports truncated coverage.
-//   2. OFF THE TURN. Nothing here is wired to a timer, a chat hook, or the
-//      cognition runtime. Reading only happens inside `DoctorCheck.run()`,
-//      which is a nonisolated async function executed on the cooperative pool
-//      by `SwiftNativeDoctorChecks.runAll` — never on the main actor and never
-//      on a turn. `DoctorScanCache` keeps a Doctor session from paying the
-//      read twice.
-//   3. HONEST ABOUT WHAT IT COULD NOT READ. A day file that EXISTS but cannot
-//      be opened/decoded is an `unreadableDay`, never a zero. Absent day files
-//      are simply absent — that is a different fact, and the callers report it
-//      as UNMEASURED rather than as health.
+// MARK: - Bounded reader for trace details
+// Explicit off-turn checks share a time-bounded record query. Empty input remains unmeasured; unreadable rows are named coverage gaps.
 
-/// What a window scan could and could not see. Every field here exists so a
-/// caller can say what it measured instead of implying it measured everything.
+/// Preserve coverage evidence so callers cannot imply they measured unreadable or absent input.
 struct TurnTraceScanSummary: Sendable {
-    /// Day files that existed and were read (whole or tailed).
-    var daysPresent: [String] = []
-    /// Day files that existed but could not be opened or decoded. Any entry
-    /// here makes the owning check FAIL — an unreadable input is not a zero.
-    var unreadableDays: [String] = []
-    /// Day files whose head was cut by the byte budget.
-    var truncatedDays: [String] = []
-    /// Lines that were non-empty but did not parse as a trace row object.
-    var malformedLines: Int = 0
-    /// Rows matching the requested kinds that were handed to the caller.
-    var matchedRows: Int = 0
+    let from: Date
+    let through: Date
+    let eventsRead: Int
+    let unreadableRows: Int
+    let observedDays: Int
+    let earlierHistoryExcluded: Bool
 
-    var isEmptyFeed: Bool { daysPresent.isEmpty && unreadableDays.isEmpty }
+    var isEmptyFeed: Bool { eventsRead == 0 && unreadableRows == 0 }
 
-    /// What the read did not cover: a bounded read is coverage, not a fault.
+    var windowCovered: String {
+        let formatter = ISO8601DateFormatter()
+        return "record queried from \(formatter.string(from: from)) through \(formatter.string(from: through))"
+            + "; \(eventsRead) event(s) read over \(observedDays) day(s) with matching events"
+    }
+
     var coverageParts: [String] {
         var parts: [String] = []
-        if !truncatedDays.isEmpty {
-            parts.append(
-                "\(truncatedDays.count) day file(s) were tailed to the read budget"
-                    + " (\(truncatedDays.joined(separator: ", "))), so earlier turns"
-                    + " that day were not scanned"
-            )
+        if earlierHistoryExcluded {
+            parts.append("earlier launch history is outside the queried window")
         }
-        if malformedLines > 0 {
-            parts.append("\(malformedLines) trace line(s) did not parse")
+        if unreadableRows > 0 {
+            parts.append("\(unreadableRows) record row(s) could not decode as trace events")
         }
         return parts
     }
 
     var coverageDetail: String {
-        let parts = coverageParts
-        return parts.isEmpty ? "" : "; " + parts.joined(separator: "; ")
+        "; " + ([windowCovered] + coverageParts).joined(separator: "; ")
     }
 }
 
 // MARK: - DoctorMeasurementWindow
-//
-// A window exists only for this launch's valid build_launch.json stamp.
+// Only this process's valid launch stamp can establish its measurement window.
 
 struct DoctorMeasurementWindow: Sendable {
-    /// Rows older than this are not this build's behavior and are not read.
+    /// Older rows describe a different build and cannot enter this window.
     let floor: Date
-    /// The clause the check prints, so the operator always knows what window
-    /// produced the number.
     let describedAs: String
-
-    /// Day files worth opening for this floor, capped so a bogus stamp can
-    /// never widen the bounded read.
-    func dayFilesToRead(now: Date, maximum: Int) -> Int {
-        let span = now.timeIntervalSince(floor)
-        guard span > 0 else { return 1 }
-        return max(1, min(maximum, Int(span / 86_400) + 2))
-    }
 }
 
 enum DoctorWindowFloor {
@@ -97,9 +66,7 @@ enum DoctorWindowFloor {
         )
     }
 
-    /// The launch descriptor's `writtenAt`, but ONLY when this process wrote it
-    /// for the build now running. A stamp left by a previous build would put
-    /// the floor before the change under observation, which is the whole bug.
+    /// Require this process's current-build stamp; an earlier launch cannot establish the running build's floor.
     private static func launchStamp(root: URL, identity: NativeAgentBuildIdentity) -> Date? {
         launchStamp(path: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename), identity: identity)
     }
@@ -112,68 +79,48 @@ enum DoctorWindowFloor {
               let writtenAt = object["writtenAt"]?.stringValue,
               let stamp = TurnTraceEvent.parseISO8601(writtenAt)
         else { return nil }
-        // One a previous launch left (this launch's write failed, or an older
-        // bundle stamped no pid) is refused, and the row says it has no stamp.
+        // Refuse stamps from other launches, including when this launch failed to write its own.
         guard object["build"]?.stringValue == identity.build,
               object["version"]?.stringValue == identity.version,
               object["pid"] == .int(Int64(ProcessInfo.processInfo.processIdentifier))
         else { return nil }
-        // Source archives legitimately have no revision. Both sides must
-        // agree, including that absence; a missing stamped identity cannot
-        // certify a running build whose revision is known.
+        // Archives may lack revision identity, but both sides must agree; missing evidence cannot certify a known revision.
         guard object["sourceRevision"]?.stringValue?.lowercased() == identity.sourceRevision?.lowercased() else { return nil }
         return stamp
     }
 }
 
 enum TurnTraceWindowReader {
-    /// Per-day tail budget. 1 MiB holds roughly a day of this feed's rows; a
-    /// busier day is tailed and SAYS it was tailed.
-    static let defaultBudgetPerDay = 1 * 1024 * 1024
+    static let source = "experiences/experiences.sqlite"
 
-    /// Scan at most `days` calendar-day files under `root`, with a byte budget per file.
-    /// Canonical decoding precedes kind/time filtering; `floor` bounds the measurement window.
-    /// Rows reach `handle` in file order; callers sort by timestamp.
+    /// Keep the launch floor and the same newest calendar-day window; deliver record order without a row-count tail.
     static func scan(
         root: URL,
         now: Date,
-        days: Int,
         floor: Date,
         kinds: Set<String>,
-        budgetPerDay: Int = defaultBudgetPerDay,
+        maximumDays: Int = 7,
         handle: (TurnTraceEvent) -> Void
-    ) async -> TurnTraceScanSummary {
-        var summary = TurnTraceScanSummary()
-
-        // The floor wins over the day count: opening yesterday's file is fine,
-        // counting a row from before this build launched is not.
-        let cutoff = floor
-
-        for offset in 0..<max(days, 1) {
-            guard let day = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -offset, to: now) else { continue }
-            let path = TurnTraceReplayReader.fileURL(for: day, root: root)
-            let name = TurnTracePersistLane.dayString(from: day)
-            guard FileManager.default.fileExists(atPath: path.path) else { continue }
-
-            guard let result = await TurnTraceReplayReader.scan(
-                path, budget: budgetPerDay, floor: cutoff, kinds: kinds, handle: handle
-            ) else {
-                summary.unreadableDays.append(name)
-                continue
-            }
-            summary.daysPresent.append(name)
-            if result.truncated { summary.truncatedDays.append(name) }
-            summary.malformedLines += result.malformedLines
-            summary.matchedRows += result.matchedRows
+    ) async throws -> TurnTraceScanSummary {
+        let calendar = TurnTracePersistLane.dayCalendar
+        guard let oldestDay = calendar.date(byAdding: .day, value: 1 - max(1, maximumDays), to: calendar.startOfDay(for: now)) else {
+            throw WindowError.invalidCalendarWindow
         }
-        return summary
+        let from = max(floor, oldestDay)
+        let read = try await TurnTracePersistLane(dataRootOverride: root).events(
+            ExperienceStore.DetailQuery(kinds: kinds.sorted(), from: from, through: now)
+        )
+        for event in read.events { handle(event) }
+        return TurnTraceScanSummary(from: from, through: now, eventsRead: read.events.count, unreadableRows: read.unreadable,
+            observedDays: Set(read.events.map { TurnTracePersistLane.dayString(from: $0.ts) }).count,
+            earlierHistoryExcluded: from > floor)
     }
+
+    private enum WindowError: Error { case invalidCalendarWindow }
 }
 
 // MARK: - JSONValue numeric accessors
-//
-// The feed writes token counts as ints and ratios as doubles; a reader that
-// only handles one of them silently drops half the data.
+// Token counts are ints and ratios doubles; accepting just one numeric shape would silently drop valid data.
 
 extension JSONValue {
     var intValue: Int? {
@@ -183,12 +130,8 @@ extension JSONValue {
 }
 
 // MARK: - DoctorScanCache
-//
-// User's constraint: these rows must never cost a turn, and opening Doctor must
-// not re-read the feed for every render. One short-lived memo per check
-// instance — long enough that a Doctor session pays the scan once, short enough
-// that pressing Run Doctor a minute later MEASURES AGAIN rather than replaying
-// a stale row. A cached row is never presented as fresher than it is.
+// Memoize off-turn readings across renders so opening Doctor does not repeatedly read the feed. A short lifetime permits fresh manual readings; cached rows
+// retain their actual measurement age.
 actor DoctorScanCache {
     private var cached: (result: CheckResult, at: Date)?
     private let ttl: TimeInterval
@@ -197,7 +140,6 @@ actor DoctorScanCache {
         self.ttl = ttl
     }
 
-    /// The still-fresh memo, or nil when the caller must measure again.
     func fresh(now: Date) -> CheckResult? {
         guard let cached, now.timeIntervalSince(cached.at) < ttl else { return nil }
         return cached.result

@@ -1,36 +1,38 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ToolSignature.swift` | Checked argument rendering for native object schemas, including required unconstrained names without properties; `call`, `doorArgs` and explicit open-object door shapes |
+// Blueprint: | `ToolSignature.swift` | `call`, `doorArgs`: checked argument shapes |
+// Required object names remain renderable without properties; explicit open-object door shapes preserve unconstrained arguments.
 
-/// A tool's arguments as one line a caller can copy from:
-/// `act(target*, verb*=click|open, app, front:bool, steps:[str|{verb*,target*,text}])`.
-/// Required first (`*`), then by name; auto-filled session fields are left out.
+/// Required fields lead, session fields stay hidden, and the rendered argument line remains copyable.
 public enum ToolSignature {
     private static func properties(_ data: Data) throws -> (props: [String: [String: Any]], required: Set<String>) {
         guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ToolFailureError("The tool's parameter schema is not an object. Repair its schema before reading its arguments or running it.", effects: .none, code: "tool_schema_unavailable")
+            throw ToolFailureError("The tool's parameter schema is not an object. Repair its schema before reading its arguments or running it.",
+                effects: .none, code: "tool_schema_unavailable")
         }
-        // JSON Schema permits an object without named property declarations,
-        // including a required list whose values are otherwise unconstrained.
+        // JSON Schema permits an object without named property declarations, including a required list whose values are otherwise unconstrained.
         let props: [String: Any]
         if let value = raw["properties"] {
             guard let declared = value as? [String: Any] else {
-                throw ToolFailureError("The tool's parameter schema properties are not an object. Repair its schema before using it.", effects: .none, code: "tool_schema_unavailable")
+                throw ToolFailureError("The tool's parameter schema properties are not an object. Repair its schema before using it.", effects: .none,
+                    code: "tool_schema_unavailable")
             }
             props = declared
         } else { props = [:] }
         let required: Set<String>
         if let value = raw["required"] {
             guard let names = value as? [String] else {
-                throw ToolFailureError("The tool's required-argument schema is not a list of names. Repair its schema before using it.", effects: .none, code: "tool_schema_unavailable")
+                throw ToolFailureError("The tool's required-argument schema is not a list of names. Repair its schema before using it.", effects: .none,
+                    code: "tool_schema_unavailable")
             }
             required = Set(names)
         } else { required = [] }
         var visible: [String: [String: Any]] = [:]
         for (key, value) in props {
             guard let property = value as? [String: Any] else {
-                throw ToolFailureError("The tool's parameter schema property \(key) is not an object. Repair its schema before using it.", effects: .none, code: "tool_schema_unavailable")
+                throw ToolFailureError("The tool's parameter schema property \(key) is not an object. Repair its schema before using it.", effects: .none,
+                    code: "tool_schema_unavailable")
             }
             let about = (property["description"] as? String ?? "").lowercased()
             if key == "__session_id" || about.contains("auto-fill") || about.contains("supplied automatically") { continue }
@@ -55,7 +57,6 @@ public enum ToolSignature {
         return nil
     }
 
-    /// `str`, `int`, `{a*,b}`, `[str|{verb*,target*}]` — the value's shape.
     private static func shape(_ property: [String: Any], depth: Int = 0) -> String {
         if let alternatives = (property["anyOf"] ?? property["oneOf"]) as? [[String: Any]] {
             let shapes = alternatives.filter { type($0) != "null" }.map { shape($0, depth: depth) }
@@ -94,8 +95,7 @@ public enum ToolSignature {
         return name + "(" + parts.joined(separator: ", ") + ")"
     }
 
-    /// The same arguments in the `app` door's form (`AppAction.args`): the
-    /// name, `?` when it may be left out or null, then `:shape` unless a string.
+    /// Use `?` only for omittable/null fields and omit `:str` to keep action signatures compact.
     public static func doorArgs(_ parametersJSON: Data) throws -> [String] {
         let (props, required) = try properties(parametersJSON)
         return ordered(props, required).map { key in
@@ -106,7 +106,7 @@ public enum ToolSignature {
         }
     }
 
-    /// Explicit door shapes for app buttons without a native parameter schema.
+    /// Use explicit door shapes when buttons have no native parameter schema.
     public static func doorProperty(_ shape: String) -> JSONValue {
         if shape == "any" { return .object([:]) }
         if shape == "list" { return .object(["type": .string("array")]) }
@@ -122,12 +122,13 @@ public enum ToolSignature {
             return .object(["type": .string("string"),
                 "enum": .array(shape.split(separator: "|").map { .string(String($0)) })])
         }
-        let type = ["int": "integer", "num": "number", "bool": "boolean", "boolean": "boolean",
+        // Short names and JSON Schema's own both name a type; an unlisted name silently made offset?:number a string ("0").
+        let type = ["int": "integer", "integer": "integer", "num": "number", "number": "number", "bool": "boolean", "boolean": "boolean",
                     "object": "object", "array": "array"][shape] ?? "string"
         return .object(["type": .string(type)])
     }
 
-    /// One shape example; angle-bracket strings are values the caller supplies.
+    /// Examples use angle brackets to distinguish caller-supplied values.
     public static func example(_ schema: JSONValue, name: String) -> JSONValue {
         guard case .object(let props) = schema else { return .string("<\(name)>") }
         if let value = props["const"] { return value }
@@ -157,8 +158,7 @@ public enum ToolSignature {
         }
     }
 
-    /// One short line per argument, same order: "steps: up to 12 acts in ONE call…".
-    /// Argument names, required and optional, auto-filled ones left out.
+    /// Match signature argument order and omit auto-filled fields so field help agrees with callable input.
     public static func argumentNames(_ parametersJSON: Data) throws -> (required: [String], optional: [String]) {
         let (props, required) = try properties(parametersJSON)
         let all = ordered(props, required)

@@ -1,11 +1,9 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
-// Blueprint: | `ChromeExtensionFiles.swift` | `ChromeExtensionFiles`: registered unpacked and bundled manifest identity/version reads; one executable closure supplies completeness, watched paths including missing files and the loaded-code SHA-256 digest shared with the extension |
+// Blueprint: | `ChromeExtensionFiles.swift` | `ChromeExtensionFiles`; Registered/shipped identity and executable digest. |
 
-/// Chrome records the unpacked folder, rather than the native-host installer.
-/// Read that exact manifest as well as the app's shipped manifest; never infer
-/// a folder from a checkout name or substitute a version literal.
+/// Chrome owns the registered folder; read its manifest and the shipped manifest without guessing paths or versions.
 struct ChromeExtensionFiles {
     private var bundled: (url: URL, revision: NSDictionary, key: String, id: String, version: String)?
     private(set) var watchedPaths = Set<URL>()
@@ -50,8 +48,7 @@ struct ChromeExtensionFiles {
         }
         let bundledURL = resources.appendingPathComponent("NativeAgentChrome/manifest.json")
         watchedPaths.insert(bundledURL)
-        // File identity detects bundle replacement even when its version and
-        // modification date were preserved.
+        // File identity catches bundle replacement even with unchanged version and modification date.
         let revision = try FileManager.default.attributesOfItem(atPath: bundledURL.path) as NSDictionary
         let shipped: (url: URL, revision: NSDictionary, key: String, id: String, version: String)
         if let bundled, bundled.url == bundledURL, bundled.revision == revision {
@@ -63,8 +60,7 @@ struct ChromeExtensionFiles {
             guard let key = manifest["key"] as? String, let bytes = Data(base64Encoded: key) else {
                 throw ChromeControlRuntimeError.connectionUnavailable("NativeAgent's shipped Chrome manifest has no valid extension identity key.")
             }
-            // Chrome's extension id is the first 128 bits of the public key's
-            // SHA256, encoded a-p; stable across bundle and unpacked copies.
+            // Chrome derives a stable extension id from the public key's first 128 SHA-256 bits, encoded a-p.
             let alphabet = Array("abcdefghijklmnop")
             let id = SHA256.hash(data: bytes).prefix(16).map {
                 String(alphabet[Int($0 >> 4)]) + String(alphabet[Int($0 & 15)])
@@ -82,8 +78,7 @@ struct ChromeExtensionFiles {
                 throw ChromeControlRuntimeError.connectionUnavailable("Chrome's profile inventory contains an invalid folder.")
             }
             let profileURL = root.appendingPathComponent(name, isDirectory: true)
-            // These are Chrome's two preference stores, not alternate guesses.
-            // Inspect both; contradictory paths are unavailable, never selected.
+            // Both Chrome preference stores are authoritative; contradictory paths prove no folder.
             for filename in ["Preferences", "Secure Preferences"] {
                 let url = profileURL.appendingPathComponent(filename)
                 watchedPaths.insert(url)
@@ -93,13 +88,15 @@ struct ChromeExtensionFiles {
                       let settings = extensions["settings"] as? [String: Any],
                       let entry = settings[shipped.id] as? [String: Any] else { continue }
                 guard let path = entry["path"] as? String, path.hasPrefix("/") else {
-                    throw ChromeControlRuntimeError.connectionUnavailable("Chrome's registered extension folder is not an absolute unpacked path (\(url.path)).")
+                    throw ChromeControlRuntimeError
+                        .connectionUnavailable("Chrome's registered extension folder is not an absolute unpacked path (\(url.path)).")
                 }
                 paths.insert(URL(fileURLWithPath: path).standardizedFileURL.path)
             }
         }
         guard paths.count == 1, let path = paths.first else {
-            throw ChromeControlRuntimeError.connectionUnavailable("Chrome's registered extension folder is \(paths.isEmpty ? "missing" : "ambiguous: " + paths.sorted().joined(separator: ", ")).")
+            throw ChromeControlRuntimeError.connectionUnavailable(
+                "Chrome's registered extension folder is \(paths.isEmpty ? "missing" : "ambiguous: " + paths.sorted().joined(separator: ", ")).")
         }
         let manifestURL = URL(fileURLWithPath: path).appendingPathComponent("manifest.json")
         watchedPaths.insert(manifestURL)
@@ -111,8 +108,8 @@ struct ChromeExtensionFiles {
                 code: Self.codeDigest(folder: URL(fileURLWithPath: path), manifest: manifest, paths: &watchedPaths))
     }
 
-    /// Match background.js: sorted "<path>\n<bytes>\n" SHA-256 records, first eight bytes in hex.
-    /// Roots and static imports serve completeness and watches; unreadable paths remain watched with a nil digest.
+    /// Match background.js: sorted "<path>\n<bytes>\n" SHA-256 records, first eight bytes in hex. Roots and static imports serve completeness and watches;
+    /// unreadable paths remain watched with a nil digest.
     static func codeDigest(folder: URL, manifest: [String: Any], paths: inout Set<URL>) -> String? {
         var queue = ["manifest.json"]
         if let background = manifest["background"] as? [String: Any], let worker = background["service_worker"] as? String { queue.append(worker) }

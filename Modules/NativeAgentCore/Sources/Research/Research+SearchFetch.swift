@@ -2,11 +2,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MacControl
-// Blueprint: | `Research+SearchFetch.swift` | SwiftNativeResearchClient: checkedSearxngBaseURL owns search configuration; search/fetch preserve transport causes; fetchURL retains explained source receipts with reader locators and block-shaped HTML; ResearchFetchRecord.readJSON selects find passages or returns the whole retained extraction through output paging |
+// Blueprint: | `Research+SearchFetch.swift` | Checked search and retained web reads |
 
 extension ResearchFetchRecord {
-    /// Select from the same extraction that was retained, never a second fetch.
-    /// HTML paragraphs, list items and table rows are already newline-delimited.
+    /// Select from the same extraction that was retained, never a second fetch. HTML paragraphs, list items and table rows are already newline-delimited.
     public func readJSON(find: String? = nil, around: Int = 1, full: Bool = false) throws -> JSONValue {
         guard (0...3).contains(around), find == nil || find?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             throw ResearchClientError.malformedResponse("find needs words and around must be from 0 through 3")
@@ -29,8 +28,7 @@ extension ResearchFetchRecord {
                     matches.append(index)
                 }
             }
-            // Keep complete matching paragraphs and their neighbours. Additional
-            // matches remain in the retained source, named by source_receipt.
+            // Keep complete matching paragraphs and their neighbours. Additional matches remain in the retained source, named by source_receipt.
             let shown = matches.prefix(8)
             var ranges: [ClosedRange<Int>] = []
             for index in shown {
@@ -45,14 +43,22 @@ extension ResearchFetchRecord {
                 "has_more_matches": .bool(matches.count > shown.count),
                 "paragraph_ranges": .array(ranges.map { .object(["start": .int(Int64($0.lowerBound + 1)), "end": .int(Int64($0.upperBound + 1))]) }),
                 "note": .string(matches.isEmpty
-                    ? "No paragraph in the retained extraction contained every find word. This does not establish absence from bytes or rendered content not read."
-                    : "Case-insensitive matches containing every find word, in source order, with surrounding paragraphs. At most eight matching paragraphs are selected; read source_receipt for the retained source.")]
+                    ? """
+                        No paragraph in the retained extraction contained every find word. This does not establish absence from bytes or rendered content not \
+                        read.
+                        """
+                    : """
+                        Case-insensitive matches containing every find word, in source order, with surrounding paragraphs. At most eight matching paragraphs \
+                        are selected; read source_receipt for the retained source.
+                        """)]
         } else {
-            // A plain read is the whole extraction; the tool-output pager
-            // bounds a large one. find selects passages instead.
+            // A plain read is the whole extraction; the tool-output pager bounds a large one. find selects passages instead.
             selected = text
             selection = ["mode": .string("whole"),
-                "note": .string("The whole extracted text. find selects the matching paragraphs and their surroundings instead. source_receipt names the retained source without another fetch.")]
+                "note": .string("""
+                    The whole extracted text. find selects the matching paragraphs and their surroundings instead. source_receipt names the retained source \
+                    without another fetch.
+                    """)]
         }
         fields["text"] = .string(selected)
         selection["whole_text_returned"] = .bool(selected == text)
@@ -63,8 +69,8 @@ extension ResearchFetchRecord {
 }
 
 extension SwiftNativeResearchClient {
-    /// The one reader of `research/config.json`'s search URL: nil when the file or key is absent,
-    /// the trimmed URL when present, and a fault naming the file when it is unreadable or malformed.
+    /// The one reader of `research/config.json`'s search URL: nil when the file or key is absent, the trimmed URL when present, and a fault naming the file
+    /// when it is unreadable or malformed.
     public nonisolated static func checkedSearxngBaseURL(root: URL) throws -> String? {
         let path = root.appendingPathComponent("research", isDirectory: true)
             .appendingPathComponent("config.json")
@@ -120,7 +126,6 @@ extension SwiftNativeResearchClient {
 
     public func fetchURL(_ url: String) async throws -> ResearchFetchRecord {
         try Task.checkCancellation()
-        // Only http/https URLs are allowed.
         guard let parsed = URL(string: url),
               let scheme = parsed.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
@@ -149,8 +154,7 @@ extension SwiftNativeResearchClient {
         }
         var response = try await get(parsed)
         var finalURL = response.finalURL
-        // A <meta http-equiv=refresh> page ("Redirecting…") is a redirect a
-        // browser follows; follow one hop, as an HTTP redirect is followed.
+        // A <meta http-equiv=refresh> page ("Redirecting…") is a redirect a browser follows; follow one hop, as an HTTP redirect is followed.
         if mimeOf(response).contains("html"),
            let next = try Self.metaRefreshTarget(String(decoding: response.body, as: UTF8.self), base: finalURL ?? parsed),
            next.absoluteString != (finalURL ?? parsed).absoluteString {
@@ -201,8 +205,7 @@ extension SwiftNativeResearchClient {
             status = "unsupported_text_encoding"; text = ""
         }
         try Task.checkCancellation()
-        // A short document alone is valid; a script-heavy shell or an explicit
-        // JavaScript gate needs a rendered read before claiming page coverage.
+        // A short document alone is valid; a script-heavy shell or an explicit JavaScript gate needs a rendered read before claiming page coverage.
         let thinPage = extracted && (response.status == 203
             || (htmlEvidence.map { evidence in
                 evidence.bodyCharacters == 0
@@ -211,7 +214,10 @@ extension SwiftNativeResearchClient {
                         .contains { text.localizedCaseInsensitiveContains($0) }
             } ?? false))
         let complete = !response.truncated && extracted && !thinPage && !textTruncated
-        let hint: JSONValue = thinPage ? .string("The fetched text is thin or requires JavaScript; it does not establish the rendered page's content. Follow next_call to open and read it in your Chrome tab.") : .null
+        let hint: JSONValue = thinPage ? .string("""
+            The fetched text is thin or requires JavaScript; it does not establish the rendered page's content. Follow next_call to open and read it in your \
+            Chrome tab.
+            """) : .null
         var verdict: [String: JSONValue] = ["status": .string(extracted ? (complete ? "completed" : (text.isEmpty ? "failed" : "partial")) : "failed")]
         if !extracted { verdict["reason"] = .string(status) }
         else if thinPage { verdict["reason"] = .string("thin_page"); verdict["hint"] = hint }
@@ -243,19 +249,30 @@ extension SwiftNativeResearchClient {
             "text_truncated": .bool(textTruncated),
             "complete": .bool(complete),
             "note": .string(extracted
-                ? "Text covers the retained response body, without a DOM node cutoff. HTML keeps paragraphs, list items, table rows and inline link targets; scripts and page chrome are omitted. Tool-output paging may expose sections: follow next_call (result.page with next_page), or sense_more when a sense serves the page, to read on. Body truncation means the source was not fully read; a continuation cannot recover bytes beyond the response bound."
+                ? """
+                    Text covers the retained response body, without a DOM node cutoff. HTML keeps paragraphs, list items, table rows and inline link targets; \
+                    scripts and page chrome are omitted. Tool-output paging may expose sections: follow next_call (result.page with next_page), or sense_more \
+                    when a sense serves the page, to read on. Body truncation means the source was not fully read; a continuation cannot recover bytes beyond \
+                    the response bound.
+                    """
                 : "No readable text was extracted. Discover an appropriate reader for this content type or encoding; this is not an empty-page finding."),
         ])
         let sourceID = UUID().uuidString.lowercased()
-        // The locator names the receipt this call actually writes. It is not
-        // an access grant, a permanent archive, or a promise of future presence.
+        // The locator names the receipt this call actually writes. It is not an access grant, a permanent archive, or a promise of future presence.
         let receiptPath = receiptsDir.appendingPathComponent("source-\(sourceID).json")
         let sourceReceipt: JSONValue = .object([
             "path": .string(receiptPath.path),
-            "purpose": .string("Source receipt: this read kept the extracted text and coverage here so you can inspect or cite what was actually read without fetching again."),
+            "purpose": .string("""
+                Source receipt: this read kept the extracted text and coverage here so you can inspect or cite what was actually read without fetching again.
+                """),
             "source_id": .string(sourceID),
-            "contents": .string("JSON with retained extracted text (if any) and coverage from this bounded read. Content beyond the response byte bound is not retained."),
-            "retention": .string("Limited local retention: newest \(Self.receiptRetentionLimit) mixed search/fetch receipts. May be pruned or removed; no fixed expiry is promised."),
+            "contents": .string("""
+                JSON with retained extracted text (if any) and coverage from this bounded read. Content beyond the response byte bound is not retained.
+                """),
+            "retention": .string("""
+                Limited local retention: newest \(Self.receiptRetentionLimit) mixed search/fetch receipts. May be pruned or removed; no fixed expiry is \
+                promised.
+                """),
             "read_tool": .string("app"),
             "read_args": .object([
                 "action": .string("files.read"),
@@ -274,10 +291,7 @@ extension SwiftNativeResearchClient {
     }
 
 
-    /// The target of a `<meta http-equiv="refresh" content="N; url=…">` in the
-    /// document head, resolved against the page's URL; nil when the head has
-    /// none or it is not http(s). Comments, scripts and styles are not markup,
-    /// so they are stripped first; a no-JS reader honours one inside noscript.
+    /// Strip comments, scripts and styles before resolving a head meta refresh so non-markup cannot manufacture a redirect. A no-JS read honors noscript.
     static func metaRefreshTarget(_ document: String, base: URL) throws -> URL? {
         try Task.checkCancellation()
         var html = document.replacingOccurrences(of: #"<!--[\s\S]*?-->|<(script|style)\b[\s\S]*?</\1\s*>"#,
@@ -299,8 +313,8 @@ extension SwiftNativeResearchClient {
     }
 
 
-    /// Decode common named and numeric HTML references; leave unknown references verbatim.
-    /// Entity lookup spans at most 32 characters; decoding checks cancellation.
+    /// Decode common named and numeric HTML references; leave unknown references verbatim. Entity lookup spans at most 32 characters; decoding checks
+    /// cancellation.
     static func decodeHTMLEntities(_ s: String) throws -> String {
         try Task.checkCancellation()
         guard s.contains("&") else { return s }

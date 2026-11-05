@@ -37,7 +37,7 @@ extension NativeAgentA2AWire {
     static func task(_ task: AgentContactTask) -> [String: Any] {
         var result: [String: Any] = ["kind": "task", "id": task.id, "contextId": task.context, "status": status(task)]
         let parts = task.parts.isEmpty ? (task.text.isEmpty ? [] : [AgentContactPart.text(task.text)]) : task.parts
-        var artifacts: [[String: Any]] = parts.isEmpty ? [] : [["artifactId": task.id + "-reply", "parts": parts.map(\.wire03)]]
+        var artifacts: [[String: Any]] = task.replyArtifacts(parts).map { ["artifactId": $0.id, "parts": $0.parts.map(\.wire03)] }
         artifacts += (task.delegatedCompletions ?? [:]).sorted { $0.key < $1.key }.map {
             ["artifactId": $0.key, "parts": [$0.value.wire03]]
         }
@@ -69,14 +69,14 @@ extension NativeAgentA2AWire {
     }
     public static func event(_ event: AgentContactEvent, id: Any, version: String = "0.3") -> [String: Any] {
         if version == "1.0" {
-            let legacy = Self.event(event, id: id)
+            let v03 = Self.event(event, id: id)
             let key: String
             switch event {
             case .snapshot: key = "task"
             case .status: key = "statusUpdate"
             case .artifact: key = "artifactUpdate"
             }
-            do { return result(id, [key: try project(legacy["result"] as! [String: Any], version: version)]) }
+            do { return result(id, [key: try project(v03["result"] as! [String: Any], version: version)]) }
             catch { return Self.error(id, -32603, "The task update could not be encoded") }
         }
         switch event {

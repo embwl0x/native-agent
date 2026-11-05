@@ -4,13 +4,11 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `LoopStatusEvidence.swift` | WatchdogStatus wire encoding, scheduler LoopState, LoopStatus and event-listener health evidence |
 
-/// Live app-owned runtime and execution evidence.
 public struct WatchdogStatus: Sendable, Encodable, Equatable {
     public var uptimeSeconds: Double
     public var runtimeLifecycleStatus: String
     public var runtimeLifecycleDetail: String
     public var runningImprovements: Int
-    public var runningExecutions: Int
     public var lastActivity: JSONValue?
     public var repairAvailable: Bool
     public var extras: JSONValue?
@@ -20,7 +18,6 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
         runtimeLifecycleStatus: String,
         runtimeLifecycleDetail: String,
         runningImprovements: Int,
-        runningExecutions: Int,
         lastActivity: JSONValue? = nil,
         repairAvailable: Bool,
         extras: JSONValue? = nil
@@ -29,7 +26,6 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
         self.runtimeLifecycleStatus = runtimeLifecycleStatus
         self.runtimeLifecycleDetail = runtimeLifecycleDetail
         self.runningImprovements = runningImprovements
-        self.runningExecutions = runningExecutions
         self.lastActivity = lastActivity
         self.repairAvailable = repairAvailable
         self.extras = extras
@@ -38,7 +34,7 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
     private static let knownKeys: Set<String> = [
         "uptimeSeconds",
         "runtimeLifecycleStatus", "runtimeLifecycleDetail",
-        "runningImprovements", "runningExecutions",
+        "runningImprovements",
         "lastActivity",
         "repairAvailable",
         "extras",
@@ -50,27 +46,25 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
         try c.encode(runtimeLifecycleStatus, forKey: JSONKey("runtimeLifecycleStatus"))
         try c.encode(runtimeLifecycleDetail, forKey: JSONKey("runtimeLifecycleDetail"))
         try c.encode(runningImprovements, forKey: JSONKey("runningImprovements"))
-        try c.encode(runningExecutions, forKey: JSONKey("runningExecutions"))
         try c.encodeIfPresent(lastActivity, forKey: JSONKey("lastActivity"))
         try c.encode(repairAvailable, forKey: JSONKey("repairAvailable"))
         try c.encodeUnknownFields(extras, excluding: Self.knownKeys)
     }
 }
 
-/// Snapshot of settled outcomes and projected timing.
 public struct LoopState: Sendable, Equatable {
     public var loopId: String
     public var lastTickAt: Date?
-    /// Periodic projection, also advanced by event/out-of-band accounting; not the retained sleeper.
+    /// Rhythms project their next tick; change-woken organs have no periodic tick.
     public var nextTickAt: Date?
     public var lastResult: String?
     public var lastError: String?
     public var tickCount: Int
 
-    /// Durable last real completion; failures and skips advance only lastTickAt.
+    /// Failures and skips advance attempts, never the durable real-completion stamp.
     public var lastCompletedAt: Date?
 
-    /// Durable first registration, the dormancy floor until real work completes.
+    /// Use first registration as the dormancy floor until real work completes.
     public var firstSeenAt: Date?
 
     public init(
@@ -96,18 +90,13 @@ public struct LoopState: Sendable, Equatable {
 
 /// Listener health distinguishes loops without listeners from stopped streams.
 public struct LoopEventListenerHealth: Sendable, Equatable {
-    /// A listener task is currently consuming the stream.
     public var active: Bool
-    /// When the stream last ended on its own (nil = it never has).
+    /// Nil means no unexpected stream end has been observed.
     public var lastEndedAt: Date?
-    /// How many times this loop's listener has been restarted since
-    /// registration. Monotonic; a healthy loop stays at 0.
+    /// Keep restart count monotonic across the registration so repeated listener failures remain visible.
     public var restartCount: Int
-    /// Ends since the last event actually arrived. Reset by a delivered event,
-    /// which is the only proof the replacement listener is really working — a
-    /// stream that ends immediately on every restart keeps climbing.
+    /// Reset consecutive ends only on delivered input, the sole proof that a replacement listener works.
     public var consecutiveEnds: Int
-    /// Human-readable last termination, carried into Doctor.
     public var lastError: String?
 
     public init(
@@ -127,34 +116,31 @@ public struct LoopEventListenerHealth: Sendable, Equatable {
 
 public struct LoopStatus: Sendable, Equatable {
     public let name: String
-    public let interval: TimeInterval
+    /// Nil means the registration is disabled or unreadable, never a guessed rhythm.
+    public let wake: OrganWake?
     public let lastRun: Date?
     public let nextRun: Date?
     public let runCount: Int
     public let lastError: String?
     public let running: Bool
     public let disabledReason: String?
-    /// A loop body is executing right now. This differs from `running`, which
-    /// only means the manager owns an active scheduler registration.
+    /// Running registration does not prove body execution; expose the actual execution gate separately.
     public let executing: Bool
     public let executionStartedAt: Date?
-    /// Watchdog budget for the active tick.
     public let executionTimeout: TimeInterval
-    /// nil for loops that are not event-driven at all.
+    /// Nil distinguishes non-event-driven loops from broken listeners.
     public let eventListener: LoopEventListenerHealth?
 
-    /// Most recent outcome text, including the reason a loop skipped work.
     public let lastResult: String?
 
-    /// Durable last real completion; failures and skips advance only lastRun.
+    /// Failures and skips cannot advance the durable real-completion stamp.
     public let lastSuccessfulWorkAt: Date?
-    /// When this loop was first registered on this machine (durable). Dormancy
-    /// is measured from max(firstSeen, lastSuccessfulWork).
+    /// Measure dormancy from the later durable first registration or real completion, never skipped work.
     public let firstSeenAt: Date?
 
     public init(
         name: String,
-        interval: TimeInterval = 300,
+        wake: OrganWake?,
         lastRun: Date?,
         nextRun: Date?,
         runCount: Int,
@@ -170,7 +156,7 @@ public struct LoopStatus: Sendable, Equatable {
         firstSeenAt: Date? = nil
     ) {
         self.name = name
-        self.interval = interval
+        self.wake = wake
         self.lastRun = lastRun
         self.nextRun = nextRun
         self.runCount = runCount

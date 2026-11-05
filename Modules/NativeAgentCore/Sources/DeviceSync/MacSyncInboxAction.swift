@@ -4,11 +4,8 @@ import NativeAgentShared
 
 typealias InboxAction = NativeAgentShared.InboxAction
 
-/// File-boundary identity for an iOS action. Both identifiers originate in a
-/// remote envelope and are used as local/iCloud filenames, so they must be
-/// canonical UUID strings before any path is derived or any transaction state
-/// is written. The original spelling is retained because it is also the wire
-/// correlation identity expected by the phone.
+/// Remote UUIDs become filenames, so validate them before path derivation or ledger writes. Preserve original spelling because the phone uses it as wire
+/// correlation identity.
 struct ValidatedInboxActionIDs: Equatable, Sendable {
     let messageID: String
     let transactionID: String

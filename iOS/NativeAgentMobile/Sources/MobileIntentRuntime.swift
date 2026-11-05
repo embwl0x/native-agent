@@ -2,8 +2,7 @@ import Foundation
 import NativeAgentShared
 // Blueprint: | `MobileIntentRuntime.swift` | `MobileIntentRuntime` enum; `prepare`, `agent` |
 
-/// Siri and notification actions use the same signed transport owners as the
-/// phone UI, including when no scene has mounted yet.
+/// Use shared signed transport for Siri and notifications even before a scene mounts.
 @MainActor
 enum MobileIntentRuntime {
     private static var retainedPairing: PairingStore?
@@ -45,8 +44,7 @@ enum MobileIntentRuntime {
     }
 
     static var phoneConversationID: String {
-        // Siri continues the conversation User is in, whichever door he last
-        // spoke at — not whatever the chat screen last adopted.
+        // Continue the Mac's current conversation, not the last session this screen adopted.
         if let anchor = iCloudSyncEngine.shared.chatAnchor?.cleanSessionId { return anchor }
         if let pending = ChatStore.shared.locallyCreatedSessionID { return pending }
         let id = UUID().uuidString
@@ -62,9 +60,7 @@ enum MobileIntentRuntime {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw failure("Enter a message to send.")
         }
-        // The ordinary phone conversation is included in Mac transcript
-        // snapshots. Retain the first identity before sending, just as the UI
-        // does, so another invocation cannot create a new chat while sync lags.
+        // Retain the first phone conversation identity before sending so another invocation cannot fork a chat while snapshots lag.
         let session = sessionID ?? phoneConversationID
         let id = UUID().uuidString
         let bridge = iCloudBridge.shared
@@ -106,7 +102,8 @@ enum MobileIntentRuntime {
             await waiters.wait(id, timeout: min(ChatStore.iCloudReplyNudgeFloorSeconds, max(0, deadline.timeIntervalSinceNow)))
         }
         if let result { return try result.get() }
-        throw failure("Your message was sent, but the Mac has not replied yet. Open NativeAgent to read the reply; running this shortcut again sends a new message.")
+        throw failure(
+            "Your message was sent, but the Mac has not replied yet. Open NativeAgent to read the reply; running this shortcut again sends a new message.")
     }
 
     static func pendingApprovals() async throws -> [ApprovalRequest] {
@@ -144,9 +141,7 @@ enum MobileIntentRuntime {
     }
 
     private static func receiveRetainedChatMessage(_ message: BridgeMessage) {
-        // The scene's observer owns visible chat. On cold intent launch, settle
-        // retained exchanges through that same store; unrelated transcripts
-        // arrive through snapshots, without appending duplicate unsolicited rows.
+        // Cold intents settle through the scene's shared store; unrelated transcript rows arrive through snapshots to avoid duplicates.
         guard ChatStore.visibleStore == nil, let id = message.correlationID,
               ChatStore.shared.pendingExchanges[id] != nil else { return }
         Task { await ChatStore.shared.receiveICloudReply(message) }

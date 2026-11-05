@@ -27,8 +27,6 @@ package struct StructuredChatExecution: Sendable {
     }
 }
 
-/// SwiftNative ChatOrchestrationClient — composes the in-process Swift
-/// building blocks into a single chat()/chatStream() surface.
 public actor SwiftNativeChatOrchestrationClient {
     let engine: SwiftNativeTurnEngine
     let tools: any ToolDispatchClient
@@ -42,33 +40,31 @@ public actor SwiftNativeChatOrchestrationClient {
     let continuationCapabilityProfile: String?
     let cognitiveRuntime: (any CognitiveRuntimeProviding)?
     let providerLifecycleObserverInstalled: Bool
-    private let configuredAutocompaction: ChatSessionAutocompactionConfig?
-    var autocompactionConfig: ChatSessionAutocompactionConfig {
-        configuredAutocompaction ?? .productionDefault()
-    }
     let clock: @Sendable () -> Date
 
-    /// Parts waking between turns use the same client and checked Chat pick,
-    /// read at each `model.call`: a run that never thinks needs no model.
-    public func withCurrentChatModel<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
-        // A wake inherits no turn's model: it is chosen fresh at its model.call.
-        try await ProviderTurnChoice.$current.withValue(nil) {
-        try await LLMCallContext.$admittedModel.withValue(nil) {
-        try await LLMCallContext.$surface.withValue("chat") {
-        try await SkillRunContext.$admitModel.withValue({ call in
-            try await self.withModelContext(try await self.engine.router.checkedRouteAdmission(for: "chat"), surface: "chat", call)
-        }, operation: body)
+    /// The wake's host receives a lazy admission dependency. Only its
+    /// `model.call` invokes it, passing the turn that call serves.
+    public func withCurrentChatModel<T: Sendable>(turn: Turn,
+        _ body: @Sendable (Turn, @escaping @Sendable (Turn) async throws -> Turn) async throws -> T
+    ) async rethrows -> T {
+        let wake = turn.with(\.client, llm).with(\.admission, nil).with(\.providerChoice, nil)
+        let admit: @Sendable (Turn) async throws -> Turn = { [self] turn in
+            let admission = try await self.engine.router.checkedRouteAdmission(for: "chat")
+            return try await self.withModelContext(admission, surface: "chat", turn: turn) { $0 }
         }
-        }
-        }
+        return try await body(wake, admit)
     }
 
     func withModelContext<T: Sendable>(_ admission: TurnRouteAdmission, surface: String,
-                                     _ body: () async throws -> T) async rethrows -> T {
-        try await LLMCallContext.$client.withValue(llm) {
-        try await LLMCallContext.$surface.withValue(surface) {
-        try await admission.withModelContext(body)
-        } }
+        turn: Turn, _ body: (Turn) async throws -> T
+    ) async throws -> T {
+        guard let provider = admission.providerId else {
+            throw ProviderRoutingError.configurationFailed("The turn's admitted provider is unavailable.")
+        }
+        let held = turn.with(\.client, llm).with(\.admission,
+            ModelAdmission(provider: provider, model: admission.modelId,
+                reasoningEffort: admission.reasoningEffort, serviceTier: turn.requestedServiceTier ?? admission.serviceTier))
+        return try await body(held)
     }
 
     public init(
@@ -84,15 +80,14 @@ public actor SwiftNativeChatOrchestrationClient {
         continuationCapabilityProfile: String? = nil,
         cognitiveRuntime: (any CognitiveRuntimeProviding)? = nil,
         providerLifecycleObserverInstalled: Bool = false,
-        autocompactionConfig: ChatSessionAutocompactionConfig? = nil,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         // Reuse the executable parser; malformed or unknown calls remain actions.
-        RunawayOutputDetector.registerReadOnlyCalls { block in
+        RunawayOutputDetector.registerReadOnlyCalls { block, turn in
             let calls = ToolCallParser.parse(block, parseInvoke: true, recordShims: false)
             guard calls.count == 1, let call = calls.first, call.undeclaredKeys.isEmpty else { return false }
-            if call.name == "app" { return RunawayOutputDetector.isAppReadOnly(call.input) }
-            return ParallelToolDispatch.isParallelSafe(internalToolName: call.name, input: call.input)
+            if call.name == "app" { return RunawayOutputDetector.isAppReadOnly(call.input, turn: turn) }
+            return ParallelToolDispatch.isParallelSafe(internalToolName: call.name, input: call.input, turn: turn)
         }
         self.engine = engine
         self.tools = tools
@@ -106,7 +101,6 @@ public actor SwiftNativeChatOrchestrationClient {
         self.continuationCapabilityProfile = continuationCapabilityProfile
         self.cognitiveRuntime = cognitiveRuntime
         self.providerLifecycleObserverInstalled = providerLifecycleObserverInstalled
-        self.configuredAutocompaction = autocompactionConfig
         self.clock = clock
     }
 
@@ -122,14 +116,17 @@ public actor SwiftNativeChatOrchestrationClient {
         persona: String? = nil,
         surface: String = "chat",
         suppressUserAppend: Bool,
-        progress: TurnEventSink? = nil
+        progress: TurnEventSink? = nil,
+        turn: Turn,
+        serviceTier: String? = nil,
+        work: ChatTurnWork = .init()
     ) async throws -> ChatResponse {
         return try await chatExecution(
             message: message, sessionId: sessionId, model: model,
             reasoningEffort: reasoningEffort, fileAccess: fileAccess,
             attachments: attachments, persona: persona, surface: surface,
             suppressUserAppend: suppressUserAppend,
-            progress: progress
+            progress: progress, turn: turn, serviceTier: serviceTier, work: work
         ).responseOrThrow()
     }
 
@@ -143,43 +140,38 @@ public actor SwiftNativeChatOrchestrationClient {
         persona: String?,
         surface: String,
         suppressUserAppend: Bool,
-        progress: TurnEventSink?
+        progress: TurnEventSink?,
+        turn: Turn,
+        serviceTier: String? = nil,
+        work: ChatTurnWork = .init()
     ) async throws -> StructuredChatExecution {
-        // Every turn owns execution and peer provenance, preserving outer scopes.
-        return try await PeerDataTaint.withScope {
-        try await ChatTurnExecution.$current.withValue(ChatTurnExecution.current ?? ChatTurnExecution()) {
-        return try await StandingBotContinuity.withSessionContract(sessionID: sessionId, dataRoot: dataRoot) {
-        let admission = try await engine.router.checkedRouteAdmission(
-            for: surface,
-            requestedModel: model,
-            requestedReasoningEffort: reasoningEffort
-        )
-        let prefixTelemetrySink = ConversationPrefixTelemetrySink()
-        return try await ConversationPrefixTelemetry.$sink.withValue(prefixTelemetrySink) {
-        try await withModelContext(admission, surface: surface) {
-            var execution = try await executeStructuredChatStreaming(
-                message: message,
-                sessionId: sessionId,
-                model: admission.modelId,
-                reasoningEffort: admission.reasoningEffort,
-                fileAccess: fileAccess,
-                attachments: attachments,
-                persona: persona,
-                surface: surface,
-                suppressUserAppend: suppressUserAppend,
-                // Saved conversational evidence must not depend on whether
-                // this caller consumes live progress (bridge vs. Telegram).
-                // chat() callers await the reply; deltas they draw (Telegram's
-                // draft) are a preview, not the answer.
-                progress: progress
-            )
-            let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
-            execution.response.requestedModel = requested.isEmpty ? nil : requested
-            return execution
-        }
-        }
-        }
-        }
+        var turn = turn
+        turn.peerSteering = turn.peerSteering ?? PeerDataTaint()
+        turn.execution = turn.execution ?? ChatTurnExecution()
+        if let serviceTier { turn = turn.with(\.requestedServiceTier, serviceTier) }
+        turn.fileAccess = fileAccess
+        turn.userText = message
+        return try await StandingBotContinuity.withSessionContract(
+            sessionID: sessionId, dataRoot: dataRoot, turn: turn) { turn in
+            let choice = turn.botContract?.choice ?? turn.providerChoice
+            let admission = try await engine.router.checkedRoutingSnapshot().routeAdmission(
+                for: surface, requestedModel: model, requestedReasoningEffort: reasoningEffort, choice: choice)
+            guard let admittedReasoningEffort = admission.reasoningEffort else {
+                throw ProviderRoutingError.configurationFailed("The turn's admitted reasoning effort is unavailable.")
+            }
+            var work = work
+            work.prefixTelemetry = ConversationPrefixTelemetrySink()
+            return try await withModelContext(admission, surface: surface, turn: turn) { turn in
+                var execution = try await executeStructuredChatStreaming(
+                    message: message, sessionId: sessionId, model: admission.modelId,
+                    reasoningEffort: admittedReasoningEffort, fileAccess: fileAccess,
+                    attachments: attachments, persona: persona, surface: surface,
+                    suppressUserAppend: suppressUserAppend, progress: progress,
+                    turn: turn, work: work)
+                let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
+                execution.response.requestedModel = requested.isEmpty ? nil : requested
+                return execution
+            }
         }
     }
 }

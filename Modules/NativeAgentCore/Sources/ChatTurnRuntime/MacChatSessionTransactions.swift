@@ -3,9 +3,8 @@ import Observation
 import Transcripts
 import NativeAgentShared
 import NativeAgentCore
-// Blueprint: | `MacChatSessionTransactions.swift` | explicit selection intent/transactions, live direct automatic selection, load-completion waiter and running-session navigation; `LatestRead` owns session-index publication, and committed create/open/rename changes use `write`; selection and durable rename intents retain their independent action identities |
+// Blueprint: | `MacChatSessionTransactions.swift` | `LatestRead`; `write`; Transactional selection and rename |
 
-/// Canonical transcript operations, implemented by the existing Core facade.
 @MainActor
 public protocol MacChatSessionStore: AnyObject {
     var sessions: [NativeAgentShared.ChatSession] { get set }
@@ -26,9 +25,7 @@ public protocol MacChatSessionSelectionPort: AnyObject {
     func commitChatSessionSelection(_ requestedId: String)
 }
 
-/// Serializes durable session-index mutations without holding an actor across
-/// a re-entrant await. A newer rename intent can supersede a queued older one;
-/// once a write has started, the next intent waits and writes last.
+/// Serialize durable writes without holding actor state across awaits; queued stale renames may yield, but a started write completes first.
 actor ChatRenameMutationGate {
     private var held = false
     private var waiters: [ScopedWaiter] = []
@@ -84,7 +81,7 @@ public final class MacChatSessionTransactions {
 
     public func existingMainSession(in sessions: [NativeAgentShared.ChatSession], anchorSessionId: String? = nil,
                                     currentSelection: String? = nil) -> NativeAgentShared.ChatSession? {
-        let direct = sessions.filter { $0.archived != true && SessionConversation.kind($0).isHisConversation }
+        let direct = sessions.filter { $0.archived != true && SessionConversation.kind($0).isPersonConversation }
         return direct.first(where: { $0.id == anchorSessionId })
             ?? direct.first(where: { $0.id == currentSelection })
             ?? direct.first(where: { isMainAppSourceKey($0.sourceKey) })
@@ -125,9 +122,7 @@ public final class MacChatSessionTransactions {
         load: (String) async throws -> Void
     ) async {
         guard !requestedId.isEmpty else { return }
-        // The human has picked a session. From here on this launch the main
-        // window stops defaulting to the conversation anchor — never yank
-        // someone off a session they chose.
+        // A user-selected session outranks the conversation anchor for the rest of this launch.
         if userInitiated { MacChatSelectionIntent.noteUserChoice() }
         port.chatSelectionGeneration += 1
         let generation = port.chatSelectionGeneration
@@ -164,13 +159,9 @@ public final class MacChatSessionTransactions {
         chatRenameIntentGeneration[sessionId] = intent
         await chatRenameMutationGate.acquire()
         defer { Task { await chatRenameMutationGate.release() } }
-        // A newer request arrived while this one was waiting. Do not write an
-        // obsolete title; the newest queued intent owns the durable index.
+        // Skip obsolete queued titles so the newest rename intent owns the final durable value.
         guard chatRenameIntentGeneration[sessionId] == intent else { return }
-        // Both visible rename controls already prevent an unchanged commit, but
-        // keep that no-write guarantee at their shared durable owner too. A
-        // recycled/focus-lost editor must not needlessly touch the session
-        // index or publish a snapshot.
+        // Enforce unchanged-title no-op at the durable owner so recycled editors cannot rewrite or republish the index.
         if store.sessions.first(where: { $0.id == sessionId })?.title == cleanTitle {
             return
         }
@@ -198,10 +189,7 @@ private func isMainAppSourceKey(_ sourceKey: String?) -> Bool {
     return raw.hasSuffix("_app")
 }
 
-/// Testable action seam for stale session-index races. A route rendered from
-/// live `streamingSessions` first resolves the current index, then performs one
-/// canonical refresh before admitting defeat. Selection itself remains owned
-/// by AppModel's transactional selector.
+/// Resolve live routes through the current index, then one canonical refresh; transactional selection stays with AppModel.
 public enum MacChatRunningSessionNavigation {
     @MainActor
     public static func navigate(
@@ -226,28 +214,16 @@ public enum MacChatRunningSessionNavigation {
     }
 }
 
-
-/// Whether the human has explicitly picked a chat session since this launch.
-///
-/// THE RULE: the main window defaults to the conversation anchor — the remote
-/// conversation User is currently in, on whichever surface — but it must NEVER
-/// take him off a session he chose himself. Same protection iOS already gives
-/// itself in `shouldReturnToMainSession`: a snapshot arriving mid-thought does
-/// not get to move the screen.
-///
-/// Process-scoped rather than persisted, and that is the point. "This launch"
-/// is the window in which his choice is still current; a choice from last week
-/// should not outrank the conversation he is having right now.
+/// The conversation anchor may choose the launch default but cannot override a session the user explicitly picked.
+/// Keep this process-scoped so an old launch's choice cannot outrank the user's current conversation.
 @MainActor
 public enum MacChatSelectionIntent {
     public private(set) static var userChoseThisLaunch = false
 
-    /// The anchor Simple last followed or was taken off by a choice. Simple
-    /// moves only when the anchor moves past this.
+    /// Follow only anchors newer than the one Simple last followed or the user explicitly left.
     public static var lastSeenAnchorSessionId: String?
 
-    /// Called wherever the human's own intent selects a session — picking one
-    /// in the sidebar, or creating a new one.
+    /// Record explicit user selection, including sidebar picks and newly created sessions.
     public static func noteUserChoice() {
         userChoseThisLaunch = true
         lastSeenAnchorSessionId = ConversationAnchor.currentSessionId()

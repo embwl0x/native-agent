@@ -68,12 +68,14 @@ public enum ChatMessageClearError: Error, LocalizedError, Sendable {
         case .transcriptClearedMetadataNotSaved(let reason):
             return "Messages were cleared, but conversation metadata could not be saved: \(reason)"
         case .transcriptVersionExhausted:
-            return "This conversation's transcript version cannot advance any further, so clearing it could not be published to your other devices. Nothing was deleted."
+            return """
+                This conversation's transcript version cannot advance any further, so clearing it could not be published to your other devices. \
+                Nothing was deleted.
+                """
         }
     }
 }
-/// One transcript, projected for the UI: the messages a view renders and
-/// the recollections the same rows carry, read together.
+/// Read displayed messages and cards from the same transcript.
 public struct TranscriptReadout: Sendable {
     public enum ReadStatus: Equatable, Sendable {
         case loading, current
@@ -87,8 +89,6 @@ public struct TranscriptReadout: Sendable {
         public let repeatCount: Int
     }
     public var messages: [ChatMessage]
-    /// Oldest first, in transcript order as decoded by the shared row parser.
-    public let recollections: [ChatSessionRecollection]
     var interactions: [(rowID: String, interaction: InlineInteraction)] = []
     public var cardsHeading: String = ""
     public var cardsByRow: [String: [Card]] {
@@ -96,22 +96,15 @@ public struct TranscriptReadout: Sendable {
     }
     public var readStatus: ReadStatus = .current
 
-    public static let empty = TranscriptReadout(messages: [], recollections: [])
-    public init(messages: [ChatMessage], recollections: [ChatSessionRecollection]) {
+    public static let empty = TranscriptReadout(messages: [])
+    public init(messages: [ChatMessage]) {
         self.messages = messages
-        self.recollections = recollections
     }
 }
-public struct MessageGroup: Identifiable, Sendable {
-    public var id: String
-    public var messages: [ChatMessage]
-    public var isToolGroup: Bool
-    /// Set when this row follows more than an hour of quiet: when it began.
-    public var gapAbove: Date? = nil
-}
-/// Cards persist on their tool row but mount below the following readable reply when present.
+/// A Mac conversation's groups are the shared transcript groups over its rows.
+public typealias MessageGroup = TranscriptGroup<ChatMessage>
+/// Persist cards on tool rows while mounting them under the next readable reply.
 public enum InlineCardMount {
-    /// Card hosts and the tool rows whose cards were relocated within this page.
     public struct Map {
         public var byHost: [String: [String]] = [:]
         public var relocated: Set<String> = []
@@ -121,51 +114,23 @@ public enum InlineCardMount {
         let byHost = hosts(groups: groups)
         var mount = Map(byHost: byHost, relocated: Set(byHost.values.joined()))
         if case .unavailable = readStatus { return mount }
-        // Prepared groups own placement; current messages own request state.
+        // Prepared groups own placement; live messages own request state.
         let rowIDs = Set(groups.flatMap { $0.messages.map(\.id) })
         for message in messages where rowIDs.contains(message.id) {
             mount.cardsByRow[message.id] = message.inlineCards.map(\.model)
         }
         return mount
     }
-    /// Assistant row id → ordinary tool rows whose cards mount under it.
     static func hosts(groups: [MessageGroup]) -> [String: [String]] {
-        var hosts: [String: [String]] = [:]
-        for (index, group) in groups.enumerated() where group.isToolGroup {
-            guard index + 1 < groups.count else { continue }
-            let next = groups[index + 1]
-            guard !next.isToolGroup,
-                  let reply = next.messages.first,
-                  reply.role == "assistant",
-                  isReadableReply(reply.content)
-            else { continue }
-            hosts[reply.id, default: []].append(contentsOf: group.messages.filter { $0.metadata?.interactionMirror == nil }.map(\.id))
-        }
-        return hosts
+        TranscriptGrouping.cardHosts(groups)
     }
-    /// Only visible prose can host cards; protocol-only tool-use markers draw no reply.
-    static func isReadableReply(_ content: String) -> Bool {
-        var visible = ""
-        var rest = Substring(content)
-        while let open = rest.range(of: "<tool_use") {
-            visible += rest[rest.startIndex..<open.lowerBound]
-            let after = rest[open.upperBound...]
-            if let close = after.range(of: "</tool_use>") {
-                rest = after[close.upperBound...]
-            } else if let end = after.range(of: ">") {
-                rest = after[end.upperBound...]
-            } else {
-                rest = after[after.endIndex...]
-            }
-        }
-        visible += rest
-        return visible.contains { !$0.isWhitespace }
+    /// The reply's words without its protocol `<tool_use …>` markers, which draw nothing.
+    public static func readableText(_ content: String) -> String {
+        TranscriptGrouping.readableText(content)
     }
 }
 public enum MessageGrouper {
-    /// Historical groups stay shared and immutable while the streaming tail
-    /// changes. Materializing a visible page copies at most that page, rather
-    /// than triggering a copy of the entire cached array on every delta.
+    /// Share immutable history while streaming changes so visible-page materialization cannot copy the whole cache per delta.
     public struct GroupedTranscript: RandomAccessCollection, Sendable {
         let base: [MessageGroup]
         var liveTail: MessageGroup?
@@ -177,8 +142,7 @@ public enum MessageGrouper {
             if position == endIndex - 1, let liveTail { return liveTail }
             return base[position]
         }
-        /// Structural preparation stays shared; the current rows supply the
-        /// reply's content so a settled reply never returns to its first copy.
+        /// Share structure but read current reply content so settled replies cannot return to their first copy.
         func readingTail(from messages: [ChatMessage]) -> GroupedTranscript {
             guard var tail = last, !tail.isToolGroup, tail.messages.count == 1,
                   let current = messages.last(where: { $0.id == tail.messages[0].id }) else { return self }
@@ -188,45 +152,10 @@ public enum MessageGrouper {
             return projection
         }
     }
-    static func projection(for messages: [ChatMessage]) -> GroupedTranscript {
+    public static func projection(for messages: [ChatMessage]) -> GroupedTranscript {
         GroupedTranscript(base: _compute(for: messages))
     }
     static func _compute(for messages: [ChatMessage]) -> [MessageGroup] {
-        var result: [MessageGroup] = []
-        var toolRun: [ChatMessage] = []
-        func flushTools() {
-            guard !toolRun.isEmpty else { return }
-            // The first tool owns the stable identity of its growing run.
-            result.append(MessageGroup(id: "toolrun-" + (toolRun.first?.id ?? UUID().uuidString), messages: toolRun, isToolGroup: true))
-            toolRun = []
-        }
-        for msg in messages {
-            // Tool-summary system rows are memory aids, not chat bubbles.
-            if msg.role == "system" && msg.content.hasPrefix("[tool:") { continue }
-            if msg.role == "tool", msg.metadata?.interactionMirror == nil {
-                toolRun.append(msg)
-            } else if msg.metadata?.interactionMirror != nil {
-                // A mirrored card is its own row, always, never folded into a tool run.
-                flushTools()
-                result.append(MessageGroup(id: msg.id, messages: [msg], isToolGroup: true))
-            } else {
-                flushTools()
-                result.append(MessageGroup(id: msg.id, messages: [msg], isToolGroup: false))
-            }
-        }
-        flushTools()
-        // A row after an hour of quiet carries its time, so a morning message
-        // never reads as the end of last night's reply.
-        var previous: Date?
-        for index in result.indices {
-            let group = result[index]
-            let first = group.messages.first.flatMap { UserDisplayFormatters.parseISOTimestamp($0.createdAt) }
-            if let first, let previous, first.timeIntervalSince(previous) > quietGap {
-                result[index].gapAbove = first
-            }
-            previous = group.messages.last.flatMap { UserDisplayFormatters.parseISOTimestamp($0.createdAt) } ?? previous
-        }
-        return result
+        TranscriptGrouping.groups(messages)
     }
-    static let quietGap: TimeInterval = 60 * 60
 }

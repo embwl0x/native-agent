@@ -2,8 +2,7 @@ import AppToolRuntime
 import NativeAgentCore
 import NativeAgentShared
 
-// Blueprint: | `MoodTint.swift` | Mood tint presentation: sampled canonical mood, damping/caps and accessibility-aware glass modifiers without independent feeling state |
-// One capped warmth axis preserves luminosity and tints glass or cards once, outside prose, with accessibility collapse.
+// Blueprint: | `MoodTint.swift` | Canonical mood sampling, capped damping and accessibility-aware glass |
 
 import AppKit
 import Cognition
@@ -12,45 +11,29 @@ import SwiftUI
 
 // MARK: - The weather
 
-/// The scalar source, the low-pass and the drain. One number, damped in time.
-/// The LEVEL is persisted so a relaunch resumes where the room was; the elapsed
-/// baseline is not, so no shutdown gap and no clock change is ever integrated.
+/// Persist the level, not the elapsed baseline, so relaunch and clock changes cannot integrate shutdown time.
 @MainActor
 @Observable
 final class MoodTintWeather {
     static let shared = MoodTintWeather()
 
-    /// The cap. 0.10 of the warm hue at `BlendMode.color` measures ΔE00 ≈ 3 on
-    /// the glass against the same pixel at rest — a breath, not a colour.
-    /// Chroma on a near-neutral dark ground is read far more readily than a
-    /// luminance nudge of the same size, which is why this can be so small and
-    /// still be felt.
+    /// Cap warm colour at 0.10 (~ΔE00 3 on glass): near-neutral dark grounds make small chroma shifts readily visible.
     static let cap: Double = 0.10
 
-    /// The hue: the room's own lamp colour (`ShellLamp`), pulled down so it
-    /// reads as the room warming rather than as a second light.
     static let hue = Color(red: 1.0, green: 0.84, blue: 0.66)
 
-    /// Hours, not seconds. One warm turn moves the room by roughly 4% of the
-    /// gap; reaching the cap from rest takes about 12 hours (3 time constants).
-    /// Nothing can flicker, because nothing can move fast.
+    /// A four-hour time constant moves about 4% per warm turn and takes ~12 hours to reach the cap, preventing flicker.
     static let timeConstantHours: Double = 4
 
-    /// Display steps only: cognition changes supply the input. At τ = 4 h a
-    /// five-minute step moves the tint by ≤2% of the gap.
+    /// At a four-hour time constant, five-minute display steps move at most 2% of the gap; cognition supplies the input.
     static let sampleSeconds: TimeInterval = 300
 
     private static let levelKey = "uiMoodTintLevel"
 
-    /// The damped value the glass wears, 0…1. Multiplied by `cap` at the glass.
     private(set) var level: Double
 
     private let defaults: UserDefaults
-    /// The baseline for the live delta, on the MONOTONIC clock. Only the LEVEL
-    /// survives a launch; the elapsed time does not. Integrating wall-clock
-    /// time across a shutdown means the first post-launch tick applies hours
-    /// (or, on a clock jump, anything at all) in one step and the tint snaps.
-    /// The room resumes where it was and moves only while the app is running.
+    /// Use a monotonic live baseline so shutdown time and wall-clock jumps cannot snap the tint.
     private var updatedAtUptime: TimeInterval
     private var timer: Timer?
     private var observation: Task<Void, Never>?
@@ -64,9 +47,7 @@ final class MoodTintWeather {
         self.updatedAtUptime = Self.uptime()
     }
 
-    /// Monotonic, and unaffected by the wall clock being set. It also does not
-    /// advance while the machine is asleep, which is what we want: a closed lid
-    /// is not weather.
+    /// The clock must ignore wall-clock changes and sleep so a closed lid does not advance the room's tint.
     static func uptime() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     func setConsumer(_ id: UUID, enabled: Bool) {
@@ -101,10 +82,7 @@ final class MoodTintWeather {
         timer = nil
     }
 
-    /// One step of the filter, toward whatever the reading is. The drain is the
-    /// same filter running toward 0 — no separate path, no snap back, no decay
-    /// curve of its own. Rest is not a state the tint is put into; it is where
-    /// the filter goes when nothing holds it up.
+    /// Drain with the same filter toward zero so releasing warmth cannot snap or introduce a second decay path.
     func tick() async {
         guard let timer else { return }
         _ = await latest.read({ await Self.reading() }, publish: { reading in
@@ -122,21 +100,13 @@ final class MoodTintWeather {
         defaults.set(level, forKey: Self.levelKey)
     }
 
-    /// The one-pole low-pass, and the whole of the damping:
-    /// `w(now) = w(prev) + (reading − w(prev)) · (1 − e^(−Δt / τ))`.
+    /// Use one-pole damping: w(now) = w(prev) + (reading − w(prev)) × (1 − exp(−Δt / τ)).
     static func damped(previous: Double, reading: Double, elapsedHours: Double) -> Double {
         let alpha = 1 - exp(-max(0, elapsedHours) / timeConstantHours)
         return min(1, max(0, previous + (reading - previous) * alpha))
     }
 
-    /// ONE scalar from whatever agent is running, read the way `inner_state`'s
-    /// tool reads it: the same pure projection off the live cognition runtime,
-    /// no new store, no second owner, no agent named anywhere in the path.
-    ///
-    /// `inner_state` exposes warmth in exactly one place — the warmth stamped
-    /// on each felt moment — so the scalar is those moments' mean. With
-    /// cognition off the reading is `available: false` and the answer is 0:
-    /// absence reads as absence, and the room drains to plain dark mode.
+    /// Average canonical felt-moment warmth without a second owner; unavailable cognition supplies zero so the room drains.
     private static func reading() async -> Double {
         await NativeAgentEngine.live.cognitionView.moodWarmth()
     }
@@ -145,15 +115,7 @@ final class MoodTintWeather {
 // MARK: - The seam the views use
 
 extension EnvironmentValues {
-    /// TRUE ONLY INSIDE A PUNCHED-OUT PROSE REGION. The local card pass exists
-    /// for exactly one situation: a clear-filled card sitting in the band the
-    /// window pass was masked out of, which would otherwise be the one surface
-    /// in the room that never warms. Anywhere else the window pass already
-    /// reached the card, and a second pass is a second tint — visible as a
-    /// doubled wash, and worse at the card's edges where the 26pt feathered
-    /// knockout and the card's own hard-edged shape overlap. `moodTintSurface`
-    /// is therefore inert unless a `moodTintProseGuard` above it says the
-    /// warmth was taken away here.
+    /// Apply local tint only inside the prose guard; elsewhere the window pass already warms the card and a second pass would double it.
     @Entry var moodTintProseGuarded: Bool = false
 }
 
@@ -161,9 +123,7 @@ enum MoodTintSpace {
     static let name = "moodTint.window"
 }
 
-/// The reading column's viewport, in the window's mood-tint space. One rect for
-/// the whole transcript — not one per row, which would put a preference write
-/// on every visible message on every scrolled frame.
+/// Publish one viewport rect so scrolling cannot cause a preference write per visible message.
 struct MoodTintProseRectKey: PreferenceKey {
     static let defaultValue: CGRect? = nil
     static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
@@ -172,13 +132,9 @@ struct MoodTintProseRectKey: PreferenceKey {
 }
 
 extension View {
-    /// The window pass. One masked composite over the whole shell.
     func moodTintWindow() -> some View { modifier(MoodTintWindowPass()) }
 
-    /// Publishes the band the warmth is kept OUT of: the reading column, across
-    /// the transcript's visible region. `columnWidth` and `leadingInset` are the
-    /// shell's own reading-column metrics, taken from the call site so this file
-    /// owns no layout.
+    /// Take reading-column metrics from the caller so the prose mask cannot become a second layout owner.
     func moodTintProseGuard(columnWidth: CGFloat, leadingInset: CGFloat) -> some View {
         background {
             GeometryReader { geometry in
@@ -187,8 +143,6 @@ extension View {
                 Color.clear.preference(
                     key: MoodTintProseRectKey.self,
                     value: CGRect(
-                        // A little wider than the words themselves: the prose
-                        // and its immediate background, per the mock.
                         x: frame.minX + leadingInset - 24,
                         y: frame.minY + insets.top,
                         width: columnWidth + 48,
@@ -200,10 +154,6 @@ extension View {
         .environment(\.moodTintProseGuarded, true)
     }
 
-    /// The same guard for a viewport whose prose fills the block rather than a
-    /// measured reading column — the Bots session transcript, which draws
-    /// `MessageBubble` under the window pass like any other conversation and
-    /// has just as much claim to an unwarmed prose ground.
     func moodTintProseGuard() -> some View {
         background {
             GeometryReader { geometry in
@@ -215,9 +165,6 @@ extension View {
         .environment(\.moodTintProseGuarded, true)
     }
 
-    /// A surface that sits inside the prose guard and still takes the warmth.
-    /// The settled card is the only one: its fill is clear, so what warms is the
-    /// room showing through it, and the window pass cannot reach it.
     func moodTintSurface(in shape: some Shape) -> some View {
         modifier(MoodTintSurfacePass(shape: AnyShape(shape)))
     }
@@ -225,14 +172,9 @@ extension View {
 
 // MARK: - The passes
 
-/// The environment decides whether the room can wear its sampled warmth.
 @MainActor
 enum MoodTintGate {
-    /// 0 collapses the feature entirely: the flag off, the light appearance
-    /// (the mocks are dark mode, and rest IS dark mode untouched), and both
-    /// accessibility requests. Reduce Transparency and Increase Contrast are
-    /// asks for a plainer, harder-edged room; a mood wash is the opposite, so
-    /// it goes to nothing rather than to less.
+    /// Disable warmth for light appearance, Reduce Transparency and Increase Contrast so appearance and accessibility requests remain plain.
     static func level(
         enabled: Bool,
         scheme: ColorScheme,
@@ -266,8 +208,7 @@ private struct MoodTintWindowPass: ViewModifier {
             .coordinateSpace(.named(MoodTintSpace.name))
             .overlayPreferenceValue(MoodTintProseRectKey.self) { prose in
                 if level > 0 {
-                    // Mask first, then blend: the shape of the pass is decided
-                    // before what it does to the light underneath it.
+                    // Mask before blending so the shape is fixed before it changes underlying light.
                     MoodTintWeather.hue
                         .opacity(MoodTintWeather.cap * level)
                         .mask { mask(prose: prose) }
@@ -279,9 +220,7 @@ private struct MoodTintWindowPass: ViewModifier {
             .background { MoodTintSampling(enabled: samples).allowsHitTesting(false) }
     }
 
-    /// White where the warmth is allowed, punched out over the prose. The
-    /// punch-out is feathered by 26pt: a hard edge would be a drawn rectangle
-    /// on glass, and a boundary in this shell is a material change, never a line.
+    /// Feather the prose knockout by 26pt to avoid drawing a hard rectangle on glass.
     private func mask(prose: CGRect?) -> some View {
         Rectangle()
             .fill(.white)
@@ -349,8 +288,7 @@ private struct MoodTintSurfacePass: ViewModifier {
     @Environment(\.moodTintProseGuarded) private var inProseGuard
 
     private var level: Double {
-        // One tint, never two: outside a punched-out prose region the window
-        // pass already warmed this card, so the local pass is nothing at all.
+        // Apply no local pass outside the prose guard because the window has already tinted that card.
         guard inProseGuard else { return 0 }
         return MoodTintGate.level(enabled: enabled, scheme: scheme,
                                   reduceTransparency: reduceTransparency, contrast: contrast,
@@ -360,8 +298,7 @@ private struct MoodTintSurfacePass: ViewModifier {
     func body(content: Content) -> some View {
         content.overlay {
             if level > 0 {
-                // No `compositingGroup()` here on purpose: the blend has to
-                // reach the room behind the card, which is the whole point.
+                // Blend through to the room behind the card; compositingGroup would isolate it.
                 shape
                     .fill(MoodTintWeather.hue)
                     .opacity(MoodTintWeather.cap * level)
@@ -376,8 +313,6 @@ private struct MoodTintSurfacePass: ViewModifier {
 
 @MainActor
 enum MoodTintReadout {
-    /// One read-only line for `app_page_read`, so the tint can be driven and
-    /// checked headless. The switch itself is a settings row, not a line here.
     static func line(_ defaults: UserDefaults = .standard) -> String {
         guard MoodTintPreference.isEnabled(defaults) else {
             return "Warmth in the glass: off."

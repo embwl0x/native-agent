@@ -1,25 +1,18 @@
-// Pure running-app name resolution without activation or a focus change.
-// Missing, ambiguous and self-process targets remain distinct so callers can
-// report an observation or refuse an act without walking an unsafe or guessed tree.
+// Resolve without activation so missing, ambiguous and self-process targets can refuse without walking a guessed or unsafe tree.
 
 import Foundation
 
-// Blueprint: | `MacBackgroundSight.swift` | `MacBackgroundSight.resolve`: exact running and checked installed identities precede partial running-app matches without activation; a matching row with unavailable platform/install classification stops partial-name guessing; missing, ambiguous, unavailable and self targets remain distinct |
+// Blueprint: | `MacBackgroundSight.swift` | `MacBackgroundSight.resolve`: Exact identities precede partial names; preserve ambiguity and source failures |
 
 public enum MacBackgroundSight {
-    /// What naming an app resolved to. Every non-match is its own case because
-    /// they lead to different next moves: launch it, disambiguate, or stop.
+    /// Keep nonmatches distinct so callers can choose between launching, disambiguating and refusing.
     public enum Resolution: Sendable, Equatable {
         case matched(MacAXAppInfo)
-        /// No running app answers to that name. The candidates are what IS
-        /// running, so the reply can say what she could have meant.
+        /// Retain running candidates so a missing-target reply can offer real alternatives.
         case notRunning(candidates: [String])
-        /// Two or more running apps answer equally well.
         case ambiguous(candidates: [String])
         case indexUnavailable
-        /// NativeAgent itself. An AX walk of our own tree re-enters AppKit
-        /// in-process and can deadlock (see `MacAnchoredRead.selfProcess`), so
-        /// this is refused by NAME here, before an element is ever resolved.
+        /// Refuse self-process names before AX resolution because in-process AppKit re-entry can deadlock.
         case selfProcess
 
         var failureCode: String? {
@@ -33,19 +26,10 @@ public enum MacBackgroundSight {
         }
     }
 
-    /// How many running app names a refusal is allowed to list back.
     public static let maxCandidates = 40
 
-    /// Resolve `name` against the running apps, WITHOUT activating anything.
-    ///
-    /// Exact running identity wins, then the installed Mac identity, then
-    /// partial running names. "Mail" means Mail even when only MailMate is
-    /// running. An installed display name can also name a differently titled
-    /// process ("World of Warcraft" runs as "Wow").
-    ///
-    /// A pass that finds exactly one match wins. A pass that finds several
-    /// returns `.ambiguous` rather than picking one: guessing which window she
-    /// meant is the failure mode this whole organ exists to avoid.
+    /// Exact running identity precedes installed identity and partial running names so Mail cannot resolve to MailMate. Installed display names can differ from
+    /// process names. Multiple matches remain ambiguous; never pick a window by guessing.
     public static func resolve(_ name: String, among apps: [MacAXAppInfo]) -> Resolution {
         let needle = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !needle.isEmpty else {
@@ -54,8 +38,7 @@ public enum MacBackgroundSight {
         func normalized(_ text: String) -> String {
             text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
-        // `.app` is how a person writes an app's name half the time, and it is
-        // never part of the localized name AppKit reports.
+        // `.app` is how a person writes an app's name half the time, and it is never part of the localized name AppKit reports.
         let bare = needle.hasSuffix(".app") ? String(needle.dropLast(4)) : needle
 
         func squashed(_ text: String) -> String { normalized(text).filter { $0.isLetter || $0.isNumber } }
@@ -70,11 +53,9 @@ public enum MacBackgroundSight {
         if let exact = resolution(apps.filter {
             normalized($0.name) == bare || normalized($0.bundleIdentifier ?? "") == bare
         }) { return exact }
-        // The hot path never waits for Spotlight, and never guesses a partial
-        // name before the installed identities are available.
+        // The hot path never waits for Spotlight, and never guesses a partial name before the installed identities are available.
         guard let indexed = MacAppIndex.shared.readyApps() else { return .indexUnavailable }
-        // Incomplete matching identity cannot authorize a partial-name guess
-        // at another running app. Exact running identities above need no census.
+        // Incomplete matching identity cannot authorize a partial-name guess at another running app. Exact running identities above need no census.
         if indexed.contains(where: {
             $0.installationUncertain && (
                 normalized($0.bundleID ?? "") == needle || normalized($0.name) == bare
@@ -106,8 +87,7 @@ public enum MacBackgroundSight {
         return .notRunning(candidates: candidateNames(apps))
     }
 
-    /// Every running app by name, sorted, so the list is the real answer to
-    /// "what is running"; a list past the cap says how many it left out.
+    /// Every running app by name, sorted, so the list is the real answer to "what is running"; a list past the cap says how many it left out.
     static func candidateNames(_ apps: [MacAXAppInfo]) -> [String] {
         let names = Set(apps.filter { $0.processIdentifier != getpid() }.map(\.name))
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
@@ -115,8 +95,7 @@ public enum MacBackgroundSight {
         return Array(names.prefix(maxCandidates)) + ["and \(names.count - maxCandidates) more"]
     }
 
-    /// The resolution, in words. A stopped app is an empty look observation;
-    /// a caller that needs a running app still treats it as a precondition failure.
+    /// The resolution, in words. A stopped app is an empty look observation; a caller that needs a running app still treats it as a precondition failure.
     public static func words(for resolution: Resolution, requested name: String) -> String? {
         switch resolution {
         case .matched:

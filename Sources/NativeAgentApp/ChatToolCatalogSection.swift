@@ -7,8 +7,8 @@ import NativeAgentShared
 import PersistenceCore
 import TrustCenter
 
-// Blueprint: | `ChatToolCatalogSection.swift` | Mounted tool catalog classification/search, approval and Full Mac presentation, detail controls and shared status tones |
-/// Compare the authoritative mounted catalog with saved Trust; Full Mac stays on until disabled.
+// Blueprint: | `ChatToolCatalogSection.swift` | Catalog classification, search, approval controls and shared status tones |
+/// Read the mounted catalog and saved Trust together; Full Mac remains on until disabled.
 enum ToolsFullMacBannerPresentation {
     struct State: Equatable {
         let title: String
@@ -44,13 +44,14 @@ enum ToolsFullMacBannerPresentation {
         }
         return State(
             title: "Full Mac tools are locked",
-            detail: "Trust says Full Mac is on, but these tools are still locked. Refresh Tools; if that does not help, save the Full Mac preset again in Trust Center."
+            detail: """
+                Trust says Full Mac is on, but these tools are still locked. Refresh Tools; if that does not help, save the Full Mac preset again in Trust \
+                Center.
+                """
         )
     }
 }
-/// The authored-tools row is a projection of the same promotion boundary the
-/// action repeats. Keeping its enabled state and refusal copy here prevents a
-/// mounted SwiftUI control from becoming a second, untested eligibility rule.
+/// Project the same promotion boundary the action enforces so the UI cannot invent a second eligibility rule.
 enum ToolApprovalPresentation {
     struct Control: Equatable {
         let accessibilityIdentifier: String
@@ -72,16 +73,14 @@ enum ToolApprovalPresentation {
         )
     }
 }
-/// Local catalog grouping and search; tool status belongs to the engine.
+/// Keep search and grouping local; the engine owns tool status.
 enum ChatToolCatalogPresentation {
     struct Bucket: Identifiable, Equatable {
         let id: String
         let title: String
         let tools: [ChatCatalogTool]
     }
-    /// A catalog row cannot be rendered safely when it has no stable name or
-    /// shares its SwiftUI identity with another row. Withhold the whole
-    /// ambiguous identity group rather than silently showing an arbitrary one.
+    /// Withhold all rows sharing a blank or duplicate identity so SwiftUI cannot select an arbitrary record.
     struct BucketResult: Equatable {
         let buckets: [Bucket]
         let visibleToolCount: Int
@@ -89,11 +88,17 @@ enum ChatToolCatalogPresentation {
         let unclassifiedToolCount: Int
         var withheldNotice: String? {
             guard withheldToolCount > 0 else { return nil }
-            return "\(withheldToolCount) broken or duplicate \(withheldToolCount == 1 ? "row was" : "rows were") left out; refresh Tools once the list is fixed."
+            return """
+                \(withheldToolCount) broken or duplicate \(withheldToolCount == 1 ? "row was" : "rows were") left out; refresh Tools once \
+                the list is fixed.
+                """
         }
         var unclassifiedNotice: String? {
             guard unclassifiedToolCount > 0 else { return nil }
-            return "\(unclassifiedToolCount) \(unclassifiedToolCount == 1 ? "tool has" : "tools have") not been sorted into a group yet. Whether they are available is shown, but their group has not been checked."
+            return """
+                \(unclassifiedToolCount) \(unclassifiedToolCount == 1 ? "tool has" : "tools have") not been sorted into a group yet. Whether they are \
+                available is shown, but their group has not been checked.
+                """
         }
     }
     enum CatalogState: Equatable {
@@ -172,8 +177,7 @@ enum ChatToolCatalogPresentation {
         return trimmed.count > limit ? String(trimmed.prefix(limit)) + "…" : trimmed
     }
 }
-/// Local presentation only: search never reclassifies or grants a tool. Keep
-/// normal disclosure choices separate so clearing a search restores the page.
+/// Search must neither reclassify nor grant tools; preserve normal disclosure state when clearing it.
 struct ChatToolCatalogSearchState {
     private(set) var query = ""
     private var expandedBuckets: Set<String> = []
@@ -247,9 +251,7 @@ internal struct ChatToolCatalogSection: View {
                     .kerning(0.6)
                     .foregroundStyle(NativeAgentShell.secondary)
                 Spacer(minLength: 8)
-                // "Chat tools" are the chat catalog, not the Capabilities
-                // records; say so in the count itself. Rows withheld for a
-                // blank or duplicate name are the only difference.
+                // Count the chat catalog rather than capability records, accounting for withheld invalid identities.
                 Text(bucketResult.visibleToolCount == catalog.tools.count
                     ? "\(catalog.tools.count) chat tools"
                     : "\(bucketResult.visibleToolCount) of \(catalog.tools.count) chat tools shown")
@@ -406,7 +408,7 @@ internal struct ChatToolCatalogSection: View {
         let isExpanded = expanded.contains(tool.id)
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                // A tool name IS a code, so it takes `ShellType.code`.
+                // Render tool identifiers in code type because they are executable names.
                 Text(tool.name)
                     .font(ShellType.code)
                     .foregroundStyle(NativeAgentShell.text)
@@ -452,7 +454,7 @@ internal struct ChatToolCatalogSection: View {
             .accessibilityLabel(badge.title)
     }
 }
-/// One tone table for both tool lists. Four states, three room colours.
+/// Share the tone table across both tool lists so status colors cannot diverge.
 internal enum ToolsStatusTone {
     static func color(_ tone: ToolCatalogStatus.Tone) -> Color {
         switch tone {

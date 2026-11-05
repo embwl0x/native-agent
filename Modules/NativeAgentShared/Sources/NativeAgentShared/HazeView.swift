@@ -297,7 +297,6 @@ public final class HazeView: HazeNativeView {
         rampStart = nil
     }
 
-    /// Rebase the drift clock without changing its local time.
     private func setSpeed(_ speed: Float, at now: CFTimeInterval = CACurrentMediaTime(), local: CFTimeInterval? = nil) {
         let local = local ?? drift.convertTime(now, from: nil)
         drift.speed = speed

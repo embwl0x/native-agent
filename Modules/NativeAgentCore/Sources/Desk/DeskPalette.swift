@@ -2,7 +2,7 @@ import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DeskPalette.swift` | `DeskPaletteRow`, `DeskFuzzy`, `DeskPaletteQuery`, `DeskPaletteCommandApplication`: ranked matching and revision-bound command admission |
+// Blueprint: | `DeskPalette.swift` | `DeskPaletteRow`, `DeskFuzzy`, `DeskPaletteQuery`, `DeskPaletteCommandApplication`: revision-bound matching |
 
 public struct DeskPaletteRow: Identifiable, Equatable, Sendable {
     public let handle: String
@@ -13,8 +13,6 @@ public struct DeskPaletteRow: Identifiable, Equatable, Sendable {
 
     public var id: String { handle }
 
-    /// What the query matches against: the visible number, the title and the
-    /// project — everything User can actually read on the row.
     public var haystack: String { "\(alias) \(title) \(project)" }
 
     public init(
@@ -42,8 +40,6 @@ public struct DeskPaletteRow: Identifiable, Equatable, Sendable {
 }
 
 public enum DeskFuzzy {
-    /// Lower ranks win; nil means no match.
-    /// 0 exact · 1 prefix · 2 word-boundary prefix · 3 substring · 4 subsequence
     public static func rank(query: String, candidate: String) -> Int? {
         let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let c = candidate.lowercased()
@@ -67,9 +63,7 @@ public enum DeskFuzzy {
         return true
     }
 
-    /// Best matches first. Ties break on title length then handle, so the list
-    /// is a TOTAL order — `sorted(by:)` is not stable in Swift, and a palette
-    /// whose rows swap under an unchanged query is unusable.
+    /// Break ties deterministically because Swift sorting is unstable and unchanged queries must not reorder rows.
     public static func filter(_ rows: [DeskPaletteRow], query: String, limit: Int = 12) -> [DeskPaletteRow] {
         let scored: [(row: DeskPaletteRow, rank: Int)] = rows.compactMap { row in
             guard let r = rank(query: query, candidate: row.haystack) else { return nil }
@@ -153,12 +147,10 @@ public enum DeskPaletteCommandApplication {
                 expectedUpdatedAt: expectedUpdatedAt
             ))
         case .deferItem:
-            // Choosing Defer only opens its date choices. It has not changed
-            // the store yet, so calling it successful here would be a lie.
+            // Opening date choices has not changed the store, so it cannot report success.
             return .beginDefer(handle: handle)
         case .note:
-            // Likewise, the note is not an effect until non-empty text is
-            // submitted through DeskQuickAction.note.
+            // A note takes effect only after nonempty submission through DeskQuickAction.note.
             return .beginNote(handle: handle)
         }
     }

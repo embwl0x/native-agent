@@ -3,7 +3,7 @@ import Cognition
 import SwiftUI
 import Observation
 import CognitiveSubstrate
-// Blueprint: | `CognitionProposalsView.swift` | `CognitionProposalsView`: read-only schema lineage and proposal-owned displaced content from canonical Dream/REM approvals |
+// Blueprint: | `CognitionProposalsView.swift` | `CognitionProposalsView`: Canonical REM lineage and proposal-owned displaced content |
 
 struct CognitionProposalsView: View {
     @Environment(AppModel.self) private var appModel

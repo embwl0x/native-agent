@@ -3,17 +3,13 @@ import Foundation
 import SwiftUI
 import NativeAgentShared
 
-// Blueprint: | `AppShellMenuPresentation.swift` | `NavigateMenuPresentation` and `MenuBarStatusPresentation`: menu order/shortcuts projected from the rail and one canonical status line |
+// Blueprint: | `AppShellMenuPresentation.swift` | `NavigateMenuPresentation`, `MenuBarStatusPresentation`: Rail-derived shortcuts and one status line |
 
-/// D7: the Navigate menu is a PROJECTION of the rail, not a second list kept
-/// by hand. It numbered the old primary list, which lacked the Helpers row the rail
-/// adds at six, so ⌘6–⌘9 each opened the page one below. It reads the rail's
-/// own order and words now (`SidebarItem.rail`).
+/// Derive Navigate order and labels from SidebarItem.rail so numbered shortcuts always match the visible rail.
 enum NavigateMenuPresentation {
     struct Entry: Equatable, Identifiable {
         let item: SidebarItem
-        /// ⌘1…⌘9 in rail order. An item past the ninth is listed WITHOUT a
-        /// shortcut rather than with a wrong or duplicated one.
+        /// Only the first nine rail items receive shortcuts to avoid duplicate or misleading digits.
         let shortcut: Character?
 
         var id: String { item.rawValue }
@@ -27,11 +23,7 @@ enum NavigateMenuPresentation {
     }
 }
 
-/// D7: the menu-bar extra renders ONE truth line. It used to stack the last
-/// status string above a separately-derived health sentence, which let the menu
-/// say "Ready" directly above "Native runtime unavailable" — two claims, no
-/// stated winner. Reachability leads (it is what the menu is opened for) and the
-/// status detail follows it on the same line.
+/// Render reachability before status detail on one line so conflicting status cannot obscure an unavailable runtime.
 enum MenuBarStatusPresentation {
     static func line(statusText: String, health: RuntimeHealth?) -> String {
         let status = statusText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -48,13 +40,10 @@ enum MenuBarStatusPresentation {
 }
 
 extension SidebarItem {
-    /// Advanced's rail top to bottom as the layout shows it (ui/layout.json,
-    /// the rail's blocks by their page ids): a page, or nil for the line
-    /// between its groups. The Navigate menu's digits and ⌘K's pages read its
-    /// pages, so ⌘N is the Nth rail row.
+    /// Read layout order from the rail so Navigate shortcuts and palette pages follow the visible rows.
     static func rail(_ layout: SurfaceLayoutAvailability) -> [SidebarItem?] {
         layout.contentNames("rail", profile: SimpleViewMode.advanced).filter { name in
-            // An unreadable document cannot override the person's Helpers switch.
+            // An unreadable layout cannot override the user's Helpers switch.
             layout.failure == nil || name != "bots"
                 || (UserDefaults.standard.object(forKey: "uiBotsShelfPreview") as? Bool) != false
         }.map { name in

@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `SomaticSignalValence.swift` | `SomaticSignalKind` intrinsic valence: one per-kind table shared by signal adaptation and organism field defaults |
+// Blueprint: | `SomaticSignalValence.swift` | `SomaticSignalKind`: shared intrinsic valence for adaptation and field defaults |
 
 /// The event adapter and organism field share this intrinsic-valence table.
 extension SomaticSignalKind {
@@ -12,7 +12,7 @@ extension SomaticSignalKind {
              .dreamCompleted, .remIntegrated:
             return 0.45
         case .toolFailed, .providerFailed, .phoneDeliveryFailed, .deskItemBlocked,
-             .memoryCorrected, .correctionReceived:
+             .memoryCorrected, .correctionReceived, .organDeviated:
             return -0.55
         case .appWake, .iPhoneReachable:
             return 0.15
@@ -20,8 +20,7 @@ extension SomaticSignalKind {
             return -0.5
         case .approvalResolved:
             return 0.4
-        // No intrinsic valence (chat felt-meaning owned by the substrate; or a
-        // neutral lifecycle marker).
+        // No intrinsic valence (chat felt-meaning owned by the substrate; or a neutral lifecycle marker).
         case .userSpoke, .assistantSpoke, .appSleep, .toolStarted, .toolCancelled,
              .providerStarted, .providerCancelled, .phoneDeliveryStarted,
              .deskItemCreated, .deskItemCancelled, .approvalRequested,

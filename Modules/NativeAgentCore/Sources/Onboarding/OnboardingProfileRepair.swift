@@ -8,8 +8,7 @@ import PersistenceCore
 import PersonaEngine
 // Blueprint: | `OnboardingProfileRepair.swift` | Missing-only profile repair under completion and profile locks; completed persona bytes stay intact |
 extension SwiftNativeOnboardingClient {
-    /// Restore only missing profile.json from both supplied names, preserving persona documents.
-    /// Require a completion anchor, no pending completion and no existing profile; use the completion schema.
+    /// Missing-profile repair requires both names, a completion anchor and no pending completion; preserve completed persona bytes.
     public func repairProfile(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult {
         let agentName = payload.agentName.trimmingCharacters(in: .whitespacesAndNewlines)
         let userName = payload.userName.trimmingCharacters(in: .whitespacesAndNewlines)

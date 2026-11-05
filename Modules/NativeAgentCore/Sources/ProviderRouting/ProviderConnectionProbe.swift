@@ -1,12 +1,11 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `ProviderConnectionProbe.swift` | Native probe capabilities and request-bound OAuth credential evidence; API-key connection probes |
 
-/// One probe's last transport attempt, including a token renewed after 401.
-/// Only a fingerprint is retained; readiness never supplies request evidence.
+/// One probe's last transport attempt, including a token renewed after 401. Only a fingerprint is retained; readiness never supplies request evidence.
 public final class OAuthProbeCredential: @unchecked Sendable {
-    @TaskLocal public static var current: OAuthProbeCredential?
     private let lock = NSLock()
     private var sent: String?
 
@@ -18,13 +17,12 @@ public final class OAuthProbeCredential: @unchecked Sendable {
         return sent
     }
 
-    static func sending(_ request: URLRequest) {
-        guard let current else { return }
+    func sending(_ request: URLRequest) {
         guard let authorization = request.value(forHTTPHeaderField: "Authorization"),
               authorization.hasPrefix("Bearer ") else { return }
-        current.lock.lock()
-        defer { current.lock.unlock() }
-        current.sent = LLMProviderStatusFeed.fingerprint(String(authorization.dropFirst("Bearer ".count)))
+        lock.lock()
+        defer { lock.unlock() }
+        sent = LLMProviderStatusFeed.fingerprint(String(authorization.dropFirst("Bearer ".count)))
     }
 }
 public extension SwiftNativeProviderRouting {
@@ -75,11 +73,7 @@ public extension SwiftNativeProviderRouting {
                     : evidence + " — " + (meaning ?? failure.errorDescription ?? "the check failed"),
                 cause: failure.encoded, credential: credential)
         }
-        // Status and the provider's own words through the one typed classifier.
-        // A key is rejected only on invalid-credential evidence: a 401, or a 403
-        // whose words say the key is invalid. Any other 403 is an unexplained
-        // refusal (an OpenAI key may generate without listing models): it
-        // neither rejects the key nor proves it; quota and rate limits stay theirs.
+        // Only invalid-credential evidence rejects a key. An unexplained 403 neither proves nor rejects it; quota and rate limits retain their own causes.
         func refused(_ code: Int, _ body: Data, model: String?, ms: Int) -> NativeAgentShared.ProviderTestResult {
             let detail = String(ProviderFailure.wireDetail(body).replacingOccurrences(of: apiKey, with: "[redacted]").prefix(160))
             let evidence = "HTTP \(code) after \(ms)ms" + (detail.isEmpty ? "" : ": " + detail)
@@ -94,10 +88,7 @@ public extension SwiftNativeProviderRouting {
         if id == "kimi-code" {
             let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedProviderSnapshot()
             let probeModel = try snapshot.probeModel(for: id)
-            // Real reachability probe: the subscription API has no free GET
-            // /models, so spend one token on a minimal Messages call. Proves
-            // key validity + endpoint reachability, and its 200 also confirms
-            // the Anthropic-compat body shape end to end.
+            // The subscription endpoint has no free models probe, so a one-token Messages request proves credentials, reachability and wire compatibility.
             guard let endpoint = URL(string: "https://api.kimi.com/coding/v1/messages") else { throw URLError(.badURL) }
             var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
@@ -131,9 +122,8 @@ public extension SwiftNativeProviderRouting {
             }
         }
 
-        // Free authenticated GETs: a models list, or OpenRouter's own key
-        // endpoint. The key rides only in a header, never the URL, so no
-        // error or log line below can carry it.
+        // Free authenticated GETs: a models list, or OpenRouter's own key endpoint. The key rides only in a header, never the URL, so no error or log line
+        // below can carry it.
         let modelsEndpoint: URL? = switch id {
         case "moonshot": MoonshotModelCatalog.endpoint
         case "anthropic": URL(string: "https://api.anthropic.com/v1/models")
@@ -183,9 +173,7 @@ public extension SwiftNativeProviderRouting {
 }
 
 public extension ProviderCatalogSnapshot {
-    /// A connectivity probe still needs A model to ask with: the model
-    /// selected for this provider on any surface, or the first catalog row
-    /// when it is not selected anywhere.
+    /// A probe needs an explicit model: use the provider's selected model, else its first declared catalog row.
     func probeModel(for id: String) throws -> String {
         guard let provider = providers.first(where: { $0.id == id }) else {
             throw ProviderRoutingError.providerNotFound
@@ -204,4 +192,12 @@ public extension ProviderCatalogSnapshot {
         return probeModel
     }
 
+}
+
+private enum ProbeCredentialPart: LLMCallPart { static let unset: OAuthProbeCredential? = nil }
+extension LLMCall {
+    public var probeCredential: OAuthProbeCredential? {
+        get { self[ProbeCredentialPart.self] }
+        set { self[ProbeCredentialPart.self] = newValue }
+    }
 }

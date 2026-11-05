@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacAssistantStatus.swift` | assistant status composition from evidence snapshots, client contract, result, lightweight serialization, Mail readiness accepts complete or partial checked account coverage with named gaps, Mac policy failures remain on dependent access rows, canonical tool names and card-based acquisition guidance; declared scheduler actions arrive from the app action owner; typed catalog data and UI words come from `Resources/abilities/mac-watch-catalog.js`, never creating jobs; missing/disabled/invalid catalog is unavailable, never an empty catalog |
+// Blueprint: | `MacAssistantStatus.swift` | `Resources/abilities/mac-watch-catalog.js`: Checked readiness and catalog data; never creates jobs |
 
 // Status rendering reads readiness evidence and never creates watch jobs.
 
@@ -173,7 +173,8 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
             "status": .string(status),
             "summary": .string(summary),
             "access": .array(project(accessJSON, keys: ["id", "title", "status", "setupRoute", "nextStep"])),
-            "watchTemplates": .array(project(templatesJSON, keys: ["id", "title", "status", "summary", "scheduleLabel", "sources", "requiredAccess", "actionIds"])),
+            "watchTemplates": .array(project(templatesJSON, keys: ["id", "title", "status", "summary", "scheduleLabel", "sources", "requiredAccess",
+                "actionIds"])),
             "blockedAccessCount": .int(Int64(blockedAccessCount)),
             "templateAttentionCount": .int(Int64(templateAttentionCount)),
             "schedulerActions": .array(schedulerActions.map { .string($0) }),
@@ -257,7 +258,9 @@ extension MacAssistantStatusResult {
                 id: "mac_notifications",
                 title: "Mac notifications",
                 status: notifications.status,
-                detail: "I post notifications on this Mac. Readiness uses policy, macOS authorization and a delivered notification retained by Notification Center.",
+                detail: """
+                    I post notifications on this Mac. Readiness uses policy, macOS authorization and a delivered notification retained by Notification Center.
+                    """,
                 setupRoute: "sidebar:trust",
                 requiredFor: ["watch_receipts"],
                 nextStep: notifications.nextStep,
@@ -277,11 +280,16 @@ extension MacAssistantStatusResult {
                 id: "local_mail",
                 title: "Mac Mail",
                 status: mailState,
-                detail: "I read Mail account metadata through Apple Events, mailbox pages through Mail's local Envelope Index, and message bodies from local message files. These reads need Automation and Full Disk Access."
+                detail: """
+                    I read Mail account metadata through Apple Events, mailbox pages through Mail's local Envelope Index, and message bodies from local \
+                    message files. These reads need Automation and Full Disk Access.
+                    """
                     + (mailAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_mail_watch"],
-                nextStep: mailAccess.nextStep ?? (mailState == "ready" ? "" : "Use Check Mail to check account coverage. If access is missing, follow the returned permission remedy."),
+                nextStep: mailAccess.nextStep ?? (mailState == "ready" ? "" : """
+                    Use Check Mail to check account coverage. If access is missing, follow the returned permission remedy.
+                    """),
                 actionIds: ["mail.recent"],
                 toolNames: [mailTool, "mail_search"]
             ),
@@ -367,14 +375,18 @@ extension MacAssistantStatusResult {
         switch text("status") {
         case "completed":
             guard text("account_coverage") == "complete" else {
-                return ("unavailable", "Coverage unavailable", "Mail did not establish account coverage. Use Check Mail again to read the current mailbox accounts.")
+                return ("unavailable", "Coverage unavailable", """
+                    Mail did not establish account coverage. Use Check Mail again to read the current mailbox accounts.
+                    """)
             }
             return ("ready", "Ready", nil)
         case "partial":
             guard text("account_coverage") == "partial",
                   case .array(let gaps)? = out["accounts_not_listed"], !gaps.isEmpty,
                   let message = text("message") else {
-                return ("unavailable", "Coverage unavailable", "Mail did not identify its account coverage gaps. Use Check Mail again to read the current mailbox accounts.")
+                return ("unavailable", "Coverage unavailable", """
+                    Mail did not identify its account coverage gaps. Use Check Mail again to read the current mailbox accounts.
+                    """)
             }
             var next = "Open Mail, check account and mailbox availability, then use Check Mail again."
             next = message + " " + next

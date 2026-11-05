@@ -1,13 +1,14 @@
+import MacControl
 import Foundation
 import NativeAgentShared
 import Darwin
 import SQLite3
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `MacMessagesHistory.swift` | protected Messages-directory access probe, bounded SQLite reads, latest-unread thread filtering, date-bounded ordering and folded matching |
+// Blueprint: | `MacMessagesHistory.swift` | bounded SQLite history and folded matching |
 
-/// A small, read-only window into Messages' own conversations and history.
-/// No transcript cache, database copy, background scan or archived-object instantiation.
+/// A small, read-only window into Messages' own conversations and history. No transcript cache, database copy, background scan or archived-object
+/// instantiation.
 enum MacMessagesHistory {
     static var hasAccess: Bool {
         let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Messages").path
@@ -16,13 +17,12 @@ enum MacMessagesHistory {
         return true
     }
 
-    /// chat.db opened read-only for one read, with a 2 s budget that
-    /// interrupts any statement still running past it.
+    /// chat.db opened read-only for one read, with a 2 s budget that interrupts any statement still running past it.
     private final class Budget {
         let deadline = ProcessInfo.processInfo.systemUptime + 2
         let database: OpaquePointer
 
-        init?() {
+        init?(context: MacOperationContext) {
             var database: OpaquePointer?
             let path = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Messages/chat.db").path
@@ -32,7 +32,7 @@ enum MacMessagesHistory {
             }
             self.database = database
             sqlite3_busy_timeout(database, 150)
-            FoldedText.register(database)
+            FoldedText.register(database, context: context)
             sqlite3_progress_handler(database, 500, { pointer in
                 guard let pointer else { return 1 }
                 let budget = Unmanaged<Budget>.fromOpaque(pointer).takeUnretainedValue()
@@ -46,21 +46,26 @@ enum MacMessagesHistory {
         }
     }
 
-    static func read(threadID: String? = nil, limit: Int, before: Int64? = nil, fromMe: Bool? = nil, since: Date? = nil) -> [String: JSONValue] {
+    static func read(threadID: String? = nil, limit: Int, before: Int64? = nil, fromMe: Bool? = nil, since: Date? = nil,
+        context: MacOperationContext) -> [String: JSONValue] {
         guard !Task.isCancelled else { return unavailable("history_cancelled", "The conversation read was cancelled.") }
-        guard let budget = Budget() else {
+        guard let budget = Budget(context: context) else {
             return unavailable("database_unavailable", fromMe == nil
-                ? "Conversation metadata is available, but its local history could not be opened. NativeAgent may need macOS Full Disk Access. No permission was changed."
+                ? """
+                    Conversation metadata is available, but its local history could not be opened. NativeAgent may need macOS Full Disk Access. No permission \
+                    was changed.
+                    """
                 : "Messages' local database could not be opened. NativeAgent may need macOS Full Disk Access. No permission was changed.")
         }
         let database = budget.database
         defer { withExtendedLifetime(budget) {} }
 
-        // guid is unique and the join's primary key starts with chat_id. Requiring
-        // their actual indexes prevents an unexpected schema from causing a scan.
+        // guid is unique and the join's primary key starts with chat_id. Requiring their actual indexes prevents an unexpected schema from causing a scan.
         guard fromMe != nil || (index(database, table: "chat", columns: ["guid"], unique: true) != nil &&
               index(database, table: "chat_message_join", columns: ["chat_id", "message_id"], unique: true) != nil) else {
-            return unavailable("unsupported_history_schema", "This Messages database does not expose the exact indexed conversation route needed for a bounded read.")
+            return unavailable("unsupported_history_schema", """
+                This Messages database does not expose the exact indexed conversation route needed for a bounded read.
+                """)
         }
         var chatID: Int64 = 0
         var chat: OpaquePointer?
@@ -73,7 +78,10 @@ enum MacMessagesHistory {
             let chatResult = sqlite3_step(chat)
             guard chatResult == SQLITE_ROW else {
                 return unavailable(chatResult == SQLITE_DONE ? "exact_thread_not_found" : "history_read_failed",
-                    "The observed Messages conversation could not be matched to local history by its exact ID. No alternate recipient or conversation was substituted.")
+                    """
+                        The observed Messages conversation could not be matched to local history by its exact ID. No alternate recipient or conversation was \
+                        substituted.
+                        """)
             }
             chatID = sqlite3_column_int64(chat, 0)
         }
@@ -91,7 +99,9 @@ enum MacMessagesHistory {
         if fromMe != nil {
             guard let dateIndex = index(database, table: "message", columns: ["date"], unique: false),
                   index(database, table: "chat_message_join", columns: ["message_id"], unique: false) != nil else {
-                return unavailable("unsupported_history_schema", "This Messages database does not expose the indexed date and conversation routes needed for a bounded sender read.")
+                return unavailable("unsupported_history_schema", """
+                    This Messages database does not expose the indexed date and conversation routes needed for a bounded sender read.
+                    """)
             }
             let dated = "message INDEXED BY \"\(dateIndex.replacingOccurrences(of: "\"", with: "\"\""))\""
             let filter = """
@@ -105,7 +115,8 @@ enum MacMessagesHistory {
                 LEFT JOIN (SELECT ROWID AS message_id FROM \(dated) WHERE \(filter) ORDER BY date DESC, ROWID DESC LIMIT ?4) page ON 1
                 LEFT JOIN message m ON m.ROWID = page.message_id
                 LEFT JOIN handle h ON h.ROWID = m.handle_id
-                LEFT JOIN chat c ON c.ROWID = (SELECT j.chat_id FROM chat_message_join j JOIN chat linked ON linked.ROWID = j.chat_id WHERE j.message_id = m.ROWID ORDER BY j.chat_id LIMIT 1)
+                LEFT JOIN chat c ON c.ROWID = (SELECT j.chat_id FROM chat_message_join j JOIN chat linked ON linked.ROWID = j.chat_id WHERE j.message_id = \
+                m.ROWID ORDER BY j.chat_id LIMIT 1)
                 ORDER BY m.date DESC, m.ROWID DESC
                 """
         } else {
@@ -142,7 +153,9 @@ enum MacMessagesHistory {
         var step = sqlite3_step(statement)
         while step == SQLITE_ROW {
             guard !Task.isCancelled, ProcessInfo.processInfo.systemUptime < budget.deadline else {
-                return unavailable("history_temporarily_unavailable", "The bounded conversation read was cancelled or exceeded its time budget; refresh to retry.")
+                return unavailable("history_temporarily_unavailable", """
+                    The bounded conversation read was cancelled or exceeded its time budget; refresh to retry.
+                    """)
             }
             if fromMe != nil {
                 if since != nil { total = sqlite3_column_int64(statement, 13) }
@@ -196,7 +209,8 @@ enum MacMessagesHistory {
             return unavailable("history_temporarily_unavailable", "The bounded conversation read was cancelled or exceeded its time budget; refresh to retry.")
         }
         guard step == SQLITE_DONE || stoppedForBudget else {
-            return unavailable(step == SQLITE_INTERRUPT || step == SQLITE_BUSY || step == SQLITE_LOCKED ? "history_temporarily_unavailable" : "history_read_failed",
+            return unavailable(step == SQLITE_INTERRUPT || step == SQLITE_BUSY || step == SQLITE_LOCKED ? "history_temporarily_unavailable"
+                : "history_read_failed",
                 "The bounded history read did not finish. No partial page is presented as a complete conversation; refresh to retry.")
         }
         var result: [String: JSONValue] = [
@@ -204,8 +218,13 @@ enum MacMessagesHistory {
             "unread_state": .string(unread ? "available" : "unavailable"),
             "unread_note": .string(unread ? "is_read is the local Messages read flag, not a recipient delivery/read receipt."
                 : "Unread state is unavailable: this Messages database does not expose is_read. No read flag is inferred."),
-            "history_ordering": .string("Recent local message records, displayed oldest to newest within this page; insertion order can differ from delivery time."),
-            "history_note": .string("Read-only local history. Plain text and supported Foundation string bodies are shown. Formatting, attachment content and special records are not interpreted; unsupported archives are labeled, never treated as empty messages. Full Disk Access remains controlled by macOS."),
+            "history_ordering": .string("""
+                Recent local message records, displayed oldest to newest within this page; insertion order can differ from delivery time.
+                """),
+            "history_note": .string("""
+                Read-only local history. Plain text and supported Foundation string bodies are shown. Formatting, attachment content and special records are \
+                not interpreted; unsupported archives are labeled, never treated as empty messages. Full Disk Access remains controlled by macOS.
+                """),
         ]
         if let fromMe {
             result["from_me"] = .bool(fromMe)
@@ -214,24 +233,26 @@ enum MacMessagesHistory {
             if let since, let total {
                 result["since"] = .string(NativeTimestampFormat.plainZulu(since))
                 result[fromMe ? "sent_count" : "received_count"] = .int(total)
-                result["count_note"] = .string("Exact local message record count from since (inclusive), independent of the page limit. Includes attachments, reactions and special records; not a count of conversations or recipients.")
+                result["count_note"] = .string("""
+                    Exact local message record count from since (inclusive), independent of the page limit. Includes attachments, reactions and special \
+                    records; not a count of conversations or recipients.
+                    """)
             }
         } else if messages.count == min(30, max(1, limit)) || stoppedForBudget, let oldest {
-            // A full page permits one bounded older read; it does not assert that
-            // older rows exist without reading them.
+            // A full page permits one bounded older read; it does not assert that older rows exist without reading them.
             result["older_before_message_id"] = .int(oldest)
         }
         return result
     }
 
-    /// Every conversation with a message, newest first: its people (handles),
-    /// group name, and last message's date and text. With `words`, a
-    /// conversation whose messages contain them carries the newest such
-    /// message as `snippet`. Names come from Contacts in the caller.
-    static func threads(words: String?, threadID: String? = nil, unreadOnly: Bool = false, oldestUnread: Bool = false, since: Date? = nil) -> [String: JSONValue] {
+    /// Word matches carry their newest matching message as the snippet; thread handles retain conversation identity.
+    static func threads(words: String?, threadID: String? = nil, unreadOnly: Bool = false, oldestUnread: Bool = false,
+        since: Date? = nil, context: MacOperationContext) -> [String: JSONValue] {
         guard !Task.isCancelled else { return unavailable("history_cancelled", "The conversation read was cancelled.") }
-        guard let budget = Budget() else {
-            return unavailable("database_unavailable", "Messages' local database could not be opened. NativeAgent may need macOS Full Disk Access. No permission was changed.")
+        guard let budget = Budget(context: context) else {
+            return unavailable("database_unavailable", """
+                Messages' local database could not be opened. NativeAgent may need macOS Full Disk Access. No permission was changed.
+                """)
         }
         let database = budget.database
         defer { withExtendedLifetime(budget) {} }
@@ -248,7 +269,10 @@ enum MacMessagesHistory {
         guard unread || !(unreadOnly || oldestUnread) else {
             return unavailable("unread_state_unavailable", "This Messages database does not expose is_read, so unread filtering and ordering are unavailable.")
         }
-        let unreadCount = unread ? "(SELECT count(*) FROM chat_message_join u JOIN message um ON um.ROWID = u.message_id WHERE u.chat_id = c.ROWID AND um.is_from_me = 0 AND um.is_read = 0)" : "NULL"
+        let unreadCount = unread ? """
+            (SELECT count(*) FROM chat_message_join u JOIN message um ON um.ROWID = u.message_id WHERE u.chat_id = c.ROWID AND um.is_from_me = 0 AND \
+            um.is_read = 0)
+            """ : "NULL"
         func window(_ column: String) -> String {
             since == nil ? "1" : "\(column) >= CASE WHEN \(column) > 100000000000 THEN ?2 ELSE ?3 END"
         }
@@ -264,7 +288,9 @@ enum MacMessagesHistory {
                 WHERE uj.chat_id = c.ROWID AND um.is_from_me = 0 AND um.is_read = 0 AND \(window("um.date"))
                 ORDER BY um.date ASC, um.ROWID ASC LIMIT 1)
             """ : ""
-        let unreadColumns = oldestUnread ? "u.date, u.ROWID, substr(u.text, 1, 400), \(archived.replacingOccurrences(of: "m.", with: "u."))" : "NULL, NULL, NULL, NULL"
+        let unreadColumns = oldestUnread ? """
+            u.date, u.ROWID, substr(u.text, 1, 400), \(archived.replacingOccurrences(of: "m.", with: "u."))
+            """ : "NULL, NULL, NULL, NULL"
         var filters = [window("j.last")]
         if threadID != nil { filters.append("c.guid = ?1") }
         if unreadOnly { filters.append("m.is_from_me = 0 AND m.is_read = 0") }
@@ -277,7 +303,8 @@ enum MacMessagesHistory {
             JOIN (SELECT chat_id, max(message_date) AS last FROM chat_message_join
                   \(threadID == nil ? "" : "WHERE chat_id IN (SELECT ROWID FROM chat WHERE guid = ?1)")
                   GROUP BY chat_id) j ON j.chat_id = c.ROWID
-            LEFT JOIN message m ON m.ROWID = (SELECT message_id FROM chat_message_join WHERE chat_id = c.ROWID ORDER BY message_date DESC, message_id DESC LIMIT 1)
+            LEFT JOIN message m ON m.ROWID = (SELECT message_id FROM chat_message_join WHERE chat_id = c.ROWID ORDER BY message_date DESC, message_id DESC \
+            LIMIT 1)
             \(unreadJoin)
             WHERE \(filters.joined(separator: " AND "))
             ORDER BY \(oldestUnread ? "u.date ASC, u.ROWID ASC, c.guid ASC" : "j.last DESC")
@@ -314,17 +341,20 @@ enum MacMessagesHistory {
             step = sqlite3_step(statement)
         }
         guard step == SQLITE_DONE else {
-            return unavailable(step == SQLITE_INTERRUPT || step == SQLITE_BUSY || step == SQLITE_LOCKED ? "history_temporarily_unavailable" : "history_read_failed",
+            return unavailable(step == SQLITE_INTERRUPT || step == SQLITE_BUSY || step == SQLITE_LOCKED ? "history_temporarily_unavailable"
+                : "history_read_failed",
                 "The conversation list did not finish within its bounded read; refresh to retry.")
         }
         var result: [String: JSONValue] = [
             "unread_state": .string(unread ? "available" : "unavailable"),
-            "unread_note": .string(unread ? "unread_count counts all incoming unread local records in each thread, across all dates. latest_message_is_read describes only its latest message."
+            "unread_note": .string(unread ? """
+                unread_count counts all incoming unread local records in each thread, across all dates. latest_message_is_read describes only its latest \
+                message.
+                """
                 : "Unread state is unavailable: this Messages database does not expose is_read. No unread count is inferred."),
         ]
         if let words {
-            // Newest first. Plain text is matched in SQL over its whole length;
-            // archived bodies are decoded and matched here.
+            // Newest first. Plain text is matched in SQL over its whole length; archived bodies are decoded and matched here.
             let folded = FoldedText.fold(words)
             var search: OpaquePointer?
             guard sqlite3_prepare_v2(database, """
@@ -413,15 +443,14 @@ enum MacMessagesHistory {
     }
 }
 
-/// Matching as people expect it, case and accents aside ("elodie" finds
-/// "Élodie"). SQLite's LIKE folds ASCII only, so the Mail and Messages reads
-/// register `folded_contains(text, needle)`, `needle` already `fold`ed.
+/// Matching as people expect it, case and accents aside ("elodie" finds "Élodie"). SQLite's LIKE folds ASCII only, so the Mail and Messages reads register
+/// `folded_contains(text, needle)`, `needle` already `fold`ed.
 enum FoldedText {
     static func fold(_ text: String) -> String {
         text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
     }
 
-    static func register(_ database: OpaquePointer) {
+    static func register(_ database: OpaquePointer, context: MacOperationContext) {
         sqlite3_create_function_v2(database, "folded_contains", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
             guard let values, let hay = sqlite3_value_text(values[0]), let needle = sqlite3_value_text(values[1]) else {
                 sqlite3_result_int(context, 0)

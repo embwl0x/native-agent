@@ -8,9 +8,8 @@ import DeviceSync
 import NotificationInbox
 import PersistenceCore
 
-// Blueprint: | `TelegramRestart.swift` | Owner-authorized Telegram restart through the injected app operation with termination deferred until the reply attempt |
+// Blueprint: | `TelegramRestart.swift` | Only the owner may restart; defer termination until the reply attempt |
 
-/// Uses the injected app restart operation; termination is armed after the reply attempt.
 public struct TelegramRestartBridge: Sendable {
     public typealias DeferredRestart = @Sendable (
         _ reason: String
@@ -69,7 +68,6 @@ public struct TelegramRestartBridge: Sendable {
 }
 
 extension SwiftNativeTelegramBot {
-    /// Owner-gated restart through the injected shared app restart routine.
     func dispatchRestartCommand(
         args: [String],
         chatId: Int?,

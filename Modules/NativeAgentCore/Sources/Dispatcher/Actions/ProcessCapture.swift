@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `ProcessCapture.swift` | `runProcess` routes URL and descriptor-pinned launches through `ManagedProcess` lifetime/deadline/group settlement; bounded capture returns strict UTF-8 or explicitly requested bytes for record-owned decoding |
+// Blueprint: | `ProcessCapture.swift` | `runProcess`: `ManagedProcess` lifetime/group settlement; strict UTF-8 or caller-owned bytes |
 
 /// Launch, timeout and capture completeness remain distinct from the exit status.
 package struct FileSystemProcessRunResult {
@@ -73,8 +73,7 @@ private func captureProcessOutput(
             stdout: "", stderr: "Process launch failed: \(error.localizedDescription)")
     }
     process.waitForSettlement()
-    // The group owner has settled or reported incomplete termination. A pipe
-    // held outside that group cannot extend capture's wait indefinitely.
+    // Once group settlement completes, a pipe held outside that group cannot extend the capture wait indefinitely.
     let drainDeadline: DispatchTime = .now() + 2
     let outComplete = outDrain.wait(until: drainDeadline)
     let errComplete = errDrain.wait(until: drainDeadline)

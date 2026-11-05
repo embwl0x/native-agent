@@ -5,10 +5,9 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 import NativeAgentShared
-// Blueprint: | `NativeCognitionRuntime+StudioCanon.swift` | Native source invalidations, background admission, throttle, audit receipts and exact deadline ownership; mind.canon satisfies the pass wait in the same retained flight, carries satisfy_wait into the editable silence policy and returns its actual report; proposals and next deadline share one read-constrained studio-canon projection |
+// Blueprint: | `NativeCognitionRuntime+StudioCanon.swift` | NativeCognitionRuntime+StudioCanon owner. |
 
-// Source invalidations use the existing organism deadline, 30-minute throttle
-// and background-cognition gate.
+// Share the organism deadline, 30-minute throttle and background-cognition gate.
 extension NativeCognitionRuntime {
 
     private func studioCanonAdmitted(explicit: Bool) -> Bool {
@@ -18,14 +17,16 @@ extension NativeCognitionRuntime {
             && (explicit || configuration.backgroundMicrocyclesEnabled)
     }
 
-    /// The pass reads the journal and the graph; the reschedule that calls it
-    /// can fire many times a minute under load.
+    /// Throttle journal/graph reads because rescheduling can fire repeatedly under load.
     static let studioCanonTendingMinimumInterval: TimeInterval = 30 * 60
 
-    /// Called from the residual-repair reschedule.
     func considerStudioCanonTending(runNow: Bool = false, reply: MindClockReply? = nil) {
+        if !isFlushedForTermination, let off = clockOffReason(explicit: runNow) {
+            if let reply { reply(.off(off)) } else { beat(.canon, .off(off)) }
+            return
+        }
         guard studioCanonAdmitted(explicit: runNow), sourceWakes.canonReady, studioCanonTask == nil else {
-            reply?(.init("held", "Canon admission is closed, sources are not ready, a tending pass is running, or the runtime is stopping.")); return
+            reply?(.init("held", "Canon sources are not ready, a tending pass is running, or the runtime is stopping.")); return
         }
         let at = now()
         if let due = sourceWakes.canonNextAt, due <= at { sourceWakes.canonDirty = true }
@@ -40,7 +41,7 @@ extension NativeCognitionRuntime {
         studioCanonTask = Task { [weak self] in
             guard let self else { reply?(.init("unavailable", "The runtime was released.")); return }
             let result = await self.runStudioCanonTending(satisfyWait: runNow)
-            reply?(result)
+            if let reply { reply(result) } else { await self.beat(.canon, result) }
             await self.finishStudioCanonTask()
         }
     }
@@ -50,16 +51,15 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
-    /// Journal, graph, recall and approval invalidations request a pass. The
-    /// existing deadline carries the part's next silence boundary. It can only STAGE cards: the part returns
-    /// proposals, this stages them, and the single path that writes a canon row
-    /// (`appendCanonRow`) throws unless the row carries HER seat.
+    /// Coalesce source invalidations on the existing deadline.
+    /// Stage proposals only; appendCanonRow requires the agent's seat before any canonical write.
     private func runStudioCanonTending(satisfyWait: Bool = false) async -> MindClockResult {
-        guard studioCanonAdmitted(explicit: satisfyWait) else { return .init("held", "The tending pass stopped or canon admission is closed.") }
+        guard studioCanonAdmitted(explicit: satisfyWait) else { return .init("stopped", "The tending pass stopped or canon admission closed.") }
         let report: StudioCanonTendingReport
         do {
             let host = self.host, root = dataRoot
-            report = try await StudioCanonTending.run(dataRoot: root, now: now(), deadlineDate: Self.deskDate,
+            // Tending is the mind's own background pass: no turn holds it, and it never hands back.
+            report = try await StudioCanonTending.run(turn: nil, handsBack: false, dataRoot: root, now: now(), deadlineDate: Self.deskDate,
                 admitEffects: { [weak self] in
                     guard let self, await self.studioCanonAdmitted(explicit: satisfyWait) else { throw CancellationError() }
                 }) { input in
@@ -79,8 +79,8 @@ extension NativeCognitionRuntime {
         }
         let stopped = isFlushedForTermination || Task.isCancelled
         let failures = report.failures
-        let result = MindClockResult(!failures.isEmpty ? "unavailable" : stopped ? "held" : "evaluated",
-            "\(report.stagedApprovalIDs.count) proposed of \(report.evaluatedWorks) works; canonization still requires her seat."
+        let result = MindClockResult(!failures.isEmpty ? "unavailable" : stopped ? "stopped" : "evaluated",
+            "\(report.stagedApprovalIDs.count) proposed of \(report.evaluatedWorks) works; canonization still requires the agent's seat."
                 + (failures.isEmpty ? "" : " " + failures.joined(separator: " ")), fields: [
             "proposals": .array(report.stagedApprovalIDs.map(JSONValue.string)),
             "evaluatedWorks": .int(Int64(report.evaluatedWorks)),
@@ -91,15 +91,11 @@ extension NativeCognitionRuntime {
             "proposalFailures": .array(report.proposalFailures.map(JSONValue.string)),
             "savedCardGaps": .array(report.savedCardGaps.map(JSONValue.string)),
             "satisfy_wait": .bool(satisfyWait)
-        ])
-        // The pass may have committed cards before cancellation or a later failure.
-        // Always publish their receipt and carry their identities in the reply.
+        ], yield: report.stagedApprovalIDs.count)
+        // Publish committed cards and receipts even if later work fails or is cancelled.
         sourceWakes.canonNextAt = report.nextAt
-        OrganPulse.record("studio_canon", found: report.stagedApprovalIDs.count,
-                          note: "\(report.stagedApprovalIDs.count) proposed of \(report.evaluatedWorks) works")
         if !failures.isEmpty {
-            // Automatic passes have no reply callback. Their exact failures
-            // and already-committed cards still need a durable receipt.
+            // Automatic passes lack reply callbacks, so persist exact failures and committed card identities.
             await substrate.recordReceipt(kind: "studio.canon_tending_unavailable", payload: .object(result.fields))
         }
         if !report.stagedApprovalIDs.isEmpty {
@@ -109,15 +105,13 @@ extension NativeCognitionRuntime {
                     "proposals": .array(report.stagedApprovalIDs.map { .string($0) }),
                     "evaluatedWorks": .int(Int64(report.evaluatedWorks)),
                     "duplicatesSkipped": .int(Int64(report.duplicatesSkipped)),
-                    // Said out loud on every mint: this is a request, not an act.
+                    // Identify each mint as a request rather than an act.
                     "soleApprover": .string(StudioCanonSeat.agent),
                     "autoCanonization": .bool(false),
                 ])
             )
         }
-        // A relation with no edge citing it back is surfaced,
-        // never repaired. Change-only — an unfixed mismatch would otherwise
-        // re-announce itself on every pass.
+        // Surface uncited relations without repairing them; announce only changes so unresolved mismatches cannot repeat every pass.
         guard report.audit.graphAvailable else { return result }
         let verdict = report.audit.isConsistent
             ? "consistent"

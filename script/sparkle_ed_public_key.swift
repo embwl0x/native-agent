@@ -1,13 +1,5 @@
 #!/usr/bin/env swift
-//
-// Derive the signing key's public half for comparison with the app's SUPublicEDKey.
-// Signature verification with the private key alone cannot prove the app trusts it.
-//
-// Usage:
-//   script/sparkle_ed_public_key.swift <private-key-file>   # prints base64 public key
-//   script/sparkle_ed_public_key.swift -                    # reads the base64 key on stdin
-//   script/sparkle_ed_public_key.swift --new                # prints "<seed-b64> <public-b64>"
-//                                                           # (throwaway pair for tests)
+// Derive the signing public key to compare with the app's SUPublicEDKey; private-key verification alone cannot prove the app trusts it.
 
 import Foundation
 import CryptoKit
@@ -17,9 +9,8 @@ func die(_ message: String) -> Never {
     exit(1)
 }
 
-/// Sparkle accepts a 32-byte seed or a 96-byte expanded-private || public secret.
-/// Derive from the seed; expanded keys already hold the public half at bytes 64..<96.
-/// Re-deriving from an expanded key would hash an already-hashed key and give the wrong answer.
+/// Sparkle accepts a 32-byte seed or a 96-byte expanded-private || public secret. Derive from the seed; expanded keys already hold the public half at bytes
+/// 64..<96. Re-deriving from an expanded key would hash an already-hashed key and give the wrong answer.
 func publicKeyBase64(fromKeyMaterial text: String) -> String {
     let compact = text.components(separatedBy: .whitespacesAndNewlines).joined()
     guard !compact.isEmpty else { die("private key file is empty") }

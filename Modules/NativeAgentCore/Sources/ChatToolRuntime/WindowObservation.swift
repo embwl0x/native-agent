@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import NativeAgentShared
 import CoreGraphics
 import AgentWorkspace
@@ -16,34 +17,34 @@ import UniformTypeIdentifiers
 import Dispatcher
 import AgentConversations
 import StandingBots
-// Blueprint: | `WindowObservation.swift` | `SwiftToolDispatcherFourVerbPerceptionSource` struct; native masked window observation, structural and visual recognition, live preview and obstruction exclusion |
+// Blueprint: | `WindowObservation.swift` | `SwiftToolDispatcherFourVerbPerceptionSource`; masked capture; visual recognition; live preview |
 
-/// Fuses MacControl's live capture and Vision recognition into one four-verb supplement.
 struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerceptionSource {
+    let invocation: ChatToolInvocation
     let host: any MacControlClient
     let liveScene: SwiftToolDispatcherFourVerbLiveScene
     let obstructionProbe = SystemMacVisualObstructionProbe()
-    /// Call-local caption keeps words and frame on the same verb.
-    /// Nil names the resolved app, as a bare `screen` does.
+    /// Call-local caption keeps words and frame on the same verb. Nil names the resolved app, as a bare `screen` does.
     let previewCaption: String?
-    /// Screen's captured frame and thin-AX reason, attached by the dispatcher after the verb.
     let pixels: FourVerbPixelAttachment?
 
     init(
+        invocation: ChatToolInvocation,
         host: any MacControlClient,
         liveScene: SwiftToolDispatcherFourVerbLiveScene,
         previewCaption: String? = nil,
         pixels: FourVerbPixelAttachment? = nil
     ) {
+        self.invocation = invocation
         self.host = host
         self.liveScene = liveScene
         self.previewCaption = previewCaption
         self.pixels = pixels
     }
 
-    func rejected() { pixels?.discard(); SenseAppReadCapture.current?.discardWindowText() }
+    func rejected() { pixels?.discard(); invocation.readCapture?.discardWindowText() }
 
-    func observe(app requestedApp: String?) async -> MacFourVerbsSupplement? {
+    func observe(app requestedApp: String?, turn: Turn, context: MacOperationContext) async -> MacFourVerbsSupplement? {
         func unavailable(_ code: String, _ message: String) -> MacFourVerbsSupplement {
             MacFourVerbsSupplement(diagnostics: ["error": .string(code), "message": .string(message),
                 "remedy": MacScreenCaptureFailure.operationFailed(code, message).remedy(app: requestedApp, part: pixels?.part)])
@@ -57,19 +58,19 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 "semantic_raw_frame": .bool(true),
                 "semantic_focus_visual_surface": .bool(true),
             ]
-            // The view decides the picture from its own AX read: a forced
-            // attachment and the live preview always take one; a `screen`
-            // attachment takes one of a thin window.
-            if pixels?.forced == true || MacScreenPreviewBus.publish != nil { body["pixels"] = .string("always") }
+            // The view owns attachment choice: forced capture and preview always need pixels, screen needs them for thin AX.
+            if pixels?.forced == true || turn.screenPreview != nil { body["pixels"] = .string("always") }
             else if pixels != nil { body["pixels"] = .string("thin") }
             if let requestedApp { body["app"] = .string(requestedApp) }
-            result = try await host.dispatch(action: "view", body: body)
+            result = try await host.dispatch(action: "view", body: body, turn: turn,
+                context: context)
         } catch {
             return unavailable("capture_failed", "The requested window observation failed: \(error.localizedDescription)")
         }
         let captureFinishedNs = DispatchTime.now().uptimeNanoseconds
+        let reply = ToolResult(result.output)
         if !result.ok, case .object(let output) = result.output {
-            var remedy = output["remedy"] ?? MacScreenCaptureFailure.operationFailed(
+            var remedy = reply.remedy ?? MacScreenCaptureFailure.operationFailed(
                 result.error ?? "capture_failed", output["message"]?.stringValue ?? "The requested screen capture failed."
             ).remedy(app: requestedApp, part: pixels?.part)
             if case .object(let fields) = remedy, fields["kind"] == .string("inspect") {
@@ -81,7 +82,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         }
         guard result.ok, case .object(let output) = result.output,
               let frameID = output["frame_id"]?.stringValue, !frameID.isEmpty else {
-            return unavailable(result.error ?? "capture_identity_unavailable", "The requested window observation did not return a usable frame identity. Observe the window again after repairing the capture failure.")
+            return unavailable(result.error ?? "capture_identity_unavailable", """
+                The requested window observation did not return a usable frame identity. Observe the window again after repairing the capture \
+                failure.
+                """)
         }
 
         let viewId = output["view"]?.stringValue
@@ -95,20 +99,21 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         let imageLogicalObject = (output["image_logical_size"]?.objectValue ?? [:])
         let pointerObject = (output["pointer"]?.objectValue ?? [:])
         let pointer: MacPointerPosition? = {
-            guard let x = pointerObject["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = pointerObject["y"]?.numberValue(coercingStrings: false, finiteOnly: true) else { return nil }
+            guard let x = pointerObject["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = pointerObject["y"]?.numberValue(
+                coercingStrings: false, finiteOnly: true) else { return nil }
             return MacPointerPosition(x: x, y: y)
         }()
         let visibleFrame: MacAXFrame? = {
-            guard let x = originObject["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = originObject["y"]?.numberValue(coercingStrings: false, finiteOnly: true),
-                  let w = logicalObject["w"]?.numberValue(coercingStrings: false, finiteOnly: true), let h = logicalObject["h"]?.numberValue(coercingStrings: false, finiteOnly: true),
+            guard let x = originObject["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = originObject["y"]?.numberValue(
+                coercingStrings: false, finiteOnly: true),
+                  let w = logicalObject["w"]?.numberValue(coercingStrings: false, finiteOnly: true), let h = logicalObject["h"]?.numberValue(
+                      coercingStrings: false, finiteOnly: true),
                   w > 0, h > 0 else { return nil }
             return MacAXFrame(x: x, y: y, w: w, h: h)
         }()
         let targetPID = Int32(app["pid"]?.numberValue(coercingStrings: false, finiteOnly: true) ?? 0)
-        // Every window over this one, whatever the capture shows (a window-only
-        // capture has no covering pixels). The probe leaves out her Shotgun and
-        // pointer (PersonOnlyWindows); another app's window there would take
-        // her hand, while the app's own sheets, menus and panels are its own.
+        // Window-only capture hides covering pixels, so probe foreground windows independently. PersonOnlyWindows excludes owned overlays; other apps obstruct
+        // actions, while the app’s own sheets remain its surface.
         let covering = targetPID > 0 ? (visibleFrame.map { obstructionProbe.obstructions(over: $0, targetPID: targetPID) } ?? []) : []
         let handObstructions = covering.filter { $0.ownerPID != targetPID }.map(\.frame)
         let structural = structuralSupplement(
@@ -124,11 +129,11 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
 
         let png = output["image"]?.stringValue
         let image: CGImage? = {
-            guard MacScreenPreviewBus.publish != nil || pixels != nil || output["recognize_pixels"] == .bool(true),
+            guard turn.screenPreview != nil || pixels != nil || output["recognize_pixels"] == .bool(true),
                   let png, let data = Data(base64Encoded: png) else { return nil }
             return VisionImageDecoder.decode(data)
         }()
-        if let publish = MacScreenPreviewBus.publish {
+        if let publish = turn.screenPreview {
             await publishPreview(image: image, appName: appName, publish: publish)
         }
 
@@ -152,13 +157,12 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                               (imageLogicalObject["h"] ?? logicalObject["h"])?.numberValue(coercingStrings: false, finiteOnly: true) ?? 0),
                 background: output["capture_isolated_window"] == .bool(true),
                 window: [bundleIdentifier ?? "", appName ?? "", title, windowFrame].joined(separator: "|"),
-                captureDetail: output["message"]?.stringValue, captureRemedy: output["remedy"]
+                captureDetail: output["message"]?.stringValue, captureRemedy: reply.remedy
             )
             if let mainPicture = frame(output["semantic_focus_frame"]) {
                 pixels.focus(name: "the window's main picture area", frame: mainPicture)
             }
         }
-        // The view decides whether this window needs pixel perception.
         guard output["recognize_pixels"] == .bool(true) else { return structural }
         guard let image,
               let originX = (imageOriginObject["x"] ?? originObject["x"])?.numberValue(coercingStrings: false, finiteOnly: true),
@@ -166,7 +170,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
               let logicalW = (imageLogicalObject["w"] ?? logicalObject["w"])?.numberValue(coercingStrings: false, finiteOnly: true),
               let logicalH = (imageLogicalObject["h"] ?? logicalObject["h"])?.numberValue(coercingStrings: false, finiteOnly: true),
               logicalW > 0, logicalH > 0 else {
-            return unavailable("visual_observation_unavailable", "The requested visual observation has missing or undecodable pixels or invalid capture geometry. Repair the capture before interpreting its visual contents." + (output["image_unavailable_reason"]?.stringValue.map { " Capture: \($0)" } ?? ""))
+            return unavailable("visual_observation_unavailable", """
+                The requested visual observation has missing or undecodable pixels or invalid capture geometry. Repair the capture before \
+                interpreting its visual contents.
+                """ + (output["image_unavailable_reason"]?.stringValue.map { " Capture: \($0)" } ?? ""))
         }
 
         #if canImport(Vision)
@@ -208,9 +215,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             var visionValues = vision.values
             let visionTargets = vision.targets.compactMap { target -> MacFourVerbsSupplementalTarget? in
                 if target.regionOnly {
-                    // The surface still exists when a small popup covers part
-                    // of it. Carry exact exclusions to the fresh point chooser;
-                    // never exempt its motor point from obstruction checks.
+                    // The surface still exists when a small popup covers part of it. Carry exact exclusions to the fresh point chooser; never exempt its motor
+                    // point from obstruction checks.
                     return MacFourVerbsSupplementalTarget(label: target.label, aliases: target.aliases,
                         kind: target.kind, secret: target.secret, frame: target.frame, observedFrame: target.observedFrame,
                         excludedFrames: obstructions.map(\.frame), provenance: target.provenance,
@@ -219,8 +225,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                         motionUncertain: target.motionUncertain, sourceAXPath: target.sourceAXPath,
                         enabled: target.enabled)
                 }
-                // Check the final motor frame too: motion lead may move a
-                // clear observed object under a foreground window.
+                // Check the final motor frame too: motion lead may move a clear observed object under a foreground window.
                 return obstructions.contains { $0.covers(target.frame) } ? nil : target
             }
             if let pixels, let part = pixels.part,
@@ -248,7 +253,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             for obstruction in obstructions.prefix(3).reversed() {
                 let coverage = Int((obstruction.coverage * 100).rounded())
                 let coverageText = coverage == 0 ? "<1%" : "\(coverage)%"
-                let text = "visual world covered in part by \(obstruction.ownerName) foreground window (\(coverageText) coverage); covered pixels excluded, only clear targets remain available"
+                let text = """
+                    visual world covered in part by \(obstruction.ownerName) foreground window (\(coverageText) coverage); covered pixels \
+                    excluded, only clear targets remain available
+                    """
                 visionValues.insert(MacScreenRender.Value(
                     text: MacScreenText(text, redacted: .string(text)),
                     provenance: .vision(1)
@@ -265,7 +273,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 "capture_post_render_ms": output["post_render_ms"] ?? .null,
                 "capture_view_total_ms": output["view_total_ms"] ?? .null,
             ]
-            OwnedProgramRunner.ReadContent.current?.record(.object(timings), content: .object([:]))
+            invocation.readContent?.record(.object(timings), content: .object([:]))
             return MacFourVerbsSupplement(
                 appName: appName,
                 bundleIdentifier: bundleIdentifier,
@@ -307,13 +315,17 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             return unavailable("visual_observation_failed", "The requested visual observation could not be interpreted: \(error.localizedDescription)")
         }
         #else
-        return unavailable("visual_observation_unsupported", "Visual recognition is unavailable in this build. Use a build with Vision support for this requested observation.")
+        return unavailable("visual_observation_unsupported",
+            "Visual recognition is unavailable in this build. Use a build with Vision support for this requested observation.")
         #endif
     }
 
     static func captureDate(from output: [String: JSONValue]) throws -> Date {
         guard let epoch = output["captured_at_epoch_seconds"]?.numberValue(coercingStrings: false, finiteOnly: true) else {
-            throw ToolFailureError("The captured frame has no valid capture timestamp; its age and motion cannot be established. Repair the window capture before interpreting motion.",
+            throw ToolFailureError("""
+                The captured frame has no valid capture timestamp; its age and motion cannot be established. Repair the window capture before \
+                interpreting motion.
+                """,
                 effects: .none, code: "capture_timestamp_unavailable")
         }
         return Date(timeIntervalSince1970: epoch)
@@ -335,9 +347,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         var targets: [MacFourVerbsSupplementalTarget] = []
         var values: [MacScreenRender.Value] = []
 
-        // Native popup menus are often siblings of the document window. Their
-        // current AX geometry is actionable, but never a window-relative path
-        // or mark: the next act re-observes and resolves their names afresh.
+        // Native popup menus may be sibling windows; resolve names afresh rather than assigning document-relative marks.
         for menuValue in menus.prefix(MacTransientMenus.maxMenus) {
             let menu = (menuValue.objectValue ?? [:])
             let truncated = menu["truncated"]?.boolValue == true
@@ -366,8 +376,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                   let number = integer(mark["mark"]) else { continue }
             let kind = MacScreenRender.kindName(role: role)
             let published = screenText(mark["label"])
-            // Keep absence as absence. The fused target/render layer assigns
-            // one ordinal after matching this mark to the semantic AX lane.
+            // Keep absence as absence. The fused target/render layer assigns one ordinal after matching this mark to the semantic AX lane.
             let label = published ?? MacScreenText("")
             let sourceAXPath: [Int]? = {
                 guard case .array(let entries)? = mark["path"] else { return nil }
@@ -431,8 +440,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         )
     }
 
-    /// Publishes the held frame masked and downscaled; missing pixels still update the caption.
-    /// The card retains its previous image when capture has none.
+    /// Publishes the held frame masked and downscaled; missing pixels still update the caption. The card retains its previous image when capture has none.
     private func publishPreview(
         image: CGImage?,
         appName: String?,
@@ -454,8 +462,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
 
     private func frame(_ value: JSONValue?) -> MacAXFrame? {
         let object = (value?.objectValue ?? [:])
-        guard let x = object["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = object["y"]?.numberValue(coercingStrings: false, finiteOnly: true),
-              let w = object["w"]?.numberValue(coercingStrings: false, finiteOnly: true), let h = object["h"]?.numberValue(coercingStrings: false, finiteOnly: true),
+        guard let x = object["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = object["y"]?.numberValue(
+            coercingStrings: false, finiteOnly: true),
+              let w = object["w"]?.numberValue(coercingStrings: false, finiteOnly: true), let h = object["h"]?.numberValue(
+                  coercingStrings: false, finiteOnly: true),
               w > 0, h > 0 else { return nil }
         return MacAXFrame(x: x, y: y, w: w, h: h)
     }

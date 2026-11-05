@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `SecurityCenter+JSONUtilities.swift` | Trust JSON primitives and workspace roots; resolved containment uses NativeAgentWorkspaceRoot's byte-exact component law; transport policy decoding belongs to TransportAllowlist in PersistenceCore |
+// Blueprint: | `SecurityCenter+JSONUtilities.swift` | Resolved workspace containment shares execution spelling. |
 
 extension SwiftNativeSecurityCenter {
     static func object(_ value: JSONValue?) -> [String: JSONValue] {
@@ -52,8 +52,7 @@ extension SwiftNativeSecurityCenter {
         return out
     }
 
-    /// `read_file`'s fence, for a file that reaches the model another way (a
-    /// chat attachment the agent names): it must sit in a Trust workspace root.
+    /// Files reaching the model outside read_file still need the same Trust workspace fence.
     public static func isInsideTrustedWorkspace(
         _ file: URL, policy: [String: JSONValue], dataRoot: URL
     ) -> Bool {

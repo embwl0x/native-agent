@@ -3,7 +3,7 @@ import NativeAgentShared
 import CryptoKit
 import SwiftUI
 import UIKit
-// Blueprint: | `iCloudBridge+Drive.swift` | Drive acquisition, outbox scanning, consumed-reply archive retention and deadline-bound staged publication on iCloudBridge |
+// Blueprint: | `iCloudBridge+Drive.swift` | Drive setup/outbox, consumed-reply archive retention and bounded staged publication |
 
 private enum ICloudBridgeIOError: LocalizedError, Sendable {
     case timeout(String, TimeInterval)
@@ -35,8 +35,7 @@ enum ICloudLegacyReplyArchive {
         do {
             try fileManager.moveItem(at: fileURL, to: destination)
         } catch {
-            // Seen-message persistence remains the delivery guard. Archive
-            // maintenance must never prevent a verified reply from reaching Chat.
+            // Archive maintenance must not block verified Chat delivery; persisted seen-message receipts own deduplication.
             NSLog("[iCloudBridge] could not archive consumed legacy reply %@: %@", fileURL.lastPathComponent, error.localizedDescription)
         }
     }
@@ -128,7 +127,7 @@ private final class ICloudBridgeWriteContinuation: @unchecked Sendable {
 }
 
 extension iCloudBridge {
-    /// Applies the container lookup only to the setup lifecycle that requested it.
+    /// Fence container lookup to the requesting setup lifecycle so late results cannot publish into a new one.
     @MainActor
     func applyContainerResult(_ containerURL: URL?, generation: Int) async {
         guard generation == setupGeneration, isSetUp else { return }
@@ -136,7 +135,7 @@ extension iCloudBridge {
         guard let containerURL else {
             available = false
             syncStatus = "iCloud unavailable — sign into iCloud in Settings → Apple Account"
-            isSetUp = false  // allow retry
+            isSetUp = false
             return
         }
         let docsURL = containerURL.appendingPathComponent("Documents")

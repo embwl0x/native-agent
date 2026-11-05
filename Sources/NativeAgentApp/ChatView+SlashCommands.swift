@@ -9,7 +9,7 @@ import Dispatcher
 import AppToolRuntime
 import Connectors
 import ChatToolRuntime
-// Blueprint: | `ChatView+SlashCommands.swift` | `ChatView`: shared slash recognition and execution preserve attachments; Simple/Advanced commands open existing pages in SimpleSetupPanel, voice action and composer context receipt |
+// Blueprint: | `ChatView+SlashCommands.swift` | `ChatView`: Shared slash dispatch, setup navigation and attachment preservation |
 
 enum ChatSlashPage: Equatable, Sendable {
     case settings, connectors, helpers, today, desk, telegram, iphone
@@ -27,21 +27,20 @@ extension ChatView {
         }
         let attachments = pendingAttachments
         let message = text
-        // Capture the edit time before clearing so this send cannot erase a newer draft in another panel.
+        // Capture edit time before clearing so this send cannot erase a newer draft in another panel.
         let messageEditedAt = draftEditedAt
         let composerSessionId = appModel.activeChatSessionId
-        // Commands consume no attachments. Paths and slash prose stay messages.
+        // Slash commands consume no attachments; paths and slash prose remain messages.
         switch ChatSlashCommandRouting.decide(
             text: message,
             supportsDispatch: true
         ) {
         case .dispatch(let commandLine):
-            // Slash commands preserve pending attachments because they send no message.
+            // Preserve attachments because commands send no message.
             handleSlashCommand(commandLine)
             return
         case .unsupportedHere(let command):
-            // Unreachable with supportsDispatch: true; kept exhaustive so a new
-            // decision case cannot silently fall through to a chat send.
+            // Keep the switch exhaustive so a new dispatch decision cannot silently become a chat send.
             showToast(ChatSlashCommandRouting.unsupportedMessage(command: command))
             return
         case .unknownCommand(let command):
@@ -50,8 +49,7 @@ extension ChatView {
         case .sendAsMessage:
             break
         }
-        // Recognize /voice before finishing dictation, so it can stop the
-        // current recording rather than finish it and immediately start again.
+        // Recognize /voice before ending dictation so stopping cannot finish and immediately restart recording.
         if !voiceSessionId.isEmpty {
             Task { @MainActor in if await finishDictation() { send() } }
             return
@@ -65,10 +63,8 @@ extension ChatView {
                 expectedSessionId: composerSessionId
             )
             switch acceptance {
-            case .accepted(let acceptedSessionId), .queued(let acceptedSessionId, _):
-                // The acceptance path can suspend behind a pending Stop write.
-                // Only clear the exact composer snapshot that was accepted;
-                // preserve any edits or attachments added while it waited.
+            case .accepted(let acceptedSessionId):
+                // Acceptance may wait behind Stop; clear only accepted text and attachments so newer edits survive.
                 guard appModel.activeChatSessionId == acceptedSessionId,
                       composerSessionId == acceptedSessionId,
                       text == message,
@@ -80,10 +76,9 @@ extension ChatView {
                     editedAt: messageEditedAt
                 )
                 pendingAttachments = []
-                // Ending dictation prevents cumulative transcripts from restoring sent words.
+                // End dictation so cumulative recognition cannot restore sent words.
                 endDictation()
                 transcriptLatestRequest &+= 1
-                scrollCoordinator.forceFollow()
             case .rejected(let failureMessage):
                 showToast(failureMessage)
             }
@@ -120,7 +115,11 @@ extension ChatView {
                 return
             case .clear: clearConfirmation.request(sessionId: appModel.activeChatSessionId)
             case .help:
-                appModel.engine.transcripts.appendMessage(ChatMessage(role: "system", content: ChatSlashCommandRegistry.helpText()), to: appModel.activeChatSessionId, leads: false)
+                appModel.engine.transcripts.appendMessage(
+                    ChatMessage(role: "system", content: ChatSlashCommandRegistry.helpText()),
+                    to: appModel.activeChatSessionId,
+                    leads: false
+                )
             case .tools: ApplicationLifetime.shared.request(.skillsTools(.tools))
             case .export: exportCurrentChatToDownloads()
             case .settings, .helpers, .today, .desk, .memory, .forget, .agents, .connect:
@@ -160,13 +159,13 @@ extension ChatView {
                     case "": page = .connectors
                     case "telegram": page = .telegram
                     case "iphone": page = .iphone
-                    default: page = .connector(service) // Checked wizard route above.
+                    default: page = .connector(service)
                     }
                 default: preconditionFailure("Expected a page command")
                 }
                 ApplicationLifetime.shared.request(.chatShortcut(page))
             case .voice:
-                // Dictation must capture the draft after the command is gone.
+                // Capture dictation's draft only after the command is removed.
                 text = ""
                 toggleVoice()
                 return
@@ -183,7 +182,7 @@ extension ChatView {
             showToast(message)
             return
         }
-        // The command was taken. Only now does the composer lose its text.
+        // Clear composer text only after the command is accepted.
         text = ""
     }
 
@@ -199,22 +198,19 @@ extension ChatSlashPage {
     @MainActor @ViewBuilder
     func content(close: @escaping () -> Void) -> some View {
         switch self {
-        case .settings: SetupView()
+        case .settings: FacePageView(page: "settings")
         case .connectors: ConnectorsRailPage()
         case .telegram: TelegramView()
         case .iphone: MacPairingView()
         case .connector(let service):
             ConnectorWizardView(provider: service, onDismiss: close)
-        case .helpers:
-            BotsShelfView(onContinue: { destination in
-                ApplicationLifetime.shared.request(destination)
-            })
+        case .helpers: FacePageView(page: "bots")
         case .today: TodayView()
-        case .desk: DeskPageView(rootRouteVersion: 0)
+        case .desk: FacePageView(page: "desk").modifier(DeskFaceEditors())
         case .memories(let query, let choosingToForget):
             ShellPageFrame(title: "Memories", subtitle: choosingToForget
                            ? "Choose a memory and use ‘Forget this…’ to confirm." : nil, alive: true) {
-                MemoriesPageView(initialQuery: query)
+                FacePageView(page: "memories").modifier(MemoriesFaceNavigation(initialQuery: query))
             }
         }
     }
@@ -227,7 +223,6 @@ extension AppModel: ChatSlashCommandHost {
     }
     func stageChatSlashBrain() { _ = enqueueChatBrainDefaultsSave() }
     func saveChatSlashBrain() async -> String { await saveChatBrainDefaults().userMessage }
-    func compactChatSlashSession() async -> String { await compactActiveChat().userMessage }
     func rememberChatSlashFact(_ text: String) async -> (succeeded: Bool, message: String) {
         let result = await addMemoryFact(text)
         return (result.succeeded, result.userMessage)

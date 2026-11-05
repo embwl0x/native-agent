@@ -1,14 +1,11 @@
 import Foundation
 import NativeAgentCore
 import os
-// Blueprint: | `Flow.swift` | `Flow`: scope-ordered open, stopped, finished and dropped helpers over ExperienceStore; failure state shares the durable owner's root-plus-scope record identity; unfinished runs owe finish, with position-prefixed landed digests and references to their owners' raw records |
+// Blueprint: | `Flow.swift` | `Flow`. |
 
-/// Landed work belongs to one unfinished experience, not to a second ledger.
-/// Each stop appends the whole list of what has landed, newest last, so a
-/// position that later lands (or is re-checked) is read from the latest list.
+/// Keep landed work on one unfinished experience; the latest complete list preserves positions that land or reconcile later.
 public enum Flow {
-    /// A scope whose last flow write failed: until one lands there, "no flow"
-    /// can't be told from "a flow I failed to record", so its lookup refuses.
+    /// After a failed flow write, absence is ambiguous; refuse reads until a successful write restores evidence.
     private static let unrecorded = OSAllocatedUnfairLock(initialState: [String: String]())
 
     private static func write(_ root: URL, _ scope: String,
@@ -31,8 +28,7 @@ public enum Flow {
         }
     }
 
-    /// The read queues behind this scope's writes, including a just-stopped run.
-    /// Unreadable is not "none": a flow it can't see may hold landed work.
+    /// Queue reads behind scope writes; unreadable flow may contain landed work and cannot mean none.
     public static func open(_ root: URL, scope: String) async throws -> Experience? {
         let result = OSAllocatedUnfairLock<Result<Experience?, Error>>(initialState: .success(nil))
         await ExperienceStore.record(root, "flow:" + scope) { store in
@@ -51,7 +47,6 @@ public enum Flow {
         return try result.withLock { $0 }.get()
     }
 
-    /// What has landed, in order, as of the latest stop.
     public static func landed(_ flow: Experience) -> [String] {
         guard let latest = flow.claims.last(where: { $0.claim.hasPrefix("landed@") }),
               let colon = latest.claim.range(of: ": ") else { return [] }
@@ -59,8 +54,7 @@ public enum Flow {
         return list.isEmpty ? [] : list.split(separator: ",").map(String.init)
     }
 
-    /// Queued behind the scope's other writes; nothing waits on it. Its owner
-    /// drops a flow its new work doesn't continue; a stop only ever adds to it.
+    /// Queue closure behind prior scope writes; new work may release a flow, while stops only add landed evidence.
     @discardableResult
     public static func stopped(_ root: URL, scope: String, landed: [String], words: String,
                                evidence: Experience.Ref, cause: [String] = []) -> Task<Void, Never> {

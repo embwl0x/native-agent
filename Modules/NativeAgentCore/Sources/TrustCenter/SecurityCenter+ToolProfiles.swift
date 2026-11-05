@@ -3,16 +3,27 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter+ToolProfiles.swift` | AuthoredToolEffects owns current primitive-effect identity for redaction and classification; shellReadOnlyWords certifies literal shell reads for gates, receipts and fixed-argv read confinement; canonicalToolRisk and declared effect projection; app-call read treatment delegates to PermissionLaw.toolClass, with argument policy and display severity |
+// Blueprint: | `SecurityCenter+ToolProfiles.swift` | Canonical effect classification; advisory metadata grants no authority. |
+
+/// One authored operation's admission mode, passed by its owner.
+public struct AuthoredEffectOptions: Sendable {
+    public var admissionOnly: Bool
+    public init(admissionOnly: Bool = false) { self.admissionOnly = admissionOnly }
+}
+
+/// The primitive implementation injected into the gated executor for this operation.
+public struct AuthoredEffectExecutor: Sendable {
+    public let call: (tool: String, perform: @Sendable () async throws -> JSONValue)
+    public init(tool: String, perform: @escaping @Sendable () async throws -> JSONValue) {
+        call = (tool, perform)
+    }
+}
 
 /// Primitive effects retain the authored envelope and the turn's ordinary gates.
 public enum AuthoredToolEffects {
-    @TaskLocal public static var admissionOnly = false
-    @TaskLocal public static var call: (tool: String, perform: @Sendable () async throws -> JSONValue)?
 
-    /// Certify only a single, literal read command. Shell syntax, expansion,
-    /// unknown programs and unknown flags retain write authority. The launch
-    /// owner binds these words to system executables under read confinement.
+    /// Certify only a single, literal read command. Shell syntax, expansion, unknown programs and unknown flags retain write authority. The launch owner binds
+    /// these words to system executables under read confinement.
     public static func shellReadOnlyWords(_ input: [String: JSONValue]) -> [String]? {
         let literal = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 /._-:=@%,+")
         guard case .string(let command)? = input["cmd"], !command.isEmpty,
@@ -46,11 +57,22 @@ public enum AuthoredToolEffects {
         }
     }
 
+    /// Programs whose effect cannot be undone. A shell call whose command starts with one asks the person even under Full Mac (permanent deletion
+    /// and macOS privacy resets are the person's). Only the first word counts: command text is never certified beyond it, so a deletion hidden inside a
+    /// script or another program's arguments is not seen here.
+    public static let irreversiblePrograms: Set<String> = ["rm", "rmdir", "srm", "unlink", "shred", "dd", "truncate", "tccutil", "diskutil"]
+
+    public static func shellIrreversible(_ tool: String, input: [String: JSONValue]) -> Bool {
+        guard ["shell", "bash"].contains(ToolNameAliases.canonical(tool)), case .string(let command)? = input["cmd"],
+              let first = command.split(whereSeparator: \.isWhitespace).first else { return false }
+        return irreversiblePrograms.contains(URL(fileURLWithPath: String(first)).lastPathComponent)
+    }
+
     public static func shellReadOnly(_ tool: String, input: [String: JSONValue]) -> Bool {
         ["shell", "bash"].contains(ToolNameAliases.canonical(tool)) && shellReadOnlyWords(input) != nil
     }
 
-    /// A watching part's hands on the window it watches (MacScreenWatch): act's effects.
+    /// A watching part acts on its watched window under the same effect class as act.
     public static let handOperations: Set<String> = ["hand.click", "hand.double_click", "hand.right_click", "hand.move",
                                                      "hand.drag", "hand.key", "hand.hold", "hand.down", "hand.up"]
     public static let primitiveCapabilities: [String: Set<String>] = [
@@ -60,22 +82,19 @@ public enum AuthoredToolEffects {
         "network.send": ["network_write", "external_send"],
         "apps.call": ["applescript", "system_control"],
         "screen.watch": ["safe_read"], "screen.next": ["safe_read"], "frame.read": ["safe_read"],
-        // A program she starts is a command line: the shell's own class. Its
-        // talk runs inside that start's admission.
+        // Program start owns shell admission; later talk stays within it.
         "program.start": ["process_spawn", "shell"], "program.send": ["process_spawn"],
         "program.receive": ["safe_read"], "program.close": ["process_spawn"],
     ].merging(handOperations.map { ($0, ["mac_control", "ax_injection"]) }) { $1 }
 
-    /// Fetch is one broker operation with keyless/secret effect identities at
-    /// admission. These and primitiveCapabilities are the current contracts.
+    /// Fetch is one broker operation with keyless/secret effect identities at admission. These and primitiveCapabilities are the current contracts.
     private static let fetchOperations: Set<String> = ["fetch", "fetch.keyless", "fetch.secret"]
     public static func isPrimitiveEffect(_ operation: String) -> Bool {
         primitiveCapabilities[operation] != nil || fetchOperations.contains(operation)
     }
 
     public static func appReadOnly(_ args: [String: JSONValue]) -> Bool {
-        // Read-only script declarations are enforced per event by MacControl's
-        // send callback before the event reaches the app.
+        // Read-only script declarations are enforced per event by MacControl's send callback before the event reaches the app.
         if case .string? = args["script"] { return args["read_only"] == .bool(true) }
         return args["script"] == nil && (args["dictionary"] == .bool(true) || args["event_class"] == .string("core")
             && [.string("getd"), .string("cnte"), .string("doex")].contains(args["event_id"] ?? .null))
@@ -88,9 +107,7 @@ public enum AuthoredToolEffects {
         }
         if fetchOperations.contains(operation) {
             let read = args["method"] == nil || arguments?.stringFields["method"]?.uppercased() == "GET"
-            // A call carrying the person's secret acts as the person at that
-            // service: one that only reads (GET or HEAD, no body) is a read; any
-            // other is an effect and passes Trust as one.
+            // A secret-bearing request acts as the person at that service; only GET/HEAD without a body remains a read.
             if operation == "fetch.secret" || operation == "fetch" && !Keyring.names(in: arguments ?? .null).isEmpty {
                 return ("fetch.secret", (read || arguments?.stringFields["method"]?.uppercased() == "HEAD") && args["body"] == nil
                     ? ["safe_read", "network_read", "secrets"] : ["network_write", "external_send", "secrets"])
@@ -102,15 +119,12 @@ public enum AuthoredToolEffects {
     }
 }
 
-/// Read-only projection of SecurityCenter's canonical tool profile risk.
-/// Consumers may use this metadata for advisory behavior, but it grants no
-/// authority and does not replace effect-time SecurityCenter evaluation.
+/// Risk metadata is advisory and never substitutes for effect-time authorization.
 public enum CanonicalToolRisk: String, Sendable, Codable, Comparable {
     case low
     case medium
     case high
     case critical
-    /// The source needed to classify the action could not be read.
     case unavailable
 
     private var rank: Int {
@@ -134,21 +148,19 @@ extension SwiftNativeSecurityCenter {
         var risk: CanonicalToolRisk
     }
 
-    /// Classify a tool through the same profile owner used by authorization.
-    /// This is deliberately pure: it does not read policy, assess origins,
-    /// record receipts, or imply that the tool is allowed to run.
+    /// Pure classification through the authorization profile owner grants no permission and records no effects.
     public static func canonicalToolRisk(
         tool: String,
         input: [String: JSONValue],
         dataRoot: URL,
+        turn: Turn?,
         trustedWorkspaceRoots: [URL] = []
     ) -> CanonicalToolRisk {
         do {
-            return try profile(tool: policyToolName(tool), input: input, dataRoot: dataRoot,
+            return try profile(tool: policyToolName(tool), input: input, dataRoot: dataRoot, turn: turn,
                                trustedWorkspaceRoots: trustedWorkspaceRoots).risk
         } catch {
-            // Advisory projections retain unknown classification. Admission
-            // below uses the throwing profile and reports the concrete cause.
+            // Advisory projections retain unknown classification. Admission below uses the throwing profile and reports the concrete cause.
             return .unavailable
         }
     }
@@ -158,6 +170,7 @@ extension SwiftNativeSecurityCenter {
         tool: String,
         input: [String: JSONValue],
         dataRoot: URL,
+        turn: Turn?,
         trustedWorkspaceRoots: [URL] = []
     ) throws -> ToolProfile {
         if AuthoredToolEffects.isPrimitiveEffect(tool) {
@@ -167,16 +180,16 @@ extension SwiftNativeSecurityCenter {
         let name = ToolNameAliases.canonical(tool)
         let schema = AppActionBinding.declaredSchema(name)
             ?? connectorActionIDs.first(where: { $0.value == tool }).flatMap { AppActionBinding.declaredSchema($0.key) }
-        let binding: AppActionBinding? = if tool == "app" { try AppActionBinding.action(input: input) }
-            else if schema == nil { try AppActionBinding.action(tool: name, input: input)
-                ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name)) }
+        let binding: AppActionBinding? = if tool == "app" { try AppActionBinding.action(input: input, turn: turn) }
+            else if schema == nil { try AppActionBinding.action(tool: name, input: input, turn: turn)
+                ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name), turn: turn) }
             else { nil }
         var capabilities = schema?.capabilities ?? binding?.descriptor?.schema.capabilities ?? binding?.capabilities ?? ["tool_call"]
         if AuthoredToolEffects.shellReadOnly(name, input: input) {
             capabilities = ["tool_call", "safe_read"]
         }
         if tool == "app" {
-            if try PermissionLaw.toolClass(name, input: input) == .read {
+            if try PermissionLaw.toolClass(name, input: input, turn: turn) == .read {
                 capabilities = ["tool_call", "safe_read"]
             } else {
                 capabilities = binding?.capabilities ?? capabilities.subtracting(["safe_read"])
@@ -195,7 +208,7 @@ extension SwiftNativeSecurityCenter {
                 capabilities.subtract(["shell", "process_spawn"])
             }
         }
-        if try !capabilityWritesOutsideAppData(tool: name, input: input, dataRoot: dataRoot, trustedWorkspaceRoots: trustedWorkspaceRoots) {
+        if try !capabilityWritesOutsideAppData(tool: name, input: input, dataRoot: dataRoot, turn: turn, trustedWorkspaceRoots: trustedWorkspaceRoots) {
             capabilities.remove("outside_app_data_write")
         }
         return ToolProfile(capabilities: capabilities, risk: displayRisk(
@@ -212,7 +225,7 @@ extension SwiftNativeSecurityCenter {
             "browser_interaction": .high, "external_send": .high, "approval_stage": .high, "secrets": .high,
             "filesystem_write": .medium, "app_data_write": .medium, "network_write": .medium,
             "clipboard_write": .medium, "notification": .medium, "image_generation": .medium,
-            "workshop_write": .medium, "ledger_write": .medium, "agent_delegate": .high,
+            "ledger_write": .medium, "agent_delegate": .high,
         ]
         return capabilities.map { capability in
             capability == "external_send" && capabilities.contains("notification") ? .medium : severity[capability] ?? .low
@@ -220,8 +233,7 @@ extension SwiftNativeSecurityCenter {
     }
 
 
-    /// The checked contact owner resolves IDs, names and handles, then reads
-    /// the exact host recipe. Missing assembly/contact/recipe is unavailable.
+    /// The checked contact owner resolves IDs, names and handles, then reads the exact host recipe. Missing assembly/contact/recipe is unavailable.
     static func messagesAnAgentHostByCommand(_ handle: JSONValue?, dataRoot: URL) throws -> Bool {
         guard case .string(let agent)? = handle, !agent.isEmpty else {
             throw ToolFailureError("Name the contact before classifying the message's effects.", effects: .none,
@@ -236,11 +248,7 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
-    /// The name a policy entry, profile and receipt are keyed on. Spellings
-    /// resolve through the one alias table (`ToolNameAliases`); what is left
-    /// here is not aliasing: a chat tool that fronts a connector action is
-    /// judged as that action (`mac_notify` performs `mac.notify`), and no
-    /// such action id is ever dispatched as a tool.
+    /// Canonical names share the alias owner; chat wrappers are judged by their connector action identity.
     package static func policyToolName(_ raw: String) -> String {
         let tool = ToolNameAliases.canonical(raw).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return connectorActionIDs[tool] ?? tool

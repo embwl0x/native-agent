@@ -1,9 +1,9 @@
 import Foundation
 import NaturalLanguage
 import PersistenceCore
-// Blueprint: | `StudioWorkingShelf.swift` | Explicit shelf selections; reads carry correction-history availability independently of known sentence supersession, including unavailable quote paths |
+// Blueprint: | `StudioWorkingShelf.swift` | Shelf quotes preserve corrections and read gaps |
 
-/// Explicit selections beside the additive journal. No cached artifacts or usage state.
+/// Shelf selections reference the additive journal without caching artifacts or usage state.
 public struct StudioWorkingShelf: Sendable {
     public let dataRoot: URL
     public var path: URL { dataRoot.appendingPathComponent("studio/working_shelf.json") }
@@ -64,7 +64,8 @@ public struct StudioWorkingShelf: Sendable {
             guard title.utf8.count <= 120,
                   !title.contains(where: { $0.isNewline }),
                   sentence.utf8.count <= 4096, limitation.utf8.count <= 2048 else {
-                throw Refusal(message: "Use a short title and aim for about 60 prose words per slot. Choose a shorter sentence from the journal rather than clipping it.")
+                throw Refusal(
+                    message: "Use a short title and aim for about 60 prose words per slot. Choose a shorter sentence from the journal rather than clipping it.")
             }
             return Slot(entryID: id, title: title, sentence: sentence, quoteField: field, limitation: limitation)
         }
@@ -88,25 +89,18 @@ public struct StudioWorkingShelf: Sendable {
         return first
     }
 
-    /// What a correction did to this slot's sentence: the amendments that
-    /// touch it, and the sentence as it now READS.
+    /// Preserve the selected sentence with its overlapping amendments.
     struct Supersession {
-        /// In document order, the amendments whose passage overlaps the
-        /// sentence. Never empty.
+        /// Keep amendments in document order; a superseded sentence always has at least one.
         let amendments: [StudioAmendment]
-        /// The selected sentence with each correction shown IN PLACE — only the
-        /// corrected words struck through, the rest of the sentence intact.
+        /// Strike only corrected words so unchanged words retain their meaning.
         let correctedSentence: String
 
         var first: StudioAmendment { amendments[0] }
     }
 
-    /// The corrections that superseded this slot's sentence, if any. A
-    /// correction that covers any part of the quoted sentence supersedes it:
-    /// serving the sentence unchanged would present words she has already
-    /// struck through as what she currently says.
-    ///
-    /// Only `response` is amendable, so a `stance.reason` quote never matches.
+    /// Any overlapping correction supersedes a quoted response; serving it unchanged would recirculate a retracted claim. Only response is amendable, so
+    /// stance.reason quotes cannot match.
     private func supersession(_ slot: Slot, entry: StudioJournalEntry) -> Supersession? {
         guard slot.quoteField == "response",
               let response = entry.response,
@@ -121,8 +115,7 @@ public struct StudioWorkingShelf: Sendable {
         case amendment(StudioAmendment)
     }
 
-    /// Corrections remain in the amendment log; quote their exact words and
-    /// carry the source amendment on shelf reads instead of rewriting history.
+    /// Corrections remain in the amendment log; quote their exact words and carry the source amendment on shelf reads instead of rewriting history.
     private func quoteSource(_ slot: Slot, entry: StudioJournalEntry) -> QuoteSource? {
         let source = slot.quoteField == "response" ? entry.response : entry.stance.reason
         let matchesOriginal = source.map { containsSentence(slot.sentence, in: $0) } ?? false
@@ -136,9 +129,7 @@ public struct StudioWorkingShelf: Sendable {
     }
 
     private func containsSentence(_ sentence: String, in source: String) -> Bool {
-        // One complete sentence, as the platform sentence tokenizer sees it (so
-        // "Dr. Smith arrived." is one sentence, not two). Compare bytes so even
-        // canonically equivalent Unicode cannot rewrite a quotation.
+        // Platform sentence boundaries handle abbreviations; compare bytes so Unicode normalization cannot rewrite quotations.
         let tokenizer = NLTokenizer(unit: .sentence)
         tokenizer.string = source
         var found = false
@@ -155,15 +146,24 @@ public struct StudioWorkingShelf: Sendable {
         let entries = try await store.journalEntriesIncludingArchive()
         for slot in slots {
             guard let entry = entry(slot.entryID, in: entries), let source = quoteSource(slot, entry: entry) else {
-                throw Refusal(message: "Entry \(slot.entryID) is unavailable or selected_sentence is not one complete sentence verbatim in \(slot.quoteField). Fragments and multiple sentences are not accepted. Choose a shorter existing sentence rather than clipping or rewriting it. The shelf is unchanged.")
+                throw Refusal(message: """
+                    Entry \(slot.entryID) is unavailable or selected_sentence is not one complete sentence verbatim in \(slot.quoteField). Fragments and \
+                    multiple sentences are not accepted. Choose a shorter existing sentence rather than clipping or rewriting it. The shelf is unchanged.
+                    """)
             }
-            // The journal line still says it; she no longer does.
+            // Historical presence does not make a superseded sentence current.
             if case .original(let superseded?) = source {
                 let amendment = superseded.first
-                throw Refusal(message: "Entry \(slot.entryID): that sentence was corrected on \(amendment.amendedOn) (\(amendment.reason)) and now reads \"\(amendment.correction)\". Shelve the corrected sentence instead. The shelf is unchanged.")
+                throw Refusal(message: """
+                    Entry \(slot.entryID): that sentence was corrected on \(amendment.amendedOn) (\(amendment.reason)) and now reads \
+                    \"\(amendment.correction)\". Shelve the corrected sentence instead. The shelf is unchanged.
+                    """)
             }
             if entry.correctionsUnreadable {
-                throw Refusal(message: "Entry \(slot.entryID): its corrections could not be read (journal/amendments.jsonl is damaged), so whether that sentence still stands is unknown. The shelf is unchanged.")
+                throw Refusal(message: """
+                    Entry \(slot.entryID): its corrections could not be read (journal/amendments.jsonl is damaged), so whether that sentence still stands is \
+                    unknown. The shelf is unchanged.
+                    """)
             }
             var workRefs = entry.artifactRefs
             if entry.origin.kind == .consult, let id = entry.origin.ref,
@@ -221,16 +221,11 @@ public struct StudioWorkingShelf: Sendable {
             if case .amendment(let amendment) = source {
                 card["selected_sentence_amendment"] = amendment.toJSON()
             }
-            // A shelved sentence is served as CURRENT, so a correction filed
-            // since has to travel with it — struck through, with the correction,
-            // its date and its reason — or the shelf keeps a retracted claim in
-            // circulation with none of that attached.
+            // Current shelf quotes must carry overlapping corrections, dates and reasons to avoid recirculating retracted claims.
             if case .original(let superseded?) = source {
                 let amendment = superseded.first
                 card["selected_sentence_status"] = .string("superseded")
-                // The correction shown at the passage it actually covers, not
-                // the whole sentence struck out: striking words she never
-                // retracted misreports her as having withdrawn them.
+                // Strike only the covered passage; striking unchanged words would falsely retract them.
                 card["selected_sentence_as_corrected"] = .string(superseded.correctedSentence)
                 card["correction"] = .string(amendment.correction)
                 card["corrected_on"] = .string(amendment.amendedOn)
@@ -241,8 +236,7 @@ public struct StudioWorkingShelf: Sendable {
                     card["entry_response_as_corrected"] = .string(corrected)
                 }
             }
-            // Known supersession and completeness of the correction history
-            // are independent facts. Carry both, even on superseded sentences.
+            // Known supersession and completeness of the correction history are independent facts. Carry both, even on superseded sentences.
             card["corrections_unreadable"] = .bool(entry.correctionsUnreadable)
             if entry.correctionsUnreadable {
                 if card["selected_sentence_status"] == nil {

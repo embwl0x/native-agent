@@ -4,8 +4,7 @@ import NativeAgentCore
 import ChatToolParsing
 // Blueprint: | `AgentWorkspaceEnvironment.swift` | `AgentWorkspaceEnvironment` enum; `isStatusReader`, `title` |
 
-/// A small destination card, not a second capability registry. The actual
-/// schema/catalog and the normal dispatcher remain availability/authority owners.
+/// A small destination card, not a second capability registry. The actual schema/catalog and the normal dispatcher remain availability/authority owners.
 struct AgentWorkspaceDestination: Sendable {
     let id: String
     let title: String
@@ -14,27 +13,29 @@ struct AgentWorkspaceDestination: Sendable {
     var input: [String: JSONValue] = [:]
     var searchField: String? = nil
     var tools: [String] = []
-    /// The search verb's words when "Search <title>" is not what its results page calls it.
     var searchLabel: String? = nil
 }
 
 package enum AgentWorkspaceEnvironment {
     static let destinations: [AgentWorkspaceDestination] =
-        AgentWorkspaceKnowledge.destinations + AgentWorkspaceApps.destinations + AgentWorkspaceActivity.destinations + AgentWorkspaceBuild.destinations + HerScreen.commsDestinations
-            + AgentWorkspaceLife.destinations + HerScreen.coreDestinations + [
-            // The app is its own door, called directly.
-            .init(id: "app", title: "NativeAgent", summary: "The app itself is its own door: call app {} directly for its pages, settings and actions, with receipts.",
+        AgentWorkspaceKnowledge.destinations + AgentWorkspaceApps.destinations + AgentWorkspaceActivity.destinations + AgentWorkspaceBuild.destinations
+            + AgentScreen.commsDestinations
+            + AgentWorkspaceLife.destinations + AgentScreen.coreDestinations + [
+            .init(id: "app", title: "NativeAgent",
+                summary: "The app itself is its own door: call app {} directly for its pages, settings and actions, with receipts.",
                   tool: nil),
             .init(id: "self", title: "My state", summary: "How things stand, current context and available abilities.",
                   tool: "inner_state", tools: ["agent_introspect", "context_lookup"])
         ]
 
     package static let readTools: Set<String> =
-        AgentWorkspaceKnowledge.readTools.union(AgentWorkspaceApps.readTools).union(AgentWorkspaceActivity.readTools).union(AgentWorkspaceBuild.readTools).union(HerScreen.commsReadTools)
-            .union(AgentWorkspaceLife.readTools).union(HerScreen.coreReadTools)
-            .union(["work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state", "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
+        AgentWorkspaceKnowledge.readTools.union(AgentWorkspaceApps.readTools).union(AgentWorkspaceActivity.readTools).union(AgentWorkspaceBuild.readTools)
+            .union(AgentScreen.commsReadTools)
+            .union(AgentWorkspaceLife.readTools).union(AgentScreen.coreReadTools)
+            .union(["work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state",
+                "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
 
-    /// A status check opens as a reading, never a form.
+    /// Status checks open as reads to avoid presenting executable forms.
     static func isStatusReader(_ tool: String) -> Bool {
         tool.hasSuffix("_status") && !tool.contains("set_")
     }
@@ -54,8 +55,7 @@ package enum AgentWorkspaceEnvironment {
         return schema
     }
 
-    /// Nil is a successful catalog read with no exact action; storage/catalog
-    /// failures and duplicate contracts remain errors at every lookup boundary.
+    /// Nil is a successful catalog read with no exact action; storage/catalog failures and duplicate contracts remain errors at every lookup boundary.
     static func optionalSchema(_ name: String, catalog: AgentWorkspace.Catalog) async throws -> LLMToolSchema? {
         let matches = try await catalog().filter { $0.name == name && browsable($0) }
         guard matches.count <= 1 else {
@@ -65,7 +65,8 @@ package enum AgentWorkspaceEnvironment {
     }
 
     static func outcome(_ value: JSONValue) -> JSONValue {
-        .string(ChatToolOutcome.exactResultClass(value).receipt.status)
+        let reply = ToolResult(value)
+        return .string(reply.outcome.receipt.status)
     }
 
     static func retained(_ result: JSONValue) -> JSONValue {
@@ -75,14 +76,15 @@ package enum AgentWorkspaceEnvironment {
            items.allSatisfy({ if case .object(let item) = $0 { item["body"] == nil } else { false } }) { return result }
         guard let serialized = try? result.serialize(pretty: false), serialized.utf8.count > 24_000 else { return result }
         return .object(["status": outcome(result), "excerpt": .string(String(serialized.prefix(12_000))),
-            "truncated": .bool(true), "detail": .string("Bounded retained receipt. Open the capability's recorded result for further detail; this excerpt is not the full response.")])
+            "truncated": .bool(true), "detail": .string(
+                "Bounded retained receipt. Open the capability's recorded result for further detail; this excerpt is not the full response.")])
     }
 
-    /// Only a target reference survives a write, never its submitted contents.
-    /// Reading it is a new gated owner operation, not proof the write succeeded.
+    /// Only a target reference survives a write, never its submitted contents. Reading it is a new gated owner operation, not proof the write succeeded.
     static func readback(tool: String, input: [String: JSONValue]) -> AgentWorkspaceLocation? {
         if tool.hasPrefix("browser.chrome_"), case .int(let tab)? = input["tab_id"] {
-            return .record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)], title: "Selected browser page")
+            return .record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)],
+                title: "Selected browser page")
         }
         if ["desk_note", "desk_update_item", "desk_set_status", "desk_add_ref"].contains(tool), let handle = input["handle"] {
             return .record(tool: "desk_read", input: ["handle": handle], title: "Updated work")
@@ -106,7 +108,8 @@ package enum AgentWorkspaceEnvironment {
         return .record(tool: "read_file", input: ["path": .string(path), "max_bytes": .int(12000)], title: "File: " + path)
     }
 
-    static func read(location: AgentWorkspaceLocation, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> JSONValue {
+    static func read(workspace: WorkspaceOperation, location: AgentWorkspaceLocation, dataRoot: URL,
+        perform: AgentWorkspace.Perform) async throws -> JSONValue {
         switch location {
         case .work(let query): return try await perform("work_context", ["query": .string(query)])
         case .documents(let query): return try await perform("artifact_find", ["query": .string(query), "limit": .int(6)])
@@ -116,27 +119,32 @@ package enum AgentWorkspaceEnvironment {
             guard appRead || readTools.contains(tool) || isStatusReader(tool) else {
                 throw AgentWorkspaceFailure(message: "This item has no supported workspace reader.")
             }
-            return tool == "chat_conversations" ? try await HumanConversationRead.read(input, dataRoot: dataRoot) : try await perform(tool, input)
+            return tool == "chat_conversations" ? try await HumanConversationRead.read(workspace: workspace, input, dataRoot: dataRoot)
+                : try await perform(tool, input)
         default: throw AgentWorkspaceFailure(message: "This view is unavailable. Return to Workspace home.")
         }
     }
 
-    static func view(location: AgentWorkspaceLocation, dataRoot: URL, catalog: AgentWorkspace.Catalog,
+    static func view(workspace: WorkspaceOperation, location: AgentWorkspaceLocation, dataRoot: URL, catalog: AgentWorkspace.Catalog,
                      perform: AgentWorkspace.Perform) async throws -> WorkspacePage? {
         switch location {
         case .browserBookmark(let url, let title, let tabID):
             var actions: [AgentWorkspaceButton] = [
                 .init(label: "Read current source", action: .open(.record(tool: "read_page", input: ["url": .string(url)], title: title))),
-                .init(label: "Open in my browser tab", action: .perform(tool: "browser.chrome_navigate", input: ["url": .string(url)], title: title, textField: nil, isEffect: true))
+                .init(label: "Open in my browser tab", action: .perform(tool: "browser.chrome_navigate", input: ["url": .string(url)], title: title,
+                    textField: nil, isEffect: true))
             ]
             if tabID != nil { actions.insert(.init(label: "Return to this browser tab", action: AgentWorkspaceNavigation.windowAction(location)), at: 0) }
             return .init(title: title, content: .object(["status": .string("saved_reference"),
                 "url": .string(url), "message": .string(tabID == nil
                     ? "Saved page address without a recorded tab identity. Read the source or open it in my browser tab; no current page evidence was restored."
-                    : "Saved tab reference, not live page evidence. Selecting this window reads that tab only while it is still mine. A missing tab or one the owner has taken over is refused.")]), items: [], actions: actions)
+                    : """
+                        Saved tab reference, not live page evidence. Selecting this window reads that tab only while it is still mine. A missing tab or one \
+                        the owner has taken over is refused.
+                        """)]), items: [], actions: actions)
         case .area(let id):
             guard let place = destinations.first(where: { $0.id == id }) else { return nil }
-            if id == "today" { return try await AgentWorkspaceActivity.today(dataRoot: dataRoot, perform: perform) }
+            if id == "today" { return try await AgentWorkspaceActivity.today(workspace: workspace, dataRoot: dataRoot, perform: perform) }
             let schemas = try await catalog()
             let names = Set(schemas.map(\.name))
             var input = place.input
@@ -147,18 +155,21 @@ package enum AgentWorkspaceEnvironment {
                 "status": .string("ok"), "about": .string(place.summary)]), items: [], actions: [])
             if let tool = place.tool, names.contains(tool) {
                 if let field = place.searchField {
-                    projection.actions.append(.init(label: place.searchLabel ?? "Search " + place.title, action: .perform(tool: tool, input: input, title: place.title, textField: field, isEffect: !readTools.contains(tool)), needsText: true))
+                    projection.actions.append(.init(label: place.searchLabel ?? "Search " + place.title, action: .perform(tool: tool, input: input, title: place
+                        .title, textField: field, isEffect: !readTools.contains(tool)), needsText: true))
                 } else if readTools.contains(tool) {
                     let location = AgentWorkspaceLocation.record(tool: tool, input: input, title: place.title), value = try await perform(tool, input)
-                    projection = await .project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
+                    projection = await .project(workspace: workspace, location: location, result: value, dataRoot: dataRoot,
+                        evidence: AgentWorkspaceDocument.evidence(
+                        location: location, value: value))
                 }
             } else if place.tool != nil {
-                projection.content = .object(["status": .string("unavailable"), "message": .string("This place's reader is not advertised in this session. Available actions are shown below.")])
+                projection.content = .object(["status": .string("unavailable"), "message": .string(
+                    "This place's reader is not advertised in this session. Available actions are shown below.")])
             }
             if id == "research", names.contains(AgentWorkspaceKnowledge.webSearchTool) {
                 projection.actions.insert(.init(label: "Search the web", action: .searchWeb, needsText: true), at: 0)
             }
-            // Status reads Doctor and Telegram through the app door's item reads.
             if id == "status", names.contains("app") {
                 for (label, page, item) in [("Doctor check of the whole app", "diagnostics", "doctor"), ("Telegram link", "telegram", "status")] {
                     projection.actions.append(.init(label: label, action: .open(.record(
@@ -180,7 +191,7 @@ package enum AgentWorkspaceEnvironment {
                     if case .perform(let tool, _, _, _, _) = $0.action { return name == tool }
                     return false
                 }) { continue }
-                projection.actions.append(AgentWorkspaceApps.quickAction(tool: name) ?? HerScreen.coreAction(tool: name)
+                projection.actions.append(AgentWorkspaceApps.quickAction(tool: name) ?? AgentScreen.coreAction(tool: name)
                     ?? .init(label: title(name), action: isStatusReader(name)
                         ? .open(.record(tool: name, input: [:], title: title(name)))
                         : .configure(tool: name, input: [:], title: title(name))))
@@ -193,8 +204,7 @@ package enum AgentWorkspaceEnvironment {
             for schema in schemas where browsable(schema) {
                 let text = (schema.name + " " + schema.description).lowercased()
                 let nameTerms = schema.name.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
-                // An exact action name must outrank incidental words in another
-                // action's description. This changes discovery, never dispatch.
+                // Exact action names outrank incidental description words; discovery never dispatches.
                 let exactName = !terms.isEmpty && terms == nameTerms
                 let score = terms.reduce(0) { $0 + (text.contains($1) ? 1 : 0) + (nameTerms.contains($1) ? 4 : 0) }
                     + (exactName ? 1000 : 0)
@@ -212,15 +222,19 @@ package enum AgentWorkspaceEnvironment {
                         ?? .init(label: "Open", action: .configure(tool: schema.name, input: [:], title: title(schema.name)))])
             }
             return .init(title: "Available actions", content: .object(["status": .string("ok"),
-                "query": .string(query), "note": .string("Live capability catalog. Opening an action shows its current form; permission and connection checks happen at its owner.")]),
+                "query": .string(query), "note": .string(
+                    "Live capability catalog. Opening an action shows its current form; permission and connection checks happen at its owner.")]),
                 items: items, actions: [])
         case .form(let form): return form.projection
         case .receipt(let tool, let title, let value, let readback):
             let location = AgentWorkspaceLocation.record(tool: tool, input: [:], title: title)
-            var projection = await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
+            var projection = await WorkspacePage.project(workspace: workspace, location: location, result: value, dataRoot: dataRoot,
+                evidence: AgentWorkspaceDocument.evidence(
+                location: location, value: value))
             projection.title = title
             projection.content = .object(["status": outcome(value), "result": projection.content,
-                "evidence": .string("Retained result of the selected action. Refresh does not execute it again and does not verify that an external state is still current.")])
+                "evidence": .string(
+                    "Retained result of the selected action. Refresh does not execute it again and does not verify that an external state is still current.")])
             if let readback {
                 if case .record("shelf_entry", let input, _) = readback {
                     projection.actions.insert(.init(label: "Return to saved reply", action: .open(readback)), at: 0)
@@ -237,7 +251,8 @@ package enum AgentWorkspaceEnvironment {
             }
             if tool.hasPrefix("browser.chrome_"), case .object(let receipt) = value,
                receipt["tabClosed"] != .bool(true), case .int(let tab)? = receipt["tabId"] {
-                projection.actions.insert(.init(label: "Read this browser page", action: .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10_000)], title: "Browser page"))), at: 0)
+                projection.actions.insert(.init(label: "Read this browser page", action: .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(
+                    tab), "max_nodes": .int(80), "max_text_chars": .int(10_000)], title: "Browser page"))), at: 0)
             }
             return projection
         default: return nil

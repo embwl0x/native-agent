@@ -2,7 +2,7 @@
 
 import Foundation
 
-// Blueprint: | `MemoryDisplayText.swift` | `MemoryDisplayText`: canonical memory text, shared author suffix and USER.md coverage/join keys, preserving date-critical kinds |
+// Blueprint: | `MemoryDisplayText.swift` | `MemoryDisplayText`: prompt rendering and coverage keys |
 
 public enum MemoryDisplayText {
     /// Author labels travel beside the fact, through every prompt projection.
@@ -14,11 +14,8 @@ public enum MemoryDisplayText {
         return names.isEmpty ? text : text + " — from " + names.joined(separator: ", ")
     }
 
-    /// Memory text as it should appear in prompts / USER.md / recall output.
-    /// Durable storage may keep timestamps for sorting and audit, but ordinary
-    /// memory prose should not start with machine chronology. Date-critical
-    /// kinds (`schedule`, `deadline`, …) keep their leading stamp — the date IS
-    /// the fact.
+    /// Memory text as it should appear in prompts / USER.md / recall output. Durable storage may keep timestamps for sorting and audit, but ordinary memory
+    /// prose should not start with machine chronology. Date-critical kinds (`schedule`, `deadline`, …) keep their leading stamp — the date IS the fact.
     public static func display(_ text: String, kind: String? = nil) -> String {
         var display = text
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
@@ -32,15 +29,9 @@ public enum MemoryDisplayText {
             : display
     }
 
-    /// Canonical comparison key for the USER.md ⇄ memory-atom precoverage join.
-    ///
-    /// Matching requires the same core; a stamped fact also requires the same stamp.
-    /// A fact's retained stamp carries the kind-aware renderer's date-critical verdict.
-    /// Removed stamps form the stamp; stripping reaches a fixed point or the pass limit.
+    /// Precoverage requires the same core and, for date-critical facts, the same retained stamp; stripping is bounded.
     public struct Key: Hashable, Sendable, CustomStringConvertible {
-        /// Text with every leading machine stamp removed.
         public let core: String
-        /// The leading stamp run that was removed, nil when there was none.
         public let stamp: String?
 
         public init(core: String, stamp: String?) {
@@ -50,19 +41,12 @@ public enum MemoryDisplayText {
 
         public var isEmpty: Bool { core.isEmpty && (stamp?.isEmpty ?? true) }
 
-        /// The key as a human reads it — what diagnostics name.
         public var description: String {
             guard let stamp, !stamp.isEmpty else { return core }
             return core.isEmpty ? stamp : "\(stamp) \(core)"
         }
 
-        /// Does `body` (a memory atom) carry this (a USER.md fact)?
-        ///
-        /// Strict in the one direction that matters: a fact that kept its stamp
-        /// is only covered by a body with the identical stamp. Getting this
-        /// wrong in the lenient direction silently drops a fact from the turn;
-        /// getting it wrong in the strict direction merely leaves USER.md
-        /// injected in full, which is the safe failure.
+        /// A retained stamp requires an identical body stamp: a false match drops a fact, while a missed match safely keeps USER.md injected.
         public func isCovered(by body: Key) -> Bool {
             guard core == body.core else { return false }
             guard let stamp, !stamp.isEmpty else { return true }
@@ -80,10 +64,7 @@ public enum MemoryDisplayText {
             core = next
         }
         guard core != collapsed, collapsed.hasSuffix(core) else {
-            // Nothing stripped, or the stripper did something other than remove
-            // a leading run (it never should). Fall back to the whole string as
-            // the core: an unreduced key can only ever fail the join, and a
-            // failed join keeps USER.md injected.
+            // An unreduced key can only miss coverage, safely keeping USER.md injected when stripping is inconsistent.
             return Key(core: collapsed, stamp: nil)
         }
         let stamp = String(collapsed.dropLast(core.count))
@@ -91,10 +72,7 @@ public enum MemoryDisplayText {
         return Key(core: core, stamp: stamp.isEmpty ? nil : stamp)
     }
 
-    /// One pass of leading-stamp removal — the same three strippers
-    /// `display(_:kind:)` applies, minus the kind gate and minus display's
-    /// "everything was a stamp, keep the original" fallback (the join key
-    /// wants to SEE that case, not hide it).
+    /// Apply the same stamp strippers as display without its kind gate or all-stamp preservation so the join can observe an empty core.
     private static func stripLeadingStamp(_ text: String) -> String {
         var value = stripLeadingBracketedTimestamp(text)
         value = value

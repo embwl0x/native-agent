@@ -5,8 +5,7 @@ import PersistenceCore
 public struct OrganismDependencies: Sendable {
     public var now: @Sendable () -> Date
     public var makeUUID: @Sendable () -> UUID
-    /// Bounded immutable projection of pending tool expectations. The kernel
-    /// still owns the prediction ledger; readers receive no mutation handle.
+    /// Bounded immutable projection of pending tool expectations. The kernel still owns the prediction ledger; readers receive no mutation handle.
     public var predictedToolGroupsSink: @Sendable (Set<String>) -> Void
 
     public init(
@@ -30,19 +29,10 @@ public actor OrganismKernel {
     /// Felt resolutions awaiting the runtime's drain, capped by dropping the oldest.
     private static let pendingResolutionFeltCap = 8
     private var pendingResolutionFelt: [OrganismResolutionFeltEvent] = [] { didSet { mutationRevision &+= 1 } }
-    /// When the canonical relational crossing last integrated tenderness.
-    /// In-memory: a gap the process did not observe is missing evidence, so a
-    /// restart resumes integrating from the next crossing rather than claiming
-    /// the whole downtime as sustained warmth.
+    /// When the canonical relational crossing last integrated tenderness. In-memory: a gap the process did not observe is missing evidence, so a restart
+    /// resumes integrating from the next crossing rather than claiming the whole downtime as sustained warmth.
     private var tendernessAnchorAt: Date? { didSet { mutationRevision &+= 1 } }
-    /// How much of the fatigue axis the WAKEFULNESS lane currently holds
-    /// (0…`OrganismChemistry.wakefulnessShareCap`). Tracked apart from the
-    /// total so hours-awake can be capped without capping work.
-    ///
-    /// In-memory: a restart is missing evidence, not proof she slept, but it is
-    /// equally not proof she was awake — and a process that was not running
-    /// cannot attest to hours. Resuming from zero is the conservative read, and
-    /// the dream resets it anyway.
+    /// Track capped wakefulness separately from work fatigue. Process downtime proves neither sleep nor wakefulness, so only observed elapsed time accrues.
     private var wakefulnessFatigue: Double = 0 { didSet { mutationRevision &+= 1 } }
     private static let minimumRuntimeDecayInterval: TimeInterval = 1
 
@@ -72,8 +62,7 @@ public actor OrganismKernel {
         publishPredictedToolGroups()
     }
 
-    /// The person's reaction to her last completion settles the expectation it
-    /// answers (part of `foldTurn`).
+    /// The person's reaction to the agent's last completion settles the expectation it answers (part of `foldTurn`).
     private func liveAfterTurnReaction(_ signal: SomaticSignal) {
         guard signal.metadata[OrganismSemanticExpectation.reactionMetadataKey] != nil else { return }
         let before = body.predictionLedger
@@ -89,10 +78,7 @@ public actor OrganismKernel {
         }
     }
 
-    /// `movesFeelings: false`, decided at signal admission: the
-    /// signal still updates the body schema, predictions and field —
-    /// health and ops posture — but leaves the ten feeling axes where time
-    /// alone left them.
+    /// Infrastructure signals may update health, predictions and field while feelings follow time alone.
     public func ingest(_ signal: SomaticSignal, movesFeelings: Bool = true) async {
         guard configuration.enabled else { return }
         if signal.kind == .dreamCompleted, body.dreamCompletions?.contains(signal.id) == true { return }
@@ -140,8 +126,7 @@ public actor OrganismKernel {
             to: body.predictionLedger,
             chemicalState: updated.chemicalState
         )
-        // Notable resolutions carry aboutness into the substrate through a
-        // rate-stamped ledger diff and a bounded drain buffer.
+        // Notable resolutions carry aboutness into the substrate through a rate-stamped ledger diff and a bounded drain buffer.
         let felt = OrganismResolutionFelt.events(
             before: ledgerBefore,
             after: predicted.ledger,
@@ -169,9 +154,7 @@ public actor OrganismKernel {
         body.field = repaired.field
         body.dreamRepairState = repaired.state
         if bounded.kind == .dreamCompleted || bounded.kind == .remIntegrated {
-            // SLEEP RESETS HOURS AWAKE. The chemistry arm already takes 0.08 off
-            // the total; this is what makes "how long have I been up" start
-            // counting again from zero.
+            // Dream completion resets the separately held wakefulness share as well as reducing total fatigue.
             wakefulnessFatigue = 0
             if bounded.kind == .dreamCompleted {
                 if body.dreamCompletions == nil { body.dreamCompletions = [] }
@@ -179,9 +162,8 @@ public actor OrganismKernel {
             }
         }
         body.signalCount = min(body.signalCount, Int.max - 1) + 1
-        // Quiet physiology follows when the signal reached this organism, not
-        // an untrusted/delayed source timestamp. The anchor is monotonic so an
-        // out-of-order event can never make repair run early.
+        // Quiet physiology follows when the signal reached this organism, not an untrusted/delayed source timestamp. The anchor is monotonic so an out-of-order
+        // event can never make repair run early.
         body.lastSignalAt = max(body.lastSignalAt ?? .distantPast, ingestedAt)
         publishPredictedToolGroups()
     }
@@ -199,9 +181,8 @@ public actor OrganismKernel {
         )
     }
 
-    /// Apply the body sample and produce the turn's fixed-time organism value
-    /// in one actor admission. Cognition's canonical warmth and pressure cross
-    /// together; the returned read remains mutation-free and advisory.
+    /// Apply the body sample and produce the turn's fixed-time organism value in one actor admission. Cognition's canonical warmth and pressure cross together;
+    /// the returned read remains mutation-free and advisory.
     public func refreshBodySchemaAndFrozenRead(
         _ read: OrganismBodyRead,
         integratesChemistry: Bool = true,
@@ -241,8 +222,7 @@ public actor OrganismKernel {
         if let canonicalAffect {
             body.chemicalState.warmth = canonicalAffect.socialWarmth.clamped01()
             body.chemicalState.urgency = canonicalAffect.taskPressure.clamped01()
-            // Elapsed since the last CROSSING, not since the last read: an
-            // Observatory poll at the same instant integrates exactly nothing.
+            // Elapsed since the last CROSSING, not since the last read: an Observatory poll at the same instant integrates exactly nothing.
             body.chemicalState.tenderness = OrganismChemistry.tenderness(
                 body.chemicalState.tenderness,
                 underCanonicalWarmth: body.chemicalState.warmth,
@@ -291,20 +271,12 @@ public actor OrganismKernel {
         )
     }
 
-    /// The app layer pushes declared quiet hours (`data/user_prefs.json` →
-    /// `quiet_hours`, also read by the turn engine) on the Mac's clock.
-    /// The kernel never reads a file and owns no preference store.
-    ///
-    /// The runtime pushes preference/clock invalidations before body reads;
-    /// the kernel never schedules a preference rescan.
+    /// The runtime pushes shared quiet-hour and clock changes before reads; the kernel owns no preference file or polling loop.
     public func configureDiurnalClock(_ clock: OrganismDiurnalClock?) {
         configuration.diurnalClock = clock
     }
 
-    /// Bounded live owner read for body projections that need the latest
-    /// device-delivery outcome. Callers must not decode the kernel's persisted
-    /// snapshot behind its back: continuity is restored into this ledger at
-    /// bootstrap, and this actor remains the sole live owner afterward.
+    /// Read delivery outcomes from this live ledger; decoding its persisted snapshot would bypass newer resident evidence.
     public func latestPrediction(ofKind kind: OrganismPredictionKind) -> OrganismPrediction? {
         guard configuration.enabled else { return nil }
         return body.predictionLedger.predictions.values
@@ -331,8 +303,7 @@ public actor OrganismKernel {
         return body.predictionLedger.predictions[id]
     }
 
-    /// Pure deadline read for event-driven repair. No timer is owned by the
-    /// kernel and no state is changed beyond ordinary analytic settlement.
+    /// Pure deadline read for event-driven repair. No timer is owned by the kernel and no state is changed beyond ordinary analytic settlement.
     public func residualRepairOpportunity() async -> OrganismResidualRepairOpportunity {
         guard configuration.enabled else { return .empty(at: dependencies.now()) }
         let now = dependencies.now()
@@ -340,9 +311,8 @@ public actor OrganismKernel {
         return currentResidualRepairOpportunity(at: now)
     }
 
-    /// Execute one already-due local repair pass. The result is false when the
-    /// evidence decayed, a newer signal reset the quiet window, or no bounded
-    /// field operation remained. It never recruits a model or dispatches work.
+    /// Execute one already-due local repair pass. The result is false when the evidence decayed, a newer signal reset the quiet window, or no bounded field
+    /// operation remained. It never recruits a model or dispatches work.
     @discardableResult
     public func runResidualRepairIfDue(satisfyWait: Bool = false) async -> Bool {
         guard configuration.enabled else { return false }
@@ -363,9 +333,8 @@ public actor OrganismKernel {
         return body.dreamRepairState != previous
     }
 
-    /// Drains felt resolutions (relief / disappointment) minted since the
-    /// last drain. The caller (NativeCognitionRuntime) turns each into a
-    /// substrate event with the resolved organ as aboutness.
+    /// Drains felt resolutions (relief / disappointment) minted since the last drain. The caller (NativeCognitionRuntime) turns each into a substrate event
+    /// with the resolved organ as aboutness.
     public func drainResolutionFelt() -> [OrganismResolutionFeltEvent] {
         let drained = pendingResolutionFelt
         pendingResolutionFelt.removeAll()
@@ -384,9 +353,7 @@ public actor OrganismKernel {
         OrganismBehaviorPosture.from(snapshot: await snapshot())
     }
 
-    /// Build a production-equivalent projection/posture from a copied state at
-    /// one explicit time. Unlike `snapshot()`/`projection()`, this never settles
-    /// or rewrites the live kernel.
+    /// Project from a copy at one time so posture reads cannot settle or rewrite the live kernel.
     public func frozenRead(at fixedAt: Date) -> OrganismFrozenRead {
         let raw = body
         let frozen = configuration.enabled
@@ -438,10 +405,7 @@ public actor OrganismKernel {
         return body
     }
 
-    /// The body's continuity for its file, whether or not its effects are
-    /// enabled. A disabled body is DORMANT: it takes no signals and no doses,
-    /// its state is kept and saved, and its saved anchor stays where time last
-    /// settled it so the next restore or enable spends the gap once.
+    /// Save disabled bodies dormant with their last settled anchor so later enable/restore spends elapsed time exactly once.
     public func exportContinuity() -> OrganismPersistentState {
         if configuration.enabled { settleElapsedTime(at: dependencies.now()) }
         return body
@@ -454,15 +418,13 @@ public actor OrganismKernel {
         body.dreamCompletions?.contains(id) == true
     }
 
-    /// The epoch with the kernel's mutation revision, read in one actor turn:
-    /// the revision orders publications of the epoch (a reset rollback can
-    /// lawfully return the old epoch at a newer revision).
+    /// The epoch with the kernel's mutation revision, read in one actor turn: the revision orders publications of the epoch (a reset rollback can lawfully
+    /// return the old epoch at a newer revision).
     public func epochAtRevision() -> (epoch: UInt64, revision: UInt64) {
         (body.epoch, mutationRevision)
     }
 
-    /// Restores whether or not the body's effects are enabled (a disabled body
-    /// restores dormant), so enabling it later never reloads the file.
+    /// Restores whether or not the body's effects are enabled (a disabled body restores dormant), so enabling it later never reloads the file.
     public func restorePersistentState(_ state: OrganismPersistentState) {
         let now = dependencies.now()
         wakefulnessFatigue = 0
@@ -478,8 +440,7 @@ public actor OrganismKernel {
         let now = dependencies.now()
         settleElapsedTime(at: now)
         wakefulnessFatigue = OrganismChemistry.relaxedFatigue(wakefulnessFatigue, elapsed: 6 * 3_600)
-        // Relax the chemistry now. This is not six hours of observed body time:
-        // fields, pending predictions and the persisted clock keep their real age.
+        // Relax the chemistry now. This is not six hours of observed body time: fields, pending predictions and the persisted clock keep their real age.
         body.chemicalState = OrganismPersistentState.decayedChemistry(
             body.chemicalState, hours: 6, tendernessHours: 6, fatigueElapsed: 6 * 3_600)
         body.savedAt = now
@@ -512,23 +473,11 @@ public actor OrganismKernel {
         return true
     }
 
-    /// THE BODY'S WHOLE SHARE OF ONE LIVED MOMENT, in one mutation
-    /// (docs/SUBCONSCIOUS.md, "Lived moments"): the caring dose, the
-    /// after-turn reaction and the correction cause land together and the body's
-    /// watermark (`body.lived`) is stamped in the same actor turn, so a crash can
-    /// never leave half of a moment in the body with its proof.
-    ///
-    /// THE GATES, in order: the body is on; the moment was admitted under this
-    /// body's epoch; the body has not already lived this fold seq. Then the
-    /// caring reading is measured against the encounter it arrives in: a new
-    /// encounter doses (and is remembered for relay judgment), a reading inside
-    /// the encounter already running rolls the window and does not dose. A
-    /// reading older than the last caring turn seen is not evidence of a new
-    /// encounter (`Encounter.opensNewEncounter`).
+    /// Gate enabled body, admission epoch and fold watermark, then atomically apply dose/reaction/correction with proof. Existing encounters extend their
+    /// window; older caring turns cannot create a new encounter.
     public func foldTurn(_ fold: OrganismTurnFold) -> OrganismTurnFoldOutcome {
         guard configuration.enabled else { return .refused }
-        // A moment from before the body's last forgetting lives in a body that
-        // no longer exists.
+        // A moment from before the body's last forgetting lives in a body that no longer exists.
         guard fold.epoch == body.epoch else { return .forgotten }
         // Already lived: its whole share is in this body (and saved with it).
         if body.lived >= fold.seq { return .alreadyLived }
@@ -554,7 +503,7 @@ public actor OrganismKernel {
         return .lived(caring: caring)
     }
 
-    /// The encounters that recently dosed, newest last.
+    /// Actual doses remain in arrival order for relay judgment.
     public func recentDoses() -> [CaringAppraisalRequest.RecentEncounter] {
         body.caringEncounter.recentDoses ?? []
     }
@@ -568,10 +517,7 @@ public actor OrganismKernel {
         body.caringEncounter.recentDoses = doses
     }
 
-    /// A human cause moving a feeling — something she came back
-    /// to with a better question (curiosity), an opinion she revised on
-    /// evidence (coherence), her own work landing or failing (agency,
-    /// confidence). Small doses; a raise saturates, a negative one lowers.
+    /// Only human causes move curiosity, coherence, agency and confidence; positive doses saturate while negative doses lower.
     public func admitHumanCause(
         curiosity: Double = 0, coherence: Double = 0, agency: Double = 0, confidence: Double = 0,
         epoch: UInt64? = nil

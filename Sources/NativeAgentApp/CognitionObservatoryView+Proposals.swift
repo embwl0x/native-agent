@@ -2,13 +2,12 @@ import NativeAgentShared
 import SwiftUI
 import CognitiveSubstrate
 
-// Blueprint: | `CognitionObservatoryView+Proposals.swift` | Observatory growth-week and developmental timeline: readout/receipt presentation from current cognition state |
+// Blueprint: | `CognitionObservatoryView+Proposals.swift` | Read-only growth timeline and current cognition receipts |
 
 extension CognitionObservatoryView {
 
-    // REM lineage renders in CognitionProposalsView on the Activity surface.
 
-    /// Weekly lessons, outcomes and forming passages precede the raw event receipts.
+    /// Lead with lessons and outcomes so raw event receipts do not obscure developmental meaning.
     @ViewBuilder
     func growthWeekReadout(_ week: CognitiveGrowthWeek) -> some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {

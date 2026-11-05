@@ -1,26 +1,25 @@
 // Shared SSE framing; event routing, sentinels and errors belong to callers.
 import Foundation
-// Blueprint: | `SSEEventStream.swift` | Shared SSE framing and `ProviderStreamContext`; transport opening and activity for every event/comment; optional round-scoped diagnostic event capture before provider decoding |
+// Blueprint: | `SSEEventStream.swift` | `ProviderRequestLifetime`, `ProviderStreamContext`: explicit SSE activity and trace-only event capture |
 
-/// Transport activity is independent of reply content. Bound by the stream
-/// guard before creating an adapter, and inherited by its transport task.
-public enum ProviderStreamContext {
-    @TaskLocal public static var activity: (@Sendable () -> Void)?
-    /// The provider admitted the request: a validated 2xx body is being read.
-    @TaskLocal public static var admitted: (@Sendable () -> Void)?
-    @TaskLocal public static var stallOnly: Bool = false
-    /// The HTTP request went out and its response head is awaited.
-    @TaskLocal public static var sending: (@Sendable () -> Void)?
-    @TaskLocal public static var diagnosticEvent: (@Sendable (SSEEvent) -> Void)?
-    /// The transport validated the route, chose the adapter and is sending.
-    @TaskLocal public static var dispatched: (@Sendable () -> Void)?
+/// One request's activity, handed to the guard, transport and parser.
+public struct ProviderRequestLifetime: Sendable {
+    public var activity: (@Sendable () -> Void)?
+    public var admitted: (@Sendable () -> Void)?
+    public var stallOnly = false
+    public var sending: (@Sendable () -> Void)?
+    public var dispatched: (@Sendable () -> Void)?
+    public init() {}
 }
 
-/// One parsed Server-Sent Event.
+/// Raw event capture is trace-only; no routing or decision reads it.
+public enum ProviderStreamContext {
+    @TaskLocal public static var diagnosticEvent: (@Sendable (SSEEvent) -> Void)?
+}
+
 public struct SSEEvent: Sendable, Equatable {
-    /// The last `event:` field seen for this event, or nil if the event
-    /// had none. Resets between events — a data-only frame following a
-    /// named one does NOT inherit the previous name.
+    /// The last `event:` field seen for this event, or nil if the event had none. Resets between events — a data-only frame following a named one does NOT
+    /// inherit the previous name.
     public let event: String?
     /// The `data:` payload; multiple `data:` lines join with "\n" per spec.
     public let data: String
@@ -31,42 +30,30 @@ public struct SSEEvent: Sendable, Equatable {
     }
 }
 
-/// WHATWG-SSE framing over any byte stream (`URLSession.AsyncBytes` in
-/// production, synthetic arrays in tests).
-///
-/// Framing rules:
-/// - Lines terminate on LF; one trailing CR is stripped (LF and CRLF
-///   streams both work).
-/// - Lines starting `:` are comments (keep-alives) — skipped.
-/// - A field splits at the first `:`; one leading space is stripped from
-///   the value, so `data:x` and `data: x` are equivalent.
-/// - `event:` names the current event; `data:` accumulates; `id:`,
-///   `retry:`, and unknown fields are ignored.
-/// - A blank line dispatches the accumulated event. No `data:` lines →
-///   nothing dispatches (and any pending `event:` name resets).
-/// - Deliberate spec deviation: a non-empty event still pending at EOF is
-///   dispatched. Real providers/proxies sometimes close without a final
-///   blank line, and every parser this replaces tolerated that.
+/// Follow WHATWG SSE framing: LF or CRLF lines, colon comments, one optional space after the field colon, event names reset between frames and data lines join
+/// with newlines. Ignore id, retry and unknown fields. Dispatch only events with data. Flush a pending provider event at EOF because providers and proxies can
+/// close without a final blank line.
 public struct SSEEventStream<Bytes: AsyncSequence & Sendable>: AsyncSequence, Sendable
 where Bytes.Element == UInt8 {
     public typealias Element = SSEEvent
 
     private let bytes: Bytes
+    private let lifetime: ProviderRequestLifetime
 
-    public init(_ bytes: Bytes) {
+    public init(_ bytes: Bytes, lifetime: ProviderRequestLifetime) {
         self.bytes = bytes
+        self.lifetime = lifetime
     }
 
-    /// Providers read only a status-validated 2xx body as SSE, so starting to
-    /// read one is the provider's admission of the request.
+    /// Providers read only a status-validated 2xx body as SSE, so starting to read one is the provider's admission of the request.
     public func makeAsyncIterator() -> AsyncIterator {
-        ProviderStreamContext.admitted?()
-        return AsyncIterator(bytes: bytes.makeAsyncIterator())
+        lifetime.admitted?()
+        return AsyncIterator(bytes: bytes.makeAsyncIterator(), parser: SSEEventParser(onActivity: lifetime.activity))
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         var bytes: Bytes.AsyncIterator
-        var parser = SSEEventParser(onActivity: ProviderStreamContext.activity)
+        var parser: SSEEventParser
         var finished = false
         var lineBuf: [UInt8] = []
 
@@ -83,17 +70,16 @@ where Bytes.Element == UInt8 {
             }
             finished = true
             defer { lineBuf = [] }
-            // EOF: a final line without a trailing LF still counts…
+            // A final unterminated line still contributes data.
             if !lineBuf.isEmpty, let event = parser.consume(lineBytes: lineBuf) {
                 return event
             }
-            // …and a pending event without a final blank line still flushes.
+            // Providers may close before the final blank event delimiter.
             return parser.flush()
         }
     }
 }
 
-/// Shared SSE state machine; a blank line completes an event.
 public struct SSEEventParser: Sendable {
     private var dataLines: [String] = []
     private var eventName: String?
@@ -107,8 +93,7 @@ public struct SSEEventParser: Sendable {
         self.onActivity = onActivity
     }
 
-    /// Strict bounded byte framing for peers: CR, LF and CRLF end lines;
-    /// incomplete lines/events remain pending until a blank line, never EOF.
+    /// Strict bounded byte framing for peers: CR, LF and CRLF end lines; incomplete lines/events remain pending until a blank line, never EOF.
     public mutating func consume(byte: UInt8, maximumBytes: Int) throws -> SSEEvent? {
         if afterCR, byte == 0x0A {
             afterCR = false
@@ -131,16 +116,13 @@ public struct SSEEventParser: Sendable {
         return consume(line: line)
     }
 
-    /// Consume one raw line (LF already stripped). Returns a completed
-    /// event on the blank-line delimiter, nil otherwise. The single
-    /// trailing-CR strip happens in `consume(line:)` — not here too, or a
-    /// payload legitimately ending in CR would lose two.
+    /// Consume one raw line (LF already stripped). Returns a completed event on the blank-line delimiter, nil otherwise. The single trailing-CR strip happens
+    /// in `consume(line:)` — not here too, or a payload legitimately ending in CR would lose two.
     public mutating func consume(lineBytes: [UInt8]) -> SSEEvent? {
         consume(line: String(decoding: lineBytes, as: UTF8.self))
     }
 
-    /// Same as `consume(lineBytes:)` for already-decoded lines. The line
-    /// must not contain its terminator; a trailing CR is stripped.
+    /// Decoded lines exclude their terminator so CR stripping happens exactly once.
     public mutating func consume(line rawLine: String) -> SSEEvent? {
         var line = rawLine
         if line.hasSuffix("\r") { line.removeLast() }
@@ -176,9 +158,8 @@ public struct SSEEventParser: Sendable {
         return nil
     }
 
-    /// Dispatch whatever is pending (blank-line delimiter or EOF flush).
-    /// Per spec an event with no `data:` lines dispatches nothing, but the
-    /// pending `event:` name still resets.
+    /// Dispatch whatever is pending (blank-line delimiter or EOF flush). Per spec an event with no `data:` lines dispatches nothing, but the pending `event:`
+    /// name still resets.
     public mutating func flush() -> SSEEvent? {
         defer {
             dataLines.removeAll(keepingCapacity: true)

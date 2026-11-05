@@ -24,7 +24,7 @@ enum ChatTurnNoticeDestination: Equatable {
 
 enum ChatTurnNoticePresentation {
     static func destination(for kind: String) -> ChatTurnNoticeDestination {
-        // Reconnect notices clear with the turn's own notice lane.
+        // Clear reconnect notices with their turn's own lane so unrelated notices survive.
         if kind == "provider_retry" {
             return .chatTop
         }
@@ -35,7 +35,7 @@ enum ChatTurnNoticePresentation {
     }
 }
 
-/// Owns message, tail-content and turn-end observation without invalidating the chat root.
+/// Confine message and lifecycle observation here so updates cannot invalidate the chat root.
 struct ChatReadAloudObserver: View {
     @Environment(AppModel.self) private var appModel
     var onChanged: () -> Void
@@ -64,18 +64,15 @@ struct ChatView: View {
     @Environment(AppModel.self) var appModel
     @Environment(\.accessibilityReduceMotion) var reduceMotion
     @Environment(\.accessibilityReduceTransparency) var reduceTransparency
-    /// Mounted chat uses page visibility to suspend input, commands and visual work.
+    /// Suspend hidden-page input, commands and visual work.
     @Environment(\.chatPageIsVisible) var chatPageIsVisible
-    /// Simple view shows this page without its conversation list (as its
-    /// profile is seeded), Work pane or new-chat button (SimpleViewMode).
+    /// Simple's seeded profile omits the conversation list, Work pane and new-chat button.
     @Environment(\.layoutProfile) var layoutProfile
     var inSimple: Bool { layoutProfile == SimpleViewMode.simple }
-    /// ⌘0: the conversations column goes with the rail (WorkPane.swift).
     @AppStorage(WorkPaneState.sidebarsHiddenKey) var sidebarsHidden = false
-    /// The Work pane beside the chat; main window only, so never in Simple.
+    /// The Work pane belongs only to main chat, never Simple.
     @AppStorage(WorkPaneState.openKey) var workPaneOpen = false
-    /// The conversation list's travelling selection bar (ChatView+ShellColumn).
-    /// Open controls only; cards belong to the engine transcript projection.
+    /// Keep open-control selection separate from engine-owned transcript cards.
     @State var inlineCards = InlineInteractionChatBinding()
     var draft: ChatComposerDraft { appModel.composerDraft(for: appModel.activeChatSessionId) }
 
@@ -96,52 +93,40 @@ struct ChatView: View {
     }
 
     @State var sessionSearch = ""
-    // One rename target shared by the row editor and its context menu.
+    // Share one rename target between the editor and context menu so they cannot race.
     @State var renamingSessionId: String? = nil
-    let bottomAnchor = "chat-bottom-anchor"
     @State var turnCardClearanceStore = ChatTurnCardClearance()
-    /// Owns the open card drawn above the scroll view and both insets.
+    /// Share one open-card owner across drawing and insets.
     @State var composerCardState = ComposerShellState()
-    /// True only for the copy of this page a quiet read mounts offscreen.
+    /// Quiet reads must be distinguishable from the mounted live page.
     @Environment(\.quietOffscreenRead) var quietOffscreenRead
 
     @State var voiceInput = VoiceInputCapture.forChat()
     @State var voiceDraftBeforeListening = ""
     @State var voiceDraftRevision: UInt64 = 0
-    /// Dictation writes are fenced to the conversation where recognition started.
+    /// Fence dictation writes to the conversation where recognition started.
     @State var voiceSessionId = ""
-    /// Every endDictation invalidates pending permission-prompt starts, including on page changes.
+    /// Ending dictation must invalidate permission-prompt starts even across page changes.
     @State var voiceGeneration = 0
     @State var voiceOutput = VoiceOutputController.forChat()
     @AppStorage("voiceAutoRead") var voiceAutoRead = false
     @State var isCapturing = false
     @State var toasts = ChatToastQueue()
-    // Slow-turn advisories belong to this conversation: a dedicated center
-    // lets a session switch or a finished turn clear them without touching
-    // app-wide toasts. Both draw in the one notice lane (NoticeLaneRoomKey).
+    // Keep slow-turn notices session-local so switching or settling cannot clear app-wide feedback.
     @StateObject var turnNoticeToasts = SystemToastCenter()
-    // Refocus the text field after slash-command insertion.
     @FocusState var inputFocused: Bool
-    @State var transcriptSearch = MacChatTranscriptSearchController()
     @State var transcriptLatestRequest = 0
-    /// Held until send acceptance returns to prevent duplicate submissions of the retained draft.
+    @State var transcriptHandle = TranscriptDocumentHandle()
+    /// Retain the send latch through acceptance to prevent duplicate submissions of the held draft.
     @State var isSubmittingSend = false
-    @State var showTranscriptSearch = false
-    @State var transcriptSearchFocusRequest: UInt = 0
-    // The state gate is separate from the SwiftUI binding so dismissal and a
-    // destructive button action cannot race into duplicate clears.
+    // Separate the state gate from the binding so dismissal and the destructive action cannot race into duplicate clears.
     @State var clearConfirmation = ChatClearConfirmationState()
-    @State var scrollCoordinator = ChatScrollFollow()
     @State var sidebarProjectionCache = ChatSidebarProjectionCache()
-    /// Per-session cursor prevents a tab switch from overwriting the marker
-    /// for a response that is still arriving in another conversation.
+    /// Use per-session cursors so tab switches cannot overwrite another conversation's arriving-response marker.
     @State var lastAutoReadMessageIds: [String: String] = [:]
-    /// A session is primed from its already-loaded transcript once. Until then
-    /// auto-read must not mistake old history for a newly appended reply.
+    /// Prime from loaded history once so auto-read cannot mistake old replies for new arrivals.
     @State var autoReadPrimedSessionIds: Set<String> = []
-    /// Fences overlapping "Go to" tasks. A route may need to refresh the
-    /// session index before selection; an older click must not resume after a
-    /// newer click and become the newest AppModel selection request.
+    /// Fence navigation tasks so an older suspended click cannot overtake the latest selection.
     @State var runningSessionNavigationGeneration: UInt = 0
 
     var clearConfirmationBinding: Binding<Bool> {
@@ -161,7 +146,7 @@ struct ChatView: View {
         appModel.engine.transcripts.sessions.first { $0.id == appModel.activeChatSessionId }
     }
 
-    // Hash session order in place without allocating an ID array or joined string.
+    // Hash in place to avoid allocating an ID array or joined string.
     var chatSessionIdsFingerprint: Int {
         var hasher = Hasher()
         hasher.combine(appModel.engine.transcripts.sessions.count)
@@ -177,8 +162,7 @@ struct ChatView: View {
                 shellConversationsColumn(appModel.engine.layout.availability)
             }
             chatColumn
-                // The chat gives the pane its width down to this floor (the
-                // detached window's); past it the pane narrows instead.
+                // Keep the detached window's minimum width as the chat floor; below it, the Work pane yields space.
                 .frame(minWidth: 380)
                 .modifier(ChatAttachmentDropTarget(
                     isEnabled: chatPageIsVisible,
@@ -201,7 +185,7 @@ struct ChatView: View {
                     .layoutPriority(1)
                     .transition(NativeAgentMotion.fade)
             }
-            // The offscreen copy a quiet read mounts never opens the pane.
+            // Offscreen quiet reads must not open the Work pane.
             if !inSimple && !quietOffscreenRead { WorkPaneAutoOpen() }
             ChatReadAloudObserver(onChanged: speakLatestAssistantIfReady)
         }
@@ -209,17 +193,15 @@ struct ChatView: View {
         .task(id: appModel.engine.dataRoot) {
             await appModel.engine.transcripts.watchNavigation()
         }
-        // Where a card's setup opens: the connector sheet, or in Simple view
-        // the floating glass panel (SimpleSetupPanel.swift).
+        // Use the surface's existing setup presentation so a card opens in the correct host.
         .inlineCardSetup(inlineCards)
         .liveOnAppear {
             prunePinnedSessions()
             Task { await appModel.engine.transcripts.reclaimContinuations(for: appModel.activeChatSessionId) }
-            // Focus the composer after the window chooses its initial responder.
+            // Wait for the initial responder before focusing the composer.
             DispatchQueue.main.async { if chatPageIsVisible { inputFocused = true } }
         }
-        // Only the live composer registers its shell; quiet reads share the
-        // session draft owner without taking the mounted shell's place.
+        // Register only the live shell so quiet reads cannot replace its shared composer registration.
         .liveOnAppear {
             QuietSelfAdmin.shared.attach(cards: composerCardState)
         }
@@ -227,23 +209,18 @@ struct ChatView: View {
             QuietSelfAdmin.shared.detachComposer(cards: composerCardState)
             endDictation()
         }
-        // Page changes dismiss composer cards and end dictation even while Chat stays mounted.
+        // Dismiss cards and stop dictation on page changes even while Chat remains mounted.
         .onChange(of: chatPageIsVisible) { _, visible in
             if !visible { composerCardState.dismiss() }
             guard !visible else {
-                refreshTranscriptSearchIfPresented()
-                // Coming BACK is the "the control closed" signal for the
-                // controls that are pages rather than sheets: a card that sent
-                // the person to Providers asks its owner, now, whether the
-                // thing is done — and fails honestly if it is not.
+                // Recheck setup on page return because page-based controls have no sheet dismissal callback.
                 Task { await inlineCards.verifyOnReturn() }
                 return
             }
             endDictation()
         }
         .liveTask {
-            // First-run: agent greets the user once a provider is connected.
-            // Idempotent + self-gating; safe to call from multiple triggers.
+            // Greeting triggers must remain idempotent and self-gating.
             await appModel.maybeSendFirstRunGreeting()
         }
         .onChange(of: appModel.activeChatSessionId) { _, newSessionId in
@@ -252,31 +229,25 @@ struct ChatView: View {
             Task { await appModel.engine.transcripts.reclaimContinuations(for: newSessionId) }
             Task { await appModel.maybeSendFirstRunGreeting() }
         }
-        // A link that names a message (a miss's history locator) lands on it
-        // through the transcript search's own selection, paging and scroll.
+        // The document centres a message locator, or holds it until that message arrives.
         .onChange(of: appModel.pendingChatMessageID, initial: true) { _, messageID in
             guard let messageID else { return }
             appModel.pendingChatMessageID = nil
-            openTranscriptSearch()
-            transcriptSearch.reveal(messageID: messageID)
+            transcriptHandle.reveal(messageID: messageID)
         }
         .onChange(of: appModel.chatProvider) {
-            // Catches the case where the user skipped the provider step at
-            // onboarding and connected an LLM later in Settings.
+            // Observe later provider connections so skipped onboarding cannot suppress the greeting.
             Task { await appModel.maybeSendFirstRunGreeting() }
         }
         .onChange(of: chatSessionIdsFingerprint) {
             prunePinnedSessions()
-            // A rename target that left the list (archived/deleted/refreshed
-            // away) must not leave a phantom editor pointed at a dead id.
+            // Clear rename targets that leave the list so no editor points at a dead identity.
             if let id = renamingSessionId,
                !appModel.engine.transcripts.sessions.contains(where: { $0.id == id }) {
                 renamingSessionId = nil
             }
         }
-        // Read-aloud failures (trust denied / not configured / auth rejected)
-        // land in voiceOutput.errorMessage, which nothing else reads — surface
-        // them as a toast. Cleared after showing so a repeat failure re-fires.
+        // Surface read-aloud failures from voiceOutput and clear after display so repeated failures can notify again.
         .onChange(of: voiceOutput.errorMessage) {
             if let msg = voiceOutput.errorMessage {
                 showToast(msg)
@@ -287,7 +258,7 @@ struct ChatView: View {
 
 }
 
-/// Labels retained panel data after refresh failure; dictionary observation stays in this leaf.
+/// Keep retained-data failure observation in this leaf so it cannot invalidate the chat root.
 struct PanelStaleNoticeView: View {
     let item: SidebarItem
     @Environment(AppModel.self) private var appModel

@@ -16,10 +16,8 @@ public enum DeskRefKind: Sendable, Equatable {
     case approval(id: String, status: String?)
     case trace(id: String, kind: String?)
     case note(text: String)
-    /// Carried work: when it is ready and where it came from.
     case step(DeskStep)
 
-    /// Wire token written as the ref's `kind` field.
     public var token: String {
         switch self {
         case .file: return "file"
@@ -35,7 +33,6 @@ public enum DeskRefKind: Sendable, Equatable {
         }
     }
 
-    /// Live-render priority: gh_pr > gh_issue > file > commit > url > agent > approval > trace > note. LOWER number = higher priority (renders first).
     public var priority: Int {
         switch self {
         case .ghPr: return 0
@@ -48,37 +45,6 @@ public enum DeskRefKind: Sendable, Equatable {
         case .trace: return 7
         case .note: return 8
         case .step: return 9
-        }
-    }
-
-    /// Merge a sparse `cachedFields` patch (from an `update_ref` op) into the in-place-updatable fields of this ref. Unknown / inapplicable keys are ignored; the immutable identity fields (path, sha, repo, number, url, name, id) are NOT
-    /// overwritten.
-    public func applyingCachedFields(_ fields: [String: JSONValue]) -> DeskRefKind {
-        func num(_ k: String) -> Int? { jsonInt(fields, k) }
-        switch self {
-        case let .file(path, line, label):
-            return .file(path: path, line: num("line") ?? line, label: fields["label"]?.stringValue ?? label)
-        case let .commit(sha, repo, label, status):
-            // repo is part of identity (like sha) — NOT overwritten by a patch.
-            return .commit(sha: sha, repo: repo, label: fields["label"]?.stringValue ?? label, status: fields["status"]?.stringValue ?? status)
-        case let .ghIssue(repo, number, title, status):
-            return .ghIssue(repo: repo, number: number, title: fields["title"]?.stringValue ?? title, status: fields["status"]?.stringValue ?? status)
-        case let .ghPr(repo, number, title, status, checks):
-            return .ghPr(repo: repo, number: number, title: fields["title"]?.stringValue ?? title, status: fields["status"]?.stringValue ?? status, checks: fields["checks"]?.stringValue ?? checks)
-        case let .url(url, title):
-            return .url(url: url, title: fields["title"]?.stringValue ?? title)
-        case let .agent(name, handoffId, sessionId):
-            return .agent(name: name, handoffId: fields["handoffId"]?.stringValue ?? handoffId, sessionId: fields["sessionId"]?.stringValue ?? sessionId)
-        case let .approval(id, status):
-            return .approval(id: id, status: fields["status"]?.stringValue ?? status)
-        case let .trace(id, kind):
-            // `traceKind` mirrors the wire key (the discriminator owns `kind`).
-            return .trace(id: id, kind: fields["traceKind"]?.stringValue ?? kind)
-        case let .note(text):
-            return .note(text: fields["text"]?.stringValue ?? text)
-        case .step(var step):
-            if step.replyRoute == nil { step.replyRoute = fields["replyRoute"] }
-            return .step(step)
         }
     }
 }
@@ -94,7 +60,7 @@ public struct DeskRef: Sendable, Equatable {
 
     public var priority: Int { kind.priority }
 
-    /// Serialize to the wire form `{kind, refId, ...fields}`. Optional fields omitted when nil (NOT emitted as null), exactly like TaskLedgerEvent.
+    /// Omit nil fields instead of emitting null so the wire form matches the shared event writer.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [
             "kind": .string(kind.token),
@@ -118,7 +84,7 @@ public struct DeskRef: Sendable, Equatable {
         case let .approval(id, status):
             obj["id"] = .string(id); put("status", status)
         case let .trace(id, kind):
-            // The trace payload's own "kind" is written under `traceKind` so it never clobbers the union discriminator (`kind` == "trace").
+            // traceKind prevents the payload from overwriting the union discriminator.
             obj["id"] = .string(id); put("traceKind", kind)
         case let .note(text):
             obj["text"] = .string(text)
@@ -128,7 +94,7 @@ public struct DeskRef: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Decode the current writer's exact reference, preserving all fields.
+    /// Decode every current field so stored references retain their full identity.
     public static func fromJSON(_ value: JSONValue) -> DeskRef? {
         guard case .object(let obj) = value,
               let token = obj["kind"]?.stringValue,

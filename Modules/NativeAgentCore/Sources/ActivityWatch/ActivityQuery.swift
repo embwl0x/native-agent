@@ -8,7 +8,7 @@ import PersistenceCore
 /// The activity store's read path owns capture, exclusions, row caps and
 /// refusals. Queries use only Calendar, SQL and arithmetic, with no inference.
 public struct ActivityQueries: Sendable {
-    /// Hard ceiling on rows in any answer, whatever the caller asks for.
+    /// Cap answer rows independently of the caller to bound context use.
     public static let maxRows = ActivityRollups.answerRowCap
 
     public enum QueryError: Error, CustomStringConvertible, Equatable {
@@ -28,9 +28,15 @@ public struct ActivityQueries: Sendable {
                 from when it was off.
                 """
             case .modelAccessDisabled:
-                return "activity_model_access_disabled: This request has neither activity model access nor admitted Full Mac authority. Only the owner can enable Trust > Features > My access > Let me answer from activity history."
+                return """
+                    activity_model_access_disabled: This request has neither activity model access nor admitted Full Mac authority. \
+                    Only the owner can enable Trust > Features > My access > Let me answer from activity history.
+                    """
             case .policyUnavailable(let detail):
-                return "activity_policy_unavailable: \(detail). Ask the owner to repair activity_watch/activity_policy.json from its retained bytes, preserving every saved choice; history access remains blocked until it is readable."
+                return """
+                    activity_policy_unavailable: \(detail). Ask the owner to repair activity_watch/activity_policy.json from its retained bytes, \
+                    preserving every saved choice; history access remains blocked until it is readable.
+                    """
             case .remoteSurfaceRefused(let surface):
                 return """
                 activity_surface_denied: Activity history is refused on '\(surface)' without \
@@ -54,11 +60,8 @@ public struct ActivityQueries: Sendable {
     /// Only these local surfaces may read history without admitted Full Mac.
     /// The dispatcher checks actual-origin Full Mac admission first.
     public static func isRefusedSurface(_ surface: String) -> Bool {
-        let id = surface
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "-")
-        return !["chat", "mac", "observatory", "workshop", ""].contains(id)
+        let id = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !["chat", "observatory", "workshop", ""].contains(id)
     }
 
     // MARK: - The query
@@ -83,9 +86,7 @@ public struct ActivityQueries: Sendable {
         }
     }
 
-    /// Runs the query. Throws `.captureDisabled` when the Trust Center toggle
-    /// is off — the tool must never answer from rows recorded before a user
-    /// turned capture off, and must never imply it has data it does not have.
+    /// Capture-off forbids answers from previously recorded rows and claims of unseen data.
     public func run(_ request: Request, fullMacAdmitted: Bool = false) async throws -> JSONValue {
         let policy: ActivityPolicy
         do {
@@ -124,20 +125,13 @@ public struct ActivityQueries: Sendable {
 
     // MARK: - Encoding
 
-    /// Turns the bundle into the tool result. Two things this does NOT do, both
-    /// load-bearing:
-    ///   * it never emits an unredacted title — the only title-ish field on a
-    ///     span is `titleRedacted`, and it is emitted under a name that says so;
-    ///   * it never invents a total. `total_seconds` is what the spans say.
+    /// Emit only explicitly redacted titles and span-derived totals; never imply raw titles or inferred time.
     static func encode(
         _ bundle: ActivityAnswerBundle,
         bundleIDFilter: String?,
         policy: ActivityPolicy
     ) -> JSONValue {
-        // Broken into named sub-expressions rather than one literal: the single
-        // literal exceeded the type-checker's budget outright (it refused to
-        // compile), and a nested `.object([...])` tree is exactly the shape
-        // that does that.
+        // Named subexpressions keep the nested JSON tree within the type-checker budget.
         let topJSON: [JSONValue] = bundle.topApps.rows.map { row in
             var out: [String: JSONValue] = [:]
             out["bundle_id"] = .string(row.bundleId)
@@ -164,9 +158,7 @@ public struct ActivityQueries: Sendable {
             out["ended_at"] = span.endedAt.map { JSONValue.double($0) } ?? .null
             out["bundle_id"] = .string(span.bundleId)
             out["app_name"] = .string(span.appName)
-            // The ONLY title-ish field, named so nobody mistakes it for the raw
-            // window title. Nil whenever titles are off, the app is a browser
-            // without the browser opt-in, or app-name-only mode is set.
+            // Name the only title field as redacted so callers cannot mistake it for the raw window title.
             let title = policy.allowsTitleCapture(bundleID: span.bundleId) ? span.titleRedacted : nil
             out["title_redacted"] = title.map { JSONValue.string($0) } ?? .null
             out["seconds"] = .double(span.duration)
@@ -175,7 +167,6 @@ public struct ActivityQueries: Sendable {
             return .object(out)
         }
 
-        // What the answer could NOT contain, stated rather than implied.
         var limits: [String: JSONValue] = [:]
         let titlesOn = policy.captureTitles && !policy.appNameOnlyMode
         limits["titles_recorded"] = .bool(titlesOn)
@@ -201,8 +192,7 @@ public struct ActivityQueries: Sendable {
         out["top_apps"] = .array(topJSON)
         out["buckets"] = .array(bucketJSON)
         out["exemplars"] = .array(exemplarJSON)
-        // HONEST TRUNCATION. Empty array means "this is the whole answer";
-        // a non-empty one names every section that lost rows and why.
+        // Name every truncated section so an incomplete answer cannot appear complete.
         out["truncated"] = .array(bundle.truncatedSections.map { JSONValue.string($0) })
         out["row_count"] = .int(Int64(topJSON.count + bucketJSON.count + exemplarJSON.count))
         out["row_cap"] = .int(Int64(Self.maxRows))
@@ -212,9 +202,7 @@ public struct ActivityQueries: Sendable {
 
     // MARK: - Range parsing
 
-    /// Named ranges the tool accepts, resolved in the ASKING timezone.
-    /// Deterministic `Calendar` arithmetic; no natural-language parsing, which
-    /// is where a model call would otherwise sneak into a "zero LLM" feature.
+    /// Resolve named ranges in the asking timezone with Calendar arithmetic, never model inference.
     public static func resolveRange(
         named name: String, timezone: TimeZone, now: Date
     ) -> (from: Double, to: Double)? {
@@ -243,9 +231,7 @@ public struct ActivityQueries: Sendable {
         }
     }
 
-    /// Epoch seconds, an ISO-8601 instant, or a bare `YYYY-MM-DD` (midnight in
-    /// the asking timezone). Anything else is nil — the tool then says what it
-    /// accepts rather than guessing at a date and answering about the wrong day.
+    /// Reject unrecognized dates rather than guessing and answering about the wrong day.
     public static func parseInstant(_ value: String, timezone: TimeZone) -> Double? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if let epoch = Double(trimmed), epoch.isFinite,
@@ -265,5 +251,5 @@ public struct ActivityQueries: Sendable {
 
     public static let maximumRangeSeconds: Double = 366 * 86_400
     private static let minimumSupportedEpoch: Double = 0
-    private static let maximumSupportedEpoch: Double = 32_503_680_000 // 3000-01-01 UTC
+    private static let maximumSupportedEpoch: Double = 32_503_680_000 // Bound Calendar conversion to supported epochs.
 }

@@ -2,13 +2,8 @@ import Foundation
 
 // Blueprint: | `FileChangeEvents.swift` | `FileChangeEvents`: bounded cancellable async vnode event bridge with one initial edge only after successful arming |
 
-/// One bounded async event stream over canonical file changes.
-///
-/// `FileChangeWatcher` owns the cross-process kqueue/vnode observation. This
-/// wrapper only bridges those edges into structured concurrency and emits one
-/// initial edge so callers can close the read-before-watch registration race.
-/// Failed arming finishes the stream without an initial edge. It performs no
-/// polling and starts no timer.
+/// Bridge vnode edges into bounded structured concurrency; an initial edge after arming closes read-before-watch races. Failed arming finishes without an edge,
+/// polling or timers.
 public final class FileChangeEvents: @unchecked Sendable {
     public struct Stream: AsyncSequence, Sendable {
         public typealias Element = URL

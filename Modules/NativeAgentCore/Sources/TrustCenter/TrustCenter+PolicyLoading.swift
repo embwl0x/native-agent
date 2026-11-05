@@ -2,31 +2,58 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustCenter+PolicyLoading.swift` | Canonical checked policy bytes, authority types and closed posture validation before normalization; shared with SavedTrustPolicyAuthority's exact-byte validation cache; absent files and validated empty objects alone receive fresh-install additions |
+// Blueprint: | `TrustCenter+PolicyLoading.swift` | One checked generation; only proven fresh policy bootstraps. |
 
-/// One checked authority generation for a SecurityCenter decision, read from
-/// one set of saved bytes so an effect-time gate cannot splice concurrent
-/// policies.
+/// One checked byte generation prevents effect-time gates from splicing concurrent policies.
 public struct TrustPolicyAuthorizationSnapshot: Sendable, Equatable {
     public let policy: [String: JSONValue]
 
 }
 
 extension SwiftNativeTrustCenter {
+    public nonisolated static func policyURL(dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent("trust", isDirectory: true).appendingPathComponent("policy.json")
+    }
+
+    /// Synchronous consumers use the same checked read as authorization, retaining saved values before normalization.
+    public nonisolated func loadSavedPolicyChecked() throws -> [String: JSONValue] {
+        try Self.loadRawPolicyChecked(at: Self.policyURL(dataRoot: dataRoot), defaults: defaultTrustPolicy())
+    }
+
+    public nonisolated func savedPolicyFlag(block: String, key: String, default defaultValue: Bool) throws -> Bool {
+        try Self.policyFlag(loadSavedPolicyChecked(), block: block, key: key, default: defaultValue)
+    }
+
+    public nonisolated static func policyFlag(
+        _ policy: [String: JSONValue], block: String, key: String, default defaultValue: Bool
+    ) throws -> Bool {
+        guard let value = policy[block] else { return defaultValue }
+        guard case .object(let fields) = value else { throw Self.policyUnavailable("\(block) must be an object") }
+        guard let value = fields[key] else { return defaultValue }
+        guard case .bool(let enabled) = value else { throw Self.policyUnavailable("\(block).\(key) must be a Boolean") }
+        return enabled
+    }
+
+    public nonisolated static func policyUnavailable(_ cause: String) -> ToolFailureError {
+        ToolFailureError("Saved Trust policy is unavailable: \(cause). Preserve its bytes and repair the policy before continuing.",
+            effects: .none, owner: "Trust policy",
+            nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")]),
+            code: "trust_policy_unavailable", instruction: "Repair the saved Trust policy, preserving its original bytes.", recovery: .repair)
+    }
+
     private nonisolated static func policyReadFailure(_ code: String, _ detail: String) -> ToolFailureError {
         ToolFailureError(detail, effects: .none, owner: "trust/policy.json",
             tap: "Trust > Access and policy > Preserve damaged policy and authorize Safe",
             code: code, instruction: "Ask the owner to preserve the damaged policy and authorize Safe.")
     }
 
-    /// Reads the authoritative saved policy without conflating a missing file
-    /// with damaged authority state. Missing is the only bootstrap-empty case.
+    /// Only absence may bootstrap; damaged saved authority remains unavailable.
     public nonisolated static func loadRawPolicyChecked(at path: URL, defaults: [String: JSONValue]) throws -> [String: JSONValue] {
         guard let data = try policyBytesChecked(at: path) else { return [:] }
         return try decodeRawPolicyChecked(data, defaults: defaults)
     }
 
-    /// One decode/shape owner for canonical loading and exact-byte gate caching.
+    /// One decode/shape owner for every checked policy read.
     nonisolated static func decodeRawPolicyChecked(_ data: Data, defaults: [String: JSONValue]) throws -> [String: JSONValue] {
         let decoded: JSONValue
         do {
@@ -42,13 +69,13 @@ extension SwiftNativeTrustCenter {
     }
 
     nonisolated static func policyBytesChecked(at path: URL) throws -> Data? {
-        // Inspect the entry without following its final symlink.
-        // A dangling link is saved but unreadable authority, never bootstrap.
+        // Inspect the entry without following its final symlink. A dangling link is saved but unreadable authority, never bootstrap.
         var metadata = stat()
         if lstat(path.path, &metadata) != 0 {
             guard errno == ENOENT else {
                 throw ToolFailureError("Saved Trust policy cannot be inspected: \(String(cString: strerror(errno))).",
-                    effects: .none, owner: path.path, tap: "Finder > Go > Go to Folder > \(path.deletingLastPathComponent().path) > policy.json > Get Info > Sharing & Permissions",
+                    effects: .none, owner: path.path,
+                        tap: "Finder > Go > Go to Folder > \(path.deletingLastPathComponent().path) > policy.json > Get Info > Sharing & Permissions",
                     code: "trust_policy_uninspectable", instruction: "Ask the owner to repair file access; preserve the policy bytes and authority.")
             }
             return nil
@@ -77,9 +104,7 @@ extension SwiftNativeTrustCenter {
         return data
     }
 
-    /// Canonical defaults define known field types. Optional authority booleans
-    /// share the current policy schema.
-    /// Unknown metadata is retained without acquiring authority.
+    /// Canonical defaults define authority field types; unknown metadata is retained without granting authority.
     public nonisolated static func validateKnownAuthorityPolicyTypes(
         _ policy: [String: JSONValue],
         against defaults: [String: JSONValue]
@@ -105,7 +130,8 @@ extension SwiftNativeTrustCenter {
             ("filePolicy.outsideWorkspaceDefault", policy["filePolicy"]?.objectValue?["outsideWorkspaceDefault"], ["deny", "ask", "allow"]),
         ] {
             if let value, !accepted.contains(value.stringValue ?? "") {
-                throw Self.policyReadFailure("trust_policy_invalid_field", "Saved Trust policy field \(path) must be one of: \(accepted.joined(separator: ", ")).")
+                throw Self.policyReadFailure("trust_policy_invalid_field",
+                    "Saved Trust policy field \(path) must be one of: \(accepted.joined(separator: ", ")).")
             }
         }
     }
@@ -148,26 +174,22 @@ extension SwiftNativeTrustCenter {
     }
 
     public func loadTrustPolicyChecked() async throws -> [String: JSONValue] {
-        let snapshot = try await loadAuthorizationSnapshotChecked()
+        let snapshot = try loadAuthorizationSnapshotChecked()
         return snapshot.policy
     }
 
-    /// Every effect-time check reads one freshly validated authority generation.
-    public func loadAuthorizationSnapshotChecked() async throws -> TrustPolicyAuthorizationSnapshot {
+    public nonisolated func loadAuthorizationSnapshotChecked() throws -> TrustPolicyAuthorizationSnapshot {
         let sourcePresent = FileManager.default.fileExists(atPath: trustPolicyURL.path)
         let defaults = defaultTrustPolicy()
-        let saved = try Self.loadRawPolicyChecked(at: trustPolicyURL, defaults: defaults)
+        let saved = try loadSavedPolicyChecked()
         return TrustPolicyAuthorizationSnapshot(
-            // An empty policy file (setup writes `{}` before the person has
-            // chosen anything) is a fresh install too.
+            // Setup's validated empty object is fresh state, like an absent policy.
             policy: normalizedTrustPolicy(saved: saved, defaults: defaults, freshInstall: !sourcePresent || saved.isEmpty)
         )
     }
 
-    private var trustPolicyURL: URL {
-        dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
+    private nonisolated var trustPolicyURL: URL {
+        Self.policyURL(dataRoot: dataRoot)
     }
 
     /// Workspace autonomy defaults apply only to absent or validated empty policies, never missing keys or fail-closed state.
@@ -176,9 +198,8 @@ extension SwiftNativeTrustCenter {
         "autonomyDefault": .string("workspace_autonomous"),
     ]
 
-    /// - Parameter freshInstall: true only when the caller has proven no
-    ///   policy file exists on disk, or its validated object is empty.
-    func normalizedTrustPolicy(
+    /// Fresh additions require proven absence or a validated empty policy object.
+    nonisolated func normalizedTrustPolicy(
         saved savedDict: [String: JSONValue],
         defaults: [String: JSONValue],
         freshInstall: Bool = false
@@ -195,10 +216,7 @@ extension SwiftNativeTrustCenter {
             }
         }
         if freshInstall {
-            // Over the merge DEFAULTS, never over a saved value. (On a proven
-            // fresh install `savedDict` is empty, so this only ever decides
-            // whether an addition may restate a default — which is the point:
-            // `autonomyDefault` has a default, `enableAutonomy` does not.)
+            // Merge additions over defaults only; a saved value must never be replaced.
             for (k, v) in Self.freshInstallTrustPolicyAdditions where savedDict[k] == nil {
                 merged[k] = v
             }
@@ -206,18 +224,12 @@ extension SwiftNativeTrustCenter {
         return Self.normalizeTrustPolicy(merged)
     }
 
-    /// Normalize saved trust policy into the shape expected by Swift gates.
-    ///
-    /// Live authority normalization:
-    ///   1. `filePolicy.outsideWorkspaceDefault` backfilled to "deny".
-    ///   2. Shell and system control are disabled outside `developerMode`.
-    /// Closed posture values are validated before normalization, never replaced.
+    /// Validate closed posture values before normalization; only missing fields receive defaults and developer gates stay enforced.
     nonisolated static func normalizeTrustPolicy(
         _ policy: [String: JSONValue]
     ) -> [String: JSONValue] {
         var out = policy
 
-        // Absent selection uses the shipped outside-workspace default.
         var filePolicy: [String: JSONValue] = [:]
         if case .object(let fp)? = out["filePolicy"] { filePolicy = fp }
         if filePolicy["outsideWorkspaceDefault"] == nil {

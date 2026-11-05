@@ -4,34 +4,22 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `MemoryV2+Wiring.swift` | `SwiftNativeMemoryV2`: `duplicateProvenancePatch`, `store`, `isRejected` |
 
-// Storage-backed memory writes and duplicate provenance on SwiftNativeMemoryV2.
-// Recall and proposals live in their named extensions; value and storage
-// contracts live in MemoryV2Contracts.swift.
 
 extension SwiftNativeMemoryV2 {
 
     // MARK: - Byte-identical collapse: keep the collapse, keep BOTH identities
 
-    /// How many occurrences of one collapsed memory appear in its preview.
-    /// Bounded because a lane that repeats forever must not grow one row's
-    /// metadata forever; the oldest occurrences fall off, `recall_count` keeps
-    /// counting past the cap. Correction counts read the full canonical
-    /// correction_occurrences record, never this preview or recall_count.
+    /// Bound duplicate previews so repeats cannot grow metadata forever. recall_count continues past the cap; correction totals use canonical
+    /// correction_occurrences only.
     static let duplicateProvenanceCap = 10
 
-    /// Metadata keys that are POLICY or shape, not the identity of a
-    /// particular occurrence. Merging these would just restate the row.
+    /// Policy and shape keys cannot identify a distinct occurrence.
     static let duplicateProvenanceIgnoredKeys: Set<String> = [
         "kind", "permittedSurfaces", "tags", "recall_count", "confidence",
         "importance", "pinned", "source_history", "duplicate_occurrences",
     ]
 
-    /// Byte-identical writes merge provenance so repeats remain traceable to both runs.
-    ///
-    /// Pure, and deliberately generic: it merges whatever scalar metadata the
-    /// new write carries that the row does not already say, plus the new
-    /// source, plus the newer observation time. Nothing here knows about
-    /// Workshop-specific identity fields.
+    /// Merge scalar occurrence metadata, source and newer observation time generically so byte-identical repeats retain both origins.
     static func duplicateProvenancePatch(
         existing: MemoryRecord,
         newSource: String?,
@@ -60,8 +48,7 @@ extension SwiftNativeMemoryV2 {
         }
         if !peerSources.isEmpty { out["peer_data_sources"] = .array(peerSources) }
 
-        // 1. Source lineage — every distinct writer of this text, oldest first,
-        //    seeded from the row's own `source` so run #1 is never implied away.
+        // Seed source lineage from the row's own source so its first writer cannot disappear.
         var sources: [String] = []
         if case .array(let arr)? = extras["source_history"] {
             sources = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
@@ -79,8 +66,7 @@ extension SwiftNativeMemoryV2 {
             out["source_history"] = .array(sources.map { .string($0) })
         }
 
-        // 2. This occurrence's identity: the scalar metadata it carries that the
-        //    row does not already say, plus its source.
+        // Carry source and new scalar metadata as this occurrence's identity.
         var identity: [String: JSONValue] = [:]
         for (key, value) in newMeta where !duplicateProvenanceIgnoredKeys.contains(key) {
             guard let value = scalar(value) else { continue }
@@ -92,8 +78,7 @@ extension SwiftNativeMemoryV2 {
             var occurrences: [JSONValue] = []
             if case .array(let arr)? = extras["duplicate_occurrences"] { occurrences = arr }
             let entry = JSONValue.object(identity)
-            // A literal re-write of the SAME occurrence (same ids, same times)
-            // is a retry, not a second run — count it, don't list it twice.
+            // Identical occurrence IDs and times mean retry: count it without listing a second run.
             if occurrences.last != entry {
                 occurrences.append(entry)
                 if occurrences.count > duplicateProvenanceCap {
@@ -103,13 +88,8 @@ extension SwiftNativeMemoryV2 {
             }
         }
 
-        // 3. Observation time: when the newest evidence was observed, not a
-        //    new assertion of present validity.
-        //    First-class column (`observed_at` maps to observedAt);
-        //    only ever moves FORWARD by instant, never by ISO string order:
-        //    offsets and fractional seconds need not sort chronologically.
-        //    Read the writer's one temporal key; an explicit malformed value
-        //    must not overwrite canonical observation time.
+        // Move observed_at forward by instant, never ISO string order; offsets and fractional seconds can sort differently. Malformed supplied time cannot
+        // overwrite canonical evidence.
         var observedAt: String?
         if case .string(let value)? = newMeta["observed_at"] { observedAt = value }
         if let raw = observedAt,
@@ -122,11 +102,8 @@ extension SwiftNativeMemoryV2 {
         return out
     }
 
-    /// True when `store` would refuse this content as tombstoned — the exact
-    /// denylist hash or a paraphrase of a rejected claim. A caller retrying a
-    /// lost write asks first: a rejected claim is settled, not lost.
+    /// Check tombstones before retrying an uncertain write: rejected claims are settled rather than lost.
     public func isTombstoned(content: String, metadata: JSONValue? = nil) async throws -> Bool {
-        let metadata = try MemorySenseProvenance.stamping(metadata)
         let content = MemoryTextClip.memoryDisplayText(content, kind: MemoryRecallScoring.kind(of: metadata))
         guard !content.isEmpty else { return false }
         try await ensureCanonicalAttachment()
@@ -137,9 +114,7 @@ extension SwiftNativeMemoryV2 {
         return try await storage.matchesTombstone(content: content, embedding: embedded.vector, embeddingEpoch: embedded.epoch)
     }
 
-    /// The forgotten or rejected claims nearest `text`, closest first, by the
-    /// recall query's own embedding: what the memory manager is shown so a
-    /// restated forgotten claim is its judgment to skip.
+    /// Show nearest forgotten claims under the recall embedding so the manager judges restated denials.
     public func forgottenClaims(near text: String, limit: Int) async throws -> [String] {
         guard !text.isEmpty, limit > 0 else { return [] }
         try await ensureCanonicalAttachment()
@@ -149,8 +124,7 @@ extension SwiftNativeMemoryV2 {
         return try await storage.nearestTombstones(embedding: vector, embeddingEpoch: embedded.epoch, limit: limit)
     }
 
-    /// Store a new memory. `memory_tombstoned` refuses forgotten or rejected
-    /// content. Cold writes owe admission until their search vector is ready.
+    /// Tombstones refuse forgotten claims; cold writes stay unadmitted until their vector is ready.
     public func store(
         content: String,
         source: String? = nil,
@@ -158,9 +132,10 @@ extension SwiftNativeMemoryV2 {
         supersedes: [String] = [],
         corrects: String? = nil,
         correctionReason: String? = nil,
-        id: String? = nil
+        id: String? = nil,
+        context: MemoryWriteContext
     ) async throws -> MemoryRecord {
-        let metadata = MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(metadata))
+        let metadata = try context.stamping(metadata)
         let content = MemoryTextClip.memoryDisplayText(
             content,
             kind: MemoryRecallScoring.kind(of: metadata)
@@ -204,8 +179,8 @@ extension SwiftNativeMemoryV2 {
             validTo: liftedValidTo,
             observedAt: liftedObservedAt,
             evidence: liftedEvidence,
-            // MemoryKindStamp preserves supplied kinds or defaults to "general" without decay or supersession.
-            // Dates are supplied by the writer, never inferred from content.
+            // MemoryKindStamp preserves supplied kinds or defaults to "general" without decay or supersession. Dates are supplied by the writer, never inferred
+            // from content.
             metadata: MemoryKindStamp.stampingDefaultKind(metadata)
         )
         let targetIDs = Set(supersedes + [corrects].compactMap { $0 })
@@ -221,9 +196,8 @@ extension SwiftNativeMemoryV2 {
                 targetId: id, expectedContentHash: MemoryStorage.contentHash(row.content),
                 reason: "explicit supersession")
         }
-        // Explicit correction uses the same fingerprinted replacement intent
-        // as supersession, including admission owed by a cold write. An exact
-        // reassertion of its own target remains a duplicate, never a demotion.
+        // Share fingerprinted replacement intent with supersession, including cold admission; reasserting the exact target is duplicate evidence, never
+        // demotion.
         if let corrects, !supersedes.contains(corrects),
            let target = existingRows.first(where: {
                $0.id == corrects && $0.status == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle)
@@ -233,23 +207,19 @@ extension SwiftNativeMemoryV2 {
                 reason: correctionReason ?? "explicit correction"))
         }
         if superseding.isEmpty {
-            // Reassert exact duplicates before paying for an embedding. The
-            // final admission repeats matching under its insertion transaction.
+            // Reassert exact duplicates before paying for an embedding. The final admission repeats matching under its insertion transaction.
             if let existing = try await storage.admitMemory(
                 record,
-                insertIfMissing: false, preserveID: id != nil
+                insertIfMissing: false, preserveID: id != nil, context: context
             ) {
                 return MemoryRecord(stored: existing)
             }
         }
-        // The write transaction checks this vector against forgotten claims.
-        // A cold model owes the vector; its landing passes the same gate.
+        // The write transaction checks this vector against forgotten claims. A cold model owes the vector; its landing passes the same gate.
         let embedded = try await residentWriteEmbedding(content)
         var admitted = record
         if embedded == nil {
-            // Saved, admitted only when its vector lands and passes the checks
-            // (under its own id when the caller owns it or explicitly
-            // supersedes). Corrections retain ordinary duplicate admission.
+            // Cold admission preserves caller-owned or replacement identity; corrections still use ordinary duplicate checks.
             admitted.metadata = MemoryStorage.owingAdmission(record.metadata, preservingID: id != nil || !supersedes.isEmpty,
                                                            superseding: superseding)
         }
@@ -257,20 +227,19 @@ extension SwiftNativeMemoryV2 {
         admitted.embeddingEpoch = embedded?.epoch.rawValue
         let inserted: StoredMemory
         if !supersedes.isEmpty || (embedded == nil && !superseding.isEmpty) {
-            inserted = try await storage.insertMemory(admitted, superseding: embedded == nil ? [] : superseding)
+            inserted = try await storage.insertMemory(admitted, superseding: embedded == nil ? [] : superseding, context: context)
         } else {
             guard let saved = try await storage.admitMemory(
                     admitted,
                     insertIfMissing: true, preserveID: id != nil,
-                    superseding: embedded == nil ? [] : superseding) else { throw MemoryV2Error.storageUnavailable }
+                    superseding: embedded == nil ? [] : superseding, context: context) else { throw MemoryV2Error.storageUnavailable }
             inserted = saved
         }
         let result = MemoryRecord(stored: inserted)
         return embedded == nil ? owedVector(result) : result
     }
 
-    /// Convenience tombstone check used by upstream filters (e.g. the chat-fact
-    /// promoter) before calling `store(...)`.
+    /// Upstream filters share the store's tombstone decision.
     public func isRejected(content: String) async throws -> Bool {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }

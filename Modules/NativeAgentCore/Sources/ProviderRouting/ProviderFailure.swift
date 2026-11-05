@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence and the owner's `ToolFailureError` repair through normalization; `repair` decides once whether a failed call owes repair (sign-in, account, model choice) or is a correction that owes nothing; preview preserves the returned failure without filing repair |
+// Blueprint: | `ProviderFailure.swift` | `Diagnostic`, `ToolFailureError`, `repair`: typed failure and repair ownership |
 
 /// Adapters translate wire evidence once for recovery and surfaces; cancellation is not a failure.
 public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable {
@@ -15,10 +15,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     case contextTooLong
     case network
     case offline
-    /// The stream guard cut a request after `seconds` of waiting. `events`
-    /// counts wire activity; `account` is the guard's sentence for which cut
-    /// it was and on what evidence. Admission rides
-    /// on the `Diagnostic`.
+    /// Guard cuts retain wait duration and wire activity; only Diagnostic carries admission evidence.
     case noReply(provider: String, seconds: Int, events: Int, account: String)
     case outputLimit
     case refused
@@ -33,8 +30,16 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         case .codexCLISessionExpired: return "Your Codex CLI sign-in needs updating. Run codex once, or sign in in NativeAgent."
         case .rateLimited(let seconds?): return "The usage limit was reached; wait \(seconds) seconds before another request."
         case .rateLimited(nil): return "The usage limit was reached; the provider gave no wait time. Check the account's usage allowance."
-        case .quotaExceeded(let seconds?): return "The account's allowance or billing limit was reached; the provider supplied a wait of \(seconds) seconds. Check its usage and billing."
-        case .quotaExceeded(nil): return "The account's allowance or billing limit was reached; no reset time was supplied. Check its usage and billing before another request."
+        case .quotaExceeded(let seconds?):
+            return """
+                The account's allowance or billing limit was reached; the provider supplied a wait of \(seconds) seconds. \
+                Check its usage and billing.
+                """
+        case .quotaExceeded(nil):
+            return """
+                The account's allowance or billing limit was reached; no reset time was supplied. \
+                Check its usage and billing before another request.
+                """
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
@@ -71,8 +76,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         }
     }
 
-    // Wire protocols and the CLI sometimes expose only text. Keep that
-    // compatibility translation here, outside every retry/tell decision.
+    // Text-only wire/CLI errors translate once here so retry and presentation cannot invent separate verdicts.
     static func wireDetail(_ object: [String: Any]) -> String {
         ["type", "code", "error_code", "message", "error"].compactMap { object[$0] as? String }.joined(separator: " ")
     }
@@ -90,20 +94,20 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if let status = Self.httpStatusCode(inDescription: text), status >= 400 {
             return http(status: status, detail: text)
         }
-        if ["invalid_api_key", "invalid authentication", "authentication_error", "unauthorized", "token expired", "expired token", "invalid token"].contains(where: text.contains) {
+        if ["invalid_api_key", "invalid authentication", "authentication_error", "unauthorized", "token expired", "expired token", "invalid token"]
+            .contains(where: text.contains) {
             return .authExpired
         }
         if quotaExceeded(text) { return .quotaExceeded(retryAfter: nil) }
         if rateLimitWording(text) { return .rateLimited(retryAfter: nil) }
         if modelUnavailable(text) { return .modelUnavailable }
-        // A provider's own transient server failure: Anthropic's api_error is its
-        // documented 500 ("Internal server error"), as overloaded_error is its 529;
-        // gateways say it in words. Each redials before any of the answer arrives.
+        // Provider-declared transient failures may redial only before answer output begins.
         if ["overloaded", "unavailable", "server_error", "try again later", "api_error",
             "internal server error", "internal_server_error", "bad gateway", "gateway timeout"].contains(where: text.contains) {
             return .overloaded
         }
-        if ["llm: transient", "connection refused", "cannot connect", "network connection was lost", "code=-1001", "timed out", "upstream connect", "disconnect/reset", "transport failure"].contains(where: text.contains) {
+        if ["llm: transient", "connection refused", "cannot connect", "network connection was lost", "code=-1001", "timed out", "upstream connect",
+            "disconnect/reset", "transport failure"].contains(where: text.contains) {
             return .network
         }
         if text.contains("stop_reason=max_tokens") { return .outputLimit }
@@ -119,7 +123,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
 
     private static func quotaExceeded(_ detail: String) -> Bool {
         let text = detail.lowercased()
-        return ["usage exhausted", "usage is exhausted", "out of extra usage", "quota exceeded", "insufficient_quota", "usage limit", "credit balance", "billing limit", "quota_exceeded", "spending limit"].contains(where: text.contains)
+        return ["usage exhausted", "usage is exhausted", "out of extra usage", "quota exceeded", "insufficient_quota", "usage limit", "credit balance",
+            "billing limit", "quota_exceeded", "spending limit"].contains(where: text.contains)
     }
 
     private static func rateLimitWording(_ detail: String) -> Bool {
@@ -129,20 +134,21 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
 
     private static func modelUnavailable(_ detail: String) -> Bool {
         let text = detail.lowercased()
-        return ["model_not_found", "model_not_available", "model not found", "model not available", "model unavailable", "model is unavailable", "does not exist or you do not have access", "claude_code_version_too_old", "does not support this model", "or newer is required"].contains(where: text.contains)
+        return ["model_not_found", "model_not_available", "model not found", "model not available", "model unavailable", "model is unavailable",
+            "does not exist or you do not have access", "claude_code_version_too_old", "does not support this model", "or newer is required"].contains(
+                where: text.contains)
     }
 
     private static func contextOverflow(_ detail: String) -> Bool {
         let text = detail.lowercased()
-        return ["prompt is too long", "context_length_exceeded", "context length", "exceeds the context window", "input is too long", "input too long", "too many total text bytes", "request_too_large", "exceeds the model's maximum", "max_tokens exceed"].contains(where: text.contains)
+        return ["prompt is too long", "context_length_exceeded", "context length", "exceeds the context window", "input is too long", "input too long",
+            "too many total text bytes", "request_too_large", "exceeds the model's maximum", "max_tokens exceed"].contains(where: text.contains)
     }
 
     /// Status numbers require HTTP/status-code context, unquoted adapter-prefix status, or a matching reason phrase.
     static func httpStatusCode(inDescription description: String) -> Int? {
         let haystack = description.lowercased()
-        // The adapter prefix: everything before the body it quoted. Adapters
-        // write "<context> status <code>: <body>", so the status they mean is
-        // always ahead of the first brace.
+        // Only the unquoted adapter prefix supplies its status; body text cannot override it.
         let prefix = String(haystack[haystack.startIndex..<(haystack.firstIndex(of: "{") ?? haystack.endIndex)])
         let reasons = "request timeout|conflict|gone|payload too large|"
             + "request entity too large|content too large|unprocessable entity|"
@@ -168,8 +174,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return nil
     }
 
-    /// 408 request timeout, 409 conflict, 425 too-early, 429 rate limit, and
-    /// every 5xx: all of them describe "ask again", not "you asked wrong".
+    /// 408 request timeout, 409 conflict, 425 too-early, 429 rate limit, and every 5xx: all of them describe "ask again", not "you asked wrong".
     static func isRecoverableStatus(_ status: Int) -> Bool {
         switch status {
         case 408, 409, 425, 429:
@@ -202,7 +207,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return nil
     }
 
-    /// `admitted`: the provider had begun a response for this request.
+    /// Admission means this request had begun a provider response.
     static func normalize(_ error: Error, admitted: Bool = false) -> Error {
         if error is CancellationError || (error as? URLError)?.code == .cancelled { return CancellationError() }
         if admitted, let diagnostic = error as? Diagnostic {
@@ -211,8 +216,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                               repair: diagnostic.repair, tries: diagnostic.tries)
         }
         if error is any ProviderFailureWrapping { return error }
-        // Output truncation carries partial prose; routing/configuration failures
-        // retain their repair identity rather than becoming a transport failure.
+        // Output truncation carries partial prose; routing/configuration failures retain their repair identity rather than becoming a transport failure.
         if ProviderRecoveryPolicy.isEmptyReply(error) { return error }
         if let error = error as? LLMError {
             switch error {
@@ -227,17 +231,15 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                           admitted: admitted)
     }
 
-    /// Retain transport evidence while people and retry policy still consume
-    /// the same typed category. Redact before it can reach durable diagnostics.
+    /// Retain transport evidence while people and retry policy still consume the same typed category. Redact before it can reach durable diagnostics.
     public struct Diagnostic: Error, LocalizedError, Sendable, ProviderFailureWrapping {
         public let cause: ProviderFailure
         public let detail: String
         public let deadlineExpired: Bool
-        /// The provider began a response for this request.
+        /// Admission means this request had begun a provider response.
         public let admitted: Bool
         public let repair: ToolFailureError?
-        /// How many times delivery dialed this request (ProviderWire): above 1,
-        /// asking again was already the wire's.
+        /// Dial count records wire-owned redelivery so surfaces do not replay it.
         public let tries: Int
         public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false,
                     repair: ToolFailureError? = nil, tries: Int = 1) {
@@ -275,19 +277,16 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
     }
 
-    /// What a failed model call is to her, decided once for every surface. A
-    /// sign-in that is rejected or expired, an account that is not connected
-    /// or a model its account does not serve stays wrong until someone changes
-    /// it: it names that owner and its lever and owes repair. An outage, a
-    /// limit, a timeout, an empty or unreadable reply or a refusal is the
-    /// provider's answer to this request: it owes nothing and names its fix
-    /// and control. Nothing here proves the Mac healthy, so nothing
-    /// says so. A failure already carrying its repair keeps it.
+    /// Sign-in, account and model faults owe repair to their owner. Request outages, limits, timeouts and refusals retain their correction without claiming
+    /// local health; existing repairs keep their identity.
     public static func repair(_ error: Error, provider: String, model: String, surface: String,
-                              dataRoot: URL, id: String, evidence: [Experience.Ref] = []) -> ToolFailureError {
+                              dataRoot: URL, id: String, evidence: [Experience.Ref] = [], call: LLMCall) -> ToolFailureError {
         if let carried = (error as? Diagnostic)?.repair { return carried }
         if error is CancellationError || (error as? URLError)?.code == .cancelled {
-            return ToolFailureError("provider_call_cancelled: The model call was cancelled. Keep any output already received and leave the call stopped; no further action is needed.",
+            return ToolFailureError("""
+                provider_call_cancelled: The model call was cancelled. Keep any output already received and leave the call stopped; no further action is \
+                needed.
+                """,
                 effects: .unknown, code: "provider_call_cancelled", status: .cancelled,
                 instruction: "Keep any output already received and leave the call stopped; no further action is needed.", recovery: .terminal)
         }
@@ -312,7 +311,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                 let connection = SwiftNativeProviderRouting.displayName(for: provider)
                 let signIn = NativeOAuthFlow.signInControl(providerID: provider, dataRoot: dataRoot)
                 let owner = connection + " (" + provider + ") saved " + (signIn == nil ? "API key" : "sign-in")
-                let tap = signIn ?? "Providers → Accounts & API keys → \(connection) → Manage → Key → Paste the key here → Save"
+                let tap = signIn ?? "Providers → Accounts → \(connection) → Add key → protected connection card"
                 let instruction = "Ask the person to reconnect at \(tap)."
                 failure = ToolFailureError("provider_auth_expired: \(owner): \(detail). \(instruction)", effects: .none, owner: owner, tap: tap,
                     code: "provider_auth_expired", instruction: instruction, recovery: .repair)
@@ -328,11 +327,10 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                     code: code, instruction: instruction, recovery: .repair)
             case .contextTooLong?:
                 // Full is not a passing outage: asking again sends the same context.
-                let instruction = "Compact this conversation with app {action:\"chat.compact\"}; repeating it unchanged sends the same full context."
+                let instruction = "Inspect the retained input and model window; reduce the input or repair its size measurement before continuing."
                 return ToolFailureError(
                     "provider_context_limit: \(provider) · \(model): the context is full (\(detail)). \(instruction)",
                     effects: .none,
-                    nextCall: ToolFailureError.call("app", ["action": .string("chat.compact")]),
                     code: "provider_context_limit", instruction: instruction, recovery: .repair)
             default:
                 let code: String
@@ -349,11 +347,15 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                     instruction = "Wait \(seconds) seconds before another request; inspect the selected account and model with setting.get \(group)_model."
                 case .rateLimited(nil)?:
                     code = "provider_rate_limited"
-                    instruction = "Check the account's usage allowance before another request; no wait time was supplied. Inspect its model choice with setting.get \(group)_model."
+                    instruction = """
+                        Check the account's usage allowance before another request; no wait time was supplied. Inspect its model choice with setting.get \
+                        \(group)_model.
+                        """
                 case .quotaExceeded(let seconds)?:
                     code = "provider_quota_exceeded"
                     let wait = seconds.map { "The provider supplied a wait of \($0) seconds. " } ?? "No reset time was supplied. "
-                    instruction = wait + "Check this account's allowance and billing before another request; inspect the selected account with setting.get \(group)_account."
+                    instruction = wait
+                        + "Check this account's allowance and billing before another request; inspect the selected account with setting.get \(group)_account."
                 case .outputLimit?:
                     code = "provider_output_limit"
                     instruction = "Keep any partial output and request only the missing portion; inspect model choices with setting.get \(group)_model."
@@ -371,31 +373,38 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                     instruction = "Wait for this Mac's network to return before another request."
                 case .noReply?:
                     code = "provider_no_reply"
-                    instruction = "Inspect the deadline evidence and preserve any output already received; inspect the selected model with setting.get \(group)_model."
+                    instruction = """
+                        Inspect the deadline evidence and preserve any output already received; inspect the selected model with setting.get \
+                        \(group)_model.
+                        """
                 case .overloaded?:
                     code = "provider_overloaded"
                     instruction = "Wait for provider capacity before another request; inspect model choices with setting.get \(group)_model."
                 default:
                     code = "provider_response_invalid"
-                    instruction = "Preserve any output already received and inspect the response error before continuing; inspect the selected model with setting.get \(group)_model."
+                    instruction = """
+                        Preserve any output already received and inspect the response error before continuing; inspect the selected model with \
+                        setting.get \(group)_model.
+                        """
                 }
                 return ToolFailureError(
                     "\(code): \(provider) · \(model) response stopped: \(detail). \(instruction)",
                     effects: .unknown,
-                    nextCall: cause == .network || cause == .offline ? nil : ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]),
+                    nextCall: cause == .network || cause == .offline ? nil : ToolFailureError.call("app", ["action": .string("setting.get"), "args":
+                        .object(["setting": .string(group + "_model")])]),
                     tap: cause == .network || cause == .offline ? "System Settings → Network" : nil,
                     code: code, status: status,
                     instruction: instruction, recovery: .inspect)
             }
         }
-        if !LLMCallContext.preview, let owner = failure.owner, !failure.personDecides {
+        if !call.preview, let owner = failure.owner, !failure.personDecides {
             RepairOwed.owe(dataRoot, id: id, kind: .act, evidence: evidence, operation: "model.call:" + provider + ":" + model,
                 owner: owner, words: failure.message, lever: lever, nextCall: failure.nextCall, tap: failure.tap)
         }
         return failure
     }
 
-    /// The cause as a string, for a receipt whose wire cannot carry the type.
+    /// String-only receipts retain the same typed cause.
     public var encoded: String? { (try? JSONEncoder().encode(self)).map { String(decoding: $0, as: UTF8.self) } }
 
     public static func decoded(_ encoded: String) -> Self? {

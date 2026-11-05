@@ -1,36 +1,23 @@
 import Foundation
 
-// Blueprint: | `OncePerPeriodReservation.swift` | `OncePerPeriodReservation`: locked durable periodic admission and stamp-specific restoration of a failed reservation |
+// Blueprint: | `OncePerPeriodReservation.swift` | `OncePerPeriodReservation`; Locked durable periodic admission. |
 
-/// Outcome of a `reserveOncePerPeriod` attempt.
 public enum OncePerPeriodReservation: Sendable {
-    /// This tick won the slot. `stamp` is the exact marker value this
-    /// reservation wrote. `rollback` restores the marker's prior contents
-    /// (or removes it if it was absent) — but ONLY when the marker still
-    /// holds OUR stamp, compare-and-restore under the same flock.
+    /// Restore prior marker bytes only while our exact stamp still holds under the same flock.
     case reserved(stamp: String, rollback: @Sendable () async -> Void)
-    /// The current period is already reserved by an earlier tick; skip.
     case alreadyReserved
-    /// Marker IO, decoding, locking, or stamping failed. Periodic work must
-    /// fail closed rather than run without a durable exclusion claim.
+    /// Persistence failures cannot admit periodic work without a durable exclusion claim.
     case failed(Error)
 }
 
-/// Dependency-neutral, cross-process check-and-stamp for periodic work.
-///
-/// PersistenceCore owns this primitive because both lower-level organs (for
-/// example DreamREMCycle) and BackgroundLoops need the same durable exclusion
-/// boundary.
+/// PersistenceCore owns durable exclusion shared by background loops and lower-level organs.
 public func reserveOncePerPeriod(
     at marker: URL,
     stamp: String,
     isFresh: @Sendable (_ stored: String?) throws -> Bool
 ) async -> OncePerPeriodReservation {
     do {
-        // Capture prior bytes INSIDE the same claim lock. Reading them before
-        // lock admission creates a stale-rollback race: another process can
-        // stamp between the read and our claim, after which our failed work
-        // would restore a marker older than the claim we actually replaced.
+        // Capture prior bytes under the claim lock so failure cannot restore a value older than the claim it replaced.
         let claim = try await SwiftNativePersistenceCore.withFileLock(marker) { () -> (reserved: Bool, prior: Data?) in
             let prior: Data?
             let stored: String?
@@ -77,7 +64,6 @@ public func reserveOncePerPeriod(
     }
 }
 
-/// Period-keyed convenience: reserve iff the stored key differs from `key`.
 public func reserveOncePerPeriod(
     key: String,
     at marker: URL

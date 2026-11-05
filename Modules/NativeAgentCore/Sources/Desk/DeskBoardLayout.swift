@@ -2,12 +2,11 @@ import NativeAgentShared
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DeskBoardLayout.swift` | `DeskBoardLayout`: active/pursuit/watch partitioning and watch order; `DeskPage` attention, freshness and timestamp interpretation |
+// Blueprint: | `DeskBoardLayout.swift` | `DeskBoardLayout` partitions active work; `DeskPage` interprets freshness |
 
 public enum DeskBoardLayout {
 
-    // Pursuits claim agent projects even with unreadable payloads; pursuits, watches
-    // and board partition active items, keeping malformed pursuits visible.
+    // Partition every active item exactly once, keeping malformed pursuits visible.
 
     public static func isWatchShaped(_ item: DeskItem) -> Bool {
         item.kind == .watch || item.status == .watch
@@ -22,7 +21,7 @@ public enum DeskBoardLayout {
     }
 
     public static func watches(_ active: [DeskItem]) -> [DeskItem] {
-        // Shared watch order is stalest first, unparseable dates last, with raw timestamp then handle breaking ties.
+        // Raw timestamps and handles break freshness ties deterministically.
         active.filter { !isPursuitLaneItem($0) && isWatchShaped($0) }
             .sorted { a, b in
                 let da = DeskPage.parseTimestamp(a.updatedAt) ?? .distantFuture

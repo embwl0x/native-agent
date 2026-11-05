@@ -1,9 +1,9 @@
 import Foundation
-// Blueprint: | `Expectation.swift` | `Expectation`: shared Wilson confidence, simultaneous-prediction correction, rule-of-succession withholding and measured-cost standing for expectations |
+// Blueprint: | `Expectation.swift` | `Expectation`: confidence and measured-cost admission |
 
 /// Deliberation is the price of surprise: an expectation pays instead of the model while it stands.
 public enum Expectation {
-    /// The chance that any simultaneously tested prediction stands by luck.
+    /// Bound the chance that any simultaneous prediction stands by luck.
     private static let alpha = 0.05
 
     /// Union-bound Gaussian confidence; not an anytime guarantee.
@@ -25,8 +25,8 @@ public enum Expectation {
         (Double(tries - hits) + 1) / (Double(tries) + 2)
     }
 
-    /// Both measured costs are required. `among` corrects simultaneous predictions;
-    /// nil preserves a single claim's per-look 95% interval, without that correction.
+    /// Both measured costs are required. `among` corrects simultaneous predictions; nil preserves a single claim's per-look 95% interval, without that
+    /// correction.
     public static func stands(hits: Int, tries: Int, cHit: Double?, cMiss: Double?, among: Int? = nil)
         -> (stands: Bool, lower: Double, bar: Double?) {
         let lower = lowerBound(hits: hits, tries: tries, z: among.map { z(among: $0) } ?? 1.959964)

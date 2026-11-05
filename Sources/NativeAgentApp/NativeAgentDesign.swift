@@ -3,7 +3,6 @@ import SwiftUI
 import AppKit
 // Blueprint: | `NativeAgentDesign.swift` | `View`: `settingsCardSurface`; centered shell layout and shared surfaces |
 
-/// An eyebrow over the kit's shared card surface.
 struct NativePanel<Content: View>: View {
     var title: String?
     var contentInsets = EdgeInsets(top: NativeAgentSpacing.lg, leading: NativeAgentSpacing.lg,
@@ -22,14 +21,11 @@ struct NativePanel<Content: View>: View {
             .padding(contentInsets)
             .aliveCard()
         }
-        // Keep each card's controls in a semantic group. Flattening a whole
-        // settings page makes SwiftUI repeatedly order unrelated descendants
-        // when accessibility clients inspect it during scrolling.
+        // Group controls per card so accessibility inspection cannot repeatedly order unrelated descendants across the whole page.
         .accessibilityElement(children: .contain)
     }
 }
 
-/// A status word in the room's state colours.
 struct StatusBadge: View {
     var text: String
     var status: String?
@@ -50,7 +46,6 @@ extension View {
             .accessibilityLabel("Close")
     }
 
-    /// The kit's card on a settings section; callers own content and padding.
     func settingsCardSurface() -> some View {
         self
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -97,7 +92,6 @@ struct InlineStatusDot: View {
 }
 
 enum HouseGlass {
-    /// Every authored plate shares clear glass, tinted black in dark and white in light.
     static let plate: Glass = .clear.tint(plateTint)
     private static let plateTint = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -137,11 +131,8 @@ private struct HouseSurface<S: Shape>: ViewModifier {
     }
 }
 
-// Shared design primitives.
 
-/// House glass card with an optional accessibility state edge. Chrome
-/// only: the chat turn card floating over the transcript and the detached
-/// panels' classic composer. Content cards wear `aliveCard`.
+/// Use glass only for floating chat chrome; content cards use aliveCard.
 struct GlassCard<Content: View>: View {
     var tint: Color? = nil
     @ViewBuilder var content: () -> Content
@@ -150,8 +141,7 @@ struct GlassCard<Content: View>: View {
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     var body: some View {
-        // A quiet screenshot draws the opaque fill too: tinted glass drawn
-        // into a bitmap blanks the whole capture.
+        // Use opaque fill for quiet screenshots because bitmap rendering blanks tinted glass.
         let opaque = reduceTransparency || quietOffscreenRead
         let edgeColor = tint ?? Color.primary
         let edgeOpacity = tint != nil
@@ -180,8 +170,7 @@ struct GlassCard<Content: View>: View {
     }
 }
 
-/// Status indicator. Static by default so persistent lists/cards do not keep
-/// SwiftUI's display list animating while the app is idle.
+/// Keep persistent status indicators static by default so idle lists cannot animate continuously.
 struct PulsingDot: View {
     let color: Color
     var size: CGFloat = 8
@@ -193,7 +182,7 @@ struct PulsingDot: View {
 
         ZStack {
             if shouldAnimate {
-                // Drawn from the clock: SwiftUI's repeatForever trapped in layout (10-31 crash).
+                // Draw from the clock to avoid repeatForever layout recursion.
                 TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
                     let t = NativeAgentMotion.loopPhase(at: context.date, period: NativeAgentMotion.breatheDuration)
                     let eased = t * t * (3 - 2 * t)
@@ -213,33 +202,23 @@ struct PulsingDot: View {
 
 // MARK: - The shell
 
-/// Appearance-aware palette: views name room, rail, list and text roles.
 enum NativeAgentShell {
-    // Charcoal-slate in dark, paper in light; cards remain lighter than the room.
     static let room       = dynamic(dark: 0x12161F, light: 0xF7F6F3)
     static let rail       = dynamic(dark: 0x121315, light: 0xF3F2EF)
     static let list       = dynamic(dark: 0x17181B, light: 0xF5F4F1)
-    // Text uses native system label colours.
     static let text       = Color(nsColor: .labelColor)
     static let secondary  = Color(nsColor: .secondaryLabelColor)
     static let tertiary   = Color(nsColor: .tertiaryLabelColor)
-    // Light felt-state colours must clear 4.5:1 against the room, rail and cards.
-    /// Teal is reserved for approval borders and the pending-approval status dot.
+    // Clear 4.5:1 on every shell surface; reserve teal for approvals.
     static let needsYou   = dynamic(dark: 0x06B6D4, light: 0x0B5F76)
-    /// Trouble — a dropped connection, a turn that failed.
     static let trouble    = dynamic(dark: 0xFF9F0A, light: 0x864800)
-    /// Calm — she is up and answering.
     static let calm       = dynamic(dark: 0x34C759, light: 0x136224)
 
-    /// Selection and chip fill: 8% white on dark, 11% black on light.
     static let softFill   = primaryTint(dark: 0.08, light: 0.11)
-    /// Quieter fill for the tool row and the search field.
     static let quietFill  = Color(nsColor: .quaternarySystemFill)
-    /// The single hairline used by the composer and the quiet cards.
     static let hairline   = Color(nsColor: .separatorColor)
 
-    /// The primary colour at an appearance-specific alpha: white on dark,
-    /// black on light, so a fill or hairline can carry more weight in light.
+    /// Use appearance-specific primary alpha so fills and hairlines stay weighted in light mode.
     private static func primaryTint(dark: Double, light: Double) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
             let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -255,7 +234,6 @@ enum NativeAgentShell {
     }
 }
 
-/// Always-active behind-window material lets the desktop bleed through the shell.
 struct ShellGlass: NSViewRepresentable {
     var material: NSVisualEffectView.Material = .sidebar
 
@@ -273,8 +251,6 @@ struct ShellGlass: NSViewRepresentable {
     }
 }
 
-/// Every column shares one material and tint; hairlines separate columns.
-/// Reduce Transparency makes the sheet opaque.
 struct ShellSheet: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
@@ -291,7 +267,6 @@ struct ShellSheet: View {
     }
 }
 
-/// A soft, edgeless warm glow in dark; the tint coat owns text contrast.
 struct ShellLamp: View {
     @Environment(\.colorScheme) private var colorScheme
 
@@ -303,7 +278,6 @@ struct ShellLamp: View {
                     Color(red: 1.0, green: 0.86, blue: 0.62).opacity(0.06),
                     .clear,
                 ],
-                // The glow stays high and left of the window's centre.
                 center: UnitPoint(x: 0.38, y: 0.24),
                 startRadius: 0,
                 endRadius: 820
@@ -315,7 +289,6 @@ struct ShellLamp: View {
     }
 }
 
-/// Fixed system-font roles; meaningful small text uses secondary ink over glass.
 enum ShellType {
     static let captionSize: CGFloat = 11
     static let labelSize: CGFloat = 13
@@ -324,92 +297,62 @@ enum ShellType {
     static let displaySize: CGFloat = 25
     static let pageTitleSize: CGFloat = 44
 
-    /// Codes and paths, and nothing else: keys, ids, file paths. Never for a
-    /// label that happens to be short.
+    /// Reserve monospaced roles for codes, keys and paths so ordinary short labels keep the prose ramp.
     static let code = Font.system(size: labelSize, design: .monospaced)
     static let caption = Font.system(size: captionSize)
     static let captionMedium = Font.system(size: captionSize, weight: .medium)
     static let captionSemibold = Font.system(size: captionSize, weight: .semibold)
     static let captionCode = Font.system(size: captionSize, design: .monospaced)
     static let captionCodeSemibold = Font.system(size: captionSize, weight: .semibold, design: .monospaced)
-    /// 13 — list subtitle, rail words, tool rows, meta lines, buttons.
     static let label = Font.system(size: labelSize)
     static let labelMedium = Font.system(size: labelSize, weight: .medium)
-    /// 14 — rail words and row titles, a step above their detail.
     static let railSize: CGFloat = 14
     static let rail = Font.system(size: railSize, weight: .medium)
     static let labelSemibold = Font.system(size: labelSize, weight: .semibold)
-    /// The shared settings and content row: 14 medium over 13 regular.
     static let rowTitle = Font.system(size: railSize, weight: .medium)
     static let rowDetail = label
     static let pageSentence = Font.system(size: railSize)
     static let pageTitle = Font.system(size: pageTitleSize, design: .serif)
-    /// 16 — body, list row title, card headline.
     static let body = Font.system(size: bodySize)
     static let bodyMedium = Font.system(size: bodySize, weight: .medium)
     static let bodySemibold = Font.system(size: bodySize, weight: .semibold)
     static let columnTitle = bodySemibold
-    /// 20 — subordinate page and detail headings.
     static let title = Font.system(size: titleSize, weight: .semibold)
-    /// Rounded display for onboarding and empty states.
     static let display = Font.system(size: displaySize, weight: .semibold, design: .rounded)
 }
 
-/// Shared shell geometry: a 740pt room holds a 708pt reply and two 16pt gutters.
+/// A 740pt room fits the 708pt reply plus two 16pt gutters.
 enum NativeAgentShellLayout {
-    // The rail accommodates full 14pt labels.
     static let railWidth: CGFloat = 112
     static let railItemHeight: CGFloat = 44
-    /// The bar's inset from the column's edge, one rule for rail and list.
     static let barInset: CGFloat = 4
-    /// The most composer the transcript will ever clear: five lines of input,
-    /// the control row and an attachment strip. Anything larger is a bad
-    /// measurement, not a tall composer.
+    /// Bound composer room to five input lines, controls and attachments so a bad measurement cannot consume the transcript.
     static let composerClearanceMax: CGFloat = 320
-    /// Where the rail's words start, one left edge top to bottom.
     static let railWordInset: CGFloat = 14
-    /// Appearance-specific tint keeps the ground coherent while allowing desktop bleed.
     @MainActor static var roomGlassTint: Double {
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         return dark ? 0.74 : 0.66
     }
-    /// Full-height glass runs behind the transparent title bar; content clears its traffic lights.
     static let titleBarInset: CGFloat = 28
-    /// The two chat column headings share the slim header's top inset.
     static let columnHeaderTopInset: CGFloat = 6
-    /// The list column, edge to edge.
     static let conversationsWidth: CGFloat = 288
-    /// The list's inner gutter — the content inside `conversationsWidth`.
     static let conversationsInset: CGFloat = 12
-    /// One list row, fixed. 46 + the 2pt gap between rows = a 48pt pitch,
-    /// two 24pt units, the same pitch the rail already runs (44 + 4).
+    /// Use a 48pt row pitch (46 + 2 gap) to match the rail's two 24pt units.
     static let listRowHeight: CGFloat = 46
-    // The room grows to the text measure plus gutters; the composer spans the column.
     static let roomColumn: CGFloat = 740
     static let replyMaxWidth: CGFloat = 708
-    /// The gutter inside the room column: header, transcript and working card
-    /// wear it, and it is also the composer's own inner padding.
     static let roomGutter: CGFloat = 16
     static var roomLeadingInset: CGFloat { roomGutter }
     static var roomTrailingInset: CGFloat { roomGutter }
     static let roomAlignment: Alignment = .top
     static let userBubbleMaxWidth: CGFloat = 640
     static let composerRadius: CGFloat = 22
-    /// The rail's floating plate.
     static let railPlateRadius: CGFloat = 18
-    /// How far the plate floats in from the window's leading and bottom edges,
-    /// and down from the title strip.
     static let railPlateInset: CGFloat = 10
-    /// Extra leading between reply lines.
     static let replyLineSpacing: CGFloat = 8
-    /// The 30pt action bar overlays the message's bottom edge without reserving layout space.
     static let hoverBarStrip: CGFloat = 30
-    /// Overlap into the message's bottom edge; the rest stays in the gap, clear of text.
     static let hoverBarOverlap: CGFloat = 6
-    /// One gap between all transcript items, in addition to each item's own padding.
     static let transcriptGap: CGFloat = 16
-    /// Breathing room between the last line of the transcript and the top of
-    /// the floating composer.
     static let composerClearanceMargin: CGFloat = 12
     static let userBubbleCorners = RectangleCornerRadii(
         topLeading: 14, bottomLeading: 14, bottomTrailing: 4, topTrailing: 14
@@ -423,7 +366,6 @@ struct NativeEmptyState: View {
     var actionIsDisabled = false
     var action: (() -> Void)?
 
-    /// The empty state's words and optional action, aligned to the page.
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {

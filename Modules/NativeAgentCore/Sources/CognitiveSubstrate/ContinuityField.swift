@@ -1,29 +1,22 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `ContinuityField.swift` | `ContinuityField`: bounded canonical node/association field, event deduplication, activation/decay and emotional-tag blending |
+// Blueprint: | `ContinuityField.swift` | `ContinuityField`: bounded nodes, associations, dedup, decay and emotion blending |
 
 struct ContinuityField: Sendable {
     private var nodesByKey: [String: CognitiveNode] = [:]
     private var decayAnchorsByKey: [String: Date] = [:]
-    /// Derived lived/audit partition for spreading, decay and eviction.
+    /// Keep lived and diagnostic partitions separate for spreading, decay and eviction.
     private var nonLiveNodeKeys: Set<String> = []
     private var seenEventKeys: Set<String> = []
     /// FIFO insertion order bounds the dedup set by evicting oldest keys first.
     private var seenEventKeyOrder: [String] = []
     private var associationWeights: [String: [String: Double]] = [:]
-    /// Rebuildable lexical index for association spreading. Tokenizing every
-    /// bounded summary on every sensory event made the resident hot path
-    /// O(nodes * Unicode text length) even though only one node's text changes.
-    /// This cache lives beside the canonical nodes, is updated atomically with
-    /// them, and is discarded/rebuilt on restore; it owns no memory or policy.
+    /// Update the rebuildable lexical index with canonical nodes so sensory admission need not retokenize the entire field; restore discards the cache.
     private var associationTokensByKey: [String: Set<String>] = [:]
-    /// Ring capacity for the event-dedup set. Well above a day's traffic, so a
-    /// duplicate can only slip through after thousands of intervening events —
-    /// long past the decay window that made deduplication matter.
+    /// Keep dedup identity beyond a day's traffic so eviction occurs long after its decay window.
     static let maximumSeenEventKeys = 4096
-    /// Evicted in one batch when the cap is passed, keeping the eviction
-    /// amortized O(1) per insert instead of a per-insert `removeFirst`.
+    /// Evicted in one batch when the cap is passed, keeping the eviction amortized O(1) per insert instead of a per-insert `removeFirst`.
     static let seenEventKeyEvictionBatch = 512
 
     var isEmpty: Bool {
@@ -35,23 +28,19 @@ struct ContinuityField: Sendable {
             && associationTokensByKey.isEmpty
     }
 
-    /// The node this ingest touched. Lets the substrate stamp the emotional tag onto
-    /// exactly the node create/reactivate landed on, without re-deriving the key.
+    /// Return the exact touched node so emotion stamping cannot derive a different identity.
     struct IngestOutcome: Sendable, Equatable {
         var key: String
         var isNewNode: Bool
     }
 
-    /// O(1) owner-level idempotence check. `CognitiveSubstrate` uses this before
-    /// any enclosing affect, pending-completion, dirty-revision, or persistence
-    /// work; `ingest` keeps its own guard below as defense in depth.
+    /// O(1) owner-level idempotence check. `CognitiveSubstrate` uses this before any enclosing affect, pending-completion, dirty-revision, or persistence work;
+    /// `ingest` keeps its own guard below as defense in depth.
     func hasSeenEvent(_ event: CognitiveEvent) -> Bool {
         seenEventKeys.contains(event.deduplicationKey)
     }
 
-    /// Structural ingest (create / reactivate). Returns which node key it touched and
-    /// whether that node was newly created — or `nil` when the event was a duplicate
-    /// and nothing changed. The caller uses the outcome to stamp the emotional tag.
+    /// Return creation/reactivation identity for tag stamping; duplicate events remain inert.
     @discardableResult
     mutating func ingest(
         _ event: CognitiveEvent,
@@ -63,10 +52,8 @@ struct ContinuityField: Sendable {
         guard seenEventKeys.insert(eventKey).inserted else { return nil }
         rememberSeenEventKey(eventKey)
         let contributesToLivedState = event.turnKind.contributesToLivedState
-        // Diagnostic traffic may be retained as bounded audit evidence, but its
-        // arrival must not advance the mutable decay anchors of lived nodes. A
-        // later read still projects those nodes to the requested time without
-        // making the diagnostic event the cause of that settlement.
+        // Diagnostic traffic may be retained as bounded audit evidence, but its arrival must not advance the mutable decay anchors of lived nodes. A later read
+        // still projects those nodes to the requested time without making the diagnostic event the cause of that settlement.
         applyDecay(at: now, matchingLivedState: contributesToLivedState)
 
         let key = nodeKey(
@@ -116,44 +103,30 @@ struct ContinuityField: Sendable {
             nonLiveNodeKeys.insert(key)
         }
 
-        // Non-live prose is audit traffic, not an activation source. Live/system
-        // events retain the existing spreading behavior, with the implementation
-        // below preventing associations from crossing the lived/audit boundary.
+        // Diagnostic prose cannot activate or spread into lived state.
         if contributesToLivedState {
             spreadActivation(from: key, event: event, input: input, configuration: configuration)
         }
         enforceCapacity(configuration.maximumActiveNodes)
-        // Report the touched node ONLY if it survived capacity enforcement (a freshly
-        // created low-salience node can be evicted immediately) — a stamp against an
-        // evicted key would silently no-op, so don't claim we touched it.
+        // Report a touched node only if it survives capacity enforcement; an evicted key cannot receive the promised stamp.
         guard nodesByKey[key] != nil else { return nil }
         return IngestOutcome(key: key, isNewNode: isNewNode)
     }
 
     // MARK: - Emotional tag stamping
 
-    /// Reconsolidation blend rates. The asymmetry is the whole point: a feeling moves
-    /// toward warmer / more-positive FAST, and toward colder / more-negative SLOW — so
-    /// a node warms up readily on a good re-encounter but only cools grudgingly, matching
-    /// how affective memory actually reconsolidates. Arousal has no "good direction," so
-    /// it uses a single moderate rate.
-    static let emotionBlendFastRate = 0.5   // toward warmer / more-positive
-    static let emotionBlendSlowRate = 0.15  // toward colder / more-negative
+    /// Warm/positive reconsolidation moves faster than cooling so good re-encounters can soften memory; arousal has no positive direction.
+    static let emotionBlendFastRate = 0.5
+    static let emotionBlendSlowRate = 0.15
     static let emotionBlendArousalRate = 0.35
 
-    /// Asymmetric lerp of one tag axis toward the incoming value: fast when moving up
-    /// (warmer / more-positive), slow when moving down (colder / more-negative).
+    /// Select the warm-fast or cool-slow blend by incoming direction.
     private func asymmetricBlend(current: Double, incoming: Double) -> Double {
         let rate = incoming >= current ? Self.emotionBlendFastRate : Self.emotionBlendSlowRate
         return current + rate * (incoming - current)
     }
 
-    /// Stamp the emotional tag onto the node at `key` (the field owns nodes, so the
-    /// mutation must go through it — mirrors `updateNodeMetadata`). For a NEW node the
-    /// tag is set directly to the incoming feeling; for a RE-ACTIVATION the stored tag is
-    /// blended ASYMMETRICALLY toward the incoming feeling (valence & warmth warm-fast /
-    /// cool-slow; arousal a single moderate rate). Returns `false` if the node is gone.
-    /// Values land through CognitiveNode's clamping setters, so tags stay welfare-bounded.
+    /// New tags take measured feeling directly; reactivation blends asymmetrically through clamped setters. A missing node cannot be stamped.
     @discardableResult
     mutating func stampEmotionTag(
         key: String,
@@ -176,41 +149,31 @@ struct ContinuityField: Sendable {
         return true
     }
 
-    /// Whether the lived moment `seq` already changed this node's feeling
-    /// (its watermark is at or past it). A node evicted since reads false.
+    /// Whether the lived moment `seq` already changed this node's feeling (its watermark is at or past it). A node evicted since reads false.
     func hasLived(_ seq: UInt64, key: String) -> Bool {
         guard let lived = nodesByKey[key]?.livedSeq else { return false }
         return lived >= seq
     }
 
-    /// Stamp the node's watermark: the lived moment `seq` changed its feeling.
-    /// Never lowered.
+    /// Stamp the node's watermark: the lived moment `seq` changed its feeling. Never lowered.
     mutating func markLived(_ seq: UInt64, key: String) {
         guard var node = nodesByKey[key] else { return }
         node.livedSeq = max(node.livedSeq ?? 0, seq)
         nodesByKey[key] = node
     }
 
-    /// Non-mutating read of one node's stored emotional tag. The U1 user-reaction
-    /// re-stamp passes the node's OWN arousal/warmth straight back into
-    /// `stampEmotionTag`, so those two blends are exact no-ops and only valence
-    /// moves. `nil` when the node has been evicted since it was remembered.
+    /// Reuse a completion's own arousal/warmth on reaction re-stamp so only valence changes; evicted nodes provide no evidence.
     func storedEmotionTag(forKey key: String) -> (valence: Double, arousal: Double, warmth: Double)? {
         guard let node = nodesByKey[key] else { return nil }
         return (node.emotionalValence, node.emotionalArousal, node.emotionalWarmth)
     }
 
-    /// The node currently living at `key`, or `nil` if it was evicted since the key was
-    /// remembered. A pure read — the `attentionSignals` producer resolves the U1
-    /// `pendingCompletion` slot (which stores only the field key) back to its summary.
+    /// Resolve pending-completion keys without mutation; an evicted node stays absent.
     func node(forKey key: String) -> CognitiveNode? {
         nodesByKey[key]
     }
 
-    /// Workspace selection needs only whether a node participates in any
-    /// association, not a rendered edge list with lexical reason strings.
-    /// Keep the diagnostic edge compiler for observability; the resident
-    /// microcycle consumes this bounded derived set instead.
+    /// Selection needs only associated ids; keep rendered edge reasons out of the resident hot path.
     func associatedNodeIDs() -> Set<UUID> {
         var ids: Set<UUID> = []
         for (fromKey, targets) in associationWeights where !targets.isEmpty {
@@ -224,30 +187,19 @@ struct ContinuityField: Sendable {
 
     // MARK: - Overnight emotional consolidation
 
-    /// Overnight-consolidation tuning. Named next to the reconsolidation blend rates so
-    /// all continuity-field emotional tuning lives in one place. Arousal-only, gentle:
-    /// what keeps recurring stays a little alive; a stale high charge softens (the memory
-    /// stays). See `consolidateEmotionalArousal`.
-    static let overnightRecurredWindow: TimeInterval = 24 * 60 * 60  // "kept mattering"
-    static let overnightStaleWindow: TimeInterval = 48 * 60 * 60     // "gone quiet"
-    static let overnightReinforceRate = 0.05                         // saturating toward 1
-    static let overnightCalmFactor = 0.7                             // charge softens, memory stays
-    static let overnightCalmArousalFloor = 0.35                      // only a real charge is worth calming
+    /// Arousal-only consolidation keeps recurring feeling alive while softening stale charge without deleting memory.
+    static let overnightRecurredWindow: TimeInterval = 24 * 60 * 60
+    static let overnightStaleWindow: TimeInterval = 48 * 60 * 60
+    static let overnightReinforceRate = 0.05
+    static let overnightCalmFactor = 0.7
+    static let overnightCalmArousalFloor = 0.35                      // Only a real charge warrants calming.
 
     // MARK: - Affective spreading
 
-    /// Ceiling on the emotional-congruence whisper in `spreadActivation`: a felt
-    /// node firing gives emotionally similar felt neighbors up to +25% on the
-    /// activation nudge (one warm thought makes the next warm thought likelier).
-    /// Facilitation-only — incongruent neighbors keep the unchanged baseline
-    /// boost, never less. Salience and stored association weights are untouched:
-    /// the whisper is transient attention per fire, not structural memory.
+    /// Felt congruence may add at most 25% activation, never suppress incongruent neighbors or change structural salience/weights.
     static let affectiveSpreadMaxWhisper = 0.25
 
-    /// Emotional congruence of two FELT tags on the two "what it feels like"
-    /// axes (valence + warmth; arousal is intensity, not quality). 1 = same
-    /// feeling, 0 = opposite. Returns 0 unless BOTH nodes are felt, so
-    /// legacy/neutral (0,0,0) nodes spread byte-identically to pre-Wave-F.
+    /// Compare valence and warmth, not arousal; both nodes must be felt so neutral tags add no congruence.
     static func affectiveCongruence(_ source: CognitiveNode, _ target: CognitiveNode) -> Double {
         guard source.feltDirection != nil, target.feltDirection != nil else { return 0 }
         let valenceDistance = abs(source.emotionalValence - target.emotionalValence) / 2
@@ -261,8 +213,7 @@ struct ContinuityField: Sendable {
     ) -> (reinforced: Int, calmed: Int) {
         var reinforced = 0
         var calmed = 0
-        // Snapshot the keys so mutation can't perturb iteration; only VALUES are replaced
-        // (no keys added/removed), mirroring `applyDecay`.
+        // Snapshot keys before replacing values so iteration cannot change under mutation.
         for key in Array(nodesByKey.keys) {
             guard var node = nodesByKey[key] else { continue }
             let age = now.timeIntervalSince(node.lastActivatedAt)
@@ -317,8 +268,7 @@ struct ContinuityField: Sendable {
         .sorted(by: Self.snapshotSort)
     }
 
-    /// Record an accepted event key and evict the oldest batch once the ring is
-    /// over capacity. Must be called only for keys that were actually inserted.
+    /// Record an accepted event key and evict the oldest batch once the ring is over capacity. Must be called only for keys that were actually inserted.
     private mutating func rememberSeenEventKey(_ key: String) {
         seenEventKeyOrder.append(key)
         guard seenEventKeyOrder.count > Self.maximumSeenEventKeys else { return }
@@ -350,10 +300,8 @@ struct ContinuityField: Sendable {
                 turnKind: turnKind
             )
             nodesByKey[key] = node
-            // `lastActivatedAt` is semantic recency, not the decay checkpoint.
-            // SQLite's row `updated_at` is the exact instant the already-decayed
-            // value was materialized. Keeping the two separate prevents restore
-            // from applying the pre-checkpoint interval a second time.
+            // `lastActivatedAt` is semantic recency, not the decay checkpoint. SQLite's row `updated_at` is the exact instant the already-decayed value was
+            // materialized. Keeping the two separate prevents restore from applying the pre-checkpoint interval a second time.
             decayAnchorsByKey[key] = max(
                 node.lastActivatedAt,
                 decayAnchorsByID[node.id] ?? node.lastActivatedAt
@@ -367,8 +315,7 @@ struct ContinuityField: Sendable {
         enforceCapacity(configuration.maximumActiveNodes)
     }
 
-    /// Initial restoration may suspend while resident events are accepted.
-    /// Their values, decay checkpoints and replay guards take precedence.
+    /// Initial restoration may suspend while resident events are accepted. Their values, decay checkpoints and replay guards take precedence.
     mutating func mergeRestoredNodes(
         _ nodes: [CognitiveNode],
         decayAnchorsByID: [UUID: Date],
@@ -475,8 +422,7 @@ struct ContinuityField: Sendable {
                     let lhsLived = !nonLiveNodeKeys.contains(lhs.key)
                     let rhsLived = !nonLiveNodeKeys.contains(rhs.key)
                     if lhsLived != rhsLived {
-                        // Audit traffic yields before lived state regardless of its
-                        // importance, so a diagnostic burst cannot evict attention.
+                        // Audit traffic yields before lived state regardless of its importance, so a diagnostic burst cannot evict attention.
                         return !lhsLived
                     }
                 }
@@ -617,9 +563,7 @@ struct ContinuityField: Sendable {
     ) -> String {
         let base = "\(kind.rawValue)|\(subject.stableKey)"
         guard let turnKind, !turnKind.contributesToLivedState else { return base }
-        // Preserve the pre-existing key space for lived state. Only diagnostic
-        // traffic receives a partition suffix, so it cannot reactivate, rewrite,
-        // or demote a live/system node that happens to share the same subject.
+        // Partition diagnostic keys so shared subjects cannot rewrite, reactivate or demote lived nodes.
         return "\(base)|turnKind:\(turnKind.rawValue)"
     }
 
@@ -708,7 +652,7 @@ struct ContinuityField: Sendable {
             "source",
             "toolName",
             "event_class",
-            // The Sound rut detector's view of a long reply's sign-off.
+            // Retain reply tails so rut detection can inspect sign-offs beyond the summary bound.
             "replyCharacterCount",
             "replyTail",
         ]

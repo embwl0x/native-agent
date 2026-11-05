@@ -1,12 +1,12 @@
 import Foundation
 import Synchronization
 import ChatTurnContracts
+import NativeAgentCore
 
 // Blueprint: | `MemoryV2+RecallQueryExpansion.swift` | `MemoryRecallQueryExpansion`: persona/user name-aware first-person recall rewrites |
 
-/// English pronoun expansion with explicit conversational roles. Stored facts
-/// name people in third person; recall keeps both the words and their named
-/// reading. This is an English retrieval aid, not language-independent parsing.
+/// English pronoun expansion with explicit conversational roles. Stored facts name people in third person; recall keeps both the words and their named reading.
+/// This is an English retrieval aid, not language-independent parsing.
 public enum MemoryRecallQueryExpansion {
     public struct Names: Sendable, Equatable {
         public var agent: String?
@@ -19,11 +19,10 @@ public enum MemoryRecallQueryExpansion {
         rewrite(text, speaker: names.agent, addressee: names.user)
     }
 
-    /// The same recorded origin stamped on the incoming turn distinguishes a
-    /// human's words (including a relay) from another agent's own words. Route
-    /// labels never make a relay's speaker the transporting agent.
-    public static func rewriteIncoming(_ text: String, names: Names) -> String? {
-        let origin = ChatPersistenceContext.originProvenance
+    /// The same recorded origin stamped on the incoming turn distinguishes a human's words (including a relay) from another agent's own words. Route labels
+    /// never make a relay's speaker the transporting agent.
+    public static func rewriteIncoming(_ text: String, names: Names, turn: Turn) -> String? {
+        let origin = turn.origin
         let recordedAgent = origin?.agent
         let speaker = origin?.authored == .agent
             ? recordedAgent.flatMap { $0 == "self" ? names.agent : $0 }
@@ -46,8 +45,7 @@ public enum MemoryRecallQueryExpansion {
         if let agent = speaker {
             swap("\\b(?:me|myself)\\b", agent)
             swap("\\b(?:my|mine)\\b", agent + "'s")
-            // "I'm" before "I": the word boundary after I sits before the
-            // apostrophe, so the bare rule would leave a name followed by 'm.
+            // Match contractions before bare pronouns so a word boundary cannot leave an apostrophe suffix after the name.
             swap("\\bI'm\\b", agent + " is", caseInsensitive: false)
             swap("\\bI\\b", agent, caseInsensitive: false)
         }
@@ -58,9 +56,7 @@ public enum MemoryRecallQueryExpansion {
         return out == text ? nil : out
     }
 
-    /// Agent and user names from `profile.json` beside the store, cached by
-    /// file modification date so the hot recall path pays one stat, not a
-    /// parse, per call.
+    /// Cache canonical profile names by modification date to avoid parsing on every recall.
     public static func names(storeDirectory: URL) throws -> Names {
         let url = storeDirectory.appendingPathComponent("profile.json")
         let modified: Date?

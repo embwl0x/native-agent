@@ -1,11 +1,8 @@
 import Foundation
 
-// Blueprint: | `GlobalHotkeyVoiceTurn.swift` | `GlobalHotkeyVoiceTurn`: push-to-talk authorization, capture and final speech result through the shared Mac send boundary |
+// Blueprint: | `GlobalHotkeyVoiceTurn.swift` | `GlobalHotkeyVoiceTurn`; Once-only push-to-talk through Mac send |
 
-/// Owns one global-hotkey push-to-talk turn from authorization through the
-/// same `AppModel.sendChat` boundary used by the visible composer. The Carbon
-/// callbacks are intentionally thin: a second release, a release before TCC
-/// resolves, or an unavailable capture can never manufacture a text turn.
+/// Use the composer's send boundary; thin Carbon callbacks cannot turn duplicate releases or unavailable capture into text turns.
 @MainActor
 public final class GlobalHotkeyVoiceTurn {
     public enum Outcome: Equatable {
@@ -22,7 +19,7 @@ public final class GlobalHotkeyVoiceTurn {
 
     private let requestPermission: () async -> VoiceInputPermissionResult
     private let isVoiceHoldCurrent: () -> Bool
-    /// Returns a visible reason when the audio engine cannot actually begin.
+    /// Report why capture cannot begin instead of claiming listening started.
     private let beginCapture: () -> String?
     private let stopCapture: () async -> VoiceInputStopResult
     private let discardCapture: () -> Void
@@ -55,7 +52,6 @@ public final class GlobalHotkeyVoiceTurn {
         self.reportRejectedTurn = reportRejectedTurn
     }
 
-    /// Called only after the press state has crossed the hold threshold.
     public func beginVoiceTurn() async -> Outcome {
         guard isVoiceHoldCurrent() else { return .releasedBeforeCapture }
         // `stopListening` waits for the recognizer's final result. A fresh
@@ -87,8 +83,7 @@ public final class GlobalHotkeyVoiceTurn {
         return .listening
     }
 
-    /// Finishes exactly one capture. A duplicate Carbon key-up is harmless;
-    /// it cannot append an orphaned duplicate message to the conversation.
+    /// Finish each capture once so duplicate key-up cannot append a second message.
     public func endVoiceTurn() async -> Outcome {
         guard captureActive else { return .noActiveCapture }
         captureActive = false

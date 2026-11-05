@@ -7,22 +7,18 @@ import PersistenceCore
 
 // Save remains unverified until the user explicitly runs a successful Test Connection.
 enum ProviderCredentialVerification: Equatable {
-    /// Nothing written or tested in this sheet session.
     case idle
-    /// Credential removed or confirmed unavailable.
     case disconnected
-    /// Credential written to disk, never checked against the service.
+    /// Disk presence alone does not verify credentials against the service.
     case savedUnverified
     /// A saved credential without a live probe (`tested:false`) is unverified, not failed.
     case savedNoProbe
     /// The attempt cannot attest the credential saved when it finished.
     case unboundCheck
-    /// Test Connection came back OK.
     case verified
-    /// Test Connection ran and did not come back OK.
     case verificationFailed
 
-    /// Save only ever means "written to disk".
+    /// Saving attests only to persistence.
     static func afterSave() -> ProviderCredentialVerification { .savedUnverified }
 
     /// Every failed attempt reports failure; verification needs a bound live probe.
@@ -36,7 +32,7 @@ enum ProviderCredentialVerification: Equatable {
         return credentialReady ? .savedNoProbe : .disconnected
     }
 
-    /// Clearing credentials drops any earlier claim.
+    /// Removing credentials invalidates prior verification.
     static func afterClear() -> ProviderCredentialVerification { .disconnected }
 
     /// Provider notes may add detail, never verification.
@@ -62,7 +58,7 @@ enum ProviderCredentialVerification: Equatable {
         return base.isEmpty ? note : "\(base) \(note)"
     }
 
-    /// Override file-presence readiness until the key is tested.
+    /// File presence cannot claim readiness before a live probe.
     var badge: (text: String, status: String)? {
         switch self {
         case .idle: return nil
@@ -133,7 +129,6 @@ struct ProviderConfigSheet: View {
     @State private var statusText = ""
     @State private var showRemoveCredentialsConfirm = false
     @State private var showDiscardKeyConfirm = false
-    /// Live verification is independent of file-presence readiness.
     @State private var verification: ProviderCredentialVerification = .idle
 
     private var authModePickerState: ProvidersFacade.AuthModePickerState {
@@ -167,7 +162,6 @@ struct ProviderConfigSheet: View {
                     Text(provider.display_name)
                         .font(ShellType.title)
                         .foregroundStyle(NativeAgentShell.text)
-                    // An unverified save cannot claim readiness.
                     if let badge = verification.badge {
                         ProviderStatusWord(text: badge.text, kind: badge.status)
                     } else {
@@ -231,7 +225,6 @@ struct ProviderConfigSheet: View {
                         .accessibilityLabel("The saved sign-in method \(unresolved) is no longer offered.")
                     }
 
-                    // API Key input (shown when api_key mode or provider only supports api_key)
                     if authMode == "api_key" {
                         AdvancedSection(title: "Key", card: .bare) {
                             ProviderCard {
@@ -280,7 +273,10 @@ struct ProviderConfigSheet: View {
                                     .pickerStyle(.menu)
                                     .labelsHidden()
                                     .font(ShellType.label)
-                                    ProviderNote(text: "This model is used wherever this provider is selected, unless you choose a different model for that use. You can make those choices on the Providers page.")
+                                    ProviderNote(text: """
+                                        This model is used wherever this provider is selected, unless you choose a different model for that use. You can \
+                                        make those choices on the Providers page.
+                                        """)
                                     if let message = modelPickerPresentation.message {
                                         ProviderNote(text: message, color: NativeAgentShell.trouble)
                                     }
@@ -407,7 +403,7 @@ struct ProviderConfigSheet: View {
                 },
                 failure: { error, action in appModel.setFailureStatus(error, action: action) }
             )
-            // A saved credential invalidates earlier verification.
+            // Earlier verification cannot attest newly saved credentials.
             if authMode == savedAuthMode, selectedModel == submittedModel { clearDraft() }
             verification = .afterSave()
             testResult = nil
@@ -499,7 +495,6 @@ struct ProviderConfigSheet: View {
         }
     }
 
-    /// Capabilities use calm or quiet text without a plate.
     @ViewBuilder
     private func capabilityPill(_ label: String, ok: Bool) -> some View {
         Text(label)

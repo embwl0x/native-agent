@@ -45,7 +45,7 @@ loop never parks for handback: they decides whether to wait, answer or stop.
 Under Full Mac their next action can reacquire control; otherwise the person's
 composer handoff grants control. Shotgun Resume grants control and sends
 “Mac control has returned; continue from the recorded results” through the
-ordinary session Send/queue path, including after the refused turn has ended.
+ordinary session Send path, including after the refused turn has ended.
 Stop still cancels the driving turn and releases held input.
 
 ### 2. Progress
@@ -84,6 +84,21 @@ Defaults are 900 seconds for interactive work and 3,900 for unattended work;
 an integer `timeout_seconds` is clamped to 30–3,600 seconds plus a 30-second
 cleanup margin. Tool-specific defaults can differ. The deadline bounds time without
 progress: a part that carries itself (`{again: input}`) renews it with every run.
+The chain is stored only on `ChatToolInvocation`; `ChatTurnWork.deadlines`
+and `AppActionExecution.deadlines` read and refine it, and the app execution's
+invocation is a view of its held work. Receiving a nested invocation therefore
+replaces the chain seen by every wait and progress callback in that operation;
+the work's invocation projection never overwrites it from a second copy.
+The projection also leaves `waitDeadline` unchanged: that independently supplied
+absolute wait budget is never synthesized from a pausable, renewable ceiling.
+The live `TurnDeadline` owns enclosing expiry and cancellation; Mac and fetch
+owners retain their own operation and transport limits.
+Ability management receives the caller's whole `Parts.Invocation`, including
+its ceilings, progress callback and preview state, through both action and
+preflight paths. Missing ceilings mean no enclosing bound, never a new timeout
+or a verdict about completion. Human waits pause active-work ceilings until
+the person answers or the wait ends; Stop and enclosing wall-clock limits
+still apply. Missing answers cannot count as approval or completion.
 Expansion's speculative delivery instead uses a wall-clock ceiling: progress
 and a person's wait cannot renew or pause the bound on the original result.
 
@@ -177,6 +192,9 @@ a successful reply.
 Anthropic's event consumer owns frame validation, timing, text/thinking liveness,
 usage and terminal receipts for both native-tool and OAuth text-marker streams;
 native signed-thinking replay and tool commitment remain payload handling.
+A call's input as it streams is movement the person sees, never a cut or a
+deadline; [the anatomy](ANATOMY_OF_A_TURN.md#5-the-model-answers-or-requests-a-tool)
+owns how it reaches the working card.
 
 `ProviderRouting/LLMClient+Real.swift` wraps streams with the configured
 per-call guard. Its whole-reply completion uses that same guarded operation
@@ -212,7 +230,7 @@ before persistence. Existing retained files are not rewritten by this change.
 `ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` owns the loop,
 including native-tool and text-marker protocols. One `TurnObservation` owns
 the model's next-round feedback for a limit, stream cut, correctness boundary,
-malformed call, empty reply, refusal, unwritten working notes, or full context.
+malformed call, empty reply, refusal or full context.
 No vocabulary of sentences decides that a reply is unfinished. It preserves kept prose and appends a user text block alongside the
 round's tool results, or a standalone user message when there were no results.
 `turn.observation` records the same feedback on both protocols.
@@ -233,12 +251,9 @@ an Error wrapper. Cancellation stays `CancellationError`; provider diagnostics
 keep their type and remedy. Incomplete text is never admitted as successful input.
 The `llm.reply.partial` receipt retains credential-redacted output under the
 trace owner's payload bounds and the selected data root, including after Stop;
-explicit preview generation emits no receipt. Prompt-only swarm workers and
-synthesis also retain the output in their existing bounded result fields,
-including when their deadline cancels the call and awaits settlement.
+explicit preview generation emits no receipt.
 An output-limit partial withholds that reply's calls and carries
-`outputLengthLimit(partial:)`, including for in-turn compaction; repair and
-classification still read that original error. The loop retains yielded
+`outputLengthLimit(partial:)`; repair and classification still read that original error. The loop retains yielded
 prose, or that prefix if nothing was yielded,
 discards that reply's calls and continues. Retained answer text stays outside
 the pre-tool commentary prefix, so every surface delivers it as answer text.
@@ -272,210 +287,15 @@ the accepted turn runs on and lands in its transcript.
 Dispatch interruption follows the [tool receipt contract](TOOL_LOADING.md).
 A late tool result cannot replace the dispatch race's first terminal outcome.
 
-### 8. Context compaction
+### 8. Conversation tail and result pointers
 
-`ChatTurnRuntime/IntraTurnContextCompaction.swift` bounds the working
-conversation: it stubs older tool-result bodies and folds earlier rounds into
-working notes. It can run proactively before a provider call or reactively
-after a context-overflow refusal. Reactive compaction has no attempt cap.
-When nothing remains to fold, the refusal is their turn part's
-`provider_failure` input like any other. After a successful trim, a
-`contextFull` observation asks the model to finish from what it has. Working
-notes that cannot be written leave their span as it was and nothing else is
-trimmed in their place; the receipt (a route that is wrong owes its repair
-through `ProviderFailure`) is their input: a note in the conversation, or, when
-an overflow has nothing else to trim, their part's `provider_failure`. The seeded prefix remains
-protected.
-Trace `context.intraTurnCompaction` records the mode, trigger and size change;
-the status notice is `context_compaction`.
-
-Persisted history has a separate owner:
-`ChatSessionWork/ChatSessionAutocompactor.swift`. The window is the selected
-provider/model's detected catalog window, limited by a Custom cap in Settings.
-Settings > Context window > **Compact at N% of the model's window** sets one
-whole percentage for every model (30–95%, default 85%), stored as
-`nativeagent.contextWindowCompactionPercent`. An invalid saved percentage is a
-visible configuration failure. The effective foreground trigger is the smaller of that percentage of the
-detected or Custom-capped window and the window minus the output allowance
-the selected request adapter will actually send. Background aging uses that
-same trigger. The ring displays this effective trigger; `setting.get` also
-reports the configured percentage and the adapter-owned output allowance.
-The agent can set the same value through
-`setting.set`, setting `chat.compaction_percent`, numeric value 30–95, with the
-person's request as `because`; increases and decreases are both allowed.
-`setting.get` reports that percentage, detected/effective windows and trigger tokens.
-Aging distills with the transcript unchanged and unlocked. If the
-backstop replaces its source meanwhile, the turn waits for the foreground
-pending recollection and aging discards its stale result at the prefix check.
-Neither lane waits for the other's model call under the transcript lock.
-
-The ring, trigger and aging share `SessionContextMeasurement`. The numerator
-is the final message/body character count returned by the request builder;
-the calibration is the last matching provider request's actual characters
-divided by that same receipt's input tokens. There is no reconstructed
-transcript baseline, assistant exclusion list or subtraction of stored rows.
-The resident fits after their turn part has composed its actual system and tools,
-and after opening additions have joined the request. Helpers fit their actual
-instruction/history request through the same seeding owner. The completed fold
-rebuilds that request through its pure replay/seed builder before checking target.
-Sizing never consumes contact exchanges, builds a
-digest or calls a model.
-
-The successful conversation receipt keeps actual `requestCharacters` and a
-payload-free `requestPlan` (encoded as Data): the request builder's selectors,
-current user-row reference and directly measured system/schema/addition sizes.
-Exact current words and complete context remain on their existing
-`sentTurnContext` user-row metadata. Manual compaction and aging use that same
-plan and the same receipt, without preparing a synthetic turn or rerunning their
-turn part. Secondary calls and previews cannot replace the conversation receipt.
-Regenerate's question cut belongs solely to the request builder, so its old
-answer and tool receipts are omitted together; answer-only ingress resolves
-its saved question there too. Those cuts apply only while building that
-replacement request. Saved-plan sizing for manual compaction and aging
-clears the completed turn's run exclusion and question cut: its current answer
-and replayable tool receipts join history, and its saved user words replay once
-from their row. The context state is seeded without repeating those words;
-a changed replay window can still require its full keyframe. Empty text, stripped
-tool markers and bounded receipt projections count as the builder actually emits them.
-Before a usable matching receipt and request plan exist, including a provider/model
-switch, manual compaction and aging use `rendered_history_estimate`
-at 3.5 characters/token. Manual compaction does not require a completed turn on
-the selected route to select source, but cannot claim its target verified
-without built-request evidence. Automatic aging waits for built-request evidence instead
-of treating that history-only estimate as a trigger. Damaged receipts or missing delivery evidence required by
-an existing plan report unavailable; absence cannot prove a target.
-The ring separately reports the last matching provider receipt's observed input
-usage and detected window. Missing receipt/window measurements are unavailable;
-estimated transcript/prompt shares never stand in for measured token counts.
-Prompt assembly retains its separate
-3.2-character safety factor. Manual compaction resolves a helper through its
-checked helper model choice even when its caller supplies the global Chat pick.
-Every helper run binds that choice's provider and model before pending
-compaction preparation reads its window, including direct and scheduled runs.
-Its full definition-owned output budget binds before fitting as well. Manual
-folds bind the target conversation's checked route, effort and helper budget;
-they do not borrow another conversation's cap. Background helper aging uses
-that helper's full next-turn budget, rather than the completed turn's depleted
-remainder. These bindings feed the request adapter's one output-allowance reader.
-
-Both lanes pursue a measured input target of
-`min(configured percent × window × 55/85, window − output allowance)`, including
-retained recollections and other provider input, rather than a fixed row count
-or a raw-only allowance. For 200k Claude with `max_tokens: 32768`, the default
-trigger is `min(170000, 167232) = 167232` (83.616%) and the target is
-`min(110000, 167232) = 110000`. Thus 169000 input plus 32768 output (201768)
-folds before send or refuses if it still cannot fit. For a 500k Sol OAuth
-window, its adapter sends no output-cap field (the endpoint rejects
-`max_output_tokens`), so no explicit wire allowance is reserved: the default
-trigger is 425000 and target 275000. A bound OpenAI API request instead
-reserves its actual remaining turn cap. For 1M Opus at medium effort, the
-adapter sends 32768: trigger `min(850000, 967232) = 850000`, target
-`min(550000, 967232) = 550000`; at high/max effort its 65536 allowance leaves
-934464 input room and the same default trigger/target. A 128k OpenRouter
-request sends no output-cap field: trigger 108800, target 70400.
-These are examples of admitted effective windows, not model-name overrides.
-Custom caps and other configured percentages use the same two minimums.
-No explicit output-cap field means no numeric cap in the request; it is not
-knowledge of the provider's eventual generated output or a guessed reserve.
-Selection reserves
-the distiller's one-fifth ask, then measures the actual completed fold and
-continues if needed. The distiller's length handling is unchanged. Raw history
-is reduced before recollection-only rollups. Whole user turns, live cards and
-the dream boundary remain protected; a target blocked by these constraints or
-a fold that makes no measured progress reports its cause and stops, rather
-than claiming completion or looping. A manual fold already below target can
-still fold half its smaller raw stretch. `context.measurement` records the
-source, ratio, window, trigger and target; `context.compact.target` records
-`reached`, `continuing` or `no_progress` after completed distillation.
-
-An ordinary fold creates and verifies a backup, retains earlier recollection
-blocks verbatim (including their original line bytes), pending cards and
-recent rows, and appends new blocks after the earlier blocks in source order.
-The compactor carries its selected source into `ChatCompactionDistiller`,
-recovering pending source once from the verified backup and recorded retention
-metadata. The distiller receives only the newly folded stretch; no prior
-stored recollection is merged into every output. Its `+SourceComposition.swift`
-extension splits that stretch into consecutive chunks of at most 32,000 rendered
-source characters (roughly 8k prose tokens; smaller on a constrained model window).
-Chunk planning uses overflow-safe source totals and ceiling division; every
-selected row still enters the chunks in order.
-Each block targets one fifth of its own chunk: up to 6,400 characters, with
-a proportional one-third cap of at most 10,666 and a one-tenth minimum (models miss an exact length; a near miss must not fail the fold).
-The allowance scales down with smaller chunks; a rich source cannot pass as
-a few headline sentences. Block-local receipt notes and a preserved-card
-clause sit outside that body allowance. Each block records its own coverage
-and continuity provenance. The latest tool-receipt pointer belongs to that
-block's source, never a changing shared header.
-First-person chronology, meaningful quotes, people, decisions and their
-reasons, promises, open threads, emotional continuity, corrections and action
-receipts remain the distiller's quality rules. A wide row is split without
-clipping its tail; its original coverage/provenance follows each piece.
-Whole-row preference merges a tail below half the nominal chunk budget with
-its neighbour when the source ceiling allows, preserving split-row boundaries.
-Quotes remain verbatim but their count is
-limited by available source lines and the block allowance; genuinely tiny
-sources can use fewer quotes or paraphrase within their proportional cap.
-
-All chunks distill concurrently, with no serial interim rewrite. Results
-are ordered before one durable transcript replacement; a failed or empty chunk
-fails the entire fold visibly, with no partial blocks stored. A non-empty block
-is retained at its actual length; the proportional allowance is the prompt's
-ask, not a rejection gate. Once every valid block has returned, `settle` commits it,
-publishes the transcript change and records its terminal trace even after Stop;
-the locked destination/prefix checks still reject stale results. Stop before a
-complete fold leaves its pending source intact. At 48–55 output tokens/second, a full
-chunk's ~1,600-token target takes about 29–34 seconds of output, or 49–56
-seconds at its ~2,667-token cap (10,666 characters at roughly four characters
-per token). Concurrent wall time follows the slowest chunk plus commit
-overhead, rather than the sum of chunk times. These output-rate estimates are
-not installed measurements or deadlines:
-provider queueing, reasoning, prefill and concurrency limits can extend it.
-The existing 300-second aging cancellation deadline remains.
-
-At a needed compaction pass, earlier blocks can themselves fold when their
-leading replay-visible run exceeds 10% of the effective context window and
-8,000 characters. Raw folds and rollups select from the same replay-visible
-rows, then map the cut to the stored transcript, preserving hidden rows wherever
-they occur. Hidden raw rows cannot block access to later recollections or enter
-the distillation source; the full transcript still owns live-row barriers.
-Each selected group must exceed 8,000 characters; it uses the same consecutive
-chunks, proportional detail and atomic ordered commit, without crossing the
-dream high-water mark. This is the rare exception to append-only recollection,
-and raw newer turns stay outside that individual rollup. A rollup is only one
-step of the target pursuit; it never ends it while the request remains above target.
-Existing on-disk recollections need no migration and keep their 40,000-character
-history read allowance; an existing pending fold still reads its retained
-backup, including prior recollections it already replaced.
-
-A failed foreground distillation leaves its block pending, unrendered, with
-the original turns in the backup and its repair owed, and refuses the turn
-with `recollection_unavailable` before provider dispatch. A failed aging pass
-leaves its source in the live transcript. Prompt history retains every
-recollection in transcript order and replays the whole current transcript.
-History leaves replay only through the measured fold into recollection.
-There is no character-budget or row-count head movement, no separate 128k
-reserve ceiling, and no prefix-window cursor. Existing local
-`chat/prefix_window/*.json` files are untouched and unused. Per-row caps still
-bound pathological rows. See the
-[prompt layout](ANATOMY_OF_A_TURN.md#how-prompt-caching-reduces-token-cost).
-Resident and helper preparation propagate compaction and contact-history read failure
-before calling its model. Damaged UTF-8/JSONL is unavailable history; it is never
-replacement text or a successful empty conversation.
-After fitting, and again before each resident/helper provider round (including
-late additions and tool feedback), `context.request.fit` records the final
-request's measured input tokens, adapter-owned output allowance and window.
-Admission requires input plus output allowance at or below the window (checked
-for integer overflow). An over-window result is a named
-`context_window_exceeded` refusal before send, never a truncated replay.
-The token count remains receipt-calibrated estimation, not a local tokenizer
-or a guarantee of the provider's eventual token count; the provider retains
-its own context/output admission. Missing window or unreadable receipt evidence
-refuses preparation. A missing receipt uses the explicitly estimated ratio
-against the actual built request at the live admission check.
-If the provider itself still refuses a conversation's context window, that
-refusal is terminal for the request under the same named code; the turn cannot
-enter the sessionless overflow-trimming path around the measured fit.
-Compaction is bounded summarization, not lossless retention.
+The [conversation context contract](conversation-context-history.md) owns the
+verbatim tail, model-default window, stateless whole-turn half-budget jumps and oldest
+result-body pointers. The transcript is never replaced with generated text.
+Before every resident or helper round, `context.request.fit` records measured
+input, output allowance and the model window. A request that remains too large
+is refused as `context_window_exceeded`; a provider's later overflow refusal
+reports its cause without an alternate summary pass.
 
 ### 9. Process continuation
 
@@ -490,7 +310,7 @@ including their final words for a resume to settle with. `runningStep` is a
 durable receipts update that presence and the turn's steering peers together.
 Receipts retain their results' labelled sources (provenance); a checkpoint
 keeps steering peers and the person's answer so a resume uses the same card.
-It keeps identity, input, envelope, reply route, kept prose, working notes and replay evidence, never the
+It keeps identity, input, envelope, reply route, kept prose and replay evidence, never the
 provider message array. Input attachment bytes stay in `chat/attachments/`;
 their existing transcript metadata supplies the saved paths.
 
@@ -515,12 +335,11 @@ separately from a witnessed byte-count or digest mismatch.
 `ChatOrchestration+Continuation.swift` re-enters the shared loop under the old
 runId and turnId with `suppressUserAppend: true`. It rebuilds the current turn
 from the durable user row and the same tool-receipt projection later turns use,
-restores working notes and kept prose, and applies `TurnObservation.restarted`.
+restores kept prose, and applies `TurnObservation.restarted`.
 Saved dispatch receipts also rebuild delivery artifacts; generated-image paths
 survive transcript body clipping. Mac recovery connects the existing stream
 adapter and lifecycle intake under the saved identity. Once that turn settles,
-its reservation is released and Send-next drains through normal queue admission,
-which keeps stopped or paused queues held.
+its reservation is released and the next arrival in line is admitted.
 An unrecorded effect is unknown, not permission to repeat it; the restart
 observation names each call their part's log shows started without a receipt
 (tool and redacted arguments), and an attached Desk journal admits the same
@@ -607,6 +426,9 @@ and this sweep cadence imposes no clock limit on a running turn.
 
 Bridge deadlines: connection 30s; enqueue acknowledgement 30s; message wait
 600s; direct tool call 300s (bridge `/tool` endpoint only); reads 60s.
+Direct tool ingress passes the 300-second active-work chain to its
+operation-aware dispatcher, so nested human waits and part progress act on
+that same ceiling rather than an empty chain.
 `Agents/ClaudeBridgeMessageRuntime.swift` releases either enqueue or message wait
 with HTTP 202 `still_working`, retaining `task_id` without cancelling admission
 or execution. A late durable enqueue continues under that same task/run identity.
@@ -626,13 +448,11 @@ message identity.
 
 ## Reading a stopped turn
 
-`TurnTrace/TurnTracePersistLane.swift` writes `turn_traces/<yyyy-MM-dd>.jsonl` under
-the data root. Group events by `turnId`, then read `kind`, `ts`, `surface`
-and the terminal payload together:
-
-Date-based trace retention deletes only regular files, checking entry type
-without following symlinks before locking and again before deletion. Unsupported
-entries and paths outside the data root are preserved and reported as errors.
+`TurnTrace/TurnTracePersistLane.swift` writes a turn's events as details in the
+record (`experiences/experiences.sqlite`, table `detail`, subject = the turn id).
+Read a turn's details by its id, then read `kind`, `ts`, `surface` and the
+terminal payload together. The record forgets details after two weeks
+([Storage](EXPERIENCE.md#storage)); there is no separate trace retention.
 
 Trace token and duration measurements accept nonnegative integers and use
 checked accumulation. Invalid or unrepresentable totals report damaged evidence;
@@ -642,11 +462,11 @@ turn's first row. Inspector call titles and grouping use the same checked
 never zero. A damaged count also marks its call row failed with its measurement
 error. Statistics fail explicitly rather than returning wrapped totals.
 
-Usage totals read the same evidence as model-call statistics: canonical daily
-turn traces plus standalone `traces/events.jsonl` receipts, as recorded. The
-reader neither infers duplicate identities from timestamps nor merges fields
-between feeds. Usage preserves malformed-row, partial-line and turn-read coverage;
-damaged coverage returns `incomplete` with the recorded totals.
+Usage totals read the same evidence as model-call statistics: the record's
+`llm.call` details, turn-bound and standalone, as recorded. The reader neither
+infers duplicate identities from timestamps nor merges fields between details.
+Unreadable details or a read that reached its bound return `incomplete` with the
+recorded totals.
 Model-call statistics derive heavy-turn titles and dispatch descriptions from
 that first week's snapshot, including `work.identified`, without rereading days.
 
@@ -662,7 +482,7 @@ propagate their own errors to their caller.
 | Evidence | What to inspect |
 |---|---|
 | `llm.call` | Call status and retained error detail. Exhausted wire recovery includes the aggregate diagnostic's tries and elapsed time; no per-attempt delay history is emitted. Missing call evidence does not prove no retry occurred. |
-| `context.intraTurnCompaction` | Trigger, mode and before/after size. |
+| `context.tail.cut` / `context.tool_result.pointer` | Whole-turn cut or retained result-body pointers, with measured before/after size. |
 | `turn.cancelled` | The `where` field and any interrupted action's effects. |
 | `turn.failed` or `turn.terminal` | The recorded outcome and reason. |
 | Historical terminal from `terminal_reconciliation` | An older build recorded that a previous process left the turn unfinished; current reconciliation records recovery obligations. |

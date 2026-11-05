@@ -1,11 +1,8 @@
-// Pages share StatusConnectionPresentation's freshness policy through
-// AlivePage(freshnessGroup:) or AliveFreshnessNote(group:).
 import SwiftUI
 import NativeAgentShared
 
 /// A Mac-reported group rebuild failure marks its rows stale regardless of sync age.
 enum MacSnapshotGroupStaleness {
-    /// The Mac's reason for this screen's group, or nil when the group built.
     static func reason(in markers: [String: String], group: String?) -> String? {
         guard let group, !group.isEmpty, let raw = markers[group] else { return nil }
         let reason = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -13,9 +10,7 @@ enum MacSnapshotGroupStaleness {
     }
 }
 
-/// The page note's words; StatusConnectionPresentation owns classification.
 enum MacSnapshotPageFreshness {
-    /// "12 minutes", "2 hours", "3 days".
     static func spokenAge(_ interval: TimeInterval) -> String {
         guard interval.isFinite, let seconds = Int(exactly: max(0, interval).rounded(.towardZero)) else { return "an unknown interval" }
         if seconds < 60 { return AliveWords.count(seconds, "second") }
@@ -34,24 +29,18 @@ enum MacSnapshotPageFreshness {
     }
 }
 
-/// Renders nothing while the snapshot is fresh; a quiet honest note
-/// otherwise. Time-based text is re-evaluated on a slow timeline so "4m old"
-/// does not itself go stale on screen.
+/// Use a slow timeline so stale-age wording stays accurate without frequent redraws.
 struct MacSnapshotFreshnessBadge: View {
     @State private var showsConnection = false
     let lastSyncedAt: Date?
-    /// The Mac's reason this screen's snapshot group was skipped, if it was.
     var staleGroupReason: String? = nil
 
     var body: some View {
         TimelineView(MacSnapshotFreshnessSchedule(lastSyncedAt: lastSyncedAt, fixed: staleGroupReason != nil)) { context in
             let state = StatusConnectionPresentation.syncState(lastSyncedAt: lastSyncedAt, now: context.date)
-            // A named group failure outranks age: a Mac that published five
-            // seconds ago can still have failed to rebuild THIS group.
+            // A named group rebuild failure outranks sync age; a recent publication can still contain stale group rows.
             let title = staleGroupReason ?? MacSnapshotPageFreshness.line(for: state)
             if staleGroupReason != nil || StatusConnectionPresentation.needsAttention(state) {
-                // Said once under the page's header in secondary text: a
-                // note, not a band.
                 AliveStatusNote(text: title, actionTitle: staleGroupReason == nil ? nil : "Connection",
                                 action: { showsConnection = true })
                     .accessibilityElement(children: staleGroupReason == nil ? .combine : .contain)

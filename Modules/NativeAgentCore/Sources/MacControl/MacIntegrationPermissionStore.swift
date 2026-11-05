@@ -3,12 +3,11 @@ import Darwin
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacIntegrationPermissionStore.swift` | Saved integration consent under one checked, flocked authority and effective-entry decoder for snapshots/mutations; present entries require every supported axis; failures throw and explicit operator off wins over Full Mac |
+// Blueprint: | `MacIntegrationPermissionStore.swift` | Checked, flocked consent; complete supported axes; explicit OFF fences Full Mac |
 
 // MARK: - Permission store
 
-/// Disk-backed, flocked permission store. Unset integrations use shipped defaults;
-/// present entries contain every supported axis. Checked failures never mean OFF.
+/// Unset integrations use shipped defaults; present entries must contain every supported axis, and read failures never mean OFF.
 public actor MacIntegrationPermissionStore {
     public static let shared = MacIntegrationPermissionStore()
     public static let didChange = Notification.Name("NativeAgent.SystemPermissionPreflight.permissionDidChange")
@@ -18,27 +17,34 @@ public actor MacIntegrationPermissionStore {
         public let readiness: MacIntegrationPermissionReadiness
 
         public func allows(_ integrationId: String, mode: MacIntegrationPermissionMode) -> Bool {
+            // An app with no read switch (the Scheduler) has nothing that refuses a read.
+            if mode == .read, !MacIntegrationID.supportsRead(integrationId) { return true }
             guard let permission = permissions[integrationId],
                   (mode == .read ? MacIntegrationID.supportsRead(integrationId) : MacIntegrationID.supportsWrite(integrationId)),
                   !(mode == .read ? readiness.operatorReadOff : readiness.operatorWriteOff).contains(integrationId) else { return false }
-            // The owner's switches are the fence inside Full Mac (User 10-31, 11-01): Full Mac never widens them.
+            // The owner’s switches fence Full Mac; Full Mac never widens them.
             return mode == .read ? permission.read : permission.write
+        }
+
+        /// This snapshot with one stored write applied, for showing until the next read confirms it.
+        public func with(_ integrationId: String, _ permission: MacIntegrationPermission) -> Snapshot {
+            var permissions = permissions
+            permissions[integrationId] = permission
+            return Snapshot(permissions: permissions, readiness: readiness)
         }
     }
 
     private let dataRoot: URL
 
-    /// Public default init — uses PersistenceCore.defaultDataRoot().
     public init() {
         self.dataRoot = defaultDataRoot()
     }
 
-    /// Pin the authority owner to the engine's data root.
+    /// Authority must use the engine’s data root.
     public init(dataRoot: URL) {
         self.dataRoot = dataRoot
     }
 
-    /// On-disk path: `<dataRoot>/security/mac_integration_permissions.json`.
     private nonisolated var storePath: URL {
         dataRoot
             .appendingPathComponent("security", isDirectory: true)
@@ -47,12 +53,11 @@ public actor MacIntegrationPermissionStore {
 
     // MARK: - Read
 
-    /// One checked read for environment presentation; no migration write, permission request, OS probe, or authority change is performed here.
+    /// Environment presentation reads authority without mutating it or probing OS permissions.
     public func readinessChecked() async throws -> MacIntegrationPermissionReadiness {
         try await snapshotChecked().readiness
     }
 
-    /// Returns the current effective permission map: stored values merged on top of defaults for any unset key. Every entry in `MacIntegrationID.all` is present in the returned dict.
     public func currentChecked() async throws -> [String: MacIntegrationPermission] {
         try await snapshotChecked().permissions
     }
@@ -61,8 +66,7 @@ public actor MacIntegrationPermissionStore {
         try snapshotNowChecked()
     }
 
-    /// Effect boundaries cannot suspend between resolving a target and posting.
-    /// This is the same checked disk reader as the actor API, never a cached grant.
+    /// Effect boundaries cannot suspend before posting; use the checked disk owner rather than a cached grant.
     public nonisolated func snapshotNowChecked() throws -> Snapshot {
         let raw = try Self.loadRawStoreChecked(at: storePath)
         let overrides = Self.operatorOverrides(in: raw)
@@ -76,8 +80,7 @@ public actor MacIntegrationPermissionStore {
             operatorWriteOff: Set(overrides.compactMap { $0.value["write"] == false ? $0.key : nil })))
     }
 
-    /// Hot-path gate. An explicit operator OFF wins over Full Mac; otherwise a valid saved preference or checked Full Mac admission permits the mode. Unsupported axes (e.g. `read` on `notify_mac`) ALWAYS return false — there is no concept
-    /// to grant.
+    /// Explicit OFF wins over Full Mac; unsupported axes can never be granted.
     public func allows(_ integrationId: String, mode: MacIntegrationPermissionMode) async throws -> Bool {
         do {
             return try await snapshotChecked().allows(integrationId, mode: mode)
@@ -90,7 +93,7 @@ public actor MacIntegrationPermissionStore {
 
     // MARK: - Write
 
-    /// Persist only the selected axis; the other axis and its operator override stay as freshly read under the authority file's lock.
+    /// Read under the authority lock so changing one axis preserves the other and its override.
     @discardableResult
     public func set(integrationId: String, read: Bool?, write: Bool?, onlyRemovingAxes: Bool = false) async throws -> MacIntegrationPermission {
         try await setWithReceipt(
@@ -104,10 +107,8 @@ public actor MacIntegrationPermissionStore {
         )
     }
 
-    /// One-generation permission mutation + provenance receipt. The receipt is embedded in the same atomic authority document, so receipt validation or persistence failure leaves the permission axes unchanged.  `onlyAddingAxes` makes the
-    /// write ADDITIVE: an axis passed `false` is left exactly as the store already has it instead of being cleared. The inline permission card asks for ONE axis — a refused file READ raises a read-only card — and the old replace-both write
-    /// then revoked the write grant the person had already given (and the mirror case revoked read). The merge happens inside the same lock as the read, so a concurrent grant on the other axis cannot be lost between them.
-    /// `onlyRemovingAxes` refuses any requested grant absent from the current effective axes under that same lock, including explicit operator OFFs.
+    /// Embed provenance and axes atomically so validation or persistence failures leave authority unchanged. Additive cards preserve unrequested axes under the
+    /// same lock; removals cannot grant an absent or explicitly disabled axis.
     @discardableResult
     public func setWithReceipt(
         integrationId: String,
@@ -147,8 +148,7 @@ public actor MacIntegrationPermissionStore {
 
         let path = storePath
         let permission = try await SwiftNativePersistenceCore.withFileLock(path) {
-            // Read-modify-write inside the lock so concurrent writers don't clobber each other's keys. Missing is the only bootstrap-empty case. Existing unreadable, malformed, or invalid authority bytes throw before this write so a toggle
-            // cannot erase the evidence and silently resurrect defaults for every sibling integration.
+            // Lock read-modify-write to preserve concurrent choices; only missing storage bootstraps, while damaged bytes remain intact.
             var dict = try Self.loadRawStoreChecked(at: path)
             let effectiveBefore = Self.effectiveEntry(integrationId, in: dict)
             var overrides = Self.operatorOverrides(in: dict)
@@ -162,7 +162,7 @@ public actor MacIntegrationPermissionStore {
                 }
                 guard gained.isEmpty else { throw MacIntegrationPermissionStoreError.wouldGainAxes(gained) }
             }
-            // Additive writes merge onto the generation just read, under this same lock, so the axis the card did not ask about survives.
+            // Merge under the read lock so unrequested axes survive concurrent grants.
             let clampedRead = onlyAddingAxes
                 ? (effectiveBefore.read || requestedRead == true)
                 : requestedRead ?? effectiveBefore.read
@@ -194,11 +194,10 @@ public actor MacIntegrationPermissionStore {
                             "Permission action id is already bound to a different mutation."]
                     )
                 }
-                // Signed inbox retries are idempotent and, critically, an old retried action may not revert a newer local choice.
+                // Idempotent signed retries must not undo newer local choices.
                 return effectiveBefore
             }
-            // Explicit human choices live with the canonical permission axes, independently of the bounded receipt journal. Permission cards only touch the axis they actually request. An agent may add an untouched default, but cannot undo
-            // a person's explicit OFF.
+            // Explicit human choices outlive the bounded receipt journal; agents cannot undo an explicit OFF.
             var integrationOverrides = overrides[integrationId] ?? [:]
             if provenance.kind == "agent" {
                 guard !(requestedRead == true && integrationOverrides["read"] == false),
@@ -219,7 +218,7 @@ public actor MacIntegrationPermissionStore {
             dict["_operatorOverrides"] = .object(overrides.mapValues { axes in
                 .object(axes.mapValues(JSONValue.bool))
             })
-            // Persist only the supported axes for this id (matches the contract: the file does not store an entry for an axis the integration doesn't have).
+            // Persist only supported axes so the authority shape cannot invent capabilities.
             var perEntry: [String: JSONValue] = [:]
             if MacIntegrationID.supportsRead(integrationId) {
                 perEntry["read"] = .bool(clampedRead)
@@ -288,7 +287,7 @@ public actor MacIntegrationPermissionStore {
             throw MacIntegrationPermissionStoreError.malformedStore
         }
 
-        // Authority metadata has an exact, supported per-axis Boolean shape. Malformed metadata cannot quietly fall back to Full Mac admission.
+        // Malformed per-axis authority metadata is unavailable, never permission through Full Mac.
         if let metadata = dict["_operatorOverrides"] {
             guard case .object(let integrations) = metadata else {
                 throw MacIntegrationPermissionStoreError.malformedStore
@@ -325,8 +324,7 @@ public actor MacIntegrationPermissionStore {
                       case .object(let after)? = object["after"],
                       case .bool(let afterRead)? = after["read"],
                       case .bool(let afterWrite)? = after["write"],
-                      // The same support clamps the writer applies: an axis the integration has no concept of is false on both sides of every receipt this store ever wrote, so a receipt claiming spotlight was granted WRITE is not one of
-                      // ours.
+                      // Clamp receipt axes exactly as the writer does so unsupported grants cannot validate as ours.
                       MacIntegrationID.supportsRead(integrationID)
                         || (!beforeRead && !afterRead),
                       MacIntegrationID.supportsWrite(integrationID)
@@ -337,7 +335,7 @@ public actor MacIntegrationPermissionStore {
                       case .string(let recordedAt)? = object["recordedAt"], !recordedAt.isEmpty else {
                     throw MacIntegrationPermissionStoreError.malformedStore
                 }
-                // A present null/nonstring identity is malformed, never absence.
+                // Present null or nonstring identity is malformed, never absent.
                 let clientID: String?
                 if let value = provenance["clientId"] {
                     guard case .string(let text) = value else {
@@ -352,8 +350,7 @@ public actor MacIntegrationPermissionStore {
             }
         }
 
-        // One document vocabulary; an unknown authority field is unavailable,
-        // never silently retained for a different build.
+        // Unknown authority fields are unavailable rather than retained for another build.
         let knownKeys = Set(MacIntegrationID.all).union(["_operatorOverrides", "_mutationReceipts"])
         guard Set(dict.keys).isSubset(of: knownKeys) else {
             throw MacIntegrationPermissionStoreError.malformedStore
@@ -381,8 +378,7 @@ public actor MacIntegrationPermissionStore {
         return dict
     }
 
-    /// Called only after the one schema validator. A missing integration is
-    /// untouched; a present entry has every supported Boolean axis.
+    /// Schema validation guarantees complete present entries; only missing integrations remain untouched.
     private nonisolated static func effectiveEntry(_ id: String, in raw: [String: JSONValue]) -> MacIntegrationPermission {
         let permission: MacIntegrationPermission
         if case .object(let entry)? = raw[id] {
@@ -407,6 +403,5 @@ public actor MacIntegrationPermissionStore {
         }
         return [:]
     }
-
 
 }

@@ -4,21 +4,16 @@ import Foundation
 
 // MARK: - Rollup shapes
 
-/// One bucket of time in the ASKING timezone.
-///
-/// Epoch-second bounds avoid storing day strings that depend on a timezone.
+/// Epoch-second bounds avoid persisting timezone-dependent day strings.
 public struct ActivityBucket: Sendable, Equatable {
     public let start: Double
     public let end: Double
     public let bundleId: String
     public let appName: String
-    /// Seconds of this app's span time that fall INSIDE this bucket.
     public let seconds: Double
-    /// Spans contributing to this bucket (a span split across two buckets
-    /// counts in both — it really was open in both).
+    /// A span crossing buckets counts in each because it was open in each.
     public let spanCount: Int
-    /// Events attributed to the part of each span inside this bucket, prorated
-    /// by duration. Fractional by construction; rounded only for display.
+    /// Prorated events remain fractional until display so bucket splits conserve their total.
     public let eventCount: Double
 
     public init(
@@ -35,19 +30,12 @@ public struct ActivityBucket: Sendable, Equatable {
     }
 }
 
-/// A bounded top-N result that says out loud what it dropped.
-///
-/// HONEST TRUNCATION: `rows` is never the whole story when `truncated` is true,
-/// and the caller (and the model reading the tool answer) is told exactly how
-/// many rows and how many seconds went missing. A silent cut here is how a
-/// "you spent 20 minutes in Mail" answer gets built out of a day that had six
-/// hours of other things in it.
+/// Report dropped rows and seconds so a bounded top-N result cannot masquerade as the whole history.
 public struct ActivityTopN: Sendable, Equatable {
     public let rows: [ActivityAppTotal]
     public let truncated: Bool
     public let droppedRowCount: Int
     public let droppedSeconds: Double
-    /// Total distinct apps before truncation.
     public let totalRowCount: Int
 
     public init(
@@ -81,7 +69,7 @@ public struct ActivityAppTotal: Sendable, Equatable {
     }
 }
 
-/// The whole answer to one question, hard-capped so it fits a context window.
+/// Cap the combined answer to fit the context window.
 public struct ActivityAnswerBundle: Sendable, Equatable {
     public let from: Double
     public let to: Double
@@ -90,7 +78,7 @@ public struct ActivityAnswerBundle: Sendable, Equatable {
     public let topApps: ActivityTopN
     public let buckets: [ActivityBucket]
     public let exemplars: [ActivitySpan]
-    /// Rows the cap removed, across every section. Reported, never silent.
+    /// Report removed rows across every section so truncation is visible.
     public let truncatedSections: [String]
 
     public init(
@@ -111,14 +99,8 @@ public struct ActivityAnswerBundle: Sendable, Equatable {
 
 // MARK: - The rollup tier
 
-/// W4 — the deterministic rollup tier. Pure SQL + pure Swift. ZERO inference,
-/// zero model calls, no materialized tables.
-///
-/// Buckets are computed HERE, at query time, in the CALLER'S timezone. The
-/// stored `tz_offset_min` is provenance only — "what offset was in force when
-/// this row was written" — and is never used to decide which day a span belongs
-/// to. That is what makes a DST day come out as 23 or 25 hours instead of a
-/// fixed 24, and what lets the same rows answer correctly from another timezone.
+/// Compute buckets at query time in the asking timezone, without inference or materialized tables.
+/// Stored offsets are provenance only; calendar boundaries preserve 23- and 25-hour DST days.
 public struct ActivityRollups: Sendable {
     public enum RollupError: Error, LocalizedError, Equatable {
         case sourceRowsExceeded(limit: Int)
@@ -127,7 +109,10 @@ public struct ActivityRollups: Sendable {
         public var errorDescription: String? {
             switch self {
             case .sourceRowsExceeded(let limit):
-                return "More than \(limit) activity spans match this request. Ask for a shorter range or one bundle_id so NativeAgent does not return an incomplete answer."
+                return """
+                    More than \(limit) activity spans match this request. Ask for a shorter range or one bundle_id so NativeAgent \
+                    does not return an incomplete answer.
+                    """
             case .invalidEventCount(let source):
                 return "Activity event counts are negative or exceed the supported integer range (\(source)); retained history was left unchanged."
             }
@@ -141,8 +126,7 @@ public struct ActivityRollups: Sendable {
         var component: Calendar.Component { self == .hourly ? .hour : .day }
     }
 
-    /// The acceptance criterion from the plan, as a constant: any single answer
-    /// fits in ~50 rows.
+    /// Keep a single answer within roughly 50 rows of context.
     public static let answerRowCap = 50
     public static let sourceSpanLimit = 20_000
 
@@ -156,17 +140,10 @@ public struct ActivityRollups: Sendable {
 
     // MARK: Bucketing
 
-    /// Cap on generated buckets. A caller asking for a decade of HOURLY buckets
-    /// must not hang — but it must also not be told it got the whole decade.
+    /// Bound hourly queries over long ranges without implying full coverage.
     public static let maxBuckets = 24 * 400
 
-    /// Boundaries plus how far they actually reach.
-    ///
-    /// `coveredTo` exists because the bucket cap is a SILENT CAP otherwise: ask
-    /// for ten years of hourly buckets and you get the first 9,600 hours, which
-    /// on a window ending at "now" is nine and a half years of empty buckets and
-    /// none of your data — reported as a complete answer. Callers must be able
-    /// to see that the range was cut, so `answerBundle` can say so.
+    /// Carry the actual coverage bound so a bucket cap cannot silently omit the requested years.
     public static func boundedBuckets(
         from: Double, to: Double, grain: Grain, timezone: TimeZone
     ) -> (boundaries: [(start: Double, end: Double)], coveredTo: Double) {
@@ -189,11 +166,7 @@ public struct ActivityRollups: Sendable {
         return (boundaries, min(to, boundaries.last?.end ?? to))
     }
 
-    /// Chronological sweep over precomputed boundaries. Each source span enters
-    /// the active set once and leaves it once; only spans which can overlap the
-    /// current bucket are inspected. This keeps a long activity history from
-    /// turning into `bucketCount * spanCount` work and lets `answerBundle` reuse
-    /// the exact boundaries it already generated for coverage accounting.
+    /// Sweep each span into and out of the active set once to avoid bucketCount × spanCount work.
     static func buckets(
         spans: [ActivitySpan],
         from: Double,
@@ -223,7 +196,7 @@ public struct ActivityRollups: Sendable {
                 cursor += 1
             }
 
-            // Key by bundle id; carry the most recent app name seen for it.
+            // Carry the most recent app name for each stable bundle id.
             var seconds: [String: Double] = [:]
             var names: [String: String] = [:]
             var counts: [String: Int] = [:]
@@ -236,9 +209,7 @@ public struct ActivityRollups: Sendable {
                 let overlap = overlapEnd - overlapStart
                 guard overlap > 0 else { continue }
                 let total = max(spanEnd - span.startedAt, 0)
-                // Prorate events by the fraction of the span inside the bucket.
-                // A zero-length span contributes its events to whichever bucket
-                // contains its instant, undivided.
+                // Prorate overlap; zero-length spans contribute undivided events to their containing bucket.
                 let share = total > 0 ? overlap / total : 1
                 seconds[span.bundleId, default: 0] += overlap
                 names[span.bundleId] = span.appName
@@ -296,8 +267,7 @@ public struct ActivityRollups: Sendable {
                     eventCount: try checkedEventCount(events[bundleId] ?? 0, source: "app \(bundleId)")
                 )
             }
-            // Deterministic order: seconds desc, then bundle id — never
-            // dictionary order, or two identical questions disagree.
+            // Tie-break by bundle id so identical queries never depend on dictionary order.
             .sorted { ($0.seconds, $1.bundleId) > ($1.seconds, $0.bundleId) }
 
         let kept = Array(all.prefix(max(0, limit)))
@@ -313,7 +283,6 @@ public struct ActivityRollups: Sendable {
 
     // MARK: Exemplars
 
-    /// The longest spans in the window, after merging contiguous same-app spans.
     public static func exemplars(
         spans: [ActivitySpan], limit: Int
     ) throws -> [ActivitySpan] {
@@ -325,9 +294,7 @@ public struct ActivityRollups: Sendable {
         )
     }
 
-    /// Same app, same redacted title, no unobserved gap →
-    /// one span. Keeps the first row's id so an exemplar still points at a real
-    /// stored row.
+    /// Merge only matching app/title spans without gaps; retain a real row id for exemplar references.
     public static func merge(spans: [ActivitySpan]) throws -> [ActivitySpan] {
         let ordered = spans.sorted { $0.startedAt < $1.startedAt }
         var out: [ActivitySpan] = []
@@ -374,12 +341,7 @@ public struct ActivityRollups: Sendable {
 
     // MARK: The single answer
 
-    /// The whole answer to "what was I doing on X", hard-capped at ~50 rows.
-    ///
-    /// Budget, spent in priority order: top apps first (the headline), then
-    /// buckets (the shape of the day), then exemplars (the evidence). Whatever
-    /// the cap removes is named in `truncatedSections` — the cap is honest or
-    /// it is a lie with a small footprint.
+    /// Spend the cap on top apps, then buckets, then exemplars; name every section that loses rows.
     public func answerBundle(
         from: Double,
         to: Double,
@@ -398,8 +360,7 @@ public struct ActivityRollups: Sendable {
         guard spans.count <= Self.sourceSpanLimit else {
             throw RollupError.sourceRowsExceeded(limit: Self.sourceSpanLimit)
         }
-        // A window longer than ~36 h is a day-scale question; below that the
-        // hour is the interesting unit.
+        // Use day buckets above roughly 36 hours, when hourly detail obscures the shape.
         let chosenGrain = grain ?? ((to - from) > 36 * 3600 ? .daily : .hourly)
 
         let cap = max(3, rowCap)
@@ -409,9 +370,7 @@ public struct ActivityRollups: Sendable {
 
         let top = try Self.topApps(spans: spans, from: from, to: to, limit: topLimit)
 
-        // Detect the bucket-generation cap BEFORE bucketing, so a window too
-        // large for the requested grain is reported rather than silently
-        // answered from its first 9,600 buckets.
+        // Detect the generation cap first so the answer names incomplete coverage.
         let coverage = Self.boundedBuckets(
             from: from, to: to, grain: chosenGrain, timezone: timezone
         )
@@ -420,9 +379,7 @@ public struct ActivityRollups: Sendable {
         let allBuckets = Self.buckets(
             spans: spans, from: from, to: to, boundaries: coverage.boundaries
         )
-        // Keep the heaviest buckets, then restore chronological order — a
-        // timeline that jumps around is unreadable, and sorting by weight is
-        // only how we choose WHICH rows survive the cap.
+        // Choose the heaviest buckets, then restore chronology for a readable timeline.
         let keptBuckets = allBuckets
             .sorted { $0.seconds > $1.seconds }
             .prefix(bucketLimit)

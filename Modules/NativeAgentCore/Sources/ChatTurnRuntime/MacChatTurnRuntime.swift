@@ -6,30 +6,30 @@ import NativeAgentShared
 import NativeAgentCore
 import Transcripts
 import PersistenceCore
-// Blueprint: | `MacChatTurnRuntime.swift` | Canonical Mac admission/lifecycle, replying/preview state and Send-next projection; queue writes use MacChatTurnLifecycleStore; cross-life requests stay stopped until the person's Resume or Send now creates fresh requests without old steering or continuations |
+// Blueprint: | `MacChatTurnRuntime.swift` | Canonical Mac admission, lifecycle and preview state |
 
-/// Admission, durable queue and lifecycle authority for Mac chat. Presentation
-/// facades observe this same state; no second queue or lifecycle is retained.
+/// Admission and lifecycle authority for Mac chat. Presentation facades
+/// observe this same state; no second lifecycle is retained.
 @MainActor
 @Observable
 public final class MacChatTurnRuntime {
-    /// Ordinary sends, retries and receipt follow-ups share this runtime's
-    /// session slot through transcript settlement, including detached chat
-    /// and local bridge turns that also carry the chat surface.
-    ///
-    /// The one place a Mac turn's run is registered for Stop: synchronously,
-    /// before any await, so a Stop from here on names the live run, and one
-    /// that came before (cancelling the task) ends it here. The run is pinned
-    /// so the turn's own acceptance is this same registration.
-    public func runAdmittedTurn<T>(sessionID: String, turnID: String, runID: String? = nil,
-                                   operation: () async throws -> T) async throws -> T {
-        let runID = runID ?? UUID().uuidString
-        let stop = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: sessionID, runId: runID, turnId: turnID)
+    /// All Mac entry points share one session slot through transcript settlement.
+    /// Register and pin the run for Stop synchronously before any await so cancellation always names the accepted run.
+    public func runAdmittedTurn<T>(sessionID: String, turnID: String, arrival: TurnArrival,
+                                   turn: Turn, operation: (Turn) async throws -> T) async throws -> TurnAdmission.Admitted<T> {
+        let stop = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: sessionID, runId: turn.run, turnId: turnID)
         defer { ChatCancelFlag.finish(stop) }
         try Task.checkCancellation()
-        return try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runID) {
-            try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID, operation: operation)
-        }
+        return try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID, arrival: arrival, turn: turn, operation: operation)
+    }
+
+    /// A regenerate replaces an answer, so it never joins another turn.
+    public func runAloneTurn<T>(sessionID: String, turnID: String,
+                                turn: Turn, operation: (Turn) async throws -> T) async throws -> T {
+        let stop = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: sessionID, runId: turn.run, turnId: turnID)
+        defer { ChatCancelFlag.finish(stop) }
+        try Task.checkCancellation()
+        return try await TurnAdmission.shared.runAlone(dataRoot: dataRoot, sessionID: sessionID, turn: turn, operation: operation)
     }
 
     public nonisolated static let streamProgressCoalesceSeconds: TimeInterval = 1.0
@@ -64,54 +64,14 @@ public final class MacChatTurnRuntime {
             if settled != replyTextSettledSessions { replyTextSettledSessions = settled }
         }
     }
-    /// Sessions whose reply text has settled, written only when that changes:
-    /// views asking "is she still replying?" observe this, not the lifecycle's
-    /// once-a-second progress writes, so the transcript does not re-render
-    /// every second of a stream.
+    /// Observe settled-text changes separately from 1 Hz lifecycle progress so transcript views need not rerender on every progress tick.
     public private(set) var replyTextSettledSessions: Set<String> = []
     @ObservationIgnored public var activeTurnIDsBySession: [String: String] = [:]
     @ObservationIgnored public var streamProgressAppliedAt: [String: (turnId: String, at: Date)] = [:]
     @ObservationIgnored public var lifecycleStore: MacChatTurnLifecycleStore
-    private var queueState: [String: [QueuedChatTurn]] = [:]
-    @ObservationIgnored public private(set) var queueStorageError: String?
-    @ObservationIgnored private var queueLoad: Task<Void, Never>?
-    @ObservationIgnored private var queueWrite: Task<Bool, Never>?
-    public var queuedBySession: [String: [QueuedChatTurn]] { queueState }
-
-    @discardableResult
-    public func updateQueuedTurns(_ change: @escaping @MainActor @Sendable (inout [String: [QueuedChatTurn]]) -> Void) async -> Bool {
-        await loadQueuedTurnsIfNeeded()
-        let previous = queueWrite
-        let write = Task { @MainActor in
-            _ = await previous?.value
-            guard queueStorageError == nil else { return false }
-            var next = queueState
-            change(&next)
-            guard next != queueState else { return true }
-            do {
-                queueState = try await lifecycleStore.saveQueuedTurns(next)
-                return true
-            } catch {
-                queueStorageError = "Send-next storage is unavailable. Repair chat/mac_turn_lifecycle.json and restart NativeAgent before sending: \(error.localizedDescription)"
-                for session in Set(queueState.keys).union(next.keys) {
-                    pausedQueueSessions.insert(session)
-                    queuePauseReasons[session] = queueStorageError
-                }
-                return false
-            }
-        }
-        queueWrite = write
-        return await write.value
-    }
-    public var pausedQueueSessions: Set<String> = []
-    public var queuePauseReasons: [String: String] = [:]
-    /// Queued turns User chose to Steer: offered to the running turn, not yet taken.
-    public var steeringTurnIDs: Set<String> = []
-    @ObservationIgnored public var drainingQueueSessions: Set<String> = []
     public var pendingStopWrites: [String: Task<Void, Never>] = [:]
     public var pendingStopWriteGenerations: [String: Int] = [:]
-    /// Bumped by every control handoff. A remote input that entered under an
-    /// older value was already waiting when control was released.
+    /// Control handoffs invalidate inputs admitted under an older epoch.
     @ObservationIgnored public var controlHandoffGenerations: [String: Int] = [:]
     /// The newest phone handoff's own send time. Later-arriving phone inputs
     /// are ordered against it on the phone's clock, never the Mac's.
@@ -128,68 +88,6 @@ public final class MacChatTurnRuntime {
         self.chatTurnTranscriptProofReader = MacChatTurnTranscriptProofReader(dataRoot: dataRoot)
     }
 
-    public func loadQueuedTurnsIfNeeded() async {
-        if queueLoad == nil {
-            queueLoad = Task { await restoreQueuedTurns() }
-        }
-        await queueLoad?.value
-    }
-
-    public func restartStoppedQueuedTurns(sessionId: String) async -> Bool {
-        await updateQueuedTurns { queues in
-            queues[sessionId] = queues[sessionId]?.map { turn in
-                guard turn.stoppedReason != nil else { return turn }
-                return QueuedChatTurn(text: turn.text, attachments: turn.attachments,
-                    hideUserBubble: turn.hideUserBubble, origin: turn.origin)
-            }
-        }
-    }
-
-    private func restoreQueuedTurns() async {
-        do {
-            let loaded = try await lifecycleStore.queuedTurns()
-            var saved = loaded
-            let records = try await lifecycleStore.records()
-            for (session, turns) in saved where turns.contains(where: { $0.startedTurnID != nil }) {
-                var waiting: [QueuedChatTurn] = []
-                for var turn in turns {
-                    if turn.stoppedReason != nil {
-                        turn.startedTurnID = nil
-                        waiting.append(turn)
-                        continue
-                    }
-                    if let started = turn.startedTurnID {
-                        let identity = MacChatTurnIdentity(sessionId: session, turnId: started)
-                        let wasSteering = started != turn.id
-                        let record = records.first { $0.identity == identity }
-                        if record?.isTerminal == true,
-                           record?.terminalEvidence != .interruptedOutcomeUnknown,
-                           !wasSteering || record?.terminalEvidence == .finalResponsePersisted { continue }
-                        switch try await chatTurnTranscriptProofReader.proof(for: identity) {
-                        case .completed: continue
-                        case .failed, .canceled:
-                            if !wasSteering { continue }
-                            turn.startedTurnID = nil
-                        case .unavailable: throw MacChatTurnLifecycleStoreError.invalidRecord
-                        case .absent, .incomplete: turn.startedTurnID = nil
-                        }
-                        pausedQueueSessions.insert(session)
-                        queuePauseReasons[session] = "A queued turn was interrupted. Check its conversation before resuming it."
-                    }
-                    waiting.append(turn)
-                }
-                saved[session] = waiting.isEmpty ? nil : waiting
-            }
-            queueState = saved == loaded ? saved : try await lifecycleStore.saveQueuedTurns(saved)
-            for (session, turns) in queueState where turns.contains(where: { $0.stoppedReason != nil }) {
-                pausedQueueSessions.insert(session)
-                queuePauseReasons[session] = "Stopped: restored. Resume starts these requests fresh."
-            }
-        } catch {
-            self.queueStorageError = "Send-next storage is unavailable. Repair chat/mac_turn_lifecycle.json and restart NativeAgent before sending: \(error.localizedDescription)"
-        }
-    }
-
     public func lifecycle(for sessionId: String) -> MacChatTurnLifecycleState? {
         lifecycleBySession[sessionId]
     }
@@ -197,9 +95,6 @@ public final class MacChatTurnRuntime {
     public func pruneSessionState(_ sessionId: String) {
         let activeTurnId = activeTurnIDsBySession[sessionId]
         let retainedTurnId = activeTurnId == nil ? lifecycleBySession[sessionId]?.identity.turnId : nil
-        Task { await updateQueuedTurns { $0.removeValue(forKey: sessionId) } }
-        pausedQueueSessions.remove(sessionId)
-        queuePauseReasons.removeValue(forKey: sessionId)
         // A joined producer still owns its terminal proof during Stop/Archive.
         if activeTurnId == nil {
             lifecycleBySession.removeValue(forKey: sessionId)
@@ -215,13 +110,19 @@ public final class MacChatTurnRuntime {
     public func staleSessionIDs(
         cached: Set<String>, known: Set<String>, keepVisible: (String) -> Bool
     ) -> Set<String> {
-        let candidates = cached.union(queuedBySession.keys).union(pausedQueueSessions)
-            .union(lifecycleBySession.keys).union(activeTurnIDsBySession.keys)
+        let candidates = cached.union(lifecycleBySession.keys).union(activeTurnIDsBySession.keys)
         return candidates.filter {
             !known.contains($0) && !streamingSessions.contains($0)
                 && !busySessions.contains($0) && !keepVisible($0)
         }
     }
+    /// Waiters for a Mac session to move resume when any task or reservation changes, then recheck their own session.
+    public func sessionSlotChange() async {
+        await withCheckedContinuation { moved in
+            withObservationTracking { _ = (tasks, busySessions) } onChange: { moved.resume() }
+        }
+    }
+
     public func finishRuntime(sessionId: String, generation: Int) -> Bool {
         guard taskGenerations[sessionId] == generation else { return false }
         streamingSessions.remove(sessionId)
@@ -235,15 +136,9 @@ public final class MacChatTurnRuntime {
     /// subsequent admission waits for this same marker write.
     @discardableResult
     public func requestStop(
-        sessionId: String, pauseQueuedTurns: Bool = true,
+        sessionId: String,
         revokeDriverControl: (@MainActor @Sendable () async -> Void)? = nil
     ) -> Task<Void, Never> {
-        if pauseQueuedTurns {
-            pausedQueueSessions.insert(sessionId)
-            queuePauseReasons.removeValue(forKey: sessionId)
-        } else {
-            pausedQueueSessions.remove(sessionId)
-        }
         let activeTask = tasks[sessionId]
         // A reservation still reading admission data has no task to cancel.
         // Revoke that reservation now; its suspended holder must not start.
@@ -276,10 +171,7 @@ public final class MacChatTurnRuntime {
         return write
     }
 
-    /// Explicit `runId` / `runIDs` stop only those runs, beside any the marker
-    /// already names: one door's task in a session other doors' queued runs
-    /// share (a contact's one conversation), where the session's in-flight
-    /// list would stop them too.
+    /// Explicit run IDs stop only named work; a shared contact session may also hold unrelated queued runs from other doors.
     public nonisolated func stop(sessionId: String, runId: String? = nil, runIDs: [String] = []) async throws {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw NSError(
@@ -296,7 +188,10 @@ public final class MacChatTurnRuntime {
             catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { existing = nil }
             // A failed read cannot authorize replacing earlier Stop requests.
             catch {
-                throw ToolFailureError("The existing Stop marker could not be read: \(error.localizedDescription). Its bytes were preserved. Repair \(flagPath.path) before merging another Stop request.",
+                throw ToolFailureError("""
+                    The existing Stop marker could not be read: \(error.localizedDescription). Its bytes were preserved. Repair \(flagPath.path) \
+                    before merging another Stop request.
+                    """,
                     effects: .none, owner: flagPath.path, code: "stop_marker_unavailable", recovery: .repair)
             }
             let requested = namedRuns.isEmpty ? ChatCancelFlag.stopContent(forFlagAt: flagPath) : namedRuns.joined(separator: "\n")
@@ -307,34 +202,20 @@ public final class MacChatTurnRuntime {
     }
 }
 
-/// What the agent is looking at, as the chat's working card shows it.
-///
-/// Display-only and transient, like the card it lives in. Nothing here is
-/// persisted, nothing here becomes memory, and the per-verb receipts remain the
-/// record of what actually happened — this is the live view while it happens.
-///
-/// The frame arrives already downscaled and secret-masked by
-/// ``MacScreenPreviewFrame`` on the capture side. The app neither crops nor
-/// re-derives what may be shown.
+/// Preview is transient display only; receipts retain effect truth and no frame becomes memory.
+/// Capture already downscales and masks secrets; presentation must not reinterpret what may be shown.
 public struct MacChatScreenPreview: @unchecked Sendable {
-    /// The masked, downscaled frame the last Mac verb captured. Optional
-    /// because a verb can move the caption without producing a picture (no
-    /// Screen Recording permission, a locked screen, a refused capture).
+    /// Missing capture permission, locked screens and refusals may update the caption without supplying a frame.
     public let image: CGImage?
-    /// One line of plain words for the verb in flight.
     public let caption: String
     public let updatedAt: Date
 
-    /// Only worth a pane when there is something to show. A caption with no
-    /// frame and no frame with no caption are both nothing to look at.
+    /// Show a pane only when both caption and frame exist.
     public var isShowable: Bool {
         image != nil && !caption.isEmpty
     }
 
-    /// Folds one update into what the card is already showing. A `nil` field in
-    /// the update means UNCHANGED: the verb that clicks a button publishes new
-    /// words over the last frame, which is exactly the behaviour wanted —
-    /// "Clicking Save" over the picture of the window Save is in.
+    /// Nil update fields preserve the previous value so caption-only actions retain their window evidence.
     public static func merged(
         _ previous: MacChatScreenPreview?,
         update: MacScreenPreviewUpdate

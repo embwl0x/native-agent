@@ -2,10 +2,9 @@ import Foundation
 import CoreGraphics
 import Synchronization
 
-// Blueprint: | `PersonOnlyWindows.swift` | `PersonOnlyWindows`: registered person-only window exclusion, input/pointer coordination and step-aside hooks without app dependencies |
+// Blueprint: | `PersonOnlyWindows.swift` | `PersonOnlyWindows`: capture exclusion and input coordination |
 
-/// Person-only windows are excluded from agent captures, pass agent pointer events
-/// through, and hold agent typing while their composer has the keyboard; person
+/// Person-only windows are excluded from agent captures, pass agent pointer events through, and hold agent typing while their composer has the keyboard; person
 /// input there is not a takeover. The app registers windows and effects here without Core depending on it.
 public enum PersonOnlyWindows {
     public struct Window: Sendable, Equatable {
@@ -19,9 +18,8 @@ public enum PersonOnlyWindows {
         }
     }
 
-    /// How long the window keeps passing her pointer through after her last
-    /// pointer event on it: long enough for the window server to route the
-    /// event she just posted, short enough that the person's own click lands.
+    /// How long the window keeps passing the agent's pointer through after its last pointer event on it: long enough for the window server to route the event
+    /// it just posted, short enough that the person's own click lands.
     public static let pointerPassThroughSeconds: TimeInterval = 0.1
 
     private struct State {
@@ -40,38 +38,32 @@ public enum PersonOnlyWindows {
     }
     private static let state = Mutex(State())
 
-    /// The session and turn whose tool call is running, set by the dispatch
-    /// chain around every tool: her windows step aside for that turn, and
-    /// Shotgun binds to it, whichever surface it came from.
+    /// The session and turn whose tool call is running, read from the held Turn: the agent's windows step aside for that turn, and Shotgun binds to
+    /// it, whichever surface it came from.
     public struct Driver: Sendable, Equatable {
         public let session: String
         public let turn: String
         public init(session: String, turn: String) { self.session = session; self.turn = turn }
     }
-    @TaskLocal public static var driver: Driver?
 
-    /// The app's way of getting its own windows out of her sight (Shotgun), installed once.
+    /// The app's way of getting its own windows out of the agent's sight (Shotgun), installed once.
     public static func installStepAside(_ handler: @escaping @Sendable (Driver?) async -> Void) {
         state.withLock { $0.stepAside = handler }
     }
 
-    /// From any surface's turn, wait for her own windows to step aside before
-    /// she looks at or acts on the screen.
-    public static func stepAsideForScreen() async {
+    /// From any surface's turn, wait for the agent's own windows to step aside before it looks at or acts on the screen.
+    public static func stepAsideForScreen(turn: Turn?) async {
         let handler = state.withLock { $0.stepAside }
-        await handler?(driver)
+        await handler?(turn?.windowDriver)
     }
 
-    /// The app's pointer effect, installed once. It runs synchronously before
-    /// her event is posted, on whatever thread posts it.
+    /// The app's pointer effect, installed once. It runs synchronously before the agent's event is posted, on whatever thread posts it.
     public static func install(passPointerThrough: @escaping @Sendable () -> Void) {
         state.withLock { $0.passPointerThrough = passPointerThrough }
     }
 
-    /// The app's watchers of her hands: `motor` on her motor output (at most
-    /// twice a second), `pointer` with where each pointer action of hers
-    /// happened and whether it pressed. Both are called on whatever thread
-    /// posts; they must only hand off.
+    /// The app's watchers of the agent's hands: `motor` on its motor output (at most twice a second), `pointer` with where each of its pointer actions happened
+    /// and whether it pressed. Both are called on whatever thread posts; they must only hand off.
     public static func observeAgent(
         motor: @escaping @Sendable () -> Void,
         pointer: @escaping @Sendable (CGPoint, Bool) -> Void
@@ -79,7 +71,7 @@ public enum PersonOnlyWindows {
         state.withLock { $0.motorObserver = motor; $0.pointerObserver = pointer }
     }
 
-    /// Her hands moved: a posted key or pointer event, or an accessibility press.
+    /// The agent's hands moved: a posted key or pointer event, or an accessibility press.
     public static func noteAgentMotor() {
         let uptime = ProcessInfo.processInfo.systemUptime
         let observer = state.withLock { state -> (@Sendable () -> Void)? in
@@ -90,20 +82,19 @@ public enum PersonOnlyWindows {
         observer?()
     }
 
-    /// Age of her last motor signal (to within half a second), `.infinity` when none.
+    /// Age of the agent's last motor signal (to within half a second), `.infinity` when none.
     public static func secondsSinceAgentHands() -> TimeInterval {
         let uptime = ProcessInfo.processInfo.systemUptime
         let last = state.withLock { $0.lastMotorSignal }
         return last.isFinite ? uptime - last : .infinity
     }
 
-    /// Her pointer acted at `point` (CGEvent space); `pressed` for a click or drag.
+    /// The agent's pointer acted at `point` (CGEvent space); `pressed` for a click or drag.
     public static func noteAgentPointer(at point: CGPoint, pressed: Bool) {
         let observer = state.withLock { $0.pointerObserver }
         observer?(point, pressed)
     }
 
-    /// The decoration window, nil when there is none.
     public static func setOverlay(number: Int?) {
         state.withLock { $0.overlays = number.map { [$0] } ?? [] }
     }
@@ -113,8 +104,7 @@ public enum PersonOnlyWindows {
         state.withLock { $0.windows = current; $0.keyHeld = held && !current.isEmpty }
     }
 
-    /// While a person-only window is up, only Stop hands control back;
-    /// person input elsewhere does not interrupt the agent.
+    /// While a person-only window is up, only Stop hands control back; person input elsewhere does not interrupt the agent.
     public static var isShowing: Bool {
         state.withLock { !$0.windows.isEmpty }
     }
@@ -127,10 +117,8 @@ public enum PersonOnlyWindows {
         state.withLock { $0.windows.contains { $0.frame.contains(point) } }
     }
 
-    /// Before one of her pointer or scroll events at `point` (CGEvent space):
-    /// the window server routes those by location, so when it lands on the
-    /// person's window, that window must let it fall through. Her events
-    /// anywhere else change nothing.
+    /// Before one of the agent's pointer or scroll events at `point` (CGEvent space): the window server routes those by location, so when it lands on the
+    /// person's window, that window must let it fall through. The agent's events anywhere else change nothing.
     public static func beforeAgentPointer(at point: CGPoint) {
         let hop = state.withLock { state -> (@Sendable () -> Void)? in
             guard state.windows.contains(where: { $0.frame.contains(point) }) else { return nil }
@@ -142,8 +130,7 @@ public enum PersonOnlyWindows {
         hop?()
     }
 
-    /// The app's restore check. Nil: her pointer has been idle long enough,
-    /// so the window takes clicks again. Otherwise how long to wait first.
+    /// The app's restore check. Nil: the agent's pointer has been idle long enough, so the window takes clicks again. Otherwise how long to wait first.
     public static func endPointerPassThroughIfIdle() -> TimeInterval? {
         state.withLock {
             let left = $0.passUntil - ProcessInfo.processInfo.systemUptime
@@ -153,14 +140,12 @@ public enum PersonOnlyWindows {
         }
     }
 
-    /// True while the person's window holds the keyboard (its composer is
-    /// focused). A keystroke posted to whatever is key would land in their
-    /// message, so hers wait until they send or click away.
+    /// True while the person's window holds the keyboard (its composer is focused). A keystroke posted to whatever is key would land in their message, so the
+    /// agent's wait until they send or click away.
     public static var keyboardHeldByPerson: Bool {
         state.withLock { $0.keyHeld }
     }
 
-    /// The person typed or pointed in their own window just now.
     public static func notePersonInput() {
         let uptime = ProcessInfo.processInfo.systemUptime
         state.withLock { $0.lastPersonInputUptime = uptime }

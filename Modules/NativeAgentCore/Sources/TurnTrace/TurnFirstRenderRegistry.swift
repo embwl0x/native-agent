@@ -2,8 +2,7 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `TurnFirstRenderRegistry.swift` | Bounded single-claim first-render correlation and publication |
 
-/// Correlates the Mac UI's first visible assistant bubble with the turn trace
-/// without putting UI concerns into the provider loop. Entries are bounded and
+/// Correlates the Mac UI's first visible assistant bubble with the turn trace without putting UI concerns into the provider loop. Entries are bounded and
 /// single-claim: an old bubble or a later delta cannot emit a duplicate render.
 public actor TurnFirstRenderRegistry {
     public static let shared = TurnFirstRenderRegistry()
@@ -36,8 +35,7 @@ public actor TurnFirstRenderRegistry {
         }
     }
 
-    /// The mounted surface reports visibility; correlation and publication
-    /// remain with the registry that owns the turn's single render claim.
+    /// The mounted surface reports visibility; correlation and publication remain with the registry that owns the turn's single render claim.
     public func observeFirstRender(
         role: String,
         content: String,
@@ -83,7 +81,8 @@ public actor TurnFirstRenderRegistry {
                 "milestone": .string("surface.firstRender"),
                 "observedBy": .string(observedBy),
                 "elapsedMs": .int(elapsedMs),
-            ])
+            ]),
+            turn: nil
         )
     }
 }

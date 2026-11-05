@@ -4,21 +4,18 @@ import Desk
 import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
-// Blueprint: | `EngineIntentionMigration.swift` | NativeAgentEngine one-time launch retirement of enabled turn/notify/workshop jobs into MY QUEUE; durable byte-exact backup, disabled definitions retained with disposition, precise clockStart timing and first-migration identity; completed roots only stop restored rows with one Desk notice, never remigrate; cancellation deadlines transfer to until, ambiguous effects stay stopped; body rhythms stay scheduler-owned |
+// Blueprint: | `EngineIntentionMigration.swift` | Locked one-time conversion of scheduled work into Desk intentions |
 
 extension NativeAgentEngine {
-    /// Before the resident clock starts, her scheduled work takes the one form
-    /// she carries, once. Later restored jobs need her decision, never a reimport.
+    /// Convert scheduled work once before the resident clock starts; restored jobs require a decision rather than reimport.
     static func migrateScheduledIntentionsAtLaunch(dataRoot: URL) async throws {
         let marker = dataRoot.appendingPathComponent("scheduler/.intentions-migrated")
         let finished = MyQueue.scheduledMigrationMarker(dataRoot: dataRoot)
         try await SwiftNativePersistenceCore.withFileLock(marker) {
             let scheduler = SwiftNativeTriggerScheduler(root: dataRoot)
             try await SwiftNativePersistenceCore.withFileLock(scheduler.jobsPath) {
-                // The job lock spans backup, filing and retirement. No other
-                // writer can change a definition between its read and commit.
-                // Completion is permanent, including the earlier empty flag.
-                // A restore cannot identify steps made by the old migrator.
+                // Hold the job lock across backup, filing and retirement so definitions cannot change mid-conversion; durable completion prevents reimport
+                // after restore.
                 if FileManager.default.fileExists(atPath: finished.path) {
                     _ = try Data(contentsOf: finished)
                     try await scheduler.stopRestoredIntentionJobs()
@@ -37,8 +34,7 @@ extension NativeAgentEngine {
                         throw ScheduledIntentionError(reason: "Scheduled jobs must be an array; source bytes preserved.")
                     }
                     let now = Date()
-                    // Invalid live work blocks bring-up with its cause, never silently
-                    // retained as a second execution path or treated as completed.
+                    // Invalid live work must block bring-up with its cause, never become completed or a second execution route.
                     var intentions = try jobs.compactMap { try ScheduledIntention($0, now: now, backup: backup) }
                     guard Set(intentions.map(\.id)).count == intentions.count else {
                         throw ScheduledIntentionError(reason: "Enabled scheduled intentions have duplicate job ids; repair the source before migration.")
@@ -63,22 +59,18 @@ extension NativeAgentEngine {
                             details[job.id] = "became intention " + filed.entry.name
                         }
                     }
-                    // All Desk writes precede one scheduler commit. An interruption
-                    // before it reuses job identity; after it, all live jobs are disabled.
-                    // In particular a cancel job cannot outlive its target's conversion.
+                    // Write Desk state before the scheduler commit; interruptions reuse job identity, and cancellation must not outlive its target’s
+                    // conversion.
                     try Task.checkCancellation()
                     let completed = details
-                    // File locks are task-reentrant; updateJobRows remains the
-                    // canonical single writer, under the lock held since the read.
+                    // Task-reentrant locks preserve `updateJobRows` as the single writer across the read and commit.
                     try await scheduler.updateJobRows { rows in
-                        // The checked reader drops retired zone selectors. Keep
-                        // untouched definitions exactly as saved, including them.
+                        // Preserve untouched saved definitions byte-for-byte, including zone selectors omitted by the checked reader.
                         rows = savedRows
                         for index in rows.indices {
                             guard case .object(var row) = rows[index], ScheduledIntention.isLegacy(row) else { continue }
                             if !SchedulerJobRuntime.bool(row["enabled"], default: true) {
-                                // Preserve paused words/timing and distinguish these
-                                // saved definitions from a later restored backup.
+                                // Preserve paused timing and distinguish converted definitions from later restored backups.
                                 if row["intentionMigration"] == nil {
                                     let prior = row["lastRunDetail"]?.stringValue ?? ""
                                     row["intentionMigration"] = .string(prior.hasPrefix("became intention ") || prior == "its intention ends itself"
@@ -95,8 +87,7 @@ extension NativeAgentEngine {
                         }
                     }
                 }
-                // The durable completion ends migration for this data root.
-                // Partial first attempts remain held until this write succeeds.
+                // Hold partial attempts until durable completion ends conversion for this root.
                 try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(Data(), to: marker)
                 try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(Data(), to: finished)
             }
@@ -163,9 +154,9 @@ private struct ScheduledIntention {
                 step = DeskStep(words: words, when: "at " + NativeTimestampFormat.microsecondUTCOffset(date, rounding: .up),
                                 origin: "self", say: kind == "notify" ? text : nil)
             } else if kind == "turn", text.range(of: #"\bcancel\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
-                // No deadline can be transferred. Carry the failure for her
-                // judgment; never silently execute a cancellation early.
-                step = DeskStep(words: words + "\nThe scheduled run time for job \(id) is unreadable. Reconcile its intended time before carrying out these instructions.",
+                // An untransferable deadline needs judgment; never execute a cancellation early.
+                step = DeskStep(words: words
+                    + "\nThe scheduled run time for job \(id) is unreadable. Reconcile its intended time before carrying out these instructions.",
                                 when: "own_turn", origin: "self")
             } else {
                 throw ScheduledIntentionError(reason: "Scheduled job \(id) has no readable nextRunAt.")
@@ -194,7 +185,10 @@ private struct ScheduledIntention {
         step.scheduledJobID = id
         if uncertain {
             step.status = "stopped"
-            step.reason = "Prior scheduled effects are unconfirmed. Reconcile job \(id) in \(backup.path) and its receipts before refiling any work; never repeat it blindly."
+            step.reason = """
+                Prior scheduled effects are unconfirmed. Reconcile job \(id) in \(backup.path) and its receipts before refiling any work; never repeat \
+                it blindly.
+                """
             // No deadline may turn unresolved effects into a completed step.
             step.until = nil
         }
@@ -202,8 +196,10 @@ private struct ScheduledIntention {
 
     func cancellationTarget(in jobs: [ScheduledIntention]) throws -> Int? {
         guard kind == "turn", oneShot else { return nil }
-        // Consume the whole prompt. Extra instructions must keep their own turn.
-        let regex = try NSRegularExpression(pattern: #"^\s*(?:please\s+)?cancel\s+(?:the\s+)?(?:scheduled\s+)?(?:job\s+)?(?:(?:named|called)\s+|(?:with\s+)?(id(?:\s+starts(?:\s+with)?)?)\s*[:=]?\s+)?[\x22'`(]?(.+?)[\x22'`)]?[.!]?\s*$"#, options: .caseInsensitive)
+        // Consume the whole prompt so extra instructions retain their own turn.
+        let regex = try NSRegularExpression(
+            pattern: #"^\s*(?:please\s+)?cancel\s+(?:the\s+)?(?:scheduled\s+)?(?:job\s+)?(?:(?:named|called)\s+|(?:with\s+)?(id(?:\s+starts(?:\s+with)?)?)\s*[:=]?\s+)?[\x22'`(]?(.+?)[\x22'`)]?[.!]?\s*$"#,
+            options: .caseInsensitive)
         guard let match = regex.firstMatch(in: prompt, range: NSRange(prompt.startIndex..., in: prompt)),
               let range = Range(match.range(at: 2), in: prompt) else { return nil }
         let target = String(prompt[range]).lowercased()
@@ -219,8 +215,7 @@ private struct ScheduledIntention {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    /// A single day and month have one intended year, rather than rolling
-    /// around forever. Keep this day's end even after its final clock moment.
+    /// A single day and month have one intended year; preserve that day’s end rather than rolling forever.
     private static func endOfPinnedDay(_ rhythm: JSONValue, now: Date) throws -> Date? {
         guard let schedule = rhythm.objectValue,
               (schedule["type"]?.stringValue ?? schedule["kind"]?.stringValue)?

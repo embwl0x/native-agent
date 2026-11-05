@@ -29,9 +29,7 @@ actor ICloudIncomingVerifier {
         return iCloudBridge.isAuthenticatedControlAction(message, secret: key)
     }
 }
-/// A chat receipt describes the furthest boundary this Mac actually observed.
-/// Neither state implies that iOS fetched, displayed, or acknowledged the
-/// message; that would require a separate signed return receipt from iOS.
+/// Receipts describe only observed Mac boundaries; phone fetch, display and acknowledgement require signed return evidence.
 enum ChatDeliveryReceiptStatus: String, Sendable {
     case failedBeforeDispatch = "failed_before_dispatch"
     case dispatchReserved = "dispatch_reserved"
@@ -42,9 +40,7 @@ enum ChatDeliveryReceiptStatus: String, Sendable {
     case queuedForICloudSync = "queued_for_icloud_sync"
     /// CloudKit accepted the outbound record, but iOS has not acknowledged it.
     case acceptedByTransport = "accepted_by_transport"
-    /// The Mac verified and delivered the inbound peer message to the runtime.
     case deliveredToMac = "delivered_to_mac"
-    /// The peer later confirmed delivery of a Mac-originated notification.
     case confirmedByPeer = "confirmed_by_peer"
     var deliveryConfirmed: Bool {
         switch self {

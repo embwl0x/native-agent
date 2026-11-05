@@ -1,9 +1,8 @@
 import Foundation
 
-// Blueprint: | `OrganismResolutionFelt.swift` | `OrganismResolutionFelt`: pure notable resolution events with aboutness and per-path rate bounds; kernel retains state ownership |
+// Blueprint: | `OrganismResolutionFelt.swift` | `OrganismResolutionFelt`: bounded notable resolutions with aboutness |
 
-// Pure ledger differences yield notable relief and disappointment with
-// aboutness and per-path rate bounds; OrganismKernel owns the state.
+// Pure ledger differences yield notable relief and disappointment with aboutness and per-path rate bounds; OrganismKernel owns the state.
 
 public struct OrganismResolutionFeltEvent: Sendable, Equatable {
     public enum Kind: String, Sendable {
@@ -13,15 +12,12 @@ public struct OrganismResolutionFeltEvent: Sendable, Equatable {
 
     public let kind: Kind
     public let pathKind: OrganismPredictionKind
-    /// The organ the resolved expectation was about ("tool:swift_build") —
-    /// real aboutness for the felt node the substrate mints.
+    /// Retain the resolved organ as the felt node's actual aboutness.
     public let sourceOrgan: String
-    /// Relief: how braced the body was (0…1). Disappointment: how far above
-    /// even odds the expectation sat (0…0.5).
+    /// Relief: how braced the body was (0…1). Disappointment: how far above even odds the expectation sat (0…0.5).
     public let magnitude: Double
     public let occurredAt: Date
-    /// Semantic resolution provenance, nil for other path kinds. The runtime
-    /// nests `sessionField` and `turnField` under
+    /// Semantic resolution provenance, nil for other path kinds. The runtime nests `sessionField` and `turnField` under
     /// `OrganismSemanticExpectation.mintMetadataKey` on the felt cognitive event.
     public let semanticScope: OrganismSemanticScope?
 
@@ -49,11 +45,7 @@ public enum OrganismResolutionFelt {
     /// At most one felt resolution per path kind per hour.
     static let feltInterval: TimeInterval = 3600
 
-    /// Diffs the ledger across one OrganismPredictiveBody.applying pass and
-    /// returns the felt events plus the ledger with rate stamps applied.
-    /// `before` must be the ledger as it stood when the resolving signal's
-    /// bracing was measured (pre-application), so the felt magnitude matches
-    /// the chemistry actually released.
+    /// Diff against pre-application bracing so felt magnitude matches released chemistry; rate stamps travel in the returned ledger.
     public static func events(
         before: OrganismPredictionLedger,
         after: OrganismPredictionLedger,
@@ -117,8 +109,7 @@ public enum OrganismResolutionFelt {
     ) {
         var stamps = ledger.lastResolutionFeltAt ?? [:]
         stamps[kind.rawValue] = now
-        // Defensive prune: only real kinds may occupy the map (every add has
-        // a bound — the keyspace itself).
+        // Restrict rate keys to real prediction kinds so the map stays bounded.
         let valid = Set([
             OrganismPredictionKind.toolCompletion, .providerCompletion,
             .phoneDelivery, .approvalResolution, .workflowAdvance,

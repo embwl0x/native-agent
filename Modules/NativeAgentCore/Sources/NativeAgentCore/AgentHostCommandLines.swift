@@ -4,63 +4,39 @@ import Foundation
 import os
 import Security
 
-// Blueprint: | `AgentHostCommandLines.swift` | `AgentHostCommandLines`: data-driven CLI launch/stream contracts, executable resolution and scrubbed environment; no host-specific adapter branches |
+// Blueprint: | `AgentHostCommandLines.swift` | `AgentHostCommandLines`: CLI contracts and scrubbed launches |
 
-/// HOW A COMMAND-LINE AGENT TAKES A PROMPT AND PRINTS A REPLY — data, like
-/// everything else on a known-agent row. One adapter reads this; nothing
-/// branches on which agent it came from.
-///
-/// Flags come from the agent's published documentation. Argument substitution
-/// is tested without launching personal agents. Where no resume contract is
-/// implemented the entry
-/// leaves `continuation` empty and every message is standalone, which is the
-/// honest answer rather than a guess at somebody else's session store.
+/// One data-driven adapter reads documented CLI contracts without host-specific branches. Without a resume contract, messages remain standalone rather than
+/// guessing a session identity.
 public struct AgentHostCommandLine: Sendable, Equatable, Codable {
-    /// Placeholders the adapter substitutes, one argument at a time, so a
-    /// message is never parsed as a flag or split by a shell.
+    /// Placeholders the adapter substitutes, one argument at a time, so a message is never parsed as a flag or split by a shell.
     public static let messagePlaceholder = "{{message}}"
     public static let sessionPlaceholder = "{{session}}"
     public static let replyFilePlaceholder = "{{reply_file}}"
-    /// What the conversation is called on the agent's side, where its CLI
-    /// lets a session be named: "NativeAgent · <her name> · <label>".
     public static let sessionNamePlaceholder = "{{session_name}}"
 
-    /// The executable name, resolved through the recipe and the login PATH.
     public let executable: String
-    /// The argv for a first message, in its non-interactive/print mode. It ends
-    /// with the CLI's documented end-of-options marker before the message, so
-    /// text beginning with a dash stays text.
+    /// The argv for a first message, in its non-interactive/print mode. It ends with the CLI's documented end-of-options marker before the message, so text
+    /// beginning with a dash stays text.
     public let arguments: [String]
-    /// The argv for a later message in the SAME conversation, or empty when
-    /// the CLI documents no resume flag.
+    /// The argv for a later message in the SAME conversation, or empty when the CLI documents no resume flag.
     public let continuation: [String]
-    /// When the CLI documents writing its final message to a file, the name of
-    /// that file inside the run's own working directory. Otherwise stdout is
-    /// the reply.
+    /// When the CLI documents writing its final message to a file, the name of that file inside the run's own working directory. Otherwise stdout is the reply.
     public let replyFileName: String?
-    /// The CLI, rather than this app, assigns the session in protocol output.
-    /// Never substitute a locally invented identity.
+    /// The CLI, rather than this app, assigns the session in protocol output. Never substitute a locally invented identity.
     public let capturesThreadID: Bool
-    /// A complete JSON result envelope supplies the reply and session.
     public let jsonResultReply: Bool
-    /// Envelope keys for reply, session, status and optional error flag;
-    /// success is the status value that proves a reply.
+    /// Envelope keys for reply, session, status and optional error flag; success is the status value that proves a reply.
     public let resultFields: [String: String]?
-    /// Some headless hosts cannot ask for permission to call an MCP tool.
-    /// Their command conversation is independent of that optional return path.
+    /// Some headless hosts cannot ask for permission to call an MCP tool. Their command conversation is independent of that optional return path.
     public let automaticMCPProbe: Bool
-    /// The CLI prints one JSON event per line while it answers; the
-    /// adapter reads those as live progress. nil: its output is read at exit.
+    /// The CLI prints one JSON event per line while it answers; the adapter reads those as live progress. nil: its output is read at exit.
     public let stream: Stream?
-    /// Which documented permission flags carry NativeAgent's launch decision
-    /// (`DrivenAgentLaunchPermission`). nil: this CLI is not given one.
+    /// Which documented permission flags carry NativeAgent's launch decision (`DrivenAgentLaunchPermission`). nil: this CLI is not given one.
     public let permissionFlags: PermissionFlags?
-    /// The wall-clock limit for one run.
     public let timeoutSeconds: Int
-    /// The documentation these flags were checked against.
     public let documentation: String
-    /// The oldest release that takes these flags (Claude Code's --name came
-    /// in 2.1.76). nil: any release.
+    /// Require the release that supports these flags; Claude Code's --name requires 2.1.76. Nil imposes no version floor.
     public let minimumVersion: String?
 
     public var continuesConversations: Bool { !continuation.isEmpty }
@@ -85,21 +61,24 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         self.minimumVersion = minimumVersion
     }
 
-    /// Why a program that reported `reported` (its `--version` text) cannot
-    /// run these flags: older than `minimumVersion`, or no version to read.
-    /// Nil when it is new enough.
+    /// Refuse incompatible or unreadable versions before passing flags the installed CLI may not understand.
     public func versionFailure(program: String, reported: String?) -> String? {
         guard let minimumVersion else { return nil }
         guard let found = reported?.range(of: #"\d+(\.\d+)+"#, options: .regularExpression).map({ String(reported![$0]) }) else {
-            return "\(program)'s version could not be read (\(program) --version), so whether it takes this recipe's flags (from \(minimumVersion)) is unknown. Update \(program), then Agents > Verify. Nothing was sent."
+            return """
+                \(program)'s version could not be read (\(program) --version), so whether it takes this recipe's flags (from \(minimumVersion)) is unknown. \
+                Update \(program), then Agents > Verify. Nothing was sent.
+                """
         }
         let have = found.split(separator: ".").compactMap { Int($0) }, need = minimumVersion.split(separator: ".").compactMap { Int($0) }
         guard have.lexicographicallyPrecedes(need) else { return nil }
-        return "\(program) is \(found); this connection needs \(minimumVersion) or newer (\(documentation)). Update \(program), then Agents > Verify. Nothing was sent."
+        return """
+            \(program) is \(found); this connection needs \(minimumVersion) or newer (\(documentation)). Update \(program), then Agents > Verify. Nothing was \
+            sent.
+            """
     }
 
-    /// Read reply and identity together; only protocol evidence confirms identity,
-    /// independently of reply success. Conflicting identities cannot be resumed.
+    /// Read reply and identity together; only protocol evidence confirms identity, independently of reply success. Conflicting identities cannot be resumed.
     public func interpretOutput(stdout: String, expected: String? = nil) -> (reply: String?, failure: String?, threadID: String?) {
         if jsonResultReply {
             guard let fields = resultFields, let object = resultObject(stdout) else { return (nil, nil, nil) }
@@ -131,7 +110,6 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         return (nil, nil, found)
     }
 
-    /// The whole-output envelope, or in stream form the one `result` event's.
     private func resultObject(_ stdout: String) -> [String: Any]? {
         guard let data = stdout.data(using: .utf8), data.count <= 16 * 1024 * 1024 else { return nil }
         if let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
@@ -151,16 +129,12 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         }
     }
 
-    /// Stream shapes, by protocol rather than by agent.
     public enum Stream: String, Sendable, Equatable, Codable, CaseIterable {
-        /// `agy --output-format stream-json`: step_update text_delta, then one result.
         case antigravity
-        /// `codex exec --json`: whole items as they complete.
         case codex
     }
 
     public enum PermissionFlags: String, Sendable, Equatable, Codable, CaseIterable {
-        /// `codex -c sandbox_mode=… -c approval_policy=…`.
         case codex
         case claude
     }
@@ -173,8 +147,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         case activity
     }
 
-    /// Retain only reply/identity evidence, so tool chatter cannot crowd out
-    /// the closing result. Live text is consumed separately as it arrives.
+    /// Retain only reply/identity evidence, so tool chatter cannot crowd out the closing result. Live text is consumed separately as it arrives.
     public func streamEvent(line: String) -> (retain: Bool, event: StreamEvent?) {
         guard let stream else { return (jsonResultReply, nil) }
         guard let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return (false, nil) }
@@ -195,10 +168,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         }
     }
 
-    /// One argv, with every placeholder replaced as a WHOLE argument. A first
-    /// message opens the conversation; `resuming` continues one the caller
-    /// already has an identity for.
-    /// `sessionName` is read only when the template names the session.
+    /// Replace each placeholder as one whole argument so message text cannot become shell syntax; resume only an observed conversation identity.
     public func argv(message: String, session: String?, resuming: Bool, replyFilePath: String?,
                      sessionName: () -> String) -> [String] {
         let template = (resuming && continuesConversations) ? continuation : arguments
@@ -210,8 +180,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
             case Self.replyFilePlaceholder: return replyFilePath ?? ""
             case Self.sessionNamePlaceholder: return name
             default:
-                // Bind option values in the same argv element, so a message
-                // beginning with '-' can never become an option.
+                // Bind option values in the same argv element, so a message beginning with '-' can never become an option.
                 if argument.hasSuffix("=" + Self.messagePlaceholder) {
                     return String(argument.dropLast(Self.messagePlaceholder.count)) + message
                 }
@@ -221,8 +190,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     }
 }
 
-/// The contact owner's checked message-effect projection. Trust sits below
-/// that owner, so assembly installs its reader; absence reports unavailable.
+/// The contact owner's checked message-effect projection. Trust sits below that owner, so assembly installs its reader; absence reports unavailable.
 public enum AgentHostLaunches {
     public typealias Launch = (acp: AgentHostACP?, commandLine: AgentHostCommandLine?)
     private static let reader = OSAllocatedUnfairLock<(@Sendable (String, URL) throws -> Bool)?>(initialState: nil)
@@ -239,7 +207,6 @@ public enum AgentHostLaunches {
     }
 }
 
-/// Command-line executable resolution and the login environment used by host recipes.
 public enum AgentHostCommandLines {
     /// Read once per app launch, with the same startup files as a login terminal.
     public static let loginEnvironment: Result<[String: String], ToolFailureError> = {
@@ -288,8 +255,7 @@ public enum AgentHostCommandLines {
                           home: FileManager.default.homeDirectoryForCurrentUser.path)
     }
 
-    /// A command as the file that runs: an absolute path, or a name on the
-    /// login PATH, with its links resolved; nil when no executable file.
+    /// Resolve links before comparing executable identities; a missing executable has no identity.
     public static func resolveCommand(_ command: String) -> String? {
         guard command.hasPrefix("/") else { return resolveExecutable(command) }
         let path = URL(fileURLWithPath: command).resolvingSymlinksInPath().path
@@ -297,8 +263,7 @@ public enum AgentHostCommandLines {
         return stat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG && access(path, X_OK) == 0 ? path : nil
     }
 
-    /// What an executable file is: its code directory hash when signed, else
-    /// the SHA-256 of its bytes. A program that changes has another identity.
+    /// What an executable file is: its code directory hash when signed, else the SHA-256 of its bytes. A program that changes has another identity.
     public static func identity(ofExecutable path: String) -> String? {
         var code: SecStaticCode?
         var info: CFDictionary?
@@ -322,15 +287,8 @@ public enum AgentHostCommandLines {
         return nil
     }
 
-    /// THE ENVIRONMENT ANOTHER AGENT'S COMMAND GETS, and nothing else.
-    ///
-    /// This app's own environment carries provider keys and the bridge token.
-    /// Handing that to an external program would give it, silently, everything
-    /// this app can reach — so the run starts from a scrubbed set instead: the
-    /// few variables a command needs to find itself, its user and its locale,
-    /// and no others. Each of the two rows above was run under exactly this set
-    /// and answered normally; a variable is added here only when a verified CLI
-    /// provably needs it.
+    /// Provider keys and the bridge token must never reach an external agent. Start from only the variables needed for executable lookup, user identity and
+    /// locale; add a variable only for a verified CLI requirement.
     public static func scrubbedEnvironment() -> [String: String] {
         switch loginEnvironment {
         case .success(let environment): return environment

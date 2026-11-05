@@ -14,7 +14,7 @@ import SlackBot
 import TelegramBot
 import TrustCenter
 
-// Blueprint: | `AppQuietLowerOnly.swift` | `AppQuietSettingsHost` and `AppQuietToolHost`: app connector/permission command bindings with Full Mac ownership limits and visible decisions |
+// Blueprint: | `AppQuietLowerOnly.swift` | `AppQuietSettingsHost`, `AppQuietToolHost`: Connector commands; Full Mac ownership |
 
 extension AppQuietSettingsHost {
     var statusForAgent: String { appModel.statusForAgent }
@@ -53,7 +53,8 @@ extension AppQuietSettingsHost {
         return (policy.allowedChannelIds, policy.allowedUserIds, policy.requireMention)
     }
     func afterCurrentSlackHandling(_ operation: @escaping @Sendable () async -> Void) async -> Bool {
-        await SlackSocketModeLoop.afterCurrentHandling(operation)
+        // The mounted settings host holds no Slack handler completion.
+        await SlackSocketModeLoop.afterCurrentHandling(operation, deferAfterHandling: nil)
     }
     func saveSlackIngress(channels: Set<String>, users: Set<String>, mention: Bool, dataRoot: URL) async -> (ok: Bool, error: String?) {
         let result = await NativeOAuthFlow.saveSlackToken(
@@ -66,8 +67,7 @@ extension AppQuietSettingsHost {
 // MARK: - connections
 
 extension AppQuietToolHost {
-    /// The connections pages' buttons.
-    func connections(verb: String, input: [String: JSONValue]) async -> JSONValue {
+    func connections(verb: String, input: [String: JSONValue], turn: Turn) async -> JSONValue {
         func text(_ key: String) -> String {
             input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
@@ -75,12 +75,12 @@ extension AppQuietToolHost {
             .object(["status": .string(result.succeeded ? "ok" : "failed"), "detail": .string(result.agentMessage)])
         }
         func decided(_ tool: String) {
-            HarnessDecidedRow.post(requester: "Full Mac", tool: tool, sessionID: input["__session_id"]?.scalarText,
+            HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: tool, sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.engine.dataRoot)
         }
         switch verb {
         case "connector_off", "connector_on":
-            // On is User's below Full Mac; the door refuses it there.
+            // Below Full Mac, enabling belongs to the user; the tool door refuses it.
             let on = verb == "connector_on"
             let wanted = text("id").lowercased()
             let connectors: [ConnectorRecord]
@@ -98,7 +98,7 @@ extension AppQuietToolHost {
             switch await appModel.updateConnector(connector, enabled: on) {
             case .verified:
                 if on {
-                    HarnessDecidedRow.post(requester: "Full Mac", tool: "connector.on \(connector.id)",
+                    HarnessDecidedRow.post(turn: turn, requester: "Full Mac", tool: "connector.on \(connector.id)",
                                            sessionID: input["__session_id"]?.scalarText,
                                            dataRoot: appModel.engine.dataRoot)
                 }
@@ -106,16 +106,14 @@ extension AppQuietToolHost {
                                 "detail": .string(on ? "\(connector.name) is on."
                                     : "\(connector.name) is off. Turning it back on is the owner's below Full Mac.")])
             case .failed(let detail):
-                // A thrown failure: the plain line plus its raw cause.
+                // Preserve the raw cause alongside the plain failure line.
                 let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
                 return AppToolExecutor.failure("\(verb)_failed",
                     "\(line) \(connector.name) may still be \(on ? "off" : "on"); read app {page:\"connectors\"}, then retry.",
                     extra: ["id": .string(connector.id), "effects": .string("unknown")])
             }
-        // User's four below Full Mac; the door refuses them there. Each posts
-        // the decided row he sees it by.
+        // Below Full Mac, these four controls belong to the user; each publishes its decided row.
         case "connector_disconnect":
-            // The phone's Connectors → Disconnect: the credential is revoked.
             let wanted = text("id").lowercased()
             let connectors: [ConnectorRecord]
             do { connectors = try await appModel.engine.connectors.refresh().get() }
@@ -135,10 +133,8 @@ extension AppQuietToolHost {
             return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
                             "detail": .string("\(connector.name) is disconnected and off. Signing back in is the owner's.")])
         case "telegram_disconnect":
-            // Telegram's Disconnect. The poll loop restarts only once every
-            // Telegram turn is done: its shutdown awaits them, this one too.
-            // Disconnect reads checked metadata itself; a Keychain read fault
-            // cannot make the current settings disappear or block revocation.
+            // Defer Telegram poll restart until all turns finish because shutdown awaits them, including this turn.
+            // Read metadata independently so a Keychain fault cannot erase settings or block revocation.
             let result = await appModel.clearTelegramToken(restartPollLoop: false)
             let loops = appModel.backgroundLoopsManager
             Task.detached {
@@ -148,7 +144,6 @@ extension AppQuietToolHost {
             if result.succeeded { decided("telegram.disconnect") }
             return outcome(result)
         case "pairing_remove":
-            // Connectors → iPhone → Remove.
             guard let store = appModel.engine.sync.owner?.pairedPhones else {
                 return AppToolExecutor.failure("pairing_unavailable", "Pairing is unavailable, so nothing was removed.")
             }
@@ -160,8 +155,11 @@ extension AppQuietToolHost {
                     extra: ["ids": .array(phones.map { .string($0.id) })])
             }
             guard await store.setStatus(.removed, id: phone.id) else {
-                return AppToolExecutor.failure("pairing_remove_failed",
-                    (store.message ?? "The removal did not save.") + " The phone is as it was.", extra: ["id": .string(phone.id), "effects": .string("unknown")])
+                return AppToolExecutor.failure(
+                    "pairing_remove_failed",
+                    (store.message ?? "The removal did not save.") + " The phone is as it was.",
+                    extra: ["id": .string(phone.id), "effects": .string("unknown")]
+                )
             }
             decided("pairing.remove \(phone.id)")
             return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(phone.id),
@@ -174,7 +172,7 @@ extension AppQuietToolHost {
             }
         case "telegram_test":
             return outcome(await appModel.testTelegram())
-        default: // telegram_clear_logs
+        default:
             await appModel.clearTelegramLogs()
             switch appModel.telegramClearLogsOutcome {
             case .completed(let receipt)?:
@@ -182,7 +180,11 @@ extension AppQuietToolHost {
                                 "removed_rows": .int(Int64(receipt.removedRowCount))])
             case .failed(let detail)?:
                 let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
-                return AppToolExecutor.failure("clear_logs_failed", line + " The logs are as they were; retry, or read \(AppToolExecutor.doorDoctor).", extra: ["effects": .string("unknown")])
+                return AppToolExecutor.failure(
+                    "clear_logs_failed",
+                    line + " The logs are as they were; retry, or read \(AppToolExecutor.doorDoctor).",
+                    extra: ["effects": .string("unknown")]
+                )
             case nil:
                 return AppToolExecutor.failure("clear_logs_busy", "A clear is already running; read app {page:\"telegram\"} in a moment.")
             }

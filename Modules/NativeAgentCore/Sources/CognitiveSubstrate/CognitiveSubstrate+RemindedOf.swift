@@ -1,27 +1,20 @@
-// CognitiveSubstrate+RemindedOf.swift
-// The felt line recalls a care's newest movement through cached vectors without a provider call.
-// Recalls require sign agreement, accepted-turn cadence and a per-moment 24-hour repeat gap.
+// Cached recall needs sign agreement, accepted-turn cadence and a per-moment 24h repeat gap; no provider call is made.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+RemindedOf.swift` | `CognitiveSubstrate` unbidden association: the felt line drags up a care's newest movement; cadence and selection revalidation |
+// Blueprint: | `CognitiveSubstrate+RemindedOf.swift` | `CognitiveSubstrate`: cached association, cadence and revalidation |
 
-/// One time a care moved her, as the unbidden line needs it.
 public struct CognitiveRecalledMoment: Sendable, Equatable, Identifiable {
     /// `<care id>@<seconds>`: the repeat ledger's key, never rendered.
     public let id: String
     public let careID: UUID
-    /// What she is reminded OF: her note. Rendered through the same capsule
-    /// signal renderer the `- Since:` bridge uses, and capped there.
+    /// Reuse capsule signal rendering so recall strips wrappers and shares sentence-aware bounds.
     public let text: String
-    /// How far it moved her, −1…1. A movement at exactly 0 is a note, not a
-    /// feeling, and never matches a felt line.
+    /// How far it moved the agent, −1…1. A movement at exactly 0 is a note, not a feeling, and never matches a felt line.
     public let valence: Double
-    /// When it happened — the relative age on the line comes from this.
     public let occurredAt: Date
-    /// Cosine of the felt line to the care, 0…1.
     public let score: Double
 
     public init(careID: UUID, text: String, valence: Double, occurredAt: Date, score: Double) {
@@ -33,8 +26,7 @@ public struct CognitiveRecalledMoment: Sendable, Equatable, Identifiable {
         self.score = score.clamped01()
     }
 
-    /// −1 / 0 / +1. Zero is deliberately NOT positive: a flat moment agrees
-    /// with no felt family.
+    /// −1 / 0 / +1. Zero is deliberately NOT positive: a flat moment agrees with no felt family.
     var valenceSign: Int {
         if valence > 0 { return 1 }
         if valence < 0 { return -1 }
@@ -46,25 +38,18 @@ extension CognitiveSubstrate {
 
     // MARK: - Constants
 
-    /// Accepted turns between two unbidden recalls. Six, so it reads as
-    /// something that happens to her rather than a feature that runs.
+    /// Accepted turns between two unbidden recalls. Six, so it reads as something that happens to the agent rather than a feature that runs.
     static let remindedOfMinTurns = 6
-    /// A diffuse felt line with no object needs REAL weight before it may drag
-    /// anything up; a line that already names its object does not.
+    /// A diffuse felt line with no object needs REAL weight before it may drag anything up; a line that already names its object does not.
     static let remindedOfValenceFloor = 0.35
     /// One moment surfaces at most once a day, however well it scores.
     static let remindedOfRepeatWindow: TimeInterval = 24 * 60 * 60
-    /// The first N characters of the moment, per the line's contract.
+    /// Bound moment text to the line's signal contract.
     static let remindedOfMaximumCharacters = 120
 
     // MARK: - The line
 
-    /// `- Reminded of: <moment> (<relative age>)`, or nil when the moment has
-    /// nothing sayable in it.
-    ///
-    /// The text goes through `capsuleSignalText` — the same renderer that lets
-    /// the `- Since:` bridge name a felt moment — so transport wrappers and
-    /// reply-context blocks are stripped and the cap is sentence-aware.
+    /// Use `capsuleSignalText` so transport and reply-context wrappers cannot enter a recall cue.
     func remindedOfCapsuleLine(for moment: CognitiveRecalledMoment, at now: Date) -> String? {
         let text = capsuleSignalText(
             moment.text, maxCharacters: Self.remindedOfMaximumCharacters)
@@ -75,9 +60,7 @@ extension CognitiveSubstrate {
         return line
     }
 
-    /// How long ago it was, the way a person says it. Elapsed-seconds based
-    /// rather than calendar based, except for the month name, so the phrase
-    /// cannot change with the machine's timezone.
+    /// Use elapsed age except for month names so timezone changes cannot alter relative phrasing.
     static func remindedOfAgePhrase(from occurredAt: Date, at now: Date) -> String {
         let elapsed = max(0, now.timeIntervalSince(occurredAt))
         switch elapsed {
@@ -110,12 +93,7 @@ extension CognitiveSubstrate {
 
     // MARK: - Selection
 
-    /// The one moment this felt line is allowed to drag up, if any, among the
-    /// moments of the cares it touches. Pure.
-    ///
-    /// - Parameter familySign: the sign of the felt family the line came from
-    ///   (`feltFamilySign`). A neutral family drags nothing up — there is no
-    ///   direction for a memory to agree with.
+    /// Pure selection requires family-sign agreement; neutral feeling has no direction for a memory to match.
     static func remindedOfSelection(
         from moments: [CognitiveRecalledMoment],
         familySign: Int,
@@ -136,14 +114,12 @@ extension CognitiveSubstrate {
             }
     }
 
-    /// Whether the cadence lets the line speak at all this turn.
     static func remindedOfCadenceAllows(_ state: CognitiveCapsulePresentationState) -> Bool {
         guard state.remindedOfLastSurfacedAt != nil else { return true }
         return state.remindedOfTurnsSinceSurfaced >= remindedOfMinTurns
     }
 
-    /// Bounded, id-only. Eviction is oldest-first: the entries closest to
-    /// falling out of the 24h window are the ones worth losing.
+    /// Bounded, id-only. Eviction is oldest-first: the entries closest to falling out of the 24h window are the ones worth losing.
     static func boundRemindedOfLedger(_ ledger: inout [String: Date]) {
         let cap = CognitiveCapsulePresentationState.remindedOfLedgerCapacity
         guard ledger.count > cap else { return }
@@ -159,21 +135,14 @@ extension CognitiveSubstrate {
 
     // MARK: - The one async step
 
-    /// Resolve this turn's unbidden recall against the SAME frozen read the
-    /// capsule will render from — no second workspace snapshot, no second
-    /// affect read, and one embedding of the felt line at most.
-    ///
-    /// Called from `prepareFrozenCapsulePresentation` rather than from the
-    /// render, because the render is synchronous by construction (it must be:
-    /// it mutates a copied presentation value inside one admission) and the
-    /// embedding is not. Carry the frozen felt inputs into rendering so the
-    /// lookup and capsule use the same computation.
+    /// Resolve embeddings before synchronous rendering, using the same frozen affect and workspace so lookup and capsule cannot disagree.
     func remindedOfMoment(
         for request: CognitiveCapsuleRequest,
         from read: CognitiveFrozenRead,
         among reachable: [CognitiveCare],
         felt: inout (signals: FeltSignals, fingerprint: FeltLineRender?)?,
-        unreadable: inout [String]
+        unreadable: inout [String],
+        turn: Turn
     ) async -> CognitiveRecalledMoment? {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
@@ -196,20 +165,16 @@ extension CognitiveSubstrate {
             affectEnabled: read.configuration.enabled)
         felt = (signals, fingerprint)
         guard let fingerprint else { return nil }
-        // THE TWO WAYS A FEELING IS SPECIFIC ENOUGH TO DRAG SOMETHING UP: it
-        // already names what it is about, or it is strong. A faint, objectless
-        // "quiet" is not a cue; asking with it would return whatever the store
-        // happened to have.
+        // Require a named object or strong feeling; a faint diffuse state would retrieve an arbitrary care.
         guard fingerprint.carriedObject
                 || abs(signals.valence) >= Self.remindedOfValenceFloor else { return nil }
         let sign = Self.feltFamilySign(fingerprint.family)
         guard sign != 0 else { return nil }
 
-        // Query the felt line against the turn's reachable cares; only a care
-        // that stands out for that feeling supplies a moment.
+        // Query the felt line against the turn's reachable cares; only a care that stands out for that feeling supplies a moment.
         let cosines: [UUID: Double]
         do {
-            guard let scores = try await careCosines(to: fingerprint.text, among: reachable) else { return nil }
+            guard let scores = try await careCosines(to: fingerprint.text, among: reachable, turn: turn) else { return nil }
             cosines = scores
         } catch { unreadable.append("recalled care meaning (" + error.localizedDescription + ")"); oweCareEmbedding(error); return nil }
         let moments = Self.caresStandingOut(cosines, among: reachable).compactMap { touched -> CognitiveRecalledMoment? in
@@ -224,16 +189,7 @@ extension CognitiveSubstrate {
             surfaced: read.capsulePresentationState.remindedOfSurfaced)
     }
 
-    /// RE-CHECK AFTER THE AWAIT. `remindedOfMoment` suspends on the felt
-    /// line's embedding, and the substrate is an actor: another turn can be accepted and
-    /// COMMITTED in that window. The frozen read's ledger is then stale, and the
-    /// reminder resolved against it could be a moment that has just been put in
-    /// front of her — the one thing the 24h rule exists to prevent — or a second
-    /// reminder inside the cadence.
-    ///
-    /// So the live cadence and the live ledger get the last word. Both fail
-    /// toward silence, which costs one skipped line; the other direction costs
-    /// the discipline.
+    /// Recheck live cadence and ledger after embedding suspends; an intervening accepted turn may already have shown the moment.
     func revalidatedRemindedOf(
         _ moment: CognitiveRecalledMoment,
         against read: CognitiveFrozenRead

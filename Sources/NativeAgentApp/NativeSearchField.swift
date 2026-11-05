@@ -3,14 +3,12 @@ import SwiftUI
 
 // Blueprint: | `NativeSearchField.swift` | `NativeSearchField`: NSSearchField bridge with native clear/escape/return behavior and explicit focus tokens |
 
-/// Native search field with magnifier, placeholder, clear and Escape-to-clear.
 struct NativeSearchField: NSViewRepresentable {
     @Binding var text: String
     var prompt: String
     var identifier: String
     var accessibilityLabel: String
-    /// Return, Escape, and a token that pulls the cursor in when it changes
-    /// (nil: the field never takes focus on its own).
+    /// A nil token prevents the field from taking focus on its own.
     var onSubmit: (() -> Void)? = nil
     var onEscape: (() -> Void)? = nil
     var focusRequest: UInt? = nil
@@ -38,7 +36,7 @@ struct NativeSearchField: NSViewRepresentable {
         context.coordinator.onEscape = onEscape
         if let focusRequest, focusRequest != context.coordinator.focusedFor {
             context.coordinator.focusedFor = focusRequest
-            // After the view is in its window (first pass has none yet).
+            // The first pass has no window, so defer focus until mounting finishes.
             DispatchQueue.main.async { field.window?.makeFirstResponder(field) }
         }
     }
@@ -64,8 +62,7 @@ struct NativeSearchField: NSViewRepresentable {
     }
 }
 
-/// NSSearchField keeps Escape for itself (clearing); with an onEscape the
-/// caller gets it first.
+/// Give the caller Escape before NSSearchField consumes it to clear the field.
 final class EscapableSearchField: NSSearchField {
     var onEscape: (() -> Bool)?
     override func cancelOperation(_ sender: Any?) {

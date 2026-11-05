@@ -15,34 +15,34 @@ import AgentWorkspace
 import Synchronization
 import Experiences
 import TelegramBot
-// Blueprint: | `EngineDoctorMeasurements.swift` | EngineDoctorRuntime reads live provider, search, Telegram, memory, tool, autonomy, bridge, contact, loop and organ health; malformed search responses leave readiness unverified rather than asserting inability; shared memory/search caches retain their measurement bounds |
+// Blueprint: | `EngineDoctorMeasurements.swift` | Mounted provider, memory, tool, transport and organ health |
 
-/// Each live health read queries the store; integrity checks retain their own cache.
+/// Read mounted health live while integrity checks retain their own cache.
 private let liveMemoryQuickCheck = Mutex<(at: Date, rows: [String])?>(nil)
 private let liveMemoryQuickCheckMaxAge: TimeInterval = 600
 private let liveSearchReading = Mutex<(base: String, result: Result<Bool, Error>, at: Date)?>(nil)
 
 extension EngineDoctorRuntime {
-    /// Query the mounted memory owner; attachment retries use the same owner.
+    /// Attachment retries must query the same mounted memory owner.
     func memoryDoctorCoverageCheck() async -> CheckResult {
         let title = "Live memory store"
         guard let storage = await SwiftNativeMemoryV2.shared.underlyingStorage() else {
             return CheckResult(source: "memory/memory.sqlite",
                 id: "live.memory", title: title, status: "fail",
                 detail: "The canonical memory store is not attached: \(safeDoctorDetail(SwiftNativeMemoryV2.sharedOpenFailure ?? "attachment unavailable"))",
-                harm: "Her memories cannot be saved or recalled.",
+                harm: "The agent's memories cannot be saved or recalled.",
                 repair: "Press Repair in Diagnostics → Health checks to retry canonical memory attachment."
             )
         }
         let path = await storage.path.path
         do {
-            // Every call: the pool the running app writes through answers.
+            // Query the pool the running app writes through.
             _ = try await storage.listMemories(persona: nil, status: nil, limit: 1)
             if let failure = SwiftNativeMemoryV2.graphProjectionFailure {
                 return CheckResult(source: "memory/memory.sqlite",
                     id: "live.memory", title: title, status: "fail",
                     detail: "The memory knowledge graph is waiting for canonical reconciliation: \(safeDoctorDetail(failure))",
-                    harm: "She cannot recall connections between her saved memories.",
+                    harm: "The agent cannot recall connections between its saved memories.",
                     repair: "Press Repair in Diagnostics → Health checks to reconcile the canonical memory graph."
                 )
             }
@@ -62,8 +62,11 @@ extension EngineDoctorRuntime {
                 return CheckResult(source: "memory/memory.sqlite",
                     id: "live.memory", title: title, status: "fail",
                     detail: "quick_check on \(path) reported: \(safeDoctorDetail(rows.joined(separator: "; ")))",
-                    harm: "Her saved memories may be damaged and further writes could lose them.",
-                    human_action: "Open Trust → Advanced → Backups, select a verified backup containing memory/memory.sqlite, then choose Restore → Restore backup before further writes.",
+                    harm: "The agent's saved memories may be damaged and further writes could lose them.",
+                    human_action: """
+                        Open Trust → Advanced → Backups, select a verified backup containing memory/memory.sqlite, then choose Restore → Restore backup \
+                        before further writes.
+                        """,
                     ask: .permission
                 )
             }
@@ -75,13 +78,13 @@ extension EngineDoctorRuntime {
             return CheckResult(source: "memory/memory.sqlite",
                 id: "live.memory", title: title, status: "fail",
                 detail: "The live memory store did not answer: \(safeDoctorDetail(String(describing: error)))",
-                harm: "Her memories cannot be saved or recalled.", repair: nil
+                harm: "The agent's memories cannot be saved or recalled.", repair: nil
             )
         }
     }
-    /// Fixed-port listener failures name the process holding the port.
+    /// Name the process holding a required fixed port when listener admission fails.
     func bridgesDoctorCoverageCheck() async -> CheckResult {
-        // Expected but down means the bridge's startup failed.
+        // An expected bridge being down means its startup failed.
         let bridges = await self.doctorBridgeSnapshots()
         var failures: [String] = []
         var warnings: [String] = []
@@ -92,7 +95,10 @@ extension EngineDoctorRuntime {
                 failures.append("\(name) is not listening: \(failure)")
                 if let range = failure.range(of: " is held by ") {
                     let holder = String(failure[range.upperBound...])
-                    nextSteps.append("quit \(holder.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))) to free port \(health.port) for \(name), then run Health checks again")
+                    nextSteps.append("""
+                        quit \(holder.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))) to free port \(health.port) for \
+                        \(name), then run Health checks again
+                        """)
                 } else {
                     nextSteps.append("press Repair in Diagnostics → Health checks to retry \(name) on port \(health.port)")
                 }
@@ -112,7 +118,7 @@ extension EngineDoctorRuntime {
                 id: "live.bridges", title: "Local bridges",
                 status: failures.isEmpty ? "unmeasured" : "fail",
                 detail: safeDoctorDetail((failures + warnings + healthy).joined(separator: "; ") + "."),
-                harm: failures.isEmpty ? nil : "Other apps and helpers cannot reach her through the affected local bridges.",
+                harm: failures.isEmpty ? nil : "Other apps and helpers cannot reach the agent through the affected local bridges.",
                 human_action: nextSteps.isEmpty ? nil : "For the affected bridges, " + nextSteps.joined(separator: "; ") + "."
             )
         }
@@ -123,8 +129,8 @@ extension EngineDoctorRuntime {
     }
     public func providerDoctorCoverageCheck() async -> CheckResult {
         do {
-            let (runtime, providers) = try await DoctorProviderPathReading.read(dataRoot: dataRoot)
-            // A configuration issue replaces registry coverage in the single live.providers row while present.
+            let (runtime, providers) = try await DoctorProviderPathReading.read(dataRoot: dataRoot, turn: turn)
+            // Configuration faults replace registry coverage within the single provider-health row.
             if case .configurationIssue(let check) = runtime { return check }
             let registryCheck = providerDoctorCoverageCheck(providers.map { ($0.auth_status.state, $0.auth_status.eligible) })
             switch runtime {
@@ -135,16 +141,17 @@ extension EngineDoctorRuntime {
                     id: "live.providers",
                     title: "Providers and OAuth",
                     status: "warn",
-                    detail: registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; active path: " + safeDoctorDetail(detail),
-                    harm: "She cannot reliably answer through the active provider.",
+                    detail: registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; active path: "
+                        + safeDoctorDetail(detail),
+                    harm: "The agent cannot reliably answer through the active provider.",
                     human_action: detail.hasPrefix("No usable provider")
-                        ? "Open Providers → Chat and choose an authenticated Provider and Model."
+                        ? "Open Providers → Chat → Model and choose an account and model."
                         : detail.contains("isn't offered") || detail.contains("is no longer offered")
                             ? "Open Providers → Chat → Model and choose a model offered by the selected Provider."
-                            : "Open Providers → active account → Manage → Test the connection and follow its authentication or connectivity step.",
+                            : "Open Providers → Accounts → active account → Test the connection and follow its reported recovery step.",
                     ask: detail.hasPrefix("No usable provider") ? .signIn : nil
                 )
-                // Only a path without a pending-transaction repair needs the person's provider control.
+                // Only paths without pending-transaction repair need the user’s provider control.
                 guard check.ask == nil, await self.doctorLiveRepair(for: check, scope: .button) == nil else { return check }
                 check.ask = .permission
                 return check
@@ -156,21 +163,23 @@ extension EngineDoctorRuntime {
             case .current:
                 guard registryCheck.status == "ok" else { return registryCheck }
                 var reading = registryCheck
-                reading.detail = registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; active provider path is ready."
+                reading.detail = registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
+                    + "; active provider path is ready."
                 reading.repair = nil
                 return reading
             case .stale(let providerID):
                 var reading = registryCheck
                 reading.source = "Providers > Chat"
                 reading.status = DoctorSafeRepairPolicy.isAdverse(registryCheck.status) ? registryCheck.status : "unmeasured"
-                reading.detail = registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; last native provider check for \(providerID ?? "an unknown provider") is stale."
-                reading.human_action = registryCheck.human_action ?? "Open Providers → active account → Manage → Test the connection."
+                reading.detail = registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
+                    + "; last native provider check for \(providerID ?? "an unknown provider") is stale."
+                reading.human_action = registryCheck.human_action ?? "Open Providers → Accounts → active account → Test the connection."
                 return reading
             case .unavailable(let detail):
-                // No native connection test exists for this route; ready
-                // authentication is the whole verdict, not a fault.
+                // This route has no native probe; authentication readiness is its full verdict, never an invented fault.
                 var reading = registryCheck
-                reading.detail = registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; " + safeDoctorDetail(detail)
+                reading.detail = registryCheck.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; "
+                    + safeDoctorDetail(detail)
                 return reading
             case .failed(let detail):
                 return CheckResult(source: "Providers > Chat",
@@ -178,7 +187,7 @@ extension EngineDoctorRuntime {
                     title: "Providers and OAuth",
                     status: "fail",
                     detail: "The last native provider check failed: \(safeDoctorDetail(detail))",
-                    human_action: "Open Providers → active account → Manage → Test the connection and follow its reported recovery step."
+                    human_action: "Open Providers → Accounts → active account → Test the connection and follow its reported recovery step."
                 )
             }
         } catch {
@@ -191,9 +200,16 @@ extension EngineDoctorRuntime {
             return CheckResult(source: file?.path ?? "Providers > saved configuration",
                 id: "live.providers", title: "Providers and OAuth", status: "fail",
                 detail: "Provider registry could not be read: \(safeDoctorDetail(error.localizedDescription))",
-                harm: "She cannot choose an authenticated provider to answer.", repair: nil,
+                harm: "The agent cannot choose an authenticated provider to answer.", repair: nil,
                 human_action: [file.map { ToolFailureError.fileRepairInstruction($0,
-                    shape: "This JSON object holds the saved provider routing selection or its pending transaction. Preserve all surface, provider, model, effort and transaction fields; never choose a replacement provider or alter credentials.") }, "Open Providers and check its saved provider configuration; restore the provider registry from a valid backup if it cannot be read."].compactMap { $0 }.joined(separator: " "))
+                    shape: """
+                        This JSON object holds the saved provider routing selection or its pending transaction. Preserve all surface, provider, model, effort \
+                        and transaction fields; never choose a replacement provider or alter credentials.
+                        """) },
+                            """
+                                Open Providers and check its saved provider configuration; restore the provider registry from a valid backup if it cannot be \
+                                read.
+                                """].compactMap { $0 }.joined(separator: " "))
         }
     }
     func telegramDoctorCoverageCheck() async -> CheckResult {
@@ -211,7 +227,10 @@ extension EngineDoctorRuntime {
                 detail: "Telegram status could not be read: \(safeDoctorDetail(error.localizedDescription))",
                 harm: "Telegram messages may not be read or answered.", repair: nil,
                 human_action: ToolFailureError.fileRepairInstruction(self.dataRoot.appendingPathComponent("telegram/config.json"),
-                    shape: "This JSON object holds Telegram's saved enabled flag, sender allowlists and configuration. Preserve all credential references and admission choices exactly."))
+                    shape: """
+                        This JSON object holds Telegram's saved enabled flag, sender allowlists and configuration. Preserve all credential references and \
+                        admission choices exactly.
+                        """))
         }
     }
     func searchDoctorCoverageCheck(probe: Bool) async -> CheckResult {
@@ -235,7 +254,7 @@ extension EngineDoctorRuntime {
             return CheckResult(source: "abilities/",
                 id: "live.tools", title: "Tool Registry", status: "fail",
                 detail: "Tool registry could not be read: \(safeDoctorDetail(error.localizedDescription))",
-                harm: "She cannot use her self-built tools.",
+                harm: "The agent cannot use its self-built tools.",
                 human_action: "Open Trust → Advanced → Backups, select a verified backup, then choose Restore → Restore backup.", ask: .permission
             )
         }
@@ -248,7 +267,7 @@ extension EngineDoctorRuntime {
             return CheckResult(source: "trust/policy.json > enableAutonomy and autonomyDefault",
                 id: "live.autonomy", title: "Autonomy", status: "fail",
                 detail: "Autonomy state could not be read: \(safeDoctorDetail(error.localizedDescription))",
-                harm: "She cannot safely continue work on her own.",
+                harm: "The agent cannot safely continue work on its own.",
                 human_action: "Open Trust → Advanced → Backups, select a verified backup, then choose Restore → Restore backup.", ask: .permission
             )
         }
@@ -260,15 +279,15 @@ extension EngineDoctorRuntime {
     public func safeDoctorDetail(_ value: String) -> String {
         Self.safeDetail(value)
     }
-    /// ProviderRouting eligibility and each path's receipt determine readiness.
+    /// Read readiness from routing eligibility and each path’s receipt.
     private func providerDoctorCoverageCheck(_ providers: [(state: String, eligible: Bool)]) -> CheckResult {
         let usable = providers.filter(\.eligible)
         if usable.isEmpty {
             return CheckResult(source: "Providers > Chat",
                 id: "live.providers", title: "Providers and OAuth", status: "warn",
                 detail: "Provider registry is readable, but no provider currently has usable authentication.",
-                harm: "She has no authenticated provider to answer through.",
-                human_action: "Providers → Sign in, reconnect or add an account → choose your provider → Sign in.",
+                harm: "The agent has no authenticated provider to answer through.",
+                human_action: "Providers → Accounts → choose your provider → Add key or Sign in → protected connection card.",
                 ask: .signIn
             )
         }
@@ -339,7 +358,7 @@ extension EngineDoctorRuntime {
         if raw.isEmpty {
             return CheckResult(source: source, id: "live.search", title: "Search", status: "fail",
                                detail: "Web search is unavailable because SearXNG is not configured.",
-                               harm: "She cannot search the web.",
+                               harm: "The agent cannot search the web.",
                                human_action: "Open Research → Search service, enter the SearXNG URL, then click Save.")
         }
         let validURL = URL(string: raw).map {
@@ -348,11 +367,13 @@ extension EngineDoctorRuntime {
         } ?? false
         guard validURL else {
             return CheckResult(source: source, id: "live.search", title: "Search", status: "fail",
-                               detail: "The configured SearXNG URL is invalid, so her web searches fail.",
-                               harm: "She cannot search the web.",
-                               human_action: "Open Research → Search service, enter a complete HTTP(S) URL in SearXNG URL without a query or fragment, then click Save.")
+                               detail: "The configured SearXNG URL is invalid, so the agent's web searches fail.",
+                               harm: "The agent cannot search the web.",
+                               human_action: """
+                                   Open Research → Search service, enter a complete HTTP(S) URL in SearXNG URL without a query or fragment, then click Save.
+                                   """)
         }
-        // Doctor runs probe; the health pill reads the cached result.
+        // Doctor may probe; the health pill must read the cached result.
         if probe {
             let result: Result<Bool, Error>
             do { result = .success(try await self.doctorProbeSearch(base: raw)) }
@@ -374,7 +395,7 @@ extension EngineDoctorRuntime {
             if let failure = error as? ResearchClientError, case .malformedResponse = failure {
                 harm = "Search readiness is unverified because the probe response could not establish it."
             } else {
-                harm = "She cannot search the web until the configured service answers."
+                harm = "The agent cannot search the web until the configured service answers."
             }
             return CheckResult(source: source, id: "live.search", title: "Search", status: "warn",
                 detail: "The configured SearXNG probe is unavailable: \(safeDoctorDetail(error.localizedDescription))",
@@ -382,15 +403,15 @@ extension EngineDoctorRuntime {
         case .success(false):
             return CheckResult(source: source, id: "live.search", title: "Search", status: "warn",
                 detail: "Connection refused at the configured SearXNG address \(safeDoctorDetail(raw)); no search response was received.",
-                harm: "She cannot search the web until the configured service answers.")
+                harm: "The agent cannot search the web until the configured service answers.")
         }
     }
-    /// Saved admission states are facts; a quarantine is not damage to undo.
+    /// Quarantine is an admission fact, not damage to undo.
     private func toolsDoctorCoverageCheck(_ tools: [DoctorToolSnapshot]) -> CheckResult {
         let quarantined = tools.filter { $0.status.lowercased() == "quarantined" }
         let active = tools.filter { $0.status.lowercased() == "active" }.count
         let scope = "; registry read only, with no tool invoked, so execution is unmeasured."
-        // This registry holds promoted self-built tools; an empty registry is healthy.
+        // An empty promoted-tool registry is healthy.
         if tools.isEmpty {
             return CheckResult(source: "abilities/",
                 id: "live.tools", title: "Tool Registry", status: "ok",
@@ -465,7 +486,10 @@ extension EngineDoctorRuntime {
                 id: "install.data_root", title: "Data root", status: "fail",
                 detail: "The data-root move marker is unreadable or malformed: \(marker.path).",
                 human_action: ToolFailureError.fileRepairInstruction(marker,
-                    shape: "This JSON object records installation history, including its reason and any earlier data-root move's backupPath. Preserve the original history and backup location; never invent a move or backup."))
+                    shape: """
+                        This JSON object records installation history, including its reason and any earlier data-root move's backupPath. Preserve the \
+                        original history and backup location; never invent a move or backup.
+                        """))
         }
         return CheckResult(source: marker.path,id: "install.data_root", title: "Data root", status: "ok",
                            detail: "No existing backup from an earlier data-root move was found.")
@@ -477,8 +501,7 @@ extension EngineDoctorRuntime {
         let now = Date()
         let uptime = await manager.uptimeSeconds(now: now)
         let pollDate = status.lastPollAt.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
-        // A normal poll holds up to 25 seconds, then waits for the next tick.
-        // Require both current-manager-lifecycle evidence and a bounded age.
+        // Long polls may hold for 25 seconds; require bounded-age evidence from the current manager lifecycle.
         let fresh = pollDate.map {
             let age = now.timeIntervalSince($0)
             return age >= 0 && age <= 35 && age < uptime
@@ -525,26 +548,33 @@ extension EngineDoctorRuntime {
                 guard health.isBroken else { return nil }
                 return health.problem.map { (peers.first { "peer:" + $0.id == agent }?.name ?? agent) + ": " + $0 }
             }
-            // Only connections owing repair are problems; each obligation projects its own remedy.
+            // Only repair obligations are problems; project each owner’s remedy.
             source = "experiences/experiences.sqlite"
             for owed in try await ExperienceStore.at(root).projection() where owed.owes["repair"]?.phase.isSettled == false
-                && owed.claims.contains(where: { $0.claim.hasPrefix("operation: peer.") || $0.claim.hasPrefix("operation: agent.") }) {
-                let operation = owed.claims.first { $0.claim.hasPrefix("operation: ") }?.claim ?? "agent connection"
+                && RepairDebt(owed).operation.map({ $0.hasPrefix("peer.") || $0.hasPrefix("agent.") }) == true {
+                let operation = RepairDebt(owed).operation.map { "operation: " + $0 } ?? "agent connection"
                 problems.append("\(operation) still owes repair (\(owed.id))")
             }
             return CheckResult(source: "agents/peers.json, agents/local-health.json and experiences/experiences.sqlite",
                 id: "live.agent_connections", title: "Agent connections", status: problems.isEmpty ? "ok" : "fail",
                 detail: problems.isEmpty ? "No broken reply path is recorded; setup alone does not prove a reply."
-                    : "Agent connection evidence: " + problems.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) }.joined(separator: "; ") + ".")
+                    : "Agent connection evidence: " + problems.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) }
+                        .joined(separator: "; ") + ".")
         } catch {
             return CheckResult(source: source,
                 id: "live.agent_connections", title: "Agent connections", status: "fail",
                 detail: "Agent connection evidence is unavailable: \(Self.safeDetail(error.localizedDescription))",
-                harm: "Her saved helper contacts and conversations cannot be read.", repair: nil,
+                harm: "The agent's saved helper contacts and conversations cannot be read.", repair: nil,
                 human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent(source),
                     shape: source == "experiences/experiences.sqlite"
-                        ? "This SQLite experience store retains original experiences, claims, evidence and obligation phases. Preserve their identities and settlement history."
-                        : "Retain the saved peer contacts, conversations or local-health observations in this file, with their original identities and recorded states. Preserve credentials, admission and elevation choices exactly; never grant authority or invent a reply."))
+                        ? """
+                            This SQLite experience store retains original experiences, claims, evidence and obligation phases. Preserve their identities and \
+                            settlement history.
+                            """
+                        : """
+                            Retain the saved peer contacts, conversations or local-health observations in this file, with their original identities and \
+                            recorded states. Preserve credentials, admission and elevation choices exactly; never grant authority or invent a reply.
+                            """))
         }
     }
 
@@ -552,10 +582,9 @@ extension EngineDoctorRuntime {
         let observations = await port.doctorManager.status()
         let receipts: [String: [DoctorLoopHealth.FailureIncident]]
         do {
-            receipts = try DoctorLoopHealth.recentFailureDates(
-                receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl"))
+            receipts = try await DoctorLoopHealth.recentFailureDates(dataRoot: dataRoot)
         } catch {
-            return CheckResult(source: "logs/background_loop_failures.jsonl",
+            return CheckResult(source: "Loop failure details",
                 id: "background_loops", title: "Background loops", status: "fail",
                 detail: "Loop failure history is unavailable: \(error.localizedDescription)")
         }
@@ -576,21 +605,22 @@ extension EngineDoctorRuntime {
         )
     }
 
-    /// Each organ's last pulse, overdue by `OrganPulse.isOverdue` since this launch.
+    /// The Body view: the same projection the agent reads in `mind.body`, line for line, deviations first.
     public func doctorOrganPulsesCheck() async -> CheckResult {
         let now = Date()
-        let manager = port.doctorManager
-        let launchedAt = now.addingTimeInterval(-(await manager.uptimeSeconds(now: now)))
-        let rows = await manager.organPulses().map { pulse in
-            if pulse.isOff { return (false, "\(pulse.organ): off (\(pulse.note.dropFirst(OrganPulse.offPrefix.count)))", pulse.organ) }
-            let age = now.timeIntervalSince(pulse.at)
-            let overdue = pulse.isOverdue(now: now, launchedAt: launchedAt)
-            return (overdue, "\(pulse.organ): \(pulse.outcome.rawValue) \(DoctorLoopHealth.describeAge(age)) ago"
-                + (pulse.note.isEmpty ? "" : " (\(pulse.note))")
-                + (pulse.cadence.map { ", every \(DoctorLoopHealth.describeAge($0))" } ?? "") + (overdue ? " — overdue" : ""), pulse.organ)
-        }.sorted { ($0.0 ? 0 : 1, $0.1) < ($1.0 ? 0 : 1, $1.1) }
-        return CheckResult(source: "Organ pulse registrations",id: "live.pulses", title: "Organ pulses", status: rows.isEmpty ? "unmeasured" : rows.contains(where: \.0) ? "warn" : "ok",
-                           detail: rows.isEmpty ? "No organ has pulsed yet." : rows.map(\.1).joined(separator: "; ") + ".")
+        let body: OrganBody
+        do { body = try await port.doctorManager.organBody(now: now) }
+        catch {
+            return CheckResult(source: "Organ beats", id: "live.pulses", title: "Body", status: "fail",
+                               detail: "The organ beats in experiences/experiences.sqlite could not be read: \(error.localizedDescription).")
+        }
+        let gaps = body.unreadable.isEmpty ? "" : " Unreadable beats, so unknown: "
+            + body.unreadable.sorted { $0.key < $1.key }.map { OrganBody.name($0.key) + " (" + $0.value + ")" }.joined(separator: "; ") + "."
+        return CheckResult(source: "Organ beats", id: "live.pulses", title: "Body",
+                           status: body.lines.isEmpty && body.unreadable.isEmpty ? "unmeasured"
+                               : body.felt.isEmpty && body.unreadable.isEmpty ? "ok" : "warn",
+                           detail: (body.lines.isEmpty ? "No organ has a readable beat yet, so nothing else is known about the body."
+                               : body.lines.map { $0.words(now: now) }.joined(separator: "; ") + ".") + gaps)
     }
 
     public func doctorInspectorCheck() async -> CheckResult {

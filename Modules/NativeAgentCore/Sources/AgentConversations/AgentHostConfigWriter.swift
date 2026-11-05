@@ -4,13 +4,9 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentHostConfigWriter.swift` | `AgentHostConfigWriter` enum; `edit` prepares backups before replacement and commits ownership/prunes undo afterward; `grantMessaging`/`removeMessaging` share recipe-declared two-tool allowances, conflict checks and receipts for Claude Code, Antigravity and Zed; `checkEntry`, `writeEnvironment`, `ensureEnvironment`; same-peer reconciliation, stale-install replacement and foreign-entry refusal; `checking` validates without writing; removal preserves unproven bytes |
+// Blueprint: | `AgentHostConfigWriter.swift` | `AgentHostConfigWriter`, `edit`, `grantMessaging`, `removeMessaging`, `checkEntry`, `writeEnvironment`, `ensureEnvironment`, `checking` |
 
-/// Write one owned entry into another program's configuration file.
-/// JSON, TOML and YAML splicers replace only the entry's bytes; foreign bytes,
-/// key order, indentation and comments survive unchanged.
-///
-/// A configuration that cannot be understood is refused with a reason.
+/// Splice only owned entry bytes; preserve foreign formatting and refuse configuration that cannot be understood.
 public enum AgentHostConfigWriter {
     public enum Failure: Error, LocalizedError, Equatable {
         case unreadable(String)
@@ -24,16 +20,22 @@ public enum AgentHostConfigWriter {
         case publicationUnconfirmed(String)
         case changedUnderneath
         case entryExists(String)
-        /// This app's entry name, written by another install of it (a copy since
-        /// moved, deleted or run from elsewhere): connect owns it and replaces it.
+        /// Connect may replace this product’s entry from another install.
         case staleEntry(at: String, helper: String, gone: Bool)
 
         public var errorDescription: String? {
             switch self {
             case .staleEntry(let at, let helper, let gone):
-                return "The entry at \(at) was written by another install of this app (its helper is \(helper)\(gone ? ", which no longer exists" : "")). agent.connect replaces it with this app's entry and keeps a backup beside the file; nothing was changed."
+                return """
+                    The entry at \(at) was written by another install of this app (its helper is \
+                    \(helper)\(gone ? ", which no longer exists" : "")). agent.connect replaces it with this app's entry and keeps a backup beside \
+                    the file; nothing was changed.
+                    """
             case .entryExists(let at):
-                return "Connector collision at \(at). The existing entry belongs to another contact or has no peer ID. Review its ownership or change the recipe's configPath/format; it was left unchanged."
+                return """
+                    Connector collision at \(at). The existing entry belongs to another contact or has no peer ID. Review its ownership or change \
+                    the recipe's configPath/format; it was left unchanged.
+                    """
             case .changedUnderneath:
                 return "The settings file changed while I was working; nothing was written."
             case .unreadable(let detail): return "The configuration file could not be read safely: \(detail)."
@@ -41,27 +43,46 @@ public enum AgentHostConfigWriter {
             case .tooLarge: return "The configuration file exceeds the bounded size this writer will edit. Nothing was changed."
             case .backupFailed: return "A timestamped backup could not be written beside the configuration file, so the file was left untouched."
             case .writeFailed: return "The configuration replacement failed. Inspect the configuration and its recorded backup before another change."
-            case .receiptFailed(let path, let detail): return "The configuration was saved, but its ownership receipt or backup cleanup failed at \(path): \(detail). Inspect the settings, receipt and retained backups before another change."
-            case .cleanupFailed(let path, let detail): return "The configuration was saved, but its previous file remains at \(path): \(detail). Inspect both files before removing the previous file."
+            case .receiptFailed(let path, let detail): return """
+                The configuration was saved, but its ownership receipt or backup cleanup failed at \(path): \(detail). Inspect the settings, \
+                receipt and retained backups before another change.
+                """
+            case .cleanupFailed(let path, let detail): return """
+                The configuration was saved, but its previous file remains at \(path): \(detail). Inspect both files before removing the previous \
+                file.
+                """
             case .removalFailed(let path, let displaced, let detail):
-                return "Configuration removal failed: \(detail). The file was moved from \(path) to \(displaced); either path may now exist. Inspect both paths before another change."
-            case .publicationUnconfirmed(let path): return "The configuration replacement was published, but a concurrent host save could not be reconciled. Both versions are preserved, including \(path). Inspect both files and repair the current configuration before another change."
+                return """
+                    Configuration removal failed: \(detail). The file was moved from \(path) to \(displaced); either path may now exist. Inspect \
+                    both paths before another change.
+                    """
+            case .publicationUnconfirmed(let path): return """
+                The configuration replacement was published, but a concurrent host save could not be reconciled. Both versions are preserved, \
+                including \(path). Inspect both files and repair the current configuration before another change.
+                """
             }
         }
     }
 
-    /// Bounded by the same order of magnitude as the peer store's own limit.
+    /// Bound settings reads to the peer store’s order of magnitude.
     public static let maximumConfigurationBytes = 4 * 1_048_576
-    /// nil writes; false checks an unconnected host; true requires its saved entry.
-    @TaskLocal static var checking: Bool? = nil
-    @TaskLocal static var repairingPeer: String? = nil
-    /// The helper of a stale entry a write is replacing, for its receipt.
     final class Replaced: @unchecked Sendable { var helper: String? }
-    @TaskLocal static var replaced: Replaced? = nil
 
-    static func checkEntry(_ existing: String?, expected: String, json: Bool, at: String) throws -> Bool {
+    /// One config edit's check mode, repair identity and replacement receipt.
+    public struct Operation: Sendable {
+        let checking: Bool?
+        let repairingPeer: String?
+        let replaced = Replaced()
+        public init(checking: Bool? = nil, repairingPeer: String? = nil) {
+            self.checking = checking
+            self.repairingPeer = repairingPeer
+        }
+    }
+
+    static func checkEntry(configuration: AgentHostConfigWriter.Operation, _ existing: String?, expected: String, json: Bool, at: String) throws -> Bool {
         guard let existing else {
-            if checking == true { throw Failure.unparsable("missing connector at \(at); connect this host after reviewing host.configPath/format with agent.recipe") }
+            if configuration.checking == true { throw Failure.unparsable(
+                "missing connector at \(at); connect this host after reviewing host.configPath/format with agent.recipe") }
             return false
         }
         // An exact entry needs no write; ownership permits reconciling a moved installation.
@@ -82,15 +103,15 @@ public enum AgentHostConfigWriter {
         if let helper = old.command, let ours = new.command,
            URL(fileURLWithPath: helper).lastPathComponent == URL(fileURLWithPath: ours).lastPathComponent,
            URL(fileURLWithPath: helper).resolvingSymlinksInPath() != URL(fileURLWithPath: ours).resolvingSymlinksInPath() {
-            guard checking == nil else {
+            guard configuration.checking == nil else {
                 throw Failure.staleEntry(at: at, helper: helper, gone: !FileManager.default.isExecutableFile(atPath: helper))
             }
-            replaced?.helper = helper
+            configuration.replaced.helper = helper
             return false
         }
         guard let peer = new.peerID, !peer.isEmpty, old.peerID == peer,
-              repairingPeer == nil || repairingPeer == peer else { throw Failure.entryExists(at) }
-        if checking != nil {
+              configuration.repairingPeer == nil || configuration.repairingPeer == peer else { throw Failure.entryExists(at) }
+        if configuration.checking != nil {
             throw ToolFailureError("This contact's connector at \(at) needs reconciliation. Connect it again to update its owned entry.",
                 effects: .none, owner: at, nextCall: ToolFailureError.call("app", ["action": .string("agent.connect"),
                     "args": .object(["name": .string("peer:" + peer)])]))
@@ -98,24 +119,24 @@ public enum AgentHostConfigWriter {
         return false
     }
 
-    /// What a write did, for an honest tool result. Never carries file content.
+    /// Write receipts must never carry file content.
     public struct Outcome: Sendable, Equatable {
         public let path: String
         public let backupPath: String?
         public let replacedExistingEntry: Bool
         public let removed: Bool
-        /// The helper of another install's entry this write replaced.
         public var replacedInstall: String? = nil
     }
 
     // MARK: - The two formats
 
-    static func writeEnvironment(path: String, descriptorPath: String, peerID: String, secret: String) throws -> Outcome {
-        if checking != nil {
+    static func writeEnvironment(configuration: AgentHostConfigWriter.Operation, path: String, descriptorPath: String, peerID: String,
+        secret: String) throws -> Outcome {
+        if configuration.checking != nil {
             let expected = environmentData(descriptorPath: descriptorPath, peerID: peerID, secret: secret)
             if FileManager.default.fileExists(atPath: path) {
-                guard checking == true, try read(path: path).0 == expected else { throw Failure.entryExists(path) }
-            } else if checking == true { throw Failure.unparsable("missing environment file \(path); reconnect this host") }
+                guard configuration.checking == true, try read(path: path).0 == expected else { throw Failure.entryExists(path) }
+            } else if configuration.checking == true { throw Failure.unparsable("missing environment file \(path); reconnect this host") }
             return .init(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
         }
         let directory = URL(fileURLWithPath: path).deletingLastPathComponent()
@@ -126,10 +147,11 @@ public enum AgentHostConfigWriter {
         return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
     }
 
-    static func ensureEnvironment(path: String, descriptorPath: String, peerID: String, secret: String) throws -> Bool {
+    static func ensureEnvironment(configuration: AgentHostConfigWriter.Operation, path: String, descriptorPath: String, peerID: String,
+        secret: String) throws -> Bool {
         var info = stat()
         if lstat(path, &info) != 0, errno == ENOENT {
-            _ = try writeEnvironment(path: path, descriptorPath: descriptorPath, peerID: peerID, secret: secret)
+            _ = try writeEnvironment(configuration: configuration, path: path, descriptorPath: descriptorPath, peerID: peerID, secret: secret)
             return true
         }
         guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid() else {
@@ -175,13 +197,12 @@ public enum AgentHostConfigWriter {
         return ["agent_message", "agent_reply"].map { syntax.rule(server: server, tool: $0) }
     }
 
-    static func grantMessaging(path: String, server: String, syntax: AgentHostRow.MessagingPermissionSyntax, peerID: String,
+    static func grantMessaging(configuration: AgentHostConfigWriter.Operation, path: String, server: String, syntax: AgentHostRow.MessagingPermissionSyntax,
+        peerID: String,
                                           recordURL: URL) throws -> Outcome {
         let rules = try messagingRules(server: server, syntax: syntax)
         let allowanceOwner = path + " " + (syntax == .toolDefaults ? toolPermissionPath.joined(separator: ".") : "permissions.allow")
-        // The original receipt tag and filename remain valid for already-connected
-        // Antigravity contacts. They are an on-disk protocol, not a host selector.
-        // Existing ownership is not a reason to undo a person's later edit.
+        // Ownership receipts are an on-disk protocol, not a host selector; ownership cannot override later person-authored edits.
         if let owner = try backupRecords(at: recordURL).last?.jsonOwnership {
             guard owner.command == "antigravity-messaging", owner.peerID == peerID, owner.name == server else {
                 throw Failure.unparsable("messaging permission ownership belongs to another connection")
@@ -190,20 +211,21 @@ public enum AgentHostConfigWriter {
             try checkMessagingConflicts(current, server: server, syntax: syntax, rules: rules, path: path)
             let allowed = try messagingAllow(current, rules: rules, syntax: syntax).rules
             guard rules.allSatisfy(allowed.contains) else {
-                throw Failure.unparsable("this connection's messaging allowances were changed or removed; review \(allowanceOwner). They were not restored automatically")
+                throw Failure.unparsable(
+                    "this connection's messaging allowances were changed or removed; review \(allowanceOwner). They were not restored automatically")
             }
             return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
         }
-        return try edit(path: path, backupRecordURL: recordURL, initial: Data("{}".utf8), ownership: { data in
+        return try edit(configuration: configuration, path: path, backupRecordURL: recordURL, initial: Data("{}".utf8), ownership: { data in
             let original = try messagingAllow(data, rules: rules, syntax: syntax)
             return JSONOwnership(command: "antigravity-messaging", peerID: peerID, name: server,
                 original: original.value, originalMember: original.member)
-        }) { data in
+        }) { data, configuration in
             try checkMessagingConflicts(data, server: server, syntax: syntax, rules: rules, path: path)
             let existing = try messagingAllow(data, rules: rules, syntax: syntax).rules
             let added = rules.filter { !existing.contains($0) }
             guard !added.isEmpty else { return nil }
-            if checking == true {
+            if configuration.checking == true {
                 throw ToolFailureError("This contact's messaging allowances in \(path) need reconciliation. Connect it again to add its two messaging tools.",
                     effects: .none, owner: allowanceOwner, nextCall: ToolFailureError.call("app", [
                         "action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peerID)])]))
@@ -212,7 +234,8 @@ public enum AgentHostConfigWriter {
         }
     }
 
-    static func removeMessaging(path: String, server: String, syntax: AgentHostRow.MessagingPermissionSyntax, peerID: String,
+    static func removeMessaging(configuration: AgentHostConfigWriter.Operation, path: String, server: String, syntax: AgentHostRow.MessagingPermissionSyntax,
+        peerID: String,
                                            recordURL: URL) throws {
         guard let owner = try backupRecords(at: recordURL).last?.jsonOwnership else { return }
         guard owner.command == "antigravity-messaging", owner.peerID == peerID, owner.name == server else {
@@ -221,7 +244,7 @@ public enum AgentHostConfigWriter {
         let baseline = try permissionArray(owner.original)
         let rules = try messagingRules(server: server, syntax: syntax)
         let added = rules.filter { !baseline.contains($0) }
-        _ = try edit(path: path, backupRecordURL: recordURL, removing: true) { data in
+        _ = try edit(configuration: configuration, path: path, backupRecordURL: recordURL, removing: true) { data, _ in
             let current = try messagingAllow(data, rules: rules, syntax: syntax).rules
             let retained = current.filter { !added.contains($0) }
             guard current != retained else { return nil }
@@ -287,12 +310,14 @@ public enum AgentHostConfigWriter {
     private static func checkMessagingConflicts(_ data: Data, server: String,
         syntax: AgentHostRow.MessagingPermissionSyntax, rules: [String], path: String) throws {
         if syntax == .toolDefaults {
-            // Zed's global default is only a fallback; an explicit per-tool
-            // default takes precedence. Preserve restrictions on the tools themselves.
+            // Per-tool defaults override the host’s global default; preserve restrictions on the tools themselves.
             for rule in rules {
                 if let value = try JSONEntrySplice.member(data, path: toolPermissionPath + [rule]),
                    try !isToolAllowance(value) {
-                    throw ToolFailureError("An existing tool permission for \(rule) in \(path) constrains this connection's messaging. It was left intact and nothing was connected.",
+                    throw ToolFailureError("""
+                        An existing tool permission for \(rule) in \(path) constrains this connection's messaging. It was left intact and nothing \
+                        was connected.
+                        """,
                         effects: .none, owner: path + " agent.tool_permissions.tools." + rule,
                         tap: "Zed settings › agent › tool_permissions › tools (\(path))", personDecides: true)
                 }
@@ -301,16 +326,14 @@ public enum AgentHostConfigWriter {
         }
         for key in ["deny", "ask"] {
             let blocked = try permissionRules(data, key).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            // The documented wildcards are mcp(*) and mcp(server/*). Refuse
-            // ambiguous broad spellings too, rather than assume they do not
-            // constrain this connection on a different CLI version.
+            // The documented wildcards are mcp(*) and mcp(server/*). Refuse ambiguous broad spellings too, rather than assume they do not constrain this
+            // connection on a different CLI version.
             guard !blocked.contains(where: { rule in
                 switch syntax {
                 case .mcpCall:
                     return ["*", "mcp", "mcp(\(server))", "mcp(*)", "mcp(\(server)/*)"].contains(rule) || rules.contains(rule)
                 case .doubleUnderscore:
-                    // Ask/Deny accept full-name globs, including partial server
-                    // and tool names. Bare server rules cover all its tools.
+                    // Ask/Deny accept full-name globs, including partial server and tool names. Bare server rules cover all its tools.
                     let tool = String(rule.prefix { $0 != "(" })
                     let pattern = "^" + NSRegularExpression.escapedPattern(for: tool)
                         .replacingOccurrences(of: "\\*", with: ".*") + "$"
@@ -321,8 +344,11 @@ public enum AgentHostConfigWriter {
                 case .toolDefaults: return false // Checked above, at its per-tool owner.
                 }
             }) else {
-                // The person's own Ask/Deny rule is his decision, never a repair of ours.
-                throw ToolFailureError("An existing \(key) rule in \(path) covers or ambiguously constrains this connection's messaging tools. That rule is the person's decision; it was left intact and nothing was connected.",
+                // The person’s Ask/Deny rules are decisions, not repair debt.
+                throw ToolFailureError("""
+                    An existing \(key) rule in \(path) covers or ambiguously constrains this connection's messaging tools. That rule is the \
+                    person's decision; it was left intact and nothing was connected.
+                    """,
                     effects: .none, owner: path + " permissions." + key,
                     tap: "Settings › permissions › \(key) (\(path))", personDecides: true)
             }
@@ -343,29 +369,28 @@ public enum AgentHostConfigWriter {
         return array
     }
 
-    /// `{ "mcpServers": { "<name>": { … } } }` — Claude Code's `~/.claude.json`,
-    /// Claude Desktop's `claude_desktop_config.json`, and every host that copied
-    /// that shape.
-    public static func writeJSONEntry(
+    public static func writeJSONEntry(configuration: AgentHostConfigWriter.Operation,
         path: String, name: String, entryJSON: String, backupRecordURL: URL,
         containerKey: String = "mcpServers", comments: Bool = false, trailingCommas: Bool = true
     ) throws -> Outcome {
         let object = try JSONSerialization.jsonObject(with: Data(entryJSON.utf8)) as? [String: Any]
         let command = object?["command"] as? String
         let peerID = (object?["env"] as? [String: Any])?[AgentHostDirectory.peerIDVariable] as? String
-        return try edit(path: path, backupRecordURL: backupRecordURL, initial: Data("{}".utf8),
+        return try edit(configuration: configuration, path: path, backupRecordURL: backupRecordURL, initial: Data("{}".utf8),
             ownership: { data in
                 guard let command, let peerID else { return nil }
                 return JSONOwnership(command: command, peerID: peerID, name: name,
                     original: nil, originalMember: nil)
-            }) { data in
-            if try checkEntry(JSONEntrySplice.entry(data, name: name, containerKey: containerKey,
-                comments: comments, trailingCommas: trailingCommas)?.value, expected: entryJSON, json: true, at: path + ":" + containerKey + "." + name) { return nil }
-            return try JSONEntrySplice.upsert(data, name: name, entryJSON: entryJSON, containerKey: containerKey, comments: comments, trailingCommas: trailingCommas)
+            }) { data, configuration in
+            if try checkEntry(configuration: configuration, JSONEntrySplice.entry(data, name: name, containerKey: containerKey,
+                comments: comments, trailingCommas: trailingCommas)?.value, expected: entryJSON, json: true, at: path + ":" + containerKey + "."
+                    + name) { return nil }
+            return try JSONEntrySplice.upsert(data, name: name, entryJSON: entryJSON, containerKey: containerKey, comments: comments,
+                trailingCommas: trailingCommas)
         }
     }
 
-    public static func removeJSONEntry(path: String, name: String, backupRecordURL: URL,
+    public static func removeJSONEntry(configuration: AgentHostConfigWriter.Operation, path: String, name: String, backupRecordURL: URL,
                                        containerKey: String = "mcpServers", comments: Bool = false, trailingCommas: Bool = true,
                                        peerID: String? = nil) throws -> Outcome {
         let owner = try backupRecords(at: backupRecordURL).last?.jsonOwnership
@@ -374,38 +399,39 @@ public enum AgentHostConfigWriter {
                 throw Failure.unparsable("ownership receipt \(backupRecordURL.path) is missing or names another peer; settings at \(path) were preserved")
             }
         }
-        return try edit(path: path, backupRecordURL: backupRecordURL, removing: true, cleanupBackups: peerID == nil) { data in
+        return try edit(configuration: configuration, path: path, backupRecordURL: backupRecordURL, removing: true, cleanupBackups: peerID == nil) { data, _ in
             if let owner {
                 return try JSONEntrySplice.disconnect(data, owner: owner, containerKey: containerKey,
-                    comments: comments, trailingCommas: trailingCommas)
+                comments: comments, trailingCommas: trailingCommas)
             }
             return try JSONEntrySplice.remove(data, name: name, containerKey: containerKey, comments: comments, trailingCommas: trailingCommas)
         }
     }
 
-    /// `[mcp_servers.<name>]` — Codex's `~/.codex/config.toml`.
-    public static func writeTOMLEntry(
+    public static func writeTOMLEntry(configuration: AgentHostConfigWriter.Operation,
         path: String, name: String, entryTOML: String, backupRecordURL: URL
     ) throws -> Outcome {
         let identity = try TOMLEntrySplice.identity(Data(entryTOML.utf8), name: name)
-        return try edit(path: path, backupRecordURL: backupRecordURL, initial: Data(), tomlOwnership: { data in
+        return try edit(configuration: configuration, path: path, backupRecordURL: backupRecordURL, initial: Data(), tomlOwnership: { data in
             guard let identity else { return nil }
             return JSONOwnership(command: identity.command, peerID: identity.peerID, name: name,
                 original: nil)
-        }) { data in
-            if try checkEntry(TOMLEntrySplice.entry(data, name: name), expected: entryTOML, json: false, at: path + ":mcp_servers." + name) { return nil }
+        }) { data, configuration in
+            if try checkEntry(configuration: configuration, TOMLEntrySplice.entry(data, name: name), expected: entryTOML, json: false, at: path
+                + ":mcp_servers." + name) { return nil }
             return try TOMLEntrySplice.upsert(data, name: name, entryTOML: entryTOML)
         }
     }
 
-    public static func removeTOMLEntry(path: String, name: String, backupRecordURL: URL, peerID: String? = nil) throws -> Outcome {
+    public static func removeTOMLEntry(configuration: AgentHostConfigWriter.Operation, path: String, name: String, backupRecordURL: URL,
+        peerID: String? = nil) throws -> Outcome {
         let owner = try backupRecords(at: backupRecordURL).last?.tomlOwnership
         if let peerID {
             guard let owner, owner.peerID == peerID else {
                 throw Failure.unparsable("ownership receipt \(backupRecordURL.path) is missing or names another peer; settings at \(path) were preserved")
             }
         }
-        return try edit(path: path, backupRecordURL: backupRecordURL, removing: true, cleanupBackups: peerID == nil) { data in
+        return try edit(configuration: configuration, path: path, backupRecordURL: backupRecordURL, removing: true, cleanupBackups: peerID == nil) { data, _ in
             if let owner { return try TOMLEntrySplice.disconnect(data, owner: owner) }
             return try TOMLEntrySplice.remove(data, name: name)
         }
@@ -413,13 +439,13 @@ public enum AgentHostConfigWriter {
 
     // MARK: - Read, splice, back up, replace
 
-    static func edit(
+    static func edit(configuration: AgentHostConfigWriter.Operation,
         path: String, backupRecordURL: URL, removing: Bool = false, initial: Data? = nil, cleanupBackups: Bool = true,
         ownership: ((Data) throws -> JSONOwnership?)? = nil,
         tomlOwnership: ((Data) throws -> JSONOwnership?)? = nil,
-        _ splice: (Data) throws -> (data: Data, replaced: Bool, removed: Bool)?
+        _ splice: (Data, Operation) throws -> (data: Data, replaced: Bool, removed: Bool)?
     ) throws -> Outcome {
-        if checking != nil { _ = try backupRecords(at: backupRecordURL) }
+        if configuration.checking != nil { _ = try backupRecords(at: backupRecordURL) }
         var info = stat()
         let missing = lstat(path, &info) != 0 && errno == ENOENT
         if missing && removing { return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false) }
@@ -427,16 +453,16 @@ public enum AgentHostConfigWriter {
         let identity: FileIdentity?
         if missing, let initial { existing = initial; identity = nil }
         else { (existing, identity) = try read(path: path) }
-        let replacing = Replaced()
-        guard var result = try $replaced.withValue(replacing, operation: { try splice(existing) }) else {
-            // Nothing to do — an absent entry a disconnect was asked to remove.
+        // Each edit owns its replacement receipt, even when one connection edits several files.
+        let configuration = Operation(checking: configuration.checking, repairingPeer: configuration.repairingPeer)
+        let replacing = configuration.replaced
+        guard var result = try splice(existing, configuration) else {
             if removing && cleanupBackups { try removeBackups(path: path, recordURL: backupRecordURL) }
             return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
         }
         guard result.data.count <= maximumConfigurationBytes else { throw Failure.tooLarge }
-        if checking != nil { return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false) }
-        // Restore exact original spacing (including an originally absent section)
-        // only while the file still matches our write. Later host edits win.
+        if configuration.checking != nil { return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false) }
+        // Restore exact original spacing (including an originally absent section) only while the file still matches our write. Later host edits win.
         var restoreAbsence = false
         if removing, let record = try backupRecords(at: backupRecordURL).last,
            record.restoresOriginal == true, record.writtenDigest == digest(existing), record.path.hasPrefix(path + ".") {
@@ -454,14 +480,9 @@ public enum AgentHostConfigWriter {
         let backup = removing ? nil : try writeBackup(path: path, data: existing, written: result.data,
                                      originallyAbsent: missing, restoresOriginal: !result.replaced,
                                      jsonOwnership: try ownership?(existing), tomlOwnership: try tomlOwnership?(existing), recordURL: backupRecordURL)
-        // THE FILE IS SOMEBODY ELSE'S. Between the read above and the rename
-        // below, the other agent — or the person in an editor — may have saved
-        // its own change, and renaming our splice of the OLD bytes over it
-        // would throw that away silently. So: look again, and abort if it is
-        // not the same file with the same bytes. Not a lock, a check.
+        // Recheck identity and bytes before rename so concurrent host or editor saves cannot be silently overwritten.
         if restoreAbsence {
-            // Claim a private name BEFORE inspecting. Never unlink the host's
-            // pathname: it may already name a newer save by the time we delete.
+            // Claim a private name BEFORE inspecting. Never unlink the host's pathname: it may already name a newer save by the time we delete.
             let claimed = path + ".nativeagent-removal-" + UUID().uuidString
             guard renamex_np(path, claimed, UInt32(RENAME_EXCL)) == 0 else { throw Failure.changedUnderneath }
             let current: Data
@@ -480,16 +501,15 @@ public enum AgentHostConfigWriter {
                     guard Darwin.unlink(claimed) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
                 } else if renamex_np(claimed, path, UInt32(RENAME_EXCL)) != 0 {
                     guard errno == EEXIST else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-                    // Both versions belong to the host. Keep both files and splice
-                    // only our entry out of the displaced version as well.
-                    if let fresh = try splice(current) {
+                    // Both versions belong to the host. Keep both files and splice only our entry out of the displaced version as well.
+                    if let fresh = try splice(current, configuration) {
                         try replaceAtomically(path: claimed, data: fresh.data, unchangedSince: currentIdentity, original: current)
                     }
                 }
                 var now = stat()
                 if lstat(path, &now) == 0 {
                     let (latest, latestIdentity) = try read(path: path)
-                    if let fresh = try splice(latest) {
+                    if let fresh = try splice(latest, configuration) {
                         try replaceAtomically(path: path, data: fresh.data, unchangedSince: latestIdentity, original: latest)
                     }
                 } else if errno != ENOENT {
@@ -502,8 +522,7 @@ public enum AgentHostConfigWriter {
             do {
                 try replaceAtomically(path: path, data: result.data, unchangedSince: identity, original: existing)
             } catch let failure as Failure {
-                // This error occurs after the validated swap committed; its
-                // displaced-file cleanup failed. Publish that committed write.
+                // This error occurs after the validated swap committed; its displaced-file cleanup failed. Publish that committed write.
                 if case .cleanupFailed = failure, let backup {
                     try commitBackup(backup, path: path, recordURL: backupRecordURL)
                 }
@@ -516,8 +535,7 @@ public enum AgentHostConfigWriter {
                        replacedExistingEntry: result.replaced, removed: result.removed, replacedInstall: replacing.helper)
     }
 
-    /// Which exact file, with which exact contents, we read. Compared again
-    /// immediately before the rename.
+    /// Compare both file identity and bytes immediately before rename.
     private struct FileIdentity: Equatable, Codable {
         let device: dev_t
         let inode: ino_t
@@ -534,9 +552,7 @@ public enum AgentHostConfigWriter {
         }
     }
 
-    /// The file's current bytes and its identity. A symlink, a directory, a
-    /// device or somebody else's file is refused rather than followed: this
-    /// writer only ever edits a regular file the person owns.
+    /// Edit only regular files owned by the person; refuse symlinks, devices, directories and foreign owners.
     private static func read(path: String) throws -> (Data, FileIdentity) {
         let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else {
@@ -555,8 +571,7 @@ public enum AgentHostConfigWriter {
         while true {
             let count = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, 65_536) }
             if count == 0 { break }
-            // A READ ERROR IS NOT END OF FILE. Swallowing it here would back up
-            // and then write a TRUNCATED copy over a complete configuration.
+            // A read error cannot mean EOF, or a truncated configuration could replace the complete file.
             guard count > 0 || errno == EINTR else {
                 throw Failure.unreadable("it could not be read to the end")
             }
@@ -570,7 +585,7 @@ public enum AgentHostConfigWriter {
         return (data, FileIdentity(info))
     }
 
-    /// The person's own undo, beside the file they can already find.
+    /// Keep undo beside the settings so the person can find it.
     private static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
     private struct PreparedBackup {
@@ -586,8 +601,7 @@ public enum AgentHostConfigWriter {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        // Create the newest undo before removing older ones, including writes
-        // in the same second. Never overwrite a colliding file.
+        // Create the newest undo before removing older ones, including writes in the same second. Never overwrite a colliding file.
         let stem = path + "." + InstallPaths.current.name("nativeagent-backup") + "-" + formatter.string(from: Date())
         for attempt in 0..<64 {
             let backup = attempt == 0 ? stem : "\(stem)-\(attempt)"
@@ -608,9 +622,7 @@ public enum AgentHostConfigWriter {
     }
 
     private static func commitBackup(_ backup: PreparedBackup, path: String, recordURL: URL) throws {
-        // The settings replacement has committed. Only now publish its ownership
-        // and prune the preceding undo. A failed replacement keeps the old receipt
-        // and backups intact, plus the newly prepared undo beside the settings.
+        // Publish ownership only after replacement commits; failed replacement preserves prior receipts and prepared undo.
         do {
             try saveBackupRecords(backup.previous + [backup.record], at: recordURL)
             try removeBackups(path: path, recordURL: recordURL, keeping: backup.record.path)
@@ -640,7 +652,10 @@ public enum AgentHostConfigWriter {
     private static func backupRecords(at url: URL) throws -> [BackupRecord] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         do { return try JSONDecoder().decode([BackupRecord].self, from: Data(contentsOf: url)) }
-        catch { throw Failure.unreadable("ownership receipt \(url.path) must read as a BackupRecord array: \(error.localizedDescription). Restore that receipt before connecting or verifying") }
+        catch { throw Failure.unreadable("""
+            ownership receipt \(url.path) must read as a BackupRecord array: \(error.localizedDescription). Restore that receipt before connecting \
+            or verifying
+            """) }
     }
 
     private static func saveBackupRecords(_ records: [BackupRecord], at url: URL) throws {
@@ -655,8 +670,7 @@ public enum AgentHostConfigWriter {
                   String(record.path.dropFirst(prefix.count)).range(
                     of: #"^\d{8}T\d{6}Z(?:-[1-9]\d?)?$"#, options: .regularExpression
                   ) != nil else { continue }
-            // A matching name is not ownership. Delete only a file we recorded
-            // creating, and leave replacements, symlinks and directories alone.
+            // A matching name is not ownership. Delete only a file we recorded creating, and leave replacements, symlinks and directories alone.
             var info = stat()
             guard lstat(record.path, &info) == 0,
                   info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(),
@@ -682,8 +696,7 @@ public enum AgentHostConfigWriter {
             guard Darwin.link(temporary, path) == 0 else { throw Failure.changedUnderneath }
             return
         }
-        // Swap keeps the host pathname present, including across a crash.
-        // The displaced file stays beside it until checked publication settles.
+        // Swap keeps the host pathname present, including across a crash. The displaced file stays beside it until checked publication settles.
         let (beforeSwap, beforeSwapIdentity) = try read(path: path)
         guard beforeSwapIdentity == identity, original == nil || beforeSwap == original else { throw Failure.changedUnderneath }
         guard renamex_np(temporary, path, UInt32(RENAME_SWAP)) == 0 else { throw Failure.changedUnderneath }
@@ -692,8 +705,7 @@ public enum AgentHostConfigWriter {
             let (current, currentIdentity) = try read(path: temporary)
             guard currentIdentity == identity, original == nil || current == original else { throw Failure.changedUnderneath }
         } catch {
-            // Publication already happened. Keep both generations; never swap
-            // old bytes over a current or concurrently saved configuration.
+            // Publication already happened. Keep both generations; never swap old bytes over a current or concurrently saved configuration.
             throw Failure.publicationUnconfirmed(temporary)
         }
         guard Darwin.unlink(temporary) == 0 else {
@@ -701,13 +713,8 @@ public enum AgentHostConfigWriter {
         }
     }
 
-    /// Create-exclusive, OWNER-ONLY, flushed before it is named: a crash
-    /// mid-write can leave a stray temp file, never a truncated configuration.
-    ///
-    /// 0600 whatever the original was. This file now carries a connection key,
-    /// and so does every backup of it; a configuration that used to be
-    /// group-readable must not keep that permission once we have put a secret
-    /// in it.
+    /// Create-exclusive, owner-only and flushed before naming prevents truncated configuration after a crash. Settings and backups carry a connection key, so
+    /// both require 0600 even if the original was readable by others.
     private static func write(_ data: Data, to path: String) -> Bool {
         let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
         guard fd >= 0 else { return false }

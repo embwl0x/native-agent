@@ -26,7 +26,7 @@ struct AnthropicOAuthDirectPanel: View {
                 .font(ShellType.bodySemibold)
                 .foregroundStyle(NativeAgentShell.text)
             ProviderNote(text: AnthropicOAuthDirectPanelPresentation.detail)
-            // Sign-in reads its canonical store, independent of the provider-list snapshot.
+            // Read sign-in from its canonical store so provider-list staleness cannot hide current state.
             OAuthSignInButton(provider: .anthropic)
             AnthropicSetupTokenInput()
         }

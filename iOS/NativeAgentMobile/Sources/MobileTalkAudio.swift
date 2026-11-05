@@ -2,10 +2,9 @@ import AVFoundation
 import Foundation
 import NativeAgentShared
 import os
-// Blueprint: | `MobileTalkAudio.swift` | Full-duplex voice-processing capture for an active talk session; timed on-device recognition and soft acknowledgment audio |
+// Blueprint: | `MobileTalkAudio.swift` | Full-duplex voice capture, timed on-device recognition and quiet acknowledgment |
 
-/// One audio session for the call's input, speech output and acknowledgment.
-/// The engine stays running across turns, mute, app backgrounding and playback.
+/// Keep one audio session running across input, output, turns, mute and backgrounding.
 actor MobileTalkAudio {
     private var engine: AVAudioEngine?
     private var analyzer: MobileSpeechAnalyzer?
@@ -40,8 +39,7 @@ actor MobileTalkAudio {
         let muted = self.muted
         let frames = OSAllocatedUnfairLock(initialState: Int64(0))
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            // Muting never feeds words into recognition. Keep the time base
-            // advancing, using silence, so pre-mute results cannot become new speech.
+            // Feed silence while muted to advance time without admitting words; pre-mute results must not appear as new speech.
             let isMuted = muted.withLock { $0 }
             let time = frames.withLock { frames in
                 frames += Int64(buffer.frameLength)
@@ -75,8 +73,7 @@ actor MobileTalkAudio {
         engine?.stop(); engine = nil
         let analyzer = self.analyzer
         self.analyzer = nil
-        // Framework cancellation can finish independently; it cannot hold
-        // the microphone, audio route or End control while awaiting results.
+        // Framework result completion must not retain microphone, route or End while cancellation finishes.
         Task { await analyzer?.cancel() }
         if active {
             try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -88,7 +85,7 @@ actor MobileTalkAudio {
         NSError(domain: "NativeAgentTalk", code: 1, userInfo: [NSLocalizedDescriptionKey: detail])
     }
 
-    /// A short, quiet sine cue; no system sound that might include a vibration.
+    /// Use a quiet sine cue because system sounds can vibrate.
     nonisolated static func acknowledgment() throws -> AVAudioPlayer {
         let rate = 24_000
         let count = 1_440

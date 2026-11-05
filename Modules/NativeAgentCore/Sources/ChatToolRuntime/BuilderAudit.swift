@@ -27,8 +27,7 @@ extension SwiftToolDispatcher {
         entry: [String: Any],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> (url: URL, error: String?) {
-        // Redacted JSON receipts and installer logs: local evidence, excluded
-        // from backup/export/phone sync; PrivacyMap: builder_audit.
+        // Redacted JSON receipts and installer logs: local evidence, excluded from backup/export/phone sync; PrivacyMap: builder_audit.
         let auditDir = dataRoot
             .appendingPathComponent("builder_audit", isDirectory: true)
         let auditURL = auditDir.appendingPathComponent("\(runId).json")
@@ -73,8 +72,7 @@ extension SwiftToolDispatcher {
         TurnSecretRedactor.isCredentialName(name) || ["auth", "credential", "cookie"].contains(name.lowercased())
     }
     static func builderAuditText(_ text: String) -> String {
-        // Include named shell flags and short assignments; token-shape scrubbing
-        // alone cannot recognize an arbitrary password passed as an argument.
+        // Include named shell flags and short assignments; token-shape scrubbing alone cannot recognize an arbitrary password passed as an argument.
         var result = text.replacingOccurrences(
             of: #"\b(?:authorization|proxy-authorization|auth|cookie|set-cookie)\s*:\s*[^\r\n"']+"#,
             with: "[REDACTED_NAMED_SECRET]", options: [.regularExpression, .caseInsensitive])
@@ -82,7 +80,8 @@ extension SwiftToolDispatcher {
             of: #"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"#,
             with: "[REDACTED_PRIVATE_KEY]", options: .regularExpression)
         let pattern = #"(?<![\w-])((?:--?)?(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization|auth|credential|cookie))(?![\w-])["']?(\s*=\s*|\s*:\s*|[ \t]+)("(?:\\.|[^"\\])*"|'[^']*'|[^\s;,]+)"#
-        guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { preconditionFailure("Invalid builder audit redaction pattern") }
+        guard let expression = try? NSRegularExpression(pattern: pattern,
+            options: [.caseInsensitive]) else { preconditionFailure("Invalid builder audit redaction pattern") }
         let source = result as NSString
         for match in expression.matches(in: result, range: NSRange(location: 0, length: source.length)).reversed() {
             let name = source.substring(with: match.range(at: 1)).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
@@ -144,7 +143,7 @@ extension SwiftToolDispatcher {
         var removed = 0
         for victim in receipts.dropFirst(keeping) {
             do {
-                // Retire each receipt with its <runId>-*.log sidecars.
+                // Keep sidecar lifetime aligned with its owning receipt.
                 let runId = victim.url.deletingPathExtension().lastPathComponent
                 for sidecar in entries
                 where sidecar.lastPathComponent.hasPrefix("\(runId)-") {

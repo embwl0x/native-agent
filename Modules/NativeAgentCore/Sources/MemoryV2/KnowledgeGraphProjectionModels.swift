@@ -42,7 +42,8 @@ public struct GraphSearchResult: Identifiable, Codable, Hashable, Sendable {
     public var matchedEntities: [String]?
     public var relatedEdges: [AgentGraphEdge]?
     public var explanation: String?
-    public init(id: String, node: AgentGraphNode, score: Double, matchedTerms: [String]? = nil, matchedEntities: [String]? = nil, relatedEdges: [AgentGraphEdge]? = nil, explanation: String? = nil) {
+    public init(id: String, node: AgentGraphNode, score: Double, matchedTerms: [String]? = nil, matchedEntities: [String]? = nil,
+        relatedEdges: [AgentGraphEdge]? = nil, explanation: String? = nil) {
         self.id = id
         self.node = node
         self.score = score
@@ -85,7 +86,8 @@ public struct GraphEntity: Identifiable, Codable, Hashable, Sendable {
     public var confidence: Double?
     public var mentions: Int?
     public var updatedAt: String?
-    public init(id: String, name: String, aliases: [String]? = nil, kind: String? = nil, confidence: Double? = nil, mentions: Int? = nil, updatedAt: String? = nil) {
+    public init(id: String, name: String, aliases: [String]? = nil, kind: String? = nil, confidence: Double? = nil, mentions: Int? = nil,
+        updatedAt: String? = nil) {
         self.id = id
         self.name = name
         self.aliases = aliases
@@ -103,7 +105,8 @@ public struct GraphIndexStatus: Codable, Hashable, Sendable {
     public var nodeCount: Int?
     public var entityCount: Int?
     public var updatedAt: String?
-    public init(status: String, embeddingModel: String? = nil, dimensions: Int? = nil, nodeCount: Int? = nil, entityCount: Int? = nil, updatedAt: String? = nil) {
+    public init(status: String, embeddingModel: String? = nil, dimensions: Int? = nil, nodeCount: Int? = nil, entityCount: Int? = nil,
+        updatedAt: String? = nil) {
         self.status = status
         self.embeddingModel = embeddingModel
         self.dimensions = dimensions

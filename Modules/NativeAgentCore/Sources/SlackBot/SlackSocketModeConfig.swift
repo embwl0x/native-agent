@@ -2,7 +2,7 @@ import Foundation
 import BackgroundLoops
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `SlackSocketModeConfig.swift` | Socket configuration and throwing ingress/toggle readers consume TransportAllowlist's typed canonical Slack policy; UI callers retain unavailable authority as a failure |
+// Blueprint: | `SlackSocketModeConfig.swift` | TransportAllowlist's canonical Slack policy; throwing ingress and toggle readers retain unavailable authority |
 
 public struct SlackSocketModeConfig: Sendable, Equatable {
     public static func parseIDs(_ raw: String) -> Set<String> {
@@ -46,8 +46,7 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
         )
     }
 
-    /// Nil when Slack is not connected; throws when its tokens could not be
-    /// read, which is a fault, never "not connected".
+    /// Nil when Slack is not connected; throws when its tokens could not be read, which is a fault, never "not connected".
     static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> SlackSocketModeConfig? {
         try SlackCredentials.withSnapshot(dataRoot: dataRoot) {
             try loadSnapshot(dataRoot: dataRoot)
@@ -76,7 +75,6 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
         )
     }
 
-    /// Switched off in the saved Slack config, whatever the tokens say.
     public static func socketModeSwitchedOff(dataRoot: URL) throws -> Bool {
         try !TransportAllowlist.slackPolicy(dataRoot: dataRoot).socketModeEnabled
     }
@@ -89,10 +87,8 @@ enum SlackIngressDenial: String, Sendable, Equatable {
     case mentionRequired = "mention_required"
 }
 
-/// The Socket Mode ingress decision.
-/// SecurityCenter separately rechecks the same channel/user union at effect
-/// time; this transport policy prevents unauthorized messages from becoming a
-/// turn in the first place. It owns no tool or provider authority.
+/// Reject unauthorized ingress before it becomes a turn; SecurityCenter rechecks the same union at effect time. Transport admission grants no tool or provider
+/// authority.
 public struct SlackIngressPolicy: Sendable, Equatable {
     public let allowedChannelIds: Set<String>
     public let allowedUserIds: Set<String>

@@ -2,7 +2,7 @@ import Foundation
 import GRDB
 import PersistenceCore
 
-// Blueprint: | `ContextSQLiteSchema.swift` | Current final Context SQLite schema: checked existing tables and direct fresh creation; no historical migration chain |
+// Blueprint: | `ContextSQLiteSchema.swift` | checked current Context schema and fresh creation |
 
 extension ContextSQLiteStore {
     /// Opening never converts or resets an unavailable store.
@@ -11,26 +11,35 @@ extension ContextSQLiteStore {
             let columns: [String: Set<String>] = [
                 "context_generations": ["id", "parent_id", "created_at", "reason", "source_fingerprint", "status", "atom_count", "source_count"],
                 "context_sources": ["id", "source_hash", "health"],
-                "context_source_versions": ["version_key", "source_id", "valid_from_generation", "valid_to_generation", "descriptor_json", "source_hash", "health", "last_error"],
-                "context_atom_versions": ["version_key", "atom_id", "source_id", "valid_from_generation", "valid_to_generation", "body", "summary", "payload_json"],
+                "context_source_versions": ["version_key", "source_id", "valid_from_generation", "valid_to_generation", "descriptor_json", "source_hash",
+                    "health", "last_error"],
+                "context_atom_versions": ["version_key", "atom_id", "source_id", "valid_from_generation", "valid_to_generation", "body", "summary",
+                    "payload_json"],
                 "context_embeddings": ["atom_version_key", "model_fingerprint", "dimensions", "vector"],
-                "context_feedback_events": ["sequence", "id", "atom_ids_json", "signal_json", "time_bucket", "evidence_ids_json", "created_at", "session_id", "history_message_fingerprint"],
+                "context_feedback_events": ["sequence", "id", "atom_ids_json", "signal_json", "time_bucket", "evidence_ids_json", "created_at", "session_id",
+                    "history_message_fingerprint"],
             ]
             let present = try columns.keys.filter { try db.tableExists($0) }
             if !present.isEmpty {
                 guard present.count == columns.count else {
-                    throw ContextFlowStoreError.malformedStoredValue("Context database schema is incomplete. Repair its schema before opening it; its bytes were preserved.")
+                    throw ContextFlowStoreError.malformedStoredValue("""
+                        Context database schema is incomplete. Repair its schema before opening it; its bytes were preserved.
+                        """)
                 }
                 for (table, expected) in columns {
                     guard Set(try db.columns(in: table).map(\.name)) == expected else {
-                        throw ContextFlowStoreError.malformedStoredValue("Context database table \(table) is not the current schema. Convert this store before opening it; its bytes were preserved.")
+                        throw ContextFlowStoreError.malformedStoredValue("""
+                            Context database table \(table) is not the current schema. Convert this store before opening it; its bytes were preserved.
+                            """)
                     }
                 }
                 return
             }
             let tables = try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
             guard tables.isEmpty else {
-                throw ContextFlowStoreError.malformedStoredValue("Context database has an unknown schema. Repair this store before opening it; its bytes were preserved.")
+                throw ContextFlowStoreError.malformedStoredValue("""
+                    Context database has an unknown schema. Repair this store before opening it; its bytes were preserved.
+                    """)
             }
             try db.execute(sql: """
                 CREATE TABLE context_generations (

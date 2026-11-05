@@ -3,7 +3,7 @@ import MacIntegration
 import AppKit
 import ChatTurnRuntime
 
-// Blueprint: | `VoiceInputController.swift` | `VoiceInputCapture.forChat`: binds agent-name recognition context, person-visible macOS speech authorization and shared user-facing failures |
+// Blueprint: | `VoiceInputController.swift` | `VoiceInputCapture.forChat`: name context, macOS speech consent and shared failures |
 
 extension VoiceInputCapture {
     @MainActor

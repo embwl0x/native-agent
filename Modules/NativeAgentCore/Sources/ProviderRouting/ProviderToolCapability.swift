@@ -1,22 +1,19 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ProviderToolCapability.swift` | `ProviderToolCapability`: adapter-declared tool/image transport capabilities independent of model-name inference |
+// Blueprint: | `ProviderToolCapability.swift` | `ProviderToolCapability`: adapter-declared wire grammar |
 
-/// How a transport carries tools. Each adapter declares its own; nothing
-/// decides it from a provider's name.
+/// How a transport carries tools. Each adapter declares its own; nothing decides it from a provider's name.
 public enum ProviderToolWire: Sendable, Equatable {
     /// A `tools` array on the request, calls back as structured events.
     case native
-    /// The catalog as prose, calls as markers in the reply. The Claude
-    /// subscription rejects a request body that carries `tools`.
+    /// The catalog as prose, calls as markers in the reply. The Claude subscription rejects a request body that carries `tools`.
     case textMarkers
     /// The transport carries no NativeAgent tools.
     case unsupported
 }
 
-/// Transport capability, independent of the selected model's catalog claims:
-/// the route id names its adapter, and the adapter's declarations answer.
+/// Transport capability, independent of the selected model's catalog claims: the route id names its adapter, and the adapter's declarations answer.
 public enum ProviderToolCapability {
     static func transport(providerID: String) -> (any LLMTransport.Type)? {
         switch providerID {
@@ -49,11 +46,14 @@ public enum ProviderToolCapability {
         supportsTools(providerID: providerID) ? nil : "text only, no tools"
     }
 
-    public static let unavailableNote = "This account cannot use tools in NativeAgent; choose ChatGPT (OAuth) or another account for tasks that read pages or files."
+    public static let unavailableNote = """
+        This account cannot use tools in NativeAgent; choose ChatGPT (OAuth) or another account for tasks that read \
+        pages or files.
+        """
 
-    static func recordOfferedTools(providerID: String, tools: [LLMToolSchema]?) {
+    static func recordOfferedTools(providerID: String, tools: [LLMToolSchema]?, call: LLMCall) {
         if tools?.isEmpty == false, !supportsTools(providerID: providerID) {
-            LLMCallContext.toolCapabilityNote?(unavailableNote)
+            call.turn?.capabilityNote?(unavailableNote)
         }
     }
 }

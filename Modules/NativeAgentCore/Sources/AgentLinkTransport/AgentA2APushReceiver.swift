@@ -1,16 +1,14 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentA2APushReceiver.swift` | `AgentA2APushReceiver` actor; `receive`, `consume`; authenticated task pushes accelerate the continuation's canonical GetTask read through its record writer; an owned invalidator registers before reads, replays pending hints, and retires on resident stop. Push evidence never selects a second state reader or changes the declared task-observation clock; the one-day boundary remains |
+// Blueprint: | `AgentA2APushReceiver.swift` | `AgentA2APushReceiver`, `receive`, `consume`; Push hints wake canonical task reads. |
 
-/// A bounded delivery mailbox, not task state: authenticated webhook evidence
-/// is validated then reduced to a wake hint. GetTask remains authoritative.
+/// Pushes only wake the bounded mailbox; GetTask remains authoritative.
 public actor AgentA2APushReceiver {
     public static let shared = AgentA2APushReceiver()
     private var hints: [(peer: String, task: String, pending: Bool)] = []
     private var invalidator: (owner: UUID, wake: @Sendable (String, String) -> Void)?
 
-    /// The continuation's existing store writer owns scheduling. Install before
-    /// reading its rows and replay retained hints to close the registration race.
+    /// Register before reading and replay retained hints to close the registration race.
     public func installInvalidator(owner: UUID, wake: @escaping @Sendable (String, String) -> Void) {
         guard invalidator?.owner != owner, !Task.isCancelled else { return }
         invalidator = (owner, wake)
@@ -32,8 +30,7 @@ public actor AgentA2APushReceiver {
         } else {
             guard case .string(let id)? = payload["taskId"], !id.isEmpty,
                   case .string(let context)? = payload["contextId"], !context.isEmpty else { throw AgentA2AWire.WireError.invalid("push task identity") }
-            // A push delta need not be preceded by an initial task snapshot.
-            // Supply only identity to the same streaming validator.
+            // Validate push identity even when no initial task snapshot preceded it.
             let seed: JSONValue = .object(["task": .object(["id": .string(id), "contextId": .string(context),
                 "status": .object(["state": .string("TASK_STATE_WORKING")])])])
             _ = try AgentA2AStream.normalize([seed, value], interface: interface, requestID: nil, expectedTaskID: id)

@@ -4,8 +4,7 @@ import Senses
 import PersistenceCore
 // Blueprint: | `WorkPaneSenseView.swift` | `WorkPaneSenseView`; separate offline script-enabled WebKit host, one version-bound sense event channel |
 
-/// A separate WebKit host, never the browser or Make host. Its only channel
-/// is pinned to the presenting sense version and cannot invoke door actions.
+/// Pin the isolated host channel to the presenting sense version; it must never invoke door actions.
 struct WorkPaneSenseView: View {
     let presentation: SenseInteractiveView
     @State private var error: String?
@@ -42,8 +41,7 @@ private struct SealedSenseWebView: NSViewRepresentable {
         configuration.setURLSchemeHandler(coordinator, forURLScheme: "sense-view")
         let content = configuration.userContentController
         content.add(coordinator, name: "senseEvent")
-        // Content blockers do not cover WebRTC sockets. Remove that API
-        // before authored code; CSP prevents fresh realms via frames/workers.
+        // Remove WebRTC before authored code because content blockers miss sockets; CSP blocks fresh realms.
         content.addUserScript(WKUserScript(source: """
         for (const name of ['RTCPeerConnection','webkitRTCPeerConnection',
                             'RTCDataChannel','WebSocket','WebTransport','Worker',
@@ -81,7 +79,11 @@ private struct SealedSenseWebView: NSViewRepresentable {
         private var eventTask: Task<Void, Never>?
         private var cancelled = false
 
-        private static let policy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; frame-src 'none'; worker-src 'none'; media-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; sandbox allow-scripts"
+        private static let policy = """
+            default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; \
+            frame-src 'none'; worker-src 'none'; media-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; sandbox \
+            allow-scripts
+            """
         private static let rules = """
         [{"trigger":{"url-filter":".*"},"action":{"type":"block"}},
          {"trigger":{"url-filter":"^sense-view://sealed/view$"},"action":{"type":"ignore-previous-rules"}},

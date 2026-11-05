@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `KnowledgeGraphEdgeWireSnapshot.swift` | `KnowledgeGraphEdgeWireSnapshot`: shared immutable edge decoding; platform wrappers retain UI identity and extra fields |
+// Blueprint: | `KnowledgeGraphEdgeWireSnapshot.swift` | `KnowledgeGraphEdgeWireSnapshot`: checked edge decoding; platforms own UI identity |
 
 public let knowledgeGraphTypeSymbols: [String: String] = [
     "person": "person.circle",

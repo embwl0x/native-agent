@@ -8,9 +8,7 @@ import EngineRuntime
 
 // Blueprint: | `SchedulerView.swift` | `SchedulerView`: scheduled job controls and explicit accepted/refused toggle receipts |
 
-/// What the Scheduler screen says after a pause/resume settles. The switch is a
-/// control now (item 36), so every outcome gets a line: a refused write must
-/// never read like an accepted one.
+/// Every pause/resume outcome needs a receipt so a refused write cannot read as accepted.
 enum SchedulerJobToggleOutcome: Equatable {
     case verified(ScheduledJob)
     case failed(String)
@@ -124,10 +122,7 @@ struct SchedulerView: View {
                                 }
                             }
                             Spacer(minLength: 8)
-                            // Item 36: this used to be a plain Text reading
-                            // "enabled"/"paused" beside a write nothing called.
-                            // It is the control now — the state User reads and
-                            // the state he sets are the same thing.
+                            // Bind display and writes to the same job state.
                             Toggle("", isOn: Binding(
                                 get: { job.enabled },
                                 set: { setEnabled(job, $0) }
@@ -149,9 +144,7 @@ struct SchedulerView: View {
         }
     }
 
-    /// One pause/resume per job in flight. The row is repainted from
-    /// `engine.desk.jobs` after the write settles, so the switch always shows the
-    /// store's truth rather than the click's.
+    /// Serialize each job's toggle and reread engine.desk.jobs so the switch shows the store's truth.
     private func setEnabled(_ job: ScheduledJob, _ enabled: Bool) {
         guard !togglingJobIDs.contains(job.id) else { return }
         togglingJobIDs.insert(job.id)

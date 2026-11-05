@@ -20,7 +20,6 @@ import ChatToolParsing
 import SlackBot
 import TelegramBot
 import TriggerScheduler
-import WorkshopExecution
 import BackgroundLoops
 import AppToolRuntime
 import TrustCenter
@@ -59,7 +58,6 @@ import Experiences
 import CryptoKit
 import ActivityWatch
 import OSLog
-import Procedures
 import SchedulerExecution
 import Darwin
 import Combine
@@ -71,29 +69,24 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `TurnCardReadout.swift` | `MacChatTurnCardModel`, `TurnCardReadout` and `MacChatTurnCardFormat`: display-only lifecycle, approval, visibility and whole-second timing projection; canonical turn state and approval records remain authoritative |
+// Blueprint: | `TurnCardReadout.swift` | `MacChatTurnCardModel`, `TurnCardReadout`, `MacChatTurnCardFormat`; Derived lifecycle presentation |
 
-/// Display-only projection of one accepted turn. Every field is derived; none
-/// is stored, mutated, or remembered by the view layer.
+/// Derive every card field from evidence; views keep no mutable turn state.
 public struct MacChatTurnCardModel: Sendable, Equatable {
-    /// Visual register. Deliberately separate from phase so that
-    /// outcome-unknown can never be rendered with the success or failure
-    /// treatment even if a future phase is added to the working family.
+    /// Keep visual register separate from phase so unknown outcomes cannot acquire success or failure treatment.
     public enum Tone: Sendable, Equatable {
-        /// The turn is moving. Accent, live indicator.
         case working
-        /// Observationally stuck or blocked. Warm, but not an error.
+        /// Observed stalls are not terminal errors.
         case attention
-        /// Terminal and honest about not knowing. Neither green nor red.
+        /// Unknown terminal outcomes are neither success nor failure.
         case unresolved
-        /// Terminal failure asserted by typed evidence.
+        /// Terminal failure requires typed evidence.
         case failed
-        /// Terminal stop acknowledged by typed evidence.
+        /// Terminal stop requires typed evidence.
         case canceled
     }
 
     public let identity: MacChatTurnIdentity
-    /// The effective phase, including the derived observational `.stalled`.
     public let phase: TurnPresentationPhase
     public let title: String
     public let detail: String?
@@ -102,40 +95,29 @@ public struct MacChatTurnCardModel: Sendable, Equatable {
     public let symbolName: String
     public let isTerminal: Bool
     public let showsLiveIndicator: Bool
-    /// Wall time the turn has been open (live) or was open (terminal).
     public let elapsed: TimeInterval
-    /// Seconds since the last observed movement; `nil` once terminal, because
-    /// a settled turn has nothing left to move.
+    /// Terminal turns have no remaining movement, so movement age is nil.
     public let secondsSinceMovement: TimeInterval?
-    /// A stop was requested and no terminal evidence has arrived yet.
-    /// Requesting a stop is not proof the turn stopped.
+    /// A Stop request is not proof of settlement.
     public let cancellationPending: Bool
-    /// The canonical approval this turn asked for, if any. Projected from the
-    /// ApprovalInbox rows the app already holds — the card stores no approval
-    /// state of its own and decides nothing.
+    /// Read approvals from the existing inbox; the card keeps no approval state or authority.
     public let approval: MacChatTurnCardApproval?
 
-    /// A live clock advances the timing readout alone; nil keeps the projected timing frozen.
+    /// Advance timing only with a live clock; nil freezes the projection.
     public var clock: Clock? = nil
 
-    /// Thinking begins here while nothing has been said or done; the title counts elapsed time from this instant.
     public var thinkingSince: Date? = nil
-    /// Her reply text is arriving and nothing else is going on: the line
-    /// that said "Thinking…" says how long she thought.
+    /// When reply text arrives alone, retain the duration spent thinking.
     public var thoughtFor: TimeInterval? = nil
 
-    /// Raw inputs for the trailing readout. Deliberately the same three
-    /// timestamps the projection uses, so the self-advancing readout and a
-    /// re-projection can never disagree about what second it is.
+    /// Use the same three timestamps for projection and live readout so their seconds cannot disagree.
     public struct Clock: Equatable, Sendable {
         public let startedAt: Date
         public let endedAt: Date?
         public let lastMovementAt: Date
         public let isTerminal: Bool
 
-        /// Whole seconds, matching `TurnCardReadout.wholeSeconds`:
-        /// the readout shows seconds, so sub-second churn would re-render the
-        /// text at token rate for a string that never changes.
+        /// Quantize to whole seconds so token-rate movement cannot re-render unchanged text.
         public static func wholeSeconds(_ interval: TimeInterval) -> TimeInterval {
             guard interval.isFinite, interval > 0 else { return 0 }
             return interval.rounded(.down)
@@ -150,17 +132,12 @@ public struct MacChatTurnCardModel: Sendable, Equatable {
         }
     }
 
-    /// True only while the card still offers something to click. A settled
-    /// card with no pending decision floats over the transcript and must be
-    /// inert; one holding a live approval must not be.
+    /// Settled cards without decisions must be inert; live approvals remain clickable.
     public var hasControls: Bool {
         !isTerminal || approval?.isActionable == true
     }
 
-    /// Spoken form of the trailing timing readout. The visual string joins its
-    /// parts with a middle dot and uses monospaced digits; read verbatim by
-    /// VoiceOver that becomes punctuation noise, so the same facts are spoken
-    /// as a sentence instead.
+    /// Speak timing as a sentence so VoiceOver does not read visual punctuation as noise.
     public var spokenMeta: String {
         MacChatTurnCardFormat.metaLine(
             elapsed: elapsed,
@@ -172,11 +149,10 @@ public struct MacChatTurnCardModel: Sendable, Equatable {
 }
 
 public enum TurnCardReadout {
-    /// Threshold at which "no movement" becomes worth saying out loud. Below
-    /// the stall threshold this is informational only, not a verdict.
+    /// Quiet movement below stall threshold is informational, never a verdict.
     public static let movementNoticeAfter: TimeInterval = 20
 
-    /// Identity and settled phase decide visibility, never the clock; only an unknown terminal outcome needs a card beyond the transcript.
+    /// Identity and settled phase decide visibility, never clock age; unknown terminal outcomes remain visible.
     public static func isVisible(_ state: MacChatTurnLifecycleState?, sessionId: String) -> Bool {
         guard let state, !sessionId.isEmpty,
               state.identity.sessionId == sessionId else { return false }
@@ -190,7 +166,7 @@ public enum TurnCardReadout {
         }
     }
 
-    /// Pending or unproven approvals keep their turn's card visible, independently of the clock.
+    /// Keep pending or unproven approval decisions reachable independently of clock age.
     public static func isVisible(
         _ state: MacChatTurnLifecycleState?,
         sessionId: String,
@@ -226,9 +202,7 @@ public enum TurnCardReadout {
         parseTimestamp: (String) -> Date?,
         stalledAfter: TimeInterval = TurnPresentationReducer.defaultStalledAfter
     ) -> MacChatTurnCardModel? {
-        // Identity fence. A card belongs to exactly one session and one turn;
-        // a state routed to the wrong surface renders nothing rather than
-        // cross-rendering another conversation's work.
+        // Require exact session and turn identity so a routed state cannot expose another conversation’s card.
         guard let state,
               isVisible(state, sessionId: sessionId, approvals: approvals, parseTimestamp: parseTimestamp) else { return nil }
 
@@ -238,16 +212,12 @@ public enum TurnCardReadout {
         let phase = isTerminal
             ? presentation.phase
             : state.effectivePhase(at: instant, stalledAfter: stalledAfter)
-        // A completed turn keeps a card only for an approval whose outcome is
-        // not proven; the approval then owns what the card says.
+        // After completion, only unproven approval outcomes retain the card, and the approval owns its words.
         let approvalOwnsCard = approval?.outcome == .pending
             || (phase == .completed && approval?.keepsCardVisible == true)
         guard phase != .completed || approvalOwnsCard else { return nil }
 
-        // Quantized to whole seconds on purpose. `lastMovementAt` advances on
-        // every streamed token; without this the projected model would differ
-        // on every token and re-render the glass card at token rate instead of
-        // at the one-second cadence the card actually displays.
+        // Quantize movement to whole seconds so streamed tokens cannot drive card updates faster than its displayed cadence.
         let sinceMovement = isTerminal
             ? nil
             : wholeSeconds(instant.timeIntervalSince(presentation.lastMovementAt))
@@ -255,12 +225,12 @@ public enum TurnCardReadout {
         let elapsed = wholeSeconds(elapsedEnd.timeIntervalSince(presentation.startedAt))
         let cancellationPending = !isTerminal && state.cancellationRequestedAt != nil
 
-        // Keep the decision reachable, but acknowledge Stop until the turn
-        // actually settles even when an approval is still pending.
+        // Keep approval reachable while acknowledging Stop until actual settlement.
         let ownedApproval = approvalOwnsCard && !cancellationPending ? approval : nil
-        // Plain work: no approval, no Stop pending, no tool or delegate line.
+        // A call being written is work with a name, not thinking.
+        let writing = phase == .stalled ? nil : presentation.writing
         let plain = !isTerminal && ownedApproval == nil && !cancellationPending
-            && presentation.currentAction == nil
+            && presentation.currentAction == nil && writing == nil
             && (phase == .acknowledged || phase == .working)
         return MacChatTurnCardModel(
             identity: state.identity,
@@ -273,13 +243,12 @@ public enum TurnCardReadout {
             ),
             detail: cancellationPending ? "Waiting for this response to stop."
                 : ownedApproval.map(approvalDetail(for:))
-                    ?? detail(phase: phase, currentAction: presentation.currentAction),
+                    ?? writing?.line ?? detail(phase: phase, currentAction: presentation.currentAction),
             delegateName: presentation.delegateName,
             tone: ownedApproval.map(tone(forApproval:)) ?? tone(for: phase),
             symbolName: ownedApproval.map(symbolName(forApproval:)) ?? symbolName(for: phase),
             isTerminal: isTerminal,
-            // A turn waiting on a person is not moving, whatever its last
-            // lifecycle event was.
+            // Waiting on the person is not movement regardless of the last lifecycle event.
             showsLiveIndicator: ownedApproval == nil && !isTerminal && !cancellationPending && isMoving(phase),
             elapsed: elapsed,
             secondsSinceMovement: sinceMovement,
@@ -297,12 +266,11 @@ public enum TurnCardReadout {
         )
     }
 
-    /// The approval's own words, used when the approval owns the card.
+    /// Use the approval’s own words when it owns the card.
     public static func approvalTitle(for approval: MacChatTurnCardApproval) -> String {
         switch approval.outcome {
         case .pending:
-            // WHO is the first thing the person needs when the asker is not
-            // them: "Approve shell?" reads like her own request.
+            // Name third-party askers first so requests cannot appear to be the agent’s own.
             if let requester = approval.requester {
                 return "\(requester) asked: approve \(approval.toolName)?"
             }
@@ -357,14 +325,11 @@ public enum TurnCardReadout {
         return interval.rounded(.down)
     }
 
-    /// Phases in which the turn is understood to be actively moving.
     private static func isMoving(_ phase: TurnPresentationPhase) -> Bool {
         switch phase {
         case .acknowledged, .working, .tool, .delegation, .retrying:
             return true
-        // `.waiting` is deliberately NOT "moving": the shared kernel refuses to
-        // let a waiting turn become stalled, so a live pulse here would animate
-        // forever with no escape and claim motion that is not happening.
+        // Waiting is not movement; a live pulse would claim motion forever because the kernel does not stall waiting turns.
         case .waiting, .blocked, .stalled, .completed, .failed, .canceled, .outcomeUnknown:
             return false
         }
@@ -402,7 +367,7 @@ public enum TurnCardReadout {
         case .stalled:
             return "No movement from \(who)"
         case .completed:
-            // Never rendered: `card(for:)` returns nil for a completed turn.
+            // Completed turns render no card.
             return "Done"
         case .failed:
             return "This turn failed"
@@ -460,8 +425,7 @@ public enum TurnCardReadout {
 }
 
 public enum MacChatTurnCardFormat {
-    /// Seconds under a minute, then m/s, then h/m; invalid or unrepresentable
-    /// elapsed intervals have no duration reading.
+    /// Invalid or unrepresentable intervals have no duration reading.
     public static func duration(_ seconds: TimeInterval) -> String {
         guard seconds.isFinite, seconds >= 0,
               let total = Int(exactly: seconds.rounded()) else { return "Duration unavailable" }
@@ -480,9 +444,7 @@ public enum MacChatTurnCardFormat {
         isTerminal ? "Ran for \(duration(seconds))" : "\(duration(seconds)) elapsed"
     }
 
-    /// Only worth saying once movement has actually gone quiet.
-    /// The one place the timing readout is assembled, so the visual line, the
-    /// spoken line, and the model's own `spokenMeta` cannot drift apart.
+    /// Assemble timing once so visual, spoken and model metadata cannot drift; name quiet only after movement actually pauses.
     public static func metaLine(
         elapsed: TimeInterval,
         secondsSinceMovement: TimeInterval?,

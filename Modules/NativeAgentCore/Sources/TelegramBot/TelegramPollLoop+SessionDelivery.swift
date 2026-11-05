@@ -2,10 +2,10 @@ import Foundation
 import ChatTurnRuntime
 import NativeAgentCore
 import TurnTrace
-// Blueprint: | `TelegramPollLoop+SessionDelivery.swift` | Telegram's session recipient for turns without an inbound handler: resolves the bound destination and existing update claim, reserves continuations in the same journal, and joins previews before canonical reply recovery |
+// Blueprint: | `TelegramPollLoop+SessionDelivery.swift` | Resolve bound destinations and join previews before journal recovery |
 
 extension TelegramPollLoop {
-    public func sessionDelivery(_ context: SessionTurnDelivery.Context) async throws -> SessionTurnDelivery.Recipient? {
+    public func sessionDelivery(_ context: SessionTurnDelivery.Context, turn: Turn) async throws -> SessionTurnDelivery.Recipient? {
         guard context.dataRoot.standardizedFileURL == dataRoot.standardizedFileURL else { return nil }
         guard let route = context.route, route.surface == "telegram",
               let raw = route.destinationId, let chat = Int(raw),
@@ -25,8 +25,7 @@ extension TelegramPollLoop {
         let claim: TelegramUpdateClaim
         if let existing { claim = existing }
         else {
-            // No finished answer is invented here. previewPending keeps recovery
-            // waiting for the canonical transcript, even if no delta ever arrives.
+            // No finished answer is invented here. previewPending keeps recovery waiting for the canonical transcript, even if no delta ever arrives.
             var pending = TelegramAssistantDeliveryState(reply: "")
             pending.previewPending = true
             claim = try await inbox.reserveReply(runId: context.runID, sessionId: context.sessionID,
@@ -40,7 +39,7 @@ extension TelegramPollLoop {
             return nil
         }
         let driver = makeAssistantDelivery(destination: destination,
-            turnId: UUID(uuidString: TurnTraceContext.turnId ?? "") ?? UUID(),
+            draftKey: turn.id, turn: turn,
             errorContext: "session_stream", update: claim.update, message: claim.update.message, text: nil,
             savedDelivery: claim.assistantDelivery)
         return .init(progress: { event in

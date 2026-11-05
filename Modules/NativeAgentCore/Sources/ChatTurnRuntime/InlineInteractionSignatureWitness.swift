@@ -1,3 +1,4 @@
+import NativeAgentCore
 import CryptoKit
 import Foundation
 import NativeAgentShared
@@ -5,7 +6,7 @@ import ChatTurnContracts
 import PersistenceCore
 import TrustCenter
 
-// Blueprint: | `InlineInteractionSignatureWitness.swift` | Shared continuation stamping binds replay identity, peer steering, DataRootLife and the persisted origin to a cryptographic witness; persisted transcript claims confer no signing authority |
+// Blueprint: | `InlineInteractionSignatureWitness.swift` | MAC-bound immutable continuation witness; persisted claims grant no signing authority |
 
 extension InlineInteraction.Continuation {
     /// Stamp replay input once; the witness covers the exact origin the writer persists.
@@ -14,46 +15,37 @@ extension InlineInteraction.Continuation {
         originRunId: String? = nil, toolCallId: String? = nil,
         toolName: String?, toolArgumentsJSON: String?, mode: Mode,
         state: ResumeState = .waiting, resumeText: String? = nil,
-        peerSurface: String, originEnvelope: TurnEnvelope?, dataRoot: URL
+        peerSurface: String, originEnvelope: TurnEnvelope?, dataRoot: URL,
+        turn: Turn
     ) throws -> Self {
-        let steer = PeerDataTaint.carried(
+        let steer = PeerDataTaint.carried(turn: turn,
             peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: peerSurface),
-            peerID: ChatToolSessionContext.envelope?.verifiedUserId)
+            peerID: turn.envelope?.verifiedUserId)
         var continuation = Self(
             originRunId: originRunId, toolCallId: toolCallId,
             toolName: toolName, toolArgumentsJSON: toolArgumentsJSON,
             mode: mode, state: state, resumeRunId: "interaction-\(interaction.id)",
             resumeText: resumeText, peerSources: steer.sources, elevatedPeerSources: steer.elevated)
+        continuation.originTurnId = turn.id
         continuation.lifeID = try DataRootLife.current(in: dataRoot)
         continuation.signatureReceipt = InlineInteractionSignatureWitness.receipt(for: .init(
             sessionID: sessionID, interactionID: interaction.id, continuation: continuation,
-            originEnvelope: originEnvelope, interaction: interaction))
+            originEnvelope: originEnvelope, interaction: interaction),turn: turn)
         return continuation
     }
 }
 
-/// A signed card resumes only through a MAC over its full witness, verified
-/// against live pairing material. Persisted envelopes carry no signing verdict.
-/// The receipt binds the session, card, origin, replay arguments and text;
-/// editing those fields or rotating the pairing secret invalidates it.
-/// The app installs the pairing owner; without it minting grants nothing.
+/// A MAC binds session, card, origin, arguments, text and route to live pairing material.
+/// Edits or key rotation invalidate it. Persisted envelopes grant no signing verdict; absent pairing grants no minting.
 public enum InlineInteractionSignatureWitness {
-    /// Everything the receipt is bound to. Assembled identically at mint time
-    /// and at replay — the replay side rebuilds it from the persisted row, so
-    /// a tampered row produces a different witness and fails.
+    /// Rebuild the witness from persisted fields at replay so tampering changes its MAC input.
     public struct Witness: Sendable {
         public let sessionID: String
         public let interactionID: String
         public let continuation: InlineInteraction.Continuation
-        /// The provenance envelope that is (or will be) persisted on this
-        /// card's row. Canonicalized through `persistedMetadata()` so both
-        /// sides see the same cleaned values, and `commandSignatureVerified`
-        /// is deliberately not part of it — it never survives the row.
+        /// Canonicalize persisted origin on both sides; never persist or restore `commandSignatureVerified` as authority.
         public let originEnvelope: TurnEnvelope?
-        /// The card itself, read ONLY for the immutable fields that compose
-        /// the text the resumed turn is told (see `canonical`). Its state,
-        /// revision and outcome move after the receipt is minted and are
-        /// deliberately not covered.
+        /// Cover only immutable card text fields; state, revision and outcome legitimately change after minting.
         public let interaction: InlineInteraction?
 
         public init(
@@ -70,9 +62,7 @@ public enum InlineInteractionSignatureWitness {
             self.interaction = interaction
         }
 
-        /// Unambiguous byte string for the MAC. Every field is
-        /// length-prefixed, so no value can be re-split into a different set
-        /// of fields by spelling a separator inside itself.
+        /// Length-prefix every field so embedded separators cannot change witness boundaries.
         var canonical: String {
             let envelope = originEnvelope
                 .map { TurnEnvelope.fromPersistedMetadata($0.persistedMetadata()) } ?? nil
@@ -82,37 +72,27 @@ public enum InlineInteractionSignatureWitness {
                 sessionID,
                 interactionID,
                 continuation.resumeRunId,
+                continuation.originTurnId ?? "",
                 continuation.lifeID ?? "",
                 envelope?.surface ?? "",
                 envelope?.agent ?? "",
                 envelope?.verifiedChatId ?? "",
                 envelope?.verifiedUserId ?? "",
-                // WHERE the reply goes is part of this card's identity too.
-                // Without these, a receipt stayed valid over an edited route:
-                // same signed authority, answer delivered somewhere else.
+                // Bind the reply route so editing a destination cannot redirect signed authority.
                 route?.destinationId ?? "",
                 route?.threadId ?? "",
                 route?.sourceKey ?? "",
                 route?.replyTo ?? "",
                 route?.correlationId ?? "",
-                // Persisted metadata carries no remoteness declaration, so the
-                // canonicalized value is absent on BOTH sides today; covered
-                // here so a row that ever does carry one is bound by the MAC.
+                // Canonicalize remoteness identically on both sides; if a persisted row supplies it, the MAC must cover it.
                 envelope?.declaredRemote.map(String.init) ?? "",
                 continuation.mode.rawValue,
                 continuation.toolName ?? "",
             ]
-            // The arguments are replayed VERBATIM, so the digest of that exact
-            // text is what the receipt has to cover: a receipt that did not
-            // name these arguments cannot authorize this call.
+            // Bind the digest of exact replay arguments because they execute verbatim.
             fields.append(Self.digest(continuation.toolArgumentsJSON))
-            // The continuation TEXT is replayed just as verbatim. `resumeText`
-            // IS the resumed prompt on the no-provider path, and the immutable
-            // card fields below are quoted into `continuationPrompt`
-            // everywhere else — so without them an edited row could put
-            // different words into a turn that still verified as signed.
-            // Mutable fields (outcome, claim, replay checkpoint) stay out:
-            // they move on the row after the mint.
+            // Bind continuation text and immutable quoted card fields so row edits cannot change a signed prompt.
+            // Exclude outcome, claim and replay checkpoint because they legitimately change after minting.
             fields.append(Self.digest(continuation.resumeText))
             if let sources = continuation.peerSources {
                 fields.append("peer-sources")
@@ -128,49 +108,39 @@ public enum InlineInteractionSignatureWitness {
             return fields.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
         }
 
-        /// Hex SHA-256, empty for an absent value. The length prefix above
-        /// keeps "absent" and "empty" distinguishable.
+        /// Length-prefix absence separately from an empty value before hashing.
         private static func digest(_ value: String?) -> String {
             guard let value else { return "" }
             return SHA256.hash(data: Data(value.utf8))
                 .map { String(format: "%02x", $0) }.joined()
         }
 
-        static let version = "inline-interaction-witness/v3"
+        static let version = "inline-interaction-witness/v4"
     }
 
-    /// Mints a receipt over a canonical witness string, or nil when no pairing
-    /// owner is installed.
     public typealias Minter = @Sendable (_ canonicalWitness: String) -> String?
-    /// Re-checks a stored receipt against the LIVE key material.
+    /// Verify against live pairing keys so rotation invalidates old receipts.
     public typealias Verifier = @Sendable (_ canonicalWitness: String, _ receipt: String) -> Bool
 
-    // Private on purpose: a caller holding the raw minter could mint a receipt
-    // for any witness it liked, with no signed-context check in the way.
+    // Keep the raw minter private so callers cannot bypass the signed-context check.
     nonisolated(unsafe) private static var minter: Minter?
     nonisolated(unsafe) private static var verifier: Verifier?
 
-    /// Installs the pairing half. Called once at launch by the app.
     public static func install(mint: @escaping Minter, verify: @escaping Verifier) {
         minter = mint
         verifier = verify
     }
 
-    /// Nil unless the current turn is signature-verified AND a minter is
-    /// installed. Callers store the result verbatim on the continuation.
-    public static func receipt(for witness: Witness) -> String? {
-        // Either binding counts: the inbound paths bind the task-local, a
-        // resumed turn binds the whole envelope. Neither is trusted further
-        // than minting — the receipt is what survives to the replay.
-        let signed = ChatToolSessionContext.commandSignatureVerified == true
-            || ChatToolSessionContext.envelope?.commandSignatureVerified == true
+    /// Mint only with both a signature-verified current turn and installed pairing owner.
+    public static func receipt(for witness: Witness,turn: Turn) -> String? {
+        // Inbound task-local and resumed-envelope verification may permit minting; only the resulting receipt survives replay.
+        let signed = turn.envelope?.commandSignatureVerified == true
+            || turn.envelope?.commandSignatureVerified == true
         guard signed else { return nil }
         return minter?(witness.canonical)
     }
 
-    /// Whether this continuation may replay as a signature-verified turn.
-    /// The witness is rebuilt from the row being replayed, so a receipt
-    /// transplanted from another card, session, or an edited row fails here.
+    /// Rebuild the full witness at replay so transplanted or edited receipts cannot grant signature-verified authority.
     public static func isStillSigned(_ witness: Witness) -> Bool {
         guard let receipt = witness.continuation.signatureReceipt, !receipt.isEmpty
         else { return false }

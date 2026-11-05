@@ -30,7 +30,7 @@ origin predates the watermark; wholly consumed exchanges remain excluded.
 | `agent` | Their conversation with another agent or one of their helpers |
 | `builder` | Their own work, including resident wakes and workers; no person is in it |
 
-`NativeAgentShared.ChatThreadKind.isHisConversation`, `isPeerConversation` and `isOwnWork` are
+`NativeAgentShared.ChatThreadKind.isPersonConversation`, `isPeerConversation` and `isOwnWork` are
 the shared questions. A stored `legacy` kind, like a row without a kind, reads
 as the effective kind an unambiguous recorded source proves: recognized app
 sources are `direct`, agent bridges are `agent`, and worker sources are

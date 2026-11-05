@@ -1,11 +1,5 @@
-// Typed reads over the checked KnowledgeGraph envelopes.
-//
-// The reader returns checked envelopes as JSONValue; these are the
-// same projections as typed Sendable values, so app surfaces read entities,
-// edges and neighbourhoods without a JSON re-serialize + Decodable pass. The
-// field rules are the ones the Mac view's decoders applied: an entity field of
-// the wrong shape is absent, an edge needs string endpoints and a kind (or
-// `type`), and a malformed element fails the read rather than vanishing.
+// Project checked envelopes directly into Sendable values without JSON reserialization. Wrong-shaped entity fields are absent; malformed elements fail the read
+// rather than disappearing.
 
 import Foundation
 import PersistenceCore
@@ -31,7 +25,6 @@ public struct KnowledgeGraphEdge: Sendable, Identifiable, Hashable {
     public var mentionCount: Int?
 }
 
-/// `entityChecked(id:)` for a present entity.
 public struct KnowledgeGraphNeighborhood: Sendable {
     public var entity: KnowledgeGraphEntity?
     public var edges: [KnowledgeGraphEdge]

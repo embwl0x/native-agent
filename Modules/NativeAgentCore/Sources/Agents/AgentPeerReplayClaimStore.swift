@@ -5,26 +5,21 @@ import PersistenceCore
 import Darwin
 import Experiences
 
-// Blueprint: | `AgentPeerReplayClaimStore.swift` | `AgentPeerReplayClaimStore`: principal/protocol/message digest claims and retained receipts; conflicting bytes refuse and prior-life unfinished claims do not resume |
+// Blueprint: | `AgentPeerReplayClaimStore.swift` | `AgentPeerReplayClaimStore` |
 
-/// At-most-once inbound messages: claim `(principal, protocol, id)` and its
-/// digest before transcript admission. Identical bytes return their retained
-/// receipt; different bytes conflict. Receipt-less claims resume only in their life.
+/// Claim principal, protocol, ID and digest before transcript admission; only identical bytes may reuse a receipt. Receipt-less claims resume only within their
+/// owning process life.
 public struct AgentPeerReplayClaimStore: Sendable {
     public enum Outcome: Sendable, Equatable {
-        /// This message is new; the caller owns it and must record a receipt.
         case claimed
-        /// The original serialized receipt; no new turn.
         case replay(String)
-        /// The id was already used for DIFFERENT bytes.
         case conflict
-        /// An identical message is still in flight (no receipt recorded yet).
         case inFlight
         case stopped
     }
 
     static let maximumClaimAgeSeconds: TimeInterval = 7 * 24 * 3600
-    /// Live claims exclude expired tombstones.
+    /// Expired tombstones still protect replay identity even when absent from live claims.
     static let maximumClaims = 4096
     /// Capacity refuses new admission; it never evicts replay protection.
     static let maximumTombstones = 1_000_000
@@ -56,7 +51,8 @@ public struct AgentPeerReplayClaimStore: Sendable {
             if let existing = try read(url) {
                 guard existing.digest == digest else { return .conflict }
                 guard let receipt = existing.receipt else {
-                    return try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent()) ? .inFlight : .stopped
+                    return try DataRootLife.isCurrent(existing.lifeID, in: directory.deletingLastPathComponent().deletingLastPathComponent())
+                        ? .inFlight : .stopped
                 }
                 return .replay(receipt)
             }
@@ -81,7 +77,10 @@ public struct AgentPeerReplayClaimStore: Sendable {
             RepairOwed.settle(root, operation: operation, evidence: .init(source: url.path, id: digest))
             return nil
         } catch {
-            let detail = "The task was retained, but its replay locator could not be saved: \(error.localizedDescription). Repair the claim receipt from its retained task; do not repeat the work."
+            let detail = """
+                The task was retained, but its replay locator could not be saved: \(error.localizedDescription). Repair the claim receipt from its \
+                retained task; do not repeat the work.
+                """
             RepairOwed.owe(root, id: UUID().uuidString.lowercased(), kind: .message,
                 operation: operation, owner: url.path, words: detail,
                 lever: "Repair the exact claim receipt from retained task evidence.")
@@ -182,7 +181,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
         guard tombstones < Self.maximumTombstones else { throw POSIXError(.ENOSPC) }
     }
 
-    /// `<64 lowercase hex>.json` — exactly what `fileURL(for:)` writes.
+    /// Storage scans accept exactly the lowercase-hex filenames produced by fileURL(for:).
     static func isClaimRecordName(_ name: String) -> Bool {
         guard name.hasSuffix(".json") else { return false }
         let stem = name.dropLast(5)
@@ -191,7 +190,6 @@ public struct AgentPeerReplayClaimStore: Sendable {
 }
 
 extension AgentPeerReplayClaimStore.Outcome {
-    /// The cached receipt, decoded back to the bridge's response shape.
     public var cachedReceipt: [String: Any]? {
         guard case .replay(let json) = self,
               let data = json.data(using: .utf8),

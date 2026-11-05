@@ -1,4 +1,3 @@
-// VoiceOutputController.swift — TTS for NativeAgent iOS via AVSpeechSynthesizer
 import Foundation
 import SwiftUI
 import AVFoundation
@@ -11,16 +10,14 @@ final class VoiceOutputController: NSObject, ObservableObject {
     /// Spoken replies default to off; the person's saved choice takes precedence.
     @AppStorage("voiceOutputEnabled") var enabled = false
 
-    // Create the synthesizer and prepare the audio session only when speech is requested.
+    // Create synthesizer/audio state lazily so idle spoken replies do not acquire the route.
     private var _synthesizer: AVSpeechSynthesizer?
     private var preparationTask: Task<Void, Never>?
     private var audioToken: UUID?
-    /// True between a successful `setActive(true)` and the deactivation that
-    /// follows the last utterance.
     private(set) var audioSessionActive = false
     private let configureAudioSession: @Sendable () throws -> Void
     private let activateAudioSession: @Sendable () throws -> Void
-    /// Deactivate with `.notifyOthersOnDeactivation` to return the audio route to other apps.
+    /// Use notifyOthersOnDeactivation so other apps regain their audio route.
     private let deactivateAudioSession: @Sendable () throws -> Void
     private var activeUtterance: AVSpeechUtterance?
 
@@ -100,7 +97,7 @@ final class VoiceOutputController: NSObject, ObservableObject {
         }
     }
 
-    /// Disabling spoken replies immediately stops current playback.
+    /// Disabling spoken replies must immediately stop playback.
     func setEnabled(_ on: Bool) {
         enabled = on
         if !on { stop() }

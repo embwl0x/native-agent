@@ -8,72 +8,56 @@ import Privacy
 import TelegramBot
 import Transcripts
 import NativeAgentShared
-// Blueprint: | `ApprovalChatCards.swift` | Approval-card projection and notifications; transcript appends delegate to the chat owner, projection generations to ChatSessionIndexFile |
+import Experiences
+// Blueprint: | `ApprovalChatCards.swift` | A conversation delivers its matter's card, then accepts its conversation door with the transcript row |
 
-/// User, 10-03: "any approval the agent needs should pop right up in chat."
-///
-/// An approval raised in User's own conversation already shows there: the tool
-/// loop writes its card into that transcript, and a Telegram turn's filer sends
-/// its buttons. Every other approval — a peer's thread, her wake, background
-/// work, a skill install — used to reach only the Inbox and Approvals. This
-/// posts ONE card for it into the conversation User is in (the anchor), bound to
-/// the approval id; its buttons answer the same row through the shared
-/// resolver, so the Inbox, the phone and the Mac panel stay in step, and a card
-/// answered anywhere reads settled everywhere. Nothing here decides anything.
+/// A conversation named at birth draws the approval's card; every surface resolves the same decision.
 public enum ApprovalChatCards {
     public static func canResolve(_ approval: ApprovalRecord) -> Bool {
         !approval.payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    public static let unavailableText = "The details of this request are missing. Refresh approvals to check again. You can decide once the details are available."
+    public static let unavailableText = """
+        The details of this request are missing. Refresh approvals to check again. \
+        You can decide once the details are available.
+        """
 
     public enum Outcome: Sendable, Equatable {
-        /// Posted into this conversation.
         case posted(String)
-        /// Already shows in User's chat, is hers, was carded, or no conversation.
         case skipped
-        /// Delivery failed; the destination is retained for a retry.
+        /// Failed delivery retains its destination for retry.
         case failed
     }
 
-    /// Post the card for a newly pending approval. `telegram` is the running
-    /// bot's filer; `quiet` holds the phone ping.
+    /// The conversation owns only its card; the router owns the other doors.
     @discardableResult
     public static func post(
         _ record: ApprovalRecord,
-        dataRoot: URL,
-        telegram: TelegramApprovalFiler? = nil,
-        quiet: Bool = false
+        dataRoot: URL
     ) async -> Outcome {
-        guard record.status == "pending", !record.isAgentsOwnDecision else { return .skipped }  // hers to decide
-        // A Telegram turn's approval: its chat has buttons, and no Mac card.
-        let outcome = hasTelegramPrompt(record) ? .skipped : await postCard(record, dataRoot: dataRoot)
-        if let telegram, !quiet { await promptTelegram(record, telegram: telegram, dataRoot: dataRoot) }
-        return outcome
+        guard record.status == "pending", !record.isAgentsOwnDecision else { return .skipped }  // the agent's to decide
+        return await postCard(record, dataRoot: dataRoot)
     }
 
-    /// The card in the conversation User is in, unless it was raised there.
+    /// Avoid duplicating a card already shown in the person's active conversation.
     private static func postCard(_ record: ApprovalRecord, dataRoot: URL) async -> Outcome {
-        let fromPart: Bool = if case .object(let payload) = record.payload { payload["hostCallID"] != nil } else { false }
-        guard !record.chatCardDelivered,
-              let anchor = record.chatCardSessionId ?? usersConversation(
-                unless: fromPart ? nil : record.chatOriginSessionId, dataRoot: dataRoot)
-        else { return .skipped }
-        let card: JSONValue = .object([
-            "sessionId": .string(anchor),
-            "at": .string(ISO8601DateFormatter().string(from: Date())),
-        ])
         do {
-            guard let saved = try await SwiftNativeApprovalInbox(root: dataRoot).claimChatCard(record.id, card: card, deliver: { pending in
-                guard let sessionID = pending.chatCardSessionId,
-                      NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID else {
-                    throw ApprovalInboxError.malformedResponse("invalid chat-card session")
-                }
-                try await appendCard(pending, sessionID: sessionID, dataRoot: dataRoot)
-            }) else { return .skipped }
-            guard let sessionID = saved.chatCardSessionId else {
+            let forPerson = ForPerson.at(dataRoot)
+            guard let matter = try await forPerson.matter(record.id),
+                  let owed = matter.owes[Door.conversation("").key], !owed.phase.isSettled,
+                  let door = Door(address: owed.to), case .conversation(let sessionID) = door else { return .skipped }
+            guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) == sessionID else {
                 throw ApprovalInboxError.malformedResponse("invalid chat-card session")
             }
+            let written: Result<Void, Error> = await settle {
+                do {
+                    try await appendCard(record, sessionID: sessionID, dataRoot: dataRoot)
+                    try await forPerson.accepted(record.id, door,
+                        evidence: .init(source: Matter.messages(sessionID), id: "approval-card-" + record.id))
+                    return .success(())
+                } catch { return .failure(error) }
+            }
+            try written.get()
             return .posted(sessionID)
         } catch {
             // The strip remains visible until delivery is confirmed.
@@ -82,57 +66,21 @@ public enum ApprovalChatCards {
         }
     }
 
-    /// User, 10-07: every approval reaches his Telegram DM once, wherever it
-    /// was raised and whichever conversation he is in. That DM is User, with
-    /// the signed phone's authority. A script install gets a line there,
-    /// never a button: Telegram cannot show the whole script.
-    private static func promptTelegram(_ record: ApprovalRecord, telegram: TelegramApprovalFiler, dataRoot: URL) async {
-        do {
-            guard !telegramPrompted(record), let owner = try ownerDM(dataRoot: dataRoot) else { return }
-            guard !Task.isCancelled else { return }
-            try await telegram.promptChatCard(redactedForTelegram(record), chatId: owner,
-                                              payload: NativeAppSecretRedactor.redactArguments(decisionPayload(record)))
-        } catch {
-            nativeLog("[approval-chat-card] Telegram prompt failed: %@", error.localizedDescription)
-        }
-    }
-
-    /// When the bot starts: pending approvals and inline cards missing delivery
-    /// get their prompt once; delivered inline cards finish outstanding settlement.
+    /// Starting the bot recovers returned sends and edits; the router alone admits new prompts.
     public static func promptPending(dataRoot: URL, telegram: TelegramApprovalFiler) async {
-        guard let rows = try? await SwiftNativeApprovalInbox(root: dataRoot).list(filter: ApprovalFilter(status: "pending"))
-        else { return }
-        for row in rows where !row.isAgentsOwnDecision {
-            guard !Task.isCancelled else { return }
-            await promptTelegram(row, telegram: telegram, dataRoot: dataRoot)
-        }
+        // The router sends owed prompts; starting the bot only recovers already-returned interaction receipts and button edits.
         await promptPendingInteractions(dataRoot: dataRoot, telegram: telegram)
     }
 
-    /// Delivered to his DM: marked only after the send succeeded.
-    private static func telegramPrompted(_ record: ApprovalRecord) -> Bool {
-        guard case .object(let card)? = record.chatCard else { return false }
-        return card["telegramPromptedAt"] != nil
-    }
-
-    /// The conversation User is in (the anchor), or nil when there is none or
-    /// it is `origin` itself — a card raised there already shows there.
-    static func usersConversation(unless origin: String?, dataRoot: URL) -> String? {
-        guard let anchor = ConversationAnchor.currentSessionId(dataRoot: dataRoot),
+    /// Exclude the origin conversation because its card already shows there.
+    static func usersConversation(unless origin: String?, dataRoot: URL) throws -> String? {
+        guard let anchor = try ConversationAnchor.checkedCurrent(dataRoot: dataRoot)?.sessionId,
               NativeAgentChatSessionID.normalizedPathComponent(anchor) == anchor,
               origin != anchor else { return nil }
         return anchor
     }
 
-    /// The bot's owner DM, when it is the conversation User is in.
-    public static func ownerDM(boundTo anchor: String, dataRoot: URL) async throws -> Int? {
-        guard let owner = try ownerDM(dataRoot: dataRoot),
-              try await TelegramSessionStore(dataRoot: dataRoot).boundSessionId(chatId: owner) == anchor
-        else { return nil }
-        return owner
-    }
-
-    /// The bot's single configured owner, whose private chat id is his user id.
+    /// A private chat id is the configured owner's user id.
     static func ownerDM(dataRoot: URL) throws -> Int? {
         guard let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false), config.tokenConfigured,
               let owner = config.ownerUserId.flatMap({ Int(exactly: $0) })
@@ -148,13 +96,6 @@ public enum ApprovalChatCards {
         return copy
     }
 
-    /// A Telegram turn's approval: its filer already sent Approve/Deny there.
-    private static func hasTelegramPrompt(_ record: ApprovalRecord) -> Bool {
-        guard case .object(let payload) = record.payload, case .object? = payload["telegram"] else { return false }
-        return true
-    }
-
-    /// What is being decided: a tool call's own arguments, else the payload.
     private static func decisionPayload(_ record: ApprovalRecord) -> JSONValue {
         guard case .object(let payload) = record.payload,
               payload["kind"] == .string("chat_tool_approval"), let input = payload["input"] else {
@@ -163,25 +104,41 @@ public enum ApprovalChatCards {
         return input
     }
 
-    /// The same `approval_pending` row the tool loop writes, so every surface
-    /// that draws an approval card from a transcript draws this one.
+    /// Attention reuses the prompt transaction, including its in-flight send and receipt-only recovery. It never adds a plain-text approval copy.
+    public static func deliverAttentionPrompt(id: String, chatId: Int, dataRoot: URL) async -> NotificationDeliveryOutcome {
+        if id.hasPrefix("interaction:") {
+            return await deliverInteractionAttentionPrompt(id: String(id.dropFirst("interaction:".count)), chatId: chatId, dataRoot: dataRoot)
+        }
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        let receipt = "telegram_prompt_delivered:\(chatId)"
+        do {
+            let record = try await inbox.get(id)
+            if record.chatCard?.objectValue?[receipt] == .bool(true) { return .delivered }
+            guard record.status == "pending" else { return .notDelivered(reason: "The approval is no longer pending") }
+            guard let telegram = runningTelegram else { return .notDelivered(reason: "The Telegram approval sender is not running") }
+            try await telegram.promptChatCard(redactedForTelegram(record), chatId: chatId,
+                payload: NativeAppSecretRedactor.redactArguments(decisionPayload(record)))
+            let saved = try await inbox.get(id)
+            if saved.chatCard?.objectValue?[receipt] == .bool(true) { return .delivered }
+            return .unknown(sent: true, reason: "The approval prompt has no saved delivery receipt; reconcile its prompt transaction")
+        } catch {
+            if let failure = error as? NotificationDeliveryFailure { return failure.outcome }
+            if TelegramAPIFailure.isKnownNotDelivered(error) { return .notDelivered(reason: error.localizedDescription) }
+            return .unknown(sent: true, reason: error.localizedDescription)
+        }
+    }
+
+    /// The same `approval_pending` row the tool loop writes, so every surface that draws an approval card from a transcript draws this one.
     private static func appendCard(_ record: ApprovalRecord, sessionID: String, dataRoot: URL) async throws {
-        let detail: String = {
-            if case .object(let payload) = record.payload, payload["kind"] == .string("chat_tool_approval") {
-                let input = (try? NativeAppSecretRedactor.redactArguments(decisionPayload(record))
-                    .serialize(pretty: false)) ?? ""
-                return String(input.prefix(1_000))
-            }
-            return record.payloadPreview
-        }()
-        let content = [record.title, record.reason, detail]
+        let face = record.matter
+        let content = [face.title, face.summary, face.words]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: "\n")
-        let summary = (try? JSONValue.object([
+        let summary = try JSONValue.object([
             "status": .string("waiting_approval"), "approvalId": .string(record.id),
-            "tool": .string(record.action), "reason": .string(record.reason),
-        ]).serialize(pretty: false)) ?? ""
+            "tool": .string(record.action), "reason": .string(face.summary),
+        ]).serialize(pretty: false)
         let row: JSONValue = .object([
             "id": .string("approval-card-\(record.id)"),
             "sessionId": .string(sessionID),
@@ -200,7 +157,6 @@ public enum ApprovalChatCards {
         try await appendRow(row, sessionID: sessionID, dataRoot: dataRoot, uniqueRunID: "approval-card-\(record.id)")
     }
 
-    /// One row appended to a conversation's transcript, which then redraws.
     static func appendRow(_ row: JSONValue, sessionID: String, dataRoot: URL, uniqueRunID: String? = nil) async throws {
         let path = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
             .appendingPathComponent("\(sessionID).jsonl")
@@ -208,8 +164,7 @@ public enum ApprovalChatCards {
         await publishTranscriptChanges(sessionIDs: [sessionID], dataRoot: dataRoot)
     }
 
-    /// Card projections change without a new message. Advance the same version
-    /// the phone's transcript cache and ordering already consume.
+    /// Card projections change without a new message. Advance the same version the phone's transcript cache and ordering already consume.
     static func publishTranscriptChanges(sessionIDs: Set<String>, dataRoot: URL) async {
         do {
             try await ChatSessionIndexFile.recordProjectionChanges(

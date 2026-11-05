@@ -44,8 +44,8 @@ docs when changing ownership, state roots, policy, or a cross-surface contract.
 - Core `BackgroundLoopLifetimes` owns loop lifecycle and single-flight state.
 - Tools and skill bodies remain lazy. Do not add broad catalogs or memory dumps
   to every prompt.
-- Fix shared boundaries and audit Mac, detached chat, iOS, Telegram, Slack,
-  local bridges, and Workshop where the contract is shared.
+- Fix shared boundaries and audit Mac, detached chat, iOS, Telegram, Slack
+  and local bridges where the contract is shared.
 - TrustCenter, approvals, Full Mac, connector proof, signed mobile actions, and
   external-send confirmation remain authoritative.
 - Follow [AGENTS.md](AGENTS.md): build, install, and check the requested behavior

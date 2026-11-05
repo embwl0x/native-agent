@@ -13,11 +13,12 @@ import StandingBots
 import DreamREMCycle
 import Observation
 import SwarmRuns
-// Blueprint: | `RuntimeReadProjection+Feeds.swift` | Notification pending counts read only ApprovalInbox; the unwritten notification receipt input and inferred authorization are retired. Browser reads, checked skills with opt-in source/revision from the inventory body epoch, JSON decoding and JSONL tails; engine.runs retains rows and availability through LatestRead and returns its own read for DeviceSync, preserving rows on failure. Saved-things reads delegate to existing Desk, bot, memory and diary owners. |
+// Blueprint: | `RuntimeReadProjection+Feeds.swift` | Checked owner-backed guidance, history, approval counts and bounded evidence tails |
 
 extension RuntimeReadouts {
     @MainActor @Observable
     public final class Runs {
+        @ObservationIgnored var diagnosticsDidChange: (@MainActor () -> Void)?
         public private(set) var rows: [RunRecord] = []
         public private(set) var readSucceeded: Bool?
         @ObservationIgnored private let latest = LatestRead()
@@ -27,6 +28,7 @@ extension RuntimeReadouts {
             let read = await latest.read({ await RuntimeReadouts.runs(dataRoot: dataRoot) }, publish: { next in
                 readSucceeded = next != nil
                 if let next { rows = next }
+                diagnosticsDidChange?()
             })
             guard let read else { throw RuntimeReadError.unreadableFeed("The run history could not be read. Refresh to try again.") }
             return read
@@ -42,8 +44,7 @@ private enum StatusFeedAvailability: Equatable {
 
 extension RuntimeReadouts {
     public static func getNotificationStatus(dataRoot: URL) async throws -> NotificationRuntimeStatus {
-        // The approval owner supplies the panel's pending count. The retired
-        // notification receipt path has no producer and cannot measure it.
+        // Read pending counts from the approval owner.
         let approvalsPath = dataRoot
             .appendingPathComponent("workflows", isDirectory: true)
             .appendingPathComponent("approvals", isDirectory: true)
@@ -72,7 +73,7 @@ extension RuntimeReadouts {
     }
 
     public static func getBrowserStatus(dataRoot: URL) async throws -> BrowserRuntimeStatus {
-        // Read without write-back; absent feeds are unmeasured only after owner recovery succeeds.
+        // Read without write-back; absent feeds stay unmeasured until owner recovery succeeds.
         let root = dataRoot
         let browserRoot = root
             .appendingPathComponent("native_power", isDirectory: true)
@@ -127,13 +128,12 @@ extension RuntimeReadouts {
         return try JSONDecoder.nativeAgent.decode(T.self, from: data)
     }
 
-    /// Checked built-in guidance; source is loaded only for source review.
+    /// Load guidance source only for source review.
     public static func skills(dataRoot: URL, includingSource: Bool = false) async throws -> [SkillRecord] {
         try InstalledSkillInventory.entries(dataRoot: dataRoot, includingSource: includingSource)
     }
 
-    /// `runs/runs.json`, newest first, at most 200; requires a bare array.
-    /// `[]` means absent or empty; nil means unreadable, so publication preserves the last good rows.
+    /// Require a bare array; nil means unreadable and preserves proven rows, while `[]` is checked absence or emptiness.
     public static func runs(dataRoot: URL) async -> [RunRecord]? {
         let path = dataRoot
             .appendingPathComponent("runs", isDirectory: true)
@@ -145,9 +145,7 @@ extension RuntimeReadouts {
         return Array(rows.prefix(200))
     }
 
-    /// A bounded receipt tail with read/decode coverage. Missing is empty;
-    /// unreadable or malformed evidence is a failure, even with valid rows.
-    /// Blank rows are counted separately so each consumer keeps its policy.
+    /// Retain tail coverage: missing is empty, malformed or unreadable evidence fails even with valid siblings, and consumers decide blank-row policy.
     public static func tailJSONL<T: Decodable>(path: URL, limit: Int) async ->
         (rows: [T], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool, failure: String?) {
         let read: (lines: [Data], bytesRead: Int, truncatedToByteWindow: Bool, leadingFragment: Bool)

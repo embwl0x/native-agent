@@ -14,8 +14,7 @@ public extension LLMToolSchema {
     }
 }
 
-/// Retained calls and catalog schemas must carry the object that was recorded.
-/// The provider codecs share this boundary rather than inventing empty objects.
+/// Retained calls and catalog schemas must carry the object that was recorded. The provider codecs share this boundary rather than inventing empty objects.
 func checkedProviderJSONObject(_ data: Data, owner: String) throws -> [String: Any] {
     guard String(data: data, encoding: .utf8) != nil,
           let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -33,10 +32,7 @@ func checkedProviderJSONText(_ data: Data, owner: String) throws -> String {
     return text
 }
 
-/// Chat Completions block encoding shared by OpenAI, OpenRouter, Moonshot,
-/// and xAI. Tool-use messages precede their tool results; image parts are
-/// retained only on messages without tool calls. Moonshot supplies its
-/// separately retrieved reasoning replay when encoding an assistant tool call.
+/// Tool calls precede their results; images stay on messages without calls. Moonshot replays its retained reasoning with assistant calls.
 func chatCompletionsMessages(
     from message: LLMMessage,
     reasoning: String? = nil

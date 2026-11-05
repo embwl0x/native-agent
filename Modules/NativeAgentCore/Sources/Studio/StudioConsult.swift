@@ -3,14 +3,14 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import CryptoKit
-// Blueprint: | `StudioConsult.swift` | Studio errors and immutable consult envelopes; saved envelopes require the current writer's refs and description-only flag, rejecting malformed optional content |
+// Blueprint: | `StudioConsult.swift` | Immutable consults and checked errors |
 
 // MARK: - Errors
 
 public enum StudioError: Error, LocalizedError, Sendable, Equatable {
-    /// A consult without artifact refs must declare itself description-only.
+    /// Missing artifact refs require an explicit description-only declaration.
     case consultMissingDescriptionOnlyFlag
-    /// A consult with neither refs nor a description — nothing to judge.
+    /// Neither refs nor description leaves nothing to judge.
     case consultHasNothingToJudge
     case consultQuestionMissing
     case unknownConsult(String)
@@ -28,19 +28,22 @@ public enum StudioError: Error, LocalizedError, Sendable, Equatable {
     case unknownJournalEntry(String)
     case amendmentReasonMissing
     case amendmentCorrectionMissing
-    /// The passage to supersede is not in the entry's original response — a correction must name text that is actually there, or it is rewriting something the entry never said.
+    /// Corrections must quote original response text; otherwise they rewrite words the entry never said.
     case amendmentPassageNotFound(String)
-    /// The passage appears more than once, so which one is being corrected is not knowable. Quote more of the sentence.
+    /// Repeated passages are ambiguous; a longer quotation must identify the correction.
     case amendmentPassageNotUnique(String)
-    /// An abstained entry with no response has no passage to supersede.
+    /// An abstained entry without a response has no passage to correct.
     case amendmentEntryHasNoResponse(String)
-    /// The passage this correction names overlaps one an earlier amendment already superseded. Two corrections over the same words would nest one strike-through inside another and neither would read as written.
+    /// Overlapping corrections would nest strike-throughs and misrepresent both amendments.
     case amendmentPassageOverlaps(passage: String, existingAmendmentID: String, existingPassage: String)
 
     public var errorDescription: String? {
         switch self {
         case .consultMissingDescriptionOnlyFlag:
-            return "studio_consult: no artifact_refs were given, so this consult is description-only — set description_only=true. A description-only consult can be critiqued, but it can never become a journal encounter."
+            return """
+                studio_consult: no artifact_refs were given, so this consult is description-only — set description_only=true. A description-only consult can \
+                be critiqued, but it can never become a journal encounter.
+                """
         case .consultHasNothingToJudge:
             return "studio_consult: give artifact_refs, a description, or both — there is nothing to look at otherwise."
         case .consultQuestionMissing:
@@ -52,13 +55,19 @@ public enum StudioError: Error, LocalizedError, Sendable, Equatable {
         case .invalidIdentifier(let raw):
             return "studio: '\(raw)' is not a valid studio id (letters, digits and underscores only)."
         case .descriptionOnlyConsultCannotBecomeEncounter(let id):
-            return "studio_journal: consult '\(id)' was description-only — a concept or brief with no work in front of you. It can be critiqued, but it is not an encounter and can never enter the journal as one. Journal the work itself when you actually receive it."
+            return """
+                studio_journal: consult '\(id)' was description-only — a concept or brief with no work in front of you. It can be critiqued, but it is \
+                not an encounter and can never enter the journal as one. Journal the work itself when you actually receive it.
+                """
         case .journalOriginConsultRequiresRef:
             return "studio_journal: origin.kind=consult needs origin.ref — the consult id this entry came from."
         case .journalWorkTitleMissing:
             return "studio_journal: work.title is required — name what you encountered."
         case .journalResponseMissing:
-            return "studio_journal: response is required unless stance.kind=abstained (an encounter doesn't owe a verdict, but a formed or open stance owes its judgment)."
+            return """
+                studio_journal: response is required unless stance.kind=abstained (an encounter doesn't owe a verdict, but a formed or open stance owes its \
+                judgment).
+                """
         case .unknownOriginKind(let raw):
             return "studio_journal: unknown origin.kind '\(raw)' (expected wandering | consult | project)."
         case .unknownStanceKind(let raw):
@@ -74,34 +83,46 @@ public enum StudioError: Error, LocalizedError, Sendable, Equatable {
         case .amendmentCorrectionMissing:
             return "studio_journal_amend: correction is required — the text that now stands."
         case .amendmentPassageNotFound(let passage):
-            return "studio_journal_amend: supersedes text is not in that entry's response, verbatim: \"\(passage)\". Quote the passage exactly as written, or omit supersedes to append a dated correction instead."
+            return """
+                studio_journal_amend: supersedes text is not in that entry's response, verbatim: \"\(passage)\". Quote the passage exactly as written, or \
+                omit supersedes to append a dated correction instead.
+                """
         case .amendmentPassageNotUnique(let passage):
-            return "studio_journal_amend: \"\(passage)\" appears more than once in that entry's response, so which one is being corrected is not knowable. Quote more of the sentence."
+            return """
+                studio_journal_amend: \"\(passage)\" appears more than once in that entry's response, so which one is being corrected is not knowable. Quote \
+                more of the sentence.
+                """
         case .amendmentEntryHasNoResponse(let id):
-            return "studio_journal_amend: entry '\(id)' has no response text, so there is no passage to supersede. Omit supersedes to append a dated correction."
+            return """
+                studio_journal_amend: entry '\(id)' has no response text, so there is no passage to supersede. Omit supersedes to \
+                append a dated correction.
+                """
         case .amendmentPassageOverlaps(let passage, let existing, let existingPassage):
-            return "studio_journal_amend: \"\(passage)\" overlaps a passage amendment '\(existing)' already corrected (\"\(existingPassage)\"). Correcting the same words twice would nest one correction inside another. Quote a passage that does not overlap it, or omit supersedes to append a dated correction that stands on its own."
+            return """
+                studio_journal_amend: \"\(passage)\" overlaps a passage amendment '\(existing)' already corrected (\"\(existingPassage)\"). Correcting the \
+                same words twice would nest one correction inside another. Quote a passage that does not overlap it, or omit supersedes to append a dated \
+                correction that stands on its own.
+                """
         }
     }
 }
 
 // MARK: - Consult envelope
 
-/// One filed consult. The envelope is written ONCE and read back verbatim; the store never edits it, never scores it, and never suggests a verdict.
+/// Keep the filed envelope immutable so reads cannot alter the evidence or imply a verdict.
 public struct StudioConsult: Sendable, Equatable {
     public var id: String
     public var filedAt: String
-    /// What the agent can actually look at — file paths or URLs. Empty means description-only.
+    /// Empty artifact refs mean description-only.
     public var artifactRefs: [String]
     public var description: String?
-    /// What portion of the work is available (a spread, a rough cut, one screen).
     public var portionAvailable: String?
     public var question: String
     public var projectContext: String?
     public var stage: String?
     public var constraints: String?
     public var priorDiscussion: String?
-    /// Declared, never inferred after the fact: this consult carries no work, only a description of one.
+    /// Declare description-only intake explicitly; later readers cannot infer an encounter.
     public var descriptionOnly: Bool
 
     public init(

@@ -1,15 +1,16 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceProjection.swift` | `WorkspacePage`: async `project` sends Music and helpers through the owned workspace part while native readers retain the other areas; record titles stay native; `AgentWorkspace` binds receipt read refs through the existing workspace name book |
+// Blueprint: | `AgentWorkspaceProjection.swift` | `WorkspacePage`, `project`, `AgentWorkspace`: owner-routed pages and read bindings |
 
 extension AgentWorkspace {
-    package static func readReferences(_ reads: [(tool: String, input: [String: JSONValue], title: String)], dataRoot: URL) throws -> [JSONValue] {
+    package static func readReferences(workspace: WorkspaceOperation, _ reads: [(tool: String, input: [String: JSONValue], title: String)],
+        dataRoot: URL) throws -> [JSONValue] {
         let keys = reads.map { read -> (String, String, String)? in
-            guard let room = read.tool == "recent_trace_summary" ? "trace" : HerScreen.commsFamily[read.tool],
-                  let key = HerScreen.key(.record(tool: read.tool, input: read.input, title: read.title)) else { return nil }
+            guard let room = read.tool == "recent_trace_summary" ? "trace" : AgentScreen.commsFamily[read.tool],
+                  let key = AgentScreen.key(.record(tool: read.tool, input: read.input, title: read.title)) else { return nil }
             return (room, key, read.title)
         }
-        return try HerScreen.withNames(dataRoot) { book in
+        return try AgentScreen.withNames(workspace: workspace, dataRoot) { book in
             try keys.map { entry in
                 guard let (room, key, title) = entry else { return .null }
                 let present = Set(keys.compactMap { $0?.0 == room ? $0?.1 : nil })
@@ -18,12 +19,13 @@ extension AgentWorkspace {
         }
     }
 
-    package static func attachReadReferences(tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) -> JSONValue {
+    package static func attachReadReferences(workspace: WorkspaceOperation, tool: String, input: [String: JSONValue], result: JSONValue,
+        dataRoot: URL) -> JSONValue {
         guard case .object(var root) = result, case .array(let messages)? = root["messages"] else { return result }
         let items = AgentWorkspaceMail.project(input: input, result: result).items
             .filter { if case .open(.record)? = $0.actions.first?.action { return true }; return false }
         let refs: [JSONValue]
-        do { refs = try readReferences(items.compactMap { item in
+        do { refs = try readReferences(workspace: workspace, items.compactMap { item in
             if case .open(.record(let reader, let bound, let title))? = item.actions.first?.action { return (reader, bound, title) }
             return nil
         }, dataRoot: dataRoot) }
@@ -47,12 +49,11 @@ extension AgentWorkspace {
     }
 }
 
-/// A view of an owner's returned evidence. This layer neither reads sources nor
-/// interprets prose as instructions, permissions, completion, or fresh state.
+/// A view of an owner's returned evidence. This layer neither reads sources nor interprets prose as instructions, permissions, completion, or fresh state.
 extension WorkspacePage {
-    static func project(location: AgentWorkspaceLocation, result: JSONValue, dataRoot: URL, evidence: (text: String, fingerprint: String)?) async -> Self {
-        // The actual owner receipt retains diagnostics. Navigation needs its
-        // evidence, not a second copy of per-call organism instrumentation.
+    static func project(workspace: WorkspaceOperation, location: AgentWorkspaceLocation, result: JSONValue, dataRoot: URL, evidence: (text: String,
+        fingerprint: String)?) async -> Self {
+        // The actual owner receipt retains diagnostics. Navigation needs its evidence, not a second copy of per-call organism instrumentation.
         var result = result
         if case .object(var row) = result {
             row.removeValue(forKey: "organism_posture")
@@ -66,21 +67,22 @@ extension WorkspacePage {
         case .documents(let query):
             return workspaceDocuments(query: query, result: result)
         case .people(let page):
-            return workspaceContacts(result: result, page: page)
+            return workspaceContacts(workspace: workspace, result: result, page: page)
         case .form(let form): return form.projection
         case .page(let source, let page):
-            var view = await project(location: source, result: result, dataRoot: dataRoot, evidence: evidence); view.page = page; return view
+            var view = await project(workspace: workspace, location: source, result: result, dataRoot: dataRoot, evidence: evidence); view
+                .page = page; return view
         case .area, .capabilities, .receipt, .openPlaces, .workOverview, .savedWorkspaces, .browserBookmark, .conversations, .arrivals, .find:
             return .init(title: location.title, content: result, items: [], actions: [])
         case .record(let tool, let input, _):
             let title = location.title
             if tool == "bot_list" {
-                var owned=await WorkspaceReadout.bots(input:input,result:result,dataRoot:dataRoot)
+                var owned=await WorkspaceReadout.bots(workspace: workspace, input:input,result:result,dataRoot:dataRoot)
                 owned.title=title
                 return owned
             }
             if AgentWorkspaceLife.room(for:tool) == "music" {
-                var owned=await AgentWorkspaceLife.project(tool:tool,input:input,result:result,dataRoot:dataRoot)
+                var owned=await AgentWorkspaceLife.project(workspace: workspace, tool:tool,input:input,result:result,dataRoot:dataRoot)
                 owned.title=title
                 return owned
             }
@@ -91,15 +93,15 @@ extension WorkspacePage {
                 if input["details"] == .bool(true) {
                     return .init(title: title, content: result, items: [], actions: [])
                 }
-                return workspaceContacts(result: result)
+                return workspaceContacts(workspace: workspace, result: result)
             }
             if tool == "chat_conversations" { return HumanConversationRead.project(input: input, result: result) }
             if tool == "agent_read" { return AgentWorkspaceConversation.project(input: input, title: title, result: result) }
             if var projection = AgentWorkspaceKnowledge.project(tool: tool, input: input, result: result)
                 ?? AgentWorkspaceApps.project(tool: tool, input: input, result: result)
                 ?? AgentWorkspaceActivity.project(tool: tool, input: input, result: result)
-                ?? HerScreen.commsProjection(tool: tool, input: input, result: result)
-                ?? HerScreen.coreProjection(tool: tool, input: input, result: result) {
+                ?? AgentScreen.commsProjection(tool: tool, input: input, result: result)
+                ?? AgentScreen.coreProjection(tool: tool, input: input, result: result) {
                 projection.title = title
                 return projection
             }
@@ -128,8 +130,7 @@ extension WorkspacePage {
                 actions.append(.init(label: "Open this conversation", action: .open(.record(
                     tool: "chat_conversations", input: ["conversation_session_id": .string(session)], title: "Conversation with you"))))
             }
-            // In particular, desk_read may return plain rendered text. Never
-            // discover actions by parsing that text or nested receipt content.
+            // desk_read can return plain text; never infer executable actions from prose or nested receipts.
             if tool == "read_file", let path = workspaceText(input["path"]), evidence != nil {
                 actions.append(.init(label: "Add to this file", action: .perform(tool: "write_file",
                     input: ["path": .string(path), "append": .bool(true)], title: "Add to " + title,
@@ -143,8 +144,7 @@ extension WorkspacePage {
         }
     }
 
-    /// Ordinary hyperlinks in the returned text window, not instructions or
-    /// inferred tasks. Nothing opens until its explicit button is selected.
+    /// Ordinary hyperlinks in the returned text window, not instructions or inferred tasks. Nothing opens until its explicit button is selected.
     private static func documentLinks(_ text: String?) -> [AgentWorkspaceItem] {
         guard let text,
               let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return [] }
@@ -202,8 +202,7 @@ extension WorkspacePage {
             lane.removeValue(forKey: "excerpts")
             content["supporting_history"] = .object(lane)
         }
-        // Lane metadata retains source, as-of time, meaning and coverage;
-        // records appear once as selectable items rather than twice in output.
+        // Source metadata retains source, as-of time, meaning and coverage; records appear once as selectable items rather than twice in output.
         return .init(title: "Work: " + query, content: .object(content), items: items,
                      actions: actions)
     }
@@ -235,8 +234,8 @@ extension WorkspacePage {
         return .init(title: "Documents: " + query, content: .object(content), items: items, actions: [])
     }
 
-    /// `page` nil is every contact (connections: its text room pages them).
-    private static func workspaceContacts(result: JSONValue, page: Int? = nil) -> Self {
+    /// A nil page must include every contact.
+    private static func workspaceContacts(workspace: WorkspaceOperation, result: JSONValue, page: Int? = nil) -> Self {
         guard var content = workspaceObject(result), case .array(let contacts)? = content["contacts"] else {
             return .init(title: "People", content: result, items: [], actions: [])
         }
@@ -253,7 +252,7 @@ extension WorkspacePage {
                    row["can_start_turn"] != .bool(false) {
                     actions.append(.init(label: "Message", action: .message(agent: agent, conversation: nil, name: title), needsText: true))
                 }
-            } else if row["state"] == .string(AgentWorkspacePorts.current.tools.listedPeerState) {
+            } else if row["state"] == .string(workspace.ports.tools.listedPeerState) {
                 actions.append(.init(label: "Connect", action: .perform(tool: "agent_connect", input: ["name": .string(title)],
                                                                       title: "Connect " + title, textField: nil, isEffect: true)))
             }
@@ -264,9 +263,7 @@ extension WorkspacePage {
             return .init(title: title, content: .object(row.filter {
                 visible.contains($0.key) && !($0.key == "readiness" && $0.value == .string("not_checked")) }), actions: actions)
         }
-        // Connection commands, endpoint/credential metadata and protocol
-        // recipes stay in the discoverable agent_contacts owner receipt.
-        // They are not necessary for choosing a person and talking.
+        // Keep connection recipes and credentials in the discoverable owner receipt so choosing a contact stays simple.
         content = content.filter { ["status", "detail"].contains($0.key) }
         content["total_contacts"] = .int(Int64(contacts.count))
         var actions: [AgentWorkspaceButton] = []
@@ -291,8 +288,7 @@ extension WorkspacePage {
         return false
     }
 
-    /// Only called at explicitly owned locator fields, never recursively. A
-    /// malformed or broader request is rejected rather than silently narrowed.
+    /// Only called at explicitly owned locator fields, never recursively. A malformed or broader request is rejected rather than silently narrowed.
     private static func workspaceReadButton(_ locator: JSONValue?, label: String, title: String,
                                              expectedTool: String? = nil) -> AgentWorkspaceButton? {
         guard let locator = workspaceObject(locator),

@@ -1,8 +1,7 @@
 import Foundation
 
-// Blueprint: | `TurnSecretRedactor.swift` | `TurnSecretRedactor`: credential-name/token recognition and shared presentation/trace scrubbing; callers own size bounds |
+// Blueprint: | `TurnSecretRedactor.swift` | `TurnSecretRedactor`: shared credential recognition; callers own size bounds |
 
-/// Credential scrubbing shared by presentation and trace boundaries; callers own bounding.
 public enum TurnSecretRedactor {
     // Pagination cursors are inputs, not credentials.
     private static let credentialName = #"(?!(?:next|pagination)_token(?![\w-]))(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)"#
@@ -13,7 +12,6 @@ public enum TurnSecretRedactor {
 
     private static let secretPatterns: [(String, NSRegularExpression)] = {
         let specs: [(String, String, NSRegularExpression.Options)] = [
-            // Scrub embedded JSON too, including JSON escaped inside another string.
             ("NAMED_SECRET", #"\\+""# + credentialName + #"\\+"\s*:\s*\\+".*?(?:\\+"(?=\s*[,}\]]|$)|$)"#, [.caseInsensitive, .dotMatchesLineSeparators]),
             ("NAMED_SECRET", #"["']"# + credentialName + #"["']\s*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,}\]]+)"#, [.caseInsensitive]),
             ("TELEGRAM_TOKEN", #"(?:bot\d+|\b\d{6,})(?::|%3[Aa])[A-Za-z0-9_-]+"#, [.caseInsensitive]),
@@ -35,7 +33,7 @@ public enum TurnSecretRedactor {
         return Array(patterns.prefix(2)) + credentialPatterns.filter { $0.0 != "BEARER_TOKEN" } + Array(patterns.suffix(3))
     }()
 
-    /// Receipt and display boundaries share token recognition; callers own replacements.
+    /// Receipt and display boundaries share token recognition; callers own replacement policy.
     public static let credentialPatterns: [(String, NSRegularExpression)] = {
         let specs: [(String, String, NSRegularExpression.Options)] = [
             (
@@ -60,8 +58,7 @@ public enum TurnSecretRedactor {
         }
     }()
 
-    /// `<credential name> = <value>` with the name captured separately, so the
-    /// label survives and only a value that PROVES itself a secret is cut.
+    /// `<credential name> = <value>` with the name captured separately, so the label survives and only a value that PROVES itself a secret is cut.
     private static let displayNamedSecretPattern: NSRegularExpression = {
         let pattern = #"((?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd)(?![A-Za-z0-9])["']?\s*[=:]\s*["']?)([^\s"']+)"#
         guard let expression = try? NSRegularExpression(
@@ -72,21 +69,18 @@ public enum TurnSecretRedactor {
         return expression
     }()
 
-    /// Token-shaped: a long unbroken run that mixes character classes the way
-    /// an issued credential does and an English word does not.
+    /// Token-shaped: a long unbroken run that mixes character classes the way an issued credential does and an English word does not.
     private static func isTokenShaped(_ value: String) -> Bool {
         guard value.count >= 16 else { return false }
         let hasDigit = value.contains(where: \.isNumber)
         let hasLetter = value.contains(where: \.isLetter)
         let hasUpper = value.contains(where: { $0.isUppercase })
         let hasLower = value.contains(where: { $0.isLowercase })
-        // Either digits mixed into letters, or mixed case in a long run — both
-        // of which a sentence fragment that got this far will not have.
+        // Either digits mixed into letters, or mixed case in a long run — both of which a sentence fragment that got this far will not have.
         return (hasDigit && hasLetter) || (hasUpper && hasLower && value.count >= 24)
     }
 
-    /// Scrub a field a PERSON reads: keeps every label, replaces only what is
-    /// demonstrably a secret.
+    /// Keep labels visible; redact only demonstrated secrets.
     public static func redactDisplayText(_ value: String) -> String {
         var text = redactText(value, patterns: credentialPatterns) { kind, _ in "[REDACTED_\(kind)]" }
         let nsText = text as NSString
@@ -124,16 +118,14 @@ public enum TurnSecretRedactor {
                 options: [],
                 range: NSRange(location: 0, length: nsText.length)
             )
-            // Each policy still sees the entire preceding policy's result.
-            // Assemble its edits once instead of copying the full document
-            // once per credential match.
+            // Each policy still sees the entire preceding policy's result. Assemble its edits once instead of copying the full document once per credential
+            // match.
             if !matches.isEmpty {
                 var safe = "", start = 0
                 safe.reserveCapacity(text.utf8.count)
                 for match in matches {
                     var range = match.range
-                    // Bare pairs keep their labels. Cursors remain usable;
-                    // assignments and explicit credential names need no shape proof.
+                    // Bare pairs keep their labels. Cursors remain usable; assignments and explicit credential names need no shape proof.
                     if kind == "NAMED_SECRET", !#""'\"#.utf16.contains(nsText.character(at: range.location)) {
                         let whole = nsText.substring(with: range)
                         guard let colon = whole.firstIndex(where: { $0 == "=" || $0 == ":" }) else { continue }

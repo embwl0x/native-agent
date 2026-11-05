@@ -10,15 +10,13 @@ public struct ProviderOAuthConfig: Sendable {
     let authorizationEndpoint: String
     public let tokenEndpoint: String
     let scope: String
-    /// Pre-registered custom-scheme redirect URI (nativeagent://oauth/<name>).
+    /// Redirect URIs must match the pre-registered provider client.
     let redirectURI: String
-    /// Extra query params appended to the authorization URL.
     let extraAuthParams: [String: String]
-    /// Token exchange body — form vs JSON varies per provider.
+    /// Providers require distinct token-exchange encodings.
     let tokenBodyFormat: TokenBodyFormat
-    /// Token responses are persisted in the selected data root's resolver/adapter format.
+    /// Persist the exact format the selected root's adapter reads.
     let persistTokens: @Sendable ([String: Any], URL) throws -> Void
-    /// Function building the token-exchange body params (extras vary).
     let extraTokenParams: @Sendable (_ state: String) -> [String: String]
 
     enum TokenBodyFormat: Sendable { case form, json }
@@ -62,9 +60,7 @@ public struct ProviderOAuthConfig: Sendable {
         authorizationEndpoint: "https://auth.openai.com/oauth/authorize",
         tokenEndpoint:         "https://auth.openai.com/oauth/token",
         scope:                 "openid profile email offline_access",
-        // Loopback, not a custom scheme: OpenAI's ChatGPT client only allows
-        // http://localhost:1455/auth/callback. The loopback flow passes this
-        // explicitly (see NativeOAuthFlow+Loopback); this field mirrors it.
+        // The ChatGPT client permits only its registered localhost callback; the loopback flow passes it explicitly.
         redirectURI:           "http://localhost:1455/auth/callback",
         extraAuthParams: [
             "id_token_add_organizations": "true",
@@ -88,8 +84,7 @@ public struct ProviderOAuthConfig: Sendable {
                 // Sign-in replaces identity without borrowing missing fields from the previous account.
                 var merged: [String: Any] = ["access_token": answer.accessToken]
                 merged["refresh_token"] = answer.refreshToken
-                // Optional response metadata is kept only when supplied as a
-                // string; JSON null must not become a malformed saved field.
+                // Optional response metadata is kept only when supplied as a string; JSON null must not become a malformed saved field.
                 merged["id_token"] = tokens["id_token"] as? String
                 if let access = tokens["access_token"] as? String,
                    let payload = jwtPayload(access),
@@ -103,8 +98,7 @@ public struct ProviderOAuthConfig: Sendable {
                 existing.removeValue(forKey: "expires_in")
                 existing["expires_at"] = answer.expiresIn.map { NativeTimestampFormat.plainZulu(Date().addingTimeInterval($0)) }
             }
-            // The sign-in is saved; a failed child copy is re-synced (and
-            // reported) by the next Codex spawn.
+            // The sign-in is saved; a failed child copy is re-synced (and reported) by the next Codex spawn.
             do {
                 try ChatGPTTransport.syncCodexChildCopy(from: authPath)
             } catch {

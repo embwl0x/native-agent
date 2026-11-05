@@ -2,18 +2,13 @@ import Darwin
 import Foundation
 // Blueprint: | `BodyReport.swift` | Crash breadcrumb paths and fatal-signal/process-exit logging |
 
-/// The crash breadcrumbs: a launch row opens each run, the exit row closes
-/// a clean one, a fatal-signal row names a crash; nothing after the launch
-/// row is a SIGKILL.
 public enum BodyReport {
     public static func crashBreadcrumbs(_ dataRoot: URL) -> URL { dataRoot.appendingPathComponent("logs/crash-breadcrumbs.log") }
     public static let launchMark = "NativeAgent launched "
 }
 
-/// Last-gasp crash stack: on a fatal signal, write the backtrace to a file
-/// opened at launch, then re-raise so macOS still files its own report. The
-/// backtrace calls are not guaranteed async-signal-safe; this is best effort
-/// (10-07: two crashes left no .ips at all).
+/// Re-raise fatal signals after recording a launch-opened backtrace so macOS also files its report.
+/// Backtrace calls are not guaranteed async-signal-safe; this is best effort.
 extension BodyReport {
     nonisolated(unsafe) private static var crashFD: Int32 = -1
 

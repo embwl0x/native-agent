@@ -8,7 +8,7 @@ import Network
 import Photos
 import UIKit
 
-// Blueprint: | `PhoneBodyReadings.swift` | Wake-only battery, app audio route, network path, Music metadata and scoped photo count; explicit permission setup, scalar callbacks and bounded network/photo queries, no background assertions |
+// Blueprint: | `PhoneBodyReadings.swift` | Wake-only battery, audio, network, Music/photo readings; scoped consent and bounded queries |
 @MainActor
 final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
     private weak var owner: PhoneSenses?
@@ -24,8 +24,7 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
     init(owner: PhoneSenses) {
         self.owner = owner
         super.init()
-        // Notifications only while iOS lets this process run; no audio activation,
-        // background task, timer cadence or location request is acquired here.
+        // Observe only while iOS runs this process; do not acquire background assertions, cadence or location.
         for name in [UIDevice.batteryLevelDidChangeNotification, UIDevice.batteryStateDidChangeNotification,
                      AVAudioSession.routeChangeNotification, .MPMusicPlayerControllerNowPlayingItemDidChange,
                      .MPMusicPlayerControllerPlaybackStateDidChange] {
@@ -47,7 +46,7 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
         if source == .music {
             Task { _ = await MusicAuthorization.request(); owner?.wake() }
         } else if source == .photos {
-            // The async form, never a callback checked onto the main actor (10-31 crash class).
+            // Use the async API so a system callback cannot violate MainActor isolation.
             Task { _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite); owner?.wake() }
         }
     }
@@ -117,7 +116,8 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
             }
             let song = player.nowPlayingItem
             let summary = [song?.title, song?.artist].compactMap { $0 }.joined(separator: " — ")
-            owner?.observed(.music, value: value, summary: summary.isEmpty ? "song metadata unavailable" : String(summary.prefix(300)), pairing: pairing, at: at)
+            owner?.observed(.music, value: value, summary: summary.isEmpty ? "song metadata unavailable" : String(summary.prefix(300)), pairing: pairing,
+                at: at)
         } else {
             if observingMusic { MPMusicPlayerController.systemMusicPlayer.endGeneratingPlaybackNotifications(); observingMusic = false }
             if enabled.contains(.music) { owner?.observed(.music, value: "unknown", pairing: pairing, at: at) }
@@ -197,7 +197,10 @@ final class PhoneBodyReadings: NSObject, PHPhotoLibraryChangeObserver {
             let current = PHPhotoLibrary.authorizationStatus(for: .readWrite)
             guard current == .authorized || current == .limited, (current == .limited) == limited else { self.owner?.wake(); return }
             self.owner?.observed(.photos, value: String(count),
-                summary: "\(day) (\(zone)); \(limited ? "selected photos only, partial count" : "visible library photos"); dated today, not necessarily captured here",
+                summary: """
+                    \(day) (\(zone)); \(limited ? "selected photos only, partial count" : "visible library photos"); dated today, not \
+                    necessarily captured here
+                    """,
                 pairing: pairing, at: at)
         }
     }

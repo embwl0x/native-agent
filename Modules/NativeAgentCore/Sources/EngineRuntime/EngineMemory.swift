@@ -6,13 +6,9 @@ import MemoryV2
 import TrustCenter
 import NativeAgentShared
 import DeviceSync
-// Blueprint: | `EngineMemory.swift` | Memory v2 status and read availability publish through `refreshStatuses`; pending proposals publish checked rows and failure together through `proposals(status:)`, retaining checked rows on failure and leaving decision animation to the Mac; canonical recall keeps request identity separate from retained rows' successful query and never substitutes inventory matches; memory reads/writes; native notifications own review-reminder acceptance; one checked `graphSnapshot` shared by Knowledge Graph and Capabilities; `ProposalRecord` evidence; LatestRead orders pending proposals and memory status; committed proposal decisions use write() with the Mac's existing animation transaction. |
+// Blueprint: | `EngineMemory.swift` | `refreshStatuses`, `proposals(status:)`, `graphSnapshot`, `ProposalRecord`; Canonical memory projections |
 
-/// `NativeAgentEngine.memory`: MemoryV2 and the
-/// Knowledge Graph for one data root, in
-/// core types. The kept list, the review queue, search and the graph are
-/// observable state the Memories and Knowledge Graph pages render; phone
-/// lanes use the same owner.
+/// Share MemoryV2 and Knowledge Graph owners per root across observable pages and phone reads.
 @MainActor
 @Observable
 public final class MemoryFacade {
@@ -60,7 +56,6 @@ public final class MemoryFacade {
     @ObservationIgnored private let statusesRead = LatestRead()
     @ObservationIgnored private let proposalsRead = LatestRead()
 
-    /// The newest 200 active memories, written by the app's refresh paths.
     public var memories: [MemoryV2.MemoryRecord] = []
     public private(set) var memoriesReadError: String?
     public private(set) var hasLoadedMemories = false
@@ -82,7 +77,6 @@ public final class MemoryFacade {
     public var totalCount: Int? { status?.counts?.active }
     public private(set) var diagnostics: MemoryV2NativeStackSnapshot = .empty
     public private(set) var diagnosticsCheckedAt: Date?
-    /// Pending proposals that still pass review.
     public private(set) var proposals: [ProposalRecord] = [] {
         didSet { proposalsDidChange?() }
     }
@@ -97,27 +91,24 @@ public final class MemoryFacade {
     @ObservationIgnored private lazy var diagnosticsRead = LatestRead()
     @ObservationIgnored private lazy var graphSnapshotRead = LatestRead()
 
-    /// Checked recall rows for the Memories field; nil means none available.
+    /// Nil recall rows mean evidence is unavailable, never an empty successful recall.
     public private(set) var searchResults: [MemoryV2.MemoryRecord]?
     public private(set) var searchError: String?
-    /// Normalized query whose request is loading or has completed.
     public private(set) var searchQuery: String?
-    /// Query answered by `searchResults`, including retained prior results.
+    /// Retain the query that actually produced displayed results.
     public private(set) var searchResultQuery: String?
-    /// A semantic request is in flight for `searchQuery`, distinct from
-    /// an empty result.
+    /// Distinguish in-flight recall from an empty result.
     public private(set) var searchIsLoading = false
     @ObservationIgnored private lazy var searchRead = LatestRead()
     @ObservationIgnored private var lastSuccessfulSearch: (query: String, records: [MemoryV2.MemoryRecord])?
 
-    /// One checked whole-graph snapshot for the graph page and Capabilities.
+    /// Share one checked whole-graph snapshot across graph and Capabilities pages.
     public private(set) var graphSnapshot: CanonicalAgentGraphReadout?
     public var graphEntities: [KnowledgeGraphEntity] { graphSnapshot?.canvasEntities ?? [] }
     public var graphEdges: [KnowledgeGraphEdge] { graphSnapshot?.canvasEdges ?? [] }
     public var graphTotalEntities: Int { graphEntities.count }
     public var graphTotalEdges: Int? { graphSnapshot?.canvasEdges.count }
     public private(set) var graphLoading = false
-    /// Why the last whole-graph read failed; nil after a good read.
     public private(set) var graphLoadError: String?
     @ObservationIgnored private var graphRead: Task<Void, Never>?
     @ObservationIgnored private var graphReadsRequested = 0
@@ -126,9 +117,7 @@ public final class MemoryFacade {
         self.dataRoot = dataRoot
     }
 
-    /// The canonical writer for this root: `.shared` for the default root,
-    /// an isolated actor for an override, so a listing and its buttons act on
-    /// the same store.
+    /// Default roots share the canonical writer; override roots isolate it so reads and buttons still address one store.
     nonisolated private var owner: SwiftNativeMemoryV2 {
         SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
     }
@@ -157,9 +146,7 @@ public final class MemoryFacade {
         }
     }
 
-    /// Active memories: the newest `limit` (nil is every one), graduated
-    /// lessons among them as history, or the recall-eligible rows for `ids`
-    /// (search resolves hits outside the bounded list).
+    /// Resolve search hits by id even outside the bounded newest-memory list.
     public nonisolated func activeMemories(ids: [String]? = nil, limit: Int? = 200) async throws -> [MemoryV2.MemoryRecord] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let stored: [StoredMemory]
@@ -175,10 +162,7 @@ public final class MemoryFacade {
         return stored.map(MemoryV2.MemoryRecord.init(stored:))
     }
 
-    /// Proposals by status. Pending rows are only the ones still awaiting
-    /// review: a statement whose successor is recorded, or one that fails the
-    /// current quality contract, is never offered for acceptance. History
-    /// reads keep every row, including the fragments the gate let go.
+    /// Pending review excludes superseded or inadmissible statements; history retains all rows.
     public func proposals(status: String,
         publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
     ) async throws -> [ProposalRecord] {
@@ -245,16 +229,18 @@ public final class MemoryFacade {
 
     // MARK: - Writes
 
-    /// One new memory in this root's store. Resolving the owner may open and
-    /// migrate the store, so this never runs on the caller's actor.
+    /// Resolve and open the memory store off the caller’s actor because it may migrate.
+    /// These page mutations have no chat turn or sense-read ledger.
     public nonisolated func store(content: String, source: String, metadata: JSONValue?) async throws {
-        _ = try await owner.store(content: content, source: source, metadata: metadata)
+        _ = try await owner.store(content: content, source: source, metadata: metadata,
+            context: MemoryWriteContext(turn: nil, senseReads: nil))
     }
 
-    /// Merges only `pinned` inside the canonical transaction.
+    /// Merge only `pinned` within the canonical transaction.
     public nonisolated func setPinned(_ pinned: Bool, id: String) async throws {
         do {
-            _ = try await owner.updateMemory(id: id, update: .object(["pinned": .bool(pinned)]))
+            _ = try await owner.updateMemory(id: id, update: .object(["pinned": .bool(pinned)]),
+                context: MemoryWriteContext(turn: nil, senseReads: nil))
         } catch MemoryV2Error.recordNotFound {
             throw Self.notFound(id)
         }
@@ -267,7 +253,7 @@ public final class MemoryFacade {
     public func accept(proposalID: String,
         publish: @MainActor @Sendable (_ change: () -> Void) -> Void = { $0() }
     ) async throws -> MemoryV2.MemoryRecord {
-        let accepted = try await owner.acceptProposal(id: proposalID)
+        let accepted = try await owner.acceptProposal(id: proposalID, context: MemoryWriteContext(turn: nil, senseReads: nil))
         proposalsRead.write { publish { proposals.removeAll { $0.id == proposalID } } }
         return accepted
     }
@@ -287,9 +273,8 @@ public final class MemoryFacade {
 
     // MARK: - Search
 
-    /// Canonical recall over this root, projected onto kept records by id.
-    /// Queries under three characters clear it.
-    public func search(query: String) async {
+    /// Clear recall for queries under three characters; resolve kept records through canonical ids. A face refresh re-ranks without recording another use.
+    public func search(query: String, recordingUsage: Bool = true) async {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let prior = lastSuccessfulSearch
         searchRead.write {
@@ -303,8 +288,7 @@ public final class MemoryFacade {
             searchIsLoading = false
             return
         }
-        // A failed read retains the last successful rows with their prior
-        // query explicitly named, never an automatic substitute search.
+        // Failed reads retain proven rows with their actual query, never a substitute search.
         _ = await searchRead.read { () -> (String?, [MemoryV2.MemoryRecord]?, String?, [String]) in
             do {
                 try await Task.sleep(nanoseconds: 150_000_000)
@@ -313,7 +297,7 @@ public final class MemoryFacade {
             }
             let owner = owner
             do {
-                // Retrieval earns no usage credit; only accepted publication does.
+                // Credit usage only after accepted publication, never retrieval.
                 let response = try await owner.recall(
                     MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil),
                     recordingUsage: false
@@ -324,10 +308,9 @@ public final class MemoryFacade {
                           case .string(let id)? = obj["id"], seen.insert(id).inserted else { return nil }
                     return id
                 }
-                // A matching older memory must not disappear because it is
-                // outside the newest 200 rows.
+                // Matching older memories remain visible outside the newest-200 list.
                 let records = try await activeMemories(ids: hitIDs)
-                return (trimmed, records, nil, records.map(\.id))
+                return (trimmed, records, nil, recordingUsage ? records.map(\.id) : [])
             } catch {
                 let retained = prior.map { " Previous results for ‘\($0.query)’ are retained." } ?? ""
                 return (prior?.query, prior?.records, "Memory search for ‘\(trimmed)’ failed: \(error.localizedDescription)." + retained, [])
@@ -339,8 +322,7 @@ public final class MemoryFacade {
             searchError = error
             searchIsLoading = false
             if error == nil, let query, let records { lastSuccessfulSearch = (query, records) }
-            // Credit exactly what the semantic lane delivered. Fire-and-forget,
-            // like recall's own bump: a dropped bump self-heals on next serve.
+            // Credit exactly the delivered recall rows; the next serve repairs a dropped asynchronous usage bump.
             if !Task.isCancelled, !deliveredIDs.isEmpty {
                 let owner = owner
                 Task { try? await owner.recordRecallHits(ids: deliveredIDs) }
@@ -360,13 +342,8 @@ public final class MemoryFacade {
         try await AgentGraphReads.searchGraph(query: query, graphPath: graphPath)
     }
 
-    /// Reads one complete checked snapshot. A failed read keeps the prior
-    /// snapshot and says why in `graphLoadError`.
-    ///
-    /// One read at a time for every mounted graph page, and a page going away
-    /// does not stop the read another page is showing. A call while a read is
-    /// in flight is served by a fresh read after it (a reload after a sweep
-    /// must not publish the pre-sweep pages); calls made meanwhile share it.
+    /// Keep the prior snapshot with its error on failure. Share one graph read across mounts; joining refreshes get a fresh trailing read so captured bytes
+    /// cannot predate the change.
     public func loadGraph() async {
         graphReadsRequested += 1
         if graphRead == nil {
@@ -397,7 +374,7 @@ public final class MemoryFacade {
         }
     }
 
-    /// Detail is derived from the exact whole-graph revision beside it.
+    /// Derive detail from the exact whole-graph revision displayed beside it.
     public func neighborhood(entityID: String) -> KnowledgeGraphNeighborhood? {
         graphSnapshot?.neighborhood(entityID: entityID)
     }

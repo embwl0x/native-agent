@@ -1,19 +1,10 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustCenter.swift` | Checked policy object and preserved damaged-policy bytes, with backup/export/live-policy phone/Trust privacy decisions; `getTrust`, `applyPolicyPatchChecked` |
+// Blueprint: | `TrustCenter.swift` | `getTrust`, `applyPolicyPatchChecked`; Locked exact-generation writes preserve damaged authority. |
 
 // MARK: - Subsystem #12: TrustCenter
-//
-// Owns trust/policy.json (checked JSON object) and byte-preserved
-// policy.unavailable-<UUID>.json recovery evidence. Both are backed up and
-// exported; phone sync carries only the live policy. PrivacyMap lists Trust.
-//
-// TrustCenter is the Swift-owned permission and policy store. It governs
-// surface-specific autonomy (Full Mac, Telegram, Slack, iOS remote, shell,
-// files, Workshop executions, mac control, connectors), drives the autonomy/policy
-// gate surfaces, and signs autonomous-tool manifests through
-// SwiftNativeManifestSigner using data/tools/.manifest_signing_key.
+// Preserve unavailable policy bytes for recovery; phone projection carries only the live authority.
 
 // MARK: - SwiftNative impl
 
@@ -33,8 +24,7 @@ public actor SwiftNativeTrustCenter {
         return try TrustPolicy(policyObject: try await loadTrustPolicyChecked())
     }
 
-    /// Called only by the person's recovery control, never a tool. Preserve
-    /// damaged authority before explicitly reauthorizing the Safe posture.
+    /// Called only by the person's recovery control, never a tool. Preserve damaged authority before explicitly reauthorizing the Safe posture.
     public func reauthorizeSafePolicy() async throws -> TrustPolicy {
         let path = trustPolicyPath, defaults = defaultTrustPolicy()
         let saved = try await SwiftNativePersistenceCore.withFileLock(path) {
@@ -58,17 +48,8 @@ public actor SwiftNativeTrustCenter {
         return try TrustPolicy(policyObject: saved)
     }
 
-    /// Canonical checked trust-policy mutation. Every patch is merged against
-    /// one freshly validated raw generation under the cross-process file lock,
-    /// and the returned normalized policy is derived from that exact written
-    /// generation rather than a later reread.
-    ///
-    /// `guardedByLockedPolicy` is checked against the raw policy generation the
-    /// patch is about to merge into, INSIDE the lock. A caller that verified
-    /// something about the posture before calling (the quiet self-administration
-    /// tools verify Full Mac) re-verifies it there, so a posture lowered between
-    /// the check and the write refuses the write instead of being written back.
-    /// A throw from it leaves the file untouched.
+    /// Merge under the cross-process lock and return that exact written generation, never a later read. Recheck guards inside the lock so a concurrent posture
+    /// downgrade refuses the write without changing bytes.
     public func applyPolicyPatchChecked(
         _ patch: [String: JSONValue],
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
@@ -77,19 +58,12 @@ public actor SwiftNativeTrustCenter {
         let defaults = defaultTrustPolicy()
         let merged = try await SwiftNativePersistenceCore.withFileLock(path) {
             let current = try Self.loadRawPolicyChecked(at: path, defaults: defaults)
-            // Fresh exactly as the canonical read defines it: no file, or a
-            // file with nothing in it (setup writes `{}`). Keying this off
-            // file existence alone let the first settings write land on that
-            // `{}`, leave the file non-empty and never materialize the
-            // additions — so `autonomyDefault` fell back to "supervised" and
-            // the Trust preset stopped matching.
+            // Absence and validated empty setup state are both fresh, matching canonical reads.
             let bootstrapWrite = current.isEmpty
             try guardedByLockedPolicy?(current)
             try Self.validateKnownAuthorityPolicyTypes(patch, against: defaults)
             var patch = patch
-            // The first write on a fresh root persists what that root already
-            // reads (Self.freshInstallTrustPolicyAdditions); without this the
-            // fresh-install grant would silently disappear on the first save.
+            // Persist fresh additions on first write so the root does not lose the grant it already reads.
             if bootstrapWrite {
                 for (k, v) in Self.freshInstallTrustPolicyAdditions where patch[k] == nil {
                     patch[k] = v

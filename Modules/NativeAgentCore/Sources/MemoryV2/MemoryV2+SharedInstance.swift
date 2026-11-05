@@ -1,5 +1,4 @@
-// SwiftNativeMemoryV2 owns canonical MemoryStorage at <dataRoot>/memory/memory.sqlite.
-// Stored rows become MemoryRecord values only at the outward boundary.
+// Keep canonical storage under SwiftNativeMemoryV2; construct MemoryRecord values only at the outward boundary.
 
 import Foundation
 import Senses
@@ -8,25 +7,18 @@ import NativeAgentCore
 import PersistenceCore
 import Synchronization
 import NativeAgentShared
-// Blueprint: | `MemoryV2+SharedInstance.swift` | `SwiftNativeMemoryV2` directly owns canonical `MemoryStorage`; attachment readiness, engine-closed projection hooks and unavailable-storage admission; late canonical attachment never reopens stopped projections; preview reads refuse an unattached store rather than initializing it |
+// Blueprint: | `MemoryV2+SharedInstance.swift` | `SwiftNativeMemoryV2`, `MemoryStorage`: canonical owner, attachment and projections |
 
 // MARK: - SwiftNativeMemoryV2.shared
 
 extension SwiftNativeMemoryV2 {
-    /// True when canonical path identity matches the process-wide production store.
     public static func usesDefaultDataRoot(_ dataRoot: URL) -> Bool {
         canonicalRootIdentity(dataRoot)
             == canonicalRootIdentity(PersistenceCore.defaultDataRoot())
     }
 
-    /// Resolve the MemoryV2 owner for an injected data root without introducing
-    /// a process-wide registry.
-    ///
-    /// The default root always returns ``shared`` so normal app composition has
-    /// one actor and one underlying `MemoryStorage`. Alternate roots remain
-    /// hermetic and receive a private actor rooted exactly at the injected URL.
-    /// Failure to open an alternate store returns the existing unwired,
-    /// fail-closed actor; it never borrows the user's live memory.
+    /// Return shared for the default root so production has one actor and store. Injected roots remain isolated; failed opens stay fail-closed and never borrow
+    /// live user memory.
     public static func resolvedOwner(
         dataRoot: URL,
         alternateRootEmbedder: (any EmbeddingProvider)? = nil
@@ -42,11 +34,7 @@ extension SwiftNativeMemoryV2 {
         )
     }
 
-    /// Resolve the concrete storage actor for operations that need canonical
-    /// administrative APIs. Default-root
-    /// callers receive the exact storage beneath ``shared``; alternate roots
-    /// open an isolated store. An unavailable shared actor fails closed rather
-    /// than quietly constructing a hookless second owner over live memory.
+    /// Administrative access must use the exact canonical actor; unavailable shared storage cannot create a hookless second owner.
     public static func resolvedStorage(dataRoot: URL) async throws -> MemoryStorage {
         if usesDefaultDataRoot(dataRoot) {
             guard let storage = await SwiftNativeMemoryV2.shared.underlyingStorage() else {
@@ -57,10 +45,7 @@ extension SwiftNativeMemoryV2 {
         return try MemoryStorage(dataRoot: dataRoot.standardizedFileURL)
     }
 
-    /// Build and attach the USER.md projection hook to this actor's exact
-    /// underlying storage. The caller gets the generator only after the hook is
-    /// installed, so launch cannot regenerate through one SQLite owner and then
-    /// attach mutations to another.
+    /// Attach USER.md to this actor's exact storage before returning its generator so launch and mutation hooks cannot split owners.
     public func bindUserMDGenerator(
         dataRoot: URL,
         personaRoot: URL? = nil,
@@ -100,9 +85,7 @@ extension SwiftNativeMemoryV2 {
         await canonicalAttachmentReady?.value
     }
 
-    /// Reconcile the rebuildable Knowledge Graph projection from the exact
-    /// canonical MemoryV2 database owned by this actor. This is the launch and
-    /// post-migration convergence seam; it does not create a second fact owner.
+    /// Reconcile the graph from this actor's canonical database without creating a second fact owner.
     @discardableResult
     public func reconcileKnowledgeGraphProjection() async throws -> KnowledgeGraphMemoryRebuildReport {
         try await ensureCanonicalAttachment()
@@ -130,29 +113,20 @@ extension SwiftNativeMemoryV2 {
     }
 
     /// Uses disclosure-filtered user facts until a pinned core is chosen.
-    public func userPromptCore(surface: String) async throws -> [String]? {
-        try await ensureCanonicalAttachment()
+    public func userPromptCore(surface: String, preview: Bool = false) async throws -> [String]? {
+        try await ensureCanonicalAttachment(preview: preview)
         guard let underlying = storage else { throw MemoryV2Error.storageUnavailable }
         return try await underlying.userPromptCore(surface: surface)
     }
 
-    /// Process-wide instance rooted at the default data root. Uses the same
-    /// SQLite store the rest of MemoryV2 writes through. Uses the
-    /// `ManagedEmbeddingProvider` which loads CoreML bge-large-en-v1.5
-    /// from the data root or Resources/embedding; if the model fails to load it
-    /// **fails closed** (embed() throws) unless the user explicitly opted
-    /// into mock vectors via config (`config/embeddings.json::backend = "mock"`).
-    /// Also installs a Spotlight indexing hook on the underlying
-    /// MemoryStorage so insert/update/delete/acceptProposal all reflect into
-    /// the system index.
+    /// The process-wide actor shares canonical SQLite and managed embeddings; failed real inference throws unless mock is explicitly configured. Attach
+    /// Spotlight hooks to the same storage for all mutations.
     public static let shared = SwiftNativeMemoryV2(canonicalDataRoot: PersistenceCore.defaultDataRoot())
 
-    /// Retry attachment on the same actor and canonical path. Failed opens never
-    /// install substitute storage; the next read or Doctor repair can retry.
-    internal func ensureCanonicalAttachment() async throws {
-        // Reading for a mind preview cannot initialize storage, migrations or
-        // projection hooks. An already attached owner remains the one reader.
-        if LLMCallContext.preview, storage == nil { throw MemoryV2Error.storageUnavailable }
+    /// Retry attachment on the same actor and canonical path. Failed opens never install substitute storage; the next read or Doctor repair can retry.
+    internal func ensureCanonicalAttachment(preview: Bool = false) async throws {
+        // Reading for a mind preview cannot initialize storage, migrations or projection hooks. An already attached owner remains the one reader.
+        if preview, storage == nil { throw MemoryV2Error.storageUnavailable }
         if let ready = canonicalAttachmentReady {
             await ready.value
             return
@@ -191,10 +165,7 @@ extension SwiftNativeMemoryV2 {
     ) throws -> (MemoryStorage, Task<Void, Never>) {
         let storage = try MemoryStorage(dataRoot: dataRoot)
         guard projectionsEnabled else { return (storage, Task {}) }
-        // Spotlight indexing hook: every memory mutation (insert/update/
-        // delete/acceptProposal) reflects into the Spotlight index so the
-        // system surfaces them. Built lazily to avoid retaining the indexer
-        // when CoreSpotlight is unavailable (Linux).
+        // Create Spotlight hooks lazily only where CoreSpotlight is available.
         #if canImport(CoreSpotlight) && !os(Linux)
         let spotClient: any SpotlightIndexClient = SystemSpotlightIndexClient()
         #else
@@ -225,8 +196,7 @@ extension SwiftNativeMemoryV2 {
             }
             do {
                 await storage.attachKnowledgeGraphHook { id in
-                    // Read production policy per mutation; off retires the
-                    // memory-derived graph, including rewritten or forgotten facts.
+                    // Read production policy per mutation; off retires the memory-derived graph, including rewritten or forgotten facts.
                     do {
                         let producing = try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
                         try await kgIndexer.reconcileProjectionIfNeeded(producing: producing)
@@ -240,8 +210,7 @@ extension SwiftNativeMemoryV2 {
                 }
             }
             await storage.enqueueKnowledgeGraphProjection {
-                // Settings ▸ "Knowledge graph": the startup backfill is graph
-                // production too — off means it does not run.
+                // The graph production switch also gates startup backfill.
                 do {
                     if try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) {
                         try await kgIndexer.reconcileProjectionIfNeeded(producing: true)
@@ -257,7 +226,7 @@ extension SwiftNativeMemoryV2 {
         return (storage, ready)
     }
 
-    /// Last canonical attachment failure for Launch and Doctor, or nil after a successful open.
+    /// Retain the attachment failure until the canonical store opens successfully.
     public static var sharedOpenFailure: String? {
         _ = shared
         return sharedOpenFailureSlot.withLock { $0 }
@@ -269,7 +238,6 @@ extension SwiftNativeMemoryV2 {
         graphProjectionFailureSlot.withLock { $0 }
     }
 
-    /// The exact canonical owner, after attachment readiness has settled.
     public func underlyingStorage() async -> MemoryStorage? {
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] Canonical attachment failed: \(error)") }
@@ -278,8 +246,7 @@ extension SwiftNativeMemoryV2 {
 }
 
 extension MemoryStorage {
-    /// Doctor's live-store probe: `PRAGMA quick_check` on the pool the running
-    /// app reads and writes through. Returns SQLite's rows ("ok" when clean).
+    /// Probe quick_check on the exact pool the running app reads and writes.
     public func quickCheck() async throws -> [String] {
         try await dbPool.read { db in try String.fetchAll(db, sql: "PRAGMA quick_check") }
     }
@@ -287,7 +254,7 @@ extension MemoryStorage {
 
 // MARK: - MemoryRecalling adapter
 
-/// Disclosure-aware recall and delivered-hit credit against the same memory owner.
+/// Keep disclosure-aware recall and delivered-hit credit on the same owner.
 public struct SwiftNativeMemoryV2Recaller: Sendable {
     private let memory: SwiftNativeMemoryV2
     public init(memory: SwiftNativeMemoryV2 = .shared) {
@@ -322,17 +289,13 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
         }
     }
 
-    /// Add one-hop entities from this memory owner's SQLite graph to `extras["kg_related"]`.
-    /// Seed only records that classify and permit this surface/persona under `MemoryRecordDisclosurePolicy`.
-    /// Recall's `extras["id"]` ties each hit to entities extracted from its own memory text.
-    /// The prompt renderer presents entity names as one `related:` line.
-    /// Enabled graph enrichment is part of the checked recall assembly.
+    /// Seed graph enrichment only with disclosed hits under this owner; bind entities through each hit's exact memory ID so related names retain source
+    /// disclosure.
     private func annotatedWithRelatedEntities(
         _ response: MemoryV2RecallResponse,
         query: MemoryV2RecallRequest
     ) async throws -> [MemoryRecallHit] {
-        // Settings ▸ "Knowledge graph": off means the graph is not USED either
-        // — recall gets no one-hop entity enrichment. Read fresh per recall.
+        // Read graph policy on each recall; disabled production also withholds graph enrichment.
         guard try MemoryPolicyGate.knowledgeGraphEnabled() else { return response.hits }
         guard !response.hits.isEmpty else { return response.hits }
         let disclosedIDs: Set<String> = Set(
@@ -353,8 +316,7 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
         related = try await indexer.relatedEntityNames(forMemoryIDs: Array(disclosedIDs))
         guard !related.isEmpty else { return response.hits }
         return response.hits.map { hit in
-            // Recall stamps the record id into `extras["id"]`; that is the only
-            // link back from a hit to the memory it came from.
+            // Use recall's extras ID as the sole link back to the canonical memory.
             guard case .object(var extras)? = hit.extras,
                   case .string(let id)? = extras["id"],
                   disclosedIDs.contains(id),
@@ -370,8 +332,7 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
 // MARK: - Stored rows as records
 
 public extension MemoryRecord {
-    /// A canonical SQLite row as the typed record: the metadata-carried fields
-    /// surface back into their typed slots (the reverse of insert's fold).
+    /// Restore metadata-carried fields to their typed slots at the outward boundary.
     init(stored s: StoredMemory) {
         var kind: String? = nil
         var tags: [String]? = nil
@@ -430,9 +391,7 @@ public extension ProposalRecord {
 }
 
 extension SwiftNativeMemoryV2 {
-    /// Her prompt core for her own background work and reflection: the same
-    /// core chat carries (read as chat sees it, since this is her own thinking,
-    /// not a door). An unavailable core fails the work that requires it.
+    /// Background thought uses chat's own prompt core; unavailable required context fails the work.
     public static func userCoreForBackground(dataRoot: URL) async throws -> [String]? {
         try await resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat")
     }

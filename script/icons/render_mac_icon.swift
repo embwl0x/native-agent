@@ -2,8 +2,7 @@ import AppKit
 import CoreGraphics
 import ImageIO
 
-// macOS frame for the shared Living Core: Big Sur+ squircle, transparent
-// margin, and baked soft shadow.
+// The macOS frame needs a transparent margin and baked shadow around its squircle.
 @main
 enum RenderMacIcon {
     static func main() {

@@ -1,7 +1,7 @@
 import AttentionRouting
 import NativeAgentShared
 
-// Blueprint: | `Shotgun.swift` | `ShotgunController`: person-only floating chat/window lifecycle while the agent drives; nonisolated animation completion adapter shared with their pointer, direct deadline/Stop-aware fade wait, saved placement, and Resume through driver handoff plus ordinary session Send/queue |
+// Blueprint: | `Shotgun.swift` | `ShotgunController`: person-only driving chat; scoped Stop/Resume, placement and fade settlement |
 
 import AppKit
 import AppToolRuntime
@@ -10,10 +10,8 @@ import MacControl
 import NativeAgentCore
 import SwiftUI
 
-/// Non-activating, so clicking it never takes the front from the app she is
-/// working in; key only when its composer needs the keyboard. Titled (with
-/// the title bar hidden) so its edges resize it; folded into the name pill it
-/// goes borderless.
+/// Stay non-activating so clicks preserve the driven app; take key only for composer input.
+/// Hidden titled chrome permits resizing; the folded pill must be borderless.
 final class ShotgunPanel: NSPanel {
     static let fullStyle: NSWindow.StyleMask = [.titled, .resizable, .fullSizeContentView, .nonactivatingPanel]
     static let pillStyle: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
@@ -45,7 +43,7 @@ final class ShotgunPanel: NSPanel {
         setFull(true)
     }
 
-    /// Full: resizable within User's bounds, no traffic lights. Pill: borderless.
+    /// Full mode keeps user sizing; pill mode needs borderless chrome.
     func setFull(_ full: Bool) {
         styleMask = full ? Self.fullStyle : Self.pillStyle
         contentMinSize = full ? Self.minSize : NSSize(width: 60, height: 24)
@@ -59,7 +57,6 @@ final class ShotgunPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// The Shotgun shortcut. A picker, not a key recorder.
 enum ShotgunShortcut: String, CaseIterable, Identifiable {
     case optionSpace = "option-space"
     case controlOptionSpace = "control-option-space"
@@ -107,44 +104,36 @@ enum ShotgunShortcut: String, CaseIterable, Identifiable {
 @Observable
 final class ShotgunController: NSObject, NSWindowDelegate {
     static let shared = ShotgunController()
-    /// The composer's switch. On: NativeAgent steps aside when she starts driving.
     static let enabledKey = ShotgunPreference.enabledKey
-    /// Where User last left it: the panel's bottom-right corner, "x,y".
+    /// Preserve user placement across launches as a bottom-right corner.
     static let cornerKey = "NativeAgent.shotgun.corner"
-    /// The size User last gave it, "w,h".
+    /// Preserve the user's chosen panel size across launches.
     static let sizeKey = "NativeAgent.shotgun.size"
     static let defaultSize = NSSize(width: 400, height: 560)
-    /// Inside the screen's visible frame: above the Dock, below the menu bar.
+    /// Keep the panel clear of the Dock and menu bar.
     static let margin: CGFloat = 16
-    /// How long "Done" stays open before it folds into the name pill.
     static let collapseAfter: Duration = .seconds(120)
 
     private(set) var isShown = false
-    /// Folded into the small name pill after a finished turn.
     private(set) var collapsed = false
-    /// False while the person holds the Mac (human takeover), so Resume shows.
+    /// Human takeover must expose Resume instead of claiming agent control.
     private(set) var driverAllowed = MacAttentionSessionStore.shared.currentDriverAllowed
-    /// The shortcut that could not be registered, if any (another app has it).
+    /// Retain shortcut registration failure so another app's ownership stays visible.
     private(set) var shortcutTaken: ShotgunShortcut?
 
     @ObservationIgnored private weak var appModel: AppModel?
     @ObservationIgnored private var panel: ShotgunPanel?
-    /// The main window Shotgun stepped aside for, until it is brought back.
+    /// Retain the displaced main window so opening restores the same window.
     @ObservationIgnored private var hiddenMain: NSWindow?
-    /// The turn that already stepped aside: once per turn, so a main window
-    /// User brought back stays back.
+    /// Step aside once per turn so a window the user brings back stays back.
     @ObservationIgnored private var steppedAsideTurn: String?
-    /// The session and turn driving the Mac while Shotgun is up, named by the
-    /// call itself: its running state and Stop are the ones Shotgun shows,
-    /// whichever surface the turn came from (a Telegram drive is not the chat
-    /// on screen and has no Mac lifecycle; it is stopped by its session).
+    /// Bind running state and Stop to the driving session, including turns without a Mac lifecycle.
     private(set) var driver: PersonOnlyWindows.Driver? {
         didSet { if let driver { selectedSessionID = driver.session } }
     }
-    /// The conversation stays on screen after its driving authority ends.
+    /// Keep the conversation visible after driving authority ends.
     private(set) var selectedSessionID: String?
-    /// True while the panel is placed or animated, so only User's drag becomes
-    /// the remembered spot.
+    /// Ignore programmatic placement so only user drags become remembered positions.
     @ObservationIgnored private var placing = false
     @ObservationIgnored private var hotKeyRef: EventHotKeyRef?
     @ObservationIgnored private var hotKeyHandler: EventHandlerRef?
@@ -152,9 +141,8 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var clickAwayMonitor: Any?
     @ObservationIgnored private var collapseTask: Task<Void, Never>?
-    /// Her pointer, drawn where her last pointer action happened.
     @ObservationIgnored private let agentPointer = AgentPointerOverlay()
-    /// Where her last pointer action was (CGEvent space): the screen she drives.
+    /// CGEvent coordinates identify the screen being driven.
     @ObservationIgnored private var lastAgentPoint: CGPoint?
 
     private override init() { super.init() }
@@ -185,16 +173,13 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             let window = note.object as? NSWindow
             MainActor.assumeIsolated { ShotgunController.shared.windowBecameKey(window) }
         })
-        // She drives however her turn moves the Mac: hands, a shell `open`, a
-        // script hiding apps (10-31 demo: every step was shell, and Shotgun never
-        // came). Her turn putting another app in front, or hiding this one, is
-        // her driving: Shotgun comes up, and this app comes back from her hide.
-        // His keys and clicks are his.
+        // Front-app changes can come from shell or scripts as well as hands; detect turn-driven changes.
+        // The person's own keys and clicks must not count as agent driving.
         observers.append(center.addObserver(
             forName: NSApplication.didHideNotification, object: nil, queue: .main
         ) { _ in
             MainActor.assumeIsolated {
-                guard let turn = ShotgunController.shared.herTurnMovedTheMac() else { return }
+                guard let turn = ShotgunController.shared.agentTurnMovedTheMac() else { return }
                 NSApp.unhideWithoutActivation()
                 ShotgunController.shared.driveBegan(turn)
             }
@@ -205,12 +190,11 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
             MainActor.assumeIsolated {
                 guard pid != ProcessInfo.processInfo.processIdentifier,
-                      let turn = ShotgunController.shared.herTurnMovedTheMac() else { return }
+                      let turn = ShotgunController.shared.agentTurnMovedTheMac() else { return }
                 ShotgunController.shared.driveBegan(turn)
             }
         })
-        // A turn from another door ended (or began): the remote driver is let go
-        // the moment its turn leaves flight, and the view reads running again.
+        // Release remote-driver ownership as soon as its turn leaves flight.
         observers.append(center.addObserver(
             forName: Notification.Name("ChatCancelFlag.inFlightDidChange"), object: nil, queue: .main
         ) { _ in MainActor.assumeIsolated { ShotgunController.shared.releaseDriverIfDone() } })
@@ -224,15 +208,12 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     // MARK: - User's controls
 
-    /// The shortcut and View ▸ Show/Hide Shotgun.
     func toggle() {
         if isShown { hide() } else { show(from: nil, makeKey: true) }
     }
 
-    /// The name pill: Shotgun opens back out where it was.
     func unfold() { setCollapsed(false) }
 
-    /// Open / Expand: NativeAgent comes back as it was, and Shotgun goes.
     func expand() {
         let main = hiddenMain ?? Self.mainWindow()
         hiddenMain = nil
@@ -246,11 +227,9 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// ×: Shotgun closes fully. NativeAgent stays wherever it is.
     func close() { hide() }
 
-    /// Resume, while the person holds the Mac: the same handback as the
-    /// composer's "Let agent use Mac", from the person's own click.
+    /// Resume uses the person's own handback authority, just like the main composer.
     func resume() {
         guard let generation = MacAttentionSessionStore.shared.userHandoffGeneration() else { return }
         let session = driver?.session ?? selectedSessionID
@@ -258,17 +237,14 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             await MacAttentionSessionStore.shared.giveAgentControl(userGeneration: generation)
             guard MacAttentionSessionStore.shared.currentDriverAllowed,
                   let appModel = self.appModel, let session else { return }
-            // A takeover is already a tool result, so there is no parked model
-            // to wake. Use the same session acceptance/queue as his Send.
+            // Takeover already returned a tool result; resume through session acceptance, not a parked model.
             if case .rejected(let message) = await appModel.startChatTurnForSession(
                 "Mac control has returned; continue from the recorded results.", sessionId: session
             ) { appModel.statusText = message }
         }
     }
 
-    /// After a send from Shotgun: the keyboard goes back to the app in front
-    /// (the one she is driving), and her held keystrokes go on. Ordering out
-    /// drops key; ordering back in does not take it.
+    /// Return the keyboard to the driven app after sending; ordering back in must not take key.
     func giveKeyboardBack() {
         guard let panel, panel.isKeyWindow else { return }
         panel.orderOut(nil)
@@ -276,9 +252,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         publish()
     }
 
-    /// The turn on screen finished (true) or is running again (false). Done
-    /// folds into the name pill after two minutes, or at the person's next
-    /// click in another app.
+    /// Fold completed work after two minutes or a click away so idle Shotgun stays unobtrusive.
     func setDone(_ done: Bool) {
         collapseTask?.cancel()
         collapseTask = nil
@@ -294,10 +268,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             guard !Task.isCancelled else { return }
             ShotgunController.shared.collapse()
         }
-        // A global monitor only sees events sent to other apps: a click in
-        // Shotgun itself never folds it.
-        // Its own top edge (the hidden title bar) is handled by the window
-        // server and reaches this monitor too: a click on Shotgun is not away.
+        // Global events include the hidden title bar; clicks on Shotgun itself must not fold it.
         clickAwayMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
             let point = NSEvent.mouseLocation
             Task { @MainActor in
@@ -316,8 +287,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         setCollapsed(true)
     }
 
-    /// Into the name pill (borderless, sized by the pill itself) or back out
-    /// to the size User gave it, keeping the bottom-right corner.
+    /// Preserve the bottom-right anchor while folding or restoring the user's size.
     private func setCollapsed(_ fold: Bool) {
         guard collapsed != fold else { return }
         collapsed = fold
@@ -337,18 +307,19 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     // MARK: - Shortcut
 
-    /// Settings and the agent use the same save and live registration.
+    /// Share shortcut persistence and registration so settings and agent actions cannot disagree.
     func setShortcut(_ shortcut: ShotgunShortcut) throws {
         UserDefaults.standard.set(shortcut.rawValue, forKey: ShotgunShortcut.storageKey)
         applyShortcut()
         if shortcutTaken != nil {
-            throw QuietSettingError.unavailable("Saved \(shortcut.title), but macOS could not register it. Choose another Shotgun shortcut in Settings; View → Show Shotgun remains available.")
+            throw QuietSettingError.unavailable("""
+                Saved \(shortcut.title), but macOS could not register it. Choose another Shotgun shortcut in Settings; View → Show \
+                Shotgun remains available.
+                """)
         }
     }
 
-    /// Registers the chosen shortcut, replacing the last. A shortcut another
-    /// app already owns is said once, in plain words; the View menu item
-    /// keeps working.
+    /// Report shortcut conflicts while preserving the working View menu action.
     func applyShortcut() {
         if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
         hotKeyRef = nil
@@ -383,7 +354,8 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             if toldTaken.insert(shortcut).inserted {
                 NativeAgentNotifications.post(
                     title: "\(shortcut.title) is taken",
-                    body: "Another app already uses \(shortcut.title), so it can't show Shotgun. Pick another in Settings, or use View ▸ Show Shotgun."
+                    body: "Another app already uses \(shortcut.title), so it can't show Shotgun. Pick another in Settings, or use View ▸ Show Shotgun.",
+                    deadline: nil
                 )
             }
             return
@@ -393,9 +365,19 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     // MARK: - Stepping aside
 
-    /// Prefer the visible chat's driving turn, then another busy session with
-    /// a screen pane, which opens on its first Mac verb.
+    /// Prefer the visible chat's drive so Shotgun follows the work the user is watching.
     private func drivingTurnID() -> String? { drivingSession()?.turn }
+
+    /// The busy turn whose hands moved: the visible chat's first, then any other in flight.
+    private func handsSession() -> (session: String, turn: String)? {
+        guard let appModel else { return nil }
+        let turns = appModel.engine.turns
+        let active = appModel.activeChatSessionId
+        for sessionId in [active] + turns.activeTurnIDsBySession.keys.sorted().filter({ $0 != active }) where turns.isBusy(sessionId) {
+            if let turn = turns.activeTurnIDsBySession[sessionId] { return (sessionId, turn) }
+        }
+        return nil
+    }
 
     private func drivingSession() -> (session: String, turn: String)? {
         guard let appModel else { return nil }
@@ -418,48 +400,38 @@ final class ShotgunController: NSObject, NSWindowDelegate {
                 ShotgunController.shared.maybeStepAside()
             }
         }
-        // The Mac chat's drive is over: her pointer goes.
         if !busy { agentPointer.fade() }
         releaseDriverIfDone()
     }
 
-    /// The named driver stays only while its turn is in flight on this root.
+    /// Driver ownership must end when its turn leaves flight on this root.
     private func releaseDriverIfDone() {
         if let driver, let appModel, !appModel.engine.turns.inFlightTurns().contains(where: { $0.turnId == driver.turn }) {
             self.driver = nil
         }
     }
 
-    /// A real Mac drive, at its first move: her hands just moved — a click,
-    /// key or accessibility press, or a hand-moving verb starting — while the
-    /// chat on screen runs a Mac verb. A look, a quiet page read, an offscreen
-    /// render and background browser work move no hands here, so they never
-    /// step aside. Once per turn.
+    /// The agent's hands on any app (posted input, an accessibility press or value, a window raised or activated) take it over, so the
+    /// busy turn rides shotgun whether or not it has a screen preview yet; looks and offscreen renders move no hands and never trigger it.
+    /// Limit this to once per turn so the user can bring the main window back.
     private func maybeStepAside() {
-        guard let driving = drivingSession(), driving.turn != steppedAsideTurn,
-              PersonOnlyWindows.secondsSinceAgentHands() < 3 else { return }
+        guard PersonOnlyWindows.secondsSinceAgentHands() < 3, let driving = handsSession(), driving.turn != steppedAsideTurn else { return }
         steppedAsideTurn = driving.turn
         if driver == nil { driver = PersonOnlyWindows.Driver(session: driving.session, turn: driving.turn) }
         guard UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true else { return }
         stepAside()
     }
 
-    /// A turn of hers in flight while the Mac moved without his keys or clicks.
-    fileprivate func herTurnMovedTheMac() -> PersonOnlyWindows.Driver? {
-        let his = [CGEventType.keyDown, .leftMouseDown, .rightMouseDown].map {
+    /// Exclude hardware keys and clicks so the person's own work cannot trigger step-aside.
+    fileprivate func agentTurnMovedTheMac() -> PersonOnlyWindows.Driver? {
+        let personIdle = [CGEventType.keyDown, .leftMouseDown, .rightMouseDown].map {
             CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0)
         }
-        guard his.allSatisfy({ $0 > 1.5 }), let appModel else { return nil }
-        let turns = appModel.engine.turns
-        let active = appModel.activeChatSessionId
-        for session in [active] + turns.activeTurnIDsBySession.keys.sorted().filter({ $0 != active })
-        where turns.isBusy(session) {
-            if let turn = turns.activeTurnIDsBySession[session] { return .init(session: session, turn: turn) }
-        }
-        return nil
+        guard personIdle.allSatisfy({ $0 > 1.5 }) else { return nil }
+        return handsSession().map { PersonOnlyWindows.Driver(session: $0.session, turn: $0.turn) }
     }
 
-    /// Once per turn, like every step-aside: a window he brought back stays back.
+    /// Once per turn preserves a window the user brought back.
     fileprivate func driveBegan(_ driving: PersonOnlyWindows.Driver) {
         driver = driving
         guard driving.turn != steppedAsideTurn,
@@ -468,30 +440,25 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         stepAside()
     }
 
-    /// Her sight or hands need the screen now (a desktop picture, a Mac verb
-    /// on the front app): the main window goes, from any surface's turn, and
-    /// the call returns once it is out of the picture. The composer's switch
-    /// still rules; User bringing the window back is still his.
+    /// Hide the main window before a screen-dependent call returns, subject to the composer switch.
+    /// The user bringing it back always wins.
     func stepAsideForScreen(driver named: PersonOnlyWindows.Driver?) async {
         guard !Task.isCancelled else { return }
-        // The call's own session and turn bind Shotgun first, whatever the
-        // window is doing; a busy session is the fallback.
+        // Bind the call's session first so remote driving cannot attach to the visible chat.
         let driving = named ?? drivingSession().map { PersonOnlyWindows.Driver(session: $0.session, turn: $0.turn) }
         if let driving { driver = driving }
         guard UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true else { return }
         let main = Self.mainWindow().flatMap { $0.isVisible && !$0.isMiniaturized ? $0 : nil }
         guard let main else { return }
-        // His fingers on this window right now: it stays under them; her verb goes on without it.
-        // Keys only, from the hardware: a watching hand on the mouse is not typing here (10-31 demo:
-        // every drive he watched skipped Shotgun), and her own posted keys are not his.
+        // Hardware typing keeps this window under the user's fingers; mouse presence alone must not block driving.
+        // Posted agent keys do not count as human input.
         if main.isKeyWindow, CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown) < 3 { return }
-        // Once per turn: a window he brought back during the turn stays back.
+        // A window the user brought back during this turn must stay visible.
         if let driving {
             guard driving.turn != steppedAsideTurn else { return }
             steppedAsideTurn = driving.turn
         }
-        // This operation owns the fade; settlement releases the waiter even
-        // if the person brings the window back during it.
+        // Settlement must release the fade waiter even if the person brings the window back.
         let done = ScopedWaiter()
         stepAside { done.resume() }
         await done.park()
@@ -510,8 +477,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         { Task { @MainActor in completion() } }
     }
 
-    /// The main window fades and orders out (never minimizes); Shotgun comes
-    /// in from where the composer was. Shotgun stays after the turn ends.
+    /// Order out rather than minimize so Shotgun can replace the window without a Dock animation.
     private func stepAside(completion: @escaping @MainActor @Sendable () -> Void = {}) {
         setCollapsed(false)
         let main = Self.mainWindow().flatMap { $0.isVisible && !$0.isMiniaturized ? $0 : nil }
@@ -530,9 +496,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         })
     }
 
-    /// Dock click, ⌘Tab, the menu bar item: User brought NativeAgent forward.
-    /// The agent putting NativeAgent back at the end of a task is not him, and
-    /// never yanks the window back.
+    /// Only human activation restores the window; agent activation must not yank it forward.
     private func appBecameActive() {
         guard hiddenMain != nil, MacPersonInput.activeSecondsAgo() != nil else { return }
         expand()
@@ -554,7 +518,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
                 ShotgunView { size in ShotgunController.shared.pillSizeChanged(size) }
                     .environment(appModel)
             ))
-            // The window follows the view's measured size, not the reverse.
+            // Size the window from the view so layout cannot feed back from window dimensions.
             hosting.sizingOptions = []
             panel.contentView = hosting
         }
@@ -589,7 +553,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         panel.orderFrontRegardless()
         if makeKey { panel.makeKey() }
         publish()
-        // Reduce Motion: a plain cross-fade in place.
+        // Reduce Motion permits a stationary crossfade, never travel.
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = reduceMotion ? 0.2 : 0.35
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -617,8 +581,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         })
     }
 
-    /// The folded pill measured itself: the window hugs it, keeping the
-    /// bottom-right corner where it is.
+    /// Preserve the bottom-right anchor when fitting the measured pill.
     private func pillSizeChanged(_ size: CGSize) {
         guard collapsed, let panel, size.width > 0, size.height > 0 else { return }
         let old = panel.frame
@@ -641,9 +604,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         )
     }
 
-    /// User's remembered spot and size while that spot is on a screen, else
-    /// the bottom-right corner of the screen she is driving. Always inside
-    /// that screen's visible frame, `margin` in from its edges.
+    /// Keep remembered placement only on an available screen and clamp it inside that screen's visible frame.
     private func placedFrame() -> NSRect {
         let size = savedSize()
         let parts = (UserDefaults.standard.string(forKey: Self.cornerKey) ?? "")
@@ -661,7 +622,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
                                     width: size.width, height: size.height), screen: screen)
     }
 
-    /// The screen of her last pointer action, else the one in front.
+    /// Prefer the last pointer action's screen so the panel follows the actual drive.
     private func drivenScreen() -> NSScreen? {
         if let point = lastAgentPoint {
             let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
@@ -671,8 +632,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         return NSScreen.main ?? NSScreen.screens.first
     }
 
-    /// Inside the visible frame (above the Dock, below the menu bar), `margin`
-    /// in, shrinking to fit a small screen.
+    /// Clamp and shrink inside the visible frame so the Dock and menu bar remain clear.
     private func clampToScreen(_ frame: NSRect, screen: NSScreen?) -> NSRect {
         guard let visible = (screen ?? drivenScreen())?.visibleFrame.insetBy(dx: Self.margin, dy: Self.margin),
               visible.width > 0, visible.height > 0 else { return frame }
@@ -682,7 +642,6 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         return DetachedChatFramePlacement.clamp(fitted, within: visible)
     }
 
-    /// Where the composer sits in the main window: bottom centre.
     private static func composerRect(in frame: NSRect) -> NSRect {
         NSRect(x: frame.midX - defaultSize.width / 2, y: frame.minY + 24, width: defaultSize.width, height: 120)
     }
@@ -693,8 +652,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     // MARK: - Rulings 1 and 2, through Core's registry
 
-    /// Tells Core what of User's is on screen, in CGEvent coordinates, and
-    /// whether its composer holds the keyboard.
+    /// Publish CGEvent-space geometry and keyboard ownership so Core can protect the person's window.
     private func publish() {
         guard let panel, isShown || panel.isVisible else {
             PersonOnlyWindows.update([], keyHeld: false)
@@ -709,9 +667,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         )
     }
 
-    /// Her pointer event is about to land on Shotgun: it falls through to the
-    /// app behind, and the panel takes clicks again a moment after her last
-    /// one (PersonOnlyWindows.pointerPassThroughSeconds). Never left on.
+    /// Temporarily pass agent clicks through to the driven app; never leave the person's panel noninteractive.
     private func passPointerThrough() {
         guard let panel else { return }
         panel.ignoresMouseEvents = true
@@ -730,7 +686,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Core's hook runs on whatever thread posts her event, and must finish
+    /// Core's hook runs on whatever thread posts the agent's event, and must finish
     /// before the event is posted.
     nonisolated private static func onMain(_ body: @MainActor (ShotgunController) -> Void) {
         if Thread.isMainThread {
@@ -752,7 +708,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         publish()
     }
 
-    /// Only User's own drag or resize becomes the remembered spot and size.
+    /// Remember only user drags and resizes, never programmatic placement.
     private func rememberFrame() {
         guard let panel, !placing, !collapsed else { return }
         let frame = panel.frame

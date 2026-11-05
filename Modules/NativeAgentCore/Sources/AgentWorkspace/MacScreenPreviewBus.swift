@@ -3,21 +3,11 @@ import CoreGraphics
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacScreenPreviewBus.swift` | `MacScreenPreviewBus` enum; preview resizes the source-masked observation |
+// Blueprint: | `MacScreenPreviewBus.swift` | `MacScreenPreviewUpdate`, captions and source-masked resizing; the turn carries its screen-preview sink |
 
-/// What the agent is looking at, on its way to the chat's working card.
-///
-/// This is a LIVE VIEW, not evidence: the per-verb receipts remain the record
-/// of what happened. Nothing here is persisted, and nothing here is sent to a
-/// provider — the frame travels from the verb that already captured it to the
-/// one card floating above the composer, inside this process.
-///
-/// Both fields are optional and mean "unchanged": a verb that moves the mouse
-/// publishes a caption with no new frame and the card keeps showing the last
-/// picture, while a capture with no caption keeps the words already there.
+/// Preview is transient presentation, never evidence or provider input; per-verb receipts remain authoritative. Nil fields mean unchanged.
 public struct MacScreenPreviewUpdate: @unchecked Sendable {
-    /// Masked at capture, then downscaled by ``MacScreenPreviewFrame``.
-    /// `nil` keeps whatever frame the card is showing.
+    /// Masked at capture, then downscaled by ``MacScreenPreviewFrame``. `nil` keeps whatever frame the card is showing.
     public let image: CGImage?
     /// One line of plain words. `nil` keeps the caption already shown.
     public let caption: String?
@@ -30,39 +20,15 @@ public struct MacScreenPreviewUpdate: @unchecked Sendable {
     }
 }
 
-/// The one channel from a Mac verb to the chat's live computer pane.
-///
-/// Dead-control-by-construction, exactly like ``ToolNoticeBus``: when no
-/// surface has bound `publish` the preview decodes nothing, resizes
-/// nothing, and hands nothing anywhere. A headless turn, a Telegram turn, and
-/// every test therefore pay zero for this feature.
-public enum MacScreenPreviewBus {
-    /// Bound by the surface that owns a chat turn, for that turn's lifetime.
-    @TaskLocal public static var publish: (@Sendable (MacScreenPreviewUpdate) async -> Void)?
-}
-
-/// Plain words for the verb in flight. Pure, so the copy is readable in one
-/// place and testable without a screen.
-///
-/// House copy: the agent is never a pronoun. These are verb phrases with no
-/// subject at all — the card's own title already names the agent.
+/// Use subject-free verb phrases because the card title already names the agent.
 public enum MacScreenPreviewCaption {
-    /// Longest caption the card will show before truncating mid-word.
+    /// Bound captions before mid-word truncation.
     static let maxTargetChars = 48
 
-    /// What a bare target is called when it cannot be shown. A password field's
-    /// label is frequently the password, so the same standalone-secret test the
-    /// legend uses decides this.
+    /// A password field's label may be the password; use the shared secret check before displaying it.
     static let withheldTarget = "a hidden field"
 
-    /// The caption for the frames captured WHILE a verb is in flight.
-    ///
-    /// In-flight frames precede input, so only ``settled(tool:input:ok:)``
-    /// speaks in the past tense, backed by the verb's verified result and
-    /// post-action frame.
-    ///
-    /// Returns `nil` for `screen`, whose best caption is the app the perception
-    /// path resolved rather than the (often absent) `app` argument.
+    /// In-flight frames precede input; only verified settled results may use past tense. Captures name the app actually resolved.
     public static func intent(tool: String, input: [String: JSONValue]) -> String? {
         switch tool {
         case "screen":
@@ -83,11 +49,7 @@ public enum MacScreenPreviewCaption {
         }
     }
 
-    /// The caption for the frame captured AFTER the verb finished, said in the
-    /// past tense backed by the post-action frame and the verb's verified
-    /// effect result in `ok`.
-    ///
-    /// `nil` where there is nothing new to say: `screen` and `wait` never acted.
+    /// Past-tense captions require the post-action frame and verified result; screen and wait do not act.
     public static func settled(tool: String, input: [String: JSONValue], ok: Bool) -> String? {
         switch tool {
         case "act":
@@ -123,7 +85,7 @@ public enum MacScreenPreviewCaption {
         }
     }
 
-    /// The caption for a capture, named by the app actually resolved.
+    /// Use the resolved app for capture captions instead of a possibly absent argument.
     public static func looking(at appName: String?) -> String {
         let name = safeTarget(appName)
         return name.isEmpty ? "Looking at the screen" : "Looking at \(name)"
@@ -134,8 +96,7 @@ public enum MacScreenPreviewCaption {
         return "About to \(wordForms(verb).plain) \(what)"
     }
 
-    /// One line, bounded, and never the secret itself. `act.text` — the typed
-    /// string — is deliberately never a caption input; only labels are.
+    /// Only labels enter captions; typed text must never be exposed as a caption input.
     static func safeTarget(_ raw: String?) -> String {
         guard let raw else { return "" }
         let collapsed = raw
@@ -143,9 +104,7 @@ public enum MacScreenPreviewCaption {
             .filter { !$0.isEmpty }
             .joined(separator: " ")
         guard !collapsed.isEmpty else { return "" }
-        // The same verdict the legend and prose channels use. A label shaped
-        // like a code or key is withheld here too, rather than being printed
-        // above the composer in 11pt.
+        // Apply the same secret verdict as legend and prose so code-like labels cannot leak above the composer.
         if MacScreenViewTextRedaction.standaloneSecretReason(collapsed) != nil {
             return withheldTarget
         }
@@ -159,10 +118,9 @@ public enum MacScreenPreviewCaption {
     }
 }
 
-/// Sizes the source-masked observation for the card.
+/// Resize only source-masked observations.
 public enum MacScreenPreviewFrame {
-    /// Widest preview kept. Comfortably above the expand sheet's drawn size,
-    /// far below a captured retina desktop.
+    /// Keep previews above the expanded card's drawn size but below retina-desktop resolution.
     public static let maxWidth = 960
 
     public static func previewImage(from image: CGImage) -> CGImage? {

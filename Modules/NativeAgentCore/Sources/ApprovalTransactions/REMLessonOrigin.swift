@@ -1,5 +1,3 @@
-// REMLessonOrigin.swift
-// Approved lessons retain one idempotent, on-device lesson_origin memory with source moments and whatChanged.
 
 import ChatTurnContracts
 import DreamREMCycle
@@ -9,15 +7,14 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 
-// Blueprint: | `REMLessonOrigin.swift` | `REMLessonOrigin`: approved lesson provenance and origin moments, retaining what changed and the exchange that taught it |
+// Blueprint: | `REMLessonOrigin.swift` | `REMLessonOrigin`; Idempotent origins preserve source disclosure. |
 
 public enum REMLessonOrigin {
     public static let kind = "lesson_origin"
     static let momentLimit = 3
     static let quoteCap = 160
 
-    /// (conversation, lived day) pairs the lesson's passages were woven from.
-    /// Refs read `<kind>:<session>/<id>@<YYYY-MM-DD>`.
+    /// Retain source conversation and lived day so origin identity follows when it happened, not review time.
     static func sourceDays(_ row: REMProposalRow) -> Set<String> {
         var out = Set<String>()
         for ref in (row.supportingPassages ?? []).flatMap(\.sourceRefs) {
@@ -33,10 +30,7 @@ public enum REMLessonOrigin {
         Set(text.lowercased().split { !$0.isLetter }.map(String.init).filter { $0.count >= 4 })
     }
 
-    /// The moments behind the lesson: same conversation, same lived day (when
-    /// it happened, not when it was reviewed), ranked by the words they share
-    /// with the passages and what changed. A moment that shares none is not
-    /// evidence of this lesson.
+    /// Shared words rank source moments; a moment sharing none cannot evidence the lesson.
     public static func originMoments(
         for row: REMProposalRow,
         moments: [MemoryRecord],
@@ -60,22 +54,17 @@ public enum REMLessonOrigin {
             .prefix(momentLimit).map(\.0)
     }
 
-    /// User and Agent's own exchange, or a peer User made his own in Trust
-    /// (`PeerTrust`). Any other peer's moment is not the origin of her lesson.
+    /// Only the person's exchange or a peer they trusted may supply a lesson origin.
     static func ownExchange(_ record: MemoryRecord, session: String, peerSessionTrusted: (String) -> Bool, dataRoot: URL) -> Bool {
         let author = record.extras?.objectValue?["author"]?.stringValue ?? "user"
         let peer = author != "user" || SessionConversation.kind(session, dataRoot: dataRoot, includingArchived: true)?.isPeerConversation == true
         return !peer || peerSessionTrusted(session)
     }
 
-    /// One origin per lesson: the memory id is the proposal's, so a second
-    /// approval run or a launch reconcile finds the row instead of adding one.
+    /// One origin per lesson: the memory id is the proposal's, so a second approval run or a launch reconcile finds the row instead of adding one.
     public static func memoryID(for proposalID: String) -> String { "lesson-origin:" + proposalID }
 
-    /// What recall surfaces in place of the slogan (GROWTH already carries
-    /// that): the moment, in his words, and what changed; with no qualifying
-    /// moment, what changed alone. A lived day is included only when the
-    /// source moment or proposal records one. nil without a "what changed".
+    /// Recall carries the source moment and what changed; include a lived day only with recorded evidence.
     public static func originText(for row: REMProposalRow, moment: MemoryRecord?) -> String? {
         guard let changed = row.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines),
               !changed.isEmpty else { return nil }
@@ -89,10 +78,7 @@ public enum REMLessonOrigin {
         return "\"\(String(said.prefix(quoteCap)))\" — what changed: \(changed)\(livedClause)"
     }
 
-    /// Keep the origin of an approved lesson, once: a replay returns the row
-    /// already kept for this proposal, whatever moment ranks first now. The
-    /// moment's author and disclosure ride along, so the origin is never
-    /// shown anywhere the moment could not be.
+    /// Keep one origin per proposal and preserve source author/disclosure so recall cannot widen its audience.
     @discardableResult
     public static func record(
         _ row: REMProposalRow,
@@ -105,8 +91,7 @@ public enum REMLessonOrigin {
         let moments = try await memory.listMemory(kind: MemoryMoments.kind)
         var peerOwners: [(id: String, prefix: String)]?
         let behind = originMoments(for: row, moments: moments, peerSessionTrusted: { session in
-            // Read contacts once when a peer candidate needs them; trust is
-            // still checked for each candidate against the live authority.
+            // Read contacts once when a peer candidate needs them; trust is still checked for each candidate against the live authority.
             if peerOwners == nil {
                 var owners = ["claude", "codex", "omp"]
                 if let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),
@@ -135,8 +120,10 @@ public enum REMLessonOrigin {
             if !scoped.isEmpty { metadata["tags"] = .array(scoped.map { .string($0) }) }
         }
         do {
+            // Approval reconciliation records durable lesson evidence, outside a live turn or sense read.
             return try await memory.store(
-                content: text, source: "rem-lesson-origin:\(row.id)", metadata: .object(metadata), id: id)
+                content: text, source: "rem-lesson-origin:\(row.id)", metadata: .object(metadata), id: id,
+                context: MemoryWriteContext(turn: nil, senseReads: nil))
         } catch {
             // Two runs raced past the read above: the loser finds the winner's row.
             if let kept = try await memory.authorityRecord(id: id) { return kept }

@@ -5,9 +5,9 @@ import AppKit
 import PersistenceCore
 import PersonaEngine
 
-// Blueprint: | `SkillLifecycleView.swift` | `SkillLifecycleView`: persona-guidance list/search/source reads and explicit build-draft handoff through existing chat owners |
+// Blueprint: | `SkillLifecycleView.swift` | `SkillLifecycleView`: persona-guidance reads and build-draft handoff through chat owners |
 
-// This page reads persona guidance; authored abilities live in Tools.
+// Keep persona guidance distinct from executable abilities owned by Tools.
 enum SkillLifecycleSearchPresentation {
     struct Results {
         let displayed: [SkillRecord]
@@ -55,9 +55,7 @@ enum SkillLifecycleSearchPresentation {
     }
 }
 
-/// Header actions have separate production owners: Build writes a chat draft,
-/// while Refresh reads the skill authorities. Keep the action result typed so
-/// neither a missing chat session nor an existing draft is called a build.
+/// Typed outcomes keep a missing session or preserved draft from being called a successful build.
 enum SkillLifecycleActionPresentation {
     enum Build: Equatable {
         case draftPrepared
@@ -75,10 +73,7 @@ enum SkillLifecycleActionPresentation {
     }
 }
 
-/// Both visible Skills entry points start the same real chat-draft handoff.
-/// Keeping the starter and owner here prevents the empty-state button from
-/// drifting from the header button and makes an existing draft's preservation
-/// part of the button contract rather than an incidental UI detail.
+/// Share Build handoff between entry points so empty-state and header actions both preserve existing drafts.
 enum SkillBuildButtonPresentation {
     static let starter = "Build me a skill that "
 
@@ -312,9 +307,7 @@ private struct BoundedSkillText: View {
 extension Notification.Name {
     static let skillBuildRequest = Notification.Name("NativeAgent.skillBuildRequest")
 }
-/// The latest user-visible outcome of a skill lifecycle operation. Identity is
-/// part of the contract: a repeated failure is a new event even when its text
-/// is byte-for-byte identical to the prior one.
+/// Receipt identity must change even for identical failures so each operation remains observable.
 struct SkillLifecycleFeedback: Identifiable, Equatable, Sendable {
     let id: UUID
     let message: String

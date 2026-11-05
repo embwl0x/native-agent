@@ -2,12 +2,10 @@ import PersistenceCore
 import NativeAgentShared
 import Foundation
 import NativeAgentCore
-// Blueprint: | `NativeAppSecretRedactor.swift` | NativeAppSecretRedactor: redactText and string-only redactValue; redactArguments withholds secret-named fields; redactedRemoteErrorDetail owns phone error path projection |
+// Blueprint: | `NativeAppSecretRedactor.swift` | App privacy extends canonical credential redaction. |
 
 public enum NativeAppSecretRedactor {
-    /// App-only privacy extensions layered after the canonical credential
-    /// redactor. Telegram credentials and local home paths intentionally remain
-    /// stricter than the cross-module activity-feed contract.
+    /// App-only boundaries redact Telegram credentials and home paths more strictly than the shared activity-feed contract.
     private static let appOnlyPatterns: [(String, NSRegularExpression)] = {
         let specs: [(String, String, NSRegularExpression.Options)] = [
             ("TELEGRAM_TOKEN", "\\b(?:bot)?[0-9]{6,12}:[A-Za-z0-9_-]{30,}\\b", [.caseInsensitive]),
@@ -32,9 +30,7 @@ public enum NativeAppSecretRedactor {
         NativeAgentSecretRedactor.isSecretName(name, use: .approval)
     }
 
-    /// An approval card's arguments as shown to a person: a secret-named
-    /// argument's value is withheld at any depth, and every string is
-    /// scrubbed for token and key patterns.
+    /// Withhold secret-named values at every depth and scrub credentials from remaining strings.
     public static func redactArguments(_ value: JSONValue) -> JSONValue {
         switch value {
         case .object(let fields):
@@ -52,8 +48,7 @@ public enum NativeAppSecretRedactor {
         value.mapStrings(redactText)
     }
 
-    /// Remote error details reduce absolute paths of two or more segments to
-    /// their leaf. Relative paths and URL schemes are excluded; `path:/…` is not.
+    /// Remote errors keep only absolute-path leaves; relative paths and URL schemes remain readable.
     public static func redactedRemoteErrorDetail(_ value: String) -> String {
         guard let regex = try? NSRegularExpression(
             pattern: "(?<![A-Za-z0-9_.~%/-])(?:/[^\\s\"'<>)\\]},;/]+){2,}", options: []

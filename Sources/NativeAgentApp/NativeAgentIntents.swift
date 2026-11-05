@@ -7,7 +7,6 @@ import NativeAgentShared
 import Transcripts
 // Blueprint: | `NativeAgentIntents.swift` | Named resident-agent Shortcuts; NativeAgentDoctorIntent admits and settles runs through the live DoctorFacade |
 
-/// One resident agent, named by this installation's canonical persona.
 struct ResidentAgentEntity: AppEntity {
     static let typeDisplayRepresentation: TypeDisplayRepresentation = "Agent"
     static let defaultQuery = ResidentAgentQuery()
@@ -53,8 +52,7 @@ struct ResidentAgentQuery: EntityStringQuery {
     }
 }
 
-/// One finite entity vocabulary; free-form messages are elicited by Siri,
-/// never interpolated as a second phrase parameter.
+/// Elicit free-form messages through Siri so phrase parameters remain a finite entity vocabulary.
 struct AskResidentAgentIntent: AppIntent {
     @available(macOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
@@ -143,6 +141,7 @@ struct NativeAgentDoctorIntent: AppIntent {
     }
 }
 
+/// Its type name is the Shortcuts identity people built Shortcuts on, so it keeps it.
 struct NativeAgentWorkshopTaskIntent: AppIntent {
     @available(macOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
@@ -163,8 +162,8 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
         try await ApplicationLifetime.shared.prepare()
-        let task = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective).execution
-        return .result(dialog: "Desk task created: \(task.title).")
+        let start = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
+        return .result(dialog: "Desk task started: \(start.deskItem.title).")
     }
 }
 

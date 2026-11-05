@@ -11,14 +11,13 @@ import IOKit.hidsystem
 import CryptoKit
 import AppKit
 import IOKit.hidsystem
-// Blueprint: | `MacControl+SystemActions.swift` | Raw file reads return complete-character byte windows with named lossless encoding and truncation; file mutations retain checked readback; Spotlight executes the supplied metadata query once; fixed system-volume recipe; media keys re-read the live Now Playing process and check its Write switch, preserving typed discovery failures before any emission; app scripts require bundle_id and use callApp's per-event switch checks under foreground driver authority |
+// Blueprint: | `MacControl+SystemActions.swift` | Lossless file windows, checked mutations, scoped Spotlight, exact media and per-event app scripts |
 #endif
 
 extension SwiftNativeMacControl {
     // MARK: file/read
 
-    // Synchronous filesystem calls may wait for permission or a volume. They
-    // must not hold the actor that owns the operation deadline and settlement.
+    // Synchronous filesystem calls may wait for permission or a volume. They must not hold the actor that owns the operation deadline and settlement.
     nonisolated func handleFileRead(_ body: [String: JSONValue]) async throws -> MacControlResult {
         guard let path = body["path"]?.stringValue, !path.isEmpty else {
             throw MacControlError.missingField("path")
@@ -28,9 +27,7 @@ extension SwiftNativeMacControl {
         }
         let maxBytes = max(1, min(body["max_bytes"]?.integerValue.flatMap(Int.init(exactly:)) ?? 1_000_000, 1_000_000))
         let started = now()
-        // TOCTOU shrink: re-resolve right before the syscall + re-fence.
-        // Foundation has no O_NOFOLLOW open, so this still leaves a window
-        // between resolve and FileManager open — see fence doc comment.
+        // Resolve and fence immediately before opening to narrow TOCTOU exposure; FileManager still lacks an O_NOFOLLOW open.
         let url = NativeAgentWorkspaceRoot.canonicalFileURL(NativeAgentWorkspaceRoot.fileCandidate(
             path, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)))
         if let reason = MacControlSensitivePathFence.reason(forPath: url.path) {
@@ -47,7 +44,10 @@ extension SwiftNativeMacControl {
             return MacControlResult(ok: false, action: "file/read", output: .object([
                 "path": .string(path),
                 "bytes": .int(Int64(rawData.count)),
-                "message": .string("The encoding of the bytes read from \(path) could not be determined and decoded losslessly. No text was returned; inspect the file's encoding or damaged bytes."),
+                "message": .string("""
+                    The encoding of the bytes read from \(path) could not be determined and decoded losslessly. No text was returned; inspect the file's \
+                    encoding or damaged bytes.
+                    """),
             ]), error: failure.rawValue, durationMs: Int(now().timeIntervalSince(started) * 1000))
         }
         let sha256Hex: String
@@ -327,7 +327,7 @@ extension SwiftNativeMacControl {
             error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
     }
 
-    func handleMedia(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    func handleMedia(_ body: [String: JSONValue], context: MacOperationContext) async throws -> MacControlResult {
         guard let action = body["action"]?.stringValue?.lowercased(),
               ["play", "resume", "pause", "toggle", "next", "skip", "previous"].contains(action) else {
             throw MacControlError.missingField("action: play, resume, pause, toggle, next, skip or previous")
@@ -347,8 +347,7 @@ extension SwiftNativeMacControl {
                 windowNumber: 0, context: nil, subtype: 8, data1: (Int(key) << 16) | (state << 8), data2: -1)?.cgEvent
         }
         guard events.count == 2 else { throw MacControlError.malformedResponse("system media key could not be created") }
-        // Re-read after admission; no cached player, foreground-app guess or
-        // playback-state guess decides which integration owns this command.
+        // Re-read after admission; no cached player, foreground-app guess or playback-state guess decides which integration owns this command.
         let pid: Int32
         do {
             guard let current = try await MacMediaTarget.currentPID() else {
@@ -362,12 +361,15 @@ extension SwiftNativeMacControl {
         guard let player = NSRunningApplication(processIdentifier: pid), !player.isTerminated,
               let bundle = player.bundleIdentifier else { return MacAppActGate.unavailable().result(action: "media") }
         try Task.checkCancellation()
-        if let refusal = MacAppActGate.refusal(pid: pid) { return refusal.result(action: "media") }
-        for event in events { CGEventSink().postNative(event) }
+        if let refusal = MacAppActGate.refusal(pid: pid, context: context) { return refusal.result(action: "media") }
+        for event in events { CGEventSink().postNative(event, context: context) }
         return MacControlResult(ok: true, action: "media",
             output: .object(["action": .string(action), "key_sent": .string(key == NX_KEYTYPE_PLAY ? "play_pause" : action == "previous" ? "previous" : "next"),
                 "target_pid": .int(Int64(pid)), "bundle_id": .string(bundle), "playback_state_confirmed": .bool(false),
-                "message": .string("System media key sent for the observed Now Playing app. Play/pause is a toggle; the key receipt does not confirm playback or a track change.")]),
+                "message": .string("""
+                    System media key sent for the observed Now Playing app. Play/pause is a toggle; the key receipt does not confirm playback or a track \
+                    change.
+                    """)]),
             error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
         #else
         throw MacControlError.malformedResponse("system media keys require macOS")
@@ -376,7 +378,7 @@ extension SwiftNativeMacControl {
 
     // MARK: applescript
 
-    func handleAppleScript(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    func handleAppleScript(_ body: [String: JSONValue], context: MacOperationContext) async throws -> MacControlResult {
         guard let script = body["script"]?.stringValue, !script.isEmpty else {
             throw MacControlError.missingField("script")
         }
@@ -388,15 +390,14 @@ extension SwiftNativeMacControl {
         let started = now()
         let result: JSONValue
         do {
-            // A declared app script uses the same per-event target/switch
-            // checks as authored app calls. Takeover cancels its bounded OSA run.
+            // A declared app script uses the same per-event target/switch checks as authored app calls. Takeover cancels its bounded OSA run.
             enum Lifetime: Sendable { case finished(JSONValue), takenOver, unwatched }
-            let adapter = appleScriptAdapter, store = attentionStore, binding = MacDriverContext.binding
+            let adapter = appleScriptAdapter, store = attentionStore, binding = context.driver
             let finished: JSONValue? = try await ScriptedInputSources.during { try await withThrowingTaskGroup(of: Lifetime.self) { group in
-                group.addTask { .finished(try await adapter.callApp(args, targets: [bundle: "write"])) }
+                group.addTask { .finished(try await adapter.callApp(args, targets: [bundle: "write"], context: context)) }
                 if let binding {
                     group.addTask {
-                        for await _ in await store.driverChanges() where !binding.allowsEmission { return .takenOver }
+                        for await _ in await store.driverChanges() where !binding.allowsEmission(context: context) { return .takenOver }
                         return .unwatched
                     }
                 }
@@ -414,8 +415,11 @@ extension SwiftNativeMacControl {
                     ok: false, action: "applescript",
                     output: .object(["script": .string(String(script.prefix(200))), "status": .string("yielded_to_user"),
                                      "effects": .string("unknown"),
-                                     "guidance": .string("The person took the Mac back while the script ran, so it was stopped; what it already did is unknown. Look before running it again.")]),
-                    error: MacAttentionSessionStore.driverRefusal,
+                                     "guidance": .string("""
+                                         The person took the Mac back while the script ran, so it was stopped; what it already did is unknown. Look before \
+                                         running it again.
+                                         """)]),
+                    error: MacAttentionSessionStore.driverRefusal(context: context),
                     durationMs: Int(now().timeIntervalSince(started) * 1000), httpStatus: 409, verification: .unverified)
             }
             result = finished
@@ -457,22 +461,22 @@ extension SwiftNativeMacControl {
         return trimmed
     }
 
-    func handleFocusApp(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    func handleFocusApp(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async throws -> MacControlResult {
         if let rawPid = body["pid"]?.integerValue.flatMap(Int.init(exactly:)) {
-            return await handleFocusExact(pid: Int32(clamping: rawPid), body: body)
+            return await handleFocusExact(pid: Int32(clamping: rawPid), body: body, turn: turn, context: context)
         }
-        if let continuation = MacWorkContinuation.current, continuation.isPending, body["background"] != .bool(true) {
-            if let refusal = continuation.refusal() {
+        if let continuation = turn.macContinuation, continuation.isPending, body["background"] != .bool(true) {
+            if let refusal = continuation.refusal(context: context) {
                 return MacControlResult(ok: false, action: "focus_app",
                     output: .object(continuation.refusalOutput(refusal)), error: "continuation_unavailable",
                     durationMs: 0)
             }
             guard let app = continuation.app else {
                 return MacControlResult(ok: false, action: "focus_app",
-                    output: .object(["message": .string(continuation.modelContext)]), error: "continuation_unavailable",
+                    output: .object(["message": .string(continuation.modelContext(context: context))]), error: "continuation_unavailable",
                     durationMs: 0)
             }
-            return await handleFocusExact(pid: app.processIdentifier, body: body)
+            return await handleFocusExact(pid: app.processIdentifier, body: body, turn: turn, context: context)
         }
         let app = try requestedAppName(body)
         let started = now()
@@ -480,16 +484,16 @@ extension SwiftNativeMacControl {
         let failure: String?
         do {
             try Task.checkCancellation()
-            // `go` without front reopens or launches behind.
+            // A background go must reopen or launch without raising the app.
             if body["background"] == .bool(true) {
-                let result = try await appControlAdapter.launchApp(named: app)
+                let result = try await appControlAdapter.launchApp(named: app, context: context)
                 return MacControlResult(
                     ok: true, action: "focus_app",
                     output: .object(appControlOutput(result, status: result.launched ? "launched" : "running", verified: false)),
                     error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000)
                 )
             }
-            let result = try await appControlAdapter.focusApp(named: app)
+            let result = try await appControlAdapter.focusApp(named: app, context: context)
             try Task.checkCancellation()
             failure = nil
             output = appControlOutput(result, status: "focused", verified: true)
@@ -508,15 +512,12 @@ extension SwiftNativeMacControl {
             error: failure, durationMs: Int(now().timeIntervalSince(started) * 1000))
     }
 
-    /// Focus an exact process, and optionally one exact
-    /// window of it: `frame_id` (the window a look was of — must still be
-    /// there), a typed foreground lease, or an explicit descriptive `window`.
-    /// An unmatched explicit window refuses; it never selects the first window.
-    /// A gone pid answers `app_gone`. Success confirms the selected window as well as its pid.
-    func handleFocusExact(pid: Int32, body: [String: JSONValue]) async -> MacControlResult {
+    /// An explicit frame, lease or window selector must match the exact process/window; a missing match never selects the first window. Success confirms both
+    /// identities.
+    func handleFocusExact(pid: Int32, body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
         func finish(_ status: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
-            let front = accessibilitySource.frontmostApp()?.processIdentifier == pid
+            let front = accessibilitySource(context: context).frontmostApp()?.processIdentifier == pid
             let ok = status == "focused" && front
             let reported = ok || status != "focused" ? status : "focus_failed"
             var output: [String: JSONValue] = [
@@ -538,17 +539,18 @@ extension SwiftNativeMacControl {
         }
         if pid == getpid() {
             // Activate our own app without an AX read of ourselves.
-            let binding = MacDriverContext.binding
+            let binding = context.driver
             await MainActor.run {
-                if binding?.allowsEmission == true { NSApplication.shared.activate() }
+                if binding?.allowsEmission(context: context) == true { NSApplication.shared.activate() }
             }
-            if accessibilitySource.frontmostApp()?.processIdentifier != pid, binding?.allowsEmission == true { _ = app.activate() }
+            if accessibilitySource(context: context).frontmostApp()?.processIdentifier != pid, binding?.allowsEmission(
+                context: context) == true { _ = app.activate() }
             try? await MacApplications.observeActivation(of: pid, within: 1)
             return finish("focused")
         }
         let exact = body["frame_id"]?.stringValue
-        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
-        let restoration = MacForegroundSnapshot.restoring
+        let continuation = turn.macContinuation.flatMap { $0.isPending ? $0 : nil }
+        let restoration = context.restoring
         var identity = restoration?.window ?? continuation?.window
         if let restoration, restoration.app.processIdentifier != pid { return finish("front_window_changed") }
         if restoration != nil {
@@ -556,7 +558,7 @@ extension SwiftNativeMacControl {
         } else if continuation != nil {
             guard identity?.pid == pid else { return finish("continuation_target_mismatch") }
         } else if let exact {
-            identity = await lookFrameStore.frame(frameId: exact)?.windowIdentity
+            identity = await lookFrameStore.frame(frameId: exact, context: context)?.windowIdentity
             guard let recorded = identity, recorded.pid == pid else { return finish("front_window_changed") }
         } else if case .object(let recorded)? = body["window"] {
             // Explicit external descriptions retain every supplied identity signal.
@@ -564,11 +566,12 @@ extension SwiftNativeMacControl {
             if case .string(let role)? = recorded["role"] {
                 var subrole: String?
                 if case .string(let value)? = recorded["subrole"] { subrole = value }
-                identity = MacAXWindowIdentity(pid: pid, index: recorded["index"]?.integerValue.flatMap(Int.init(exactly:)), role: role, subrole: subrole, title: recorded["title"]?.stringValue, frame: frame)
+                identity = MacAXWindowIdentity(pid: pid, index: recorded["index"]?.integerValue.flatMap(Int.init(exactly:)), role: role, subrole: subrole,
+                    title: recorded["title"]?.stringValue, frame: frame)
             }
         }
         let windows: [MacAXWindowRef]
-        do { windows = try accessibilityActSource.windows(pid: pid) }
+        do { windows = try accessibilityActSource(context: context).windows(pid: pid, context: context) }
         catch {
             return finish("window_read_unavailable", ["message": .string(error.localizedDescription),
                 "remedy": .string("Read this app again after repairing its Accessibility read; no window was selected or raised.")])
@@ -585,24 +588,23 @@ extension SwiftNativeMacControl {
             chosen = windows.first
         }
         guard let chosen else {
-            // Putting back an app that had no window (no window asked for):
-            // activate that exact pid; `finish` verifies it is frontmost.
+            // Putting back an app that had no window (no window asked for): activate that exact pid; `finish` verifies it is frontmost.
             guard identity == nil, exact == nil else { return finish("app_has_no_window") }
-            guard MacDriverContext.binding?.allowsEmission == true else { return finish("yielded_to_user") }
+            guard context.driver?.allowsEmission(context: context) == true else { return finish("yielded_to_user") }
             _ = app.activate()
             try? await MacApplications.observeActivation(of: pid, within: 1)
             return finish("focused", ["window_matched": .bool(false)])
         }
-        if let continuation, let refusal = continuation.refusal() {
+        if let continuation, let refusal = continuation.refusal(context: context) {
             return finish("continuation_unavailable", continuation.refusalOutput(refusal))
         }
-        let outcome = accessibilityActSource.raise(chosen)
+        let outcome = accessibilityActSource(context: context).raise(chosen, context: context)
         guard outcome == .performed else {
             var extra: [String: JSONValue] = ["raise": .string(outcome.rawValue)]
-            if let why = accessibilityActSource.raiseDiagnostic { extra["diagnostic"] = .string(why) }
+            if let why = accessibilityActSource(context: context).raiseDiagnostic { extra["diagnostic"] = .string(why) }
             return finish("focus_failed", extra)
         }
-        guard let focused = accessibilityActSource.focusedWindow(pid: pid),
+        guard let focused = accessibilityActSource(context: context).focusedWindow(pid: pid, context: context),
               case .matched = MacAXWindowIdentity.match(chosen.identity, among: [(focused, focused.identity)]) else {
             return finish("front_window_changed")
         }
@@ -616,10 +618,9 @@ extension SwiftNativeMacControl {
         #endif
     }
 
-    /// Launch Services acceptance is transport evidence, not settlement. The
-    /// result stays explicitly unverified; the four-verb surface follows this
-    /// operation with a fresh screen and speaks only what that read shows.
-    func handleOpenTarget(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    /// Launch Services acceptance is transport evidence, not settlement. The result stays explicitly unverified; the four-verb surface follows this operation
+    /// with a fresh screen and speaks only what that read shows.
+    func handleOpenTarget(_ body: [String: JSONValue], context: MacOperationContext) async throws -> MacControlResult {
         guard let raw = body["url"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let url = URL(string: raw),
@@ -630,7 +631,7 @@ extension SwiftNativeMacControl {
         }
         let started = now()
         do {
-            var output = try await openTargetAdapter.requestOpen(url, background: body["background"] == .bool(true))
+            var output = try await openTargetAdapter.requestOpen(url, background: body["background"] == .bool(true), context: context)
             output["status"] = .string("requested")
             output["verified"] = .bool(false)
             return MacControlResult(ok: true, action: "open_target", output: .object(output),
@@ -643,22 +644,23 @@ extension SwiftNativeMacControl {
         }
     }
 
-    func handleQuitApp(_ body: [String: JSONValue]) async throws -> MacControlResult {
+    func handleQuitApp(_ body: [String: JSONValue], context: MacOperationContext) async throws -> MacControlResult {
         let app = try requestedAppName(body)
         let started = now()
         do {
-            let result = try await appControlAdapter.quitApp(named: app)
+            let result = try await appControlAdapter.quitApp(named: app, context: context)
             let ok = result.terminated || result.alreadyInDesiredState
             var output = appControlOutput(result, status: ok ? "quit_requested" : "quit_failed", verified: false)
             do {
-                let observedRunning = try await appControlAdapter.isApplicationRunning(matching: result.bundleIdentifier ?? app)
+                let observedRunning = try await appControlAdapter.isApplicationRunning(matching: result.bundleIdentifier ?? app, context: context)
                 output["verified"] = .bool(ok && !observedRunning)
             } catch {
-                // The quit has already been requested. A failed observation
-                // neither proves termination nor authorizes repeating it.
+                // The quit has already been requested. A failed observation neither proves termination nor authorizes repeating it.
                 output["verification"] = .string("unavailable")
                 output["verification_error"] = .string(error.localizedDescription)
-                output["remedy"] = .string("Inspect the app's current running state before requesting quit again; repair the reported app-index failure if inspection is unavailable.")
+                output["remedy"] = .string("""
+                    Inspect the app's current running state before requesting quit again; repair the reported app-index failure if inspection is unavailable.
+                    """)
             }
             return MacControlResult(
                 ok: ok,
@@ -710,15 +712,12 @@ extension SwiftNativeMacControl {
         }
         let limit = max(1, min(body["limit"]?.integerValue.flatMap(Int.init(exactly:)) ?? 10, 200))
         let started = now()
-        // Her files and the Mac's apps, never the whole disk: unscoped, one
-        // query took 10 s and timed out, then 15 s (fresh install, 10-19).
+        // Scope Spotlight to user files and app folders because a whole-disk query can exhaust the read budget.
         let roots = [NSHomeDirectory(), "/Applications", "/System/Applications"]
         let scopes = roots.flatMap { ["-onlyin", $0] }
-        // The caller chooses the search before execution: query is Spotlight
-        // words/predicate; the files.spotlight name argument arrives as an
-        // explicit kMDItemFSName predicate. An empty result stays empty.
-        // What arrived within the budget is the answer, marked partial, with
-        // the lever that narrows it; a slow index never turns into an error.
+        // The caller chooses the search before execution: query is Spotlight words/predicate; the files.spotlight name argument arrives as an explicit
+        // kMDItemFSName predicate. An empty result stays empty. What arrived within the budget is the answer, marked partial, with the lever that narrows it; a
+        // slow index never turns into an error.
         let budget: TimeInterval = 4
         let result = try await processAdapter.run(executable: "/usr/bin/mdfind", arguments: scopes + [query], currentDirectory: nil,
                                                  environment: nil, standardInput: nil,
@@ -731,8 +730,7 @@ extension SwiftNativeMacControl {
             .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
             .map(String.init)
             .filter { !$0.isEmpty }
-            // Consult the fence like the file handlers do — raw mdfind hits
-            // would otherwise leak paths file read/list refuse to touch.
+            // Consult the fence like the file handlers do — raw mdfind hits would otherwise leak paths file read/list refuse to touch.
             .filter { MacControlSensitivePathFence.reason(forPath: $0) == nil }
             .prefix(limit)
         let durationMs = Int(now().timeIntervalSince(started) * 1000)

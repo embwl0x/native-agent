@@ -5,11 +5,11 @@ import TurnTrace
 import ProviderRouting
 import ToolRegistry
 import Synchronization
-// Blueprint: | `ToolLoopSupport.swift` | `ToolLoopTraceObservation` retains prose and dispatch evidence across every loop throw and owns failed-attempt classification; failed-slot counting stays separate; `ToolDispatchDeadline` |
+import ChatToolParsing
+// Blueprint: | `ToolLoopSupport.swift` | `ToolLoopTraceObservation`; `ToolDispatchDeadline`; Retained loop evidence and response deadlines |
 
 /// Retains loop evidence across a throw without changing the public error carriers.
 final class ToolLoopTraceObservation: Sendable {
-    @TaskLocal static var current: ToolLoopTraceObservation?
     private let state = Mutex<(payload: [String: JSONValue], dispatches: [TurnEngineResult.ToolDispatchRecord], prose: String)>(([:], [], ""))
 
     func record(_ counters: TurnEngineResult.LoopCounters, dispatches: [TurnEngineResult.ToolDispatchRecord], reply: String) {
@@ -27,8 +27,9 @@ final class ToolLoopTraceObservation: Sendable {
 
     static func toolCounts(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> [String: JSONValue] {
         let attempts = dispatches.filter {
-            !ChatToolOutcome.neverRan($0.result)
-                && !ChatToolOutcome.isWaitingOnPerson($0.result)
+            let reply = ToolResult($0.result)
+            return !ChatToolOutcome.neverRan(reply.payload)
+                && !ChatToolOutcome.isWaitingOnPerson(reply.payload, verdict: reply.outcome)
         }
         return [
             "toolAttemptCount": .int(Int64(attempts.count)),
@@ -40,8 +41,9 @@ final class ToolLoopTraceObservation: Sendable {
     }
 
     static func isFailedAttempt(_ output: JSONValue) -> Bool {
-        !ChatToolOutcome.neverRan(output) && [.failed, .refused, .timeout].contains(ChatToolOutcome.exactResultClass(output))
-            && !ChatToolOutcome.isWaitingOnPerson(output)
+        let reply = ToolResult(output)
+        return !ChatToolOutcome.neverRan(reply.payload) && [.failed, .refused, .timeout].contains(reply.outcome)
+            && !ChatToolOutcome.isWaitingOnPerson(reply.payload, verdict: reply.outcome)
     }
 }
 
@@ -51,7 +53,6 @@ extension TurnEngineResult.LoopCounters {
             "providerAttemptCount": .int(Int64(providerAttemptCount)),
             "failedProviderAttemptCount": .int(Int64(failedProviderAttemptCount)),
             "providerRoundCount": .int(Int64(providerRoundCount)),
-            "contextOverflowRecoveryCount": .int(Int64(contextOverflowRecoveryCount)),
             "toolRoundCount": .int(Int64(toolRoundCount)),
             "roundsAfterToolFailureCount": .int(Int64(roundsAfterToolFailureCount)),
             "protocolViolationRoundCount": .int(Int64(protocolViolationRoundCount)),
@@ -61,44 +62,33 @@ extension TurnEngineResult.LoopCounters {
 }
 
 // MARK: - Per-tool-dispatch deadline
-//
-// runSingleDispatch bounds the response wait; the original tool retains its actual receipt and checkpoint settlement.
-// Interactive and unattended calls have backstops; explicit timeout_seconds retains its window plus cleanup margin.
-// Expiry never cancels the write. Stop requests cancellation; neither signal proves the effect stopped.
+// Bound only the response wait; the tool retains receipt and checkpoint settlement. Expiry never cancels a write.
+// Stop requests cancellation, but neither Stop nor timeout proves the effect stopped.
 public enum ToolDispatchDeadline {
-    /// Env override for the universal backstop, in seconds. <=0 / non-finite
-    /// disables it on every surface.
+    /// Nonpositive or nonfinite override values explicitly disable the universal response backstop.
     static let envVar = "NATIVE_AGENT_TOOL_DISPATCH_TIMEOUT_SECONDS"
 
-    /// Default backstop for an unattended surface. Above the longest
-    /// self-bounding tool (timeout_seconds <=3600s) so it never clips legit
-    /// work; only an unbounded wedge ever reaches it.
+    /// Set unattended backstop beyond the longest 1-hour self-bounded tool so valid work retains its requested window.
     static let defaultUnattendedSeconds: TimeInterval = 3900
-    /// Interactive calls should never hang forever either. Fifteen minutes is
-    /// above normal connector/MCP work; tools that expose timeout_seconds keep
-    /// their requested duration plus a cleanup margin, up to their 1h cap.
+    /// Interactive calls get a 15-minute backstop; explicit tool timeouts retain their requested window plus cleanup margin up to 1 hour.
     static let defaultInteractiveSeconds: TimeInterval = 900
     static let cleanupMarginSeconds: TimeInterval = 30
 
-    /// Surfaces with no human watching the turn — a hung tool there freezes
-    /// work nobody can recover without an app restart. Mirrors the
-    /// machine-driven surfaces, including training.
+    /// Unattended surfaces need a backstop because nobody is watching to recover a wedged wait.
     static func isUnattended(surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "autonomy", "background",
-             "swarm", "swarms", "worker", "workers", "training":
+             "worker", "workers", "training":
             return true
-        case let s where WorkshopSurfaceVocabulary.isWorkshopGateSurface(s):
+        case let s where WorkshopSurfaceVocabulary.isWorkshopSurface(s):
             return true
         default:
             return false
         }
     }
 
-    /// Per-dispatch deadline. Explicit tool timeouts are honored with a 30s
-    /// teardown margin, so this backstop cannot shorten requested long work.
-    /// Mac observation has a shorter ceiling; actions keep the general backstop so
-    /// a valid multi-step batch is never cut off after earlier steps acted.
+    /// Add 30 seconds for teardown without shortening explicit work. Only observation takes the shorter Mac ceiling;
+    /// actions keep the general backstop so earlier steps cannot be cut off by a later observation timeout.
     static func timeoutNanos(
         toolName: String,
         input: [String: JSONValue],
@@ -114,7 +104,7 @@ public enum ToolDispatchDeadline {
             let seconds: Int64
             if case .int(let value)? = input["wait_seconds"] { seconds = value } else { seconds = 60 }
             raw = TimeInterval(max(1, min(120, seconds))) + cleanupMarginSeconds
-        } else if toolName == "invoke_codex" || toolName == "image_generate" {
+        } else if toolName == "image_generate" {
             raw = 600 + cleanupMarginSeconds
         } else if ["screen", "menu", "mac_look", "mac_view"].contains(toolName) {
             raw = 180
@@ -134,70 +124,25 @@ public enum ToolDispatchDeadline {
     /// A wait expiry is not the tool's terminal outcome.
     static func timeoutError(tool: String, seconds: TimeInterval) -> ToolFailureError {
         let label = seconds >= 1 ? "\(Int(seconds))s" : "\(Int(seconds * 1000))ms"
-        return ToolFailureError("The wait for tool '\(tool)' exceeded \(label). Its original work continues to its own limit; effects are unknown until its receipt arrives.",
+        return ToolFailureError("""
+            The wait for tool '\(tool)' exceeded \(label). Its original work continues to its own limit; effects are \
+            unknown until its receipt arrives.
+            """,
             effects: .unknown, owner: tool, code: "tool_dispatch_wait_expired", status: .timeout,
-            instruction: "Read this turn's tool.dispatch.settled receipt and inspect the affected state before proposing another action. A missing receipt is an unknown outcome, never permission to repeat the write.",
+            instruction: """
+                Read this turn's tool.dispatch.settled receipt and inspect the affected state before proposing another action. A missing receipt is \
+                an unknown outcome, never permission to repeat the write.
+                """,
             recovery: .reconcile)
-    }
-}
-
-// MARK: - Tool-result stub
-//
-// The stub `IntraTurnContextCompaction` puts in place of an older tool-result
-// body under window pressure. Historical tool receipts are bounded; a temporary
-// output handle belongs to its turn and never promises full source retention.
-enum IntraTurnToolResultClearing {
-    /// Preserved head length; independent of SessionHistory's cross-turn head-and-tail projection budget.
-    static let headLength = 180
-
-    /// Prefix of OUR stub's terminal marker line.
-    static let clearedMarkerPrefix = "[cleared: full result was "
-
-    /// Suffix of OUR stub's terminal marker line.
-    static let clearedMarkerSuffix = " chars; recover the existing output from its receipt or saved result; do not repeat mutations or external sends merely to recover output]"
-
-    /// A body is already stubbed only if its final line is exactly the marker prefix, decimal character count and suffix.
-    static func isAlreadyStubbed(_ content: String) -> Bool {
-        guard content.hasSuffix(clearedMarkerSuffix) else { return false }
-        let lastLine = content.split(separator: "\n", omittingEmptySubsequences: false).last
-            ?? Substring(content)
-        guard lastLine.hasPrefix(clearedMarkerPrefix) else { return false }
-        let count = lastLine
-            .dropFirst(clearedMarkerPrefix.count)
-            .dropLast(clearedMarkerSuffix.count)
-        return !count.isEmpty && count.allSatisfy { $0.isASCII && $0.isNumber }
-    }
-
-    /// Stubbed form of a tool-result body, or nil when the body should be
-    /// kept as-is (already stubbed, or so short the stub would not shrink
-    /// it — clearing must never GROW the payload). Re-stubbing a stub would
-    /// corrupt the original-length record, hence the sentinel guard.
-    static func stub(_ content: String) -> String? {
-        guard !isAlreadyStubbed(content) else { return nil }
-        let head = String(content.prefix(headLength))
-        let stubbed = "\(head)\n\(clearedMarkerPrefix)\(content.count)\(clearedMarkerSuffix)"
-        guard stubbed.count < content.count else { return nil }
-        return stubbed
     }
 }
 
 // MARK: - Provider-facing result ceiling
 
-/// Keeps one unexpectedly large tool response from consuming the rest of a
-/// model window. Dispatch records and persisted receipts retain their normal
-/// bounded projections; only the live provider block is replaced with a
-/// valid JSON page containing whole sections. Recover the existing
-/// output before deciding whether another operation is needed.
+/// Page oversized live results into whole JSON sections so one response cannot consume the remaining window.
+/// Keep ordinary receipt projections and recover existing output before repeating any operation.
 enum ProviderToolResultPage {
     static let defaultMaxUTF8Bytes = 48_000
-    static let compactMaxUTF8Bytes = 12_000
-
-    static func maxUTF8Bytes(for toolName: String) -> Int {
-        if toolName == "invoke_codex" {
-            return compactMaxUTF8Bytes
-        }
-        return defaultMaxUTF8Bytes
-    }
 
     static func project(
         toolName: String,
@@ -207,12 +152,12 @@ enum ProviderToolResultPage {
         originalResultClass: ChatToolOutcome.ExactResultClass? = nil,
         appDoor: Bool = false
     ) async -> String {
-        let limit = maxUTF8Bytes(for: toolName)
+        let limit = defaultMaxUTF8Bytes
         guard content.utf8.count > limit else { return content }
         do {
         let parsed = try? JSONValue.parse(Data(content.utf8))
         let originalResultClass = originalResultClass ?? (content.utf8.count <= ProviderToolResultRecoveryStore.maxEntryBytes
-            ? parsed.map(ChatToolOutcome.exactResultClass) ?? .unknown : .unknown)
+            ? parsed.map({ ToolResult($0).outcome }) ?? .unknown : .unknown)
         let recovery = try await ProviderToolResultRecoveryStore.shared.store(
             content: content,
             parsed: parsed,
@@ -229,15 +174,18 @@ enum ProviderToolResultPage {
             query: ""
         ) {
             fields = page
-            // Through the door the page is app's result.page.
             fields["recovery_tool"] = .string(appDoor ? "app result.page" : "tool_result_page")
             if appDoor, case .string(let detail)? = fields["detail"] {
                 fields["detail"] = .string(ToolNameAliases.foldedProse(detail))
             }
             fields["retained_bytes"] = .int(Int64(recovery.bytes))
         } else {
-            fields = ["sections": .array(ToolResultSections.pages(sections: try ToolResultSections.projection(content: content, value: parsed, budget: budget), query: "", budget: budget)[0]),
-                "detail": .string("Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing output does not establish failure.")]
+            fields = ["sections": .array(ToolResultSections.pages(sections: try ToolResultSections.projection(content: content, value: parsed,
+                budget: budget), query: "", budget: budget)[0]),
+                "detail": .string("""
+                    Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing \
+                    output does not establish failure.
+                    """)]
         }
         fields["provider_projection"] = .string("bounded_tool_result")
         fields["tool"] = .string(appDoor ? ToolNameAliases.appAction(toolName) ?? toolName : toolName)
@@ -247,12 +195,10 @@ enum ProviderToolResultPage {
         fields["original_bytes"] = .int(Int64(content.utf8.count))
         fields["full_result_retained"] = .bool(recovery != nil)
         fields["retention_reason"] = .string(recovery == nil ? "retention_unavailable" : "response_exceeds_inline_limit")
-        // Home's controls must remain usable even when a page's reading
-        // evidence is paged. Preserve the exact live controls, never reconstruct
-        // or replay them from retained content. The full result remains paged.
+        // Keep exact live home controls outside paged reading evidence; never reconstruct or replay controls from retained content.
         if toolName == "app", case .object(var frame)? = parsed {
             fields["version"] = frame["version"]
-            // A home-item send puts its receipt on top and the room under view.
+            // Put a home-item send's receipt above the room view so its own outcome remains visible.
             if case .object(let view)? = frame["view"] { frame.merge(view) { top, _ in top } }
             let keys: Set<String> = ["status", "workspace", "path", "actions", "windows", "places", "desktop"]
             let navigation = JSONValue.object(frame.filter { keys.contains($0.key) })
@@ -264,7 +210,10 @@ enum ProviderToolResultPage {
         }
         return try JSONValue.object(fields).serialize(pretty: false)
         } catch {
-            return "Tool result projection is unavailable because its values could not be encoded: \(error.localizedDescription). This does not establish whether the tool's effects occurred. Inspect the saved result and repair its producing owner before repeating an action."
+            return """
+                Tool result projection is unavailable because its values could not be encoded: \(error.localizedDescription). This does not establish \
+                whether the tool's effects occurred. Inspect the saved result and repair its producing owner before repeating an action.
+                """
         }
     }
 }

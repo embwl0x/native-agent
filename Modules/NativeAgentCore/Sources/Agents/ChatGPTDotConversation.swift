@@ -10,9 +10,9 @@ import PersistenceCore
 import PersonaEngine
 import ProviderRouting
 import Transcripts
-// Blueprint: | `ChatGPTDotConversation.swift` | `ChatGPTDotConversation` actor; `refresh`, `conversation`; saved arrivals wait on `TurnAdmission` capacity signals; failed turns retain their actual cause and never create a second turn on link changes; launch resumes only arrivals whose turn has not started; the delegation runner stops subscriptions with discovery and Dot socket observation; old lifecycle callbacks cannot retry admissions |
+// Blueprint: | `ChatGPTDotConversation.swift` | `ChatGPTDotConversation`, `refresh`, `conversation`, `TurnAdmission` |
 
-/// Dot's room is an ingress into his ordinary contact session, not an outbound reply tracker.
+/// IPC ingress joins the canonical contact session, never a separate outbound reply tracker.
 actor ChatGPTDotConversation {
     let dataRoot: URL
     let clients: any AgentContactClients
@@ -23,7 +23,7 @@ actor ChatGPTDotConversation {
         var lifeID: String?
         let message: JSONValue
         var started = false
-        /// The actual terminal reason and supplied provider cause, never replay authority.
+        /// Terminal reasons and provider causes grant no replay authority.
         var failed: String?
         var retryCause: ProviderFailure?
     }
@@ -37,7 +37,7 @@ actor ChatGPTDotConversation {
         self.clients = clients
     }
 
-    /// At launch. An interrupted admission has no proven network cause and stays terminal.
+    /// Interrupted admission has no proven network cause and remains terminal.
     func resumeAdmissions() async throws {
         guard !retired, !recoveryAttempted, !Task.isCancelled else { return }
         recoveryAttempted = true
@@ -123,29 +123,32 @@ actor ChatGPTDotConversation {
         guard let peer = try AgentPeerStore(dataRoot: dataRoot).list().first(where: {
             ChatGPTDotIPCTransport.owns($0) && principal($0).storedConversation("mcp-" + $0.id) == sessionID
         }) else { return false }
-        let tools = clients.bridgeToolDispatchClient(fileAccess: "read_only", verifiedSessionId: sessionID)
-        _ = try await ChatToolSessionContext.$envelope.withValue(ChatToolSessionContext.envelope ?? .native("contact.refresh:" + peer.id)) {
-            try await tools.dispatch(tool: "agent_read", input: ["agent": .string("peer:" + peer.id)], surface: "chat")
-        }
+        let tools = clients.bridgeToolDispatchClient(fileAccess: "read_only", verifiedSessionId: sessionID, conversation: .init())
+        var turn = Turn(session: sessionID)
+        turn.verifiedSessionID = sessionID
+        turn.envelope = .native("contact.refresh:" + peer.id)
+        _ = try await tools.dispatch(tool: "agent_read", input: ["agent": .string("peer:" + peer.id)], surface: "chat", turn: turn, invocation: .init())
         return true
     }
 
-    func conversation(root: URL, peer: AgentPeerContact, messages: [JSONValue], sent: String?, window: [String: JSONValue]? = nil) async throws -> JSONValue {
+    func conversation(turn: Turn?, root: URL, peer: AgentPeerContact, messages: [JSONValue], sent: String?,
+        window: [String: JSONValue]? = nil) async throws -> JSONValue {
         guard !retired else { throw CancellationError() }
         try Task.checkCancellation()
         guard root.standardizedFileURL == dataRoot.standardizedFileURL else {
             throw AgentConversationStore.Failure(message: "Dot's conversation belongs to another app data root.")
         }
         if let sent {
+            guard let turn else { throw AgentConversationStore.Failure(message: "A contact send requires its originating turn.") }
             let session = principal(peer).storedConversation("mcp-" + peer.id)
             var clientID: String?
             if case .object(let receipt)? = messages.first, case .string(let id)? = receipt["client_user_message_id"] {
                 clientID = id
             }
-            // The person's own send from his thread is marked theirs, not hers.
-            let byPerson = PersonInitiatedSend.current?.matches(["agent": .string("peer:" + peer.id), "text": .string(sent)]) == true
+            // Composer sends carry person authorship, not agent authorship.
+            let byPerson = turn.personInitiatedSend?.matches(["agent": .string("peer:" + peer.id), "text": .string(sent)]) == true
             try await clients.bridgeChatClient().appendAgentConversationSend(sessionID: session, text: sent,
-                                                                             clientUserMessageID: clientID, byPerson: byPerson)
+                                                                             clientUserMessageID: clientID, byPerson: byPerson, turn: turn)
             return .object(["status": .string("sent"), "sent": .bool(true)])
         }
         if let window, case .string(let asked)? = window["conversation_id"] {
@@ -153,7 +156,10 @@ actor ChatGPTDotConversation {
             let remote: JSONValue? = if case .object(let state) = ChatGPTDotIPCTransport.readiness { state["conversation_id"] } else { nil }
             guard asked == local || .string(asked) == remote else {
                 return .object(["status": .string("unavailable"), "sent": .bool(false), "reason": .string("invalid_conversation"),
-                    "detail": .string("Dot has one conversation; use the conversation_id returned by Dot's read or his current root. Omit it for a fresh read. Nothing was sent or read.")])
+                    "detail": .string("""
+                        Dot has one conversation; use the conversation_id returned by Dot's read or Dot's current root. Omit it for a fresh read. \
+                        Nothing was sent or read.
+                        """)])
             }
         }
         for message in messages {
@@ -193,7 +199,10 @@ actor ChatGPTDotConversation {
         let version = SHA256.hash(data: try JSONValue.array(rows.map { .object($0) }).serializedData(pretty: false))
             .map { String(format: "%02x", $0) }.joined()
         if let expected = window["source_version"], expected != .string(version) {
-            throw AgentConversationStore.Failure(message: "Dot's retained conversation changed. Read again without source_version, offset or text_offset, then follow the new next; no characters from a different message were substituted.")
+            throw AgentConversationStore.Failure(message: """
+                Dot's retained conversation changed. Read again without source_version, offset or text_offset, then follow the new next; no \
+                characters from a different message were substituted.
+                """)
         }
         func integer(_ key: String) -> Int {
             if case .int(let value)? = window[key] { return Int(value) }
@@ -239,7 +248,7 @@ actor ChatGPTDotConversation {
     private func drain(peer: AgentPeerContact) async throws -> JSONValue {
         defer { pull = nil }
         var result: JSONValue
-        // Taken only once in her session: a failed append keeps them for the next event.
+        // Taken only once in the agent's session: a failed append keeps them for the next event.
         repeat {
             let messages = pendingMessages
             result = try await append(messages, peer: peer)
@@ -303,10 +312,9 @@ actor ChatGPTDotConversation {
             let failed = pending[id]?.failed
             if failed != nil { continue }
             let lifeID = try DataRootLife.current(in: dataRoot)
-            // His reply is a message in her Dot session that wakes her, like any
-            // contact's; she answers him with agent_message when she wants to.
+            // Inbound contact replies wake the agent in the contact’s canonical session.
             let turn = AgentContactTurn(taskID: UUID().uuidString, context: context, requestID: id, principal: principal,
-                parts: [.text(text + "\n\n(Dot sees your answer only if you send it to him with agent_message.)")],
+                parts: [.text(text + "\n\n(Dot sees your answer only if you send it to Dot with agent_message.)")],
                 bindRun: { _, _ in try await self.startAdmission(id: id, peer: peer.id) })
             let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
             let request = principal.turnRequest(context: context, plain: plain,
@@ -333,8 +341,7 @@ actor ChatGPTDotConversation {
                 else { accepted = try await request.enqueue(on: client) }
             } catch { admissionTasks.removeValue(forKey: key); throw error }
             durableIDs.insert(id)
-            // Enqueue may have committed while Stop arrived. Keep that row
-            // and its saved admission for restart, but admit no new turn.
+            // Enqueue may have committed while Stop arrived. Keep that row and its saved admission for restart, but admit no new turn.
             do { try checkRecovery() }
             catch { admissionTasks.removeValue(forKey: key); throw error }
             let root = dataRoot
@@ -420,7 +427,7 @@ actor ChatGPTDotConversation {
                 } else { ownSend = false }
                 afterSend = ownSend ? date : nil
             } else if fields["kind"] == .string("dot") {
-                // An answer to our send, or an address to the configured resident.
+                // Accept only answers to this install’s send or messages addressed to its configured resident.
                 let text = (fields["text"].flatMap { if case .string(let t) = $0 { return t }; return nil } ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 let address = text.hasPrefix("@") ? String(text.dropFirst()) : text

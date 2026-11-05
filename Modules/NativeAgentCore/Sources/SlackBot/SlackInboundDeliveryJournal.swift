@@ -95,10 +95,8 @@ enum SlackInboundJournalError: Error, CustomStringConvertible {
     }
 }
 
-/// Durable handoff between Socket Mode acknowledgement, local generation, and
-/// Slack delivery. Terminal rows are bounded. Pending/ambiguous rows are never
-/// evicted: once their cap is reached, admission fails before ACK so Slack can
-/// retain and retry the envelope instead of NativeAgent silently dropping it.
+/// Pending/ambiguous rows cannot be evicted: at capacity, refuse admission before ACK so Slack retains the envelope rather than silently dropping accepted
+/// work.
 public actor SlackInboundDeliveryJournal {
     public struct RecoverySummary: Sendable, Equatable {
         public let pendingCount: Int
@@ -111,7 +109,6 @@ public actor SlackInboundDeliveryJournal {
         var version = 1
         var records: [SlackInboundDeliveryRecord] = []
         var pendingLimit: Int?
-        /// Event ids whose bot-event fan-out has been taken.
         var botEventClaims: [String] = []
 
         init() {}
@@ -130,9 +127,7 @@ public actor SlackInboundDeliveryJournal {
     private let terminalCap = 500
     private let pendingCap = 100
     private let encoder: JSONEncoder
-    /// One handler per accepted event in this process, whichever loop's
-    /// journal took it: a loop replaced while its handler still runs leaves
-    /// that handler the event, and the replacement's recovery skips it.
+    /// One handler owns each accepted event across loop replacements; recovery must not duplicate its work.
     nonisolated(unsafe) private static var activeHandlers: Set<String> = []
     nonisolated(unsafe) private static var handlerTasks: [String: Task<Void, Never>] = [:]
     private static let handlerLock = NSLock()
@@ -150,9 +145,7 @@ public actor SlackInboundDeliveryJournal {
             .appendingPathComponent("inbound_delivery_journal.json")
     }
 
-    /// Counts only, never raw messages or private attachment URLs. The mounted
-    /// Connectors status reader uses this independent durable evidence so a
-    /// fresh socket hello cannot hide a queue requiring human recovery.
+    /// Expose counts without private message data; a fresh socket hello cannot hide work requiring human recovery.
     public nonisolated static func recoverySummary(dataRoot: URL) throws -> RecoverySummary? {
         let path = path(dataRoot: dataRoot)
         guard let file = try loadFile(path: path) else { return nil }
@@ -199,8 +192,7 @@ public actor SlackInboundDeliveryJournal {
         Self.handlerLock.withLock { Self.activeHandlers.insert(path.path + "\u{0}" + eventId).inserted }
     }
 
-    /// Accepted human work belongs to the journal, not a socket session. Claim
-    /// before launching, retain through settlement, and retire at actual exit.
+    /// Accepted human work belongs to the journal, not a socket session. Claim before launching, retain through settlement, and retire at actual exit.
     func startHandler(eventId: String, operation: @escaping @Sendable () async -> Void) {
         let key = path.path + "\u{0}" + eventId
         Self.handlerLock.withLock {
@@ -234,12 +226,7 @@ public actor SlackInboundDeliveryJournal {
         }
     }
 
-    /// Durable once-only claim for waking bots on this message (0.4.12). The
-    /// handler set above is in-memory, so recovery or a retry of an unresolved
-    /// row would re-enter handling after a restart; this claim is persisted
-    /// beside the delivery rows, in this actor's serialized write, so one
-    /// accepted Slack message wakes a bot exactly once. A claim is trimmed only
-    /// once its event has no unresolved row left.
+    /// Persist fan-out claims beside delivery rows so recovery cannot wake bots twice after a restart. Trim a claim only when its event has no unresolved row.
     func claimBotEvent(eventId: String) throws -> Bool {
         try CredentialFileLock.withLock(path) {
             var file = try load()
@@ -325,11 +312,38 @@ public actor SlackInboundDeliveryJournal {
         }
     }
 
+    /// An event whose run never reached the agent's turn is claimed again, keeping its run and conversation for the replay.
+    func reclaim(eventId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
+        try mutate(eventId: eventId) { record in
+            record.phase = .claimed
+            record.updatedAt = now
+            record.outcomeDetail = nil
+        }
+    }
+
+    /// Read by the agent's turn in progress: settled with no post of its own.
+    func markSteered(eventId: String, turnID: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
+        try mutate(eventId: eventId) { record in
+            record.phase = .delivered
+            record.updatedAt = now
+            record.outcomeDetail = "Read by the agent's turn \(turnID); that turn's reply answers it."
+        }
+    }
+
     func markDelivered(eventId: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) { record in
             record.phase = record.failedBeforeAnswer == true ? .failedBeforeAnswer : .delivered
             record.updatedAt = now
             record.outcomeDetail = nil
+        }
+    }
+
+    /// The agent's completed turn chose silence: the inbound is settled without a Slack post.
+    func markSilent(eventId: String, turnID: String, now: Date = Date()) throws -> SlackInboundDeliveryRecord {
+        try mutate(eventId: eventId) { record in
+            record.phase = .delivered
+            record.updatedAt = now
+            record.outcomeDetail = "The agent's turn \(turnID) ended silently."
         }
     }
 
@@ -373,7 +387,10 @@ public actor SlackInboundDeliveryJournal {
     }
 
     func answerRecord(runId: String, originRunId: String) throws -> SlackInboundDeliveryRecord? {
-        try load().records.first { $0.assistantRunId == runId || $0.assistantRunId == originRunId || $0.assistantOriginRunId == originRunId || $0.settledAssistantRuns?[runId] != nil }
+        try load().records.first { $0.assistantRunId == runId
+            || $0.assistantRunId == originRunId
+            || $0.assistantOriginRunId == originRunId
+            || $0.settledAssistantRuns?[runId] != nil }
     }
 
     func savedUnconfirmedReply(for inbound: SlackInboundMessage) throws -> SlackInboundDeliveryRecord? {
@@ -413,7 +430,8 @@ public actor SlackInboundDeliveryJournal {
 
     func prepareSuccessor(eventId: String, response: SlackPreparedReply, runId: String, sessionId: String) throws {
         _ = try mutate(eventId: eventId) {
-            if let priorRun = $0.assistantRunId { $0.settledAssistantRuns = ($0.settledAssistantRuns ?? [:]).merging([priorRun: $0.phase.rawValue], uniquingKeysWith: { first, _ in first }) }
+            if let priorRun = $0.assistantRunId { $0.settledAssistantRuns = ($0.settledAssistantRuns ?? [:])
+                .merging([priorRun: $0.phase.rawValue], uniquingKeysWith: { first, _ in first }) }
             $0.assistantOriginRunId = $0.assistantOriginRunId ?? $0.assistantRunId
             $0.assistantRunId = runId; $0.assistantSessionId = sessionId
             $0.prepared = response; $0.phase = .prepared; $0.failedBeforeAnswer = false; $0.dispatchStartedAt = nil; $0.updatedAt = Date()
@@ -492,8 +510,7 @@ public actor SlackInboundDeliveryJournal {
         file.pendingLimit = pendingCap
         let directory = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        // Creation-time 0600, not chmod after publication: the existing slack
-        // directory may be 0755 and these rows contain private message bodies.
+        // Creation-time 0600, not chmod after publication: the existing slack directory may be 0755 and these rows contain private message bodies.
         guard NativePrivateFile.write(try encoder.encode(file), to: path) else {
             throw CocoaError(.fileWriteUnknown)
         }

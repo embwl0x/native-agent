@@ -4,7 +4,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ChatSessionRetention.swift` | Archive eligibility and protected conversations; manual/retention archive settlement and durable append before hot-row removal; index to transcript to archive lock order, exact acknowledged-version guard and retained chat storage; unavailable anchor protection halts automatic archive planning with its source fault |
+// Blueprint: | `ChatSessionRetention.swift` | Locked archival preserves acknowledged transcript bytes |
 
 public struct ChatSessionRetentionPolicy: Sendable, Equatable {
     public var maxActiveSessions: Int
@@ -46,19 +46,18 @@ public struct ChatSessionRetentionReport: Sendable, Equatable {
     }
 }
 
-/// Bounds the hot index without deleting history; `enforce` uses the caller's locked rows.
-/// Manual archive owns its locks. Rows append to `chat/archive/sessions.jsonl`;
-/// transcripts move from `chat/messages/` to `chat/archive/messages/`.
-/// Lock sessions index, transcript, then archive index; writers release the transcript
-/// lock before index sync. Contended transcripts stay hot for a later pass.
-/// Archive history belongs to local/off-disk backups and PrivacyMap/chat;
-/// data export and phone sync exclude raw archive files.
+/// Bounds the hot index without deleting history; `enforce` uses the caller's locked rows. Manual archive owns its locks. Rows append to
+/// `chat/archive/sessions.jsonl`; transcripts move from `chat/messages/` to `chat/archive/messages/`. Lock sessions index, transcript, then archive index;
+/// writers release the transcript lock before index sync. Contended transcripts stay hot for a later pass. Archive history belongs to local/off-disk backups
+/// and PrivacyMap/chat; data export and phone sync exclude raw archive files.
 public enum ChatSessionRetention {
     public static let diskStorageOwner = DiskStorageOwner.retained(id: "chat", roots: ["chat"],
-        policy: "Transcripts, archives and compaction backups are memory; Clean Up keeps them. The history search index belongs to chat and is kept because launch rebuilds it. chat.archive organizes conversations without reclaiming transcript bytes. No history erasure control is provided by this cleanup.")
+        policy: """
+            Transcripts, archives and retained tool results are memory; Clean Up keeps them. Launch rebuilds the retained history search index. \
+            chat.archive organizes conversations without reclaiming transcript bytes. No history erasure control is provided by this cleanup.
+            """)
 
-    // Archived transcripts and their locator rows are durable history. Only
-    // explicit deletion may remove them; the active index remains bounded.
+    // Archived transcripts and their locator rows are durable history. Only explicit deletion may remove them; the active index remains bounded.
     public nonisolated static func defaultBestEffortFailureLogger(_ message: String) {
         nativeLog("%@", message)
     }
@@ -92,8 +91,7 @@ public enum ChatSessionRetention {
         var kept: [[String: JSONValue]] = []
         kept.reserveCapacity(rows.count - reasons.count)
         var indexedRows = rows
-        // The caller holds the sessions lock. Checkpoint each removal while
-        // archive still holds the transcript lock, before deleting hot history.
+        // The caller holds the sessions lock. Checkpoint each removal while archive still holds the transcript lock, before deleting hot history.
         var report = ChatSessionRetentionReport()
         var staleEmptyAborts = 0
         for (index, row) in rows.enumerated() {
@@ -116,8 +114,7 @@ public enum ChatSessionRetention {
             }
         }
 
-        // Aborted stale-empty archives rejoin active-cap planning as nonempty
-        // sessions. The bounded second pass executes only active-cap removals.
+        // Aborted stale-empty archives rejoin active-cap planning as nonempty sessions. The bounded second pass executes only active-cap removals.
         if staleEmptyAborts > 0 {
             let secondReasons = plannedArchiveReasons(
                 rows: kept,
@@ -138,9 +135,8 @@ public enum ChatSessionRetention {
         return (indexedRows, report)
     }
 
-    /// Best-effort enforcement for callers whose success path must continue even
-    /// if retention is temporarily unavailable. Failures are logged, never
-    /// silently swallowed.
+    /// Best-effort enforcement for callers whose success path must continue even if retention is temporarily unavailable. Failures are logged, never silently
+    /// swallowed.
     @discardableResult
     public static func enforceBestEffort(
         dataRoot: URL,
@@ -160,9 +156,8 @@ public enum ChatSessionRetention {
         }
     }
 
-    /// Manual archive keeps the transcript in place and commits its row to the
-    /// archive before removing it from the hot index. Both archive writers use
-    /// the same checked schema and durable append under the archive lock.
+    /// Manual archive keeps the transcript in place and commits its row to the archive before removing it from the hot index. Both archive writers use the same
+    /// checked schema and durable append under the archive lock.
     public static func archiveSession(id: String, dataRoot: URL) async throws -> [String: JSONValue]? {
         guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return nil }
         let index = dataRoot.appendingPathComponent("chat/sessions.json")
@@ -181,8 +176,7 @@ public enum ChatSessionRetention {
                 latest?["archivedAt"] = row["archivedAt"]
                 if latest != row { try appendJSONL(.object(row), to: archive) }
             }
-            // The archived claim survives an index failure, so a retry only
-            // removes the hot row rather than appending another archive record.
+            // The archived claim survives an index failure, so a retry only removes the hot row rather than appending another archive record.
             rows.remove(at: position)
             try ChatSessionIndexFile.write(rows, to: index, removeWhenEmpty: true)
             return archived
@@ -232,20 +226,17 @@ public enum ChatSessionRetention {
         if policy.includeMacPinnedSessions {
             protected.formUnion(try macPinnedChatSessionIds(dataRoot: dataRoot))
         }
-        // The live anchor stays protected independently of pins on every surface.
-        // Its publisher shares this caller's sessions lock, so the read is atomic.
+        // The live anchor stays protected independently of pins on every surface. Its publisher shares this caller's sessions lock, so the read is atomic.
         protected.formUnion(try ConversationAnchor.protectedSessionIds(dataRoot: dataRoot))
-        // A session a door (Telegram chat, Slack channel/thread) is bound to is
-        // where that door's next message lands; archiving it would restart
-        // that door with an empty conversation.
+        // A session a door (Telegram chat, Slack channel/thread) is bound to is where that door's next message lands; archiving it would restart that door with
+        // an empty conversation.
         protected.formUnion(try doorMappedSessionIds(dataRoot: dataRoot))
-        // A contact's conversations (a saved contact's, a built-in lane's) are
-        // what its pane reads; archiving one would blank that pane.
+        // Contact panes read their owned conversation; archiving it would blank the pane.
         protected.formUnion(try contactSessionIds(dataRoot: dataRoot))
         return protected
     }
 
-    /// Every session a contact owns starts with this: its id, hashed.
+    /// Hash contact identity so its protected session prefix is shared across surfaces.
     public static func contactSessionPrefix(owner: String) -> String {
         let digest = SHA256.hash(data: Data(owner.utf8))
         return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
@@ -261,8 +252,7 @@ public enum ChatSessionRetention {
             }
             for case .object(let peer) in peers { if case .string(let id)? = peer["id"] { owners.append(id) } }
         } catch CocoaError.fileReadNoSuchFile {}
-        // Each contact's one conversation (ContactThread.session), not every
-        // session it opened: a peer starting a context per task stays bounded.
+        // Each contact's one conversation (ContactThread.session), not every session it opened: a peer starting a context per task stays bounded.
         return Set(owners.map { contactSessionPrefix(owner: $0) + "mcp-" + $0 })
     }
 
@@ -333,16 +323,13 @@ public enum ChatSessionRetention {
             }
             // Archive only the transcript version acknowledged by the session index.
             if reason == .activeCap, transcriptModifiedDate(messagesPath) != nil {
-                // A pending writer changes the exact transcript version before
-                // synchronizing the index. Legacy rows stay hot until bounded
-                // reconciliation acknowledges their bytes.
+                // Pending writers alter bytes before index sync; retain unacknowledged versions until reconciliation confirms them.
                 guard let version = ChatSessionIndexFile.transcriptVersion(at: messagesPath),
                       row[ChatSessionIndexFile.acknowledgedTranscriptKey] == version else {
                     return false
                 }
             }
-            // Check existence only after locking: a writer may be creating the
-            // first row while retention is selecting this session.
+            // Check existence only after locking: a writer may be creating the first row while retention is selecting this session.
             var archivedMessagesPath: URL?
             if FileManager.default.fileExists(atPath: messagesPath.path) {
                 let archiveDir = dataRoot
@@ -363,8 +350,7 @@ public enum ChatSessionRetention {
             if let archivedMessagesPath {
                 archivedRow["messagesArchivePath"] = .string(relativePath(archivedMessagesPath, under: dataRoot))
             }
-            // Lock archive after transcript. On contention, discard the copy and
-            // keep the session hot; no removal may precede its durable archive row.
+            // Lock archive after transcript. On contention, discard the copy and keep the session hot; no removal may precede its durable archive row.
             let indexRowWritten = try CredentialFileLock.tryWithLock(archiveIndex) {
                 try appendJSONL(.object(archivedRow), to: archiveIndex)
                 return true
@@ -376,9 +362,8 @@ public enum ChatSessionRetention {
                 return false
             }
 
-            // Both archive bytes and its row exist before the active row goes.
-            // If interrupted after this checkpoint, the hot copy may survive
-            // and be recovered as an orphan; an active row never loses history.
+            // Both archive bytes and its row exist before the active row goes. If interrupted after this checkpoint, the hot copy may survive and be recovered
+            // as an orphan; an active row never loses history.
             try commitIndexRemoval()
             if archivedMessagesPath != nil {
                 try FileManager.default.removeItem(at: messagesPath)
@@ -388,8 +373,7 @@ public enum ChatSessionRetention {
         return archived ?? false
     }
 
-    /// Under the transcript lock, detect a non-blank JSONL line.
-    /// Unreadable bytes count as empty, allowing stale-empty sessions to leave the hot tier.
+    /// Under the transcript lock, detect a non-blank JSONL line. Unreadable bytes count as empty, allowing stale-empty sessions to leave the hot tier.
     private static func transcriptIsNonEmpty(_ path: URL) -> Bool {
         guard let data = try? Data(contentsOf: path), !data.isEmpty else { return false }
         guard let text = String(data: data, encoding: .utf8) else { return true }
@@ -398,7 +382,6 @@ public enum ChatSessionRetention {
         }
     }
 
-    /// The transcript's last-write time, or nil when there is no transcript.
     static func transcriptModifiedDate(_ path: URL) -> Date? {
         (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
     }
@@ -463,8 +446,7 @@ public enum ChatSessionRetention {
         )
         var line = try record.serialize(pretty: false)
         line += "\n"
-        // The shared append: torn-line repair and O_APPEND. The caller holds
-        // the index lock.
+        // The caller's index lock serializes torn-line repair and O_APPEND.
         try SwiftNativePersistenceCore.appendOwnedBytes(Data(line.utf8), to: path, durable: true)
     }
 

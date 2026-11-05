@@ -1,10 +1,7 @@
-// ICloudBridgeConstants.swift — shared iCloud bridge namespace.
-//
-// Mac and iOS both use these values as wire/storage paths. Keeping them in the
-// shared module prevents one side from silently drifting from the other.
+// Shared wire/storage namespaces prevent the Mac and phone from drifting.
 import Foundation
 
-// Blueprint: | `ICloudBridgeConstants.swift` | Checked bundle-owned iCloud identity, mobile source and background task identifiers; shared retained Drive and current KVS namespaces |
+// Blueprint: | `ICloudBridgeConstants.swift` | Bundle-owned iCloud identity and shared wire/storage namespaces |
 
 public enum NativeAgentICloudBridgeConstants {
     public static var containerID: String {
@@ -42,8 +39,8 @@ public enum NativeAgentICloudBridgeConstants {
         }
     }
 
-    /// The signed bundle is the one runtime configuration. Source-build defaults
-    /// belong in xcconfig, never in an environment override or a failed read.
+    /// The signed bundle is the one runtime configuration. Source-build defaults belong in xcconfig, never in an environment override or a failed
+    /// read.
     private static func configuredValue(infoKey: String) throws -> String {
         guard let value = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String,
               !value.isEmpty,

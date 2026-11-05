@@ -1,7 +1,7 @@
 import AppToolRuntime
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `OnboardingTourOverlay.swift` | Tour progress uses stable stop identity and reconciles rail changes from the engine layout passed by ContentView; only in-overlay progress is local |
+// Blueprint: | `OnboardingTourOverlay.swift` | Stable rail-stop identity from engine layout; local overlay progress |
 
 // MARK: - Tour Step Model
 
@@ -12,9 +12,7 @@ struct OnboardingTourStep: Identifiable, Equatable, Sendable {
     let body: String
 }
 
-// One stop per word on the rail, in rail order, each with one plain sentence.
-// The title is the rail's own word (`SidebarItem.shellRailTitle`), so a stop can
-// never name a page that is no longer there.
+// Derive titles from the rail so stops cannot name absent pages.
 private let onboardingTourStops: [OnboardingTourStep] = [
     OnboardingTourStep(
         item: .chat,
@@ -72,9 +70,7 @@ private let onboardingTourStops: [OnboardingTourStep] = [
 
 // MARK: - Tour interaction state
 
-/// The view-free tour state machine. It owns only in-overlay progress and the
-/// exact effect each visible control requests; ContentView remains the owner
-/// of persisted overlay visibility.
+/// Keep progress local; ContentView owns persisted overlay visibility.
 enum OnboardingTourAction: Equatable, Sendable {
     case advance
     case retreat
@@ -103,9 +99,7 @@ enum OnboardingTourEffect: Equatable, Sendable {
 
     var step: OnboardingTourStep? { steps.first { $0.id == currentStopID } ?? steps.first }
 
-    /// Applies one visible control action. Completion is idempotent so a
-    /// duplicate Skip/Return event cannot ask ContentView to persist a second
-    /// presentation transition.
+    /// Completion is idempotent so duplicate Skip/Return events cannot persist twice.
     mutating func apply(_ action: OnboardingTourAction) -> OnboardingTourEffect {
         guard !didComplete else { return .none }
         switch action {
@@ -140,9 +134,7 @@ enum OnboardingTourEffect: Equatable, Sendable {
     }
 }
 
-/// All user-visible tour chrome derived from the same state that routes the
-/// sidebar. Keeping this projection pure prevents the label, disabled Back
-/// state, and action target from drifting into separate SwiftUI branches.
+/// Derive labels and targets together so they cannot drift from sidebar routing.
 @MainActor struct OnboardingTourPresentation: Equatable, Sendable {
     let progressText: String
     let advanceLabel: String
@@ -174,7 +166,7 @@ struct OnboardingTourOverlay: View {
     @State private var previousViewMode: String?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    /// A rail the layout left empty has no stop to show: the tour ends.
+    /// An empty rail has no stop to present.
     var body: some View {
         if let step = tour.step, let presentation = OnboardingTourPresentation(state: tour) {
             tourBody(step: step, presentation: presentation)
@@ -192,10 +184,9 @@ struct OnboardingTourOverlay: View {
 
     private func tourBody(step: OnboardingTourStep, presentation: OnboardingTourPresentation) -> some View {
         ZStack {
-            // Dimmed background
             Color.black.opacity(0.55)
                 .ignoresSafeArea()
-                .onTapGesture { } // absorb taps
+                .onTapGesture { } // Keep background taps from reaching the dimmed room.
 
             HStack(spacing: NativeAgentSpacing.xl) {
                 tabRail
@@ -207,8 +198,7 @@ struct OnboardingTourOverlay: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                    // Only the stop's words change; the plate and the buttons
-                    // stay put, and each stop arrives once.
+                    // Keep the plate and controls fixed so only the current stop changes.
                     VStack(spacing: NativeAgentSpacing.sm) {
                         Text(step.title)
                             .font(ShellType.display)
@@ -257,8 +247,7 @@ struct OnboardingTourOverlay: View {
                 .frame(maxWidth: 520)
             }
             .padding(NativeAgentSpacing.xl)
-            // The overlay sits on a dimmed room, so its words read as they do
-            // in the dark room whatever the appearance.
+            // The overlay stays over a dimmed room in either appearance.
             .environment(\.colorScheme, .dark)
         }
         .onAppear {
@@ -274,8 +263,6 @@ struct OnboardingTourOverlay: View {
         .accessibilityIdentifier("onboarding-tour.overlay")
     }
 
-    /// The stops as the rail draws its places: words at one left edge, and the
-    /// 2pt bar beside the one you are on.
     private var tabRail: some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(tour.steps) { tabStep in
@@ -336,8 +323,7 @@ struct OnboardingTourOverlay: View {
 }
 
 private extension View {
-    /// The rail's own plate: clear glass with the dark tint, no drawn border.
-    /// Reduce Transparency gets the flat rail colour instead.
+    /// Reduce Transparency needs a flat rail colour instead of glass.
     func plate(reduceTransparency: Bool) -> some View {
         let shape = RoundedRectangle(cornerRadius: NativeAgentShellLayout.railPlateRadius, style: .continuous)
         return background { if reduceTransparency { shape.fill(NativeAgentShell.rail) } }

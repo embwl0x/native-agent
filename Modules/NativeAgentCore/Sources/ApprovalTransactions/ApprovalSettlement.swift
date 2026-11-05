@@ -17,7 +17,6 @@ import ChatToolParsing
 import TrustCenter
 import ToolRegistry
 import DreamREMCycle
-import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
@@ -27,10 +26,9 @@ import MacIntegration
 import ProviderRouting
 import MacControl
 import Transcripts
-// Blueprint: | `ApprovalSettlement.swift` | Chat tool execution and receipt settlement; checked carried provenance before approval spend or continuation queue consumption |
+// Blueprint: | `ApprovalSettlement.swift` | Provenance checks precede spend; receipts precede continuation. |
 extension ApprovalExecution {
-    /// The returned outcome and the execution slot settle together. Failed
-    /// storage keeps the exact outcome with its owner for receipt-only repair.
+    /// The returned outcome and the execution slot settle together. Failed storage keeps the exact outcome with its owner for receipt-only repair.
     func settleApprovalExecution(_ id: String, dataRoot: URL,
         settlement: ApprovalExecutionOwners.Settlement) async -> Result<ApprovalRecord, Error> {
         await Self.settleRecordedApprovalExecution(id, dataRoot: dataRoot, settlement: settlement)
@@ -51,11 +49,10 @@ extension ApprovalExecution {
         continuation: ChatApprovalContinuation? = nil
     ) async {
         let dataRoot = requestedRoot ?? self.dataRoot
-        let continuation: ChatApprovalContinuation = continuation ?? { root, session, envelope, prompt in
-            try await self.continueChatToolApproval(dataRoot: root, sessionID: session, envelope: envelope, prompt: prompt)
+        let continuation: ChatApprovalContinuation = continuation ?? { root, session, turn, prompt in
+            try await self.continueChatToolApproval(dataRoot: root, sessionID: session, turn: turn, prompt: prompt)
         }
-        // Recovery may annotate an abandoned durable spend, but must never
-        // annotate a spend whose executor is still awaiting its verifier.
+        // Recovery may annotate an abandoned durable spend, but must never annotate a spend whose executor is still awaiting its verifier.
         let owners = ApprovalExecutionOwners.shared
         guard owners.acquire(root: dataRoot, approvalID: rec.id) else { return }
         var receiptOwnsRelease = false
@@ -103,11 +100,7 @@ extension ApprovalExecution {
                 words: error.localizedDescription, lever: "Preserve the unspent approval and repair its recorded provenance before replay.")
             return
         }
-        // Injection approvals have their own capability-specific durable spend
-        // inside InjectionApprovalVerifier. Every other generic approved tool
-        // spends here, immediately before dispatch. A crash can therefore
-        // leave an unknown outcome, but it cannot turn one approval into a
-        // second effect after restart.
+        // Spend immediately before dispatch so a restart cannot repeat an effect; injection owns its narrower fence.
         if !MacInjectionToolNames.isInjectionTool(replay.toolName) {
             let inbox = SwiftNativeApprovalInbox(root: dataRoot)
             let digest = ApprovalInboxApprovedReplayVerifier.effectDigest(rec.payload)
@@ -158,6 +151,7 @@ extension ApprovalExecution {
             let tools = effects.toolDispatchClient(
                 enforceAppAutonomy: false
             )
+            let host = await ApprovalLifecycleBus.shared.hostContext(rec)
             let gated = makeGatedToolDispatchClient(
                 tools: tools,
                 fileAccess: replay.fileAccess,
@@ -172,46 +166,51 @@ extension ApprovalExecution {
                     verifiedSessionID: replay.sessionId,
                     verifiedChatID: replay.telegramChatId,
                     verifiedUserID: replay.verifiedUserId
-                )
+                ),
+                work: ChatTurnWork(admissionOnly: host?.effectOptions.admissionOnly ?? false)
             )
-            // Verified approval carries the card's steer through all calls in this command.
-            // Approval replay is a fresh detached dispatch, not the original
-            // provider turn. Rehydrate only the approved lazy tool for this
-            // dispatch so the lazy gate cannot answer `not_loaded`, while no
-            // sibling tool receives an accidental capability grant.
-            let result = try await PeerDataTaint.$current.withValue(PeerDataTaint(restoring: carried.sources, elevated: carried.elevated)) {
-            try await LLMCallContext.$turnActiveTools.withValue([replay.toolName]) {
-                try await ChatToolSessionContext.$commandSignatureVerified.withValue(true) {
-                    try await TurnRequest(message: "", sessionID: replay.sessionId, surface: replay.surface,
-                        envelope: TurnEnvelope(surface: replay.surface, verifiedChatId: replay.telegramChatId,
-                            verifiedUserId: replay.verifiedUserId, commandSignatureVerified: true, deliveryRoute: replay.replyRoute),
-                        verifiedSessionID: .some(replay.sessionId),
-                        verifiedChatID: .some(replay.telegramChatId), verifiedUserID: .some(replay.verifiedUserId),
-                        replyRoute: replay.replyRoute, threadKind: ChatPersistenceContext.threadKind,
-                        ownedSessionID: ChatPersistenceContext.ownedSessionID).bind {
-                        let send: @Sendable () async throws -> JSONValue = {
-                            if let context = await ApprovalLifecycleBus.shared.hostContext(rec) {
-                                return try await context {
-                                    try await gated.dispatch(tool: replay.toolName, input: replay.input, surface: replay.surface)
-                                }
-                            }
-                            return try await gated.dispatch(tool: replay.toolName, input: replay.input, surface: replay.surface)
-                        }
-                        if replay.toolName == "agent_message" {
-                            // The waiting call still owns its conversation exchange.
-                            let hostReply = await ApprovalLifecycleBus.shared.awaitsHostReply(rec)
-                            return try await AgentConversationApproval.replay(id: rec.id, dataRoot: dataRoot,
-                                awaitingHostReply: hostReply, dispatch: { tool, input in
-                                    try await gated.dispatch(tool: tool, input: input, surface: replay.surface)
-                                }, perform: send)
-                        }
-                        return try await send()
-                    }
-                }
+            // The verified card is this replay's ingress, including its original remote/agent identity.
+            let origin = replay.envelope
+            let envelope = TurnEnvelope(surface: origin.surface, agent: origin.agent,
+                verifiedChatId: origin.verifiedChatId, verifiedUserId: origin.verifiedUserId,
+                commandSignatureVerified: true, deliveryRoute: origin.deliveryRoute,
+                declaredRemote: origin.declaredRemote, macContinuation: origin.macContinuation,
+                workIdentity: origin.workIdentity, answerExperienceID: origin.answerExperienceID)
+            let steer = host?.turn.peerSteering ?? PeerDataTaint(restoring: carried.sources, elevated: carried.elevated)
+            carried.sources.forEach { steer.mark(peer: $0) }
+            carried.elevated.forEach { steer.elevate(peer: $0) }
+            // A waiting host already holds this act. Standalone replay starts at the verified card.
+            let turn = (host?.turn ?? TurnRequest(message: "", sessionID: replay.sessionId, fileAccess: replay.fileAccess,
+                surface: replay.surface, envelope: envelope, verifiedSessionID: .some(replay.sessionId))
+                .turn())
+                .with(\.envelope, envelope)
+                .with(\.verifiedSessionID, replay.sessionId)
+                .with(\.fileAccess, replay.fileAccess)
+                .with(\.peerSteering, steer)
+                .with(\.offeredTools, [replay.toolName])
+            // Replay owns one operation; conversation callbacks refine it and
+            // hand that refinement to every nested dispatch on the held turn.
+            let invocation = ChatToolInvocation().with(\.authoredCall, host?.effectExecutor?.call)
+            let send: @Sendable (Turn, AgentConversationContext, MacOperationContext) async throws -> JSONValue = { turn, conversation, mac in
+                try await gated.dispatch(tool: replay.toolName, input: replay.input, surface: replay.surface, turn: turn,
+                    invocation: invocation.serving(conversation: conversation).serving(mac: mac))
             }
+            let result: JSONValue
+            if replay.toolName == "agent_message" {
+                // The waiting call still owns its conversation exchange.
+                let hostReply = await ApprovalLifecycleBus.shared.awaitsHostReply(rec)
+                result = try await AgentConversationApproval.replay(turn: turn, mac: invocation.macContext(dataRoot: dataRoot),
+                    conversation: invocation.conversation, workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
+                    id: rec.id, dataRoot: dataRoot,
+                    awaitingHostReply: hostReply, dispatch: { tool, input, turn, conversation, mac in
+                        try await gated.dispatch(tool: tool, input: input, surface: replay.surface, turn: turn,
+                            invocation: invocation.serving(conversation: conversation).serving(mac: mac))
+                    }, perform: send)
+            } else {
+                result = try await send(turn, invocation.conversation, invocation.macContext(dataRoot: dataRoot))
             }
             let receipt = Self.chatToolApprovalExecutionReceipt(
-                toolName: replay.toolName, surface: replay.surface, result: result)
+                toolName: replay.toolName, surface: replay.surface, result: result, turn: turn)
             settlement = .init(action: receipt.action,
                 detail: "", result: result)
         } catch {
@@ -230,10 +229,7 @@ extension ApprovalExecution {
             await ensureChatToolApprovalOutcomeReceipt(approvalID: rec.id, dataRoot: dataRoot, continuation: continuation)
         }
     }
-    /// Persist exactly one compact tool receipt into the conversation that
-    /// originated a generic approval, then claim one follow-up turn on
-    /// that same surface. Owns the record read under continuation ownership;
-    /// a refused turn leaves the receipt as recovery evidence.
+    /// Commit one receipt before claiming follow-up on its originating surface; refusal retains that recovery evidence.
     @discardableResult
     public func ensureChatToolApprovalOutcomeReceipt(
         approvalID: String,
@@ -241,11 +237,10 @@ extension ApprovalExecution {
         continuation: ChatApprovalContinuation? = nil
     ) async -> Bool {
         let dataRoot = requestedRoot ?? self.dataRoot
-        let continuation: ChatApprovalContinuation = continuation ?? { root, session, envelope, prompt in
-            try await self.continueChatToolApproval(dataRoot: root, sessionID: session, envelope: envelope, prompt: prompt)
+        let continuation: ChatApprovalContinuation = continuation ?? { root, session, turn, prompt in
+            try await self.continueChatToolApproval(dataRoot: root, sessionID: session, turn: turn, prompt: prompt)
         }
-        // Hold ownership through delivery and settlement. A concurrent scan
-        // must not retire a live claim and make its row evictable mid-turn.
+        // Hold ownership through delivery and settlement. A concurrent scan must not retire a live claim and make its row evictable mid-turn.
         let owners = ApprovalExecutionOwners.continuations
         guard owners.acquire(root: dataRoot, approvalID: approvalID) else { return true }
         defer { owners.release(root: dataRoot, approvalID: approvalID) }
@@ -268,18 +263,15 @@ extension ApprovalExecution {
             executedAction = .object(["status": .string(decision == "denied" ? "refused" : "cancelled")])
         } else { return true }
         if case .object(let state)? = rec.chatContinuation, state["settlement"] == .string("host_reply") { return true }
-        // Page-owned ephemeral requests retain their result on the approval
-        // itself. There is no conversation to append to or wake with an LLM.
+        // Page-owned ephemeral requests retain their result on the approval itself. There is no conversation to append to or wake with an LLM.
         if replay.surface == "connector_action",
            safeSessionID.hasPrefix("ephemeral:connector_action:") { return true }
-        // A durable queued delivery survives downtime. Historical conversations
-        // without one remain bounded. Existing claims settle without resending.
+        // A durable queued delivery survives downtime. Historical conversations without one remain bounded. Existing claims settle without resending.
         let continueConversation = SwiftNativeApprovalInbox.continuationIsPending(rec)
-        // Missing evidence is NOT a success. An annotation with no status and no
-        // retained class tells us only that the replay ran; the outcome is
-        // unconfirmed and every sentence below says so.
+        // Missing outcome evidence remains unconfirmed, never success.
         let recordedStatus = executedAction.objectValue?["status"]?.stringValue
-        let resultClass = rec.executedAction == nil ? ChatToolOutcome.exactResultClass(executedAction) : rec.executionResultClass
+        let reply = ToolResult(executedAction)
+        let resultClass = rec.executedAction == nil ? reply.outcome : rec.executionResultClass
         let ok = resultClass.receipt.ok
         let resultPreview = (executedAction.objectValue?["resultPreview"]?.stringValue
             ?? executedAction.objectValue?["error"]?.stringValue).map(TurnTraceRedactor.redactText)
@@ -305,12 +297,12 @@ extension ApprovalExecution {
             return false
         }
         // Validate provenance before queued steps can be consumed or released.
-        let resume = await HerScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
+        let resume = await AgentScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
                                             dataRoot: dataRoot)
         let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
         // Approval elevates the carried peers for the rest of this command.
         if decision == "approved" { steer.checkpointSources.forEach(steer.elevate) }
-        // The filing turn's file access; nil for an older card (the host's chat default).
+        // Absent retained file access uses the host's chat policy.
         let fileAccess: String? = if case .string(let mode)? = payload["fileAccess"] { mode } else { nil }
         do {
             try await inbox.writeChatReceipt(
@@ -324,8 +316,7 @@ extension ApprovalExecution {
                 guard case .object(let state)? = rec.chatContinuation else { return false }
                 return state["started"] != nil && state["done"] != .bool(true)
             }()
-            // The receipt is durable before any claim becomes evictable. A
-            // prior process may have delivered already, so never resend it.
+            // The receipt is durable before any claim becomes evictable. A prior process may have delivered already, so never resend it.
             if abandonedClaim {
                 _ = try await inbox.annotateChatContinuation(rec.id, done: true, settlement: "interrupted")
             } else if continueConversation,
@@ -333,15 +324,15 @@ extension ApprovalExecution {
                 rec.id, done: false) {
                 var settlement = "completed"
                 do {
-                    try await PeerDataTaint.$current.withValue(steer) {
-                        try await ChatToolSessionContext.$fileAccess.withValue(fileAccess) {
-                        try await continuation(dataRoot, safeSessionID, replay.envelope, """
+                    let turn = TurnRequest(message: "", sessionID: safeSessionID, surface: replay.surface,
+                        envelope: replay.envelope, verifiedSessionID: .some(safeSessionID)).turn()
+                        .with(\.peerSteering, steer).with(\.fileAccess, fileAccess)
+                    try await continuation(dataRoot, safeSessionID, turn, """
                             The approval for \(replay.toolName) was decided. This is its receipt, not a new user request:
                             \(summary)\(resume.text.isEmpty ? "" : "\n" + resume.text)
-                            Verify the outcome as needed, then briefly tell the user what happened, including any failure or uncertainty. Do not repeat the approved action or ask to approve this card again.
+                            Verify the outcome as needed, then briefly tell the user what happened, including any failure or uncertainty. \
+                            Do not repeat the approved action or ask to approve this card again.
                             """)
-                        }
-                    }
                 } catch {
                     settlement = "failed"
                     nativeLog("[approvals] continuation failed for \(rec.id); receipt retained: \(error)")
@@ -356,37 +347,32 @@ extension ApprovalExecution {
         await effects.chatTurnCompleted(sessionID: replay.sessionId)
         return true
     }
-    public typealias ChatApprovalContinuation = @Sendable (URL, String, TurnEnvelope, String) async throws -> Void
-    /// Follow-up uses normal tools under the card's and queued steps' steer,
-    /// bound by the caller as `PeerDataTaint.current` and retained by the host turn.
-    public func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String) async throws {
+    public typealias ChatApprovalContinuation = @Sendable (URL, String, Turn, String) async throws -> Void
+    /// Follow-up holds the card's origin, file restriction and queued steps' steering on its explicit turn.
+    public func continueChatToolApproval(dataRoot: URL, sessionID: String, turn: Turn, prompt: String) async throws {
         // With no turn's own, the chat applies the saved choice itself.
-        let fileAccess = ChatToolSessionContext.fileAccess ?? "auto"
+        let fileAccess = turn.fileAccess ?? "auto"
         try await effects.continueChatToolApproval(
-            dataRoot: dataRoot, sessionID: sessionID, envelope: envelope, prompt: prompt, fileAccess: fileAccess)
+            dataRoot: dataRoot, sessionID: sessionID, turn: turn, prompt: prompt, fileAccess: fileAccess)
     }
-    /// The actual replay writer's projection, shared with injected fixtures.
-    /// Preserve outcome and receipt fields from the complete result before the
-    /// privacy-safe preview is clipped; never persist the full result.
+    /// Preserve outcome and receipt evidence before clipping the privacy-safe preview; never persist the full result.
     public static func chatToolApprovalExecutionReceipt(
         toolName: String,
         surface: String,
-        result: JSONValue
+        result: JSONValue,
+        turn: Turn
     ) -> (action: JSONValue, preview: String) {
-        // Approval records sync across surfaces. Tool-specific redaction must
-        // remove literal values typed by ax_act before general redaction/caps.
-        let redactedResult = MacInjectionResultRedaction.redacted(tool: toolName, result: result)
+        // Approval records sync across surfaces. Tool-specific redaction must remove literal values typed by ax_act before general redaction/caps.
+        let redactedResult = MacInjectionResultRedaction.redacted(tool: toolName, result: result, turn: turn)
         let returnedID = ChatTranscriptEvidenceRendering.returnedIdentifier(redactedResult)
             .map(TurnTraceRedactor.redactText)
         let resultEffects = ChatTranscriptEvidenceRendering.receiptField("effects", in: redactedResult).map {
             String(ChatTranscriptEvidenceRendering.receiptValue(TurnTraceRedactor.redactValue($0)).prefix(512))
         }
         let preview = Self.approvalResultPreview(redactedResult)
-        // The outcome is derived from the COMPLETE original result and retained
-        // here, before the preview clips it. A result without a `status` field
-        // still carries evidence (ok/success/error); it is never assumed to have
-        // succeeded, and an unreadable one is recorded as unconfirmed.
-        let resultClass = ChatToolOutcome.exactResultClass(result)
+        // Derive outcome before clipping; missing status still needs evidence, and unreadable results remain unconfirmed.
+        let reply = ToolResult(result)
+        let resultClass = reply.outcome
         var action: [String: JSONValue] = [
             "op": .string("chat_tool_approval_replay"),
             "tool": .string(toolName),
@@ -395,9 +381,7 @@ extension ApprovalExecution {
             "resultClass": .string(resultClass.rawValue),
             "resultPreview": .string(preview),
         ]
-        // The word the result itself recorded, never one made up here: the
-        // replayed row keeps it as any tool row does, and omits it when the
-        // result had none (a nested "queued" stays visible in the body).
+        // Retain only the result's own class; nested queued evidence stays in the body.
         if let recorded = result.objectValue?["status"]?.stringValue { action["resultStatus"] = .string(recorded) }
         if let returnedID { action["returned_id"] = .string(returnedID) }
         if let resultEffects { action["effects"] = .string(resultEffects) }

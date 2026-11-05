@@ -11,16 +11,10 @@ extension TelegramPollLoop {
     /// Image downloads share the 10 MB chat-attachment ceiling and reject declared oversize before transfer.
     public static let defaultPhotoMaxBytes = 10 * 1024 * 1024
 
-    /// Extract a supported chat attachment. Telegram sends a `photo` as a LIST of size variants
-    /// (smallest..largest); pick the largest by width*height so the model sees
-    /// the best resolution. Also accept an `image/*` `document` — the
-    /// uncompressed "send as file" path, plus PDF and TXT/MD files through the
-    /// shared type resolver. Both shapes live in `message.extras`
-    /// (neither `photo` nor `document` is a TelegramMessage known key).
+    /// Choose the largest photo variant so the model sees the best resolution; preserve image documents through the shared type resolver.
     static func chatAttachment(from message: TelegramMessage) -> TelegramMediaAttachment? {
         guard case .object(let extras)? = message.extras else { return nil }
 
-        // photo: list of variants -> largest by pixel count
         if case .array(let variants)? = extras["photo"], !variants.isEmpty {
             var best: [String: JSONValue]?
             var bestPixels = -1
@@ -52,8 +46,7 @@ extension TelegramPollLoop {
             }
         }
 
-        // Documents keep the sender's filename; Telegram's download path may
-        // have a generic extension that does not describe the original file.
+        // Documents keep the sender's filename; Telegram's download path may have a generic extension that does not describe the original file.
         if case .object(let doc)? = extras["document"],
            case .string(let fileId)? = doc["file_id"],
            !fileId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -71,10 +64,7 @@ extension TelegramPollLoop {
         return nil
     }
 
-    /// Caption text for a media-only send (a photo/document with no `text`).
-    /// Telegram puts it in `message.extras["caption"]` — TelegramMessage.text
-    /// only reads `text`, so without this an image-with-caption loses the
-    /// caption entirely.
+    /// Media captions live in extras rather than TelegramMessage.text; read them so image prompts are not lost.
     static func caption(from message: TelegramMessage) -> String? {
         guard case .object(let extras)? = message.extras else { return nil }
         guard case .string(let cap)? = extras["caption"] else { return nil }
@@ -82,8 +72,7 @@ extension TelegramPollLoop {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// Only classify unsupported payloads; supported chat/voice owners and
-    /// the original caption remain authoritative for their existing paths.
+    /// Only classify unsupported payloads; supported chat/voice owners and the original caption remain authoritative for their existing paths.
     static func unsupportedAttachmentKind(from message: TelegramMessage) -> String? {
         guard case .object(let extras)? = message.extras else { return nil }
         if case .object(_)? = extras["video"] { return "video" }
@@ -95,7 +84,8 @@ extension TelegramPollLoop {
 
     func notifyUnsupportedAttachment(kind: String, update: TelegramUpdate, message: TelegramMessage) async {
         await emitAttachmentDroppedTrace(
-            kind: kind, reason: "unsupported_attachment_type", chatId: message.chatId, updateId: update.updateId
+            kind: kind, reason: "unsupported_attachment_type", chatId: message.chatId, updateId: update.updateId,
+            turn: nil
         )
         let notice = "I can't read that \(kind) in Telegram. Please send an image, PDF, TXT or MD file, or paste the relevant text."
         do {
@@ -108,7 +98,6 @@ extension TelegramPollLoop {
         }
     }
 
-    /// Prefer an advertised image MIME; otherwise resolve a known filename extension.
     static func imageMime(forFilename name: String?, fallbackMime: String?) -> String? {
         if let fallbackMime, fallbackMime.lowercased().hasPrefix("image/") {
             return fallbackMime.lowercased()
@@ -131,12 +120,12 @@ extension TelegramPollLoop {
             : photoMaxBytes
     }
 
-    /// Record attachment refusal with a token-redacted reason and no image bytes.
     func emitAttachmentDroppedTrace(
         kind: String,
         reason: String,
         chatId: Int,
-        updateId: Int
+        updateId: Int,
+        turn: Turn?
     ) async {
         let event = TurnTraceEvent(kind: "telegram.attachment_dropped",
             title: "telegram_attachment_dropped", status: "error", payload: .object([
@@ -145,12 +134,11 @@ extension TelegramPollLoop {
                 "chatId": .string(String(chatId)),
                 "updateId": .int(Int64(updateId)),
                 "surface": .string("telegram"),
-            ]), createdAt: _tgNowString())
+            ]), createdAt: _tgNowString(), turn: turn)
         await TurnTracePersistLane(dataRootOverride: dataRoot).append(event)
     }
 
-    /// Build a user-visible attachment refusal. The reason is
-    /// token-redacted and trimmed; never echoes raw bytes or the token.
+    /// Build a user-visible attachment refusal. The reason is token-redacted and trimmed; never echoes raw bytes or the token.
     static func attachmentDroppedNotice(for error: Error) -> String {
         if let mediaError = error as? TelegramMediaDownloadError {
             switch mediaError {

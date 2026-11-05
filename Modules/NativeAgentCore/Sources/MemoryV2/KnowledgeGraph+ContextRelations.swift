@@ -1,20 +1,5 @@
-// The graph half of clause-6 reach: typed relations as SELECTABLE context.
-//
-// `KnowledgeGraph+RelatedEntities.swift` answers "what does this recalled
-// memory touch?" for Context-off recall's `related:`
-// garnish. This file answers the question the resident index needs instead:
-// "what typed edges does the graph hold, ranked, so the selector can pull the
-// ones this message is actually about?" Nothing here injects anything; it hands
-// the projection a bounded, ordered list and stops.
-//
-// ── WHY ENTITY→ENTITY ONLY ───────────────────────────────────────────────────
-// `indexActiveFact` writes user-to-fact and structural mentions edges, excluded
-// here so memory text is not projected twice. Typed entity-to-entity claims
-// from Studio or imported graph data remain selectable under the same caps.
-//
-// ── PRIVACY ──────────────────────────────────────────────────────────────────
-// Entity NAMES only — never a memory body, never a fact node. The projection
-// publishes these at the same privacy/surface tier the memory lane defaults to.
+// Expose bounded, ranked entity-to-entity claims as selectable context, never injection. Exclude structural memory edges to avoid projecting memory text twice.
+// Return entity names only at the memory projection's privacy/surface tier.
 
 import Foundation
 import GRDB
@@ -22,7 +7,6 @@ import PersistenceCore
 import NativeAgentShared
 // Blueprint: | `KnowledgeGraph+ContextRelations.swift` | Bounded typed entity relations with disclosure and provenance evidence |
 
-/// One typed entity→entity edge, resolved to names.
 public struct KnowledgeGraphContextRelation: Sendable, Equatable {
     public let subjectID: String
     public let subject: String
@@ -31,23 +15,16 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
     public let object: String
     public let weight: Double
     public let mentionCount: Int
-    /// ISO-8601 `last_seen` of the fresher endpoint after validating both;
-    /// nil when absent or unavailable. Edges have no timestamp of their own.
+    /// Edges have no timestamp; use the fresher endpoint only after validating both, with nil for absent or unavailable evidence.
     public let lastSeen: String?
     /// Canonical endpoint validation failure; no sibling date can conceal it.
     public let sourceDateFailure: String?
-    /// The edge's `provenance` column — who claims it. Memory-derived edges
-    /// leave this nil; a studio edge says `studio-journal`.
+    /// Keep the edge's own provenance: studio claims name `studio-journal`; memory-derived edges leave it nil.
     public let provenance: String?
-    /// Journal entry ids asserting this edge, from
-    /// `metadata_json.studio_entry_ids`. Empty for every non-studio edge.
-    ///
-    /// Studio claims retain their journal evidence under the same reader, caps and endpoint scoping.
+    /// Studio claims retain journal entry IDs as evidence under the same reader, caps and endpoint scoping.
     public let journalEntryIDs: [String]
-    /// The memory that last asserted this edge (`last_memory_id`); nil for an
-    /// edge no memory wrote. The projection checks its disclosure and tracks it.
+    /// The memory that last asserted this edge (`last_memory_id`); nil for an edge no memory wrote. The projection checks its disclosure and tracks it.
     public let memoryID: String?
-    /// That memory's version (`updated_at`) when the edge was read.
     public let memoryVersion: String?
 
     public init(
@@ -83,20 +60,11 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
 
 extension SwiftNativeKnowledgeGraphIndexer {
 
-    /// Structural edge type written by `indexActiveFact` for every extracted
-    /// entity. It is plumbing, not a claim, and is never projected.
+    /// Structural mentions edges are plumbing rather than claims and must not be projected.
     static let structuralRelationType = "mentions"
 
-    /// Bounded, deterministically ordered typed relations for the resident
-    /// context index.
-    ///
-    /// Ordering is evidence-first (`mention_count` desc, then `weight` desc,
-    /// then a stable name/type tiebreak) so the caps keep the best-attested
-    /// edges. `perSubjectLimit` bounds how much one hub entity — User touches
-    /// most of the graph — can spend of `maximumRelations`.
-    ///
-    /// A missing database is an empty graph, not an error: nothing has been
-    /// indexed yet. A genuinely unreadable one throws, and the caller decides.
+    /// Evidence-first ordering keeps best-attested edges under caps; per-subject limits stop a hub consuming the whole budget. Missing storage means nothing
+    /// indexed; unreadable storage throws.
     public func contextRelations(
         perSubjectLimit: Int = 4,
         maximumRelations: Int = 192
@@ -115,8 +83,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             _ = try await reconcileMemoryIndexFingerprints()
         }
         let prefix = Self.memoryFactIDPrefix
-        // Read a bounded superset so the per-subject cap has something to
-        // choose from without ever streaming the whole edge table.
+        // Read a bounded superset so the per-subject cap has something to choose from without ever streaming the whole edge table.
         let readLimit = min(4_096, min(4_096, total) * 8)
         // Keep GRDB rows on the database executor; return only Sendable values.
         return try await dbPool.read { db in

@@ -2,9 +2,10 @@ import Darwin
 import Foundation
 import NativeAgentChromeRelayCore
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import MacControl
-// Blueprint: | `ChromeControlChannel.swift` | `ChromeControlChannel` actor, private socket/request ownership and shared offPool socket dispatch; ordered frames, cancellation/timeout settlement and unknown mutation outcomes; Chrome group tab authority, `ChromeConversationTab` values, document/inventory invalidation fences cached and pending page publication, host/URL/user-sequence snapshot admission, call-scoped pixels and mutation-backed page change streams |
+// Blueprint: | `ChromeControlChannel.swift` | `ChromeControlChannel`, `ChromeConversationTab`; Ordered socket effects; tab/document authority. |
 
 private final class ChromeSocketHandle: @unchecked Sendable {
     private let lock = NSLock()
@@ -31,7 +32,6 @@ private final class ChromeSocketHandle: @unchecked Sendable {
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
     }
 
-    /// The write side's own descriptor. Nil once the write queue has closed it.
     func writeFileHandle() -> FileHandle? {
         lock.lock()
         defer { lock.unlock() }
@@ -66,8 +66,7 @@ private final class ChromeSocketHandle: @unchecked Sendable {
     }
 }
 
-/// Cancellation and the write queue race for one dispatch decision. Once a
-/// write starts, cancellation cannot establish whether Chrome applied it.
+/// Once a write starts, cancellation cannot establish whether Chrome applied it.
 private final class ChromeRequestDispatch: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
@@ -81,7 +80,6 @@ private final class ChromeRequestDispatch: @unchecked Sendable {
         return true
     }
 
-    /// Suppress an unstarted frame, returning whether dispatch already began.
     @discardableResult
     func cancel() -> Bool {
         lock.lock()
@@ -170,13 +168,13 @@ actor ChromeControlChannel {
         self.onDisconnect = onDisconnect
     }
 
-    func start() {
+    func start(context: MacOperationContext) {
         guard !closed, readTask == nil, let handle = socket.fileHandle() else { return }
         driverTask = Task { [weak self] in
             let changes = await MacAttentionSessionStore.shared.driverChanges()
             for await _ in changes {
                 guard !Task.isCancelled else { return }
-                await self?.yieldInvalidDriver()
+                await self?.yieldInvalidDriver(context: context)
             }
         }
         let framer = self.framer
@@ -191,7 +189,7 @@ actor ChromeControlChannel {
                     let value: JSONValue = try autoreleasepool {
                         try JSONValue(fromFoundation: framer.validateJSONObject(data))
                     }
-                    await self?.receive(value)
+                    await self?.receive(value, context: context)
                 }
                 await self?.connectionEnded(error: ChromeControlRuntimeError.disconnected)
             } catch {
@@ -200,13 +198,13 @@ actor ChromeControlChannel {
         }
     }
 
-    func request(action: ChromeControlEffect, payload: [String: JSONValue]) async throws -> JSONValue {
-        // Her tab group yields to explicit takeover, not the person's input.
-        if action.requiresDriver, MacDriverContext.binding?.allowsBackgroundEmission != true {
-            return Self.driverTakeoverResult(action: action, payload: payload, dispatched: false)
+    func request(action: ChromeControlEffect, payload: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
+        // Tab ownership yields only to explicit takeover, so the person's input does not release it.
+        if action.requiresDriver, context.driver?.allowsBackgroundEmission(context: context) != true {
+            return Self.driverTakeoverResult(action: action, payload: payload, dispatched: false, context: context)
         }
-        yieldInvalidDriver()
-        if action.requiresDriver { actionDriver = MacDriverContext.binding }
+        yieldInvalidDriver(context: context)
+        if action.requiresDriver { actionDriver = context.driver }
         guard !closed, socket.isOpen else {
             throw ChromeControlRuntimeError.disconnected
         }
@@ -224,29 +222,28 @@ actor ChromeControlChannel {
         return try await withTaskCancellationHandler {
             let timeout = Task { [weak self, requestTimeout] in
                 try? await Task.sleep(for: requestTimeout)
-                await self?.timeoutRequest(id)
+                await self?.timeoutRequest(id, context: context)
             }
             pending[id] = Pending(
                 expectedAction: action,
                 tabID: { if case .int(let id)? = payload["tabId"] { id } else { nil } }(),
                 targetReceipt: payload.filter { ["snapshotId", "nodeId", "targetNodeId", "url", "tabId", "expectedUserSequence"].contains($0.key) },
-                driver: action.requiresDriver ? MacDriverContext.binding : nil,
+                driver: action.requiresDriver ? context.driver : nil,
                 response: response,
                 timeout: timeout,
                 dispatch: dispatch
             )
-            enqueueWrite(data, dispatch: dispatch, driver: action.requiresDriver ? MacDriverContext.binding : nil) { [weak self] error in
+            enqueueWrite(data, dispatch: dispatch, driver: action.requiresDriver ? context.driver : nil, context: context) { [weak self] error in
                 Task { await self?.failWrite(id: id, error: error) }
             }
             // A dispatched effect must settle even when its caller is cancelled.
             let done = response.done
-            await Task { await done.park() }.value
+            await Task { await done.park(budget: .init()) }.value
             return try response.result!.get()
         } onCancel: {
-            // Invalidate synchronously: the actor may not service cancellation
-            // before the serial socket queue reaches this frame.
+            // Invalidate synchronously before the socket queue can outrun actor cancellation.
             dispatch.cancel()
-            Task { await self.cancelRequest(id) }
+            Task { await self.cancelRequest(id, context: context) }
         }
     }
 
@@ -261,39 +258,39 @@ actor ChromeControlChannel {
         failPending(error)
     }
 
-    private func yieldInvalidDriver() {
+    private func yieldInvalidDriver(context: MacOperationContext) {
         guard actionDriver?.handedBack == true else { return }
         actionDriver = nil
         let yielded = pending.filter { $0.value.driver?.handedBack == true }
         for (id, row) in yielded {
             if row.dispatch.cancel() {
-                cancelAction(id)
+                cancelAction(id, context: context)
                 continue // Receive merges the settled evidence into the yield.
             }
             pending.removeValue(forKey: id)
             row.timeout?.cancel()
             complete(row.response, .success(Self.driverTakeoverResult(
-                action: row.expectedAction, payload: row.targetReceipt, dispatched: false)))
+                action: row.expectedAction, payload: row.targetReceipt, dispatched: false, context: context)))
         }
     }
 
     private static func driverTakeoverResult(
-        action: ChromeControlEffect, payload: [String: JSONValue], dispatched: Bool
+        action: ChromeControlEffect, payload: [String: JSONValue], dispatched: Bool,
+        context: MacOperationContext
     ) -> JSONValue {
         .object(["result": .object(payload.merging([
             "status": .string("yielded_to_user"),
             "action": .string(action.rawValue),
             "tabId": payload["tabId"] ?? .null,
             "outcome": .string(dispatched && action.mayChangeExternalState ? "outcome_unknown" : "not_performed"),
-            "message": .string(MacAttentionSessionStore.driverRefusal),
+            "message": .string(MacAttentionSessionStore.driverRefusal(context: context)),
         ]) { _, new in new })])
     }
 
     func tabs() -> [Int64: ChromeConversationTab] { ownTabs }
 
     func existingPageAddress(host: String, tabID: Int64?) throws -> [String: JSONValue] {
-        // Addressing comes from current ownership, not a previous capture.
-        // The ensuing read proves which documents are actually readable.
+        // Current ownership supplies addressing; the ensuing read proves document readability.
         let matches = ownTabs.compactMap { id, tab -> (Int64, JSONValue)? in
             guard tabID == nil || tabID == id,
                   let url = tab.url,
@@ -303,14 +300,14 @@ actor ChromeControlChannel {
         guard matches.count == 1, let (id, sequence) = matches.first else {
             throw ChromeControlRuntimeError.conversationContext(matches.isEmpty
                 ? "No owned Chrome tab is available for \(host)."
-                : "More than one of her Chrome pages matches \(host); name the tab to read.")
+                : "More than one of the agent's Chrome pages matches \(host); name the tab to read.")
         }
         return ["tab_id": .int(id), "expected_user_sequence": sequence]
     }
 
     func pageChanges(host: String, tabID: Int64) throws -> AsyncThrowingStream<JSONValue, Error> {
         guard ownTabs[tabID] != nil else {
-            throw ChromeControlRuntimeError.conversationContext("The Chrome page observation needs one of her tabs.")
+            throw ChromeControlRuntimeError.conversationContext("The Chrome page observation needs one of the agent's tabs.")
         }
         if host != "*" { _ = try existingPageAddress(host: host, tabID: tabID) }
         let id = UUID()
@@ -334,8 +331,7 @@ actor ChromeControlChannel {
 
     private func invalidatePageSnapshot(tabID: Int64) {
         pageSnapshots.removeValue(forKey: tabID)
-        // A read still returns what it read, but cannot republish an old
-        // document after the ordered invalidation event or inventory edge.
+        // Return the read but fence publication after ordered document or inventory invalidation.
         for id in Array(pending.keys) where pending[id]?.tabID == tabID {
             pending[id]?.mayPublishPage = false
         }
@@ -360,7 +356,7 @@ actor ChromeControlChannel {
         } else { pageSnapshots.removeAll(); pageGenerations.removeAll() }
     }
 
-    private func receive(_ value: JSONValue) async {
+    private func receive(_ value: JSONValue, context: MacOperationContext) async {
         guard case .object(let object) = value,
               case .int(1)? = object["version"],
               case .string(let type)? = object["type"] else {
@@ -368,7 +364,7 @@ actor ChromeControlChannel {
             return
         }
         if type == "event" {
-            await applyEvent(object)
+            await applyEvent(object, context: context)
             return
         }
         guard type == "response", case .string(let id)? = object["id"],
@@ -377,9 +373,7 @@ actor ChromeControlChannel {
               case .bool(let ok)? = object["ok"],
               (ok && object["result"] != nil && object["error"] == nil)
                 || (!ok && object["result"] == nil && object["error"] != nil) else {
-            // A response id alone is not proof that this is the effect we
-            // dispatched. Close the channel so a mismatched/replayed envelope
-            // cannot settle the wrong action or settle the wrong tab action.
+            // A response id alone cannot bind an effect; close on replay or mismatch to avoid settling another action.
             connectionEnded(error: ChromeControlRuntimeError.invalidResponse)
             return
         }
@@ -387,8 +381,8 @@ actor ChromeControlChannel {
         row.timeout?.cancel()
         if !ok, row.driver?.handedBack == true {
             complete(row.response, .success(Self.driverTakeoverResult(
-                action: row.expectedAction, payload: row.targetReceipt, dispatched: true)))
-            yieldInvalidDriver()
+                action: row.expectedAction, payload: row.targetReceipt, dispatched: true, context: context)))
+            yieldInvalidDriver(context: context)
             return
         }
         if ok {
@@ -396,8 +390,8 @@ actor ChromeControlChannel {
                 var receipt = row.targetReceipt
                 if case .object(let result)? = object["result"] { receipt.merge(result) { _, new in new } }
                 complete(row.response, .success(Self.driverTakeoverResult(
-                    action: row.expectedAction, payload: receipt, dispatched: true)))
-                yieldInvalidDriver()
+                    action: row.expectedAction, payload: receipt, dispatched: true, context: context)))
+                yieldInvalidDriver(context: context)
                 return
             }
             if case .object(let result)? = object["result"] {
@@ -461,7 +455,7 @@ actor ChromeControlChannel {
         }
     }
 
-    private func applyEvent(_ object: [String: JSONValue]) async {
+    private func applyEvent(_ object: [String: JSONValue], context: MacOperationContext) async {
         if object["event"] == .string("extension.reload_failed"),
            case .object(let payload)? = object["payload"],
            case .string(let id)? = payload["reloadId"], id.utf8.count <= 128,
@@ -473,7 +467,9 @@ actor ChromeControlChannel {
            case .array(let values)? = payload["tabs"] {
             guard let projected = ChromeConversationTab.inventory(values, previous: ownTabs) else { return }
             for id in ownTabs.keys where projected[id] == nil {
-                endPageObservers(tabID: id, error: ChromeControlRuntimeError.extensionRejected(code: "tab_not_owned", message: "This tab is outside the NativeAgent group."))
+                endPageObservers(
+                    tabID: id,
+                    error: ChromeControlRuntimeError.extensionRejected(code: "tab_not_owned", message: "This tab is outside the NativeAgent group."))
                 NotificationCenter.default.post(name: Notification.Name("NativeAgentChromeTabEnded"), object: nil,
                     userInfo: ["tabId": id, "closed": false])
             }
@@ -502,13 +498,12 @@ actor ChromeControlChannel {
             }
             let error = ChromeControlRuntimeError.extensionRejected(code: "tab_not_owned", message: message)
             endPageObservers(tabID: tabID, error: error)
-            // Every end of ownership is one yield (a close yields first, reason
-            // tab_closed); the closing confirmation is not a second release.
+            // Closing already yields ownership as tab_closed; its confirmation must not release it twice.
             if event == "tab.yielded" { await onTabReleased(released) }
             let interrupted = pending.filter { $0.value.tabID == tabID && $0.value.expectedAction != .closeTab }
             for (id, row) in interrupted {
                 if row.dispatch.cancel() {
-                    cancelAction(id)
+                    cancelAction(id, context: context)
                     continue // Retain any partial page reply through settlement.
                 }
                 pending.removeValue(forKey: id); row.timeout?.cancel()
@@ -536,25 +531,20 @@ actor ChromeControlChannel {
         }
     }
 
-    /// Hand one frame to the serial write queue. The failure callback fires
-    /// only when the write itself threw; a request already settled by timeout
-    /// or cancellation no longer has a row and is left alone.
+    /// Write errors affect only pending rows; timeout or cancellation may already have settled the request.
     private nonisolated func enqueueWrite(
         _ data: Data,
         dispatch: ChromeRequestDispatch? = nil,
         driver: MacDriverBinding? = nil,
-        onFailure: @escaping @Sendable (Error) -> Void
-    ) {
+        context: MacOperationContext, onFailure: @escaping @Sendable (Error) -> Void) {
         let framer = self.framer
         let socket = self.socket
         writeQueue.async {
             if let driver, driver.handedBack {
-                onFailure(ChromeControlRuntimeError.conversationContext(MacAttentionSessionStore.driverRefusal))
+                onFailure(ChromeControlRuntimeError.conversationContext(MacAttentionSessionStore.driverRefusal(context: context)))
                 return
             }
-            // The descriptor is taken here, on the queue, not when the write
-            // was enqueued: after teardown there is none, and the frame is
-            // dropped instead of written to a reused descriptor number.
+            // Take the descriptor on the queue so teardown cannot redirect a frame to a reused descriptor.
             guard let handle = socket.writeFileHandle() else {
                 onFailure(ChromeControlRuntimeError.disconnected)
                 return
@@ -578,36 +568,32 @@ actor ChromeControlChannel {
     private func failWrite(id: String, error: Error) {
         guard let row = pending.removeValue(forKey: id) else { return }
         row.timeout?.cancel()
-        // FileHandle may report a write failure after a frame prefix or payload
-        // reached the relay. For an effect, transport failure is therefore not
-        // proof that Chrome did nothing and must not invite a blind retry.
+        // A failed write may have reached the relay; preserve uncertainty rather than invite a blind retry.
         complete(row.response, .failure(row.unconfirmedFailure(error)))
     }
 
-    private func timeoutRequest(_ id: String) {
+    private func timeoutRequest(_ id: String, context: MacOperationContext) {
         guard let row = pending.removeValue(forKey: id) else { return }
         row.timeout?.cancel()
-        if row.dispatch.cancel() { cancelAction(id) }
+        if row.dispatch.cancel() { cancelAction(id, context: context) }
         complete(row.response, .failure(row.unconfirmedFailure(ChromeControlRuntimeError.requestTimedOut)))
     }
 
-    private func cancelAction(_ id: String) {
+    private func cancelAction(_ id: String, context: MacOperationContext) {
         let cancellation = JSONValue.object([
             "version": .int(1), "type": .string("event"), "event": .string("action.cancel"),
             "occurredAt": .string(ISO8601DateFormatter().string(from: Date())),
             "payload": .object(["requestId": .string(id)]),
         ])
-        if let data = try? cancellation.serializedData(pretty: false) { enqueueWrite(data) { _ in } }
+        if let data = try? cancellation.serializedData(pretty: false) { enqueueWrite(data, context: context) { _ in } }
     }
 
-    private func cancelRequest(_ id: String) {
+    private func cancelRequest(_ id: String, context: MacOperationContext) {
         guard let row = pending[id] else { return }
         let started = row.dispatch.cancel()
         if started {
-            cancelAction(id)
-            // Keep the one waiter until Chrome settles the dispatched work,
-            // including partial typing output. The existing deadline still
-            // bounds a missing reply and reports its outcome as unknown.
+            cancelAction(id, context: context)
+            // Await dispatched work, including partial typing; a missing reply ends as unknown at the request deadline.
             return
         }
         pending.removeValue(forKey: id)

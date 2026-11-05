@@ -28,12 +28,11 @@ never creates missing signing authority.
 
 Security effect profiling requires the addressed contact's readable transport
 and host recipe. Unknown contact classification blocks admission, and advisory
-risk reads say `unavailable`. Trust uses `workshopPolicy` on both devices; the
-alternate Mission key and its folding adapter are removed. Audit retention
-appends current receipts without the completed pre-retention archival migration;
-existing archive files remain untouched. Unrecognized call inputs are withheld
-by the generic redaction boundary; the current folded `card.answer` executor
-keeps its typed value protection without a retired-name table.
+risk reads say `unavailable`. Audit retention appends current receipts without
+the completed pre-retention archival migration; existing archive files remain
+untouched. Unrecognized call inputs are withheld by the generic redaction
+boundary; the current folded `card.answer` executor keeps its typed value
+protection without a retired-name table.
 
 > One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
 
@@ -60,7 +59,8 @@ Source: [NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/EngineRunti
 ## Conversation surfaces
 
 - **Mac:** streaming chat, sessions and queued follow-ups; Simple, Advanced
-  and Agent views. Agent view is read-only.
+  and Agent views. Agent Home draws their shared face with row actions; the
+  other Agent rooms remain read-only.
 - **iPhone/iPad:** a companion using signed iCloud transport to the Mac.
   The Mac must remain awake with NativeAgent open to answer.
   Optional phone senses and their setup evidence share one bounded owner;
@@ -785,37 +785,12 @@ See [Cognition wiring](COGNITION_WIRING.md) and [Organism](ORGANISM.md).
 ## Desk and directed work
 
 Desk holds durable work identity, hierarchy, dependencies, schedules, progress
-and outcomes. Its execution path retains checkpoints, approvals and verification.
-Workshop admission reports active-plus-pending capacity overflow as invalid configuration.
-Planner calls declare no separate elapsed-time ceiling; provider/transport
-termination and caller cancellation own their lifetime.
-Execution reads and mutations require a faithful checked record, including every
-plan row and field; damaged records remain byte-preserved and cannot be admitted
-or rewritten as empty work.
-Synthesis uses the turn owner's completed-return contract and explicit
-`expected_outputs` evidence. English phrases, text length and instructions
-quoted in objective prose never create refusal or exact-equality verdicts.
-Verification classifies resolved action calls through `PermissionLaw`, as
-dispatch does; read-like names cannot exempt writes from effect verification.
+and outcomes. A task the person starts becomes a Desk item carried by a line of
+theirs, and their jobs are its movement ([Desk](DESK.md)).
 Pursuit feed rows and compaction snapshots share checked reservation accounting;
 unrepresentable totals refuse decoding before scheduling can use them.
 Pursuit `maxDays` is an elapsed-day lifetime from `openedAt`: selection and
-reservation refuse expired work, and sessions enforce its remaining wall-clock
-bound separately from their default 600-second active-work deadline, which renews
-on progress and pauses during human waits. The existing pump deadline wakes
-budget-exhaustion closure at expiry.
-Workshop uses Desk's unresolved-receipt interpretation: acceptance, running work,
-unknown effects and unsatisfied verification block dependent steps while the
-original receipt and owner references remain available for reconciliation.
-Every blocked Workshop session disposition blocks its Desk item, including
-timeout, failed turns and missing progress reports, using the actual receipt cause.
-Directed submission reports an accepted execution ID if Desk linkage fails;
-terminal reconciliation restores that execution's exact Desk trace association
-before settling it, without submitting the work again.
-Directed reconciliation appends missing receipts from one locked feed snapshot
-before checking each execution's Desk settlement marker.
-Link repair is idempotent under Desk's lock and compares canonical acceptance
-timestamps, so repairing an older execution cannot supersede newer linked work.
+reservation refuse expired work.
 A held row reflects its current blocker or defer, rather than a new stored
 task status.
 An absent hold file starts empty; unreadable or malformed hold state refuses

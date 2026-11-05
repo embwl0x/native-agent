@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `NativeAgentPublicSafety.swift` | `NativeAgentPublicSafety`: canonical onboarding completion and neutral organism admission before resident cognition wakes |
+// Blueprint: | `NativeAgentPublicSafety.swift` | `NativeAgentPublicSafety`. |
 
 public enum NativeAgentPublicSafety {
     public static let publicSafeModeEnvironmentKey = "NATIVEAGENT_PUBLIC_SAFE_MODE"
@@ -26,8 +26,7 @@ public enum NativeAgentPublicSafety {
 
     public static func hasCompletedOnboarding(dataRoot: URL) -> Bool {
         let fm = FileManager.default
-        // Pending completion or reset must finish before resident cognition
-        // wakes. Reset can still carry the previous completion sentinel.
+        // Finish pending setup or reset before cognition wakes; reset may still retain the previous completion sentinel.
         for pending in ["pending-completion.json", "pending-reset.json"] {
             if fm.fileExists(atPath: dataRoot
                 .appendingPathComponent("onboarding", isDirectory: true)

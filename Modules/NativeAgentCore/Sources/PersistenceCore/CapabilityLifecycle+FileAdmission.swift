@@ -10,9 +10,8 @@ extension CapabilityLifecycle {
                                            "quarantinedAt", "quarantinedStatus", "quarantineReason", "quarantinePath",
                                            "unavailableReason", "retired", "suspended"]
 
-    /// Raw file mutations cannot bypass the ability lifecycle, including by
-    /// replacing a parent folder. Other protected stores recheck the turn's steer.
-    public static func requireFileMutation(_ path: URL, dataRoot: URL, personaRoot: URL? = nil) throws {
+    /// Raw file mutations cannot bypass the ability lifecycle, including by replacing a parent folder. Other protected stores recheck the turn's steer.
+    public static func requireFileMutation(_ path: URL, dataRoot: URL, personaRoot: URL? = nil, turn: Turn?) throws {
         let path = path.standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
         func reaches(_ store: URL) -> Bool {
             let store = store.standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
@@ -23,7 +22,7 @@ extension CapabilityLifecycle {
             .flatMap { root in Store.allCases.map { $0.directory(in: root) } + [root.appendingPathComponent("abilities")] }
         if abilities.contains(where: reaches) || protectedStores.contains(where: { reaches(dataRoot.appendingPathComponent($0)) })
             || reaches(personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)) {
-            try requireWrite()
+            try requireWrite(turn: turn)
         }
         if abilities.contains(where: reaches) {
             throw PersistenceCoreError.ioFailure("Ability stores require lifecycle actions; use the sense, tool or skill action for this change.")
@@ -35,15 +34,16 @@ extension CapabilityLifecycle {
                                      disabledBy: row["disabledBy"]?.stringValue)
     }
 
-    /// Reconcile under the registry lock. Off ownership belongs to the ability,
-    /// not its selected version or the snapshot an upgrade was assembled from.
+    /// Reconcile under the registry lock. Off ownership belongs to the ability, not its selected version or the snapshot an upgrade was assembled from.
     public static func preservingOwnerOff(_ proposed: [String: JSONValue], before current: [String: JSONValue]?,
-                                          ownerAuthorized: Bool = false, enabling: Bool = false, preview: Bool = false) throws -> [String: JSONValue] {
+                                          ownerAuthorized: Bool = false, enabling: Bool = false, preview: Bool = false,
+                                          turn: Turn?) throws -> [String: JSONValue] {
         let key = proposed["state"] == nil ? "status" : "state"
         if let attribution = current?["disabledBy"], attribution != .null,
            !offActors.contains(attribution.stringValue ?? "") {
             let name = current?["id"]?.stringValue ?? "The ability"
-            throw PersistenceCoreError.ioFailure("\(name)'s off ownership is unreadable: its registry entry says disabledBy \((try? attribution.serialize(pretty: false)) ?? "?"). "
+            throw PersistenceCoreError.ioFailure(
+                "\(name)'s off ownership is unreadable: its registry entry says disabledBy \((try? attribution.serialize(pretty: false)) ?? "?"). "
                 + "Set disabledBy to who switched it off (owner, hers or peer; owner when unsure) before changing it. Nothing changed.")
         }
         let ownerOff = current.map(requiresOwnerToEnable) ?? false
@@ -63,28 +63,31 @@ extension CapabilityLifecycle {
             }
             row["disabledBy"] = .string("owner")
         } else {
-            // Off belongs to the owner when he acts, else the recorded non-owner actor, else hers.
+            // Off belongs to the owner when the owner acts, else the recorded non-owner actor, else the agent.
             let recorded = row["disabledBy"]?.stringValue.flatMap { offActors.contains($0) && $0 != "owner" ? $0 : nil }
             row["disabledBy"] = offStatuses.contains(row[key]?.stringValue ?? "") ? .string(ownerAuthorized ? "owner" : recorded ?? "hers") : nil
             if enabling, !offStatuses.contains(row[key]?.stringValue ?? "") {
                 for field in retirementFields { row.removeValue(forKey: field) }
             }
         }
-        if !preview, abilityContents(.object(row)) != abilityContents(current.map(JSONValue.object) ?? .null) { try requireWrite() }
+        if !preview, abilityContents(.object(row)) != abilityContents(current.map(JSONValue.object) ?? .null) { try requireWrite(turn: turn) }
         return row
     }
 
     public static func preservingOwnerOff<Record: Codable>(_ proposed: Record, before current: Record?,
-                                                           ownerAuthorized: Bool = false, enabling: Bool = false, preview: Bool = false) throws -> Record {
+                                                           ownerAuthorized: Bool = false, enabling: Bool = false, preview: Bool = false,
+                                                           turn: Turn?) throws -> Record {
         let row = try preservingOwnerOff(JSONRow(JSONValue.fromEncodable(proposed)).fields,
-            before: current.map { try JSONRow(JSONValue.fromEncodable($0)).fields }, ownerAuthorized: ownerAuthorized, enabling: enabling, preview: preview)
+            before: current.map { try JSONRow(JSONValue.fromEncodable($0)).fields }, ownerAuthorized: ownerAuthorized,
+            enabling: enabling, preview: preview, turn: turn)
         return try JSONDecoder().decode(Record.self, from: JSONValue.object(row).serializedData(pretty: false))
     }
 
     /// Selected part/sense rows share one rule; a new sense id retains its corner's owner-off attribution.
     public static func preservingOwnerOff(_ proposed: JSONValue, before current: JSONValue,
-                                          ownerAuthorized: Bool = false, enabling: Bool = false, senseRecords: Bool = false) throws -> JSONValue {
-        if abilityContents(proposed) != abilityContents(current) { try requireWrite() }
+                                          ownerAuthorized: Bool = false, enabling: Bool = false, senseRecords: Bool = false,
+                                          turn: Turn?) throws -> JSONValue {
+        if abilityContents(proposed) != abilityContents(current) { try requireWrite(turn: turn) }
         if case .array(let rows) = proposed {
             let previous = current.arrayValue ?? current.objectValue?["tools"]?.arrayValue ?? current.objectValue?["skills"]?.arrayValue ?? []
             return .array(try rows.map { value in
@@ -95,14 +98,13 @@ extension CapabilityLifecycle {
                         : previous.compactMap(\.objectValue).first { $0["corner"] == row["corner"] && requiresOwnerToEnable($0) })
                 if old == row { return value }
                 return .object(try preservingOwnerOff(row, before: old, ownerAuthorized: ownerAuthorized,
-                    enabling: enabling))
+                    enabling: enabling, turn: turn))
             })
         }
         return proposed
     }
 
-    /// Usage evidence is not an ability edit. Only these existing row fields
-    /// are accounting; unknown fields and all program/fixture bytes stay protected.
+    /// Usage evidence is not an ability edit. Only these existing row fields are accounting; unknown fields and all program/fixture bytes stay protected.
     private static func abilityContents(_ value: JSONValue) -> JSONValue {
         switch value {
         case .array(let rows): return .array(rows.map(abilityContents))

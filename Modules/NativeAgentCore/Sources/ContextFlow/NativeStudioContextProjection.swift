@@ -6,70 +6,26 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 
-// Blueprint: | `NativeStudioContextProjection.swift` | `StudioContext`: rebuildable journal/canon pointer atoms and invalidation; judgments remain behind on-demand pointers |
+// Blueprint: | `NativeStudioContextProjection.swift` | `StudioContext`: bounded journal/canon pointers; judgments stay on demand |
 
-/// The studio journal, made REACHABLE — as a POINTER, never as the judgment.
-///
-/// ── WHAT AN ATOM SAYS ────────────────────────────────────────────────────────
-/// One short line per journal entry: the work, its creator, its medium, the
-/// entry id, the stance, and how to pull the entry itself. It does NOT carry the
-/// response — the judgment is the point, and a paragraph of it in every packet
-/// would be prompt mass wearing reach's name. Clause 6: selectable, expandable,
-/// one pull away. The pull is `studio_recall`, which returns the entry verbatim.
-///
-/// Her own words for why the body stops here: "my first contact should be with
-/// the work, not a prediction of my reaction." A pointer cannot pre-empt the
-/// encounter; a pasted judgment can.
-///
-/// ── WHAT SELECTS AN ATOM ─────────────────────────────────────────────────────
-/// The work TITLE, the CREATOR, and the MEDIUM. Nothing else — not the response,
-/// not the stance, not a tag. Those three are published as
-/// `ContextCorrectionScope.studioEntityKind` entities, which is also what GATES
-/// eligibility, so an unnamed work is `outsideContextScope` outright rather than
-/// left to rank low. The second admission is
-/// `ContextCorrectionScope.isTasteJudgmentTask` — a design review or an
-/// aesthetic call, where the pointer is relevant without the work being named.
-/// An ops turn is neither, and that is deliberate: "if it shows up on ops turns
-/// I'll learn to ignore it, and ignored is worse than absent."
-///
-/// ── ARTIFACT REFS ────────────────────────────────────────────────────────────
-/// Rendered as TEXT, never dereferenced. Nothing in this file opens a path or
-/// fetches a URL; a ref is a string the line happens to contain. Honest
-/// encounters are made in front of the work, through the vision/browser organs,
-/// never by a context projection quietly reading a file.
-///
-/// ── NO SCORES ────────────────────────────────────────────────────────────────
-/// Every pointer carries the same neutral confidence. There is no rating on a
-/// journal entry and there will not be one here either: ranking her judgments
-/// against each other is the taste score the whole design refuses to keep.
-///
-/// ── BOUNDS ───────────────────────────────────────────────────────────────────
-/// Per work (`maximumEntriesPerWork`), total (`maximumPointers`), and body shape
-/// (one line, capped bytes). A work she keeps returning to cannot flood the
-/// index, and the `.evidence` kind cap bounds how much of a packet these can
-/// ever take.
-///
-/// ── FAILURE ──────────────────────────────────────────────────────────────────
-/// Missing stores are empty. Unreadable stores retain published pointers for
-/// rebuilding, but selection and expansion withhold them with an unavailable
-/// receipt. Healthy independent Studio sources keep circulating.
+/// Keep judgments behind selectable pointers so context cannot pre-empt encountering the work. Title, creator and medium gate eligibility; taste-judgment tasks
+/// also admit pointers, while unrelated operations do not. Artifact refs remain text: only vision/browser organs may open the work. Neutral confidence avoids
+/// ranking judgments as taste scores. Per-work, total and body caps prevent repeated encounters with one work from flooding the packet. Unreadable sources
+/// retain rebuild inputs but withhold unverified pointers; healthy independent sources still circulate. Missing stores start empty; unreadable sources cannot
+/// become evidence that no entries exist.
 struct StudioContext: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.studio"
     static let schemaVersion = "studio-context-projection-v2"
-    /// The invalidation namespace the studio tool lane publishes on after a
-    /// journal append, so a just-filed entry is reachable on the NEXT turn
-    /// rather than after the next launch.
+    /// Journal appends invalidate this namespace so a new entry is reachable on the next turn.
     static let invalidationNamespace = "studio"
     static let maximumPointers = 96
     static var canonSourceID: ContextSourceID { ContextStableID.source(owner: owner, locator: "studio/canon") }
     static var shelfSourceID: ContextSourceID { ContextStableID.source(owner: owner, locator: "studio/working_shelf") }
     static let maximumEntriesPerWork = 3
-    /// One neutral value for every pointer. See "NO SCORES" above.
+    /// All pointers share neutral confidence to avoid scoring judgments.
     static let pointerConfidence = 0.5
 
-    /// Same tier the memory lane defaults to for a `local_private` record:
-    /// User's authenticated personal surfaces, never Slack. Her aesthetic life is
-    /// private by default and this is the line that keeps it that way.
+    /// Personal-surface disclosure keeps aesthetic life private by default and off Slack.
     static let surfaces: Set<ContextSurface> = Set(
         MemoryRecordDisclosurePolicy.localPrivateSurfaces.map(ContextSurface.init(rawValue:))
     )
@@ -163,8 +119,7 @@ struct StudioContext: ContextCompiledProjectionProvider, Sendable {
 }
 
 extension StudioContext {
-    /// One line in the existing Studio projection, independent of journal availability.
-    /// Keeping its own bounded atom preserves both the exact titles and journal pointers.
+    /// A separate bounded atom preserves exact titles and journal pointers independently of journal availability.
     static func prepareShelfPointer(_ slots: [StudioWorkingShelf.Slot]) -> ContextCompiledSource? {
         guard !slots.isEmpty else { return nil }
         let line = "Working shelf: " + slots.map(\.title).joined(separator: "; ") + "; open with app studio.shelf"
@@ -187,9 +142,7 @@ extension StudioContext {
         return ContextCompiledSource(descriptor: descriptor, sourceHash: sourceHash, atoms: [atom])
     }
 
-    /// One source per WORK, one atom per entry about it. Grouping this way lets
-    /// the selector's existing `maximumAtomsPerSource` bound keep a work she has
-    /// returned to five times from owning the whole studio budget of a packet.
+    /// Group entries by work so maximumAtomsPerSource prevents one revisited work consuming the studio budget.
     static func prepare(
         _ entries: [StudioJournalEntry]
     ) -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
@@ -206,8 +159,7 @@ extension StudioContext {
         var failures: [ContextSourceID: String] = [:]
         for key in grouped.keys.sorted() {
             guard remaining > 0, let all = grouped[key], !all.isEmpty else { continue }
-            // Newest first inside a work: the entry that revised her mind is the
-            // one worth reaching before the one it revised.
+            // Newest first: reach the entry that revised the judgment before the one it revised.
             let ordered = Array(
                 all.sorted { lhs, rhs in
                     if lhs.recordedAt != rhs.recordedAt { return lhs.recordedAt > rhs.recordedAt }
@@ -253,13 +205,7 @@ extension StudioContext {
         return (result, failures)
     }
 
-    /// ONE source for the whole canon, one atom per member.
-    ///
-    /// The canon is small by construction (it is earned, and demotion proposals
-    /// keep it from only growing), so it does not need the per-work grouping the
-    /// journal uses. Selection is identical: title / creator / medium-free
-    /// entities and triggers, so a canon pointer reaches a turn on exactly the
-    /// same admission rule as a journal pointer and never on an ops turn.
+    /// The earned, demotable canon stays small enough for one source; its pointers share journal admission rules.
     static func prepareCanon(_ members: [StudioCanonMember]) throws -> ContextCompiledSource? {
         let usable = members.filter { member in
             let body = canonBody(member)
@@ -302,10 +248,7 @@ extension StudioContext {
         )
     }
 
-    /// A POINTER, exactly like the journal's. It says the work holds (or does
-    /// not), since when, how many entries argued for it, and how to pull them.
-    /// The judgment itself stays in the journal — a canon pointer must not
-    /// become a shortcut past re-reading what she actually wrote.
+    /// Keep judgments in the journal; canon pointers must lead back to the original entries.
     static func canonBody(_ member: StudioCanonMember) -> String {
         let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(member.workTitle), to: 120)
         guard !title.isEmpty else { return "" }
@@ -325,14 +268,12 @@ extension StudioContext {
         return parts.joined(separator: " · ")
     }
 
-    /// Title + creator, folded — two entries about the same work by the same
-    /// hand are the same work however they were capitalised.
+    /// Fold title and creator so capitalization cannot split the same work's identity.
     static func workKey(_ work: StudioWork) -> String {
         [fold(work.title), fold(work.creator ?? "")].joined(separator: "\u{1f}")
     }
 
-    /// The whole atom body: a POINTER, not the judgment. The `response` is
-    /// deliberately absent — see the file note.
+    /// Omit the response so a pointer cannot pre-empt the judgment.
     static func body(_ entry: StudioJournalEntry) -> String {
         let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(entry.work.title), to: 120)
         guard !title.isEmpty else { return "" }
@@ -344,14 +285,11 @@ extension StudioContext {
             head += " (" + NativeContextProjectionText.bounded(medium, to: 48) + ")"
         }
         var parts = [head, "journal \(entry.id)", "stance \(entry.stance.kind.rawValue)"]
-        // A corrected entry SAYS so on the pointer. Without this the model
-        // reaches an entry whose claim she has already withdrawn and has no way
-        // to know before it pulls — the correction would be durable and
-        // unreachable, the exact failure this projection exists to prevent.
+        // Mark withdrawn claims on the pointer so corrections are visible before the entry is pulled.
         if let latest = entry.amendments.last {
             parts.append("corrected \(latest.amendedOn)")
         }
-        // TEXT ONLY. Nothing in this file opens this path or fetches this URL.
+        // Refs stay text; context projection cannot open a path or fetch a URL.
         if let ref = entry.artifactRefs.first.map(NativeContextProjectionText.clean), !ref.isEmpty {
             parts.append("ref \(NativeContextProjectionText.bounded(ref, to: 120))")
         }
@@ -397,10 +335,7 @@ extension StudioContext {
         )
     }
 
-    /// Title, creator, medium — the three selection keys, and only those. They
-    /// carry `ContextCorrectionScope.studioEntityKind`, which is what gates
-    /// eligibility, so an entry whose work this message never named is excluded
-    /// outright with an honest `outsideContextScope` receipt.
+    /// Gate eligibility on title, creator and medium so unnamed works are excluded rather than merely ranked lower.
     static func entities(_ work: StudioWork) -> [ContextEntity] {
         var result: [ContextEntity] = []
         var seen = Set<String>()
@@ -416,9 +351,7 @@ extension StudioContext {
         return result
     }
 
-    /// Tokens of the three selection keys only. The response never becomes a
-    /// trigger: admitting judgment words would let "is this sloppy?" pull an
-    /// unrelated entry that happens to use the word.
+    /// Only selection-key tokens may trigger recall; judgment words could pull unrelated works.
     static func triggers(_ work: StudioWork) -> [String] {
         let text = [work.title, work.creator ?? "", work.medium ?? ""].joined(separator: " ")
         return NativeContextProjectionText.triggers(text)

@@ -15,14 +15,9 @@ extension CognitiveSubstrate {
             persistenceHealth = .disabled
             return
         }
-        // Restore and Clear exclude each other: a restore waits for a Clear in
-        // flight (and then finds her mind already read: the cleared one), and a
-        // Clear waits for a restore in flight, so a bundle loaded before the
-        // clear can never be reconciled into the store after it.
+        // Restore and Clear share exclusion so a pre-clear bundle can never reconcile after forgetting.
         await waitForLifecycleHold()
-        // Restore runs once: a mind already read (or cleared) in this process
-        // is the resident truth, and re-reading the disk over it would lose
-        // what it has not saved yet (map risk 6).
+        // Restore once per process: resident state may contain unsaved changes that a second disk read would erase.
         guard !persistenceRestored else { await restoreSelfKnowledge(); return }
         restoreInFlight = true
         defer {
@@ -58,8 +53,7 @@ extension CognitiveSubstrate {
                       timeline: [UUID: CognitiveDevelopmentalTimelineEvent], reflections: [UUID: CognitiveReflectionReceipt],
                       cares: [UUID: CognitiveCare], migration: CognitiveCareMigration?)
         do {
-            // The forgetting boundary is read with her mind: a turn admitted
-            // from here on is stamped with it.
+            // The forgetting boundary is read with the agent's mind: a turn admitted from here on is stamped with it.
             mindEpoch = try await store.loadEpoch("mind")
             bundle = try await store.loadRestoreBundle(
                 artifactFamilies: restoreArtifactFamilyLoads()
@@ -87,14 +81,12 @@ extension CognitiveSubstrate {
             )
             throw error
         }
-        // The retired kinds are read only for their one conversion into cares:
-        // never reconciled, rewritten or deleted here.
+        // Conversion-only inputs cannot be reconciled or rewritten as live state.
         let retiredViews = bundle.artifacts.removeValue(forKey: "standing_view") ?? []
         let retiredSeeds = bundle.artifacts.removeValue(forKey: "thought_seed") ?? []
 
-        // Read resident state AFTER the suspended load. On recovery it is the
-        // complete current family, including removals; on the first load its
-        // accepted rows overlay the persisted family.
+        // Read resident state AFTER the suspended load. On recovery it is the complete current family, including removals; on the first load its accepted rows
+        // overlay the persisted family.
         await waitForMaintenanceTransition()
         let resident = residentRestoreArtifacts(at: dependencies.now())
         var reconciled = bundle
@@ -132,8 +124,7 @@ extension CognitiveSubstrate {
         for (id, care) in cares where care.origin == .seed { cares[id]?.open = nil }
         applyRestoreBundle(reconciled)
         residentRestoreIsAuthoritative = true
-        // Commit the reconciled nodes and artifacts together, including the
-        // resident removals.
+        // Commit the reconciled nodes and artifacts together, including the resident removals.
         do {
             try await persistReconciledRestoreState(replacing: bundle)
         } catch {
@@ -153,8 +144,7 @@ extension CognitiveSubstrate {
             lastSuccessfulRestoreAt: dependencies.now()
         )
         publishAttentionProjection(at: dependencies.now())
-        // Resolve only the resident reads, after reconciliation: no migration
-        // write of existing relationship keys. Later lived writes save normally.
+        // Resolve relationship identity on the resident read; only later lived writes persist it.
         await refreshCarePeople()
         await restoreSelfKnowledge()
         await establishCares(retiredViews: retiredViews, retiredSeeds: retiredSeeds)
@@ -219,17 +209,16 @@ extension CognitiveSubstrate {
                 guard case .object(let object) = payload else { continue }
                 let id = restoreArtifactID(family: family, payload: payload)
                 retainedIDs.insert(id)
-                // Counts in this diagnostic payload live only in SQLite. A
-                // matching consolidation clock does not replace that evidence.
-                // Without a loaded bundle to compare (a failed Clear's whole
-                // save) it is never overwritten blind.
+                // Counts in this diagnostic payload live only in SQLite. A matching consolidation clock does not replace that evidence. Without a loaded bundle
+                // to compare (a failed Clear's whole save) it is never overwritten blind.
                 if family == "emotional_consolidation" {
                     guard let bundle else { continue }
                     if case .object(let persisted)? = bundle.artifacts[family]?.first,
                        object["ranAt"] == persisted["ranAt"] { continue }
                 }
                 var status = object["status"]?.stringValue ?? "current"
-                var score = object["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? object["score"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0
+                var score = object["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? object["score"]?.numberValue(coercingStrings: false,
+                    finiteOnly: false) ?? 0
                 switch family {
                 case "episode", "developmental_timeline": status = "recorded"; score = 0.5
                 case "reflection_receipt":
@@ -308,7 +297,8 @@ extension CognitiveSubstrate {
         ]
     }
 
-    private func decodeRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) throws -> (episodes: [UUID: CognitiveEpisodeReference], proposals: [UUID: CognitiveSchemaProposal],
+    private func decodeRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) throws -> (episodes: [UUID: CognitiveEpisodeReference],
+        proposals: [UUID: CognitiveSchemaProposal],
                                      timeline: [UUID: CognitiveDevelopmentalTimelineEvent], reflections: [UUID: CognitiveReflectionReceipt],
                                      cares: [UUID: CognitiveCare], migration: CognitiveCareMigration?) {
         var episodes: [UUID: CognitiveEpisodeReference] = [:]
@@ -394,7 +384,7 @@ extension CognitiveSubstrate {
             return dateValue(object["updatedAt"]) != nil
         case "care_retired_migration":
             return uuidValue(object["id"]) != nil && dateValue(object["migratedAt"]) != nil
-        // A retired row the conversion cannot read is dropped there, never a failed restore.
+        // Unreadable conversion-only rows do not fail restoration of the live mind.
         case "standing_view", "thought_seed":
             return true
         default:
@@ -402,8 +392,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// Missing sets belong to retained single-claim artifacts. A present set
-    /// must be complete: dropping one unreadable claim would permit re-dose.
+    /// A present night-claim set must decode completely; losing one claim could permit a second dose.
     private func validDreamClaims(_ value: JSONValue?) -> Bool {
         guard let value else { return true }
         guard case .array(let rows) = value else { return false }
@@ -414,8 +403,7 @@ extension CognitiveSubstrate {
     }
 
     private func applyRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) {
-        // A successfully loaded (or explicitly cleared) resident field also
-        // owns evictions and deletions. A disk snapshot cannot revive them.
+        // A successfully loaded (or explicitly cleared) resident field also owns evictions and deletions. A disk snapshot cannot revive them.
         if !residentRestoreIsAuthoritative {
             field.mergeRestoredNodes(
                 bundle.nodes,

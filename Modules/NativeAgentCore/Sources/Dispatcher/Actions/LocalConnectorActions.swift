@@ -1,24 +1,17 @@
 import Foundation
 import PersistenceCore
 import Darwin
-// Blueprint: | `LocalConnectorActions.swift` | Canonical file/system handlers and verification flags; `nativeReadOnly` selects the exact seven native/slash tools |
+// Blueprint: | `LocalConnectorActions.swift` | File/system handlers; `nativeReadOnly` selects seven native/slash tools |
 
 // MARK: - Native connector-action registry
-//
-// NativeActionDispatch uses the shipped read-only selection unconditionally.
-// SwiftNativeDispatcher runs registered handlers in-process and writes a dispatch
-// receipt. An absent registry or missing handler fails closed.
+// Native dispatch uses only the read-only registry; missing registries or handlers fail closed with a receipt.
 
-/// A native action maps input and connector context to the payload retained as DispatchResult.output.
 public typealias ConnectorInvocation =
     @Sendable (_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue
 
-/// Registry of natively-executable connector actions, keyed by tool name.
 public struct LocalConnectorActions: Sendable {
     private let handlers: [String: ConnectorInvocation]
-    /// Tool names whose handler mutates the filesystem and needs autonomy admission.
     private let sideEffecting: Set<String>
-    /// Read-only handlers whose successful result is sufficient verification.
     private let trivialVerify: Set<String>
 
     public init(
@@ -35,8 +28,7 @@ public struct LocalConnectorActions: Sendable {
 
     public func isSideEffecting(_ tool: String) -> Bool { sideEffecting.contains(tool) }
 
-    /// Whether a successful handler result should carry `verifyPassed=true`.
-    /// Failed results and handlers requiring effect verification leave it unset.
+    /// Only successful read-only handlers can verify directly; failures and effectful handlers leave verification unset.
     public func isTrivialVerify(_ tool: String) -> Bool { trivialVerify.contains(tool) }
 
     public func run(_ tool: String, input: [String: JSONValue], ctx: ConnectorActionContext) -> JSONValue? {
@@ -75,8 +67,7 @@ public struct LocalConnectorActions: Sendable {
         }
     }
 
-    /// All file, repository and persona/system handlers available in this module.
-    /// Production NativeActionDispatch uses the read-only selection below.
+    /// Keep full registration separate from production's read-only selection so native dispatch cannot admit writes.
 
     public static let fileSystemDefault = LocalConnectorActions(
         handlers: [
@@ -100,7 +91,6 @@ public struct LocalConnectorActions: Sendable {
             "time_now":            { PersonaSystemActions.timeNow($0, $1) },
         ],
         sideEffecting: ["write_file", "move_file", "copy_file", "trash_file"],
-        // Successful read-only results are sufficient verification.
         trivialVerify: [
             "read_file", "file_excerpt", "list_dir", "file_info", "system_info",
             "grep", "git_status", "git_diff", "git_log", "repo_dirty_summary",
@@ -108,7 +98,6 @@ public struct LocalConnectorActions: Sendable {
         ]
     )
 
-    /// The exact read-only tools exposed by native actions and slash commands.
     public static let nativeReadOnly: LocalConnectorActions = {
         let names: Set<String> = [
             "persona_read", "workspace_list", "time_now", "persona_list_skills",

@@ -155,7 +155,7 @@ transcript settlement before releasing the reply (sleep joins accepted
 recordings; only interpretation rides the tail). User's own turn means no peer
 `speaker`, not a `standingAgent`, and a session whose recorded kind is their
 conversation (`SessionConversation.kind` through `conversationKind`, including
-archived rows, has `isHisConversation == true`). Their turns keep live judgment
+archived rows, has `isPersonConversation == true`). Their turns keep live judgment
 unless the complete-no-op claim has standing. Every other recorded turn is
 left owed for a batch, irrespective of the prediction: peer and standing-agent
 turns, helper sessions and any other session not proven their. Own-work sessions
@@ -196,10 +196,16 @@ inferred cap. The form is [Promises they makes](INTENTIONS.md#promises-they-make
 
 Returned replies are validated and usable meanings persisted through `settle`,
 even if Stop or sleep arrived as the call returned; unfinished provider work
-is cancelled and stays owed. Missing, malformed or repeated sections,
-and failed meaning writes, leave their rows owed and backing off.
-`AfterTurnSurpriseLedger.label` scores the original prediction under the model
-that judged, preserving its deferred flag. Never-deferred rows count as
+is cancelled and stays owed. A row whose section is missing, malformed or
+repeated, and every row of a call the memory model refused, is next judged
+alone, in a batch of one; skipped or refused alone too, they lets it go: the
+journal row is refused with reason `batch_section_missing` or `refused` and is
+never judged again. A transient failed call (cancelled, provider) or a failed
+meaning write leaves its rows owed, alone or batched as they were.
+Only a judgment writes the ledger: `AfterTurnSurpriseLedger.label` takes a
+judged turn's channels and scores the original prediction under the model
+that judged, preserving its deferred flag. An attempt that judged nothing
+writes no ledger row; it shows once in `mind.why` and the row stays owed. Never-deferred rows count as
 recovery, so their batch cost does not measure live c_hit; a deferred miss's
 wait to its label measures c_miss. Service seconds use a monotonic stopwatch
 around the judgment call alone (a batch shares that duration across its rows),
@@ -208,11 +214,17 @@ Prediction-to-label wall time is the separate delay cost.
 Recovery uses the live observation tail, admitting each pass only while no live
 observation is waiting (idle drains also require idle). A pass folds one
 recorded meaning or judges one batch: one pass at idle, up to eight at wake,
-and all due work at night, stopping when no pass progresses. Unfinished rows
-back off from one minute, doubling to six hours with a capped exponent;
-the least recently tried due row goes first. One timer schedules the next
-idle pass one to thirty minutes away, including a lone deferred row, and
-advances for earlier work; a cancelled timer cannot clear its replacement.
+and all due work at night, stopping when no pass progresses. No failed row is
+retried on a clock: it waits until something it depended on, read before the
+attempt began, changes. That is their judging route (surface, provider account
+and model, `MemoryManaging.judgmentRouteKey`); for a failed call (cancelled,
+network, rate limit, overloaded, deadline), the provider answering a judgment
+on that route, live or batch; for any other failure, another turn held owed;
+or the row's own journal state. A relaunch clears that RAM record. The least recently tried due row goes first.
+One timer schedules the next idle pass one to thirty minutes away for a row
+due by its own time (a lone deferred row, work left after a pass, live work in
+the way) and advances for earlier work; a failed row never sets it, and a
+cancelled timer cannot clear its replacement.
 Night joins any drain already in flight, then continues through that same
 owner before the dream reads their day. Only the caller that starts a drain
 cancels it and joins its settlement; joining another caller's flight leaves
@@ -226,6 +238,8 @@ One append-only `memory/after_turn_surprise.jsonl` (version 3, detector 3) under
 memory owner's data root keeps each turn's prediction, label, provider
 seconds and failure; older-version rows stay on disk and never grant standing, and a corrupt row or a current-version row that does not decode makes the whole record unreadable, so nothing stands on incomplete evidence.
 It contains no conversation or memory prose (precedent vectors only, bounded).
+A turn's vectors are written once, on its prediction row; its label row omits
+them and the reader takes them from that prediction.
 Rows written before promises were asked retain an unknown promise outcome and
 are incomplete. They supply neither complete precedents nor no-op trials,
 hits or dream-miss labels; a missing channel never becomes "no promise".
@@ -265,12 +279,12 @@ current request before passing it to Context selection.
 
 Resident-work context uses `MemoryRecordDisclosurePolicy.localPrivateSurfaces`,
 the same disclosure owner as private memory and Studio context. Relevance never
-admits private Desk or Workshop facts to a shared Slack turn.
-Selection and expansion reread the Desk and Workshop owners and compare the
-projected source hashes. Changed or removed work is withheld; unavailable or
-corrupt execution reads withhold resident-work atoms with a degraded-source
-receipt, including atoms in retained generations.
-Reconciliation retains resident-work rebuild inputs when either owner is
+admits private Desk facts to a shared Slack turn.
+Selection and expansion reread the Desk owner and compare the projected source
+hashes. Changed or removed work is withheld; unavailable or corrupt Desk reads
+withhold resident-work atoms with a degraded-source receipt, including atoms in
+retained generations.
+Reconciliation retains resident-work rebuild inputs when the Desk is
 unavailable, reports the failure and lets healthy independent projections
 publish. Retained atoms still require the same checked read before use.
 Resident-work lexical filtering excludes identities from the injected root's
@@ -298,8 +312,11 @@ It does not load tools, authorize actions or inject an entire backlog.
 `Context/ContextSelectionConfiguration.swift` bounds candidate counts, selected
 atoms, per-source/per-kind selection and pointers.
 `ChatSessionWork/ContextBudgetPolicy.swift` derives the turn's character
-and memory-row allowances from the admitted model window. These are different
-limits and both apply.
+and memory-row allowances from the model admission held on that turn, through
+`resolve(turn:dataRoot:)`. History renderers require that resolved budget;
+preparation cannot select a route or supply a default window. The
+[history contract](conversation-context-history.md) owns the admission boundary.
+These are different limits and both apply.
 
 Active ContextFlow turns carry memories in their packet. The independent
 recall list is empty on that path; a context preparation error fails the turn.
@@ -359,7 +376,7 @@ delivery.
 | Owed moments | `DreamBackgroundWork.runDream` awaits `AdaptiveMemoryPromoter.drainOwedAtNight` before dreaming. | Due lived judgments settle through the moment owner before the dream reads the day. |
 | Dream | `SchedulerDueJobRunner+Selection.swift` registers `nativeagent-nightly-dream`; scheduled/manual engine calls reach `DreamCycleRunner.runNightlyDreamCycle`. | `dream_diary/<date>.md`, receipts, mood and committed-dream somatic/reflection facts. |
 | Care night | The diary's saved work delivers the exact shown night through `DreamBackgroundWork.passCaresNight`, independently of reflection delivery. | Care settlement and owner-review life cards; delivery failures remain pending on that dream. No automatic life-depth approval. |
-| Practice | The turn's private keep opens on the second meeting of hand work ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); no nightly compiler wake. | `practice.keep` records first/later meeting and keep admission; existing compiled abilities retain replay-before-admission. |
+| Practice | On the second meeting of hand work, a practice note rides their next call inside the turn ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); no nightly compiler wake. | `practice.keep` records first/later meeting and whether the note was sent; existing compiled abilities retain replay-before-admission. |
 | REM | The same scheduler registers `nativeagent-weekly-rem`; `DreamREMCycle/REMConsolidator.swift` runs consolidation. | REM proposals, reviewed growth and pins. |
 | Microcycle | `NativeCognitionRuntime.scheduleDirtyMicrocycle` after admitted state changes. | Coalesced substrate processing and persistence. |
 | Replay/reflection | Dream/REM commit signals; `EngineRuntime/EngineLaunch.swift` supplies daily integrity sweeps. | Replayed continuity and gated reflective work. |
@@ -367,7 +384,7 @@ delivery.
 Dream/REM carry typed reports through background processing; cognition returns `LoopTickOutcome` directly, bounded only for published status. `EngineDreams` constructs
 external responses after commit signals, care processing and practice admission.
 Replacement commits share PersistenceCore's durable byte writer; Dream/REM owners retain their encodings and commit order.
-Dream input selects complete exchanges paired by `ChatSessionRecollections`; `oversized_conversation_input` preserves the watermark.
+Dream input selects complete exchanges paired by `ConversationHistory`; `oversized_conversation_input` preserves the watermark.
 Required surprise-read or assembly failure stops before generation and preserves the watermark.
 Each returned dream first saves one `dream_diary/work/<section UUID>.json` record before
 publication or the consumed cutoff commits. That record lists the exact diary publication,
@@ -430,7 +447,7 @@ Dream diary entries encode modification time as `modified_at`. Nightly discovery
 `YYYY-MM-DD.md`; the live archive collision writer's `YYYY-MM-DD_<UUID>.md` retains the same day.
 Each further dream in that file begins `## Dreamt again — <time>`.
 REM counts current `exchange:` and `message:` references as supporting experiences;
-recollection rows remain resolvable material, without pretending their changing row IDs are independent experiences.
+Generated transcript recollections have no reader; dreams read original conversation rows.
 Retained claim references stay intact. A claim without `gentle` or `about_owner`
 has an unknown judgment and supplies no eligibility for dream outreach.
 Manual REM completion requires a boolean `ok` and nonnegative integer
@@ -465,9 +482,10 @@ Default cycles and shared background clients use the resident provider assembly'
 ### Shared work-slot admission
 
 They stays active while the Mac is on; fatigue and heat color presentation.
-`runReflectionIfDue` claims Workshop's persisted two-hour `BackgroundWorkLease`
-window before substrate planning; a claimed window skips the pass. Only the
-holder's newest unused claim is released; spent windows remain claimed.
+`runReflectionIfDue` claims the persisted two-hour `BackgroundWorkLease` window
+of the Desk day (`background_lease.json`) before substrate planning; a claimed
+window skips the pass. Only the holder's newest unused claim is released; spent
+windows remain claimed.
 `NativeCognitionRuntime+Reflection.swift` and `BackgroundWorkLease.swift` own this gate.
 `runManualReflection` bypasses the shared slot; both paths retain
 [Subconscious admission](SUBCONSCIOUS.md#between-turns).

@@ -7,9 +7,8 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import TurnTrace
-import WorkshopExecution
 import NativeAgentShared
-// Blueprint: | `PersonaContextFlowProvider.swift` | `PersonaContextFlowProvider` actor; persona source registrations and required-document mirrors share one compiler batch and surface provenance |
+// Blueprint: | `PersonaContextFlowProvider.swift` | `PersonaContextFlowProvider`: one persona/mirror compiler batch with provenance |
 
 actor PersonaContextFlowProvider: ContextRequiredDocumentMirrorProviding {
     private struct Build: Sendable {
@@ -134,8 +133,7 @@ actor PersonaContextFlowProvider: ContextRequiredDocumentMirrorProviding {
             .filter { !$0.surfaceOverride }
             .sorted { $0.canonicalOrder < $1.canonicalOrder }
         let documents = try canonicalDocuments.map { source in
-            // Mirror provenance shares makeBuild's descriptor inputs; only canonical
-            // documents reach this map, and they permit every surface.
+            // Mirror provenance shares makeBuild's descriptor inputs; only canonical documents reach this map, and they permit every surface.
             let locator = Self.locator(personaID: personaID, document: source)
             return try RequiredDocument(
                 id: RequiredDocumentID(rawValue: "\(source.id).md"),

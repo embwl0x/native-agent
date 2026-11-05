@@ -6,10 +6,9 @@ import NativeAgentShared
 import Observation
 import PersistenceCore
 import Senses
-// Blueprint: | `EngineSenses.swift` | One engine Senses projection for registry records, actual source/helper watches, news and interactive views through `LatestRead`, committed switches through `write`; visible-window observation of canonical ability files and news/view invalidations, without idle sampling |
+// Blueprint: | `EngineSenses.swift` | `LatestRead`, `write`; Checked source state and owner-driven visible refresh |
 
-/// The Work pane and Senses page read this engine projection only when its
-/// owners change; observation ends when both leave the window.
+/// Refresh from owner changes only, ending observation when both panes unmount.
 @MainActor
 @Observable
 public final class SensesFacade {
@@ -47,7 +46,8 @@ public final class SensesFacade {
         })
     }
 
-    private func readPresentation() async -> (wired: Bool, registry: Result<([SenseRecord], [SenseCorner: String]), Error>, news: [SenseNews], watches: [SenseLiveWatch], view: SenseInteractiveView?) {
+    private func readPresentation() async -> (wired: Bool, registry: Result<([SenseRecord], [SenseCorner: String]), Error>, news: [SenseNews],
+        watches: [SenseLiveWatch], view: SenseInteractiveView?) {
         let hub = SensesHub.shared
         let wired = hub.registry != nil
         async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
@@ -80,7 +80,7 @@ public final class SensesFacade {
         }
         do {
             let saved = try await registry.setStatus(id: record.id, version: record.version, status: enabled ? .on : .off,
-                                             preview: false, ownerAuthorized: true)
+                                             preview: false, ownerAuthorized: true, turn: nil)
             latest.write {
                 if let index = records.firstIndex(where: { $0.id == record.id }) {
                     records[index] = saved
@@ -93,7 +93,6 @@ public final class SensesFacade {
         await refresh()
     }
 
-    /// User's Share action supplies the native destination picker.
     public func export(_ record: SenseRecord, destination: () -> URL?) async {
         guard saving.insert(record.id).inserted else { return }
         defer { saving.remove(record.id) }

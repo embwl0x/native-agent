@@ -6,13 +6,11 @@ import NativeAgentCore
 
 // Blueprint: | `UpdateController.swift` | `UpdateController`: configured Sparkle lifecycle, version probes and explicit unavailable/update presentation |
 
-// Sparkle runs on MainActor only for fully configured release bundles with NativeAgentUpdateFeedPublished.
+// Start Sparkle on MainActor only for configured bundles with a published feed.
 
 @MainActor
 final class UpdateController: NSObject {
-    /// A release page is a user-facing escape hatch, so only an absolute HTTPS
-    /// URL with a host is admissible. Relative, scheme-less, and HTTP values
-    /// never become an external-navigation action.
+    /// Release links leave the app; require absolute HTTPS URLs with a host.
     static func releasePageURL(in info: [String: Any]) -> URL? {
         let rawValue = (info["NativeAgentReleasePageURL"] as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -26,19 +24,13 @@ final class UpdateController: NSObject {
         return url
     }
 
-    /// One updater owns the host app. The app menu and both Settings surfaces
-    /// must not each start an independent Sparkle scheduler.
+    /// Share one updater so menus and Settings cannot start competing Sparkle schedulers.
     static let shared = UpdateController()
 
-    /// Observable found-update state. Sparkle's own scheduled prompt shows
-    /// once and can be dismissed; this keeps a persistent, gentle notice in
-    /// Settings and the app menu until the update is installed (or a later
-    /// check finds none). Display-only — Sparkle retains the entire
-    /// download/verify/install authority.
+    /// Retain found-update state after Sparkle's prompt closes; Sparkle still owns download, verification and install.
     @Observable
     @MainActor
     final class Status {
-        /// Display version of the update Sparkle found; nil when none known.
         var availableVersion: String? = nil
         var noticeFailure: String? = nil
         var canCheckForUpdates = false
@@ -54,7 +46,7 @@ final class UpdateController: NSObject {
         let done = ScopedWaiter()
         var failure: String?
     }
-    /// The agent's probe in flight; the actor records its outcome before waking it.
+    /// Record the probe outcome on the actor before waking its caller.
     private var probe: Probe?
     private var probeGeneration = 0
     private var canCheckObservation: NSKeyValueObservation?
@@ -82,8 +74,7 @@ final class UpdateController: NSObject {
         super.init()
         applyNotice(SoftwareUpdateState.restoreNotice(
             info: info, preferences: preferences, isNewer: Self.isVersion))
-        // Created after super.init so the controller can carry `self` as the
-        // updater delegate (found/not-found mirror into `status`).
+        // Create after super.init so self can serve as the updater delegate.
         if unavailability == nil {
             updaterController = SPUStandardUpdaterController(
                 startingUpdater: true,
@@ -94,8 +85,7 @@ final class UpdateController: NSObject {
                 \.canCheckForUpdates, options: [.initial, .new]
             ) { [weak self] _, _ in
                 Task { @MainActor [weak self] in
-                    // Read the current value on the owner actor, so a queued
-                    // callback cannot apply a stale transition.
+                    // Read on the owner actor so a queued callback cannot apply stale state.
                     guard let self else { return }
                     self.status.canCheckForUpdates = self.updaterController?.updater.canCheckForUpdates ?? false
                 }
@@ -113,13 +103,9 @@ final class UpdateController: NSObject {
         }
     }
 
-    /// Whether this build has a real, published feed. Fixed at launch — deliberately
-    /// NOT Sparkle's `canCheckForUpdates`, which also goes false while a check is
-    /// already running. Basing the menu on that would relabel the item mid-check and
-    /// then answer a click with "updates aren't available", which is its own lie.
+    /// Feed availability is fixed at launch; canCheckForUpdates also goes false mid-check and would mislabel the build.
     var updatesAreAvailable: Bool { unavailability == nil }
 
-    /// Whether a manual update check can be initiated right now (config + Sparkle state).
     var canCheckForUpdates: Bool {
         guard updatesAreAvailable else { return false }
         return status.canCheckForUpdates
@@ -127,8 +113,7 @@ final class UpdateController: NSObject {
 
     var automaticChecksEnabled: Bool { updatesAreAvailable && status.automaticChecksEnabled }
 
-    /// Menu title. It never says "Check for Updates…" unless a check will actually run,
-    /// and it names a known-available update outright.
+    /// Offer Check for Updates only when a check can run; name a known update directly.
     var menuTitle: String {
         if let version = status.availableVersion {
             return "Update Available — \(version)…"
@@ -136,16 +121,14 @@ final class UpdateController: NSObject {
         return updatesAreAvailable ? "Check for Updates…" : "About Software Updates…"
     }
 
-    /// Compact copy shared by the visible Settings row and its footer.
+    /// Share settings copy so the row and footer cannot disagree.
     var settingsDetail: String {
         let detail = Self.settingsDetail(for: unavailability, automaticChecksEnabled: automaticChecksEnabled)
         if let failure = status.noticeFailure { return failure + " " + detail }
         return detail
     }
 
-    /// Pure copy boundary for the Settings row. Keeping this separate from the
-    /// Sparkle controller makes the three truthful states testable without
-    /// starting an updater (which can otherwise contact the network at init).
+    /// Separate presentation from Sparkle so deriving status cannot start network activity.
     static func settingsDetail(for unavailability: Unavailability?, automaticChecksEnabled: Bool) -> String {
         guard let unavailability else {
             return automaticChecksEnabled
@@ -155,10 +138,7 @@ final class UpdateController: NSObject {
         return unavailability.detail
     }
 
-    /// Call from the "Check for Updates…" menu item.
-    ///
-    /// When no feed is published this presents a truthful, immediate explanation
-    /// instead of starting a network check that is known in advance to fail.
+    /// Without a published feed, explain immediately instead of starting a check known to fail.
     func checkForUpdates() {
         guard updatesAreAvailable, let updaterController else {
             presentUnavailableExplanation()
@@ -168,9 +148,7 @@ final class UpdateController: NSObject {
         updaterController.checkForUpdates(nil)
     }
 
-    /// The agent's check (interaction_act check_updates): Sparkle's
-    /// information-only probe, which shows nothing and installs nothing.
-    /// Found or not lands in `status` as any check does; installing stays User's.
+    /// Use Sparkle's information-only probe; it shows and installs nothing, leaving installation to the person.
     func probeForUpdate() async -> (detail: String, refusal: (reason: String, detail: String)?) {
         guard updatesAreAvailable, let updater = updaterController?.updater else {
             let reason = unavailability ?? .notConfigured
@@ -260,11 +238,8 @@ final class UpdateController: NSObject {
 
 }
 
-// Mirrors Sparkle's found/not-found signals into the observable `status` so
-// the notice persists after Sparkle's own prompt is dismissed. Fires for both
-// scheduled and manual checks. SPUUpdaterDelegate is main-actor annotated
-// (NS_SWIFT_UI_ACTOR), so these run on the main actor and assign directly —
-// no async hop that could reorder against a subsequent check.
+// Retain found-update state for scheduled and manual checks after Sparkle dismisses its prompt.
+// SPUUpdaterDelegate is main-actor isolated; assign directly to avoid reordering against a later check.
 extension UpdateController: SPUUpdaterDelegate {
     func updater(
         _ updater: SPUUpdater,

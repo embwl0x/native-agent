@@ -7,23 +7,23 @@ import ApprovalTransactions
 import NotificationInbox
 import ChatTurnRuntime
 import BackgroundWork
-// Blueprint: | `InboxCardActions.swift` | `AppInboxCardActionEffects`: mounted navigation and injected engine inbox; callers use the core inbox transaction directly |
+import Experiences
+// Blueprint: | `InboxCardActions.swift` | `AppInboxCardActionEffects`: native navigation for core inbox transactions |
 
-/// Mounted presentation and live app bindings for the core inbox transaction.
 struct AppInboxCardActionEffects: InboxCardActionEffects {
     let inbox: InboxFacade
 
-    func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool) async throws {
-        try await InteractionCardDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet)
+    func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool, turn: Turn) async throws {
+        try await InteractionCardDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet, turn: turn)
     }
 
-    func resolveApproval(id: String, decision: String, dataRootOverride: URL?) async throws {
+    func resolveApproval(id: String, decision: String, dataRootOverride: URL?, turn: Turn) async throws {
         _ = try await ApprovalExecution.app()
-            .resolveApproval(id: id, decision: decision)
+            .resolveApproval(id: id, decision: decision, turn: turn)
     }
 
     func inboxItems(dataRoot: URL) async throws -> [InboxItemRecord] {
-        try await inbox.list()
+        try await ForPerson.at(dataRoot).inbox()
     }
 
     func cleanUpDiskHygiene(dataRoot: URL) async throws -> String {

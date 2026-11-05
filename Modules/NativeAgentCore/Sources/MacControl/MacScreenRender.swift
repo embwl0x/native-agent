@@ -2,24 +2,13 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MacScreenRender.swift` | `MacScreenText` and `MacScreenRender`: shared semantic/pixel screen formatting that preserves compiler redaction verdicts |
+// Blueprint: | `MacScreenRender.swift` | `MacScreenText`, `MacScreenRender`: Shared semantic/pixel formatting retains compiler redaction |
 
-// Shared screen evidence and pixel formatting for MacScreenPageCompiler.
-// Text carries the compiler's redaction verdict through both presentations.
+// Both presentations must preserve the compiler’s text redaction verdict.
 
 // MARK: - The one text channel
 
-/// A string on its way to the screen render, carrying the redactor's verdict
-/// with it.
-///
-/// `redacted` is the JSON the compiler already produced under the FULL node
-/// context (standalone shape, the control's own caption, the enclosing
-/// secret-naming group, the caption beside/above) — `.string` when redaction
-/// let the text through, the count+digest object when it withheld it. It is
-/// the ONLY thing that decides what prints. When it is nil (a hand-built value,
-/// or a source that has no compiler behind it) the shared standalone shape test
-/// runs as the floor, so this type has no path that prints an unexamined
-/// string.
+/// Only full-context redacted JSON decides what prints; absent compiler context still requires the standalone shape check.
 public struct MacScreenText: Sendable, Equatable {
     public let raw: String
     public let redacted: JSONValue?
@@ -29,7 +18,6 @@ public struct MacScreenText: Sendable, Equatable {
         self.redacted = redacted
     }
 
-    /// The clear text, or nil when the redactor withheld it / there is nothing.
     public var display: String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -44,8 +32,7 @@ public struct MacScreenText: Sendable, Equatable {
         return trimmed
     }
 
-    /// True when the redactor examined this string and withheld it — as opposed
-    /// to there being no string at all. The render says which.
+    /// Withheld text differs from absent text and must render that distinction.
     public var withheld: Bool {
         !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && display == nil
     }
@@ -57,17 +44,12 @@ public enum MacScreenRender {
 
     // MARK: Provenance
 
-    /// Where a row's evidence came from, and how sure that evidence is.
-    ///
-    /// A FIELD on the row, never a mode. AX omits a confidence because it is 1
-    /// by construction — the app said so. Vision always prints one, because a
-    /// vision row that hides its confidence is indistinguishable from a claim.
+    /// Confidence belongs on each row: AX speaks authoritatively, while vision must disclose uncertainty.
     public enum Provenance: Sendable, Equatable {
         case ax
         case vision(Double)
 
-        /// `ax` or `vision 0.83`. Two decimals, non-localised, so the byte
-        /// output is identical on every machine.
+        /// Nonlocalized confidence formatting keeps output deterministic across machines.
         public var text: String {
             switch self {
             case .ax:
@@ -86,22 +68,18 @@ public enum MacScreenRender {
 
     // MARK: Rows
 
-    /// One row of the dominant content. THE ORDINAL IS THE ADDRESS — it is
-    /// assigned by the renderer, 1-based, in the order the rows arrive, so she
-    /// can say "open 3" for a row whose label is ambiguous or absent.
+    /// Rendered one-based ordinals are addresses, letting callers select ambiguous or unnamed rows.
     public struct Row: Sendable, Equatable {
         /// Private fusion metadata; never printed as a model-facing address.
         public let sourceAXPath: [Int]?
         public let label: MacScreenText?
-        /// Extra columns, in the caller's order — a type ("folder"), a quantity,
-        /// a price. Rendered as columns, not as prose.
+        /// Preserve caller column order so values remain associated with their headings.
         public let detail: [MacScreenText]
         public let provenance: Provenance
-        /// Non-nil ⇒ this row ABSTAINS, with this reason. Printed, never dropped.
+        /// Render abstention in place rather than dropping the row.
         public let abstain: String?
 
-        /// A located physical point, not an understood semantic control. The
-        /// act owner still rechecks visibility and authority before input.
+        /// Located pixels do not imply semantic understanding; the act still rechecks visibility and authority.
         public let physicalOnly: Bool
 
         public init(
@@ -121,14 +99,11 @@ public enum MacScreenRender {
         }
     }
 
-    /// One actionable thing. Its state rides INLINE — `(disabled)`, `(empty)`,
-    /// `(checked)`, `(selected)` — never in a parallel object the reader has to
-    /// correlate.
+    /// Render state inline so readers need not correlate a parallel state object.
     public struct Control: Sendable, Equatable {
         /// Private fusion metadata; never printed as a model-facing address.
         public let sourceAXPath: [Int]?
         public let label: MacScreenText
-        /// The kind, in this renderer's fixed vocabulary (see `kindName`).
         public let kind: String
         public let states: [String]
         public let provenance: Provenance
@@ -151,8 +126,6 @@ public enum MacScreenRender {
         }
     }
 
-    /// A read-only value the screen SAYS — a status bar, a count, a total, an
-    /// error.
     public struct Value: Sendable, Equatable {
         public let text: MacScreenText
         public let provenance: Provenance
@@ -165,18 +138,13 @@ public enum MacScreenRender {
 
     // MARK: Content
 
-    /// The three content types. The section KEYWORD is the type, which is how a
-    /// reader knows what kind of thing she is looking at before reading a row.
-    ///
-    /// `canvas` is the pixel surface. It distinguishes an unparsed extent from
-    /// partial object/text evidence without claiming semantic understanding.
+    /// Section keywords identify content kind; canvas distinguishes unparsed extent from partial evidence without claiming understanding.
     public enum ContentKind: String, Sendable, Equatable, CaseIterable {
         case list
         case grid
         case canvas
 
         var keyword: String { rawValue.uppercased() }
-        /// The noun for the retained row count.
         var noun: String {
             switch self {
             case .list: return "items"
@@ -186,8 +154,7 @@ public enum MacScreenRender {
         }
     }
 
-    /// The pixel region. Its SIZE is mandatory in the render: "act
-    /// physically" is not actionable without an extent.
+    /// Physical action needs the pixel region’s extent, so size is mandatory.
     public struct Canvas: Sendable, Equatable {
         public let description: String
         public let width: Double
@@ -228,22 +195,18 @@ public enum MacScreenRender {
 
     // MARK: Layout constants
 
-    /// Section keyword column. Everything after it lines up, so a reader's eye
-    /// finds SCREEN / WHERE / DO without parsing.
+    /// Aligned keywords let readers scan sections without parsing their content.
     static let keywordWidth = 8
-    /// Indent for a row line, including room for a right-aligned 2-digit ordinal.
+    /// Reserve room for right-aligned two-digit ordinals.
     static let rowIndent = 6
     static let labelColumn = 24
     static let detailColumn = 22
-    /// What a withheld string prints as. Visibly absent — never the clear text,
-    /// never a digest a reader could mistake for content.
+    /// Withheld text must look absent, never like a digest that could be mistaken for content.
     public static let redactedMarker = "⟨redacted⟩"
-    /// What an unlabeled row prints as. The row still exists and is still
-    /// addressable by its ordinal.
+    /// Unlabeled rows stay visible and addressable by ordinal.
     public static let unlabeledMarker = "⟨unlabeled⟩"
 
-    /// Add only independently recognized pixel evidence to the AX page. No
-    /// second screen title, AX control census or repeated raw text channel.
+    /// Add independent pixel evidence without duplicating AX titles, censuses or raw text.
     static func pixelEvidence(contents: [Content] = [], controls: [Control] = [], values: [Value] = []) -> String {
         var lines: [String] = []
         for content in contents {
@@ -267,8 +230,7 @@ public enum MacScreenRender {
         var lines: [String] = []
 
         guard content.kind != .canvas else {
-            // CANVAS is a single honest sentence, and it must carry its extent:
-            // "act physically" is not actionable without one.
+            // Canvas descriptions need an extent to make physical action meaningful.
             var line: String
             if let canvas = content.canvas {
                 let size = "\(integer(canvas.width))x\(integer(canvas.height))"
@@ -284,7 +246,11 @@ public enum MacScreenRender {
             }
             lines.append(section(content.kind.keyword, line))
             if content.canvas?.hasRegionTarget == true {
-                lines.append("        Target: canvas — move, hover, drag, hold, scroll. Drag endpoints may be 'left side of canvas' / 'right side of canvas'; covered points refuse.")
+                lines.append(
+                    """
+                                Target: canvas — move, hover, drag, hold, scroll. Drag endpoints may be 'left side of canvas' / 'right side of canvas'; \
+                        covered points refuse.
+                        """)
             }
             return lines
         }
@@ -364,8 +330,7 @@ public enum MacScreenRender {
         line = pad(line + detail, to: rowIndent + labelColumn + detailColumn)
 
         line += "  " + row.provenance.text
-        // The abstain rides on the row itself, in place. Never a footnote, never
-        // a dropped row: a refusal she cannot see is a guess.
+        // Keep abstentions on their rows so uncertainty cannot be hidden as a missing observation.
         if let abstain = row.abstain, !abstain.isEmpty {
             line += "  ABSTAINED: " + abstain
         } else if row.physicalOnly {
@@ -398,11 +363,7 @@ public enum MacScreenRender {
     }
 
     // MARK: - The fixed KIND vocabulary
-    //
-    // One map, both lanes. The vision lane guesses AX role names by contract
-    // ("AXUnknown" + a low role confidence, never a guessed AXButton at 1.0), so
-    // an AX row and a vision row naming the same role print the same word — the
-    // vocabulary cannot fork between sources.
+    // AX and vision share one role vocabulary; guessed roles retain their confidence rather than impersonating certain AX evidence.
 
     static let kindNames: [String: String] = [
         "AXButton": "button",
@@ -437,9 +398,7 @@ public enum MacScreenRender {
         "AXUnknown": "unknown",
     ]
 
-    /// A role in the renderer's vocabulary. An unmapped role degrades to its
-    /// bare name rather than to a guess — an honest "AXFoo" beats a confident
-    /// "button".
+    /// Unmapped roles retain their names instead of becoming guessed controls.
     public static func kindName(role: String) -> String {
         if let known = kindNames[role] { return known }
         let stripped = role.hasPrefix("AX") ? String(role.dropFirst(2)) : role
@@ -450,21 +409,15 @@ public enum MacScreenRender {
 
     // MARK: - AX target classification
 
-    /// Roles whose affordances are CONTENT rows rather than controls: the rows
-    /// of a list, the cells of a table, the rename-in-place text field every
-    /// file row publishes. Shape, never app.
+    /// Content-row classification follows role structure rather than app identity.
     static let contentRowRoles: Set<String> = [
         "AXRow", "AXCell", "AXOutlineRow", "AXListItem",
     ]
 
-    /// Landmark kinds whose CONTENTS are controls whatever their own role is —
-    /// the compiler's `controlContainerRoles`, in the landmark vocabulary the
-    /// percept publishes.
+    /// Landmark control-container kinds must agree with the compiler’s controlContainerRoles.
     static let controlContainerKinds: Set<String> = ["toolbar", "sheet", "dialog"]
 
-    /// Keep the established unnamed-control addresses, then number duplicated
-    /// names after them. Rendering and resolution consume this same assignment;
-    /// a repeated label never forces the caller to guess the first match.
+    /// Rendering and resolution share ordinal assignment so duplicate labels remain addressable without guessing.
     static func controlRoleOrdinals(for controls: [MacLookAffordance]) -> [String: Int] {
         let identities = controls.map { control in
             (

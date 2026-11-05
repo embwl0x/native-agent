@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-// Blueprint: | `NativeMessagingFraming.swift` | `NativeMessagingFramer`: bounded little-endian JSON framing shared by Chrome pipes and private relay socket, with exact fragmented reads |
+// Blueprint: | `NativeMessagingFraming.swift` | `NativeMessagingFramer`; Bounded little-endian JSON frames; exact fragmented reads. |
 
 public enum NativeMessagingFramingError: Error, Equatable, LocalizedError, Sendable {
     case unexpectedEndOfFile
@@ -26,10 +26,7 @@ public enum NativeMessagingFramingError: Error, Equatable, LocalizedError, Senda
     }
 }
 
-/// Chrome native messaging uses a four-byte little-endian payload length
-/// followed by one UTF-8 JSON message. The same framing is deliberately reused
-/// on the relay's private Unix-socket side so the relay can remain opaque and
-/// transport-only.
+/// Share Chrome's length-prefixed UTF-8 framing on both pipes and socket so the relay stays opaque and transport-only.
 public struct NativeMessagingFramer: Sendable {
     private static let maximumMessageBytes = 1_048_576
 
@@ -49,8 +46,7 @@ public struct NativeMessagingFramer: Sendable {
         }
     }
 
-    /// Authentication readers update their deadline before each fragmented
-    /// read. An empty chunk means EOF; a short non-empty chunk is accumulated.
+    /// Update authentication deadlines per fragment; only an empty read proves EOF, while short reads accumulate.
     public func readMessage(read: (Int) throws -> Data) throws -> Data? {
         guard let header = try readExactly(4, allowCleanEOF: true, read: read) else {
             return nil
@@ -162,9 +158,7 @@ public struct NativeMessagingFramer: Sendable {
                 throw NativeMessagingFramingError.unexpectedEndOfFile
             }
             guard chunk.count <= count - result.count else {
-                // A FileHandle honors the requested count. Refuse a custom
-                // reader that violates the same contract instead of dropping
-                // bytes from the next frame.
+                // Refuse oversized custom-reader chunks instead of dropping bytes belonging to the next frame.
                 throw NativeMessagingFramingError.messageTooLarge(
                     actual: result.count + chunk.count,
                     maximum: count

@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Corrections.swift` | `MemoryStorage`: canonical correction occurrences, idempotent turn identities and complete-window reads; duplicate previews never supply counts |
+// Blueprint: | `MemoryStorage+Corrections.swift` | `MemoryStorage`: idempotent canonical correction occurrences |
 
 extension MemoryStorage {
     struct CorrectionOccurrence: Sendable {
@@ -13,8 +13,7 @@ extension MemoryStorage {
         let history: String?
     }
 
-    /// Called inside the memory write, before any turn payload is settled.
-    /// Replaying the same origin on the same correction adds no second miss.
+    /// Called inside the memory write, before any turn payload is settled. Replaying the same origin on the same correction adds no second miss.
     static func recordCorrectionOccurrence(metadata: JSONValue?, rowID: String, createdAt: String, on id: String,
                                            proposal: Bool = false, in db: Database) throws {
         guard case .object(let metadata)? = metadata,
@@ -75,10 +74,9 @@ extension MemoryStorage {
                                        on: id, proposal: true, in: db)
     }
 
-    /// A repeat uses the same canonical duplicate transaction as a save,
-    /// with the incoming turn intact rather than encoded into a preview patch.
-    func repeatCorrection(id: String, source: String, metadata: JSONValue) async throws {
-        let metadata = try MemorySenseProvenance.stamping(MemoryDataProvenance.stamping(metadata))
+    /// A repeat uses the same canonical duplicate transaction as a save, with the incoming turn intact rather than encoded into a preview patch.
+    func repeatCorrection(id: String, source: String, metadata: JSONValue, context: MemoryWriteContext) async throws {
+        let metadata = try context.stamping(metadata)
         let saved = try await dbPool.write { db -> StoredMemory in
             guard let row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
                 .map(Self.decodeMemory), row.metadata?.objectValue?["kind"] == .string("correction") else {
@@ -94,8 +92,7 @@ extension MemoryStorage {
         await pokeProjectionHooks(saved)
     }
 
-    /// Full owner record for the window. Failure or incomplete retained
-    /// history throws; neither is presented as zero or a partial total.
+    /// Full owner record for the window. Failure or incomplete retained history throws; neither is presented as zero or a partial total.
     func correctionOccurrences(from start: Date, to end: Date) async throws -> [CorrectionOccurrence] {
         try await dbPool.read { db in
             guard let since = try Double.fetchOne(db, sql: "SELECT complete_since FROM correction_ledger_state WHERE id = 1"),
@@ -104,7 +101,10 @@ extension MemoryStorage {
             }
             guard start.timeIntervalSince1970 >= since else {
                 throw MemoryStorageError.databaseUnavailable(
-                    "Complete correction history is available only since \(Date(timeIntervalSince1970: since).ISO8601Format()); earlier duplicate previews discarded occurrences.")
+                    """
+                        Complete correction history is available only since \(Date(timeIntervalSince1970: since).ISO8601Format()); earlier duplicate previews \
+                        discarded occurrences.
+                        """)
             }
             return try Row.fetchAll(db, sql: """
                 SELECT memories.*, c.origin_id AS correction_origin, c.at AS correction_at,
@@ -129,11 +129,11 @@ extension MemoryStorage {
 }
 
 extension SwiftNativeMemoryV2 {
-    func repeatCorrection(id: String, source: String, turnMetadata: [String: JSONValue]) async throws {
+    func repeatCorrection(id: String, source: String, turnMetadata: [String: JSONValue], context: MemoryWriteContext) async throws {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         var metadata = turnMetadata
         metadata["kind"] = .string("correction")
-        try await storage.repeatCorrection(id: id, source: source, metadata: .object(metadata))
+        try await storage.repeatCorrection(id: id, source: source, metadata: .object(metadata), context: context)
     }
 }

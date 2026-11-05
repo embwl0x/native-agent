@@ -1,14 +1,12 @@
 import Foundation
 import NativeAgentShared
 
-/// One MainActor-isolated rendezvous between the transport drain that persists
-/// `responses/<correlationID>.json` and the task waiting on that response.
-/// ScopedWaiter owns parking; this actor records the first outcome before waking it.
+/// MainActor owns the rendezvous; record the durable response outcome before waking its ScopedWaiter.
 @MainActor
 final class ActionResponseWaiters {
     static let shared = ActionResponseWaiters()
 
-    /// Backstop cadence for transport drains when no push arrives.
+    /// Bound transport backstops when no push arrives.
     static let backstopInterval: TimeInterval = 5
 
     private var waiters: [String: [UUID: ScopedWaiter]] = [:]
@@ -19,14 +17,13 @@ final class ActionResponseWaiters {
 
     func isWaiting(_ correlationID: String) -> Bool { armed.contains(correlationID) }
 
-    /// Start watching `correlationID`. Called before the first response read so
-    /// an arrival that races the first poll is remembered, not lost.
+    /// Register before reading so an arrival racing the first poll is remembered.
     func arm(_ correlationID: String) {
         armed.insert(correlationID)
         arrived.remove(correlationID)
     }
 
-    /// Stop watching and release anyone still parked on this correlation.
+    /// Release parked callers when removing their correlation.
     func disarm(_ correlationID: String) {
         iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
         armed.remove(correlationID)
@@ -37,9 +34,7 @@ final class ActionResponseWaiters {
         waiters.removeValue(forKey: correlationID)
     }
 
-    /// The response for `correlationID` is now durable in the local mailbox.
-    /// Ignored for correlations nobody is waiting on so the arrival set cannot
-    /// grow without bound across a long session.
+    /// Record durable arrivals only for watched correlations so the set stays bounded.
     func signal(_ correlationID: String) {
         guard armed.contains(correlationID) else { return }
         arrived.insert(correlationID)
@@ -48,14 +43,11 @@ final class ActionResponseWaiters {
         }
     }
 
-    /// True when a signal for `correlationID` is already recorded.
     func hasArrived(_ correlationID: String) -> Bool {
         arrived.contains(correlationID)
     }
 
-    /// Park until the response is signalled or `timeout` elapses. Returns true
-    /// when a push signalled the arrival — the caller can then skip the
-    /// transport drain it would otherwise have paid for.
+    /// A signalled arrival lets the caller skip a transport drain; timeout still bounds parking.
     @discardableResult
     func wait(_ correlationID: String, timeout: TimeInterval) async -> Bool {
         if arrived.contains(correlationID) { return true }

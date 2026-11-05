@@ -1,29 +1,14 @@
-// The Knowledge Graph's handle on memory.sqlite.
-//
-// MemoryStorage alone opens memory.sqlite and migrates every table; `pool(at:)` returns its pool.
-//
-// Lifecycle (every add has a remove):
-//   - ADD: the first `pool(at:)` for a path asks the owner for its pool and
-//     remembers it. A missing file throws `.databaseMissing` without asking —
-//     the graph never causes a store to be created.
-//   - REMOVE on file deletion: a missing file drops the entry, so a later
-//     recreate resolves the owner again.
-//   - REMOVE on failure: an owner that throws leaves no entry; the next call
-//     asks again.
-//
-// Concurrency: the first caller for a path parks a resolving Task in the
-// dictionary before its suspension point, so concurrent callers await the
-// same resolution instead of asking the owner twice.
+// MemoryStorage alone opens and migrates memory.sqlite. Missing files throw without creating storage and drop cached pools; owner failures leave no entry.
+// Cache each resolving task before suspension so concurrent callers share one owner resolution.
 
 import Foundation
 import GRDB
-// Blueprint: | `KnowledgeGraph+PoolCache.swift` | Direct canonical MemoryStorage resolution with missing-file refusal, per-path single-flight and failed-resolution eviction; no launch owner-registration port |
+// Blueprint: | `KnowledgeGraph+PoolCache.swift` | MemoryStorage pool resolution, missing-file refusal and per-path single-flight |
 
 public actor KnowledgeGraphPoolCache {
     public static let shared = KnowledgeGraphPoolCache()
 
     public enum PoolError: Error, Sendable, Equatable {
-        /// The database file does not exist at the given path.
         case databaseMissing(String)
     }
 
@@ -31,8 +16,7 @@ public actor KnowledgeGraphPoolCache {
 
     public init() {}
 
-    /// The owning MemoryStorage's pool for `url`. Throws `.databaseMissing`
-    /// when the file does not exist; an owner failure propagates.
+    /// Resolve the owner's pool without creating a missing file; propagate owner failures.
     public func pool(at url: URL) async throws -> DatabasePool {
         let key = url.standardizedFileURL.path
         guard FileManager.default.fileExists(atPath: key) else {

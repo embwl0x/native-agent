@@ -24,7 +24,7 @@ import MemoryV2
 import StandingBots
 import TurnTrace
 import Studio
-// Blueprint: | `QuietSetting.swift` | QuietSetting value and throwing read/choice contract; unavailable Trust rejects policy-backed controls on every page before read or write; setting errors, host provider and MainActor write receipt detail |
+// Blueprint: | `QuietSetting.swift` | Throwing read/choice contract, explicit turn-bound writes, checked Trust and MainActor receipt detail |
 
 public typealias QuietSettingsHostProvider = @MainActor @Sendable () -> (any QuietSettingsHost)?
 
@@ -32,7 +32,7 @@ public enum QuietSettingError: Error, LocalizedError {
     /// A rejected value, before any mutation. Failed saves are unavailable.
     case badValue(String)
     case unavailable(String)
-    /// The value would raise Trust: User's call, refused as `owners_call`.
+    /// Trust raises are the user's decision and refuse as owners_call.
     case users(String)
 
     public var errorDescription: String? {
@@ -44,19 +44,15 @@ public enum QuietSettingError: Error, LocalizedError {
     }
 }
 
-/// Extra lines a write leaves for its own receipt.
-///
-/// A setting that covers several surfaces changes more than its own row, and `app_setting_set` cannot see that from the lead value it reads
-/// back. The write records what it actually touched here, and the tool folds it into the receipt — the same trail, no second ledger.
-/// Main-actor only, and taken exactly once per call, so two writes cannot read each other's detail.
+/// Multi-surface writes record their actual reach in the transcript receipt, not a second ledger.
+/// Main-actor detail is taken exactly once per call so concurrent writes cannot borrow each other's evidence.
 @MainActor
 public final class QuietWriteDetail {
-    @TaskLocal public static var current: QuietWriteDetail?
     private var pending: [String: JSONValue] = [:]
 
     public init() {}
 
-    public static func record(_ key: String, _ value: JSONValue) { current?.pending[key] = value }
+    public func record(_ key: String, _ value: JSONValue) { pending[key] = value }
 
     public func take() -> [String: JSONValue] {
         defer { pending = [:] }
@@ -64,44 +60,50 @@ public final class QuietWriteDetail {
     }
 }
 
-/// One control on one page, named so the model never has to guess.
-///
-/// A setting is registered ONCE, with the read that answers what the page shows and the write that the page's own control calls. There is
-/// no reflection and no key-guessing: `app_settings_list` returns exactly this registry, so a control that is not here is honestly reported
-/// as absent rather than silently attempted.
+/// One setting mutation holds its admitted turn and its own receipt accumulator.
+public struct QuietSettingWrite: Sendable {
+    public let turn: Turn
+    public let detail: QuietWriteDetail
+
+    public init(turn: Turn, detail: QuietWriteDetail) {
+        self.turn = turn
+        self.detail = detail
+    }
+}
+
+/// Register each control once with its page-owned read/write; absent controls must never be guessed or reflected into writes.
 public struct QuietSetting: Sendable {
     public enum Kind: String, Sendable {
         case boolean, text, choice, number
-        /// An ordered list of lines. Read back as an array; written as an array, or as one string of newline-separated lines. Add and
-        /// remove are the same operation — send the list you want.
+        /// List writes replace the desired list; both arrays and newline-separated text share that operation.
         case list
     }
 
     public let id: String
     public let page: String
-    /// The page's tab the control is on, by the key the page stores; nil is the page's first tab. ⌘K opens the control there.
+    /// nil selects the first tab; stored tab keys keep navigation aligned with the page.
     public private(set) var tab: String?
     public let label: String
     public let kind: Kind
-    /// Non-empty for `.choice`. Stated in the catalog so a set never has to discover the allowed values by being refused.
+    /// Publish nonempty choice values so callers need not discover them through refused writes.
     public let choices: [String]
-    /// Choices that only exist at run time — the accounts this Mac has actually connected. The catalog reports exactly what the write
-    /// enforces, out of one closure, so a set can never be refused for a value `app_settings_list` had just offered.
+    /// Catalog and validation share one runtime choice owner so separate lists cannot drift.
     public let liveChoices: (@MainActor @Sendable (@escaping QuietSettingsHostProvider) async throws -> [String])?
     public let note: String
-    /// The person's own posture. These READ like any other setting and refuse to be written, saying why — the agent widening its own
-    /// authority is the one thing self-administration must not be able to do.
+    /// User-owned posture rows stay readable but reject agent writes so self-administration cannot widen its own authority.
     public let ownerOnly: Bool
     /// Writable only in Full Mac, with receipts; raising to Full Mac remains the owner's call.
     public let fullMacOnly: Bool
-    /// Its value lives on another device: a page read lists it without asking that device
-    /// (a page never waits on a round trip); setting.get reads it.
+    /// The agent's own thought and memory controls do not ask for a person's request or Trust posture.
+    public private(set) var mindOwned = false
+    /// The preference owner this row reads; page invalidation watches only its declared keys.
+    public private(set) var defaultsKey: String?
+    /// Page reads list remote settings without waiting on another device; setting.get performs that read.
     public let readsAnotherDevice: Bool
     public let read: @MainActor @Sendable (any QuietSettingsHost) async throws -> JSONValue
-    public let write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void)?
-    /// The rule a value must pass before it is written (which way a lower-only switch may move, what a narrow-only list may gain), read
-    /// only. `write` asks it first, and the door's preview asks it alone, so a preview refuses what the write would.
-    public let check: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async -> QuietSettingError?)?
+    public let write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void)?
+    /// Preview shares the read-only direction/value rule that write checks before mutation.
+    public let check: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, Turn) async -> QuietSettingError?)?
 
     public init(
         id: String,
@@ -114,10 +116,9 @@ public struct QuietSetting: Sendable {
         ownerOnly: Bool = false,
         fullMacOnly: Bool = false,
         readsAnotherDevice: Bool = false,
-        requiresTrustPolicy: Bool = false,
         read: @escaping @MainActor @Sendable (any QuietSettingsHost) async throws -> JSONValue,
-        write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void)? = nil,
-        check: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async -> QuietSettingError?)? = nil
+        write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void)? = nil,
+        check: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, Turn) async -> QuietSettingError?)? = nil
     ) {
         self.id = id
         self.page = page
@@ -130,34 +131,46 @@ public struct QuietSetting: Sendable {
         self.fullMacOnly = fullMacOnly
         self.readsAnotherDevice = readsAnotherDevice
         self.read = { host in
-            if (page == "trust" || requiresTrustPolicy), host.trustPolicy == nil {
+            if page == "trust", host.trustPolicy == nil {
                 throw QuietSettingError.unavailable("Trust policy is unavailable. Read Trust and repair its reported policy error before reading this control.")
             }
             return try await read(host)
         }
         self.check = check
         if let write {
-            self.write = { @MainActor @Sendable host, value in
-                if (page == "trust" || requiresTrustPolicy), host.trustPolicy == nil {
-                    throw QuietSettingError.unavailable("Trust policy is unavailable. Read Trust and repair its reported policy error before changing this control.")
+            self.write = { @MainActor @Sendable host, value, context in
+                if page == "trust", host.trustPolicy == nil {
+                    throw QuietSettingError.unavailable("""
+                        Trust policy is unavailable. Read Trust and repair its reported policy error before changing this control.
+                        """)
                 }
-                if let refused = await check?(host, value) { throw refused }
-                try await write(host, value)
+                if let refused = await check?(host, value, context.turn) { throw refused }
+                try await write(host, value, context)
             }
         } else {
             self.write = nil
         }
     }
 
-    /// The same control, on `tab` of its page.
     public func onTab(_ tab: String) -> QuietSetting {
         var row = self
         row.tab = tab
         return row
     }
 
-    /// Whether a set would be accepted RIGHT NOW. `fullMac` is the posture read fresh off the saved policy, so the catalog's `writable` and
-    /// the answer `app_setting_set` gives are one answer.
+    public func watchingDefaults(_ key: String) -> QuietSetting {
+        var row = self
+        row.defaultsKey = key
+        return row
+    }
+
+    public func ownedByMind() -> QuietSetting {
+        var row = self
+        row.mindOwned = true
+        return row
+    }
+
+    /// Read fullMac fresh so catalog writability and the write's refusal use the same authority.
     public func writable(fullMac: Bool) -> Bool {
         guard !ownerOnly, write != nil else { return false }
         return fullMac || !fullMacOnly
@@ -173,7 +186,9 @@ public struct QuietSetting: Sendable {
         ]
         let offered = try await (liveChoices?(host) ?? choices)
         if !offered.isEmpty { row["choices"] = .array(offered.map { .string($0) }) }
-        if !note.isEmpty { row["note"] = .string(note) }
+        let guidance = mindOwned ? "Yours to set in either direction; no request needed." : ""
+        let notes = [guidance, note].filter { !$0.isEmpty }
+        if !notes.isEmpty { row["note"] = .string(notes.joined(separator: " ")) }
         if ownerOnly {
             row["owner_only"] = .bool(true)
             row["refusal"] = .string(QuietSettings.ownerOnlyRefusal)

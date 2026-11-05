@@ -4,11 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import ToolRegistry
-// Blueprint: | `CapabilityRecords+Dynamic.swift` | Checked read-only capability projections from abilities through Parts' shared name schema, saved workflows and connector actions; absent source status/counts/dates remain unknown, name damage stays row-local and other malformed fields reject the read |
+// Blueprint: | `CapabilityRecords+Dynamic.swift` | Owner-derived capability rows preserve missing evidence. |
 
-// Read-only capability aggregation. Authored parts and saved workflow templates
-// come from their owners; extra JSON fields remain intact in the projections.
-// SavedWorkflows alone reads, validates and mutates the workflow registry.
+// Aggregate owner projections without altering extra fields; SavedWorkflows alone validates and mutates its registry.
 
 // MARK: - Helpers (file-local)
 
@@ -50,7 +48,6 @@ public func promptSafeCapabilityText(_ raw: String?, limit: Int = 500) -> String
             )
         }
     }
-    // When the character count exceeds the limit, truncate by Unicode scalar.
     if text.count > limit {
         let scalars = Array(text.unicodeScalars)
         if scalars.count > limit {
@@ -82,10 +79,7 @@ public func listTools(
 }
 
 // MARK: - Saved workflows
-//
-// Reads saved <dataRoot>/workflows/registry.json rows through SavedWorkflows'
-// checked schema and stable timestamp sort. Neither listing nor capability
-// aggregation seeds defaults or writes the registry.
+// Listing saved workflows must not seed defaults or mutate authority.
 public func listWorkflows(dataRoot: URL) async throws -> [[String: JSONValue]] {
     try SavedWorkflows.readProjection(dataRoot: dataRoot).map {
         _ = try WorkflowRecord(row: $0)
@@ -100,7 +94,6 @@ private func capabilityTrustMetadata(_ source: [String: JSONValue]) -> [String: 
 
 // MARK: - Capability aggregation
 
-// Merge built-in features, installed skills, authored parts, workflows and connectors in that order.
 public func capabilityRecordsFull(
     dataRoot: URL,
     nowISO: String,
@@ -109,12 +102,10 @@ public func capabilityRecordsFull(
 
     var records: [[String: JSONValue]] = []
 
-    // Built-in features
     for fs in featureSurfaceRecords(nowISO: nowISO) {
         if case .object(let record) = fs.contextLookupJSON() { records.append(record) }
     }
 
-    // Installed skills
     let skills = try InstalledSkillInventory.entries(dataRoot: dataRoot)
     for skill in skills.prefix(230) {
         var rec: [String: JSONValue] = [:]
@@ -135,7 +126,6 @@ public func capabilityRecordsFull(
         records.append(rec)
     }
 
-    // Authored parts
     let tools = try await listTools(dataRoot: dataRoot)
     for tool in tools.prefix(150) {
         let row = try JSONRow(.object(tool))
@@ -162,7 +152,6 @@ public func capabilityRecordsFull(
         records.append(rec)
     }
 
-    // Saved workflows
     let workflows = try await listWorkflows(dataRoot: dataRoot)
     for workflow in workflows.prefix(100) {
         let row = try JSONRow(.object(workflow))
@@ -176,7 +165,6 @@ public func capabilityRecordsFull(
         rec["description"] = workflow["description"] ?? .null
         rec["triggers"] = try row.optionalString("trigger").map { .array([.string($0)]) } ?? .null
         rec["permissions"] = .array([])
-        // requires approval check on steps
         let requirements = try row.array("steps").map { try JSONRow($0).optionalBool("requiresApproval") }
         rec["riskClass"] = requirements.contains(true) ? .string("approval_gated")
             : requirements.contains(nil) ? .null : .string("app_data")
@@ -187,7 +175,6 @@ public func capabilityRecordsFull(
         records.append(rec)
     }
 
-    // Connector actions
     let actionStatuses = try await connectorActionStatuses()
     for action in connectorActionDescriptors().prefix(200) {
         var rec: [String: JSONValue] = [:]
@@ -212,12 +199,10 @@ public func capabilityRecordsFull(
         records.append(rec)
     }
 
-    // Every caller receives the same checked rows, including the trust network
-    // and evaluator that do not otherwise pass through the typed summary.
+    // All consumers share checked rows so alternate projections cannot bypass validation.
     for record in records { _ = try CapabilityRecord(catalogRow: record) }
 
-    // Sort by supplied updatedAt or name, preserving undated/unnamed absence
-    // and merge order for equal keys; this does not rewrite either field.
+    // Stable sorting preserves absent dates/names and equal-key merge order without rewriting evidence.
     let indexed = records.enumerated().map { ($0.offset, $0.element) }
     let sorted = indexed.sorted { lhs, rhs in
         let lk = lhs.1["updatedAt"]?.stringValue ?? lhs.1["name"]?.stringValue

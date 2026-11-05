@@ -16,20 +16,16 @@ import Photos
 import PersistenceCore
 import UserNotifications
 
-// Blueprint: | `SystemPermissionPreflight.swift` | Shared card and Settings consent acquisition collects item authorization errors and remedies while continuing unrelated grants; three-second foreground activation and task-cancellable thirty-second Bluetooth answer bounds release their observers/managers without inventing a grant verdict |
+// Blueprint: | `SystemPermissionPreflight.swift` | Shared consent; scoped failures, bounded activation and Bluetooth waits, checked cleanup |
 
 extension SystemPermissionPreflight {
-    /// From a card tap, with the person there: fire macOS's own prompt where
-    /// it has one, and open the right System Settings pane for what is still
-    /// off. True when the card should wait for that pane.
+    /// Request native grants only with the person present. Each unresolved item reports why; the first one in walk order has its Settings pane open.
     @MainActor
-    static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> Bool {
-        !(try await requestMacOSAccess(ids, mode: mode)).isEmpty
+    static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> [String] {
+        try await requestMacOSAccess(ids, mode: mode)
     }
 
-    /// Both permission cards and Settings request through this owner. A grant
-    /// that succeeds stays in NativeAgent; only unresolved access opens a pane.
-    /// Item failures are reported together after unrelated grants are requested.
+    /// Successful grants stay in-app; collect item failures while unrelated requests proceed.
     @MainActor
     static func requestMacOSAccess(
         _ ids: [String], mode: InlineInteraction.AccessMode? = nil
@@ -38,7 +34,7 @@ extension SystemPermissionPreflight {
         var requestFailed = false
         var openedPanes: Set<SystemPermissionCapability> = []
         defer { NotificationCenter.default.post(name: permissionDidChange, object: nil) }
-        for id in ids {
+        for id in frictionOrder(ids) {
             guard let gate = cardSettingsCapability(id),
                   await cardBlockReason([id], mode: mode) != nil else { continue }
             if let problem = await activationProblem() {
@@ -77,10 +73,8 @@ extension SystemPermissionPreflight {
                     if let unresolved = await BluetoothPrompt.ask() {
                         throw ToolFailureError(unresolved, effects: .none)
                     }
-                // These two list the app in their pane on first ask, so the
-                // person has a switch to turn on.
-                case .accessibility:
-                    _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+                // First requests register the app in Settings so the person has a switch to enable.
+                case .accessibility: registerForAccessibility()
                 case .screenRecording: _ = CGRequestScreenCaptureAccess()
                 case .inputMonitoring: _ = CGRequestListenEventAccess()
                 case .fullDiskAccess:
@@ -90,13 +84,13 @@ extension SystemPermissionPreflight {
             }
             } catch {
                 let cause = "\(gate.displayName) (\(id)) permission request could not complete: \(error.localizedDescription)"
-                // A cancelled caller never opens another pane. Other request
-                // failures retain their cause alongside the existing remedy.
-                let handoff = Task.isCancelled || TaskWaitDeadline.expired || !openedPanes.isEmpty || !openedPanes.insert(gate).inserted ? nil : openSettings(gate)
+                // Cancellation must not open another pane; other failures keep both cause and remedy.
+                let handoff = Task.isCancelled
+                    || !openedPanes.isEmpty || !openedPanes.insert(gate).inserted ? nil : openSettings(gate, registered: true)
                 let remedy = " Open System Settings > Privacy & Security > \(gate.displayName), allow NativeAgent, then return here and refresh."
                 problems.append(cause + remedy + (handoff.map { " " + $0 } ?? ""))
                 requestFailed = true
-                if Task.isCancelled || TaskWaitDeadline.expired { break }
+                if Task.isCancelled { break }
                 continue
             }
             guard !Task.isCancelled else {
@@ -105,9 +99,8 @@ extension SystemPermissionPreflight {
             }
             if let reason = await cardBlockReason([id], mode: mode) {
                 problems.append(reason)
-                // One pane at a time, the first still off: System Settings shows only
-                // the last pane opened, so a second would hide the one that matters.
-                if openedPanes.isEmpty, openedPanes.insert(gate).inserted, let failure = openSettings(gate) {
+                // Open only the first unresolved pane because each later pane hides the previous one.
+                if openedPanes.isEmpty, openedPanes.insert(gate).inserted, let failure = openSettings(gate, registered: true) {
                     problems.append(failure)
                 }
             }
@@ -115,13 +108,15 @@ extension SystemPermissionPreflight {
         if requestFailed {
             throw ToolFailureError(problems.joined(separator: " "), effects: .none,
                 owner: "macOS permissions", tap: "System Settings",
-                code: "system_permission_request_unresolved", instruction: "For each unresolved permission, allow NativeAgent in the named pane, then return to the permission card or Settings and refresh.")
+                code: "system_permission_request_unresolved", instruction: """
+                    For each unresolved permission, allow NativeAgent in the named pane, then return to the permission card or Settings and \
+                    refresh.
+                    """)
         }
         return problems
     }
 
-    /// Activation is a request macOS may decline. Waking is not proof: read
-    /// AppKit's current state before asking for any grant, on every exit.
+    /// Activation may be declined; verify AppKit state on every exit before asking for a grant.
     @MainActor
     private static func activationProblem() async -> String? {
         guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
@@ -146,22 +141,33 @@ extension SystemPermissionPreflight {
         return nil
     }
 
-    /// Retain a failed handoff as a visible request error in Settings.
+    /// The Accessibility list shows only apps that asked, so asking first gives the person NativeAgent's switch in the pane.
     @MainActor
-    static func openSettings(_ capability: SystemPermissionCapability) -> String? {
+    private static func registerForAccessibility() {
+        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+    }
+
+    /// Keep a failed handoff visible in Settings instead of implying the request ran. Accessibility registers before its pane opens unless the caller
+    /// just asked for it.
+    @MainActor
+    static func openSettings(_ capability: SystemPermissionCapability, registered: Bool = false) -> String? {
+        if capability == .accessibility, !registered { registerForAccessibility() }
         guard let url = settingsURL(for: capability) else {
             return "NativeAgent could not find a System Settings privacy pane for \(capability.displayName)."
         }
         guard NSWorkspace.shared.open(url) else {
-            return "NativeAgent could not open System Settings → Privacy & Security → \(capability.displayName). Open System Settings manually, enable NativeAgent, then return here and refresh."
+            return """
+                NativeAgent could not open System Settings → Privacy & Security → \(capability.displayName). Open System Settings \
+                manually, enable NativeAgent, then return here and refresh.
+                """
         }
+        SettingsDock.shared.show(for: capability)
         return nil
     }
 
 }
 
-/// Bluetooth has no request call: macOS asks when the app first makes a
-/// central manager, and the manager's state settles on the answer.
+/// Bluetooth prompts on central-manager creation; its state supplies the answer, not a request callback.
 @MainActor
 private final class BluetoothPrompt: NSObject, @preconcurrency CBCentralManagerDelegate {
     private var manager: CBCentralManager?

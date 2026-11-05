@@ -8,12 +8,10 @@ import MacControl
 import PersistenceCore
 import ApplicationServices
 import ToolExecution
-// Blueprint: | `DesktopAgentConversationRoute.swift` | The originating app door calls `Resources/abilities/desktop-courier.js` through L0 `Parts.call` for reply-address wording and the courier's constrained tool-turn procedure. Native code serializes exact recipient/message data and retains the tool-turn owner, exact-recipient/send-evidence fence, screen/input ownership, uncertain outcomes and settlement. Grok's direct native send/reply watch remains separate; part failure stops before courier typing, with no compiled procedure fallback |
+// Blueprint: | `DesktopAgentConversationRoute.swift` | `Resources/abilities/desktop-courier.js`, `Parts.call` |
 
-/// Executes the SEND half of a desktop adapter beneath the conversation API.
-/// The short-lived operator uses the ordinary gated Mac tools; it owns no agent
-/// or transcript. A desktop contact is send-only: its reply comes back through
-/// this app's own inbound agent door, never by reading its screen.
+/// Desktop operators use ordinary gated Mac tools and own no transcript or agent. Send-only contacts answer through authenticated inbound messaging, never
+/// screen scraping.
 public actor DesktopAgentConversationRoute {
     let clients: any AgentContactClients
     private let dataRoot: URL
@@ -21,18 +19,19 @@ public actor DesktopAgentConversationRoute {
 
     init(clients: any AgentContactClients, dataRoot: URL) { self.clients = clients; self.dataRoot = dataRoot }
 
-    public func grokBootstrap(_ text: String, bot: String, beforeSubmission: @Sendable () throws -> Void) async throws {
+    public func grokBootstrap(turn: Turn, mac: MacOperationContext, _ text: String, bot: String, beforeSubmission: @Sendable () throws -> Void) async throws {
         guard !busy else { throw GrokRoutineAccessibility.Blocker.busy }
         busy = true
         defer { busy = false }
-        try await GrokRoutineAccessibility.send(text, bot: bot, beforeSubmission: beforeSubmission)
+        try await GrokRoutineAccessibility.send(turn: turn, mac: mac, text, bot: bot, beforeSubmission: beforeSubmission)
     }
 
-    @discardableResult public func importGrokRoutine(peer: String, dataRoot: URL, waitForCreation: Bool) async throws -> String {
+    @discardableResult public func importGrokRoutine(turn: Turn, mac: MacOperationContext, peer: String, dataRoot: URL,
+        waitForCreation: Bool) async throws -> String {
         guard !busy else { throw GrokRoutineAccessibility.Blocker.busy }
         busy = true
         defer { busy = false }
-        return try await GrokRoutineAccessibility.importRoutine(peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation)
+        return try await GrokRoutineAccessibility.importRoutine(turn: turn, mac: mac, peer: peer, dataRoot: dataRoot, waitForCreation: waitForCreation)
     }
 
     private struct CourierInstructions: Codable, Sendable {
@@ -40,16 +39,18 @@ public actor DesktopAgentConversationRoute {
         let procedure: String
     }
 
-    public func run(plan: [String: JSONValue], inner: any ToolDispatchClient, surface: String) async -> JSONValue {
+    public func run(turn: Turn, work: ChatTurnWork, mac: MacOperationContext, plan: [String: JSONValue], inner: any ToolDispatchClient,
+        surface: String) async -> JSONValue {
         let agent = string(plan["agent"]) ?? "unknown"
         guard !busy else { return result(agent, "busy", "The desktop is handling another conversation. Send again when it finishes.") }
         busy = true
-        let output = await operate(plan: plan, inner: inner, surface: surface)
+        let output = await operate(turn: turn, work: work, mac: mac, plan: plan, inner: inner, surface: surface)
         return await settle { await self.release(output) }
     }
     private func release(_ output: JSONValue) -> JSONValue { busy = false; return output }
 
-    private func operate(plan: [String: JSONValue], inner: any ToolDispatchClient, surface: String) async -> JSONValue {
+    private func operate(turn: Turn, work: ChatTurnWork, mac: MacOperationContext, plan: [String: JSONValue], inner: any ToolDispatchClient,
+        surface: String) async -> JSONValue {
         let agent = string(plan["agent"]) ?? "unknown"
         guard case .object(let target)? = plan["target"], let bundle = string(target["app_bundle_id"]),
               let label = string(target["conversation_label"]), !label.isEmpty else {
@@ -58,24 +59,23 @@ public actor DesktopAgentConversationRoute {
         guard let requested = string(plan["requested_text"]), !requested.isEmpty else {
             return result(agent, "needs_setup", "A desktop contact is send-only; this route carries a message or nothing at all.")
         }
-        // Grok's answer is read from its own chat, so it is not asked to answer
-        // through an agent door as well: an inbound message there carries
-        // nothing that ties it to this send, and two answers would be recorded.
-        // Wake a covered screen before activating the target app.
-        do { try await MacScreenLock.wakeIfCovered() } catch {
+        // Native chat readers already correlate the answer, so requesting a second inbound answer would duplicate it. Wake covered screens before activation.
+        do { try await MacScreenLock.wakeIfCovered(turn: turn, context: mac) } catch {
             return Self.stopped(agent, app: "the app", stage: "waking the screen", typed: false, submitted: false,
                                 why: (error as? MacScreenLock.Covered)?.detail ?? "\(error)")
         }
-        // Grok's native sender owns submission evidence and reply watching.
+        // Native submission and reply-watch evidence remain with their route owner.
         if bundle == GrokBotRoute.bundleID {
             do {
-                try await GrokRoutineAccessibility.send(requested, bot: label, watchReply: true)
-                // The reply watch runs after this returns, outside `busy`
-                // (GrokDesktopReply.follow), so other desktop sends aren't held.
+                try await GrokRoutineAccessibility.send(turn: turn, mac: mac, requested, bot: label, watchReply: true)
+                // Release busy ownership before following replies so other desktop sends can proceed.
                 guard case .object(var fields) = Self.delivered(agent) else { return Self.delivered(agent) }
                 fields["submission_observation"] = await GrokRoutineAccessibility.submissionObservation
                 guard let sent = await GrokRoutineAccessibility.sentLayout else {
-                    fields["detail"] = .string("Pasted into chat \u{201C}\(label)\u{201D} in the Grok Bot app and seen there, but that chat's transcript could not be read to watch for the answer; it stays in that chat.")
+                    fields["detail"] = .string("""
+                        Pasted into chat \u{201C}\(label)\u{201D} in the Grok Bot app and seen there, but that chat's transcript could not be read \
+                        to watch for the answer; it stays in that chat.
+                        """)
                     fields.removeValue(forKey: "reply_with")
                     return .object(fields)
                 }
@@ -93,28 +93,28 @@ public actor DesktopAgentConversationRoute {
         }
         let instructions: CourierInstructions
         switch await Parts(root: dataRoot).call(id: "desktop-courier",
-            input: .object(["agentName": .string(PeerFacingIdentity.agentName)]), as: CourierInstructions.self) {
+            input: .object(["agentName": .string(PeerFacingIdentity.agentName)]), invocation: .init(host: nil, execution: .init(turn: turn,
+                surface: surface, deadlines: work.deadlines)), as: CourierInstructions.self) {
         case .success(let value): instructions = value
         case .failure(let error):
             return Self.stopped(agent, app: "the app", stage: "preparing the courier instructions",
                 typed: false, submitted: false, why: error.localizedDescription)
         }
         let message = requested + "\n\n" + instructions.replyInstruction
-        let operatorTools = DesktopConversationTools(inner: inner, bundle: bundle, label: label, message: message)
+        let operatorTools = DesktopConversationTools(mac: mac, inner: inner, bundle: bundle, label: label, message: message)
         let client = clients.chatClient(tools: operatorTools)
         let task: JSONValue = .object([
             "app_bundle_id": .string(bundle), "conversation_label": .string(label),
             "operation": .string("send"), "message": .string(message)
         ])
         do {
-            // Native serialization carries the exact recipient/message data;
-            // the editable part owns the procedure, never delivery evidence.
+            // Native serialization carries the exact recipient/message data; the editable part owns the procedure, never delivery evidence.
             let prompt = instructions.procedure + "\n" + (try task.serialize(pretty: false))
-            let response = try await client.runEphemeralToolTurn(message: prompt, fileAccess: "auto", requireCompleted: true, surface: surface)
+            let response = try await client.runEphemeralToolTurn(message: prompt, fileAccess: "auto", requireCompleted: true,
+                surface: surface, turn: turn, work: work)
             return await operatorTools.project(answer: Self.answer(response.output), agent: agent)
         } catch let incomplete as EphemeralToolTurnIncomplete {
-            // A turn that stopped short still has an answer; it is judged only
-            // against what this fence saw happen.
+            // A turn that stopped short still has an answer; it is judged only against what this fence saw happen.
             return await operatorTools.project(answer: Self.answer(incomplete.output), agent: agent)
         } catch {
             return await operatorTools.stopped(agent, why: error.localizedDescription)
@@ -129,12 +129,14 @@ public actor DesktopAgentConversationRoute {
         .object([
             "agent": .string(agent), "view": .string("conversation"), "transport": .string("desktop"),
             "status": .string("sent"), "sent": .bool(true), "completed": .bool(false),
-            "detail": .string("Delivered to the app's chat: the outgoing message is visible in the verified conversation. Its reply arrives as an inbound message through the agent door, not in this result."),
+            "detail": .string("""
+                Delivered to the app's chat: the outgoing message is visible in the verified conversation. Its reply arrives as an inbound message \
+                through the agent door, not in this result.
+                """),
             "reply_with": .object(["tool": .string("agent_message"), "input": .object(["agent": .string(agent), "text": .string("<your next message>")])])
         ])
     }
-    /// Every unfinished send says where it stopped and whether sending again
-    /// could double-post: nothing typed is safe to resend; typed or submitted is not.
+    /// Typed or submitted text may double-post on resend; report the exact stopping point.
     static func stopped(_ agent: String, app: String, stage: String, typed: Bool, submitted: Bool, why: String) -> JSONValue {
         let reason = why.isEmpty ? "" : " (\(why))"
         let detail = !typed
@@ -158,10 +160,10 @@ public actor DesktopAgentConversationRoute {
     }
 }
 
-/// Request-scoped evidence fence over the transport's own verbs (screen, go,
-/// read, its result pages and act); every call still enters the app's file,
-/// Trust and Mac Control gates. No other execution door is offered or dispatched.
+/// Request-scoped evidence fence over the transport's own verbs (screen, go, read, its result pages and act); every call still enters the app's file, Trust and
+/// Mac Control gates. No other execution door is offered or dispatched.
 package actor DesktopConversationTools: ToolDispatchClient {
+    let mac: MacOperationContext
     let inner: any ToolDispatchClient
     let bundle: String
     let label: String
@@ -171,30 +173,34 @@ package actor DesktopConversationTools: ToolDispatchClient {
     private var typed = false
     private var submitted = false
     private var selectionSucceeded = false
-    /// Exact outgoing transcript occurrences before submission, when the app
-    /// has a native reader. Missing evidence permits sending, never confirmation.
+    /// Exact outgoing transcript occurrences before submission, when the app has a native reader. Missing evidence permits sending, never confirmation.
     private var baseline: Int?
     private var observed = ""
     private var goReport = ""
-    /// Where the route is and the last thing that went wrong, for a stop to name.
+    /// Retain stage and failure evidence so Stop can report where the send ended.
     private var stage = "opening the app"
     private var problem = ""
 
-    package init(inner: any ToolDispatchClient, bundle: String, label: String, message: String,
+    package init(mac: MacOperationContext, inner: any ToolDispatchClient, bundle: String, label: String, message: String,
          frontmostBundle: @escaping @Sendable () async -> String? = {
              await MainActor.run { NSWorkspace.shared.frontmostApplication?.bundleIdentifier }
          }) {
-        self.inner = inner; self.bundle = bundle; self.label = label; self.message = message
+        self.mac = mac; self.inner = inner; self.bundle = bundle; self.label = label; self.message = message
         self.frontmostBundle = frontmostBundle
     }
-    package func listAvailableTools() async throws -> [String] {
-        try await listAvailableToolSchemas().map(\.name)
+    package func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
+        try await listAvailableToolSchemas(turn: turn, surface: surface).map(\.name)
     }
     private static let offered: Set<String> = ["screen", "go", "read", "tool_result_page", "act"]
-    package func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas(named: Self.offered).filter { Self.offered.contains($0.name) }
+    package func listAvailableToolSchemas(turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(named: Self.offered, turn: turn, surface: surface).filter { Self.offered.contains($0.name) }
     }
-    package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    package func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
+        var mac = self.mac
+        if let deadline = invocation.waitDeadline {
+            mac.deadline = mac.deadline.map { min($0, deadline) } ?? deadline
+        }
+        let invocation = invocation.serving(mac: mac)
         guard Self.offered.contains(tool) else {
             throw refusal("This courier only offers its scoped screen, go, read, result paging and act operations. That call did not run.")
         }
@@ -207,19 +213,20 @@ package actor DesktopConversationTools: ToolDispatchClient {
         } else if tool == "go" {
             selectionSucceeded = false
             if await frontmostBundle() != bundle {
-                // go reads a dotted bundle id as a web address; hand it the app's name.
+                // Use the app name because go interprets dotted bundle IDs as web addresses.
                 let appName = await MainActor.run {
                     NSRunningApplication.runningApplications(withBundleIdentifier: bundle).first?.localizedName
                         ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle)?.deletingPathExtension().lastPathComponent
                 }
-                let went = try await inner.dispatch(tool: "go", input: ["name": .string(appName ?? bundle)], surface: surface)
+                let went = try await inner.dispatch(tool: "go", input: ["name": .string(appName ?? bundle)], surface: surface, turn: turn,
+                    invocation: invocation)
                 goReport = String(flatten(went).prefix(300))
             }
             guard await frontmostBundle() == bundle else { throw refusal("The exact target app could not be brought forward. \(goReport)") }
             stage = "selecting the conversation"
-            // MacFourVerbs' destination wording compares display names. Verify
-            // the bundle identity ourselves, then return a fresh scoped read.
-            let screen = try await inner.dispatch(tool: "screen", input: ["app": .string(bundle), "pixels": .bool(false)], surface: surface)
+            // MacFourVerbs' destination wording compares display names. Verify the bundle identity ourselves, then return a fresh scoped read.
+            let screen = try await inner.dispatch(tool: "screen", input: ["app": .string(bundle), "pixels": .bool(false)], surface: surface, turn: turn,
+                invocation: invocation)
             observed = String(flatten(screen).prefix(120_000))
             return screen
         } else if ["read", "tool_result_page", "act"].contains(tool) {
@@ -229,31 +236,32 @@ package actor DesktopConversationTools: ToolDispatchClient {
                 guard args["path"] == nil || args["path"] == .string("") else { throw refusal("This route only reads the on-screen conversation, not files.") }
                 args = [:]
             } else if tool == "tool_result_page" {
-                // The existing turn-result owner validates handle scope and
-                // bounds; no new file reader or persistence is introduced.
+                // The existing turn-result owner validates handle scope and bounds; no new file reader or persistence is introduced.
             } else {
-                // The app is pinned and verified in front above; act needs no name for it.
+                // Act can omit its target only after the foreground app is pinned and verified.
                 args.removeValue(forKey: "app")
                 let target = string(args["target"])
-                // "press" is a key for a key name, else a click (as MacControl reads it).
+                // Interpret press as a key only for key names, matching MacControl’s own parser.
                 let verb = string(args["verb"]) == "press" ? (["return", "enter"].contains(target.lowercased()) ? "key" : "click") : string(args["verb"])
                 for key in ["holding", "to", "to_app"] where args[key] == .string("") { args.removeValue(forKey: key) }
                 for key in ["seconds", "interval"] where args[key] == .int(0) || args[key] == .double(0) { args.removeValue(forKey: key) }
                 if args["repeat"] == .int(1) { args.removeValue(forKey: "repeat") }
                 if args["button"] == .string("auto") { args.removeValue(forKey: "button") }
-                guard Set(args.keys).isSubset(of: ["verb", "target", "text", "direction", "scroll_amount", "session_id", "__session_id"]) else { throw refusal("Unsupported desktop action fields.") }
+                guard Set(args.keys).isSubset(of: ["verb", "target", "text", "direction", "scroll_amount", "session_id",
+                    "__session_id"]) else { throw refusal("Unsupported desktop action fields.") }
                 if submitted {
                     return .object([
                         "ok": .bool(true), "status": .string("already_submitted"),
                         "sent": .bool(false), "automatic_resend": .bool(false),
-                        "text": .string("Submission was already attempted. No additional action was performed. Use read with {} to verify the outgoing message."),
+                        "text": .string(
+                            "Submission was already attempted. No additional action was performed. Use read with {} to verify the outgoing message."),
                         "next_action": .object(["tool": .string("read"), "input": .object([:])]),
                     ])
                 }
                 switch verb {
                 case "type":
                     guard !typed, string(args["text"]) == message else { throw refusal("Only the exact requested message may be typed once.") }
-                    guard selectionSucceeded, let composer = try await Self.verifiedComposerTarget(bundle: bundle, label: label, content: "") else {
+                    guard selectionSucceeded, let composer = try await Self.verifiedComposerTarget(mac: mac, bundle: bundle, label: label, content: "") else {
                         throw refusal("The exact conversation and an empty message box could not be verified. Nothing was typed.")
                     }
                     args["target"] = .string(composer)
@@ -261,18 +269,19 @@ package actor DesktopConversationTools: ToolDispatchClient {
                     stage = "typing the message"; typing = true
                 case "key":
                     guard typed, ["return", "enter"].contains(target.lowercased()) else { throw refusal("Only one message submission key is permitted.") }
-                    guard try await Self.verifiedComposerTarget(bundle: bundle, label: label, content: message) != nil else {
+                    guard try await Self.verifiedComposerTarget(mac: mac, bundle: bundle, label: label, content: message) != nil else {
                         throw refusal("The conversation or composed message changed. Submission stopped.")
                     }
-                    baseline = try await DesktopChatRoute.outgoingOccurrences(message, bundle: bundle, label: label)
+                    baseline = try await DesktopChatRoute.outgoingOccurrences(mac: mac, message, bundle: bundle, label: label)
                     submitted = true; stage = "verifying the sent message"; submitting = true
                 case "click":
                     if typed {
-                        guard ["send", "send message"].contains(target.lowercased()) else { throw refusal("Only the send control may be clicked after composing.") }
-                        guard try await Self.verifiedComposerTarget(bundle: bundle, label: label, content: message) != nil else {
+                        guard ["send", "send message"].contains(target.lowercased()) else { throw refusal(
+                            "Only the send control may be clicked after composing.") }
+                        guard try await Self.verifiedComposerTarget(mac: mac, bundle: bundle, label: label, content: message) != nil else {
                             throw refusal("The conversation or composed message changed. Submission stopped.")
                         }
-                        baseline = try await DesktopChatRoute.outgoingOccurrences(message, bundle: bundle, label: label)
+                        baseline = try await DesktopChatRoute.outgoingOccurrences(mac: mac, message, bundle: bundle, label: label)
                         submitted = true; stage = "verifying the sent message"; submitting = true
                     } else {
                         let decorated = target.hasPrefix(label + ", ") && observed.contains(target)
@@ -287,7 +296,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
         // Only a read taken after the submission counts as evidence of it.
         if submitting { observed = "" }
         let response: JSONValue
-        do { response = try await inner.dispatch(tool: tool, input: args, surface: surface) }
+        do { response = try await inner.dispatch(tool: tool, input: args, surface: surface, turn: turn, invocation: invocation) }
         catch { problem = String(error.localizedDescription.prefix(240)); throw error }
         if ["screen", "read", "tool_result_page"].contains(tool) {
             observed = String(flatten(response).prefix(120_000))
@@ -297,8 +306,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
         }
         if case .object(let reply) = response, reply["ok"] == .bool(false) {
             if case .string(let text)? = reply["text"] { problem = String(text.prefix { $0 != "\n" }.prefix(240)) }
-            // MacControl touched nothing (no such target, ambiguous, disabled,
-            // the front moved): that typing attempt never happened, so it may be tried again.
+            // A refusal that touched nothing permits another typing attempt without duplicating text.
             if typing, case .object(let detail)? = reply["detail"],
                case .string(let code)? = detail["error"],
                ["no_match", "ambiguous", "target_disabled", "front_window_changed", "owner_changed_apps"].contains(code) {
@@ -308,54 +316,54 @@ package actor DesktopConversationTools: ToolDispatchClient {
         return response
     }
 
-    @MainActor private static func verifiedComposerTarget(bundle: String, label: String, content: String) throws -> String? {
-        try MacAccessibilityReader.withReadBudget { try verifiedComposerTargetRead(bundle: bundle, label: label, content: content) }
+    @MainActor private static func verifiedComposerTarget(mac: MacOperationContext, bundle: String, label: String, content: String) throws -> String? {
+        try MacAccessibilityReader.withReadBudget(context: mac) { mac in try verifiedComposerTargetRead(mac: mac, bundle: bundle, label: label,
+            content: content) }
     }
-    @MainActor private static func verifiedComposerTargetRead(bundle: String, label: String, content: String) throws -> String? {
+    @MainActor private static func verifiedComposerTargetRead(mac: MacOperationContext, bundle: String, label: String, content: String) throws -> String? {
         let source = SystemMacAXElementSource()
         guard source.isTrusted(), let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier == bundle else { return nil }
-        let windows = try source.nativeWindows(pid: app.processIdentifier)
-        guard let root = source.nativeApplication(pid: app.processIdentifier),
-              let focused = MacAXAttributeRead.copyElement(root, kAXFocusedWindowAttribute),
+        let windows = try source.nativeWindows(pid: app.processIdentifier, context: mac)
+        guard let root = source.nativeApplication(pid: app.processIdentifier, context: mac),
+              let focused = MacAXAttributeRead.copyElement(root, kAXFocusedWindowAttribute, context: mac),
               let window = windows.first(where: { CFEqual(focused, $0) }) else { return nil }
-        let tree = try MacAccessibilityReader.elements(in: window, searching: "the exact desktop conversation and composer") {
-            MacAXAttributeRead.text($0, kAXSubroleAttribute) != "AXApplicationLog"
+        let tree = try MacAccessibilityReader.elements(in: window, searching: "the exact desktop conversation and composer", context: mac) {
+            MacAXAttributeRead.text($0, kAXSubroleAttribute, context: mac) != "AXApplicationLog"
         }
         func named(_ node: AXUIElement) -> Bool {
-            MacAXAttributeRead.text(node, kAXTitleAttribute) == label || MacAXAttributeRead.text(node, kAXDescriptionAttribute) == label
+            MacAXAttributeRead.text(node, kAXTitleAttribute, context: mac) == label || MacAXAttributeRead.text(node, kAXDescriptionAttribute,
+                context: mac) == label
         }
-        guard !tree.contains(where: { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXSheetRole || MacAXAttributeRead.text($0, kAXSubroleAttribute) == kAXDialogSubrole }),
+        guard !tree.contains(where: { MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == kAXSheetRole || MacAXAttributeRead.text($0,
+            kAXSubroleAttribute, context: mac) == kAXDialogSubrole }),
               named(window) || tree.contains(where: {
-                  named($0) && (MacAXAttributeRead.text($0, kAXRoleAttribute) == "AXHeading"
-                      || MacAXAttributeRead.copyRaw($0, kAXSelectedAttribute) as? Bool == true)
+                  named($0) && (MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac) == "AXHeading"
+                      || MacAXAttributeRead.copyRaw($0, kAXSelectedAttribute, context: mac) as? Bool == true)
               }) else { return nil }
         let boxes = tree.filter {
-            [kAXTextAreaRole, kAXTextFieldRole].contains(MacAXAttributeRead.text($0, kAXRoleAttribute))
-                && MacAXAttributeRead.text($0, kAXSubroleAttribute) != kAXSearchFieldSubrole
-                && MacAXAttributeRead.copyRaw($0, kAXEnabledAttribute) as? Bool == true
+            [kAXTextAreaRole, kAXTextFieldRole].contains(MacAXAttributeRead.text($0, kAXRoleAttribute, context: mac))
+                && MacAXAttributeRead.text($0, kAXSubroleAttribute, context: mac) != kAXSearchFieldSubrole
+                && MacAXAttributeRead.copyRaw($0, kAXEnabledAttribute, context: mac) as? Bool == true
         }
         guard boxes.count == 1 else { return nil }
-        let value = try GrokRoutineAccessibility.composerValue(boxes[0])
+        let value = try GrokRoutineAccessibility.composerValue(mac: mac, boxes[0])
         guard
               value.trimmingCharacters(in: .whitespacesAndNewlines) == content.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
-        return MacAXAttributeRead.text(boxes[0], kAXRoleAttribute) == kAXTextAreaRole ? "text area" : "text"
+        return MacAXAttributeRead.text(boxes[0], kAXRoleAttribute, context: mac) == kAXTextAreaRole ? "text area" : "text"
     }
-    /// Send-only: native transcript reads establish outgoing delivery.
-    /// No reply is looked for here — the recipient answers through the app's
-    /// own inbound agent door, which arrives as an ordinary inbound message.
+    /// Native outgoing rows may prove delivery; replies still arrive through the authenticated inbound door.
     func project(answer: [String: JSONValue], agent: String) async -> JSONValue {
         if submitted, let baseline {
             do {
-                if let count = try await DesktopChatRoute.outgoingOccurrences(message, bundle: bundle, label: label), count > baseline {
+                if let count = try await DesktopChatRoute.outgoingOccurrences(mac: mac, message, bundle: bundle, label: label), count > baseline {
                     return DesktopAgentConversationRoute.delivered(agent)
                 }
             } catch { problem = "Outgoing transcript read failed: \(error.localizedDescription)" }
         } else if submitted {
             problem = "No native outgoing-transcript baseline was available; delivery is unconfirmed."
         }
-        // The operator's note is model-written: it rides inside the fixed
-        // frame of what this fence itself saw happen.
+        // Frame model-written notes inside fixed evidence from this request’s fence.
         let note = String(string(answer["detail"]).prefix(300))
         let why = [problem, note.isEmpty ? "" : "operator: " + note].filter { !$0.isEmpty }.joined(separator: " ")
         return stopped(agent, why: why)

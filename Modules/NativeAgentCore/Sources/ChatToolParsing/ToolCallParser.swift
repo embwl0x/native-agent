@@ -6,17 +6,14 @@ import TurnTrace
 // MARK: - Parsed tool call
 
 package struct ParsedToolCall: Equatable {
-    /// Provider-issued call id. Echoed back as `tool_result.tool_use_id`
-    /// (Anthropic) or `function_call_output.call_id` (OpenAI). Empty when
-    /// the text-marker protocol supplied none.
+    /// Provider-issued call id. Echoed back as `tool_result.tool_use_id` (Anthropic) or `function_call_output.call_id` (OpenAI). Empty when the text-marker
+    /// protocol supplied none.
     package let id: String
     package let name: String
     package let input: [String: JSONValue]
-    /// <invoke> parameters that were JSON-typed, as written, so a
-    /// string-schema param given text "42" can be restored to the string.
+    /// <invoke> parameters that were JSON-typed, as written, so a string-schema param given text "42" can be restored to the string.
     package var invokeRawText: [String: String] = [:]
-    /// Text lane: undeclared fields or raw invoke content without parameters.
-    /// Such a block is a result she wrote, not a call, and never runs.
+    /// Text lane: undeclared fields or raw invoke content without parameters. Such a block is a result the agent wrote, not a call, and never runs.
     package var undeclaredKeys: [String] = []
 
     package init(
@@ -47,15 +44,16 @@ package struct ToolCallProtocolViolation: Equatable {
         if kind == .malformedToolUseMarker {
             return "[tool.call reason=malformed_tool_call] Broken call text; no call from this reply ran. Correct it using this conversation's call format."
         }
-        return "[tool.call reason=formatted_tool_call] The call was formatted as Markdown; no call from this reply ran. Use this conversation's executable call format."
+        return """
+            [tool.call reason=formatted_tool_call] The call was formatted as Markdown; no call from this reply ran. Use this conversation's executable \
+            call format.
+            """
     }
 
 }
 
 package enum ToolCallParser {
-    /// Parse only the offered text-marker grammar. Native structured calls
-    /// are decoded by their transport, never by reparsing response prose.
-    /// `parseInvoke`: only the text tool lane runs Claude's `<invoke>` form.
+    /// Native calls belong to their transport decoder; only the text protocol parses invoke markup.
     package static func parse(_ raw: String, parseInvoke: Bool = false, recordShims: Bool = true) -> [ParsedToolCall] {
         let positioned = parseAnthropic(raw)
         guard formattedToolCallViolation(in: raw, toolNames: Set(positioned.map { $0.1.name }), parseInvoke: parseInvoke,
@@ -66,13 +64,13 @@ package enum ToolCallParser {
             let call = positioned.1
             guard !isIgnorableToolName(call.name) else { return nil }
             if recordShims, positioned.2, call.undeclaredKeys.isEmpty {
-                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L12"), "site": .string("ToolCallParser.swift:parseAnthropic")]))
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L12"), "site": .string(
+                    "ToolCallParser.swift:parseAnthropic")]), turn: nil)
             }
             return call
         }
     }
 
-    /// Restore the outer closing tag swallowed by the text-lane API stop.
     package static func throughLastToolMarker(_ raw: String) -> String {
         guard ["</tool_use>", "</invoke>", "</function_calls>"].contains(where: raw.contains) else { return raw }
         var cut = raw
@@ -91,7 +89,6 @@ package enum ToolCallParser {
         #"<invoke\s+name="[^"]+"\s*>[\s\S]*?</invoke>"#,
     ].map { try! NSRegularExpression(pattern: $0) }
 
-    /// The prose without text-protocol calls, with or without supplied IDs.
     package static func stripToolUseMarkers(_ raw: String) -> String {
         var s = raw
         for rx in toolUseMarkerRegexes {
@@ -139,25 +136,26 @@ package enum ToolCallParser {
     private static let orphanRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:</?(?:tool_use|invoke|parameter)\b|_?(?:tool_use|ool_use)\b[ \t>])"#)
     private static let invokeStartRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:<function_calls>\s*)?<invoke\b"#)
     private static let formattedMarkerRegex = try! NSRegularExpression(pattern: #"(?is)(?:\*\*|__)\s*<(tool_use|invoke)\b[\s\S]*?</\1>\s*(?:\*\*|__)"#)
-    private static let headerRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:\d+[ \t]*)?(?:\*\*|__)?[ \t]*Tool[ \t]+Call[ \t]*(?::[ \t]*[A-Za-z0-9_.:-]*)?[ \t]*(?:\*\*|__)?[ \t]*$"#)
+    private static let headerRegex = try! NSRegularExpression(
+        pattern: #"(?im)^[ \t]*(?:\d+[ \t]*)?(?:\*\*|__)?[ \t]*Tool[ \t]+Call[ \t]*(?::[ \t]*[A-Za-z0-9_.:-]*)?[ \t]*(?:\*\*|__)?[ \t]*$"#)
     private static let fencedJSONRegex = try! NSRegularExpression(pattern: #"(?is)(?:```|~~~)[ \t]*(?:json)?[ \t]*\r?\n[ \t]*\{[\s\S]*?(?:```|~~~)"#)
     private static let markerRegex = try! NSRegularExpression(pattern: #"<tool_use\s+(?:id="([^"]*)"\s+)?name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#)
     private static let positionedMarkerRegex = try! NSRegularExpression(pattern: "(?=" + markerRegex.pattern + ")")
     private static let invokeRegex = try! NSRegularExpression(pattern: #"<invoke\s+name="([^"]+)"\s*>([\s\S]*?)</invoke>"#)
     private static let parameterRegex = try! NSRegularExpression(pattern: #"<parameter\s+name="([^"]+)"\s*>([\s\S]*?)</parameter>"#)
 
-    /// Control debris is not prose, even when the provider ends inside it.
-    /// Keep fenced and inline code and complete calls intact, including their arguments.
+    /// Control debris is not prose, even when the provider ends inside it. Keep fenced and inline code and complete calls intact, including their
+    /// arguments.
     package static func stripProtocolDebris(_ raw: String) -> String {
         let stripped = raw.replacingOccurrences(
-            of: #"(?is)(```.*?```|~~~.*?~~~|(?<!`)(`+)(?!`).*?(?<!`)\2(?!`)|<tool_use\b[^<>]*>.*?</tool_use>|<invoke\b[^<>]*>.*?</invoke>)|(?:"# + protocolDebrisPattern + ")",
+            of: #"(?is)(```.*?```|~~~.*?~~~|(?<!`)(`+)(?!`).*?(?<!`)\2(?!`)|<tool_use\b[^<>]*>.*?</tool_use>|<invoke\b[^<>]*>.*?</invoke>)|(?:"#
+                + protocolDebrisPattern + ")",
             with: "$1", options: .regularExpression)
-        // Debris stripping is protocol transport and carries no receipt (L16 stays uninstrumented: the envelope is expected, so a stamp could not tell debris from protocol).
+        // Expected protocol debris carries no receipt because a stamp cannot distinguish it from valid protocol.
         return stripped
     }
 
-    /// Broken or formatted executable calls get a format nudge; quoted code is prose.
-    /// The shared loop gives one format nudge before settling incomplete.
+    /// Broken or formatted executable calls get a format nudge; quoted code is prose. The shared loop gives one format nudge before settling incomplete.
     package static func formattedToolCallViolation(
         in raw: String, toolNames: Set<String> = [], parseInvoke: Bool = false
     ) -> ToolCallProtocolViolation? {
@@ -170,8 +168,7 @@ package enum ToolCallParser {
         calls: [ParsedToolCall]
     ) -> ToolCallProtocolViolation? {
         let unquoted = unquotedProtocolText(raw)
-        // Remove complete calls before looking for orphan tags or placeholders.
-        // Their arguments may legitimately contain these strings.
+        // Remove complete calls before looking for orphan tags or placeholders. Their arguments may legitimately contain these strings.
         let remainder = stripToolUseMarkers(unquoted)
         if regexMatches(orphanRegex, in: remainder)
             || (!unquoted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -185,13 +182,7 @@ package enum ToolCallParser {
             return ToolCallProtocolViolation(kind: .formattedToolUseMarker)
         }
 
-        // Pin the real failure shape observed on Telegram:
-        //   **Tool Call: codex_message**
-        //   ```json
-        //   { ... }
-        //   ```
-        // Requiring both an exact header line and a following fenced JSON
-        // object avoids bouncing ordinary prose that merely discusses calls.
+        // Require an exact call header followed by a fenced JSON object to avoid bouncing ordinary discussion of calls.
         if regexMatches(headerRegex, in: unquoted), regexMatches(fencedJSONRegex, in: raw) {
             return ToolCallProtocolViolation(kind: .markdownToolCallBlock)
         }
@@ -223,7 +214,7 @@ package enum ToolCallParser {
         "<function_result", "</function_result", "</tool_result", "<result", "</result",
     ]
 
-    /// Hold potential call text until the complete round can be checked.
+    /// Hold potential call text until the complete round can distinguish calls from examples.
     package static func earliestPotentialProtocolMarker(in raw: String) -> Range<String.Index>? {
         var candidates = protocolMarkerStarts.compactMap { needle in
             raw.range(of: needle, options: [.caseInsensitive])
@@ -243,7 +234,6 @@ package enum ToolCallParser {
         return candidates.min { $0.lowerBound < $1.lowerBound }
     }
 
-    /// Visible prose preceding the earliest possible protocol marker, unchanged if absent.
     package static func visiblePrefix(in raw: String) -> String {
         let unquoted = unquotedProtocolText(raw)
         if let candidate = earliestPotentialProtocolMarker(in: unquoted),
@@ -258,8 +248,7 @@ package enum ToolCallParser {
         return regex.firstMatch(in: raw, range: range) != nil
     }
 
-    /// A call's arguments as one object. Absent or empty arguments are none;
-    /// anything else that is not one JSON object is a body that never runs
+    /// A call's arguments as one object. Absent or empty arguments are none; anything else that is not one JSON object is a body that never runs
     /// (`undeclaredKeys` says why), never an empty call.
     static func argumentsCall(id: String, name: String, _ arguments: JSONValue) -> ParsedToolCall {
         let input: [String: JSONValue]?
@@ -276,14 +265,12 @@ package enum ToolCallParser {
         return call
     }
 
-    /// Read the marker body as the declared JSON object.
     static func markerObject(_ body: String) -> [String: JSONValue]? {
         guard case .object(let object)? = try? JSONValue.parse(Data(body.utf8)) else { return nil }
         return object
     }
 
-    /// Validate the entire invoke body before constructing an argument map.
-    /// Empty/whitespace bodies are the valid zero-argument call.
+    /// Validate the entire invoke body before constructing an argument map. Empty/whitespace bodies are the valid zero-argument call.
     private static func invokeParameters(in body: String) -> [NSTextCheckingResult]? {
         let ns = body as NSString
         let range = NSRange(location: 0, length: ns.length)

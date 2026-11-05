@@ -14,13 +14,12 @@ import ProviderRouting
 import AppToolRuntime
 // Blueprint: | `ContactPortraits.swift` | Contact app icons, initial tints, Clawd drawing and helper/crew clock tiles |
 
-/// The contact's app icon in a circle, or its initial on a tint of its own.
 struct SimpleAvatar: View {
     @Environment(AppModel.self) private var appModel
     let contact: SimpleContact
     var size: CGFloat = 30
 
-    /// Eight evenly spaced muted hues each contrast at least 5.09:1 with white initials.
+    /// Eight muted hues each clear 5.09:1 against white initials.
     nonisolated private static let tints: [UInt32] = [0x925A56, 0x886439, 0x6A713C, 0x42795D, 0x2B7880, 0x496F96, 0x6F6393, 0x895A79]
     nonisolated static var slotCount: Int { tints.count }
 
@@ -37,7 +36,7 @@ struct SimpleAvatar: View {
             if contact.clawd {
                 ClawdMark(size: size)
             } else if let icon = loadedIcon {
-                // The icon's squircle fills the circle; its transparent margin falls outside.
+                // Let the transparent icon margin fall outside so its squircle fills the circle.
                 Image(nsImage: icon).resizable().interpolation(.high).scaledToFit().scaleEffect(1.24)
             } else {
                 tint.overlay {
@@ -50,7 +49,6 @@ struct SimpleAvatar: View {
         .frame(width: size, height: size)
         .clipShape(Circle())
         .overlay { Circle().strokeBorder(NativeAgentShell.hairline, lineWidth: 0.5) }
-        // A small window on the desktop app's corner: this contact is the app itself.
         .overlay(alignment: .bottomTrailing) {
             if contact.link == .desktopApp {
                 Image(systemName: "macwindow")
@@ -73,7 +71,7 @@ struct SimpleAvatar: View {
     }
 }
 
-/// Clawd's 9×5 pixel drawing snaps to device pixels on a dark disc.
+/// Snap the pixel drawing to device pixels to keep its edges crisp.
 struct ClawdMark: View {
     var size: CGFloat
     @Environment(\.displayScale) private var displayScale
@@ -104,7 +102,6 @@ struct ClawdMark: View {
     }
 }
 
-/// Helpers and crews use quiet symbol tiles with a working rim.
 struct SimpleClockTile: View {
     var size: CGFloat = 30
     var symbol = "clock"

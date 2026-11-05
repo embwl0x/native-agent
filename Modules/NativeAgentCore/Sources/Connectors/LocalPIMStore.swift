@@ -2,13 +2,11 @@ import AuthoredCapabilities
 import Foundation
 @preconcurrency import EventKit
 import PersistenceCore
-// Blueprint: | `LocalPIMStore.swift` | concrete `LocalPIMStore` EventKit session; main-actor mutations, queue-confined reads and nonisolated reminder callback entry |
+// Blueprint: | `LocalPIMStore.swift` | `LocalPIMStore`: main-actor mutations, queue-confined reads and nonisolated callbacks |
 
 public enum LocalPIMCalendarAccess { case read, write }
 
-/// One EventKit session per action. Live objects never leave the main actor;
-/// enumeration uses its own store and callback queues render Core results
-/// inline before exporting Sendable values.
+/// Confine each action's EventKit objects to their actor or enumeration queue; export only rendered Sendable values.
 @MainActor
 final class LocalPIMStore {
     private let store = EKEventStore()
@@ -88,8 +86,7 @@ final class LocalPIMStore {
         store.fetchReminders(matching: predicate, completion: Self.reminderCompletion(completion))
     }
 
-    // Create Apple's ordinary block outside the actor; a hop inside an
-    // actor-inferred block would be too late to repair its callback entry.
+    // Create Apple's block outside actor isolation: hopping inside it cannot repair an actor-inferred callback entry.
     nonisolated private static func reminderCompletion(
         _ completion: @escaping @Sendable ([EKReminder]?) -> Void
     ) -> ([EKReminder]?) -> Void {

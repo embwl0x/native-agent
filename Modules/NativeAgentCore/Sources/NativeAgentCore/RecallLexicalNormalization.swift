@@ -1,4 +1,4 @@
-// Blueprint: | `RecallLexicalNormalization.swift` | `characterEditDistance`: pure Character comparison; `RecallLexicalNormalization`: shared retrieval-only inflections and question-word vocabulary; canonical text and authority remain verbatim |
+// Blueprint: | `RecallLexicalNormalization.swift` | `characterEditDistance`, `RecallLexicalNormalization`: shared retrieval normalization |
 
 /// Stable FNV-1a-64 over exact UTF-8; callers own seeds, normalization and formatting.
 public func fnv1a64(_ text: String, seed: UInt64 = 0xcbf2_9ce4_8422_2325) -> UInt64 {
@@ -23,9 +23,8 @@ public func characterEditDistance(_ a: [Character], _ b: [Character]) -> Int {
     return row[b.count]
 }
 
-/// Lightweight English inflection normalization for retrieval only. Never use
-/// this for canonical text, identifiers, authorization, or exact-match tools.
-/// Both sides of lexical matching use the same form; embeddings stay verbatim.
+/// Lightweight English inflection normalization for retrieval only. Never use this for canonical text, identifiers, authorization, or exact-match tools. Both
+/// sides of lexical matching use the same form; embeddings stay verbatim.
 public enum RecallLexicalNormalization {
     public static func term(_ token: String) -> String {
         guard token.count >= 5,
@@ -40,8 +39,7 @@ public enum RecallLexicalNormalization {
         return token
     }
 
-    /// Words that carry the SHAPE of a question, never its subject. Both the
-    /// context router and MemoryV2's BM25 lane score against this one list.
+    /// Share question-shape words between context routing and BM25 so subject words remain discriminative.
     public static let stopWords: Set<String> = [
         "a", "an", "and", "are", "as", "at", "be", "been", "by", "for",
         "from", "has", "have", "he", "her", "hers", "him", "his", "i", "in",
@@ -49,9 +47,8 @@ public enum RecallLexicalNormalization {
         "that", "the", "their", "theirs", "them", "they", "this", "to", "was",
         "we", "were", "what", "when", "where", "which", "who", "why", "will",
         "with", "you", "your", "yours",
-        // Auxiliary/modal verbs express the question, not its subject. A
-        // question starting "should the agent ..." must not rank every
-        // unrelated instruction containing "agent should" above the answer.
+        // Auxiliary/modal verbs express the question, not its subject. A question starting "should the agent ..." must not rank every unrelated instruction
+        // containing "agent should" above the answer.
         "am", "being", "can", "could", "did", "do", "does", "had",
         "may", "might", "must", "shall", "should", "would",
     ]

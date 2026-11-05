@@ -8,7 +8,7 @@ import ImageIO
 import Desk
 import Experiences
 import ToolExecution
-// Blueprint: | `SwiftOpenAIImageGenerationClient.swift` | OpenAI image request/result values and HTTP transport; default-deny admission, API credentials and per-item response decoding failures |
+// Blueprint: | `SwiftOpenAIImageGenerationClient.swift` | Admit only declared routes; report per-item response failures. |
 
 struct OpenAIImageGenerationRequest: Sendable, Equatable {
     var prompt: String
@@ -44,8 +44,8 @@ final class SwiftOpenAIImageGenerationClient: Sendable {
         self.dataRoot = dataRoot ?? PersistenceCore.defaultDataRoot()
     }
 
-    func generate(_ request: OpenAIImageGenerationRequest) async throws -> OpenAIImageGenerationResult {
-        guard try await ImageGenerationAdmission.allowed(dataRoot: dataRoot) else { throw ImageGenerationToolError.trustDenied }
+    func generate(turn: Turn?, _ request: OpenAIImageGenerationRequest) async throws -> OpenAIImageGenerationResult {
+        guard try await ImageGenerationAdmission.allowed(turn: turn, dataRoot: dataRoot) else { throw ImageGenerationToolError.trustDenied }
 
         let trimmedPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { throw ImageGenerationToolError.missingPrompt }

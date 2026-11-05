@@ -1,7 +1,7 @@
 import NativeAgentShared
 import Foundation
 
-// Blueprint: | `CognitionObservatoryView+Organism.swift` | Observatory organism panel: read-only kernel rows distinguish off, empty, stale and malformed readings |
+// Blueprint: | `CognitionObservatoryView+Organism.swift` | Kernel rows distinguish off, empty, stale and malformed |
 
 import Cognition
 import SwiftUI
@@ -71,9 +71,7 @@ extension CognitionObservatoryView {
     }
 }
 
-/// Read-only mapping for the mounted Organism Body panel. The kernel owns the
-/// snapshot; this presentation layer makes the difference between a real empty
-/// body, an off kernel, and a stale or malformed sample visible to the operator.
+/// Distinguish an empty body from off, stale or malformed kernel evidence; the kernel remains the snapshot owner.
 struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
     struct Row: Identifiable, Equatable, Sendable {
         let label: String

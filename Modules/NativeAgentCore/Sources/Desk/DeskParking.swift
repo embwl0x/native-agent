@@ -4,15 +4,11 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `DeskParking.swift` | `DeskDeferPreset`; deferred-work interpretation |
 
-/// "Parked": one rule for the Desk page's folded group and the agent's home
-/// screen. A piece of work with nothing executing for it that
-/// nobody has touched (itself or any of its parts) for two weeks, or a plan
-/// with none of its parts done that nobody moved for a week.
+/// Park untouched, nonexecuting work after two weeks, or an unstarted plan after one week.
 public enum DeskParking {
     public static let quietDays = 14
     public static let untouchedPlanDays = 7
 
-    /// The newest touch on the item or any of its parts.
     public static func lastTouch(_ item: DeskItem, in children: [String?: [DeskItem]]) -> Date? {
         ([item] + SwiftNativeDeskStore.descendants(of: item.handle, in: children))
             .compactMap { NativeTimestampFormat.parseISO8601FractionalFirst($0.updatedAt) }.max()
@@ -53,8 +49,7 @@ public enum DeskDeferPreset: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// `now` and `calendar` are injected so the boundary cases (a park chosen at
-    /// 23:59, a non-local time zone) are testable instead of clock-dependent.
+    /// Use the supplied clock and calendar so midnight and time-zone boundaries remain consistent.
     public func day(from now: Date, calendar: Calendar = .current) -> String {
         let target = calendar.date(byAdding: .day, value: days, to: now) ?? now
         return NativeTimestampFormat.calendarDay(target, timeZone: calendar.timeZone)

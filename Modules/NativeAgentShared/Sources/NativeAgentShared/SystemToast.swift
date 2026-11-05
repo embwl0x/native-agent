@@ -1,6 +1,6 @@
 import Foundation
 import Combine
-// Blueprint: | `SystemToast.swift` | `SystemToast` and `SystemToastCenter`: shared replace-by-ID notice values, severity defaults, queue and owned dismissal timers; each platform owns its queue instance |
+// Blueprint: | `SystemToast.swift` | `SystemToast`, `SystemToastCenter`: replace-by-ID notices and owned dismissal timers |
 
 @MainActor
 public struct SystemToast: Identifiable, Sendable, Equatable {

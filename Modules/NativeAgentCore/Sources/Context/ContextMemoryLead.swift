@@ -1,11 +1,8 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: memory age, provenance and stored-source extraction; packet lines retain the shared author suffix |
+// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: rendered age, provenance and source |
 
-/// How a memory record came to be known, as the agent should read it back.
-///
-/// `verified` — she checked it herself. `told` — someone told her (`by`).
-/// `inferred` — she worked it out. Unstamped rows render nothing.
+/// Render only recorded provenance: verified, told with its speaker, or inferred; unstamped rows make no claim.
 public struct ContextMemoryProvenance: Codable, Equatable, Sendable {
     public enum Kind: String, Codable, Sendable, CaseIterable {
         case verified
@@ -31,19 +28,8 @@ public struct ContextMemoryProvenance: Codable, Equatable, Sendable {
     public var tag: String { "[\(text)]" }
 }
 
-/// The ONE time a packet render is allowed to know about.
-///
-/// An age tag is a function of the TURN, not of whenever a renderer happened to
-/// run: two atoms rendered either side of local midnight must not disagree
-/// about what "yesterday" means, and re-rendering the same prepared turn must
-/// produce the same bytes. So the time is frozen (the turn's own evaluation
-/// time) and the calendar — time zone included — is passed in explicitly rather
-/// than read from the environment inside the renderer.
-///
-/// `.unstamped` is the explicit clock for a caller with no turn in hand: it
-/// renders NO age tag rather than one computed from a stray wall-clock read.
+/// Freeze time and calendar per turn so midnight and rerendering cannot change age tags. Without a turn clock, `.unstamped` claims no age.
 public struct ContextRenderClock: Sendable, Equatable {
-    /// nil → this render has no turn time, so it claims no age.
     public let now: Date?
     public let calendar: Calendar
 
@@ -57,9 +43,7 @@ public struct ContextRenderClock: Sendable, Equatable {
         calendar: ContextRenderClock.calendar(in: TimeZone(secondsFromGMT: 0) ?? .current)
     )
 
-    /// The turn's frozen evaluation time, read in the user's local zone. The
-    /// zone is a parameter so the ambient value is captured ONCE per turn by the
-    /// caller, never per atom deep inside the renderer.
+    /// Capture the user's time zone once per turn, never per atom.
     public static func turn(
         _ need: NeedSignal,
         timeZone: TimeZone = .current
@@ -67,9 +51,7 @@ public struct ContextRenderClock: Sendable, Equatable {
         ContextRenderClock(now: need.evaluationTime, calendar: calendar(in: timeZone))
     }
 
-    /// A fixed civil calendar in `timeZone`: Gregorian, POSIX locale. Month
-    /// names must not drift with the host locale — the packet is model-facing
-    /// text, and "(in March)" has to mean the same thing on every machine.
+    /// Fixed Gregorian/POSIX formatting keeps model-facing month names independent of host locale.
     public static func calendar(in timeZone: TimeZone) -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
@@ -78,45 +60,28 @@ public struct ContextRenderClock: Sendable, Equatable {
     }
 }
 
-/// Time and provenance ON a recalled memory, applied where the packet is
-/// RENDERED rather than where the atom is compiled.
-///
-/// Two things the resident agent reported are fixed here. "Same-session and
-/// long-term feel the same" — so every memory atom leads with how old it is.
-/// "Something Claude told me and something I verified read the same a day
-/// later" — so every memory atom that knows its provenance says it.
-///
-/// Render-lane by construction: the compiled atom body, its hash and the
-/// selector's decisions are untouched, so nothing here re-compiles an atom or
-/// invalidates a cached generation. The buckets are also deliberately coarse:
-/// for anything older than yesterday the tag cannot change within a calendar
-/// day, so the rendered lead is stable turn to turn.
+/// Render age and provenance without changing compiled bodies, hashes or selection; coarse day buckets keep older age tags stable within a day.
 public enum ContextMemoryLead {
     public static func untrustedSources(for draft: ContextAtomDraft) -> [String] {
         draft.entities.filter { $0.kind == "untrusted_source" && !$0.label.isEmpty }.map(\.label)
     }
 
-    /// Entity kind the memory projection uses for a record's provenance blob.
     public static let provenanceEntityKind = "provenance"
 
     /// Under two hours reads as the same breath, not as a memory.
     public static let justNowSeconds: TimeInterval = 2 * 60 * 60
 
-    /// Above this many days the tag names the month instead of counting days.
     public static let dayCountLimit = 14
 
     // MARK: Facts carried from the compiled atom onto the packet item
 
-    /// The record's own time, as the projection recorded it. Memory and correction atoms:
-    /// persona docs and instructions are not episodes and take no age tag.
+    /// Only episodic memory and correction atoms take age tags; persona documents and instructions do not.
     public static func recordedAt(for draft: ContextAtomDraft) -> Date? {
         guard draft.kind == .memory || draft.kind == .correction else { return nil }
         return draft.freshness.createdAt
     }
 
-    /// Current atoms carry typed attribution. The single retained label reader
-    /// is needed by context.sqlite's existing delimited atoms until lead rebuild.
-    /// Evidence ends that retained metadata prefix; its text is never a field.
+    /// Typed attribution and delimited labels carry provenance; evidence terminates the label prefix and must never be parsed as a field.
     public static func provenance(for draft: ContextAtomDraft) -> ContextMemoryProvenance? {
         guard draft.kind == .memory || draft.kind == .correction else { return nil }
         if let provenance = draft.memoryProvenance {
@@ -141,9 +106,7 @@ public enum ContextMemoryLead {
         return ContextMemoryProvenance(kind: kind, by: rawBy.flatMap(validDisplayName))
     }
 
-    /// Characters a provenance name may contain: letters, digits, space, and
-    /// `. - '`. No delimiters, brackets, or control characters — the value is
-    /// rendered into a model-facing line and parsed out of a delimited blob.
+    /// Exclude delimiters, brackets and controls because provenance names enter model-facing lines and delimited metadata.
     public static let displayNameMaximumCharacters = 40
 
     public static func validDisplayName(_ raw: String) -> String? {
@@ -158,11 +121,7 @@ public enum ContextMemoryLead {
 
     // MARK: Rendering
 
-    /// `(yesterday)`, `(3 days ago)`, `(in March)` — the coarse, day-stable
-    /// bucket a person actually uses when placing their own memory in time.
-    /// `calendar` is required, never defaulted: an age tag read in the wrong
-    /// time zone is a wrong tag, and a silent `Calendar.current` deep in a
-    /// renderer is exactly how that happens.
+    /// Require the turn's calendar: ambient time-zone reads can produce the wrong age tag.
     public static func ageTag(
         recordedAt: Date,
         now: Date,
@@ -190,11 +149,7 @@ public enum ContextMemoryLead {
             : "(in \(month) \(recordedYear))"
     }
 
-    /// The rendered memory line: age in front, provenance behind, the atom's
-    /// own text (whole body or lead) untouched in between. Other atom kinds and
-    /// atoms carrying neither fact render byte-identically to before.
-    /// An `.unstamped` clock renders provenance but no age: a render with no
-    /// turn behind it says nothing about time rather than guessing.
+    /// Preserve the atom's text between age and provenance; `.unstamped` renders provenance without guessing time.
     public static func decorate(
         _ text: String,
         recordedAt: Date?,
@@ -210,7 +165,6 @@ public enum ContextMemoryLead {
         return parts.joined(separator: " ")
     }
 
-    /// Convenience over a packet item — the shape a renderer actually holds.
     public static func decorate(
         _ text: String,
         item: ContextPacketItem,
@@ -246,7 +200,6 @@ public enum ContextMemoryLead {
 }
 
 private extension String {
-    /// The remainder after `prefix`, or nil when the string does not start with it.
     func dropPrefix(_ prefix: String) -> String? {
         hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
     }

@@ -2,22 +2,11 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `PersonInitiatedSend.swift` | `PersonInitiatedSend` class; `matches`, `claim` |
 
-/// A message the person typed into a contact's thread and sent with their own
-/// click or Return. That act is the consent for exactly that one send, so the
-/// approval gate lets it through without a card (`AutonomyGatedDispatcher`).
-///
-/// WHY THE MODEL CANNOT FORGE IT: this is a task-local, and only Swift code can
-/// bind one. No tool parameter, schema field or tool result reaches it. The app
-/// binds it in one place, around one direct dispatch from the thread composer
-/// (`ContactThreadSend`), never around a model turn. It names the exact
-/// contact and text, and the first matching gate check spends it, so nothing
-/// nested under that send (a desktop operator turn, a peer's callback) can
-/// ride it. It waives only the send: a call that would also run a program on
-/// this Mac, or that Trust refuses, is refused plainly instead of carded.
+/// A composer click or Return grants exactly one matching contact-and-text send, never nested work. Swift carries this grant on `turn.personInitiatedSend`
+/// through the direct composer dispatch; model input cannot forge it. It waives only send approval: program execution and Trust refusals still refuse plainly.
 public final class PersonInitiatedSend: @unchecked Sendable {
-    @TaskLocal public static var current: PersonInitiatedSend?
 
-    /// The only capabilities the person's act answers for.
+    /// The person’s act answers only these send capabilities.
     package static let sendOnly: Set<String> = ["tool_call", "external_send", "network_write"]
 
     public let agent: String
@@ -43,8 +32,7 @@ public final class PersonInitiatedSend: @unchecked Sendable {
         return true
     }
 
-    /// The gate took this send as the person's. Read after the gate, so the
-    /// contact's answer stays in the thread instead of starting an agent turn.
+    /// Read the claim after admission so person-initiated replies stay in their thread rather than waking the agent.
     public var admitted: Bool {
         lock.lock(); defer { lock.unlock() }
         return spent

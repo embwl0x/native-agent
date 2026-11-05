@@ -2,15 +2,10 @@ import CryptoKit
 import Foundation
 import PersistenceCore
 import Security
-// Blueprint: | `SlackCredentials.swift` | Immutable Slack Keychain grants selected by canonical connectors/slack/auth.json; checked metadata, transactional save/recovery, toggle and revoke; file-token migration removed; pre-grant Keychain reader retained until installed credential inventory proves conversion |
+// Blueprint: | `SlackCredentials.swift` | Immutable Keychain grants selected by connectors/slack/auth.json; locked metadata save and revocation |
 
-/// Slack's tokens live in this Mac's Keychain (secrets → Keychain), one pair
-/// per data root. `connectors/slack/auth.json` owns metadata and the grant
-/// reference: team, allowlists, socket-mode switches. Local backup includes
-/// that file through connectors; export excludes it; phone sync carries status
-/// only. A missing selected grant is a credential failure and requires reconnecting
-/// Slack. The pre-grant Keychain reader remains pending a checked installed inventory;
-/// a command-line miss does not prove absence in the data-protected Keychain.
+/// Each data root owns a Keychain token pair; auth.json owns metadata and its grant reference. Backup includes metadata, export excludes it, and phone sync
+/// carries status only. A missing selected grant requires reconnecting; a command-line miss cannot prove Keychain absence.
 public enum SlackCredentials {
     public enum Token: String, Sendable, CaseIterable { case bot, app }
     private static let service = "com.nativeagent.connector.slack.v1"
@@ -49,8 +44,7 @@ public enum SlackCredentials {
         }
     }
 
-    /// Retained until the installed app can inventory its data-protected Keychain.
-    /// File-token migration and the mutable token writer are retired.
+    /// Only installed-app inventory can establish absence in the data-protected Keychain.
     private static func readLegacy(_ token: Token, dataRoot: URL) throws -> String? {
         var request = query()
         request[kSecAttrAccount as String] = rootAccount(dataRoot: dataRoot) + ":" + token.rawValue
@@ -76,12 +70,11 @@ public enum SlackCredentials {
         }
     }
 
-    /// Disconnecting Slack removes every immutable grant for this root,
-    /// including references retained by backups or interrupted saves.
+    /// Disconnecting Slack removes every immutable grant for this root, including references retained by backups or interrupted saves.
     public static func delete(dataRoot: URL) throws {
         try CredentialFileLock.withLock(TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)) {
             guard !FileManager.default.fileExists(atPath: saveIntent(dataRoot: dataRoot).path) else { throw Failure.unavailable }
-            // While the old reader remains, disconnect must remove its namespace too.
+            // Disconnect must revoke every readable credential namespace.
             for token in Token.allCases {
                 try DeviceSecretKeychain.delete(service: service,
                     account: rootAccount(dataRoot: dataRoot) + ":" + token.rawValue)
@@ -103,7 +96,6 @@ public enum SlackCredentials {
         }
     }
 
-    /// Only the selected canonical metadata document is read.
     public static func metadata(dataRoot: URL) throws -> [String: JSONValue] {
         let path = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
         return try CredentialFileLock.withLock(ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot)) {
@@ -127,7 +119,12 @@ public enum SlackCredentials {
             throw PersistenceCoreError.ioFailure("Saved connector credentials must be a JSON object")
         }
         guard fileKeys.values.joined().allSatisfy({ object[$0] == nil }) else {
-            throw PersistenceCoreError.ioFailure("Slack metadata contains plaintext credentials. Reconnect Slack to publish a verified Keychain grant; the existing file is preserved.")
+            throw PersistenceCoreError.ioFailure(
+                """
+                Slack metadata contains plaintext credentials. Reconnect Slack to publish a verified Keychain grant; \
+                the existing file is preserved.
+                """
+            )
         }
         for field in ["refresh_token", "token_type", "scope",
                       "client_id", "client_secret", "connector_id", "redirect_uri", "provider",
@@ -154,8 +151,7 @@ public enum SlackCredentials {
         return object
     }
 
-    /// The registry lock is held by the caller, then this owner holds metadata
-    /// through both publications, matching credential saves and snapshots.
+    /// The registry lock is held by the caller, then this owner holds metadata through both publications, matching credential saves and snapshots.
     public static func setSocketModeEnabled(
         _ enabled: Bool, dataRoot: URL,
         publishRegistry: @Sendable () async throws -> Void
@@ -224,8 +220,7 @@ public enum SlackCredentials {
         dataRoot.appendingPathComponent("connectors/slack/save_intent.json")
     }
 
-    /// Caller holds registry and connector locks. The intent contains
-    /// only metadata and a verified immutable Keychain reference, never tokens.
+    /// Caller holds registry and connector locks. The intent contains only metadata and a verified immutable Keychain reference, never tokens.
     public static func commitSave(connector: JSONValue, registry: JSONValue, dataRoot: URL) throws {
         guard case .object(let fields) = connector else { throw Failure.unavailable }
         _ = try TransportAllowlist.slackPolicy(fields: fields)
@@ -254,8 +249,7 @@ public enum SlackCredentials {
                 let registry = JSONValue.array(try ConnectorOAuthRegistry.checkedConnectorRows(from: savedRegistry).map(JSONValue.object))
                 _ = try TransportAllowlist.slackPolicy(fields: connector)
                 _ = try grant(reference, dataRoot: dataRoot)
-                // Canonical auth publishes metadata and grant together; the
-                // registry is last. A crash keeps the exact intent for retry.
+                // Canonical auth publishes metadata and grant together; the registry is last. A crash keeps the exact intent for retry.
                 let bytes = try JSONValue.object(connector).serializedData(pretty: true)
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: authPath)
                 guard try Data(contentsOf: authPath) == bytes else { throw Failure.unavailable }

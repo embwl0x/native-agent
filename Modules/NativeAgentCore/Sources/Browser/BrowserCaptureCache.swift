@@ -2,11 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `BrowserCaptureCache.swift` | `BrowserCaptureCache`: serialized bounded storage and grouped eviction of disposable perception artifacts; expired captures require new observation |
+// Blueprint: | `BrowserCaptureCache.swift` | `BrowserCaptureCache`: bounded grouped artifact eviction; expired captures require new observation |
 
-/// Disposable observations only. Downloads, authored documents, profile state,
-/// and generated images never enter this owner. Old receipt paths may expire;
-/// callers must capture again rather than treating a missing file as evidence.
+/// Only disposable observations enter; expired receipt paths require fresh capture and cannot stand as evidence.
 public actor BrowserCaptureCache {
     public static let shared = BrowserCaptureCache()
 
@@ -46,9 +44,8 @@ public actor BrowserCaptureCache {
 
     public nonisolated let policy = Policy()
 
-    /// One serialized admission point for every canonical perception writer.
-    /// Matching text/links/screenshots are evicted together; adding a later
-    /// screenshot never evicts the current operation's source text.
+    /// One serialized admission point for every canonical perception writer. Matching text/links/screenshots are evicted together; adding a later screenshot
+    /// never evicts the current operation's source text.
     public func store(id: String, artifacts: [Kind: Data], browserRoot: URL,
                       now: Date = Date()) throws -> [Kind: URL] {
         guard Self.isCaptureID(id), !artifacts.isEmpty else { throw failure("invalid_capture") }
@@ -63,8 +60,7 @@ public actor BrowserCaptureCache {
 
         let fm = FileManager.default
         let root = browserRoot.standardizedFileURL
-        // Refuse redirection inside the configured data root. The system's
-        // /var or /tmp aliases above that root are not cache-owned directories.
+        // Refuse redirection inside the configured data root. The system's /var or /tmp aliases above that root are not cache-owned directories.
         for directory in [root.deletingLastPathComponent().deletingLastPathComponent(),
                           root.deletingLastPathComponent(), root] {
             try requireOrdinaryDirectory(directory, create: false)
@@ -90,8 +86,7 @@ public actor BrowserCaptureCache {
                     [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
                 guard values.isRegularFile == true, values.isSymbolicLink != true,
                       let captureID = Self.captureID(filename: url.lastPathComponent, directory: directory) else { continue }
-                // Existing sparse/inherited files obey the same bounds as new
-                // artifacts. An invalid inventory is reported before eviction.
+                // Existing sparse/inherited files obey the same bounds as new artifacts. An invalid inventory is reported before eviction.
                 guard let size = values.fileSize, size >= 0, size <= policy.maxArtifactBytes else {
                     throw failure("capture_cache_invalid_size")
                 }
@@ -108,8 +103,7 @@ public actor BrowserCaptureCache {
         var destinations: [Kind: URL] = [:] // Validate destinations before eviction.
         for kind in artifacts.keys {
             let destination = root.appendingPathComponent(kind.directory).appendingPathComponent(id + kind.suffix)
-            // Never overwrite an existing file, directory, or symlink, even if
-            // the caller accidentally repeats an operation ID.
+            // Never overwrite an existing file, directory, or symlink, even if the caller accidentally repeats an operation ID.
             if (try? fm.attributesOfItem(atPath: destination.path)) != nil {
                 throw failure("capture_already_exists")
             }
@@ -124,8 +118,7 @@ public actor BrowserCaptureCache {
         for (entries, date) in oldest {
             guard now.timeIntervalSince(date) > policy.maxAge || bytes > policy.maxBytes || count > policy.maxGroups else { continue }
             for entry in entries {
-                // No recursive deletion or symlink following. Directory changes
-                // since enumeration abort the write instead of following them.
+                // No recursive deletion or symlink following. Directory changes since enumeration abort the write instead of following them.
                 try requireOrdinaryDirectory(entry.url.deletingLastPathComponent(), create: false)
                 let attributes = try fm.attributesOfItem(atPath: entry.url.path)
                 guard attributes[.type] as? FileAttributeType == .typeRegular else {

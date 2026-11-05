@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import ChatToolParsing
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -7,27 +8,8 @@ import MacControl
 import MacIntegration
 // Blueprint: | `InlineInteractionNeed.swift` | `InlineInteractionNeed` enum; `blocksTurn`, `envelope` |
 
-/// Builds the typed "I need something from you" tool envelope that a dispatch
-/// boundary returns INSTEAD of an error string, and reads it back out.
-///
-/// The shape is deliberately small:
-///
-/// ```json
-/// { "status": "needs_input",
-///   "needs": { ...encoded InlineInteraction... } }
-/// ```
-///
-/// Two rules hold this honest and are the reason this type exists rather than
-/// each boundary hand-rolling a dictionary:
-///
-/// 1. **Only a typed boundary may raise a need.** A corrupt store, an
-///    unsupported route, malformed arguments, a missing bridge, or a security
-///    refusal is a FAILURE, not a setup invitation. Those keep their existing
-///    envelopes.
-/// 2. **Nothing the model wrote defines a button.** The need carries canonical
-///    IDs and prose only. The card's action comes from the descriptor registry
-///    on the app side; no URL, selector, settings path, or executable action
-///    crosses this boundary.
+/// Only typed boundaries may raise needs; corrupt stores, unsupported routes, malformed input, missing bridges and security refusals remain failures. Model
+/// text defines no button: carry canonical IDs and prose; the app registry alone supplies executable actions.
 public enum InlineInteractionNeed {
     public static func blocksTurn(_ interaction: InlineInteraction) -> Bool {
         (interaction.kind == .permission && interaction.allTargets.contains {
@@ -36,9 +18,9 @@ public enum InlineInteractionNeed {
     }
 
     /// macOS grants wait for the person's tap; other setup keeps its typed card.
-    public static func envelope(_ interaction: InlineInteraction) -> JSONValue {
-        // A skill's step never raises a card: it hands back to her.
-        if SkillRunContext.handsBack { return SkillRunContext.handBack(interaction.title) }
+    public static func envelope(invocation: ChatToolInvocation, _ interaction: InlineInteraction) -> JSONValue {
+        // A skill's step never raises a card: it hands back to the agent.
+        if invocation.handsBack { return SkillRunContext.handBack(interaction.title) }
         var object: [String: JSONValue] = [
             "status": .string(blocksTurn(interaction) ? InlineInteractionWire.waitingStatus : "skipped"),
             "kind": .string(interaction.kind.rawValue),
@@ -46,10 +28,9 @@ public enum InlineInteractionNeed {
         if !interaction.target.isEmpty {
             object["target"] = .string(interaction.target)
         }
-        // The card by id, where a script's call row keeps it.
+        // Retain the card ID so script call rows can address the same interaction.
         object["card_id"] = .string(interaction.id)
-        // A one-line reason so a surface that knows nothing about cards (a
-        // log, a bot transport) still says something true.
+        // A one-line reason so a surface that knows nothing about cards (a log, a bot transport) still says something true.
         let unavailable = interaction.kind == .connector ? "connected" : "allowed"
         object["detail"] = .string(blocksTurn(interaction)
             ? interaction.kind == .permission
@@ -62,16 +43,13 @@ public enum InlineInteractionNeed {
         return .object(object)
     }
 
-    /// The interaction carried by a tool result, or nil for every other
-    /// envelope. Strict by construction: a result must say `needs_input` or `skipped` AND
-    /// carry a decodable interaction with a non-empty id. Anything else stays
-    /// an ordinary tool receipt — a malformed envelope must never surface an
-    /// actionable card without an authority behind it.
+    /// Only needs_input or skipped envelopes with a decodable nonempty interaction ID may create actionable cards.
     public static func interaction(in result: JSONValue) -> InlineInteraction? {
+        let reply = ToolResult(result)
         guard case .object(let object) = result,
-              case .string(let status)? = object["status"],
-              (status == InlineInteractionWire.waitingStatus || status == "skipped"
-                || (status == "ok" && object["connected"] == .bool(false)
+              reply.status == object["status"]?.stringValue,
+              (reply.said(InlineInteractionWire.waitingStatus) || reply.said("skipped")
+                || (reply.said("ok") && object["connected"] == .bool(false)
                     && object["kind"] == .string("connector"))),
               let raw = object[InlineInteractionWire.needsKey],
               let interaction = decode(raw),
@@ -81,15 +59,12 @@ public enum InlineInteractionNeed {
         return interaction
     }
 
-    /// Same question against a persisted result summary string.
     public static func interaction(inResultSummary summary: String) -> InlineInteraction? {
         guard let value = try? JSONValue.parse(Data(summary.utf8)) else { return nil }
         return interaction(in: value)
     }
 
-    /// True when this is a typed card result, including a nonblocking skip.
-    /// Dispatch uses this to preserve the envelope without marking an error;
-    /// the loop separately asks blocksTurn before yielding to the person.
+    /// Typed cards preserve their envelope without an error; blocksTurn separately decides whether to yield to the person.
     public static func isWaiting(_ result: JSONValue) -> Bool {
         interaction(in: result) != nil
     }

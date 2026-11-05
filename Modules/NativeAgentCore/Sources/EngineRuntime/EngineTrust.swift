@@ -9,12 +9,13 @@ import TrustCenter
 import MacControl
 import NativeAgentCore
 import Privacy
-// Blueprint: | `EngineTrust.swift` | TrustFacade owns checked policy, effective feature verdicts and security status/invalidation; raw/typed policy and phone serialization publish through LatestRead without policy effects, committed policy through write and the policy-change callback. Current capability/source/network publication, Privacy Map and inbox policy each share a LatestRead; source/inbox commits use write. Policy derives autonomy guardrails; connected-agent rows belong to engine.contacts. Rooted Mac audit decoding retains availability and requires canonical receipt identity, method and execution time. |
+import Experiences
+import AuthoredCapabilities
+// Blueprint: | `EngineTrust.swift` | Checked policy, audit and capability publication through canonical mutation owners |
 
-/// Root-specific audit read availability and canonical receipt decoding.
+/// Audit availability and receipt decoding must remain root-specific.
 public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
-    // Identifiable row id: stable per row but built from receiptID when
-    // present so rows are deduped reliably in the List.
+    // Prefer receipt identity so List rows deduplicate reliably.
     public var id: String { receiptID ?? "\(ts)-\(method)" }
 
     var receiptID: String?
@@ -39,7 +40,6 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
     public var allowed: Bool?
 
     enum CodingKeys: String, CodingKey {
-        // Canonical (snake_case on disk).
         case receiptID = "id"
         case method
         case category
@@ -60,7 +60,6 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
 
-        // Canonical fields.
         receiptID = try c.decode(String.self, forKey: .receiptID)
         let decodedMethod = try c.decode(String.self, forKey: .method)
         category = try c.decodeIfPresent(String.self, forKey: .category)
@@ -78,11 +77,11 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
         blocked = try c.decodeIfPresent(Bool.self, forKey: .blocked)
         blockReason = try c.decodeIfPresent(String.self, forKey: .blockReason)
 
-        // UI summary fields derive from required canonical evidence.
+        // Derive summaries only from required canonical evidence.
         ts = decodedExecutionTime
         method = decodedMethod
         action = method
-        // Empty canonical `block_reason` must not hide stderr when deriving historical receipt detail.
+        // Empty canonical `block_reason` must not hide receipt stderr.
         detail = Self.firstNonEmpty(blockReason, stderr)
         if let b = blocked {
             allowed = !b
@@ -91,9 +90,7 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
         }
     }
 
-    /// Pick the first non-nil, non-empty string. Treats `""` as absent so the
-    /// canonical-row pattern `block_reason: ""` (successful execution rows)
-    /// doesn't mask a useful `stderr` underneath.
+    /// Treat empty strings as absent so a successful row’s empty block reason cannot hide useful stderr.
     private static func firstNonEmpty(_ candidates: String?...) -> String? {
         for c in candidates {
             if let s = c, !s.isEmpty { return s }
@@ -105,29 +102,22 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
 
 public enum MacControlAuditLogRead: Sendable {
     case entries([MacControlAuditEntry], malformedLineCount: Int)
-    case sourceAbsent(URL)
     case unreadable(String)
 
-    fileprivate static func read(from url: URL, limit: Int = 100) -> Self {
-        guard FileManager.default.fileExists(atPath: url.path) else { return .sourceAbsent(url) }
+    fileprivate static func read(dataRoot: URL, limit: Int = 100) async -> Self {
         do {
-            let content = try String(contentsOf: url, encoding: .utf8)
+            let details = try await ExperienceStore.at(dataRoot).details(.init(kinds: ["mac.act.audit"], limit: limit, newestFirst: true))
             var malformed = 0
-            let entries = content
-                .split(separator: "\n", omittingEmptySubsequences: true)
-                .compactMap { line -> MacControlAuditEntry? in
-                    guard let data = line.data(using: .utf8) else {
-                        malformed += 1
-                        return nil
-                    }
+            let entries = details
+                .compactMap { detail -> MacControlAuditEntry? in
                     do {
-                        return try JSONDecoder().decode(MacControlAuditEntry.self, from: data)
+                        return try JSONDecoder().decode(MacControlAuditEntry.self, from: detail.row)
                     } catch {
                         malformed += 1
                         return nil
                     }
                 }
-            return .entries(Array(entries.suffix(limit).reversed()), malformedLineCount: malformed)
+            return .entries(entries, malformedLineCount: malformed)
         } catch {
             return .unreadable(UserFacingError.cause(error, action: "read the audit log"))
         }
@@ -135,24 +125,18 @@ public enum MacControlAuditLogRead: Sendable {
 }
 
 
-/// `NativeAgentEngine.trust`: the TrustCenter for one data root, in core
-/// types. The Trust Center pages, Setup, chat and the badges render `policy`;
-/// Backups render `backups`; Capabilities renders `capabilityNetwork`. Reads
-/// and publication use the same owner for the phone lanes. Policy writes still
-/// run through the one trust-write chokepoint (`TrustPolicyToolWriter`)
-/// and backups through the backup executors.
+/// Share one root’s checked Trust policy across surfaces and phone publication; retain `TrustPolicyToolWriter` and backup executors as mutation owners.
 @MainActor
 @Observable
 public final class TrustFacade {
     public nonisolated let dataRoot: URL
     private nonisolated let connectorActionStatuses: (@Sendable () async throws -> [String: String])?
 
-    /// The saved policy as of the last read or write.
     public private(set) var policy: TrustPolicy?
+    public private(set) var policyReadError: String?
     /// Effects follow committed policy changes, never a checked read.
     @ObservationIgnored public var policyDidChange: (@MainActor () -> Void)?
-    /// Effective switches from the same checked policy the rest of Trust renders.
-    /// Absence means unavailable, never a manufactured default permission.
+    /// Derive switches from checked policy; absence means unavailable, never default permission.
     public struct FeatureVerdict: Sendable {
         public let enabled: Bool
         public let forced: Bool
@@ -163,11 +147,6 @@ public final class TrustFacade {
     private nonisolated static func unattendedWork(for policy: TrustPolicy) -> FeatureVerdict {
         let forced = TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy)
         return FeatureVerdict(enabled: policy.enableAutonomy || forced, forced: forced)
-    }
-    public var deskTasks: FeatureVerdict? {
-        guard let policy else { return nil }
-        if policy.developerMode { return FeatureVerdict(enabled: true, forced: true) }
-        return (policy.workshopPolicy?.enabled).map { FeatureVerdict(enabled: $0, forced: false) }
     }
     public var memoryPermissions: TrustMemoryPolicy? { policy?.memoryPolicy }
 
@@ -181,9 +160,11 @@ public final class TrustFacade {
     public func publishPolicy(_ saved: TrustPolicy?) {
         policyRead.write {
             policy = saved
+            policyReadError = nil
             securityStatus = nil
         }
         policyDidChange?()
+        Task { await capabilitiesDidChange?() }
     }
 
     private func readPolicy() async -> Result<[String: JSONValue], Error> {
@@ -199,7 +180,13 @@ public final class TrustFacade {
             }
             return (checked, status)
         }, publish: { checked, status in
-            policy = try? TrustPolicy(policyObject: checked.get())
+            do {
+                policy = try TrustPolicy(policyObject: checked.get())
+                policyReadError = nil
+            } catch {
+                policy = nil
+                policyReadError = error.localizedDescription
+            }
             switch status {
             case .success(let value):
                 securityStatus = value
@@ -208,16 +195,17 @@ public final class TrustFacade {
                 securityRefreshError = UserFacingError.cause(error, action: "read security status")
             }
         })
+        await capabilitiesDidChange?()
         return result.0
     }
 
-    /// Policy, its effective switches and Security Center share one invalidation
-    /// boundary and one checked policy generation. The view holds no snapshot.
+    /// Policy, switches and Security Center share one checked generation and invalidation boundary, without view snapshots.
     public func observeSecurity() async {
         await EventDeadlinePhysiology.refreshOnChanges(paths:
-            ["trust/policy.json", "security/audit.jsonl", "telegram/config.json", "paired_phones.json"]
+            ["trust/policy.json", "telegram/config.json", "paired_phones.json"]
                 .map { dataRoot.appendingPathComponent($0) }
-                + [TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)]
+                + [TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)],
+            notifications: [SwiftNativeSecurityCenter.consentDidWrite]
         ) { await self.refreshSecurity() }
     }
 
@@ -242,13 +230,18 @@ public final class TrustFacade {
         await task.value
     }
 
-    /// Local backups, newest first, as of the last read.
     public var backups: [BackupRecord] = []
     public private(set) var capabilityCatalogSources: [CapabilityCatalogSource] = []
     public private(set) var catalogRefresh: PanelRefreshStatus?
     public var autonomyKernel: AutonomyKernelSummary? { policy.map(Self.autonomyKernel(for:)) }
 
     public var capabilityNetwork: CapabilityTrustNetwork?
+    public internal(set) var latestCapabilityTrustEvaluation: CapabilityTrustEvaluation?
+    @ObservationIgnored let capabilityEvaluationRead = LatestRead()
+    @ObservationIgnored nonisolated(unsafe) private var abilityObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var capabilityChangeTask: Task<Void, Never>?
+    @ObservationIgnored private var capabilityChangeRequested = false
+    @ObservationIgnored var capabilitiesDidChange: (@MainActor @Sendable () async -> Void)?
     public private(set) var capabilitySummary: CapabilitySummaryResponse?
     public private(set) var capabilitySummaryError: String?
     public private(set) var privacyMap: PrivacyMap?
@@ -286,6 +279,7 @@ public final class TrustFacade {
                 lastSuccessAt: read.3.isEmpty ? Date() : catalogRefresh?.lastSuccessAt,
                 failedEndpoints: read.3.map { $0.endpoint })
         })
+        await capabilitiesDidChange?()
         return read.3
     }
     public private(set) var inboxPolicyEnabled = false
@@ -293,40 +287,71 @@ public final class TrustFacade {
     public private(set) var hasReadInboxPolicy = false
     @ObservationIgnored private let inboxPolicyRead = LatestRead()
 
-    /// Observe policy publication, then read the checked local authority.
-    /// SecurityCenter has no per-tool Full Mac admission to copy or retain.
-    public var nativeActionYoloAdmitted: Bool {
-        _ = policy
-        return SwiftNativeSecurityCenter.localFullMacYoloAdmitted(dataRoot: dataRoot)
-    }
-
     public nonisolated init(
         dataRoot: URL,
-        // Policy-only readers need no connector binding. Capability reads do.
+        // Only capability reads require connector binding.
         connectorActionStatuses: (@Sendable () async throws -> [String: String])? = nil
     ) {
         self.dataRoot = dataRoot
         self.connectorActionStatuses = connectorActionStatuses
+        abilityObserver = NotificationCenter.default.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { [weak self] event in
+            guard let path = event.object as? String else { return }
+            Task { @MainActor [weak self] in self?.capabilitySourceChanged(path) }
+        }
+    }
+
+    isolated deinit {
+        if let abilityObserver { NotificationCenter.default.removeObserver(abilityObserver) }
+        capabilityChangeTask?.cancel()
+    }
+
+    private func capabilitySourceChanged(_ path: String) {
+        let root = AbilityStore(dataRoot: dataRoot).root
+        let changed = URL(fileURLWithPath: path)
+        guard changed == root || changed.deletingLastPathComponent() == root else { return }
+        capabilityChangeRequested = true
+        guard capabilityChangeTask == nil else { return }
+        capabilityChangeTask = Task { [weak self] in
+            guard let self else { return }
+            defer { capabilityChangeTask = nil }
+            repeat {
+                capabilityChangeRequested = false
+                _ = await refreshCapabilityCatalog()
+            } while capabilityChangeRequested && !Task.isCancelled
+        }
+    }
+
+    nonisolated static func capabilityNeedsReview(_ status: String?) -> Bool {
+        guard let status else { return false }
+        return ["review", "proposal", "draft", "drafted", "needs_setup"].contains(status.lowercased())
+    }
+
+    public func checkCapabilityTrust(id: String) async throws -> CapabilityTrustEvaluation {
+        let evaluation = try await capabilityEvaluationRead.read({ try await evaluateCapability(id: id) }, publish: {
+            latestCapabilityTrustEvaluation = $0
+        })
+        _ = await refreshCapabilityCatalog()
+        return evaluation
     }
 
     public nonisolated func notify(
-        title: String, message: String, notificationCenterAdapter: any NotificationPosting
+        title: String, message: String, notificationCenterAdapter: any NotificationPosting, turn: Turn
     ) async throws -> Bool {
         try await runMacControl(action: .notify, body: [
             "title": .string(title), "message": .string(message),
-        ], notificationCenterAdapter: notificationCenterAdapter).ok
+        ], notificationCenterAdapter: notificationCenterAdapter, turn: turn).ok
     }
 
     public nonisolated func runMacControl(
-        action: MacControlWorkbenchAction, body: [String: JSONValue], notificationCenterAdapter: any NotificationPosting
+        action: MacControlWorkbenchAction, body: [String: JSONValue], notificationCenterAdapter: any NotificationPosting, turn: Turn
     ) async throws -> MacControlResult {
         let client = makeMacControl(
             policyProvider: TrustCenterMacControlPolicyProvider(
                 dataRoot: dataRoot, operatorOrigin: SecurityOriginContext(surface: "native_actions")),
-            auditAppendPath: MacControlActionRoutes.auditPath(dataRoot: dataRoot),
+            auditDataRoot: dataRoot,
             notificationCenterAdapter: notificationCenterAdapter
         )
-        return try await client.dispatch(action: action.rawValue, body: body)
+        return try await client.dispatch(action: action.rawValue, body: body, turn: turn, context: .init(dataRoot: dataRoot))
     }
 
     nonisolated private var center: SwiftNativeTrustCenter {
@@ -347,11 +372,11 @@ public final class TrustFacade {
         var review = 0
         var autoloaded = 0
         let activeStatuses: Set<String> = ["active", "installed", "ready", "configured"]
-        let reviewStatuses: Set<String> = ["review", "proposal", "draft", "drafted", "needs_setup"]
         var identities: Set<String> = []
         for record in records {
             guard !record.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw RuntimeReadError.unreadableFeed("The capability list does not add up (one or more entries have no stable id). Refresh before relying on it.")
+                throw RuntimeReadError.unreadableFeed(
+                    "The capability list does not add up (one or more entries have no stable id). Refresh before relying on it.")
             }
             guard identities.insert(record.id).inserted else {
                 throw RuntimeReadError.unreadableFeed("The capability list does not add up (the list contains duplicate ids). Refresh before relying on it.")
@@ -359,7 +384,7 @@ public final class TrustFacade {
             byKind[record.kind ?? "", default: 0] += 1
             let status = (record.status ?? "").lowercased()
             if activeStatuses.contains(status) { active += 1 }
-            if reviewStatuses.contains(status) { review += 1 }
+            if Self.capabilityNeedsReview(record.status) { review += 1 }
             if record.autoload == true { autoloaded += 1 }
         }
         return CapabilitySummaryResponse(
@@ -370,27 +395,22 @@ public final class TrustFacade {
         )
     }
 
-    /// The typed policy of one checked generation; damaged policy bytes throw.
+    /// Damaged policy bytes must throw, never produce a typed default.
     public func load() async throws -> TrustPolicy {
         let checked = await readPolicy()
         return try TrustPolicy(policyObject: checked.get())
     }
 
     public nonisolated func auditLog(limit: Int = 100) async -> MacControlAuditLogRead {
-        let path = MacControlActionRoutes.auditPath(dataRoot: dataRoot)
-        return await Task.detached(priority: .utility) {
-            MacControlAuditLogRead.read(from: path, limit: limit)
-        }.value
+        await MacControlAuditLogRead.read(dataRoot: dataRoot, limit: limit)
     }
 
-    /// The raw checked policy, for blocks the typed model does not name
-    /// (inboxPolicy).
+    /// Read raw checked policy for fields outside the typed model, including inboxPolicy.
     public nonisolated func rawPolicy() async throws -> [String: JSONValue] {
         try await readPolicy().get()
     }
 
-    /// The phone receives every checked field and the same resolved Trust
-    /// interpretation as the Mac, from this read's own policy generation.
+    /// Phone fields and Trust interpretation must come from this read’s own checked generation.
     public nonisolated func snapshotData() async throws -> Data {
         var snapshot = try await rawPolicy()
         let policy = try TrustPolicy(policyObject: snapshot)
@@ -402,7 +422,6 @@ public final class TrustFacade {
         return try JSONValue.object(snapshot).serializedData(pretty: false)
     }
 
-    /// Read the sole current `backups/index.json` array, newest first.
     public nonisolated func listBackups() async throws -> [BackupRecord] {
         try TrustBackupPersistence.readBackupRecords(root: dataRoot)
     }
@@ -414,8 +433,6 @@ public final class TrustFacade {
         try await backupsRead.read({ try await listBackups() }, publish: { backups = $0 })
     }
 
-    /// The capability trust network: roots, catalog sources and one trust
-    /// record per capability.
     public nonisolated func loadCapabilityNetwork() async throws -> CapabilityTrustNetwork {
         try await capabilityTrust().network()
     }
@@ -436,7 +453,7 @@ public final class TrustFacade {
 
 extension TrustFacade {
     public func observeInboxPolicy() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot)]) {
+        await EventDeadlinePhysiology.refreshOnChanges(paths: [SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)]) {
             do { _ = try await self.inboxEnabled() }
             catch { print("[inbox settings] \(error.localizedDescription)") }
         }
@@ -456,16 +473,16 @@ extension TrustFacade {
                     lastSuccessAt: catalogRefresh?.lastSuccessAt, failedEndpoints: ["catalog sources"])
             }
         })
+        await capabilitiesDidChange?()
         _ = try result.get()
     }
 
-    /// Saved catalog sources only. Missing state has no saved records;
-    /// a damaged store throws and is never rewritten.
+    /// Missing catalog state has no saved rows; damaged bytes throw and remain unchanged.
     public nonisolated func catalogSources() async throws -> [CapabilityCatalogSource] {
         try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot).map { try CapabilityCatalogSource(row: .object($0)) }
     }
 
-    /// Add or update one catalog source under the sources lock, with its trace.
+    /// Mutate catalog sources under their lock with a trace.
     public func saveCatalogSource(name: String, url: String, kind: String) async throws -> CapabilityCatalogSource {
         let saved = try CapabilityCatalogSource(row: .object(try await catalogWrites.upsertCatalogSource(
             name: name, url: url, kind: kind)))
@@ -474,6 +491,7 @@ extension TrustFacade {
                 capabilityCatalogSources[index] = saved
             } else { capabilityCatalogSources.append(saved) }
         }
+        await capabilitiesDidChange?()
         return saved
     }
 

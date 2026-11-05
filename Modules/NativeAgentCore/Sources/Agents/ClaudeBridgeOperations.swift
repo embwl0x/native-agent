@@ -4,6 +4,7 @@ import Darwin
 import Network
 import ChatTurnRuntime
 import ChatTurnContracts
+import ChatToolRuntime
 import AgentConversations
 import ChatToolParsing
 import Cognition
@@ -32,12 +33,13 @@ extension ClaudeBridgeRuntime {
             writeJSON(conn, status: 403, obj: ["error": "invalid_peer_identity"])
             return
         }
-        messageRuntime().handleMessage(response: { [weak self] status, object in
+        messageRuntime().handleMessage(response: { [weak self] status, object, settle in
+            guard let self else { settle(false); conn.cancel(); return }
             let taskID = object["task_id"] as? String
             let carriesReply = AgentContactRoutes.carriesReply(object)
-            self?.writeJSON(conn, status: status, obj: object, onSent: { [weak self] in
-                // Failed work can still return produced words/files. The
-                // successful write acknowledges those bytes, not execution success.
+            self.writeJSON(conn, status: status, obj: object, onSent: { [weak self] in
+                settle(true)
+                // Failed work can still return produced words/files. The successful write acknowledges those bytes, not execution success.
                 guard carriesReply, let taskID, let self else { return }
                 Task {
                     do {
@@ -45,7 +47,7 @@ extension ClaudeBridgeRuntime {
                         await self.tasks.recordReplyFetch(task)
                     } catch { nativeLog("Bridge transmitted reply acknowledgment unavailable for %@: %@", taskID, error.localizedDescription) }
                 }
-            })
+            }, onFailed: { settle(false) })
         }, body: body, defaultSender: defaultSender, principal: principal)
     }
 
@@ -98,7 +100,8 @@ extension ClaudeBridgeRuntime {
         let tasks = self.tasks
         let session = context.map(principal.storedConversation)
         let tools = toolClient(verifiedSessionID: session)
-        let turn = principal.turnRequest(context: context, plain: "", messageID: request)
+        let requestTurn = principal.turnRequest(context: context, plain: "", messageID: request)
+        let turn = requestTurn.turn()
         let taskID = context.flatMap { context in request.map { "na3.\(context).\($0)" } }
         let requestDigest = AgentPeerReplayClaimStore.digest(body)
         let started = Date()
@@ -119,12 +122,13 @@ extension ClaudeBridgeRuntime {
                     }
                     admitted = true
                 }
-                let result = try await TurnDeadline.withThrowingDeadline(seconds: Double(Self.toolWorkDeadlineSeconds)) {
+                // A bridge tool call is outermost work: it starts its own ceiling.
+                let result = try await TurnDeadline.withThrowingDeadline(seconds: Double(Self.toolWorkDeadlineSeconds),
+                                                                         deadlines: OperationDeadlines()) { deadlines in
                     try await self.runToolOperation(id) {
                         do {
-                            let result = try await turn.bind {
-                                try await tools.dispatch(tool: name, input: inputJV, surface: turn.surface)
-                            }
+                            let result = try await tools.dispatch(tool: name, input: inputJV, surface: requestTurn.surface, turn: turn,
+                                invocation: ChatToolInvocation().with(\.deadlines, deadlines))
                             if let taskID { try await tasks.finishTool(taskID, owner: principal.id, result: result) }
                             return result
                         } catch {

@@ -3,29 +3,27 @@ import NativeAgentCore
 import Foundation
 import PersistenceCore
 import Experiences
-// Blueprint: | `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog` enum; `load`, `matchingModels`; one decoded catalog for account matching and separate Codex/OAuth projections, invalidated by file attributes with auth identity checked on selection; a cache read fault owes repair under `codex.model_catalog:<file path>` with the file as owner; a later successful read settles it; preview preserves the prior decoded cache and owes or settles no repair |
+// Blueprint: | `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog`, `load`, `matchingModels`, `codex.model_catalog:<file path>` |
 
-/// Reads the signed, account-scoped Codex model catalog instead of advertising
-/// preview models to users whose ChatGPT/Codex account cannot select them.
+/// Account-scoped discovery prevents advertising models the signed-in account cannot select.
 public enum CodexAccountModelCatalog {
     public static func providerModels(
         providerID: String,
         cacheURL: URL? = nil,
         useDefaultCacheWhenNil: Bool = true,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(), preview: Bool = false
     ) -> [ProviderModelInfo] {
         guard isAccountBackedProvider(providerID) else {
             return []
         }
-        // The account's models see images; whether this route's transport
-        // carries them is the adapter's declaration (the Codex CLI does not).
+        // The account's models see images; whether this route's transport carries them is the adapter's declaration (the Codex CLI does not).
         let vision = ProviderToolCapability.carriesImages(
             providerID: providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         return load(
             providerID: providerID,
             cacheURL: cacheURL,
             useDefaultCacheWhenNil: useDefaultCacheWhenNil,
-            dataRoot: dataRoot
+            dataRoot: dataRoot, preview: preview
         ).map {
             ProviderModelInfo(
                 id: $0.id,
@@ -81,12 +79,11 @@ public enum CodexAccountModelCatalog {
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var decodedByPath: [String: (stamp: [FileAttributeKey: Any], cache: Cache?)] = [:]
 
-    /// Account matching and both route projections share this decode. File
-    /// replacement invalidates it; auth identity is checked on every selection.
-    private static func readCache(at url: URL, dataRoot: URL) -> Cache? {
+    /// Account matching and both route projections share this decode. File replacement invalidates it; auth identity is checked on every selection.
+    private static func readCache(at url: URL, dataRoot: URL, preview: Bool = false) -> Cache? {
         let url = url.resolvingSymlinksInPath()
         cacheLock.lock()
-        let previewCache = LLMCallContext.preview ? decodedByPath : nil
+        let previewCache = preview ? decodedByPath : nil
         defer {
             if let previewCache { decodedByPath = previewCache }
             cacheLock.unlock()
@@ -121,7 +118,7 @@ public enum CodexAccountModelCatalog {
             decodedByPath.remove(at: decodedByPath.startIndex)
         }
         decodedByPath[url.path] = (attributes, cache)
-        guard !LLMCallContext.preview else { return cache }
+        guard !preview else { return cache }
         if let failure {
             RepairOwed.owe(dataRoot, id: "codex-model-catalog:" + UUID().uuidString,
                            kind: .act, operation: "codex.model_catalog:" + url.path, owner: url.path,
@@ -168,10 +165,10 @@ public enum CodexAccountModelCatalog {
         providerID: String = "codex",
         cacheURL: URL? = nil,
         useDefaultCacheWhenNil: Bool = true,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(), preview: Bool = false
     ) -> [Model] {
         let url = cacheURL ?? (useDefaultCacheWhenNil ? cacheSource(dataRoot: dataRoot, environment: ProcessInfo.processInfo.environment) : nil)
-        let cache = url.flatMap { readCache(at: $0, dataRoot: dataRoot) }
+        let cache = url.flatMap { readCache(at: $0, dataRoot: dataRoot, preview: preview) }
         if let url, modelCatalogFault(at: url, read: cache != nil, owner: "this ChatGPT account") != nil { return [] }
         return models(providerID: providerID, cache: cache)
     }
@@ -210,11 +207,7 @@ public enum CodexAccountModelCatalog {
         }
     }
 
-    /// Both routes use the same ChatGPT account entitlement catalog. The
-    /// transport remains exact: `openai_oauth_direct` calls the ChatGPT Codex
-    /// Responses backend, while `codex` invokes the CLI. API-key `openai`
-    /// stays deliberately excluded so account-only levels cannot leak onto a
-    /// public API request.
+    /// Both account transports share entitlement discovery; public API requests must not inherit account-only controls.
     public static func isAccountBackedProvider(_ providerID: String) -> Bool {
         switch providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "codex", "openai_oauth_direct": return true
@@ -222,41 +215,38 @@ public enum CodexAccountModelCatalog {
         }
     }
 
-    /// Resolve the account-matched cache, preserving an unreadable source URL
-    /// so load() can report it instead of mistaking it for absent discovery.
+    /// Retain an unreadable source URL so discovery faults cannot look absent.
     public static func chatGPTOAuthCacheCandidate(
         dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment, preview: Bool = false
     ) -> URL? {
         let source = cacheSource(dataRoot: dataRoot, environment: environment)
-        if modelCatalogFault(at: source, read: readCache(at: source, dataRoot: dataRoot) != nil, owner: "this ChatGPT account") != nil {
+        if modelCatalogFault(at: source, read: readCache(at: source, dataRoot: dataRoot, preview: preview) != nil, owner: "this ChatGPT account") != nil {
             return source
         }
-        return chatGPTOAuthCache(dataRoot: dataRoot, environment: environment)?.url
+        return chatGPTOAuthCache(dataRoot: dataRoot, environment: environment, preview: preview)?.url
     }
 
     static func chatGPTOAuthCatalogs(
         dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment, preview: Bool = false
     ) -> [String: [Model]] {
-        if cacheFault(dataRoot: dataRoot, environment: environment) != nil {
+        if cacheFault(dataRoot: dataRoot, environment: environment, preview: preview) != nil {
             return ["codex": [], "openai_oauth_direct": []]
         }
-        let cache = chatGPTOAuthCache(dataRoot: dataRoot, environment: environment)?.cache
+        let cache = chatGPTOAuthCache(dataRoot: dataRoot, environment: environment, preview: preview)?.cache
         return Dictionary(uniqueKeysWithValues: ["codex", "openai_oauth_direct"].map {
             ($0, models(providerID: $0, cache: cache))
         })
     }
 
-    /// The account's own list is there but unreadable (the CLI's shared one
-    /// only when the account has none beside its sign-in): its models and
-    /// windows are unknown, never the shipped rows.
+    /// Unreadable account discovery leaves models and windows unknown; shipped rows cannot stand in for it.
     public static func cacheFault(
         dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment, preview: Bool = false
     ) -> String? {
         let url = cacheSource(dataRoot: dataRoot, environment: environment)
-        guard let cache = readCache(at: url, dataRoot: dataRoot) else {
+        guard let cache = readCache(at: url, dataRoot: dataRoot, preview: preview) else {
             return modelCatalogFault(at: url, read: false, owner: "this ChatGPT account")
                 ?? "This ChatGPT account's model catalog is not available at \(url.path). Refresh its models in Providers before choosing or running a model."
         }
@@ -279,42 +269,42 @@ public enum CodexAccountModelCatalog {
 
     private static func chatGPTOAuthCache(
         dataRoot: URL,
-        environment: [String: String]
+        environment: [String: String], preview: Bool = false
     ) -> (url: URL, cache: Cache)? {
         let authURL = authPath(dataRoot: dataRoot, environment: environment)
         return matchingCache(
             oauthAuthURL: authURL,
-            dataRoot: dataRoot
+            dataRoot: dataRoot, preview: preview
         )
     }
 
     static func matchingModels(
         providerID: String,
         oauthAuthURL: URL,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(), preview: Bool = false
     ) -> [Model] {
         let source = oauthAuthURL.deletingLastPathComponent().appendingPathComponent("models_cache.json")
-        if modelCatalogFault(at: source, read: readCache(at: source, dataRoot: dataRoot) != nil, owner: "this ChatGPT account") != nil { return [] }
+        if modelCatalogFault(at: source, read: readCache(at: source, dataRoot: dataRoot, preview: preview) != nil,
+            owner: "this ChatGPT account") != nil { return [] }
         return models(providerID: providerID, cache: matchingCache(
-            oauthAuthURL: oauthAuthURL, dataRoot: dataRoot
+            oauthAuthURL: oauthAuthURL, dataRoot: dataRoot, preview: preview
         )?.cache)
     }
 
     private static func matchingCache(
         oauthAuthURL: URL,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(), preview: Bool = false
     ) -> (url: URL, cache: Cache)? {
         let sibling = oauthAuthURL.deletingLastPathComponent()
             .appendingPathComponent("models_cache.json")
-        if let cache = readCache(at: sibling, dataRoot: dataRoot), cacheMatchesAccount(cache, authURL: oauthAuthURL) {
+        if let cache = readCache(at: sibling, dataRoot: dataRoot, preview: preview), cacheMatchesAccount(cache, authURL: oauthAuthURL) {
             return (sibling, cache)
         }
         return nil
     }
 
     private static func cacheMatchesAccount(_ cache: Cache, authURL: URL) -> Bool {
-        // A current external CLI cache has no NativeAgent marker. The explicit
-        // CLI source is already bound to the selected sign-in's directory.
+        // An external CLI cache has no app marker; its explicit source is already bound to the selected sign-in directory.
         guard let account = cache.accountID else { return true }
         return account == persistedAccountID(at: authURL)
     }

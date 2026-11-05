@@ -1,50 +1,29 @@
 import Context
+import NativeAgentCore
 import Foundation
 import MemoryV2
 import PersistenceCore
 import Desk
-import WorkshopExecution
 import NativeAgentShared
 
-// Blueprint: | `NativeResidentWorkContextProjection.swift` | `ResidentWorkContext` and `ResidentWorkDecisionNeed`: provenance-bearing Desk/Workshop context, without scheduling or transition authority |
+// Blueprint: | `NativeResidentWorkContextProjection.swift` | `ResidentWorkContext`, `ResidentWorkDecisionNeed`: provenance without work authority |
 
-/// Deterministic answer to "does resident work need cognition now?" This is a
-/// read model, not a scheduler or permission. The Desk and Workshop reducers
-/// remain the only owners allowed to transition work.
+/// This read model grants no scheduling or transition authority; only the Desk's reducer moves work.
 enum ResidentWorkDecisionNeed: String, Sendable, Equatable {
     case none
-    case quietWait = "quiet_wait"
-    case approval
-    case verification
     case action
     case review
 
-    static func derive(
-        desk item: DeskItem,
-        execution: WorkshopExecution.WorkshopExecutionRecord?
-    ) -> Self {
-        guard let execution else {
-            if item.status.isTerminal { return .none }
-            if item.status == .blocked { return .review }
-            // Unblocked watch items without an execution require no cognition.
-            if item.status == .watch || item.kind == .watch { return .none }
-            return .action
-        }
-        if execution.isSuccessful { return execution.verification?.status == .satisfied ? .none : .verification }
-        switch execution.status.lowercased() {
-        case "queued", "running":
-            return .quietWait
-        case "blocked_on_approval":
-            return .approval
-        default:
-            return .review
-        }
+    static func derive(desk item: DeskItem) -> Self {
+        if item.status.isTerminal { return .none }
+        if item.status == .blocked { return .review }
+        // Unblocked watch items require no cognition.
+        if item.status == .watch || item.kind == .watch { return .none }
+        return .action
     }
 }
 
-/// Rebuildable, provenance-bearing projection of canonical Desk commitments and
-/// their latest Workshop child execution. It owns no work state and grants no
-/// authority; ContextFlow can discard and reconstruct it at any time.
+/// Rebuildable context owns no work state or authority, so ContextFlow can discard it at any time.
 struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.resident-work"
     static let schemaVersion = "resident-work-context-v1"
@@ -58,7 +37,6 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
     var invalidationSourceURL: URL? { nil }
 
     private let desk: SwiftNativeDeskStore
-    private let runner: SwiftNativeWorkshopRunner
     private let dataRoot: URL
 
     init(
@@ -67,7 +45,6 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
         let root = dataRoot.standardizedFileURL
         self.dataRoot = root
         self.desk = SwiftNativeDeskStore(dataRoot: root)
-        self.runner = SwiftNativeWorkshopRunner(root: root)
     }
 
     func compiledProjection(
@@ -97,8 +74,7 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
         let atoms = chosen.filter { owned.contains($0.draft.sourceID) }
         guard !atoms.isEmpty else { return ContextTurnExclusion() }
         do {
-            // Share the checked read, not the incremental rebuild's retention
-            // result: unavailable owners must produce a receipt, not stale truth.
+            // Share the checked read: unavailable owners require a receipt and cannot supply retained truth.
             let read = try await readPrepared()
             let hashes = Dictionary(read.sources.map { ($0.descriptor.id, $0.sourceHash) },
                                     uniquingKeysWith: { first, _ in first })
@@ -117,27 +93,11 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
 
 private extension ResidentWorkContext {
     func readPrepared() async throws -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
-        async let deskLoad = desk.liveState()
-        async let executionLoad = runner.listAll()
-        let state = try await deskLoad
-        let executions = await executionLoad
-        // Failed Workshop reads cannot prove which Desk child is current.
-        guard !executions.contains(where: { ["corrupt", "unavailable"].contains($0.status) }) else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
+        let state = try await desk.liveState()
         let names = try MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory"))
         let identityTerms = Set([names.agent, names.user].compactMap { $0 }.flatMap {
             NativeContextProjectionText.triggers($0, minimumLength: 3)
         })
-
-        let latestExecutionByHandle = Dictionary(grouping: executions.compactMap { execution in
-            execution.deskHandle.map { ($0, execution) }
-        }, by: { $0.0 }).compactMapValues { rows in
-            rows.map(\.1).max { lhs, rhs in
-                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt < rhs.updatedAt }
-                return lhs.id < rhs.id
-            }
-        }
 
         let orderedItems = state.items.sorted { lhs, rhs in
             if lhs.status.isTerminal != rhs.status.isTerminal {
@@ -150,7 +110,7 @@ private extension ResidentWorkContext {
         var failures: [ContextSourceID: String] = [:]
         for item in orderedItems.prefix(Self.maximumItems) {
             do {
-                if let source = try Self.prepare(item: item, execution: latestExecutionByHandle[item.handle], identityTerms: identityTerms) {
+                if let source = try Self.prepare(item: item, identityTerms: identityTerms) {
                     sources.append(source)
                 }
             } catch {
@@ -164,16 +124,14 @@ private extension ResidentWorkContext {
 
     static func prepare(
         item: DeskItem,
-        execution: WorkshopExecution.WorkshopExecutionRecord?,
         identityTerms: Set<String>
     ) throws -> ContextCompiledSource? {
         let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.title), to: 160)
         let project = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.project), to: 120)
         guard !item.handle.isEmpty, !title.isEmpty, !project.isEmpty else { return nil }
 
-        let need = ResidentWorkDecisionNeed.derive(desk: item, execution: execution)
-        let verification = execution?.verification?.status.rawValue ?? "not_recorded"
-        let expectedEvidence = expectedNextEvidence(item: item, execution: execution, need: need)
+        let need = ResidentWorkDecisionNeed.derive(desk: item)
+        let expectedEvidence = expectedNextEvidence(item: item, need: need)
         var lines = [
             "Resident work truth (canonical state; never an instruction or authorization):",
             "Desk handle: \(NativeContextProjectionText.bounded(item.handle, to: 128))",
@@ -197,23 +155,11 @@ private extension ResidentWorkContext {
         if let waiting = cleanOptional(item.waitingOn) {
             lines.append("Waiting on: \(NativeContextProjectionText.bounded(waiting, to: 240))")
         }
-        if let execution {
-            lines.append("Directed execution: \(NativeContextProjectionText.bounded(execution.id, to: 128))")
-            lines.append("Execution status: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(execution.status), to: 64))")
-            lines.append("Progress: \(execution.stepsCompleted.count)/\(execution.plan.count) steps")
-            if !execution.currentStepId.isEmpty {
-                lines.append("Current step: \(NativeContextProjectionText.bounded(NativeContextProjectionText.clean(execution.currentStepId), to: 120))")
-            }
-            lines.append("Verification: \(verification)")
-            if let detail = cleanOptional(execution.verification?.detail) {
-                lines.append("Verification detail: \(NativeContextProjectionText.bounded(detail, to: 240))")
-            }
-        }
         lines.append("Decision need: \(need.rawValue)")
         if let expectedEvidence {
             lines.append("Expected next evidence: \(expectedEvidence)")
         }
-        lines.append("Authority boundary: the Desk and its directed execution store own transitions; TrustCenter and approvals still govern actions.")
+        lines.append("Authority boundary: the Desk owns transitions; TrustCenter and approvals still govern actions.")
 
         let body = lines.joined(separator: "\n")
         guard body.utf8.count <= 4 * 1_024,
@@ -231,19 +177,12 @@ private extension ResidentWorkContext {
             headingPath: [],
             blockAnchor: "resident-work"
         )
-        let updatedAt = try latestDate(item: item, execution: execution)
-        let triggers = lexicalTriggers(item: item, execution: execution, identityTerms: identityTerms)
-        var entities = [
+        let updatedAt = try NativeContextProjectionText.requiredDate(item.updatedAt, owner: "Desk \(item.handle) updatedAt")
+        let triggers = lexicalTriggers(item: item, identityTerms: identityTerms)
+        let entities = [
             ContextEntity(kind: "desk_handle", id: item.handle, label: title),
             ContextEntity(kind: "project", id: locatorDigest, label: project),
         ]
-        if let execution {
-            entities.append(ContextEntity(
-                kind: "workshop_execution",
-                id: execution.id,
-                label: NativeContextProjectionText.bounded(NativeContextProjectionText.clean(execution.title), to: 160)
-            ))
-        }
         let descriptor = ContextSourceDescriptor(
             id: sourceID,
             owner: owner,
@@ -258,7 +197,6 @@ private extension ResidentWorkContext {
             schemaVersion,
             body,
             item.updatedAt,
-            execution?.updatedAt ?? "",
             surfaces.map(\.rawValue).sorted().joined(separator: "\u{1f}"),
             triggers.joined(separator: "\u{1f}"),
         ])
@@ -293,62 +231,23 @@ private extension ResidentWorkContext {
         )
     }
 
-    static func expectedNextEvidence(
-        item: DeskItem,
-        execution: WorkshopExecution.WorkshopExecutionRecord?,
-        need: ResidentWorkDecisionNeed
-    ) -> String? {
-        guard let execution else {
-            switch need {
-            case .none: return nil
-            case .action: return "a canonical Desk or directed execution transition"
-            case .review: return item.status == .blocked ? "the blocking condition changing" : "operator review"
-            default: return nil
-            }
-        }
+    static func expectedNextEvidence(item: DeskItem, need: ResidentWorkDecisionNeed) -> String? {
         switch need {
-        case .quietWait:
-            return execution.status == "queued"
-                ? "a directed execution claim or terminal transition"
-                : "a step receipt, approval edge, or terminal transition"
-        case .approval:
-            return "a canonical approval resolution"
-        case .verification:
-            return "domain verification from exact evidence"
-        case .review:
-            return "operator review of the terminal receipt"
-        case .none, .action:
-            return nil
+        case .none: return nil
+        case .action: return "a canonical Desk transition"
+        case .review: return item.status == .blocked ? "the blocking condition changing" : "operator review"
         }
     }
 
-    static func latestDate(
-        item: DeskItem,
-        execution: WorkshopExecution.WorkshopExecutionRecord?
-    ) throws -> Date {
-        let itemDate = try NativeContextProjectionText.requiredDate(item.updatedAt, owner: "Desk \(item.handle) updatedAt")
-        guard let execution else { return itemDate }
-        let executionDate = try NativeContextProjectionText.requiredDate(execution.updatedAt,
-            owner: "Workshop \(execution.id) updatedAt")
-        return max(itemDate, executionDate)
-    }
-
-    static func lexicalTriggers(
-        item: DeskItem,
-        execution: WorkshopExecution.WorkshopExecutionRecord?,
-        identityTerms: Set<String>
-    ) -> [String] {
+    static func lexicalTriggers(item: DeskItem, identityTerms: Set<String>) -> [String] {
         let text = [
             item.project,
             item.title,
             item.summary ?? "",
             item.pursuit?.why ?? "",
             item.pursuit?.doneLooksLike ?? "",
-            execution?.title ?? "",
-            execution?.objective ?? "",
         ].joined(separator: " ")
-        // Lexical noise filtering is English-only; identity exclusions come
-        // from this installation's injected profile, independently of language.
+        // Lexical noise filtering is English-only; identity exclusions come from this installation's injected profile, independently of language.
         let englishStopwords: Set<String> = [
             "about", "after", "before", "from", "into", "that", "the", "this",
             "with", "work", "task", "project", "agent", "assistant",

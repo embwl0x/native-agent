@@ -4,6 +4,7 @@ import Darwin
 import Network
 import ChatTurnRuntime
 import ChatTurnContracts
+import ChatToolRuntime
 import AgentConversations
 import ChatToolParsing
 import Cognition
@@ -15,9 +16,9 @@ import PersistenceCore
 import Privacy
 import MacControl
 import TrustCenter
-// Blueprint: | `ClaudeBridgeRuntime.swift` | Authenticated HTTP/contact routes and generation-ordered contact lifecycle; stop closes admission before passive cleanup, preserving accepted turns/tools; the 64-request ceiling holds workers/actual tool dispatches until exit, beyond response deadlines; the shared human-pausable tool ceiling returns unknown on timeout without prematurely settling the tool receipt; listener readiness retains the Codex queue/reply supervisor and concurrent OMP recovery through exit, with failure-only reattachment and ProcessExecution-owned helper reaping; live payload publication, retained clients and event transport |
+// Blueprint: | `ClaudeBridgeRuntime.swift` | Response deadlines retain accepted work until exit. |
 
-/// Factories and app observations bound at launch; ingress and retained delivery stay with the agent runtime.
+/// Factories bind at launch; ingress and retained delivery remain with the runtime owner.
 public protocol ClaudeBridgeRuntimePort: ClaudeBridgeMessagePort {
     var dataRoot: URL { get }
     var cognition: NativeCognitionRuntime { get }
@@ -45,13 +46,11 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     private static let maxRequestBodyBytes = 4 * 1024 * 1024
 
     private static let connectionDeadlineSeconds: Int = 30
-    /// Work-phase bound for /claude/tool dispatches.
     public static let toolWorkDeadlineSeconds: Int = 300
-    /// Work-phase bound for the read/debug endpoints (/claude/state, /claude/organism_debug). Both await the cognition runtime actor; a stalled actor left their detached Tasks and connections unbounded. Short by design — neither endpoint
-    /// does LLM work.
+    /// Keep read/debug waits short: stalled cognition must not retain unbounded tasks or connections, and these endpoints do no model work.
     public static let readWorkDeadlineSeconds: Int = 60
 
-    /// Claim-once latch shared by a work Task and its deadline timer so exactly one of them writes the HTTP response.
+    /// Work and deadline share one latch so exactly one can write the HTTP response.
     public final class WorkLatch: @unchecked Sendable {
         public init() {}
 
@@ -59,7 +58,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         private var claimed = false
         private var deadlineWork: DispatchWorkItem?
 
-        /// Returns true exactly once. The winner also cancels the deadline this latch owns, so a burst of requests can no longer stack live timers that each retain the bridge (and the connection) until their deadline elapses.
+        /// The winning response cancels its timer so completed requests cannot retain connections until expiry.
         public func claim() -> Bool {
             lock.lock()
             if claimed {
@@ -75,7 +74,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             return true
         }
 
-        /// Arms the single deadline timer this latch owns. If the work already claimed the response, nothing is scheduled at all.
+        /// Do not arm a deadline after work has already claimed the response.
         public func arm(afterSeconds seconds: Int, _ body: @escaping @Sendable () -> Void) {
             let work = DispatchWorkItem(block: body)
             lock.lock()
@@ -91,7 +90,6 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         port: ClaudeBridgeRuntime.port,
         label: "ClaudeBridge"
     )
-    /// Doctor's "Local bridges" row: which port this bridge got, or why it has none.
     public var listenerHealth: (port: UInt16, boundPort: UInt16?, isActive: Bool, failure: String?) {
         let listener = bridgeListener.health
         return stateLock.withLock {
@@ -104,8 +102,6 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     private var _token: String = ""
     private var _activePort: UInt16 = 0
     private var discoveryPublicationFailure: String?
-    private var replyRecoveryTask: Task<Void, Never>?
-    private var replyRecoveryToken: String?
     private var contactLifecycleRevision: UInt64 = 0
     private var contactLifecycleWorkers: [UInt64: Task<Void, Never>] = [:]
     private struct RequestWorker {
@@ -139,7 +135,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
     }
 
-    /// Retain each request through actual exit, including a tool operation whose HTTP deadline has already answered. Accepted tool work survives disconnect/stop; reads are canceled with their connection.
+    /// Retain each request through actual exit, including a tool operation whose HTTP deadline has already answered. Accepted tool work survives
+    /// disconnect/stop; reads are canceled with their connection.
     func startRequest(conn: NWConnection, latch: WorkLatch, priority: TaskPriority,
                       accepted: Bool = false,
                       operation: @escaping @Sendable (UUID) async -> Void) -> Task<Void, Never>? {
@@ -169,7 +166,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     }
 
     func runToolOperation(_ id: UUID, operation: @escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue {
-        // Created inside TurnDeadline's scope so human waits still pause the existing active-work ceiling. Retain the actual dispatch, not just the wrapper that returns as soon as that ceiling fires.
+        // Created inside TurnDeadline's scope so human waits still pause the existing active-work ceiling. Retain the actual dispatch, not just the wrapper
+        // that returns as soon as that ceiling fires.
         let worker = try stateLock.withLock {
             guard requestWorkers[id]?.operationClosed == false, !Task.isCancelled else { throw CancellationError() }
             requestWorkers[id]?.operationAdmitted = true
@@ -212,12 +210,11 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     private var eventSeq: UInt64 = 0
     private let eventDeliveryQueue = DispatchQueue(label: "com.nativeagent.bridge.events")
 
-    /// Bridge activity event. Pushed into recentToolCalls (bounded) AND fanned out to /claude/events SSE subscribers. Payload values must be JSONSerialization-compatible (String/Int/Bool/NSNull/Array/Dict of same) — kept as a pre-
-    /// serialized JSON string to satisfy strict- concurrency Sendable checking without losing structured access.
+    /// Pre-serialize JSON-compatible event payloads for strict-concurrency Sendable transport without losing structured access.
     struct BridgeEvent: @unchecked Sendable {
         let seq: UInt64
         let timestamp: Date
-        let kind: String          // "tool", "message_in", "message_out", "message_failed", "tool_failed"
+        let kind: String
         let payload: [String: Any]
 
         var asJSON: [String: Any] {
@@ -231,13 +228,13 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
     }
 
-    /// Canonical SSE framing for both a live fan-out and a reconnect backfill. Keeping this at the route owner prevents a valid bridge event from being silently emitted in one format and replayed in another.
+    /// Live SSE and reconnect backfill must use identical framing.
     static func eventStreamFrame(for event: BridgeEvent) throws -> Data {
         let json = String(decoding: try JSONSerialization.data(withJSONObject: event.asJSON), as: UTF8.self)
         return Data("data: \(json)\n\n".utf8)
     }
 
-    /// Bounded projection used by the state endpoint and hermetic route evals. Callers receive values, never access to the mutable event ring.
+    /// State callers receive bounded values, never mutable event-ring access.
     public func recentEventPayloads() -> [[String: Any]] {
         stateLock.lock()
         let recent = recentToolCalls
@@ -245,9 +242,11 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         return recent.map { $0.asJSON }
     }
 
-    /// A returned envelope proves dispatch completed, not that the requested operation succeeded. Share chat's exact classification; do not turn queued/approval/unknown results into success or retain result content.
+    /// A returned envelope proves dispatch completed, not that the requested operation succeeded. Share chat's exact classification; do not turn
+    /// queued/approval/unknown results into success or retain result content.
     public func publishToolResultEvent(name: String, surface: String, result: JSONValue, durationMs: Int) {
-        let outcome = ChatToolOutcome.exactResultClass(result)
+        let reply = ToolResult(result)
+        let outcome = reply.outcome
         let ok: Any
         switch outcome {
         case .succeeded: ok = true
@@ -261,7 +260,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         ])
     }
 
-    /// Canonical organism-debug event seam shared by the HTTP endpoint and no-network eval harness. Optional fields are omitted rather than serialized as null so reset/settle/clear events stay minimal.
+    /// Omit absent debug fields rather than encoding null so reset and clear events stay minimal.
     public func publishOrganismDebugEvent(
         status: String,
         scenario: String? = nil,
@@ -276,7 +275,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     public var token: String { stateLock.lock(); defer { stateLock.unlock() }; return _token }
     public var activePort: UInt16 { stateLock.lock(); defer { stateLock.unlock() }; return _activePort }
 
-    // Lazily-built ChatTurnRuntime client + dispatcher. Built off-MainActor on first need. Both are Sendable.
+    // Build the Sendable turn client and dispatcher off the main actor on first use.
     let clientLock = NSLock()
     private var cachedToolClient: (any ToolDispatchClient)?
 
@@ -348,15 +347,13 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }.value
     }
 
-    /// Synchronous entry for the AppDelegate bootstrap path. We were dispatching via `Task.detached(priority: .background) { await startServer() }` from `applicationDidFinishLaunching`, but the `.background` Task was being indefinitely
-    /// deferred on cold-launch (the SwiftUI lifecycle finished, BUT the cooperative pool never scheduled our task — no log, no bind, no token file). Mirrors MacControlBridge.shared.start() which uses DispatchQueue and runs every time. NOT
-    /// async.
+    /// Bootstrap synchronously because a background cooperative task can remain unscheduled during cold launch.
     public func startSyncForBootstrap() {
         nativeLog("[claude-bootstrap] startSyncForBootstrap entered — invoking startSync")
         startSync()
     }
 
-    /// Cancel the listener, all live connections + their deadline timers, clear the in-memory endpoint, and remove discovery files. Idempotent.
+    /// Retire listeners, connections, timers and discovery files together; repeated stop is safe.
     public func stop() {
         teardown(token: nil)
     }
@@ -371,12 +368,10 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         _token = ""
         _activePort = 0
         updateContactLifecycleLocked(active: false)
-        let recovery = replyRecoveryTask
         eventSubscribers.removeAll()
         if token == nil { bridgeListener.stop() }
         removeDiscoveryFiles()
         stateLock.unlock()
-        recovery?.cancel()
         retireRequests(token: retiringToken)
         for entry in entries {
             entry.deadlineWork.cancel()
@@ -385,8 +380,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     }
 
     private func startSync() {
-        // The coding-organ return listener is ordinary NativeAgent infrastructure, not a developer-mode capability. It is always resident so installed Codex/Claude sessions can complete their authenticated round trip. Authority still comes
-        // from loopback-only binding, a per-launch private bearer, and the normal Trust Center / approval gates applied at each message and tool endpoint.
+        // Keep completion return infrastructure resident; loopback binding, a private launch bearer and ordinary Trust gates own authority.
         stateLock.lock()
         let alreadyRunningOrStarting = bridgeListener.isActive || !_token.isEmpty
         stateLock.unlock()
@@ -441,7 +435,10 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         // Hold the lifecycle lock over the tiny atomic publications so stop() cannot remove them and then lose a race to a stale ready callback.
         do { try writeDiscoveryFiles(token: token, port: port) }
         catch {
-            let detail = "Bridge discovery publication failed at \(configDir.path): \(error.localizedDescription). Repair the named file error and start the bridge again."
+            let detail = """
+                Bridge discovery publication failed at \(configDir.path): \(error.localizedDescription). Repair the named file error and start the \
+                bridge again.
+                """
             discoveryPublicationFailure = detail
             _activePort = 0
             updateContactLifecycleLocked(active: false)
@@ -456,84 +453,10 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         _activePort = port
         startedAt = Date()
         updateContactLifecycleLocked(active: true)
-        startReplyRecoveryLocked(token: token)
         stateLock.unlock()
 
         nativeLog("[ClaudeBridge] listening on 127.0.0.1:%d", Int(port))
     }
-
-    private func startReplyRecoveryLocked(token: String) {
-        guard replyRecoveryTask == nil, replyRecoveryToken != token else { return }
-        replyRecoveryToken = token
-        replyRecoveryTask = Task.detached(priority: .utility) { [self] in
-            defer {
-                stateLock.withLock {
-                    replyRecoveryTask = nil
-                    // A new listener may have become ready while the old helper drained. Its state change admits one recovery.
-                    if !_token.isEmpty, _activePort != 0, _token != token {
-                        startReplyRecoveryLocked(token: _token)
-                    }
-                }
-            }
-            guard !Task.isCancelled, self.token == token else { return }
-            // Each organ recovers independently; the retained parent owns both children until exit, including cancellation and helper reaping.
-            async let codex: Void = startCodexReplyJobRecovery(token: token)
-            async let omp: Void = AgentBridgeRuntime.startOMPReplyJobRecovery()
-            _ = await (codex, omp)
-        }
-    }
-
-    /// One retained, event-backed queue/reply owner for this listener. A helper
-    /// exit ends that process, never the accepted work's observation lifetime.
-    private func startCodexReplyJobRecovery(token: String) async {
-        let environment = ProcessInfo.processInfo.environment
-        if ["1", "true", "yes"].contains(
-            environment["NATIVE_AGENT_CODEX_REPLY_RECOVERY_DISABLED"]?.lowercased() ?? ""
-        ) {
-            return
-        }
-        let dataRoot = host.dataRoot
-        let repoRoot = dataRoot.deletingLastPathComponent()
-        guard let helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot) else {
-            nativeLog(
-                "[ClaudeBridge] codex wake helper missing; expected %@",
-                AgentBridgeRuntime.expectedHelperPath(named: "codex_thread_wakeup.js", dataRoot: dataRoot).path
-            )
-            return
-        }
-        nativeLog("[ClaudeBridge] codex wake helper: %@", helper.path)
-        let processEnvironment = AgentBridgeRuntime.processEnvironment(base: environment)
-        guard let node = AgentBridgeRuntime.executableURL(named: "node", environment: processEnvironment) else {
-            return
-        }
-        var childEnvironment = processEnvironment
-        childEnvironment["NATIVE_AGENT_DATA_ROOT"] = dataRoot.path
-        let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
-        childEnvironment.merge(InstallPaths.current.bridgeEnvironment(configRoot: configRoot)) { existing, _ in existing }
-        if childEnvironment["CODEX_BIN"] == nil,
-           let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: processEnvironment) {
-            childEnvironment["CODEX_BIN"] = codex.path
-        }
-        while !Task.isCancelled, self.token == token {
-            do {
-                // This task retains/reaps the supervisor and its children on cancellation.
-                let result = try await ProcessExecution().run(executable: node.path,
-                    arguments: [helper.path, "--recover-wakes"], currentDirectory: repoRoot,
-                    environment: childEnvironment, standardInput: nil, timeoutSeconds: nil, outputByteLimit: 0)
-                if !Task.isCancelled {
-                    nativeLog("[ClaudeBridge] Codex wake owner exited %d; reattaching retained work", Int(result.exitCode))
-                }
-            } catch {
-                if !Task.isCancelled {
-                    nativeLog("[ClaudeBridge] Codex wake owner unavailable: %@", String(describing: error))
-                }
-            }
-            guard !Task.isCancelled, self.token == token else { return }
-            // Failure-only backoff; healthy observation is driven by owner events.
-            do { try await Task.sleep(for: .seconds(30)) } catch { return }
-        }
-    }
-
 
     private func accept(_ conn: NWConnection) {
         guard BridgeCore.endpointIsLoopback(conn.endpoint) else { conn.cancel(); return }
@@ -542,8 +465,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         stateLock.unlock()
         guard bridgeIsReady else { conn.cancel(); return }
         let key = ObjectIdentifier(conn)
-        // Per-connection read deadline — prevents a peer from holding a slot open forever by never sending the body bytes promised in Content-Length. UUID-gated (C5): a late fire only cancels the exact connection it was armed for, never an
-        // ObjectIdentifier-reused sibling.
+        // Bound request-body reads so a peer cannot hold a slot forever; UUID fencing prevents late timers cancelling reused connections.
         let deadlineToken = UUID()
         let deadlineWork = DispatchWorkItem { [weak self] in
             self?.cancelUnroutedConnection(key: key, deadlineToken: deadlineToken)
@@ -580,7 +502,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         BridgeCore.readRequest(conn, buffered: Data(), maxBodyBytes: Self.maxRequestBodyBytes, server: self)
     }
 
-    /// Cancel a connection whose request never fully arrived before its read deadline fired. Identity-gated so it cannot cancel a routed connection or a different connection that reused the ObjectIdentifier.
+    /// Cancel only the exact still-unrouted request whose read deadline expired.
     private func cancelUnroutedConnection(key: ObjectIdentifier, deadlineToken: UUID) {
         stateLock.lock()
         guard let entry = connections[key],
@@ -670,35 +592,28 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             let tasks = self.tasks
             Task {
                 let reply = await AgentContactRoutes.retainedReply(requestID: request, sessionID: session,
-                    taskID: AgentContactRoutes.taskID(requestID: request, sessionID: session, principal: principal), receiptSessionID: session, offset: offset, maxChars: maxChars,
+                    taskID: AgentContactRoutes.taskID(requestID: request, sessionID: session, principal: principal), receiptSessionID: session,
+                        offset: offset, maxChars: maxChars,
                     principal: principal, tasks: tasks)
+                let held: AgentContactHeldResponse
+                do { held = try AgentContactHeldResponse(principal: principal, dataRoot: host.dataRoot, via: "/" + lane + "/reply") }
+                catch { writeJSON(conn, status: 503, obj: AgentContactHeldResponse.failure(error, dataRoot: host.dataRoot)); return }
+                let fetched = AgentContactRoutes.fetched(reply.receipt, task: reply.task, tasks: tasks)
+                func respond(_ status: Int, _ object: [String: Any]) {
+                    writeJSON(conn, status: status, obj: held.adding(to: object),
+                        onSent: { fetched?(); held.settle(true) }, onFailed: { held.settle(false) })
+                }
                 if reply.task == nil, reply.receipt["status"] as? String != "ok" {
                     if reply.receipt["evidence"] as? String == "canonical_task_unreadable" {
-                        writeJSON(conn, status: 503, obj: reply.receipt)
+                        respond(503, reply.receipt)
                     } else {
-                        writeJSON(conn, status: 404, obj: ["status": "unavailable",
+                        respond(404, ["status": "unavailable",
                             "detail": "No retained result is available for this caller and request. Absence does not authorize resending.",
                             "evidence": reply.receipt["evidence"] ?? NSNull()])
                     }
                     return
                 }
-                writeJSON(conn, status: 200, obj: reply.receipt,
-                    onSent: AgentContactRoutes.fetched(reply.receipt, task: reply.task, tasks: tasks))
-            }
-        case "/launch":
-            // A queued Codex launch asks when it launches: the Mac's ceiling now, never a stamp.
-            guard method == "GET", lane == "codex" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            let dataRoot = host.dataRoot
-            Task {
-                let ceiling = await SwiftNativeSecurityCenter(dataRoot: dataRoot).drivenAgentLaunchCeiling()
-                if case .denied(let reason) = ceiling {
-                    writeJSON(conn, status: 200, obj: ["status": "denied", "reason": reason])
-                } else {
-                    writeJSON(conn, status: 200, obj: ["status": "ok", "sandbox": ceiling.codexSandbox, "approvalPolicy": ceiling.codexApprovalPolicy])
-                }
+                respond(200, reply.receipt)
             }
         case "/organism/debug":
             guard method == "POST" else {
@@ -706,12 +621,6 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                 return
             }
             handleOrganismDebug(conn: conn, body: body, path: path)
-        case "/live":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            handleAgentLive(conn: conn, body: body, agent: lane)
         case "/events":
             guard method == "GET" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
@@ -730,8 +639,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
 
     // MARK: - Activity event publisher
 
-    /// Push an event into the ring buffer + fan out to SSE subscribers. stateLock orders sequence assignment and delivery enqueueing together. Connection writes run on one serial queue, outside the state lock. `retain: false` fans out
-    /// only: a live partial is stale the moment the next one lands and must not crowd real actions out of the backfill ring.
+    /// Order sequence assignment and subscriber enqueues under stateLock; serialize writes outside it. Do not retain partials in backfill because newer
+    /// partials immediately supersede them.
     public func publishEvent(kind: String, payload: [String: Any], retain: Bool = true) {
         stateLock.lock()
         eventSeq += 1
@@ -759,7 +668,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     }
 
     private func handleEventsStream(conn: NWConnection) {
-        // SSE headers — keep-alive, never close, no Content-Length.
+        // SSE must remain open without Content-Length.
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
         let hello = "event: hello\ndata: {\"connected\":true,\"recentToolCallsCap\":\(Self.recentToolCallsCap)}\n\n"
         let initial = Data((headers + hello).utf8)
@@ -785,8 +694,9 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
 
     // MARK: - HTTP response
 
-    public func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any], onSent: (@Sendable () -> Void)? = nil) {
-        BridgeCore.writeJSON(conn, status: status, obj: obj, onSent: onSent)
+    public func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any], onSent: (@Sendable () -> Void)? = nil,
+                          onFailed: (@Sendable () -> Void)? = nil) {
+        BridgeCore.writeJSON(conn, status: status, obj: obj, onSent: onSent, onFailed: onFailed)
     }
 }
 
@@ -812,16 +722,11 @@ extension ClaudeBridgeRuntime {
         ]
     }
 
-    func handleAgentLive(conn: NWConnection, body: Data, agent: String) {
-        messageRuntime().handleAgentLive(response: { [weak self] status, object in
-            self?.writeJSON(conn, status: status, obj: object)
-        }, body: body, agent: agent)
-    }
 }
 
 extension ClaudeBridgeRuntime {
     func handleState(conn: NWConnection, path: String) {
-        // Same WorkLatch + asyncAfter bound as handleMessage/handleTool: exactly one of the work Task and the deadline writes the response.
+        // Work and deadline must share one response latch.
         let workLatch = WorkLatch()
         let workTask = startRequest(conn: conn, latch: workLatch, priority: .userInitiated) { [weak self] _ in
             guard let self else { return }

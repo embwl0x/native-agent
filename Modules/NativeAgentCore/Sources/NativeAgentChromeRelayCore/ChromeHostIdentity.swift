@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import Security
 
-// Blueprint: | `ChromeHostIdentity.swift` | `ChromeHostIdentity`: native messaging browser/relay process identity, listener token location and filesystem identity, allowed-origin checks and private refusal evidence |
+// Blueprint: | `ChromeHostIdentity.swift` | `ChromeHostIdentity`; Browser/relay identity, allowed origins and private refusal evidence. |
 
 /// Both ends require a browser-launched relay for the registered extension.
 public enum ChromeHostIdentity {
@@ -26,11 +26,9 @@ public enum ChromeHostIdentity {
         }
     }
 
-    /// The extension the native-host manifest registers this relay for. The
-    /// manifest's `allowed_origins` is the same value.
+    /// Relay admission and manifest allowed_origins must share the same extension identity.
     public static let extensionID = "egdbijiogeeggnmjheomgnnkhmlepfcn"
 
-    /// The origin Chrome passes in argv when it launches the host.
     public static var allowedOrigin: String { "chrome-extension://\(extensionID)/" }
 
     /// Only listed signing identifiers with their vendor teams are admitted.
@@ -73,14 +71,9 @@ public enum ChromeHostIdentity {
         return pid_t(info.pbi_ppid)
     }
 
-    /// Dynamic validation of the running process: the kernel's code-signing
-    /// state for its code plus the requirement (identifier, anchor, team). That
-    /// never hashes the browser's resources on disk. macOS 27 rejects
-    /// kSecCSBasicValidateOnly for a running guest (-67070, "invalid or
-    /// inappropriate API flags"), which refused every real Chrome launch.
+    /// Validate running code without hashing browser resources; macOS 27 rejects kSecCSBasicValidateOnly for live guests (-67070).
     private static var validationFlags: SecCSFlags { [] }
 
-    /// The failed running-code check and its original Security status.
     public struct SigningFailure: Error, LocalizedError, Sendable {
         public let check: String
         public let status: OSStatus
@@ -89,8 +82,7 @@ public enum ChromeHostIdentity {
         }
     }
 
-    /// Both launch preflight and the relay use this exact running-code check.
-    /// Preserve the failing API and its status, rather than collapsing it to nil.
+    /// Preflight and relay checks must preserve the same failed Security API and status.
     public static func checkedBrowserSigningIdentifier(forProcess pid: pid_t) throws -> String {
         func requireSuccess(_ status: OSStatus, _ check: String) throws {
             guard status == errSecSuccess else { throw SigningFailure(check: check, status: status) }
@@ -125,10 +117,7 @@ public enum ChromeHostIdentity {
         return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
     }
 
-    /// Chrome passes the calling extension's origin as an argument (alongside
-    /// `--parent-window=`). Accept it with or without the trailing slash; the
-    /// value must be OUR extension's, so a second native host's origin or a
-    /// foreign extension's does not pass.
+    /// Chrome may add --parent-window= and a trailing slash; only the registered extension's origin is admitted.
     public static func argumentsCarryAllowedOrigin(_ arguments: [String]) -> Bool {
         let origin = allowedOrigin
         let withoutSlash = String(origin.dropLast())
@@ -140,8 +129,7 @@ public enum ChromeHostIdentity {
         public static let bundleIDField = "parent_bundle_id"
         public static let processIDField = "parent_pid"
         public static let validatedAtField = "parent_validated_at"
-        /// A relay dials the app immediately after it validates its parent, so
-        /// a stamp older than this is not evidence from this launch.
+        /// Dial follows launch validation immediately; older stamps cannot prove this launch's parent.
         public static let maximumAgeSeconds: TimeInterval = 300
         /// Tolerance for a clock that moved between the two stamps.
         public static let clockSkewSeconds: TimeInterval = 60
@@ -156,7 +144,6 @@ public enum ChromeHostIdentity {
             self.validatedAt = validatedAt
         }
 
-        /// The fields the relay adds to its hello frame.
         public var helloFields: [String: Any] {
             [
                 Self.bundleIDField: bundleIdentifier,
@@ -165,9 +152,7 @@ public enum ChromeHostIdentity {
             ]
         }
 
-        /// Accepts a hello's evidence when it is internally consistent: a
-        /// browser identifier THIS build accepts, a real pid, and a stamp from
-        /// the relay's own lifetime rather than the distant past or the future.
+        /// Require an admitted browser, real PID and stamp within the relay's own lifetime so stale or future evidence cannot pass.
         public static func isWellFormed(
             bundleIdentifier: String?,
             processID: Int?,
@@ -194,8 +179,7 @@ public enum ChromeHostIdentity {
     }
 }
 
-/// The relay's last refusal, beside the socket. Evidence is current only for
-/// the same living browser process, until a newer relay greeting succeeds.
+/// Refusal evidence is current only for the same living browser process, until a newer relay greeting succeeds.
 public struct ChromeRelayRefusal: Codable, Sendable {
     public enum Scope: String, Codable, Sendable { case browser, listener }
     public let scope: Scope

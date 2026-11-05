@@ -4,10 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `TurnContextSnapshotTrace.swift` | Final opening-request snapshots and wire fingerprints; root-bound, admission-ordered and joined fed-context writes with checked missing/loaded/unavailable reads; context.ready stays at assembly |
-// v2Prefix receipts (ConversationPrefixTelemetry).
+// Blueprint: | `TurnContextSnapshotTrace.swift` | Exact opening-request snapshots and ordered fed-context writes |
 import ProviderRouting
-// ContextFlow packet provenance, for the memory-recall outcome on packet turns.
+// Packet turns retain their own memory provenance for recall-outcome reporting.
 import Context
 
 // MARK: - Turn Inspector context snapshots
@@ -15,11 +14,11 @@ import Context
 extension SwiftNativeTurnEngine {
     /// Cheap lifecycle boundary; snapshot redaction and local persistence may
     /// run beside dispatch without moving the meaning of context.ready.
-    nonisolated static func fireContextReady(surface: String, context: TurnContext, sessionId: String?) {
+    nonisolated static func fireContextReady(surface: String, context: TurnContext, sessionId: String?, turn: Turn) {
         TurnLifecycleTelemetry.emit(.contextReady, surface: surface, sessionId: sessionId,
             observedBy: "context.snapshot.input", counts: [
                 "systemBytes": Int64((context.systemPrompt ?? context.systemSegments?.combined ?? "").utf8.count),
-                "toolSchemaParameterBytes": Int64(context.toolSchemas.reduce(0) { $0 + $1.parametersJSON.count })])
+                "toolSchemaParameterBytes": Int64(context.toolSchemas.reduce(0) { $0 + $1.parametersJSON.count })], turn: turn)
     }
     private static let contextSnapshotChunkChars = 1_800
     private static let contextSnapshotStableLimit = 48_000
@@ -29,21 +28,16 @@ extension SwiftNativeTurnEngine {
     private static let contextSnapshotCognitiveLimit = 12_000
     private static let contextSnapshotToolLimit = 160
 
-    /// Inspect the final opening request, after seeding, codec layout and fit.
-    ///
-    /// This is intentionally separate from `assembly.stage`, which remains
-    /// sizes-only. The snapshot event is still local, bounded, redacted, and
-    /// tied to the current `TurnTraceContext.turnId`; if no turn is bound it is
-    /// dropped by `TurnTraceBus.fireFromContext`. An empty recall with no
-    /// explicit outcome stays `unknown`; this seam never guesses that a
-    /// failed recall was a legitimate zero-hit result. Returns the
-    /// session id the snapshot was filed under, for the turn's later milestones.
+    /// Inspect only the final fitted opening request; keep local snapshots bounded and redacted under the current turn ID.
+    /// No bound turn emits nothing. Empty recall without explicit outcome remains unknown, never guessed healthy emptiness.
     @discardableResult
     nonisolated static func fireContextSnapshotEvent(
         surface: String,
         request: ConversationPrefixSeeding.Request,
         messages: [LLMMessage],
         publication: ContextFedRecord.Publication?,
+        prefix: ConversationPrefixTelemetrySnapshot?,
+        turn: Turn,
         sessionId: String? = nil,
         runId: String? = nil,
         emitReady: Bool = true
@@ -96,12 +90,7 @@ extension SwiftNativeTurnEngine {
             guard case .image(_, _, _, let byteSize) = block else { return partial }
             return partial + max(0, byteSize)
         }
-        // On a ContextFlow-active turn the direct `recalled` lane is empty BY
-        // DESIGN — memory arrives inside the packet — so falling straight to
-        // `.unknown` reported "we have no idea" about a turn whose memory
-        // provenance is fully known. Derive the same `.contextFlow` outcome
-        // `buildTurnContext` already stamps on the stage trace, from the same
-        // packet, so the two receipts agree.
+        // Derive active-turn recall outcome from the packet owner, matching preparation traces even when direct recall is empty.
         let contextFlowMemoryAtoms = context.fluidContextTurn.map { prepared in
             prepared.packet.selectedItems.reduce(into: 0) {
                 if $1.pointer.kind == .memory || $1.pointer.kind == .correction { $0 += 1 }
@@ -117,7 +106,7 @@ extension SwiftNativeTurnEngine {
             return .unknown
         }()
 
-        if emitReady { fireContextReady(surface: surface, context: context, sessionId: sessionId) }
+        if emitReady { fireContextReady(surface: surface, context: context, sessionId: sessionId, turn: turn) }
 
         var payload: [String: JSONValue] = [
             "schema": .string("context.snapshot.v1"),
@@ -194,11 +183,7 @@ extension SwiftNativeTurnEngine {
                 }
             ))
             payload["volatileBlockChars"] = .int(Int64(context.turnVolatileBlock?.count ?? 0))
-            // Bytes as well as chars, because the composer's receipt puts these
-            // two lanes beside `systemTotalBytes`, `toolSchemaMaterialBytes` and
-            // `userMessageBytes` and divides one by their sum. A share computed
-            // across mixed units is the wrong-value-no-error class: it looks
-            // like a percentage and is not one.
+            // Measure UTF-8 bytes beside other byte totals; mixing character counts into a byte denominator would fabricate a percentage.
             payload["historyMessageBytes"] = .int(Int64(
                 context.historyMessages.reduce(0) { total, message in
                     total + message.content.reduce(0) {
@@ -209,11 +194,7 @@ extension SwiftNativeTurnEngine {
             ))
             payload["volatileBlockBytes"] = .int(Int64(volatileBlock.utf8.count))
         }
-        // Text tool lane: the provider gets no tools array, so the schema JSON
-        // above is never sent. Each tool rides as one prose row, the always-on
-        // floor inside the system prompt and this session's loads in the turn
-        // brief. Measure those rows where they actually sit, so the receipt
-        // can name the tool cost without counting JSON that never left.
+        // Text-tool requests send catalog prose, not schema JSON; measure rows at their actual stable or volatile placement.
         if systemPrompt.contains(AnthropicOAuthTransport.textToolProtocolHeader) {
             do {
                 let catalog = try TextMarkerCodec.catalogSections(
@@ -231,7 +212,7 @@ extension SwiftNativeTurnEngine {
                 payload["toolCatalogMeasurementError"] = .string(String(error.localizedDescription.prefix(1000)))
             }
         }
-        if let prefix = ConversationPrefixTelemetry.current {
+        if let prefix {
             for (key, value) in prefix.payload { payload[key] = value }
         }
         if let runId, !runId.isEmpty {
@@ -281,7 +262,7 @@ extension SwiftNativeTurnEngine {
         payload["toolNames"] = .array(toolNames.map { .string($0) })
 
         if !context.recalled.isEmpty {
-            // Bound this recalled-hit trace slice by ContextBudgetPolicy.wideRecallRowLimit.
+            // Apply the shared recall row bound to trace slices.
             payload["recalled"] = .array(context.recalled
                 .prefix(ContextBudgetPolicy.wideRecallRowLimit).map { hit in
                 var row: [String: JSONValue] = [
@@ -300,21 +281,22 @@ extension SwiftNativeTurnEngine {
             kind: "context.snapshot",
             sessionId: sessionId,
             surface: surface,
-            payload: .object(payload)
+            payload: .object(payload),
+            turn: turn
         )
         if let publication {
             do {
                 let saved = try ContextFedRecord.save(publication: publication, surface: surface, fed: dynamic,
                     brief: ridesVolatileBlock ? "" : volatileBlock)
                 TurnTraceBus.fireFromContext(kind: "context.fed.saved", sessionId: sessionId, surface: surface,
-                    payload: .object(["status": .string(saved ? "saved" : "superseded")]))
+                    payload: .object(["status": .string(saved ? "saved" : "superseded")]), turn: turn)
             } catch {
                 TurnTraceBus.fireFromContext(kind: "context.fed.failed", sessionId: sessionId, surface: surface,
-                    payload: .object(["reason": .string(error.localizedDescription)]))
+                    payload: .object(["reason": .string(error.localizedDescription)]), turn: turn)
             }
         } else if let sessionId, !sessionId.isEmpty {
             TurnTraceBus.fireFromContext(kind: "context.fed.failed", sessionId: sessionId, surface: surface,
-                payload: .object(["reason": .string("No owning data root was supplied for this session's context record.")]))
+                payload: .object(["reason": .string("No owning data root was supplied for this session's context record.")]), turn: turn)
         }
         return sessionId
     }
@@ -405,7 +387,6 @@ extension SwiftNativeTurnEngine {
                 kind = "felt"
                 wording = line
             } else { continue }
-            // A Sound cue may carry its own rut nudge on the following line.
             let measured = kind == "sound"
                 ? ([wording] + lines.dropFirst(index + 1).filter { $0.hasPrefix("- Sound:") })
                     .joined(separator: " ")
@@ -450,11 +431,8 @@ extension SwiftNativeTurnEngine {
     }
 }
 
-
-/// What a conversation's latest turn was fed, whole: the changing part of the
-/// system prompt (pinned facts, recalled memories, inner state, clock) and any
-/// turn brief. The trace keeps a preview; this keeps the text, one small file
-/// per conversation, overwritten each turn, so the composer can show it.
+/// Retain the latest dynamic context and turn brief in one overwritten session file so the composer can show the actual feed.
+/// The trace keeps only its bounded preview.
 public enum ContextFedRecord {
     /// Reserved synchronously at dispatch admission, before bookkeeping escapes.
     /// Identity orders publications without assuming task scheduling or wall clocks.

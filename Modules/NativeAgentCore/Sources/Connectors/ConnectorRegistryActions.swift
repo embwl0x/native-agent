@@ -3,9 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import SlackBot
 import TrustCenter
-// Blueprint: | `ConnectorRegistryActions.swift` | connector/workspace registry operations and ordered workspace readback verification; Slack disconnect records the person’s decision before credential removal; socket-mode metadata writes delegate to SlackCredentials |
+// Blueprint: | `ConnectorRegistryActions.swift` | Ordered registry verification; disconnect intent precedes credential removal |
 
-/// Checked status projection supplied by the higher-level status owner.
 public struct ConnectorRegistryProjectionPort: Sendable {
     public let defaultName: @Sendable (String) -> String
     public let overlay: @Sendable ([String: JSONValue], URL) -> [String: JSONValue]
@@ -42,7 +41,6 @@ public enum ConnectorRegistryActions {
         root: URL,
         projection: ConnectorRegistryProjectionPort
     ) async throws -> JSONValue {
-        // ConnectorOAuthRegistry owns the checked array and locked publication.
         let normalizedID = ConnectorOAuthRegistry.normalizedConnectorID(id)
         guard let currentEntry = try await ConnectorOAuthRegistry.readConnectorRegistryEntry(
             root: root,
@@ -89,10 +87,13 @@ public enum ConnectorRegistryActions {
         return .object(overlay)
     }
 
-    public static func addWorkspace(name: String, path: String, permissions: [String], root: URL) async throws -> (added: WorkspaceRecord, refreshed: [WorkspaceRecord], verified: Bool) {
-        // DAEMON-DEAD PORT P4: append a new row to <dataRoot>/connectors/
-        // workspaces.json under flock. Matches the reader path in
-        // Connectors.swift L132.
+    public static func addWorkspace(
+        name: String,
+        path: String,
+        permissions: [String],
+        root: URL
+    ) async throws -> (added: WorkspaceRecord, refreshed: [WorkspaceRecord], verified: Bool) {
+        // Match the canonical Connectors reader path and serialize workspace publication under flock.
         let cleanedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanedName.isEmpty else {
             throw workspaceValidationError("Enter a workspace name.")

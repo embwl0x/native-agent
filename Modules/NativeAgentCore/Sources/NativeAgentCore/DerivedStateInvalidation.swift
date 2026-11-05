@@ -1,10 +1,9 @@
 import Foundation
 import NativeAgentShared
 
-// Blueprint: | `DerivedStateInvalidation.swift` | `DerivedStateInvalidationCenter`: post-write canonical-source invalidations through StoreReloadDebouncer.Timer and coalesced sink delivery; derived owners must reread truth |
+// Blueprint: | `DerivedStateInvalidation.swift` | `DerivedStateInvalidationCenter`: writes wake derived readers |
 
-/// Dependency-neutral source invalidation emitted only after a canonical write
-/// succeeds. Derived systems use this as a wake-up signal and must reread the
+/// Dependency-neutral source invalidation emitted only after a canonical write succeeds. Derived systems use this as a wake-up signal and must reread the
 /// canonical owner rather than treating the event as source data.
 public struct DerivedSourceChange: Codable, Equatable, Hashable, Sendable {
     public enum Operation: String, Codable, Sendable {
@@ -45,8 +44,7 @@ public struct DerivedSourceChange: Codable, Equatable, Hashable, Sendable {
     }
 }
 
-/// Implemented by a process-owned derived-state coordinator. Canonical owners
-/// depend only on this base protocol, so persona/memory/skills do not acquire a
+/// Implemented by a process-owned derived-state coordinator. Canonical owners depend only on this base protocol, so persona/memory/skills do not acquire a
 /// dependency on ContextFlow or any other derived index.
 public protocol DerivedStateInvalidationSink: Sendable {
     func sourceDidChange(_ changes: [DerivedSourceChange]) async
@@ -58,9 +56,8 @@ public extension DerivedStateInvalidationSink {
     }
 }
 
-/// Process-wide event bridge from canonical owners to rebuildable derived
-/// systems. Writes remain complete when no sink is installed; events are
-/// advisory wake-ups and never become a second source of truth.
+/// Process-wide event bridge from canonical owners to rebuildable derived systems. Writes remain complete when no sink is installed; events are advisory
+/// wake-ups and never become a second source of truth.
 public actor DerivedStateInvalidationCenter {
     public static let shared = DerivedStateInvalidationCenter()
 
@@ -97,8 +94,7 @@ public actor DerivedStateInvalidationCenter {
     public func publish(_ changes: [DerivedSourceChange]) async {
         guard sink != nil, !changes.isEmpty else { return }
         for change in changes {
-            // Candidate databases retain the live row IDs. Their changes must
-            // not replace a live-root change while this batch is coalescing.
+            // Candidate databases retain the live row IDs. Their changes must not replace a live-root change while this batch is coalescing.
             pending[ChangeKey(
                 namespace: change.namespace,
                 stableID: change.stableID,
@@ -115,8 +111,7 @@ public actor DerivedStateInvalidationCenter {
         }
     }
 
-    /// Nobody joins a delivery: writers publish and return, and derived
-    /// owners rebuild on their own.
+    /// Nobody joins a delivery: writers publish and return, and derived owners rebuild on their own.
     private func scheduledDeliveryFired(_ expectedGeneration: UInt64) {
         guard timer.take(expectedGeneration) else { return }
         startPendingDelivery()
@@ -133,9 +128,8 @@ public actor DerivedStateInvalidationCenter {
             return $0.occurredAt < $1.occurredAt
         }
         pending.removeAll(keepingCapacity: true)
-        // The debounce timer and entered delivery have separate lifetimes.
-        // Sink replacement requests cancellation but retains exclusion until
-        // the old sink actually returns; writers never join that execution.
+        // The debounce timer and entered delivery have separate lifetimes. Sink replacement requests cancellation but retains exclusion until the old sink
+        // actually returns; writers never join that execution.
         activeDelivery = Task { [weak self] in
             if !Task.isCancelled { await sink.sourceDidChange(changes) }
             await self?.deliveryFinished()

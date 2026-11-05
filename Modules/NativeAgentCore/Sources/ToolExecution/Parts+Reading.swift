@@ -9,29 +9,29 @@ import ToolRegistry
 import CryptoKit
 import TrustCenter
 import Privacy
-// Blueprint: | `Parts+Reading.swift` | Parts identity and row lookup, selected-version reads and bounded all-kind lists over the shared part read schema; built-in guidance with named body gaps and refused unavailable reads, and nearest-three unknown-id receipts |
+// Blueprint: | `Parts+Reading.swift` | shared checked inventory and latest-version reads |
 
 extension Parts {
-    /// One reference spelling for every ability verb, including save's new id. Action names come from the registry; they name the same
-    /// ability.
+    /// Every ability verb must resolve the same reference spelling, including IDs created by save.
     public static func referenceID(_ given: String) -> String {
         ToolNameAliases.authoredTool(given) ?? given.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// The part a name names: its bare/action id, else its name, either case.
+    /// An ability is named by its id, its name or the door action it answers to (face.action, unique by admission's collision check).
     public func row(_ named: String, kind: AbilityStore.Kind? = .part) throws -> [String: JSONValue]? {
         let name = Self.referenceID(named)
         let all = try rows(kind: kind)
         return all.first { Self.string($0, "id")?.caseInsensitiveCompare(name) == .orderedSame }
             ?? all.first { Self.string($0, "name")?.caseInsensitiveCompare(name) == .orderedSame }
+            ?? all.first { Self.string(Self.fields($0["face"] ?? .null), "action")?.caseInsensitiveCompare(name) == .orderedSame }
     }
 
-    /// The id rule: lowercase letters, digits, - and _, a letter first, 2 to 64 long. "Days left" is days-left.
+    /// Bound IDs to 2–64 lowercase letters/digits/dashes/underscores with an initial letter so names produce stable references.
     public static func id(_ given: String) -> String {
         AbilityStore.normalizedID(referenceID(given))
     }
 
-    /// Its latest version: the one waiting, else the selected one.
+    /// Waiting code is the latest version even while another version remains selected.
     public func latest(_ row: [String: JSONValue]) throws -> OwnedProgramStore.Candidate? {
         guard let id = Self.string(row, "id"),
               let digest = Self.string(row, "candidateDigest") ?? Self.string(row, "codeFingerprint") else { return nil }
@@ -54,7 +54,8 @@ extension Parts {
         return (false, detail,
          ["reason": .string("unknown_part"), "effects": .string("none"), "detail": .string(detail),
           "nearest_ids": .array(nearest.map(JSONValue.string)),
-          "remedy": Repair.remedy(owner: "abilities", nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("ability.list")])]), tap: nil,
+          "remedy": Repair.remedy(owner: "abilities", nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("ability.list")])]),
+              tap: nil,
                                   instruction: "Choose an exact id from ability.list, or save a new ability.")])
     }
 
@@ -68,8 +69,7 @@ extension Parts {
             instruction: "Choose an exact id from ability.list, or save a new ability.", recovery: .inspect)
     }
 
-    /// `ability.read`: selected declarations/status plus the latest code (waiting before selected), labeled by source.version; guidance
-    /// reads too.
+    /// Label latest code by its source version so waiting code cannot look selected.
     public func read(_ named: String, offset: Int = 0, step: Int? = nil) throws -> JSONValue {
         guard let row = try row(named, kind: nil), let id = Self.string(row, "id") else {
             let entries = try InstalledSkillInventory.entries(dataRoot: root)
@@ -86,7 +86,8 @@ extension Parts {
                             "guidance": .string(body),
                             "note": .string("Built-in guidance from the persona: read it; it is not an ability and does not run.")])
         }
-        var read = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason", "triggers", "origin", "overrides", "disabledBy", "disabledReason",
+        var read = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason", "triggers", "origin", "overrides",
+            "disabledBy", "disabledReason",
                                  "validation_evidence", "candidate_validation_evidence", "learned"].contains($0.key) }
         if row["status"] == .string("unavailable") { return .object(read) }
         read["status"] = .string("ok"); read["ability_status"] = row["status"] ?? .null
@@ -110,7 +111,7 @@ extension Parts {
             .object(["version": .string(candidate.digest), "converts": Self.fields(candidate.manifest)["converts"] ?? .array([])])
         })
         let latest = row["kind"] == .string("ability") ? try latest(row) : nil
-        // Compiled from recorded practice: where its lifecycle stands. Standing is never granted here; its live runs (learned) earn it.
+        // Only live learned runs earn standing; reading lifecycle state cannot grant it.
         if let latest, case .object(var compiled)? = Self.fields(latest.manifest)["compiled"] {
             let waiting = row["candidateDigest"] != nil
             compiled["lifecycle"] = .string(waiting ? (row["candidateValidation"] == .string("replayed") ? "verified" : "staged")
@@ -132,7 +133,6 @@ extension Parts {
         return .object(read)
     }
 
-    /// One `app.step` of its code: its label and guidance as written, and its lines when each step starts a line of its own.
     static func step(_ source: String, _ n: Int) -> JSONValue {
         let lines = source.components(separatedBy: "\n")
         let starts = lines.indices.filter { lines[$0].contains("app.step(") }
@@ -159,7 +159,7 @@ extension Parts {
         return .object(out)
     }
 
-    /// `ability.list`: every part, one row each, and the built-in guidance to read.
+    /// List code and readable built-in guidance through the same inventory.
     public func list(offset: Int = 0) throws -> JSONValue {
         let rows = try rows(kind: nil).sorted { (Self.string($0, "id") ?? "") < (Self.string($1, "id") ?? "") }
         let start = min(max(0, offset), rows.count)
@@ -178,7 +178,7 @@ extension Parts {
             if case .double(let stamp)? = last {
                 item["last_run_at"] = .string(NativeTimestampFormat.plainZulu(Date(timeIntervalSinceReferenceDate: stamp)))
             } else { item["last_run_at"] = last ?? .null }
-            // Her own curve: the model rounds each recent use of it took.
+            // Recent model-round counts expose the part's own learned cost.
             if case .array(let rounds)? = row["learned"]?.objectValue?["use"]?.objectValue?["rounds_per_use"], !rounds.isEmpty {
                 item["rounds_per_use"] = .array(rounds)
             }

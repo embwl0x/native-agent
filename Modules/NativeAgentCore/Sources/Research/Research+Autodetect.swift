@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Research+Autodetect.swift` | Explicit setup discovery retains candidate-local probe gaps while siblings proceed; refused listeners alone mean absence; Docker inventory and config reads are required; config saves fence concurrent edits; configured-server checks never select another endpoint, and answering checks cannot certify readiness from only parse gaps and no usable results |
+// Blueprint: | `Research+Autodetect.swift` | Checked setup discovery; candidate gaps stay local |
 
 extension SwiftNativeResearchClient {
     // MARK: autodetect
@@ -70,8 +70,7 @@ extension SwiftNativeResearchClient {
         case failed(String)
     }
 
-    /// A failed candidate cannot cancel another candidate or become absence.
-    /// Cancellation still ends the operation; each HTTP read has its own timeout.
+    /// A failed candidate cannot cancel another candidate or become absence. Cancellation still ends the operation; each HTTP read has its own timeout.
     private func discoveryProbe(_ candidate: SearXNGCandidate) async throws -> DiscoveryProbe {
         do {
             return try await checkSearXNG(base: candidate.baseURL) ? .reachable : .absent
@@ -82,16 +81,15 @@ extension SwiftNativeResearchClient {
         }
     }
 
-    /// False means a refused connection (no listener). Every unavailable probe
-    /// keeps its cause; discovery must not turn it into an absent installation.
+    /// False means a refused connection (no listener). Every unavailable probe keeps its cause; discovery must not turn it into an absent installation.
     public func checkSearXNG(base: String, answering: Bool = false, timeout: TimeInterval = 16) async throws -> Bool {
         let trimmed = try Self.normalizedSearXNGBaseURL(base)
         guard let url = makeURL(base: trimmed, path: "/search", query: [("q", "nativeagent"), ("format", "json")]) else {
             throw ResearchClientError.malformedResponse("Invalid SearXNG probe address: \(base)")
         }
         do {
-            // SearXNG itself may wait up to its max_request_timeout (15 s on a slow
-            // network) before answering; a shorter probe reports a working instance as down.
+            // SearXNG itself may wait up to its max_request_timeout (15 s on a slow network) before answering; a shorter probe reports a working instance as
+            // down.
             let response = try await http.getBounded(url: url, timeout: timeout, maxBytes: 512_000)
             guard response.status == 200 else { throw ResearchClientError.httpStatus(response.status) }
             guard !response.truncated else { throw ResearchClientError.malformedResponse("SearXNG probe exceeds 512,000 bytes") }
@@ -112,8 +110,6 @@ extension SwiftNativeResearchClient {
         }
     }
 
-    /// Discover numeric loopback ports from Docker rows containing `searxng`
-    /// in their lowercased Image, Names, Labels or Ports.
     func dockerSearXNGCandidates() async throws -> [SearXNGCandidate] {
         // A missing executable is known absence of this discovery source.
         guard let stdout = try await docker.runJSONLines() else { return [] }
@@ -136,7 +132,6 @@ extension SwiftNativeResearchClient {
             let ports = haystackParts[3]
             for rawPart in ports.split(separator: ",") {
                 let part = rawPart.trimmingCharacters(in: .whitespaces)
-                // Docker formats: 0.0.0.0:8888->8080/tcp, [::]:8888->8080/tcp
                 if !part.contains("->") { continue } // Exposed, unpublished container port.
                 let binding = part.components(separatedBy: "->")
                 guard binding.count == 2, let left = binding.first,
@@ -156,8 +151,7 @@ extension SwiftNativeResearchClient {
         return out
     }
 
-    /// A complete http or https SearXNG base URL with no query or fragment:
-    /// scheme and host lowercased, no trailing slash.
+    /// Normalize scheme, host and trailing slash; queries and fragments cannot identify a SearXNG base endpoint.
     public static func normalizedSearXNGBaseURL(_ value: String) throws -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let components = URLComponents(string: trimmed),
@@ -186,8 +180,7 @@ extension SwiftNativeResearchClient {
         return base
     }
 
-    /// Save a person-entered SearXNG base URL, normalized, under the same
-    /// config lock autodetect writes through.
+    /// Manual saves share discovery's config lock so either writer fences concurrent edits.
     @discardableResult
     public func saveSearXNGBaseURL(_ value: String) async throws -> String {
         let normalized = try Self.normalizedSearXNGBaseURL(value)
@@ -195,8 +188,7 @@ extension SwiftNativeResearchClient {
         return normalized
     }
 
-    /// Manual saves and discovery share the config lock. Discovery commits
-    /// only while the configuration it probed from is still current.
+    /// Manual saves and discovery share the config lock. Discovery commits only while the configuration it probed from is still current.
     private func persistSearXNGBaseURL(_ base: String, expectedConfiguration: JSONValue? = nil) async throws {
         let work: @Sendable () async throws -> Void = { [configPath] in
             let raw = try await SwiftNativePersistenceCore.readJSON(configPath, ifMissing: .object([:]))
@@ -215,7 +207,10 @@ extension SwiftNativeResearchClient {
     nonisolated static func checkedSearchConfiguration(_ raw: JSONValue) throws -> [String: JSONValue] {
         guard case .object(let object) = raw,
               object["searxng_base_url"] == nil || object["searxng_base_url"]?.stringValue != nil else {
-            throw ResearchClientError.malformedResponse("research/config.json must be an object with a string searxng_base_url when present. Original contents have been preserved; repair that file before saving an address.")
+            throw ResearchClientError.malformedResponse("""
+                research/config.json must be an object with a string searxng_base_url when present. Original contents have been preserved; repair that file \
+                before saving an address.
+                """)
         }
         return object
     }

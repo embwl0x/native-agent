@@ -17,7 +17,6 @@ import ChatToolParsing
 import TrustCenter
 import ToolRegistry
 import DreamREMCycle
-import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
@@ -37,7 +36,7 @@ extension ApprovalExecution {
         let sessionId: String?
         let telegramChatId: String?
         let verifiedUserId: String?
-        let replyRoute: ChatToolSessionContext.ReplyRoute?
+        let replyRoute: TurnEnvelope.DeliveryRoute?
         let envelope: TurnEnvelope
     }
     static func chatToolApprovalReplay(from rec: ApprovalRecord) -> ChatToolApprovalReplay? {
@@ -55,10 +54,10 @@ extension ApprovalExecution {
         let sourceKey = Self.nonEmptyPayloadString(origin["sourceKey"])
         let replyTo = Self.nonEmptyPayloadString(origin["replyTo"])
         let correlationId = Self.nonEmptyPayloadString(origin["correlationId"])
-        let replyRoute: ChatToolSessionContext.ReplyRoute? = [
+        let replyRoute: TurnEnvelope.DeliveryRoute? = [
             destinationId, threadId, sourceKey, replyTo, correlationId,
         ].contains(where: { $0 != nil })
-            ? ChatToolSessionContext.ReplyRoute(
+            ? TurnEnvelope.DeliveryRoute(
                 surface: Self.nonEmptyPayloadString(origin["surface"]) ?? surface,
                 destinationId: destinationId,
                 threadId: threadId,
@@ -68,9 +67,7 @@ extension ApprovalExecution {
             )
             : nil
         let fileAccess = if case .string(let mode)? = payload["fileAccess"] { mode } else { "auto" }
-        // A card the person decided on his paired iPhone (an action the router
-        // verified) authenticates its own follow-up: the persisted envelope never
-        // keeps the raising turn's signature, so his decision is the one it runs under.
+        // A verified paired-phone decision authorizes follow-up because the persisted envelope has no raising-turn signature.
         let signedDecision: Bool? = if case .signedIOS? = rec.resolutionProvenance { true } else { nil }
         return ChatToolApprovalReplay(
             toolName: toolName,
@@ -105,8 +102,8 @@ extension ApprovalExecution {
         records: [ApprovalRecord],
         continuation: ChatApprovalContinuation? = nil
     ) async -> (executed: Int, failures: Set<String>) {
-        let continuation: ChatApprovalContinuation = continuation ?? { root, session, envelope, prompt in
-            try await self.continueChatToolApproval(dataRoot: root, sessionID: session, envelope: envelope, prompt: prompt)
+        let continuation: ChatApprovalContinuation = continuation ?? { root, session, turn, prompt in
+            try await self.continueChatToolApproval(dataRoot: root, sessionID: session, turn: turn, prompt: prompt)
         }
         var failures: Set<String> = []
         var executed = 0
@@ -117,10 +114,7 @@ extension ApprovalExecution {
                 await applyResolvedChatToolApproval(from: rec, dataRoot: dataRoot, continuation: continuation)
                 executed += 1
             }
-            // Execution truth and conversational continuity are separate
-            // commits. Heal the latter too: an approved tool that ran before a
-            // crash must still leave one resident tool receipt in the original
-            // session so the next turn knows it completed and does not retry.
+            // Heal continuity separately from execution so a completed effect leaves a receipt instead of inviting a repeat.
             if !(await ensureChatToolApprovalOutcomeReceipt(
                 approvalID: rec.id, dataRoot: dataRoot, continuation: continuation)) {
                 failures.insert(rec.id)

@@ -8,19 +8,7 @@ import MacControl
 // Blueprint: | `ChatOrchestration+AutonomyGate.swift` | `AutonomyGate`: TrustCenter autonomy resolution and approval filing before concrete tool dispatch |
 
 // MARK: - Autonomy auto-gating for tool dispatch
-//
-// AutonomyGate sits between SwiftNativeTurnEngine's tool dispatch path and
-// the concrete ToolDispatchClient. For each tool call:
-//   1. Resolve the autonomy level via TrustCenter.
-//   2. Map level → allow / requireApproval / deny.
-//   3. If requireApproval and an ApprovalFiler is wired, file a request
-//      and await the user's decision (with timeout).
-//
-// CARVES:
-//   * This gate depends on a narrow ApprovalFiler protocol so dispatch code
-//     does not need to know which app/core component staged the durable
-//     approval record. NativeAgent.app wires the real Swift approval queue and
-//     follow-up executor; tests use mocks.
+// Depend on the approval protocol so dispatch need not know which component owns durable requests and their resolution.
 // MARK: - AutonomyGate
 
 public actor AutonomyGate {
@@ -30,18 +18,14 @@ public actor AutonomyGate {
         self.filer = approvalFiler
     }
 
-    /// File an approval request and await its resolution. Returns the final
-    /// decision (allow on approved, deny on denied/canceled). On timeout,
-    /// returns .deny (NOT throws). Also returns the approval record ID.
-    ///
-    /// A `MacInjectionCapability` names the resolved approval that authorized it.
+    /// Timeout denies without throwing; return the approval ID so injection capabilities name their authorizing decision.
     public func resolveWithApprovalDetailed(
         toolName: String,
         surface: String,
         requestPayload: JSONValue,
         timeoutSeconds: Double = 300,
         reason: String? = nil
-    ) async throws -> (decision: AutonomyDecision, approvalID: String?, notRunStatus: ToolNotRunStatus?) {
+    ,turn: Turn) async throws -> (decision: AutonomyDecision, approvalID: String?, notRunStatus: ToolNotRunStatus?) {
         guard timeoutSeconds.isFinite, timeoutSeconds >= 0,
               let nanos = UInt64(exactly: (timeoutSeconds * 1_000_000_000).rounded(.towardZero)) else {
             throw AutonomyGateError.invalidApprovalTimeout
@@ -58,7 +42,7 @@ public actor AutonomyGate {
                 surface: surface,
                 payload: requestPayload,
                 reason: resolvedReason
-            )
+            ,turn: turn)
         } catch {
             if let gateError = error as? AutonomyGateError { throw gateError }
             throw AutonomyGateError.approvalFilingFailed(String(describing: error))
@@ -79,7 +63,7 @@ public actor AutonomyGate {
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: nanos)
-                return nil  // timeout sentinel
+                return nil
             }
             var result: (AutonomyDecision, ToolNotRunStatus?) = (.deny(reason: "approval timeout"), .approvalTimedOut)
             if let first = await group.next(), let decided = first {

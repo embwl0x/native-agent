@@ -1,6 +1,6 @@
 import Foundation
 import CryptoKit
-// Blueprint: | `DiskStorageOwner.swift` | `DiskStorageOwner`: owner retention plans and execution, contained identity-checked moves to Trash and logical-byte outcomes; no history deletion |
+// Blueprint: | `DiskStorageOwner.swift` | `DiskStorageOwner`; Contained retention moves preserve history in Trash. |
 
 /// Owners declare policy and execute only the candidates saved on the card.
 public struct DiskStorageOwner: Sendable {
@@ -72,7 +72,7 @@ public struct DiskStorageOwner: Sendable {
         return resolved
     }
 
-    /// Logical bytes leaving app storage. Trash remains on the volume until the human empties it.
+    /// Logical bytes leave app storage; Trash keeps them on the volume until the person empties it.
     public static func trash(_ path: String, candidate expected: Candidate, dataRoot: URL) -> Outcome {
         do {
             let current = try snapshot(path, dataRoot: dataRoot)

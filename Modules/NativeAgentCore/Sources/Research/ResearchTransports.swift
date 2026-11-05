@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import MacControl
-// Blueprint: | `ResearchTransports.swift` | `URLSessionResearchHTTPClient.getBounded`; Docker discovery/start retains daemon readiness polling at 3-second intervals within its 90-second window, with no confirmed push replacement; subprocesses delegate to `MacControl.ProcessExecution` with full output capture |
+// Blueprint: | `ResearchTransports.swift` | `URLSessionResearchHTTPClient.getBounded`, `MacControl.ProcessExecution` |
 
 // MARK: - URLSession-backed HTTP client (production)
 
@@ -32,14 +32,12 @@ public final class URLSessionResearchHTTPClient: Sendable {
 
 // MARK: - System `docker ps` executor (production)
 
-/// Why a local SearXNG container could not be started, in one sentence.
 public struct SearXNGStartError: LocalizedError, Sendable {
     public let message: String
     public var errorDescription: String? { message }
 }
 
-/// Shells out to `docker ps --format '{{json .}}'` with an 8s deadline.
-/// Nil means no Docker executable. Execution failures throw with their cause.
+/// Bound Docker inventory to eight seconds; missing executable is absence, while execution failures retain their cause.
 public final class SystemDockerPSExecutor: Sendable {
     public init() {}
 
@@ -49,13 +47,9 @@ public final class SystemDockerPSExecutor: Sendable {
         return try await run(arguments: ["ps", "--format", "{{json .}}"])
     }
 
-    /// Starts the stopped SearXNG container that serves the configured
-    /// loopback address, starting Docker Desktop first when its daemon is
-    /// down. The container is discovered, never named by hand: the official
-    /// image, its default entrypoint, and a binding of 8080/tcp to the
-    /// configured port. Returns the started container id; throws a plain
-    /// sentence saying why nothing could be started.
-    /// `mayOpenDockerDesktop` false leaves a stopped Docker daemon alone.
+    /// Starts the stopped SearXNG container that serves the configured loopback address, starting Docker Desktop first when its daemon is down. The container
+    /// is discovered, never named by hand: the official image, its default entrypoint, and a binding of 8080/tcp to the configured port. Returns the started
+    /// container id; throws a plain sentence saying why nothing could be started. `mayOpenDockerDesktop` false leaves a stopped Docker daemon alone.
     public func startLocalSearXNG(base: String, mayOpenDockerDesktop: Bool = true) async throws -> String {
         func fail(_ message: String) -> SearXNGStartError {
             SearXNGStartError(message: message)
@@ -81,8 +75,7 @@ public final class SystemDockerPSExecutor: Sendable {
             try await startDockerDesktop(dockerPath: dockerPath)
         }
         let port = String(url.port ?? 80)
-        // Only a complete listing with no SearXNG in it means "no backend";
-        // a listing Docker could not give is an error.
+        // Only a complete listing with no SearXNG in it means "no backend"; a listing Docker could not give is an error.
         let ids = try await run(arguments: ["ps", "--all", "--quiet"])
         let candidates = ids.split(whereSeparator: \.isWhitespace).map(String.init)
         guard candidates.allSatisfy({ $0.allSatisfy(\.isHexDigit) }) else {
@@ -160,8 +153,7 @@ public final class SystemDockerPSExecutor: Sendable {
         return id
     }
 
-    /// Opens the Docker Desktop app that ships this `docker` CLI and waits up
-    /// to 90 seconds for its daemon to answer.
+    /// Opens the Docker Desktop app that ships this `docker` CLI and waits up to 90 seconds for its daemon to answer.
     private func startDockerDesktop(dockerPath: String) async throws {
         var app = URL(fileURLWithPath: dockerPath).resolvingSymlinksInPath()
         while app.pathComponents.count > 1, app.pathExtension != "app" {
@@ -234,7 +226,10 @@ func runResearchSubprocess(
         outputByteLimit: Int.max
     )
     guard !result.timedOut, result.exitCode == 0 else {
-        throw SearXNGStartError(message: "\(URL(fileURLWithPath: executable).lastPathComponent) \(arguments.joined(separator: " ")) \(result.timedOut ? "timed out" : "exited \(result.exitCode)"): \(result.stderr.prefix(600))")
+        throw SearXNGStartError(message: """
+            \(URL(fileURLWithPath: executable).lastPathComponent) \(arguments.joined(separator: " ")) \
+            \(result.timedOut ? "timed out" : "exited \(result.exitCode)"): \(result.stderr.prefix(600))
+            """)
     }
     return result
 }

@@ -4,10 +4,9 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Security.swift` | MacSyncEngine pairing rotation holds signing through accepted-write verification; signed responses and complete signed CloudKit action-record budgeting before terminal ledger settlement; oversized readbacks return an explicit processed-action error; BridgeMessage owns HMAC, constant-time comparison and inner-action verification; outer signatures remain case-sensitive |
+// Blueprint: | `MacSyncEngine+Security.swift` | Pairing verification gates signing; bounded signed responses settle ledger outcomes. |
 
 extension MacSyncEngine {
-    // The HMAC pairing secret is loaded lazily through PairingSecret.
     func pairingSecret() throws -> Data {
         guard !pairingSecretRotationInProgress else {
             throw NSError(
@@ -23,9 +22,7 @@ extension MacSyncEngine {
         return s
     }
 
-    /// Close the HMAC boundary before canonical pairing bytes are replaced.
-    /// Inbound validation/signing remains unavailable until `finish` installs
-    /// the exact bytes read back by rotation or existing-item reconciliation.
+    /// Close signing and validation before key replacement; reopen only on exact canonical readback.
     public func beginPairingSecretRotation() {
         pairingSecretRotation = .writing
         _pairingSecret = nil
@@ -39,8 +36,7 @@ extension MacSyncEngine {
     public func finishPairingSecretRotation(with persistedSecret: Data?) async {
         _pairingSecret = persistedSecret
         pairingSecretRotation = nil
-        // Revoke the old Drive write generation and republish into this key's
-        // directory. Late writes remain confined to their captured old URL.
+        // Revoke the old write generation; captured URLs confine late writes to the old key's directory.
         if inboxDir != nil, let docsURL = activeDocsURL {
             stop()
             await start(docsURL: docsURL)
@@ -56,9 +52,7 @@ extension MacSyncEngine {
         return try signedResponse(body)
     }
 
-    /// Budget the complete signed record before it becomes the terminal ledger
-    /// response. Oversized readbacks settle explicitly; delivery never replays
-    /// an undeliverable response or repeats its already-processed action.
+    /// Budget the full signed terminal response so oversized readbacks cannot cause undeliverable replay or repeated actions.
     func deliverableActionResponse(_ response: [String: String], for action: InboxAction) throws -> [String: String] {
         let signed = try actionResponse(response, for: action)
         let message = try sync.bridge.cloudKitActionResponseMessage(signed, correlationID: action.msgId)
@@ -67,8 +61,20 @@ extension MacSyncEngine {
             return signed
         } catch DeviceSyncError.payloadTooLarge {
             var terminal = ["status": "error", "ok": "false", "code": "action_readback_too_large",
-                "message": "The Mac processed this action, but its readback exceeds the delivery limit. Refresh the page to read its current state. Do not repeat the action."]
-            for key in ["approvalId", "resolvedProposalId", "memoryId", "inboxItemId", "decisionAccepted", "decisionStatus", "approvalReadbackRevision", "inboxReadbackRevision", "memoryReadbackRevision"] {
+                "message": """
+                    The Mac processed this action, but its readback exceeds the delivery limit. Refresh the page to read its current state. Do not \
+                    repeat the action.
+                    """]
+            for key in [
+                "approvalId",
+                "resolvedProposalId",
+                "memoryId",
+                "inboxItemId",
+                "decisionAccepted",
+                "decisionStatus",
+                "approvalReadbackRevision",
+                "inboxReadbackRevision",
+                "memoryReadbackRevision"] {
                 terminal[key] = response[key].map { String($0.prefix(512)) }
             }
             terminal["effectStatus"] = response["status"].map { String($0.prefix(80)) }
@@ -126,8 +132,7 @@ extension MacSyncEngine {
         }
         guard let responseData = try? JSONEncoder().encode(response) else { return false }
         let msgId = action.msgId
-        // Off-main write, but AWAITED so the kvs signal ordering and caller
-        // sequencing are preserved (no fire-and-forget race).
+        // Await off-main writes so KVS signalling and caller transitions remain ordered.
         let writeError = await Task.detached(priority: .utility) { [responseURL, responseData] in
             Self.atomicWrite(data: responseData, to: responseURL)
         }.value
@@ -144,8 +149,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Write `data` to `url` with atomic semantics. Returns an error description on failure, nil on success.
-    /// Must be nonisolated static — called from detached tasks off the main actor.
+    /// Nonisolated for detached storage work; report atomic write failure rather than losing it.
     nonisolated static func atomicWrite(data: Data, to url: URL) -> String? {
         do {
             try data.write(to: url, options: .atomic)

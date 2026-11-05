@@ -2,28 +2,30 @@ import Foundation
 import os
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `ChatGPTDotIPCTransport.swift` | `ChatGPTDotIPCTransport` enum; `listen`, `reconnect`, `stop`, `readiness`; retained socket observation and helper pipes close on the delegation runner's shutdown; generation guards reject old callbacks, accepted room deliveries retain their handles until exit |
+import NativeAgentCore
+// Blueprint: | `ChatGPTDotIPCTransport.swift` | `ChatGPTDotIPCTransport`, `listen`, `reconnect`, `stop`, `readiness` |
 
 public enum ChatGPTDotIPCTransport {
-    public typealias Conversation = @Sendable (URL, AgentPeerContact, [JSONValue], String?, [String: JSONValue]?) async throws -> JSONValue
+    public typealias Conversation = @Sendable (Turn?, URL, AgentPeerContact, [JSONValue], String?, [String: JSONValue]?) async throws -> JSONValue
     private static let handler = OSAllocatedUnfairLock<Conversation?>(initialState: nil)
 
     public static func installConversation(_ conversation: @escaping Conversation) {
         handler.withLock { $0 = conversation }
     }
 
-    public static func conversation(_ root: URL, _ peer: AgentPeerContact, _ messages: [JSONValue], _ sent: String?, window: [String: JSONValue]? = nil) async throws -> JSONValue {
+    public static func conversation(turn: Turn?, _ root: URL, _ peer: AgentPeerContact, _ messages: [JSONValue], _ sent: String?,
+        window: [String: JSONValue]? = nil) async throws -> JSONValue {
         guard let conversation = handler.withLock({ $0 }) else {
             return .object(["status": .string("unavailable"), "detail": .string("Dot's conversation is unavailable.")])
         }
-        return try await conversation(root, peer, messages, sent, window)
+        return try await conversation(turn, root, peer, messages, sent, window)
     }
 
     public static func owns(_ peer: AgentPeerContact) -> Bool {
         peer.transport == .mcpHost && AgentPeerStore.hostRowID(peer.endpoint) == "chatgpt-dot"
     }
 
-    /// Dot's state is the listener's last word, never a cached check.
+    /// Use the listener’s latest transport evidence, never a cached readiness check.
     public static var readiness: JSONValue { listener.withLock { $0.state } }
 
     public static var available: Bool {
@@ -31,24 +33,20 @@ public enum ChatGPTDotIPCTransport {
         return false
     }
 
-    /// Dot is inbound only (User 10-16): he reaches her by running the local
-    /// message command on this Mac; she cannot start a message to him, since
-    /// ChatGPT 26.1013 and later keeps his conversation in its cloud and no
-    /// window here owns it. Not a broken reply path, nothing to repair. The
-    /// listener's word is the reason; should ChatGPT ever hand the
-    /// conversation back to a local window, sends work again by themselves.
+    /// Cloud-owned conversations have no local outbound target; inbound-only is a transport limit, not a broken reply path.
     public static var inboundOnly: Bool {
         guard case .object(let value) = readiness else { return true }
-        // Loading is a moment, not a way: a send then waits, as it always did.
+        // Loading is transient, so sends must wait rather than classify it as a transport mode.
         return ![.string("available"), .string("not_checked"), .string("loading")].contains(value["status"] ?? .null)
     }
 
     public static var detail: String {
         if available { return "In-house ChatGPT Dot · two-way" }
-        let reason: String = if case .object(let value) = readiness, case .string(let why)? = value["detail"], !why.isEmpty { why } else { "Dot messaging has not been checked yet." }
+        let reason: String = if case .object(let value) = readiness, case .string(let why)? = value["detail"],
+            !why.isEmpty { why } else { "Dot messaging has not been checked yet." }
         guard inboundOnly else { return reason }
-        return "Inbound only. Dot reaches her by running the local message command on this Mac (nativeagent-link message, with his contact file). "
-            + "She cannot start a message to him, and a reply typed in his own chat does not arrive here: " + reason
+        return "Inbound only. Dot reaches the agent by running the local message command on this Mac (nativeagent-link message, with Dot's contact file). "
+            + "The agent cannot start a message to Dot, and a reply typed in Dot's own chat does not arrive here: " + reason
     }
 
     public static let didChange = Notification.Name("ChatGPTDotIPCTransport.didChange")
@@ -57,13 +55,8 @@ public enum ChatGPTDotIPCTransport {
         .object(["status": .string(status), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail)])
     }
 
-    /// Dot's room is followed by one long-lived helper (`chatgpt_dot_ipc.js
-    /// listen`) for as long as ChatGPT keeps its connection. ChatGPT pushes
-    /// every change; each line the helper prints is Dot's state, with his
-    /// room when he can be followed, and his messages go to her Dot session as
-    /// they land (one that is hers wakes her). A helper that ends says why
-    /// and the next starts at once while ChatGPT runs; one that dies right
-    /// after that restart waits for ChatGPT's socket to be replaced.
+    /// Follow pushed IPC state through one long-lived helper. Restart once while ChatGPT runs; an immediate second exit waits for socket replacement to avoid a
+    /// restart loop.
     private struct Listener {
         var dataRoot: URL?
         var events: FileChangeEvents?
@@ -73,10 +66,10 @@ public enum ChatGPTDotIPCTransport {
         var generation = UUID()
         var process: Process?
         var output: FileHandle?
-        /// The helper's stdin, held open: closing it (or this app ending) ends the helper.
+        /// Keep stdin open for the helper’s lifetime; closing it ends the child.
         var lifeline: Pipe?
         var socket: UInt64?
-        /// This helper is the restart after one ended, and how many lines it printed.
+        /// Track the single restart and its output count to detect immediate failure.
         var restarted = false
         var lines = 0
         var state = ChatGPTDotIPCTransport.unavailable("Dot messaging has not been checked yet.", status: "not_checked")
@@ -84,7 +77,6 @@ public enum ChatGPTDotIPCTransport {
     private static let listener = OSAllocatedUnfairLock(uncheckedState: Listener())
     private static let socket = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/ipc/ipc.sock")
 
-    /// Once, for the app's data root: follow Dot from now on.
     public static func listen(dataRoot: URL) {
         listener.withLock { state in
             guard state.dataRoot == nil, !state.stopping, !Task.isCancelled else { return }
@@ -133,7 +125,7 @@ public enum ChatGPTDotIPCTransport {
         NotificationCenter.default.post(name: didChange, object: nil)
     }
 
-    /// Starts the listener unless one runs. Without a Dot contact there is nothing to follow.
+    /// No saved contact means there is no conversation to follow.
     public static func reconnect() { reconnect(generation: listener.withLock { $0.generation }) }
 
     private static func reconnect(restarted: Bool = false, generation: UUID) {
@@ -192,10 +184,7 @@ public enum ChatGPTDotIPCTransport {
         settle(.object(fields), messages: messages, generation: generation)
     }
 
-    /// The helper is gone. It said why in its last line; one that did not
-    /// stopped unexpectedly. While ChatGPT runs the next starts now, unless
-    /// this one was already that restart and died at once (its last line was
-    /// its only one): then its reason stands until ChatGPT's socket changes.
+    /// After one immediate restart failure, retain its reason until the socket changes instead of looping.
     private static func ended(_ lifeline: Pipe, generation: UUID) {
         guard let (state, started, quick) = listener.withLock({ value -> (JSONValue, UInt64?, Bool)? in
             guard value.generation == generation, value.lifeline === lifeline else { return nil }
@@ -216,7 +205,7 @@ public enum ChatGPTDotIPCTransport {
         return stat(socket.path, &info) == 0 ? UInt64(info.st_ino) : nil
     }
 
-    /// A new state is news at once: the contact rows and her contact health follow it.
+    /// Publish transport changes immediately so contact rows and health agree.
     private static func settle(_ state: JSONValue, messages: [JSONValue]? = nil, generation: UUID) {
         guard let (root, changed) = listener.withLock({ value -> (URL, Bool)? in
             guard value.generation == generation, let root = value.dataRoot else { return nil }
@@ -225,7 +214,7 @@ public enum ChatGPTDotIPCTransport {
             return (root, changed)
         }) else { return }
         if changed { NotificationCenter.default.post(name: didChange, object: nil) }
-        // Inbound only has no send path to be unavailable: a mark an earlier refused send left is lifted here, once.
+        // Inbound-only has no outbound path to mark unavailable.
         if changed, inboundOnly, let peers = try? AgentPeerStore(dataRoot: root).list() {
             for peer in peers where owns(peer) && peer.unavailableAt != nil {
                 AgentPeerStore(dataRoot: root).clearUnavailable(peerID: peer.id, since: .distantPast)
@@ -237,11 +226,11 @@ public enum ChatGPTDotIPCTransport {
             guard listener.withLock({ $0.generation == generation && $0.dataRoot != nil }) else { return }
             guard let peer = try? AgentPeerStore(dataRoot: root).list().first(where: owns) else { return }
             do {
-                // This delivery also drains messages retained after a failed ingestion.
-                _ = try await conversation(root, peer, messages ?? [], nil)
+                // Also drain messages retained after failed ingestion.
+                _ = try await conversation(turn: nil, root, peer, messages ?? [], nil)
                 if messages != nil { AgentConversationRunning.shared.changed() }
             } catch {
-                nativeLog("Dot's room could not be brought into her session: %@", error.localizedDescription)
+                nativeLog("Dot's room could not be brought into the agent's session: %@", error.localizedDescription)
             }
         }
     }

@@ -13,16 +13,11 @@ import Research
 import AgentConversations
 import TelegramBot
 import Synchronization
-// Blueprint: | `EngineDoctorRepairs.swift` | EngineDoctorRuntime selects and executes owner repairs and persists receipts; search repair checks/starts only the configured endpoint, never discovers or saves a replacement |
+// Blueprint: | `EngineDoctorRepairs.swift` | Owner repairs with receipts; search stays on its configured endpoint |
 
 extension EngineDoctorRuntime {
     public func doctorRecordRepair(checkID: String, receipt: String, status: String) async throws {
-        let path = dataRoot
-            .appendingPathComponent("doctor/repair_receipts.jsonl")
-        try await SwiftNativePersistenceCore.appendJSONL(.object([
-            "at": .string(ISO8601DateFormatter().string(from: Date())),
-            "check_id": .string(checkID), "receipt": .string(receipt), "status": .string(status),
-        ]), to: path)
+        nativeLog("[Doctor repair] %@: %@; recheck=%@", checkID, receipt, status)
     }
 
     public func doctorLiveRepair(for check: CheckResult, scope: DoctorRepairScope) async -> DoctorExecutableRepair? {
@@ -46,7 +41,7 @@ extension EngineDoctorRuntime {
             let pendingPath = requestedRoot.appendingPathComponent("providers/pending-surface-configuration.json")
             let pendingSelection = FileManager.default.fileExists(atPath: pendingPath.path)
             let needsProbe: Bool
-            switch try? await DoctorProviderPathReading.read(dataRoot: requestedRoot).runtime {
+            switch try? await DoctorProviderPathReading.read(dataRoot: requestedRoot, turn: turn).runtime {
             case .some(.healthy(.stale)), .some(.healthy(.failed)): needsProbe = true
             default: needsProbe = false
             }
@@ -66,10 +61,11 @@ extension EngineDoctorRuntime {
                         let row = await providerDoctorCoverageCheck()
                         return .unverified("Repair could not test the active provider: \(row.detail)")
                     }
-                    let test = try await ProvidersFacade(dataRoot: requestedRoot).testProvider(providerID)
-                    // Same verdict the Providers page uses for Test Connection.
+                    let test = try await NativeAgentEngine.live.providers.testProvider(providerID)
+                    // Share the Providers page’s connection-test verdict.
                     guard test.tested && test.status == "ok" else {
-                        return .unverified("Repair attempted: the \(providerID) connection test did not pass: \(Self.safeDetail(test.detail ?? test.error ?? test.status))")
+                        return .unverified(
+                            "Repair attempted: the \(providerID) connection test did not pass: \(Self.safeDetail(test.detail ?? test.error ?? test.status))")
                     }
                     let row = await providerDoctorCoverageCheck()
                     return row.status == "ok"
@@ -102,7 +98,6 @@ extension EngineDoctorRuntime {
                 catch {
                     return .unverified("The configured search at \(base) could not be checked: \(error.localizedDescription)")
                 }
-                // Otherwise start the stopped local container behind the configured URL.
                 guard try await doctorSearchURL() == base else {
                     return .unverified("Repair skipped: the configured search address changed.")
                 }
@@ -127,15 +122,18 @@ extension EngineDoctorRuntime {
                     do {
                         if try await research.checkSearXNG(base: base, answering: true, timeout: timeout) {
                             guard try await doctorSearchURL() == base else {
-                                return .unverified("Started container \(container.prefix(12)) for \(base), but the search setting changed; its new address was kept.")
+                                return .unverified(
+                                    "Started container \(container.prefix(12)) for \(base), but the search setting changed; its new address was kept.")
                             }
-                            return .completed("Completed: started the local SearXNG container \(container.prefix(12)); search answers at its configured address \(base).")
+                            return .completed(
+                                "Completed: started the local SearXNG container \(container.prefix(12)); search answers at its configured address \(base).")
                         }
                         lastFailure = "Connection refused."
                     } catch where Task.isCancelled || error is CancellationError { throw CancellationError() }
                     catch { lastFailure = error.localizedDescription }
                 } while ContinuousClock.now < deadline
-                return .unverified("Started the local SearXNG container \(container.prefix(12)), but \(base) did not answer within the readiness window: \(lastFailure)")
+                return .unverified(
+                    "Started the local SearXNG container \(container.prefix(12)), but \(base) did not answer within the readiness window: \(lastFailure)")
             }
         case "live.telegram":
             guard let state = try? await doctorTelegramSnapshot(), state.enabled,
@@ -143,7 +141,7 @@ extension EngineDoctorRuntime {
             return DoctorExecutableRepair(checkID: check.id) {
                 let facade = TelegramFacade(dataRoot: dataRoot)
                 let manager = port.doctorManager
-                // The poll notice and the state file it then clears both wake the check.
+                // Observe both poll notices and their cleared state file to catch completion.
                 let events = EventDeadlinePhysiology.storeAndFileEvents(
                     paths: [dataRoot.appendingPathComponent("telegram/state.json")],
                     notifications: [TelegramLongPollSession.successfulPoll])
@@ -163,8 +161,7 @@ extension EngineDoctorRuntime {
                 }
                 _ = await manager.start()
                 try Task.checkCancellation()
-                // Observe the owner's ordinary bounded long poll, never send
-                // a second getUpdates request or force a duplicate tick.
+                // Observe the ordinary bounded poll; never issue a duplicate getUpdates request or tick.
                 let result = await raceAgainstTimeout(seconds: 35) {
                     var iterator = events.makeAsyncIterator()
                     repeat {
@@ -189,8 +186,7 @@ extension EngineDoctorRuntime {
             }.map(\.name)
             guard !names.isEmpty else { return nil }
             return DoctorExecutableRepair(checkID: check.id) {
-                // The bridges publish their descriptors from their ready callbacks.
-                // Watch those existing transitions, then read authoritative listener health.
+                // Ready callbacks publish bridge descriptors; observe those transitions before reading listener health.
                 let changes = FileChangeEvents(paths: [
                     AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot).appendingPathComponent("bridge.json"),
                     dataRoot.appendingPathComponent("browser_ipc.json"),

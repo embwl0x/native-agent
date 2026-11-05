@@ -2,25 +2,19 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `PersonaSystemActions.swift` | Protected persona tool reads through PersonaEngine's document selection and the filesystem owner's sensitive-path/regular-descriptor checks; skill/workspace read adapters; `ClockReply` owns timezone selection and date projection with local/chat field adapters |
+// Blueprint: | `PersonaSystemActions.swift` | Descriptor-fenced persona reads; skill/workspace adapters; `ClockReply` owns time projection |
 
 // MARK: - Native persona/system connector actions
-//
-// Registered read-only handlers for persona documents, skill inventory,
-// workspace listings and the clock. Persona reads resolve the sensitive-path
-// fence before opening a verified regular-file descriptor.
+// Persona reads apply the sensitive-path fence before opening the verified regular-file descriptor.
 
 package enum PersonaSystemActions {
 
     // MARK: helpers
 
-    /// An explicit context personaRoot, otherwise
-    /// PersistenceCore.defaultPersonaRoot for the context's data root.
     static func personaRootURL(_ ctx: ConnectorActionContext) -> URL {
         ctx.personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRootURL(ctx))
     }
 
-    /// Resolve the data root used for skill bodies + sensitive-path block.
     static func dataRootURL(_ ctx: ConnectorActionContext) -> URL {
         ctx.dataRoot ?? PersistenceCore.defaultDataRoot()
     }
@@ -107,7 +101,6 @@ package enum PersonaSystemActions {
         let sortedNames = records.keys.sorted()
         let totalCount = sortedNames.count
 
-        // Negative offsets count from the end, clamped to zero; positive offsets cap at count; limit <= 0 is uncapped.
         var pageNames = sortedNames
         if offset != 0 {
             let count = pageNames.count
@@ -194,7 +187,6 @@ package enum PersonaSystemActions {
             ])
         }
 
-        // Listing failures, including a file target, return ok=false and error without error_code.
         let fm = FileManager.default
         let children: [URL]
         do {
@@ -209,7 +201,6 @@ package enum PersonaSystemActions {
             ])
         }
 
-        // Directories sort before files, each group by name.
         struct Entry { let isDir: Bool; let name: String; let size: Int64 }
         var entries: [Entry] = []
         for child in children {
@@ -255,7 +246,6 @@ package enum PersonaSystemActions {
         ])
     }
 
-    /// Explicit workspaceRoot wins; otherwise NativeAgentWorkspaceRoot owns environment and install-root resolution.
     static func workspaceRootURL(_ ctx: ConnectorActionContext) -> URL {
         ctx.workspaceRoot ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRootURL(ctx))
     }
@@ -267,7 +257,6 @@ package enum PersonaSystemActions {
     }
 }
 
-/// One clock projection, with the existing local-action and chat field adapters.
 package struct ClockReply {
     let now: Date
     let zone: TimeZone
@@ -326,7 +315,6 @@ package struct ClockReply {
     package var local: JSONValue {
         let tz = zone, tzName = zoneName, cal = calendar
         let comps = cal.dateComponents([.year, .month, .day, .hour, .minute, .second, .weekday], from: now)
-        // Local-action timestamps use optional six-digit microseconds and an explicit ±HH:MM offset, including UTC.
         let isoLocal = isoFormat(now, tz: tz)
         let isoUTC = isoFormat(now, tz: TimeZone(identifier: "UTC")!)
 
@@ -366,12 +354,11 @@ private func boolField(_ v: JSONValue?) -> Bool {
     }
 }
 
-/// Listed entry path relative to the resolved base, preserving the entry's symlink name.
+/// Preserve listed symlink names when reporting paths relative to the resolved base.
 private func relativePath(of entry: URL, base: URL) -> String {
     NativeAgentWorkspaceRoot.relativePath(entry.path, under: base.path) ?? entry.lastPathComponent
 }
 
-/// YYYY-MM-DDTHH:MM:SS.ffffff±HH:MM, omitting the fraction when microseconds are zero.
 private func isoFormat(_ date: Date, tz: TimeZone) -> String {
     var cal = Calendar(identifier: .gregorian)
     cal.timeZone = tz
@@ -386,7 +373,6 @@ private func isoFormat(_ date: Date, tz: TimeZone) -> String {
     return base + frac + offset
 }
 
-/// ±HH:MM; UTC is +00:00.
 private func isoOffset(_ seconds: Int) -> String {
     let sign = seconds < 0 ? "-" : "+"
     let abs = Swift.abs(seconds)
@@ -395,7 +381,6 @@ private func isoOffset(_ seconds: Int) -> String {
     return String(format: "%@%02d:%02d", sign, h, m)
 }
 
-/// ±HHMM without a colon.
 private func formatUTCOffset(_ seconds: Int) -> String {
     let sign = seconds < 0 ? "-" : "+"
     let abs = Swift.abs(seconds)
@@ -404,7 +389,6 @@ private func formatUTCOffset(_ seconds: Int) -> String {
     return String(format: "%@%02d%02d", sign, h, m)
 }
 
-/// Gregorian weekday (1=Sunday … 7=Saturday) to its English name.
 private func weekdayName(_ weekday: Int) -> String {
     let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     let idx = weekday - 1

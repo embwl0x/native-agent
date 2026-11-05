@@ -3,7 +3,7 @@ import NativeAgentShared
 import PersistenceCore
 import Experiences
 import TurnTrace
-// Blueprint: | `MacSyncEngine+WorkActivity.swift` | `MacSyncEngine`: `startWorkActivityObservation`, `projectWorkshopWorkActivities`, `requestWorkActivityPublication` |
+// Blueprint: | `MacSyncEngine+WorkActivity.swift` | `MacSyncEngine`, `startWorkActivityObservation`, `requestWorkActivityPublication` |
 
 extension MacSyncEngine {
     func startWorkActivityObservation() {
@@ -18,7 +18,7 @@ extension MacSyncEngine {
     }
 
     private func activity(_ experience: Experience) -> MobileWorkActivity? {
-        // Only the person's conversations: a worker's brief answers its caller, never him.
+        // Only the person's conversations reach their phone; worker answers belong to the requesting caller.
         guard experience.kind == .heard, let answer = experience.owes["answer"], answer.to.hasPrefix("conversation:"),
               let started = DeskActivityState.movementDate(experience.at) else { return nil }
         let state: MobileWorkActivity.State
@@ -40,36 +40,6 @@ extension MacSyncEngine {
             startedAt: started, content: .init(
                 title: String((experience.face?.words ?? "Conversation").prefix(96)), state: state,
                 status: status, updatedAt: DeskActivityState.movementDate(experience.updatedAt) ?? started))
-    }
-
-    func projectWorkshopWorkActivities(_ records: [WorkshopTaskRecord]) {
-        for record in records {
-            guard let started = DeskActivityState.movementDate(record.createdAt),
-                  let updated = DeskActivityState.movementDate(record.updatedAt) else { continue }
-            let id = "execution:\(record.id)"
-            let state: MobileWorkActivity.State
-            let status: String
-            switch record.status {
-            case "queued": state = .queued; status = "Queued"
-            case "blocked_on_approval": state = .blocked; status = "Approval required"
-            case "running":
-                if let movement = DeskActivityState.movementDate(record.lastMovementAt),
-                   movement <= Date(), Date().timeIntervalSince(movement) < DeskActivityState.movementWindow {
-                    state = .working; status = "Executing the task"
-                } else { state = .unknown; status = "Activity unconfirmed" }
-            case "completed": state = .completed; status = "Execution completed"
-            case "cancelled": state = .stopped; status = "Stopped"
-            case "failed": state = .failed; status = "Execution failed"
-            default: state = .unknown; status = "State unknown"
-            }
-            let row = MobileWorkActivity(id: id, sessionID: nil, startedAt: started,
-                content: .init(title: String(TurnTraceRedactor.redactText(record.title).prefix(96)),
-                    state: state, status: status, updatedAt: updated))
-            workActivities[id] = row
-        }
-        let retained = Set(workActivities.values.sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64).map(\.id))
-        workActivities = workActivities.filter { retained.contains($0.key) }
-        requestWorkActivityPublication()
     }
 
     func requestWorkActivityPublication() {
@@ -101,7 +71,7 @@ extension MacSyncEngine {
                 experiences = []
                 unavailable = error.localizedDescription
             }
-            var rows = Array((experiences.compactMap(activity) + workActivities.values)
+            var rows = Array(experiences.compactMap(activity)
                 .sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64))
             if let unavailable {
                 rows.append(.init(id: "experience:unavailable", sessionID: nil, startedAt: Date(),

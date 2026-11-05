@@ -1,47 +1,36 @@
 import EngineRuntime
 import ApprovalTransactions
 import AppToolRuntime
+import ChatTurnRuntime
+import ChatTurnContracts
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import SwiftUI
 import TrustCenter
 
-// Blueprint: | `InlineInteractionChatBinding.swift` | `InlineInteractionChatBinding`: card action/control presentation, existing setup sheets and verify-on-return settlement |
+// Blueprint: | `InlineInteractionChatBinding.swift` | `InlineInteractionChatBinding`: card controls and verify-on-return settlement |
 
-/// Card actions and open controls only. TranscriptsFacade owns card reads.
 @MainActor
 @Observable
 final class InlineInteractionChatBinding {
 
-    /// The connector setup sheet, when a card opened one. `ConnectorWizardView`
-    /// is the control Connectors already ships; the card presents that, it does
-    /// not reimplement a token field.
     var connectorSheet: ConnectorSheetRequest?
 
-    /// Simple view has no pages: a page a card opens (Telegram, Trust,
-    /// Providers) shows here instead, in the floating glass panel over the
-    /// chat (SimpleSetupPanel.swift). Always nil in Advanced.
+    /// Simple view uses a floating panel because it has no pages; Advanced routes to the page.
     var panelPage: SidebarItem?
 
     private var sessionID: String = ""
     private var engine = NativeAgentEngine.live
     private var dataRoot: URL { engine.dataRoot }
 
-    /// Interactions the person left through a control (Trust, Providers) and
-    /// has not come back from. On return to chat each is re-verified with its
-    /// owner exactly once — that return IS the "the control closed" signal for
-    /// the controls that are pages rather than sheets.
-    /// Keyed by interaction id, valued by the conversation that raised it:
-    /// the person can switch conversations while they are away in Trust or
-    /// Providers, and the answer still belongs to the transcript that asked.
+    /// Key page-backed interactions by their originating conversation so returning from setup verifies the owner once without settling another transcript.
     private var awaitingReturn: [String: (sessionID: String, revision: Int)] = [:]
 
     struct ConnectorSheetRequest: Identifiable, Equatable {
         let id: String
         let provider: String
-        /// The conversation the card was tapped in. A sheet outlives a
-        /// conversation switch, and what it settles belongs to the transcript
-        /// that asked, never to whichever one is open when it closes.
+        /// A sheet can outlive a conversation switch; settle the transcript that raised it.
         let sessionID: String
         let revision: Int
     }
@@ -59,9 +48,6 @@ final class InlineInteractionChatBinding {
         guard !sessionID.isEmpty else { return }
         switch action {
         case .secondary:
-            // "Not now." The resolver settles it as declined and resumes the
-            // turn with the consequence the card promised, so she carries on
-            // and says plainly what she could not do.
             Task { await self.decline(card.id, sessionID: sessionID, appModel: appModel) }
         case .primary(let value, let choice, let values):
             Task {
@@ -78,8 +64,6 @@ final class InlineInteractionChatBinding {
                 )
             }
         case .retry:
-            // Retry is begin again. A failed card that collects something
-            // sends `.primary` instead, so a retyped key is not thrown away.
             Task {
                 await self.begin(
                     card.id, sessionID: sessionID,
@@ -87,8 +71,6 @@ final class InlineInteractionChatBinding {
                 )
             }
         case .stop:
-            // A need is waiting on a person; there is nothing in flight. Stop
-            // means "this card stops being able to start a turn".
             Task {
                 await InlineInteractionResolver.invalidateContinuation(
                     id: card.id, sessionID: sessionID, dataRoot: self.dataRoot
@@ -98,9 +80,6 @@ final class InlineInteractionChatBinding {
         }
     }
 
-    /// The person came back to Chat. Every card that sent them to a page is
-    /// asked of its OWNER whether the thing is now done — settling it, or
-    /// failing it with the owner's own words and keeping the retry.
     func verifyOnReturn() async {
         guard !awaitingReturn.isEmpty, !sessionID.isEmpty else { return }
         let pending = awaitingReturn
@@ -116,7 +95,7 @@ final class InlineInteractionChatBinding {
     private func decline(_ id: String, sessionID: String, appModel: AppModel) async {
         do {
             _ = try await InlineInteractionResolver.decline(
-                id: id, sessionID: sessionID, dataRoot: dataRoot
+                id: id, sessionID: sessionID, turn: nil, dataRoot: dataRoot
             )
         } catch {
             appModel.setFailureStatus(error, action: "decline that request")
@@ -133,6 +112,9 @@ final class InlineInteractionChatBinding {
         fullSetup: Bool = false,
         appModel: AppModel
     ) async {
+        // This local control tap starts its own act; it is not the card's waiting turn.
+        let turn = TurnRequest(message: "", sessionID: sessionID, surface: "chat",
+            envelope: TurnEnvelope.personOnMac("mac_ui:interaction." + id)).turn()
         let current: InlineInteraction
         let descriptor: InlineInteractionDescriptor
         do {
@@ -155,13 +137,11 @@ final class InlineInteractionChatBinding {
             choice: choice,
             values: values,
             fullSetup: fullSetup,
+            turn: turn,
             appModel: appModel
         )
     }
 
-    /// Open the EXISTING control the descriptor names. Nothing here decides
-    /// whether the thing is done — that is always the owner's answer, asked
-    /// through `complete`.
     private func open(
         sessionID: String,
         interaction: InlineInteraction,
@@ -170,11 +150,12 @@ final class InlineInteractionChatBinding {
         choice: String?,
         values: [String: String],
         fullSetup: Bool,
+        turn: Turn,
         appModel: AppModel
     ) async {
         await InlineInteractionResolver.runControl(
             interaction, descriptor: descriptor, sessionID: sessionID,
-            value: value, choice: choice, values: values, fullSetup: fullSetup,
+            value: value, choice: choice, values: values, fullSetup: fullSetup, turn: turn,
             controls: AppInlineInteractionControlPort(appModel: appModel), dataRoot: dataRoot,
             present: { control in
                 switch control {
@@ -187,7 +168,6 @@ final class InlineInteractionChatBinding {
                         appModel.systemToasts.push(error: "Could not open Internet Accounts in System Settings.")
                     }
                 case .pairDevice:
-                    // The route lands on the page's first tab, so the tab is chosen after it.
                     self.openPage(.connectors, for: interaction.id, sessionID: sessionID, revision: interaction.revision)
                     UserDefaults.standard.set("iphone", forKey: ShellRailTab.storageKey(.connectors))
                 case .connectorManualToken where descriptor.target == "telegram":
@@ -207,9 +187,6 @@ final class InlineInteractionChatBinding {
         )
     }
 
-    /// A page a card (or the chat's own empty state) needs: the panel in
-    /// Simple view, the page itself in Advanced. With an interaction, coming
-    /// back is what asks its owner whether the thing is done.
     func openPage(_ item: SidebarItem, for id: String? = nil, sessionID: String = "", revision: Int? = nil) {
         if let id, let revision { awaitingReturn[id] = (sessionID, revision) }
         if SimpleViewMode.isShowing {
@@ -219,16 +196,12 @@ final class InlineInteractionChatBinding {
         }
     }
 
-    /// The Simple panel closed, by Esc or its close button: the same
-    /// questions a closed sheet and a return to Chat ask.
     func panelClosed() async {
         panelPage = nil
         await connectorSheetClosed()
         await verifyOnReturn()
     }
 
-    /// While the Simple panel is up: settle what it was opened for the moment
-    /// the owner says done, and close it. Writes nothing until then.
     func settlePanelIfDone() async {
         var waiting = awaitingReturn
         if let sheet = connectorSheet { waiting[sheet.id] = (sheet.sessionID, sheet.revision) }
@@ -241,19 +214,13 @@ final class InlineInteractionChatBinding {
         await refreshCurrent()
     }
 
-    /// The connector sheet closed. Connectors is the authority on whether an
-    /// account is connected. Closed without it connecting, nothing was tried
-    /// on the card, so the card goes back to its fresh "Connect <Name>" ask;
-    /// "still isn't connected" and "Try again" belong to a real failed attempt
-    /// (the card's own fields, which carry the owner's refusal).
+    /// A closed setup sheet is not evidence of a connection; ask Connectors before settling, and reserve failure wording for an actual attempt.
     func connectorSheetClosed() async {
         guard let request = connectorSheet else { return }
         connectorSheet = nil
         await settleOrReopen(request.id, sessionID: request.sessionID, revision: request.revision)
     }
 
-    /// Settle if the owner now says done; otherwise put a card this tap left
-    /// running back to pending.
     private func settleOrReopen(_ id: String, sessionID: String, revision: Int) async {
         await InlineInteractionResolver.settleOrReopen(id, sessionID: sessionID, expectedRevision: revision, dataRoot: dataRoot)
         await refreshCurrent()
@@ -269,9 +236,7 @@ final class InlineInteractionChatBinding {
         }
     }
 
-    /// Re-read whatever conversation is open NOW. Every post-action refresh
-    /// goes through this: the action belongs to the session it started in, the
-    /// cards on screen belong to the session on screen.
+    /// Refresh the visible conversation after actions; settlement still belongs to the originating session.
     private func refreshCurrent() async {
         await engine.transcripts.refreshCards(in: sessionID)
     }

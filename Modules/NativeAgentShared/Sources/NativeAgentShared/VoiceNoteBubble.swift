@@ -3,7 +3,7 @@ import Foundation
 import SwiftUI
 import Observation
 @preconcurrency import AVFoundation
-// Blueprint: | `VoiceNoteBubble.swift` | Shared Mac/phone voice-note face: original-audio waveform, duration, inline playback and expandable transcript with speaker ownership |
+// Blueprint: | `VoiceNoteBubble.swift` | Mac/phone voice-note face; original audio, playback and expandable transcript |
 
 @MainActor @Observable
 private final class VoiceNotePlayback: NSObject, AVAudioPlayerDelegate {

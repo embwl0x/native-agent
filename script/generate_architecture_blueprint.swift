@@ -13,13 +13,15 @@ while !arguments.isEmpty {
         guard !arguments.isEmpty else { fatalError("--repo requires a path") }
         given = arguments.removeFirst()
     case "--help", "-h":
-        print("Usage: swift script/generate_architecture_blueprint.swift [--check] [--repo PATH]\nGenerate source-owned tables, or check equality, coverage and architecture policy.")
+        print("""
+            Usage: swift script/generate_architecture_blueprint.swift [--check] [--repo PATH]\nGenerate source-owned tables, or check equality, coverage and \
+            architecture policy.
+            """)
         exit(0)
     case let argument: fatalError("unknown argument: \(argument)")
     }
 }
-// realpath, not resolvingSymlinksInPath: Foundation maps /private/tmp back to
-// /tmp, while the enumerator hands back /private/tmp paths.
+// realpath, not resolvingSymlinksInPath: Foundation maps /private/tmp back to /tmp, while the enumerator hands back /private/tmp paths.
 let repo = URL(fileURLWithPath: realpath(given, nil).map { defer { free($0) }; return String(cString: $0) } ?? given)
 let document = repo.appendingPathComponent("docs/ARCHITECTURE_BLUEPRINT.md")
 let original = try String(contentsOf: document, encoding: .utf8)
@@ -72,8 +74,7 @@ for root in roots.sorted() {
 let sourcePaths = Set(sources.keys)
 var rows: [String: String] = [:]
 var missing: [String] = []
-// Her parts are hers byte for byte (a changed turn.js stops matching its shipped
-// digest, and upgrades stop): a part's row is its own header's declaration.
+// Parts must stay byte-identical to their authored digests; read each row from its own header declaration.
 func partRow(_ file: URL, _ text: String) -> String? {
     guard let open = text.range(of: "/*"), let close = text.range(of: "*/", range: open.upperBound..<text.endIndex),
           let brace = text[open.upperBound..<close.lowerBound].firstIndex(of: "{"),
@@ -84,7 +85,7 @@ func partRow(_ file: URL, _ text: String) -> String? {
             .prefix { $0.hasPrefix("// ") }.map { $0.dropFirst(3) }.joined(separator: " ")
     var words = declared.trimmingCharacters(in: .whitespaces)
     guard !words.isEmpty else { return nil }
-    // One sentence: the second when the first is only a name ("Her turn.").
+    // Skip a name-only sentence so the row explains the part's purpose.
     if let stop = words.range(of: ". ") {
         let rest = words[stop.upperBound...]
         let next = rest.range(of: ". ").map { rest[..<$0.lowerBound] + "." } ?? rest
@@ -133,7 +134,7 @@ for line in original.components(separatedBy: "\n") {
         output.append(line)
         body = []
         generatedRows = []
-        // Directories select basename rows; path globs split existing family tables.
+        // Directory selectors match basenames; globs partition existing family tables.
         let selectors = line.dropFirst(begin.count).dropLast(4).split(separator: " ").map(String.init)
         for path in rows.keys.sorted() {
             let directory = (path as NSString).deletingLastPathComponent + "/"

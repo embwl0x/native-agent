@@ -6,10 +6,9 @@ import NativeAgentShared
 import TrustCenter
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `EngineSync.swift` | `SyncFacade` class; shared pairing assessment and delivery repair; pairing availability reads publish through `LatestRead`; rotation retains accepted-write verification and publication obligations |
+// Blueprint: | `EngineSync.swift` | `SyncFacade`, `LatestRead`; Checked pairing and owed key publication |
 
-/// Settings' observable projection of the engine's canonical device-sync owner.
-/// Combine subscriptions bridge the core's published values without wire models.
+/// Bridge the canonical sync owner’s published values directly, without another wire model.
 @MainActor
 @Observable
 public final class SyncFacade {
@@ -17,10 +16,11 @@ public final class SyncFacade {
     public private(set) var status = "iCloud not checked"
     public private(set) var phones: [PairedPhoneStore.Phone] = []
     public private(set) var message: String?
-    /// Another Mac on this Apple Account holds the phone's pairing.
     public private(set) var phonePairedElsewhere = false
-    /// The one assessment of the phone's connection, as the bridge holds it.
+    /// Use the bridge’s single phone-connection assessment.
     public private(set) var connection: NAPhoneConnection?
+    /// Connected and can-approve, as the bridge says it; nil until observed.
+    public private(set) var standing: NAPhoneStanding?
     public var pairingError: String?
     public private(set) var isCheckingPairing = false
     @ObservationIgnored private var subscriptions: Set<AnyCancellable> = []
@@ -31,8 +31,7 @@ public final class SyncFacade {
         self.owner = owner
     }
 
-    /// Mounting the page subscribes before its first read. Core publishers
-    /// deliver on their MainActor owner, including their current values.
+    /// Subscribe before the first read; core publishers deliver current values on their MainActor owner.
     public func observeStatus() {
         guard subscriptions.isEmpty, let owner else { return }
         owner.bridge.$syncStatus.sink { [weak self] in self?.status = $0 }
@@ -45,9 +44,11 @@ public final class SyncFacade {
             .store(in: &subscriptions)
         owner.bridge.$phoneConnection.sink { [weak self] in self?.connection = $0 }
             .store(in: &subscriptions)
+        owner.bridge.$phoneStanding.sink { [weak self] in self?.standing = $0 }
+            .store(in: &subscriptions)
     }
 
-    /// Move the phone to this Mac: the person's act, never a launch side effect.
+    /// Moving phone ownership requires the person’s act, never launch.
     public func usePhoneHere() async {
         guard let owner else { return }
         if !(await owner.bridge.usePhoneHere()) {
@@ -59,8 +60,7 @@ public final class SyncFacade {
         _ = await owner?.pairedPhones.setStatus(status, id: id)
     }
 
-    /// Ask the existing delivery owner to reconcile the current key and claim.
-    /// Checking never deliberately replaces another Mac's pairing.
+    /// Reconciliation must not deliberately replace another Mac’s pairing.
     public func checkPairingDelivery() async {
         guard let owner, !isCheckingPairing, !isRotatingSecret else { return }
         isCheckingPairing = true
@@ -96,8 +96,7 @@ public final class SyncFacade {
         isRotatingSecret = true
         secretRead.write {}
         defer { isRotatingSecret = false }
-        // Close admission before changing durable signing bytes, and reopen
-        // with exactly the read-back key before either publication awaits.
+        // Close admission before changing signing bytes; reopen with the exact read-back key before publication suspends.
         let publicationWasOwed = owner.bridge.pairingPublicationOwed
         owner.bridge.owePairingPublication(true)
         owner.engine.beginPairingSecretRotation()
@@ -115,8 +114,7 @@ public final class SyncFacade {
                 pairingError = "Pairing key regeneration failed. \(error.localizedDescription)"
             }
             if accepted || publicationWasOwed {
-                // Acceptance cannot be undone by a failed read. The normal
-                // claim path reconciles this exact item now or at the next sync.
+                // A failed read cannot undo acceptance; reconcile that exact claim now or at the next sync.
                 owner.engine.awaitPairingSecretVerification()
                 nativeLog("[PairingBootstrap] Rotation requires exact-item reconciliation; pairing publication remains owed: \(error.localizedDescription)")
                 await owner.bridge.claimPhonePairing()
@@ -127,8 +125,7 @@ public final class SyncFacade {
             return
         }
         await owner.engine.finishPairingSecretRotation(with: persistedSecret)
-        // A publication that does not land stays owed and is the pairing fact
-        // of the one connection assessment until iCloud takes the key.
+        // Unpublished pairing remains owed and visible in the shared assessment until iCloud accepts the key.
         async let kvsPublished = PairingSecret.publishMaterialToKVS(persistedSecret)
         async let cloudKitPublished = owner.bridge.publishPairingSecret(persistedSecret)
         _ = await (kvsPublished, cloudKitPublished)

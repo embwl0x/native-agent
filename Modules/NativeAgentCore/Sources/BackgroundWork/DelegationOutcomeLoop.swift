@@ -8,34 +8,28 @@ import PersistenceCore
 public struct DelegationOutcomeLoop: LoopRunner {
     public let loopId: String = "delegation_outcome"
     public static let workRemaining = Notification.Name("NativeAgent.delegation.outcomeWorkRemaining")
-    public let interval: TimeInterval
+    public let wake: OrganWake
     public var tickTimeoutOverride: TimeInterval? { 120 }
 
-    /// Reads both wake-job stores. Injected — see the dependency note at the
-    /// top of this file.
     private let readJobs: @Sendable () async -> DelegationJobsRead
-    /// Upserts one inbox card. Returns whether the row actually landed; a
-    /// `false` leaves the job un-carded so the next tick retries it.
+    /// Failed publication leaves the job uncarded for the next reconciliation.
     private let fileCard: @Sendable (DelegationOutcomeCard, DelegationJobsRead) async -> Bool
     /// Records downstream transition evidence. `false` keeps the cursor
     /// unsettled so the same transition is retried on the next reconciliation.
     private let observeTransition: @Sendable (DelegationReadout) async -> Bool
     /// Reports a healthy per-tick cap remainder after the cursor is durable.
     /// The owner requests one coalesced continuation. Failed settlement or
-    /// unavailable state waits for a source/repair event or the integrity sweep.
+    /// unavailable state waits for a source/repair event or the integrity pass.
     private let reportDeferral: @Sendable (Bool) async -> Void
     private let readHandledOutcomes: @Sendable () async throws -> Set<String>
     private let cursorPath: URL
     private let clock: @Sendable () -> Date
 
-    /// Cards filed per tick. A ceiling exists so a store that suddenly reveals
-    /// a hundred terminal jobs (a restored backup, a cursor reset) cannot dump
-    /// a hundred rows into the inbox at once. Never silent — the tick outcome
-    /// names the remainder (`no_silent_caps`).
+    /// Bound inbox bursts after restore or cursor loss; the tick names every capped remainder.
     public static let maxCardsPerTick = 10
 
     public init(
-        interval: TimeInterval = 5 * 60,
+        wake: OrganWake,
         cursorPath: URL,
         clock: @escaping @Sendable () -> Date = { Date() },
         readJobsWithAvailability: @escaping @Sendable () async -> DelegationJobsRead,
@@ -44,7 +38,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         reportDeferral: @escaping @Sendable (Bool) async -> Void = { _ in },
         readHandledOutcomes: @escaping @Sendable () async throws -> Set<String> = { throw CocoaError(.fileReadCorruptFile) }
     ) {
-        self.interval = interval
+        self.wake = wake
         self.cursorPath = cursorPath
         self.clock = clock
         self.readJobs = readJobsWithAvailability
@@ -53,7 +47,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
         self.reportDeferral = reportDeferral
         self.readHandledOutcomes = readHandledOutcomes
     }
-    /// Conventional cursor location under a data root.
     public static func defaultCursorPath(dataRoot: URL) -> URL {
         dataRoot
             .appendingPathComponent("logs", isDirectory: true)
@@ -105,18 +98,21 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 }
                 let backup = cursorPath.appendingPathExtension("corrupt.\(UUID().uuidString)")
                 try FileManager.default.copyItem(at: cursorPath, to: backup)
-                recoveryNote = "corrupt delegation cursor preserved at \(backup.lastPathComponent); rebuilt from canonical notification and settlement identities; unseen outcomes remain pending"
+                recoveryNote = """
+                    corrupt delegation cursor preserved at \(backup.lastPathComponent); rebuilt from canonical notification and settlement identities; unseen \
+                    outcomes remain pending
+                    """
                 wasSeeded = false
                 seedResult = nil
             } catch {
-                return .failed(error: "delegation outcome cursor unavailable and preserved; restore readable cursor or canonical notifications before retrying: \(error.localizedDescription)")
+                return .failed(error: """
+                    delegation outcome cursor unavailable and preserved; restore readable cursor or canonical notifications before retrying: \
+                    \(error.localizedDescription)
+                    """)
             }
         }
-        // Stuck liveness is not a terminal outcome. It gets its own reversible
-        // cursor bit so the first real stall speaks once, recovered liveness
-        // clears the warning, and a later stall can speak again. The verdict
-        // itself came from DelegationStatusProjector; this loop never invents
-        // another timeout or state machine.
+        // Stalls are reversible warnings, never terminal outcomes.
+        // The projector owns liveness; only warning settlement is tracked here.
         let newlyStalled = jobs.filter { job in
             job.stalled && !job.isTerminal
                 && !cursor.store(job.source).announcedStallIDs.contains(job.id)
@@ -155,26 +151,18 @@ public struct DelegationOutcomeLoop: LoopRunner {
             if store.cardedIDs.contains(job.id) {
                 if let version = job.deliveryReceiptVersion,
                    store.deliveryReceiptVersions[job.id] != version { return true }
-                // Already carded. It cards AGAIN only when the outcome it now
-                // presents is more alarming than the one it was carded under
-                // (finished → unconfirmed once the codex reply is preserved).
-                // An id with no recorded outcome predates that field and
-                // stays settled: the cursor cannot prove what its card said.
+                // Re-card only a proven escalation; an unrecorded prior outcome cannot prove its severity.
                 guard let recorded = cursor.cardedOutcome(source: job.source, id: job.id),
                       let current = job.terminalOutcome else { return false }
                 return current.alarmRank > recorded.alarmRank
             }
             return true
         }
-        // Oldest first: the inbox reads newest-last, and a burst should land in
-        // the order the work actually finished.
+        // Oldest-first insertion preserves completion order in the newest-last inbox.
         let ordered = pending.sorted {
             ($0.completionStamp ?? .distantPast, $0.id) < ($1.completionStamp ?? .distantPast, $1.id)
         }
-        // Liveness warnings take the shared per-tick card budget first: a job
-        // that is stuck now should not sit silent behind a terminal-history
-        // burst. Terminal outcomes remain ordered oldest-first in the space
-        // left this tick.
+        // Current stalls take priority over terminal-history bursts within the shared card budget.
         let outcomeCapacity = max(0, Self.maxCardsPerTick - livenessBatch.count)
         let batch = ordered.prefix(outcomeCapacity)
         let deferred = ordered.count - batch.count
@@ -183,8 +171,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         var failed = 0
         var receiptsRecorded = 0
         for job in batch {
-            // These dispositions need only cursor acknowledgement here, without
-            // an outcome card or downstream delegation settlement.
+            // These dispositions require cursor acknowledgement without a card or downstream settlement.
             if ["delivered", "owed", "sent_unconfirmed", "failed_before_answer", "let_go", "dry_run"].contains(job.deliveryOutcome ?? "") {
                 guard await observeTransition(job) else {
                     failed += 1
@@ -221,10 +208,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 return .completed(result: seedResult)
             }
             guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
-            // Nothing settled, nothing stuck, nothing filed. The cursor was not
-            // even rewritten — this tick did no work, and calling it
-            // `.completed` is what let a lane that files a card once a month
-            // read as freshly successful every two minutes.
+            // Idle ticks must not refresh successful-work age.
             return .skipped(
                 reason: "no newly-terminal or stuck delegated jobs (\(terminal.count) terminal on record)")
         }
@@ -235,14 +219,10 @@ public struct DelegationOutcomeLoop: LoopRunner {
         do {
             try cursor.write(to: cursorPath)
         } catch {
-            // The cards landed; the cursor did not. Report it as a failure so
-            // the loop's own health surface shows it — the next tick would
-            // otherwise re-file everything this tick just filed.
+            // Cards landed without their cursor; surface the failure before a retry repeats them.
             return .failed(error: "delegation outcome cursor write failed after \(filed) card(s): \(error)")
         }
-        // A cap leaves known, selectable work behind; a failure does not.
-        // Publish only after the cursor advances, so a failed write cannot
-        // turn the same unsettled batch into a self-sustaining retry loop.
+        // Publish capped work only after durable cursor progress to avoid a failed-write retry loop.
         await reportDeferral(!Task.isCancelled && stampsMayAdvance && writeFailures == 0
             && recoveryNote == nil && deferred + livenessDeferred > 0
             && filed + livenessFiled + receiptsRecorded > 0)

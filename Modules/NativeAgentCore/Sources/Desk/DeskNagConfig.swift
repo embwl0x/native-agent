@@ -4,49 +4,20 @@ import PersistenceCore
 // Blueprint: | `DeskNagConfig.swift` | `DeskNagLane`, `DeskNagPanelModel`; canonical nag scope interpretation |
 
 // MARK: - DeskNagConfig — User's nag switch, persisted (default OFF)
-//
-// Nagging is HIS switch, not hers: "stay on me about the release track" /
-// "go quiet, I'm busy this week". So the whole lane is scoped, persisted, and
-// DEFAULT OFF — a fresh install never nags, and `enabled == false` makes the
-// evaluator inert (it doesn't even record observations, so an untouched config
-// file is never written).
-//
-// WHY A SEPARATE FILE AND NOT AN OP: this is User's operating preference, not a
-// fact about the work. It has no place in the desk's event history — replaying
-// the op-log must not resurrect a mute he lifted last week, and a nag ledger
-// entry is bookkeeping about NOTIFICATIONS, not about items. It lives at
-// <dataRoot>/desk/nag_config.json, written through the SAME PersistenceCore
-// idioms the desk store uses (withFileLock + atomic writeJSON), so a chat tool
-// and the background loop can both touch it across processes.
-//
-// THE WINDOW IS THE UNIT OF ATTENTION. `windowId` increments on every unmute
-// and on every global off→on transition. `ledger[handle] == windowId` means
-// "this item already nagged in the current window" — the hard cap Agent made
-// binding (one nag per item per unmute window). Bumping the window is the ONLY
-// way to re-arm an item, which is why the bump is tied to a deliberate User
-// action rather than a timer.
-//
-// `observed` is the evaluator's memory: the last snapshot it saw of each item.
-// A nag needs a DELTA against that snapshot (blockers cleared / defer elapsed /
-// content advanced while stale) — staleness alone never pings. Muted ticks
-// never CONSUME: while muted the evaluator freezes existing baselines and
-// leaves new items without one, so drift and new work stay visible when User
-// unmutes and asks what moved.
+// Nagging is opt-in and scoped; disabled evaluation must not even write observations.
+// Preferences live outside work history so replay cannot resurrect an old mute.
+// Flocked atomic writes serialize the chat tool and background loop across processes.
+// Each deliberate unmute or enable opens one attention window: at most one nag per item.
+// Staleness alone cannot notify; muted evaluation freezes baselines so drift remains visible on unmute.
 
-/// What a scope entry addresses. Project scope is the common case ("stay on me
-/// about the release track"); item scope is the surgical one.
 public enum DeskNagScopeKind: String, Sendable, CaseIterable, Equatable {
     case project, item
 }
 
-/// One enable/disable entry. An `item` entry always wins over a `project`
-/// entry (most specific scope decides), so User can mute one card inside a
-/// project he otherwise wants pressure on.
+/// Item scope wins over project scope so one card can be muted inside an enabled project.
 public struct DeskNagScope: Sendable, Equatable {
     public var kind: DeskNagScopeKind
-    /// Project name (matched case-insensitively) or a stable item handle. The
-    /// chat tool resolves a visible desk number to a handle BEFORE it lands
-    /// here — aliases are display, handles are identity.
+    /// Resolve visible aliases before storage because handles carry identity.
     public var id: String
     public var enabled: Bool
 
@@ -64,9 +35,7 @@ public struct DeskNagScope: Sendable, Equatable {
         ])
     }
 
-    /// Tolerant: an unknown kind or a missing id drops the ROW, not the file.
-    /// A config that fails to decode entirely would silently revert to
-    /// default-off, which is the quiet failure this whole lane is about.
+    /// Reject only the malformed scope row so one bad entry cannot silently disable the saved configuration.
     public static func fromJSON(_ value: JSONValue) -> DeskNagScope? {
         guard case .object(let obj) = value,
               case .string(let rawKind)? = obj["kind"],
@@ -82,16 +51,11 @@ public struct DeskNagScope: Sendable, Equatable {
     }
 }
 
-/// The last snapshot the evaluator saw of one item — the baseline every delta
-/// is measured against. Deliberately three cheap scalars: the delta vocabulary
-/// is "content advanced", "blockers cleared", "defer elapsed", and nothing else
-/// needs to be remembered between ticks.
+/// Retain only the scalars needed to recognize content, blocker and defer deltas between ticks.
 public struct DeskNagObservation: Sendable, Equatable {
     public var updatedAt: String
     public var effectiveBlockerCount: Int
-    /// True when neither the item nor an ancestor was deferred at snapshot
-    /// time. Stored in the positive sense the delta reads:
-    /// false → true is "the defer date passed".
+    /// Positive readiness makes a false-to-true transition mean the defer date elapsed.
     public var deferElapsed: Bool
 
     public init(updatedAt: String, effectiveBlockerCount: Int, deferElapsed: Bool) {
@@ -125,9 +89,7 @@ public struct DeskNagObservation: Sendable, Equatable {
     }
 }
 
-/// The persisted shape of `desk/nag_config.json`. Keeping this vocabulary in
-/// the production owner lets diagnostics distinguish a valid preference from a
-/// writer that quietly started emitting fields this reader does not own.
+/// Diagnostics share the owner’s schema so unexpected writer fields cannot masquerade as preferences.
 public enum DeskNagConfigSchema {
     public static let version = 1
     public static let rootKeys: Set<String> = [
@@ -138,9 +100,7 @@ public enum DeskNagConfigSchema {
         "updatedAt", "effectiveBlockerCount", "deferElapsed",
     ]
 
-    /// Every emitted key outside the persisted config schema, including
-    /// nested scope/observation records. Checked loading also validates field
-    /// types before a saved preference can be decoded or replaced.
+    /// Validate every nested key and field type before decoding or replacing saved preferences.
     public static func unexpectedKeys(in value: JSONValue) -> [String] {
         guard case .object(let object) = value else { return [] }
         var unexpected = object.keys
@@ -168,24 +128,16 @@ public enum DeskNagConfigSchema {
 }
 
 public struct DeskNagConfig: Sendable, Equatable {
-    /// GLOBAL master switch. Default false — User opts IN.
+    /// Default off: nagging requires the person’s opt-in.
     public var enabled: Bool
     public var scopes: [DeskNagScope]
-    /// ISO timestamp or `yyyy-MM-dd` day. nil = not muted. A stamp in the PAST
-    /// is also not muted (a mute expires by itself; the loop notices the
-    /// transition and emits the drift digest).
     public var mutedUntil: String?
-    /// Attention window. Bumped on unmute and on global off→on.
     public var windowId: Int
-    /// handle → the windowId this item last NAGGED in. Nag-only by design:
-    /// a digest mention must never spend an item's nag budget for the window.
+    /// Digest mentions cannot consume the per-item nag budget for the current window.
     public var ledger: [String: Int]
-    /// handle → last snapshot the evaluator saw.
     public var observed: [String: DeskNagObservation]
 
-    /// "Mute with no end date." A far-future sentinel rather than a separate
-    /// `mutedForever` flag: one field, one comparison, and `status` can print
-    /// it honestly ("muted indefinitely") by recognising the sentinel.
+    /// One far-future sentinel represents indefinite mute without a second state flag.
     public static let indefiniteMuteSentinel = "9999-12-31"
 
     public init(
@@ -206,11 +158,7 @@ public struct DeskNagConfig: Sendable, Equatable {
 
     // MARK: - Reads
 
-    /// True while `mutedUntil` parses and is strictly in the future.
-    ///
-    /// An UNPARSEABLE stamp reads as NOT muted — same call as
-    /// DeskSequencing.isDeferred: silently going quiet forever because someone
-    /// typed a bad date is the worse failure of the two.
+    /// Treat malformed mute dates as unmuted so bad input cannot silently suppress notifications forever.
     public func isMuted(now: Date) -> Bool {
         guard let raw = mutedUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
@@ -218,17 +166,12 @@ public struct DeskNagConfig: Sendable, Equatable {
         return until > now
     }
 
-    /// True when the mute field is SET but has already elapsed — the
-    /// transition the loop watches for to fire the drift digest.
     public func muteHasElapsed(now: Date) -> Bool {
         guard let raw = mutedUntil?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return false }
         return !isMuted(now: now)
     }
 
-    /// Scope decision for one item: item entry wins, then project entry, then
-    /// NOTHING. No scope entry means no nag — enabling the global switch alone
-    /// does not turn the whole desk into a nag surface (User asks for pressure
-    /// on a track, not on everything he has ever written down).
+    /// Global enable alone cannot nag every item: an item or project scope must opt in.
     public func scopeEnabled(for item: DeskItem) -> Bool {
         if let entry = scopes.first(where: { $0.kind == .item && $0.id == item.handle }) {
             return entry.enabled
@@ -243,8 +186,7 @@ public struct DeskNagConfig: Sendable, Equatable {
 
     // MARK: - Transitions (value-returning; the store persists the result)
 
-    /// Flip the global switch. An off→on transition BUMPS the window so an
-    /// item that nagged before User went quiet is re-armed when he comes back.
+    /// Enabling opens a new window so prior nags do not consume the new attention budget.
     public func settingGlobal(_ on: Bool) -> DeskNagConfig {
         var next = self
         next.enabled = on
@@ -252,7 +194,6 @@ public struct DeskNagConfig: Sendable, Equatable {
         return next
     }
 
-    /// Upsert one scope entry (kind+id is the key).
     public func settingScope(kind: DeskNagScopeKind, id: String, enabled on: Bool) -> DeskNagConfig {
         var next = self
         if let idx = next.scopes.firstIndex(where: {
@@ -266,8 +207,7 @@ public struct DeskNagConfig: Sendable, Equatable {
         return next
     }
 
-    /// Go quiet until `until` (nil = indefinitely). No window bump: muting
-    /// doesn't re-arm anything, it suspends.
+    /// Muting suspends attention without rearming an item’s consumed budget.
     public func muted(until: String?) -> DeskNagConfig {
         var next = self
         let trimmed = until?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -275,9 +215,7 @@ public struct DeskNagConfig: Sendable, Equatable {
         return next
     }
 
-    /// Come back: clear the mute and OPEN A NEW WINDOW, so every item is
-    /// eligible to nag once again. Callers pair this with the drift digest —
-    /// unmuting must never be blind.
+    /// Unmuting opens a new window and pairs with a drift digest so resumption is informed.
     public func unmuted() -> DeskNagConfig {
         var next = self
         next.mutedUntil = nil
@@ -287,8 +225,7 @@ public struct DeskNagConfig: Sendable, Equatable {
 
     // MARK: - Wire
 
-    /// Omit-empty: an untouched config serialises to the three scalars, so the
-    /// file stays readable by a human deciding whether the machine is nagging.
+    /// Omit empty collections so an untouched preference remains human-readable.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [
             "version": .int(Int64(DeskNagConfigSchema.version)),
@@ -305,17 +242,9 @@ public struct DeskNagConfig: Sendable, Equatable {
 
 // MARK: - Store
 
-/// Flock-serialised reader/writer for `<dataRoot>/desk/nag_config.json`.
-///
-/// Stateless like SwiftNativeDeskStore (all state on disk) and locked on the
-/// config path itself — NOT on the desk ops feed. Two locks, two concerns: a
-/// nag-config write must never park behind a desk op append, and the evaluator
-/// reads a state SNAPSHOT anyway (it is pure; it does not need the two files to
-/// be mutually consistent to the millisecond — a lost tick is one delta later,
-/// not a lost delta, because the observation baseline only advances when a
-/// delta is actually consumed).
-/// nag_config.json: excluded from local backup/export and phone sync;
-/// off-disk backup includes it; PrivacyMap lists desk/.
+/// Lock the preference file independently so config writes need not wait for Desk appends.
+/// A lost evaluation tick preserves its baseline, leaving the delta visible on the next read.
+/// Local export and phone sync exclude this preference; off-disk backup retains it.
 public struct DeskNagConfigStore: Sendable {
     public let dataRoot: URL
 
@@ -385,18 +314,13 @@ public struct DeskNagConfigStore: Sendable {
         }
     }
 
-    /// Read-modify-write INSIDE the flock — the only safe shape when the chat
-    /// tool and the background loop both mutate (a load/mutate/save pair
-    /// outside the lock loses whichever write lands first). Returns the
-    /// committed config.
+    /// Read-modify-write under the same flock so chat and background mutations cannot lose one another.
     @discardableResult
     public func update(_ transform: @Sendable (DeskNagConfig) -> DeskNagConfig) async throws -> DeskNagConfig {
         try await updating { (transform($0), ()) }.config
     }
 
-    /// Read-modify-write with a returned value. A part's proposal is computed
-    /// outside this lock, then its source config is compared here before any
-    /// baseline, ledger or window transition can commit.
+    /// Compute proposals outside the lock, then compare their source before any baseline or window commits.
     public func updating<T: Sendable>(
         _ transform: @Sendable (DeskNagConfig) throws -> (DeskNagConfig, T)
     ) async throws -> (config: DeskNagConfig, value: T) {
@@ -421,9 +345,7 @@ public struct DeskNagLane: Identifiable, Equatable, Sendable {
 }
 
 public enum DeskNagPanelModel {
-    /// One row per project that has live work, with its current scope decision.
-    /// A project with NO scope entry is off — matching `DeskNagConfig
-    /// .scopeEnabled(for:)`, where the absence of an entry means no nag.
+    /// Absence of project scope means off, matching the owner’s item-before-project decision.
     public static func lanes(items: [DeskItem], config: DeskNagConfig) -> [DeskNagLane] {
         let active = DeskBoardLayout.activeItems(items)
         let byProject = Dictionary(grouping: active, by: \.project)
@@ -438,7 +360,6 @@ public enum DeskNagPanelModel {
         }
     }
 
-    /// Count live items using the owner's item-before-project scope decision.
     public static func summary(_ config: DeskNagConfig, items: [DeskItem], now: Date) -> String {
         if config.isMuted(now: now) {
             let phrase = config.mutedUntil == DeskNagConfig.indefiniteMuteSentinel
@@ -456,9 +377,7 @@ public enum DeskNagPanelModel {
             : "Nagging is ON for \(on) live item\(on == 1 ? "" : "s")."
     }
 
-    /// Snooze choices, resolved against an injected `now` so the mapping is
-    /// testable. `nil` = mute with no end date (the tool writes its indefinite
-    /// sentinel).
+    /// Resolve against the supplied clock so near-midnight choices use one consistent instant.
     public struct SnoozeOption: Identifiable, Equatable, Sendable {
         public let label: String
         public let until: String?
@@ -468,7 +387,8 @@ public enum DeskNagPanelModel {
     public static func snoozeOptions(from now: Date, calendar: Calendar = .current) -> [SnoozeOption] {
         [
             SnoozeOption(label: "Through tomorrow", until: DeskDeferPreset.tomorrow.day(from: now, calendar: calendar)),
-            SnoozeOption(label: "Through " + DeskDeferPreset.nextWeek.day(from: now, calendar: calendar), until: DeskDeferPreset.nextWeek.day(from: now, calendar: calendar)),
+            SnoozeOption(label: "Through " + DeskDeferPreset.nextWeek.day(from: now, calendar: calendar), until: DeskDeferPreset.nextWeek.day(from: now,
+                calendar: calendar)),
             SnoozeOption(label: "Indefinitely", until: nil),
         ]
     }

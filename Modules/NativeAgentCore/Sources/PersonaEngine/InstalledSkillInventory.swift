@@ -3,11 +3,11 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `InstalledSkillInventory.swift` | Built-in guidance inventory, matching and body reads shared by Parts, Mac and phone as SkillRecord, carrying source text and revision without reconstruction; unreadable bodies remain named unavailable rows while readable siblings proceed |
+// Blueprint: | `InstalledSkillInventory.swift` | InstalledSkillInventory owner. |
 
-/// The identity and availability projection shared by discovery, UI and recall.
+/// Share skill identity and availability across discovery, UI and recall.
 public enum InstalledSkillInventory {
-    /// The persona's built-in guidance, excluding ids now owned by abilities.
+    /// Exclude IDs now owned by abilities so built-in guidance cannot compete with executable parts.
     public static func entries(dataRoot: URL, includingSource: Bool = true) throws -> [SkillRecord] {
         let bodies = defaultPersonaRoot(dataRoot: dataRoot).appendingPathComponent("skills/bodies")
         let directory: [URL]
@@ -29,7 +29,7 @@ public enum InstalledSkillInventory {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    /// Bundled originals stay outside the writable ability store.
+    /// Keep bundled originals outside the writable ability store.
     private static func entry(_ id: String, file: URL, includingSource: Bool) throws -> SkillRecord {
         let body = try body(at: file)
         return SkillRecord(id: id, name: id, description: body.split(separator: "\n").first.map(String.init) ?? id,

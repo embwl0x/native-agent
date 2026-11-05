@@ -2,14 +2,13 @@ import ChatToolParsing
 import Dispatcher
 import Foundation
 import PersistenceCore
-// Blueprint: | `AppToolExecutor+PagePresentation.swift` | screenshot results and quiet page/read rendering |
+// Blueprint: | `AppToolExecutor+PagePresentation.swift` | screenshot results with an explicit image sink and quiet page/read rendering |
 
 extension AppToolExecutor {
-    /// PNG outputs: excluded from local/off-disk backup, export and phone sync;
-    /// listed in PrivacyMap. The returned path is a live output artifact.
+    /// PNG outputs: excluded from local/off-disk backup, export and phone sync; listed in PrivacyMap. The returned path is a live output artifact.
     public static func pageScreenshotResult(
         page: QuietToolPage, tabKey: String, dataRoot: URL,
-        rendered: (data: Data, width: Int, height: Int)
+        rendered: (data: Data, width: Int, height: Int), imageSink: LocalToolImage.Sink?
     ) -> JSONValue {
         // Every picture is also a file, so whoever asked can open the PNG.
         let folder = dataRoot
@@ -28,9 +27,8 @@ extension AppToolExecutor {
             return .object(failure)
         }
         do {
-            // The current file stays protected until delivery. Inline delivery
-            // owns the encoded bytes, so later trims cannot invalidate pixels
-            // already handed to an active model continuation.
+            // The current file stays protected until delivery. Inline delivery owns the encoded bytes, so later trims cannot invalidate pixels already handed
+            // to an active model continuation.
             try prunePageShots(in: folder, preserving: file)
         } catch {
             return AppToolExecutor.doorRefusal("page_image_retention_failed", "The PNG was saved, but retention failed: \(error.localizedDescription)",
@@ -38,9 +36,8 @@ extension AppToolExecutor {
                 next: ["action": .string("files.read"), "args": .object(["path": .string(file.path)])],
                 extra: ["path": .string(file.path), "effects": .string("occurred")])
         }
-        // A text-only call (the Claude bridge) has no turn to show pixels in:
-        // the path comes back instead.
-        if LocalToolImage.sink == nil {
+        // Text-only bridge calls have no image continuation, so return the file path.
+        if imageSink == nil {
             return .object([
                 "status": .string("ok"), "page": .string(page.id), "title": .string(page.title),
                 "path": .string(file.path),
@@ -50,7 +47,7 @@ extension AppToolExecutor {
         }
         guard case .object(var delivery) = LocalToolImage.deliverPNG(
             rendered.data, name: "\(page.id).png",
-            width: rendered.width, height: rendered.height
+            width: rendered.width, height: rendered.height, sink: imageSink
         ) else {
             return AppToolExecutor.doorRefusal("page_image_delivery_failed", "The PNG was saved; delivery to the model was not verified.",
                 remedy: "inspect", "Read the saved PNG; do not render another copy to recover delivery.",
@@ -73,8 +70,7 @@ extension AppToolExecutor {
         return .object(delivery)
     }
 
-    /// Replaceable offscreen pictures: seven days, 64 files, 64 MiB. The
-    /// picture being returned is always kept, even if it alone exceeds a bound.
+    /// Replaceable offscreen pictures: seven days, 64 files, 64 MiB. The picture being returned is always kept, even if it alone exceeds a bound.
     private static func prunePageShots(in folder: URL, preserving current: URL, now: Date = Date()) throws {
         let files = try FileManager.default.contentsOfDirectory(
             at: folder, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey],

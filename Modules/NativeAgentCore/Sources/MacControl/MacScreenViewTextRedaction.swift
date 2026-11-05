@@ -22,28 +22,15 @@ import CryptoKit
 import os
 #endif
 // Blueprint: | `MacScreenViewTextRedaction.swift` | One secret-decision owner for text, pixels and enclosing captions |
-/// Keeps a secret that is merely DISPLAYED out of the fused view's text channel.
-///
-/// Displayed secrets include static text; redact secret shapes while keeping prose legible:
-///
-///   • a lone 6–8 digit code (an OTP and nothing else in the line);
-///   • a long high-entropy single token, or one carrying a known key prefix;
-///   • a run of bullets/asterisks (a masked field, drawn as text);
-///   • `label: value` on one line where the label names a secret and the value
-///     is a single token — "API key: sk-live-…";
-///   • a code-shaped token sitting immediately right of / below a SHORT label
-///     that names a secret. This masks possible secrets; it does not assign
-///     an unrelated caption as a control's action identity.
-///
-/// Each detector below guards against matching ordinary prose.
+/// Displayed secrets include static text: apply shape and caption checks while preserving ordinary prose. Cover lone OTPs, opaque tokens, masks, inline labeled
+/// tokens and nearby secret values; caption evidence never assigns action identity.
 public enum MacScreenViewTextRedaction {
-    /// Field names use these hints without the prose caption-length or code-disqualifier rules.
+    /// Field names bypass prose caption-length and code-disqualifier limits.
     public static let secretFieldLabelTokens: [String] = [
         "password", "passcode", "passphrase", "secret", "api key", "api-key",
         "token", "pin code", "security code", "2fa", "one-time code",
     ]
-    /// Words that make a SHORT nearby line a secret LABEL. Matched only against
-    /// labels (≤ `maxLabelChars`), never against the body of a sentence.
+    /// Only short labels may caption secrets; sentence bodies cannot.
     public static let secretLabelTokens = secretFieldLabelTokens.filter {
         $0 != "pin code" && $0 != "one-time code"
     } + [
@@ -55,27 +42,17 @@ public enum MacScreenViewTextRedaction {
         "seed phrase", "recovery phrase", "seed words", "recovery words",
         "mnemonic", "backup phrase", "secret phrase", "card number",
     ]
-    /// A label naming the 3–4 digit code on the back of a card. Split out from
-    /// `secretLabelTokens` because its VALUE is shorter than any other secret
-    /// we redact — three digits — and only a label this specific earns the
-    /// right to darken something that short. "Security code" lives here AND in
-    /// the generic list; the disqualifier pass never applies to these.
+    /// Only specific card-verification labels justify masking short three- or four-digit values; code disqualifiers do not apply.
     public static let cardVerificationLabelTokens: [String] = [
         "cvv", "cvc", "csc", "cvv2", "cid",
         "security code", "card verification", "card security",
     ]
-    /// A label naming a wallet's recovery words. Under one of these, a run of
-    /// lowercase words far SHORTER than the unlabeled bar is still the secret.
+    /// Explicit recovery labels justify masking shorter word runs than the unlabeled threshold.
     public static let seedPhraseLabelTokens: [String] = [
         "seed phrase", "recovery phrase", "seed words", "recovery words",
         "mnemonic", "backup phrase", "secret phrase", "secret recovery phrase",
     ]
-    /// Function words that are common in English prose. Used ONLY as a
-    /// false-positive guard on the unlabeled seed-phrase shape: a run of
-    /// lowercase words containing any of these is a sentence, not a wallet
-    /// backup. Deliberately conservative — a wordlist phrase that happens to
-    /// contain one of these is MISSED rather than prose being darkened, and an
-    /// explicitly labeled phrase is caught regardless of this list.
+    /// Function words guard unlabeled prose from seed-phrase masking; labeled phrases still qualify regardless of this list.
     public static let proseFunctionWords: Set<String> = [
         "the", "and", "that", "this", "with", "for", "are", "was", "not",
         "but", "have", "from", "they", "his", "her", "has", "had", "were",
@@ -85,9 +62,7 @@ public enum MacScreenViewTextRedaction {
         "them", "him", "your", "our", "their", "its", "would", "could",
         "should", "said", "says", "our", "you",
     ]
-    /// "Code" is the most useful indicator and the most dangerous one: a screen
-    /// is full of zip codes, area codes, promo codes and error codes. A label
-    /// whose "code" is qualified by any of these is not naming a secret.
+    /// Qualified zip, area, promo and error codes are not secrets; bare code needs this disqualifier guard.
     public static let codeDisqualifiers: [String] = [
         "zip", "postal", "post code", "area", "country", "dial", "promo",
         "coupon", "discount", "error", "status", "color", "colour", "qr",
@@ -95,23 +70,19 @@ public enum MacScreenViewTextRedaction {
         "airport", "region", "state", "sort code", "swift code", "referral",
         "invite", "tracking",
     ]
-    /// Known secret prefixes: short but unambiguous, so they bypass the length
-    /// bar an unlabeled random token has to clear.
+    /// Known key prefixes are unambiguous enough to bypass the opaque-token length floor.
     public static let knownSecretPrefixes: [String] = [
         "sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_",
         "github_pat_", "xoxb-", "xoxp-", "xoxa-", "akia", "asia", "aiza",
         "ya29.", "eyj", "npm_", "glpat-", "shpat_",
     ]
-    /// A label longer than this is a sentence, not a caption.
+    /// Long captions are sentences rather than secret labels.
     public static let maxLabelChars = 40
-    /// A redactable VALUE is a token, not a paragraph.
+    /// Token bounds prevent a secret caption from masking an entire paragraph.
     public static let maxValueChars = 128
-    /// Same reach the legend's label inference uses, for the same reason.
+    /// Match the legend’s label-inference reach so both channels judge nearby captions consistently.
     public static let proximityPoints: Double = 240
-    /// The replacement: never the characters, always enough to audit them.
-    /// Same digest shape as `MacInjectionResultRedaction.redactedSecret`, plus
-    /// the reason — a caller deserves to know WHY a line went dark, otherwise
-    /// redaction is indistinguishable from the organ failing to see.
+    /// Replace secret characters with the shared digest shape and a reason so callers can audit withholding without mistaking it for failed sight.
     public static func redactedText(_ secret: String, reason: String) -> JSONValue {
         guard case .object(var object) =
             MacInjectionResultRedaction.redactedSecret(secret) else {
@@ -120,8 +91,7 @@ public enum MacScreenViewTextRedaction {
         object["reason"] = .string(reason)
         return .object(object)
     }
-    /// Is this line, ON ITS OWN, a secret? Independent of neighbours, so it
-    /// also guards the legend's labels and values.
+    /// Standalone checks protect labels and values even without caption context.
     public static func standaloneSecretReason(_ raw: String) -> String? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
@@ -135,40 +105,33 @@ public enum MacScreenViewTextRedaction {
         if isBase64Token(text) { return "high_entropy_token" }
         return nil
     }
-    /// Does this SHORT line name the 3–4 digit card verification code?
     public static func isCardVerificationLabel(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !text.isEmpty, text.count <= maxLabelChars else { return false }
         return cardVerificationLabelTokens.contains { token in
-            // "cid"/"cvc" are short enough to appear inside another word, so a
-            // 3-letter token has to sit on a word boundary.
+            // Short tokens such as cid and cvc need word boundaries to avoid matching inside unrelated words.
             guard token.count <= 3 else { return text.contains(token) }
             return text.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
                 .contains { $0.lowercased() == token }
         }
     }
-    /// Does this SHORT line name a wallet recovery phrase?
     public static func isSeedPhraseLabel(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !text.isEmpty, text.count <= maxLabelChars else { return false }
         return seedPhraseLabelTokens.contains { text.contains($0) }
     }
-    /// Exactly 3–4 digits and nothing else. Only ever redacted UNDER a card
-    /// verification label — on its own, three digits is a quantity.
+    /// Three- or four-digit values require a card-verification caption; unlabeled digits may be ordinary quantities.
     static func isShortCodeValue(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 3, text.count <= 4 else { return false }
         return text.allSatisfy { $0.isNumber }
     }
-    /// Does this SHORT line name a secret — i.e. is it the caption of a secret
-    /// field/value? Never true for a sentence.
+    /// Only short secret-naming captions qualify, never sentences.
     public static func looksLikeSecretLabel(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !text.isEmpty, text.count <= maxLabelChars else { return false }
         guard secretLabelTokens.contains(where: { text.contains($0) }) else { return false }
-        // Qualified "code" labels (zip/area/promo/…) are not secrets. Only the
-        // bare-"code" match needs the guard: every other token in the list is
-        // unambiguous on its own.
+        // Disqualify only bare code matches; other secret-label tokens remain unambiguous independently.
         let matchedOnlyCode = !secretLabelTokens.contains {
             $0 != "code" && $0 != "pin" && text.contains($0)
         }
@@ -177,8 +140,7 @@ public enum MacScreenViewTextRedaction {
         }
         return true
     }
-    /// Transfer the shared node verdict to visible text without truncating it.
-    /// Paths align with items; context includes captions from the whole snapshot.
+    /// Transfer complete-snapshot caption verdicts without truncation; paths must stay aligned with text items.
     public static func applied(
         to items: [MacScreenViewBuilder.VisibleText],
         paths: [[Int]] = [],
@@ -193,14 +155,8 @@ public enum MacScreenViewTextRedaction {
             return MacScreenViewBuilder.VisibleText(text: item.text, frame: item.frame, redactionReason: reason)
         }
     }
-    /// The legend's mirror of `applied`: a name or a value that is itself a
-    /// secret never rides out as a label row either.
-    /// - Parameter under: the control's own label, when this string is that
-    ///   control's VALUE. A legend row carries its own caption, so the CVV box
-    ///   labeled "CVV" showing `123` is the positional shape the prose channel
-    ///   already redacts — without this the same three digits ride out in the
-    ///   legend. Nil for a label (a label has no label).
-    /// - Parameter enclosing: secret-naming ancestor groups, including captions absent from `under`.
+    /// Legend labels need the same standalone secret checks as prose. Values additionally use their own label and enclosing groups, so short captioned CVVs
+    /// cannot escape through the legend.
     public static func redactedLegendString(
         _ text: String,
         valueChars: Int,
@@ -246,14 +202,12 @@ public enum MacScreenViewTextRedaction {
         }
         return .object(object)
     }
-    /// Redact text at serialization with the view's detectors; the shared AX reader stays read-only.
-    /// Preserve role, subrole, enabled, frame, actions, path and score so redacted nodes stay addressable.
+    /// Redact at serialization while the shared reader remains read-only; preserve all addressing and action evidence.
     public struct NodeSecretContext: Sendable {
         public let secretLabelFrames: [MacAXFrame]
         public let cvvLabelFrames: [MacAXFrame]
         public let seedLabelFrames: [MacAXFrame]
-        /// An ancestor GROUP whose
-        /// title names a secret and whose frame contains the value.
+        /// Enclosing secret groups need both a naming title and a frame around the value.
         public let enclosingCaptions: [EnclosingCaption]
         public init(
             secretLabelFrames: [MacAXFrame],
@@ -270,9 +224,7 @@ public enum MacScreenViewTextRedaction {
             secretLabelFrames: [], cvvLabelFrames: [], seedLabelFrames: []
         )
     }
-    /// Which frames on this screen are CAPTIONS naming a secret. Built from the
-    /// WHOLE snapshot — including nodes a `find` query did not match — because a
-    /// caption two rows away still names the value beside it.
+    /// Build captions from the whole snapshot; a find query may omit the label that protects its matched value.
     public static func nodeSecretContext(_ nodes: [MacAXNode]) -> NodeSecretContext {
         var secret: [MacAXFrame] = []
         var cvv: [MacAXFrame] = []
@@ -292,8 +244,7 @@ public enum MacScreenViewTextRedaction {
             enclosingCaptions: enclosingCaptions(nodes)
         )
     }
-    /// One node's text field, judged by shape on its own, then by the caption it
-    /// carries (`under`), then by the caption sitting beside/above it.
+    /// Combine standalone shape, the value’s own caption and nearby-caption evidence.
     static func redactedNodeString(
         _ text: String,
         valueChars: Int,
@@ -320,12 +271,11 @@ public enum MacScreenViewTextRedaction {
         }
         return redacted
     }
-    /// Serialize one AX node with its text channels redacted and every
-    /// addressing channel intact.
+    /// Redact every text channel without removing node addressing.
     public static func redactedNodeFields(
         _ node: MacAXNode,
         valueChars: Int = MacAXLimits.hardValueChars,
-        context: NodeSecretContext = .empty
+        context: NodeSecretContext
     ) -> [String: JSONValue] {
         let attributes = node.attributes
         var object: [String: JSONValue] = [
@@ -348,7 +298,7 @@ public enum MacScreenViewTextRedaction {
         if let frame = attributes.frame { object["frame"] = frame.toJSON() }
         if let summary = attributes.listSummary { object["list_summary"] = .string(summary) }
         let frame = node.attributes.frame
-        // Include secret-naming groups enclosing this node.
+        // Enclosing secret captions protect untitled descendants too.
         let enclosing = enclosingKinds(
             forNodeAt: frame,
             path: node.path,
@@ -365,9 +315,7 @@ public enum MacScreenViewTextRedaction {
             )
         }
         if let value = node.attributes.value {
-            // A value whose secrecy evidence did not read (its label: title,
-            // description or caption, or the subrole that marks a secure field)
-            // cannot be proven non-secret, as an unreadable "CVV" caption: withheld.
+            // Unreadable secrecy evidence cannot establish a non-secret value; withhold it.
             let editable = ["AXTextField", "AXTextArea", "AXComboBox"].contains(node.attributes.role)
             let secrecyUnread = node.attributes.attributeGaps.contains { gap in
                 [kAXTitleAttribute, kAXDescriptionAttribute, "caption read"].contains { gap.hasPrefix($0 + ":") }
@@ -381,8 +329,7 @@ public enum MacScreenViewTextRedaction {
                 value,
                 valueChars: valueChars,
                 frame: frame,
-                // A control's own title IS its caption — the "CVV" box showing
-                // `123`, the "API key" field showing the key.
+                // A control’s own title captions its value, protecting short CVVs and displayed keys.
                 under: node.attributes.title,
                 enclosing: enclosing,
                 context: context
@@ -390,7 +337,6 @@ public enum MacScreenViewTextRedaction {
         }
         return object
     }
-    /// `mac_ax_tree`'s node array.
     public static func redactedNodesJSON(
         _ nodes: [MacAXNode],
         valueChars: Int = MacAXLimits.hardValueChars
@@ -398,8 +344,7 @@ public enum MacScreenViewTextRedaction {
         let context = nodeSecretContext(nodes)
         return nodes.map { .object(redactedNodeFields($0, valueChars: valueChars, context: context)) }
     }
-    /// `mac_ax_find`'s match array. Same redaction, `score` preserved — a match
-    /// on a redacted node is still a usable handle.
+    /// Find matches retain score and addressing even when their text is redacted.
     public static func redactedMatchesJSON(
         _ matches: [MacAXMatch],
         valueChars: Int = MacAXLimits.hardValueChars,
@@ -411,23 +356,8 @@ public enum MacScreenViewTextRedaction {
             return .object(object)
         }
     }
-    /// A secret-naming ancestor can caption an untitled field by containment:
-    ///
-    ///     AXGroup  title="CVV"          ← encloses
-    ///       AXTextField  value="451"    ← no title of its own
-    ///
-    /// Containment uses the shared caption vocabulary and shape detectors, with stricter matching:
-    ///
-    ///   • the caption must NAME a secret — a group titled "Payment", "Form",
-    ///     "Account" or "Toolbar" is ordinary structure and its children stay
-    ///     fully legible;
-    ///   • the secret word must be a WORD, not a substring — "Shipping"
-    ///     contains "pin" and a shipping section is not a secret. Nearby captions use substrings.
-    ///   • the ROOT window is never an enclosing caption. It encloses
-    ///     everything, so a window titled "Recovery Code" would blank the whole
-    ///     screen; the window title is redacted on its own, standalone.
-    ///   • the value still has to have a secret SHAPE. A toolbar group named
-    ///     "Password" enclosing a "New Tab" button keeps its button.
+    /// Enclosing captions require secret words, not substrings, and a secret-shaped value; ordinary groups and buttons remain legible. Exclude the root window
+    /// because it encloses everything; its title receives standalone redaction instead.
     public struct EnclosingCaptionKinds: Sendable, Equatable {
         public let secret: Bool
         public let cvv: Bool
@@ -447,10 +377,7 @@ public enum MacScreenViewTextRedaction {
             )
         }
     }
-    /// One node that both NAMES a secret and ENCLOSES things: a candidate
-    /// ancestor. `path` is what makes it an ancestor rather than merely a
-    /// bigger overlapping rectangle — frame containment alone would let a
-    /// full-window backdrop caption a control it has no relationship to.
+    /// Require a path ancestor as well as frame containment so unrelated overlapping backdrops cannot caption controls.
     public struct EnclosingCaption: Sendable, Equatable {
         public let frame: MacAXFrame
         public let path: [Int]
@@ -461,10 +388,7 @@ public enum MacScreenViewTextRedaction {
             self.kinds = kinds
         }
     }
-    /// Words, not substrings: `"Shipping"` must not match `"pin"`.
-    /// Normalizes both sides (lowercase, every non-alphanumeric run becomes a
-    /// single space) so a multi-word token like `"api key"` or `"one-time"`
-    /// matches `"API Key:"` and `"One-Time Code"` on the same rule.
+    /// Normalize word boundaries on both sides so multiword secret names match punctuation without matching pin inside Shipping.
     static func captionWords(_ raw: String) -> String {
         let words = raw.lowercased().split { !$0.isLetter && !$0.isNumber }
         return " " + words.joined(separator: " ") + " "
@@ -476,8 +400,7 @@ public enum MacScreenViewTextRedaction {
             return normalized.contains(needle)
         }
     }
-    /// Which secret-caption vocabularies does this title belong to, judged at
-    /// the stricter word-boundary bar an enclosing caption has to clear?
+    /// Enclosing captions use stricter word-boundary matching than nearby captions.
     public static func enclosingCaptionKinds(forCaption raw: String) -> EnclosingCaptionKinds {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count <= maxLabelChars else { return .none }
@@ -486,8 +409,7 @@ public enum MacScreenViewTextRedaction {
         let seed = captionContainsWord(normalized, anyOf: seedPhraseLabelTokens)
         var secret = captionContainsWord(normalized, anyOf: secretLabelTokens)
         if secret {
-            // Same disqualifier pass the beside-geometry runs: a group titled
-            // "Zip Code" or "Promo Code" names neither a secret nor a PIN.
+            // Use the same qualified-code disqualifiers as nearby-caption geometry.
             let matchedOnlyCode = !secretLabelTokens.contains {
                 $0 != "code" && $0 != "pin"
                     && captionContainsWord(normalized, anyOf: [$0])
@@ -499,14 +421,11 @@ public enum MacScreenViewTextRedaction {
         }
         return EnclosingCaptionKinds(secret: secret, cvv: cvv, seed: seed)
     }
-    /// Every node on this screen that could caption its own subtree. Built from
-    /// the WHOLE snapshot for the same reason the beside-caption map is: a
-    /// `find` query matches the field, never the group around it.
+    /// Build enclosing captions from the whole snapshot because find may match a field without its protecting group.
     public static func enclosingCaptions(_ nodes: [MacAXNode]) -> [EnclosingCaption] {
         var captions: [EnclosingCaption] = []
         for node in nodes {
-            // The root (empty path) encloses the entire window — excluded on
-            // purpose, see the guard list above.
+            // Exclude the root because it encloses the entire window.
             guard !node.path.isEmpty else { continue }
             guard let frame = node.attributes.frame, frame.w > 0, frame.h > 0 else { continue }
             guard let title = node.attributes.title else { continue }
@@ -516,10 +435,7 @@ public enum MacScreenViewTextRedaction {
         }
         return captions
     }
-    /// Which enclosing captions apply to the node at `path`/`frame`: a strict
-    /// path ancestor whose frame also contains the node. Both are required —
-    /// the path proves the relationship, the frame proves the group is really
-    /// drawn around it (an AX subtree can outlive its visual box).
+    /// Require both strict path ancestry and frame containment: AX subtrees can outlive their visible boxes.
     public static func enclosingKinds(
         forNodeAt frame: MacAXFrame?,
         path: [Int],
@@ -547,8 +463,7 @@ public enum MacScreenViewTextRedaction {
             && outer.x + outer.w >= inner.x + inner.w - slack
             && outer.y + outer.h >= inner.y + inner.h - slack
     }
-    /// The enclosing rule, applied to one string. Shape still decides: the
-    /// caption only says WHICH shapes are in play here.
+    /// Captions select applicable secret shapes; shape checks still decide withholding.
     static func enclosingSecretReason(_ text: String, kinds: EnclosingCaptionKinds) -> String? {
         guard kinds.any else { return nil }
         if kinds.cvv, isShortCodeValue(text) { return "enclosing_cvv" }
@@ -558,14 +473,15 @@ public enum MacScreenViewTextRedaction {
         if kinds.secret, looksLikeRedactableValue(text) { return "enclosing_secret_caption" }
         return nil
     }
-    /// Complete masking coverage; callers choose timing and frame-size requirements.
+    /// Coverage must be complete; callers own timing and minimum frame size.
     public static func inspectSecretFields(source: any MacAXElementSource, root: MacAXElementRef,
-        deadline: Date, nonnegativeFrames: Bool = true) throws -> [MacAXNode] {
-        try MacAXLimits.$readDeadline.withValue(deadline) {
+        deadline: Date, nonnegativeFrames: Bool = true, context: MacOperationContext) throws -> [MacAXNode] {
+        try context.holding(\.readDeadline, deadline) { context in
             let snapshot = MacAccessibilityReader.walk(source: source, root: root, limits: .whole,
-                read: { try source.checkedMaskingAttributes(of: $0) }, deadline: deadline, stopAtCut: true)
+                read: { ref, context in try source.checkedMaskingAttributes(of: ref, context: context) }, deadline: deadline, stopAtCut: true, context: context)
             guard !snapshot.truncated else {
-                throw SenseFailure(code: "redaction_coverage_unavailable", message: "AX inspection was cut: \(snapshot.truncationReasons.joined(separator: ", ")). "
+                throw SenseFailure(code: "redaction_coverage_unavailable",
+                    message: "AX inspection was cut: \(snapshot.truncationReasons.joined(separator: ", ")). "
                     + snapshot.readFailures.joined(separator: "; "))
             }
             guard !snapshot.nodes.isEmpty else { throw SenseFailure(code: "redaction_coverage_unavailable", message: "AX inspection returned no nodes.") }
@@ -585,16 +501,15 @@ public enum MacScreenViewTextRedaction {
             return snapshot.nodes
         }
     }
-    /// Masks withheld words and secret controls in one pass over indexed
-    /// captions and names. Nil past the deadline withholds the window's pixels.
+    /// Mask withheld words and secret controls together; incomplete deadline coverage withholds the window pixels.
     public static func secretFrames(
         nodes: [MacAXNode],
         geometry: MacScreenViewGeometry,
         deadline: Date
-    ) -> [MacAXFrame]? {
+    , context: MacOperationContext) -> [MacAXFrame]? {
         let context = nodeSecretContext(nodes)
         let names = MacScreenViewBuilder.LabelIndex(nodes)
-        // The indexes are built from a walk the share already bounded; past the deadline the window is masked whole.
+        // If indexing exceeds the share’s deadline, mask the whole window rather than disclose unchecked pixels.
         guard Date() < deadline else { return nil }
         var frames: [MacAXFrame] = []
         for node in nodes {
@@ -618,8 +533,7 @@ public enum MacScreenViewTextRedaction {
         }
         return frames
     }
-    /// Shared AX/OCR caption geometry: coordinates and proximity share units,
-    /// with a top-left origin and y increasing downward.
+    /// AX and OCR caption geometry must share units and a top-left origin.
     static func labelDistance(_ label: MacAXFrame, forValueAt value: MacAXFrame, proximity: Double) -> Double? {
         guard label.w > 0, label.h > 0, value.w > 0, value.h > 0 else { return nil }
         let sameRow = label.y < value.y + value.h && label.y + label.h > value.y
@@ -636,10 +550,7 @@ public enum MacScreenViewTextRedaction {
         }
         return nil
     }
-    /// A value worth redacting BY POSITION is a token, not prose: one word,
-    /// long enough to be a secret, and either carrying a digit, long, or an
-    /// all-caps/alnum run. "Cancel" beside a password label stays visible;
-    /// "8F2K-91QT" does not.
+    /// Nearby captions mask only code-shaped tokens, not ordinary prose such as a Cancel button.
     static func looksLikeRedactableValue(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 4, text.count <= maxValueChars else { return false }
@@ -648,8 +559,7 @@ public enum MacScreenViewTextRedaction {
         let allCaps = text.allSatisfy { !$0.isLowercase } && text.contains { $0.isLetter }
         return hasDigit || allCaps || text.count >= 12
     }
-    /// Dot filenames are excluded only from positional `labeled_secret_nearby` value matching.
-    /// Standalone secrets, captioned CVVs/recovery phrases and inline secrets retain their checks.
+    /// Dot filenames bypass only generic positional matching; standalone and explicitly captioned secret shapes still apply.
     static func isFilenameShapedToken(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 2, text.count <= maxValueChars else { return false }
@@ -659,10 +569,7 @@ public enum MacScreenViewTextRedaction {
             $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_"
         }
     }
-    /// `looksLikeRedactableValue`, minus the shapes that are not values at all.
-    /// The ONE gate every `labeled_secret_nearby` decision goes through, so the
-    /// prose channel, the legend and the perception compiler cannot disagree
-    /// about the same filename.
+    /// One positional-value predicate keeps prose, legends and perception compilation consistent about filenames.
     static func isLabeledSecretValue(_ text: String) -> Bool {
         looksLikeRedactableValue(text) && !isFilenameShapedToken(text)
     }
@@ -672,8 +579,7 @@ public enum MacScreenViewTextRedaction {
         guard stripped.count >= 4 else { return false }
         return stripped.allSatisfy { masks.contains($0) }
     }
-    /// A LONE 6–8 digit code. The whole line has to be the code: "123456" is an
-    /// OTP, "Order 123456 shipped" is not.
+    /// Only a whole-line six- to eight-digit code qualifies as an unlabeled OTP; surrounding prose disqualifies it.
     static func isOneTimeCode(_ text: String) -> Bool {
         guard text.count <= 12 else { return false }
         guard !text.contains(where: { $0.isLetter }) else { return false }
@@ -682,10 +588,7 @@ public enum MacScreenViewTextRedaction {
         let separators: Set<Character> = [" ", "-", "–", "—", "\u{00A0}"]
         return text.allSatisfy { $0.isNumber || separators.contains($0) }
     }
-    /// `label: value` on one line, where the label names a secret and the value
-    /// is a single token. The single-token bar is the false-positive guard:
-    /// "Choose a strong password: it must be at least 8 characters" has a
-    /// secret-naming label and a SENTENCE after the colon, so it stays visible.
+    /// Inline secret captions require a single-token value so password instructions remain readable prose.
     static func inlineLabeledSecretReason(_ text: String) -> String? {
         guard text.count <= 200 else { return nil }
         for separator in [":", "=", "："] {
@@ -702,8 +605,7 @@ public enum MacScreenViewTextRedaction {
                 return "labeled_recovery_phrase"
             }
             guard looksLikeSecretLabel(label) else { continue }
-            // The generic token test rejects whitespace, so a spaced card
-            // number or a word run after a secret caption needs its own shape.
+            // Spaced cards and recovery words need dedicated shapes because generic tokens reject whitespace.
             guard looksLikeRedactableValue(value)
                 || isPaymentCardNumber(value)
                 || isRecoveryPhrase(value, labeled: true) else { continue }
@@ -711,15 +613,9 @@ public enum MacScreenViewTextRedaction {
         }
         return nil
     }
-    /// Under an explicit seed/recovery caption the wordlist run does not have to
-    /// reach the unlabeled 12-word bar — the caption already said what it is.
+    /// Explicit recovery captions justify shorter word runs than the unlabeled twelve-word floor.
     public static let labeledSeedMinWords = 6
-    /// A payment card number, INCLUDING the spaced/dashed form a human reads.
-    ///
-    /// FALSE-POSITIVE GUARD: **Luhn**. 13–19 digits is a wide net (an order id,
-    /// an account number, a serial all live in there), so the line only goes
-    /// dark if it also satisfies the card checksum. An order number, a tracking
-    /// number and a phone number are shorter, carry letters, or fail Luhn.
+    /// Require a Luhn checksum for 13–19 digit card shapes so ordinary numeric identifiers are less likely to be masked.
     static func isPaymentCardNumber(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count <= 32 else { return false }
@@ -729,7 +625,6 @@ public enum MacScreenViewTextRedaction {
         guard digits.count >= 13, digits.count <= 19 else { return false }
         return luhnValid(digits)
     }
-    /// The Luhn mod-10 checksum every issuer's numbering satisfies.
     static func luhnValid(_ digits: String) -> Bool {
         var sum = 0
         var double = false
@@ -745,18 +640,8 @@ public enum MacScreenViewTextRedaction {
         }
         return sum % 10 == 0
     }
-    /// A wallet seed / recovery phrase: a run of lowercase space-separated
-    /// words, checked separately from single-token secrets.
-    ///
-    /// FALSE-POSITIVE GUARD, three layers, because "lowercase words" is what
-    /// prose is made of: (1) every word must be 3–8 letters, pure alphabetic —
-    /// wordlist shape, and prose is full of 1–2 letter function words; (2) the
-    /// WHOLE line must be the run, so any capital or punctuation mark — which
-    /// real prose lines carry — disqualifies it; (3) no common English function
-    /// word may appear. A phrase that happens to contain one of those words is
-    /// MISSED rather than a sentence being darkened; that direction of error is
-    /// the deliberate one, and a LABELED phrase is caught regardless (see
-    /// `labeled`, which also drops the minimum to 6 under that caption).
+    /// Unlabeled recovery phrases need whole-line lowercase words of three to eight letters and no common function words. Favor missed unlabeled phrases over
+    /// masked prose; explicit captions bypass that guard and lower the floor to six words.
     static func isRecoveryPhrase(_ raw: String, labeled: Bool = false) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count <= 400 else { return false }
@@ -769,17 +654,8 @@ public enum MacScreenViewTextRedaction {
         }
         return true
     }
-    /// A base64 / base64url blob, including `+`, `/` and `=` markers.
-    ///
-    /// FALSE-POSITIVE GUARD, four gates, because `/` also means "path":
-    /// (1) at least one true base64 marker (`+`, `/`, `=`) — those never occur
-    /// in an identifier or an English word; (2) no `.` or `:`, which kills URLs,
-    /// hostnames and filenames outright; (3) mixed case AND a digit, the
-    /// signature random bytes always produce; (4) no same-case alphabetic run
-    /// longer than 5, which is what separates `Reports/2024/Summary` (run of 6
-    /// in "eports") from an encoded blob; then a Shannon entropy floor.
-    /// base64url tokens made only of `[A-Za-z0-9-_]` carry no marker char and
-    /// are already caught by `isHighEntropyToken` above.
+    /// Base64 needs a marker, no dot or colon, mixed case, digits, short same-case letter runs and sufficient entropy to exclude paths. Markerless base64url
+    /// tokens use the opaque-token detector.
     static func isBase64Token(_ text: String) -> Bool {
         guard text.count >= 20, text.count <= maxValueChars else { return false }
         guard !text.contains(where: { $0.isWhitespace }) else { return false }
@@ -796,8 +672,7 @@ public enum MacScreenViewTextRedaction {
         guard longestSameCaseRun(text) <= 5 else { return false }
         return shannonEntropyBitsPerCharacter(text) >= 3.5
     }
-    /// Longest run of consecutive letters sharing a case. Words have long ones;
-    /// encoded bytes do not.
+    /// Long same-case letter runs suggest words rather than encoded bytes.
     static func longestSameCaseRun(_ text: String) -> Int {
         var best = 0
         var current = 0
@@ -814,7 +689,6 @@ public enum MacScreenViewTextRedaction {
         }
         return best
     }
-    /// Shannon entropy over the characters, in bits per character.
     static func shannonEntropyBitsPerCharacter(_ text: String) -> Double {
         guard !text.isEmpty else { return 0 }
         var counts: [Character: Int] = [:]
@@ -825,9 +699,7 @@ public enum MacScreenViewTextRedaction {
             return partial - probability * log2(probability)
         }
     }
-    /// A single opaque token: long, mixed, and made only of token characters
-    /// (so a URL, a path, an email or a sentence cannot qualify) — or short but
-    /// carrying a known key prefix.
+    /// Opaque tokens must exclude URL, path, email and prose syntax; known key prefixes may bypass the length floor.
     static func isHighEntropyToken(_ text: String) -> Bool {
         guard !text.contains(where: { $0.isWhitespace }) else { return false }
         let allowed = text.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "." }
@@ -838,7 +710,7 @@ public enum MacScreenViewTextRedaction {
         }
         guard text.count <= maxValueChars else { return false }
         guard text.count >= 20 else { return false }
-        // A dotted word run (a hostname, a filename, a version) is not a token.
+        // Dotted runs are names or versions rather than opaque tokens.
         guard !text.contains(".") else { return false }
         let hasDigit = text.contains { $0.isNumber }
         let hasLetter = text.contains { $0.isLetter }
@@ -847,8 +719,7 @@ public enum MacScreenViewTextRedaction {
         guard !looksLikeCamelCaseIdentifier(text) else { return false }
         return Set(text).count >= 10
     }
-    /// Does this split at its capitals into three or more real words? A random
-    /// token does not — its "words" are two characters long and full of digits.
+    /// CamelCase word segmentation distinguishes ordinary identifiers from short random fragments.
     static func looksLikeCamelCaseIdentifier(_ text: String) -> Bool {
         var segments: [String] = []
         var current = ""

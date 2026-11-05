@@ -1,25 +1,18 @@
 import Foundation
 
-// Blueprint: | `AgentHostACP.swift` | `AgentHostACP`: documented stdio launch contracts, protocol pins, explicit ask permissions and verification/version blockers |
+// Blueprint: | `AgentHostACP.swift` | `AgentHostACP`: stdio contracts and version admission |
 
-/// Documented stdio entry points, not prompt templates. ACP wire version 1.
-/// https://agentclientprotocol.com/protocol/v1/transports
+/// Use documented stdio contracts, not prompt templates: https://agentclientprotocol.com/protocol/v1/transports
 public struct AgentHostACP: Sendable, Equatable, Codable {
     public let executable: String
     public let arguments: [String]
     public let documentation: String
     /// Explicit ask mode, never the host's saved auto-approval setting.
     public let permissionMode: String
-    /// ACP registry pins this integration was written against, not a promise
-    /// that arbitrary installed builds have been tested.
+    /// Registry pins bound compatibility; arbitrary installed releases are unverified.
     public let referenceVersion: String
-    /// Set over the scrubbed environment the program starts with.
     public var environment: [String: String] = [:]
-    /// What the agent said at its last dry run (`agent.verify`, a failed
-    /// send's repair), written back as "learned": its ACP version (this app
-    /// speaks 1), the session modes it advertised ([]: no set_mode is sent)
-    /// and whether it reopens a session (neither: a continued conversation
-    /// starts a new one). A send holds the agent to `modes`; nil is not known yet.
+    /// Retain verified ACP version, session modes and reopen support. A send must honor the advertised modes; nil means unverified.
     public var protocolVersion: Int? = nil
     public var modes: [String]? = nil
     public var supportsLoad: Bool? = nil
@@ -41,14 +34,17 @@ public struct AgentHostACP: Sendable, Equatable, Codable {
         self.supportsResume = supportsResume
     }
 
-    /// Exact installed version whose sandbox launcher was inspected. Do not
-    /// infer compatibility for neighbouring releases or bypass its sandbox.
+    /// Exact installed version whose sandbox launcher was inspected. Do not infer compatibility for neighbouring releases or bypass its sandbox.
     /// https://github.com/google-gemini/gemini-cli/issues/23959
     public func startupBlocker(installedVersion: String?) -> String? {
         guard executable == "gemini", arguments.contains("--acp"), arguments.contains("--sandbox"),
               let version = installedVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
               version == "0.46.0" || version == "v0.46.0" else { return nil }
-        return "Gemini CLI 0.46.0 cannot start this sandboxed ACP connection: its launcher consumes the protocol input before starting ACP (upstream issue #23959). Nothing ran and the message was not sent. Use a Gemini release with verified sandboxed ACP support, then reconnect. No fixed version has been verified here; do not disable sandboxing or retry this message automatically."
+        return """
+            Gemini CLI 0.46.0 cannot start this sandboxed ACP connection: its launcher consumes the protocol input before starting ACP (upstream issue \
+            #23959). Nothing ran and the message was not sent. Use a Gemini release with verified sandboxed ACP support, then reconnect. No fixed version has \
+            been verified here; do not disable sandboxing or retry this message automatically.
+            """
     }
 
     public func versionNote(_ reported: String?) -> String {

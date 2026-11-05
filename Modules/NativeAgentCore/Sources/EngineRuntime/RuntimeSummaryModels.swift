@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `RuntimeSummaryModels.swift` | `KernelGuardrail`, `ApprovalClass` and policy-only `AutonomyKernelSummary`; running improvement counts belong to the loop lifecycle owner |
+// Blueprint: | `RuntimeSummaryModels.swift` | `KernelGuardrail`, `ApprovalClass`, `AutonomyKernelSummary`; Policy-only summaries |
 
 public struct KernelGuardrail: Identifiable, Codable, Hashable {
     public var id: String
@@ -33,7 +33,8 @@ public struct AutonomyKernelSummary: Codable, Hashable {
     public var guardrails: [KernelGuardrail]
     public var approvalClasses: [ApprovalClass]
     public var createdAt: String?
-    public init(status: String, mode: String? = nil, enabled: Bool? = nil, processEnabled: Bool? = nil, trustEnabled: Bool? = nil, disabledReason: String? = nil, guardrails: [KernelGuardrail], approvalClasses: [ApprovalClass], createdAt: String? = nil) {
+    public init(status: String, mode: String? = nil, enabled: Bool? = nil, processEnabled: Bool? = nil, trustEnabled: Bool? = nil,
+        disabledReason: String? = nil, guardrails: [KernelGuardrail], approvalClasses: [ApprovalClass], createdAt: String? = nil) {
         self.status = status
         self.mode = mode
         self.enabled = enabled

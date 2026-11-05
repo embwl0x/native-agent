@@ -13,24 +13,22 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
 import Senses
 import ToolRegistry
 import ActivityWatch
 import ChatTurnContracts
 import NativeAgentShared
-// Blueprint: | `SwiftToolDispatcher+ActivityQuery.swift` | `SwiftToolDispatcher`: activity-query discovery, argument parsing and named failures; capture policy and actual-origin authority admit bounded local history answers |
+// Blueprint: | `SwiftToolDispatcher+ActivityQuery.swift` | `SwiftToolDispatcher`: Bound reads by capture and origin gates. |
 
 extension SwiftToolDispatcher {
-    /// Discover activity queries only when capture is on and agent access is
-    /// granted directly or by Full Mac. Dispatch rechecks actual-origin authority.
-    func activityCaptureEnabled() async -> Bool {
+    /// Discover activity queries only when capture is on and agent access is granted directly or by Full Mac. Dispatch rechecks actual-origin authority.
+    func activityCaptureEnabled(turn: Turn?, surface: String) async -> Bool {
         guard let policy = try? ActivityPolicyStore(dataRoot: dataRoot).loadChecked() else {
             return false
         }
         guard policy.captureEnabled else { return false }
         if policy.allowModelAccess { return true }
-        return await fullMacYoloAdmitted(surface: "chat")
+        return await fullMacYoloAdmitted(turn: turn, surface: surface)
     }
 
     private func activityQueryFailure(_ error: ActivityQueries.QueryError, argumentPath: String = "$") -> ToolFailureError {
@@ -63,11 +61,9 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// The read path into the local activity store: authenticated Full Mac or
-    /// local model-access opt-in admits bounded answers; capture off, malformed
-    /// policies and unparseable ranges refuse. Parsing and SQL make no model
-    /// calls, and answers enter neither cognition nor memory promotion.
-    func impl_activity_query_tool(
+    /// Admit bounded activity reads only through actual-origin authority and capture policy. Malformed policies or ranges refuse; these reads make no model
+    /// calls and never promote cognition or memory.
+    func impl_activity_query_tool(turn: Turn,
         tool: String,
         input: [String: JSONValue],
         surface: String
@@ -77,7 +73,7 @@ extension SwiftToolDispatcher {
                 reason: "SwiftToolDispatcher: '\(tool)' has no Swift activity-query implementation"
             )
         }
-        let fullMacAdmitted = await fullMacYoloAdmitted(surface: surface)
+        let fullMacAdmitted = await fullMacYoloAdmitted(turn: turn, surface: surface)
         guard fullMacAdmitted || !ActivityQueries.isRefusedSurface(surface) else {
             throw activityQueryFailure(.remoteSurfaceRefused(surface: surface))
         }
@@ -155,8 +151,7 @@ extension SwiftToolDispatcher {
                 rowCap: intArg("limit") ?? ActivityQueries.maxRows
             ), fullMacAdmitted: fullMacAdmitted)
         } catch let error as ActivityQueries.QueryError {
-            // Surfaced as a tool denial, not a crash and not an empty answer:
-            // "capture is off" must never look like "you did nothing today".
+            // Surfaced as a tool denial, not a crash and not an empty answer: "capture is off" must never look like "you did nothing today".
             throw activityQueryFailure(error)
         }
     }

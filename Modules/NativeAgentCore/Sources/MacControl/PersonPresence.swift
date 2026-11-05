@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `PersonPresence.swift` | One derived person presence from Mac input and timestamped phone evidence; home, senses, capsule and carried work share it; phone departure arms the input owner's first physical return; stale or absent phone data remains unknown |
+// Blueprint: | `PersonPresence.swift` | One Mac/phone presence; phone departure arms physical return, missing evidence stays unknown |
 public enum PersonPresence {
     public static let phoneFreshFor = PhoneSenseHistory.freshFor
     public struct Reading: Sendable {
@@ -26,7 +26,11 @@ public enum PersonPresence {
             func fresh(_ date: Date) -> Bool { (0...phoneFreshFor).contains(now.timeIntervalSince(date)) }
             let place = places.max { $0.timestamp < $1.timestamp }
             if let place {
-                lines.append("phone \(place.transition == .left ? "left" : "at") \(String(reflecting: place.name)) at \(clock(place.timestamp)) (phone place\(fresh(place.timestamp) ? "" : ", last observation"))")
+                lines.append(
+                    """
+                        phone \(place.transition == .left ? "left" : "at") \(String(reflecting: place.name)) at \(clock(place.timestamp)) (phone \
+                        place\(fresh(place.timestamp) ? "" : ", last observation"))
+                        """)
             }
             var latest: [PhoneSenseEvent.Source: PhoneSenseEvent] = [:]
             for event in senses where !event.isSetup && (latest[event.source].map({ $0.timestamp < event.timestamp }) ?? true) { latest[event.source] = event }
@@ -40,7 +44,11 @@ public enum PersonPresence {
             }
             let needsSetup = latestSetup.filter { !($0.setup?.missing.isEmpty ?? false) }.map { $0.source.title }
             if !needsSetup.isEmpty {
-                lines.append("phone setup missing for \(needsSetup.joined(separator: ", ")); read app {page:\"pairing\",item:\"phone-senses\"} for the missing steps and phone senses guide")
+                lines.append(
+                    """
+                        phone setup missing for \(needsSetup.joined(separator: ", ")); read app {page:\"pairing\",item:\"phone-senses\"} for the missing steps \
+                        and phone senses guide
+                        """)
             } else if latestSetup.count < PhoneSenseEvent.Source.allCases.count {
                 lines.append("phone sense setup not fully reported; open the paired phone app, then read app {page:\"pairing\",item:\"phone-senses\"}")
             }
@@ -54,8 +62,7 @@ public enum PersonPresence {
             }
             if let newest { if !fresh(newest) { lines.append("phone unknown since \(clock(newest))") } }
             else { lines.append("phone unknown as of \(clock(now)) (never reported)") }
-            // Motion is evidence of leaving the computer, never evidence of coming home.
-            // A later physical Mac input wins. Focus/charging/arrival alone cannot say away.
+            // Motion proves departure, never arrival; later physical Mac input wins, while focus and charging alone prove neither.
             if let motion = latest[.motion], fresh(motion.timestamp), motion.isMovement,
                lastPersonInput.map({ $0 < motion.timestamp }) ?? true {
                 let began = firstMovement?.timestamp ?? motion.timestamp

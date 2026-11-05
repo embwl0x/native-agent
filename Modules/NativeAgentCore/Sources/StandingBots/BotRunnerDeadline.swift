@@ -1,10 +1,7 @@
 import Foundation
-// Blueprint: | `BotRunnerDeadline.swift` | One helper seconds deadline is reported when crossed and never cancels its work; scheduled runs and direct conversations share it |
+// Blueprint: | `BotRunnerDeadline.swift` | Report helper deadlines without cancelling work; scheduled runs and conversations share settlement |
 
-/// The run's time budget is a fact reported when it is crossed, never a
-/// cancel around the helper's work: the turn finishes under its own lifetime,
-/// and the person's Stop is what ends one early (10-24: cancelling cut a helper
-/// off mid-conversation and sent her a blank message).
+/// A deadline reports lateness while work settles under its own lifetime; only the person's Stop ends it early.
 package enum BotRunnerDeadline {
     /// The claim keeps its crossing mark until the session has settled.
     package static func settled<T: Sendable>(seconds: TimeInterval, onDeadline: @escaping @Sendable () async -> Void,

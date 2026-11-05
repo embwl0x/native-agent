@@ -1,14 +1,12 @@
-// CloudKit delivers pairing material; PairingStore alone checks and commits it.
 import Foundation
 import NativeAgentShared
 import Observation
 import Security
 import CryptoKit
 import UIKit
-// Blueprint: | `PairingStore.swift` | Device-local phone signing identity and sole pairing Keychain transaction owner; checked unavailable/removed/installed material controls sense and delivery retention |
+// Blueprint: | `PairingStore.swift` | Sole phone identity/Keychain transaction owner; checked pairing evidence governs sense/delivery retention |
 
-/// One device-local signing identity, never synced through iCloud or restored
-/// onto another phone. A failed read must not silently replace the identity.
+/// Keep signing identity device-local and unsynced; a failed read must never replace it.
 actor PhoneSigningIdentity {
     static let shared = PhoneSigningIdentity()
     private var cachedKey: Curve25519.Signing.PrivateKey?
@@ -69,9 +67,7 @@ actor PhoneSigningIdentity {
 
 @MainActor
 final class PairingStore: ObservableObject {
-    /// Unreadable authority is distinct from a checked absence. Sense and
-    /// delivery owners retire retained state only for removed or a committed
-    /// different key.
+    /// Unreadable pairing is not removal; retire retained state only on checked removal or a committed different key.
     enum Material: Equatable {
         case unavailable
         case removed
@@ -83,9 +79,8 @@ final class PairingStore: ObservableObject {
         }
     }
     private enum Keys {
-        // Older builds' installed-key flag did not prove Mac confirmation.
+        // Pairing requires Mac confirmation; locally installed credentials alone cannot establish it.
         static let iCloudPaired = "mobile.pairing.macConfirmed"
-        // Legacy UserDefaults key — only read for one-time migration
         static let iCloudPairingSecretLegacy = "mobile.pairing.iCloudPairingSecret"
     }
 
@@ -107,8 +102,7 @@ final class PairingStore: ObservableObject {
         return (status, item as? Data)
     }
 
-    /// Transaction algorithm is closure-injected so failure boundaries are
-    /// provable without mutating a developer's real Keychain in tests.
+    /// Inject transaction boundaries so failure reasoning does not require changing the user's Keychain.
     static func persistSecretTransaction(
         _ data: Data,
         read: () -> (OSStatus, Data?),
@@ -193,12 +187,15 @@ final class PairingStore: ObservableObject {
     }
     var iCloudPairingSecret: Data? { material.secret }
 
-    /// All sense retention decisions read this checked result, never nil key
-    /// bytes (which can also mean locked, unreadable or not yet restored).
+    /// Retention reads checked pairing state; nil bytes can mean locked, unreadable or unrestored storage rather than removal.
     func sensePairingIdentity() throws -> String? {
         switch material {
         case .unavailable:
-            throw DeviceSyncError.underlying(message: "The saved pairing key is unavailable. Retained phone senses and pending readings are unchanged; unlock the iPhone and check the Mac connection.")
+            throw DeviceSyncError.underlying(
+                message: """
+                    The saved pairing key is unavailable. Retained phone senses and pending readings are unchanged; unlock the iPhone and \
+                    check the Mac connection.
+                    """)
         case .removed: return nil
         case .installed(let data):
             guard let identity = AgentNameCache.fingerprint(data) else {
@@ -247,26 +244,22 @@ final class PairingStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "mobile.pairing.connectionRepairPending")
     }
 
-    /// True after the Mac confirms this phone, with signed transport configured.
     var isPaired: Bool {
         isICloudPaired && isICloudSigned
     }
 
-    /// True when the 32-byte HMAC secret is present (messages can be signed)
     var isICloudSigned: Bool {
         iCloudPairingSecret != nil
     }
 
-    /// True when iCloud should be used as the transport, even if the convenience
-    /// paired flag lagged behind a Keychain/KVS bootstrap.
+    /// A retained secret authorizes iCloud transport even while the paired flag lags bootstrap.
     var usesICloudTransport: Bool {
         isICloudPaired || iCloudPairingSecret != nil
     }
 
     private static let knownSecretVersionKey = "mobile.pairing.knownSecretVersion"
 
-    /// The latest pairing_secret_version this device observed from KVS.
-    /// Persisted in UserDefaults so a stale-version check survives relaunches.
+    /// Persist pairing_secret_version so stale-key checks survive relaunch.
     var knownSecretVersion: Int64 {
         get { Int64(UserDefaults.standard.integer(forKey: Self.knownSecretVersionKey)) }
         set { UserDefaults.standard.set(Int(newValue), forKey: Self.knownSecretVersionKey) }
@@ -275,7 +268,7 @@ final class PairingStore: ObservableObject {
     init() {
         isICloudPaired = UserDefaults.standard.bool(forKey: Keys.iCloudPaired)
 
-        // Read Keychain first; migrate legacy UserDefaults only when no Keychain entry exists.
+        // Read Keychain first; import stored defaults only on checked Keychain absence.
         let keychainRead = readSecretFromKeychain()
         if keychainRead.status == errSecSuccess,
            let keychainData = keychainRead.data, keychainData.count == 32 {
@@ -283,15 +276,21 @@ final class PairingStore: ObservableObject {
         } else if keychainRead.status == errSecItemNotFound,
                   let b64 = UserDefaults.standard.string(forKey: Keys.iCloudPairingSecretLegacy),
                   let data = Data(base64Encoded: b64), data.count == 32 {
-            // Clear legacy UserDefaults only after a successful Keychain write.
+            // Clear imported defaults only after the Keychain write succeeds.
             let saveStatus = saveSecretToKeychain(data)
             if saveStatus == errSecSuccess {
                 UserDefaults.standard.removeObject(forKey: Keys.iCloudPairingSecretLegacy)
                 material = .installed(data)
             } else {
-                // Keep legacy UserDefaults so we don't lose the secret.
-                secretStorageError = "Pairing could not be saved in this iPhone's Keychain (status \(saveStatus)). The original key is retained. Unlock the iPhone and check Keychain access before trying Connect again."
-                NSLog("[PairingStore] Pairing unavailable: Keychain migration failed (status=\(saveStatus)); source bytes retained. Repair iPhone Keychain access before pairing can resume.")
+                // Keep the import source when writing fails so secret material is not lost.
+                secretStorageError = """
+                    Pairing could not be saved in this iPhone's Keychain (status \(saveStatus)). The original key is retained. Unlock the iPhone and check \
+                    Keychain access before trying Connect again.
+                    """
+                NSLog("""
+                    [PairingStore] Pairing unavailable: Keychain migration failed (status=\(saveStatus)); source bytes retained. Repair iPhone Keychain \
+                    access before pairing can resume.
+                    """)
             }
         } else {
             if keychainRead.status == errSecItemNotFound,
@@ -299,7 +298,10 @@ final class PairingStore: ObservableObject {
                 material = .removed
                 AgentNameCache.forget()
             } else {
-                secretStorageError = "The saved pairing key could not be read or has an invalid shape (Keychain status \(keychainRead.status)). Its bytes are retained. Unlock the iPhone and repair Keychain access before reconnecting."
+                secretStorageError = """
+                    The saved pairing key could not be read or has an invalid shape (Keychain status \(keychainRead.status)). Its bytes are retained. Unlock \
+                    the iPhone and repair Keychain access before reconnecting.
+                    """
             }
         }
 
@@ -327,24 +329,23 @@ final class PairingStore: ObservableObject {
                 self.secretStorageError = nil
                 self.material = .installed(data)
             } else {
-                self.pairingUnavailable("The saved pairing key could not be verified after unlock (Keychain status \(result.status)). Retained sense state is unchanged; check the Mac connection.")
+                self.pairingUnavailable("""
+                    The saved pairing key could not be verified after unlock (Keychain status \(result.status)). Retained sense state is unchanged; check the \
+                    Mac connection.
+                    """)
             }
             _ = await self.refreshFromCloudKit()
         }
     }
 
-    /// Runs NSUbiquitousKeyValueStore.synchronize() under a wall-clock timeout
-    /// so a wedged cloudd / KVS subsystem can't freeze the caller.
+    /// Bound the synchronize wait so a wedged KVS service cannot freeze its caller.
     nonisolated static func synchronizeKVSWithTimeout() async {
         _ = await withCKTimeout("PairingStore.KVS.synchronize", seconds: 2) {
             NSUbiquitousKeyValueStore.default.synchronize()
         }
     }
 
-    /// Receives pairing material from the CloudKit transport. Exact length is
-    /// validated before the existing PairingStore transaction writes Keychain;
-    /// no bridge or transport may become a second persistence owner. True only
-    /// when a different key was installed.
+    /// Validate exact length before PairingStore commits; transport must not become another persistence owner.
     @discardableResult
     func applyCloudKitPairingSecret(
         _ data: Data,
@@ -354,8 +355,7 @@ final class PairingStore: ObservableObject {
         return installPairingSecret(data, source: "CloudKit", persist: persist)
     }
 
-    /// Keychain-first pairing transaction. Published/UI state changes only
-    /// after the durable write and exact read-back succeed.
+    /// Publish pairing state only after durable Keychain write and exact readback.
     private func installPairingSecret(
         _ data: Data,
         source: String,
@@ -373,7 +373,10 @@ final class PairingStore: ObservableObject {
         }
         let writeStatus = persist?(data) ?? saveSecretToKeychain(data)
         guard writeStatus == errSecSuccess else {
-            pairingUnavailable("\(source) pairing Keychain write could not be verified (status \(writeStatus)). Unlock the iPhone and check the Mac connection; retained sense state is unchanged.")
+            pairingUnavailable("""
+                \(source) pairing Keychain write could not be verified (status \(writeStatus)). Unlock the iPhone and check the Mac connection; retained \
+                sense state is unchanged.
+                """)
             return false
         }
         isICloudPaired = false
@@ -383,8 +386,7 @@ final class PairingStore: ObservableObject {
         return true
     }
 
-    /// Refresh pairing through its transport owner, without re-entering message
-    /// delivery: an incoming resync hint can call this during the setup drain.
+    /// Resync can arrive during setup drain; refresh pairing without re-entering message delivery.
     @discardableResult
     func refreshFromCloudKit() async -> Bool {
         guard !isRepairingConnection else { return false }

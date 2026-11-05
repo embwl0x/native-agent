@@ -19,31 +19,26 @@ import ProviderRouting
 import Experiences
 import ToolRegistry
 import Cognition
-// Blueprint: | `OffDiskBackupRunner.swift` | `MaintenanceBackgroundWork.makeOffDiskBackupLoop`; backup-cadence selects freshness and identity-change timing from native volume/metadata observations; native root protection and backup execution; canceled deadline reads publish no outcome and canceled ticks skip; actual cadence failures name the part, cause and repair lever in scheduler receipts and Doctor health; unavailable observations remain unavailable |
+import PersonaEngine
+// Blueprint: | `OffDiskBackupRunner.swift` | `MaintenanceBackgroundWork.makeOffDiskBackupLoop`; Native metadata, root protection and copying |
 
 extension MaintenanceBackgroundWork {
-    /// Off-disk backup into iCloud Drive at its daily deadline and after
-    /// identity-file changes. See `OffDiskBackupRunner`.
     public func makeOffDiskBackupLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> some LoopRunner {
-        OffDiskBackupRunner(port: port, interval: 24 * 60 * 60, dataRoot: dataRoot)
+        OffDiskBackupRunner(port: port, period: 24 * 60 * 60, dataRoot: dataRoot)
     }
 }
 
 let backupCadenceRepairStep = "Repair or restore the backup-cadence part."
 
-/// Versioned off-disk backup (`port.createOffDiskBackup`). Her backup-cadence
-/// part selects the deadline and trigger from native backup freshness and
-/// identity-file modification observations; the shipped seed keeps daily and
-/// identity-change timing. Metadata reads, root protection and copying stay here.
-/// Identity-file invalidations coalesce before the canonical reread; the daily
-/// interval remains the missed-event/unavailable-volume backstop. With
-/// iCloud Drive off the tick is an `unavailable:` skip (a WARN row in Doctor);
-/// cancellation is not a backup defect; other failures are `.failed` and logged.
+/// The part selects timing; native code owns metadata, root protection and copying.
+/// Identity-file events supplement the daily backup rhythm.
+/// Unavailable iCloud is a warning skip, cancellation is not a defect, and actual failures remain failed outcomes.
 private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
     let port: any MaintenanceBackgroundWorkPort
-    let interval: TimeInterval
+    let period: TimeInterval
+    var wake: OrganWake { .every(period) }
     let dataRoot: URL
 
     var loopId: String { "offdisk_backup" }
@@ -60,25 +55,33 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
                 at: personaRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
                 .filter { !$0.lastPathComponent.hasSuffix(".lock") }
         } catch {
-            let cause = "Off-disk backup source watches are incompletely armed at \(personaRoot.path): \(error.localizedDescription). Repair persona directory access and reopen NativeAgent to rearm its child watches; the parent watch remains active."
+            let cause = """
+                Off-disk backup source watches are incompletely armed at \(personaRoot.path): \(error.localizedDescription). Repair persona directory access \
+                and reopen NativeAgent to rearm its child watches; the parent watch remains active.
+                """
             Task { await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId, outcome: .failed(error: cause)) }
             identityFiles = []
         }
+        // The onboarding sentinel and its transaction folder are what onboarded() reads, so completing setup mid-run wakes the first pass.
         return EventDeadlinePhysiology.storeAndFileEvents(
-            paths: [personaRoot, dataRoot.appendingPathComponent("memory/profile.json")] + identityFiles,
+            paths: [personaRoot, dataRoot.appendingPathComponent("memory/profile.json"), dataRoot.appendingPathComponent(".onboarded"),
+                dataRoot.appendingPathComponent("onboarding", isDirectory: true)] + identityFiles,
             loopId: loopId
         )
     }
 
+    /// iCloud Drive is first read after setup completes, so its access prompt never comes before the person has a screen.
+    private var onboarded: Bool { NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) }
+
     func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else { return nil }
+        guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL, onboarded else { return nil }
         let parent = port.offDiskBackupParent()
         let port = port
         do {
             let newest = try await VolumeIO.run { try port.offDiskAutomaticBackups(in: parent).first?.date }
             return try await port.backupDeadline(dataRoot: dataRoot, input: .object([
                 "kind": .string("deadline"), "now": .double(now.timeIntervalSince1970),
-                "newest": newest.map { .double($0.timeIntervalSince1970) } ?? .null, "interval": .double(interval)
+                "newest": newest.map { .double($0.timeIntervalSince1970) } ?? .null, "interval": .double(period)
             ])).map { Date(timeIntervalSince1970: $0) }
         } catch where Task.isCancelled || error is CancellationError {
             return nil
@@ -92,8 +95,7 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
         }
     }
 
-    /// A deadline read runs outside the tick. Nil alone would erase its failure;
-    /// use the same scheduler receipt and Doctor health path as a failed tick.
+    /// Deadline reads occur outside ticks; use the same failure receipt so nil cannot erase a fault.
     private func recordDeadlineFailure(_ outcome: LoopTickOutcome) async {
         await settle {
             await BackgroundLoops.BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId, outcome: outcome)
@@ -108,11 +110,11 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
     }
 
     func tickOutcome() async -> LoopTickOutcome {
-        // Only the live root goes to iCloud; an alternate (test) root must never
-        // write into, or prune, User's backup folder.
+        // Only the live root may write or prune the person’s iCloud backup folder.
         guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else {
             return .skipped(reason: "alternate data root")
         }
+        guard onboarded else { return .skipped(reason: "setup is not complete; the first backup runs when it is") }
         let parent = port.offDiskBackupParent()
         let port = port
         do {
@@ -160,9 +162,7 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
         }
     }
 
-    /// Newest modification among the persona root's own files (SOUL.md,
-    /// GROWTH.md, ...) and the personality profile, which is where identity
-    /// writes land.
+    /// Identity lives in persona-root files and the personality profile; observe both for backup freshness.
     private func identityChangedAt() throws -> Date? {
         let fm = FileManager.default
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)

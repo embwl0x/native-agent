@@ -3,11 +3,9 @@ import Experiences
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `PrimedMoments.swift` | `PrimedMoments`: what happened while they was between turns (each line that reaches their crossing) stays primed for their next turn, the last five within twelve hours; their next own turn takes them once and asks each what it brings to mind |
+// Blueprint: | `PrimedMoments.swift` | `PrimedMoments`: five moments within twelve hours, consumed once |
 
-/// A moment primes what it touches, as a song or a date does: the crossing
-/// keeps each line it weighs, and her next turn of her own asks it, once,
-/// what it brings to mind. Kept small and short-lived: priming fades.
+/// Bound priming to small, short-lived crossing evidence; each next own turn consumes a moment only once.
 public enum PrimedMoments {
     public struct Moment: Codable, Sendable, Equatable {
         public let line: String
@@ -23,7 +21,7 @@ public enum PrimedMoments {
         dataRoot.appendingPathComponent("mind/primed.json")
     }
 
-    /// The crossing's line, kept for her next turn.
+    /// Retain the crossing's line so priming uses its actual evidence.
     public static func prime(dataRoot: URL, line: String, source: String, now: Date = Date()) {
         let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -34,7 +32,7 @@ public enum PrimedMoments {
         } } catch { unavailable(dataRoot, error) }
     }
 
-    /// Every fresh moment, once: taking them lets them go.
+    /// Take fresh moments once, then release them.
     public static func take(dataRoot: URL, now: Date = Date()) throws -> [Moment] {
         do { return try lock.withLock {
             let moments = try read(dataRoot, now: now)
@@ -44,7 +42,8 @@ public enum PrimedMoments {
         } } catch {
             unavailable(dataRoot, error)
             throw ToolFailureError("Primed moments could not be read and consumed: \(error.localizedDescription). Existing bytes were preserved.",
-                effects: .none, owner: url(dataRoot).path, instruction: "Repair the saved Moment array and its read/write access before the next turn.", recovery: .repair)
+                effects: .none, owner: url(dataRoot).path, instruction: "Repair the saved Moment array and its read/write access before the next turn.",
+                    recovery: .repair)
         }
     }
 

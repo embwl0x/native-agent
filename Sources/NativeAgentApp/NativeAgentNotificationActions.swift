@@ -1,4 +1,3 @@
-import Cognition
 import EngineRuntime
 import ApprovalTransactions
 import Foundation
@@ -6,7 +5,8 @@ import NativeAgentShared
 import AttentionRouting
 import UserNotifications
 import AppKit
-// Blueprint: | `NativeAgentNotificationActions.swift` | Native response mapping, shared category registration and mounted window/conversation dispatch; effects stay in EngineNotificationActions |
+import Experiences
+// Blueprint: | `NativeAgentNotificationActions.swift` | Native response mapping and mounted dispatch; EngineNotificationActions owns effects |
 
 extension NativeAgentNotificationActions.Response {
     init(_ response: UNNotificationResponse) {
@@ -85,7 +85,6 @@ extension NativeAgentNotificationActions {
         }
     }
 
-    /// Opens the conversation; with `messageID`, lands on that message.
     @MainActor
     static func openConversation(_ sessionID: String, messageID: String? = nil) async {
         _ = ApplicationLifetime.shared.request(.sidebar(.chat))
@@ -102,9 +101,7 @@ extension NativeAgentNotificationActions {
     }
 }
 
-/// App-lifetime observation of the same inbox the approval buttons read. The
-/// initial read establishes a baseline for Mac banners. AttentionRouter owns
-/// phone acceptance independently of discovery.
+/// Conversation cards follow committed matters; a requests-file event cannot race their birth.
 @MainActor
 enum NativeAgentApprovalNotifications {
     static func observe() async {
@@ -113,16 +110,10 @@ enum NativeAgentApprovalNotifications {
 
     private static func observeApprovals() async {
         let engine = NativeAgentEngine.live
-        let approvals = engine.approvals
         let delivery = ApprovalNotificationDelivery(engine: engine)
-        let approvalPath = await approvals.requestsPath()
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [approvalPath] + [
-            "config/apns.json", "notifications/push_tokens.json", "user_prefs.json"
-        ].map { approvals.dataRoot.appendingPathComponent($0) },
-            notifications: [NSApplication.didBecomeActiveNotification, .NSSystemClockDidChange, UserDefaults.didChangeNotification]) {
+        for await _ in await ForPerson.at(engine.dataRoot).changes() {
+            guard !Task.isCancelled else { return }
             await delivery.refresh(
-                router: .shared,
-                telegram: { ApprovalChatCards.runningTelegram },
                 writeSnapshots: { Task { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() } }
             )
         }

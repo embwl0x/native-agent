@@ -6,7 +6,6 @@ import DoctorChecks
 import PersistenceCore
 import Desk
 import ApprovalInbox
-import WorkshopExecution
 import AgentWorkspace
 import NotificationInbox
 import Privacy

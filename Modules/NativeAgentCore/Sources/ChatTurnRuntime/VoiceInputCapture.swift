@@ -3,12 +3,9 @@ import Observation
 import Speech
 import AVFoundation
 import NativeAgentShared
-// Blueprint: | `VoiceInputCapture.swift` | consent-driven native microphone lifecycle; shared SpeechUtterance recognition and original audio travel through existing chat attachments |
+// Blueprint: | `VoiceInputCapture.swift` | Consent-driven capture with terminal quality and audio attachments |
 
-/// The terminal quality of a stopped voice capture.  A recognizer timeout is
-/// deliberately distinct from a completed transcription: callers can retain
-/// the partial text for visible recovery without ever submitting it as though
-/// it were a finished user utterance.
+/// Keep timeout distinct from final recognition so partial text remains recoverable without being submitted as a finished utterance.
 public enum VoiceInputStopResult: Equatable, Sendable {
     case final(String)
     case partial(String)
@@ -31,9 +28,7 @@ public enum VoiceInputStopResult: Equatable, Sendable {
     }
 }
 
-/// The terminal result of one user-initiated voice permission request.  This
-/// stays separate from `isListening`: an authorization success only permits a
-/// capture attempt; it does not claim that audio capture actually started.
+/// Permission success admits a capture attempt; it does not prove the audio engine started.
 public enum VoiceInputPermissionResult: Equatable, Sendable {
     case granted
     case speechNotDetermined
@@ -48,7 +43,10 @@ public enum VoiceInputPermissionResult: Equatable, Sendable {
         case .granted:
             nil
         case .speechNotDetermined:
-            "Speech recognition permission was not resolved, so voice input did not start. Open System Settings → Privacy & Security → Speech Recognition and try again."
+            """
+                Speech recognition permission was not resolved, so voice input did not start. Open System Settings → Privacy & Security → Speech \
+                Recognition and try again.
+                """
         case .speechDenied:
             "Speech recognition permission denied. Enable it in System Settings → Privacy & Security → Speech Recognition."
         case .speechRestricted:
@@ -125,27 +123,15 @@ public final class VoiceInputCapture {
     private let requestSpeechAuthorization: @MainActor () async -> SFSpeechRecognizerAuthorizationStatus
     private let failureMessage: @Sendable (Error, String) -> String
 
-    // Every concurrent stop caller waits for the same terminal capture result.
-    // The first caller owns finish(); later callers only join this list. Each
-    // waiter is drained exactly once by a final result, failure, or
-    // timeout, so a duplicate UI/hotkey stop cannot observe a transient
-    // partial transcript as a completed phrase.
+    // All stop callers join one terminal result; only the first finishes capture, preventing duplicate stops from treating partial text as final.
     private var stopWaiters: [UUID: ScopedWaiter] = [:]
     private var stopResults: [UUID: VoiceInputStopResult] = [:]
     private var stopInFlight = false
-    // A mounted composer can observe `isListening` and queue its stop task in
-    // the same run-loop turn that the timeout wins. Preserve that terminal
-    // quality until the next capture starts, rather than reclassifying the
-    // retained partial text as a new final result.
+    // Retain terminal quality until the next capture because a queued UI stop can run after timeout in the same run-loop turn.
     private var latestStopResult: VoiceInputStopResult?
-    // The stop timeout armed by stopListeningResult(). Cancelled when the
-    // continuation resolves early (cleanupRecognition) — otherwise a previous
-    // stop's stale timer could resume a LATER stop's continuation with a
-    // truncated transcript.
+    // Cancel the resolved stop's deadline so its stale timer cannot truncate a later capture.
     private var stopTimeoutTask: Task<Void, Never>?
-    // A canceled Task can already be scheduled on the main actor. Bind its
-    // completion to this stop generation so it can never resolve a later
-    // session's continuation.
+    // Match completion to stop generation because an already-scheduled canceled task can still run on MainActor.
     private var stopGeneration: UInt64 = 0
     private var recognitionGeneration: UInt64 = 0
 
@@ -176,8 +162,7 @@ public final class VoiceInputCapture {
         return recognitionGeneration
     }
 
-    /// Exposes whether a stop was final, incomplete, or failed. Composers
-    /// submit only the final transcript; recovery can describe partial capture.
+    /// Only final transcripts may submit; incomplete and failed capture stay available for visible recovery.
     public func stopListeningResult() async -> VoiceInputStopResult {
         guard isListening else { return latestStopResult ?? .final(transcript) }
         let id = UUID(), done = ScopedWaiter()
@@ -244,11 +229,7 @@ public final class VoiceInputCapture {
         resolveStopWaiters(with: result ?? .final(transcript))
     }
 
-    /// Chat, detached chat, and the global voice shortcut each own a
-    /// controller. Keep Speech and AVFoundation cold until one of those
-    /// surfaces actually starts native voice input; constructing them during
-    /// ordinary app/view initialization needlessly loads service state and the
-    /// Speech framework retains per-recognizer internals on macOS.
+    /// Construct Speech and AVFoundation only on capture start so idle chat surfaces retain no unnecessary recognizer or service state.
     private func prepareNativeResourcesIfNeeded() {
         if recognizer == nil {
             recognizer = SFSpeechRecognizer(locale: Locale.current)
@@ -265,7 +246,7 @@ public final class VoiceInputCapture {
     }
 
     private func requestSystemPermission() async -> VoiceInputPermissionResult {
-        // Speech-to-text authorization (separate from microphone access on macOS).
+        // Speech authorization is separate from microphone access on macOS.
         let current = SFSpeechRecognizer.authorizationStatus()
         let speechStatus = current == .notDetermined ? await requestSpeechAuthorization() : current
         switch speechStatus {

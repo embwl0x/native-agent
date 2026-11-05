@@ -10,16 +10,13 @@ import ApplicationServices
 import AppKit
 import os
 #endif
-// Blueprint: | `MacPerceptionCompiler.swift` | `MacPerceptionCompiler`, look frames and handles: graded perception from the existing AX snapshot, redacted readouts and fresh target resolution |
+// Blueprint: | `MacPerceptionCompiler.swift` | `MacPerceptionCompiler`: One AX snapshot supplies graded, redacted perception and stable target handles |
 public enum MacPerceptionCompiler {
-    /// A glance is one line. 220 characters is roughly what fits on a terminal
-    /// row and is ~55 tokens — the whole point of the grade.
+    /// 220 characters fit roughly one terminal row and cost about 55 tokens.
     public static let glanceMaxChars = 220
-    /// Hard byte cap on the FINAL look payload (inner percept + tool envelope).
+    /// Cap the complete delivered payload, including the tool envelope.
     public static let lookByteBudget = 6144
-    /// What a glance may print for a text channel: the compiler-redacted clear
-    /// text when it was let through, nil when redaction withheld it; with no
-    /// compiler verdict (hand-built value) the standalone shape test decides.
+    /// Prose uses approved clear text only; without a compiler verdict, the standalone shape check decides.
     static func displayText(_ raw: String?, json: JSONValue?) -> String? {
         guard let raw else { return nil }
         guard let json else { return safeDisplay(raw) }
@@ -33,15 +30,11 @@ public enum MacPerceptionCompiler {
     public static let maxLandmarkDepth = 6
     /// An affordance's VALUE is a hint, not a document.
     public static let affordanceValueChars = 40
-    /// A readout channel longer than this is the text of the
-    /// window, not the values in it.
+    /// Bound readouts so values cannot become a full window transcript.
     public static let maxReadouts = 12
-    /// The ranking the affordance list is emitted in, named on the
-    /// wire so a caller can tell a ranked list from a document-order one.
+    /// Publish ranking on the wire so callers do not mistake it for document order.
     public static let affordanceRankingName = "controls_first"
-    /// Non-interactive roles that CARRY a value a human reads.
-    /// `AXTextField`/`AXTextArea` are here for the read-only case: when they are
-    /// interactive they are already affordances and are skipped.
+    /// Read-only text fields remain readouts; interactive ones are already affordances.
     public static let readoutRoles: Set<String> = [
         "AXStaticText", "AXHeading", "AXValueIndicator", "AXLevelIndicator",
         "AXProgressIndicator", "AXTextField", "AXTextArea",
@@ -52,19 +45,15 @@ public enum MacPerceptionCompiler {
         "AXRadioButton", "AXTab", "AXLink", "AXMenuItem", "AXComboBox",
         "AXSlider", "AXDisclosureTriangle", "AXIncrementor",
     ]
-    /// Ancestor roles that make anything inside them a CONTROL for ranking:
-    /// a toolbar's contents and a sheet's contents are what she came for.
+    /// Toolbar and sheet descendants rank as controls because they contain the immediate actions.
     public static let controlContainerRoles: Set<String> = [
         "AXToolbar", "AXSheet", "AXMenuBar", "AXMenu",
     ]
-    /// Pick `budget` of `members` (indices into `paths`, in ranked order)
-    /// spread over the tree: where the paths branch, each branch gets an even
-    /// share (a small branch keeps all of its members and its unused share goes
-    /// to the others), recursively. Returns a subset of `members`.
+    /// Share budget recursively across branches so one large subtree cannot crowd out smaller regions.
     static func fairShare(_ members: [Int], paths: [[Int]], budget: Int, depth: Int) -> [Int] {
         guard members.count > budget else { return members }
         guard budget > 0 else { return [] }
-        // Branch on the path component at `depth`; a path that ends here is its own branch.
+        // An ended path forms its own branch so it does not disappear from the budget.
         var order: [Int] = []
         var branches: [Int: [Int]] = [:]
         for member in members {
@@ -88,10 +77,7 @@ public enum MacPerceptionCompiler {
             fairShare(branches[key] ?? [], paths: paths, budget: shares[key] ?? 0, depth: depth + 1)
         }
     }
-    /// Advertises `AXPress`, or is one of the roles that is interactive whether
-    /// or not the app bothered to advertise an action. Same two-family logic as
-    /// `MacScreenViewBuilder.isMarkable`, narrowed: this list is what she can
-    /// ACT on, so scroll containers are landmarks here rather than affordances.
+    /// Interactive roles remain actionable without advertised AXPress; scroll containers remain landmarks rather than controls.
     public static let interactiveRoles: Set<String> = [
         "AXButton", "AXSwitch", "AXSearchField",
         "AXTextField", "AXTextArea", "AXLink", "AXCheckBox", "AXPopUpButton",
@@ -104,8 +90,6 @@ public enum MacPerceptionCompiler {
         if attributes.actions.contains("AXPress") { return true }
         return interactiveRoles.contains(attributes.role)
     }
-    /// role → landmark kind. A window's structure in the vocabulary a human
-    /// would use for it.
     public static let landmarkKinds: [String: String] = [
         "AXToolbar": "toolbar",
         "AXOutline": "sidebar",
@@ -119,10 +103,7 @@ public enum MacPerceptionCompiler {
     public static let modalSubroles: Set<String> = [
         "AXDialog", "AXSystemDialog", "AXSheet",
     ]
-    /// A display string that is safe for the PROSE grade: nil when the redactor
-    /// says the text is itself a secret. The glance has no room for a
-    /// count+digest object, so a secret is simply absent from it and the
-    /// structured grade carries the audit shape.
+    /// Glances omit secret text because prose cannot safely carry a structured count/digest verdict.
     static func safeDisplay(_ text: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -134,17 +115,14 @@ public enum MacPerceptionCompiler {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
-    /// Fields and popups an app names with a separate label (`MacAXAttributeRead.copyLabel`).
     static let captionedRoles: Set<String> = ["AXTextField", "AXComboBox", "AXPopUpButton"]
-    /// "Save As:" → "Save As"; nil when there is no text.
     static func captionText(_ raw: String?) -> String? {
         var text = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasSuffix(":") { text.removeLast() }
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text
     }
-    /// Compile ONE walk into ONE percept. Pure: same snapshot in ⇒ same percept
-    /// out, handles included.
+    /// One snapshot deterministically produces one percept, including handles.
     public static func compile(
         snapshot: MacAXTreeSnapshot,
         secretContext: MacScreenViewTextRedaction.NodeSecretContext,
@@ -152,8 +130,7 @@ public enum MacPerceptionCompiler {
         windowTitle: String?,
         focusPath: [Int]? = nil,
         maxAffordances: Int = MacPerceptionCompiler.maxAffordances,
-        /// The act's identity check: the element at a handle's path is judged
-        /// against the whole walk, never against which controls a cap kept.
+        /// Identity checks need the whole walk, not the subset retained by presentation caps.
         uncapped: Bool = false
     ) -> MacLookPercept {
         let cap = uncapped ? Int.max : max(1, min(maxAffordances, MacPerceptionCompiler.maxAffordances))
@@ -186,18 +163,11 @@ public enum MacPerceptionCompiler {
         for node in ordered where !node.path.isEmpty {
             childrenByParent[Array(node.path.dropLast()), default: []].append(node)
         }
-        // The identity of a TITLE-LESS container, from the text it
-        // contains two levels down (Finder's shape is AXRow > AXCell >
-        // AXStaticText). The row's OWN text, all of it: a child control's
-        // label ("Delete" in every row) is skipped and the whole text is
-        // hashed, so two records sharing a sender, a prefix or a button stay
-        // distinct. A recycled row that shows another record is a new handle.
+        // Hash the untitled row’s own complete text, excluding child controls, so shared prefixes and buttons cannot merge records.
         func contentName(of node: MacAXNode) -> String? {
             let attributes = node.attributes
             guard MacLookHandle.contentIdentityRoles.contains(attributes.role) else { return nil }
-            // Rule 2 is untouched for anything with a name of its own, and for
-            // any CONTROL whose value IS its label — the popup button reading
-            // "Medium" then "Large" must keep one handle.
+            // Named controls keep identity across value changes such as a popup switching from Medium to Large.
             guard cleaned(attributes.title) == nil else { return nil }
             guard !(isInteractive(attributes) && cleaned(attributes.value) != nil) else { return nil }
             var texts: [String] = []
@@ -217,7 +187,6 @@ public enum MacPerceptionCompiler {
         var ancestorLabelByPath: [[Int]: String] = [:]
         var contentNameByPath: [[Int]: String] = [:]
         for node in ordered {
-            // Compute content explicitly only for untitled nodes, keeping coalescing at String?.
             let title = cleaned(node.attributes.title)
             let content = title == nil ? contentName(of: node) : nil
             let label: String? = title ?? content
@@ -236,24 +205,16 @@ public enum MacPerceptionCompiler {
             }
             return chain
         }
-        // 1. Handles for EVERY node, in document order, so the focused element
-        //    and an affordance agree on one identity. Ordinals are assigned by
-        //    rendered TOKEN, which makes a hash collision between two distinct
-        //    fingerprints a disambiguated pair rather than a silent merge.
-        //
-        //    THIS PASS RUNS BEFORE RANKING and over document order, so the
-        //    controls-first ordering below can never change a handle.
+        // Mint handles before ranking in document order so presentation cannot move identity. Disambiguate rendered-token collisions as ordinals rather than
+        // silently merging distinct fingerprints.
         let tokens = ordered.map { node in
             MacLookHandle.token(
                 fingerprint: MacLookHandle.fingerprint(
                     role: node.attributes.role,
                     subrole: node.attributes.subrole,
-                    // TITLE only — never the value. A field whose contents
-                    // change is still the same field.
+                    // Changing a field’s value must not change its handle.
                     title: cleaned(node.attributes.title),
                     ancestors: ancestors(of: node.path),
-                    // Already computed once above; `fingerprint` ignores it for
-                    // titled nodes anyway.
                     contentName: contentNameByPath[node.path]
                 )
             )
@@ -264,8 +225,7 @@ public enum MacPerceptionCompiler {
             handleByPath[node.path] = minted.handle
             ambiguityByPath[node.path] = minted.ambiguity
         }
-        // Repeated tokens remain actionable and explicitly report their positional ambiguity.
-        // 2. Affordances, landmarks, unlabeled census — one pass.
+        // Repeated tokens stay actionable with explicit positional ambiguity.
         var affordances: [MacLookAffordance] = []
         var landmarks: [MacLookLandmark] = []
         var unlabeled: [String: Int] = [:]
@@ -277,7 +237,6 @@ public enum MacPerceptionCompiler {
         for node in ordered {
             let attributes = node.attributes
             let depth = node.path.count + 1
-            // Landmark?
             if let kind = landmarkKinds[attributes.role], depth <= maxLandmarkDepth {
                 if landmarks.count < maxLandmarks {
                     let label = cleaned(attributes.title)
@@ -308,7 +267,7 @@ public enum MacPerceptionCompiler {
                     enabled: attributes.enabled
                 ))
             }
-            // Modal? The ROOT is never a modal — it is the window itself.
+            // The root window is not its own modal.
             if modal == nil, !node.path.isEmpty {
                 let isSheet = attributes.role == "AXSheet" || attributes.subrole == "AXSheet"
                 let isDialog = attributes.subrole == "AXDialog" || attributes.subrole == "AXSystemDialog"
@@ -325,7 +284,7 @@ public enum MacPerceptionCompiler {
                     )
                 }
             }
-            // Collect read-only candidates; dedupe/rank/cap after the affordance list is final.
+            // Defer readout deduplication, ranking and capping until affordances are final.
             if !isInteractive(attributes) {
                 let value = cleaned(attributes.value)
                 let isReadoutRole = readoutRoles.contains(attributes.role)
@@ -353,28 +312,17 @@ public enum MacPerceptionCompiler {
                 label = title
                 labelSource = "title"
             } else if let value {
-                // A popup button / tab publishes its own state as its name.
-                // Nearby-text inference is deliberately NOT run here: it needs
-                // the capture geometry `mac_view` has and a look does not, and
-                // a guessed label that costs a second AX pass is not "trivially
-                // available".
+                // Popups and tabs publish their own state; nearby-label inference needs capture geometry and must not add a second AX pass.
                 label = value
                 labelSource = "value"
             } else {
-                // A missing AX name is not a reason to throw a visible,
-                // interactive control away. Keep its stable look handle and
-                // let the one fused screen/target model publish `button 2`,
-                // `text area 1`, and similar role ordinals. The empty label is
-                // intentional: it renders as ⟨unlabeled⟩ and never masquerades
-                // as an invented name.
+                // Unlabeled controls keep stable handles and role ordinals; absence of a name cannot justify dropping or inventing one.
                 label = ""
                 labelSource = "unlabeled"
                 unlabeled[attributes.role, default: 0] += 1
             }
             if labelSource != "unlabeled", labelSource != "unreadable" { labeledCount += 1 }
-            // NO CAP HERE: the cap is applied AFTER ranking, so
-            // "the 60 rows we kept" are the 60 most useful rows and not the
-            // first 60 in document order (Finder's filenames, every time).
+            // Rank before capping so useful controls survive instead of merely the first document-order rows.
             let shownValue = labelSource == "value" ? nil : value
             affordances.append(MacLookAffordance(
                 handle: handleByPath[node.path] ?? "",
@@ -392,11 +340,9 @@ public enum MacPerceptionCompiler {
                 selected: attributes.selected,
                 frame: attributes.frame,
                 path: node.path,
-                // A value-derived label IS a value: redact it as one (under no
-                // caption of its own). A title is redacted as a title.
+                // A value-derived label requires value redaction, not title redaction.
                 labelJSON: redacted(label, of: node, under: nil, isValue: labelSource == "value"),
-                // The control's own title is the value's caption — the "CVV"
-                // box showing `123`, the "API key" field showing the key.
+                // A control’s title captions its value, protecting fields such as CVV and API key.
                 valueJSON: shownValue.map { redacted($0, of: node, under: title, isValue: true) },
                 handleAmbiguity: ambiguityByPath[node.path],
                 placeholder: cleaned(attributes.placeholder),
@@ -404,12 +350,7 @@ public enum MacPerceptionCompiler {
                 state: attributes.state
             ))
         }
-        // 2b. RANK, THEN CAP. Controls — buttons, menus, popups,
-        //     checkboxes, radios, tabs, links, and anything inside a toolbar or
-        //     a sheet — come before row CONTENT (the rename-able filename in
-        //     every Finder row). Document order is preserved WITHIN a tier, and
-        //     handles were minted in the pass above, so nothing here can move a
-        //     handle.
+        // Controls outrank row content, preserving document order within tiers and the handles already minted.
         func rankTier(_ affordance: MacLookAffordance) -> Int {
             if controlRoles.contains(affordance.role) { return 0 }
             for depth in 0..<affordance.path.count {
@@ -428,10 +369,7 @@ public enum MacPerceptionCompiler {
         affordances = (ranked[0] ?? []) + (ranked[1] ?? [])
         if affordances.count > cap {
             omitted = affordances.count - cap
-            // Share the cap across regions in tier order, retaining ranked order among survivors.
-            // Never shared out: the focused control, a selected one, and
-            // anything in a dialog or sheet. A lone modal button must not lose
-            // its slot to a busy branch.
+            // Share regional caps in tier order, but reserve focused, selected and modal controls so busy branches cannot crowd them out.
             func protected(_ affordance: MacLookAffordance) -> Bool {
                 if affordance.path == focusPath || affordance.selected == true { return true }
                 return (0..<affordance.path.count).contains { depth in
@@ -452,9 +390,7 @@ public enum MacPerceptionCompiler {
             }
             affordances = affordances.indices.filter { kept.contains($0) }.map { affordances[$0] }
         }
-        // 3. Focus — only when the source could actually tell us. An absent
-        //    focus is reported as absent, never guessed at from "the first text
-        //    field", which is how a look starts lying about where the cursor is.
+        // Absent focus remains unknown; guessing the first field would fabricate cursor location.
         var focus: MacLookFocus?
         if let focusPath, let node = byPath[focusPath] {
             let title = cleaned(node.attributes.title)
@@ -464,10 +400,7 @@ public enum MacPerceptionCompiler {
                 label: label,
                 handle: handleByPath[focusPath],
                 path: focusPath,
-                // A focused field's VALUE is the thing most likely to be the
-                // secret (the cursor is in the password box). When the label
-                // fell back to the value, the node has no title to caption it,
-                // so its secure role and the surrounding context decide.
+                // Value-derived labels have no title caption; secure role and surrounding context must protect focused secrets.
                 labelJSON: label.map { redacted($0, of: node, under: nil, isValue: title == nil) },
                 selectionRange: node.attributes.selectionRange,
                 enabled: node.attributes.enabled
@@ -475,13 +408,7 @@ public enum MacPerceptionCompiler {
         }
         let rootNode = byPath[[]]
         let title = cleaned(windowTitle)
-        // 4. READOUTS — dedupe hard, then rank, then cap.
-        //
-        //    Without the dedupe this channel becomes a second tree: a button's
-        //    own AXStaticText child says exactly what the button says, and a
-        //    sheet's message is already the modal's label. A control's text is
-        //    the readout inside it or its caption beside it, never the same
-        //    words elsewhere: Calculator's display reading "1" is not the "1" key.
+        // Deduplicate readouts against their own control or nearby caption, never equal words elsewhere on screen.
         func normalizedText(_ text: String) -> String {
             text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
@@ -527,11 +454,7 @@ public enum MacPerceptionCompiler {
                 path: candidate.node.path,
                 nearFocus: tier == 1,
                 inModal: tier == 0,
-                // A readout is a VALUE. Same compile-time redactor, same full
-                // node context (standalone shape, enclosing secret-naming group,
-                // the caption beside/above) as every affordance channel — a
-                // readout channel that bypassed this would ship the password
-                // the login sheet is displaying.
+                // Readouts are values and need the same full-context redaction as affordances to avoid leaking displayed secrets.
                 textJSON: redacted(
                     candidate.text,
                     of: candidate.node,
@@ -572,10 +495,7 @@ public enum MacPerceptionCompiler {
                 + readouts.filter(\.handleAmbiguous).count
         )
     }
-    /// A sheet often has no title of its own; its message is the first static
-    /// text inside it. Naming it from there is what makes the MODAL segment of
-    /// a glance useful instead of "MODAL: AXSheet". Returns the NODE so the
-    /// caller can redact the message under that node's own frame/context.
+    /// Untitled sheets use their first static message; return its node so redaction retains the message’s own context.
     private static func firstStaticText(under path: [Int], in ordered: [MacAXNode]) -> MacAXNode? {
         for node in ordered where node.path.count > path.count && Array(node.path.prefix(path.count)) == path {
             guard node.attributes.role == "AXStaticText" else { continue }

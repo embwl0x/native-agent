@@ -2,10 +2,9 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions` struct; `developerModePatchBody`, `saveMemoryPolicy`, `saveAgentAccessMode`; `saveMacControlPolicy` patches edited fields and checks their baseline inside the policy lock |
+// Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions`, `developerModePatchBody`, `saveMemoryPolicy`, `saveAgentAccessMode`, `saveMacControlPolicy` |
 
 
-/// Operator choices mapped to the canonical checked TrustCenter writer.
 public struct TrustPolicyActions: Sendable {
     private let dataRoot: URL
 
@@ -17,19 +16,7 @@ public struct TrustPolicyActions: Sendable {
         try await TrustPolicyToolWriter.applyTrustPolicyPatch(body: body, dataRoot: dataRoot)
     }
 
-    public func saveWorkshopPolicyToggle(enabled: Bool? = nil) async throws -> TrustPolicy {
-        var patch: [String: Any] = [:]
-        if let enabled { patch["enabled"] = enabled }
-        return try await postTrustWrite(body: [WorkshopPolicyBlockVocabulary.wireKey: patch])
-    }
-
-    /// The Developer Mode toggle is an operator-facing, restart-applied policy
-    /// change. Keep its persistence separate from changing Full Mac access.
-    ///
-    /// The same patch also keeps the dependent shell and
-    /// system-control gates coherent on the next launch. Deep merge preserves
-    /// all unrelated Trust Center policy and canonical normalization remains
-    /// the final authority.
+    /// Developer Mode applies on restart independently of Full Mac; patch dependent shell/system gates without replacing unrelated policy.
     public static func developerModePatchBody(enabled: Bool) -> [String: Any] {
         [
             "developerMode": enabled,
@@ -38,20 +25,6 @@ public struct TrustPolicyActions: Sendable {
                 "system_control_allowed": enabled,
             ],
         ]
-    }
-
-    public func saveMultimodalPolicy(_ policy: TrustMultimodalPolicy) async throws -> TrustPolicy {
-        let body: [String: Any] = [
-            "multimodalPolicy": [
-                "screen_capture": policy.screen_capture,
-                "vision_api_calls": policy.vision_api_calls,
-                "file_ingestion_pdf": policy.file_ingestion_pdf,
-                "file_ingestion_docx": policy.file_ingestion_docx,
-                "image_generation_openai": policy.image_generation_openai,
-                "tts_openai": policy.tts_openai,
-            ]
-        ]
-        return try await postTrustWrite(body: body)
     }
 
     public func saveEnableAutonomy(_ enabled: Bool) async throws -> TrustPolicy {
@@ -64,8 +37,6 @@ public struct TrustPolicyActions: Sendable {
         ])
     }
 
-    /// Security Center's "Pause everything": `securityPolicy.killSwitchEnabled`,
-    /// deep-merged through the one trust-write chokepoint.
     public func saveKillSwitchEnabled(_ enabled: Bool) async throws -> TrustPolicy {
         try await postTrustWrite(body: [
             "securityPolicy": ["killSwitchEnabled": enabled]
@@ -94,9 +65,7 @@ public struct TrustPolicyActions: Sendable {
         return try await postTrustWrite(body: ["memoryPolicy": memoryPolicy])
     }
 
-    /// Save only edited fields. Compare their original values with the current
-    /// effective policy inside the canonical writer's lock; a conflicting edit
-    /// leaves the policy untouched, and unrelated concurrent choices survive.
+    /// Compare edited-field baselines under the canonical write lock so conflicts refuse while unrelated choices survive.
     public func saveMacControlPolicy(
         _ policy: MacControlPolicyWireSnapshot,
         comparedTo baseline: MacControlPolicyWireSnapshot,

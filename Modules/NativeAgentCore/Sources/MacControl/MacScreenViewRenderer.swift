@@ -14,15 +14,7 @@ import AppKit
 
 #if canImport(CoreGraphics) && canImport(CoreText) && os(macOS)
 
-/// Set-of-marks renderer.
-///
-/// LEGIBILITY IN BOTH THEMES, deterministically: every stroke is drawn twice —
-/// a thick WHITE halo underneath and a thin BLACK line on top — so the marker
-/// survives a white background and a black one without sampling the pixels
-/// underneath (sampling would make the output depend on the screen's content,
-/// which is exactly the non-determinism a set-of-marks image must not have).
-/// The number badge is the same sandwich: white plate, black border, black
-/// digits.
+/// White halos under black strokes keep markers legible in both themes without content-dependent pixel sampling.
 public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
     public init() {}
 
@@ -57,8 +49,7 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
             context.fill(CGRect(x: rect.x, y: Double(height) - rect.y - rect.h, width: rect.w, height: rect.h).integral)
         }
 
-        // Marker scale: tie the badge to the IMAGE's own size so a 1x window
-        // capture and a 2x retina capture look the same to the eye.
+        // Scale badges with image size so 1x and Retina captures appear equivalent.
         let unit = max(1.0, Double(min(width, height)) / 400.0)
         let lineWidth = max(1.0, 1.5 * unit)
         let fontSize = max(9.0, 9.0 * unit)
@@ -68,8 +59,7 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
             let x = placement.x * factor
             let w = max(1.0, placement.w * factor)
             let h = max(1.0, placement.h * factor)
-            // Placements are top-left origin (image space); CGContext is
-            // bottom-left. Flip once, here, at the boundary.
+            // Flip once at the boundary from top-left image coordinates to bottom-left CGContext coordinates.
             let y = Double(height) - (placement.y * factor) - h
             let rect = CGRect(x: x, y: y, width: w, height: h)
 
@@ -114,8 +104,7 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
         let padding = 2.0 * unit
         let plateWidth = max(fontSize, textBounds.width) + padding * 2
         let plateHeight = fontSize + padding * 2
-        // Badge sits just ABOVE the element's top-left corner, tucked back
-        // inside the image when the element is flush with an edge.
+        // Keep above-corner badges inside the image when elements touch an edge.
         var plate = CGRect(
             x: anchor.x,
             y: anchor.y,
@@ -153,8 +142,7 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
 
 #endif
 
-/// Platform fallback: no renderer, reported as an encode failure rather than a
-/// blank image.
+/// Unsupported rendering reports encode failure rather than a blank image.
 public struct UnavailableMacScreenImageRenderer: MacScreenImageRenderer {
     public init() {}
     public func renderPNG(

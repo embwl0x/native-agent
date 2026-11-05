@@ -4,7 +4,6 @@ import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `SecurityCenter+Models.swift` | `SecurityToolDecision` enum; `PairedPhoneAuthority` checked pairing reader |
 
-/// Checked paired-phone authority shared by pairing and security status.
 public enum PairedPhoneAuthority {
     public struct Phone: Codable, Identifiable, Sendable {
         public enum Status: String, Codable, Sendable { case pending, paired, removed }
@@ -60,14 +59,7 @@ public enum SecurityToolDecision: String, Codable, Sendable, Equatable {
     case block
 }
 
-/// Result of the one checked Full Mac YOLO authority read.
-///
-/// `.admitted` is deliberately narrow: the saved Full Mac grant is active,
-/// the concrete conversation origin is local or has been authenticated by its
-/// canonical remote surface. Callers may use that state to flatten per-call
-/// ask/confirm policy into allow. It never authorizes a SecurityCenter
-/// `.block` or a domain-owned boundary such as protected roots, disabled
-/// integrations, or macOS TCC.
+/// Origin-checked Full Mac may flatten ask/confirm, never explicit blocks or domain-owned boundaries such as TCC.
 public enum FullMacYoloAuthorityState: String, Codable, Sendable, Equatable {
     case admitted
     case inactive
@@ -89,22 +81,16 @@ public struct FullMacYoloAuthorityAssessment: Codable, Sendable, Equatable {
     public var admitted: Bool { state == .admitted }
 }
 
-/// How an agent NativeAgent drives (Codex, Claude Code) is launched for one
-/// request. Only `SwiftNativeSecurityCenter.drivenAgentLaunchPermission`
-/// produces it, and every launch sends its values explicitly — a restricted
-/// launch never inherits a thread default or a saved CLI setting, so a Trust
-/// downgrade governs the very next turn.
+/// Every driven-agent launch uses explicit checked values so a downgrade cannot inherit broader thread or CLI defaults.
 public enum DrivenAgentLaunchPermission: Sendable, Equatable {
     case fullMac
     case restricted
-    /// No launch at all.
     case denied(reason: String)
 
     public var codexSandbox: String { self == .fullMac ? "danger-full-access" : "workspace-write" }
     /// Unattended: nobody is there to answer an approval either way.
     public var codexApprovalPolicy: String { "never" }
 
-    /// The same values as command-line arguments for that CLI.
     public func arguments(_ flags: AgentHostCommandLine.PermissionFlags) -> [String] {
         switch flags {
         case .codex: return ["-c", "sandbox_mode=\"\(codexSandbox)\"", "-c", "approval_policy=\"\(codexApprovalPolicy)\""]
@@ -204,19 +190,14 @@ public struct SecurityToolEnvelope: Codable, Sendable, Equatable, Identifiable {
     public var autonomyReason: String? = nil
     public var remedy: JSONValue? = nil
 
-    /// Canonical effect truth derived from the same capability vocabulary used
-    /// by Security Center. Presentation layers must not maintain a second,
-    /// partial write list: doing so can make a correctly profiled mutation look
-    /// like a read-only command.
+    /// Derive effects from the same capability vocabulary as authorization so presentation cannot mislabel mutations as reads.
     public var hasSideEffects: Bool {
         SecurityCapabilityClassifier.hasSideEffects(capabilities)
     }
 }
 
 public enum SecurityCapabilityClassifier {
-    /// Capabilities that can change app state, host state, remote state, or a
-    /// user's visible environment. Sensitivity-only tags such as `secrets` and
-    /// read tags such as `network_read` intentionally stay out of this set.
+    /// Sensitivity and read tags do not imply mutation of app, host, remote or visible state.
     public static let sideEffecting: Set<String> = [
         "agent_delegate",
         "approval_stage",
@@ -226,8 +207,8 @@ public enum SecurityCapabilityClassifier {
         "clipboard_write",
         "destructive",
         "external_send",
-        "file_write",          // normalized policy vocabulary
-        "filesystem_delete",   // canonical tool-profile vocabulary
+        "file_write",
+        "filesystem_delete",
         "filesystem_write",
         "image_generation",
         "ledger_write",
@@ -245,7 +226,6 @@ public enum SecurityCapabilityClassifier {
         "skill_write",
         "system_control",
         "system_permission_reset",
-        "workshop_write",
     ]
 
     public static func hasSideEffects(_ capabilities: [String]) -> Bool {

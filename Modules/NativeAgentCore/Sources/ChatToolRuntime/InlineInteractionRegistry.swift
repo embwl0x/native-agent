@@ -8,31 +8,18 @@ import ProviderRouting
 import TrustCenter
 // Blueprint: | `InlineInteractionRegistry.swift` | `InlineInteractionRegistry` enum; `connectorSetup`, `canonicalConnectorID` |
 
-/// Turns a canonical ID into a card, without any per-service code.
-///
-/// Everything here is DERIVED from a registry that already exists for its own
-/// reasons — the connector registry on disk, `MacIntegrationID`, the Providers
-/// group table, the trust-policy capability catalog. Connector setup uses
-/// the registry and Shared's field vocabulary without renderer branches.
-/// An id no registry knows produces an `unavailable`
-/// descriptor, which the card renders as a statement rather than a dead
-/// control.
-///
-/// The one thing a registry cannot derive is HOW an account is set up
-/// (a pasted token, or no setup flow here). That table lives here, once, and
-/// `ConnectorWizardSetupRoute` reads it instead of holding its own copy.
+/// Derive cards from checked connector, integration, provider and capability owners so labels and permissions do not drift. Unknown IDs render unavailable
+/// text, never dead controls. Setup routes live here once and are shared with the wizard.
 public enum InlineInteractionRegistry {
 
     // MARK: - Connector setup routes
-    //
-    // The wizard and card share setup routes. Slack and Telegram use pasted tokens.
+    // Keep setup routes shared by wizard and cards so token setup cannot diverge.
 
     public enum ConnectorSetup: String, Sendable, Equatable {
         case manualToken
         case unavailable
     }
 
-    /// Canonical connector id → how it is set up.
     public static func connectorSetup(for rawID: String) -> ConnectorSetup {
         switch canonicalConnectorID(rawID) {
         case "slack", "telegram":
@@ -49,7 +36,6 @@ public enum InlineInteractionRegistry {
 
     // MARK: - Descriptors
 
-    /// The descriptor for one need, derived from its checked owner.
     public static func descriptor(
         kind: InlineInteraction.Kind,
         target: String,
@@ -88,26 +74,18 @@ public enum InlineInteractionRegistry {
             )
 
         case .permission:
-            // EVERY capability this card would grant, not just the one it is
-            // named after. A need can carry a chain (`also_needed`), and the
-            // grant writes all of them — so a descriptor derived from the
-            // primary alone offers a live grant button for a chain whose OTHER
-            // half the posture forbids, and the write lands as a latent allow
-            // that switches on the day the person moves to Full Mac.
+            // Check the whole also_needed chain; granting only the primary's permitted category could leave a forbidden latent allow.
             let targets = ([target] + additionalTargets).filter { !$0.isEmpty }
             let known = !targets.isEmpty && targets.allSatisfy {
                 MacIntegrationID.all.contains($0) || isMacControlCategory($0)
                     || SystemPermissionPreflight.cardSettingsCapability($0) != nil
             }
-            // User's fence, in code: Safe and Workspace are the person's own
-            // standing posture and no card may move it. When the posture
-            // forbids the whole category, the card says so and the only thing
-            // it offers is the page where that decision actually lives.
+            // Cards cannot change the person's saved posture; a forbidden category offers only its owning settings page.
             let posturePermits: Bool
             do {
                 if known && targets.contains(where: isMacControlCategory) {
                     let policy = try macControlPolicySnapshot(dataRoot: dataRoot)
-                    posturePermits = policy.trustPolicy.map(MacControlGate.fullMacActive) ?? false
+                    posturePermits = policy.trustPolicy.map { PermissionLaw.posture($0) == .fullMac } ?? false
                 } else {
                     posturePermits = true
                 }
@@ -129,9 +107,8 @@ public enum InlineInteractionRegistry {
                 control: control,
                 // A macOS permission prompt happens on the Mac, by the person.
                 location: .macRequired,
-                unavailableReason: known ? nil : "No such Mac capability on this build. macOS permissions here: "
-                    + SystemPermissionCapability.requestable
-                    + " (permissions.request takes the name, card.request privacy:<name>); Automation is applescript:<bundle_id>."
+                unavailableReason: known ? nil : "No such Mac capability on this build. A macOS grant is privacy:<grant>, grant one of "
+                    + SystemPermissionCapability.requestable + "; Automation for one app is applescript:<bundle_id>."
             )
 
         case .modelChoice:
@@ -147,8 +124,7 @@ public enum InlineInteractionRegistry {
             )
 
         case .apiKey where target.hasPrefix("secret:"):
-            // A keyring secret one of her abilities names: no registry knows
-            // it, and none needs to. The person grants it once.
+            // A keyring secret one of the agent's abilities names: no registry knows it, and none needs to. The person grants it once.
             let name = String(target.dropFirst("secret:".count))
             return InlineInteractionDescriptor(
                 kind: .apiKey, target: target, displayName: name, icon: "key",
@@ -175,8 +151,7 @@ public enum InlineInteractionRegistry {
                 target: target,
                 displayName: flag?.displayName ?? target,
                 icon: "switch.2",
-                // NOT a universal flag writer: only catalogued,
-                // user-configurable flags have a control.
+                // NOT a universal flag writer: only catalogued, user-configurable flags have a control.
                 control: flag == nil ? .unavailable : .capabilityFlag,
                 location: .anywhere,
                 unavailableReason: flag == nil
@@ -207,40 +182,34 @@ public enum InlineInteractionRegistry {
 
     // MARK: - Display names
 
-    /// From `connectors/registry.json` — the same catalog Connectors renders.
-    /// A connector added there is named correctly here with no code change.
+    /// Use the connector catalog's display name so new entries need no renderer branch.
     public static func connectorDisplayName(_ id: String, dataRoot: URL) -> String {
         let canonical = canonicalConnectorID(id)
         do {
             let rows = try ConnectorOAuthRegistry.readRegistry(at: ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot))
             if let row = rows.first(where: { $0["id"]?.stringValue == canonical }),
                let name = row["name"]?.stringValue, !name.isEmpty { return name }
-            // No registered display name is an optional fact, not a reason to
-            // manufacture a second name. The exact connector ID is usable.
+            // No registered display name is an optional fact, not a reason to manufacture a second name. The exact connector ID is usable.
             return canonical
         } catch {
             return "\(canonical) (registry name unavailable: \(error.localizedDescription); repair connectors/registry.json)"
         }
     }
 
-    /// Mac Integration ids own their display names; the five Mac Control
-    /// approval categories carry Trust's own titles.
+    /// Mac Integration ids own their display names; the five Mac Control approval categories carry Trust's own titles.
     public static func macCapabilityDisplayName(_ id: String) -> String {
         if id.hasPrefix("privacy:"), let gate = SystemPermissionPreflight.cardSettingsCapability(id) { return gate.displayName }
         if MacIntegrationID.all.contains(id) {
             return MacIntegrationID.displayName(for: id)
         }
         if let bundleID = AppleScriptExecution.automationTarget(id) { return "Automation for \(bundleID)" }
-        // The card names the thing being allowed ("File access"), not the
-        // switch's own row title in Trust ("File changes") — a read that says
-        // "File changes" reads as a lie to the person granting it.
+        // Name the access being granted so a read permission never appears to authorize only changes.
         if let noun = macControlCategoryGrantNouns[id] {
             return noun.prefix(1).uppercased() + noun.dropFirst()
         }
         return macControlCategoryTitles[id] ?? titleCased(id)
     }
 
-    /// Trust's own wording for the Mac Control categories (MacControlPermissions).
     static let macControlCategoryTitles: [String: String] = [
         "shell": "Terminal commands",
         "file_ops": "File changes",
@@ -252,9 +221,7 @@ public enum InlineInteractionRegistry {
         "spotlight": "Spotlight search",
     ]
 
-    /// The noun a grant is phrased with: "Allow file access", not "Allow File
-    /// changes". Trust's own titles name the SWITCH; a card names the thing the
-    /// person is allowing.
+    /// Use access nouns on grant cards; switch titles describe settings rather than the permission being requested.
     static let macControlCategoryGrantNouns: [String: String] = [
         "shell": "terminal commands",
         "file_ops": "file access",
@@ -266,45 +233,38 @@ public enum InlineInteractionRegistry {
         "spotlight": "Spotlight search",
     ]
 
-    /// True when `id` is one of Trust's Mac Control approval categories rather
-    /// than a MacIntegration capability. The two are granted by DIFFERENT
-    /// owners, which is the whole reason this question is asked.
+    /// Mac Control and MacIntegration grants have different owners; resolve the category before writing.
     public static func isMacControlCategory(_ id: String) -> Bool {
         macControlCategoryTitles[id] != nil
     }
 
-    /// Whether the SAVED Trust posture permits Mac Control categories at all.
-    ///
-    /// Read through Trust's checked saved-policy owner and MacControl's gate, so
-    /// the card cannot disagree with the thing that will refuse the call. Under
-    /// Safe or Workspace this is false, and no per-category switch would take
-    /// effect even if one were written — so the card must not offer to write one.
+    /// Read saved policy and the MacControl gate so cards cannot offer writes that the active posture would refuse.
     public static func macControlPostureAllowsCategories(dataRoot: URL) throws -> Bool {
         let policy = try macControlPolicySnapshot(dataRoot: dataRoot)
         guard let trust = policy.trustPolicy
         else { return false }
-        return MacControlGate.fullMacActive(trust)
+        return PermissionLaw.posture(trust) == .fullMac
     }
 
-    /// Whether the saved policy already allows a category — the same question
-    /// the dispatch gate asks, so a settled card and a working call agree.
+    /// Whether the saved policy already allows a category — the same question the dispatch gate asks, so a settled card and a working call agree.
     public static func macControlCategoryAllowed(_ category: String, dataRoot: URL) throws -> Bool {
         let policy = try macControlPolicySnapshot(dataRoot: dataRoot)
-        guard let trust = policy.trustPolicy, MacControlGate.fullMacActive(trust) else {
+        guard let trust = policy.trustPolicy, PermissionLaw.posture(trust) == .fullMac else {
             return false
         }
         return MacControlGate.gate(policy, category: category).allowed
     }
 
     static func macControlPolicySnapshot(dataRoot: URL) throws -> MacControlPolicy {
-        switch SavedTrustPolicyAuthority.read(dataRoot: dataRoot) {
-        case .absent:
-            return .fromTrustPolicyObject([:], dataRoot: dataRoot)
-        case .present(let root):
+        do {
+            let root = try SwiftNativeTrustCenter(dataRoot: dataRoot).loadSavedPolicyChecked()
             return .fromTrustPolicyObject(root, dataRoot: dataRoot)
-        case .damaged:
-            let path = SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot).path
-            throw ToolFailureError("Saved Trust policy at \(path) could not be read or validated. Preserve the damaged file and ask the owner to repair it in Trust > Access and policy.",
+        } catch {
+            let path = SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot).path
+            throw ToolFailureError("""
+                Saved Trust policy at \(path) could not be read or validated. Preserve the damaged file and ask the owner to repair it in Trust > \
+                Access and policy.
+                """,
                 effects: .none, owner: path,
                 tap: "Trust > Access and policy > Preserve damaged policy and authorize Safe",
                 code: "trust_policy_unavailable",
@@ -331,9 +291,7 @@ public enum InlineInteractionRegistry {
 
     // MARK: - Providers you sign into
 
-    /// The spellings an agent reaches for, folded onto the ids Providers and
-    /// ProviderRouting use. xAI has no API-key provider on this build, so
-    /// `xai` IS the sign-in one.
+    /// Use ProviderRouting's sign-in IDs; xai denotes the sign-in provider, not an API-key route.
     public static func canonicalProviderID(_ rawID: String) -> String {
         switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "chatgpt", "openai_codex_oauth", "openai_oauth", "codex_oauth": return "openai_oauth_direct"
@@ -343,10 +301,7 @@ public enum InlineInteractionRegistry {
         }
     }
 
-    /// A provider with a "Sign in with …" flow — the one onboarding's buttons
-    /// run. `oauthProviderID` is what `NativeOAuthFlow` signs into;
-    /// `pasteLabel` names what the card's field takes instead, or nil when
-    /// signing in is the only way in.
+    /// Sign-in cards must use onboarding's OAuth owner; offer paste fields only when that provider supports them.
     public struct ProviderSignIn: Sendable, Equatable {
         public var oauthProviderID: String
         public var displayShort: String
@@ -365,7 +320,6 @@ public enum InlineInteractionRegistry {
             return ProviderSignIn(oauthProviderID: "anthropic_oauth_direct", displayShort: "Claude",
                                   pasteLabel: "or paste an API key")
         case "anthropic_oauth_direct":
-            // Claude's other way in is a `claude setup-token` paste.
             return ProviderSignIn(oauthProviderID: "anthropic_oauth_direct", displayShort: "Claude",
                                   pasteLabel: "or paste a setup token (claude setup-token)")
         case "xai_oauth_direct":
@@ -378,14 +332,10 @@ public enum InlineInteractionRegistry {
 
     // MARK: - Capability catalog
 
-    /// The user-configurable capability flags, with the trust-policy path each
-    /// one writes. This IS the catalog: a flag absent from here has no control
-    /// and cannot be switched on by raising a card, which is what keeps
-    /// `needs_capability` from becoming a universal flag writer.
+    /// Only catalogued user-configurable capability flags may have controls; needs_capability must not become a universal policy writer.
     public struct CapabilityFlag: Sendable, Equatable {
         public var id: String
         public var displayName: String
-        /// Trust policy block, then key inside it.
         public var policyBlock: String
         public var policyKey: String
         public var why: String
@@ -406,13 +356,6 @@ public enum InlineInteractionRegistry {
             policyKey: "screen_capture",
             why: "Reading your screen " + InlineInteraction.ConsequenceCopy.trustSwitchedOff
         ),
-        "vision_api_calls": CapabilityFlag(
-            id: "vision_api_calls",
-            displayName: "Image understanding",
-            policyBlock: "multimodalPolicy",
-            policyKey: "vision_api_calls",
-            why: "Looking at images " + InlineInteraction.ConsequenceCopy.trustSwitchedOff
-        ),
         "tts": CapabilityFlag(
             id: "tts",
             displayName: "Speech",
@@ -423,11 +366,7 @@ public enum InlineInteractionRegistry {
     ]
 
     // MARK: - Builders
-    //
-    // One place that writes the prose, so every card in the app says the same
-    // KIND of thing: one title, one sentence of why, a real primary label, and
-    // — Agent's rule — what happens if you say no. A need with no decline
-    // consequence cannot be constructed.
+    // All cards need an outcome, a reason, a primary action and a decline consequence; construction requires the consequence.
 
     public static func connector(
         _ rawID: String,
@@ -443,7 +382,6 @@ public enum InlineInteractionRegistry {
             target: id,
             title: "Connect \(name)",
             why: why,
-            // The primary action names the connection outcome.
             primaryActionLabel: "Connect \(name)",
             declineConsequence: declineConsequence
                 ?? "Without \(name) I can't do this part, and " + InlineInteraction.ConsequenceCopy.connectorCarryOn,
@@ -455,10 +393,7 @@ public enum InlineInteractionRegistry {
         )
     }
 
-    /// One need, every capability it covers. Agent's rule: when the checker
-    /// can know a request needs Mac Control AND Desktop access, it asks ONCE
-    /// and the person grants once — step-by-step escalation is for the cases
-    /// where the second need genuinely cannot be known in advance.
+    /// Combine capabilities known in advance into one grant; ask again only when a later need could not have been known.
     public static func permission(
         _ capabilities: [String],
         why: String,
@@ -466,9 +401,7 @@ public enum InlineInteractionRegistry {
         declineConsequence: String? = nil
     ) -> InlineInteraction? {
         guard let primary = capabilities.first else { return nil }
-        // A Mac Control category is named by what it lets the agent DO
-        // ("Allow file access"); a MacIntegration capability is named by its
-        // own display name, as it always was.
+        // Name the access being granted, using Mac Control capability nouns or MacIntegration's own display name.
         let grantPhrase = englishList(capabilities.map {
             macControlCategoryGrantNouns[$0] ?? macCapabilityDisplayName($0)
         })
@@ -479,13 +412,12 @@ public enum InlineInteractionRegistry {
             mode: mode,
             title: "Allow \(grantPhrase)",
             why: why,
-            // The outcome, named: "Allow Calendar", never a bare "Allow".
             primaryActionLabel: "Allow \(grantPhrase)",
             declineConsequence: declineConsequence
                 ?? "I'll leave \(grantPhrase) " + InlineInteraction.ConsequenceCopy.permissionLeaveAlone,
-            // User's fence, said out loud on the card: a grant is not for one
-            // turn, and the person should know that before they tap.
-            persistenceNote: capabilities.allSatisfy { !MacIntegrationID.all.contains($0) && !isMacControlCategory($0) && SystemPermissionPreflight.cardSettingsCapability($0) != nil }
+            // Explain that a grant persists beyond the current turn before the person chooses it.
+            persistenceNote: capabilities.allSatisfy { !MacIntegrationID.all.contains($0) && !isMacControlCategory($0)
+                && SystemPermissionPreflight.cardSettingsCapability($0) != nil }
                 ? "macOS keeps your decision until you change it in System Settings."
                 : "Stays on until you turn it off in Trust.",
             cardProse: "I need your go-ahead for \(grantPhrase) \u{2014} allow it below, "
@@ -493,18 +425,10 @@ public enum InlineInteractionRegistry {
         )
     }
 
-    /// The one option id that is not a model: "save this for the whole group",
-    /// resolved through Providers' own page like every other permanent change.
+    /// Permanent group changes go through Providers' page; the option must not be decoded as a model.
     public static let persistentChoiceOptionID = "__save_for_group__"
 
-    /// The models on this Mac that can make a picture, as options.
-    ///
-    /// Provider-blind by construction: the only per-provider thing consulted is
-    /// DATA — `FirstPartyModelCatalog`'s own image-route table and the exact
-    /// data root's checked provider catalog, the same owner Providers reads. `providerIDs` is
-    /// whatever the routing snapshot says this person actually uses, so a
-    /// catalog row for an account they do not have never appears. No branch
-    /// anywhere names a provider.
+    /// Read image-capable options from the same checked provider catalog and image-route table as Providers; hide accounts absent from the routing snapshot.
     public static func imageCapableModelOptions(
         providerIDs: [String], dataRoot: URL
     ) throws -> [InlineInteraction.Option] {
@@ -515,41 +439,33 @@ public enum InlineInteractionRegistry {
             else { continue }
             let catalog = try SwiftNativeProviderRouting(dataRoot: dataRoot).checkedCatalogModels(for: providerID)
             for model in catalog {
-                // An option names the ACCOUNT and the model. Before this it
-                // named the model alone and the resolver inferred the account
-                // back from the id — which sends every bare `gpt-*` to the
-                // OAuth route, so an API-key-only install resumed through an
-                // account it has never connected. Dedupe is on the pair for
-                // the same reason: two accounts serving one model id are two
-                // different answers, not a duplicate.
+                // Qualify and deduplicate by account/model pair; a bare model ID cannot identify the correct connected account.
                 guard seen.insert("\(providerID.lowercased())::\(model.id.lowercased())").inserted
                 else { continue }
                 rows.append((providerID, model, route.model))
             }
         }
-        // The account name appears ONLY where it is needed to tell two rows
-        // apart; otherwise the person reads a model name, as before.
+        // Show the account name only when needed to distinguish model options, as the Providers page names it.
         var countsByModel: [String: Int] = [:]
         for row in rows { countsByModel[row.model.id.lowercased(), default: 0] += 1 }
-        return rows.map { row in
+        let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
+        return try rows.map { row in
             let name = row.model.name.isEmpty ? row.model.id : row.model.name
-            let ambiguous = (countsByModel[row.model.id.lowercased()] ?? 0) > 1
+            var label = name
+            if (countsByModel[row.model.id.lowercased()] ?? 0) > 1 { label += " (\(try routing.providerDisplayName(row.providerID)))" }
             return InlineInteraction.Option(
                 id: modelOptionID(providerID: row.providerID, modelID: row.model.id),
-                label: ambiguous ? "\(name) (\(providerDisplayName(row.providerID)))" : name,
+                label: label,
                 detail: "Makes pictures through \(row.routeModel)."
             )
         }
     }
 
-    /// A model option's identity: which account, then which model. The
-    /// resolver reads the account straight off this instead of guessing it
-    /// from the model id.
+    /// Read the account from the option identity; guessing from a model ID can select the wrong connected account.
     public static func modelOptionID(providerID: String, modelID: String) -> String {
         "\(providerID)::\(modelID)"
     }
 
-    /// Split the current provider-qualified option ID; malformed IDs refuse.
     public static func splitModelOptionID(_ id: String) -> (providerID: String, modelID: String)? {
         guard let separator = id.range(of: "::") else { return nil }
         let providerID = String(id[id.startIndex..<separator.lowerBound])
@@ -558,12 +474,7 @@ public enum InlineInteractionRegistry {
         return (providerID, modelID)
     }
 
-    /// A model choice for a Providers group.
-    ///
-    /// `scopedToThisRequest` is Agent's one-image seam: for a single piece of
-    /// work, the PRIMARY action binds the choice to this request only and the
-    /// SECONDARY is the permanent group change. Choosing a model to finish one
-    /// picture must never silently rewrite what every Work task runs on.
+    /// A request-scoped choice changes only the resumed work; a permanent group change requires explicit selection.
     public static func modelChoice(
         group: String,
         why: String,
@@ -573,10 +484,8 @@ public enum InlineInteractionRegistry {
     ) -> InlineInteraction {
         let title = ProviderSurfaceGroups.all.first { $0.id == group }?.title ?? group
         if let scopeNoun = scopedToThisRequest {
-            // The permanent alternative is a CHOICE in the list, not a second
-            // affirmative button: the card grammar has one primary and one
-            // quiet decline, and a scope this consequential must be picked
-            // deliberately rather than tapped past.
+            // The permanent alternative is a CHOICE in the list, not a second affirmative button: the card grammar has one primary and one quiet decline, and a
+            // scope this consequential must be picked deliberately rather than tapped past.
             var scopedOptions = options
             if !options.isEmpty {
                 scopedOptions.append(
@@ -629,7 +538,6 @@ public enum InlineInteractionRegistry {
             target: provider,
             title: providerSignIn(for: provider) == nil ? "Add your \(name) key" : "Connect \(name)",
             why: why,
-            // The outcome of pasting a key is \(name), reachable.
             primaryActionLabel: "Connect \(name)",
             declineConsequence: declineConsequence
                 ?? "Without a key I can't reach \(name)" + InlineInteraction.ConsequenceCopy.apiKeyNothingChanges,
@@ -641,8 +549,7 @@ public enum InlineInteractionRegistry {
         )
     }
 
-    /// A keyring secret: what it is called, where it may go, and the sign-in
-    /// that fetches it when she supplied one; or its removal.
+    /// Name the secret's allowed destination so granting it does not imply unrestricted disclosure.
     public static func secret(
         _ name: String, ask: InlineInteraction.SecretAsk, why: String, declineConsequence: String? = nil
     ) -> InlineInteraction {

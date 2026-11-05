@@ -128,7 +128,7 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         if !body.providersHealthy || !body.toolHandsAvailable { return "Provider or tool path is brittle, so completion claims tighten." }
         if !body.iPhoneReachable { return "Phone reachability is unconfirmed; notification delivery needs its own receipts." }
         if body.notificationPathHealthy == false { return "Phone delivery failed, so delivery needs receipts." }
-        if body.resourcePressure != .nominal { return "Resource pressure is present in her body state." }
+        if body.resourcePressure != .nominal { return "Resource pressure is present in the agent's body state." }
         if !body.memoryHealthy || !body.dreamHealthy || !body.approvalChannelsOpen {
             return "A local body path needs \(agentDisplayName)'s attention, but no user action is requested."
         }

@@ -8,7 +8,7 @@ import ProviderRouting
 import StandingBots
 import ToolRegistry
 import TurnTrace
-// Blueprint: | `SwiftToolDispatcher+StandingBots.swift` | `SwiftToolDispatcher`: `standingBotApprovalReason`, `standingBotsArgumentRefusal`, `impl_standingBots`; following-helper edits refuse each submitted conflicting field and report inherited-value no-op notes; shelf exports retain per-artifact rows through item and acknowledgement failures |
+// Blueprint: | `SwiftToolDispatcher+StandingBots.swift` | `SwiftToolDispatcher` `standingBotApprovalReason` `standingBotsArgumentRefusal` `impl_standingBots` |
 
 extension SwiftToolDispatcher {
     func standingBotApprovalReason(tool: String, input: [String: JSONValue]) -> String? {
@@ -19,8 +19,7 @@ extension SwiftToolDispatcher {
         return "Delete the bot \(bot.name)? Its saved notes stay."
     }
 
-    /// Shared across chat surfaces, separate from every UI reader. Sparse IDs,
-    /// never the page token, are persisted as the agent's acknowledgement.
+    /// Shared across chat surfaces, separate from every UI reader. Sparse IDs, never the page token, are persisted as the agent's acknowledgement.
     static let standingBotReaderID = "agent"
 
     /// The same builders validate shape, cadence and route before approval and again before writing.
@@ -32,8 +31,7 @@ extension SwiftToolDispatcher {
             let candidate = tool == "bot_create"
                 ? try await botCreateCandidate(args)
                 : try await botUpdateCandidate(args, definitions: definitions, reportShim: false)
-            // The cadence floor and the rest of the persisted-shape rules, from
-            // the store itself rather than a second copy of them here.
+            // Read persisted-shape rules from the store so cadence admission cannot drift.
             do {
                 try botCheck(candidate.bot, definitions: definitions, input: tool == "bot_create" ? args : try botObject(args["fields"], field: "fields"))
             } catch let error as ToolFailureError {
@@ -65,7 +63,8 @@ extension SwiftToolDispatcher {
             if case .object(let cadence)? = object["cadence"] {
                 object["cadence"] = .object(cadence.filter { $0.value != .null })
                 if reportShim, cadence.values.contains(.null) {
-                    TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T21"), "site": .string("SwiftToolDispatcher+StandingBots.swift:botCadence")]))
+                    TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T21"), "site": .string(
+                        "SwiftToolDispatcher+StandingBots.swift:botCadence")]), turn: nil)
                 }
             }
             if case .object(var trigger)? = object["event_trigger"], case .string(let source)? = trigger["source"] {
@@ -81,19 +80,17 @@ extension SwiftToolDispatcher {
         }
         let schema = try JSONValue.parse(declared.parametersJSON)
         if tool == "bot_create", case .object(let root) = schema, case .object(let properties)? = root["properties"] {
-            // Empty optional controls are unset; unknown fields remain for the
-            // closed schema to refuse, including an empty retired argument.
+            // Empty optional controls are unset; undeclared fields still reach the closed-schema refusal.
             args = args.filter { properties[$0.key] == nil || $0.key == "schedule" || $0.value != .string("") }
         }
         args = ToolArguments.normalized(args, schema: schema, recordShims: reportShim)
         if let problem = JSONValue.object(args).schemaProblem(schema: schema, path: "$") {
-            throw ToolFailureError("\(problem.path) must be \(problem.expected)", argumentPath: problem.path, accepted: problem.expected, effects: .none)
+            throw ToolFailureError(problem.words, argumentPath: problem.path, accepted: problem.expected, effects: .none)
         }
         return args
     }
 
-    /// The bot bot_create would write. Shared by dispatch and the pre-approval
-    /// check; it touches no file.
+    /// Share the write-free create builder with pre-approval so preview admits the same shape.
     private func botCreateCandidate(_ args: [String: JSONValue]) async throws -> (bot: BotDefinition, notes: [String]) {
         _ = try botDetails(args)
         var bot = BotDefinition(name: try botString(args["name"], field: "name"),
@@ -118,21 +115,21 @@ extension SwiftToolDispatcher {
         return (bot, notes)
     }
 
-    /// The bot bot_update would write, read from the store and edited in
-    /// memory. Shared by dispatch and the pre-approval check; it writes nothing.
-    private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore, reportShim: Bool = true) async throws -> (bot: BotDefinition, notes: [String]) {
+    /// Share the write-free update builder with pre-approval so preview admits the same edit.
+    private func botUpdateCandidate(_ args: [String: JSONValue], definitions: BotDefinitionStore, reportShim: Bool = true) async throws -> (
+        bot: BotDefinition, notes: [String]) {
         _ = try botDetails(args)
         let fields = try botObject(args["fields"], field: "fields")
         let edits = fields.filter { $0.value != .null && (["schedule", "notify_condition"].contains($0.key) || $0.value != .string("")) }
-        guard !edits.isEmpty else { throw botArgumentError("fields must contain at least one setting", field: "fields", accepted: "An object containing at least one setting to change.") }
+        guard !edits.isEmpty else { throw botArgumentError("fields must contain at least one setting", field: "fields",
+            accepted: "An object containing at least one setting to change.") }
         var bot = try definitions.get(botReference(args, definitions: definitions))
         let notes: [String]
         do {
             if let value = edits["name"] { bot.name = try botString(value, field: "name") }
             if let value = edits["brief"] { bot.brief = try botString(value, field: "brief") }
             if let value = edits["personality"] { bot.personality = try botString(value, field: "personality") }
-            // One "When" choice, as in the Bots editor: a schedule replaces an
-            // event trigger, and an event trigger replaces the schedule.
+            // One "When" choice, as in the Bots editor: a schedule replaces an event trigger, and an event trigger replaces the schedule.
             let timing = try botRequestedCadence(edits)
             if let timing { bot.cadence = timing; bot.eventTrigger = nil }
             if let value = edits["event_trigger"] {
@@ -160,23 +157,23 @@ extension SwiftToolDispatcher {
         return (bot, notes)
     }
 
-    /// The live route check — the exact closure the app installs into
-    /// `BotRunGate` at launch (NativeAgentApp.swift), so a tuple refused here is
-    /// refused identically by a scheduled run and by `BotChatContract`.
+    /// Use the app’s BotRunGate route check so scheduled runs, chat and preview admit the same tuple.
     private func botRouteCheck(_ bot: BotDefinition) async throws {
         do { _ = try await BotChatContract.choice(for: bot, dataRoot: dataRoot) }
         catch {
             throw ToolFailureError(String(describing: error), argumentPath: "$",
-                accepted: "Follow Providers with model_pinned false, or pin a connected provider/model/reasoning_effort choice from bot_list include_models true.", effects: .none)
+                accepted: """
+                    Follow Providers with model_pinned false, or pin a connected provider/model/reasoning_effort choice from bot_list \
+                    include_models true.
+                    """, effects: .none)
         }
     }
 
-    /// shelf_entry save_to: the Save button on a Helpers shelf artifact. Each
-    /// inline file is written into the folder under its own name; a file
-    /// already there is never replaced. The folder passes the gate write_file
-    /// passes: trusted workspace roots, or anywhere under Full Mac file access.
-    private func shelfSave(_ artifacts: [BotArtifact], folder: String, surface: String, writeStarted: inout Bool) async throws -> (receipt: JSONValue, needs: [JSONValue]) {
-        let anywhere = try await fullMacToolAccess(surface: surface).fileOpsAllowed
+    /// Shelf exports never replace existing files and share write_file’s workspace and Full Mac gates.
+    private func shelfSave(turn: Turn, invocation: ChatToolInvocation, _ artifacts: [BotArtifact], folder: String, surface: String,
+        writeStarted: inout Bool) async throws -> (
+        receipt: JSONValue, needs: [JSONValue]) {
+        let anywhere = try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed
         var rows: [JSONValue] = []
         var needs: [JSONValue] = []
         for (index, artifact) in artifacts.enumerated() {
@@ -200,9 +197,9 @@ extension SwiftToolDispatcher {
                 if anywhere {
                     url = NativeAgentWorkspaceRoot.resolveFileMutationPath(target, dataRoot: dataRoot)
                 } else {
-                    do { url = try await resolveTrustedFilePath(target, write: true) }
+                    do { url = try await resolveTrustedFilePath(turn: turn, target, write: true) }
                     catch {
-                        if let need = fileOpsNeedEnvelope(tool: "shelf_entry", mode: .write, path: target, error: error) {
+                        if let need = fileOpsNeedEnvelope(invocation: invocation, tool: "shelf_entry", mode: .write, path: target, error: error) {
                             needs.append(need)
                             if let cardID = need.objectValue?["card_id"] { row["card_id"] = cardID }
                         }
@@ -210,8 +207,11 @@ extension SwiftToolDispatcher {
                     }
                 }
                 // The sensitive-subtree fence every file tool keeps, Full Mac or not.
-                guard !connectorPathIsSensitiveData(url.resolvingSymlinksInPath(), dataRoot: dataRoot) else {
-                    throw StandingBotsError.invalidValue("This item's save_to is inside the app's protected data (credentials, pairing, Trust policy). Choose a folder outside it, such as one in the workspace.")
+                guard !connectorPathIsSensitiveData(url.resolvingSymlinksInPath(), dataRoot: dataRoot, turn: turn) else {
+                    throw StandingBotsError.invalidValue("""
+                        This item's save_to is inside the app's protected data (credentials, pairing, Trust policy). Choose a folder outside it, \
+                        such as one in the workspace.
+                        """)
                 }
                 row["path"] = .string(url.path)
                 guard !FileManager.default.fileExists(atPath: url.path) else {
@@ -234,7 +234,8 @@ extension SwiftToolDispatcher {
         return (.object(["status": .string(incomplete ? "partial" : "ok"), "files": .array(rows)]), needs)
     }
 
-    func impl_standingBots(tool: String, input: [String: JSONValue], surface: String = "chat") async throws -> JSONValue {
+    func impl_standingBots(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue],
+        surface: String = "chat") async throws -> JSONValue {
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
         let shelf = ShelfStore(dataRoot: dataRoot)
         var writeStarted = false
@@ -267,15 +268,10 @@ extension SwiftToolDispatcher {
                 _ = try definitions.get(botID)
                 writeStarted = true
                 let outcome = try await BotRunner(dataRoot: dataRoot, session: standingBotSession).ask(
-                    bot: botID, question: question)
-                // The status travels with the answer. A provider failure used to
-                // come back as a bare empty answer with no cause, and a result
-                // carrying no status at all reads as success on the
-                // approved-replay path. A partial answer is still returned.
+                    bot: botID, question: question, parent: turn, scope: .init(ancestry: invocation.botAncestry))
+                // Approved replay needs an explicit status to distinguish failed asks from success; retain any partial answer.
                 let status = outcome.runtimeStatus
-                // The wire words the dispatch trace already grades by, so a
-                // failed ask is a failure and an ask stopped on an approval is
-                // neither a failure nor progress.
+                // Use the trace’s verdict vocabulary: an approval hold is neither failure nor progress.
                 let wire: String
                 switch status {
                 case .completed: wire = "completed"
@@ -287,10 +283,7 @@ extension SwiftToolDispatcher {
                 }
                 var result: [String: JSONValue] = [
                     "answer": .string(outcome.actualReply), "status": .string(wire),
-                    // The exact return address for the run that just happened.
-                    // The runner already saved all of this; the handoff used to
-                    // drop it, so using a helper's actual output meant another
-                    // run or a shelf search.
+                    // Retain the runner’s saved return address so retrieving output needs no repeated run or shelf search.
                     "entry_id": .string(outcome.id.uuidString),
                 ]
                 if status != .completed, let detail = outcome.statusDetail ?? outcome.uncertainties.first {
@@ -302,9 +295,7 @@ extension SwiftToolDispatcher {
                 if let approvalID = outcome.approvalID, !approvalID.isEmpty {
                     result["approval_id"] = .string(approvalID)
                 }
-                // References, never bytes: name/path/type, with any inline
-                // base64 left in the saved entry. Bounded, so a run that wrote
-                // many files cannot flood the answer.
+                // Bound artifact references and leave inline bytes in storage so large runs cannot flood the answer.
                 let artifacts = outcome.artifacts ?? []
                 if !artifacts.isEmpty {
                     let shown = artifacts.prefix(8)
@@ -321,7 +312,6 @@ extension SwiftToolDispatcher {
                         result["artifacts_truncated"] = .int(Int64(artifacts.count - shown.count))
                     }
                 }
-                // The full-detail pull for everything not carried here.
                 result["shelf_entry"] = .object([
                     "tool": .string("shelf_entry"), "id": .string(outcome.id.uuidString),
                 ])
@@ -392,8 +382,10 @@ extension SwiftToolDispatcher {
                         return try botDefinitionJSON(bot, details: details, currentModel: currentModel)
                     }
                     let entries = byBot[bot.id] ?? []
-                    if let run = entries.filter({ $0.asked != true }).max(by: { $0.runAt < $1.runAt }) { row["lastRunAt"] = .string(iso.string(from: run.runAt)) }
-                    if let reply = entries.filter({ $0.asked == true }).max(by: { $0.runAt < $1.runAt }) { row["lastReplyAt"] = .string(iso.string(from: reply.runAt)) }
+                    if let run = entries.filter({ $0.asked != true }).max(by: { $0.runAt < $1.runAt }) { row["lastRunAt"] = .string(iso.string(
+                        from: run.runAt)) }
+                    if let reply = entries.filter({ $0.asked == true }).max(by: { $0.runAt < $1.runAt }) { row["lastReplyAt"] = .string(iso
+                        .string(from: reply.runAt)) }
                     return .object(row)
                 })]
                 if includeModels { result["model_choices"] = try await SwiftNativeProviderRouting(dataRoot: dataRoot).botModelChoices() }
@@ -434,7 +426,10 @@ extension SwiftToolDispatcher {
                         case .deadlineExceeded:
                             return .object(["status": .string("outcome_unknown"), "effects": .string("unknown"),
                                 "id": .string(entryID.uuidString), "terminal": .bool(false),
-                                "detail": .string("This run exceeded its observation deadline but still owns its writer claim. Its result is not settled; reconcile this run before requesting another.")])
+                                "detail": .string("""
+                                    This run exceeded its observation deadline but still owns its writer claim. Its result is not settled; \
+                                    reconcile this run before requesting another.
+                                    """)])
                         case .absent:
                             if let detail = try BotRunQueue(dataRoot: dataRoot).refusal(bot: botID(owner), requestID: entryID) {
                                 return .object(["status": .string("refused"), "effects": .string("none"),
@@ -445,7 +440,8 @@ extension SwiftToolDispatcher {
                     guard let landed else { throw StandingBotsError.notFound(entryID) }
                     savedEntry = landed
                     if let expected = selection["bot_id"], savedEntry.botId != (try botID(expected)) {
-                        throw StandingBotsError.invalidValue("This shelf entry belongs to a different bot. Use the exact message_id returned by the selected bot.")
+                        throw StandingBotsError.invalidValue(
+                            "This shelf entry belongs to a different bot. Use the exact message_id returned by the selected bot.")
                     }
                 } else {
                     let selected = try definitions.get(botReference(["id": selection["bot_id"] ?? .null], definitions: definitions))
@@ -465,8 +461,8 @@ extension SwiftToolDispatcher {
                 var needs: [JSONValue] = []
                 if let folder = args["save_to"] {
                     _ = try botString(folder, field: "save_to")
-                    let exported = try await shelfSave(entry.artifacts ?? [], folder: botString(folder, field: "save_to"), surface: surface,
-                                                writeStarted: &writeStarted)
+                    let exported = try await shelfSave(turn: turn, invocation: invocation, entry.artifacts ?? [], folder: botString(folder,
+                        field: "save_to"), surface: surface, writeStarted: &writeStarted)
                     saved = exported.receipt
                     needs = exported.needs
                 }
@@ -499,7 +495,6 @@ extension SwiftToolDispatcher {
                     ? nil : try botReference(args, definitions: definitions)
                 let since = try args["since"].map { value in
                     let text = try botString(value, field: "since")
-                    // A bare YYYY-MM-DD means local midnight of that day.
                     let day = DateFormatter()
                     day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"; day.isLenient = false
                     guard let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) ?? (text.count == 10 ? day.date(from: text) : nil) else {
@@ -512,7 +507,8 @@ extension SwiftToolDispatcher {
                 let limit = try args["limit"].map { try botDecode(Int.self, $0, field: "limit") } ?? 20
                 let offset = try args["offset"].map { try botDecode(Int.self, $0, field: "offset") } ?? 0
                 guard offset >= 0, cursor == nil || args["offset"] == nil else {
-                    throw botArgumentError("Use a nonnegative offset or a cursor, not both.", field: "offset", accepted: "A nonnegative integer without cursor.")
+                    throw botArgumentError("Use a nonnegative offset or a cursor, not both.", field: "offset",
+                        accepted: "A nonnegative integer without cursor.")
                 }
                 let sort = try args["sort"].map { try botString($0, field: "sort") }
                 if let sort, !["newest_first", "oldest_first", "oldest_unread"].contains(sort) {
@@ -521,7 +517,8 @@ extension SwiftToolDispatcher {
                 let includeRead = try args["include_read"].flatMap { $0 == .null ? nil : $0 }
                     .map { try botDecode(Bool.self, $0, field: "include_read") } ?? (sort != "oldest_unread")
                 guard sort != "oldest_unread" || !includeRead else {
-                    throw botArgumentError("oldest_unread selects unread replies; include_read true conflicts with it.", field: "include_read", accepted: "false or omitted with oldest_unread.")
+                    throw botArgumentError("oldest_unread selects unread replies; include_read true conflicts with it.", field: "include_read",
+                        accepted: "false or omitted with oldest_unread.")
                 }
                 let newestFirst = sort == nil || sort == "newest_first"
                 let markRead = try args["mark_read"].flatMap { $0 == .null ? nil : $0 }
@@ -529,7 +526,7 @@ extension SwiftToolDispatcher {
                 let page = try shelf.shelfRead(bot: bot, since: since, topic: topic, limit: limit,
                                               cursor: cursor, readerId: includeRead ? nil : Self.standingBotReaderID,
                                               newestFirst: newestFirst, offset: offset)
-                // Removed helpers still own their saved replies and names.
+                // Saved replies and names outlive their helper’s definition.
                 let agentNames = Dictionary(try definitions.list(includeDeleted: true).map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
                 var shortenedChange = false
                 let reconciled = try page.rows.map { try shelf.entry($0.id) }
@@ -553,8 +550,7 @@ extension SwiftToolDispatcher {
                     "entries": .array(rows), "nextCursor": page.nextCursor.map(JSONValue.string) ?? .null,
                     "truncated": .bool(page.truncated || shortenedChange),
                 ])
-                // Finish every read and response conversion before acknowledging.
-                // Lookahead rows, filtered rows and unread earlier gaps stay unread.
+                // Finish every read and response conversion before acknowledging. Lookahead rows, filtered rows and unread earlier gaps stay unread.
                 if markRead, !page.rows.isEmpty {
                     writeStarted = true
                     try shelf.acknowledge(readerId: Self.standingBotReaderID, entryIds: page.rows.map(\.id))
@@ -581,8 +577,7 @@ extension SwiftToolDispatcher {
             }
             return result
         } catch let error as StandingBotsError {
-            // These definition/queue admissions throw before committing their
-            // write. I/O failures remain unknown after an attempted mutation.
+            // These definition/queue admissions throw before committing their write. I/O failures remain unknown after an attempted mutation.
             let refusal: Bool
             switch error {
             case .notFound, .alreadyExists, .staleDefinition, .invalidValue, .invalidCursor:
@@ -614,7 +609,10 @@ private func botFollowingRefusal(_ error: BotChatContract.FollowingSettingsRefus
         "effects": .string("none"), "detail": .string(error.localizedDescription),
         "argument_path": error.problems.first.map { .string(prefix + $0.field) } ?? .null,
         "argument_errors": .array(problems),
-        "accepted": .string("Omit per-helper settings to follow Providers, submit the inherited value as a no-op, or pin a model (model_pinned:true, model, provider) to set them.")
+        "accepted": .string("""
+            Omit per-helper settings to follow Providers, submit the inherited value as a no-op, or pin a model (model_pinned:true, model, \
+            provider) to set them.
+            """)
     ]), tool: tool)
 }
 
@@ -625,7 +623,8 @@ private func botFieldsError(_ error: ToolFailureError) -> ToolFailureError {
 
 private func botTimingError(_ error: ToolFailureError, input: [String: JSONValue]) -> ToolFailureError {
     if let schedule = input["schedule"], schedule != .null, error.argumentPath?.hasPrefix("$.cadence") == true {
-        return botArgumentError(error.message, field: "schedule", accepted: "A schedule string: every N minutes or every N hours, with positive integer N and an interval meeting the reported minimum.")
+        return botArgumentError(error.message, field: "schedule",
+            accepted: "A schedule string: every N minutes or every N hours, with positive integer N and an interval meeting the reported minimum.")
     }
     return error
 }
@@ -645,7 +644,10 @@ private func botObject(_ value: JSONValue?, field: String) throws -> [String: JS
 private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field: String) throws -> T {
     var shape = type == Bool.self ? "A boolean." : type == Int.self ? "An integer." : type == String.self ? "A string."
         : type == BotBudget.self ? "An object with tokens: positive integer and seconds: positive finite number."
-        : type == BotCadence.self ? "An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string}. Times are on this Mac's local clock and follow it when it changes zone."
+        : type == BotCadence.self ? """
+            An object with exactly one of manual: {}, interval: {seconds: number}, or cron: {expression: string}. Times are on this Mac's local \
+            clock and follow it when it changes zone.
+            """
         : "An object matching " + field + "."
     guard let value else { throw botArgumentError("missing " + field, field: field, accepted: shape) }
     do { return try JSONDecoder().decode(type, from: value.serializedData(pretty: false)) }
@@ -653,7 +655,8 @@ private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field:
         let keys: [String]
         switch error {
         case DecodingError.keyNotFound(let key, let context): keys = context.codingPath.map(\.stringValue) + [key.stringValue]
-        case DecodingError.typeMismatch(_, let context), DecodingError.valueNotFound(_, let context), DecodingError.dataCorrupted(let context): keys = context.codingPath.map(\.stringValue)
+        case DecodingError.typeMismatch(_, let context), DecodingError.valueNotFound(_, let context), DecodingError.dataCorrupted(
+            let context): keys = context.codingPath.map(\.stringValue)
         default: keys = []
         }
         let path = ([field] + keys).joined(separator: ".")
@@ -670,7 +673,8 @@ private func botDecode<T: Decodable>(_ type: T.Type, _ value: JSONValue?, field:
 
 private func botString(_ value: JSONValue?, field: String) throws -> String {
     let text = try botDecode(String.self, value, field: field)
-    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw botArgumentError("empty " + field, field: field, accepted: "A nonblank string.") }
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw botArgumentError("empty " + field, field: field,
+        accepted: "A nonblank string.") }
     return text
 }
 
@@ -679,15 +683,17 @@ private func botID(_ value: JSONValue?) throws -> UUID {
     return id
 }
 
-/// The sole helper reference is id: a UUID or the exact current helper name.
+/// The sole helper reference is id: any form the app shows a helper by, or the exact current helper name.
 private func botSuppliedReferences(_ args: [String: JSONValue]) -> [(key: String, value: JSONValue)] {
     guard let id = args["id"], id != .null else { return [] }
     return [("id", id)]
 }
 
+/// The one helper resolver: bot.* and the Helpers page item. A helper is shown as its UUID (any case), its contact bot:<UUID>,
+/// its session bot-<uuid> or its name; each names it here.
 func botReference(_ args: [String: JSONValue], definitions: BotDefinitionStore) throws -> UUID {
     let text = try botString(args["id"], field: "id").trimmingCharacters(in: .whitespacesAndNewlines)
-    if let id = UUID(uuidString: text) { return id }
+    if let id = UUID(uuidString: text.hasPrefix("bot:") ? String(text.dropFirst(4)) : text) ?? BotDefinition.id(forSession: text) { return id }
     let matches = try definitions.list().filter { $0.name.lowercased() == text.lowercased() }
     guard matches.count == 1 else {
         throw botArgumentError(matches.isEmpty ? "No helper matches \(text). Use an id from bot.list."
@@ -707,7 +713,10 @@ private func botEventTrigger(_ value: JSONValue?) throws -> BotEventTrigger {
     let filter = try botString(object["filter"], field: "event_trigger.filter").trimmingCharacters(in: .whitespacesAndNewlines)
     // Slack delivers a channel ID, never a name, so a name would never match.
     if !BotEventTrigger.isChannelID(filter) {
-        throw botArgumentError("A Slack trigger needs the channel ID, such as C0123ABCD, not its name. In Slack, open the channel, choose View channel details, and copy the ID at the bottom.", field: "event_trigger.filter", accepted: "A Slack channel ID such as C0123ABCD.")
+        throw botArgumentError("""
+            A Slack trigger needs the channel ID, such as C0123ABCD, not its name. In Slack, open the channel, choose View channel details, and \
+            copy the ID at the bottom.
+            """, field: "event_trigger.filter", accepted: "A Slack channel ID such as C0123ABCD.")
     }
     let keyword = try object["keyword"].map { try botDecode(String.self, $0, field: "event_trigger.keyword") }
     return BotEventTrigger(source: source, filter: filter.uppercased(), keyword: keyword)
@@ -717,8 +726,7 @@ private var botTriggerTimingError: ToolFailureError { botArgumentError(
     "An event-woken helper keeps no schedule: the event is what runs it. Drop schedule and cadence, or use schedule manual.",
     field: "event_trigger", accepted: "event_trigger with no schedule, or with schedule manual.") }
 
-/// Both pre-approval and persistence call this adapter; cadence validity and
-/// the operator's minimum interval still belong to BotDefinitionStore.
+/// Both pre-approval and persistence call this adapter; cadence validity and the operator's minimum interval still belong to BotDefinitionStore.
 private func botRequestedCadence(_ args: [String: JSONValue]) throws -> BotCadence? {
     let args = args.filter { $0.value != .null }
     guard args["schedule"] != nil else {
@@ -730,7 +738,10 @@ private func botRequestedCadence(_ args: [String: JSONValue]) throws -> BotCaden
     do {
         return try StandingBotSchedule.parse(botString(args["schedule"], field: "schedule"))
     } catch StandingBotsError.invalidValue(let message) {
-        throw ToolFailureError(message, argumentPath: "$", accepted: "schedule: manual; every N minutes or hours; daily at HH:mm; weekdays at HH:mm; weekly on DAY at HH:mm. Clock: 00:00-23:59 on this Mac's local clock.", effects: .none)
+        throw ToolFailureError(message, argumentPath: "$", accepted: """
+            schedule: manual; every N minutes or hours; daily at HH:mm; weekdays at HH:mm; weekly on DAY at HH:mm. Clock: 00:00-23:59 on this \
+            Mac's local clock.
+            """, effects: .none)
     }
 }
 
@@ -745,7 +756,8 @@ private func botJSON<T: Encodable>(_ value: T) throws -> JSONValue {
     return try JSONDecoder().decode(JSONValue.self, from: encoder.encode(value))
 }
 
-private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, operation: String? = nil, currentModel: String? = nil, notes: [String] = []) throws -> JSONValue {
+private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, operation: String? = nil, currentModel: String? = nil,
+    notes: [String] = []) throws -> JSONValue {
     guard case .object(var fields) = try botJSON(bot) else { throw StandingBotsError.invalidValue("bot") }
     if !details {
         let visible: Set<String> = ["id", "name", "personality", "brief", "provider", "model", "modelPinned", "reasoningEffort", "fast",
@@ -764,7 +776,6 @@ private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, oper
     }
     fields["scheduler_status"] = .string(bot.paused ? "paused" : bot.eventTrigger != nil ? "on_event" : bot.cadence == .manual ? "manual" : "scheduled")
     let reference = JSONValue.string(bot.name)
-    // Each is her app call: these tools are app actions now.
     var actions: [String: JSONValue] = [
         "talk": .object(["tool": .string("agent_message"),
             "input": .object(["agent": reference, "text": .string("<your message>")])]),
@@ -781,17 +792,31 @@ private func botDefinitionJSON(_ bot: BotDefinition, details: Bool = false, oper
         switch operation {
         case "created without timing" where bot.paused:
             fields["operation"] = .string("created")
-            fields["detail"] = .string("Saved paused as manual; this call did not run the helper. No timing was given: ask the person when it should run, such as daily at 09:00, weekdays at 08:30 or weekly on monday at 09:00, then set it with bot_update schedule. Manual messages and run once remain available.")
+            fields["detail"] = .string("""
+                Saved paused as manual; this call did not run the helper. No timing was given: ask the person when it should run, such as daily \
+                at 09:00, weekdays at 08:30 or weekly on monday at 09:00, then set it with bot_update schedule. Manual messages and run once \
+                remain available.
+                """)
         case "created" where bot.paused:
             fields["operation"] = .string("created")
-            fields["detail"] = .string("Saved paused; this call did not run the helper. Scheduled turns stay paused until resumed with bot_pause paused false. Manual messages and run once remain available.")
+            fields["detail"] = .string("""
+                Saved paused; this call did not run the helper. Scheduled turns stay paused until resumed with bot_pause paused false. Manual \
+                messages and run once remain available.
+                """)
         case "created":
-            fields["detail"] = .string("Saved; this call did not run the helper. Send a message or run once when ready. Scheduled turns follow the saved timing.")
+            fields["detail"] = .string(
+                "Saved; this call did not run the helper. Send a message or run once when ready. Scheduled turns follow the saved timing.")
         case "created without timing":
             fields["operation"] = .string("created")
-            fields["detail"] = .string("Saved as manual; this call did not run the helper. No timing was given: ask the person when it should run, such as daily at 09:00, weekdays at 08:30 or weekly on monday at 09:00, then set it with bot_update schedule.")
+            fields["detail"] = .string("""
+                Saved as manual; this call did not run the helper. No timing was given: ask the person when it should run, such as daily at \
+                09:00, weekdays at 08:30 or weekly on monday at 09:00, then set it with bot_update schedule.
+                """)
         case "paused":
-            fields["detail"] = .string("Scheduled turns are paused. Any in-flight run is not cancelled. Manual messages and run once remain available; context and saved replies are preserved.")
+            fields["detail"] = .string("""
+                Scheduled turns are paused. Any in-flight run is not cancelled. Manual messages and run once remain available; context and saved \
+                replies are preserved.
+                """)
         case "resumed":
             fields["detail"] = .string(bot.cadence == .manual
                 ? "Unpaused with the same context and saved replies. Timing is manual, so no scheduled run was started."

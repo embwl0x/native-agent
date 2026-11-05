@@ -9,32 +9,29 @@ import StandingBots
 import Transcripts
 import Darwin
 import Experiences
-// Blueprint: | `ContactConversationReads.swift` | AgentContactThreads and shared contact values read canonical contact conversations, helper results and isolated live flights for desktop and phone; helper reply times come from recorded settlement, with missing times unavailable; live-only read failures propagate instead of requesting a second full read; mobile summaries project plain state and activity time from that evidence, retaining diagnostics in detail; waitingForMac projects the conversation queue's automatic hold as waiting for the Mac to be free |
+// Blueprint: | `ContactConversationReads.swift` | Canonical contact history, helper results and isolated live flights |
 
-/// A saved contact, keyed `peer:<id>` like the agent's conversation records.
+/// Use the same `peer:<id>` identity as conversation records.
 public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
     public let id: String
     public let name: String
-    /// How the agent reaches it, in a line.
     public let via: String
     /// A saved connection stays visible even when it cannot initiate a turn.
     public var sendRestriction: String? = nil
-    /// Proven traffic counts even when its transcript is no longer retained.
+    /// Retain proven traffic counts independently of transcript retention.
     public var lastActivityAt: Date? = nil
-    /// The Mac app behind it, when there is one, for its avatar.
     public var appBundleID: String? = nil
-    /// Distinguishes desktop-app and routine connections sharing one app.
+    /// Distinguish desktop and routine connections that share one app.
     public var link: Link? = nil
-    /// Claude contacts wear Clawd instead of an app icon.
     public var clawd = false
-    /// ChatGPT Dot uses its chat session rather than a conversation record.
+    /// Use the chat session for direct chat contacts.
     public var dot = false
     public var health: AgentLocalHealth? = nil
     public var recoveredFailure = false
     public var owedExperiences: [Experience] = []
     public var initial: String { name.first.map { String($0).uppercased() } ?? "?" }
 
-    /// One precedence for every door; dates and clipping belong to the renderer.
+    /// Share precedence across doors; leave dates and clipping to renderers.
     public func status(flight: AgentContactFlight?, waiting: Bool, delivery: AgentConversationDelivery?) -> String? {
         if let flight, !flight.inFlight, flight.queued.contains(where: { $0.waitingForMac }) {
             return "Waiting for the Mac to be free"
@@ -75,32 +72,28 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
     }
 }
 
-/// One thing said between the agent and a contact.
 public struct AgentContactThreadLine: Identifiable, Equatable, Sendable {
     public let id: String
     public let fromAgent: Bool
     public let text: String
     /// Nil when this retained helper reply has no recorded completion time.
     public let at: Date?
-    /// Typed by the person in this thread rather than sent by the agent.
+    /// Distinguish the person’s typed message from the agent’s send.
     public var byPerson = false
     public var door: String? = nil
     public var fetched = false
     public var resultID: UUID? = nil
 }
 
-/// Live progress, queued follow-ups and the stop on this send; nil when none is present.
 public struct AgentContactFlight: Equatable, Sendable {
     public let recordID: String
-    /// How agent_cancel names the contact and its conversation.
     public let agent: String
     public let label: String
     public let scope: String
-    /// The send is still going or its reply is still coming.
     public let inFlight: Bool
     public var live: AgentConversationLive?
     public var queued: [Queued]
-    /// Only the stop asked for on this send.
+    /// Stop applies only to this send.
     public var stop: AgentConversationStop?
 
     public struct Queued: Identifiable, Equatable, Sendable {
@@ -126,9 +119,7 @@ public struct AgentContactFlight: Equatable, Sendable {
         (self.inFlight, self.live, self.queued, self.stop) = (inFlight, live, queued, stop)
     }
 
-    /// The other agent is on it right now (not just handed off).
     public var working: Bool { inFlight && live?.state == "working" }
-    /// Streamed words so far, when its lane streams them.
     public var partial: String? {
         guard working, live?.streams == true, let text = live?.partial?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else { return nil }
@@ -136,7 +127,7 @@ public struct AgentContactFlight: Equatable, Sendable {
     }
 }
 
-/// Root-scoped contact reads and live reply projections shared by desktop and phone.
+/// Scope shared desktop and phone reads to one root.
 public enum AgentContactThreads {
     public struct HelperResult: Identifiable, Equatable, Sendable {
         public let entry: ShelfEntry
@@ -161,7 +152,7 @@ public enum AgentContactThreads {
         public let latestCompleted: HelperResult?
     }
 
-    /// Shelf identity selects results; Experience owns the words on every door.
+    /// Select by shelf identity; share Experience wording across doors.
     public static func helperResults(_ helper: BotsShelfRecord, root: URL, historyLimit: Int = 40,
                                      representedResults: Set<UUID> = []) async throws -> HelperResults {
         let history = Array(helper.sortedEntries.filter { !representedResults.contains($0.id) }.prefix(historyLimit))
@@ -183,7 +174,7 @@ public enum AgentContactThreads {
         public var flights: [String: AgentContactFlight]
         public var helpers: [BotsShelfRecord]
         public var running: Set<UUID>
-        /// Uncompared record identities and stamp let live-only ticks re-read just flights.
+        /// Retain uncompared identities so live-only ticks can skip unchanged records.
         public var flightRecords: [String: String] = [:]
         public var recordsStamp: [SnapshotTailOpLog.FileStamp?] = []
         public init(contacts: [AgentContactPresentation], lines: [String: [AgentContactThreadLine]],
@@ -196,7 +187,7 @@ public enum AgentContactThreads {
         }
     }
 
-    /// What a read changed, worked out off the main actor; nil is unchanged.
+    /// Compute changes off the main actor; nil means unchanged.
     public struct Delta: Sendable {
         public var otherRooms: [OtherRoomExchange]?
         public var contacts: [AgentContactPresentation]?
@@ -222,7 +213,7 @@ public enum AgentContactThreads {
         return unchanged ? nil : delta
     }
 
-    /// A file's identity, size and times; status changes include mode changes.
+    /// Include mode changes when comparing file status.
     private static func stamp(_ path: String) throws -> SnapshotTailOpLog.FileStamp {
         var info = stat()
         guard lstat(path, &info) == 0 else {
@@ -233,10 +224,9 @@ public enum AgentContactThreads {
         return SnapshotTailOpLog.FileStamp(info)
     }
 
-    /// The helper's `bot:<id>` key in conversation lines and waiting state.
+    /// Use the same `bot:<id>` identity in conversation lines and waiting state.
     public static func key(_ helper: UUID) -> String { "bot:" + helper.uuidString }
 
-    /// Resolve installed app icons from the contact's desktop address or known-agent row.
     private static func appBundleID(_ row: AgentContactRow) -> String? {
         if row.contact?.transport == .grokBot {
             return NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) == nil
@@ -296,9 +286,7 @@ public enum AgentContactThreads {
             }
             let tail = lines.suffix(32)
             return MobileAgentThread(agent: row, lines: try tail.map {
-                // Only contacts are published here, using the transcript's
-                // existing time projection. Optional helper times never enter
-                // this contract. Never manufacture a date or drop a line here.
+                // Publish canonical contact times only; optional helper times must not invent a date or drop a line.
                 guard let at = $0.at else {
                     throw ToolFailureError("This contact message has no recorded time; preserve and repair its transcript.", effects: .none)
                 }
@@ -312,10 +300,7 @@ public enum AgentContactThreads {
         let recordsStamp = try threadStamp(root: root)
         let (doors, recordRead) = try await contactOwner.refreshDoors()
         let rows = doors.filter { $0.primary && $0.contact != nil }
-        // The contact owner has already selected canonical rows and checked credentials.
-        let restrictions = try rows.map { row in
-            try AgentConversationDelivery.lane(for: row.key, dataRoot: root) != nil ? nil : sendRestriction(row)
-        }
+        let restrictions = rows.map(sendRestriction)
         let grouped = rows.indices.sorted { a, b in
             return restrictions[a] == nil && restrictions[b] != nil
         }
@@ -340,7 +325,7 @@ public enum AgentContactThreads {
         func owner(_ agent: String) -> String? {
             if ids.contains(agent) { return agent }
             if let id = displayed[identity.canonical(agent)] { return id }
-            // A helper's thread, keyed by the helper whatever case its id came in.
+            // Helper thread identity is case-insensitive.
             if agent.hasPrefix("bot:") { return UUID(uuidString: String(agent.dropFirst(4))).map(key) }
             return nil
         }
@@ -353,12 +338,11 @@ public enum AgentContactThreads {
             contact.lastActivityAt.map { (contact.id, $0) }
         }, uniquingKeysWith: { first, _ in first })
         for record in records {
-            // Dot sends straight through; his old record is no part of his thread.
+            // Direct chat contacts use their session rather than conversation records.
             guard let id = owner(record.agent), !dots.contains(id) else { continue }
             lastActive[id] = max(lastActive[id] ?? .distantPast, record.updatedAt)
             if record.updatedAt >= (latest[id]?.updatedAt ?? .distantPast) { latest[id] = record }
-            // A contact's thread is its own session (below); its record says
-            // only where the current send stands. A helper's is its record.
+            // Contact records describe the current send; contact sessions own history, while helper records own theirs.
             guard id.hasPrefix("bot:") else { continue }
             let history = record.exchanges ?? []
             let receipt = record.retainedReply
@@ -384,7 +368,6 @@ public enum AgentContactThreads {
                     resultID: receipt.resultID))
             }
         }
-        // Everything a contact and the agent said to each other, from its own session.
         let transcripts = contacts.isEmpty ? [] : try ChatSessionRetention.transcriptFiles(dataRoot: root,
             archived: ChatSessionRetention.archivedTranscripts(dataRoot: root))
         for contact in contacts {
@@ -397,8 +380,7 @@ public enum AgentContactThreads {
         }
         for (id, said) in replies { lines[id, default: []] += said }
         for key in lines.keys {
-            // Dated messages are chronological. Unknown-time replies retain
-            // source order after them and are rendered as time unavailable.
+            // Sort dated messages chronologically; retain source order for unknown-time replies and show time unavailable.
             lines[key] = lines[key]?.enumerated().sorted { lhs, rhs in
                 switch (lhs.element.at, rhs.element.at) {
                 case let (a?, b?): return a == b ? lhs.offset < rhs.offset : a < b
@@ -443,8 +425,7 @@ public enum AgentContactThreads {
         for contact in contacts where latest[contact.id] == nil && lines[contact.id]?.last?.fetched == true {
             status[contact.id] = .read
         }
-        // Dot's thread owns its wait; every view uses the same reply projection.
-        // Inbound only, no reply is awaited: his thread carries his contact's state.
+        // The direct chat session owns its wait; inbound-only contacts retain contact state without an owed reply.
         for id in dots where ChatGPTDotIPCTransport.available {
             guard let last = lines[id]?.last, last.fromAgent, let at = last.at else { continue }
             if case .object(let reply) = AgentConversationView.dotReply(.object([:]), sentAt: at), reply["terminal"] == .bool(true) {
@@ -464,11 +445,11 @@ public enum AgentContactThreads {
             }
         }.map(\.element)
         let helpers = includeHelpers ? try await NativeAgentEngine.forRoot(root).botsShelfRead() : []
-        // Queued, or claimed by a runner in this app: the shelf's own "Running".
         let running = try BotRunQueue(dataRoot: root).activeOrQueuedIDs()
         return Snapshot(contacts: ordered, lines: lines, waiting: waiting, status: status, flights: flights,
                          helpers: helpers, running: running, flightRecords: latest.mapValues(\.id),
-                         recordsStamp: recordsStamp, otherRooms: try HerScreen.otherRoomExchanges(dataRoot: root, identity: identity, since: .distantPast).map {
+                         recordsStamp: recordsStamp,
+                         otherRooms: try AgentScreen.otherRoomExchanges(dataRoot: root, identity: identity, since: .distantPast).map {
                              var event = $0
                              event.contactID = owner(event.contactID) ?? event.contactID
                              return event
@@ -480,8 +461,7 @@ public enum AgentContactThreads {
          try stamp(root.appendingPathComponent("chat/sessions.json").path)]
     }
 
-    /// Only the flights, for a tick of the live file alone. Nil when the
-    /// records or chat index moved since the last full read.
+    /// Live-only reads require unchanged records and chat index; nil requests a full read.
     public static func readFlights(root: URL, last: Snapshot) throws -> [String: AgentContactFlight]? {
         let stamp = try threadStamp(root: root)
         guard stamp == last.recordsStamp else { return nil }
@@ -496,7 +476,6 @@ public enum AgentContactThreads {
         return flights
     }
 
-    /// How a contact is reached, in words a person uses.
     private static func via(_ row: AgentContactRow) -> String {
         guard let contact = row.contact else { return "On this Mac" }
         if ChatGPTDotIPCTransport.owns(contact) { return ChatGPTDotIPCTransport.detail }

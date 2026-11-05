@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import ApplicationServices
-// Blueprint: | `MacActClosedLoop+EffectDifferences.swift` | `MacActClosedLoop`: effect-difference records, redacted JSON, walk comparability, `diff` and target-owned press evidence; complete comparison sets retain receipt caps and context redaction |
+// Blueprint: | `MacActClosedLoop+EffectDifferences.swift` | `MacActClosedLoop`, `diff`: Redacted diff and target-owned press evidence |
 
 extension MacActClosedLoop {
     // MARK: the diff
@@ -64,9 +64,8 @@ extension MacActClosedLoop {
                 "handle": .string(handle),
                 "role": .string(role),
             ]
-            // The compiler's own redaction wins wherever it exists; the
-            // standalone redactor is only the floor for a side that never came
-            // from a compile (a focus-only entry).
+            // The compiler's own redaction wins wherever it exists; the standalone redactor is only the floor for a side that never came from a compile (a
+            // focus-only entry).
             if beforeLabel != afterLabel {
                 object["label_before"] = beforeLabelJSON ?? redacted(beforeLabel, under: nil)
                 object["label_after"] = afterLabelJSON ?? redacted(afterLabel, under: nil)
@@ -132,8 +131,7 @@ extension MacActClosedLoop {
                 "after": emit(afterJSON, raw: afterText),
             ]
             if let handle { object["handle"] = .string(handle) }
-            // Emitted only when true, so an ordinary changed row is byte-for-byte
-            // what it always was.
+            // Omit false flags so ordinary changed rows carry no extra metadata.
             if renamed { object["renamed"] = .bool(true) }
             return .object(object)
         }
@@ -166,8 +164,7 @@ extension MacActClosedLoop {
             var object: [String: JSONValue] = [
                 "role": .string(role),
                 "path": .array(path.map { .int(Int64($0)) }),
-                // The compile's verdict wins; the standalone redactor is only
-                // the floor for a row that never came from one.
+                // The compile's verdict wins; the standalone redactor is only the floor for a row that never came from one.
                 "text": textJSON ?? text.map {
                     MacScreenViewTextRedaction.redactedLegendString($0, valueChars: valueChars)
                 } ?? .null,
@@ -206,11 +203,7 @@ extension MacActClosedLoop {
         /// All rows behind those totals; only receipt rendering caps them.
         public let readoutsAdded: [ReadoutRow]
         public let readoutsRemoved: [ReadoutRow]
-        /// Were the two compiles allowed to see the same window? False when one
-        /// side's walk truncated or the two ran under different caps — the
-        /// added/removed affordance and readout CENSUS is a set difference and
-        /// means nothing
-        /// across mismatched bounds. Said out loud rather than dropped silently.
+        /// Set-difference censuses require complete walks under matching bounds; otherwise report incomparability instead of claiming additions or removals.
         public let diffComparable: Bool
         public let diffIncomparableReason: String?
 
@@ -258,7 +251,6 @@ extension MacActClosedLoop {
             self.readoutsChanged = readoutsChanged
         }
 
-        /// Any reported change channel makes the diff nonempty, including read-only displays.
         public var isEmpty: Bool { changeReasons.isEmpty }
 
         /// Name every changed channel; set-membership deltas require comparable walks, while identity-bound channels remain observable under truncation.
@@ -281,7 +273,8 @@ extension MacActClosedLoop {
 
         public var windowChanged: Bool { !changeReasons.isEmpty }
 
-        /// Navigation requires a title/modal transition or comparable affordance turnover; readout changes, focus and enabled-state changes alone do not prove it.
+        /// Navigation requires a title/modal transition or comparable affordance turnover; readout changes, focus and enabled-state changes alone do not prove
+        /// it.
         public var navigated: Bool {
             if windowTitleChanged || modalAppeared || modalDisappeared { return true }
             if diffComparable, addedTotal > 0 || removedTotal > 0 { return true }
@@ -293,9 +286,8 @@ extension MacActClosedLoop {
     static let positionRoles: Set<String> = ["AXSlider", "AXProgressIndicator", "AXBusyIndicator",
                                              "AXScrollBar", "AXLevelIndicator", "AXValueIndicator"]
 
-    /// A screen delta is evidence of a press only when it belongs to the
-    /// target. Independent controls, global title/modal churn and a readout
-    /// that merely holds still do not establish causation.
+    /// A screen delta is evidence of a press only when it belongs to the target. Independent controls, global title/modal churn and a readout that merely holds
+    /// still do not establish causation.
     public static func pressEvidence(
         _ diff: EffectDiff, before: MacLookFrame, pressed: MacLookFrameEntry,
         settled: (ReadoutChange) -> Bool
@@ -389,16 +381,14 @@ extension MacActClosedLoop {
         for (handle, entry) in beforeEntries where afterByHandle[handle] == nil {
             removed.append(entry)
         }
-        // Deterministic order, so a diff is comparable across calls and a test
-        // is not asserting on dictionary iteration order.
+        // Deterministic ordering keeps diffs comparable across calls, independent of dictionary iteration.
         removed.sort { MacPerceptionCompiler.pathIsBefore($0.path, $1.path) }
         changed.sort { $0.handle < $1.handle }
 
         let focusBefore = before.focusHandle
         let focusAfter = after.focus?.handle
-        // The canonical post-read walks this same entire window when the
-        // retained frame owns completeWindow. A page-scoped census cannot
-        // prove what disappeared outside its current scope.
+        // The canonical post-read walks this same entire window when the retained frame owns completeWindow. A page-scoped census cannot prove what disappeared
+        // outside its current scope.
         let afterComplete = before.completeWindow && !after.truncated && !afterCaps.truncated
         let focusChanged = focusBefore != focusAfter && (focusAfter != nil || afterComplete)
 
@@ -409,7 +399,6 @@ extension MacActClosedLoop {
         let titleBefore = normalizedLabel(before.windowTitle)
         let titleAfter = normalizedLabel(afterWindowTitle)
 
-        // Diff readouts by handle when available, otherwise by path.
         var readoutsChanged: [ReadoutChange] = []
         var readoutsAdded: [ReadoutRow] = []
         let beforeReadouts = before.readouts
@@ -443,7 +432,7 @@ extension MacActClosedLoop {
         }
         var readoutsRemoved = beforeReadouts.values
             .filter { !afterReadoutKeys.contains($0.key) }
-            // Removed readouts retain the frame's own compile-redacted text.
+            // Retain removed readouts' own contextual redaction; the new frame cannot rejudge them.
             .map { ReadoutRow(handle: $0.handle, path: $0.path, role: $0.role, text: normalizedLabel($0.text), textJSON: $0.textJSON) }
             .sorted { MacPerceptionCompiler.pathIsBefore($0.path, $1.path) }
 

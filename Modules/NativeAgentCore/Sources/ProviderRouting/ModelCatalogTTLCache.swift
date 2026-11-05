@@ -4,45 +4,36 @@ import PersistenceCore
 import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `ModelCatalogTTLCache.swift` | shared live fetch and TTL/backoff state machine; a path-bound LatestRead orders publication and coalesces equal-credential fetches; persisted credential bindings are checked under the credential lock on every catalog admission; unchanged credentials and checked persistence own cache/backoff commits; `ModelCatalogDecodeCache` memoizes decoded rows and authority stamps by canonical file path and mtime; only a checked not-found result is catalog absence, while stat/read/decode faults remain unavailable |
+// Blueprint: | `ModelCatalogTTLCache.swift` | `ModelCatalogDecodeCache`: credential-bound cache; ordered publication |
 
 /// Catalog freshness records where the rows came from and whether the response is complete.
 public enum ModelCatalogFreshness: String, Sendable, Equatable {
-    /// Fetched from the provider on this call, and the envelope said nothing
-    /// about a further page — the whole catalogue.
+    /// Only a complete live envelope establishes the whole catalog.
     case live
     /// A live partial response is cached and stamped but cannot prune omitted rows.
     case liveIncomplete = "live_incomplete"
-    /// Served from the on-disk cache without attempting the network.
+    /// Cached rows carry no claim that the network was reached.
     case cached
-    /// Historical refresh-failure status retained by aggregate catalog readers;
-    /// this cache never returns stale rows as selectable models.
+    /// Aggregate readers retain refresh-failure provenance; stale rows are never selectable here.
     case staleAfterFailedRefresh = "stale"
     /// No cached provider rows are available; the picker stays empty and names the cause.
     case unavailable
 
-    /// True when this read reached the provider AND carried the whole list —
-    /// the only case a caller may treat as authoritative enough to prune rows
-    /// the provider no longer has.
+    /// Only a complete live response can authorize pruning omitted rows.
     public var isLive: Bool { self == .live }
 }
 
-/// Process-local decoded cache keyed by canonical path and file mtime.
-///
-/// Every read still stats the exact file, so removal and atomic replacement are
-/// visible on the next read. Missing, unreadable, empty, or undecodable bytes
-/// cache only the nil result for that observed mtime; a later mtime always
-/// retries the decode. Mirrors `REMPinsDecodedCache` in DreamREMCycle — same
-/// invariant, same retry-on-concurrent-write guard.
-/// A saved model list that is there but cannot be read: the receipt that
-/// replaces its rows, never the shipped rows. Nil when absent or read.
+/// Stat the exact file on every read so replacement/removal invalidates decoded bytes. Cache only against the observed mtime and reject a concurrent-write
+/// mismatch.
 func modelCatalogFault(at url: URL, read: Bool, owner: String) -> String? {
     guard !read, !modelCatalogIsAbsent(at: url) else { return nil }
-    return "\(url.path) could not be read as \(owner)'s model list, so its models and windows are unknown; move that file aside on the Mac and the next refresh fetches it again."
+    return """
+        \(url.path) could not be read as \(owner)'s model list, so its models and windows are unknown; move that file aside on the Mac and the next \
+        refresh fetches it again.
+        """
 }
 
-/// Only an actual not-found result permits catalog bootstrap. A denied stat
-/// is an unreadable catalog, including when its parent cannot be searched.
+/// Only an actual not-found result permits catalog bootstrap. A denied stat is an unreadable catalog, including when its parent cannot be searched.
 func modelCatalogIsAbsent(at url: URL) -> Bool {
     do {
         _ = try FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path)
@@ -64,16 +55,14 @@ final class ModelCatalogDecodeCache: @unchecked Sendable {
         url: URL,
         decode: (Data) -> DecodedModelCatalog?
     ) -> DecodedModelCatalog? {
-        // `attributesOfItem` does NOT follow symlinks, but `Data(contentsOf:)`
-        // does. Resolve first so a symlinked cache path stats as the regular
-        // file it points at instead of silently reading as "no catalog".
+        // `attributesOfItem` does NOT follow symlinks, but `Data(contentsOf:)` does. Resolve first so a symlinked cache path stats as the regular file it
+        // points at instead of silently reading as "no catalog".
         let url = url.resolvingSymlinksInPath()
         let key = url.path
         lock.lock()
         defer { lock.unlock() }
 
-        // Retry once if a writer replaces the file between the first stat and
-        // the read. Never associate bytes with a stale mtime key.
+        // Retry once if a writer replaces the file between the first stat and the read. Never associate bytes with a stale mtime key.
         for _ in 0..<2 {
             guard let modifiedAt = modificationDate(url) else {
                 entries.removeValue(forKey: key)
@@ -105,17 +94,14 @@ final class ModelCatalogDecodeCache: @unchecked Sendable {
     }
 }
 
-/// One catalog read: the list, and where it came from.
+/// Rows travel with their provenance.
 public struct ModelCatalogRead: Sendable {
     public let models: [ProviderModelInfo]
     public let freshness: ModelCatalogFreshness
-    /// Why the provider's list could not be fetched (`stale`, `unavailable`).
     public var failure: String? = nil
-    /// When the served list was fetched from the provider (`cached`, `stale`).
     public var fetchedAt: Date? = nil
 
-    /// The line the Providers page shows beside this provider's models; nil
-    /// when the list is the provider's current answer.
+    /// The picker must name why rows are not the provider's current answer.
     public var note: String? {
         switch freshness {
         case .unavailable:
@@ -129,7 +115,7 @@ public struct ModelCatalogRead: Sendable {
     }
 }
 
-/// A live fetch carries rows and an explicit completeness verdict.
+/// Live rows must carry an explicit completeness verdict.
 public struct ModelCatalogFetch: Sendable {
     public let models: [ProviderModelInfo]
     /// Completeness depends only on the response envelope, never the cached row count.
@@ -141,8 +127,7 @@ public struct ModelCatalogFetch: Sendable {
     }
 }
 
-/// Rows and authority stamps from the same cached bytes. A missing
-/// completeness stamp cannot establish that an absent model is unavailable.
+/// Rows and authority stamps from the same cached bytes. A missing completeness stamp cannot establish that an absent model is unavailable.
 struct DecodedModelCatalog: Sendable {
     let models: [ProviderModelInfo]
     let isComplete: Bool?
@@ -151,21 +136,18 @@ struct DecodedModelCatalog: Sendable {
 }
 
 struct ModelCatalogTTLCache: Sendable {
-    /// A cached list older than this is unavailable until its live refresh
-    /// succeeds; stale bytes remain on disk as historical evidence.
+    /// A cached list older than this is unavailable until its live refresh succeeds; stale bytes remain on disk as historical evidence.
     var cacheTTL: TimeInterval = 24 * 60 * 60
-    /// After a FAILED stale-path refresh, don't re-probe the network on every
-    /// subsequent read for this long. Explicit `refresh: true` always bypasses.
+    /// Failed stale refreshes cool down to avoid a network probe on every read; explicit refresh bypasses cooldown.
     var staleRefreshRetryBackoff: TimeInterval = 15 * 60
 
-    /// The cache file for a data root (its `.path` is the backoff key).
+    /// The cache path also scopes failure backoff.
     var cachePath: @Sendable (URL) -> URL
-    /// Source URL stamped into the written cache payload.
     var endpoint: URL
-    /// Decode rows and authority stamps together (`nil` when absent/empty).
+    /// Decode rows and authority stamps from the same bytes.
     var readCache: @Sendable (URL) -> DecodedModelCatalog?
     var providerConfigFile: String
-    /// Fetch the live list; throws on any failure (network/credentials).
+    /// Fetch failures must stay visible to the cache owner.
     var fetchLive: @Sendable (String?, URLSession) async throws -> ModelCatalogFetch
 
     // Backoff is keyed by cache-file path and retains the failure reason for last-known reads.
@@ -209,8 +191,7 @@ struct ModelCatalogTTLCache: Sendable {
                 }, publish: { result in
                     committed = cache.commit(result, credential: credential, dataRoot: dataRoot)
                 })
-                // Even a read whose publication was superseded must not return
-                // another credential's list as this account's live answer.
+                // Even a read whose publication was superseded must not return another credential's list as this account's live answer.
                 do {
                     let current = try CredentialFileLock.withLock(cache.configPath(dataRoot)) {
                         try LLMCredentialResolver.checkedAPIKey(providerConfigFile: cache.providerConfigFile, dataRoot: dataRoot)
@@ -243,21 +224,20 @@ struct ModelCatalogTTLCache: Sendable {
         credential.map { "api_key:" + LLMProviderStatusFeed.fingerprint($0) } ?? "unauthenticated"
     }
 
-    /// Rows never outlive their credential authority, even across a restart.
-    /// Read the binding under the same credential lock as fetch publication.
+    /// Rows never outlive their credential authority, even across a restart. Read the binding under the same credential lock as fetch publication.
     private func checkedCache(dataRoot: URL) throws -> DecodedModelCatalog? {
         try CredentialFileLock.withLock(configPath(dataRoot)) {
             let credential = try LLMCredentialResolver.checkedAPIKey(providerConfigFile: providerConfigFile, dataRoot: dataRoot)
             guard let decoded = readCache(dataRoot) else { return nil }
             guard decoded.credentialBinding == Self.credentialBinding(credential) else {
-                throw ProviderRoutingError.configurationFailed("The saved model catalog has no evidence for the current credential. Refresh its models in Providers.")
+                throw ProviderRoutingError.configurationFailed(
+                    "The saved model catalog has no evidence for the current credential. Refresh its models in Providers.")
             }
             return decoded
         }
     }
 
-    /// Synchronous routing and availability admission share the passive read's
-    /// binding, failed-refresh and freshness checks. Nil is confirmed absence.
+    /// Synchronous routing and availability admission share the passive read's binding, failed-refresh and freshness checks. Nil is confirmed absence.
     func currentCache(dataRoot: URL, now: Date = Date()) throws -> DecodedModelCatalog? {
         let decoded = try checkedCache(dataRoot: dataRoot)
         if let reason = lastFailureReason(dataRoot: dataRoot) {
@@ -301,8 +281,6 @@ struct ModelCatalogTTLCache: Sendable {
         }
     }
 
-    /// True when the cache is missing its `updated_at` stamp or that stamp is
-    /// older than `cacheTTL`.
     func cacheIsStale(fetchedAt: Date?, now: Date = Date()) -> Bool {
         guard let updated = fetchedAt else { return true }
         return now.timeIntervalSince(updated) >= cacheTTL
@@ -316,7 +294,7 @@ struct ModelCatalogTTLCache: Sendable {
         await modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh).models
     }
 
-    /// Reads return provider rows with freshness and failure reasons, or unavailable when no rows exist.
+    /// Unavailable rows retain the failure reason rather than becoming an empty successful catalog.
     func modelsWithFreshness(
         dataRoot: URL,
         session: URLSession,
@@ -341,8 +319,7 @@ struct ModelCatalogTTLCache: Sendable {
                     failure: cacheFailure ?? lastFailureReason(dataRoot: dataRoot)
                         ?? modelCatalogFault(at: cachePath(dataRoot), read: false, owner: endpoint.host ?? "this provider"))
             }
-            // The last attempt failed (a success clears the stamp): the list is
-            // last-known and says so until a fetch succeeds, fresh TTL or not.
+            // The last attempt failed (a success clears the stamp): the list is last-known and says so until a fetch succeeds, fresh TTL or not.
             if let reason = lastFailureReason(dataRoot: dataRoot) {
                 guard cacheIsStale(fetchedAt: fetchedAt), staleRefreshAllowed(dataRoot: dataRoot) else {
                     return ModelCatalogRead(
@@ -356,7 +333,8 @@ struct ModelCatalogTTLCache: Sendable {
             await Self.refreshOwner(key: backoffKey(dataRoot)).schedule(self, dataRoot: dataRoot, session: session)
             let reason = lastFailureReason(dataRoot: dataRoot)
             return ModelCatalogRead(models: [], freshness: .unavailable,
-                failure: reason ?? "The model catalog is out of date; its owner is refreshing it. Wait for refresh before choosing a model.", fetchedAt: fetchedAt)
+                failure: reason ?? "The model catalog is out of date; its owner is refreshing it. Wait for refresh before choosing a model.",
+                    fetchedAt: fetchedAt)
         }
         switch await attemptLiveRefresh(dataRoot: dataRoot, session: session) {
         case .success(let live):
@@ -371,10 +349,7 @@ struct ModelCatalogTTLCache: Sendable {
         }
     }
 
-    /// Fetch live models and update the disk cache. Returns the live list on
-    /// success, or the reason it could not be fetched — `models()` never
-    /// throws. Writing the cache changes the file's mtime, which is what
-    /// invalidates the catalogs' stat()-keyed membership memo.
+    /// Successful writes change mtime and invalidate membership decodes; fetch failures return their reason without exposing stale rows as current.
     private func attemptLiveRefresh(
         dataRoot: URL,
         session: URLSession
@@ -382,8 +357,7 @@ struct ModelCatalogTTLCache: Sendable {
         await Self.refreshOwner(key: backoffKey(dataRoot)).refresh(self, dataRoot: dataRoot, session: session)
     }
 
-    /// A probe already fetched these bytes with this credential. Publication
-    /// shares refresh ordering and checks that the saved key is still the same.
+    /// A probe already fetched these bytes with this credential. Publication shares refresh ordering and checks that the saved key is still the same.
     func publish(_ fetched: ModelCatalogFetch, credential: String, dataRoot: URL) async -> Result<ModelCatalogFetch, FetchFailure> {
         await Self.refreshOwner(key: backoffKey(dataRoot)).publish(fetched, cache: self, credential: credential, dataRoot: dataRoot)
     }
@@ -408,8 +382,7 @@ struct ModelCatalogTTLCache: Sendable {
     private func commit(_ result: Result<ModelCatalogFetch, FetchFailure>, credential: String?, dataRoot: URL) -> Result<ModelCatalogFetch, FetchFailure> {
         let key = backoffKey(dataRoot)
         do {
-            // LatestRead admitted this publication. The credential lock binds
-            // its cache write and backoff verdict to the still-selected key.
+            // LatestRead admitted this publication. The credential lock binds its cache write and backoff verdict to the still-selected key.
             return try CredentialFileLock.withLock(configPath(dataRoot)) {
                 try Self.lastFailedByPath.withLock { failures in
                     let current = try LLMCredentialResolver.checkedAPIKey(providerConfigFile: providerConfigFile, dataRoot: dataRoot)

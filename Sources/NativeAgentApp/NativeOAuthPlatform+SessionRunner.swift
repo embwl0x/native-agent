@@ -4,7 +4,7 @@ import Foundation
 import AppKit
 import AuthenticationServices
 import NativeAgentCore
-// Blueprint: | `NativeOAuthPlatform+SessionRunner.swift` | `NativeOAuthPlatform`: `runAuthSession`; nonisolated Apple callback entry, main-actor result settlement |
+// Blueprint: | `NativeOAuthPlatform+SessionRunner.swift` | `NativeOAuthPlatform`: `runAuthSession`; nonisolated callbacks, actor settlement |
 
 @MainActor
 private final class OAuthSessionResult {
@@ -65,8 +65,7 @@ extension NativeOAuthPlatform {
                 // Keep existing browser-session cookies / autofill / 2FA.
                 authSession.prefersEphemeralWebBrowserSession = false
 
-                // Let onOpenURL resolve the same outcome if
-                // the OS routes the redirect outside the ASWebAuth sheet.
+                // The OS may route the redirect outside the ASWebAuth sheet.
                 PendingCallbacks.shared.register(
                     state: expectedState,
                     resolver: { url in Task { @MainActor in response.finish(.success(url)) } }
@@ -88,8 +87,7 @@ extension NativeOAuthPlatform {
             }
             outcome = callback
         } catch { outcome = .failure(error) }
-        // All exits join the same cleanup. Cancellation selects an outcome;
-        // it cannot let the caller return ahead of callback/session release.
+        // Cancellation must await callback and session release through the same cleanup.
         await settle { @MainActor [session] in
             deadline.cancel()
             await deadline.value

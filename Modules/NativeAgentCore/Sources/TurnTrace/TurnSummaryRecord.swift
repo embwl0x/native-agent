@@ -1,56 +1,33 @@
 import Foundation
 import NativeAgentShared
+import Experiences
 // Blueprint: | `TurnSummaryRecord.swift` | `TurnSummaryComputer`, `TurnSummarySource`: Mac-owned Inspector privacy projection and byte budgets |
 
 // MARK: - Per-turn summaries for the iCloud snapshot lane
-//
-// The iOS read-only inspector does NOT receive the full per-event stream (size
-// budget — turn_traces files run to 20k rows/day). The engine's Inspector
-// projection supplies a compact summary PER TURN, and Mac sync writes a
-// single bounded `turn_summaries.json` into the iCloud snapshot dir. iOS decodes
-// it through NativeAgentShared's lenient wire value and renders a
-// flat list of turn cards.
-//
-// Phone summaries carry bounded identities, dates, metrics and allowlisted kind
-// counts; event payloads and content previews stay local (TurnTraceRedactor).
-//
-// Project the engine's grouped trace evidence directly, preserving its order
-// and metrics without constructing Inspector presentation rows.
+// Bound phone snapshots to content-free per-turn summaries: the full daily event stream exceeds the transport budget. Reuse the engine's grouped order and
+// metrics; event payloads and previews stay local.
 
 // MARK: - TurnSummaryComputer (pure projection + size budget)
 
-/// Pure transform: the engine's grouped trace evidence → a bounded
-/// encoded content-free `TurnSummaryFile`. No independent IO or grouping.
+/// Pure transform: the engine's grouped trace evidence → a bounded encoded content-free `TurnSummaryFile`. No independent IO or grouping.
 public enum TurnSummaryComputer {
 
-    /// Hard cap on the number of turns carried in the snapshot. Newest-first;
-    /// oldest turns past this count are dropped (marker set). ~200 summaries at
-    /// ~250 bytes each is comfortably under the byte budget below.
+    /// About 200 summaries at 250 bytes each fit comfortably below the snapshot byte cap.
     public static let maxTurns = 200
 
-    /// Hard byte budget for the serialized JSON. The snapshot lane is for compact
-    /// summaries, not the event stream; well under iOS's 4 MB default snapshot
-    /// read limit. If `maxTurns` summaries still exceed this, turns are dropped
-    /// oldest-first until the serialized payload fits.
+    /// Stay well below the phone's 4 MB read limit; drop oldest turns until the encoded payload fits.
     public static let maxBytes = 256 * 1024
 
-    /// The ONLY kinds the summary breakdown will name. `TurnTraceEvent.kind` is a
-    /// freeform String at the bus layer — a buggy emitter could put content in it
-    /// and a JSON KEY would carry that content into the iCloud snapshot. Unknown
-    /// kinds are bucketed as `"other"` so the snapshot never serializes a string
-    /// the summarizer didn't choose.
+    /// Allowlist kind keys so freeform emitter content cannot enter phone snapshots; bucket unknown kinds as other.
     public static let allowedKinds: Set<String> = [
         "assembly.stage", "stream.tick", "llm.call",
         "tool.dispatch", "file.touch", "thinking.delta", "memory.commit",
     ]
     public static let otherKindBucket = "other"
 
-    /// Identity fields (turnId/surface/sessionId) are also freeform strings; cap
-    /// them so a pathological value can't bloat or leak through the snapshot.
+    /// Cap freeform identities so they cannot bloat snapshots or leak unbounded content.
     public static let maxIdentityFieldLength = 120
 
-    /// Project grouped evidence to summaries, preserving newest-first order
-    /// and applying count and byte budgets with oldest-first truncation.
     public static func compute(
         from groups: [TurnTraceGroup],
         encoder: JSONEncoder = TurnSummaryComputer.makeEncoder(),
@@ -102,7 +79,7 @@ public enum TurnSummaryComputer {
         return bounded.data
     }
 
-    /// ISO8601 dates + sorted keys for the measured snapshot bytes.
+    /// Measure the same sorted-key, ISO8601 encoding the snapshot writes.
     public static func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -137,25 +114,20 @@ public enum EncodedPrefix {
 
 // MARK: - TurnSummarySource (the engine projection's persisted reader)
 
-/// Reads today's and optionally yesterday's canonical day files under the supplied root.
-/// Read failures or incomplete framing throw.
+/// Reads this day's and optionally the previous day's details under the supplied root. Read failures or unreadable details throw.
 public enum TurnSummarySource {
 
-    /// Load + decode today's (and optionally yesterday's) day files under `root`,
-    /// returning the concatenated events. Yesterday is appended SECOND so today's
-    /// events keep their natural arrival index for stable tie-breaking inside the
-    /// grouping (the grouping sorts by ts anyway; index only breaks exact ties).
+    /// Append yesterday after today so equal-time grouping retains today's original arrival precedence.
     public static func loadEvents(root: URL, now: Date = Date(), includeYesterday: Bool = true) async throws -> [TurnTraceEvent] {
-        var out: [TurnTraceEvent] = []
-        let today = try await TurnTraceReplayReader.read(TurnTraceReplayReader.fileURL(for: now, root: root))
-        guard today.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
-        out.append(contentsOf: today.events)
-        if includeYesterday {
-            let yDate = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -1, to: now) ?? now
-            let yesterday = try await TurnTraceReplayReader.read(TurnTraceReplayReader.fileURL(for: yDate, root: root))
-            guard yesterday.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
-            out.append(contentsOf: yesterday.events)
+        let calendar = TurnTracePersistLane.dayCalendar
+        let today = calendar.startOfDay(for: now)
+        guard let from = calendar.date(byAdding: .day, value: includeYesterday ? -1 : 0, to: today) else {
+            throw CocoaError(.fileReadUnknown)
         }
-        return out
+        let read = try await TurnTraceReplayReader.read(.init(from: from, through: now), root: root)
+        guard read.isClean else { throw CocoaError(.fileReadCorruptFile) }
+        // Today's equal-time arrival precedence is the same on both faces.
+        let turns = read.events.filter { $0.turnId != "unknown" }
+        return turns.filter { $0.ts >= today } + turns.filter { $0.ts < today }
     }
 }

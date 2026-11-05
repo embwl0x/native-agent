@@ -38,7 +38,7 @@ import AppKit
 import MacControl
 import ChatToolParsing
 import UniformTypeIdentifiers
-// Blueprint: | `CommandPaletteInventory.swift` | Palette item inventory, exact saved destinations (helper and reply, diary date, memory id), saved-owner projections and deterministic search ranking |
+// Blueprint: | `CommandPaletteInventory.swift` | Saved palette destinations, shared inventory and deterministic ranking |
 
 enum PaletteSavedDestination: Hashable, Sendable {
     case botReply(botID: UUID, entryID: UUID)
@@ -46,15 +46,13 @@ enum PaletteSavedDestination: Hashable, Sendable {
     case memory(String)
 }
 
-/// A single match row in the command palette.
 struct PaletteItem: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
     let subtitle: String?
     let systemImage: String
     let kind: Kind
-    /// Matched after the title and subtitle, never shown: a memory's whole
-    /// text, a tab's stored key.
+    /// Search hidden full text after visible labels so matches need not appear in the row.
     let searchText: String?
     let normalizedTitle: String
     let normalizedSubtitle: String
@@ -74,17 +72,16 @@ struct PaletteItem: Identifiable, Hashable, Sendable {
 
     enum Kind: Hashable, Sendable {
         case tab(SidebarItem)
-        case railTab(SidebarItem, String)  // rail page, tab key
-        case setting(String, tab: String?) // registry page id, the tab it is on
-        case chatSession(String)         // chat session id
-        case recentAction(String)        // recent-action id
-        case deskItem(String)            // desk handle — active OR done
+        case railTab(SidebarItem, String)
+        case setting(String, tab: String?)
+        case chatSession(String)
+        case recentAction(String)
+        case deskItem(String)
         case saved(PaletteSavedDestination)
     }
 }
 
 extension PaletteItem {
-    /// A live Desk row, as the Desk page hands it in.
     init(desk row: DeskPaletteRow) {
         self.init(
             id: "desk.\(row.handle)",
@@ -96,10 +93,6 @@ extension PaletteItem {
     }
 }
 
-/// What the Desk page adds when ⌘K opens there: its live rows, the row
-/// already selected, and its three verbs. A leading
-/// close / defer / note turns the field into a Desk command; anything else is
-/// the ordinary app-wide search with the Desk's rows in it.
 struct DeskPaletteScope {
     let rows: [DeskPaletteRow]
     let selectedHandle: String?
@@ -107,7 +100,6 @@ struct DeskPaletteScope {
     let onCommand: (DeskPaletteQuery.Verb, String) -> Void
 }
 
-/// Resolves the one row a Desk command names in its banner and hands to Enter.
 enum DeskPalettePresentation {
     static func target(
         rows: [DeskPaletteRow],
@@ -123,8 +115,7 @@ enum DeskPalettePresentation {
         return matches[min(max(highlighted, 0), matches.count - 1)]
     }
 
-    /// Says out loud what Enter is about to do. A palette that mutates on
-    /// Enter without naming the mutation is how a stray keystroke closes an item.
+    /// Name Enter's mutation before a stray keystroke can close an item.
     static func bannerText(
         for verb: DeskPaletteQuery.Verb,
         target: DeskPaletteRow?,
@@ -160,13 +151,9 @@ enum CommandPaletteRecentAction: String, CaseIterable, Sendable {
     }
 }
 
-/// The visible, deterministic projection behind Cmd+K. Keeping this separate
-/// from the sheet lets every presentation state use the same exact pool and
-/// ranking rules the user interacts with.
+/// Share the palette's pool and ranking across presentation states.
 enum CommandPalettePresentation {
-    /// `confirmed` are rows already matched elsewhere (a chat's words, found
-    /// by the message index): listed after the pool's matches, never
-    /// re-matched against what they display.
+    /// Index-confirmed chat matches keep their rank without rematching display text.
     static func filteredItems(pool: [PaletteItem], query: String, confirmed: [PaletteItem], rail: [SidebarItem]) -> [PaletteItem] {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !cleanQuery.isEmpty else {
@@ -187,7 +174,7 @@ enum CommandPalettePresentation {
             if item.normalizedSearch.contains(cleanQuery) { return (item, 5, index) }
             return nil
         }
-        // A chat its title already found is not listed again for its words.
+        // Do not duplicate a chat already matched by title.
         var chats = Set<String>()
         return (scored.sorted {
             if $0.1 != $1.1 { return $0.1 < $1.1 }
@@ -198,7 +185,6 @@ enum CommandPalettePresentation {
         }
     }
 
-    /// The rail top to bottom, in its own words — the Navigate menu's order.
     @MainActor static func railItems(_ layout: SurfaceLayoutAvailability) -> [SidebarItem] {
         SidebarItem.rail(layout).compactMap { $0 }
     }
@@ -215,8 +201,7 @@ enum CommandPalettePresentation {
             PaletteItem(id: "tab.\(item.rawValue)", title: item.shellRailTitle, subtitle: nil,
                         systemImage: item.systemImage, kind: .tab(item))
         }
-        // Every tab, under the rail page that holds it; a page's first tab
-        // shares its name and is the page row above.
+        // A page's first tab shares its name, so the page row already represents it.
         let tabs = ShellRailTab.all(layout).flatMap { page, tabs in
             tabs.filter { $0.title != page.shellRailTitle }.map { tab in
                 PaletteItem(id: "railtab.\(page.rawValue).\(tab.key)", title: tab.title,
@@ -235,8 +220,7 @@ enum CommandPalettePresentation {
                 kind: .chatSession(session.id)
             )
         }
-        // Destinations and chats rank first on an equal match; the saved things
-        // sit behind them, so ⌘K still opens a page when that is what was typed.
+        // Destinations win ties so a page name still opens that page.
         return pages + tabs + settings + chats + saved + CommandPaletteRecentAction.allCases.map { action in
             let presentation = action.presentation
             return PaletteItem(
@@ -262,8 +246,6 @@ enum CommandPalettePresentation {
         return ordered.filter { ids.insert($0.id).inserted }
     }
 
-    /// Every control in the settings registry, by its label, opening the
-    /// page it is on. Read once per opening.
     @MainActor
     static func settingItems(appModel: AppModel) throws -> [PaletteItem] {
         try QuietSettings.all(host: AppQuietSettingsHost(appModel)).map { row in
@@ -274,8 +256,6 @@ enum CommandPalettePresentation {
     }
 }
 
-/// Search rows derived from the engine's current Desk and diary revisions.
-/// Bot replies and the full memory listing use their existing checked readers.
 enum CommandPaletteSavedThings {
     @MainActor
     static func shared(engine: NativeAgentEngine) -> [PaletteItem] {
@@ -333,7 +313,7 @@ enum CommandPaletteSavedThings {
         }
     }
 
-    /// Every memory, not a newest slice; its whole text is searched.
+    /// Search all saved memories and their full text, not a newest slice.
     private static func memoryItems(_ memories: [MemoryV2.MemoryRecord]) -> [PaletteItem] {
         memories.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
             .map { record in

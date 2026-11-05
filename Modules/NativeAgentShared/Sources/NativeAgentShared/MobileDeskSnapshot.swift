@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `MobileDeskSnapshot.swift` | `DeskKind`, `DeskStatus`, `WorkOverview` and mobile Desk values: bounded canonical-identity reading copies, owner counts and execution movement; no second decision owner |
+// Blueprint: | `MobileDeskSnapshot.swift` | `DeskKind`, `DeskStatus`, `WorkOverview`: bounded Desk copies; no decision authority |
 
 public enum DeskKind: String, Sendable, CaseIterable, Equatable {
     case watch, plan, project, gh, standing
@@ -9,8 +9,7 @@ public enum DeskKind: String, Sendable, CaseIterable, Equatable {
 public enum DeskStatus: String, Sendable, CaseIterable, Equatable {
     case watch, flag, now, next, todo, done, blocked, canceled
 
-    /// done / canceled are terminal — an item is archivable only once terminal,
-    /// and a parent refuses archive while any child is non-terminal.
+    /// done / canceled are terminal — an item is archivable only once terminal, and a parent refuses archive while any child is non-terminal.
     public var isTerminal: Bool { self == .done || self == .canceled }
 }
 
@@ -29,8 +28,7 @@ public extension DeskStatus {
     }
 }
 
-/// A reading copy, never a second work or decision owner. References use the
-/// canonical identity rather than a title, alias, path, or chat draft.
+/// A reading copy, never a second work or decision owner. References use the canonical identity rather than a title, alias, path, or chat draft.
 public struct WorkOverviewReference: Codable, Equatable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case desk, approval, execution, inbox
@@ -100,7 +98,6 @@ public struct WorkOverview: Codable, Equatable, Sendable {
         self.omittedRecentlyDone = omittedRecentlyDone
     }
 
-    /// The one "needs you" number every surface shows.
     public var needsYouCount: Int { needsYou.count + omittedNeedsYou }
 
     public var headline: String {
@@ -110,7 +107,6 @@ public struct WorkOverview: Codable, Equatable, Sendable {
             : "\(waiting) \(waiting == 1 ? "thing needs" : "things need") you."
     }
 
-    /// The "and N more" line under the capped Needs-you list.
     public var needsYouOverflow: String? {
         omittedNeedsYou > 0 ? "And \(omittedNeedsYou) more waiting in Approvals, Inbox, and Desk." : nil
     }
@@ -179,8 +175,7 @@ public enum DeskActivityState: String, Sendable {
     }
 }
 
-/// Bounded, rebuildable projection of the Mac-owned Desk for companion devices.
-/// Stable handles are used for every mutation; aliases are display-only.
+/// Bounded, rebuildable projection of the Mac-owned Desk for companion devices. Stable handles are used for every mutation; aliases are display-only.
 public struct MobileDeskNote: Codable, Equatable, Sendable {
     public var timestamp: String
     public var text: String
@@ -252,12 +247,7 @@ public struct MobileDeskItem: Codable, Equatable, Identifiable, Sendable {
 }
 
 
-/// A complete reading copy of ONE Desk item, carried automatically for the few
-/// items that are worth reading away from the Mac: the ones waiting on you, the
-/// pinned active ones, and the most recently touched ones. The compact board is
-/// unchanged — this rides beside it. `capturedAt` is the source timestamp of
-/// the item this copy was taken from, so the phone can say how old the reading
-/// copy is instead of implying it is live.
+/// Bounded reading copies carry the source `capturedAt` so the phone shows their age rather than implying live state.
 public struct MobileDeskItemReadingCopy: Codable, Equatable, Identifiable, Sendable {
     public var id: String { handle }
     public var handle: String
@@ -285,11 +275,9 @@ public struct MobileDeskItemReadingCopy: Codable, Equatable, Identifiable, Senda
 public struct MobileDeskProjectionReport: Codable, Equatable, Sendable {
     /// Desk items the Mac holds, before any bound was applied.
     public var totalRows: Int
-    /// Items actually published in desk.json.
     public var includedRows: Int
     /// Items the bounds dropped. Authoritative — never recomputed by a reader.
     public var omittedCount: Int
-    /// True when anything was dropped, by either the row cap or the size cap.
     public var truncated: Bool
 
     public init(totalRows: Int, includedRows: Int) {
@@ -305,8 +293,7 @@ public enum MobileDeskProjectionBounds {
     public static let maximumRows = 300
     public static let maximumSummaryCharacters = 2_000
     public static let maximumNoteCharacters = 2_000
-    /// Every clipped string ends with this, so no reader mistakes a cut
-    /// sentence ("three watchdog kills on healthy sessi") for the whole text.
+    /// Mark every clipped string so readers cannot mistake an incomplete sentence for the whole text.
     public static let truncationMark = "…"
 
     public static func clipped(_ text: String, to limit: Int) -> String {

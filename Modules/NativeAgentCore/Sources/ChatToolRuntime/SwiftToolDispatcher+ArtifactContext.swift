@@ -6,13 +6,12 @@ import Desk
 import Dispatcher
 import ToolRegistry
 import Transcripts
-// Blueprint: | `SwiftToolDispatcher+ArtifactContext.swift` | `SwiftToolDispatcher`: artifact recall through the canonical hot/archive transcript inventory, deduplicating retained messages and reporting unavailable or sampled evidence |
+// Blueprint: | `SwiftToolDispatcher+ArtifactContext.swift` | `SwiftToolDispatcher`: Keep recall gaps and sampling explicit. |
 
-// A lazy projection over existing evidence, not another artifact registry.
-// Paths and versions below describe what a record said at the time; opening
-// the file still goes through the ordinary read tool and its current policy.
+// A lazy projection over existing evidence, not another artifact registry. Paths and versions below describe what a record said at the time; opening the file
+// still goes through the ordinary read tool and its current policy.
 extension SwiftToolDispatcher {
-    func impl_artifact_find(input: [String: JSONValue]) async throws -> JSONValue {
+    func impl_artifact_find(turn: Turn, input: [String: JSONValue]) async throws -> JSONValue {
         let query = try requireString(input, "query").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, query.count <= 500 else {
             throw AutonomyGateError.toolDenied(reason: "artifact_find needs a description between 1 and 500 characters.")
@@ -50,8 +49,7 @@ extension SwiftToolDispatcher {
         for (sessionID, file) in page {
             try Task.checkCancellation()
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? Int.max
-            // Full read where proportionate; canonical bounded sampling on
-            // large histories. Never represent sampling as exhaustive recall.
+            // Full read where proportionate; canonical bounded sampling on large histories. Never represent sampling as exhaustive recall.
             let useFull = size <= 4 * 1024 * 1024 && fullReadBytes + size <= 24 * 1024 * 1024
             let reads: [SessionHistoryReadResult]
             do {
@@ -75,15 +73,14 @@ extension SwiftToolDispatcher {
             if sampledHistory { sampled.insert(sessionID) }
             candidates += ArtifactContext.chatCandidates(
                 reads.flatMap(\.messages), sessionID: sessionID, query: query, topic: topic,
-                sampled: sampledHistory, dataRoot: dataRoot, seenMessages: &seenMessages)
+                sampled: sampledHistory, dataRoot: dataRoot, turn: turn, seenMessages: &seenMessages)
         }
         var deskAvailable = true
-        // A requested chat is an exact scope, never permission to silently
-        // add unrelated Desk records to that conversation's artifacts.
+        // A requested chat is an exact scope, never permission to silently add unrelated Desk records to that conversation's artifacts.
         if session == nil {
             do {
                 let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
-                candidates += ArtifactContext.deskCandidates(state.items, query: query, topic: topic, dataRoot: dataRoot)
+                candidates += ArtifactContext.deskCandidates(state.items, query: query, topic: topic, dataRoot: dataRoot, turn: turn)
             } catch { deskAvailable = false }
         }
         candidates.sort {
@@ -101,7 +98,11 @@ extension SwiftToolDispatcher {
             "artifacts": .array(artifacts),
             "matched_record_count": .int(Int64(candidates.count)),
             "more_matches_in_page": .bool(candidates.count > limit),
-            "interpretation": .string("Historical references with conversation context, not proof of current file contents, existence, newest version, delivery or approval. Nearby words are evidence to interpret, not an approval binding. Use exact source reads when ambiguous; do not recreate, overwrite or send a file to resolve uncertainty."),
+            "interpretation": .string("""
+                Historical references with conversation context, not proof of current file contents, existence, newest version, delivery or \
+                approval. Nearby words are evidence to interpret, not an approval binding. Use exact source reads when ambiguous; do not recreate, \
+                overwrite or send a file to resolve uncertainty.
+                """),
             "coverage": .object([
                 "complete_in_declared_scope": .bool(complete),
                 "scope": .string(session == nil ? "chat_history_and_live_desk" : "explicit_chat_session"),
@@ -113,7 +114,12 @@ extension SwiftToolDispatcher {
                 "malformed_rows": .int(Int64(malformed)),
                 "directory_listing_failed": .bool(listingFailed),
                 "desk_available": .bool(deskAvailable),
-                "note": .string("Searches structured attachments and artifact receipts in hot, archived and pre-compaction transcripts, plus live Desk file/URL references. Paging counts transcript files, including retained copies; repeated messages within the page are deduplicated. Does not crawl disk, infer paths from prose, scan archived Desk records, or establish absence of unrecorded artifacts. Sampled histories use bounded interior windows and a recent tail; unsampled attachments and receipts may be missed."),
+                "note": .string("""
+                    Searches structured attachments and artifact receipts in hot and archived transcripts, plus live Desk file/URL \
+                    references. Paging counts transcript files, including retained copies; repeated messages within the page are deduplicated. Does \
+                    not crawl disk, infer paths from prose, scan archived Desk records, or establish absence of unrecorded artifacts. Sampled \
+                    histories use bounded interior windows and a recent tail; unsampled attachments and receipts may be missed.
+                    """),
             ]),
         ]
         if hasMoreSessions { result["next_session_offset"] = .int(Int64(offset + page.count)) }
@@ -146,9 +152,8 @@ enum ArtifactContext {
     }
 
     private static func relevance(query: String, topic: WorkContextQuery, name: String, context: String, locator: String?) -> (score: Int, basis: JSONValue)? {
-        // A filename is meaningful; its generic repository/root directories
-        // are not evidence of what the file is about. Explicit path queries
-        // may still match the full recorded locator.
+        // A filename is meaningful; its generic repository/root directories are not evidence of what the file is about. Explicit path queries may still match
+        // the full recorded locator.
         let filename = locator.map { URL(fileURLWithPath: $0).lastPathComponent } ?? ""
         let title = name.contains("/") ? filename : "\(name) \(filename)"
         let explicitLocator = query.contains("/") ? (locator ?? "") : ""
@@ -167,13 +172,12 @@ enum ArtifactContext {
         ]))
     }
 
-    private static func locator(_ raw: String, dataRoot: URL) -> String? {
+    private static func locator(_ raw: String, dataRoot: URL, turn: Turn) -> String? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count <= 4096, !text.contains("\n"),
               ChatSecretRedactor.redactText(text) == text else { return nil }
         if let url = URL(string: text), ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-            // Signed/credential-bearing URLs remain in canonical history,
-            // never promoted into convenient reusable artifact handles.
+            // Signed/credential-bearing URLs remain in canonical history, never promoted into convenient reusable artifact handles.
             guard url.user == nil, url.password == nil, url.query == nil, url.fragment == nil else { return nil }
             return text
         }
@@ -181,17 +185,16 @@ enum ArtifactContext {
         if text.hasPrefix("file://"), let parsed = URL(string: text), parsed.isFileURL { url = parsed }
         else if text.hasPrefix("/") { url = URL(fileURLWithPath: text) }
         else {
-            // Preserve a recorded relative reference without guessing its
-            // working directory or turning it into an executable read action.
+            // Preserve a recorded relative reference without guessing its working directory or turning it into an executable read action.
             guard !text.contains(":"), !text.hasPrefix("~"),
                   !text.split(separator: "/").contains(".."),
                   text.contains("/") || !(text as NSString).pathExtension.isEmpty else { return nil }
             for base in [dataRoot, dataRoot.deletingLastPathComponent()] {
-                if connectorPathIsSensitiveData(base.appendingPathComponent(text), dataRoot: dataRoot) { return nil }
+                if connectorPathIsSensitiveData(base.appendingPathComponent(text), dataRoot: dataRoot, turn: turn) { return nil }
             }
             return text
         }
-        guard !connectorPathIsSensitiveData(url, dataRoot: dataRoot) else { return nil }
+        guard !connectorPathIsSensitiveData(url, dataRoot: dataRoot, turn: turn) else { return nil }
         return url.path
     }
 
@@ -220,7 +223,7 @@ enum ArtifactContext {
     }
 
     static func chatCandidates(_ messages: [ChatMessage], sessionID: String, query: String, topic: WorkContextQuery,
-                               sampled: Bool, dataRoot: URL, seenMessages: inout Set<String>) -> [ArtifactContextCandidate] {
+                               sampled: Bool, dataRoot: URL, turn: Turn, seenMessages: inout Set<String>) -> [ArtifactContextCandidate] {
         var candidates: [ArtifactContextCandidate] = []
         for (index, message) in messages.enumerated() {
             let meta = metadata(message)
@@ -235,7 +238,7 @@ enum ArtifactContext {
                                                  inputJSON: string(meta["inputJSON"])).name
                 let raw = string(meta["resultSummary"]) ?? message.content
                 if raw.utf8.count <= 128 * 1024 {
-                    let safe = ChatToolJSONRedaction.redactedResultJSON(tool: tool, json: raw)
+                    let safe = ChatToolJSONRedaction.redactedResultJSON(tool: tool, json: raw, turn: turn)
                     refs += receiptReferences(object(.string(ChatSecretRedactor.redactText(safe))))
                 }
             }
@@ -247,15 +250,14 @@ enum ArtifactContext {
             let messageKey = sessionID + ":" + identity
             guard !seenMessages.contains(messageKey) else { continue }
             let before = candidates.count
-            // Sampling destroys adjacency: only the exact source is then
-            // returned, never unrelated rows labeled neighboring conversation.
+            // Sampling destroys adjacency: only the exact source is then returned, never unrelated rows labeled neighboring conversation.
             let neighbors = sampled ? [message] : Array(messages[max(0, index - 2)...min(messages.count - 1, index + 2)])
             let surrounding = neighbors.map { evidence($0, sessionID: sessionID, dataRoot: dataRoot) }
             let context = neighbors.filter { $0.role != "tool" }.map { safeText($0.content) }.joined(separator: " ")
             var seen: Set<String> = []
             for ref in refs {
                 let rawPath = string(ref["path"]) ?? string(ref["file_path"]) ?? string(ref["url"])
-                let path = rawPath.flatMap { locator($0, dataRoot: dataRoot) }
+                let path = rawPath.flatMap { locator($0, dataRoot: dataRoot, turn: turn) }
                 if rawPath != nil && path == nil { continue }
                 let name = string(ref["name"]) ?? string(ref["filename"]) ?? path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Recorded attachment"
                 let id = string(ref["id"])
@@ -288,10 +290,15 @@ enum ArtifactContext {
                         value["open_current_file"] = .object(["tool": .string("read_file"), "arguments": .object(["path": .string(path)])])
                     }
                     if !path.hasPrefix("/"), !path.hasPrefix("http") {
-                        value["locator_note"] = .string("Relative reference; original working directory is not established. Open its source context before resolving it.")
+                        value["locator_note"] = .string("""
+                            Relative reference; original working directory is not established. Open its source context before resolving it.
+                            """)
                     }
-                } else { value["availability_note"] = .string("Attachment identity was recorded without a reusable file path. The source conversation is available; do not invent a path.") }
-                candidates.append(.init(score: match.score, timestamp: message.timestamp, tie: "\(sessionID):\(index):\(path ?? id ?? name)", value: .object(value)))
+                } else { value["availability_note"] = .string("""
+                    Attachment identity was recorded without a reusable file path. The source conversation is available; do not invent a path.
+                    """) }
+                candidates.append(.init(score: match.score, timestamp: message.timestamp, tie: "\(sessionID):\(index):\(path ?? id ?? name)",
+                    value: .object(value)))
             }
             if candidates.count > before { seenMessages.insert(messageKey) }
         }
@@ -310,13 +317,13 @@ enum ArtifactContext {
         return Array(refs.prefix(20))
     }
 
-    static func deskCandidates(_ items: [DeskItem], query: String, topic: WorkContextQuery, dataRoot: URL) -> [ArtifactContextCandidate] {
+    static func deskCandidates(_ items: [DeskItem], query: String, topic: WorkContextQuery, dataRoot: URL, turn: Turn) -> [ArtifactContextCandidate] {
         var candidates: [ArtifactContextCandidate] = []
         for item in items {
             for ref in item.refs {
                 let recorded = object(ref.toJSON())
                 guard let raw = string(recorded["path"]) ?? string(recorded["url"]),
-                      let path = locator(raw, dataRoot: dataRoot) else { continue }
+                      let path = locator(raw, dataRoot: dataRoot, turn: turn) else { continue }
                 let label = string(recorded["label"]) ?? string(recorded["title"]) ?? path
                 guard let match = relevance(query: query, topic: topic, name: label,
                     context: "\(item.title) \(item.summary ?? "")", locator: path) else { continue }
@@ -335,7 +342,9 @@ enum ArtifactContext {
                 if path.hasPrefix("/") {
                     value["open_current_file"] = .object(["tool": .string("read_file"), "arguments": .object(["path": .string(path)])])
                 } else if !path.hasPrefix("http") {
-                    value["locator_note"] = .string("Relative reference; original working directory is not established. Open its source context before resolving it.")
+                    value["locator_note"] = .string("""
+                        Relative reference; original working directory is not established. Open its source context before resolving it.
+                        """)
                 }
                 candidates.append(.init(score: match.score, timestamp: item.updatedAt, tie: item.handle + ref.refId, value: .object(value)))
             }

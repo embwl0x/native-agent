@@ -154,8 +154,7 @@ The habit's own `chat.post` also carries initiative `.intention` and does not
 spend or wait for the hourly proactive quota.
 
 After a carried resident-wake turn, its complete top-level dispatch evidence
-and model-call count record a trial off the turn path, including a turn whose
-private keep closes dispatches after the terminal: the two completion
+and model-call count record a trial off the turn path: the two completion
 notifications join in either order, once per turn. The last eight handlings
 and the one `Expectation.stands` cost law may add a once-per-day
 suggestion to the existing carried line; they alone chooses `queue.update`.
@@ -303,9 +302,9 @@ Talk is not a kind they sets. Every live intention can come to mind whenever
 what is said or read touches it.
 
 While the network is down, resident wake admission leaves arrivals pending:
-it neither moves them to recent nor stamps `lastWake`. The shared path's return
+it does not move them to recent. The shared path's return
 re-ticks the delegation loop, which rechecks normal admission and claims them
-once free. An already running wake is not replayed; its provider call ends
+once its resident session is free. An already running wake is not replayed; its provider call ends
 with a typed failure if the network stays gone for 30 seconds.
 
 An accepted date is stored with its year and absolute timestamp. If their local
@@ -371,11 +370,16 @@ stays, as a care fades.
   it neither selects by message relevance nor consumes or closes a step.
 
 **Pacing.**
-- Clock, person, released news and body-signal moments skip the free-time quiet and
-  freedom gate. They wait for a turn already running; work that wakes their
-  retains the wake owner's gathering, spacing and thread-rest rules. Direct
+- A resident arrival is ready at its own `at + hold`, with no gathering window
+  or spacing between wakes. Its `my wake` line can run alongside a conversation;
+  only another open resident wake holds that session. A carried MY QUEUE step
+  with `next_turn`, `own_turn` or `quiet` still means free time and waits for
+  the half-hour quiet interval; it cannot hold up other arrivals or join their
+  wake before it is free. Named clock, person, news, body-signal, message and
+  card moments do not acquire that quiet wait at resident admission. Thread
+  hop/rest limits, peer quota and Reach's separate-wake rule remain. Direct
   fixed-word speech retains the carry opportunity gate and records its
-  occurrence without a wake, gathering window or new thread hop.
+  occurrence without a wake or new thread hop.
 - A world moment rests 12 hours per current intention condition, kept in its
   Desk release notes. A newly filed topic has its own release evidence.
 - Quiet hours hold delivery to the person, not their doing, as now.
@@ -444,8 +448,7 @@ Words come from `payload.prompt` for a turn, `payload.message` or `payload.body`
 for a notification, and `payload.objective` for a workshop. The job's name is
 prefixed when it is not already in those words. Notifications also keep their
 message as `say`. Each step has origin `self`, with no session or reply route.
-Workshop objectives become carried words; filing a Workshop task remains their
-turn's work.
+Workshop objectives become carried words; doing that work remains their turn's.
 
 A one-shot flag or `once`/`at` schedule becomes `at <ISO nextRunAt>`, with no
 rhythm or until. A cancellation turn with an unreadable time carries its

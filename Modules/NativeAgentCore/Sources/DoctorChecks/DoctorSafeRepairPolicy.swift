@@ -7,16 +7,14 @@ public enum DoctorRepairScope: Sendable {
     case button
 }
 
-/// Safe repair admission and receipt interpretation shared by Doctor and its UI.
 public enum DoctorSafeRepairPolicy {
     public static let oauthRefreshInstruction = "Press Repair in Diagnostics → Health checks to refresh expired OAuth access through each credential owner."
 
-    // Automatic repair delegates to registered owners. Doctor never seeds
-    // persona, resets runtime authority or rewrites transcripts.
+    // Automatic repair delegates to registered owners. Doctor never seeds persona, resets runtime authority or rewrites transcripts.
     static func allowsCoreRepair(_ id: String, scope: DoctorRepairScope) -> Bool {
         switch scope {
         case .automatic:
-            ["icloud_bridge_state", "oauth_token_expiry", "inspector.trace_integrity", "coreml_embedder"].contains(id)
+            ["icloud_bridge_state", "oauth_token_expiry", "coreml_embedder"].contains(id)
         case .onboarding: ["icloud_bridge_state", "oauth_token_expiry"].contains(id)
         case .button: true
         }
@@ -61,8 +59,7 @@ public enum DoctorSafeRepairPolicy {
         Set(checkIDs(for: checks)).intersection(coreHandlerIDs)
     }
 
-    /// Only sign-ins and permissions join the consent inbox ask; app-defect
-    /// recovery instructions do not become consent requests.
+    /// Only sign-ins and permissions join the consent inbox ask; app-defect recovery instructions do not become consent requests.
     public static func isUserAsk(_ check: CheckResult) -> Bool {
         isAdverse(check.status) && check.ask != nil
     }

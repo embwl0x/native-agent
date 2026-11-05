@@ -37,7 +37,11 @@ struct NativeAgentPushTokenSyncCache {
     func load() throws -> Record? {
         guard let stored = defaults.object(forKey: Self.defaultsKey) else { return nil }
         guard let data = stored as? Data else {
-            throw SyncError.persistence("The saved APNS registration cache is not data. Repair NativeAgentMobile.lastSyncedAPNSToken in the phone's preferences; its value is retained.")
+            throw SyncError.persistence(
+                """
+                    The saved APNS registration cache is not data. Repair NativeAgentMobile.lastSyncedAPNSToken in the phone's \
+                    preferences; its value is retained.
+                    """)
         }
         return try JSONDecoder().decode(Record.self, from: data)
     }
@@ -95,8 +99,7 @@ enum NativeAgentAPNSEnvironment: String, Equatable {
 enum NativeAgentAPNSEnvironmentResolver {
     static func current(bundle: Bundle = .main) -> NativeAgentAPNSEnvironment? {
         guard let profileURL = bundle.url(forResource: "embedded", withExtension: "mobileprovision") else {
-            // App Store and TestFlight installs do not carry an embedded profile;
-            // their APNS tokens use the production environment.
+            // App Store/TestFlight installs lack embedded profiles; their APNS tokens require production.
             return resolve(embeddedProfileData: nil, embeddedProfilePresent: false)
         }
         return resolve(
@@ -137,9 +140,7 @@ enum NativeAgentAPNSEnvironmentResolver {
     }
 }
 
-/// UIKit requires the background-fetch completion callback exactly once. The
-/// timeout and the normal async path race, so the gate is synchronized rather
-/// than relying on either task being the first to return.
+/// Synchronize timeout and normal completion so UIKit's background-fetch callback fires exactly once.
 final class NativeAgentRemotePushCompletionGate: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
@@ -169,7 +170,7 @@ final class NativeAgentRemotePushCompletionGate: @unchecked Sendable {
         if Thread.isMainThread {
             completionHandler(finalResult)
         } else {
-            // UIKit hands this over from the main thread and only asks it back there.
+            // Keep UIKit's completion on its originating main thread.
             nonisolated(unsafe) let handler = completionHandler
             DispatchQueue.main.async { handler(finalResult) }
         }
@@ -245,7 +246,7 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         let completionGate = NativeAgentRemotePushCompletionGate(completionHandler)
-        // Recovery and acknowledgement share one push deadline.
+        // Recovery and acknowledgment must share the same push deadline.
         let deadline = Date().addingTimeInterval(
             Double(Self.backgroundPushDeadlineNanoseconds) / 1_000_000_000
         )
@@ -255,25 +256,17 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
             completionGate.complete(.noData)
         }
         Task { @MainActor in
-            await NADeviceSyncRecoveryBudget.$deadline.withValue(deadline) {
-                await NADeviceSyncRecoveryBudget.$didApplyData.withValue({ completionGate.noteAppliedData() }) {
-                    PushReceiptLedger.record(userInfo: userInfo)
-                    PhoneSenses.shared.wake()
-                    if NADeviceSyncRecoveryBudget.hasTime,
-                       await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo) {
-                        completionGate.noteAppliedData()
-                    }
-                    // Activity publishes Inbox independently and reports its acceptance to the gate.
-                    if NADeviceSyncRecoveryBudget.hasTime {
-                        _ = await withCKTimeout("NativeAgentMobile.push.activitySnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
-                            guard deadline.timeIntervalSinceNow > 0 else { return }
-                            await NADeviceSyncRecoveryBudget.$deadline.withValue(deadline) {
-                                await NADeviceSyncRecoveryBudget.$didApplyData.withValue({ completionGate.noteAppliedData() }) {
-                                    _ = await iCloudSyncEngine.shared.refreshActivitySnapshot()
-                                }
-                            }
-                        }
-                    }
+            let recovery = DeviceSyncRecovery(deadline: deadline, didApplyData: { completionGate.noteAppliedData() })
+            PushReceiptLedger.record(userInfo: userInfo)
+            PhoneSenses.shared.wake()
+            if recovery.hasTime,
+               await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo, recovery: recovery) {
+                completionGate.noteAppliedData()
+            }
+            if recovery.hasTime {
+                _ = await withCKTimeout("NativeAgentMobile.push.activitySnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
+                    guard recovery.hasTime else { return }
+                    _ = await iCloudSyncEngine.shared.refreshActivitySnapshot(recovery: recovery)
                 }
             }
             timeoutTask.cancel()
@@ -289,8 +282,7 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        // The visible conversation owns its reply, even if its chat record
-        // arrives after this notification. Other conversations keep their alert.
+        // Visible conversations suppress their own alerts even before chat records arrive; other conversations retain alerts.
         let keys = ChatReplyNotificationKeys(userInfo: notification.request.content.userInfo)
         nonisolated(unsafe) let done = completionHandler
         Task { @MainActor in
@@ -334,9 +326,7 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             directKey: "taskId", cloudKitRecordKey: "notificationTaskId", in: userInfo
         )
         DispatchQueue.main.async {
-            // Persist before posting. ContentView consumes this intent from
-            // UserDefaults on appearance, so a cold-launch view tree that has
-            // not installed its ephemeral observer yet still receives the tap.
+            // Persist before posting navigation so cold-launch views cannot miss a tap before their observer attaches.
             NativeAgentNotificationLaunchIntent.stage(screen: screen, sessionID: sessionID, taskID: taskID)
             NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil)
             done()
@@ -349,8 +339,7 @@ enum NativeAgentNotificationDelegatePresentation {
         .banner, .list, .sound, .badge,
     ]
 
-    /// Only a notification tap is navigation intent. A system dismiss is not a
-    /// request to reopen the app, and an unknown action must not guess a route.
+    /// Only taps authorize navigation; dismissals and unknown actions must not guess a destination.
     static func shouldRouteUserResponse(actionIdentifier: String) -> Bool {
         actionIdentifier == UNNotificationDefaultActionIdentifier
     }
@@ -370,12 +359,7 @@ enum NativeAgentNotificationEventGate {
         trigger: UNNotificationTrigger?,
         center: UNUserNotificationCenter = .current()
     ) async throws -> Bool {
-        // Avoid reposting an already pending or delivered local event.
-        // Remote/local route selection happens before this gate.
-        // UserNotifications reference types are not Sendable. Keep the center
-        // and returned request objects on this task instead of moving them into
-        // `async let` child tasks. These reads are local and bounded, and the
-        // second read still observes at least as fresh a notification snapshot.
+        // Check pending/delivered alerts to avoid duplicates. Keep non-Sendable UserNotifications objects in this task rather than async-let children.
         let pending = await center.pendingNotificationRequests()
         let delivered = await center.deliveredNotifications()
         let existingRequests = pending + delivered.map(\.request)
@@ -423,9 +407,7 @@ enum NativeAgentBridgeNotificationScheduler {
         userInfo["messageId"] = msg.id
         userInfo["source"] = userInfo["source"] ?? "mac_icloud_bridge"
 
-        // Ordinary notifications render through CloudKit's visible subscription.
-        // Their signed record acknowledges receipt, regardless of transport
-        // outcome, never posting a local alert. Requested results own that renderer.
+        // CloudKit renders ordinary alerts; signed receipt acknowledgment must not post a duplicate local notification.
         if userInfo["source"] as? String != "requested_result" {
             await iCloudSyncEngine.shared.sendNotificationReceipt(eventID: eventID, channel: "icloud_bridge_record")
             return true
@@ -436,11 +418,13 @@ enum NativeAgentBridgeNotificationScheduler {
         if settings.authorizationStatus == .notDetermined {
             do {
                 guard try await center.requestAuthorization(options: [.alert, .badge, .sound]) else {
-                    await reportFailure("iPhone notifications are not allowed. Enable notifications for NativeAgent in iPhone Settings to receive this retained alert.")
+                    await reportFailure(
+                        "iPhone notifications are not allowed. Enable notifications for NativeAgent in iPhone Settings to receive this retained alert.")
                     return false
                 }
             } catch {
-                await reportFailure("iPhone notification permission could not be requested: \(error.localizedDescription). Check Notifications in iPhone Settings.")
+                await reportFailure(
+                    "iPhone notification permission could not be requested: \(error.localizedDescription). Check Notifications in iPhone Settings.")
                 return false
             }
         } else if settings.authorizationStatus == .denied {
@@ -453,7 +437,6 @@ enum NativeAgentBridgeNotificationScheduler {
         content.body = body
         content.sound = .default
         content.userInfo = userInfo
-        // Urgent bridge notifications use time-sensitive interruption, matching APNS.
         if (metadata["urgency"] ?? (userInfo["urgency"] as? String))?.lowercased() == "urgent" {
             content.interruptionLevel = .timeSensitive
         }
@@ -474,7 +457,8 @@ enum NativeAgentBridgeNotificationScheduler {
             return true
         } catch {
             NSLog("[NativeAgentMobile] bridge notification failed id=%@: %@", msg.id, error.localizedDescription)
-            await reportFailure("The iPhone could not prepare this notification: \(error.localizedDescription). Check Notifications in iPhone Settings, then refresh Activity.")
+            await reportFailure(
+                "The iPhone could not prepare this notification: \(error.localizedDescription). Check Notifications in iPhone Settings, then refresh Activity.")
             return false
         }
     }

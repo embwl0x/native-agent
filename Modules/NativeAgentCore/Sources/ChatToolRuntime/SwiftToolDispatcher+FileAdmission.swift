@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import ChatToolParsing
 import AgentWorkspace
 import Foundation
 import TurnTrace
@@ -13,13 +14,12 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
 import Senses
 import ToolRegistry
 import ActivityWatch
 import ChatTurnContracts
 import NativeAgentShared
-// Blueprint: | `SwiftToolDispatcher+FileAdmission.swift` | `SwiftToolDispatcher`: file-root admission, bundled document reads, Full Mac access projection, local connector execution and file-result errors; connector work preserves call-scoped image and source-material context |
+// Blueprint: | `SwiftToolDispatcher+FileAdmission.swift` | `SwiftToolDispatcher`; file admission; call-scoped connectors |
 
 extension SwiftToolDispatcher {
     static func stringArray(_ value: JSONValue?) -> [String] {
@@ -51,9 +51,7 @@ extension SwiftToolDispatcher {
         return docs
     }
 
-    /// Resolve `docs/...` (and `docs` itself) against the bundled docs tree.
-    /// Returns nil for anything else, for an escape attempt, or when the path
-    /// does not exist; ordinary paths retain the normal sandbox errors.
+    /// Bundled-document resolution retains sandbox errors for ordinary paths and rejects escapes.
     static func resolveBundledDocsPath(_ path: String, bundle: Bundle = .main) -> URL? {
         let trimmed = path
         guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.hasPrefix("~") else { return nil }
@@ -72,6 +70,7 @@ extension SwiftToolDispatcher {
     }
 
     package func resolveTrustedFilePath(
+        turn: Turn,
         _ rawPath: String,
         write: Bool = false,
         followFinalLink: Bool = true,
@@ -100,7 +99,7 @@ extension SwiftToolDispatcher {
             }
         } else {
             let roots = if let trustedRoots { trustedRoots } else { try await trustedWorkspaceRoots() }
-            guard AbilityStore.fileReachAllows(candidate, write: write)
+            guard AbilityStore.fileReachAllows(candidate, write: write, turn: turn)
                 || roots.contains(where: { SwiftNativeSecurityCenter.isSelfOrAncestor(root: $0, of: candidate) }) else {
                 let renderedRoots = roots.map(\.path).sorted().joined(separator: ", ")
                 throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: '\(rawPath)' is outside trusted workspace roots (\(renderedRoots))")
@@ -146,10 +145,7 @@ extension SwiftToolDispatcher {
     }
 
     struct FullMacToolAccess: Sendable {
-        /// The exact policy snapshot used to admit this tool call. Passing the
-        /// same snapshot into MacControl avoids reading and decoding Trust
-        /// Center a second time inside one dispatch while keeping every new
-        /// tool call sensitive to policy changes.
+        /// Reuse the admission policy snapshot inside MacControl to avoid a second Trust read within one call.
         var macPolicy: MacControlPolicy
         var fullMacActive: Bool
         var fileOpsAllowed: Bool
@@ -159,21 +155,20 @@ extension SwiftToolDispatcher {
         var outsideWorkspaceDefault: String
     }
 
-    func fullMacYoloAdmitted(surface: String) async -> Bool {
-        await ChatFullMacYoloAdmission.admitted(surface: surface,
-            dataRoot: dataRoot, source: "swift_tool_dispatcher")
+    func fullMacYoloAdmitted(turn: Turn?, surface: String) async -> Bool {
+        await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+            origin: .currentTurn(turn: turn, surface: surface, source: "swift_tool_dispatcher"), turn: turn).admitted
     }
 
-    func fullMacToolAccess(surface: String = "chat") async throws -> FullMacToolAccess {
+    func fullMacToolAccess(turn: Turn?, surface: String = "chat") async throws -> FullMacToolAccess {
         let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
         let policy = snapshot.policy
-        let admitted = await ChatFullMacYoloAdmission.admitted(surface: surface,
-            dataRoot: dataRoot, source: "swift_tool_dispatcher", snapshot: snapshot)
+        let admitted = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+            origin: .currentTurn(turn: turn, surface: surface, source: "swift_tool_dispatcher"), snapshot: snapshot, turn: turn).admitted
         let macPolicy = MacControlGate.policyForAdmittedFullMac(
             MacControlPolicy.fromTrustPolicyObject(policy, dataRoot: dataRoot), admitted: admitted
         )
-        let trust = macPolicy.trustPolicy ?? MacControlTrustPolicy()
-        let fullMacActive = MacControlGate.fullMacActive(trust)
+        let fullMacActive = PermissionLaw.posture(policy) == .fullMac
         let trigger = Self.fullMacTrigger(forSurface: surface)
 
         func categoryAllowed(_ category: String) -> Bool {
@@ -187,18 +182,13 @@ extension SwiftToolDispatcher {
             fileOpsAllowed: categoryAllowed("file_ops"),
             systemAllowed: categoryAllowed("system"),
             accessibilityAllowed: categoryAllowed("accessibility"),
-            permissionLevel: trust.permissionLevel,
-            outsideWorkspaceDefault: trust.outsideWorkspaceDefault
+            permissionLevel: policy["permissionLevel"]?.stringValue ?? "balanced",
+            outsideWorkspaceDefault: policy["filePolicy"]?.objectValue?["outsideWorkspaceDefault"]?.stringValue ?? "deny"
         )
     }
 
     private static func fullMacTrigger(forSurface surface: String) -> String {
-        switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "ios", "icloud", "iphone", "ipad", "mobile", "watch":
-            return "ios"
-        default:
-            return "user"
-        }
+        surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ios" ? "ios" : "user"
     }
 
     func categoryForLocalConnectorTool(_ tool: String) -> String? {
@@ -211,8 +201,10 @@ extension SwiftToolDispatcher {
         return nil
     }
 
-    func impl_local_connector_tool(tool: String, input: [String: JSONValue], surface: String, attachment: (filename: String, data: Data)? = nil) async throws -> JSONValue {
-        let access = try await fullMacToolAccess(surface: surface)
+    func impl_local_connector_tool(turn: Turn, invocation: ChatToolInvocation, tool: String, input: [String: JSONValue], surface: String, attachment: (
+        filename: String,
+        data: Data)? = nil) async throws -> JSONValue {
+        let access = try await fullMacToolAccess(turn: turn, surface: surface)
         let category = categoryForLocalConnectorTool(tool)
         let allowed: Bool
         switch category {
@@ -221,10 +213,8 @@ extension SwiftToolDispatcher {
         default: allowed = false
         }
         guard allowed else {
-            // Not a refusal to relay as prose — a decision the person has not
-            // made. It gets asked where the work is, carrying the axis this
-            // call wanted, and it never touches the Trust posture itself.
-            if let category, let need = macControlCategoryNeedEnvelope(
+            // Ask for the missing axis where the work is; a refusal cannot substitute for the person’s decision.
+            if let category, let need = macControlCategoryNeedEnvelope(invocation: invocation,
                 categories: [category],
                 mode: ["read_file", "list_dir", "file_info"].contains(tool) ? .read : .write,
                 why: "\(tool) needs \(InlineInteractionRegistry.macCapabilityDisplayName(category).lowercased()), which is off right now."
@@ -239,18 +229,17 @@ extension SwiftToolDispatcher {
         var input = input
         if ["read_file", "list_dir", "file_info", "file_excerpt"].contains(tool),
            let path = input["path"]?.stringValue, path == "docs" || path.hasPrefix("docs/") {
-            input["path"] = .string(try await resolveTrustedFilePath(path).path)
+            input["path"] = .string(try await resolveTrustedFilePath(turn: turn, path).path)
         }
-        // The git tools' contract: an omitted cwd reads the app's verified source
-        // checkout, or the workspace when this Mac has none.
+        // The git tools' contract: an omitted cwd reads the app's verified source checkout, or the workspace when this Mac has none.
         let sourceRoot = ["git_status", "git_diff", "git_log", "repo_dirty_summary"].contains(tool)
             && (input["cwd"]?.stringValue ?? "").isEmpty ? Self.builderSourceRepoRoot(dataRoot: dataRoot) : nil
         if let sourceRoot { input["cwd"] = .string(sourceRoot.path) }
         if ["mac_volume", "mac_media"].contains(tool) {
-            let impl = makeMacControl(
-                policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
-                auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl"))
-            return try await impl.dispatch(action: tool == "mac_volume" ? "volume" : "media", body: input).toJSON()
+            let impl = makeMacControl(policyProvider: TrustCenterMacControlPolicyProvider(admittedPolicy: access.macPolicy, dataRoot: dataRoot),
+                auditDataRoot: dataRoot)
+            return try await impl.dispatch(action: tool == "mac_volume" ? "volume" : "media", body: input,
+                turn: turn, context: invocation.macContext(dataRoot: dataRoot)).toJSON(readContent: invocation.readContent)
         }
         let ctx = ConnectorActionContext(
             repoRoot: workspaceRoot,
@@ -265,20 +254,15 @@ extension SwiftToolDispatcher {
                 workspaceRoot,
             ] + (sourceRoot.map { [$0] } ?? []),
             personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot),
-            workspaceRoot: workspaceRoot
+            workspaceRoot: workspaceRoot,
+            turn: turn, readOptions: .init(metadataOnly: invocation.metadataOnly, imageSink: invocation.imageSink)
         )
         // Blocking connector filesystem work runs outside the cooperative pool.
-        let imageSink = LocalToolImage.sink
-        let sourceMaterialOnly = FileReadSourceMaterial.metadataOnly
         if let attachment { return LocalConnectorActions.saveAttachment(attachment, input: input, ctx: ctx) }
         let admittedInput = input
         let connectorResult: JSONValue? = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                let result = FileReadSourceMaterial.$metadataOnly.withValue(sourceMaterialOnly) {
-                    LocalToolImage.$sink.withValue(imageSink) {
-                        LocalConnectorActions.fileSystemDefault.run(tool, input: admittedInput, ctx: ctx)
-                    }
-                }
+                let result = LocalConnectorActions.fileSystemDefault.run(tool, input: admittedInput, ctx: ctx)
                 continuation.resume(returning: result)
             }
         }
@@ -304,7 +288,10 @@ extension SwiftToolDispatcher {
            let personaDoc = Self.personaDocumentHint(for: rawPath) {
             out["suggested_tool"] = .string("app")
             out["suggested_input"] = .object(["action": .string("persona.doc"), "args": .object(["doc": .string(personaDoc)])])
-            hint = "Persona documents are not workspace files on app-only installs. Use app with suggested_input; do not retry read_file with another relative path."
+            hint = """
+                Persona documents are not workspace files on app-only installs. Use app with suggested_input; do not retry read_file with \
+                another relative path.
+                """
         } else if case .string(let path)? = obj["path"] {
             if obj["path_kind"] == .string("directory") { hint = "\(path) is a folder, not a file. Use list_dir on it." }
             else if obj["path_kind"] == .string("file") { hint = "\(path) is a file, not a folder. Use read_file on it." }
@@ -337,8 +324,9 @@ extension SwiftToolDispatcher {
     }
 
 
-    func impl_full_mac_list_dir(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        let result = try await impl_local_connector_tool(tool: "list_dir", input: input, surface: surface)
+    func impl_full_mac_list_dir(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let result = try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: "list_dir", input: input, surface: surface)
+        let reply = ToolResult(result)
         guard case .object(let obj) = result else { return result }
         if case .array? = obj["entries"] { return result }
         if case .string(let code)? = obj["error_code"], ["directory_changed", "bad_input"].contains(code) {
@@ -347,8 +335,8 @@ extension SwiftToolDispatcher {
         if let pathMiss = filePathMissEnvelope(tool: "list_dir", input: input, resultObject: obj) {
             return pathMiss
         }
-        if case .string(let error)? = obj["error"] {
-            throw AutonomyGateError.toolDenied(reason: error)
+        if case .string? = obj["error"] {
+            throw AutonomyGateError.toolDenied(reason: reply.failure ?? "")
         }
         return result
     }

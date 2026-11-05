@@ -7,8 +7,7 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-import WorkshopExecution
-// Blueprint: | `MorningBriefAssembly.swift` | SwiftNativeTriggerScheduler authored morning-brief card assembly, part invocation and inactive schedule defaults |
+// Blueprint: | `MorningBriefAssembly.swift` | Authored brief cards and inactive schedule defaults |
 
 extension SwiftNativeTriggerScheduler {
     // MARK: InboxItem builder
@@ -40,7 +39,6 @@ extension SwiftNativeTriggerScheduler {
         return item
     }
 
-    /// Same shape as ApprovalInbox stamps.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
@@ -57,8 +55,7 @@ extension SwiftNativeTriggerScheduler {
 
     internal func defaults() async throws -> MorningBriefDefaults {
         var value = try await callBrief(.object(["operation": .string("defaults")]), as: MorningBriefDefaults.self)
-        // A seed is behaviour, never consent. Only an explicit enable mutation
-        // can activate a schedule; existing saved rows remain untouched.
+        // Seed behavior is not consent: only an explicit enable mutation activates the schedule.
         func inactive(_ rows: [JSONValue]) -> [JSONValue] {
             rows.map { row in
                 guard case .object(var fields) = row else { return row }
@@ -67,7 +64,6 @@ extension SwiftNativeTriggerScheduler {
             }
         }
         value.inbox = inactive(value.inbox)
-        value.workshop = inactive(value.workshop)
         return value
     }
 }

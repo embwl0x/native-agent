@@ -34,7 +34,10 @@ public enum DoctorEmbeddingDownloadCheck {
             return (CheckResult(source: "NativeAgent.app/Contents/Resources/embedding-download.json", id: id, title: title, status: "fail",
                                detail: error.localizedDescription,
                                harm: "The required memory model cannot be downloaded.",
-                               human_action: "Tell the person: this copy of NativeAgent has an unreadable or invalid embedding-download.json; preserve the reported descriptor error.", owner: .builder), false, false)
+                               human_action: """
+                                   Tell the person: this copy of NativeAgent has an unreadable or invalid embedding-download.json; preserve the reported \
+                                   descriptor error.
+                                   """, owner: .builder), false, false)
         }
         guard descriptor.distribution == "separate-download" else {
             return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "not needed",
@@ -50,7 +53,10 @@ public enum DoctorEmbeddingDownloadCheck {
         }
         if case .unknown(let reason) = installation.ownership {
             return (CheckResult(source: target.path, id: id, title: title, status: "unmeasured",
-                               detail: "Installation is unverified: ownership is unknown; bytes are preserved. \(reason) \(installation.modelFailure ?? "The manifest and model artifacts passed inspection; Core ML Embedder checks loading.")",
+                               detail: """
+                                   Installation is unverified: ownership is unknown; bytes are preserved. \(reason) \
+                                   \(installation.modelFailure ?? "The manifest and model artifacts passed inspection; Core ML Embedder checks loading.")
+                                   """,
                                human_action: EmbeddingModelDownload.ownershipRepairInstruction(at: target)), false, false)
         }
         if case .downloader(let installedRelease) = installation.ownership, installedRelease == descriptor.sha256 {
@@ -68,19 +74,24 @@ public enum DoctorEmbeddingDownloadCheck {
                 if state.activeEpoch != epoch.rawValue || state.dimensions != runtime.dimensions {
                     return (CheckResult(source: "extras/coreml and memory/memory.sqlite: embedding epoch", id: id, title: title, status: "warn",
                                        detail: "The installed memory model and memory search have different embedding epochs.",
-                                       harm: "She cannot reliably find memories using the installed model.",
-                                       human_action: "Press Repair in Diagnostics → Health checks to retry memory search reconciliation.", repair_available: true), true, false)
+                                       harm: "The agent cannot reliably find memories using the installed model.",
+                                       human_action: "Press Repair in Diagnostics → Health checks to retry memory search reconciliation.",
+                                           repair_available: true), true, false)
                 }
             } catch {
                 return (CheckResult(source: "extras/coreml and memory/memory.sqlite: embedding epoch", id: id, title: title, status: "unmeasured",
-                                   detail: "The installed memory model's memory search epoch could not be checked: \(error.localizedDescription)"), false, false)
+                                   detail: "The installed memory model's memory search epoch could not be checked: \(error.localizedDescription)"), false,
+                                       false)
             }
             if let failure = download.cleanupFailure {
                 return (CheckResult(source: "extras/.coreml-download", id: id, title: title, status: "warn",
-                                   detail: "The model target was installed and memory search uses its epoch; staging cleanup failed independently: \(failure)."), false, false)
+                                   detail: """
+                                       The model target was installed and memory search uses its epoch; staging cleanup failed independently: \(failure).
+                                       """), false, false)
             }
             return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "ok",
-                               detail: "An installed model is present and memory search uses its embedding epoch; Core ML Embedder checks loadability."), false, false)
+                               detail: "An installed model is present and memory search uses its embedding epoch; Core ML Embedder checks loadability."), false,
+                                   false)
         }
         let phase = download.phase
         if download.running {
@@ -96,7 +107,10 @@ public enum DoctorEmbeddingDownloadCheck {
                                human_action: ToolFailureError.fileRepairInstruction(work,
                                    shape:
                                    "These downloaded memory model parts failed the release digest and the download refuses them while they sit here. "
-                                   + "Move this whole directory intact to a sibling recovery name, never deleting a part, so app embeddings.resume downloads the release model again.")), false, false)
+                                   + """
+                                       Move this whole directory intact to a sibling recovery name, never deleting a part, so app embeddings.resume downloads \
+                                       the release model again.
+                                       """)), false, false)
         }
         let userPaused: Bool
         do { userPaused = try await EmbeddingModelDownloadController.shared.doctorUserPaused() }
@@ -124,9 +138,13 @@ public enum DoctorEmbeddingDownloadCheck {
         }
         if bytes > 0, bytes < descriptor.byteLength {
             return (CheckResult(source: "extras/.coreml-download/\(descriptor.sha256)", id: id, title: title, status: "warn",
-                               detail: "A resumable memory model transfer has \(bytes) of \(descriptor.byteLength) bytes saved; the owner will verify the final digest before installation.",
+                               detail: """
+                                   A resumable memory model transfer has \(bytes) of \(descriptor.byteLength) bytes saved; the owner will verify the final \
+                                   digest before installation.
+                                   """,
                                harm: "Memory search cannot use the required model until its transfer finishes.",
-                               human_action: "Press Repair in Diagnostics → Health checks to resume the saved transfer.", repair_available: true), false, true)
+                               human_action: "Press Repair in Diagnostics → Health checks to resume the saved transfer.",
+                               repair_available: true), false, true)
         }
         if bytes == descriptor.byteLength {
             return (CheckResult(source: "extras/.coreml-download/\(descriptor.sha256)",
@@ -134,7 +152,8 @@ public enum DoctorEmbeddingDownloadCheck {
                                id: id, title: title, status: "warn",
                                detail: "The memory model archive is fully downloaded but has not been installed; current phase: \(phase).",
                                harm: "Memory search cannot use the required model until it is installed.",
-                               human_action: "Open Diagnostics and choose Check / resume on the Memory model download row to verify and install it."), false, false)
+                               human_action: "Open Diagnostics and choose Check / resume on the Memory model download row to verify and install it."), false,
+                                   false)
         }
         return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "warn",
                            detail: "The required separate memory model has not been downloaded; current phase: \(phase).",

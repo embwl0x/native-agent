@@ -1,8 +1,9 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import TurnTrace
 import ChatTurnContracts
-// Blueprint: | `TelegramAssistantDeliveryDriver.swift` | `TelegramAssistantDeliveryDriver`: private rich drafts and durable group reply previews; `onDelta`, `finalize` join publication, retain creation uncertainty and settle known preview messages in place |
+// Blueprint: | `TelegramAssistantDeliveryDriver.swift` | `TelegramAssistantDeliveryDriver`, `onDelta`, `finalize`: join before final send |
 
 enum TelegramAssistantDeliveryOutcome: Sendable, Equatable {
     case delivered(messageId: Int?)
@@ -25,7 +26,6 @@ struct TelegramAssistantDeliveryState: Sendable, Equatable, Codable {
     var confirmedImageCount: Int? = nil
     var silent: Bool? = nil
     var lastRejection: Rejection? = nil
-    // Group previews are durable messages, updated in place by final delivery.
     var previewMessageIds: [Int]? = nil
     var previewPending: Bool? = nil
 
@@ -40,8 +40,7 @@ struct TelegramAssistantDeliveryState: Sendable, Equatable, Codable {
     }
 }
 
-/// Private chats use native drafts; groups grow durable rich messages in place.
-/// Finals retain confirmed progress; an ambiguous chunk needs explicit resend.
+/// Private chats use native drafts; groups grow durable rich messages in place. Finals retain confirmed progress; an ambiguous chunk needs explicit resend.
 actor TelegramAssistantDeliveryDriver {
     typealias SendRichDraft = @Sendable (
         _ token: String,
@@ -60,6 +59,7 @@ actor TelegramAssistantDeliveryDriver {
     typealias PersistDelivery = @Sendable (TelegramAssistantDeliveryState) async throws -> Void
 
     private let token: String
+    private let turn: Turn?
     private let destination: TelegramDestination
     private let draftId: Int
     private let sendRichDraft: SendRichDraft
@@ -84,7 +84,8 @@ actor TelegramAssistantDeliveryDriver {
     init(
         token: String,
         destination: TelegramDestination,
-        turnId: UUID,
+        draftKey: String,
+        turn: Turn?,
         savedDelivery: TelegramAssistantDeliveryState? = nil,
         sendRichDraft: @escaping SendRichDraft,
         sendRichFinal: @escaping SendRichFinal,
@@ -96,8 +97,9 @@ actor TelegramAssistantDeliveryDriver {
         sendGeneratedImage: @escaping @Sendable (String, Data) async throws -> Void
     ) {
         self.token = token
+        self.turn = turn
         self.destination = destination
-        self.draftId = Self.draftId(for: turnId)
+        self.draftId = Self.draftId(for: draftKey)
         self.groupDelivery = savedDelivery
         self.draftsUnavailable = savedDelivery?.outcomeUnknown == true
         self.sendRichDraft = sendRichDraft
@@ -141,8 +143,7 @@ actor TelegramAssistantDeliveryDriver {
             guard let text = pendingRichText else { break }
             pendingRichText = nil
             let safeText = TelegramRichMessageRenderer.sanitize(TelegramRichMessageRenderer.stripBoldMarkers(text))
-            // An opening code fence alone has no visible block yet. The next
-            // delta can complete it without disabling the native preview.
+            // An opening fence has no visible block; let the next delta complete it before disabling the preview.
             let packets = TelegramRichMessageRenderer.render(safeText)
             guard let rich = packets.last else { continue }
             // One task owns the wire and claims this window before the send.
@@ -171,8 +172,7 @@ actor TelegramAssistantDeliveryDriver {
         draftSpacing?.cancel()
         // Private drafts have no durable identity and cannot overwrite a final.
         if destination.chatId > 0 { richDraftFlush?.cancel() }
-        // A group create must retain its result before final delivery chooses
-        // between editing it and posting. Never abandon/cancel that wire call.
+        // A group create must retain its result before final delivery chooses between editing it and posting. Never abandon/cancel that wire call.
         await richDraftFlush?.value
         richDraftFlush = nil
     }
@@ -193,8 +193,7 @@ actor TelegramAssistantDeliveryDriver {
                 groupDelivery = delivery
                 try await persistDelivery(delivery)
                 if terminal {
-                    // Settlement started while the pre-dispatch row was saving;
-                    // no create was attempted, so there is no unknown send.
+                    // Settlement started while the pre-dispatch row was saving; no create was attempted, so there is no unknown send.
                     delivery.outcomeUnknown = false
                     groupDelivery = delivery
                     try await persistDelivery(delivery)
@@ -213,8 +212,7 @@ actor TelegramAssistantDeliveryDriver {
                 tracePreviewAccepted(characters: text.count)
                 delivery.previewMessageIds = (delivery.previewMessageIds ?? []) + [id]
                 delivery.outcomeUnknown = false
-                // Keep the known ID even if persistence throws: this process can
-                // still edit it; the saved unknown boundary protects a restart.
+                // Keep the known ID even if persistence throws: this process can still edit it; the saved unknown boundary protects a restart.
                 groupDelivery = delivery
                 try await persistDelivery(delivery)
             }
@@ -223,12 +221,12 @@ actor TelegramAssistantDeliveryDriver {
     }
 
     private func tracePreviewAccepted(characters: Int) {
-        guard let turn = TurnTraceContext.turnId else { return }
-        TurnTraceBus.fire(TurnTraceEvent(turnId: turn, kind: "surface.previewAccepted",
-            sessionId: ChatToolSessionContext.verifiedSessionId, surface: "telegram", payload: .object([
+        guard let turn else { return }
+        TurnTraceBus.fire(TurnTraceEvent(turnId: turn.id, kind: "surface.previewAccepted",
+            sessionId: turn.verifiedSessionID, surface: "telegram", payload: .object([
                 "characters": .int(Int64(characters)),
                 "previewKind": .string(destination.chatId > 0 ? "private_draft" : "group_message")
-            ])))
+            ]), turn: turn))
     }
 
     func finalize(
@@ -240,8 +238,7 @@ actor TelegramAssistantDeliveryDriver {
         guard !terminal else {
             return .outcomeUnknown(reason: "assistant delivery was already terminal")
         }
-        // Claim the final before the wire: reentrant finalize/abort cannot send
-        // it again while Telegram is accepting a chunk.
+        // Claim the final before the wire: reentrant finalize/abort cannot send it again while Telegram is accepting a chunk.
         terminal = true
         await finishRichDrafts()
         // A recovery containing only live prose is not a completed model reply.
@@ -265,9 +262,7 @@ actor TelegramAssistantDeliveryDriver {
         }
         do {
             try await persistDelivery(delivery)
-            // Final words (including a failure notice) replace the unfinished
-            // preview before any refusal. Unknown creation stays unknown and
-            // never authorizes another send, but recovery retains these words.
+            // Final words replace unfinished previews; unknown creation never authorizes another send, but recovery must retain the words.
             if !resendUnknown, let reason = delivery.rejectionReason { return .failed(reason: reason) }
             guard !delivery.outcomeUnknown || resendUnknown else {
                 return .outcomeUnknown(reason: "use /retry resend to resend the unconfirmed part; it may arrive twice")
@@ -288,8 +283,7 @@ actor TelegramAssistantDeliveryDriver {
             }
             for index in delivery.confirmedMessageIds.count..<messages.count {
                 let message = messages[index]
-                // A crash after acceptance but before confirmation is uncertain,
-                // too. Persist that boundary before touching the wire.
+                // A crash after acceptance but before confirmation is uncertain, too. Persist that boundary before touching the wire.
                 delivery.outcomeUnknown = true
                 try await persistDelivery(delivery)
                 if try await holdDelivery() {
@@ -315,8 +309,7 @@ actor TelegramAssistantDeliveryDriver {
                 try await persistDelivery(confirmed)
                 delivery = confirmed
             }
-            // Parsing an unfinished fence/table may have used more packets than
-            // the completed reply. Remove only those superseded preview packets.
+            // Parsing an unfinished fence/table may have used more packets than the completed reply. Remove only those superseded preview packets.
             for id in (delivery.previewMessageIds ?? []).dropFirst(messages.count) {
                 try await deleteMessage(token, destination.chatId, id)
             }
@@ -333,7 +326,8 @@ actor TelegramAssistantDeliveryDriver {
         }
     }
 
-    private func deliverGeneratedImages(_ delivery: inout TelegramAssistantDeliveryState, preparedImages: [Data]) async throws -> TelegramAssistantDeliveryOutcome {
+    private func deliverGeneratedImages(_ delivery: inout TelegramAssistantDeliveryState,
+        preparedImages: [Data]) async throws -> TelegramAssistantDeliveryOutcome {
         for (path, bytes) in zip((delivery.imagePaths ?? []).dropFirst(delivery.confirmedImageCount ?? 0), preparedImages) {
             delivery.outcomeUnknown = true
             try await persistDelivery(delivery)
@@ -401,10 +395,8 @@ actor TelegramAssistantDeliveryDriver {
             : "Telegram didn't confirm it"
     }
 
-    private static func draftId(for turnId: UUID) -> Int {
-        let compact = turnId.uuidString.replacingOccurrences(of: "-", with: "")
-        let suffix = compact.suffix(8)
-        let value = UInt32(suffix, radix: 16) ?? 1
+    private static func draftId(for key: String) -> Int {
+        let value = SHA256.hash(data: Data(key.utf8)).prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         return max(1, Int(value & 0x7FFF_FFFF))
     }
 }

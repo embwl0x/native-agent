@@ -7,12 +7,13 @@ import SwarmRuns
 import Agents
 import ChatSessionWork
 import NativeAgentCore
+import ChatTurnContracts
 import PersistenceCore
 import StandingBots
 import ProviderRouting
 import AppKit
 import AppToolRuntime
-// Blueprint: | `SimpleContactThread.swift` | Contact conversation, live reply, stop and queued resend retain canonical session acceptance and delivery evidence |
+// Blueprint: | `SimpleContactThread.swift` | Contact replies, Stop and queued resend through canonical session acceptance |
 
 struct SimpleContactThread: View {
     let contact: SimpleContact
@@ -20,20 +21,17 @@ struct SimpleContactThread: View {
     let openChat: () -> Void
     @Environment(AppModel.self) private var appModel
     @State private var note: String?
-    /// The person's sends still being handed over (a second can go while
-    /// the first's reply is coming; it queues behind it).
+    /// Allow another send during a reply; session acceptance queues it behind the current turn.
     @State private var sending = 0
     @State private var failure: String?
-    /// Stop tapped; cleared once the stop call returns.
     @State private var stopAsked = false
-    /// Held messages being sent again.
     @State private var resending: Set<String> = []
-    @State private var reading = ChatScrollFollow()
+    @State private var transcriptHandle = TranscriptDocumentHandle()
 
     private var agentName: String { AgentVoice(name: appModel.agentDisplayName).name }
     private var root: URL { appModel.engine.dataRoot }
 
-    /// Where the last send stands when no reply is owed or none came.
+    /// Retain delivery state when no reply arrives so silence cannot imply success.
     private var receipt: String? {
         if store.flight(for: contact.id)?.stop?.state == "stopped" { return "Stopped." }
         return switch store.status[contact.id] {
@@ -46,9 +44,7 @@ struct SimpleContactThread: View {
         }
     }
 
-    /// Chats this contact opened with the agent over the bridge. Peer-owned
-    /// session IDs survive retitling.
-    /// The contact's own conversation is this thread, so it is not listed.
+    /// Peer session IDs survive retitling; omit the thread's own conversation from its extra chats.
     private var openedChats: [ChatSession] {
         let owner = String(contact.id.dropFirst(5))
         return appModel.engine.transcripts.sessions.filter { session in
@@ -57,121 +53,138 @@ struct SimpleContactThread: View {
         }
     }
 
-    var body: some View {
-        let lines = store.lines[contact.id] ?? []
-        let opened = openedChats
-        TranscriptScrollView(coordinator: reading) {
-            LazyVStack(alignment: .leading, spacing: 26) {
-                if let error = store.refreshError {
-                    Text(error)
-                        .font(ShellType.body)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                }
-                if !opened.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Chats \(contact.name) started with \(agentName)")
-                            .font(ShellType.captionSemibold)
-                            .foregroundStyle(NativeAgentShell.tertiary)
-                        ForEach(opened) { session in
-                            Button {
-                                Task {
-                                    await appModel.selectChatSession(session)
-                                    openChat()
-                                }
-                            } label: {
-                                Text(topic(session))
-                                    .font(ShellType.label)
-                                    .foregroundStyle(NativeAgentShell.secondary)
-                                    .lineLimit(1)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityHint("Opens this chat with \(agentName)")
-                        }
-                    }
-                }
-                if lines.isEmpty && opened.isEmpty && store.refreshError == nil {
-                    Text(contact.lastActivityAt == nil
-                         ? "Nothing has passed between \(agentName) and \(contact.name) yet."
-                         : "Earlier activity is recorded, but no messages are retained here.")
-                        .font(ShellType.body)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                }
-                ForEach(lines) { line in
-                    SimpleTranscriptEntry(speaker: (line.byPerson ? "You" : line.fromAgent ? agentName : contact.name)
+    /// The thread's lines and, while the contact writes, its partial reply as the last line.
+    private var documentLines: [SimpleThreadDocument.Line] {
+        var rows = (store.lines[contact.id] ?? []).map { line in
+            SimpleThreadDocument.Line(id: line.id, speaker: (line.byPerson ? "You" : line.fromAgent ? agentName : contact.name)
                                           + (line.door.map { " · " + $0 } ?? ""),
-                                          text: line.text, at: line.at)
-                        .equatable()
-                        .readingBlock("\(line.id)")
+                                      text: line.text, at: line.at)
+        }
+        if store.waiting.contains(contact.id), let partial = store.partial(for: contact.id) {
+            rows.append(SimpleThreadDocument.Line(id: "live:" + contact.id, speaker: contact.name, text: partial, at: nil))
+        }
+        return rows
+    }
+
+    var body: some View {
+        TranscriptDocumentView(sessionID: "contact:" + contact.id, groups: SimpleThreadDocument.groups(documentLines),
+                               handle: transcriptHandle)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                VStack(alignment: .leading, spacing: 12) {
+                    SimpleThreadHeader(title: contact.name, subtitle: contact.via) {
+                        SimpleAvatar(contact: contact, size: 36)
+                    }
+                    threadNotes
                 }
-                let flight = store.flight(for: contact.id)
-                if store.waiting.contains(contact.id) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        SimpleLiveReply(contact: contact, store: store, stopping: stopAsked, stop: stop)
-                        // A stop or a queued send that didn't take, said while the reply still comes.
-                        if let failure {
-                            Text(failure)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    flightStatus
+                        .padding(.bottom, 8)
+                    composer
+                }
+            }
+    }
+
+    /// What sits above the thread: a read failure, the chats the contact opened, or why there is nothing yet.
+    private var threadNotes: some View {
+        let opened = openedChats
+        return VStack(alignment: .leading, spacing: 12) {
+            if let error = store.refreshError {
+                Text(error)
+                    .font(ShellType.body)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            if !opened.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Chats \(contact.name) started with \(agentName)")
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(NativeAgentShell.tertiary)
+                    ForEach(opened) { session in
+                        Button {
+                            Task {
+                                await appModel.selectChatSession(session)
+                                openChat()
+                            }
+                        } label: {
+                            Text(topic(session))
                                 .font(ShellType.label)
                                 .foregroundStyle(NativeAgentShell.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Opens this chat with \(agentName)")
                     }
-                    .readingBlock("live")
-                } else if sending > 0 {
-                    Text("Sending…")
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.tertiary)
-                } else if let failure {
+                }
+            }
+            if (store.lines[contact.id] ?? []).isEmpty && opened.isEmpty && store.refreshError == nil {
+                Text(contact.lastActivityAt == nil
+                     ? "Nothing has passed between \(agentName) and \(contact.name) yet."
+                     : "Earlier activity is recorded, but no messages are retained here.")
+                    .font(ShellType.body)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+        }
+        .simpleRoomColumn()
+    }
+
+    /// The send in flight under the thread: who is writing and Stop, the delivery receipt or failure, and anything queued.
+    private var flightStatus: some View {
+        let flight = store.flight(for: contact.id)
+        return VStack(alignment: .leading, spacing: 10) {
+            if store.waiting.contains(contact.id) {
+                SimpleLiveReply(contact: contact, store: store, stopping: stopAsked, stop: stop)
+                if let failure {
                     Text(failure)
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                } else if let said = receipt {
-                    Text(said)
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
-                if let flight, let words = SimpleLiveReply.stopWords(flight) {
-                    Text(words)
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                ForEach(flight?.queued ?? []) { item in
-                    SimplePendingMessage(item: item, speaker: item.byPerson ? "You" : agentName, name: contact.name,
-                                         resending: resending.contains(item.id)) {
-                        if let flight { sendAgain(item, from: flight) }
-                    }
-                }
-            }
-            .simpleRoomColumn()
-            .padding(.top, 12)
-            .padding(.bottom, 24)
-        }
-        // From the top when it fits; opened at the newest, and kept there
-        // while the reader is (TranscriptScrollView).
-        .defaultScrollAnchor(.top, for: .alignment)
-        .defaultScrollAnchor(.bottom, for: .initialOffset)
-        // Lines dissolve before the header, as in the chat.
-        .roomTopChrome {
-            SimpleThreadHeader(title: contact.name, subtitle: contact.via) {
-                SimpleAvatar(contact: contact, size: 36)
-            }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if let restriction = contact.sendRestriction {
-                Text(restriction == "Replies only"
-                     ? "Replies only · \(agentName) can't start a conversation with \(contact.name)."
-                     : restriction)
+            } else if sending > 0 {
+                Text("Sending…")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+            } else if let failure {
+                Text(failure)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
-                    .simpleRoomColumn()
-                    .padding(.vertical, 12)
-            } else {
-                SimpleComposer(thread: contact.id, placeholder: "Message \(contact.name)", recipient: contact.name, note: note) { text in
-                    await send(text)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let said = receipt {
+                Text(said)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+            }
+            if let flight, let words = SimpleLiveReply.stopWords(flight) {
+                Text(words)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(flight?.queued ?? []) { item in
+                SimplePendingMessage(item: item, speaker: item.byPerson ? "You" : agentName, name: contact.name,
+                                     resending: resending.contains(item.id)) {
+                    if let flight { sendAgain(item, from: flight) }
                 }
+            }
+        }
+        .simpleRoomColumn()
+    }
+
+    @ViewBuilder
+    private var composer: some View {
+        if let restriction = contact.sendRestriction {
+            Text(restriction == "Replies only"
+                 ? "Replies only · \(agentName) can't start a conversation with \(contact.name)."
+                 : restriction)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .simpleRoomColumn()
+                .padding(.vertical, 12)
+        } else {
+            SimpleComposer(thread: contact.id, placeholder: "Message \(contact.name)", recipient: contact.name, note: note) { text in
+                await send(text)
             }
         }
     }
@@ -184,7 +197,7 @@ struct SimpleContactThread: View {
 
     private func send(_ text: String) async -> Bool {
         guard contact.sendRestriction == nil else { return false }
-        // Sends queue behind a live reply in the agent's current conversation.
+        // Queue behind the current reply to preserve session ordering.
         let session = appModel.activeChatSessionId
         guard !session.isEmpty, appModel.engine.transcripts.sessions.contains(where: { $0.id == session }) else {
             note = "Chat is still starting. Nothing was sent."
@@ -194,18 +207,19 @@ struct SimpleContactThread: View {
         note = nil
         failure = nil
         sending += 1
-        reading.followFromLiveEdge()
+        transcriptHandle.goToLatest()
         let agent = contact.id
         defer { sending -= 1 }
-        if let why = await NativeAgentEngine.live.sendContactMessage(agent: agent, text: text, session: session, root: root) {
+        let turn = Turn(session: session).with(\.envelope,
+            .personOnMac("mac_ui:contact.send"))
+        if let why = await NativeAgentEngine.live.sendContactMessage(agent: agent, text: text, session: session, root: root, turn: turn) {
             failure = why
             return false
         }
         return true
     }
 
-    /// Stop the reply in flight, through the same gated chain as a send. What
-    /// happened is written on the thread and shows from there.
+    /// Use the send gates for Stop and retain its outcome in the thread.
     private func stop() {
         guard !stopAsked, let flight = store.flight(for: contact.id) else { return }
         let session = flight.scope
@@ -222,8 +236,7 @@ struct SimpleContactThread: View {
         }
     }
 
-    /// A held message, sent again by the person's tap; the held copy leaves
-    /// the thread once the new send is accepted (sent or queued).
+    /// Remove the held copy only after the replacement send is accepted.
     private func sendAgain(_ item: SimpleFlight.Queued, from flight: SimpleFlight) {
         let session = flight.scope
         guard !resending.contains(item.id) else { return }
@@ -235,9 +248,11 @@ struct SimpleContactThread: View {
         let agent = flight.agent
         resending.insert(item.id)
         failure = nil
+        let turn = Turn(session: session).with(\.envelope,
+            .personOnMac("mac_ui:contact.send"))
         Task { @MainActor in
             if let why = await NativeAgentEngine.live.sendContactMessage(agent: agent, text: item.text, session: session, root: root,
-                                                      conversation: flight.agent.hasPrefix("bot:") ? nil : flight.recordID) {
+                                                      conversation: flight.agent.hasPrefix("bot:") ? nil : flight.recordID, turn: turn) {
                 failure = why
             } else {
                 do {
@@ -251,7 +266,6 @@ struct SimpleContactThread: View {
     }
 }
 
-/// Show streamed words, elapsed work or handoff waiting, with the contact's Stop action.
 private struct SimpleLiveReply: View {
     let contact: SimpleContact
     let store: SimpleViewStore
@@ -259,7 +273,7 @@ private struct SimpleLiveReply: View {
     let stop: () -> Void
     private var flight: SimpleFlight? { store.flight(for: contact.id) }
 
-    /// A stop that could not stop, in plain words, for as long as it applies.
+    /// Keep a failed Stop visible while it still applies.
     static func stopWords(_ flight: SimpleFlight) -> String? {
         switch flight.stop?.state {
         case "cannot_stop"? where flight.inFlight: flight.stop?.detail
@@ -299,16 +313,13 @@ private struct SimpleLiveReply: View {
                     .accessibilityHint("Asks \(contact.name) to stop. Anything queued goes next.")
                 }
             }
-            if let partial = store.partial(for: contact.id) {
-                SimpleLiveText(text: partial)
-                    .font(ShellType.body)
-                    .foregroundStyle(NativeAgentShell.text.opacity(0.82))
-                    .lineSpacing(NativeAgentShellLayout.replyLineSpacing)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
-                    .accessibilityLabel("\(contact.name) is writing: \(partial)")
+            if store.partial(for: contact.id) != nil {
+                // The partial reply reads as the thread's last line, so this strip says only that it is coming.
+                Text("Writing…")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.tertiary)
             } else if let flight, flight.working, let since = flight.live?.startedAt {
-                // Once a second, only while it works and has nothing to show.
+                // Tick only while working with no text so idle or populated rows need no timer.
                 TimelineView(.periodic(from: since, by: 1)) { context in
                     Text("Working · " + Self.elapsed(from: since, to: context.date))
                         .font(ShellType.label)
@@ -331,7 +342,6 @@ private struct SimpleLiveReply: View {
         .accessibilityElement(children: .contain)
     }
 
-    /// "12s", "3m 04s", "1h 02m".
     static func elapsed(from start: Date, to now: Date) -> String {
         let interval = now.timeIntervalSince(start)
         guard interval >= 0, let seconds = Int(exactly: interval.rounded(.towardZero)) else {
@@ -343,7 +353,7 @@ private struct SimpleLiveReply: View {
     }
 }
 
-/// Pending sends show their queue state; held messages explain why and offer Send again.
+/// Held messages need a reason and an explicit resend; pending sends retain their queue state.
 private struct SimplePendingMessage: View {
     let item: SimpleFlight.Queued
     let speaker: String

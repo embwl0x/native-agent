@@ -1,16 +1,13 @@
 import SwiftUI
 
-// Blueprint: | `ChatPacedReveal.swift` | `ChatStreamPacer` and shared streaming views: paragraph-aware paced reveal, explicit inline outcomes, edge fade and settle crossfade for Mac/iPhone |
+// Blueprint: | `ChatPacedReveal.swift` | `ChatStreamPacer`: paragraph reveal, fade and settle shared by Mac/phone |
 
-// Mac and iPhone share paced reply reveal, edge fade and settle crossfade.
 
-/// One Text per paragraph, with the same gap and inline styling as settled
-/// replies. The pacer retains paragraph offsets and the styled edge; fade-only
-/// frames change the edge's renderer without splitting or parsing the source.
+/// One Text per paragraph, with the same gap and inline styling as settled replies. The pacer retains paragraph offsets and the styled edge;
+/// fade-only frames change the edge's renderer without splitting or parsing the source.
 @available(macOS 15, iOS 18, *)
 public struct StreamingParagraphText: View {
     let text: Substring
-    /// The newest revealed runs, still fading in. Empty when not paced.
     var fades: [ChatStreamPacer.Fade] = []
     var now: TimeInterval = 0
     /// The settled reply's inline markdown parse; nil streams raw text.
@@ -32,7 +29,6 @@ public struct StreamingParagraphText: View {
         self.inline = inline
     }
 
-    /// Between paragraphs, on top of the line spacing: 10pt, Grok's gap.
     public static let paragraphGap: CGFloat = 10
 
     public var body: some View {
@@ -40,8 +36,7 @@ public struct StreamingParagraphText: View {
         let last = paragraphs.count - 1
         let styled = projectedStyles ?? Self.styledParagraphs(paragraphs, enabled: inline != nil)
         VStack(alignment: .leading, spacing: lineSpacing + Self.paragraphGap) {
-            // Positional ids: paragraphs only append while a reply streams,
-            // so a finished one keeps its id and its layout.
+            // Positional ids: paragraphs only append while a reply streams, so a finished one keeps its id and its layout.
             ForEach(paragraphs.indices, id: \.self) { index in
                 let parse = styled[index] ? inline : nil
                 if index == last {
@@ -54,8 +49,7 @@ public struct StreamingParagraphText: View {
         }
     }
 
-    /// Which paragraphs take markdown: none inside, opening or closing a
-    /// code fence.
+    /// Code fences must remain literal while prose receives markdown styling.
     static func styledParagraphs(_ paragraphs: [Substring], enabled: Bool) -> [Bool] {
         guard enabled else { return Array(repeating: false, count: paragraphs.count) }
         var inFence = false
@@ -66,8 +60,7 @@ public struct StreamingParagraphText: View {
         }
     }
 
-    /// One paragraph, its still-fading runs tagged with when they appeared.
-    /// Fade offsets are UTF-8 offsets into the whole reply.
+    /// Fade offsets address UTF-8 bytes in the whole reply.
     static func paragraph(
         _ text: Substring,
         fades: [ChatStreamPacer.Fade],
@@ -80,9 +73,8 @@ public struct StreamingParagraphText: View {
             case .parsed(let styled):
                 return paragraph(text, styled: styled, fades: fades)
             case .failed(_, let reason):
-                // The notice is not a subsequence of the source, so source
-                // fade offsets must not be applied to it. Show the actual
-                // revealed source, without the live edge's closing markers.
+                // The notice is not a subsequence of the source, so source fade offsets must not be applied to it. Show the actual revealed source,
+                // without the live edge's closing markers.
                 return Text(ChatRichContentParser.InlineOutcome.failed(
                     source: String(text), reason: reason).presentation)
             }
@@ -105,10 +97,8 @@ public struct StreamingParagraphText: View {
         return composed
     }
 
-    /// The styled paragraph, split where each fade starts. The parse drops
-    /// markers, so a fade's source offset maps to the first drawn character
-    /// that came from at or after it (drawn characters are a subsequence of
-    /// the source).
+    /// The styled paragraph, split where each fade starts. The parse drops markers, so a fade's source offset maps to the first drawn character that
+    /// came from at or after it (drawn characters are a subsequence of the source).
     static func paragraph(_ text: Substring, styled: AttributedString, fades: [ChatStreamPacer.Fade]) -> Text {
         guard !fades.isEmpty else { return Text(styled) }
         let start = text.base.utf8.distance(from: text.base.utf8.startIndex, to: text.startIndex)
@@ -141,12 +131,10 @@ public struct StreamingParagraphText: View {
         return composed
     }
 
-    /// The live edge with a marker she has opened but not yet closed closed,
-    /// so `**bold` streams bold; with nothing after it yet, the marker is
-    /// hidden. Only live markers count: a backslash-escaped `*` and anything
-    /// inside a closed code span are literal, and inside a code span still
-    /// open at the edge `**` is literal too.
-    static func closingEdge(_ text: Substring) -> String {
+    /// The live edge with a marker the agent has opened but not yet closed, so `**bold` streams bold; with nothing after it yet, the marker is
+    /// hidden. Only live markers count: a backslash-escaped `*` and anything inside a closed code span are literal, and inside a code span still open
+    /// at the edge `**` is literal too.
+    public static func closingEdge(_ text: Substring) -> String {
         var edge = String(text)
         var bold: [Range<String.Index>] = []
         var index = edge.startIndex
@@ -177,20 +165,17 @@ public struct StreamingParagraphText: View {
         }
         if bold.count % 2 == 1, let open = bold.last {
             var tail = edge[open.upperBound...]
-            // The closing marker's first half already arrived.
             if tail.hasSuffix("*"), !tail.hasSuffix("\\*") { tail = tail.dropLast() }
             // A closing `**` after a space does not close.
             let words = tail[..<(tail.lastIndex { !$0.isWhitespace }.map(tail.index(after:)) ?? tail.startIndex)]
             edge = words.isEmpty ? String(edge[..<open.lowerBound]) : String(edge[..<words.endIndex]) + "**"
         } else if edge.hasSuffix("*"), edge.dropLast().last?.isWhitespace ?? true {
-            // A marker's first half, alone at the edge.
             edge.removeLast()
         }
         return edge
     }
 
-    /// Splits at each blank line, dropping the break. A break still at the
-    /// stream's edge adds nothing until the next paragraph's first word.
+    /// Splits at each blank line, dropping the break. A break still at the stream's edge adds nothing until the next paragraph's first word.
     public static func paragraphs(_ text: Substring) -> [Substring] {
         var out: [Substring] = []
         var start = text.startIndex
@@ -204,8 +189,7 @@ public struct StreamingParagraphText: View {
     }
 }
 
-/// A paragraph the stream has moved past. Its text no longer changes, so it
-/// parses once and its body is skipped on every later frame.
+/// A paragraph the stream has moved past. Its text no longer changes, so it parses once and its body is skipped on every later frame.
 @available(macOS 15, iOS 18, *)
 private struct FinishedParagraph: View, Equatable {
     let text: Substring
@@ -221,8 +205,7 @@ private struct FinishedParagraph: View, Equatable {
     }
 }
 
-/// The platform's settled-reply inline markdown parse, handed to the live
-/// reply so both draw the same words and expose the same parse failures.
+/// The platform's settled-reply inline markdown parse, handed to the live reply so both draw the same words and expose the same parse failures.
 public struct ChatInlineMarkdown: Sendable {
     let parse: @Sendable (String) -> ChatRichContentParser.InlineOutcome
 
@@ -231,24 +214,20 @@ public struct ChatInlineMarkdown: Sendable {
     }
 }
 
-/// The live reply reveals words smoothly and pauses when caught up or hidden.
-/// Mounts, hidden-window returns and excessive backlog show current words;
+/// The live reply reveals words smoothly and pauses when caught up or hidden. Mounts, hidden-window returns and excessive backlog show current words;
 /// Reduce Motion bypasses pacing and fades.
 @available(macOS 15, iOS 18, *)
 public struct PacedStreamingText: View {
     let text: String
-    /// Further behind than this, jump. The iPhone's ~1 s batches run up to
-    /// ~1,200 bytes, so it passes a larger lag than the Mac's 70 ms publishes.
+    /// Further behind than this, jump. The iPhone's ~1 s batches run up to ~1,200 bytes, so it passes a larger lag than the Mac's 70 ms publishes.
     var maxLagBytes: Int
     var inline: ChatInlineMarkdown?
     var isVisible: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pacer = ChatStreamPacer()
-    /// The text length the pacer last came to rest at; paused only while
-    /// that is still the whole text, so a jump to the end also pauses.
+    /// The text length the pacer last came to rest at; paused only while that is still the whole text, so a jump to the end also pauses.
     @State private var restedAt = -1
 
-    /// Called each time the reveal has caught up with the whole text.
     var onCaughtUp: (() -> Void)?
 
     public init(text: String, maxLagBytes: Int = ChatStreamPacer.maxLagBytes, inline: ChatInlineMarkdown? = nil,
@@ -305,17 +284,12 @@ public struct PacedStreamingText: View {
     }
 }
 
-/// The paced reveal's clock. Lives in `PacedStreamingText`'s state, is read
-/// and advanced only inside its timeline, and is never observed.
-///
-/// Muse's numbers: 80 words a second over a buffer of about 50 characters,
-/// 0.9× while under 37.5 are buffered, 1× to 75, then ramping to 1.75× at
-/// 150 and capped at 2×. At most one word a frame, two while catching up.
+/// The paced reveal's clock. Lives in `PacedStreamingText`'s state, is read and advanced only inside its timeline, and is never observed. 80 words/s
+/// over a ~50-character buffer balances smooth reveal and catch-up; cap at two words per frame.
 @available(macOS 15, iOS 18, *)
 @MainActor
 public final class ChatStreamPacer {
     public struct Fade: Equatable {
-        /// UTF-8 offset where this frame's reveal starts.
         let start: Int
         let at: TimeInterval
     }
@@ -417,15 +391,13 @@ public final class ChatStreamPacer {
         shown == text.utf8.count && fades.isEmpty
     }
 
-    /// Reveals what is due at `now` and returns the revealed UTF-8 length,
-    /// always on a scalar boundary.
-    func advance(_ text: String, now: TimeInterval, maxLagBytes: Int) -> Int {
+    /// Reveals what is due at `now` and returns the revealed UTF-8 length, always on a scalar boundary.
+    public func advance(_ text: String, now: TimeInterval, maxLagBytes: Int) -> Int {
         let utf8 = text.utf8
         let target = utf8.count
         let gap = max(0, now - (lastTick ?? now))
         lastTick = now
-        // First look, a reset (a retried turn starts over), or a window that
-        // was hidden while text waited: show it all, never replay it.
+        // First look, a reset (a retried turn starts over), or a window that was hidden while text waited: show it all, never replay it.
         guard shown >= 0, shown <= target, !(waitingAtLastTick && gap > Self.hiddenGap) else {
             shown = target
             fades.removeAll()
@@ -451,8 +423,7 @@ public final class ChatStreamPacer {
             budget = 0
         }
         fades.removeAll { now - $0.at >= ChatEdgeFade.duration }
-        // A same-instant re-read (a publish while paused) is not a frame; the
-        // first real frame after a rest must pace, not count as hidden.
+        // A same-instant re-read (a publish while paused) is not a frame; the first real frame after a rest must pace, not count as hidden.
         if gap > 0 { waitingAtLastTick = shown < target }
         return shown
     }
@@ -461,7 +432,6 @@ public final class ChatStreamPacer {
         byte == 0x20 || byte == 0x0A || byte == 0x09 || byte == 0x0D
     }
 
-    /// The end of the next word, taking the spaces before it along.
     static func wordEnd(_ utf8: String.UTF8View, from: Int, limit: Int) -> Int {
         var offset = from
         var index = utf8.index(utf8.startIndex, offsetBy: from)
@@ -490,7 +460,6 @@ public final class ChatStreamPacer {
     }
 }
 
-/// When a run of the live reply appeared, for its fade-in.
 @available(macOS 15, iOS 18, *)
 struct ChatEdgeFade: TextAttribute {
     /// Only the new edge fades, over about 150 ms, ease-out.
@@ -498,8 +467,7 @@ struct ChatEdgeFade: TextAttribute {
     let revealedAt: TimeInterval
 }
 
-/// Draws the newest words of the live reply fading in and everything else as
-/// it is. Only opacity changes per frame: a redraw, never a re-layout.
+/// Draws the newest words of the live reply fading in and everything else as it is. Only opacity changes per frame: a redraw, never a re-layout.
 @available(macOS 15, iOS 18, *)
 struct ChatEdgeFadeRenderer: TextRenderer, Equatable {
     var now: TimeInterval
@@ -534,8 +502,7 @@ public struct ChatCrossfadeStack: Layout {
     }
 
     public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        // The parent's width, not the incoming phase's: an outgoing reply
-        // keeps wrapping where it did while it fades.
+        // The parent's width, not the incoming phase's: an outgoing reply keeps wrapping where it did while it fades.
         let width = ProposedViewSize(width: proposal.width ?? bounds.width, height: nil)
         for subview in subviews {
             subview.place(at: bounds.origin, anchor: .topLeading, proposal: width)

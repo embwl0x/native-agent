@@ -113,9 +113,8 @@ public struct OrganismField: Codable, Sendable, Equatable {
     public var nodes: [String: OrganismNode]
     public var edges: [String: OrganismEdge]
     public var lastUpdatedAt: Date?
-    /// Monotonic local mutation generation. Source timestamps remain
-    /// provenance; repair acknowledgement uses this generation so delayed
-    /// events cannot be lost and repaired tissue is not replayed.
+    /// Monotonic local mutation generation. Source timestamps remain provenance; repair acknowledgement uses this generation so delayed events cannot be lost
+    /// and repaired tissue is not replayed.
     public var mutationGeneration: UInt64
 
     public init(
@@ -289,17 +288,13 @@ public enum OrganismPlasticity {
         case .correctionReceived, .memoryCorrected:
             return .weaken(0.65)
         case .toolFailed, .providerFailed, .phoneDeliveryFailed, .deskItemBlocked, .iPhoneStale,
-             .approvalRequested, .resourcePressureChanged:
+             .approvalRequested, .resourcePressureChanged, .organDeviated:
             return .uncertain(0.35)
         case .userSpoke, .toolStarted, .toolCancelled, .providerStarted, .providerCancelled,
              .phoneDeliveryStarted, .deskItemCreated, .deskItemCancelled, .appWake, .appSleep:
             return .strengthen(0.7)
         case .horizonRefresh:
-            // Unreachable by construction — `associations` returns [] for this
-            // kind, so there are no nodes to touch and no edges to learn on.
-            // Stated as an explicit zero rather than folded into a neighbouring
-            // case so that if associations are ever given to it, the default is
-            // "learns nothing" instead of somebody else's multiplier.
+            // No associations means nothing to learn; keep an explicit zero so adding associations cannot inherit another kind's multiplier.
             return .strengthen(0)
         }
     }
@@ -386,15 +381,11 @@ public enum OrganismPlasticity {
             return ["body:mac:\(bodySchema.macAwake ? "awake" : "sleeping")"]
         case .resourcePressureChanged:
             return ["body:resource:\(OrganismResourcePressure.from(metadata: metadata)?.rawValue ?? bodySchema.resourcePressure.rawValue)"]
-        case .userSpoke, .assistantSpoke, .correctionReceived, .deskItemCreated, .deskItemBlocked, .deskItemClosed, .deskItemCancelled:
+        case .userSpoke, .assistantSpoke, .correctionReceived, .deskItemCreated, .deskItemBlocked, .deskItemClosed, .deskItemCancelled,
+             .organDeviated:
             return []
         case .horizonRefresh:
-            // Item 5: NO association, deliberately. `.appWake` — the kind this
-            // lane used before it had one of its own — returns
-            // `body:mac:<awake>`, so every refresh pass re-touched the
-            // association meaning "the Mac is awake" and slowly made a calendar
-            // read look like evidence about the machine. A horizon refresh is
-            // evidence about nothing; it only moves the rows.
+            // Horizon refresh only moves prediction rows; it supplies no evidence for field associations.
             return []
         }
     }

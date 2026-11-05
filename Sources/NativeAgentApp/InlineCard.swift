@@ -4,18 +4,11 @@ import SwiftUI
 
 // Blueprint: | `InlineCard.swift` | Inline card visual grammar: surfaces, controls, symbols and receipts; no store or work lifecycle ownership |
 
-/// Cards render supplied values and actions; the interaction owner decides effects.
-/// Live cards use fill and hairline; receipts use hairline with the same symbol inset.
-/// The consequence alone uses “→”; links remain plain.
-/// Receipt marks are green ✓ done, white ✕ declined and yellow ? unknown.
-/// Failures keep the live card, explanation and safe retry under the yellow mark.
-/// Declining consequences and permission durations are explicit.
-/// Titles wrap at narrow widths; metadata moves to a gray second line.
+/// The interaction owner owns effects; views must keep failures live with their controls and reserve receipts for settled outcomes.
 
 // MARK: - Tokens
 
 enum InlineCardPalette {
-    /// Primary buttons use dark ink on dark-mode teal, white on light-mode teal.
     static let onNeedsYou = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             ? NSColor(srgbRed: 0x0B / 255, green: 0x10 / 255, blue: 0x13 / 255, alpha: 1)
@@ -24,17 +17,14 @@ enum InlineCardPalette {
 }
 
 enum InlineCardMetrics {
-    /// The symbol column and its gap: body and controls align with the title.
     static let symbolColumn: CGFloat = 24
     static let symbolGap: CGFloat = NativeAgentSpacing.sm
     static let padding: CGFloat = NativeAgentSpacing.lg
     static let controlHeight: CGFloat = 32
-    /// The pointer target a control must fill, whatever its drawn height.
     static let touchTarget: CGFloat = 44
 }
 
-/// Live cards wear the kit's house glass; receipts carry the hairline alone; a quiet line
-/// (superseded, declined) carries neither — it is scrollback, not an object.
+/// Quiet scrollback carries no fill so it does not compete with live cards.
 enum InlineCardSurface {
     case live
     case settled
@@ -52,7 +42,7 @@ extension View {
             case .quiet: framed
             }
         }
-        // Cards inside the window's prose mask receive one local mood tint.
+        // Apply one local mood tint only inside the window's prose mask.
         .moodTintSurface(in: shape)
         .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
     }
@@ -60,7 +50,6 @@ extension View {
 
 // MARK: - The display model
 
-/// The three receipt marks. Three colours, three meanings, no fourth.
 enum InlineCardMark {
     case done
     case declined
@@ -85,12 +74,10 @@ enum InlineCardMark {
 
 // MARK: - Parts
 
-/// The symbol column: 24 pt wide, 8 pt gap, everything else aligned to the title.
 struct InlineCardSymbol: View {
     let name: String
     var tint: Color = NativeAgentShell.secondary
-    // The ramp scales with the system's Text size, so the column the title
-    // aligns to has to scale with it or the glyph crowds the words.
+    // Scale the symbol column with Text size so its glyph cannot crowd the title.
     @ScaledMetric(relativeTo: .body) private var column: CGFloat = InlineCardMetrics.symbolColumn
     @ScaledMetric(relativeTo: .body) private var glyph: CGFloat = 15
 
@@ -167,7 +154,6 @@ struct InlineCardSecondaryButton: View {
     }
 }
 
-/// One primary, one quiet secondary and its consequence; “→” belongs only here.
 struct InlineCardActions: View {
     let primary: String
     var primaryEnabled: Bool = true
@@ -182,12 +168,10 @@ struct InlineCardActions: View {
             HStack(spacing: NativeAgentSpacing.sm) {
                 InlineCardPrimaryButton(title: primary, enabled: primaryEnabled,
                                         busy: busy, action: onPrimary)
-                // Busy disables a SECOND submission, never the way out: the
-                // quiet command stays live while the card is working.
+                // Busy prevents duplicate submission but must leave the quiet way out active.
                 InlineCardSecondaryButton(title: secondary, action: onSecondary)
             }
             if !consequence.isEmpty {
-                // The cost of declining uses subtitle weight with contrast above captions.
                 Text(consequence)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -197,8 +181,6 @@ struct InlineCardActions: View {
     }
 }
 
-/// In-place disclosure — the payload, the exact scope, the historical receipt.
-/// Never a sheet and never a navigation.
 struct InlineCardDetails<Content: View>: View {
     let label: String
     @ViewBuilder var content: Content
@@ -217,7 +199,6 @@ struct InlineCardDetails<Content: View>: View {
     }
 }
 
-/// A scope line: what the permission actually covers, wrapped, never a caption.
 struct InlineCardScopeLine: View {
     let text: String
 
@@ -235,8 +216,6 @@ struct InlineCardScopeLine: View {
     }
 }
 
-/// Busy is still: one small indicator, no shimmer, no gradient, no percentage
-/// the app cannot prove.
 struct InlineCardBusyLine: View {
     let text: String
 
@@ -250,9 +229,6 @@ struct InlineCardBusyLine: View {
 
 // MARK: - The shell
 
-/// Symbol column, title, one-sentence reason, whatever the card needs in the
-/// middle, and an optional disclosure. Everything below the title aligns with
-/// the title's leading edge.
 struct InlineCard<Content: View>: View {
     let symbol: String
     var symbolTint: Color = NativeAgentShell.secondary
@@ -266,7 +242,6 @@ struct InlineCard<Content: View>: View {
             InlineCardSymbol(name: symbol, tint: symbolTint)
             VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                    // The title never truncates, at any width.
                     Text(title)
                         .font(ShellType.bodySemibold)
                         .foregroundStyle(NativeAgentShell.text)
@@ -288,16 +263,12 @@ struct InlineCard<Content: View>: View {
     }
 }
 
-/// The settled receipt: hairline only, ONE line — symbol + outcome — at the
-/// live card's horizontal inset, so the mark lands in the icon column. When the
-/// width cannot hold outcome and metadata together, the metadata drops to a
-/// gray second line; the outcome itself is never truncated.
+/// Align receipt marks with live-card symbols; wrap metadata separately so outcomes never truncate.
 struct InlineCardReceipt<Details: View>: View {
     let mark: InlineCardMark
     let outcome: String
     var meta: String? = nil
     var detailsLabel: String? = nil
-    /// Quiet declines use one gray line without a box.
     var quiet: Bool = false
     @ViewBuilder var details: Details
 
@@ -363,12 +334,8 @@ extension InlineCardReceipt where Details == EmptyView {
     }
 }
 
-/// The one line an ask leaves behind when a newer, identical ask replaced it.
-/// No mark, no box, no controls: the question is still open, but it is open on
-/// the card further down, and this line says where it went.
 struct InlineCardSupersededLine: View {
     var text: String = "Asked earlier"
-    // Stays aligned with the symbol column beside it, at any text size.
     @ScaledMetric(relativeTo: .body) private var column: CGFloat = InlineCardMetrics.symbolColumn
 
     var body: some View {

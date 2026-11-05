@@ -7,11 +7,10 @@ import TurnTrace
 import Transcripts
 import ChatTurnContracts
 
-// Blueprint: | `MacChatTurnCommands.swift` | `NativeChatTurnOptions` normalizes picker persona; `MacChatTurnRuntime` owns memory facts, notes and scratch commands; transcript commands live on NativeAgentEngine |
+// Blueprint: | `MacChatTurnCommands.swift` | `NativeChatTurnOptions`; `MacChatTurnRuntime`; Shared picker and Mac command ownership |
 
-/// Picker persona normalization shared with Core.
 public struct NativeChatTurnOptions: Sendable, Equatable {
-    /// The picker displays the same normalized value Core compiles.
+    /// The picker and Core share normalization so the displayed persona matches the compiled one.
     public static func normalizedPickerPersona(_ raw: String?, fallback: String = "canonical") -> String {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? fallback : trimmed
@@ -19,9 +18,11 @@ public struct NativeChatTurnOptions: Sendable, Equatable {
 }
 
 public extension MacChatTurnRuntime {
+    // These direct UI commands run outside a model turn and perform no sense reads.
     nonisolated func storeMacChatMemoryFact(_ text: String) async throws {
         _ = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-            .store(content: text, source: "mac.slash-remember", metadata: nil)
+            .store(content: text, source: "mac.slash-remember", metadata: nil,
+                   context: MemoryWriteContext(turn: nil, senseReads: nil))
     }
 
     nonisolated func storeMacChatNote(_ text: String) async throws {
@@ -35,8 +36,9 @@ public extension MacChatTurnRuntime {
             metadata: .object([
                 "note_kind": .string("user_note"), "tags": .array([]),
                 "confidence": .double(0.8), "importance": .double(0.5),
-                "surface": .string("mac"), "command": .string("/note"),
-            ])
+                "surface": .string("chat"), "command": .string("/note"),
+            ]),
+            context: MemoryWriteContext(turn: nil, senseReads: nil)
         )
     }
 

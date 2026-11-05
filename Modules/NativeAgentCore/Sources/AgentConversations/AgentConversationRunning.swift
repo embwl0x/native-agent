@@ -2,11 +2,9 @@ import AgentWorkspace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentConversationRunning.swift` | `AgentConversationRunning` class; `begin`, `end`; retains sends by row and operation through their matching exit, including Stop waiters when a follow-up begins; retains queued senders and background conclusions through actual exit; a response timeout does not release an accepted send's owner; withdrawing queued work wakes its sender to exit; Stop joins local send settlement before retiring and joining exchange-owned desktop readers; the continuation lifecycle closes reader admission and drains settlement before closing live publication |
+// Blueprint: | `AgentConversationRunning.swift` | `AgentConversationRunning`, `begin`, `end` |
 
-/// A route that returned "waiting" and watches for the answer itself (Grok's
-/// desktop chat): the exchange is in flight only while this process still
-/// runs that watch, so a restart never leaves the thread waiting on nothing.
+/// A desktop reply watch exists only while its owning process runs, so restart cannot leave a thread waiting on nothing.
 public enum AgentConversationWatches {
     public static func begin(row: String, operation: String) { AgentConversationRunning.shared.beginWatch(row + ":" + operation) }
     public static func end(row: String, operation: String) { AgentConversationRunning.shared.endWatch(row + ":" + operation) }
@@ -19,9 +17,7 @@ public enum AgentConversationWatches {
     public static func stop() async { await AgentConversationRunning.shared.shutdownWatches() }
 }
 
-/// What this process is doing for a thread right now: the in-flight send it
-/// can stop, and the queued follow-ups it has a sender waiting on. Memory
-/// only; the record on disk stays the state every surface reads.
+/// In-flight ownership is process-local; durable records remain the state every surface reads.
 final class AgentConversationRunning: @unchecked Sendable {
     static let shared = AgentConversationRunning()
     private let lock = NSLock()
@@ -34,8 +30,7 @@ final class AgentConversationRunning: @unchecked Sendable {
         var stopped = false
         var waiters: [CheckedContinuation<Bool, Never>] = []
     }
-    // A ready row can begin its next send before the previous settlement exits.
-    // Each operation keeps its Stop waiters until its own matching end.
+    // A ready row can begin its next send before the previous settlement exits. Each operation keeps its Stop waiters until its own matching end.
     private var sends: [SendKey: Send] = [:]
     private var conclusions: [String: Task<Void, Never>] = [:]
     private struct Sender {
@@ -66,7 +61,7 @@ final class AgentConversationRunning: @unchecked Sendable {
         lock.withLock { retainedWatches.values.contains { $0.row == row && $0.operation == operation } }
     }
 
-    /// Explicit retirement also reaches watches whose reporting deadline passed.
+    /// Retirement must also reach watches past their reporting deadline.
     func retireWatches(row: String, operation: String) async -> Bool {
         let tasks = lock.withLock {
             retainedWatches.values.filter { $0.row == row && $0.operation == operation }.map(\.task)
@@ -102,8 +97,7 @@ final class AgentConversationRunning: @unchecked Sendable {
         changed()
     }
 
-    /// The accepted send owns its settlement until actual exit, including
-    /// after the inline response timeout or a stop request cancels its send.
+    /// The accepted send owns its settlement until actual exit, including after the inline response timeout or a stop request cancels its send.
     func conclude(row: String, operation: String, work: @escaping @Sendable () async -> Void) {
         let key = row + ":" + operation
         lock.withLock {
@@ -119,7 +113,6 @@ final class AgentConversationRunning: @unchecked Sendable {
         lock.withLock { sends[SendKey(row: row, operation: operation)] != nil }
     }
 
-    /// Stops this process's own in-flight send for that exact operation.
     func stop(row: String, operation: String) async -> Bool {
         await withCheckedContinuation { cancel(row: row, operation: operation, waiter: $0) }
     }
@@ -141,7 +134,8 @@ final class AgentConversationRunning: @unchecked Sendable {
 
     func beginWatch(_ key: String) { lock.withLock { _ = routeWatches.insert(key) } }
     func endWatch(_ key: String) { lock.withLock { _ = routeWatches.remove(key) }; changed() }
-    func routeWatching(row: String, operation: String) -> Bool { lock.withLock { routeWatches.contains(row + ":" + operation) } || observing(row: row, operation: operation) }
+    func routeWatching(row: String, operation: String) -> Bool { lock.withLock { routeWatches.contains(row + ":" + operation) } || observing(row: row,
+        operation: operation) }
 
     /// One sender per queued message, for this process's lifetime.
     func adopt(_ item: String) -> Bool {
@@ -160,7 +154,6 @@ final class AgentConversationRunning: @unchecked Sendable {
     func release(_ item: String) { lock.withLock { _ = senders.removeValue(forKey: item) } }
     func waiting(_ item: String) -> Bool { lock.withLock { senders[item] != nil } }
 
-    /// A `wait` is watching this thread for its reply right now.
     func watch(_ row: String) { lock.withLock { watches[row, default: 0] += 1 } }
     func unwatch(_ row: String) {
         lock.withLock { watches[row] = (watches[row] ?? 1) > 1 ? watches[row]! - 1 : nil }
@@ -181,7 +174,6 @@ final class AgentConversationRunning: @unchecked Sendable {
         woken.resume()
     }
 
-    /// Returns at the first store write after `seen`, or at `deadline`.
     func change(after seen: Int, until deadline: Date) async {
         guard let waiter = lock.withLock({ generation == seen ? changeWaiter : nil }) else { return }
         await withTaskGroup(of: Void.self) { group in

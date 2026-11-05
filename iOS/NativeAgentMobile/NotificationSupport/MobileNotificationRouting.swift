@@ -2,8 +2,7 @@ import CloudKit
 import NativeAgentShared
 import UserNotifications
 
-/// Presentation/routing hints only. Decisions still re-read the synced row
-/// and enter the signed Mac action path; a push cannot grant approval authority.
+/// Push hints carry no approval authority: decisions re-read the synced row and use signed Mac actions.
 enum MobileNotificationRouting {
     static let approvalCategory = "nativeagent.mobile.approval"
     static let messageCategory = "nativeagent.mobile.message"
@@ -23,9 +22,7 @@ enum MobileNotificationRouting {
             throw NSError(domain: "NativeAgentNotification", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "Notification content could not be copied for routing."])
         }
-        // The Mac's router names the conversation a knock came from as
-        // `originSessionId`. A knock with no screen of its own opens that
-        // conversation, with Reply, instead of the Activity queue.
+        // `originSessionId` names the knock's conversation; a knock without its own screen opens that conversation with Reply.
         let screen = nonEmpty(copy.userInfo["screen"] as? String)
         if nonEmpty(copy.userInfo["sessionId"] as? String) == nil,
            nonEmpty(copy.userInfo["approvalId"] as? String) == nil,
@@ -42,9 +39,7 @@ enum MobileNotificationRouting {
         return copy
     }
 
-    /// CloudKit's three-field alert projection omits action IDs. Read the exact
-    /// notified record's existing envelope, without changing the Mac schema or
-    /// selecting a different request by title/time.
+    /// CloudKit alerts omit action IDs; read the exact notified record's envelope, never choose a request by title or time.
     static func resolvingCloudKitRouting(_ content: UNNotificationContent) async throws -> UNNotificationContent {
         guard let query = CKNotification(fromRemoteNotificationDictionary: content.userInfo) as? CKQueryNotification,
               let recordID = query.recordID else { return try categorized(content) }

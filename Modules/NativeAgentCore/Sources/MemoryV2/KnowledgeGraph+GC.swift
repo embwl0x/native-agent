@@ -1,31 +1,6 @@
-// ── ORPHAN DEFINITION (verified against the live schema) ────────────────────
-// The live schema has NO memory<->entity link table. The only linkage is:
-//   - kg_entities.metadata_json.last_memory_id  (most recent sourcing memory,
-//     written by the indexer on insert AND touch)
-//   - kg_memory_index.memory_id                 (the set of indexed memories;
-//     reconciled against the canonical facts in the sweep transaction)
-// `last_memory_id` alone is NOT sufficient: memory A and B can both mention
-// an entity, last points at B, B dies, A lives — last-based sweeping would
-// destroy a live entity. So orphanhood is a conjunction of FOUR conditions:
-//
-//   An entity is an orphan candidate iff ALL of:
-//   1. metadata_json[created_by_indexer] is present — the entity was PROVABLY
-//      created by this indexer from a MemoryV2 memory. Unknown ownership never
-//      proves that an entity is an orphan.
-//   2. metadata_json.last_memory_id is present AND not in the transaction's
-//      live memory IDs — its most recent source is gone.
-//   3. Re-extraction over the transaction's live memory contents does not
-//      yield the entity's (type, name) key — no surviving memory still
-//      mentions it. This is the load-bearing reconcile; conditions 1-2 are
-//      cheap pre-filters and extraction-drift protection.
-//   4. The entity is not the stable primary-user role hub.
-//
-// Sweeping an entity also deletes its incident kg_relationships rows in the
-// SAME transaction, plus any dangling edges and stale kg_memory_index rows
-// (every add has a remove). Canonical facts, support and candidates share that
-// transaction; preview uses the same scan in a read transaction.
-//
-// Preview is read-only; apply rechecks the exact reviewed candidate set.
+// Only indexer-created entities with a missing latest source, no surviving extracted mention and no primary-user role are orphan candidates. The latest-source
+// stamp alone cannot prove orphanhood because other memories may still mention an entity. Reconcile support, candidates, incident edges, dangling edges and
+// stale index rows in one canonical transaction. Preview reads only; apply rechecks the exact reviewed set.
 
 import Foundation
 import GRDB
@@ -47,11 +22,9 @@ public struct KnowledgeGraphGCCandidate: Sendable, Equatable {
 }
 
 public struct KnowledgeGraphGCReport: Sendable, Equatable {
-    /// Entities that met the orphan definition at scan time.
     public var candidates: [KnowledgeGraphGCCandidate]
     /// Entities without creation ownership evidence; reported, never swept.
     public var untrackedEntities: Int
-    /// True when deletions were performed.
     public var applied: Bool
     public var candidateSetDiverged: Bool
     public var entitiesDeleted: Int
@@ -61,11 +34,8 @@ public struct KnowledgeGraphGCReport: Sendable, Equatable {
 
 extension SwiftNativeKnowledgeGraphIndexer {
 
-    /// Sweep using canonical active, non-empty facts in the scan transaction.
-    ///
-    /// - apply=false: pure read (dry run) — candidates only, no mutations.
-    /// - apply=true: deletes candidates + incident edges + dangling edges +
-    ///   stale index rows in ONE write transaction after checking the reviewed IDs.
+    /// Preview reads canonical facts without mutation; apply rechecks reviewed IDs and removes candidates, incident/dangling edges and stale index rows in one
+    /// write transaction.
     public func collectGarbage(
         apply: Bool = false,
         expectedCandidateIDs: Set<String>? = nil
@@ -109,7 +79,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
             }
             var edgesDeleted = 0
             var staleDeleted = 0
-            // 1. Stale index rows (deleted memories whose hook never fired).
             for chunk in Self.gcChunks(scan.staleIndexIDs) {
                 let qs = Array(repeating: "?", count: chunk.count).joined(separator: ",")
                 try db.execute(
@@ -118,7 +87,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 )
                 staleDeleted += db.changesCount
             }
-            // 2. Orphan entities + their incident edges.
             let orphanIDs = scan.candidates.map { $0.id }
             for chunk in Self.gcChunks(orphanIDs) {
                 let qs = Array(repeating: "?", count: chunk.count).joined(separator: ",")
@@ -132,8 +100,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     arguments: StatementArguments(chunk)
                 )
             }
-            // 3. Any dangling edges left by historical paths (read path drops
-            //    them on load; remove the rows for real).
             try db.execute(sql: """
                 DELETE FROM kg_relationships
                 WHERE from_id NOT IN (SELECT id FROM kg_entities)
@@ -204,22 +170,17 @@ extension SwiftNativeKnowledgeGraphIndexer {
             let type: String = r["type"] ?? ""
             guard !id.isEmpty else { continue }
             let meta = try Self.metadataObject(r["metadata_json"])
-            // Condition 4: never the stable primary-user role hub. v4 hubs
-            // have no creation stamp, but keep the explicit role guard so a
-            // future metadata migration cannot make identity sweepable.
+            // Always protect the primary-user role hub, even if its creation metadata changes.
             if case .string(let role)? = meta["role"], role == "primary_user" {
                 continue
             }
-            // Condition 1: provably indexer-created.
             guard meta[createdByKey] != nil else {
                 untracked += 1
                 continue
             }
-            // Condition 2: most recent source memory gone.
             guard case .string(let lastID)? = meta["last_memory_id"],
                   !lastID.isEmpty else { continue }
             if liveIDs.contains(lastID) { continue }
-            // Condition 3: no surviving memory still mentions it.
             if liveKeys.contains("\(type.lowercased())|\(name.lowercased())") { continue }
             let mentions: Int = {
                 if let mc: Int64 = r["mention_count"] { return Int(mc) }

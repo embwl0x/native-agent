@@ -33,7 +33,10 @@ extension DoctorReadout {
         } catch {
             config.enabled = false
             config.runOnStartup = false
-            config.readError = "Auto Doctor configuration is unavailable at \(path.path): \(error.localizedDescription). Its bytes were preserved; repair this file before automatic diagnostics can run."
+            config.readError = """
+                Auto Doctor configuration is unavailable at \(path.path): \(error.localizedDescription). Its bytes were preserved; repair \
+                this file before automatic diagnostics can run.
+                """
         }
         return config
     }

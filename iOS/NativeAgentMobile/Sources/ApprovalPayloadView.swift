@@ -2,25 +2,63 @@ import SwiftUI
 import CoreFoundation
 import NativeAgentShared
 import UserNotifications
-// Blueprint: | `ApprovalPayloadView.swift` | Readable approval payload fields and exact Mac-sent details |
+// Blueprint: | `ApprovalPayloadView.swift` | An approval's words (title, kind, reason) and readable payload fields with the exact Mac-sent details |
+
+typealias PendingApproval = ApprovalRequest
+
+enum ApprovalText {
+    @MainActor static var agentDecision: String { "Studio canon is \(iCloudSyncEngine.shared.agentDisplayName)'s to decide." }
+
+    static func kind(_ action: String) -> String {
+        let id = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let head = id.split(separator: ".").first.map(String.init) ?? id
+        switch head {
+        case "self_improvement", "improvement": return "Self-improvement"
+        case "skill": return "New skill"
+        case "memory", "rem": return "Memory"
+        case "autonomy": return "Autonomy"
+        default: return id.isEmpty ? "Before I go ahead" : ToolActivityPresentation.title(id)
+        }
+    }
+
+    static func title(_ approval: PendingApproval) -> String {
+        approval.title.isEmpty ? ToolActivityPresentation.title(approval.action)
+            : ToolActivityPresentation.approvalText(approval.title, tool: approval.action)
+    }
+
+    static func reason(_ approval: PendingApproval) -> String? {
+        approval.reason.map { readable(ToolActivityPresentation.approvalText($0, tool: approval.action)) }
+    }
+
+    static func readable(_ raw: String) -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let tag = text.firstMatch(of: /^\[[A-Za-z0-9_.\-]+\]\s*/) { text.removeSubrange(tag.range) }
+        var lines: [String] = []
+        for rawLine in text.components(separatedBy: .newlines) {
+            var line = rawLine.trimmingCharacters(in: .whitespaces)
+            if let marks = line.firstMatch(of: /^#{1,6}\s*/) {
+                line.removeSubrange(marks.range)
+                if !line.contains(" "), line.contains(where: { "-_.".contains($0) }) { continue }
+            }
+            line = line.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: "")
+            if line.isEmpty, lines.last?.isEmpty ?? true { continue }
+            lines.append(line)
+        }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
 
 // MARK: - Payload preview
 
-/// What will be sent, said on the card in plain lines ("To: Sam", "Message:
-/// …") above Approve: nobody says yes to something they cannot see, and
-/// nobody reads JSON. Keys become words; braces, quotes and ids never show.
-/// The full raw view stays one tap away in "Details". When the Mac sent
-/// nothing, one plain line says so; nothing is ever synthesized.
+/// Show readable outgoing fields before approval so consent is informed; retain exact raw details and never synthesize missing payloads.
 struct PayloadPreview: View {
     let approval: PendingApproval
-    /// Chat's inline card is shorter: fewer lines before "Details".
     var maxLines = 6
     @State private var showsDetails = false
     @State private var lines: [Line]?
 
     static let missingLine = "Full details appear once your Mac sends them."
 
-    /// The Mac's own payload, or nil.
     var payload: String? {
         guard let preview = approval.payloadPreview?.trimmingCharacters(in: .whitespacesAndNewlines),
               !preview.isEmpty else { return nil }
@@ -40,8 +78,6 @@ struct PayloadPreview: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 } else {
-                    // The Mac wrote a sentence, not a payload: its first
-                    // paragraph in plain words; the rest stays in Details.
                     Text(ApprovalText.readable(payload).components(separatedBy: "\n\n").first ?? payload)
                         .font(.subheadline)
                         .foregroundStyle(AlivePalette.text)
@@ -78,7 +114,7 @@ struct PayloadPreview: View {
         let value: String
     }
 
-    /// Lead with connector input; return nil for non-object payloads so the Mac preview is used.
+    /// Non-object payloads need the Mac's preview; connector input takes precedence for readable objects.
     static func readableLines(_ payload: String) -> [Line]? {
         guard let data = payload.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
@@ -99,8 +135,7 @@ struct PayloadPreview: View {
         return lines
     }
 
-    /// Who and where first, then what, then the message, then the rest:
-    /// the order a person reads an envelope, not the alphabet.
+    /// Put who and where before content to match how the user reads an envelope.
     private static func readingOrder<S: Sequence>(_ keys: S) -> [String] where S.Element == String {
         let lead = ["to", "recipient", "recipients", "channel", "chat", "calendar", "list", "account",
                     "cc", "bcc", "subject", "title", "name", "when", "date", "start", "start_date",
@@ -118,7 +153,6 @@ struct PayloadPreview: View {
             || (key.hasSuffix("Id") || key.hasSuffix("ID")) && key.count > 2
     }
 
-    /// "startDate" / "start_date" → "Start date".
     private static func label(_ key: String) -> String {
         var spaced = ""
         for (index, char) in key.enumerated() {
@@ -129,8 +163,7 @@ struct PayloadPreview: View {
         return words.prefix(1).uppercased() + words.dropFirst()
     }
 
-    /// A value as words: strings as they are (dates readable), numbers,
-    /// Yes/No, short lists joined. Nested structures stay in Details.
+    /// Keep nested structures in Details so the card stays readable.
     private static func words(_ value: Any?) -> String? {
         let text: String
         switch value {
@@ -153,7 +186,7 @@ struct PayloadPreview: View {
     }
 }
 
-/// The approval's details: exactly what the Mac sent, off the card.
+/// Details preserve exactly what the Mac sent.
 private struct ApprovalDetailsSheet: View {
     let title: String
     let payload: String

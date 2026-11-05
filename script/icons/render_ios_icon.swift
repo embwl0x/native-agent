@@ -2,7 +2,6 @@ import AppKit
 import CoreGraphics
 import ImageIO
 
-// iOS frame for the shared Living Core: opaque, full-bleed 1024.
 @main
 enum RenderIOSIcon {
     static func main() {

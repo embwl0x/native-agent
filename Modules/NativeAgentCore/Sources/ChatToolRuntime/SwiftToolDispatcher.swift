@@ -1,5 +1,7 @@
 import AuthoredCapabilities
+import ChatTurnContracts
 import Experiences
+import CognitiveSubstrate
 import Foundation
 import StandingBots
 import Research
@@ -15,21 +17,21 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher.swift` | Native dispatcher construction; capability-filtered schema factory owns native catalog membership; authored projections share AbilityStore's checked ToolRecord projection and exact catalog revision; named schema construction consumes parsed registry rows and selects before encoding |
+// Blueprint: | `SwiftToolDispatcher.swift` | Dispatcher/catalog construction; checked registry revision and selected schema encoding |
 
 // MARK: - SwiftToolDispatcher
 
-/// Native ToolDispatchClient for built-in Swift tools and registered tools.
-/// Tools contributed by an app executor share this catalog
-/// and run in that executor, including the Core tools it explicitly replaces.
-/// Chat exposes `app`; its actions reach the underlying dispatch routes, whose
-/// permission and availability checks still apply.
+/// Integrations bind the originating operation before invoking any backend or retained callback.
+public protocol ChatMacIntegrationToolBridge: MacIntegrationToolBridge {
+    func serving(turn: Turn, context: MacOperationContext) -> any MacIntegrationToolBridge
+}
+
+/// App actions share this catalog and dispatch routes; contributed executors retain their permission and availability checks.
 public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable {
-    /// Implementations that still own process-global credentials, app
-    /// lifecycle, or another live-body singleton. Synthetic roots fail closed
-    /// instead of reaching across bodies.
+    /// Implementations that still own process-global credentials, app lifecycle, or another live-body singleton. Synthetic roots fail closed instead of
+    /// reaching across bodies.
     static let canonicalBodyOnlyToolNames: Set<String> = [
-        "restart_app", "agent_swarm", "image_generate",
+        "restart_app", "image_generate",
     ]
 
     let allowsCanonicalBodyTools: Bool
@@ -42,66 +44,51 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
 
     let dataRoot: URL
     let pageReader: SwiftNativeResearchClient
-    /// Local durable enqueue only: return the accepted request ID after writing,
-    /// without executing a provider or waiting for a bot run. Supplied by the
+    /// Local durable enqueue only: return the accepted request ID after writing, without executing a provider or waiting for a bot run. Supplied by the
     /// runner's app assembly; nil reports unavailable rather than fake success.
     let standingBotSession: BotRunnerSession?
     let standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)?
-    /// Exact semantic-memory owner for this dispatcher body. Alternate roots
-    /// must never fall through to the process-wide production singleton.
+    /// Exact semantic-memory owner for this dispatcher body. Alternate roots must never fall through to the process-wide production singleton.
     let memoryV2: SwiftNativeMemoryV2
-    /// Exact KG projection belonging to `dataRoot`.
     let knowledgeGraphPath: URL
-    let swarmChatFactory: any SwarmChatClientFactory
     let providerLifecycleObserver: (any LLMCallLifecycleObserving)?
-    /// Parent conversation approval projection reused by inherited swarm
-    /// workers. It adds no authority; it only preserves the ordinary CONFIRM
-    /// path for the originating surface.
-    let swarmApprovalFiler: (any ApprovalFiler)?
-    /// App-injected bridge for Mac integration backends (EventKit / notify /
-    /// Spotlight). nil in headless contexts — dispatch surfaces a
-    /// `bridge_not_wired` error envelope to the LLM in that case.
-    public let macIntegrationBridge: (any MacIntegrationToolBridge)?
-    /// Permission authority for the Mac integration route. Production uses the
-    /// shared app-root store; an explicit store keeps a dispatcher assembled
-    /// for another root from consulting live permission state.
+    /// The cognition runtime's journal bus; no other dispatcher or global body supplies it.
+    let studioJournalBus: StudioJournalCognitiveBus?
+    /// Headless contexts have no Mac integration bridge; return bridge_not_wired rather than claim execution.
+    public let macIntegrationBridge: (any ChatMacIntegrationToolBridge)?
+    /// Permission authority for the Mac integration route. Production uses the shared app-root store; an explicit store keeps a dispatcher assembled for
+    /// another root from consulting live permission state.
     let macIntegrationPermissionStore: MacIntegrationPermissionStore
-    /// Tools an owner outside Core contributes (the app's browser, pages,
-    /// health reads): registered in this one catalog and
-    /// executed there. nil in headless bodies, which then have none of them.
-    let appTools: (any ToolExecutor)?
+    /// Tools an owner outside Core contributes (the app's browser, pages, health reads): registered in this one catalog and executed there. nil in headless
+    /// bodies, which then have none of them.
+    let appTools: (any ChatToolExecuting)?
     private let executorDescriptors: [String: ToolDescriptor]
     let agentBridgeConfigRoot: URL?
     let a2aPushConfiguration: (@Sendable (AgentPeerContact) async throws -> JSONValue)?
-    /// Rebuildable temporal continuity for the agent-readable screen. This is
-    /// dispatcher-local perception state, never memory, authority, or a second
-    /// screen owner.
+    /// Rebuildable temporal continuity for the agent-readable screen. This is dispatcher-local perception state, never memory, authority, or a second screen
+    /// owner.
     let fourVerbLiveScene = SwiftToolDispatcherFourVerbLiveScene()
     private let builtInSchemaCacheLock = NSLock()
     private var builtInSchemaCache: [BuiltInSchemaCacheKey: [LLMToolSchema]] = [:]
 
-    /// Connector execution context; relative file reads resolve only in the
-    /// canonical workspace, with an explicit namespace for bundled docs.
+    /// Connector execution context; relative file reads resolve only in the canonical workspace, with an explicit namespace for bundled docs.
     var rootForRead: URL { dataRoot.deletingLastPathComponent().standardizedFileURL }
 
-    /// Her requests carry one tool, `app` (docs/TOOL_LOADING.md); every
-    /// other tool here is reached by name through it, or by a lane with its
-    /// own declared list.
+    /// Requests carry only app; named executors remain behind it or an explicitly declared caller list.
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         memoryV2: SwiftNativeMemoryV2? = nil,
         knowledgeGraphPath: URL? = nil,
         allowProcessGlobalTools: Bool = true,
         providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
-        swarmApprovalFiler: (any ApprovalFiler)? = nil,
-        macIntegrationBridge: (any MacIntegrationToolBridge)? = nil,
+        studioJournalBus: StudioJournalCognitiveBus? = nil,
+        macIntegrationBridge: (any ChatMacIntegrationToolBridge)? = nil,
         macIntegrationPermissionStore: MacIntegrationPermissionStore? = nil,
-        appTools: (any ToolExecutor)? = nil,
+        appTools: (any ChatToolExecuting)? = nil,
         agentBridgeConfigRoot: URL? = nil,
         a2aPushConfiguration: (@Sendable (AgentPeerContact) async throws -> JSONValue)? = nil,
         standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)? = nil,
-        standingBotSession: BotRunnerSession? = nil,
-        swarmChatFactory: any SwarmChatClientFactory
+        standingBotSession: BotRunnerSession? = nil
     ) {
         _ = Self.builtInsRegistered
         let descriptors = appTools?.descriptors ?? []
@@ -121,9 +108,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("memory.sqlite")
         self.allowsCanonicalBodyTools = allowProcessGlobalTools
-        self.swarmChatFactory = swarmChatFactory
         self.providerLifecycleObserver = providerLifecycleObserver
-        self.swarmApprovalFiler = swarmApprovalFiler
+        self.studioJournalBus = studioJournalBus
         self.macIntegrationBridge = macIntegrationBridge
         self.macIntegrationPermissionStore = macIntegrationPermissionStore
             ?? (dataRoot == PersistenceCore.defaultDataRoot()
@@ -146,10 +132,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             | (includeFullMacSystemTools ? 2 : 0)
             | (includeFullMacAccessibilityReadTools ? 8 : 0)
             | (includeFullMacAccessibilityInjectionTools ? 16 : 0)
-            // W7 — the activity-capture toggle is part of the cache identity.
-            // Without this bit a catalog built while capture was OFF would be
-            // served after the user turned it ON (and vice versa), which is the
-            // exact class of staleness the toggle exists to prevent.
+            // Include capture preference in cache identity so a toggle cannot serve stale catalog membership.
             | (includeActivityQueryTool ? 32 : 0)
         let key = BuiltInSchemaCacheKey(
             accessFlags: accessFlags,
@@ -188,21 +171,22 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         return generated
     }
 
-    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
+    public func listAvailableToolSchemas(named names: Set<String>, turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
         if names == ["app"] {
             return appTools == nil ? [] : executorDescriptors.values.filter { names.contains($0.name) }.map(\.schema)
         }
-        return try await catalogSnapshot(includeSchemas: true, schemaNames: names).schemas
+        return try await catalogSnapshot(turn: turn, includeSchemas: true, schemaNames: names, surface: surface).schemas
     }
 
-    public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await catalogSnapshot(includeSchemas: true).schemas
+    public func listAvailableToolSchemas(turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        try await catalogSnapshot(turn: turn, includeSchemas: true, surface: surface).schemas
     }
 
-    func catalogSnapshot(includeSchemas: Bool, schemaNames: Set<String>? = nil, surface: String = "chat") async throws -> (names: [String], schemas: [LLMToolSchema], access: FullMacToolAccess) {
+    func catalogSnapshot(turn: Turn?, includeSchemas: Bool, schemaNames: Set<String>? = nil, surface: String) async throws -> (names: [String],
+        schemas: [LLMToolSchema], access: FullMacToolAccess) {
         let records = try readRegistryRecords()
-        let access = try await fullMacToolAccess(surface: surface)
-        let activity = await activityCaptureEnabled()
+        let access = try await fullMacToolAccess(turn: turn, surface: surface)
+        let activity = await activityCaptureEnabled(turn: turn, surface: surface)
         let builtIn = cachedBuiltInToolSchemas(
             includeFullMacFileTools: access.fileOpsAllowed,
             includeFullMacSystemTools: access.systemAllowed,
@@ -237,19 +221,17 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             .sorted { $0.name < $1.name }.map(\.schema)
     }
 
-    /// Names of the contributed tools this catalog actually offers.
     var contributedToolNames: Set<String> {
         executorOwnedToolNames.subtracting(Self.nativeCanonicalToolNames)
     }
 
-    /// Every name an executor answers: its own tools and the Core tools it
-    /// runs in their place.
+    /// Every name an executor answers: its own tools and the Core tools it runs in their place.
     var executorOwnedToolNames: Set<String> {
         appTools == nil ? [] : Set(executorDescriptors.keys)
     }
 
-    public func listAvailableTools() async throws -> [String] {
-        try await catalogSnapshot(includeSchemas: false).names
+    public func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
+        try await catalogSnapshot(turn: turn, includeSchemas: false, surface: surface).names
     }
 
     func registryToolRecord(_ tool: String) throws -> [String: JSONValue]? {
@@ -257,7 +239,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         switch Self.authoredRegistry(dataRoot: dataRoot) {
         case .success(let read): rows = read
         case .failure(let error):
-            throw ToolFailureError("Her tool registry did not read (\(error.localizedDescription)), so '\(tool)' could not be looked up. Nothing ran.",
+            throw ToolFailureError("The agent's tool registry did not read (\(error.localizedDescription)), so '\(tool)' could not be looked up. Nothing ran.",
                                    effects: .none, owner: "abilities")
         }
         for row in rows where row.id == tool { return row.fields }
@@ -266,9 +248,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
 
     private func readRegistryRecords() throws -> [ToolRecord] { try Self.authoredRegistry(dataRoot: dataRoot).get() }
 
-    /// Her authored tool registry, or the fault that kept it from reading.
-    /// A fault is never an empty registry: the catalog offers none of her
-    /// tools while it lasts, and her home owes the repair until a read works.
+    /// The agent's authored tool registry, or the fault that kept it from reading. A fault is never an empty registry: the catalog offers none of
+    /// the agent's tools while it lasts, and the agent's home owes the repair until a read works.
     static func authoredRegistry(dataRoot: URL) -> Result<[ToolRecord], any Error> {
         do {
             let rows = try AbilityStore(dataRoot: dataRoot).checkedToolRecords()
@@ -276,32 +257,28 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             return .success(rows)
         } catch {
             RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act, operation: "abilities.tool_registry", owner: "abilities",
-                           words: "Her tool registry did not read (\(error.localizedDescription)); her own tools are not offered until it reads again.")
+                           words: "The agent's tool registry did not read (\(error.localizedDescription)); the agent's own tools"
+                               + " are not offered until it reads again.")
             return .failure(error)
         }
     }
 
-    /// Canonical built-in dispatch names stay reserved regardless of gate state;
-    /// authored tools cannot shadow them or their dotted alias spellings.
+    /// Canonical built-in dispatch names stay reserved regardless of gate state; authored tools cannot shadow them or their dotted alias spellings.
     static let nativeCanonicalToolNames = Set(nativeToolDescriptors.keys)
 
-    /// Registered with the policy registry once, the first time a dispatcher is made.
     private static let builtInsRegistered: Void = AppActionBinding.registerTools(Array(nativeToolDescriptors.values))
     package static let reservedBuiltInNames = nativeCanonicalToolNames.union(alwaysOnCoreNames)
 
-    /// Built-in executor IDs and current door bindings own their names.
     static let registryReservedNames: Set<String> = reservedBuiltInNames
 
-    /// A name a tool she writes may take: no built-in executor or current door binding.
+    /// A name a tool the agent writes may take: no built-in executor or current door binding.
     public static func isAuthorableToolName(_ id: String) -> Bool {
         !registryReservedNames.contains(id) && !AppActionBinding.builtInToolName(id)
             && CanonicalToolNameDispatcher.canonical(id) == id
     }
 
-    /// The same, for the `app` door's generated `authored.<id>` actions, with
-    /// the primitive permissions and app dependencies each declares.
-    /// The store's lock and canonical revision cover local and external changes.
-    /// A failed read is not memoized; the key is read before the catalog walk.
+    /// The same, for the `app` door's generated `authored.<id>` actions, with the primitive permissions and app dependencies each declares. The store's lock
+    /// and canonical revision cover local and external changes. A failed read is not memoized; the key is read before the catalog walk.
     package static func authoredTools(dataRoot: URL) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
         switch checkedAuthoredTools(dataRoot: dataRoot) {
         case .success(let tools): return tools
@@ -310,7 +287,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     }
 
     /// Inventory readers retain the fault; execution discovery stays fail-closed.
-    package static func checkedAuthoredTools(dataRoot: URL) -> Result<[(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)], any Error> {
+    package static func checkedAuthoredTools(dataRoot: URL) -> Result<[(schema: LLMToolSchema, permissions: [String], actions: [String],
+        page: String?, action: String?)], any Error> {
         checkedAuthoredCatalog(dataRoot: dataRoot).map(\.tools)
     }
 
@@ -325,7 +303,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             let revision: [String]
             do { revision = try AbilityStore(dataRoot: dataRoot).revision() } catch {
                 RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act, operation: "abilities.tool_registry", owner: "abilities",
-                               words: "Her tool registry's revision did not read (\(error.localizedDescription)); her own tools are not offered until it reads again.")
+                               words: """
+                                   The agent's tool registry's revision did not read (\(error.localizedDescription)); the agent's own tools are not offered \
+                                   until it reads again.
+                                   """)
                 return .failure(error)
             }
             let key = (dataRoot.path, revision, AppActionBinding.registeredToolCount)
@@ -344,7 +325,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, [String], Int),
         catalog: AuthoredCatalog)?
 
-    static func authoredTools(records: [ToolRecord], named names: Set<String>? = nil) throws -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
+    static func authoredTools(records: [ToolRecord], named names: Set<String>? = nil) throws -> [(schema: LLMToolSchema, permissions: [String],
+        actions: [String], page: String?, action: String?)] {
         let active = records
             .filter { $0.fields["status"] == .string("active") && $0.fields["disabledBy"] != .string("owner") }
         var tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] = []

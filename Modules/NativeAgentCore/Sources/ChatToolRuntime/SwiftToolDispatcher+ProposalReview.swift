@@ -1,14 +1,4 @@
-// SwiftToolDispatcher+ProposalReview.swift
-// Her review seat over memory proposals.
-//
-// A fact from the owner, a trusted agent or her own words is kept at once
-// (MemoryV2+AdaptivePromoter). What an untrusted peer said, and what
-// consolidation proposes, waits here: `memory_proposals_pending` lists every
-// proposal the Memories page offers (the same awaitsReview rule), and
-// `memory_proposal_review` decides one with the page's own accept/reject;
-// `status: rejected` is the page's "things I let go" history. A kept fact is
-// reworded afterwards with the app door's memory.rewrite.
-//
+// Trust and the Memories page’s awaitsReview rule decide what needs review; all doors share its accept/reject owner.
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -17,8 +7,7 @@ import MemoryV2
 
 extension SwiftToolDispatcher {
 
-    /// Most proposals listed in one pull. Bounded because the point is a
-    /// review she can actually finish, not an inbox.
+    /// Bound each pull to a review that can be finished.
     static let maxPendingProposalsListed = 10
 
     private static func awaitsReview(_ proposal: ProposalRecord) -> Bool {
@@ -81,12 +70,8 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    func impl_memory_proposal_review(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // Bad input is REFUSED, not thrown. A strict provider schema routinely
-        // materializes an omitted optional as "" or null, and a thrown
-        // toolDenied reads to the model as a policy block rather than "you left
-        // the id out" — so both malformed shapes come back as a refusal
-        // envelope that says exactly what to send instead.
+    func impl_memory_proposal_review(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // Strict schemas may supply empty optionals; return a refusal with a remedy rather than a misleading policy exception.
         let id = (optionalString(input, "id") ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else {
@@ -107,8 +92,7 @@ extension SwiftToolDispatcher {
         let reason = optionalString(input, "reason")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Off the pending list: a proposal she can review is by definition
-        // still pending and offered by the page's own rule.
+        // Apply the page’s pending rule so completed proposals cannot be reviewed again.
         let pending: [ProposalRecord]
         do {
             pending = try await memoryV2.listProposals(status: "pending")
@@ -142,9 +126,9 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        // Accepts exactly as the Memories page's Keep does.
         do {
-            let record = try await memoryV2.acceptProposal(id: id)
+            let record = try await memoryV2.acceptProposal(id: id,
+                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads))
             return .object([
                 "status": .string("ok"),
                 "decision": .string("accept"),

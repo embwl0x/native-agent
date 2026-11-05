@@ -12,13 +12,9 @@ import MacControl
 import Context
 import CognitiveSubstrate
 import Transcripts
-// Blueprint: | `TurnContextPreparation.swift` | SwiftNativeTurnEngine context preparation, checked route admission, frozen reach, live intention facts and bounded attention inputs |
+// Blueprint: | `TurnContextPreparation.swift` | Admitted route, frozen facts and bounded attention input |
 extension SwiftNativeTurnEngine {
-    /// Build the per-turn context, optionally carrying per-turn DYNAMIC image
-    /// content blocks attached to the CURRENT user message. The image blocks
-    /// NEVER enter systemPrompt/systemSegments (cache invariant) — they sit on
-    /// `TurnContext.imageBlocks` and are consumed when the first user message
-    /// of the conversation is built (ToolLoop/Streaming/Text-compat).
+    /// Current-turn image blocks stay on the in-flight user message, never in cached system segments.
     public func buildTurnContext(
         surface: String,
         userMessage: String,
@@ -29,18 +25,12 @@ extension SwiftNativeTurnEngine {
         sessionID: String? = nil,
         recentTurns: [String] = [],
         recentExchanges: [[String]] = [],
-        // The raw user text for RELEVANCE consumers (selection queryText,
-        // memory recall, query embedding) when `userMessage` carries
-        // turn-scoped wire riders — e.g. the text-compat tool-routing hint,
-        // which otherwise makes tool names query vocabulary on every turn.
-        // nil → `userMessage`.
-        // `userMessage` stays the wire/persona-visible turn text.
+        // Relevance consumers use raw user text so wire tool hints cannot become recall vocabulary; nil uses the supplied message.
         queryUserMessage: String? = nil,
-        // Turn-start instant for the clock line; a multi-iteration tool loop
-        // passes the same value every iteration so the dynamic segment's
-        // time line can't churn the cache mid-turn. nil = clock() per build.
+        // Freeze one turn-start instant so repeated builds cannot churn the dynamic clock line mid-turn.
         clockNowOverride: Date? = nil,
-        offeredToolNames: Set<String>? = nil
+        offeredToolNames: Set<String>? = nil,
+        turn: Turn, work: ChatTurnWork
     ) async throws -> TurnContext {
         let quietHoursWindow = try readTurnQuietHours()
         return try await buildTurnContext(
@@ -56,8 +46,8 @@ extension SwiftNativeTurnEngine {
             queryUserMessage: queryUserMessage,
             clockNowOverride: clockNowOverride,
             quietHoursSnapshot: quietHoursWindow,
-            offeredToolNames: offeredToolNames
-        )
+            offeredToolNames: offeredToolNames,
+         turn: turn, work: work)
     }
     func buildTurnContext(
         surface: String,
@@ -73,32 +63,36 @@ extension SwiftNativeTurnEngine {
         clockNowOverride: Date?,
         quietHoursSnapshot: TurnQuietHoursWindow?,
         offeredToolNames: Set<String>? = nil,
-        recallHistory: [SessionHistoryPromptRenderer.Renderable]? = nil
+        recallHistory: [SessionHistoryPromptRenderer.Renderable]? = nil,
+        turn: Turn, work: ChatTurnWork
     ) async throws -> TurnContext {
-        guard surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "missions" else {
-            throw ToolFailureError("The routing surface is workshop. Correct the caller's surface before preparing context.", effects: .none, recovery: .correctArguments)
-        }
         try Task.checkCancellation()
-        var trace = ContextStageTrace()
+        var trace = ContextStageTrace(turn: turn)
         if userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && imageBlocks.isEmpty
         {
             throw TurnEngineError.emptyMessage
         }
+        let turnBudget = try ContextBudgetPolicy.resolve(turn: turn, dataRoot: remPinsDataRoot)
+        guard let admission = turn.admission,
+              let effort = admission.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !effort.isEmpty else {
+            throw ProviderRoutingError.configurationFailed("The turn's admitted Think level is unavailable.")
+        }
+        let modelId = admission.model
+        let admittedProvider = admission.provider
+        let admittedServiceTier = admission.serviceTier
+        trace.setFlag("provider.admissionReused", true)
         // Explicit relevance text is authoritative even when blank, keeping wire hints out of recall.
         // Blank text skips query embedding; selection can still use attention terms and entities.
         let queryMessage = queryUserMessage ?? userMessage
         trace.setCount("contextFlow.queryMessageChars", queryMessage.count)
-        // Pin one clock instant for both the dynamic clock line and the receipt
-        // flag. The flag is the active semantic, not mere preference-file
-        // availability: an outside-window turn must never look quiet merely
-        // because a window happens to be configured.
+        // Pin one instant for prompt and receipt; configured quiet hours alone do not prove the turn is inside them.
         let currentTurnClock = clockNowOverride ?? clock()
-        // The facts of this moment read nothing assembled below, so they
-        // gather beside it and the composition at the end consumes them once.
+        // Gather independent facts beside assembly and consume them once at composition.
         async let currentFacts = includeClockContext
             ? try currentTurnFacts(clockNow: currentTurnClock, quietHours: quietHoursSnapshot,
-                               sessionID: sessionID, queryUserMessage: queryMessage)
+                               sessionID: sessionID, queryUserMessage: queryMessage, turn: turn, work: work)
             : nil
         // Start the existing bge query lane before the bounded attention
         // read, so the vector embeds while that work runs.
@@ -106,14 +100,13 @@ extension SwiftNativeTurnEngine {
             userMessage: queryMessage, recentTurns: recentTurns
         )
         trace.setCount("contextFlow.semanticQueryChars", semanticQuery.count)
-        // A follow-up also asks in its own words, each a separate reading.
+        // Read follow-up queries in their own words rather than merging their relevance evidence.
         let queryEmbeddingTicket = await contextFlow?.beginQueryEmbedding(
-            semanticQuery, ownWords: semanticQuery == queryMessage ? nil : queryMessage
+            semanticQuery, ownWords: semanticQuery == queryMessage ? nil : queryMessage, turn: turn
         )
 
-        // Read attention within its deadline before constructing the context request.
         let attentionStartNs = DispatchTime.now().uptimeNanoseconds
-        let attention = try await resolvedAttentionInputs(now: clock(), message: queryMessage, trace: &trace)
+        let attention = try await resolvedAttentionInputs(now: clock(), message: queryMessage, trace: &trace, turn: turn)
         trace.record(.contextFlowAttention, since: attentionStartNs)
         // Work context remains query-selectable without coloring unrelated turns.
         let suppressActiveIntent = ContextSurface(rawValue: surface) == .workshop
@@ -121,51 +114,8 @@ extension SwiftNativeTurnEngine {
         let contextFlowMode: ContextFlowMode
         do { contextFlowMode = try await contextFlow?.contextFlowMode() ?? .off }
         catch { throw TurnEngineError.contextLoadFailed(underlying: error) }
-        // Recall by meaning is what this turn's memory is for, so it waits a
-        // bounded moment for the vector; a missing requested reading is
-        // reported unavailable by preparation, never replaced by lexical recall.
-        // 1. Reuse the facade's already-checked route when present. Direct
-        //    context callers still admit here. This avoids adding a second
-        //    provider-store read to ordinary chat; the shared adapter performs
-        //    its existing checked reread immediately before transport, so
-        //    corrupt/revoked authority still fails closed without allowing a
-        //    newer valid generation to splice into this turn.
-        let boundModel = LLMCallContext.admittedModel?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let boundEffort = LLMCallContext.reasoningEffort?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let modelId: String
-        let effort: String
-        let admittedProvider: String?
-        let admittedServiceTier: String?
-        if let boundModel, !boundModel.isEmpty,
-           let boundEffort, !boundEffort.isEmpty {
-            modelId = boundModel
-            effort = boundEffort
-            // The admission owns the route; model names never select a provider.
-            admittedProvider = LLMCallContext.providerId
-            admittedServiceTier = LLMCallContext.serviceTier
-            trace.setFlag("provider.admissionReused", true)
-        } else {
-            let prefsStartNs = DispatchTime.now().uptimeNanoseconds
-            let admission = try await router.checkedRouteAdmission(for: surface)
-            trace.record(.providerPreferences, since: prefsStartNs)
-            modelId = admission.modelId
-            effort = admission.reasoningEffort
-            admittedProvider = admission.providerId
-            admittedServiceTier = admission.serviceTier
-            trace.setFlag("provider.admissionReused", false)
-        }
-        let turnBudget = try ContextBudgetPolicy.resolve(
-            model: modelId,
-            providerID: admittedProvider,
-            dataRoot: remPinsDataRoot
-        )
         trace.setFlag("budget.packetDerived", turnBudget.isDerived)
-        // Settings ▸ "Remember across conversations". One fresh read per turn,
-        // shared by the packet's memory lane and the explicitly selected direct recall lane below.
-        // The explicit `recall_memory` tool is deliberately NOT gated: this
-        // switch is about AUTOMATIC recall, not about asking.
+        // Read the automatic recall switch once per turn for both paths; explicit memory requests remain outside that switch.
         let crossSessionRecall = try MemoryPolicyGate.crossSessionRecallEnabled(
             dataRoot: remPinsDataRoot
         )
@@ -222,9 +172,7 @@ extension SwiftNativeTurnEngine {
             characterBudget: turnBudget.packetChars,
             maximumCharacterBudget: turnBudget.packetExpandedChars,
             postMandatoryCharacterReserve: turnBudget.packetPostMandatoryReserve,
-            // The chat turn renders the persona's required documents into the
-            // STABLE segment, so the
-            // packet must not mirror them into the volatile block as well.
+            // Required persona documents already ride the stable segment; do not duplicate them in the volatile packet.
             stableSegmentCarriesRequiredDocuments: true,
             userMemoryCore: userMemoryCore,
             memoryRecallEnabled: crossSessionRecall,
@@ -243,7 +191,7 @@ extension SwiftNativeTurnEngine {
             trace.setFlag("contextFlow.enabled", true)
             let start = DispatchTime.now().uptimeNanoseconds
             do {
-                preparedContextTurn = try await contextFlow?.prepareContextTurn(contextFlowRequest)
+                preparedContextTurn = try await contextFlow?.prepareContextTurn(contextFlowRequest, turn: turn)
                 try Task.checkCancellation()
                 if let expansion = preparedContextTurn?.budgetExpansion {
                     trace.setFlag("contextFlow.budgetExpanded", true)
@@ -268,8 +216,7 @@ extension SwiftNativeTurnEngine {
             } catch {
                 try Task.checkCancellation()
                 trace.record(.contextFlowPrepare, since: start)
-                // No legacy prompt stands in: a reply without her context
-                // would read as her while missing what she knows.
+                // Failed context preparation must end the turn; a stand-in prompt cannot represent the agent's missing knowledge.
                 throw TurnEngineError.contextLoadFailed(underlying: error)
             }
         }
@@ -279,11 +226,8 @@ extension SwiftNativeTurnEngine {
         let resolvedPersonaID: String?
         let compiledPersonaPrompt: String
         let personaStartNs = DispatchTime.now().uptimeNanoseconds
-        // The stable segment holds only what changes when her documents
-        // change: USER renders there with its preamble alone, and the facts
-        // memory adds each day ride the dynamic tail, so a new fact does not
-        // rewrite the cached history behind it. Nil (no memory root) keeps the
-        // whole document, which only changes when the document does.
+        // Keep the USER preamble stable and daily facts dynamic so new memory does not invalidate the cached history prefix.
+        // Without a memory root, retain the whole stored document, which changes only with the document.
         let stableUserCore = userMemoryCore.map { _ in [String]() }
         let stableDocuments = Self.stablePrefixPersonaDocuments(preparedContextTurn)
         do {
@@ -315,22 +259,15 @@ extension SwiftNativeTurnEngine {
                 )
                 // Memory selection reasons belong only in the trace.
                 if let why = Self.memoryWhyPayload(preparedContextTurn, message: queryMessage) {
-                    TurnTraceBus.fireFromContext(kind: "mind.why", sessionId: sessionID, surface: surface, payload: why)
+                    TurnTraceBus.fireFromContext(kind: "mind.why", sessionId: sessionID, surface: surface, payload: why, turn: turn)
                 }
-                // How many ranked memory rows the semantic floor refused. A
-                // packet that is quiet because nothing was relevant and one
-                // that is quiet because the embedder was cold look identical
-                // downstream; this is the number that tells them apart.
+                // Count semantic-floor refusals so a quiet packet distinguishes irrelevant memory from unavailable embedding evidence.
                 let memoryFloorDropped = preparedContextTurn.packet.receipt
                     .memoryFloorDroppedCount
                 if memoryFloorDropped > 0 {
                     trace.setCount("contextFlow.memoryFloorDropped", memoryFloorDropped)
                 }
-                // Lead-and-pointer receipts. `truncatedAtoms` is how many bodies
-                // became a rule plus a pointer, `leadChars` is what those leads
-                // cost, and `expandableAfterTruncation` must equal
-                // `truncatedAtoms` — any gap is a cut body the model cannot get
-                // back, which is the one failure mode of this whole change.
+                // Expandable count must equal truncated count; any gap means a cut body has no usable recovery pointer.
                 let truncation = Self.packetTruncationCounts(preparedContextTurn)
                 trace.setCount("contextFlow.truncatedAtoms", truncation.truncatedAtoms)
                 trace.setCount("contextFlow.leadChars", truncation.leadChars)
@@ -338,15 +275,10 @@ extension SwiftNativeTurnEngine {
                     "contextFlow.expandableAfterTruncation",
                     truncation.expandableAfterTruncation
                 )
-                // The persona's required documents ride the CACHED prefix on
-                // this path, not the per-turn packet.
+                // Required documents belong in the cached prefix, not the per-turn packet.
                 trace.setFlag("persona.inStablePrefix", true)
                 trace.setCount("persona.stableDocs", stableDocuments.included.count)
-                // A document that could not PROVE a surface permission is
-                // withheld from the prefix AND refused by the packet, so it is
-                // absent from the turn entirely. That is a wiring fault, never a
-                // policy outcome, and it must never be silent: name the
-                // documents so the trace says which identity went missing.
+                // Missing surface-permission evidence withholds the document from both prefix and packet; trace the wiring fault explicitly.
                 if !stableDocuments.unprovenDocumentIDs.isEmpty {
                     trace.setCount(
                         "persona.stableDocsUnproven",
@@ -379,8 +311,7 @@ extension SwiftNativeTurnEngine {
             try Task.checkCancellation()
             throw TurnEngineError.personaLoadFailed(underlying: error)
         }
-        // What USER carried this turn: its preamble in the stable segment, its
-        // pinned facts in the dynamic tail (`UserMDAutogenMarkers.pinnedSection`).
+        // Keep USER's preamble stable and pinned facts dynamic under the same projection contract.
         let userDocument = personaMap["USER"]
         if let userDocument {
             personaMap["USER"] = UserMDAutogenMarkers.promptText(userDocument, pinnedCore: userMemoryCore)
@@ -418,8 +349,7 @@ extension SwiftNativeTurnEngine {
             // the provider to accept this context (`creditDeliveredMemories`).
             servedContextMemoryIDs = preparedContextTurn.selectedMemoryRecordIDs
         } else if let memory, crossSessionRecall {
-            // Settings ▸ "Remember across conversations": off skips the
-            // automatic root-wide recall entirely (see `crossSessionRecall`).
+            // Disabling cross-session recall skips automatic root-wide reads, never explicit memory requests.
             let expandedRecallQuery: String?
             if recallQueryOverride == nil, let recallHistory {
                 expandedRecallQuery = await trace.measure(.recallQuery) {
@@ -464,9 +394,7 @@ extension SwiftNativeTurnEngine {
             .measuredSelectionMicroseconds {
             trace.setMicroseconds(.memoryRecall, microseconds: Int64(selectionMicros))
         }
-        // Dedup: drop recalls whose text is superseded by a REM pin sharing
-        // the same key or whose preview contains the pin's text verbatim.
-        // This keeps the context tight — the pin IS the authoritative fact.
+        // REM pins are authoritative; remove overlapping recall keys or verbatim pin text to avoid duplicated context.
         if !remPins.isEmpty {
             recalled = recalled.filter { hit in
                 !remPins.contains(where: { pin in
@@ -476,26 +404,26 @@ extension SwiftNativeTurnEngine {
                 })
             }
         }
-        // Ordinary turns offer only app. Internal catalogs remain available
-        // on discovery and to lanes that supply their own tool lists.
+        // Chat offers only `app`; internal catalogs remain discoverable and available to explicit callers.
         let toolNames: [String]
         let toolSchemas: [LLMToolSchema]
         trace.setFlag("tools.fullCatalogRequested", offeredToolNames == nil)
         do {
-            (toolNames, toolSchemas) = try await FluidContextToolScope.$current.withValue(preparedContextTurn) {
+            (toolNames, toolSchemas) = try await holding(work.with(\.preparedContext, preparedContextTurn)) { work in
+                let tools = self.tools
                 if let offeredToolNames {
                     let started = DispatchTime.now().uptimeNanoseconds
-                    let schemas = try await tools.listAvailableToolSchemas(named: offeredToolNames)
+                    let schemas = try await tools.listAvailableToolSchemas(named: offeredToolNames, turn: turn, surface: surface)
                     trace.recordMicroseconds(.toolsSchemas, since: started)
                     return (schemas.map(\.name), schemas)
                 }
                 async let names: ([String], UInt64) = {
                     let started = DispatchTime.now().uptimeNanoseconds
-                    return (try await tools.listAvailableTools(), DispatchTime.now().uptimeNanoseconds &- started)
+                    return (try await tools.listAvailableTools(turn: turn, surface: surface), DispatchTime.now().uptimeNanoseconds &- started)
                 }()
                 async let schemas: ([LLMToolSchema], UInt64) = {
                     let started = DispatchTime.now().uptimeNanoseconds
-                    return (try await tools.listAvailableToolSchemas(), DispatchTime.now().uptimeNanoseconds &- started)
+                    return (try await tools.listAvailableToolSchemas(turn: turn, surface: surface), DispatchTime.now().uptimeNanoseconds &- started)
                 }()
                 let catalog = try await (names, schemas)
                 trace.setTiming(.toolsNames, milliseconds: Int64(catalog.0.1 / 1_000_000))
@@ -506,28 +434,33 @@ extension SwiftNativeTurnEngine {
             try Task.checkCancellation()
             throw TurnEngineError.toolCatalogLoadFailed(underlying: error)
         }
-        // The stem gathers prompt inputs; abilities/turn.js owns their composition and order.
-        let intentions = try await intentionsContext(now: currentTurnClock, sessionID: sessionID)
+        // The stem gathers inputs; turn.js owns prompt composition and ordering.
+        let intentions = try await intentionsContext(now: currentTurnClock, sessionID: sessionID, turn: turn)
         let renderStartNs = DispatchTime.now().uptimeNanoseconds
         // A pinned USER core establishes the person and suppresses first-run invitations.
         let established = !(userMemoryCore ?? []).isEmpty
         let deliveredRows = Self.deliveredRecalledMemoryRows(recalled, budget: turnBudget)
+        let personaPrompt = Self.renderPersonaPrompt(
+            compiledPersonaPrompt: compiledPersonaPrompt,
+            requiredDocuments: stableDocuments.included,
+            userMemoryCore: stableUserCore,
+            surfaceGuidance: preparedContextTurn?.kernel.surfaceGuidance ?? ""
+        )
+        let pinnedUser = userDocument.map {
+            UserMDAutogenMarkers.pinnedSection($0, pinnedCore: userMemoryCore)
+        } ?? ""
+        let contextPacket = preparedContextTurn.map(Self.renderContextPacket) ?? ""
+        let macContext = work.invocation.macContext(dataRoot: remPinsDataRoot ?? defaultDataRoot())
+        let continuationContext = turn.envelope?.macContinuation?.modelContext(context: macContext) ?? ""
+        let packetSections: [String] = [pinnedUser, intentions, contextPacket, continuationContext]
+        let packet = packetSections.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        // The agent's own line with written instructions is the one they write; everything else it reaches is the agent's.
         let reach = TurnReach(
-            persona: Self.renderPersonaPrompt(
-                compiledPersonaPrompt: compiledPersonaPrompt,
-                requiredDocuments: stableDocuments.included,
-                userMemoryCore: stableUserCore,
-                surfaceGuidance: preparedContextTurn?.kernel.surfaceGuidance ?? ""
-            ),
+            persona: turn.lineInstructions ?? personaPrompt,
             expression: .object(["established": .bool(established)]),
             pins: remPins.map(\.text),
             recall: Self.renderRecalledMemoryBlock(deliveredRows) ?? "",
-            packet: [
-                userDocument.map { UserMDAutogenMarkers.pinnedSection($0, pinnedCore: userMemoryCore) } ?? "",
-                intentions,
-                preparedContextTurn.map(Self.renderContextPacket) ?? "",
-                MacWorkContinuation.current?.modelContext ?? "",
-            ].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            packet: packet
         )
         trace.record(.promptRender, since: renderStartNs)
         let baseContext = TurnContext(
@@ -554,10 +487,7 @@ extension SwiftNativeTurnEngine {
             calendar.timeZone = .current
             return quietHours.contains(hour: calendar.component(.hour, from: currentTurnClock))
         }()
-        // The summary is emitted even when a history caller asks this base
-        // builder to defer clock rendering, so stamp the same pinned semantic
-        // before the branch. The history assembler then owns the one eventual
-        // prompt rendering without leaving its base context receipt ambiguous.
+        // Stamp the same frozen quiet-hour semantic even when history defers clock rendering, so the base receipt remains unambiguous.
         trace.setFlag(
             "clock.quietHoursActive",
             quietHoursActive
@@ -565,11 +495,9 @@ extension SwiftNativeTurnEngine {
         let factsJoinStart = DispatchTime.now().uptimeNanoseconds
         if let facts = try await currentFacts {
             trace.record(.factsJoin, since: factsJoinStart)
-            // Receipt truth: the dynamic prompt gets the quiet-hours marker
-            // only on an active turn, and the summary carries that same pinned
-            // active state for live-rate observation.
+            // Prompt and summary share the same pinned active quiet-hour state.
             finalContext = try await contextByAppendingCurrentTurnFacts(
-                baseContext, facts: facts, sessionID: sessionID, clockNowOverride: currentTurnClock, trace: &trace)
+                baseContext, facts: facts, sessionID: sessionID, clockNowOverride: currentTurnClock, trace: &trace, turn: turn, work: work)
             trace.record(ContextStageName.contextClockRuntime, since: factsJoinStart)
         } else {
             finalContext = baseContext
@@ -594,8 +522,7 @@ extension SwiftNativeTurnEngine {
         trace.setCount("imageBlockCount", imageBlocks.count)
         trace.setFlag("snapshot.requestScoped", true)
         finalContext.preparationMs = trace.emit(kind: "context.summary", surface: surface)
-        // creditDeliveredMemories credits accepted context only, after pin dedup and render limits.
-        // Undelivered rows must not gain use_count, which vetoes eviction.
+        // Credit only accepted, rendered memories after pin deduplication; undelivered rows must not gain eviction-protecting use counts.
         finalContext.usageCreditMemoryIDs = servedContextMemoryIDs
             + deliveredRows.compactMap { row in
                 guard case .object(let extras)? = row.hit.extras,
@@ -617,23 +544,19 @@ extension SwiftNativeTurnEngine {
     private enum AttentionRaceOutcome: Sendable {
         case signals(CognitiveAttentionSignals?, CognitiveAttentionTraceRecorder.Snapshot)
     }
-    /// Bounded, pure read of the cognitive provider's attention signals,
-    /// translated into ContextTurnRequest inputs. Records per-input trace
-    /// counts + a timeout flag. Only a successful empty read (or no provider)
-    /// produces empty inputs; an unavailable read fails preparation.
+    /// Bound attention reads and trace only counts and timeout state. Only no provider or successful emptiness yields empty input;
+    /// unavailable reads fail preparation.
     private func resolvedAttentionInputs(
         now: Date,
         message: String,
-        trace: inout ContextStageTrace
+        trace: inout ContextStageTrace,
+        turn: Turn
     ) async throws -> AttentionInputs {
         try Task.checkCancellation()
         guard let cognitiveRuntime else { return AttentionInputs() }
 
-        // The live provider reads an already-published cache without actor or
-        // storage waits. Keep the protocol seam bounded for other providers.
-        // The operation's race owner cancels the deadline on success, the read
-        // on expiry, and both on requester cancellation, without joining a
-        // non-cooperative read or publishing its late result.
+        // Bound the provider seam even though the live owner reads published cache without waits.
+        // The race cancels the losing deadline/read without joining noncooperative work; late reads cannot publish into the turn.
         let attentionTrace = CognitiveAttentionTraceRecorder()
         let outcome = await raceAgainstTimeout(seconds: Double(Self.attentionSignalsTimeoutNanos) / 1_000_000_000) {
             let signals = await CognitiveAttentionTraceContext.$recorder.withValue(attentionTrace) {
@@ -655,7 +578,8 @@ extension SwiftNativeTurnEngine {
                         "totalMs": .int(snapshot.totalMilliseconds),
                         "cancellationObserved": .bool(snapshot.cancellationObserved),
                         "stageMs": .object(stages),
-                    ])
+                    ]),
+                    turn: turn
                 )
             }
             return AttentionRaceOutcome.signals(signals, snapshot)
@@ -688,8 +612,7 @@ extension SwiftNativeTurnEngine {
         trace.setFlag("contextFlow.attentionPresent", true)
 
         var inputs = AttentionInputs()
-        // Terms carry weights across the seam but fold into queryText lexically —
-        // only the keys are needed here (empties dropped: never pass empty text).
+        // Only nonempty term keys enter the lexical query; weights cross the attention seam separately.
         inputs.contextualTerms = Set(signals.terms.keys.filter { !$0.isEmpty })
         inputs.predictedToolGroups = signals.predictedToolGroups
         inputs.unresolvedQuestion = Self.nonEmpty(signals.unresolvedQuestion)
@@ -697,9 +620,7 @@ extension SwiftNativeTurnEngine {
         inputs.goal = Self.nonEmpty(signals.goal)
         inputs.residentWorkIntent = signals.residentWorkIntent
 
-        // Memory RECORD ids → ContextAtomID is app-owned (owner string lives
-        // app-side). Without a translator, memory-keyed activation is dropped;
-        // terms/intent still flow.
+        // The app maps memory record IDs to owned atoms; absent mapping drops only memory activation, preserving terms and intent.
         if let memoryAtomTranslator {
             for (recordID, weight) in signals.memoryActivation {
                 guard let atomID = memoryAtomTranslator(recordID) else { continue }
@@ -707,7 +628,7 @@ extension SwiftNativeTurnEngine {
                     inputs.cognitiveActivation[atomID] ?? 0, weight
                 )
             }
-            // Suppress memories she rejected for this kind of thing.
+            // Suppress memories the agent rejected for this kind of thing.
             for recordID in signals.suppressedMemoryRecordIDs(for: message) {
                 if let atomID = memoryAtomTranslator(recordID) {
                     inputs.suppressedAtomIDs.insert(atomID)

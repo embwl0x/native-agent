@@ -1,28 +1,20 @@
 import Foundation
 
-// Blueprint: | `PhysiologySelfWriteRegistry.swift` | `PhysiologySelfWriteRegistry`: writer-generation suppression of watcher echoes, without time-window suppression of external writes |
+// Blueprint: | `PhysiologySelfWriteRegistry.swift` | `PhysiologySelfWriteRegistry`: generation-based echo suppression without hiding external writes |
 
 /// Suppress watcher echoes whose file identity matches the post-tick snapshot, never by time window.
-///
 /// A foreign write during a tick may fold into its stamp; periodic and deadline wakes still cover it.
 public final class PhysiologySelfWriteRegistry: @unchecked Sendable {
     public static let shared = PhysiologySelfWriteRegistry()
 
-    /// Identity of one file at one instant. Equality means "unchanged".
     struct FileGeneration: Equatable {
         let exists: Bool
-        /// A DIRECTORY's generation only moves when an ENTRY is added or
-        /// removed — an in-place rewrite of a file inside it leaves the
-        /// directory byte-identical. Suppressing on that would silently drop a
-        /// real foreign write, so a watched directory disables suppression
-        /// entirely (see `isSelfWriteEcho`).
+        /// Directory identity misses in-place child rewrites, so watched directories must disable suppression.
         let isDirectory: Bool
-        /// APFS bumps `st_gen` on content change; it is THE writer generation
-        /// where the volume supplies it, and 0 where it does not.
+        /// Use APFS st_gen for content changes where supplied; zero means the volume provides no generation.
         let generation: UInt32
         let size: Int64
-        /// Nanosecond mtime. Second-granularity would let two writes inside the
-        /// same second read as unchanged.
+        /// Nanosecond mtime distinguishes writes within one second; coarser equality would suppress foreign changes.
         let modifiedNanoseconds: Int64
         let inode: UInt64
     }
@@ -33,16 +25,12 @@ public final class PhysiologySelfWriteRegistry: @unchecked Sendable {
 
     public init() {}
 
-    /// One carried work identity across its reflex and model turn, independent
-    /// of whichever authored part it calls.
+    /// Carry one work identity through reflex and model execution regardless of authored part.
     public static func intentionWriteID(_ work: String, _ url: URL) -> String {
         "intention:" + work + ":" + url.standardizedFileURL.path
     }
 
-    /// Arm suppression for `loopId` over `paths`. Called by the event stream as
-    /// it builds its watcher. Re-arming (a listener restart) drops any previous
-    /// stamp: a rebuilt listener must not inherit a suppression decision taken
-    /// against a window in which it was not listening.
+    /// Re-arming clears prior stamps: a rebuilt listener cannot inherit suppression from time it did not observe.
     public func register(loopId: String, paths: [URL]) {
         let normalized = paths.map(\.standardizedFileURL)
         lock.lock(); defer { lock.unlock() }
@@ -50,9 +38,7 @@ public final class PhysiologySelfWriteRegistry: @unchecked Sendable {
         stamp.removeValue(forKey: loopId)
     }
 
-    /// Record the generation of `loopId`'s watched paths as of the END of a
-    /// tick that actually ran its body. Everything unchanged from here is this
-    /// loop's own work.
+    /// Stamp only after an admitted body exits so subsequent unchanged identity proves its watcher echo.
     public func stampAfterTick(loopId: String) {
         lock.lock()
         let paths = watched[loopId]
@@ -60,16 +46,12 @@ public final class PhysiologySelfWriteRegistry: @unchecked Sendable {
         guard let paths, !paths.isEmpty else { return }
         let generations = paths.map(Self.generation(of:))
         lock.lock(); defer { lock.unlock() }
-        // A concurrent `register` may have replaced the path set while we were
-        // stat'ing; a stamp against the old set would be compared against the
-        // new one. Drop it rather than store a mismatched snapshot.
+        // Drop a stamp if registration changed during stat; comparing it against the replacement paths would be false evidence.
         guard watched[loopId] == paths else { return }
         stamp[loopId] = generations
     }
 
-    /// True when nothing under `loopId`'s watched paths has changed since the
-    /// last `stampAfterTick`. An unregistered loop, or one that has not ticked
-    /// yet, is never suppressed.
+    /// Suppress only identity unchanged since a real tick; never suppress unregistered or not-yet-run loops.
     public func isSelfWriteEcho(loopId: String) -> Bool {
         lock.lock()
         let paths = watched[loopId]
@@ -82,20 +64,14 @@ public final class PhysiologySelfWriteRegistry: @unchecked Sendable {
         return current == previous
     }
 
-    /// Forget `loopId` entirely (unregistration / manager shutdown).
     public func clear(loopId: String) {
         lock.lock(); defer { lock.unlock() }
         watched.removeValue(forKey: loopId)
         stamp.removeValue(forKey: loopId)
     }
 
-    /// `lstat(2)` deliberately, NOT `URL.resourceValues`: URL caches its
-    /// resource values, so a second read of the same URL object returns the
-    /// generation from BEFORE the write and every change reads as unchanged —
-    /// which would suppress real foreign writes forever. (Caught by
-    /// `sameSizeContentChangeIsDetected`, which saw an identical mtime across a
-    /// rewrite.) `lstat` also means a watched path that is a symlink is
-    /// compared as the LINK, matching the scanner's no-follow rule.
+    /// Use lstat because URL caches resource values and can return pre-write identity, hiding foreign changes.
+    /// Compare symlinks as links to match the scanner’s no-follow rule.
     static func generation(of url: URL) -> FileGeneration {
         var info = stat()
         guard lstat(url.path, &info) == 0 else {

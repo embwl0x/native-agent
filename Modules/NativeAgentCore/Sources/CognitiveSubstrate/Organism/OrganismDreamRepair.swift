@@ -46,10 +46,7 @@ public struct OrganismDreamRepairEvidence: Codable, Sendable, Equatable, Identif
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !oneLine.isEmpty else { return fallback }
         let lower = oneLine.lowercased()
-        // Credential SHAPES come from the one shared filter; the key-name
-        // markers below are this lane's own, broader rule about evidence text.
-        // (The private copy this replaces matched `sk-` unanchored, so any
-        // `desk-…` evidence line was hidden as if it were a key.)
+        // Share credential-shape detection; evidence key markers apply an additional conservative text rule.
         if JSONValueBounding.containsSecretLikeValue(oneLine)
             || lower.contains("authorization:")
             || lower.contains("api_key")
@@ -282,11 +279,7 @@ public enum OrganismDreamRepair {
         )
     }
 
-    /// Quiet local repair driven by exact residual evidence rather than a clock
-    /// or an LLM-authored dream. The caller must supply the current derived
-    /// opportunity; stale/not-ready opportunities are harmless no-ops. This is
-    /// field maintenance only: it creates no standing view, memory, prompt,
-    /// notification, or action.
+    /// Repair only a current due opportunity using exact residual evidence; field maintenance creates no model call, prompt, memory or action.
     public static func applyingResidualPressure(
         _ opportunity: OrganismResidualRepairOpportunity,
         at date: Date,

@@ -17,7 +17,6 @@ import ChatToolParsing
 import TrustCenter
 import ToolRegistry
 import DreamREMCycle
-import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
@@ -53,9 +52,7 @@ extension ApprovalExecution {
             nativeLog("[deskApprovalWait] Desk waits on decided approvals were not settled: \(error)")
         }
     }
-    /// Settle what was decided while the app was down, then again on every
-    /// resolve the inbox publishes, whoever resolved it. Subscribes first so a
-    /// decision landing during the launch pass is not missed.
+    /// Subscribe before reconciling downtime so decisions arriving during the launch pass cannot be missed.
     public static func settleDeskWaitsOnEveryResolve(dataRoot: URL) async {
         let events = await ApprovalLifecycleBus.shared.events()
         await settleDeskWaits(dataRoot: dataRoot)
@@ -82,14 +79,12 @@ extension ApprovalExecution {
         dataRoot: URL, records: [ApprovalRecord]
     ) async throws -> Int {
         let executed = await Self.reconcileUnappliedApprovalExecutions(
-            kinds: approvalExecutors(), records: records)
+            kinds: approvalExecutors(turn: nil), records: records)
         let chatTools = await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot, records: records)
         let connectors = await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot, records: records)
         try await checkpointApprovalReconciliation(dataRoot: dataRoot, records: records, retry: chatTools.failures)
         return executed + chatTools.executed + connectors
     }
-    // Owns the Codable cursor object in workflows/approvals: local backup and
-    // export include it, phone sync excludes it, PrivacyMap lists Approvals.
     struct ApprovalReconciliationCursor: Codable {
         var stamp = ""
         var boundaryIDs: Set<String> = []
@@ -126,9 +121,8 @@ extension ApprovalExecution {
             return Array(page) + rows.filter { record in
                 guard !ids.contains(record.id) else { return false }
                 if retryIDs.contains(record.id) { return true }
-                // Continuity is a separate commit from the replay cursor.
-                // Include owed turns and abandoned claims independently of age
-                // and the execution cursor. A started turn must be settled.
+                // Continuity is a separate commit from the replay cursor. Include owed turns and abandoned claims independently of age and the execution
+                // cursor. A started turn must be settled.
                 guard let replay = Self.chatToolApprovalReplay(from: record),
                       let session = NativeAgentChatSessionID.normalizedPathComponent(replay.sessionId),
                       !(replay.surface == "connector_action" && session.hasPrefix("ephemeral:connector_action:")) else { return false }
@@ -149,7 +143,7 @@ extension ApprovalExecution {
             var cursor = try ApprovalReconciliationCursor.read(dataRoot)
             let refreshed = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .resolved)
             let selected = Set(records.map(\.id))
-            let domains = approvalExecutors()
+            let domains = approvalExecutors(turn: nil)
             let unresolved = refreshed.filter { record in
                 selected.contains(record.id) && ((record.executedAction == nil && (record.decision == "approved"
                     || domains.contains { executor in ExecutionEventVocabulary.matches(record.action, executor.action) && executor.shouldReconcile(record) }))
@@ -175,7 +169,6 @@ extension ApprovalExecution {
             throw error
         }
     }
-    /// Execute the checked batch in executor order.
     @discardableResult
     public static func reconcileUnappliedApprovalExecutions(
         kinds: [ApprovalExecutor],
@@ -195,19 +188,17 @@ extension ApprovalExecution {
         }
         return executed
     }
-    public func approvalExecutors() -> [ApprovalExecutor] {
+    /// nil is record-only reconciliation or an executor inventory, never a live decision.
+    public func approvalExecutors(turn: Turn?) -> [ApprovalExecutor] {
         let client = self
         return [
             ApprovalExecutor(
                 action: "rem.proposal",
                 execute: { await client.applyResolvedREMProposal(from: $0) }),
             ApprovalExecutor(
-                action: WorkshopStepApprovalAction.canonical,
-                execute: { await client.applyResolvedWorkshopStep(from: $0) }),
-            ApprovalExecutor(
                 action: "self_improvement.apply",
                 shouldReconcile: { $0.decision == "approved" },
-                execute: { await client.applyApprovedSelfImprovement(from: $0) }),
+                execute: { await client.applyApprovedSelfImprovement(from: $0, turn: turn) }),
             ApprovalExecutor(
                 action: "browser.open_url",
                 execute: { try await self.executeResolvedBrowserRun(from: $0) }),
@@ -216,12 +207,7 @@ extension ApprovalExecution {
                 execute: { await self.applyResolvedStudioCanonProposal(from: $0) }),
             ApprovalExecutor(
                 action: SwiftNativeApprovalInbox.skillScriptInstallAction,
-                execute: { await self.applyResolvedSkillScriptInstall(from: $0) }),
-            ApprovalExecutor(
-                action: SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
-                execute: {
-                    await Self.applyResolvedProcedureExactActivation(from: $0, dataRoot: self.dataRoot)
-                }),
+                execute: { await self.applyResolvedSkillScriptInstall(from: $0, turn: turn) }),
             ApprovalExecutor(action: MemoryKindBackfill.action,
                 execute: { await MemoryApprovalTransactions.applyResolvedKindBackfill(from: $0, dataRoot: self.dataRoot) }),
         ]

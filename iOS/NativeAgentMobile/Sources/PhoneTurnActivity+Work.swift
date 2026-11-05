@@ -1,7 +1,7 @@
 import ActivityKit
 import NativeAgentShared
 import SwiftUI
-// Blueprint: | `PhoneTurnActivity+Work.swift` | `PhoneTurnActivity`: `setEnabled`, `receive`, `resumeWorkActivities`; Live Activities and the thinking light share Mac-projected activity state and Experience correlation evidence; no local turn-status persistence or bridge-event reducer |
+// Blueprint: | `PhoneTurnActivity+Work.swift` | `PhoneTurnActivity`: `setEnabled`, `receive`, `resumeWorkActivities`; shared projected activity |
 
 extension PhoneTurnActivity {
     func setEnabled(_ enabled: Bool) {
@@ -225,11 +225,13 @@ extension PhoneTurnActivity {
         let workID = activity.attributes.workID
         let pairing = activity.attributes.pairingFingerprint
         if let token = activity.pushToken {
-            await shared.registerActivity(enabled: true, workID: workID, activityToken: token.map { String(format: "%02x", $0) }.joined(), tokenPairing: pairing)
+            await shared.registerActivity(enabled: true, workID: workID, activityToken: token.map { String(format: "%02x", $0) }.joined(),
+                tokenPairing: pairing)
         }
         for await token in activity.pushTokenUpdates {
             guard !Task.isCancelled else { return }
-            await shared.registerActivity(enabled: true, workID: workID, activityToken: token.map { String(format: "%02x", $0) }.joined(), tokenPairing: pairing)
+            await shared.registerActivity(enabled: true, workID: workID, activityToken: token.map { String(format: "%02x", $0) }.joined(),
+                tokenPairing: pairing)
         }
     }
 

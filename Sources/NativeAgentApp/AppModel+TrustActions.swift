@@ -24,6 +24,7 @@ import ProviderRouting
 import BackgroundLoops
 import PersonaEngine
 import ChatTurnRuntime
+import ChatTurnContracts
 import ChatSessionWork
 import MultimodalTTS
 import TelegramBot
@@ -48,7 +49,7 @@ extension AppModel {
         }
     }
 
-    /// All mounted approval controls share the facade's one resolution flight.
+    /// All mounted approval controls must share the facade's one resolution flight.
     func resolveApprovalOnce(id: String, decision: String) async -> ApprovalsFacade.Resolution {
         do {
             return try await engine.approvals.resolveOnce(id: id) { id in
@@ -56,17 +57,6 @@ extension AppModel {
             }
         } catch {
             return .unavailable(UserFacingError.cause(error, action: "update that approval"))
-        }
-    }
-
-    @MainActor
-    func saveWorkshopPolicyToggle(enabled: Bool? = nil) async {
-        do {
-            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot)
-                .saveWorkshopPolicyToggle(enabled: enabled)
-            applySavedTrustPolicy(savedPolicy, status: "Desk execution policy saved")
-        } catch {
-            setFailureStatus(error, action: "save the Desk execution policy")
         }
     }
 
@@ -80,23 +70,6 @@ extension AppModel {
         } catch {
             recordTrustActionFailure(UserFacingError.message(error, action: "save the memory policy"), cause: error)
             systemToasts.push(error: "That memory setting could not be saved.")
-        }
-    }
-
-    @MainActor
-    @discardableResult
-    func saveMultimodalPolicy(_ policy: TrustMultimodalPolicy) async -> Bool {
-        do {
-            let savedPolicy = try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMultimodalPolicy(policy)
-            applySavedTrustPolicy(savedPolicy, status: "Multimodal policy saved")
-            return true
-        } catch {
-            // A failed canonical write can mean the underlying policy bytes
-            // became unreadable between the UI read and this mutation. Do not
-            // leave a stale OpenAI-voice grant available to playback.
-            engine.trust.publishPolicy(nil)
-            recordTrustActionFailure(UserFacingError.message(error, action: "save the multimodal policy"), cause: error)
-            return false
         }
     }
 
@@ -138,7 +111,7 @@ extension AppModel {
                 savedPolicy,
                 status: enabled ? "Chrome control enabled" : "Chrome control disabled"
             )
-            await NativeAgentEngine.live.chrome.reconcilePolicy()
+            await engine.chrome.reconcilePolicy(context: .init(dataRoot: engine.dataRoot))
         } catch {
             recordTrustActionFailure(UserFacingError.message(error, action: "save Chrome control"), cause: error)
         }
@@ -208,7 +181,10 @@ extension AppModel {
                 id: backup.id, dataRoot: firstRunDataRoot
             )
             if result.requiresRestart {
-                let message = "Restore validated and staged. NativeAgent is restarting to install the backup and carry only readable current requests and consumption evidence. A turn in progress when the backup was taken is restored as stopped; nothing from the backup runs on its own."
+                let message = """
+                    Restore validated and staged. NativeAgent is restarting to install the backup and carry only readable current requests and consumption \
+                    evidence. A turn in progress when the backup was taken is restored as stopped; nothing from the backup runs on its own.
+                    """
                 statusText = message
                 trustCenterActionOutcome = .saved(message)
                 AppRelaunch.relaunchApp(terminate: {
@@ -222,7 +198,10 @@ extension AppModel {
             }
             let scopes = TrustBackupPersistence.scopeNames(for: result.restored)
             let restoredDescription = scopes.isEmpty ? "no matching data scopes" : scopes.joined(separator: ", ")
-            receipt = "Restore completed at \(result.restoredAt): \"\(backup.reason)\" from \(backup.createdAt). Safety backup created first. Restored: \(restoredDescription)."
+            receipt = """
+                Restore completed at \(result.restoredAt): \"\(backup.reason)\" from \(backup.createdAt). Safety backup created first. Restored: \
+                \(restoredDescription).
+                """
             outcome = .saved(receipt)
         } catch {
             receipt = "Restore failed for \"\(backup.reason)\" from \(backup.createdAt). "
@@ -248,14 +227,11 @@ extension AppModel {
     }
 
     // MARK: Approvals
-    /// Overload of the existing `resolveApproval(_:decision:)` for callers that
-    /// hold only the approval id (inline cards, sidebar rows). Concurrent
-    /// callers share one task because a terminal approval may start a real
-    /// executor after its durable decision is written.
+    /// Concurrent ID-only callers share one task because a durable terminal decision may start a real executor.
     func resolveApproval(id: String, decision: String) async throws -> ApprovalRecord {
         try await engine.approvals.resolveApproval(
             id: id, decision: decision,
-            coordinator: .app()
+            coordinator: .app(), turn: ApprovalResolutionProvenance.local(decidedBy: "mac_ui").resolvingTurn
         )
     }
 
@@ -264,8 +240,6 @@ extension AppModel {
         try await TrustPolicyActions(dataRoot: engine.dataRoot).saveMacIntegrationPreset(preset, currentPolicy: currentPolicy)
     }
 
-    /// Overload of the existing `runConnectorAction(_:)` for the id/dryRun/input
-    /// call shape used by the Mac-data probe.
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue] = [:]) async throws -> ConnectorActionReceipt {
         try await engine.runConnectorAction(id: id, dryRun: dryRun, input: input,
             origin: "mac_ui:connector_action:" + id, platform: AppConnectorActionPlatform(engine: engine))
@@ -281,14 +255,20 @@ extension AppModel {
     }
 
     func macControlNotify(title: String, message: String) async throws -> Bool {
-        try await engine.trust.notify(
-            title: title, message: message, notificationCenterAdapter: MacNotificationPosting()
+        let turn = TurnRequest(message: "", sessionID: nil, surface: "native_actions",
+            envelope: TurnEnvelope.personOnMac("mac_ui:mac_control.notify", surface: "native_actions")).turn()
+        return try await engine.trust.notify(
+            title: title, message: message,
+            notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn
         )
     }
 
     func macControlRun(action: MacControlWorkbenchAction, body: [String: JSONValue]) async throws -> MacControlResult {
-        try await engine.trust.runMacControl(
-            action: action, body: body, notificationCenterAdapter: MacNotificationPosting()
+        let turn = TurnRequest(message: "", sessionID: nil, surface: "native_actions",
+            envelope: TurnEnvelope.personOnMac("mac_ui:mac_control." + action.rawValue, surface: "native_actions")).turn()
+        return try await engine.trust.runMacControl(
+            action: action, body: body,
+            notificationCenterAdapter: MacNotificationPosting(turn: turn, deadline: nil), turn: turn
         )
     }
 

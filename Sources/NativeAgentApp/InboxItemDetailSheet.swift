@@ -12,14 +12,38 @@ import AppKit
 import PersistenceCore
 import Desk
 import EngineRuntime
-import WorkshopExecution
 import Cognition
 import BackgroundLoops
 import ApprovalInbox
 
-// Blueprint: | `InboxItemDetailSheet.swift` | Full note reader, related-note routes, action words and shared single-flight outcomes |
+// Blueprint: | `InboxItemDetailSheet.swift` | Chat-capsule note detail, shared source presentation and single-flight outcomes; Activity uses the Inbox face |
 
-/// A full note, files, related routes and actions; failures appear above its buttons.
+extension InboxItemRecord {
+    var severityColor: Color {
+        switch severity {
+        case "actionable": return .orange
+        case "important": return .blue
+        default: return .secondary
+        }
+    }
+
+    var sourceIcon: String { presentation?.icon ?? "bell.fill" }
+    var sourceBadgeLabel: String { presentation?.badge ?? "SOURCE UNKNOWN" }
+
+    var sourceWord: String {
+        let label = sourceBadgeLabel
+        guard label != "REM" else { return label }
+        let words = label.replacingOccurrences(of: "-", with: " ").lowercased()
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+
+    var detailEyebrow: String {
+        let level = severity.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !level.isEmpty, level.lowercased() != "info" else { return sourceWord }
+        return "\(sourceWord) · \(AdvancedStatusWords.label(level))"
+    }
+}
+
 struct InboxItemDetailSheet: View {
     let item: InboxItemRecord
     var allItems: [InboxItemRecord] = []
@@ -122,7 +146,6 @@ struct InboxItemDetailSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack(spacing: NativeAgentSpacing.sm) {
-                    // Opening marks the note read; Close only closes.
                     Button("Close") { onClose() }
                         .keyboardShortcut(.cancelAction)
                     Spacer(minLength: 0)
@@ -156,7 +179,7 @@ struct InboxItemDetailSheet: View {
             let outcome = await onAction(actionID)
             switch outcome {
             case .succeeded:
-                // Dismiss only after the action's durable write succeeds.
+                // Dismiss only after the durable action write succeeds.
                 if closesOnSuccess { onClose() }
             case .failed(let detail):
                 actionError = detail
@@ -168,7 +191,6 @@ struct InboxItemDetailSheet: View {
 
 }
 
-/// Action labels and useful failure wording.
 enum InboxActionWords {
     static func isPrimary(_ actionID: String) -> Bool {
         actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
@@ -176,7 +198,7 @@ enum InboxActionWords {
 
 }
 
-/// One action flight prevents double submission and distinguishes failed writes from success.
+/// One action flight prevents duplicate writes and preserves the terminal outcome.
 @MainActor @Observable
 final class InboxRowActionFlight {
     enum Outcome: Equatable {

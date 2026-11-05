@@ -2,43 +2,17 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import BackgroundLoops
-// Blueprint: | `SlackSocketModeLoop+Evidence.swift` | `SlackSocketModeLoop`: bounded receipts and errors, envelope evidence, diagnostic state patches, timestamps and secret redaction |
+// Blueprint: | `SlackSocketModeLoop+Evidence.swift` | `SlackSocketModeLoop`: bounded, redacted diagnostics and envelope evidence |
 
 extension SlackSocketModeLoop {
-    func recordReceipt(kind: String, inbound: SlackInboundMessage, reply: String) async {
-        var row: [String: JSONValue] = [
-            "id": .string(UUID().uuidString),
-            "at": .string(Self.nowString()),
-            "kind": .string(kind),
-            "eventId": .string(inbound.eventId),
-            "teamId": .string(inbound.teamId),
-            "channelId": .string(inbound.channelId),
-            "userId": .string(inbound.userId),
-            "ts": .string(inbound.ts),
-            "textPreview": .string(Self.preview(inbound.text)),
-            "replyPreview": .string(Self.preview(reply)),
-        ]
-        if let threadTs = inbound.threadTs { row["threadTs"] = .string(threadTs) }
-        var statePatch: [String: JSONValue] = [
+    func recordReceipt(kind _: String, inbound: SlackInboundMessage, reply _: String) async {
+        let statePatch: [String: JSONValue] = [
             "lastReplyAt": .string(Self.nowString()),
             "lastReplyEventId": .string(inbound.eventId),
             "lastReplyChannelId": .string(inbound.channelId),
             "lastError": .null,
             "lastErrorAt": .null,
         ]
-        do {
-            try await appendJSONLCapped(
-                .object(row),
-                to: slackDir.appendingPathComponent("receipts.jsonl"),
-                maxLines: feedRetention.maxLines,
-                logLabel: "SlackSocketModeLoop.receipts",
-                maxBytes: feedRetention.maxBytes,
-                trimToBytes: feedRetention.trimToBytes
-            )
-            statePatch["lastReceiptFeedWriteError"] = .null
-        } catch {
-            statePatch["lastReceiptFeedWriteError"] = .string(Self.preview(String(describing: error), limit: 512))
-        }
         await writeState(statePatch)
     }
 
@@ -151,8 +125,7 @@ extension SlackSocketModeLoop {
     )
 
     static func redact(_ raw: String) -> String {
-        // Socket errors embed authenticated URLs (sometimes more than once).
-        // Retain the endpoint for diagnosis, never its query or fragment.
+        // Socket errors embed authenticated URLs (sometimes more than once). Retain the endpoint for diagnosis, never its query or fragment.
         return TurnSecretRedactor.redactText(
             TurnSecretRedactor.redactText(raw), patterns: [("AUTHENTICATED_URL", authenticatedURL)]
         ) { _, value in
@@ -160,8 +133,7 @@ extension SlackSocketModeLoop {
         }
     }
 
-    /// Stable diagnostic classes make the bounded feed rankable without
-    /// retaining transport payloads or redacted error prose as an identifier.
+    /// Stable diagnostic classes make the bounded feed rankable without retaining transport payloads or redacted error prose as an identifier.
     private static func errorClass(for error: Error) -> String {
         if error is CancellationError { return "cancelled" }
         if error is SlackSocketModeError { return "slack_api" }

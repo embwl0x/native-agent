@@ -3,8 +3,7 @@ import UIKit
 import NativeAgentShared
 // Blueprint: | `NativeAgentMobileTheme.swift` | `NativeAgentMobileTheme` enum |
 
-/// Shared iOS vocabulary: native type and materials with the Mac's quiet hierarchy.
-/// Content stays quiet; Liquid Glass belongs to floating controls and navigation.
+/// Keep content quiet; reserve Liquid Glass for floating controls and navigation.
 enum NativeAgentMobileTheme {
     static var plateGlass: Glass { .clear.tint(.black.opacity(0.28)) }
 

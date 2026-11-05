@@ -4,28 +4,18 @@ import SwiftUI
 // Blueprint: | `ShellTabs.swift` | Shell page/tab components: content-local action rows, shared scroll gutter and tabbed page layout |
 
 extension View {
-    /// Page actions stay inside the content pane, so changing sidebar pages
-    /// never adds or removes a window toolbar. On a tabbed page they sit at
-    /// the right end of the tab row (`ShellTabbedPage`); elsewhere, in a row
-    /// of their own at the top of the page.
+    /// Keep actions inside page content so navigation never adds or removes a window toolbar.
     func pageActions<Actions: View>(@ViewBuilder _ actions: () -> Actions) -> some View {
         modifier(PageActionsModifier(actions: actions()))
     }
 
-    /// The page column's right edge, the same whether or not this page's
-    /// scroll view is showing a scroller. With legacy scrollers (a mouse
-    /// attached) the scroller takes its width out of the column only while
-    /// the page overflows; a page that fits leaves the same room empty, so
-    /// the controls above the scroll view (`ShellScrollGutter`) and the rows
-    /// in it end at one x either way. Applies to the scroll views inside.
+    /// Reserve the same scroller width even when content fits so controls and rows share one right edge.
     func pageScrollColumn() -> some View {
         modifier(PageScrollColumn())
     }
 }
 
-/// The width a legacy scroller takes out of a page's scroll view; zero with
-/// overlay scrollers. Controls drawn above a page's scroll view inset their
-/// trailing edge by it so they end where the rows below end.
+/// Inset controls above scrolling rows by the scroller width so their trailing edges align.
 @MainActor @Observable
 final class ShellScrollGutter {
     static let shared = ShellScrollGutter()
@@ -48,8 +38,7 @@ final class ShellScrollGutter {
     }
 }
 
-/// The trailing gutter always follows the legacy scroller's width.
-/// Never derive it from content overflow: rewrapping would feed back into that measurement.
+/// Use scroller width, never overflow; rewrapping would feed back into an overflow measurement.
 private struct PageScrollColumn: ViewModifier {
     func body(content: Content) -> some View {
         content.contentMargins(.trailing, ShellScrollGutter.shared.width, for: .scrollContent)
@@ -57,11 +46,10 @@ private struct PageScrollColumn: ViewModifier {
 }
 
 extension EnvironmentValues {
-    /// Set by `ShellTabbedPage`: its tab row draws the page's actions.
+    /// Let the tab row own actions so they are not drawn twice.
     @Entry var shellTabRowHostsActions: Bool = false
 }
 
-/// The selected tab's actions, handed up to the tab row that draws them.
 struct ShellPageActionsKey: PreferenceKey {
     static var defaultValue: AnyView? { nil }
     static func reduce(value: inout AnyView?, nextValue: () -> AnyView?) {
@@ -90,16 +78,14 @@ private struct PageActionsModifier<Actions: View>: ViewModifier {
     }
 }
 
-// Related rail destinations share a page with tabs styled like the rail.
 
-/// One tab: a stable key (persisted per page) and the word a person reads.
+/// Persist stable keys independently of user-facing tab words.
 struct ShellTab<Key: Hashable>: Identifiable {
     let key: Key
     let title: String
     var id: Key { key }
 }
 
-/// Page sections use the native segmented control and the app tint.
 struct ShellTabs<Key: Hashable>: View {
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
@@ -120,9 +106,7 @@ struct ShellTabs<Key: Hashable>: View {
     }
 }
 
-/// A rail page with tabs: the page frame's title, the tab row under it, then
-/// the selected tab's content. Content is keyed by the selection so a tab
-/// switch is a clean swap, never a half-updated page.
+/// Key content by selection so tab changes replace the entire page coherently.
 struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     @Environment(AppModel.self) private var appModel
     let title: String
@@ -130,7 +114,6 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     var subtitlePage: SidebarItem? = nil
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
-    /// The serif header; the tab content hands its line up (`alivePageLine`).
     var alive: Bool = false
     @ViewBuilder let content: (Key) -> Content
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
@@ -138,12 +121,15 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
     @State private var tabRowHeight: CGFloat = 24
 
     var body: some View {
-        // A screenshot's offscreen copy draws the tab it asked for, else the
-        // first (default) tab — not the one User last left open, which is his.
+        // Screenshots use their requested or default tab without changing the user's mounted selection.
         let shown = quietOffscreenRead
             ? (tabs.first { ($0.key as? String) == quietRailTab } ?? tabs.first)?.key ?? selection
             : selection
-        ShellPageFrame(title: title, subtitle: subtitlePage.flatMap { appModel.engine.transcripts.presentation.words("page:"+$0.normalized.rawValue) } ?? subtitle, alive: alive) {
+        ShellPageFrame(
+            title: title,
+            subtitle: subtitlePage.flatMap { ShellPageSubtitle.line($0, appModel) } ?? subtitle,
+            alive: alive
+        ) {
             VStack(alignment: .leading, spacing: 0) {
                 ShellTabs(tabs: tabs, selection: quietOffscreenRead ? .constant(shown) : $selection)
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { tabRowHeight = $0 }
@@ -154,8 +140,7 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
                     .aliveTopDissolve(alive ? 18 : 0)
                     .environment(\.shellTabRowHostsActions, true)
             }
-            // The tab's actions (Refresh) at the right end of the tab row,
-            // ending where the tab's rows end.
+            // Align tab actions to the rows' trailing edge.
             .overlayPreferenceValue(ShellPageActionsKey.self, alignment: .topTrailing) { actions in
                 if let actions {
                     HStack(spacing: 12) { actions }
@@ -177,16 +162,9 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
 private let aliveTopClearBand: CGFloat = 8
 
 extension View {
-    /// An alive page's gap under its pinned header or tab row, as a dissolve
-    /// instead of a gap. The gap becomes safe area, so content still rests
-    /// `gap` down but scrolls up into it, and a static alpha mask fades it
-    /// out across the gap: the soft edge the chat header has
-    /// (`roomTopChrome`), not a hard slice at the scroll view's edge.
-    /// Static geometry, no `safeAreaBar` (it pinned the main thread).
-    /// The first `aliveTopClearBand` points are fully clear, so a line cut
-    /// at the edge shows no partial glyphs; the ramp fills the rest of the
-    /// gap and ends where content rests. Chat's 24pt fade (`simpleTopFade`)
-    /// runs over scrolled lines only; here the gap is the whole budget.
+    /// Use static safe-area geometry to keep scrolling responsive; safeAreaBar can block the main thread.
+    /// Fade over the header gap and clear its first points so clipped partial glyphs stay invisible.
+    /// Keep the fade within the gap so resting content retains full opacity.
     @ViewBuilder
     func aliveTopDissolve(_ gap: CGFloat) -> some View {
         if gap > 0 {
@@ -207,24 +185,34 @@ extension View {
     }
 }
 
-/// A rail page without tabs: the frame and its title, nothing else added.
 struct ShellRailPage<Content: View>: View {
     @Environment(AppModel.self) private var appModel
     let title: String
     var subtitle: String? = nil
     var subtitlePage: SidebarItem? = nil
     var wide: Bool = false
-    /// The serif header; the content hands its line up (`alivePageLine`).
     var alive: Bool = false
     @ViewBuilder let content: Content
 
     var body: some View {
-        ShellPageFrame(title: title, subtitle: subtitlePage.flatMap { appModel.engine.transcripts.presentation.words("page:"+$0.normalized.rawValue) } ?? subtitle,
+        ShellPageFrame(
+            title: title,
+            subtitle: subtitlePage.flatMap { ShellPageSubtitle.line($0, appModel) } ?? subtitle,
             wide: wide, alive: alive) { content }
             .quietReadTask(id: subtitlePage?.normalized.rawValue) {
                 if let page=subtitlePage?.normalized {
-                    await appModel.engine.transcripts.presentation.prepare("page:"+page.rawValue,input:.object(["kind":.string("page"),"page":.string(page.rawValue)]))
+                    await appModel.engine.transcripts.presentation.prepare(
+                        "page:"+page.rawValue,
+                        input:.object(["kind":.string("page"),"page":.string(page.rawValue)]))
                 }
             }
+    }
+}
+
+/// A faced page's own line is its subtitle under the rail; other pages read their prepared caption.
+enum ShellPageSubtitle {
+    @MainActor static func line(_ page: SidebarItem, _ appModel: AppModel) -> String? {
+        appModel.engine.pages.snapshots[page.normalized.rawValue]?.face?.line
+            ?? appModel.engine.transcripts.presentation.words("page:" + page.normalized.rawValue)
     }
 }

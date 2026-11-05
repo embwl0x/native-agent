@@ -2,29 +2,28 @@ import Foundation
 import Experiences
 import NativeAgentShared
 import NativeAgentCore
+import ChatTurnContracts
 import PersistenceCore
 import TrustCenter
-import WorkshopExecution
 import os
 import Privacy
 import NotificationInbox
 import Darwin
-// Blueprint: | `TriggerOccurrences.swift` | SwiftNativeTriggerScheduler daily eligibility, durable life-stamped trigger claims, repair, deadlines and checked occurrence/config reads |
+// Blueprint: | `TriggerOccurrences.swift` | Locked trigger claims, repair, deadlines and checked reads |
 
 extension SwiftNativeTriggerScheduler {
 
     /// Saved inbox authority gates all inbox fires; damage throws instead of saying the person disabled it.
     nonisolated var inboxMasterOn: Bool {
         get throws {
-            try SavedTrustPolicyAuthority.flag(block: "inboxPolicy", key: "enabled", default: true, dataRoot: root)
+            try SwiftNativeTrustCenter(dataRoot: root).savedPolicyFlag(block: "inboxPolicy", key: "enabled", default: true)
         }
     }
 
-    /// The full fire envelopes for this tick, in fire order.
     public func evaluateAndFireDetailed() async -> [TriggerFireResult] {
         var fired: [TriggerFireResult] = []
         var deferredDueToCap = false
-        for (surface, path) in [("inbox", inboxStatePath), ("workshop", workshopExecutionStatePath)] {
+        for (surface, path) in [("inbox", inboxStatePath)] {
             guard case .parsed(let state) = Self.readStateRaw(path) else { continue }
             for (name, value) in state {
                 guard case .object(let entry) = value, entry["state"] != .string("stopped"),
@@ -35,16 +34,14 @@ extension SwiftNativeTriggerScheduler {
             }
         }
 
-        // Claims prevent duplicate effects; only successful work settles repair.
-        // A surface whose configuration cannot be read or whose state is
-        // damaged fires nothing until repaired, and the pass says so: its
-        // receipt is an error row, never an empty pass.
+        // Claims prevent duplicate effects; only successful work settles repair. A surface whose configuration cannot be read or whose state is damaged fires
+        // nothing until repaired, and the pass says so: its receipt is an error row, never an empty pass.
         var unavailable: [TriggerFireResult] = []
-        for (surface, statePath) in [("inbox", inboxStatePath), ("workshop", workshopExecutionStatePath)] {
+        for (surface, statePath) in [("inbox", inboxStatePath)] {
             let configs: [TriggerConfig]
             do {
-                if surface == "inbox", try !inboxMasterOn { continue }
-                configs = try await surface == "inbox" ? listInboxTriggers() : listWorkshopTriggers()
+                if try !inboxMasterOn { continue }
+                configs = try await listInboxTriggers()
             } catch {
                 unavailable.append(TriggerFireResult(status: "error", name: "\(surface) triggers",
                     error: "\(surface.capitalized) triggers could not be read; none fire until they can: \(error.localizedDescription)"))
@@ -59,9 +56,8 @@ extension SwiftNativeTriggerScheduler {
             for cfg in configs where cfg.enabled {
                 guard let scheduled = scheduledInstantIfDue(cfg) else { continue }
                 if fired.count >= Self.periodicFireCapPerTick {
-                    // A clock-due trigger may already have fired. Only an
-                    // unclaimed remainder earns another pass; failed/corrupt
-                    // state waits for its repair or source-change event.
+                    // A clock-due trigger may already have fired. Only an unclaimed remainder earns another pass; failed/corrupt state waits for its repair or
+                    // source-change event.
                     let state: [String: JSONValue]
                     switch Self.readStateRaw(statePath) {
                     case .corrupt: continue
@@ -81,12 +77,17 @@ extension SwiftNativeTriggerScheduler {
                         error: "Trigger \(cfg.name) is due but could not be claimed, so it did not fire: \(error.localizedDescription)"))
                     continue
                 }
-                fired.append(await runClaimedTrigger(surface: surface, name: cfg.name, occurrence: occurrence))
+                // A clock claim is this turn's ingress; repair calls below keep their caller's turn instead.
+                let turn = Turn().with(\.envelope, TurnEnvelope.native("trigger:\(surface):\(cfg.name):\(occurrence)", surface: "scheduler"))
+                fired.append(await runClaimedTrigger(surface: surface, name: cfg.name, occurrence: occurrence, turn: turn))
             }
         }
         if deferredDueToCap {
             Self.logger.error(
-                "periodic trigger fire cap (\(Self.periodicFireCapPerTick, privacy: .public)) hit this tick — fired \(fired.count, privacy: .public), remaining due triggers request a continuation"
+                """
+                    periodic trigger fire cap (\(Self.periodicFireCapPerTick, privacy: .public)) hit this tick — fired \(fired.count, privacy: .public), \
+                    remaining due triggers request a continuation
+                    """
             )
             if !Task.isCancelled {
                 NotificationCenter.default.post(name: Self.dueWorkRemaining, object: nil)
@@ -95,58 +96,34 @@ extension SwiftNativeTriggerScheduler {
         return fired + unavailable
     }
 
-    public func repairTrigger(surface: String, name: String, occurrence: String? = nil) async -> TriggerFireResult {
-        return await runClaimedTrigger(surface: surface, name: name, occurrence: occurrence)
+    public func repairTrigger(surface: String, name: String, occurrence: String? = nil, turn: Turn) async -> TriggerFireResult {
+        return await runClaimedTrigger(surface: surface, name: name, occurrence: occurrence, turn: turn)
     }
 
-    private func runClaimedTrigger(surface: String, name: String, occurrence requestedOccurrence: String? = nil) async -> TriggerFireResult {
-        guard ["inbox", "workshop"].contains(surface) else {
-            return TriggerFireResult(status: "error", name: name, error: "surface must be inbox or workshop")
+    private func runClaimedTrigger(surface: String, name: String, occurrence requestedOccurrence: String? = nil,
+                                  turn: Turn) async -> TriggerFireResult {
+        guard surface == "inbox" else {
+            return TriggerFireResult(status: "error", name: name, error: "surface must be inbox")
         }
-        let statePath = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
+        let statePath = inboxStatePath
         let occurrence: String
         do { occurrence = try retainedClaim(statePath: statePath, name: name, requested: requestedOccurrence) }
         catch { return TriggerFireResult(status: "error", name: name, error: error.localizedDescription) }
         let operation = "trigger:\(surface):\(name):\(occurrence)"
         var result: TriggerFireResult
         do {
-            // Admission precedes the part's model/tools. Release both locks
-            // while it thinks, then use the same admission again to publish.
+            // Admission precedes the part's model/tools. Release both locks while it thinks, then use the same admission again to publish.
             if let refused = try await withEnabledTriggerClaim(surface: surface, name: name, occurrence: occurrence, work: { _ in nil }) {
                 result = refused
             } else {
-                let prepared: InboxPreparation
-                switch surface {
-                case "inbox":
-                    prepared = try await prepareInboxTrigger(name: name)
-                case "workshop":
-                    prepared = .refused(TriggerFireResult(status: "not_found", name: name))
-                default: throw TriggerSchedulerError.invalidRequest("surface must be inbox or workshop")
-                }
+                let prepared = try await prepareInboxTrigger(name: name)
                 guard let published = try await withEnabledTriggerClaim(surface: surface, name: name, occurrence: occurrence, work: { [self] current in
-                    var result: TriggerFireResult
-                    switch surface {
-                    case "inbox":
-                        let currentPreparation: InboxPreparation
-                        switch prepared {
-                        case .ready(_, let notify, let item): currentPreparation = .ready(row: current, notify: notify, item: item)
-                        case .refused: currentPreparation = prepared
-                        }
-                        result = await publishInboxTrigger(name: name, occurrence: occurrence, prepared: currentPreparation)
-                    case "workshop":
-                        let rows = try await workshopRunner.listWorkshopExecutions()
-                        let source = "trigger:\(name):occurrence:\(occurrence)"
-                        if let prior = rows.first(where: {
-                            guard case .object(let row) = $0 else { return false }
-                            return row["trigger_source"] == .string(source)
-                        }), case .object(let row) = prior, case .string(let id)? = row["id"] {
-                            result = TriggerFireResult(status: "fired", name: name, executionId: id)
-                        } else {
-                            result = try await fireWorkshopTrigger(name: name, occurrence: occurrence, seed: [])
-                        }
-                    default: throw TriggerSchedulerError.invalidRequest("surface must be inbox or workshop")
+                    let currentPreparation: InboxPreparation
+                    switch prepared {
+                    case .ready(_, let notify, let item): currentPreparation = .ready(row: current, notify: notify, item: item)
+                    case .refused: currentPreparation = prepared
                     }
-                    return result
+                    return await publishInboxTrigger(name: name, occurrence: occurrence, prepared: currentPreparation)
                 }) else {
                     throw TriggerSchedulerError.persistenceFailure("Trigger publication returned no result; its retained claim remains unfinished.")
                 }
@@ -162,15 +139,14 @@ extension SwiftNativeTriggerScheduler {
         return result
     }
 
-    /// nil means admission succeeded without publication (the preparation pass).
-    /// Both passes use the same config → state transaction and exact claim.
+    /// nil means admission succeeded without publication (the preparation pass). Both passes use the same config → state transaction and exact claim.
     private func withEnabledTriggerClaim(
         surface: String, name: String, occurrence: String,
         work: @Sendable (TriggerConfig) async throws -> TriggerFireResult?
     ) async throws -> TriggerFireResult? {
         try Task.checkCancellation()
-        let configPath = surface == "inbox" ? inboxPath : workshopExecutionsPath
-        let statePath = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
+        let configPath = inboxPath
+        let statePath = inboxStatePath
         return try await SwiftNativePersistenceCore.withFileLock(configPath) { [self] in
             // A retained claim requires an existing definition, never seeded defaults.
             if case .missing = Self.readConfigsRaw(configPath) {
@@ -190,9 +166,11 @@ extension SwiftNativeTriggerScheduler {
                 try Task.checkCancellation()
                 let result: TriggerFireResult?
                 if !current.enabled {
-                    result = TriggerFireResult(status: "disabled", name: name, error: "The current trigger definition is disabled; its retained occurrence was settled without running.")
+                    result = TriggerFireResult(status: "disabled", name: name,
+                        error: "The current trigger definition is disabled; its retained occurrence was settled without running.")
                 } else if surface == "inbox", try !inboxMasterOn {
-                    result = TriggerFireResult(status: "disabled", name: name, error: "Raising things unasked is off (Notifications); its retained occurrence was settled without running.")
+                    result = TriggerFireResult(status: "disabled", name: name,
+                        error: "Raising things unasked is off (Notifications); its retained occurrence was settled without running.")
                 } else {
                     result = try await work(current)
                 }
@@ -224,7 +202,7 @@ extension SwiftNativeTriggerScheduler {
     }
 
     private func oweTrigger(surface: String, name: String, occurrence: String) -> Task<Void, Never> {
-        let path = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
+        let path = inboxStatePath
         let operation = "trigger:\(surface):\(name):\(occurrence)"
         return RepairOwed.owe(root, id: "trigger-claim:" + operation, kind: .run,
             operation: operation, owner: path.path + " > " + name + ".unfinished_occurrences",
@@ -233,14 +211,8 @@ extension SwiftNativeTriggerScheduler {
                 "surface": .string(surface), "name": .string(name), "occurrence": .string(occurrence)])]))
     }
 
-    /// Earliest clock crossing for an enabled `time` trigger; other kinds have
-    /// no deadline. This is a read-only projection over canonical config and liveness
-    /// state. It never claims or fires an occurrence.
-    ///
-    /// Future time instants remain exact. A capped pass requests a coalesced
-    /// continuation; an unavailable or failed occurrence waits for source or
-    /// repair invalidation, with the slow integrity sweep as a missed-event
-    /// backstop. Overdue work never manufactures a retry deadline.
+    /// Project exact clock deadlines without claiming effects. Capped passes request continuation; failures wait for repair/source invalidation. A slow
+    /// integrity sweep covers missed events; overdue work must not manufacture retry deadlines.
     public func nextMeaningfulDeadline(after reference: Date) async -> Date? {
         var candidates: [Date] = []
         do {
@@ -249,26 +221,11 @@ extension SwiftNativeTriggerScheduler {
                 candidates.append(contentsOf: deadlines(for: inbox, statePath: inboxStatePath, after: reference))
             }
             await RepairOwed.settle(root, operation: "scheduler.inbox.discovery",
-                evidence: .init(source: "trust", id: SavedTrustPolicyAuthority.policyURL(dataRoot: root).path)).value
+                evidence: .init(source: "trust", id: SwiftNativeTrustCenter.policyURL(dataRoot: root).path)).value
         } catch {
             await RepairOwed.owe(root, id: "trigger-inbox-policy", kind: .run,
                 operation: "scheduler.inbox.discovery", owner: "Trust policy and inbox triggers",
                 words: "Inbox trigger deadline is unavailable: \(error.localizedDescription)",
-                nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")])).value
-        }
-        do {
-            let executions = try await listWorkshopTriggers()
-            candidates.append(contentsOf: deadlines(
-                for: executions,
-                statePath: workshopExecutionStatePath,
-                after: reference
-            ))
-            await RepairOwed.settle(root, operation: "scheduler.workshop.discovery",
-                evidence: .init(source: "trigger", id: workshopExecutionsPath.path)).value
-        } catch {
-            await RepairOwed.owe(root, id: "trigger-workshop-config", kind: .run,
-                operation: "scheduler.workshop.discovery", owner: workshopExecutionsPath.path,
-                words: "Workshop trigger deadline is unavailable: \(error.localizedDescription)",
                 nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")])).value
         }
         return candidates.min()
@@ -307,7 +264,7 @@ extension SwiftNativeTriggerScheduler {
         }
     }
 
-    /// Clock-only daily eligibility; invalid schedules are dormant. claimIfDue recomputes under the state lock with last-fired state to prevent double fires.
+    /// Recompute clock eligibility under the claim lock with last-fired evidence to prevent duplicate daily effects.
     private nonisolated func scheduledInstantIfDue(_ cfg: TriggerConfig) -> Date? {
         let current = now()
         guard let schedule = Self.dailySchedule(cfg),
@@ -340,8 +297,7 @@ extension SwiftNativeTriggerScheduler {
         case parsed([String: JSONValue])
     }
 
-    /// Classification of a per-surface trigger CONFIG file (a JSON array), the
-    /// array-shaped sibling of `StateRead`. Same three cases, same reason.
+    /// Distinguish missing, parsed and damaged configuration before mutation, matching the state owner's availability model.
     enum ConfigRead {
         case missing
         case corrupt
@@ -358,10 +314,8 @@ extension SwiftNativeTriggerScheduler {
         return .parsed(items)
     }
 
-    /// One config loader for reads and mutations. Only a missing file asks the
-    /// part for defaults, before any lock; locked mutations supply prepared defaults.
-    /// Parsed → the user's rows. Corrupt → the canonical bytes stay in place
-    /// and the operation throws, never resurrecting defaults over user data.
+    /// One config loader for reads and mutations. Only a missing file asks the part for defaults, before any lock; locked mutations supply prepared defaults.
+    /// Parsed → the user's rows. Corrupt → the canonical bytes stay in place and the operation throws, never resurrecting defaults over user data.
     nonisolated static func loadConfigs(
         path: URL,
         defaultValue: @autoclosure @Sendable () async throws -> [JSONValue]
@@ -374,7 +328,10 @@ extension SwiftNativeTriggerScheduler {
         case .corrupt:
             logger.error("corrupt trigger config \(path.lastPathComponent, privacy: .public) — preserved in place; refusing to overwrite it with defaults")
             throw TriggerSchedulerError.persistenceFailure(
-                "Trigger configuration \(path.lastPathComponent) is unreadable and has been preserved. Repair the file before using triggers; defaults have not been restored."
+                """
+                    Trigger configuration \(path.lastPathComponent) is unreadable and has been preserved. Repair the file before using triggers; defaults \
+                    have not been restored.
+                    """
             )
         }
     }
@@ -415,8 +372,7 @@ extension SwiftNativeTriggerScheduler {
         })
     }
 
-    /// Pull a trigger's persisted `last_fired_at` out of an already-read state
-    /// map. nil when the trigger has no recorded fire.
+    /// No saved last_fired_at means no recorded fire.
     private static func lastFiredFromState(_ state: [String: JSONValue], name: String) -> Date? {
         guard case .object(let entry)? = state[name],
               case .string(let s)? = entry["last_fired_at"] else {
@@ -440,16 +396,14 @@ extension SwiftNativeTriggerScheduler {
         return date + String(format: " %02d:%02d", intField(cfg.config, "hour")!, intField(cfg.config, "minute") ?? 0)
     }
 
-    /// Lock order is configuration → state, shared with the configuration writer.
-    /// Re-read the enabled definition before claiming its scheduled instant.
-    /// Nil means not due or already claimed; unavailable claims throw.
+    /// Lock order is configuration → state, shared with the configuration writer. Re-read the enabled definition before claiming its scheduled instant. Nil
+    /// means not due or already claimed; unavailable claims throw.
     private func claimIfDue(_ cfg: TriggerConfig, statePath: URL) async throws -> String? {
         let name = cfg.name
-        let configPath = statePath == inboxStatePath ? inboxPath : workshopExecutionsPath
+        let configPath = inboxPath
         let seed: [JSONValue]
         if case .missing = Self.readConfigsRaw(configPath) {
-            let proposed = try await defaults()
-            seed = statePath == inboxStatePath ? proposed.inbox : proposed.workshop
+            seed = try await defaults().inbox
         } else { seed = [] }
         return try await SwiftNativePersistenceCore.withFileLock(configPath) { [self] in
             let configs = try await Self._readList(path: configPath, defaultValue: seed)
@@ -466,16 +420,16 @@ extension SwiftNativeTriggerScheduler {
                 case .parsed(let o):
                     state = o
                 }
-                // Re-check under the lock: another instance may have just claimed
-                // this same occurrence.
+                // Recheck under the lock because another instance may have claimed this occurrence.
                 if Self.hasFired(cfg, state: state, scheduled: scheduled) {
                     return nil
                 }
-                let surface = statePath == inboxStatePath ? "inbox" : "workshop"
+                let surface = "inbox"
                 // `last_fired_at` stamps the scheduled instant at claim, not successful completion.
                 var entry: [String: JSONValue] = if case .object(let saved)? = state[name] { saved } else { [:] }
                 let life = try DataRootLife.current(in: root)
-                let unfinished: [JSONValue] = if DataRootLife.life(of: entry["lifeID"]) == life, case .array(let saved)? = entry["unfinished_occurrences"] { saved } else { [] }
+                let unfinished: [JSONValue] = if DataRootLife.life(of: entry["lifeID"]) == life,
+                    case .array(let saved)? = entry["unfinished_occurrences"] { saved } else { [] }
                 entry["unfinished_occurrences"] = .array(unfinished + [.string(stamp)])
                 entry["lifeID"] = .string(life)
                 entry["state"] = .string("running")
@@ -506,8 +460,7 @@ extension SwiftNativeTriggerScheduler {
         }
     }
 
-    /// Parse an ISO8601 timestamp (with or without fractional seconds), matching
-    /// the shape `isoTimestamp` writes.
+    /// Parse an ISO8601 timestamp (with or without fractional seconds), matching the shape `isoTimestamp` writes.
     static func parseISOTimestamp(_ value: String) -> Date? {
         return NativeTimestampFormat.parseISO8601FractionalFirst(value)
     }

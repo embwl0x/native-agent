@@ -1,10 +1,4 @@
-// Studio feeling reads lexical valence from the written judgment through studioValence.
-// Stance gates and scales: abstained is silent, open weighs half, formed weighs full;
-// empty or neutral responses move nothing, and entries without artifact refs weigh half again.
-// Description-only consults cannot enter the journal. Valence concerns the work,
-// never her socialWarmth, uncertainty or taskPressure; this file writes no dreams.
-// Dream-citation seam: stable `studio_journal:<entry.id>` events carry the entry id
-// in `subject.id` (type `studio_entry`) and metadata `studioEntryId`.
+// Studio stance scales measured work feeling; neutral entries move nothing. Stable journal ids publish pointers, never response prose or social affect.
 
 import Foundation
 import NativeAgentShared
@@ -14,16 +8,14 @@ import Studio
 // Blueprint: | `CognitiveSubstrate+StudioEvents.swift` | `CognitiveSubstrate`: `studioJournalFelt`, `studioJournalEvent`, `ingestStudioJournalEntry` |
 
 public extension CognitiveEvent {
-    /// Metadata key for valence measured by the event's owner.
+    /// Owner-measured feeling uses this metadata contract.
     static let feltValenceMetadataKey = "feltValence"
     static let feltArousalMetadataKey = "feltArousal"
-    /// The journal entry this event came from. The dream felt-summary cites it.
+    /// Retain journal identity so dream summaries cite the source.
     static let studioEntryIDMetadataKey = "studioEntryId"
     static let studioStanceMetadataKey = "studioStance"
 
-    /// True when this event's owner MEASURED its feeling. Such an event stamps
-    /// that value and takes no additional flat per-kind affect delta — applying
-    /// both would add an inferred delta on top of a measured one.
+    /// Measured feeling replaces per-kind inference so one entry cannot count twice.
     var carriesMeasuredFeltValence: Bool {
         switch metadata[Self.feltValenceMetadataKey] {
         case .some(.double), .some(.int): true
@@ -32,13 +24,10 @@ public extension CognitiveEvent {
     }
 }
 
-/// The measured feeling of one filed entry.
 public struct StudioJournalFelt: Sendable, Equatable {
-    /// −1…1, bounded. Zero means "this entry moves nothing", which is a real
-    /// and common outcome, not a failure to score.
+    /// Zero is a valid neutral entry, never a scoring failure.
     public var valence: Double
-    /// 0…1. A judgment that lands hard is a little more activating than one
-    /// that does not; it is derived from the same magnitude, never invented.
+    /// Arousal follows measured magnitude so it cannot be invented independently.
     public var arousal: Double
 
     public static let still = StudioJournalFelt(valence: 0, arousal: 0)
@@ -47,8 +36,7 @@ public struct StudioJournalFelt: Sendable, Equatable {
 
 public extension CognitiveSubstrate {
 
-    /// Bound on how far one entry can move her. Same ceiling the organism's own
-    /// measured resolutions use — composed, never melodrama.
+    /// Share the body's measured-resolution ceiling to keep work feeling composed.
     static let studioJournalFeltCeiling = 0.7
 
     func studioJournalFelt(for entry: StudioJournalEntry) -> StudioJournalFelt {
@@ -66,7 +54,7 @@ public extension CognitiveSubstrate {
         return StudioJournalFelt(valence: bounded, arousal: abs(bounded).clamped01())
     }
 
-    /// Mint a filed entry's event only when its title and id are nonempty.
+    /// A filed event needs nonempty source title and id.
     func studioJournalEvent(
         for entry: StudioJournalEntry
     ) throws -> CognitiveEvent? {
@@ -76,9 +64,7 @@ public extension CognitiveSubstrate {
         guard let occurredAt = NativeTimestampFormat.parseISO8601FractionalFirst(entry.recordedAt) else {
             throw CognitiveArtifactCodec.FieldFailure(path: "studio_journal:\(entry.id).recordedAt")
         }
-        // The summary names the ACT, never the judgment. Her written response
-        // stays in the journal, which is the record of it; a continuity node is
-        // a pointer to that, not a second copy competing for the same space.
+        // A continuity node names the act and points to the journal; copying the judgment would create competing records.
         let summary = "Journal entry on \(bounded(title, maxCharacters: 120)) "
             + "— stance \(entry.stance.kind.rawValue)."
         return CognitiveEvent(
@@ -92,8 +78,7 @@ public extension CognitiveSubstrate {
             sourceClass: .selfReported,
             occurredAt: occurredAt,
             summary: summary,
-            // A neutral entry is not merely valence-zero, it is unimportant:
-            // nothing about it should draw attention it did not earn.
+            // A neutral entry is not merely valence-zero, it is unimportant: nothing about it should draw attention it did not earn.
             importance: abs(felt.valence).clamped01(),
             metadata: [
                 CognitiveEvent.feltValenceMetadataKey: .double(felt.valence),
@@ -105,8 +90,7 @@ public extension CognitiveSubstrate {
         )
     }
 
-    /// Put one filed entry on the bus. Idempotent by the event's stable id: the
-    /// field's seen-event check makes a replay inert.
+    /// Put one filed entry on the bus. Idempotent by the event's stable id: the field's seen-event check makes a replay inert.
     func ingestStudioJournalEntry(_ entry: StudioJournalEntry) async {
         do {
             guard let event = try studioJournalEvent(for: entry) else { return }
@@ -119,39 +103,30 @@ public extension CognitiveSubstrate {
     }
 }
 
-/// Delivers durable journal entries to one sink; logs once while no sink is installed.
+/// One sink receives durable entries; a missing sink is logged once.
 public actor StudioJournalCognitiveBus {
     public typealias Sink = @Sendable (StudioJournalEntry) async -> Void
 
-    @TaskLocal static var shared = StudioJournalCognitiveBus()
     private var sink: Sink?
     private var warnedAboutMissingSink = false
 
-    /// Install the process's one sink. A second install REPLACES the first —
-    /// there is one resident mind, so there is one sink.
-    public static func install(_ sink: @escaping Sink) async {
-        await shared.setSink(sink)
-    }
+    public init() {}
 
-    /// Publish a filed entry. Never throws and never blocks the journal write's
-    /// success: the entry is already durable when this runs.
-    public static func publish(_ entry: StudioJournalEntry) async {
-        await shared.deliver(entry)
-    }
-
-    private func setSink(_ value: @escaping Sink) {
+    /// One resident mind installs its own sink.
+    public func install(_ value: @escaping Sink) {
         sink = value
         warnedAboutMissingSink = false
     }
 
-    private func deliver(_ entry: StudioJournalEntry) async {
+    /// Publish a filed entry after its durable write. Missing delivery is reported; it cannot undo that write.
+    public func publish(_ entry: StudioJournalEntry) async {
         guard let sink else {
             if !warnedAboutMissingSink {
                 warnedAboutMissingSink = true
                 nativeLog(
                     "[studio] journal entry %@ filed with no cognitive sink installed — "
                         + "the entry is durable, but nothing put it on the bus. "
-                        + "Install StudioJournalCognitiveBus at startup.",
+                        + "Install this runtime's studio journal sink at startup.",
                     entry.id
                 )
             }

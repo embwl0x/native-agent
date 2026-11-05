@@ -12,10 +12,9 @@ import CognitiveSubstrate
 import Context
 import ContextFlow
 import TurnTrace
-// Blueprint: | `EngineCognitionView.swift` | `CognitionViewFacade`: checked diary/gate revision and file invalidation shared by Dreams, Settings and search; root-scoped model-call readout/refresh; `LatestRead` owns observatory, proposals, vitals, model-call and Living Status publication; watched paths and coalesced refresh coordination; `DreamDiary`: `FileBackedDreamDiary` rows |
+// Blueprint: | `EngineCognitionView.swift` | `CognitionViewFacade`, `LatestRead`, `DreamDiary`, `FileBackedDreamDiary`; Shared checked cognition projections |
 
-/// Observable page state over this engine's canonical cognition runtime.
-/// Reads retain core types; controls and Dream/REM keep their existing executors.
+/// Keep canonical cognition types and executors across page reads and controls.
 @MainActor
 @Observable
 public final class CognitionViewFacade {
@@ -24,7 +23,6 @@ public final class CognitionViewFacade {
 
     public var detail: CognitiveObservatoryDetail?
     public var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
-    public var workshop: WorkshopObservatorySnapshot?
     public var lastRefresh: Date?
     public var subconsciousRuntime: NativeSubconsciousRuntimeState?
     public var reflectionRoute: NativeReflectionRouteStatus?
@@ -40,6 +38,8 @@ public final class CognitionViewFacade {
 
     public var livingSnapshot: LivingStatusSnapshot?
     public var livingRefreshStatus: PanelRefreshStatus?
+    public internal(set) var livingWatchAvailability: LivingStatusFileWatch.Availability?
+    @ObservationIgnored var livingStatusDidChange: (@MainActor () -> Void)?
     @ObservationIgnored private let observatoryLatest = LatestRead()
     @ObservationIgnored private let detailRead = LatestRead()
     @ObservationIgnored private let vitalsRead = LatestRead()
@@ -99,8 +99,7 @@ public final class CognitionViewFacade {
         )
     }
 
-    /// The app supplies its existing live owners; this facade publishes to the
-    /// page's root. Enabling supplies a Context Flow default only when unset.
+    /// Publish to the page root; enable Context Flow defaults only when unset.
     public func setInnerLifeEnabled(
         _ enabled: Bool,
         runtime: NativeCognitionRuntime,
@@ -149,32 +148,28 @@ public final class CognitionViewFacade {
         return min(1, max(0, sum / Double(reading.feltNodes.count)))
     }
 
-    /// TrustCenter supplies policy; DreamREMCycle owns the composite gate arithmetic.
+    /// Read policy from TrustCenter and composite gate arithmetic from DreamREMCycle.
     public nonisolated func dreamGate() async throws -> DreamREMGatePolicy {
-        try DreamREMGatePolicy(authority: .read(dataRoot: dataRoot))
+        try DreamREMGatePolicy(policy: SwiftNativeTrustCenter(dataRoot: dataRoot).loadSavedPolicyChecked())
     }
 
-    /// Manual REM changes persistent, approval-gated state. Unlike a passive
-    /// compatibility read, its effect-time policy check must expose damaged
-    /// authority bytes rather than turn a fail-closed projection into an
-    /// apparently enabled REM cycle.
+    /// Manual REM changes durable state: its effect-time gate must expose damaged authority, never an apparently enabled cycle.
     public nonisolated func dreamGateChecked() async throws -> DreamREMGatePolicy {
         let policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked()
-        return try DreamREMGatePolicy(authority: .present(policy))
+        return try DreamREMGatePolicy(policy: policy)
     }
 
-    /// A dream needs both the scheduler and personality-cycle gates.
+    /// Dreams require both scheduler and personality-cycle gates.
     public nonisolated func dreamEnabled() async throws -> Bool {
         try await dreamGate().dreamEnabled
     }
 
-    /// The file-backed diary, newest first, with its composite gate.
     public func dreamDiary(limit: Int = 30) async throws -> DreamDiary {
         diaryLimit = max(diaryLimit, limit)
         if diaryWatch == nil {
             diaryWatch = FileChangeWatcher(paths: [
                 dataRoot.appendingPathComponent("dream_diary", isDirectory: true),
-                SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot)
+                SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)
             ]) { [weak self] _ in
                 Task { @MainActor [weak self] in await self?.refreshDiary() }
             }
@@ -204,7 +199,7 @@ public final class CognitionViewFacade {
     }
 
     public func refreshDiary(limit: Int = 60) async {
-        do { _ = try await dreamDiary(limit: limit) } catch { /* Published by the owner. */ }
+        do { _ = try await dreamDiary(limit: limit) } catch { /* dreamDiary already published the failure. */ }
     }
 
     private nonisolated func readDreamDiary(limit: Int, enabled: Bool) async throws -> DreamDiary {
@@ -226,7 +221,7 @@ public final class CognitionViewFacade {
         )
     }
 
-    /// One night's entry; a missing one is the read route's not-found error.
+    /// A missing diary entry must remain a not-found error.
     public nonisolated func dreamEntry(date: String) async throws -> DreamEntry {
         guard let entry = try FileBackedDreamDiary(dataRoot: dataRoot).getEntry(date) else {
             throw DreamREMCycleError.underlying("No dream entry for \(date) in \(dataRoot.appendingPathComponent("dream_diary").path)")
@@ -235,13 +230,10 @@ public final class CognitionViewFacade {
     }
 }
 
-/// A bounded window of the dream diary.
 public struct DreamDiary: Equatable, Sendable {
     public var entries: [DreamEntry] = []
     public var enabled = false
-    /// Number of diary `.md` files before applying the caller's bounded window.
     public var totalEntries: Int?
-    /// `.md` files in the bounded diary window that could not be decoded.
     public var unreadableEntries: Int?
     public init(entries: [DreamEntry] = [], enabled: Bool = false, totalEntries: Int? = nil, unreadableEntries: Int? = nil) {
         self.entries = entries
@@ -253,14 +245,10 @@ public struct DreamDiary: Equatable, Sendable {
 }
 
 extension DreamEntry {
-    /// The entry's text; a body-less entry reads as empty.
     public var text: String { content ?? "" }
 }
 
-/// The durable inputs read by `LivingStatusPanel` that can change outside this
-/// process. This is deliberately a small, consumer-owned list: watching a
-/// producer that the panel does not read creates a reassuring refresh signal
-/// without changing the displayed state.
+/// Watch only durable inputs this panel actually reads; unrelated producers can signal refresh without updating displayed state.
 public enum LivingStatusFileWatch {
     public enum Availability: Equatable, Sendable {
         case watching(inputCount: Int)
@@ -270,18 +258,15 @@ public enum LivingStatusFileWatch {
     public static func watchedPaths(dataRoot: URL) -> [URL] {
         let desk = SwiftNativeDeskStore(dataRoot: dataRoot)
         return [
-            // The process-local cognition stream covers in-process changes;
-            // this file covers another process replacing the persisted state.
+            // Process-local signals do not cover another process replacing persisted state.
             dataRoot.appendingPathComponent("cognition/organism_state.json"),
-            // `liveState()` reconstructs from both the append-only feed and
-            // its compaction base. A Desk commit can update either.
+            // Watch both the append feed and compaction base because Desk commits may update either.
             desk.opsPath,
             desk.basePath,
             dataRoot.appendingPathComponent("workflows/approvals/requests.json"),
-            // The Desk overview also counts actionable inbox rows as needs you.
+            // Include actionable inbox changes because they contribute to Needs you.
             dataRoot.appendingPathComponent("notifications/inbox.jsonl"),
-            // Dream reads choose the newest dated entry, so the directory—not
-            // a guessed filename—is the canonical invalidation boundary.
+            // Watch the directory because dream reads select the newest dated entry.
             dataRoot.appendingPathComponent("dream_diary", isDirectory: true),
         ]
     }
@@ -308,6 +293,7 @@ extension CognitionViewFacade {
                 lastSuccessAt: outcome.failedEndpoints.isEmpty ? now : livingRefreshStatus?.lastSuccessAt,
                 failedEndpoints: outcome.failedEndpoints
             )
+            livingStatusDidChange?()
             })
             guard !Task.isCancelled else {
                 livingRefreshCoalescer.cancel()
@@ -333,7 +319,7 @@ extension CognitionViewFacade {
             return (nil, ["Cognition"], false, nil)
         }
         var failedEndpoints: [String] = []
-        // The Desk's own overview: its Needs you is the one "needs User".
+        // Use the Desk overview’s own Needs you value.
         let board = await desk.loadBoard()
         guard let overview = board.overview else { return (nil, ["Desk"], false, nil) }
         if !overview.unavailable.isEmpty { failedEndpoints.append("Desk") }
@@ -379,7 +365,6 @@ extension CognitionViewFacade {
 
 extension CognitionViewFacade {
     public func refreshObservatory(
-        includeWorkshopReceipts: () -> Bool,
         contextFlowHealthRead: () async -> ContextFlowObservatoryHealthState
     ) async {
         pendingObservatoryReads += 1
@@ -387,19 +372,9 @@ extension CognitionViewFacade {
         guard runtime != nil else { return }
         await refreshDetail()
         _ = await observatoryLatest.read({
-        let nextContextFlowHealth = await contextFlowHealthRead()
-        let deskRoot = dataRoot
-        let nextWorkshop = await WorkshopObservatorySnapshot.load(
-            store: SwiftNativeDeskStore(dataRoot: deskRoot),
-            receiptsPath: deskRoot
-                .appendingPathComponent("workshop", isDirectory: true)
-                .appendingPathComponent("receipts.jsonl"),
-            includeReceipts: includeWorkshopReceipts()
-        )
-        return (nextContextFlowHealth, nextWorkshop)
-        }, publish: { nextContextFlowHealth, nextWorkshop in
-        if contextFlowHealth != nextContextFlowHealth { contextFlowHealth = nextContextFlowHealth }
-        if workshop != nextWorkshop { workshop = nextWorkshop }
+            await contextFlowHealthRead()
+        }, publish: { nextContextFlowHealth in
+            if contextFlowHealth != nextContextFlowHealth { contextFlowHealth = nextContextFlowHealth }
         })
     }
 }

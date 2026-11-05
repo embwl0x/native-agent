@@ -1,4 +1,3 @@
-// CloudKit device transport is shared by the Mac and phone independently of the core.
 
 import Foundation
 import CryptoKit
@@ -6,7 +5,7 @@ import CryptoKit
 #if canImport(CloudKit) && !os(Linux)
 import CloudKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport` class; account failures, incoming subscription readiness, chat/status push classification, cursor persistence and original-envelope re-signalling |
+// Blueprint: | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport`: checked account, push and cursor ownership |
 
 let devicePushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "subscription")
 
@@ -32,19 +31,24 @@ struct DeviceCKLandmineTimeout: LocalizedError, Sendable {
     }
 }
 
+/// CloudKit bounds its own requests (60 s); this guard only catches a cloudd that never answers.
+/// A slow iCloud is not a hung one: lookups can take 8 s, and a tighter guard fails every subscription, pull and send.
+public let deviceCKHangSeconds: TimeInterval = 30
+
 func withDeviceCKTimeout<T: Sendable>(
     _ label: String,
-    seconds: TimeInterval = 5,
+    seconds: TimeInterval = deviceCKHangSeconds,
+    recovery: DeviceSyncRecovery = .init(),
     onFailure: (@Sendable (Error) async -> Void)? = nil,
     _ work: @Sendable @escaping () async throws -> T
 ) async -> T? {
-    guard NADeviceSyncRecoveryBudget.hasTime else { return nil }
-    let seconds = NADeviceSyncRecoveryBudget.seconds(upTo: seconds)
+    guard recovery.hasTime else { return nil }
+    let seconds = recovery.seconds(upTo: seconds)
     let state = ContinuationOnce<Result<T, Error>?>()
     let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
     let workTask = Task<Void, Never>(priority: .utility) {
         do {
-            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
+            guard recovery.hasTime else { throw CancellationError() }
             state.resume(.success(try await work()))
         }
         catch { state.resume(.failure(error)) }
@@ -65,15 +69,16 @@ func withDeviceCKTimeout<T: Sendable>(
 
 func withDeviceCKTimeoutThrowing<T: Sendable>(
     _ label: String,
-    seconds: TimeInterval = 5,
+    seconds: TimeInterval = deviceCKHangSeconds,
+    recovery: DeviceSyncRecovery = .init(),
     onFailure: (@Sendable (Error) async -> Void)? = nil,
     beforeDispatch: @Sendable () async throws -> Void = {},
     cancelWorkOnTimeout: Bool = true,
     _ work: @Sendable @escaping () async throws -> T
 ) async throws -> T {
     try Task.checkCancellation()
-    guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
-    let seconds = NADeviceSyncRecoveryBudget.seconds(upTo: seconds)
+    guard recovery.hasTime else { throw CancellationError() }
+    let seconds = recovery.seconds(upTo: seconds)
     try await beforeDispatch()
     let state = ContinuationOnce<Result<T, Error>?>()
     let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
@@ -98,10 +103,8 @@ func withDeviceCKTimeoutThrowing<T: Sendable>(
     }
 }
 
-/// Thread-safe accumulator for the retention sweep's recordMatchedBlock. Holds
-/// record NAMES (not `CKRecord.ID`s) so the page crosses the continuation as a
-/// plain Sendable value; the delete op rebuilds the ids in the default zone,
-/// which is the zone every send writes into.
+/// Thread-safe accumulator for the retention sweep's recordMatchedBlock. Holds record NAMES (not `CKRecord.ID`s) so the page crosses the continuation
+/// as a plain Sendable value; the delete op rebuilds the ids in the default zone, which is the zone every send writes into.
 final class DeviceCKRecordNameHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var names: [String] = []
@@ -114,24 +117,21 @@ final class DeviceCKRecordNameHolder: @unchecked Sendable {
     }
 }
 
-/// One oldest-page retention query. Confirmed deletions advance the next sweep;
-/// no server traversal cursor is retained or resumed.
+/// One oldest-page retention query. Confirmed deletions advance the next sweep; no server traversal cursor is retained or resumed.
 struct DeviceCKSweepPage: Sendable {
     let names: [String]
     let fetched: Int
 }
 
-/// What one record type's sweep achieved. `deleted` counts CONFIRMED deletions
-/// only: a delete batch that timed out may or may not have been applied by the
-/// server, so it is reported as unknown rather than as zero.
+/// What one record type's sweep achieved. `deleted` counts CONFIRMED deletions only: a delete batch that timed out may or may not have been applied
+/// by the server, so it is reported as unknown rather than as zero.
 struct DeviceCKSweepOutcome {
     var deleted = 0
     var backlog = false
     var deleteTimedOut = false
 }
 
-/// Thread-safe per-page accumulator for pull's recordMatchedBlock. The CK
-/// callback runs on CloudKit's own queue, so the holder locks its own appends.
+/// Thread-safe per-page accumulator for pull's recordMatchedBlock. The CK callback runs on CloudKit's own queue, so the holder locks its own appends.
 final class DeviceCKPullPageHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var items: [NAChatMessageFields] = []
@@ -164,8 +164,7 @@ struct DeviceCKPullResult: Sendable {
 
 // MARK: - CloudKitDeviceTransport
 
-/// CloudKit-backed device transport. `@unchecked Sendable` with an internal
-/// NSLock for mutable state (handlers + last-pull cursor + seen ids).
+/// CloudKit-backed device transport. `@unchecked Sendable` with an internal NSLock for mutable state (handlers + last-pull cursor + seen ids).
 public final class CloudKitDeviceTransport: @unchecked Sendable {
     public let role: NADeviceRole
     public let containerIdentifier: String
@@ -180,37 +179,28 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
     private var statusHandlers: [String: DeviceStatusObserver] = [:]
     private var lastPullDate: Date?
     private var lastPullCursorPersistenceAt: Date?
-    // One drain owns claims and cursor advancement; event callers queue another
-    // pass, while periodic callers can skip a busy slot without extending it.
+    // One drain owns claims and cursor advancement; event callers queue another pass, while periodic callers can skip a busy slot without extending
+    // it.
     var drainInFlight = false
     var drainAgain = false
     // Status delivery is serialized so an older handler cannot overwrite a newer value.
     var statusDrainInFlight = false
     var statusDrainAgain = false
-    // LWW/dedup cursors per (pairing, peer role, key).
-    // We only re-dispatch when the server modificationDate advances, so a
-    // redraw triggered by a redundant push does not re-fire the same value.
+    // LWW/dedup cursors per (pairing, peer role, key). We only re-dispatch when the server modificationDate advances, so a redraw triggered by a
+    // redundant push does not re-fire the same value.
     private var lastStatusModDates: [String: Date] = [:]
     // Retention cadence is in-memory; a relaunch permits another sweep.
     var lastRetentionSweepAt: Date?
-    // True while the last sweep's query page came back full, i.e. there is more
-    // of the collection to walk; the next sweep then comes back in a minute
-    // instead of an hour.
+    // A full query page signals backlog and shortens the next sweep interval.
     var retentionBacklog = false
-    // Insertion-ordered seen-id dedup, capped, mirroring iCloudBridge.
     private var seenMessageIDs: Set<String> = []
     private var seenMessageIDsOrdered: [String] = []
     private let seenMessageIDsCap = 2000
     private var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
     private var assetSecretProvider: (@Sendable () async -> Data?)?
-    // Set by `claimPairing` and this transport's own pairing publication. A
-    // Mac reads and writes the phone's records only while it holds the
-    // account's Mac pairing record; one it has not read yet is not held
-    // (10-29: a second Mac whose claim read failed drained the phone's
-    // messages and answered them under its own key).
+    // A Mac may access phone records only after proving it holds the account's Mac pairing slot; an unread claim grants no access.
     var pairingClaim: PairingClaim = .unread
-    // Counts this transport's own pairing publications, so a claim whose read
-    // began before one of them cannot undo it.
+    // Counts this transport's own pairing publications, so a claim whose read began before one of them cannot undo it.
     var pairingPublications: UInt64 = 0
 
     public func useAssetSecret(_ provider: @escaping @Sendable () async -> Data?) {
@@ -292,8 +282,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         "NADeviceSync.cursor.\(role.rawValue).\(container)"
     }
 
-    /// Quiet successful pulls advance the in-memory high watermark on every
-    /// drain, but do not need to dirty preferences on every repeated drain.
+    /// Quiet successful pulls advance the in-memory high watermark on every drain, but do not need to dirty preferences on every repeated drain.
     static let emptyCursorPersistenceInterval: TimeInterval = 5 * 60
 
     static func shouldPersistPullCursor(
@@ -313,8 +302,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         return DeviceCloudKitSubscriptionID.recognizes(subID)
     }
 
-    /// True when the push says a pairing record changed: some Mac on this
-    /// Apple Account may have just taken or released the phone.
+    /// A pairing push may mean another Mac took or released the phone.
     public static func isPairingNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
         guard let subID = CKNotification(fromRemoteNotificationDictionary: userInfo)?.subscriptionID else { return false }
         return subID == DeviceCloudKitSubscriptionID.pairing || subID.hasPrefix("NAPairingDevice.")
@@ -371,16 +359,14 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         return pairingHandler
     }
 
-    /// Snapshot copy of the status handlers so we never hold the lock across the
-    /// awaits in drainStatus (matches the never-lock-across-await rule).
+    /// Snapshot handlers before awaiting them so no lock spans suspension.
     func loadStatusHandlers() -> [String: DeviceStatusObserver] {
         lock.lock(); defer { lock.unlock() }
         return statusHandlers
     }
 
-    /// Per-key LWW freshness check for status singletons. It does NOT consume
-    /// the record: `commitStatusDate` is what marks it seen, and only a handler
-    /// that applied it may call that.
+    /// Per-key LWW freshness check for status singletons. It does NOT consume the record: `commitStatusDate` is what marks it seen, and only a
+    /// handler that applied it may call that.
     func statusIsNewer(key: String, _ modDate: Date?) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if let modDate, let last = lastStatusModDates[key] {
@@ -425,16 +411,14 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
                                   forKey: Self.cursorKey(role: role, container: containerIdentifier))
     }
 
-    /// Transport acknowledgement applies to these bytes, never to an
-    /// unauthenticated message identity. A corrected record remains eligible.
+    /// Transport acknowledgement applies to these bytes, never to an unauthenticated message identity. A corrected record remains eligible.
     static func deliveryClaimKey(_ fields: NAChatMessageFields) -> String {
         let digest = SHA256.hash(data: Data(fields.payloadJSON.utf8))
             .map { String(format: "%02x", $0) }.joined()
         return fields.recordName + ":" + digest
     }
 
-    /// Atomic check-and-claim: inserts `id` into the seen set and returns true
-    /// iff it was newly claimed. Prevents two concurrent drains from both
+    /// Atomic check-and-claim: inserts `id` into the seen set and returns true iff it was newly claimed. Prevents two concurrent drains from both
     /// delivering the same message id (the check + insert are one locked op).
     func isSeen(_ id: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -463,8 +447,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         return true
     }
 
-    /// Release a claim taken by `claimIfUnseen` when delivery is rejected, so
-    /// the message is retried on the next drain.
+    /// Release a claim taken by `claimIfUnseen` when delivery is rejected, so the message is retried on the next drain.
     func releaseClaim(_ id: String) {
         lock.lock(); defer { lock.unlock() }
         guard seenMessageIDs.remove(id) != nil else { return }
@@ -554,7 +537,6 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
 // MARK: - Entitled construction
 
 public extension DeviceSyncTransportResolver {
-    /// Constructs only when CloudKit is selected and the service and exact container are entitled.
     static func makeCloudKitTransport(
         role: NADeviceRole,
         containerIdentifier: String,
@@ -573,15 +555,14 @@ public extension DeviceSyncTransportResolver {
     }
 }
 
-/// Sendable value carriers for the pairing/status singleton drains (returned
-/// across the withDeviceCKTimeout race boundary).
+/// Sendable value carriers for the pairing/status singleton drains (returned across the withDeviceCKTimeout race boundary).
 enum PairingSlot: Sendable { case empty, holds(Data) }
 /// Where a Mac stands on the account's Mac pairing record.
 enum PairingClaim: Sendable { case unread, held, elsewhere }
 struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
 struct DeviceStatusObserver: Sendable {
     let pairingSecret: @Sendable () async -> Data?
-    let apply: @Sendable (String, Date?, Data) async -> Bool
+    let apply: @Sendable (String, Date?, Data, DeviceSyncRecovery) async -> Bool
 }
 
 #endif

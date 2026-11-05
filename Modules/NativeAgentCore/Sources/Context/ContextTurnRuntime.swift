@@ -1,11 +1,10 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`, request and embedding ticket: generation lease, bounded query-vector handoff (the query, its other voice and a follow-up's own words) and turn feedback/delivery accounting |
+// Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`: turn leases, query handoff and delivery |
 
-/// One-shot handoff for all requested semantic readings. A deadline ends
-/// only the wait: the runtime retains the embedding task until settlement.
-/// A missing or late result is unavailable, never permission to rank by words.
+/// One-shot handoff for all requested semantic readings. A deadline ends only the wait: the runtime retains the embedding task until settlement. A missing or
+/// late result is unavailable, never permission to rank by words.
 public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     private let lock = NSLock()
     private var result: Result<ContextQueryEmbeddingValue, NativeSemanticQueryError>?
@@ -94,21 +93,13 @@ public struct NativeSemanticQueryError: Error, LocalizedError, Sendable {
 
 public struct ContextQueryEmbeddingValue: Sendable, Equatable {
     public let values: [Float]
-    /// The question's other voice ("me" → agent, "you" → user), embedded with `values`.
-    /// Selection takes the better cosine; nil when voices match or names are unknown.
+    /// Embed both voices together and keep the better cosine; matching voices or unknown names supply no alternate reading.
     public fileprivate(set) var alternateValues: [Float]?
-    /// A follow-up's query is its words in the context of the recent
-    /// turns; these are its OWN words (and their other voice), embedded in the
-    /// same batch. Each is a separate reading the memory lane scores on its
-    /// own (`ContextSelector.memoryRelevance`): a self-contained follow-up
-    /// ("…headphones… connect over Bluetooth?") kept its subject only as a
-    /// fifth of a window filled by the previous exchange. Empty when the
-    /// query is the message itself.
+    /// Score a follow-up's own words and their other voice separately from its contextual query so prior exchanges cannot dilute a self-contained subject.
+    /// Empty when the query is the message itself.
     public fileprivate(set) var ownWordsValues: [[Float]]
     public let modelFingerprint: String
-    /// The embedder's model id (`embedding.json` `model_id`), read from the
-    /// same runtime snapshot as the fingerprint. The
-    /// selector's meaning scale is per model (`memorySemanticFloors`).
+    /// Read model ID and fingerprint from one runtime snapshot so selection uses the matching semantic floor.
     public let modelID: String
 
     public init(
@@ -141,8 +132,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let personaIDHint: String?
     public let sessionID: String?
     public let recentTurns: [String]
-    /// Retained transcript exchanges, oldest first; each holds its user words.
-    /// Empty exchanges still count toward rest, independently of delivery.
+    /// Retained transcript exchanges, oldest first; each holds its user words. Empty exchanges still count toward rest, independently of delivery.
     public let recentExchanges: [[String]]
     public let activeTask: String?
     public let unresolvedQuestion: String?
@@ -150,40 +140,23 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let predictedToolGroups: Set<String>
     public let contextualTerms: Set<String>
     public let cognitiveActivation: [ContextAtomID: Double]
-    /// Memory atoms she rejected for this kind of message.
     public let suppressedAtomIDs: Set<ContextAtomID>
     public let queryEmbedding: ContextQueryEmbeddingValue?
     public let allowedPrivacy: Set<ContextPrivacy>
     public let permissionLabels: Set<String>
     public let characterBudget: Int
-    /// Optional bounded escape hatch for authoritative mandatory context that
-    /// grows beyond `characterBudget`. The coordinator retries only a
-    /// `mandatoryBudgetExceeded` selection and never exceeds this ceiling.
-    /// Defaults to `characterBudget`, preserving strict callers and tests.
+    /// Retry only `mandatoryBudgetExceeded`, within this ceiling; default to the ordinary budget for strict callers.
     public let maximumCharacterBudget: Int
-    /// Ranked-context room retained after mandatory atoms on an expanded
-    /// retry. This keeps accumulated authoritative corrections from silently
-    /// crowding all relevant memory and task context out of the packet.
+    /// Reserve ranked-context room so accumulated mandatory corrections cannot crowd out relevant memory and tasks.
     public let postMandatoryCharacterReserve: Int
-    /// The caller's STABLE system-prompt segment already carries the persona's
-    /// required documents verbatim, so the packet must not mirror them a second
-    /// time into the per-turn (dynamic, uncached) block.
-    ///
-    /// Every caller explicitly states its document contract.
+    /// Every caller declares which persona documents its stable prompt carries verbatim so dynamic context does not duplicate them.
     public let stableSegmentCarriesRequiredDocuments: Bool
     /// Nil means the USER memory projection is unavailable; [] withholds all generated facts.
     public let userMemoryCore: [String]?
-    /// Automatic memory disclosure, including correction/identity atoms.
     public let memoryRecallEnabled: Bool
-    /// Body length above which the caller's packet renderer replaces an atom's
-    /// full text with a lead plus a `context_expand` pointer. The selector uses
-    /// it for ONE thing: publishing an expandable pointer for every atom the
-    /// renderer will truncate, so the full body stays reachable. `0` (default)
-    /// means the caller renders atoms whole and no truncation pointers are
-    /// published — today's behavior.
+    /// Publish expansion pointers for every body the caller truncates; zero means whole-body rendering without truncation pointers.
     public let packetAtomExpandThresholdChars: Int
-    /// Shared quota for nonmandatory memory and correction atoms. `nil` uses
-    /// the selector's quota. Mandatory atoms bypass it; other kinds do not count.
+    /// Shared quota for nonmandatory memory and correction atoms. `nil` uses the selector's quota. Mandatory atoms bypass it; other kinds do not count.
     public let memoryAtomRowLimit: Int?
 
     public init(
@@ -244,12 +217,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
     }
 }
 
-/// Exact outcome of the one permitted mandatory-context budget retry.
-///
-/// A present value proves the coordinator retried only after mandatory atoms
-/// exceeded the ordinary packet budget. The granted reserve is the ACTUAL room
-/// left after mandatory context at the configured ceiling; it may be smaller
-/// than the request when the ceiling itself is the limiting factor.
+/// Only mandatory overflow permits expansion; record actual reserved room because the ceiling may grant less than requested.
 public struct ContextFlowBudgetExpansion: Sendable, Equatable {
     public let requestedCharacterBudget: Int
     public let effectiveCharacterBudget: Int
@@ -258,8 +226,7 @@ public struct ContextFlowBudgetExpansion: Sendable, Equatable {
     public let grantedPostMandatoryReserve: Int
 }
 
-/// Owns the immutable generation lease for the complete provider/tool loop.
-/// Copying this reference into derived TurnContext values preserves the pin.
+/// Owns the immutable generation lease for the complete provider/tool loop. Copying this reference into derived TurnContext values preserves the pin.
 public final class ContextPreparedTurn: @unchecked Sendable {
     public let mode: ContextFlowMode
     public let kernel: StablePromptKernel
@@ -268,8 +235,6 @@ public final class ContextPreparedTurn: @unchecked Sendable {
     public let lease: ContextGenerationLease
     public let generation: ContextStoredGeneration
     public let need: NeedSignal
-    /// Non-nil only when the coordinator consumed the bounded mandatory-context
-    /// expansion setting for this prepared turn.
     public let budgetExpansion: ContextFlowBudgetExpansion?
     private let feedbackHandler: (@Sendable (
         ContextFeedbackSignal,
@@ -316,21 +281,19 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         self.deliveryHandler = deliveryHandler
     }
 
-    /// Expansion re-checks the one atom it opens, as the choice did: an atom its
-    /// owner retired or narrowed since the turn began is not opened.
+    /// Expansion re-checks the one atom it opens, as the choice did: an atom its owner retired or narrowed since the turn began is not opened.
     public func verify(_ pointer: ContextAtomPointer) async -> ContextTurnExclusion {
         guard let verifier else { return ContextTurnExclusion() }
         return await verifier(generation.atoms.filter { $0.draft.id == pointer.atomID })
     }
 
-    /// The projection owner resolves selected memory/correction locators in the leased generation to record IDs.
-    /// IDs attach once before sharing; unattached means empty; packets, fingerprints and receipts stay identity-free.
+    /// Resolve record IDs through the projection owner in the leased generation; attach once before sharing and keep packets, fingerprints and receipts
+    /// identity-free.
     public var selectedMemoryRecordIDs: [String] {
         feedbackLock.withLock { memoryRecordProvenance ?? [] }
     }
 
-    /// The memory record behind one atom the selection scored,
-    /// selected or not, once attached: the why receipt's source, never use.
+    /// Scored records explain selection receipts, never memory use.
     public func memoryRecordID(for atomID: ContextAtomID) -> String? {
         feedbackLock.withLock { listedMemoryRecords[atomID] }
     }
@@ -351,9 +314,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         }
     }
 
-    /// Called only AFTER the canonical memory owner confirms a correction.
-    /// Exact selected-record attribution, independent of turn completion;
-    /// unrelated memories and duplicate tool retries receive no signal.
+    /// Signal only after canonical confirmation, with exact selected-record attribution; completion, unrelated memories and duplicate retries grant no credit.
     public func recordAppliedMemoryCorrection(recordID: String, replacementID: String) async {
         guard !replacementID.isEmpty, replacementID != recordID else { return }
         let atoms: [ContextAtomID] = feedbackLock.withLock {
@@ -399,15 +360,14 @@ public final class ContextPreparedTurn: @unchecked Sendable {
 
 public protocol ContextTurnPreparing: Sendable {
     func contextFlowMode() async throws -> ContextFlowMode
-    /// `ownWords`: the message alone when `text` is it in the context of the
-    /// recent turns (a follow-up); nil when `text` is the message.
-    func beginQueryEmbedding(_ text: String, ownWords: String?) async -> ContextQueryEmbeddingTicket?
-    func prepareContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn
+    /// `ownWords`: the message alone when `text` is it in the context of the recent turns (a follow-up); nil when `text` is the message.
+    func beginQueryEmbedding(_ text: String, ownWords: String?, turn: Turn) async -> ContextQueryEmbeddingTicket?
+    func prepareContextTurn(_ request: ContextTurnRequest, turn: Turn) async throws -> ContextPreparedTurn
 }
 
 public extension ContextTurnPreparing {
-    func beginQueryEmbedding(_ text: String, ownWords: String?) async -> ContextQueryEmbeddingTicket? {
-        _ = (text, ownWords)
+    func beginQueryEmbedding(_ text: String, ownWords: String?, turn: Turn) async -> ContextQueryEmbeddingTicket? {
+        _ = (text, ownWords, turn)
         return nil
     }
 }

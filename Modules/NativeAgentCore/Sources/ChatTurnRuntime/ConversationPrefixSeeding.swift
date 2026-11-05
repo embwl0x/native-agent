@@ -9,12 +9,10 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import Synchronization
-// Blueprint: | `ConversationPrefixSeeding.swift` | One provider-independent user-leading context delivery; ordered paragraph replacements from the preceding replayed complete state, keyframes, sent-row metadata and full/delta byte telemetry; bounded exact-input diagnostic preview reuse keeps unchanged history redaction off subsequent dispatches |
+// Blueprint: | `ConversationPrefixSeeding.swift` | User-leading deltas, keyframes and exact sent-row metadata |
 
-/// historyMessages ‖ [user: sent context block, current words].
-/// Every provider gets the same layout. Earlier blocks remain exactly as sent
-/// on their user rows; changes replace paragraphs of the preceding state. A route/window
-/// change or loss of the last full block starts a new keyframe.
+/// Every provider shares the same user-leading layout; preserve prior blocks exactly as sent.
+/// A route/window change or missing full block starts a keyframe so paragraph deltas retain a valid base.
 enum ConversationPrefixSeeding {
     private struct PreviewKey: Hashable, Sendable {
         let bytes: Data
@@ -91,13 +89,26 @@ enum ConversationPrefixSeeding {
         }
     }
 
+    // Preserve the current turn while replacing only its prior-history prefix.
+    static func additionalMessages(in messages: [LLMMessage], after seed: Seed) throws -> [LLMMessage] {
+        let index = seed.currentUserIndex
+        guard messages.indices.contains(index), seed.messages.indices.contains(index),
+              messages[index].content.count >= seed.messages[index].content.count else {
+            throw ProviderRoutingError.configurationFailed("The request no longer contains its built user block.")
+        }
+        let added = Array(messages[index].content.dropFirst(seed.messages[index].content.count))
+        var additional = added.isEmpty ? [] : [LLMMessage(role: .user, content: added)]
+        additional.append(contentsOf: messages.dropFirst(index + 1))
+        return additional
+    }
+
     /// The request and its count leave the same builder, after codec layout.
-    static func request(_ context: TurnContext, codec: ToolCallCodec) throws -> Request {
+    static func request(_ context: TurnContext, codec: ToolCallCodec, turn: Turn?) throws -> Request {
         let seed = seed(context, textToolCatalogAppendix: codec == .textMarkers
             ? try TextMarkerCodec.volatileCatalogAppendix(for: context) : nil)
         let layout = codec == .textMarkers
             ? try TextMarkerCodec.systemLayout(baseSystem: seed.context.systemPrompt,
-                segments: seed.context.systemSegments, context: seed.context)
+                segments: seed.context.systemSegments, context: seed.context, turn: turn)
             : (system: seed.context.systemPrompt ?? "", segments: seed.context.systemSegments)
         let names = ProviderToolNameMap(seed.context.toolSchemas)
         return Request(seed: seed, system: layout.system, segments: layout.segments,
@@ -106,18 +117,16 @@ enum ConversationPrefixSeeding {
 
     /// Nudges append to the trailing user message without changing prior blocks.
     static func appendUserText(_ text: String, to conversation: inout [LLMMessage]) {
-        if let last = conversation.last, last.role == .user {
-            conversation[conversation.count - 1] = LLMMessage(role: .user, content: last.content + [.text(text)])
-        } else { conversation.append(.user(text)) }
+        appendUser([.text(text)], to: &conversation)
     }
 
-    /// PERMANENT DIAGNOSTIC: a short digest of ONE message — its role plus its
-    /// serialized content — so head drift is visible in the trace.
-    ///
-    /// Sizes are blind to this failure: two different first messages have the
-    /// same length, so `historyMessageChars` looks stable while the provider
-    /// re-reads everything. Twelve hex characters is enough to compare two
-    /// turns' rows by eye and far too little to reconstruct content from.
+    static func appendUser(_ blocks: [LLMContentBlock], to conversation: inout [LLMMessage]) {
+        if let last = conversation.last, last.role == .user {
+            conversation[conversation.count - 1] = LLMMessage(role: .user, content: last.content + blocks)
+        } else { conversation.append(LLMMessage(role: .user, content: blocks)) }
+    }
+
+    /// Role-and-content digests reveal prefix drift that equal sizes cannot. Twelve hex characters permit comparison without retaining prose.
     static func messageDigest(_ message: LLMMessage) -> String {
         var hasher = SHA256()
         SwiftNativeTurnEngine.updateFingerprint(&hasher, label: "role", data: Data(message.role.rawValue.utf8))
@@ -127,15 +136,11 @@ enum ConversationPrefixSeeding {
         return String(hasher.finalize().map { String(format: "%02x", $0) }.joined().prefix(12))
     }
 
-    /// How many leading messages carry a digest. Six covers the head — where
-    /// drift actually shows — without turning a trace row into a transcript.
+    /// Six messages cover prefix-head drift without turning the trace into a transcript.
     static let messageDigestCount = 6
 
-    /// SHA-256 over everything that must be byte-identical from one turn to the
-    /// next for a provider prefix cache to hit: the stable segments, the tool
-    /// contract, and every message STRICTLY BEFORE the volatile block.
-    ///
-    /// Sizes and digests only — no prompt content ever leaves this function.
+    /// Hash stable material, the tool contract and messages before the volatile block to measure reusable provider prefixes.
+    /// Only sizes and digests leave this boundary; no prompt content.
     static func prefixFingerprint(
         stable: String,
         toolSchemaFingerprint: String,
@@ -155,9 +160,7 @@ enum ConversationPrefixSeeding {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    /// One labelled component digest. Same length-prefixed feed as
-    /// `prefixFingerprint` so a component hash cannot be confused with a
-    /// concatenation of its neighbours. Sizes and digests only.
+    /// Length-prefix labelled components so their digest cannot collide structurally with concatenated neighbors.
     static func componentFingerprint(_ label: String, _ parts: [String]) -> String {
         var hasher = SHA256()
         hasher.update(data: Data("\(label.utf8.count):\(label)".utf8))
@@ -191,24 +194,16 @@ enum ConversationPrefixSeeding {
         return preview
     }
 
-    /// Fingerprint + size receipts for one seeded turn, published to the turn
-    /// trace and the `llm.call` row. Payload-free.
+    /// Trace only seeded sizes and fingerprints, never prompt payloads.
     static func telemetry(
         _ seed: Seed,
         toolSchemaFingerprint: String
     ) -> ConversationPrefixTelemetrySnapshot {
-        // "What the next turn can reuse": history through the previous
-        // assistant. The CURRENT user message is per-turn content and is
-        // excluded — including it would make the fingerprint change every turn
-        // by construction and measure nothing.
+        // Exclude the current user message so per-turn content does not make the reusable-prefix fingerprint change every turn.
         let before = Array(seed.messages.prefix(seed.currentUserIndex))
         let digests = seed.messages.prefix(max(messageDigestCount, before.count)).map(messageDigest)
         let segments = seed.context.systemSegments
-        // TEXT-COMPAT lane: only the always-on FLOOR is inside the cached
-        // prefix — the session-loaded run rides the volatile block. Hashing the
-        // whole schema set here would report a moved prefix on every
-        // tool_load/promotion the layout deliberately stopped moving, which is
-        // the instrument lying about the exact fix it is measuring.
+        // Text-compat prefixes cache only the always-on floor; volatile session schemas must not make that fingerprint drift.
         let prefixToolFingerprint = seed.textToolCatalogRidesVolatileBlock
             ? SwiftNativeTurnEngine.toolSchemaFingerprint(
                 seed.context.toolSchemas.filter {

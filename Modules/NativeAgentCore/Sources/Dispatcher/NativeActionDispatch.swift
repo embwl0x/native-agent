@@ -8,21 +8,24 @@ public enum NativeActionDispatch {
         tool: String,
         input: [String: JSONValue],
         dryRun: Bool,
-        dataRoot: URL? = nil
+        dataRoot: URL? = nil,
+        turn: Turn?, deadlines: OperationDeadlines, fileReadOptions: FileReadOptions = .init()
     ) async throws -> Dispatcher.DispatchResult {
         let dispatcher = SwiftNativeDispatcher(
-            ledgerPath: (dataRoot ?? PersistenceCore.defaultDataRoot()).appendingPathComponent("traces/events.jsonl"),
+            dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot(),
             localActions: .nativeReadOnly
         )
-        let ctx = try strictDispatchContextForTool(tool, surface: "native_actions", dataRoot: dataRoot)
+        let ctx = try strictDispatchContextForTool(tool, surface: "native_actions", dataRoot: dataRoot, turn: turn, deadlines: deadlines,
+            fileReadOptions: fileReadOptions)
         return try await dispatcher.dispatch(tool: tool, input: input, ctx: ctx, dryRun: dryRun)
     }
 
-    public static func strictDispatchContextForTool(_ tool: String, surface: String, dataRoot: URL? = nil) throws -> DispatchContext {
+    public static func strictDispatchContextForTool(_ tool: String, surface: String, dataRoot: URL? = nil, turn: Turn?, deadlines: OperationDeadlines,
+        fileReadOptions: FileReadOptions = .init()) throws -> DispatchContext {
         guard tool == "read_file" || tool == "file_excerpt" else {
-            var context = DispatchContext.defaultForSurface(surface)
-            // Ordinary clients retain the established persona/workspace
-            // resolver. Only an explicit isolated root overrides those reads.
+            var context = DispatchContext.defaultForSurface(surface, turn: turn, deadlines: deadlines)
+            context.fileReadOptions = fileReadOptions
+            // Only an explicit isolated root may override the ordinary persona/workspace resolver.
             if let dataRoot {
                 context.dataRoot = dataRoot
                 context.workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot, environment: [:])
@@ -46,7 +49,7 @@ public enum NativeActionDispatch {
             surface: surface,
             persona: "",
             extra: extra,
-            dataRoot: dataRoot
+            dataRoot: dataRoot, turn: turn, deadlines: deadlines, fileReadOptions: fileReadOptions
         )
     }
 

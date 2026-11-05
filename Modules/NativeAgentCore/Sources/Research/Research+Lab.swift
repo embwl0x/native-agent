@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Privacy
-// Blueprint: | `Research+Lab.swift` | `SwiftNativeResearchClient`: complete current Lab history validates before sorting, reading or capped writes; SearXNG evidence distinguishes unavailable from empty, the research-lab part selects sources/composes the brief, native validation binds sources and settlement commits locked history plus activity/trace receipts |
+// Blueprint: | `Research+Lab.swift` | `SwiftNativeResearchClient`: authored briefs; native evidence and receipts |
 
 /// Authored content only. Identity, source evidence and publication remain native.
 public struct ResearchLabProposal: Codable, Sendable {
@@ -23,7 +23,9 @@ extension SwiftNativeResearchClient {
         }
         let decorated = try rows.enumerated().map { index, row -> (Int, ResearchLabRun) in
             guard let run = ResearchLabRun(row: row) else {
-                throw ResearchClientError.malformedResponse("Saved research history is unavailable: runs[\(index)] is not a complete current run. Original contents have been preserved.")
+                throw ResearchClientError.malformedResponse("""
+                    Saved research history is unavailable: runs[\(index)] is not a complete current run. Original contents have been preserved.
+                    """)
             }
             return (index, run)
         }
@@ -34,9 +36,8 @@ extension SwiftNativeResearchClient {
         return sorted.map { $0.1 }
     }
 
-    public func runResearchLab(objective rawObjective: String, maxResults rawMax: Int,
+    public func runResearchLab(objective rawObjective: String, maxResults rawMax: Int, turn: Turn,
         compose: @Sendable (JSONValue) async throws -> ResearchLabProposal) async throws -> ResearchLabRun {
-        // Trim the objective and reject an empty result.
         let objective = rawObjective.trimmingCharacters(in: .whitespacesAndNewlines)
         if objective.isEmpty {
             throw ResearchClientError.malformedResponse("Research objective is required")
@@ -99,13 +100,13 @@ extension SwiftNativeResearchClient {
         )
         // Once accepted, save the run and its feed/trace settlement even if Stop arrives.
         let result: Result<ResearchLabRun, Error> = await settle {
-            do { try await self.commitResearchLab(run); return .success(run) }
+            do { try await self.commitResearchLab(run, turn: turn); return .success(run) }
             catch { return .failure(error) }
         }
         return try result.get()
     }
 
-    private func commitResearchLab(_ run: ResearchLabRun) async throws {
+    private func commitResearchLab(_ run: ResearchLabRun, turn: Turn) async throws {
         // Read/insert/cap/write stays one native transaction; no part runs under the lock.
         let labRunsPath = self.labRunsPath
         let writeBack: @Sendable () async throws -> Void = {
@@ -116,8 +117,7 @@ extension SwiftNativeResearchClient {
         }
         try await SwiftNativePersistenceCore.withFileLock(labRunsPath, writeBack)
 
-        // Emit activity and trace side effects so the Mac activity feed and
-        // trace ledger stay complete for in-process research runs.
+        // In-process runs must publish both activity and trace receipts so both readers stay complete.
         let activityStatus = run.error == nil ? "ok" : "warn"
         let detail = Self.pythonCodepointPrefix(NativeAgentSecretRedactor.redactText(run.objective), 120)
         let activityPayload: JSONValue = .object([
@@ -132,7 +132,6 @@ extension SwiftNativeResearchClient {
             payload: activityPayload
         )
 
-        // Trace uses the run's status; the activity feed uses ok/warn.
         let tracePayload: JSONValue = .object([
             "researchRunId": .string(run.id),
             "status": .string(run.status),
@@ -141,7 +140,8 @@ extension SwiftNativeResearchClient {
         try await recordTrace(
             kind: "research.run",
             title: detail,
-            payload: tracePayload
+            payload: tracePayload,
+            turn: turn
         )
     }
 }

@@ -1,9 +1,8 @@
 import Foundation
 import Context
 import NativeAgentShared
-// Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText` enum; `clean`, `bounded`; projection triggers delegate to ContextMarkdownCompiler |
+// Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText`; `clean`, `bounded`; ContextMarkdownCompiler triggers |
 
-/// Shared text rules for rebuildable context projections.
 enum NativeContextProjectionText {
     static func requiredDate(_ raw: String?, owner: String) throws -> Date {
         guard let raw, let date = NativeTimestampFormat.parseISO8601FractionalFirst(raw) else {

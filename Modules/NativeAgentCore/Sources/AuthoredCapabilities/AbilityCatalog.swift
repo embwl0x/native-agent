@@ -5,7 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityCatalog.swift` | Checked inventory and redacted catalog projections; redacted accounting reuses the root's checked state identity without reserializing rows |
+// Blueprint: | `AbilityCatalog.swift` | Checked inventory and redacted identity-matched accounting projections |
 extension AbilityStore {
     /// Presentation adapters share one checked inventory and accounting read.
     public func catalog() throws -> (files: [File], retained: [Slot: [String: File]], states: [String: JSONValue]) {
@@ -20,7 +20,7 @@ extension AbilityStore {
         try Self.withLock { try registry(catalog(), kind: kind) }
     }
     private func registry(_ catalog: (files: [File], retained: [Slot: [String: File]], states: [String: JSONValue]), kind: Kind?) throws -> JSONValue {
-        // catalog() just checked this root's identity under the same recursive lock.
+        // The recursive lock keeps this catalog root's checked identity valid for this read.
         let revision = Self.stateMemo[root.path]?.revision
         let stats: [String: JSONValue]
         if let revision, let cached = Self.redactedAccounting[root.path], cached.revision == revision { stats = cached.rows }
@@ -31,9 +31,9 @@ extension AbilityStore {
             stats = redacted
             if let revision { Self.redactedAccounting[root.path] = (revision, stats) }
         }
-        // Typed registries retain their published-record selection; the
-        // all-kind read also exposes unkept files, never as active records.
-        let selected = catalog.files.filter { (kind == nil || $0.kind == kind) && (kind == nil || $0.kind == .turn || $0.metadata["record"]?.objectValue != nil) }
+        // Typed registries select published records; all-kind reads expose unkept files without marking them active.
+        let selected = catalog.files.filter { (kind == nil || $0.kind == kind) && (kind == nil || $0.kind == .turn
+            || $0.metadata["record"]?.objectValue != nil) }
         return .array(try selected.map { file in
             var row = try record(file, redactedStatistics: stats[file.id])
             var versions: [JSONValue] = []
@@ -50,15 +50,15 @@ extension AbilityStore {
                 reviewFile = next
                 row.merge((next.metadata["record"]?.objectValue ?? [:]).filter { Self.pending.contains($0.key) || $0.key == "updatedAt" }) { _, new in new }
                 row["candidateDigest"] = .string(digest)
-                row["candidate_validation_evidence"] = Self.validationEvidence(next.metadata["proof"], fixtures: next.metadata["candidate"]?.objectValue?["fixtures"])
+                row["candidate_validation_evidence"] = Self.validationEvidence(next.metadata["proof"], fixtures: next
+                    .metadata["candidate"]?.objectValue?["fixtures"])
                 if let status = Self.validationStatus(next.metadata["proof"]) { row["candidateValidation"] = .string(status) }
             } else {
                 for key in Self.pending { row.removeValue(forKey: key) }
                 if let status = Self.validationStatus(file.metadata["proof"]) { row["candidateValidation"] = .string(status) }
             }
             if kind == .part {
-                // Capture the code and its digest in this locked catalog read,
-                // for both a waiting candidate and a selected version turned off.
+                // Capture code and digest together under the catalog lock for waiting and disabled versions.
                 if reviewFile.pathExtension == "js", let digest = identity(reviewFile),
                    let candidate = reviewFile.metadata["candidate"]?.objectValue,
                    let manifest = candidate["manifest"]?.objectValue {
@@ -80,10 +80,11 @@ extension AbilityStore {
             return .object(row)
         })
     }
-    public func saveRegistry(_ value: JSONValue, kind: Kind, ownerAuthorized: Bool = false, enabling: Bool = false) throws {
+    public func saveRegistry(_ value: JSONValue, kind: Kind, ownerAuthorized: Bool = false, enabling: Bool = false, turn: Turn?) throws {
         try Self.withLock {
             let catalog = try catalog()
-            let checked = try CapabilityLifecycle.preservingOwnerOff(value, before: registry(catalog, kind: kind), ownerAuthorized: ownerAuthorized, enabling: enabling, senseRecords: kind == .sense)
+            let checked = try CapabilityLifecycle.preservingOwnerOff(value, before: registry(catalog, kind: kind), ownerAuthorized: ownerAuthorized,
+                enabling: enabling, senseRecords: kind == .sense, turn: turn)
             guard let values = checked.arrayValue, values.allSatisfy({ $0.objectValue != nil }) else { throw Self.failure("Invalid ability records.") }
             let publications = try values.compactMap(\.objectValue).map { input in
                 guard let id = input["id"]?.stringValue else { throw Self.failure("An ability record has no id.") }
@@ -98,7 +99,9 @@ extension AbilityStore {
             }
             var stats = catalog.states
             let ids = Set(publications.map(\.id))
-            for file in catalog.files where file.kind == kind && !ids.contains(file.id) { try remove(id: file.id, ownerAuthorized: ownerAuthorized); stats.removeValue(forKey: file.id) }
+            for file in catalog.files where file.kind == kind && !ids.contains(file.id) { try remove(id: file.id, ownerAuthorized: ownerAuthorized,
+                turn: turn); stats
+                .removeValue(forKey: file.id) }
             for (input, id, current, next, promote) in publications {
                 // SenseRecord owns these four fields, not the stem's run evidence.
                 let accounting = kind == .sense ? (stats[id]?.objectValue ?? [:]).filter {
@@ -115,7 +118,8 @@ extension AbilityStore {
                 else if let next { file = next; slot = .next }
                 else {
                     let script = input["script"]?.objectValue
-                    file = try File(id: id, kind: kind, metadata: ["record": .object(input)], body: script?["source"]?.stringValue ?? input["body"]?.stringValue ?? "",
+                    file = try File(id: id, kind: kind, metadata: ["record": .object(input)], body: script?["source"]?.stringValue ?? input["body"]?.stringValue
+                        ?? "",
                                 pathExtension: "js")
                 }
                 var row = Self.storedRecord(input, kind: kind)
@@ -127,20 +131,15 @@ extension AbilityStore {
                     let priorProposal = proposal.metadata["record"]?.objectValue ?? [:]
                     let changed = row.filter { Self.pending.contains($0.key) } != priorProposal.filter { Self.pending.contains($0.key) }
                     proposal.metadata["record"] = .object(row)
-                    if proposal != next { try write(proposal, slot: .next) }
+                    if proposal != next { try write(proposal, slot: .next, turn: turn) }
                     if changed, let selected = current.metadata["record"]?.objectValue { row = selected }
                     else if row["updatedAt"] == priorProposal["updatedAt"] { row["updatedAt"] = current.metadata["record"]?.objectValue?["updatedAt"] }
                     for key in Self.pending { row.removeValue(forKey: key) }
                 }
                 if kind != .sense, slot == .current { for key in Self.pending { row.removeValue(forKey: key) } }
                 file.metadata["record"] = .object(row)
-                if (slot == .current ? current : next) != file { try write(file, slot: slot) }
-                if promote != nil { try remove(id: id, slot: .next) }
-                if let keeping = Self.keeping, try Slot.allCases.map({ try readFile(id: id, slot: $0) }) != Slot.allCases.map({ catalog.retained[$0]?[id] }) {
-                    var fields = stats[id]?.objectValue ?? [:]
-                    fields["keptAfter"] = .object(["turn": .string(keeping.turn), "at": .string(NativeTimestampFormat.plainZulu(keeping.at))])
-                    stats[id] = .object(fields)
-                }
+                if (slot == .current ? current : next) != file { try write(file, slot: slot, turn: turn) }
+                if promote != nil { try remove(id: id, slot: .next, turn: turn) }
             }
             try writeState(stats)
         }
@@ -152,7 +151,7 @@ extension AbilityStore {
         if var script = row["script"]?.objectValue { script.removeValue(forKey: "source"); row["script"] = .object(script) }
         return row
     }
-    /// Retained and bundled senses share the record's numeric Codable date projection.
+    /// Retained and bundled senses share SenseRecord's numeric Codable date projection.
     public static func senseRecord(_ input: [String: JSONValue]) throws -> [String: JSONValue] {
         var row = input
         if case .string(let at)? = row["lastUsedAt"] {
@@ -184,8 +183,7 @@ extension AbilityStore {
         if var script = row["script"]?.objectValue { script["source"] = .string(file.body); row["script"] = .object(script) }
         return row
     }
-    /// Reapply today's content policy to retained evidence without rewriting
-    /// its accounting or truncating the reached-call labels.
+    /// Reapply today's content policy to retained evidence without rewriting its accounting or truncating the reached-call labels.
     static func redactedEvidence(_ value: JSONValue) -> JSONValue {
         var strings: [Data: String] = [:]
         return value.mapStrings { text in

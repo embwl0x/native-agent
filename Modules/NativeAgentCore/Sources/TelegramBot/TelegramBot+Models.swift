@@ -6,7 +6,7 @@ import TurnTrace
 import BackgroundLoops
 import ProviderRouting
 
-// Blueprint: | `TelegramBot+Models.swift` | Telegram wire models: typed API failures/results, sender/update/message/reply context and callback number decoding |
+// Blueprint: | `TelegramBot+Models.swift` | Typed wire failures, sender identity, reply context and exact numeric decoding |
 
 // MARK: - TelegramStatus
 
@@ -107,7 +107,6 @@ public struct TelegramStatus: Sendable, Codable, Equatable {
 
 // MARK: - TelegramTestResult
 
-/// Required identifiers from the validated sendMessage result.
 public struct TelegramTestResult: Sendable, Decodable, Equatable {
     public let chatId: Int
     public let messageId: Int
@@ -124,8 +123,7 @@ public struct TelegramTestResult: Sendable, Decodable, Equatable {
 
 // MARK: - Errors
 
-/// Telegram's structured rate-limit / migration hints. Callers can retain
-/// these instead of scraping a human-readable error string.
+/// Telegram's structured rate-limit / migration hints. Callers can retain these instead of scraping a human-readable error string.
 public struct TelegramAPIResponseParameters: Sendable, Codable, Equatable {
     public let retryAfter: Int?
     public let migrateToChatId: Int64?
@@ -164,7 +162,6 @@ public struct TelegramAPIResponse<Result: Decodable & Sendable>: Sendable, Decod
 
 }
 
-/// The bot username used to admit commands addressed to this bot.
 public struct TelegramAPIBotIdentity: Sendable, Codable, Equatable {
     public let username: String
 }
@@ -177,8 +174,7 @@ public struct TelegramAPIMessageResult: Sendable, Codable, Equatable {
     }
 }
 
-/// A semantic Telegram transport failure. The typed fields preserve retry and
-/// migration information while the description is sanitized before exposure.
+/// A semantic Telegram transport failure. The typed fields preserve retry and migration information while the description is sanitized before exposure.
 public struct TelegramAPIFailure: Error, LocalizedError, CustomStringConvertible, Sendable, Equatable {
     public enum Kind: String, Sendable, Codable, Equatable {
         case httpStatus
@@ -222,9 +218,7 @@ public struct TelegramAPIFailure: Error, LocalizedError, CustomStringConvertible
             detail += " [retry_after=\(retryAfter)s]"
         }
         if let chatID = parameters?.migrateToChatId {
-            // This string is persisted by TelegramPollLoop.recordError into
-            // state.json/errors.jsonl, so a migration hint cannot disappear
-            // behind a generic rejection.
+            // Retain migration hints in persisted error text so state and log receipts preserve the remedy.
             detail += " [migrate_to_chat_id=\(chatID)]"
         }
         if let chatID = parameters?.migrateToChatId {
@@ -243,9 +237,7 @@ public struct TelegramAPIFailure: Error, LocalizedError, CustomStringConvertible
         return detail
     }
 
-    /// Most poll-loop error receipts accept a String.  Preserve the structured
-    /// Bot API hints there instead of letting Swift's synthesized struct
-    /// description turn a migration into an opaque rejection.
+    /// String-based error receipts must preserve structured Bot API hints rather than synthesized descriptions.
     public var description: String { errorDescription ?? "telegram: \(operation) \(kind.rawValue)" }
 }
 
@@ -258,9 +250,15 @@ public enum TelegramBotError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidRequest: return "telegram_request_invalid: Request or destination is invalid. Check the request fields and allowed destination in Telegram setup."
+        case .invalidRequest: return """
+            telegram_request_invalid: Request or destination is invalid. Check the request fields and allowed destination in \
+            Telegram setup.
+            """
         case .notConfigured: return "telegram_not_configured: Bot token or destination is missing. Set both in Telegram setup."
-        case .invalidResponse(let s): return "telegram_http_failed: Transport returned HTTP \(s). Inspect Telegram connection status and the delivery receipt before resending."
+        case .invalidResponse(let s): return """
+            telegram_http_failed: Transport returned HTTP \(s). Inspect Telegram connection status and the delivery receipt \
+            before resending.
+            """
         case .unavailable: return "telegram_delivery_unavailable: Delivery cannot proceed. Inspect the saved reply and destination in Telegram setup."
         case .underlying(let m): return "telegram: \(m)"
         }
@@ -291,7 +289,6 @@ func _tgNowString(_ date: Date = Date()) -> String {
     NativeTimestampFormat.fractionalZulu(date)
 }
 
-/// Parse expiring state stamps with or without fractional seconds.
 func _tgParseDate(_ value: String?) -> Date? {
     guard let value, !value.isEmpty else { return nil }
     return NativeTimestampFormat.parseISO8601FractionalFirst(value)
@@ -396,9 +393,7 @@ public enum TelegramReplyPromptRenderer {
         } else {
             clippedQuote = rawQuote
         }
-        // Telegram's is_bot identifies a bot, not necessarily this assistant.
-        // Group replies can quote another bot; the transport has not compared
-        // the quoted sender with our own identity here.
+        // is_bot identifies any bot; group replies may quote another bot without proving this assistant's identity.
         let source = replyTo.fromIsBot == true
             ? "a Telegram bot message"
             : "a Telegram message"
@@ -424,17 +419,12 @@ public struct TelegramDestination: Sendable, Hashable {
         self.threadId = threadId
     }
 
-    /// The chat-only destination. Used where there is genuinely no topic to
-    /// answer into: a recovered legacy claim, a config-driven send, a tool
-    /// route that carried no thread.
+    /// Use a chat-only destination only when the claim, configuration or tool route carries no topic.
     public static func chat(_ chatId: Int) -> TelegramDestination {
         TelegramDestination(chatId: chatId)
     }
 
-    /// The forum topic a raw Telegram `Message` object belongs to, or nil.
-    /// Same rule as `TelegramMessage`: `message_thread_id` only counts when
-    /// `is_topic_message` says this really is a topic message. Callback
-    /// queries carry the button's message, so their buttons answer in place.
+    /// Count message_thread_id only when is_topic_message is true; callback replies must stay with the button's topic.
     public static func topicThreadId(inMessageObject obj: [String: JSONValue]?) -> Int? {
         guard let obj else { return nil }
         guard case .bool(true)? = obj["is_topic_message"] else { return nil }
@@ -445,10 +435,7 @@ public struct TelegramDestination: Sendable, Hashable {
 public struct TelegramMessage: Sendable, Codable, Equatable {
     public var messageId: Int
     public var chatId: Int
-    /// Telegram `chat.type` from the wire update: "private", "group",
-    /// "supergroup", or "channel". Owner-gated commands (/restart) require
-    /// "private" — an allowlisted group chat must never widen who can fire
-    /// them. nil for legacy/synthetic shapes that never carried it.
+    /// Owner-gated commands require private chat.type; an allowlisted group cannot widen authority. Synthetic shapes may omit it.
     public var chatType: String?
     /// Retain `message_thread_id` only for `is_topic_message`, excluding linked-discussion threads.
     public var messageThreadId: Int?
@@ -480,7 +467,6 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
         self.extras = extras
     }
 
-    /// Where a reply to this message must go.
     public var destination: TelegramDestination {
         TelegramDestination(chatId: chatId, threadId: messageThreadId)
     }
@@ -496,11 +482,8 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: JSONKey.self)
-        // message_id (wire) or messageId (Swift-encoded round-trip)
         self.messageId = c.integer(for: "message_id") ?? c.integer(for: "messageId") ?? 0
 
-        // chat.id / chat.type (nested) or chatId/chatType (Swift-encoded
-        // round-trip)
         if let chat = c.jsonValue(for: "chat"), case .object(let obj) = chat {
             self.chatId = obj["id"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
             if case .string(let t)? = obj["type"] {
@@ -515,9 +498,7 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
                 return t
             }()
         }
-        // Forum topic. The wire form only counts when `is_topic_message` says
-        // this really is a topic message; the Swift-encoded round-trip carries
-        // the already-decided value under its own key.
+        // Wire topics require is_topic_message; the Swift round-trip already carries the decided thread identity.
         if let wireThread = c.integer(for: "message_thread_id") {
             let isTopic: Bool = {
                 guard let v = c.jsonValue(for: "is_topic_message"), case .bool(let b) = v else { return false }
@@ -559,8 +540,7 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
 
 public struct TelegramUpdate: Sendable, Codable, Equatable {
     public var updateId: Int
-    // Synthetic replies use exactly the negative 56-bit namespace; only
-    // upstream IDs advance getUpdates, and each must have a representable successor.
+    // Synthetic replies use exactly the negative 56-bit namespace; only upstream IDs advance getUpdates, and each must have a representable successor.
     var hasValidInboxID: Bool { updateId >= -(1 << 56) && nextOffset != nil }
     var nextOffset: Int? {
         let (next, overflow) = updateId.addingReportingOverflow(1)
@@ -620,8 +600,7 @@ public struct TelegramPollResult: Sendable, Equatable {
     }
 }
 
-/// Every callback family shares transport identity decoding.
-/// Command parsing stays with each caller and runs before envelope decoding.
+/// Every callback family shares transport identity decoding. Command parsing stays with each caller and runs before envelope decoding.
 struct TelegramCallbackPayload<Command> {
     let callbackId: String
     let command: Command
@@ -656,9 +635,8 @@ struct TelegramCallbackPayload<Command> {
 }
 
 extension TelegramAPIFailure {
-    /// Nothing reached Telegram: it answered with a refusal, or the request never left this
-    /// Mac (offline, no route, name lookup failed). A later send may try again. A timeout,
-    /// a dropped connection, an unreadable answer or a server error leaves the outcome unknown.
+    /// Nothing reached Telegram: it answered with a refusal, or the request never left this Mac (offline, no route, name lookup failed). A later send may
+    /// try again. A timeout, a dropped connection, an unreadable answer or a server error leaves the outcome unknown.
     public static func isKnownNotDelivered(_ error: Error) -> Bool {
         if let failure = error as? TelegramAPIFailure { return failure.isKnownNotDelivered }
         guard let url = error as? URLError else { return false }
@@ -666,7 +644,6 @@ extension TelegramAPIFailure {
                 .internationalRoamingOff, .dataNotAllowed].contains(url.code)
     }
 
-    /// Telegram answered and refused it, so nothing went out.
     public var isKnownNotDelivered: Bool {
         switch kind {
         case .rejected, .invalidDuration: return true

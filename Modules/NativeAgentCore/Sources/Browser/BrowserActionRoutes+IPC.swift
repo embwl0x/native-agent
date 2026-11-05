@@ -27,10 +27,8 @@ extension BrowserActionRoutes {
         }
     }
 
-    /// Every IPC page effect enters the browser the way a run does: it owns
-    /// the window for its duration (so it cannot touch a page another run is
-    /// capturing) and acts only on an http(s) page (N8: a JS redirect to
-    /// file:// after a validated navigate must not open local files).
+    /// Own the window during IPC effects to avoid touching another run's capture. Recheck http(s): a validated navigation may redirect to file:// before the
+    /// effect.
     @MainActor private static func owningPage(
         _ effects: any BrowserIPCWindowEffects, _ body: () async throws -> [String: Any]
     ) async throws -> [String: Any] {
@@ -45,8 +43,7 @@ extension BrowserActionRoutes {
         return try await body()
     }
 
-    /// A click or fill is a run like a navigation: the one operation owner
-    /// persists its start and completion and can cancel or recover it.
+    /// Page effects need the canonical operation owner so cancellation and recovery reach them too.
     @MainActor private static func pageEffect(
         _ effects: any BrowserIPCWindowEffects, _ name: String, _ detail: [String: JSONValue],
         _ effect: @escaping @MainActor () async throws -> Void
@@ -80,14 +77,12 @@ extension BrowserActionRoutes {
             let runID = requestedRunID?.isEmpty == false
                 ? requestedRunID!
                 : "ipc-\(UUID().uuidString.lowercased())"
-            // The same operation owner as every other navigation: a persisted
-            // run with its ownership, cancellation and recovery. Its atomic
-            // start reports a duplicate before any window effects run; distinct
-            // runs still acquire exclusive browser ownership at the effect.
+            // Persist ownership before window effects; duplicates return before acting and distinct runs acquire exclusivity.
             let routes = BrowserActionRoutes(effects: effects)
             let run = try BrowserRun(row: try await routes.executeVisibleBrowserRun(
                 parsed: parsed, runID: runID, approvalId: nil,
-                captureSource: false, captureScreenshot: false))
+                // IPC has no model continuation; screenshot reads return their encoded bytes directly.
+                captureSource: false, captureScreenshot: false, imageSink: nil))
             let receipt = (run.sourceReceipt.flatMap { try? $0.serializedData(pretty: false) })
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
             return ["ok": run.status == "succeeded", "runId": run.id, "status": run.status,

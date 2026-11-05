@@ -173,15 +173,11 @@ extension TelegramPollLoop {
         )
     }
 
-    /// Concrete ordinary-reply transport.  Kept separately from the closure
-    /// default so a hermetic URLProtocol session can execute this exact request
-    /// and validator path, including flood-control retry semantics.
     static func sendMessage(
         token: String,
         chatId: Int,
         text: String,
         threadId: Int? = nil,
-        // nil uses the bounded reply session.
         session: URLSession? = nil,
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) async throws {
@@ -204,7 +200,8 @@ extension TelegramPollLoop {
         }
     }
 
-    public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, Data, String?) async throws -> Void = { token, destination, imagePath, imageData, caption in
+    public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, Data, String?) async throws -> Void = { token,
+        destination, imagePath, imageData, caption in
         try await sendPhoto(token: token, destination: destination, imagePath: imagePath, imageData: imageData, caption: caption)
     }
 
@@ -264,9 +261,7 @@ extension TelegramPollLoop {
         }
     }
 
-    // Bot API JSON calls are finite requests, not long-poll/streaming work.
-    // A request timeout alone resets as bytes arrive; bound the whole resource
-    // too so a stalled send cannot hold the shared chat lane indefinitely.
+    // Bound the whole request as well as inactivity: arriving bytes must not let stalled sends hold the chat lane indefinitely.
     private static let deliverySession: URLSession = {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 20
@@ -274,8 +269,7 @@ extension TelegramPollLoop {
         return URLSession(configuration: configuration)
     }()
 
-    // Reply chunks and photo uploads: bounded, but roomier than the 30s
-    // delivery bound so a slow reply does not fail after earlier chunks landed.
+    // Reply chunks and photo uploads: bounded, but roomier than the 30s delivery bound so a slow reply does not fail after earlier chunks landed.
     private static let replySendSession: URLSession = {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 60
@@ -283,8 +277,7 @@ extension TelegramPollLoop {
         return URLSession(configuration: configuration)
     }()
 
-    /// Build each JSON request inside its caller's existing retry attempt.
-    /// Keep serialization lazy so an invalid bot URL still fails first.
+    /// Build each JSON request inside its caller's existing retry attempt. Keep serialization lazy so an invalid bot URL still fails first.
     static func _tgPostJSON<Result: Decodable & Sendable>(
         token: String,
         method: String,
@@ -307,8 +300,7 @@ extension TelegramPollLoop {
         do {
             (data, response) = try await session.data(for: request)
         } catch let error as URLError where error.code == .cancelled {
-            // URLSession reports cooperative task cancellation as -999; keep it a
-            // cancellation, as the long poll does, so shutdown mid-send retries.
+            // URLSession reports cooperative task cancellation as -999; keep it a cancellation, as the long poll does, so shutdown mid-send retries.
             throw CancellationError()
         }
         return try _tgValidateResponse(
@@ -334,9 +326,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// One validation seam for every Telegram Bot API method: HTTP status is
-    /// transport evidence, while the typed response envelope and result decide
-    /// semantic success.
+    /// HTTP status proves transport only; the typed envelope and result decide semantic success for every API method.
     static func _tgValidateResponse<Result: Decodable & Sendable>(
         _ data: Data,
         response: URLResponse,
@@ -420,13 +410,7 @@ extension TelegramPollLoop {
         return .value(result)
     }
 
-    /// Split a message into Telegram-safe chunks. Telegram's 4096 limit
-    /// counts UTF-16 code units: 4000 emoji graphemes can be 8000 units. All
-    /// budgeting below is in UTF-16 units while cuts stay on Character
-    /// boundaries, splitting an oversized grapheme at scalar boundaries.
-    /// Prefers newline boundaries (lines are preserved exactly,
-    /// including blank lines; only the single boundary newline between two
-    /// chunks is consumed). Always returns at least one element.
+    /// Telegram counts UTF-16 units, not graphemes. Preserve characters and blank lines; consume only the boundary newline between chunks.
     static func _tgChunkMessage(_ text: String, limit: Int) throws -> [String] {
         // A scalar needs at most two UTF-16 units; every hard split consumes one.
         guard limit >= 2 else {
@@ -441,8 +425,7 @@ extension TelegramPollLoop {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         for lineSub in lines {
             var line = String(lineSub)
-            // Hard-split any single line that alone exceeds the budget,
-            // walking Characters so graphemes are never torn.
+            // Hard-split any single line that alone exceeds the budget, walking Characters so graphemes are never torn.
             while line.utf16.count > limit {
                 var head = ""
                 var units = 0
@@ -598,8 +581,7 @@ actor TelegramChatSendLane {
         let done = ScopedWaiter()
         waiting[chatId, default: []].append(Waiter(id: waiterId, done: done))
         await done.park()
-        // If still queued, cancellation won. Otherwise run owns the handed
-        // off lane and releases it through its defer, including on Stop.
+        // If still queued, cancellation won. Otherwise run owns the handed off lane and releases it through its defer, including on Stop.
         if let index = waiting[chatId]?.firstIndex(where: { $0.id == waiterId }) {
             waiting[chatId]?.remove(at: index)
             if waiting[chatId]?.isEmpty == true { waiting[chatId] = nil }
@@ -637,13 +619,7 @@ actor TelegramChatSendLane {
     }
 }
 
-/// A Bot API 429 is a definite non-delivery, unlike a transport interruption
-/// after bytes left this process. Retry exactly once, only for that typed
-/// rejection, and honor the server's advertised retry window before rebuilding
-/// the request. This keeps a successful retry from being duplicated while
-/// refusing to invent a replay after an ambiguous transport outcome.
-///
-/// Chat-bound attempts share a send lane; retry sleeps stay outside it.
+/// Retry once only after a definite Bot API 429, honoring its cooldown outside the send lane; ambiguous transport outcomes never authorize replay.
 func _tgRetryAfterFloodControl<T: Sendable>(
     chatId: Int? = nil,
     sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
@@ -660,9 +636,7 @@ func _tgRetryAfterFloodControl<T: Sendable>(
     do {
         return try await attempt()
     } catch let error as TelegramAPIFailure {
-        // `retry_after` is meaningful only for the actual flood-control
-        // response.  Do not replay a different rejection merely because a
-        // future API error happens to carry the same-shaped field.
+        // Only flood-control rejection authorizes retry_after; another error carrying that field must not replay the request.
         guard (error.httpStatus == 429 || error.errorCode == 429),
               let seconds = error.parameters?.retryAfter, seconds > 0 else { throw error }
         try await sleep(_tgDurationNanoseconds(TimeInterval(seconds)))

@@ -23,46 +23,37 @@ import ContextFlow
 import AuthoredCapabilities
 // Blueprint: | `Reach.swift` | `ReachCandidate` and pure `Reach` pacing, eligibility, provenance and delivery policy |
 
-/// One thing worth sharing, and why.
 struct ReachCandidate: Sendable, Equatable {
     enum Kind: Int, Sendable, Comparable {
-        case plan, care, shipped, dream
+        case plan, care, dream
         static func < (lhs: Kind, rhs: Kind) -> Bool { lhs.rawValue < rhs.rawValue }
-        var name: String { ["plan", "care", "shipped", "dream"][rawValue] }
+        var name: String { ["plan", "care", "dream"][rawValue] }
     }
     var kind: Kind
-    /// `desk:<handle>`, `care:<uuid>`, `view:<uuid>`, `ship:<builder>:<id>` or `dream:<id>`:
-    /// what the cooldown keys on and what `mind.reject` takes.
+    /// Share subject identity between cooldown and mind.reject.
     var subject: String
     var source: String
     var why: String
     var text: String
-    /// When it happened. Something from before User's last turn, he has been
-    /// around for.
+    /// Use the source event time so material predating the person's last turn cannot appear newly shared.
     var at: Date
 }
 
-/// The policy, as pure functions over facts.
 enum Reach {
-    /// Offers (her wake turns) per local day. A pass spends it: the cost is
-    /// bounded to one turn a day whatever she decides.
+    /// A pass spends the daily offer because it still costs one wake turn.
     static let dailyCap = 1
-    /// Between two offers, so a day boundary cannot put two side by side.
+    /// Separate offers across day boundaries so midnight cannot place two adjacent.
     static let minimumSpacing: TimeInterval = 8 * 3_600
-    /// One subject at most once a week, whatever came of it.
+    /// Apply weekly subject pacing regardless of outcome.
     static let subjectCooldown: TimeInterval = 7 * 86_400
-    /// User's last turn at a verified door (or Claude's last worklog line)
-    /// this recent means he is in the middle of something.
+    /// Recent verified person activity indicates the person is occupied.
     static let activeWindow: TimeInterval = 30 * 60
-    /// Older than this it is not news.
     static let freshness: TimeInterval = 72 * 3_600
-    /// "He took a turn within a day after it."
     static let answerWindow = ReachAnswerSettlement.window
-    /// How often the candidates are read from disk.
     static let scanInterval: TimeInterval = 10 * 60
 
     enum Verdict: String, Sendable, Equatable {
-        case offer, quietHours, userActive, withClaude, dailyCap, spacing, awaitingUser
+        case offer, quietHours, userActive, dailyCap, spacing, awaitingUser
         case subjectCooldown, alreadySeen, rejected, stale
     }
 
@@ -71,25 +62,19 @@ enum Reach {
         var quietHours: Bool
         var liveTurn: Bool
         var lastUserTurn: Date?
-        var lastClaude: Date?
         var calendar: Calendar = .current
     }
 
-    /// Is this a considerate moment: not his quiet hours, not while he is
-    /// talking to her or working with Claude.
+    /// Respect quiet hours and current person activity before offering.
     static func presence(_ t: Timing) -> Verdict {
         if t.quietHours { return .quietHours }
         if t.liveTurn || t.lastUserTurn.map({ t.now.timeIntervalSince($0) < activeWindow }) == true { return .userActive }
-        if let claude = t.lastClaude, t.now.timeIntervalSince(claude) < activeWindow { return .withClaude }
         return .offer
     }
 
-    /// The pace of what actually reached him, on DELIVERY time (a wake from
-    /// yesterday that delivers today is today's): one a day, eight hours
-    /// apart, and after a message he has not come back to, nothing more until
-    /// he takes a turn — no escalation.
+    /// Recheck pacing at delivery time; uncertain unanswered speech holds outreach without escalation.
     static func pace(_ t: Timing, ledger: ReachLedger) -> Verdict {
-        let sent = ledger.offers.filter(\.mayHaveReachedHim).compactMap(\.sentAt)
+        let sent = ledger.offers.filter(\.mayHaveReachedPerson).compactMap(\.sentAt)
         if sent.filter({ t.calendar.isDate($0, inSameDayAs: t.now) }).count >= dailyCap { return .dailyCap }
         guard let last = sent.max() else { return .offer }
         if t.now.timeIntervalSince(last) < minimumSpacing { return .spacing }
@@ -97,8 +82,7 @@ enum Reach {
         return .offer
     }
 
-    /// Offer time: presence, pace, and the cost bound — one wake of hers a
-    /// day for this, so a pass spends the day's.
+    /// A pass spends daily offer admission because the wake turn already ran.
     static func timing(_ t: Timing, ledger: ReachLedger) -> Verdict {
         let moment = presence(t)
         guard moment == .offer else { return moment }
@@ -108,8 +92,7 @@ enum Reach {
         return offered.count >= dailyCap ? .dailyCap : .offer
     }
 
-    /// Right before delivery, every gate again, on delivery time (her own
-    /// wake turn is the live one, so it does not count as his).
+    /// Recheck every gate at delivery; the agent's own wake is not person activity.
     static func deliverable(_ offer: ReachLedger.Offer, timing t: Timing, ledger: ReachLedger,
                             rejectedSources: [String]) -> Verdict {
         var now = t
@@ -123,17 +106,15 @@ enum Reach {
         return .offer
     }
 
-    /// The moment for an offer already made has passed: quiet hours began,
-    /// or he took a turn. (Not "a turn is live": her own wake is one.)
-    static func momentPassed(_ t: Timing) -> Bool {
+    /// Withdraw when quiet hours or renewed person activity invalidate timing; the agent's own live wake does not. Nil while the moment holds.
+    static func momentPassed(_ t: Timing) -> Verdict? {
         var now = t
         now.liveTurn = false
-        now.lastClaude = nil
-        return presence(now) != .offer
+        let moment = presence(now)
+        return moment == .offer ? nil : moment
     }
 
-    /// A Desk item's text came from User only when no peer steered it in: every
-    /// peer on its steps, elevated or not, must be one User trusts as his own.
+    /// Treat Desk words as person-authorized only if every steering peer is trusted as the person's own.
     static func deskProvenanceTrusted(_ item: DeskItem, trusts: (String) -> Bool) -> Bool {
         item.refs.allSatisfy { ref in
             guard case .step(let step) = ref.kind else { return true }
@@ -154,8 +135,7 @@ enum Reach {
         return .offer
     }
 
-    /// What her wake reads: the thing, its source and why — no counters, no
-    /// absence, nothing about how long he has been gone.
+    /// Expose source and reason, never absence counters or duration away.
     static func wakeLine(_ c: ReachCandidate, person: String) -> String {
         "Something you could share with \(person), if you want to. From \(c.source): \(c.text). "
             + "Why it might be worth it: \(c.why). Nothing is owed and no reply will be chased. "
@@ -170,7 +150,7 @@ enum Reach {
         return first == "pass" && trimmed.count <= 80
     }
 
-    /// The knock carries nothing of the message: that is in his chat.
+    /// Keep message content in chat; the notification carries only its pointer.
     static let knockLine = "Left you something in chat. No reply needed."
 
     static func digest(_ text: String) -> String {

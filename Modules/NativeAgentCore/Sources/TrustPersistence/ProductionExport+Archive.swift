@@ -5,14 +5,12 @@ import PersistenceCore
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `ProductionExport+Archive.swift` | Production archives consume PrivacyMap.productionExportRelativePaths; production, support and local backup input scopes are complete allowlists with unselected scopes excluded; the backup owner's recursive copier snapshots nested memory SQLite and omits lock/journal sidecars; canonical memory backup and persona root, credential exclusions with actual skipped paths; support bundles keep their separate selection and registry rows; staging is removed on return or failure and archives use the backup owner's streaming digest |
+// Blueprint: | `ProductionExport+Archive.swift` | Owner-selected copy scopes, coherent SQLite and credential exclusions. |
 
 extension ProductionExport {
     public typealias ArtifactProcessRunner = @Sendable (String, [String], URL, TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)
 
-    /// A data export: hardening and privacy reports, the exportable stores
-    /// (memory through a consistent SQLite backup), a manifest, as one
-    /// checksummed tar.gz recorded in the export registry.
+    /// Export consistent SQLite memory and selected stores as one checksummed archive recorded in the registry.
     public static func createArchive<Hardening: Encodable>(
         dataRoot root: URL, runProcess: ArtifactProcessRunner,
         hardening: () async throws -> Hardening
@@ -32,7 +30,8 @@ extension ProductionExport {
         defer { try? fm.removeItem(at: stageDir) }
 
         try TrustBackupPersistence.writeCodableJSON(try await hardening(), to: stageDir.appendingPathComponent("production_hardening.json"))
-        try TrustBackupPersistence.writeCodableJSON(PrivacyMap(dataRoot: root, generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date())), to: stageDir.appendingPathComponent("privacy_map.json"))
+        try TrustBackupPersistence.writeCodableJSON(PrivacyMap(dataRoot: root, generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date())),
+            to: stageDir.appendingPathComponent("privacy_map.json"))
 
         let dataDir = stageDir.appendingPathComponent("data", isDirectory: true)
         var excluded: [String] = []
@@ -42,7 +41,7 @@ extension ProductionExport {
             relativePaths: PrivacyMap.productionExportRelativePaths.filter { $0 != "memory" && $0 != "persona" },
             excluded: &excluded
         )
-        // The live persona root (`defaultPersonaRoot`: a checkout's sits beside data/).
+        // Resolve the live persona owner because checkout persona sits outside data.
         if try TrustBackupPersistence.copyExistingItem(
             from: PersistenceCore.defaultPersonaRoot(dataRoot: root),
             to: dataDir.appendingPathComponent("persona", isDirectory: true),
@@ -75,8 +74,7 @@ extension ProductionExport {
         )
     }
 
-    /// A support bundle: diagnostics and health plus logs-and-state paths,
-    /// with transcripts and the memory database left out.
+    /// Support bundles exclude transcripts and memory while retaining diagnostics and selected logs/state.
     public static func createSupportBundle<Diagnostics: Encodable, Health: Encodable>(
         dataRoot root: URL, runProcess: ArtifactProcessRunner,
         diagnostics: () async throws -> Diagnostics, health: () throws -> Health
@@ -120,8 +118,7 @@ extension ProductionExport {
     }
 
 
-    /// Complete support copy inputs: all unselected data-root scopes are
-    /// excluded. Generated diagnostics/health reports are separate inputs.
+    /// Unselected data scopes stay excluded; generated diagnostic reports are separate inputs.
     private static let supportBundleRelativePaths: [String] = [
         "doctor",
         "runtime",
@@ -129,9 +126,6 @@ extension ProductionExport {
         "activity/events.jsonl",
         "harness/learning_receipts.jsonl",
         "improvements/gauntlet/runs.json",
-        "mcp/cache/tools.json",
-        "mcp/cache/resources.json",
-        "mcp/consent/ledger.json",
         "telegram/state.json",
         "cutover",
     ]

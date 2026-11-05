@@ -22,19 +22,9 @@ import CryptoKit
 import os
 #endif
 // Blueprint: | `MacScreenViewResultRedaction.swift` | Persisted result previews omit image payloads |
-/// `mac_view` returns a base64 PNG of the screen. That is correct for the LIVE
-/// model call — it is the spatial backdrop the whole organ exists to provide —
-/// and wrong for everything downstream of it. The generic trace/persistence
-/// preview sinks redact injection-SHAPED results only, so a full screenshot of
-/// whatever User had open (a banking page, a private message, an authenticator)
-/// was riding into the turn trace and the persisted transcript, which syncs.
-///
-/// This strips the pixels at those sinks and leaves the audit trail: how big it
-/// was, what it hashed to, and what its pixel size was (already in the result).
+/// Screenshots belong in the live model call but not trace, persistence or sync; those sinks retain only size, hash and pixel dimensions.
 public enum MacScreenViewResultRedaction {
-    /// Every name `mac_view` answers to across the tool/registry/action layers.
-    ///
-    /// `mac_wake` uses the same top-level view keys, source redaction and image stripping.
+    /// All view names and mac_wake share top-level image stripping and text redaction.
     public static let viewToolNames: Set<String> = [
         "mac_view", "mac.view", "view",
         "mac_attention", "mac.attention", "attention",
@@ -45,8 +35,7 @@ public enum MacScreenViewResultRedaction {
             tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         )
     }
-    /// Idempotent: an already-stripped result has no `image` string left, so a
-    /// sink can call this without knowing whether an upstream sink did.
+    /// Idempotent stripping lets each sink enforce redaction without tracking upstream work.
     public static func redacted(tool: String, result: JSONValue) -> JSONValue {
         guard carriesImage(tool: tool) else { return result }
         guard case .object(var object) = result else { return result }

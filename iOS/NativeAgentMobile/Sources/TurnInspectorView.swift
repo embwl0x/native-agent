@@ -1,6 +1,4 @@
-// Read-only `turn_summaries.json` summaries: times, surface, event/kind counts,
-// tokens and latency metrics; no event stream or content previews.
-// Render the writer's newest-started-first order unchanged.
+// Preserve the writer's newest-started-first turn-summary order; this surface reads no event stream or content previews.
 import SwiftUI
 import NativeAgentShared
 // Blueprint: | `TurnInspectorView.swift` | Turn summary presentation reads the shared sync projection directly |
@@ -44,8 +42,6 @@ enum TurnInspectorPresentation {
         "Showing \(visibleCount) of \(totalCount) turns (oldest dropped for sync size)."
     }
 
-    /// How long, the way a person says it: "under a second", "8 seconds",
-    /// "2 minutes". Nil when unknown.
     static func plainDuration(wallMs: Int) -> String? {
         guard wallMs >= 0 else { return nil }
         let seconds = Int((Double(wallMs) / 1000).rounded())
@@ -99,11 +95,8 @@ struct TurnInspectorView: View {
 private struct TurnSummaryRow: View {
     let summary: TurnSummaryRecord
 
-    /// What happened and how long, in plain words: "Replied in 8 seconds,
-    /// with two tool events."
     private var plainLine: String {
         let took = TurnInspectorPresentation.plainDuration(wallMs: summary.wallMs)
-        // Kinds arrive as "reply" or "chat.reply", "tool" or "tool.call".
         let replied = summary.kinds.contains { $0.key.contains("reply") && $0.value > 0 }
         let tools = summary.kinds.filter { $0.key.hasPrefix("tool") }.values.reduce(Optional(0)) { total, count in
             guard let total, count >= 0 else { return nil }
@@ -119,7 +112,6 @@ private struct TurnSummaryRow: View {
         return line + "."
     }
 
-    /// The numbers, second: tokens, time to the first word, the event mix.
     private var measures: String {
         var parts: [String] = []
         if let tokens = summary.llmTokens, tokens >= 0 {
@@ -132,7 +124,6 @@ private struct TurnSummaryRow: View {
         return parts.joined(separator: " · ")
     }
 
-    /// "12 events: 2 tools, 1 reply".
     private var eventsLine: String {
         let count = summary.eventCount >= 0 ? AliveWords.count(summary.eventCount, "event") : "Events unknown"
         guard !summary.kinds.isEmpty else { return count }

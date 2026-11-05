@@ -1,8 +1,7 @@
-import AuthoredCapabilities
 import Foundation
 @preconcurrency import EventKit
 import PersistenceCore
-// Blueprint: | `LocalPIMConnectorActions+Authorization.swift` | calendar read/write authorization interpretation and EventKit permission prompts; wizard status |
+// Blueprint: | `LocalPIMConnectorActions+Authorization.swift` | EventKit read/write grants, permission prompts and wizard status |
 
 extension LocalPIMConnectorActions {
     public enum CalendarAuthorizationAction: Equatable {
@@ -68,32 +67,24 @@ extension LocalPIMConnectorActions {
 
     // MARK: - TCC status (for Mac Integration permission wizard)
 
-    /// Returns the current Calendar (EKEvent) authorization status in the
-    /// wizard vocabulary: "granted" | "denied" | "restricted" | "limited" |
-    /// "not_determined". Does NOT trigger a prompt. `.writeOnly` is mapped to
-    /// "limited" since it is a partial grant.
+    /// Read wizard status without prompting; writeOnly is limited because it grants only partial access.
     public nonisolated static func currentCalendarAuthorizationStatus() -> String {
         ekStatusToWizardString(EKEventStore.authorizationStatus(for: .event))
     }
 
-    /// Returns the current Reminders (EKReminder) authorization status in the
-    /// wizard vocabulary. Does NOT trigger a prompt.
+    /// Read Reminders wizard status without prompting.
     public nonisolated static func currentReminderAuthorizationStatus() -> String {
         ekStatusToWizardString(EKEventStore.authorizationStatus(for: .reminder))
     }
 
-    /// Triggers the Calendar TCC prompt if status is `.notDetermined`;
-    /// otherwise returns current status without prompting. Returns the
-    /// post-request status in the wizard vocabulary.
+    /// Prompt only while undetermined; return the resulting wizard status.
     public static func requestCalendarAccess() async throws -> String {
         let store = EKEventStore()
         _ = try await requestCalendarReadAccess(store: store)
         return currentCalendarAuthorizationStatus()
     }
 
-    /// Triggers the Reminders TCC prompt if status is `.notDetermined`;
-    /// otherwise returns current status without prompting. Returns the
-    /// post-request status in the wizard vocabulary.
+    /// Prompt only while undetermined; return the resulting wizard status.
     public static func requestReminderAccess() async throws -> String {
         let store = EKEventStore()
         if EKEventStore.authorizationStatus(for: .reminder) == .notDetermined { _ = try await store.requestFullAccessToReminders() }
@@ -123,8 +114,8 @@ extension LocalPIMConnectorActions {
         case .ready:
             return true
         case .requestWriteOnly:
-            // A skill never asks macOS for access (`SkillRunContext`); its step hands back.
-            return SkillRunContext.handsBack ? false : try await store.requestWriteOnlyAccessToEvents()
+            // Only the foreground permission owner calls this prompting API.
+            return try await store.requestWriteOnlyAccessToEvents()
         case .requestFull, .unavailable:
             return false
         }
@@ -136,7 +127,7 @@ extension LocalPIMConnectorActions {
         case .ready:
             return true
         case .requestFull:
-            return SkillRunContext.handsBack ? false : try await store.requestFullAccessToEvents()
+            return try await store.requestFullAccessToEvents()
         case .requestWriteOnly, .unavailable:
             return false
         }

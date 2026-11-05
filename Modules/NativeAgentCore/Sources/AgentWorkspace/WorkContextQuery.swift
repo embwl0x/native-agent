@@ -26,9 +26,8 @@ package struct WorkContextQuery: Sendable {
 
     package var text: String { terms.joined(separator: " ") }
 
-    /// Match a topic in a bounded passage, not scattered words across an
-    /// entire status report. Incidental repository paths are not prose about
-    /// the project. An explicitly requested locator remains searchable.
+    /// Match a topic in a bounded passage, not scattered words across an entire status report. Incidental repository paths are not prose about the project. An
+    /// explicitly requested locator remains searchable.
     package func matchedTerms(_ content: String) -> [String] {
         let searchable = includesLocator ? content : content.components(separatedBy: .whitespacesAndNewlines)
             .filter { !Self.isLocatorToken($0) }.joined(separator: " ")
@@ -55,7 +54,7 @@ package struct WorkContextQuery: Sendable {
 
     package func score(_ content: String) -> Int {
         let matches = matchedTerms(content).count
-        // Preserve the existing partial-topic allowance for natural phrasing.
+        // Allow partial-topic matches for natural phrasing.
         let required = max(1, Int(ceil(Double(terms.count) * 0.6)))
         guard !terms.isEmpty, matches >= required else { return 0 }
         return matches
@@ -68,18 +67,15 @@ package struct WorkContextQuery: Sendable {
             || token.hasPrefix("../") || token.contains("://") { return true }
         let parts = token.split(separator: "/", omittingEmptySubsequences: true)
         guard let first = parts.first, let last = parts.last, parts.count >= 2 else { return false }
-        // Relative file references have a filename or a recognizable directory
-        // root. Ordinary browser/research and Mac/Telegram topic pairs remain
-        // prose, rather than being mistaken for filesystem paths.
+        // Relative file references have a filename or a recognizable directory root. Ordinary browser/research and Mac/Telegram topic pairs remain prose,
+        // rather than being mistaken for filesystem paths.
         let roots: Set<String> = ["src", "sources", "modules", "docs", "data", "research", "script",
                                   "scripts", "tests", "users", "volumes", "applications", "library",
                                   "projects", "tmp", "var"]
         return roots.contains(first.lowercased()) || !(String(last) as NSString).pathExtension.isEmpty
     }
 
-    // Local lexical equivalence, not a change to global memory matching.
-    // Retain whole-word boundaries (especially X); allow bot/bots and the
-    // existing conservative longer-word normalization on both sides.
+    // Keep lexical normalization local and whole-word bounded, especially for one-letter topics.
     private static func simplePluralPair(_ lhs: String, _ rhs: String) -> Bool {
         let shorter = lhs.count < rhs.count ? lhs : rhs
         let longer = lhs.count < rhs.count ? rhs : lhs

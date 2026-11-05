@@ -39,7 +39,7 @@ import UniformTypeIdentifiers
 import Desk
 // Blueprint: | `ComposerShellState.swift` | Mounted native menu tracking, context receipt and Trust confirmation state; quiet reads use the open menu |
 
-/// Quiet reads use the very menu the person opened.
+/// Quiet reads must use the person's open menu.
 struct ComposerShellRow: Identifiable, Hashable {
     let id: String
     let label: String
@@ -80,7 +80,7 @@ final class ComposerShellState {
         dismiss()
         menu = nativeMenu
         activePane = card
-        // Let a quiet command return before native menu tracking begins.
+        // Return the quiet command before native menu tracking blocks.
         DispatchQueue.main.async { [weak self, weak anchor] in
             guard let self, let anchor, self.menu === nativeMenu else { return }
             nativeMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.maxY), in: anchor)
@@ -142,8 +142,6 @@ final class ComposerShellState {
     }
 }
 
-/// The word supplies an anchor and menu. AppKit owns tracking, submenus,
-/// keyboard navigation, scrolling and edge placement.
 struct ComposerMenuAnchor: NSViewRepresentable {
     let card: ChatComposerCard
     let state: ComposerShellState?

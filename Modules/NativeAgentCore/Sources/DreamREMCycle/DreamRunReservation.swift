@@ -2,12 +2,11 @@ import Foundation
 import Darwin
 // Blueprint: | `DreamRunReservation.swift` | `DreamRunReservation` struct; `acquire`, `release` |
 
-/// Dream and REM reservations exclude same-process and cross-process runners; crashes release flock.
+/// Use process and cross-process exclusion; crashes release flock.
 struct DreamRunReservation {
     private let fd: Int32
 
-    /// nil when another run holds the reservation. Throws only when the lock
-    /// file cannot be opened or flock fails for a reason other than contention.
+    /// Contention is nil; failed lock creation or noncontention flock errors throw.
     static func acquire(at path: URL) throws -> DreamRunReservation? {
         let fd = Darwin.open(path.path, O_CREAT | O_WRONLY, 0o600)
         if fd < 0 {

@@ -1,10 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MemoryStatusProjection.swift` | MemoryV2 and embedding runtime status projections and recent misses; embedding settings act through MemoryFacade's canonical owner; `MemoryV2NativeStackSnapshot` reads native stack health |
+// Blueprint: | `MemoryStatusProjection.swift` | `MemoryV2NativeStackSnapshot`: memory and embedding health, recent misses |
 
-/// Read-only status projections using the existing stores and runtime.
 public enum MemoryRecoveryReadout {
-    /// The journal's owed turns (recorded, not yet lived).
     public static func afterTurnRecovery(dataRoot: URL) async -> AfterTurnMemoryRecoveryStatus {
         let owed = await AdaptiveMemoryPromoter.shared.owedMomentCount(dataRoot: dataRoot)
         return AfterTurnMemoryRecoveryStatus(status: owed.map { $0 == 0 ? "ready" : "owed" } ?? "unavailable",
@@ -40,16 +38,17 @@ public enum MemoryRecoveryReadout {
             case ManagedEmbeddingProvider.mockBackend:
                 return "Semantic embeddings are explicitly set to mock in config/embeddings.json"
             case ManagedEmbeddingProvider.failClosedBackend:
-                return "bge-large-en-v1.5 semantic embeddings unavailable; recall is fail-closed. \(runtimeSnapshot?.lastLoadError ?? "Read Doctor for the model file and failure.")"
+                return """
+                    bge-large-en-v1.5 semantic embeddings unavailable; recall is fail-closed. \
+                    \(runtimeSnapshot?.lastLoadError ?? "Read Doctor for the model file and failure.")
+                    """
             default:
-                // Snapshot was nil (runtime not yet wired) — surface that honestly.
+                // An unwired runtime is unavailable, never a healthy snapshot.
                 return "Semantic embedding runtime is unavailable"
             }
         }()
         return MemoryV2Status(
-            // An unreadable store is not an empty store. The Memory screen
-            // uses this provenance to avoid claiming no memories are saved
-            // when the real reader could not establish a count.
+            // Keep failed count provenance so unreadable storage cannot appear empty.
             status: storageReadable ? (memCount == 0 ? "empty" : "ready") : "unavailable",
             version: "swift-native",
             embedding: MemoryV2Embedding(
@@ -69,11 +68,8 @@ public enum MemoryRecoveryReadout {
         )
     }
 
-    /// All canonical correction occurrences for the ISO `weeks` asked,
-    /// including graduated rows, grouped by lesson, newest first. Incomplete
-    /// retained history fails explicitly; examples are bounded after counting.
-    /// Read for a `surface`, a row its disclosure keeps from that surface still
-    /// counts but shows no text (nil: the Mac's own page, which sees all).
+    /// Count every canonical occurrence in the requested weeks, including graduated rows, before bounding examples. Incomplete history fails explicitly;
+    /// disclosure withholds text but never counts.
     public static func misses(dataRoot: URL, weeks: [String], surface: String? = nil) async throws -> [MemoryMissLesson] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let calendar = Calendar(identifier: .iso8601)
@@ -93,9 +89,7 @@ public enum MemoryRecoveryReadout {
             let m = occurrence.memory
             let week = isoWeek(occurrence.date)
             guard weeks.contains(week) else { continue }
-            // Scope only: a graduated or archived miss is history, not hidden.
-            // A hidden one counts under one name and shows neither its words
-            // nor the lesson named from them.
+            // Archived and graduated misses stay in history; hidden rows contribute counts without exposing lesson names or words.
             let record = MemoryRecord(stored: m)
             let shown = surface == nil || MemoryRecordDisclosurePolicy.classify(
                 personaID: record.personaId, status: "active", lifecycle: nil, tags: record.tags, metadata: record.extras
@@ -124,23 +118,17 @@ public enum MemoryRecoveryReadout {
         }
     }
 
-    /// "2026-W41": the ISO week `date` falls in, on this Mac's clock. `ago`
-    /// whole weeks back from it.
     public static func isoWeek(_ date: Date = Date(), ago: Int = 0) -> String {
         let date = date.addingTimeInterval(-Double(ago) * 7 * 86_400)
         let parts = Calendar(identifier: .iso8601).dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
         return String(format: "%04d-W%02d", parts.yearForWeekOfYear ?? 0, parts.weekOfYear ?? 0)
     }
 
-    /// Labels too broad to say what an agreement or a correction is about.
     public static let genericSubjects: Set<String> = [
         "instruction", "correction", "preference", "policy", "user", "agent", "claude", "codex", "nativeagent",
     ]
 
-    /// The lesson a correction teaches, as one short tag, stamped once when it
-    /// is kept (`lesson`): the memory manager's subject, else her first
-    /// specific tag or topic, else the first words of its first clause. Rows
-    /// kept before the stamp are named the same way when read.
+    /// Stamp one lesson tag when kept; derive unstamped labels with the same subject, tag/topic and first-clause priority.
     public static func lesson(metadata: JSONValue?, text: String) -> String {
         func tag(_ text: String) -> String {
             text.lowercased().split { !$0.isLetter && !$0.isNumber }.prefix(4).joined(separator: "-")
@@ -182,13 +170,12 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     public var cloudKitAccountStatus: String
     public var dataRootPath: String
 
-    /// Visual + textual status derived from the runtime fields above.
-    /// Distinguishes real-model readiness from disabled or mock search.
+    /// Distinguish real inference readiness from disabled or synthetic search.
     public enum EmbedderHealth {
-        case working(loadCount: Int)   // green
-        case ready                      // orange — resources present, never loaded
-        case broken(reason: String)     // red — lastLoadError set
-        case missing                    // red — bundled resources not reachable
+        case working(loadCount: Int)
+        case ready
+        case broken(reason: String)
+        case missing
         case disabled
         case mock
 
@@ -200,9 +187,6 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         }
     }
 
-    /// Derive the at-a-glance health state. Caller decides how to
-    /// render — typical: green for working, orange for ready, red for
-    /// broken/missing.
     public var embedderHealth: EmbedderHealth {
         if requestedEmbeddingBackend == ManagedEmbeddingProvider.mockBackend {
             return .disabled
@@ -257,9 +241,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         var spotlightEligibleCount = 0
         var storageGeneration: String?
 
-        // SQLite probe — open the same store MemoryV2+Storage.swift uses and
-        // count active rows. A clean empty store is 0; a failed read remains
-        // explicit so the panel cannot present it as an empty memory profile.
+        // Probe the canonical store; zero requires a successful read, while failure remains explicit.
         do {
             let store = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             let counts = try await store.statusCounts()
@@ -274,8 +256,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             snap.storageReadable = false
         }
 
-        // Ask the runtime's resolver; missing or broken bge assets are never
-        // ready. applyEmbeddingRuntime() below carries the named load error.
+        // Use the runtime's resolver so missing and broken assets cannot appear ready.
         do {
             let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
             snap.coreMLReady = true
@@ -285,11 +266,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             snap.coreMLModelLabel = "bge-large-en-v1.5 unavailable"
         }
 
-        // Runtime truth fields — the disk probe above tells us if
-        // resources are reachable, but only the runtime knows whether
-        // the model actually loaded and inference works. Pull
-        // coreMLLoaded / lastLoadError / loadCount from
-        // SwiftNativeMemoryV2's snapshot.
+        // Disk reachability cannot prove inference works; take loaded state, load error and count from the runtime snapshot.
         snap.applyEmbeddingRuntime(await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).embeddingRuntimeSnapshot())
 
         // Spotlight proof is valid only for the current canonical generation.
@@ -318,8 +295,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
 }
 
 extension MemoryRecoveryReadout {
-    /// This ISO week's and last week's misses by lesson; nil when the ledger
-    /// could not be read.
+    /// Nil means the miss ledger could not be read, never zero misses.
     public static func recentMisses(dataRoot: URL) async -> [MemoryMissLesson]? {
         try? await MemoryRecoveryReadout.misses(
             dataRoot: dataRoot, weeks: [MemoryRecoveryReadout.isoWeek(), MemoryRecoveryReadout.isoWeek(ago: 1)])

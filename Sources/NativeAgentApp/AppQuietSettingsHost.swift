@@ -12,9 +12,9 @@ import MemoryV2
 import Onboarding
 import DeviceSync
 import EngineRuntime
-// Blueprint: | `AppQuietSettingsHost.swift` | Settings adapters and owner-declared Mac controls; phone-local rows resolve through bounded signed requests to their phone owners, without Mac value copies; provider defaults patch only the account model |
+// Blueprint: | `AppQuietSettingsHost.swift` | Owner-declared settings; phone rows use signed requests, with no Mac copies |
 
-/// Adapts the settings catalog to the same observed model actions as the UI.
+/// Settings adapters must share the UI's observed model actions.
 @MainActor
 class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     let appModel: AppModel
@@ -48,11 +48,19 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
         var rows = [
             QuietSetting(
                 id: "phone.settings", page: "pairing", label: "iPhone settings", kind: .text,
-                note: "Read this directory while the paired phone app is open. It returns phone-owned setting ids, current values, kinds and choices; use those ids with setting.get/set. Enabling a phone sense, place or Lock Screen task names asks on the phone. Saving a new location and deleting a place use the phone's Places controls.",
+                note: """
+                    Read this directory while the paired phone app is open. It returns phone-owned setting ids, current values, kinds and choices; use those \
+                    ids with setting.get/set. Enabling a phone sense, place or Lock Screen task names asks on the phone. Saving a new location and deleting \
+                    a place use the phone's Places controls.
+                    """,
                 readsAnotherDevice: true,
                 read: { _ in
                     let result = try await self.phoneSettingsRequest(kind: .settingsRead, params: [:])
-                    guard let rows = result.values["settings"] else { throw QuietSettingError.unavailable("The phone returned no settings directory. Reopen NativeAgent on the paired iPhone and read phone.settings again.") }
+                    guard let rows = result.values["settings"] else {
+                        throw QuietSettingError.unavailable(
+                            "The phone returned no settings directory. Reopen NativeAgent on the paired iPhone and read phone.settings again."
+                        )
+                    }
                     // Validate the current wire shape before presenting it.
                     _ = try self.decodePhoneSettings([MobileAppSetting].self, from: rows)
                     return .string(rows)
@@ -71,16 +79,19 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                     }
                     return .string(raw)
                 },
-                write: { _, value in
+                write: { _, value, _ in
                     guard case .string(let raw) = value, let shortcut = ShotgunShortcut(rawValue: raw) else {
                         throw QuietSettingError.badValue("Choose a listed Shotgun shortcut.")
                     }
                     try ShotgunController.shared.setShortcut(shortcut)
                 }
-            ),
+            ).watchingDefaults(ShotgunShortcut.storageKey),
             QuietSetting(
                 id: "memories.meaning_based", page: "settings", label: "Meaning-based memory", kind: .boolean,
-                note: "true enables the on-device semantic model; false selects word matching. Re-indexes saved memories, just as the Settings control does. A saved request does not prove the model loaded.",
+                note: """
+                    true enables the on-device semantic model; false selects word matching. Re-indexes saved memories, just as the Settings control does. A \
+                    saved request does not prove the model loaded.
+                    """,
                 read: { _ in
                     if model.engine.memory.embeddingSnapshot == nil { await model.engine.memory.loadEmbeddings() }
                     guard let snapshot = model.engine.memory.embeddingSnapshot else {
@@ -93,16 +104,16 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                     }
                     return .bool(snapshot.requestedBackend != ManagedEmbeddingProvider.mockBackend)
                 },
-                write: { _, value in
+                write: { _, value, context in
                     let enabled = try QuietSettings.boolValue(value, "Meaning-based memory")
                     try await model.engine.memory.toggleEmbeddings(enabled)
                     guard let snapshot = model.engine.memory.embeddingSnapshot else {
                         throw QuietSettingError.unavailable("Memory's embedding runtime became unavailable after saving. Inspect Memory before another change.")
                     }
-                    QuietWriteDetail.record("effective_backend", .string(snapshot.effectiveBackend))
-                    if let problem = snapshot.lastLoadError { QuietWriteDetail.record("model_load_error", .string(problem)) }
+                    context.detail.record("effective_backend", .string(snapshot.effectiveBackend))
+                    if let problem = snapshot.lastLoadError { context.detail.record("model_load_error", .string(problem)) }
                 }
-            ),
+            ).ownedByMind(),
             QuietSetting(
                 id: "settings.show_tour", page: "settings", label: "Show the tour", kind: .boolean,
                 read: { _ in
@@ -112,16 +123,21 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                     }
                     return .bool(enabled)
                 },
-                write: { _, value in
+                write: { _, value, _ in
                     let enabled = try QuietSettings.boolValue(value, "Show the tour")
                     UserDefaults.standard.set(enabled, forKey: "nativeagent.showTour")
                     if enabled { OnboardingTourReplay.shared.requestReplay() }
                 }
-            ),
+            ).watchingDefaults("nativeagent.showTour"),
             QuietSetting(
                 id: "providers.credentials", page: "providers", label: "Provider sign-ins and API keys", kind: .text,
                 note: "Credentials never go through chat. Use the account's secure setup control.",
-                read: { _ in .string("Mac: Providers → account → Sign in or Configure. iPhone: Settings → Providers → account. Enter credentials only in the secure setup sheet.") }
+                read: { _ in
+                    .string("""
+                        Mac: Providers → Accounts → Add key or Sign in opens the protected connection card in your conversation. \
+                        iPhone: Settings → Providers → account. Enter credentials only in the protected setup control.
+                        """)
+                }
             ),
             QuietSetting(
                 id: "telegram.credentials", page: "telegram", label: "Telegram bot token", kind: .text,
@@ -129,17 +145,21 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 read: { _ in .string("On the Mac, open Telegram → Bot token to add or replace the token in its secure field.") }
             )
         ]
-        // The same accounts the provider sheets render; reads and choices re-enter
-        // their checked owner, rather than retaining a copy of account state.
+        // Read and choose accounts through the provider owner so the adapter keeps no second account state.
         for account in model.engine.providers.connections {
             let id = account.provider_id
             @MainActor @Sendable func checkedProvider() async throws -> ProviderInfo {
                 let provider = try await model.engine.providers.provider(id: id)
                 guard provider.auth_status.state != "unavailable" else {
-                    throw QuietSettingError.unavailable("\(id)'s provider configuration is unavailable: \(provider.auth_status.detail) Repair providers/\(id).json in the app data folder, then reload Providers before reading or changing its default model.")
+                    throw QuietSettingError.unavailable("""
+                        \(id)'s provider configuration is unavailable: \(provider.auth_status.detail) Repair providers/\(id).json in the app data folder, \
+                        then reload Providers before reading or changing its default model.
+                        """)
                 }
                 if let problem = provider.models_note {
-                    throw QuietSettingError.unavailable("\(id)'s model choices are unavailable: \(problem) Refresh its models in Providers before reading or changing its default model.")
+                    throw QuietSettingError.unavailable(
+                        "\(id)'s model choices are unavailable: \(problem) Refresh its models in Providers before reading or changing its default model."
+                    )
                 }
                 return provider
             }
@@ -152,13 +172,12 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                     guard let saved = provider.default_model else { return .string("") }
                     return .string(saved)
                 },
-                write: { _, value in
+                write: { _, value, _ in
                     let provider = try await checkedProvider()
                     guard case .string(let wanted) = value, provider.models.contains(where: { $0.id == wanted }) else {
                         throw QuietSettingError.badValue("Choose one of this account's offered models.")
                     }
-                    // The sheet writes this same field through ProviderRouting.
-                    // Patch only the model; no credential or auth-mode input.
+                    // Patch only the model through ProviderRouting; this control has no credential or auth-mode input.
                     _ = try await model.engine.providers.routing.configureProvider(id: id, config: .object(["default_model": .string(wanted)]))
                     _ = await model.engine.providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
                 }
@@ -170,12 +189,19 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     private func decodePhoneSettings<Value: Decodable>(_ type: Value.Type, from body: String) throws -> Value {
         do { return try JSONDecoder().decode(type, from: Data(body.utf8)) }
         catch {
-            throw QuietSettingError.unavailable("The phone's settings reply could not be decoded: \(error.localizedDescription). Install the matching companion revision, reopen it and read phone.settings again.")
+            throw QuietSettingError.unavailable("""
+                The phone's settings reply could not be decoded: \(error.localizedDescription). Install the matching companion revision, reopen it and read \
+                phone.settings again.
+                """)
         }
     }
 
     private func phoneSettingsRequest(kind: PhoneRequest.Kind, params: [String: String]) async throws -> PhoneRequestResult {
-        guard let sync = appModel.engine.deviceSync else { throw QuietSettingError.unavailable("Phone sync is not running in this app. Open Connectors → iPhone and repair the connection.") }
+        guard let sync = appModel.engine.deviceSync else {
+            throw QuietSettingError.unavailable(
+                "Phone sync is not running in this app. Open Connectors → iPhone and repair the connection."
+            )
+        }
         let count = try PairedPhoneStore.pairedCountChecked(at: sync.dataRoot.appendingPathComponent("paired_phones.json"))
         guard count == 1 else {
             throw QuietSettingError.unavailable(count == 0
@@ -183,7 +209,8 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
                 : "More than one phone is paired; this request channel cannot select one safely. Use that phone's NativeAgent Settings.")
         }
         let request = PhoneRequest(kind: kind, params: params, waitSeconds: kind == .settingsRead ? 20 : 60)
-        let reply = try await sync.bridge.phoneRequests.request(request)
+        // This settings port holds no enclosing deadline; the request owns its expiry.
+        let reply = try await sync.bridge.phoneRequests.request(request, deadline: nil)
         let result = try decodePhoneSettings(PhoneRequestResult.self, from: reply.text)
         guard result.requestID == request.id, result.status == .completed else {
             throw QuietSettingError.unavailable((result.message ?? "The phone returned \(result.status.rawValue).")
@@ -194,30 +221,50 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
 
     private func readPhoneSetting(_ id: String) async throws -> MobileAppSetting {
         let reply = try await phoneSettingsRequest(kind: .settingsRead, params: ["id": id])
-        guard let body = reply.values["setting"] else { throw QuietSettingError.unavailable("The phone returned no setting row. Reopen NativeAgent on the paired iPhone and read phone.settings again.") }
+        guard let body = reply.values["setting"] else {
+            throw QuietSettingError.unavailable(
+                "The phone returned no setting row. Reopen NativeAgent on the paired iPhone and read phone.settings again."
+            )
+        }
         let row = try decodePhoneSettings(MobileAppSetting.self, from: body)
-        guard row.id == id else { throw QuietSettingError.unavailable("The phone answered for a different setting. Reopen NativeAgent on the paired iPhone and read phone.settings again.") }
+        guard row.id == id else {
+            throw QuietSettingError.unavailable(
+                "The phone answered for a different setting. Reopen NativeAgent on the paired iPhone and read phone.settings again."
+            )
+        }
         return row
     }
 
     func phoneSetting(id: String) async throws -> QuietSetting? {
         if id == "phone.settings" { return platformSettings.first { $0.id == id } }
         let descriptor = try await readPhoneSetting(id)
-        guard let kind = QuietSetting.Kind(rawValue: descriptor.type) else { throw QuietSettingError.unavailable("The phone returned an unknown setting kind. Install the matching companion revision, reopen it and read phone.settings again.") }
+        guard let kind = QuietSetting.Kind(rawValue: descriptor.type) else {
+            throw QuietSettingError.unavailable(
+                "The phone returned an unknown setting kind. Install the matching companion revision, reopen it and read phone.settings again."
+            )
+        }
         let read: @MainActor @Sendable (any QuietSettingsHost) async throws -> JSONValue = { _ in
             let row = try await self.readPhoneSetting(id)
             if let reason = row.unavailableReason { throw QuietSettingError.unavailable(reason) }
-            guard let value = row.value else { throw QuietSettingError.unavailable("The phone supplied no value. Reopen NativeAgent on the paired iPhone and read phone.settings for its owner's errors.") }
+            guard let value = row.value else {
+                throw QuietSettingError.unavailable(
+                    "The phone supplied no value. Reopen NativeAgent on the paired iPhone and read phone.settings for its owner's errors."
+                )
+            }
             if kind == .boolean {
-                guard value == "true" || value == "false" else { throw QuietSettingError.unavailable("The phone supplied an invalid switch value. Install the matching companion revision, reopen it and read phone.settings again.") }
+                guard value == "true" || value == "false" else {
+                    throw QuietSettingError.unavailable(
+                        "The phone supplied an invalid switch value. Install the matching companion revision, reopen it and read phone.settings again."
+                    )
+                }
                 return .bool(value == "true")
             }
             if kind == .list { return .array(value.split(separator: "\n").map { .string(String($0)) }) }
             return .string(value)
         }
-        let write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void)?
+        let write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void)?
         if descriptor.writable {
-            write = { _, value in
+            write = { _, value, _ in
                 let text: String
                 switch value {
                 case .bool(let enabled): text = enabled ? "true" : "false"
@@ -230,7 +277,10 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
             write = nil
         }
         return QuietSetting(id: id, page: "pairing", label: descriptor.label, kind: kind, choices: descriptor.choices,
-            note: "Owned by this iPhone. Keep its NativeAgent app open for reads and changes. Consent increases ask on the phone; a timeout confirms no outcome.",
+            note: """
+                Owned by this iPhone. Keep its NativeAgent app open for reads and changes. Consent increases ask on the phone; a timeout \
+                confirms no outcome.
+                """,
             readsAnotherDevice: true, read: read, write: write)
     }
 
@@ -325,7 +375,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
         return (state.enabled, problem)
     }
 
-    /// The same runtime setters the Settings and Cognition pages call.
+    /// Use the same runtime setters as Settings and Cognition.
     func setCognitionLane(_ lane: QuietCognitionLane, enabled: Bool) async {
         await lane.setEnabled(enabled, runtime: NativeAgentEngine.liveCognition)
     }
@@ -339,8 +389,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
         }
         return effectiveMode
     }
-    /// The key and the manager call together, as the Settings switch pairs
-    /// them (SetupRestRows.shortcutRow).
+    /// Pair each key with the same manager call as the Settings switch.
     func setGlobalHotkeyEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: "globalHotkeyEnabled")
         GlobalHotkey.shared.setEnabled(enabled)
@@ -358,16 +407,16 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
             .saveSearXNGBaseURL(url)
         try await appModel.engine.configuration.readSearXNG(dataRoot: appModel.engine.dataRoot)
     }
-    func findSearchService() async throws -> String {
+    func findSearchService(context: QuietSettingWrite) async throws -> String {
         switch await appModel.autodetectSearXNG() {
         case .found(let baseURL, let gaps):
-            if !gaps.isEmpty { QuietWriteDetail.record("discovery_gaps", .array(gaps.map { .string($0) })) }
+            if !gaps.isEmpty { context.detail.record("discovery_gaps", .array(gaps.map { .string($0) })) }
             return baseURL
         case .notFound(let detail), .failed(let detail): throw QuietSettingError.unavailable(detail)
         }
     }
 
-    // The Notifications page's own reads and writes (InboxSettingsView).
+    // Share InboxSettingsView's reads and writes so notification controls keep one owner.
     func inboxTriggers() async throws -> [QuietInboxTrigger] {
         try await appModel.engine.inbox.triggers().map {
             QuietInboxTrigger(

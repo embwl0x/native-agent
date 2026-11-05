@@ -14,9 +14,35 @@ import ToolExecution
 import Senses
 import PersonaEngine
 import AgentWorkspace
-// Blueprint: | `EngineTools.swift` | ToolsFacade owns checked authored tools, full form descriptors, catalog buckets and shared status classification; `withPartDoor` gives native scheduled/UI owners and Tools Keep the ordinary gated chain and AppChatToolDispatcher host with authenticated origin, resident approval session and caller file-access posture. One checked skill inventory supplies metadata, source/revision and guidance from the same body read (phone metadata omits source). LatestRead orders catalog, authored, skill and native-power reads; committed Parts Keep/Off writes publish through write. Native actions derive from their registry; receipts and notification/browser status retain availability. |
+import Desk
+import MacControl
+// Blueprint: | `EngineTools.swift` | `PartDoor`, `withPartDoor`; Explicit turn, host and originating gated chain for native part calls |
 
-/// The catalog's one status classification for Mac and phone.
+/// A native operation holds its turn and dependencies, including in callbacks it keeps.
+public struct PartDoor: Sendable {
+    public typealias Dispatch = AppActionExecution.Perform
+    public let turn: Turn
+    public let host: any OwnedProgramToolHost
+    public let dispatch: Dispatch
+    public let execution: AppActionExecution
+    public var invocation: Parts.Invocation {
+        let program = OwnedProgramExecution(turn: turn, surface: turn.envelope?.surface ?? "chat",
+            deadlines: execution.deadlines, wake: execution.wake, options: .init(handsBack: execution.handsBack),
+            readContent: execution.invocation.readContent, valueIdentity: execution.valueCall,
+            deadline: execution.invocation.waitDeadline, onActivity: { execution.deadlines.progressed() })
+        let openScreenWatch: (@Sendable (MacScreenWatch.Request, Bool) async throws -> MacScreenWatch)? = execution.openScreenWatch.map { open in
+            { @Sendable request, hands in try await open(request, hands, turn) }
+        }
+        return Parts.Invocation(host: host, execution: program, arrived: execution.arrived,
+            progressed: { execution.deadlines.progressed() }, openScreenWatch: openScreenWatch)
+    }
+
+    public func perform(_ tool: String, _ input: [String: JSONValue]) async throws -> JSONValue {
+        try await dispatch(tool, input, turn, execution)
+    }
+}
+
+/// Mac and phone share the catalog’s status classification.
 public enum ToolCatalogStatus: String, Sendable {
     case locked, unavailable, blocked, approval, active, available
     case unknown = "status unavailable"
@@ -59,11 +85,7 @@ extension ChatToolCatalogSnapshot {
     }
 }
 
-/// `NativeAgentEngine.tools`: the tool catalog and the authored-tool
-/// registry for one data root, in core types. The Tools page renders
-/// `catalog` (every tool, its model visibility and its trust here) and `authored`;
-/// the phone snapshot and Doctor use the same owner. Parts Keep/Off mutations
-/// read back through the same checked authored inventory.
+/// Share root-specific catalog and authored inventory across Tools, phone and Doctor; Keep/Off mutations read back through that same checked owner.
 @MainActor
 @Observable
 public final class ToolsFacade {
@@ -96,24 +118,26 @@ public final class ToolsFacade {
     public private(set) var notificationStatus: NotificationRuntimeStatus?
     public private(set) var browserStatus: BrowserRuntimeStatus?
     public private(set) var nativePowerRefresh: PanelRefreshStatus?
+    public internal(set) var browserDryRunStartedAt: Date?
+    public internal(set) var browserDryRunPreview: BrowserRun?
+    public internal(set) var browserDryRunError: String?
+    @ObservationIgnored var capabilitiesDidChange: (@MainActor @Sendable () async -> Void)?
 
     @ObservationIgnored private lazy var catalogRead = LatestRead()
     @ObservationIgnored private lazy var authoredRead = LatestRead()
 
     public nonisolated let dataRoot: URL
-    nonisolated private let manifestReader: @Sendable (String?) async throws -> JSONValue
+    nonisolated private let manifestReader: @Sendable (String?, Turn) async throws -> JSONValue
 
-    /// The full catalog as of the last successful read.
     public private(set) var catalog: ChatToolCatalogSnapshot?
-    /// Why the last catalog read failed; nil after a successful one. A failed
-    /// read keeps the previous `catalog` so the page can say it is stale.
+    /// Retain proven catalog rows with failure state so the page can identify stale evidence.
     public var catalogLoadError: String?
-    /// The tools she wrote, as of the last read.
     public private(set) var authored: [ToolRecord] = []
 
     public func refreshNativePower() async -> [(endpoint: String, label: String, error: Error)] {
         let read = await nativePowerRead.read({
-            let receiptRead: (rows: [NativeActionReceipt], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool, failure: String?) = await RuntimeReadouts.tailJSONL(
+            let receiptRead: (rows: [NativeActionReceipt], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool,
+                failure: String?) = await RuntimeReadouts.tailJSONL(
                 path: SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot).nativeActionsReceiptsPath, limit: 50)
             var notification: NotificationRuntimeStatus?
             var browser: BrowserRuntimeStatus?
@@ -133,43 +157,90 @@ public final class ToolsFacade {
             nativePowerRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
                 lastSuccessAt: read.3.isEmpty ? Date() : nativePowerRefresh?.lastSuccessAt, failedEndpoints: read.3.map { $0.endpoint })
         })
+        await capabilitiesDidChange?()
         return read.3
     }
 
-    public nonisolated init(dataRoot: URL, manifestReader: @escaping @Sendable (String?) async throws -> JSONValue) {
+    public nonisolated init(dataRoot: URL, manifestReader: @escaping @Sendable (String?, Turn) async throws -> JSONValue) {
         self.dataRoot = dataRoot
         self.manifestReader = manifestReader
     }
 
-    /// Native owners and authenticated transports enter the same door as a turn.
-    /// Its envelope keeps its authority through nested calls and approvals.
+    /// Raw sense reads retain their exact operation while traversing the ordinary gates.
+    public nonisolated func readSense(tool: String, input: [String: JSONValue], turn parent: Turn?,
+        operation: ExistingCornerReadOperation, admissionOnly: Bool) async throws -> JSONValue {
+        let turn = parent ?? Turn().with(\.envelope, .native("sense:read"))
+        let surface = TurnEnvelope.current(turn: turn, surface: "chat").surface
+        let profile = surface == "chat" ? NativeAgentAppChatSurfaceProfile.mac
+            : NativeAgentAppChatSurfaceProfile(rawValue: surface)
+        let sessionID = turn.verifiedSessionID
+        let filer = sessionID != nil && profile != .background ? NativeAgentChatApprovalFiler(dataRoot: dataRoot) : nil
+        var invocation = ChatToolInvocation()
+        invocation.metadataOnly = operation.metadataOnly
+        invocation.readingRaw = operation.readingRaw
+        invocation.frameSource = operation.lookSource
+        invocation.passiveObservation = operation.passiveObservation || operation.sense.passive
+        invocation.waitDeadline = operation.sense.deadline
+        invocation.readCapture = operation.sense.appCapture
+        invocation.readContent = operation.sense.readContent
+        invocation.senseReads = operation.sense.senseReads
+        invocation.senseRead = operation.sense
+        let work = ChatTurnWork(admissionOnly: admissionOnly, toolInvocation: invocation)
+        var execution = AppActionExecution(invocation: invocation, deadlines: invocation.deadlines, turnWork: work)
+        execution.admissionOnly = admissionOnly
+        let tools = NativeAgentEngine.forRoot(dataRoot).toolDispatchClient(enforceAppAutonomy: false, actionExecution: execution)
+        let dispatcher = makeGatedToolDispatchClient(tools: tools, fileAccess: turn.fileAccess ?? "read_only",
+            approvalFiler: filer, dataRoot: dataRoot, verifiedSessionId: sessionID,
+            work: work)
+        return try await dispatcher.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: execution.invocation)
+    }
+
+    /// Native owners and authenticated transports use the same turn door, preserving authority through nested calls and approvals.
     public nonisolated func withPartDoor<Value: Sendable>(envelope: TurnEnvelope,
         fileAccess: String = "auto", approvalFiler: (any ApprovalFiler)? = nil,
         approvedReplay: ApprovedChatToolReplay? = nil,
-        operation: @Sendable () async throws -> Value) async throws -> Value {
+        turn parent: Turn? = nil, wake: JSONValue? = nil,
+        wrote: (@Sendable (URL) -> Void)? = nil,
+        continuation: DeskContinuationTurn? = nil,
+        admitModel: (@Sendable (Turn?) async throws -> Turn)? = nil,
+        execution suppliedExecution: AppActionExecution? = nil,
+        operation: @Sendable (PartDoor) async throws -> Value) async throws -> Value {
         let surface = envelope.surface
+        let turn = (parent ?? Turn(session: ResidentWake.session).with(\.verifiedSessionID, ResidentWake.session))
+            .with(\.envelope, envelope).with(\.fileAccess, fileAccess)
         let engine = NativeAgentEngine.forRoot(dataRoot)
         let filer: any ApprovalFiler = approvalFiler ?? NativeAgentChatApprovalFiler(dataRoot: dataRoot)
-        let tools = engine.toolDispatchClient(enforceAppAutonomy: false, swarmApprovalFiler: filer)
-        let chain = makeGatedToolDispatchClient(tools: tools, fileAccess: fileAccess,
-            approvalFiler: filer, dataRoot: dataRoot, verifiedSessionId: ResidentWake.session, approvedReplay: approvedReplay)
-        return try await ChatToolSessionContext.$fileAccess.withValue(fileAccess) {
-            try await ChatToolSessionContext.$envelope.withValue(envelope) {
-                try await AppDoorReentry.$perform.withValue({ name, arguments in
-                    try await chain.dispatch(tool: name, input: arguments, surface: surface)
-                }) {
-                    try await tools.withAuthoredProgramHost(surface: surface, operation: operation)
-                }
-            }
+        let perform: PartDoor.Dispatch = { name, arguments, turn, execution in
+            let scopedTools = engine.toolDispatchClient(enforceAppAutonomy: false, actionExecution: execution)
+            let invocation = execution.invocation.with(\.authoredCall, execution.authoredCall)
+            let chain = makeGatedToolDispatchClient(tools: scopedTools, fileAccess: fileAccess,
+                approvalFiler: filer, dataRoot: self.dataRoot, verifiedSessionId: turn.verifiedSessionID,
+                approvedReplay: approvedReplay,
+                work: .init(handsBack: execution.handsBack, admissionOnly: execution.admissionOnly, toolInvocation: invocation))
+            return try await chain.dispatch(tool: name, input: arguments, surface: surface, turn: turn, invocation: invocation)
+        }
+        // A native ingress without a supplied operation starts one here; callers with an operation keep it whole.
+        let invocation = ChatToolInvocation()
+        var execution = suppliedExecution ?? AppActionExecution(invocation: invocation, deadlines: invocation.deadlines,
+            turnWork: .init(toolInvocation: invocation))
+        execution.perform = perform
+        execution.wake = wake
+        execution.invocation.wrote = wrote
+        execution.invocation.deskContinuation = continuation
+        execution.admitModel = admitModel
+        let tools = engine.toolDispatchClient(enforceAppAutonomy: false, actionExecution: execution)
+        return try await tools.withAuthoredProgramHost(surface: surface, turn: turn, execution: execution) { turn, execution in
+            guard let host = execution.host else { throw PartError.invalid("The part door has no host.") }
+            return try await operation(PartDoor(turn: turn, host: host, dispatch: perform, execution: execution))
         }
     }
 
-    /// The trust-aware manifest from this engine's tool-chain composition.
-    public nonisolated func loadManifest(detail: String? = nil) async throws -> JSONValue {
-        try await manifestReader(detail)
+    public nonisolated func loadManifest(detail: String? = nil, turn: Turn? = nil) async throws -> JSONValue {
+        // A standalone native catalog read is its ingress; invoked reads keep their caller's turn.
+        let turn = turn ?? Turn().with(\.envelope, .personOnMac("mac_ui:tools.catalog"))
+        return try await manifestReader(detail, turn)
     }
 
-    /// The full manifest, typed for the Tools page.
     public func loadCatalog() async throws -> ChatToolCatalogSnapshot {
         let result: Result<ChatToolCatalogSnapshot, Error> = await catalogRead.read({
             do { return .success(try await readCatalog()) }
@@ -197,14 +268,14 @@ public final class ToolsFacade {
         }
         for tool in snapshot.tools {
             guard let raw = tool.catalogBucket, ChatToolCatalogBucket(rawValue: raw) != nil else {
-                throw RuntimeReadError.unreadableFeed("Tool catalog bucket is unavailable for \(tool.name). Repair its registered catalog entry before reading Tools again.")
+                throw RuntimeReadError.unreadableFeed(
+                    "Tool catalog bucket is unavailable for \(tool.name). Repair its registered catalog entry before reading Tools again.")
             }
         }
         return snapshot
     }
 
-    /// Checked authored records: missing required fields are omitted by the store;
-    /// invalid authored fields fail the read.
+    /// Missing required fields are omitted by the store; invalid authored fields must fail the read.
     public func listAuthored() async throws -> [ToolRecord] {
         try await authoredRead.read({
             try await SwiftNativeToolRegistry(root: dataRoot).listTools()
@@ -217,32 +288,31 @@ public final class ToolsFacade {
         return true
     }
 
-    /// UI visibility stays separate from Parts' exact keep eligibility.
-    public nonisolated func keepRefusal(_ tool: ToolRecord) -> String? {
+    /// Keep UI visibility separate from exact Parts keep eligibility.
+    public nonisolated func keepRefusal(_ tool: ToolRecord, turn: Turn?) -> String? {
         guard tool.candidateDigest != nil || ["draft", "disabled"].contains(tool.status) else {
             return tool.status == "active" ? "\(tool.name) is already on." : "Save a version of \(tool.name) before keeping it."
         }
         if (tool.candidateDigest ?? tool.codeFingerprint) != nil, tool.reviewedKeepDigest == nil {
             return "Refresh Tools to read the exact version before keeping it."
         }
-        let outcome = Parts(root: dataRoot).keepEligibility(tool, fullMac: false, ownerAuthorized: true)
+        let outcome = Parts(root: dataRoot).keepEligibility(tool, fullMac: false, ownerAuthorized: true, turn: turn)
         return outcome.ok ? nil : outcome.text
     }
 
-    /// The Tools page's Keep: the owner keeps a part's rehearsed waiting
-    /// version, or turns it back on (nil version for Markdown guidance);
-    /// read back through the authored-field check.
+    /// Keep the rehearsed waiting version or re-enable it, then verify authored fields through readback.
     public nonisolated func keep(id: String, version: String?) async throws -> ToolRecord {
-        let outcome = try await withPartDoor(envelope: .native("mac_ui:ability.keep:" + id)) {
-            await Parts(root: dataRoot).enable(id, version: version, fullMac: false, ownerAuthorized: true)
+        let outcome = try await withPartDoor(envelope: .personOnMac("mac_ui:ability.keep:" + id)) { door in
+            await Parts(root: dataRoot).enable(id, version: version, fullMac: false, ownerAuthorized: true, invocation: door.invocation)
         }
         guard outcome.ok else { throw PartError.invalid(outcome.text) }
         return try await readBack(id)
     }
 
-    /// The Tools page's off-switch: the owner's, kept until the owner turns it back on.
+    /// Owner-disabled parts stay off until the owner re-enables them.
     public nonisolated func switchOff(id: String, reason: String) async throws -> ToolRecord {
-        let outcome = Parts(root: dataRoot).disable(id, reason: reason, fullMac: false, ownerAuthorized: true)
+        let turn = Turn().with(\.envelope, .personOnMac("mac_ui:ability.disable:" + id))
+        let outcome = Parts(root: dataRoot).disable(id, reason: reason, fullMac: false, ownerAuthorized: true, turn: turn)
         guard outcome.ok else { throw PartError.invalid(outcome.text) }
         return try await readBack(id)
     }
@@ -258,8 +328,7 @@ public final class ToolsFacade {
         return record
     }
 
-    /// Loads the catalog into `catalog`, recording a failure instead of
-    /// clearing what the page already shows.
+    /// Catalog load failures must not clear the page’s proven rows.
     @discardableResult
     public func refreshCatalog() async -> Bool {
         do {
@@ -273,8 +342,8 @@ public final class ToolsFacade {
 }
 extension ToolsFacade {
     public nonisolated convenience init(dataRoot: URL) {
-        self.init(dataRoot: dataRoot) { detail in
-            try await NativeAgentEngine.forRoot(dataRoot).toolDispatchClient().toolManifest(detail: detail)
+        self.init(dataRoot: dataRoot) { detail, turn in
+            try await NativeAgentEngine.forRoot(dataRoot).toolDispatchClient().toolManifest(detail: detail, turn: turn)
         }
     }
 }

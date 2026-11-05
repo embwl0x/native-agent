@@ -1,29 +1,20 @@
-// MacCrossAppDrag.swift — two anchors, one drag.
-// `to_app` resolves the destination in that app's window; `holding` carries macOS copy/move modifiers.
-// Raising is explicit and must not cover the source; secure fields refuse the drag path.
-// This owner decides bounded pointer-drag refusals; clipboard transfer uses the clipboard actions.
+// Keep both app anchors explicit; destination raising must not bury the source. Secure fields refuse the drag path, and clipboard transfer retains its separate
+// owner.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MacCrossAppDrag.swift` | `MacCrossAppDrag`, `MacFourVerbs.performCrossAppDrag`: two-anchor drag resolution, destination raising and secure/obstructed path refusals with actual-effect evidence |
+// Blueprint: | `MacCrossAppDrag.swift` | `MacCrossAppDrag` `MacFourVerbs.performCrossAppDrag` |
 
 public enum MacCrossAppDrag {
     // MARK: - The raise
 
-    /// Whether the destination app must be brought forward, and why — decided
-    /// ONCE, spoken out loud, and recorded on the receipt.
-    ///
-    /// Bounded to a single raise on purpose. A drag that needed to reorder
-    /// windows twice is not a drag a person could have done either.
+    /// Decide one bounded destination raise so focus changes are explicit and retained in the receipt.
     public struct Raise: Sendable, Equatable {
-        /// False when the destination app is ALREADY frontmost: then nothing
-        /// moves, and the receipt says nothing moved.
+        /// An already-front destination needs no raise, so the receipt must claim no focus move.
         public let needed: Bool
-        /// Machine-readable, for the receipt.
         public let reason: String
-        /// The sentence User reads when his focus moved.
         public let words: String
 
         public init(needed: Bool, reason: String, words: String) {
@@ -36,8 +27,7 @@ public enum MacCrossAppDrag {
     public static let raiseReasonAlreadyFront = "destination_already_frontmost"
     public static let raiseReasonDropNeedsWindow = "drop_needs_destination_window_in_front"
 
-    /// `destinationIsFront` is MEASURED — it is the `front` fact the anchored
-    /// look published, not an assumption from having named an app.
+    /// Use the look's measured front state; naming an app cannot prove that it owns the foreground.
     public static func raise(destinationApp: String, destinationIsFront: Bool) -> Raise {
         guard !destinationIsFront else {
             return Raise(
@@ -56,8 +46,8 @@ public enum MacCrossAppDrag {
 
     // MARK: - Would the raise bury the source?
 
-    /// The union of read target frames is only a lower bound on window coverage.
-    /// Use the anchored window frame first; the union may refuse a drag but never aim one.
+    /// The union of read target frames is only a lower bound on window coverage. Use the anchored window frame first; the union may refuse a drag but never aim
+    /// one.
     public static func bounds(of frames: [MacAXFrame]) -> MacAXFrame? {
         let usable = frames.filter {
             $0.x.isFinite && $0.y.isFinite && $0.w.isFinite && $0.h.isFinite && $0.w > 0 && $0.h > 0
@@ -76,9 +66,7 @@ public enum MacCrossAppDrag {
 
     public static let coveredSourceReason = "raise_would_cover_the_source"
 
-    /// True when raising the destination would put its window over the point
-    /// the drag has to press down on. `nil` bounds ⇒ false: an unknown must
-    /// not become a refusal, and the post-act look still reports what happened.
+    /// Refuse only known coverage of the pickup point; unknown bounds alone cannot establish obstruction. The post-act look still reports effects.
     public static func raiseWouldCoverSource(
         _ source: MacPointerPosition,
         destinationBounds: MacAXFrame?
@@ -87,10 +75,7 @@ public enum MacCrossAppDrag {
         return source.isInside(destinationBounds)
     }
 
-    /// The rectangle the coverage guard must test: the destination WINDOW's own
-    /// frame when the look published one, and only otherwise the union of what
-    /// was read inside it. Written once, here, so both the pre-raise refusal and
-    /// the post-raise re-check ask the same question of the same rectangle.
+    /// Share one coverage rectangle between pre/post-raise checks: the window frame first, otherwise the lower-bound union of read targets.
     public static func coverageBounds(
         windowFrame: MacAXFrame?,
         targetFrames: [MacAXFrame]
@@ -104,7 +89,10 @@ public enum MacCrossAppDrag {
         source: String,
         destinationApp: String
     ) -> String {
-        "Bringing \(destinationApp) forward covered \(source), so dragging stopped. Focus moved; no input was sent or drag performed. Move the windows so both are visible before continuing."
+        """
+            Bringing \(destinationApp) forward covered \(source), so dragging stopped. Focus moved; no input was sent or drag performed. Move the windows so \
+            both are visible before continuing.
+            """
     }
 
     public static let destinationMovedReason = "destination_moved_during_raise"
@@ -130,18 +118,15 @@ public enum MacCrossAppDrag {
 
     // MARK: - Secure input on the path
 
-    /// Reuses `MacActClosedLoop`'s name for the same boundary, so a receipt
-    /// reads the same whether typing or the pointer ran into it.
+    /// Reuses `MacActClosedLoop`'s name for the same boundary, so a receipt reads the same whether typing or the pointer ran into it.
     public static var secureCrossingReason: String { MacActClosedLoop.secureFieldReason }
 
-    /// The rendered kind a secure text field carries. Derived from the renderer
-    /// rather than spelled out, so the two cannot drift apart.
+    /// The rendered kind a secure text field carries. Derived from the renderer rather than spelled out, so the two cannot drift apart.
     public static var secureKind: String { MacScreenRender.kindName(role: "AXSecureTextField") }
 
     public static func isSecureKind(_ kind: String) -> Bool { kind == secureKind }
 
-    /// What this refusal already did, said as it is: a raise that happened
-    /// is never denied.
+    /// What this refusal already did, said as it is: a raise that happened is never denied.
     static func effectsSoFar(raised app: String?) -> String {
         app.map { "I brought \($0) to the front; I sent no input." } ?? "I haven't raised anything or sent input."
     }
@@ -160,17 +145,13 @@ public enum MacCrossAppDrag {
 
     // MARK: - Refusals the two anchors can produce
 
-    // Cross-app refusals may name the app/window and a capped names-only disambiguation list.
-    // They must not disclose the background render, values, readouts or frames.
+    // Cross-app refusals may name the app/window and a capped names-only disambiguation list. They must not disclose the background render, values, readouts or
+    // frames.
 
-    /// How many names a cross-app destination refusal may read back.
     public static let maxDisclosedNames = 5
-    /// How long one of those names may be before it is cut.
     public static let maxDisclosedNameChars = 60
 
-    /// Names ONLY, trimmed, de-duplicated, cut to length, capped in number.
-    /// Every cross-app destination refusal passes its list through this, so the
-    /// bound is one function rather than a habit at four call sites.
+    /// Bound, deduplicate and trim every destination candidate list at one boundary so disambiguation cannot leak unlimited background names.
     public static func disclosableNames(_ names: [String]) -> [String] {
         var seen: Set<String> = []
         var out: [String] = []
@@ -260,9 +241,8 @@ public enum MacCrossAppDrag {
 extension MacFourVerbs {
     // MARK: - Two-anchor drag
 
-    /// Resolve both anchors without focus, refuse unsafe paths, raise once with authority,
-    /// revalidate the raised destination, then drag once. Judge the drop against that
-    /// destination's pre-drag sight and preserve every focus effect in the receipt.
+    /// Resolve both anchors without focus, refuse unsafe paths, raise once with authority, revalidate the raised destination, then drag once. Judge the drop
+    /// against that destination's pre-drag sight and preserve every focus effect in the receipt.
     func performCrossAppDrag(
         source: ActTarget,
         spokenSource: String,
@@ -273,13 +253,12 @@ extension MacFourVerbs {
         holding: String?,
         button: String?,
         attention: BurstAttention?,
-        before: Sighting
+        before: Sighting,
+        turn: Turn, context: MacOperationContext
     ) async -> MacFourVerbsReply {
-        // 1. THE SECOND ANCHOR. `sight(app:)` walks that app's front window and
-        //    activates nothing; the look handler already answers not-running,
-        //    ambiguous and self-process in MacBackgroundSight's own words.
+        // Resolve the destination without activation so missing or ambiguous anchors refuse before focus moves.
         let anchored: Sighting
-        switch await sight(part: nil, app: destinationApp) {
+        switch await sight(part: nil, app: destinationApp, turn: turn, context: context) {
         case .seen(let seen): anchored = seen
         case .blind(let reply):
             let why = Self.string(reply.detail["message"])
@@ -293,9 +272,7 @@ extension MacFourVerbs {
         }
         let destinationAppName = anchored.appName ?? destinationApp
 
-        // The window itself is a drop target: by its title (resolve already
-        // names windows), or by the app's name / "window" when nothing inside
-        // is called that.
+        // Allow a window drop by its own title or app/window name when no interior target answers.
         func resolveDrop(_ targets: [ActTarget]) -> Resolution {
             let resolved = Self.resolve(destination, among: targets)
             guard case .none = resolved,
@@ -356,10 +333,7 @@ extension MacFourVerbs {
             )
         }
 
-        // 2. SECURE INPUT. Dropping into a credential box is the same boundary
-        //    `type` refuses at, and a drag that merely CROSSES one can
-        //    spring-load it open on the way past. Both ends and the line
-        //    between them, before anything is raised.
+        // A drag can spring-load a credential box it crosses; check both endpoints and the full path before raising.
         if endTarget.secret {
             return MacFourVerbsReply(
                 ok: false,
@@ -391,8 +365,7 @@ extension MacFourVerbs {
             )
         }
 
-        // 3. THE RAISE. Measured, not assumed: `anchored.isFront` is the fact
-        //    the look published about the window it actually read.
+        // Use the anchored look's front state so a receipt never invents a raise.
         let raise = MacCrossAppDrag.raise(
             destinationApp: destinationAppName,
             destinationIsFront: anchored.isFront
@@ -406,14 +379,12 @@ extension MacFourVerbs {
         if let bundle = anchored.bundleIdentifier {
             raiseDetail["destination_app_bundle"] = .string(bundle)
         }
-        // What the drag actually lets go of, and where. Re-derived after the
-        // raise (below) because raising re-lays a window: the pre-raise point
-        // is a resolution, not yet an aim.
+        // Raising can relayout the destination, so rederive the release point after it rather than aim from the earlier resolution.
         var dropPoint = end
         var dropTarget = endTarget
         var anchoredAfterRaise = anchored
         if raise.needed {
-            guard Self.foregroundRequested else {
+            guard context.foregroundRequested else {
                 return MacFourVerbsReply(
                     ok: false,
                     text: "I need the screen because the drop needs \(destinationAppName) in front. Nothing was raised or dragged. "
@@ -449,7 +420,7 @@ extension MacFourVerbs {
                 focused = try await host.dispatch(
                     action: "focus_app",
                     body: ["app": .string(destinationAppName)]
-                )
+                , turn: turn, context: context)
             } catch {
                 return MacFourVerbsReply(
                     ok: false,
@@ -471,10 +442,9 @@ extension MacFourVerbs {
                 )
             }
 
-            // Raising can change layout; reread once, resolve the endpoint and recheck coverage before mouse-down.
-            // A refusal after focus moved must say so.
+            // Raising can change layout; reread once, resolve the endpoint and recheck coverage before mouse-down. A refusal after focus moved must say so.
             let reread: Sighting
-            switch await sight(part: nil, app: destinationAppName) {
+            switch await sight(part: nil, app: destinationAppName, turn: turn, context: context) {
             case .seen(let seen): reread = seen
             case .blind(let reply):
                 return MacFourVerbsReply(
@@ -515,9 +485,7 @@ extension MacFourVerbs {
                 describedBy: destination
             ) else { return movedRefusal() }
 
-            // The window is in front NOW. If its real frame covers the pick-up
-            // point, the mouse-down would land on it — the exact failure the
-            // pre-raise guard exists to prevent, asked again of the truth.
+            // Recheck real window coverage after raising; otherwise mouse-down could hit the newly foreground destination instead of the source.
             guard !MacCrossAppDrag.raiseWouldCoverSource(
                 start,
                 destinationBounds: MacCrossAppDrag.coverageBounds(
@@ -539,8 +507,7 @@ extension MacFourVerbs {
                 )
             }
 
-            // The secure boundary is re-drawn on the line that will actually be
-            // travelled: a raise can bring a password field onto it.
+            // The secure boundary is re-drawn on the line that will actually be travelled: a raise can bring a password field onto it.
             let rereadSecureFrames = (before.targets + reread.targets)
                 .filter(\.secret)
                 .compactMap(\.frame)
@@ -580,20 +547,13 @@ extension MacFourVerbs {
         raiseDetail["raised"] = .bool(raise.needed)
         if raise.needed { raiseDetail["raised_app"] = .string(destinationAppName) }
 
-        // 4. ONE DRAG, through the one pointer tail: the line checked against
-        //    the scene its events land in (the destination as raised, and
-        //    whatever covers the source), exactly as an ordinary drag is.
+        // Use the shared pointer tail so the raised scene retains ordinary path safety and input gates.
         let spokenDestination = Self.spokenName(dropTarget, requestedAs: destination)
         let description = "\(button == "right" ? "Right-dragged" : "Dragged") \(spokenSource) "
             + "into \(destinationAppName) — onto \(spokenDestination). \(raise.words)"
-        // The pre-act reading passed here is the DESTINATION window's, taken
-        // after the raise when there was one: the post-act look lands on that
-        // same window, so the comparison is drop evidence rather than the noise
-        // of the window order having changed underneath it.
-        // The destination coming forward is part of this drag: once it was
-        // raised, IT is the app that must stay in front while the drag posts
-        // (any third app taking the front stops the hand).
-        let dragFront = raise.needed ? anchoredAfterRaise.pid : Self.requiredFrontPid ?? before.pid
+        // Compare against destination sight after any raise so window-order noise cannot verify a drop. The destination must retain the foreground during
+        // emission; a third app taking it stops the drag.
+        let dragFront = raise.needed ? anchoredAfterRaise.pid : context.requiredFrontPid ?? before.pid
         if raise.needed, dragFront == nil {
             return MacFourVerbsReply(
                 ok: false,
@@ -601,7 +561,7 @@ extension MacFourVerbs {
                 detail: raiseDetail.merging(["raised": .bool(true), "error": .string("front_unknown")]) { current, _ in current }
             )
         }
-        return await Self.$requiredFrontPid.withValue(dragFront) {
+        return await context.holding(\.requiredFrontPid, dragFront) { context in
             await performPointer(
                 PhysicalVerb.drag.rawValue, at: start, to: dropPoint, saying: spokenSource, destination: spokenDestination,
                 before: anchoredAfterRaise,
@@ -610,7 +570,7 @@ extension MacFourVerbs {
                 physicalOnly: dropTarget.physicalOnly, receipt: raiseDetail,
                 secrets: (before.targets + anchoredAfterRaise.targets).filter(\.secret).compactMap(\.frame),
                 described: description
-            )
+            , turn: turn, context: context)
         }
     }
 }

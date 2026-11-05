@@ -3,17 +3,12 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 
-// Blueprint: | `SystemOps+Production.swift` | `ProductionExport`: checked typed export registry reads, stable newest-first ordering and archive verification; no external status runtime |
+// Blueprint: | `SystemOps+Production.swift` | `ProductionExport`: Checked newest-first export registry and archives |
 
 // MARK: - Production read routes
-//
-// Swift-owned reader for production export registry state.
-// Exports read <dataRoot>/production/exports/registry.json. Health-card and
-// whats-running live in their dedicated Swift runtime/status surfaces; do not
-// resurrect an external runtime to answer production status.
+// Production status belongs to native runtime owners; registry reads must not start an external runtime.
 
-/// One production export as the Capabilities page shows it: the typed
-/// projection of a registry row, and the row an export appends.
+/// Keep the page projection and export writer on the same typed registry row.
 public struct ProductionExport: Identifiable, Codable, Hashable, Sendable {
     @MainActor
     public func verifyRegistry(dataRoot: URL) async throws -> (records: [ProductionExport], failure: String?) {

@@ -3,11 +3,8 @@ import Foundation
 
 extension DoctorReadout {
     public static func getProductionHardening(dataRoot: URL) async throws -> ProductionHardeningSummary {
-        // The hardening report is an operator-produced authority. A missing
-        // report means no report has been recorded; an existing unreadable or
-        // malformed report is unavailable and must never be presented as the
-        // same neutral state. Keep the report on the client's injected root so
-        // the mounted panel, export action, and reload all agree on one store.
+        // Missing reports are neutral; unreadable reports stay unavailable, never synthetic health. Use the injected root so the panel, export and reload read
+        // the same owner.
         let path = dataRoot
             .appendingPathComponent("runtime", isDirectory: true)
             .appendingPathComponent("hardening.json")

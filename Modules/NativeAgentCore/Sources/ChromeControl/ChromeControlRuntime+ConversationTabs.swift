@@ -5,7 +5,7 @@ import Darwin
 import NativeAgentChromeRelayCore
 import TrustCenter
 import MacControl
-// Blueprint: | `ChromeControlRuntime+ConversationTabs.swift` | `ChromeControlRuntime` conversation tab members: durable last-tab memory forgotten on release/ownership refusal, numeric addressing, per-tab reading views and remembered owned-tab page.look; last eight release causes/times/URLs survive reconnects for this app run |
+// Blueprint: | `ChromeControlRuntime+ConversationTabs.swift` | `ChromeControlRuntime`; Per-conversation tab memory and release evidence. |
 
 extension ChromeControlRuntime {
     private func refreshGroupTabs() async {
@@ -50,7 +50,7 @@ extension ChromeControlRuntime {
                 "last_capture_error": captureErrors[String(id)] ?? .null])
         }
         var result: [String: JSONValue] = ["tabs": .array(tabs), "extension_connected": .bool(readyChannel != nil),
-            "released": .array(releasedTabs), "released_note": .string("tabs that were hers and why they stopped being hers")]
+            "released": .array(releasedTabs), "released_note": .string("tabs that were the agent's and why they stopped being the agent's")]
         if let conversationTabsStorageError { result["tab_memory_error"] = .string(conversationTabsStorageError) }
         return result
     }
@@ -62,13 +62,15 @@ extension ChromeControlRuntime {
     }
 
     public func performInConversation(
-        _ effect: ChromeControlEffect, payload: [String: JSONValue], verifiedSessionID: String?
+        _ effect: ChromeControlEffect, payload: [String: JSONValue], verifiedSessionID: String?,
+        turn: Turn, context: MacOperationContext
     ) async throws -> JSONValue {
-        if channel != nil, readyChannel == nil { throw await connectionFailure() }
+        if channel != nil, readyChannel == nil { throw await connectionFailure( context: context) }
         let session = verifiedSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let session, !session.isEmpty {
             guard busyConversations.insert(session).inserted else {
-                throw ChromeControlRuntimeError.conversationContext("Another Chrome action is still running in this conversation. Nothing was sent; wait for its result before continuing.")
+                throw ChromeControlRuntimeError.conversationContext(
+                    "Another Chrome action is still running in this conversation. Nothing was sent; wait for its result before continuing.")
             }
         }
         defer { if let session { busyConversations.remove(session) } }
@@ -83,15 +85,17 @@ extension ChromeControlRuntime {
             else if let current { resolved["tabId"] = .int(current.tabID) }
         }
         if effect != .navigate, resolved["tabId"] == nil {
-            throw ChromeControlRuntimeError.conversationContext("This conversation has no Chrome tab yet. browser.chrome_navigate{url} opens one; later calls reuse it. Nothing was sent.")
+            throw ChromeControlRuntimeError.conversationContext(
+                "This conversation has no Chrome tab yet. browser.chrome_navigate{url} opens one; later calls reuse it. Nothing was sent.")
         }
-        if resolved["expectedUserSequence"] == nil, let current, resolved["tabId"] == .int(current.tabID) { resolved["expectedUserSequence"] = current.userSequence }
+        if resolved["expectedUserSequence"] == nil, let current,
+            resolved["tabId"] == .int(current.tabID) { resolved["expectedUserSequence"] = current.userSequence }
         if effect == .snapshot, let current, resolved["tabId"] == .int(current.tabID) {
             for (key, value) in current.readingView where resolved[key] == nil { resolved[key] = value }
         }
         let reply: (response: JSONValue, channel: ChromeControlChannel)
         do {
-            reply = try await performOnChannel(effect, payload: resolved)
+            reply = try await performOnChannel(effect, payload: resolved, turn: turn, context: context)
         } catch ChromeControlRuntimeError.extensionRejected(let code, let message) where code == "tab_not_owned" {
             if case .int(let id)? = resolved["tabId"] { forgetTab(id) }
             throw ChromeControlRuntimeError.extensionRejected(code: code, message: message)

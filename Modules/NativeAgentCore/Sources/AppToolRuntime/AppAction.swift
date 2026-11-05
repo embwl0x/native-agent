@@ -24,23 +24,19 @@ import MemoryV2
 import StandingBots
 import TurnTrace
 import Studio
-// Blueprint: | `AppAction.swift` | AppAction value, folded calls, argument policy and receipt effects; run receipts use broker-recorded read classes and validation has effect none |
+// Blueprint: | `AppAction.swift` | Action declarations, folded gates, argument policy and effect receipts |
 
-/// One button of NativeAgent's, as the `app` door offers it.
-///
-/// Its last word means one thing on every page: archive puts away, show brings forward on User's screen, clear erases, approve is his below
-/// Full Mac. App admission classifies the action; folded calls re-enter their underlying tool's gates (`runFolded`).
+/// Action verbs retain their meaning on every page; admission classifies the action and folded calls re-enter their own gates.
 public struct AppAction: Sendable {
     public enum Owner: Sendable {
-        case hers
-        /// Why it is User's and where he does it, and the action of hers that does the safe part instead, when there is one.
-        case his(String, instead: String? = nil)
+        case agent
+        /// Owner-only actions name the user's control and an agent-safe alternative when one exists.
+        case person(String, instead: String? = nil)
     }
 
     public let id: String
-    /// Where User's own button is; "*" is every page.
+    /// "*" shares an action across all pages.
     public let page: String
-    /// The button's words.
     public let label: String
     /// Complete search and catalog-version input, including schema words.
     public let scope: String
@@ -48,27 +44,21 @@ public struct AppAction: Sendable {
     let returnedScope: String
     public let schema: LLMToolSchema?
     public let partAction: Bool
-    /// The part of hers it runs, by name: a skill, a sense ("" for a door that runs whichever part it is given). What it does is the
-    /// part's, not her hand's.
+    /// An empty part name runs the supplied part; behavior belongs to that part rather than its door.
     let part: String?
-    /// This row declares a direct call to its tool, including fixed input.
     public let folded: Bool
-    /// `name`, `a|b` for either, `?` optional, `:type` when not a string; `:object*` explicitly accepts arbitrary fields.
-    /// `:object` needs declared fields or a typed map in its owner schema; `:secret` is redacted in receipts and logs.
+    /// `name`, `a|b` for either, `?` optional, `:type` when not a string; `:object*` explicitly accepts arbitrary fields. `:object` needs declared fields or a
+    /// typed map in its owner schema; `:secret` is redacted in receipts and logs.
     public let args: [String]
-    /// The args naming what it acts on (`AppActionBinding.subject`).
     public let subject: [String]
     public let owner: Owner
     public let lifecycle: CapabilityLifecycle.Action?
-    /// Cannot be taken back once done, even when it is hers.
+    /// Irreversible effects remain irreversible under Full Mac.
     public let irreversible: Bool
-    /// What it is when it does not read: a write, a send, or destructive (no way back).
     public let toolClass: ToolClass
-    /// Moves User's screen or makes a sound.
+    /// Screen and sound effects require the user's attention fences.
     public let screen: Bool
-    /// What she must know before doing it, shown on its line.
     public let warn: String
-    /// The code it runs (`runFolded`), and the input that picks the verb.
     public let tool: String
     public let input: [String: JSONValue]
     /// Door arg name → the host call's own input key, where the two differ.
@@ -78,8 +68,8 @@ public struct AppAction: Sendable {
     public let readWhen: [String: JSONValue]
     /// Advisory reads replay their saved answer rather than a new ranking or sampling.
     public let advisory: Bool
-    /// A skill call needing no app-page version: an append, an idempotent named change, or a pinned tool contract whose target is not that
-    /// page. Decided per action, with the reason on its entry.
+    /// A skill call needing no app-page version: an append, an idempotent named change, or a pinned tool contract whose target is not that page. Decided per
+    /// action, with the reason on its entry.
     public let versionExempt: Bool
     /// Bump for behavior changes, including result semantics, without a schema change.
     public let revision: Int
@@ -87,24 +77,29 @@ public struct AppAction: Sendable {
     public let capabilities: Set<String>
     public let resultSchema: JSONValue
 
-    init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], subject: [String] = [], owner: Owner = .hers,
-         irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .hers, capabilities: Set<String>? = nil,
+    init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], subject: [String] = [], owner: Owner = .agent,
+         irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .agent, capabilities: Set<String>? = nil,
          screen: Bool = false, warn: String = "", tool: String = "",
          input: [String: JSONValue] = [:], rename: [String: String] = [:], read: Bool = false,
          versionExempt: Bool = false, revision: Int = 1, readWhen: [String: JSONValue] = [:], scope: String = "",
          advisory: Bool = false, resultSchema: JSONValue = AppActions.resultEnvelope,
          lifecycle: CapabilityLifecycle.Action? = nil, schema: LLMToolSchema? = nil, partAction: Bool = false,
          part: String? = nil, folded: Bool = false) {
-        // A door action is a read when it says read:, else a write; it writes the app's own data unless it says otherwise.
+        // Without an explicit class, read declares a read; other actions write app-owned data by default.
         let toolClass = toolClass ?? (read ? .read : .write)
+        // A folded action runs its host tool, so it answers to that tool's schema and door names unless it declares its own.
+        let schema = schema ?? (folded ? AppActions.foldSchemas[tool] : nil)
+        let hostNames = folded ? Dictionary(uniqueKeysWithValues: (ToolNameAliases.doorArgNames[tool] ?? [:]).map { ($0.value, $0.key) }) : [:]
         self.id = id; self.page = AppDoorNames.resolve(page); self.label = label; self.args = args; self.subject = subject; self.owner = owner
         self.irreversible = irreversible; self.toolClass = toolClass; self.screen = screen; self.warn = warn; self.tool = tool
-        self.input = input; self.rename = rename; self.read = read
+        self.input = input; self.rename = hostNames.merging(rename) { _, declared in declared }; self.read = read
         self.versionExempt = versionExempt
         self.revision = revision
         self.readWhen = readWhen
-        self.returnedScope = [scope, schema.map { ToolNameAliases.foldedProse(AppActions.argumentProse($0.description, tool: tool)) } ?? ""].filter { !$0.isEmpty }.joined(separator: " ")
-        self.scope = [scope, args.joined(separator: " "), schema?.description ?? "", schema.map { String(decoding: $0.parametersJSON, as: UTF8.self) } ?? ""].filter { !$0.isEmpty }.joined(separator: " ")
+        self.returnedScope = [scope, schema.map { ToolNameAliases.foldedProse(AppActions.argumentProse($0.description, tool: tool)) } ?? ""]
+            .filter { !$0.isEmpty }.joined(separator: " ")
+        self.scope = [scope, args.joined(separator: " "), schema?.description ?? "", schema.map { String(decoding: $0.parametersJSON, as: UTF8.self) } ?? ""]
+            .filter { !$0.isEmpty }.joined(separator: " ")
         self.schema = schema
         self.partAction = partAction
         self.part = part
@@ -119,14 +114,15 @@ public struct AppAction: Sendable {
     /// A folded tool runs under its own gates and Trust key. Omitted label and args come from its schema.
     static func fold(_ tool: String, _ page: String, id: String? = nil, _ label: String? = nil, _ args: [String]? = nil,
                      input: [String: JSONValue] = [:], read: Bool = false,
-                     irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .hers, capabilities: Set<String> = ["safe_read", "tool_call"], screen: Bool = false,
+                     irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .agent, capabilities: Set<String> = ["safe_read", "tool_call"],
+                         screen: Bool = false,
                      warn: String = "", schema: LLMToolSchema? = nil, versionExempt: Bool = false,
                      readWhen: [String: JSONValue] = [:], advisory: Bool = false,
                      resultSchema: JSONValue = AppActions.resultEnvelope, lifecycle: CapabilityLifecycle.Action? = nil) throws -> AppAction {
-        // A fold is a read when it says read:, else a write; it carries the door's own capabilities unless it says otherwise.
+        // Without an explicit class, read declares a read; other folds write with the door's default capabilities.
         let toolClass = toolClass ?? (read ? .read : .write)
         let schema = schema ?? AppActions.foldSchemas[tool]
-        // Its args by the door's names (`ToolNameAliases.doorArgNames`), each renamed back as it runs.
+        // Declared args take the door's names; init's rename maps them back to the host call's.
         let names = ToolNameAliases.doorArgNames[tool] ?? [:]
         func door(_ arg: String) -> String {
             let end = arg.firstIndex { $0 == "?" || $0 == ":" } ?? arg.endIndex
@@ -138,30 +134,27 @@ public struct AppAction: Sendable {
                          declaredArgs,
                          irreversible: irreversible, toolClass: toolClass, reach: reach, capabilities: capabilities,
                          screen: screen, warn: warn, tool: tool, input: input,
-                         rename: Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) }),
                          read: read, versionExempt: versionExempt, readWhen: readWhen,
                          advisory: advisory, resultSchema: resultSchema, lifecycle: lifecycle, schema: schema, folded: true)
     }
 
-    public var isHis: Bool { if case .his = owner { true } else { false } }
-    /// What running it is: a read, a folded tool's declared class, or its own.
+    public var isPersonOwned: Bool { if case .person = owner { true } else { false } }
     var reaches: ToolClass { read ? .read : folded ? schema?.toolClass ?? toolClass : toolClass }
-    /// A row declares whether it runs as its tool; parts retain their own identity.
+    /// Parts retain their own identity when a row declares a tool call.
     public var isFold: Bool { folded || authored }
-    /// A tool she wrote, by its own name or as a part's action: a program, not a native call.
+    /// Authored tools run as programs, not native calls.
     public var authored: Bool { partAction || ToolNameAliases.authoredTool(id) == tool }
-    /// One of an inline card's buttons, not the composer (`AppToolExecutor.runCardAction`).
+    /// Inline card buttons use runCardAction, independently of the composer.
     public var isCard: Bool { tool == "interaction_act" && input["target"] == nil }
     var isItemRead: Bool { tool == "app_page_read" && input["item"] != nil }
 
-    /// Declared credential args (`:secret`). SecurityCenter's records and the transcript redact them; typed text is redacted at the
-    /// injection boundary.
+    /// Declared credential args (`:secret`). SecurityCenter's records and the transcript redact them; typed text is redacted at the injection boundary.
     public var secretArgs: [String] {
         zip(args, argSpecs).filter { $0.0.hasSuffix(":secret") }.flatMap { $0.1.names }
     }
 
     public var binding: AppActionBinding {
-        AppActionBinding(isHis: isHis, irreversible: irreversible, read: read, secretArgs: secretArgs,
+        AppActionBinding(isPersonOwned: isPersonOwned, irreversible: irreversible, read: read, secretArgs: secretArgs,
                          readWhen: readWhen, lifecycle: lifecycle, subject: subject,
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
@@ -173,8 +166,7 @@ public struct AppAction: Sendable {
         binding.readOnly(args: args) || AuthoredToolEffects.shellReadOnly(tool, input: args)
     }
 
-    /// Admission uses declared reach; a run's receipt uses its actual calls. The broker's per-call read class wins over broad ability
-    /// permissions.
+    /// Admission uses declared reach; a run's receipt uses its actual calls. The broker's per-call read class wins over broad ability permissions.
     func effectFields(args: [String: JSONValue] = [:], result: [String: JSONValue] = [:]) -> [String: JSONValue] {
         var read = readOnly(args: args)
         var irreversible = irreversible
@@ -188,10 +180,11 @@ public struct AppAction: Sendable {
             }
         }
         return ["read_only": .bool(read), "irreversible": .bool(irreversible),
-                "effect": .string(id == "ability.validate" ? "none" : read ? "read" : part != nil || authored ? "part" : irreversible ? "irreversible" : "write")]
+                "effect": .string(id == "ability.validate" ? "none" : read ? "read" : part != nil || authored ? "part" : irreversible ? "irreversible"
+                    : "write")]
     }
 
-    /// `id(args) label`, then what User needs to know about it. The id with its argument names, nothing else: what a compact page row shows.
+    /// Compact rows show the id and argument names with the user's required context.
     public var signature: String { args.isEmpty ? id : "\(id)(\(args.joined(separator: ", ")))" }
 
     public var line: String {
@@ -201,8 +194,8 @@ public struct AppAction: Sendable {
         if !warn.isEmpty { text += " · \(warn)" }
         // Only while Simple view is on screen does showing a page change the view itself.
         if id == "page.show", SimpleViewMode.isShowing { text += " · " + SimpleViewMode.noPagesNote }
-        if case .his(let why, let instead) = owner {
-            // Under Full Mac it is hers, unless it needs User himself (no tool runs it).
+        if case .person(let why, let instead) = owner {
+            // Full Mac admits owner actions unless the action requires the person directly.
             text += (tool.isEmpty ? " · the owner's: " : " · the owner's below Full Mac: ") + why
                 + (instead.map { ". Instead: \($0)" } ?? "")
         }
@@ -217,7 +210,6 @@ public struct AppAction: Sendable {
                                           with: "(\((required + ["…"]).joined(separator: ", ")))")
     }
 
-    /// Each arg's accepted names, and whether it may be left out.
     var argSpecs: [(names: [String], optional: Bool)] {
         args.map { raw in
             let head = raw.split(separator: ":", maxSplits: 1).first.map(String.init) ?? raw

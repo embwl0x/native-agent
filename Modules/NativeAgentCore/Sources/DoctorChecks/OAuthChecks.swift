@@ -1,10 +1,9 @@
 import Foundation
 import ProviderRouting
 import PersistenceCore
-// Blueprint: | `OAuthChecks.swift` | OAuthTokenExpiryCheck measures credentials through their owners; inspection never exchanges tokens and scoped repair refreshes only expired refreshable credentials |
+// Blueprint: | `OAuthChecks.swift` | Owner-measured credential expiry; inspection never exchanges; repair refreshes expired credentials |
 
-/// Expiry repair delegates to the credential's runtime owner. Inspection never exchanges tokens; safe repair refreshes only
-/// expired, refreshable credentials.
+/// Inspection never exchanges tokens; only the credential's owner may repair expired refreshable credentials.
 public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
     public let id = "oauth_token_expiry"
     public let title = "OAuth Token Expiry"
@@ -82,8 +81,7 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
                     asks.append(credential.signIn(root))
                     continue
                 }
-                // Refreshable is normal (it renews on next use): not a finding, or she reads it as signed out and asks User to
-                // sign in again.
+                // Refreshable tokens renew on use; reporting them as signed out would provoke an unnecessary sign-in.
                 guard repair else {
                     refreshable = true
                     continue
@@ -126,7 +124,7 @@ public struct OAuthTokenExpiryCheck: RepairingDoctorCheck {
         return CheckResult(source: credentialList.map { $0.path.path }.joined(separator: ", "), id: id, title: title,
                            status: unreadable ? "fail" : findings.isEmpty ? "ok" : "warn",
                            detail: parts.joined(separator: "; ") + ".",
-                           harm: asks.isEmpty ? nil : "She cannot keep using the affected services without renewed access.",
+                           harm: asks.isEmpty ? nil : "The agent cannot keep using the affected services without renewed access.",
                            repair: refreshable ? DoctorSafeRepairPolicy.oauthRefreshInstruction : nil,
                            receipt: repaired.isEmpty ? nil : "Repaired: refreshed \(repaired.joined(separator: ", ")).",
                            repairApplied: !repaired.isEmpty,

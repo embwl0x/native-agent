@@ -4,8 +4,7 @@ import PersistenceCore
 import TurnTrace
 // Blueprint: | `TelegramRichMessage.swift` | `TelegramInputRichBlock` enum |
 
-/// Typed subset of Bot API 10.2 rich blocks that improves ordinary assistant
-/// replies without exposing provider traces or requiring a second UI surface.
+/// Typed subset of Bot API 10.2 rich blocks that improves ordinary assistant replies without exposing provider traces or requiring a second UI surface.
 public indirect enum TelegramInputRichBlock: Sendable, Equatable {
     case paragraph(String)
     case heading(text: String, size: Int)
@@ -81,19 +80,15 @@ public struct TelegramInputRichMessage: Sendable, Equatable {
     }
 }
 
-/// Pure, bounded renderer. Its only input is the already-user-visible
-/// assistant reply. It strips explicit reasoning containers defensively and
-/// runs the same secret redactor used by turn traces before building blocks.
+/// Render only user-visible replies; strip reasoning containers and redact secrets before building blocks.
 enum TelegramRichMessageRenderer {
-    // Bot API rich limits: 32768 UTF-8 bytes, 500 nested blocks/rows,
-    // 16 nesting levels and 20 table columns. Keep payload headroom.
+    // Bot API rich limits: 32768 UTF-8 bytes, 500 nested blocks/rows, 16 nesting levels and 20 table columns. Keep payload headroom.
     static let maximumUTF8Bytes = 30_000
     static let maximumBlocks = 256
     static let maximumBlockUnits = 480
     static let maximumTableColumns = 20
 
-    /// Split at native block boundaries, retaining every visible text fragment.
-    /// A draft uses the latest packet; final delivery persists all packets.
+    /// Split at native block boundaries, retaining every visible text fragment. A draft uses the latest packet; final delivery persists all packets.
     static func render(_ raw: String) -> [TelegramInputRichMessage] {
         let safe = sanitize(raw)
         guard !safe.isEmpty else { return [] }
@@ -130,8 +125,7 @@ enum TelegramRichMessageRenderer {
                     let fragments = cells.map {
                         textChunks($0.text, maximumBytes: maximumBytes / columnsPerBlock)
                     }
-                    // Continue oversized cell text in the same column; no text
-                    // is dropped to make a wide or long table fit a packet.
+                    // Continue oversized cell text in the same column; no text is dropped to make a wide or long table fit a packet.
                     for part in 0..<max(1, fragments.map(\.count).max() ?? 0) {
                         let continued = cells.enumerated().map { index, cell in
                             TelegramInputRichTableCell(
@@ -154,8 +148,7 @@ enum TelegramRichMessageRenderer {
             }
             return result
         case .details(let summary, let children):
-            // A deeply nested summary can consume its parent's remaining text
-            // budget. Preserve its text and children as native sibling blocks.
+            // A deeply nested summary can consume its parent's remaining text budget. Preserve its text and children as native sibling blocks.
             guard maximumBytes >= 8, maximumUnits >= 2 else {
                 return split(.paragraph(summary), maximumBytes: maximumBytes, maximumUnits: maximumUnits)
                     + children.flatMap { split($0, maximumBytes: maximumBytes, maximumUnits: maximumUnits) }
@@ -239,8 +232,7 @@ enum TelegramRichMessageRenderer {
     }
 
     private static let boldExpression = try? NSRegularExpression(pattern: #"\*\*(?=\S)(.+?)(?<=\S)\*\*"#)
-    // Opens at start/after space or an opening bracket/quote; closes before
-    // space, punctuation or end. A / or . beside a star never counts (globs).
+    // Opens at start/after space or an opening bracket/quote; closes before space, punctuation or end. A / or . beside a star never counts (globs).
     private static let italicExpression = try? NSRegularExpression(
         pattern: #"(?<![^\s(\[{"'“‘])\*(?=[^\s*/.])(.+?)(?<=[^\s*/.])\*(?![^\s,;:!?)\]}"'”’])"#
     )
@@ -273,7 +265,6 @@ enum TelegramRichMessageRenderer {
                     }
                     return part
                 }
-            // Paired backticks (odd part count) are inline code: drop them.
             return cleaned.joined(separator: parts.count.isMultiple(of: 2) ? "`" : "")
         }.joined(separator: "\n")
     }

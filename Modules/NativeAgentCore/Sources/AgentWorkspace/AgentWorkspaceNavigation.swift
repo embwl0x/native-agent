@@ -7,10 +7,8 @@ import MemoryV2
 import NotificationInbox
 import Desk
 import StandingBots
-import WorkshopExecution
-import SwarmRuns
 import NativeAgentShared
-// Blueprint: | `AgentWorkspaceNavigation.swift` | Shared `AgentWorkspaceNavigation` actor requires data root and scope to restore each `Session`'s conversation arrangement and last undo receipt, never in a second ledger |
+// Blueprint: | `AgentWorkspaceNavigation.swift` | `AgentWorkspaceNavigation`, `Session`: root/scope-bound arrangement; no duplicate ledger |
 
 /// Bounded per-chat navigation persists references and supported drafts; live buttons, grants and evidence stay disposable.
 package actor AgentWorkspaceNavigation {
@@ -50,11 +48,11 @@ package actor AgentWorkspaceNavigation {
     }
     var sessions: [String: Session] = [:]
     private let capacity = 64
-    func begin(key: String, dataRoot: URL, scope: String) throws -> UUID {
+    func begin(workspace: WorkspaceOperation, key: String, dataRoot: URL, scope: String) throws -> UUID {
         if sessions[key]?.operation != nil {
             throw AgentWorkspaceFailure(message: "This workspace is already handling an action. No second action was started.")
         }
-        var session = try session(key: key, dataRoot: dataRoot, scope: scope)
+        var session = try session(workspace: workspace, key: key, dataRoot: dataRoot, scope: scope)
         let operation = UUID()
         session.operation = operation
         session.touched = Date()
@@ -63,16 +61,19 @@ package actor AgentWorkspaceNavigation {
         return operation
     }
 
-    private func session(key: String, dataRoot: URL, scope: String) throws -> Session {
+    private func session(workspace: WorkspaceOperation, key: String, dataRoot: URL, scope: String) throws -> Session {
         if sessions[key] == nil, sessions.count >= capacity {
             guard let oldest = sessions.filter({ $0.value.operation == nil && canEvict($0.value) }).min(by: { $0.value.touched < $1.value.touched }) else {
-                throw AgentWorkspaceFailure(message: "Resident workspaces contain unsaved or temporary drafts. Return to an existing chat to finish or discard a draft before opening another. Nothing was evicted.")
+                throw AgentWorkspaceFailure(message: """
+                    Resident workspaces contain unsaved or temporary drafts. Return to an existing chat to finish or discard a draft before opening another. \
+                    Nothing was evicted.
+                    """)
             }
             sessions.removeValue(forKey: oldest.key)
-            HerNamed.shared.removeSession(oldest.key)
-            HerItemPages.shared.removeSession(oldest.key)
+            AgentNamed.shared.removeSession(oldest.key)
+            AgentItemPages.shared.removeSession(oldest.key)
         }
-        return sessions[key] ?? restoredSession(dataRoot: dataRoot, scope: scope)
+        return sessions[key] ?? restoredSession(workspace: workspace, dataRoot: dataRoot, scope: scope)
     }
 
     package func undoReceipt(dataRoot: URL, scope: String) -> JSONValue? {
@@ -83,17 +84,17 @@ package actor AgentWorkspaceNavigation {
         sessions[dataRoot.standardizedFileURL.path + "\u{0}" + scope]?.lastDoorPage
     }
 
-    package func rememberDoorPage(_ page: String?, dataRoot: URL, scope: String) throws {
+    package func rememberDoorPage(workspace: WorkspaceOperation, _ page: String?, dataRoot: URL, scope: String) throws {
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
-        var session = try session(key: key, dataRoot: dataRoot, scope: scope)
+        var session = try session(workspace: workspace, key: key, dataRoot: dataRoot, scope: scope)
         session.lastDoorPage = page
         session.touched = Date()
         sessions[key] = session
     }
 
-    package func rememberUndo(_ receipt: JSONValue, dataRoot: URL, scope: String) throws {
+    package func rememberUndo(workspace: WorkspaceOperation, _ receipt: JSONValue, dataRoot: URL, scope: String) throws {
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
-        var session = try session(key: key, dataRoot: dataRoot, scope: scope)
+        var session = try session(workspace: workspace, key: key, dataRoot: dataRoot, scope: scope)
         session.lastUndoReceipt = receipt
         session.touched = Date()
         sessions[key] = session
@@ -119,7 +120,10 @@ package actor AgentWorkspaceNavigation {
               let button, !button.consumed, !button.retired else {
             var next: [String: JSONValue] = [:]
             if let name = button?.viewName { next["item"] = .string(name) }
-            throw ToolFailureError("That reference is expired, consumed or no longer in this view. Nothing was repeated; entered form values remain. Open next_call for current controls.",
+            throw ToolFailureError("""
+                That reference is expired, consumed or no longer in this view. Nothing was repeated; entered form values remain. Open next_call for current \
+                controls.
+                """,
                 argumentPath: "item", effects: .none, nextCall: ToolFailureError.call("app", next))
         }
         // Claim before dispatch so a lost send response cannot repeat the same button.
@@ -132,7 +136,6 @@ package actor AgentWorkspaceNavigation {
     func toggleControls(key: String) { sessions[key]?.controlsExpanded.toggle() }
     func beginWindowSwitch(key: String) { sessions[key]?.switchingWindow = true }
 
-    /// The pages this conversation holds, current one first.
     func browserPages(key: String) -> [AgentWorkspaceLocation] {
         guard let session = sessions[key] else { return [] }
         var pages: [AgentWorkspaceLocation] = []
@@ -144,7 +147,7 @@ package actor AgentWorkspaceNavigation {
         return pages.filter { if case .browserBookmark(_, _, let tab?) = $0 { !ChromePageMirror.isClosed(tab) } else { true } }
     }
 
-    /// An explicitly closed tab leaves this chat's windows and home.
+    /// Explicit closure removes a tab from this chat's windows and Home.
     package func forgetTab(tab: Int64, key: String) {
         guard var session = sessions[key] else { return }
         // Remove only the window and bookmark recorded for this tab.
@@ -187,7 +190,11 @@ package actor AgentWorkspaceNavigation {
         let oldPlaces = session.arrangement.places, oldWatched = session.watched
         if case .form(let form) = location {
             guard session.arrangement.drafts.contains(where: { $0.draftID == form.draftID }) || session.arrangement.drafts.count < 4 else {
-                throw AgentWorkspaceFailure(message: "Four unfinished drafts are already open. Open places to finish or discard one before starting another; existing drafts were preserved.")
+                throw AgentWorkspaceFailure(
+                    message: """
+                        Four unfinished drafts are already open. Open places to finish or discard one before starting another; existing drafts \
+                        were preserved.
+                        """)
             }
             session.arrangement.drafts.removeAll { $0.draftID == form.draftID }
             session.arrangement.drafts.append(form)
@@ -267,12 +274,14 @@ package actor AgentWorkspaceNavigation {
             case "screen": return "screen:" + (input["app"].flatMap { if case .string(let app) = $0 { return app }; return nil } ?? "frontmost")
             case "bot_list": target = "id"
             case "mac_calendar_list_upcoming":
-                do { return tool + ":" + (try ["day", "calendar_name", "calendar_id", "hours_ahead"].map { try (input[$0] ?? .null).serialize(pretty: false) }.joined(separator: "\u{0}")) }
+                do { return tool + ":" + (try ["day", "calendar_name", "calendar_id", "hours_ahead"].map { try (input[$0] ?? .null).serialize(pretty: false) }
+                    .joined(separator: "\u{0}")) }
                 catch { return nil }
             case "mac_reminders_list_due_today": return tool
             case "mac_reminders_read": target = "id"
             case "mac_reminders_query":
-                do { return tool + ":" + (try ["query", "list_name", "due_start", "due_end", "undated_only", "include_completed", "offset"].map { try (input[$0] ?? .null).serialize(pretty: false) }.joined(separator: "\u{0}")) }
+                do { return tool + ":" + (try ["query", "list_name", "due_start", "due_end", "undated_only", "include_completed", "offset"].map { try (
+                    input[$0] ?? .null).serialize(pretty: false) }.joined(separator: "\u{0}")) }
                 catch { return nil }
             case "mail_search": target = "query"
             case "messages_recent_threads": target = "thread_id"
@@ -395,12 +404,12 @@ package actor AgentWorkspaceNavigation {
         return current(key: key)
     }
 
-    func present(_ projection: WorkspacePage, key: String, outcome: JSONValue) -> JSONValue {
-        let projection = AgentWorkspaceReadiness.filter(projection)
+    func present(workspace: WorkspaceOperation, _ projection: WorkspacePage, key: String, outcome: JSONValue) -> JSONValue {
+        let projection = AgentWorkspaceReadiness.filter(workspace: workspace, projection)
         guard var session = sessions[key] else { return .object(["status": .string("unavailable")]) }
         session.retireButtons()
         session.issuedAt = Date()
-        // Retired references keep their names within the bound; the session counter never reuses an id.
+        // Retain reference names within the bound; never reuse the session's issued IDs.
         if session.buttonPrefix.isEmpty {
             session.buttonPrefix = String((0..<4).map { _ in "abcdefghijkmnpqrstuvwxyz23456789".randomElement()! })
         }
@@ -507,7 +516,7 @@ package actor AgentWorkspaceNavigation {
             "windows": .array(windows),
             "total_items": .int(Int64(projection.items.count)), "page": .int(Int64(projection.page))
         ]
-        // Honest counts: a capped list says how much of it this is.
+        // Capped lists must disclose the visible portion.
         let total = projection.items.count, first = projection.page * 8
         if total > 8 || projection.page > 0 {
             frame["showing"] = .string("items \(min(total, first + 1))–\(min(total, first + 8)) of \(total)"
@@ -538,10 +547,9 @@ package actor AgentWorkspaceNavigation {
             if case .form(let form)? = session.arrangement.path.last { value.viewName = form.lastingName }
             else if let place = session.arrangement.path.last, place != .home {
                 value.viewName = Self.recognizedPlaces(session).contains(place)
-                    ? Self.windowReference(place) : HerScreen.textRoomName(place)
+                    ? Self.windowReference(place) : AgentScreen.textRoomName(place)
             }
             session.buttons[id] = value
-            // An item of home's: app {item: id}, with args.text when it needs text.
             rendered.append(.object(["label": .string(String(value.label.prefix(200))),
                 "item": .string(id), "needs_text": .bool(value.needsText)]))
         }

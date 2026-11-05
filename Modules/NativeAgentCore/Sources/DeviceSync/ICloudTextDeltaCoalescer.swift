@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ICloudTextDeltaCoalescer.swift` | Accumulates each nonempty delta into an immediate full-text snapshot; transport mailboxes conflate unsent snapshots without a time or character hold; sequences rise with the clock, so a restarted run's new snapshots outrank its old ones on the phone |
+// Blueprint: | `ICloudTextDeltaCoalescer.swift` | Immediate full snapshots; clock sequences outrank prior runs. |
 
 struct ICloudTextDeltaFlush: Equatable, Sendable {
     enum Reason: String, Sendable {
@@ -16,11 +16,8 @@ struct ICloudTextDeltaCoalescer: Sendable {
     private(set) var sequence: Int = 0
     private(set) var text: String = ""
 
-    /// The retained transport worker replaces unsent full snapshots. Intake
-    /// never waits for a send, more characters, a timer or the next tool call.
-    /// The phone keeps only snapshots above the highest sequence it has seen
-    /// for a run; a run restarted under the same id gets a fresh coalescer, so
-    /// sequences follow the clock (milliseconds) and never fall back to 1.
+    /// Intake cannot await publication; the phone accepts only increasing sequences for a run. Millisecond clock sequences let a restarted run outrank its
+    /// prior snapshots.
     mutating func push(delta: String) -> ICloudTextDeltaFlush? {
         guard !delta.isEmpty else { return nil }
         let first = text.isEmpty

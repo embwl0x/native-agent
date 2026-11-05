@@ -2,7 +2,7 @@ import NativeAgentShared
 import Cognition
 import Foundation
 
-// Blueprint: | `CognitionObservatoryView+Affect.swift` | Observatory affect presentation: snapshot axes and warmth context distinguish disabled/unavailable evidence from real zero |
+// Blueprint: | `CognitionObservatoryView+Affect.swift` | Affect axes distinguish unavailable evidence from zero |
 
 import SwiftUI
 import CognitiveSubstrate
@@ -39,9 +39,7 @@ extension CognitionObservatoryView {
     }
 }
 
-/// Read-only presentation contract for the Observatory's Affect Signals panel.
-/// The substrate owns the axes; this layer only prevents a missing or disabled
-/// read from being rendered as a calm-looking zero.
+/// Keep missing and disabled substrate axes distinct from a measured calm zero.
 struct CognitionObservatoryAffectPresentation: Equatable, Sendable {
     struct Axis: Equatable, Sendable {
         let label: String

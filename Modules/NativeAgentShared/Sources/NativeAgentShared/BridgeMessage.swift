@@ -1,8 +1,7 @@
-// BridgeMessage.swift — shared wire format for iCloud chat channel
 import Foundation
 import CryptoKit
 
-// Blueprint: | `BridgeMessage.swift` | `BridgeMessage`: shared signed device envelope, canonical HMAC body, exact reply correlation and inner approval signature validation |
+// Blueprint: | `BridgeMessage.swift` | `BridgeMessage`: signed device envelope, exact reply correlation and inner HMAC |
 
 // MARK: - Message model (shared wire format for outbox JSON files)
 
@@ -12,21 +11,13 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
     public let timestamp: Date
     public let text: String
     public let sessionID: String?
-    /// Reply correlation. Mac replies set this to the original iOS message id
-    /// so iOS updates the correct pending bubble even when replies arrive late
-    /// or out of order.
+    /// The original iOS message ID keeps late or out-of-order replies on the correct pending bubble.
     public let correlationID: String?
-    /// Optional small string metadata for the remote surface. This is kept
-    /// intentionally tiny so chat can carry controls without turning the
-    /// iCloud message into a general-purpose config blob.
+    /// Keep control metadata tiny so the chat envelope cannot become a general-purpose config blob.
     public let metadata: [String: String]?
-    /// Optional multimodal attachments for the chat turn. Used by the iOS
-    /// companion to send camera-roll images through iCloud to the Mac.
     public let attachments: [MultimodalAttachment]?
-    /// HMAC-SHA256 (lowercase hex) over canonical JSON body
-    /// (keys sorted, "signature" key excluded). Nil while constructing a
-    /// message and for the narrowly validated unsigned pairing resync hint;
-    /// receivers reject unsigned action and conversation envelopes.
+    /// HMAC-SHA256 (lowercase hex) over canonical JSON body (keys sorted, "signature" key excluded). Nil while constructing a message and for the
+    /// narrowly validated unsigned pairing resync hint; receivers reject unsigned action and conversation envelopes.
     public var signature: String?
 
     public static func make(
@@ -42,7 +33,9 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         BridgeMessage(
             id: id,
             sender: sender,
-            timestamp: timestamp,
+            // A message's time is whole seconds: the signature and the record carry it in different encoders, and a time in the last
+            // half-millisecond of a second rounds into the next one in one of them, so the receiver would find a valid signature wrong.
+            timestamp: Date(timeIntervalSinceReferenceDate: timestamp.timeIntervalSinceReferenceDate.rounded(.down)),
             text: text,
             sessionID: sessionID,
             correlationID: correlationID,
@@ -52,8 +45,7 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         )
     }
 
-    /// Canonical JSON body used for HMAC computation: keys sorted, signature
-    /// excluded. Identical on both Mac and iOS sides.
+    /// Both platforms sign identical bytes: sorted JSON keys, excluding the signature.
     public func canonicalBodyForSigning() throws -> Data {
         var body: [String: Any] = [
             "id":        id,
@@ -88,7 +80,6 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     }
 
-    /// Compute HMAC over canonical body using `secret`. Returns lowercase hex.
     public static func hmacHex(of canonical: Data, secret: Data) -> String {
         let key = SymmetricKey(data: secret)
         let mac = HMAC<SHA256>.authenticationCode(for: canonical, using: key)
@@ -113,10 +104,9 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     }
 
-    /// The inner action envelope signs sorted JSON with its signature removed.
-    /// Its case-insensitive hex rule is distinct from the outer message's wire rule.
+    /// The inner action envelope signs sorted JSON with its signature removed. Its case-insensitive hex rule is distinct from the outer message's
+    /// wire rule.
     public static func innerActionSignatureError(data: Data, signature sig: String, secret: () throws -> Data) -> String? {
-        // Reject wrong-format signatures before computing HMAC.
         let hexChars = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
         if sig.count != 64 || sig.unicodeScalars.contains(where: { !hexChars.contains($0) }) {
             return "signature wrong format (expected 64 hex chars, got \(sig.count) chars)"
@@ -136,10 +126,9 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         if !constantTimeEqual(sigLower, expected) {
             return "HMAC mismatch — possible tampering or wrong pairing secret"
         }
-        return nil // valid
+        return nil
     }
 
-    /// Returns a copy of self with `signature` populated.
     public func signed(with secret: Data) throws -> BridgeMessage {
         let canonical = try canonicalBodyForSigning()
         var out = self
@@ -147,9 +136,7 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         return out
     }
 
-    /// Verify that the embedded signature matches an HMAC computed from this
-    /// message's canonical body. Returns false if the signature is missing
-    /// or doesn't match (constant-time comparison).
+    /// Missing or mismatched signatures fail verification; comparison must be constant-time.
     public func verifySignature(secret: Data) -> Bool {
         guard let sig = signature else { return false }
         do {
@@ -161,11 +148,9 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         }
     }
 
-    /// The only deliberately unsigned message accepted on the Mac→iOS wire.
-    /// It is a pairing wake-up, never a command: the receiver may refresh the
-    /// separately authenticated KVS material, but cannot infer an action,
-    /// session, attachment, or arbitrary metadata from this envelope.
-    /// Field names only: diagnostics must never print pairing material or payloads.
+    /// The only deliberately unsigned message accepted on the Mac→iOS wire. It is a pairing wake-up, never a command: the receiver may refresh the
+    /// separately authenticated KVS material, but cannot infer an action, session, attachment, or arbitrary metadata from this envelope. Field names
+    /// only: diagnostics must never print pairing material or payloads.
     public var unsignedResyncHintFailure: String? {
         let requiredKeys: Set<String> = [
             "kind",
@@ -186,8 +171,7 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         guard metadata["targetSourceKey"]?.isEmpty == false else { return "targetSourceKey" }
         guard let versionText = metadata["pairing_secret_version"],
               let version = Int(versionText), version >= 0 else { return "pairing_secret_version" }
-        // `publishedAt` may be empty when the KVS timestamp has not reached
-        // this Mac yet; the hint is still only a request to re-read KVS.
+        // `publishedAt` may be empty when the KVS timestamp has not reached this Mac yet; the hint is still only a request to re-read KVS.
         return nil
     }
 }
@@ -206,8 +190,7 @@ public struct ICloudTransactionRecord: Codable, Identifiable, Sendable {
     public var response: [String: String]?
     /// Bind the phone's potentially colliding transaction ID to its exact envelope; nil fields mean unbound.
     public var msgId: String?
-    /// SHA-256 over the action envelope's canonical body (sorted keys, the
-    /// `signature` key removed) — the same bytes the inner HMAC covers.
+    /// SHA-256 over the action envelope's canonical body (sorted keys, the `signature` key removed) — the same bytes the inner HMAC covers.
     public var actionDigest: String?
 
     public init(

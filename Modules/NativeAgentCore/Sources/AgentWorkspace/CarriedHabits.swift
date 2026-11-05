@@ -2,10 +2,10 @@ import Foundation
 import Desk
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CarriedHabits.swift` | `CarriedHabits`: bounded last-eight carried handling trials and measured model costs in mind/habits.json; the shared Expectation law offers a habit at most once per day, never binds it |
+// Blueprint: | `CarriedHabits.swift` | `CarriedHabits`: bounded trials; daily offers never bind |
+// Retain at most eight handling trials and measured costs; the shared Expectation law permits only one offer per day.
 
-/// Her handling, as lived in carried wake turns. This is evidence for a
-/// choice in the carried line, never another runner or an automatic binding.
+/// The agent's handling, as lived in carried wake turns. This is evidence for a choice in the carried line, never another runner or an automatic binding.
 package actor CarriedHabits {
     package static let shared = CarriedHabits()
     private struct Trial: Codable {
@@ -34,8 +34,7 @@ package actor CarriedHabits {
             try await SwiftNativePersistenceCore.withFileLock(url) {
                 var ledger = try Self.read(url), step = ledger.steps[handle] ?? Step()
                 guard !step.trials.contains(where: { $0.turn == turn }) else { return }
-                // An overlong handling is unknown, never a truncated sequence
-                // that could earn standing as though it were the whole turn.
+                // An overlong handling is unknown, never a truncated sequence that could earn standing as though it were the whole turn.
                 step.trials.append(Trial(turn: turn, handling: handling.count <= 64 ? handling : [], modelCalls: modelCalls, at: at))
                 step.trials = Array(step.trials.suffix(8))
                 ledger.steps[handle] = step
@@ -63,7 +62,7 @@ package actor CarriedHabits {
                     $0.count == $1.count ? ($0.last?.at ?? .distantPast) > ($1.last?.at ?? .distantPast) : $0.count > $1.count
                 }).first, let handling = hits.first?.handling else { return nil }
                 let cHit = Double(hits.reduce(0) { $0 + $1.modelCalls }) / Double(hits.count)
-                // One fruitless run plus the observed wake cost when it misses.
+                // Include wake cost with fruitless runs so a missed habit has an honest cost.
                 let cMiss = 1 + Double(record.trials.reduce(0) { $0 + $1.modelCalls }) / Double(record.trials.count)
                 guard Expectation.stands(hits: hits.count, tries: record.trials.count, cHit: cHit, cMiss: cMiss, among: nil).stands else { return nil }
                 record.offered = at; ledger.steps[item.handle] = record

@@ -40,8 +40,7 @@ enum NativeAgentRemoteNotificationPayload {
     }
 }
 
-/// Shared by the app and its notification service extension. Only display
-/// identity crosses the app group; pairing credentials stay in the Keychain.
+/// Only display identity crosses the shared app group; pairing credentials remain in Keychain.
 enum CommunicationNotification {
     private static var defaults: UserDefaults? {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "NativeAgentNotificationGroup") as? String else { return nil }
@@ -60,8 +59,7 @@ enum CommunicationNotification {
             throw NSError(domain: "CommunicationNotification", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "No paired sender identity has synced to this phone."])
         }
-        // No persona avatar currently ships on iOS. Use it when supplied in
-        // the shared resource catalog; never substitute the application icon.
+        // Use only the persona avatar from shared resources; the application icon is not the agent's identity.
         let avatar = UIImage(named: "AgentAvatar")?.pngData().map { INImage(imageData: $0) }
         let sender = INPerson(personHandle: INPersonHandle(value: "agent-\(pairing)", type: .unknown),
             nameComponents: nil, displayName: name, image: avatar, contactIdentifier: nil,

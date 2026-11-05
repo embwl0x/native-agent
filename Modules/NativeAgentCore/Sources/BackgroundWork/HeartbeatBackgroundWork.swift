@@ -1,3 +1,4 @@
+import AgentConversations
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -6,7 +7,6 @@ import DoctorChecks
 import PersistenceCore
 import Desk
 import ApprovalInbox
-import WorkshopExecution
 import AgentWorkspace
 import NotificationInbox
 import Privacy
@@ -17,21 +17,12 @@ public struct HeartbeatBackgroundWork: Sendable {
 
     public init(port: any BackgroundWorkNotificationPort) { self.port = port }
 
-    /// Health heartbeat driven by assessment-input changes and age crossings. Reads
-    /// `HEARTBEAT.md` from the persona dir, gathers a compact live signal
-    /// block (stuck executions / Full-Mac expiry / Doctor),
-    /// and surfaces deterministic anomalies as stable inbox cards. Clean
-    /// assessments make no notice; anomalies use their per-condition template. The checklist read,
-    /// assessment gather, and notice surface share this owner.
+    /// Keep checklist, live assessment and notice settlement in one owner so condition cards reflect the same reading.
     public func makeHeartbeatLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> HeartbeatLoop {
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        // Live-verify hook: a terminal-launched bundle can shrink the integrity interval
-        // (NATIVE_AGENT_HEARTBEAT_INTERVAL_SECONDS=60) to watch a real tick.
-        // The normal `open`-launched app never has this set → 12h integrity.
-        // Floor at 1s: interval ≤ 0 reaches Task.sleep(0) in the scheduler —
-        // a tight busy loop.
+        // A nonpositive interval reaches Task.sleep(0), causing a busy loop; floor it at one second.
         let configured = ProcessInfo.processInfo.environment["NATIVE_AGENT_HEARTBEAT_INTERVAL_SECONDS"]
         let parsed = configured.flatMap(TimeInterval.init)
         let valid = parsed.map { $0.isFinite && $0 >= 1
@@ -47,33 +38,31 @@ public struct HeartbeatBackgroundWork: Sendable {
             events: {
                 let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
                 let desk = SwiftNativeDeskStore(dataRoot: dataRoot)
-                let executions = dataRoot.appendingPathComponent("workshop/executions", isDirectory: true)
                 let workflows = dataRoot.appendingPathComponent("workflows/run_state", isDirectory: true)
                 func children(_ path: URL) -> [URL] {
                     do { return try FileManager.default.contentsOfDirectory(at: path, includingPropertiesForKeys: nil) }
                     catch CocoaError.fileReadNoSuchFile { return [] }
                     catch {
-                        let cause = "Heartbeat source watches are incompletely armed at \(path.path): \(error.localizedDescription). Repair directory access and reopen NativeAgent to rearm its child watches; the parent watch remains active."
+                        let cause = """
+                            Heartbeat source watches are incompletely armed at \(path.path): \(error.localizedDescription). Repair directory access and \
+                            reopen NativeAgent to rearm its child watches; the parent watch remains active.
+                            """
                         Task { await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: "heartbeat", outcome: .failed(error: cause)) }
                         return []
                     }
                 }
-                let executionFiles = children(executions).map { ExecutionRecordFile.canonicalPath(in: $0) }
                 let workflowFiles = children(workflows)
-                // Nested records created after subscription retain the 12h
-                // missed-event backstop; the vnode watcher is not recursive.
+                // The watcher is not recursive; retain the integrity pass for later-created nested records.
                 return EventDeadlinePhysiology.storeAndFileEvents(
                     paths: [personaRoot.appendingPathComponent("HEARTBEAT.md"),
                             dataRoot.appendingPathComponent("doctor/latest.json"),
                             ledger.eventsPath, ledger.basePath, desk.opsPath, desk.basePath,
-                            executions, workflows,
-                            dataRoot.deletingLastPathComponent().appendingPathComponent("docs/eval_acknowledgments.json")]
-                        + executionFiles + workflowFiles
-                        + ErrorFeeds.errorFeeds.map { $0.url(dataRoot: dataRoot) }
-                        + DelegationStatusProjector(dataRoot: dataRoot).watchedPaths,
+                            AgentJobStore(dataRoot: dataRoot).fileURL, workflows]
+                        + workflowFiles
+                        + ErrorFeeds.errorFeeds.map { $0.url(dataRoot: dataRoot) },
                     stores: [.desk],
                     notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
-                        DeskContinuationScheduler.ownerReceiptChanged],
+                        DeskContinuationScheduler.ownerReceiptChanged, LoopFailureReceipts.didWrite],
                     loopId: "heartbeat"
                 )
             },
@@ -96,7 +85,7 @@ public struct HeartbeatBackgroundWork: Sendable {
             }
         )
     }
-    internal let heartbeatExecutionStuckAge: TimeInterval = 6 * 60 * 60
+    internal let heartbeatJobStuckAge: TimeInterval = 6 * 60 * 60
     internal let heartbeatWorkflowStaleAge: TimeInterval = 60 * 60
     internal let heartbeatClaimStaleAge: TimeInterval = 24 * 60 * 60
     internal let heartbeatDeskStaleAge: TimeInterval = 30 * 24 * 60 * 60

@@ -5,7 +5,7 @@ import MemoryV2
 import Observation
 import PersistenceCore
 
-// Blueprint: | `NativeAgentAppCoordinator.swift` | `ApplicationLifetime`: process bootstrap and queued scene navigation including exact saved identities and chat shortcut panels; delivery receipts prove scene acceptance, not finished rendering or work |
+// Blueprint: | `NativeAgentAppCoordinator.swift` | `ApplicationLifetime`: bootstrap and scene navigation; delivery proves acceptance only |
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
@@ -41,6 +41,8 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
             return .skillsTools(.skills)
         case "desk":
             return .sidebar(.desk)
+        case "bots":
+            return .sidebar(.bots)
         case "personality":
             return .sidebar(.personality)
         case "connectors":
@@ -77,9 +79,7 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
     }
 }
 
-/// Receipt for accepting a navigation request. Delivery means that the mounted
-/// scene received the destination; it deliberately does not claim that the
-/// destination's UI has finished rendering or completed any work.
+/// Delivery proves mounted-scene acceptance only, never finished rendering or work.
 enum NativeAgentNavigationRequestReceipt: Equatable, Sendable {
     case deliveredToMountedScene
     case queuedForMainScene
@@ -119,7 +119,6 @@ final class ApplicationLifetime {
         deliver: (NativeAgentNavigationDestination) -> Void
     )?
 
-    /// Retain the scene's opening action so routing can reopen a closed window.
     func configureMainWindowOpening(_ open: @escaping @MainActor () -> Void) {
         openMainWindow = open
         if !pendingDestinations.isEmpty {
@@ -168,17 +167,9 @@ final class ApplicationLifetime {
             : .queuedForMainScene
     }
 
-    /// The same destination, with neither half of `request`'s window work.
-    ///
-    /// `request` activates the app and opens the main window, which is exactly
-    /// what quiet self-administration must never do. This hands the
-    /// destination to a scene that is ALREADY mounted and returns false if
-    /// there is none — it never queues, because a queued destination would
-    /// ambush the person the next time a window happened to open.
+    /// Quiet routing requires a mounted scene and never queues: a deferred route would interrupt the person when a window next opens.
     func deliverQuietly(_ destination: NativeAgentNavigationDestination) -> Bool {
         guard let deliver = mountedScene?.deliver else { return false }
-        // Explicit page.show selects an Advanced page. Ordinary chat entry
-        // uses request and keeps the person's saved view.
         UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key)
         deliver(destination)
         return true
@@ -219,10 +210,7 @@ final class ApplicationLifetime {
             Task { @MainActor in SettingsLink.open(.trust, tab: TrustTab.features.rawValue) }
             return nil
         }
-        // Inbox act → chat draft: the coordinator only activates the window and
-        // lands on Chat; ContentView's receiver does the draft injection.
         observe(.openChatDraftRequest) { _ in .sidebar(.chat) }
-        // The message is persisted; ContentView reloads it after navigation.
         observe(.openSpokenChatRequest) { _ in .sidebar(.chat) }
         observe(.openCommandRouteRequest) { note in
             NativeAgentNavigationDestination.route(note.object as? String)

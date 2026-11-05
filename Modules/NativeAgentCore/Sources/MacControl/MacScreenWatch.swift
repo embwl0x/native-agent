@@ -7,18 +7,12 @@ import PersistenceCore
 import ScreenCaptureKit
 import Senses
 import Synchronization
-// Blueprint: | `MacScreenWatch.swift` | One exact-window ScreenCaptureKit stream per part run, generation-bound frame queries and physical hands in same-owner extensions; person-only windows refused; each delivered frame awaits its complete secret-field inspection and masking; the newest pending capture survives inspection and its 500 ms interval and is inspected without another capture; incomplete inspection ends with an owned failure. Inspection work is retained; success and failure commit only while active, so expiry cancellation cannot cut admitted settlement short or create repair debt. Authority is checked at next/read/hand; window identity at each event. Terminal errors retain their cause; outside an enclosing act Experiences owns repair until an inspected frame from the same window/region arrives or it is let go. Duration stops capture and closes admission immediately; an admitted frame read or hand has up to 10s (the maximum hand duration) to settle before the retained frame and held input retire. Non-cooperative work retains its local frame until actual exit and cannot publish after retirement. Stop, window loss/resize, revocation, part change and takeover retire immediately. |
+// Blueprint: | `MacScreenWatch.swift` | Exact-window stream; complete secret masks precede publication; bounded settlement and immediate takeover |
 
-/// A part's eyes on one window for one run: one ScreenCaptureKit stream of
-/// that window's own pixels, its newest frame and the one before copied into
-/// buffers of its own, read in place. No frame byte leaves this object; a
-/// part asks a frame questions and gets numbers and redacted text back. Its
-/// hands turn frame pixels into screen points and go through the four verbs'
-/// physical tail on one driver binding held for the whole watch, so the person's input
-/// ends the watch and releases any key it holds.
+/// Keep frame pixels local; queries return only numbers and redacted text. One driver binding spans the watch, so person input ends its hands and releases held
+/// keys.
 public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    /// What a part asks to watch: an app's front window (or a region of it, in
-    /// window points), how often (`fps` 1...30) and for how long (at most 600 s).
+    /// Bound watch duration and frame rate to one selected window or region.
     public struct Request: Sendable {
         public let app: String
         public let fps: Int
@@ -47,18 +41,15 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         }
     }
 
-    /// The app door's way to open one for the part run it serves: its access,
-    /// its sight, and hands built under the access it has at each hand.
-    @TaskLocal public static var open: (@Sendable (Request, _ hands: Bool) async throws -> MacScreenWatch)?
+    public typealias Opener = @Sendable (Request, Bool) async throws -> MacScreenWatch
 
-    /// A refusal that is a receipt of its own: Screen control's card.
+    /// Retain Screen control’s refusal card as the receipt.
     public struct Refusal: Error, Sendable {
         public let receipt: JSONValue
         public init(receipt: JSONValue) { self.receipt = receipt }
     }
 
-    /// One frame: its pixels (secret fields painted out), the window's own
-    /// place on screen when it came, and the pixels of the frame before it.
+    /// Each frame retains masked pixels, observed window placement and the preceding pixels for comparisons.
     struct Frame {
         let seq: Int
         let at: Int
@@ -67,7 +58,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         let prior: [UInt8]?
     }
 
-    /// Only the newest capture waits; its preceding inspection masks travel with it.
+    /// Only the newest pending capture survives, with its own pre-inspection masks.
     struct Capture {
         let pixels: [UInt8]
         let window: MacAXFrame
@@ -75,26 +66,25 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         let at: Double
     }
 
-    /// Ties a frame handle to the watch that made it: a replacement watch never answers an old one.
+    /// Bind handles to their originating watch so replacements cannot answer old frame ids.
     public let generation: Int
     private static let generations = Mutex(0)
     public let width: Int
     public let height: Int
     let app: String
     private let dataRoot: URL
-    public var handRefusal: MacAppActRefusal? { MacAppActGate.refusal(pid: pid, dataRoot: dataRoot) }
-    private let enclosingAct = Experience.currentAct
+    public var handRefusal: MacAppActRefusal? { MacAppActGate.refusal(pid: pid, dataRoot: dataRoot, context: context) }
+    let turn: Turn
+    let context: MacOperationContext
     let pid: Int32
     let windowNumber: Int
-    /// The window's size in points; a resize ends the watch, since frame pixels
-    /// would then mean other places.
+    /// Resize ends the watch because existing pixel coordinates would address different places.
     private let size: (w: Double, h: Double)
-    /// What the frames cover, in window points from its top-left corner.
+    /// Region bounds stay relative to the watched window’s top-left corner.
     let region: MacAXFrame
     let sighting: MacFourVerbs.Sighting
     let verbs: (@Sendable () async throws -> MacFourVerbs)?
-    /// Screen control still allowed: Full Mac active and the accessibility
-    /// category on, as the four verbs read it.
+    /// Watch admission must use the four verbs’ current Full Mac and accessibility-category authority.
     private let authority: @Sendable () async throws -> Bool
     let binding: MacDriverBinding?
     let started = ProcessInfo.processInfo.systemUptime
@@ -112,36 +102,31 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     var queries = 0
     var hands = 0
     private var window: MacAXFrame
-    /// Password fields in window points from the latest complete inspection.
+    /// Hands use secret fields from the latest complete inspection.
     var secrets: [MacAXFrame]?
     var inspected: Double
     var inspectedSuccessfully = false
     private var settledRepair = false
-    /// Bumped whenever the secret fields change: a frame painted under older
-    /// verdicts is never kept or published.
+    /// Secret-verdict changes invalidate every frame painted under the older verdict.
     var verdict = 0
     var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     var ended: String?
     private var failure: SenseFailure?
-    /// Duration closes capture and admission immediately. A read or hand already
-    /// admitted has at most the maximum hand duration (10s) to settle. It then
-    /// drops the retained frame and releases held input. Every other end is at once.
+    /// Expiry closes admission immediately; admitted work gets at most ten seconds to settle before frames and held input are released.
     var spent = false
     private var operations = 0
 
-    /// How often the secret fields are read again while frames change: one
-    /// whole-window AX walk, the desktop picture's index, costs tens to a few
-    /// hundred milliseconds on a busy window, so it runs off the frame queue
-    /// at most every 500 ms. Each deliverable frame waits for its own complete
-    /// inspection; intervening captures replace the pending capture, which
-    /// is inspected when due even if the window then stays static.
+    /// Whole-window AX inspection is costly, so coalesce it off the frame queue at 500 ms intervals. Every deliverable frame awaits its own complete
+    /// inspection, including pending captures after the window becomes static.
     static let inspectionInterval = 0.5
     static let inspectionBudget = 0.5
 
     fileprivate init(app: String, dataRoot: URL, pid: Int32, window: SCWindow, region: MacAXFrame, width: Int, height: Int,
                      sighting: MacFourVerbs.Sighting, verbs: (@Sendable () async throws -> MacFourVerbs)?,
-                     authority: @escaping @Sendable () async throws -> Bool, binding: MacDriverBinding?) {
+                     authority: @escaping @Sendable () async throws -> Bool, binding: MacDriverBinding?, turn: Turn, context: MacOperationContext) {
         let frame = MacAXFrame(x: window.frame.minX, y: window.frame.minY, w: window.frame.width, h: window.frame.height)
+        self.turn = turn
+        self.context = context
         generation = Self.generations.withLock { $0 += 1; return $0 }
         self.app = app; self.dataRoot = dataRoot; self.pid = pid; self.windowNumber = Int(window.windowID)
         self.window = frame; self.size = (frame.w, frame.h)
@@ -155,15 +140,16 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
 
     static func start(app: String, dataRoot: URL, pid: Int32, window frame: MacAXFrame, sighting: MacFourVerbs.Sighting, request: Request,
                       verbs: (@Sendable () async throws -> MacFourVerbs)?,
-                      authority: @escaping @Sendable () async throws -> Bool) async throws -> MacScreenWatch {
+                      turn: Turn, context: MacOperationContext, authority: @escaping @Sendable () async throws -> Bool) async throws -> MacScreenWatch {
         guard CGPreflightScreenCaptureAccess() else {
-            throw SenseFailure(code: "screen_recording_not_trusted", message: "Screen Recording is off for NativeAgent. System Settings > Privacy & Security > Screen Recording > NativeAgent switch on.",
+            throw SenseFailure(code: "screen_recording_not_trusted",
+                message: "Screen Recording is off for NativeAgent. System Settings > Privacy & Security > Screen Recording > NativeAgent switch on.",
                                remedy: MacFourVerbsReply.privacyRemedy("screen_recording_not_trusted"))
         }
-        let content: SCShareableContent = try await macScreenCaptureWait { receive in
+        let content: SCShareableContent = try await macScreenCaptureWait(context: context) { receive in
             SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true, completionHandler: receive)
         }
-        // The window the sight described, by the same exact selection a one-shot capture uses.
+        // Retain the sight’s exact window selection for capture.
         let windows = content.windows
         guard let number = MacScreenCaptureWindowSelection.selectedID(windows: windows.compactMap { window in
                   window.owningApplication.map { (window.windowID, $0.processID, MacAXFrame(
@@ -177,10 +163,11 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         }
         let region = request.region ?? MacAXFrame(x: 0, y: 0, w: window.frame.width, h: window.frame.height)
         guard region.x + region.w <= window.frame.width, region.y + region.h <= window.frame.height else {
-            throw SenseFailure(code: "bad_input", message: "region lies outside \(app)'s window, which is \(Int(window.frame.width))×\(Int(window.frame.height)) points.")
+            throw SenseFailure(code: "bad_input",
+                message: "region lies outside \(app)'s window, which is \(Int(window.frame.width))×\(Int(window.frame.height)) points.")
         }
         let filter = SCContentFilter(desktopIndependentWindow: window)
-        // Native pixels, the long side at most 1024.
+        // Bound the long edge to 1024 native pixels.
         let scale = min(max(1, Double(filter.pointPixelScale)), 1024 / max(region.w, region.h))
         let configuration = SCStreamConfiguration()
         if request.region != nil { configuration.sourceRect = CGRect(x: region.x, y: region.y, width: region.w, height: region.h) }
@@ -191,10 +178,9 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         configuration.ignoreShadowsSingleWindow = true
         configuration.showsCursor = false
         let binding = verbs == nil ? nil : try await MacAttentionSessionStore.shared.bindDriver()
-        let watch = MacScreenWatch(app: app, dataRoot: dataRoot, pid: pid, window: window, region: region, width: configuration.width,
-                                   height: configuration.height, sighting: sighting, verbs: verbs, authority: authority, binding: binding)
-        // Establish complete pre-capture masks before the stream's first frame.
-        // A static window may supply only that one complete frame.
+        let watch = MacScreenWatch(app: app, dataRoot: dataRoot, pid: pid, window: window, region: region, width: configuration.width, height: configuration
+            .height, sighting: sighting, verbs: verbs, authority: authority, binding: binding, turn: turn, context: context)
+        // Inspect before starting capture because static windows may never produce a second frame.
         let baseline = watch.lock.withLock { () -> Task<Void, Never> in
             let task = Task.detached {
                 defer { watch.lock.withLock { watch.inspectionTask = nil } }
@@ -213,10 +199,9 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             try stream.addStreamOutput(watch, type: .screen, sampleHandlerQueue: watch.queue)
             watch.lock.withLock { watch.stream = stream }
             try await withTaskCancellationHandler {
-                let _: Bool = try await macScreenCaptureWait { receive in
+                let _: Bool = try await macScreenCaptureWait(context: context) { receive in
                     stream.startCapture { error in
-                        // Cancellation may have retired the stream before its
-                        // asynchronous start completed. Retire that late start too.
+                        // Cancellation may have retired the stream before its asynchronous start completed. Retire that late start too.
                         if watch.lock.withLock({ watch.ended != nil }) { stream.stopCapture { _ in } }
                         receive(true, error)
                     }
@@ -233,15 +218,14 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             watch.end("capture_failed")
             throw watch.captureFailure("SCStream.startCapture", error.localizedDescription)
         }
-        // The watch's own length, and the person's hands on the Mac (only a watch with
-        // hands holds the driver: their input never ends a watch that only looks).
+        // Only hands hold the driver, so person input ends interactive watches but not read-only watches.
         var tasks = [Task { [weak watch] in
             guard (try? await Task.sleep(for: .seconds(request.seconds))) != nil else { return }
             watch?.spend()
         }]
         if let binding {
             tasks.append(Task { [weak watch] in
-                for await _ in await MacAttentionSessionStore.shared.driverChanges() where !binding.allowsEmission {
+                for await _ in await MacAttentionSessionStore.shared.driverChanges() where !binding.allowsEmission(context: context) {
                     watch?.end("taken_over")
                     return
                 }
@@ -256,7 +240,6 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         return watch
     }
 
-    /// What screen.watch answers: the frames' size and where they are.
     public var opened: JSONValue {
         lock.withLock {
             .object(["app": .string(app), "watch": .int(Int64(generation)), "width": .int(Int64(width)),
@@ -264,12 +247,12 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         }
     }
 
-    /// What the frames cover, in screen points, with the window at `window`.
+    /// Place frame coverage using the window’s current observed position.
     func place(_ window: MacAXFrame) -> MacAXFrame {
         MacAXFrame(x: window.x + region.x, y: window.y + region.y, w: region.w, h: region.h)
     }
 
-    /// The watched window's place now, by its number: one window-server read.
+    /// Resolve current placement by window number, never a sibling’s geometry.
     private func currentWindow() -> MacAXFrame? {
         guard let info = (CGWindowListCopyWindowInfo([.optionIncludingWindow], CGWindowID(windowNumber)) as? [[String: Any]])?.first,
               info[kCGWindowIsOnscreen as String] as? Bool == true,
@@ -278,7 +261,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         return MacAXFrame(x: rect.minX, y: rect.minY, w: rect.width, h: rect.height)
     }
 
-    /// The window where it is now, or the watch ends: gone, or resized.
+    /// A gone or resized window invalidates pixel addressing and ends the watch.
     func liveWindow() throws -> MacAXFrame {
         let now = currentWindow()
         guard let now, abs(now.w - size.w) < 1, abs(now.h - size.h) < 1 else {
@@ -289,8 +272,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         return now
     }
 
-    /// Screen control still allowed, asked every time; when it is not, the
-    /// watch ends ("authority_revoked").
+    /// Recheck screen authority on each admission; revocation ends the watch.
     func allowed() async -> Bool {
         guard lock.withLock({ ended == nil }) else { return false }
         do {
@@ -302,10 +284,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         return lock.withLock { ended == nil } && !Task.isCancelled
     }
 
-    /// The newest frame not yet handed out, as soon as there is one (frames
-    /// that came and went meanwhile are skipped, never queued); with
-    /// `timeout`, `{timedOut: true}` when that many seconds pass without one.
-    /// Null once the watch has ended.
+    /// Skip intermediate captures rather than queueing them; next times out explicitly, and watch end returns null.
     public func next(timeout: Double?) async throws -> JSONValue {
         let id = UUID()
         let deadline = timeout.map { ContinuousClock.now.advanced(by: .seconds(max(0, $0))) }
@@ -338,8 +317,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
                     settledRepair = true
                     return true
                 }) {
-                    // An inspected captured frame proves both app-wide grants.
-                    // Window selection and capture races are corrections, not debts.
+                    // Inspected capture proves both grants; window-selection and capture races need correction rather than permission debt.
                     for owner in ["macOS Accessibility grant", "macOS Screen Recording grant"] {
                         RepairOwed.settle(dataRoot, operation: "screen.watch:" + owner,
                             evidence: .init(source: "screen.watch", id: "\(generation):\(seq)"))
@@ -370,9 +348,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             inspectionTask?.cancel()
             pending = nil
             if operations > 0 {
-                // One cleanup deadline, cancelled on actual settlement. A
-                // non-cooperative read keeps only its local frame until exit;
-                // it cannot publish after this deadline retires the watch.
+                // One cleanup deadline bounds settlement; non-cooperative reads retain only local frames and cannot publish after retirement.
                 settlementTask = Task { [weak self] in
                     guard (try? await Task.sleep(for: .seconds(10))) != nil else { return }
                     self?.end("budget_spent")
@@ -406,7 +382,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         if retire { end("budget_spent") }
     }
 
-    /// Why no hand goes out any more, once the watch has ended.
+    /// Retain the terminal reason so later hands explain their refusal.
     var over: SenseFailure? {
         if let failure = lock.withLock({ failure }) { return failure }
         return lock.withLock { ended ?? (spent ? "budget_spent" : nil) }.map { reason in
@@ -417,14 +393,11 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
 
     // MARK: Ending
 
-    /// Ends the watch once, for the first reason given: the stream stops, its
-    /// frames are dropped with every handle to them, held keys and buttons
-    /// are released, and a waiting `next` answers null.
+    /// First termination wins: drop frames and handles, release held input, stop streaming and wake next with null.
     public func end(_ reason: String, failure: SenseFailure? = nil) {
         let ending = lock.withLock { () -> (stream: SCStream?, waiters: [CheckedContinuation<Void, Never>], tasks: [Task<Void, Never>])? in
             guard ended == nil else { return nil }
-            // An inspection failure belongs only to an active watch. Decide
-            // under the retirement lock so expiry preserves admitted settlement.
+            // Decide inspection failure under the retirement lock so expired watches retain admitted settlement.
             guard reason != "window_uninspected" || (!spent && !Task.isCancelled) else { return nil }
             ended = reason
             self.failure = failure
@@ -432,19 +405,15 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             return (stream, Array(waiters.values), tasks + [inspectionTask, settlementTask].compactMap { $0 })
         }
         guard let ending else { return }
-        if enclosingAct == nil, let failure, case .object(let remedy)? = failure.remedy,
-           remedy["kind"] == .string("repair"), case .string(let owner)? = remedy["owner"] {
-            let tap: String? = if case .string(let value)? = remedy["tap"] { value } else { nil }
-            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act, operation: "screen.watch:" + owner,
-                owner: owner, words: failure.message, nextCall: remedy["next_call"].flatMap { try? $0.serialize(pretty: false) }, tap: tap)
-        }
+        // Every watch now serves its held Turn. Its retained failure is returned through
+        // next/hand to that turn's owner; there is no ambient "no enclosing act" branch.
         ending.stream?.stopCapture { _ in }
         binding?.cancel()
         ending.tasks.forEach { $0.cancel() }
         ending.waiters.forEach { $0.resume() }
     }
 
-    /// The watch's one receipt: frames seen and skipped, queries, hands, how it ended.
+    /// One receipt accounts for frames, queries, hands and the termination reason.
     public var summary: JSONValue {
         lock.withLock {
             let frames = sequence
@@ -467,14 +436,11 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
 }
 
 extension MacFourVerbs {
-    /// Opens a watch on `app`'s front window: the window this verb's own sight
-    /// resolves (refusing what a sight refuses), streamed by exact identity.
-    /// `hands` builds the verbs each hand runs on; nil watches without hands.
-    /// `authority` answers whether screen control is still allowed.
+    /// Open only the sight’s exact window under its admission; nil hands remain read-only and authority is rechecked.
     public func watch(_ request: MacScreenWatch.Request, dataRoot: URL, hands: (@Sendable () async throws -> MacFourVerbs)?,
-                      authority: @escaping @Sendable () async throws -> Bool) async throws -> MacScreenWatch {
+                      turn: Turn, context: MacOperationContext, authority: @escaping @Sendable () async throws -> Bool) async throws -> MacScreenWatch {
         let seen: Sighting
-        switch await sight(part: nil, app: request.app) {
+        switch await sight(part: nil, app: request.app, turn: turn, context: context) {
         case .blind(let reply):
             throw SenseFailure(code: Self.string(reply.detail["error"]) ?? "blind", message: reply.text, remedy: reply.detail["remedy"])
         case .seen(let sighting): seen = sighting
@@ -482,7 +448,7 @@ extension MacFourVerbs {
         guard let pid = seen.pid, let frame = seen.windowFrame else {
             throw SenseFailure(code: "window_unavailable", message: "\(request.app) shows no window I can name to watch.")
         }
-        return try await MacScreenWatch.start(app: seen.appName ?? request.app, dataRoot: dataRoot, pid: pid, window: frame,
-                                              sighting: seen, request: request, verbs: hands, authority: authority)
+        return try await MacScreenWatch.start(app: seen.appName ?? request.app, dataRoot: dataRoot, pid: pid, window: frame, sighting: seen, request: request,
+            verbs: hands, turn: turn, context: context, authority: authority)
     }
 }

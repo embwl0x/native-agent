@@ -14,7 +14,6 @@ public enum DeskWorkDisposition: String, Sendable, Equatable {
     case abandon
 }
 
-/// The execution record for pursuit and owner-cadence work.
 public struct DeskWorkAttempt: Sendable, Equatable {
     public enum Lane: String, Sendable, Equatable {
         case ownerCadence = "owner_cadence"
@@ -101,8 +100,7 @@ public struct DeskWorkAttempt: Sendable, Equatable {
             artifactRefs: artifacts
         )
     }
-    /// The one current attempt collection. Missing means no attempts because
-    /// the writer omits an empty collection; a present collection is complete.
+    /// Omission means no attempts; a present collection must decode whole to preserve accounting.
     static func readAttempts(_ object: [String: JSONValue]) -> [DeskWorkAttempt]? {
         if case .object(let pursuit)? = object["pursuit"], pursuit["reservations"] != nil { return nil }
         guard let attempts = DeskJSON.collection(object["workAttempts"], decode: Self.fromJSON),
@@ -112,13 +110,8 @@ public struct DeskWorkAttempt: Sendable, Equatable {
 }
 
 // MARK: - Pursuit (the origin=agent, kind=project payload — carried on create)
-//
-// All REQUIRED fields (why/evidence/doneLooksLike/abandonCondition) ride the
-// create op payload so a pursuit is fully evidenced the moment it
-// exists; the store REFUSES a create missing any of them. maxSessions/maxDays
-// bound the pursuit ("unbounded pursuits are theater"); creation has defaults,
-// and the write/read gates reject values outside the declared bounds.
-// Item attempts and retired daily counts preserve the pursuit lifetime budget.
+// Required evidence rides the create op so a pursuit cannot exist without its admission proof.
+// Read and write gates enforce lifetime bounds; attempts and daily counts preserve spent budget.
 
 public struct Pursuit: Sendable, Equatable {
     public static let defaultMaxSessions = 12
@@ -126,13 +119,13 @@ public struct Pursuit: Sendable, Equatable {
     public static let defaultMaxDays = 10
     public static let maxMaxDays = 21
 
-    public var why: String                 // first-person, required
+    public var why: String
     public var evidence: PromotionDossier   // required, source-mix enforced
-    public var doneLooksLike: String        // required
-    public var maxSessions: Int             // default 12, cap 24
-    public var maxDays: Int                 // default 10, cap 21
-    public var abandonCondition: String     // required
-    public var privateName: String?         // hers, optional
+    public var doneLooksLike: String
+    public var maxSessions: Int
+    public var maxDays: Int
+    public var abandonCondition: String
+    public var privateName: String?
     public var lastWorkedAt: String?
     public var retiredSessionsByDay: [String: Int]
     public var retiredSessions: Int { retiredSessionsByDay.values.reduce(0, +) }
@@ -161,7 +154,7 @@ public struct Pursuit: Sendable, Equatable {
         self.retiredSessionsByDay = retiredSessionsByDay
     }
 
-    /// The required-field gate (structural). Trimmed-empty required strings are refused; evidence must pass the dossier gate. Returns a human reason or nil; shared by admission and stored-value decoding.
+    /// Share structural validation between admission and decoding so persisted work cannot bypass evidence gates.
     public func validationError() -> String? {
         if !(1...Self.maxMaxSessions).contains(maxSessions) { return "pursuit: maxSessions must be in 1...\(Self.maxMaxSessions)" }
         if !(1...Self.maxMaxDays).contains(maxDays) { return "pursuit: maxDays must be in 1...\(Self.maxMaxDays)" }
@@ -189,7 +182,7 @@ public struct Pursuit: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Both feed and base inputs must carry lossless, representable accounting.
+    /// Reject lossy accounting from feed and base so replay preserves the same budget.
     public static func fromJSON(_ value: JSONValue) -> Pursuit? {
         guard case .object(let obj) = value, obj["reservations"] == nil,
               let why = obj["why"]?.stringValue,

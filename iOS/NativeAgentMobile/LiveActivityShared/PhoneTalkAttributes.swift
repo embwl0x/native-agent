@@ -1,7 +1,7 @@
 import ActivityKit
 import AppIntents
 import Foundation
-// Blueprint: | `PhoneTalkAttributes.swift` | Call identity and Live Activity state; app-executed mute/end intents reach the live talk owner without persisted command copies |
+// Blueprint: | `PhoneTalkAttributes.swift` | Call identity and Live Activity state; intents reach the live app owner without copied commands |
 
 struct PhoneTalkAttributes: ActivityAttributes, Sendable {
     struct ContentState: Codable, Hashable, Sendable {
@@ -13,8 +13,7 @@ struct PhoneTalkAttributes: ActivityAttributes, Sendable {
     let startedAt: Date
 }
 
-/// LiveActivityIntent executes in the app process. The app registers this
-/// boundary at launch; the extension has no microphone or copied call state.
+/// LiveActivityIntent executes in the app; the extension has neither microphone access nor copied call state.
 @MainActor enum PhoneTalkCommands {
     enum Command { case mute, end }
     static var handle: ((String, Command) -> Bool)?

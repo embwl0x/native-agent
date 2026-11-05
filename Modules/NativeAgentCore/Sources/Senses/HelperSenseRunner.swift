@@ -4,9 +4,9 @@ import CryptoKit
 import Darwin
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `HelperSenseRunner.swift` | Isolated plug supervision with validated progress-based stall detection excluding app-served reply waits, read-to-watch idle holds, subscription-owned lifetime and restarts; source callbacks keep newest material and signal EnginePartWake for unattended interpretation, fenced by helper generation; canonical sense disable/replacement retires only that selected lifetime's passive helpers (including unattended on-call wakes) and pending admissions; late retirement and failure reporting cannot affect a replacement, and availability reports rejected by the registry post no news, while sense-identified accepted human on-call work settles with its requesting owner; notebook access delegates to AbilityStore; versioned use and visible live failure news, sealed view events, detached site following and app change deduplication/news; app reads use assembly's Trust-admitted read closure. Live-watch reporting reads actual helper subscriptions, with presentation invalidation at their lifecycle edges. Cancellation joins the worker through settle before terminal accounting and preserves returned action receipts. |
+// Blueprint: | `HelperSenseRunner.swift` | Progress supervision, selected-lifetime retirement, source wakes and cancellation-safe receipts |
 
-/// One sandboxed helper per live sense/source; on-call helpers are discarded after their answer. Only a caller's act request can reach the installed door.
+/// Only a caller's act request may reach the installed door; live helpers are source-bound and on-call helpers end after answering.
 public actor HelperSenseRunner: SenseWatchReporting {
     public typealias SandboxProfile = @Sendable (SenseRecord, URL, URL) throws -> String
 
@@ -36,7 +36,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
     private let helperURL: URL
     private let profile: SandboxProfile
     private let limits: Limits
-    private let apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)?
+    private let apps: (@Sendable (JSONValue, [String: String], SenseReadOperation) async throws -> JSONValue)?
     private var live: [String: Live] = [:]
     private struct Call {
         let selection: String
@@ -60,7 +60,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
     }
 
     public init(dataRoot: URL, helperURL: URL, sandboxProfile: @escaping SandboxProfile,
-                limits: Limits = Limits(), apps: (@Sendable (JSONValue, [String: String]) async throws -> JSONValue)? = nil) {
+                limits: Limits = Limits(), apps: (@Sendable (JSONValue, [String: String], SenseReadOperation) async throws -> JSONValue)? = nil) {
         self.dataRoot = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
         self.fileRegistry = FileSenseRegistry(dataRoot: dataRoot)
         self.helperURL = helperURL
@@ -70,15 +70,12 @@ public actor HelperSenseRunner: SenseWatchReporting {
     }
 
     public func run(_ record: SenseRecord, request: SenseRequest,
-                    source: any SenseSourceProvider) async -> SenseOutcome {
-        if request == .watch, !SensesHub.passiveObservation {
-            return await SensesHub.$passiveObservation.withValue(true) {
-                await run(record, request: request, source: source)
-            }
-        }
+                    source: any SenseSourceProvider, operation: SenseReadOperation) async -> SenseOutcome {
+        var operation = operation
+        if request == .watch { operation = operation.observing() }
         let provenance = SenseProvenance(record: record)
         let isEvent = if case .event = request { true } else { false }
-        if case .act = request, !record.verbsEnabled || SenseActionContext.perform == nil {
+        if case .act = request, !record.verbsEnabled || operation.perform == nil {
             return .failed(SenseFailure(code: "act_denied", message: "Sense actions require enabled verbs and an active app door.", provenance: provenance))
         }
         guard !shutDown else {
@@ -88,7 +85,11 @@ public actor HelperSenseRunner: SenseWatchReporting {
             return .failed(SenseFailure(code: "disabled", message: "Sense is off.", provenance: provenance))
         }
         if record.status == .unavailable {
-            return .failed(SenseFailure(code: "sense_unavailable", message: record.unavailableReason ?? "Sense is unavailable; repair it and switch it on to retry.", provenance: provenance))
+            return .failed(SenseFailure(
+                code: "sense_unavailable",
+                message: record.unavailableReason ?? "Sense is unavailable; repair it and switch it on to retry.",
+                provenance: provenance
+            ))
         }
         guard limits.requestSeconds.isFinite, limits.requestSeconds > 0,
               limits.idleSeconds.isFinite, limits.idleSeconds >= limits.requestSeconds,
@@ -102,11 +103,11 @@ public actor HelperSenseRunner: SenseWatchReporting {
             guard let sense = ExistingCornerSense(record: record) else {
                 return .failed(SenseFailure(code: "unsupported", message: "Native sense identity is unsupported.", provenance: provenance))
             }
-            let perform: SenseActionContext.Perform? = if case .act = request { SenseActionContext.perform } else { nil }
-            let outcome = await SenseActionContext.$perform.withValue(perform) {
-                await sense.run(request, source: source)
-            }
-            return await complete(outcome, record: record, request: request)
+            let perform: SenseActionContext.Perform? = if case .act = request { operation.perform } else { nil }
+            var nativeOperation = operation
+            nativeOperation.perform = perform
+            let outcome = await sense.run(request, source: source, operation: nativeOperation)
+            return await complete(outcome, record: record, request: request, turn: operation.turn)
         }
         var selected: String?
         do {
@@ -129,7 +130,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
             case .watch: nil
             case .event: viewAddresses[record.id].flatMap { $0.selection == selection ? $0.address : nil }
             }
-            let key = try await slotKey(record, selection: selection, source: source, address: address)
+            let key = try await slotKey(record, selection: selection, source: source, address: address, operation: operation)
             if record.status == .on, let registry = SensesHub.shared.registry {
                 guard let current = try await registry.sense(for: record.corner),
                       current.status == .on, try fileRegistry.helperSelection(current) == selection else {
@@ -162,28 +163,31 @@ public actor HelperSenseRunner: SenseWatchReporting {
             } else {
                 generation = UUID()
                 process = try makeProcess(record, key: key, generation: generation, address: address)
-                onCall[callID] = Call(selection: selection, passive: SensesHub.passiveObservation, process: process)
+                onCall[callID] = Call(selection: selection, passive: operation.passive, process: process)
             }
             let outcome: SenseOutcome
             if record.mode == .live, request != .watch, !isEvent {
-                let result = await process.requestFollowing(request, source: source, perform: SenseActionContext.perform)
+                let result = await process.requestFollowing(request, source: source, operation: operation)
                 outcome = result.outcome
                 if live[key]?.generation == generation {
                     live[key]?.following = result.following
                     armIdle(key)
                 }
                 if let failure = result.watchFailure, !shutDown, admissions[callID] == selection {
-                    _ = await complete(.failed(failure), record: record, request: .watch, selection: selection)
+                    _ = await complete(.failed(failure), record: record, request: .watch, selection: selection, turn: nil)
                     if record.status == .on {
                         await SenseNewsBoard.shared.post(SenseNews(senseID: record.id, version: record.version,
                             address: address ?? record.corner.key,
-                            summary: "Live updates could not start: \(ContextSecretContentPolicy.redactedFragment(failure.message))\n\(provenance.line(now: Date()))", at: Date()))
+                            summary: """
+                                Live updates could not start: \
+                                \(ContextSecretContentPolicy.redactedFragment(failure.message))\n\(provenance.line(now: Date()))
+                                """, at: Date()))
                     }
                 }
             } else {
-                outcome = await SenseActionContext.$perform.withValue(isEvent ? nil : SenseActionContext.perform) {
-                    await process.request(request, source: source, perform: SenseActionContext.perform)
-                }
+                var helperOperation = operation
+                if isEvent { helperOperation.perform = nil }
+                outcome = await process.request(request, source: source, operation: helperOperation)
             }
             if record.mode == .onCall {
                 await process.stop()
@@ -194,15 +198,16 @@ public actor HelperSenseRunner: SenseWatchReporting {
                     viewAddresses[record.id] = (selection, address)
                 }
             }
-            return await complete(outcome, record: record, request: request, selection: selection)
+            return await complete(outcome, record: record, request: request, selection: selection, turn: operation.turn)
         } catch {
-            return await complete(.failed(Self.failure(error, provenance: provenance)), record: record, request: request, selection: selected)
+            return await complete(.failed(Self.failure(error, provenance: provenance)), record: record, request: request, selection: selected,
+                turn: operation.turn)
         }
     }
 
-    private func complete(_ outcome: SenseOutcome, record: SenseRecord, request: SenseRequest, selection: String? = nil) async -> SenseOutcome {
+    private func complete(_ outcome: SenseOutcome, record: SenseRecord, request: SenseRequest, selection: String? = nil, turn: Turn?) async -> SenseOutcome {
         guard !Task.isCancelled else {
-            // A settled action receipt remains evidence after Stop. Its own status says whether the sense completed or was interrupted.
+            // Keep settled action receipts after Stop; the receipt's status distinguishes completion from interruption.
             if case .acted = outcome { return Self.attributed(outcome, to: record) }
             return .failed(SenseFailure(code: "cancelled", message: "Sense request cancelled.", provenance: SenseProvenance(record: record)))
         }
@@ -218,14 +223,21 @@ public actor HelperSenseRunner: SenseWatchReporting {
         }
         if case .page(var page, var provenance) = outcome {
             guard page.text.utf8.count <= NativePage.maximumTextBytes else {
-                return await complete(.failed(SenseFailure(code: "bad_output", message: "Sense page exceeds the text ceiling; fold it and offer more.")), record: record, request: request, selection: selection)
+                return await complete(
+                    .failed(SenseFailure(code: "bad_output", message: "Sense page exceeds the text ceiling; fold it and offer more.")),
+                    record: record,
+                    request: request,
+                    selection: selection, turn: turn
+                )
             }
             if record.status == .on, !record.verbsEnabled { for i in page.things.indices { page.things[i].verbs = [] } }
-            if case .read = request, record.status == .on, let registry = SensesHub.shared.registry,
-               (try? AbilityStore(dataRoot: dataRoot).read(id: record.id)) == nil {
-                do { try await registry.recordUse(senseID: record.id, version: record.version) }
-                catch { return .failed(Self.failure(error, provenance: provenance)) }
-                provenance.uses += 1
+            if case .read = request, record.status == .on, let registry = SensesHub.shared.registry {
+                do {
+                    if try AbilityStore(dataRoot: dataRoot).read(id: record.id) == nil {
+                        try await registry.recordUse(senseID: record.id, version: record.version, turn: turn)
+                        provenance.uses += 1
+                    }
+                } catch { return .failed(Self.failure(error, provenance: provenance)) }
             }
             outcome = .page(page, provenance)
         }
@@ -268,9 +280,10 @@ public actor HelperSenseRunner: SenseWatchReporting {
         guard !shutDown else { throw SenseFailure(code: "unavailable", message: "Sense runner has shut down.") }
     }
 
-    private func slotKey(_ record: SenseRecord, selection: String, source: any SenseSourceProvider, address: String?) async throws -> String {
+    private func slotKey(_ record: SenseRecord, selection: String, source: any SenseSourceProvider, address: String?,
+        operation: SenseReadOperation) async throws -> String {
         let identity: String
-        if case .fileKind = record.corner, case .file(let path, _, _) = try await source.material(for: record.corner, address: address) {
+        if case .fileKind = record.corner, case .file(let path, _, _) = try await source.material(for: record.corner, address: address, operation: operation) {
             identity = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
         } else { identity = record.corner.key }
         return record.id + "\0" + selection + "\0" + identity
@@ -317,7 +330,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
         }
     }
 
-    /// Only EnginePartWake admits unattended interpretation. Material stays in the source-bound helper; a retired generation can never consume it.
+    /// Only EnginePartWake admits unattended interpretation; source-bound material cannot be consumed by a retired generation.
     public func sourceChanged(slot key: String, generation: UUID) async {
         guard !shutDown, let slot = live[key], slot.generation == generation else { return }
         await slot.process?.drainChange()
@@ -348,7 +361,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
 
     private func expireIdle(_ id: String, deadline: Date) async {
         guard let slot = live[id], slot.idleAt == deadline, !slot.following else { return }
-        // Idle retention is not an entry limit. Settlement will revisit this deadline if an entry is still running when it crosses.
+        // Idle retention cannot limit a running entry; settlement revisits deadlines crossed during execution.
         if let process = slot.process, !(await process.stopIfIdle()) { return }
         guard live[id]?.idleAt == deadline, live[id]?.generation == slot.generation else { return }
         await stopSlot(id)

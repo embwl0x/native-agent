@@ -1,12 +1,9 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `KnowledgeGraphMaintenanceActions.swift` | `KnowledgeGraphMaintenanceActions`: canonical orphan-sweep preview/apply; apply requires exactly the reviewed candidate set |
+// Blueprint: | `KnowledgeGraphMaintenanceActions.swift` | `KnowledgeGraphMaintenanceActions`: exact-reviewed-set orphan removal |
 
-/// The action boundary behind the Knowledge Graph's explicit orphan-sweep
-/// controls and the agent's `rebuild_knowledge_graph mode: sweep_orphans`.
-/// Both preview and apply re-read the canonical memory store at the moment
-/// they run; a preview is never permission to delete a later state.
+/// Preview grants no permission to delete a later state; both graph controls and `rebuild_knowledge_graph mode: sweep_orphans` reread canonical memory.
 public struct KnowledgeGraphMaintenanceActions: Sendable {
     public enum ApplyResult: Sendable, Equatable {
         case applied(KnowledgeGraphGCReport)
@@ -23,10 +20,8 @@ public struct KnowledgeGraphMaintenanceActions: Sendable {
         return try await indexer.collectGarbage(apply: false)
     }
 
-    /// Applies only when the candidate set is still exactly the one the user
-    /// reviewed. A shrink can mean another writer fixed an item; a superset can
-    /// contain a newly orphaned item the user never saw. Both require a new
-    /// confirmation instead of silently broadening or narrowing deletion.
+    /// Require the exact reviewed candidate set: shrinking may reflect another writer's repair, and growth may include unseen orphans; either requires
+    /// confirmation.
     public func applyOrphanSweep(expectedCandidateIDs: Set<String>) async throws -> ApplyResult {
         let indexer = try await liveIndexer()
         let applied = try await indexer.collectGarbage(

@@ -5,44 +5,34 @@ import NativeAgentShared
 import NativeAgentCore
 import Experiences
 
-// Blueprint: | `FirstConversationPersonaProgression.swift` | `FirstConversationPersonaProgression`: shared dialogue and exact-session progression; successful authorized writes settle tokens and the durable voice step under one lock |
+// Blueprint: | `FirstConversationPersonaProgression.swift` | `FirstConversationPersonaProgression`; One-shot session/title progression |
 
-// The first conversation progresses from SOUL.md to VOICE.md by spending
-// exact-session, exact-title one-shot tokens. Trust authorizes every write.
+// Exact-session, exact-title one-shot tokens order persona progression; Trust still authorizes every write.
 public enum FirstConversationPersonaProgression {
 
-    /// The section-title prefix the flow writes under. Used ONLY to detect that
-    /// a role section already exists; it is never what a dispatch is matched
-    /// against — that is the exact title carried in the token.
+    /// Use the prefix only to detect an existing role section; admission must match the token's exact title.
     public static let roleSectionPrefix = "Who I am to "
 
-    /// Durable "this persona has been met" marker. Written when the opener's
-    /// turn finishes; never removed.
+    /// Keep the durable completion marker so the opener cannot repeat.
     public static let metMarkerFilename = ".first_conversation"
 
-    /// The one-shot progression token.
     public static let writeTokenFilename = ".first_conversation.write"
 
-    /// Where the token goes when it is spent. Kept rather than deleted so the
-    /// trail records that this step was completed.
+    /// Retain spent tokens as evidence that the step completed.
     public static let spentTokenFilename = ".first_conversation.write.spent"
 
-    /// The tool whose matching write advances the conversation.
     public static let writeTool = "persona_append_section"
 
-    /// The document the first answer goes into.
     public static let soulDocument = "SOUL.md"
 
-    // The voice step opens after the matching soul write spends its token.
+    // Arm voice only after the matching soul write spends its token.
     public static let voiceSectionPrefix = "How I talk with "
     public static let voiceDocument = "VOICE.md"
     public static let voiceTokenFilename = ".first_conversation.voice"
     public static let voiceSpentTokenFilename = ".first_conversation.voice.spent"
     public static let voiceDeliveredFilename = ".first_conversation.voice.delivered"
 
-    /// The exact title this flow must write under, for a given person.
-    /// Computed by the app from the profile and pinned into the token, so the
-    /// model cannot widen it by changing the suffix.
+    /// Pin the profile-derived title in the token so the model cannot widen its section by changing a suffix.
     public static func roleSectionTitle(personName: String) -> String {
         let trimmed = personName.trimmingCharacters(in: .whitespacesAndNewlines)
         return "\(roleSectionPrefix)\(trimmed)"
@@ -89,11 +79,10 @@ public enum FirstConversationPersonaProgression {
     public struct WriteToken: Sendable, Equatable {
         public let sessionID: String
         public let title: String
-        /// When this step was armed; an unanswered step expires after one hour.
+        /// Expire unanswered steps after one hour.
         public let armedAt: Date
     }
 
-    /// How long the token stays live after the opener lands.
     public static let writeTokenLifetime: TimeInterval = 3600
 
     /// Create once, or verify the exact already-committed intent during settlement repair.
@@ -118,7 +107,10 @@ public enum FirstConversationPersonaProgression {
         for path in [spent, live] {
             if let saved = try decodeToken(at: path) {
                 guard saved.sessionID == session, saved.title == sectionTitle else {
-                    throw ToolFailureError("First-conversation progression at \(path.path) belongs to another session or title. Preserve it and reconcile before continuing.", effects: .none)
+                    throw ToolFailureError("""
+                        First-conversation progression at \(path.path) belongs to another session or title. Preserve it and \
+                        reconcile before continuing.
+                        """, effects: .none)
                 }
                 alreadyArmed = true
             }
@@ -133,12 +125,12 @@ public enum FirstConversationPersonaProgression {
         let data = try JSONSerialization.data(withJSONObject: payload)
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: live)
         guard let saved = try decodeToken(at: live), saved.sessionID == session, saved.title == sectionTitle else {
-            throw ToolFailureError("The first-conversation token did not read back at \(live.path). Repair the retained progression before continuing.", effects: .unknown)
+            throw ToolFailureError("The first-conversation token did not read back at \(live.path). Repair the retained progression before continuing.",
+                effects: .unknown)
         }
     }
 
-    /// The title the matching write used, live or spent — what the receipt row
-    /// matches against so only that one write gets the settled receipt.
+    /// Match the receipt against the live or spent token's exact title so unrelated writes cannot settle it.
     public static func recordedWriteTitle(
         dataRoot: URL,
         fileManager: FileManager = .default
@@ -149,7 +141,10 @@ public enum FirstConversationPersonaProgression {
                 ?? decodeToken(at: root.appendingPathComponent(spentTokenFilename))?.title
         } catch {
             RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "first_conversation.token",
-                owner: root.path, words: "The first-conversation token is unavailable: \(error.localizedDescription). Repair its retained file; no spent-token title was substituted.")
+                owner: root.path, words: """
+                    The first-conversation token is unavailable: \(error.localizedDescription). Repair its retained file; no spent-token title was \
+                    substituted.
+                    """)
             return nil
         }
     }
@@ -163,7 +158,10 @@ public enum FirstConversationPersonaProgression {
               let title = object["title"] as? String,
               !session.isEmpty, !title.isEmpty,
               let seconds = object["armed_at"] as? TimeInterval, seconds.isFinite else {
-            throw ToolFailureError("The first-conversation token is malformed: \(url.path). Repair its retained session, title and armed_at before advancing the conversation.", effects: .none, owner: url.path, recovery: .repair)
+            throw ToolFailureError("""
+                The first-conversation token is malformed: \(url.path). Repair its retained session, title and armed_at before advancing the \
+                conversation.
+                """, effects: .none, owner: url.path, recovery: .repair)
         }
         let armedAt = Date(timeIntervalSince1970: seconds)
         return WriteToken(sessionID: session, title: title, armedAt: armedAt)
@@ -193,7 +191,6 @@ public enum FirstConversationPersonaProgression {
               case .string(let rawTitle)? = input["title"],
               case .string(let rawContent)? = input["content"] else { return false }
 
-        // Kind: soul, or the voice step it arms, and nothing else.
         let kind = SwiftNativePersonaEngine.canonicalizeKind(rawKind)
         guard kind == "soul" || kind == "voice" else { return false }
 
@@ -215,7 +212,10 @@ public enum FirstConversationPersonaProgression {
             // The writer appends the trimmed title and unmodified content. A success
             // response alone cannot stand in for these committed persona bytes.
             guard body.contains("\n\n## \(title)\n\(rawContent)") else {
-                throw ToolFailureError("The successful persona append could not be verified at \(document.path). Read it before repeating the write; progression remains owed.", effects: .unknown)
+                throw ToolFailureError("""
+                    The successful persona append could not be verified at \(document.path). Read it before repeating the write; progression remains \
+                    owed.
+                    """, effects: .unknown)
             }
             if kind == "soul" {
                 guard title.hasPrefix(roleSectionPrefix) else { return false }
@@ -264,9 +264,7 @@ public enum FirstConversationPersonaProgression {
         bodyHasSection(body, prefix: roleSectionPrefix)
     }
 
-    /// True when a persona document already carries a `## <prefix>…` heading.
-    /// Matching on the heading rather than raw text keeps a person who happened
-    /// to type those words inside an answer from tripping it.
+    /// Match actual headings so quoted role words inside an answer cannot falsely complete progression.
     static func bodyHasSection(_ body: String, prefix sectionPrefix: String) -> Bool {
         let prefix = sectionPrefix
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

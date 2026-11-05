@@ -1,8 +1,5 @@
-// One model pass judges the exchange against kept memories and returns grounded add, update or skip actions.
-// Native gates check shape and provenance, not a phrase catalogue.
-//
-// A lived moment is not a memory here: it is a care movement, judged in the
-// same call (docs/MEMORY_SYSTEM_MAP.md).
+// The model judges grounded add, update and skip decisions; native gates check shape and provenance rather than language patterns. Lived moments become care
+// movements in the same call.
 
 import Foundation
 import NativeAgentShared
@@ -13,16 +10,13 @@ import CognitiveSubstrate
 import TurnTrace
 import Desk
 
-// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`: checked bounded after-turn decisions with grounded correction validation and reviewed targets; `MemoryManagerPromise` validates an absent/empty or complete reply-grounded promises section; malformed present sections refuse interpretation |
+// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`, `MemoryManagerPromise`: grounded decisions, reviewed targets and promises |
 
 // MARK: - What the manager returns
 
 public enum MemoryManagerAction: String, Codable, Sendable, Equatable {
-    /// A new memory about the person.
     case add
-    /// This changes a memory that already exists; `updatesId` names it.
     case update
-    /// Nothing here worth keeping. The common answer.
     case skip
 }
 
@@ -33,8 +27,7 @@ public struct MemoryManagerReviewedTarget: Codable, Sendable, Equatable {
     public let pending: Bool
 }
 
-/// Semantic eligibility belongs to the existing interpretation call. Native
-/// validation checks attribution and exact evidence, never English word overlap.
+/// Semantic eligibility belongs to the existing interpretation call. Native validation checks attribution and exact evidence, never English word overlap.
 public struct MemoryManagerGrounding: Codable, Sendable, Equatable {
     public enum Source: String, Codable, Sendable { case incoming, reply }
     public enum Attribution: String, Codable, Sendable { case speaker, agent, other }
@@ -46,17 +39,14 @@ public struct MemoryManagerGrounding: Codable, Sendable, Equatable {
 }
 
 public struct MemoryManagerDecision: Codable, Sendable, Equatable {
-    /// A standalone third-person sentence about the person, in plain words.
     public let statement: String
-    /// identity / location / employment / schedule / preference / relationship /
-    /// goal / skill / fact — free text; stamped on the proposal as `kind`.
+    /// Carry the model's free-text classification into proposal kind.
     public let kind: String
-    /// Why it would still matter in a month. Shown on the review card.
+    /// Retain the long-term reason for review.
     public let whyItMatters: String
     /// 0…1. Below `MemoryManagerLane.confidenceFloor` nothing stages.
     public let confidence: Double
     public let action: MemoryManagerAction
-    /// For `.update`: the id of the existing memory this supersedes.
     public let updatesId: String?
     public let correctionSubject: String?
     public let standingEvidence: String?
@@ -92,7 +82,6 @@ public struct MemoryManagerDecision: Codable, Sendable, Equatable {
     }
 }
 
-/// One existing memory, as the manager sees it.
 public struct MemoryManagerExistingMemory: Sendable, Equatable {
     public let id: String
     public let content: String
@@ -106,22 +95,19 @@ public struct MemoryManagerExistingMemory: Sendable, Equatable {
     }
 }
 
-/// Everything the manager is given for one turn.
 public struct MemoryManagerRequest: Sendable, Equatable {
     public let userMessage: String
     public let assistantMessage: String
-    /// Top-K memories recalled by embedding for this exchange.
     public let existing: [MemoryManagerExistingMemory]
-    /// Pending rows shown in the prompt and used to resolve update targets before meaning is written.
-    /// Never reconstructed on replay.
+    /// Pending rows shown in the prompt and used to resolve update targets before meaning is written. Never reconstructed on replay.
     public let pendingTargets: [MemoryManagerExistingMemory]
-    /// The nearest claims she was told to forget or the person rejected.
+    /// The nearest claims the agent was told to forget or the person rejected.
     public let forgotten: [String]
-    /// The person's configured name, so a memory is about "User", never "the person".
+    /// Use the person's configured name so retained facts identify their subject.
     public let personName: String?
     public let standingAgent: Bool
     public let appAuthored: Bool
-    /// What her turn took (`AfterTurnOrigin.took`), when it used tools.
+    /// Preserve tool-use origin from AfterTurnOrigin.took.
     public let took: String?
     /// The exchange's clock, retained when an owed turn is judged later.
     public let occurredAt: Date?
@@ -151,7 +137,7 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     }
 }
 
-/// What she said she would do later in this reply, not a request made to her.
+/// What the agent said it would do later in this reply, not a request made to the agent.
 public struct MemoryManagerPromise: Codable, Sendable, Equatable {
     public let words: String
     public let when: String
@@ -192,16 +178,14 @@ public struct AfterTurnInterpretation: Codable, Sendable {
     public let memories: [MemoryManagerDecision]
     public let affect: CognitiveSubstrate.AffectAppraisal
     public let caring: CaringAppraisalVerdict
-    /// What moved her against the cares she was shown.
     public let cares: [CognitiveCareJudgment]
     public let promises: [MemoryManagerPromise]
-    /// The incoming words were the app's, so only her side of the exchange counts.
+    /// The incoming words were the app's, so only the agent's side of the exchange counts.
     public let appAuthored: Bool
     public let model: String?
     public let surface: String
 
-    /// The record's key for the model that judged: the judgment's own surface
-    /// and model, as the call reported them. A label's scope is this key.
+    /// The record's key for the model that judged: the judgment's own surface and model, as the call reported them. A label's scope is this key.
     public var judgingKey: String { Self.judgingKey(surface: surface, model: model) }
     public static func judgingKey(surface: String, model: String?) -> String {
         AfterTurnMemorySurprise.fingerprint(["memory-judgment-v2", surface, model ?? ""])
@@ -238,11 +222,7 @@ public struct AfterTurnInterpretation: Codable, Sendable {
     }
 }
 
-/// The seam. The production conformer (`MindMemoryJudgment`) asks the model on
-/// the Providers "Memory" row. There is
-/// deliberately NO rule-based conformer: a memory invented by a pattern is what
-/// this file exists to delete.
-///
+/// Use the configured Memory model for judgment; rule-based invention cannot establish a memory.
 public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
     public enum Reason: String, Codable, Sendable, Hashable {
         case deadline, cancelled, provider, invalidJSON, missingSections
@@ -289,8 +269,7 @@ public enum AfterTurnInterpretationFailure: String, Error, Sendable {
     case envelope, caring, affect, memories, cares
 }
 
-/// One owed exchange in a batch: its own request and context, exactly
-/// as the turn would have been judged alone.
+/// Each batched exchange retains the request and context it would have received alone.
 public struct MemoryBatchInput: Sendable {
     public let request: MemoryManagerRequest
     public let context: AfterTurnContext?
@@ -302,18 +281,16 @@ public struct MemoryBatchInput: Sendable {
     }
 }
 
-/// No incoming message returns nil; failures throw bounded recovery evidence.
-/// An empty memory array is a valid abstention.
+/// No incoming message returns nil; failures throw bounded recovery evidence. An empty memory array is a valid abstention.
 public protocol MemoryManaging: Sendable {
-    /// The record's key (`AfterTurnInterpretation.judgingKey`) for the model
-    /// this turn's judgment would run on, read without changing the request.
-    /// nil: unkeyed, so no prediction stands.
+    /// Read the judging model's key without changing the request; unkeyed predictions earn no standing.
     func predictionModelKey() async -> String?
+    /// The judging route as it stands now: surface, provider account and model; nil when the route cannot be read.
+    func judgmentRouteKey() async -> String?
     func interpret(_ request: MemoryManagerRequest, context: AfterTurnContext?,
-                   factsEnabled: Bool) async throws -> AfterTurnInterpretation?
-    /// Several owed exchanges in one call, one section each, in input order.
-    /// A nil entry is a section the reply lacked or got wrong: that exchange
-    /// stays owed. Throws when the call itself fails.
+                   factsEnabled: Bool, call: LLMCall) async throws -> AfterTurnInterpretation?
+    /// Several owed exchanges in one call, one section each, in input order. A nil entry is a section the reply lacked or got wrong: that exchange stays owed.
+    /// Throws when the call itself fails.
     func interpretBatch(_ inputs: [MemoryBatchInput]) async throws -> [AfterTurnInterpretation?]
     func relevantRecallIDs(query: String, candidates: [MemoryManagerExistingMemory], generation: String?, topK: Int?) async
         -> Result<Set<String>, AfterTurnMemoryFailure>
@@ -322,41 +299,29 @@ public protocol MemoryManaging: Sendable {
 // MARK: - Lane constants, prompt, parse, gate
 
 public enum MemoryManagerLane {
-    /// Distinct from `adaptive-promoter:` (the deleted regex lane) and the
-    /// retired `moment-promoter:` so a row's provenance names the pass that made it.
+    /// Source provenance identifies the judgment pass.
     public static let sourcePrefix = "memory-manager"
     /// Nothing below this stages, whatever the action says.
     public static let confidenceFloor = 0.8
-    /// How many owed exchanges one batch judgment takes. Four keeps one
-    /// call's prompt near a single turn's scale while the rules are sent once.
+    /// Four exchanges keep a batch near one turn's prompt scale while sharing its rules.
     public static let batchLimit = 4
-    /// How many existing memories the manager is shown.
     public static let recallTopK = 8
-    /// How many pending proposals the manager is shown.
     public static let pendingCap = 24
-    /// A memory is a sentence, not a paragraph.
+    /// Bound memories to sentences rather than paragraphs.
     public static let statementCap = 200
     public static let statementFloor = 12
-    /// How many forgotten claims the manager is shown: the nearest, by the
-    /// same embedding as the memories it sees.
+    /// Use the same embedding to select forgotten claims and known memories for judgment.
     public static let forgottenTopK = 8
-    /// Metadata key carrying the memory an update supersedes, so Keep archives
-    /// the old row (`SwiftNativeMemoryV2.acceptProposal`).
+    /// Carry the superseded target so acceptance can archive the exact old row.
     public static let supersedesKey = "supersedes_memory_id"
-    /// Metadata key carrying the fingerprint the superseded memory had WHEN THE
-    /// PROPOSAL WAS STAGED. Acceptance refuses to demote a row that has changed
-    /// since — the person reviewed a replacement for the old wording, not for
-    /// whatever that row says now.
+    /// Retain the target's staging-time fingerprint so acceptance cannot demote wording the user never reviewed.
     public static let supersedesHashKey = "supersedes_content_hash"
-    /// Metadata key carrying the manager's reason, for the review card.
     public static let whyKey = "why_it_matters"
-    /// Metadata `lane` value. NOT "moment" — `MemoryMoments.isMoment` keys on
-    /// that word for the retired lane's rows.
+    /// Keep this classification distinct from moment rows because MemoryMoments keys on that value.
     public static let lane = "fact"
 
     // MARK: parse
 
-    /// Parse the decoded candidates; an empty array is valid abstention.
     public static func parse(_ array: [Any]) throws -> [MemoryManagerDecision] {
         for (index, candidate) in array.enumerated() {
             if let object = candidate as? [String: Any], let raw = object["statement"] as? String,
@@ -365,8 +330,7 @@ public enum MemoryManagerLane {
                 throw FoundationModelsError.decodeFailed("memory candidate \(index) exceeds the \(statementCap)-character statement bound")
             }
         }
-        // An empty list is abstention; a candidate that is not the declared
-        // shape is a failed reply, held for retry, never a silent drop.
+        // An empty list is abstention; a candidate that is not the declared shape is a failed reply, held for retry, never a silent drop.
         let decisions = array.map { ($0 as? [String: Any]).flatMap(decision(from:)) }
         guard !decisions.contains(where: { $0 == nil }) else {
             throw FoundationModelsError.decodeFailed("a memory candidate did not match the declared shape")
@@ -423,8 +387,7 @@ public enum MemoryManagerLane {
         )
     }
 
-    /// Decode only the writer's ISO-8601 field, never the statement's prose.
-    /// A date-time without an offset is in the Mac's local time zone.
+    /// Decode only the writer's ISO-8601 field, never the statement's prose. A date-time without an offset is in the Mac's local time zone.
     private static func due(from value: Any?) -> Date? {
         guard let raw = value as? String else { return nil }
         let formatter = ISO8601DateFormatter()
@@ -481,10 +444,7 @@ public enum MemoryManagerLane {
 
     // MARK: the gate
 
-    /// Why this statement must NOT be staged — nil when it may.
-    ///
-    /// The interpretation owns semantic eligibility in every language. This
-    /// gate checks bounded shape and exact attributed evidence in its source.
+    /// Interpretation owns multilingual semantics; native validation checks only bounded shape and exact attributed evidence.
     public static func statementRejectionReason(
         _ decision: MemoryManagerDecision,
         userMessage: String,
@@ -536,14 +496,11 @@ public enum MemoryManagerLane {
             model: interpretation.model, surface: interpretation.surface)
     }
 
-    /// The fingerprint an update carries for its target. Same normalization and
-    /// digest the store uses for proposal content, so one definition answers
-    /// "is this still the row that was reviewed?".
+    /// Share the store's normalized fingerprint so review and acceptance identify the same target.
     public static func contentFingerprint(_ text: String) -> String {
         MemoryStorage.contentHash(text)
     }
 
-    /// Metadata stamped on one staged statement.
     public static func metadata(
         for decision: MemoryManagerDecision,
         sessionId: String,

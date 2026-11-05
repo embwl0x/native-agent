@@ -1,11 +1,14 @@
 import AuthoredCapabilities
 import ActivityWatch
 import Foundation
+import ChatTurnContracts
+import Experiences
 import Context
 import OSLog
 import ApprovalTransactions
 import BackgroundLoops
 import BackgroundWork
+import DreamREMCycle
 import Browser
 import ChatTurnRuntime
 import ChatToolParsing
@@ -19,11 +22,9 @@ import MemoryV2
 import NativeAgentCore
 import NotificationInbox
 import PersistenceCore
-import Procedures
 import PersonaEngine
 import Transcripts
 import TurnTrace
-import WorkshopExecution
 import AgentConversations
 import Agents
 import AppToolRuntime
@@ -48,11 +49,11 @@ import NativeAgentShared
 import Senses
 import ToolExecution
 import Studio
-// Blueprint: | `EngineComposition.swift` | Concrete runtime and background-work composition through root-bound engine ports; the existing delegation scheduler combines independent contact-continuation and resident-wake deadlines and gives both owners their recovery pass |
+// Blueprint: | `EngineComposition.swift` | Root-bound body ports forward typed matters to the attention router |
 
 extension NativeAgentEngine {
 
-    /// Resolve the one cognition owner for a loop body. Alternate roots must never observe or mutate the process-global personal runtime.
+    /// Alternate roots must never observe or mutate the process-global personal cognition runtime.
     public static func cognitionRuntime(
         for dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> NativeCognitionRuntime {
@@ -63,48 +64,43 @@ extension NativeAgentEngine {
                                      contextFlow: NativeContextFlowRuntime(dataRoot: standardized))
     }
 
-    /// Body work shares the resident turn provider assembly and its exact credential/routing resolution. PersonaBackedBackgroundLLMClient supplies persona, user-memory core and organism posture when persona context is absent. Background
-    /// calls carry the same idle and wall as resident turns, so one stalled call cannot hold the memory promotion chain forever.
+    /// Share resident routing, credentials and call limits so a stalled background call cannot hold memory promotion forever.
     public static func makeSharedLLMClient(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        cognitionRuntime: NativeCognitionRuntime? = nil
+        cognitionRuntime: NativeCognitionRuntime? = nil,
+        assembly: PrivateWorkContextAssembly
     ) -> any LLMClient {
         let runtime = cognitionRuntime ?? self.cognitionRuntime(for: dataRoot)
         let inner = makeResidentProviderLLMClient(dataRoot: dataRoot, lifecycleObserver: runtime)
         return PersonaBackedBackgroundLLMClient(
             inner: inner,
             dataRoot: dataRoot,
-            cognitionRuntime: runtime
+            cognitionRuntime: runtime, assembly: assembly
         )
     }
-    /// Full loop manifest for BackgroundLoopLifetimes: doctor, memory, self-improvement, Workshop execution executor, heartbeat, and hooks. A periodic dream wrapper is intentionally absent from this manifest: unattended dreams have exactly
-    /// one owner, the `nativeagent-nightly-dream` TriggerScheduler job at 03:30 Mac-local. A periodic REM wrapper is absent for the same reason: `nativeagent-weekly-rem` at 04:30 Mac-local on Sundays owns weekly REM.
+    /// Unattended dreams and REM each have one scheduler owner: `nativeagent-nightly-dream` at 03:30 and `nativeagent-weekly-rem` Sundays at 04:30 Mac-local.
     public static func assembleAllLoops(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [LoopRegistration] {
         let cognition = cognitionRuntime(for: dataRoot)
-        let llm = makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition)
+        let llm = makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition, assembly: .compilePersona)
         let runners: [any LoopRunner] = [
             makeAutoDoctorLoop(dataRoot: dataRoot),
-            makeTurnTraceRetentionLoop(dataRoot: dataRoot),
             makeOffDiskBackupLoop(dataRoot: dataRoot),
-            // Disk hygiene detects oversize files and files one card; never deletes.
+            // Disk hygiene files an oversize notice; it never deletes.
             makeDataRootDiskHygieneLoop(dataRoot: dataRoot),
             makeWeeklySelfImprovementLoop(dataRoot: dataRoot, llm: llm),
-            // No `rem_cycle` entry: the `nativeagent-weekly-rem` TriggerScheduler job is the sole owner of weekly REM (see the manifest note above). User-authored scheduler jobs and time/idle triggers use exact persisted deadlines plus
-            // config/activity invalidations. Core owns the only lifecycle; the six-hour cadence is missed-event repair.
+            // Core owns lifecycle; exact persisted deadlines and activity/config invalidations drive jobs.
             makeTriggerSchedulerLoop(dataRoot: dataRoot),
-            makeWorkshopExecutorLoopRunner(dataRoot: dataRoot, cognitionRuntime: cognition),
-            // The pump reserves a Desk slot before one bounded self-pursuit session.
-            makeWorkshopPumpLoop(dataRoot: dataRoot, cognitionRuntime: cognition),
-            CognitiveMaintenanceLoop(interval: 24 * 60 * 60, runtime: cognition),
-            CognitiveReplayLoop(interval: 24 * 60 * 60, runtime: cognition),
-            CognitiveReflectionLoop(interval: 24 * 60 * 60, llm: llm, runtime: cognition),
-            // Cue authoring is manual-only; production scheduling requires a live consumer.
+            CognitiveMaintenanceLoop(interval: NativeCognitionRuntime.substrateClockCadence, runtime: cognition),
+            CognitiveReplayLoop(interval: NativeCognitionRuntime.substrateClockCadence, runtime: cognition),
+            CognitiveReflectionLoop(interval: NativeCognitionRuntime.substrateClockCadence,
+                llm: makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition, assembly: .suppliedPersona), runtime: cognition),
+            // Cue authoring requires a live consumer before production scheduling.
             makeHeartbeatLoop(dataRoot: dataRoot),
-            // Desk notifications read marked items without touching cognition.
+            // Desk notifications must not touch cognition.
             makeDeskNotifyLoop(dataRoot: dataRoot),
-            // A durable cursor files each delegation terminal card once.
+            // A durable cursor prevents duplicate delegation terminal cards.
             makeDelegationOutcomeLoop(dataRoot: dataRoot),
         ]
         var loops = runners.map(LoopRegistration.enabled)
@@ -140,8 +136,7 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
             dataRoot: dataRoot, configRoot: configRoot)
     }
 
-    /// Each reply owner reconciles on its own: one owner's failure is reported
-    /// after the others have run, never instead of them.
+    /// Run every reply owner independently before reporting failures so one cannot suppress its siblings.
     func reconcileReplyDeliveries(dataRoot: URL) async throws {
         var failures: [String] = []
         func run(_ owner: String, _ body: () async throws -> Void) async {
@@ -172,10 +167,11 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
 
     func reconcileAgentConversations() async throws {
         let agents = NativeAgentEngine.live.agents
-        // Both due-work owners get their pass. One contact's failed read must
-        // not prevent the resident from considering its own arrivals.
+        // Reconciliation is the background owner's operation, outside a chat turn.
+        let workspace = ChatWorkspaceBinding.operation(turn: nil, invocation: .init())
+        // A contact read failure must not prevent resident due-work consideration.
         var firstError: Error?
-        do { try await agents.continuation.tick() }
+        do { try await agents.continuation.tick(workspace: workspace) }
         catch is CancellationError { throw CancellationError() }
         catch { firstError = error }
         do { _ = try await agents.residentWake.tick() }
@@ -196,21 +192,18 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
 }
 
 // MARK: - Desk notifications
-// The part selects changed work; native owners gate cooldown/quiet hours, deliver Mac and paired-device
-// pushes, and stamp lastNotifiedAt to prevent duplicates, without touching CognitiveSubstrate.
+// Native owners gate and deliver selected Desk work, stamping `lastNotifiedAt` to prevent duplicates without touching cognition.
 
 extension NativeAgentEngine {
     public static func makeDeskNotifyLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval = 24 * 60 * 60
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> some LoopRunner {
         DeskNotifyRunner(
-            interval: intervalSeconds,
             dataRoot: dataRoot,
             attention: NativeAgentEngine.live.ports.backgroundWork.attention,
             propose: { input in
-                try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native("background:desk_notify")) {
-                    switch await Parts(root: dataRoot).call(id: "desk-notify", input: input, as: DeskNotificationProposal.self) {
+                try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native("background:desk_notify")) { door in
+                    switch await Parts(root: dataRoot).call(id: "desk-notify", input: input, invocation: door.invocation, as: DeskNotificationProposal.self) {
                     case .success(let proposal): return proposal
                     case .failure(let error): throw error
                     }
@@ -229,14 +222,8 @@ extension NativeAgentEngine {
 }
 
 struct EngineBackgroundWorkPort: BackgroundWorkNotificationPort {
-    func notifyIfAttentionWorthy(
-        dataRoot: URL, itemId: String, title: String,
-        summary: String, source: String, severity: String
-    ) async {
-        await NativeAgentEngine.live.ports.backgroundWork.attention.notifyIfAttentionWorthy(
-            dataRoot: dataRoot, itemId: itemId, title: title,
-            summary: summary, source: source, severity: severity
-        )
+    func tell(_ matter: Matter, dataRoot: URL, reach: AttentionRouter.Reach, turn: Turn?) async throws -> AttentionOutcome {
+        try await NativeAgentEngine.forRoot(dataRoot).ports.backgroundWork.attention.tell(matter, reach: reach, turn: turn)
     }
 }
 
@@ -246,14 +233,8 @@ extension NativeAgentEngine {
         intervalSeconds: TimeInterval? = nil,
         freshMeasurement: Bool = false
     ) -> some LoopRunner {
-        MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeAutoDoctorLoop(dataRoot: dataRoot, intervalSeconds: intervalSeconds, freshMeasurement: freshMeasurement)
-    }
-
-    public static func makeTurnTraceRetentionLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval = 6 * 60 * 60
-    ) -> some LoopRunner {
-        MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeTurnTraceRetentionLoop(dataRoot: dataRoot, intervalSeconds: intervalSeconds)
+        MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeAutoDoctorLoop(dataRoot: dataRoot, intervalSeconds: intervalSeconds,
+            freshMeasurement: freshMeasurement)
     }
 
     public static func makeOffDiskBackupLoop(
@@ -267,18 +248,7 @@ extension NativeAgentEngine {
         llm: any LLMClient
     ) -> WeeklySelfImprovementLoop {
         MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).makeWeeklySelfImprovementLoop(
-            dataRoot: dataRoot, llm: llm, workshopOutcomes: {
-                let engine = NativeAgentEngine.forRoot(dataRoot)
-                return try await engine.tools.withPartDoor(envelope: .native("maintenance:self_improvement_sweep:weekly-outcomes")) {
-                    let input = try await SwiftNativeWorkshopRunner(root: dataRoot).weeklyOutcomeInput()
-                    let result = await Parts(root: dataRoot).call(id: "weekly-outcomes", input: input, as: String.self)
-                    try Task.checkCancellation()
-                    switch result {
-                    case .success(let text): return text
-                    case .failure(let error): throw error
-                    }
-                }
-            })
+            dataRoot: dataRoot, llm: llm, jobOutcomes: { try AgentJobs.weeklyOutcomes(dataRoot: dataRoot, now: Date()) })
     }
 
     public static func makeDataRootDiskHygieneLoop(
@@ -288,9 +258,9 @@ extension NativeAgentEngine {
     }
 
     public static func cleanUpDiskHygiene(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(), matterID: String? = nil
     ) async throws -> String {
-        try await MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).cleanUpDiskHygiene(dataRoot: dataRoot)
+        try await MaintenanceBackgroundWork(port: EngineBackgroundWorkPort()).cleanUpDiskHygiene(dataRoot: dataRoot, matterID: matterID)
     }
 }
 
@@ -301,8 +271,7 @@ extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
     }
 
     func runAutoDoctor(checks: SwiftNativeDoctorChecks, dataRoot: URL) async throws -> [CheckResult] {
-        // An automatic run (launch, first turn, the weekly sweep) takes the same lifecycle as Run: admitted only when no run is in flight, and its report is the one the Doctor page and the pill read, so a relaunch is never left at "no
-        // report" while one ran.
+        // Automatic and manual runs share single-flight lifecycle and published reports so relaunches retain completed evidence.
         let doctor = NativeAgentEngine.live.doctor
         let owned = doctor.dataRoot == dataRoot
         if owned, !(await doctor.admitRun()) { return [] }
@@ -318,13 +287,6 @@ extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
             if owned { await doctor.finishRun(nil, failure: error.localizedDescription) }
             throw error
         }
-    }
-
-    func routeDoctorAsk(eventID: String, title: String, detail: String) async throws {
-        try await NativeAgentEngine.live.ports.backgroundWork.attention.route(
-            eventId: eventID, importance: .ownerWaiting, title: title, body: detail,
-            userInfo: ["screen": "inbox", "source": "doctor_ask", "itemId": "doctor-ask", "dedupKey": eventID]
-        )
     }
 
     var unavailableSkipPrefix: String { DoctorLoopHealth.unavailableSkipPrefix }

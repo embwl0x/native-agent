@@ -1,9 +1,7 @@
 import Foundation
 // Blueprint: | `OutcomeTraceIdentity.swift` | `OutcomeTraceIdentity` enum; `normalized` |
 
-/// Closed validation for the opaque correlation token stored on canonical
-/// assistant completions. It intentionally rejects whitespace, paths, prose,
-/// and unbounded identifiers.
+/// Reject whitespace, paths, prose and unbounded identifiers from the persisted opaque correlation token.
 package enum OutcomeTraceIdentity {
     private static let allowed = CharacterSet.alphanumerics.union(
         CharacterSet(charactersIn: "-._:")

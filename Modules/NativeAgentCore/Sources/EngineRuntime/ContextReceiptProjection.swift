@@ -5,21 +5,16 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import ProviderRouting
-// Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceipts`; checked context trace fields and named unavailable errors; complete measured sizes alone calibrate estimates, with unmeasured components/totals remaining unknown; caller engine owns trace and provider/window reads |
+// Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceipts` |
 
-/// The composer's receipt reads the session's last accepted `context.snapshot`.
-/// Rows use traced sizes and split the provider's first-request input tokens by byte share.
-/// Tool rounds use the provider's difference; percentages use her selected-model window.
+/// Use accepted context sizes and provider counts; split token shares by bytes and use the selected-model window.
 public struct ComposerContextReceiptRow: Identifiable, Equatable, Sendable {
     public let label: String
-    /// The count that makes the row legible — tools on the wire, messages
-    /// kept, recall hits. Absent when the trace records none.
+    /// Absent counts mean untraced evidence, never zero.
     public let detail: String?
-    /// Bytes as assembled. `nil` means "this component's size is not traced",
-    /// which is why the row still appears but carries no share.
+    /// Untraced size leaves the row visible without a share.
     public let bytes: Int?
-    /// Tokens: the provider's count split by byte share, or — when `measured`
-    /// — the provider's own count for this component.
+    /// Split provider tokens by bytes unless the component has a measured provider count.
     public var tokens: Int? = nil
     public var measured = false
 
@@ -33,19 +28,13 @@ public struct ComposerContextReceipt: Equatable, Sendable {
     /// The complete assembled size; nil when any component is unmeasured or
     /// the sum overflows. A partial sum cannot calibrate token shares.
     public let assembledBytes: Int?
-    /// The provider's input tokens for the turn's LAST request, from the same
-    /// turn's `llm.call` rows — never from another turn's receipt file.
+    /// Use this turn’s final request counters, never another turn’s receipt.
     public let lastRequestTokens: Int?
-    /// Bytes per token of the split: assembled bytes ÷ the provider's count
-    /// for the request those bytes built. nil when there is nothing to split
-    /// by (no provider count, or an image turn, whose tokens are not bytes).
+    /// Calibrate only a request with provider counts and byte-based input; image tokens are not bytes.
     public let bytesPerToken: Double?
-    /// Her selected-model window, derived from the same native window shown beside it.
     public var windowTokens: Int? = nil
-    /// The selected model's own window, named beside hers in the caption.
     public var nativeWindowTokens: Int? = nil
-    /// Whose window that is, named in the caption — the selected model can
-    /// differ from the one the provenance line says ran the turn.
+    /// The selected model’s window may differ from the model that ran the turn.
     public var windowModelName: String? = nil
 
     public func share(_ row: ComposerContextReceiptRow) -> Double? { share(tokens: row.tokens) }
@@ -58,7 +47,6 @@ public struct ComposerContextReceipt: Equatable, Sendable {
 
 public enum ComposerContextReceiptState: Equatable, Sendable {
     case loading
-    /// A fresh conversation, or a turn that has not reached its context yet.
     case noTurn
     case outsideSearch
     case unavailable(String)
@@ -73,10 +61,9 @@ public enum ContextReceipts {
     public static let rowLimit = 20_000
     public static let nearRowLimit = 2_000
 
-    /// Percentages use her selected-model window (resolved model if unselected), with the native window named.
+    /// Use the selected-model window, or the resolved model when unselected, and name its native window.
     public static func load(sessionId: String, selectedModel: String, dataRoot: URL) async throws -> ComposerContextReceiptState {
-        // The newest rows first: her latest turn is almost always in them, and
-        // parsing the whole day's trace on every open made the popover slow.
+        // Read newest rows first to bound parsing while favoring the latest turn.
         let near = try await load(sessionId: sessionId, reader: TurnTraceRecentReader(dataRootOverride: dataRoot, rowLimit: nearRowLimit))
         let loaded: ComposerContextReceiptState
         if case .outsideSearch = near {
@@ -87,45 +74,35 @@ public enum ContextReceipts {
         guard let windowModel = selected.isEmpty ? receipt.model : selected else {
             return .unavailable("context.snapshot has no valid model")
         }
-        // The selected model on the Chat route, as the ring reads it; a window
-        // no catalog row states stays nil, and the card says so.
+        // Share the composer’s selected model; absent catalog windows stay unknown.
         let route = try await SwiftNativeProviderRouting(dataRoot: dataRoot).chatRouteProvider()
         receipt.nativeWindowTokens = ProviderRouting.verifiedContextLength(forModel: windowModel, providerID: route, dataRoot: dataRoot)
-        receipt.windowTokens = try ChatSessionAutocompactionConfig.productionDefault().effectiveWindowTokens(nativeWindowTokens: receipt.nativeWindowTokens)
+        receipt.windowTokens = receipt.nativeWindowTokens
         receipt.windowModelName = windowModel.isEmpty
             ? nil
             : FirstPartyModelCatalog.descriptor(for: windowModel)?.name ?? windowModel
         return .receipt(receipt)
     }
 
-    /// Reads yesterday and today, the same way the Observatory does: the trace
-    /// ledger is day-keyed, so a today-only read goes blind at midnight and
-    /// would report "no turn yet" on a conversation that ran at 23:59.
+    /// Read the retained record because a turn may cross midnight.
     public static func load(
         sessionId: String,
         reader: TurnTraceRecentReader = TurnTraceRecentReader(rowLimit: rowLimit),
         now: Date = Date()
     ) async throws -> ComposerContextReceiptState {
         guard !sessionId.isEmpty else { return .noTurn }
-        // A tail read is bounded by design, and a bound is coverage, not a fault: the newest
-        // rows are always in the tail, so the session's latest acceptance in today's window is
-        // its latest turn, and that turn's rows run unbroken to the end of the window. Only a
-        // turn that is not in a window cut short is unknown, and then it is older than the search.
+        // A bounded tail limits coverage, not validity: acceptance within the tail proves its remaining turn rows are covered.
         let accepted = TurnLifecycleMilestone.turnAccepted.rawValue
         func holdsTurn(_ read: TurnTraceRecentReader.Snapshot) -> Bool {
             read.events.contains { $0.kind == accepted && $0.sessionId == sessionId }
         }
-        let today = try await reader.read(now: now)
-        if holdsTurn(today) { return project(events: today.events, sessionId: sessionId) }
-        if today.truncated { return .outsideSearch }
-        // Yesterday too: the ledger is day-keyed, and a turn accepted at 23:59 runs on past midnight.
-        let earlier = try await reader.read(now: now.addingTimeInterval(-86_400))
-        guard holdsTurn(earlier) else { return .outsideSearch }
-        return project(events: earlier.events + today.events, sessionId: sessionId)
+        // A detail that no longer decodes names no turn; it cannot void this session's readable evidence.
+        let read = try await reader.read(now: now, history: true)
+        guard holdsTurn(read) else { return .outsideSearch }
+        return project(events: read.events, sessionId: sessionId)
     }
 
-    /// Pure projection, so the rows can be reasoned about without touching a
-    /// file. Events arrive earliest-first (append order), so "last" is latest.
+    /// Append order is earliest-first, so the last matching event is latest.
     public static func project(
         events: [TurnTraceEvent],
         sessionId: String
@@ -135,8 +112,7 @@ public enum ContextReceipts {
             $0.kind == accepted && $0.sessionId == sessionId
         })?.turnId else { return .noTurn }
 
-        // The FIRST snapshot is the context the turn's first request carried;
-        // the tool rounds after it are counted from the provider's numbers.
+        // The first snapshot describes initial context; provider counters account for subsequent tool rounds.
         guard let first = events.firstIndex(where: {
             $0.kind == snapshotKind && $0.turnId == turnId
         }) else { return .noTurn }
@@ -145,10 +121,7 @@ public enum ContextReceipts {
         }
         let snapshot = events[first]
 
-        // Same turn AND surface, and only the turn's own loop: auxiliary lanes
-        // (memory, moments) run under the parent turn id and are stamped
-        // `requestShape: unmeasured` with no tool contract or prefix shape;
-        // every main-loop request carries one of those two.
+        // Match turn and surface, excluding auxiliary requests marked `requestShape: unmeasured` without a tool contract or prefix shape.
         var calls: [[String: JSONValue]] = []
         for event in events[first...] where event.kind == callKind && event.turnId == turnId && event.surface == snapshot.surface {
             guard case .object(let call) = event.payload else {
@@ -167,8 +140,8 @@ public enum ContextReceipts {
             guard case .object(let previous) = event.payload else { return nil }
             return int(previous, "historyMessageBytes")
         }
-        let compacted = events.contains {
-            $0.kind == TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue
+        let pointed = events.contains {
+            $0.kind == "context.tool_result.pointer"
                 && $0.turnId == turnId
         }
         if let failure = string(payload, "toolCatalogMeasurementError") {
@@ -178,7 +151,7 @@ public enum ContextReceipts {
             return .receipt(try receipt(
                 payload: payload,
                 ranAt: snapshot.ts,
-                compactedMidTurn: compacted,
+                pointedMidTurn: pointed,
                 calls: calls,
                 previousHistoryBytes: previousHistoryBytes
             ))
@@ -190,7 +163,7 @@ public enum ContextReceipts {
     public static func receipt(
         payload: [String: JSONValue],
         ranAt: Date,
-        compactedMidTurn: Bool,
+        pointedMidTurn: Bool,
         calls: [[String: JSONValue]] = [],
         previousHistoryBytes: Int? = nil
     ) throws -> ComposerContextReceipt {
@@ -223,12 +196,7 @@ public enum ContextReceipts {
                 if let count = try row.optionalInt(key), count < 0 { throw JSONRow.Malformed.field(key) }
             }
         }
-        // Text tool lane: no tools array goes to the provider (the call row
-        // says `tools.wireSchemaBytes: 0`); each tool is one prose line inside
-        // the system prompt or the turn brief. The schema JSON is never sent,
-        // so it must not be counted — it read as 40% of a request it was not
-        // in. Newer snapshots measure the lines; they move out of the two rows
-        // that carry them into the tool row, so nothing is counted twice.
+        // Text-tool schemas never reach the provider: move measured prose bytes from their containing prompt rows to avoid double counting.
         let catalogInSystem = int(payload, "toolCatalogSystemBytes")
         let catalogInBrief = int(payload, "toolCatalogBriefBytes")
         let toolsAsText = catalogInSystem != nil
@@ -246,10 +214,7 @@ public enum ContextReceipts {
         let briefBytes = int(payload, "volatileBlockBytes").flatMap { total in
             toolsAsText ? catalogInBrief.flatMap { difference(total, $0) } : total
         }
-        // What this turn fed her rides in the system prompt's changing part
-        // (pinned facts, recalled memories, inner state, clock), plus any brief.
-        // When the per-turn part rides as the brief, the snapshot's dynamic IS
-        // the brief and the system prompt holds none of it.
+        // When dynamic context travels as the brief, its bytes belong to the brief rather than the system prompt.
         let dynamicBytes = int(payload, "dynamicBytes")
         let ridesBrief = int(payload, "volatileBlockBytes").map { $0 > 0 && $0 == dynamicBytes } == true
         let personaBytes = ridesBrief ? systemBytes
@@ -273,8 +238,7 @@ public enum ContextReceipts {
             guard let bytes, let tokensPerByte else { return nil }
             return Int(exactly: (Double(bytes) * tokensPerByte).rounded())
         }
-        // What the last exchange added to the history she carries — tool
-        // rounds never persist into it, so this is the per-turn growth.
+        // Only persisted history measures per-turn growth; tool rounds do not persist into it.
         let historyGrowth: Int? = {
             guard let historyBytes, let previousHistoryBytes,
                   previousHistoryBytes >= 0, historyBytes > previousHistoryBytes else { return nil }
@@ -307,7 +271,7 @@ public enum ContextReceipts {
             ),
             ComposerContextReceiptRow(
                 label: "Conversation history",
-                detail: historyDetail(payload, compactedMidTurn: compactedMidTurn, growth: historyGrowth),
+                detail: historyDetail(payload, pointedMidTurn: pointedMidTurn, growth: historyGrowth),
                 bytes: historyBytes,
                 tokens: tokens(historyBytes)
             ),
@@ -324,8 +288,6 @@ public enum ContextReceipts {
             ),
         ].filter { $0.bytes != nil || $0.detail != nil }
 
-        // Tool calls and results inside this turn: the provider's own
-        // difference between the turn's first and last request.
         if let firstTokens, let lastTokens, lastTokens > firstTokens, calls.count > 1 {
             let more = calls.count - 1
             rows.append(ComposerContextReceiptRow(
@@ -347,8 +309,7 @@ public enum ContextReceipts {
         )
     }
 
-    /// The provider's logical input for one request — Anthropic's three
-    /// disjoint counters summed, OpenAI's total as is (`LLMUsage` owns that).
+    /// Use `LLMUsage` logical input: Anthropic’s disjoint counters sum, while OpenAI already reports a total.
     private static func inputTokens(_ call: [String: JSONValue]) -> Int? {
         guard let provider = string(call, "provider"),
               case .bool(let additive)? = call["additiveInputCounters"] else { return nil }
@@ -362,9 +323,7 @@ public enum ContextReceipts {
 
     // MARK: Details
 
-    /// Persona is compiled INTO the system prompt, so it is named as a share of
-    /// that row rather than given a row of its own — two rows would count the
-    /// same bytes twice.
+    /// Persona is already in the system prompt; show its share without double counting bytes.
     private static func personaDetail(
         _ payload: [String: JSONValue],
         tokens: (Int?) -> Int?
@@ -376,8 +335,7 @@ public enum ContextReceipts {
         return "including \(size) of persona"
     }
 
-    /// The count is the tools actually advertised on this request; `app` is
-    /// the only always-on tool. Actions are discovered through its results.
+    /// Count advertised tools only; actions are discovered through the always-on `app` tool.
     private static func toolDetail(
         _ payload: [String: JSONValue],
         asText: Bool,
@@ -389,8 +347,7 @@ public enum ContextReceipts {
         return measured ? "\(tools), one text line each; no schemas sent" : "\(tools) as text lines, inside the rows above"
     }
 
-    /// The recall lane records an OUTCOME and hit counts, never a size, so this
-    /// row says what was recalled and stays silent about how big it was.
+    /// Recall traces record outcomes and hits, not size; do not invent a byte count.
     private static func recallDetail(_ payload: [String: JSONValue]) -> String? {
         guard case .object(let recall)? = payload["memoryRecall"] else { return nil }
         let injected = int(recall, "injectedHitCount")
@@ -406,15 +363,10 @@ public enum ContextReceipts {
         }
     }
 
-    /// The history row is NEVER dropped. It used to fall out of the receipt
-    /// whenever the trace recorded no count — which is every turn of the lane
-    /// that renders prior turns as text into the system prompt — so a
-    /// multi-turn conversation read as if it had been sent with no history.
-    /// `historyDelivery` says where the lane put it; absent that, the row says
-    /// "not recorded", which is a different claim from zero.
+    /// Always retain the history row: unrecorded counts are unknown, never zero; `historyDelivery` identifies where history was carried.
     private static func historyDetail(
         _ payload: [String: JSONValue],
-        compactedMidTurn: Bool,
+        pointedMidTurn: Bool,
         growth: Int?
     ) -> String {
         var kept = count(payload, "historyMessageCount", one: "message kept", many: "messages kept")
@@ -422,22 +374,19 @@ public enum ContextReceipts {
         if let kept0 = kept, let growth {
             kept = "\(kept0) · grew \(formatTokens(growth, approximate: true)) last turn"
         }
-        guard let kept else { return compactedMidTurn ? "compacted this turn" : "not recorded" }
-        return compactedMidTurn ? "\(kept), compacted this turn" : kept
+        guard let kept else { return pointedMidTurn ? "older result bodies kept as pointers" : "not recorded" }
+        return pointedMidTurn ? "\(kept), older result bodies kept as pointers" : kept
     }
 
     private static func deliveryDetail(_ payload: [String: JSONValue]) -> String? {
         switch string(payload, "historyDelivery") {
-        // A statement about the LANE, not about this turn: this delivery puts
-        // prior turns inside the system prompt, so whatever history the turn
-        // had is already counted in the row above and has no size of its own.
+        // This delivery embeds history in the system prompt, so a separate size would double count it.
         case "systemPrompt": "this lane carries history inside the system prompt"
         case "none": "no earlier turns"
         default: nil
         }
     }
 
-    /// Silent on a turn that carried no image, rather than a row saying zero.
     private static func imageDetail(_ payload: [String: JSONValue]) -> String? {
         guard let images = int(payload, "imageBlockCount"), images > 0 else { return nil }
         return images == 1 ? "1 image" : "\(images) images"
@@ -505,8 +454,7 @@ public enum ComposerContextReceiptPresentation {
         NumberFormatter.localizedString(from: NSNumber(value: count), number: .decimal)
     }
 
-    /// Percent of the whole window: one decimal below 10%, because on a 1M
-    /// window every row lives there.
+    /// Use one decimal below 10% so shares remain legible on large windows.
     public static func share(_ fraction: Double?) -> String? {
         guard let fraction, fraction.isFinite, fraction >= 0 else { return nil }
         let percent = fraction * 100
@@ -517,8 +465,7 @@ public enum ComposerContextReceiptPresentation {
         return "\(whole)%"
     }
 
-    /// The row's value column: tokens when the turn has a provider count to
-    /// split, bytes as assembled otherwise (image turns, older traces).
+    /// Use assembled bytes when provider token counts cannot be split, including image turns.
     public static func value(_ row: ComposerContextReceiptRow) -> String? {
         if let count = row.tokens { return ContextReceipts.formatTokens(count, approximate: !row.measured) }
         return row.bytes.map { "\(exact($0)) bytes" }
@@ -530,9 +477,7 @@ public enum ComposerContextReceiptPresentation {
         return formatter.localizedString(for: date, relativeTo: now)
     }
 
-    /// The total line: the provider's own count for the turn's last request —
-    /// what the window actually held — or the assembled bytes when the trace
-    /// has no provider count for this turn.
+    /// Use this turn’s final provider count, or assembled bytes when that count is unrecorded.
     public static func total(_ receipt: ComposerContextReceipt) -> (label: String, value: String, share: String?) {
         guard let last = receipt.lastRequestTokens else {
             return ("Assembled", receipt.assembledBytes.map { "\(exact($0)) bytes" } ?? "Size unavailable", nil)
@@ -540,7 +485,6 @@ public enum ComposerContextReceiptPresentation {
         return ("Last request", exact(last), share(receipt.share(tokens: last)))
     }
 
-    /// What every percent is of, and how the rows were split.
     public static func window(_ receipt: ComposerContextReceipt) -> String? {
         guard let window = receipt.windowTokens, window > 0 else { return nil }
         var line = "of your \(exact(window))-token window"
@@ -560,9 +504,7 @@ public enum ComposerContextReceiptPresentation {
         return parts.joined(separator: ", ")
     }
 
-    /// The receipt in words, one line per row, in the order the card draws
-    /// it: what the composer pane's page read lists and what
-    /// `app_page_read page=context` returns, so the two say the same thing.
+    /// Share the card’s row order and wording with the context page read.
     public static func lines(_ state: ComposerContextReceiptState) -> [(id: String, label: String)] {
         switch state {
         case .loading: return [("loading", "Reading the last turn…")]

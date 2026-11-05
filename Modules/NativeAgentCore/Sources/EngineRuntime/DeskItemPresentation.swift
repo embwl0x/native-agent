@@ -6,7 +6,6 @@ import StandingBots
 import NativeAgentShared
 import Desk
 import TriggerScheduler
-import WorkshopExecution
 // Blueprint: | `DeskItemPresentation.swift` | Desk tones, item freshness and shared relative-time wording with exact next-change boundaries |
 public enum DeskPresentationTone: Sendable, Equatable {
     case neutral
@@ -16,7 +15,7 @@ public enum DeskPresentationTone: Sendable, Equatable {
     case danger
 }
 
-/// Desk timestamps use the caller's frozen clock and exact freshness boundaries.
+/// Use the caller’s frozen clock so freshness decisions agree.
 public enum DeskRelativeTimePresentation {
     public static func text(forISO raw: String, now: Date) -> String {
         guard let date = UserDisplayFormatters.parseISOTimestamp(raw) else {
@@ -47,7 +46,7 @@ public enum DeskRelativeTimePresentation {
         }
     }
 
-    /// The next change in this vocabulary, rather than a periodic clock tick.
+    /// Refresh at the next wording boundary rather than polling.
     public static func nextRefreshAt(for date: Date, now: Date) -> Date {
         let remaining = date.timeIntervalSince(now)
         if remaining > 0 {
@@ -100,18 +99,14 @@ public enum DeskItemPresentation {
         return config.enabled ? "bell.fill" : "bell"
     }
 
-    /// The whole-board store failure is rendered next to lane failures, so it
-    /// shares their precise bounded-error contract instead of creating a second
-    /// arbitrary limit at the top of the Desk.
+    /// Use the same bounded-error contract for board and individual-source failures.
     public struct Freshness: Sendable, Equatable {
         public let text: String
         public let isStale: Bool
         public let isKnown: Bool
     }
 
-    /// The row's timestamp claim. A malformed timestamp is unknown, never
-    /// fresh; blocked and flagged rows retain a plain age because their status
-    /// already carries the urgent signal.
+    /// Malformed time is unknown, never fresh; urgent status already carries urgency, so retain its plain age.
     public static func freshness(for item: DeskItem, now: Date) -> Freshness {
         let facts = DeskPage.freshness(item, now: now)
         guard let date = facts.date else {

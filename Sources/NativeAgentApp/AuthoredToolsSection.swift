@@ -8,12 +8,9 @@ import PersistenceCore
 import TrustCenter
 
 // Blueprint: | `AuthoredToolsSection.swift` | Authored tool lifecycle labels, controls and confirmation through AppModel commands |
-/// Values consumed by the mounted authored-tool controls.
 enum AuthoredToolPresentation {
     static func canQuarantine(_ tool: ToolRecord) -> Bool { tool.status != "disabled" }
-    /// Authored rows are durable registry records, not live dispatcher
-    /// receipts. Keep their distinct lifecycle labels explicit rather than
-    /// borrowing the catalog's availability wording.
+    /// Registry lifecycle records do not prove live dispatch availability; keep their labels distinct.
     static func statusBadge(for tool: ToolRecord) -> (title: String, systemImage: String, tone: ToolCatalogStatus.Tone) {
         let status = tool.status
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -95,7 +92,9 @@ internal struct AuthoredToolsSection: View {
             }
             .font(ShellType.caption)
             .foregroundStyle(NativeAgentShell.secondary)
-            if let evidence = try? JSONValue.object(tool.fields.filter { ["validation_evidence", "candidate_validation_evidence", "learned"].contains($0.key) }).serialize(pretty: true) {
+            if let evidence = try? JSONValue.object(
+                tool.fields.filter { ["validation_evidence", "candidate_validation_evidence", "learned"].contains($0.key) }
+            ).serialize(pretty: true) {
                 DisclosureGroup("Evidence and learned use") {
                     Text(evidence).font(ShellType.code).textSelection(.enabled)
                 }
@@ -135,7 +134,9 @@ internal struct AuthoredToolsSection: View {
                 DisclosureGroup("Code") {
                     Text(code).font(ShellType.code).textSelection(.enabled)
                 }
-                if let declarations = try? JSONValue.object(review.filter { !["code", "description", "reach", "version"].contains($0.key) }).serialize(pretty: true) {
+                if let declarations = try? JSONValue.object(
+                    review.filter { !["code", "description", "reach", "version"].contains($0.key) }
+                ).serialize(pretty: true) {
                     DisclosureGroup("Declarations and fixtures") {
                         Text(declarations).font(ShellType.code).textSelection(.enabled)
                     }
@@ -143,7 +144,7 @@ internal struct AuthoredToolsSection: View {
             }
             HStack(spacing: 8) {
                 if tool.status != "active" || tool.candidateDigest != nil {
-                    let approval = ToolApprovalPresentation.control(for: tool, keepRefusal: appModel.engine.tools.keepRefusal(tool))
+                    let approval = ToolApprovalPresentation.control(for: tool, keepRefusal: appModel.engine.tools.keepRefusal(tool, turn: nil))
                     Button("Approve") {
                         Task { await appModel.promoteTool(tool) }
                     }

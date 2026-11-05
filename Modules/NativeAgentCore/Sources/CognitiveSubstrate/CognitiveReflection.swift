@@ -33,9 +33,7 @@ public struct CognitiveReflectionJudgment: Codable, Sendable, Equatable {
     public var affect: Double?
     public var takeaway: String?
     public var sources: [String]
-    /// The care its view or takeaway belongs to: a key it was shown
-    /// (`CognitiveReflectionRequest.cares`), or "new". Which care a thought is
-    /// about is the reflection's to say, never a cosine's.
+    /// The reflection names its thought's care from the shown keys or "new"; vector similarity only orders the choices.
     public var care: String?
 
     public func validate(material: [String: CognitiveReflectionCause], cares: [CognitiveCareLine]) throws {
@@ -51,7 +49,10 @@ public struct CognitiveReflectionJudgment: Codable, Sendable, Equatable {
               Set(sources).isSubset(of: Set(material.keys)),
               takeaway == nil || !sources.isEmpty else {
             throw DecodingError.dataCorrupted(.init(codingPath: [],
-                debugDescription: "Invalid reflection judgment: affect must be -1...1 or null; a takeaway must be complete, at most 240 characters, and cite supplied causes."))
+                debugDescription: """
+                    Invalid reflection judgment: affect must be -1...1 or null; a takeaway must be complete, at most 240 characters, and cite supplied \
+                    causes.
+                    """))
         }
     }
 }
@@ -60,7 +61,7 @@ public struct CognitiveReflectionRequest: Codable, Sendable, Equatable {
     public var reason: String
     public var prompt: String
     public var surface: String
-    /// Planning configuration, replaced by the bound checked route before execution and settlement.
+    /// Planning configuration is not execution authority; bind the checked route before effects and settlement.
     public var model: String
     public var provider: String
     public var reasoningEffort: String
@@ -68,13 +69,11 @@ public struct CognitiveReflectionRequest: Codable, Sendable, Equatable {
     /// Reflection evidence uses the nodes frozen at prompt construction, never the workspace after the model returns.
     public var sourceNodeIds: [UUID]
 
-    /// Full peer identities captured with the sources; excerpt labels are presentation only.
-    /// Nil means provenance is unknown, including receipts predating this field.
+    /// Full peer identities carry provenance; labels are presentation only and nil remains unknown.
     public var sourcePeerIds: [String]?
     /// Full source material keyed by its canonical reference, frozen for this call.
     public var material: [String: CognitiveReflectionCause]
-    /// The cares the call was shown, by key, for naming the one its thought
-    /// belongs to. Retained with the judgment until care integration lands.
+    /// The cares the call was shown, by key, for naming the one its thought belongs to. Retained with the judgment until care integration lands.
     public var cares: [CognitiveCareLine]
 
     public init(
@@ -115,13 +114,12 @@ public struct CognitiveReflectionReceipt: Codable, Sendable, Equatable, Identifi
     public var estimatedPromptTokens: Int
     public var estimatedResultTokens: Int
     public var estimatedCostUnits: Double
-    /// Affected care identities. SQLite retains its existing `proposalIds` key.
+    /// SQLite uses `proposalIds` for affected care identities.
     public var affectedCareIDs: [UUID]
     public var judgment: CognitiveReflectionJudgment?
     /// The returned judgment remains available even if its undertone failed to save.
     public var dispositionSaveFailed: Bool
-    /// Present on judgments whose effects have not yet run. Existing recorded
-    /// receipts already integrated cares and keep that recorded completion.
+    /// Only unfinished effects remain pending; a recorded completion is not applied again.
     public var careIntegrationPending: Bool?
     public var integrationEpoch: UInt64?
     public var integrationSkipped: String?

@@ -10,16 +10,15 @@ import SystemConfiguration
 #if canImport(Darwin)
 import Darwin
 #endif
-// Blueprint: | `RepositoryReadActions.swift` | `FileSystemActions` repository reads: descriptor-pinned system grep skips build/VCS and supported root ignore globs, retaining per-record gaps and deadline partials; parsed Git status, dated diff/log and dirty summary; Git policy shared with `FileReadSourceMaterial.shellReadLaunch` |
+// Blueprint: | `RepositoryReadActions.swift` | `FileSystemActions`: confined grep/Git; `FileReadSourceMaterial.shellReadLaunch` shares Git policy |
 
 let connectorGrepMaxResults = 50
 
 extension FileReadSourceMaterial {
-    /// Certified shell reads share Git's existing read-only process boundary,
-    /// including its config, environment and sensitive-store fences.
-    package static func shellReadLaunch(words: [String], cwd: String, dataRoot: URL) -> (arguments: [String], environment: [String: String]) {
+    /// Shell reads share Git's read-only process, configuration and sensitive-store authority.
+    package static func shellReadLaunch(words: [String], cwd: String, dataRoot: URL, turn: Turn?) -> (arguments: [String], environment: [String: String]) {
         let ctx = ConnectorActionContext(repoRoot: URL(fileURLWithPath: cwd),
-            fileAccess: ["mode": .string("full"), "sandbox": .string("danger-full-access")], dataRoot: dataRoot)
+            fileAccess: ["mode": .string("full"), "sandbox": .string("danger-full-access")], dataRoot: dataRoot, turn: turn)
         var command = words
         if command.first == "/usr/bin/git" {
             command.insert(contentsOf: FileSystemActions.gitReadOnlyConfigOverrideArgs, at: 1)
@@ -35,8 +34,6 @@ extension FileReadSourceMaterial {
 
 extension FileSystemActions {
     // MARK: - grep
-    //
-    // Read-only search through verified paths, with bounded capture and matches.
 
     static func grep(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let pattern = (input["pattern"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -45,11 +42,9 @@ extension FileSystemActions {
         guard let parsedMr = safeInt(rawMr, default: connectorGrepMaxResults) else {
             return errResult("max_results must be an integer, got \(jsonRepr(rawMr))", code: "bad_input")
         }
-        // Pass negative limits to the engine for grep_error; guard prefix separately.
         let maxResults = min(parsedMr, connectorGrepMaxResults)
         let sliceCount = max(0, maxResults)
 
-        // An empty search path uses the repository root.
         let rawPathField = input["path"]?.stringValue ?? ""
         let rawSearchPath = rawPathField.isEmpty ? "." : rawPathField
         let searchPath = resolvePath(rawSearchPath, repoRoot: ctx.repoRoot, workspaceRoot: ctx.workspaceRoot)
@@ -70,12 +65,10 @@ extension FileSystemActions {
             )
         }
 
-        // Search "." in the verified directory descriptor; refuse every walk failure.
         var searchTarget = searchPath.path
         var spawnDirectory: URL? = nil
         var fileDisplayPath: String? = nil
         #if canImport(Darwin)
-        // Single-file searches inherit the verified file descriptor itself.
         let inheritedChildDescriptor: Int32 = 3
         var cwdFD: Int32 = -1
         var searchFD: Int32 = -1
@@ -85,10 +78,9 @@ extension FileSystemActions {
         }
         do {
             let parent = try VerifiedPath.openParent(of: searchPath)
-            // The deferred owner holds this descriptor even if openFinal throws.
+            // Defer already owns the descriptor, including when openFinal throws.
             cwdFD = parent.fd
-            // O_NOFOLLOW on the final component too: it is part of the path the
-            // sandbox check judged.
+            // The final component also needs O_NOFOLLOW so every authorized path component resists a swap.
             let finalFD = try VerifiedPath.openFinal(parent, flags: O_RDONLY | O_NONBLOCK)
             var metadata = stat()
             guard fstat(finalFD, &metadata) == 0 else {
@@ -100,22 +92,18 @@ extension FileSystemActions {
             }
             switch metadata.st_mode & mode_t(S_IFMT) {
             case mode_t(S_IFDIR):
-                // The parent has done its job; ownership of the verified
-                // DIRECTORY transfers to the same deferred owner.
+                // Transfer the verified directory to the deferred owner before any later throw.
                 _ = Darwin.close(cwdFD)
                 cwdFD = finalFD
                 searchTarget = "."
                 spawnDirectory = searchPath
             case mode_t(S_IFREG):
-                // Kept open and handed to the child as `/dev/fd/<n>`, which
-                // resolves to this exact vnode and never to a name.
+                // Pass the held vnode through /dev/fd so the child cannot resolve a different pathname.
                 searchFD = finalFD
                 searchTarget = "/dev/fd/\(inheritedChildDescriptor)"
                 fileDisplayPath = searchPath.path
             default:
-                // A fifo, socket or device is not a search target, and opening
-                // one by name for an engine is exactly the swap this fence is
-                // about. Refuse rather than guess.
+                // Refuse FIFOs, sockets and devices rather than reopening a name that could block or be swapped.
                 _ = Darwin.close(finalFD)
                 return errResult(
                     "Only a directory or a regular file can be searched.",
@@ -134,17 +122,12 @@ extension FileSystemActions {
 
         let launch = "/usr/bin/grep"
         guard FileManager.default.isExecutableFile(atPath: launch) else {
-            return errResult("The macOS search tool /usr/bin/grep is unavailable. Repair the macOS installation before searching files.", code: "grep_unavailable")
+            return errResult(
+                "The macOS search tool /usr/bin/grep is unavailable. Repair the macOS installation before searching files.", code: "grep_unavailable")
         }
-        // Patterns are regex data, never CLI options (e.g. searching --help
-        // must not execute the engine's help command and report it as matches).
-        // The sensitive-path filter parses NUL-delimited filenames.
-        // macOS grep is the only engine. -p refuses recursive symlink traversal;
-        // -I skips binary files and --devices=skip avoids FIFOs/devices. The
-        // fixed environment removes GREP_OPTIONS and makes matching byte-based,
-        // so invalid UTF-8 in one text line cannot hide its valid siblings.
-        // The verified single file is handed through /dev/fd, itself a symlink:
-        // read it directly, rather than asking recursive -p to walk it.
+        // Treat patterns as data, never options; NUL framing protects sensitive-path checks for arbitrary filenames. macOS grep -p refuses symlink traversal;
+        // -I and --devices=skip avoid binary files and devices. Pin the environment to remove GREP_OPTIONS and match bytes so one invalid UTF-8 line cannot
+        // hide valid siblings. Read a verified /dev/fd file directly: recursive -p would refuse that descriptor symlink.
         var traversal: [String] = []
         if fileDisplayPath == nil {
             traversal = ["-r", "-p"] + [".git", ".build", "DerivedData*", "node_modules"].flatMap {
@@ -163,8 +146,7 @@ extension FileSystemActions {
         ]
         let environment = ["LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
 
-        // -m limits each file, not the complete recursive output. Keep pipe
-        // capture bounded as well as the agent-facing presentation.
+        // -m bounds each file, not recursive output; also bound pipe capture and presentation.
         let captureLimit = 1_048_576
         let searchDeadline: TimeInterval = 30
         #if canImport(Darwin)
@@ -202,8 +184,7 @@ extension FileSystemActions {
             guard path.hasPrefix("/"), !isSensitiveDataPath(URL(fileURLWithPath: path), ctx) else { return nil }
             return path
         }
-        // Filenames may contain newlines and colons. Judge the complete NUL-
-        // delimited filename before exposing either its match or its line gap.
+        // Filenames can contain newlines and colons; judge the entire NUL-delimited path before exposing matches or gaps.
         let admitted = grepMatchRecords(raw.stdout, capped: run.stdoutTruncated || run.timedOut).compactMap { record -> String? in
             guard let pathBytes = record.path, let recordPath = String(data: pathBytes, encoding: .utf8),
                   !recordPath.isEmpty else {
@@ -221,7 +202,7 @@ extension FileSystemActions {
                 gap(detail)
                 return nil
             }
-            let line = String(decoding: record.body[..<colon], as: UTF8.self) // validated ASCII digits
+            let line = String(decoding: record.body[..<colon], as: UTF8.self) // ASCII validation makes strict text conversion safe.
             detail["line"] = .string(line)
             var text = Data(record.body[record.body.index(after: colon)...])
             let dropped = record.partial ? grepIncompleteUTF8SuffixCount(text) : 0
@@ -240,11 +221,8 @@ extension FileSystemActions {
             }
             return path + ":" + line + ":" + decoded
         }
-        // BSD warn/warnx emits `grep: path: reason` in the fixed C locale.
-        // Split at the last colon-space so colons in a filename stay in its path.
-        // Each warning starts with grep's prefix. Keep embedded filename LFs
-        // inside that warning. Undecodable/cut diagnostics remain named by byte
-        // offset rather than an invented filename or reason.
+        // BSD diagnostics use grep: path: reason in the fixed C locale; split at the last colon-space. Preserve embedded filename LFs; name undecodable or cut
+        // diagnostics by byte offset without inventing a path.
         let diagnosticBoundary = Data("\ngrep: ".utf8)
         var remainingDiagnostics = raw.stderr[...]
         var hasPathDiagnostic = false
@@ -293,13 +271,13 @@ extension FileSystemActions {
         if run.timedOut {
             gap(["code": .string("search_timed_out"),
                  "deadline_seconds": .int(Int64(searchDeadline)),
-                 "message": .string("Search reached its \(Int(searchDeadline))-second deadline; these are only the matches captured before it stopped. Narrow the path or pattern; no matches does not establish absence.")])
+                 "message": .string("""
+                     Search reached its \(Int(searchDeadline))-second deadline; these are only the matches captured before it stopped. Narrow the \
+                     path or pattern; no matches does not establish absence.
+                     """)])
         }
-        // Grep's exit status and captured output decide the result. Exit 0
-        // means matches; exit 1 without stderr means no matches. Exit 2 keeps
-        // stdout matches and path-specific gaps, even with no sibling matches.
-        // Judge stdout before decoding/filtering: those steps cannot turn a
-        // matched but unavailable record into a whole-search failure.
+        // Exit 0 proves matches; exit 1 without stderr proves none; exit 2 retains matches and item-scoped gaps. Judge raw stdout first so decoding or
+        // filtering cannot turn unavailable matches into whole-search failure.
         let failure: String? = run.timedOut || run.status == 0 || (run.status == 1 && raw.stderr.isEmpty)
             ? nil : "grep exited with status \(run.status); search coverage is incomplete."
         if let failure {
@@ -311,16 +289,13 @@ extension FileSystemActions {
             gap(["code": .string("search_incomplete"), "message": .string(failure),
                  "exit_status": .int(Int64(run.status))])
         }
-        // Negative limits have already failed in the engine.
         let lines = Array(admitted.prefix(sliceCount))
         let selectedText = lines.joined(separator: "\n")
         let outputClipped = selectedText.count > connectorResultMaxChars
         let output = outputClipped
             ? String(selectedText.prefix(connectorResultMaxChars)) + "\n[match output truncated]"
             : selectedText
-        // -m is a per-file engine ceiling; the presentation limit is global.
-        // Reaching it cannot establish the total, even when no extra admitted
-        // line was observed. Counts never include filtered sensitive paths.
+        // -m is per-file and presentation is global; hitting either bound cannot establish the total. Counts exclude filtered sensitive paths.
         let limitReached = sliceCount == 0 || admitted.count >= sliceCount
         let omittedObserved = max(0, admitted.count - lines.count)
         var result: [String: JSONValue] = [
@@ -334,7 +309,12 @@ extension FileSystemActions {
             "output": .string(output),
             "coverage": .object([
                 "complete": .bool(!limitReached && !outputClipped && !run.stdoutTruncated && gapCount == 0),
-                "scope": .string("Byte-based POSIX extended-regex matches from macOS grep, admitted by the path policy. Recursive searches skip .git, .build, DerivedData*, node_modules and supported repository-root .gitignore basename globs. Anchored/path-specific, escaped and nested ignore rules are not applied; hidden files otherwise remain searchable. Binary files, devices and recursive symlinks are skipped. Explicit files are searched regardless of ignore rules."),
+                "scope": .string("""
+                    Byte-based POSIX extended-regex matches from macOS grep, admitted by the path policy. Recursive searches skip .git, .build, \
+                    DerivedData*, node_modules and supported repository-root .gitignore basename globs. Anchored/path-specific, escaped and \
+                    nested ignore rules are not applied; hidden files otherwise remain searchable. Binary files, devices and recursive symlinks \
+                    are skipped. Explicit files are searched regardless of ignore rules.
+                    """),
                 "matches_are_total": .bool(!limitReached && !outputClipped && !run.stdoutTruncated && gapCount == 0),
                 "observed_matches_lower_bound": .int(Int64(admitted.count)),
                 "omitted_observed_matches": .int(Int64(omittedObserved)),
@@ -349,15 +329,17 @@ extension FileSystemActions {
             "gaps": .array(gaps),
         ]
         if limitReached || outputClipped || run.stdoutTruncated || gapCount > 0 {
-            result["coverage_note"] = .string("Matches is the selected line count, not the total number of occurrences. More evidence may be omitted; narrow path/pattern or raise max_results up to 50. Read an identified file with file_excerpt for surrounding lines. Do not infer absence from this limited result.")
+            result["coverage_note"] = .string("""
+                Matches is the selected line count, not the total number of occurrences. More evidence may be omitted; narrow path/pattern \
+                or raise max_results up to 50. Read an identified file with file_excerpt for surrounding lines. Do not infer absence from \
+                this limited result.
+                """)
         }
         return .object(result)
     }
 
-    /// Grep supports basename exclusion globs, not Git's ordered path language.
-    /// Read the repository's rules once for this call; never cache a second truth.
-    /// A negation that might re-include a basename prevents its exclusion.
-    /// The work tree a search runs in: the nearest directory at or above it holding `.git`.
+    /// Read Git rules once; grep supports unordered basename globs, not Git's ordered path language. Negations that may re-include a basename must prevent its
+    /// exclusion.
     private static func enclosingRepository(_ path: URL) -> URL? {
         var directory = NativeAgentWorkspaceRoot.canonicalFileURL(path)
         while true {
@@ -374,11 +356,15 @@ extension FileSystemActions {
         switch FileBytes().readbackData(at: url, maxBytes: 65_537, fromEnd: false) {
         case .absent: return .success([])
         case .unavailable(let error):
-            return .failure(FileReadFailure(message: "Could not read repository ignore rules at \(url.path): \(error.localizedDescription)", code: "grep_ignore_unavailable"))
+            return .failure(
+                FileReadFailure(message: "Could not read repository ignore rules at \(url.path): \(error.localizedDescription)",
+                code: "grep_ignore_unavailable"))
         case .present(let bytes): data = bytes
         }
         guard data.count <= 65_536, let text = String(data: data, encoding: .utf8) else {
-            return .failure(FileReadFailure(message: "Repository .gitignore exceeds 65536 bytes or is not valid UTF-8; search exclusions are unavailable.", code: "grep_ignore_unavailable"))
+            return .failure(
+                FileReadFailure(message: "Repository .gitignore exceeds 65536 bytes or is not valid UTF-8; search exclusions are unavailable.",
+                code: "grep_ignore_unavailable"))
         }
         let rules = text.components(separatedBy: .newlines).filter { !$0.isEmpty && !$0.hasPrefix("#") }
         var arguments: [String] = []
@@ -390,8 +376,7 @@ extension FileSystemActions {
             let mayReinclude = rules.dropFirst(index + 1).contains { later in
                 guard later.hasPrefix("!") else { return false }
                 let name = String(later.dropFirst()).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                // Wildcard/escaped negations cannot be safely translated into
-                // grep's unordered excludes. Keep that earlier rule searchable.
+                // Wildcard or escaped negations cannot safely become unordered excludes; keep the earlier rule searchable.
                 if name.contains(where: { "*?[\\".contains($0) }) { return true }
                 #if canImport(Darwin)
                 return fnmatch(pattern, (name as NSString).lastPathComponent, 0) == 0
@@ -410,9 +395,8 @@ extension FileSystemActions {
         return .success(arguments)
     }
 
-    /// macOS grep emits `filename NUL line:text LF`. Framing happens before
-    /// decoding, including filenames containing LF. A known capture cap or
-    /// search deadline permits a partial final body; a cut filename is a gap.
+    /// Frame filename NUL line:text LF before decoding so LF inside a filename cannot split it. Only a known cap or deadline permits a partial final body; a
+    /// cut filename stays a gap.
     static func grepMatchRecords(_ output: Data, capped: Bool) -> [(path: Data?, body: Data, partial: Bool, offset: Int)] {
         var remaining = output[...]
         var records: [(path: Data?, body: Data, partial: Bool, offset: Int)] = []
@@ -436,8 +420,7 @@ extension FileSystemActions {
         return records
     }
 
-    /// Remove only an unfinished UTF-8 scalar at a known byte cap. Invalid
-    /// bytes elsewhere still fail that line's strict decode; never replace them.
+    /// Trim only a scalar cut by a known byte cap; other invalid bytes fail strict decoding.
     static func grepIncompleteUTF8SuffixCount(_ data: Data) -> Int {
         let tail = Array(data.suffix(4))
         guard !tail.isEmpty else { return 0 }
@@ -462,9 +445,8 @@ extension FileSystemActions {
     }
 
     // MARK: - git_status
-    //
-    // Parsed branch and changed files from a confined repository read.
-    package static func gitStatus(_ input: [String: JSONValue], _ ctx: ConnectorActionContext, timeout: TimeInterval = 15, captureByteLimit: Int? = nil) -> JSONValue {
+    package static func gitStatus(
+        _ input: [String: JSONValue], _ ctx: ConnectorActionContext, timeout: TimeInterval = 15, captureByteLimit: Int? = nil) -> JSONValue {
         guard let cwd = gitResolveCwd(input, ctx, tool: "git_status") else {
             return gitCwdBlocked(input, ctx, tool: "git_status")
         }
@@ -527,8 +509,6 @@ extension FileSystemActions {
     }
 
     // MARK: - git_diff
-    //
-    // Working-tree, staged or dated diffs accept exit 0/1 and retain full scalar count.
 
     static func gitDiff(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         guard let cwd = gitResolveCwd(input, ctx, tool: "git_diff") else {
@@ -557,14 +537,11 @@ extension FileSystemActions {
             "status": .string("ok"),
             "diff": .string(truncate(result.stdout)),
             "cwd": .string(cwd.path),
-            // The bytes field counts Unicode scalars, not grapheme clusters.
             "bytes": .int(Int64(result.stdout.unicodeScalars.count)),
         ])
     }
 
     // MARK: - git_log
-    //
-    // Recent commits: absent, invalid or zero limit means ten, capped at 100.
     static func gitLog(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         guard let cwd = gitResolveCwd(input, ctx, tool: "git_log") else {
             return gitCwdBlocked(input, ctx, tool: "git_log")
@@ -611,7 +588,10 @@ extension FileSystemActions {
             "history_state": .string(result.historyState ?? "committed"),
             "coverage": .string(since.isEmpty
                 ? "Files across returned commits only; has_more means older commit details and files were omitted. Git quotes unusual filenames."
-                : "Files across every matching commit in the period; has_more means older commit details were omitted, not their files. Git quotes unusual filenames."),
+                : """
+                    Files across every matching commit in the period; has_more means older commit details were omitted, not their files. Git \
+                    quotes unusual filenames.
+                    """),
         ])
     }
 
@@ -622,8 +602,6 @@ extension FileSystemActions {
     }
 
     // MARK: - repo_dirty_summary
-    //
-    // Parsed status plus a checked short log; only an observed unborn HEAD has no history.
 
     static func repoDirtySummary(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         guard let cwd = gitResolveCwd(input, ctx, tool: "repo_dirty_summary") else {
@@ -632,7 +610,6 @@ extension FileSystemActions {
         let parsed = safeInt(input["log_limit"], default: 5)
         let logLimit = min((parsed == nil || parsed == 0) ? 5 : parsed!, 20)
 
-        // Every failed status or history read aborts the summary.
         let statusRun = runGit(["status", "--short", "--branch"], cwd: cwd, timeout: 15,
                                label: "git status", context: ctx)
         switch statusRun {
@@ -662,7 +639,6 @@ extension FileSystemActions {
 
     // MARK: - Git reads
 
-    /// Complete confined output or the named failure that prevented it.
     package enum GitRun: Sendable {
         case success(GitResult)
         case failure(JSONValue)
@@ -673,7 +649,6 @@ extension FileSystemActions {
         var historyState: String? = nil
     }
 
-    /// Resolve cwd (or repo_root) against allowed roots; nil means gitCwdBlocked.
     static func gitResolveCwd(_ input: [String: JSONValue], _ ctx: ConnectorActionContext, tool: String) -> URL? {
         let rawCwd = input["cwd"]?.stringValue ?? ""
         let base = rawCwd.isEmpty ? "." : rawCwd
@@ -694,28 +669,23 @@ extension FileSystemActions {
         )
     }
 
-    /// Read Git in a verified directory; incomplete output and process failures
-    /// remain unavailable, with stderr retained for an unsuccessful exit.
-    /// GIT_OPTIONAL_LOCKS=0 prevents index stat-cache writes, keeping concurrent reads read-only.
+    /// Keep incomplete output and process failures unavailable; unsuccessful exits retain stderr. GIT_OPTIONAL_LOCKS=0 prevents index stat-cache writes during
+    /// concurrent reads.
     static let gitReadOnlyEnvironmentOverrides: [String: String] = [
         "GIT_OPTIONAL_LOCKS": "0",
         // Pin command-bearing environment/config and confine all children to read authority.
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
-        // Git helpers resolve only through the system PATH.
         "PATH": gitSanitizedSearchPath,
     ]
 
-    /// The ONLY PATH a read-tier git child sees for Git's own helpers.
     static let gitSanitizedSearchPath = "/usr/bin:/bin:/usr/sbin:/sbin"
 
-    /// The supported Git executable is the system's developer-tools entry point.
     static func gitExecutablePath() -> String? {
         FileManager.default.isExecutableFile(atPath: "/usr/bin/git") ? "/usr/bin/git" : nil
     }
 
-    /// Environment variables that name a command for git to execute. Removed
-    /// outright (an empty value is not always the same as unset).
+    /// Unset command-bearing variables entirely; empty values can still select executable behavior.
     static let gitReadOnlyEnvironmentRemovals: [String] = [
         "GIT_EXTERNAL_DIFF",
         "GIT_PAGER",
@@ -729,10 +699,7 @@ extension FileSystemActions {
         "GIT_CONFIG_COUNT",
     ]
 
-    /// Global `-c` overrides prepended to every read-tier git invocation. The
-    /// exec-capable knobs a repository's own `.git/config` / `.gitattributes`
-    /// can set: an external diff driver, a textconv filter, an fsmonitor hook
-    /// (`git status` runs it), the hooks directory, and the pager.
+    /// Override repository-controlled execution: diff/textconv drivers, fsmonitor, hooks and pager cannot run on reads.
     static let gitReadOnlyConfigOverrideArgs: [String] = [
         "--no-pager",
         "-c", "core.fsmonitor=false",
@@ -743,8 +710,7 @@ extension FileSystemActions {
         "-c", "protocol.ext.allow=never",
     ]
 
-    /// The inherited environment with the read-only overrides applied. Built by
-    /// merging (not replacing) because `Process.environment` is wholesale.
+    /// Merge read-only overrides with the inherited environment; Process.environment replaces the whole environment.
     static var gitReadOnlyEnvironment: [String: String] {
         var env = ProcessInfo.processInfo.environment
             .merging(gitReadOnlyEnvironmentOverrides) { _, override in override }
@@ -752,15 +718,13 @@ extension FileSystemActions {
         return env
     }
 
-    /// Conversion filters and submodule children inherit the caller's read
-    /// authority. Confinement applies at execution, including config changes.
+    /// Confine children at execution so conversion, submodules or concurrent config changes cannot expand read authority.
     static func gitReadOnlySandboxProfile(_ ctx: ConnectorActionContext) -> String {
         func quoted(_ path: String) -> String {
             "\"" + path.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"") + "\""
         }
-        // Use explicit alternatives: Seatbelt regexes must match the same
-        // case-folded sensitive paths as isSensitiveDataPath.
+        // Explicit Seatbelt alternatives must match the file fence's case-folded sensitive paths.
         func foldedPattern(_ path: String) -> String {
             path.map { character in
                 let value = String(character)
@@ -773,18 +737,22 @@ extension FileSystemActions {
             "(version 1)", "(allow default)",
             "(deny file-write*)", "(allow file-write* (literal \"/dev/null\"))",
             "(deny network*)", "(deny appleevent-send)", "(deny mach-lookup)",
-            // Seatbelt names this operation `signal`, not `process-signal`.
+            // Seatbelt accepts signal; process-signal is not an operation.
             "(deny signal)",
         ]
         let roots = allowedRoots(ctx)
         if !roots.isEmpty {
-            let runtimeRoots = ["/System/Library", "/usr/lib", "/usr/libexec", "/usr/bin", "/bin", "/sbin", "/Library/Developer", "/Applications/Xcode.app/Contents/Developer"]
+            let runtimeRoots = ["/System/Library", "/usr/lib", "/usr/libexec", "/usr/bin", "/bin", "/sbin", "/Library/Developer",
+                "/Applications/Xcode.app/Contents/Developer"]
             let reads = (runtimeRoots + roots.map(\.path))
                 .map { "(subpath \(quoted($0)))" }.joined(separator: " ")
             let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
             rules += [
                 "(deny file-read-data)",
-                "(allow file-read-data \(reads) (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \(quoted(home + "/.gitconfig"))) (literal \(quoted(home + "/.config/git/config"))))",
+                """
+                    (allow file-read-data \(reads) (literal \"/dev/null\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \
+                    \(quoted(home + "/.gitconfig"))) (literal \(quoted(home + "/.config/git/config"))))
+                    """,
             ]
         }
         let dataRoot = NativeAgentWorkspaceRoot.canonicalFileURL(ctx.dataRoot ?? PersistenceCore.defaultDataRoot())
@@ -818,7 +786,10 @@ extension FileSystemActions {
         captureByteLimit: Int? = nil
     ) -> GitRun {
         guard let git = gitExecutablePath() else {
-            return .failure(errResult("/usr/bin/git is unavailable. Install or repair Apple's Command Line Tools (xcode-select --install), then request this read again.", code: "git_unavailable"))
+            return .failure(errResult("""
+                /usr/bin/git is unavailable. Install or repair Apple's Command Line Tools (xcode-select --install), then request this read \
+                again.
+                """, code: "git_unavailable"))
         }
         let directoryFD: Int32
         do { directoryFD = try VerifiedPath.open(cwd, flags: O_RDONLY | O_DIRECTORY) }
@@ -848,8 +819,7 @@ extension FileSystemActions {
             return .success(GitResult(stdout: run.stdout, status: run.status))
         }
         if args.first == "log" {
-            // Git's porcelain-v2 branch header explicitly names an unborn HEAD.
-            // A failed log, missing output or a broken ref is never that evidence.
+            // Only an explicit porcelain-v2 unborn header proves no history; failed logs and broken refs cannot.
             let head = execute(["status", "--porcelain=v2", "--branch", "--untracked-files=no"],
                 label: "git history state", accepted: [0])
             switch head {
@@ -857,7 +827,8 @@ extension FileSystemActions {
             case .success(let result):
                 let headers = result.stdout.split(separator: "\n").filter { $0.hasPrefix("# branch.oid ") }
                 guard headers.count == 1 else {
-                    return .failure(errResult("Git did not report its history state; repair the repository's HEAD before reading history.", code: "git_unavailable"))
+                    return .failure(
+                        errResult("Git did not report its history state; repair the repository's HEAD before reading history.", code: "git_unavailable"))
                 }
                 if headers[0] == "# branch.oid (initial)" {
                     return .success(GitResult(stdout: "", status: 0, historyState: "unborn"))
@@ -869,7 +840,6 @@ extension FileSystemActions {
 
 }
 
-/// Universal newlines, without a trailing empty element for the final newline.
 private func splitLines(_ text: String) -> [String] {
     if text.isEmpty { return [] }
     var lines: [String] = []
@@ -894,11 +864,9 @@ private func splitLines(_ text: String) -> [String] {
     return lines
 }
 
-/// Parse the leading integer that appears immediately after `marker` in `s`.
 func parseTrailingInt(_ s: String, after marker: String) -> Int? {
     guard let r = s.range(of: marker) else { return nil }
     let rest = s[r.upperBound...]
-    // Take up to the first ']' or ','.
     var digits = ""
     for ch in rest {
         if ch == "]" || ch == "," { break }

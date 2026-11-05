@@ -7,12 +7,8 @@ public struct SupportDiagnostics: Codable, Hashable, Sendable {
     public var doctorStatus: String?
     public var generatedAt: String
 
-    /// The Support Snapshot reuses checks from a still-fresh Doctor report
-    /// so the full offline Doctor pass is not re-run just for the rollup: the
-    /// reuse path excludes exactly the app-added live-coverage checks
-    /// (`live.*`) that `runAll` never produces, so the snapshot is
-    /// byte-identical to a cold run. The export path (and any stale-cache
-    /// caller) passes nil → full run.
+    /// Reuse fresh offline checks so each rollup need not rerun Doctor; exclude app-only live.* rows that runAll cannot produce. Stale reads and exports
+    /// request a full run so the export reflects current evidence.
     public static func read(reusingChecks checks: [CheckResult]?) async -> SupportDiagnostics {
         let doctorStatus: String
         if let checks {

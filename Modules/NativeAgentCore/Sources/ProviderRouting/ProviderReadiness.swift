@@ -4,7 +4,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ProviderReadiness.swift` | Provider inventory and credential readiness; unreadable configuration is unavailable only on its own row; helper choices check catalog faults before membership and OpenRouter efforts through its own catalog, never substituting shipped rows for an unreadable list |
+// Blueprint: | `ProviderReadiness.swift` | exact credential/catalog readiness |
 extension SwiftNativeProviderRouting {
     nonisolated var providersDir: URL {
         dataRoot.appendingPathComponent("providers", isDirectory: true)
@@ -14,7 +14,7 @@ extension SwiftNativeProviderRouting {
         moonshotModels: [[String: JSONValue]]? = nil,
         codexCacheURL: URL? = nil,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment,
-        additionalProviderIDs: Set<String> = []
+        additionalProviderIDs: Set<String> = [], preview: Bool = false
     ) throws -> (providers: [Provider], cache: ProviderConfigCache) {
         var byId: [String: Provider] = [:]
         for provider in try Self.loadProviderRegistryChecked(at: providersDir.appendingPathComponent("registry.json")) ?? [] {
@@ -30,7 +30,10 @@ extension SwiftNativeProviderRouting {
         do { files = try FileManager.default.contentsOfDirectory(at: providersDir, includingPropertiesForKeys: nil) }
         catch CocoaError.fileReadNoSuchFile { files = [] }
         catch {
-            throw ProviderRoutingError.underlying("Provider directory \(providersDir.path) could not be enumerated: \(error.localizedDescription). Repair its access before listing providers.")
+            throw ProviderRoutingError.underlying("""
+                Provider directory \(providersDir.path) could not be enumerated: \(error.localizedDescription). Repair its access before listing \
+                providers.
+                """)
         }
         for file in files where file.pathExtension == "json" && !skipNames.contains(file.lastPathComponent) {
             ids.insert(file.deletingPathExtension().lastPathComponent)
@@ -44,7 +47,7 @@ extension SwiftNativeProviderRouting {
             if Self.connectableProviderIds.contains(id) || row.modelCatalog == nil {
                 row.modelCatalog = .array(modelsForProvider(
                     id, openRouterModels: openRouterModels, moonshotModels: moonshotModels,
-                    codexCacheURL: codexCacheURL, authEnvironment: authEnvironment
+                    codexCacheURL: codexCacheURL, authEnvironment: authEnvironment, preview: preview
                 ).map { .object($0) })
             }
             var extras: [String: JSONValue] = [:]
@@ -52,9 +55,10 @@ extension SwiftNativeProviderRouting {
             if Self.connectableProviderIds.contains(id) || extras["auth_modes"] == nil {
                 extras["auth_modes"] = .array(authModes(for: id).map { .string($0) })
             }
-            // The wire's existing why-the-list-is-missing slot carries an unreadable account list.
+            // An unreadable account catalog must retain its cause in the missing-list field.
             if codexCacheURL == nil, CodexAccountModelCatalog.isAccountBackedProvider(id) {
-                extras["models_note"] = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment).map(JSONValue.string)
+                extras["models_note"] = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment, preview: preview).map(
+                    JSONValue.string)
             }
             if Self.normalizeProviderId(id) == "moonshot" {
                 extras["models_note"] = MoonshotModelCatalog.cacheFault(dataRoot: dataRoot).map(JSONValue.string)
@@ -95,7 +99,7 @@ extension SwiftNativeProviderRouting {
         row.extras = .object(extras)
         return row
     }
-    /// The body reads the same credential admission as provider routing, without catalog discovery.
+    /// Body status shares credential admission without triggering catalog discovery.
     public nonisolated func hasUsableCredentials() -> Bool {
         let receipts = ProviderConfigCache(receipts: LLMProviderStatusFeed.receipts(dataRoot: dataRoot))
         return ["anthropic_oauth_direct", "anthropic", "openai_oauth_direct", "openai",
@@ -113,11 +117,8 @@ extension SwiftNativeProviderRouting {
         if let error = cache?.reads[id]?.unreadable {
             return (false, "unavailable", error)
         }
-        /// A present credential, a key or a sign-in, is eligible to dispatch
-        /// (dispatch is its proof) and read by its own last check for exactly
-        /// that credential: rejected is not ready; a failed or unreadable check
-        /// stays eligible and says so; otherwise `standing` answers, given the
-        /// date a check proved it, if one did.
+        /// Readiness grades the exact credential's own check. Rejection blocks it; absent, failed or unreadable proof stays eligible and unproven until
+        /// dispatch.
         func receiptReadiness(_ credential: String, holding: String, rejected: String,
                               standing: (Date?) -> (ready: Bool, state: String, detail: String))
             -> (ready: Bool, state: String, detail: String) {
@@ -132,7 +133,7 @@ extension SwiftNativeProviderRouting {
             case .unchecked: return standing(nil)
             }
         }
-        /// needs_key is absent; rejected is refused at its last check; saved is present and unproven; ready is proven.
+        /// Absent, rejected, saved and proven credentials must remain distinct.
         func keyReadiness(_ name: String) -> (ready: Bool, state: String, detail: String) {
             let key: String?
             do {
@@ -155,13 +156,16 @@ extension SwiftNativeProviderRouting {
         func signInReadiness(_ judged: (Bool, String, String?, unavailable: Bool)) -> (ready: Bool, state: String, detail: String) {
             if judged.unavailable { return (false, "unavailable", judged.1) }
             guard judged.0, let token = judged.2 else { return (judged.0, "needs_oauth", judged.1) }
-            // A sign-in with no check receipt yet is present and unproven, the
-            // same word a saved key gets; needs_oauth is for a sign-in that is
-            // absent (judged unusable above). 0.6.9 night: Doctor and the
-            // Providers page told User to sign in to the account every turn ran on.
+            // A usable sign-in without a check is present and unproven; needs_oauth is reserved for absent sign-in.
             return receiptReadiness(token, holding: "Signed in",
-                                    rejected: "This sign-in was rejected at its last check; sign in again in Providers.") { _ in
-                (true, "saved", judged.1)
+                                    rejected: "This sign-in was rejected at its last check; sign in again in Providers.") { checkedAt in
+                // The check time reads as every face row's time does: the clock today, the day otherwise.
+                if let checkedAt {
+                    let when = Calendar.current.isDateInToday(checkedAt) ? checkedAt.formatted(date: .omitted, time: .shortened)
+                        : checkedAt.formatted(.dateTime.month(.abbreviated).day())
+                    return (true, "ready", judged.1 + "; checked " + when)
+                }
+                return (true, "saved", judged.1)
             }
         }
         switch id {
@@ -171,9 +175,7 @@ extension SwiftNativeProviderRouting {
                     return (false, "needs_install", "Install Codex CLI to use this account through Codex.")
                 }
             }
-            // Reads codex_home/auth.json and the OAuth candidate paths, not
-            // `providers/<id>.json` — nothing in the model lane touches those,
-            // so there is no shared read to make.
+            // Account credentials have their own paths, so provider-config reads cannot stand in for them.
             return signInReadiness(Self.validateOpenAIOAuthDirect(dataRoot: dataRoot, environment: authEnvironment))
         case "anthropic_oauth_direct":
             return signInReadiness(Self.validateAnthropicOAuthDirect(providersDir: providersDir, preRead: cache?.reads[id]))
@@ -185,8 +187,7 @@ extension SwiftNativeProviderRouting {
         case "moonshot": return keyReadiness("Moonshot")
         case "kimi-code": return keyReadiness("Kimi Code")
         default:
-            // The cached read has already resolved any Keychain reference.
-            // Bookkeeping alone (auth mode/default model) is not a credential.
+            // The cached read has already resolved any Keychain reference. Bookkeeping alone (auth mode/default model) is not a credential.
             let config = (cache?.reads[id] ?? readProviderConfig(id)).object ?? [:]
             let credentialKeys = ["api_key", "access_token", "setup_token", "refresh_token", "token", "id_token"]
             let tokens = config["tokens"] as? [String: Any] ?? [:]
@@ -201,6 +202,13 @@ extension SwiftNativeProviderRouting {
             }
             return (false, "needs_credentials", "No provider credential configured")
         }
+    }
+    /// The account's name as the Providers page lists it: a shipped route by its fixed name, a registered one by its own; throws when the registry is
+    /// unreadable.
+    public nonisolated func providerDisplayName(_ id: String) throws -> String {
+        if Self.connectableProviderIds.contains(id) { return Self.displayName(for: id) }
+        let registered = try Self.loadProviderRegistryChecked(at: providersDir.appendingPathComponent("registry.json"))?.first { $0.id == id }
+        return registered?.displayName ?? Self.displayName(for: id)
     }
     nonisolated static func displayName(for id: String) -> String {
         switch id {
@@ -222,32 +230,23 @@ extension SwiftNativeProviderRouting {
         if ["openai", "anthropic", "openrouter", "moonshot", "kimi-code"].contains(id) { return ["api_key"] }
         return ["api_key", "oauth"]
     }
-    /// Can this route actually run this model at this Think level, on THIS
-    /// install? Used wherever a provider/model/effort tuple is CHOSEN rather
-    /// than resolved — the Bots editor, the bot tools, the bot runner, and a bot
-    /// session continued in Chat.
-    ///
-    /// Requires a connected provider and a model its authoritative catalog offers.
-    ///
-    /// It never reaches the network. An unavailable account or Moonshot cache
-    /// stops validation with its cause, before membership is checked. OpenRouter's
-    /// stale, absent or known-truncated list cannot disprove a saved choice.
+    /// Validate explicit helper choices without network or reselection. Required catalog faults stop membership checks; incomplete OpenRouter evidence
+    /// cannot disprove a saved pin.
     public func botChoiceRejection(
         provider: String?,
         model: String?,
-        reasoningEffort: String?
+        reasoningEffort: String?, preview: Bool = false
     ) -> String? {
         let routeID = Self.normalizeProviderId(provider ?? "")
         if routeID == "openrouter" {
-            let catalog = catalogRows(routeID)
+            let catalog = catalogRows(routeID, preview: preview)
             if let fault = catalog.fault { return fault }
             guard let model, let row = catalog.rows.first(where: { $0["id"] == .string(model) }),
                   case .array(let efforts)? = row["supported_reasoning_efforts"] else {
                 return "OpenRouter's model capabilities are unavailable. Reload Providers and choose a model."
             }
             if efforts.isEmpty {
-                // A declared absent selector is a valid model. It admits
-                // omission of the optional control, never a guessed effort.
+                // A declared absent selector is a valid model. It admits omission of the optional control, never a guessed effort.
                 guard reasoningEffort == nil || reasoningEffort == "" || reasoningEffort == "default" else {
                     return "This OpenRouter model has no Think selector. Choose provider default in Providers."
                 }
@@ -258,7 +257,7 @@ extension SwiftNativeProviderRouting {
         }
         let accountBacked = CodexAccountModelCatalog.isAccountBackedProvider(provider ?? "")
         if accountBacked,
-           let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot) { return fault }
+           let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, preview: preview) { return fault }
         if routeID == "moonshot", let fault = MoonshotModelCatalog.cacheFault(dataRoot: dataRoot) { return fault }
         if routeID == "openrouter", let fault = OpenRouterModelCatalog.cacheFault(dataRoot: dataRoot) { return fault }
         let moonshotModels = routeID == "moonshot"
@@ -266,8 +265,8 @@ extension SwiftNativeProviderRouting {
         let accountModels = accountBacked
             ? CodexAccountModelCatalog.load(
                 providerID: provider ?? "",
-                cacheURL: CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(dataRoot: dataRoot),
-                useDefaultCacheWhenNil: false, dataRoot: dataRoot
+                cacheURL: CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(dataRoot: dataRoot, preview: preview),
+                useDefaultCacheWhenNil: false, dataRoot: dataRoot, preview: preview
             ) : nil
         if let shape = ProviderModelChoice.rejection(
             provider: provider, model: model, reasoningEffort: reasoningEffort,
@@ -282,24 +281,20 @@ extension SwiftNativeProviderRouting {
         guard providerReadiness(id: route).ready else {
             return "\(route) is not connected. Connect it in Providers, or choose an account that is."
         }
-        // A fetched-catalog route: convict only on a complete, fresh cache that
-        // does not list the model.
+        // A fetched-catalog route: convict only on a complete, fresh cache that does not list the model.
         if Self.normalizeProviderId(route) == "openrouter",
            OpenRouterModelCatalog.cachedAvailability(of: picked, dataRoot: dataRoot) == .unavailable {
             return "OpenRouter no longer lists \(picked). Pick a model from its list."
         }
         return nil
     }
-    /// `openRouterModels` / `moonshotModels` are the provider's fetched list
-    /// when the caller read it (empty = the fetch had nothing), nil when it did
-    /// not. A missing or unreadable fetched catalog offers no replacement rows.
-    /// Fetched Moonshot rows also govern saved picks and helper validation.
+    /// A missing/unreadable fetched catalog offers no replacement rows; nil means unread and empty means the fetch returned no models.
     nonisolated func modelsForProvider(
         _ id: String,
         openRouterModels: [[String: JSONValue]]? = nil,
         moonshotModels: [[String: JSONValue]]? = nil,
         codexCacheURL: URL? = nil,
-        authEnvironment: [String: String] = ProcessInfo.processInfo.environment
+        authEnvironment: [String: String] = ProcessInfo.processInfo.environment, preview: Bool = false
     ) -> [[String: JSONValue]] {
         // A catalog belongs to the selected route. Unknown catalogs offer no rows.
         var moonshot: [[String: JSONValue]] {
@@ -308,15 +303,14 @@ extension SwiftNativeProviderRouting {
         }
         switch id {
         case "openai_oauth_direct", "codex":
-            if CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment) != nil { return [] }
+            if CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment, preview: preview) != nil { return [] }
             let cacheURL = codexCacheURL ?? CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(
-                dataRoot: dataRoot, environment: authEnvironment
+                dataRoot: dataRoot, environment: authEnvironment, preview: preview
             )
-            // This catalog belongs to the selected credential; no second
-            // token-presence read may redirect it to the command CLI's cache.
+            // This catalog belongs to the selected credential; no second token-presence read may redirect it to the command CLI's cache.
             return CodexAccountModelCatalog.providerModels(
                 providerID: id, cacheURL: cacheURL,
-                useDefaultCacheWhenNil: false, dataRoot: dataRoot
+                useDefaultCacheWhenNil: false, dataRoot: dataRoot, preview: preview
             ).map { $0.providerJSON() }
         case "openrouter": return openRouterModels ?? []
         case "moonshot": return moonshot

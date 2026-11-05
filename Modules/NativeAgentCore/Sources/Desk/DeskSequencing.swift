@@ -2,52 +2,26 @@ import NativeAgentShared
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `DeskSequencing.swift` | `DeskSequencing.compute`: derived blockedness, cycles and subtree plans from stored edges; unblocking never writes a separate operation |
+// Blueprint: | `DeskSequencing.swift` | `DeskSequencing.compute`: blockedness derives from edges without unblocking writes |
 
 // MARK: - DeskSequencing — the "what's next" derivation (PURE, never stored)
-//
-// The Desk answers "what exists"; this answers "what's next".
-//
-// THE LOAD-BEARING DECISION: blockedness is COMPUTED from the stored edge set on
-// every read. Nothing here is persisted, and no op is ever written to "unblock"
-// an item. That is the whole auto-unblock cascade: when a blocker reaches a
-// terminal status (or is archived out of live state), every dependent becomes
-// ready on the very next read — with no writer running, no background loop, and
-// no op to fire. A derived `isBlocked` FIELD on DeskItem would have to be
-// maintained by a writer and would rot exactly the way `blockedReason` prose
-// rots. So: edges are stored, blockedness is derived.
-//
-// Everything here is pure and deterministic — `now` is injected, no wall clock
-// is read inside — so the projection and its tests are reproducible.
-//
-// CYCLE SAFETY IS MANDATORY, not defensive politeness. The write path
-// (SwiftNativeDeskStore.validateBlockedOn) refuses an edge that closes a cycle,
-// but a hand-authored feed, a legacy feed, or another process sharing the flock
-// can still put one on disk. A hang here would freeze EVERY desk_read, so both
-// graph walks (blocked-on edges and parent chains) carry a visited set AND a
-// depth cap.
+// Derive blockedness from stored edges so settlement releases dependents without a second writer.
+// Inject now so every projection uses the same instant.
+// Authored feeds can contain cycles despite write gates; bound both graph walks to keep reads responsive.
 
-/// Defensive traversal bound for both the blocked-on graph and parent chains.
-/// Far above any real desk; it exists so a pathological feed degrades into a
-/// wrong-but-finite answer instead of a hang.
+/// Bound pathological traversal so malformed feeds cannot hang every Desk read.
 let deskMaxGraphDepth = 512
 
 public enum DeskSequencing {
 
-    /// The derived sequencing facts for one item.
     public struct ItemPlan: Sendable, Equatable {
         public var handle: String
-        /// Live, NON-TERMINAL blockers only. A blocker that closed, was canceled,
-        /// was archived, or simply isn't in live state DOES NOT BLOCK. An exp:
-        /// condition blocks until its settlement is written back (MyQueueReady.release).
+        /// Only live nonterminal Desk blockers bind; experience conditions wait for a durable release.
         public var effectiveBlockers: [String]
-        /// `deferUntil` parses AND is strictly in the future.
         public var isDeferred: Bool
         public var isReady: Bool
-        /// This item sits ON a cycle in the blocked-on graph — unresolvable, so
-        /// never ready, and surfaced in the projection rather than hidden.
+        /// Cyclic work is unresolvable and must stay visibly unready.
         public var blockedByCycle: Bool
-        /// Whole descendant subtree (all depths), self EXCLUDED.
         public var doneCount: Int
         public var totalCount: Int
 
@@ -73,9 +47,7 @@ public enum DeskSequencing {
     public struct Plan: Sendable, Equatable {
         public var byHandle: [String: ItemPlan]
         public var children: [String?: [DeskItem]]
-        /// Ready handles, desk-wide, best-first. Capped at `nextUpCap`.
-        /// Derived from dependency edges + status + creation time — there is
-        /// deliberately NO manual rank field anywhere in the Desk.
+        /// Dependency, status and creation time derive next-up order without a second persisted rank.
         public var nextUp: [String]
 
         public init(byHandle: [String: ItemPlan] = [:], nextUp: [String] = [], children: [String?: [DeskItem]] = [:]) {
@@ -87,8 +59,6 @@ public enum DeskSequencing {
 
     public static let nextUpCap = 5
 
-    /// Status ordering for `nextUp`: the operator's own triage vocabulary is the
-    /// rank. now > next > flag > todo > watch > anything else.
     static func statusRank(_ status: DeskStatus) -> Int {
         switch status {
         case .now: return 0
@@ -100,11 +70,7 @@ public enum DeskSequencing {
         }
     }
 
-    /// True when `item.deferUntil` parses AND is strictly after `now`.
-    ///
-    /// An UNPARSEABLE value is treated as NOT deferred. Parking an item forever
-    /// because someone typed a bad date is the worse failure: it would vanish
-    /// silently from `nextUp` and be suppressed from staleness at the same time.
+    /// Malformed defer dates cannot silently hide work from both next-up and staleness.
     public static func isDeferred(_ item: DeskItem, now: Date) -> Bool {
         guard let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
@@ -112,14 +78,12 @@ public enum DeskSequencing {
         return until > now
     }
 
-    /// A bare `yyyy-MM-dd` defers through that day in the Mac's zone; ISO stamps keep their time.
+    /// A local day defers through its end; an ISO instant keeps its exact time.
     public static func parseDeferStamp(_ raw: String) -> Date? {
         if let d = DeskClock.parseDay(raw) { return Calendar.autoupdatingCurrent.date(byAdding: .day, value: 1, to: d) }
         return DeskClock.parseISO(raw)
     }
 
-    /// The `yyyy-MM-dd` day a defer stamp lands on, for display. nil if
-    /// unparseable.
     public static func deferDisplayDay(_ raw: String) -> String? {
         DeskClock.normalizedDay(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
@@ -133,10 +97,7 @@ public enum DeskSequencing {
         byHandle.reserveCapacity(items.count)
         for item in items { byHandle[item.handle] = item }
 
-        // A blocker only blocks while it is LIVE and NON-TERMINAL. Absent from
-        // live state (archived, never existed, aged out) → does not block. THIS
-        // is the cascade. An experience condition blocks until its release is
-        // written onto the item, so every reader of the Desk sees the same wait.
+        // Experience waits require a durable release so every Desk reader observes the same condition.
         func blocks(_ handle: String) -> Bool {
             if handle.hasPrefix("exp:") { return true }
             guard let item = byHandle[handle] else { return false }
@@ -152,9 +113,7 @@ public enum DeskSequencing {
 
         let onCycle = cycleNodes(in: items, effectiveBlockers: effectiveBlockers)
 
-        // An item is not actionable while an ANCESTOR is deferred, effectively
-        // blocked, or waiting on owner input.
-        // Cycle-safe: parent chains can loop in a hand-authored feed.
+        // Ancestor waits propagate to descendants; visited handles keep authored parent cycles finite.
         func ancestorObstructs(_ handle: String) -> Bool {
             var seen: Set<String> = [handle]
             var current = byHandle[handle]?.parent
@@ -162,7 +121,8 @@ public enum DeskSequencing {
             while let cur = current, depth < deskMaxGraphDepth, seen.insert(cur).inserted {
                 depth += 1
                 guard let ancestor = byHandle[cur] else { return false }
-                if ancestor.status == .blocked || ancestor.requiresOwnerInput || ancestor.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false { return true }
+                if ancestor.status == .blocked || ancestor.requiresOwnerInput || ancestor.blockedReason?.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty == false { return true }
                 if deferred[cur] == true { return true }
                 if !(effectiveBlockers[cur] ?? []).isEmpty { return true }
                 if onCycle.contains(cur) { return true }
@@ -196,7 +156,6 @@ public enum DeskSequencing {
             )
         }
 
-        // nextUp: status rank, then blocker count, then openedAt, then alias seq.
         let ready = items.filter { plans[$0.handle]?.isReady == true }
         let ordered = ready.sorted { a, b in
             let ra = statusRank(a.status), rb = statusRank(b.status)
@@ -214,13 +173,8 @@ public enum DeskSequencing {
 
     // MARK: - Graph internals
 
-    /// Every node that sits ON a cycle in the effective blocked-on graph.
-    ///
-    /// Memoized iterative-free DFS with an ON-STACK set: when an edge lands on a
-    /// node that is currently on the stack, the whole stack suffix from that node
-    /// is a cycle and is marked. The visited set guarantees each node is expanded
-    /// once, so the walk TERMINATES on any input; the depth cap is the second
-    /// belt for a pathologically deep (non-cyclic) chain.
+    /// Mark only the active-stack suffix when DFS closes a cycle.
+    /// Visit each node once and cap depth so malformed graphs cannot hang a read.
     static func cycleNodes(in items: [DeskItem], effectiveBlockers: [String: [String]]) -> Set<String> {
         var visited: Set<String> = []
         var onStack: Set<String> = []
@@ -230,16 +184,13 @@ public enum DeskSequencing {
         func visit(_ node: String, depth: Int) {
             guard depth <= deskMaxGraphDepth else { return }
             if onStack.contains(node) {
-                // Mark the suffix of the current path starting at `node`.
                 if let idx = stackOrder.lastIndex(of: node) {
                     for n in stackOrder[idx...] { cyclic.insert(n) }
                 }
                 return
             }
             if visited.contains(node) {
-                // Already fully expanded. If it was found cyclic, a node feeding
-                // INTO it is not itself on that cycle — only reachability, which
-                // the effective-blocker check already handles.
+                // Reaching a cyclic node does not place this caller on that cycle.
                 return
             }
             visited.insert(node)

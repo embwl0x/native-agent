@@ -11,7 +11,7 @@ import MemoryV2
 import Privacy
 import SystemOps
 import TriggerScheduler
-// Blueprint: | `TrustBackupRestore.swift` | TrustBackupPersistence forward restore; complete validation before intent, canonical persona installation, cataloged safety backup, required transcript floor, durable receipt and continuity fences |
+// Blueprint: | `TrustBackupRestore.swift` | Validate before intent; preserve life and continuity before replacement. |
 
 actor RestoreExclusion {
     private var activeDataRoots: Set<String> = []
@@ -73,7 +73,10 @@ extension TrustBackupPersistence {
             }
         } catch {
             throw NSError(domain: "NativeAgentBackup", code: 422, userInfo: [
-                NSLocalizedDescriptionKey: "Backup source, integrity, persona, authority, session state or current transcript floor is invalid; no restore was staged or current data changed: \(error.localizedDescription)",
+                NSLocalizedDescriptionKey: """
+                    Backup source, integrity, persona, authority, session state or current transcript floor is invalid; no restore was staged or \
+                    current data changed: \(error.localizedDescription)
+                    """,
                 NSUnderlyingErrorKey: error,
             ])
         }
@@ -109,9 +112,7 @@ extension TrustBackupPersistence {
         )
     }
 
-    /// Runs before NativeAgentApp/AppModel construction, while no SQLite, TrustCenter, chat, cognition, or background-loop
-    /// owner has opened the data root. Preserve the life being left through the normal backup writer before replacing any
-    /// scope, then install the approved backup forward.
+    /// Restore before any live owner opens storage; capture the life being left before replacing validated scopes.
     public static func resumeStagedBackupRestoreAtLaunch(
         dataRoot root: URL
     ) async throws -> BackupRestoreResult? {
@@ -136,7 +137,10 @@ extension TrustBackupPersistence {
                 intent.safetyManifestSHA256 = kept.manifestSHA256
             } catch {
                 throw Self.backupError(code: 500,
-                    "NativeAgent could not keep the life before restore of \(target.id). No current data was replaced. Tell the person: the backup could not be written: \(error.localizedDescription)")
+                    """
+                        NativeAgent could not keep the life before restore of \(target.id). No current data was replaced. Tell the person: the backup \
+                        could not be written: \(error.localizedDescription)
+                        """)
             }
         }
         intent.state = .applying
@@ -152,8 +156,7 @@ extension TrustBackupPersistence {
             requiresRestart: false,
             notCarried: notes
         )
-        // Launch has no Backup UI owner yet. Keep the completed receipt on disk before removing the intent, so omissions remain
-        // inspectable afterward.
+        // Persist the completed receipt before removing intent so omissions remain inspectable without a launch UI owner.
         try SwiftNativePersistenceCore.writeDataAtomicDurable(
             JSONEncoder().encode(result), to: root.appendingPathComponent("backups/restore-receipt.json"))
         try FileManager.default.removeItem(at: intentPath)
@@ -212,7 +215,6 @@ extension TrustBackupPersistence {
                 at: destination.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            // Into a kept scope directory child by child, never over what it keeps.
             let copies = kept.isEmpty ? [source] : try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil)
             for from in copies where kept.isEmpty || !from.lastPathComponent.hasSuffix(".lock") {
                 let to = kept.isEmpty ? destination : destination.appendingPathComponent(from.lastPathComponent)
@@ -226,8 +228,7 @@ extension TrustBackupPersistence {
                     }
                 }
             }
-            // The scope was just replaced by real directories, so a recreated link never lands on (or writes through) an
-            // existing entry.
+            // Recreate links only after real scope directories replace prior entries so no write follows an existing link.
             for link in snapshot.links where NativeAgentWorkspaceRoot.relativePath(link.path, under: rel) != nil {
                 let path = destinationRoot.appendingNativeRelativePath(link.path)
                 try fm.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -243,15 +244,16 @@ extension TrustBackupPersistence {
         notes: inout [String]
     ) async throws {
         guard let id = intent.safetyBackupID else {
-            throw Self.backupError(code: 422, "The pre-restore backup is missing. Tell the person: NativeAgent cannot replace current data until its backup is kept.")
+            throw Self.backupError(code: 422,
+                "The pre-restore backup is missing. Tell the person: NativeAgent cannot replace current data until its backup is kept.")
         }
         let kept = try Self.validateBackupSnapshot(id: id, dataRoot: destinationRoot, requireRestorableAuthority: false)
         guard kept.manifestSHA256 == intent.safetyManifestSHA256,
               kept.reason == "before restore of \(target.id)" else {
-            throw Self.backupError(code: 422, "The pre-restore backup changed. Tell the person: NativeAgent kept the restore intent and refused to replace current data.")
+            throw Self.backupError(code: 422,
+                "The pre-restore backup changed. Tell the person: NativeAgent kept the restore intent and refused to replace current data.")
         }
-        // These are required evidence, never omissions. Read both before the first replacement,
-        // including on an interrupted .applying launch (the safety snapshot remains the old life).
+        // Read required continuity evidence before any replacement, including interrupted applying launches.
         let generationFloor = max(
             try Self.requiredTranscriptGenerationFloor(in: kept.dataDirectory, epochRoot: destinationRoot),
             try Self.requiredTranscriptGenerationFloor(in: target.dataDirectory, epochRoot: destinationRoot)
@@ -270,15 +272,14 @@ extension TrustBackupPersistence {
         notes += try SwiftNativeTriggerScheduler.mergeRestoreFences(
             safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot)
         try DataRootLife.begin(in: destinationRoot, id: intent.transactionID)
-        // Raise the selected backup above the prior phone version floor.
         try Self.rollTranscriptGenerationsForward(
             in: destinationRoot,
             priorGenerationFloor: generationFloor
         )
     }
 
-    /// Include hot and archived generations: archiving moves a counter, never retires it.
-    /// A readable empty index has no counters; only the archive and epoch may be truly absent.
+    /// Include hot and archived generations: archiving moves a counter, never retires it. A readable empty index has no counters; only the archive and epoch
+    /// may be truly absent.
     static func requiredTranscriptGenerationFloor(in root: URL, epochRoot: URL? = nil) throws -> Int64 {
         let archive = root.appendingPathComponent("chat/archive/sessions.jsonl")
         var floor: Int64 = 0
@@ -314,7 +315,6 @@ extension TrustBackupPersistence {
         return max(floor, value)
     }
 
-    /// Stamp the installed index above the required pre-replacement version floor.
     private static func rollTranscriptGenerationsForward(
         in root: URL,
         priorGenerationFloor: Int64
@@ -360,7 +360,10 @@ extension TrustBackupPersistence {
         } catch {
             throw Self.backupError(
                 code: 500,
-                "The transcript restore epoch could not be recorded, so the restored transcripts could not be raised above what the phone already holds: \(error.localizedDescription)"
+                """
+                    The transcript restore epoch could not be recorded, so the restored transcripts could not be raised above what the phone already \
+                    holds: \(error.localizedDescription)
+                    """
             )
         }
         return next
@@ -394,7 +397,6 @@ extension TrustBackupPersistence {
         }
     }
 
-    /// The live children of a restore scope that no backup carries, kept in place.
     private static func unbackedChildren(of rel: String, at destination: URL) throws -> Set<String> {
         guard rel == "senses" else { return [] }
         do { try Self.requireRegularDirectory(destination) }

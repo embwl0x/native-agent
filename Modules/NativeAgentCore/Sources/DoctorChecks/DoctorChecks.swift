@@ -1,13 +1,12 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `DoctorChecks.swift` | SwiftNativeDoctorChecks inventory and execution; seventeen ordered checks, StorageCheck-first preparation, concurrent measurements, scoped repairs and shared heartbeat exclusions |
+// Blueprint: | `DoctorChecks.swift` | Ordered Doctor inventory; StorageCheck-first setup; concurrent readings and scoped repair |
 
-/// Report internal failures as status "fail" with error detail so other checks still run.
+/// Convert internal failures into failed rows so independent checks still run.
 public protocol DoctorCheck: Sendable {
     var id: String { get }
     var title: String { get }
-    /// False excludes a check from unattended execution, failure counts and health; it remains visible in Doctor. Defaults to
-    /// true; operator-only checks must opt out.
+    /// Operator-only checks must opt out of unattended execution, health and failure counts.
     var heartbeatEligible: Bool { get }
     func run() async -> CheckResult
 }
@@ -16,15 +15,14 @@ public extension DoctorCheck {
     var heartbeatEligible: Bool { true }
 }
 
-/// Core exclusions derive from defaultChecks; app-mounted live IDs are explicit for persisted-report readers.
+/// Derive core exclusions from defaultChecks; persisted-report readers also need explicit app-mounted live IDs.
 public enum DoctorHeartbeatPolicy {
     public static let ineligibleCheckIDs: Set<String> = Set(
         SwiftNativeDoctorChecks.defaultChecks
             .filter { !$0.heartbeatEligible }
             .map(\.id)
     ).union([
-        // App-mounted Cognition checks include historical receipts and operator-only readings. They belong in Doctor, not phone
-        // alerts.
+        // Historical and operator-only cognition readings belong in Doctor and cannot trigger unattended phone alerts.
         "live.cognition.runtime", "live.cognition.persistence",
         "live.cognition.receipts", "live.cognition.readouts",
         "live.cognition.body", "live.cognition.welfare",
@@ -32,13 +30,11 @@ public enum DoctorHeartbeatPolicy {
         "live.cognition.context_flow", "live.cognition.phone_pairing",
     ])
 
-    /// True when an unattended sweep may judge this id.
     public static func isEligible(_ id: String) -> Bool {
         !ineligibleCheckIDs.contains(id)
     }
 }
 
-/// Checks that can safely repair app-owned state without an LLM.
 public protocol RepairingDoctorCheck: DoctorCheck {
     func run(repair: Bool) async -> CheckResult
 }
@@ -62,10 +58,9 @@ public actor SwiftNativeDoctorChecks: Sendable {
             RuntimeJSONStoresCheck(root: dataRoot),
             AbilityFilesCheck(root: dataRoot),
             RunLedgerIntegrityCheck(root: dataRoot),
-            TurnTraceIntegrityCheck(root: dataRoot),
             ChatSessionsCheck(root: dataRoot),
             SessionIdentityCheck(root: dataRoot),
-            // These bounded trace readings run only in Doctor and are excluded from unattended sweeps.
+            // Keep bounded trace readings off unattended execution and its alerts.
             PromptPrefixHealthCheck(root: dataRoot),
             SubconsciousVitalsCheck(root: dataRoot),
             ModelCompensationsCheck(root: dataRoot),
@@ -84,7 +79,7 @@ public actor SwiftNativeDoctorChecks: Sendable {
     }
 
     public func runAll() async -> [CheckResult] {
-        // Run StorageCheck first to prepare the tree, then the remaining checks concurrently; preserve declaration order.
+        // Prepare storage before concurrent measurements; preserve declared order in the returned rows.
         var sequentialResults: [(Int, CheckResult)] = []
         var concurrentChecks: [(Int, any DoctorCheck)] = []
         for (index, check) in checks.enumerated() {

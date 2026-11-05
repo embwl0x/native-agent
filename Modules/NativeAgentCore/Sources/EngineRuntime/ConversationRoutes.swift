@@ -1,5 +1,5 @@
 import ChatSessionWork
-// Blueprint: | `ConversationRoutes.swift` | Current SidebarItem route vocabulary, shell tab homes, SkillsToolsSection and fixed conversation provenance labels |
+// Blueprint: | `ConversationRoutes.swift` | Sidebar routes, tab homes and fixed provenance labels |
 
 public enum SkillsToolsSection: String, CaseIterable, Identifiable, Sendable {
     case skills = "Skills"
@@ -9,36 +9,32 @@ public enum SkillsToolsSection: String, CaseIterable, Identifiable, Sendable {
 }
 
 public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
-    // ── Page routes ─────────────────────────────────────────────────────
     case chat = "Chat"
     case bots = "Bots" // Injected by BotsShelfPreference; absent from unflagged destination lists.
-    case activity = "Activity"           // approvals + inbox + proposals
-    case memories = "Memories"           // memory list
-    case skills = "Skills"               // displayed as Skills & Tools; owns both subpages
-    case desk = "Desk"                   // the agent's canonical planning and work surface
-    case trust = "Trust"                 // policy, autonomy, Mac control
+    case activity = "Activity"
+    case memories = "Memories"
+    case skills = "Skills"
+    case desk = "Desk"
+    case trust = "Trust"
     case providers = "Providers"
-    case macIntegration = "Mac Integration" // per-integration READ/WRITE permission toggles (Calendar, Mail, Messages, ...)
-    case settings = "Settings"           // slim: voice + appearance + pairing + about
+    case macIntegration = "Mac Integration"
+    case settings = "Settings"
 
-    // ── Additional routes ───────────────────────────────────────────────
-    case personality = "Personality"     // agent identity and voice
+    case personality = "Personality"
     case connectors = "Connectors"
     case capabilities = "Capabilities"
     case knowledge = "Knowledge Graph"
-    case dreams = "Dreams"               // dream diary + REM consolidation controls (identity-adjacent)
+    case dreams = "Dreams"
     case cognition = "Cognition"
-    case diagnostics = "Diagnostics"     // Doctor + Status + Runs Log
+    case diagnostics = "Diagnostics"
     case inboxPolicy = "Inbox Policy"
-    case inspector = "Inspector"         // live per-turn readout and replay
+    case inspector = "Inspector"
 
-    // ── Routed child surfaces (not listed as sidebar rows) ────────────────
-    case telegram = "Telegram"           // Settings child + command route
-    case tools = "Tools"                 // Skills & Tools child page + command route
+    case telegram = "Telegram"
+    case tools = "Tools"
 
     public var id: String { rawValue }
 
-    /// Child routes resolve to their current page home.
     public var normalized: SidebarItem {
         switch self {
         case .tools: .skills
@@ -46,7 +42,6 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// The rail page hosting a routed tab and the tab's persisted key.
     public static func shellHome(for item: SidebarItem) -> (parent: SidebarItem, tab: String)? {
         switch item.normalized {
         case .knowledge: (.memories, "knowledge")
@@ -62,7 +57,6 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
 
     public var systemImage: String {
         switch self {
-        // Primary
         case .chat: "bubble.left.and.bubble.right"
         case .bots: "books.vertical"
         case .activity: "tray.full"
@@ -75,7 +69,6 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .providers: "server.rack"
         case .macIntegration: "gearshape.2"
         case .settings: "gearshape"
-        // Advanced
         case .capabilities: "shippingbox"
         case .knowledge: "circle.hexagonpath"
         case .dreams: "moon.stars"
@@ -92,13 +85,11 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         switch normalized {
         case .skills: "Skills & Tools"
         case .inboxPolicy: "Notifications"
-        // The page calls them helpers; the route id stays "Bots".
         case .bots: "Helpers"
         default: rawValue
         }
     }
 
-    /// Rail wording; display names and deep-link vocabulary stay unchanged.
     public var shellRailTitle: String {
         switch normalized {
         case .activity: "Today"
@@ -111,16 +102,13 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
 
 }
 
-/// Fixed provenance labels never render raw recorded origin strings;
-/// unknown origins are automated, never human-authored.
+/// Never render raw origin strings; unknown origins cannot claim human authorship.
 public struct MacChatMessageProvenance: Sendable, Equatable {
-    /// Fixed display text. Always a compile-time constant from this file —
-    /// never interpolated from a recorded value.
+    /// Use fixed display text so recorded values cannot inject provenance labels.
     public let label: String
-    /// SF Symbol name. Also always a constant from this file.
+    /// Use a fixed symbol, never a recorded value.
     public let symbol: String
-    /// True for automated/non-human ingress. This drives the stronger visual
-    /// treatment; it is not a cryptographic claim about a named process.
+    /// Visual automation treatment is not cryptographic process identity.
     public let isAutomated: Bool
 
     public static func make(role: String, source: String?, envelope: ChatMessageOriginMetadata?) -> MacChatMessageProvenance? {
@@ -129,8 +117,6 @@ public struct MacChatMessageProvenance: Sendable, Equatable {
             surface: envelope?.surface, agent: envelope?.agent
         ) else { return nil }
         switch provenance {
-        case .claude: return .init(label: "Claude - bridge", symbol: "arrow.triangle.branch", isAutomated: true)
-        case .codex: return .init(label: "Codex - bridge", symbol: "arrow.triangle.branch", isAutomated: true)
         case .telegram: return .init(label: "Telegram", symbol: "paperplane", isAutomated: false)
         case .slack: return .init(label: "Slack", symbol: "bubble.left.and.bubble.right", isAutomated: false)
         case .iPhone: return .init(label: "iPhone", symbol: "iphone", isAutomated: false)

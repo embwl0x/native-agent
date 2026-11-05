@@ -120,8 +120,7 @@ extension SwiftToolDispatcher {
             audit["detail"] = detail
             return audit
         }
-        // The detached native helper owns the delay, script process, explicit
-        // abort signals and terminal audit even after installation quits us.
+        // The detached native helper owns the delay, script process, explicit abort signals and terminal audit even after installation quits us.
         let auditURL = logURL.deletingLastPathComponent().appendingPathComponent("\(runId).json")
         let pid: pid_t
         do {
@@ -170,15 +169,15 @@ extension SwiftToolDispatcher {
             "sandboxed": .bool(false),
             "sandbox_mode": .string("off"),
             "outer_sandbox_policy": .string("forced_off"),
-            "note": .string("Installation handed to helper PID \(pid). It owns the start delay, installer and terminal audit at audit_path; stopping this conversation does not abort it."),
+            "note": .string("""
+                Installation handed to helper PID \(pid). It owns the start delay, installer and terminal audit at audit_path; stopping this \
+                conversation does not abort it.
+                """),
         ]
         return .object(env)
     }
-    /// The executable entry point stays synchronous: SwiftUI's App.main never
-    /// returns, so an async main would hold the main actor for the whole run and
-    /// no @MainActor launch work would ever start (10-23: her engine and bridges
-    /// never came up). In helper mode this process has no UI: it waits here for
-    /// the helper's own task and then exits.
+    /// Keep the executable entry synchronous: SwiftUI App.main never returns, so an async entry would monopolize the main actor and block launch work. Helper
+    /// mode has no UI and waits for its own task before exiting.
     public static func runScheduledInstallerHelperIfRequestedBlocking() -> Bool {
         guard CommandLine.arguments.dropFirst().first == "--nativeagent-install-helper" else { return false }
         let done = DispatchSemaphore(value: 0)
@@ -189,9 +188,8 @@ extension SwiftToolDispatcher {
         done.wait()
         return true
     }
-    /// Executable-only mode, before runtime startup. The accepted install has
-    /// its own process owner; app shutdown does not cancel it. Sending a stop
-    /// signal to this helper is the separate explicit abort boundary.
+    /// Executable-only mode, before runtime startup. The accepted install has its own process owner; app shutdown does not cancel it. Sending a stop signal to
+    /// this helper is the separate explicit abort boundary.
     static func runScheduledInstallerHelperIfRequested() async -> Bool {
         let args = CommandLine.arguments
         guard args.dropFirst().first == "--nativeagent-install-helper" else { return false }
@@ -222,8 +220,7 @@ extension SwiftToolDispatcher {
                 FileHandle.standardError.write(Data("Installer settlement failed: \(error)\n".utf8))
             }
         }
-        // A signal can interrupt admission during this user-selected delay.
-        // The physical helper owns the wait and checks cancellation before run.
+        // A signal can interrupt admission during this user-selected delay. The physical helper owns the wait and checks cancellation before run.
         await withTaskCancellationHandler {
             _ = await startDelay.result
         } onCancel: {

@@ -2,12 +2,9 @@ import Foundation
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `MoonshotModelCatalog.swift` | `MoonshotModelCatalog`: authenticated model parsing/capabilities and credential-bound cache through shared TTL state machinery; models without a declared adapter reasoning contract retain unknown controls and a row-owned limitation note |
+// Blueprint: | `MoonshotModelCatalog.swift` | `MoonshotModelCatalog`: authenticated model discovery |
 
-/// Authenticated Moonshot/Kimi model discovery with a bounded offline cache.
-/// Capability flags come from Moonshot's `/v1/models` response; NativeAgent's
-/// own adapter capabilities (streaming, tools, JSON, and supported Think
-/// controls) remain explicit here rather than inferred from marketing names.
+/// Only provider metadata supplies model capabilities; native wire support and Think controls remain explicit.
 public enum MoonshotModelCatalog {
     public static let endpoint = URL(string: "https://api.moonshot.ai/v1/models")!
 
@@ -28,7 +25,7 @@ public enum MoonshotModelCatalog {
         await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// The same read, saying whether it reached Moonshot and, if not, why.
+    /// Discovery provenance must say whether the network was reached.
     public static func modelsWithFreshness(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         session: URLSession = .shared,
@@ -37,10 +34,7 @@ public enum MoonshotModelCatalog {
         await ttlCache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// The routing guard recognizes account-visible IDs from the same decoded
-    /// disk cache `models()` maintains, without touching the network.
-    /// Only the provider's own fetched rows count here; the shipped rows are
-    /// `FirstPartyModelCatalog.moonshotModels`, which routing checks first.
+    /// Routing reads the same credential-bound cache without network access; shipped rows retain their own catalog authority.
     public static func isKnownCatalogModelID(
         _ id: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -60,7 +54,8 @@ public enum MoonshotModelCatalog {
             guard !id.isEmpty else { throw LLMError.providerError(message: "Moonshot model row has an empty ID.") }
             guard let context = positiveInt(row["context_length"]),
                   let vision = boolean(row["supports_image_in"]) else {
-                throw LLMError.providerError(message: "Moonshot did not establish the context window or image capability of \(id). Refresh its model catalog before selecting it.")
+                throw LLMError.providerError(
+                    message: "Moonshot did not establish the context window or image capability of \(id). Refresh its model catalog before selecting it.")
             }
             byID[id] = ProviderModelInfo(
                 id: id,
@@ -86,8 +81,7 @@ public enum MoonshotModelCatalog {
         }
     }
 
-    /// The live catalog states no reasoning contract: a model's controls are
-    /// its declared row's. An id with no row has unknown controls.
+    /// The live catalog states no reasoning contract: a model's controls are its declared row's. An id with no row has unknown controls.
     public static func defaultReasoningEffort(for modelID: String) -> String? {
         FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.defaultReasoningEffort
     }

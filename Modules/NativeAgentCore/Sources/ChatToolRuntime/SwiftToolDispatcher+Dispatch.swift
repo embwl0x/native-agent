@@ -21,12 +21,9 @@ import Studio
 import Senses
 import Research
 import TurnTrace
-// Blueprint: | `SwiftToolDispatcher+Dispatch.swift` | One normalized dispatch ingress, pure argument validation and part-write receipts with unchanged routes and artifact results |
+// Blueprint: | `SwiftToolDispatcher+Dispatch.swift` | Normalized dispatch; pure validation; part-write receipts |
 extension SwiftToolDispatcher {
-    /// A bare address as a person types it ("example.com", "x.com/home") gets
-    /// https:// before Chrome or page-read dispatch.
-    /// Anything else, a scheme, not a domain ("back") or a file name
-    /// ("notes.txt"), is returned as given; https:// typed out still works.
+    /// Only bare web addresses gain https://; explicit schemes, file names and navigation words retain their meaning.
     static func withWebScheme(_ raw: String) -> String {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let bare = #"^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?::\d+)?(?:[/?#]\S*)?$"#
@@ -39,19 +36,22 @@ extension SwiftToolDispatcher {
         "dmg", "pkg", "app", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "key", "pages", "numbers", "mov", "mp3", "mp4",
         "wav", "yaml", "yml", "toml", "xml", "plist", "sql", "db", "rtf", "ipynb"]
 
-    public func dispatch(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
-        ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: requestedTool, input: rawInput) { input in
+    public func dispatch(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String, turn: Turn,
+        invocation: ChatToolInvocation) async throws -> JSONValue {
+        return ChatToolOutcome.normalizedFailure(try await withToolArguments(turn: turn, invocation: invocation, tool: requestedTool, input: rawInput,
+            surface: surface) { input, invocation in
             try await MacAppActGate.withAdmission(
-                origin: SecurityOriginContext.currentTurn(verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface),
-                dataRoot: dataRoot
-            ) {
-                try await dispatchNormalized(tool: requestedTool, input: input, surface: surface)
+                origin: SecurityOriginContext.currentTurn(turn: turn, surface: surface),
+                dataRoot: dataRoot, turn: turn, context: invocation.macContext(dataRoot: dataRoot)
+            ) { turn, context in
+                try await dispatchNormalized(turn: turn, invocation: invocation.serving(mac: context), tool: requestedTool, input: input, surface: surface)
             }
-        }, tool: CanonicalToolNameDispatcher.canonical(requestedTool))
+        }, tool: CanonicalToolNameDispatcher.canonical(requestedTool), throughAppDoor: invocation.appDoor != nil)
     }
-    private func dispatchNormalized(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
+    private func dispatchNormalized(turn: Turn, invocation: ChatToolInvocation, tool requestedTool: String, input rawInput: [String: JSONValue],
+        surface: String) async throws -> JSONValue {
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        var input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
+        var input = ChatToolSessionInjection.apply(turn: turn, toolName: tool, input: rawInput)
         if ToolCallParser.isIgnorableToolName(tool) {
             return .object([
                 "status": .string("ignored"),
@@ -83,29 +83,34 @@ extension SwiftToolDispatcher {
         var deskState: DeskState?
         if Self.deskItemTools.contains(tool) {
             if tool == "desk_wait" {
-                try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["desk_wait"]).deskSchemas().compactMap { $0 }.first)
+                try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["desk_wait"]).deskSchemas()
+                    .compactMap { $0 }.first)
             }
             let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
             deskState = state
             let handle = try resolveDeskHandle(input, in: state)
             input["handle"] = .string(handle)
-            if let session = ChatToolSessionInjection.currentSession,
+            if let session = ChatToolSessionInjection.currentSession(turn: turn),
                let refusal = try await deskHeld(handle, session: session) { return refusal }
         }
         // A contributed tool runs in its owner's executor.
         if let appTools, executorOwnedToolNames.contains(tool) {
             if tool == "app" {
-                return try await AppDoorReentry.$validate.withValue({ name, arguments in
-                    if let refusal = await self.preApprovalRefusal(tool: name, input: arguments, surface: surface) { return refusal }
-                    return await self.fileReadPreviewRefusal(tool: name, input: arguments, surface: surface)
-                }) {
-                    try await appTools.execute(tool: tool, input: input, surface: surface)
+                guard var door = invocation.appDoor else {
+                    throw ToolFailureError("The app door has no dispatcher. Nothing ran.", effects: .none, owner: "App dispatch")
                 }
+                door.validate = { name, arguments, turn, invocation in
+                    if let refusal = await self.preApprovalRefusal(turn: turn, invocation: invocation, tool: name, input: arguments,
+                        surface: surface) { return refusal }
+                    return await self.fileReadPreviewRefusal(turn: turn, invocation: invocation, tool: name, input: arguments, surface: surface)
+                }
+                return try await appTools.execute(tool: tool, input: input, surface: surface,
+                    turn: turn, invocation: invocation.with(\.appDoor, door))
             }
-            return try await appTools.execute(tool: tool, input: input, surface: surface)
+            return try await appTools.execute(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
         }
-        if Self.fileAccessGatedToolNames.contains(tool), try await !fullMacToolAccess(surface: surface).fileOpsAllowed {
-            return builderFullMacRequired(tool: tool, input: input)
+        if Self.fileAccessGatedToolNames.contains(tool), try await !fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+            return builderFullMacRequired(invocation: invocation, tool: tool, input: input)
         }
         switch tool {
         case "maps_search":
@@ -126,8 +131,10 @@ extension SwiftToolDispatcher {
                 try await reader.search(query: query, categories: categories.isEmpty ? nil : categories,
                                         timeRange: timeRange.isEmpty ? nil : timeRange)
             }
+            let reply = ToolResult(result)
             // A search only reads: a failed one changed nothing.
-            if case .object(var fields) = result, fields["status"] != .string("ok") {
+            if case .object(var fields) = result,
+               !(reply.said("ok") && reply.status == fields["status"]?.stringValue) {
                 fields["effects"] = .string("none")
                 result = .object(fields)
             }
@@ -175,84 +182,86 @@ extension SwiftToolDispatcher {
             var senseInput = input
             senseInput["__sense_action"] = .string("web.read")
             let result = try await SenseDoor.read(corner: corner, address: observedURL, input: senseInput,
-                scope: ChatToolSessionContext.verifiedSessionId ?? "",
+                scope: turn.verifiedSessionID ?? "",
                 nativeCorner: .stream(id: "web"),
-                raw: { fetched },
-                material: { document in
-                    guard case .object(let fields) = document, fields["status"] != .string("failed") else {
+                operation: invocation.senseOperation(turn: turn),
+                raw: { _ in fetched },
+                material: { document, _ in
+                    let reply = ToolResult(document)
+                    guard case .object(let fields) = document,
+                          !(reply.said("failed") && reply.status == fields["status"]?.stringValue) else {
                         throw SenseFailure(code: "source_unavailable", message: "The original reader refused this read.")
                     }
                     return .pageSnapshot(document)
                 })
             if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"], coverage["thin_page"] == .bool(true) {
                 let continuation: [String: JSONValue] = ["reason": .string("thin_page"), "hint": coverage["hint"] ?? .null,
-                    "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("chrome.navigate"), "args": .object(["url": .string(observedURL)])])])]
+                    "next_call": .object([
+                        "tool": .string("app"),
+                        "input": .object([
+                            "action": .string("chrome.navigate"),
+                            "args": .object(["url": .string(observedURL)])])])]
                 if case .object(let output) = result { return .object(output.merging(continuation) { _, next in next }) }
                 if case .string(let text) = result { return .string(text + "\n" + (try JSONValue.object(continuation).serialize(pretty: false))) }
             }
             return result
-        // The three basic file tools, when Full Mac file access is off. A path
-        // the workspace lane cannot reach is not a fact to report in prose —
-        // it is one switch away, and asking for it is the honest move.
+        // Ask for the missing file-access switch; prose alone cannot resolve a workspace boundary.
         case "read_file":
             do {
-                return try await impl_read_file(input: input, surface: surface)
+                return try await impl_read_file(turn: turn, invocation: invocation, input: input, surface: surface)
             } catch {
-                guard let need = fileOpsNeedEnvelope(
+                guard let need = fileOpsNeedEnvelope(invocation: invocation,
                     tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
                 ) else { throw error }
                 return need
             }
         case "list_dir", "file_info":
             if tool == "list_dir" { input = Self.listDirInput(input) }
-            if try await fullMacToolAccess(surface: surface).fileOpsAllowed {
-                return tool == "list_dir" ? try await impl_full_mac_list_dir(input: input, surface: surface)
-                    : try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
+            if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+                return tool == "list_dir" ? try await impl_full_mac_list_dir(turn: turn, invocation: invocation, input: input, surface: surface)
+                    : try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
             }
             do {
-                return try await impl_file_metadata(tool: tool, input: input)
+                return try await impl_file_metadata(turn: turn, invocation: invocation, tool: tool, input: input)
             } catch {
-                guard let need = fileOpsNeedEnvelope(
+                guard let need = fileOpsNeedEnvelope(invocation: invocation,
                     tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
                 ) else { throw error }
                 return need
             }
         case "write_file", "move_file", "copy_file", "trash_file":
-            if try await fullMacToolAccess(surface: surface).fileOpsAllowed {
-                return partWrote(try await impl_local_connector_tool(tool: tool, input: input, surface: surface))
+            if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+                return partWrote(invocation: invocation, try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: input,
+                    surface: surface))
             }
             do {
-                return partWrote(try await impl_trusted_file_mutation(tool: tool, input: input))
+                return partWrote(invocation: invocation, try await impl_trusted_file_mutation(turn: turn, invocation: invocation, tool: tool, input: input))
             } catch {
-                guard let need = fileOpsNeedEnvelope(
+                guard let need = fileOpsNeedEnvelope(invocation: invocation,
                     tool: tool, mode: .write, path: input["path"]?.stringValue, error: error
                 ) else { throw error }
                 return need
             }
         case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete":
-            return try await impl_standingBots(tool: tool, input: input, surface: surface)
-        case "recall_memory":   return try await impl_recall_memory(input: input, surface: surface)
-        case "commit_memory":   return try await impl_commit_memory(input: input)
-        // Her review seat over the memory proposals still waiting on her.
+            return try await impl_standingBots(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
+        case "recall_memory":   return try await impl_recall_memory(turn: turn, input: input, surface: surface)
+        case "commit_memory":   return try await impl_commit_memory(turn: turn, invocation: invocation, input: input)
         case "memory_proposals_pending": return try await impl_memory_proposals_pending(input: input, surface: surface)
-        case "memory_proposal_review": return try await impl_memory_proposal_review(input: input, surface: surface)
+        case "memory_proposal_review": return try await impl_memory_proposal_review(turn: turn, invocation: invocation, input: input, surface: surface)
         case "forget_memory":   return try await impl_forget_memory(input: input)
         case "rebuild_knowledge_graph": return try await impl_rebuild_knowledge_graph(input: input)
-        case "workshop_submit": return try await impl_workshop_submit(input: input)
-        case "workshop_status": return try await impl_workshop_status(input: input)
         case "task_ledger_post": return try await impl_task_ledger_post(input: input)
         case "task_ledger_list": return try await impl_task_ledger_list(input: input)
-        // delegation_status reads wake-job stores without writes, spawns or network access.
-        case "delegation_status": return try await impl_delegation_status(input: input)
+        case "delegation_status": return try await impl_delegation_status(invocation: invocation, input: input)
         case "agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel":
-            let result = try await impl_agentCommunication(tool: tool, input: input, surface: surface)
+            let result = try await impl_agentCommunication(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
             // A connection ends discovery's offer of it in the same call.
             if tool == "agent_connect" { await AgentDiscoverySession.shared.settle(dataRoot: dataRoot) }
             return result
         case "desk_read": return try await impl_desk_read(input: input)
         case "desk_add_item": return try await impl_desk_add_item(input: input)
-        case "desk_set_status": return try await impl_desk_set_status(input: input, state: deskState!)
-        case "desk_wait": return try await impl_desk_wait(input: input, state: deskState!)
+        case "desk_set_status": return try await impl_desk_set_status(invocation: invocation, input: input, state: deskState!)
+        case "desk_wait": return try await impl_desk_wait(invocation: invocation, input: input, state: deskState!)
         case "desk_update_item": return try await impl_desk_update_item(input: input)
         case "desk_note": return try await impl_desk_note(input: input)
         case "desk_add_ref": return try await impl_desk_add_ref(input: input)
@@ -263,100 +272,91 @@ extension SwiftToolDispatcher {
         case "desk_blocked_on": return try await impl_desk_blocked_on(input: input, state: deskState!)
         case "desk_defer": return try await impl_desk_defer(input: input)
         case "desk_breakdown": return try await impl_desk_breakdown(input: input)
-        case "desk_nag_control": return try await impl_desk_nag_control(input: input)
+        case "desk_nag_control": return try await impl_desk_nag_control(turn: turn, invocation: invocation, input: input, surface: surface)
         case "desk_open_pursuit": return try await impl_desk_open_pursuit(input: input)
         case "desk_work_log": return try await impl_desk_work_log(input: input)
-        // Studio chat lane (desk 903): consults filed against the agent's taste
-        // and the journal she writes herself. Nothing here auto-appends and
-        // nothing auto-retrieves.
+        // Consults and journal entries remain deliberate calls; dispatch neither appends nor retrieves automatically.
         case "studio_consult": return try await impl_studio_consult(input: input)
         case "studio_consult_read": return try await impl_studio_consult_read(input: input)
-        case "studio_journal": return try await impl_studio_journal(input: input)
-        case "studio_journal_amend": return try await impl_studio_journal_amend(input: input)
-        case "studio_recall": return try await impl_studio_recall(input: input)
+        case "studio_journal": return try await impl_studio_journal(turn: turn, input: input, surface: surface)
+        case "studio_journal_amend": return try await impl_studio_journal_amend(turn: turn, input: input, surface: surface)
+        case "studio_recall": return try await impl_studio_recall(turn: turn, invocation: invocation, input: input)
         case "dream_diary_read": return try await impl_dream_diary_read(input: input)
-        case "studio_shelf_read": return await impl_studio_shelf(input: input, surface: surface, set: false)
-        case "studio_shelf_set": return await impl_studio_shelf(input: input, surface: surface, set: true)
+        case "studio_shelf_read": return await impl_studio_shelf(turn: turn, input: input, surface: surface, set: false)
+        case "studio_shelf_set": return await impl_studio_shelf(turn: turn, input: input, surface: surface, set: true)
         case "studio_canon": return try await impl_studio_canon(input: input)
-        // `surface` is threaded in because the canon SEAT is decided from
-        // runtime provenance and cross-checked against the running turn, never
-        // read from tool input. See StudioCanonSeatGate.
+        // Derive the canon seat from runtime provenance, cross-checked against the live turn, never tool input.
         case "studio_canon_resolve":
-            return try await impl_studio_canon_resolve(input: input, surface: surface)
+            return try await impl_studio_canon_resolve(turn: turn, input: input, surface: surface)
         case "search_kg":       return try await impl_search_kg(input: input, surface: surface)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "workspace":
-            // The outer verified-session facade consumes this preparation;
-            // Core alone never turns a button into an ungated nested action.
+            // The outer verified-session facade consumes this preparation; Core alone never turns a button into an ungated nested action.
             return .object(["status": .string("prepared"), "execution": .string("requires_workspace_runtime")])
-        case "work_context": return try await impl_work_context(input: input, surface: surface)
-        case "artifact_find": return try await impl_artifact_find(input: input)
+        case "work_context": return try await impl_work_context(turn: turn, invocation: invocation, input: input, surface: surface)
+        case "artifact_find": return try await impl_artifact_find(turn: turn, input: input)
         case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)
-        case "get_persona_doc": return try await impl_get_persona_doc(input: input)
-        case "persona_read": return try await impl_persona_read(input: input)
+        case "get_persona_doc": return try await impl_get_persona_doc(turn: turn, input: input)
+        case "persona_read": return try await impl_persona_read(turn: turn, input: input)
         case "persona_write": return try await impl_persona_write(input: input)
         case "persona_append_section": return try await impl_persona_append_section(input: input)
-        case "agent_introspect": return try await impl_agent_introspect(input: input)
-        case "tool_result_page": return await impl_tool_result_page(input: input)
-        case "request_interaction": return await impl_request_interaction(input: input)
+        case "agent_introspect": return try await impl_agent_introspect(turn: turn, input: input, surface: surface)
+        case "tool_result_page": return await impl_tool_result_page(turn: turn, input: input)
+        case "request_interaction": return await impl_request_interaction(invocation: invocation, input: input)
         case "context_lookup": return try await impl_context_lookup(input: input)
-        case "context_expand": return try await impl_context_expand(input: input, surface: surface)
+        case "context_expand": return try await impl_context_expand(turn: turn, invocation: invocation, input: input, surface: surface)
         case "scratchpad_read": return try await impl_scratchpad_read(input: input)
-        case "recent_trace_summary": return try await impl_recent_trace_summary(input: input)
+        case "recent_trace_summary": return try await impl_recent_trace_summary(turn: turn, invocation: invocation, input: input)
         case "time_now": return ClockReply.read(input) { $0.chat }
-        // Reading inner state never mutates, persists or calls a provider.
         case "inner_state": return await impl_inner_state(input: input, surface: surface)
-        // Builder CLI calls require the Full Mac file-operations gate and write data/builder_audit/<uuid>.json.
         case "shell":
-            return await Self.impl_shell(input: input, dataRoot: dataRoot)
+            return await Self.impl_shell(turn: turn, input: input, dataRoot: dataRoot)
         case "bash":
-            return await Self.impl_shell(input: input, dataRoot: dataRoot, executable: "/bin/bash", toolName: "bash")
+            return await Self.impl_shell(turn: turn, input: input, dataRoot: dataRoot, executable: "/bin/bash", toolName: "bash")
         case "git":
-            return await Self.impl_git(input: input, dataRoot: dataRoot)
+            return await Self.impl_git(turn: turn, input: input, dataRoot: dataRoot)
         case "apply_patch":
-            return await Self.impl_apply_patch(input: input, dataRoot: dataRoot)
+            return await Self.impl_apply_patch(turn: turn, input: input, dataRoot: dataRoot)
         case "swift_build":
-            return await Self.impl_swift_package(command: "build", input: input, dataRoot: dataRoot)
+            return await Self.impl_swift_package(turn: turn, command: "build", input: input, dataRoot: dataRoot)
         case "swift_test":
-            return await Self.impl_swift_package(command: "test", input: input, dataRoot: dataRoot)
+            return await Self.impl_swift_package(turn: turn, command: "test", input: input, dataRoot: dataRoot)
         case "remote_node_list":
             return try await impl_remote_node_list()
         case "remote_node_execute":
             return try await impl_remote_node_execute(input: input)
         case "install_app":
             return await Self.impl_install_app(input: input, dataRoot: dataRoot)
-        // restart_app shares the builder gate and AppRelaunch cooldown, audit and relaunch with Telegram /restart.
+        // Share restart policy, cooldown and audit with Telegram /restart.
         case "restart_app":
             let reason: String = {
                 if case .string(let r)? = input["reason"] { return r }
                 return ""
             }()
-            return await AppRelaunch.shared.requestRestart(
+            return await AppRelaunch.shared.requestRestart(turn: turn,
                 reason: reason,
                 source: "chat:\(surface)"
             )
-        case "agent_swarm": return try await impl_agent_swarm(input: input, surface: surface)
         case "image_generate":
-            let generated = await impl_image_generate(input: input, surface: surface)
-            guard case .object(let generation) = generated, generation["status"] == .string("ok") else { return generated }
+            let generated = await impl_image_generate(turn: turn, invocation: invocation, input: input, surface: surface)
+            let reply = ToolResult(generated)
+            guard case .object(let generation) = generated, reply.said("ok"), reply.status == generation["status"]?.stringValue else { return reply.payload }
             let paths = (generation["images"]?.arrayValue ?? []).compactMap { image -> String? in
                 guard let path = (image.objectValue?["path"])?.stringValue else { return nil }
                 return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
             }
-            // Provider execution stays native; the part composes its raw
-            // artifact result with make.add. Only this native receipt grants
-            // output provenance, not the part's returned or supplied JSON.
-            let registration = await MakeStudio.$generatedImagePaths.withValue(Set(paths)) {
-                await Parts(root: dataRoot).call(id: "make-generated", input: .object([
+            // Provider execution stays native; the part composes its raw artifact result with make.add. Only this native receipt grants output provenance, not
+            // the part's returned or supplied JSON.
+            let registration = await Parts(root: dataRoot).call(id: "make-generated", input: .object([
                     "generated": generated, "prompt": .string(input["prompt"]?.stringValue ?? input["description"]?.stringValue ?? ""),
                     "ref": input["__make_ref"]?.stringValue.map(JSONValue.string) ?? .null]),
-                    within: .init(actions: ["make.add"], capabilities: []), as: JSONValue.self)
-            }
+                    within: .init(actions: ["make.add"], capabilities: []),
+                    invocation: invocation.partInvocation(turn: turn.with(\.makeRegistration, .init(generatedImagePaths: Set(paths))), surface: surface),
+                    as: JSONValue.self)
             switch registration {
             case .success(let result): return Self.studioImageInvitation(result)
             case .failure(let error):
-                // Registration failed after generation completed. Keep the
-                // artifacts top-level for every reply surface and persistence.
+                // Registration failed after generation completed. Keep the artifacts top-level for every reply surface and persistence.
                 var response = generation
                 response["status"] = .string("failed")
                 response["reason"] = .string("make_registration_failed")
@@ -364,62 +364,43 @@ extension SwiftToolDispatcher {
                 response["effects"] = .string("unknown")
                 return .object(response)
             }
-        case let name where MacIntegrationGates.byTool[name] != nil:
-            return try await dispatchMacIntegrationTool(tool: name, surface: surface, input: input)
-        case "claude_message":
-            // Claude messages append to the private JSONL inbox without launching a process.
-            return try await runClaudeMessage(
-                input: input,
-                surface: surface,
-                configRootOverride: agentBridgeConfigRoot
-            )
-        case "codex_message":
-            // Codex messages use the durable inbox and optionally notify through the Mac integration bridge.
-            return try await runCodexMessage(input: input, surface: surface)
-        case "omp_message":
-            return try await runOMPMessage(input: input, surface: surface)
-        case "invoke_codex":
-            // codex exec runs a bounded subprocess with a Trust-selected sandbox and a data/from_codex/<uuid>.json audit.
-            return PeerDataTaintDispatcher.labelled(try await Self.runInvokeCodex(input: input, dataRoot: dataRoot,
-                launch: await Self.drivenAgentLaunch(
-                surface: surface, contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot),
-                name: "Codex", dataRoot: dataRoot)), agent: "codex", dataRoot: dataRoot)
+        case let name where Self.macIntegrationAccess(forTool: name) != nil:
+            return try await dispatchMacIntegrationTool(turn: turn, invocation: invocation, tool: name, surface: surface, input: input)
         case "mac_location":
-            // The fix the Mac holds answers first, whatever the permission now.
-            // Not yet asked: macOS's own prompt is the ask (the reader raises it);
-            // the Settings-row card is for a denial with nothing held.
-            let held = try await MacLocationReader.read()
-            guard !Task.isCancelled, !TaskWaitDeadline.expired else { throw TaskWaitDeadline.cancellationError }
-            guard case .object(let fields) = held, fields["status"] != .string("ok"),
+            // The fix the Mac holds answers first, whatever the permission now. Not yet asked: macOS's own prompt is the ask (the reader raises it); the
+            // Settings-row card is for a denial with nothing held.
+            let held = try await MacLocationReader.read(context: invocation.macContext(dataRoot: dataRoot))
+            let reply = ToolResult(held)
+            guard !Task.isCancelled, !invocation.expired else { throw invocation.cancellationError }
+            guard case .object(let fields) = held, !(reply.said("ok") && reply.status == fields["status"]?.stringValue),
                   [.denied, .restricted].contains(SystemPermissionPreflight.status(.location)) else { return held }
-            return await Self.requestedInteraction(input: [
+            return await Self.requestedInteraction(invocation: invocation, input: [
                 "kind": .string("permission"), "target": .string("location"), "mode": .string("read"),
                 "why": .string("I need Location Services to read where this Mac is."),
                 "decline_consequence": .string("I can ask the paired iPhone for location or use a place you give me.")
             ], dataRoot: dataRoot)
         case "mac_screenshot_save":
-            return try await impl_mac_screenshot_save(input: input, surface: surface)
+            return try await impl_mac_screenshot_save(turn: turn, invocation: invocation, input: input, surface: surface)
         case let name where Self.fullMacFileToolNames.contains(name):
-            return try await impl_local_connector_tool(tool: name, input: input, surface: surface)
+            return try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: name, input: input, surface: surface)
         case let name where Self.fullMacSystemToolNames.contains(name):
-            return try await impl_local_connector_tool(tool: name, input: input, surface: surface)
+            return try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: name, input: input, surface: surface)
         // Four verbs own their composed execution before the raw routes.
         case let name where Self.fourVerbToolNames.contains(name):
-            return try await impl_mac_four_verbs_tool(tool: name, input: input, surface: surface)
+            return try await impl_mac_four_verbs_tool(turn: turn, invocation: invocation, tool: name, input: input, surface: surface)
         case let name where Self.fullMacAccessibilityReadToolNames.contains(name)
             || Self.fullMacAccessibilityInjectionToolNames.contains(name)
             || Self.macClipboardToolNames.contains(name) || Self.macMenuToolNames.contains(name):
-            return try await impl_mac_control_tool(tool: name, input: input, surface: surface)
+            return try await impl_mac_control_tool(turn: turn, invocation: invocation, tool: name, input: input, surface: surface)
         // Document reads also apply file authority when their route uses a path.
         case let name where Self.macReadToolNames.contains(name):
-            return try await impl_mac_read_tool(tool: name, input: input, surface: surface)
+            return try await impl_mac_read_tool(turn: turn, invocation: invocation, tool: name, input: input, surface: surface)
         // Activity queries use capture preferences and remain Mac-local.
         case let name where Self.activityQueryToolNames.contains(name):
-            return try await impl_activity_query_tool(tool: name, input: input, surface: surface)
+            return try await impl_activity_query_tool(turn: turn, tool: name, input: input, surface: surface)
         default:
-            // Authored calls use Parts.run with the selected fingerprint.
-            // Parts verifies admission on every run; keeping follows its
-            // Full Mac/owner authority rule. Built-ins matched above.
+            // Authored calls use Parts.run with the selected fingerprint. Parts verifies admission on every run; keeping follows its Full Mac/owner authority
+            // rule. Built-ins matched above.
             if let record = try registryToolRecord(tool) {
                 guard case .string(let fingerprint)? = record["codeFingerprint"], !fingerprint.isEmpty else {
                     return .object([
@@ -427,14 +408,23 @@ extension SwiftToolDispatcher {
                         "effects": .string("none"),
                         "reason": .string("unsigned_tool"),
                         "tool": .string(tool),
-                        "fix": .string("Part '\(tool)' has no codeFingerprint in its selected abilities/<id>.js file. Read it with ability.read, then keep it with ability.enable."),
+                        "fix": .string("""
+                            Part '\(tool)' has no codeFingerprint in its selected abilities/<id>.js file. Read it with ability.read, then keep \
+                            it with ability.enable.
+                            """),
                     ])
                 }
-                // Pin execution to the selected fingerprint; a registry or manifest
-                // swap between selection and run must fail with fingerprintMismatch.
+                // Pin the selected fingerprint so a registry or manifest swap fails with fingerprintMismatch.
+                var partInvocation = invocation.partInvocation(turn: turn, surface: surface)
+                partInvocation = Parts.Invocation(host: partInvocation.host, execution: partInvocation.execution,
+                    arrived: partInvocation.arrived, progressed: partInvocation.progressed,
+                    openScreenWatch: { request, hands in
+                        try await self.openScreenWatch(turn: turn, invocation: invocation, request, hands: hands, surface: surface)
+                    })
                 return try await Parts(root: dataRoot)
                     .run(id: tool, input: .object(input.filter { $0.key != "__session_id" }),
-                         requiredFingerprint: OwnedProgramInvocation.valueCall.flatMap { $0.id == tool ? $0.version : nil } ?? fingerprint)
+                         requiredFingerprint: invocation.valueCall.flatMap { $0.id == tool ? $0.version : nil } ?? fingerprint,
+                         invocation: partInvocation)
             }
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' is not in the dispatch table"
@@ -443,14 +433,14 @@ extension SwiftToolDispatcher {
     }
 }
 extension SwiftToolDispatcher: PureToolArgumentValidating {
-    public func argumentRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
+    public func argumentRefusal(tool: String, input: [String: JSONValue], turn: Turn) async -> JSONValue? {
         let tool = CanonicalToolNameDispatcher.canonical(tool)
         if tool == "desk_close" {
             do { try Self.validateDeskClose(input) }
             catch { return ChatToolOutcome.failure(error: error, tool: tool) }
         }
         if let appTools, executorOwnedToolNames.contains(tool) {
-            return await (appTools as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
+            return await (appTools as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input, turn: turn)
         }
         if tool == "apply_patch" { return Self.builderValidatePatch(input: input).refusal }
         if ["mail_mark_read", "mail_archive", "mail_delete", "mail_reply", "mail_draft"].contains(tool),
@@ -463,13 +453,13 @@ extension SwiftToolDispatcher: PureToolArgumentValidating {
                     argumentPath: "$.expected_message_id", accepted: "An observed exact Mail locator, or subject matching.", effects: .none), tool: tool)
             }
         }
-        return await (macIntegrationBridge as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
+        return await (macIntegrationBridge as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input, turn: turn)
     }
 }
 extension SwiftToolDispatcher {
     /// A part's own file write, told to its run as it stands right after the write.
-    func partWrote(_ result: JSONValue) -> JSONValue {
-        guard let wrote = SkillRunContext.wrote, ChatToolOutcome.outputLooksSuccessful(result),
+    func partWrote(invocation: ChatToolInvocation, _ result: JSONValue) -> JSONValue {
+        guard let wrote = invocation.wrote, ChatToolOutcome.outputLooksSuccessful(result),
               case .object(let fields) = result, case .string(let path)? = fields["path"] else { return result }
         wrote(URL(fileURLWithPath: path))
         return result

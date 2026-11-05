@@ -2,11 +2,9 @@ import Foundation
 import PersistenceCore
 import PersonaEngine
 
-// Blueprint: | `REMGrowthWriter.swift` | Exact standalone-paragraph ranges shared by approved append, pin survival and eviction; approved append requires a checked existing GROWTH document and preserves authored content |
+// Blueprint: | `REMGrowthWriter.swift` | REMGrowthWriter owner. |
 
-// Approved lessons append as standalone paragraphs to canonical GROWTH.md.
-// The writer preserves the approved text and existing hand-authored headings;
-// it does not derive a heading from the lesson.
+// Preserve approved text and authored headings; do not derive new headings from lesson prose.
 public enum REMGrowthWriter {
 
     public struct InvalidLesson: Error, LocalizedError {
@@ -16,7 +14,7 @@ public enum REMGrowthWriter {
         }
     }
 
-    /// Matches text only at line or document boundaries, never inside a longer paragraph.
+    /// Match only standalone line/document boundaries so a longer paragraph cannot count as an approved entry.
     public static func containsEntryParagraph(_ body: String, _ text: String) -> Bool {
         !entryParagraphRanges(body, text).isEmpty
     }
@@ -32,19 +30,14 @@ public enum REMGrowthWriter {
         while let range = body.range(of: text, range: searchFrom..<body.endIndex) {
             if (range.lowerBound == body.startIndex || body[body.index(before: range.lowerBound)] == "\n"),
                (range.upperBound == body.endIndex || body[range.upperBound] == "\n") { ranges.append(range) }
-            // Overlapping matches can contain another standalone paragraph.
+            // Overlapping matches may contain another standalone paragraph.
             searchFrom = body.index(after: range.lowerBound)
         }
         return ranges
     }
 
-    /// Append an approved REM lesson to `<personaRoot>/GROWTH.md` under the
-    /// same cross-process flock every other GROWTH writer holds. Idempotent:
-    /// when the doc already contains the exact proposal text as its own
-    /// entry paragraph (a reconcile re-fire after a crash window, or a
-    /// manual backfill) nothing is written and `false` returns. A missing or
-    /// unreadable GROWTH.md throws with its path and repair remedy before any
-    /// write, so the caller's approval never flips. Returns `true` when the entry landed.
+    /// Hold the shared GROWTH lock across checked read and append; exact existing paragraphs make retries idempotent.
+    /// Missing or unreadable GROWTH fails before writing so approval cannot flip without saved text.
     @discardableResult
     public static func appendApprovedLesson(
         personaRoot: URL,
@@ -52,8 +45,7 @@ public enum REMGrowthWriter {
     ) async throws -> Bool {
         let text = proposalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw InvalidLesson(reason: "empty lesson") }
-        // Pending approvals can predate the staging bound. Enforce it again
-        // at the write boundary before any existing persona content changes.
+        // Recheck passage bounds at the write boundary because pending approvals may predate them.
         if let reason = REMProposalStore.growthPassageRefusal(text) {
             throw InvalidLesson(reason: reason)
         }

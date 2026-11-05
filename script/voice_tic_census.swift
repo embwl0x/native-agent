@@ -1,10 +1,7 @@
 #!/usr/bin/env swift
 import Foundation
 
-// Voice tic census: measures LLM-ism density in Agent's assistant messages.
-//
-// Run before/after VOICE.md speech changes to verify that the density moved.
-// Usage: script/voice_tic_census.swift [--days 14]
+// Measure assistant-message speech density before and after voice guidance changes so the claimed style improvement is observable.
 
 struct TicPattern {
     let name: String

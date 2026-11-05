@@ -1,8 +1,7 @@
 import UserNotifications
 import NativeAgentShared
 
-// The system expiry callback races donation. The lock owns both retained
-// fields and makes delivery exactly once across those callbacks.
+// Expiry races donation; one lock makes delivery exactly once and protects both retained fields.
 final class NotificationService: UNNotificationServiceExtension, @unchecked Sendable {
     private let lock = NSLock()
     private var handler: ((UNNotificationContent) -> Void)?
@@ -10,8 +9,7 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
 
     override func didReceive(_ request: UNNotificationRequest,
                             withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
-        // UNNotificationContent is immutable; its ObjC declaration lacks
-        // Sendable. Do not carry the framework-owned request into the task.
+        // Immutable UNNotificationContent lacks ObjC Sendable annotation; keep the framework request out of the task.
         nonisolated(unsafe) let content = request.content
         lock.lock()
         handler = contentHandler

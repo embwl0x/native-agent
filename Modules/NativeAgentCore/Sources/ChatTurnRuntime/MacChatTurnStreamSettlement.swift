@@ -1,3 +1,4 @@
+import NativeAgentCore
 import Foundation
 import ProviderRouting
 import NativeAgentShared
@@ -8,7 +9,7 @@ import TurnTrace
 import Transcripts
 import AgentWorkspace
 import ToolRegistry
-// Blueprint: | `MacChatTurnStreamSettlement.swift` | Mac stream completion, joined persistence and lifecycle settlement; helper conversations enter their own runner with the existing Mac admission |
+// Blueprint: | `MacChatTurnStreamSettlement.swift` | Joined Mac/helper stream settlement |
 
 public protocol MacChatRenderedMessage: MacChatRetryMessage {
     var sessionId: String? { get }
@@ -19,8 +20,7 @@ public protocol MacChatRenderedMessage: MacChatRetryMessage {
 
 public struct MacChatStreamCompletion: Sendable {
     public let text: String
-    /// Where `text`'s working commentary ends, when the core's final reply is
-    /// the text and it said so.
+    /// Use the commentary boundary only when Core confirms the final reply is this accumulated text.
     public var workingCommentaryCharacters: Int? = nil
 }
 
@@ -133,8 +133,9 @@ public extension ChatStreamExecution {
         sessionId: String, activityIdentity: MacChatTurnIdentity, replyRowId: String,
         hideUserBubble: Bool,
         onScreenPreview: @escaping @Sendable (MacScreenPreviewUpdate) async -> Void,
-        helperSession: @escaping @Sendable (TurnEventSink?) -> BotRunnerSession,
-        dataRoot: URL
+        helperSession: @escaping @Sendable (TurnEventSink?, Turn) -> BotRunnerSession,
+        dataRoot: URL,
+        turn: Turn
     ) -> ChatStreamExecution {
         let message = text.isEmpty ? "(see attachments)" : text
         let helper: Bool
@@ -155,11 +156,10 @@ public extension ChatStreamExecution {
                         throw ChatOrchestrationError.underlying("invalid helper session id")
                     }
                     let bot = try BotDefinitionStore(dataRoot: dataRoot).get(helperID)
-                    let session = helperSession { continuation.yield($0) }
-                    let reply = try await TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
-                        try await TurnTraceContext.$replyRow.withValue(.init(turnId: activityIdentity.turnId, sessionId: sessionId, messageId: replyRowId)) {
-                        try await session(bot, message)
-                        }
+                    let replyTurn = turn.with(\.replyRow, .init(turnId: turn.id, sessionId: sessionId, messageId: replyRowId))
+                    let session = helperSession({ continuation.yield($0) }, replyTurn)
+                    let reply = try await TurnTraceContext.$turnId.withValue(turn.id) {
+                        try await session(bot, message, replyTurn, .init(ancestry: [bot.id]), .init())
                     }
                     if reply.status == .failed || reply.status == .interrupted {
                         let error = NSError(domain: "NativeAgentStream", code: -1,
@@ -169,7 +169,7 @@ public extension ChatStreamExecution {
                         continuation.finish()
                     }
                     return .success(StandingBotContinuity.response(reply,
-                        sessionID: sessionId, runID: activityIdentity.turnId))
+                        sessionID: sessionId, runID: turn.run))
                 } catch {
                     continuation.finish(throwing: error)
                     return .failure(error)
@@ -177,14 +177,14 @@ public extension ChatStreamExecution {
             }
             return ChatStreamExecution(events: events, producer: producer)
         }
-        return TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
+        return TurnTraceContext.$turnId.withValue(turn.id) {
             client.chatStreamExecution(
                 message: message, sessionId: sessionId,
                 model: "", reasoningEffort: "", fileAccess: "auto",
                 attachments: attachments, persona: nil, surface: "chat",
                 suppressUserAppend: hideUserBubble, choice: nil,
-                consumerRendersInlineCards: true, replyRowID: replyRowId, onScreenPreview: onScreenPreview
-            )
+                consumerRendersInlineCards: true, replyRowID: replyRowId, onScreenPreview: onScreenPreview,
+             turn: turn)
         }
     }
 }

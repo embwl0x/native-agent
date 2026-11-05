@@ -11,14 +11,13 @@ import IOKit.ps
 #if canImport(Darwin)
 import Darwin
 #endif
-// Blueprint: | `MachineFactsActions.swift` | `FileSystemActions.systemInfo`: OS-owned physical memory and power snapshot, checked VM counters and bounded process reads; unavailable measurements retain per-field partial coverage |
+// Blueprint: | `MachineFactsActions.swift` | `FileSystemActions.systemInfo`: OS memory/power and bounded processes; per-field gaps |
 
 extension FileSystemActions {
     // MARK: - system_info
 
     static func systemInfo(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         if input["person"] == .bool(true) {
-            // The shape the line promises: {here, idle_seconds} at the top.
             var out: [String: JSONValue] = ["ok": .bool(true), "status": .string("ok")]
             if case .object(let fact) = MacPersonInput.presenceDetail { out.merge(fact) { $1 } }
             return .object(out)
@@ -35,12 +34,14 @@ extension FileSystemActions {
                 return errResult("Use app for an installed app version or check_updates for macOS updates, separately.", code: "bad_input")
             }
             let installedURL: URL?
-            do { installedURL = try MacApplications.installedApplicationURL(named: app) }
+            do { installedURL = try MacApplications.installedApplicationURL(named: app,
+                context: MacOperationContext(dataRoot: ctx.dataRoot ?? PersistenceCore.defaultDataRoot())) }
             catch { return errResult(error.localizedDescription, code: "app_index_unavailable") }
             guard !app.isEmpty, let url = installedURL,
                   let bundle = Bundle(url: url), let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
                   !version.isEmpty else {
-                return errResult("No readable version for that exact installed app name. Supply its exact name or full .app path.", code: "app_version_unavailable")
+                return errResult(
+                    "No readable version for that exact installed app name. Supply its exact name or full .app path.", code: "app_version_unavailable")
             }
             return .object(["ok": .bool(true), "status": .string("ok"), "app": .string(url.deletingPathExtension().lastPathComponent),
                 "path": .string(url.path), "version": .string(version),
@@ -50,12 +51,16 @@ extension FileSystemActions {
             let run = runProcess("/usr/sbin/softwareupdate", ["--list"], timeout: 30, captureByteLimit: 64 * 1024)
             guard run.launched, !run.timedOut, run.status == 0, !run.captureReadFailed,
                   !run.stdoutTruncated, !run.stderrTruncated else {
-                return errResult(run.timedOut ? "macOS update check exceeded 30 seconds; no update status is known. Check System Settings → General → Software Update."
+                return errResult(
+                    run.timedOut ? "macOS update check exceeded 30 seconds; no update status is known. Check System Settings → General → Software Update."
                     : "macOS update check failed: \(run.stderr). Check System Settings → General → Software Update.", code: "software_update_unavailable")
             }
             return .object(["ok": .bool(true), "status": .string("ok"), "source": .string("softwareupdate --list"),
                 "updates": .string(run.stdout + run.stderr),
-                "scope": .string("macOS and software offered by Software Update. NativeAgent and App Store app updates are separate; check App Store → Updates for App Store apps.")])
+                "scope": .string("""
+                    macOS and software offered by Software Update. NativeAgent and App Store app updates are separate; check App Store → Updates \
+                    for App Store apps.
+                    """)])
         }
         let version = ProcessInfo.processInfo.operatingSystemVersion
         var fields: [String: JSONValue] = [
@@ -63,8 +68,7 @@ extension FileSystemActions {
         ]
         var failures: [String] = []
 
-        // APFS separates the sealed system volume from the writable data volume.
-        // Name both; everyday disk capacity is the data volume's observation.
+        // APFS separates sealed system and writable data volumes; everyday capacity belongs to the data volume.
         for (key, path, name) in [("disk", "/System/Volumes/Data", "Data"), ("system_disk", "/", "System")] {
             var st = statfs()
             if statfs(path, &st) == 0 {
@@ -124,11 +128,13 @@ extension FileSystemActions {
             fields["top_processes"] = .object([
                 "by_cpu": .array(rows.sorted { $0.cpu > $1.cpu }.prefix(5).map(\.row)),
                 "by_memory": .array(rows.sorted { $0.memory > $1.memory }.prefix(5).map(\.row)),
-                "note": .string("Top five processes per ranking from one ps read. CPU is ps's scheduler estimate; memory is resident MB. Process arguments are not read."),
+                "note": .string("""
+                    Top five processes per ranking from one ps read. CPU is ps's scheduler estimate; memory is resident MB. Process arguments \
+                    are not read.
+                    """),
             ])
         } else { failures.append("top_processes: ps did not return a complete bounded snapshot") }
 
-        // Network: ping 8.8.8.8 → reachable bool.
         var network: [String: JSONValue] = ["local_ip": .null, "vpn": .null]
         if let ping = runCommand("/sbin/ping", ["-c", "1", "-W", "1000", "8.8.8.8"]), [0, 2].contains(ping.status) {
             network["reachable"] = .bool(ping.status == 0)
@@ -147,7 +153,9 @@ extension FileSystemActions {
                 network["local_ip"] = .array(addresses.map(JSONValue.string))
             }
         }
-        let publicIP = runProcess("/usr/bin/curl", ["--silent", "--show-error", "--fail", "--connect-timeout", "2", "--max-time", "3", "https://api.ipify.org"], timeout: 5, captureByteLimit: 1024)
+        let publicIP = runProcess(
+            "/usr/bin/curl", ["--silent", "--show-error", "--fail", "--connect-timeout", "2", "--max-time", "3", "https://api.ipify.org"], timeout: 5,
+            captureByteLimit: 1024)
         let address = publicIP.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         var ipv4 = in_addr(), ipv6 = in6_addr()
         if publicIP.launched, publicIP.status == 0, !publicIP.timedOut, !publicIP.stdoutTruncated,
@@ -162,14 +170,20 @@ extension FileSystemActions {
             let connected = vpn.stdout.split(separator: "\n").filter { $0.contains("(Connected)") }.map { JSONValue.string(String($0)) }
             network["vpn"] = .object(["connected": .bool(!connected.isEmpty), "services": .array(connected),
                 "source": .string("scutil --nc list"),
-                "note": .string("Connected macOS VPN services. VPN apps that do not register a network connection service may not appear; this does not prove all traffic uses a VPN.")])
+                "note": .string("""
+                    Connected macOS VPN services. VPN apps that do not register a network connection service may not appear; this does not prove \
+                    all traffic uses a VPN.
+                    """)])
         } else { failures.append("vpn: macOS network connection services could not be read") }
         if input["speed_test"] == .bool(true) {
             let speed = runProcess("/usr/bin/networkQuality", ["-s", "-c", "-M", "20"], timeout: 25, captureByteLimit: 64 * 1024)
             if speed.launched, speed.status == 0, !speed.timedOut, !speed.stdoutTruncated, !speed.captureReadFailed,
                let measured = try? JSONValue.parse(Data(speed.stdout.utf8)), case .object = measured {
                 network["speed_test"] = .object(["source": .string("networkQuality -s -c -M 20"), "measurement": measured,
-                    "note": .string("Requested sequential upload/download measurement, limited to 20 seconds. Throughput is bits per second; responsiveness is round trips per minute. This uses internet bandwidth.")])
+                    "note": .string("""
+                        Requested sequential upload/download measurement, limited to 20 seconds. Throughput is bits per second; responsiveness is \
+                        round trips per minute. This uses internet bandwidth.
+                        """)])
             } else { failures.append("speed_test: no complete networkQuality measurement; request a new measurement when the connection is available") }
         }
         if let wifi = CWWiFiClient.shared().interface() {
@@ -178,7 +192,10 @@ extension FileSystemActions {
                 "interface": wifi.interfaceName.map(JSONValue.string) ?? .null,
                 "power_on": .bool(wifi.powerOn()), "ssid": ssid.map(JSONValue.string) ?? .null,
                 "note": .string(ssid == nil
-                    ? "Wi-Fi SSID is unavailable: Wi-Fi may be disconnected or macOS may withhold it without Location Services access. No permission was requested."
+                    ? """
+                        Wi-Fi SSID is unavailable: Wi-Fi may be disconnected or macOS may withhold it without Location Services access. No \
+                        permission was requested.
+                        """
                     : "Current Wi-Fi SSID from CoreWLAN; primary_interface identifies the Mac's active IPv4 route."),
             ])
         } else { network["wifi_note"] = .string("No Wi-Fi interface is available.") }
@@ -233,7 +250,7 @@ private func firstCapturedInt(in text: String, pattern: String) -> Int? {
     return Int(s)
 }
 
-/// One IOKit snapshot owns both the supplying source and internal battery facts.
+/// Read supplying source and battery facts from one IOKit snapshot so they describe the same power state.
 private func powerSnapshot(failures: inout [String]) -> JSONValue {
     var battery: [String: JSONValue] = ["source": .null, "present": .null, "percent": .null, "charging": .null]
     guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else {

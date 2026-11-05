@@ -2,21 +2,19 @@ import Foundation
 import NativeAgentCore
 import AgentWorkspace
 import AgentConversations
-// Blueprint: | `AgentContactRow.swift` | Contact identity/health folding, per-door authority and shared status vocabulary; ContactListFacade retains one checked door read, with primary contacts derived from it. |
+// Blueprint: | `AgentContactRow.swift` | Shared contact health and per-door grants |
 
 public struct AgentContactRow: Identifiable, Sendable {
     public let id: String
     public let name: String
     public let contact: AgentPeerContact?
     public var candidate: AgentDiscoveryCandidate? = nil
-    /// The canonical contact row; associated doors retain their own grants.
+    /// Associated doors retain their own grants.
     public var primary = true
-    /// The newest retained exchange with this contact, from any chat.
     public var lastExchange: String?
-    /// Home's own word for this contact (AgentContactHealth): one source, so
-    /// Agents, the Simple view and home never disagree.
+    /// Share home health vocabulary so every surface agrees.
     public var health: AgentLocalHealth?
-    /// Read once when the row is built (a Keychain read), not on every redraw.
+    /// Read Keychain once per row, never on redraw.
     public var credentialAvailable = true
     public var credentialFailure: ToolFailureError?
     public var elevationFailure: ToolFailureError?
@@ -43,7 +41,10 @@ public struct AgentContactRow: Identifiable, Sendable {
                 return host.description + " Messages start a routine; its local reply returns here. Grok Bot may ask you to approve each reply command."
             }
             if host.acp != nil {
-                return "\(host.description) I can start a conversation with it after you connect.\nRoute: ACP\nConnect to choose its starting folder and approve the exact program. Cannot start a turn yet."
+                return """
+                    \(host.description) I can start a conversation with it after you connect.\nRoute: ACP\nConnect to choose its starting folder and \
+                    approve the exact program. Cannot start a turn yet.
+                    """
             }
             return host.description + " I add myself to its settings so it can message me. "
                 + (host.commandLine == nil ? "It can message me; I cannot start a conversation with it yet."
@@ -67,7 +68,6 @@ public struct AgentContactRow: Identifiable, Sendable {
             candidate.hostID.flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
         }
         let discovered = candidates.filter { candidate in
-            // A card, or a find no recipe knows yet (its draft).
             (candidate.cardURL != nil || candidate.draft != nil) && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
         }.map { Self(id: $0.id, name: $0.name, contact: nil, candidate: $0) }
         let contacts = (rows(peers: peers, installed: hosts, everyDoor: everyDoor) + discovered).map { row in
@@ -79,7 +79,7 @@ public struct AgentContactRow: Identifiable, Sendable {
         return contacts
     }
 
-    /// The same canonical contact identities as People, retaining each door's grants.
+    /// Reuse canonical identities without merging door grants.
     public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], dataRoot: URL, everyDoor: Bool = false) throws -> [Self] {
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         let identity = try AgentContactIdentity(dataRoot: dataRoot, peers: peers)
@@ -106,11 +106,10 @@ public struct AgentContactRow: Identifiable, Sendable {
         }
     }
 
-    /// The id home and the health file know it by: a lane's name, a contact's `peer:` id.
+    /// Share home and health-file identity: a transport name or `peer:` id.
     public var key: String { id }
 
-    /// One row per who; `everyDoor` (Trust: each door keeps its own grant) lists
-    /// each associated door too, under its who's name.
+    /// Group doors by contact without merging their Trust grants.
     public static func rows(peers: [AgentPeerContact], installed: [AgentHostRow], everyDoor: Bool = false) -> [Self] {
         let configured = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
         return peers.filter { peer in everyDoor || !peers.contains { $0.id == peer.who } }.map { peer in
@@ -131,11 +130,9 @@ public struct AgentContactRow: Identifiable, Sendable {
                 .map { Self(id: $0.id, name: $0.displayName, contact: nil) }
     }
 
-    /// Installed with no proven reply: the health record's word and detail
-    /// stand over a saved contact's setup state.
+    /// Without a proven reply, health evidence takes precedence over saved setup state.
     private var unproven: Bool { health?.current == true && health?.status == "installed" }
 
-    /// The one word the row's pill carries; the full status stays below it.
     public var pillWord: String {
         if credentialFailure != nil { return "Unavailable" }
         if candidate?.setupFailure != nil { return "Unavailable" }
@@ -179,7 +176,10 @@ public struct AgentContactRow: Identifiable, Sendable {
             : contact.unavailableAt.map { "Unavailable now · Checked \($0)\n" } ?? ""
         if let proof = contact.roundTripProof {
             return unavailable + (keyAvailable && contact.isReady ? "Ready" : "Historical round trip")
-                + " · \(contact.transport == .acp ? "ACP round trip" : proof.executable == nil ? "Remote round trip" : "Command-line round trip") · \(proof.executable ?? proof.endpoint.absoluteString)"
+                + """
+                     · \(contact.transport == .acp ? "ACP round trip" : proof.executable == nil ? "Remote round trip" : "Command-line round trip") · \
+                    \(proof.executable ?? proof.endpoint.absoluteString)
+                    """
                 + " · Version \(proof.version ?? "not reported") · Folder: \(proof.workspace)"
                 + " · Sign-in: \(proof.credentialKey == nil ? "connection session" : "saved credential")"
                 + " · Proven \(proof.at)" + returnProof
@@ -200,7 +200,6 @@ public struct AgentContactRow: Identifiable, Sendable {
         switch contact.state {
         case .unavailable: return AgentPeerCredentials.unavailableDetail
         case .listed: return "On this Mac · Not set up"
-        // With history, the last exchange shows in its own note below.
         case .setUp: return lastExchange != nil ? "Set up · No proven round trip" : contact.provenOutboundAt == nil
             ? "Set up · Nothing has crossed yet" : "Set up · Sent a message, no reply yet"
         case .sendOnly: return "Can send · Replies are not connected"

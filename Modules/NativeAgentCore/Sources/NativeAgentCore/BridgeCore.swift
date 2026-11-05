@@ -4,10 +4,8 @@ import Network
 import Security
 // Blueprint: | `BridgeCore.swift` | Shared HTTP framing, bearer comparison, loopback/authentication admission and response transport |
 
-/// Identity-gated state for one accepted connection's exact request-read
-/// deadline. The token prevents a late deadline work item from cancelling a
-/// different connection if an `ObjectIdentifier` is reused after the
-/// original connection deallocated.
+/// Identity-gated state for one accepted connection's exact request-read deadline. The token prevents a late deadline work item from cancelling a different
+/// connection if an `ObjectIdentifier` is reused after the original connection deallocated.
 public struct BridgeReadDeadlineState: Sendable, Equatable {
     public let token: UUID
     public var routed: Bool = false
@@ -19,22 +17,15 @@ public struct BridgeReadDeadlineState: Sendable, Equatable {
     }
 }
 
-/// Outcome of the shared bearer-token auth decision.
 public enum BridgeAuthDecision: Equatable {
-    /// Bearer matched the live token — dispatch the route.
     case authorized
-    /// The live token is empty (the listener was terminated between accept and
-    /// route). Answer 503 rather than leaking that race as a 200 to a peer that
-    /// sent "Authorization: Bearer " (which string-equals an empty token).
+    /// An empty live token means the server is stopping; reject it so an empty bearer cannot authenticate during shutdown.
     case serverStopping
-    /// Bearer present but did not match — answer 401.
     case unauthorized
 }
 
-/// A loopback HTTP bridge that reads requests through `BridgeCore`. `route` is
-/// invoked exactly once, after a full request (headers + Content-Length body)
-/// has been read. Held weakly by the receive chain so a dead bridge stops the
-/// read loop.
+/// A loopback HTTP bridge that reads requests through `BridgeCore`. `route` is invoked exactly once, after a full request (headers + Content-Length body) has
+/// been read. Held weakly by the receive chain so a dead bridge stops the read loop.
 public protocol BridgeHTTPServer: AnyObject, Sendable {
     func route(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data)
     func received(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data)
@@ -46,21 +37,14 @@ public extension BridgeHTTPServer {
     }
 }
 
-/// Shared, stateless server tissue. All members are `static` — there is no
-/// per-instance state here; the stateful pieces (listener, token, connection
-/// registry) stay with each bridge.
+/// Keep listener, token and connection state with each bridge; shared framing owns no instance state.
 public enum BridgeCore {
-    /// Ceiling on the header block, enforced BOTH before the `\r\n\r\n`
-    /// terminator (bounds pre-auth RAM against a peer that never terminates the
-    /// header block) AND on a terminated-but-oversized block. 64KB is far above
-    /// any legitimate request header set.
+    /// Cap headers before and after the terminator to bound pre-auth memory. 64 KB comfortably exceeds legitimate request headers.
     public static let headerByteCap = 65_536
 
     // MARK: - Endpoint
 
-    /// True for loopback peers (localhost / 127.0.0.1 / ::1). A non-hostPort
-    /// endpoint (should not occur on a loopback-required listener) is treated as
-    /// loopback rather than dropped.
+    /// Non-hostPort endpoints count as loopback; loopback-required listeners otherwise expose hostPort peers.
     public static func endpointIsLoopback(_ endpoint: NWEndpoint) -> Bool {
         guard case let .hostPort(host, _) = endpoint else { return true }
         let value = "\(host)".lowercased()
@@ -73,8 +57,7 @@ public enum BridgeCore {
 
     // MARK: - Token
 
-    /// 24 cryptographically-random bytes, base64url with no padding. Returns nil
-    /// only when the OS RNG fails; callers treat that as a failed startup.
+    /// 24 cryptographically-random bytes, base64url with no padding. Returns nil only when the OS RNG fails; callers treat that as a failed startup.
     public static func generateToken() -> String? {
         var bytes = [UInt8](repeating: 0, count: 24)
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
@@ -88,10 +71,8 @@ public enum BridgeCore {
 
     // MARK: - Auth
 
-    /// Constant-time bearer-token compare. XOR-OR every byte and return at the
-    /// end — a length mismatch sets `diff` non-zero up front and STILL walks the
-    /// loop so wall-clock timing can't be used to recover the token byte-by-byte
-    /// or leak its length via a short-circuit return.
+    /// Constant-time bearer-token compare. XOR-OR every byte and return at the end — a length mismatch sets `diff` non-zero up front and STILL walks the loop
+    /// so wall-clock timing can't be used to recover the token byte-by-byte or leak its length via a short-circuit return.
     public static func constantTimeEquals(_ a: String, _ b: String) -> Bool {
         let aBytes = Array(a.utf8)
         let bBytes = Array(b.utf8)
@@ -107,9 +88,7 @@ public enum BridgeCore {
         return diff == 0
     }
 
-    /// Shared bearer-auth decision. Empty live token → `.serverStopping` (the
-    /// listener was terminated mid-flight); otherwise a constant-time compare
-    /// against `Bearer <liveToken>`.
+    /// An empty live token means shutdown, never successful empty-bearer authentication.
     public static func authorize(authorizationHeader: String?, liveToken: String) -> BridgeAuthDecision {
         guard !liveToken.isEmpty else { return .serverStopping }
         let auth = authorizationHeader ?? ""
@@ -127,8 +106,7 @@ public enum BridgeCore {
         guard parts.count >= 2 else { return nil }
         let method = parts[0]
         let barePath = parts[1].components(separatedBy: "?").first ?? parts[1]
-        // A2A REST has typed query parameters. Other bridge lanes retain their
-        // existing exact-path routing behavior.
+        // A2A REST separates typed query parameters; other bridges require exact paths.
         let path = barePath.hasPrefix("/a2a/") ? parts[1] : barePath
 
         var headers: [String: String] = [:]
@@ -142,8 +120,7 @@ public enum BridgeCore {
         return (method, path, headers)
     }
 
-    /// Parse Content-Length. Absent/empty header → 0 (no body). A non-numeric,
-    /// negative, or over-`maxBytes` value → nil (the caller answers 413).
+    /// Parse Content-Length. Absent/empty header → 0 (no body). A non-numeric, negative, or over-`maxBytes` value → nil (the caller answers 413).
     public static func parseContentLength(_ headers: [String: String], maxBytes: Int) -> Int? {
         guard let raw = headers["content-length"], !raw.isEmpty else { return 0 }
         guard let length = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -155,11 +132,7 @@ public enum BridgeCore {
         return length
     }
 
-    /// Read one HTTP request: accumulate until the `\r\n\r\n` terminator (capped
-    /// at `headerByteCap` both pre- and post-terminator), parse the request line
-    /// + headers, then read exactly Content-Length body bytes. Cancels the
-    /// connection on transport error or premature EOF (peer closed before the
-    /// promised bytes arrived). On a fully-read request, invokes `server.route`.
+    /// Bound headers before and after termination; premature EOF or transport failure cancels the connection before routing an incomplete request.
     public static func readRequest<Server: BridgeHTTPServer>(
         _ conn: NWConnection,
         buffered: Data,
@@ -173,9 +146,7 @@ public enum BridgeCore {
             if let d = data { buf.append(d) }
 
             guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else {
-                // Bound pre-terminator accumulation: a peer streaming unbounded
-                // header bytes (never sending the terminator) would otherwise
-                // grow `buf` until the read deadline — pre-auth RAM exhaustion.
+                // Bound pre-auth accumulation even if the peer never sends the header terminator.
                 if buf.count > headerByteCap { conn.cancel(); return }
                 if isComplete {
                     conn.cancel()
@@ -185,8 +156,7 @@ public enum BridgeCore {
                 return
             }
 
-            // Enforce the cap on TERMINATED blocks too — without this a single
-            // oversized-but-valid header section bypasses the pre-terminator cap.
+            // A terminated oversized header must obey the same cap as an incomplete one.
             guard headerEnd.lowerBound <= headerByteCap else { conn.cancel(); return }
 
             let headerData = buf.subdata(in: 0..<headerEnd.lowerBound)
@@ -209,9 +179,8 @@ public enum BridgeCore {
         }
     }
 
-    /// Read the remaining Content-Length body bytes. Cancels on transport error
-    /// or premature EOF (`isComplete` before `need` bytes); the per-connection
-    /// read deadline is the final backstop against a peer that simply stalls.
+    /// Read the remaining Content-Length body bytes. Cancels on transport error or premature EOF (`isComplete` before `need` bytes); the per-connection read
+    /// deadline is the final backstop against a peer that simply stalls.
     public static func readBody<Server: BridgeHTTPServer>(
         _ conn: NWConnection,
         have: Data,
@@ -230,7 +199,6 @@ public enum BridgeCore {
                 let body = Data(acc.prefix(need))
                 server.received(conn: conn, method: method, path: path, headers: headers, body: body)
             } else if isComplete {
-                // Peer closed before the promised body arrived — abandon.
                 conn.cancel()
             } else {
                 readBody(conn, have: acc, need: need, method: method, path: path, headers: headers, server: server)
@@ -240,7 +208,6 @@ public enum BridgeCore {
 
     // MARK: - HTTP response
 
-    /// Reason phrase for bridge status codes; unknown codes use "Internal Server Error".
     public static func statusText(for status: Int) -> String {
         switch status {
         case 200: return "OK"
@@ -261,9 +228,7 @@ public enum BridgeCore {
         }
     }
 
-    /// Serialize `obj` and send a single `Connection: close` JSON response, then
-    /// cancel the connection. A payload that is not JSON-serializable falls back
-    /// to a small error body rather than dropping the response entirely.
+    /// A serialization failure still needs a JSON error response before closing the connection.
     public static func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any], onSent: (@Sendable () -> Void)? = nil,
                                  onFailed: (@Sendable () -> Void)? = nil) {
         let data: Data
@@ -276,7 +241,9 @@ public enum BridgeCore {
             data = Data("{\"error\":\"serialization_failed\"}".utf8)
             serialized = false
         }
-        let header = "HTTP/1.1 \(status) \(statusText(for: status))\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
+        let header = """
+            HTTP/1.1 \(status) \(statusText(for: status))\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n
+            """
         var resp = Data(header.utf8)
         resp.append(data)
         conn.send(content: resp, completion: .contentProcessed { error in

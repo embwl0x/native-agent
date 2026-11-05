@@ -9,11 +9,11 @@ final class PhoneTurnActivity: ObservableObject {
     static let shared = PhoneTurnActivity()
     var settingControl: PhoneLocalSetting {
         PhoneLocalSetting(id: "phone.live_activities", label: "Show task names on the iPhone Lock Screen", type: "boolean",
-            read: { try self.settingEnabled() ? "true" : "false" }, write: { value in
+            read: { try self.settingEnabled() ? "true" : "false" }, write: { value, authority in
                 let enabled = try PhoneLocalSetting.boolean(value)
                 let current = try self.settingEnabled()
                 if current == enabled { return }
-                try PhoneSettingWrite.check(raising: enabled && !current)
+                try authority.check(raising: enabled && !current)
                 self.setEnabled(enabled)
                 guard self.isEnabled == enabled else {
                     throw PhoneLocalSetting.failure(self.errorMessage ?? "The Live Activities switch did not change.")
@@ -23,7 +23,8 @@ final class PhoneTurnActivity: ObservableObject {
     private func settingEnabled() throws -> Bool {
         guard let saved = UserDefaults.standard.object(forKey: "NativeAgentMobile.workActivityEnabled") else { return false }
         guard let enabled = saved as? Bool else {
-            throw PhoneLocalSetting.failure("The saved Live Activities switch is not a Boolean. Repair Show task names on Lock Screen in iPhone NativeAgent Settings.")
+            throw PhoneLocalSetting.failure(
+                "The saved Live Activities switch is not a Boolean. Repair Show task names on Lock Screen in iPhone NativeAgent Settings.")
         }
         return enabled
     }

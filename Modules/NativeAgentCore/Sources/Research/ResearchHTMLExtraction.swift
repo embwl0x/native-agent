@@ -1,13 +1,10 @@
 import Foundation
 
-// Blueprint: | `ResearchHTMLExtraction.swift` | `ResearchHTMLExtraction`: fetched HTML block, list and table text with inline resolved links; HN story rows and comment paragraphs; chrome exclusion and cancellable parsing without a DOM node cutoff |
+// Blueprint: | `ResearchHTMLExtraction.swift` | `ResearchHTMLExtraction`: cancellable HTML extraction |
 
-/// Joins inline text into paragraphs, list items and table rows, resolving links
-/// against the final URL or first valid head base; each URL label appears once.
-/// HN layout tables become story/points/comments rows or author/comment blocks.
-/// Scripts, navigation, footers, hidden content and recognized cookie banners
-/// are omitted. Extraction has no DOM node cutoff; excessive nesting is refused.
-/// Parsing and rendering check cancellation; Chrome snapshots own their separate
+/// Joins inline text into paragraphs, list items and table rows, resolving links against the final URL or first valid head base; each URL label appears once.
+/// HN layout tables become story/points/comments rows or author/comment blocks. Scripts, navigation, footers, hidden content and recognized cookie banners are
+/// omitted. Extraction has no DOM node cutoff; excessive nesting is refused. Parsing and rendering check cancellation; Chrome snapshots own their separate
 /// node-limited readMore cursor, independent of this bounded-response extraction.
 enum ResearchHTMLExtraction {
     struct Evidence {
@@ -80,8 +77,7 @@ enum ResearchHTMLExtraction {
             }
             return result
         }
-        // HTML permits omitted p/li/tr/td closing tags. Close only within
-        // their containing scope, so a nested table never closes its outer row.
+        // HTML permits omitted p/li/tr/td closing tags. Close only within their containing scope, so a nested table never closes its outer row.
         func closeOpen(_ names: Set<String>, within boundaries: Set<String>) {
             for index in stack.indices.reversed() {
                 if names.contains(stack[index].tag) { stack.removeSubrange(index...); return }
@@ -98,8 +94,7 @@ enum ResearchHTMLExtraction {
                 }
                 let node = Node("text")
                 let decoded = try decode(String(chars[start..<i]))
-                // Source wrapping is whitespace, not a paragraph boundary.
-                // Keep boundary spaces so adjacent inline elements join naturally.
+                // Source wrapping is whitespace, not a paragraph boundary. Keep boundary spaces so adjacent inline elements join naturally.
                 node.text = stack.contains(where: { $0.tag == "pre" }) ? decoded
                     : decoded.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
                 stack.last!.children.append(node)
@@ -179,7 +174,8 @@ enum ResearchHTMLExtraction {
             let style = (attrs["style"] ?? "").lowercased().filter { !$0.isWhitespace }
             if style.contains("display:none") || style.contains("visibility:hidden") { return true }
             let tokens = ((attrs["id"] ?? "") + " " + (attrs["class"] ?? "")).lowercased().split(whereSeparator: \.isWhitespace)
-            return tokens.contains { ["cookie-banner", "cookie-consent", "cookie-notice", "consent-banner", "onetrust-banner-sdk", "onetrust-consent-sdk", "pagetop", "yclinks"].contains(String($0)) }
+            return tokens.contains { ["cookie-banner", "cookie-consent", "cookie-notice", "consent-banner", "onetrust-banner-sdk", "onetrust-consent-sdk",
+                "pagetop", "yclinks"].contains(String($0)) }
         }
         func descendants(_ node: Node, matching predicate: (Node) -> Bool) throws -> [Node] {
             try Task.checkCancellation()
@@ -206,7 +202,11 @@ enum ResearchHTMLExtraction {
             if label == target || (label == raw && ["http", "https"].contains(URL(string: label)?.scheme?.lowercased() ?? "")) { return target }
             return label + " → " + target
         }
-        let blocks: Set<String> = ["address", "article", "aside", "blockquote", "dd", "details", "div", "dl", "dt", "fieldset", "figcaption", "figure", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "ol", "p", "pre", "section", "summary", "table", "tbody", "thead", "tfoot", "tr", "ul"]
+        let blocks: Set<String> = [
+            "address", "article", "aside", "blockquote", "dd", "details", "div", "dl", "dt", "fieldset", "figcaption", "figure",
+            "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "ol", "p", "pre", "section", "summary", "table", "tbody", "thead", "tfoot",
+            "tr", "ul"
+        ]
         let hackerNews = base.host?.lowercased() == "news.ycombinator.com"
         func render(_ node: Node, links: Bool = true) throws -> String {
             try Task.checkCancellation()
@@ -223,8 +223,7 @@ enum ResearchHTMLExtraction {
             if hackerNews && node.hasClass("comment") {
                 return "\n" + (try node.children.map { try render($0, links: links) }.joined()) + "\n"
             }
-            // HN uses a story row followed by its subtext row in a layout table.
-            // Emit that pair as one readable item, without vote/profile/hide URLs.
+            // HN uses a story row followed by its subtext row in a layout table. Emit that pair as one readable item, without vote/profile/hide URLs.
             if hackerNews && ["table", "tbody"].contains(node.tag) {
                 var out = "", index = 0
                 while index < node.children.count {

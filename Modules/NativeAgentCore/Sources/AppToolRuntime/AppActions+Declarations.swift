@@ -21,20 +21,25 @@ import DeviceSync
 import TrustCenter
 import ChatTurnContracts
 import ChromeControl
+import Desk
 import MemoryV2
 import StandingBots
 import TurnTrace
 import Studio
 import TriggerScheduler
-// Blueprint: | `AppActions+Declarations.swift` | AppActions seed declarations, including find as the same discovery read with what/query; fixed input, layout vocabulary and hot actions in catalog order; structured arguments share owner schemas and the launch catalog checks their declared shapes |
+// Blueprint: | `AppActions+Declarations.swift` | Seed actions, owner schemas, fixed input and hot-action vocabulary |
 
 extension AppActions {
     private static let abilitySaveSchema = LLMToolSchema(name: "ability_manage", toolClass: .write,
-        description: "Save a new ability or revise one. Only id is always required; a new ability also needs description and code. Revisions inherit omitted fields. Code is function run(input) or async function run(input), returning plain JSON; call the app as app.<page>.<action>(args) or app({action, args}) / app({actions:[…]}) (app and host calls answer at once and may be awaited).",
+        description: """
+            Save a new ability or revise one. Only id is always required; a new ability also needs description and code. Revisions inherit omitted fields. \
+            Code is function run(input) or async function run(input), returning plain JSON; call the app as app.<page>.<action>(args) or app({action, args}) \
+            / app({actions:[…]}) (app and host calls answer at once and may be awaited).
+            """,
         parametersJSON: try! Parts.saveArgumentsSchema.serializedData(pretty: false))
 
-    /// Every door argument's shape, complex ones from their owners; the declaration owns which are required.
-    /// Discovery reads only this schema, so an argument missing here is unusable.
+    /// Every door argument's shape, complex ones from their owners; the declaration owns which are required. Discovery reads only this schema, so an argument
+    /// missing here is unusable.
     private static func arguments(_ tool: String, _ properties: [String: JSONValue], required: [String] = [], read: Bool = false) -> LLMToolSchema {
         LLMToolSchema(name: tool, toolClass: read ? .read : .write, description: "",
             parametersJSON: try! JSONValue.object(["type": .string("object"), "properties": .object(properties),
@@ -48,20 +53,41 @@ extension AppActions {
         "action": .object([:]), "say": .object([:]), "when": SchedulerJobNormalizer.intentionWhenSchema,
         "until": .object([:])], required: ["id"])
 
+    /// AgentJobs.commission owns these shapes and refuses anything else.
+    private static let agentJobSchema = arguments("agent_job", [
+        "agent": ToolSchema.strSchema("""
+            Who takes the job: a contact's name or peer:<id> from agent.contacts, or self for a line of your own: a turn of yours in its own work \
+            conversation, with your tools, Trust and present.
+            """),
+        "instructions": ToolSchema.strSchema("""
+            For agent self only: who this line is (a researcher, a critic, a specialist), in your words; they stand in place of your persona. Omit and \
+            the line is you.
+            """),
+        "brief": ToolSchema.strSchema("The job in your words: what to make or change, and what done looks like."),
+        "where": ToolSchema.strSchema("""
+            Another agent only: the one folder it works in, or a git repository's folder; omit for work that needs no place. Never your own data \
+            folder. Your own line works with your own hands.
+            """),
+        "reach": .object(["type": .string("object"), "additionalProperties": .bool(false), "description": .string("""
+            Another agent only: what it may touch, always within your Trust posture: writes (default true with where) lands only in where; network \
+            (default false) needs Full Mac. Your own line has your Trust.
+            """), "properties": .object(["writes": ToolSchema.boolSchema(), "network": ToolSchema.boolSchema()])]),
+        "done": .object(["type": .string("object"), "additionalProperties": .bool(false), "description": .string("""
+            Your check of the result, one of {command} (another agent only: a shell command run in where under reach; exit 0 passes), {file} (that \
+            path exists) or {grep, in} (the regex matches in that file). Without it the job ends delivered, unchecked, never done.
+            """), "properties": .object(["command": ToolSchema.strSchema(), "file": ToolSchema.strSchema(), "grep": ToolSchema.strSchema(),
+                "in": ToolSchema.strSchema()])]),
+        "desk": ToolSchema.strSchema("The Desk item this job carries, as desk.read names it."),
+    ], required: ["agent", "brief"])
+
     private static func composer(_ verb: String) -> [String: JSONValue] {
         ["target": .string("composer"), "verb": .string(verb)]
     }
     private static func verb(_ verb: String) -> [String: JSONValue] { ["verb": .string(verb)] }
-    /// A note's own button, pressed through the inbox's act.
     private static func press(_ button: String) -> [String: JSONValue] {
         ["verb": .string("act"), "action": .string(button)]
     }
-    private static func queue(_ action: String) -> [String: JSONValue] {
-        ["verb": .string("queue"), "action": .string(action)]
-    }
-    /// An inline card's own button.
     private static func card(_ action: String) -> [String: JSONValue] { ["action": .string(action)] }
-    private static func decision(_ decision: String) -> [String: JSONValue] { ["decision": .string(decision)] }
 
     package static var seedActions: [AppAction] { get throws { try seedInventory.get() } }
     private static let seedInventory: Result<[AppAction], Error> = Result {
@@ -69,46 +95,66 @@ extension AppActions {
         AppAction("find", "*", "Discover actions, pages and skills by intent", ["what|query"],
                   warn: "The same discovery as app {find:\"words\"}. Pass what or query inside args.",
                   tool: "app_find", read: true),
-        AppAction("chrome.history", "browser", "Read visited sites and browsing history in Chrome (the whole Default profile, every tab and window, not just her own tab): most visited domains, title/URL search or recent pages",
+        AppAction("chrome.history", "browser", """
+            Read visited sites and browsing history in Chrome (the whole Default profile, every tab and window, not just the agent's own tab): \
+            most visited domains, title/URL search or recent pages
+            """,
                   ["mode?", "query?", "since?", "limit?:int"],
-                  warn: "mode: recent (default when omitted), top_domains (since required) or search (query required, since optional). since: inclusive ISO 8601 with timezone. limit: default 15, max 50. Chrome Default profile only, independent of extension/tab group; local ISO 8601 times. Domain counts: visits since since; page counts: lifetime visits. Requires Full Mac and file-read permission; no card. Deadline: 2 seconds.",
+                  warn: """
+                      mode: recent (default when omitted), top_domains (since required) or search (query required, since optional). since: inclusive ISO 8601 \
+                      with timezone. limit: default 15, max 50. Chrome Default profile only, independent of extension/tab group; local ISO 8601 times. Domain \
+                      counts: visits since since; page counts: lifetime visits. Requires Full Mac and file-read permission; no card. Deadline: 2 seconds.
+                      """,
                   tool: "read_file", read: true),
         AppAction("photos.count", "files", "Count how many photos, pictures or recorded videos are in Photos by creation date and media type",
                   ["start?", "end?", "media_type?"],
-                  warn: "start/end: ISO 8601 with timezone, start inclusive/end exclusive. media_type: all (default), image or video. Missing macOS Photos access raises a permission card; only the person taps Allow. Limited access counts only shared assets.",
+                  warn: """
+                      start/end: ISO 8601 with timezone, start inclusive/end exclusive. media_type: all (default), image or video. Missing macOS Photos \
+                      access raises a permission card; only the person taps Allow. Limited access counts only shared assets.
+                      """,
                   tool: "photos_read", input: verb("count"), read: true),
-        AppAction("photos.recent", "files", "Read recent photos, pictures and recorded videos in Photos: creation date, media type, dimensions, favorite and stored location coordinates",
+        AppAction("photos.recent", "files", """
+            Read recent photos, pictures and recorded videos in Photos: creation date, media type, dimensions, favorite and stored location coordinates
+            """,
                   ["limit?:int", "start?", "end?", "media_type?"],
-                  warn: "limit: 1–100, default 10, newest creation first. start/end: ISO 8601 with timezone, start inclusive/end exclusive. media_type: all (default), image or video. Metadata only; missing macOS Photos access raises a permission card for the person's Allow tap.",
+                  warn: """
+                      limit: 1–100, default 10, newest creation first. start/end: ISO 8601 with timezone, start inclusive/end exclusive. media_type: all \
+                      (default), image or video. Metadata only; missing macOS Photos access raises a permission card for the person's Allow tap.
+                      """,
                   tool: "photos_read", input: verb("recent"), read: true),
-        // Today's Inbox: the notes Today and the Desk count. Each id is the word on the note's button; a note read lists its buttons as
-        // these ids.
+        // Inbox action ids must match the button ids published by each note read.
         AppAction("inbox.archive", "inbox", "Archive", ["ids|id", "reason"], tool: "inbox", input: verb("archive")),
         AppAction("inbox.acknowledge", "inbox", "Archive", ["ids|id", "reason"], tool: "inbox", input: verb("archive")),
         AppAction("inbox.dismiss", "inbox", "Dismiss", ["ids|id", "reason"], tool: "inbox", input: verb("dismiss")),
         AppAction("inbox.mark_read", "inbox", "Mark read (opening a note does this)", ["ids|id", "reason"],
                   tool: "inbox", input: verb("mark_read")),
         AppAction("inbox.repair", "inbox", "Repair", ["id"], subject: ["id"], tool: "inbox", input: verb("repair")),
-        AppAction("inbox.act", "inbox", "Act", ["id", "action?"], subject: ["id"], irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: verb("act")),
+        AppAction("inbox.act", "inbox", "Act", ["id", "action?"], subject: ["id"], irreversible: true, capabilities: ["app_data_write", "safe_read",
+            "tool_call"], tool: "inbox", input: verb("act")),
         AppAction("inbox.clean_up", "inbox", "Clean Up", ["id"], subject: ["id"], tool: "inbox", input: press("act")),
         AppAction("inbox.open_approvals", "inbox", "Open Approvals", ["id"], subject: ["id"], tool: "inbox", input: press("open_approvals")),
         AppAction("inbox.not_now", "inbox", "Not now", ["id", "reason?"], subject: ["id"], irreversible: true,
-                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "declines the card. The owner's own Not now wakes the conversation that raised it; yours does not: "
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: """
+                      declines the card. The owner's own Not now wakes the conversation that raised it; yours does not:\u{20}
+                      """
                       + "the card retires and that request does not run again",
                   tool: "inbox", input: verb("not_now")),
         AppAction("inbox.withdraw", "inbox", "Withdraw my own pending approval", ["id", "reason?"], subject: ["id"], irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: verb("withdraw")),
-        AppAction("inbox.open_on_mac", "inbox", "Open on Mac", ["id"], subject: ["id"], owner: .his("it opens the card for the owner at the Mac",
+        AppAction("inbox.open_on_mac", "inbox", "Open on Mac", ["id"], subject: ["id"], owner: .person("it opens the card for the owner at the Mac",
                   instead: "inbox.not_now declines it; inbox.archive retires a stale one"), tool: "inbox", input: press("act")),
-        AppAction("inbox.approve", "inbox", "Approve", ["id"], subject: ["id"], owner: .his("it is his consent; he approves on Today or the banner"),
+        AppAction("inbox.approve", "inbox", "Approve", ["id"], subject: ["id"], owner: .person(
+                      "it is the person's consent; the person approves on Today or the banner"),
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("approve")),
-        AppAction("inbox.deny", "inbox", "Deny", ["id"], subject: ["id"], owner: .his("it decides an approval; he answers on Today or the banner"),
+        AppAction("inbox.deny", "inbox", "Deny", ["id"], subject: ["id"], owner: .person("it decides an approval; the person answers on Today or the banner"),
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "inbox", input: press("reject")),
 
-        // Chat: the sidebar and the conversation's own controls. An idempotent append through Reach's owner, independent of a page version.
+        // Version-exempt: chat appends through Reach without overwriting page state.
         AppAction("chat.post", "chat", "Tell the person directly", ["message"], irreversible: true,
-                  toolClass: .send, reach: .his, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_post", versionExempt: true),
-        AppAction("chat.list", "chat", "Conversations, newest first; query filters by title; pinned:true only pinned, pinned:false only unpinned; filters apply before offset", ["archived?:bool", "pinned?:bool", "query?", "offset?:int"],
+                  toolClass: .send, reach: .person, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_post", versionExempt: true),
+        AppAction("chat.list", "chat", """
+            Conversations, newest first; query filters by title; pinned:true only pinned, pinned:false only unpinned; filters apply before offset
+            """, ["archived?:bool", "pinned?:bool", "query?", "offset?:int"],
                   tool: "chat_conversations", read: true),
         AppAction("chat.new", "chat", "New chat; title names it in the same call", ["title?"], tool: "chat_session", input: verb("new")),
         AppAction("chat.show", "chat", "Show", ["session_id"], subject: ["session_id"], screen: true, tool: "chat_session", input: verb("show")),
@@ -119,14 +165,6 @@ extension AppActions {
         AppAction("chat.stop", "chat", "Stop", ["session_id?"], subject: ["session_id"], tool: "chat_session", input: verb("stop")),
         AppAction("chat.regenerate", "chat", "Regenerate (redo / try again) your last answer", ["session_id?"], subject: ["session_id"], irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_session", input: verb("regenerate")),
-        AppAction("chat.steer", "chat", "Steer (queue)", ["turn_id", "session_id?"], subject: ["turn_id"], tool: "chat_session",
-                  input: queue("steer")),
-        AppAction("chat.send_next", "chat", "Send next (queue)", ["turn_id?", "session_id?"], subject: ["turn_id"], tool: "chat_session",
-                  input: queue("send_next")),
-        // Irreversible: the queued message is dropped from memory, and nothing keeps User's words to bring back.
-        AppAction("chat.remove", "chat", "Remove (queue)", ["turn_id", "session_id?", "reason?"], subject: ["turn_id"], irreversible: true,
-                  capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_session", input: queue("remove")),
-        AppAction("chat.compact", "chat", "Compact now", ["session_id?"], subject: ["session_id"], tool: "chat_session", input: verb("compact_now")),
         AppAction("chat.export", "chat", "Export to Markdown", ["session_id?"], subject: ["session_id"], tool: "chat_session", input: verb("export")),
         AppAction("chat.detach", "chat", "Open in its own window", ["session_id?"], subject: ["session_id"], screen: true,
                   tool: "chat_session", input: verb("detach")),
@@ -134,7 +172,6 @@ extension AppActions {
                   tool: "chat_session", input: verb("close_window")),
         AppAction("chat.clear", "chat", "/clear", ["session_id"], subject: ["session_id"], irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "chat_session", input: verb("clear")),
-        // The composer.
         AppAction("chat.draft", "chat", "Draft", ["value", "session_id?", "attachments?:list"],
                   tool: "interaction_act", input: composer("set_draft")),
         AppAction("chat.send", "chat", "Send", ["value?", "session_id?", "attachments?:list"], irreversible: true,
@@ -161,112 +198,161 @@ extension AppActions {
                   tool: "interaction_act", input: composer("show_pane"), rename: ["view": "value", "ref": "choice"]),
         AppAction("pane.hide", "chat", "Close the Work pane", screen: true, tool: "interaction_act",
                   input: composer("hide_pane")),
-        // What she makes, in versions; the Work pane's Make tab shows them. Version-exempt: add only appends a version, and never touches
-        // one.
+        // Version-exempt: adding a version never overwrites an existing one.
         AppAction("make.add", "chat", "Add a file to Make as a new version of ref (a new ref when left out); returns the ref",
                   ["path", "ref?", "prompt?", "model?"], tool: "make_studio", input: verb("add"), versionExempt: true),
         AppAction("make.read", "chat", "A Make ref's versions: n, path, prompt, created (the newest ref when left out)",
                   ["ref?"],tool: "make_studio", input: verb("read"), read: true),
-        AppAction("studio.intake.read", "personality", "Read neutral consult or corrected complete-history facts for unanswered-work intake; carry snapshot through every page",
+        AppAction("studio.intake.read", "personality", """
+            Read neutral consult or corrected complete-history facts for unanswered-work intake; carry snapshot through every page
+            """,
                   ["kind:history|consults", "offset?:number", "snapshot?"], capabilities: ["app_data_read"], tool: "studio_intake_read", read: true),
-        // What goes with her answer, by her hand: the reply's face carries it to every door.
-        AppAction("reply.attach", "chat", "Attach an image to the reply you are writing now; it goes with your answer wherever this conversation is answered (the Mac chat, Telegram)",
-                  ["path"], warn: "One image per call, by its own path: jpg, png, gif, webp, bmp or heic, inside your Trust workspace unless this Mac is in Full Mac.",
+        // The reply face carries attachments to every delivery door.
+        AppAction("reply.attach", "chat", """
+            Attach an image to the reply you are writing now; it goes with your answer wherever this conversation is answered (the Mac chat, Telegram)
+            """,
+                  ["path"], warn: """
+                      One image per call, by its own path: jpg, png, gif, webp, bmp or heic, inside your Trust workspace unless this Mac is in Full Mac.
+                      """,
                   tool: "read_file", read: true),
-        // Her own fix for a place, in her turn; then it's built.
-        AppAction("sense.make", "chat", "Learn to read a Mac app, live Chrome site, or foreign file format (including binary) from captured material. Plain text uses files.read; a web page is read with read_page (app web.read), not sense.make. Folder watches are not sense.make corners: to act when a file or folder changes, save an ability whose header wakes on file.changed:<path> (ability.save). Read with mac.look, chrome.snapshot or files.read first. code: complete sense.js; kit: Contents/Resources/Senses (AUTHORING.md, sense.js, builtin/app.js, builtin/site.js). Runs on the last-read place or explicit place; returns page, trial_id/digest and timing. Keep the exact trial with {trial_id,digest,keep:true}, no code. {code,keep:true} runs and keeps immediately. {show:\"material\"} returns captured material",
-                  ["code?", "trial_id?", "digest?", "keep?:bool", "place?", "why?", "show?", "apps?:list", "reach?:object", "wake?:list", "face?:object", "resident?:bool", "learned?:any", "choices?:any"],
-                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "apps declares bundle ids for sense.apps.read({bundle_id,dictionary:true}) or read-only Apple Events using event_class, event_id and parameters. Standard core getd/cnte/doex events are reads; other events require a tool's write declaration.", tool: "sense_make",
+        AppAction("sense.make", "chat", """
+            Learn to read a Mac app, live Chrome site, or foreign file format (including binary) from captured material. Plain text uses files.read; a web \
+            page is read with read_page (app web.read), not sense.make. Folder watches are not sense.make corners: to act when a file or folder changes, save \
+            an ability whose header wakes on file.changed:<path> (ability.save). Read with mac.look, chrome.snapshot or files.read first. code: complete \
+            sense.js; kit: Contents/Resources/Senses (AUTHORING.md, sense.js, builtin/app.js, builtin/site.js). Runs on the last-read place or explicit \
+            place; returns page, trial_id/digest and timing. Keep the exact trial with {trial_id,digest,keep:true}, no code. {code,keep:true} runs and keeps \
+            immediately. {show:\"material\"} returns captured material
+            """,
+                  ["code?", "trial_id?", "digest?", "keep?:bool", "place?", "why?", "show?", "apps?:list", "reach?:object", "wake?:list", "face?:object",
+                      "resident?:bool", "learned?:any", "choices?:any"],
+                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: """
+                      apps declares bundle ids for sense.apps.read({bundle_id,dictionary:true}) or read-only Apple Events using event_class, event_id and \
+                      parameters. Standard core getd/cnte/doex events are reads; other events require a tool's write declaration.
+                      """, tool: "sense_make",
                   readWhen: ["show": .string("material"), "trial_id": .null, "digest": .null], lifecycle: .change,
-                  schema: arguments("sense_make", AbilityStore.partArgumentSchemas.merging(["code": ToolSchema.strSchema(), "trial_id": ToolSchema.strSchema(), "digest": ToolSchema.strSchema(),
-                    "keep": .object(["type": .string("boolean")]), "place": ToolSchema.strSchema(), "why": ToolSchema.strSchema(), "show": ToolSchema.strSchema()]) { owned, _ in owned })),
-        AppAction("sense.versions", "senses", "Read a sense's current and retained versions", ["sense_id"], subject: ["sense_id"],tool: "sense_lifecycle", input: ["verb": .string("versions")], read: true),
-        AppAction("sense.quarantine", "chat", "Turn a sense off while retaining its current and previous versions", ["sense_id", "version:int"], subject: ["sense_id"], tool: "sense_lifecycle", input: ["verb": .string("quarantine")], revision: 2, lifecycle: .change),
-        AppAction("sense.restore", "chat", "Turn the selected sense version back on", ["sense_id"], subject: ["sense_id"], tool: "sense_lifecycle", input: ["verb": .string("restore")], revision: 2, lifecycle: .restore),
-        AppAction("sense.drop", "chat", "Delete a sense and its run statistics permanently", ["sense_id"], subject: ["sense_id"], irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "sense_lifecycle", input: ["verb": .string("drop")], revision: 2, lifecycle: .drop),
+                  schema: arguments("sense_make", AbilityStore.partArgumentSchemas.merging(["code": ToolSchema.strSchema(), "trial_id": ToolSchema.strSchema(),
+                      "digest": ToolSchema.strSchema(),
+                    "keep": .object(["type": .string("boolean")]), "place": ToolSchema.strSchema(), "why": ToolSchema.strSchema(), "show": ToolSchema.strSchema(
+                        )]) { owned, _ in owned })),
+        AppAction("sense.versions", "senses", "Read a sense's current and retained versions", ["sense_id"], subject: ["sense_id"],tool: "sense_lifecycle",
+            input: ["verb": .string("versions")], read: true),
+        AppAction("sense.quarantine", "chat", "Turn a sense off while retaining its current and previous versions", ["sense_id", "version:int"],
+            subject: ["sense_id"], tool: "sense_lifecycle", input: ["verb": .string("quarantine")], revision: 2, lifecycle: .change),
+        AppAction("sense.restore", "chat", "Turn the selected sense version back on", ["sense_id"], subject: ["sense_id"], tool: "sense_lifecycle",
+            input: ["verb": .string("restore")], revision: 2, lifecycle: .restore),
+        AppAction("sense.drop", "chat", "Delete a sense and its run statistics permanently", ["sense_id"], subject: ["sense_id"], irreversible: true,
+            capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "sense_lifecycle", input: ["verb": .string("drop")], revision: 2,
+            lifecycle: .drop),
         AppAction("persona.set", "personality", "Switch persona", ["name"], screen: true, tool: "interaction_act",
                   input: composer("set_persona"), rename: ["name": "value"]),
-        AppAction("app.check_updates", "settings", "Check for NativeAgent updates only; macOS uses mac.system_info with check_updates:true, App Store apps use App Store → Updates",tool: "interaction_act",
+        AppAction("app.check_updates", "settings", """
+            Check for NativeAgent updates only; macOS uses mac.system_info with check_updates:true, App Store apps use App Store → Updates
+            """,tool: "interaction_act",
                   input: composer("check_updates"), read: true),
-        // How the window lays out each surface (ui/layout.json), hers to read and rewrite as the person asks; the window changes as a write
-        // lands.
-        AppAction("layout.read", "settings", "The window's layout: each surface's blocks in order, hidden and expanded, each view's profile, its version, the previous layout and what every block is",
+        // Window layout reads the same ui/layout.json that these writes update.
+        AppAction("layout.read", "settings", """
+            The window's layout: each surface's blocks in order, hidden and expanded, each view's profile, its version, the previous layout and what every \
+            block is
+            """,
                  tool: "app_page_read", read: true, scope: layoutScope),
-        AppAction("layout.write", "settings", "Change the layout, passing layout.read's version as layout_version and only what changes (a surface's whole block list, a profile, phone); the window follows at once; undo puts the previous one back",
+        AppAction("layout.write", "settings", """
+            Change the layout, passing layout.read's version as layout_version and only what changes (a surface's whole block list, a profile, phone); the \
+            window follows at once; undo puts the previous one back
+            """,
                   ["layout:object", "layout_version"], tool: "app_setting_set", scope: layoutScope,
                   schema: arguments("app_setting_set", ["layout": SurfaceLayoutStore.writeArgumentSchema, "layout_version": ToolSchema.strSchema()])),
-        // Settings rows: owner_only rows stay his, lower-only rows move the safe way.
-        AppAction("setting.get", "*", "Read a setting's current value, kind and accepted choices (app {page} lists ids). phone.settings reads the paired phone's own settings directory while its app is open. chat.compaction_percent also reports the detected model window and trigger tokens", ["setting"], subject: ["setting"],
+        // Owner-only rows stay with the user; lower-only rows may only move in the safe direction.
+        AppAction("setting.get", "*", """
+            Read a setting's current value, kind and accepted choices (app {page} lists ids). phone.settings reads the paired phone's own settings directory \
+            while its app is open.
+            """, ["setting"], subject: ["setting"],
                  tool: "app_setting_get", read: true, scope: "setting value read get home timezone phone preferences appearance shortcut memory"),
-        AppAction("setting.set", "*", "Set", ["setting", "value:any", "because"], subject: ["setting"],
-                  warn: "on model turns, because must quote at least 3 words from a person or trusted agent in this conversation; you may restore a switch whose last change was yours",
-                  tool: "app_setting_set", schema: arguments("app_setting_set", ["setting": ToolSchema.strSchema(), "because": ToolSchema.strSchema(), "value": .object([
-                    "description": .string("Type is this setting's kind; read setting.get {setting} for its current value, kind and accepted values before setting it. For setting chat.compaction_percent, value is a whole percentage 30–95 (default 85), raised or lowered as the person asks, for every model's detected or Custom-capped window.")])])),
+        AppAction("setting.set", "*", "Set", ["setting", "value:any", "because?"], subject: ["setting"],
+                  warn: """
+                      Your own mind settings need no request. For other settings below Full Mac on model turns, because must quote at least 3 words from \
+                      a person or trusted agent in this conversation; you may restore a switch whose last change was yours.
+                      """,
+                  tool: "app_setting_set", schema: arguments("app_setting_set", ["setting": ToolSchema.strSchema(), "because": ToolSchema.strSchema(),
+                      "value": .object([
+                    "description": .string("""
+                        Type is this setting's kind; read setting.get {setting} for its current value, kind and accepted values before setting it.
+                        """)])])),
         // Version-exempt: generated captures have no user state to overwrite.
         AppAction("page.screenshot", "*",
-                  "Screenshot of one of your own NativeAgent pages (your current page, chat, settings…), drawn offscreen; returns the PNG's path. Not the Mac screen. tab is a tab key as page.show takes it "
+                  """
+                      Screenshot of one of your own NativeAgent pages (your current page, chat, settings…), drawn offscreen; returns the PNG's path. Not the \
+                      Mac screen. tab is a tab key as page.show takes it\u{20}
+                      """
                   + "(trust_access…), the page's default tab when left out", ["page", "tab?", "height?:int"],
                   warn: "saves a PNG and prunes old page captures", tool: "app_page_screenshot", versionExempt: true),
-        // Inline cards, by the interaction id the chat read or the card's inbox note lists, in whichever conversation raised them. Whose
-        // card it is and what it moves are decided per card: a card from User's phone or Telegram, or one that raises what you may reach
-        // below Full Mac, stays his and says so. Irreversible: the card's own button does what it asked, as inbox.approve does, and nothing
-        // presses it back.
-        AppAction("permissions.request", "chat", "Ask for a macOS permission in your own words", ["capability", "why", "mode?"], subject: ["capability", "mode"],
-                  capabilities: ["safe_read", "tool_call"], warn: "capability: \(SystemPermissionCapability.requestable); Automation: applescript:<bundle_id>. Only the person taps Allow on the Mac; the waiting work continues after the grant.",
-                  tool: "request_interaction", input: ["kind": .string("permission")], folded: true),
+        // Phone, Telegram and below-Full-Mac authority cards remain user-owned; answering runs an irreversible control.
+        AppAction("permissions.request", "chat", "Ask for a macOS permission in your own words", ["capability", "why", "mode?", "also_needed?:list"],
+            subject: ["capability", "mode"],
+                  capabilities: ["safe_read", "tool_call"], warn: """
+                      capability: privacy:<grant>, grant one of \(SystemPermissionCapability.requestable); Automation for one app: \
+                      applescript:<bundle_id>. also_needed: the other grants this same card asks for, in the same forms, so everything still off \
+                      is one card. Only the person taps Allow on the Mac; the waiting work continues after the grant.
+                      """,
+                  tool: "request_interaction", input: ["kind": .string("permission")], rename: ["capability": "target"], folded: true),
         AppAction("card.answer", "chat", "The card's own button (its Do: line)", ["id", "value?:secret", "choice?"], subject: ["id"],
-                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "never ask the owner for a key or token in chat: they type it into the card",
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"],
+                      warn: "never ask the owner for a key or token in chat: they type it into the card",
                   tool: "interaction_act", input: card("primary"), rename: ["id": "interaction_id"]),
-        AppAction("card.not_now", "chat", "Not now", ["id", "reason?"], subject: ["id"], irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "interaction_act",
+        AppAction("card.not_now", "chat", "Not now", ["id", "reason?"], subject: ["id"], irreversible: true, capabilities: ["app_data_write", "safe_read",
+            "tool_call"], tool: "interaction_act",
                   input: card("decline"), rename: ["id": "interaction_id"]),
         // Irreversible: it runs the card's own control as card.answer does, a capability grant included.
         AppAction("card.try_again", "chat", "Try again", ["id", "value?:secret", "choice?"], subject: ["id"], irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "interaction_act",
                   input: card("retry"), rename: ["id": "interaction_id"]),
 
-        // Providers.
         AppAction("provider.test", "providers", "Test the connection", ["provider"], subject: ["provider"],tool: "provider",
                   input: verb("test"), read: true),
         AppAction("provider.refresh", "providers", "Refresh", tool: "provider", input: verb("refresh_models")),
         AppAction("provider.set_fallback_model", "providers", "Model it falls back to", ["provider", "model"], subject: ["provider"],
                   tool: "provider", input: verb("set_default_model")),
         AppAction("provider.sign_in", "providers", "Sign in",
-                  owner: .his("he signs in through the browser window Providers → Sign in opens, or pastes the key there")),
+                  owner: .person("the person signs in through the browser window Providers → Sign in opens, or pastes the key there")),
         AppAction("provider.disconnect", "providers", "Disconnect", ["provider"], subject: ["provider"],
-                  owner: .his("only he can sign back in; he disconnects on Providers"), irreversible: true,
+                  owner: .person("only the person can sign back in, and disconnects on Providers"), irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "provider", input: verb("disconnect")),
 
-        // Connectors, Telegram and the paired phone: down, never up.
+        // Connector and pairing controls may lower access, never raise it.
         AppAction("connector.off", "connectors", "Turn off", ["id", "reason?"], subject: ["id"], tool: "connections", input: verb("connector_off")),
-        AppAction("connector.on", "connectors", "Turn on", ["id"], subject: ["id"], owner: .his("it raises Trust; he turns it on in Connectors"),
+        AppAction("connector.on", "connectors", "Turn on", ["id"], subject: ["id"], owner: .person("it raises Trust; the person turns it on in Connectors"),
                   tool: "connections", input: verb("connector_on")),
         AppAction("connector.disconnect", "connectors", "Disconnect", ["id"], subject: ["id"],
-                  owner: .his("only he can sign back in; he disconnects in Connectors", instead: "connector.off stops one"),
+                  owner: .person("only the person can sign back in, and disconnects in Connectors", instead: "connector.off stops one"),
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("connector_disconnect")),
         AppAction("telegram.repair", "telegram", "Rebuild admission index", ["inbox"], tool: "connections",
                   input: verb("telegram_repair")),
-        // Irreversible: a real message to User's Telegram.
-        AppAction("telegram.test", "telegram", "Send test reply", irreversible: true, toolClass: .send, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections",
+        // Irreversible: this sends a real Telegram message to the user.
+        AppAction("telegram.test", "telegram", "Send test reply", irreversible: true, toolClass: .send, capabilities: ["app_data_write", "safe_read",
+            "tool_call"], tool: "connections",
                   input: verb("telegram_test")),
-        AppAction("telegram.clear_logs", "telegram", "Clear logs", irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections",
+        AppAction("telegram.clear_logs", "telegram", "Clear logs", irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"],
+            tool: "connections",
                   input: verb("telegram_clear_logs")),
         AppAction("telegram.disconnect", "telegram", "Remove the token",
-                  owner: .his("only he can sign back in; Connectors → Telegram",
+                  owner: .person("only the person can sign back in; Connectors → Telegram",
                              instead: "setting.set with setting telegram.enabled, value false stops it"),
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("telegram_disconnect")),
         AppAction("pairing.remove", "pairing", "Remove the phone", ["id"], subject: ["id"],
-                  owner: .his("only he can pair it again; Connectors → iPhone"), irreversible: true,
+                  owner: .person("only the person can pair it again; Connectors → iPhone"), irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "connections", input: verb("pairing_remove")),
 
-        // Upkeep buttons, on the pages that carry them.
         AppAction("doctor.run", "diagnostics", "Run Doctor checks",tool: "doctor_status", input: ["repair": .bool(false)], read: true),
         AppAction("doctor.repair", "diagnostics", "Repair", ["check_id?"], subject: ["check_id"], tool: "doctor_status", input: ["repair": .bool(true)]),
-        AppAction("doctor.support_report", "diagnostics", "Support report: the app's diagnostic bundle to send to the developer", tool: "upkeep", input: verb("support_report")),
-        AppAction("export.bundle", "capabilities", "Export a verified bundle file (support:true makes the support bundle to send the developer)", ["support?:bool"], tool: "upkeep", input: verb("export_bundle")),
+        AppAction("doctor.support_report", "diagnostics", "Support report: the app's diagnostic bundle to send to the developer", tool: "upkeep", input: verb(
+            "support_report")),
+        AppAction("export.bundle", "capabilities",
+            "Export a verified bundle file (support:true makes the support bundle to send the developer)", ["support?:bool"], tool: "upkeep", input: verb(
+            "export_bundle")),
         AppAction("backup.now", "trust", "Back up now", tool: "upkeep", input: verb("backup_now")),
         AppAction("backup.restore", "trust", "Restore", ["id"], subject: ["id"],
-                  owner: .his("it replaces what is here now; Trust → Advanced → Backups → Restore"), irreversible: true,
-                  capabilities: ["app_data_write", "safe_read", "tool_call"], warn: "a restore that needs it restarts NativeAgent when this turn ends, 20 seconds at most",
+                  owner: .person("it replaces what is here now; Trust → Advanced → Backups → Restore"), irreversible: true,
+                  capabilities: ["app_data_write", "safe_read", "tool_call"],
+                      warn: "a restore that needs it restarts NativeAgent when this turn ends, 20 seconds at most",
                   tool: "upkeep", input: verb("backup_restore")),
         AppAction("history.clear", "trust", "Delete all recorded activity", irreversible: true,
                   capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "upkeep", input: verb("activity_wipe")),
@@ -275,7 +361,6 @@ extension AppActions {
         AppAction("embeddings.resume", "settings", "Resume the memory-search download", tool: "upkeep",
                   input: verb("embeddings_resume")),
         AppAction("memory.reindex", "memories", "Spotlight reindex", tool: "upkeep", input: verb("spotlight_reindex")),
-        // Her memories, through MemoryCuration.
         AppAction("memory.list", "memories", "List memories with exact total and remaining counts; follow next_after_id only for more entries. "
                   + "sort newest_first or oldest_first; status active or archived. "
                   + "Archived entries include what replaced them",
@@ -285,32 +370,45 @@ extension AppActions {
                   ["id", "text?", "pinned?:bool", "restore?:bool", "reason?"], subject: ["id"],
                   capabilities: ["memory_write", "tool_call"], warn: "text is the thing itself, one or two sentences, no date, source, ids or preamble; "
                       + "a restore that matches something forgotten stays archived",
-                  // Not version-exempt: a text rewrite or a restore can overwrite another conversation's correction. The supersede demotion
-                  // is memory.commit's supersedes, which is.
+                  // Rewrites and restores need versions because they can overwrite another conversation's correction; commit supersedes is idempotent.
                   tool: "rewrite_memory"),
-        AppAction("memory.pin", "memories", "Pin a fact about the owner (identity, location, employment, schedule, preference, relationship, attribute) to your prompt core, in pin order; moments stay in recall", ["id"], subject: ["id"],
+        AppAction("memory.pin", "memories", """
+            Pin a fact about the owner (identity, location, employment, schedule, preference, relationship, attribute) to your prompt core, in pin order; \
+            moments stay in recall
+            """, ["id"], subject: ["id"],
                   capabilities: ["memory_write", "tool_call"], tool: "rewrite_memory", input: ["pinned": .bool(true)]),
 
-        // Her mind: Dreams (Personality), Self-Improvement (Today), her current mind state and body controls.
         AppAction("mind.dream", "personality", "Run a dream pass", tool: "mind_run", input: verb("dream")),
-        AppAction("mind.canon", "diagnostics", "Tend studio canon now; skip its clock wait, retain proposal and seat gates", tool: "mind_run", input: verb("canon")),
+        AppAction("mind.canon", "diagnostics", "Tend studio canon now; skip its clock wait, retain proposal and seat gates", tool: "mind_run", input: verb(
+            "canon")),
         AppAction("mind.horizon", "diagnostics", "Refresh horizon expectations now from current sources", tool: "mind_run", input: verb("horizon")),
-        AppAction("mind.rhythm", "diagnostics", "Read his day now with the standing-time boundary satisfied; keep real history and care admission", tool: "mind_run", input: verb("rhythm")),
-        AppAction("mind.wander", "diagnostics", "Offer her hour now; skip quiet/refractory waits, retain installation and live-turn gates", tool: "mind_run", input: verb("wander")),
+        AppAction("mind.rhythm", "diagnostics", """
+            Read the person's day now with the standing-time boundary satisfied; keep real history and care admission
+            """, tool: "mind_run", input: verb("rhythm")),
+        AppAction("mind.wander", "diagnostics", "Offer the wander hour now; skip quiet/refractory waits, retain installation and live-turn gates",
+            tool: "mind_run", input: verb("wander")),
         AppAction("mind.reach", "diagnostics", "Consider Reach now; skip scan wait, retain every person-facing gate", tool: "mind_run", input: verb("reach")),
-        AppAction("mind.carried", "diagnostics", "Consider carried work now with free-time quiet satisfied; retain real readiness and Desk revision", tool: "mind_run", input: verb("carried")),
-        AppAction("mind.cross", "diagnostics", "Send a line through the real care crossing on this watch; no synthetic care or wake", ["line", "watch"], tool: "mind_run", input: verb("cross")),
-        AppAction("mind.maintenance", "diagnostics", "Run the checked substrate maintenance now, satisfying only its interval", tool: "mind_run", input: verb("maintenance")),
-        AppAction("mind.residual_repair", "diagnostics", "Run eligible bounded residual repair now, satisfying only its quiet wait", tool: "mind_run", input: verb("residual_repair")),
+        AppAction("mind.carried", "diagnostics", """
+            Consider carried work now with free-time quiet satisfied; retain real readiness and Desk revision
+            """, tool: "mind_run", input: verb("carried")),
+        AppAction("mind.cross", "diagnostics", "Send a line through the real care crossing on this watch; no synthetic care or wake", ["line", "watch"],
+            tool: "mind_run", input: verb("cross")),
+        AppAction("mind.maintenance", "diagnostics", "Run the checked substrate maintenance now, satisfying only its interval", tool: "mind_run", input: verb(
+            "maintenance")),
+        AppAction("mind.residual_repair", "diagnostics", "Run eligible bounded residual repair now, satisfying only its quiet wait", tool: "mind_run",
+            input: verb("residual_repair")),
         AppAction("mind.rem", "personality", "Run a REM pass", ["repair?:bool"], tool: "mind_run", input: verb("rem")),
-        AppAction("scheduler.trigger_fire", "desk", "Reconcile a claimed trigger", ["surface", "name", "occurrence?"], subject: ["name"], tool: "mind_run", input: verb("trigger_fire")),
+        AppAction("scheduler.trigger_fire", "desk", "Reconcile a claimed trigger", ["surface", "name", "occurrence?"], subject: ["name"], tool: "mind_run",
+            input: verb("trigger_fire")),
         AppAction("mind.self_improvement", "today", "Self-Improvement: Run now", tool: "mind_run",
                   input: verb("self_improvement")),
         AppAction("mind.misses", "today", "Your misses: corrections by lesson, this week against last, each with its history locator",
                  tool: "mind_run", input: verb("misses"), read: true),
         AppAction("mind.think_now", "diagnostics", "Think now", tool: "mind_run", input: verb("think_now")),
-        // Phase 5 B0: why something surfaced, and her two corrections.
-        AppAction("mind.why", "personality", "Why a felt cue or memory surfaced on a turn (default: last completed turn)",
+        AppAction("mind.body", "personality", """
+            Your body: each organ's latest beat, its why and when it beats next, with what broke from its record first; the same lines as Doctor's Body
+            """, tool: "mind_run", input: verb("body"), read: true),
+        AppAction("mind.why", "personality", "Why a felt cue or memory surfaced on a turn (default: latest recorded completed turn)",
                   ["turn?"],tool: "mind_run", input: verb("why"), read: true),
         AppAction("mind.reject", "personality",
                   "Stop a memory, care or dream phrase surfacing for this kind of thing (source from mind.why)",
@@ -321,119 +419,304 @@ extension AppActions {
         AppAction("mind.reflect", "diagnostics", "Reflect", tool: "mind_run", input: verb("reflect")),
         AppAction("mind.settle_body", "diagnostics", "Settle your body state (calm down when wound up)", tool: "mind_run", input: verb("settle_body")),
         AppAction("mind.reset_body", "diagnostics", "Reset body", tool: "mind_run", input: verb("reset_body")),
-        AppAction("mind.pin_concern", "diagnostics", "Keep a concern open in your cares: care names the care it belongs to in its own words, omitted it is a care of its own; omitted concern uses what presses most", ["concern?", "care?"], tool: "mind_run", input: verb("pin_concern")),
+        AppAction("mind.pin_concern", "diagnostics", """
+            Keep a concern open in your cares: care names the care it belongs to in its own words, omitted it is a care of its own; omitted concern uses what \
+            presses most
+            """, ["concern?", "care?"], tool: "mind_run", input: verb("pin_concern")),
         AppAction("mind.clear", "diagnostics", "Clear the thought store",
                   irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "mind_run", input: verb("clear")),
 
-        // Her parts (docs/AGENT_IS_THE_APP.md): what a part can do is what it declares, never which door made it. One save, one keep, one
-        // run (authored.<id>), one read, one lifecycle; ability_manage runs them all.
-        AppAction("ability.save", "tools", "Grow an ability beyond existing actions: apps through AppleScript/Apple Events, programs, servers or services; or keep a route that worked by hand. Resident abilities hold programs/connections until turned off or app quit; reopening at launch requires wake [\"resumed\"] and reopening code",
+        // Every part shares one lifecycle and declared reach regardless of its authoring door (docs/AGENT_IS_THE_APP.md).
+        AppAction("ability.save", "tools", """
+            Grow an ability beyond existing actions: apps through AppleScript/Apple Events, programs, servers or services; or keep a route that worked by \
+            hand. Resident abilities hold programs/connections until turned off or app quit; reopening at launch requires wake [\"resumed\"] and reopening \
+            code
+            """,
                   ToolSignature.doorArgs(abilitySaveSchema.parametersJSON),
-                  warn: "description: one line; save keeps its first line within 500 characters and says so; details in params. code: JavaScript function run(input) (or async function run(input); app and host calls answer at once and may be awaited) returning JSON (to decline on purpose, return {status:\"refused\",reason:\"revision_required\",detail:\"This ability does not support that input.\",effects:\"none\",remedy:{instruction:\"Read this ability, then revise it for the input.\",next_call:{tool:\"app\",input:{action:\"ability.read\",args:{id:\"your_ability_id\"}}}}}; use the actual cause, detail, effects and id. A person-owned decision uses remedy {instruction,tap}; a terminal refusal uses remedy {kind:\"terminal\",instruction:\"why no further action is appropriate\",next_call:null}. A decline is an answer, not a fault; a throw or {ok:false} reads as broken and owes a repair). app.<page>.<action>(args), or the door's own form app({action,args}) / app({actions:[…]}), runs any action under ordinary gates; calls are derived from code. app.step(label,guidance), app.decide(question,data), app.expect(ok,what), app.expect_fail(code,fn) make a strict journal; decide hands back its question for ability.resume {run_id,answer}. Calls return action data plus call (action id) and effects (none,occurred,partial,unknown); failures throw catchable AppError with e.reason,e.effects,e.call,e.receipt. host.state.get() and host.state.set(value) persist this ability's JSON. host.files: read/list/info/excerpt/grep/spotlight/write/copy/move/trash/patch. host.network: connect/listen/accept/send/receive/close; connect takes {host,port,tls?,transport?} or {path} for a Mac socket (localhost). host.program.start({command,args?,env?,cwd?}) runs a path or a name on the login PATH, returning {id}. host.program.send and host.network.send take {id,text} or {id,base64}, each through Trust as an effect. host.program.receive({id})/host.network.receive({id}) return the next {text} or non-UTF-8 {base64,binary:true}, with eof and, for programs, stream/exit_code. receive/accept wait up to wait seconds (default 30), then {pending:true}; fetch waits up to wait seconds (default 120) for its whole answer. send waits up to wait seconds (default 30) for acceptance, else ends that program/connection. Over 4 MiB unread program output ends it. host.program.close({id}) ends it and its children; detached sessions can outlive it, as in the shell. Declare shell: requires Full Mac with file operations on, the same shell sandbox, and cwd inside the workspace (default) unless Full Mac lifts the sandbox. host.call(id,args) reaches exactly app.<id>(args) or the named primitive (host.call(\"network.send\",…) is host.network.send(…)), under the same declarations/gates. "
+                  warn: """
+                      description: one line; save keeps its first line within 500 characters and says so; details in params. code: JavaScript function \
+                      run(input) (or async function run(input); app and host calls answer at once and may be awaited) returning JSON (to decline on purpose, \
+                      return {status:\"refused\",reason:\"revision_required\",detail:\"This ability does not support that \
+                      input.\",effects:\"none\",remedy:{instruction:\"Read this ability, then revise it for the \
+                      input.\",next_call:{tool:\"app\",input:{action:\"ability.read\",args:{id:\"your_ability_id\"}}}}}; use the actual cause, detail, \
+                      effects and id. A person-owned decision uses remedy {instruction,tap}; a terminal refusal uses remedy \
+                      {kind:\"terminal\",instruction:\"why no further action is appropriate\",next_call:null}. A decline is an answer, not a fault; a throw \
+                      or {ok:false} reads as broken and owes a repair). app.<page>.<action>(args), or the door's own form app({action,args}) / \
+                      app({actions:[…]}), runs any action under ordinary gates; calls are derived from code. app.step(label,guidance), \
+                      app.decide(question,data), app.expect(ok,what), app.expect_fail(code,fn) make a strict journal; decide hands back its question for \
+                      ability.resume {run_id,answer}. Calls return action data plus call (action id) and effects (none,occurred,partial,unknown); failures \
+                      throw catchable AppError with e.reason,e.effects,e.call,e.receipt. host.state.get() and host.state.set(value) persist this ability's \
+                      JSON. host.files: read/list/info/excerpt/grep/spotlight/write/copy/move/trash/patch. host.network: \
+                      connect/listen/accept/send/receive/close; connect takes {host,port,tls?,transport?} or {path} for a Mac socket (localhost). \
+                      host.program.start({command,args?,env?,cwd?}) runs a path or a name on the login PATH, returning {id}. host.program.send and \
+                      host.network.send take {id,text} or {id,base64}, each through Trust as an effect. host.program.receive({id})/host.network.receive({id}) \
+                      return the next {text} or non-UTF-8 {base64,binary:true}, with eof and, for programs, stream/exit_code. receive/accept wait up to wait \
+                      seconds (default 30), then {pending:true}; fetch waits up to wait seconds (default 120) for its whole answer. send waits up to wait \
+                      seconds (default 30) for acceptance, else ends that program/connection. Over 4 MiB unread program output ends it. \
+                      host.program.close({id}) ends it and its children; detached sessions can outlive it, as in the shell. Declare shell: requires Full Mac \
+                      with file operations on, the same shell sandbox, and cwd inside the workspace (default) unless Full Mac lifts the sandbox. \
+                      host.call(id,args) reaches exactly app.<id>(args) or the named primitive (host.call(\"network.send\",…) is host.network.send(…)), \
+                      under \
+                      the same declarations/gates.\u{20}
+                      """
                       + "A habit that gathers and wants your judgment returns needs_me: \"<why>\"; otherwise it finishes the job itself. "
-                      + "host.model.call({purpose,prompt|messages,schema?}) uses your current chat model, without persona, returning text or checked JSON; declare model. messages: {role,content} strings. "
-                      + "host.fetch({url,method?,headers?,body?}) returns {status,headers,body}, body as UTF-8. Keyless calls require network_public, or network_localhost for loopback. Returns redirects without following. "
-                      + "Use {{secret:<name>}} in fetch url/headers/body, network.send text or program args/env/stdin; declare secret:<name>. Values go only to their granted host (https, established TLS, or Mac loopback; never udp) or program, and read back as [secret:<name>]. An absent secret refuses with card.request to ask once. Secret-bearing GET/HEAD with no body is a read; every other secret-bearing call passes Trust as an effect. host.measurementSystem: us, metric or other. app.mac.system_info({person:true}) returns {here,idle_seconds} from the person's input only (never yours), away after 300 seconds idle. Use it: ioreg/event-source idle clocks count your input. "
-                      + "host.calendar.upcoming/create/modify/delete, host.reminders.query/create/update/delete and host.contacts.search/save use each current app action's named arguments. calendar/reminders/contacts declarations include their app action dependencies; file reach includes reads, write reach mutations. reach: {capabilities,readPaths?,hosts?,apps?}. Every effect passes Trust. "
-                      + "host.apps.call({bundle_id,dictionary:true}) reads sdef; events take {bundle_id,event_class,event_id,parameters}. Declare app_read:<bundle_id> or app_write:<bundle_id> in reach.capabilities. Standard core getd/cnte/doex events are reads; modifying/unclassified events require write. Calls never prompt: request permission with target applescript:<bundle_id> for the owner's macOS grant. "
-                      + "host.apps.call({bundle_id,script}) runs AppleScript in that app's tell context; always requires app_write:<bundle_id>. No scripting additions, resource imports, script objects or self references; every event targets that exact process. app_write grants the app's broad reach: Finder, for example, can open files/URLs in other apps. "
-                      + "Event parameters use four-character keys and JSON descriptors: primitives, lists, {type}, {enum}, {ordinal}, {record}, or {object:{want,form,seld,from}}. {ordinal:\"all \"} selects every element with form:\"indx\"; the other absolute ordinals are \"firs\", \"last\", \"midd\" and \"any \" (spaces matter). "
-                      + "Omitted/null from targets the application: host.apps.call({bundle_id:\"com.apple.Keynote\",event_class:\"core\",event_id:\"getd\",parameters:{\"----\":{object:{want:\"prop\",form:\"prop\",seld:{type:\"pnam\"},from:null}}}}) reads its name. "
-                      + "screen.watch({app,fps?,seconds?,region?}) watches that app's front window for the run; fps up to 30 (default 10), seconds up to 600 (default 60); declare screen.watch. "
-                      + "screen.next(timeout?) skips older frames and returns the newest unseen {watch,seq,at,width,height,screen,read}; {timedOut:true} after timeout seconds without a new frame. Returns null when the watch ends: window gone, duration spent, Stop, screen control off, or person input with hands. Without hands, person input never ends it. "
-                      + "f.read([...]) batches queries in frame pixels until the next frame: {at:[x,y]} → {r,g,b}; {mean:[x,y,w,h]} → {r,g,b,l}; {changed:[x,y,w,h]} → share changed since the prior frame; {text:[x,y,w,h]} → redacted on-device text. "
-                      + "Declare hands for hand.click/double_click/right_click/move(x,y), hand.drag(x,y,toX,toY), hand.key(\"cmd+s\"), hand.hold(\"w\",seconds), hand.down(\"w\"), hand.up(\"w\"): frame-speed actions on that window in frame pixels, no model call; code is the reflex, args the intent. Keys held by down release on up, run end or person input. "
-                      + "const eyes = screen.watch({app:\"Safari\",fps:10,seconds:60}); while (true) { const f = screen.next(); if (!f) break; const [c] = f.read([{at:[120,80]}]); if (c.r > 200 && c.g < 60) hand.click(120,80) } "
-                      + "host.paths.home: absolute user home; resolve ~ in tool inputs. host.paths.workspace: your file folder; save there unless the person names another place. Files use app action arguments/results: host.files.write({path:\"workspace/note.txt\",content:\"hello\"}). "
-                      + "actions declares indirect app calls through host.call, app.call, app.read(actionID) and part.call, literal or computed; direct app dot/bracket members and reach derive the other dependencies. Save checks literal names and missing declarations before staging; computed names keep runtime checks and appear in receipt warnings. app(…) takes the door's own request forms ({action, args}, {actions:[…]}, {find}, {page, item}); other impossible prelude shapes refuse save with the supported form. Declarations grant no authority. params: input name → string/int/number/bool/list/object (optional with ?), {type,description?}, or a JSON Schema object. Revisions inherit code and unstated declarations (description,params,actions,reach,wake,face,resident,learned,choices) from the latest version; restating replaces, []/{} clears. ability.read {id} reads its code. Use edits:[{old,new}] instead of code: each old must occur exactly once; replacements apply in order and save as a revision. ability.validate intercepts calls: omit fixtures or use capture:true for one input run (default {}): "
-                      + "reads run live and answers are sealed; effects, nested tools and decisions return visible placeholders. Later validation replays that capture, covering only supplied inputs/reached calls; intercepted replies prove no live behavior. "
+                      + """
+                          host.model.call({purpose,prompt|messages,schema?}) uses your current chat model, without persona, returning text or checked JSON; \
+                          declare model. messages: {role,content} strings.\u{20}
+                          """
+                      + """
+                          host.fetch({url,method?,headers?,body?}) returns {status,headers,body}, body as UTF-8. Keyless calls require network_public, or \
+                          network_localhost for loopback. Returns redirects without following.\u{20}
+                          """
+                      + """
+                          Use {{secret:<name>}} in fetch url/headers/body, network.send text or program args/env/stdin; declare secret:<name>. Values go only \
+                          to their granted host (https, established TLS, or Mac loopback; never udp) or program, and read back as [secret:<name>]. An absent \
+                          secret refuses with card.request to ask once. Secret-bearing GET/HEAD with no body is a read; every other secret-bearing call \
+                          passes Trust as an effect. host.measurementSystem: us, metric or other. app.mac.system_info({person:true}) returns \
+                          {here,idle_seconds} from the person's input only (never yours), away after 300 seconds idle. Use it: ioreg/event-source idle clocks \
+                          count your input.\u{20}
+                          """
+                      + """
+                          host.calendar.upcoming/create/modify/delete, host.reminders.query/create/update/delete and host.contacts.search/save use each \
+                          current app action's named arguments. calendar/reminders/contacts declarations include their app action dependencies; file reach \
+                          includes reads, write reach mutations. reach: {capabilities,readPaths?,hosts?,apps?}. Every effect passes Trust.\u{20}
+                          """
+                      + """
+                          host.apps.call({bundle_id,dictionary:true}) reads sdef; events take {bundle_id,event_class,event_id,parameters}. Declare \
+                          app_read:<bundle_id> or app_write:<bundle_id> in reach.capabilities. Standard core getd/cnte/doex events are reads; \
+                          modifying/unclassified events require write. Calls never prompt: request permission with target applescript:<bundle_id> for the \
+                          owner's macOS grant.\u{20}
+                          """
+                      + """
+                          host.apps.call({bundle_id,script}) runs AppleScript in that app's tell context; always requires app_write:<bundle_id>. No scripting \
+                          additions, resource imports, script objects or self references; every event targets that exact process. app_write grants the app's \
+                          broad reach: Finder, for example, can open files/URLs in other apps.\u{20}
+                          """
+                      + """
+                          Event parameters use four-character keys and JSON descriptors: primitives, lists, {type}, {enum}, {ordinal}, {record}, or \
+                          {object:{want,form,seld,from}}. {ordinal:\"all \"} selects every element with form:\"indx\"; the other absolute ordinals are \
+                          \"firs\", \"last\", \"midd\" and \"any \" (spaces matter).\u{20}
+                          """
+                      + """
+                          Omitted/null from targets the application: \
+                          host.apps.call({bundle_id:\"com.apple.Keynote\",event_class:\"core\",event_id:\"getd\",parameters:{\"----\":{object:{want:\"prop\",form:\"prop\",seld:{type:\"pnam\"},from:null}}}}) \
+                          reads its name.\u{20}
+                          """
+                      + """
+                          screen.watch({app,fps?,seconds?,region?}) watches that app's front window for the run; fps up to 30 (default 10), seconds up to 600 \
+                          (default 60); declare screen.watch.\u{20}
+                          """
+                      + """
+                          screen.next(timeout?) skips older frames and returns the newest unseen {watch,seq,at,width,height,screen,read}; {timedOut:true} \
+                          after timeout seconds without a new frame. Returns null when the watch ends: window gone, duration spent, Stop, screen control off, \
+                          or person input with hands. Without hands, person input never ends it.\u{20}
+                          """
+                      + """
+                          f.read([...]) batches queries in frame pixels until the next frame: {at:[x,y]} → {r,g,b}; {mean:[x,y,w,h]} → {r,g,b,l}; \
+                          {changed:[x,y,w,h]} → share changed since the prior frame; {text:[x,y,w,h]} → redacted on-device text.\u{20}
+                          """
+                      + """
+                          Declare hands for hand.click/double_click/right_click/move(x,y), hand.drag(x,y,toX,toY), hand.key(\"cmd+s\"), \
+                          hand.hold(\"w\",seconds), hand.down(\"w\"), hand.up(\"w\"): frame-speed actions on that window in frame pixels, no model call; code \
+                          is the reflex, args the intent. Keys held by down release on up, run end or person input.\u{20}
+                          """
+                      + """
+                          const eyes = screen.watch({app:\"Safari\",fps:10,seconds:60}); while (true) { const f = screen.next(); if (!f) break; const [c] = \
+                          f.read([{at:[120,80]}]); if (c.r > 200 && c.g < 60) hand.click(120,80) }\u{20}
+                          """
+                      + """
+                          host.paths.home: absolute user home; resolve ~ in tool inputs. host.paths.workspace: your file folder; save there unless the person \
+                          names another place. Files use app action arguments/results: host.files.write({path:\"workspace/note.txt\",content:\"hello\"}).\u{20}
+                          """
+                      + """
+                          actions declares indirect app calls through host.call, app.call, app.read(actionID) and part.call, literal or computed; direct app \
+                          dot/bracket members and reach derive the other dependencies. Save checks literal names and missing declarations before staging; \
+                          computed names keep runtime checks and appear in receipt warnings. app(…) takes the door's own request forms ({action, args}, \
+                          {actions:[…]}, {find}, {page, item}); other impossible prelude shapes refuse save with the supported form. Declarations grant no \
+                          authority. params: input name → string/int/number/bool/list/object (optional with ?), {type,description?}, or a JSON Schema \
+                          object. \
+                          Revisions inherit code and unstated declarations (description,params,actions,reach,wake,face,resident,learned,choices) from the \
+                          latest version; restating replaces, []/{} clears. ability.read {id} reads its code. Use edits:[{old,new}] instead of code: each old \
+                          must occur exactly once; replacements apply in order and save as a revision. ability.validate intercepts calls: omit fixtures or \
+                          use capture:true for one input run (default {}):\u{20}
+                          """
+                      + """
+                          reads run live and answers are sealed; effects, nested tools and decisions return visible placeholders. Later validation replays \
+                          that capture, covering only supplied inputs/reached calls; intercepted replies prove no live behavior.\u{20}
+                          """
                       + "Or supply {input,expected,calls?:[{operation,args,result}]} fixtures to intercept every host call, "
-                      + "including app.<action> dependencies as operation app.<action>. reach.capabilities from app_data_read, app_data_write, network_localhost, "
-                      + "network, network_public, computer_files, arbitrary_file_write, shell, model, calendar, reminders, contacts, screen.watch, hands, secret:<name>, app_read:<bundle_id> or app_write:<bundle_id>. "
-                      + "Read-only code declares each primitive's reach; active abilities are callable from scripts under the same gates. Under Full Mac, your own save is kept and on immediately unless the owner turned it off; only the owner can lift that off. Active code runs as authored.<id>; "
-                      + "below Full Mac or on a turn started by an untrusted agent, it remains unkept; ability.enable files the owner's card. wake defaults []; face {page?,action?,projection?} places the action and may name an unclaimed app action id. projection:true declares face(input) → {sections:[{id,title?,rows:[{id,title,detail?,value?}]}]} from frozen native sources, with no host effects/state. part.call(id,input) calls a declared authored.<id> → {ok:true,value} or {ok:false,error:{code,message}}; input: frozen JSON object, max 4 MiB. host.model.call may pass tools:[\"app\"] and a routing surface, limited by this ability's reach and caller. params {type:\"object\",properties,readOnly:true} declares a read contract; effects still pass Trust. resident defaults false; true retains JS across successful runs and holds opened programs/connections until code closes them, the ability is turned off or replaced, or the app quits. Nonresident held resources end with the run; detached program sessions may outlive it. wake [\"held\"] delivers input.wake {id,kind} for arriving data; read via receive/accept, wait 0 for only available data. wake [\"resumed\"] delivers input.wake at launch; code must reopen resources using saved state. Without it, no launch wake. wake [\"person.away\"]/[\"person.here\"] delivers input.wake {idle_seconds} once per presence change: away at 300 seconds idle, back on person input (never yours). learned.use reports exact-input/reached-call outcomes of ordinary gated runs of the selected version: execution, not proof of a larger task. Intercepted executions, previews and replays earn no competence. choices: reserved JSON. Source max: 524288 bytes. converts: optional original source SHA-256 digests from Tools census, binding conversion counterparts to this exact version.",
+                      + """
+                          including app.<action> dependencies as operation app.<action>. reach.capabilities from app_data_read, app_data_write, \
+                          network_localhost,\u{20}
+                          """
+                      + """
+                          network, network_public, computer_files, arbitrary_file_write, shell, model, calendar, reminders, contacts, screen.watch, hands, \
+                          secret:<name>, app_read:<bundle_id> or app_write:<bundle_id>.\u{20}
+                          """
+                      + """
+                          Read-only code declares each primitive's reach; active abilities are callable from scripts under the same gates. Under Full Mac, \
+                          your own save is kept and on immediately unless the owner turned it off; only the owner can lift that off. Active code runs as \
+                          authored.<id>;\u{20}
+                          """
+                      + """
+                          below Full Mac or on a turn started by an untrusted agent, it remains unkept; ability.enable files the owner's card. wake defaults \
+                          []; face {page?,action?,projection?} places the action and may name an unclaimed app action id. projection:true declares \
+                          face(input) → {sections:[{id,title?,rows:[{id,title,detail?,value?}]}]} from frozen native sources, with no host effects/state. \
+                          part.call(id,input) calls a declared authored.<id> → {ok:true,value} or {ok:false,error:{code,message}}; input: frozen JSON \
+                          object, \
+                          max 4 MiB. host.model.call may pass tools:[\"app\"] and a routing surface, limited by this ability's reach and caller. params \
+                          {type:\"object\",properties,readOnly:true} declares a read contract; effects still pass Trust. resident defaults false; true \
+                          retains JS across successful runs and holds opened programs/connections until code closes them, the ability is turned off or \
+                          replaced, or the app quits. Nonresident held resources end with the run; detached program sessions may outlive it. wake [\"held\"] \
+                          delivers input.wake {id,kind} for arriving data; read via receive/accept, wait 0 for only available data. wake [\"resumed\"] \
+                          delivers input.wake at launch; code must reopen resources using saved state. Without it, no launch wake. wake \
+                          [\"person.away\"]/[\"person.here\"] delivers input.wake {idle_seconds} once per presence change: away at 300 seconds idle, back on \
+                          person input (never yours). learned.use reports exact-input/reached-call outcomes of ordinary gated runs of the selected version: \
+                          execution, not proof of a larger task. Intercepted executions, previews and replays earn no competence. choices: reserved JSON. \
+                          Source max: 524288 bytes. converts: optional original source SHA-256 digests from Tools census, binding conversion counterparts to \
+                          this exact version.
+                          """,
                   tool: "ability_manage", input: verb("save"), lifecycle: .change, schema: abilitySaveSchema),
-        AppAction("ability.read", "tools", "One ability of yours: what it declares, its status and versions, and its code in pages; a built-in skill's guidance reads too",
+        AppAction("ability.read", "tools", """
+            One ability of yours: what it declares, its status and versions, and its code in pages; a built-in skill's guidance reads too
+            """,
                   ["id", "offset?:int", "step?:int"], subject: ["id"], tool: "ability_manage", input: verb("read"), read: true),
-        AppAction("ability.list", "tools", "Your abilities with runs and last_run_at; follow next_call when has_more", ["offset?:int"], tool: "ability_manage", input: verb("list"), read: true),
+        AppAction("ability.list", "tools", "Your abilities with runs and last_run_at; follow next_call when has_more", ["offset?:int"], tool: "ability_manage",
+            input: verb("list"), read: true),
         AppAction("ability.validate", "tools", "Validate an unkept version on supplied input or one captured run; intercepted replies prove no live behavior",
                   ["id", "input?:object*", "capture?:bool"], subject: ["id"], tool: "ability_manage", input: verb("validate"), read: true,
-                  schema: arguments("ability_manage", ["id": ToolSchema.strSchema(), "capture": .object(["type": .string("boolean")]), "input": .object(["type": .string("object"), "additionalProperties": .bool(true),
-                    "description": .string("Input for the selected ability version; its params/input schema from ability.read determines the fields and types. Omit for {} or saved fixtures.")])], read: true)),
-        AppAction("ability.enable", "tools", "Keep an unkept version and turn it on: your work under Full Mac unless the owner turned it off, else the owner's card. Code needs its full version digest; omit version only to restore Markdown guidance",
+                  schema: arguments("ability_manage", ["id": ToolSchema.strSchema(), "capture": .object(["type": .string("boolean")]),
+                      "input": .object(["type": .string("object"), "additionalProperties": .bool(true),
+                    "description": .string("""
+                        Input for the selected ability version; its params/input schema from ability.read determines the fields and types. Omit for {} or \
+                        saved fixtures.
+                        """)])], read: true)),
+        AppAction("ability.enable", "tools", """
+            Keep an unkept version and turn it on: your work under Full Mac unless the owner turned it off, else the owner's card. Code needs its full \
+            version digest; omit version only to restore Markdown guidance
+            """,
                   ["id", "version?"], subject: ["id"], tool: "ability_manage", input: verb("enable"), lifecycle: .enable),
-        AppAction("ability.restore", "tools", "Turn an ability back on via ability.enable; code needs its full version digest; omit version only to restore Markdown guidance", ["id", "version?"], subject: ["id"],
+        AppAction("ability.restore", "tools", """
+            Turn an ability back on via ability.enable; code needs its full version digest; omit version only to restore Markdown guidance
+            """, ["id", "version?"], subject: ["id"],
                   tool: "ability_manage", input: verb("restore"), revision: 3, lifecycle: .restore),
         AppAction("ability.disable", "tools", "Turn an ability off, keeping its current and previous versions", ["id", "reason?"], subject: ["id"],
                   tool: "ability_manage", input: verb("disable"), revision: 2, lifecycle: .change),
-        AppAction("ability.drop", "tools", "Delete an ability, its versions and its run state permanently; pending:true discards only its unkept version", ["id", "pending?:bool", "reason?"], subject: ["id"],
-                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "ability_manage", input: verb("drop"), revision: 2, lifecycle: .drop),
+        AppAction("ability.drop", "tools", """
+            Delete an ability, its versions and its run state permanently; pending:true discards only its unkept version
+            """, ["id", "pending?:bool", "reason?"], subject: ["id"],
+                  irreversible: true, capabilities: ["app_data_write", "safe_read", "tool_call"], tool: "ability_manage", input: verb("drop"), revision: 2,
+                      lifecycle: .drop),
         AppAction("ability.resume", "tools", "Resume a run stopped at a decision or card preview only if its journal contains no primitive call",
-                  ["run_id", "id?", "answer?:any"], subject: ["run_id"], warn: "Optional id binds the run to its ability (bare id or authored.<id>); a mismatch claims nothing. The stopped step returns answer. Any journal call beginning with primitive blocks resume. Before starting a fresh run, inspect prior calls and effects: a fresh run executes from the beginning and may repeat effects; pass the answer as input and account for completed work.",
-                  tool: "ability_manage", input: verb("resume"), schema: arguments("ability_manage", ["run_id": ToolSchema.strSchema(), "id": ToolSchema.strSchema(), "answer": .object([
-                    "description": .string("Any JSON returned to the stopped app.decide step; its recorded question determines the answer's meaning. Inspect that run's question before answering.")])]), part: ""),
+                  ["run_id", "id?", "answer?:any"], subject: ["run_id"], warn: """
+                      Optional id binds the run to its ability (bare id or authored.<id>); a mismatch claims nothing. The stopped step returns answer. Any \
+                      journal call beginning with primitive blocks resume. Before starting a fresh run, inspect prior calls and effects: a fresh run executes \
+                      from the beginning and may repeat effects; pass the answer as input and account for completed work.
+                      """,
+                  tool: "ability_manage", input: verb("resume"), schema: arguments("ability_manage", ["run_id": ToolSchema.strSchema(), "id": ToolSchema
+                      .strSchema(), "answer": .object([
+                    "description": .string("""
+                        Any JSON returned to the stopped app.decide step; its recorded question determines the answer's meaning. Inspect that run's question \
+                        before answering.
+                        """)])]), part: ""),
 
-        // The Desk.
-        AppAction("desk.deny", "desk", "Deny", ["id", "reason?"], subject: ["id"], irreversible: true,capabilities: ["safe_read", "tool_call", "workshop_write"], tool: "workshop_reject"),
-        AppAction("desk.approve", "desk", "Approve", ["id"], subject: ["id"], owner: .his("approving a waiting step is his; the Desk"),
-                  tool: "workshop_reject", input: decision("approve")),
-
-        // MY QUEUE: steps she means to do later, kept on her Desk until she marks each done or dropped. Version-exempt: done and drop close
-        // the one step their id names, and a second close finds it no longer open and changes nothing. add: it appends, a new step, or a
-        // newer step ref on the open step with the same words (MyQueue.add keeps the old ref, newest wins), and the same call again changes
-        // nothing.
+        // Version-exempt: done/drop close an exact id idempotently; add appends or updates the open step's ref, retaining its prior ref.
         AppAction("undo", "desk", "Undo this conversation's last layout, recipe or setting change",
                   tool: "undo", versionExempt: true),
-        AppAction("queue.add", "desk", "Mean to do something later (an intention, reminder, check-in or habit): it comes back at its moment, in your own words", ToolSignature.doorArgs(queueAddSchema.parametersJSON).map { ["until?", "action?"].contains($0) ? $0 + ":any" : $0 },
-                 warn: "when is next_turn (the default), own_turn, when_user_messages with an optional door, "
-                      + "when_user_here, when_user_away, on_news <words>, on <signal> (e.g. \"on file.changed:~/Downloads\", \"on message.arrived:telegram\"; use rhythms for schedule:), "
-                      + "after_card <approval id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), \"in 20 minutes\", or a rhythm that brings it back each time: "
+        AppAction("queue.add", "desk", """
+            Mean to do something later (an intention, reminder, check-in or habit): it comes back at its moment, in your own words
+            """, ToolSignature.doorArgs(queueAddSchema.parametersJSON).map { ["until?", "action?"].contains($0) ? $0 + ":any" : $0 },
+                 warn: "when is next_turn (the default), own_turn, when_user_messages with an optional door (\(MyQueue.Door.listed)), "
+                      + """
+                          when_user_here, when_user_away, on_news <words>, on <signal> (e.g. \"on file.changed:~/Downloads\", \"on message.arrived:telegram\"; \
+                          use rhythms for schedule:),\u{20}
+                          """
+                      + """
+                          after_card <approval id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), \"in 20 minutes\", or a \
+                          rhythm that brings it back each time:\u{20}
+                          """
                       + "\"every 0 9,16 * * *\" (cron, Mac clock), \"every 2 hours\", or a schedule object {type: daily|weekly|cron|…}. "
-                      + "until takes a moment as when does: at <ISO time>, in N minutes|hours|days, or {at:\"<ISO time>\"} (it ends itself then); also words you check when it comes up, or standing (a rhythm's default). "
-                      + "say is fixed words for the person, said as they are. action:{action:\"authored.<id>\",args:{…}} binds a habit: it runs through your door at its moment, waking you only for needs_me or an unfinished/refused run. An action id string also works. With say, the habit runs first. "
+                      + """
+                          until takes a moment as when does: at <ISO time>, in N minutes|hours|days, or {at:\"<ISO time>\"} (it ends itself then); also words \
+                          you check when it comes up, or standing (a rhythm's default).\u{20}
+                          """
+                      + """
+                          say is fixed words for the person, said as they are. action:{action:\"authored.<id>\",args:{…}} binds a habit: it runs through \
+                          your \
+                          door at its moment, waking you only for needs_me or an unfinished/refused run. An action id string also works. With say, the habit \
+                          runs first.\u{20}
+                          """
                       + "The receipt shows the next times the clock heard",
                   tool: "my_queue", input: verb("add"), versionExempt: true,
                   schema: queueAddSchema),
-        AppAction("queue.update", "desk", "Edit a carried step or bind/drop its habit", ["id", "action?:any", "say?:any", "when?:any", "until?:any"], subject: ["id"],
-                  warn: "Only named fields change. action:{action:\"authored.<id>\",args:{…}} binds a habit; action:null drops it. say:null clears fixed words. when and until use queue.add's grammar. The receipt names the stored habit.",
+        AppAction("queue.update", "desk", "Edit a carried step or bind/drop its habit", ["id", "action?:any", "say?:any", "when?:any", "until?:any"],
+            subject: ["id"],
+                  warn: """
+                      Only named fields change. action:{action:\"authored.<id>\",args:{…}} binds a habit; action:null drops it. say:null clears fixed words. \
+                      when and until use queue.add's grammar. The receipt names the stored habit.
+                      """,
                   tool: "my_queue", input: verb("update"), versionExempt: true, schema: queueUpdateSchema),
         AppAction("queue.done", "desk", "Mark a MY QUEUE step done", ["id", "reason?"], subject: ["id"],tool: "my_queue",
                   input: verb("done"), versionExempt: true),
         AppAction("queue.drop", "desk", "Drop a MY QUEUE step", ["id", "reason?"], subject: ["id"],tool: "my_queue",
                   input: verb("drop"), versionExempt: true),
-        // a repair she owes settles when that operation works again, or here, with why.
-        AppAction("repair.let_go", "desk", "Let go of something you owe (a repair on your home's OWED line, or a reply no door can carry), saying why", ["id", "reason"], subject: ["id"],
+        // Owed repair settles only when its operation works again or an explicit reason releases it.
+        AppAction("repair.let_go", "desk", """
+            Let go of something you owe (a repair on your home's OWED line, or a reply no door can carry), saying why
+            """, ["id", "reason"], subject: ["id"],
                   tool: "repair_let_go", versionExempt: true),
-        AppAction("abilities.restore_state", "diagnostics", "Restore recovered ability run state, preserving damaged bytes and existing authority", ["state:object", "expected_digest"],
-                  warn: "Read abilities/state.json with files.read and recover its accounting rows, including pending work. Do not invent run evidence. expected_digest is supplied by the unreadable-state refusal.",
+        AppAction("abilities.restore_state", "diagnostics",
+            "Restore recovered ability run state, preserving damaged bytes and existing authority", ["state:object", "expected_digest"],
+                  warn: """
+                      Read abilities/state.json with files.read and recover its accounting rows, including pending work. Do not invent run evidence. \
+                      expected_digest is supplied by the unreadable-state refusal.
+                      """,
                   tool: "abilities_restore_state", versionExempt: true, lifecycle: .change,
                   schema: arguments("abilities_restore_state", ["state": AbilityStore.recoveryStateSchema, "expected_digest": ToolSchema.strSchema()])),
-        AppAction("turn.reconcile", "chat", "Reconcile a saved turn without repeating completed effects", ["session_id", "turn_id?"], subject: ["session_id"], tool: "turn_reconcile", versionExempt: true),
+        AppAction("turn.reconcile", "chat", "Reconcile a saved turn without repeating completed effects", ["session_id", "turn_id?"], subject: ["session_id"],
+            tool: "turn_reconcile", versionExempt: true),
         AppAction("home.accept", "desk", "Accept kept arrivals", ["id?"], subject: ["id"], tool: "arrival_accept", versionExempt: true),
-        // A part's one way to her between turns (AGENT_IS_THE_APP contract #2): an arrival, never her context.
-        AppAction("home.arrive", "desk", "From a part's run: one line on your home; event_key deduplicates this occurrence durably within this part, otherwise the same line is offered once per local day",
+        // Between-turn part arrivals reach the news board, never context (AGENT_IS_THE_APP contract #2).
+        AppAction("home.arrive", "desk", """
+            From a part's run: one line on your home; event_key deduplicates this occurrence durably within this part, otherwise the same line is offered \
+            once per local day
+            """,
                   ["line", "event_key?"],tool: "resident_wake", versionExempt: true),
         AppAction("house.file", "desk", "File something to tend, with who owns it", ["title", "summary", "owner", "refs?:array"],
                  warn: "owner is me, builder or user; refs contains strings or Desk ref objects {kind,…}", tool: "house_file", versionExempt: true),
 
-        // Folded tools. Reads: a script may call them, and no inbox is read around them.
+        // Folded reads are scriptable and raise no inbox notes.
         .fold("time_now", "*", "The date and time now: local, UTC, epoch, weekday and day of year", read: true),
-        .fold("context_expand", "chat", "Read deeper context by its offered atom id or a history: id from a replayed receipt; offset defaults to 0, pages cap at 12000 characters, continue with next_offset until null",
+        .fold("context_expand", "chat", """
+            Read deeper context by its offered atom id or a history: id from a replayed receipt; offset defaults to 0, pages cap at 12000 characters, \
+            continue with next_offset until null
+            """,
               ["atom_id", "max_characters?:int", "offset?:int"], read: true),
         .fold("inner_state", "personality",
               "Your inner state, from your organs' record; asked how you feel, read this first, then speak",
               ["window_hours?:int", "detail?:compact|full"], read: true),
         .fold("agent_introspect", "diagnostics", "Your live runtime, provider and conversation identity",
               ["detail?:compact|full"], read: true),
-        .fold("recent_trace_summary", "diagnostics", "Read saved traces; receipts span all conversations unless session_id is explicit, with non-read actions first and complete retained since windows",
-              ["view?:receipts", "trace?", "effects_only?:bool", "since?", "limit?:int", "before?", "offset?:int", "completed_turns?:int", "kind?", "name?", "status?", "session_id?", "turn_id?", "receipt_id?", "fields?:[str]"], read: true),
-        .fold("recent_trace_summary", "diagnostics", id: "trace.model_calls", "Model calls: per-turn counts by purpose and rounds per turn (p50, p90) for the last 24 hours and 7 days, the top five purposes by total milliseconds, and the week's five heaviest asks with their first six calls; reads retained traces without a model call",
+        .fold("recent_trace_summary", "diagnostics", """
+            Read traces from the life record; receipts span all conversations unless session_id is explicit, with non-read actions first and complete \
+            retained since windows
+            """,
+              ["view?:receipts", "effects_only?:bool", "since?", "limit?:int", "before?", "offset?:int", "completed_turns?:int", "kind?", "name?",
+                  "status?", "session_id?", "turn_id?", "receipt_id?", "fields?:[str]"], read: true),
+        .fold("recent_trace_summary", "diagnostics", id: "trace.model_calls", """
+            Model calls: per-turn counts by purpose and rounds per turn (p50, p90) for the last 24 hours and 7 days, the top five purposes by total \
+            milliseconds, and the week's five heaviest asks with their first six calls; reads retained traces without a model call
+            """,
               [], input: ["view": .string("model_calls")], read: true),
-        .fold("recent_trace_summary", "diagnostics", id: "trace.usage", "Recorded model usage: exact retained call, input, cached input, output token and duration sums, grouped by model, surface or local day; since defaults to today (local midnight) or accepts an ISO-8601 timestamp; reports missing measurements and retention coverage",
+        .fold("recent_trace_summary", "diagnostics", id: "trace.usage", """
+            Recorded model usage: exact retained call, input, cached input, output token and duration sums, grouped by model, surface or local day; since \
+            defaults to today (local midnight) or accepts an ISO-8601 timestamp; reports missing measurements and retention coverage
+            """,
               ["since?", "by?:model|surface|day"], input: ["view": .string("usage")], read: true),
 
-        // Her own state: the Desk, its task ledger, Workshop and schedules; memory; helpers; persona and skills; studio and mind.
-        .fold("desk_read", "desk", "Your Desk: paged items with status, summary, notes and refs; handle reads one item, query searches, limit/offset page, sort changes order only", read: true),
+        .fold("desk_read", "desk", """
+            Your Desk: paged items with status, summary, notes and refs; handle reads one item, query searches, limit/offset page, sort changes order only
+            """, read: true),
         .fold("desk_add_item", "desk"),
         .fold("desk_note", "desk"),
         .fold("desk_set_status", "desk"),
@@ -452,10 +735,11 @@ extension AppActions {
         .fold("desk_open_pursuit", "desk"),
         .fold("task_ledger_list", "desk", "Shared task ledger: a separate list from your Desk", read: true),
         .fold("task_ledger_post", "desk", "Post to the shared task ledger (separate from your Desk)"),
-        .fold("workshop_status", "desk", read: true),
-        .fold("workshop_submit", "desk"),
         .fold("scheduler_list_jobs", "desk", read: true),
-        .fold("scheduler_create_job", "desk", "Schedule a body rhythm: dream, rem, part, connector_action, harness_benchmark or proactive_scan; for intentions, check-ins and reminders use queue.add"),
+        .fold("scheduler_create_job", "desk", """
+            Schedule a body rhythm: dream, rem, part, connector_action, harness_benchmark or proactive_scan; for intentions, check-ins and reminders use \
+            queue.add
+            """),
         .fold("scheduler_update_job", "desk", "Edit a body rhythm; for intentions, check-ins and reminders use queue.add"),
         .fold("scheduler_pause_job", "desk"),
         .fold("scheduler_resume_job", "desk"),
@@ -498,40 +782,65 @@ extension AppActions {
         .fold("agent_contacts", "agents", read: true),
         // The send schema owns wait_seconds and the live/async receipt contract.
         .fold("agent_message", "agents"),
-        .fold("claude_message", "agents", id: "claude.say"),
         .fold("agent_read", "agents", read: true),
-        AppAction("claude.worklog", "agents", "Read what Claude has been doing and working on, newest first: her worklog of shipped features, fixes, builds and work in progress",
+        AppAction("claude.worklog", "agents", """
+            Read what Claude has been doing and working on, newest first: the worklog of shipped features, fixes, builds and work in progress
+            """,
                   ["since?", "limit?:int"],
-                  warn: "since: today or an ISO 8601 timestamp with timezone. limit: 1–50, default 10, newest first. Reads the bounded recent worklog tail; refs are clipped. Reading never sends a message.",
+                  warn: """
+                      since: today or an ISO 8601 timestamp with timezone. limit: 1–50, default 10, newest first. Reads the bounded recent worklog tail; \
+                      refs \
+                      are clipped. Reading never sends a message.
+                      """,
                   tool: "claude_worklog", read: true),
         .fold("agent_connect", "agents"),
         AppAction("agent.rename", "agents", "Rename an agent: call it by a new name or nickname when the person asks; its identity and handles stay the same",
                   ["agent", "name"], subject: ["agent"], tool: "agent_connect", scope: "call it name it nickname rename an agent"),
-        // How each agent is reached (agents/recipes/<host>.json), hers to read and fix when an app changes under it. A write is
-        // connect-level: below Full Mac its card is connect's (other_app_settings_write).
+        // Recipe writes change connection authority and require other_app_settings_write below Full Mac.
         AppAction("agent.recipe", "agents", "Read a host's connection recipe and the version a write replaced; omit host for all hosts",
                   ["host?"], subject: ["host"],tool: "agent_contacts", read: true),
-        AppAction("agent.recipe_write", "agents", "Create a recipe using agent.recipe's shape and a new host.id, or replace at the version read; keeps the prior version for undo",
-                  ["host", "recipe:object"], subject: ["host"], reach: .his, capabilities: ["other_app_settings_write", "tool_call"], tool: "agent_connect",
+        AppAction("agent.recipe_write", "agents", """
+            Create a recipe using agent.recipe's shape and a new host.id, or replace at the version read; keeps the prior version for undo
+            """,
+                  ["host", "recipe:object"], subject: ["host"], reach: .person, capabilities: ["other_app_settings_write", "tool_call"], tool: "agent_connect",
                   schema: arguments("agent_connect", ["host": ToolSchema.strSchema(), "recipe": AgentRecipeStore.writeArgumentSchema])),
-        // The "no" to an agent discovery found here; only discovery.json changes.
+        // Discovery refusal changes only discovery.json.
         AppAction("agent.discovery_dismiss", "agents", "Decline an agent found on this Mac; it is not offered or connected automatically again",
                   ["name"],tool: "agent_discovery_dismiss"),
         // Verification is explicit; a failed send returns its first outcome without retry.
-        AppAction("agent.verify", "agents", "Dry-run a host recipe or contact settings, handshake or window controls; sends nothing. A pass proves only the named checks; a reply needs separate proof",
+        AppAction("agent.verify", "agents", """
+            Dry-run a host recipe or contact settings, handshake or window controls; sends nothing. A pass proves only the named checks; a reply needs \
+            separate proof
+            """,
                   ["agent", "workspace?"], subject: ["agent"], tool: "agent_message"),
         .fold("agent_cancel", "agents", "Stop the reply an agent is working on in your conversation with it"),
-        // The answer of a contact reached through one of her abilities, from that ability's code.
+        // The organ brings its own model and sign-in: the job carries no model of any kind, and what it makes comes back as the agent's.
+        AppAction("agent.job", "agents", """
+            Give another agent, or a line of your own (agent self), a whole piece of your work: what it makes comes back to you as yours, checked by \
+            done, and wakes you here when it ends; several at once run side by side; agent.read and agent.cancel with job:<job id> read or stop it
+            """,
+                  ["agent", "brief", "instructions?", "where?", "reach?:object", "done?:object", "desk?"], subject: ["agent"], toolClass: .send,
+                  capabilities: ["app_data_write", "external_send", "network_read", "network_write", "process_spawn", "shell", "tool_call"],
+                  tool: "agent_job", schema: agentJobSchema),
+        // The agent's hands on a repo job's branch. Apply's merge runs as the agent's own git call, under that tool's gates, Trust and cards; the stem only
+        // reads first.
+        AppAction("agent.apply", "agents", """
+            Merge a finished repo job's branch into the repository's current branch with your own git; read its diff first with agent.read. A conflict is \
+            reported and changes nothing
+            """,
+                  ["job"], subject: ["job"], capabilities: ["app_data_write", "process_spawn", "tool_call"], tool: "agent_job"),
+        AppAction("agent.discard", "agents", """
+            Drop a repo job's worktree, uncommitted work included, and delete its branch; your repository's own branches stay, and its patch stays in Make
+            """,
+                  ["job"], subject: ["job"], irreversible: true, capabilities: ["app_data_write", "filesystem_delete", "process_spawn", "tool_call"],
+                  tool: "agent_job"),
         AppAction("agent.reply", "agents", "From a contact's connecting ability, answer as that contact in its conversation; done:false marks progress",
                   ["text", "done?:bool", "agent?", "exchange?"], tool: "agent_message"),
         .fold("delegation_status", "agents", read: true),
-        .fold("agent_swarm", "agents", "Run temporary workers on an objective; reasoning_effort sets Think for the run or each worker, defaulting to Work thinking (providers.work_thinking)"),
-        .fold("codex_message", "agents"),
-        .fold("invoke_codex", "agents"),
-        .fold("omp_message", "agents"),
 
-        // Each Mac app and connector is a page.
-        .fold("mail_list_recent", "mail", "Read Apple Mail drafts to a person/address with mailbox:\"drafts\"; also inbox or sent. Read one body with scope + message_id "
+        .fold("mail_list_recent", "mail", """
+            Read Apple Mail drafts to a person/address with mailbox:\"drafts\"; also inbox or sent. Read one body with scope + message_id\u{20}
+            """
               + "+ expected_message_id + expected_account_id", read: true),
         .fold("mail_read_batch", "mail", read: true),
         .fold("mail_search", "mail", read: true),
@@ -550,7 +859,8 @@ extension AppActions {
         .fold("mac_calendar_create_event", "calendar"),
         .fold("mac_calendar_modify_event", "calendar"),
         .fold("mac_calendar_delete_event", "calendar", irreversible: true),
-        .fold("mac_reminders_list_due_today", "reminders", "Reminders due today and overdue as separate parts, each counted and capped independently", read: true),
+        .fold("mac_reminders_list_due_today", "reminders", "Reminders due today and overdue as separate parts, each counted and capped independently",
+            read: true),
         .fold("mac_reminders_query", "reminders", read: true),
         .fold("mac_reminders_lists", "reminders", "Every reminder list with its open count", read: true),
         .fold("mac_reminders_read", "reminders", read: true),
@@ -567,20 +877,25 @@ extension AppActions {
         .fold("contacts_search", "contacts", read: true),
         .fold("contacts_create_or_update", "contacts"),
         .fold("contacts_delete", "contacts", irreversible: true),
-        .fold("messages_recent_threads", "messages", "List Messages threads with selected fields, latest-unread filtering and a since window; or read sent, received and exact conversation history", read: true),
+        .fold("messages_recent_threads", "messages", """
+            List Messages threads with selected fields, latest-unread filtering and a since window; or read sent, received and exact conversation history
+            """, read: true),
         .fold("messages_send", "messages", irreversible: true),
         .fold("mac_notify", "notifications"),
         .fold("mobile_notify", "notifications"),
         .fold("phone_request", "pairing"),
-        // Reading where the paired iPhone is changes nothing: a read of its own, so a part that only looks (weather) stays a read. Its wait
-        // is a phone that is open: a push, the person's tap, a fix and the Mac's 8-second drain while the request is out; not a minute for
-        // one that is not.
+        // Location is read-only; the wait covers an open phone's push, tap, fix and 8-second Mac drain, not a closed phone.
         .fold("phone_request", "pairing", id: "phone.location", "Ask the paired iPhone for its current location", [],
               input: ["kind": .string("location.current"), "wait_seconds": .int(20)], read: true),
         .fold("image_generate", "chat"),
 
-        .fold("read_file", "files", "Read a workspace/approved file or image pixels; query searches the whole text. Continue with returned next arguments, including version", read: true),
-        .fold("list_dir", "files", "List names/dates in an approved folder. sort:newest orders by added then modified date; sort:added by date added, including app bundles; sort:size reads allocated disk usage within a time budget and names partial results", read: true),
+        .fold("read_file", "files", """
+            Read a workspace/approved file or image pixels; query searches the whole text. Continue with returned next arguments, including version
+            """, read: true),
+        .fold("list_dir", "files", """
+            List names/dates in an approved folder. sort:newest orders by added then modified date; sort:added by date added, including app bundles; \
+            sort:size reads allocated disk usage within a time budget and names partial results
+            """, read: true),
         .fold("file_info", "files", "Read name, directory/regular flags, size and modified date without following the final symbolic link", read: true),
         .fold("file_excerpt", "files", read: true),
         .fold("grep", "files", read: true),
@@ -591,14 +906,31 @@ extension AppActions {
         .fold("trash_file", "files"),
         .fold("apply_patch", "files", "Apply a unified diff with paths relative to cwd",
               warn: #"Example app {action:"files.patch",args:{cwd:"/absolute/path/to/repo",patch:"--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"}}; supply actual content/ranges; the marker is only for missing final newlines"#),
-        .fold("git_status", "shell", "Read parsed branch and changes; omitted path uses the app's verified source checkout, or workspace when none exists; returns cwd", read: true),
+        .fold("git_status", "shell", """
+            Read parsed branch and changes; omitted path uses the app's verified source checkout, or workspace when none exists; returns cwd
+            """, read: true),
         .fold("git_diff", "shell", "Read changes; omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd", read: true),
-        .fold("git_log", "shell", "Read commits and changed files; omitted path uses the app's verified source checkout, or workspace when none exists; returns cwd", read: true),
-        .fold("repo_dirty_summary", "shell", "Read branch, changes and recent commits; omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd", read: true),
-        .fold("shell", "shell", "Run a command with sh; cwd defaults to your workspace, relative cwd starts there; select the source checkout with explicit cwd",
-              warn: "Requires Full Mac file access. Only a literal command certified by the shell owner reads (including pwd, df and simple git log/status/diff/show); shell syntax and all other commands remain writes. Certified reads run under read-only confinement. Invalid cwd or another pre-launch refusal returns execution:not_run, effect:none."),
-        .fold("bash", "shell", "Run a command with bash; cwd defaults to your workspace, relative cwd starts there; select the source checkout with explicit cwd",
-              warn: "Requires Full Mac file access. The same read certification and confinement as shell.run applies; all other commands remain writes. Pre-launch refusals return execution:not_run, effect:none."),
+        .fold("git_log", "shell", """
+            Read commits and changed files; omitted path uses the app's verified source checkout, or workspace when none exists; returns cwd
+            """, read: true),
+        .fold("repo_dirty_summary", "shell", """
+            Read branch, changes and recent commits; omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd
+            """, read: true),
+        .fold("shell", "shell", """
+            Run a command with sh; cwd defaults to your workspace, relative cwd starts there; select the source checkout with explicit cwd
+            """,
+              warn: """
+                  Requires Full Mac file access. Only a literal command certified by the shell owner reads (including pwd, df and simple git \
+                  log/status/diff/show); shell syntax and all other commands remain writes. Certified reads run under read-only confinement. Invalid cwd or \
+                  another pre-launch refusal returns execution:not_run, effect:none.
+                  """),
+        .fold("bash", "shell", """
+            Run a command with bash; cwd defaults to your workspace, relative cwd starts there; select the source checkout with explicit cwd
+            """,
+              warn: """
+                  Requires Full Mac file access. The same read certification and confinement as shell.run applies; all other commands remain writes. \
+                  Pre-launch refusals return execution:not_run, effect:none.
+                  """),
         .fold("git", "shell", "Run Git with explicit args; omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd"),
         .fold("swift_build", "shell"),
         .fold("swift_test", "shell"),
@@ -607,10 +939,16 @@ extension AppActions {
         .fold("restart_app", "shell"),
         .fold("install_app", "shell"),
         .fold("read_page", "web", read: true,
-              warn: "find reads matching paragraphs with surroundings; without find the whole extracted text is read. raw:true bypasses the sense view; wrong:true reads the original view and offers repair guidance after success (why is an optional explanation). Every successful fetch retains a source receipt with its path and purpose."),
+              warn: """
+                  find reads matching paragraphs with surroundings; without find the whole extracted text is read. raw:true bypasses the sense view; \
+                  wrong:true reads the original view and offers repair guidance after success (why is an optional explanation). Every successful fetch \
+                  retains a source receipt with its path and purpose.
+                  """),
         .fold("web_search", "web", read: true),
         .fold("maps_route", "web", "Read a route, distance and driving time between places", read: true,
-              warn: "traffic: not_included; time assumes ideal conditions. Every step is returned; step distance covers its path segment, not just its turn/exit."),
+              warn: """
+                  traffic: not_included; time assumes ideal conditions. Every step is returned; step distance covers its path segment, not just its turn/exit.
+                  """),
         .fold("maps_search", "web", "Find nearby places and addresses in Maps", read: true,
               warn: "near is optional when query includes near/in/around plus a place, for example coffee near Tampa airport; the result says what was split."),
         .fold("browser.status", "browser", read: true),
@@ -621,14 +959,17 @@ extension AppActions {
         .fold("browser.chrome_setup", "browser"),
         .fold("browser.chrome_status", "browser", read: true),
         .fold("browser.chrome_snapshot", "browser", read: true),
-    ] + ToolNameAliases.chromeVerbs.filter { $0 != "snapshot" }.map { try AppAction.fold("browser.chrome_" + $0, "browser", read: $0 == "wait" || $0 == "look") } + [
+    ] + ToolNameAliases.chromeVerbs.filter { $0 != "snapshot" }.map { try AppAction.fold("browser.chrome_" + $0, "browser", read: $0 == "wait"
+        || $0 == "look") } + [
         .fold("search_chat_history", "chat", read: true),
         .fold("read_chat_message", "chat", read: true),
         .fold("chat_reply", "chat"),
-        .fold("tool_result_page", "*", "Page a long result retained this turn without rerunning its action; continue:true resumes the last read and ignores page; omit continue to select page/query/raw", read: true),
+        .fold("tool_result_page", "*", """
+            Page a long result retained this turn without rerunning its action; continue:true resumes the last read and ignores page; omit continue to select \
+            page/query/raw
+            """, read: true),
 
-        // Mac control and folded tools. Each Mac verb re-enters under its own name, so Full Mac's accessibility category, MacAttention and
-        // User's saved levels judge it as before. act's whole guide is an item read on the mac page (`guided`); its refusals point to it.
+        // Each Mac verb re-enters its own gate so accessibility, MacAttention and saved levels still apply; mac/guided owns the act guide.
         .fold("screen", "mac", "Read the live screen as words; lists running apps when NativeAgent is frontmost. "
               + "app reads a running app's window without activation; part zooms in; "
               + "pixels:true is a picture of the desktop", read: true),
@@ -647,8 +988,12 @@ extension AppActions {
         .fold("menu_press", "mac", screen: true),
         .fold("clipboard_read", "mac", read: true),
         .fold("clipboard_write", "mac"),
-        .fold("system_info", "mac", "Read system, network, battery and named Data/System volume capacity; disk is Data, system_disk is the sealed System volume", read: true),
-        AppAction("mac.apps", "mac", "List installed apps or check one by name; returns name, bundle ID, path, version and scriptability", ["name?", "all?:bool"],
+        .fold("system_info", "mac", """
+            Read system, network, battery and named Data/System volume capacity; disk is Data, system_disk is the sealed System volume
+            """, read: true),
+        AppAction("mac.apps", "mac", """
+            List installed apps or check one by name; returns name, bundle ID, path, version and scriptability
+            """, ["name?", "all?:bool"],
                  tool: "mac_apps", read: true, scope: "installed apps applications what apps do I have; name: optional substring filter"),
         .fold("mac_screenshot_save", "mac"),
         .fold("mac_location", "mac", "Where this Mac is", read: true),
@@ -669,8 +1014,7 @@ extension AppActions {
         return actions
     }
 
-    /// act's arguments as its schema has them, but verb and target may be left out (a flow's steps carry their own). The recursive
-    /// credential detector judges typed text, including text/value inside flow steps.
+    /// Flows carry their own verbs/targets; recursive credential checks must still inspect typed text/value inside every step.
     static var actArgs: [String]? { get throws { try foldSchemas["act"].map {
         try ToolSignature.doorArgs($0.parametersJSON).map {
             ["verb", "target"].contains($0) ? $0 + "?" : $0

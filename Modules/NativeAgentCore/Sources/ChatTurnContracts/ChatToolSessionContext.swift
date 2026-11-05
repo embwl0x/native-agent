@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import MacControl
-// Blueprint: | `ChatToolSessionContext.swift` | `ChatToolSessionContext` enum; `rendersInlineCards`, `withReplyRoute`; `TurnEnvelope.workIdentity` carries attribution, `answerExperienceID` carries the owed answer through continuations; neither grants authority |
+// Blueprint: | `ChatToolSessionContext.swift` | `ChatToolSessionContext`, `TurnEnvelope.workIdentity`, `answerExperienceID`: attribution, not authority |
 
 // MARK: - Per-turn tool session context
 
@@ -42,17 +42,7 @@ public enum ChatToolSessionContext {
              "requesterUserId": requesterUserId].compactMapValues { $0 }
         }
 
-        /// Whether this route ends at a surface that can DRAW an inline card.
-        ///
-        /// Only the Mac and iPhone chat UIs render the card; the Mac's own
-        /// in-process turn carries no route at all, which is why a nil route is
-        /// treated as the UI (see `rendersInlineCards(_:)` below). Every other
-        /// route — Telegram, Slack, the bridge — is text and nothing else, and
-        /// a card sent there must be said in prose or it arrives as silence.
-        ///
-        /// It keys on the ROUTE, never on `surface:` as passed to `chat(…)`:
-        /// the Claude bridge deliberately calls in as surface "chat" and
-        /// carries its real destination only here.
+        /// Only Mac and iPhone routes draw cards; other routes need prose. Check the route because bridges can use the chat surface.
         public var rendersInlineCards: Bool {
             switch surface.lowercased() {
             case "chat", "app", "ios": true
@@ -61,172 +51,30 @@ public enum ChatToolSessionContext {
         }
     }
 
-    /// The turn's route, answered for the ABSENT case too: a Mac chat turn runs
-    /// in-process and binds no route, and it is the one surface that has always
-    /// been able to draw the card.
-    public static func rendersInlineCards(_ route: ReplyRoute?) -> Bool {
-        route?.rendersInlineCards ?? true
-    }
 
-    /// True while the turn is being consumed as a STREAM by a chat UI.
-    ///
-    /// Bound by the stream facade, which is what the Mac and iPhone chat views
-    /// consume. Telegram, Slack and the bridge all call the non-streaming
-    /// `chat(…)` and read `ChatResponse.output`, so they never see this set —
-    /// which is a structural fact about how they consume a turn, not a string
-    /// anyone can spell wrong.
-    @TaskLocal public static var replyStreamRendersCards: Bool = false
-
-    /// Whether this turn's only way to say something is TEXT.
-    ///
-    /// Both signals must agree before prose is withheld: the turn is being
-    /// streamed to a UI, AND the route ends at a surface that draws cards. The
-    /// belt and braces are deliberate — the Claude bridge calls in as surface
-    /// "chat" and may carry no route at all, and getting this wrong in that
-    /// direction is exactly the silence this guards against.
-    public static var replyIsTextOnly: Bool {
-        !(replyStreamRendersCards && rendersInlineCards(replyRoute))
-    }
-
-    /// The per-turn envelope. See `TurnEnvelope` below — this is the ONE
-    /// value a new surface adapter fills in, and every field below is its
-    /// projection. Bound by the transport around its `chat()` call.
-    ///
-    /// Ingress binds this explicitly. An absent envelope carries no authenticated identity.
-    @TaskLocal public static var envelope: TurnEnvelope?
-
-    @TaskLocal public static var verifiedSessionId: String?
-
-    /// The current request only; history and tool results never populate this.
-    @TaskLocal public static var userText: String?
-
-    /// Nil rejects the quote; otherwise says whether this restores her last switch change.
-    @TaskLocal public static var settingRequestEvidence: (@Sendable (String, JSONValue, JSONValue, String) async -> Bool?)?
-
-    /// The gate binds the filing turn's file access so the card's follow-up uses the same access.
-    @TaskLocal public static var fileAccess: String?
-
-    /// The transport-verified remote chat identifier (e.g. Telegram chatId),
-    /// set by the remote transport around its `chat()` call. Trust resolution
-    /// for Telegram matches the allowlist on this id. We carry it explicitly
-    /// because the chatId is NOT always recoverable from the session id string:
-    /// the legacy session form is `telegram:<chatId>`, but a `/new` session is a
-    /// bare UUID. Without this, an allowlisted Telegram chat on a UUID session
-    /// derives `chatId=nil` in BOTH gates and high-risk invokes false-block.
-    /// Nil for local/Mac surfaces (no remote id) and for iOS (trust is
-    /// policy-based, not id-based) — both correct.
-    @TaskLocal public static var verifiedChatId: String?
-
-    /// User allowlists match the transport-verified user ID; it is nil where no per-user trust root exists.
-    @TaskLocal public static var verifiedUserId: String?
-
-    /// True when the inbound remote transport has already verified provenance
-    /// for this turn. Socket Mode Slack events arrive over a preauthenticated
-    /// WebSocket rather than per-event signed HTTP requests; the transport binds
-    /// this after it has opened the app-token socket.
-    @TaskLocal public static var commandSignatureVerified: Bool?
-
-    /// Immutable return route for work that finishes after the originating
-    /// turn has ended. Async agent bridges persist this with their job rather
-    /// than trying to rediscover a Telegram chat, Slack thread, or iOS device
-    /// from mutable current-surface state at completion time.
-    @TaskLocal public static var replyRoute: ReplyRoute?
-
-    /// Bind the turn's return route AND mirror its delivery identity onto the
-    /// turn-trace context in one call, so the rows this turn writes name the
-    /// conversation it came from.
-    ///
-    /// Bind the route and trace destination together, including explicit clearing.
-    public static func withReplyRoute<T>(
-        _ route: ReplyRoute?,
-        isolation: isolated (any Actor)? = #isolation,
-        operation: () async throws -> T
-    ) async rethrows -> T {
-        let origin = envelope.map { $0.withDeliveryRoute(route) }
-        return try await $envelope.withValue(origin) {
-        try await $replyRoute.withValue(route) {
-            try await TurnTraceContext.$destinationId.withValue(route?.destinationId) {
-                try await TurnTraceContext.$threadId.withValue(route?.threadId) {
-                    try await operation()
-                }
-            }
-        }
-        }
-    }
 }
-
 
 // MARK: - TurnEnvelope (the per-turn surface contract)
 
-/// EVERYTHING one turn's surface identity consists of, in one value.
-///
-/// # How to add a surface
-///
-/// NativeAgent is built so a new messaging surface — Signal, WhatsApp, a
-/// device, anything — can be connected later. This type is the contract that
-/// makes that a small job. A new adapter does exactly three things and touches
-/// nothing outside itself:
-///
-/// 1. **Bind identity.** Build a `TurnEnvelope` naming its `surface` and the
-///    identifiers its transport ACTUALLY VERIFIED — `verifiedChatId` (the
-///    conversation) and/or `verifiedUserId` (the person) — and bind it around
-///    its `chat()` call with `ChatToolSessionContext.$envelope.withValue(_:)`.
-///    Whatever the transport could not verify stays nil. Nil is honest and
-///    fails closed; a guess is neither.
-/// 2. **Provide a delivery route.** Fill `deliveryRoute` so a completion that
-///    lands after the originating loop has moved on still knows where to go.
-///    `replyRoute` is this envelope's delivery projection, so every existing
-///    `ChatToolSessionContext.replyRoute` consumer keeps working unchanged.
-/// 3. **Publish an anchor**, if the surface is a direct conversation with the
-///    human rather than a shared room — see `ConversationAnchor` in
-///    PersistenceCore. That is a one-line call and it is surface-agnostic:
-///    the Mac and the phone consume the anchor without knowing which surface
-///    published it.
-///
-/// There is no fourth step. In particular an adapter must NOT encode identity
-/// into the session id and expect a gate to parse it back out. Five sites used
-/// to do that (plan §1.2); all five are deleted. The session id is a storage
-/// key — path-safe, opaque, and evidence of nothing.
-///
-/// # Two invariants this type exists to hold
-///
-/// **A tool call's authority comes from the CURRENT turn's envelope, never
-/// from any envelope in history.** History rows are prose plus provenance
-/// labels; they grant nothing. A Mac-authored (local, trusted) turn can sit
-/// three rows above a remote allowlist-gated turn in the same transcript, and
-/// the remote turn is still assessed alone.
-///
-/// **Surface never widens.** `isRemote` is derived from the surface profile
-/// and can be ADDED to an unknown surface but never SUBTRACTED from a
-/// known-remote one. That rule is enforced generically in
-/// `SecurityCenter.assessOrigin` against `ConversationSurfaceProfile`, so it
-/// covers a surface added tomorrow exactly as it covers the ones here today.
+/// Carry only transport-verified identity on the explicit turn; unverifiable identifiers stay nil and fail closed.
+/// Persist `deliveryRoute` for delayed completions; publish a `ConversationAnchor` for direct user conversations.
+/// Session IDs are opaque storage keys and prove no identity. Only the current envelope grants authority; history grants none.
+/// Remoteness may be added for unknown surfaces but never removed from a known-remote surface.
 public struct TurnEnvelope: Sendable, Equatable {
-    /// The immutable return route for work that finishes after the
-    /// originating turn has ended. Kept as its own value because it is the
-    /// half of the envelope that must be DURABLE on the message row.
+    /// Delayed replies require this half of the envelope to survive on the durable message row.
     public typealias DeliveryRoute = ChatToolSessionContext.ReplyRoute
 
-    /// Raw surface name, as the adapter calls itself ("telegram", "slack",
-    /// "signal", "chat"). Normalization to a canonical profile happens at the
-    /// trust boundary, not here — this field records what the adapter said.
+    /// Record the adapter's raw surface; canonical normalization belongs at the trust boundary.
     public let surface: String
-    /// Bridge lane, when the turn arrived through an agent bridge
-    /// ("claude", "codex"). Generalizes the existing `metadata.origin.agent`.
     public let agent: String?
-    /// The conversation identifier the TRANSPORT verified. Nil when the
-    /// transport has no such notion (a local window) or could not verify one.
+    /// Only transport verification supplies this identity; absent or unverifiable identifiers stay nil.
     public let verifiedChatId: String?
-    /// The person identifier the TRANSPORT verified. Nil as above.
+    /// Only the transport may attest this person identifier.
     public let verifiedUserId: String?
-    /// True when the inbound transport has already verified provenance for
-    /// this turn by its own scheme (a signed request, a preauthenticated
-    /// socket). Nil means "no such scheme", which is not the same as false.
+    /// Nil means the transport has no verification scheme; false means verification did not succeed.
     public let commandSignatureVerified: Bool?
-    /// Where this turn's reply goes, and nowhere else.
     public let deliveryRoute: DeliveryRoute?
-    /// Explicit remoteness for a surface the profile does not know yet. It can
-    /// only ADD remoteness — see the widening invariant above.
+    /// Unknown surfaces may add remoteness; known-remote surfaces cannot subtract it.
     public let declaredRemote: Bool?
     /// Request-time AX evidence, process-local and never restored from history.
     public let macContinuation: MacWorkContinuation?
@@ -258,9 +106,15 @@ public struct TurnEnvelope: Sendable, Equatable {
         self.answerExperienceID = answerExperienceID
     }
 
-    /// Her own native owner (a schedule, a click, a maintenance pass): local, attributed, no transport identity.
+    /// Native work is locally attributed without inventing a transport identity.
     public static func native(_ workIdentity: String, surface: String = "chat") -> TurnEnvelope {
         TurnEnvelope(surface: surface, agent: "self", declaredRemote: false, workIdentity: workIdentity)
+    }
+
+    /// The person's own act on this Mac. UI owners use this constructor;
+    /// native agent work uses `native` and never impersonates the person.
+    public static func personOnMac(_ workIdentity: String, surface: String = "chat") -> TurnEnvelope {
+        TurnEnvelope(surface: surface, declaredRemote: false, workIdentity: workIdentity)
     }
 
     public func withMacContinuation(_ continuation: MacWorkContinuation) -> TurnEnvelope {
@@ -277,16 +131,11 @@ public struct TurnEnvelope: Sendable, Equatable {
             workIdentity: workIdentity, answerExperienceID: answerExperienceID)
     }
 
-    /// The delivery route carries the envelope's surface when no explicit route is bound.
     public var replyRoute: DeliveryRoute {
         deliveryRoute ?? DeliveryRoute(surface: surface)
     }
 
-    /// The durable shape written to `metadata.envelope` on every message row.
-    ///
-    /// `trusted` is NOT included and must never be: a persisted trust verdict
-    /// would be exactly the "authority from history" this type forbids. The
-    /// row records WHO and WHERE, and the gate re-decides every turn.
+    /// Persist provenance without a trust verdict: each turn's gate must decide authority afresh.
     public func persistedMetadata() -> JSONValue {
         var object: [String: JSONValue] = ["surface": .string(surface)]
         func put(_ key: String, _ value: String?) {
@@ -294,6 +143,7 @@ public struct TurnEnvelope: Sendable, Equatable {
             object[key] = .string(value)
         }
         put("agent", Self.cleaned(agent))
+        if let declaredRemote { object["declaredRemote"] = .bool(declaredRemote) }
         put("workIdentity", workIdentity)
         put("answerExperienceID", answerExperienceID)
         put("chatId", verifiedChatId)
@@ -307,8 +157,7 @@ public struct TurnEnvelope: Sendable, Equatable {
         return .object(object)
     }
 
-    /// Rebuild an envelope from a persisted row. Provenance only — the result
-    /// is a LABEL for a reader, never an authorization for a tool call.
+    /// Restored envelopes label provenance only; they never authorize tool calls.
     public static func fromPersistedMetadata(_ value: JSONValue?) -> TurnEnvelope? {
         guard case .object(let object)? = value else { return nil }
         func read(_ key: String) -> String? {
@@ -316,6 +165,12 @@ public struct TurnEnvelope: Sendable, Equatable {
             return cleaned(string)
         }
         guard let surface = read("surface") else { return nil }
+        let declaredRemote: Bool?
+        switch object["declaredRemote"] {
+        case .bool(let value)?: declaredRemote = value
+        case nil: declaredRemote = nil
+        default: return nil
+        }
         let route = ChatToolSessionContext.ReplyRoute(
             surface: surface,
             destinationId: read("destinationId"),
@@ -331,15 +186,16 @@ public struct TurnEnvelope: Sendable, Equatable {
             verifiedChatId: read("chatId"),
             verifiedUserId: read("userId"),
             deliveryRoute: route,
+            declaredRemote: declaredRemote,
             workIdentity: read("workIdentity"),
             answerExperienceID: read("answerExperienceID")
         )
     }
 
-    /// Only the bound ingress envelope supplies identity. Missing provenance is unbound,
+    /// Only the explicit ingress envelope supplies identity. Missing provenance is unbound,
     /// never authenticated or local merely because a caller supplied a surface spelling.
-    public static func current(surface: String) -> TurnEnvelope {
-        if let bound = ChatToolSessionContext.envelope {
+    public static func current(turn: Turn?, surface: String) -> TurnEnvelope {
+        if let bound = turn?.envelope {
             return bound
         }
         return TurnEnvelope(
@@ -355,13 +211,8 @@ public struct TurnEnvelope: Sendable, Equatable {
     }
 }
 
-/// Replay data for a persisted, human-approved chat-tool request. This public
-/// value carries no authority: `matches` checks only call and verified origin equality.
-/// For injection replays, `AutonomyGatedDispatcher` calls the concrete
-/// `ApprovalInboxInjectionApprovalVerifier` before exemption or minting;
-/// that owner verifies the canonical record and enforces permanent single-use spend.
-/// Failed record verification refuses replay. SecurityCenter, file access and effect-time
-/// validation still run.
+/// Call and origin equality grant no authority. Injection replay must verify and spend the canonical approval before minting.
+/// SecurityCenter, file access and effect-time validation still apply.
 public struct ApprovedChatToolReplay: Sendable, Equatable {
     public let approvalID: String
     public let tool: String
@@ -389,24 +240,15 @@ public struct ApprovedChatToolReplay: Sendable, Equatable {
         self.verifiedUserID = verifiedUserID
     }
 
-
 }
 
-/// Per-turn runtime facts the tool loop binds so in-process tools can report
-/// what's actually generating the current turn. `agent_introspect` reads this
-/// to answer "which model/provider is running me right now" accurately — the
-/// live turn model can differ from the surface's configured model (a per-turn
-/// override), and the surface lets it resolve the real active provider. Nil
-/// when a tool runs outside a chat turn (e.g. a direct dispatch), in which case
-/// introspect falls back to the configured model.
+/// Introspection reads the live turn route, which may differ from configuration. Outside a turn it reads the configured route.
 public enum ChatTurnRuntimeContext {
     public struct Active: Sendable {
         public let model: String
         public let surface: String
         public let personaID: String?
-        /// Exact provider/auth transport admitted for this turn. Keep this
-        /// separate from model-family inference: API key, OAuth-direct,
-        /// OpenRouter, and Codex may expose overlapping model names.
+        /// Keep admitted transport separate from model-family inference because transports can expose overlapping model names.
         public let providerID: String?
         public init(
             model: String,
@@ -420,13 +262,10 @@ public enum ChatTurnRuntimeContext {
             self.providerID = providerID
         }
     }
-    @TaskLocal public static var current: Active?
 }
 
-/// What her reply carries by her own hand: bound for the whole turn, so a
-/// direct call, a batch at any depth and a script's call all choose here.
+/// One turn-wide choice covers direct calls, nested batches and scripts.
 public final class ReplyChoices: @unchecked Sendable {
-    @TaskLocal public static var current: ReplyChoices?
     private let lock = NSLock()
     private var chosen: [String] = []
     public init() {}

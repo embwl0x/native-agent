@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `TelegramApprovalHandling.swift` | `TelegramApprovalHandling`: addressed-bot-aware approval parsing, callback contracts and canonical approval resolution/delivery lifecycle |
+// Blueprint: | `TelegramApprovalHandling.swift` | `TelegramApprovalHandling`: addressed approval resolution |
 
 public enum TelegramApprovalDecision: String, Sendable, Equatable {
     case approved
@@ -12,9 +12,7 @@ public enum TelegramApprovalDecision: String, Sendable, Equatable {
 public struct TelegramApprovalCommand: Sendable, Equatable {
     public let id: String
     public let decision: TelegramApprovalDecision
-    /// The command's `@bot` suffix, or nil for commands without one and callback buttons.
     public let addressedBot: String?
-    /// A mirrored inline card's option, by index (`na_approval:c<n>:<id>`).
     public let choice: Int?
 
     public init(
@@ -88,7 +86,6 @@ public struct TelegramApprovalCallback: Sendable, Equatable {
     public let callbackId: String
     public let command: TelegramApprovalCommand
     public let chatId: Int
-    /// The button's forum topic, shared by acknowledgements and continuation replies.
     public let threadId: Int?
     public let messageId: Int
     public let fromUserId: Int?

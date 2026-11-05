@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `ContextRelevance.swift` | `ContextSelector` relevance mathematics: lexical/semantic scoring, memory-population standing, diversity and redundancy; `ContextLexicalTokenizer` shares recall normalization |
+// Blueprint: | `ContextRelevance.swift` | `ContextSelector`, `ContextLexicalTokenizer`: shared relevance and normalization |
 
 extension ContextSelector {
     struct ScoreContext {
@@ -8,8 +8,7 @@ extension ContextSelector {
         let normalizedMessage: String?
         let identifiers: Set<String>
         let contextualTokens: Set<String>
-        /// Raw current-message tokens are messageCoverage's denominator;
-        /// queryTokens additionally carries context and can dilute a single source.
+        /// Raw current-message tokens are messageCoverage's denominator; queryTokens additionally carries context and can dilute a single source.
         let messageTokens: Set<String>
         let tokenSpecificity: [String: Double]
 
@@ -60,8 +59,8 @@ extension ContextSelector {
         let w = configuration.weights
         let costRatio = Double(atom.draft.body.count) / Double(max(1, need.characterBudget))
         let costPenalty = min(w.characterCostPenaltyCap, costRatio * w.characterCostPenaltyCap)
-        // Current-message coverage excludes carried context and reaches full weight
-        // at the memory lane's short-message boundary; tiny queries lean on semantics/overlap.
+        // Current-message coverage excludes carried context and reaches full weight at memory's short-message boundary; tiny queries lean on
+        // semantics/overlap.
         let messageCoverage: Double = {
             guard !context.messageTokens.isEmpty else { return 0 }
             let hit = context.matchedWeight(context.messageTokens, in: lexicalEntry.searchableTokens)
@@ -105,11 +104,7 @@ extension ContextSelector {
     }
 
     private func queryText(_ need: NeedSignal) -> String {
-        // Match the existing semantic-recall and correction-scope contract:
-        // prior conversation helps resolve a referential follow-up, but is
-        // not fresh topic evidence after a self-contained user request.
-        // Otherwise old work can clear minimumRelevance on lexical overlap
-        // alone even when the current message has changed subjects.
+        // Prior conversation resolves referential follow-ups but supplies no fresh topic evidence after a self-contained request changes subjects.
         let recentTurns = ContextCorrectionScope.isReferentialFollowup(need.message)
             ? need.recentTurns.suffix(2).map { String($0.prefix(600)) }
             : []
@@ -139,11 +134,8 @@ extension ContextSelector {
         identifiers.formUnion(contextualIDs.map { "id:\($0.lowercased())" })
         let trimmedMessage = need.message.trimmingCharacters(in: .whitespacesAndNewlines)
         let queryTokens = Self.tokens(queryText(need))
-        // Smoothed, normalized inverse document frequency: ubiquitous names
-        // and boilerplate are weak relevance evidence, not multiple strong
-        // votes against a semantic paraphrase. Only eligible/scorable atoms
-        // participate, so inaccessible sources cannot influence ranking.
-        // Uses the resident lexical index; no tokenization, I/O or model call.
+        // Normalized inverse document frequency weakens ubiquitous names and boilerplate; only eligible atoms influence ranking, using the resident lexical
+        // index.
         let documentCount = Double(lexicalIndex.count)
         let normalization = 1 + log(documentCount + 1)
         let specificity = Dictionary(uniqueKeysWithValues: queryTokens.map { token in
@@ -216,14 +208,9 @@ extension ContextSelector {
         min(1, max(0, VectorMath.cosine(lhs, rhs)))
     }
 
-    /// Memory touch is the best leave-one-out standing across query readings:
-    /// primary, other voice, and a follow-up's own words and other voice.
-    /// Remove each atom's mean pull toward others relative to the lane's mean.
-    /// Summed unit vectors and aggregate moments keep this linear. The selector
-    /// applies its configured fixed deviation floor to the best reading;
-    /// `looks` records atoms × readings for diagnostics only.
-    /// Above a constant background, infinite standing saturates to finite Double.
-    /// Fewer than three vectors use model-scaled semantics; no comparable vectors give no touch.
+    /// Use the best leave-one-out standing across query readings, removing each atom's general pull. Aggregate moments keep this linear; the fixed deviation
+    /// floor ignores diagnostic `looks`. Saturate infinite standing to finite Double. Fewer than three comparable vectors use model-scaled semantics; none
+    /// supply no touch.
     func memoryRelevance(
         _ atoms: [ContextStoredAtom],
         need: NeedSignal,
@@ -239,8 +226,7 @@ extension ContextSelector {
             guard norm > 0, norm.isFinite else { continue }
             units.append((atom.draft.id, embedding.values.map { Double($0) / norm }))
         }
-        // One or two vectors cannot establish a relative population. Use the
-        // same model-scaled semantic contribution as the ordinary score.
+        // One or two vectors cannot establish a relative population. Use the same model-scaled semantic contribution as the ordinary score.
         if units.count < 3 {
             let floor = min(0.99, max(0, configuration.memorySemanticFloor(forModel: need.queryEmbeddingModelID) ?? 0))
             return (Dictionary(uniqueKeysWithValues: units.map {
@@ -264,7 +250,6 @@ extension ContextSelector {
             guard norm > 0, norm.isFinite else { continue }
             let query = reading.map { Double($0) / norm }
             let touch = zip(units, pull).map { unit, pull in
-                // The selector's [0, 1] cosine clamp (`cosine`), on unit vectors.
                 min(1, max(0, zip(unit.vector, query).reduce(0.0) { $0 + $1.0 * $1.1 })) - (pull - meanPull)
             }
             for (index, standing) in VectorMath.standout(touch).enumerated() {
@@ -280,8 +265,7 @@ extension ContextSelector {
 }
 
 enum ContextLexicalTokenizer {
-    /// Structural English words provide no overlap evidence; identifiers, numbers,
-    /// domain terms and triggers remain. MemoryV2 BM25 shares these stop words.
+    /// Structural English words provide no overlap evidence; identifiers, numbers, domain terms and triggers remain. MemoryV2 BM25 shares these stop words.
     private static let routingStopWords: Set<String> = RecallLexicalNormalization.stopWords
 
     static func tokens(_ text: String) -> Set<String> {

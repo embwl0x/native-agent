@@ -4,7 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `APNSNotificationReadiness.swift` | Checked paired-phone notification readiness, canonical optional APNS registration reads and provider configuration validation |
+// Blueprint: | `APNSNotificationReadiness.swift` | Checked pairing, registration and optional APNs configuration. |
 extension SwiftNativeAPNSSender {
     func workActivityConfiguration(dataRoot: URL) -> (configured: Bool, usable: Bool, error: String?) {
         do {
@@ -15,19 +15,24 @@ extension SwiftNativeAPNSSender {
             return (true, false, error.localizedDescription)
         }
     }
-    /// Ordinary notifications target paired phones through iCloud, independent
-    /// of optional provider credentials, tokens or background-wake outcomes.
+    /// Paired-phone iCloud notifications do not depend on optional APNs credentials, tokens or wakes.
     public func deliverableTargetCount(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> Int {
         let path = dataRoot.appendingPathComponent("paired_phones.json")
         do { return try PairedPhoneAuthority.pairedCountChecked(at: path) }
         catch { throw Self.notificationReadFailure(error, path: path) }
     }
-    /// Readiness names the supported route, not proof of presentation. Delivery
-    /// remains unconfirmed until the phone's signed receipt; it never proves display.
+    /// Readiness proves only a route; signed phone receipts confirm delivery, never display.
     public func notificationReadiness(dataRoot: URL) async throws -> (supported: Bool, status: String, detail: String, paired: Int) {
         let paired = try await deliverableTargetCount(dataRoot: dataRoot)
         guard paired > 0 else { return (false, "not_paired", "No phone is paired.", paired) }
-        return (true, "ready", "A phone is paired for notifications through iCloud. iPhone notification settings and Focus govern alerts; delivery and display are not yet verified.", paired)
+        return (
+            true,
+            "ready",
+            """
+                A phone is paired for notifications through iCloud. iPhone notification settings and Focus govern alerts; delivery and display are not yet \
+                verified.
+                """,
+            paired)
     }
     private static func notificationReadFailure(_ error: Error, path: URL) -> NSError {
         NSError(domain: "NativeAgentAPNS", code: -5, userInfo: [
@@ -37,7 +42,6 @@ extension SwiftNativeAPNSSender {
         ])
     }
     internal func loadTokens(dataRoot: URL, config: APNSConfig) async throws -> (tokens: [APNSToken], errors: [String]) {
-        // An empty canonical registration set stays empty.
         let read = try await loadSwiftTokens(dataRoot: dataRoot)
         return (filteredTokens(read.tokens, config: config), read.errors)
     }
@@ -131,8 +135,7 @@ extension SwiftNativeAPNSSender {
             return config
         }
 
-        /// Only an absent file means no optional provider was configured.
-        /// Existing unreadable or malformed bytes never become a missing config.
+        /// Only an absent file means unconfigured; unreadable or malformed bytes remain failures.
         static func loadIfPresent(from dataRoot: URL) throws -> APNSConfig? {
             let path = dataRoot
                 .appendingPathComponent("config", isDirectory: true)
@@ -152,10 +155,7 @@ extension SwiftNativeAPNSSender {
                 topic: try Self.optionalConfigString(obj, "topic"),
                 environment: try Self.optionalConfigString(obj, "environment").map(Environment.checked)
             )
-            // The configured path owns the credential. Never search for a
-            // different key after that path becomes unavailable.
-            // A checked read preserves missing/permission/encoding causes; an
-            // existence probe cannot establish that this exact key is usable.
+            // Only a checked read of the configured key proves usability and preserves missing, permission and encoding causes.
             _ = try P256.Signing.PrivateKey(pemRepresentation:
                 String(contentsOf: URL(fileURLWithPath: config.keyPath), encoding: .utf8))
             return config

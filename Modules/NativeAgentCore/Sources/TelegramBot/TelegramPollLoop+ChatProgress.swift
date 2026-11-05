@@ -5,7 +5,8 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import ChatSessionWork
-// Blueprint: | `TelegramPollLoop+ChatProgress.swift` | `TelegramPollLoop`: `makeTurnProgressCard`, `makeAssistantDelivery`, `makeProgressSink`; one notification policy covers final text and generated images |
+// Blueprint: | `TelegramPollLoop+ChatProgress.swift` | `TelegramPollLoop`, `makeTurnProgressCard`, `makeAssistantDelivery`, `makeProgressSink` |
+// Final text and generated images share one notification policy.
 
 private actor TelegramTypingHeartbeat {
     let start: @Sendable () -> Task<Void, Never>
@@ -92,7 +93,8 @@ extension TelegramPollLoop {
 
     func makeAssistantDelivery(
         destination: TelegramDestination,
-        turnId: UUID,
+        draftKey: String,
+        turn: Turn?,
         errorContext: String,
         update: TelegramUpdate?,
         message: TelegramMessage?,
@@ -103,7 +105,8 @@ extension TelegramPollLoop {
         return TelegramAssistantDeliveryDriver(
             token: token,
             destination: destination,
-            turnId: turnId,
+            draftKey: draftKey,
+            turn: turn,
             savedDelivery: savedDelivery,
             sendRichDraft: Self.defaultSendRichMessageDraft,
             sendRichFinal: silent ? Self.defaultSendSilentRichMessage : Self.defaultSendRichMessage,
@@ -143,7 +146,8 @@ extension TelegramPollLoop {
             sendGeneratedImage: { path, bytes in
                 do { try await Self.defaultSendChatAction(token, destination, "upload_photo") }
                 catch {
-                    FileHandle.standardError.write(Data("TelegramPollLoop: upload_photo action failed: \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8))
+                    FileHandle.standardError.write(Data(
+                        "TelegramPollLoop: upload_photo action failed: \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8))
                 }
                 try await Self.sendPhoto(token: token, destination: destination, imagePath: path,
                     imageData: bytes, caption: nil, silent: silent)
@@ -178,14 +182,12 @@ extension TelegramPollLoop {
         }
         if delivery?.imagePaths == nil { delivery?.imagePaths = saved?.imagePaths }
         guard delivery != nil else { return nil }
-        // No wire attempt can precede the delivery row. This canonical reply
-        // survived a stop or restart between model settlement and that handoff.
+        // No wire attempt can precede the delivery row. This canonical reply survived a stop or restart between model settlement and that handoff.
         return try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).recordAssistantDelivery(
             updateId: claim.updateId, delivery: delivery, recovering: true
         )
     }
 
-    /// The images of her reply's face, sent beside its words.
     public static func replyImagePaths(_ response: ChatResponse) -> [String] {
         (response.attachments ?? []).compactMap { $0.type == "image" ? $0.path : nil }
     }
@@ -204,7 +206,7 @@ extension TelegramPollLoop {
 
     static func progressMessage(for event: TurnStreamEvent) -> String? {
         switch event {
-        case .replyTextSettled:
+        case .replyTextSettled, .writing:
             return nil
         case .notice(_, let text):
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -244,11 +246,12 @@ extension TelegramPollLoop {
         attachments: [TelegramMediaAttachment] = [],
         progress: @escaping TelegramChatProgressSink,
         context: TelegramChatAttemptContext
-    ) async throws -> (reply: String, imagePaths: [String]) {
-        let sessionID: String
-        if let pinned = context.sessionId { sessionID = pinned }
-        else { sessionID = try await TelegramSessionStore(dataRoot: dataRoot).activeSessionId(destination: destination) }
-        guard let runID = context.runId else { throw TelegramBotError.invalidRequest }
+    ) async throws -> (reply: String, imagePaths: [String], readBy: String?) {
+        guard let sessionID = context.turn.session else {
+            throw TelegramBotError.underlying(
+                "The admitted Telegram turn has no resolved session. Repair its ingress before answering; no reply was generated.")
+        }
+        let runID = context.turn.run
         let typing = await startTypingHeartbeat(destination: destination)
         let displayProgress: TelegramChatProgressSink = { event in
             if case .replyTextSettled(let settled) = event {
@@ -283,7 +286,7 @@ extension TelegramPollLoop {
         text: String,
         attachments: [TelegramMediaAttachment],
         context: TelegramChatAttemptContext
-    ) async throws -> (reply: String, imagePaths: [String]) {
+    ) async throws -> (reply: String, imagePaths: [String], readBy: String?) {
         if let attachmentChatHandler {
             return try await attachmentChatHandler(destination.chatId, text, attachments, context)
         }
@@ -291,12 +294,15 @@ extension TelegramPollLoop {
             await emitAttachmentDroppedTrace(
                 kind: "image",
                 reason: "no attachment-capable chat handler wired",
-                chatId: destination.chatId, updateId: 0)
+                chatId: destination.chatId, updateId: 0, turn: context.turn)
             return ("(I received your image but this bot configuration "
                 + "has no vision-capable handler wired — the image was "
-                + "not processed.)", [])
+                + "not processed.)", [], nil)
         }
-        throw TelegramBotError.underlying("telegram_chat_handler_missing: No conversation handler is connected. The runtime owner must wire Telegram's chat handler in NativeAgent before accepting messages.")
+        throw TelegramBotError.underlying("""
+            telegram_chat_handler_missing: No conversation handler is connected. The runtime owner must wire Telegram's chat \
+            handler in NativeAgent before accepting messages.
+            """)
     }
 
     static func chatErrorNotice(for error: Error) -> String {

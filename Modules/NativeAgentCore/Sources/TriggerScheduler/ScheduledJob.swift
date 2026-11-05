@@ -4,8 +4,7 @@ import PersistenceCore
 
 // Blueprint: | `ScheduledJob.swift` | `ScheduledJob`: strict scheduler row decoding and projected civil next-run decoration while preserving claimed instants |
 
-/// Scheduler list projection: unclaimed wall-clock nextRunAt follows the current
-/// zone; active occurrences retain their saved instant.
+/// Scheduler list projection: unclaimed wall-clock nextRunAt follows the current zone; active occurrences retain their saved instant.
 public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var name: String
@@ -56,9 +55,7 @@ public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
         }
     }
 
-    /// A listed writer row. `id`, `name`, `kind` and `enabled` are required;
-    /// a present field of the wrong type makes the row malformed, never
-    /// silently absent.
+    /// A listed writer row. `id`, `name`, `kind` and `enabled` are required; a present field of the wrong type makes the row malformed, never silently absent.
     public init(row: JSONValue) throws {
         do {
             let row = try JSONRow(SchedulerJobNormalizer.decorateNextRunAt(row))

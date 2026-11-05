@@ -3,12 +3,11 @@ import NativeAgentCore
 import PersistenceCore
 import os
 import TurnTrace
-// Blueprint: | `LLMRequestShape.swift` | Request cache markers, conversation-prefix snapshots and task-local secondary-call isolation; pending prefix computation is joined by receipt readers, outside request encoding; `ToolContractWeight` measures schema material without retaining content |
+// Blueprint: | `LLMRequestShape.swift` | `ToolContractWeight`: bounded request receipts and secondary-call isolation |
 
-/// Cache marker positions and TTLs from the finished request body, never prompt bytes.
-/// Anthropic renders tools → system → messages; longer TTLs must precede shorter ones.
+/// Cache marker positions and TTLs from the finished request body, never prompt bytes. Anthropic renders tools → system → messages; longer TTLs must
+/// precede shorter ones.
 public struct LLMCacheMarker: Sendable, Equatable {
-    /// `"tools[2]"`, `"system[1]"`, `"messages[7]"` — section plus index.
     public let position: String
     /// `"1h"` for extended TTL; `"5m"` names the wire's absent-`ttl` default.
     public let ttl: String
@@ -24,9 +23,7 @@ public struct LLMCacheMarker: Sendable, Equatable {
 }
 
 // MARK: - Conversation-prefix shape receipts
-//
-// Prefix receipts flow through a turn-scoped task-local and remain absent when unbound.
-// Receipts contain sizes, digests and bounded redacted previews.
+// Prefix receipts are held by `LLMCall.prefixMeasurement` and remain absent when not supplied. Receipts contain sizes, digests and bounded redacted previews.
 public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
     public let shapeVersion: String
     public let prefixFingerprintSHA256: String
@@ -38,17 +35,15 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
     public let volatileKeyframe: Bool
     public let volatileDelivery: String
     public let historyContextWindow: String
-    /// Message count and bounded digests of role plus serialized content (first 12 SHA-256 hex).
-    /// Digests expose head drift even when consecutive messages have equal sizes.
+    /// Role/content digests expose head drift even when message sizes match.
     public let messageCount: Int
     public let messageDigests: [String]
-    /// One digest per cacheable-prefix message, excluding the current user message.
-    /// Reuse requires turn N's list to prefix turn N+1's; the whole-prefix hash changes each turn.
+    /// One digest per cacheable-prefix message, excluding the current user message. Reuse requires turn N's list to prefix turn N+1's; the whole-prefix
+    /// hash changes each turn.
     public let prefixMessageDigests: [String]
     /// Bounded prefix conversation excerpts, credential-redacted before truncation.
     public let headPreviews: [String]
-    /// Separate stable-instruction, tools and history-head fingerprints identify drift.
-    /// Empty when the caller does not compute them.
+    /// Separate stable-instruction, tools and history-head fingerprints identify drift. Empty when the caller does not compute them.
     public let stablePrefixFingerprintSHA256: String
     public let toolsFingerprintSHA256: String
     public let historyHeadFingerprintSHA256: String
@@ -120,19 +115,17 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
     }
 }
 
-/// Turn-scoped receipt mailbox, bound empty at turn admission and filled after context assembly.
+/// Admission supplies an empty receipt sink to the call; context assembly fills that exact sink.
 public final class ConversationPrefixTelemetrySink: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ConversationPrefixTelemetrySnapshot?
     private var pending: Task<ConversationPrefixTelemetrySnapshot, Never>?
     private var weight: ToolContractWeight.Measurement?
 
-    /// True when this binding exists to SHED an outer turn's receipts rather
-    /// than to carry its own. Such a sink is permanently empty.
+    /// A shedding binding stays empty so secondary calls cannot carry an outer turn's receipts.
     public let marksRequestShapeUnmeasured: Bool
 
-    /// The sink a secondary lane binds to detach the parent turn's shape. One
-    /// shared value is safe because it is permanently empty by construction.
+    /// A permanently empty shared sink safely detaches secondary calls from parent receipts.
     public static let unmeasuredRequestShape =
         ConversationPrefixTelemetrySink(marksRequestShapeUnmeasured: true)
 
@@ -146,8 +139,7 @@ public final class ConversationPrefixTelemetrySink: @unchecked Sendable {
         lock.lock(); value = snapshot; pending = nil; lock.unlock()
     }
 
-    /// Diagnostics can prepare beside the request. Receipt writers join this
-    /// exact work before reading it; request construction never needs it.
+    /// Diagnostics can prepare beside the request. Receipt writers join this exact work before reading it; request construction never needs it.
     public func setPending(_ task: Task<ConversationPrefixTelemetrySnapshot, Never>) {
         guard !marksRequestShapeUnmeasured else { return }
         lock.withLock { value = nil; pending = task }
@@ -173,33 +165,32 @@ public final class ConversationPrefixTelemetrySink: @unchecked Sendable {
     }
 }
 
-public enum ConversationPrefixTelemetry {
-    /// Bound once per turn by the chat lane, alongside the shape task-local.
-    @TaskLocal public static var sink: ConversationPrefixTelemetrySink?
+private enum PrefixMeasurementPart: LLMCallPart { static let unset: ConversationPrefixTelemetrySink? = nil }
+private enum AnthropicReusePart: LLMCallPart { static let unset = false }
 
-    public static var current: ConversationPrefixTelemetrySnapshot? { sink?.current }
-
-    /// Does the innermost binding say "this call's request shape is not the one
-    /// in the sink"?
-    public static var requestShapeUnmeasured: Bool { sink?.marksRequestShapeUnmeasured == true }
-
-    /// Secondary calls retain turnId with an unmeasured shape, shedding chat receipts, route and token budget.
-    public static func withUnmeasuredRequestShape<T: Sendable>(
-        _ body: () async throws -> T
-    ) async rethrows -> T {
-        try await $sink.withValue(.unmeasuredRequestShape) {
-            try await LLMCallContext.$providerId.withValue(nil) {
-                try await LLMCallContext.$admittedModel.withValue(nil) {
-                    try await LLMCallContext.$reasoningEffort.withValue(nil) {
-                        try await LLMCallContext.$serviceTier.withValue(nil) {
-                            try await LLMCallContext.$turnTokenBudget.withValue(nil) {
-                                try await body()
-                            }
-                        }
-                    }
-                }
-            }
-        }
+extension LLMCall {
+    /// The request builder's measurement; nil means no measurement was supplied.
+    public var prefixMeasurement: ConversationPrefixTelemetrySink? {
+        get { self[PrefixMeasurementPart.self] }
+        set { self[PrefixMeasurementPart.self] = newValue }
+    }
+    public var requestShapeUnmeasured: Bool { prefixMeasurement?.marksRequestShapeUnmeasured == true }
+    public var withinTurnReuse: Bool {
+        get { self[AnthropicReusePart.self] }
+        set { self[AnthropicReusePart.self] = newValue }
+    }
+    /// A secondary call retains causal identity, with its own route, layout and allowance.
+    public func unmeasured() -> LLMCall {
+        var call = self
+        call.prefixMeasurement = .unmeasuredRequestShape
+        call.conversationRequest = false
+        call.requestPlan = nil
+        call.systemSegments = nil
+        call.currentUserIndex = nil
+        call.withinTurnReuse = false
+        call.admission = nil
+        call.turn?.tokenBudget = nil
+        return call
     }
 }
 
@@ -225,7 +216,7 @@ public enum ToolContractWeight {
         }
     }
 
-    /// Material bytes of one schema, the `context.snapshot` convention.
+    /// Schema weight follows context.snapshot's material-byte convention.
     public static func materialBytes(
         name: String, description: String, parameterBytes: Int
     ) -> Int {

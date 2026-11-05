@@ -1,33 +1,27 @@
-// Browser status reads atomic owner files without running browser work.
-// Receipt summaries retain artifact paths; full captures stay on disk.
+// Read owner files without browser effects; full captures stay on disk while summaries retain paths.
 
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Browser.swift` | Browser status reads owner recovery and named damaged runs alongside valid siblings; operation/capture paths; WebKit owns website data, with no advertised data-root profile |
+// Blueprint: | `Browser.swift` | Owner recovery and damaged-run status; capture paths; WebKit owns website data |
 
 public struct SwiftNativeBrowserClient: Sendable {
-    /// Absolute path to `<dataRoot>/native_power/browser/runs.json`.
     public let runsPath: URL
-    /// Absolute path to `<dataRoot>/native_power/browser/receipts.jsonl`.
     public let receiptsPath: URL
-    /// Absolute path to `<dataRoot>/native_power/browser/sources`.
     public let sourcesDir: URL
-    /// Absolute path to `<dataRoot>/native_power/browser/screenshots`.
     public let screenshotsDir: URL
     let now: @Sendable () -> Date
 
-    /// Shared NativeActionReceipt JSONL, capped through appendPathOwnedJSONL.
-    /// Off-disk backup only; no archive inputs/phone copy; PrivacyMap: native_actions.
+    /// Capped receipt feed; off-disk backup only, excluded from archive inputs and phone sync.
     public var nativeActionsReceiptsPath: URL {
         runsPath.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("actions/receipts.jsonl")
     }
 
-    public var tracesPath: URL {
+    /// The data root whose record holds this browser's standalone receipts.
+    var dataRoot: URL {
         runsPath.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("traces/events.jsonl")
     }
 
     public init(
@@ -44,8 +38,7 @@ public struct SwiftNativeBrowserClient: Sendable {
         self.now = now
     }
 
-    /// Resolve the browser operation and capture files under the data root.
-    /// WebKit owns its website data; this client has no profile directory.
+    /// WebKit owns website data; the data-root client resolves only operation and capture files.
     public static func defaultClient(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> SwiftNativeBrowserClient {
@@ -83,8 +76,14 @@ public struct SwiftNativeBrowserClient: Sendable {
             throw PersistenceCoreError.ioFailure("The browser receipt feed is malformed.")
         }
         let receipts = receiptRead.rows
-        let artifactKeys: Set<String> = ["url", "title", "ipcUrl", "ipcTitle", "httpStatus", "textPath", "htmlPath", "linksPath", "pngPath", "path", "textChars", "linkCount", "captureRetention", "openError", "canceled"]
-        let receiptKeys = Set(["id", "transitionId", "domain", "status", "opened", "dryRun", "createdAt", "updatedAt", "completedAt", "verificationStatus", "outcomeKind", "errorCode", "sourceReceipt", "screenshotReceipt"])
+        let artifactKeys: Set<String> = [
+            "url", "title", "ipcUrl", "ipcTitle", "httpStatus", "textPath", "htmlPath", "linksPath", "pngPath", "path",
+            "textChars", "linkCount", "captureRetention", "openError", "canceled"
+        ]
+        let receiptKeys = Set([
+            "id", "transitionId", "domain", "status", "opened", "dryRun", "createdAt", "updatedAt", "completedAt", "verificationStatus",
+            "outcomeKind", "errorCode", "sourceReceipt", "screenshotReceipt"
+        ])
             .union(artifactKeys)
         let latestReceipt = receipts.last.map { value -> JSONValue in
             guard case .object(let row) = value else { return .null }
@@ -94,7 +93,6 @@ public struct SwiftNativeBrowserClient: Sendable {
             })
         } ?? .null
 
-        // createdAt timestamps this status response.
         return .object([
             "status": .string(recoveryIssue == nil && admissionIssues.isEmpty ? "ready" : "unavailable"),
             "recoveryIssue": recoveryIssue.map(JSONValue.string) ?? .null,

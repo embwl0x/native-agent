@@ -4,26 +4,19 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `ChatGPTTransport.swift` | ChatGPT OAuth request/stream/error execution with conversation or stable Workshop cache routing |
-// Uses endpoint-scoped ChatGPT OAuth credentials with the Codex Responses
-// backend. NativeAgent.app owns browser sign-in; this adapter consumes and
-// refreshes the persisted tokens. Requests use the shared backend identity
-// and the account ID from persisted tokens or the access-token JWT.
-// Refreshes are serialized per credential path and persisted atomically.
-// ChatTurnRuntime owns tool permission, dispatch, and budgets.
+// Blueprint: | `ChatGPTTransport.swift` | ChatGPT OAuth request/stream/error execution with conversation or stable workshop-surface cache routing |
+// Browser sign-in and token refresh share endpoint-scoped credentials; path serialization prevents duplicate rotations. ChatTurnRuntime owns tool
+// authority.
 
 public final class ChatGPTTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
-    /// This transport sends no output-cap field.
-    public func requestOutputTokens(model: String) throws -> Int { 0 }
+    /// The backend rejects output-cap fields.
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
 
     public let providerId: String = "openai_oauth_direct"
 
     public static let productionSession: URLSession = makeProductionSession()
-    /// ChatGPT's Codex backend uses the official Codex client identity as a
-    /// routing contract, not merely analytics. A neutral NativeAgent
-    /// originator currently receives repeatable `server_is_overloaded`
-    /// failures for requests that succeed with this exact identity.
+    /// The backend requires the official Codex client identity for routing; a neutral originator receives overload failures.
     public static let codexBackendOriginator = "codex_cli_rs"
     public static var codexBackendUserAgent: String {
         let rawVersion =
@@ -41,7 +34,6 @@ public final class ChatGPTTransport: LLMTransport {
     internal let authPathOverride: URL?
     internal let dataRootOverride: URL?
     internal let openAIPublicClientID: String
-    /// Per-call llm.call telemetry writer.
     private let telemetry: LLMCallTraceRecorder
     /// Refresh serialization is shared across instances by resolved credential path.
     private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
@@ -74,23 +66,16 @@ public final class ChatGPTTransport: LLMTransport {
         self.openAIPublicClientID = openAIPublicClientID
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
-    /// Responses prompt-cache routing key, shared with the session_id header.
-    /// A conversation id wins, then the sessionless Workshop scope, then the
-    /// turn id. With none of those bound no prompt_cache_key is added.
-    /// `store:false` is intentionally NOT flipped.
-    static func currentPromptCacheKey() -> String? {
-        guard let raw = cacheScopeID() else { return nil }
+    /// Cache routing follows conversation, the sessionless workshop surface, then turn; an unbound call has no cache key and never changes store:false.
+    static func currentPromptCacheKey(call: LLMCall) -> String? {
+        guard let raw = cacheScopeID(call: call) else { return nil }
         return "nativeagent-session-\(raw)"
     }
-    /// Conversation identity owns routing when present. Workshop steps have
-    /// no transcript session: route their common prefix to one stable scope
-    /// across invocations, rather than a new cache node for every run UUID.
-    /// This is only a cache hint; it creates no session or execution identity.
-    /// Other ephemeral calls reuse their own turn's cache node.
-    private static func cacheScopeID() -> String? {
-        let workshopScope = WorkshopSurfaceVocabulary.isWorkshopSurface(LLMCallContext.surface ?? "")
+    /// Sessionless calls on the workshop surface share a cache scope so their common prefix reaches one node across runs; this grants no identity.
+    private static func cacheScopeID(call: LLMCall) -> String? {
+        let workshopScope = WorkshopSurfaceVocabulary.isWorkshopSurface(call.surface)
             ? "nativeagent-workshop" : nil
-        for candidate in [LLMCallContext.sessionId, workshopScope, TurnTraceContext.turnId] {
+        for candidate in [call.session, workshopScope, call.turn?.id] {
             if let raw = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
                !raw.isEmpty {
                 return raw
@@ -98,11 +83,9 @@ public final class ChatGPTTransport: LLMTransport {
         }
         return nil
     }
-    /// session_id supplies backend cache-node affinity alongside prompt_cache_key.
-    /// Admit only alphanumerics, dash, underscore and dot, at most 128 characters;
-    /// no bound cache scope yields nil.
-    static func currentSessionRoutingID() -> String? {
-        guard let raw = cacheScopeID() else { return nil }
+    /// Bound cache affinity admits only alphanumerics, dash, underscore and dot, capped at 128 characters.
+    static func currentSessionRoutingID(call: LLMCall) -> String? {
+        guard let raw = cacheScopeID(call: call) else { return nil }
         let safe = raw.unicodeScalars
             .filter { scalar in
                 CharacterSet.alphanumerics.contains(scalar)
@@ -112,7 +95,7 @@ public final class ChatGPTTransport: LLMTransport {
         guard !safe.isEmpty else { return nil }
         return String(safe.prefix(128))
     }
-    private func responsesRequest(accessToken: String) throws -> URLRequest {
+    private func responsesRequest(accessToken: String, call: LLMCall) throws -> URLRequest {
         guard let accountID = try currentAccountID(accessToken: accessToken) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
@@ -125,16 +108,13 @@ public final class ChatGPTTransport: LLMTransport {
         req.setValue("responses=experimental", forHTTPHeaderField: "OpenAI-Beta")
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // Sticky cache-node routing — see currentSessionRoutingID().
-        if let sessionRoutingID = Self.currentSessionRoutingID() {
+        // Keep header affinity aligned with the prompt-cache routing key.
+        if let sessionRoutingID = Self.currentSessionRoutingID(call: call) {
             req.setValue(sessionRoutingID, forHTTPHeaderField: "session_id")
         }
         return req
     }
-    /// Returns a fresh Codex/ChatGPT OAuth token plus account id for non-chat
-    /// Codex backend calls, such as the image_generation Responses tool.
-    /// staleToken identifies the failing request so refresh can reuse a rotation
-    /// already completed by another caller.
+    /// Retain the failing token so refresh can reuse another caller's completed rotation.
     public func codexAccessContext(
         forceRefresh: Bool = false,
         staleToken: String? = nil
@@ -150,38 +130,28 @@ public final class ChatGPTTransport: LLMTransport {
             authPath: resolveAuthPath()
         )
     }
-    /// Structured multi-turn variant. Encodes the LLMMessage array into
-    /// Responses-API `input` items (message / function_call /
-    /// function_call_output). Without these structured items the model can't
-    /// see its own prior tool calls as PAIRED with their results — the loop
-    /// re-emits the same tool call every iteration and never converges.
-    ///
-    /// Whole-reply callers (Telegram, the bridge, background work) ride the
-    /// same SSE request and decoder as the chat surface, so the stream guard
-    /// sees wire activity as it arrives and one llm.call row is written.
+    /// Structured calls must stay paired with results or the model can repeat them indefinitely. Whole replies share SSE decoding, liveness and one
+    /// receipt.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         return try await LLMMessageStreamEvent.reply(collecting:
-            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
+            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         let session = self.session
         let endpoint = self.endpoint
         return AsyncThrowingStream { continuation in
             let task = Task {
-                // Coerce INSIDE the stream task: this is a non-throwing
-                // factory, so an unserviceable model id has to reach the
-                // caller as a thrown continuation finish rather than as a
-                // silently defaulted model (NORTHSTAR clause 2).
+                // Validate inside the nonthrowing stream factory so an invalid model reaches the caller as a thrown finish.
                 let coercedModel: String
                 let substitutedFrom: String?
                 do {
@@ -216,15 +186,16 @@ public final class ChatGPTTransport: LLMTransport {
                             throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
                                 detail: "\(resolveAuthPath().path): \(ProviderFailure.diagnosticDescription(error))")
                         }
-                        var req = try responsesRequest(accessToken: access)
+                        var req = try responsesRequest(accessToken: access, call: call)
 
-                        guard let accountRow = accountModel(coercedModel) else {
-                            throw LLMError.providerError(message: "The selected ChatGPT account's controls for \(coercedModel) are unavailable. Refresh its models in Providers.")
+                        guard let accountRow = accountModel(coercedModel, preview: call.preview) else {
+                            throw LLMError.providerError(
+                                message: "The selected ChatGPT account's controls for \(coercedModel) are unavailable. Refresh its models in Providers.")
                         }
                         let bodyDict = try Self.buildResponsesBodyFromMessages(
                             model: coercedModel, messages: messages, system: system, tools: tools,
                             supportedEfforts: accountRow.supportedReasoningEfforts,
-                            supportsFast: accountRow.supportsFast
+                            supportsFast: accountRow.supportsFast, call: call
                         )
                         do {
                             req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
@@ -235,7 +206,7 @@ public final class ChatGPTTransport: LLMTransport {
                         let bytes: URLSession.AsyncBytes
                         let response: URLResponse
                         do {
-                            (bytes, response) = try await ProviderWire.open(session, req)
+                            (bytes, response) = try await ProviderWire.open(session, req, call: call)
                         } catch {
                             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
                         }
@@ -259,7 +230,7 @@ public final class ChatGPTTransport: LLMTransport {
                             requestStartNs: requestStartNs, substitutedFrom: substitutedFrom,
                             providerLabel: "openai oauth", errorPrefix: "chatgpt-backend",
                             networkError: { self.transientNetworkError($0, endpoint: endpoint, operation: "streamMessages") },
-                            continuation: continuation
+                            continuation: continuation, call: call
                         )
                         continuation.finish()
                         return
@@ -270,7 +241,7 @@ public final class ChatGPTTransport: LLMTransport {
                 }
                 continuation.finish(throwing: LLMError.notConfigured(provider: "openai_oauth_direct"))
             }
-            ProviderReplyWork.current?.own(task)
+            call.replyWork?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -278,15 +249,19 @@ public final class ChatGPTTransport: LLMTransport {
         prompt: String,
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         try await completeMessages(
             messages: [LLMMessage(role: .user, content: [.text(prompt)])],
-            system: system, model: model, tools: tools
+            system: system, model: model, tools: tools, call: call
         )
     }
     internal func transientNetworkError(_ error: Error, endpoint: URL, operation: String) -> LLMError {
-        .transient(message: "\(providerId) \(operation) failed for \(endpoint.host ?? "chatgpt.com"): \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))")
+        .transient(
+            message: """
+                \(providerId) \(operation) failed for \(endpoint.host ?? "chatgpt.com"): \
+                \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))
+                """)
     }
     private static func boundedBodyString(
         from bytes: URLSession.AsyncBytes,
@@ -300,11 +275,7 @@ public final class ChatGPTTransport: LLMTransport {
         if collected.count > maxBytes { text += "\n...(truncated)" }
         return text
     }
-    /// ChatGPT currently emits both a legacy top-level `message` and a newer
-    /// nested `error` object. `response.failed` places that same object under
-    /// `response.error`. Keep one decoder for buffered, streaming, plain, and
-    /// structured lanes so one backend envelope change cannot degrade only one
-    /// chat surface to an unhelpful "unknown" error.
+    /// Top-level message and nested error envelopes are current backend forms; one decoder preserves their cause across all response paths.
     static func backendErrorDescription(
         from event: [String: Any],
         fallback: String
@@ -324,10 +295,7 @@ public final class ChatGPTTransport: LLMTransport {
         let code = boundedProviderErrorField(rawCode, fallback: "")
         return code.isEmpty ? message : "\(message) [code=\(code)]"
     }
-    /// HTTP 200 does not mean the ChatGPT Responses stream succeeded. Preserve
-    /// hard auth and rate-limit semantics while classifying explicit capacity
-    /// and availability failures as transient so existing surface retry policy
-    /// can handle them truthfully.
+    /// HTTP 200 can carry a failed response; preserve auth, rate-limit and capacity evidence for typed recovery.
     static func classifiedBackendError(_ description: String) -> ProviderFailure.Diagnostic {
         .init(cause: ProviderFailure.wire(description), detail: description)
     }
@@ -343,13 +311,11 @@ public final class ChatGPTTransport: LLMTransport {
         guard value.count > maximumCharacters else { return value }
         return String(value.prefix(maximumCharacters)) + "…"
     }
-    /// Strip the openai/ namespace and normalize syntax, then admit only a model
-    /// in the selected account catalog. Missing or unavailable picks are refused.
+    /// Only the selected account's catalog can admit a normalized model ID.
     private func coerceToGPTModel(_ requested: String?) throws -> String {
         guard let r = requested?.trimmingCharacters(in: .whitespaces), !r.isEmpty else {
             throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: "")
         }
-        // Strip openai/ namespace.
         let stripped: String = {
             if r.lowercased().hasPrefix("openai/") {
                 return String(r.dropFirst("openai/".count))
@@ -366,7 +332,7 @@ public final class ChatGPTTransport: LLMTransport {
         }
         throw LLMError.modelUnavailable(provider: "openai_oauth_direct", model: r)
     }
-    /// Record a changed requested ID as llm.call's substitutedFrom; unchanged is nil.
+    /// Record ID normalization so substitution stays visible in telemetry.
     static func substitutionTrace(requested: String?, coerced: String) -> String? {
         guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
             return nil

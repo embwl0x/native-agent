@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgramPrelude.swift` | Frozen callable app door and namespace bindings with working-shape misuse errors; bare registry verbs preserve their built-in bindings; preview/version-preserving calls and ordered batches, strict replay vocabulary; canonical host namespace and PIM action names shared with static save inspection |
+// Blueprint: | `OwnedProgramPrelude.swift` | Frozen app/host namespaces, preview/version propagation, ordered batches and strict replay |
 extension OwnedProgramRunner {
     public static let hostPrimitiveNamespaces: Set<String> = ["files", "network", "program", "apps", "model"]
     public static let hostDoorActions: Set<String> = [
@@ -11,12 +11,7 @@ extension OwnedProgramRunner {
         "reminders.query", "reminders.create", "reminders.update", "reminders.delete",
         "contacts.search", "contacts.save"
     ]
-    /// The callable `app` door the script sees. Its only native calls are `__call`
-    /// and `__log`, captured here and then removed from the global object.
-    /// A strict run adds `expect`, `expect_fail`, `decide` and `step`, and
-    /// an unknown action name reaches the door, so it fails as unknown_action.
-    /// With `input`, the frozen `input` is parsed from its native binding.
-    /// Her turn part (`turn`) gets its reach and a `run` that is its `step`.
+    /// Capture __call and __log before removing their global bindings; freeze input and namespace bindings while unknown actions retain door validation.
     public static func prelude(ids: String, strict: Bool = false, input: Bool = false, primitives: Bool = false,
                                turn: Bool = false) -> String {
         let marks = !strict ? "" : """
@@ -85,7 +80,9 @@ extension OwnedProgramRunner {
             }
             return "\(space): Object.freeze({\(methods.joined(separator: ","))})"
         }
-        let host = !primitives ? (strict ? state + "Object.defineProperty(globalThis, \"host\", {value: Object.freeze({state: partState})});" : "") : state + """
+        let host = !primitives ? (strict ? state + """
+            Object.defineProperty(globalThis, \"host\", {value: Object.freeze({state: partState})});
+            """ : "") : state + """
           function primitive(operation, args) {
             if (operation.indexOf("files.") === 0) return door(operation, args);
             return invoke("primitive", operation, args === undefined ? [] : [args]);
@@ -124,8 +121,8 @@ extension OwnedProgramRunner {
               try { return primitive("part.call", {id: id, input: input}); }
               catch (error) { return {ok: false, error: {code: error.reason || "failed", message: error.message}}; }
             }
-          // A convenience name never takes a name from her code: her own
-          // declaration of `part` or `screen` replaces it in her sandbox.
+          // A convenience name never takes a name from the agent's code: its own
+          // declaration of `part` or `screen` replaces it in the agent's sandbox.
           }), writable: true, configurable: true});
           Object.defineProperty(globalThis, "screen", {value: Object.freeze({
             watch: function (args) { return primitive("screen.watch", args); },

@@ -1,28 +1,20 @@
-// Every store write preserves a supplied kind or stamps "general" with kind_source "write_default_v1".
-// The default leaves decay unchanged; classification and decay rates require agent/user approval.
-//
-// kind_source provenance keeps default-stamped rows visible to future
-// backfill passes: "write_default_v1" means "machine default, still
-// classifiable"; a kind without kind_source means a deliberate caller signal.
+// Preserve supplied kinds; stamp absent kinds as general without decay changes. `write_default_v1` keeps machine defaults eligible for approved classification,
+// while unsourced kinds remain deliberate caller signals.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MemoryV2+KindStamp.swift` | `MemoryKindStamp`: conservative write-time memory kind and source metadata defaults; the one kind vocabulary (`writerKinds`, `personKinds`) the writer, the explicit save and the person picture share |
+// Blueprint: | `MemoryV2+KindStamp.swift` | `MemoryKindStamp`, `writerKinds`, `personKinds`: shared kind vocabulary and conservative defaults |
 
 public enum MemoryKindStamp {
 
-    /// Default kind for writes that carry no kind signal. NOT in
-    /// `memoryDecayHalfLifeDays` (decayFactor 1.0). Replacement always requires
-    /// explicit intent, regardless of kind.
+    /// General has no decay half-life; every replacement still requires explicit intent.
     public static let defaultKind = "general"
 
-    /// kind_source for the write-time default stamp. Rows carrying this
-    /// source are still classifiable by the approval-gated backfill.
+    /// kind_source for the write-time default stamp. Rows carrying this source are still classifiable by the approval-gated backfill.
     public static let writeDefaultSource = "write_default_v1"
 
-    /// kind_source written by the approval-gated LLM backfill apply path.
     public static let backfillSource = "backfill_llm_v1"
 
     /// One kind vocabulary serves the memory writer, explicit saves and person-picture admission.
@@ -31,11 +23,9 @@ public enum MemoryKindStamp {
         "relationship", "goal", "skill", "fact", "correction",
     ]
 
-    /// Explicit saves additionally name agreements and unclassified notes.
     public static let commitKinds = writerKinds + ["instruction", genericCommitKind]
 
-    /// The person picture and pinned core admit these person kinds, including persisted labels.
-    /// Other kinds remain fully recallable outside the picture.
+    /// The person picture and pinned core admit these person kinds, including persisted labels. Other kinds remain fully recallable outside the picture.
     public static let personKinds: Set<String> = [
         "identity", "location", "employment", "schedule", "preference",
         "relationship", "user_fact", "user_preference", "attribute",
@@ -52,23 +42,18 @@ public enum MemoryKindStamp {
         "general",
     ]
 
-    /// The kind carried in a metadata blob (same convention as
-    /// `MemoryRecallScoring.kind(of:)` — metadata.kind, empty string = nil).
+    /// Share kind extraction with recall scoring: empty strings are absent.
     public static func kind(of metadata: JSONValue?) -> String? {
         MemoryRecallScoring.kind(of: metadata)
     }
 
-    /// The kind_source provenance marker, when present.
     public static func kindSource(of metadata: JSONValue?) -> String? {
         guard case .object(let obj)? = metadata,
               case .string(let s)? = obj["kind_source"], !s.isEmpty else { return nil }
         return s
     }
 
-    /// Stamp the write-time default kind into `metadata` IFF it carries no
-    /// kind signal. Caller-provided kinds pass through untouched (existing
-    /// keys always win). Non-object metadata is returned verbatim — never
-    /// destroy what we don't understand.
+    /// Existing kinds always win; preserve non-object metadata rather than destroying an unknown shape.
     public static func stampingDefaultKind(_ metadata: JSONValue?) -> JSONValue? {
         switch metadata {
         case nil:
@@ -86,8 +71,7 @@ public enum MemoryKindStamp {
         }
     }
 
-    /// Backfill classifies missing kinds, machine defaults or unsourced `note` rows; deliberate kinds are never re-proposed.
-    /// Backfill changes kind metadata without touching content.
+    /// Classify only missing kinds, machine defaults and unsourced notes; preserve deliberate kinds and content.
     public static func isClassifiable(_ metadata: JSONValue?) -> Bool {
         guard let k = kind(of: metadata) else { return true }
         let source = kindSource(of: metadata)

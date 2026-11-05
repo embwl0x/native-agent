@@ -3,12 +3,9 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
-// Blueprint: | `CognitionObservatoryView+Shared.swift` | Observatory shared rows/count badges: explicit zero stays visible; unavailable or malformed counts never become fabricated badges |
+// Blueprint: | `CognitionObservatoryView+Shared.swift` | Count badges preserve zero and withhold unavailable evidence |
 
-/// The collapsed Observatory header has two materially different no-number
-/// states: an explicit empty count and a count that was not available from its
-/// producer. Keep that distinction at the presentation boundary so every
-/// collapsible panel uses the same honest badge rule.
+/// Distinguish explicit empty counts from unavailable reads at the shared badge boundary.
 enum CognitionObservatoryCountBadgePresentation {
     struct Badge: Equatable {
         let count: Int
@@ -16,9 +13,7 @@ enum CognitionObservatoryCountBadgePresentation {
         var text: String { String(count) }
     }
 
-    /// `nil` is unavailable and intentionally has no badge. Zero is a real
-    /// producer result and must remain visible. Negative values are malformed
-    /// counts, not evidence of an empty panel, so they also remain absent.
+    /// Show measured zero; nil and malformed negative counts cannot prove emptiness and receive no badge.
     static func badge(for count: Int?) -> Badge? {
         guard let count, count >= 0 else { return nil }
         return Badge(count: count)

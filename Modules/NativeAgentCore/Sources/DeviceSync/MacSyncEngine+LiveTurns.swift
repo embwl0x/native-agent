@@ -6,11 +6,7 @@ import Transcripts
 import Privacy
 // Blueprint: | `MacSyncEngine+LiveTurns.swift` | `MacSyncEngine`: `startLiveTurnRelay`, `stopLiveTurnRelay` |
 
-/// A turn another door started in the anchored conversation reaches the phone
-/// as it streams, the way the phone's own turns do (ICloudIncomingTurnForwarder):
-/// coalesced `text_delta` records under the turn's run id, then the saved
-/// answer, all marked `live` so the phone knows it did not send them. The
-/// phone's own turns stay with the forwarder.
+/// Other-door turns use their own run id and live marker so the phone can distinguish them from turns its forwarder owns.
 extension MacSyncEngine {
     func startLiveTurnRelay() {
         stopLiveTurnRelay()
@@ -80,8 +76,7 @@ extension MacSyncEngine {
                 if queued { continuation.yield(()) }
             }
         }
-        // A successful transport operation wakes retained finals without a
-        // second retry loop. The signal holds no text; the mailbox owns it.
+        // Successful transport wakes retained finals without another retry loop; only the mailbox owns text.
         sync.bridge.onTransportSucceeded = { continuation.yield(()) }
         liveTurnRelayTask = Task { [weak self] in
             for await _ in signals {

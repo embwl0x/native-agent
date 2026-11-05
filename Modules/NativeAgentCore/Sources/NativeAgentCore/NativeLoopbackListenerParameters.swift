@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import Darwin
 import Network
-// Blueprint: | `NativeLoopbackListenerParameters.swift` | Loopback listener construction, generation and rebind lifecycle; one retained, cancellable two-second port diagnostic, with admission held through process exit and stale generations excluded from publication |
+// Blueprint: | `NativeLoopbackListenerParameters.swift` | Fixed-port listeners and retained bounded diagnostics |
 
 private let nativeLog = ModuleLog(category: "NativeAgentApp")
 
@@ -34,12 +34,9 @@ enum NativeLoopbackListenerParameters {
     }
 }
 
-/// Socket-lifecycle tissue shared by the three resident loopback adapters.
-/// It owns listener identity, cancellation and its bounded port diagnostic. Tokens, descriptors,
-/// request policy, effects, and verification remain with each bridge/browser
-/// owner. Each install listens on its own fixed port (InstallPaths
-/// .loopbackPorts); a port another process holds is a failure naming that
-/// process, never a hop to another port.
+/// Socket-lifecycle tissue shared by the three resident loopback adapters. It owns listener identity, cancellation and its bounded port diagnostic. Tokens,
+/// descriptors, request policy, effects, and verification remain with each bridge/browser owner. Each install listens on its own fixed port (InstallPaths
+/// .loopbackPorts); a port another process holds is a failure naming that process, never a hop to another port.
 public final class NativeLoopbackListener: @unchecked Sendable {
     private struct Callbacks: @unchecked Sendable {
         let ready: @Sendable (UInt16) -> Void
@@ -59,8 +56,6 @@ public final class NativeLoopbackListener: @unchecked Sendable {
     // Kept through actual process exit, even after stop or a new bind attempt.
     private var diagnostic: ListeningProcessDiagnostic?
 
-    /// What Doctor shows: the install's fixed port, whether it is bound, and
-    /// why the listener gave up, if it did.
     public struct Health: Sendable {
         public let port: UInt16
         public let boundPort: UInt16?
@@ -195,7 +190,6 @@ public final class NativeLoopbackListener: @unchecked Sendable {
         fail(error, generation: attempt)
     }
 
-    /// A taken port is said with its holder; any other error as it came.
     private func fail(_ error: Error, generation attempt: UInt64) {
         guard NativeLoopbackListenerParameters.isAddressInUse(error) else {
             nativeLog("[\(label)] listener failed: \(error)")
@@ -288,8 +282,7 @@ public final class NativeLoopbackListener: @unchecked Sendable {
 
 }
 
-/// One read-only `lsof`, stopped after two seconds or owner cancellation.
-/// The listener retains admission until termination; no timeout joins a worker.
+/// One read-only `lsof`, stopped after two seconds or owner cancellation. The listener retains admission until termination; no timeout joins a worker.
 private final class ListeningProcessDiagnostic: @unchecked Sendable {
     let id: UUID
     private let lock = NSLock()
@@ -361,8 +354,7 @@ private final class ListeningProcessDiagnostic: @unchecked Sendable {
         process.terminationHandler = nil
         try? pipe.fileHandleForWriting.close()
         lock.unlock()
-        // EOF is not awaited: the existing drain performs only bounded,
-        // nonblocking reads, then closes even if a writer retained the pipe.
+        // EOF is not awaited: the existing drain performs only bounded, nonblocking reads, then closes even if a writer retained the pipe.
         drain?.stopAndWait()
         if drain == nil { try? pipe.fileHandleForReading.close() }
         let output = lock.withLock { String(decoding: bytes, as: UTF8.self) }

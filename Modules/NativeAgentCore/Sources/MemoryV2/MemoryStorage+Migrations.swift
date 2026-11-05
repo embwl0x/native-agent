@@ -80,7 +80,7 @@ extension MemoryStorage {
                 CREATE INDEX idx_kg_rel_to ON kg_relationships(to_id);
             """)
         }
-        // v3: recall counters default to 0/NULL; a real use_count column permits atomic increments.
+        // A canonical use_count column permits atomic access increments.
         m.registerMigration("v3_recall_counters") { db in
             try db.execute(sql: """
                 ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0;
@@ -88,18 +88,18 @@ extension MemoryStorage {
                 CREATE INDEX idx_memories_last_used ON memories(last_used_at);
             """)
         }
-        // v4: tombstone embeddings block paraphrases; NULL preserves exact-hash-only matching.
+        // Tombstone vectors block paraphrases; NULL permits only exact-hash matching.
         m.registerMigration("v4_tombstone_embeddings") { db in
             try db.execute(sql: "ALTER TABLE tombstones ADD COLUMN embedding BLOB;")
         }
-        // v5: status tracks storage state; lifecycle tracks fact quality and defaults existing rows to confirmed.
+        // Storage status and fact lifecycle are distinct; existing facts begin confirmed.
         m.registerMigration("v5_memory_lifecycle") { db in
             try db.execute(sql: """
                 ALTER TABLE memories ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'confirmed';
                 CREATE INDEX idx_memories_lifecycle ON memories(lifecycle);
             """)
         }
-        // v6: vector identity remains unverified until atomic full-corpus activation; migration never guesses provenance.
+        // Only checked full-corpus activation verifies vector identity; migration cannot guess provenance.
         m.registerMigration("v6_embedding_epochs") { db in
             try db.execute(sql: """
                 ALTER TABLE memories ADD COLUMN embedding_epoch TEXT;
@@ -128,8 +128,7 @@ extension MemoryStorage {
                 );
             """)
         }
-        // v7: nullable temporal validity and evidence lineage. Additive only;
-        // no historical row is assigned invented dates or evidence.
+        // Nullable validity and lineage preserve existing rows without inventing dates or evidence.
         m.registerMigration("v7_temporal_evidence") { db in
             try db.execute(sql: """
                 ALTER TABLE memories ADD COLUMN valid_from TEXT;
@@ -141,8 +140,7 @@ extension MemoryStorage {
                 CREATE INDEX idx_memories_observed_at ON memories(observed_at);
             """)
         }
-        // v8: migrations own every kg_* table; IF NOT EXISTS adopts existing kg_memory_index tables.
-        // KnowledgeGraph verifies schema without creating tables.
+        // Migrations alone own kg_* schema; adopt existing tables without a second creation owner.
         m.registerMigration("v8_kg_memory_index") { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS kg_memory_index (
@@ -153,12 +151,9 @@ extension MemoryStorage {
                 );
             """)
         }
-        // The embedding rollback lane had no caller; its retained-vector copy
-        // table is dropped rather than kept filling on every activation.
         m.registerMigration("v9_drop_embedding_previous") { db in
             try db.execute(sql: "DROP TABLE IF EXISTS memory_embedding_previous")
         }
-        // Preserve the retired consolidation schema in migration history.
         m.registerMigration("v10_consolidation_applied") { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS consolidation_applied (
@@ -167,8 +162,7 @@ extension MemoryStorage {
                 )
             """)
         }
-        // Keep the first core choice after every pinned row is unpinned or
-        // deleted. Triggers cover every writer in the pin's own transaction.
+        // Keep the first core choice after every pinned row is unpinned or deleted. Triggers cover every writer in the pin's own transaction.
         m.registerMigration("v11_user_core_chosen") { db in
             try db.execute(sql: """
                 CREATE TABLE memory_metadata (
@@ -227,8 +221,7 @@ extension MemoryStorage {
                 END;
                 """)
         }
-        // Contact sessions use agent-; standing helpers use bot-. Repair the
-        // old user-seat label from that canonical source, never from acceptance.
+        // Derive speaker authority from canonical agent- and bot- session identities, never acceptance.
         m.registerMigration("v13_peer_moment_origin") { db in
             for table in ["memories", "proposals"] {
                 try db.execute(sql: """
@@ -243,8 +236,7 @@ extension MemoryStorage {
                     """)
             }
         }
-        // Relevance judgments belong to one canonical corpus. Access counters
-        // do not change its meaning; every other memory mutation advances it.
+        // Relevance judgments belong to one canonical corpus. Access counters do not change its meaning; every other memory mutation advances it.
         m.registerMigration("v14_recall_judgment_generation") { db in
             try db.execute(sql: """
                 INSERT INTO memory_metadata (key, value) VALUES ('recall_generation', 0);
@@ -265,8 +257,7 @@ extension MemoryStorage {
                 END;
                 """)
         }
-        // Repair rows imported after v13, including interrupted older imports.
-        // New imports normalize at their persistence boundary after this runs.
+        // Repair imported rows at persistence boundaries without skipping interrupted imports.
         m.registerMigration("v15_imported_peer_moment_origin") { db in
             for table in ["memories", "proposals"] {
                 try db.execute(sql: """
@@ -291,8 +282,7 @@ extension MemoryStorage {
                 );
                 """)
         }
-        // Width is committed with the provider epoch, including an empty
-        // corpus. Existing epochs must undergo checked activation to earn it.
+        // Width is committed with the provider epoch, including an empty corpus. Existing epochs must undergo checked activation to earn it.
         m.registerMigration("v17_embedding_dimensions") { db in
             try db.execute(sql: "ALTER TABLE memory_embedding_state ADD COLUMN dimensions INTEGER")
         }
@@ -328,8 +318,7 @@ extension MemoryStorage {
                 """)
         }
         m.registerMigration("v21_correction_occurrences") { db in
-            // Older previews discarded occurrence identities. Do not backfill
-            // them into a record that claims to be complete.
+            // Incomplete previews cannot backfill an occurrence ledger that claims completeness.
             let existing = try Int.fetchOne(db, sql: "SELECT (SELECT COUNT(*) FROM memories) + (SELECT COUNT(*) FROM proposals)")
             guard let existing else {
                 throw MemoryStorageError.databaseUnavailable("correction ledger: memory inventory unavailable")
@@ -362,8 +351,7 @@ extension MemoryStorage {
             try db.execute(sql: "INSERT INTO correction_ledger_state VALUES (1, ?)",
                            arguments: [existing == 0 ? 0 : Date().timeIntervalSince1970])
         }
-        // The retained repair uses the schema owner too. Adopt the cursor and
-        // index already created by older launches without resetting progress.
+        // Schema adoption preserves existing repair cursor and index progress.
         m.registerMigration("v22_proposal_repair_schema") { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS proposal_repair_cursor (singleton INTEGER PRIMARY KEY, stamp TEXT NOT NULL, id TEXT NOT NULL);

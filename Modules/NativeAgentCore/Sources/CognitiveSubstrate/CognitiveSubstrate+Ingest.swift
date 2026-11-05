@@ -5,8 +5,7 @@ import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Ingest.swift` | `CognitiveSubstrate`: `ingest`, `ingestResident`, `reconsolidateCompletion` |
 
 extension CognitiveSubstrate {
-    /// The full redacted reply length and tail let Sound inspect text beyond
-    /// the bounded event summary without retaining another complete reply.
+    /// The full redacted reply length and tail let Sound inspect text beyond the bounded event summary without retaining another complete reply.
     public static let replyCharacterCountMetadataKey = "replyCharacterCount"
     public static let replyTailMetadataKey = "replyTail"
 
@@ -14,10 +13,7 @@ extension CognitiveSubstrate {
         _ = await ingest(event, defersPersistenceToMicrocycle: false)
     }
 
-    /// Resident hot-path admission. Canonical in-memory state and the published
-    /// attention projection advance with semantic metadata before this returns; the
-    /// dirty microcycle persists the coalesced latest state. Direct library
-    /// callers retain `ingest(_:)`'s synchronous durability contract.
+    /// Resident admission publishes semantic state before returning and coalesces persistence; direct library ingest still waits for durability.
     @discardableResult
     public func ingestResident(_ event: CognitiveEvent) async -> (accepted: Bool, semanticMetadata: [String: JSONValue]) {
         await ingest(event, defersPersistenceToMicrocycle: true)
@@ -45,20 +41,14 @@ extension CognitiveSubstrate {
             oweCareEmbedding(error)
             return (false, ["appraisalUnavailable": .string(error.localizedDescription)])
         }
-        // Only a caller that commits inline must not interleave with the
-        // maintenance commit. Resident admission marks the state dirty, which
-        // tells a suspended maintenance pass not to revert over it, and the
-        // microcycle persists it after maintenance ends.
+        // Inline commits exclude maintenance; deferred resident ingest marks dirty so suspended maintenance cannot overwrite newer state.
         if !(defersPersistenceToMicrocycle && configuration.backgroundMicrocyclesEnabled) {
             await waitForMaintenanceTransition()
         }
         guard configuration.enabled else { return (false, [:]) }
         // Felt resolutions without personal stakes are rejected before any state changes.
         guard feltResolutionIsAtStake(event, cares: touchedCares) else { return (false, [:]) }
-        // A duplicate CognitiveEvent is inert across the WHOLE cognition owner,
-        // not merely ContinuityField structure. This await-free O(1) check keeps
-        // affect, mood, relational-presence anchors, pending completion, revision,
-        // attention publication, and persistence untouched on replay.
+        // Deduplicate before any mutation so replay cannot change affect, cadence, presence, attention or persistence.
         guard !field.hasSeenEvent(event) else { return (false, [:]) }
         let now = dependencies.now()
         if event.kind == .assistantTurnCompleted || event.kind == .providerFailure,
@@ -74,17 +64,13 @@ extension CognitiveSubstrate {
                 return true
             }
         }
-        // One deterministic scan bundle per admitted user turn. This stays
-        // inside the actor's await-free transition and owns no state: it only
-        // prevents affect, semantic appraisal, and retrospective landing from
-        // rescanning the same already-loaded text and cares.
+        // One await-free scan bundle keeps affect, meaning and landing on the same loaded words and cares.
         let buildsAffectBundle = configuration.enabled
             && event.turnKind.contributesToLivedState
         let defersInterpretation = buildsAffectBundle && Self.isUserAuthored(event.kind)
             && event.sessionId != nil && !helper
         let userAppraisal = AffectAppraisal()
-        // Semantic relationship stake reads warmth for every lived event;
-        // affect consumes it only for user turns. A peer carries half User's reach.
+        // Semantic relationship stake reads all lived warmth; affect consumes user turns only, and peer reach is halved.
         let turnWarmthBoost = !defersInterpretation && (buildsAffectBundle || event.kind == .userMessageReceived)
             ? relationalWarmthBoost(
                 for: event,
@@ -113,23 +99,19 @@ extension CognitiveSubstrate {
         }
         noteTurnForContext(event)
         let contributesToLivedState = event.turnKind.contributesToLivedState
-        // Accepted live completions advance cadence even when no cue was emitted.
-        // Commits preserve these counters across a suspended frozen render.
+        // Accepted live completions advance cadence even when no cue was emitted. Commits preserve these counters across a suspended frozen render.
         if contributesToLivedState, event.kind == .assistantTurnCompleted {
             capsulePresentationState.soundRutTurnsSinceSurfaced = min(capsulePresentationState.soundRutTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
-            // The reminded-of cadence counts the same boundary for the same
-            // reason: it is the one accepted-turn tick the substrate owns.
+            // The reminded-of cadence counts the same boundary for the same reason: it is the one accepted-turn tick the substrate owns.
             capsulePresentationState.remindedOfTurnsSinceSurfaced = min(
                 capsulePresentationState.remindedOfTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
-            // The tick is durable state: a restart must not restore the rut
-            // counter one turn behind. Written with this ingest's persistence
-            // (below, or the resident microcycle's transaction).
+            // Persist the accepted-turn tick with ingest so relaunch cannot restore cadence one turn behind.
             capsulePresentationDirty = true
         }
         if contributesToLivedState, event.kind == .userMessageReceived {
             lastUserPresenceAt = now
-            // Anchor the ambient warmth floor to genuinely warm moments only, so a pure-work
-            // session followed by absence never manufactures affect-warmth (it stays content-driven).
+            // Anchor the ambient warmth floor to genuinely warm moments only, so a pure-work session followed by absence never manufactures affect-warmth (it
+            // stays content-driven).
             if turnWarmthBoost > 0 { lastWarmPresenceAt = now }
         }
         // Affect application and emotional-tag stamping share one await-free segment before persistence.
@@ -142,10 +124,7 @@ extension CognitiveSubstrate {
             : affect
         // Stamp the feeling produced by this event only when affect is enabled.
         if contributesToLivedState, configuration.enabled, let ingestOutcome {
-            // Appraise the event's meaning (pure, no suspension — stays inside
-            // this await-free segment) so the stamped feeling is about what happened,
-            // not the fact that something happened.
-            // Semantic appraisal and emotion tagging share the admitted appraisal.
+            // Appraise meaning in the same await-free segment so the emotion tag reflects what happened, not merely that an event arrived.
             let semantic = semanticAppraisal(
                 for: event,
                 post: updatedAffect,
@@ -166,8 +145,7 @@ extension CognitiveSubstrate {
                 configuration: configuration
             )
         }
-        // Completion matching, node reconsolidation and resident-slot updates
-        // share this await-free admission transition.
+        // Completion matching, node reconsolidation and resident-slot updates share this await-free admission transition.
         var semanticMetadata: [String: JSONValue] = [:]
         if contributesToLivedState && configuration.enabled && !defersInterpretation {
             semanticMetadata = Self.foldReaction(event: event, completion: pendingCompletion,
@@ -197,13 +175,11 @@ extension CognitiveSubstrate {
                 }
             }
         }
-        // Publish before persistence awaits. The owner transition is already
-        // internally consistent, and a slow SQLite write must not delay the
-        // resident attention available to the next turn.
+        // Publish before persistence awaits. The owner transition is already internally consistent, and a slow SQLite write must not delay the resident
+        // attention available to the next turn.
         publishAttentionProjection(at: now)
         if defersPersistenceToMicrocycle, configuration.backgroundMicrocyclesEnabled {
-            // Verification evictions are rare and their receipt is diagnostic;
-            // keep it off the sensory admission path without losing the fact.
+            // Verification evictions are rare and their receipt is diagnostic; keep it off the sensory admission path without losing the fact.
             if evicted > 0, configuration.persistenceEnabled {
                 let sessionId = event.sessionId
                 Task { [weak self] in
@@ -240,8 +216,7 @@ extension CognitiveSubstrate {
         now: Date,
         reaction: Double
     ) {
-        // A user turn sharing its completion's field key has already stamped
-        // that node; blending its own reaction would count the feeling twice.
+        // A user turn sharing its completion's field key has already stamped that node; blending its own reaction would count the feeling twice.
         guard outcome?.key != completion.nodeKey else { return }
         if let landedNode = field.node(forKey: completion.nodeKey) {
             stampLandingScore(Self.landingScore(fromReactionValence: reaction),

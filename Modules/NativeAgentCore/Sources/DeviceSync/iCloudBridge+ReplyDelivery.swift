@@ -11,11 +11,10 @@ import PersistenceCore
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `iCloudBridge+ReplyDelivery.swift` | Correlated reply recovery accepts only observed transport acceptance; retained signed publications reconcile by original identity with checked receipts; fair event-driven steering outcome redelivery and stable action response identities; canonical terminal kinds and continuation run correlation |
+// Blueprint: | `iCloudBridge+ReplyDelivery.swift` | Observed acceptance, retained signed recovery and stable control/reply identities. |
 
 extension iCloudBridge {
-    /// Re-signal one retained control outcome per existing receive/repair event.
-    /// No event means it remains owed on disk; no timer or new identity is minted.
+    /// Receive/repair events re-signal one owed outcome; without an event, disk retains it without timers or new identity.
     func retryOwedControlPublication() async {
         let root = sync.dataRoot
         let directory = root.appendingPathComponent("icloud/chat_transactions", isDirectory: true)
@@ -50,8 +49,7 @@ extension iCloudBridge {
         }
     }
 
-    /// Send admission, receipt validation and recovery agree about which
-    /// envelopes settle a canonical answer, including live failure/Stop.
+    /// Send, receipt and recovery must agree on terminal envelopes, including live failure and Stop.
     nonisolated static func isRetainedChatReply(kind: String?, canonicalRun: String?) -> Bool {
         kind == nil || ["reply", "final", "codex_completion"].contains(kind ?? "")
             || canonicalRun != nil && ["rejection", "error", "cancelled", "incomplete"].contains(kind ?? "")
@@ -78,13 +76,18 @@ extension iCloudBridge {
 
     public func recoverReply(_ response: ChatResponse, route: AgentBridgeCompletionRoute, priorVerdict: String? = nil,
                              liveTurn: Bool = false) async throws -> String {
-        guard let answerSession = response.sessionId, let sourceKey = route.sourceKey,
-              AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(sourceKey) else {
-            throw BridgeError.containerUnavailable
+        guard let answerSession = response.sessionId else { throw BridgeError.containerUnavailable }
+        // Every phone route is minted with its device and surface (ICloudPhoneRoute, steerChat); a reply never guesses either.
+        guard let sourceKey = route.sourceKey, AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(sourceKey) else {
+            throw ToolFailureError("The phone reply route names no device; nothing was sent.", argumentPath: "route.sourceKey",
+                accepted: "iphone, iphone:<device name>", effects: .none)
+        }
+        guard let replyTo = route.replyTo else {
+            throw ToolFailureError("The phone reply route names no client surface; nothing was sent.", argumentPath: "route.replyTo",
+                accepted: ICloudPhoneRoute.clientSurfaces.sorted().joined(separator: ", "), effects: .none)
         }
         let session = route.sessionId ?? answerSession
-        // A new turn after a phone request has settled is a live turn in that
-        // conversation. Its snapshots and terminal must resolve the same run.
+        // Turns after a settled phone request are live; their snapshots and terminal must share the new run correlation.
         let liveContinuation = liveTurn || route.correlationId != response.runId
         let correlation = liveContinuation ? response.runId : route.correlationId ?? response.runId
         let transportID = "reply-" + MacSyncSnapshotIntegrity.digest(Data("\(answerSession)\n\(response.runId)".utf8))
@@ -93,10 +96,10 @@ extension iCloudBridge {
         let reservation = try Self.replyReservation(correlation, session: session, sourceKey: sourceKey, dataRoot: root)
         let verdict = try await Self.replyVerdict(correlationID: correlation, runID: response.runId, dataRoot: root)
         if verdict != "completed" {
-            var metadata = ["transport": "icloud", "source": "mac", "assistantRunId": response.runId, "replyTo": route.replyTo ?? "iphone",
-                            "targetSourceKey": route.sourceKey ?? "", "canonicalAnswerRunId": response.runId,
+            var metadata = ["transport": "icloud", "source": "mac", "assistantRunId": response.runId, "replyTo": replyTo,
+                            "targetSourceKey": sourceKey, "canonicalAnswerRunId": response.runId,
                             "canonicalAnswerSessionId": answerSession]
-            if liveContinuation { metadata["live"] = "true" }
+            if liveContinuation || response.isSilentCompletion { metadata["live"] = "true" }
             // Canonical ending is independent of the transport correlation.
             switch response.terminalState {
             case .failed:
@@ -176,19 +179,19 @@ extension iCloudBridge {
             return status
         }
         if statuses.contains("accepted_by_transport") || statuses.contains("confirmed_by_peer") { return "completed" }
-        // An unverified commit is unknown, not sent: it stays owed, so recovery
-        // resends it (the phone keeps one reply per correlation).
-        if statuses.contains("queued_for_icloud_sync") || statuses.contains("submission_unknown") || statuses.contains("commit_unverified") { return "sent_unconfirmed" }
+        // Unverified commits remain owed; recovery reuses correlation so the phone retains one reply.
+        if statuses.contains("queued_for_icloud_sync")
+            || statuses.contains("submission_unknown") || statuses.contains("commit_unverified") { return "sent_unconfirmed" }
         return statuses.contains("dispatch_reserved") ? "reserved" : nil
     }
 
-    func resendSavedReply(_ message: BridgeMessage, dataRoot: URL) async -> Bool? {
+    func resendSavedReply(_ message: BridgeMessage, route phone: ICloudPhoneRoute, dataRoot: URL) async -> Bool? {
         guard message.text.trimmingCharacters(in: .whitespacesAndNewlines) == "/retry resend" else { return nil }
         do {
             guard let session = message.sessionID, NativeAgentChatSessionID.normalizedPathComponent(session) == session else { return false }
-            let source = message.metadata?["routeKey"] ?? message.metadata?["deviceSourceKey"] ?? message.metadata?["sourceKey"] ?? "app"
+            let source = phone.routeKey
             let route = AgentBridgeCompletionRoute(surface: "ios", sessionId: session, sourceKey: source,
-                replyTo: message.metadata?["clientSurface"], correlationId: message.id)
+                replyTo: phone.replyTo, correlationId: message.id)
             if try await Self.replyVerdict(correlationID: message.id, runID: message.id, dataRoot: dataRoot) == "completed" {
                 _ = try await recoverReply(ChatResponse(runId: message.id, model: "", output: "", sessionId: session), route: route)
                 return true
@@ -214,9 +217,17 @@ extension iCloudBridge {
                     break
                 }
             }
-            var response = ChatResponse(runId: message.id, model: "", output: "There's no saved answer waiting to be delivered.", sessionId: session, terminalState: .completed)
+            var response = ChatResponse(
+                runId: message.id,
+                model: "",
+                output: "There's no saved answer waiting to be delivered.",
+                sessionId: session,
+                terminalState: .completed)
             if let originalRun, !originalRun.isEmpty {
-                guard let saved = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: originalSession, runId: originalRun) else { return false }
+                guard let saved = try await SwiftNativeChatOrchestrationClient.savedReply(
+                    dataRoot: dataRoot,
+                    sessionId: originalSession,
+                    runId: originalRun) else { return false }
                 response = saved
                 response.runId = message.id
             }
@@ -262,7 +273,6 @@ extension iCloudBridge {
             attachments: attachments.isEmpty ? nil : attachments,
             timestamp: timestamp ?? Date()
         )
-        // Sign every outgoing envelope with the pairing secret.
         let (secret, signed) = try await sync.storage.perform {
             let secret = try PairingSecret.loadOrGenerateSecret()
             return (secret, try unsigned.signed(with: secret))
@@ -277,7 +287,11 @@ extension iCloudBridge {
             let verdict = try await Self.replyVerdict(correlationID: correlationID, runID: runID, dataRoot: root)
             if verdict == "completed" { return signed }
             if verdict != nil, !FileManager.default.fileExists(atPath: Self.chatURL(messageID, dataRoot: root).path) {
-                throw DeviceSyncSendOutcomeUnknown(message: "The retained reply has no original signed envelope; reconcile its server/phone evidence before resubmission. Its checkpoint remains owed.")
+                throw DeviceSyncSendOutcomeUnknown(
+                    message: """
+                        The retained reply has no original signed envelope; reconcile its server/phone evidence before resubmission. Its checkpoint remains \
+                        owed.
+                        """)
             }
         }
         let msg: BridgeMessage
@@ -293,11 +307,7 @@ extension iCloudBridge {
             operation = "message \(msg.id)"
         }
 
-        // CK-3b: CloudKit transport path. The signed BridgeMessage rides verbatim
-        // in the record's payloadJSON (lossless — signature preserved), so iOS
-        // verifies with the same secret exactly as on the Drive path. The shared
-        // codec rejects an oversized encoded record before CloudKit sees it,
-        // producing a clear user-facing error instead of an opaque server failure.
+        // Preserve signed payloadJSON verbatim for phone verification; reject oversized records before CloudKit's opaque server failure.
         if let ck = deviceTransport {
             do {
                 try requireDeliveryAdmission()
@@ -338,16 +348,14 @@ extension iCloudBridge {
             } catch {
                 throw DeviceSyncSendOutcomeUnknown(message: "CloudKit accepted the message, but local settlement failed: " + error.localizedDescription)
             }
-            // A foreground wake is optional; CloudKit has already accepted the
-            // envelope. One conflated worker nudges without holding its caller.
+            // CloudKit acceptance permits an optional wake; conflate nudges without holding the caller.
             enqueueMessageNudge(msg.id)
                 lastSyncAt = Date()
             syncStatus = "CloudKit accepted message — waiting for iOS"
             return msg
         }
 
-        // Ordinary alerts belong to CloudKit's visible subscription. A Drive
-        // publication cannot produce that alert and must not claim it was queued.
+        // Drive cannot render CloudKit's visible-subscription alert, so it cannot claim one was queued.
         if metadata?["kind"] == "notification", metadata?["userInfo.source"] != "requested_result" {
             throw DeviceSyncError.notConfigured
         }
@@ -398,7 +406,6 @@ extension iCloudBridge {
             throw DeviceSyncSendOutcomeUnknown(message: "The iCloud file was committed, but its local receipt failed: " + error.localizedDescription)
         }
 
-        // KVS trigger: notify iOS side that a new file is waiting in Drive
         enqueueMessageNudge(msg.id)
         if metadata?["kind"] != "text_delta" {
             await scheduleDeliveryNudges(for: msg.id)
@@ -424,9 +431,7 @@ extension iCloudBridge {
         return try unsigned.signed(with: secret)
     }
 
-    /// Return the existing MacSyncEngine-signed action response over CloudKit.
-    /// Trust/dispatch/receipt ownership stays in MacSyncEngine; BridgeMessage
-    /// contributes transport HMAC, correlation, ordering, and retry semantics.
+    /// MacSyncEngine keeps action and receipt ownership; BridgeMessage adds only signed transport semantics.
     func sendCloudKitActionResponse(
         _ response: [String: String],
         correlationID: String
@@ -451,9 +456,7 @@ extension iCloudBridge {
             lastSyncAt = Date()
             syncStatus = "Sent action response via CloudKit"
         } catch {
-            // Do not leave a prior green send painted as current health. The
-            // durable response remains available to MacSync for a restart-safe
-            // resend, but the bridge state must say that this attempt failed.
+            // Retained responses permit restart-safe resend, but a failed attempt must replace prior healthy bridge status.
             syncStatus = "CloudKit action response waiting to resend: \(error.localizedDescription)"
             await recordSendResult(operation: "action response \(correlationID)", error: error)
             throw error

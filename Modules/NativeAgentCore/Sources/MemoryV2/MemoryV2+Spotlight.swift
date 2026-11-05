@@ -3,21 +3,12 @@ import PersistenceCore
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 import NativeAgentShared
-// Blueprint: | `MemoryV2+Spotlight.swift` | Canonical generation-proven rebuild shared by launch and repair, serialized with incremental Spotlight projections; native searchable-item expiration follows canonical valid_to without a timer; isolated roots never alter system Spotlight |
+// Blueprint: | `MemoryV2+Spotlight.swift` | generation-proven rebuilds and serialized projection |
 #endif
 
 // MARK: - Core Spotlight indexer for memory records.
-//
-// Carves:
-//   * QUERYING Spotlight from within the app (CSUserQuery / CSSearchQuery)
-//     is OUT OF SCOPE here — in-app recall goes through
-//     SwiftNativeMemoryV2.recall. System Spotlight (cmd+space) surfaces
-//     items automatically once they're indexed.
-//   * On platforms without CoreSpotlight (Linux / CI), the system backend
-//     is unavailable; tests use MockSpotlightIndexClient.
-//   * CSSearchableItemAttributeSet has dozens of richer fields
-//     (location/image/contact/...) — only title / contentDescription /
-//     keywords are wired here.
+// System Spotlight surfaces indexed items; in-app recall stays with MemoryV2. Keep title, description and keywords as the indexed projection; unavailable
+// platforms expose no system backend.
 
 public struct SpotlightItem: Sendable, Codable, Equatable {
     public let id: String
@@ -93,10 +84,7 @@ public actor MockSpotlightIndexClient: SpotlightIndexClient {
 }
 
 // MARK: - SwiftNativeMemoryIndexer
-//
-// Maps memory records to Spotlight's title, description and keywords.
-/// .spotlight_reindexed is this owner's generation fingerprint: local
-/// backup/export and memory PrivacyMap, never phone sync.
+/// .spotlight_reindexed is this owner's generation fingerprint: local backup/export and memory PrivacyMap, never phone sync.
 public actor SwiftNativeMemoryIndexer {
     public static let defaultDomain = "memory.nativeagent"
     private let client: any SpotlightIndexClient
@@ -181,10 +169,7 @@ extension SwiftNativeMemoryIndexer {
         let marker = markerURL(dataRoot: dataRoot)
         let snapshot = try await storage.spotlightSnapshot()
 
-        // Delete the old proof BEFORE clearing the derived index. A crash
-        // or failure after clearing must read as unconfirmed rather
-        // than reporting the old SQLite count over an empty Spotlight
-        // domain.
+        // Delete generation proof before clearing the index so interruption cannot report a confirmed count over an empty domain.
         try clearMarker(at: marker)
 
         try await client.deleteAll(domainIdentifier: defaultDomain)
@@ -192,9 +177,7 @@ extension SwiftNativeMemoryIndexer {
 
         let completedGeneration = try await storage.spotlightSnapshot().fingerprint
         guard completedGeneration == snapshot.fingerprint else {
-            // A concurrent canonical write makes this batch stale. There
-            // is intentionally no marker. The queued incremental operations
-            // repair this batch next; a future rebuild uses the new generation.
+            // A racing canonical write leaves the batch unconfirmed; queued mutations repair it and the next rebuild uses the new generation.
             return .changedDuringReindex
         }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(
@@ -229,8 +212,7 @@ extension SwiftNativeMemoryIndexer {
             return SystemSpotlightIndexClient()
         }
         #endif
-        // An injected/test root must not replace the user's system Spotlight
-        // domain merely because the UI is hosted in this app process.
+        // Isolated data roots must never replace the user's system Spotlight domain.
         return MockSpotlightIndexClient()
     }
 }

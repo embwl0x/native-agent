@@ -5,8 +5,6 @@ import PersistenceCore
 import NativeAgentCore
 // Blueprint: | `NativeAgentA2AWire.swift` | A2A bindings use contact task workers and a dedicated gRPC listener; turns execute through shared chat |
 
-/// The name peers see for this agent: the persona's own name, or "the agent"
-/// when no persona name is set.
 public enum PeerFacingIdentity {
     public static var agentName: String {
         let name = PersonaCompiler.agentDisplayName()
@@ -14,18 +12,14 @@ public enum PeerFacingIdentity {
     }
 }
 
-/// A2A 1.0/0.3 bindings use contact task workers and a dedicated gRPC listener;
-/// turns execute through the shared chat runtime.
+/// Every A2A binding uses shared contact task workers and the canonical chat runtime.
 public enum NativeAgentA2AWire {
     // rpcID is restricted by parse to immutable String/NSNumber values.
     public struct Send: @unchecked Sendable {
         let rpcID: Any
         let context: String
         let request: String
-        /// The CALLER's own `messageId`, kept rather than discarded: `request`
-        /// below is a freshly minted server UUID and so is unique on every
-        /// resend, which makes it useless as a replay identity. This is the id
-        /// `AgentPeerReplayClaimStore` claims.
+        /// Use the caller’s messageId for replay protection; fresh server request UUIDs cannot identify retries.
         let clientMessageID: String
         var parts: [AgentContactPart] = []
         var streaming = false
@@ -33,6 +27,8 @@ public enum NativeAgentA2AWire {
         var continuedTask: String?
         var acceptedOutputModes = ["*/*"]
         var pushConfig: JSONValue?
+        /// Set when the message's skill is the job.
+        var job: AgentContactJob?
         var taskID: String { "na3.\(context).\(request)" }
 
         public init(rpcID: Any, context: String, request: String, clientMessageID: String,
@@ -158,7 +154,33 @@ public enum NativeAgentA2AWire {
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || decodedParts.contains(where: { $0.isAttachment }) else {
                 return .response(error(id, -32602, "Provide text or an attachment; text is limited to 64000 bytes"))
             }
+            // The skill rides in the message's metadata: {"skill": "conversation" | "job", "done": "<what will be true when it is done>"}.
+            let metadata = message["metadata"] as? [String: Any] ?? [:]
+            let skill: String
+            if let raw = metadata["skill"] {
+                guard let named = raw as? String, ["conversation", AgentContactJob.skill].contains(named) else {
+                    return .response(error(id, -32602, "skill must be conversation or job"))
+                }
+                skill = named
+            } else { skill = "conversation" }
+            var job: AgentContactJob?
+            if skill == AgentContactJob.skill {
+                var done: String?
+                if let raw = metadata["done"] {
+                    guard let value = raw as? String, value.utf8.count <= AgentContactJob.maximumDoneBytes else {
+                        return .response(error(id, -32602, "done must be text of at most \(AgentContactJob.maximumDoneBytes) bytes"))
+                    }
+                    done = value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : value
+                }
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return .response(error(id, -32602, "A job needs its brief as message text"))
+                }
+                job = AgentContactJob(done: done)
+            } else if metadata["done"] != nil {
+                return .response(error(id, -32602, "done belongs to the job skill"))
+            }
             var send = Send(rpcID: id, context: context, request: UUID().uuidString.lowercased(), clientMessageID: messageID, parts: decodedParts)
+            send.job = job
             send.streaming = method == "message/stream" || method == "SendStreamingMessage"
             send.blocking = blocking
             send.continuedTask = message["taskId"] as? String
@@ -202,13 +224,17 @@ public enum NativeAgentA2AWire {
                      grpcPort: UInt16? = nil) -> [String: Any] {
         let agent = agentName ?? PeerFacingIdentity.agentName
         var card: [String: Any] = ["protocolVersion": "0.3.0", "name": agent, "version": "1.0.0",
-         "description": "Talk, share files and receive replies as they are written. Reconnect to ongoing work or cancel it. Permission cards stay with the person. Files use embedded bytes; links are not fetched. Access is local and requires a key. Tasks are retained for this app run, up to 128 tasks. Push notifications are not available.",
+         "description": """
+             Talk, hand over jobs for files back, share files and receive replies as they are written. Reconnect to ongoing work or cancel it. \
+             Permission cards stay with the person. Files use embedded bytes; links are not fetched. Access is local and requires a key. Tasks \
+             are retained for this app run, up to 128 tasks. Push notifications are not available.
+             """,
          "url": "http://127.0.0.1:\(port)/a2a", "preferredTransport": "JSONRPC",
          "capabilities": ["streaming": true, "pushNotifications": false],
          "defaultInputModes": AgentContactPart.inputModes, "defaultOutputModes": ["text/plain", "application/json", "application/octet-stream"],
          "securitySchemes": ["bridgeBearer": ["type": "http", "scheme": "bearer"]],
          "security": [["bridgeBearer": [String]()]],
-         "skills": [["id": "conversation", "name": "Talk with \(agent)", "description": "Full persona, memory retrieval, Fluid Context and persistent conversation history with ordinary tool permission gates", "tags": ["conversation"]]]]
+         "skills": skills(agent: agent, extended: false)]
         if version == "1.0" {
             card.removeValue(forKey: "protocolVersion")
             card.removeValue(forKey: "url")
@@ -224,15 +250,39 @@ public enum NativeAgentA2AWire {
                 card["supportedInterfaces"] = interfaces
             }
             card["capabilities"] = ["streaming": true, "pushNotifications": true, "extendedAgentCard": true]
-            card["description"] = "Talk, share embedded files, stream replies, list retained tasks or cancel work. Authenticated local access; outbound push supports validated webhooks. This listener stays loopback-only; remote peers use polling or streaming."
+            card["description"] = """
+                Talk, hand over jobs for files back, share embedded files, stream replies, list retained tasks or cancel work. Authenticated local \
+                access; outbound push supports validated webhooks. This listener stays loopback-only; remote peers use polling or streaming.
+                """
             card["securitySchemes"] = ["bridgeBearer": ["httpAuthSecurityScheme": ["scheme": "bearer"]]]
             card["securityRequirements"] = [["schemes": ["bridgeBearer": ["list": [String]()]]]]
         }
         if version == "0.3" { card["supportsAuthenticatedExtendedCard"] = true }
         if extended {
-            card["skills"] = [["id": "conversation", "name": "Talk with \(agent)",
-                "description": "Persistent peer conversations with persona, memory retrieval and ordinary tool permissions. Permission cards stay with the person. Embedded files only; file links are not fetched. Task listing covers this app run's bounded 128-task index; history is not exported.", "tags": ["conversation", "files", "tasks"]]]
+            card["skills"] = skills(agent: agent, extended: true)
         }
         return card
+    }
+    /// Every message is a conversation unless its metadata names the job skill.
+    private static func skills(agent: String, extended: Bool) -> [[String: Any]] {
+        let conversation: [String: Any] = extended
+            ? ["id": "conversation", "name": "Talk with \(agent)",
+                "description": """
+                    Persistent peer conversations with persona, memory retrieval and ordinary tool permissions. Permission cards stay with the \
+                    person. Embedded files only; file links are not fetched. Task listing covers this app run's bounded 128-task index; history is \
+                    not exported.
+                    """, "tags": ["conversation", "files", "tasks"]]
+            : ["id": "conversation", "name": "Talk with \(agent)",
+                "description": "Full persona, memory retrieval, Fluid Context and persistent conversation history with ordinary tool permission gates",
+                "tags": ["conversation"]]
+        let job: [String: Any] = ["id": AgentContactJob.skill, "name": "Give \(agent) a job",
+            "description": """
+                Hand over work and get files back. Send the brief as the message text, optional input files as embedded file parts, and set the message \
+                metadata to {"skill": "job", "done": "what will be true when it is done"}; done is optional. The task completes with artifacts: one \
+                per file made for the job, plus a report artifact holding the written reply. A job runs under the same permissions as a conversation, \
+                and permission cards stay with the person.
+                """, "tags": ["job", "files", "artifacts"],
+            "inputModes": AgentContactPart.inputModes, "outputModes": ["text/plain", "application/json", "application/octet-stream"]]
+        return [conversation, job]
     }
 }

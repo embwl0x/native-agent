@@ -1,50 +1,37 @@
-// Read canonical memory.sqlite through the owning MemoryStorage pool.
-// Missing and unreadable canonical storage throw.
-// Reconstruct the JSONValue envelopes KnowledgeGraphStore readers expect.
+// Read canonical memory.sqlite through the owning MemoryStorage pool. Missing and unreadable canonical storage throw. Reconstruct the JSONValue envelopes
+// KnowledgeGraphStore readers expect.
 
 import Foundation
 import NativeAgentShared
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `KnowledgeGraph+SQLite.swift` | Checked canonical prepared-pool boundary and shared strict entity/edge serialization; batched entity reads retain relationship limits and fail on source damage |
+// Blueprint: | `KnowledgeGraph+SQLite.swift` | checked canonical SQLite reads and strict bounded graph serialization |
 
-/// Typed empty-vs-error result classes for the SQLite KG load path.
 public enum KnowledgeGraphSQLiteLoadError: Error, Sendable {
-    /// The canonical memory database has not been created.
     case databaseMissing(String)
-    /// memory.sqlite EXISTS but could not be opened or read. This is an
-    /// ERROR state: the caller must surface it, not fabricate healthy-empty.
+    /// Existing unreadable storage is an error, never a healthy empty graph.
     case unreadable(path: String, detail: String)
 }
 
 extension KnowledgeGraphStore {
 
-    /// Ordinary graph pages are fixed at the retired route's 100-row size.
     public static let sqlitePageSize = 100
-    /// Search is a prompt/UI projection, not an export surface. Candidate SQL
-    /// is capped before Swift applies the deterministic ranker.
+    /// Search is a prompt/UI projection, not an export surface. Candidate SQL is capped before Swift applies the deterministic ranker.
     public static let sqliteSearchCandidateLimit = 2_000
     public static let sqliteSearchQueryMaximumBytes = 4 * 1_024
     public static let sqliteSearchQueryMaximumTokens = 32
-    /// A malformed or hub-like graph must not turn one page/entity read into an
-    /// unbounded prompt/UI payload. Complete snapshots retain the full edge set.
+    /// A malformed or hub-like graph must not turn one page/entity read into an unbounded prompt/UI payload. Complete snapshots retain the full edge set.
     public static let sqliteIncidentEdgeLimit = 2_000
     public static let sqliteCompleteSnapshotRelationshipLimit = 100_000
 
-    /// The "now" the SQL recency ordering compares `last_seen` against, rendered
-    /// in the same ISO-8601 shape the indexer writes so the comparison is a
-    /// plain lexicographic one. Stored values carry either a `Z` or a `+00:00`
-    /// suffix; those differ only after the seconds field, so ordering by string
-    /// agrees with ordering by instant everywhere except a sub-second tie, which
-    /// no ranking decision rests on.
+    /// Use the indexer's ISO-8601 shape for lexicographic recency ordering; Z and +00:00 differ only after seconds, and ranking never depends on a subsecond
+    /// tie.
     static func orderingTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalZulu(date)
     }
 
-    /// Read one bounded page directly from SQLite. The entity count, page rows,
-    /// incident edges, and edge total share one GRDB read transaction, so the
-    /// envelope cannot mix graph generations.
+    /// Read counts, rows and incident edges in one transaction so the envelope cannot mix graph generations.
     public static func pageFromMemoryV2(
         memoryDir: URL,
         page: Int
@@ -111,10 +98,7 @@ extension KnowledgeGraphStore {
         }
     }
 
-    /// Read only SQL candidates that can satisfy the name/alias/summary
-    /// matcher, then apply the exact Swift ranker to those rows. The SQL cap is
-    /// deliberately much larger than every shipped consumer's result cap
-    /// (10–50) while preventing a generic query from materializing the graph.
+    /// Prefilter by the same matcher before exact Swift ranking; cap well above shipped result limits to bound generic queries.
     public static func searchFromMemoryV2(
         memoryDir: URL,
         query: String,
@@ -144,15 +128,14 @@ extension KnowledgeGraphStore {
             memoryDir: memoryDir
         ) { pool in
             try await pool.read { db in
-                // GRDB's built-in function uses the same Unicode lowercasing
-                // as the Swift ranker; SQLite lower() only folds ASCII.
+                // GRDB's built-in function uses the same Unicode lowercasing as the Swift ranker; SQLite lower() only folds ASCII.
                 let haystack = "swiftLowercaseString(coalesce(name, '') || ' ' || coalesce(aliases_json, '') || ' ' || coalesce(summary, ''))"
                 let nameHaystack = "swiftLowercaseString(coalesce(name, '') || ' ' || coalesce(aliases_json, ''))"
                 let clauses = Array(repeating: "instr(\(haystack), ?) > 0", count: needles.count)
                     .joined(separator: " OR ")
                 var arguments: [DatabaseValueConvertible] = needles
-                // Before the candidate cap, order by match class, recency, then id so weaker matches cannot displace stronger ones.
-                // Clamp missing, future and malformed timestamps to oldest, matching the Swift reranker's recency rule.
+                // Before the candidate cap, order by match class, recency, then id so weaker matches cannot displace stronger ones. Clamp missing, future and
+                // malformed timestamps to oldest, matching the Swift reranker's recency rule.
                 arguments.append(qLower)
                 arguments.append(qLower)
                 arguments.append(Self.orderingTimestamp(now))
@@ -188,16 +171,14 @@ extension KnowledgeGraphStore {
                     entityOrder: order
                 )
                 return .object([
-                    // Both ranking stages share ONE clock, so a row can never be
-                    // "fresh" to the prefilter and "future" to the reranker.
+                    // Both ranking stages share ONE clock, so a row can never be "fresh" to the prefilter and "future" to the reranker.
                     "results": .array(candidates.searchEntities(query, now: now))
                 ])
             }
         }
     }
 
-    /// Read one entity, its incident edges, and its neighbors in one bounded
-    /// transaction. Unknown ids are explicit; unreadable SQLite propagates.
+    /// Read one entity, its incident edges, and its neighbors in one bounded transaction. Unknown ids are explicit; unreadable SQLite propagates.
     public static func entityFromMemoryV2(
         memoryDir: URL,
         id: String
@@ -283,9 +264,7 @@ extension KnowledgeGraphStore {
         ]))
     }
 
-    /// Materialize the canonical export/iCloud projection in exactly one GRDB
-    /// read transaction. `maxPages` retains the prior safety contract while
-    /// avoiding hundreds of separately versioned page reads.
+    /// Materialize the complete export/iCloud projection in one read transaction so pages cannot mix generations; retain the `maxPages` safety bound.
     public static func completeSnapshotFromMemoryV2(
         memoryDir: URL,
         maxPages: Int,
@@ -297,8 +276,7 @@ extension KnowledgeGraphStore {
             memoryDir: memoryDir
         ) { pool in
             try await pool.read { db in
-                // The audience decision and graph rows share this read
-                // transaction; a concurrent privacy edit cannot split them.
+                // The audience decision and graph rows share this read transaction; a concurrent privacy edit cannot split them.
                 let disclosure: KnowledgeGraphMemoryDisclosure?
                 if let surface {
                     let records = try Row.fetchAll(db, sql: "SELECT * FROM memories")
@@ -434,8 +412,7 @@ extension KnowledgeGraphStore {
         for (key, value) in metadata where object[key] == nil {
             object[key] = value
         }
-        // Presentation reads are bounded; audits read the complete SQLite
-        // citations directly rather than this display projection.
+        // Presentation reads are bounded; audits read the complete SQLite citations directly rather than this display projection.
         if object["from"] != nil, case .array(let citations)? = object["studio_entry_ids"] {
             object["studio_entry_ids"] = .array(Array(citations.prefix(24)))
             object["studio_entry_count"] = .int(Int64(citations.count))

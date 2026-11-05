@@ -18,7 +18,7 @@ import AppKit
 import Carbon
 #endif
 
-// Blueprint: | `MacPointer.swift` | `MacMouseEvent`, `MacScrollEvent` and `AgentPointerHold`: pointer/scroll event values and bounded ownership restoring the person's cursor after agent input |
+// Blueprint: | `MacPointer.swift` | `MacMouseEvent`, `MacScrollEvent`, `AgentPointerHold`: Bounded pointer ownership restores the person's cursor |
 
 public enum MacMouseButton: String, Sendable, Equatable {
     case left
@@ -73,9 +73,8 @@ public struct MacScrollEvent: Sendable, Equatable {
 
 /// Unhook the person's mouse during agent pointer actions, then restore its cursor; held buttons defer release only up to `cap`.
 enum AgentPointerHold {
-    /// Idle time after her last pointer event that ends the action.
     static let settle: TimeInterval = 1.0
-    /// The longest the person's mouse is ever unhooked for one action.
+    /// Bound the time the person’s mouse can remain unhooked.
     static let cap: TimeInterval = 15
 
     private static let lock = NSLock()
@@ -94,10 +93,7 @@ enum AgentPointerHold {
         return agentPoint
     }
 
-    /// Before her pointer event. Starting an action notes the person's cursor
-    /// and unhooks their mouse; `warpTo` then puts the cursor on her point
-    /// (a scroll is routed by where the cursor is). Returns where the cursor
-    /// now is for her.
+    /// Save the person’s cursor before unhooking; scroll delivery follows the agent’s actual cursor position.
     @discardableResult
     static func begin(warpTo point: CGPoint?) -> CGPoint? {
         let now = ProcessInfo.processInfo.systemUptime
@@ -126,8 +122,7 @@ enum AgentPointerHold {
         return point ?? current
     }
 
-    /// After her event: where her pointer is, and whether a button is down.
-    /// Her pointer is shown there (Shotgun's overlay).
+    /// Keep the pointer overlay aligned with emitted input and held-button state.
     static func posted(phase: MacMousePhase?, at point: CGPoint) {
         lock.lock()
         lastPost = ProcessInfo.processInfo.systemUptime
@@ -139,17 +134,14 @@ enum AgentPointerHold {
         PersonOnlyWindows.noteAgentPointer(at: point, pressed: phase == .down)
     }
 
-    /// Posts move the one deadline. A held button waits for its up event or
-    /// the original cap; it never asks a timer whether the button is still down.
+    /// Posts move one deadline; held buttons wait only for release or the original cap, without polling.
     private static func scheduleReleaseLocked() {
         guard held else { return }
         let due = buttonsDown > 0 ? startedAt + cap : min(startedAt + cap, lastPost + settle)
         releaseTimer?.schedule(deadline: .now() + max(0, due - ProcessInfo.processInfo.systemUptime))
     }
 
-    /// The action is over: the person's cursor goes back and their mouse is
-    /// hooked up again. A callback queued before a post re-arms only to the
-    /// new exact deadline, never a sampling interval.
+    /// A stale callback rearms to the newest exact deadline; final release restores the person’s cursor and mouse.
     private static func releaseIfIdle(chain: Int) {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
@@ -160,8 +152,7 @@ enum AgentPointerHold {
             lock.unlock()
             return
         }
-        // Under the lock: a new action of hers can't begin between the
-        // person's cursor going back and their mouse being hooked up again.
+        // Hold the lock across restoration so another action cannot begin between cursor return and mouse reattachment.
         held = false
         releaseTimer?.cancel()
         releaseTimer = nil

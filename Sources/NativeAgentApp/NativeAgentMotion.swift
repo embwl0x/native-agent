@@ -1,10 +1,9 @@
 import AppKit
 import SwiftUI
 
-// Blueprint: | `NativeAgentMotion.swift` | `NativeAgentMotion`: shared timing/arrival transitions with Reduce Motion-aware layout and retained opacity crossfades |
+// Blueprint: | `NativeAgentMotion.swift` | `NativeAgentMotion`: shared transitions; Reduce Motion stops layout, retains fades |
 
-/// Shared timing and transitions. Layout changes stop under Reduce Motion;
-/// opacity transitions keep their own animation so content still crossfades.
+/// Reduce Motion stops layout interpolation while opacity keeps content transitions legible.
 enum NativeAgentMotion {
     static let quickDuration = 0.12
     static let standardDuration = 0.28
@@ -22,23 +21,21 @@ enum NativeAgentMotion {
     static var spring: Animation? {
         respecting(.spring(response: springDuration, dampingFraction: 0.88), reduceMotion: reducesMotion)
     }
-    /// Smooth, zero-bounce layout motion for the composer tray; off under Reduce Motion.
+    /// Reduce Motion disables layout motion without disabling fades.
     static var glide: Animation? {
         respecting(.smooth(duration: springDuration), reduceMotion: reducesMotion)
     }
-    /// A message arrives in the transcript over a 180ms timing curve.
     static let arrivalCurve = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.18)
     static var arrive: Animation? {
         respecting(arrivalCurve, reduceMotion: reducesMotion)
     }
     /// Opacity stays animated when Reduce Motion removes layout interpolation.
     static var arrivalFade: AnyTransition { .opacity.animation(arrivalCurve) }
-    /// The reply's live, settled and folded phases share its arrival rhythm.
+    /// Reply phases share the arrival rhythm so transitions stay coherent.
     static var replyDissolve: AnyTransition { arrivalFade }
     static let breatheDuration = standardDuration * 5
     static let breathe = Animation.easeInOut(duration: breatheDuration)
-    /// Where a repeating motion is in its loop, 0..<1, read from the clock. Repeating
-    /// motion is drawn from a TimelineView, never SwiftUI's repeatForever (10-31 crash).
+    /// Read the clock through TimelineView; repeatForever can crash during repeating motion.
     static func loopPhase(at date: Date, period: TimeInterval) -> CGFloat {
         CGFloat(date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period) / period)
     }
@@ -54,13 +51,10 @@ enum NativeAgentMotion {
         .asymmetric(insertion: fade, removal: .opacity.animation(.easeIn(duration: standardDuration)))
     }
 
-    /// A page or transcript swapped in place: the old goes in the same frame
-    /// and only the new fades in, so two translucent layers of text never
-    /// draw over each other.
+    /// Remove the old page immediately so translucent text layers never overlap.
     static var fadeIn: AnyTransition { .asymmetric(insertion: fade, removal: .identity) }
 
-    /// A small row swapped in place: the old leaves first, then the new comes
-    /// in, so two one-line rows never draw over each other.
+    /// Remove the old row before inserting the new one so their text never overlaps.
     static var fadeThrough: AnyTransition {
         .asymmetric(
             insertion: .opacity.animation(.easeOut(duration: quickDuration).delay(quickDuration)),
@@ -91,7 +85,6 @@ private struct MotionArrival: ViewModifier {
 }
 
 extension View {
-    /// A newly mounted onboarding step fades in once.
     func motionArrival() -> some View {
         modifier(MotionArrival())
     }

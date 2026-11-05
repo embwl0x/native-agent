@@ -11,7 +11,6 @@ public struct ChatUpdateNoteRecord: Codable, Equatable, Sendable {
     public var to: String
     public var createdAt: String
     public var note: String
-    /// Stamped when the note has been put in front of the agent once.
     public var deliveredAt: String?
 
     public init(from: String, to: String, createdAt: String, note: String, deliveredAt: String? = nil) {
@@ -24,8 +23,7 @@ public struct ChatUpdateNoteRecord: Codable, Equatable, Sendable {
 }
 
 public enum ChatUpdateNote {
-    /// A note nobody ever collected stops being news. Without this, an app that
-    /// is updated while it is closed for a month would open with a stale note.
+    /// Expire uncollected notes so a long-closed app does not announce stale updates.
     public static let retentionSeconds: TimeInterval = 7 * 24 * 60 * 60
 
     public static func recordURL(dataRoot: URL) -> URL {
@@ -42,13 +40,14 @@ public enum ChatUpdateNote {
         guard ISO8601DateFormatter().date(from: record.createdAt) != nil,
               record.deliveredAt == nil || record.deliveredAt.flatMap({ ISO8601DateFormatter().date(from: $0) }) != nil,
               !record.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw ToolFailureError("The saved update note has an invalid timestamp or empty text. Repair context/update_note.json; its bytes are preserved.", effects: .none, owner: "context/update_note.json", recovery: .repair)
+            throw ToolFailureError("""
+                The saved update note has an invalid timestamp or empty text. Repair context/update_note.json; its bytes \
+                are preserved.
+                """, effects: .none, owner: "context/update_note.json", recovery: .repair)
         }
         return record
     }
 
-    /// The note to put in this turn's context, or nil when there is nothing to
-    /// say: no record, already delivered, empty, or past retention.
     public static func pendingNote(dataRoot: URL, now: Date = Date()) throws -> String? {
         guard let record = try load(dataRoot: dataRoot) else { return nil }
         guard record.deliveredAt == nil else { return nil }
@@ -69,7 +68,10 @@ public enum ChatUpdateNote {
             RepairOwed.settle(dataRoot, operation: "update_note.delivered", evidence: .init(source: "context/update_note.json", id: record.to))
         } catch {
             RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "update_note.delivered", owner: "context/update_note.json",
-                words: "The provider accepted the update note, but its delivery stamp could not be saved: \(error.localizedDescription). Repair the note store before consuming it again.")
+                words: """
+                    The provider accepted the update note, but its delivery stamp could not be saved: \(error.localizedDescription). Repair the note \
+                    store before consuming it again.
+                    """)
             throw error
         }
     }
@@ -83,8 +85,7 @@ public enum ChatUpdateNote {
 }
 
 public enum ChatUpdateNoteDecision: Equatable, Sendable {
-    /// No version was ever stored. A fresh install is NOT an update and gets no
-    /// note — the first-run greeting already owns that moment.
+    /// A fresh install is not an update; the first-run greeting owns that moment.
     case freshInstall(version: String)
     case unchanged(version: String)
     case updated(from: String, to: String)
@@ -92,14 +93,11 @@ public enum ChatUpdateNoteDecision: Equatable, Sendable {
 }
 
 extension ChatUpdateNote {
-    /// Persisted "last launched version". One key, written after the decision.
+    /// Write the stored version only after deciding whether this launch is an update.
     public static let lastLaunchedVersionDefaultsKey = "NativeAgentLastLaunchedVersion"
 
-    /// The whole note is capped so one update cannot swallow a turn's context.
-    /// Anything trimmed is still on disk, and the note says where. The ceiling
-    /// is well under the context projection's 4 KiB per-atom body gate, which
-    /// silently DROPS an oversized atom — a too-generous cap here would mean no
-    /// note at all after a big release.
+    /// Keep the whole note below the context projection's 4 KiB atom gate so oversized updates cannot disappear.
+    /// Leave trimmed detail on disk and include its location.
     public static let maximumNoteCharacters = 3200
 
     public static let bundledNotesRelativeDirectory = "docs/release-notes"
@@ -112,8 +110,7 @@ extension ChatUpdateNote {
         return .updated(from: stored, to: current)
     }
 
-    /// Numeric dot-component compare, so 0.4.10 sorts after 0.4.9 (a string
-    /// compare gets that backwards, which would drop the newest note).
+    /// Compare numeric components so 0.4.10 sorts after 0.4.9.
     public static func versionIsLessThan(_ lhs: String, _ rhs: String) -> Bool {
         let a = components(lhs)
         let b = components(rhs)
@@ -134,9 +131,7 @@ extension ChatUpdateNote {
             }
     }
 
-    /// Versions to include, oldest first: everything newer than the stored
-    /// version up to and including the current one. A downgrade or an unknown
-    /// current version still reports the current version if a note exists.
+    /// Select notes in ascending version order; an unknown or downgraded current version still names its available note.
     public static func versionsToReport(
         from stored: String,
         to current: String,
@@ -154,9 +149,7 @@ extension ChatUpdateNote {
         return window
     }
 
-    /// The note, in plain words. The closing line is the whole point of the
-    /// quiet channel: the agent may use this when asked or when it fits, and is
-    /// told NOT to announce it on its own.
+    /// The note is context for relevant replies, never an invitation to announce the update unprompted.
     public static func compose(
         from: String,
         to: String,
@@ -186,8 +179,7 @@ extension ChatUpdateNote {
         return text
     }
 
-    /// Call once per launch. Returns what it decided so the caller (and tests)
-    /// can see it; writes a note ONLY for `.updated`.
+    /// Call once per launch; write a note only for an actual update.
     @discardableResult
     public static func recordLaunch(
         dataRoot: URL,
@@ -231,7 +223,6 @@ extension ChatUpdateNote {
 }
 
 extension ChatUpdateNote {
-    /// Versions whose notes ship inside this bundle.
     public static func bundledVersions(resources: URL?) throws -> [String] {
         let dir = try bundledNotesDirectory(resources: resources)
         let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
@@ -273,7 +264,10 @@ extension ChatUpdateNote {
         RepairOwed.settle(dataRoot, operation: "update_note.launch", evidence: .init(source: "context/update_note.json", id: currentVersion))
         return decision
         } catch {
-            let words = "The update note could not be prepared: \(error.localizedDescription). The launch version was not advanced; repair the bundled notes or note store and reopen the app."
+            let words = """
+                The update note could not be prepared: \(error.localizedDescription). The launch version was not advanced; repair the bundled notes \
+                or note store and reopen the app.
+                """
             RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "update_note.launch", owner: "context/update_note.json", words: words)
             nativeLog("[update-note] \(words)")
             return .unavailable(reason: words)

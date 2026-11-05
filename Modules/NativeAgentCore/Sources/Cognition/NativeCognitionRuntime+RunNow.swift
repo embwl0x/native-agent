@@ -1,24 +1,50 @@
 import BackgroundLoops
 import CognitiveSubstrate
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Privacy
 import Senses
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+RunNow.swift` | `MindClockVerb`, `MindClockResult` and the mind_run clock family: one-shot wait satisfaction, existing retained owner flights, exact owner outcomes and redacted correlated run-now traces; a 45-second reply bound reports pending while retained real work continues; all nine clock previews refuse before effectful admission with a specific cause; mindPreviewRefusal reads existing lifecycle/substrate readiness without bootstrap or waiting |
+// Blueprint: | `NativeCognitionRuntime+RunNow.swift` | `MindClockVerb`, `MindClockResult`. |
 
-/// An invocation's answer, not a second copy of an owner's state. Owners return
-/// the decision at the branch that made it, including unavailable evidence.
+/// Return the owner's actual branch decision, including unavailable evidence; keep no second state copy.
 public struct MindClockResult: Sendable {
     public var outcome: String
     public var why: String
     public var fields: [String: JSONValue]
+    /// What the pass produced, when the owner counts it: a pass that produced nothing beats `nothing`.
+    public var yield: Int?
+    /// The owner held only until its own time comes (a refractory, quiet wait, cooldown or timing gate it re-arms for): an automatic pass writes no beat.
+    public var waits = false
     public var ok: Bool { !["failed", "error", "unavailable", "unweighed", "not_kept", "pending", "preview_refused"].contains(outcome) }
 
-    public init(_ outcome: String, _ why: String, fields: [String: JSONValue] = [:]) {
-        self.outcome = outcome; self.why = why; self.fields = fields
+    public init(_ outcome: String, _ why: String, fields: [String: JSONValue] = [:], yield: Int? = nil) {
+        self.outcome = outcome; self.why = why; self.fields = fields; self.yield = yield
+    }
+
+    public static func waiting(_ why: String, fields: [String: JSONValue] = [:]) -> MindClockResult {
+        var result = MindClockResult("held", why, fields: fields)
+        result.waits = true
+        return result
+    }
+
+    /// Held because the owner is switched off; its beat carries the off prefix, so it is never felt.
+    public static func off(_ reason: String) -> MindClockResult {
+        .init("held", OrganPulse.offPrefix + reason)
+    }
+
+    /// The beat this decision is to its organ; nil for an answer still pending or a preview, which decide nothing.
+    public var pulseOutcome: OrganPulse.Outcome? {
+        guard outcome != "pending", fields["preview"] != .bool(true) else { return nil }
+        switch outcome {
+        case "held": return .held
+        case "stopped": return .stopped
+        case "nothing": return .nothing
+        default: return !ok ? .failed : yield == 0 ? .nothing : .worked
+        }
     }
 
     public var json: [String: JSONValue] {
@@ -37,19 +63,16 @@ public enum MindClockVerb: String, Sendable {
 }
 
 extension NativeCognitionRuntime {
-    /// Only the selected owner's scheduling wait is satisfied. All evidence,
-    /// expiry, readiness and person-facing policy reads keep the actual time.
+    /// Satisfy only the selected scheduling wait; evidence, expiry, readiness and person-facing policy use actual time.
     public func runClockNow(verb: MindClockVerb, input: [String: JSONValue]) async -> MindClockResult {
         if input["preview"] == .bool(true) {
-            // These owners interleave decisions with durable effects. Do not
-            // enter them, bootstrap, claim a flight or change a deadline just
-            // to discover that they cannot finish a read-only preview.
+            // Refuse preview before bootstrap, flight claims or deadlines because these owners interleave admission with durable effects.
             let why: String
             switch verb {
             case .canon: why = "Canon tending stages approval proposals inside its decision pass and records its audit."
             case .horizon: why = "Horizon composition updates source deadlines and refresh settles felt resolutions into the live organism."
-            case .rhythm: why = "His day refresh saves awake history before admitting and consuming pending care-felt breaks."
-            case .wander: why = "Her hour claims its real admission and runs an editable part with tools and settlement."
+            case .rhythm: why = "The person's day refresh saves awake history before admitting and consuming pending care-felt breaks."
+            case .wander: why = "The wander hour claims its real admission and runs an editable part with tools and settlement."
             case .reach: why = "Reach reconciles deliveries and lands care answers before selecting and saving an offer."
             case .carried: why = "Carried work settles owed deliveries, expires intentions and reconciles its wake ledger before selection."
             case .cross: why = "Crossing primes the mind and releases news intentions before weighing the line."
@@ -70,7 +93,7 @@ extension NativeCognitionRuntime {
         } else if isFlushedForTermination || Task.isCancelled {
             result = .init("held", "The runtime is stopping.")
         } else if !configuration.enabled {
-            result = .init("held", "Inner life is off; enable settings.inner_life before running this owner.")
+            result = .off("inner life is off; enable settings.inner_life before running this owner")
         } else {
             switch verb {
             case .canon:
@@ -94,7 +117,7 @@ extension NativeCognitionRuntime {
                     considerReach(runNow: true, reply: reply)
                 }
             case .carried:
-                result = await considerCarried(runNow: true).result
+                result = await considerCarried(runNow: true, besides: input["__session_id"]?.stringValue).result
             case .cross:
                 guard let line = input["line"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !line.isEmpty,
@@ -109,13 +132,13 @@ extension NativeCognitionRuntime {
                 case .woke(let care): result = .init("woke", "The line touched " + care + "; its ResidentWake was kept.", fields: fields)
                 case .untouched: result = .init("untouched", "The line did not touch a live care.", fields: fields)
                 case .unweighed: result = .init("unweighed", "The crossing could not weigh the line; no care verdict is available.", fields: fields)
-                case .resting(let care): result = .init("resting", "This watch already woke her about " + care + ".", fields: fields)
+                case .resting(let care): result = .init("resting", "This watch already woke the agent about " + care + ".", fields: fields)
                 case .notKept(let care): result = .init("not_kept", "The line touched " + care + ", but its ResidentWake was not kept.", fields: fields)
                 }
             case .maintenance:
                 result = Self.clockResult(await runMaintenance(reason: "mind.maintenance", runNow: true))
             case .residualRepair:
-                if liveTurnInFlight {
+                if liveTurnInFlight(besides: input["__session_id"]?.stringValue) {
                     result = .init("held", "A live turn is in flight.")
                 } else if await organismKernel.runResidualRepairIfDue(satisfyWait: true) {
                     let saved = await persistOrganismContinuity(reason: "residual_pressure_repair")
@@ -131,20 +154,18 @@ extension NativeCognitionRuntime {
         return result.fields["run_id"] != nil ? result : Self.recordClockRun(owner, result, runID: runID)
     }
 
-    /// Read the existing owners' admission state; a preview never opens her
-    /// mind, joins an unfinished restore or waits for a future readiness event.
+    /// Preview cannot bootstrap, join unfinished restore or wait for future readiness.
     public func mindPreviewRefusal() async -> String? {
         guard bootstrapTask != nil, organismContinuityReadable, !doorHeld else {
-            return "Her mind has not finished opening, or a lifecycle transition holds it. Preview did not wait or bootstrap it."
+            return "The agent's mind has not finished opening, or a lifecycle transition holds it. Preview did not wait or bootstrap it."
         }
         if let bootstrapFailure { return bootstrapFailure }
         guard !isFlushedForTermination, !Task.isCancelled else { return "The runtime is stopping." }
         return await substrate.carePreviewRefusal()
     }
 
-    /// Bound the action's observation, not the owner's work. A slow owner keeps
-    /// its retained flight and single-flight gate; its later answer is traced
-    /// with this same run id. Silence is pending, never completion or failure.
+    /// Bound observation only; retained work and single-flight ownership continue, with late answers traced to the same run.
+    /// Silence remains pending, never completion or failure.
     private func waitForClockOwner(_ verb: String, runID: String,
                                    start: (@escaping MindClockReply) -> Void) async -> MindClockResult {
         await withCheckedContinuation { continuation in
@@ -164,19 +185,23 @@ extension NativeCognitionRuntime {
         }
     }
 
+    /// The run trace is the reply's record; the owner beats the same decision as asked, except a switched-off owner, whose off words stay as they are.
     public nonisolated static func recordClockRun(_ verb: String, _ result: MindClockResult,
                                                  runID: String = UUID().uuidString.lowercased()) -> MindClockResult {
+        if let organ = MindClockVerb(rawValue: verb)?.organ, let outcome = result.pulseOutcome {
+            let off = outcome == .held && result.why.hasPrefix(OrganPulse.offPrefix)
+            OrganJudge.beat(organ, outcome, note: off ? result.why : "asked: " + result.why, yield: result.yield)
+        }
         var result = result
         result.fields["run_id"] = .string(runID)
         result.fields["owner"] = .string(verb)
         TurnTraceBus.fire(TurnTraceEvent(turnId: "run-now:" + runID, kind: "mind.run_now",
-            sessionId: "resident-wake", surface: "chat", payload: NativeAppSecretRedactor.redactValue(.object(result.json))))
+            sessionId: "resident-wake", surface: "chat", payload: NativeAppSecretRedactor.redactValue(.object(result.json)), turn: nil))
         return result
     }
 }
 
-/// Only an invocation's reply rendezvous lives here. All execution/state stays
-/// with the retained owner. The lock chooses exactly one continuation resume.
+/// Keep only the reply rendezvous here; the retained owner executes, and the lock permits exactly one continuation resume.
 private final class MindClockReplyGate: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<MindClockResult, Never>?
@@ -208,7 +233,11 @@ private final class MindClockReplyGate: @unchecked Sendable {
     private func expire() {
         lock.lock()
         let waiting = continuation; continuation = nil; deadline = nil
-        let reported = waiting.map { _ in publish(.init("pending", "The owner has not answered within 45 seconds. Its retained flight still owns the work; inspect this run_id for a later outcome before another attempt.")) }
+        let reported = waiting.map { _ in publish(.init("pending",
+            """
+                The owner has not answered within 45 seconds. Its retained flight still owns the work; inspect this run_id for a later outcome before another \
+                attempt.
+                """)) }
         lock.unlock()
         if let reported { waiting?.resume(returning: reported) }
     }

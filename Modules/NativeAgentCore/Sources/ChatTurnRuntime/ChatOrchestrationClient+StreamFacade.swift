@@ -13,12 +13,9 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import AgentWorkspace
-// Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`: `chatStream`, `chatStreamExecution`; the producer mounts its exact session/run recipient with SessionTurnDelivery; `ChatStreamExecution` joins or cancels its producer Task's settled result |
+// Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`,`chatStream`,`chatStreamExecution`,`ChatStreamExecution` |
 
-/// Joinable ownership for one core streaming producer. Surface adapters that
-/// cancel a consumer must wait for this execution before treating the turn as
-/// settled: the producer owns cancellation/failure transcript persistence and
-/// can emit its terminal event before that write has completed.
+/// Join the producer before declaring settlement: terminal events can precede its cancellation/failure transcript write.
 public struct ChatStreamExecution: Sendable {
     public let events: AsyncThrowingStream<TurnStreamEvent, Error>
     private let producer: Task<Result<ChatResponse, any Error>, Never>
@@ -39,9 +36,7 @@ public struct ChatStreamExecution: Sendable {
 extension SwiftNativeChatOrchestrationClient {
     // MARK: chatStream
 
-    /// Concrete request-scoped overload used by signed remote regenerate. The
-    /// replacement binding is installed inside the producer Task (the same
-    /// memory-safe pattern as TurnTraceContext), never around Task creation.
+    /// The producer captures the accepted turn and its exact transcript choices.
     public nonisolated func chatStream(
         message: String,
         sessionId: String?,
@@ -53,21 +48,15 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String = "chat",
         suppressUserAppend: Bool,
         replacementAssistantMessageID: String? = nil,
-        /// The bot's saved provider tuple when this turn belongs to a bot.
-        /// Bound INSIDE the producer task (see chatStreamExecution), never
-        /// around this call: a synchronous binding here would pop before the
-        /// producer ran.
+        /// The producer holds the helper's saved provider choice.
         choice: ProviderTurnChoice? = nil,
-        /// The turn's immutable return route, when the calling surface owns
-        /// one. Same reason as `choice`: bound INSIDE the producer task, never
-        /// synchronously around this call.
+        /// Bind the immutable return route inside the producer for its full lifetime.
         replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
-        /// The turn's provider service tier, when the calling surface resolves
-        /// one. Bound inside the producer for the same reason.
+        /// Bind the service tier inside the producer for its full lifetime.
         serviceTier: String? = nil,
-        /// See `chatStreamExecution`. Defaults to false: consuming a stream is
-        /// not by itself evidence that anything can DRAW a card.
-        consumerRendersInlineCards: Bool = false
+        /// Stream consumption alone does not prove card rendering, so the default stays text-only.
+        consumerRendersInlineCards: Bool = false,
+        turn: Turn
     ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
         chatStreamExecution(
             message: message,
@@ -83,13 +72,11 @@ extension SwiftNativeChatOrchestrationClient {
             choice: choice,
             replyRoute: replyRoute,
             serviceTier: serviceTier,
-            consumerRendersInlineCards: consumerRendersInlineCards
+            consumerRendersInlineCards: consumerRendersInlineCards, turn: turn
         ).events
     }
 
-    /// Concrete joinable form used by the Mac lifecycle owner. Existing
-    /// `chatStream` callers retain their stream-only API and cancellation
-    /// behavior; callers that own terminal truth can also join persistence.
+    /// Lifecycle owners join producer persistence before claiming terminal truth; stream-only consumers retain ordinary cancellation.
     public nonisolated func chatStreamExecution(
         message: String,
         sessionId: String?,
@@ -101,64 +88,53 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         suppressUserAppend: Bool,
         replacementAssistantMessageID: String? = nil,
-        /// The turn's bound provider tuple (a bot's saved choice). Passed as a
-        /// PARAMETER rather than bound by the caller around this call: the
-        /// producer below owns its task-local bindings for its entire lifetime.
+        /// Pass the route as a parameter so the producer holds the value for its full lifetime.
         choice: ProviderTurnChoice? = nil,
-        /// The turn's immutable return route. A PARAMETER for the same reason
-        /// as `choice`: bound inside the producer for its entire lifetime.
+        /// Pass the reply route as a parameter so the producer holds the value for its full lifetime.
         replyRoute: ChatToolSessionContext.ReplyRoute? = nil,
-        /// The turn's provider service tier, same parameter-not-wrapper rule.
+        /// Pass the service tier as a parameter so the producer holds the value for its full lifetime.
         serviceTier: String? = nil,
         /// Only the mounted transcript UI declares inline-card rendering; every other consumer defaults to text-only.
         consumerRendersInlineCards: Bool = false,
-        /// Where User was when his door received a "take over". Bound inside
-        /// the producer, same parameter-not-wrapper rule.
+        /// Capture the user's takeover location at ingress; carry it on the captured turn.
         macContinuation: MacWorkContinuation? = nil,
-        /// The row the surface is drawing this reply in: the answer is saved
-        /// under it and lands in place. Same parameter-not-wrapper rule.
+        /// Save under the surface's existing reply-row identity; carry it on the captured turn.
         replyRowID: String? = nil,
-        onScreenPreview: (@Sendable (MacScreenPreviewUpdate) async -> Void)? = nil
+        onScreenPreview: (@Sendable (MacScreenPreviewUpdate) async -> Void)? = nil,
+        turn: Turn
     ) -> ChatStreamExecution {
-        // Bind task locals inside the producer for its entire lifetime.
-        let turnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
+        let request = TurnRequest(message: message, sessionID: sessionId, model: model,
+            reasoningEffort: reasoningEffort, fileAccess: fileAccess, attachments: attachments,
+            persona: persona, surface: surface, suppressUserAppend: suppressUserAppend)
+        var held = turn
+        held.rows.replacementAssistantMessageID = replacementAssistantMessageID
+        held.replyStreamRendersCards = consumerRendersInlineCards
+        if let replyRoute { held.envelope = held.envelope?.withDeliveryRoute(replyRoute) }
+        if let macContinuation {
+            held.macContinuation = macContinuation
+            held.envelope = held.envelope?.withMacContinuation(macContinuation)
+        }
+        if let choice { held.providerChoice = choice }
+        if let serviceTier { held.requestedServiceTier = serviceTier }
+        if let onScreenPreview { held.screenPreview = onScreenPreview }
+        // Omission clears a parent's mounted row; this stream owns only the row its caller supplied.
+        held.replyRow = replyRowID.flatMap { row in
+            sessionId.map { TurnTraceContext.ReplyRow(turnId: held.id, sessionId: $0, messageId: row) }
+        }
+        let turn = held
         let (events, continuation) = AsyncThrowingStream<TurnStreamEvent, Error>.makeStream()
-        // Consumer termination detaches; the producer runs until it ends or Stop is raised.
-        let producer = Task { [self] in
+        // Consumer termination detaches; the producer holds the accepted turn until settlement.
+        let producer = Task { [self, turn] in
             if surface == "chat", let sessionId, !sessionId.isEmpty {
-                await TurnFirstRenderRegistry.shared.register(
-                    turnId: turnId,
-                    sessionId: sessionId,
-                    surface: surface
-                )
+                await TurnFirstRenderRegistry.shared.register(turnId: turn.id, sessionId: sessionId, surface: surface)
             }
-            let request = TurnRequest(
-                message: message, sessionID: sessionId, model: model,
-                reasoningEffort: reasoningEffort, fileAccess: fileAccess,
-                attachments: attachments, persona: persona, surface: surface,
-                suppressUserAppend: suppressUserAppend, replyRoute: replyRoute,
-                replacementAssistantMessageID: .some(replacementAssistantMessageID),
-                serviceTier: serviceTier.map { .some($0) },
-                threadKind: ChatPersistenceContext.threadKind,
-                ownedSessionID: ChatPersistenceContext.ownedSessionID
-            )
-            return await request.bind {
-                await TurnTraceContext.$bus.withValue(turnTraceBus) {
-                await TurnTraceContext.$turnId.withValue(turnId) {
-                await TurnTraceContext.$replyRow.withValue(replyRowID.flatMap { row in
-                    sessionId.map { TurnTraceContext.ReplyRow(turnId: turnId, sessionId: $0, messageId: row) }
-                }) {
-                await ProviderTurnChoice.$current.withValue(choice ?? ProviderTurnChoice.current) {
-                await MacWorkContinuation.$current.withValue(macContinuation ?? MacWorkContinuation.current) {
-                await ChatToolSessionContext.$replyStreamRendersCards.withValue(consumerRendersInlineCards) {
-                await MacScreenPreviewBus.$publish.withValue(onScreenPreview ?? MacScreenPreviewBus.publish) {
-                    await self.runStream(request: request, continuation: continuation)
-                }
-                }
-                }
-                }
-                }
-                }
+            return await TurnTraceContext.$bus.withValue(turnTraceBus) {
+                await TurnTraceContext.$turnId.withValue(turn.id) {
+                    await TurnTraceContext.$destinationId.withValue(turn.replyRoute?.destinationId) {
+                        await TurnTraceContext.$threadId.withValue(turn.replyRoute?.threadId) {
+                            await self.runStream(request: request, continuation: continuation, turn: turn)
+                        }
+                    }
                 }
             }
         }
@@ -167,7 +143,8 @@ extension SwiftNativeChatOrchestrationClient {
 
     private func runStream(
         request: TurnRequest,
-        continuation: AsyncThrowingStream<TurnStreamEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<TurnStreamEvent, Error>.Continuation,
+        turn: Turn
     ) async -> Result<ChatResponse, any Error> {
         let trimmed = request.message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty && request.attachments.isEmpty {
@@ -176,9 +153,8 @@ extension SwiftNativeChatOrchestrationClient {
             return .failure(ChatOrchestrationError.emptyMessage)
         }
         let execution: StructuredChatExecution
-        let runID = ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString
-        // The stream is this session's mounted delivery. Every entry into the
-        // session resolves it through the owner, including a resumed turn.
+        let runID = turn.run
+        // Resolve mounted session delivery through its owner, including on resumed turns.
         let lease = request.sessionID.map {
             SessionTurnDelivery.mount(dataRoot: dataRoot, sessionID: $0, runID: runID,
                 recipient: .init(progress: { event in continuation.yield(event) }))
@@ -189,8 +165,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         do {
-            execution = try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runID) {
-            try await chatExecution(
+            execution = try await chatExecution(
                 message: request.message,
                 sessionId: request.sessionID,
                 model: request.model,
@@ -200,9 +175,7 @@ extension SwiftNativeChatOrchestrationClient {
                 persona: request.persona,
                 surface: request.surface,
                 suppressUserAppend: request.suppressUserAppend,
-                progress: nil
-            )
-            }
+                progress: nil, turn: turn)
         } catch {
             continuation.finish(throwing: ProviderFailure.report(error) ?? error)
             return .failure(error)

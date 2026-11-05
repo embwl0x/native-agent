@@ -1,7 +1,7 @@
 import PersistenceCore
 // Blueprint: | `CognitiveMetadataSignals.swift` | `CognitiveMetadataSignals` enum; `stringSignals` |
 
-// Deterministic string/key traversal shared by event, node, and workspace metadata.
+// Share deterministic traversal so event, node and workspace metadata expose the same signals.
 enum CognitiveMetadataSignals {
     static func stringSignals(from value: JSONValue) -> [String] {
         switch value {

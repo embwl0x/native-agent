@@ -8,21 +8,15 @@ import ProviderRouting
 import Cognition
 import DeviceSync
 import ChatToolRuntime
-// Blueprint: | `EngineProviders.swift` | ProvidersFacade.settings owns routing, connections, catalog and derived readiness for every Mac picker and phone publication; provider/account invalidations refresh this snapshot. LatestRead orders settings and per-session route/context reads, returning each caller its own result; committed routing publishes through write. ProviderRouting owns persistence, discovery and eligibility; editors hold pending choices only. Catalog rows come only from the live catalog owners; independent ChatGPT, OpenRouter and Moonshot refreshes run concurrently with their existing error/freshness results; the unwritten providers/models.json compatibility input is retired. |
+import AuthoredCapabilities
+// Blueprint: | `EngineProviders.swift` | One checked root-specific settings/catalog owner across surfaces |
 
-/// `NativeAgentEngine.providers`: provider routing for one data root.
-/// The chat picker, Setup, Telegram and the Providers page render
-/// `connections` (each provider's auth state and models) and `catalog` (the
-/// selectable models plus each surface's saved pick), derived from `settings`.
-/// The same snapshot supplies per-surface routing. Phone lanes use the same
-/// published owner: `configureProvider`,
-/// `saveSurfaceSelection`, and `routing` for the active-provider pin.
+/// Share checked root-specific provider settings, catalog and routing across pickers, setup, Telegram and phone.
 @MainActor
 @Observable
 public final class ProvidersFacade {
     public nonisolated let dataRoot: URL
 
-    /// Every provider connection, as of the last read.
     public var connections: [ProviderInfo] { settings?.providers ?? [] }
     public enum Readiness: Equatable, Sendable {
         case loading, ready, needsConnection
@@ -33,18 +27,20 @@ public final class ProvidersFacade {
         guard settings != nil else { return .loading }
         return hasReadyConnection ? .ready : .needsConnection
     }
-    /// The model catalog and each surface's pick, as of the last read or write.
     public var catalog: ModelCatalogResponse? { settings?.catalog }
     public private(set) var settings: SettingsSnapshot?
     public private(set) var settingsError: String?
     @ObservationIgnored lazy var settingsReads = LatestRead()
+    @ObservationIgnored weak var facePages: PartFaces?
+    var providerProbeStarts: [String: Date] = [:]
+    var catalogRefreshStarted: Date?
     public var codexAuth: CodexAuthStatus?
     @ObservationIgnored private let codexAuthRead = LatestRead()
 
     public func refreshCodexAuth() async throws -> CodexAuthStatus {
         try await codexAuthRead.read({ try await codexAuthStatus() }, publish: { codexAuth = $0 })
     }
-    /// One effective route and context readout per conversation, shared by every surface.
+    /// Share effective route and context evidence per conversation across surfaces.
     @MainActor public struct SessionPresentation {
         public let contract: BotChatContract?
         public var choice: ProviderTurnChoice?
@@ -66,8 +62,7 @@ public final class ProvidersFacade {
     }
     public private(set) var sessions: [String: SessionPresentation] = [:]
     @ObservationIgnored private var sessionReads: [String: LatestRead] = [:]
-    /// The mounted conversation owns the observation lifetime; another window's
-    /// session cannot cancel it. All its readers consume `sessions`.
+    /// Mounts own observation independently so another window cannot cancel this session’s reads.
     public func observeSession(_ sessionID: String) async {
         var paths = ["providers/surfaces.json", "providers/active.json", "providers",
                      "chat/messages/\(sessionID).jsonl", "chat/session_state/\(sessionID)/provider_usage.json"]
@@ -101,10 +96,10 @@ public final class ProvidersFacade {
                 }
             }
             let context: SessionContextStatus?
-            // A helper never uses the resident's context preparation or compaction.
+            // A helper uses its own context preparation and the shared verbatim-tail boundary.
             if !sessionID.isEmpty, contract == nil, let choice {
                 context = try await RuntimeReadouts.getSessionContext(sessionId: sessionID,
-                    model: choice.model, providerID: choice.provider, dataRoot: dataRoot, configuredThresholdTokens: nil)
+                    model: choice.model, providerID: choice.provider, dataRoot: dataRoot)
             } else { context = nil }
             let read = SessionPresentation(contract: contract, choice: choice, context: context, error: contract?.modelChoiceProblem, settings: settings)
             return read
@@ -165,21 +160,20 @@ public final class ProvidersFacade {
         settings = snapshot
         sessions = sessions.mapValues { var value = $0; value.settings = snapshot; return value }
         settingsError = nil
+        refreshFace()
     }
 
-    func publishSettingsFailure(_ detail: String) { settingsError = detail }
+    func publishSettingsFailure(_ detail: String) { settingsError = detail; refreshFace() }
 
     deinit {
         accountModelUpdatesTask?.cancel()
     }
 
-    /// Core routing for this root: active provider per surface, saved picks,
-    /// the Providers page's row set.
     public nonisolated var routing: SwiftNativeProviderRouting {
         SwiftNativeProviderRouting(dataRoot: dataRoot)
     }
 
-    /// UI maintenance returns immediately; no turn waits for account discovery.
+    /// Account discovery must never hold a turn or UI maintenance.
     public nonisolated func refreshAccountModelsInBackground() {
         Task { @MainActor [weak self] in
             guard let self, self.accountModelRefreshTask == nil else { return }
@@ -201,23 +195,21 @@ extension ProvidersFacade {
     public nonisolated func disconnectProvider(_ id: String) async throws -> (ok: Bool, detail: String) {
         try await clearProvider(id)
         Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
-        // OAuth credentials have their own store; removing the registry row
-        // alone must never claim the account was disconnected.
+        // OAuth credentials have their own store; deleting a registry row alone cannot prove disconnect.
         let clearedOAuth = NativeOAuthFlow.clearTokens(providerId: id, dataRoot: dataRoot)
         let oauthID = NativeOAuthFlow.normalizedOAuthProviderId(id)
         if ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].contains(oauthID),
            !clearedOAuth {
             return (false, "Clear failed: the OAuth credential could not be removed.")
         }
-        // CLI adoption is declined by sign-out, so inspect the shared file
-        // itself rather than the credential path chat would now use.
+        // Inspect the shared CLI file directly because app sign-out disables CLI adoption in chat’s credential path.
         do {
             let sharedRemains = try NativeOAuthFlow.sharedCodexCLISessionRemains(providerId: id)
             return (true, sharedRemains
                 ? "Credentials removed. Shared Codex auth is still signed in. Sign out from Codex to remove it."
                 : "Credentials removed.")
         } catch {
-            // The independent CLI read cannot undo the completed app sign-out.
+            // An independent CLI read cannot undo committed app sign-out.
             return (true, "Credentials removed. Shared Codex session could not be checked: \(ProviderFailure.diagnosticDescription(error))")
         }
     }
@@ -229,8 +221,7 @@ extension ProvidersFacade {
         }
     }
 
-    /// Presentation conversion only. ProviderRouting owns discovery, readiness,
-    /// saved bookkeeping and the provider-specific model catalog.
+    /// Presentation must derive discovery, readiness, bookkeeping and model contracts from ProviderRouting.
     public nonisolated static func connections(from snapshot: ProviderCatalogSnapshot) throws -> [ProviderInfo] {
         snapshot.providers.map { provider in
             do {
@@ -268,9 +259,12 @@ extension ProvidersFacade {
                     models = try JSONDecoder.nativeAgent.decode(
                         [ProviderModelInfo].self, from: JSONEncoder().encode(provider.modelCatalog))
                 } catch {
-                    throw ProviderRoutingError.underlying("Provider \(provider.id) authentication/model catalog could not be read: \(error.localizedDescription). Repair the reported catalog row before using its account list.")
+                    throw ProviderRoutingError.underlying("""
+                        Provider \(provider.id) authentication/model catalog could not be read: \(error.localizedDescription). Repair the reported catalog \
+                        row before using its account list.
+                        """)
                 }
-                // Eligibility is ProviderRouting's own answer; the state word only says how far it is proven.
+                // Use ProviderRouting eligibility; the state word describes only proof.
                 guard let configured = provider.configured else {
                     throw ProviderRoutingError.underlying("Provider \(provider.id) has no checked readiness result; refresh its provider catalog.")
                 }
@@ -291,7 +285,6 @@ extension ProvidersFacade {
         }
     }
 
-    /// One connection by id, exact first, then case-folded.
     public nonisolated func provider(id: String) async throws -> ProviderInfo {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -363,7 +356,6 @@ public extension NativeAgentEngine {
 // MARK: - Catalog
 
 extension ProvidersFacade {
-    /// Available models and their capabilities, independent of saved selections.
     public nonisolated func modelCatalog(
         refresh: Bool,
         codexCacheURL: URL? = nil
@@ -391,8 +383,7 @@ extension ProvidersFacade {
             ModelCatalogItem(model, priority: 100 + index)
         }
         let (openRouterRead, _) = await (openRouterRefresh, moonshotRefresh)
-        // Discovery failure is catalog status, not a failed routing read:
-        // callers must still publish the other providers' refreshed lists.
+        // Discovery failure belongs to that catalog; publish refreshed sibling provider lists.
         let catalogFreshness = accountRefreshError == nil
             ? openRouterRead.freshness : .staleAfterFailedRefresh
         let catalogNote = accountRefreshError.map {
@@ -434,8 +425,7 @@ extension ProvidersFacade {
         )
     }
 
-    /// Project the same selected credential and adapter verdict as provider
-    /// readiness; source flags describe that credential, not a second scan.
+    /// Use readiness’s selected credential and adapter verdict; source flags must not come from a second scan.
     public nonisolated func codexAuthStatus(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         allowEnvironmentOverride: Bool = true
@@ -448,9 +438,7 @@ extension ProvidersFacade {
         do {
             status = try ChatGPTTransport.credentialStatus(at: path)
         } catch {
-            // This readout is published by an optional configuration refresh.
-            // Keep the failure in the readout, rather than leave a prior signed-in
-            // snapshot behind when that caller discards a thrown refresh error.
+            // Publish optional-refresh failure in its readout so discarded throws cannot leave stale signed-in state.
             return CodexAuthStatus(
                 active: "unavailable", appOwnedLoggedIn: false, sharedLoggedIn: false,
                 codexHome: path.deletingLastPathComponent().path,
@@ -472,8 +460,7 @@ extension ProvidersFacade {
 // MARK: - Writes
 
 extension ProvidersFacade {
-    /// Save one provider's sign-in mode, key and default model. The mode must
-    /// be one the provider advertises; an omitted mode takes its first.
+    /// Accept only advertised sign-in modes; omission selects the provider’s first advertised mode.
     public nonisolated func configureProvider(
         id: String, apiKey: String?, authMode: String, defaultModel: String? = nil
     ) async throws {
@@ -482,14 +469,13 @@ extension ProvidersFacade {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }
         let requestedMode = authMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // The sheet always supplies a selected mode. Keep the existing
-        // programmatic/iCloud compatibility behavior for omitted values by
-        // selecting the provider's first advertised mode, never an invented
-        // generic fallback.
+        // Omitted mode selects the provider’s first advertised choice, never an invented generic mode.
         let normalizedMode = requestedMode.isEmpty ? (supportedModes.first ?? "") : requestedMode
         guard supportedModes.contains(normalizedMode) else {
             throw NSError(domain: "NativeAgentProvider", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "\(provider.display_name) does not support the \(normalizedMode.isEmpty ? "requested" : normalizedMode) authentication method"
+                NSLocalizedDescriptionKey: """
+                    \(provider.display_name) does not support the \(normalizedMode.isEmpty ? "requested" : normalizedMode) authentication method
+                    """
             ])
         }
         var config: [String: JSONValue] = ["auth_mode": .string(normalizedMode)]
@@ -502,10 +488,7 @@ extension ProvidersFacade {
         _ = try await routing.configureProvider(id: id, config: .object(config))
     }
 
-    /// Save one surface's pick, admitted by the same served catalog the Mac
-    /// and phone pickers show (the routing owner checks it inside its
-    /// transaction lock), and return the committed routing. A nil `providerID`
-    /// leaves the surface's active-provider pin alone.
+    /// Admit selections under the routing transaction against the served picker catalog; nil `providerID` preserves the active-provider pin.
     public func saveSurfaceSelection(
         surface: String, model: String, reasoningEffort: String?, serviceTier: String?, providerID: String?
     ) async throws -> ProviderRoutingSnapshot {

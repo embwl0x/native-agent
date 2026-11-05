@@ -11,7 +11,7 @@ import PersistenceCore
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `iCloudBridge+Publication.swift` | Pairing-bound provider catalog and snapshot status publication under each group's canonical CloudKit key, explicit publication invalidation, presence and progress publication |
+// Blueprint: | `iCloudBridge+Publication.swift` | Pairing-bound canonical status/catalog groups, presence and progress. |
 
 extension iCloudBridge {
     /// Forced repair revokes accepted-byte suppression at the publication owner.
@@ -19,10 +19,7 @@ extension iCloudBridge {
         lastPublishedMobileSnapshotStatus.removeAll()
     }
 
-    /// Publish the Mac-owned provider/model catalog to the paired phone without
-    /// copying credentials or requiring the legacy iCloud Drive snapshot lane.
-    /// The status record is a bounded LWW projection with one publication owner;
-    /// the Mac remains the only provider configuration owner.
+    /// CloudKit catalog projection carries no credentials; the Mac remains the sole provider configuration owner.
     @discardableResult
     public func publishProviderCatalogStatus() async -> Bool {
         guard speaksToPhone else { return false }
@@ -58,8 +55,7 @@ extension iCloudBridge {
                     try await deviceTransport.setStatus(key: NAProviderCatalogStatusCodec.statusKey, value: value, pairingSecret: secret)
                     guard generation == setupGeneration, speaksToPhone else { continue }
                     lastPublishedProviderCatalogStatus = (secret, value)
-                    // Reread current configuration after every send. Only a
-                    // stable projection, or an unqueued failure, ends this owner.
+                    // Recheck after each send so only a stable projection or unqueued failure ends ownership.
                     providerCatalogPublicationQueued = true
                     await recordSendResult(operation: NAProviderCatalogStatusCodec.statusKey)
                 }
@@ -74,8 +70,7 @@ extension iCloudBridge {
         return published
     }
 
-    /// A credential-free projection of one frozen routing generation. Never
-    /// reread a second picker file while constructing the phone's tuple.
+    /// Freeze one routing generation so a second picker read cannot split the phone tuple.
     nonisolated static func providerSurfaceSelections(
         from snapshot: ProviderRoutingSnapshot
     ) -> [String: NAProviderSurfaceSelection] {
@@ -91,11 +86,7 @@ extension iCloudBridge {
         }
     }
 
-    /// Publish selected rebuildable iOS read projections through the existing
-    /// bounded CloudKit status seam. The snapshot writer remains the only
-    /// projection compiler; this adapter only transports its exact file bytes.
-    /// Returns each group that did not publish, with why; nil when there is no
-    /// CloudKit transport or the pass was torn down.
+    /// Transport only exact snapshot-writer bytes; report failed groups, with nil reserved for no transport or a retired pass.
     @discardableResult
     func publishMobileSnapshotStatus(
         groups: Set<NAMobileSnapshotGroup>,
@@ -131,9 +122,7 @@ extension iCloudBridge {
                 guard shouldPublish() else { return nil }
                 failures[group] = error as? DeviceSyncError ?? .underlying(message: error.localizedDescription)
                 await recordSendResult(operation: group.statusKey, error: error)
-                // Forget what was last published for this group: the retained
-                // value is what suppresses the next attempt, and this group is
-                // now known not to be on the phone as published.
+                // Revoke suppression for a group known absent on the phone so its next attempt cannot skip publication.
                 lastPublishedMobileSnapshotStatus[group] = nil
                 nativeLog(
                     "[iCloudBridge] mobile snapshot %@ publication failed: %@",

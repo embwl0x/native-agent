@@ -106,8 +106,8 @@ the routine wake merely to decide to run it.
 
 **As built in source, 10-30.** `EngineCarriedHabits` joins the durable
 resident-wake terminal and persisted dispatch-closure notifications in either
-order. A private keep may outlive the terminal; closure re-reads the trial,
-and the existing turn identity prevents a duplicate trial. Off the turn path,
+order: closure re-reads the trial, and the existing turn identity prevents a
+duplicate trial. Off the turn path,
 it drains accepted trace ingress and reads that turn's `work.identified.workIdentity`
 (`carry.<handle>`), ordered top-level dispatch receipts and `llm.call` rows.
 Dispatch coverage, matching begins/ends and turn acceptance must be present;
@@ -143,27 +143,28 @@ its existing work-identification event now also names its work identity.
 
 ### H3 — keep what repeats, not what happened once
 
-Implemented in source, 10-30; release build, install and live proof pending.
-The turn part offers a private keep after hand work or one call repeated with
-the same input 3+ rounds. The native stem opens it on the **second** meeting
-of that practice, and on later meetings while no active ability covers it.
-The first meeting only records its `practice: ` line through
-`FamiliarLines.firstMet` in `mind/familiar.bin`; it makes no keep model call.
+Keeping happens inside the turn. After each tool round the native stem meets
+the turn's hand work so far, once per route per turn. The first meeting only
+records its `practice: ` line through `FamiliarLines.firstMet` in
+`mind/familiar.bin`. On the **second** and later meetings, while no active
+ability covers it, the round's last result carries `practice: {route, hand,
+loop?}`, at most once a turn, and the shipped turn makes it the note of their next
+`model.call`. There is no private call after the reply.
 
 A practice is the ordered tool/action ids of the turn's landed writes or
 irreversible non-ability calls, without arguments or incidental reads. When
 there is no such hand work, it is the one call repeated 3+ rounds, counted
 once. A practice worth keeping replaces at least two calls (or is that one
 call looped 3+ rounds): a lone write, however often they makes it, is just
-using the tool (10-30 live: a lone `queue.add` met again opened a keep).
-An active ability's current learned-use or validation route suppresses
-the keep when it contains those ids in order; declared reach proves no route.
-Later rounds of an admitted keep finish normally.
+using the tool. An active ability's current learned-use or validation route
+suppresses the note when it contains those ids in order; declared reach proves
+no route.
 
-`practice.keep` traces `{practice, met: "first"|"again", kept: bool}`.
-`kept` says the gate admitted the private keep, not that they saved an ability.
-Familiarity uses the existing bounded line record; it is not a lifetime count.
-A one-off makes no keep call; a repeat can become an ability.
+`practice.keep` traces `{practice, met: "first"|"again", noted: bool}`, or
+`failed` with the cause when familiarity or the ability index cannot be read
+(the turn goes on without the note). `noted` says the note was sent, not that
+they saved an ability. Familiarity uses the existing bounded line record; it is
+not a lifetime count. A one-off sends no note; a repeat can become an ability.
 
 ### H4 — one crystallizer
 
@@ -184,27 +185,27 @@ crystallizer; there is no producer of new compiled candidates.
 
 - The office check-in, once they binds it, costs ~0 model calls when nothing
   needs their and starts from the gathered board when something does.
-- Keep calls drop from ~60 a day to the routines that actually repeat.
-- Never slower: H1 removes model turns, H3 removes model calls; nothing is added
-  to a turn's path.
+- The separate keep calls (~60 a day) are gone: a repeat's note rides a call
+  they was making anyway.
+- Never slower: H1 removes model turns, H3 removes model calls.
 
 ## Proof on them
 
 - Before/after: model calls per carried wake (traces: `llm.call` per
-  `turn.accepted` in resident-wake with work identity `carry.*`), keep calls a
-  day (`purpose: keep`).
+  `turn.accepted` in resident-wake with work identity `carry.*`); no
+  `llm.call` row has `purpose: keep`.
 - Drive: bind desk.68 via queue.update; the 16:00 (or next) occurrence runs
   with no model call and leaves its "Ran" note; an ability that returns
   `needs_me` wakes their with `already_looked`.
 - The habit line appears on a step they have handled the same way ≥ standing.
-- H3: first hand-work meeting traces `met:first, kept:false`; a later meeting
-  traces `met:again`, with `kept:true` only when no active recorded route covers it.
-  Confirm the suppressed first meeting has no keep model call. Installed proof
-  belongs to the release lead; this lane runs no separate tests or builds.
+- H3: first hand-work meeting traces `met:first, noted:false`; a later meeting
+  traces `met:again`, with `noted:true` only when no active recorded route covers
+  it, and the turn's next `llm.call` carries the note. Installed proof belongs to
+  the release lead; lanes run no separate tests or builds.
 
 ## Lanes
 
 | Lane | What | Owners |
 |---|---|---|
 | habits-reflex | H1 + H2 | Desk/MyQueue.swift, Desk/DeskCadence.swift (DeskStep.action), AppToolRuntime/AppToolExecutor+MyQueue.swift (queue.add/update action), Cognition/NativeCognitionRuntime+Pursuit.swift (run on due), EngineRuntime/EnginePartWake.swift run path (reuse), AgentWorkspace/HarnessQueue.swift (the habit line), NativeAgentCore/Expectation.swift (use), docs |
-| habits-keep | H3 + H4 | Resources/abilities/turn.js, ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift (met-before hand-work gate), removed nightly compiler/recorder, docs/SURPRISE.md S3/S4 |
+| habits-keep | H3 + H4 | Resources/abilities/turn.js, ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift (familiarity nerve inside the turn), removed nightly compiler/recorder, docs/SURPRISE.md S3/S4 |

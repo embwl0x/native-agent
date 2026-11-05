@@ -1,19 +1,21 @@
 import Foundation
+import Experiences
 import os
 import AttentionRouting
 import BackgroundWork
 import Desk
 import NativeAgentCore
 import TriggerScheduler
-import WorkshopExecution
 import Connectors
 import Browser
 import Agents
 import AppToolRuntime
 import ChatTurnRuntime
 import ChatTurnContracts
+import ChatToolRuntime
 import AgentConversations
 import Cognition
+import DreamREMCycle
 import CognitiveSubstrate
 import DeviceSync
 import PersistenceCore
@@ -23,20 +25,21 @@ import ToolExecution
 import Senses
 import NativeAgentShared
 import TelegramBot
-// Blueprint: | `NativeAgentEnginePorts.swift` | Once-installed native host factories, body effects and shared EngineCognitionHost defaults; pure readout faces bind the selected Parts version through the no-effect authored host; read-part calls bind the existing ToolsFacade originating door and narrow the pinned candidate to native-permitted read actions/capabilities |
+// Blueprint: | `NativeAgentEnginePorts.swift` | Native host factories and read faces; cognition's shoulder tap tells its conversation matter |
 
-/// Platform hosts supplied once to Core's composition root. The factories
-/// bind existing app adapters; dispatch and chat policy stay in the engine.
+/// Supply platform hosts once; dispatch and chat policy remain in the engine.
 public struct NativeAgentEnginePorts: Sendable {
     public let backgroundWork: any EngineBackgroundWorkHost
     public let connectorStatus: AppConnectorStatusPlatform
     public let cognitionHost: any CognitionHost
     public let deviceSyncHost: any DeviceSyncHost
-    public let macIntegration: any MacIntegrationToolBridge
+    public let macIntegration: any ChatMacIntegrationToolBridge
     public let a2aPushConfiguration: @Sendable (AgentPeerContact) async throws -> JSONValue
     public let completionSender: @Sendable (URL) -> any AgentBridgeCompletionSending
     public let standingBotQueue: BotRunQueue
     public let appTools: @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor
+    public let browserRoutes: BrowserActionRoutes
+    public let connectorActions: @Sendable (NativeAgentEngine) -> any ConnectorActionPlatform
     public let chatPlatform: ChatToolPlatformPort
 
     public init(
@@ -44,11 +47,13 @@ public struct NativeAgentEnginePorts: Sendable {
         connectorStatus: AppConnectorStatusPlatform,
         cognitionHost: any CognitionHost,
         deviceSyncHost: any DeviceSyncHost,
-        macIntegration: any MacIntegrationToolBridge,
+        macIntegration: any ChatMacIntegrationToolBridge,
         a2aPushConfiguration: @escaping @Sendable (AgentPeerContact) async throws -> JSONValue,
         completionSender: @escaping @Sendable (URL) -> any AgentBridgeCompletionSending,
         standingBotQueue: BotRunQueue,
         appTools: @escaping @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor,
+        browserRoutes: BrowserActionRoutes,
+        connectorActions: @escaping @Sendable (NativeAgentEngine) -> any ConnectorActionPlatform,
         chatPlatform: ChatToolPlatformPort
     ) {
         self.backgroundWork = backgroundWork
@@ -60,6 +65,8 @@ public struct NativeAgentEnginePorts: Sendable {
         self.completionSender = completionSender
         self.standingBotQueue = standingBotQueue
         self.appTools = appTools
+        self.browserRoutes = browserRoutes
+        self.connectorActions = connectorActions
         self.chatPlatform = chatPlatform
     }
 }
@@ -74,10 +81,12 @@ extension CognitionHost {
     }
 
     public func readoutFace(id: String, input: JSONValue, version: String, dataRoot: URL) async -> PartCallResult<PartFace> {
-        let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { _, _ in nil }
-        return await OwnedProgramInvocation.$host.withValue(host) {
-            await Parts(root: dataRoot).face(id: id, input: input, version: version)
-        }
+        let invocation = ChatToolInvocation()
+        let work = ChatTurnWork(toolInvocation: invocation)
+        let execution = AppActionExecution(invocation: invocation, deadlines: work.deadlines, turnWork: work)
+        let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot, turn: nil, execution: execution) { _, _, _, _ in nil }
+        return await Parts(root: dataRoot).face(id: id, input: input, version: version,
+            invocation: .init(host: host, execution: .init(turn: nil, surface: "cognition:readout", deadlines: execution.deadlines)))
     }
 
     public func inQuietHours(at date: Date, dataRoot: URL) -> Bool {
@@ -85,15 +94,17 @@ extension CognitionHost {
     }
 
     public func unattendedWorkAllowed(dataRoot: URL) async -> Bool {
-        await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
+        await UnattendedWork.allowed(dataRoot: dataRoot)
     }
 
     public func backgroundWorkLease(dataRoot: URL) -> any BackgroundWorkLeasing { BackgroundWorkLease(dataRoot: dataRoot) }
 
-    public func backgroundWorkWindow(_ date: Date) -> String { WorkshopPump.windowKey(date) }
+    public func backgroundWorkWindow(_ date: Date) -> String { DeskPursuitChoice.windowKey(date) }
+
+    public func backgroundWorkWindowEnd(_ date: Date) -> Date { DeskPursuitChoice.windowEnd(date) }
 
     public func pursuitChoiceTotal(for item: DeskItem, now: Date) -> Double? {
-        WorkshopPump.choiceScore(for: item, now: now)?.total
+        DeskPursuitChoice.score(for: item, now: now)?.total
     }
 
     public func schedulerJobRows(at path: URL) throws -> [JSONValue] {
@@ -125,16 +136,14 @@ extension BackgroundWorkLease: BackgroundWorkLeasing {}
 extension AttentionRouter {
     public func deliverShoulderTap(
         eventId: String, title: String, body: String, reason: String,
-        userInfo: [String: String], at date: Date
+        userInfo: [String: String], at date: Date, turn: Turn?
     ) async throws -> String? {
-        // Her knock points at the conversation the Mac and the phone show, so
-        // it goes to the phone, never to a Telegram chat that lacks it.
-        let outcome = try await route(
-            eventId: eventId, importance: .informational, title: title, body: body,
-            reason: reason, userInfo: userInfo, at: date
-        )
-        guard outcome.transportOutcome == .delivered else { return nil }
-        return outcome.delivery.rawValue
+        // Send conversation attention to the phone; Telegram cannot open the referenced Mac conversation.
+        let outcome = try await tell(Matter(id: eventId, form: .words, from: userInfo["source"] ?? "cognition",
+            title: title, summary: body, open: userInfo["sessionId"].map { "chat:" + $0 }),
+            reach: .person(from: nil), at: date, turn: turn)
+        let accepted = outcome.destinationOutcomes.filter { $0.value == .delivered }.keys.sorted()
+        return accepted.isEmpty ? nil : accepted.joined(separator: ",")
     }
 }
 
@@ -167,9 +176,9 @@ public struct EngineCognitionHost: CognitionHost {
     }
 
     public func callReadPart(id: String, input: JSONValue, actions: Set<String>, dataRoot: URL, origin: String) async throws -> JSONValue {
-        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native(origin)) {
+        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native(origin)) { door in
             switch await Parts(root: dataRoot).call(id: id, input: input,
-                within: .init(actions: actions, capabilities: ["app_data_read"]), as: JSONValue.self) {
+                within: .init(actions: actions, capabilities: ["app_data_read"]), invocation: door.invocation, as: JSONValue.self) {
             case .success(let value): return value
             case .failure(let error): throw error
             }
@@ -177,18 +186,19 @@ public struct EngineCognitionHost: CognitionHost {
     }
     public func deliverShoulderTap(
         eventId: String, title: String, body: String, reason: String,
-        userInfo: [String: String], at date: Date
+        userInfo: [String: String], at date: Date, turn: Turn?
     ) async throws -> String? {
         try await attention.deliverShoulderTap(
-            eventId: eventId, title: title, body: body, reason: reason, userInfo: userInfo, at: date)
+            eventId: eventId, title: title, body: body, reason: reason, userInfo: userInfo, at: date, turn: turn)
     }
 
 
-    public func backgroundLLMClient(dataRoot: URL, cognition: NativeCognitionRuntime?) -> any LLMClient {
-        NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition)
+    public func backgroundLLMClient(dataRoot: URL, cognition: NativeCognitionRuntime?, assembly: PrivateWorkContextAssembly) -> any LLMClient {
+        NativeAgentEngine.makeSharedLLMClient(dataRoot: dataRoot, cognitionRuntime: cognition, assembly: assembly)
     }
 
     public func studioWanderClient(dataRoot: URL, usesLiveAppBody: Bool) -> any StudioWanderClientPort {
-        EngineStudioWanderClient(engine: usesLiveAppBody ? NativeAgentEngine.live : NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot), hasBody: false))
+        EngineStudioWanderClient(engine: usesLiveAppBody ? NativeAgentEngine.live : NativeAgentEngine(dataRoot: dataRoot, ports: .app(dataRoot: dataRoot),
+            hasBody: false))
     }
 }

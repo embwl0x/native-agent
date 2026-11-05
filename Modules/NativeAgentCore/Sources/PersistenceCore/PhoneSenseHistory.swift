@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentShared
 
-// Blueprint: | `PhoneSenseHistory.swift` | Bounded atomic phone evidence history; retains each organ's latest setup and observation plus first movement; bridge-only writes post person-evidence invalidation after durable admission |
+// Blueprint: | `PhoneSenseHistory.swift` | Bounded phone evidence preserves each source and first movement. |
 public enum PhoneSenseHistory {
     public static let freshFor: TimeInterval = 15 * 60
     public static let changed = Notification.Name("NativeAgent.phonePresenceEvidence")
@@ -26,7 +26,6 @@ public enum PhoneSenseHistory {
             + (event.source == .battery && Int(event.value) != nil ? ", percent" : "")
             + (fresh ? "" : ", current unknown") + ")"
     }
-    /// The detailed phone-senses page and the compact presence line read this same history.
     public static func setupLines(_ root: URL, now: Date = Date()) throws -> [String] {
         let events = try read(root)
         return PhoneSenseEvent.Source.allCases.flatMap { source -> [String] in
@@ -34,10 +33,14 @@ public enum PhoneSenseHistory {
             var lines = [setup.map {
                 "\(source.title): \($0.setup!.line); phone setup at \($0.timestamp.formatted(.iso8601))"
                     + ((0...freshFor).contains(now.timeIntervalSince($0.timestamp)) ? "" : "; last reported setup, current setup unconfirmed")
-            } ?? "\(source.title): setup not reported yet; open the paired phone app with the Mac connected. Missing evidence does not mean off or permission denied."]
+            } ?? """
+                \(source.title): setup not reported yet; open the paired phone app with the Mac connected. Missing evidence does not mean off or \
+                permission denied.
+                """]
             if let reading = events.filter({ $0.source == source && !$0.isSetup }).max(by: { $0.timestamp < $1.timestamp }) {
                 lines.append(observationLine(reading, now: now))
-            } else if source != .places { lines.append("\(source.title): no observation received; use its setup steps below, then open the phone app. Silence is not a verdict.") }
+            } else if source != .places { lines.append(
+                "\(source.title): no observation received; use its setup steps below, then open the phone app. Silence is not a verdict.") }
             return lines
         }
     }
@@ -51,8 +54,7 @@ public enum PhoneSenseHistory {
                 events.filter { $0.source == source && $0.isSetup == setup }.max { $0.timestamp < $1.timestamp }
             }
         }
-        // Preserve the current absence's first movement through the cap. The
-        // Mac input owner supplies its current fact; no copied presence latch.
+        // Preserve the current absence's first movement through the cap. The Mac input owner supplies its current fact; no copied presence latch.
         let firstMovement = events.filter { observation in
             observation.isMovement
                 && (afterPersonInput.map { observation.timestamp > $0 } ?? true)

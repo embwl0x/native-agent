@@ -13,32 +13,28 @@ import MemoryV2
 import PersistenceCore
 import DeviceSync
 
-// Blueprint: | `ChatInboxStrip.swift` | `InboxStripContainer`: compact unread-note/approval/card projection; reading does not resolve and settled origins archive their pointer |
+// Blueprint: | `ChatInboxStrip.swift` | `InboxStripContainer`: Inbox projection; reads do not resolve |
 
 struct InboxStripContainer<Header: View>: View {
     let sessionID: String
     let interactionBinding: InlineInteractionChatBinding
-    /// Fluid glass A2: unread notes are one capsule; the host places it (the
-    /// chat header) and the strip keeps other chats' approvals and cards.
+    /// Let the host place unread notes while the strip retains other chats' approvals and cards.
     @ViewBuilder let header: (InboxNotesCapsule) -> Header
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     private var items: [InboxItemRecord] {
         appModel.engine.inbox.items.filter {
-            // Reading a request is not resolving it. Delivery archives its
-            // pointer when the originating interaction settles.
+            // Reading is not resolution; archive only the pointer when the originating interaction settles.
             $0.source == InlineInteractionDelivery.source
                 ? $0.normalizedStatus != "archived"
                 : $0.isUnread
         }
     }
 
-    /// A card already posted into the open conversation shows there, once.
-    /// Her own decisions (her canon) are hers: never a card here.
+    /// An approval born in this conversation already has its card here (its conversation door); agent-owned canon decisions never belong here.
     private var stripApprovals: [ApprovalRecord] {
         appModel.engine.approvals.records.filter {
-            $0.status == "pending" && !$0.isAgentsOwnDecision
-                && (!$0.chatCardDelivered || $0.chatCardSessionId != sessionID)
+            $0.status == "pending" && !$0.isAgentsOwnDecision && (try? $0.personOrigin)?.session != sessionID
         }
     }
     private var stripCards: [InboxItemRecord] {
@@ -52,10 +48,7 @@ struct InboxStripContainer<Header: View>: View {
             items: items.filter { $0.source != InlineInteractionDelivery.source && !$0.hasLinkedApproval },
             onAction: { id, actionID in
                 try await appModel.inboxAction(id, action: actionID)
-                // Every successful action changes inbox state. Reload now so
-                // a read item leaves the unread count immediately instead of
-                // lingering until the next file event, then publish the same state
-                // to peripheral surfaces.
+                // Reload after each successful action so unread counts update before file events and peripheral surfaces share the same state.
                 await appModel.engine.inbox.refresh()
                 await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
             }
@@ -64,7 +57,7 @@ struct InboxStripContainer<Header: View>: View {
             Text(approvalError).foregroundStyle(.orange)
         }
         if !stripApprovals.isEmpty || !stripCards.isEmpty {
-            // Hugs what it holds: an empty or answered set takes no room over her chat.
+            // Empty or answered sets must take no room over chat.
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(stripApprovals.prefix(2)) { approval in
                     Group {

@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `TelegramNotificationDelivery.swift` | `TelegramPollLoop.notificationOutcome`: UTF-16 chunked notification dispatch, all-parts acceptance and client-owned known rejection versus unknown classification |
+// Blueprint: | `TelegramNotificationDelivery.swift` | `TelegramPollLoop.notificationOutcome`: accept only complete chunked sends |
 
 extension TelegramPollLoop {
     public static func notificationOutcome(_ token: String, _ destination: TelegramDestination,
@@ -13,8 +13,7 @@ extension TelegramPollLoop {
                 guard !Task.isCancelled else { return .notDelivered(reason: "cancelled before part dispatch") }
                 _ = try await defaultSendMessageWithReplyMarkupReturningId(token, destination, part, .object([:]))
             }
-            // The occurrence is accepted only after every part is accepted.
-            // A refused part remains retryable even if earlier parts landed.
+            // The occurrence is accepted only after every part is accepted. A refused part remains retryable even if earlier parts landed.
             return .delivered
         } catch {
             return TelegramAPIFailure.isKnownNotDelivered(error)

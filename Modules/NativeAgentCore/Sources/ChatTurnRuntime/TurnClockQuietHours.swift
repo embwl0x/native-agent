@@ -4,10 +4,9 @@ import PersistenceCore
 import NativeAgentCore
 import Experiences
 
-// Blueprint: | `TurnClockQuietHours.swift` | `TurnQuietHoursWindow`: checked preference owner with repair owed; local wall-clock membership, wraparound and exact end deadline shared by native reply admission |
+// Blueprint: | `TurnClockQuietHours.swift` | `TurnQuietHoursWindow`; Checked local quiet hours shared with delivery |
 
-/// Declared quiet hours in local wall-clock time, shared by turn context and delivery admission.
-/// `start > end` wraps midnight.
+/// Share local quiet-hour interpretation between context and delivery; start after end denotes a midnight-spanning window.
 public struct TurnQuietHoursWindow: Sendable, Equatable {
     public static func holdsResidentWake(session: String?, dataRoot: URL, at date: Date = Date()) -> Bool {
         do {
@@ -88,7 +87,8 @@ public struct TurnQuietHoursWindow: Sendable, Equatable {
     private static func reportUnavailable(_ error: Error, dataRoot: URL) {
         RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "clock.quiet_hours",
             owner: "user_prefs.json", words: error.localizedDescription,
-            nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(dataRoot.appendingPathComponent("user_prefs.json").path)])]))
+            nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(dataRoot
+                .appendingPathComponent("user_prefs.json").path)])]))
     }
 
     private static func intValue(_ raw: JSONValue?) -> Int? {

@@ -5,11 +5,11 @@ import Privacy
 import os
 import NativeAgentCore
 import TrustCenter
-import WorkshopExecution
 import Experiences
 import NotificationInbox
 import Darwin
-// Blueprint: | `SchedulerRecurrence.swift` | SchedulerJobNormalizer recurrence arithmetic, civil-minute matching, timestamp parsing and the shared queue intention timing schema, including system-read local date/time words |
+import Desk
+// Blueprint: | `SchedulerRecurrence.swift` | Shared recurrence, civil-minute and intention timing grammar |
 
 extension SchedulerJobNormalizer {
 
@@ -54,8 +54,7 @@ extension SchedulerJobNormalizer {
     }
 
     static func checkedEpoch(_ epoch: Double) throws -> Int64 {
-        // ISO/civil scheduling supports Gregorian years 1...9999; occurrence
-        // identity additionally requires rounded milliseconds to fit Int64.
+        // ISO/civil scheduling supports Gregorian years 1...9999; occurrence identity additionally requires rounded milliseconds to fit Int64.
         guard epoch.isFinite, (-62_135_596_800...253_402_300_799).contains(epoch),
               Int64(exactly: (epoch * 1_000).rounded()) != nil,
               let value = Int64(exactly: epoch.rounded(.towardZero)) else {
@@ -104,8 +103,7 @@ extension SchedulerJobNormalizer {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = tz
 
-        // after = the minute after the one the clock shows, kept as an instant:
-        // in the hour a fall-back repeats, one reading names two instants.
+        // after = the minute after the one the clock shows, kept as an instant: in the hour a fall-back repeats, one reading names two instants.
         let offset = Double(tz.secondsFromGMT(for: Date(timeIntervalSince1970: nowEpoch)))
         let shown = ((nowEpoch + offset) / 60).rounded(.down) * 60
         let afterMinute = Date(timeIntervalSince1970: shown - offset + 60)
@@ -114,7 +112,7 @@ extension SchedulerJobNormalizer {
 
         switch typ {
         case "once":
-            // Current saved jobs use at; the shared intention grammar declares its input units.
+            // Saved jobs and intention inputs meet at the same recurrence owner.
             return try epochFromValue(firstPresent(schedule["run_at"], schedule["runAt"], schedule["at"]) ?? .null, zone: tz, now: now)
         case "every":
             let resolved = try everyInterval(schedule)
@@ -127,14 +125,11 @@ extension SchedulerJobNormalizer {
             guard (0...59).contains(minute) else {
                 throw TriggerSchedulerError.schedulerInvalid("hourly schedule minute out of range")
             }
-            // Shared intention input units meet at this recurrence owner.
             let weekdays = typ == "weekly" ? try weekdaySet(firstPresent(schedule["weekdays"], schedule["weekday"])) : Set(0...6)
-            // Shared intention month-day units.
             let monthDay = try max(1, min(31, integerOr(
                 schedule["day"], schedule["monthday"], schedule["monthDay"],
                 default: 1
             )))
-            // Shared intention cron input units.
             let expression = (string(firstPresent(schedule["expression"], schedule["cron"], .string(""))) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let fields: CronFields = try typ == "cron" ? cronFields(expression) : (
@@ -187,9 +182,7 @@ extension SchedulerJobNormalizer {
         return (hour, minute)
     }
 
-    /// Match `^\s*(\d{1,2})(?::(\d{1,2}))?\s*$`: 1-2 digit hour,
-    /// optional `:` + 1-2 digit minute, surrounded only by whitespace. Returns
-    /// (hour, minute) — minute defaults to 0 when the `:MM` group is absent.
+    /// Require a whole-field H[:MM] match; whitespace surrounds digits and only an absent minute defaults to zero.
     static func parseHHMM(_ raw: String) -> (Int, Int)? {
         let s = raw.trimmingCharacters(in: .whitespaces)
         let parts = s.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
@@ -256,7 +249,10 @@ extension SchedulerJobNormalizer {
                 let t = token.trimmingCharacters(in: .whitespaces)
                 if let n = names[t] { return n }
                 if t.allSatisfy({ $0.isNumber }), !t.isEmpty, let v = Int(t) { return v }
-                throw TriggerSchedulerError.schedulerInvalid("cron token '\(token)' is invalid; use an integer from \(minimum) through \(maximum)\(names.isEmpty ? "" : " or " + names.keys.sorted().joined(separator: ", ")) in schedule.expression", code: "schedule_cron_token_invalid", path: "$.schedule.expression")
+                throw TriggerSchedulerError.schedulerInvalid("""
+                    cron token '\(token)' is invalid; use an integer from \(minimum) through \
+                    \(maximum)\(names.isEmpty ? "" : " or " + names.keys.sorted().joined(separator: ", ")) in schedule.expression
+                    """, code: "schedule_cron_token_invalid", path: "$.schedule.expression")
             }
             var step = 1
             if let slash = part.firstIndex(of: "/") {
@@ -264,7 +260,8 @@ extension SchedulerJobNormalizer {
                 part = String(part[..<slash])
                 // Steps are integers clamped to at least one; nonnumeric input refuses.
                 guard let parsedStep = Int(stepText), stepText.allSatisfy({ $0.isASCII && ($0.isNumber || $0 == "-") }) else {
-                    throw TriggerSchedulerError.schedulerInvalid("cron step '\(stepText)' is not an integer; use */N in schedule.expression, for example */5", code: "schedule_cron_step_invalid", path: "$.schedule.expression")
+                    throw TriggerSchedulerError.schedulerInvalid("cron step '\(stepText)' is not an integer; use */N in schedule.expression, for example */5",
+                        code: "schedule_cron_step_invalid", path: "$.schedule.expression")
                 }
                 step = max(1, parsedStep)
             }
@@ -282,7 +279,8 @@ extension SchedulerJobNormalizer {
                 start = value; end = value
             }
             guard (minimum...maximum).contains(start), (minimum...maximum).contains(end), start <= end else {
-                throw TriggerSchedulerError.schedulerInvalid("cron range '\(part)' must ascend within \(minimum)...\(maximum); edit schedule.expression", code: "schedule_cron_range_invalid", path: "$.schedule.expression")
+                throw TriggerSchedulerError.schedulerInvalid("cron range '\(part)' must ascend within \(minimum)...\(maximum); edit schedule.expression",
+                    code: "schedule_cron_range_invalid", path: "$.schedule.expression")
             }
             var value = start
             while value <= end {
@@ -299,7 +297,8 @@ extension SchedulerJobNormalizer {
     static func cronFields(_ expression: String) throws -> CronFields {
         let fields = expression.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard fields.count == 5 else {
-            throw TriggerSchedulerError.schedulerInvalid("schedule.expression needs 5 cron fields: minute hour day month weekday; for example 0 9 * * *", code: "schedule_cron_fields_invalid", path: "$.schedule.expression")
+            throw TriggerSchedulerError.schedulerInvalid("schedule.expression needs 5 cron fields: minute hour day month weekday; for example 0 9 * * *",
+                code: "schedule_cron_fields_invalid", path: "$.schedule.expression")
         }
         let weekdayNames: [String: Int] = ["sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6]
         let minute = try cronValues(fields[0], minimum: 0, maximum: 59)
@@ -321,20 +320,12 @@ extension SchedulerJobNormalizer {
             && dowMatch
     }
 
-    /// Normalize Z to +00:00, accepting
-    /// both `T` and space separators and naive (offset-less) forms, including
-    /// date-only. We try, in order:
-    ///   1. offset-bearing forms (with/without fractional seconds)
-    ///   2. naive datetime forms → wall-clock time in `zone` (the Mac's
-    ///      current zone unless the caller is doing civil arithmetic)
-    ///   3. date-only `YYYY-MM-DD` → midnight in `zone`
+    /// Offset-bearing input names an instant; naive datetime and date-only input use the supplied civil zone (midnight for dates).
     static func parseISO(_ text: String, zone: TimeZone = .autoupdatingCurrent) -> Double? {
         let normalized = text.replacingOccurrences(of: "Z", with: "+00:00")
 
-        // 1. Offset-bearing (Internet date-time).
         if let d = NativeTimestampFormat.parseISO8601FractionalFirst(normalized) { return d.timeIntervalSince1970 }
 
-        // 2 & 3. Naive forms (no offset) → `zone`. Accept both `T` and space.
         let candidates = ["yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
                           "yyyy-MM-dd'T'HH:mm:ss.SSS",
                           "yyyy-MM-dd'T'HH:mm:ss",
@@ -358,10 +349,10 @@ extension SchedulerJobNormalizer {
 // MARK: - An intention's rhythm
 
 extension SchedulerJobNormalizer {
-    /// The kinds an intention's rhythm takes; a `once` is an `at` moment, not a rhythm.
+    /// A once input is an at moment, not a recurring rhythm.
     public static let rhythmKinds: Set<String> = ["every", "hourly", "daily", "weekly", "monthly", "cron"]
 
-    /// queue.add's timing grammar, beside the rhythm parser that reads these fields.
+    /// Keep the public timing schema beside the rhythm parser so they cannot drift.
     public static let intentionWhenSchema: JSONValue = {
         let number: JSONValue = .object(["type": .array([.string("number"), .string("string")])])
         let text = ToolSchema.strSchema()
@@ -379,13 +370,19 @@ extension SchedulerJobNormalizer {
             "weekdays": weekdays, "weekday": weekdays]
         for name in ["seconds", "minutes", "hours", "days", "interval_seconds", "intervalSeconds",
                      "hour", "minute", "day", "monthday", "monthDay"] { fields[name] = number }
-        return .object(["description": .string("Omit for next_turn. Strings: own_turn, when_user_messages [door], when_user_here, when_user_away, on_news <words>, on <signal>, after_card <id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), in N minutes|hours|days, every <cron>, every N minutes|hours|days. Objects name a rhythm type/kind, or cron/expression; {at:<ISO/local time>} and {type:once,at:<ISO/local time>} name one moment. Local words use the system date reader in the Mac's zone; ambiguous readings refuse with their interpretation. Rhythm defaults and cross-field timing are checked by the clock."),
+        return .object(["description": .string("""
+            Omit for next_turn. Strings: own_turn, when_user_messages [door: \(MyQueue.Door.listed)], when_user_here, when_user_away, \
+            on_news <words>, on <signal>, after_card <id>, at \
+            <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), in N minutes|hours|days, every <cron>, every N minutes|hours|days. \
+            Objects name a rhythm type/kind, or cron/expression; {at:<ISO/local time>} and {type:once,at:<ISO/local time>} name one moment. Local words use \
+            the system date reader in the Mac's zone; ambiguous readings refuse with their interpretation. Rhythm defaults and cross-field timing are checked \
+            by the clock.
+            """),
             "oneOf": .array([text, .object(["type": .string("object"), "properties": .object(fields),
                 "additionalProperties": .bool(true)])])])
     }()
 
-    /// Her rhythm as the clock reads it: a bare `cron`/`expression` names a cron, "cron <expr>" or "every <expr>"
-    /// with five fields is one, and "every N minutes|hours|days" is an interval. Nil when it is no rhythm.
+    /// Require five-field cron syntax or an explicit interval; unmatched text cannot establish a rhythm.
     public static func rhythm(_ value: JSONValue) -> JSONValue? {
         var fields: [String: JSONValue]
         switch value {
@@ -396,7 +393,8 @@ extension SchedulerJobNormalizer {
             let rest = Array(words.dropFirst())
             if rest.count == 5 { fields = ["type": .string("cron"), "expression": .string(rest.joined(separator: " "))] }
             else if rest.count == 2, let count = Int(rest[0]),
-                    let unit = ["minute": "minutes", "minutes": "minutes", "hour": "hours", "hours": "hours", "day": "days", "days": "days"][rest[1].lowercased()] {
+                    let unit = ["minute": "minutes", "minutes": "minutes", "hour": "hours", "hours": "hours", "day": "days",
+                        "days": "days"][rest[1].lowercased()] {
                 fields = ["type": .string("every"), unit: .int(Int64(count))]
             } else { return nil }
         default: return nil

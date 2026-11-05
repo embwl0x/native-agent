@@ -1,3 +1,5 @@
+import AgentConversations
+import AuthoredCapabilities
 import Foundation
 import CryptoKit
 import ChatTurnRuntime
@@ -7,7 +9,6 @@ import NativeAgentCore
 import SlackBot
 import TelegramBot
 import TriggerScheduler
-import WorkshopExecution
 import BackgroundLoops
 import AppToolRuntime
 import TrustCenter
@@ -27,11 +28,9 @@ import ToolExecution
 import Transcripts
 import StandingBots
 import ChatTurnContracts
-// Blueprint: | `EngineDeviceSync+Snapshots.swift` | Phone snapshot/action adapter; remote Mac control translates through engine Trust and the platform native route; engine owners: retained Desk board/overview and checked inbox/approval lanes, connectors through `engine.connectors`, persona through `engine.persona` (PersonaFacade), runs through `engine.runs`, guidance through engine.tools and all-kind abilities through Parts.rows in the Tools snapshot; shared transcript/card/navigation, other-room exchange and live layout projections; conversation rows carry engine classification and assistant rows carry persisted tool evidence; Trust serialization delegates to `engine.trust.snapshotData`; proposal first_seen/last_seen/staged_at project createdAt and resolved_at is unset; signed incoming-turn delivery and handoff ordering; approvals carry the selected Mac turn ID for transcript anchoring; native presentation and cross-area assembly through ports |
+// Blueprint: | `EngineDeviceSync+Snapshots.swift` | `engine.connectors`, `engine.persona`, `engine.runs`, `engine.trust.snapshotData`; Checked phone adapter |
 
-// The phone's memory_proposals.json row. Mac views read ProposalRecord.
-// Legacy wire timestamps: first_seen, last_seen and staged_at all project
-// createdAt; resolved_at is unset. They are not independent historical facts.
+// Phone timestamp fields project `createdAt`; they are not independent historical facts, and `resolved_at` remains unset.
 extension MemoryProposalRecord {
     public init(_ proposal: ProposalRecord) {
         self.init(id: proposal.id, text: proposal.content,
@@ -60,7 +59,7 @@ public enum MobileToolCatalog {
 }
 
 extension NAProviderCatalogProvider {
-    /// The phone's credential-free row for one provider.
+    /// Never expose provider credentials in phone rows.
     public init(_ provider: ProviderInfo) {
         self.init(
             providerID: provider.provider_id,
@@ -93,6 +92,8 @@ extension NativeAgentEngine {
         let cards = projection.cardsByRow
         var result: [ChatMessageRecord] = []
         let messages = projection.messages
+        let window = Array(messages.filter { !$0.isAgentOwnTurnInput }.suffix(MacSyncEngine.transcriptSnapshotRowLimit))
+        let faces = await mobileTranscriptFaces(window)
         var toolsByRun: [String: [ToolEvent]] = [:]
         let lastReplyByRun = Dictionary(messages.filter { $0.role == "assistant" }.compactMap { row in
             row.runId.map { ($0, row.id) }
@@ -101,7 +102,10 @@ extension NativeAgentEngine {
             if let run = row.runId, let rawName = row.metadata?.toolName {
                 let name = ToolNameAliases.shown(rawName, inputJSON: row.metadata?.inputJSON).name
                 let output = row.metadata?.resultSummary.flatMap { try? JSONValue.parse(Data($0.utf8)) }
-                let outcome = output.map { ChatToolOutcome.recordedResultClass($0) ?? ChatToolOutcome.exactResultClass($0) }?.rawValue ?? "unknown"
+                let outcome = output.map { value in
+                    let reply = ToolResult(value)
+                    return ChatToolOutcome.recordedResultClass(reply.payload) ?? reply.outcome
+                }?.rawValue ?? "unknown"
                 let detail = output.map { [ChatToolOutcome.explanation($0), ChatToolOutcome.remedy($0)].compactMap { $0 }.joined(separator: " · ") }
                 let seq = toolsByRun[run, default: []].count + 1
                 toolsByRun[run, default: []].append(ToolEvent(name: name,
@@ -114,13 +118,16 @@ extension NativeAgentEngine {
             let events = message.runId.flatMap { lastReplyByRun[$0] == message.id ? toolsByRun[$0] : nil } ?? []
             var row = ChatMessageRecord(id: Self.phoneMessageID(message.id), sessionId: message.sessionId, role: message.role,
                 content: message.content, createdAt: message.createdAt, runId: message.runId,
-                source: message.source, metadata: message.metadata, isPersonVisible: !message.isHerOwnTurnInput)
+                source: message.source, metadata: message.metadata, isPersonVisible: !message.isAgentOwnTurnInput)
+            row.face = faces[message.id]
             row.toolEvents = events.isEmpty ? nil : events
             if let projected = cards[message.id]?.first {
                 var card = projected.interaction
                 card.continuation = nil
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
+                // Stable bytes: an unchanged card never reads as a changed transcript, so the phone never rebuilds a chat for nothing.
+                encoder.outputFormatting = [.sortedKeys]
                 row.interactionJSON = String(decoding: try encoder.encode(card), as: UTF8.self)
                 row.interactionDescriptorJSON = String(decoding: try encoder.encode(projected.descriptor), as: UTF8.self)
                 row.interactionSessionID = projected.sessionID
@@ -129,6 +136,36 @@ extension NativeAgentEngine {
         }
         return result
     }
+
+    @MainActor
+    private func mobileTranscriptFaces(_ messages: [ChatMessage]) async -> [String: TranscriptRowFace] {
+        guard !messages.isEmpty else { return [:] }
+        let receiptTitle = transcripts.firstConversationReceiptTitle
+        let presentation = transcripts.presentation
+        var faces = Dictionary(uniqueKeysWithValues: messages.map {
+            ($0.id, TranscriptRowFace.read($0, receiptTitle: receiptTitle))
+        })
+        for group in TranscriptGrouping.groups(messages) where group.isToolGroup {
+            if group.messages.count == 1, group.messages[0].metadata?.interactionMirror != nil { continue }
+            let foldRows = group.messages.filter { faces[$0.id]?.asks != true && faces[$0.id]?.receipt == nil }
+            guard let first = foldRows.first else { continue }
+            let key = "headline:" + first.id
+            if presentation.words(key, readyOnly: true) == nil {
+                let previous = presentation.words(key)
+                let prepared = await transcripts.prepareToolFold(foldRows)
+                // The owner's retained diagnostic suppresses repeated logs while later snapshots retry the failed preparation.
+                if presentation.words(key, readyOnly: true) == nil, previous != prepared {
+                    nativeLog("[DeviceSync] Tool fold %@ has no prepared headline: %@", first.id, prepared)
+                }
+            }
+            faces[first.id]?.headline = presentation.words(key, readyOnly: true)
+        }
+        for message in messages {
+            faces[message.id]?.detail = presentation.words("detail:" + message.id, readyOnly: true)
+        }
+        return faces
+    }
+
     @MainActor public func mobileProviderCatalogSnapshot() async throws -> (providers: [NAProviderCatalogProvider], routing: ProviderRoutingSnapshot) {
         switch await providers.refreshSettings(refreshCatalog: false, cause: { error, _ in error.localizedDescription }) {
         case .loaded(let snapshot):
@@ -139,12 +176,9 @@ extension NativeAgentEngine {
     }
 }
 
-/// A needs-User knock the router did not get onto any channel. Thrown so the
-/// edge is not committed as delivered and the next pass retries it.
+/// Throw on undelivered owner attention so the edge remains owed for the next pass.
 extension NativeAgentEngine {
-    /// The phone's message identity is a UUID. A transcript row with another live id
-    /// (an interaction mirror is `interaction-mirror-<card>`) gets one stable UUID
-    /// derived from that id, so every snapshot names the row the same way.
+    /// Derive stable UUIDs for non-UUID transcript ids so every phone snapshot names the same message.
     nonisolated static func phoneMessageID(_ id: String) -> String {
         if UUID(uuidString: id) != nil { return id }
         var bytes = Array(SHA256.hash(data: Data(("nativeagent.message:" + id).utf8)).prefix(16))
@@ -155,13 +189,7 @@ extension NativeAgentEngine {
     }
 }
 
-struct NeedsUserNotifyUndelivered: LocalizedError {
-    let projection: AttentionOutcome.Delivery
-    var errorDescription: String? { "needs-owner knock not delivered (\(projection.rawValue))" }
-}
-
-/// Device sync's reads and actions through the live engine's facades and the
-/// app's owners, remote Mac control and the attention router.
+/// Device sync shares live engine facades and native app owners.
 public struct EngineDeviceSyncHost: DeviceSyncHost {
     private let getEngine: @Sendable () -> NativeAgentEngine
     private let router: @Sendable () -> AttentionRouter
@@ -191,7 +219,7 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func workOverview() async -> (
         overview: WorkOverview, deskItems: [DeskItem]?,
         approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>,
-        executions: Result<[WorkshopTaskRecord], Error>
+        jobEvidence: Result<[DeskExecutionEvidence], Error>
     ) {
         let board = await engine.desk.refreshPage().board!
         let lifecycles = await engine.turns.lifecycleBySession
@@ -209,23 +237,23 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
                 return row
             }
         }
-        let executions: Result<[WorkshopTaskRecord], Error> = board.executions.unavailableReason.map {
-            .failure(NSError(domain: "Workshop", code: 1, userInfo: [NSLocalizedDescriptionKey: $0]))
-        } ?? .success(board.executions.items.map { row in
-            WorkshopTaskRecord(id: row.id, title: row.title, objective: row.objective,
-                status: row.status, phase: row.status, createdAt: row.createdAt,
-                updatedAt: row.updatedAt, currentStepId: row.currentStepId,
-                deskHandle: row.deskHandle.flatMap { $0.isEmpty ? nil : $0 },
-                projectSpaceId: row.projectSpaceId.flatMap { $0.isEmpty ? nil : $0 },
-                lastMovementAt: row.lastMovementAt,
-                requiresApproval: WorkOverviewRead.requiresApproval(status: row.status))
-        })
-        return (board.overview!, board.deskState?.items, approvals, board.inbox, executions)
+        // The jobs carrying Desk items are their movement on the phone, as on the Mac.
+        let jobEvidence: Result<[DeskExecutionEvidence], Error> = board.agentJobs.unavailableReason.map {
+            .failure(NSError(domain: "Jobs", code: 1, userInfo: [NSLocalizedDescriptionKey: $0]))
+        } ?? .success(board.agentJobs.items.filter { $0.desk != nil }.map(DeskMovementPresentation.evidence(of:)))
+        return (board.overview!, board.deskState?.items, approvals, board.inbox, jobEvidence)
     }
     public func getChatSessions() async throws -> [NativeAgentShared.ChatSession] { try await engine.transcripts.list() }
     public func getChatTranscriptGenerations() async throws -> [String: Int?] { try await engine.transcripts.transcriptGenerations() }
-    @MainActor public func sessionNavigation(for sessions: [NativeAgentShared.ChatSession]) -> ChatSessionNavigation { engine.transcripts.navigation(for: sessions) }
+    @MainActor public func sessionNavigation(
+        for sessions: [NativeAgentShared.ChatSession]
+    ) -> ChatSessionNavigation { engine.transcripts.navigation(for: sessions) }
     @MainActor public func surfaceLayout() -> SurfaceLayoutAvailability { engine.layout.availability }
+    /// The published faces: every page is read by its owner at launch and at each change, so a pass never reads one again.
+    @MainActor public func pageFaces() async -> [String: PartFaceSnapshot] { engine.pages.snapshots }
+    @MainActor public func faceAction(page: String, row: String, action: String, value: String?, device: String) async throws -> String? {
+        try await engine.pages.act(page: page, row: row, action: action, value: value, by: .person(door: "phone", device: device))
+    }
     public func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord] {
         try await engine.mobileChatMessages(sessionId: sessionId)
     }
@@ -242,14 +270,13 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func mobileToolCatalog() async throws -> [MobileToolCatalogRecord] {
         let native = MobileToolCatalog.records(from: try await engine.tools.loadCatalog())
         let root = engine.dataRoot
-        // Same checked, all-kind owner used by the Mac's Tools page. Guidance
-        // remains in skills_snapshot; executable parts must not disappear with it.
+        // Use the Tools page’s checked all-kind owner so executable parts remain visible alongside guidance.
         let abilities = try await Task.detached(priority: .utility) {
             try Parts(root: root).rows(kind: nil).map { row in
                 let checked = try JSONRow(.object(row))
                 let id = try checked.string("id")
                 let kind = try checked.string("kind")
-                // Parts supplies the display name and any row-local name damage.
+                // Parts owns both display names and row-local name damage.
                 return MobileToolCatalogRecord(id: "ability:" + id, name: try checked.string("name"),
                     kind: kind, status: try checked.optionalString("status"),
                     description: try checked.optionalString("unavailableReason") ?? checked.optionalString("description"))
@@ -273,15 +300,9 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
             graphPath: engine.dataRoot.appendingPathComponent("memory/memory.sqlite"), surface: "ios")
     }
     public func getRunsStrict() async -> [RunRecord]? { try? await engine.runs.refresh(dataRoot: engine.dataRoot) }
-    public func submitWorkshopExecution(title: String, objective: String) async throws -> DeviceSyncWorkshopSubmission {
+    public func submitDeskTask(title: String, objective: String) async throws -> DeviceSyncDeskTask {
         let result = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
-        return DeviceSyncWorkshopSubmission(executionId: result.executionId,
-                                            desk_handle: result.deskItem.handle, desk_alias: result.deskItem.alias)
-    }
-    public func resolveWorkshopStep(executionId: String, stepId: String, decision: String, provenance: ApprovalResolutionProvenance) async throws {
-        _ = try await engine.ports.backgroundWork.approvals.resolveWorkshopStep(
-            executionId: executionId, stepId: stepId, decision: decision, provenance: provenance,
-            runner: NativeAgentEngine.makeWorkshopExecutionRunner())
+        return DeviceSyncDeskTask(job: result.job, desk_handle: result.deskItem.handle, desk_alias: result.deskItem.alias)
     }
     public func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord {
         try await engine.memory.accept(proposalID: proposalID)
@@ -291,7 +312,8 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     }
     public func deleteMemory(id: String) async throws { try await engine.memory.delete(id: id) }
     public func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord {
-        try await engine.ports.backgroundWork.approvals.resolveApproval(id: id, decision: decision, provenance: provenance)
+        try await engine.ports.backgroundWork.approvals.resolveApproval(id: id, decision: decision, provenance: provenance,
+            turn: provenance.resolvingTurn)
     }
     public func inboxAction(_ id: String, action: String) async throws {
         try await platform.inboxAction(id, action: action)
@@ -312,14 +334,15 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func setActiveProvider(surface: String, providerId: String) async throws {
         try await engine.providers.routing.setActiveProvider(surface: surface, providerId: providerId)
     }
-    public func saveSurfaceSelection(surface: String, model: String, reasoningEffort: String?, serviceTier: String?, providerID: String?) async throws -> ProviderRoutingSnapshot {
+    public func saveSurfaceSelection(surface: String, model: String, reasoningEffort: String?, serviceTier: String?,
+        providerID: String?) async throws -> ProviderRoutingSnapshot {
         try await engine.providers.saveSurfaceSelection(
             surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier, providerID: providerID)
     }
     @MainActor public func pinnedChatSessionIDs() -> [String] { engine.transcripts.pinnedSessionIDs }
     @MainActor public func savePinnedChatSessionIDs(_ ids: [String]) throws { _ = try engine.transcripts.savePinnedSessionIDs(ids) }
     @MainActor
-    public func remoteMacControl(payload: [String: String]) async throws -> [String: String] {
+    public func remoteMacControl(payload: [String: String], turn: Turn) async throws -> [String: String] {
         let method = payload["method"] ?? ""
         guard let action = PhoneMacControlAction.resolve(payload) else {
             return ["status": "error", "message": "Unknown mac_control method: \(method)"]
@@ -349,8 +372,10 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
             body["level"] = level
         }
         let bodyData = try JSONSerialization.data(withJSONObject: body)
-        let receipt = try await platform.runMacControl(path: action.path, bodyData: bodyData)
-        let result = receipt.foundationObject as? [String: Any] ?? [:]
+        let receipt = try await platform.runMacControl(path: action.path, bodyData: bodyData,
+                                                     turn: turn, context: .init(dataRoot: engine.dataRoot))
+        let reply = ToolResult(receipt)
+        let result = reply.payload.foundationObject as? [String: Any] ?? [:]
 
         let nestedOutput = result["output"] as? [String: Any]
         func responseValue(_ key: String) -> Any? {
@@ -376,7 +401,7 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         }
 
         passthrough["status"] = (responseValue("status") as? String) ?? passthrough["status"] ?? "ok"
-        passthrough["result_class"] = ChatToolOutcome.exactResultClass(receipt).rawValue
+        passthrough["result_class"] = reply.outcome.rawValue
 
         let resultText: String
         if (responseValue("output_kind") as? String) == "binary_data" {
@@ -388,7 +413,7 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         } else if let stderr = responseValue("stderr") as? String, !stderr.isEmpty {
             resultText = stderr
         } else if let nestedOutput {
-            // Structured readers consume the output JSON without losing its keys.
+            // Preserve output JSON keys for structured readers.
             resultText = String(decoding: try JSONSerialization.data(withJSONObject: nestedOutput, options: [.sortedKeys]), as: UTF8.self)
         } else {
             resultText = (responseValue("error") as? String) ?? ""
@@ -397,24 +422,6 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         return passthrough
     }
 
-    public func knockNeedsUser(title: String, body: String, userInfo: [String: String]) async throws {
-        // Owner-waiting by definition — this notifier exists because Agent
-        // needs User.
-        let outcome = try await router().route(
-            eventId: userInfo["dedupKey"] ?? "needs_user",
-            importance: .ownerWaiting,
-            title: title,
-            body: body,
-            userInfo: userInfo
-        )
-        // Only checked delivery (including an already-delivered ledger row)
-        // projects as accepted. Queued/unknown, deferred, suppressed and failed
-        // outcomes cannot commit the episode; a throw keeps it owed.
-        let projection = outcome.deliveryProjection
-        guard projection.reachedAChannel else {
-            throw NeedsUserNotifyUndelivered(projection: projection)
-        }
-    }
 }
 
 public protocol EngineDeviceSyncPlatform: Sendable {
@@ -423,7 +430,7 @@ public protocol EngineDeviceSyncPlatform: Sendable {
     @MainActor func adoptProvider(_ id: String) async
     func inboxAction(_ id: String, action: String) async throws
     @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String]
-    @MainActor func runMacControl(path: String, bodyData: Data) async throws -> JSONValue
+    @MainActor func runMacControl(path: String, bodyData: Data, turn: Turn, context: MacOperationContext) async throws -> JSONValue
 }
 
 extension EngineDeviceSyncHost {
@@ -435,8 +442,8 @@ extension EngineDeviceSyncHost {
         try await engine.deviceHelperAction(action: action, payload: payload)
     }
 
-    public func agentThreadAction(action: String, payload: [String: String]) async throws -> [String: String] {
-        try await engine.deviceAgentThreadAction(action: action, payload: payload)
+    public func agentThreadAction(action: String, payload: [String: String], turn: Turn) async throws -> [String: String] {
+        try await engine.deviceAgentThreadAction(action: action, payload: payload, turn: turn)
     }
 }
 
@@ -449,7 +456,7 @@ extension EngineDeviceSyncHost {
     @MainActor
     public func setAppSetting(id: String, value: String, actionID: String, clientID: String) async throws -> MobileAppSetting {
         try await QuietSettings.setMobileSetting(host: platform.settingsHost(), id: id, value: value,
-                                                actionID: actionID, clientID: clientID)
+                                                actionID: actionID, clientID: clientID, turn: Turn(id: actionID))
     }
 
 }
@@ -524,6 +531,9 @@ extension AttentionDeliveryPorts {
         },
         slack: { input, dataRoot in
             await SlackWebAPI.notificationOutcome(input: input, dataRoot: dataRoot)
+        },
+        telegramApproval: { id, chat, root in
+            await ApprovalChatCards.deliverAttentionPrompt(id: id, chatId: chat, dataRoot: root)
         }
     )
     }
@@ -553,12 +563,13 @@ public struct EngineICloudIncomingTurnPort: ICloudIncomingTurnPort {
     }
 
     public func helperReply(message: String, sessionID: String, attachments: [NativeAgentShared.MultimodalAttachment], fileAccess: String,
-                            progress: TurnEventSink?) async throws -> ChatResponse {
+                            progress: TurnEventSink?, turn: Turn) async throws -> ChatResponse {
         guard let id = BotDefinition.id(forSession: sessionID) else { throw BotRunnerError.cannotRun("invalid helper session id") }
         let bot = try BotDefinitionStore(dataRoot: engine.dataRoot).get(id)
-        let reply = try await engine.standingBotSession(admitted: true, attachments: attachments, fileAccess: fileAccess, progress: progress)(bot, message)
+        let reply = try await engine.standingBotSession(admitted: true, attachments: attachments, fileAccess: fileAccess, progress: progress)(
+            bot, message, turn, .init(), .init())
         return StandingBotContinuity.response(reply, sessionID: sessionID,
-            runID: ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString)
+            runID: turn.run)
     }
 
     public func received(in sessionID: String) {
@@ -573,8 +584,7 @@ public struct EngineICloudIncomingTurnPort: ICloudIncomingTurnPort {
         engine.turns.runtime.controlHandoffGenerations[sessionID] ?? 0
     }
 
-    /// Waiting when a handoff landed, or sent by the phone before its handoff.
-    /// Same-second stamps are not provably older, so they run.
+    /// Same-second handoffs are not provably older, so they remain eligible to run.
     public func holdsMessageAfterControlHandoff(sessionID: String, receivedAtGeneration: Int, sentAt: Date) -> Bool {
         let runtime = engine.turns.runtime
         if (runtime.controlHandoffGenerations[sessionID] ?? 0) != receivedAtGeneration { return true }

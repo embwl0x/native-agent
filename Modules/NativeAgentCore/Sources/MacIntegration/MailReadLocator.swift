@@ -10,7 +10,7 @@ public struct MailReadLocator {
     /// Mail's account id: the host of the message's mailbox URL in Mail's index.
     public let accountID: String?
     public let position: Int?
-    /// The fields that carry one row's exact identity from a list to a later read or action.
+    /// Carry the same row identity from listing into later reads and actions.
     public static let fields: Set<String> = ["message_id", "expected_message_id", "expected_account", "expected_account_id", "position", "scope"]
 
     public static func parse(_ input: [String: JSONValue], allowMissingMessageID: Bool = false) -> Self? {

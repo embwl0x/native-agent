@@ -1,11 +1,10 @@
 import Foundation
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `KnowledgeGraphReadProjection.swift` | Checked complete graph projection, typed canvas entities/edges with complete last-seen timestamp parsing, and derived neighborhoods from the same snapshot; `canonicalAgentGraphProjection`, `canonicalKnowledgeGraphSnapshotData` |
+// Blueprint: | `KnowledgeGraphReadProjection.swift` | `canonicalAgentGraphProjection`, `canonicalKnowledgeGraphSnapshotData`: checked graph projections |
 
 extension KnowledgeGraphEntity {
-    /// Only a complete recorded timestamp establishes recency. Do not salvage
-    /// a date prefix or substitute creation time for missing last-seen evidence.
+    /// Only a complete recorded timestamp establishes recency. Do not salvage a date prefix or substitute creation time for missing last-seen evidence.
     public var lastSeenDate: Date? {
         lastSeen.flatMap(Self.parseLastSeen)
     }
@@ -35,7 +34,6 @@ public struct CanonicalAgentGraphReadout: Sendable {
     }
 }
 
-/// Checked graph projections shared by mounted views and remote snapshots.
 public enum AgentGraphReads {
     public static func canonicalAgentGraphProjection(
         graphPath: URL = SwiftNativeKnowledgeGraphReader.defaultPath(),

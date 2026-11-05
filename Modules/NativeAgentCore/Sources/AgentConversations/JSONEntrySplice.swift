@@ -1,13 +1,11 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `JSONEntrySplice.swift` | Byte-preserving JSON/JSONC server and nested permission member splicing, validation and duplicate-key refusal over shared JSONByteScanner spans |
+// Blueprint: | `JSONEntrySplice.swift` |  |
 
-/// Splice one member without re-encoding the rest. Validate the complete object
-/// before shared lexical scanning; refuse unreadable or ambiguous settings.
+/// Validate the whole object before splicing; foreign bytes must survive and ambiguous settings must be refused.
 enum JSONEntrySplice {
 
-    /// Nested permission members use the same scanner and byte splice as server
-    /// entries. Existing ancestor objects and sibling bytes are never re-encoded.
+    /// Nested edits share the byte scanner so ancestors and siblings are never re-encoded.
     static func member(_ data: Data, path: [String]) throws -> String? {
         let bytes = try validatedBytes(data, comments: true, trailingCommas: true)
         var open = try objectStart(bytes)
@@ -49,15 +47,11 @@ enum JSONEntrySplice {
         return output
     }
 
-    /// THE ONE member of this name, or none. JSON permits duplicate keys and
-    /// readers disagree about which of them wins, so a file carrying two is
-    /// ambiguous: we would edit the copy the host is going to ignore, and the
-    /// person would see a connection that does not work. Refuse before
-    /// splicing rather than guess which one is live.
+    /// Refuse duplicate keys because readers disagree which copy wins; a splice cannot safely choose the live one.
     static func unique(_ members: [JSONByteScanner.Member], named key: String, called what: String) throws -> JSONByteScanner.Member? {
         let matches = members.filter { $0.key == key }
         guard matches.count <= 1 else {
-            throw AgentHostConfigWriter.Failure.unparsable(
+                    throw AgentHostConfigWriter.Failure.unparsable(
                 "it has more than one \(what) named \"\(key)\", so which one the app actually uses is ambiguous")
         }
         return matches.first
@@ -76,8 +70,7 @@ enum JSONEntrySplice {
         let original = [UInt8](data)
         let root = try JSONByteScanner.members(bytes, from: try objectStart(bytes))
         guard let container = try unique(root.members, named: containerKey, called: "section") else {
-            // No servers configured yet: add the whole container as one new
-            // top-level member, leaving every existing member untouched.
+            // Add an absent container as one member without touching existing members.
             let indent = indentation(bytes, memberStart: root.members.first?.start)
             let member = originalMember ?? (quoted(name) + ": " + reindented(entryJSON, by: indent + indent))
             let body = "\"\(containerKey)\": {\n\(indent)\(indent)" + member + "\n\(indent)}"
@@ -125,8 +118,7 @@ enum JSONEntrySplice {
                 String(decoding: original[member.start..<member.end], as: UTF8.self))
     }
 
-    /// Find our command AND connection id throughout the document, including
-    /// renamed or relocated members. A same-name foreign member is never ours.
+    /// Find our command AND connection id throughout the document, including renamed or relocated members. A same-name foreign member is never ours.
     static func disconnect(_ data: Data, owner: AgentHostConfigWriter.JSONOwnership,
                            containerKey: String, comments: Bool, trailingCommas: Bool) throws
         -> (data: Data, replaced: Bool, removed: Bool)? {
@@ -166,9 +158,12 @@ enum JSONEntrySplice {
         if let original = owner.original {
             if let current = try entry(output, name: owner.name, containerKey: containerKey,
                                        comments: comments, trailingCommas: trailingCommas)?.value {
-                let lhs = try JSONSerialization.jsonObject(with: Data(validatedBytes(Data(current.utf8), comments: comments, trailingCommas: trailingCommas))) as? NSDictionary
-                let rhs = try JSONSerialization.jsonObject(with: Data(validatedBytes(Data(original.utf8), comments: comments, trailingCommas: trailingCommas))) as? NSDictionary
-                guard lhs == rhs else { throw AgentHostConfigWriter.Failure.unparsable("the original entry's name is occupied; resolve the collision before disconnecting") }
+                let lhs = try JSONSerialization.jsonObject(with: Data(validatedBytes(Data(current.utf8), comments: comments,
+                    trailingCommas: trailingCommas))) as? NSDictionary
+                let rhs = try JSONSerialization.jsonObject(with: Data(validatedBytes(Data(original.utf8), comments: comments,
+                    trailingCommas: trailingCommas))) as? NSDictionary
+                guard lhs == rhs else { throw AgentHostConfigWriter.Failure.unparsable(
+                    "the original entry's name is occupied; resolve the collision before disconnecting") }
             } else {
                 output = try upsert(output, name: owner.name, entryJSON: original,
                     containerKey: containerKey, comments: comments, trailingCommas: trailingCommas,
@@ -181,8 +176,7 @@ enum JSONEntrySplice {
 
     // MARK: Scanning
 
-    /// Mask JSONC trivia with spaces, keeping every byte offset into the original.
-    /// Foundation validates the entire document, including nested values and EOF.
+    /// Mask JSONC trivia with spaces, keeping every byte offset into the original. Foundation validates the entire document, including nested values and EOF.
     static func validatedBytes(_ data: Data, comments: Bool, trailingCommas: Bool = true,
                                preservingTrailingCommas: Bool = false) throws -> [UInt8] {
         do {
@@ -256,19 +250,17 @@ enum JSONEntrySplice {
         return output
     }
 
-    /// A removed member takes its own separating comma with it, so the object
-    /// is still valid JSON and no other member's bytes move.
+    /// Remove the member’s separating comma too, preserving valid JSON and every sibling byte.
     private static func deletionRange(_ bytes: [UInt8], of member: JSONByteScanner.Member, in scan: JSONByteScanner.Scan) -> Range<Int> {
         guard let position = scan.members.firstIndex(where: { $0.start == member.start }) else {
             return member.start..<member.end
         }
         if position > 0 {
-            // Take everything from the end of the previous member: the comma,
-            // and the whitespace that belonged to this row.
+            // Include the preceding separator and this row’s whitespace in the removed range.
             return scan.members[position - 1].end..<member.end
         }
         if scan.members.count > 1 {
-            // First of several: take up to the start of the next member.
+            // The first member owns the separator before the next member.
             return member.start..<scan.members[1].start
         }
         var end = member.end
@@ -283,13 +275,10 @@ enum JSONEntrySplice {
         if let last = scan.members.last {
             return splice(bytes, range: last.end..<last.end, with: ",\n" + indent + text)
         }
-        // An empty object: put the first member between its braces.
         return splice(bytes, range: (scan.open + 1)..<(scan.open + 1), with: text)
     }
 
-    /// The indentation the file already uses for members of this object, so an
-    /// inserted row looks like the rows around it. Two spaces when the object
-    /// is empty or written on one line.
+    /// Match existing indentation; empty or single-line objects use two spaces.
     private static func indentation(_ bytes: [UInt8], memberStart: Int?) -> String {
         guard let memberStart else { return "  " }
         var index = memberStart - 1
@@ -301,8 +290,7 @@ enum JSONEntrySplice {
         return String(decoding: run.reversed(), as: UTF8.self)
     }
 
-    /// Our entry is authored with two-space indents at depth zero; push every
-    /// line after the first out to where it is being pasted.
+    /// Shift authored two-space indentation to the insertion depth.
     private static func reindented(_ text: String, by indent: String) -> String {
         text.split(separator: "\n", omittingEmptySubsequences: false)
             .enumerated()
@@ -310,9 +298,7 @@ enum JSONEntrySplice {
             .joined(separator: "\n")
     }
 
-    /// A JSON string literal. Slashes stay slashes: this file is one the person
-    /// opens and reads, and a path written as `\/Users\/…` is legal JSON that
-    /// looks like a mistake.
+    /// Keep slashes readable because the person reads paths directly in this file.
     static func quoted(_ text: String) -> String {
         guard let data = try? JSONSerialization.data(
                 withJSONObject: text, options: [.fragmentsAllowed, .withoutEscapingSlashes]),

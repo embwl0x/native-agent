@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `TrustBackupModels.swift` | Backup records and restore results; requiresRestart distinguishes staged scopes/time from completed installation; notCarried records unreadable pieces, causes and losses |
+// Blueprint: | `TrustBackupModels.swift` | Staged and installed results remain distinct. |
 
 public struct BackupRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String

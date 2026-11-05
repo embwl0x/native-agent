@@ -10,11 +10,11 @@ import PersistenceCore
 import Studio
 import Senses
 
-// Blueprint: | `WorkPane.swift` | `WorkPaneState` and `WorkPane`: one read-only work column's Steps/Screen/Make selection, explicit visibility and turn-driven auto-open |
+// Blueprint: | `WorkPane.swift` | `WorkPaneState`, `WorkPane`: read-only tabs, visibility and turn-driven auto-open |
 
-// The main window's Work pane reads the turn; opening or closing it never changes the work.
+// Pane visibility must never change the work it observes.
 
-/// What the pane shows. `make` carries the ref the Make studio opens.
+/// Carry Make identity so opening the tab reaches the same artifact.
 enum WorkPaneTab: Hashable {
     case steps
     case screen
@@ -33,33 +33,27 @@ enum WorkPaneTab: Hashable {
     }
 }
 
-/// The pane's one owner, shared by the header button, the menu, the turn
-/// card, the auto-open and the agent's `pane.show`. Whether it is open lives
-/// in defaults, so views read it through `@AppStorage(openKey)` and it
-/// survives a relaunch; the tab and which turns User closed it in live here.
+/// Share pane ownership across controls and actions; persist visibility across launches.
+/// Keep tab selection and user-closed turn identities local to this owner.
 @MainActor
 @Observable
 final class WorkPaneState {
     static let shared = WorkPaneState()
     static let openKey = "NativeAgent.workPane.open"
-    /// The pane opened itself (or she opened it) for a turn's steps or
-    /// screen; it closes again once nothing is running. User's own open, and
-    /// one for something new in Make, stay open. In defaults, so a pane left
-    /// open that way closes on the next launch too.
+    /// Auto-opened panes close when work ends; user opens and new Make artifacts stay open.
+    /// Persist auto-open state so an idle pane also closes after relaunch.
     static let transientKey = "NativeAgent.workPane.transient"
     static let widthKey = "NativeAgent.workPane.width"
-    /// ⌘0: the rail and the conversations column hidden, chat fills the window.
     static let sidebarsHiddenKey = "NativeAgent.shell.sidebarsHidden"
 
     var tab: WorkPaneTab = .steps {
         didSet { if case .make(let ref) = tab { makeRef = ref } }
     }
-    /// The last ref Make was opened on, so the tab keeps it across a switch.
+    /// Retain Make identity across tab switches so selection cannot jump to another artifact.
     private(set) var makeRef: String?
-    /// Turns that were running when User closed the pane. User closing it wins:
-    /// nothing but User reopens it for those turns.
+    /// User closure wins for all running turns; only the user can reopen the pane for them.
     @ObservationIgnored private var closedByUser: Set<String> = []
-    /// Turns the pane already opened itself for: once per turn.
+    /// Track auto-opened turns so each may open the pane only once.
     @ObservationIgnored private var autoOpened: Set<String> = []
 
     private var isOpen: Bool {
@@ -72,14 +66,13 @@ final class WorkPaneState {
         set { UserDefaults.standard.set(newValue, forKey: Self.transientKey) }
     }
 
-    /// Nothing is running: a pane that opened itself goes again.
+    /// Close only auto-opened panes so idle settlement preserves the user's open choice.
     func closeIfIdle() {
         guard transient else { return }
         transient = false
         isOpen = false
     }
 
-    /// User's own open or close: the header button, ⌥⌘0.
     func userToggle(appModel: AppModel) {
         if isOpen {
             closedByUser = Set(appModel.engine.turns.activeTurnIDsBySession.values)
@@ -101,8 +94,7 @@ final class WorkPaneState {
         turnID.map(closedByUser.contains) ?? false
     }
 
-    /// `pane.show` / `pane.hide`. The composer verb has already refused a
-    /// show in a turn User closed the pane during.
+    /// The composer already refuses reopening a pane the user closed during this turn.
     func agentShow(_ tab: WorkPaneTab) {
         self.tab = tab
         if !isOpen || transient { transient = tab.kind != .make }
@@ -114,14 +106,11 @@ final class WorkPaneState {
         isOpen = false
     }
 
-    /// User picked a tab in a pane that opened itself: it is his now.
+    /// Choosing a tab makes an auto-opened pane user-owned so settlement cannot close it.
     func keep() { transient = false }
 
-    /// The turn on screen produced its first showable screen: open on Screen,
-    /// once per turn, unless User closed the pane during it. Already open, it
-    /// stays on whatever tab User is reading.
-    /// Something new landed in Make during a turn (an image she generated,
-    /// a mockup she added): the pane pops it up, unless User closed it this turn.
+    /// Auto-open once for a first screen or new Make artifact unless the user closed this turn.
+    /// Preserve the selected tab when the pane is already open.
     func autoOpenMake(turnID: String) {
         guard !closedByUser.contains(turnID) else { return }
         tab = .make(ref: nil)
@@ -144,8 +133,7 @@ final class WorkPaneState {
 struct WorkPane: View {
     static let defaultWidth = 420.0
     static let widthRange = 320.0...760.0
-    /// How narrow the pane may get when the window itself is too tight to
-    /// give it the width User chose; the chat keeps its own floor first.
+    /// Preserve chat's minimum width before honoring the user's chosen pane width.
     static let floorWidth = 240.0
 
     @Environment(AppModel.self) private var appModel
@@ -157,10 +145,7 @@ struct WorkPane: View {
 
     var body: some View {
         let state = WorkPaneState.shared
-        // A screenshot's copy is 1280 wide, not the window's width. At the
-        // width User gave the pane it squeezed the chat to its 380 floor, and
-        // the composer wrapped tall and spilled into the pane. The copy draws
-        // the pane at its floor so the chat keeps its room column, as on screen.
+        // Snapshot width is fixed; use the pane floor so the chat and composer retain their room.
         let width = quietOffscreenRead ? Self.floorWidth : dragWidth ?? storedWidth
         let sessionId = appModel.activeChatSessionId
         HStack(spacing: 0) {
@@ -217,7 +202,6 @@ struct WorkPane: View {
         .accessibilityIdentifier("chat.work-pane")
     }
 
-    /// The hairline between chat and pane, and the handle that resizes it.
     private func seam(width: Double) -> some View {
         Rectangle()
             .fill(NativeAgentShell.hairline)
@@ -249,18 +233,12 @@ struct WorkPane: View {
 
 // MARK: - Steps
 
-/// The turn's steps as one-liners: what is happening now on top with a soft
-/// live dot, what went before below it — a check only for a tool whose result
-/// says it worked, a cross for one refused or failed. Pending approvals for this
-/// chat sit above them, as the same card the transcript shows — one shared
-/// inbox, so answering here answers there.
+/// Derive step outcomes from tool results, not terminal reasons; share approvals with the transcript inbox.
 struct WorkPaneSteps: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
 
-    /// The finished steps, newest first, and what is happening now. Stream
-    /// bumps and repeats of one action collapse; a terminal reason is the
-    /// turn's outcome, not a step.
+    /// Collapse streaming repeats and exclude terminal reasons so the step list reflects actual actions.
     static func steps(_ turn: TurnPresentationState)
         -> (now: String?, done: [(text: String, outcome: TurnPresentationActivity.Outcome?)]) {
         var seen: [(text: String, outcome: TurnPresentationActivity.Outcome?)] = []
@@ -268,13 +246,12 @@ struct WorkPaneSteps: View {
             guard let detail = activity.detail, seen.last?.text != detail else { continue }
             seen.append((detail, activity.outcome))
         }
-        let now = turn.isTerminal ? nil : turn.currentAction
+        let now = turn.isTerminal ? nil : turn.writing?.line ?? turn.currentAction
         if let now, seen.last?.text == now { seen.removeLast() }
         return (now, seen.reversed())
     }
 
-    /// The live line when the turn has no named action: it is thinking, or
-    /// writing the reply.
+    /// With no named action, distinguish thinking from writing instead of inventing a tool step.
     static func liveLine(_ turn: TurnPresentationState) -> String {
         turn.currentAction ?? (turn.streamedTextLength > 0 ? "Writing the reply" : "Thinking")
     }
@@ -309,7 +286,6 @@ struct WorkPaneSteps: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                 }
                 ForEach(Array(steps.done.enumerated()), id: \.offset) { _, step in
-                    // The step's own words name its outcome ("Refused: …").
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Image(systemName: step.outcome == .ok ? "checkmark" : "xmark")
                             .font(ShellType.caption)
@@ -340,9 +316,7 @@ struct WorkPaneSteps: View {
 
 // MARK: - Screen
 
-/// What the turn is looking at while it drives the Mac, full pane width. The
-/// capture side has already painted out every secure field, and the picture
-/// never leaves this process.
+/// Capture already redacts secure fields; keep the screen picture inside this process.
 struct WorkPaneScreen: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
@@ -383,10 +357,7 @@ struct WorkPaneScreen: View {
 
 // MARK: - Header button
 
-/// The room header's Work button. With the pane closed while a turn runs it
-/// is the slim pill — "● Working · what is happening" — and a click opens the
-/// pane. Idle, it is the word Work. It shares the engine's busy/streaming
-/// visibility with glow and haze; the header and ChatView do not observe it.
+/// Observe busy state in this leaf so Work status cannot invalidate the header or ChatView.
 struct WorkPaneHeaderButton: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -421,25 +392,21 @@ struct WorkPaneHeaderButton: View {
         .accessibilityIdentifier("chat.work-button")
     }
 
-    /// While the Mac is being driven the verb's own words win, as on the turn
-    /// card; otherwise the turn's current action.
+    /// Prefer the driving verb's words so Work status agrees with the turn card.
     private func pillLine(_ turn: TurnPresentationState, sessionId: String) -> String {
         let preview = appModel.engine.turns.screenPreview(for: sessionId)
         let what = preview?.isShowable == true ? preview?.caption : turn.currentAction
-        // Cut at a word, short enough to sit beside the status dot.
+        // Cut at words so the short status remains readable beside its dot.
         return what.map { "Working · " + TodayWords.bounded($0, limit: 36) } ?? "Working"
     }
 }
 
 // MARK: - Auto-open
 
-/// Zero-size: opens the pane on Screen the first time the turn on screen
-/// produces a showable screen (it started driving the Mac or the browser).
-/// Plain chat turns never produce one, so they never open it.
+/// Open only when a turn produces a screen; ordinary chat must not open the pane.
 struct WorkPaneAutoOpen: View {
     @Environment(AppModel.self) private var appModel
-    /// The newest Make version seen; `.none` until the studio is first read,
-    /// so a first artifact in an empty studio still counts as new.
+    /// Start at none so the first artifact in an empty studio still counts as new.
     @State private var lastMake: String?? = .none
     private var makeShelf: MakeStudio.Shelf { appModel.engine.make }
 
@@ -451,7 +418,6 @@ struct WorkPaneAutoOpen: View {
         Color.clear
             .frame(width: 0, height: 0)
             .accessibilityHidden(true)
-            // Nothing running anywhere: a pane that opened itself closes.
             .onChange(of: turns.activeTurnIDsBySession.isEmpty, initial: true) { _, idle in
                 if idle { WorkPaneState.shared.closeIfIdle() }
             }
@@ -459,7 +425,6 @@ struct WorkPaneAutoOpen: View {
                 guard let turnID else { return }
                 WorkPaneState.shared.autoOpen(turnID: turnID, running: turns.activeTurnIDsBySession.values)
             }
-            // A new Make version while this chat's turn runs pops up in the pane.
             .task {
                 makeShelf.start()
             }
@@ -477,15 +442,13 @@ struct WorkPaneAutoOpen: View {
 
 // MARK: - Menu
 
-/// View ▸ Hide Sidebar (⌘0), Show Work Pane (⌥⌘0), Show Shotgun (its chosen
-/// shortcut) and, in dark mode, Warmth in the glass (Simple's words).
 struct ShellViewCommands: Commands {
     let appModel: AppModel
     @AppStorage(WorkPaneState.sidebarsHiddenKey) private var sidebarsHidden = false
     @AppStorage(WorkPaneState.openKey) private var workPaneOpen = false
     @AppStorage(SimpleViewMode.key) private var viewMode = ""
     @AppStorage(ShotgunShortcut.storageKey) private var shotgunShortcut = ShotgunShortcut.optionSpace.rawValue
-    /// Simple's settings menu carries the same switch; this is Advanced's.
+    /// Share the warmth switch with Simple settings so both modes keep the same preference.
     @AppStorage(MoodTintPreference.key) private var warmth = true
 
     var body: some Commands {
@@ -496,17 +459,15 @@ struct ShellViewCommands: Commands {
                 WorkPaneState.shared.userToggle(appModel: appModel)
             }
             .keyboardShortcut("0", modifiers: [.command, .option])
-            // Only Advanced has a Work pane (the agent's show_pane refuses the same).
+            // Offer Work only in Advanced, matching the agent action's visibility rule.
             .disabled(SimpleViewMode.resolved(viewMode) != SimpleViewMode.advanced)
-            // Shown with the chosen shortcut; the item works even when another
-            // app owns that shortcut or it is off.
+            // Keep the menu action usable even if another app owns the configured shortcut.
             Button(ShotgunController.shared.isShown ? "Hide Shotgun" : "Show Shotgun") {
                 ShotgunController.shared.toggle()
             }
             .keyboardShortcut(ShotgunShortcut(rawValue: shotgunShortcut)?.menuModifiers
                 .map { KeyboardShortcut(.space, modifiers: $0) })
-            // The warmth only lands in dark mode (MoodTintGate), so it is
-            // offered only there.
+            // Offer warmth only in dark mode because MoodTintGate applies it only there.
             if AppearanceController.shared.isDark {
                 Divider()
                 Toggle("Warmth in the glass", isOn: $warmth)

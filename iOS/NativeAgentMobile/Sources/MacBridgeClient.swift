@@ -15,13 +15,11 @@ enum MacBridgeReconnectPolicy {
 
 /// Refresh only while an age can change the connection or its displayed recency.
 enum MacConnectionRefreshPolicy {
-    /// Cadence while a presence, startup or transport boundary is imminent.
     static let activeInterval: TimeInterval = 5
     /// Foreground presence rereads are at most once a minute.
     static let presenceRefreshInterval: TimeInterval = 60
 
-    /// Seconds until the next recompute, or nil when nothing time-dependent
-    /// remains — the availability publisher and any Mac confirmation re-arm it.
+    /// Stop ticking when no age-dependent facts remain; availability events and Mac confirmations rearm the clock.
     static func refreshInterval(
         now: Date,
         lastSeenAt: Date?,
@@ -36,19 +34,17 @@ enum MacConnectionRefreshPolicy {
            now.timeIntervalSince(connectingStartedAt) <= initialConnectingInterval {
             return activeInterval
         }
-        // Paired + unavailable is still counting up to the transport diagnosis.
+        // Paired unavailability still needs a clock until transport diagnosis becomes due.
         if isPaired, let bridgeUnavailableSince,
            now.timeIntervalSince(bridgeUnavailableSince) < macUnreachableThreshold {
             return activeInterval
         }
         if let lastSeenAt {
-            // After the presence window, refresh at minute or hour granularity.
             let age = now.timeIntervalSince(lastSeenAt)
             if age <= recentLastSeenInterval { return max(activeInterval, recentLastSeenInterval - age) }
             return age < 3600 ? presenceRefreshInterval : 3600
         }
-        // Never seen, not connecting, already past the unreachable threshold:
-        // the projection is settled until an event changes an input.
+        // Without presence or connecting state, stop ticking after the unreachable threshold until an input changes.
         return nil
     }
 }
@@ -70,12 +66,11 @@ final class MacBridgeClient: ObservableObject {
     private var bridgeAvailabilityCancellable: AnyCancellable?
     private var macKeyCancellable: AnyCancellable?
     private var pairingCancellable: AnyCancellable?
-    /// The key the account's Mac pairing record held when last read.
     @Published private(set) var macPairingKey: iCloudBridge.MacPairingKeyReading?
     private var networkPathCancellable: AnyCancellable?
     private var statusRefreshTask: Task<Void, Never>?
     private let pathObserver: NetworkPathObserver = .shared
-    /// Resume queued sends on network restoration; replay a missed event when the callback is set.
+    /// Replay a missed network-restoration event when the queue callback attaches.
     var onNetworkPathRestored: (() -> Void)? {
         didSet {
             guard missedPathRestore, let onNetworkPathRestored else { return }
@@ -84,18 +79,15 @@ final class MacBridgeClient: ObservableObject {
         }
     }
     private var missedPathRestore = false
-    /// When the presence beat was last re-read, only while the app is open.
     private var presenceRereadAt: Date?
-    /// nil until NWPathMonitor reports; nil never paints an outage. Republished
-    /// here so views observing the client see the transition.
+    /// Nil means NWPathMonitor has not reported, so it cannot establish an outage; republish changes for client-observing views.
     @Published private(set) var deviceIsOffline: Bool?
-    /// Banner copy for the offline case, or nil when there is nothing to say.
     var offlineBannerMessage: String? {
         NetworkPathObserver.offlineBannerMessage(isOffline: deviceIsOffline)
     }
     var connectingStartedAt: Date?
     private var bridgeUnavailableSince: Date?
-    /// Pairing distinguishes an unreachable Mac after 30 seconds of bridge unavailability.
+    /// Wait 30 seconds of bridge unavailability before classifying a paired Mac as unreachable.
     weak var pairingStore: PairingStore? {
         didSet {
             pairingCancellable = pairingStore?.objectWillChange.sink { [weak self] _ in
@@ -105,7 +97,7 @@ final class MacBridgeClient: ObservableObject {
         }
     }
 
-    /// NAMacPresence defines the phone's window for the Mac's two-minute idle heartbeat.
+    /// Use NAMacPresence's window for the Mac's two-minute idle heartbeat.
     private static let recentLastSeenInterval = NAMacPresence.phoneWindow
     private static let initialConnectingInterval: TimeInterval = 30
     private static let macUnreachableThreshold: TimeInterval = 30
@@ -135,7 +127,7 @@ final class MacBridgeClient: ObservableObject {
                     let wasOffline = self.deviceIsOffline
                     self.deviceIsOffline = offline
                     self.refreshConnection()
-                    // An already-online cold launch also resumes retained sends.
+                    // Cold launch must resume retained sends even when the network was already online.
                     if wasOffline != false, offline == false {
                         if let handler = self.onNetworkPathRestored { handler() }
                         else { self.missedPathRestore = true }
@@ -166,7 +158,7 @@ final class MacBridgeClient: ObservableObject {
         return .init(.holds, "Paired with your Mac")
     }
 
-    /// Each fact comes directly from this phone's pairing, transport and Mac evidence.
+    /// Derive connection facts only from this phone's pairing, transport and Mac evidence.
     private func assessedConnection(now: Date) -> NAPhoneConnection {
         var transport = NAPhoneConnection.Fact(.holds, "iCloud is carrying our messages")
         var exchange = NAPhoneConnection.Fact(.waiting, "Not heard from your Mac yet")
@@ -273,7 +265,7 @@ final class MacBridgeClient: ObservableObject {
         attachments: [MultimodalAttachment] = [],
         suppressRemoteUserAppend: Bool = false,
         replacementAssistantMessageID: UUID? = nil,
-        /// A caller-supplied correlation ID lets Stop name the run before send returns.
+        /// Accept a caller-minted correlation so Stop can name the run before transport returns.
         messageID: String = UUID().uuidString,
         preparedMessage: BridgeMessage? = nil,
         expectedPairing: String? = nil,
@@ -326,9 +318,7 @@ final class MacBridgeClient: ObservableObject {
         return metadata
     }
 
-    /// `runIDs` name the in-flight turns this Stop is for. The Mac cancels
-    /// only a run it was given, so a send issued straight after Stop is never
-    /// cancelled in place of the turn the user stopped.
+    /// Stop names exact runs so a subsequent send cannot be cancelled in place of the work the user stopped.
     func steerChat(sessionID: String, runID: String, text: String) async throws -> Bool {
         try await iCloudSyncEngine.shared.steerChat(sessionId: sessionID, runId: runID, text: text)
     }
@@ -357,15 +347,13 @@ final class MacBridgeClient: ObservableObject {
 
     @discardableResult
     func observeICloudReplyRejections(onReject: @escaping (ICloudBridgeRejectedMessage) -> Void) -> UUID? {
-        // A record that failed verification is not the Mac speaking: it never
-        // refreshes presence.
+        // Unverified records cannot refresh Mac presence.
         bridge.observeRejectedMessages(onReject: onReject)
     }
 
-    /// Observe unsigned signature_invalid_resync hints for chat send recovery.
     @discardableResult
     func observeICloudResyncHints(onHint: @escaping (BridgeMessage) -> Void) -> UUID? {
-        // Unsigned, so it is no evidence the Mac is up.
+        // Unsigned hints cannot prove Mac presence.
         bridge.observeResyncHints(onResync: onHint)
     }
 
@@ -388,9 +376,7 @@ final class MacBridgeClient: ObservableObject {
         return delivered
     }
 
-    /// Only Mac-originated activity or a confirmed Mac action may refresh the
-    /// status chip. Queuing an iPhone message proves iCloud accepted it, not
-    /// that the Mac is awake to process it.
+    /// Only Mac activity or confirmed Mac actions refresh status; an accepted phone upload proves iCloud receipt only.
     func recordMacConfirmation(at timestamp: Date = Date()) {
         guard timestamp > (lastSeenAt ?? .distantPast) else { return }
         connectingStartedAt = nil
@@ -404,7 +390,7 @@ final class MacBridgeClient: ObservableObject {
             bridgeUnavailableSince = now
         }
         var next = assessedConnection(now: now)
-        // An old sighting waits for a foreground presence read before losing contact.
+        // Require foreground presence read before an old sighting loses contact.
         if next.transport.state == .holds, next.exchange.state == .waiting, lastSeenAt != nil,
            UIApplication.shared.applicationState == .active,
            now.timeIntervalSince(presenceRereadAt ?? .distantPast) >= MacConnectionRefreshPolicy.presenceRefreshInterval {
@@ -421,7 +407,6 @@ final class MacBridgeClient: ObservableObject {
         rescheduleStatusRefresh(now: now)
     }
 
-    /// Arm one recompute at the cadence the current ages justify.
     private func rescheduleStatusRefresh(now: Date) {
         statusRefreshTask?.cancel()
         guard let interval = MacConnectionRefreshPolicy.refreshInterval(
@@ -455,9 +440,7 @@ final class MacBridgeClient: ObservableObject {
         } else {
             return .unavailable
         }
-        // A refresh is also the missed-reply recovery path. Existing in-memory
-        // rows do not prove that the latest Mac snapshot has been adopted.
-        // The snapshot reader retains last-good rows if the read is unavailable.
+        // Refresh may recover a missed reply; cached rows cannot prove newest-snapshot adoption, and unavailable reads must retain admitted rows.
         await engine.refreshChatTranscriptsSnapshot()
         return engine.transcriptRead(for: sid)
     }

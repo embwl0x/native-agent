@@ -4,14 +4,11 @@ import PersistenceCore
 import Privacy
 import ApprovalInbox
 import NativeAgentShared
-// Blueprint: | `BrowserActionRoutes.swift` | Browser orchestration; previews return validated in-memory runs; every post-start page preflight/effect exit reaches settlement; malformed approval payloads throw to the checked approval owner; task-local `retainRead` delivers the exact visible read capture |
+import Dispatcher
+// Blueprint: | `BrowserActionRoutes.swift` | Canonical claims settle every exit; previews stay in memory; `retainRead` owns exact captures |
 
-/// Browser operation orchestration. The canonical reducer remains the sole
-/// owner of persisted transitions and derived native-action receipts.
+/// The canonical reducer alone persists transitions and derives native-action receipts.
 public struct BrowserActionRoutes: Sendable {
-    /// The read door retains this exact capture before disposable artifacts
-    /// can expire. It never needs another visible read to recover the evidence.
-    @TaskLocal public static var retainRead: (@Sendable (BrowserVisibleCapture) -> Void)?
     let effects: any BrowserRouteEffects
 
     public init(effects: any BrowserRouteEffects) {
@@ -34,10 +31,10 @@ public struct BrowserActionRoutes: Sendable {
         dryRun: Bool,
         captureSource: Bool,
         captureScreenshot: Bool,
-        dataRoot: URL
+        dataRoot: URL,
+        imageSink: LocalToolImage.Sink?
     ) async throws -> BrowserRun {
-        // Browser Core owns every canonical operation transition and derived
-        // receipt. The app owns only the visible WKWebView effect adapter.
+        // Core owns persistence; the app only adapts visible WKWebView effects.
         if dryRun {
             let parsed = try ValidBrowserURL(url)
             return BrowserRun(id: UUID().uuidString.lowercased(), url: parsed.url.absoluteString,
@@ -51,7 +48,8 @@ public struct BrowserActionRoutes: Sendable {
             approvalId: nil,
             captureSource: captureSource,
             captureScreenshot: captureScreenshot,
-            dataRoot: dataRoot
+            dataRoot: dataRoot,
+            imageSink: imageSink
         )
         return try BrowserRun(row: run)
     }
@@ -84,7 +82,8 @@ public struct BrowserActionRoutes: Sendable {
         approvalId: String?,
         captureSource: Bool,
         captureScreenshot: Bool,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        imageSink: LocalToolImage.Sink?
     ) async throws -> JSONValue {
         try Task.checkCancellation()
         var status = "succeeded"
@@ -101,14 +100,12 @@ public struct BrowserActionRoutes: Sendable {
             approvalId: approvalId,
             captureSource: captureSource,
             captureScreenshot: captureScreenshot,
-            // BrowserWindowController owns and enforces the same 30-second
-            // navigation timeout. Core persists it for restart recovery.
+        // Match the window controller's 30-second timeout so persisted recovery uses the effect's deadline.
             deadlineSeconds: 30
         )
         let requestDigest = SwiftNativeBrowserClient.browserRequestDigest(for: start)
         let claim = try await browser.executeBrowserOperation(.start(start))
-        // Only the canonical start claimant may attach cancellation, execute
-        // effects or settle this run. A duplicate reports the original row.
+        // Only the canonical claimant may execute or settle; duplicates report the original row.
         guard claim.didTransition else {
             guard let existing = claim.run else { throw BrowserOperationStoreError.runNotFound }
             return existing
@@ -121,8 +118,7 @@ public struct BrowserActionRoutes: Sendable {
         let captureTask = navigation.task
         var capture: BrowserVisibleCapture?
         do {
-            // Adopt the returned capture before observing cancellation. Produced
-            // material belongs to settlement even when Stop won the outcome.
+            // Retain produced material before checking Stop; cancellation cannot discard settlement output.
             capture = try await withTaskCancellationHandler {
                 try await captureTask.value
             } onCancel: { captureTask.cancel() }
@@ -163,7 +159,8 @@ public struct BrowserActionRoutes: Sendable {
                 if captureScreenshot, let png = result.screenshot {
                     do {
                         screenshotReceipt = .object(try await persistBrowserScreenshotCapture(
-                            id: runID, url: parsed.url, png: png, dataRoot: dataRoot, showToModel: false))
+                            id: runID, url: parsed.url, png: png, dataRoot: dataRoot,
+                            imageSink: imageSink, showToModel: false))
                     } catch {
                         sourceReceipt["screenshotPersistenceError"] = .string(error.localizedDescription)
                         if status != "canceled" { status = "failed" }
@@ -192,13 +189,11 @@ public struct BrowserActionRoutes: Sendable {
             }
         }
         let committed = try outcome.get()
-        // Inline pixels belong to this caller's admitted turn context, which
-        // settle deliberately does not inherit. The canonical receipt already
-        // owns the artifact; delivery metadata is this response's projection.
+        // The receipt owns the artifact; the caller retains its image sink through settlement.
         if case .object(var fields) = committed,
            case .object(var screenshot)? = fields["screenshotReceipt"],
            case .string(let path)? = screenshot["pngPath"] {
-            let shown = effects.showProducedImage(at: URL(fileURLWithPath: path), name: "\(runID).png")
+            let shown = effects.showProducedImage(at: URL(fileURLWithPath: path), name: "\(runID).png", sink: imageSink)
             screenshot["shownToModel"] = .bool(shown.shown)
             screenshot["visionNote"] = .string(shown.note)
             fields["screenshotReceipt"] = .object(screenshot)
@@ -207,12 +202,8 @@ public struct BrowserActionRoutes: Sendable {
         return committed
     }
 
-    /// A page effect that is not a navigation (a click, a fill) under the one
-    /// operation owner. The window is owned before the first suspension and
-    /// the run is cancellable before its start is persisted; after the start,
-    /// the canonical state is read again and the page must still be the one
-    /// it started on, so a cancel committed meanwhile, or a replacement page,
-    /// gets no input. The completion says what it did.
+    /// Own the window and cancellation before suspending or persisting the start. Recheck canonical state and page identity before input so cancellation or
+    /// replacement cannot receive it.
     @MainActor
     public func executePageEffect(
         _ name: String, detail: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -239,8 +230,7 @@ public struct BrowserActionRoutes: Sendable {
         var dispatched = false
         var effectCompleted = false
         let task = Task { @MainActor in
-            // No throwing work may escape between the canonical claim and
-            // this task's catch/settlement boundary, including the owner read.
+            // Every throw after the claim, including the owner read, must reach this task's settlement.
             let phase = try await browser.motorActionReadModel(actionId: runID)?.phase
             if phase == .cancelled { throw CancellationError() }
             guard phase == .running else { throw BrowserOperationStoreError.invalidTransition }
@@ -254,7 +244,6 @@ public struct BrowserActionRoutes: Sendable {
             try await effect()
         }
         latch.install { task.cancel() }
-        // The caller's cancel reaches the effect the way navigation's does.
         do {
             try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
             effectCompleted = true
@@ -268,7 +257,6 @@ public struct BrowserActionRoutes: Sendable {
             }
         }
         if state == .canceled, dispatched, !effectCompleted { receipt["outcomeKind"] = .string("outcome_unknown") }
-        // Settlement outlives the caller's cancellation, as for a navigation.
         let completion = BrowserOperationCompletion(
             id: runID, requestDigest: SwiftNativeBrowserClient.browserRequestDigest(for: start),
             state: state, opened: false, sourceReceipt: .object(receipt))
@@ -313,7 +301,6 @@ public struct BrowserActionRoutes: Sendable {
         }
     }
 
-    /// One checked identity read for execution, rejection and receipt repair.
     public static func browserApprovalPayload(_ approval: ApprovalRecord) throws
         -> (url: ValidBrowserURL, runID: String, fields: [String: JSONValue]) {
         guard case .object(let payload) = approval.payload,
@@ -345,7 +332,9 @@ public struct BrowserActionRoutes: Sendable {
             approvalId: approval.id,
             captureSource: captureSource,
             captureScreenshot: captureScreenshot,
-            dataRoot: dataRoot
+            dataRoot: dataRoot,
+            // Durable approval reconciliation has no active model continuation.
+            imageSink: nil
         )
     }
 
@@ -392,8 +381,7 @@ public struct BrowserActionRoutes: Sendable {
         captureScreenshot: Bool,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> BrowserVisibleCapture {
-        // The app installs the cancellation hook before this task starts.
-        // Catch a canonical cancel that landed before that registration.
+        // The installed hook may miss an earlier canonical cancel; inspect it before acting.
         try Task.checkCancellation()
         let model = try await SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
             .motorActionReadModel(actionId: runID)
@@ -455,7 +443,10 @@ public struct BrowserActionRoutes: Sendable {
         fields["url_scheme"] = url?.scheme.map { .string($0.lowercased()) } ?? .null
         fields["readable"] = .object(["browser.text": .bool(readable),
             "browser.links": .bool(readable), "browser.screenshot": .bool(readable)])
-        fields["read_note"] = .string("Page reads require an HTTP(S) page. Preview app {action:\"browser.open\",args:{url:\"<http/https URL>\"},preview:true} first, then open the page if authorized.")
+        fields["read_note"] = .string("""
+            Page reads require an HTTP(S) page. Preview app {action:\"browser.open\",args:{url:\"<http/https URL>\"},preview:true} \
+            first, then open the page if authorized.
+            """)
         return .object(fields)
     }
 
@@ -472,7 +463,10 @@ public struct BrowserActionRoutes: Sendable {
               let url = URL(string: current),
               Self.canReadVisiblePage(url) else {
             throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Visible browser is not on an http/https page. Preview app {action:\"browser.open\",args:{url:\"<http/https URL>\"},preview:true} first, then open the page if authorized."
+                NSLocalizedDescriptionKey: """
+                    Visible browser is not on an http/https page. Preview app {action:\"browser.open\",args:{url:\"<http/https \
+                    URL>\"},preview:true} first, then open the page if authorized.
+                    """
             ])
         }
         let nav = BrowserNavigationResult(url: current, title: "", httpStatus: nil)
@@ -543,13 +537,14 @@ public struct BrowserActionRoutes: Sendable {
         url: URL,
         png: Data,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        imageSink: LocalToolImage.Sink?,
         showToModel: Bool = true
     ) async throws -> [String: JSONValue] {
         let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         let paths = try await BrowserCaptureCache.shared.store(
             id: id, artifacts: [.screenshot: png], browserRoot: browser.screenshotsDir.deletingLastPathComponent())
         guard let path = paths[.screenshot] else { throw CocoaError(.fileWriteUnknown) }
-        // The turn image sink shows the thumbnail (no sink means shown is false); the full-size PNG stays at pngPath.
+        // No turn image sink means shown is false; the full-size PNG remains at pngPath.
         var receipt: [String: JSONValue] = [
             "url": .string(url.absoluteString),
             "pngPath": .string(path.path),
@@ -557,7 +552,7 @@ public struct BrowserActionRoutes: Sendable {
             "captureRetention": BrowserCaptureCache.shared.policy.receipt,
         ]
         if showToModel {
-            let shown = effects.showProducedImage(at: path, name: "\(id).png")
+            let shown = effects.showProducedImage(at: path, name: "\(id).png", sink: imageSink)
             receipt["shownToModel"] = .bool(shown.shown)
             receipt["visionNote"] = .string(shown.note)
         }

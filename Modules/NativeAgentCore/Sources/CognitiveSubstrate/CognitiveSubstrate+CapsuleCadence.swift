@@ -5,7 +5,7 @@ import TurnTrace
 // Blueprint: | `CognitiveSubstrate+CapsuleCadence.swift` | `CognitiveSubstrate`: fingerprint cadence and the Since gap cue |
 
 extension CognitiveSubstrate {
-    /// Her reflection preview keeps every cue that passed its own gate.
+    /// The agent's reflection preview keeps every cue that passed its own gate.
     static let cadenceExemptCapsuleSurface = "reflection"
 
     // MARK: - Fingerprint cadence
@@ -16,9 +16,8 @@ extension CognitiveSubstrate {
         var run: Int
     }
 
-    /// Cadence eligibility; live assembly also requires `run == 1`.
-    /// Reflection uses `speak` alone. A timed same-family verdict retains its
-    /// pre-reset run, so it does not itself deliver another live fingerprint.
+    /// Cadence eligibility; live assembly also requires `run == 1`. Reflection uses `speak` alone. A timed same-family verdict retains its pre-reset run, so it
+    /// does not itself deliver another live fingerprint.
     func fingerprintCadenceVerdict(
         family: String,
         at now: Date,
@@ -49,13 +48,7 @@ extension CognitiveSubstrate {
 
     // MARK: - W4/P7 — the session bridge ("since we last talked")
 
-    /// ONE line, on the first turn User takes after a real gap, saying what
-    /// actually happened while he was away.
-    ///
-    /// User's own turns define the gap across doors; only events inside it speak.
-    ///
-    /// GAP-GATED SO IT CAN NEVER BECOME PER-TURN: at least
-    /// `sessionBridgeGapHours` since User's last turn, at most once per gap.
+    /// The user's verified turns define gaps across doors. Only events inside a gap may speak, once after `sessionBridgeGapHours`.
     func feltSessionBridgeLine(
         from read: CognitiveFrozenRead,
         presentationState: inout CognitiveCapsulePresentationState,
@@ -67,7 +60,7 @@ extension CognitiveSubstrate {
         let now = read.fixedAt
         let dyn = read.personalityDynamics
         let opened = Self.sinceGapOpened(presentationState, previousUserTurn: previousUserTurn, dynamics: dyn, at: now)
-        // A User turn with nothing to bridge closes any owed gap.
+        // A user turn with nothing to bridge closes any owed gap.
         presentationState.owedSinceGap = nil
         guard let opened, let all = gapItems, !all.isEmpty else { return nil }
         let shown = all.prefix(3).joined(separator: "; ")
@@ -77,11 +70,9 @@ extension CognitiveSubstrate {
                 + " meanwhile \(shown).",
             maxCharacters: 320)
         guard line.hasPrefix("- Since:") else { return nil }
-        // Keyed to the GAP (when it opened), not to this turn: the next gap
-        // opens at this very turn, so it always qualifies.
+        // Keyed to the GAP (when it opened), not to this turn: the next gap opens at this very turn, so it always qualifies.
         presentationState.lastSessionBridgeAt = opened
-        // Owed until it is shown: if it loses the slot, the commit keeps this
-        // and restores the bridge key (`keepUnshownCuesOwed`).
+        // Owed until it is shown: if it loses the slot, the commit keeps this and restores the bridge key (`keepUnshownCuesOwed`).
         presentationState.owedSinceGap = opened
         return line
     }

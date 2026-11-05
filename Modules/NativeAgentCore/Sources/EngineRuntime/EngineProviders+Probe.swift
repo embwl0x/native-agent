@@ -4,27 +4,53 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import ChatTurnRuntime
-// Blueprint: | `EngineProviders+Probe.swift` | `ProvidersFacade`: native capability-directed checks, outgoing-credential receipts, post-probe saved-credential matching and `clearProvider` |
+import ChatTurnContracts
+// Blueprint: | `EngineProviders+Probe.swift` | `ProvidersFacade`, `clearProvider`; Native probes and matched credential verification |
 
 extension ProvidersFacade {
-    // Probe the supplied API-key draft or this root's saved credential through the provider's native route.
-    public nonisolated func testProvider(_ id: String, apiKeyOverride: String? = nil, authMode: String? = nil) async throws -> NativeAgentShared.ProviderTestResult {
-        // This write is deliberately attached to the canonical, user-initiated
-        // reachability probe rather than to a provider-list refresh. A readable
-        // credential is not evidence that the provider was reachable. If the
-        // status-file write itself fails, report that failure to the caller;
-        // a passing transport probe alone is not a saved verification.
+    public nonisolated func testProvider(_ id: String, apiKeyOverride: String? = nil, authMode: String? = nil) async throws -> NativeAgentShared
+        .ProviderTestResult {
+        try await beginProviderProbe(id)
+        do {
+            let result = try await performProviderTest(id, apiKeyOverride: apiKeyOverride, authMode: authMode)
+            await settle { @MainActor in self.finishProviderProbe(id) }
+            return result
+        } catch {
+            await settle { @MainActor in self.finishProviderProbe(id) }
+            throw error
+        }
+    }
+
+    @MainActor private func beginProviderProbe(_ id: String) throws {
+        guard providerProbeStarts[id] == nil else {
+            throw PartCallError(code: "provider_probe_running", message: "This account's connection check is already running.")
+        }
+        providerProbeStarts[id] = Date()
+        refreshFace()
+    }
+
+    @MainActor private func finishProviderProbe(_ id: String) {
+        providerProbeStarts.removeValue(forKey: id)
+        refreshFace()
+    }
+
+    private nonisolated func performProviderTest(
+        _ id: String, apiKeyOverride: String?, authMode: String?
+    ) async throws -> NativeAgentShared.ProviderTestResult {
+        // Persist verification only from the explicit native probe; readable credentials prove no reachability, and transport success does not excuse a failed
+        // status write.
         let draftKey: String? = {
             let trimmed = apiKeyOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed?.isEmpty == false ? trimmed : nil
         }()
         func recordProbeResult(_ result: NativeAgentShared.ProviderTestResult) async throws -> NativeAgentShared.ProviderTestResult {
-            // Draft probes answer only the sheet; they cannot claim the configured credential was checked.
+            // Draft probes cannot verify the configured credential.
             guard draftKey == nil else { return result }
             try await LLMProviderStatusFeed.write(result, dataRoot: dataRoot, checkedAt: Date())
+            _ = await refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
             return result
         }
-        // An explicit connection check probes the current saved credential.
+        // Explicit checks must probe the current saved credential.
         let capability = SwiftNativeProviderRouting.connectionProbe(id, authMode: authMode)
         switch capability {
         case .unsupported:
@@ -41,12 +67,15 @@ extension ProvidersFacade {
                 probeModel = model
                 let llm = makeResidentProviderLLMClient(dataRoot: dataRoot)
                 // No turn context may override the probe's provider or budget.
+                var turn = Turn()
+                turn.envelope = .native("provider:probe:" + id)
+                turn.admission = ModelAdmission(provider: id, model: model)
+                var call = LLMCall(turn: turn, surface: "chat", purpose: "probe")
+                call.probeCredential = credential
+                let heldCall = call
                 let probe = Task.detached {
-                    try await LLMCallContext.$providerId.withValue(id) {
-                        try await OAuthProbeCredential.$current.withValue(credential) {
-                            try await llm.complete(prompt: "ping", system: "This is a provider connection check.", model: model, surface: "chat", purpose: "probe", tools: nil)
-                        }
-                    }
+                    try await llm.complete(prompt: "ping", system: "This is a provider connection check.", model: model,
+                        tools: nil, call: heldCall)
                 }
                 _ = try await withTaskCancellationHandler {
                     try await probe.value
@@ -75,8 +104,7 @@ extension ProvidersFacade {
                     cause: ProviderFailure.classify(error)?.encoded, credential: credential.fingerprint
                 )
             }
-            // Persistence is outside the transport catch: a save failure must
-            // neither become a provider failure nor trigger a second save.
+            // Keep persistence outside transport handling so a save failure cannot become provider failure or a duplicate save.
             return try await recordProbeResult(result)
         }
 
@@ -85,8 +113,7 @@ extension ProvidersFacade {
         return try await recordProbeResult(result)
     }
 
-    // Remove the matching registry entry under its lock; damaged authority
-    // must remain byte-preserved rather than becoming an empty registry.
+    // Lock registry removal; damaged authority must remain byte-preserved, never empty.
     public nonisolated func clearProvider(_ id: String) async throws {
         // Provider removal is confined to the facade's data root.
         let path = dataRoot.appendingPathComponent("providers/registry.json")
@@ -102,8 +129,7 @@ extension ProvidersFacade {
         let reference = try await SwiftNativePersistenceCore.withFileLock(path) {
             _ = try SwiftNativeProviderRouting.loadProviderRegistryChecked(at: path)
             return try await SwiftNativePersistenceCore.withFileLock(credFile) { () async throws -> String? in
-                // Validate the target row and credential before the first write.
-                // Unrelated rows survive; credential deletion still happens last.
+                // Validate the target before writing, preserve siblings and delete credentials last.
                 let remaining = try ProviderStateValidation.registryRemovingProvider(at: path, providerID: id)
                 let credential = try ProviderStateValidation.credential(at: credFile)
                 let reference = credential[ProviderAPIKeyStore.referenceField] as? String
@@ -140,11 +166,9 @@ extension ProvidersFacade {
         let result = try await testProvider(provider.provider_id,
             apiKeyOverride: testsDraft ? draft : nil, authMode: authMode)
         guard !testsDraft else { return (result, false, false) }
-        // A failed attempt owns its cause, even if admission/refresh failed
-        // before a request existed. Later readiness reads cannot replace it.
+        // Failed attempts retain their cause even before request creation; later readiness cannot overwrite it.
         guard result.status != "error" else { return (result, false, false) }
-        // This is a consumer checking the returned receipt, never a source of
-        // request evidence. A replacement during the call earns no badge.
+        // Only the returned receipt proves this request; credential replacement mid-call earns no badge.
         let current = try await list().providers.first { $0.provider_id == provider.provider_id }
         let credentialReady = current?.auth_status.eligible == true
             && (current?.auth_mode == authMode || (current?.auth_mode == nil && provider.auth_modes.count == 1))

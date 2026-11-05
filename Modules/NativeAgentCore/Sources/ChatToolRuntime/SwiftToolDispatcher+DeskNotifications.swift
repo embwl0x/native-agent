@@ -18,7 +18,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher+DeskNotifications.swift` | `SwiftToolDispatcher`: item notification preferences and explicit nag controls; permanent-handle scopes, mute windows, proposal validation and unmute drift settlement |
+// Blueprint: | `SwiftToolDispatcher+DeskNotifications.swift` | `SwiftToolDispatcher`; stable scopes, mute windows, nag settlement |
 
 extension SwiftToolDispatcher {
     func impl_desk_set_notify(input: [String: JSONValue]) async throws -> JSONValue {
@@ -39,10 +39,8 @@ extension SwiftToolDispatcher {
         return await deskConfirm(store, handle: handle, prefix: "notify \(level.rawValue)")
     }
 
-    /// Explicit notification controls never infer the person’s intent.
-    /// Unmute clears the mute, opens a new attention window, re-arms each item’s nag
-    /// and returns the drift digest in the same reply.
-    func impl_desk_nag_control(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Unmute opens a fresh attention window and re-arms nags so drift returns with the same reply.
+    func impl_desk_nag_control(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let action = try deskString(input, "action")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let kindRaw = (optionalString(input, "scope_kind") ?? "global")
@@ -100,7 +98,10 @@ extension SwiftToolDispatcher {
             if let untilRaw, !untilRaw.isEmpty, !DeskClock.isParseableDate(untilRaw) {
                 return .object([
                     "status": .string("refused"),
-                    "reason": .string("desk_nag_control: cannot mute until '\(untilRaw)' — expected a yyyy-MM-dd day or a full ISO timestamp (omit `until` to mute indefinitely)"),
+                    "reason": .string("""
+                        desk_nag_control: cannot mute until '\(untilRaw)' — expected a yyyy-MM-dd day or a full ISO timestamp (omit `until` to \
+                        mute indefinitely)
+                        """),
                 ])
             }
             let next = try await configStore.update { $0.muted(until: untilRaw?.isEmpty == false ? untilRaw : nil) }
@@ -113,11 +114,12 @@ extension SwiftToolDispatcher {
             ])
 
         case "unmute", "proposal":
-            // AppChatToolDispatcher.withAuthoredProgramHost binds the originating door.
+            // Hold the originating door through the part's execution and callbacks.
             let preview = action == "proposal"
             let read = try await DeskNotificationRead.read(dataRoot: dataRoot, now: Date(), unmute: !preview)
             let proposal: DeskNotificationProposal
-            switch await Parts(root: dataRoot).call(id: "desk-notify", input: read.input, preview: preview, as: DeskNotificationProposal.self) {
+            switch await Parts(root: dataRoot).call(id: "desk-notify", input: read.input, preview: preview,
+                invocation: invocation.partInvocation(turn: turn, surface: surface), as: DeskNotificationProposal.self) {
             case .success(let value): proposal = value
             case .failure(let error): throw error
             }
@@ -178,7 +180,6 @@ extension SwiftToolDispatcher {
         return base
     }
 
-    /// Return the whole config, including its ledger.
     private func deskNagConfigJSON(_ config: DeskNagConfig) -> JSONValue {
         config.toJSON()
     }

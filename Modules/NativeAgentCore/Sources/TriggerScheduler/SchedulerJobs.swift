@@ -5,13 +5,11 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-import WorkshopExecution
 import CryptoKit
 import Desk
-// Blueprint: | `SchedulerJobs.swift` | SwiftNativeTriggerScheduler canonical bounded job storage, mutation (including intention-kind resume refusals), post-migration restored intentions kept stopped with a keyed Desk notice and byte-exact backup, activity receipts and read-only app-door watch admission |
+// Blueprint: | `SchedulerJobs.swift` | Locked job storage, stopped conversion evidence and read-only watches |
 
-// Canonical scheduled-job storage and occurrence transactions shared by UI,
-// agent tools, and execution. Effects run only after a durable claim.
+// Canonical scheduled-job storage and occurrence transactions shared by UI, agent tools, and execution. Effects run only after a durable claim.
 
 // MARK: - Errors (scheduler-job specific)
 
@@ -26,8 +24,7 @@ extension TriggerSchedulerError {
 }
 
 extension SwiftNativeTriggerScheduler {
-    /// A completed migration is never rerun. A later legacy definition is
-    /// evidence for her, not another runnable copy of an intention she has.
+    /// One-time conversion cannot run again; later non-runnable definitions remain evidence rather than duplicate intentions.
     public func stopRestoredIntentionJobs() async throws {
         let finished = MyQueue.scheduledMigrationMarker(dataRoot: root)
         guard FileManager.default.fileExists(atPath: finished.path) else { return }
@@ -55,22 +52,27 @@ extension SwiftNativeTriggerScheduler {
             for index in restored {
                 guard let job = rows[index].objectValue, case .object(var saved) = savedRows[index] else { continue }
                 guard let id = job["id"]?.stringValue, !id.isEmpty else {
-                    throw TriggerSchedulerError.schedulerInvalid("A restored scheduled intention has no job id. Its source is preserved; repair its identity before filing its Desk notice.")
+                    throw TriggerSchedulerError.schedulerInvalid(
+                        "A restored scheduled intention has no job id. Its source is preserved; repair its identity before filing its Desk notice.")
                 }
                 let name = job["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let shownName = name.isEmpty ? id : name
                 let schedule = try job["schedule"]?.serialize(pretty: false)
                 let when = job["nextWallClockOccurrence"]?.stringValue
-                    ?? SchedulerJobRuntime.scheduledEpoch(for: job).map { NativeTimestampFormat.microsecondUTCOffset(Date(timeIntervalSince1970: $0), rounding: .up) }
+                    ?? SchedulerJobRuntime.scheduledEpoch(for: job).map { NativeTimestampFormat.microsecondUTCOffset(Date(timeIntervalSince1970: $0),
+                        rounding: .up) }
                     ?? job["nextRunAt"]?.stringValue ?? schedule
-                let words = "A restored backup brought back scheduled job \(shownName) (\(when ?? "time unavailable")); add it again with queue.add if you still want it"
+                let words = """
+                    A restored backup brought back scheduled job \(shownName) (\(when ?? "time unavailable")); add it again with queue.add if you still want \
+                    it
+                    """
                 do {
                     _ = try await store.fileSystemItem(kind: .watch, project: "NativeAgent", title: words,
                         summary: words + "\nStopped source: \(jobsPath.path), job \(id).", assignee: nil,
                         findingKey: "restored-scheduled-intention:" + id,
                         note: words, refs: [])
                 } catch DeskError.findingArchived {
-                    // Her archived notice is already surfaced; do not recreate it.
+                    // The agent's archived notice is already surfaced; do not recreate it.
                 }
                 saved["enabled"] = .bool(false)
                 saved["lastRunStatus"] = .string("stopped")
@@ -83,8 +85,7 @@ extension SwiftNativeTriggerScheduler {
                 }
                 savedRows[index] = .object(saved)
             }
-            // Notice first, then disposition: interruption reuses the same keyed
-            // Desk finding. A failed notice leaves the source for a later retry.
+            // Notice first, then disposition: interruption reuses the same keyed Desk finding. A failed notice leaves the source for a later retry.
             let stoppedRows = savedRows
             try await updateJobRows { $0 = stoppedRows }
         }
@@ -92,8 +93,7 @@ extension SwiftNativeTriggerScheduler {
 
     private static let jobActivityLogger = Logger(subsystem: "com.nativeagent.core", category: "scheduler-jobs")
 
-    // Jobs are already committed; a missing activity receipt must not invite
-    // a retry of the successful mutation.
+    // Jobs are already committed; a missing activity receipt must not invite a retry of the successful mutation.
     private nonisolated static func appendJobActivity(
         _ event: JSONValue,
         to path: URL,
@@ -103,7 +103,8 @@ extension SwiftNativeTriggerScheduler {
             try await SwiftNativePersistenceCore.appendActivityEvent(event, to: path,
                 logLabel: logLabel)
         } catch {
-            jobActivityLogger.error("Scheduled Desk task mutation committed, but activity receipt failed (\(logLabel, privacy: .public)): \(String(describing: error))")
+            jobActivityLogger.error(
+                "Scheduled Desk task mutation committed, but activity receipt failed (\(logLabel, privacy: .public)): \(String(describing: error))")
         }
     }
 
@@ -141,7 +142,6 @@ extension SwiftNativeTriggerScheduler {
             jobs.append(job)
         }
 
-        // Record creation through the shared activity-feed owner.
         let jobObj: [String: JSONValue]
         if case .object(let o) = job { jobObj = o } else { jobObj = [:] }
         let jobName = SchedulerJobNormalizer.string(jobObj["name"]) ?? ""
@@ -169,14 +169,14 @@ extension SwiftNativeTriggerScheduler {
         return job
     }
 
-    /// Cancel by exact or unique-prefix id, retaining a durable cancellation marker.
+    /// Require an exact or unique-prefix ID and retain durable cancellation evidence.
     public func cancelJob(jobId: String) async throws -> JSONValue {
         if jobId.isEmpty {
             throw TriggerSchedulerError.schedulerInvalid("jobId is required")
         }
 
         let updatedTarget: JSONValue = try await updateJobRows { jobs in
-            // Thrown INSIDE the lock, so a miss writes nothing.
+            // Throw under the lock so a missing ID cannot write.
             let idx = try Self.jobIndex(jobs, id: jobId)
             guard case .object(var obj) = jobs[idx] else { throw TriggerSchedulerError.schedulerInvalid("Unknown scheduled Desk task: \(jobId)") }
             obj["enabled"] = .bool(false)
@@ -188,8 +188,7 @@ extension SwiftNativeTriggerScheduler {
 
         let targetObj: [String: JSONValue]
         if case .object(let o) = updatedTarget { targetObj = o } else { targetObj = [:] }
-        let jobId = (SchedulerJobNormalizer.string(targetObj["id"]) ?? "")  // the job a start of its id named
-        // A blank or absent display name uses the id.
+        let jobId = (SchedulerJobNormalizer.string(targetObj["id"]) ?? "")
         let detailRaw = SchedulerJobNormalizer.string(
             targetObj["name"]
         ) ?? jobId
@@ -211,8 +210,7 @@ extension SwiftNativeTriggerScheduler {
         return .object(["ok": .bool(true), "job": updatedTarget])
     }
 
-    /// Pause / resume one scheduled job. Same locked read-modify-write and
-    /// activity receipt as `cancelJob`, with a separate pause marker.
+    /// Pause and resume share the job mutation lock and activity receipts; pauses retain their own marker.
     public func setJobEnabled(jobId: String, enabled: Bool) async throws -> JSONValue {
         if jobId.isEmpty {
             throw TriggerSchedulerError.schedulerInvalid("jobId is required")
@@ -222,8 +220,7 @@ extension SwiftNativeTriggerScheduler {
             let idx = try Self.jobIndex(jobs, id: jobId)
             guard case .object(var obj) = jobs[idx] else { throw TriggerSchedulerError.schedulerInvalid("Unknown scheduled Desk task: \(jobId)") }
             if enabled, ["notify", "turn", "workshop"].contains(SchedulerJobNormalizer.string(obj["kind"]) ?? "notify") {
-                // Resume cannot resurrect the retired execution path. The
-                // normalizer returns the same MY QUEUE remedy as create/update.
+                // Non-runnable definitions receive the normalizer's queue remedy instead of resuming effects.
                 _ = try SchedulerJobNormalizer.normalize(body: obj, now: now, uuid: uuid)
             }
             obj["enabled"] = .bool(enabled)
@@ -234,8 +231,7 @@ extension SwiftNativeTriggerScheduler {
                     obj["lastRunDetail"] = .string(DataRootLife.stoppedReason)
                     obj.removeValue(forKey: "activeOccurrence")
                 }
-                // Resume also clears a cancel (and legacy pauses,
-                // which were stored as cancels).
+                // Explicit Resume clears both pause and cancellation markers.
                 obj.removeValue(forKey: "pausedAt")
                 obj.removeValue(forKey: "cancelledAt")
                 obj.removeValue(forKey: "disabledReason")
@@ -248,7 +244,7 @@ extension SwiftNativeTriggerScheduler {
 
         let targetObj: [String: JSONValue]
         if case .object(let o) = updatedTarget { targetObj = o } else { targetObj = [:] }
-        let jobId = (SchedulerJobNormalizer.string(targetObj["id"]) ?? "")  // the job a start of its id named
+        let jobId = (SchedulerJobNormalizer.string(targetObj["id"]) ?? "")
         let detailRaw = SchedulerJobNormalizer.string(
             targetObj["name"]
         ) ?? jobId
@@ -287,7 +283,8 @@ extension SwiftNativeTriggerScheduler {
         let changes = changes.filter { $0.value != .null }
         let allowed: Set<String> = ["name", "kind", "payload", "schedule", "interval_seconds"]
         guard !changes.isEmpty, Set(changes.keys).isSubset(of: allowed) else {
-            throw invalid("Supply at least one of name, kind, payload, schedule, interval_seconds; other fields cannot be edited.", path: "$", accepted: "At least one of name, kind, payload, schedule, interval_seconds; no other edit fields.")
+            throw invalid("Supply at least one of name, kind, payload, schedule, interval_seconds; other fields cannot be edited.", path: "$",
+                accepted: "At least one of name, kind, payload, schedule, interval_seconds; no other edit fields.")
         }
         if let name = changes["name"] {
             guard case .string(let value) = name,
@@ -299,7 +296,9 @@ extension SwiftNativeTriggerScheduler {
         if let kind = changes["kind"] {
             guard case .string(let value) = kind,
                   SchedulerJobNormalizer.allowedKinds.contains(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
-                throw invalid("kind must name a supported scheduled Desk task kind. Use queue.add {text, when, until?, say?} for intentions, check-ins and reminders.", path: "$.kind", accepted: SchedulerJobNormalizer.allowedKinds.sorted().joined(separator: ", "))
+                throw invalid(
+                    "kind must name a supported scheduled Desk task kind. Use queue.add {text, when, until?, say?} for intentions, check-ins and reminders.",
+                    path: "$.kind", accepted: SchedulerJobNormalizer.allowedKinds.sorted().joined(separator: ", "))
             }
         }
         if let payload = changes["payload"] {
@@ -311,7 +310,8 @@ extension SwiftNativeTriggerScheduler {
             switch schedule {
             case .object, .string: break
             default:
-                throw invalid("schedule must be an object or ISO-8601 datetime string", path: "$.schedule", accepted: "An ISO-8601 datetime string or an object with type once, every, hourly, daily, weekly, monthly or cron and its required fields.")
+                throw invalid("schedule must be an object or ISO-8601 datetime string", path: "$.schedule",
+                    accepted: "An ISO-8601 datetime string or an object with type once, every, hourly, daily, weekly, monthly or cron and its required fields.")
             }
         }
         if let interval = changes["interval_seconds"] {
@@ -334,7 +334,8 @@ extension SwiftNativeTriggerScheduler {
                 .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let kindChanged = newKind != nil && newKind != SchedulerJobNormalizer.string(existing["kind"])
             if kindChanged, changes["payload"] == nil {
-                throw ToolFailureError("Changing kind requires the complete payload for the new kind.", argumentPath: "$.payload", accepted: "The complete payload for the new kind.", effects: .none)
+                throw ToolFailureError("Changing kind requires the complete payload for the new kind.", argumentPath: "$.payload",
+                    accepted: "The complete payload for the new kind.", effects: .none)
             }
             if !kindChanged, case .object(let patch)? = changes["payload"],
                case .object(var payload)? = existing["payload"] {
@@ -394,8 +395,7 @@ extension SwiftNativeTriggerScheduler {
         return .object(["ok": .bool(true), "job": updated])
     }
 
-    /// Read under the same jobs-file lock as mutations,
-    /// then project timing with `decorateNextRunAt`. Only absence is empty.
+    /// Read under the same jobs-file lock as mutations, then project timing with `decorateNextRunAt`. Only absence is empty.
     public func listJobs() async throws -> [JSONValue] {
         try await listJobsIfPresent() ?? []
     }
@@ -408,30 +408,31 @@ extension SwiftNativeTriggerScheduler {
         }
     }
 
-    /// Every writer, including occurrence settlement, must stay readable by
-    /// the canonical job reader. Validate the exact bytes before replacement.
+    /// Every writer, including occurrence settlement, must stay readable by the canonical job reader. Validate the exact bytes before replacement.
     public nonisolated static func jobsDataForWrite(_ rows: [JSONValue]) throws -> Data {
         try validateRows(rows)
         guard rows.count <= 1_024 else {
             throw ToolFailureError("scheduler/jobs.json would exceed 1024 rows.", effects: .none,
                                    nextCall: ToolFailureError.call("app", ["action": .string("schedule.list")]),
-                                   code: "schedule_store_row_limit", instruction: "The task store is full. schedule.delete only turns a task off; completed tasks leave after seven days of retention. Tell the person no new task can be saved until then.", recovery: .inspect)
+                                   code: "schedule_store_row_limit", instruction: """
+                                       The task store is full. schedule.delete only turns a task off; completed tasks leave after seven days of retention. \
+                                       Tell the person no new task can be saved until then.
+                                       """, recovery: .inspect)
         }
         let data = try JSONValue.array(rows).serializedData(pretty: true)
         guard data.count <= 4 * 1_024 * 1_024 else {
             throw ToolFailureError("scheduler/jobs.json would exceed 4 MiB.", effects: .none,
                                    nextCall: ToolFailureError.call("app", ["action": .string("schedule.list")]),
-                                   code: "schedule_store_byte_limit", instruction: "The task store is at its size limit. Reduce the proposed payload; schedule.delete only turns a task off, and completed tasks leave after seven days of retention.", recovery: .inspect)
+                                   code: "schedule_store_byte_limit", instruction: """
+                                       The task store is at its size limit. Reduce the proposed payload; schedule.delete only turns a task off, and completed \
+                                       tasks leave after seven days of retention.
+                                       """, recovery: .inspect)
         }
         return data
     }
 
-    /// Scheduler jobs are authority state. Only a missing file means an empty
-    /// schedule; malformed or wrongly typed existing bytes must not be
-    /// reinterpreted as a dormant empty schedule and then overwritten by the
-    /// next create/cancel mutation.
-    /// Exact string identity first, then one unambiguous prefix.
-    /// An unknown id, or a start several jobs share, refuses and names them.
+    /// Existing malformed jobs are unavailable authority, never an empty schedule that a later mutation can overwrite. Resolve IDs exactly or by a single
+    /// prefix; ambiguous and unknown IDs refuse.
     nonisolated static func jobIndex(_ jobs: [JSONValue], id jobId: String) throws -> Int {
         let ids = jobs.map { if case .object(let row) = $0 { (SchedulerJobNormalizer.string(row["id"]) ?? "") } else { "" } }
         if !jobId.isEmpty, let exact = ids.firstIndex(of: jobId) { return exact }
@@ -461,7 +462,8 @@ extension SwiftNativeTriggerScheduler {
                         throw TriggerSchedulerError.schedulerInvalid("\(path).\(key): invalid saved timestamp; bytes preserved")
                     }
                     do { _ = try SchedulerJobNormalizer.checkedEpoch(epoch) }
-                    catch { throw TriggerSchedulerError.schedulerInvalid("\(path).\(key): timestamp outside supported civil/millisecond domain; bytes preserved") }
+                    catch { throw TriggerSchedulerError.schedulerInvalid(
+                        "\(path).\(key): timestamp outside supported civil/millisecond domain; bytes preserved") }
                 }
             }
         }
@@ -478,9 +480,7 @@ extension SwiftNativeTriggerScheduler {
                   case .object(let payload)? = object["payload"] else {
                 throw TriggerSchedulerError.schedulerInvalid("job[\(index)] has missing, duplicate or wrongly typed required authority; bytes preserved")
             }
-            // DATA PRESENT: migrated intention definitions and their original
-            // backup still exist. They remain readable for that one conversion,
-            // while due-job admission accepts only allowedKinds.
+            // Retain original conversion evidence and its backup; due-job admission accepts only allowedKinds.
             guard SchedulerJobNormalizer.allowedKinds.contains(kind) || ["notify", "turn", "workshop"].contains(kind) else {
                 throw TriggerSchedulerError.schedulerInvalid("job[\(index)].kind is unsupported; bytes preserved")
             }
@@ -549,38 +549,40 @@ extension SwiftNativeTriggerScheduler {
     private nonisolated static func jobStoreReadFailure(_ detail: String, code: String, path: URL) -> ToolFailureError {
         ToolFailureError(detail, effects: .none, owner: path.path,
                          nextCall: ToolFailureError.call("app", ["action": .string("files.info"), "args": .object(["path": .string(path.path)])]),
-                         code: code, instruction: "Inspect the file with next_call, then repair its saved array or access. Preserve occurrence and delivery evidence.", recovery: .repair)
+                         code: code,
+                             instruction: "Inspect the file with next_call, then repair its saved array or access. Preserve occurrence and delivery evidence.",
+                             recovery: .repair)
     }
 }
 
 // MARK: - Factory (scheduler-job writer)
 
-/// Swift-native create-job writer. Job creation carries no briefing-part host
-/// or notification sender; the engine supplies those only at their native entry.
+/// Swift-native create-job writer. Job creation carries no briefing-part host or notification sender; the engine supplies those only at their native entry.
 public func makeSchedulerJobWriter(
     dataRoot: URL = PersistenceCore.defaultDataRoot()
 ) -> SwiftNativeTriggerScheduler {
-    let runner = makeWorkshopRunner(dataRoot: dataRoot)
-    return SwiftNativeTriggerScheduler(
-        root: dataRoot,
-        workshopRunner: runner
-    )
+    SwiftNativeTriggerScheduler(root: dataRoot)
 }
 
 extension SwiftNativeTriggerScheduler {
-    /// A scheduled read is a watch: its action runs through the app door as a
-    /// read, and what changed comes to her as news. Nil when `action` is such a
-    /// read; otherwise why not, in words she can act on. Scheduling and each run ask it.
-    public static func watchRefusal(action: String, input: [String: JSONValue]) -> String? {
+    /// A scheduled read is a watch: its action runs through the app door as a read, and what changed comes to the agent as news. Nil when `action` is such a
+    /// read; otherwise why not, in words the agent can act on. Scheduling and each run ask it.
+    public static func watchRefusal(action: String, input: [String: JSONValue], turn: Turn?) -> String? {
         let declared: ToolClass?
-        do { declared = try PermissionLaw.doorClass(action: action, args: input) }
+        do { declared = try PermissionLaw.doorClass(action: action, args: input, turn: turn) }
         catch {
             return "The action's effect class is unavailable: \(error.localizedDescription). Repair its action catalog before scheduling this watch."
         }
         switch declared {
         case .read?: return nil
-        case nil: return "No app action is called \(action). A watch reads through the app door (app {find} names the reads; a part of yours runs as authored.<id>), and what changed comes to you as news."
-        case let other?: return "\(action) is a \(other), and a watch only reads: what changed comes to you as news. To act on a schedule, give a part a schedule:<cron> wake instead."
+        case nil: return """
+            No app action is called \(action). A watch reads through the app door (app {find} names the reads; a part of yours runs as authored.<id>), and \
+            what changed comes to you as news.
+            """
+        case let other?: return """
+            \(action) is a \(other), and a watch only reads: what changed comes to you as news. To act on a schedule, give a part a schedule:<cron> wake \
+            instead.
+            """
         }
     }
 }

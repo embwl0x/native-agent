@@ -6,37 +6,15 @@ import TurnTrace
 // Blueprint: | `SessionIdentityCheck.swift` | `SessionIdentityCheck.run`: session mint-site counts and source/row disagreement diagnostics |
 
 // MARK: - One Thread, Many Surfaces — Phase 0 Doctor row
-//
-// docs/build_plans/one-thread-many-surfaces-plan.md §7 Phase 0:
-//
-//   "Doctor row: hot session count, rows minted in the last 24h BY MINT SITE,
-//    count of sessions whose `source` disagrees with the majority of their
-//    rows' `source` (the §1.3 flapping detector)."
-//
-// The plan's own test for this row is pointed: "Doctor row asserts non-zero on
-// the live data root (a health row that reads '0' on a system with 202
-// sessions would be exactly the sweep-item-3 lie)." So this check does not get
-// to be quiet about what it could not measure. Three separate honesty rules:
-//
-//   * An unreadable or malformed index is a FAIL. A valid empty or entirely
-//     archived index legitimately has 0 hot sessions.
-//   * Transcripts this check could not scan are reported as `unreadable`
-//     rather than folded into "0 disagreements". A zero that was never
-//     measured is the lie the sweep names.
-//   * An EMPTY `session.identity` feed says "not yet instrumented", not
-//     "nothing minted". Phase 0 has just landed; a feed with no rows means the
-//     mint sites have not run since, which is a different fact from silence.
-//
-// The check is READ-ONLY. It takes no lock, mutates nothing, and never
-// repairs — there is nothing here to repair, only something to see.
+// An unreadable index fails; a valid empty or archived index can have zero hot sessions. Unscanned transcripts remain unreadable rather than clean
+// disagreements; an empty identity feed remains uninstrumented. This row only observes: it must neither mutate history nor infer unmeasured health.
 
 public struct SessionIdentityCheck: DoctorCheck {
     public let id: String = "session_identity"
     public let title: String = "Chat Session Identity"
 
     private let root: URL
-    /// How many disagreeing session ids to name in `detail` before summarizing.
-    /// Bounded so one badly-flapping root cannot produce an unreadable row.
+    /// Bound named disagreement IDs so one flapping root cannot overwhelm the row.
     private let maximumNamedSessions = 5
 
     public init(root: URL = defaultDataRoot()) {
@@ -50,17 +28,16 @@ public struct SessionIdentityCheck: DoctorCheck {
         let indexExists = FileManager.default.fileExists(atPath: sessionsPath.path)
 
         let report = SessionIdentityLedger.flappingReport(dataRoot: root)
-        let tally = SessionIdentityLedger.mintTally(dataRoot: root, now: Date())
-        if let path = tally.unreadablePaths.first {
-            return CheckResult(source: tally.unreadablePaths.joined(separator: ", "),
+        let tally = await SessionIdentityLedger.mintTally(dataRoot: root, now: Date())
+        if tally.readIssue != nil || tally.unreadable > 0 {
+            let cause = tally.readIssue.map { "the record could not be read: \($0)" }
+                ?? "\(tally.unreadable) session.identity detail(s) no longer decode"
+            return CheckResult(source: "experiences/experiences.sqlite",
                 id: id, title: title, status: "fail",
-                detail: "Session minting could not be measured because turn-trace day files could not be read completely: \(tally.unreadablePaths.joined(separator: ", ")).",
-                harm: "Session creation history cannot be checked from the saved turns.",
-                human_action: ToolFailureError.fileRepairInstruction(URL(fileURLWithPath: path),
-                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
+                detail: "Session minting could not be measured because \(cause).",
+                harm: "Session creation history cannot be checked from the saved turns.")
         }
 
-        // Fresh install: no index yet. Honest "ok" with an explicit zero.
         guard indexExists else {
             return CheckResult(source: "chat/sessions.json",
                 id: id, title: title, status: "ok",
@@ -80,7 +57,6 @@ public struct SessionIdentityCheck: DoctorCheck {
 
         var parts: [String] = ["\(report.hotSessionCount) hot session(s)"]
 
-        // Minted-in-24h, BY MINT SITE — the smoking gun the phase exists for.
         if tally.totalMinted > 0 {
             let breakdown = tally.mintedByMintSite
                 .sorted { lhs, rhs in
@@ -93,11 +69,7 @@ public struct SessionIdentityCheck: DoctorCheck {
             parts.append("0 minted in 24h across \(tally.totalRows) identity row(s)")
         } else {
             // Distinguish "instrumented and quiet" from "not instrumented".
-            parts.append(
-                tally.daysRead == 0
-                    ? "no turn-trace feed on disk, so minting is UNMEASURED"
-                    : "no session.identity rows in the feed yet, so minting is UNMEASURED"
-            )
+            parts.append("no session.identity details recorded in 24h, so minting is UNMEASURED")
         }
 
         parts.append("\(report.mixedSourceSessionCount) mixed-source transcript(s)")
@@ -109,7 +81,6 @@ public struct SessionIdentityCheck: DoctorCheck {
             )
         }
 
-        // The §1.3 flapping detector.
         var status = "ok"
         if report.disagreeingSessionCount > 0 {
             status = "warn"
@@ -147,8 +118,7 @@ public struct SessionIdentityCheck: DoctorCheck {
             if status == "ok" { status = "unmeasured" }
         }
 
-        // A disagreement is a build finding — a mint site stamped the wrong
-        // source — so it goes to the builder, never to her as a triage.
+        // Source disagreement belongs to the builder's mint site, never the agent's triage.
         return CheckResult(source: "chat/sessions.json",
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",

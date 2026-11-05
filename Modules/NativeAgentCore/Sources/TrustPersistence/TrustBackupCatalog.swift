@@ -5,7 +5,7 @@ import TrustCenter
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupCatalog.swift` | TrustBackupPersistence catalog publication and retention; one array catalog at index.json, verified restore points, pins and staged dependencies |
+// Blueprint: | `TrustBackupCatalog.swift` | Verified restore points, pins and staged dependencies govern retention. |
 
 extension TrustBackupPersistence {
     public static func diskStorageOwner(dataRoot root: URL) -> DiskStorageOwner {
@@ -56,7 +56,10 @@ extension TrustBackupPersistence {
     private static func backupReclamationPlan(dataRoot root: URL) throws -> DiskStorageOwner.Plan {
         let keepCount = 2
         var plan = DiskStorageOwner.Plan(owner: "backups", roots: ["backups"],
-            policy: "Keep the newest two verified restore points, catalog pins and staged restore dependencies. Older registered restore points move to Trash; failed verification and unregistered branches stay.",
+            policy: """
+                Keep the newest two verified restore points, catalog pins and staged restore dependencies. Older registered restore points move to \
+                Trash; failed verification and unregistered branches stay.
+                """,
             candidates: [:])
         let backupRoot = root.appendingPathComponent("backups")
         guard pathEntryExists(backupRoot) else { return plan }
@@ -109,7 +112,10 @@ extension TrustBackupPersistence {
             }
         }
         guard verified.count >= keepCount else {
-            plan.notes.append("No backup reclamation: \(verified.count) verified restore points; two are required before retiring older backups. Create verified backups using backup.now.")
+            plan.notes.append("""
+                No backup reclamation: \(verified.count) verified restore points; two are required before retiring older backups. Create verified \
+                backups using backup.now.
+                """)
             return plan
         }
         pinned.formUnion(verified.prefix(keepCount))
@@ -125,7 +131,8 @@ extension TrustBackupPersistence {
     }
 
     static func appendBackupRecord(_ record: BackupRecord, backupRoot: URL) async throws {
-        try await appendRegistryRow(Self.backupRecordJSON(record), path: backupRoot.appendingPathComponent("index.json"), id: record.id, maxRows: nil, isBackupCatalog: true)
+        try await appendRegistryRow(Self.backupRecordJSON(record), path: backupRoot.appendingPathComponent("index.json"), id: record.id, maxRows: nil,
+            isBackupCatalog: true)
     }
 
     public static func appendRegistryRow(_ row: JSONValue, path: URL, id: String, maxRows: Int? = 200) async throws {

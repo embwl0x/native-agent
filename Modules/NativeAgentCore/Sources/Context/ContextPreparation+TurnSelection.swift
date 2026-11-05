@@ -6,7 +6,7 @@ import TrustCenter
 import CryptoKit
 import GRDB
 import PersonaEngine
-// Blueprint: | `ContextPreparation+TurnSelection.swift` | Generation-derived authorization and precoverage, exact turn leases and mandatory-budget retry; verification filters delivery while preserving selection receipts, budgets and feedback IDs |
+// Blueprint: | `ContextPreparation+TurnSelection.swift` | turn leases, authorization, precoverage and verified delivery |
 
 extension ContextPreparation {
     struct GenerationDerivedCacheKey: Hashable, Sendable {
@@ -20,8 +20,7 @@ extension ContextPreparation {
         let kernelSourceFingerprint: String
         let stableIncludedDocumentIDs: [String]
         let allowedPrivacy: [String]
-        /// Part of the key because it changes the DERIVED value: it decides
-        /// whether every persona source is precovered or only the kernel's.
+        /// Part of the key because it changes the DERIVED value: it decides whether every persona source is precovered or only the kernel's.
         let stableSegmentCarriesRequiredDocuments: Bool
         let userMemoryCore: [String]?
         let memoryRecallDisabled: Bool
@@ -97,7 +96,6 @@ extension ContextPreparation {
                request.allowedPrivacy.contains(source.descriptor.privacy),
                source.descriptor.owner != ContextPersonaSourceNaming.owner
                     || source.descriptor.canonicalLocator.hasPrefix(personaPrefix) {
-                // Preserve generation order for precoverage derivation.
                 selectedSources.append(source)
             }
         }
@@ -107,9 +105,8 @@ extension ContextPreparation {
             String($0.rawValue.dropLast(3))
         })
         let surfaceSuffix = "/surfaces/\(request.surface.rawValue).md"
-        // Precover persona sources carried verbatim by the stable segment;
-        // otherwise precover only kernel and surface documents.
-        // Rendering and precoverage must both enforce the source's surface permission.
+        // Precover persona sources carried verbatim by the stable segment; otherwise precover only kernel and surface documents. Rendering and precoverage must
+        // both enforce the source's surface permission.
         var precoveredSourceIDs = Set(selectedSources.lazy.filter { source in
             guard source.descriptor.owner == ContextPersonaSourceNaming.owner,
                   source.descriptor.permittedSurfaces.contains(request.surface)
@@ -174,13 +171,17 @@ extension ContextPreparation {
         }
         if request.memoryRecallEnabled, !request.userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             guard let embedding = request.queryEmbedding, embedding.isUsable else {
-                throw NativeSemanticQueryError(detail: "The requested semantic readings are unavailable or still pending; no lexical substitution was selected.")
+                throw NativeSemanticQueryError(detail: """
+                    The requested semantic readings are unavailable or still pending; no lexical substitution was selected.
+                    """)
             }
         }
         if feedbackRestoreFailure != nil { await restoreFeedbackEvents() }
         if let reconciliationFailure {
             reconcileInBackground(reason: "turn_generation_repair")
-            throw ContextFlowStoreError.malformedStoredValue("Context preparation is unavailable: \(reconciliationFailure). Repair its source and republish before another turn.")
+            throw ContextFlowStoreError.malformedStoredValue("""
+                Context preparation is unavailable: \(reconciliationFailure). Repair its source and republish before another turn.
+                """)
         }
         // The turn reads the published generation; it never joins a compile.
         guard let generation = activeStoredGeneration else {
@@ -213,8 +214,7 @@ extension ContextPreparation {
                 mirror: mirror,
                 kernel: kernel
             )
-            // Diagnose slot-ID memory scopes, including slot/agent name collisions.
-            // Emit once per turn, never per atom.
+            // Diagnose slot-ID memory scopes, including slot/agent name collisions. Emit once per turn, never per atom.
             if generationDerived.slotScopedMemorySourceCount > 0 {
                 diagnostics(
                     "[context-flow] ERROR memory-scope vocabulary drift: "
@@ -265,7 +265,6 @@ extension ContextPreparation {
                                 $0.draft, message: request.userMessage, recentTurns: request.recentTurns
                             )
                     }.map(\.draft.id)),
-                    // Her rejected atoms use the selector's exclusion set.
                     deletedAtomIDs: request.suppressedAtomIDs,
                     queryEmbedding: request.queryEmbedding?.values,
                     alternateQueryEmbedding: request.queryEmbedding?.alternateValues,
@@ -382,8 +381,7 @@ extension ContextPreparation {
         }
     }
 
-    /// Excludes rejected items/pointers and adds verification notices. Selection
-    /// receipt and budget stay unchanged; outcome feedback retains the original IDs.
+    /// Verification changes delivered items and pointers, never selection accounting; outcome feedback retains the original IDs.
     private static func verified(
         _ packet: ContextPacket, by verifier: @Sendable ([ContextStoredAtom]) async -> ContextTurnExclusion,
         in generation: ContextStoredGeneration

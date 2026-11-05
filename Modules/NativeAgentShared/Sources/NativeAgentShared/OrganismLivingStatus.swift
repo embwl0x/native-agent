@@ -1,16 +1,14 @@
 import Foundation
 
-// Blueprint: | `OrganismLivingStatus.swift` | `OrganismLivingStatusFile`: rebuildable shared body/status transport values with explicit unavailable boundaries; cognition remains Mac-owned |
+// Blueprint: | `OrganismLivingStatus.swift` | `OrganismLivingStatusFile`: read-only body status; unavailable stays explicit |
 
-/// Whether this file is a complete current projection or an explicit boundary
-/// condition. Consumers must not infer a calm zero from an unavailable file.
+/// Whether this file is a complete current projection or an explicit boundary condition. Consumers must not infer a calm zero from an unavailable file.
 public enum OrganismLivingStatusAvailability: String, Codable, Hashable, Sendable {
     case live
     case disabled
     case unavailable
 }
-/// Rebuildable, read-only organism projection shared by the Mac snapshot
-/// writer and the iOS display client. Cognition remains Mac-owned; this DTO is
+/// Rebuildable, read-only organism projection shared by the Mac snapshot writer and the iOS display client. Cognition remains Mac-owned; this DTO is
 /// transport tissue only and deliberately carries no behavior.
 public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
     public var generatedAt: Date
@@ -25,8 +23,7 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
     public var body: OrganismLivingBodyFile
     public var counters: OrganismLivingCountersFile
     public var availability: OrganismLivingStatusAvailability
-    /// A bounded machine-readable reason for `.unavailable`; never carries a
-    /// raw filesystem or desk error into the mobile snapshot.
+    /// A bounded machine-readable reason for `.unavailable`; never carries a raw filesystem or desk error into the mobile snapshot.
     public var unavailableReason: String?
 
     public var availabilityState: OrganismLivingStatusAvailability {

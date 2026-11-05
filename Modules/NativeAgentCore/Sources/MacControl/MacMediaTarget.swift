@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MacMediaTarget.swift` | One read-only live Now Playing process recipe through ProcessExecution; successful no-player evidence returns nil, Stop throws CancellationError; typed launch, channel, timeout, exit, truncation and PID failures retain bounded process evidence in the same admission/execution refusal; no player launch or retained target state |
+// Blueprint: | `MacMediaTarget.swift` | Bounded Now Playing identity discovery; no-player evidence is nil, cancellation and process failures stay typed |
 
 enum MacMediaTarget {
     struct Failure: Error, LocalizedError, Sendable {
@@ -39,9 +39,7 @@ enum MacMediaTarget {
         }
     }
 
-    // MediaRemote's read requires an Apple platform host on recent macOS.
-    // This fixed recipe reads only the system player's process identity; no
-    // caller-supplied code or app command enters the interpreter.
+    // Recent macOS requires an Apple host for MediaRemote reads; this fixed recipe admits no caller code and reads only player identity.
     static let query = #"""
     ObjC.import('Foundation');
     function run() {
@@ -68,9 +66,12 @@ enum MacMediaTarget {
                 currentDirectory: nil, environment: nil, standardInput: Data(query.utf8),
                 timeoutSeconds: 2, outputByteLimit: 4096, launchFailure: { $0 })
             try Task.checkCancellation()
-            guard !result.timedOut else { throw Failure(kind: .timeout, cause: "The two-second process deadline expired; the player is unknown.", process: result) }
-            guard result.exitCode == 0 else { throw Failure(kind: .exit, cause: "The Now Playing recipe exited with status \(result.exitCode): \(result.stderr)", process: result) }
-            guard !result.stdoutTruncated, !result.stderrTruncated else { throw Failure(kind: .truncated, cause: "Discovery output exceeded its 4096-byte capture limit.", process: result) }
+            guard !result.timedOut else { throw Failure(kind: .timeout, cause: "The two-second process deadline expired; the player is unknown.",
+                process: result) }
+            guard result.exitCode == 0 else { throw Failure(kind: .exit,
+                cause: "The Now Playing recipe exited with status \(result.exitCode): \(result.stderr)", process: result) }
+            guard !result.stdoutTruncated, !result.stderrTruncated else { throw Failure(kind: .truncated,
+                cause: "Discovery output exceeded its 4096-byte capture limit.", process: result) }
             let answer = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             if answer == "no_player" { return nil }
             guard let pid = Int32(answer), pid > 0 else {
@@ -79,7 +80,8 @@ enum MacMediaTarget {
             return pid
         } catch let failure as Failure { throw failure }
         catch is ProcessRunCancellation { throw CancellationError() }
-        catch let error as ProcessRunIOFailure { throw Failure(kind: .channels, cause: error.localizedDescription, process: error.result, channels: error.channels) }
+        catch let error as ProcessRunIOFailure { throw Failure(kind: .channels, cause: error.localizedDescription,
+            process: error.result, channels: error.channels) }
         catch is CancellationError { throw CancellationError() }
         catch { throw Failure(kind: .process, cause: error.localizedDescription, underlying: error) }
         #else

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import ApprovalInbox
@@ -7,43 +8,41 @@ import MemoryV2
 import NativeAgentShared
 import NotificationInbox
 import Transcripts
-// Blueprint: | `DeviceSyncHost.swift` | Engine snapshot/action seam; surface layout carries checked value or owning path/repair failure to the phone; transcript timestamps bound read-only other-room exchanges to shown history; message owners omit previews for transport budgets |
+// Blueprint: | `DeviceSyncHost.swift` | Shared snapshot/action seam, checked layout and bounded message projections. |
 
-/// Snapshot rows whose type the app's mirrors still own. Device sync only
-/// encodes them, with the snapshot encoder, so the phone's bytes are the app
-/// type's own.
+/// Encode app-owned mirror types directly so device sync cannot invent a second wire shape.
 public typealias DeviceSyncSnapshotRows = any Encodable & Sendable
 
-/// What a Workshop submission hands back to the phone.
-public struct DeviceSyncWorkshopSubmission: Sendable {
-    public var executionId: String?
-    public var desk_handle: String?
-    public var desk_alias: String?
+/// A Desk task the phone starts: its item and the agent's line that carries it.
+public struct DeviceSyncDeskTask: Sendable {
+    public var job: String
+    public var desk_handle: String
+    public var desk_alias: String
 
-    public init(executionId: String?, desk_handle: String?, desk_alias: String?) {
-        self.executionId = executionId
+    public init(job: String, desk_handle: String, desk_alias: String) {
+        self.job = job
         self.desk_handle = desk_handle
         self.desk_alias = desk_alias
     }
 }
 
-/// What device sync reaches that the app still owns: its reads and actions,
-/// the engine facades, remote Mac control and the attention router.
 public protocol DeviceSyncHost: Sendable {
     func helpersSnapshot() async throws -> MobileHelpersSnapshot
     func helperAction(action: String, payload: [String: String]) async throws -> [String: String]
-    func agentThreadAction(action: String, payload: [String: String]) async throws -> [String: String]
-    // Snapshot reads.
-    /// One Desk/authority read per pass; failed lanes keep their own errors.
+    func agentThreadAction(action: String, payload: [String: String], turn: Turn) async throws -> [String: String]
+    /// One Desk/authority read per pass; failed groups keep their own errors.
     func workOverview() async -> (
         overview: WorkOverview, deskItems: [DeskItem]?,
         approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>,
-        executions: Result<[WorkshopTaskRecord], Error>
+        jobEvidence: Result<[DeskExecutionEvidence], Error>
     )
     func getChatSessions() async throws -> [NativeAgentShared.ChatSession]
     func getChatTranscriptGenerations() async throws -> [String: Int?]
     @MainActor func sessionNavigation(for sessions: [NativeAgentShared.ChatSession]) -> ChatSessionNavigation
     @MainActor func surfaceLayout() -> SurfaceLayoutAvailability
+    /// Every page's published face (the phone shows them all).
+    @MainActor func pageFaces() async -> [String: PartFaceSnapshot]
+    @MainActor func faceAction(page: String, row: String, action: String, value: String?, device: String) async throws -> String?
     func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord]
     func getOtherRoomExchanges() async throws -> [OtherRoomExchange]
     func getHealth() async throws -> RuntimeHealth
@@ -62,17 +61,14 @@ public protocol DeviceSyncHost: Sendable {
     func getPersonality() async throws -> PersonalityProfile
     func knowledgeGraphSnapshotData() async throws -> Data
     func getRunsStrict() async -> [RunRecord]?
-    // The phone's signed actions.
     func schedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue
-    /// The Mac's settings registry: every row as its page reads it, and one
-    /// row set through the write its page control calls.
+    /// Phone settings read and write through the same registry as the Mac page controls.
     @MainActor func appSettings() async throws -> [MobileAppSetting]
     @MainActor func setAppSetting(id: String, value: String, actionID: String, clientID: String) async throws -> MobileAppSetting
     func applyMobileTrustAction(_ request: MobileTrustAction) async throws -> Data
     func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows
     func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows
-    func submitWorkshopExecution(title: String, objective: String) async throws -> DeviceSyncWorkshopSubmission
-    func resolveWorkshopStep(executionId: String, stepId: String, decision: String, provenance: ApprovalResolutionProvenance) async throws
+    func submitDeskTask(title: String, objective: String) async throws -> DeviceSyncDeskTask
     func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord
     func rejectMemoryProposal(proposalID: String, reason: String) async throws
     func deleteMemory(id: String) async throws
@@ -86,16 +82,17 @@ public protocol DeviceSyncHost: Sendable {
     func testProvider(_ id: String) async throws -> NativeAgentShared.ProviderTestResult
     func clearProvider(_ id: String) async throws
     func setActiveProvider(surface: String, providerId: String) async throws
-    func saveSurfaceSelection(surface: String, model: String, reasoningEffort: String?, serviceTier: String?, providerID: String?) async throws -> ProviderRoutingSnapshot
-    /// The Mac's own pinned chats, in order, and their one mutation seam.
+    func saveSurfaceSelection(
+        surface: String,
+        model: String,
+        reasoningEffort: String?,
+        serviceTier: String?,
+        providerID: String?) async throws -> ProviderRoutingSnapshot
     @MainActor func pinnedChatSessionIDs() -> [String]
     @MainActor func savePinnedChatSessionIDs(_ ids: [String]) throws
-    /// A phone's `mac_control` action, through the app's Mac control route.
-    func remoteMacControl(payload: [String: String]) async throws -> [String: String]
+    /// Remote control must pass through the app's Mac control route.
+    func remoteMacControl(payload: [String: String], turn: Turn) async throws -> [String: String]
 
-    /// The needs-User knock, through the attention router. Throws when it
-    /// reached no channel, so the edge is retried.
-    func knockNeedsUser(title: String, body: String, userInfo: [String: String]) async throws
     /// Retry persisted result delivery independently of turn execution.
     func retryRequestedResults() async
 }

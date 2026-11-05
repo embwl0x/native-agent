@@ -21,8 +21,8 @@ public enum OrganismPredictiveBody {
         var nextLedger = ledger
         var nextChemistry = chemicalState
 
-        // Horizon refresh belongs to applyingHorizonRefresh; ordinary signals still expire passed horizons.
-        // Resolve an outcome before expiry; other signals sweep first so starts and cancellations cannot erase a miss.
+        // Horizon refresh belongs to applyingHorizonRefresh; ordinary signals still expire passed horizons. Resolve an outcome before expiry; other signals
+        // sweep first so starts and cancellations cannot erase a miss.
         let resolvesOwnRow: Bool
         switch signal.kind {
         case .userSpoke, .toolSucceeded, .toolFailed,
@@ -76,7 +76,7 @@ public enum OrganismPredictiveBody {
             // Only the appraisal owner's metadata can mint an expectation.
             mintSemanticExpectation(signal: signal, in: &nextLedger)
         case .userSpoke:
-            // The scoped reaction answers the completion she expected a response to.
+            // The scoped reaction answers the completion the agent expected a response to.
             resolveSemanticExpectations(
                 signal: signal,
                 ledger: &nextLedger,
@@ -85,7 +85,7 @@ public enum OrganismPredictiveBody {
         case .correctionReceived, .appWake, .appSleep, .horizonRefresh,
              .providerRecovered, .iPhoneReachable, .iPhoneStale,
              .memoryCommitted, .memoryCorrected,
-             .dreamCompleted, .remIntegrated, .resourcePressureChanged:
+             .dreamCompleted, .remIntegrated, .resourcePressureChanged, .organDeviated:
             break
         }
 
@@ -131,9 +131,8 @@ public enum OrganismPredictiveBody {
         }
     }
 
-    /// Live and restored rows share expiry; silence about a belief is no miss.
-    /// Callers own ledger effects: the live sweep stamps violation and chemistry,
-    /// while restore avoids dosing a body already decayed through the gap.
+    /// Live and restored rows share expiry; silence about a belief is no miss. Callers own ledger effects: the live sweep stamps violation and chemistry, while
+    /// restore avoids dosing a body already decayed through the gap.
     static func applyExpiryTransition(
         to prediction: inout OrganismPrediction,
         at date: Date
@@ -154,12 +153,7 @@ public enum OrganismPredictiveBody {
         guard let id = pendingID(kind: kind, signal: signal) else { return }
         let dueAt = signal.occurredAt.addingTimeInterval(defaultHorizon(for: kind))
         if var existing = ledger.predictions[id] {
-            // Correlated source evidence can arrive late. It may still inform
-            // generic physiology upstream, but it cannot reopen the prediction
-            // at an older epoch or move its due horizon backward.
-            // Lifecycle owners may replay the same durable edge after a
-            // restart. Equality is the same observation, not fresh evidence;
-            // accepting it repeatedly inflated confidence and evidenceCount.
+            // Reject older or equal-time lifecycle replays so delayed evidence cannot reopen a row, move its deadline backward or inflate confidence.
             guard signal.occurredAt >= existing.lastUpdatedAt else { return }
             if existing.status == .pending,
                signal.occurredAt == existing.lastUpdatedAt { return }
@@ -196,9 +190,8 @@ public enum OrganismPredictiveBody {
         let status: OrganismPredictionStatus = satisfied ? .satisfied : .violated
         if let existing {
             guard signal.occurredAt >= existing.lastUpdatedAt else { return }
-            // A replay of the same terminal edge is not new evidence. Keep
-            // equal-time pending→terminal transitions valid: some lifecycle
-            // owners legitimately stamp both phases from one clock sample.
+            // A replay of the same terminal edge is not new evidence. Keep equal-time pending→terminal transitions valid: some lifecycle owners legitimately
+            // stamp both phases from one clock sample.
             if existing.status == status,
                signal.occurredAt == existing.lastUpdatedAt { return }
         }
@@ -392,8 +385,7 @@ public enum OrganismPredictiveBody {
         case .workflowAdvance:
             confidence.workflowPath = OrganismBodyConfidence.clamp(confidence.workflowPath + amount)
         case .semanticExpectation:
-            // No body path by design (see the kind's doc comment). Being right
-            // or wrong about how work lands is not evidence about her hands.
+            // Semantic work judgments cannot change beliefs about physical tool paths.
             break
         }
     }
@@ -472,8 +464,7 @@ public enum OrganismPredictiveBody {
 
 }
 
-/// Pending expectations precede recent terminal evidence, retained fairly
-/// across capability kinds without favoring any terminal status.
+/// Pending expectations precede recent terminal evidence, retained fairly across capability kinds without favoring any terminal status.
 enum OrganismPredictionRetention {
     static func bounded(
         _ predictions: [OrganismPrediction],

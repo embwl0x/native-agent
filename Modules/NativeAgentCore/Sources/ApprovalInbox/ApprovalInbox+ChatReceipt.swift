@@ -6,9 +6,8 @@ import Transcripts
 // Blueprint: | `ApprovalInbox+ChatReceipt.swift` | Approval receipt rows and healing order; transcript bytes are written through ContactThread |
 
 extension SwiftNativeApprovalInbox {
-    /// One receipt identity per approval, including a healed execution outcome.
-    /// Presentation supplies the already-redacted envelope; the inbox owns the
-    /// receipt row and ContactThread owns its transcript bytes.
+    /// One receipt identity per approval, including a healed execution outcome. Presentation supplies the already-redacted envelope; the inbox owns the receipt
+    /// row and ContactThread owns its transcript bytes.
     public func writeChatReceipt(
         approvalID: String, sessionID: String, toolName: String, surface: String,
         summary: String, resultClass: String, resultStatus: String?, ok: Bool?, resultPreview: String?,
@@ -48,17 +47,10 @@ extension SwiftNativeApprovalInbox {
             ]
             if let ok { metadata["ok"] = .bool(ok) }
             metadata["resultClass"] = .string(resultClass)
-            // The same exact word any tool row keeps beside its class.
             if let resultStatus { metadata["resultStatus"] = .string(resultStatus) }
             if let returnedID { metadata["resultReturnedID"] = .string(returnedID) }
             if let effects { metadata["resultEffects"] = .string(effects) }
-            // The envelope above is what the pill parses; its prose preamble
-            // is longer than the history projection's head, so the result
-            // body never survived into the model's next turn (it re-ran the
-            // tool and asked for a second approval). Keep the already-
-            // redacted body unwrapped too — `SessionHistoryPromptRenderer
-            // .toolSummary` reads this key and projects it exactly like an
-            // ordinary tool result.
+            // Project the redacted body unwrapped so history clipping cannot hide the result and provoke a repeat approval.
             if let resultPreview, !resultPreview.isEmpty {
                 metadata["resultBody"] = .string(resultPreview)
             }
@@ -68,15 +60,12 @@ extension SwiftNativeApprovalInbox {
                 "role": .string("tool"),
                 "content": .string(""),
                 "createdAt": priorObject["createdAt"] ?? .string(recoveredAt ?? now),
-                "source": .string(surface),
+                "source": .string(ChatThreadKind.transcriptSource(surface: surface)),
                 "runId": .string("approval-\(approvalID)"),
                 "metadata": .object(metadata),
             ])
             if let existingIndex {
-                // A narrowly recoverable pre-dispatch failure can later
-                // succeed. Keep one canonical receipt, but replace its
-                // stale failure result so conversation continuity agrees
-                // with the approval store's latest execution truth.
+                // Replace a recoverable failure in the canonical receipt so history agrees with the latest execution outcome.
                 if rows[existingIndex] != row {
                     var updated = rows
                     updated[existingIndex] = row
@@ -91,8 +80,7 @@ extension SwiftNativeApprovalInbox {
                           else { return false }
                           return date > recoveredDate
                       }) {
-                // History projection consumes file order. Heal an old receipt
-                // before newer turns, under the same lock as ordinary appends.
+                // History consumes file order, so heal receipts before newer turns under the append lock.
                 var updated = rows
                 updated.insert(row, at: insertionIndex)
                 try ContactThread.replace(updated, to: path)

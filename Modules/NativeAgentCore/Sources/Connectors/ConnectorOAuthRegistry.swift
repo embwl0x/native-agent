@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import SlackBot
-// Blueprint: | `ConnectorOAuthRegistry.swift` | Canonical connector row edits, including revocation; extends PersistenceCore's checked registry owner with `mutateConnectorRegistryEntry`, `removeConnectorRegistryEntries` |
+// Blueprint: | `ConnectorOAuthRegistry.swift` | Registry owner: `mutateConnectorRegistryEntry`, `removeConnectorRegistryEntries` |
 
 extension ConnectorOAuthRegistry {
     public static func mutateConnectorRegistryEntry(
@@ -19,8 +19,7 @@ extension ConnectorOAuthRegistry {
         }
         let path = connectorRegistryPath(root: root)
         return try await SwiftNativePersistenceCore.withFileLock(path) {
-            // Finish an interrupted Slack registry publication before any
-            // connector mutation can advance that registry generation.
+            // Finish the pending Slack publication before another mutation advances the registry generation.
             try SlackCredentials.recoverPendingSave(dataRoot: root)
             var rows = try readRegistry(at: path)
             let index = rows.firstIndex { connectorRow($0, matches: providerID) }
@@ -39,8 +38,6 @@ extension ConnectorOAuthRegistry {
         }
     }
 
-    /// Drops the rows `ids` name, under the registry lock; a row that is not
-    /// there is nothing to drop.
     public static func removeConnectorRegistryEntries(root: URL, ids: Set<String>) async throws {
         let path = connectorRegistryPath(root: root)
         try await SwiftNativePersistenceCore.withFileLock(path) {

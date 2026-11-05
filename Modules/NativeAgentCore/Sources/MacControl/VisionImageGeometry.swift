@@ -8,14 +8,13 @@ import PersistenceCore
 import ScreenCaptureKit
 import Senses
 import Synchronization
-// Blueprint: | `VisionImageGeometry.swift` | Owned image decoding and geometry-preserving crops; no-region requests keep the whole image, invalid or failed requested crops return unavailable |
+// Blueprint: | `VisionImageGeometry.swift` | Owned bitmaps and geometry-preserving crops; failed requested crops remain unavailable |
 
-/// Decode the fused Mac view into an owned bitmap.
 public enum VisionImageDecoder {
     public static func decode(_ data: Data) -> CGImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let lazy = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        // Own the bitmap so Vision never reads released ImageIO backing.
+        // Own bitmap storage so Vision cannot read released ImageIO backing.
         guard let context = CGContext(
             data: nil, width: lazy.width, height: lazy.height, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
@@ -32,7 +31,7 @@ public struct VisionImageCrop {
     public let logicalSize: (width: Double, height: Double)
 }
 
-/// Crop to the AX-located visual surface, preserving global hand coordinates.
+/// AX-directed crops must preserve global hand coordinates.
 public enum VisionImageCropper {
     public static func crop(
         _ image: CGImage,

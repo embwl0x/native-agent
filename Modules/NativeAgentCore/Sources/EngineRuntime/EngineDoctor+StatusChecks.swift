@@ -6,7 +6,7 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSync
 import ToolExecution
-// Blueprint: | `EngineDoctor+StatusChecks.swift` | `DoctorFacade`: checked Desk attention and Activity facts go through L0 Parts.call to Resources/abilities/diagnostic-narration.js outside view rendering; native measured status, approval/store failures, corruption detection, unknown-outcome reconciliation and parent repair remain here; an unavailable narrator is explicit without being mistaken for a canonical read failure |
+// Blueprint: | `EngineDoctor+StatusChecks.swift` | `DoctorFacade`; Native Desk and Activity evidence with authored narration |
 
 private struct DiagnosticNarration: Codable, Sendable {
     let detail: String
@@ -24,7 +24,8 @@ extension DoctorFacade {
         return (rows, desk.repaired)
     }
 
-    private static func deskCheck(approvals: ApprovalsFacade, root: URL, repair: Bool, stuckReason: (DeskItem, [DeskItem]) -> String, safeDetail: (String) -> String) async -> (row: CheckResult, repaired: Bool) {
+    private static func deskCheck(approvals: ApprovalsFacade, root: URL, repair: Bool, stuckReason: (DeskItem, [DeskItem]) -> String, safeDetail: (
+        String) -> String) async -> (row: CheckResult, repaired: Bool) {
         let store = SwiftNativeDeskStore(dataRoot: root)
         do {
             var state = try await store.liveState()
@@ -49,7 +50,14 @@ extension DoctorFacade {
                                     detail: "Approvals could not be read: \(safeDetail(error.localizedDescription)).",
                                     harm: "Pending decisions cannot be read or safely settled.",
                                     human_action: ToolFailureError.fileRepairInstruction(root.appendingPathComponent("workflows/approvals/requests.json"),
-                                        shape: "A JSON array of saved approval requests with their original identities, payloads and decisions. Preserve all authority and decision fields exactly; never approve, deny or invent a request.") + " Open Approvals and refresh its pending list; inspect the approval store before changing any saved request."), repaired)
+                                        shape: """
+                                            A JSON array of saved approval requests with their original identities, payloads and decisions. Preserve all \
+                                            authority and decision fields exactly; never approve, deny or invent a request.
+                                            """)
+                                                + """
+                                                     Open Approvals and refresh its pending list; inspect the approval store before changing any saved \
+                                                    request.
+                                                    """), repaired)
             }
             let id = "status.desk_attention"
             let title = "Desk work and decisions"
@@ -67,7 +75,8 @@ extension DoctorFacade {
             let severity = contradictions.isEmpty ? "ok" : "warn"
             return (CheckResult(source: "desk/desk_ops_base.json and desk/desk_ops.jsonl", id: id, title: title, status: severity, detail: narration.detail,
                                 harm: severity == "warn" ? "The named Desk work cannot move forward or is marked finished while work remains." : nil,
-                                repair: contradictions.isEmpty ? nil : "Press Repair in Diagnostics → Health checks to reconcile terminal Desk parents with open descendants.",
+                                repair: contradictions.isEmpty ? nil
+                                    : "Press Repair in Diagnostics → Health checks to reconcile terminal Desk parents with open descendants.",
                                 human_action: narration.humanAction,
                                 repair_available: pendingApprovals > 0 || !waiting.isEmpty || !blocked.isEmpty || !contradictions.isEmpty
                                     ? !contradictions.isEmpty : nil), repaired)
@@ -84,17 +93,24 @@ extension DoctorFacade {
                                 detail: "Desk's canonical state could not be read: \(safeDetail(error.localizedDescription)).",
                                 harm: "Saved work cannot be read or safely advanced.",
                                 human_action: [file.map { ToolFailureError.fileRepairInstruction($0,
-                                    shape: "The Desk compaction base holds the saved items and lastCompactedOpId; its JSONL tail holds DeskOp events. Preserve identities, parent links, continuations and recorded outcomes.") }, file == nil
-                                    ? "Open Trust → Advanced → Backups, select a verified backup containing desk/desk_ops_base.json and desk/desk_ops.jsonl, then choose Restore → Restore backup."
-                                    : "Open Desk and inspect its unavailable-state detail before recovering the named canonical feed."].compactMap { $0 }.joined(separator: " "),
+                                    shape: """
+                                        The Desk compaction base holds the saved items and lastCompactedOpId; its JSONL tail holds DeskOp events. Preserve \
+                                        identities, parent links, continuations and recorded outcomes.
+                                        """) }, file == nil
+                                    ? """
+                                        Open Trust → Advanced → Backups, select a verified backup containing desk/desk_ops_base.json and \
+                                        desk/desk_ops.jsonl, then choose Restore → Restore backup.
+                                        """
+                                    : "Open Desk and inspect its unavailable-state detail before recovering the named canonical feed."].compactMap { $0 }
+                                        .joined(separator: " "),
                                 ask: file == nil ? .permission : nil), false)
         }
     }
 
     private static func diagnosticNarration(root: URL, input: JSONValue, safeDetail: (String) -> String) async -> DiagnosticNarration {
         do {
-            return try await NativeAgentEngine.forRoot(root).tools.withPartDoor(envelope: .native("doctor:status-narration")) {
-                switch await Parts(root: root).call(id: "diagnostic-narration", input: input, as: DiagnosticNarration.self) {
+            return try await NativeAgentEngine.forRoot(root).tools.withPartDoor(envelope: .native("doctor:status-narration")) { door in
+                switch await Parts(root: root).call(id: "diagnostic-narration", input: input, invocation: door.invocation, as: DiagnosticNarration.self) {
                 case .success(let narration): return narration
                 case .failure(let error): throw error
                 }
@@ -132,15 +148,25 @@ extension DoctorFacade {
                                id: id, title: title, status: malformed > 0 ? "fail" : reconciliation.isEmpty ? "ok" : "unmeasured",
                                detail: narration.detail,
                                harm: malformed > 0 ? "Parts of the activity history cannot be reviewed." : nil,
-                               human_action: malformed > 0 ? ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(dataRoot: root),
-                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence.") : nil)
+                               human_action: malformed > 0 ? ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(
+                                   dataRoot: root),
+                                   shape: """
+                                       Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. \
+                                       Preserve unknown outcomes and reconciliation evidence.
+                                       """) : nil)
         } catch {
             return CheckResult(source: "activity/events.jsonl",
                                id: id, title: title, status: "fail",
                                detail: "The activity log could not be read: \(safeDetail(error.localizedDescription)).",
                                harm: "Recent work and its outcomes cannot be reviewed.",
                                human_action: ToolFailureError.fileRepairInstruction(SwiftNativePersistenceCore.activityEventsPath(dataRoot: root),
-                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence.") + " Open Status and refresh Recent activity once; if the log is still unavailable, inspect activity/events.jsonl without replacing its bytes.")
+                                   shape: """
+                                       Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. \
+                                       Preserve unknown outcomes and reconciliation evidence.
+                                       """) + """
+                                        Open Status and refresh Recent activity once; if the log is still unavailable, inspect activity/events.jsonl without \
+                                       replacing its bytes.
+                                       """)
         }
     }
 

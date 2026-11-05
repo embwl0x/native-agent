@@ -3,15 +3,16 @@ import Foundation
 import NativeAgentCore
 import Security
 import PersistenceCore
-// Blueprint: | `AgentPeerTransport.swift` | `AgentPeerCredentials`: per-contact checked credential reads and unique resolution among readable keys; an unreadable contact retains its own failure without denying readable siblings; inbound doors disclose no Keychain details; bearer comparison delegates to `BridgeCore` |
+// Blueprint: | `AgentPeerTransport.swift` | `AgentPeerCredentials`, `BridgeCore` |
 
 
 /// Dedicated per-peer secrets. Never consults generic provider or bridge keys.
 public enum AgentPeerCredentials {
-    public static let unavailableDetail = "Contact credential is unresolved. agent.connect repairs a confirmed missing key; resolve Keychain access errors before reconnecting."
+    public static let unavailableDetail = """
+        Contact credential is unresolved. agent.connect repairs a confirmed missing key; resolve Keychain access errors before reconnecting.
+        """
 
-    /// Inbound doors disclose no local credential-read failure to the caller.
-    /// A failed row cannot authenticate, but does not veto readable siblings.
+    /// Inbound doors disclose no local credential-read failure to the caller. A failed row cannot authenticate, but does not veto readable siblings.
     public static func resolve(_ token: String, peers: [AgentPeerContact],
                                readCredential: (String) throws -> String? = { try read(peerID: $0) }) -> AgentPeerContact? {
         guard AgentPeerHTTP.validToken(token) else { return nil }
@@ -23,8 +24,7 @@ public enum AgentPeerCredentials {
         let result: Result<String?, ToolFailureError>
     }
 
-    /// Call-scoped evidence only; the next use reads the credential owner again.
-    /// Keep failure distinct from confirmed absence, and attribute it to its row.
+    /// Call-scoped evidence only; the next use reads the credential owner again. Keep failure distinct from confirmed absence, and attribute it to its row.
     private static func credentialReads(_ peers: [AgentPeerContact],
                                         readCredential: (String) throws -> String?) -> [CredentialRead] {
         peers.filter { $0.credentialKey == AgentPeerContact.credentialKey(for: $0.id) }.map { peer in
@@ -73,8 +73,7 @@ public enum AgentPeerCredentials {
         }
     }
 
-    /// Authority checks deny on unreadable credentials. Local projections use
-    /// `availability` so the same failure remains visible with its remedy.
+    /// Authority checks deny on unreadable credentials. Local projections use `availability` so the same failure remains visible with its remedy.
     public static func isAvailable(_ peer: AgentPeerContact, peers: [AgentPeerContact]) -> Bool {
         switch availability(peer, peers: peers) {
         case .success(let available): return available
@@ -82,8 +81,7 @@ public enum AgentPeerCredentials {
         }
     }
 
-    // Retained only until an entitled installed-app read establishes old-key
-    // coverage. An unentitled command-line absence cannot prove it empty.
+    // Only an entitled installed-app read can establish key coverage; unentitled command-line absence proves nothing.
     static let legacyService = "com.nativeagent.agent-peer-bearer"
     static var service: String {
         get throws {
@@ -102,7 +100,10 @@ public enum AgentPeerCredentials {
             switch self {
             case .invalidPeer: return "Contact credential identity is invalid."
             case .invalidToken: return "Contact bearer credential is invalid."
-            case .unavailable(let status): return "Contact credential access failed in Keychain (\(status)): \(SecCopyErrorMessageString(status, nil) as String? ?? "No system explanation")."
+            case .unavailable(let status): return """
+                Contact credential access failed in Keychain (\(status)): \
+                \(SecCopyErrorMessageString(status, nil) as String? ?? "No system explanation").
+                """
             }
         }
         var failure: ToolFailureError {
@@ -135,13 +136,13 @@ public enum AgentPeerCredentials {
         let invalid = ToolFailureError("Saved credential peer:\(peerID) is not a valid bearer token.", effects: .none,
             owner: "Keychain \(service) / \(AgentPeerContact.credentialKey(for: peerID))",
             tap: "Keychain Access → login → \(service) → \(AgentPeerContact.credentialKey(for: peerID))",
-            code: "agent_saved_credential_invalid", instruction: "Repair the named Keychain entry with the contact's valid token; preserve existing credential evidence.")
+            code: "agent_saved_credential_invalid",
+                instruction: "Repair the named Keychain entry with the contact's valid token; preserve existing credential evidence.")
         guard let data = try readData(query, invalidData: invalid) else { return nil }
         guard let token = String(data: data, encoding: .utf8), AgentPeerHTTP.validToken(token) else { throw invalid }
         return token
     }
-    /// Read this install's Keychain at each credential
-    /// use, so external repairs and removal take effect without a restart.
+    /// Read this install's Keychain at each credential use, so external repairs and removal take effect without a restart.
     public static func read(peerID: String) throws -> String? {
         let service = try Self.service
         if let current = try readToken(peerID: peerID, service: service) { return current }
@@ -152,8 +153,7 @@ public enum AgentPeerCredentials {
         guard AgentPeerHTTP.validToken(token) else { throw CredentialError.invalidToken.failure }
         try upsert(Data(token.utf8), query: query)
     }
-    /// A peer's other secrets (a callback's credentials) live in this same
-    /// dedicated store, each under its own account, never in a data file.
+    /// A peer's other secrets (a callback's credentials) live in this same dedicated store, each under its own account, never in a data file.
     public static func writeSecret(_ data: Data, account: String) throws {
         try upsert(data, query: secretQuery(account))
     }

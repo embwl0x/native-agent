@@ -9,10 +9,7 @@ public struct TelegramTestResponse: Codable, Hashable, Sendable {
     public var chatId: String
     public var messageId: Int?
     public var receipt: TelegramReceipt?
-    /// A successful outgoing reply proves the saved credential can send, but
-    /// it does not prove the inbound long-poll lane is alive.  These fields
-    /// are attached after the transport reply, from the live
-    /// BackgroundLoops owner.
+    /// Successful outgoing sends prove credentials, never inbound liveness; attach inbound evidence from the live BackgroundLoops owner.
     public var tokenConfigured: Bool?
     public var pollerRegistered: Bool?
     public var pollerTicking: Bool?

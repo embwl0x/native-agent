@@ -3,14 +3,9 @@ import SwiftUI
 
 // Blueprint: | `SimpleSetupPanel.swift` | `InlineCardSetupPresentation`: existing setup controls in a floating Simple panel or Advanced sheet/page |
 
-// Simple view has no pages, so the setup a card opens — "Open full setup",
-// the connector that needs its own sheet (Slack), and
-// the pages a card sends the person to (Telegram, Trust, Providers) — opens
-// in one floating glass panel over the chat, with the existing setup view
-// inside it. Advanced keeps the sheet and the pages it always had.
+// Simple has no pages; host canonical setup views over chat while Advanced uses its page routes.
 
 extension View {
-    /// Where a chat's inline cards open their setup.
     func inlineCardSetup(_ cards: InlineInteractionChatBinding) -> some View {
         modifier(InlineCardSetupPresentation(cards: cards))
     }
@@ -35,7 +30,7 @@ struct InlineCardSetupPresentation: ViewModifier {
                                 Task { await cards.panelClosed() }
                             }
                         } else if let page = cards.panelPage {
-                            Self.page(page)
+                            Self.page(page, appModel: appModel)
                         }
                     }
                     .task { while !Task.isCancelled {
@@ -44,7 +39,6 @@ struct InlineCardSetupPresentation: ViewModifier {
                     } }
                 }
             }
-            // Advanced: Connectors' own setup, opened as the sheet it is.
             .sheet(item: Binding(
                 get: { simple ? nil : cards.connectorSheet },
                 set: { if $0 == nil { Task { await cards.connectorSheetClosed() } } }
@@ -56,22 +50,22 @@ struct InlineCardSetupPresentation: ViewModifier {
             }
     }
 
-    /// The pages a card can open, as Advanced shows them.
     @ViewBuilder
-    static func page(_ item: SidebarItem) -> some View {
+    static func page(_ item: SidebarItem, appModel: AppModel) -> some View {
         switch item {
         case .telegram: TelegramView()
-        case .trust: TrustCenterView()
-        case .providers: ProviderSettingsView()
-        case .settings: SetupView()
-        // The pairing card opens Connectors on its iPhone tab.
+        case .trust: FacePageView(page: "trust")
+        case .providers:
+            FacePageView(page: "providers", isReading: appModel.panelRefreshCounts[.providers, default: 0] > 0)
+                .quietReadTask { _ = await appModel.refreshForSidebarItem(.providers) }
+        case .settings: FacePageView(page: "settings")
+        // Pairing must select the iPhone tab instead of Connectors' default.
         case .connectors: ConnectorsRailPage()
         default: EmptyView()
         }
     }
 }
 
-/// Native glass, radius 22, a close button, Esc closes it.
 struct SimpleSetupPanel<Content: View>: View {
     var showsClose = true
     let close: () -> Void
@@ -83,9 +77,7 @@ struct SimpleSetupPanel<Content: View>: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
         ZStack {
-            // Holds the chat still behind the panel; the chat is disabled too.
-            // Apple's dimming layer under glass over busy content: 35% black,
-            // so the card behind stops showing through the panel.
+            // Disable background chat and dim it 35% so text behind glass cannot compete with the panel.
             Color.black.opacity(0.35).ignoresSafeArea()
             content
                 .frame(maxWidth: 760)
@@ -102,9 +94,7 @@ struct SimpleSetupPanel<Content: View>: View {
                         .padding(12)
                     }
                 }
-                // A page read in full (Connectors, Providers) sits on the
-                // room's own fill; the glass keeps only its rim. Clear glass
-                // let the chat read through the text (User, 10-18).
+                // Full pages need an opaque room fill so chat text cannot show through their content.
                 .background { shape.fill(NativeAgentShell.room) }
                 .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
                 .padding(32)

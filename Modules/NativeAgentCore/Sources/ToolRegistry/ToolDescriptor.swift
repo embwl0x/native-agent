@@ -2,15 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ToolDescriptor.swift` | `ToolDescriptor`, `ToolExecutor`, `AppActionBinding`: composed action calls, effect declarations (class, reach, capabilities; each form supplies the common case) and executable ownership registration |
+// Blueprint: | `ToolDescriptor.swift` | `ToolDescriptor`, `ToolExecutor`, `AppActionBinding`: one call/effect declaration |
 
 // MARK: - Tool descriptors
 
-/// Stable, runtime-owned categories for the Tools catalog. The catalog is the
-/// authority for the mounted tool set; this registry is the authority for the
-/// names implemented by the Swift dispatcher. Keeping both facts together
-/// means a new dispatcher case cannot quietly fall into a presentation
-/// catch-all without its category being reviewed.
+/// Register categories beside dispatcher names so a new built-in cannot silently become an unreviewed presentation catch-all.
 public enum ChatToolCatalogBucket: String, CaseIterable, Sendable {
     case shell
     case system
@@ -51,10 +47,7 @@ public enum ChatToolCatalogBucket: String, CaseIterable, Sendable {
     }
 }
 
-/// One tool as the router and the catalog know it: the schema the model is
-/// offered (name, description, parameters — byte for byte) and the Tools-page
-/// bucket it is filed under. Trust stays keyed on the canonical name in the
-/// Trust Center's profiles; a descriptor adds no authority.
+/// Schema bytes and presentation category share one descriptor; Trust remains keyed on the canonical name and gains no authority here.
 public struct ToolDescriptor: Sendable {
     public let schema: LLMToolSchema
     public let bucket: ChatToolCatalogBucket
@@ -67,48 +60,43 @@ public struct ToolDescriptor: Sendable {
     public var name: String { schema.name }
 }
 
-/// Tools an owner outside Core contributes to the one catalog (the app's
-/// browser, its own pages, health reads). Core registers the
-/// descriptors, lists them in the Tools page's manifest, and hands each
-/// call here.
+/// External owners contribute to the same catalog so listing and execution cannot diverge.
 public protocol ToolExecutor: Sendable {
     var descriptors: [ToolDescriptor] { get }
-    /// Core tools this owner runs in place of Core's own case on the bodies
-    /// that carry it, with Core's schema: one owner per body. (The app's
-    /// notify reaches its live senders and gates them this way.)
+    /// A body has one executor per overridden Core tool, using Core's schema and the body's own gates.
     var replacesCoreTools: Set<String> { get }
     func execute(
-        tool: String, input: [String: JSONValue], surface: String
+        tool: String, input: [String: JSONValue], surface: String, turn: Turn
     ) async throws -> JSONValue
 }
 
-/// The app action's declared call and policy, shared without importing its executor.
+/// Core reads declared app policy without importing its executor.
 public struct AppActionBinding: Sendable {
     public let tool: String
     public let fixedInput: [String: JSONValue]
     public let rename: [String: String]
     public let folded: Bool
     public let descriptor: ToolDescriptor?
-    public let isHis: Bool
+    public let isPersonOwned: Bool
     public let irreversible: Bool
     public var read: Bool
     public let readWhen: [String: JSONValue]
     public let secretArgs: [String]
     public let lifecycle: CapabilityLifecycle.Action?
-    /// What the action is when it does not read (`read`/`readWhen` say when it does).
+    /// Read predicates refine when the declared effect class applies.
     public let toolClass: ToolClass
     public let reach: ToolReach
     public let capabilities: Set<String>
-    /// The args that name what it acts on: one act per subject, so a success settles only its own debt.
+    /// Subject arguments distinguish debts so success settles only its own target.
     public let subject: [String]
 
-    public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
+    public init(isPersonOwned: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
                 lifecycle: CapabilityLifecycle.Action? = nil, subject: [String] = [],
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
                 folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write,
-                reach: ToolReach = .hers, capabilities: Set<String>? = nil) {
+                reach: ToolReach = .agent, capabilities: Set<String>? = nil) {
         self.tool = tool; self.fixedInput = fixedInput; self.rename = rename; self.folded = folded; self.descriptor = descriptor
-        self.isHis = isHis; self.irreversible = irreversible; self.read = read
+        self.isPersonOwned = isPersonOwned; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
         self.lifecycle = lifecycle
         self.subject = subject
@@ -118,7 +106,7 @@ public struct AppActionBinding: Sendable {
         self.capabilities = capabilities ?? (toolClass == .read ? toolClass.baseCapabilities : toolClass.baseCapabilities.union(["app_data_write"]))
     }
 
-    /// Repair identity: the act and what it acted on, by its declared subject (door names, or the host's renamed keys).
+    /// Repair identity must preserve the declared subject across door argument renaming.
     public static func repairOperation(_ action: String, _ args: [String: JSONValue]) -> String {
         let binding = declaredBinding(action)
         let subject = (binding?.subject ?? []).compactMap { (args[$0] ?? binding?.rename[$0].flatMap { args[$0] })?.stringValue }
@@ -129,43 +117,38 @@ public struct AppActionBinding: Sendable {
         read || (!readWhen.isEmpty && readWhen.allSatisfy { (args[$0.key] ?? .null) == $0.value })
     }
 
-    /// Hold executor closures by reference so generic lock-state mutations cannot
-    /// accumulate reabstraction thunks around them.
+    /// Hold executor closures by reference so generic lock-state mutations cannot accumulate reabstraction thunks around them.
     private final class Resolvers: Sendable {
         let authorableToolName: @Sendable (String) -> Bool
-        let part: @Sendable (String) throws -> AppActionBinding?
-        let catalog: @Sendable () throws -> [String: AppActionBinding]
-        init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String) throws -> AppActionBinding?,
-             catalog: @escaping @Sendable () throws -> [String: AppActionBinding]) {
+        let part: @Sendable (String, Turn?) throws -> AppActionBinding?
+        let catalog: @Sendable (Turn?) throws -> [String: AppActionBinding]
+        init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String, Turn?) throws -> AppActionBinding?,
+             catalog: @escaping @Sendable (Turn?) throws -> [String: AppActionBinding]) {
             self.authorableToolName = authorableToolName
             self.part = part
             self.catalog = catalog
         }
     }
 
-    // Installed from AppActions at executor assembly, before any app call or
-    // receipt. No static initializer here reaches back into the app schemas.
+    // Installed from AppActions at executor assembly, before any app call or receipt. No static initializer here reaches back into the app schemas.
     private static let registry = OSAllocatedUnfairLock(initialState: (
         actions: [String: AppActionBinding](), tools: [String: ToolDescriptor](),
-        resolvers: Resolvers(authorableToolName: { _ in false }, part: { _ in nil }, catalog: { [:] })))
+        resolvers: Resolvers(authorableToolName: { _ in false }, part: { _, _ in nil }, catalog: { _ in [:] })))
 
-    public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool, partPolicy: @escaping @Sendable (String) throws -> AppActionBinding?,
-                                policyCatalog: @escaping @Sendable () throws -> [String: AppActionBinding] = { [:] }) {
+    public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool,
+        partPolicy: @escaping @Sendable (String, Turn?) throws -> AppActionBinding?,
+                                policyCatalog: @escaping @Sendable (Turn?) throws -> [String: AppActionBinding] = { _ in [:] }) {
         registerTools(tools)
         let resolvers = Resolvers(authorableToolName: authorableToolName, part: partPolicy, catalog: policyCatalog)
         registry.withLock { $0 = (actions, $0.tools, resolvers) }
     }
 
-    @TaskLocal private static var catalog: [String: AppActionBinding]?
-
-    /// One synchronous, bounded projection operation, including misses.
-    package static func withCatalog<T>(_ body: () throws -> T) throws -> T {
-        try $catalog.withValue(registry.withLock { $0.resolvers }.catalog(), operation: body)
+    /// A projection holds one catalog and passes it to each lookup, including misses.
+    package static func policyCatalog(turn: Turn?) throws -> [String: AppActionBinding] {
+        try registry.withLock { $0.resolvers }.catalog(turn)
     }
 
-    /// The core dispatcher's own tool names, registered where the dispatcher is
-    /// assembled, so a chain with no app executor (core-only, no body) still
-    /// knows shell and git as built-ins; an executor's descriptors join them.
+    /// Core-only dispatch still needs built-in names; app assembly adds executor descriptors without replacing them.
     public static func registerTools(_ tools: [ToolDescriptor]) {
         let tools = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
         registry.withLock { state in
@@ -181,11 +164,9 @@ public struct AppActionBinding: Sendable {
         registry.withLock { $0.tools[ToolNameAliases.canonical(tool)] != nil }
     }
 
-    /// How many tool names are reserved; the table only grows, so a reader
-    /// that derived something from the namespace can key on it.
+    /// Monotonic namespace size lets derived readers invalidate when registration grows.
     public static var registeredToolCount: Int { registry.withLock { $0.tools.count } }
 
-    /// The class a registered tool's declaration gives it.
     public static func declaredClass(_ tool: String) -> ToolClass? {
         registry.withLock { $0.tools[ToolNameAliases.canonical(tool)]?.schema.toolClass }
     }
@@ -194,13 +175,11 @@ public struct AppActionBinding: Sendable {
         registry.withLock { $0.tools[ToolNameAliases.canonical(tool)]?.schema }
     }
 
-    /// The catalog bucket a registered tool is filed under.
     public static func declaredBucket(_ tool: String) -> ChatToolCatalogBucket? {
         registry.withLock { $0.tools[ToolNameAliases.canonical(tool)]?.bucket }
     }
 
-    /// Whether a declared door action executes through this tool: its arguments
-    /// have that action's current contract.
+    /// A door binding may execute this tool only under the action's current argument contract.
     public static func bindsTool(_ tool: String) -> Bool {
         let name = tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return registry.withLock { $0.actions.values.contains { $0.tool.lowercased() == name } }
@@ -210,37 +189,42 @@ public struct AppActionBinding: Sendable {
         registry.withLock { $0.resolvers }.authorableToolName(tool)
     }
 
-    public static func action(tool: String = "app", input: [String: JSONValue]) throws -> AppActionBinding? {
+    public static func action(tool: String = "app", input: [String: JSONValue], turn: Turn?,
+        catalog: [String: AppActionBinding]? = nil) throws -> AppActionBinding? {
         let id: String
         if tool == "app", case .string(let action)? = input["action"] { id = action }
         else if let action = ToolNameAliases.appAction(tool, input: input) { id = action }
         else { return nil }
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard var policy = try binding(key) else { return nil }
+        guard var policy = try binding(key, turn: turn, catalog: catalog) else { return nil }
         let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
         policy.read = policy.readOnly(args: args)
         return policy
     }
 
+    /// Every action maps door names to its host's through `rename` alone; a folded action's rename already carries its tool's door names.
     public func arguments(_ args: [String: JSONValue]) -> [String: JSONValue] {
-        var call = folded ? ToolNameAliases.hostArgs(tool, args) : [:]
-        if !folded { for (key, value) in args { call[rename[key] ?? key] = value } }
+        var call: [String: JSONValue] = [:]
+        for key in args.keys.sorted() {
+            let name = rename[key] ?? key
+            // Conflicting spellings stay visible to validation, never one picked arbitrarily.
+            if name != key, rename[name] == nil, let other = args[name], other != args[key] { call[key] = args[key] } else { call[name] = args[key] }
+        }
         return call.merging(fixedInput) { _, fixed in fixed }
     }
 
-    /// Pure declaration lookup for name/receipt projection. Runtime admission
-    /// uses `binding`, which also checks the authored owner and can fail.
+    /// Pure declaration lookup for name/receipt projection. Runtime admission uses `binding`, which also checks the authored owner and can fail.
     public static func declaredBinding(_ id: String) -> AppActionBinding? {
         registry.withLock { $0.actions[id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }
     }
 
-    public static func binding(_ id: String) throws -> AppActionBinding? {
+    public static func binding(_ id: String, turn: Turn?, catalog: [String: AppActionBinding]? = nil) throws -> AppActionBinding? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !key.isEmpty else { return nil }
         let (saved, resolvers) = registry.withLock { ($0.actions[key], $0.resolvers) }
         if let saved { return saved }
         if let catalog { return catalog[key] }
-        return try resolvers.part(key)
+        return try resolvers.part(key, turn)
     }
 
     static func actionID(tool: String, input: [String: JSONValue]) -> String? {
@@ -252,7 +236,7 @@ public struct AppActionBinding: Sendable {
         return selected.count == 1 ? selected.first?.key : nil
     }
 
-    /// Whether the table is installed yet: before assembly nothing is known.
+    /// Before table installation, absence proves no declaration.
     public static var isRegistered: Bool { registry.withLock { !$0.actions.isEmpty } }
 
     public static var secretActionIDs: [String] {

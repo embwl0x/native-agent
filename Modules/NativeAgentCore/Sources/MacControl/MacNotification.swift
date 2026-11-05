@@ -49,8 +49,7 @@ extension SwiftNativeMacControl {
             "title": .string(title),
             "message": .string(message),
             "sound": sound.map { .string($0) } ?? .null,
-            // `UNUserNotificationCenter.add` acknowledges only that the request was accepted. It cannot prove a banner appeared, sound played, or a person received it; keep the terminal operation receipt explicitly unverified until a
-            // distinct observer supplies that evidence.
+            // Notification submission proves acceptance only; keep delivery unverified until a distinct observer supplies evidence.
             "receipt": .object(receiptFields),
         ]
         return MacControlResult(

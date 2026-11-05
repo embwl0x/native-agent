@@ -11,18 +11,14 @@ import Agents
 import NativeAgentCore
 import DeviceSync
 import TrustCenter
-// Blueprint: | `EngineApprovals.swift` | `ApprovalsFacade`: one checked records/loading/error publication for health, sidebar, views, actions and phone overview; failed reads retain checked rows and mark them unavailable; shared inline settlement, single-flight resolution and outcome/preflight checks; shared summary/failure wording; Approval reads return their own result; LatestRead orders records/failure publication and committed decisions use write(). |
+// Blueprint: | `EngineApprovals.swift` | `ApprovalsFacade`; Checked shared inbox and gated single-flight decisions |
 
-/// `NativeAgentEngine.approvals`: the ApprovalInbox for one data root, in
-/// core types. Every read publishes `records` and its load state for all surfaces.
-/// Decisions run
-/// through the approval executors (`ApprovalExecution`).
+/// Share checked approval rows and load state across surfaces; keep decisions in `ApprovalExecution`.
 @MainActor
 @Observable
 public final class ApprovalsFacade {
     public nonisolated let dataRoot: URL
 
-    /// Every approval, pending and decided, newest first, as of the last read.
     public private(set) var records: [ApprovalRecord] = [] {
         didSet { recordsDidChange?() }
     }
@@ -48,7 +44,10 @@ public final class ApprovalsFacade {
                 : "Approvals could not be loaded. Choose Refresh to try again."
         }
         guard hasLoadedSnapshot else { return "Checking which actions need your permission." }
-        return "Review requests to use tools, change memories, control your Mac or browser, make changes in connected apps, work on Desk tasks, or improve the agent."
+        return """
+            Review requests to use tools, change memories, control your Mac or browser, make changes in connected apps, work on Desk tasks, or \
+            improve the agent.
+            """
     }
 
     @ObservationIgnored public var recordsDidChange: (@MainActor () -> Void)?
@@ -63,7 +62,7 @@ public final class ApprovalsFacade {
         SwiftNativeApprovalInbox(root: dataRoot)
     }
 
-    /// Returns this read; only a forward publication replaces the shared rows.
+    /// Return this read; only forward publication replaces shared rows.
     public func list() async throws -> [ApprovalRecord] {
         readsInFlight += 1
         defer { readsInFlight -= 1 }
@@ -85,7 +84,7 @@ public final class ApprovalsFacade {
 
     public func refresh() async { _ = try? await list() }
 
-    /// The one file the reader, resolver and app-lifetime observer share.
+    /// Reader, resolver and lifetime observer must share the same file.
     public nonisolated func requestsPath() async -> URL {
         await inbox.approvalsPath
     }
@@ -116,11 +115,11 @@ public final class ApprovalsFacade {
     }
 
     public func settleInlineCard(
-        id: String, decision: String, coordinator: ApprovalExecution,
+        id: String, decision: String, coordinator: ApprovalExecution, turn: Turn,
         refreshHealth: @MainActor () async -> Void
     ) async throws {
         do {
-            _ = try await resolveApproval(id: id, decision: decision, coordinator: coordinator)
+            _ = try await resolveApproval(id: id, decision: decision, coordinator: coordinator, turn: turn)
             await refreshHealth()
         } catch ApprovalInboxError.alreadyResolved {
             _ = try await list()
@@ -132,7 +131,7 @@ public final class ApprovalsFacade {
     }
 
     public func resolveApproval(
-        id: String, decision: String, coordinator: ApprovalExecution
+        id: String, decision: String, coordinator: ApprovalExecution, turn: Turn
     ) async throws -> ApprovalRecord {
         let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty else {
@@ -152,7 +151,7 @@ public final class ApprovalsFacade {
             return try await task.value
         }
         let task = Task<ApprovalRecord, Error> { @MainActor in
-            let resolved = try await coordinator.resolveApproval(id: trimmedID, decision: decision)
+            let resolved = try await coordinator.resolveApproval(id: trimmedID, decision: decision, turn: turn)
             latest.write {
                 if let index = records.firstIndex(where: { $0.id == resolved.id }) {
                     records[index] = resolved
@@ -186,7 +185,6 @@ public enum ApprovalLoadFailurePresentation {
 }
 
 extension ApprovalRequest {
-    /// The phone's approvals.json row, in the shape the Mac has always sent.
     public init(record: ApprovalRecord) {
         let outcome = record.executedAction.map { _ in record.executionResultClass }
         let summary = record.executedAction.flatMap { _ in record.decisionExperience.face?.words }
@@ -203,8 +201,7 @@ extension ApprovalRequest {
             payloadPreview: record.payloadPreview,
             localOnly: record.localOnly,
             remoteResolvable: record.remoteResolvable,
-            // Where the phone draws its inline card: the conversation the
-            // approval's chat card went to, else the one that asked.
+            // Route the phone card to the conversation that received the approval’s chat card, or its originating conversation.
             chatOriginSessionId: record.chatCardSessionId ?? record.chatOriginSessionId,
             lastRequestedAt: record.lastRequestedAt,
             executionOutcome: outcome?.rawValue,
@@ -218,90 +215,43 @@ extension NativeAgentEngine {
     @MainActor
     public static func configureInlineInteractionsAtLaunch(startTurn: @escaping InlineInteractionResolver.TurnStarter) {
         InlineInteractionResolver.startTurn = startTurn
-        // The blocked call, replayed with the arguments the model originally
-        // wrote, through the ORDINARY gate: the same membrane a first call
-        // passes, with no autonomy bypass and no approval inherited from the
-        // card. Resolving "connect GitHub" is not permission to act as GitHub.
-        //
-        // It is the SAME dispatcher and the SAME approval inbox Mac chat uses.
-        // A bare SwiftToolDispatcher cannot reach the app-owned tools at all,
-        // and a nil filer makes every CONFIRM-tier call fail closed with no
-        // request ever landing in front of the person — a card resolved into
-        // silence.
-        InlineInteractionResolver.replayBlockedTool = { toolName, argumentsJSON, sessionID, origin in
+        // Replay original arguments through the shared dispatcher and ordinary gate; card resolution grants no sibling authority. Keep the filer so
+        // confirmations reach the person.
+        InlineInteractionResolver.replayBlockedTool = { toolName, argumentsJSON, sessionID, turn in
             guard case .object(let input)? = try? JSONValue.parse(Data(argumentsJSON.utf8))
             else { return .failed("the blocked call's arguments are no longer readable") }
             let dataRoot = PersistenceCore.defaultDataRoot()
-            // The ORIGIN surface answers for this call, not the Mac.
-            //
-            // The replay used to build the Mac profile and dispatch under
-            // surface "chat" whatever the card came from, so a card raised from
-            // the phone with remote_from_ios_allowed false — or from a Telegram
-            // chat that is not on the allowlist — replayed as a trusted local
-            // call. The envelope the raising turn wrote on the card's own row is
-            // bound here instead, including its surface.
-            guard let origin else {
+            // Bind the card’s recorded origin and surface so remote restrictions cannot become local authority during replay.
+            guard let origin = turn.envelope else {
                 return .failed("The blocked call has no recorded origin. Review this card on its originating surface before continuing.")
             }
             let originSurface = origin.surface
             let approvalFiler = NativeAgentChatApprovalFiler(dataRoot: dataRoot)
             let gated = makeGatedToolDispatchClient(
                 tools: NativeAgentEngine.live.toolDispatchClient(
-                    // The gate below resolves autonomy once, as it does for an
-                    // ordinary Mac turn; the inner dispatcher must not re-run
-                    // that decision from a reconstructed origin.
-                    enforceAppAutonomy: false,
-                    swarmApprovalFiler: approvalFiler
+                    // Resolve autonomy once at the outer gate; reconstructed origin must not trigger another decision.
+                    enforceAppAutonomy: false
                 ),
                 fileAccess: "auto",
                 approvalFiler: approvalFiler,
                 dataRoot: dataRoot
             )
-            // Only the replayed tool is rehydrated: a lazy gate must not answer
-            // `not_loaded` for the one call being replayed, and no sibling tool
-            // gets an accidental capability out of it.
+            // Rehydrate only the replayed tool so it is available without admitting siblings.
             do {
-                let result = try await LLMCallContext.$turnActiveTools.withValue([toolName]) {
-                    // The whole origin envelope — verified chat/user ids and
-                    // the reply route included — so the gate resolves trust
-                    // from the same identities the first attempt was judged on.
-                    try await ChatToolSessionContext.$envelope.withValue(origin) {
-                    try await ChatToolSessionContext.$verifiedChatId
-                        .withValue(origin.verifiedChatId) {
-                    try await ChatToolSessionContext.$verifiedUserId
-                        .withValue(origin.verifiedUserId) {
-                    try await ChatToolSessionContext.$commandSignatureVerified
-                        .withValue(origin.commandSignatureVerified) {
-                    try await ChatToolSessionContext.$verifiedSessionId.withValue(sessionID) {
-                        try await ChatToolSessionContext.$replyRoute
-                            .withValue(origin.deliveryRoute) {
-                                try await gated.dispatch(
-                                    tool: toolName, input: input, surface: originSurface
-                                )
-                            }
-                    }
-                    }
-                    }
-                    }
-                    }
-                }
+                // The continuation owns this act, including restored peer steering and approval provenance.
+                var replayTurn = turn
+                replayTurn.verifiedSessionID = sessionID
+                replayTurn.offeredTools = [toolName]
+                let result = try await gated.dispatch(tool: toolName, input: input, surface: originSurface, turn: replayTurn, invocation: .init())
                 return .dispatched(try? result.serialize(pretty: false))
             } catch {
-                // A throw means the call never completed. Reported as such so
-                // the resolver does not record a replay that did not happen.
+                // Report thrown calls as incomplete so the resolver cannot record a replay that never happened.
                 return .failed("\(error)")
             }
         }
 
-        // The pairing half of the card's signature receipt.
-        //
-        // A card raised by a signed iPhone turn has to be able to replay AS a
-        // signed turn, and the persisted envelope must never carry that
-        // verdict itself. So the continuation carries a MAC over its own row
-        // identity, minted here from the live pairing secret and re-checked
-        // here at replay. A rotated or missing secret simply stops verifying,
-        // and the card says "sign in from the phone again" instead of
-        // replaying with authority it can no longer prove.
+        // Persist a MAC over the card identity, never the signed-turn verdict; replay must verify against the live pairing secret, refusing missing or rotated
+        // authority.
         InlineInteractionSignatureWitness.install(
             mint: { canonical in
                 guard let secret = try? PairingSecret.loadOrGenerateSecret()

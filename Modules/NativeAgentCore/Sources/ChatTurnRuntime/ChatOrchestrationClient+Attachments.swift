@@ -3,13 +3,10 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import MacControl
-// Blueprint: | `ChatOrchestrationClient+Attachments.swift` | image/document admission and voice evidence projection; audio remains an attachment, never a provider content block |
+// Blueprint: | `ChatOrchestrationClient+Attachments.swift` | Trust-gated images and bounded document excerpts; audio stays attached |
 
 extension SwiftNativeChatOrchestrationClient {
-    /// Convert delivered `MultimodalAttachment`s into native `.image` content
-    /// blocks. Skips non-image types (audio/file/etc.) and entries with empty
-    /// base64. Returns `[]` when nothing actionable — callers stay on the
-    /// pre-multimodal `.user(text)` shape (byte-identical wire body).
+    /// Only nonempty image attachments become image blocks; text-only turns retain their original wire shape.
     nonisolated static func imageBlocksFromAttachments(
         _ attachments: [MultimodalAttachment]
     ) -> [LLMContentBlock] {
@@ -28,22 +25,20 @@ extension SwiftNativeChatOrchestrationClient {
         return out
     }
 
-    // MARK: - Trust ▸ Multimodal, at the point of use
-    //
-    // Read vision and PDF policy fresh each turn so Trust changes apply on the next turn.
+    // MARK: - Reading preferences, at the point of use
+    // Read vision and PDF preferences each turn so Settings changes apply on the next turn.
 
     /// Missing policy or keys use TrustCenter defaults; existing unreadable or malformed policy fails closed.
-    /// SavedTrustPolicyAuthority validates the whole policy and distinguishes dangling symlinks from absent files.
+    /// TrustCenter validates the whole policy and distinguishes dangling symlinks from absent files.
     nonisolated static func multimodalPolicyAllows(
         _ key: String,
         default fallback: Bool,
         dataRoot: URL
     ) throws -> Bool {
-        try SavedTrustPolicyAuthority.flag(
+        try SwiftNativeTrustCenter(dataRoot: dataRoot).savedPolicyFlag(
             block: "multimodalPolicy",
             key: key,
-            default: fallback,
-            dataRoot: dataRoot
+            default: fallback
         )
     }
 
@@ -53,9 +48,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// Shared character budget spent in attachment order; exhausted documents are skipped with a count and reason.
     static let turnDocumentCharacterBudget = 120_000
 
-    /// What the model gets for this turn's attachments: the image blocks it is
-    /// allowed to see, and the user message with an honest note appended for
-    /// anything that was skipped or read out of a document.
+    /// Report every skipped or extracted attachment so the model knows what it actually received.
     struct TurnAttachmentInput: Sendable {
         let imageBlocks: [LLMContentBlock]
         let userMessage: String
@@ -88,10 +81,7 @@ extension SwiftNativeChatOrchestrationClient {
             notes.append(try utterance.evidence(audioReference: reference))
         }
 
-        // "Allow vision API calls". Off → the images never become blocks, and
-        // the model is told so in the same shape LLMClient+Real uses when a
-        // non-vision adapter drops them: honest, and explicitly not licence to
-        // describe what it did not see.
+        // Disabled vision withholds image blocks and explicitly reports that nothing was seen.
         let visionAllowed = try multimodalPolicyAllows("vision_api_calls", default: true, dataRoot: dataRoot)
         let imageBlocks = visionAllowed ? imageBlocksFromAttachments(attachments) : []
         if !visionAllowed {
@@ -99,7 +89,7 @@ extension SwiftNativeChatOrchestrationClient {
             if skipped > 0 {
                 notes.append(
                     "[NOTE TO ASSISTANT: the user attached \(skipped) image(s), but "
-                    + "\"Allow vision API calls\" is off in Trust Center ▸ Permissions, so the "
+                    + "Image understanding is off in Settings (settings.image_understanding), so the "
                     + "image(s) were skipped and NOT sent. Tell the user honestly that you could "
                     + "not view them and that the switch is what stopped it — do NOT guess or "
                     + "pretend to describe them.]")
@@ -122,10 +112,8 @@ extension SwiftNativeChatOrchestrationClient {
         return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: composed, queryUserMessage: composedQuery)
     }
 
-    /// Read documents in attachment order with the read organ's extractors; only PDFs require the ingestion switch.
-    /// Each document respects its cap and the remaining turn budget; skipped, cut and unreadable inputs are named to the model.
-    /// The query selects overlong passages only; fitting documents stay whole.
-    /// An unusable query or passage budget stays explicitly unavailable.
+    /// Read documents in attachment order under per-document and turn caps; only PDFs require the ingestion switch.
+    /// Name skipped, cut and unreadable inputs. Queries select only overlong passages; unusable selection stays unavailable.
     nonisolated static func documentAttachmentNotes(
         _ attachments: [MultimodalAttachment],
         dataRoot: URL,
@@ -138,7 +126,7 @@ extension SwiftNativeChatOrchestrationClient {
         if pdfCount > 0, !pdfAllowed {
             notes.append(
                 "[NOTE TO ASSISTANT: \(pdfCount) PDF attachment(s) were skipped — "
-                + "\"Allow PDF file ingestion\" is off in Trust Center ▸ Permissions. Say so "
+                + "Read PDFs is off in Settings (settings.pdf_reading). Say so "
                 + "plainly; do NOT guess at what the document(s) say.]")
         }
 
@@ -187,10 +175,16 @@ extension SwiftNativeChatOrchestrationClient {
                         text = excerpt
                         selected = true
                     case .noMatch:
-                        notes.append("[The attached \(label) \"\(name)\" exceeds this turn's allowance. No passages matched the request in the extracted text. No document text was supplied. Ask for a specific section or a location to read; do not infer its contents.]")
+                        notes.append("""
+                            [The attached \(label) \"\(name)\" exceeds this turn's allowance. No passages matched the request in the extracted text. \
+                            No document text was supplied. Ask for a specific section or a location to read; do not infer its contents.]
+                            """)
                         continue
                     case .unavailable(let reason):
-                        notes.append("[Passage selection for the attached \(label) \"\(name)\" is unavailable: \(reason) No document text was supplied. Ask for a specific section or a location to read; do not infer its contents.]")
+                        notes.append("""
+                            [Passage selection for the attached \(label) \"\(name)\" is unavailable: \(reason) No document text was supplied. Ask for \
+                            a specific section or a location to read; do not infer its contents.]
+                            """)
                         continue
                     }
                     cut = true
@@ -237,10 +231,7 @@ extension SwiftNativeChatOrchestrationClient {
         return String(data: data, encoding: .utf16) != nil
     }
 
-    /// Text by EXTENSION first (the same allow-list the `read` organ uses — a
-    /// .png decodes to garbage that looks like a short document), then by mime
-    /// for the surfaces that deliver a file without a usable name. Images and
-    /// PDFs are somebody else's job.
+    /// Prefer the read organ's extension allowlist so binary images cannot masquerade as text; use MIME when no usable name exists.
     nonisolated static func isPlainTextAttachment(_ attachment: MultimodalAttachment) -> Bool {
         let type = attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard type != "image" else { return false }

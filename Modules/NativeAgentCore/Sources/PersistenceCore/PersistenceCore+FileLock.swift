@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import Darwin
 
-// Blueprint: | `PersistenceCore+FileLock.swift` | `FileLockScope`, `CredentialFileLock` and persistence lock support: current-task lock ownership, bounded acquisition and sidecar identity checks |
+// Blueprint: | `PersistenceCore+FileLock.swift` | `FileLockScope`, `CredentialFileLock`; Bounded inode-checked locks. |
 
 /// Task-local held paths let nested acquisitions reuse the same nonrecursive flock.
 public enum FileLockScope {
@@ -64,7 +64,8 @@ public enum CredentialFileLock {
             attempts += 1
             let fd = Darwin.open(lockPath, O_CREAT | O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0o600)
             if fd < 0 {
-                throw NSError(domain: "FileLock", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
+                throw NSError(domain: "FileLock", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
             }
             while true {
                 let e: Int32
@@ -74,7 +75,8 @@ public enum CredentialFileLock {
                 // Interruptions and contention share one monotonic deadline.
                 if ProcessInfo.processInfo.systemUptime >= deadline {
                     Darwin.close(fd)
-                    throw NSError(domain: "FileLock", code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "lock at \(lockPath) is still held after \(Int(acquireTimeout))s"])
+                    throw NSError(domain: "FileLock", code: Int(ETIMEDOUT),
+                        userInfo: [NSLocalizedDescriptionKey: "lock at \(lockPath) is still held after \(Int(acquireTimeout))s"])
                 }
                 usleep(5_000)
             }
@@ -82,7 +84,8 @@ public enum CredentialFileLock {
                 _ = flock(fd, LOCK_UN)
                 Darwin.close(fd)
                 if attempts >= 8 {
-                    throw NSError(domain: "FileLock", code: Int(EAGAIN), userInfo: [NSLocalizedDescriptionKey: "lock file at \(lockPath) replaced repeatedly; giving up after \(attempts) attempts"])
+                    throw NSError(domain: "FileLock", code: Int(EAGAIN),
+                        userInfo: [NSLocalizedDescriptionKey: "lock file at \(lockPath) replaced repeatedly; giving up after \(attempts) attempts"])
                 }
                 usleep(5_000)
                 continue
@@ -96,7 +99,8 @@ public enum CredentialFileLock {
                 throw NSError(domain: "FileLock", code: Int(EINVAL), userInfo: [NSLocalizedDescriptionKey: "lock at \(lockPath) is not a regular file"])
             }
             guard fchmod(fd, 0o600) == 0 else {
-                throw NSError(domain: "FileLock", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "secure lock permissions failed: \(String(cString: strerror(errno)))"])
+                throw NSError(domain: "FileLock", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "secure lock permissions failed: \(String(cString: strerror(errno)))"])
             }
             return try FileLockScope.$heldLockPaths.withValue(
                 FileLockScope.heldLockPaths.union([lockPath])
@@ -125,7 +129,6 @@ public enum CredentialFileLock {
     }
 }
 
-/// How long an async file-lock acquire waits before it gives up and says so.
 public enum PersistenceFileLockWait {
     /// Bound acquisition so a stalled holder cannot hang the caller.
     public static let defaultSeconds: TimeInterval = 60
@@ -159,7 +162,8 @@ public extension SwiftNativePersistenceCore {
                 fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
             }
             if fd < 0 {
-                throw NSError(domain: "FileLock", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
+                throw NSError(domain: "FileLock", code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
             }
             var acquired = false
             var keep = false
@@ -186,7 +190,8 @@ public extension SwiftNativePersistenceCore {
             if !sidecarIsCurrent(fd, at: lockPath) {
                 // Bound retries when a sidecar is repeatedly replaced.
                 if attempts >= 8 {
-                    throw NSError(domain: "FileLock", code: Int(EAGAIN), userInfo: [NSLocalizedDescriptionKey: "lock file at \(lockPath) replaced repeatedly; giving up after \(attempts) attempts"])
+                    throw NSError(domain: "FileLock", code: Int(EAGAIN),
+                        userInfo: [NSLocalizedDescriptionKey: "lock file at \(lockPath) replaced repeatedly; giving up after \(attempts) attempts"])
                 }
                 try await Task.sleep(nanoseconds: 5_000_000)
                 continue

@@ -2,17 +2,14 @@ import Foundation
 import CoreGraphics
 // Blueprint: | `VisionPerceptionTypes.swift` | `VisionConfidence`, `VisionStateGuess`, `VisionEvidenceSource`, `VisionCandidate` |
 
-// Pixel perception compiles CGImage into VisionPercept; fourVerbSupplement
-// translates it into additive MacFourVerbsSupplement evidence and physical targets.
-// Heuristics use colour, text geometry and saliency, never app identity or known strings.
-// Every rendered row retains vision provenance and explicit abstention.
-// Pixel perception is pure: CGImage in, percept out, with no capture or input injection.
+// Pixel perception is capture- and input-free; its adapter adds physical evidence without inventing app-specific semantics. Every row retains vision provenance
+// and explicit abstention.
 
 // MARK: - Per-attribute confidence (the trust contract)
 
 /// Confidence is per attribute; only target confidence gates acting.
 public struct VisionConfidence: Sendable, Equatable {
-    /// How precise are these bounds — did the region grow to a real edge?
+    /// Bounds confidence reflects observed edges rather than semantic role.
     public let bounds: Double
     /// Target certainty incorporates role evidence and is capped by abstention.
     public let target: Double
@@ -30,9 +27,7 @@ public struct VisionConfidence: Sendable, Equatable {
 
 // MARK: - State guesses
 
-/// One state guess, with its own confidence. NEVER a bare `Bool`: a boolean in
-/// a percept reads as a fact, and "we think this button is enabled" is not a
-/// fact — it is the single most dangerous guess this module makes.
+/// State guesses need confidence; bare booleans would turn uncertain enabled state into a fact.
 public struct VisionStateFlag: Sendable, Equatable {
     public let value: Bool
     public let confidence: Double
@@ -42,15 +37,11 @@ public struct VisionStateFlag: Sendable, Equatable {
     }
 }
 
-/// Each state is optional — absent means "we did not
-/// form a view", which is a different and more honest answer than `false`.
+/// Absent state means unobserved, never false.
 public struct VisionStateGuess: Sendable, Equatable {
     public let selected: VisionStateFlag?
     public let checked: VisionStateFlag?
-    /// The load-bearing one. A believed-enabled control that is actually
-    /// disabled produces a confident click with no effect — the hopeful-click
-    /// failure the whole rank exists to prevent — so when the pixels suggest a
-    /// greyed control we SAY SO, with a confidence, and let the caller refuse.
+    /// Report disabled-state uncertainty so a caller can refuse hopeful clicks that may have no effect.
     public let disabled: VisionStateFlag?
 
     public init(
@@ -66,8 +57,7 @@ public struct VisionStateGuess: Sendable, Equatable {
 
 // MARK: - Evidence
 
-/// Which layer produced a candidate. Carried per row so a reader can weigh it:
-/// a colour-region button and a saliency blob are not equally trustworthy.
+/// Layer provenance lets callers distinguish bounded colour evidence from vague saliency.
 public enum VisionEvidenceSource: String, Sendable, Equatable, CaseIterable {
     case colorRegion = "color_region"
     case textBand = "text_band"
@@ -76,9 +66,7 @@ public enum VisionEvidenceSource: String, Sendable, Equatable, CaseIterable {
 
 // MARK: - Candidates (the element layer's output, pre-fusion)
 
-/// A bounded visual colour fact carried from the sampled region. The compact
-/// name is deliberately perceptual rather than semantic: "yellow" is useful
-/// evidence; "quest marker" would be an invention.
+/// Colour facts remain perceptual; a semantic label such as quest marker would be invented.
 public struct VisionColorSample: Sendable, Equatable {
     public let red: Double
     public let green: Double
@@ -125,20 +113,16 @@ public struct VisionColorSample: Sendable, Equatable {
     }
 }
 
-/// A candidate interactive region, before role/label/redaction/handles.
 public struct VisionCandidate: Sendable, Equatable {
     public let rect: VisionRect
     public let sources: [VisionEvidenceSource]
-    /// How well the region's edges are pinned by its evidence, 0…1.
     public let boundsConfidence: Double
-    /// Mean linear luminance of the region's fill, 0…1 — the input to the
-    /// disabled/greyed heuristic. nil when the layer could not sample it.
+    /// Missing luminance samples remain nil rather than inventing disabled-state evidence.
     public let fillLuminance: Double?
-    /// Saliency rank contribution, 0…1; 0 when saliency did not see it.
+    /// Keep saliency contribution distinct from bounds and role confidence.
     public let salience: Double
     public let fillColor: VisionColorSample?
-    /// Geometry-only silhouette evidence from a connected colour component.
-    /// Compact values are intentionally limited to `round` and `square`.
+    /// Limit silhouettes to conservative connected-component geometry rather than invented object shapes.
     public let visualShape: String?
 
     public init(

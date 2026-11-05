@@ -1,77 +1,54 @@
-// The Trust Center / Setup memory switches, read at the point of use.
-//
-// Every memory gate reads memoryPolicy through this reader.
-//
-// FRESH ON EVERY CALL, deliberately. There is no launch-time snapshot and no
-// cache: a flip in Setup or Trust Center is written atomically to policy.json
-// and the next turn / next run reads the new value. The file is small and the
-// call sites are per-turn or rarer, so the read costs nothing that matters.
-//
-// Defaults match SwiftNativeTrustCenter's DEFAULT_TRUST_POLICY["memoryPolicy"]
-// (TrustCenter+Defaults.swift) so an absent key behaves exactly as the Settings
-// card shows it — the gate and the switch can never disagree about "unset".
-//
-// It lives in MemoryV2 rather than TrustCenter because MemoryV2 is the module
-// every consumer already depends on (ChatOrchestration and the app target both
-// import it).
+// Reread saved authority at each use so settings take effect on the next turn. Missing keys share TrustCenter defaults; saved damage stays unavailable. Keep
+// the reader in MemoryV2 so every consuming module shares it.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `MemoryV2+PolicyGate.swift` | `MemoryPolicyGate` enum; checked throwing graph/recall/promotion flags and explicit knowledgeGraphFailure distinguish unavailable Trust from operator-disabled memory; unavailable graph authority never authorizes projection retirement |
+// Blueprint: | `MemoryV2+PolicyGate.swift` | `MemoryPolicyGate`: checked saved memory authority |
 
 public enum MemoryPolicyGate {
 
-    /// One boolean out of `memoryPolicy` in the saved trust policy. Missing
-    /// file, missing block or missing key → `fallback`; unavailable, malformed
-    /// or otherwise damaged saved authority throws its owner failure.
-    ///
-    /// Shared `SavedTrustPolicyAuthority` validation fails closed on damage anywhere in the saved policy.
-    public static func isEnabled(
-        _ key: String,
-        default fallback: Bool,
-        dataRoot: URL? = nil
-    ) throws -> Bool {
-        try SavedTrustPolicyAuthority.flag(
-            block: "memoryPolicy",
-            key: key,
-            default: fallback,
-            dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
-        )
+    /// Synchronous memory readers use TrustCenter's checked snapshot; the typed policy owns missing-field defaults.
+    private static func policy(dataRoot: URL?) throws -> TrustMemoryPolicy {
+        let root = dataRoot ?? PersistenceCore.defaultDataRoot()
+        let snapshot = try SwiftNativeTrustCenter(dataRoot: root).loadAuthorizationSnapshotChecked()
+        return try TrustPolicy(policyObject: snapshot.policy).memoryPolicy ?? TrustMemoryPolicy()
     }
 
-    /// Settings ▸ "Knowledge graph".
     public static func knowledgeGraphEnabled(dataRoot: URL? = nil) throws -> Bool {
-        try isEnabled("knowledge_graph_enabled", default: true, dataRoot: dataRoot)
+        try policy(dataRoot: dataRoot).knowledge_graph_enabled
     }
 
-    /// The checked authority distinguishes a person's switch from damaged Trust.
+    /// A disabled mind setting and unreadable storage remain different outcomes.
     public static func knowledgeGraphFailure(dataRoot: URL) -> ToolFailureError? {
-        let authority = SavedTrustPolicyAuthority.read(dataRoot: dataRoot)
-        // Match TrustCenter+Defaults for absent policy, block or key.
         do {
-            if try authority.flag(block: "memoryPolicy", key: "knowledge_graph_enabled", default: true) { return nil }
+            if try knowledgeGraphEnabled(dataRoot: dataRoot) { return nil }
         } catch let failure as ToolFailureError { return failure }
-        catch { return SavedTrustPolicyAuthority.unavailable(error.localizedDescription) }
+        catch {
+            return ToolFailureError("Memory settings could not be read: \(error.localizedDescription)", effects: .none,
+                owner: "trust/policy.json", code: "trust_policy_unavailable",
+                instruction: "Repair the saved policy, preserving its bytes.", recovery: .repair)
+        }
         return ToolFailureError(knowledgeGraphOffMessage, effects: .none,
-            owner: "Knowledge graph", tap: "Trust ▸ Living Memory ▸ Knowledge graph", personDecides: true,
+            owner: "Knowledge graph",
+            nextCall: ToolFailureError.call("app", ["action": .string("setting.set"),
+                "args": .object(["setting": .string("memories.knowledge_graph"), "value": .bool(true)])]),
+            tap: "Settings ▸ Memory ▸ Knowledge graph",
             code: "knowledge_graph_disabled", status: .refused,
-            instruction: "Ask the person to enable Knowledge graph.")
+            instruction: "Enable your Knowledge graph in Settings or through setting.set.")
     }
 
-    /// Settings ▸ "Remember across conversations".
     public static func crossSessionRecallEnabled(dataRoot: URL? = nil) throws -> Bool {
-        try isEnabled("cross_session_recall", default: true, dataRoot: dataRoot)
+        try policy(dataRoot: dataRoot).cross_session_recall
     }
 
     /// Trusted facts are accepted immediately; untrusted facts wait for review.
     public static func adaptivePromotionEnabled(dataRoot: URL? = nil) throws -> Bool {
-        try isEnabled("adaptive_promotion", default: true, dataRoot: dataRoot)
+        try policy(dataRoot: dataRoot).adaptive_promotion
     }
 
-    /// The one sentence every knowledge-graph surface says when the switch is
-    /// off, so the tools, the rebuild and any future reader cannot drift.
+    /// Share the disabled-graph reason across tools, rebuilds and readers.
     public static let knowledgeGraphOffMessage =
-        "The knowledge graph is off. Enable Trust ▸ Living Memory ▸ Knowledge graph to build or read it."
+        "The knowledge graph is off. Enable Settings ▸ Memory ▸ Knowledge graph to build or read it."
 }

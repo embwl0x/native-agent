@@ -1,3 +1,4 @@
+import AgentConversations
 import Foundation
 import ApprovalInbox
 import Desk
@@ -6,34 +7,18 @@ import NativeAgentCore
 import NotificationInbox
 import PersistenceCore
 import Privacy
-import WorkshopExecution
-// Blueprint: | `WorkOverviewRead.swift` | `WorkOverviewRead` enum; `project`, execution/Desk-item `row`, `text`, `requiresApproval`; overview and phone task rows share the execution approval predicate; ID-based details use the same status projection; complete owner-attention counts by reference kind before mobile list bounds |
+// Blueprint: | `WorkOverviewRead.swift` | `WorkOverviewRead`, `project`, `row`, `text`; owner attention and the agent's jobs at work |
 
-/// One surface-neutral projection over the canonical owners. Only explicit
-/// approval/execution links collapse rows; a shared Desk parent is not proof
-/// that two questions are the same question.
+/// Collapse rows only with explicit approval links; a shared Desk parent cannot prove two asks are the same. A job is a row of the work it does.
 public enum WorkOverviewRead {
-    public static func requiresApproval(status: String) -> Bool { status == "blocked_on_approval" }
-    /// Needs-you rows open their canonical record, so their copies stay short
-    /// and few: the overview rides in a phone snapshot group.
+    /// Bound overview copies because phone snapshot groups carry them; open details through canonical records.
     static let needsYouLimit = 12
 
-    /// Needs you is `OwnerAttentionPolicy`, applied once here.
+    /// Apply OwnerAttentionPolicy once here for every overview.
     static func project(board: DeskBoardRead, approvals: [ApprovalRecord], inbox: [InboxItemRecord],
                         experiences: [Experience] = [], unavailable: [String], now: Date) -> WorkOverview {
         let pending = approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }
         let pendingByID = Dictionary(grouping: pending, by: \.id)
-        var executionSteps: [String: Set<String>] = [:]
-        for approval in pending {
-            guard ExecutionEventVocabulary.matches(approval.action, WorkshopStepApprovalAction.canonical),
-                  case .object(let payload) = approval.payload,
-                  case .string(let stepID)? = payload["step_id"], !stepID.isEmpty,
-                  let executionID = WorkshopStepApprovalPayload.executionId({ key in
-                      if case .string(let value)? = payload[key] { return value }
-                      return nil
-                  }) else { continue }
-            executionSteps[executionID, default: []].insert(stepID)
-        }
         typealias Candidate = (reference: WorkOverviewReference, updatedAt: String, render: () -> WorkOverviewRow)
         var needs: [Candidate] = pending.map { approval in
             (.init(kind: .approval, id: approval.id), approval.lastRequestedAt ?? approval.createdAt, {
@@ -43,19 +28,13 @@ public enum WorkOverviewRead {
                     approval.lastRequestedAt ?? approval.createdAt, detail: 1_000)
             })
         }
-        let linkedExecutionIDs = Set(board.executions.items.filter {
-            requiresApproval(status: $0.status) && executionSteps[$0.id]?.contains($0.currentStepId) == true
-        }.map(\.id))
-        for execution in board.executions.items where requiresApproval(status: execution.status) && !linkedExecutionIDs.contains(execution.id) {
-            needs.append((.init(kind: .execution, id: execution.id), execution.updatedAt, {
-                row(.execution, execution.id, execution.title, execution.objective, "Decision needed", execution.updatedAt, detail: 1_000)
-            }))
+        for job in board.agentJobs.items where job.state == .needsYou {
+            needs.append((.init(kind: .execution, id: job.id), NativeTimestampFormat.fractionalZulu(job.updatedAt), { Self.row(for: job, now: now) }))
         }
         var needsDeskIDs: Set<String> = []
         for item in board.items where item.requiresOwnerInput {
             needsDeskIDs.insert(item.handle)
-            // A reference can also be background context for another ask.
-            // Collapse a wrapper only when its exact link AND request agree.
+            // Context links do not prove ask identity; collapse only when exact link and request agree.
             let request = (item.blockedReason ?? item.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let approvalIDs = Set(item.refs.compactMap { ref -> String? in
                 if case .approval(let id, _) = ref.kind { return id }; return nil
@@ -67,8 +46,7 @@ public enum WorkOverviewRead {
             needs.append((.init(kind: .desk, id: item.handle), item.updatedAt, { Self.row(for: item, now: now) }))
         }
         for item in inbox where item.requiresOwnerInput {
-            // The approval owns both its wait and its settlement. Its old
-            // inbox face must not become a new ask once it leaves pending.
+            // Approval owns settlement; a nonpending approval’s inbox face must not become a new ask.
             if item.id == item.related_approval_id { continue }
             // Contextual links do not establish that a note is the same ask.
             needs.append((.init(kind: .inbox, id: item.id), item.created_at, {
@@ -77,18 +55,16 @@ public enum WorkOverviewRead {
         }
 
         var current: [Candidate] = [], recent: [Candidate] = []
-        let terminalDeskIDs = Set(board.items.filter { $0.status.isTerminal }.map(\.handle))
-        let executionDeskIDs = Set(board.executions.items.filter {
-            !$0.isTerminal
-                || ($0.result != .null && $0.deskHandle.map(terminalDeskIDs.contains) == true)
-        }.compactMap(\.deskHandle))
-        for execution in board.executions.items {
-            if requiresApproval(status: execution.status) { continue }
-            let result: Candidate = (.init(kind: .execution, id: execution.id), execution.updatedAt, { Self.row(for: execution, now: now) })
-            if execution.isTerminal { recent.append(result) } else { current.append(result) }
+        // A Desk item a working job carries reads as that job.
+        let carriedDeskIDs = Set(board.agentJobs.items.filter { !$0.state.isTerminal }.compactMap(\.desk))
+        for job in board.agentJobs.items where job.state != .needsYou {
+            let result: Candidate = (.init(kind: .execution, id: job.id), NativeTimestampFormat.fractionalZulu(job.updatedAt), {
+                Self.row(for: job, now: now)
+            })
+            if job.state.isTerminal { recent.append(result) } else { current.append(result) }
         }
         for item in board.items {
-            guard !executionDeskIDs.contains(item.handle), !needsDeskIDs.contains(item.handle) else { continue }
+            guard !carriedDeskIDs.contains(item.handle), !needsDeskIDs.contains(item.handle) else { continue }
             let result: Candidate = (.init(kind: .desk, id: item.handle), item.closedAt ?? item.updatedAt, { Self.row(for: item, now: now) })
             if item.status.isTerminal { recent.append(result) } else { current.append(result) }
         }
@@ -115,25 +91,17 @@ public enum WorkOverviewRead {
               updatedAt: updated, location: location, movementAt: movement)
     }
 
-    /// The overview and ID-based details describe the same execution revision.
-    public static func row(for execution: WorkshopExecutionRecord, now: Date) -> WorkOverviewRow {
-        let terminal = execution.isTerminal
-        let text = Self.text(for: execution)
-        var state = execution.status == "running" ? "running"
-            : DeskActivityState.execution(.init(deskHandle: execution.deskHandle,
-                status: execution.status, updatedAt: execution.updatedAt,
-                lastMovementAt: execution.lastMovementAt), now: now).label
-        if execution.status == "blocked_on_approval" { state = "Decision needed" }
-        else if ["corrupt", "unavailable"].contains(execution.status) {
-            state = execution.status.capitalized
-        } else if terminal {
-            state = execution.status.capitalized
-            state += execution.verification.map { " · verification: \($0.status.rawValue)" }
-                ?? " · no verification record"
+    /// Overview and id-based detail read the same job record.
+    public static func row(for job: AgentJob, now: Date) -> WorkOverviewRow {
+        let updated = NativeTimestampFormat.fractionalZulu(job.updatedAt)
+        let state = switch job.state {
+        case .working: "running"
+        case .needsYou: "Decision needed"
+        default: job.state.rawValue.capitalized + (job.check.map { " · check: \($0.verdict.rawValue)" } ?? " · no check set")
         }
-        return row(.execution, execution.id, execution.title, text, state, execution.updatedAt,
-            location: execution.receiptsDir.isEmpty ? nil : "Receipts: \(execution.receiptsDir)",
-            movement: execution.lastMovementAt)
+        let first = job.brief.split(whereSeparator: \.isNewline).first.map(String.init) ?? job.brief
+        return row(.execution, job.id, (job.isOwn ? "Your line: " : job.name + ": ") + first, text(for: job), state, updated,
+            location: job.desk.map { "Desk: " + $0 }, movement: job.state == .working ? updated : nil)
     }
 
     public static func row(for item: DeskItem, now: Date) -> WorkOverviewRow {
@@ -142,42 +110,18 @@ public enum WorkOverviewRead {
                        "Needs you", item.updatedAt, location: item.project, detail: 1_000)
         }
         let state = DeskActivityState.item(status: item.status.rawValue, kind: item.kind.rawValue,
-            deferred: item.deferUntil != nil, updatedAt: item.updatedAt, evidence: nil, now: now)
+            deferred: DeskSequencing.isDeferred(item, now: now), updatedAt: item.updatedAt, evidence: nil, now: now)
         return row(.desk, item.handle, item.title,
             item.summary ?? item.notes.last?.text ?? "No summary was recorded.",
             state.label, item.closedAt ?? item.updatedAt, location: item.project)
     }
 
-    /// Progress and the next step while an execution runs, its full result and
-    /// verification once it ends, or a bounded storage error when unreadable.
-    public static func text(for execution: WorkshopExecutionRecord) -> String {
-        if ["corrupt", "unavailable"].contains(execution.status),
-           case .object(let result) = execution.result,
-           case .string(let error)? = result["error"] {
-            return MobileDeskProjectionBounds.clipped(error, to: 4_000)
-        }
-        guard execution.isTerminal else {
-            var text = execution.objective
-            if !execution.plan.isEmpty {
-                let completed = min(execution.stepsCompleted.count, execution.plan.count)
-                text = "\(completed) of \(execution.plan.count) steps done.\n\n" + text
-                if completed < execution.plan.count {
-                    text += "\n\nNext: \(execution.plan[completed].description)"
-                }
-            }
-            return text
-        }
-        var text: String
-        switch execution.result {
-        case .null: text = "No result was recorded."
-        case .string(let value): text = value.isEmpty ? "No result was recorded." : value
-        default:
-            do { text = try execution.result.serialize(pretty: true) }
-            catch { text = "Result unavailable: \(error.localizedDescription)" }
-        }
-        if let verification = execution.verification, !verification.detail.isEmpty {
-            text += "\n\nVerification: \(verification.detail)"
-        }
+    /// The brief and its latest working line until the job ends, then its answer, its check and how it ended.
+    public static func text(for job: AgentJob) -> String {
+        guard job.state.isTerminal else { return job.note.map { job.brief + "\n\nNow: " + $0 } ?? job.brief }
+        var text = job.report?.text ?? "No answer was recorded."
+        if let check = job.check { text += "\n\nCheck: " + check.output }
+        if let detail = job.detail { text += "\n\n" + detail }
         return text
     }
 }

@@ -5,9 +5,8 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SensesContract.swift` | Shared sense records, current JavaScript/native languages and canonical origin vocabulary, wire validators, notebook bounds, native catalog, memory provenance and crossing contracts; provenance age formatting rejects invalid times |
+// Blueprint: | `SensesContract.swift` | Sense wire records, bounds, origins, provenance and crossing contracts |
 
-// Shared sense contract: pages, named things, addresses and change news; behavior owners are in docs/SENSES.md.
 
 // MARK: - Corners
 
@@ -56,20 +55,16 @@ public enum SenseWire {
     public static func validStateKey(_ key: String) -> Bool { !key.isEmpty && key.utf8.count <= stateKeyBytes }
 }
 
-/// One corner of the world a sense serves.
 public enum SenseCorner: Hashable, Codable, Sendable {
-    /// A Mac app, by bundle id.
     case app(bundleID: String)
-    /// A kind of file, by lowercased extension without the dot ("numbers", "docx").
+    /// File extensions are lowercased and omit the dot.
     case fileKind(String)
-    /// A website, by lowercased host ("bank.example.com").
+    /// Site identity uses the lowercased host.
     case site(host: String)
-    /// A device or stream with a stable id.
     case stream(id: String)
-    /// A need with no natural home, by its need id.
     case need(id: String)
 
-    /// Stable registry key, e.g. "app:com.apple.iWork.Numbers", "file:numbers".
+    /// Use prefixed registry keys to distinguish apps from files and other corners.
     public var key: String {
         switch self {
         case .app(let id): "app:\(id)"
@@ -97,17 +92,12 @@ public enum SenseCorner: Hashable, Codable, Sendable {
 
 // MARK: - The native form
 
-/// A named thing on a page she can point at and act on.
 public struct NativeThing: Codable, Sendable, Hashable {
-    /// What it is called, as she would say it ("Total", "Header layer", "Send").
     public var name: String
-    /// A short kind word ("cell", "layer", "button", "row", "track").
     public var kind: String
-    /// Its address: stable, so she can remember it and come back.
+    /// Addresses must remain stable so things can be revisited.
     public var address: String
-    /// One short line of detail (its value, its state), or nil.
     public var detail: String?
-    /// Verbs she may invoke on it in her turn ("set", "press", "open").
     public var verbs: [String]
 
     public init(name: String, kind: String, address: String, detail: String? = nil, verbs: [String] = []) {
@@ -115,19 +105,15 @@ public struct NativeThing: Codable, Sendable, Hashable {
     }
 }
 
-/// A corner in the native form. Compact by design: what matters is shown,
-/// the rest folded, with more one request away.
+/// Fold secondary detail behind another request to keep the native page compact.
 public struct NativePage: Codable, Sendable, Hashable {
     public var corner: SenseCorner
-    /// The page's own address (the root of its things' addresses).
+    /// Thing addresses share the page's root.
     public var address: String
     public var title: String
-    /// Plain text with light structure (headings, lists, tables as text).
     public var text: String
     public var things: [NativeThing]
-    /// Names of sections folded away to keep the page compact.
     public var folded: [String]
-    /// The address that returns more (the next part, a folded section), or nil.
     public var more: String?
 
     public init(corner: SenseCorner, address: String, title: String, text: String,
@@ -136,11 +122,9 @@ public struct NativePage: Codable, Sendable, Hashable {
         self.things = things; self.folded = folded; self.more = more
     }
 
-    /// The size ceiling for a page's text (same order as Chrome page text).
     public static let maximumTextBytes = 40_000
 }
 
-/// News from a live sense: something at an address changed.
 public struct SenseNews: Codable, Sendable, Hashable {
     public var id: UUID = UUID()
     public var senseID: String
@@ -148,10 +132,9 @@ public struct SenseNews: Codable, Sendable, Hashable {
     public var address: String
     public var summary: String
     public var at: Date
-    /// Stable observed file/tab identity; navigation changes the visible
-    /// address without creating another pending stream of news.
+    /// Navigation changes visible addresses without creating a second pending news stream; keep file/tab identity stable.
     public var observationID: String?
-    /// Source-owned change identity, independent of a clipped/redacted summary.
+    /// Source change identity must not depend on clipped or redacted summaries.
     public var changeID: String?
 
     public init(senseID: String, version: Int, address: String, summary: String, at: Date, observationID: String? = nil, changeID: String? = nil) {
@@ -165,12 +148,9 @@ public struct SenseNews: Codable, Sendable, Hashable {
 
 public enum SenseStatus: String, Codable, Sendable { case draft, on, off, unavailable }
 
-/// The language a sense is written in. `native` = a built-in Swift sense
-/// (our existing corners, wrapped unchanged on day one).
 public enum SenseLanguage: String, Codable, Sendable { case javascript, native }
 
-/// On call: runs when she reads or acts, then stops. Live: keeps running to
-/// follow or maintain its corner, supervised and restarted from its state.
+/// On-call helpers end after a read/act; live helpers retain state while supervised across updates.
 public enum SenseMode: String, Codable, Sendable { case onCall = "on_call", live }
 
 public enum SenseOrigin: String, Codable, Sendable {
@@ -185,16 +165,13 @@ public enum SenseOrigin: String, Codable, Sendable {
     }
 }
 
-/// What a sense may reach, enforced by its sandbox profile. Secrets,
-/// credentials, Trust, approvals and persona are never
-/// reachable, whatever is declared.
+/// Sandbox declarations must never expose secrets, credentials, Trust, approvals or persona.
 public struct SenseReach: Codable, Sendable, Hashable {
-    /// Paths it may read (files of its kind are handed over by the source
-    /// provider; this is for extra read-only reach, usually empty).
+    /// Ordinary source files arrive through the provider; declared paths grant only additional read-only reach.
     public var readPaths: [String]
-    /// Hosts it may reach over the network (empty = none).
+    /// Empty hosts grants no network reach.
     public var hosts: [String]
-    /// Bundle identifiers; senses may only read these apps.
+    /// Bundle declarations grant reads only.
     public var apps: [String]?
 
     public init(readPaths: [String] = [], hosts: [String] = [], apps: [String]? = nil) {
@@ -202,7 +179,7 @@ public struct SenseReach: Codable, Sendable, Hashable {
     }
 }
 
-/// One sense: identity, version and lifecycle, projected from its ability file.
+/// Project lifecycle from the ability file instead of keeping another owner.
 public struct SenseRecord: Codable, Sendable, Hashable {
     public var id: String
     public var corner: SenseCorner
@@ -213,26 +190,24 @@ public struct SenseRecord: Codable, Sendable, Hashable {
     public var mode: SenseMode
     public var origin: SenseOrigin
     public var reach: SenseReach
-    /// Source entry name, retained for bundled modules and portable exports (nil for `native`).
+    /// Retain entry names for bundle modules and portable exports; native senses have none.
     public var entry: String?
-    /// Validated program identity; absent for bundled JavaScript and native senses.
+    /// Bundled JavaScript and native senses have no validated program identity.
     public var candidateDigest: String?
     public var disabledBy: String?
-    /// The verbs it offers on its things, for door discovery.
     public var verbs: [String]
-    /// Built-in senses ship with the app; they have no invented birth date.
+    /// Built-in senses have no authored creation date.
     public var createdAt: Date?
     public var enabledAt: Date?
     public var lastUsedAt: Date?
     public var uses: Int
     public var corrections: Int
-    /// Provider spend to grow this version, in USD; nil means not recorded.
+    /// Spend uses USD; nil means unrecorded rather than zero.
     public var growthCostUSD: Double?
-    /// The complaint that caused this version, retained for durable delivery.
+    /// Retain the triggering complaint so growth can be delivered durably.
     public var grownBecause: String?
 
-    /// Shared code may offer verbs only after this version has run here once.
-    /// The runner records a use after a successful local read, never an act.
+    /// Shared verbs require a successful local read of this exact version; an act cannot establish that proof.
     public var verbsEnabled: Bool { status == .on && (origin != .shared || uses > 0) }
 
     public init(id: String, corner: SenseCorner, version: Int = 1, status: SenseStatus = .on,
@@ -302,7 +277,7 @@ public struct SenseRecord: Codable, Sendable, Hashable {
     }
 }
 
-/// The one line every served view carries, so she knows who made it.
+/// Every served view must identify its producing sense.
 public struct SenseProvenance: Codable, Sendable, Hashable {
     public var senseID: String
     public var version: Int
@@ -317,10 +292,8 @@ public struct SenseProvenance: Codable, Sendable, Hashable {
         origin = record.origin
     }
 
-    /// e.g. "via sense numbers-file v3 · grown 2h ago · used 41× · corrected 1×"
-    public func line(now: Date) -> String {
-        // Imported provenance may predate registry validation. Invalid dates
-        // remain visible evidence rather than trapping or becoming a fresh age.
+    public func line(now: Date, readContent: OwnedProgramRunner.ReadContent? = nil) -> String {
+        // Keep invalid provenance dates visible instead of trapping or inventing a fresh age.
         let seconds = grownAt.map { now.timeIntervalSince($0) } ?? .nan
         let whole = seconds.isFinite ? Int(exactly: seconds.rounded(.towardZero)) : nil
         let ago = whole.map { value in
@@ -331,7 +304,7 @@ public struct SenseProvenance: Codable, Sendable, Hashable {
         let source = origin == .builtIn ? "built in" : validDate
             ? ago.map { "grown \($0) ago" } ?? "creation time unavailable" : "invalid creation time"
         let line = "via sense \(senseID) v\(version) · \(source) · used \(uses)× · corrected \(corrections)×"
-        OwnedProgramRunner.ReadContent.current?.record(.string(line),
+        readContent?.record(.string(line),
             content: .string("via sense \(senseID) v\(version) · \(origin.rawValue)"))
         return line
     }
@@ -340,31 +313,59 @@ public struct SenseProvenance: Codable, Sendable, Hashable {
 // MARK: - Running a sense
 
 public enum SenseRequest: Sendable, Equatable {
-    /// Read the corner (or an address inside it) in the native form.
     case read(address: String?)
-    /// A verb SHE invoked in her turn on a named thing. The sense turns it
-    /// into door requests; it never acts on its own.
+    /// Only a verb invoked in the agent's turn may produce door requests; senses cannot act independently.
     case act(verb: String, address: String, args: JSONValue)
-    /// Start following the corner (live senses only).
     case watch
-    /// Handle an interactive view or part wake without authorizing door actions.
+    /// View and part-wake handling grants no door action authority.
     case event(JSONValue)
 }
 
-/// Bound only while the door answers her act, never for reads or background work.
-/// `verb` names an existing app action; the callback re-enters its normal gates.
+/// An act's explicitly supplied callback re-enters normal app gates.
 public enum SenseActionContext {
     public typealias Perform = @Sendable (_ verb: String, _ address: String, _ args: JSONValue) async throws -> JSONValue
-    @TaskLocal public static var perform: Perform?
+}
+
+/// Re-entry and verification are properties of this read's call path.
+public struct SenseReadOptions: Sendable {
+    public var raw = false
+    public var verifyingActCorner: SenseCorner?
+    public init(raw: Bool = false, verifyingActCorner: SenseCorner? = nil) {
+        self.raw = raw; self.verifyingActCorner = verifyingActCorner
+    }
+}
+
+/// One read or watch operation, captured by its source and asynchronous callbacks.
+/// A passive owner has no turn and no action callback; it never inherits either.
+public struct SenseReadOperation: Sendable {
+    public var turn: Turn?
+    public var options: SenseReadOptions
+    public var appCapture: SenseAppReadCapture?
+    public var senseReads: SenseTurnReads?
+    public var readContent: OwnedProgramRunner.ReadContent?
+    public var perform: SenseActionContext.Perform?
+    public var passive: Bool
+    public var deadline: ContinuousClock.Instant?
+    public init(turn: Turn?, options: SenseReadOptions = .init(), appCapture: SenseAppReadCapture? = nil,
+                senseReads: SenseTurnReads? = nil, readContent: OwnedProgramRunner.ReadContent? = nil,
+                perform: SenseActionContext.Perform? = nil, passive: Bool = false, deadline: ContinuousClock.Instant? = nil) {
+        self.turn = turn; self.options = options; self.appCapture = appCapture; self.senseReads = senseReads
+        self.readContent = readContent; self.perform = perform; self.passive = passive; self.deadline = deadline
+    }
+    public func observing() -> SenseReadOperation {
+        var operation = self
+        operation.turn = nil; operation.perform = nil; operation.passive = true
+        operation.options.verifyingActCorner = nil
+        operation.appCapture = nil; operation.senseReads = nil; operation.readContent = nil; operation.deadline = nil
+        return operation
+    }
 }
 
 public struct SenseFailure: Codable, Sendable, Hashable, Error {
-    /// e.g. "crashed", "timeout", "bad_output", "unsupported", "source_unavailable".
     public var code: String
     public var message: String
-    /// A short excerpt of the input that broke it.
     public var inputExcerpt: String?
-    /// The runner attaches the same provenance to failures as to served views.
+    /// Failures need the same producing provenance as served views.
     public var provenance: SenseProvenance?
     public var remedy: JSONValue?
 
@@ -413,52 +414,41 @@ public enum SenseOutcome: Sendable {
     case failed(SenseFailure)
 }
 
-/// The raw material NativeAgent hands a sense (`source.read`). A sense never
-/// touches the operating system directly.
+/// Supply raw material through source.read; senses must never touch the operating system directly.
 public enum SenseMaterial: Sendable {
-    /// An app's accessibility tree, as JSON.
     case accessibility(JSONValue)
-    /// A file: its path (read-only), size and bytes already admitted by a read.
+    /// File bytes must already have passed read admission.
     case file(path: String, bytes: Int, data: Data? = nil)
-    /// A web page snapshot, as JSON (the Chrome read model).
     case pageSnapshot(JSONValue)
-    /// Plain text (a document extract, a stream chunk).
     case text(String)
 
-    /// macOS document packages: folders a file sense reads as one file.
+    /// Treat macOS document packages as a single file despite their directory shape.
     public static let packageExtensions: Set<String> = ["pages", "numbers", "key", "rtfd"]
 }
 
-/// Fetches raw material for a corner. Implemented by the app over the
-/// existing readers (four verbs, files, Chrome).
 public protocol SenseSourceProvider: Sendable {
-    func material(for corner: SenseCorner, address: String?) async throws -> SenseMaterial
+    func material(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> SenseMaterial
 }
 
-/// Receipt for the exact whole-file bytes delivered by the helper runner.
-/// Package bytes count member content; version hashes names and content.
+/// Whole-file receipts count package member bytes and hash both names and content for version identity.
 public protocol SenseFileReadReporting: SenseSourceProvider {
     func didReadFile(path: String, bytes: Int, version: String, data: Data) async
 }
 
-/// Optional event-backed observation. Every delivered material passes the
-/// current raw-read gates. Unsupported corners fail rather than fake a watch.
+/// Every observed material must pass current read gates; unsupported corners must fail rather than pretend to watch.
 public protocol SenseSourceWatchingProvider: SenseSourceProvider {
-    func changes(for corner: SenseCorner, address: String?) async throws -> AsyncStream<SenseSourceChange>
+    func changes(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> AsyncStream<SenseSourceChange>
 }
 
-/// A source failure is a reading, never an empty snapshot. A file source owns
-/// both admitted material and its checked membership identity in one reading.
+/// A failed reading is not an empty snapshot; admitted file material and checked membership share one owner.
 public enum SenseSourceChange: Sendable {
     case changed(SenseMaterial, files: [String: [Int64]]? = nil)
-    /// The gated file reader proved the watched root absent (ENOENT).
-    /// This is an empty membership identity, never a material/read failure.
+    /// Only gated ENOENT proves root absence and empty membership, distinct from a material failure.
     case absent
     case unavailable(SenseFailure)
 }
 
-/// Entry-local progress admission shared by the app supervisor and JS watchdog.
-/// Call `read` only after a successful read; valid publish/notify always advance.
+/// Share progress admission between supervisor and watchdog; only successful reads and valid publish/notify may advance it.
 public struct SenseEntryProgress: Sendable {
     private var readAddresses: Set<String?> = []
     private var highWater: Double?
@@ -469,7 +459,7 @@ public struct SenseEntryProgress: Sendable {
         readAddresses.insert(address).inserted
     }
 
-    /// Nil reports one completed unit. Returns the accepted mark, or nil for a repeat.
+    /// Nil reports a completed unit; repeated marks cannot renew progress.
     public mutating func advance(to value: Double?) throws -> Double? {
         let n = value ?? (highWater ?? 0) + 1
         guard n.isFinite else {
@@ -481,8 +471,7 @@ public struct SenseEntryProgress: Sendable {
     }
 }
 
-/// A subscription actually held by a source or helper, independent of the
-/// sense's declared on-call/live mode. It ends with that owner's subscription.
+/// Live subscription evidence must follow the actual owner lifetime rather than the sense's declared mode.
 public struct SenseLiveWatch: Sendable, Hashable {
     public let address: String
     public let senseID: String
@@ -499,8 +488,7 @@ public protocol SenseWatchReporting: Sendable {
     func liveWatches() async -> [SenseLiveWatch]
 }
 
-/// An offline interactive view. HTML is handed over as bytes, never a file
-/// URL; its sole event channel is tied to this exact sense version.
+/// Deliver view HTML as bytes, never a file URL; bind its sole event channel to the exact sense version.
 public struct SenseInteractiveView: Codable, Sendable, Hashable {
     public var senseID: String
     public var version: Int
@@ -534,10 +522,8 @@ enum SenseRetainedText {
     }
 }
 
-/// The ordinary app read owns capture. The sense receives this frozen copy,
-/// containing redacted AX and recognized text, never pixels or a new capture.
+/// Reuse the app read's frozen, redacted AX and recognized text; senses receive neither pixels nor a new capture.
 public final class SenseAppReadCapture: @unchecked Sendable {
-    @TaskLocal public static var current: SenseAppReadCapture?
     private let lock = NSLock()
     private var trees: [String: JSONValue] = [:]
     private let requestedBundle: String?
@@ -567,7 +553,9 @@ public final class SenseAppReadCapture: @unchecked Sendable {
             guard case .object(var tree) = value else { continue }
             tree.removeValue(forKey: "recognized_text")
             tree.removeValue(forKey: "recognized_text_body")
-            tree["window_text_unavailable_reason"] = .string("The app window changed before its recognized text could be retained; read the app and reject that view again.")
+            tree["window_text_unavailable_reason"] = .string("""
+                The app window changed before its recognized text could be retained; read the app and reject that view again.
+                """)
             trees[bundle] = .object(tree)
         }
     }
@@ -582,34 +570,28 @@ public final class SenseAppReadCapture: @unchecked Sendable {
     }
 }
 
-/// MemoryV2 owns the durable flags; lifecycle and door owners report the exact version.
+/// MemoryV2 owns durable flags; lifecycle and door reporting must identify the exact version.
 public protocol SenseMemoryProvenanceSink: Sendable {
     func markVersionWrong(senseID: String, version: Int) async throws
 }
 
-/// What crosses from a watch into her mind (docs/SUBCONSCIOUS.md, Cares): a
-/// line weighed on CPU against her live cares. Her cognition installs it.
+/// Cognition installs CPU weighing against live cares so watched lines cross through the same care owner.
 public protocol SenseCrossing: Sendable {
-    /// When `line` touches a care, asks for one wake on the watch's thread
-    /// whose arrival `id` says `says`, and whose reason names the care.
+    /// Wake the watch's own thread once, naming the touched care and retaining the arrival identity.
     func cross(_ line: String, watch: String, reason: String, id: String, says: String, agent: String?) async -> SenseCrossed
 }
 
-/// What a watch's line touched (a care, by its about) and what came of it.
 public enum SenseCrossed: Sendable, Equatable {
     case woke(care: String)
     case untouched
-    /// Nothing could judge it (no inner life, no cares, a cold embedder): the
-    /// line crosses as it would with no crossing at all.
+    /// Without inner life, cares or a ready embedder, pass the line through without a crossing verdict.
     case unweighed
-    /// This watch already woke her about it and the care has not rested since.
+    /// Suppress another wake while the touched care has not rested.
     case resting(care: String)
-    /// The wake could not be kept.
     case notKept(care: String)
 }
 
-/// Errors surface their own words wherever they are shown, never
-/// "SenseFailure error 1".
+/// Expose the failure's own words instead of an opaque NSError description.
 extension SenseFailure: LocalizedError {
     public var errorDescription: String? { message.isEmpty ? code : message }
 }

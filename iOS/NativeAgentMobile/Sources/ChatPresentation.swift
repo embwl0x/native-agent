@@ -11,7 +11,6 @@ enum ChatSessionTabPresentation {
     }
 }
 
-/// Presentation for ChatView's controls; the shared sync projection owns choices.
 enum ChatRuntimeControlPresentation {
     static func processingModeTitle(fastMode: Bool) -> String {
         fastMode ? "Fast" : "Normal"
@@ -22,27 +21,6 @@ enum ChatRuntimeControlPresentation {
     }
 }
 
-
-/// Ordinary scroll bursts coalesce; forced or animated requests supersede the pending callback.
-struct ChatScrollScheduler: Equatable {
-    private(set) var serial = 0
-    private(set) var isScheduled = false
-
-    mutating func schedule(animated: Bool, force: Bool) -> Int? {
-        if isScheduled && !animated && !force {
-            return nil
-        }
-        serial &+= 1
-        isScheduled = true
-        return serial
-    }
-
-    mutating func complete(serial: Int, messagesAreAvailable: Bool) -> Bool {
-        guard serial == self.serial else { return false }
-        isScheduled = false
-        return messagesAreAvailable
-    }
-}
 
 actor ChatAttachmentPresentation {
     static let shared = ChatAttachmentPresentation()
@@ -70,10 +48,7 @@ actor ChatAttachmentPresentation {
 }
 
 enum PhotosPickerLoadPresentation {
-    /// The Photos picker can successfully return selections that cannot fit the
-    /// signed CloudKit turn. If every selection is rejected, the composer has
-    /// no thumbnail strip, so the message must say that no attachment was
-    /// added rather than merely naming the rejected source files.
+    /// Photos can return selections too large for CloudKit; if none fit, say none were added because no thumbnail strip can show the rejection.
     static func message(loadedCount: Int, skippedCount: Int) -> String? {
         guard skippedCount > 0 else { return nil }
         if loadedCount == 0 {
@@ -83,7 +58,10 @@ enum PhotosPickerLoadPresentation {
         }
         return skippedCount == 1
             ? "One photo was too large or unsupported; \(loadedCount) photo\(loadedCount == 1 ? "" : "s") is ready to send."
-            : "\(skippedCount) photos were too large or unsupported; \(loadedCount) photo\(loadedCount == 1 ? "" : "s") \(loadedCount == 1 ? "is" : "are") ready to send."
+            : """
+                \(skippedCount) photos were too large or unsupported; \(loadedCount) photo\(loadedCount == 1 ? "" : "s") \(loadedCount == 1 ? "is" : "are") \
+                ready to send.
+                """
     }
 }
 

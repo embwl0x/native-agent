@@ -1,21 +1,18 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PersonaEngine+GrowthVoiceWrites.swift` | `SwiftNativePersonaEngine`: shared document-kind normalization and selection; locked mutations require checked existing documents and exact-byte private backups; skill-specific aliases are retired |
+// Blueprint: | `PersonaEngine+GrowthVoiceWrites.swift` | `SwiftNativePersonaEngine`. |
 
-// Persona tool writes hold one cross-process file lock around each target's
-// read, backup and mutation. USER.md remains owned by MemoryV2.
+// Lock each persona target across read, backup and mutation; MemoryV2 retains USER ownership.
 
 extension SwiftNativePersonaEngine {
 
-    // USER.md is intentionally absent from the mutation sets. MemoryV2 owns
-    // USER.md and regenerates it from SQLite; persona tools may read it, but
-    // direct writes would split the projection from the source of truth.
+    // Exclude USER from mutations because direct writes would split its projection from MemoryV2 authority.
     static let personaWriteKinds: Set<String> = ["soul", "voice", "growth", "agents"]
     static let memoryOwnedUserDocMessage =
         "USER.md is generated from MemoryV2; use app memory.commit or memory proposal tools for durable user facts."
 
-    /// Protected reads and writes share NFKC, trimming and lowercase before selecting a document.
+    /// Normalize protected reads and writes identically before selecting documents.
     package static func canonicalizeKind(_ kind: String) -> String {
         (kind)
             .precomposedStringWithCompatibilityMapping
@@ -25,9 +22,7 @@ extension SwiftNativePersonaEngine {
 
     package static let personaReadKinds: Set<String> = ["soul", "user", "voice", "growth", "agents"]
 
-    /// Document selection shared by protected tool reads and guarded writes.
-    /// USER is readable here; mutation callers exclude it because MemoryV2
-    /// owns that projection. Routine authoring uses the app door.
+    /// Share selection across protected reads and writes, but keep MemoryV2's USER projection outside mutation authority.
     package static func personaDocumentPath(kind: String, root: URL) -> URL? {
         let kind = canonicalizeKind(kind)
         guard personaReadKinds.contains(kind) else { return nil }
@@ -36,7 +31,7 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - persona_write (full-doc REPLACE + backup)
 
-    /// Under the target lock, `keeping` may refuse replacement before backup or write.
+    /// Run keeping under the target lock before backup or write so refused replacements leave no edit.
     @discardableResult
     public func personaWrite(kind: String, content: String,
                              keeping: (@Sendable (_ current: String) throws -> Void)? = nil) async throws -> PersonaToolWriteResult {
@@ -75,8 +70,7 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - persona_append_section (titled section append + backup)
 
-    /// Append the full `\n\n## <trimmed title>\n<content>` section after trimming the base's trailing whitespace.
-    /// Read, backup and rewrite hold the target lock.
+    /// Hold the target lock across checked read, backup and complete section append.
     @discardableResult
     public func personaAppendSection(kind: String, title: String, content: String) async throws -> PersonaToolWriteResult {
         let canon = Self.canonicalizeKind(kind)
@@ -121,9 +115,8 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - shared write helpers
 
-    /// Ordinary edits require the canonical document, even for replacement.
-    /// Read under its lock and fail before backup/write; only explicit setup
-    /// creates documents. Missing or unreadable content is never an empty base.
+    /// Ordinary edits require the checked canonical document; only explicit setup creates one.
+    /// Missing or unreadable content cannot become an empty replacement base.
     static func readPersonaDocumentForMutation(at url: URL) throws -> (text: String, data: Data) {
         do {
             return try readPersonaDocumentContents(at: url)
@@ -144,7 +137,7 @@ extension SwiftNativePersonaEngine {
         ))
     }
 
-    /// Remove trailing Unicode whitespace scalars only.
+    /// Trim Unicode whitespace scalars only.
     static func rstrip(_ s: String) -> String {
         var scalars = Array(s.unicodeScalars)
         while let last = scalars.last, CharacterSet.whitespacesAndNewlines.contains(last) {
@@ -153,7 +146,7 @@ extension SwiftNativePersonaEngine {
         return String(String.UnicodeScalarView(scalars))
     }
 
-    /// Copy checked prior bytes to `<file>.pre-<UTC timestamp>-<8 lowercase hex digits>.bak`.
+    /// Copy checked prior bytes under a unique timestamped backup name.
     static func backup(_ target: URL, data: Data) throws -> String {
         let ts = backupTimestamp()
         let uid = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(8))
@@ -164,22 +157,22 @@ extension SwiftNativePersonaEngine {
         } catch {
             throw PersonaWriteError.ioFailure("Could not create backup: \(error.localizedDescription)")
         }
-        // The edit has not run yet. Refuse it if its backup retention cannot
-        // be maintained, preserving the prior bytes and the newly made copy.
+        // Refuse the edit if backup retention fails, preserving both prior content and the new recovery copy.
         do { try pruneOldBackups(for: target, keeping: backupRetention) }
         catch {
-            throw PersonaWriteError.ioFailure("Created the recovery copy at \(backupURL.path), but could not prune older copies. The edit has not been applied. Repair access to \(target.deletingLastPathComponent().path). \(error.localizedDescription)")
+            throw PersonaWriteError.ioFailure(
+                """
+                    Created the recovery copy at \(backupURL.path), but could not prune older copies. The edit has not been applied. Repair access to \
+                    \(target.deletingLastPathComponent().path). \(error.localizedDescription)
+                    """)
         }
         return backupURL.path
     }
 
-    /// Newest `.pre-*.bak` copies to keep per persona file.
     static let backupRetention = 10
 
-    /// Delete all but the newest `keeping` `<basename>.pre-*.bak` siblings of
-    /// `target`. Inspection and deletion failures refuse the pending edit. Scoped by an
-    /// exact `<basename>.pre-` prefix so it can only ever touch this file's own
-    /// timestamped backups, never another file or a non-backup sibling.
+    /// Scope retention to the exact target's timestamped backup prefix so cleanup cannot remove unrelated files.
+    /// Inspection or deletion failure refuses the pending edit.
     static func pruneOldBackups(for target: URL, keeping: Int) throws {
         guard keeping >= 0 else { return }
         let dir = target.deletingLastPathComponent()
@@ -189,14 +182,14 @@ extension SwiftNativePersonaEngine {
         )
         let backups = entries
             .filter { $0.lastPathComponent.hasPrefix(prefix) && $0.lastPathComponent.hasSuffix(".bak") }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }   // newest first
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
         guard backups.count > keeping else { return }
         for stale in backups.dropFirst(keeping) {
             try FileManager.default.removeItem(at: stale)
         }
     }
 
-    /// Backup timestamp shape: YYYYMMDDTHHMMSS<6-digit-microseconds>Z in UTC.
+    /// Use UTC microsecond timestamps so backup names sort chronologically.
     static func backupTimestamp() -> String {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = .gmt

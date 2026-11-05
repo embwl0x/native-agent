@@ -1,22 +1,19 @@
 import Foundation
-// Blueprint: | `ConnectorOAuthRegistry.swift` | Sole checked connector-array reader/schema and durable publication owner (`writeRegistry`), including bootstrap; canonical IDs and `connectionDecision`. A connection decision is recorded only by the person's own connect or disconnect; seeds and retained pre-decision rows are undecided without inferring from enabled/authState. Malformed authority throws; dictionary-shape and credential-migration adapters are removed |
+// Blueprint: | `ConnectorOAuthRegistry.swift` | `writeRegistry`, `connectionDecision`; Only owner acts record consent. |
 
-/// Checked connector registry authority, shared by mutations and credential migration.
 public enum ConnectorOAuthRegistry {
-    /// Only the person's own connect or disconnect records a choice. Catalog
-    /// seeds, first reads and migrations are undecided, never inferred from health or enabled.
+    /// Only the person's connect or disconnect records consent; seeds and health cannot imply it.
     public enum ConnectionDecision: String, Sendable {
         case undecided, connected, disconnected
         public var value: JSONValue { .string(rawValue) }
     }
     public static let decisionField = "connectionDecision"
 
-    /// Validate the entire authority before projecting or changing any row.
-    /// The current array shape is required. Retained pre-decision rows remain
-    /// undecided until their owner converts them; no health field infers consent.
+    /// Check the entire current array before use; pre-decision rows remain undecided until the owner records consent.
     public static func checkedConnectorRows(from value: JSONValue) throws -> [[String: JSONValue]] {
         guard case .array(let entries) = value else {
-            throw PersistenceCoreError.ioFailure("Connector registry must be an array of current connector rows. Preserve and convert the file before continuing.")
+            throw PersistenceCoreError.ioFailure(
+                "Connector registry must be an array of current connector rows. Preserve and convert the file before continuing.")
         }
         var ids = Set<String>()
         return try entries.map { value in
@@ -60,8 +57,7 @@ public enum ConnectorOAuthRegistry {
             .appendingPathComponent("registry.json")
     }
 
-    /// Sole registry publication owner, including bootstrap.
-    /// Caller holds the registry lock across its read/edit/write transaction.
+    /// Sole registry publication owner, including bootstrap. Caller holds the registry lock across its read/edit/write transaction.
     public static func writeRegistry(_ value: JSONValue, at path: URL) throws {
         let rows = try checkedConnectorRows(from: value).map(JSONValue.object)
         try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONValue.array(rows).serializedData(pretty: true), to: path)

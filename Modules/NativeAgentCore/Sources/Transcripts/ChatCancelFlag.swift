@@ -2,17 +2,11 @@ import Foundation
 import os
 import PersistenceCore
 
-// Blueprint: | `ChatCancelFlag.swift` | `ChatCancelFlag`: run-identity Stop markers and in-flight registration; later acceptance never erases a prior turn's Stop |
+// Blueprint: | `ChatCancelFlag.swift` | `ChatCancelFlag`: Run-tagged Stop survives later acceptance |
 
-/// The session's Stop marker, `chat/sessions/<id>/cancelled.flag`, keyed by
-/// run identity. Each accepted turn registers its run id and watches the
-/// marker through a URL carrying that id (in its fragment, which `.path`
-/// ignores). A Stop writes the run ids in flight on the session (or its last
-/// run) INTO the marker, and a turn counts it only when its own id is there.
-/// Acceptance preserves prior Stop markers. Empty content and an untagged URL count any
-/// marker; a stale marker naming an old run never matches a new one.
-/// Storage: Stop markers are excluded from local backup, data export and phone
-/// sync; included in off-disk backup and PrivacyMap/chat.
+/// Run-tagged Stop markers preserve cancellation across later acceptance; only a matching run observes a tagged marker. Empty markers and untagged URLs match
+/// any run. URL fragments carry run identity without changing the file path. Stop markers use off-disk backup and PrivacyMap/chat; local backup, export and
+/// phone sync exclude them.
 public enum ChatCancelFlag {
     public static func path(dataRoot: URL, sessionId: String) -> URL {
         dataRoot
@@ -22,21 +16,16 @@ public enum ChatCancelFlag {
             .appendingPathComponent("cancelled.flag")
     }
 
-    /// One accepted run, whichever door started it: its session, the trace
-    /// turn its milestones carry, and when it was accepted.
+    /// Carry accepted session and trace identity across every ingress door.
     public struct InFlightTurn: Sendable {
         public let runId: String
         public let sessionId: String
         public let turnId: String
         public let acceptedAt: Date
-        /// The marker as this run watches it (tagged with its run id).
         public let stop: URL
     }
 
-    /// Registers `runId` (trace turn `turnId`) as in flight on the session;
-    /// pair with `finish`. A door registers its run at admission, before any
-    /// await, so a Stop always names the live run; the turn's own acceptance of
-    /// the same run is then the same registration.
+    /// Register before any await so Stop can name the live run; repeated admission is idempotent and must pair with finish.
     public static func accept(dataRoot: URL, sessionId: String, runId: String, turnId: String) -> URL {
         let file = path(dataRoot: dataRoot, sessionId: sessionId)
         let key = file.standardizedFileURL.path
@@ -55,8 +44,7 @@ public enum ChatCancelFlag {
         return stop
     }
 
-    /// A run was accepted or finished, on any session and surface: whoever
-    /// shows a turn from another door (Shotgun) follows this.
+    /// Surface-independent admission and finish events keep other doors' visible turns current.
     public static let inFlightDidChange = Notification.Name("ChatCancelFlag.inFlightDidChange")
 
     public static func finish(_ flag: URL) {
@@ -76,14 +64,11 @@ public enum ChatCancelFlag {
         NotificationCenter.default.post(name: inFlightDidChange, object: nil)
     }
 
-    /// Every run accepted and not yet finished, on any session. The app's quit
-    /// waits for these so a Quit mid-turn lets the turn land.
+    /// Quit waits for accepted unfinished runs so their settlement can land.
     public static func inFlightRunIDs() -> Set<String> {
         registry.withLock { runs in Set(runs.inFlight.values.joined().map(\.runId)) }
     }
 
-    /// The turns in flight on `dataRoot`'s sessions, whichever door started
-    /// them.
     public static func inFlightTurns(dataRoot: URL) -> [InFlightTurn] {
         registry.withLock { runs in
             runs.inFlight.flatMap { key, turns in
@@ -92,8 +77,7 @@ public enum ChatCancelFlag {
         }
     }
 
-    /// What a Stop writes: the runs in flight on this marker's session, else
-    /// its last run, else a token no turn matches.
+    /// Target in-flight runs, then the last run, otherwise a token no turn can match.
     public static func stopContent(forFlagAt flag: URL) -> String {
         let key = flag.standardizedFileURL.path
         return registry.withLock { runs in

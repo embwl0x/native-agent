@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import Experiences
 import PersistenceCore
 
@@ -6,23 +7,19 @@ import PersistenceCore
 public protocol CognitiveRuntimeProviding: Sendable {
     /// Ingest turns without extracting conversational commitments or predictions.
     func observe(_ event: CognitiveEvent) async
-    /// One fixed-time value for the ordinary turn's cognition/organism seam.
-    /// The value is advisory and owns no authority.
-    func prepareTurnProjection(_ request: CognitiveCapsuleRequest) async -> CognitionAtTurn
+    /// One fixed-time value for the ordinary turn's cognition/organism seam. The value is advisory and owns no authority.
+    func prepareTurnProjection(_ request: CognitiveCapsuleRequest, turn: Turn) async -> CognitionAtTurn
     /// Commits presentation bookkeeping at confirmed provider delivery, never preparation.
     func commitTurnProjection(
         _ projection: CognitionAtTurn,
-        request: CognitiveCapsuleRequest
+        request: CognitiveCapsuleRequest,
+        turn: Turn
     ) async
     /// A bounded, pure attention read for context selection; nil leaves turn preparation unchanged.
     func attentionSignals(at date: Date) async -> CognitiveAttentionSignals?
 }
-/// What her mind is holding right now, shaped for the context selector.
-/// All fields are bounded at CONSTRUCTION so no producer can flood the
-/// selector: terms ≤ 16 (64 chars each), tool groups ≤ 8, memory ids ≤ 32;
-/// free-text intents ≤ 200 chars. Weights clamp to 0…1.
-/// Memory entries carry MEMORY RECORD ids — never context atom ids; the
-/// app layer owns the projection's stable-ID derivation.
+/// Construction caps terms (16), tool groups (8), memory ids (32) and text so producers cannot flood selection. Record ids stay native; the app derives atom
+/// ids.
 public struct CognitiveAttentionSignals: Sendable, Equatable {
     // Immutable fields preserve the initializer's bounding contract.
     public let terms: [String: Double]
@@ -30,15 +27,11 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
     public let completionWindow: CognitiveSubstrate.OpenCompletionRead?
     public let activeTask: String?
     public let goal: String?
-    /// Provenance bit for an activeTask/goal supplied by the resident Desk
-    /// pursuit overlay. The turn engine keeps this intent out of ordinary
-    /// conversation relevance; the Desk context projection remains available
-    /// for explicit, query-selected work recall.
+    /// Keep Desk pursuit intent out of ordinary relevance; explicit work queries still reach its context projection.
     public let residentWorkIntent: Bool
     public let predictedToolGroups: Set<String>
     public let memoryActivation: [String: Double]
-    /// Phase 5 B0: memory record id → the signatures she rejected it for
-    /// (empty signature: never). ≤ 48 rows, already capped by the owner.
+    /// Carry at most 48 owner-capped memory suppression signatures; an empty signature suppresses every context.
     public let suppressedMemory: [String: [[String]]]
 
     public var isEmpty: Bool {
@@ -47,7 +40,7 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
             && memoryActivation.isEmpty
             && suppressedMemory.isEmpty
     }
-    /// The record ids she rejected for this kind of message.
+    /// Memory suppression remains specific to this message context.
     public func suppressedMemoryRecordIDs(for message: String) -> Set<String> {
         guard !suppressedMemory.isEmpty else { return [] }
         let terms = CognitiveSubstrate.associationTerms(in: message)
@@ -69,10 +62,7 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
         func bounded(_ text: String, to limit: Int) -> String {
             text.count <= limit ? text : String(text.prefix(limit))
         }
-        // Deterministic keep-order under the caps: strongest first, then
-        // lexicographic so equal weights can't reshuffle across calls (the
-        // packet fingerprint folds these in — nondeterminism would thrash
-        // the selection cache).
+        // Sort strength then lexical identity so equal weights cannot thrash packet fingerprints or selection caches.
         func cappedByWeight(_ dict: [String: Double], cap: Int, keyLimit: Int) -> [String: Double] {
             var entries: [(key: String, value: Double)] = dict.map { entry in
                 (key: bounded(entry.key, to: keyLimit), value: (entry.value).clamped01())
@@ -135,23 +125,16 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     public var organismProjection: OrganismReadout?
     /// The caller supplies a payload-free nearest open horizon; absent evidence leaves the forward object silent.
     public var toward: OrganismTowardRead?
-    /// Trusted local teammate bridges may read the current inner-state
-    /// projection without allowing their diagnostic traffic to become felt
-    /// experience. Event turn-kind filtering remains independent.
+    /// Trusted local teammate bridges may read the current inner-state projection without allowing their diagnostic traffic to become felt experience. Event
+    /// turn-kind filtering remains independent.
     public var allowNonLiveProjection: Bool
-    /// Accepted chat provenance, when supplied by the shared turn owner.
-    /// An unclassified diagnostic read never becomes a live exchange.
+    /// Accepted chat provenance, when supplied by the shared turn owner. An unclassified diagnostic read never becomes a live exchange.
     public var turnKind: CognitiveTurnKind?
-    /// Phase 5 B2: User started this turn himself, from one of his doors (Mac,
-    /// phone, Telegram). Her wakes, peer threads and bridge lanes are not him,
-    /// so they never open or close the "since we last talked" gap.
+    /// Only person-started turns across local doors move the conversation-gap boundary; wakes and peer or bridge traffic cannot.
     public var fromUser: Bool
-    /// Phase 5 B2/E2: User's verified turn before this one (`UserTurnStamp`),
-    /// where the gap this turn closes opened. Nil when unknown or not his turn.
+    /// `UserTurnStamp` provides the prior verified user turn; unknown or non-user turns leave it nil.
     public var previousUserTurnAt: Date?
-    /// Cares lane 2: whose words these are, as cares key people (`owner`, a
-    /// peer id, a helper's bot id). Nil for her own wake or a sender with no
-    /// person key: only her own cares press then.
+    /// Care speaker identity limits privacy; nil wakes or unidentified senders may press only self-held cares.
     public var speaker: String?
 
     public var resolvedTurnKind: CognitiveTurnKind {
@@ -219,9 +202,8 @@ public struct CognitiveCapsule: Sendable, Equatable {
         self.truncated = truncated
     }
 }
-/// Pure result of rendering one live injection against a frozen presentation
-/// state. The substrate applies it only after the provider accepts that exact
-/// turn; previews, reflections, failures, and retries merely discard it.
+/// Pure result of rendering one live injection against a frozen presentation state. The substrate applies it only after the provider accepts that exact turn;
+/// previews, reflections, failures, and retries merely discard it.
 public struct CognitiveCapsulePresentationCommit: Sendable, Equatable {
     public let mindEpoch: UInt64
     public let fixedAt: Date
@@ -243,7 +225,7 @@ public struct CognitiveCapsulePresentationCommit: Sendable, Equatable {
 public struct CognitivePreparedCapsule: Sendable, Equatable {
     public let capsule: CognitiveCapsule
     public let presentationCommit: CognitiveCapsulePresentationCommit?
-    /// Phase 5 B0: why this cue (or none) — for the turn trace, never the prompt.
+    /// Cue explanations reach traces only, never provider prompts.
     public let why: JSONValue?
 
     public init(
@@ -260,16 +242,14 @@ public struct CognitivePreparedCapsule: Sendable, Equatable {
         capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : capsule
     }
 }
-/// Bounded, immutable turn-scoped composition of the existing cognition and
-/// organism owners. This is a read value, not a new state owner or global
-/// transaction; effect-time authority remains independently revalidated.
+/// Bounded, immutable turn-scoped composition of the existing cognition and organism owners. This is a read value, not a new state owner or global transaction;
+/// effect-time authority remains independently revalidated.
 public struct CognitionAtTurn: Sendable, Equatable {
     public let fixedAt: Date
     public let capsule: CognitiveCapsule?
     public let posture: OrganismBehaviorPosture?
     public let capsulePresentationCommit: CognitiveCapsulePresentationCommit?
-    /// Phase 5 B0: the cue's `mind.why` record, fired into the turn trace once
-    /// the turn is delivered.
+    /// Trace `mind.why` only after delivery so previews cannot claim a cue was read.
     public let why: JSONValue?
 
     public init(
@@ -293,10 +273,7 @@ public struct CognitiveAffectState: Codable, Sendable, Equatable {
     public var taskPressure: Double
     public var socialWarmth: Double
     public var updatedAt: Date
-    /// The fold seq of the last lived moment that changed this affect
-    /// (docs/SUBCONSCIOUS.md, "Lived moments"). Saved with the axes and their
-    /// temporal anchors in the one affect row, so whichever writer saves the
-    /// change saves its proof. 0: none (or a row an older binary wrote).
+    /// Save the lived fold seq with affect axes and anchors so every writer retains the mutation's proof; zero carries no watermark.
     public var lived: UInt64
 
     public init(

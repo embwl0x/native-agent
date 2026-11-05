@@ -128,7 +128,7 @@ when their day starts; no new timer is created.
 Observation and refresh tasks cancel and join in cognition's sleep settlement.
 
 Break identity is `rhythm:<kind>:<local date>`. Pending breaks contain only the
-instant and claim; local `h:mm a` words use `HerScreen.names(dataRoot).person`
+instant and claim; local `h:mm a` words use `AgentScreen.names(dataRoot).person`
 when felt. `CognitiveSubstrate.feelRhythmBreak` uses `ingestResident`'s existing
 felt-resolution stakes gate and records a zero-move note in a touched live
 care, with no open/close/stance/depth change. Durable pending identity lets a
@@ -138,7 +138,7 @@ release, `ResidentWake.request`, nor Reach. `care.charge` sums only movement;
 adding zero leaves it identical at the same instant, and `carePressure`'s open
 multiplier is unchanged. The somatic adapter returns nil for this felt kind.
 
-`mind.inner_state` returns `his_day` with the configured person's title,
+`mind.inner_state` returns `person_day` with the configured person's title,
 standing claims and confidence words, through the substrate's bounded reading.
 This is a pull, not extra per-turn context.
 

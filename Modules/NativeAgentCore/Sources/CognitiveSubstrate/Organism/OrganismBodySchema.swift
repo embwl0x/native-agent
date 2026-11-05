@@ -13,16 +13,14 @@ public enum ProviderPathEvidenceOutcome: String, Codable, Sendable, Equatable {
         switch self {
         case .succeeded, .recovered: 1
         case .failed: 0
-        // A cancelled request says nothing about path health. An unresolved
-        // start and its later expiry are likewise unknown, not failures.
+        // A cancelled request says nothing about path health. An unresolved start and its later expiry are likewise unknown, not failures.
         case .cancelled, .started, .expired: nil
         }
     }
 }
 
-/// Payload-free evidence about a provider path. The initializer hashes the
-/// supplied reference into `evidenceID`; provider output, prompts, account ids,
-/// and credentials therefore cannot survive in the typed evidence value.
+/// Payload-free evidence about a provider path. The initializer hashes the supplied reference into `evidenceID`; provider output, prompts, account ids, and
+/// credentials therefore cannot survive in the typed evidence value.
 public struct ProviderPathEvidence: Codable, Sendable, Equatable {
     public let evidenceID: String
     public let observedAt: Date
@@ -97,10 +95,7 @@ public enum ProviderPathBeliefState: String, Codable, Sendable, Equatable {
     case unobserved
 }
 
-/// A read-time belief projection, not canonical provider reality. Exact
-/// lifecycle events remain owned by their provider/trace stores. Consumers may
-/// use estimate, freshness and uncertainty for posture; the optional Boolean
-/// is only the legacy `BodySchema` compatibility view.
+/// Provider lifecycle owns reality; this read offers estimate, freshness and uncertainty for posture, with a lossy Boolean projection.
 public struct ProviderPathEstimate: Codable, Sendable, Equatable {
     public let generatedAt: Date
     public let estimate: Double
@@ -175,9 +170,8 @@ public struct ProviderPathEstimate: Codable, Sendable, Equatable {
 }
 
 public enum ProviderPathBeliefProjector {
-    /// A few seconds of clock skew may occur across local evidence producers;
-    /// anything farther ahead is not evidence about the present and must not
-    /// manufacture maximal freshness or confidence.
+    /// A few seconds of clock skew may occur across local evidence producers; anything farther ahead is not evidence about the present and must not manufacture
+    /// maximal freshness or confidence.
     public static let maximumFutureClockSkew: TimeInterval = 5
 
     public static func project(
@@ -245,9 +239,8 @@ public enum ProviderPathBeliefProjector {
             )
         }
 
-        // A weak Beta(1,1) prior keeps one lifecycle observation from
-        // masquerading as certainty about the future provider path. Exact
-        // success/failure remains owned by provider lifecycle truth.
+        // A weak Beta(1,1) prior keeps one lifecycle observation from masquerading as certainty about the future provider path. Exact success/failure remains
+        // owned by provider lifecycle truth.
         let estimate = ((weightedEstimate + 1) / (totalWeight + 2)).clamped01()
         let lowSupport = 1 / sqrt(totalWeight + 1)
         let disagreement = 4 * estimate * (1 - estimate)
@@ -266,8 +259,7 @@ public enum ProviderPathBeliefProjector {
 public struct OrganismBodyRead: Sendable, Equatable {
     public var macAwake: Bool?
     public var iPhoneStaleAfter: TimeInterval
-    /// Exact configuration/credential availability. This is not path health:
-    /// a configured provider can still be stale, failing, or unobserved.
+    /// Exact configuration/credential availability. This is not path health: a configured provider can still be stale, failing, or unobserved.
     public var providersAvailable: Bool?
     public var providerPathBelief: ProviderPathEstimate?
     public var peerPresenceBelief: PeerPresenceBelief?
@@ -331,9 +323,7 @@ public enum OrganismBodySchemaSampler {
             if let providersHealthy = belief.bodySchemaProvidersHealthy {
                 body.providersHealthy = providersHealthy
             } else if read.providersAvailable != nil {
-                // Compatibility Bool cannot express unknown. Fail closed until
-                // informative lifecycle evidence exists instead of promoting
-                // mere configuration to health.
+                // A Boolean cannot express unknown; require informative lifecycle evidence before calling a path healthy.
                 body.providersHealthy = false
             }
         }
@@ -361,8 +351,7 @@ public enum OrganismBodySchemaSampler {
                 body.approvalChannelsOpen = open
             }
         }
-        // No delivery evidence means unknown, even if persisted continuity or
-        // a peer-contact signal previously carried a compatibility value.
+        // No delivery evidence means unknown; persisted continuity and contact presence cannot attest delivery.
         body.notificationDeliveryBelief = read.notificationDeliveryBelief
         body.notificationPathHealthy = read.notificationDeliveryBelief?.compatibilityPathHealthy
         if let notificationDeliveryBelief = read.notificationDeliveryBelief {

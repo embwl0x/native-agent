@@ -2,7 +2,7 @@ import SwiftUI
 import NativeAgentShared
 import UIKit
 
-/// The Live Activity's Mac-projected working state. Core Animation owns every frame.
+/// Core Animation owns every frame; working state comes only from the Mac projection.
 struct PhoneThinkingLight: View {
     let correlationIDs: Set<String>
     @ObservedObject private var activity = PhoneTurnActivity.shared

@@ -55,7 +55,7 @@ enum MobileSchedules {
             }
         }
         var snapshot = MobileSchedulerSnapshot(capturedAt: capturedAt, jobs: jobs)
-        // The Mac's current zone rides with the facts; the phone shows them in it (Law 7).
+        // Carry the Mac's current zone so the phone interprets schedule facts in the same zone.
         snapshot.mac_time_zone = TimeZone.autoupdatingCurrent.identifier
         return snapshot
     }

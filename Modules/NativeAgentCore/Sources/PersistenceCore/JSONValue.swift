@@ -1,11 +1,10 @@
 import CryptoKit
 import Foundation
 import Darwin
-// Blueprint: | `JSONValue.swift` | `JSONValue` ADT and wire codec; strict JSON parsing, Python-compatible ordered/sorted serialization, Codable conversion; `decodeCompletion`, `fromEncodable`, `mapStrings`, `decodedExactly` (strict stored-document shape), checked throwing `digest`, `differences` |
+// Blueprint: | `JSONValue.swift` | `JSONValue`, `decodeCompletion`, `fromEncodable`, `mapStrings`, `decodedExactly`, `digest`, `differences` |
 
 // MARK: - JSONValue
 
-/// Sendable, Hashable JSON ADT used at the persistence boundary.
 public enum JSONValue: Sendable, Hashable {
     case null
     case bool(Bool)
@@ -17,8 +16,7 @@ public enum JSONValue: Sendable, Hashable {
 }
 
 extension JSONValue {
-    /// Sorted object leaves and indexed array leaves; empty containers are leaves.
-    /// False means the collected prefix is incomplete at the caller's bounds.
+    /// Sorted object leaves and indexed array leaves; empty containers are leaves. False means the collected prefix is incomplete at the caller's bounds.
     @discardableResult
     package func leaves(prefix: String = "", into out: inout [(path: String, value: JSONValue)],
                         limit: Int, depthLimit: Int = .max, depth: Int = 0) -> Bool {
@@ -76,7 +74,6 @@ extension JSONValue {
         }
     }
 
-    /// Null, zero, false and empty strings or containers are false; all other values are true.
     public var isTruthy: Bool {
         switch self {
         case .null: return false
@@ -89,7 +86,6 @@ extension JSONValue {
         }
     }
 
-    /// An object's string fields by key; empty for anything that isn't an object.
     public var stringFields: [String: String] {
         guard case .object(let fields) = self else { return [:] }
         return fields.compactMapValues { value in
@@ -98,12 +94,10 @@ extension JSONValue {
         }
     }
 
-    /// Convert using the default Codable wire format and the canonical JSON parser.
     public static func fromEncodable<T: Encodable>(_ value: T) throws -> JSONValue {
         try parse(JSONEncoder().encode(value))
     }
 
-    /// Transform string leaves without changing keys or non-string values.
     package func mapStrings(_ transform: (String) -> String) -> JSONValue {
         switch self {
         case .string(let string):
@@ -117,9 +111,8 @@ extension JSONValue {
         }
     }
 
-    /// Decode the first balanced object/array candidate matching this job's type.
-    /// Candidates may nest inside the other container kind, never their own.
-    /// Quoted brackets and escapes are data.
+    /// Decode the first balanced object/array candidate matching this job's type. Candidates may nest inside the other container kind, never their own. Quoted
+    /// brackets and escapes are data.
     public static func decodeCompletion<T: Decodable>(_ text: String, as type: T.Type) throws -> T {
         var stack: [(start: String.Index, close: Character)] = []
         var spans: [Range<String.Index>] = []
@@ -152,9 +145,7 @@ extension JSONValue {
         throw failure
     }
 
-    /// Parse JSON bytes into a JSONValue. Distinguishes Int vs Double by
-    /// inspecting the underlying CFNumber type (NSNumber from JSONSerialization).
-    /// Invalid numeric tokens are rejected without changing the supplied bytes.
+    /// Inspect CFNumber identity to distinguish Int from Double; reject invalid numeric tokens without altering input bytes.
     public static func parse(_ data: Data) throws -> JSONValue {
         // Release JSONSerialization's autoreleased tree after each parse.
         try autoreleasepool {
@@ -165,19 +156,11 @@ extension JSONValue {
         }
     }
 
-    /// Build a `JSONValue` from a Foundation `Any` leaf/container — the same
-    /// shape `JSONSerialization.jsonObject` produces (NSNull / NSNumber /
-    /// String / [Any] / [String: Any]). Uses the identical NSNumber
-    /// bool-vs-int-vs-double disambiguation as `parse`, so a value built from
-    /// an in-memory body round-trips byte-identically to one read off disk.
-    /// Non-JSON Foundation types fall through to `.null` (unreachable for valid
-    /// JSON output). Used to carry profile.json "extras" (unknown keys) through
-    /// the persona normalize/write path losslessly.
+    /// Use the same NSNumber disambiguation as parse so in-memory Foundation JSON round-trips identically to disk data.
     public init(fromFoundation any: Any) {
         self = JSONValue.convert(any)
     }
 
-    /// The in-memory Foundation tree for JSON serialization and transport boundaries.
     public var foundationObject: Any {
         switch self {
         case .null: return NSNull()
@@ -193,8 +176,7 @@ extension JSONValue {
     private static func convert(_ any: Any) -> JSONValue {
         if any is NSNull { return .null }
         if let n = any as? NSNumber {
-            // CFBooleanRef shows up as NSNumber, but objCType is "c". The reliable
-            // disambiguator is comparing against kCFBooleanTrue/False.
+            // CFBoolean bridges as NSNumber with objCType c; compare the canonical Boolean objects to distinguish it.
             if CFGetTypeID(n) == CFBooleanGetTypeID() {
                 return .bool(n.boolValue)
             }
@@ -215,23 +197,19 @@ extension JSONValue {
             for (k, v) in dict { out[k] = convert(v) }
             return .object(out)
         }
-        // Fallback — should be unreachable for valid JSON output.
         return .null
     }
 }
 
 extension JSONValue {
-    /// Serialize to a UTF-8 string matching Python's `json.dumps(v, sort_keys=True,
-    /// ensure_ascii=True)`. When `pretty` is true, matches `indent=2` formatting
-    /// (separators default to `(',', ': ')` with indent); otherwise compact mode
-    /// uses `(', ', ': ')`.
+    /// Serialize to a UTF-8 string matching Python's `json.dumps(v, sort_keys=True, ensure_ascii=True)`. When `pretty` is true, matches `indent=2` formatting
+    /// (separators default to `(',', ': ')` with indent); otherwise compact mode uses `(', ', ': ')`.
     public func serialize(pretty: Bool) throws -> String {
         var out = ""
         try encode(into: &out, pretty: pretty, indentLevel: 0, path: "")
         return out
     }
 
-    /// UTF-8 byte form of `serialize`.
     public func serializedData(pretty: Bool) throws -> Data {
         try Data(serialize(pretty: pretty).utf8)
     }
@@ -264,10 +242,7 @@ extension JSONValue {
             out += "]"
         case .object(let dict):
             if dict.isEmpty { out += "{}"; return }
-            // Sort keys by UTF-8 byte order to match Python's json.dumps(sort_keys=True)
-            // (Python sorts by Unicode code point, which equals UTF-8 byte order).
-            // Swift's default String.sorted() uses NFC + locale-aware comparison
-            // which diverges from Python on non-ASCII keys.
+            // UTF-8 order matches Python's Unicode code-point key order; Swift's normalized comparison diverges for non-ASCII keys.
             let keys = dict.keys.sorted { lhs, rhs in
                 lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
             }
@@ -286,15 +261,10 @@ extension JSONValue {
         }
     }
 
-    /// Match Python `json.encoder.py_encode_basestring_ascii`: shortest control
-    /// escapes for \b \t \n \f \r, \" and \\ for quote/backslash, \u00XX for
-    /// other C0 controls and DEL, \uXXXX for non-ASCII (surrogate pairs >0xFFFF).
-    /// Forward slash is NOT escaped.
+    /// Match Python `json.encoder.py_encode_basestring_ascii`: shortest control escapes for \b \t \n \f \r, \" and \\ for quote/backslash, \u00XX for other C0
+    /// controls and DEL, \uXXXX for non-ASCII (surrogate pairs >0xFFFF). Forward slash is NOT escaped.
     package static func encodeString(_ s: String, into out: inout String) {
-        // Do not derive reserve capacity from `out.count` here. String.count
-        // walks the entire accumulated Unicode output, so doing it once per
-        // JSON string makes a large projection quadratic. Swift's String
-        // storage already grows amortized while we append.
+        // String.count scans Unicode output; reserving per string would make large projections quadratic.
         out.append("\"")
         for scalar in s.unicodeScalars {
             let v = scalar.value
@@ -314,7 +284,6 @@ extension JSONValue {
                 } else if v <= 0xFFFF {
                     out += String(format: "\\u%04x", v)
                 } else {
-                    // Surrogate pair
                     let adjusted = v - 0x10000
                     let hi = 0xD800 + (adjusted >> 10)
                     let lo = 0xDC00 + (adjusted & 0x3FF)
@@ -328,17 +297,7 @@ extension JSONValue {
 
 // MARK: - Codable
 
-/// JSONValue ↔ Codable so it can ride inside other Codable wire structs.
-/// Round-trip preserves shape; numeric tags follow the same Int vs Double
-/// policy as `parse(_:)`.
-///
-/// IMPORTANT: This Codable conformance is for SHAPE-ONLY use (composing
-/// JSONValue inside other Codable structs).
-/// It does NOT produce bytes that match `serializedData(pretty:)`. Any
-/// byte-sensitive write path (registry.json, persona docs, replay
-/// captures) MUST use `serializedData(pretty:)` directly to match Python's
-/// `json.dumps(indent=2, sort_keys=True)` output exactly. Treating Codable
-/// output as canonical will break replay validators on downstream subsystems.
+/// Codable preserves shape, not canonical bytes; byte-sensitive writes must use serializedData to match Python exactly.
 extension JSONValue: Codable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
@@ -376,9 +335,7 @@ extension JSONValue {
         public init(description: String) { self.description = description }
     }
 
-    /// THE ONE SHAPE CHECK for a document a store reads or is handed: every
-    /// field `T` has, and none it lacks, so a misspelt field never silently
-    /// drops. The error names the field.
+    /// Check every named field so misspellings cannot silently disappear during decoding.
     public func decodedExactly<T: Codable>(as _: T.Type) throws -> T {
         let value: T
         do { value = try JSONDecoder().decode(T.self, from: serializedData(pretty: false)) }
@@ -389,11 +346,7 @@ extension JSONValue {
         return value
     }
 
-    /// The first field `given` names that the value it decoded to does not
-    /// have: one the decoder skipped. A field is the value's when the value
-    /// encodes it, or when it is one of the value's own optional properties
-    /// left nil, so a null is checked by name like any other value
-    /// (`colour: null` is refused; a nil optional's `null` is not).
+    /// Nil optional properties still own their field names; reject skipped unknown fields even when their supplied value is null.
     private static func unknownField(_ given: JSONValue, _ decoded: JSONValue, _ value: Any?, path: String = "") -> String? {
         switch (given, decoded) {
         case (.object(let fields), _):
@@ -433,7 +386,6 @@ extension JSONValue {
         return mirror.displayStyle == .optional && mirror.children.isEmpty
     }
 
-    /// A decoding failure as the field it names, so the fix is plain.
     public static func describe(_ error: Error) -> String {
         guard let error = error as? DecodingError else { return error.localizedDescription }
         func path(_ context: DecodingError.Context, _ key: CodingKey? = nil) -> String {
@@ -447,14 +399,12 @@ extension JSONValue {
         }
     }
 
-    /// The first 8 bytes of the compact form's SHA-256, as hex.
     public var digest: String {
         get throws {
             SHA256.hash(data: try serializedData(pretty: false)).prefix(8).map { String(format: "%02x", $0) }.joined()
         }
     }
 
-    /// The dotted fields whose values differ, for a write's receipt.
     public static func differences(_ old: JSONValue, _ new: JSONValue, path: String = "") -> [String] {
         guard case .object(let before) = old, case .object(let after) = new else { return old == new ? [] : [String(path.dropLast())] }
         return Set(before.keys).union(after.keys).sorted().flatMap { differences(before[$0] ?? .null, after[$0] ?? .null, path: path + $0 + ".") }

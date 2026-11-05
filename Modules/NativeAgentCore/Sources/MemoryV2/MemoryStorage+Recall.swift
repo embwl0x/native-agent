@@ -3,7 +3,7 @@ import GRDB
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Recall.swift` | `MemoryStorage`: `invalidateRecallCache`, shared `rankedRecall` scoring and bounded `recall` deduplication, canonical recall-generation cache |
+// Blueprint: | `MemoryStorage+Recall.swift` | `MemoryStorage`, `invalidateRecallCache`, `rankedRecall`, `recall` |
 
 extension MemoryStorage {
     struct RecallCandidate: Sendable {
@@ -37,10 +37,8 @@ extension MemoryStorage {
         recallRead.write { recallCache = nil }
     }
 
-    /// Reuse decoded vectors and lexical documents while the canonical corpus
-    /// generation is unchanged. Read its epoch and generation together before
-    /// candidates: a racing write can only cause a later miss,
-    /// never label an older candidate snapshot with a newer generation.
+    /// Cache by canonical corpus generation, reading epoch and generation before candidates; a racing write may cause a miss but cannot relabel an old
+    /// snapshot.
     func recallCandidates(
         queryEpoch: MemoryEmbeddingEpoch?
     ) async throws -> [RecallCandidate] {
@@ -60,8 +58,7 @@ extension MemoryStorage {
                cache.embeddingEpoch == activeEpoch {
                 return cache
             }
-            // One rowid-ordered query preserves equal-score tie-breaking, dedup
-            // preference, and BM25 document indices across query-planner choices.
+            // One rowid-ordered query preserves equal-score tie-breaking, dedup preference, and BM25 document indices across query-planner choices.
             let candidates = try await dbPool.read { db -> [RecallCandidate] in
                 var sql = """
                     SELECT * FROM memories
@@ -136,8 +133,7 @@ extension MemoryStorage {
             let lexicalBoost = (idx < lexicalScores.count)
                 ? lexicalWeight * lexicalScores[idx]
                 : 0
-            // Recency may break near-ties, never erase semantic relevance.
-            // Exempt kinds and legacy nil-kind records retain factor 1.0.
+            // Recency only breaks near-ties; kinds without decay retain full relevance.
             let decay = MemoryRecallScoring.recallRecencyFactor(
                 kind: MemoryRecallScoring.kind(of: m.metadata),
                 updatedAt: m.updatedAt,
@@ -161,9 +157,7 @@ extension MemoryStorage {
         let cappedLimit = max(0, limit)
         guard cappedLimit > 0 else { return [] }
         var seen: [String: [MemoryDisclosureClassification?]] = [:]
-        // One pass with an early stop: `seen` makes this predicate stateful,
-        // so it must never run twice over the same rows (a lazy filter's
-        // `prefix` walks it once for `count` and again to copy).
+        // Run stateful deduplication once with early stop; lazy prefix can traverse twice and lose rows through `seen`.
         var out: [(memory: StoredMemory, similarity: Double)] = []
         for candidate in scored {
             let key = comparisonKey(candidate.0.content, mode: .recall)

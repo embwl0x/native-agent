@@ -6,8 +6,7 @@ import UIKit
 // MARK: - Cards
 
 extension View {
-    /// The one card surface: a fill, a top light and a rim. Content layer, so
-    /// never glass; the haze behind is what makes it read as glass.
+    /// Content cards use fill, never glass; the room haze supplies their translucency.
     func aliveCard(radius: CGFloat = AliveMetrics.cardRadius) -> some View {
         modifier(AliveCardSurface(radius: radius))
     }
@@ -39,7 +38,6 @@ private struct AliveCardSurface: ViewModifier {
     }
 }
 
-/// ONE card holding rows; put an `AliveDivider()` between them.
 struct AliveCard<Content: View>: View {
     @ViewBuilder var content: Content
     @Environment(\.aliveInList) private var inList
@@ -56,7 +54,7 @@ struct AliveCard<Content: View>: View {
 }
 
 extension View {
-    /// A row inside an AliveCard: the card's inset, no chrome of its own.
+    /// Rows inherit the card's inset and must not add chrome.
     func aliveRow() -> some View { modifier(AliveRowInset()) }
 }
 
@@ -71,7 +69,7 @@ private struct AliveRowInset: ViewModifier {
     }
 }
 
-/// Between rows of a card; a List draws its own separators.
+/// Lists own separators; add AliveDivider only between standalone card rows.
 struct AliveDivider: View {
     @Environment(\.aliveInList) private var inList
 
@@ -84,8 +82,7 @@ struct AliveDivider: View {
     }
 }
 
-/// The card for what waits on you: the kit's card, lit from the top with the
-/// haze. Waiting on you is the haze colour's one job.
+/// Reserve the haze highlight for cards waiting on the user.
 struct AliveWaitingCard<Content: View>: View {
     @ViewBuilder var content: Content
     @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
@@ -107,7 +104,6 @@ struct AliveWaitingCard<Content: View>: View {
 
 // MARK: - Sections and rows
 
-/// Section label: small caps in full secondary (the Mac's AliveEyebrow).
 struct AliveEyebrow: View {
     let title: String
     init(_ title: String) { self.title = title }
@@ -123,8 +119,6 @@ struct AliveEyebrow: View {
     }
 }
 
-/// An eyebrow, what it labels (one card of rows by default), and an optional
-/// quiet line under it.
 struct AliveSection<Trailing: View, Content: View>: View {
     enum Surface { case card, waiting, none }
     let title: String?
@@ -198,7 +192,6 @@ extension AliveSection where Trailing == EmptyView {
     }
 }
 
-/// A quiet line under a card.
 struct AliveFootnote: View {
     let text: String
     var systemImage: String?
@@ -218,8 +211,6 @@ struct AliveFootnote: View {
     }
 }
 
-/// The one row: a name, its detail in secondary text, and an optional
-/// trailing control (an `AliveChevron` makes it a link row).
 struct AliveRow<Trailing: View>: View {
     let title: String
     var detail: String?
@@ -264,7 +255,6 @@ extension AliveRow where Trailing == EmptyView {
     }
 }
 
-/// A label on the left, its value in secondary text on the right.
 struct AliveValueRow: View {
     let label: String
     let value: String
@@ -286,7 +276,6 @@ struct AliveValueRow: View {
     }
 }
 
-/// A quiet sentence inside a card.
 struct AliveNote: View {
     let text: String
     init(_ text: String) { self.text = text }
@@ -300,7 +289,6 @@ struct AliveNote: View {
     }
 }
 
-/// A row that does something: its words in the haze, the one tinted control.
 struct AliveTapRow: View {
     let title: String
     let action: () -> Void
@@ -333,10 +321,9 @@ struct AliveChevron: View {
     }
 }
 
-/// Rows carry no chrome; a press shows a soft inset wash.
+/// Rows carry no chrome; presses add only a soft inset wash.
 extension View {
-    /// A row's press: in a List the cell's own native highlight; elsewhere a
-    /// soft inset wash.
+    /// Use native List highlighting inside a List; standalone rows need the inset wash.
     func aliveRowButtonStyle() -> some View { modifier(AliveRowPress()) }
 }
 

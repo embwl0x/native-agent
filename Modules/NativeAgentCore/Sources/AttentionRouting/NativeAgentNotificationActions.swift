@@ -1,5 +1,6 @@
 import Foundation
 import ChatTurnContracts
+import NativeAgentCore
 // Blueprint: | `NativeAgentNotificationActions.swift` | `NativeAgentNotificationActions` |
 
 public enum NativeAgentNotificationActions {
@@ -12,8 +13,8 @@ public enum NativeAgentNotificationActions {
     public static let sessionKey = "chatSessionId"
     public static let newConversationKey = "newNotificationConversation"
 
-    public static var messageRoute: [String: String] {
-        ChatToolSessionContext.verifiedSessionId.map { [sessionKey: $0] }
+    public static func messageRoute(turn: Turn?) -> [String: String] {
+        turn?.verifiedSessionID.map { [sessionKey: $0] }
             ?? [newConversationKey: "true"]
     }
 

@@ -36,7 +36,7 @@ extension MemoryStorage {
                     ? String(reason.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces) : "")
                 if marker == nil, !successor.isEmpty {
                     metadata["supersededBy"] = .string(successor)
-                    // Preserve the ordering key while repairing historical rows.
+                    // Preserve ordering keys during row repair.
                     metadata["supersededAt"] = .string(raw["repair_stamp"])
                     metadata["supersededByRecovery"] = .string("launch-repair")
                 }
@@ -59,10 +59,7 @@ extension MemoryStorage {
 
     // MARK: - Proposals
 
-    /// Retain recent review history, today's quota evidence and every proposal
-    /// referenced by retained rows or memories. Denial lives in tombstones,
-    /// which this bound never changes. Historical supersession repairs must
-    /// finish before their evidence can be forgotten.
+    /// Bound review history without discarding quota evidence, retained references or unfinished supersession repairs; denial remains in tombstones.
     static func pruneTerminalProposals(in db: Database, at now: Date = Date()) throws {
         let terminalCount = try Int.fetchOne(db, sql: """
             SELECT COUNT(*) FROM proposals WHERE status IN ('accepted', 'rejected', 'merged', 'superseded')
@@ -127,26 +124,21 @@ extension MemoryStorage {
     }
 
     @discardableResult
-    /// Match, merge and insert pending proposals under one write lock to preserve concurrent evidence.
-    ///
-    /// `foldedKey` is the caller's normalisation (article folding + content
-    /// hash); `merge` receives the row found under the lock and returns the
-    /// metadata to store on it. With `insertIfAbsent` false, no match means no
-    /// write and a nil result — that lets the caller skip embedding work it
-    /// only needs on the insert path.
+    /// Match, merge and insert under one write lock to preserve concurrent evidence. `foldedKey` is caller normalization; disabling insertion returns nil on a
+    /// miss so callers need not embed.
     public func stagePendingProposal(
         _ proposal: StoredProposal,
         insertIfAbsent: Bool,
         foldedKey: @Sendable (String) -> String,
-        merge: @Sendable (StoredProposal) throws -> JSONValue?
+        merge: @Sendable (StoredProposal) throws -> JSONValue?,
+        context: MemoryWriteContext
     ) async throws -> StoredProposal? {
         var stamped = proposal
-        stamped.metadata = MemoryDataProvenance.stamping(try MemorySenseProvenance.stamping(stamped.metadata))
+        stamped.metadata = try context.stamping(stamped.metadata)
         let proposal = stamped
         return try await dbPool.write { db -> StoredProposal? in
             let key = foldedKey(proposal.content)
-            // staged_at DESC matches `listProposals(status:)`, whose order this
-            // path's `.first(where:)` used to depend on.
+            // Match listProposals' newest-first order for deterministic duplicate choice.
             let pending = try Row.fetchAll(
                 db,
                 sql: "SELECT * FROM proposals WHERE status = 'pending' ORDER BY staged_at DESC"
@@ -198,12 +190,11 @@ extension MemoryStorage {
 
     public func acceptProposal(
         id: String,
-        superseding: SupersedingAcceptance? = nil
+        superseding: SupersedingAcceptance? = nil,
+        context: MemoryWriteContext
     ) async throws -> StoredMemory {
-        let turnProvenance = try MemorySenseProvenance.stamping(nil)
-        // The semantic-gate rejection must COMMIT, so the write closure returns
-        // an outcome instead of throwing mid-transaction (a throw inside
-        // dbPool.write rolls back everything — including the rejection row).
+        let turnProvenance = try MemorySenseProvenance.stamping(nil, reads: context.senseReads)
+        // Return semantic refusal as an outcome so it commits; throwing inside the transaction would erase the refusal.
         enum AcceptOutcome {
             case accepted(StoredMemory, evicted: [StoredMemory], demoted: [StoredMemory])
             case tombstoned
@@ -223,9 +214,7 @@ extension MemoryStorage {
                 metadata.merge(provenance) { _, incoming in incoming }
                 proposal.metadata = .object(metadata)
             }
-            // Recheck the exact denylist inside the admission transaction.
-            // A tombstone can arrive after the caller's earlier check, and
-            // embeddingless legacy claims cannot rely on the semantic gate.
+            // Recheck exact tombstones inside admission: a denylist write may race the caller, and vectorless claims have no semantic gate.
             let exactTombstone = try Int.fetchOne(
                 db, sql: "SELECT COUNT(*) FROM tombstones WHERE content_hash = ?",
                 arguments: [Self.contentHash(proposal.content)]
@@ -297,15 +286,13 @@ extension MemoryStorage {
                 validTo: proposalMeta["valid_to"]?.stringValue,
                 observedAt: proposalMeta["observed_at"]?.stringValue,
                 evidence: proposalMeta["evidence"],
-                // Promotion preserves supplied kinds and defaults missing kinds to "general" (no decay or supersession).
-                // Keep the writer's named date as supplied in the proposal.
+                // Preserve supplied kinds and writer-named dates; absent kind stays general without decay or supersession.
                 metadata: MemoryKindStamp.stampingDefaultKind(proposal.metadata)
             )
             try Self.validateTemporalEvidence(mem)
             try Self.recordProposedCorrection(proposal, on: proposal.id, in: db)
             try Self.executeMemoryInsert(mem, in: db, recordCorrection: false)
-            // Pending merges keep every incoming origin. Acceptance transfers
-            // that full evidence, not recurrence_count or the latest metadata.
+            // Pending merges keep every incoming origin. Acceptance transfers that full evidence, not recurrence_count or the latest metadata.
             try db.execute(sql: """
                 INSERT INTO correction_occurrences (memory_id, origin_id, at, occurred_at, session_id, history)
                 SELECT ?, origin_id, at, occurred_at, session_id, history
@@ -316,10 +303,7 @@ extension MemoryStorage {
             try db.execute(sql: """
                 UPDATE proposals SET status = 'accepted', resolved_at = ? WHERE id = ?
             """, arguments: [now, id])
-            // The replacement half of a memory-manager `update`: one
-            // transaction, so the new memory and the demotion of the one it
-            // replaces either both land or neither does. A throw here rolls the
-            // acceptance back and the proposal stays pending.
+            // Insert the replacement and demote its exact target in one transaction; refusal leaves the proposal pending.
             var demoted: [StoredMemory] = []
             if let superseding {
                 demoted.append(try Self.demoteSuperseded(superseding, by: mem, in: db))
@@ -340,7 +324,9 @@ extension MemoryStorage {
         }
         switch outcome {
         case .tombstoned:
-            throw MemoryV2Error.forgottenContent("Proposal content matches a forgotten or rejected memory; the proposal was marked rejected. Proposal id: \(id)", effects: .occurred)
+            throw MemoryV2Error.forgottenContent("""
+                Proposal content matches a forgotten or rejected memory; the proposal was marked rejected. Proposal id: \(id)
+                """, effects: .occurred)
         case .accepted(let result, let evicted, let demoted):
             invalidateRecallCache()
             pokeUserMDRegen(persona: result.personaId)
@@ -354,12 +340,8 @@ extension MemoryStorage {
         }
     }
 
-    /// Demote the memory an accepted update replaces, inside the acceptance
-    /// transaction. The one replacement lineage write — lifecycle
-    /// 'corrected', queryable corrected_by/at plus history, DEMOTION not
-    /// erasure — with one addition: the row must still hash to what it hashed
-    /// to when the proposal was staged. If it has changed, or is gone, or is
-    /// already terminal, this throws and the whole acceptance rolls back.
+    /// Demote only the fingerprint reviewed at staging, retaining corrected lineage and history. Changed, missing or terminal targets refuse the whole
+    /// acceptance.
     static func demoteSuperseded(
         _ superseding: SupersedingAcceptance,
         by replacement: StoredMemory,
@@ -441,7 +423,6 @@ extension MemoryStorage {
         }
     }
 
-    /// Fetch a proposal directly by id.
     public func getProposal(id: String) async throws -> StoredProposal? {
         try await dbPool.read { db in
             try Row.fetchOne(
@@ -452,8 +433,7 @@ extension MemoryStorage {
         }
     }
 
-    /// Rewrite pending or superseded metadata; superseded rows need successor links for their audit trail.
-    /// Accepted, rejected, merged and missing rows return nil without a write.
+    /// Only pending or superseded rows permit metadata repair; preserve successor audit links without mutating terminal rows.
     @discardableResult
     public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> StoredProposal? {
         try await dbPool.write { db in

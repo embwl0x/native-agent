@@ -1,19 +1,13 @@
 import Foundation
-// Blueprint: | `Keyring.swift` | `Keyring` enum: the one keyring's storage — a secret by their name in one Keychain service with the hosts and programs the person granted it for, its renewal and when it was granted; `kept`, every entry by name; `{{secret:<name>}}` names; a program grant is the executable's path and code identity; no network |
+// Blueprint: | `Keyring.swift` | `Keyring`, `kept`, `{{secret:<name>}}`; Secret storage and grant identity only. |
 
-/// The one keyring (docs/AGENT_IS_THE_APP.md, "Reach"): where every secret
-/// her abilities reach with is kept, under the name she gave it, in this
-/// Mac's Keychain under one service, with where the person granted it to go.
-/// Storage and names only: granting, signing in and renewing belong to
-/// ProviderRouting's OAuth owner, inserting and redacting to the broker.
+/// Keep named secrets and their granted destinations in one Keychain service; OAuth owns renewal, the broker owns use/redaction.
 public enum Keyring {
     static let service = "NativeAgent.keyring"
     private static let placeholder = try! NSRegularExpression(pattern: "\\{\\{secret:([^{}]*)\\}\\}")
     private static let lock = NSLock()
 
-    /// A signed-in secret's value expires; its token endpoint renews it, the
-    /// client authenticating as it did at sign-in (`clientAuth` "basic" for
-    /// HTTP Basic, else in the body).
+    /// Renewal must authenticate like sign-in: clientAuth basic uses HTTP Basic, otherwise credentials stay in the body.
     public struct Renewal: Codable, Sendable, Equatable {
         public var token: String
         public var clientID: String
@@ -28,17 +22,14 @@ public enum Keyring {
         }
     }
 
-    /// A program a secret may be handed to: the executable's path and its
-    /// code identity when the person granted it.
+    /// Bind program grants to executable path and code identity at the time of consent.
     public struct Program: Codable, Sendable, Hashable {
         public var path: String
         public var identity: String
         public init(path: String, identity: String) { self.path = path; self.identity = identity }
     }
 
-    /// One kept secret: the value, the hosts it may be carried to, the
-    /// programs it may be handed to, its renewal, when it was granted, and
-    /// the account a sign-in granted it for (not secret: she may read it).
+    /// Account identity is readable metadata; the secret value remains restricted to granted hosts and programs.
     public struct Entry: Codable, Sendable, Equatable {
         public var value: String
         public var hosts: [String]
@@ -57,10 +48,7 @@ public enum Keyring {
         }
     }
 
-    /// A host as a grant keeps it and a destination is checked against it:
-    /// a DNS name lowercased, or an IPv6 literal (brackets optional) in its
-    /// one short form; nil for anything else, a scoped literal (`%en0`)
-    /// included: the system folds its interface into the address.
+    /// Canonicalize hosts for grant comparison; reject scoped IPv6 literals because the system folds interface into address.
     public static func host(_ text: String) -> String? {
         let text = text.lowercased()
         let bare = text.hasPrefix("[") && text.hasSuffix("]") ? String(text.dropFirst().dropLast()) : text
@@ -69,7 +57,6 @@ public enum Keyring {
         return text.range(of: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$", options: .regularExpression) != nil ? text : nil
     }
 
-    /// Every name a value's strings write as `{{secret:<name>}}`, in order.
     public static func names(in value: JSONValue) -> [String] {
         var names: [String] = []
         _ = value.mapStrings { text in
@@ -88,7 +75,6 @@ public enum Keyring {
         return try JSONDecoder().decode(Entry.self, from: data)
     }
 
-    /// Every kept secret by name: what the Connectors page lists.
     public static func kept() throws -> [(name: String, entry: Entry)] {
         try DeviceSecretKeychain.accounts(service: service).sorted().compactMap { name in try entry(name).map { (name, $0) } }
     }
@@ -113,7 +99,7 @@ public enum Keyring {
         changed()
     }
 
-    /// Every open list of the keyring rereads it, whichever window granted, renewed or removed.
+    /// Reread on every open so grants, renewal and removal from other windows stay visible.
     private static func changed() {
         StoreChangeBus.shared.emit(StoreChange(store: .keyring, path: URL(string: "keychain:" + service)!))
     }

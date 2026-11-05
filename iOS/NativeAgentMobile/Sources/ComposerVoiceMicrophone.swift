@@ -1,6 +1,6 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `ComposerVoiceMicrophone.swift` | One mic gesture: tap dictation, hold/release voice note, slide cancel or lock; accessible record and lock actions |
+// Blueprint: | `ComposerVoiceMicrophone.swift` | Mic gestures and accessible dictation, voice-note recording, cancel and lock |
 
 struct ComposerVoiceMicrophone: View {
     let input: VoiceInputController
@@ -36,7 +36,7 @@ struct ComposerVoiceMicrophone: View {
         } else { begin(false) }
     }
 
-    // Split from `body` so the type checker sees two short chains (10-31: one chain timed out).
+    // Split the view so the type checker handles two short modifier chains.
     private var gestured: some View {
         Image(systemName: input.isLocked ? "lock.fill" : "mic.fill")
             .font(.system(size: 18))
@@ -48,7 +48,6 @@ struct ComposerVoiceMicrophone: View {
                     if !pressed {
                         pressed = true; held = false; cancelled = false; lockRequested = false
                         gestureCanRecord = !(input.isListening || input.isStarting)
-                        // An active tap-dictation session still ends with a tap.
                         if input.isListening || input.isStarting { return }
                         holdTask = Task { @MainActor in
                             do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
@@ -57,8 +56,7 @@ struct ComposerVoiceMicrophone: View {
                             begin(true)
                         }
                     }
-                    // Movement during the hold delay is intent too. A still
-                    // finger after that movement must not turn cancel into send.
+                    // Movement during the hold delay is intent; a subsequently still finger must not turn cancellation into send.
                     guard gestureCanRecord, !cancelled, !lockRequested else { return }
                     if value.translation.width < -70 {
                         cancelled = true; cancel()

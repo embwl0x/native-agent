@@ -4,7 +4,7 @@ import CryptoKit
 import AppIntents
 import SwiftUI
 import Observation
-// Blueprint: | `iCloudSyncEngine+Transcripts.swift` | PublishedTranscript projection, generation-ordered reconciliation and history adoption; retained local rows, compatible fuller text and non-image attachment bytes share one owner |
+// Blueprint: | `iCloudSyncEngine+Transcripts.swift` | Version-ordered transcript/history reconciliation; retained fuller text and attachment bytes |
 
 extension iCloudSyncEngine {
     /// Rows and their Mac transcript version publish together, including version-only empty updates.
@@ -16,13 +16,11 @@ extension iCloudSyncEngine {
         /// The Mac increments this on every clear/write; nil means an empty transcript cannot clear local rows.
         var generation: Int?
         var hasOlder = false
-        /// Mac history beyond the published window.
         var historyIDs: Set<UUID> = []
         var readError: String? = nil
     }
 
-    /// Transcript versions and row/run identity own reconciliation for every reader.
-    /// Unfinished handoffs remain separate durable requests; settled rows are not cached.
+    /// Versions and row/run IDs own reconciliation; unfinished handoffs remain durable requests rather than settled-row caches.
     func adoptChatTranscripts(_ incoming: [String: PublishedTranscript], completeSnapshot: Bool = true) {
         for (session, var published) in incoming {
             if let failure = published.readError {
@@ -66,8 +64,7 @@ extension iCloudSyncEngine {
                 let history = published.messages.isEmpty || !overlaps ? [] : current.messages.filter {
                     current.historyIDs.contains($0.id) && !canonicalIDs.contains($0.id)
                 }
-                // Matched full text survives compatible truncation regardless of history membership.
-                // Phone-local non-image bytes carry over; Mac previews own images.
+                // Keep compatible full text despite snapshot truncation; retain phone-local non-image bytes while Mac previews own images.
                 let truncationSuffix = "\n" + ChatStore.snapshotTruncationMarker
                 var firstIdentity: [[String]: Int] = [:]
                 for (index, row) in current.messages.enumerated().reversed() {
@@ -125,9 +122,10 @@ extension iCloudSyncEngine {
             for row in rows {
                 let clean = row.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !clean.isEmpty else { continue }
+                let records = row.messages.map(ChatMessageRecord.canonical)
                 do { out[clean] = PublishedTranscript(
-                    records: row.messages,
-                    messages: try ChatMessage.projectChatRecords(row.messages),
+                    records: records,
+                    messages: try ChatMessage.projectChatRecords(records),
                     otherRooms: row.otherRooms ?? [],
                     generation: row.transcriptGeneration,
                     hasOlder: row.hasOlder ?? false,
@@ -142,8 +140,6 @@ extension iCloudSyncEngine {
         }.value
     }
 
-    /// Saved rows the transcript snapshot leaves out: older history before
-    /// `beforeID`, or one whole message through `throughID`.
     func chatHistoryPage(sessionID: String, beforeID: String? = nil, throughID: String? = nil,
                          limit: Int = 80) async throws -> (messages: [ChatMessage], hasOlder: Bool) {
         let lifecycle = lifecycleGeneration
@@ -154,7 +150,7 @@ extension iCloudSyncEngine {
             .make(action: "chat_history_page", payload: payload)))
         guard let raw = result["messages"] else { throw SyncError.persistence("The Mac did not return the messages.") }
         let (records, messages) = try await Task.detached(priority: .userInitiated) {
-            let records = try JSONDecoder().decode([ChatMessageRecord].self, from: Data(raw.utf8))
+            let records = try JSONDecoder().decode([ChatMessageRecord].self, from: Data(raw.utf8)).map(ChatMessageRecord.canonical)
             return (records, try ChatMessage.projectChatRecords(records))
         }.value
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
@@ -184,4 +180,26 @@ extension iCloudSyncEngine {
         return (messages, result["hasOlder"] == "true")
     }
 
+}
+
+extension ChatMessageRecord {
+    /// The row with its embedded JSON in one spelling (keys sorted), so a snapshot that says the same thing compares equal and an
+    /// unchanged conversation is never adopted, redrawn or moved because the Mac wrote a key in another order.
+    nonisolated static func canonical(_ record: ChatMessageRecord) -> ChatMessageRecord {
+        var record = record
+        record.interactionJSON = canonicalJSON(record.interactionJSON)
+        record.interactionDescriptorJSON = canonicalJSON(record.interactionDescriptorJSON)
+        if var metadata = record.metadata {
+            metadata.inputJSON = canonicalJSON(metadata.inputJSON)
+            record.metadata = metadata
+        }
+        return record
+    }
+
+    private nonisolated static func canonicalJSON(_ text: String?) -> String? {
+        guard let text, let object = try? JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed]),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes])
+        else { return text }
+        return String(decoding: data, as: UTF8.self)
+    }
 }

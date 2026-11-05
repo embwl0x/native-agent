@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ICloudSyncStatePaths.swift` | `ICloudSyncStatePaths` and bridge health reader: local sync bookkeeping paths and read-only live bridge health, without probing or sync authority |
+// Blueprint: | `ICloudSyncStatePaths.swift` | `ICloudSyncStatePaths`; Local bookkeeping and read-only bridge health. |
 
 /// Read-only view of the running bridge. No probing, persisted mirror, or sync authority.
 public struct ICloudBridgeHealthSnapshot: Sendable {
@@ -43,16 +43,8 @@ public enum ICloudBridgeHealthReader {
     }
 }
 
-/// Canonical LOCAL paths for the Mac↔iOS sync engine's own bookkeeping.
-///
-/// These live under `<dataRoot>/icloud/` — deliberately on local disk, not in
-/// the iCloud container. The failures they exist to survive (disk full, iCloud
-/// permission denial, file-provider hiccup) are exactly the ones that make the
-/// iCloud container unwritable, so a marker written there would be lost by the
-/// same fault it is meant to record.
-///
-/// DeviceSync's dependency-free state target lets `MacSyncEngine` and
-/// `DoctorChecks` share these paths without a runtime dependency cycle.
+/// Keep bookkeeping local so iCloud faults cannot erase the evidence needed to repair them. A dependency-free state target lets sync and Doctor share paths
+/// without a runtime cycle.
 public enum ICloudSyncStatePaths {
     public static func stateDirectory(dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent("icloud", isDirectory: true)
@@ -63,23 +55,17 @@ public enum ICloudSyncStatePaths {
         stateDirectory(dataRoot: dataRoot).appendingPathComponent("account_failure.json")
     }
 
-    /// The processed-message-id window that stops a restart from re-dispatching
-    /// an already-executed iOS command.
+    /// Processed IDs prevent restart from redispatching an executed phone command.
     public static func processedIds(dataRoot: URL) -> URL {
         stateDirectory(dataRoot: dataRoot).appendingPathComponent("processed_ids.json")
     }
 
-    /// Where an UNREADABLE `processed_ids.json` is preserved before it is
-    /// replaced, so the evidence survives and Doctor can say the window was
-    /// lost rather than silently starting from an empty set.
+    /// Preserve damaged processed-ID bytes so Doctor can report the lost replay window.
     public static func processedIdsCorruptBackup(dataRoot: URL) -> URL {
         stateDirectory(dataRoot: dataRoot).appendingPathComponent("processed_ids.corrupt.json")
     }
 
-    /// Directory of `<msgId>.completed-unarchived` markers: iOS commands that
-    /// RAN and whose response landed, but whose completion could not be
-    /// recorded (processed-id save failed and/or the pending file could not be
-    /// archived). A marker is a durable "never dispatch this again".
+    /// Completion markers forbid redispatch when a response landed but processed-ID saving or archival failed.
     public static func completedUnarchivedDirectory(dataRoot: URL) -> URL {
         stateDirectory(dataRoot: dataRoot)
             .appendingPathComponent("completed-unarchived", isDirectory: true)
@@ -92,15 +78,12 @@ public enum ICloudSyncStatePaths {
             .appendingPathComponent("\(msgId).\(completedUnarchivedExtension)")
     }
 
-    /// Snapshot groups the last publish pass could not build, so Doctor can say
-    /// the phone is holding stale approvals/inbox/model-preferences rather than
-    /// current state. Rewritten every pass; absent means "nothing skipped".
+    /// Persist skipped-group reasons so Doctor can distinguish stale phone projections from current state.
     public static func snapshotSkips(dataRoot: URL) -> URL {
         stateDirectory(dataRoot: dataRoot).appendingPathComponent("snapshot_skips.json")
     }
 
-    /// Marker msgIds currently on disk. Missing directory = none, which is the
-    /// normal case and never an error.
+    /// A missing marker directory is normal absence, not a read failure.
     public static func completedUnarchivedMsgIds(dataRoot: URL) throws -> [String] {
         let dir = completedUnarchivedDirectory(dataRoot: dataRoot)
         let items: [URL]

@@ -3,7 +3,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `TelegramModelSelectionHandling.swift` | `TelegramModelSelectionCallback`: provider/model selection callback encoding, key validation and action parsing |
+// Blueprint: | `TelegramModelSelectionHandling.swift` | `TelegramModelSelectionCallback`: checked callback identities |
 
 public enum TelegramModelSelectionAction: Sendable, Equatable {
     case providers

@@ -1,5 +1,4 @@
 import NativeAgentShared
-// Diagnostics renders the engine’s retained Desk revision.
 
 import SwiftUI
 import Desk
@@ -28,7 +27,7 @@ struct DeskDebugPanels: View {
         .task { _ = await desk.loadBoard() }
     }
 
-    // MARK: agent's compact view (the projection she actually reads)
+    // MARK: agent's compact view (the projection the agent actually reads)
 
     private func agentViewDisclosure(_ board: DeskBoardRead) -> some View {
         DisclosureGroup(isExpanded: $showAgentView) {
@@ -52,7 +51,10 @@ struct DeskDebugPanels: View {
         DisclosureGroup(isExpanded: $showAllItems) {
             LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(board.items, id: \.handle) { item in
-                    Text("\(item.alias)  \(item.handle)  \(item.kind.rawValue)  \(item.status.rawValue)  \(item.origin.rawValue)  \(item.project)  —  \(item.title)")
+                    Text("""
+                        \(item.alias)  \(item.handle)  \(item.kind.rawValue)  \(item.status.rawValue)  \(item.origin.rawValue)  \(item.project)  —  \
+                        \(item.title)
+                        """)
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.tail)

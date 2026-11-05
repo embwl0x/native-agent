@@ -7,14 +7,13 @@ import CognitiveSubstrate
 import Context
 import ContextFlow
 import PersistenceCore
-import Procedures
 import PersonaEngine
 import NotificationInbox
 import Transcripts
-// Blueprint: | `ClaudeBridgeStateProjection.swift` | `ClaudeBridgeReadout` enum; `procedureStatusJSON`, `microcycleTelemetryJSON` |
+import Experiences
+// Blueprint: | `ClaudeBridgeStateProjection.swift` | Bridge state; recent notes read ForPerson's in-memory inbox and retain read failures |
 
-/// App-owned preferences and transport activity, plus the existing runtime owners.
-/// Core chooses state fields; the app encodes and writes the resulting payload.
+/// Core chooses state fields from existing runtime owners; the app only encodes and writes the projection.
 public protocol ClaudeBridgeStatePort: Sendable {
     var startedAt: Date { get }
     var preferredPersona: String? { get }
@@ -24,28 +23,7 @@ public protocol ClaudeBridgeStatePort: Sendable {
     func recentEventPayloads() -> [[String: Any]]
 }
 
-/// Semantic bridge state projection shared with the Core conversation owner.
 public enum ClaudeBridgeReadout {
-    static func procedureStatusJSON(_ status: ProcedureArtifactStatusSnapshot) -> [String: Any] {
-        [
-            "schema": "compiled.procedure.status.v1",
-            "artifacts": status.artifactCount,
-            "corruptArtifacts": status.corruptArtifactCount,
-            "corruptInvocations": status.corruptInvocationCount,
-            // What could not be read, named, so an empty count is never mistaken for none.
-            "unreadable": status.unreadable,
-            "invocations": status.invocationCount,
-            "verifiedInvocations": status.verifiedInvocationCount,
-            "lastInvocationStatus": status.lastInvocationStatus.map { $0.rawValue as Any }
-                ?? NSNull(),
-            // There is deliberately no automatic selection path. Local
-            // ApprovalInbox review plus an explicit manual invocation remain
-            // required even when an artifact exists.
-            "automaticSelectionEnabled": status.automaticSelectionEnabled,
-            "payloadFree": status.payloadFree,
-        ]
-    }
-
     static func microcycleTelemetryJSON(_ telemetry: CognitiveMicrocycleTelemetry) -> [String: Any] {
         return [
             "schema": "cognition.microcycle.telemetry.v1",
@@ -345,16 +323,12 @@ extension ClaudeBridgeReadout {
             readErrors.note(PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot), error.localizedDescription)
         }
         let (activeSessionId, _) = readBridgeActiveSession(dataRoot: dataRoot, preferred: { port.preferredSessionID }, errors: readErrors)
-        let recentInbox = readRecentInbox(dataRoot: dataRoot, limit: 10, errors: readErrors)
+        let recentInbox = await readRecentInbox(dataRoot: dataRoot, limit: 10, errors: readErrors)
 
         let uptime = Int(Date().timeIntervalSince(port.startedAt))
         let buildIdentity = NativeAgentBuildIdentity.current
 
-        // Phase 3b: recentToolCalls now wired from the bridge's own ring buffer.
-        // Surfaces the last N /claude/tool dispatches + /claude/message turns
-        // so Claude can see what the configured agent has just been doing
-        // having to subscribe to the SSE stream. The full live feed is at
-        // GET /claude/events.
+        // Expose recent bridge activity from its existing ring without requiring a live SSE subscription.
         let recentToolCallsJSON = port.recentEventPayloads()
 
         var payload: [String: Any] = [
@@ -365,9 +339,7 @@ extension ClaudeBridgeReadout {
             "chatReady": routing != nil && routing?.unusablePickNotice(for: "chat") == nil
                 && !(activeModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
                 && !(activeProvider?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
-            // Empty when every state file was readable OR legitimately absent.
-            // A non-empty row means a file exists but could not be read or
-            // decoded — the empty payload above is a failure, not "nothing yet".
+            // Empty read errors mean readable or legitimately absent files; unreadable state must remain a named failure.
             "readErrors": readErrors.messages,
             "recentInbox": recentInbox,
             "recentToolCalls": recentToolCallsJSON,
@@ -390,8 +362,6 @@ extension ClaudeBridgeReadout {
             "lastInjectedCapsule": Self.capsuleSummaryJSON(capsule),
             "microcycle": Self.microcycleTelemetryJSON(microcycle),
         ]
-        let procedureStatus = await ProcedureArtifactStore(dataRoot: dataRoot).statusSnapshot()
-        payload["compiledProcedure"] = Self.procedureStatusJSON(procedureStatus)
         return payload
     }
 
@@ -406,8 +376,7 @@ extension ClaudeBridgeReadout {
         ]
     }
 
-    /// Absent state stays silent; unreadable or undecodable state is published
-    /// in `/claude/state`'s `readErrors`.
+    /// Absent state stays silent; unreadable or undecodable state is published in `/claude/state`'s `readErrors`.
     final class BridgeReadErrors {
         private(set) var messages: [String] = []
         func note(_ url: URL, _ reason: String) {
@@ -462,27 +431,16 @@ extension ClaudeBridgeReadout {
         dataRoot: URL,
         limit: Int,
         errors: BridgeReadErrors? = nil
-    ) -> [[String: Any]] {
-        let url = LiveNotificationInbox.livePath(dataRoot: dataRoot)
-        let lines: [LiveNotificationInbox.Line]
-        do { lines = try LiveNotificationInbox.readLines(url) }
+    ) async -> [[String: Any]] {
+        let items: [InboxItemRecord]
+        do { items = try await ForPerson.at(dataRoot).inbox() }
         catch {
-            errors?.note(url, "read failed: \(error.localizedDescription)")
+            errors?.note(dataRoot, "inbox read failed: \(error.localizedDescription)")
             return []
         }
-        let selected = lines.filter { !$0.raw.isEmpty }.suffix(limit * 2)
-        let items: [[String: Any]] = selected.compactMap { line in
-            guard let obj = line.row?.objectValue else { return nil }
-            return ["id": obj["id"]?.foundationObject ?? NSNull(),
-                "kind": obj["source"]?.foundationObject ?? NSNull(),
-                "title": obj["title"]?.foundationObject ?? NSNull(),
-                "body": obj["summary"]?.foundationObject ?? NSNull(),
-                "createdAt": obj["created_at"]?.foundationObject ?? NSNull()]
+        return items.prefix(limit).map { item in
+            ["id": item.id, "kind": item.source, "title": item.title, "body": item.summary,
+             "createdAt": item.created_at, "status": item.status]
         }
-        let malformedLines = selected.count - items.count
-        if malformedLines > 0 {
-            errors?.note(url, "decode failed: \(malformedLines) undecodable JSONL line(s)")
-        }
-        return Array(items.suffix(limit))
     }
 }

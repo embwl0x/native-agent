@@ -1,10 +1,9 @@
 import Foundation
 import NativeAgentShared
 
-// Blueprint: | `TurnPresentation.swift` | `TurnPresentationReducer`: sanitized bounded turn lifecycle/activity projection; no tool arguments, payloads or hidden reasoning |
+// Blueprint: | `TurnPresentation.swift` | `TurnPresentationReducer`: bounded lifecycle evidence without payloads |
 
-/// Surface-neutral lifecycle phases for presenting one accepted agent turn.
-/// Raw values remain stable for existing persisted presentation adapters.
+/// Keep phase raw values stable for persisted presentation adapters.
 public enum TurnPresentationPhase: String, CaseIterable, Sendable, Codable, Equatable {
     case acknowledged
     case working
@@ -29,8 +28,7 @@ public enum TurnPresentationPhase: String, CaseIterable, Sendable, Codable, Equa
     }
 }
 
-/// Explicit lifecycle evidence supplied by a surface or turn orchestrator.
-/// Associated strings are redacted, normalized, and bounded before entering
+/// Explicit lifecycle evidence supplied by a surface or turn orchestrator. Associated strings are redacted, normalized, and bounded before entering
 /// ``TurnPresentationState``.
 public enum TurnPresentationLifecycleEvent: Sendable, Equatable {
     case acknowledged
@@ -47,12 +45,9 @@ public enum TurnPresentationLifecycleEvent: Sendable, Equatable {
     case outcomeUnknown(reason: String?)
 }
 
-/// One sanitized, bounded movement entry. It intentionally contains no tool
-/// arguments, provider payload, model output, hidden reasoning, or transport
-/// identity.
+/// One sanitized, bounded movement entry. It intentionally contains no tool arguments, provider payload, model output, hidden reasoning, or transport identity.
 public struct TurnPresentationActivity: Sendable, Equatable {
-    /// How a tool step ended, read from its own result. Nil for a step that
-    /// is not a settled tool result.
+    /// How a tool step ended, read from its own result. Nil for a step that is not a settled tool result.
     public enum Outcome: Sendable, Equatable {
         case ok
         case refused
@@ -80,8 +75,23 @@ public struct TurnPresentationActivity: Sendable, Equatable {
     }
 }
 
-/// Compact value-only state for presenting one accepted turn. The state owns
-/// no timer and performs no IO; callers supply event and observation instants.
+/// A call whose input is streaming: the name it shows and the input bytes written so far. Movement, never a step.
+public struct TurnCallWriting: Sendable, Equatable {
+    public let call: String
+    public let bytes: Int
+
+    public init(call: String, bytes: Int) {
+        self.call = call
+        self.bytes = bytes
+    }
+
+    /// Every door shows a writing call in these words.
+    public var line: String {
+        "Writing \(call) · \(ByteCountFormatter.string(fromByteCount: Int64(max(0, bytes)), countStyle: .file))"
+    }
+}
+
+/// Compact value-only state for presenting one accepted turn. The state owns no timer and performs no IO; callers supply event and observation instants.
 public struct TurnPresentationState: Sendable, Equatable {
     public internal(set) var phase: TurnPresentationPhase
     public internal(set) var startedAt: Date
@@ -91,11 +101,11 @@ public struct TurnPresentationState: Sendable, Equatable {
     public internal(set) var delegateName: String?
     public internal(set) var activities: [TurnPresentationActivity]
 
-    // Accumulated model text never enters presentation state. Its length is
-    // enough to coalesce duplicate streaming snapshots while observing real
-    // movement.
+    // Accumulated model text never enters presentation state. Its length is enough to coalesce duplicate streaming snapshots while observing real movement.
     public internal(set) var streamedTextLength: Int
     public internal(set) var firstReplyAt: Date? = nil
+    /// The call being written now; the next lifecycle step ends it.
+    public internal(set) var writing: TurnCallWriting? = nil
 
     public var isTerminal: Bool { phase.isTerminal }
 
@@ -111,9 +121,8 @@ public struct TurnPresentationState: Sendable, Equatable {
     }
 }
 
-/// The single authoritative pure lifecycle reducer shared by presentation
-/// surfaces. Surface adapters translate their transport/progress vocabulary
-/// into these lifecycle events and may supply one additional token redactor.
+/// The single authoritative pure lifecycle reducer shared by presentation surfaces. Surface adapters translate their transport/progress vocabulary into these
+/// lifecycle events and may supply one additional token redactor.
 public enum TurnPresentationReducer {
     public typealias AdditionalRedactor = @Sendable (String) -> String
 
@@ -189,8 +198,7 @@ public enum TurnPresentationReducer {
         )
     }
 
-    /// Records growing assistant output by length only. The text itself never
-    /// crosses the presentation boundary.
+    /// Records growing assistant output by length only. The text itself never crosses the presentation boundary.
     public static func recordStreamProgress(
         _ state: TurnPresentationState,
         accumulatedUTF16Length: Int,
@@ -207,9 +215,25 @@ public enum TurnPresentationReducer {
         )
     }
 
-    /// Records surface-normalized activity that carries an optional delegate.
-    /// This is the narrow adapter seam for progress vocabularies whose detail
-    /// does not originate as an explicit lifecycle event.
+    /// Every streamed byte is movement, words or not; a writing call names itself without becoming a step.
+    public static func recordMovement(
+        _ state: TurnPresentationState,
+        writing: TurnCallWriting?,
+        at instant: Date,
+        additionalRedactor: AdditionalRedactor? = nil
+    ) -> TurnPresentationState {
+        guard !state.isTerminal else { return state }
+        var next = state
+        next.lastMovementAt = max(instant, state.lastMovementAt)
+        // A streamed byte is the first evidence of work.
+        if next.phase == .acknowledged { next.phase = .working }
+        next.writing = writing.flatMap { call in
+            sanitized(call.call, additionalRedactor: additionalRedactor).map { TurnCallWriting(call: $0, bytes: call.bytes) }
+        }
+        return next
+    }
+
+    /// Surface adapters may report activity whose vocabulary does not originate in a lifecycle event.
     public static func recordActivity(
         _ state: TurnPresentationState,
         phase: TurnPresentationPhase,
@@ -250,9 +274,8 @@ public enum TurnPresentationReducer {
         return String(singleLine.prefix(textLimit - 1)) + "…"
     }
 
-    /// Derives a stalled presentation without mutating authoritative lifecycle
-    /// state. Waiting, blocked, explicit-stall, and terminal states do not age
-    /// into a different meaning.
+    /// Derives a stalled presentation without mutating authoritative lifecycle state. Waiting, blocked, explicit-stall, and terminal states do not age into a
+    /// different meaning.
     public static func effectivePhase(
         _ state: TurnPresentationState,
         secondsSinceMovement: TimeInterval,
@@ -292,7 +315,10 @@ public enum TurnPresentationReducer {
                 || safeAction != state.currentAction
                 || safeDelegate != state.delegateName
                 || nextTextLength != state.streamedTextLength else {
-            return state
+            // A step that changes nothing is no new step; it only ends the line of a call being written.
+            var next = state
+            next.writing = nil
+            return next
         }
 
         var next = state
@@ -303,6 +329,7 @@ public enum TurnPresentationReducer {
         next.currentAction = safeAction
         next.delegateName = safeDelegate
         next.streamedTextLength = nextTextLength
+        next.writing = nil
         if nextTextLength > 0, next.firstReplyAt == nil { next.firstReplyAt = movementAt }
         next.activities.append(TurnPresentationActivity(
             phase: phase,

@@ -3,27 +3,26 @@ import AttentionRouting
 import BackgroundLoops
 import ChatTurnRuntime
 import Cognition
-import NotificationInbox
+import Experiences
 import PersistenceCore
 import Desk
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `DeskNotifyRunner.swift` | `DeskNotifyRunner`: calls the desk-notify part through the scheduled owner's originating app door; revision-checked native preparation, quiet hours and exact-deadline scheduling; direct stamps and nag consumption follow channel acceptance or durable hold, leaving failed occurrences retryable; already-held deliveries retain their native release path even when a new proposal fails |
+// Blueprint: | `DeskNotifyRunner.swift` | Desk matters and nags; ForPerson changes arm the quiet-window end deadline, which releases owed doors |
 
 // The part proposes; this native owner commits bookkeeping and delivers.
 public struct DeskNotifyRunner: EventDeadlineLoopRunner {
     private let propose: @Sendable (JSONValue) async throws -> DeskNotificationProposal
     private let attention: AttentionRouter
-    public init(interval: TimeInterval, dataRoot: URL,
+    public init(dataRoot: URL,
                 attention: AttentionRouter,
                 propose: @escaping @Sendable (JSONValue) async throws -> DeskNotificationProposal) {
         self.propose = propose
-        self.interval = interval
         self.dataRoot = dataRoot
         self.attention = attention
     }
 
-    public let interval: TimeInterval
+    public var wake: OrganWake { .onChange }
     let dataRoot: URL
 
     public var loopId: String { "desk_notify" }
@@ -31,15 +30,23 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
 
     public func physiologyEvents() -> AsyncStream<Void> {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        // The inbox too: a knock held for quiet hours books their end.
-        return EventDeadlinePhysiology.storeAndFileEvents(
+        let events = EventDeadlinePhysiology.storeAndFileEvents(
             paths: [store.opsPath, store.basePath, DeskNagConfigStore(dataRoot: dataRoot).configPath,
                     dataRoot.appendingPathComponent("abilities/desk-notify.js"),
-                    LiveNotificationInbox.livePath(dataRoot: dataRoot), dataRoot.appendingPathComponent("user_prefs.json")],
+                    dataRoot.appendingPathComponent("user_prefs.json")],
             stores: [.desk],
             notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange],
             loopId: loopId
         )
+        let pair = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let files = Task {
+            for await _ in events { pair.continuation.yield(()) }
+        }
+        let matters = Task {
+            for await _ in await ForPerson.at(dataRoot).changes() { pair.continuation.yield(()) }
+        }
+        pair.continuation.onTermination = { _ in files.cancel(); matters.cancel() }
+        return pair.stream
     }
 
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
@@ -47,7 +54,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         do { held = try await AttentionRouter.hasHeld(dataRoot: dataRoot) }
         catch {
             nativeLog("desk_notify: held delivery source unavailable: \(error)")
-            return nil // File/store invalidation retries when the source changes.
+            return nil // The record's next change rearms the read.
         }
         let quietEnd: Date?
         do {
@@ -55,50 +62,54 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             quietEnd = window?.contains(hour: Calendar.current.component(.hour, from: now)) == true
                 ? window?.end(after: now) : nil
         } catch {
-            // The owner records repair owed; its watched preference event
-            // rearms scheduling. No guessed release deadline is booked.
+            // Repair events rearm scheduling; unreadable preferences cannot supply a guessed release deadline.
             return nil
         }
         do {
             let read = try await DeskNotificationRead.read(dataRoot: dataRoot, now: now)
             let proposal = try await propose(read.input)
             try read.validate(proposal)
-            let needsQuietEnd = held || read.config.enabled || proposal.notifications.contains(where: { $0.level != "urgent" })
-            return [proposal.deadline.map { Date(timeIntervalSince1970: $0) }, needsQuietEnd ? quietEnd : nil].compactMap { $0 }.min()
+            return [proposal.deadline.map { Date(timeIntervalSince1970: $0) }, held ? quietEnd : nil].compactMap { $0 }.min()
         } catch {
             nativeLog("desk_notify: deadline proposal failed: \(error)")
             await settle {
                 await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId,
-                    outcome: .failed(error: "Desk notification deadline unavailable: \(error.localizedDescription). Repair the Desk or inbox source before retrying."))
+                    outcome: .failed(error: """
+                        Desk notification deadline unavailable: \(error.localizedDescription). Repair the Desk or inbox source before retrying.
+                        """))
             }
             return held ? quietEnd : nil
         }
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
+        let outcome = await notify()
+        if Task.isCancelled {
+            OrganJudge.beat(loopId, .stopped, note: "cancelled", cadence: wake.period)
+        } else {
+            OrganJudge.beat(loopId, tick: outcome, cadence: wake.period)
+        }
+        return outcome
+    }
+
+    private func notify() async -> LoopTickOutcome {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        var quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
+        var released = 0
+        var failures: [String] = []
+        if !Task.isCancelled {
+            do { released = try await AttentionRouter.release(dataRoot: dataRoot, router: attention) }
+            catch { failures.append("Held notification release: \(error.localizedDescription)") }
+        }
         let prepared: Result<(DeskNotificationRead, DeskNotificationProposal), Error>
         do {
             try Task.checkCancellation()
             let read = try await DeskNotificationRead.read(dataRoot: dataRoot, now: Date())
             let proposal = try await propose(read.input)
-            quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
-            _ = try await read.commit(proposal, dataRoot: dataRoot, quietHours: quietHours)
+            _ = try await read.commit(proposal, dataRoot: dataRoot)
             try Task.checkCancellation()
             prepared = .success((read, proposal))
         } catch {
-            quietHours = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
             prepared = .failure(error)
-        }
-        // Already-committed inbox deliveries retain their native release path
-        // when a new Desk proposal fails. Stop still prevents new delivery.
-        var released = 0
-        var failures: [String] = []
-        if !quietHours && !Task.isCancelled {
-            do { released = try await AttentionRouter.releaseHeld(
-                dataRoot: dataRoot, router: attention) }
-            catch { failures.append("Held notification release: \(error.localizedDescription)") }
         }
         let read: DeskNotificationRead
         let proposal: DeskNotificationProposal
@@ -112,55 +123,43 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let state = read.state
         let decisions = proposal.notifications
         var notified = 0
-        let nagCount = quietHours ? 0 : await publishNags(proposal, read: read, failures: &failures)
+        let nagCount = await publishNags(proposal, read: read, failures: &failures)
         if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
             return .skipped(reason: "no Desk notification due")
         }
-        // Quiet hours hold a direct ping's Mac banner exactly as they hold its
-        // push. Nothing is stamped, so it still lands on the first tick after
-        // the window. An urgent item is never held: it posts and routes now.
-        for decision in decisions where !quietHours || decision.level == "urgent" {
+        // Retain every due decision now; the router owns quiet-hours holding and its release.
+        for decision in decisions {
             guard !Task.isCancelled else { break }
-            // Dual delivery: retain a failed occurrence for the next pass.
-            // Derive identity from the same immutable state evaluated
-            // above, never from prose or a second read after delivery.
-            let item = state.items.first { $0.handle == decision.handle }
-            let revision = item?.status.isTerminal == true
-                ? (item?.closedAt ?? decision.observedUpdatedAt)
+            // Preserve failed occurrences and derive identity from the evaluated immutable state, never a post-delivery reread.
+            guard let item = state.items.first(where: { $0.handle == decision.handle }) else {
+                failures.append("\(decision.handle) notification has no observed Desk item")
+                continue
+            }
+            let revision = item.status.isTerminal
+                ? (item.closedAt ?? decision.observedUpdatedAt)
                 : decision.observedUpdatedAt
-            // A non-throwing return is not a delivery: the router can
-            // return normally having chosen no channel at all. Read its own
-            // projection instead.
+            // A normal router return retains intent; destination verdicts alone prove acceptance.
             var outcome: AttentionOutcome?
             if !Task.isCancelled {
-                do { outcome = try await attention.route(
-                eventId: "desk_notify:\(decision.handle):\(revision)",
-                importance: decision.level == "urgent" ? .adverse : .ownerWaiting,
-                title: decision.title,
-                body: decision.body,
-                userInfo: ["screen": "inbox", "source": "desk", NativeAgentNotificationRoute.deskHandleKey: decision.handle],
-                macBanner: true
-                ) } catch { failures.append("\(decision.handle) paired-device route: \(error.localizedDescription)") }
+                do { outcome = try await attention.tell(Matter(id: "desk_notify:\(decision.handle):\(revision)",
+                    form: decision.level == "urgent" ? .wentWrong : item.status.isTerminal ? .done : .words,
+                    from: "desk", title: decision.title, summary: decision.body,
+                    open: "page:desk/" + decision.handle, evidence: [.init(source: "desk", id: decision.handle)]),
+                    reach: .person(from: nil), turn: nil
+                ) } catch { failures.append("\(decision.handle) notification route: \(error.localizedDescription)") }
             }
-            let projection = outcome?.deliveryProjection ?? .failed
-            let mobileOK = outcome != nil // The immutable ledger owns every admitted intent, including retryable refusal.
-            let macOK = outcome?.destinationOutcomes["mac"]?.settled == true
-            let mobileReached = projection.reachedAChannel
-            // Log both channel outcomes so no failure is silent.
-            if !macOK {
-                nativeLog("desk_notify: Mac banner failed for \(decision.handle)")
-                failures.append("\(decision.handle) Mac banner")
+            if let outcome, !outcome.deferredForQuietHours {
+                for (destination, verdict) in outcome.destinationOutcomes {
+                    if case .notDelivered(let reason) = verdict {
+                        failures.append("\(decision.handle) \(destination): \(reason)")
+                    }
+                }
             }
-            if !mobileOK {
-                nativeLog("desk_notify: paired-device push failed for \(decision.handle)")
-                failures.append("\(decision.handle) paired-device push")
-            }
-            if macOK || mobileReached { notified += 1 }
-            guard macOK || mobileOK else { continue }
-            // Stamp lastNotifiedAt via CAS on the NOTIFIED version: if a content
-            // change landed during this tick, skip the stamp so the next tick
-            // pings the newer state (no lost ping). markNotified does NOT bump
-            // updatedAt, so it can never re-trigger itself.
+            if outcome?.destinationOutcomes.values.contains(.delivered) == true { notified += 1 }
+            // The matter keeps its owed doors, even while held or awaiting a receipt.
+            guard outcome != nil else { continue }
+            // CAS stamps only the notified version so concurrent edits keep their ping owed.
+            // markNotified leaves updatedAt unchanged to prevent self-triggering.
             // One-time announcements stamp unconditionally to prevent repeat delivery.
             let stampError: String? = await settle {
                 do {
@@ -181,8 +180,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             return .failed(error: "Desk notification partial failure: "
                 + failures.prefix(5).joined(separator: "; "))
         }
-        // The count is what a channel actually took, not how many decisions
-        // this pass considered.
+        // Count channel acceptance, not proposed decisions.
         return .completed(result: "notified \(notified) of \(decisions.count) Desk decision(s)"
             + (nagCount > 0 ? " + \(nagCount) nag(s)" : ""))
     }
@@ -222,8 +220,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         return delivered
     }
 
-    /// Same dual delivery as the notify pass (Mac banner + paired-device push),
-    /// with both channel outcomes logged so no failure is silent.
+    /// Keep each selected destination's refusal visible without inventing an absent door.
     private func deliverNag(
         title: String,
         body: String,
@@ -232,27 +229,20 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         failures: inout [String]
     ) async -> Bool {
         guard !Task.isCancelled else { return false }
-        // The banner carries the handle it is about, so a click lands on that
-        // item instead of on the app's front page. The unmute digest is about
-        // no single item and carries nothing.
-        let mobileOutcome: AttentionOutcome?
-        do { mobileOutcome = try await attention.route(
-            eventId: "desk_nag:\(label)",
-            importance: .ownerWaiting,
-            title: title,
-            body: body,
-            userInfo: ["screen": "inbox", "source": "desk", NativeAgentNotificationRoute.deskHandleKey: deskHandle ?? ""],
-            macBanner: true
+        // Item handles route banner clicks to their item; the unmute digest has no single target.
+        let outcome: AttentionOutcome?
+        do { outcome = try await attention.tell(Matter(id: "desk_nag:\(label)", form: .words, from: "desk",
+            title: title, summary: body, open: deskHandle.map { "page:desk/" + $0 } ?? "page:desk",
+            evidence: deskHandle.map { [.init(source: "desk", id: $0)] } ?? []), reach: .person(from: nil), turn: nil
         ) } catch {
-            mobileOutcome = nil
-            failures.append("\(label) nag paired-device route: \(error.localizedDescription)")
+            outcome = nil
+            failures.append("\(label) nag route: \(error.localizedDescription)")
         }
-        let mobileOK = mobileOutcome != nil // Accepted durable intent; the ledger now owns delivery.
-        let macPosted = mobileOutcome?.destinationOutcomes["mac"] == .delivered
-        if !mobileOK {
-            nativeLog("desk_notify: nag paired-device push failed for \(label)")
-            failures.append("\(label) nag paired-device push")
+        if let outcome, !outcome.deferredForQuietHours {
+            for (destination, verdict) in outcome.destinationOutcomes {
+                if case .notDelivered(let reason) = verdict { failures.append("\(label) nag \(destination): \(reason)") }
+            }
         }
-        return macPosted || mobileOK
+        return outcome != nil // The matter owns every destination from here.
     }
 }

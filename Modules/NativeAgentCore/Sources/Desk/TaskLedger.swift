@@ -1,40 +1,29 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `TaskLedger.swift` | `SwiftNativeTaskLedger` owns the checked, complete orchestration event feed and compaction base; current actors only; the CLI and wrapper use `PersistenceCore.defaultDataRoot()` unless `--data-root` is explicit |
+// Blueprint: | `TaskLedger.swift` | `SwiftNativeTaskLedger`: locked history; `PersistenceCore.defaultDataRoot()` or explicit `--data-root` |
 
 // MARK: - Cross-agent task ledger
-//
-// Shared append-under-flock state records task ownership, progress and outcomes.
-//
-// MODULE HOME: Desk. The ledger owns orchestration records here and imports
-// PersistenceCore for shared JSONL, snapshot/tail and task-tree-aware flock IO.
-//
-// STORE:
-//   • <dataRoot>/orchestration/task_ledger.jsonl — append-only EVENTS feed.
-//   • <dataRoot>/orchestration/task_ledger_base.json — compaction snapshot.
-//   Both under the events-feed flock discipline (withFileLock + the shared
-//   `<path>.lock` sidecar). Bound: snapshot+tail compaction at newest-5000
-//   with a threshold/4 keep-tail.
-//
-// EVENT SCHEMA: {id, taskId, ts, actor, kind, title?, note?, refs[]}
-//   actor in claude | assistant | codex | user
-//   kind  ∈ created | claimed | update | blocked | done | cancelled
-//
-// CROSS-PROCESS: the CLI writer (script/task_ledger.sh -> task-ledger) flocks the SAME
-// `<path>.lock` sidecar this module's withFileLock uses (open O_CREAT|O_WRONLY
-// 0o600 + flock LOCK_EX), so Swift-in-app and Swift-on-CLI serialize against
-// each other on the events file. See PersistenceCore+FileLock.swift for the
-// lock-file naming convention both sides match exactly. No Python helper owns
-// this path on the Swift-native branch.
+// Flocked events serialize app and CLI ownership, progress and outcomes.
+// Both writers share the PersistenceCore sidecar lock so cross-process appends cannot race.
+// Snapshot-plus-tail compaction bounds the feed while preserving founding task state.
 
 // MARK: - Event types
 
-public enum TaskLedgerActor: String, Sendable, CaseIterable {
-    case claude, assistant, codex, user
+/// Who wrote an event: the agent, the person, or one saved contact named by its peer id.
+public struct TaskLedgerActor: Sendable, Hashable {
+    public let rawValue: String
 
-    /// The CLI and stored records use the same current actor vocabulary.
+    public static let agent = Self(rawValue: "agent")
+    public static let user = Self(rawValue: "user")
+    public static func contact(_ id: UUID) -> Self { Self(rawValue: "peer:" + id.uuidString.lowercased()) }
+
+    private init(rawValue: String) { self.rawValue = rawValue }
+
     public init?(wire raw: String) {
-        self.init(rawValue: raw)
+        if raw == Self.agent.rawValue { self = .agent; return }
+        if raw == Self.user.rawValue { self = .user; return }
+        guard raw.hasPrefix("peer:"), let id = UUID(uuidString: String(raw.dropFirst(5))) else { return nil }
+        self = .contact(id)
     }
 }
 
@@ -42,13 +31,10 @@ public enum TaskLedgerKind: String, Sendable, CaseIterable {
     case created, claimed, update, blocked, done, cancelled, deleted
 }
 
-/// One append-only ledger event. `id` is the event id; `taskId` groups events
-/// for one task. `title`/`note` are optional free text; `refs` are opaque
-/// reference strings (file paths, commit ids, PR urls, etc.).
 public struct TaskLedgerEvent: Sendable, Equatable {
     public var id: String
     public var taskId: String
-    public var ts: String          // ISO-8601 UTC, microsecond precision
+    public var ts: String
     public var actor: TaskLedgerActor
     public var kind: TaskLedgerKind
     public var title: String?
@@ -75,9 +61,7 @@ public struct TaskLedgerEvent: Sendable, Equatable {
         self.refs = refs
     }
 
-    /// Serialize to the JSONValue wire form persisted to the events feed.
-    /// Optional fields are omitted when nil/empty (NOT emitted as null).
-    /// The app and task-ledger CLI share this writer.
+    /// Omit nil or empty optionals so app and CLI writers emit the same wire shape.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
@@ -92,8 +76,7 @@ public struct TaskLedgerEvent: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Decode one complete current event. A rejected row makes the owning
-    /// history unavailable; callers never project a shortened successful feed.
+    /// Reject incomplete history whole so a malformed row cannot become a successful omission.
     public static func fromJSON(_ value: JSONValue) -> TaskLedgerEvent? {
         guard case .object(let obj) = value,
               case .string(let id)? = obj["id"],
@@ -127,13 +110,12 @@ public struct TaskLedgerEvent: Sendable, Equatable {
     }
 }
 
-/// Derived (compacted) state for one task — the latest title/owner/status
-/// folded from its event stream. Deletion remains the final status.
+/// Deletion remains final when later events fold into compacted state.
 public struct TaskLedgerTaskState: Sendable, Equatable {
     public var taskId: String
     public var title: String?
-    public var owner: TaskLedgerActor?     // last claimer (nil if never claimed)
-    public var status: TaskLedgerKind       // last kind applied before or at deletion
+    public var owner: TaskLedgerActor?
+    public var status: TaskLedgerKind
     public var createdTs: String
     public var updatedTs: String
     public var lastNote: String?
@@ -153,8 +135,6 @@ public struct TaskLedgerTaskState: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Parse one compacted task state off the compaction base. Mirrors `toJSON`:
-    /// `status`/`taskId`/`createdTs`/`updatedTs` are required, the rest optional.
     public static func fromJSON(_ value: JSONValue) -> TaskLedgerTaskState? {
         guard case .object(let obj) = value,
               case .string(let taskId)? = obj["taskId"],
@@ -191,8 +171,7 @@ public struct TaskLedgerTaskState: Sendable, Equatable {
     }
 }
 
-/// The base retains full reduced task state through lastCompactedOpId in first-seen order.
-/// Replay applies only following events; an absent base starts from genesis.
+/// Keep reduced state through the compacted prefix so tail-only replay retains founding events.
 struct TaskLedgerCompactionBase: Sendable, Equatable {
     let tasks: [TaskLedgerTaskState]
     let lastCompactedOpId: String
@@ -209,9 +188,7 @@ struct TaskLedgerCompactionBase: Sendable, Equatable {
         ])
     }
 
-    /// STRICT decode — a malformed task row fails the whole base so the caller
-    /// throws rather than folding from the tail alone (which would silently drop
-    /// every compacted task). `lastCompactedOpId` must be present and non-empty.
+    /// Reject malformed bases whole because tail-only replay would silently erase compacted tasks.
     static func fromJSON(_ value: JSONValue) -> TaskLedgerCompactionBase? {
         guard case .object(let obj) = value,
               obj["version"] == .int(1),
@@ -239,50 +216,49 @@ struct TaskLedgerCompactionBase: Sendable, Equatable {
     }
 }
 
-/// One consistent read of the replayable feed: the compaction base (if any) and
-/// the tail events that FOLLOW it, plus the raw file event count (the trim
-/// threshold keys on actual file size, pre prefix-drop).
+/// Pair base and following events; count physical rows before prefix-drop so compaction tracks file growth.
 struct TaskLedgerFeed: Sendable {
     let base: TaskLedgerCompactionBase?
     var events: [TaskLedgerEvent]
     var fileEventCount: Int
-    /// What the raw feed scan could not use — malformed lines and events whose
-    /// `kind` token this build does not know. Compaction REFUSES while this is
-    /// non-clean: the truncate drops everything before the kept tail, so a
-    /// skipped row would be erased. Same policy as DeskStore; see
-    /// `SnapshotTailOpLog`.
+    /// Refuse compaction with undecodable rows because truncation would erase their original evidence.
     var integrity: SnapshotTailOpLog.OpLogIntegrity = .clean
 
-    /// Compaction thresholds count physical feed rows, including undecodable events.
+    /// Count undecodable rows too because they still consume feed space.
     var compactionRowCount: Int { integrity.feedRowCount(decodedCount: fileEventCount) }
 }
 
 public struct TaskLedgerBaseCorrupt: Error, LocalizedError, Sendable {
     public let path: String
     public var errorDescription: String? {
-        "task ledger: compaction base at \(path) exists but does not decode — refusing to fold from the tail alone (that would silently drop every compacted task)"
+        """
+            task ledger: compaction base at \(path) exists but does not decode — refusing to fold from the tail alone (that would silently drop \
+            every compacted task)
+            """
     }
 }
 
-/// The base file EXISTS but its bytes could not be read at all (fd exhaustion,
-/// an iCloud dataless placeholder, a transient IO error). Distinct from
-/// `TaskLedgerBaseCorrupt` on purpose: this one is TRANSIENT and retryable, so
-/// it must never be reported as — or acted on like — permanent corruption.
+/// Distinguish unreadable bytes from decoded corruption so transient I/O cannot permanently invalidate the ledger.
 public struct TaskLedgerBaseUnreadable: Error, LocalizedError, Sendable {
     public let path: String
     public var errorDescription: String? {
-        "task ledger: compaction base at \(path) exists but its bytes could not be read (transient IO — fd exhaustion or a dataless file); retry rather than treating the ledger as corrupt"
+        """
+            task ledger: compaction base at \(path) exists but its bytes could not be read (transient IO — fd exhaustion or a dataless file); \
+            retry rather than treating the ledger as corrupt
+            """
     }
 }
 
-/// The file is retained intact; no derived state or mutation may use a feed
-/// whose complete event history could not be read.
+/// Preserve unreadable history intact and prevent partial state from authorizing mutations.
 public struct TaskLedgerHistoryUnavailable: Error, LocalizedError, Sendable {
     public let path: String
     public let integrity: SnapshotTailOpLog.OpLogIntegrity
 
     public var errorDescription: String? {
-        "task ledger history unavailable at \(path): \(integrity.summary). Original bytes retained; repair the named event feed before reading or changing tasks."
+        """
+            task ledger history unavailable at \(path): \(integrity.summary). Original bytes retained; repair the named event feed before \
+            reading or changing tasks.
+            """
     }
 }
 
@@ -314,26 +290,17 @@ public struct TaskLedgerTaskDeleted: Error, LocalizedError, Sendable {
 
 // MARK: - Reader / writer
 
-/// Append-under-flock task-ledger store. Stateless — all state lives on disk.
-/// The events feed and compaction base share the events feed's flock,
-/// so replay and compaction can never race an append.
-/// Owns task_ledger.jsonl and its versioned compaction base.
-/// Local backup/export and phone sync exclude orchestration/; off-disk includes
-/// it; PrivacyMap lists the tree.
+/// Append, replay and compaction share the events flock so reads cannot straddle committed writes.
+/// Local export and phone sync exclude orchestration; off-disk backup retains it.
 public struct SwiftNativeTaskLedger: Sendable {
     public static let logLabel = "TaskLedger"
-    /// Crossing this bound triggers snapshot+truncate compaction; founding task events survive in the base.
+    /// Compact under the append lock so threshold crossing cannot race another writer.
     public static let maxLines = JSONLLineCaps.activityEvents
-    /// File event count that triggers a snapshot+truncate on the next in-lock
-    /// append.
     static let opsCompactionThreshold = JSONLLineCaps.activityEvents
-    /// Retain the newest threshold/4 events so compaction amortizes across the next 3/4 threshold appends.
+    /// Keep a quarter-tail so compaction amortizes across the next three-quarter-threshold appends.
     static let compactionKeepTail = max(1, opsCompactionThreshold / 4)
-    /// Done/cancelled tasks older than this since their last update are evicted when the base folds.
     static let terminalTaskRetention: TimeInterval = 30 * 24 * 60 * 60
-    /// Per-task cap on the derived `refs` union. Without it a long-lived task
-    /// that attaches a ref per event grows the derived state — and the
-    /// compaction base it is baked into — without bound. Newest-wins.
+    /// Cap refs newest-first so long-lived tasks cannot grow their state and compaction base indefinitely.
     static let maxRefsPerTask = 64
 
     public let dataRoot: URL
@@ -341,23 +308,19 @@ public struct SwiftNativeTaskLedger: Sendable {
         self.dataRoot = dataRoot
     }
 
-    /// `<dataRoot>/orchestration/task_ledger.jsonl`.
     public var eventsPath: URL {
         dataRoot
             .appendingPathComponent("orchestration", isDirectory: true)
             .appendingPathComponent("task_ledger.jsonl")
     }
 
-    /// `<dataRoot>/orchestration/task_ledger_base.json` — the compaction snapshot
-    /// the feed folds FROM. Written atomically BEFORE the feed truncate; a
-    /// crash between the two is healed by the replay prefix-drop.
+    /// Write the base before truncation so prefix-drop repairs crashes between those writes.
     public var basePath: URL {
         dataRoot
             .appendingPathComponent("orchestration", isDirectory: true)
             .appendingPathComponent("task_ledger_base.json")
     }
 
-    /// Append one event and compact if needed under the events-feed flock.
     @discardableResult
     public func append(_ event: TaskLedgerEvent) async throws -> TaskLedgerEvent {
         try await SwiftNativePersistenceCore.withFileLock(eventsPath) {
@@ -368,8 +331,7 @@ public struct SwiftNativeTaskLedger: Sendable {
         return event
     }
 
-    /// Append a delete marker only if the current task still has the title
-    /// observed by the caller. The same flock protects the comparison and append.
+    /// Compare the observed title and append under one flock so deletion cannot erase renamed work.
     @discardableResult
     public func delete(_ event: TaskLedgerEvent, expectedTitle: String) async throws -> Bool {
         guard event.kind == .deleted else { return false }
@@ -385,8 +347,7 @@ public struct SwiftNativeTaskLedger: Sendable {
         }
     }
 
-    /// Claim a task with an in-lock compare-and-set guard. Without `force`,
-    /// another actor's active `claimed` / `update` state refuses the takeover.
+    /// Claim with locked CAS so active ownership cannot be taken without force.
     @discardableResult
     public func claim(_ event: TaskLedgerEvent, force: Bool = false) async throws -> TaskLedgerEvent {
         guard event.kind == .claimed else {
@@ -406,14 +367,12 @@ public struct SwiftNativeTaskLedger: Sendable {
     }
 
     private func appendAndRecompactUnlocked(_ event: TaskLedgerEvent, feed: TaskLedgerFeed, current: TaskLedgerTaskState?) async throws {
-        // The caller holds the flock: deletion cannot race this refusal.
+        // The held flock keeps deletion from racing this refusal.
         if current?.status == .deleted {
             throw TaskLedgerTaskDeleted(taskId: event.taskId)
         }
-        // Snapshot-before-truncate compaction retains each task's founding state.
         try await SwiftNativePersistenceCore.appendJSONLDurable(event.toJSON(), to: eventsPath)
         var next = feed
-        // Match the wire form's omitted empty optional fields.
         var committed = event
         if committed.title?.isEmpty == true { committed.title = nil }
         if committed.note?.isEmpty == true { committed.note = nil }
@@ -424,41 +383,27 @@ public struct SwiftNativeTaskLedger: Sendable {
         }
         next.fileEventCount += 1
         next.integrity = next.integrity.appendingRows(1)
-        // The durable append terminates a torn last line before its new row,
-        // making the old fragment malformed rather than a tolerated tail.
+        // Terminate torn last lines before appending so malformed bytes remain visible.
         if next.integrity.trailingPartialLine {
             next.integrity.malformedLineCount += 1
             next.integrity.trailingPartialLine = false
         }
-        // End-of-transaction snapshot+truncate once the feed file crosses the
-        // threshold: fold the pre-tail prefix into the base, keep the newest tail.
         try await compactIfNeededUnlocked(feed: next)
     }
 
-    /// Snapshot the pre-tail prefix into the base and truncate the feed to the
-    /// newest `compactionKeepTail` events, once the raw file crosses `opsCompactionThreshold`.
-    /// The base is written atomically BEFORE the feed rewrite; the replay
-    /// prefix-drop makes the in-between crash window safe (never lost, never
-    /// double-applied). The caller holds the events flock.
+    /// Write the prefix snapshot before rewriting the tail under the flock.
+    /// Prefix-drop protects interrupted compaction against loss and duplicate application.
     private func compactIfNeededUnlocked(feed: TaskLedgerFeed) async throws {
-        // PHYSICAL rows, not decoded events — see `TaskLedgerFeed.compactionRowCount`.
         guard feed.compactionRowCount >= Self.opsCompactionThreshold else { return }
         // Refuse compaction if any row cannot be folded, preserving newer writers' event kinds.
         guard SnapshotTailOpLog.mayCompact(feed.integrity, feed: Self.logLabel, path: eventsPath) else { return }
-        // `feed.events` is already base+tail (prefix-dropped). Fold everything
-        // EXCEPT the kept tail into the (existing) base.
+        // Exclude the retained tail from the base so replay cannot apply it twice.
         guard feed.events.count > Self.compactionKeepTail else { return }
         let prefix = Array(feed.events.dropLast(Self.compactionKeepTail))
         let tail = Array(feed.events.suffix(Self.compactionKeepTail))
         guard let lastPrefix = prefix.last else { return }
-        // "Now" for the retention fold is the FEED'S OWN newest stamp, never
-        // wall-clock (mirrors GitHubCommandStore's terminal retirement, which
-        // anchors to `updatedAt`): the same feed must fold to the same base on
-        // every machine and at every replay, otherwise two writers compacting
-        // the identical feed minutes apart produce different bases and the
-        // eviction boundary drifts with whoever happened to run the append.
-        // No parseable stamp anywhere in the feed → evict nothing (eviction
-        // must never lose a row just because the clock is unreadable).
+        // Use the feed clock so identical history compacts identically across machines and times.
+        // Unreadable clock evidence cannot authorize eviction.
         let folded = Self.compact(base: feed.base, prefix)
         let feedNow = feed.events.compactMap { DeskClock.parseISO($0.ts) }.max()
         let tailTaskIDs = Set(tail.map(\.taskId))
@@ -478,11 +423,8 @@ public struct SwiftNativeTaskLedger: Sendable {
         )
     }
 
-    /// Retention predicate for the compaction-base fold:
-    /// done/cancelled tasks past `terminalTaskRetention` are retired from the
-    /// base. Deleted tasks retain their tombstone so later events cannot revive
-    /// them after the original delete event leaves the tail. Non-terminal tasks
-    /// always retain, and an unparseable stamp fails toward KEEPING the task.
+    /// Keep deletion tombstones so tail events cannot resurrect deleted tasks after compaction.
+    /// Retain nonterminal tasks and unknown ages; only known-old terminal work may expire.
     static func retainInCompactionBase(_ task: TaskLedgerTaskState, now: Date) -> Bool {
         if task.status == .deleted { return true }
         guard task.status == .done || task.status == .cancelled else { return true }
@@ -490,9 +432,7 @@ public struct SwiftNativeTaskLedger: Sendable {
         return now.timeIntervalSince(updated) < terminalTaskRetention
     }
 
-    /// Inspect all events in the file and retain the exact integrity receipt.
-    /// Diagnostic health reads may inspect this receipt; functional reads
-    /// require it to be complete before replay or mutation.
+    /// Retain exact integrity diagnostics; functional reads require complete history before replay.
     func readEventsWithIntegrityUnlocked() async throws -> (events: [TaskLedgerEvent], integrity: SnapshotTailOpLog.OpLogIntegrity) {
         let (raw, report) = try await SwiftNativePersistenceCore.readJSONLReporting(eventsPath)
         let events = raw.compactMap { TaskLedgerEvent.fromJSON($0) }
@@ -506,14 +446,11 @@ public struct SwiftNativeTaskLedger: Sendable {
         return (events, integrity)
     }
 
-    /// The readable counter behind the log line: what the ledger's feed
-    /// currently cannot decode. Non-zero means compaction is (correctly)
-    /// refusing to run and the feed is growing.
+    /// Rejected-row counts explain blocked compaction and continued physical feed growth.
     public func feedIntegrity() async throws -> SnapshotTailOpLog.OpLogIntegrity {
         try await readEventsWithIntegrityUnlocked().integrity
     }
 
-    /// Doctor feed health includes undecodable rows and physical feed size.
     public func feedHealth() async throws -> SnapshotTailOpLog.OpLogHealth {
         let integrity = try await feedIntegrity()
         return SnapshotTailOpLog.OpLogHealth(
@@ -526,13 +463,8 @@ public struct SwiftNativeTaskLedger: Sendable {
         )
     }
 
-    /// Read the replayable feed: the compaction base (if any) + the events that
-    /// FOLLOW it. Events are read FIRST, base SECOND — a reader racing a
-    /// compaction then sees (old/absent base, full ops), (new base, full ops →
-    /// prefix-dropped), or (new base, truncated ops); the prefix-drop also heals
-    /// a crash between base write and feed truncate. A base file that EXISTS but
-    /// does not decode throws (folding the tail alone would blank compacted
-    /// tasks). No base file → genesis: the whole feed folds from empty.
+    /// Read events before base so compaction cannot pair an old snapshot with a truncated tail.
+    /// Prefix-drop prevents duplicate replay; malformed existing bases fail whole and absent bases start at genesis.
     func readFeedUnlocked() async throws -> (feed: TaskLedgerFeed, rawEvents: [TaskLedgerEvent]) {
         let (events, integrity) = try await readEventsWithIntegrityUnlocked()
         return (try readFeedUnlocked(events: events, integrity: integrity), events)
@@ -546,14 +478,7 @@ public struct SwiftNativeTaskLedger: Sendable {
         guard FileManager.default.fileExists(atPath: basePath.path) else {
             return TaskLedgerFeed(base: nil, events: events, fileEventCount: fileEventCount, integrity: integrity)
         }
-        // Read the base bytes DIRECTLY — `SwiftNativePersistenceCore.readJSON` collapses every
-        // failure mode into its default (EMFILE burst, an iCloud dataless
-        // placeholder, a mid-read EIO all look identical to a parse failure),
-        // and the corruption invariant below is PERMANENT: it bricks reads AND
-        // writes. Separating "could not read the bytes" (transient → throw a
-        // distinct, retryable error) from "read the bytes, they are not a base"
-        // (genuine corruption → fail loud) keeps the fail-loud contract without
-        // laundering a transient IO blip into permanent corruption.
+        // Distinguish byte-read failure from malformed content so transient I/O cannot become permanent corruption.
         guard let data = try? Data(contentsOf: basePath) else {
             throw TaskLedgerBaseUnreadable(path: basePath.path)
         }
@@ -567,12 +492,8 @@ public struct SwiftNativeTaskLedger: Sendable {
         return TaskLedgerFeed(base: base, events: tail, fileEventCount: fileEventCount, integrity: integrity)
     }
 
-    /// List the derived compacted task states, newest-updated first. Reads the
-    /// canonical base + events feed, so a list right after a CLI append reflects it.
-    ///
-    /// The events flock pairs base and tail atomically so compaction cannot cause double replay.
-    /// claim and appendAndRecompactUnlocked already hold the lock.
-    /// withFileLock supports same-task-tree reentry without another acquisition.
+    /// Pair base and tail under the flock so listing cannot double-replay concurrent compaction.
+    /// Same-task-tree reentry lets callers retain their existing acquisition.
     public func listTasks(includeTerminal: Bool = true) async throws -> [TaskLedgerTaskState] {
         let feed = try await SwiftNativePersistenceCore.withFileLock(eventsPath) {
             try await readFeedUnlocked().feed
@@ -585,8 +506,7 @@ public struct SwiftNativeTaskLedger: Sendable {
         return states.sorted { $0.updatedTs > $1.updatedTs }
     }
 
-    /// Folded state and raw retained events share one locked read; a stale
-    /// pre-compaction prefix remains evidence, never replayed twice into state.
+    /// Read state and retained events together so precompaction evidence cannot replay twice.
     public func taskDetail(id: String) async throws -> (state: TaskLedgerTaskState?, events: [TaskLedgerEvent]) {
         try await SwiftNativePersistenceCore.withFileLock(eventsPath) {
             let (events, integrity) = try await readEventsWithIntegrityUnlocked()
@@ -598,19 +518,12 @@ public struct SwiftNativeTaskLedger: Sendable {
 
     // MARK: - Compaction
 
-    /// Fold the event stream into per-task derived state. Events are applied in
-    /// FILE ORDER (append order); `created` seeds the title/createdTs, `claimed`
-    /// sets the owner, every event advances status + updatedTs until deletion,
-    /// and refs union in first-seen order. Deletion is final. A task with no
-    /// explicit `created` event still materializes (first event seeds it).
+    /// Fold in append order; deletion is final, while a first event may found a task without explicit creation.
     public static func compact(_ events: [TaskLedgerEvent]) -> [TaskLedgerTaskState] {
         compact(base: nil, events)
     }
 
-    /// Fold seeded from a compaction base: the base's task states ARE the reduced
-    /// ledger through `lastCompactedOpId`, so the tail events apply on top exactly
-    /// as if the compacted prefix had just been replayed. This is what keeps a
-    /// compacted task's title/owner alive after a trim.
+    /// Seed from the base and apply only following events so trimming cannot erase task identity or ownership.
     static func compact(base: TaskLedgerCompactionBase?, _ events: [TaskLedgerEvent]) -> [TaskLedgerTaskState] {
         var byTask: [String: TaskLedgerTaskState] = [:]
         var order: [String] = []
@@ -629,11 +542,7 @@ public struct SwiftNativeTaskLedger: Sendable {
                 s.updatedTs = e.ts
                 if let n = e.note, !n.isEmpty { s.lastNote = n }
                 for r in e.refs where !s.refs.contains(r) { s.refs.append(r) }
-                // Bound the union: refs were the one unbounded field in the
-                // derived state — a long-lived task accumulating a ref per
-                // event grew the compaction base forever. Newest-wins
-                // (suffix), matching every other tail cap
-                // in the store.
+                // Cap refs newest-first so long-lived tasks cannot grow the base indefinitely.
                 if s.refs.count > Self.maxRefsPerTask { s.refs = Array(s.refs.suffix(Self.maxRefsPerTask)) }
                 byTask[e.taskId] = s
             } else {

@@ -8,21 +8,19 @@ import OSLog
 extension CloudKitDeviceTransport {
     // MARK: retention sweep
 
-    // The Mac alone sweeps expired chat/notification records by server modificationDate; pairing/status singletons are retained. Offline phones recover from transcript snapshots.
+    // The Mac alone sweeps expired chat/notification records by server modificationDate; pairing/status singletons are retained. Offline phones
+    // recover from transcript snapshots.
     public static let retentionWindow: TimeInterval = 14 * 24 * 60 * 60
 
-    /// Deletions per sweep, per record type. Bounded so a first sweep over a
-    /// large backlog cannot turn one drain into a long CloudKit transaction;
+    /// Deletions per sweep, per record type. Bounded so a first sweep over a large backlog cannot turn one drain into a long CloudKit transaction;
     /// the backlog clears over successive sweeps.
     public static let retentionSweepBatch = 100
 
-    /// Minimum spacing between sweeps in the steady state. Drains run as often
-    /// at subsecond cadence during phone contact; retention is housekeeping, not a per-drain cost.
+    /// Minimum spacing between sweeps in the steady state. Drains run as often at subsecond cadence during phone contact; retention is housekeeping,
+    /// not a per-drain cost.
     static let retentionSweepInterval: TimeInterval = 60 * 60
 
-    /// Spacing while a sweep's page still comes back full. The first sweep on a
-    /// container that has been accumulating since the cutover has a large
-    /// backlog, and at one bounded batch an hour it would take weeks to clear.
+    /// Full pages need a shorter cadence so a large backlog clears without increasing each sweep's bounded work.
     static let retentionBacklogSweepInterval: TimeInterval = 60
 
     static func shouldSweepRetention(
@@ -31,15 +29,13 @@ extension CloudKitDeviceTransport {
         backlog: Bool,
         now: Date
     ) -> Bool {
-        guard role == .mac else { return false }   // the phone never deletes
+        guard role == .mac else { return false }
         guard let lastSweepAt else { return true }
         let interval = backlog ? retentionBacklogSweepInterval : retentionSweepInterval
         return now.timeIntervalSince(lastSweepAt) >= interval
     }
 
-    /// Delete chat + notification records past the retention window. Mac-only,
-    /// rate-limited, and bounded per record type. Returns the number deleted.
-    /// Safe to call on every drain — it self-throttles and no-ops on iOS.
+    /// Mac-only and self-throttled so every drain may request bounded retention work.
     @discardableResult
     public func sweepExpiredRecords() async -> Int {
         guard holdsPairing else { return 0 }
@@ -77,8 +73,7 @@ extension CloudKitDeviceTransport {
         return deleted
     }
 
-    /// Claim the sweep slot under the lock. Doubles as the rate limiter and as
-    /// the mutual exclusion between two concurrent drains.
+    /// Claim the sweep slot under the lock. Doubles as the rate limiter and as the mutual exclusion between two concurrent drains.
     private func claimRetentionSweep(now: Date) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard Self.shouldSweepRetention(
@@ -148,13 +143,10 @@ extension CloudKitDeviceTransport {
         return outcome
     }
 
-    /// One bounded page of the OLDEST records of `recordType`, filtered to those
-    /// the cutoff has passed. In modificationDate order, ascending is what makes
-    /// a single page enough: the page is either wholly eligible or contains the
-    /// cutoff boundary, and deleting it moves the next sweep's page forward.
-    /// Eligibility and ordering use server modificationDate. `desiredKeys = []`
-    /// keeps the page to system fields, so a sweep never downloads payloads it
-    /// is about to delete.
+    /// One bounded page of the OLDEST records of `recordType`, filtered to those the cutoff has passed. In modificationDate order, ascending is what
+    /// makes a single page enough: the page is either wholly eligible or contains the cutoff boundary, and deleting it moves the next sweep's page
+    /// forward. Eligibility and ordering use server modificationDate. `desiredKeys = []` keeps the page to system fields, so a sweep never downloads
+    /// payloads it is about to delete.
     private func expiredRecordPage(
         recordType: String,
         cutoff: Date

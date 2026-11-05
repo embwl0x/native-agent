@@ -12,11 +12,12 @@ import Observation
 import PersistenceCore
 import TrustCenter
 import UserNotifications
-// Blueprint: | `EngineMacIntegration.swift` | `MacIntegrationFacade`: root-specific checked permissions, nonprompting OS grants and watch readiness publish through `LatestRead`; Mail readiness accepts checked covered accounts with named gaps for status pages, card verification and transcript projections, publishing after refreshed grants and surviving Mail launch/quit; unreadable Trust policy marks its dependent watch access unavailable without hiding local integrations or phone readiness; scheduler names read the app declarations; Setup, Mac Integration, connector actions and quiet pages share these reads; permission-file and root-specific notifications invalidate the same owner; phone serialization uses its own returned checked permission result |
+// Blueprint: | `EngineMacIntegration.swift` | `MacIntegrationFacade`, `LatestRead`; Shared checked grants and watch readiness |
 
-/// One root's checked Mac permissions, nonprompting OS grants and watch readiness.
+/// Share checked permissions, nonprompting OS grants and watch readiness per root.
 @MainActor @Observable
 public final class MacIntegrationFacade: MacAssistantStatusClient {
+    public static let systemStatusesDidChange = Notification.Name("NativeAgent.macSystemStatusesDidChange")
     public nonisolated let dataRoot: URL
     private nonisolated let deviceSync: DeviceSync?
     private nonisolated let platform: AppConnectorStatusPlatform
@@ -47,11 +48,9 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
         self.platform = platform
     }
 
-    /// The existing permission signal belongs to this engine; the cancellable
-    /// releases its observer with the facade. Writes identify their root.
+    /// Release the permission observer with its facade; writes must identify their root.
     public func observePermissionChanges() {
-        // The permission store posts from its own actor: hop to main before this
-        // main-actor closure runs (a background call traps the isolation check).
+        // The permission store posts off-main; hop before the main-actor closure to avoid isolation traps.
         permissionObservation = NotificationCenter.default.publisher(for: SystemPermissionPreflight.permissionDidChange)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
@@ -80,7 +79,9 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             if checkMail, case .success(let snapshot) = result, snapshot.permissions["mail"]?.read == true {
                 do {
                     mailEvidence = MacAssistantStatusResult.mailReadiness(
-                        from: await MacAssistantParts.recover(try await MacAppleScriptBridge.mailListRecent(input: ["limit": .int(1)]), integration:"mail", dataRoot:dataRoot))
+                        from: await MacAssistantParts.recover(try await MacAppleScriptBridge.mailListRecent(input: ["limit": .int(1)], context: .init(
+                            dataRoot: dataRoot)), integration:"mail",
+                            dataRoot:dataRoot))
                 } catch {
                     mailEvidence = (status: "failed", word: "Check failed", next: UserFacingError.cause(error, action: "check Mail"))
                 }
@@ -111,18 +112,17 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             let mailAutomationKey = AppleScriptExecution.automationStatusKey(app: "Mail")
             let priorAutomation = systemStatuses[mailAutomationKey]
             let automation = grants[mailAutomationKey]
-            // A stopped app or an unknown probe says nothing about consent.
-            // A newly observed refusal invalidates even after such a gap;
-            // observing granted again after a launch does not erase the read.
+            // Unknown probes say nothing about consent; a new refusal invalidates evidence, and grants alone cannot erase it.
             let consentChanged = priorAutomation != automation
                 && (automation == "denied" || automation == "not_determined"
                     || (automation == "granted" && (priorAutomation == "denied" || priorAutomation == "not_determined")))
             if systemStatuses["fullDiskAccess"] != grants["fullDiskAccess"] || consentChanged { mailCheck = nil }
+            let grantsChanged = systemStatuses != grants
             systemStatuses = grants
-            // Mail may have launched during its read. Publish the refreshed
-            // grants first, then its checked evidence in this same snapshot.
+            // Mail may launch during its read; publish refreshed grants before checked evidence in the same snapshot.
             if let mailEvidence { mailCheck = mailEvidence }
             isLoading = false
+            if grantsChanged { NotificationCenter.default.post(name: Self.systemStatusesDidChange, object: dataRoot) }
         }
         if refreshWatches, watchState.response != nil { await self.refreshWatches(refreshPermissions: false) }
         return result
@@ -138,12 +138,15 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
         }
     }
 
-    public func set(_ id: String, mode: MacIntegrationPermissionMode, allowed: Bool) async throws {
+    public func set(_ id: String, mode: MacIntegrationPermissionMode, allowed: Bool,
+                    surface: String = "mac_ui", provenance: MacIntegrationPermissionMutationProvenance = .local()) async throws {
         do {
-            try await MacIntegrationPermissionStore(dataRoot: dataRoot).set(
-                integrationId: id, read: mode == .read ? allowed : nil, write: mode == .write ? allowed : nil)
+            let stored = try await MacIntegrationPermissionStore(dataRoot: dataRoot).setWithReceipt(
+                integrationId: id, read: mode == .read ? allowed : nil, write: mode == .write ? allowed : nil,
+                actionID: UUID().uuidString.lowercased(), surface: surface, provenance: provenance)
             permissionRead.write {
-                checkedPermissions = nil
+                // The write fences older reads; the page keeps every switch, this one as stored, until the reread publishes.
+                if case .success(let snapshot)? = checkedPermissions { checkedPermissions = .success(snapshot.with(id, stored)) }
                 mailCheck = nil
             }
             await refresh()
@@ -154,7 +157,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     }
 
     public func refreshWatches(refreshPermissions: Bool = true) async {
-        // readWatches publishes a visible failure before throwing.
+        // `readWatches` publishes its visible failure before throwing.
         _ = try? await readWatches(lightweight: false, refreshPermissions: refreshPermissions)
     }
 
@@ -165,7 +168,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     private func readWatches(lightweight: Bool, refreshPermissions: Bool) async throws -> MacAssistantStatusResult {
         isLoadingWatches = true
         let result = await watchRead.read {
-            // The same checked snapshot and OS grants supply both pages.
+            // Both pages share the checked snapshot and OS grants.
             if refreshPermissions { await refresh(refreshWatches: false) }
             do {
                 guard let deviceSync else { throw CocoaError(.featureUnsupported) }
@@ -217,7 +220,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
                     availableTools: availableTools,
                     localStatuses: localStatusProjection(),
                     schedulerActions: try AppActions.seedActions.filter {
-                        MacIntegrationGates.byTool[$0.tool]?.integration == MacIntegrationID.scheduler
+                        $0.schema?.macIntegration?.integration == MacIntegrationID.scheduler
                     }.map(\.id),
                     watchCatalog: { [dataRoot] in try await MacAssistantParts.watchCatalog(dataRoot: dataRoot) })
                 return Result<MacAssistantStatusResult, Error>.success(response)
@@ -230,12 +233,12 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
             case .failure(let error): watchState = watchState.afterFailure(UserFacingError.message(error, action: "refresh background watches"))
             }
             isLoadingWatches = false
+            NotificationCenter.default.post(name: Self.watchesDidChange, object: nil)
         }
         return try result.get().projected(lightweight: lightweight)
     }
 
-    /// Rendering reads the same evidence as the status page. Only an explicit
-    /// check enters Mail; a grant on its own never establishes readiness.
+    /// Only an explicit check enters Mail; a grant alone never proves readiness.
     public func mailReadiness(check: Bool) async -> (status: String, word: String, next: String?) {
         if check { await checkMail() }
         else { await refresh(refreshWatches: false) }
@@ -247,8 +250,7 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
         await refreshWatches(refreshPermissions: false)
     }
 
-    /// One combined verdict for every consumer. Missing or invalidated read
-    /// evidence needs a check, even when all permission probes are granted.
+    /// Missing or invalidated read evidence needs a check even when every grant probe succeeds.
     private func currentMailReadiness() -> (status: String, word: String, next: String?) {
         guard let checkedPermissions else {
             return ("unavailable", "Permission evidence unavailable", "Refresh Mac Integrations to read Mail access.")
@@ -280,7 +282,8 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
                 return (id, ["status": .string("unavailable"), "detail": .string(error.localizedDescription)])
             }
             if permissions[integration]?.read != true {
-                return (id, ["status": .string("needs_policy"), "detail": .string("Read access is disabled in Mac Integrations."), "nextStep": .string("Enable read access in Mac Integrations.")])
+                return (id, ["status": .string("needs_policy"), "detail": .string("Read access is disabled in Mac Integrations."), "nextStep": .string(
+                    "Enable read access in Mac Integrations.")])
             }
             return (id, LocalPIMConnectorActions.authorizationStatusPayload(localId: id, wizardStatus: systemStatuses[integration] ?? "unknown"))
         })
@@ -289,6 +292,11 @@ public final class MacIntegrationFacade: MacAssistantStatusClient {
     public nonisolated static func badgeKey(_ status: SystemPermissionStatus) -> String {
         status == .notDetermined ? "not_determined" : status.rawValue
     }
+}
+
+extension MacIntegrationFacade {
+    /// The watch reading was published (current, stale or unavailable); pages that show it read the published state again.
+    public static let watchesDidChange = Notification.Name("MacIntegrationFacade.watchesDidChange")
 }
 
 public enum MacAssistantWatchSetupLoadState: Equatable {

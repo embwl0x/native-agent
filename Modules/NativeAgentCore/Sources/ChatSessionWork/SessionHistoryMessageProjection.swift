@@ -4,37 +4,19 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `SessionHistoryMessageProjection.swift` | `admission` counts exact sent user text and context blocks; `project` replays nonempty blocks on their user rows without rewriting their bytes, omits empty text for captionless images and returns delivered row identities, retained keyframes and the window identity |
+// Blueprint: | `SessionHistoryMessageProjection.swift` | `admission`, `project`. |
 
-/// Prior turns become an oldest-first message prefix whose bytes can be cached.
-///
-/// Admission shares the renderer's row filtering and role caps. The transcript
-/// owns the replayed head: only a fold into recollection moves it.
-///
-/// Mapping (deliberately conservative — prior tool rounds have NO provider
-/// call ids, so inventing `tool_use`/`tool_result` pairs would be a lie the
-/// provider would reject or, worse, accept):
-///   - user      → exact sent leading block + words from row metadata;
-///                 legacy rows retain their existing text projection
-///   - assistant → `.assistant` text, with `<tool_use>` markers STRIPPED
-///                 (text-compat transcripts retain literal markers; replaying
-///                 one re-injects a call)
-///   - tool row  → an extra text block `[tool <name> <status>] <projection>`
-///                 appended to the immediately preceding assistant message
-///                 (a synthetic assistant message when there is none)
-///   - compaction summary → a leading `[session recollection] …` text block on
-///                 the OLDEST replayed user message
-/// Consecutive same-role rows merge; a historical header preserves leading
-/// assistant/tool rows while keeping `messages[0]` on the user side.
+/// Replay the retained tail in order without rewriting its words.
+/// Prior tool rounds lack provider call IDs, so render text evidence rather than inventing executable tool pairs.
+/// Merge consecutive roles and preserve orphaned assistant/tool history behind a user-side historical header.
 package enum SessionHistoryMessages {
     package struct Result: Sendable {
-        /// Oldest → newest. Always starts with a `.user` message (or is empty).
+        /// A nonempty prefix must start with a user message.
         package let messages: [LLMMessage]
-        /// Measured from the final messages produced below, after every omission.
+        /// Measure only the final rendered messages after every omission.
         package var characters: Int {
             LLMMessage.inputCharacters(messages, system: nil, tools: [])
         }
-        /// Run ids of the user turns this prefix actually replays.
         package let replayedRunIds: Set<String>
         package var historyIdentities: Set<String> = []
         package var rowCharacters: [String: Int] = [:]
@@ -46,25 +28,21 @@ package enum SessionHistoryMessages {
         )
     }
 
-    /// Admission carries every rendered body into replay.
-    package struct Admission {
+    package struct Admission: Sendable {
         let renderables: [(row: SessionHistoryPromptRenderer.Renderable, body: String)]
     }
 
-    /// Admission retains the contiguous range the reader returned, rendered
-    /// with legacy per-row caps and exact sent user blocks/words, with
-    /// compaction recollections pinned. The measured request fit folds old
-    /// turns into recollection; neither a row count nor a character cap drops them.
-    /// Nonpositive history limits explicitly disable admission.
+    /// Admit exact sent user blocks and whole speech rows; nonpositive history limits disable admission.
+    /// A checked model budget is required even when the range is empty or disabled.
     package static func admission(
         messages: [ChatMessage],
         historyLimit: Int,
-        windowTokens: Int? = nil,
+        budget: ContextBudgetPolicy.Resolved,
         unboundedUserIdentities: Set<String> = []
-    ) throws -> Admission? {
-        try admission(
+    ) -> Admission? {
+        admission(
             renderables: messages.compactMap(SessionHistoryPromptRenderer.renderable),
-            historyLimit: historyLimit, windowTokens: windowTokens,
+            historyLimit: historyLimit, budget: budget,
             unboundedUserIdentities: unboundedUserIdentities
         )
     }
@@ -72,12 +50,11 @@ package enum SessionHistoryMessages {
     package static func admission(
         renderables: [SessionHistoryPromptRenderer.Renderable],
         historyLimit: Int,
-        windowTokens: Int?,
+        budget: ContextBudgetPolicy.Resolved,
         unboundedUserIdentities: Set<String> = []
-    ) throws -> Admission? {
+    ) -> Admission? {
         guard max(0, historyLimit) > 0 else { return nil }
         guard !renderables.isEmpty else { return nil }
-        let budget = try ContextBudgetPolicy.resolve(windowTokens: windowTokens)
         let rendered = renderables.map { row in
             (row: row, body: row.sentContext?.userText
                 ?? (unboundedUserIdentities.contains(row.historyIdentity)
@@ -89,18 +66,17 @@ package enum SessionHistoryMessages {
     package static func project(
         messages: [ChatMessage],
         historyLimit: Int,
-        windowTokens: Int? = nil
-    ) throws -> Result {
-        guard let admission = try admission(
+        budget: ContextBudgetPolicy.Resolved
+    ) -> Result {
+        guard let admission = admission(
             messages: messages,
             historyLimit: historyLimit,
-            windowTokens: windowTokens
+            budget: budget
         ) else { return .empty }
         return project(admission)
     }
 
-    /// Stored context is replayed in its original user content block, never
-    /// rebuilt or promoted to a system message. A new window gets a keyframe.
+    /// Replay stored context inside its original user block; never rebuild it or promote it to system authority.
     package static func project(
         _ admission: Admission
     ) -> Result {
@@ -109,8 +85,6 @@ package enum SessionHistoryMessages {
 
         var out: [(role: LLMMessage.Role, content: [LLMContentBlock], identities: Set<String>)] = []
         var rowCharacters: [String: Int] = [:]
-        var pendingRecollection: String?
-        var recollectionIdentities = Set<String>()
         var replayedRunIds = Set<String>()
         var replayedContexts: [SentTurnContext] = []
 
@@ -126,22 +100,8 @@ package enum SessionHistoryMessages {
 
         for (row, body) in admitted {
             if body.isEmpty && row.sentContext?.block.isEmpty != false { continue }
-            if row.isCompactionSummary {
-                // Held for the oldest replayed USER message rather than
-                // emitted as its own turn: a synthetic role here would read as
-                // a real exchange that never happened.
-                rowCharacters[row.historyIdentity] = row.recollectionLabel.count + 1 + body.count
-                recollectionIdentities.insert(row.historyIdentity)
-                let recollection = row.recollectionLabel + " " + body
-                pendingRecollection = pendingRecollection.map { $0 + "\n\n" + recollection } ?? recollection
-                continue
-            }
-            // An orphaned assistant/tool row is still retained history. Open
-            // with its recollection or an explicit history header, never drop it.
             if out.isEmpty, row.isTool || row.role == "assistant" {
-                let heading = pendingRecollection ?? "[Earlier conversation; retained assistant and tool messages follow.]"
-                pendingRecollection = nil
-                append(.user, [.text(heading)], identities: [])
+                append(.user, [.text("[Earlier conversation; retained assistant and tool messages follow.]")], identities: [])
             }
             if row.isTool {
                 rowCharacters[row.historyIdentity] = body.count
@@ -151,17 +111,11 @@ package enum SessionHistoryMessages {
             switch row.role {
             case "user":
                 var blocks: [LLMContentBlock] = []
-                if let recollection = pendingRecollection {
-                    pendingRecollection = nil
-                    blocks.append(.text(recollection))
-                }
                 if let sent = row.sentContext {
                     replayedContexts.append(sent)
                     if !sent.block.isEmpty { blocks.append(.text(sent.block)) }
                 }
-                // Captionless images have no user text. Replay only blocks
-                // that carry text; nonempty sent words keep their exact bytes
-                // and boundary, including whitespace-only words.
+                // Replay only text-bearing image blocks; nonempty sent words retain exact bytes, including whitespace-only content.
                 if !body.isEmpty { blocks.append(.text(body)) }
                 rowCharacters[row.historyIdentity] = body.count + (row.sentContext?.block.count ?? 0)
                 append(.user, blocks, identities: [row.historyIdentity])
@@ -169,42 +123,26 @@ package enum SessionHistoryMessages {
                     replayedRunIds.insert(runId)
                 }
             case "assistant":
-                // A replayed assistant turn that still carries a literal
-                // `<tool_use>` marker would re-issue that call on the next
-                // provider read. Strip before it ever reaches the wire.
-                let text = ToolCallParser.stripToolUseMarkers(body)
+                let text = body
                 if !text.isEmpty {
                     rowCharacters[row.historyIdentity] = text.count
                     append(.assistant, [.text(text)], identities: [row.historyIdentity])
                 }
             default:
-                // system/summary/unknown rows are not a two-party turn; fold
-                // them into the user side rather than inventing a role.
+                // Fold non-conversation rows into the user side rather than inventing provider roles.
                 rowCharacters[row.historyIdentity] = row.role.count + 3 + body.count
                 append(.user, [.text("[\(row.role)] " + body)], identities: [row.historyIdentity])
             }
         }
 
-        // A recollection-only history still reaches the conversation as a user message.
-        if out.isEmpty {
-            guard let recollection = pendingRecollection else { return .empty }
-            pendingRecollection = nil
-            append(.user, [.text(recollection)], identities: [])
-        }
-        // A recollection with no surviving user row to lead still has to be
-        // said: prepend it to the first message rather than dropping it.
-        if let recollection = pendingRecollection, !out.isEmpty {
-            out[0].content.insert(.text(recollection), at: 0)
-        }
-        let delivered = out.reduce(into: recollectionIdentities) { $0.formUnion($1.identities) }
+        let delivered = out.reduce(into: Set<String>()) { $0.formUnion($1.identities) }
         return Result(
             messages: out.map { LLMMessage(role: $0.role, content: $0.content) },
             replayedRunIds: replayedRunIds,
             historyIdentities: delivered,
             rowCharacters: rowCharacters.filter { delivered.contains($0.key) },
             replayedContexts: replayedContexts,
-            contextWindow: ([""] + admitted.filter { $0.row.isCompactionSummary }.map { $0.row.historyIdentity })
-                .map { "\($0.utf8.count):\($0)" }.joined()
+            contextWindow: admitted.first?.row.historyIdentity ?? "0:"
         )
     }
 

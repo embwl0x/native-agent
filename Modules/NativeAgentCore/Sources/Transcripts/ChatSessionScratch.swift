@@ -1,10 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `ChatSessionScratch.swift` | `ChatSessionScratch` owns the session scratch JSON path, locked mutation and reads for Mac, Telegram and tools; off-disk backup only, no local backup/export/phone sync, inventoried under chat |
+// Blueprint: | `ChatSessionScratch.swift` | `ChatSessionScratch`: Locked scratch state; off-disk backup only |
 
-/// Session-local JSON scratch object, shared by Mac, Telegram and tool reads.
-/// Local working state: off-disk backup only; no local backup, export or phone sync.
-/// Inventoried under PrivacyMap's `chat`; no migration or extra local copy.
+/// Share session scratch state across Mac, Telegram and tools; off-disk backup and PrivacyMap/chat include it, local backup/export/phone sync do not.
 public enum ChatSessionScratch {
     private static func path(dataRoot: URL, sessionID: String) -> URL {
         dataRoot.appendingPathComponent("chat/sessions/\(sessionID)/scratch.json")

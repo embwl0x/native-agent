@@ -7,7 +7,6 @@ import TrustCenter
 
 // MARK: - Result type
 
-/// The bounded feature-surface lookup result, timestamped at the read.
 public struct ContextLookupResult: Sendable, Equatable {
     public let status: String
     public let type: String
@@ -23,7 +22,6 @@ public struct ContextLookupResult: Sendable, Equatable {
         self.createdAt = createdAt
     }
 
-    /// Current feature-surface result envelope.
     public func toJSON() -> JSONValue {
         .object([
             "status": .string(status),
@@ -45,7 +43,6 @@ public actor SwiftNativeContextClient {
         self.now = now
     }
 
-    /// The current feature-surface operation consumes one typed query.
     public func lookup(query: String) -> ContextLookupResult {
         let createdAt = ContextLookupResult.isoTimestamp(now())
         let records = featureSurfaceRecords(nowISO: createdAt)
@@ -59,7 +56,6 @@ public actor SwiftNativeContextClient {
 }
 
 extension ContextLookupResult {
-    /// ISO-8601 UTC timestamp for this lookup.
     public static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.flooredOptionalMicrosecondUTCOffset(date)
     }

@@ -16,7 +16,8 @@ extension SwiftNativeMemoryV2 {
         supportingSessionIDs: [String] = [],
         recurrenceCount: Int? = nil,
         // Caller metadata is subordinate to typed fields when staging a new proposal.
-        extraMetadata: [String: JSONValue] = [:]
+        extraMetadata: [String: JSONValue] = [:],
+        context: MemoryWriteContext
     ) async throws -> ProposalRecord {
         guard ["confidence", "recurrence_count", "supporting_session_ids"].allSatisfy({ extraMetadata[$0] == nil }) else {
             throw MemoryV2Error.underlying("proposal confidence, recurrence and supporting sessions must use the typed arguments")
@@ -117,13 +118,12 @@ extension SwiftNativeMemoryV2 {
             metadata: meta.isEmpty ? nil : .object(meta)
         )
 
-        // Match and merge before embedding, then recheck under the insertion
-        // transaction so concurrent observations retain all their evidence.
+        // Match and merge before embedding, then recheck under the insertion transaction so concurrent observations retain all their evidence.
         if let merged = try await storage.stagePendingProposal(
             proposal,
             insertIfAbsent: false,
             foldedKey: dedupKey,
-            merge: mergedMetadata
+            merge: mergedMetadata, context: context
         ) {
             return ProposalRecord(stored: merged)
         }
@@ -134,12 +134,12 @@ extension SwiftNativeMemoryV2 {
             proposal,
             insertIfAbsent: true,
             foldedKey: dedupKey,
-            merge: mergedMetadata
+            merge: mergedMetadata, context: context
         ) else { throw MemoryV2Error.storageUnavailable }
         return ProposalRecord(stored: staged)
     }
 
-    public func acceptProposal(id: String) async throws -> MemoryRecord {
+    public func acceptProposal(id: String, context: MemoryWriteContext) async throws -> MemoryRecord {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         guard let proposal = try await storage.getProposal(id: id) else {
@@ -160,7 +160,8 @@ extension SwiftNativeMemoryV2 {
         if try await storage.isTombstoned(content: proposal.content) {
             try await storage.rejectProposal(id: id, reason: "tombstoned at acceptance")
             requestEmbeddingEpochReconcile()
-            throw MemoryV2Error.forgottenContent("Proposal content matches a forgotten or rejected memory; the proposal was marked rejected.", effects: .occurred)
+            throw MemoryV2Error.forgottenContent("Proposal content matches a forgotten or rejected memory; the proposal was marked rejected.",
+                effects: .occurred)
         }
         // Fingerprinted replacements atomically accept and mark the old memory corrected, preserving it.
         let superseding = Self.supersedingAcceptance(from: proposal.metadata)
@@ -171,10 +172,10 @@ extension SwiftNativeMemoryV2 {
                 code: "memory_supersession_review_required", status: .refused,
                 instruction: "Read the current target and stage a newly reviewed replacement; do not resubmit this unverified proposal.", recovery: .inspect)
         }
-        return MemoryRecord(stored: try await storage.acceptProposal(id: id, superseding: superseding))
+        return MemoryRecord(stored: try await storage.acceptProposal(id: id, superseding: superseding, context: context))
     }
 
-    /// Reviewed replacement intent; nil unless both target and fingerprint are present.
+    /// Missing target or fingerprint grants no replacement intent.
     static func supersedingAcceptance(from metadata: JSONValue?) -> SupersedingAcceptance? {
         guard case .object(let meta)? = metadata,
               let targetId = Self.supersedesTargetId(from: metadata),
@@ -203,9 +204,8 @@ extension SwiftNativeMemoryV2 {
         return try await storage.supersedeProposal(id: id, by: successorId)
     }
 
-    /// Repair correction-rejected, superseded and successor-linked pending rows in cursor order.
-    /// Remove only tombstones matching the proposal's content/hash and recorded supersession reason.
-    /// Genuine denials remain authoritative; repair and cursor advancement commit together.
+    /// Repair correction-rejected, superseded and successor-linked pending rows in cursor order. Remove only tombstones matching the proposal's content/hash
+    /// and recorded supersession reason. Genuine denials remain authoritative; repair and cursor advancement commit together.
     public func repairSupersededTombstones() async {
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] Supersession repair attachment failed: \(error)"); return }
@@ -216,9 +216,7 @@ extension SwiftNativeMemoryV2 {
 
     static let supersessionReasonPrefix = "superseded by a correction: "
 
-    /// A pending statement waits on the owner's review when nothing has
-    /// superseded it and it passes the durable-candidate gate. The Today page
-    /// ("Waiting on you") and the agent's home count by this one rule.
+    /// Share one waiting-for-review rule between Today and the agent's home; superseded or ineligible statements do not count.
     public static func awaitsReview(content: String, source: String?, metadata: JSONValue?) -> Bool {
         guard supersededByMarker(in: metadata) == nil else { return false }
         let kind: String? = if case .object(let meta)? = metadata, case .string(let value)? = meta["kind"] { value } else { nil }

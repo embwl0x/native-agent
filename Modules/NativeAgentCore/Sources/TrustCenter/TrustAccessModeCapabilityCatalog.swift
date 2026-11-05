@@ -1,8 +1,7 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `TrustAccessModeCapabilityCatalog.swift` | `TrustAccessModeCapabilityCatalog` enum; `normalizedMode`, `macControlPolicy` and Mac integration preset recognition |
+// Blueprint: | `TrustAccessModeCapabilityCatalog.swift` | `TrustAccessModeCapabilityCatalog`, `normalizedMode`, `macControlPolicy`; Canonical presets. |
 
-/// Canonical Mac-control policy templates used by the access-mode writer.
 public enum TrustAccessModeCapabilityCatalog {
     public static func normalizedMode(_ rawMode: String) -> String {
         let mode = rawMode
@@ -90,7 +89,8 @@ extension TrustAccessModeCapabilityCatalog {
         if policy.shellAllowed && policy.fileOpsAllowed && policy.accessibilityAllowed && policy.approvalRequiredFor.isEmpty {
             return .full
         }
-        if policy.fileOpsAllowed || policy.shellAllowed || policy.systemControlAllowed || policy.accessibilityAllowed || policy.applesScriptAllowed || policy.jxaAllowed {
+        if policy.fileOpsAllowed || policy.shellAllowed || policy.systemControlAllowed || policy.accessibilityAllowed || policy.applesScriptAllowed
+            || policy.jxaAllowed {
             return .assistant
         }
         return .watch

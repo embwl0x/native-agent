@@ -2,9 +2,8 @@ import Foundation
 import NativeAgentShared
 import os
 import SwiftUI
-// Blueprint: | `iCloudSyncEngine+Snapshots.swift` | `iCloudSyncEngine`: `applyHelpersSnapshot` owns both file and action receipt adoption, retaining newer Mac helper revisions; `refreshHelpersSnapshot`, `applySchedulerSnapshot`, `refreshSchedulerSnapshot`, `applyProviderState`; Mac revisions order approvals, inbox and memory snapshots against per-record readbacks/removals until acknowledged; provider snapshots and action receipts use the checked routing revision in the same shared surface-model projection; one typed skill/tool/graph decode owner through catalog and graph refreshes; Advanced group delivery refreshes that graph projection for its open list/detail; connector and Telegram receipts share snapshot ordering |
+// Blueprint: | `iCloudSyncEngine+Snapshots.swift` | `iCloudSyncEngine`: `applyHelpersSnapshot`, `refreshHelpersSnapshot`, `applySchedulerSnapshot`, `refreshSchedulerSnapshot`, `applyProviderState` |
 
-/// Provider refresh distinguishes unavailable snapshots from a usable model list.
 enum ProviderControlsRefreshOutcome: Equatable, Sendable {
     case refreshed
     case partial
@@ -72,8 +71,7 @@ struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
 }
 
 extension iCloudSyncEngine {
-    /// Retain newer canonical rows (including absent rows) in this one shared
-    /// projection until a Mac snapshot's revision acknowledges their readbacks.
+    /// Retain newer canonical rows and removals until the Mac snapshot revision acknowledges their readbacks.
     func orderedSnapshot<Row: Decodable & Identifiable & Sendable>(
         _ read: MacSnapshotRead<[Row]>, file: String, current: [Row]
     ) -> [Row] where Row.ID == String {
@@ -187,9 +185,7 @@ extension iCloudSyncEngine {
         PhoneRequests.shared.syncDidSucceed()
     }
 
-    /// Apply the credential-free CloudKit projection published by the Mac.
-    /// Decode/validation is all-or-nothing so malformed or future payloads
-    /// retain the phone's last proven catalog instead of blanking the picker.
+    /// Validate provider projection atomically; malformed/future payloads must preserve the admitted catalog rather than blank the picker.
     @discardableResult
     func applyProviderCatalogStatus(_ value: String, originatingPairing pairing: Data, isCurrent: @MainActor () -> Bool) async -> Bool {
         let lifecycle = lifecycleGeneration
@@ -243,8 +239,7 @@ extension iCloudSyncEngine {
         }
     }
 
-    // Snapshots and readbacks carry the routing owner's revision. There is no
-    // pending acknowledgment fence to reinstall after an acknowledgment arrived.
+    // Order snapshots/readbacks by the routing owner's revision; do not reintroduce an already acknowledged pending fence.
     private func applyProviderState(providers nextProviders: [ProviderInfo]?, surfaceModels incoming: MacSnapshotRead<[String: NAProviderSurfaceSelection]>?) {
         if let nextProviders, providers != nextProviders { providers = nextProviders }
         guard let incoming else { return }
@@ -353,7 +348,6 @@ extension iCloudSyncEngine {
         return refreshed
     }
 
-    // The inspector refreshes only its turn-summary snapshot.
     @discardableResult
     func refreshTurnSummariesSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
@@ -397,10 +391,10 @@ extension iCloudSyncEngine {
     }
 
     @discardableResult
-    func refreshActivitySnapshot() async -> Bool {
+    func refreshActivitySnapshot(recovery: DeviceSyncRecovery = .init()) async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
-        let read = await readActivitySnapshots(snapshotDir: snapshotDir, lifecycle: lifecycle)
+        let read = await readActivitySnapshots(snapshotDir: snapshotDir, lifecycle: lifecycle, recovery: recovery)
         guard !Task.isCancelled, lifecycle == lifecycleGeneration else { return false }
         if read.loadedAll {
             noteRefreshSucceeded()
@@ -418,6 +412,17 @@ extension iCloudSyncEngine {
         guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return false }
         guard let snapshot = acceptSnapshot(read, named: "work_activity.json") else { return false }
         PhoneTurnActivity.shared.receive(snapshot)
+        return true
+    }
+
+    /// Every page's face, as the Mac last published them.
+    func refreshFacesSnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
+        let lifecycle = lifecycleGeneration
+        let read: SnapshotReading<[String: PartFaceSnapshot]> = await Self.loadSnapshotObjectOnly(named: "faces.json", in: snapshotDir)
+        guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return false }
+        guard let snapshot = acceptSnapshot(read, named: "faces.json") else { return false }
+        faces = snapshot
         return true
     }
 
@@ -452,7 +457,8 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         _ = await memoryRead.read({
             async let latestMemories: SnapshotReading<MacSnapshotRead<[MemoryRecord]>> = Self.loadSnapshotObjectOnly(named: "memories.json", in: snapshotDir)
-            async let latestProposals: SnapshotReading<MacSnapshotRead<[MemoryProposalRecord]>> = Self.loadSnapshotObjectOnly(named: "memory_proposals.json", in: snapshotDir)
+            async let latestProposals: SnapshotReading<MacSnapshotRead<[MemoryProposalRecord]>> = Self.loadSnapshotObjectOnly(
+                named: "memory_proposals.json", in: snapshotDir)
             let rows = await (latestMemories, latestProposals)
             await refreshSnapshotStaleness()
             return rows
@@ -475,23 +481,6 @@ extension iCloudSyncEngine {
         })
     }
 
-    func refreshWorkshopTasksSnapshot() async {
-        guard let snapshotDir else { return }
-        let lifecycle = lifecycleGeneration
-        _ = await workshopRead.read({ () async -> SnapshotReading<[WorkshopTaskRecord]> in
-            await Self.loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
-        }, publish: { latest in
-            guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return }
-            if let latest = acceptSnapshot(latest, named: "workshop_tasks.json") {
-                workshopTasks = latest
-                WorkshopCompletionNotificationTracker.shared.apply(latest)
-                noteRefreshSucceeded()
-            } else {
-                syncError = snapshotHealth.damageSentence() ?? "Workshop snapshot is still downloading from iCloud. Try again in a moment."
-            }
-        })
-    }
-
     @discardableResult
     func refreshDeskSnapshot() async -> Bool {
         guard let snapshotDir else { return false }
@@ -500,7 +489,8 @@ extension iCloudSyncEngine {
         _ = await deskRead.read({
             async let latestOverview: SnapshotReading<WorkOverview> = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
             async let latestBounds: SnapshotReading<MobileDeskProjectionReport> = Self.loadSnapshotObjectOnly(named: "desk_bounds.json", in: snapshotDir)
-            async let latestReadingCopies: SnapshotReading<[MobileDeskItemReadingCopy]> = Self.loadSnapshotArrayOnly(named: "desk_details.json", in: snapshotDir)
+            async let latestReadingCopies: SnapshotReading<[MobileDeskItemReadingCopy]> = Self.loadSnapshotArrayOnly(named: "desk_details.json",
+                in: snapshotDir)
             async let latest: SnapshotReading<[MobileDeskItem]> = Self.loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir)
             return await (items: latest, bounds: latestBounds, readingCopies: latestReadingCopies, overview: latestOverview)
         }, publish: { read in
@@ -520,7 +510,10 @@ extension iCloudSyncEngine {
                     noteRefreshSucceeded()
                     refreshed = true
                 } else {
-                    syncError = snapshotHealth.damageSentence() ?? "Desk's bounds, reading copies or overview have not arrived. Refresh rereads the received copy; ask your agent on the Mac to run doctor.repair for icloud_bridge_state to rebuild phone views."
+                    syncError = snapshotHealth.damageSentence() ?? """
+                        Desk's bounds, reading copies or overview have not arrived. Refresh rereads the received copy; ask your agent on the Mac to run \
+                        doctor.repair for icloud_bridge_state to rebuild phone views.
+                        """
                 }
             } else {
                 syncError = snapshotHealth.damageSentence() ?? "Desk is still syncing from the Mac. Try again in a moment."
@@ -529,8 +522,7 @@ extension iCloudSyncEngine {
         return refreshed
     }
 
-    /// A missing or unreadable file is a failed read, not an empty overview:
-    /// it never replaces a newer copy another group already delivered.
+    /// Missing/unreadable overview is not empty; it cannot replace a newer delivered copy.
     func applyWorkOverview(_ overview: WorkOverview?) {
         guard let overview, let incomingDate = DeskActivityState.movementDate(overview.capturedAt) else { return }
         if let currentDate = DeskActivityState.movementDate(workOverview?.capturedAt),
@@ -563,7 +555,8 @@ extension iCloudSyncEngine {
         if personalityRow != nil { availableFields.insert(.personality) }
         if connectorRows != nil { availableFields.insert(.connectors) }
         if healthRow != nil { availableFields.insert(.health) }
-        let outcome = SettingsSnapshotRefreshOutcome(availableFields: availableFields, damage: snapshotHealth.damageSentence(for: SettingsSnapshotRefreshOutcome.filenames))
+        let outcome = SettingsSnapshotRefreshOutcome(availableFields: availableFields, damage: snapshotHealth.damageSentence(
+            for: SettingsSnapshotRefreshOutcome.filenames))
         if let personalityRow { applyPersonality(personalityRow, pairing: personalityPairing) }
         if let connectorRows { applyConnectorSnapshot(connectorRows) }
         if let healthRow { health = healthRow }
@@ -630,8 +623,7 @@ extension iCloudSyncEngine {
         return read.value != nil
     }
 
-    /// All Trust readers admit and publish through this boundary, including
-    /// reads composed with other snapshots. Committed receipts use its write.
+    /// All Trust readers share this admission/publication boundary; committed receipts publish through its write.
     private func readTrustSnapshot(in directory: URL) async -> SnapshotReading<TrustPolicy> {
         let lifecycle = lifecycleGeneration
         return await trustRead.read({ () async -> SnapshotReading<TrustPolicy> in
@@ -654,7 +646,8 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         async let latestProviders: SnapshotReading<[ProviderInfo]> = Self.loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let latestTrust = readTrustSnapshot(in: snapshotDir)
-        async let latestSurfaceModels: SnapshotReading<MacSnapshotRead<[String: NAProviderSurfaceSelection]>> = Self.loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
+        async let latestSurfaceModels: SnapshotReading<MacSnapshotRead<[String: NAProviderSurfaceSelection]>> = Self.loadSnapshotObjectOnly(
+            named: "model_preferences.json", in: snapshotDir)
         let (providerRead, trustRead, surfaceModelRead) = await (latestProviders, latestTrust, latestSurfaceModels)
         guard lifecycle == lifecycleGeneration, !Task.isCancelled else {
             return (.superseded, ProviderControlsRefreshOutcome.superseded.feedbackMessage(damage: nil))
@@ -714,7 +707,7 @@ extension iCloudSyncEngine {
     }
 
     @discardableResult
-    func refreshInboxSnapshot() async -> Bool {
+    func refreshInboxSnapshot(recovery: DeviceSyncRecovery = .init()) async -> Bool {
         guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         var refreshed = false
@@ -729,7 +722,7 @@ extension iCloudSyncEngine {
                 inboxSnapshotLoaded = true
                 inboxItems = orderedSnapshot(latest, file: "inbox.json", current: inboxItems)
                 noteRefreshSucceeded()
-                NADeviceSyncRecoveryBudget.didApplyData?()
+                recovery.didApplyData?()
                 refreshed = true
             } else {
                 syncError = snapshotHealth.damageSentence() ?? "Inbox snapshot is still downloading from iCloud. Try again in a moment."
@@ -746,7 +739,8 @@ extension iCloudSyncEngine {
         let organism = acceptSnapshot(bundle.organismLivingStatus, named: "organism_living_status.json")
         if let state = bundle.organismLivingStatus.health, !state.failed { organismLivingStatus = organism }
         if let v = acceptSnapshot(bundle.connectors, named: "connectors.json") { applyConnectorSnapshot(v) }
-        applyProviderState(providers: acceptSnapshot(bundle.providers, named: "providers.json"), surfaceModels: acceptSnapshot(bundle.surfaceModels, named: "model_preferences.json"))
+        applyProviderState(providers: acceptSnapshot(bundle.providers, named: "providers.json"), surfaceModels: acceptSnapshot(bundle.surfaceModels,
+            named: "model_preferences.json"))
         if let v = acceptSnapshot(bundle.providerSignIns, named: "provider_sign_ins.json"), providerSignIns != v { providerSignIns = v }
     }
 
@@ -790,13 +784,15 @@ extension iCloudSyncEngine {
         async let personality: SnapshotReading<PersonalityProfile> = Self.loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         async let voicePreference: SnapshotReading<MobileVoicePreference> = Self.loadSnapshotObjectOnly(named: "voice_preference.json", in: snapshotDir)
         async let health: SnapshotReading<RuntimeHealth> = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
-        async let organismLivingStatus: SnapshotReading<OrganismLivingStatusFile> = Self.loadSnapshotObjectOnly(named: "organism_living_status.json", in: snapshotDir)
+        async let organismLivingStatus: SnapshotReading<OrganismLivingStatusFile> = Self.loadSnapshotObjectOnly(named: "organism_living_status.json",
+            in: snapshotDir)
         async let sessions: SnapshotReading<[ChatSession]> = Self.loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
         async let pinnedChatSessions: SnapshotReading<ChatSessionNavigation> = Self.loadSnapshotObjectOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
         async let connectors: SnapshotReading<[MobileConnectorSnapshot]> = Self.loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: SnapshotReading<[ProviderInfo]> = Self.loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let providerSignIns: SnapshotReading<[String: [String: String]]> = Self.loadSnapshotObjectOnly(named: "provider_sign_ins.json", in: snapshotDir)
-        async let surfaceModels: SnapshotReading<MacSnapshotRead<[String: NAProviderSurfaceSelection]>> = Self.loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
+        async let surfaceModels: SnapshotReading<MacSnapshotRead<[String: NAProviderSurfaceSelection]>> = Self.loadSnapshotObjectOnly(
+            named: "model_preferences.json", in: snapshotDir)
         async let approvals: SnapshotReading<MacSnapshotRead<[ApprovalRequest]>> = Self.loadSnapshotObjectOnly(named: "approvals.json", in: snapshotDir)
         return await LightweightSnapshotBundle(
             trustPolicy: trustPolicy,
@@ -815,34 +811,27 @@ extension iCloudSyncEngine {
     }
 
     private func readActivitySnapshots(
-        snapshotDir: URL, lifecycle: UInt64
+        snapshotDir: URL, lifecycle: UInt64, recovery: DeviceSyncRecovery
     ) async -> (loadedAny: Bool, loadedAll: Bool, publishedAll: Bool) {
         guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return (false, false, false) }
-        let inboxAccepted = await refreshInboxSnapshot()
-        var publications = 0
-        let snapshots = await workshopRead.read({
-            await memoryRead.read({
-                async let workshopTasks: SnapshotReading<[WorkshopTaskRecord]> = Self.loadSnapshotArrayOnly(named: "workshop_tasks.json", in: snapshotDir)
-                async let memories: SnapshotReading<MacSnapshotRead<[MemoryRecord]>> = Self.loadSnapshotObjectOnly(named: "memories.json", in: snapshotDir)
-                async let memoryProposals: SnapshotReading<MacSnapshotRead<[MemoryProposalRecord]>> = Self.loadSnapshotObjectOnly(named: "memory_proposals.json", in: snapshotDir)
-                return await (workshopTasks: workshopTasks, memories: memories, memoryProposals: memoryProposals)
-            }, publish: { rows in
-                guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return }
-                if let v = acceptSnapshot(rows.memories, named: "memories.json") { memories = orderedSnapshot(v, file: "memories.json", current: memories) }
-                if let v = acceptSnapshot(rows.memoryProposals, named: "memory_proposals.json") {
-                    memoryProposalsSnapshotLoaded = true
-                    memoryProposals = orderedSnapshot(v, file: "memory_proposals.json", current: memoryProposals).filter(\.isPending)
-                }
-                publications += 1
-            })
+        let inboxAccepted = await refreshInboxSnapshot(recovery: recovery)
+        var published = false
+        let snapshots = await memoryRead.read({
+            async let memories: SnapshotReading<MacSnapshotRead<[MemoryRecord]>> = Self.loadSnapshotObjectOnly(named: "memories.json", in: snapshotDir)
+            async let memoryProposals: SnapshotReading<MacSnapshotRead<[MemoryProposalRecord]>> = Self.loadSnapshotObjectOnly(
+                named: "memory_proposals.json", in: snapshotDir)
+            return await (memories: memories, memoryProposals: memoryProposals)
         }, publish: { rows in
             guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return }
-            if let v = acceptSnapshot(rows.workshopTasks, named: "workshop_tasks.json") { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
-            publications += 1
+            if let v = acceptSnapshot(rows.memories, named: "memories.json") { memories = orderedSnapshot(v, file: "memories.json", current: memories) }
+            if let v = acceptSnapshot(rows.memoryProposals, named: "memory_proposals.json") {
+                memoryProposalsSnapshotLoaded = true
+                memoryProposals = orderedSnapshot(v, file: "memory_proposals.json", current: memoryProposals).filter(\.isPending)
+            }
+            published = true
         })
-        let loaded = [snapshots.workshopTasks.value != nil, snapshots.memories.value != nil, inboxAccepted,
-                      snapshots.memoryProposals.value != nil]
-        return (loaded.contains(true), loaded.allSatisfy { $0 }, publications == 2 && inboxAccepted)
+        let loaded = [snapshots.memories.value != nil, inboxAccepted, snapshots.memoryProposals.value != nil]
+        return (loaded.contains(true), loaded.allSatisfy { $0 }, published && inboxAccepted)
     }
 
 }

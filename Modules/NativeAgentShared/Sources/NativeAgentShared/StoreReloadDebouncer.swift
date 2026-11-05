@@ -1,8 +1,7 @@
 import Foundation
 
-// Blueprint: | `StoreReloadDebouncer.swift` | `StoreReloadDebouncer`: visibility-gated trailing-edge reloads with one in flight; exclusion lasts until actual reload exit; `Timer` owns cancellable delays for reloads, source invalidations, context and cognition |
+// Blueprint: | `StoreReloadDebouncer.swift` | `StoreReloadDebouncer`, `Timer`: one reload in flight until actual exit |
 
-/// Trailing-edge event debounce with visibility gating and one reload in flight.
 public actor StoreReloadDebouncer {
     /// Actor-owned trailing-edge sleeper. Domain state stays with the caller.
     public struct Timer: Sendable {
@@ -68,8 +67,7 @@ public actor StoreReloadDebouncer {
         timer.cancel()
         dirty = false
         visible = false
-        // Keep exclusion until reload actually exits, including work that
-        // ignores cancellation. A subsequent visible lifecycle waits for it.
+        // Keep exclusion until reload actually exits, including work that ignores cancellation. A subsequent visible lifecycle waits for it.
         activeReload?.cancel()
     }
 

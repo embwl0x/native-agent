@@ -13,7 +13,7 @@ import CoreFoundation
 import ProviderRouting
 import CryptoKit
 import SQLite3
-// Blueprint: | `AgentContactTaskReceipts.swift` | Canonical SQLite task receipts and checked payload compaction; recovery-debt payloads remain retained; launch recovery requires a complete checked store read; the finished per-reply JSON importer is removed |
+// Blueprint: | `AgentContactTaskReceipts.swift` | SQLite owns checked task receipts and payload debt. |
 extension AgentContactTasks {
     private func taskKey(id: String, owner: String) -> String {
         AgentPeerReplayClaimStore.digest(Data((owner + "\u{1f}" + id).utf8))
@@ -31,7 +31,8 @@ extension AgentContactTasks {
         }
     }
     private func compactReplyPayloads() throws {
-        let retained = try retainedTasks().filter { $0.state.terminal && $0.replyRecovery == nil && !$0.owesCallbacks && $0.replyPayloadExpired != true && $0.hasReplyPayload }
+        let retained = try retainedTasks().filter { $0.state.terminal && $0.replyRecovery == nil && !$0.owesCallbacks
+            && $0.replyPayloadExpired != true && $0.hasReplyPayload }
         var expired: [AgentContactTask] = []
         for saved in retained.sorted(by: { $0.updated < $1.updated }).prefix(max(0, retained.count - capacity)) {
             var compact = saved
@@ -90,7 +91,8 @@ extension AgentContactTasks {
         let key = id.flatMap { id in owner.map { taskKey(id: id, owner: $0) } }
         return try withTaskDatabase { database in
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(database, key == nil ? "SELECT key, receipt FROM outcomes" : "SELECT key, receipt FROM outcomes WHERE key = ?", -1, &statement, nil) == SQLITE_OK else {
+            guard sqlite3_prepare_v2(database, key == nil ? "SELECT key, receipt FROM outcomes" : "SELECT key, receipt FROM outcomes WHERE key = ?",
+                -1, &statement, nil) == SQLITE_OK else {
                 throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
             }
             defer { sqlite3_finalize(statement) }
@@ -113,7 +115,8 @@ extension AgentContactTasks {
                       NativeAgentA2AWire.locator(task.id) != nil,
                       taskKey(id: task.id, owner: task.owner) == storedKey,
                       key == nil || (task.id == id && task.owner == owner) else {
-                    if key != nil || requireComplete { throw AgentContactFailure(code: -32603, message: "The retained task at key \(storedKey) is invalid. Existing bytes were preserved.") }
+                    if key != nil || requireComplete { throw AgentContactFailure(code: -32603,
+                        message: "The retained task at key \(storedKey) is invalid. Existing bytes were preserved.") }
                     nativeLog("AgentContactTasks: invalid retained task at %@; existing bytes were preserved", storedKey)
                     continue
                 }
@@ -129,7 +132,9 @@ extension AgentContactTasks {
             var committed = false
             defer { if !committed { sqlite3_exec(database, "ROLLBACK", nil, nil, nil) } }
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(database, "INSERT INTO outcomes (key, receipt) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET receipt = excluded.receipt", -1, &statement, nil) == SQLITE_OK else {
+            guard sqlite3_prepare_v2(database,
+                "INSERT INTO outcomes (key, receipt) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET receipt = excluded.receipt", -1, &statement,
+                nil) == SQLITE_OK else {
                 throw AgentContactFailure(code: -32603, message: "The reply could not be saved. Do not resend automatically.")
             }
             defer { sqlite3_finalize(statement) }

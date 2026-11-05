@@ -6,7 +6,7 @@ import TrustCenter
 import CryptoKit
 import GRDB
 import PersonaEngine
-// Blueprint: | `ContextPreparation+Feedback.swift` | Ordered advisory feedback persistence and replay; cache matches generation, event ordinal and decay bucket; retained delivery evidence alone grants conversation-local rest |
+// Blueprint: | `ContextPreparation+Feedback.swift` | ordered feedback replay and delivery-backed local rest |
 
 extension ContextPreparation {
     func feedbackSnapshot(
@@ -56,8 +56,7 @@ extension ContextPreparation {
         }
     }
 
-    /// Rest needs proof that this delivery is in this conversation's retained
-    /// exchanges. Older events still train global reachability, never local rest.
+    /// Rest needs proof that this delivery is in this conversation's retained exchanges. Older events still train global reachability, never local rest.
     func servedTurnsAgo(sessionID: String?, recentExchanges: [[String]]) -> [ContextAtomID: Int] {
         guard let sessionID else { return [:] }
         var distances: [String: Int] = [:]
@@ -110,8 +109,7 @@ extension ContextPreparation {
                 feedbackEvents.removeFirst(feedbackEvents.count - 4_096)
             }
         } catch {
-            // Context feedback is advisory, but a failed write must not look
-            // like a healthy restart that merely learned nothing.
+            // Context feedback is advisory, but a failed write must not look like a healthy restart that merely learned nothing.
             lastError = "context feedback persistence failed: \(error)"
             diagnostics("[context-flow] \(lastError ?? "context feedback persistence failed")")
             return
@@ -125,8 +123,7 @@ extension ContextPreparation {
         do {
             let restored = try await store.recentFeedbackEvents(limit: 4_096)
             guard isCurrent(lifecycleID) else { return }
-            // Event IDs are ordinal-scoped. Retaining the current high-water
-            // mark prevents a relaunch from overwriting a retained event.
+            // Event IDs are ordinal-scoped. Retaining the current high-water mark prevents a relaunch from overwriting a retained event.
             let ordinal = try await store.feedbackEventOrdinalHighWaterMark()
             guard isCurrent(lifecycleID) else { return }
             feedbackEvents = restored

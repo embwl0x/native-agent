@@ -26,7 +26,7 @@ import ContextFlow
 import AuthoredCapabilities
 // Blueprint: | `StudioWanderToolWitness.swift` | `StudioWanderToolWitness`: hour action admission and encounter evidence at the gated dispatch seam |
 
-/// Witnesses artifact attempts, real delivery and journal writes at the gated dispatch seam.
+/// Witness attempts, actual delivery and journal writes at gated dispatch, never from reply claims.
 actor StudioWanderToolWitness: ToolDispatchClient {
     struct Report: Sendable, Equatable {
         var attemptedArtifact: Bool
@@ -34,25 +34,14 @@ actor StudioWanderToolWitness: ToolDispatchClient {
         var journalEntryID: String?
     }
 
-    /// REACHING for a work. Navigation counts here: opening the page IS the
-    /// attempt, and an attempt that never becomes a delivery is exactly the
-    /// `no_artifact` ending.
-    ///
-    /// `screen` is absent on purpose. Glancing at whatever happens to be in
-    /// front of her is not reaching for anything.
+    /// Navigation establishes an artifact attempt; a screen glance is orientation and cannot establish reaching for a work.
     static let artifactOrgans: Set<String> = deliveringOrgans.union([
         "browser.open",
-        // Opening the consult User left on the table IS reaching for the work it
-        // names. Whether it DELIVERS depends on what the envelope carries — see
-        // `consultDelivered`.
+        // Reading a consult establishes an attempt; only its delivered content can establish an encounter.
         "studio.consult_read",
     ])
 
-    /// RECEIVING one. Only these can prove she actually met the work: the page's
-    /// text, its links, a picture of it, the document itself, the file itself,
-    /// the window itself. Deliberately narrower than the turn's allowlist — a
-    /// tool added tomorrow does not silently start counting as an encounter.
-    ///
+    /// Count delivery only from explicit content-bearing actions so newly allowed tools cannot silently become encounter proof.
     static let deliveringOrgans: Set<String> = [
         "browser.text", "browser.links", "browser.screenshot",
         "mac.read", "mac.look", "files.read", "files.excerpt", "web.read",
@@ -81,7 +70,9 @@ actor StudioWanderToolWitness: ToolDispatchClient {
     nonisolated func dispatch(
         tool: String,
         input: [String: JSONValue],
-        surface: String
+        surface: String,
+        turn: Turn,
+        invocation: ChatToolInvocation
     ) async throws -> JSONValue {
         guard await shouldContinue(), !Task.isCancelled else { throw CancellationError() }
         guard Self.admits(tool: tool, input: input) else {
@@ -89,11 +80,11 @@ actor StudioWanderToolWitness: ToolDispatchClient {
         }
         let name = Self.action(tool: tool, input: input)
         let preview = tool == "app" && input["preview"] == .bool(true)
-        // A screen glance is orientation, not reaching for a work.
+        // A screen glance is orientation rather than an artifact attempt.
         let artifact = !preview && tool != "screen"
         if artifact, Self.artifactOrgans.contains(name) { await noteArtifactAttempt() }
         do {
-            let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
+            let result = try await inner.dispatch(tool: tool, input: input, surface: surface, turn: turn, invocation: invocation)
             if artifact, Self.delivered(tool: name, result: result) { await noteArtifactObtained() }
             if !preview, name == "studio.journal",
                Self.succeeded(result), let id = Self.journalEntryID(in: result) {
@@ -101,49 +92,37 @@ actor StudioWanderToolWitness: ToolDispatchClient {
             }
             return result
         } catch {
-            // A refused or failed organ is exactly the `no_artifact` evidence
-            // this witness exists to keep. Rethrow: she must see the failure.
+            // Retain refusal as no_artifact evidence and rethrow so the agent sees the failure.
             throw error
         }
     }
 
-    nonisolated func listAvailableTools() async throws -> [String] {
-        try await inner.listAvailableTools().filter(Self.advertises)
+    nonisolated func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
+        try await inner.listAvailableTools(turn: turn, surface: surface).filter(Self.advertises)
     }
 
-    nonisolated func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas().filter { Self.advertises($0.name) }
+    nonisolated func listAvailableToolSchemas(turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas(turn: turn, surface: surface).filter { Self.advertises($0.name) }
     }
 
     private func noteArtifactAttempt() { attempted = true }
     private func noteArtifactObtained() { obtained = true }
     private func noteJournalEntry(_ id: String) { journalEntryID = id }
 
-    /// DID THIS CALL PUT THE WORK IN FRONT OF HER?
-    ///
-    /// Three rules, because three organs answer the question differently:
-    ///
-    ///   * A reading organ (`read`, `read_file`, `browser.read_text`, …) that
-    ///     returned a real result delivered.
-    ///   * `browser.open_url` delivers ONLY when it was asked to CAPTURE —
-    ///     `sourceReceipt`/`screenshotReceipt` on the browser run receipt. A
-    ///     bare navigation opened a window and returned; nothing came back to
-    ///     her, so the page is not yet a work she has met.
-    ///   * `studio_consult_read` discovers references, not artifact content.
-    ///     Only a subsequent read or capture witnesses an encounter.
+    /// Content-bearing reads can prove delivery; bare navigation and consult-reference discovery cannot.
+    /// Browser navigation requires a captured source or screenshot receipt before it counts as an encounter.
     static func delivered(tool: String, result: JSONValue) -> Bool {
         guard succeeded(result) else { return false }
         if tool == "browser.open" {
             return carriesCapture(result)
         }
         if tool == "studio.consult_read" { return false }
-        // A cookie wall or script shell is a stub of the page, not the work.
+        // Cookie walls and script shells are page stubs rather than the requested work.
         if tool == "web.read", isThinPage(result) { return false }
         return deliveringOrgans.contains(tool)
     }
 
-    /// web.read's stub flag, wherever the reply carries it: the raw fields,
-    /// an app envelope around them, or the page view's coverage text.
+    /// Read the stub flag through its actual raw, envelope and page-coverage shapes.
     static func isThinPage(_ result: JSONValue) -> Bool {
         switch result {
         case .string(let text): return text.contains("\"thin_page\":true")
@@ -155,10 +134,7 @@ actor StudioWanderToolWitness: ToolDispatchClient {
         }
     }
 
-    /// A browser run that actually brought something back. The run receipt
-    /// carries `sourceReceipt` / `screenshotReceipt` as an object when the call
-    /// asked to capture, and `.null` when it did not
-    /// (Browser+OperationStore.swift).
+    /// Capture receipts establish returned content; null receipts prove only navigation.
     static func carriesCapture(_ result: JSONValue) -> Bool {
         for key in ["sourceReceipt", "screenshotReceipt", "source_receipt", "screenshot_receipt"] {
             if case .object? = deepValue(result, key) { return true }
@@ -166,8 +142,7 @@ actor StudioWanderToolWitness: ToolDispatchClient {
         return false
     }
 
-    /// Read a key from the payload or from one level of nesting (`consult`,
-    /// `output`, `run`), which is how these executors wrap their bodies.
+    /// Read payload keys through one executor-owned wrapper level only.
     static func deepValue(_ result: JSONValue, _ key: String) -> JSONValue? {
         guard case .object(let object) = result else { return nil }
         if let direct = object[key] { return direct }
@@ -179,14 +154,15 @@ actor StudioWanderToolWitness: ToolDispatchClient {
         return nil
     }
 
-    /// Errors, refusals, previews and dry runs never prove delivery.
+    /// Errors, refusals, previews and dry runs cannot prove delivery.
     static func succeeded(_ result: JSONValue) -> Bool {
-        guard ChatToolOutcome.exactResultClass(result) == .succeeded else { return false }
-        if case .object(let object) = result {
+        let reply = ToolResult(result)
+        guard reply.outcome == .succeeded else { return false }
+        if case .object(let object) = reply.payload {
             if object["dryRun"] == .bool(true) || object["dry_run"] == .bool(true)
                 || object["preview"] == .bool(true) { return false }
-            if case .string(let status)? = object["status"],
-               ["dry_run", "preview"].contains(status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) { return false }
+            if object["status"]?.stringValue != nil,
+               reply.said("dry_run") || reply.said("preview") { return false }
         }
         return true
     }
@@ -204,7 +180,7 @@ actor StudioWanderToolWitness: ToolDispatchClient {
     }
 }
 
-/// Only named actions are advertised and dispatchable; refusals explain the boundary.
+/// Advertise and dispatch only named actions; explain refused boundaries.
 extension StudioWanderToolWitness {
     static let admittedActions: Set<String> = [
         "mac.look", "mac.read", "files.read", "files.excerpt", "web.read",
@@ -224,8 +200,7 @@ extension StudioWanderToolWitness {
             : ToolNameAliases.appAction(tool, input: input) ?? ToolNameAliases.canonical(tool)
     }
 
-    // The internal Mac readers remain distinct native organs; the alias owner
-    // maps the other tool spellings onto their app action.
+    // Keep native Mac readers distinct while the alias owner maps other tool spellings to app actions.
     static let admittedOrgans = admittedActions.union(["mac_view", "mac_look"])
 
     static func advertises(_ tool: String) -> Bool {
@@ -235,8 +210,7 @@ extension StudioWanderToolWitness {
     static func admits(tool: String, input: [String: JSONValue]) -> Bool {
         if tool == "workspace" { return input.allSatisfy { $0.key == "__session_id" || $0.value == .null } }
         guard tool == "app" else { return admittedOrgans.contains(action(tool: tool, input: input)) }
-        // Home items can send or mutate at once; scripts hide their individual
-        // actions from this witness. Use the bounded actions directly.
+        // Use bounded actions because home items may mutate immediately and scripts conceal nested actions from this witness.
         for key in ["script", "item"] {
             if let value = input[key], value != .null && value != .string("") { return false }
         }

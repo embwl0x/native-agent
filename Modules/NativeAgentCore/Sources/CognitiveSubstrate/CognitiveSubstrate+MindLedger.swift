@@ -1,17 +1,14 @@
-// CognitiveSubstrate+MindLedger.swift
-// The `mind_ledger` artifact holds bounded suppressions and one disposition undo.
-// Every selector honors source/context suppressions; undo refuses changes newer than the update it reverses.
+// Bound suppressions and disposition undo; selectors honor source/context scope, and undo requires the exact value its update left.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Studio
 
-// Blueprint: | `CognitiveSubstrate+MindLedger.swift` | `CognitiveSubstrate` mind ledger: bounded association suppressions and one disposition undo, persistence and restoration |
+// Blueprint: | `CognitiveSubstrate+MindLedger.swift` | `CognitiveSubstrate`: bounded suppressions and disposition undo |
 
 public struct CognitiveAssociationSuppression: Sendable, Equatable {
-    /// `memory:<record id>`, `care:<uuid>` or `dream:<date>#<n>`;
-    /// an outreach subject may also be `desk:<handle>` or `ship:<builder>[:<id>]`.
+    /// `memory:<record id>`, `care:<uuid>` or `dream:<date>#<n>`; an outreach subject may also be `desk:<handle>` or `ship:<builder>[:<id>]`.
     public var source: String
     /// The signature of the turn it surfaced on. Empty means never.
     public var terms: [String]
@@ -19,7 +16,6 @@ public struct CognitiveAssociationSuppression: Sendable, Equatable {
 }
 
 public struct CognitiveUndoEntry: Sendable, Equatable {
-    /// `disposition`.
     public var key: String
     public var what: String
     /// The item before the update; `.null` when the update created it.
@@ -50,15 +46,12 @@ extension CognitiveSubstrate {
 
     // MARK: - Association signature
 
-    /// What a turn is about, as a few content terms: the context half of a
-    /// suppression and of every `mind.why` record. Same tokenizer the
-    /// continuity matching uses.
+    /// Share continuity tokenization so suppression and `mind.why` agree on turn context.
     public static func associationSignature(_ text: String) -> [String] {
         Array(associationTerms(in: text).prefix(associationSignatureTermCap)).sorted()
     }
 
-    /// A suppression covers a message that shares at least two of its terms
-    /// (all of them when it has fewer). No terms: always.
+    /// A suppression covers a message that shares at least two of its terms (all of them when it has fewer). No terms: always.
     public static func suppressionCovers(_ terms: [String], messageTerms: [String]) -> Bool {
         guard !terms.isEmpty else { return true }
         let shared = terms.filter { term in messageTerms.contains { associationTermsMatch($0, term) } }.count
@@ -71,7 +64,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// Memory record id → signature, for the context lane's attention read.
+    /// Memory suppression signatures serve the context owner's attention read.
     func suppressedMemoryAssociations() -> [String: [[String]]] {
         var out: [String: [[String]]] = [:]
         for row in associationSuppressions where row.source.hasPrefix("memory:") {
@@ -80,15 +73,14 @@ extension CognitiveSubstrate {
         return out
     }
 
-    /// She rejects one association. Idempotent per (source, signature); the
-    /// oldest drops past the cap.
+    /// Suppression is idempotent per source and context; evict the oldest beyond the cap.
     @discardableResult
     public func rejectAssociation(
         source: String,
         terms: [String],
         seat: StudioCanonTurnProvenance
     ) async -> String? {
-        // Her own live turn, never a bridge.
+        // The agent's own live turn, never a bridge.
         guard seat.isComplete else { return "a rejection is made from inside your own turn" }
         let source = String(source.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
         guard ["memory:", "care:", "dream:", "desk:", "ship:"].contains(where: source.hasPrefix), source.count > 6 else {
@@ -118,7 +110,7 @@ extension CognitiveSubstrate {
         "\(disposition.valence)|\(disposition.updatedAt.timeIntervalSince1970)"
     }
 
-    /// The newest undertone update replaces the previous undo.
+    /// Retain only the newest undertone undo.
     func recordDispositionUndo(what: String, previous: JSONValue, stamp: String) async {
         dispositionUndo = .init(
             key: "disposition", what: bounded(what, maxCharacters: 160), previous: previous,
@@ -128,8 +120,7 @@ extension CognitiveSubstrate {
 
     public func undoSnapshot() -> [CognitiveUndoEntry] { dispositionUndo.map { [$0] } ?? [] }
 
-    /// Reverse ONE update of hers. Compare-and-set: the item must still hold
-    /// the value that update left, else the call is refused with what it holds
+    /// Reverse ONE update of the agent's. Compare-and-set: the item must still hold the value that update left, else the call is refused with what it holds
     /// now and nothing changes.
     public func undoUpdate(key: String, seat: StudioCanonTurnProvenance) async -> CognitiveUndoOutcome {
         guard seat.isComplete else {
@@ -182,8 +173,7 @@ extension CognitiveSubstrate {
             return .refused(reason: "the undo was not saved; you can retry: \(error)",
                             current: .object(["valence": .double(current.valence)]))
         }
-        // Only the entry this call undid: a newer update of the same item may
-        // have recorded its own while the write above was suspended.
+        // Only the entry this call undid: a newer update of the same item may have recorded its own while the write above was suspended.
         if dispositionUndo == entry { dispositionUndo = nil }
         await recordReceipt(kind: "mind.undo", payload: .object([
             "item": .string(key), "what": .string(entry.what),

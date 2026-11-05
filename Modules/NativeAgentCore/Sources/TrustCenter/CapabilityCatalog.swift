@@ -3,19 +3,11 @@ import Darwin
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `CapabilityCatalog.swift` | Read-only typed saved capability sources and trust roots; source writes validate stable name-derived identity and commit under the source lock. No pack source, root, key creation or availability projection; retained pack bytes remain untouched. |
+// Blueprint: | `CapabilityCatalog.swift` | Read-only checked sources/roots; writes validate identity under lock. |
 
 // MARK: - Capability catalog persistence
-//
-// Sources and trust roots are checked operator authority. Reads never rewrite
-// lists; missing lists have no saved records. Reads create no signing identity
-// or synthetic local pack source/root. Retained pack files are inert.
-// Local backup includes sources, roots and registry; export
-// selects sources, roots and registry only. The 64-hex-character, 0600
-// retained .pack_signing_key is deliberately excluded from local backup, export and
-// phone sync. No catalog file syncs to the phone. PrivacyMap lists Catalog
-// including regular hidden files in its directory size tally. Storage/export
-// exclusions do not exclude bytes from this privacy inventory.
+// Saved sources and roots are checked authority: reads neither rewrite them nor create signing identity. Storage exclusions do not remove hidden retained files
+// from privacy inventory.
 
 // MARK: - File-private helpers
 
@@ -28,7 +20,10 @@ public enum CapabilityCatalogPersistenceError: Error, LocalizedError {
         case .unreadable(let path, let detail):
             return "capability_catalog_unreadable: Cannot read \(path): \(detail). Repair access to this file; preserve its bytes and saved authority."
         case .malformed(let path, let detail):
-            return "capability_catalog_malformed: Invalid records in \(path): \(detail). Repair this file from its retained bytes, preserving every record and authority choice; never reset it to an empty catalog."
+            return """
+                capability_catalog_malformed: Invalid records in \(path): \(detail). Repair this file from its retained bytes, preserving every \
+                record and authority choice; never reset it to an empty catalog.
+                """
         }
     }
 
@@ -47,7 +42,11 @@ public enum CapabilityCatalogPersistenceError: Error, LocalizedError {
                 effects: .none, owner: path,
                 code: "capability_catalog_malformed",
                 instruction: ToolFailureError.fileRepairInstruction(file,
-                    shape: "This catalog authority store must be a JSON array of records with unique nonblank string IDs, string names and typed optional string fields. Preserve every record, field, trust root, source and authority choice. Recover required fields only from these retained bytes; never invent IDs, status or authority, or reset the catalog.") + " Repair only the named catalog file from its retained bytes, preserving saved authority.")
+                    shape: """
+                        This catalog authority store must be a JSON array of records with unique nonblank string IDs, string names and typed optional \
+                        string fields. Preserve every record, field, trust root, source and authority choice. Recover required fields only from these \
+                        retained bytes; never invent IDs, status or authority, or reset the catalog.
+                        """) + " Repair only the named catalog file from its retained bytes, preserving saved authority.")
         }
     }
 }
@@ -96,12 +95,9 @@ private func loadObjectRowsChecked(
     return try CapabilityCatalogStoreReader.objectRowsChecked(raw, at: path, recordKind: recordKind, validate: validate)
 }
 
-/// Reusable strict boundary for capability authority files. Backup/restore and
-/// other ingress paths should call these methods before installing bytes so the
-/// same missing-vs-damaged contract governs live reads and restore preflight.
+/// Use the same strict boundary for live reads and restore preflight so missing and damaged authority never collapse.
 public enum CapabilityCatalogStoreReader {
-    /// Pure, strict read of saved catalog sources. A missing store has no
-    /// records. An existing damaged store throws; its bytes remain untouched.
+    /// Pure, strict read of saved catalog sources. A missing store has no records. An existing damaged store throws; its bytes remain untouched.
     public static func catalogSources(dataRoot: URL) throws -> [[String: JSONValue]] {
         let sourcesPath = dataRoot
             .appendingPathComponent("catalog", isDirectory: true)
@@ -181,14 +177,14 @@ public enum CapabilityCatalogStoreReader {
     }
 }
 
-/// Stable name-derived identity. An unusable name is refused before any write.
+/// Refuse unusable names before deriving durable source identity or writing.
 private func swiftCatalogSlugify(_ value: String) throws -> String {
     let lowered = value.lowercased()
     var out = ""
     var pendingDash = false
     for scalar in lowered.unicodeScalars {
         let v = scalar.value
-        let isLowerAlnum = (v >= 0x61 && v <= 0x7A) || (v >= 0x30 && v <= 0x39) // a-z 0-9
+        let isLowerAlnum = (v >= 0x61 && v <= 0x7A) || (v >= 0x30 && v <= 0x39)
         if isLowerAlnum {
             if pendingDash && !out.isEmpty { out += "-" }
             pendingDash = false
@@ -228,14 +224,6 @@ public actor SwiftNativeCatalogWrites {
             .appendingPathComponent("sources.json")
     }
 
-    /// Shared diagnostic ledger; appends belong to TurnTracePersistLane.
-    private var tracesPath: URL {
-        dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-    }
-
-    /// Replace the source with the same slugified ID and append its replacement.
     public func upsertCatalogSource(name: String, url: String, kind: String) async throws -> [String: JSONValue] {
         let name = String(name.prefix(120))
         let sourceID = try swiftCatalogSlugify(name)
@@ -270,12 +258,12 @@ public actor SwiftNativeCatalogWrites {
             return record
         }
         // Receipt failures propagate even after the source write succeeded.
-        try await TurnTracePersistLane(standalonePath: tracesPath).appendChecked(
+        try await TurnTracePersistLane(dataRootOverride: dataRoot).appendChecked(
             TurnTraceEvent(kind: "catalog.source.save", title: name, status: status,
             payload: .object([
                 "sourceId": .string(sourceID),
                 "status": .string(status),
-            ]), createdAt: SwiftNativeManifestSigner.isoTimestamp(clock())))
+            ]), createdAt: SwiftNativeManifestSigner.isoTimestamp(clock()), turn: nil))
         return record
     }
 

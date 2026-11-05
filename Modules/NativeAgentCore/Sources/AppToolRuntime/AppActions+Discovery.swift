@@ -24,7 +24,7 @@ import MemoryV2
 import StandingBots
 import TurnTrace
 import Studio
-// Blueprint: | `AppActions+Discovery.swift` | AppActions argument guides, current folded schema projection including root form constraints and schema-derived root-alternative examples, call discovery, plural expansion and disabled-ability records |
+// Blueprint: | `AppActions+Discovery.swift` | Guides, schema constraints, examples and scalar-list discovery |
 
 extension AppActions {
     /// Guides that carry their arguments' own words. Every folded action's guide is an item read (guide:<id>) its refusals point to.
@@ -55,14 +55,12 @@ extension AppActions {
         }
     }
 
-    /// The folded tools' own schemas, built once: a fold's args and label are its tool's, and its whole description answers a call that
-    /// went wrong.
+    /// The folded tools' own schemas, built once: a fold's args and label are its tool's, and its whole description answers a call that went wrong.
     static let foldSchemas: [String: LLMToolSchema] = Dictionary(uniqueKeysWithValues:
         SwiftToolDispatcher.nativeToolDescriptors.values.filter { ToolNameAliases.foldedTools[$0.name] != nil }
             .map { ($0.name, $0.schema) } + AppToolExecutor.appToolSchemas(includeDoor: false).map { ($0.name, $0) })
 
-    /// Project parameter references once, using the door's accepted names. Common words such as "by name" or "a path" retain their prose
-    /// meaning.
+    /// Project parameter references once, using the door's accepted names. Common words such as "by name" or "a path" retain their prose meaning.
     static func argumentProse(_ text: String, tool: String) -> String {
         if let names = ToolNameAliases.doorArgNames[tool] {
             let words = try! NSRegularExpression(pattern: #"\b[a-z][a-z0-9_]*\b"#)
@@ -86,15 +84,15 @@ extension AppActions {
         return text
     }
 
-    /// A folded tool's whole description, its old tool names read as action ids. A guided action's carries every argument's own words too.
+    /// Guides translate folded tool names to action ids and retain every guided argument's description.
     public static func about(_ action: AppAction) throws -> String? {
-        // Every action has a guide. A native action's is its own declaration:
-        // what it does, its arguments and what to know before running it.
+        // Native guides use their declaration so behavior, arguments and admission notes have one owner.
         let warn = action.warn.isEmpty ? "" : "\nBefore running: " + action.warn
         let declared = action.args.isEmpty ? "" : "\nArgs: " + action.args.joined(separator: ", ")
         guard let schema = schema(action) else { return action.label + declared + warn }
-        guard action.isFold else {
-            // Its tool's own words for each argument, under the door's names.
+        // A fold with fixed input and declared args is its own narrower door over the host (permissions.request over card requests), so its
+        // declaration guides it; one with no args (phone.location, trace.model_calls) keeps the fold guide, which lists none.
+        guard action.isFold, action.input.isEmpty || action.args.isEmpty else {
             let doorNames = Set(action.args.flatMap { arg in
                 String(arg.prefix { $0 != ":" && $0 != "?" }).split(separator: "|").map(String.init)
             })
@@ -114,9 +112,7 @@ extension AppActions {
     }
 
     static func schema(_ action: AppAction) -> LLMToolSchema? {
-        // Folded/native contracts are captured when the action is declared.
-        // A door-owned action with only explicit arg shapes is intentionally
-        // schema-less, not a failed read of its executor's multiplexed schema.
+        // Folded/native contracts are captured at declaration; explicit door argument shapes may intentionally have no executor schema.
         action.schema
     }
 
@@ -135,8 +131,7 @@ extension AppActions {
             let values = if case .array(let values)? = property["enum"] { values } else { property["const"].map { [$0] } ?? [] }
             return values.contains { if case .array = $0 { false } else if case .object = $0 { false } else { true } }
         }
-        // An argument whose schema takes a list is never fanned out: a list there is one value, well-formed or not, so a malformed one is
-        // refused whole by the door's validation instead of running element by element.
+        // A list accepted by the schema is one value; malformed values must fail whole instead of fanning out.
         func takesList(_ schema: JSONValue) -> Bool {
             guard case .object(let property) = schema else { return false }
             if property["type"] == .string("array") { return true }
@@ -149,17 +144,21 @@ extension AppActions {
         return properties.filter { key, value in !action.secretArgs.contains(key) && scalar(value) && !takesList(value) }.keys.sorted()
     }
 
-    /// the native schema's descriptions, enums and nested constraints.
+    /// Retain the native schema's descriptions, enums and nested constraints.
     static func discovery(_ action: AppAction, blocker: String? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> JSONValue {
         let native = try schema(action).map { try JSONValue.parse($0.parametersJSON) }
         let properties: [String: JSONValue]
         if let native {
             guard case .object(let root) = native else {
-                throw ToolFailureError("\(action.id)'s declared parameter schema is not an object. Repair its owning schema before using this action.", effects: .none, code: "action_schema_unavailable")
+                throw ToolFailureError("""
+                    \(action.id)'s declared parameter schema is not an object. Repair its owning schema before using this action.
+                    """, effects: .none, code: "action_schema_unavailable")
             }
             if let value = root["properties"] {
                 guard case .object(let props) = value else {
-                    throw ToolFailureError("\(action.id)'s declared parameter schema properties are not an object. Repair its owning schema before using this action.", effects: .none, code: "action_schema_unavailable")
+                    throw ToolFailureError("""
+                        \(action.id)'s declared parameter schema properties are not an object. Repair its owning schema before using this action.
+                        """, effects: .none, code: "action_schema_unavailable")
                 }
                 properties = props
             } else { properties = [:] }
@@ -172,8 +171,7 @@ extension AppActions {
             let shape = raw.split(separator: ":", maxSplits: 1).dropFirst().first.map(String.init) ?? "string"
             for name in spec.names {
                 if native != nil {
-                    // Folded names may project one schema argument to the door,
-                    // but an unavailable property is never a synthesized contract.
+                    // Folded names may project one schema argument to the door, but an unavailable property is never a synthesized contract.
                     let nativeName = action.rename[name] ?? name
                     let property: JSONValue
                     if let declared = properties[nativeName] { property = declared }
@@ -182,7 +180,9 @@ extension AppActions {
                         // Required does not imply a property/type declaration.
                         property = .object([:])
                     } else {
-                        throw ToolFailureError("\(action.id)'s schema does not declare \(name). Repair its owning action/schema declaration before using it.", effects: .none, code: "action_schema_unavailable")
+                        throw ToolFailureError("""
+                            \(action.id)'s schema does not declare \(name). Repair its owning action/schema declaration before using it.
+                            """, effects: .none, code: "action_schema_unavailable")
                     }
                     props[name] = property
                 } else { props[name] = ToolSignature.doorProperty(shape) }
@@ -213,8 +213,9 @@ extension AppActions {
             example["subject"] = .string("<observed subject>")
         }
         if action.id == "mac.act", example.isEmpty {
-            // The steps she can see go in one act, each checked against the screen the last one left.
-            example = ["app": .string("<app>"), "steps": .array([.string("<button>"), .object(["verb": .string("type"), "target": .string("<field>"), "text": .string("<text>")]), .string("return")])]
+            // Each act step is checked against the screen left by the preceding step.
+            example = ["app": .string("<app>"), "steps": .array([.string("<button>"), .object(["verb": .string("type"), "target": .string("<field>"),
+                "text": .string("<text>")]), .string("return")])]
         }
         if action.id == "mac.look" { example["app"] = .string("<app name or bundle ID>") }
         if action.id == "ability.validate", example["input"] == nil { example["input"] = .object([:]) }
@@ -225,10 +226,7 @@ extension AppActions {
             example = ["kind": .string("rem"), "payload": .object(["objective": .string("Consolidate the week's memories")]),
                 "schedule": .object(["type": .string("daily"), "at": .string("<HH:MM>")])]
         }
-        // Authored calls use their native contract without folding. Omitted
-        // properties never erase required names or change additionalProperties.
-        // A bound form (for example phone.location) supplies fixed executor
-        // arguments itself; its public call uses its declared action args.
+        // Authored contracts retain required names and additionalProperties; bound forms supply fixed executor args outside the public call.
         var args: [String: JSONValue] = if action.folded, action.input.isEmpty, let native,
             case .object(let fields) = ToolNameAliases.doorSchema(action.tool, native) { fields }
         else if action.authored || action.argSpecs.isEmpty && action.input.isEmpty, case .object(let fields)? = native { fields }
@@ -241,8 +239,7 @@ extension AppActions {
             let declared = if case .array(let forms)? = args["allOf"] { forms } else { [JSONValue]() }
             args["allOf"] = .array(declared + alternatives)
         }
-        // Root alternatives constrain the whole call even when each argument is
-        // individually optional. Use the published schema's first alternative.
+        // Root alternatives constrain the whole call even when each argument is individually optional. Use the published schema's first alternative.
         if case .array(let variants)? = args["anyOf"],
            case .object(let first)? = variants.first,
            case .array(let required)? = first["required"],
@@ -262,10 +259,15 @@ extension AppActions {
         if !plural.isEmpty, action.isFold || action.read || !action.readWhen.isEmpty {
             result["door_expansion"] = .object(["scalar_arguments": .array(plural.map(JSONValue.string)),
                 "max_list_arguments": .int(1),
-                "note": .string("For a folded action or read call, one eligible scalar may be a nonempty list: runs once per value with each child's validation and gates. After a failure or person wait, only later read values run. Native array arguments stay arrays.")])
+                "note": .string("""
+                    For a folded action or read call, one eligible scalar may be a nonempty list: runs once per value with each child's validation and gates. \
+                    After a failure or person wait, only later read values run. Native array arguments stay arrays.
+                    """)])
         }
         if !action.returnedScope.isEmpty { result["scope"] = .string(action.returnedScope) }
-        if !action.read { result["version_note"] = .string("expected_version is optional. Chain versioned calls with the latest receipt's page_version; a change can replace the prior version.") }
+        if !action.read { result["version_note"] = .string("""
+            expected_version is optional. Chain versioned calls with the latest receipt's page_version; a change can replace the prior version.
+            """) }
         if let blocker {
             result["availability"] = .string("unavailable")
             result["blocker"] = .string(blocker)

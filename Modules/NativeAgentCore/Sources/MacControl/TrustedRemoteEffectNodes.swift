@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustedRemoteEffectNodes.swift` | Reads operator-provisioned trusted node JSON; SSH settlement retains bounded output, exit and truncation evidence on Stop without claiming remote cancellation |
+// Blueprint: | `TrustedRemoteEffectNodes.swift` | Provisioned SSH nodes retain bounded settlement evidence without claiming remote cancellation |
 
 public struct TrustedRemoteEffectNode: Codable, Identifiable, Hashable, Sendable {
     public let id: String
@@ -52,22 +52,31 @@ public enum TrustedRemoteEffectError: Error, LocalizedError, Equatable, Sendable
 
     public var errorDescription: String? {
         switch self {
-        case .corruptStore: "remote_node_store_corrupt: Execution is disabled. Repair mac_control/trusted_remote_nodes.json under the app data root, preserving the original bytes; do not replace it with an empty list."
+        case .corruptStore: """
+                remote_node_store_corrupt: Execution is disabled. Repair mac_control/trusted_remote_nodes.json under the app data root, preserving the \
+                original bytes; do not replace it with an empty list.
+                """
         case .invalidNode(let reason): "invalid_remote_node: \(reason). Correct this field in mac_control/trusted_remote_nodes.json before execution."
         case .unknownNode(let id): "remote_node_not_found: \(id). Use app {action:\"node.list\"} to select a configured node."
-        case .disabledNode(let name): "remote_node_disabled: \(name). The owner must enable this node's enabled field in mac_control/trusted_remote_nodes.json before execution."
-        case .executableDenied(let value): "remote_executable_denied: \(value). Choose an allowed executable from app {action:\"node.list\"}; only the owner may expand allowedExecutables in mac_control/trusted_remote_nodes.json."
+        case .disabledNode(let name): """
+                remote_node_disabled: \(name). The owner must enable this node's enabled field in mac_control/trusted_remote_nodes.json before \
+                execution.
+                """
+        case .executableDenied(let value): """
+                remote_executable_denied: \(value). Choose an allowed executable from app {action:\"node.list\"}; only the owner may expand allowedExecutables \
+                in mac_control/trusted_remote_nodes.json.
+                """
         case .invalidArgument(let reason): "invalid_remote_argument: \(reason). Correct the reported argument in node.run before execution."
-        case .transport(let reason): "remote_transport_failed: \(reason). Inspect the remote command's effects before another execution; correct the reported SSH connection or authentication cause in the node's host, port, user or pinned host key."
+        case .transport(let reason): """
+                remote_transport_failed: \(reason). Inspect the remote command's effects before another execution; correct the reported SSH connection or \
+                authentication cause in the node's host, port, user or pinned host key.
+                """
         }
     }
 }
 
-/// A narrow MacControl adapter. It owns no remote mind, memory, scheduler, or
-/// tool catalog. SSH identity is pinned per invocation in a temporary
-/// known_hosts file and the existing local SSH agent/keychain supplies auth.
-/// Node JSON is operator-provisioned; execution returns its receipt without
-/// writing a second, unread receipt store.
+/// Pin SSH identity per invocation with temporary known_hosts; auth stays in the local SSH agent/keychain. Operator-provisioned nodes return receipts
+/// directly without another store or remote-agent lifecycle.
 public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
     private let root: URL
 

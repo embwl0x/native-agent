@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ProviderRoutingContracts.swift` | `ProviderRoutingSnapshot` carries its checked source revision and owns modelOverrideSurfaces independently of effort/Fast for settings and UI inheritance reads; `TurnRouteAdmission` and checked snapshot admission bind one execution tuple with explicit inheritance; `SwiftNativeProviderRouting` surface lookup conveniences |
+// Blueprint: | `ProviderRoutingContracts.swift` | `ProviderRoutingSnapshot`, `TurnRouteAdmission`, `SwiftNativeProviderRouting` |
 
 extension ProviderSurfaceGroups {
     public static func group(for surface: String) -> ProviderSurfaceGroup? {
@@ -16,10 +16,9 @@ extension ProviderSurfaceGroups {
 
 }
 
-/// Bots carry an explicit provider/model/effort tuple that is validated without downstream reselection.
-/// Route-supplied catalogs precede shipped rows; absent control evidence is unavailable.
+/// Bots carry an explicit provider/model/effort tuple that is validated without downstream reselection. Route-supplied catalogs precede shipped rows;
+/// absent control evidence is unavailable.
 public enum ProviderModelChoice {
-    /// nil when the tuple is usable, else a sentence naming what is wrong.
     public static func rejection(
         provider: String?,
         model: String?,
@@ -79,19 +78,7 @@ public enum ProviderModelChoice {
 }
 
 // MARK: - Subsystem #14: ProviderRouting
-//
-// SwiftNative owns provider inspection/configuration from local app data.
-//
-// Scope: provider CONFIG/INSPECTION plus per-surface model-preference storage:
-// list providers, get one, configure one, run a connectivity test, and
-// read/write model preferences. Live chat routing is Swift-native too:
-// ChatTurnRuntime resolves the surface/model choice and SwiftNativeLLMClient
-// dispatches to the installed OAuth/API-key adapters. This file is not the
-// whole routing engine; it is the provider state/config surface used by the UI
-// and by that Swift chat pipeline.
-//
-// In-process configuration uses the `modelRouting` envelope shared by the UI
-// and the provider store.
+// Provider inspection/configuration and runtime dispatch share the in-process routing owner and modelRouting envelope.
 
 // MARK: - Provider
 
@@ -292,10 +279,7 @@ public enum ProviderRoutingError: Error, LocalizedError {
 
 // MARK: - Resolved surface preferences
 
-/// One surface's resolved preference from the in-process ProviderRouting owner.
-/// Chat members share Chat's tuple; Work and Memory and mind share their
-/// unanimous group override, or inherit Chat's model/account with independent
-/// effort/tier. Partial or conflicting saved overrides are unavailable.
+/// Group members share a unanimous override or inherit Chat's model/account with independent effort/tier; partial/conflicting tuples remain unavailable.
 public struct SurfacePreference: Sendable, Codable, Equatable {
     public var surface: String
     public var model: String
@@ -315,7 +299,7 @@ public struct SurfacePreference: Sendable, Codable, Equatable {
     }
 }
 
-/// The committed group and its canonical readback.
+/// Read back the canonical group after commit.
 public struct ProviderGroupWriteResult: Sendable {
     public let surfacesChanged: [String]
     public let snapshot: ProviderRoutingSnapshot
@@ -338,10 +322,7 @@ public struct ProviderCatalogSnapshot: Sendable {
     public let rowSet: ProviderSurfaceRowSet
 }
 
-/// One reconciled, internally consistent view of the two authoritative picker
-/// projections. Execution paths use this instead of independently reading
-/// model preferences, active providers, and explicit pins across separate
-/// locks, which could otherwise combine values from different commits.
+/// Execution consumes one reconciled picker tuple so model, route and pins cannot come from different commits.
 public struct ProviderRoutingSnapshot: Sendable, Equatable {
     /// The checked picker files' committed source revision, read under their lock.
     public let revision: Double
@@ -372,8 +353,7 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
         self.unusablePicks = unusablePicks
     }
 
-    /// The sentence to show for `surface` when it has no model because the one
-    /// it had cannot be used, else nil.
+    /// An unset surface must name why its saved model cannot run.
     public func unusablePickNotice(for surface: String) -> String? {
         ProviderRoutingSurfaceLookup.value(unusablePicks, surface)
     }
@@ -381,18 +361,11 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
 
 // MARK: - Routing vocabulary
 
-/// Every in-process LLM consumer routes through one of these surfaces.
-/// `ProviderSurfaceGroups` owns the inventory in Chat, Work, then Memory and mind order.
-/// Members share their group's model, account, effort and service tier; Work
-/// and Memory and mind inherit Chat's model/account only with no saved
-/// override; partial/conflicting overrides are unavailable. Setting effort or
-/// tier alone preserves model/account inheritance.
-/// A provider-only override uses that account's default and requires a model
-/// selection when no usable default exists.
+/// One group inventory governs all model consumers. Model/account inherit only with no override; effort/tier mutate independently, and partial/conflicting
+/// tuples remain unavailable.
 public let MODEL_SURFACES: [String] = ProviderSurfaceGroups.all.flatMap(\.surfaces)
 
-/// The current picker rows and any unsupported saved keys, named as an
-/// adverse configuration state rather than silently hidden.
+/// Unsupported saved keys remain visible as adverse state.
 public struct ProviderSurfaceRowSet: Sendable, Equatable {
     public let visibleSurfaces: [String]
     public let unsupportedStoredKeys: [String]
@@ -412,22 +385,20 @@ public struct ProviderSurfaceRowSet: Sendable, Equatable {
     }
 }
 
-/// Current surface names share whitespace/case normalization; retired names
-/// are rejected by each routing admission boundary.
+/// Normalize current surface spelling consistently; unsupported names fail admission.
 public func canonicalRoutingSurface(_ surface: String) -> String {
     surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 }
 
-/// Reasoning controls normalized by the in-process routing owner.
 public let REASONING_EFFORT_OPTIONS: [String] = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
 
 public let SERVICE_TIER_OPTIONS: [String] = ["default", "priority"]
 
-/// Default reasoning control before model/account compatibility normalization.
+/// Default effort still requires model/account compatibility admission.
 public let DEFAULT_REASONING_EFFORT: String = "high"
 
 extension SwiftNativeProviderRouting {
-    /// Independent model lookup for sizing or an explicitly injected routing choice.
+    /// Context sizing may look up a model independently of selection.
     public func modelStringForSurface(_ surface: String) async throws -> String? {
         let prefs = try await computeModelPreferences()
         if let m = ProviderRoutingSurfaceLookup.value(prefs, surface)?.model, !m.isEmpty {
@@ -444,44 +415,50 @@ public enum ProviderRoutingSurfaceLookup {
     }
 }
 
-/// One immutable provider-routing generation admitted before a chat facade
-/// chooses its execution branch. This is execution context only; the
-/// ProviderRouting store remains the sole authority and adapters still use a
-/// checked reread to detect corrupt/revoked authority.
+/// Hold one immutable execution tuple before choosing a branch. The store remains authority and adapters reread credentials for corruption/revocation.
 public struct TurnRouteAdmission: Sendable, Equatable {
     public let routingSurface: String
     public let modelId: String
-    public let reasoningEffort: String
+    public let reasoningEffort: String?
     public let providerId: String?
     public let serviceTier: String?
-    public init(routingSurface: String, modelId: String, reasoningEffort: String,
+    public init(routingSurface: String, modelId: String, reasoningEffort: String?,
                 providerId: String?, serviceTier: String?) {
         self.routingSurface = routingSurface; self.modelId = modelId
         self.reasoningEffort = reasoningEffort; self.providerId = providerId; self.serviceTier = serviceTier
     }
 
-    public func withModelContext<T: Sendable>(model: String? = nil, reasoningEffort: String? = nil,
-        isolation: isolated (any Actor)? = #isolation,
-        _ body: () async throws -> T) async rethrows -> T {
-        try await LLMCallContext.$admittedModel.withValue(model ?? modelId) {
-        try await LLMCallContext.$providerId.withValue(providerId) {
-        try await LLMCallContext.$reasoningEffort.withValue(reasoningEffort ?? self.reasoningEffort) {
-        try await LLMCallContext.$serviceTier.withValue(serviceTier, operation: body)
-        } } }
+    public var modelAdmission: ModelAdmission {
+        get throws {
+            guard let providerId, !providerId.isEmpty else { throw LLMError.notConfigured(provider: "router") }
+            return ModelAdmission(provider: providerId, model: modelId,
+                reasoningEffort: reasoningEffort, serviceTier: serviceTier)
+        }
+    }
+
+    /// Apply the selected tuple to the value the caller will hand to its work.
+    public func admittedTurn(_ turn: Turn, model: String? = nil, reasoningEffort: String? = nil) throws -> Turn {
+        let admitted = try modelAdmission
+        return turn.with(\.admission, ModelAdmission(provider: admitted.provider, model: model ?? admitted.model,
+            reasoningEffort: reasoningEffort ?? admitted.reasoningEffort, serviceTier: admitted.serviceTier))
     }
 }
 
 extension ProviderRoutingSnapshot {
     public func routeAdmission(for surface: String, requestedModel: String? = nil,
         requestedReasoningEffort: String? = nil, suppliedModel: String = "",
-        choice: ProviderTurnChoice? = ProviderTurnChoice.current,
-        inheritingCall: Bool = false, inheritChat: Bool = true) throws -> TurnRouteAdmission {
+        choice: ProviderTurnChoice? = nil,
+        call: LLMCall? = nil, inheritChat: Bool = true) throws -> TurnRouteAdmission {
         let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let routingSurface = canonicalRoutingSurface(normalized)
-        // Dispatch inherits its bound admission before considering an ambient picker choice.
-        let inheritedModel = inheritingCall ? LLMCallContext.admittedModel?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "" : ""
-        if let choice, inheritedModel.isEmpty {
+        // An admitted call reads exactly the held tuple. Picker changes cannot splice into it.
+        if let admitted = call?.admission {
+            return TurnRouteAdmission(routingSurface: routingSurface, modelId: admitted.model,
+                reasoningEffort: admitted.reasoningEffort,
+                providerId: admitted.provider, serviceTier: admitted.serviceTier)
+        }
+        let choice = choice ?? call?.turn?.providerChoice
+        if let choice {
             guard !choice.provider.isEmpty, !choice.model.isEmpty, !choice.reasoningEffort.isEmpty else {
                 throw LLMError.providerError(message: "Choose a provider, model and Think level.")
             }
@@ -489,9 +466,8 @@ extension ProviderRoutingSnapshot {
                 reasoningEffort: choice.reasoningEffort, providerId: choice.provider,
                 serviceTier: choice.fast ? "priority" : "default")
         }
-        // A supplied/requested model cannot make a broken saved group borrow
-        // Chat's account. An already bound call retains its own admission.
-        if inheritedModel.isEmpty, let fault = unusablePickNotice(for: routingSurface) {
+        // A supplied/requested model cannot make a broken saved group borrow Chat's account. An already bound call retains its own admission.
+        if let fault = unusablePickNotice(for: routingSurface) {
             throw LLMError.providerError(message: fault)
         }
         let preference = ProviderRoutingSurfaceLookup.value(self.preferences, routingSurface)
@@ -502,9 +478,7 @@ extension ProviderRoutingSnapshot {
         let requested = requestedModel?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let admittedModel: String
-        if !inheritedModel.isEmpty {
-            admittedModel = inheritedModel
-        } else if !supplied.isEmpty {
+        if !supplied.isEmpty {
             admittedModel = supplied
         } else if ProviderRoutingSurfaceLookup.value(self.activeProviders, routingSurface) != nil {
             admittedModel = configuredModel
@@ -512,7 +486,7 @@ extension ProviderRoutingSnapshot {
             admittedModel = requested.isEmpty ? configuredModel : requested
         }
         guard !admittedModel.isEmpty else {
-            if inheritingCall { throw LLMError.notConfigured(provider: "router") }
+            if call != nil { throw LLMError.notConfigured(provider: "router") }
             let notice = self.unusablePickNotice(for: routingSurface)
                 ?? ProviderSurfaceGroups.members(of: routingSurface)
                     .compactMap { self.unusablePickNotice(for: $0) }.first
@@ -524,26 +498,22 @@ extension ProviderRoutingSnapshot {
         }
         let requestedEffort = requestedReasoningEffort?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let inheritedProvider = inheritingCall ? LLMCallContext.providerId?
-            .trimmingCharacters(in: .whitespacesAndNewlines) : nil
         return TurnRouteAdmission(
             routingSurface: routingSurface,
             modelId: admittedModel,
-            reasoningEffort: inheritingCall ? (LLMCallContext.reasoningEffort ?? preference?.reasoningEffort ?? DEFAULT_REASONING_EFFORT) : requestedEffort.isEmpty
-                ? (preference?.reasoningEffort ?? DEFAULT_REASONING_EFFORT)
-                : requestedEffort,
-            providerId: inheritedProvider?.isEmpty == false ? inheritedProvider
-                : ProviderRoutingSurfaceLookup.value(self.activeProviders, routingSurface)
+            reasoningEffort: requestedEffort.isEmpty
+                ? (preference?.reasoningEffort ?? DEFAULT_REASONING_EFFORT) : requestedEffort,
+            providerId: ProviderRoutingSurfaceLookup.value(self.activeProviders, routingSurface)
                 ?? (inheritChat ? self.activeProviders["chat"] : nil),
-            serviceTier: (inheritingCall ? LLMCallContext.serviceTier : nil) ?? preference?.serviceTier ?? (inheritingCall ? nil : "default")
+            serviceTier: preference?.serviceTier ?? "default"
         )
     }
 }
 
 extension SwiftNativeProviderRouting {
     public func checkedRouteAdmission(for surface: String, requestedModel: String? = nil,
-        requestedReasoningEffort: String? = nil, suppliedModel: String = "") async throws -> TurnRouteAdmission {
-        try await checkedRoutingSnapshot().routeAdmission(for: surface, requestedModel: requestedModel,
+        requestedReasoningEffort: String? = nil, suppliedModel: String = "", preview: Bool = false) async throws -> TurnRouteAdmission {
+        try await checkedRoutingSnapshot(preview: preview).routeAdmission(for: surface, requestedModel: requestedModel,
             requestedReasoningEffort: requestedReasoningEffort, suppliedModel: suppliedModel)
     }
 }

@@ -1,14 +1,12 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `MacSyncActionRouter+ChatHistory.swift` | `MacSyncActionRouter`: `chatHistoryPage`; history rows carry a session-index generation unchanged across the history read |
+// Blueprint: | `MacSyncActionRouter+ChatHistory.swift` | `MacSyncActionRouter`, `chatHistoryPage`; Generation-bound history. |
 
 extension MacSyncActionRouter {
     static let historyPageByteBudget = 256 * 1024
 
-    /// What the transcript snapshot leaves out, on demand: up to `limit` saved
-    /// rows ending just before `beforeId` (older history), or through
-    /// `throughId` (one message), in the snapshot's own row encoding.
+    /// Page within the snapshot's encoding so older rows and single-message reads retain the same wire shape.
     func chatHistoryPage(_ action: InboxAction) async throws -> [String: String] {
         let payload = action.payload
         guard let session = NativeAgentChatSessionID.normalizedPathComponent(payload["sessionId"]) else {
@@ -56,8 +54,7 @@ extension MacSyncActionRouter {
         var rows: [ChatMessageRecord] = []
         var taken = 0
         while start > 0, taken < limit {
-            // A row that is hers alone is skipped, not counted: it still
-            // anchors paging (an older phone may hold its id) but is not shown.
+            // Private rows still anchor paging by id but must neither appear nor count toward the page.
             guard messages[start - 1].isPersonVisible else { start -= 1; continue }
             var row = messages[start - 1]
             var candidate = try response([row] + rows, start: start - 1)

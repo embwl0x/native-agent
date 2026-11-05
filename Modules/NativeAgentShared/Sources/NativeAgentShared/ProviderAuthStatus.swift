@@ -1,19 +1,16 @@
 import Foundation
 
-// Blueprint: | `ProviderAuthStatus.swift` | `ProviderAuthStatus`: checked credential-proof presentation and bounded metadata projection; providers retain dispatch eligibility authority |
+// Blueprint: | `ProviderAuthStatus.swift` | `ProviderAuthStatus`: credential-proof display; providers own dispatch eligibility |
 
 public struct ProviderAuthStatus: Codable, Hashable, Sendable {
     public var provider_id: String
-    /// How far the credential is proven: ready, saved, failed, rejected or a
-    /// needs_* state. Never read for eligibility; `eligible` is that answer.
+    /// Credential proof is display evidence; only `eligible` decides dispatch.
     public var state: String
     public var detail: String
-    /// Free-form metadata projected by the shared decoder.
     public var user_info: [String: String]?
     public var last_checked_at: String?
 
-    /// May dispatch, as ProviderRouting publishes it (the provider's
-    /// `configured`).
+    /// ProviderRouting owns dispatch eligibility through `configured`.
     public var eligible: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -43,7 +40,6 @@ public struct ProviderAuthStatus: Codable, Hashable, Sendable {
         self.detail      = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
         self.last_checked_at = try c.decodeIfPresent(String.self, forKey: .last_checked_at)
         self.eligible = try c.decode(Bool.self, forKey: .eligible)
-        // Coerce any nested JSON value into a string. Drop nulls.
         if c.contains(.user_info), try !c.decodeNil(forKey: .user_info) {
             let nested = try c.decode([String: AnyJSONValue].self, forKey: .user_info)
             self.user_info = nested.compactMapValues { $0.asString }

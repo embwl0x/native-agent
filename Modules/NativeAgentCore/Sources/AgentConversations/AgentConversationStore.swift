@@ -9,7 +9,7 @@ import ApprovalInbox
 import ChatTurnContracts
 import Experiences
 import TurnTrace
-// Blueprint: | `AgentConversationStore.swift` | `save` publishes experience/live projections; `restoreProjections` replays durable state at contact startup; `records` reconciles/saves denied approvals without replaying projections; `AgentConversationDelivery.answersLive` includes live inbox readers and MCP return bridges; `offerReplyToInlineWait` and `offerBridgeReplyToInlineWait` serialize collected/inbound answers with the send deadline, recording bridge receipts before publishing inline answers and keeping them out of delayed turns and resident wakes; held answers require the sole delivered exchange in the returned conversation; `outcome_unknown` attention receipts use the session's `unsettledAttention` owner; `records` and `recordsUnlocked` project stored reply deadlines through `AgentConversationView`; reply expiry releases the conversation while the retained desktop observer ends at the same deadline and writes its terminal receipt, partial text and local release together at settlement; other reply expiry is terminal with no reply, while transport still accepts late answers; resumable work retains DataRootLife; other-life work reads stopped/restored and explicit resumption starts fresh |
+// Blueprint: | `AgentConversationStore.swift` | `save`, `restoreProjections`, `records`, `AgentConversationDelivery.answersLive`, `offerReplyToInlineWait`, `offerBridgeReplyToInlineWait`, `outcome_unknown`, `unsettledAttention`, `recordsUnlocked`, `AgentConversationView` |
 
 
 
@@ -19,13 +19,11 @@ public struct AgentConversationStore: Sendable {
 
     public struct Failure: Error, LocalizedError, Sendable {
         public let message: String
-        /// Refused before anything was sent, unless rethrown after a send.
         public var effects: ToolFailureError.Effects = .none
         package init(message: String) { self.message = message }
         public var errorDescription: String? { message }
     }
 
-    /// Reconciles/saves denied approvals, then returns the conversation snapshot.
     public func records() throws -> [AgentConversationRecord] {
         try locked {
             var rows = try load()
@@ -34,7 +32,7 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// Read-only and without the lock, for a glance that must not wait; a file caught mid-write fails to decode and throws.
+    /// Unlocked glance reads must not block; a file caught mid-write remains a decode failure.
     public func recordsUnlocked() throws -> [AgentConversationRecord] { try load() }
 
     public func find(scopeSessionID: String, agent: String, label: String?, in snapshot: [AgentConversationRecord]? = nil) throws -> AgentConversationRecord? {
@@ -43,7 +41,6 @@ public struct AgentConversationStore: Sendable {
             ?? Self.continuing(rows, agent: agent, label: label)
     }
 
-    /// Without a thread in this chat, continue the contact's newest matching thread.
     static func continuing(_ rows: [AgentConversationRecord], agent: String, label: String?) -> AgentConversationRecord? {
         rows.filter { row in
             guard row.agent == agent else { return false }
@@ -52,8 +49,8 @@ public struct AgentConversationStore: Sendable {
         }.max { $0.updatedAt < $1.updatedAt }
     }
 
-    /// Reserve before dispatch. Bind the protocol message to its own operation UUID; a queued send keeps its reservation identity.
-    /// Never run two messages against one bookmark. A crash leaves a visible uncertain send, never permission to replay it.
+    /// Reserve before dispatch to prevent concurrent sends against one bookmark. Bind protocol identity separately from operation identity; crashes preserve
+    /// uncertainty, never replay authority.
     public func begin(scopeSessionID: String, agent: String, name: String, label: String?, record: String? = nil,
                       fresh: Bool, sourceSurface: String, fingerprint: String?,
                       replyRoute: [String: String]?, message: String? = nil,
@@ -64,6 +61,10 @@ public struct AgentConversationStore: Sendable {
             throw ToolFailureError("message_id must be a non-empty protocol message string.",
                 argumentPath: "message_id", effects: .none)
         }
+        // Every record names its contact; replies are attributed by it (BridgeLane.bridgeSurfaceName).
+        guard !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw Failure(message: "Name the contact this conversation is with. Nothing was sent.")
+        }
         guard !scopeSessionID.isEmpty, scopeSessionID.utf8.count <= 256,
               label == nil || (label!.count <= 120 && !label!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) else {
             throw Failure(message: "Choose a short conversation name.")
@@ -71,13 +72,14 @@ public struct AgentConversationStore: Sendable {
         return try locked {
             var rows = try load()
             if try reconcileDeniedApprovals(&rows) { try save(rows) }
-            // The exact record the caller resolved (by id) is the one continued.
+            // Continue the exact record resolved by the caller.
             let old = try record.flatMap { id in rows.first { $0.id == id && $0.agent == agent } }
                 ?? select(rows, scope: scopeSessionID, agent: agent, label: label)
                 ?? (fresh ? nil : Self.continuing(rows, agent: agent, label: label))
             // An accepted ask its peer never answered (Grok Bot) may be superseded; an unsettled send never is.
             if !fresh, let old, old.phase == "sending" || (old.phase == "waiting" && !supersedeWaiting) {
-                throw Failure(message: "This conversation is still waiting for its previous message. Open it to see the current state; do not send that message again.")
+                throw Failure(
+                    message: "This conversation is still waiting for its previous message. Open it to see the current state; do not send that message again.")
             }
             // A queued message taken to go next keeps its place. Its own send begins only while it is still reserved and still queued (not withdrawn).
             if !fresh, let old, let held = old.queueReservation, held != reservation {
@@ -88,7 +90,8 @@ public struct AgentConversationStore: Sendable {
                 throw Failure(message: "That queued message was withdrawn before it went; nothing was sent.")
             }
             if !fresh, let old, old.peerRouteFingerprint != fingerprint {
-                throw Failure(message: "This contact's connection changed. Start a separate conversation explicitly; the existing conversation has been preserved.")
+                throw Failure(
+                    message: "This contact's connection changed. Start a separate conversation explicitly; the existing conversation has been preserved.")
             }
             if fresh, label != nil, old != nil {
                 throw Failure(message: "That conversation name is already in use. Choose a different name for a separate conversation.")
@@ -96,7 +99,7 @@ public struct AgentConversationStore: Sendable {
             var row: AgentConversationRecord
             if !fresh, let old {
                 row = old
-                // Continuing from another chat moves the thread here, like dragging a window onto the desktop that is in front.
+                // Continuing from another chat transfers the thread’s scope to that chat.
                 row.scopeSessionID = scopeSessionID
             } else {
                 guard rows.count < 512 else { throw Failure(message: "The saved conversation limit has been reached.") }
@@ -106,7 +109,7 @@ public struct AgentConversationStore: Sendable {
                     phase: "ready", operationID: id, updatedAt: Date(), sourceSurface: sourceSurface)
             }
             try Self.absorbExchange(into: &row, file: fileURL)
-            // Promotion is this queued send beginning, under its original experience.
+            // Queued promotion retains the original experience.
             row.operationID = reservation ?? UUID().uuidString.lowercased()
             row.lifeID = try DataRootLife.current(in: fileURL.deletingLastPathComponent().deletingLastPathComponent())
             row.phase = "sending"
@@ -142,7 +145,7 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// Queue a follow-up on a thread whose reply is still in flight. Nil when the reply settled meanwhile (the caller sends it normally instead).
+    /// If the reply settled meanwhile, leave the send to the caller instead of queuing it.
     public func enqueue(id: String, text: String, byPerson: Bool, arguments: [String: JSONValue]? = nil,
                         stillInFlight: (AgentConversationRecord) throws -> Bool) throws -> (AgentConversationRecord, AgentConversationQueued)? {
         try locked {
@@ -161,22 +164,21 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// Take a queued follow-up off its thread to send it: only the oldest one still waiting, and only once `ready` says the thread has settled. The thread stays reserved for it until its `begin` (or `releaseReservation`), so nothing else
-    /// can start in between.
+    /// Reserve only the oldest queued send after settlement, keeping the thread occupied until begin or release.
     public func takeQueued(id: String, item: String, ready: (AgentConversationRecord) throws -> Bool) throws -> AgentConversationQueued? {
         try locked {
             var rows = try load()
             guard let i = rows.firstIndex(where: { $0.id == id }), rows[i].queueReservation == nil, try ready(rows[i]),
                   let head = rows[i].queued?.first(where: { $0.held == nil || $0.waitingForMac == true }),
                   head.held == nil, head.id == item else { return nil }
-            // It stays queued (and visible) until its `begin` takes it off.
+            // Keep a reservation visible in the queue until its send begins.
             rows[i].queueReservation = item
             try save(rows)
             return head
         }
     }
 
-    /// Ends a reservation its send never used. True when it was still held, meaning that message did not begin.
+    /// Releasing an unused reservation proves its send never began.
     public func releaseReservation(id: String, item: String) throws -> Bool {
         try locked {
             var rows = try load()
@@ -187,7 +189,6 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// Put a follow-up back, first in line, marked with why it did not go.
     public func holdQueued(id: String, item: AgentConversationQueued, reason: String) throws {
         try locked {
             var rows = try load()
@@ -204,8 +205,7 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// The desktop route calls only before emitting Return. Full text stays in
-    /// this owner's existing queue, under the same send id and original age.
+    /// The desktop route calls only before emitting Return. Full text stays in this owner's existing queue, under the same send id and original age.
     public func holdForMac(id: String, operation: String, text: String, conversation: String?, detail: String) throws {
         try locked {
             var rows = try load()
@@ -215,7 +215,7 @@ public struct AgentConversationStore: Sendable {
                 throw Failure(message: "The conversation moved on; no waiting message was saved.")
             }
             let args: [String: JSONValue] = ["expects_reply": .bool(rows[i].awaitsReply)]
-            // Exact desktop calls also retain their requested chat title.
+            // Exact desktop requests must retain their requested chat title.
             if let conversation { rows[i].conversationID = conversation }
             var item = AgentConversationQueued(id: operation, text: text,
                 queuedAt: started,
@@ -228,8 +228,7 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// The current exchange settles with its receipt; a late answer lands on its earlier exchange, never on the current one.
-    /// Only a successful save (or an already saved answer) settles this exchange's reply-storage repair debt.
+    /// Late replies settle their own exchange, never the current send. Only committed reply storage can settle its repair debt.
     public func settleExchange(id: String, exchange: String, reply: String?, receipt: JSONValue? = nil,
                                firstActivity: Date? = nil, stopDetail: String? = nil) throws {
         try locked {
@@ -269,7 +268,7 @@ public struct AgentConversationStore: Sendable {
                 rows[i].exchanges = try AgentConversationExchange.bounded(history, file: fileURL)
             }
             try save(rows)
-            // Read from this record's own route: the route the transport read attests it.
+            // The route read attests the reply’s provenance.
             noteReplies(was: before, now: rows[i], from: rows[i].agent,
                         answer: reply.map { (exchange, $0) }, retained: receipt.flatMap {
                             if case .object(let fields) = $0, fields["reply_location"] != nil { exchange } else { nil }
@@ -279,8 +278,7 @@ public struct AgentConversationStore: Sendable {
             operation: "agent.reply.settlement:" + exchange, evidence: .init(source: fileURL.path, id: exchange))
     }
 
-    /// At launch: Dot keeps no records (his sends go straight to his session), and a send to a contact no longer saved can never settle, so neither stays to show a stale state or have its queue retried. Each one dropped is first kept whole
-    /// in `conversations-dropped.jsonl`.
+    /// Contacts with direct sessions or no saved recipient cannot settle records here; archive dropped records whole before removal.
     @discardableResult public func dropUnsettleable(dot: Set<String>, saved: Set<String>) throws -> Int {
         try locked {
             let rows = try load()
@@ -303,7 +301,6 @@ public struct AgentConversationStore: Sendable {
         }
     }
 
-    /// Withdraw every follow-up still queued (`agent_cancel` clear_queue).
     @discardableResult public func clearQueued(id: String) throws -> Int {
         try locked {
             var rows = try load()
@@ -349,7 +346,7 @@ public struct AgentConversationStore: Sendable {
                 }
             }
             try save(rows)
-            // An owner read of this record's route: that route attests the reply.
+            // Only the route owner can attest the reply.
             noteReplies(was: identity, now: rows[i], from: rows[i].agent)
             return rows[i]
         }
@@ -375,8 +372,7 @@ public struct AgentConversationStore: Sendable {
 }
 
 extension AgentConversationStore {
-    /// What last passed with each contact, in words ("last answered 06:31", "last send unavailable 03:17 — …"), from its own session; its newest record says only where a send of hers still stands. Nil when nothing passed. Keyed by peer id;
-    /// `count` is the lines its session keeps.
+    /// Conversation words come from the contact’s own session; the newest send record alone cannot summarize both sides.
     public static func lastExchanges(peers: [AgentPeerContact], records: [AgentConversationRecord],
                                      dataRoot: URL) -> [String: (summary: String, count: Int, replyState: JSONValue?)] {
         var found: [String: (summary: String, count: Int, replyState: JSONValue?)] = [:]
@@ -414,7 +410,7 @@ extension AgentConversationStore {
         if ["waiting", "sending"].contains(current.phase) { return "last message \(when), reply still coming" }
         var detail: String?
         if case .object(let receipt)? = row.receipt, case .string(let text)? = receipt["detail"] { detail = text }
-        // A sentence, not a word like "delivering" or "interrupted".
+        // Use a sentence so the state is actionable rather than an isolated status word.
         if let state = row.deliveryState, state.contains(" ") { detail = state }
         let status = current.status == "unknown" ? current.phase : current.status
         return "last send \(status.replacingOccurrences(of: "_", with: " ")) \(when)"

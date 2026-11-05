@@ -5,16 +5,11 @@ import PersistenceCore
 import AppKit
 #endif
 
-// Blueprint: | `MacWaitSignals.swift` | `MacWaitSignals` and activation observation ports: cancellable event-driven waits that consume existing app/AX signals |
+// Blueprint: | `MacWaitSignals.swift` | `MacWaitSignals`: Cancellable AX/app signal waits with owned observer lifetimes |
 
-/// The signal an AX observer cannot carry. An `AXObserver` is installed on ONE
-/// process; when macOS brings a different app forward, nothing fires on the old
-/// one, and a `wait until "Mail is in front"` would sit blind until the
-/// deadline. NSWorkspace publishes exactly this, so it is the second
-/// subscription rather than a reason to keep polling.
+/// AX observes one process and misses app switches; NSWorkspace activation supplies that missing signal without polling.
 public protocol MacAppActivationObserverSource: Sendable {
-    /// `nil` when no activation observer could be installed; the wait refuses
-    /// with its subscription failure instead of selecting another mechanism.
+    /// Missing activation subscription refuses the wait rather than choosing another mechanism.
     func install(
         onActivation: @escaping @Sendable () -> Void
     ) -> (any MacAXEffectObservation)?
@@ -37,9 +32,7 @@ public struct SystemMacAppActivationObserverSource: MacAppActivationObserverSour
     }
 }
 
-/// Removes the workspace observer exactly once, from wherever control leaves
-/// the wait — the same contract each observation holds for the AX
-/// side.
+/// Release the workspace subscription exactly once on every wait exit.
 final class MacWorkspaceActivationObservation: MacAXEffectObservation, @unchecked Sendable {
     private let center: NotificationCenter
     private var token: NSObjectProtocol?
@@ -78,7 +71,7 @@ public func defaultMacAppActivationObserverSource() -> any MacAppActivationObser
     #endif
 }
 
-/// Coalesces AX changes and app activation until the consumer drains them.
+/// Coalesce AX and activation signals until drained.
 public final class MacWaitSignals: @unchecked Sendable {
     private let collector = MacAXEffectCollector()
     private let effects: (any MacAXEffectObservation)?
@@ -113,7 +106,6 @@ public final class MacWaitSignals: @unchecked Sendable {
             : nil
     }
 
-    /// Anything since the last call? Drains both channels.
     public func consume() -> Bool {
         collector.consumeSignal()
     }
@@ -122,7 +114,7 @@ public final class MacWaitSignals: @unchecked Sendable {
         await collector.waitForSignal(seconds: seconds)
     }
 
-    /// Removes both observers and releases pending signal waits exactly once.
+    /// Release both observers and pending waits exactly once.
     public func stop() {
         lock.lock()
         guard !stopped else { lock.unlock(); return }

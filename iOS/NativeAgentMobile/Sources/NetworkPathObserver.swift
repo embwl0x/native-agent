@@ -1,16 +1,12 @@
 import Foundation
 import Network
 
-/// Publishes coarse device reachability. Deliberately reports only what
-/// NWPathMonitor actually knows: whether a usable path exists. It never claims
-/// anything about the Mac or about iCloud, which is a separate question the
-/// bridge already answers.
+/// NWPathMonitor proves only a usable device path; Mac/iCloud availability remains the bridge's responsibility.
 @MainActor
 final class NetworkPathObserver: ObservableObject {
     static let shared = NetworkPathObserver()
 
-    /// nil until the first path update lands — an unknown path must not be
-    /// painted as an outage.
+    /// Unknown path before the first update must not appear as an outage.
     @Published private(set) var isOffline: Bool?
 
     private let monitor: NWPathMonitor
@@ -39,7 +35,6 @@ final class NetworkPathObserver: ObservableObject {
         monitor.cancel()
     }
 
-    /// Copy for the offline banner. nil while online or still unknown.
     static func offlineBannerMessage(isOffline: Bool?) -> String? {
         isOffline == true
             ? "This iPhone has no network connection. Messages are queued and will send when it returns."

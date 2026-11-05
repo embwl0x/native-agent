@@ -5,11 +5,9 @@ import CognitiveSubstrate
 import Context
 import PersistenceCore
 
-// Blueprint: | `CognitionObservatoryView+Metrics.swift` | `CognitionTensionsPresentation`: same-snapshot capacity/counter models for Observatory metrics and pruning panels |
+// Blueprint: | `CognitionObservatoryView+Metrics.swift` | `CognitionTensionsPresentation`: Same-snapshot capacities and counters |
 
-/// One capacity reading for the Observatory's Tensions & Pruning panel. The
-/// counts come from the same runtime snapshot as the panel, while caps come
-/// from that snapshot's effective cognition configuration.
+/// Read counts and effective caps from the same runtime snapshot so capacity comparisons are coherent.
 enum CognitionTensionsPresentation {
     enum Capacity: Equatable {
         case belowCap

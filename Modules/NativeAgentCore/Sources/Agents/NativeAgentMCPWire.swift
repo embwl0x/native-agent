@@ -3,8 +3,7 @@ import ChatToolParsing
 import CoreFoundation
 // Blueprint: | `NativeAgentMCPWire.swift` | MCP negotiation, parsing, caller-supplied request identity and reply projection |
 
-/// Stateless MCP transport projection only. Chat admission, context and receipts
-/// stay with the canonical bridge and chat owners.
+/// Stateless MCP transport projection only. Chat admission, context and receipts stay with the canonical bridge and chat owners.
 enum NativeAgentMCPWire {
     enum Action {
         case message(body: [String: Any], replayBody: Data, wait: (seconds: Int, progressToken: ID?),
@@ -16,9 +15,7 @@ enum NativeAgentMCPWire {
     }
 
     static let versions = ["2025-11-25", "2025-06-18", "2025-03-26"]
-    /// How long `agent_message` holds the call open for the reply when the
-    /// caller does not say. Below the 60 s per-call default most MCP clients
-    /// use (TypeScript SDK, Codex), leaving time for transport settlement.
+    /// Keep the default reply wait below clients’ usual 60-second deadline to leave time for transport settlement.
     static let defaultWaitSeconds = 25
     static let maximumWaitSeconds = 300
 
@@ -33,10 +30,9 @@ enum NativeAgentMCPWire {
         }
     }
 
-    /// Her messages held for this caller, and how many more still wait.
     typealias Held = (messages: [[String: String]], remaining: Int)
 
-    /// `held` rides beside the normal result of either tool (`held_messages`).
+    /// Include held messages beside either tool’s ordinary result.
     static func parse(_ json: [String: Any]?, byteCount: Int, defaultSession: String? = nil, held: Held = ([], 0)) -> Action {
         guard byteCount <= 100_000, let json else {
             return failure(.null, code: -32700, message: "Expected one bounded JSON-RPC request.")
@@ -70,7 +66,11 @@ enum NativeAgentMCPWire {
                 "protocolVersion": versions.contains(requested) ? requested : versions[0],
                 "capabilities": ["tools": [:]],
                 "serverInfo": ["name": "NativeAgent", "version": "1.0"],
-                "instructions": "Talk with \(PeerFacingIdentity.agentName) through persistent full chat sessions. agent_message waits for the reply (up to wait_seconds) and returns it; status enqueued means queued, not finished, so read the rest with agent_reply. Keep the returned session and request IDs. Never resend solely because a reply is missing. \(heldNote)"
+                "instructions": """
+                    Talk with \(PeerFacingIdentity.agentName) through persistent full chat sessions. agent_message waits for the reply (up to \
+                    wait_seconds) and returns it; status enqueued means queued, not finished, so read the rest with agent_reply. Keep the returned \
+                    session and request IDs. Never resend solely because a reply is missing. \(heldNote)
+                    """
             ])
         case "ping": return success(id, result: [:])
         case "tools/list":
@@ -101,7 +101,10 @@ enum NativeAgentMCPWire {
                 // Only the caller can identify a retry with the same request_id.
                 guard let supplied = args["request_id"], let request = supplied as? String,
                       exactUUID(request) else {
-                    return failure(id, code: -32602, message: "request_id is required and must be a canonical UUID. It is this message's replay key: retry the same message under the same request_id, and use a new one only for new content.")
+                    return failure(id, code: -32602, message: """
+                        request_id is required and must be a canonical UUID. It is this message's replay key: retry the same message under the same \
+                        request_id, and use a new one only for new content.
+                        """)
                 }
                 guard let seconds = wholeNumber(args["wait_seconds"] ?? defaultWaitSeconds, in: 0...maximumWaitSeconds) else {
                     return failure(id, code: -32602, message: "wait_seconds must be an integer from 0 through \(maximumWaitSeconds).")
@@ -111,8 +114,7 @@ enum NativeAgentMCPWire {
                 if let text = rawToken as? String, text.utf8.count <= 256 { token = .string(text) }
                 else if let number = rawToken as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
                         number.stringValue == String(number.int64Value) { token = .number(number.int64Value) }
-                // wait_seconds stays OUT of the message body: that body is the
-                // replay digest, and waiting longer is not different content.
+                // wait_seconds stays OUT of the message body: that body is the replay digest, and waiting longer is not different content.
                 let message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
                 guard let data = try? JSONSerialization.data(withJSONObject: message, options: .sortedKeys) else {
                     return failure(id, code: -32603, message: "Could not encode message.")
@@ -131,10 +133,12 @@ enum NativeAgentMCPWire {
                     ]
                     if status >= 400 && status < 500 { result["status"] = "rejected" }
                     if !accepted, let detail = receipt["detail"] { result["detail"] = detail }
-                    // A waited call carries what the task holds now.
+                    // A waited response must project the task’s current retained state.
                     var failed = !accepted
                     if accepted, let state = receipt["original_status"] as? String {
-                        for key in ["reply", "attachments", "completionDelivery", "deliveryId", "has_more", "next_offset", "original_status", "run_id", "provider_failure", "work", "delegated_completions", "retrieval_result_class", "execution_result_class", "execution_terminal", "reply_recovery"] {
+                        for key in ["reply", "attachments", "completionDelivery", "deliveryId", "has_more", "next_offset", "original_status", "run_id",
+                            "provider_failure", "work", "delegated_completions", "retrieval_result_class", "execution_result_class",
+                                "execution_terminal", "reply_recovery"] {
                             result[key] = receipt[key]
                         }
                         let more = receipt["has_more"] as? Bool == true
@@ -142,7 +146,14 @@ enum NativeAgentMCPWire {
                             result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request, "offset": next]]
                         }
                         let execution = ChatToolOutcome.ExactResultClass(rawValue: receipt["execution_result_class"] as? String ?? "")
-                        if execution == .succeeded {
+                        // A message the agent's turn in progress read has no answer of its own: that turn's reply answers it.
+                        if execution == .succeeded, let steered = receipt["result"] as? [String: Any], steered["status"] as? String == "steered" {
+                            result["status"] = "steered"
+                            result["detail"] = receipt["detail"]
+                            if let answer = steered["requestId"] as? String {
+                                result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": answer]]
+                            }
+                        } else if execution == .succeeded {
                             result["status"] = "answered"
                             result["detail"] = more ? "\(agent) answered. Follow read_with for the rest of the reply." : "\(agent) answered."
                         } else if execution?.isFailure == true {
@@ -150,7 +161,10 @@ enum NativeAgentMCPWire {
                             result["detail"] = receipt["detail"] ?? "The turn did not finish. Do not resend automatically."
                             failed = true
                         } else {
-                            result["detail"] = "Queued and still in progress (\(state)); reply holds what is written so far. Read the rest with agent_reply. Do not resend."
+                            result["detail"] = """
+                                Queued and still in progress (\(state)); reply holds what is written so far. Read the rest with agent_reply. Do not \
+                                resend.
+                                """
                         }
                     }
                     // Acceptance and the requested observation are independent.
@@ -187,7 +201,10 @@ enum NativeAgentMCPWire {
                     waitSeconds = value
                 }
                 return .reply(requestID: request, sessionID: session, offset: offset, waitSeconds: waitSeconds, project: { receipt in
-                    let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class", "execution_terminal", "reply_recovery"]
+                    let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id",
+                        "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail",
+                            "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class",
+                                "execution_terminal", "reply_recovery"]
                     return toolResult(id, fields: receipt.filter { allowed.contains($0.key) },
                                       // "pending" is a reply still being written, not an error.
                                       failed: ["retrieval_result_class", "execution_result_class"].contains {
@@ -229,9 +246,7 @@ enum NativeAgentMCPWire {
         .immediate(status: 200, body: ["jsonrpc": "2.0", "id": id.value, "result": result])
     }
 
-    /// What the held messages may add to one result, measured as they appear
-    /// in it: once in its structured content, once in its text (escaped twice);
-    /// well under the 1 MiB a relay reads.
+    /// Budget held messages for structured content and twice-escaped text together, below the relay’s 1 MiB limit.
     static let heldBudget = 256 * 1024
 
     static func heldFits(_ messages: [[String: String]]) -> Bool {
@@ -242,9 +257,7 @@ enum NativeAgentMCPWire {
 
     private static func toolResult(_ id: ID, fields: [String: Any], failed: Bool, held: Held = ([], 0)) -> [String: Any] {
         var fields = fields
-        // The text is the structured content serialized: a host may show its
-        // model either one, so the messages ride in both. A structured copy
-        // that only counted them reached Claude Desktop as a blank message.
+        // Include actual messages in both structured and text content because hosts may expose only one to their model.
         if !held.messages.isEmpty || held.remaining > 0 {
             fields["held_messages"] = held.messages
             fields["held_remaining"] = held.remaining
@@ -253,7 +266,10 @@ enum NativeAgentMCPWire {
         do { data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]) }
         catch {
             return ["jsonrpc": "2.0", "id": id.value, "error": ["code": -32603,
-                "message": "The retained tool result could not be encoded: \(error.localizedDescription). Repair the result projection; do not repeat the action."]]
+                "message": """
+                    The retained tool result could not be encoded: \(error.localizedDescription). Repair the result projection; do not repeat the \
+                    action.
+                    """]]
         }
         return ["jsonrpc": "2.0", "id": id.value, "result": [
             "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
@@ -261,25 +277,44 @@ enum NativeAgentMCPWire {
         ]]
     }
 
-    /// She cannot push into a host that has no command line, so what she
-    /// writes to it waits for its next call and comes back in that result.
+    /// Pull hosts have no push command; queued messages leave through their next call’s result.
     static var heldNote: String {
-        "Every agent_message and agent_reply result may also carry held_messages: what \(PeerFacingIdentity.agentName) wrote to you since your last call, oldest first, each {at, text, conversation_id}, with held_remaining saying how many more wait for your next call. They are delivered by being returned there and nowhere else, so read them every time; answer one with agent_message, session_id set to its conversation_id."
+        """
+            Every agent_message and agent_reply result may also carry held_messages: what \(PeerFacingIdentity.agentName) wrote to you since your \
+            last call, oldest first, each {at, text, conversation_id}, with held_remaining saying how many more wait for your next call. They are \
+            delivered by being returned there and nowhere else, so read them every time; answer one with agent_message, session_id set to its \
+            conversation_id.
+            """
     }
 
     static var tools: [[String: Any]] {
         let agent = PeerFacingIdentity.agentName
         return [
-            ["name": "agent_message", "description": "Talk with \(agent). You and \(agent) have one conversation: every message goes on in it, and its mcp- session_id comes back with each result. The call waits up to wait_seconds and returns the reply (status answered). If it is still in progress the status is enqueued: keep the returned IDs and read the reply with agent_reply. \(heldNote)",
+            ["name": "agent_message", "description": """
+                Talk with \(agent). You and \(agent) have one conversation: every message goes on in it, and its mcp- session_id comes back with \
+                each result. The call waits up to wait_seconds and returns the reply (status answered). If it is still in progress the status is \
+                enqueued: keep the returned IDs and read the reply with agent_reply. \(heldNote)
+                """,
              "inputSchema": ["type": "object", "properties": [
                 "text": ["type": "string", "maxLength": 64000],
-                "session_id": ["type": "string", "description": "Optional. Your one conversation with \(agent) continues either way; a returned ID is accepted."],
-                "request_id": ["type": "string", "description": "Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same request_id, and new content needs a new one. Never resend solely because a reply is missing."],
+                "session_id": ["type": "string",
+                    "description": "Optional. Your one conversation with \(agent) continues either way; a returned ID is accepted."],
+                "request_id": ["type": "string", "description": """
+                    Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same \
+                    request_id, and new content needs a new one. Never resend solely because a reply is missing.
+                    """],
                 "wait_seconds": ["type": "integer", "minimum": 0, "maximum": maximumWaitSeconds, "default": defaultWaitSeconds,
-                                 "description": "How long this call waits for the reply. Keep the default unless your client allows longer tool calls; 0 returns as soon as the message is queued."]
+                                 "description": """
+                                     How long this call waits for the reply. Keep the default unless your client allows longer tool calls; 0 \
+                                     returns as soon as the message is queued.
+                                     """]
              ], "required": ["text", "request_id"], "additionalProperties": false],
              "annotations": ["readOnlyHint": false, "idempotentHint": false, "openWorldHint": true]],
-            ["name": "agent_reply", "description": "Read the retained reply to an exact \(agent) message. It only reads: nothing is sent, resent or started. wait_seconds holds the call until the reply settles, as agent_message's wait does, so one call replaces polling. Missing evidence does not prove failure or authorize replay. Follow next_offset when has_more is true. \(heldNote)",
+            ["name": "agent_reply", "description": """
+                Read the retained reply to an exact \(agent) message. It only reads: nothing is sent, resent or started. wait_seconds holds the \
+                call until the reply settles, as agent_message's wait does, so one call replaces polling. Missing evidence does not prove failure \
+                or authorize replay. Follow next_offset when has_more is true. \(heldNote)
+                """,
              "inputSchema": ["type": "object", "properties": [
                 "session_id": ["type": "string"], "request_id": ["type": "string"],
                 "offset": ["type": "integer", "minimum": 0, "maximum": 1048576],

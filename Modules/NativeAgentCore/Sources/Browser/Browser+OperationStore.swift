@@ -4,12 +4,10 @@ import PersistenceCore
 import TurnTrace
 import NativeAgentShared
 import Synchronization
-// Blueprint: | `Browser+OperationStore.swift` | Canonical run/outbox owner with row-scoped validation, byte-preserved damaged rows and owner-scoped recovery admission; checked transition projections; local backup/export/raw phone sync excluded, PrivacyMap lists Browser Runs |
+// Blueprint: | `Browser+OperationStore.swift` | Canonical run/outbox owner; preserve damaged rows; exclude backup/export/phone sync |
 
-/// Canonical Browser lifecycle commands. WebKit/AppKit remain effect adapters;
-/// every durable lifecycle transition enters through this boundary.
-/// runs.json is the browser's JSON operation array, deliberately excluded from
-/// local backup, export and phone sync; PrivacyMap lists Browser Runs.
+/// Every durable Browser transition enters here; WebKit/AppKit only adapt effects. The operation array is excluded from backup, export and phone sync;
+/// PrivacyMap lists Browser Runs.
 public enum BrowserOperationInitialState: String, Sendable {
     case waitingApproval = "waiting_approval"
     case running
@@ -114,7 +112,11 @@ public enum BrowserOperationStoreError: Error, LocalizedError, Sendable, Equatab
 
     public var errorDescription: String? {
         if case .recoveryUnavailable(let cause) = self {
-            return "browser_operation_recovery_unavailable: Browser actions are unavailable: \(cause). Preserve and repair native_power/browser/runs.json and the named projection feed under the app data root, reconcile unknown effects by observing the existing page, then restart NativeAgent to recover. Do not reopen an uncertain URL; other surfaces remain available."
+            return """
+                browser_operation_recovery_unavailable: Browser actions are unavailable: \(cause). Preserve and repair \
+                native_power/browser/runs.json and the named projection feed under the app data root, reconcile unknown effects by observing \
+                the existing page, then restart NativeAgent to recover. Do not reopen an uncertain URL; other surfaces remain available.
+                """
         }
         if case .corruptRunsDocument = self {
             return "The canonical browser runs document is unreadable or is not an array; original bytes retained."
@@ -136,14 +138,15 @@ public struct BrowserCancellationProjectionError: Error, LocalizedError {
     public var errorDescription: String? { underlyingError.localizedDescription }
 }
 
-/// Completion is durable even if its derived evidence is unavailable. Carry
-/// the actual outcome to approval settlement; it must never label a completed
-/// effect failed merely because its receipt projection failed.
+/// Durable completion remains successful if its derived receipt fails; approval settlement must retain the actual outcome.
 public struct BrowserCompletionProjectionError: Error, LocalizedError {
     public let run: JSONValue
     public let underlyingError: any Error
     public var errorDescription: String? {
-        "Browser completion committed; its receipt projection is unavailable: \(underlyingError.localizedDescription). Inspect the canonical run before repeating the action."
+        """
+            Browser completion committed; its receipt projection is unavailable: \(underlyingError.localizedDescription). Inspect the \
+            canonical run before repeating the action.
+            """
     }
 }
 
@@ -168,7 +171,10 @@ extension SwiftNativeBrowserClient {
     private static func recoveryRefusal(_ message: String) -> ToolFailureError {
         ToolFailureError(message, effects: .none, owner: "browser_operation_recovery",
             code: "browser_operation_recovery_unavailable", status: .refused,
-            instruction: "Preserve and repair the named browser run or projection feed, reconcile unknown effects by observing the existing page without reopening its URL, then restart NativeAgent.", recovery: .repair)
+            instruction: """
+                Preserve and repair the named browser run or projection feed, reconcile unknown effects by observing the existing page \
+                without reopening its URL, then restart NativeAgent.
+                """, recovery: .repair)
     }
 
     /// Read-only diagnostics use the same canonical row validation as admission.
@@ -177,8 +183,7 @@ extension SwiftNativeBrowserClient {
         return snapshot.failures.keys.sorted().compactMap { snapshot.failures[$0] }
     }
 
-    /// Stable identity for one operation request. This binds idempotency to the
-    /// requested effect without exposing URL/domain in shared motor projections.
+    /// Stable identity for one operation request. This binds idempotency to the requested effect without exposing URL/domain in shared motor projections.
     public static func browserRequestDigest(for start: BrowserOperationStart) -> String {
         CausalTransitionEvidence.opaqueIdentity([
             "browser.open_url",
@@ -193,19 +198,15 @@ extension SwiftNativeBrowserClient {
         ].joined(separator: "|"))
     }
 
-    /// Sole canonical Browser command boundary. The runs row is committed
-    /// first under one lock; receipt/trace feeds are idempotent derived
-    /// projections and can be resumed after a crash. A start returns
-    /// its committed claim before projecting; its effect owner must receive
-    /// that claim and install settlement even when an older feed is damaged.
+    /// Commit the run under one lock before projecting idempotent feeds. Return a start's claim before projection so its owner can settle even with a damaged
+    /// feed.
     public func executeBrowserOperation(
         _ command: BrowserOperationCommand
     ) async throws -> BrowserOperationCommandResult {
         let result: BrowserOperationCommandResult
         switch command {
         case .start(let request):
-            // Starts have no receipt. Terminal settlement drains
-            // pending projections and reports any derived-feed failures then.
+            // Starts have no receipt. Terminal settlement drains pending projections and reports any derived-feed failures then.
             return try await commitStart(request)
         case .complete(let completion):
             result = try await commitCompletion(completion)
@@ -398,8 +399,7 @@ extension SwiftNativeBrowserClient {
             row["updatedAt"] = .string(timestamp)
             row["verificationStatus"] = .string("not_required")
             row.removeValue(forKey: "deadlineAt")
-            // An executing owner still owes its evidence and one terminal
-            // projection. A request cannot claim that nothing opened.
+            // The executing owner owes terminal evidence; a cancel request cannot prove that nothing opened.
             if executing { row["opened"] = .null }
             if !executing {
                 row["completedAt"] = .string(timestamp)
@@ -421,10 +421,7 @@ extension SwiftNativeBrowserClient {
             var last: JSONValue?
             for index in rows.indices {
                 guard snapshot.failures[index] == nil else { continue }
-                // This command is a launch/restart assertion: no process-local
-                // WebKit task can survive it. Any persisted running row is
-                // therefore stranded even when its wall-clock deadline has not
-                // elapsed. Never reopen an outcome-unknown external effect.
+                // No live WebKit task survives restart; persisted running effects remain stranded and must never reopen.
                 let status = rows[index].objectValue?["status"]?.stringValue
                 guard status == "running" || (status == "canceled" && rows[index].objectValue?["completedAt"]?.stringValue == nil),
                       case .object(var row) = rows[index] else { continue }
@@ -453,8 +450,7 @@ extension SwiftNativeBrowserClient {
         }
     }
 
-    /// Resumes receipt/trace projection from canonical pending transition IDs.
-    /// Feeds and traces land before one checkpoint removes only the captured IDs.
+    /// Resumes receipt/trace projection from canonical pending transition IDs. Feeds and traces land before one checkpoint removes only the captured IDs.
     private func projectPendingBrowserReceipts() async throws {
         let pending: [PendingBrowserReceipt] = try await withCanonicalRunsLock {
             let snapshot = try await Self.readCanonicalSnapshot(at: self.runsPath)
@@ -488,12 +484,12 @@ extension SwiftNativeBrowserClient {
             let domain = try fields.string("domain")
             let url = try fields.string("url")
 
-            try await TurnTracePersistLane(standalonePath: tracesPath).appendChecked(
+            try await TurnTracePersistLane(dataRootOverride: dataRoot).appendChecked(
                 TurnTraceEvent(kind: "browser.action", title: domain, status: status, payload: .object([
                     "url": .string(url),
                     "status": .string(status),
                     "dryRun": .bool(false),
-                ]), id: projection.projectionID, createdAt: createdAt), transitionId: projection.projectionID)
+                ]), id: projection.projectionID, createdAt: createdAt, turn: nil), transitionId: projection.projectionID)
         }
         let projected = Set(pending.map(\.projectionID))
         try await withCanonicalRunsLock {
@@ -526,15 +522,15 @@ extension SwiftNativeBrowserClient {
     ) async throws {
         guard !pending.isEmpty else { return }
         let work: @Sendable () async throws -> Void = {
-            // A missing feed is empty; unreadable or malformed evidence cannot
-            // establish that an append-before-checkpoint transition is absent.
+            // A missing feed is empty; unreadable or malformed evidence cannot establish that an append-before-checkpoint transition is absent.
             let read = try await SwiftNativePersistenceCore.tailJSONLReadReceipt(
                 path, limit: JSONLLineCaps.actionReceipts, maxBytes: nil
             )
             guard read.malformedJSONRowCount == 0, !read.truncatedToByteWindow,
                   read.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
                   read.physicalRowsScanned > 0 || read.bytesRead == 0 else {
-                throw PersistenceCoreError.ioFailure("Browser projection cannot deduplicate \(path.path): its receipt feed is malformed or incomplete; existing bytes retained.")
+                throw PersistenceCoreError.ioFailure(
+                    "Browser projection cannot deduplicate \(path.path): its receipt feed is malformed or incomplete; existing bytes retained.")
             }
             var seen = Set(read.rows.compactMap { $0.objectValue?["transitionId"]?.stringValue })
             for projection in pending where !seen.contains(projection.projectionID) {
@@ -589,8 +585,7 @@ extension SwiftNativeBrowserClient {
         catch let error as CocoaError where error.isFileAbsent {
             return CanonicalRuns(rows: [], rawRows: [], failures: [:], uncertainRows: [])
         }
-        // The canonical writer emits UTF-8. A different document encoding
-        // cannot be byte-spliced into that writer's output without corruption.
+        // The canonical writer emits UTF-8. A different document encoding cannot be byte-spliced into that writer's output without corruption.
         guard String(data: data, encoding: .utf8) != nil, !data.contains(0) else {
             throw PersistenceCoreError.ioFailure("Browser runs at \(path.path) must be UTF-8 JSON; original bytes retained.")
         }
@@ -630,9 +625,11 @@ extension SwiftNativeBrowserClient {
                 let row = value.objectValue
                 let id = row?["id"]?.stringValue
                 let name = id.flatMap { $0.isEmpty ? nil : $0 } ?? "<row \(index + 1): missing id>"
-                failures[index] = "Browser run \(name) (row \(index + 1)) unavailable: \(error.localizedDescription) Original row bytes retained; repair this run in \(path.path) and reconcile its effects before repeating it."
-                // Only explicit, parseable terminal evidence can exclude an
-                // in-flight effect. Missing or ambiguous identity cannot.
+                failures[index] = """
+                    Browser run \(name) (row \(index + 1)) unavailable: \(error.localizedDescription) Original row bytes retained; repair this \
+                    run in \(path.path) and reconcile its effects before repeating it.
+                    """
+                // Only explicit, parseable terminal evidence can exclude an in-flight effect. Missing or ambiguous identity cannot.
                 let terminal = row?["status"]?.stringValue.map(terminalStatuses.contains) == true
                 let completed = row?["completedAt"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) != nil
                 if !terminal || !completed || id == nil || id?.isEmpty == true || id.flatMap({ identityCounts[$0] }) != 1 {
@@ -643,8 +640,7 @@ extension SwiftNativeBrowserClient {
         return CanonicalRuns(rows: rows, rawRows: rawRows, failures: failures, uncertainRows: uncertainRows)
     }
 
-    /// Locate original top-level JSON values after parsing the complete JSON.
-    /// Strings/escapes and nested arrays/objects cannot split an element.
+    /// Parse complete JSON before locating byte ranges so nested values and string escapes cannot split an element.
     private static func rawArrayRows(_ data: Data, count: Int) throws -> [Data] {
         let bytes = Array(data)
         var rows: [Data] = []
@@ -671,8 +667,7 @@ extension SwiftNativeBrowserClient {
         return rows
     }
 
-    /// Only valid siblings change. Damaged values are spliced from their exact
-    /// original byte ranges, including unknown fields, rather than re-encoded.
+    /// Re-encode only valid siblings; splice damaged values from their exact bytes to preserve unknown fields.
     private func writeCanonicalRuns(_ rows: [JSONValue], preserving snapshot: CanonicalRuns) throws {
         var damaged = snapshot.failures.keys.sorted()
         var data = Data("[\n".utf8)
@@ -689,8 +684,7 @@ extension SwiftNativeBrowserClient {
         try SwiftNativePersistenceCore.atomicWrite(data, to: runsPath)
     }
 
-    /// Validate the writer's current shape before any reader can interpret
-    /// missing evidence as a receipt or a completed projection.
+    /// Validate the writer's current shape before any reader can interpret missing evidence as a receipt or a completed projection.
     private static func validateRun(_ value: JSONValue, canonical: Bool) throws -> [String: JSONValue] {
         guard case .object(let row) = value else { throw BrowserOperationStoreError.corruptRunsDocument }
         let id = row["id"]?.stringValue ?? "<missing id>"
@@ -713,7 +707,8 @@ extension SwiftNativeBrowserClient {
             try require(row[field] == .null || row[field]?.objectValue != nil, field)
         }
         try require(row["requestDigest"]?.stringValue.map(isDigest) == true, "requestDigest")
-        try require(row["verificationStatus"]?.stringValue.map { ["pending", "not_required", "satisfied", "failed"].contains($0) } == true, "verificationStatus")
+        try require(
+            row["verificationStatus"]?.stringValue.map { ["pending", "not_required", "satisfied", "failed"].contains($0) } == true, "verificationStatus")
         for field in ["createdAt", "updatedAt", "completedAt", "canceledAt", "deniedAt", "deadlineAt"] {
             if row[field] != nil || field == "createdAt" || field == "updatedAt" {
                 try require(row[field]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) != nil, field)
@@ -812,9 +807,7 @@ extension SwiftNativeBrowserClient {
         let projectionID = CausalTransitionEvidence.opaqueIdentity(
             "browser|\(runID)|\(sequence)|\(status)|\(timestamp)"
         )
-        // The outbox stores the transition snapshot, not a pointer back to the
-        // mutable run row. A later cancel can therefore append its own
-        // transition without rewriting evidence that has not projected yet.
+        // Snapshot the transition so a later cancel cannot rewrite evidence awaiting projection.
         let snapshot = try externalRun(.object(row))
         var outbox: [JSONValue]
         if case .array(let existing)? = row["projectionOutbox"] {

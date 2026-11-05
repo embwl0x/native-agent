@@ -2,15 +2,9 @@ import Foundation
 import Darwin
 import os
 
-// Blueprint: | `FileLockSidecarLifecycle.swift` | `FileLockSidecarLifecycle`: bounded locked reaping of old regular orphan sidecars; live/fresh/link sidecars stay untouched |
+// Blueprint: | `FileLockSidecarLifecycle.swift` | `FileLockSidecarLifecycle`; Reap only old locked orphan sidecars. |
 
-/// Outcome of one bounded sweep of orphaned `<target>.lock` sidecars.
-///
-/// A sidecar whose guarded target still exists is live bookkeeping and is never
-/// removed. A fresh orphan is also left alone because an in-flight writer may
-/// have taken the lock before creating its target. Only old, regular, non-link
-/// orphan sidecars are candidates; `reaped` means the candidate was rechecked
-/// and unlinked while holding that exact sidecar's flock.
+/// Reap only old regular orphan sidecars, rechecked under their exact flock; fresh orphans may belong to in-flight writers.
 public struct FileLockSidecarReapReport: Sendable, Equatable {
     public var discovered: Int = 0
     public var candidates: Int = 0
@@ -21,40 +15,22 @@ public struct FileLockSidecarReapReport: Sendable, Equatable {
     public var skippedAfterContention: Int = 0
     public var deferred: Int = 0
     public var failures: Int = 0
-    /// Root-relative paths successfully removed by this pass. Their audit
-    /// identity is captured before unlink so a deleted leaf cannot make
-    /// symlink canonicalization lose the mounted data-root relationship.
+    /// Capture root-relative audit identity before unlink so a missing leaf cannot change symlink canonicalization.
     public var reapedArtifactPaths: [String] = []
 
     public init() {}
 }
 
-/// Generic lifecycle owner for the sidecars created by `withFileLock`.
-///
-/// The lock implementation intentionally leaves its sidecar behind: unlinking
-/// it on every release is unsafe because a waiter may already hold an fd for
-/// that inode. This reaper instead handles crash/deletion residue at a paced
-/// maintenance boundary. It serializes with the exact sidecar, rechecks that
-/// the guarded target is still absent and that the sidecar is still old, then
-/// unlinks as the final act inside the flock. `withFileLock`'s inode validation
-/// makes waiters re-open a fresh sidecar after that unlink rather than proceed
-/// on the detached inode.
+/// Release leaves sidecars in place because waiters may hold their inode. Reap under the exact flock after rechecking absence and age; inode validation makes
+/// waiters reopen detached sidecars.
 public enum FileLockSidecarLifecycle {
-    /// Give an in-flight writer ample time to create its guarded target. This
-    /// is intentionally a wall-clock grace, not a lock-age heuristic: lock
-    /// sidecar mtimes are not refreshed by `flock` acquisition.
+    /// Allow in-flight writers to create their target; use wall-clock age because flock does not refresh mtime.
     public static let defaultMinimumAge: TimeInterval = 24 * 60 * 60
 
-    /// A data root can contain years of residue. Bound one pass so background
-    /// maintenance stays short and reports any remaining work honestly.
+    /// Bound maintenance work so years of residue cannot monopolize one pass.
     public static let maximumCandidatesPerPass = 256
 
-    /// Reap old orphaned lock sidecars below `dataRoot`.
-    ///
-    /// Individual acquisition/unlink failures are counted and the rest of the
-    /// pass continues; callers must treat a nonzero `failures` result as a
-    /// degraded sweep. Failure to enumerate an existing data root throws so it
-    /// cannot masquerade as a clean, empty result.
+    /// Count individual failures and continue; enumeration failure throws so an unreadable root cannot look clean.
     @discardableResult
     public static func reapOrphanedSidecars(
         dataRoot: URL = defaultDataRoot(),
@@ -114,8 +90,7 @@ public enum FileLockSidecarLifecycle {
             )
         }
 
-        // Deterministic oldest-first reclamation makes a bounded pass fair and
-        // lets the report's deferred count describe real remaining residue.
+        // Oldest-first order keeps bounded reclamation fair and deferred counts meaningful.
         candidates.sort { lhs, rhs in
             if lhs.modified == rhs.modified { return lhs.url.path < rhs.url.path }
             return lhs.modified < rhs.modified
@@ -130,10 +105,7 @@ public enum FileLockSidecarLifecycle {
             report.attempted += 1
             do {
                 let didReap = try await SwiftNativePersistenceCore.withFileLock(guarded, waitingAtMost: 0) { () -> Bool in
-                    // We now hold this candidate's flock. Recheck every
-                    // destructive predicate after contention: a writer may
-                    // have created the guarded target or replaced the sidecar
-                    // before this sweep acquired the lock.
+                    // Recheck every destructive predicate under the flock because contention may have changed the target or sidecar.
                     guard !FileManager.default.fileExists(atPath: guarded.path),
                           let state = sidecarState(at: sidecar, cutoff: cutoff),
                           state.isAged else {
@@ -151,8 +123,7 @@ public enum FileLockSidecarLifecycle {
             } catch let error as NSError where error.domain == "FileLock" && error.code == Int(ETIMEDOUT) {
                 report.deferred += 1
             } catch {
-                // Do not let one permissions or IO problem starve other stale
-                // sidecars; the mounted runner reports this as degraded.
+                // Do not let one permissions or IO problem starve other stale sidecars; the mounted runner reports this as degraded.
                 report.failures += 1
             }
         }
@@ -164,8 +135,7 @@ public enum FileLockSidecarLifecycle {
         var isAged: Bool
     }
 
-    /// Fresh URL/resource values on every call; the in-lock check must not use
-    /// an enumeration snapshot from before a writer changed the filesystem.
+    /// Fresh URL/resource values on every call; the in-lock check must not use an enumeration snapshot from before a writer changed the filesystem.
     private static func sidecarState(at sidecar: URL, cutoff: Date) -> SidecarState? {
         let fresh = URL(fileURLWithPath: sidecar.path)
         guard let values = try? fresh.resourceValues(

@@ -2,17 +2,14 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MacTransientMenus.swift` | Bounded near-focus native menu evidence with named optional-attribute/action-read gaps and retained observation nodes for structural presentation and gap summaries; menus never widen a window's pixel capture |
+// Blueprint: | `MacTransientMenus.swift` | Bounded near-focus menu reads retain scoped AX gaps and structure without widening window capture |
 
-/// Current native menu evidence, not a second accessibility address space.
-/// Item paths remain private to this read and are never used as window paths.
+/// Menu paths remain private to this read and must never become window AX paths.
 public enum MacTransientMenus {
     public static let maxMenus = 4
     public static let maxItems = 80
 
-    /// Menus can be siblings of an ancestor of the focused web area, while
-    /// focus itself stays on the page. This is a bounded neighborhood search,
-    /// not a second full-window walk or a hidden menu-bar expansion.
+    /// Focused web areas may have menu siblings above them; search a bounded neighborhood rather than walking the whole window again.
     static func nearFocus<Element>(
         _ focused: Element?, parent: (Element) -> Element?,
         children: (Element, Int) -> [Element], isMenu: (Element) -> Bool,
@@ -45,8 +42,7 @@ public enum MacTransientMenus {
         public let frame: MacAXFrame
         public var items: [MacAXAttributes] { itemIndices.map { observedNodes[$0].attributes } }
         public let truncated: Bool
-        /// The actual bounded read, including its root and structural nodes,
-        /// supplies gap counts even for elements without a displayed item.
+        /// Gap counts include root and structural nodes even when no item is displayed.
         let observedNodes: [MacAXNode]
         let itemIndices: [Int]
     }
@@ -58,16 +54,16 @@ public enum MacTransientMenus {
             && frame.w < 30_000 && frame.h < 30_000
     }
 
-    public static func read(source: any MacAXElementSource, pid: Int32) -> [Menu] {
+    public static func read(source: any MacAXElementSource, pid: Int32, context: MacOperationContext) -> [Menu] {
         guard pid != getpid(), source.isTrusted(), source.frontmostApp()?.processIdentifier == pid else { return [] }
         var remaining = maxItems
-        return source.transientMenuRoots(pid: pid).prefix(maxMenus).compactMap { root in
-            guard remaining > 0, let attributes = source.attributes(of: root),
+        return source.transientMenuRoots(pid: pid, context: context).prefix(maxMenus).compactMap { root in
+            guard remaining > 0, let attributes = source.attributes(of: root, context: context),
                   attributes.role == "AXMenu", let frame = attributes.frame, validFrame(frame) else { return nil }
             let snapshot = MacAccessibilityReader.walk(
                 source: source, root: root,
                 limits: MacAXLimits(maxNodes: maxItems + 1, maxDepth: 5, valueChars: 200)
-            )
+            , context: context)
             let itemIndices = snapshot.nodes.indices.filter { index in
                 let item = snapshot.nodes[index].attributes
                 guard item.role == "AXMenuItem", let rect = item.frame, validFrame(rect),

@@ -10,12 +10,12 @@ public enum OrganismPredictionKind: String, Codable, Sendable, Equatable, CaseIt
     /// Semantic expectations concern how work lands and affect strategy, never body capability beliefs.
     case semanticExpectation
 
-    /// The substrate chooses words for what she is waiting to find out, never exposing Swift case names.
+    /// The substrate chooses words for what the agent is waiting to find out, never exposing Swift case names.
     public var humanLabel: String {
         switch self {
         case .toolCompletion: return "a tool to finish"
         case .providerCompletion: return "a reply to come back"
-        case .phoneDelivery: return "a message to reach him"
+        case .phoneDelivery: return "a message to reach the person"
         case .approvalResolution: return "your approval"
         case .workflowAdvance: return "the work to move on"
         case .semanticExpectation: return "how that landed"
@@ -69,8 +69,7 @@ public struct OrganismPrediction: Codable, Sendable, Equatable, Identifiable {
     public var uncertainty: Double
     public var evidenceCount: Int
     public var lastUpdatedAt: Date
-    /// Session and completion turn for semantic rows only; other kinds are
-    /// correlation-keyed. An absent wire key decodes as nil.
+    /// Session and completion turn for semantic rows only; other kinds are correlation-keyed. An absent wire key decodes as nil.
     public var semanticScope: OrganismSemanticScope?
     /// Only semantic-expectation rows may carry a horizon; an absent wire key decodes as nil.
     public var horizon: OrganismHorizonExpectation?
@@ -100,21 +99,16 @@ public struct OrganismPrediction: Codable, Sendable, Equatable, Identifiable {
         self.uncertainty = OrganismBodyConfidence.clamp(uncertainty)
         self.evidenceCount = max(0, evidenceCount)
         self.lastUpdatedAt = lastUpdatedAt
-        // Scope belongs to the semantic lane alone; no other kind can grow one.
+        // Only semantic rows may carry turn scope.
         self.semanticScope = kind == .semanticExpectation
             ? semanticScope.flatMap { $0.isUsable ? $0 : nil }
             : nil
-        // Same discipline for the horizon payload: only the family that shares
-        // the semantic kind may carry it, so no other lane can grow a row.
+        // Only semantic horizon rows may carry horizon payload.
         self.horizon = kind == .semanticExpectation ? horizon : nil
     }
 }
 
-/// Time-forgotten counterpart of the lifetime outcome tallies. Fractional
-/// because the organism clock ticks at second granularity: integer counters
-/// cannot carry an exponential decay without either starving (a one-second
-/// tick never removes half a unit) or bleeding at a rate set by signal
-/// frequency instead of wall time.
+/// Fractional evidence permits wall-time decay at second granularity; integer rounding would make forgetting depend on traffic.
 public struct OrganismPredictionOutcomeWeights: Codable, Sendable, Equatable {
     public var satisfied: Double
     public var violated: Double
@@ -131,16 +125,13 @@ public struct OrganismPredictionOutcomeWeights: Codable, Sendable, Equatable {
     }
 }
 
-/// Cumulative, per-capability outcome evidence. Unlike the bounded prediction
-/// reservoir, these counters are not a display sample and therefore remain a
-/// valid basis for Agent's capability self-read after old rows are evicted.
+/// Per-capability totals survive bounded row eviction and remain the basis for capability reads.
 public struct OrganismPredictionOutcomeCounts: Codable, Sendable, Equatable {
     public var satisfied: Int
     public var violated: Int
     public var expired: Int
     public var lastEvidenceAt: Date?
-    /// Lifetime counts stay monotone; weights forget on the organism clock.
-    /// Persisted weights are the sole current evidence mass.
+    /// Lifetime counts stay monotone; weights forget on the organism clock. Persisted weights are the sole current evidence mass.
     public var weights: OrganismPredictionOutcomeWeights
 
     public init(
@@ -208,13 +199,11 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
     public var bodyConfidence: OrganismBodyConfidence
     public var lastUpdatedAt: Date?
     public var lastViolationAt: Date?
-    /// Feeling-bearing misses have their own clock; infrastructure misses
-    /// still update the operational violation clock above.
+    /// Feeling-bearing misses have their own clock; infrastructure misses still update the operational violation clock above.
     public var lastFeltViolationAt: Date?
     /// Nil means per-kind totals are unavailable; the bounded reservoir is no outcome sample.
     public var outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts]
-    /// At most one felt resolution per prediction kind per hour, keyed by
-    /// `OrganismPredictionKind` raw value. An absent wire key decodes as nil.
+    /// At most one felt resolution per prediction kind per hour, keyed by `OrganismPredictionKind` raw value. An absent wire key decodes as nil.
     public var lastResolutionFeltAt: [String: Date]?
 
     public init(

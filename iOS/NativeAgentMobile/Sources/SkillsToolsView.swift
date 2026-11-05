@@ -1,6 +1,6 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `SkillsToolsView.swift` | Combined catalog refresh/loading/error owner; Tools opens first and separates canonical abilities from native tools; shared sync catalog and local search state |
+// Blueprint: | `SkillsToolsView.swift` | Combined catalog refresh/loading; abilities and native tools read shared sync state with local search |
 
 enum ToolCatalogPresentation {
     enum ContentState: Equatable {
@@ -30,9 +30,7 @@ private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// One combined destination matching the Mac app. Both pages read the shared
-/// sync catalog; this destination owns their one refresh and visible page
-/// selection, inside its caller's navigation stack.
+/// Both catalog pages share one refresh owner and their caller's navigation stack.
 struct SkillsToolsView: View {
     @State private var selectedRawValue = MobileSkillsToolsSection.tools.rawValue
     @EnvironmentObject private var pairingStore: PairingStore
@@ -47,7 +45,6 @@ struct SkillsToolsView: View {
         )
     }
 
-    /// The page switch sits under the header; each page owns its scroll and filters.
     private var picker: some View {
         AliveSegmentedPicker(selection: selection, options: MobileSkillsToolsSection.allCases) { $0.rawValue }
             .accessibilityElement(children: .contain)
@@ -162,9 +159,8 @@ private struct MobileToolCatalogView: View {
                 }
             }
         }
-        // The search floats over the list, like Memories.
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            // Nothing to search until the Mac has published tools.
+            // Do not offer search until the Mac publishes tools.
             if !tools.isEmpty || !searchText.isEmpty {
                 AliveSearchField(prompt: "Search tools", text: $searchText)
                     .padding(.horizontal, AliveMetrics.pageInset)
@@ -190,7 +186,6 @@ private struct MobileToolCatalogView: View {
 private struct ToolCatalogRow: View {
     let tool: MobileToolCatalogRecord
 
-    /// Status, how it runs and its kind, folded into one secondary line.
     private var statusLine: String {
         var parts: [String] = []
         if let raw = tool.status?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {

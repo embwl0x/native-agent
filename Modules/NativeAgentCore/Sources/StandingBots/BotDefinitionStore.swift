@@ -1,8 +1,8 @@
 import Foundation
 import Experiences
-// Blueprint: | `BotDefinitionStore.swift` | Definition persistence and exact helper session ownership; typed definition edits accept cadence, event and budget values; launch leaves saved definitions and model choices untouched |
+// Blueprint: | `BotDefinitionStore.swift` | Atomic definition/audit persistence, exact session ownership and typed edits |
 
-/// Empty until explicitly populated. Definition and audit rows commit in the same atomic JSON file.
+/// Commit definitions with their audit rows atomically so revisions cannot lose their evidence.
 public struct BotDefinitionStore: Sendable {
     private let disk: StandingBotsDisk
     private let dataRoot: URL
@@ -26,10 +26,7 @@ public struct BotDefinitionStore: Sendable {
         return result
     }
 
-    /// The same validation `create` and `update` perform — the cadence floor
-    /// included — with nothing written. A caller that must refuse a definition
-    /// BEFORE it costs an approval click (the chat tools' pre-approval check)
-    /// asks here rather than keeping a second copy of the rules.
+    /// Share validation with writers so pre-approval checks cannot drift.
     public func check(_ definition: BotDefinition) throws {
         try disk.validate(definition, validateCron: true)
     }
@@ -38,9 +35,7 @@ public struct BotDefinitionStore: Sendable {
         try disk.locked { try disk.definition(id).definition }
     }
 
-    /// Exact helper ownership for policies that apply to helpers alone.
-    /// Resolve the owner's locator before reading only its definition. An
-    /// unrelated damaged definition cannot block an ordinary conversation.
+    /// Resolve exact ownership first so unrelated damaged definitions cannot block a conversation.
     public func definition(forSession sessionID: String?) throws -> BotDefinition? {
         guard let id = BotDefinition.id(forSession: sessionID) else { return nil }
         return try get(id)
@@ -50,8 +45,7 @@ public struct BotDefinitionStore: Sendable {
         try disk.locked { try listUnlocked(includeDeleted: includeDeleted) }
     }
 
-    /// The same read without the store lock, for a glance that must not wait:
-    /// read-only; a definition caught mid-write fails its check and throws.
+    /// A nonblocking glance may fail on a concurrent write; it never takes the store lock.
     public func listUnlocked(includeDeleted: Bool = false) throws -> [BotDefinition] {
         let definitions = try disk.files(at: disk.root.appendingPathComponent("definitions"), extension: "json").map { path -> BotDefinition in
             guard let id = UUID(uuidString: path.deletingPathExtension().lastPathComponent) else {
@@ -59,8 +53,7 @@ public struct BotDefinitionStore: Sendable {
             }
             return try disk.definition(id).definition
         }.filter { includeDeleted || $0.deleted != true }.sorted { $0.id.uuidString < $1.id.uuidString }
-        // A successful owner read settles the storage defect independently
-        // of replaying the event whose matching was unavailable.
+        // A valid owner read settles storage repair independently of event replay.
         RepairOwed.settle(dataRoot, operation: "bot.event.definitions",
             evidence: .init(source: "bots/definitions", id: UUID().uuidString.lowercased()))
         return definitions
@@ -116,8 +109,7 @@ public struct BotDefinitionStore: Sendable {
             let at = Date()
             document.definition.updatedAt = try updatedTime(at, after: document.definition.updatedAt)
             document.definition.deleted = true
-            // Keep the definition and audit available to an already-owned run's
-            // shelf/claim settlement. Lists and admission exclude this tombstone.
+            // Preserve settlement evidence for owned runs while excluding this tombstone from admission.
             document.audit.append(BotAuditRow(id: UUID(), at: at, operation: .update,
                                              definition: document.definition))
             try disk.write(document, at: disk.definitionPath(id))
@@ -134,8 +126,7 @@ public struct BotDefinitionStore: Sendable {
 }
 
 extension BotDefinitionStore {
-    /// Forms parse their own controls. The owner accepts only domain values;
-    /// `create` and `update` validate and commit the resulting definition.
+    /// Accept domain values so form parsing cannot bypass the owner's validation.
     public static func editedDefinition(_ definition: BotDefinition?, name: String, personality: String?, brief: String,
         provider: String, model: String, think: String, modelPinned: Bool, fast: Bool,
         budget: BotBudget, dailyTokenCeiling: Int?, cadence: BotCadence,

@@ -12,10 +12,10 @@ import CoreGraphics
 #endif
 #if canImport(ApplicationServices)
 import ApplicationServices
-// Blueprint: | `MacControl+Perception.swift` | Shallow checked menu reading preserves availability and coverage for native page and windowless-app projections |
+// Blueprint: | `MacControl+Perception.swift` | Checked shallow menus retain availability/coverage for native pages and windowless apps |
 #endif
 extension SwiftNativeMacControl {
-    func menuBarReading(pid: Int32) -> MacMenuBar.Reading {
-        MacMenuBar.read(source: accessibilitySource, pid: pid, depth: 1)
+    func menuBarReading(pid: Int32, context: MacOperationContext) -> MacMenuBar.Reading {
+        MacMenuBar.read(source: accessibilitySource(context: context), pid: pid, depth: 1, context: context)
     }
 }

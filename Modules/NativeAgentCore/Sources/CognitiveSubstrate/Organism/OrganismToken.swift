@@ -1,7 +1,7 @@
 import Foundation
 // Blueprint: | `OrganismToken.swift` | `OrganismToken` enum; `canonicalToken` |
 
-// Stable identifier normalization shared by field and prediction records.
+// Share identity normalization so field and prediction records refer to the same organ.
 enum OrganismToken {
     static func canonicalToken(_ raw: String) -> String {
         let lower = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

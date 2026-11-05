@@ -2,7 +2,6 @@ import SwiftUI
 
 // Blueprint: | `ObservatoryNoticeRow.swift` | `ObservatoryNoticeRow`: one compact tinted notice presentation shared by Observatory panels |
 
-/// Shared compact notice row for observatory panels.
 struct ObservatoryNoticeRow: View {
     let icon: String
     let tint: Color

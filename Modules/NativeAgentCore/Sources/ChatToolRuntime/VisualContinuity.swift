@@ -16,10 +16,10 @@ import Dispatcher
 import Senses
 import AgentConversations
 import StandingBots
-// Blueprint: | `VisualContinuity.swift` | `VisionLiveSceneSnapshot` struct and `SwiftToolDispatcherFourVerbLiveScene` actor; dispatcher-owned temporal identities, motion hypotheses and occlusion tracking |
+// Blueprint: | `VisualContinuity.swift` | `VisionLiveSceneSnapshot`, `SwiftToolDispatcherFourVerbLiveScene`; bounded motion and occlusion |
 
-/// Dispatcher-local, rebuildable perception continuity, never canonical memory or authority.
-/// Shared across four-verb observations; app/window keys keep identities separate.
+/// Dispatcher-local, rebuildable perception continuity, never canonical memory or authority. Shared across four-verb observations; app/window keys keep
+/// identities separate.
 struct VisionLiveSceneSnapshot: Sendable, Equatable {
     let identities: [VisionRect: VisionLiveRegionIdentity]
     let temporarilyNotVisible: [VisionLiveOccludedRegion]
@@ -37,9 +37,8 @@ actor SwiftToolDispatcherFourVerbLiveScene {
         var seenCount: Int
         var velocityX: Double
         var velocityY: Double
-        // An appearance-only jump is not motion proof. Retain one bounded
-        // hypothesis for association only; a third visible frame must confirm
-        // its direction and speed before it can influence motor lead.
+        // An appearance-only jump is not motion proof. Retain one bounded hypothesis for association only; a third visible frame must confirm its direction and
+        // speed before it can influence motor lead.
         var provisionalVelocityX: Double = 0
         var provisionalVelocityY: Double = 0
         var lastCapturedAt: Date
@@ -149,12 +148,8 @@ actor SwiftToolDispatcherFourVerbLiveScene {
                     }
                     return true
                 }()
-                // A successful click may make one game object teleport. Its
-                // spatial identity is then gone but its visual signature is
-                // still the strongest evidence available. Preserve identity
-                // only for a close size/salience/contrast match; weaker shapes
-                // still require ordinary overlap, bounded motion, or a short
-                // continuation of an already measured trajectory.
+                // A click can teleport an object; preserve visual identity only for close size/salience/contrast matches. Weaker matches still need overlap,
+                // bounded motion or a short continuation of measured trajectory.
                 guard overlap >= 0.05 || distance <= reach
                     || predictionConsistent || appearance >= 0.86 else { continue }
                 let score = overlap * 4
@@ -197,12 +192,8 @@ actor SwiftToolDispatcherFourVerbLiveScene {
                     ? ((frame.x + frame.w / 2) - (previous.x + previous.w / 2)) / elapsed : 0
                 scene.tracks[bestIndex].provisionalVelocityY = provisionalMotion
                     ? ((frame.y + frame.h / 2) - (previous.y + previous.h / 2)) / elapsed : 0
-                // A slow target can remain on the same sampled pixel for one
-                // frame. Do not let that quantization erase an established
-                // trajectory used for next-frame association and brief
-                // occlusion, but decay it quickly so a genuinely stopped
-                // object becomes stationary. Motor lead below still uses only
-                // this frame's observed displacement.
+                // Pixel quantization must not erase a slow trajectory after one still frame; decay it quickly to recognize real stops. Motor lead uses only
+                // this frame’s observed displacement.
                 let priorVelocityX = scene.tracks[bestIndex].velocityX
                 let priorVelocityY = scene.tracks[bestIndex].velocityY
                 let priorSpeed = hypot(priorVelocityX, priorVelocityY)
@@ -220,21 +211,14 @@ actor SwiftToolDispatcherFourVerbLiveScene {
                     : boundedMotion && displacement < 3 && elapsed <= 0.5
                         ? priorVelocityY * 0.75
                         : velocityY
-                // Lead through the already-spent perception time plus a small
-                // dispatch allowance. A first two-frame estimate gets a
-                // conservative cap; an independently corroborated fast track
-                // may lead up to one measured frame's travel, still bounded by
-                // surface scale. A measured reversal gets no lead this
-                // frame rather than projecting through its old direction.
+                // Lead through perception delay and a dispatch allowance; cap two-frame estimates conservatively. Corroborated tracks may lead at most one
+                // measured frame within surface bounds; reversals get no lead.
                 let horizon = min(0.75, max(0, now.timeIntervalSince(capturedAt)) + 0.05)
                 let speed = hypot(velocityX, velocityY)
                 let corroboratedVelocity = boundedMotion && elapsed <= 0.75
                     && priorSpeed >= 3 && speed >= priorSpeed * 0.65 && speed <= priorSpeed * 1.5
                     && (velocityX * priorVelocityX + velocityY * priorVelocityY) / (speed * priorSpeed) >= 0.9
-                // Two positions describe a direction, not yet a stable
-                // trajectory. When perception delay can carry the object past
-                // its own radius, spend the existing third-frame opportunity
-                // instead of ending acquisition on that first estimate.
+                // Two positions do not prove stable motion; use a third frame when delay could carry a target past its radius.
                 let needsMotionConfirmation = boundedMotion
                     && speed * horizon > max(4, min(frame.w, frame.h) / 2)
                     && !corroboratedVelocity
@@ -250,8 +234,7 @@ actor SwiftToolDispatcherFourVerbLiveScene {
                     && elapsed <= 0.75 && !reversing
                     ? min(displacement, hypot(logicalSize.width, logicalSize.height) * 0.12)
                     : 0
-                // Extra motor lead requires a corroborated trajectory;
-                // an appearance jump alone grants no extra motor authority.
+                // Extra motor lead requires a corroborated trajectory; an appearance jump alone grants no extra motor authority.
                 let maxLead = max(ordinaryMaxLead, corroboratedTravel)
                 let leadScale = rawDistance > maxLead && rawDistance > 0 ? maxLead / rawDistance : 1
                 let motionDescription: String? = {

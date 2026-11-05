@@ -8,7 +8,6 @@ import UserNotifications
 import AppIntents
 import NativeAgentCore
 import EngineRuntime
-import WorkshopExecution
 import ChatTurnRuntime
 import ChatToolRuntime
 import ChromeControl
@@ -29,7 +28,7 @@ import os
 import DeviceSync
 import AppToolRuntime
 import NativeAgentShared
-// Blueprint: | `AppDelegate+Launch.swift` | `AppDelegate`: launch and turn-safe quit; closes external ingress, retains launch/approval observation settlement, joins the engine's shared quit sleep, retires browser IPC after tracked turns and wake runs |
+// Blueprint: | `AppDelegate+Launch.swift` | `AppDelegate`: Launch, turn-safe quit, ingress retirement and shared sleep settlement |
 
 extension AppDelegate {
     @MainActor private static var launchTask: Task<Void, Never>?
@@ -47,8 +46,7 @@ extension AppDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self,
             selector: #selector(continuationAppActivated(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
-        // A clicked banner has to reach the app: without a delegate, the
-        // identity a Desk reminder carries goes nowhere.
+        // A notification delegate is required to deliver the Desk reminder's identity to the app.
         UNUserNotificationCenter.current().delegate = self
         NativeAgentEngine.installActionLabelsAtLaunch()
         NativeAgentNotificationActions.register()
@@ -76,15 +74,13 @@ extension AppDelegate {
         guard !Task.isCancelled else { return }
         NativeAgentShortcuts.updateAppShortcutParameters()
         approvalNotificationTask = Task { await NativeAgentApprovalNotifications.observe() }
-        // Wire restart before the migration suspension: SwiftUI can already
-        // accept turns while Workshop prepares its execution records.
+        // Wire restart before migration suspends because SwiftUI can already accept turns.
         await AppRelaunch.shared.configure(
             scheduleTerminate: { graceSeconds in
                 DispatchQueue.main.asyncAfter(deadline: .now() + graceSeconds) {
                     ModuleLog.app("[restart_app] settlement wait ended — terminating for relaunch")
-                    // Off this main-queue block: a held quit spins a nested run
-                    // loop, and the main queue cannot drain while one of its own
-                    // blocks is still on the stack — MainActor work would stall.
+                    // Leave the main-queue block before holding quit; its nested run loop cannot drain MainActor work while that block remains
+                    // stacked.
                     RunLoop.main.perform(inModes: [.common]) {
                         MainActor.assumeIsolated { AppDelegate.terminateForRestart() }
                     }
@@ -93,9 +89,7 @@ extension AppDelegate {
             spawnRelauncher: { _ = try AppRelaunch.spawnDetached(argv: $0) }
         )
         guard !Task.isCancelled else { return }
-        // Housekeeping, never awaited by launch: an older extension without
-        // extension.reload, or a same-version resource change, still gets the
-        // new copy. A reload request prepares the folder itself first.
+        // Do not await folder preparation during launch; a reload request prepares the folder before using it.
         Task.detached(priority: .utility) { ChromeExtensionFolder.refreshIfPresent() }
         guard !Task.isCancelled else { return }
         await NativeAgentEngine.reconcileConnectorCredentialsAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
@@ -118,12 +112,10 @@ extension AppDelegate {
         // Regular activation keeps the Dock icon visible while window closure leaves the runtime alive.
         NSApp.setActivationPolicy(.regular)
 
-        // Speech consent belongs to a voice action. Only reconcile an existing
-        // grant here, including changes made in System Settings between launches.
+        // Speech consent belongs to a voice action; launch only reconciles an existing grant.
         NativeAgentEngine.reconcileSpeechPermissionAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
 
-        // Process services start once launch and the shared model are ready,
-        // independently of the main SwiftUI Window appearing.
+        // Start process services independently of the window so background launches have the same runtime.
         ApplicationLifetime.shared.applicationDidFinishLaunching()
         NativeAgentEngine.startResidentWorkAtLaunch(
             dataRoot: PersistenceCore.defaultDataRoot(),
@@ -132,34 +124,29 @@ extension AppDelegate {
                 let alert = NSAlert()
                 alert.alertStyle = .critical
                 alert.messageText = "Memory did not open"
-                alert.informativeText = "NativeAgent is running without memory this session: nothing is recalled or saved. Doctor shows the details under Live memory store."
+                alert.informativeText = """
+                    NativeAgent is running without memory this session: nothing is recalled or saved. Doctor shows the details under Live \
+                    memory store.
+                    """
                 alert.addButton(withTitle: "OK")
                 alert.runModal()
             },
             registerBackgroundTasks: Self.registerBackgroundTaskHandlers,
             resumeMacTurn: { checkpoint, runtime in
                 guard let model = await ApplicationLifetime.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
-                try await model.resumeMacChatTurn(checkpoint) {
-                    try await runtime.resumeTurn(checkpoint)
+                try await model.resumeMacChatTurn(checkpoint) { turn in
+                    try await runtime.resumeTurn(checkpoint, turn: turn)
                 }
             },
             approvals: .app())
 
-        // ActivityWatcher owns the capture gate; call unconditionally and leave disabled or unreadable policy off.
+        // Call unconditionally because ActivityWatcher owns the capture gate, including disabled and unreadable policy.
         NativeAgentEngine.live.activityWatch.startAtLaunch()
 
         BrowserWindowController.shared.startIPCServer()
-        // ClaudeBridge: localhost HTTP on 8771 so Claude (Claude Code
-        // CLI) can query Agent's state, fire chat turns, and run tools
-        // without UI click-through. Started
-        // in the SAME lifecycle hook so menu-bar/background launches
-        // (which never show the main window and never fire SwiftUI .task
-        // modifiers) still bring the bridge up. The launch owns this work;
-        // cancellation after either start closes anything it just installed.
+        // Start the local bridge in the process lifecycle so background launches expose it too; launch cancellation closes newly installed listeners.
         ModuleLog.app("[claude-bootstrap] dispatching ClaudeBridge.startServer on dispatch queue")
-        // A closure written here would inherit main-actor isolation
-        // (DispatchWorkItem's block is not @Sendable) and trap on the global
-        // queue; the nonisolated function reference runs off main as intended.
+        // A closure here inherits main-actor isolation and traps on the global queue; use a nonisolated reference for DispatchWorkItem.
         let bridgeWork = DispatchWorkItem(block: Self.startBridgesAtLaunch)
         Self.bridgeLaunchWork = bridgeWork
         DispatchQueue.global(qos: .userInitiated).async(execute: bridgeWork)
@@ -174,7 +161,7 @@ extension AppDelegate {
                 return appModel
             }))
         NativeAgentEngine.startDeviceSyncAtLaunch(
-            forward: { await forwarder.forwardToSwiftRuntime($0) },
+            forward: { await forwarder.forwardToSwiftRuntime($0, route: $1) },
             registerLoginItem: AppDelegate.registerLoginItemInBackground)
 
     }
@@ -190,7 +177,7 @@ extension AppDelegate {
         }
     }
 
-    // Closing the last window leaves the menu-bar app running.
+    // Closing the last window must leave the menu-bar runtime alive.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
     }
@@ -232,36 +219,24 @@ extension AppDelegate {
         }
     }
 
-    /// Set while a restart_app quit is under way. Behind a lock, not the main
-    /// actor: a held quit's waiter reads it while the main queue may be stuck.
+    /// A held quit may block the main queue, so its restart flag must be lock-protected rather than main-actor isolated.
     nonisolated private static let restartQuit = OSAllocatedUnfairLock(initialState: false)
     @MainActor private static var quitWaitingForTurns = false
 
-    /// restart_app's quit waits for no turns: its origin already settled or hit its bound,
-    /// and the relauncher reopens the bundle once we exit.
-    /// A quit already held just stops waiting.
+    /// Restart has already bounded its origin's settlement; skip the turn wait and release any held quit so the relauncher can reopen.
     @MainActor
     static func terminateForRestart() {
         restartQuit.withLock { $0 = true }
         NotificationCenter.default.post(name: NativeAgentEngine.quitRestartWake, object: nil)
         if quitWaitingForTurns { return }
         NSApp.terminate(nil)
-        // Reached only when the quit was refused (a modal vetoed it): a later
-        // ordinary Quit must still wait for its turns.
+        // Clear restart intent after a modal veto so an ordinary Quit still waits for turns.
         restartQuit.withLock { $0 = false }
     }
 
-    /// Turn-safe quit. A Quit that lands mid-turn (menu, install_app.sh's
-    /// AppleScript quit, logout, restart_app) used to kill the turn and lose
-    /// its reply. Tool receipts are already durable as each tool finishes
-    /// (appendToolMessage → appendJSONLDurable); this lets the turns running
-    /// at Quit finish too. Bounded at 20s (restart_app has already waited for
-    /// its origin's settlement): past it the quit goes ahead. The retained sleep
-    /// still joins tracked turns before its final snapshot or dependency retirement.
-    ///
-    /// Then her sleep (`NativeAgentEngine.sleepMind`): one joinable settlement
-    /// shared by this async hold and the termination drain. Neither bound
-    /// owns the lifetime of that retained settlement.
+    /// Bound the turn wait at 20 seconds so Quit remains responsive while active replies get time to finish.
+    /// The retained sleep joins tracked turns before its final snapshot or dependency retirement.
+    /// The async hold and termination drain share one joinable settlement; neither wait bound owns its lifetime.
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard ApplicationLifetime.shared.appModel != nil else { return .terminateNow }
@@ -283,10 +258,8 @@ extension AppDelegate {
                     isRestarting: { Self.restartQuit.withLock { $0 } })
             }
             let slept = await NativeAgentEngine.sleepMind(after: settlement)
-            ModuleLog.app("[quit] her sleep: %@", slept)
-            // A run-loop block, not MainActor.run: if the Quit came from inside
-            // a main-queue block (a MainActor task), the main queue cannot drain
-            // until that block returns, and the reply would never be delivered.
+            ModuleLog.app("[quit] the agent's sleep: %@", slept)
+            // Use a run-loop block because MainActor.run cannot drain until an originating main-queue block returns.
             let main = CFRunLoopGetMain()
             CFRunLoopPerformBlock(main, CFRunLoopMode.commonModes.rawValue) {
                 MainActor.assumeIsolated { NSApp.reply(toApplicationShouldTerminate: true) }
@@ -296,8 +269,7 @@ extension AppDelegate {
         return .terminateLater
     }
 
-    // runtime integration + background loops: drain Swift-native subsystems
-    // before process exit.
+    // Drain native subsystems before process exit.
     @MainActor
     private func closeQuitIngress() {
         Self.launchTask?.cancel()
@@ -307,16 +279,12 @@ extension AppDelegate {
         approvalNotificationTask?.cancel()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         guard ApplicationLifetime.shared.appModel != nil else { return }
-        // Close these ingress listeners now. Browser IPC also owns admitted
-        // operations, so its full stop waits for the retained quit settlement.
+        // Close ingress now, but defer Browser IPC's full stop until admitted operations join the retained quit settlement.
         NativeAgentA2AGRPCListener.shared.stop()
         ClaudeBridgeRuntime.shared.stop()
         MainActor.assumeIsolated {
             MoodTintWeather.shared.stop()
-            // The phone bridge and its snapshot projection are ingress too.
-            // Stop them before cognition/loop drains: otherwise a late iCloud
-            // action or cognition-change observation can start new snapshot
-            // work while the process is trying to reach a terminal state.
+            // Stop phone ingress and snapshot observations before drains so late actions cannot start snapshot work during termination.
             NativeAgentEngine.liveDeviceSync.bridge.tearDown()
         }
     }

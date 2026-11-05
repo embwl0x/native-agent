@@ -7,21 +7,13 @@ import Security
 
 // Blueprint: | `DeviceCloudKitPreflight.swift` | `DeviceCloudKitPreflight`: entitlement/container admission before constructing CKContainer |
 
-/// Entitlement preflight for CloudKit. Every member decides whether it is safe
-/// to construct a `CKContainer`; NONE constructs one.
+/// Decide entitlement admission without constructing a container: construction can trap synchronously.
 public enum DeviceCloudKitPreflight {
-    /// Runtime entitlement key listing the granted iCloud services.
     public static let iCloudServicesEntitlementKey = "com.apple.developer.icloud-services"
-    /// Runtime entitlement key listing the granted iCloud container identifiers.
     public static let iCloudContainersEntitlementKey = "com.apple.developer.icloud-container-identifiers"
 
-    /// THE HARD GATE. True iff this process may safely touch CloudKit.
-    /// The transport factory refuses construction without this grant and the
-    /// exact container entitlement, without touching `CKContainer`.
-    ///
-    /// macOS requires `CloudKit` in the signed `com.apple.developer.icloud-services` entitlement.
-    ///
-    /// iOS devices rely on install-time provisioning; simulators return false to avoid synchronous traps.
+    /// Construction requires the CloudKit service and exact container grant. macOS checks signed entitlements; iOS provisioning enforces them.
+    /// Simulators refuse access to avoid synchronous traps.
     public static func hasCloudKitEntitlement() -> Bool {
         #if os(macOS)
         guard let task = SecTaskCreateFromSelf(nil),
@@ -45,9 +37,8 @@ public enum DeviceCloudKitPreflight {
         #endif
     }
 
-    /// Exact container gate. True iff the process entitlements list the selected
-    /// `containerIdentifier` (macOS), or install-time provisioning has already
-    /// enforced the declared container entitlement (iOS).
+    /// Exact container gate. True iff the process entitlements list the selected `containerIdentifier` (macOS), or install-time provisioning has
+    /// already enforced the declared container entitlement (iOS).
     public static func entitlementGrantsContainer(_ containerIdentifier: String) -> Bool {
         #if os(macOS)
         guard let task = SecTaskCreateFromSelf(nil),

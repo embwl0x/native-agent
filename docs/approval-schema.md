@@ -42,9 +42,8 @@ The current sender produces:
 | Action | Payload / purpose |
 | --- | --- |
 | `approveApproval`, `rejectApproval`, `cancelApproval` | `approvalId` (or `id`): resolve a durable approval. |
-| `approveStep`, `rejectStep` | `executionId`, plus a real `stepId`: decide a Workshop step. Retained old records remain readable until their conversion. |
 | `approveMemoryProposal`, `rejectMemoryProposal` | `proposalId`: decide a staged memory proposal. |
-| `submitWorkshopTask`, `submitMission` | `title`, `objective`: submit Workshop work. |
+| `submitDeskTask` | `title`, `objective`: create a Desk item and start a line of theirs that carries it ([Desk](DESK.md)). |
 | `set_trust_policy` | Validated trust change through the Mac policy owner. |
 | `mac_control` | Remote Mac control through its policy/dispatch owner. |
 
@@ -52,11 +51,6 @@ These are iOS wire actions, not Agent's tool names. Agent uses the single
 `app` tool and its action registry.
 
 ## Resolution and execution
-
-Workshop step payloads freeze the resolved `tool` and `args`, plus `source_args`
-for validation against the original plan schema. Replay checks the frozen call
-without resolving step references again; existing payloads whose source and
-resolved arguments are identical use their saved `args`.
 
 The chat autonomy gate validates its timeout before filing a request. A timeout
 must be finite, nonnegative and representable as UInt64 nanoseconds; unsupported
@@ -95,7 +89,12 @@ Transcript and mirror-ownership read errors refuse the operation with their
 cause. They never prove a card completed or that the agent may answer User's card.
 Connector, provider and permission verification preserve the owning read error
 instead of reporting missing setup. A failed control acquisition is shown on the
-card; a failed inbox speech delivery keeps that same delivery owed. Stale
+card; a failed inbox speech delivery keeps that same delivery owed. Whether a
+card still needs the person is one rule, the card's own `needsAttention` read
+from its owner-verified live state: open, or failed with a control that can
+retry it. The inbox pointer, Today, the phone and the owed decision all follow
+it. A grant made outside the card settles it, and a failure no control on this
+build can retry is let go, so its pointer archives instead of drawing blank. Stale
 revision callbacks are settled no-ops and never create repair debt. Local
 control watches retire missing or moved cards without claiming their effects
 succeeded, and each watch is checked even when another remains unverified.
@@ -107,8 +106,22 @@ Permission requests accept `read`, `write` and `read_write`; supplied nonempty
 unknown modes are refused before reading or constructing a grant. Stored scope,
 access mode and control location reject unknown executable enum values. Optional
 omitted access modes in retained cards remain readable. Inline replay requires
-the recorded originating envelope. Direct card filing requires that envelope
-and uses it for both continuation stamping and the transcript row. First-provider
+the recorded originating envelope and `originTurnId`. Direct card filing requires
+the held turn and envelope and uses them for continuation stamping and the transcript
+row. Both card writers share that stamp; the phone signature witness binds the
+originating act along with the envelope and replay input. The envelope codec
+retains `declaredRemote` as provenance (a Boolean or absent), never a saved
+signature verdict; malformed remoteness makes the envelope unavailable. A missing act or
+origin refuses continuation with the card left retryable; there is no reconstruction
+from the answering turn. Only the matching act in the same session can receive
+a hand-back, checked against the open-turn owner. Every replay installs the
+card's envelope, even when a live host supplies its other turn parts. A busy
+Mac admission refuses a standalone card continuation with its replay checkpoint
+retained for another tap; it cannot flatten the held turn into fresh queued input.
+The resolving Mac/phone/Telegram door records who decided. It does not supply
+replay authority. Chat approvals install the approved card's envelope (including
+verified command signature) on their held host turn; bounded domain cards with
+no requesting envelope execute as local approval acts. First-provider
 setup records the accepted chat request's envelope even before a provider can
 run; the launch-owned Input Monitoring card records its native owner and remains
 nonresumable. Follow-up execution maps `chat` explicitly to the Mac profile and
@@ -149,7 +162,7 @@ authority flags. A true not-found is distinct from unavailable or malformed
 authority. Conversation approval waits read that inbox using their conversation's
 data root. Continuation ownership lives in the approval row alone; transcript
 receipt metadata does not claim it. The empty retired approval-store importer
-and unused procedure-review adapter have been removed.
+has been removed.
 Chat replay accepts only `chat_tool_approval` payloads with canonical origin
 strings. Retired skill-proposal, external-send, nextgen and self-evolution
 executor branches are removed after retained-data and saved-caller inventory.
@@ -217,9 +230,7 @@ on the approval, so it closes the visible card and is not replayed at launch.
 Part enable/disable adapters retain the owner's explicit effect evidence;
 missing effect evidence remains unknown. REM application checks
 the reviewed text against the canonical proposal and reconciles matching
-GROWTH/graduation evidence before checking for external staleness. Exact
-procedure installation returns its manifest before receipt settlement, so a
-receipt failure cannot report that installation did not happen. Full Mac
+GROWTH/graduation evidence before checking for external staleness. Full Mac
 kind backfill uses a persisted approval identity and creates a pending card
 only for a genuinely pending record.
 

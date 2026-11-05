@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
-// Blueprint: | `MacSyncActionRouter+Scheduler.swift` | `MacSyncActionRouter`: `schedulerAction`; phone creates body rhythms through one supported-kind validation |
+// Blueprint: | `MacSyncActionRouter+Scheduler.swift` | `MacSyncActionRouter`, `schedulerAction`; Validated phone jobs. |
 
 extension MacSyncActionRouter {
     func schedulerAction(_ action: String, payload: [String: String]) async throws -> [String: String] {
@@ -23,7 +23,6 @@ extension MacSyncActionRouter {
             guard case .object(let receipt) = result, let created = receipt["job"] else {
                 return ["status": "error", "message": "The Mac did not return a saved scheduler job."]
             }
-            // The nightly reflection exists but is paused: nothing was armed, and the phone says why.
             if receipt["operation"] == .string("paused"), case .string(let detail)? = receipt["detail"] {
                 return ["status": "error", "message": detail]
             }
@@ -35,7 +34,6 @@ extension MacSyncActionRouter {
             let changed = action == "cancel_scheduler_job"
                 ? try await writer.cancelJob(jobId: id)
                 : try await writer.setJobEnabled(jobId: id, enabled: action == "resume_scheduler_job")
-            // The job the change landed on: a unique start of an id resolves to the whole id.
             if case .object(let answer) = changed, case .object(let job)? = answer["job"], case .string(let whole)? = job["id"] {
                 jobID = whole
             } else {

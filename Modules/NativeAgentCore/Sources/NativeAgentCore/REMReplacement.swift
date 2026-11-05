@@ -2,8 +2,7 @@ import Foundation
 
 // Blueprint: | `REMReplacement.swift` | Source-bound displaced REM content and shared review wording; missing history is not recorded |
 
-/// Historical words, not permission to remove or restore their source. The
-/// producer binds both fields to the source it read when making the proposal.
+/// Historical words, not permission to remove or restore their source. The producer binds both fields to the source it read when making the proposal.
 public struct REMReplacement: Codable, Sendable, Equatable {
     public let source: String
     public let text: String

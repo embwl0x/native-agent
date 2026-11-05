@@ -3,9 +3,7 @@ import CryptoKit
 import PersistenceCore
 // Blueprint: | `AgentWorkspaceFileRevision.swift` | `AgentWorkspaceFileRevision` struct; `prepare` |
 
-/// A selected file, never an editable target. Reading the whole bounded source
-/// prepares the ordinary file form; the file owner checks its content again at
-/// replacement time using the immutable hash carried by that form.
+/// The immutable hash binds replacement to the selected file's read; the file owner rechecks content before writing.
 struct AgentWorkspaceFileRevision: Sendable {
     let path: String
     let title: String
@@ -31,7 +29,10 @@ struct AgentWorkspaceFileRevision: Sendable {
         let input: [String: JSONValue] = ["path": .string(path), "offset": .int(0), "max_bytes": .int(65_536), "version": .string(version)]
         let fresh = try await perform("read_file", input)
         guard let content = Self.completeContent(fresh) else {
-            throw AgentWorkspaceForm.Failure(message: "This file could not be read completely as editable text within 64 KiB. Reopen the source to check its current state; no replacement draft was created.")
+            throw AgentWorkspaceForm.Failure(message: """
+                This file could not be read completely as editable text within 64 KiB. Reopen the source to check its current state; no replacement draft \
+                was created.
+                """)
         }
         let hash = Self.hash(content)
         guard selectedHash == nil || selectedHash == hash else {
@@ -41,7 +42,10 @@ struct AgentWorkspaceFileRevision: Sendable {
         return try AgentWorkspaceForm(schema: schema, title: "Revise " + title,
             bound: ["path": .string(path), "expected_content_sha256": .string(hash)])
             .editing(field: "content", text: content)
-            .withNotice("The complete current text is entered. Edit Content, then Save revision. The file is checked again before replacement; a changed source is refused.")
+            .withNotice("""
+                The complete current text is entered. Edit Content, then Save revision. The file is checked again before replacement; a changed source is \
+                refused.
+                """)
     }
 
     private static func completeContent(_ result: JSONValue) -> String? {

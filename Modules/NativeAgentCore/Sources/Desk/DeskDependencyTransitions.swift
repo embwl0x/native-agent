@@ -6,16 +6,8 @@ import NativeAgentCore
 import Synchronization
 // Blueprint: | `DeskDependencyTransitions.swift` | Dependencies, hierarchy settlement and locked revalidation |
 extension SwiftNativeDeskStore {
-    /// setBlockedOn — REPLACE the whole blocker set for `handle`. Blockers are
-    /// stable handles of LIVE items or exp:<id> (the chat lane resolves first).
-    /// A named wait replaces prose blocking and may carry her reason as a note.
-    /// Validated UNDER THE OPS FLOCK against ops-derived live state so a refusal
-    /// can't race a sibling close: unknown blocker, self-block, and any edge that
-    /// would close a cycle are all refused.
-    ///
-    /// The ts is minted INSIDE the lock via commitStamp — a defaulted timestamp
-    /// parameter would be evaluated at the call site BEFORE the lock and could
-    /// commit behind a later-issued stamp (the trap this file documents).
+    /// Replace the blocker set under the ops flock so validation cannot race a close.
+    /// Reject unknown, self or cyclic Desk edges; timestamp inside the lock to preserve commit order.
     @discardableResult
     public func setBlockedOn(_ handle: String, blockers: [String], waiting: Bool = false, note: String? = nil) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -45,10 +37,7 @@ extension SwiftNativeDeskStore {
             return op
         }
     }
-    /// setDeferUntil — park `handle` until a day (`yyyy-MM-dd`) or ISO stamp.
-    /// nil / empty CLEARS. An unparseable value is REFUSED rather than stored:
-    /// the read side treats an unparseable defer as NOT deferred (never park an
-    /// item forever silently), so accepting one here would quietly no-op.
+    /// Reject malformed defer dates because readers treat them as not deferred, making a write silently ineffective.
     @discardableResult
     public func setDeferUntil(_ handle: String, until: String?) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -71,8 +60,7 @@ extension SwiftNativeDeskStore {
             return op
         }
     }
-    /// Trim, drop empties, dedup — preserving FIRST-SEEN order so the stored set
-    /// reads back the way the operator named it.
+    /// Preserve first-seen order so the stored set reads back as named.
     static func normalizeBlockers(_ raw: [String]) -> [String] {
         var seen: Set<String> = []
         var out: [String] = []
@@ -83,8 +71,7 @@ extension SwiftNativeDeskStore {
         }
         return out
     }
-    /// Settled conditions come off the item as it is now, under the ops lock,
-    /// so a wait committed meanwhile is never overwritten; the note says why.
+    /// Remove settled waits under the lock so a concurrently committed wait survives.
     public func releaseBlockers(_ handle: String, removing settled: Set<String>, note: String, author: String) async throws {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             var feed = try await readFeedUnlocked()
@@ -98,10 +85,7 @@ extension SwiftNativeDeskStore {
             }
         }
     }
-    /// Write-time gate for a proposed blocker set: every Desk blocker must be a live
-    /// item; experience conditions are checked by their caller. Desk edges cannot close a cycle in
-    /// the PROSPECTIVE graph (live edges with this item's edges replaced by the
-    /// proposal). A cycle is unresolvable — nothing in it can ever become ready.
+    /// Validate the prospective graph: every Desk blocker is live and no edge closes an unresolvable cycle.
     static func validateBlockedOn(handle: String, proposed: [String], in state: DeskState) throws {
         let liveHandles = Set(state.items.map(\.handle))
         for blocker in proposed {
@@ -114,10 +98,7 @@ extension SwiftNativeDeskStore {
         var edges: [String: [String]] = [:]
         for item in state.items { edges[item.handle] = item.blockedOn.filter { !$0.hasPrefix("exp:") } }
         edges[handle] = proposed.filter { !$0.hasPrefix("exp:") }
-        // Is `handle` reachable FROM any proposed blocker? If so the proposal
-        // closes a loop. DFS carries the path so the refusal can name it, and is
-        // bounded by both a visited set (existing cycles elsewhere in the graph
-        // can't hang it) and a depth cap.
+        // Carry a bounded DFS path so refusals name cycles without hanging on malformed graphs.
         for start in proposed where !start.hasPrefix("exp:") {
             var seen: Set<String> = []
             var path: [String] = []
@@ -140,49 +121,12 @@ extension SwiftNativeDeskStore {
             }
         }
     }
-    /// close_item -> status=done (or canceled), closedAt=now, summary=outcomeSummary.
     @discardableResult
     public func closeItem(_ handle: String, outcomeSummary: String, canceled: Bool = false) async throws -> DeskOp {
         let status: DeskStatus = canceled ? .canceled : .done
         return try await appendValidated(DeskOp(handle: handle, body: .closeItem(outcomeSummary: outcomeSummary, status: status)))
     }
-    /// Settle only the most recently linked Workshop execution, under the same
-    /// lock that admits new references and lifecycle changes.
-    public func settleWorkshopExecution(
-        _ handle: String, executionId: String, note: String, status: DeskStatus,
-        summary: String, waitingOn: String? = nil, latestExecutionId: String? = nil
-    ) async throws -> Bool {
-        try await SwiftNativePersistenceCore.withFileLock(opsPath) {
-            var feed = try await readFeedUnlocked()
-            var state = Self.compact(base: feed.base, feed.ops)
-            guard let item = state.items.first(where: { $0.handle == handle }) else { return false }
-            let executions = item.refs.compactMap { ref -> String? in
-                if case .trace(let id, "workshop_execution") = ref.kind { return id }
-                return nil
-            }
-            guard executions.contains(executionId) else { return false }
-            let latest = latestExecutionId ?? executions.last
-            guard latest == executionId else { return true }
-            if !item.notes.contains(where: { $0.text == note }) {
-                var op = DeskOp(handle: handle, body: .appendNote(text: note))
-                op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-                (state, feed) = try await appendAndRecompactUnlocked(op, feed: feed)
-            }
-            guard !item.status.isTerminal else { return true }
-            if status == .done, let continuation = item.continuation,
-               ![.complete, .canceled].contains(continuation.state) { return true }
-            var op = DeskOp(handle: handle, body: status == .blocked
-                ? .setStatus(status: .blocked, blockedReason: summary, waitingOn: waitingOn,
-                             progress: nil, assignee: nil, laneOf: nil)
-                : .closeItem(outcomeSummary: summary, status: status))
-            try Self.validateHierarchyTransition(op, in: state)
-            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
-            op.ts = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
-            return true
-        }
-    }
-    /// Under the ops flock, close only a nonterminal item with matching updatedAt; otherwise return false.
+    /// Match updatedAt under the lock so a stale close cannot settle newer work.
     @discardableResult
     public func closeItemIfUnchanged(_ handle: String, expectedUpdatedAt: String, outcomeSummary: String, canceled: Bool = false) async throws -> Bool {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -201,10 +145,8 @@ extension SwiftNativeDeskStore {
             return true
         }
     }
-    /// Close a pursuit only when the exact completed reservation durably owns a
-    /// typed `goal_satisfied` outcome and the item has not changed since the
-    /// caller verified its handle-scoped artifacts. This is the sole automatic
-    /// completion path; prose is never interpreted as completion evidence.
+    /// Automatic completion requires the exact reservation’s typed goal_satisfied outcome and unchanged artifacts.
+    /// Prose cannot stand in for completion evidence.
     @discardableResult
     public func closePursuitIfGoalSatisfied(
         _ handle: String,
@@ -238,21 +180,14 @@ extension SwiftNativeDeskStore {
             return true
         }
     }
-    /// Repair legacy contradictory projections without rewriting the canonical
-    /// feed. Each terminal parent that still owns a non-terminal descendant is
-    /// reopened to its last recorded non-terminal status with a new set_status
-    /// event. The original terminal event remains in the log for audit/replay.
-    ///
-    /// This is explicit rather than hidden in liveState(): reads stay pure, and
-    /// the app-owned runtime can decide when to perform a migration/recovery pass.
+    /// Reopen contradictory terminal ancestors with compensating events, preserving canonical history.
+    /// Recovery is explicit so liveState remains a pure read.
     @discardableResult
     public func reconcileTerminalParentsWithNonTerminalDescendants() async throws -> [DeskOp] {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             var feed = try await readFeedUnlocked()
             var state = Self.compact(base: feed.base, feed.ops)
-            // DeskState is parent-before-descendant. Reopen outer terminal
-            // parents first so a nested repair never sits beneath a terminal
-            // ancestor while its compensating event is appended.
+            // Reopen outer ancestors first so each appended repair respects hierarchy invariants.
             let candidates = Self.terminalParentsWithNonTerminalDescendants(in: state)
             var repairs: [DeskOp] = []
             for candidate in candidates {
@@ -290,15 +225,12 @@ extension SwiftNativeDeskStore {
             return repairs
         }
     }
-    /// markNotified — stamp notify.lastNotifiedAt (a notification was attempted).
-    /// Does NOT bump updatedAt; the notify loop calls this after ATTEMPTING
-    /// delivery (v1 stamps after attempt, not delivery-success) so the same
-    /// change can't fan out into duplicate pings.
+    /// Stamp notification attempts without changing updatedAt so one change cannot fan out into duplicate pings.
     @discardableResult
     public func markNotified(_ handle: String, at: String = DeskClock.nowISO()) async throws -> DeskOp {
         try await appendValidated(DeskOp(handle: handle, body: .markNotified(at: at)))
     }
-    /// Stamp notify.lastNotifiedAt only for matching updatedAt, keeping newer content eligible; return whether stamped.
+    /// Match updatedAt so stamping an old notification leaves newer content eligible.
     @discardableResult
     public func markNotifiedIfUnchanged(_ handle: String, expectedUpdatedAt: String, at: String? = nil) async throws -> Bool {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -306,9 +238,7 @@ extension SwiftNativeDeskStore {
             let state = Self.compact(base: feed.base, feed.ops)
             guard let item = state.items.first(where: { $0.handle == handle }),
                   item.updatedAt == expectedUpdatedAt else { return false }
-            // Default stamp is minted HERE, inside the flock — a default-argument
-            // stamp is evaluated at the call site, before the lock, where it can
-            // misorder against a mutation racing for the same lock.
+            // Mint the stamp inside the flock so it cannot precede a mutation that wins the lock.
             let stamp = at ?? DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
             _ = try await appendAndRecompactUnlocked(
                 DeskOp(ts: stamp, handle: handle, body: .markNotified(at: stamp)),

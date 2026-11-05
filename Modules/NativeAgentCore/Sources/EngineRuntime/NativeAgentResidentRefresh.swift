@@ -5,7 +5,7 @@ import Onboarding
 import PersonaEngine
 import ChatTurnRuntime
 
-// Blueprint: | `NativeAgentResidentRefresh.swift` | `NativeAgentEngine` onboarding/resident refresh: profile transitions defer mind/context reload until admitted turns drain |
+// Blueprint: | `NativeAgentResidentRefresh.swift` | `NativeAgentEngine`; Defer mind/context reload until admitted turns settle |
 
 public extension NativeAgentEngine {
     @MainActor
@@ -76,9 +76,7 @@ public extension NativeAgentEngine {
         return result
     }
 
-    /// A profile repair cannot reload cognition or Context Flow underneath an
-    /// admitted turn. Shared admission retains a busy root's request and
-    /// rechecks the actual in-flight owner before publication and reload.
+    /// Profile repair must not reload cognition during admitted turns; retain busy requests and recheck the live owner before publication.
     @MainActor
     func refreshResidentMindAfterProfileRepair(
         publishProfile: @escaping @MainActor @Sendable () async -> Void,

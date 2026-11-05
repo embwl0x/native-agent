@@ -3,10 +3,10 @@ import NativeAgentCore
 import NativeAgentShared
 import Observation
 import PersistenceCore
-// Blueprint: | `TurnInspectorFeed.swift` | Engine-owned persisted today/yesterday evidence, exact file observation, `LatestRead` publication with checked read failures, grouped Mac cards, bounded phone summaries and immutable selected-date replay reads |
+import Experiences
+// Blueprint: | `TurnInspectorFeed.swift` | `LatestRead`: Checked evidence via `LatestRead`; shared Mac/phone grouping |
 
-/// The engine's persisted trace projection. Mac details and phone summaries
-/// share today's and yesterday's rows, grouped once after source changes.
+/// Share persisted evidence across Mac and phone so independent projections cannot disagree on grouping.
 @MainActor
 @Observable
 public final class TurnInspectorFeed {
@@ -18,7 +18,6 @@ public final class TurnInspectorFeed {
 
     private let lane: TurnTracePersistLane
     @ObservationIgnored private var watcher: FileChangeWatcher?
-    @ObservationIgnored private var watchedDay: URL?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var refreshRequested = false
 
@@ -32,13 +31,12 @@ public final class TurnInspectorFeed {
     }
 
     public func start() {
-        observeCurrentDays()
+        observeRecord()
     }
 
     public func stop() {
         watcher?.cancel()
         watcher = nil
-        watchedDay = nil
         refreshTask?.cancel()
         refreshTask = nil
     }
@@ -49,17 +47,13 @@ public final class TurnInspectorFeed {
         return TurnInspectorGrouping.group(groups.flatMap(\.events).filter { $0.ts > cutoff })
     }
 
-    private func observeCurrentDays() {
-        let today = lane.path(for: Date())
-        guard watchedDay != today else { return }
-        watcher?.cancel()
-        watchedDay = today
-        let yesterday = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -1, to: Date()) ?? Date()
+    private func observeRecord() {
+        guard watcher == nil else { return }
+        let database = lane.resolvedDataRoot().appendingPathComponent("experiences/experiences.sqlite")
         watcher = FileChangeWatcher(paths: [
-            today, lane.path(for: yesterday), today.deletingLastPathComponent(),
+            database, URL(fileURLWithPath: database.path + "-wal"), database.deletingLastPathComponent(),
         ]) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.observeCurrentDays()
                 self?.scheduleRefresh()
             }
         }
@@ -67,12 +61,17 @@ public final class TurnInspectorFeed {
     }
 
     /// Replay returns an immutable read result; each window keeps its selection.
-    public func loadReplay(for date: Date) async throws -> (exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]) {
-        let url = lane.path(for: date)
+    public func loadReplay(for date: Date) async throws -> (hasEvidence: Bool, unreadable: Int, cards: [InspectorTurnCard]) {
+        let root = lane.resolvedDataRoot()
+        let calendar = TurnTracePersistLane.dayCalendar
+        let from = calendar.startOfDay(for: date)
+        guard let nextDay = calendar.date(byAdding: .day, value: 1, to: from) else { throw CocoaError(.fileReadUnknown) }
+        let through = Date(timeIntervalSince1970: nextDay.timeIntervalSince1970.nextDown)
         return try await Task.detached(priority: .userInitiated) {
-            let exists = FileManager.default.fileExists(atPath: url.path)
-            let parsed = try await TurnTraceReplayReader.read(url)
-            return (exists: exists, report: parsed.report, cards: TurnInspectorGrouping.group(parsed.events))
+            let read = try await TurnTraceReplayReader.read(.init(from: from, through: through), root: root)
+            let events = read.events.filter { $0.ts < nextDay && $0.turnId != "unknown" }
+            return (hasEvidence: !events.isEmpty || read.unreadable > 0, unreadable: read.unreadable,
+                    cards: TurnInspectorGrouping.group(events))
         }.value
     }
 
@@ -98,7 +97,7 @@ public final class TurnInspectorFeed {
         }
     }
 
-    /// Coalesce persisted-file changes for 0.1s before refreshing.
+    /// Coalesce record changes for 0.1s before refreshing.
     private func scheduleRefresh() {
         refreshRequested = true
         guard refreshTask == nil else { return }

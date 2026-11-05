@@ -1,26 +1,22 @@
 import Foundation
-// Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser`: shared fence, list and sanitized inline grammar with explicit parse outcomes and failure presentation; `ChatContentCache`: bounded content-keyed FIFO storage |
+// Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser`: checked grammar; `ChatContentCache`: bounded FIFO |
 
 // Split fences before inline parsing so code remains literal on both platforms.
-/// Identity is deliberately NOT derived from the block's contents: a message
-/// can repeat the same prose or the same snippet twice, and content-derived ids
-/// would collide inside one `ForEach`. The list is recomputed atomically from a
-/// single content string, so positional identity is both correct and stable.
+/// Identity is deliberately NOT derived from the block's contents: a message can repeat the same prose or the same snippet twice, and content-derived
+/// ids would collide inside one `ForEach`. The list is recomputed atomically from a single content string, so positional identity is both correct and
+/// stable.
 public enum ChatContentBlock: Equatable, Sendable {
     case prose(String)
-    /// `language` is the fence info string when the model supplied one.
     case code(language: String?, code: String)
 }
 
 public enum ChatRichContentParser {
-    /// A failed parse is never a successfully rendered literal message. Keep
-    /// its cause and source together through caches and presentation.
+    /// A failed parse is never a successfully rendered literal message. Keep its cause and source together through caches and presentation.
     public enum InlineOutcome: Sendable {
         case parsed(AttributedString)
         case failed(source: String, reason: String)
 
-        /// The same visible failure on every surface, including Copy. Source
-        /// is evidence below the notice, not input to a second interpreter.
+        /// The same visible failure on every surface, including Copy. Source is evidence below the notice, not input to a second interpreter.
         public var presentation: AttributedString {
             switch self {
             case .parsed(let text): return text
@@ -54,7 +50,6 @@ public enum ChatRichContentParser {
         pattern: #"^( *)([-+*]|[0-9]{1,9}[.)])[ \t]+(.*)$"#
     )
 
-    /// The same list grammar and soft continuations on every chat surface.
     public static func listRows(_ content: String) -> [ProseRow] {
         var rows: [ProseRow] = []
         for line in content.components(separatedBy: "\n") {
@@ -88,23 +83,17 @@ public enum ChatRichContentParser {
         pattern: "\u{E200}cite[^\u{E201}]*[\u{E201}]|\u{E200}(?:c(?:i(?:t(?:e[^\u{E201}]*)?)?)?)?$"
     )
 
-    /// Provider reference IDs have no visible source URL. Hide whole tokens,
-    /// including an unfinished streamed token, before Markdown sees them.
+    /// Provider reference IDs have no visible source URL. Hide whole tokens, including an unfinished streamed token, before Markdown sees them.
     public static func visibleText(_ content: String) -> String {
         guard content.contains("\u{E200}") else { return content }
         return providerCitation.stringByReplacingMatches(
             in: content, range: NSRange(content.startIndex..., in: content), withTemplate: "")
     }
 
-    /// Split `content` into prose and fenced-code blocks.
-    ///
-    /// Only backtick fences are recognised. An UNTERMINATED fence takes the
-    /// remainder of the message as code — a truncated or cancelled turn still
-    /// shows its snippet as a snippet rather than as mangled prose.
+    /// An unterminated backtick fence keeps the remaining snippet literal, including on cancellation.
     public static func blocks(_ content: String) -> [ChatContentBlock] {
         let content = visibleText(content)
-        // Fast path: the overwhelming majority of messages carry no fence at
-        // all, and they must not pay for line splitting or array building.
+        // Fast path: the overwhelming majority of messages carry no fence at all, and they must not pay for line splitting or array building.
         guard content.contains("```") else { return [.prose(content)] }
 
         var blocks: [ChatContentBlock] = []
@@ -112,17 +101,15 @@ public enum ChatRichContentParser {
         var code: [Substring] = []
         var fence: (ticks: Int, language: String?)?
 
-        // `omittingEmptySubsequences: false` keeps blank lines, which carry the
-        // paragraph structure the inline parser preserves.
+        // `omittingEmptySubsequences: false` keeps blank lines, which carry the paragraph structure the inline parser preserves.
         let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
 
         func flushProse() {
             guard !prose.isEmpty else { return }
             let text = prose.joined(separator: "\n")
             prose.removeAll()
-            // A fence sitting between two paragraphs leaves a trailing newline
-            // on the prose above it; dropping whitespace-only prose avoids an
-            // empty Text view opening a gap in the bubble.
+            // A fence sitting between two paragraphs leaves a trailing newline on the prose above it; dropping whitespace-only prose avoids an empty
+            // Text view opening a gap in the bubble.
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
             blocks.append(.prose(text))
         }
@@ -137,9 +124,8 @@ public enum ChatRichContentParser {
             let ticks = leading.prefix { $0 == "`" }.count
 
             if let open = fence {
-                // A closing fence is backticks alone, at least as long as the
-                // opener. A line of code that merely CONTAINS backticks (an
-                // inline-code example) must not terminate the block.
+                // A closing fence is backticks alone, at least as long as the opener. A line of code that merely CONTAINS backticks (an inline-code
+                // example) must not terminate the block.
                 let isClose = ticks >= open.ticks
                     && leading.dropFirst(ticks).trimmingCharacters(in: .whitespaces).isEmpty
                 if isClose {
@@ -183,8 +169,7 @@ public enum ChatLinkPolicy {
         return allowedSchemes.contains(scheme)
     }
 
-    /// Strip the `.link` attribute from every run whose URL is not allowlisted.
-    /// Collect ranges before mutation, since clearing links coalesces runs.
+    /// Collect ranges before clearing untrusted links: mutation coalesces runs.
     public static func sanitized(_ attributed: AttributedString) -> AttributedString {
         let doomed = attributed.runs.compactMap { run -> Range<AttributedString.Index>? in
             guard let url = run.link, !isAllowed(url) else { return nil }

@@ -6,13 +6,14 @@ import ApprovalInbox
 import ChatTurnRuntime
 import Transcripts
 import NotificationInbox
+import Experiences
 
-// Blueprint: | `InboxCardActions.swift` | `InboxCardActions`: primary action projection and spoken/draft delivery through one inbox claim; speech addresses the card's conversation or checked anchor and marks read only after acceptance |
+// Blueprint: | `InboxCardActions.swift` | Inbox actions change the matter's reading; putting away an open ask first declines through its resolver |
 
 /// Assembly and presentation bindings; the transaction owns ordering and receipts.
 public protocol InboxCardActionEffects: Sendable {
-    func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool) async throws
-    func resolveApproval(id: String, decision: String, dataRootOverride: URL?) async throws
+    func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool, turn: Turn) async throws
+    func resolveApproval(id: String, decision: String, dataRootOverride: URL?, turn: Turn) async throws
     func inboxItems(dataRoot: URL) async throws -> [InboxItemRecord]
     func cleanUpDiskHygiene(dataRoot: URL) async throws -> String
     func chatClient(dataRoot: URL) -> SwiftNativeChatOrchestrationClient
@@ -25,14 +26,19 @@ public protocol InboxCardActionEffects: Sendable {
 public enum InboxCardActions {
     public static func perform(
         _ id: String, action: String, metadata: [String: JSONValue] = [:], quiet: Bool = false,
-        dataRootOverride: URL?, effects: any InboxCardActionEffects
+        dataRootOverride: URL?, turn: Turn, effects: any InboxCardActionEffects
     ) async throws {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let visibleInboxPath = LiveNotificationInbox.livePath(dataRoot: root)
         let normalizedAction = InboxActionVocabulary.normalizedAction(action)
-        if id.hasPrefix("interaction:"), !["read", "archive", "dismiss"].contains(normalizedAction) {
-            try await effects.interactionAction(id: id, action: normalizedAction, dataRoot: root, quiet: quiet)
-            return
+        if id.hasPrefix("interaction:"), normalizedAction != "read" {
+            let putsAway = ["archive", "dismiss"].contains(normalizedAction)
+            do {
+                try await effects.interactionAction(id: id, action: putsAway ? "reject" : normalizedAction, dataRoot: root, quiet: quiet, turn: turn)
+            } catch InlineInteractionResolver.ResolveError.alreadySettled where putsAway {
+                // A decision already settled (or failed) has nothing left to decline; putting its card away is all the person asked.
+            }
+            // Save the requested inbox disposition after its underlying decision; other card actions own their delivery reconciliation.
+            if !putsAway { return }
         }
         if normalizedAction == "reply" {
             throw NSError(
@@ -49,31 +55,18 @@ public enum InboxCardActions {
         let endpointAction = normalizedAction
 
         if endpointAction == "archive" || endpointAction == "dismiss",
-           let row = try await LiveNotificationInbox(path: visibleInboxPath).rows().first(where: {
-               $0.objectValue?["id"]?.stringValue == id }),
-           case .object(let card) = row,
-           !(card["related_approval_id"]?.stringValue ?? "").isEmpty,
-           !(card["actions"]?.arrayValue ?? []).contains(where: { $0.objectValue?["id"]?.stringValue == endpointAction }) {
-            // The same rule every surface shows: an approval's card is settled by its approval.
-            throw NSError(domain: "NativeAgentSwiftOnly", code: -409, userInfo: [NSLocalizedDescriptionKey:
-                "This card belongs to a pending approval; approve or deny it (or open Approvals) instead of \(endpointAction == "archive" ? "archiving" : "dismissing") it."])
+           let matter = try await ForPerson.at(root).matter(id), matter.owes["decide"]?.phase.isSettled == false,
+           let approval = matter.evidence.first(where: { $0.source == Matter.approvals }) {
+            do { try await effects.resolveApproval(id: approval.id, decision: "reject", dataRootOverride: root, turn: turn) }
+            catch ApprovalInboxError.alreadyResolved { }
         }
         if endpointAction == "read" || endpointAction == "archive" || endpointAction == "dismiss" {
-            if await updateVisibleStatus(
-                id: id, action: endpointAction, inboxPath: visibleInboxPath, metadata: metadata) {
-                return
-            }
-            nativeLog("[inbox] inboxAction(\(endpointAction)) id=\(id): live inbox status write declined")
-            throw NSError(
-                domain: "NativeAgentSwiftOnly",
-                code: -423,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "Inbox \(endpointAction) for \(id) didn't persist (transient lock/IO failure or stale row) — retry."]
-            )
+            try await setReading(id: id, action: endpointAction, dataRoot: root)
+            return
         }
         if endpointAction == "approve" || endpointAction == "reject" {
             do {
-                try await effects.resolveApproval(id: id, decision: endpointAction, dataRootOverride: dataRootOverride)
+                try await effects.resolveApproval(id: id, decision: endpointAction, dataRootOverride: dataRootOverride, turn: turn)
             } catch ApprovalInboxError.alreadyResolved(let resolvedID, let status) {
                 nativeLog("[inbox] inboxAction(\(endpointAction)) id=\(resolvedID): already resolved (\(status)); treating as success")
             } catch {
@@ -84,9 +77,9 @@ public enum InboxCardActions {
         }
         if endpointAction == "open_approvals" {
             if quiet {
-                _ = await updateVisibleStatus(id: id, action: "read", inboxPath: visibleInboxPath)
+                try await setReading(id: id, action: "read", dataRoot: root)
             } else {
-                await openApprovalsFromInboxAction(id: id, inboxPath: visibleInboxPath, effects: effects)
+                try await openApprovalsFromInboxAction(id: id, dataRoot: root, effects: effects)
             }
             return
         }
@@ -103,18 +96,15 @@ public enum InboxCardActions {
             switch resolution {
             case .openApprovals:
                 if quiet {
-                    _ = await updateVisibleStatus(id: id, action: "read", inboxPath: visibleInboxPath)
+                    try await setReading(id: id, action: "read", dataRoot: root)
                 } else {
-                    await openApprovalsFromInboxAction(id: id, inboxPath: visibleInboxPath, effects: effects)
+                    try await openApprovalsFromInboxAction(id: id, dataRoot: root, effects: effects)
                 }
-            case .openDeskExecution:
-                if quiet { break }
-                await effects.openDesk()
             case .chatDraft(let draft):
                 if quiet { break }
                 await effects.openChatDraft(draft)
             case .chatSpoken(let message):
-                let spokenSession = try await postSpokenInboxMessage(message: message, item: item, dataRoot: root, effects: effects)
+                let spokenSession = try await postSpokenInboxMessage(message: message, item: item, dataRoot: root, turn: turn, effects: effects)
                 if !quiet { await effects.openSpokenChat(spokenSession) }
             case .diskCleanup:
                 let message = try await effects.cleanUpDiskHygiene(dataRoot: root)
@@ -129,13 +119,9 @@ public enum InboxCardActions {
                         + "or open the item for full context."]
                 )
             }
-            // A refused effect leaves the card unread. A posted speech is
-            // idempotent, so a failed read-marker write can safely be retried.
+            // A refused effect leaves the card unread. A posted speech is idempotent, so a failed read-marker write can safely be retried.
             if let statusAction = resolution.inboxStatusAction {
-                guard await updateVisibleStatus(id: id, action: statusAction, inboxPath: visibleInboxPath) else {
-                    throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey:
-                        "Inbox act for \(id) completed, but marking it \(statusAction) did not persist. Retry this same card."])
-                }
+                try await setReading(id: id, action: statusAction, dataRoot: root)
             }
             return
         }
@@ -148,7 +134,6 @@ public enum InboxCardActions {
 
     public enum InboxPrimaryActionResolution: Equatable, Sendable {
         case openApprovals
-        case openDeskExecution(executionId: String)
         case chatDraft(draft: String)
         case chatSpoken(message: String)
         case diskCleanup
@@ -157,7 +142,7 @@ public enum InboxCardActions {
         var inboxStatusAction: String? {
             switch self {
             case .openApprovals, .diskCleanup, .unresolved: return nil
-            case .openDeskExecution, .chatDraft, .chatSpoken: return "read"
+            case .chatDraft, .chatSpoken: return "read"
             }
         }
     }
@@ -165,9 +150,6 @@ public enum InboxCardActions {
     public static func resolvePrimaryAction(for item: InboxItemRecord) -> InboxPrimaryActionResolution {
         if item.isApprovalBacklogCard {
             return .openApprovals
-        }
-        if let executionId = item.relatedWorkshopExecutionId, !executionId.isEmpty {
-            return .openDeskExecution(executionId: executionId)
         }
         if item.source == "disk_hygiene" {
             return .diskCleanup
@@ -180,7 +162,7 @@ public enum InboxCardActions {
         if title.isEmpty && summary.isEmpty {
             return .unresolved(reason: "no linked approval/execution and no referenceable content")
         }
-        if isHerVoiceCard(item) {
+        if isAgentVoiceCard(item) {
             return .chatSpoken(
                 message: inboxSpokenMessageText(title: title, summary: summary, detail: item.detail)
             )
@@ -188,11 +170,11 @@ public enum InboxCardActions {
         return .chatDraft(draft: inboxChatDraftText(title: title, summary: summary))
     }
 
-    // Only these exact producers author a message in her voice.
-    static let herVoiceCardSources: Set<String> = ["trigger:morning_brief", "idle_checkin"]
+    // Only these exact producers author a message in the agent's voice.
+    static let agentVoiceCardSources: Set<String> = ["trigger:morning_brief", "idle_checkin"]
 
-    static func isHerVoiceCard(_ item: InboxItemRecord) -> Bool {
-        herVoiceCardSources.contains(item.source.trimmingCharacters(in: .whitespacesAndNewlines))
+    static func isAgentVoiceCard(_ item: InboxItemRecord) -> Bool {
+        agentVoiceCardSources.contains(item.source.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     static func inboxSpokenMessageText(title: String, summary: String, detail: String?) -> String {
@@ -216,7 +198,8 @@ public enum InboxCardActions {
         return draft + "\n\n"
     }
 
-    private static func postSpokenInboxMessage(message: String, item: InboxItemRecord, dataRoot: URL, effects: any InboxCardActionEffects) async throws -> String {
+    private static func postSpokenInboxMessage(message: String, item: InboxItemRecord, dataRoot: URL,
+        turn: Turn, effects: any InboxCardActionEffects) async throws -> String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey: "This inbox message has no content to deliver."])
@@ -246,7 +229,8 @@ public enum InboxCardActions {
                     content: trimmed
                 ),
                 sessionId: sessionId,
-                initiative: .userRequested
+                initiative: .userRequested,
+                turn: turn
             )
             switch outcome {
             case .posted(let destination, _):
@@ -254,7 +238,11 @@ public enum InboxCardActions {
             case .duplicate(let destination):
                 return destination
             case .rateLimited(let seconds):
-                throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey: "Inbox delivery is rate limited for \(seconds) seconds. The same card and message remain available; retry later."])
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -423,
+                    userInfo: [NSLocalizedDescriptionKey: """
+                        Inbox delivery is rate limited for \(seconds) seconds. \
+                        The same card and message remain available; retry later.
+                        """])
             }
         } catch let error as ProactiveSpeechError {
             throw error
@@ -263,41 +251,24 @@ public enum InboxCardActions {
         }
     }
 
-    private static func openApprovalsFromInboxAction(id: String, inboxPath: URL, effects: any InboxCardActionEffects) async {
-        _ = await updateVisibleStatus(id: id, action: "read", inboxPath: inboxPath)
+    private static func openApprovalsFromInboxAction(id: String, dataRoot: URL, effects: any InboxCardActionEffects) async throws {
+        try await setReading(id: id, action: "read", dataRoot: dataRoot)
         await effects.openApprovals()
     }
 
-    @discardableResult
-    public static func updateVisibleStatus(
-        id: String,
-        action: String,
-        inboxPath: URL,
-        metadata: [String: JSONValue] = [:]
-    ) async -> Bool {
-        let status: String
-        let readAt: String?
-        switch action {
-        case "read":
-            status = "read"
-            readAt = NotificationInboxClock.nowISO()
-        case "archive":
-            status = "archived"
-            readAt = nil
-        case "dismiss":
-            status = "dismissed"
-            readAt = nil
-        default:
-            return false
+    private static func setReading(id: String, action: String, dataRoot: URL) async throws {
+        let forPerson = ForPerson.at(dataRoot)
+        guard try await forPerson.matter(id) != nil else {
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -410,
+                userInfo: [NSLocalizedDescriptionKey: "Inbox item \(id) not found. Refresh the inbox before acting."])
         }
-
-        do {
-            return try await LiveNotificationInbox(path: inboxPath).updateStatus(
-                id: id, status: status, readAt: readAt, metadata: metadata
-            )
-        } catch {
-            nativeLog("[inbox] updateVisibleNotificationInboxStatus(\(action)) failed for \(id): \(String(describing: error))")
-            return false
+        switch action {
+        case "read": try await forPerson.read(id)
+        case "archive": try await forPerson.putAway(id, .archived)
+        case "dismiss": try await forPerson.putAway(id, .dismissed)
+        default:
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -410,
+                userInfo: [NSLocalizedDescriptionKey: "Unknown inbox reading: \(action)"])
         }
     }
 }

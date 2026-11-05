@@ -5,11 +5,10 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ToolRegistry
+import ChatToolParsing
 // Blueprint: | `MacChatTurnActivity.swift` | `MacChatTurnActivity` struct |
 
-/// Exact routing identity for live Mac turn activity. The session id selects
-/// the AppModel slot; the turn id prevents late events from a prior stream
-/// from entering a replacement turn in that same session.
+/// Pair session and turn IDs so late activity from a prior stream cannot enter its replacement.
 public struct MacChatTurnIdentity: Sendable, Equatable {
     public let sessionId: String
     public let turnId: String
@@ -26,30 +25,22 @@ public enum MacChatTurnActivitySource: Sendable, Equatable {
     case notice(kind: String)
 }
 
-/// A boundary-sanitized reducer input. It deliberately has no field capable
-/// of retaining tool arguments/results, provider payloads, model output, or
-/// hidden reasoning.
+/// Retain no payload-capable fields so the activity reducer cannot hold provider, tool, output or reasoning bodies.
 public struct MacChatTurnActivity: Sendable, Equatable {
     public let identity: MacChatTurnIdentity
     public let source: MacChatTurnActivitySource
     public let phase: TurnPresentationPhase
     public let actionSummary: String?
-    /// Existing toast copy, redacted and independently capped before crossing
-    /// the boundary. The stored shared-kernel summary remains at its tighter
-    /// shared detail limit.
+    /// Redact and cap toast text independently; the shared kernel retains its tighter summary limit.
     public let userVisibleNoticeText: String?
     public let delegateDisplayName: String?
     public let outcome: TurnPresentationActivity.Outcome?
     public let occurredAt: Date
 }
 
-/// Converts the existing ChatOrchestration stream vocabulary at the Mac
-/// boundary. Raw JSON input/output is discarded in this switch before an
-/// activity value can be constructed; only the progress phrase's plain names
-/// (an app, an agent, a page, a web host) pass, inside its words, and a
-/// result passes only as its exact outcome class.
+/// Discard raw input and output before constructing activity; retain only bounded plain labels and exact outcome class.
 public enum MacChatTurnActivityBoundary {
-    /// `shown` is the turn's own: an `app` call reads as the action it ran.
+    /// Label `app` activity by the action actually run.
     public static func activity(
         from event: TurnStreamEvent,
         identity: MacChatTurnIdentity,
@@ -61,15 +52,16 @@ public enum MacChatTurnActivityBoundary {
             let call = shown.use(name, input: input)
             return toolUse(name: call.name, args: call.input.stringFields, identity: identity, at: instant)
         case .toolResult(let name, let output):
+            let reply = ToolResult(output)
             return toolResult(
                 name: shown.result(name).name,
-                result: ChatToolOutcome.exactResultClass(output),
+                result: reply.outcome,
                 identity: identity,
                 at: instant
             )
         case .notice(let kind, let text):
             return notice(kind: kind, text: text, identity: identity, at: instant)
-        case .delta, .final, .error, .replyTextSettled:
+        case .delta, .final, .error, .replyTextSettled, .writing:
             return nil
         }
     }
@@ -151,7 +143,7 @@ public enum MacChatTurnActivityBoundary {
 
     private static func delegateName(forTool name: String, args: [String: String]) -> String? {
         switch name.lowercased() {
-        case "agent_message", "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message", "agent_swarm":
+        case "agent_message":
             guard let agent = sanitized(args["agent"]),
                   !agent.hasPrefix("peer:"), !agent.hasPrefix("bot:") else { return "Agent" }
             return agent

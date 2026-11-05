@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ContextExpansion.swift` | `ContextExpander.expand`: expands selector-offered pointers without mutating context or deriving authority from their contents |
+// Blueprint: | `ContextExpansion.swift` | `ContextExpander.expand`: offered-pointer expansion without mutation or authority |
 
 public enum ContextExpansionError: Error, Equatable, Sendable {
     case invalidCharacterLimit
@@ -73,15 +73,13 @@ public struct ContextExpansionResult: Codable, Equatable, Sendable {
     }
 }
 
-/// Resolves a selector-issued, on-demand pointer without mutating context state
-/// or deriving any new authority from the pointed-to atom.
+/// Resolves a selector-issued, on-demand pointer without mutating context state or deriving any new authority from the pointed-to atom.
 public struct ContextExpander: Sendable {
     private static let maximumCharacters = 12_000
 
     public init() {}
 
-    /// - Parameter offeredSelectedItems: selected representations whose
-    ///   pointers this turn's packet offered. Empty offers no expansions.
+    /// - Parameter offeredSelectedItems: selected representations whose pointers this turn's packet offered. Empty offers no expansions.
     public func expand(
         _ pointer: ContextAtomPointer,
         for need: NeedSignal,
@@ -175,8 +173,7 @@ public struct ContextExpander: Sendable {
         if let failure = ContextSelector.commonEligibilityFailure(
             for: atom, generationID: generationID, source: source, need: need
         ) { throw failure.expansionError }
-        // Admission follows the offered representation, not the full body's
-        // length: a short summary can omit a body below the render threshold.
+        // Admission follows the offered representation, not the full body's length: a short summary can omit a body below the render threshold.
         let omittedInPacket = offeredSelectedItems.contains { item in
                 item.pointer == pointer
                     && item.isExpandable(thresholdChars: need.packetAtomExpandThresholdChars)

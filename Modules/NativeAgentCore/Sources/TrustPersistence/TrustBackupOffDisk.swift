@@ -6,7 +6,7 @@ import TrustCenter
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupOffDisk.swift` | TrustBackupPersistence off-disk copies; credential exclusions, checked SQLite conversion inventory, landed integrity verification and automatic retention |
+// Blueprint: | `TrustBackupOffDisk.swift` | Credential-filtered coherent copies; verify before retention. |
 
 extension TrustBackupPersistence {
     private static let offDiskBackupKeepCount = 14
@@ -20,16 +20,14 @@ extension TrustBackupPersistence {
         return formatter
     }
 
-    /// `~/Library/Mobile Documents/com~apple~CloudDocs/NativeAgent-Backups` — iCloud Drive, so a lost or wiped Mac does not
-    /// take Agent with it.
+    /// iCloud Drive preserves the agent's backup when the Mac is lost or wiped.
     public static func offDiskBackupParent() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs", isDirectory: true)
             .appendingPathComponent("NativeAgent-Backups", isDirectory: true)
     }
 
-    /// Automatic folders only (`auto-YYYY-MM-DD-HHmmss`, UTC), newest first. Any other folder in the parent — a hand-made copy
-    /// — is never listed, so it is never pruned.
+    /// List only automatic UTC folders so retention never prunes hand-made copies.
     public static func offDiskAutomaticBackups(in parent: URL) throws -> [(url: URL, date: Date)] {
         guard Self.pathEntryExists(parent) else { return [] }
         let formatter = Self.offDiskBackupFolderFormatter()
@@ -48,10 +46,8 @@ extension TrustBackupPersistence {
         }.sorted { $0.date > $1.date }
     }
 
-    /// One versioned off-disk backup: the same snapshot `createBackup` seals, staged in a local temp directory (SQLite copies
-    /// leave WAL mode there), copied into `parent/auto-<UTC time>`, re-verified against its manifest where it landed, then
-    /// automatic folders beyond the newest `offDiskBackupKeepCount` are pruned. Every step that touches iCloud Drive runs on
-    /// VolumeIO, never on the cooperative pool.
+    /// Seal locally with SQLite outside WAL, copy to the versioned destination, then verify before retention. VolumeIO owns iCloud access so slow storage
+    /// cannot block the cooperative pool.
     public static func createOffDiskBackup(
         reason: String,
         dataRoot root: URL,
@@ -76,8 +72,7 @@ extension TrustBackupPersistence {
         let staging = fm.temporaryDirectory
             .appendingPathComponent("NativeAgent-offdisk-\(UUID().uuidString.lowercased())", isDirectory: true)
         let partial = parent.appendingPathComponent(".\(name).partial", isDirectory: true)
-        // Once queued, VolumeIO owns the staged source until the physical copy
-        // exits, even when Stop/deadline has already released this caller.
+        // Once queued, VolumeIO owns the staged source until the physical copy exits, even when Stop/deadline has already released this caller.
         var copyQueued = false
         defer { if !copyQueued { try? fm.removeItem(at: staging) } }
         let files = try await Self.writeBackupSnapshot(
@@ -115,8 +110,20 @@ extension TrustBackupPersistence {
         return destination
     }
 
-    /// A WAL-mode SQLite file cannot be opened from iCloud Drive. Every SQLite copy in the staged snapshot is switched to a
-    /// rollback journal (folding any copied `-wal` into the main file) before it is hashed and shipped.
+    /// The staged copy of the record keeps experiences and events and drops its detail grain: what the body noticed is private, two weeks deep and
+    /// rebuilt by living; the restored store creates an empty detail table on first open. Only the staged copy changes, never the agent's store.
+    static func dropRecordDetails(in dataDir: URL) throws {
+        let record = dataDir.appendingNativeRelativePath("experiences/experiences.sqlite")
+        guard Self.pathEntryExists(record) else { return }
+        var db: OpaquePointer?
+        defer { sqlite3_close_v2(db) }
+        guard sqlite3_open_v2(record.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+              sqlite3_exec(db, "DROP TABLE IF EXISTS detail; VACUUM;", nil, nil, nil) == SQLITE_OK else {
+            throw Self.backupError(code: 500, "The staged record copy could not drop its details: \(String(cString: sqlite3_errmsg(db)))")
+        }
+    }
+
+    /// iCloud cannot open WAL-mode SQLite; fold sidecars into staged copies before hashing and shipping.
     static func convertSQLiteCopiesToRollbackJournal(in dataDir: URL) throws {
         var databases: [URL] = []
         for item in try Self.backupEntries(in: dataDir)
@@ -156,7 +163,6 @@ extension TrustBackupPersistence {
         }
     }
 
-    /// nil for a file that is not SQLite; otherwise whether its header is in WAL mode (format bytes 18/19 == 2).
     private static func sqliteIsWALMode(_ url: URL) throws -> Bool? {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -165,20 +171,20 @@ extension TrustBackupPersistence {
         return header[18] == 2
     }
 
-    /// Off-disk leaves these data-root-relative paths behind: the model that ships in the DMG, local backups, past export and
-    /// support bundles (copies of what the backup carries), the rebuildable history index, regenerable diagnostics, old
-    /// pre-consolidation memory copies, and what PrivacyMap promises never leaves the Mac (usage history, sense ledger and
-    /// news). Credential files anywhere else are `isCredentialFile`.
+    /// The agent's experiences travel (a restore keeps its life and what is still owed); the record's details stay home (`dropRecordDetails`).
+    /// Retained trail paths stay excluded so a backup never reads their old bytes. Credential filtering applies everywhere else.
     private static let offDiskExcludedPaths: Set<String> = [
         "extras", "backups", "production", "chat/index", "activity_watch",
         "logs", "diagnostics", "crash_reports", "ui-frames", "mobile_snapshot_cache",
-        "evals", "traces", "turn_traces", "harness", "builder_audit", "memory/backups",
+        "traces", "turn_traces", "harness", "builder_audit", "memory/backups",
+        "cognition/caring_appraisals.jsonl", "context/feedback.jsonl", "mac_control_audit.jsonl",
+        "slack/receipts.jsonl", "scheduler/retired.jsonl", "mobile_push/apns_outcomes.jsonl", "doctor/repair_receipts.jsonl",
         "senses/ledger",
         "senses/news",
         "ability_fetches",
     ]
 
-    /// `providers/` holds API keys and OAuth tokens; only its model routing goes.
+    /// Only model routing may leave providers; keys and OAuth tokens stay local.
     private static let offDiskProviderFiles: Set<String> = ["providers/active.json", "providers/surfaces.json"]
 
     private static let outgoingCredentialStores: Set<String> = [
@@ -191,15 +197,13 @@ extension TrustBackupPersistence {
             || (NativeAgentWorkspaceRoot.relativePath(relative, under: "providers").map({ !$0.isEmpty }) == true && !offDiskProviderFiles.contains(relative))
     }
 
-    /// True for a data-root-relative path an off-disk backup leaves behind.
     private static func isOffDiskExcluded(_ relative: String, _ url: URL) -> Bool {
         relative.hasSuffix(".lock")
             || Self.isOutgoingCredential(relative, url)
             || Self.offDiskExcludedPaths.contains { NativeAgentWorkspaceRoot.relativePath(relative, under: $0) != nil }
     }
 
-    /// A feed and its optional compaction base are one copy, at any depth (REM's pair lives directly in the data root). Only
-    /// the feed copies its base, so traversal cannot later replace half with a newer epoch.
+    /// Copy feed and optional base together so traversal cannot replace half with a newer compaction epoch.
     static func copyOffDiskEntry(
         _ source: URL, relative: String, into dataDir: URL, dataRoot root: URL
     ) async throws -> [String] {
@@ -227,9 +231,7 @@ extension TrustBackupPersistence {
         }
     }
 
-    /// Copy one data-root item into an off-disk snapshot, returning false when it is left behind. Every SQLite database is
-    /// copied as a coherent image without the backup ever opening live data for write; its `-wal`/`-shm`/`-journal` never
-    /// travel raw. Snapshot/tail feeds copy their optional base and tail together under the feed writer's lock.
+    /// Copy coherent SQLite images without live writes or raw sidecars; feed/base pairs share their writer's lock.
     static func copyOffDiskItem(
         _ source: URL,
         relative: String,
@@ -240,8 +242,7 @@ extension TrustBackupPersistence {
         let destination = dataDir.appendingNativeRelativePath(relative)
         let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
         if values.isSymbolicLink == true {
-            // Never followed: recorded in the manifest as {path, target} by `takeBackupLinks`. The live one points into the
-            // persona root, which this backup copies anyway.
+            // Preserve raw link targets in the manifest; never follow them while copying.
             try Self.copyBackupLink(from: source, to: destination)
             return true
         }
@@ -255,13 +256,12 @@ extension TrustBackupPersistence {
             let names = Set(children.map(\.lastPathComponent))
             for child in children {
                 let name = child.lastPathComponent
-                // A database's sidecars, only when that sibling really is SQLite.
+                // Treat sidecars as database state only when the sibling really is SQLite.
                 if ["-wal", "-shm", "-journal"].contains(where: { suffix in
                     let base = String(name.dropLast(suffix.count))
                     return name.hasSuffix(suffix) && names.contains(base)
                         && (try? Self.sqliteIsWALMode(source.appendingPathComponent(base))).flatMap { $0 } != nil
                 }) { continue }
-                // An atomic writer's in-flight temp file (`.<name>.<pid>...tmp`).
                 if name.hasPrefix("."), name.hasSuffix(".tmp") { continue }
                 _ = try await Self.copyOffDiskEntry(child, relative: relative + "/" + name, into: dataDir, dataRoot: root)
             }
@@ -273,15 +273,12 @@ extension TrustBackupPersistence {
             try Self.copyLiveSQLite(from: source, to: destination)
             return true
         }
-        // A database that may be live goes through a read-only online backup. A WAL database with no `-wal` has no open
-        // connection; it is copied as bytes like any file, and only the staged copy is ever opened for write
-        // (`convertSQLiteCopiesToRollbackJournal` converts and quick_checks it).
+        // Use read-only online backup for live databases; only staged copies may open for write during WAL conversion.
         if let walMode = try Self.sqliteIsWALMode(source),
            !walMode || Self.pathEntryExists(URL(fileURLWithPath: source.path + "-wal")) {
             try Self.copyLiveSQLite(from: source, to: destination)
             return true
         }
-        // The paths the local backup copies under their writers' locks keep them.
         let locked = relative.hasPrefix("memory/") || relative == "chat/sessions.json"
             || relative.hasPrefix("chat/messages/") || relative.hasPrefix("chat/session_state/")
             || relative.hasPrefix("chat/archive/")
@@ -293,10 +290,8 @@ extension TrustBackupPersistence {
         return true
     }
 
-    /// Secrets an off-disk backup never carries, wherever they sit: anything named for a token, secret, credential or signing
-    /// key; connector `auth.json` and OAuth app secrets; private keys (`.p8`, `.pem`, `.key`, `.p12`, `.pfx`, SSH `id_*`); and
-    /// the config files that embed a token or key — app config (Telegram token, X app secrets), Telegram config, MCP server
-    /// commands, and the Mac-control / browser IPC bridge files. Whole credential stores are in `outgoingCredentialStores`.
+    /// Exclude secret-named files, private keys and configurations embedding credentials at every depth. Whole credential stores remain under
+    /// outgoingCredentialStores.
     private static func isCredentialFile(_ url: URL) -> Bool {
         let name = url.lastPathComponent.lowercased()
         return ["auth.json", "oauth_app.json", "macctl_bridge.json", "browser_ipc.json"].contains(name)

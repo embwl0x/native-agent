@@ -5,11 +5,9 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Surface identity is security-relevant and `ConversationSurfaceProfile` owns
-// the remote/iOS sets. A second copy of them here would be a second answer to
-// "is this surface the person" — the thing that type exists to prevent.
+// ConversationSurfaceProfile owns surface identity so security checks share one answer.
 import TrustCenter
-// Blueprint: | `ApprovalContinuations.swift` | Locked shared reporting-turn and card claims; reporting answers belong to session delivery, with no approval-specific queued-answer fields |
+// Blueprint: | `ApprovalContinuations.swift` | Reporting claims retain delivery ownership. |
 extension SwiftNativeApprovalInbox {
     public func annotateChatContinuation(
         _ id: String, done: Bool, settlement: String? = nil
@@ -28,8 +26,7 @@ extension SwiftNativeApprovalInbox {
             return true
         }
     }
-    /// An unstarted reporting turn is eligible within its existing age window.
-    /// Started and completed claims never replay; session delivery owns answers.
+    /// An unstarted reporting turn is eligible within its existing age window. Started and completed claims never replay; session delivery owns answers.
     public nonisolated static func continuationIsPending(_ record: ApprovalRecord, now: Date = Date()) -> Bool {
         guard record.status == "resolved", record.decision != nil,
               hasChatReportingObligation(record) else { return false }
@@ -40,8 +37,7 @@ extension SwiftNativeApprovalInbox {
         guard let date = record.resolvedAt.flatMap(NativeTimestampFormat.parseISO8601) else { return false }
         return (0...600).contains(now.timeIntervalSince(date))
     }
-    /// Only a conversation that actually asked, or a retained reporting claim,
-    /// owes a reporting turn. A mirrored card alone does not create one.
+    /// Only a conversation that actually asked, or a retained reporting claim, owes a reporting turn. A mirrored card alone does not create one.
     nonisolated static func hasChatReportingObligation(_ record: ApprovalRecord) -> Bool {
         if case .object(let state)? = record.chatContinuation,
            state["started"] != nil { return true }
@@ -56,42 +52,7 @@ extension SwiftNativeApprovalInbox {
         return payload["kind"] == .string("chat_tool_approval")
             || payload["kind"] == .string("agent_acp_live_approval")
     }
-    /// Retain the destination before delivery, then mark it delivered only
-    /// after its idempotent transcript write. An unfinished claim resumes at
-    /// the same destination; an old claim without delivery evidence does too.
-    public func claimChatCard(
-        _ id: String, card: JSONValue,
-        deliver: @escaping @Sendable (ApprovalRecord) async throws -> Void
-    ) async throws -> ApprovalRecord? {
-        try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
-            var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-            guard let index = items.firstIndex(where: {
-                guard case .object(let object) = $0 else { return false }
-                return object["id"] == .string(id)
-            }), case .object(var object) = items[index],
-                object["status"] == .string("pending") else { return nil }
-            // A Telegram mark (`markChatCard`) may come first; the
-            // destination joins it.
-            var current: [String: JSONValue] = [:]
-            if case .object(let saved)? = object["chatCard"] { current = saved }
-            if current["sessionId"] == nil, case .object(let fresh) = card {
-                object["chatCard"] = .object(current.merging(fresh) { kept, _ in kept })
-                items[index] = .object(object)
-                try await SwiftNativePersistenceCore.writeJSON(.array(items), to: approvalsPath)
-            }
-            guard case .object(var savedCard)? = object["chatCard"],
-                  savedCard["delivered"] != .bool(true),
-                  let claimed = ApprovalRecord(json: .object(object)) else { return nil }
-            try await deliver(claimed)
-            savedCard["delivered"] = .bool(true)
-            object["chatCard"] = .object(savedCard)
-            items[index] = .object(object)
-            try await SwiftNativePersistenceCore.writeJSON(.array(items), to: approvalsPath)
-            return ApprovalRecord(json: .object(object))
-        }
-    }
-    /// Merge delivery receipts even if the approval was resolved while its
-    /// Telegram send was in flight. A decision does not erase what was sent.
+    /// Merge delivery receipts even if the approval was resolved while its Telegram send was in flight. A decision does not erase what was sent.
     public func markChatCard(_ id: String, _ fields: [String: JSONValue]) async throws {
         try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
             var items = try Self.loadApprovalRowsChecked(at: approvalsPath)

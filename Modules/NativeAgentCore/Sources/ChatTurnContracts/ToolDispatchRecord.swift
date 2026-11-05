@@ -1,11 +1,9 @@
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ToolDispatchRecord.swift` | `ToolDispatchRecord` struct; retains the call resolved before execution for outcome attribution and argument evidence |
+// Blueprint: | `ToolDispatchRecord.swift` | `ToolDispatchRecord`; Pre-execution call identity |
 
 public struct ToolDispatchRecord: Sendable {
-    /// Provider-issued tool-use identity when the transport supplied one.
-    /// Outcome Tissue hashes this before persistence; nil remains an
-    /// explicit sequence-only observation for legacy/direct dispatches.
+    /// Hash provider-issued identity before persistence; nil remains an explicit sequence-only observation for direct dispatches.
     public let id: String?
     public let name: String
     public let input: [String: JSONValue]

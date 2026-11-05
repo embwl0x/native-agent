@@ -57,7 +57,9 @@ extension MemoryStorage {
     static func decodeEmbedding(_ data: Data?) throws -> [Float]? {
         guard let data else { return nil }
         guard !data.isEmpty, data.count % 4 == 0 else {
-            throw MemoryStorageError.databaseUnavailable("Stored embedding has invalid byte length \(data.count); repair the canonical vector before semantic use.")
+            throw MemoryStorageError.databaseUnavailable("""
+                Stored embedding has invalid byte length \(data.count); repair the canonical vector before semantic use.
+                """)
         }
         let count = data.count / 4
         var out = [Float](); out.reserveCapacity(count)
@@ -106,7 +108,9 @@ extension MemoryStorage {
             lastUsedAt: row.decode(forColumn: "last_used_at")
         )
         do { try validateTemporalEvidence(memory) }
-        catch { throw MemoryStorageError.databaseUnavailable("Memory \(memory.id) has unreadable temporal evidence: \(error.localizedDescription). Repair the saved row before recall.") }
+        catch { throw MemoryStorageError.databaseUnavailable("""
+            Memory \(memory.id) has unreadable temporal evidence: \(error.localizedDescription). Repair the saved row before recall.
+            """) }
         return memory
     }
 

@@ -1,64 +1,43 @@
 import Foundation
+import ChatTurnContracts
 import PersistenceCore
 import TriggerScheduler
 import DeviceSync
 import NativeAgentShared
-// Blueprint: | `TriggerNotificationDelivery.swift` | `TriggerNotificationDelivery` enum; `importance`, `notify` |
+import NativeAgentCore
+// Blueprint: | `TriggerNotificationDelivery.swift` | Deliver the trigger's already-filed obligations; no second tell or separate occurrence |
 
-/// Trigger delivery policy; the inbox owns the card and host ports carry it.
 public enum TriggerNotificationDelivery {
     public static func notify(
         _ note: TriggerNotification,
         notify: Bool,
         delivery: any TriggerSnapshotDeliveryPort,
-        router: @Sendable () -> AttentionRouter
+        router: @Sendable () -> AttentionRouter,
+        turn: Turn?
     ) async -> JSONValue {
-        let itemID = note.itemId
-        let eventID = "trigger:\(itemID)"
-        let importance: AttentionImportance = note.ownerWaiting ? .ownerWaiting : .informational
-        let userInfo = ["screen": note.screen, "source": note.source, "urgency": note.urgency,
-                        "itemId": itemID, "trigger": note.triggerName]
-        // The accepted card reaches the phone snapshot before the knock.
+        let attention = router()
+        let root = await attention.dataRoot
+        // Acceptance already told the matter; this host publishes its reading and sends the obligations it owes.
         await delivery.writeSnapshots()
         guard notify else { return .object(["delivered": .bool(false), "mirrored": .bool(true)]) }
         do {
-            let outcome = try await router().route(
-                eventId: eventID,
-                importance: importance,
-                title: note.title,
-                body: note.body,
-                userInfo: userInfo
-            )
+            _ = try await AttentionRouter.release(dataRoot: root, router: attention)
+            let outcome = try await attention.outcome(note.itemId,
+                held: AttentionRouter.inQuietHours(at: Date(), dataRoot: root))
             let projection = outcome.deliveryProjection
-            if let receipt = outcome.receipt {
-                var fields = receipt.deliveryFields()
-                fields["delivered"] = .bool(projection.reachedAChannel)
-                fields["delivery"] = .string(projection.rawValue)
-                fields["mirrored"] = .bool(true)
-                return .object(fields)
-            } else {
-                if !projection.reachedAChannel {
-                    nativeLog("trigger_notify: %@ mirrored but no channel accepted the knock (%@)",
-                          note.triggerName, projection.rawValue)
-                }
-                // `delivered` is the router's own projection, not "no failure
-                // was reported". A routing that chose no channel, or deferred
-                // for quiet hours, delivered nothing. `mirrored` (the card was
-                // saved) stays a separate fact.
-                var fields: [String: JSONValue] = [
-                    "delivered": .bool(projection.reachedAChannel),
-                    "delivery": .string(projection.rawValue),
-                    "mirrored": .bool(true),
-                    "routedTo": .string(outcome.delivery.rawValue),
-                    "suppressed": .bool(outcome.suppressed),
-                ]
-                if projection == .failed {
-                    fields["error"] = .string(
-                        "the knock was tried and no channel accepted it; the card is in the "
-                        + "inbox but nothing reached him")
-                }
-                return .object(fields)
+            if projection != .accepted {
+                nativeLog("trigger_notify: %@ mirrored; destination acceptance remains incomplete (%@)", note.triggerName, projection.rawValue)
             }
+            var fields = outcome.receipt?.deliveryFields() ?? [:]
+            fields["delivered"] = .bool(projection == .accepted)
+            fields["delivery"] = .string(projection.rawValue)
+            fields["mirrored"] = .bool(true)
+            fields["destinations"] = .object(outcome.destinationFields)
+            fields["suppressed"] = .bool(outcome.suppressed)
+            if projection == .failed {
+                fields["error"] = .string("At least one destination refused the knock; the card and remaining delivery stay in their owners.")
+            }
+            return .object(fields)
         } catch {
             nativeLog("trigger_notify: paired-device push failed for \(note.triggerName): \(error)")
             return .object([

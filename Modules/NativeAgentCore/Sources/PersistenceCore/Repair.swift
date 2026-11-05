@@ -1,16 +1,10 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `Repair.swift` | Shared repair, reconciliation, terminal and person-decision shapes; ToolFailureError.call builds native calls, while fileRepairInstruction owns byte-preserving person recovery prose for damaged files, without executable coding requests |
+// Blueprint: | `Repair.swift` | Owner-issued remedies, reconciliation and honest terminal outcomes. |
 
-/// The one shape of a fixable no. Every refusal or
-/// failure whose cause lies outside the call's own input names what decided it
-/// and carries its lever: her native call, or the person's recovery step.
-/// A failure that carries one owes repair until that
-/// operation works again or she lets it go with a reason.
+/// Owner-caused refusals carry a native repair call or person recovery step until fixed or explicitly let go.
 public enum Repair {
-    /// A tool result's `remedy` for an owned no. Carry the owner's whole
-    /// lever: the call first, then the person's control when both are supplied.
-    /// Missing evidence never settles a repair.
+    /// Keep the owner's whole repair lever; missing evidence never settles it.
     public static func remedy(owner: String, nextCall: JSONValue?, tap: String?, instruction: String? = nil) -> JSONValue {
         var fields: [String: JSONValue] = [
             "kind": .string("repair"), "owner": .string(owner),
@@ -32,10 +26,7 @@ public enum Repair {
         return .object(fields)
     }
 
-    /// Why a lawful decision went the way it did, and the person's exact
-    /// control over it, with no debt: a Trust ask or block, a posture, a
-    /// saved entry or a peer's elevation is the law working, not a dead end.
-    /// She can tell the person precisely where it is decided; nothing is owed.
+    /// Lawful Trust decisions name their owner and control without creating repair debt.
     public static func why(owner: String, tap: String, instruction: String? = nil) -> JSONValue {
         .object([
             "kind": .string("person_decides"), "owner": .string(owner), "tap": .string(tap), "next_call": .null,
@@ -53,8 +44,7 @@ public enum Repair {
         .object(["kind": .string("terminal"), "instruction": .string(instruction), "next_call": .null])
     }
 
-    /// An owner inside a sentence: one that is itself a step ("… → Save
-    /// token.") keeps no stop of its own, so the instruction reads as one.
+    /// An owner that is already a step omits its own stop so the instruction reads as one sentence.
     private static func clause(_ owner: String) -> String {
         owner.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
     }
@@ -96,13 +86,11 @@ public extension ToolFailureError {
         return value
     }
 
-    /// Her lever for `nextCall`: the call with its input.
     static func call(_ tool: String, _ input: [String: JSONValue] = [:]) -> String {
         (try? JSONValue.object(["tool": .string(tool), "input": .object(input)]).serialize(pretty: false)) ?? ""
     }
 
-    /// The person's recovery step for damaged saved state. `shape` says what
-    /// the file must hold; no coding request is executable recovery.
+    /// The person's recovery step for damaged saved state. `shape` says what the file must hold; no coding request is executable recovery.
     static func fileRepairInstruction(_ file: URL,
         shape: String) -> String {
         "Ask the person to repair only \(file.path), preserving its original bytes in a sibling recovery copy before editing. "

@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import ImageIO
 import NativeAgentCore
 import PersistenceCore
@@ -7,12 +8,11 @@ import UniformTypeIdentifiers
 import Darwin
 #endif
 
-// Blueprint: | `FileSystemVerifiedPath.swift` | `VerifiedImageRead`: shared image delivery from verified file or owned Chrome capture bytes; text-only reads return verified dimensions, byte size and type without claiming pixel delivery; bounded-thumbnail receipts retain source dimensions |
+// Blueprint: | `FileSystemVerifiedPath.swift` | `VerifiedImageRead`: verified file/Chrome bytes; metadata never claims pixel delivery |
 
 // MARK: - Image pixels decoded from the verified descriptor
 
-/// Decode already admitted bytes, avoiding a file reopen. Chrome's owned-tab
-/// capture shares this same image delivery boundary without creating a file.
+/// Decode admitted bytes without reopening a path; owned Chrome captures share this delivery boundary.
 public enum VerifiedImageRead {
 
     static let imageExtensions: Set<String> = [
@@ -27,16 +27,15 @@ public enum VerifiedImageRead {
         .object(["ok": .bool(false), "status": .string("failed"), "error": .string(reason)])
     }
 
-    public static func deliver(data: Data, name: String) -> JSONValue {
+    public static func deliver(data: Data, name: String, sink: LocalToolImage.Sink?) -> JSONValue {
         guard !data.isEmpty, data.count <= LocalToolImage.maximumBytes else {
             return failure("Image must be a nonempty regular file of at most 8 MiB.")
         }
         guard let thumbnail = LocalToolImage.thumbnail(data, maxPixelSize: 2048) else {
             return failure("Image is unreadable, unsupported, or exceeds the 40-megapixel limit.")
         }
-        guard LocalToolImage.sink != nil else {
-            // Both pixels and metadata come from the admitted descriptor's bytes;
-            // a filename extension is not evidence of the encoded type.
+        guard sink != nil else {
+            // Derive type and pixels from the admitted bytes; filename extensions cannot prove encoding.
             guard let source = CGImageSourceCreateWithData(data as CFData, nil),
                   let type = CGImageSourceGetType(source) else {
                 return failure("Could not read the image's encoded type.")
@@ -59,12 +58,10 @@ public enum VerifiedImageRead {
         guard CGImageDestinationFinalize(destination), encoded.length <= LocalToolImage.maximumBytes else {
             return failure("Encoded image exceeds the 8 MiB delivery limit.")
         }
-        let delivered = LocalToolImage.deliverPNG(
-            encoded as Data, name: name, width: thumbnail.pixels.width, height: thumbnail.pixels.height)
-        // Keep the reader's receipt: it reports the SOURCE dimensions and says
-        // what the bounded thumbnail is and is not.
-        guard case .object(var fields) = delivered,
-              case .string("ok")? = fields["status"] else { return delivered }
+        let reply = ToolResult(LocalToolImage.deliverPNG(
+            encoded as Data, name: name, width: thumbnail.pixels.width, height: thumbnail.pixels.height, sink: sink))
+        // Retain source dimensions and the bounded-thumbnail distinction so delivery cannot imply full-resolution pixels.
+        guard reply.said("ok"), case .object(var fields) = reply.payload else { return reply.payload }
         fields["source_width"] = .int(Int64(thumbnail.sourceWidth))
         fields["source_height"] = .int(Int64(thumbnail.sourceHeight))
         fields["note"] = .string("Actual image follows this tool result. First frame, oriented and bounded to 2048 pixels; not OCR or a text description.")

@@ -3,19 +3,17 @@ import SwiftUI
 import ChatTurnRuntime
 import ChatSessionWork
 
-// Blueprint: | `ChatTurnFailure.swift` | `FailedTurnRetryConfirmation` and continuation binding: shared confirmation after effects/unknown outcomes and session-local continue action |
+// Blueprint: | `ChatTurnFailure.swift` | `FailedTurnRetryConfirmation`: Shared retry confirmation and session-local continuation |
 
 extension AppModel {
-    /// Continue from here: a new turn in the failed message's session that
-    /// sees the rows above it, instead of replaying the whole turn.
+    /// Continue in the failed message's session with prior rows visible so it does not replay the whole turn.
     func continueFailedTurn(_ message: ChatMessage) async {
         let sessionId = message.sessionId ?? activeChatSessionId
         _ = await startChatTurnForSession(ChatTurnFailure.continuePrompt, sessionId: sessionId)
     }
 }
 
-/// The one confirmation every retry path shows before re-running a turn that
-/// acted or whose outcome is unknown.
+/// Every retry after effects or unknown outcomes must share one confirmation.
 struct FailedTurnRetryConfirmation: ViewModifier {
     @Binding var failure: ChatTurnFailure?
     var onRetry: () -> Void
@@ -35,11 +33,4 @@ struct FailedTurnRetryConfirmation: ViewModifier {
             Text(failure.confirmationMessage)
         }
     }
-}
-
-extension EnvironmentValues {
-    /// True in the main room, where the trouble card carries Retry, so the
-    /// failed bubble does not draw a second one. Detached panels have no card
-    /// and keep the bubble's own button.
-    @Entry var troubleCardOwnsRetry = false
 }

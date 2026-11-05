@@ -11,12 +11,11 @@ import MemoryV2
 import DeviceSync
 import NotificationInbox
 
-// Blueprint: | `TelegramBot+Client.swift` | `SwiftNativeTelegramBot` client wiring and dependency/result contracts; status/test send, locked log clearing and long-poll accounting |
+// Blueprint: | `TelegramBot+Client.swift` | `SwiftNativeTelegramBot`: checked status and send lanes |
 
-/// Writes Telegram-originated durable memory and notes through the app layer.
 public protocol TelegramMemoryWriteRef: Sendable {
-    func remember(text: String, source: String) async throws -> String
-    func note(text: String, kind: String, source: String) async throws -> String
+    func remember(text: String, source: String, turn: Turn) async throws -> String
+    func note(text: String, kind: String, source: String, turn: Turn) async throws -> String
 }
 
 /// Nil reply means unsupported; a committed restart must terminate after the reply attempt, even on send failure.
@@ -49,7 +48,6 @@ public struct TelegramBotCompletenessDeps: Sendable {
 public actor SwiftNativeTelegramBot {
     let dataRoot: URL
     private let backgroundLoopsManager: BackgroundLoopLifetimes
-    let compactionHandler: TelegramCompaction?
     let completenessDeps: TelegramBotCompletenessDeps?
     let partCall: TelegramPartCall?
     let partFace: PartFaces.Call?
@@ -59,14 +57,12 @@ public actor SwiftNativeTelegramBot {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         backgroundLoopsManager: BackgroundLoopLifetimes = .shared,
         completenessDeps: TelegramBotCompletenessDeps? = nil,
-        compactionHandler: TelegramCompaction? = nil,
         partCall: TelegramPartCall? = nil,
         partFace: PartFaces.Call? = nil
     ) {
         self.dataRoot = dataRoot
         self.backgroundLoopsManager = backgroundLoopsManager
         self.completenessDeps = completenessDeps
-        self.compactionHandler = compactionHandler
         self.partCall = partCall
         self.partFace = partFace
     }
@@ -181,7 +177,6 @@ public actor SwiftNativeTelegramBot {
                 "maxBytes": .int(Int64(voice.maxBytes)),
             ]),
         ]
-        // Running means the registered loop's runtime is actually running.
         let pollerRunning = await manager.isRunning(loopId: "telegram_poll")
         func integer(_ value: JSONValue?) -> Int? {
             if case .bool(let value)? = value { return value ? 1 : 0 }
@@ -194,7 +189,8 @@ public actor SwiftNativeTelegramBot {
             lastSeenUpdateId: integer(stateObj["lastSeenUpdateId"]),
             lastSeenAt: stateObj["lastSeenAt"]?.stringValue,
             lastReplyAt: stateObj["lastReplyAt"]?.stringValue,
-            lastError: configurationError?.localizedDescription ?? checked.credentialError?.localizedDescription ?? stateError?.localizedDescription ?? stateObj["lastError"]?.stringValue
+            lastError: configurationError?.localizedDescription ?? checked.credentialError?.localizedDescription
+                ?? stateError?.localizedDescription ?? stateObj["lastError"]?.stringValue
                 ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil),
             extras: .object(extras)
         )

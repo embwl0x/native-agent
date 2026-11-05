@@ -11,8 +11,7 @@ import DreamREMCycle
 import MemoryV2
 // Blueprint: | `CommandPalette.swift` | Mounted command search, navigation and window-scoped key interception; actions remain with canonical owners |
 
-/// The one ⌘K palette. ContentView presents it everywhere except the Desk,
-/// which presents the same view with its `DeskPaletteScope`.
+/// Share the palette across pages; Desk injects its own scope instead of maintaining a second implementation.
 struct CommandPaletteView: View {
     @Environment(AppModel.self) private var appModel
     @Binding var isPresented: Bool
@@ -21,12 +20,11 @@ struct CommandPaletteView: View {
     @State private var query: String = ""
     @State private var selection: Int = 0
     @State private var preparedPool: [PaletteItem] = []
-    /// The settings registry's controls — read once per opening.
+    /// Read settings controls once per opening so the palette uses one catalog snapshot.
     @State private var settingThings: [PaletteItem] = []
     @State private var settingsFailure: String?
-    /// Conversations whose words hold the query, from the message index.
     @State private var messageHits: [PaletteItem] = []
-    /// The query `messageHits` answer; another query shows none of them.
+    /// Bind hits to their exact query so stale results cannot answer newer text.
     @State private var messageHitsQuery = ""
     @State private var messagesIndexed = false
     @State private var indexRevision: UInt64 = 0
@@ -38,7 +36,7 @@ struct CommandPaletteView: View {
         IndexRequest(sessions: appModel.engine.transcripts.sessions,
                      revision: appModel.engine.transcripts.structureVersion)
     }
-    /// Conversations the current index could not read.
+    /// Retain unreadable-conversation evidence so missing rows cannot imply a complete search.
     @State private var unreadChats = 0
     @State private var indexRead = LatestRead()
     @State private var matchesRead = LatestRead()
@@ -66,16 +64,14 @@ struct CommandPaletteView: View {
                     .focused($fieldFocused)
                     .onSubmit { commitCurrent() }
                     .onChange(of: query) { _, _ in
-                        // Reset highlight whenever the query changes so the
-                        // top match is always the default.
+                        // Reset highlight on query changes so Return selects the top current match.
                         selection = 0
                         pendingCommit = false
                     }
                 if !query.isEmpty {
                     Button {
                         query = ""
-                        // Re-focus the field; the cleared button disappears
-                        // and the responder would otherwise drift.
+                        // Refocus after clearing because the disappearing button would otherwise leave the responder adrift.
                         Task { @MainActor in
                             try? await Task.sleep(nanoseconds: 10_000_000)
                             fieldFocused = true
@@ -105,7 +101,8 @@ struct CommandPaletteView: View {
                 Divider()
             }
 
-            if let error = settingsFailure ?? appModel.engine.transcripts.savedSearchError ?? appModel.engine.cognitionView.diaryError ?? appModel.engine.desk.board.deskError {
+            if let error = settingsFailure ?? appModel.engine.transcripts.savedSearchError ?? appModel.engine.cognitionView.diaryError
+                ?? appModel.engine.desk.board.deskError {
                 Text(error).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble)
                     .padding(.horizontal, 14).padding(.vertical, 8)
             }
@@ -126,7 +123,7 @@ struct CommandPaletteView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                                // Stable item IDs preserve each filtered row’s content and action.
+                                // Preserve stable IDs so filtering cannot redirect row content or actions.
                                 paletteRow(item: item, isSelected: index == selection)
                                     .id(item.id)
                                     .contentShape(Rectangle())
@@ -135,11 +132,8 @@ struct CommandPaletteView: View {
                                         commit(item)
                                     }
                                     .onContinuousHover { phase in
-                                        // A filtered row can materialize beneath a
-                                        // stationary pointer while the user types.
-                                        // Treat only real pointer movement as hover
-                                        // navigation so Return still opens the top
-                                        // keyboard match.
+                                        // Only real pointer movement changes hover selection; a new row under a stationary pointer must not steal
+                                        // Return from the keyboard match.
                                         if commandPaletteShouldAdoptHover(
                                             phase.isActive,
                                             eventType: NSApp.currentEvent?.type
@@ -184,10 +178,7 @@ struct CommandPaletteView: View {
         ))
         .onAppear {
             selection = 0
-            // SwiftUI sheet presentation animation can swallow a synchronous
-            // @FocusState assignment on first present, leaving the palette
-            // open but un-typeable. Defer one run-loop tick so the responder
-            // chain lands after the window is on screen.
+            // Defer focus one run-loop tick because SwiftUI sheet animation can swallow a synchronous FocusState assignment.
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 30_000_000)
                 fieldFocused = true
@@ -235,7 +226,7 @@ struct CommandPaletteView: View {
             if pendingCommit { pendingCommit = false; commitCurrent() }
             })
         }
-        // The words of every chat, searched a beat after typing stops.
+        // Debounce full-text search until typing pauses to avoid redundant reads.
         .task(id: "\(messagesIndexed) \(indexRevision) \(query)") {
             let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
             guard messagesIndexed, text.count >= 3 else { hitsRead.write { messageHits = [] }; return }
@@ -258,8 +249,6 @@ struct CommandPaletteView: View {
 
     // MARK: - Rows
 
-    // The shell's row: the soft fill marks the highlighted row, the kind is a
-    // quiet word at the trailing edge.
     @ViewBuilder
     private func paletteRow(item: PaletteItem, isSelected: Bool) -> some View {
         HStack(spacing: 10) {
@@ -328,13 +317,10 @@ struct CommandPaletteView: View {
             return general
         }
         let parsed = DeskPaletteQuery.parse(query)
-        // A verb narrows the list to the rows it can act on; an empty field
-        // opens on the Desk's own rows.
+        // Restrict verbs to applicable rows; an empty query opens on Desk's own rows.
         let rows = deskMatches(desk, parsed).map(PaletteItem.init(desk:))
         if parsed.verb != nil || parsed.query.isEmpty { return rows }
-        // A plain search: the Desk's rows fuzzy-matched first, as the Desk
-        // ranks them, then everything else — including the saved Desk entries,
-        // so an item's summary still finds it.
+        // Rank Desk's rows first while retaining saved entries so summaries remain searchable.
         let shown = Set(rows.map(\.id))
         return rows + general
             .filter { !shown.contains($0.id) }
@@ -359,8 +345,7 @@ struct CommandPaletteView: View {
         DeskFuzzy.filter(desk.rows, query: parsed.query)
     }
 
-    /// The row a Desk command applies to: the selected row when only the verb
-    /// is typed, otherwise the highlighted match.
+    /// A bare verb targets the selected Desk row; additional query text targets the highlighted match.
     private func deskTarget(_ desk: DeskPaletteScope) -> DeskPaletteRow? {
         let parsed = DeskPaletteQuery.parse(query)
         return DeskPalettePresentation.target(
@@ -382,8 +367,7 @@ struct CommandPaletteView: View {
     }
 
     private func commitCurrent() {
-        // A Desk command applies to the row its banner names; with nothing
-        // named the sheet stays open so the query can be corrected.
+        // Require a named Desk target before dismissal so the person can correct an incomplete query.
         if let desk, DeskPaletteQuery.parse(query).verb != nil {
             guard let target = deskTarget(desk) else { return }
             commit(PaletteItem(desk: target))
@@ -411,11 +395,9 @@ struct CommandPaletteView: View {
         case .tab(let s):
             ApplicationLifetime.shared.request(.sidebar(s.normalized))
         case .railTab(let page, let key):
-            // A route lands on the page's first tab; Settings' own links
-            // choose the tab after it, and so does this.
+            // Choose the control's tab after routing because the route itself opens the page's first tab.
             SettingsLink.open(page, tab: key)
         case .setting(let pageID, let tab):
-            // The page the control is on, on the tab it is on.
             if let page = QuietPages.page(named: pageID) {
                 let home = SidebarItem.shellHome(for: page.item)
                 SettingsLink.open(home?.parent ?? page.item, tab: tab ?? page.tab ?? home?.tab)
@@ -428,10 +410,9 @@ struct CommandPaletteView: View {
         case .recentAction(let id):
             handleRecentAction(id)
         case .deskItem(let handle):
-            // The same handle a Desk notification click hands the page, so the
-            // row is scrolled to and opened rather than merely on screen.
-            appModel.pendingDeskHandle = handle
+            // Use the notification's exact handle so navigation reveals and opens the intended row.
             ApplicationLifetime.shared.request(.sidebar(.desk))
+            appModel.pendingDeskHandle = handle
         case .saved(let destination):
             ApplicationLifetime.shared.request(.savedThing(destination))
         }
@@ -454,7 +435,7 @@ struct CommandPaletteView: View {
 
 }
 
-/// Ignore hardware arrow/escape flags while preserving every user-held modifier.
+/// Ignore hardware arrow/escape flags while preserving all user-held modifiers.
 func commandPaletteIsBareKeyEvent(_ flags: NSEvent.ModifierFlags) -> Bool {
     flags.intersection(.deviceIndependentFlagsMask)
         .subtracting([.function, .numericPad])
@@ -489,9 +470,7 @@ private extension Comparable {
 }
 
 // MARK: - Arrow / escape key catcher
-// SwiftUI doesn't surface up/down arrow events from a focused TextField, so
-// we use an NSViewRepresentable that observes local key events while the
-// view is in the window.
+// Observe local keys because SwiftUI does not surface focused TextField arrow events.
 
 private struct KeyCatcher: NSViewRepresentable {
     var onMoveUp: () -> Void
@@ -513,8 +492,7 @@ private struct KeyCatcher: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ nsView: KeyCatcherView, coordinator: ()) {
-        // Deterministic teardown — don't rely on viewDidMoveToWindow(nil)
-        // or deinit timing to drop the global key monitor.
+        // Tear down deterministically; window removal or deinit timing cannot reliably release the global key monitor.
         nsView.dismantle()
     }
 }
@@ -543,9 +521,7 @@ final class KeyCatcherView: NSView {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self else { return event }
-            // Scope strictly to the palette's own window so we never swallow
-            // arrows/escape in another NativeAgent window (or after the sheet
-            // has visually dismissed but a stray monitor is still alive).
+            // Scope interception to the palette's window so a lingering monitor cannot swallow another window's keys.
             let paletteWindow = self.window
             guard event.window === paletteWindow,
                   paletteWindow?.isKeyWindow == true,
@@ -573,5 +549,5 @@ final class KeyCatcherView: NSView {
         }
     }
 
-    // Monitor teardown stays on the main actor through window removal and dismantle.
+    // Keep monitor teardown on the main actor through both window removal and dismantle.
 }

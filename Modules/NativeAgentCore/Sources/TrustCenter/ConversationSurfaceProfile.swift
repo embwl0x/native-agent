@@ -1,45 +1,25 @@
 import Foundation
 
-// Blueprint: | `ConversationSurfaceProfile.swift` | `ConversationSurfaceProfile`: canonical origin normalization and remote/mobile classification; domain trust evidence stays with authority owners |
+// Blueprint: | `ConversationSurfaceProfile.swift` | `ConversationSurfaceProfile`; One security-relevant surface identity. |
 
-/// Canonical classification for a conversation/action origin.
-///
-/// Surface identity is security-relevant: remote callers must not become local
-/// merely because one subsystem forgot an alias. This type owns normalization
-/// and the remote/mobile sets; domain-specific trust evidence still belongs to
-/// TrustCenter and the signed origin stores.
+/// A surface compared by its one spelling; every named bridge lane is the agent bridge. Domain owners still supply trust evidence.
 public struct ConversationSurfaceProfile: Sendable, Equatable, Hashable {
     public let id: String
 
     public init(_ rawValue: String) {
-        let normalized = rawValue
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "-")
-        self.id = Self.aliases[normalized] ?? normalized
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Every bridge lane (BridgeLane.bridgeSurfaceName: "<sender>-bridge", peer:<id>-bridge included) is a peer on the agent bridge, never the
+        // local operator, whatever its sender.
+        self.id = normalized == "bridge" || normalized.hasSuffix("-bridge") ? Self.agentBridgeID : normalized
     }
 
     public var isRemote: Bool { Self.remoteSurfaceIDs.contains(id) }
 
-    /// Current named bridge transports classify as peer surfaces. A transport
-    /// label alone never admits the caller as the local operator.
+    /// Current named bridge transports classify as peer surfaces. A transport label alone never admits the caller as the local operator.
     public static let agentBridgeID = "agent-bridge"
     public var isAgentBridge: Bool { id == Self.agentBridgeID }
-    public var isIOSRemote: Bool { Self.iosRemoteSurfaceIDs.contains(id) }
+    public var isIOSRemote: Bool { id == "ios" }
 
-    public static let remoteSurfaceIDs: Set<String> = [
-        "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "remote", "watch",
-        agentBridgeID,
-    ]
+    public static let remoteSurfaceIDs: Set<String> = ["telegram", "slack", "ios", agentBridgeID]
 
-    public static let iosRemoteSurfaceIDs: Set<String> = [
-        "ios", "icloud", "iphone", "ipad", "mobile", "watch",
-    ]
-
-    private static let aliases: [String: String] = [
-        "claude-bridge": agentBridgeID,
-        "codex-bridge": agentBridgeID,
-        "omp-bridge": agentBridgeID,
-        "bridge": agentBridgeID,
-    ]
 }

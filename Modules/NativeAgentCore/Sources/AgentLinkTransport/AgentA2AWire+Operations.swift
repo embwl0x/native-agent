@@ -3,8 +3,7 @@ import PersistenceCore
 // Blueprint: | `AgentA2AWire+Operations.swift` | `AgentA2AWire`: `operationRequest`, `operationResult`, `normalizeTaskList` |
 
 extension AgentA2AWire {
-    /// Other 1.0 operations share the same canonical ProtoJSON dictionaries as
-    /// message/task projection. No separate REST model is kept.
+    /// Operations share canonical ProtoJSON dictionaries so REST cannot diverge.
     public static func operationRequest(_ method: String, parameters: [String: JSONValue] = [:],
                                         interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
         guard interface.version == "1.0", ["JSONRPC", "HTTP+JSON", "GRPC"].contains(interface.binding) else {
@@ -74,7 +73,6 @@ extension AgentA2AWire {
         let tasks: [JSONValue]
         if case .array(let values)? = object["tasks"] { tasks = values }
         else if object["tasks"] == nil { tasks = [] } else { throw WireError.invalid("tasks") }
-        // Validate each task through the existing canonical task mapping.
         for task in tasks {
             guard case .object(let row) = task, case .string(let id)? = row["id"] else { throw WireError.invalid("listed task ID") }
             let direct = Interface(endpoint: interface.endpoint, version: "1.0", binding: "HTTP+JSON")
@@ -88,7 +86,16 @@ extension AgentA2AWire {
     }
 
     static func validateListParameters(_ params: [String: JSONValue]) throws {
-        guard Set(params.keys).isSubset(of: ["tenant", "contextId", "status", "pageSize", "pageToken", "historyLength", "statusTimestampAfter", "includeArtifacts"]) else { throw WireError.invalid("ListTasks fields") }
+        guard Set(params.keys).isSubset(
+            of: [
+                "tenant",
+                "contextId",
+                "status",
+                "pageSize",
+                "pageToken",
+                "historyLength",
+                "statusTimestampAfter",
+                "includeArtifacts"]) else { throw WireError.invalid("ListTasks fields") }
         for (key, value) in params {
             switch key {
             case "pageSize": guard case .int(let size) = value, (1...100).contains(size) else { throw WireError.invalid(key) }
@@ -103,8 +110,7 @@ extension AgentA2AWire {
         ["127.0.0.1", "::1", "[::1]"].contains(url.host?.lowercased() ?? "")
     }
 
-    /// NativeAgent's receiver is loopback-only. Never promise a callback to a
-    /// remote peer; the caller must additionally supply a running receiver.
+    /// The receiver is loopback-only; callback admission also requires a running receiver.
     public static func validatePushConfiguration(_ config: JSONValue, interface: Interface) throws {
         guard interface.version == "1.0", interface.pushNotifications else { throw WireError.unsupported("push notifications were not offered") }
         guard isLoopback(interface.endpoint), case .object(let object) = config,

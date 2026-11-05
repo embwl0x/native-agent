@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `MemoryModels.swift` | Shared canonical memory values preserve optional absence and tags; checked proposals carry one createdAt without synthetic historical timestamps |
+// Blueprint: | `MemoryModels.swift` | Memory/proposal values preserve absence and source timestamps |
 
 public struct MemoryRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String

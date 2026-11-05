@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `SlackSocketModeLoop+WebAPI.swift` | `SlackSocketModeLoop.slackAPI` performs checked Web API reads for exact accepted-reply effect reconciliation; Socket Mode alone owns inbound messages |
+// Blueprint: | `SlackSocketModeLoop+WebAPI.swift` | `SlackSocketModeLoop.slackAPI`: checked reads for accepted-reply reconciliation |
 
 extension SlackSocketModeLoop {
     func slackAPI(method: String, httpMethod: String, params: [String: String]) async throws -> [String: JSONValue] {

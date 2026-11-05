@@ -4,7 +4,7 @@ import SwiftUI
 import ApprovalInbox
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `ChatInlineApprovalCard.swift` | mounted approval card; record-owned verb and recipient scope, transient interaction state and facade-owned decisions |
+// Blueprint: | `ChatInlineApprovalCard.swift` | Approval card with record-owned scope and facade decisions |
 
 struct InlineApprovalCard: View {
     var message: ChatMessage
@@ -22,8 +22,7 @@ struct InlineApprovalCard: View {
         return title + String(message.content[titleEnd...])
     }
 
-    /// The inbox's own view of this approval, so a card recreated by a
-    /// re-render cannot offer a second click on an already-resolved request.
+    /// Read the inbox owner so a recreated card cannot offer a second click on a resolved request.
     private var externalApproval: ApprovalRecord? {
         appModel.engine.approvals.records.first(where: { $0.id == approvalId })
     }
@@ -35,9 +34,7 @@ struct InlineApprovalCard: View {
 
     var body: some View {
         shellBody
-        // After a launch the chat can draw before the approvals list loads;
-        // a card that doesn't know its approval reads the inbox once, so an
-        // answered one never comes back asking.
+        // A launch can draw before approvals load; read the inbox once before offering an unknown approval.
         .task(id: approvalId) {
             guard externalApproval == nil, !approvalId.isEmpty else { return }
             await appModel.engine.approvals.refresh()
@@ -45,8 +42,7 @@ struct InlineApprovalCard: View {
     }
 
     // MARK: - The shell card
-    //
-    // A click is not settlement: an approved request reads "Approved", never "Done."
+    // A click is not settlement: approval must not claim the effect is done.
     private var shellBody: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             InlineCardView(model: cardModel) { taken in
@@ -68,8 +64,7 @@ struct InlineApprovalCard: View {
         .accessibilityIdentifier("chat.shell.approval-card")
     }
 
-    /// The approval projected into the shared card value. Nothing is stored
-    /// here that the approval itself does not already say.
+    /// Project the approval without keeping a second record.
     private var cardModel: InlineCardModel {
         let title = ChatShellApprovalCopy.title(displayContent)
         let why = ChatShellApprovalCopy.why(displayContent)
@@ -114,21 +109,20 @@ struct InlineApprovalCard: View {
         do {
             try await appModel.engine.approvals.settleInlineCard(
                 id: approvalId, decision: decision,
-                coordinator: .app(),
+                coordinator: .app(), turn: ApprovalResolutionProvenance.local(decidedBy: "mac_ui").resolvingTurn,
                 refreshHealth: { await appModel.loadHealthCard() }
             )
         } catch {
-            // A failed settlement stays visible on the card.
+            // Keep failed settlement visible on the card.
             resolveError = UserFacingError.message(error, action: "record that decision")
         }
     }
 }
 
-/// Prose is displayed as filed; it never determines the action or recipient.
+/// Display prose as filed; it must never decide action or recipient.
 enum ChatShellApprovalCopy {
     static let decline = "Not now"
 
-    /// The card's plain title: the first line of the request, no decoration.
     static func title(_ content: String) -> String {
         let first = content.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
             .first.map(String.init) ?? content
@@ -136,11 +130,9 @@ enum ChatShellApprovalCopy {
         return trimmed.isEmpty ? "\(AgentVoice.live.Subject) \(AgentVoice.live.verb("need")) a decision" : String(trimmed.prefix(120))
     }
 
-    /// The why, for the person: the reason's opening sentence or two (the
-    /// line under the title). Ids, timestamps, counters and " · "-joined
-    /// metadata stay off the face — they fold into `details`.
+    /// Keep metadata in details so the face explains why the person is being asked.
     static func why(_ content: String) -> String {
-        // The first line that reads as a sentence: a lone tag ("recurring") is a label, not the why.
+        // Use sentence-like reasons; lone tags are labels, not an explanation.
         let all = lines(content)
         guard let reason = all.first(where: { $0.components(separatedBy: " · ")[0].split(separator: " ").count >= 3 }) ?? all.first,
               !reason.hasPrefix("{"), !reason.hasPrefix("[") else { return "" }
@@ -152,8 +144,7 @@ enum ChatShellApprovalCopy {
         return why
     }
 
-    /// Everything after the title and the why, each sentence once, one piece
-    /// per line; nil when nothing is left. What was filed stays intact.
+    /// Keep filed details intact while avoiding duplicate sentences on the face.
     static func details(_ content: String) -> String? {
         var seen = Set(sentences(why(content)))
         let rest = lines(content).flatMap { $0.components(separatedBy: " · ") }.compactMap { piece -> String? in
@@ -170,7 +161,6 @@ enum ChatShellApprovalCopy {
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
-    /// Split after ". ", "! " or "? ".
     private static func sentences(_ text: String) -> [String] {
         var out: [String] = [], current = ""
         for char in text {

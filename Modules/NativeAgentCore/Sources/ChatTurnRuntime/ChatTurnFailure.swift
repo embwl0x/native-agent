@@ -7,7 +7,7 @@ import ToolRegistry
 import PersistenceCore
 import MacControl
 
-// Blueprint: | `ChatTurnFailure.swift` | `ChatTurnFailure`: failure metadata and retry-confirmation classification from the turn's own dispatch/effect evidence |
+// Blueprint: | `ChatTurnFailure.swift` | `ChatTurnFailure`; Retry from exact dispatch/effect evidence |
 
 public protocol ChatTurnFailureMetadata {
     var providerRefusal: Bool? { get }
@@ -35,22 +35,15 @@ public protocol ChatTurnFailureMessage {
     var metadata: Metadata? { get }
 }
 
-/// What a failed turn provably did before it stopped, read from the turn's
-/// own evidence: its tool rows, the failure's work state, and whether the
-/// request ever left this Mac. A blind retry can repeat a real action.
+/// Read the failed turn's tool rows, work state and dispatch evidence before retry: repeating a turn can repeat real effects.
 public enum ChatTurnFailure: Equatable {
-    /// The request never reached the model. Nothing ran.
     case notSent
-    /// The model had it and stopped; no tool that changes anything ran.
     case stoppedNoActions
-    /// It changed something before stopping. Names are the tools that ran;
-    /// empty when the engine says steps ran but no row names them.
+    /// Retain unnamed actions when execution evidence says steps ran but no receipt identifies them.
     case acted([String])
-    /// Nothing here can say whether it finished.
     case unknown
 
-    /// The failed tail turn and what it did, or nil when the last turn did
-    /// not fail. Same tail `ChatShellTroubleState.consecutiveFailures` reads.
+    /// Only the same failed tail read by `consecutiveFailures` may drive this decision.
     public static func read<Message: ChatTurnFailureMessage>(_ messages: [Message]) -> (message: Message, failure: ChatTurnFailure)? {
         guard consecutiveFailures(messages) > 0,
               let index = messages.lastIndex(where: { role($0) == "assistant" }) else { return nil }
@@ -64,15 +57,12 @@ public enum ChatTurnFailure: Equatable {
     }
 
     public static func classify<Message: ChatTurnFailureMessage>(_ meta: Message.Metadata?, toolRows: [Message]) -> ChatTurnFailure {
-        // The core already wrote "outcome unknown — inspect before retry" on
-        // a rejected turn that may have run steps; the card must agree.
+        // The card must preserve the core's unknown-outcome warning when steps may have run.
         if meta?.providerRefusal == true, meta?.providerRefusalDraft != true { return .unknown }
         var seen = Set<String>()
         let actions = toolRows.compactMap { actionTitle($0.metadata) }.filter { seen.insert($0).inserted }
         if !actions.isEmpty { return .acted(actions) }
-        // A proven pre-dispatch refusal, or a request whose user row the core
-        // never wrote (it writes that row before calling the model), cannot
-        // have reached the model.
+        // Only a proven pre-dispatch refusal or an unwritten pre-model user row can establish that the model never received the request.
         if toolRows.isEmpty, meta?.providerRefusalDraft == true || meta?.syntheticUserRowPersisted == false {
             return .notSent
         }
@@ -92,12 +82,9 @@ public enum ChatTurnFailure: Equatable {
         }
     }
 
-    /// Stamped on a synthetic failure whose request provably never left.
     public static let notSentWork = "not sent"
 
-    /// The work state a synthetic failure bubble carries, from the error the
-    /// stream threw. A connection that was never made sent nothing; anything
-    /// else is what the provider failure itself reports.
+    /// Only a connection never made proves nothing was sent; other failures retain their provider's work evidence.
     public static func work(for error: Error) -> String {
         let text = error.localizedDescription.lowercased()
         let neverConnected = [
@@ -112,7 +99,6 @@ public enum ChatTurnFailure: Equatable {
         return (ProviderFailure.report(error)?.work ?? .outcomeUnknown).rawValue
     }
 
-    /// The one line the card says.
     public func line(model: String?) -> String {
         let model = model.flatMap { $0.isEmpty ? nil : $0 }
         switch self {
@@ -149,35 +135,25 @@ public enum ChatTurnFailure: Equatable {
         }
     }
 
-    /// What Continue from here sends: a new turn that sees the rows above.
     public static let continuePrompt =
         "Continue from where you stopped. Don't repeat any step that already ran."
 
-    /// The tool a row ran, named for a person, or nil only when it is
-    /// positively known to have just read. Fail-safe both ways: an `app` call
-    /// is a read only if the engine's own app test says so
-    /// (`RunawayOutputDetector.isAppReadOnly`: a registry action marked read,
-    /// or a page/find read), and any other tool only if the engine's
-    /// read-only dispatch test vouches for its name. Unknown, unparseable or
-    /// unregistered means it acted.
+    /// Only engine-verified read-only calls are safe to repeat; unknown, unparseable or unregistered calls may have acted.
     private static func actionTitle<Metadata: ChatTurnFailureMetadata>(_ meta: Metadata?) -> String? {
         let name = meta?.toolName ?? ""
         guard name == "app" else {
-            return ParallelToolDispatch.isParallelSafe(internalToolName: name) ? nil : ToolActivityPresentation.title(name)
+            return ParallelToolDispatch.isParallelSafe(internalToolName: name, turn: nil) ? nil : ToolActivityPresentation.title(name)
         }
         let json = meta?.inputJSON ?? ""
         if case .object(let fields)? = try? JSONValue.parse(Data(json.utf8)) {
-            if RunawayOutputDetector.isAppReadOnly(fields) { return nil }
+            if RunawayOutputDetector.isAppReadOnly(fields, turn: nil) { return nil }
             return ToolActivityPresentation.title(ToolNameAliases.shown(name, input: .object(fields)).name)
         }
-        // The row keeps only the first 4,000 characters of the input, so a
-        // long call (a mail.send with its body) no longer parses. What was cut
-        // could hold anything (a script past the cutoff), so it always counts
-        // as acted; the id near the front only names it.
+        // Clipped arguments may hide any effect, so classify them as acted; a leading action ID can name but never disprove that effect.
         return ToolActivityPresentation.title(clippedActionID(json) ?? name)
     }
 
-    /// `"action": "<id>"` from input text that may be cut off mid-way.
+    /// Extract only the action label from input that may be clipped.
     public static func clippedActionID(_ json: String) -> String? {
         guard let regex = try? NSRegularExpression(pattern: #""action"\s*:\s*"([^"\\]+)""#),
               let match = regex.firstMatch(in: json, range: NSRange(json.startIndex..., in: json)),
@@ -216,8 +192,7 @@ public enum ChatTurnFailure: Equatable {
         message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    /// A tool row that never executed — a card still waiting, a declined or
-    /// superseded request — did nothing.
+    /// Waiting, declined and superseded tool rows prove no execution when their own outcome explicitly says so.
     private static func ran<Message: ChatTurnFailureMessage>(_ row: Message) -> Bool {
         guard let meta = row.metadata else { return true }
         if meta.isPendingApproval || meta.interactionMirror != nil { return false }
@@ -240,11 +215,7 @@ public enum ChatTurnFailure: Equatable {
 }
 
 public extension ChatTurnFailure {
-    /// THE retry decision, for every way a failed turn can be re-run (the
-    /// card, the bubble's Try again, Regenerate on hover, in the context menu
-    /// and for accessibility, detached panels, and her own chat.retry verb).
-    /// Nil: retrying is safe, go. Otherwise the failure whose retry could
-    /// repeat a real action, which must be confirmed first.
+    /// All retry surfaces share this decision: nil permits retry; possible repeated effects require confirmation.
     static func retryNeedsConfirmation<Message: ChatTurnFailureMessage>(for message: Message, in messages: [Message]) -> ChatTurnFailure? {
         guard let tail = read(messages), tail.message.id == message.id,
               tail.failure.retryNeedsConfirmation else { return nil }

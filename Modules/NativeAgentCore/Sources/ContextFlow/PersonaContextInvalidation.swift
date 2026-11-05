@@ -7,9 +7,8 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import TurnTrace
-import WorkshopExecution
 import NativeAgentShared
-// Blueprint: | `PersonaContextInvalidation.swift` | `DerivedPersonaPinInvalidationSink`, `ContextFlowInvalidationRelay` and `REMPinRebuildCoalescer`; persona invalidation reaches Context Flow and rebuilds REM pins even while it is off |
+// Blueprint: | `PersonaContextInvalidation.swift` | `DerivedPersonaPinInvalidationSink`, `ContextFlowInvalidationRelay`, `REMPinRebuildCoalescer` |
 
 /// Persona invalidation rebuilds REM pins even when Context Flow is off or unavailable.
 public struct DerivedPersonaPinInvalidationSink: DerivedStateInvalidationSink {

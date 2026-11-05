@@ -4,13 +4,7 @@ import NativeAgentShared
 
 // Blueprint: | `MacChatRunningSessionMenu.swift` | `MacChatRunningSessionMenu`: shared go-to menu for sessions with background turns |
 
-/// 658.14 — "Go to…" for the sessions running a turn in the background.
-///
-/// Lives in its own file rather than inline in ChatView for a mechanical
-/// reason: ChatView's body is already at the Swift type-checker's limit, and
-/// adding a Menu + ForEach inline pushed it over ("unable to type-check this
-/// expression in reasonable time"). Extraction is the fix that SwiftUI godfiles
-/// require; it also gives the routing its own testable seam.
+/// Keep the menu outside ChatView.body to stay within Swift's type-checker complexity limit.
 struct MacChatRunningSessionMenu: View {
     let routes: [MacChatRunningSessionRoute]
     let onSelect: (String) -> Void

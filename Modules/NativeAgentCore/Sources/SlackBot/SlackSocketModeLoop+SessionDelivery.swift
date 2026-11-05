@@ -1,7 +1,7 @@
 import Foundation
 import ChatTurnRuntime
 import NativeAgentCore
-// Blueprint: | `SlackSocketModeLoop+SessionDelivery.swift` | Slack's session recipient resolves continuation previews through the existing inbound journal; final recovery updates the retained message after the preview writer joins |
+// Blueprint: | `SlackSocketModeLoop+SessionDelivery.swift` | Journal previews; final recovery joins the preview writer before updating its message |
 
 extension SlackSocketModeLoop {
     public func sessionDelivery(_ context: SessionTurnDelivery.Context) async throws -> SessionTurnDelivery.Recipient? {

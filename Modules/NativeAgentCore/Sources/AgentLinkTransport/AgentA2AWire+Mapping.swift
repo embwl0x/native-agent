@@ -3,8 +3,7 @@ import PersistenceCore
 // Blueprint: | `AgentA2AWire+Mapping.swift` | `AgentA2AWire`: `canonicalPart`, `wirePart`, `canonicalState` |
 
 extension AgentA2AWire {
-    /// The canonical content shape is 1.0 ProtoJSON. Both directions use this
-    /// mapping; transport policy (file admission, size, fetching) stays outside.
+    /// Both directions share canonical 1.0 ProtoJSON; transport admission stays outside.
     public static func canonicalPart(_ value: JSONValue, version: String) throws -> JSONValue {
         guard case .object(var part) = value else { throw WireError.invalid("part must be an object") }
         if version == "0.3" {
@@ -35,7 +34,7 @@ extension AgentA2AWire {
         if part["text"] != nil { part["kind"] = .string("text") }
         else if let data = part["data"] {
             part["kind"] = .string("data")
-            // Match the SDK compatibility projection: 0.3 data is an object.
+            // The SDK's 0.3 projection requires object-valued data.
             if case .object = data {} else { part["data"] = .object(["value": data]) }
         }
         else {
@@ -62,8 +61,7 @@ extension AgentA2AWire {
             : "TASK_STATE_" + state.uppercased().replacingOccurrences(of: "-", with: "_")
     }
 
-    /// Project an existing 0.3 task/message/event without traversing user data
-    /// or metadata. The server retains one execution model for both versions.
+    /// Project protocol fields without traversing user data or metadata.
     public static func canonicalObject(_ value: JSONValue) throws -> JSONValue {
         guard case .object(var object) = value else { throw WireError.invalid("object") }
         object.removeValue(forKey: "kind")

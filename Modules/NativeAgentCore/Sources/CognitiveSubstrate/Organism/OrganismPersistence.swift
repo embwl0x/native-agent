@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `OrganismPersistence.swift` | `OrganismPersistentState`: persisted body field, chemistry, predictions and caring encounter; restore decay and strict current identity validation |
+// Blueprint: | `OrganismPersistence.swift` | `OrganismPersistentState`: checked identity, body continuity and restore decay |
 
 public struct OrganismPersistentState: Codable, Sendable, Equatable {
     static let maximumDecayHours: Double = 72
@@ -19,17 +19,13 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
     public var lastSignalAt: Date?
     /// The encounter window persists with chemistry so relaunch cannot dose the same exchange twice.
     public var caringEncounter: OrganismCaringEvent.Encounter
-    /// The body's FORGETTING EPOCH. Reset and Clear bump it in the same atomic
-    /// file write that empties the body, so a moment admitted under an older
-    /// epoch is refused by the body's parts however late it arrives. Absent in
-    /// files written before epochs: 0.
+    /// Reset and Clear persist the bumped forgetting epoch with empty chemistry so late moments from the previous epoch remain refused; absent epoch carries
+    /// zero.
     public var epoch: UInt64
-    /// The fold seq of the last lived moment the body lived (its whole share:
-    /// dose, reaction and correction cause, in one `OrganismKernel.foldTurn`).
-    /// Saved in the same atomic file write as the chemistry it describes.
+    /// The fold seq of the last lived moment the body lived (its whole share: dose, reaction and correction cause, in one `OrganismKernel.foldTurn`). Saved in
+    /// the same atomic file write as the chemistry it describes.
     public var lived: UInt64
-    /// Journaled dream identities lived by this body. No claim means that
-    /// completion remains owed, including in a body saved before this producer.
+    /// Dream claims persist with effects; a missing claim leaves completion owed.
     public var dreamCompletions: Set<UUID>?
 
     private enum CodingKeys: String, CodingKey {
@@ -58,9 +54,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         lived = try container.decode(UInt64.self, forKey: .lived)
         dreamCompletions = try container.decodeIfPresent(Set<UUID>.self, forKey: .dreamCompletions)
 
-        // Decay rebuilds these dictionaries by embedded ID. Validate before
-        // restoration so inconsistent JSON reaches the restore-failed handler
-        // instead of trapping on duplicate keys and crashing every launch.
+        // Decay rebuilds these dictionaries by embedded ID. Validate before restoration so inconsistent JSON reaches the restore-failed handler instead of
+        // trapping on duplicate keys and crashing every launch.
         func requireMatchingIDs<Value>(
             _ values: [String: Value], id: KeyPath<Value, String>, key: CodingKeys
         ) throws {
@@ -223,43 +218,19 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         let decayed = next.predictions.values.map { prediction -> OrganismPrediction in
                 var copy = prediction
                 if copy.status == .pending && copy.dueAt < now && !deferredIDs.contains(copy.id) {
-                    // ONE expiry transition, shared with the live sweep
-                    // (`OrganismPredictiveBody.expireOverdue`) so the two can no
-                    // longer disagree about what an expired row looks like. It
-                    // also owns the horizon exception: a passed horizon goes
-                    // terminal without being counted as a miss, because Friday
-                    // arriving with nothing on it means she was waiting, not
-                    // wrong.
+                    // Share live expiry transitions; a passed horizon means waiting, never an incorrect prediction.
                     if OrganismPredictiveBody.applyExpiryTransition(to: &copy, at: now) {
                         expiredKinds.append(copy.kind)
                     } else {
                         expiredHorizons += 1
                     }
-                    // ...and NOTHING after it. The uncertainty the transition
-                    // just stamped is evidence dated `now`; the generic decay
-                    // below forgets the window that ENDS at `now`, so applying
-                    // it here would age a fact that is zero seconds old and
-                    // leave the same expiry looking different depending on
-                    // whether she happened to be running when it ran out. Same
-                    // rule the outcome weights already follow two blocks down
-                    // ("Forget the elapsed window BEFORE stamping evidence
-                    // dated `now`").
+                    // Do not decay a freshly stamped expiry again: its evidence is dated now and the elapsed window ends now.
                     return copy
                 }
                 copy.uncertainty = OrganismBodyConfidence.clamp(copy.uncertainty * pow(0.94, hours))
                 return copy
             }
-        // An expiry found by the restart/idle sweep is the same evidence the
-        // live sweep records (OrganismPredictiveBody.expireOverdue). Flipping
-        // the row without the counters meant every expectation that ran out
-        // across a restart or a sleep gap was silently dropped from the
-        // cumulative outcome evidence — and the capability self-read, which now
-        // prefers outcomeCountsByKind over the bounded reservoir, then read
-        // more certain than the evidence warranted. The row is only counted on
-        // the tick that flips it: later sweeps see .expired and skip it.
-        // Forget the elapsed window BEFORE stamping evidence dated `now`: the
-        // expiry this sweep just found is fresh and must not be decayed by the
-        // same window that aged everything preceding it.
+        // Count an expiry only when its row turns terminal, using the same live-sweep rule. Decay prior evidence before adding this newly observed outcome.
         next.outcomeCountsByKind = forgottenOutcomeCounts(next.outcomeCountsByKind, at: now, hours: evidenceHours)
         next.expiredCount = min(next.expiredCount, Int.max - expiredHorizons) + expiredHorizons
         for kind in expiredKinds.sorted(by: { $0.rawValue < $1.rawValue }) {
@@ -273,14 +244,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         return next
     }
 
-    /// Cumulative outcome evidence was the one organism quantity that never
-    /// moved with the clock, so after thousands of clean runs no real
-    /// regression could shift `successLikelihood` and a bad stretch's
-    /// missing-evidence penalty never relaxed. The lifetime Int tallies stay
-    /// untouched as the receipt; the fractional weights the capability read
-    /// reasons from forget on the same 7-day half-life that read already uses
-    /// for freshness, so evidence weight and evidence freshness fade together
-    /// instead of a belief reading certain from outcomes it calls stale.
+    /// Decay fractional outcome evidence on the capability read's seven-day freshness clock; lifetime integer receipts remain unchanged so old certainty can
+    /// relax.
     private func forgottenOutcomeCounts(
         _ counts: [String: OrganismPredictionOutcomeCounts],
         at now: Date,

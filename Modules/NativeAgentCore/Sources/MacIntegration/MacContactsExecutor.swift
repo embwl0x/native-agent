@@ -1,9 +1,10 @@
+import MacControl
 import AuthoredCapabilities
 import Foundation
 import Contacts
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacContactsExecutor.swift` | concrete `CNContactStore` ownership, raw argument schemas/admission, single-route selection, complete labeled-array mutation validation and projection; Messages handles read as numbers, never contact names |
+// Blueprint: | `MacContactsExecutor.swift` | `CNContactStore`: checked Contacts reads and labeled mutations |
 
 public enum MacContactsExecutor {
     // MARK: - One caller contract (forms, app door and native dispatch)
@@ -22,7 +23,10 @@ public enum MacContactsExecutor {
             "name": textSchema("Name fragment; selects only a name lookup."),
             "phone": textSchema("Phone number; selects only a phone lookup."),
             "email": textSchema("Email address; selects only an email lookup."),
-            "query": textSchema("Search text: @ selects email, phone-shaped text selects phone, otherwise name. When several fields are supplied, selection order is identifier, name, phone, email, query; only one lookup runs."),
+            "query": textSchema("""
+                Search text: @ selects email, phone-shaped text selects phone, otherwise name. When several fields are supplied, selection order is \
+                identifier, name, phone, email, query; only one lookup runs.
+                """),
             "limit": .object(["type": .string("integer"), "minimum": .int(1), "maximum": .int(100),
                 "description": .string("Maximum contacts (1–100; omit for 20).")]),
         ]),
@@ -69,23 +73,19 @@ public enum MacContactsExecutor {
         }
     }
 
-    /// Runs before protocol normalization and again at the concrete owner.
-    /// Internal transport metadata is not a public Contacts argument.
+    /// Runs before protocol normalization and again at the concrete owner. Internal transport metadata is not a public Contacts argument.
     public static func validateArguments(tool: String, input: [String: JSONValue]) throws {
         guard let schema = parameters(for: tool) else { return }
         let arguments = input.filter { !$0.key.hasPrefix("__") }
         if let problem = JSONValue.object(arguments).schemaProblem(schema: schema, path: "$") {
-            throw ToolFailureError("\(problem.path) must be \(problem.expected). No Contacts lookup or save ran.",
+            throw ToolFailureError("\(problem.words). No Contacts lookup or save ran.",
                 argumentPath: problem.path, effects: .none, code: "invalid_input")
         }
     }
 
     // MARK: - TCC status (for Mac Integration permission wizard)
 
-    /// Returns the current Contacts authorization status in the wizard
-    /// vocabulary: "granted" | "denied" | "restricted" | "limited" | "not_determined".
-    /// Does NOT trigger a prompt — pure status query.
-    /// `.limited` is macOS 15+ (rawValue == 4); on macOS 14 it's unreachable.
+    /// Status reads never prompt; limited access is available only on macOS 15 and later.
     public static func currentAuthorizationStatus() -> String {
         let status = CNContactStore.authorizationStatus(for: .contacts)
         if status.rawValue == 4 { return "limited" }
@@ -101,13 +101,13 @@ public enum MacContactsExecutor {
     // MARK: - Public API
 
     /// Select a query once, before reading Contacts. A miss never selects another route.
-    public static func search(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func search(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         try validateArguments(tool: "contacts_search", input: input)
         let selected = try selectedSearch(input)
         let limit = input["limit"]?.exactIntegerValue ?? 20
         let store = CNContactStore()
         guard SystemPermissionPreflight.status(.contacts) == .granted else {
-            return permissionDeniedEnvelope()
+            return permissionDeniedEnvelope(context: context)
         }
 
         let keys: [CNKeyDescriptor] = [
@@ -125,7 +125,8 @@ public enum MacContactsExecutor {
             case .identifier:
                 matches = [try store.unifiedContact(withIdentifier: selected.text, keysToFetch: keys)]
             case .phone:
-                matches = try store.unifiedContacts(matching: CNContact.predicateForContacts(matching: CNPhoneNumber(stringValue: selected.text)), keysToFetch: keys)
+                matches = try store.unifiedContacts(matching: CNContact.predicateForContacts(matching: CNPhoneNumber(stringValue: selected.text)),
+                    keysToFetch: keys)
             case .email:
                 matches = try store.unifiedContacts(matching: CNContact.predicateForContacts(matchingEmailAddress: selected.text), keysToFetch: keys)
             case .name:
@@ -146,18 +147,18 @@ public enum MacContactsExecutor {
             }
             return .object(result)
         } catch {
-            return failedEnvelope(error: error)
+            return failedEnvelope(error: error, context: context)
         }
     }
 
     /// Validate the entire request before reading or saving; arrays contain only labeled entries.
-    public static func createOrUpdate(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func createOrUpdate(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         try validateArguments(tool: "contacts_create_or_update", input: input)
         let phones = try parseLabeledValues(input["phones"], field: "phones")
         let emails = try parseLabeledValues(input["emails"], field: "emails")
         let store = CNContactStore()
         guard SystemPermissionPreflight.status(.contacts) == .granted else {
-            return permissionDeniedEnvelope()
+            return permissionDeniedEnvelope(context: context)
         }
 
         let givenName = input["given_name"]?.stringValue?
@@ -243,19 +244,19 @@ public enum MacContactsExecutor {
             "contact": contactJSON(mutable),
         ]
         if identifier.isEmpty, action == "updated" { result["message"] = .string("Updated the one existing contact with this name.") }
-        if sameName.count > 1 { result["message"] = .string("\(sameName.count) contacts already had this name, so a new one was made; pass identifier to update one.") }
+        if sameName.count > 1 { result["message"] = .string("""
+            \(sameName.count) contacts already had this name, so a new one was made; pass identifier to update one.
+            """) }
         return .object(result)
         } catch {
-            return failedEnvelope(error: error)
+            return failedEnvelope(error: error, context: context)
         }
     }
 
-    /// Standard failed-envelope shape, parallel to permissionDeniedEnvelope
-    /// and matching the AppleScript bridge's `failedEnvelope(integration:reason:)`.
-    private static func failedEnvelope(error: Error) -> JSONValue {
+    private static func failedEnvelope(error: Error, context: MacOperationContext) -> JSONValue {
         let failure = error as NSError
         if failure.domain == CNErrorDomain, failure.code == CNError.Code.authorizationDenied.rawValue {
-            return permissionDeniedEnvelope()
+            return permissionDeniedEnvelope(context: context)
         }
         return failedEnvelope(reason: error.localizedDescription)
     }
@@ -268,14 +269,12 @@ public enum MacContactsExecutor {
         ])
     }
 
-    /// Delete a contact by identifier (CNContact.identifier from a prior
-    /// search result). Gated on contacts/.write. Required: "identifier".
-    /// Returns: {status, action: "deleted", identifier}.
-    public static func delete(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Deletion requires an identifier from a prior search and contacts write admission.
+    public static func delete(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         try validateArguments(tool: "contacts_delete", input: input)
         let store = CNContactStore()
         guard SystemPermissionPreflight.status(.contacts) == .granted else {
-            return permissionDeniedEnvelope()
+            return permissionDeniedEnvelope(context: context)
         }
         guard let identifier = input["identifier"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -302,14 +301,13 @@ public enum MacContactsExecutor {
                 "name": .string([existing.givenName, existing.familyName].filter { !$0.isEmpty }.joined(separator: " ")),
             ])
         } catch {
-            return failedEnvelope(error: error)
+            return failedEnvelope(error: error, context: context)
         }
     }
 
     // MARK: - Numbers for handles (Messages)
 
-    /// Emails and explicit international numbers retain their whole identity.
-    /// A local number has no region evidence here, so cannot name a person.
+    /// Emails and explicit international numbers retain their whole identity. A local number has no region evidence here, so cannot name a person.
     private static func handleKey(_ raw: String) -> String {
         if raw.contains("@") { return raw.lowercased().trimmingCharacters(in: .whitespaces) }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -319,11 +317,7 @@ public enum MacContactsExecutor {
         return "+" + digits
     }
 
-    /// A Messages read with each number as a person would write it, so a reply
-    /// copies it instead of re-typing raw digits: participants' `name` and each
-    /// message's `sender_name` are that number, never a contact's name. The
-    /// number is the identity she works with (User 10-28: going by names
-    /// drifted to the wrong person). Handles are untouched.
+    /// Use formatted numbers as participant and sender names so a reply retains the handle identity instead of selecting a namesake.
     public static func naming(_ result: [String: JSONValue]) async -> [String: JSONValue] {
         func name(_ handle: JSONValue?) -> String? {
             guard case .string(let raw)? = handle else { return nil }
@@ -355,7 +349,6 @@ public enum MacContactsExecutor {
 
     // MARK: - Finding one contact
 
-    /// Contacts whose full name is exactly `name` (case aside).
     private static func exactNameMatches(store: CNContactStore, name: String, keys: [CNKeyDescriptor]) throws -> [CNContact] {
         let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !wanted.isEmpty else { return [] }
@@ -366,8 +359,8 @@ public enum MacContactsExecutor {
 
     // MARK: - Authorization
 
-    private static func permissionDeniedEnvelope() -> JSONValue {
-        if SkillRunContext.handsBack { return SkillRunContext.handBack("macOS Contacts permission") }
+    private static func permissionDeniedEnvelope(context: MacOperationContext) -> JSONValue {
+        if context.handsBack { return SkillRunContext.handBack("macOS Contacts permission") }
         return .object([
             "status": .string("denied"),
             "reason": .string("os_permission_denied"),
@@ -427,7 +420,8 @@ public enum MacContactsExecutor {
                   case .string(let label)? = entry["label"], case .string(let text)? = entry["value"],
                   !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw ToolFailureError("Each \(field) entry needs nonblank label and value strings.", argumentPath: "$.\(field)[\(index)]", effects: .none, code: "invalid_input")
+                throw ToolFailureError("Each \(field) entry needs nonblank label and value strings.", argumentPath: "$.\(field)[\(index)]", effects: .none,
+                    code: "invalid_input")
             }
             return (label.trimmingCharacters(in: .whitespacesAndNewlines), text.trimmingCharacters(in: .whitespacesAndNewlines))
         }
@@ -451,8 +445,7 @@ public enum MacContactsExecutor {
 
     // MARK: - CN label conversion
 
-    /// Maps a user-supplied or extracted label string to a CN label constant.
-    /// Unknown labels fall through verbatim (CN accepts custom labels).
+    /// Contacts accepts custom labels, so unknown labels retain their spelling.
     private static func contactLabel(forPhone label: String) -> String {
         switch label.lowercased() {
         case "mobile", "cell", "cell phone": return CNLabelPhoneNumberMobile
@@ -477,7 +470,6 @@ public enum MacContactsExecutor {
         }
     }
 
-    /// Inverse of `contactLabel(forPhone:/forEmail:)` for serialization back to JSON.
     private static func labelString(_ raw: String?) -> String {
         guard let raw, !raw.isEmpty else { return "other" }
         return CNLabeledValue<NSString>.localizedString(forLabel: raw)

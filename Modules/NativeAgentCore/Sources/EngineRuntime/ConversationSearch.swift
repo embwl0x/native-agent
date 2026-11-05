@@ -19,7 +19,6 @@ import ChatToolParsing
 import SlackBot
 import TelegramBot
 import TriggerScheduler
-import WorkshopExecution
 import BackgroundLoops
 import AppToolRuntime
 import TrustCenter
@@ -59,7 +58,6 @@ import Experiences
 import CryptoKit
 import ActivityWatch
 import OSLog
-import Procedures
 import SchedulerExecution
 import Darwin
 import Combine
@@ -71,7 +69,7 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `ConversationSearch.swift` | `CommandPaletteMessageIndex` and saved bot/memory search inputs remain owned by `TranscriptsFacade`; `LatestRead` orders checked publication per root; `TranscriptSearch` projects the same provenance-selected visible words as conversation rendering |
+// Blueprint: | `ConversationSearch.swift` | `CommandPaletteMessageIndex`, `TranscriptsFacade`, `LatestRead`, `TranscriptSearch` |
 
 extension TranscriptsFacade {
     public func observeSavedSearch(bots: BotRunnerScheduler, memory: MemoryFacade) async {
@@ -83,8 +81,7 @@ extension TranscriptsFacade {
         }
     }
 
-    /// The remaining saved search inputs share the transcript search owner;
-    /// Desk and dreams already publish their own revisions.
+    /// Share saved search inputs with the transcript owner; Desk and dreams own their revisions.
     public func refreshSavedSearch(bots: BotRunnerScheduler, memory: MemoryFacade) async {
         _ = await savedSearchRead.read({
         var failures: [String] = []
@@ -119,10 +116,7 @@ extension TranscriptsFacade {
     }
 }
 
-/// Every visible conversation's words, for ⌘K: the text ⌘F searches in the
-/// open chat (`MacChatTranscriptSearch`), across all of them. A transcript is
-/// read again when its session or transcript revision moves. Each engine's
-/// transcript facade owns its index, so roots never share search documents.
+/// Share visible search words across open chat and the palette; revision-driven indexes stay scoped to each engine root.
 public actor CommandPaletteMessageIndex {
 
     public struct Hit: Sendable {
@@ -132,7 +126,6 @@ public actor CommandPaletteMessageIndex {
 
     private struct Snapshot: Sendable {
         var texts: [String: (stamp: String, lines: [String])] = [:]
-        /// Newest conversation first, as the palette lists them.
         var order: [String] = []
     }
 
@@ -175,15 +168,11 @@ public actor CommandPaletteMessageIndex {
         "\(session.updatedAt ?? session.createdAt)|\(session.transcriptGeneration ?? -1)|\(session.messageCount ?? -1)"
     }
 
-    /// Reads what changed and returns how many conversations could not be
-    /// read. A failed read is not cached: it keeps whatever text it had
-    /// before, and is tried again on the next revision refresh.
+    /// Failed reads retain proven text without caching failure; the next revision refresh can read it again.
     public func refresh(_ sessions: [(id: String, stamp: String)], transcripts: TranscriptsFacade) async -> Int {
         await projection.refresh(sessions, transcripts: transcripts)
     }
 
-    /// The newest line in each conversation that holds `query`, newest
-    /// conversation first, every conversation that has one.
     public func search(_ query: String) async -> [Hit] {
         let snapshot = await projection.snapshot
         let texts = snapshot.texts
@@ -201,7 +190,6 @@ public actor CommandPaletteMessageIndex {
         return hits
     }
 
-    /// A line of the message starting a few words before the match.
     private static func snippet(_ text: String, around range: Range<String.Index>) -> String {
         var start = text.index(range.lowerBound, offsetBy: -40, limitedBy: text.startIndex) ?? text.startIndex
         if start != text.startIndex, let space = text[start..<range.lowerBound].firstIndex(of: " ") {
@@ -232,7 +220,7 @@ extension TranscriptSearch {
         )
     }
 
-    /// Rendering and search share visible words selected by recorded provenance.
+    /// Rendering and search must share provenance-selected visible words.
     public static func visibleText(of message: ChatMessage) -> String {
         let content = message.content
         let bridged = ChatShellConversationRow.isBridgeRouted(message.metadata?.origin)

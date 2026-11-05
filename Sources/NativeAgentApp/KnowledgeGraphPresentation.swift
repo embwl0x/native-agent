@@ -9,9 +9,8 @@ import Cognition
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `KnowledgeGraphPresentation.swift` | Graph modes, filters, cached date projection, selection and content/error presentation; retains the canvas size boundary |
+// Blueprint: | `KnowledgeGraphPresentation.swift` | Shared graph filters, date cache, selection and checked content/error states |
 
-// List and Graph share the same filtered entities; Graph enforces its size cap.
 enum KGViewMode: String, CaseIterable, Identifiable {
     case list = "List"
     case graph = "Graph"
@@ -30,8 +29,6 @@ enum KGTimeWindow: String, CaseIterable, Identifiable {
     case week = "Last week"
     case month = "Last month"
     var id: String { rawValue }
-    /// Cutoff date — anything with a valid recorded `last_seen` at or
-    /// after the cutoff is included. `nil` means no filter.
     var cutoff: Date? {
         let cal = Calendar.current
         let now = Date()
@@ -52,8 +49,7 @@ enum KnowledgeGraphFilterCatalog {
 
 @MainActor
 enum KnowledgeGraphPresentation {
-    /// Selection and drawing reuse the same filter result until an input or
-    /// the next timestamp boundary changes. Dates are parsed once per source.
+    /// Reuse filtered entities for selection and drawing until inputs or a timestamp boundary change; parse dates once per source.
     final class GraphFilter {
         private var source: [KnowledgeGraphEntity] = []
         private var dates: [Date?] = []
@@ -110,10 +106,7 @@ enum KnowledgeGraphPresentation {
 
     enum Content: Equatable { case loading, unavailable(String), policyUnavailable, policyUnreadable(String), disabled, empty, filteredEmpty, list, graph }
     enum ErrorPlacement: Equatable { case none, emptyState(String), retainedDataBanner(message: String, isStale: Bool) }
-    /// Error provenance is retained with the message so the mounted banner
-    /// never labels a maintenance-action error as stale graph data.  A boolean
-    /// from an earlier load attempt is insufficient: a later GC failure can
-    /// replace the visible message while retained graph rows are still current.
+    /// Keep error provenance with its message so maintenance failures cannot label current graph rows stale.
     enum ErrorOrigin: Equatable { case graphLoad, maintenance }
     static func content(
         isLoading: Bool,
@@ -125,9 +118,7 @@ enum KnowledgeGraphPresentation {
         policyReadError: String? = nil
     ) -> Content {
         if let error, entityCount == 0 { return .unavailable(error) }
-        // Retained rows are still useful while a refresh is in flight. Do not
-        // replace them with an unlabelled spinner; the error presentation
-        // above the graph carries the failure/provenance instead.
+        // Keep useful retained rows during refresh; the banner carries their failure and provenance.
         if isLoading && entityCount == 0 { return .loading }
         if isEnabled == nil,
            let policyReadError,
@@ -151,17 +142,13 @@ enum KnowledgeGraphPresentation {
         entityCount: Int,
         errorOrigin: ErrorOrigin?
     ) -> ErrorPlacement {
-        // A maintenance action can fail while another graph operation is
-        // loading. The error is still evidence and must remain visible; the
-        // content classifier decides whether an empty graph shows a full
-        // unavailable state or retained rows stay on screen.
+        // Loading must not hide an independent maintenance failure; classify unavailable and retained content separately.
         guard let error else { return .none }
         return entityCount == 0
             ? .emptyState(error)
             : .retainedDataBanner(message: error, isStale: errorOrigin == .graphLoad)
     }
 
-    /// A selection is valid only while its node is visible.
     static func reconciledSelection(_ selectedID: String?, visibleIDs: Set<String>) -> String? {
         guard let selectedID, visibleIDs.contains(selectedID) else { return nil }
         return selectedID

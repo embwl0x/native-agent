@@ -12,18 +12,16 @@ import PersistenceCore
 import StandingBots
 import ProviderRouting
 import AppToolRuntime
-// Blueprint: | `SimpleThreadComposer.swift` | SimpleComposer binds drafts to their thread and clears only accepted sends, retaining alternate routes and accessibility |
+// Blueprint: | `SimpleThreadComposer.swift` | Thread-bound drafts clear only on acceptance; shared send and accessibility |
 
-/// The thread composer shares chat glass and spacing; Return sends and only acceptance clears.
+/// Clear the draft only after acceptance so failed sends preserve the user's words.
 struct SimpleComposer: View {
-    /// The thread the draft belongs to across presentations.
+    /// Bind drafts to thread identity so changing presentation cannot send to the wrong recipient.
     let thread: String
     let placeholder: String
-    /// Who a send goes straight to. Shown the whole time, because the
-    /// placeholder that named them is gone at the first keystroke.
+    /// Keep the recipient visible because a placeholder disappears at the first keystroke.
     var recipient: String?
     var note: String?
-    /// A second way to send the draft, beside the arrow: a title and its send.
     var alternate: (title: String, send: (String) async -> Bool)?
     let send: (String) async -> Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency

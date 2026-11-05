@@ -16,8 +16,7 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
-// Blueprint: | `ChatHistoryMessage.swift` | Verbatim persisted messages and bounded receipt pages; missing selected transcripts keep exact-message coverage incomplete |
+// Blueprint: | `ChatHistoryMessage.swift` | Keep selected-transcript gaps explicit. |
 
 extension SwiftToolDispatcher {
     /// Characters per page. A page is a bounded read, not a whole transcript.
@@ -44,7 +43,7 @@ extension SwiftToolDispatcher {
         let requestedSession = input["session_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // The session ids to look in, most recently written first. An explicit id is the most specific instruction there is; without one this looks through the same file set search_chat_history searches.
+        // An explicit session is exact scope; otherwise search canonical history files newest-written first.
         let files: [(String, URL)]
         var listingFailed = false
         let archived = try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot)
@@ -60,7 +59,7 @@ extension SwiftToolDispatcher {
             }
         }
 
-        // The canonical transcript reader — the same one prompt assembly uses. No second JSONL parser lives here.
+        // Use the prompt reader's transcript interpretation; a second JSONL parser would drift.
         let reader = SessionHistoryReader(dataRoot: dataRoot)
         // Shared message ids return the newest-written copy and list other sessions for explicit selection.
         var found: (sessionId: String, index: Int, message: ChatMessage, stats: SessionHistoryReadStats)?
@@ -78,7 +77,7 @@ extension SwiftToolDispatcher {
                 continue
             }
             guard rows.contains(where: { $0.valid && $0.messageId == messageId }) else {
-                // Counted as the canonical reader would have counted this transcript.
+                // Keep scanned-line accounting consistent with the canonical reader.
                 malformedRowCount += rows.filter { $0.shape == 0 && !$0.identity.isEmpty }.count
                 invalidShapeRowCount += rows.filter { $0.shape == 1 }.count
                 continue
@@ -129,7 +128,10 @@ extension SwiftToolDispatcher {
                 "searched_session_count": .int(Int64(Set(files.map { $0.0 }).count)),
                 "coverage": coverage,
                 "reason": .string(!complete
-                    ? "History could not be read completely. This does not establish that the message is absent. Preserve the original locator; do not recreate or replay the original action."
+                    ? """
+                        History could not be read completely. This does not establish that the message is absent. Preserve the original locator; do \
+                        not recreate or replay the original action.
+                        """
                     : requestedSession?.isEmpty == false
                     ? "No message with that id in that session. Drop session_id to search every transcript."
                     : "No message with that id in any transcript. Ids come from search_chat_history hits."),
@@ -177,10 +179,15 @@ extension SwiftToolDispatcher {
         }
         if found.stats.malformedRowCount > 0 || found.stats.invalidShapeRowCount > 0 {
             response["message_index"] = .null
-            response["message_index_note"] = .string("Source row index unavailable because earlier rows may have been skipped. Use the exact message_id and session_id.")
+            response["message_index_note"] = .string("""
+                Source row index unavailable because earlier rows may have been skipped. Use the exact message_id and session_id.
+                """)
         }
         if !complete {
-            response["coverage_note"] = .string("The returned message was readable, but other history evidence was unavailable or malformed. Other copies or missing messages cannot be ruled out.")
+            response["coverage_note"] = .string("""
+                The returned message was readable, but other history evidence was unavailable or malformed. Other copies or missing messages cannot \
+                be ruled out.
+                """)
         }
         if isToolReceipt {
             response["evidence_type"] = .string("persisted_tool_receipt")

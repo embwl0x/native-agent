@@ -4,12 +4,10 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `CognitiveSubstrate+Cares.swift` | `CognitiveSubstrate` cares: seeds, meaning-matched births, stance pressure and provenance-gated apply; personKey follows injected address-book who aliases after door trust; converts retired views and thought seeds once |
+// Blueprint: | `CognitiveSubstrate+Cares.swift` | `CognitiveSubstrate`: provenance-gated care birth, movement and durable merges |
 
-// After-turn interpretation reads both sides against the four care seeds and the closest existing cares.
 
-/// One care as the after-turn call is shown it: a short key the model answers
-/// with, the care it maps back to, and its line.
+/// Short prompt keys map judgments back to the exact cares shown.
 public struct CognitiveCareLine: Codable, Sendable, Equatable {
     public let key: String
     public let id: UUID
@@ -22,7 +20,6 @@ public struct CognitiveCareLine: Codable, Sendable, Equatable {
     }
 }
 
-/// What the after-turn call said moved her, for one care.
 public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
     public enum Target: Codable, Sendable, Equatable {
         case existing(UUID)
@@ -50,10 +47,7 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
         self.stance = stance
     }
 
-    /// The `cares` section of a reply. nil when it is missing or malformed
-    /// (a `new` with no `about` included), which fails the interpretation the
-    /// way a malformed memories section does. An entry naming a care that was not shown
-    /// makes the interpretation malformed, never silently dropped or guessed.
+    /// Missing or malformed care judgments fail interpretation; an unshown key cannot be silently discarded or guessed.
     public static func parse(_ raw: Any?, shown: [CognitiveCareLine]) -> [CognitiveCareJudgment]? {
         guard let items = raw as? [Any] else { return nil }
         let ids = Dictionary(shown.map { ($0.key.lowercased(), $0.id) }, uniquingKeysWith: { first, _ in first })
@@ -110,16 +104,12 @@ public struct CognitiveCareJudgment: Codable, Sendable, Equatable {
     }
 }
 
-/// Who the incoming words came from, and what they may change.
 public struct CognitiveCareProvenance: Sendable, Equatable {
-    /// The speaker's person key: `CognitiveCare.ownerKey`, a peer id or a helper's bot id.
     public var speaker: String
-    /// The owner, or a peer the owner trusts. An untrusted peer moves only
-    /// what she already cares about: no new care, no stance, no gap.
+    /// The owner, or a peer the owner trusts. An untrusted peer moves only what the agent already cares about: no new care, no stance, no gap.
     public var trusted: Bool
-    /// The app wrote the incoming words (her hour). Only what her reply did counts.
+    /// The app wrote the incoming words (the wander hour). Only what the agent's reply did counts.
     public var appAuthored: Bool
-    /// `exchange:<session>/<turn>`: where the moment really happened.
     public var source: String
     public var at: Date
 
@@ -131,15 +121,12 @@ public struct CognitiveCareProvenance: Sendable, Equatable {
         self.at = at
     }
 
-    /// One key per who, as `PeerTrust.ownerTrusts` reads it: a session names
-    /// a helper `bot-<id>`, history `peer:bot-<id>`, a live helper reply's
-    /// origin `bot:<id>`.
+    /// Normalize helper identities to the person key `PeerTrust.ownerTrusts` reads across session, history and live-origin shapes.
     public static func personKey(_ raw: String) -> String {
         personKey(raw, aliases: [:])
     }
 
-    /// Relationship identity follows the address book's explicit `who` link.
-    /// This is never a trust principal: grants still belong to attested doors.
+    /// Relationship identity follows the address book's explicit `who` link. This is never a trust principal: grants still belong to attested doors.
     public static func personKey(_ raw: String, aliases: [String: String]) -> String {
         var key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let peer = key.hasPrefix("peer:") ? key : "peer:" + key
@@ -165,28 +152,25 @@ public struct CognitiveCareNotSaved: Error, LocalizedError, CustomStringConverti
         self.detail = detail
         self.ids = ids
     }
-    public var description: String { "her cares were not all saved: \(detail)" }
+    public var description: String { "the agent's cares were not all saved: \(detail)" }
     public var errorDescription: String? { description }
 }
 
-/// Once per store: the four seeds, the migration of views and open seeds, and
-/// the reading of her recent life that follows it.
+/// Seed and import markers advance only after their care writes are durable.
 public struct CognitiveCareMigration: Sendable, Equatable, Codable {
     public var id: UUID
     public var migratedAt: Date
     public var migrated: Int
     public var dropped: Int
-    /// When her recent life was read into cares; nil while that is still owed.
+    /// Nil leaves the recent-life reading owed.
     public var lifeReadAt: Date?
-    /// The (conversation, day) groups already read.
     public var groupsRan: [String]
-    /// Groups whose reading failed on the last pass, with the cause.
+    /// Failed group readings retain their causes rather than claiming complete coverage.
     public var groupsFailed: [String: String]
 }
 
 extension CognitiveSubstrate {
     static let careSeedKeys = ["truth", "person", "work", "mind"]
-    /// Most shown beside the seeds.
     static let maximumShownGrownCares = 6
 
     func careSeedID(_ key: String) -> UUID { stableArtifactID("care_seed|\(key)") }
@@ -208,12 +192,7 @@ extension CognitiveSubstrate {
 
     // MARK: - Seeds and migration (once, at restore)
 
-    /// Establish the seeds while no marker says they ran, and convert the
-    /// retired views and thought seeds (their raw rows, read at restore) while
-    /// no `care_retired_migration` marker says that ran: a store upgraded
-    /// after the 0.6.12 seed marker still gets it. Each marker is written only
-    /// after every care write landed; until then the next restore runs this
-    /// again, and stable ids keep a repeated pass from duplicating anything.
+    /// Write each bootstrap marker only after every care write lands; stable identities make an interrupted import safe to resume.
     public func establishCares(retiredViews: [JSONValue] = [], retiredSeeds: [JSONValue] = []) async {
         guard configuration.enabled else { return }
         await waitForMaintenanceTransition()
@@ -266,11 +245,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// The retired standing views and thought seeds as cares, read from their
-    /// raw rows (the types are gone), with the mapping of the first migration.
-    /// Each keeps one story entry pointing at the row it came from. Retired
-    /// views and machine noise (every anomaly, the microcycle pressure seed,
-    /// runtime talk, any follow-up that is not a pinned concern) are dropped.
+    /// Imported rows retain source pointers; only pinned human concerns become cares, never machine noise.
     func retiredCares(views: [JSONValue], seeds: [JSONValue], at now: Date)
         -> (cares: [CognitiveCare], dropped: Int) {
         var out: [CognitiveCare] = []
@@ -359,11 +334,7 @@ extension CognitiveSubstrate {
 
     // MARK: - What the after-turn call is shown
 
-    /// The four seeds always; plus the six other cares whose embedding is
-    /// closest to `text` (the incoming words and her reply). The embedding only
-    /// orders the list; which care moved, or whether it is new, is the reading
-    /// call's to name. A cold embedder shows the seeds alone: the warm one is
-    /// never loaded for this.
+    /// Warm embeddings only order candidates; interpretation names what moved. A cold model is not loaded for this read.
     public func caresShown(for text: String) async throws -> [CognitiveCareLine] {
         guard configuration.enabled, !cares.isEmpty else { return [] }
         let seedOrder = Self.careSeedKeys.map(careSeedID)
@@ -371,7 +342,7 @@ extension CognitiveSubstrate {
             .sorted { (seedOrder.firstIndex(of: $0.id) ?? .max) < (seedOrder.firstIndex(of: $1.id) ?? .max) }
         let others = cares.values.filter { $0.origin != .seed && $0.fadedAt == nil }
         var chosen: [CognitiveCare] = []
-        if let cosines = try await careCosines(to: text, among: others) {
+        if let cosines = try await careCosines(to: text, among: others, turn: nil) {
             var scored: [(care: CognitiveCare, cosine: Double)] = []
             for care in others {
                 if let cosine = cosines[care.id] { scored.append((care, cosine)) }
@@ -398,11 +369,9 @@ extension CognitiveSubstrate {
             + (care.open.map { " | open: \($0)" } ?? "")
     }
 
-    // MARK: - Applying what moved her
+    // MARK: - Applying what moved the agent
 
-    /// The provenance of a deferred turn's incoming words, read from the same
-    /// out-of-band evidence the rest of the mind reads: the persistence seam's
-    /// source class and origin record, and the owner's peer trust.
+    /// Use the persistence seam's out-of-band source and origin plus owner trust; message wording cannot establish provenance.
     func careProvenance(for event: CognitiveEvent, appAuthored: Bool) -> CognitiveCareProvenance {
         let turn = event.metadata["messageId"]?.stringValue ?? event.subject.id
         let source = "exchange:\(event.sessionId ?? "")/\(turn)"
@@ -416,8 +385,7 @@ extension CognitiveSubstrate {
                                        appAuthored: appAuthored, source: source, at: event.occurredAt)
     }
 
-    /// A new care's identity for a lived moment: derived from (moment,
-    /// ordinal), so a refold finds the care its first fold created.
+    /// A new care's identity for a lived moment: derived from (moment, ordinal), so a refold finds the care its first fold created.
     static func momentCareID(_ momentID: String, ordinal: Int) -> UUID {
         let digest = Array(SHA256.hash(data: Data("\(momentID)|care|\(ordinal)".utf8)))
         var bytes = Array(digest.prefix(16))
@@ -427,12 +395,7 @@ extension CognitiveSubstrate {
                            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
     }
 
-    /// Write provenance-admitted movement, story, gap and stance; return affected
-    /// IDs after checked saves. A generation before Clear applies nothing.
-    /// `seq`: the lived moment's fold seq (nil off the journal). Every care's
-    /// watermark is read once before the moment's judgments, a care already at
-    /// or past `seq` is left alone, and each touched care is stamped after ALL
-    /// of the moment's judgments (two may move the same care).
+    /// Read each care watermark once before applying all judgments, then stamp after the last one; pre-Clear generations apply nothing.
     @discardableResult
     public func applyCares(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
                            generation: UInt64, seq: UInt64? = nil,
@@ -441,8 +404,7 @@ extension CognitiveSubstrate {
             seq: seq, momentID: momentID)
     }
 
-    /// Reflection prepares both judgments before mutating either; its care
-    /// effects and their done receipt share the owner's transaction.
+    /// Reflection prepares both judgments before mutating either; its care effects and their done receipt share the owner's transaction.
     func applyCareJudgments(_ judgments: [CognitiveCareJudgment], provenance: CognitiveCareProvenance,
                             generation: UInt64, seq: UInt64? = nil, momentID: String? = nil,
                             reflectionReceipt: CognitiveReflectionReceipt? = nil,
@@ -465,9 +427,8 @@ extension CognitiveSubstrate {
         }
         var provenance = provenance
         provenance.speaker = CognitiveCareProvenance.personKey(provenance.speaker, aliases: carePersonAliases)
-        // Resolve birth words once, before any mutation. A cold embedder leaves
-        // the whole appraisal owed, never half-applied. No suspension splits
-        // the moment's in-memory care applications.
+        // Resolve birth words once, before any mutation. A cold embedder leaves the whole appraisal owed, never half-applied. No suspension splits the moment's
+        // in-memory care applications.
         let birthTexts = judgments.enumerated().flatMap { ordinal, judgment -> [String] in
             guard provenance.trusted, !provenance.appAuthored || judgment.by == .her,
                   case .new(let about, _) = judgment.target else { return [] }
@@ -483,16 +444,15 @@ extension CognitiveSubstrate {
         if !birthTexts.isEmpty {
             while true {
                 let inventory = cares.values.sorted { $0.id.uuidString < $1.id.uuidString }
-                guard let lookup = try await careVectorLookup(queries: birthTexts, among: inventory) else {
-                    throw CognitiveCareNotSaved(detail: "the embedder is cold, a new care could not meet her existing cares")
+                guard let lookup = try await careVectorLookup(queries: birthTexts, among: inventory, turn: nil) else {
+                    throw CognitiveCareNotSaved(detail: "the embedder is cold, a new care could not meet the agent's existing cares")
                 }
                 await waitForMaintenanceTransition()
                 guard configuration.enabled, generation == caringAppraisalGeneration else {
                     if reflectionReceipt != nil { throw CognitiveWriteDiscarded() }
                     return []
                 }
-                // Another moment may have moved her while embedding suspended.
-                // Match the inventory she actually holds when this one applies.
+                // Another moment may have moved the agent while embedding suspended. Match the inventory the agent actually holds when this one applies.
                 guard inventory == cares.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) else {
                     if reflectionReceipt != nil {
                         throw CognitiveCareNotSaved(detail: "care inventory changed during reflection preparation; retry its retained judgment")
@@ -519,13 +479,12 @@ extension CognitiveSubstrate {
             guard let seq else { return false }
             return (livedBefore[id] ?? 0) >= seq
         }
-        // Prepare on a local value: a corrupt donor discovered by a later
-        // judgment cannot leave half a reflection applied in the owner.
+        // Prepare on a local value: a corrupt donor discovered by a later judgment cannot leave half a reflection applied in the owner.
         var workingCares = cares
         for (ordinal, judgment) in judgments.enumerated() {
-            // An app-authored prompt's words are the app's: only her side counts.
+            // An app-authored prompt's words are the app's: only the agent's side counts.
             if provenance.appAuthored, judgment.by != .her { refused += 1; continue }
-            // An untrusted peer moves her only as what they said.
+            // An untrusted peer moves the agent only as what they said.
             if !provenance.trusted, judgment.by != .them { refused += 1; continue }
             let who = judgment.by == .them ? provenance.speaker : nil
             var care: CognitiveCare
@@ -559,12 +518,9 @@ extension CognitiveSubstrate {
                     let standing = Self.careMeaningStanding(cosines, among: inventory).filter {
                         Set($0.care.with) == Set(with) && (judgment.open == nil || $0.care.origin != .seed)
                     }
-                    // Several standing are the same thing said several ways (her
-                    // existing duplicates): the nearest is moved, the night merges
-                    // the rest. A new care only when nothing stands.
+                    // Move the nearest matching care; the night merges duplicates, and only unmatched meaning creates a care.
                     let matched = standing.max { (cosines[$0.care.id] ?? -1) < (cosines[$1.care.id] ?? -1) }?.care
-                    // A donor's words still witness the meaning, but only its
-                    // survivor can move. Fading alone remains reversible.
+                    // A donor's words still witness the meaning, but only its survivor can move. Fading alone remains reversible.
                     let same = matched.flatMap { CognitiveCare.survivorID(for: $0.id, among: workingCares) }.flatMap { workingCares[$0] }
                     guard matched == nil || same != nil else {
                         throw CognitiveCareNotSaved(detail: "a meaning-matched care's survivor is missing or cyclic")
@@ -576,7 +532,7 @@ extension CognitiveSubstrate {
                         "about": .string(about), "nearest": nearest.map { .string($0.about) } ?? .null,
                         "deviation": deviation.map { $0.isFinite ? .double($0) : .string("infinity") } ?? .null,
                         "kept": .string(same == nil ? "new" : "moved"), "standing": .int(Int64(standing.count)),
-                    ]))
+                    ]), turn: nil)
                     if let same, let resident = workingCares[same.id] {
                         guard !alreadyLived(same.id) else { relived.append(same.id); continue }
                         care = resident
@@ -613,7 +569,7 @@ extension CognitiveSubstrate {
                     } else if current { care.stance = stance }
                 }
             }
-            // A faded care touched again comes back live.
+            // Touching an ordinarily faded care makes it live again.
             care.fadedAt = nil
             workingCares[care.id] = care
             let embeddingText = Self.careEmbeddingText(care)
@@ -631,10 +587,9 @@ extension CognitiveSubstrate {
             "refused": .int(Int64(refused)),
             "trusted": .bool(provenance.trusted),
         ])
-        TurnTraceBus.fireFromContext(kind: "mind.cares", payload: payload)
+        TurnTraceBus.fireFromContext(kind: "mind.cares", payload: payload, turn: nil)
         if let seq {
-            // Read, then write: `cares[id]?.lived = max(cares[id]?.lived …)`
-            // reads `cares` inside its own write access, which aborts at runtime.
+            // Read, then write: `cares[id]?.lived = max(cares[id]?.lived …)` reads `cares` inside its own write access, which aborts at runtime.
             for id in touched {
                 let prior = cares[id]?.lived ?? 0
                 cares[id]?.lived = max(prior, seq)
@@ -659,18 +614,16 @@ extension CognitiveSubstrate {
         return touched
     }
 
-    /// Writes these cares as they stand in RAM. A failed write leaves the care
-    /// resident but not on disk, so what dedupes by a care's story saves it
-    /// before it answers that something is already there.
+    /// Writes these cares as they stand in RAM. A failed write leaves the care resident but not on disk, so what dedupes by a care's story saves it before it
+    /// answers that something is already there.
     func saveCares(_ ids: [UUID], at now: Date) async -> Result<Void, CognitiveCareNotSaved> {
         guard !configuration.persistenceEnabled || store != nil else {
             return .failure(CognitiveCareNotSaved(detail: CognitivePersistenceError.storeUnavailable.description, ids: ids))
         }
         var failure: Error?
         do {
-            // Any care write carrying a reflection mutation carries ALL of
-            // that receipt's care effects and its done flag. Another writer
-            // cannot persist a care while losing the receipt that dedupes it.
+            // Any care write carrying a reflection mutation carries ALL of that receipt's care effects and its done flag. Another writer cannot persist a care
+            // while losing the receipt that dedupes it.
             let companions = reflectionReceipts.values.filter {
                 $0.careIntegrationPending == false && !Set($0.affectedCareIDs).isDisjoint(with: ids)
             }
@@ -680,8 +633,7 @@ extension CognitiveSubstrate {
                 return CognitiveArtifactWrite(kind: "care", id: id, status: care.fadedAt == nil ? "live" : "faded",
                     score: min(1, abs(care.charge(at: now))), payload: try Self.careJSON(care))
             }
-            // A survivor and the cares that became part of it are one durable
-            // transition, through the store's existing transaction owner.
+            // A survivor and the cares that became part of it are one durable transition, through the store's existing transaction owner.
             let receipts = companions.map { CognitiveArtifactWrite(kind: "reflection_receipt", id: $0.id,
                 status: $0.persistenceStatus, score: 0, payload: $0.toJSON()) }
             var effects = artifacts + receipts

@@ -1,28 +1,16 @@
 import Foundation
 
-// Blueprint: | `DocumentExcerpt.swift` | `DocumentExcerpt.selected`: explicit passages/no-match/unavailable selection; query-scored line windows in document order with line ranges, without prefix substitution |
+// Blueprint: | `DocumentExcerpt.swift` | `DocumentExcerpt.selected`; Bounded query-scored passages; absence stays explicit |
 
-/// Selective reading for an attachment that does not fit its per-turn
-/// allowance (third conversation pass, item 4).
-///
-/// The old behaviour was a blind prefix: "compare the termination clauses in
-/// these three contracts" got three introductions and no clauses. This scores
-/// fixed-size line windows against the turn's own words and hands over the
-/// windows that match, in document order, each labelled with its line range so
-/// the model can name what it still needs instead of asking for another upload.
-///
-/// PURE AND CHEAP. No clock, no I/O, one pass over the lines plus a bounded
-/// sort; it runs once per over-long attachment, never on a keystroke or a
-/// stream chunk. A declined selection stays explicit; it never sends a prefix.
+/// Rank bounded line windows against the request so oversized attachments retain relevant clauses with source line ranges.
+/// One pass and bounded sorting run only on oversized attachments; declined selection remains explicit and sends no guessed prefix.
 enum DocumentExcerpt {
     enum Selection {
         case passages(String)
         case noMatch
         case unavailable(String)
     }
-    /// Lines per scored window. Big enough that a clause or a paragraph lands
-    /// in one window with its context, small enough that a 40k allowance holds
-    /// several windows from different parts of a long document.
+    /// Keep clauses and nearby context together while allowing several windows within a 40k allowance.
     static let windowLines = 24
 
     /// Preserve no-match separately from a query or budget that cannot be read.
@@ -55,11 +43,7 @@ enum DocumentExcerpt {
         for window in ranked {
             let end = min(window.start + windowLines, lines.count)
             let body = lines[window.start..<end].joined(separator: "\n")
-            // Budget what is RENDERED, not just the body: the line-range label,
-            // the omission marker that can precede this window, and the newline
-            // each rendered part is joined with. A flat "+ 32" undercounted
-            // those, so an excerpt near the limit came back LONGER than its
-            // allowance and the caller's per-turn budget went negative.
+            // Charge rendered labels, omission markers and join newlines as well as body text so the caller's turn budget cannot go negative.
             let cost = body.count
                 + renderOverhead(start: window.start, end: end, total: lines.count)
             if used + cost > allowance {
@@ -71,30 +55,22 @@ enum DocumentExcerpt {
         }
         guard !chosen.isEmpty else { return .unavailable("The matching passage does not fit the remaining allowance.") }
 
-        // Clamp on the real thing. The per-window estimate cannot know which
-        // windows end up adjacent (no marker between them) or how the joins
-        // fall, so measure the rendered text and drop the weakest window until
-        // it fits. The caller subtracts what comes back from its budget, so
-        // "never longer than the allowance" has to be a fact, not an estimate.
+        // Measure the final rendering and remove weakest windows until it fits; adjacency changes marker and newline costs.
         while !chosen.isEmpty {
             let rendered = render(chosen: chosen, lines: lines)
             if rendered.count <= allowance { return .passages(rendered) }
-            chosen.removeLast()  // `chosen` is in ranked order: weakest goes first
+            chosen.removeLast()
         }
         return .unavailable("The matching passages do not fit the remaining allowance.")
     }
 
-    /// What one window costs beyond its body once rendered: its own line-range
-    /// label and, at worst, an omission marker ahead of it — each with the
-    /// newline the parts are joined with. Worst-case line numbers, so the
-    /// estimate can only over-charge.
+    /// Use worst-case line numbers and omission joins so the estimate can only overcharge rendered overhead.
     private static func renderOverhead(start: Int, end: Int, total: Int) -> Int {
         let label = "[lines \(start + 1)–\(end)]\n"
         let marker = "[… lines \(start + 1)–\(total) not shown …]\n"
         return label.count + marker.count
     }
 
-    /// The exact text the caller hands to the model for a set of windows.
     private static func render(chosen: [Int], lines: [String]) -> String {
         var out: [String] = []
         var previousEnd: Int?
@@ -113,9 +89,7 @@ enum DocumentExcerpt {
         return out.joined(separator: "\n")
     }
 
-    /// Content words of the request, lowercased. Short and ultra-common words
-    /// are dropped — they match every window and would rank the document's
-    /// first pages back to the top, which is the behaviour this replaces.
+    /// Drop short and common words so every window cannot tie and promote the document's opening by accident.
     static func terms(_ query: String) -> [String] {
         let words = query.lowercased()
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })

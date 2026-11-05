@@ -1,10 +1,8 @@
-// iOS-specific snapshot models; shared wire types live in NativeAgentShared.
 import Foundation
 import NativeAgentShared
 
 // MARK: - iOS-local models (not shared — different shape from Mac side)
 
-// Command-summary count and policy models live in NativeAgentShared.
 
 struct TrustFilePolicy: Codable, Hashable, Sendable {
     var requireBackupBeforeWrite: Bool?
@@ -38,7 +36,6 @@ struct TrustPolicy: Decodable, Hashable, Sendable {
     var requireBackups: Bool?
     var outsideDefault: String?
     var developerMode: Bool?
-    var workshopPolicy: TrustWorkshopPolicy?
     var filePolicy: TrustFilePolicy?
     var trainingPolicy: TrustTrainingPolicy?
     var updatedAt: String?
@@ -47,14 +44,12 @@ struct TrustPolicy: Decodable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case resolvedPreset, effectivePermissionLevel
         case permissionLevel, autonomyDefault, requireBackups, outsideDefault, developerMode
-        case workshopPolicy
         case filePolicy, trainingPolicy, updatedAt, macControlPolicy
     }
 
 }
 
-/// A malformed present value fails decoding. Extension placement preserves
-/// the synthesized memberwise initializer.
+/// Present malformed values must fail decoding; an extension preserves the synthesized memberwise initializer.
 extension TrustPolicy {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -65,7 +60,6 @@ extension TrustPolicy {
         requireBackups = try c.decodeIfPresent(Bool.self, forKey: .requireBackups)
         outsideDefault = try c.decodeIfPresent(String.self, forKey: .outsideDefault)
         developerMode = try c.decodeIfPresent(Bool.self, forKey: .developerMode)
-        workshopPolicy = try c.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
         filePolicy = try c.decodeIfPresent(TrustFilePolicy.self, forKey: .filePolicy)
         trainingPolicy = try c.decodeIfPresent(TrustTrainingPolicy.self, forKey: .trainingPolicy)
         updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
@@ -81,7 +75,6 @@ extension TrustPolicy {
     }
 }
 
-// ApprovalRequest moved to NativeAgentShared.
 
 
 typealias ProviderAuthStatus = NativeAgentShared.ProviderAuthStatus

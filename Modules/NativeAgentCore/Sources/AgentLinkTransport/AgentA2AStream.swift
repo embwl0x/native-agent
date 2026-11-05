@@ -3,12 +3,9 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `AgentA2AStream.swift` | `AgentA2AStream` enum; `normalize`; shared stream accumulator |
 
-/// Bounded SSE evidence folded into the same result as send/get. No replay and
-/// no completion inferred from EOF, lastChunk, or the legacy `final` field.
+/// EOF, lastChunk and `final` cannot establish completion; only explicit task evidence can.
 public enum AgentA2AStream {
-    /// Validated display snapshots: assembled artifact text, a direct message,
-    /// and status progress notes, retained together for coalesced delivery.
-    /// Never evidence; the accumulator's receipt alone decides the outcome.
+    /// Coalesced display text is not evidence; only the accumulator's receipt decides the outcome.
     public struct LiveUpdate: Sendable {
         public var text: String?
         public var note: String?
@@ -26,7 +23,7 @@ public enum AgentA2AStream {
         return accumulator.receipt
     }
 
-    /// Live publication and final evidence share identity, shape and artifact folding.
+    /// Live and final publication must share identity, validation and artifact folding.
     struct Accumulator: Sendable {
         let interface: AgentA2AWire.Interface
         let requestID: String?
@@ -42,7 +39,7 @@ public enum AgentA2AStream {
         }
 
         mutating func receive(_ event: JSONValue) throws -> LiveUpdate {
-            let legacy = interface.version == "0.3"
+            let v03 = interface.version == "0.3"
             guard case .object(var payload) = event else { throw AgentA2AWire.WireError.invalid("stream event") }
             if interface.binding == "JSONRPC" {
                 let result: JSONValue
@@ -58,7 +55,7 @@ public enum AgentA2AStream {
                 throw AgentA2AWire.WireError.invalid("event after stream outcome")
             }
             let kind: String
-            if legacy, case .string(let value)? = payload["kind"] { kind = value }
+            if v03, case .string(let value)? = payload["kind"] { kind = value }
             else {
                 let keys = ["task", "message", "statusUpdate", "artifactUpdate"].filter { payload[$0] != nil }
                 guard keys.count == 1, case .object(let content)? = payload[keys[0]] else {
@@ -73,7 +70,7 @@ public enum AgentA2AStream {
             case "message":
                 guard task == nil else { throw AgentA2AWire.WireError.invalid("mixed task and message stream") }
             case "status-update", "statusUpdate", "artifact-update", "artifactUpdate":
-                if legacy, task == nil {
+                if v03, task == nil {
                     guard case .string(let id)? = payload["taskId"], !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                           case .string(let context)? = payload["contextId"], !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         throw AgentA2AWire.WireError.invalid("stream task identity mismatch")
@@ -98,8 +95,7 @@ public enum AgentA2AStream {
                     }) {
                         if payload["append"] == .bool(true), case .object(let old) = artifacts[index],
                            case .array(var before)? = old["parts"], case .array(var after)? = artifact["parts"] {
-                            // Only the explicit append boundary joins text fragments;
-                            // distinct parts within either update keep their separators.
+                            // Only explicit append joins fragments; distinct parts keep their separators.
                             if case .object(let tail)? = before.last, case .string(let prefix)? = tail["text"],
                                case .object(let head)? = after.first, case .string(let suffix)? = head["text"] {
                                 _ = try AgentA2AWire.canonicalPart(.object(head), version: interface.version)
@@ -119,7 +115,7 @@ public enum AgentA2AStream {
             default: throw AgentA2AWire.WireError.invalid("unknown stream event")
             }
             let body = task ?? payload
-            let response: JSONValue = legacy ? .object(body) : .object([task == nil ? "message" : "task": .object(body)])
+            let response: JSONValue = v03 ? .object(body) : .object([task == nil ? "message" : "task": .object(body)])
             let wrapped: JSONValue = interface.binding == "JSONRPC"
                 ? .object(["jsonrpc": .string("2.0"), "id": .string(requestID!), "result": response]) : response
             guard try wrapped.serializedData(pretty: false).count <= AgentPeerHTTP.maximumResponseBytes else {

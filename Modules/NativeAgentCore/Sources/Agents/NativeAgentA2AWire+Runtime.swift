@@ -11,14 +11,22 @@ import ProviderRouting
 import StandingBots
 import Experiences
 import AgentWorkspace
+import Privacy
 
-// Blueprint: | `NativeAgentA2AWire+Runtime.swift` | Contact task admission, runtime dispatch and reply/event framing; restored builder turns consume their saved input and share live contact-reply settlement; an authenticated text reply to a delivered held message enters its active inline waiter before turn admission; the same contact runtime revalidates a local helper against this install's definition, without granting peer elevation |
+// Blueprint: | `NativeAgentA2AWire+Runtime.swift` | Shared admission and canonical reply framing. |
 
 public struct AgentContactA2AEndpoint: Sendable {
     public enum Response: @unchecked Sendable {
-        case json([String: Any], onSent: (@Sendable () async -> Void)? = nil)
+        case json([String: Any], onSent: (@Sendable () async -> Void)? = nil, onFailed: (@Sendable () -> Void)? = nil)
         case stream(id: Any, events: AsyncStream<AgentContactEvent>, version: String,
-                    onSent: @Sendable (AgentContactEvent) async -> Void)
+                    metadata: JSONValue, onSent: @Sendable (AgentContactEvent) async -> Void, settle: @Sendable (Bool) -> Void)
+
+        func failed() {
+            switch self {
+            case .json(_, _, let onFailed): onFailed?()
+            case .stream(_, _, _, _, _, let settle): settle(false)
+            }
+        }
     }
     let tasks: AgentContactTasks
     var port: UInt16 = 0
@@ -56,30 +64,26 @@ public struct AgentContactA2AEndpoint: Sendable {
                 let value = try await tasks.push(operation: operation, owner: principal.id, parameters: JSONValue(fromFoundation: params))
                 return .json(NativeAgentA2AWire.result(id, value.foundationObject as! [String: Any]))
             case .send(let send):
-                // Method and params, not the envelope: a client retrying the same
-                // messageId mints a new JSON-RPC id.
-                let replayBytes = try JSONSerialization.data(withJSONObject: ["method": method, "params": envelope?["params"] ?? NSNull()], options: .sortedKeys)
+                // Method and params, not the envelope: a client retrying the same messageId mints a new JSON-RPC id.
+                let replayBytes = try JSONSerialization.data(withJSONObject: ["method": method, "params": envelope?["params"] ?? NSNull()],
+                    options: .sortedKeys)
                 let task = try await tasks.send(send, principal: principal, digest: AgentPeerReplayClaimStore.digest(replayBytes))
                 if send.streaming {
-                    return .stream(id: id, events: try await tasks.subscribe(task.id, owner: principal.id), version: wireVersion,
-                                   onSent: eventAcknowledgement)
+                    return try await streamResponse(id: id, task: task.id, principal: principal, version: wireVersion)
                 }
                 let returned = send.blocking ? try await tasks.settled(task.id, owner: principal.id) : task
-                let projected = try NativeAgentA2AWire.project(returned, version: wireVersion)
-                return .json(NativeAgentA2AWire.result(id, wireVersion == "1.0" ? ["task": projected] : projected),
-                             onSent: replyAcknowledgement(returned))
+                return try await replyResponse(id: id, task: returned, principal: principal, version: wireVersion, sending: true)
             case .get(_, let task):
                 let returned = try await tasks.get(task, owner: principal.id)
-                let projected = try NativeAgentA2AWire.project(returned, version: wireVersion)
-                return .json(NativeAgentA2AWire.result(id, projected), onSent: replyAcknowledgement(returned))
+                return try await replyResponse(id: id, task: returned, principal: principal, version: wireVersion)
             case .subscribe(_, let task):
                 if wireVersion == "1.0", try await tasks.get(task, owner: principal.id).state.terminal {
                     throw AgentContactFailure(code: -32004, message: "This task has ended; retrieve it with GetTask")
                 }
-                return .stream(id: id, events: try await tasks.subscribe(task, owner: principal.id), version: wireVersion,
-                               onSent: eventAcknowledgement)
+                return try await streamResponse(id: id, task: task, principal: principal, version: wireVersion)
             case .cancel(_, let task):
-                return .json(NativeAgentA2AWire.result(id, try NativeAgentA2AWire.project(try await tasks.cancel(task, owner: principal.id), version: wireVersion)))
+                return .json(NativeAgentA2AWire.result(id, try NativeAgentA2AWire.project(try await tasks.cancel(task, owner: principal.id),
+                    version: wireVersion)))
             case .list(_, let params):
                 let listed = try await tasks.list(owner: principal.id, parameters: JSONValue(fromFoundation: params))
                 return .json(NativeAgentA2AWire.result(id, listed.foundationObject as! [String: Any]))
@@ -91,7 +95,32 @@ public struct AgentContactA2AEndpoint: Sendable {
         }
     }
 
-    /// The transport invokes this only after writing the selected reply.
+    private func heldResponse(principal: AgentBridgePrincipal) async throws -> AgentContactHeldResponse {
+        do { return try AgentContactHeldResponse(principal: principal, dataRoot: tasks.dataRoot, via: "a2a") }
+        catch {
+            throw AgentContactFailure(code: -32603, message: "Held-message drain failed: "
+                + NativeAgentSecretRedactor.redactText(error.localizedDescription) + ". No held message was taken.")
+        }
+    }
+
+    private func replyResponse(id: Any, task: AgentContactTask, principal: AgentBridgePrincipal,
+                               version: String, sending: Bool = false) async throws -> Response {
+        var projected = try NativeAgentA2AWire.project(task, version: version)
+        let held = try await heldResponse(principal: principal)
+        if case .object(let fields) = held.metadata, !fields.isEmpty { projected["metadata"] = held.metadata.foundationObject }
+        let fetched = replyAcknowledgement(task)
+        return .json(NativeAgentA2AWire.result(id, sending && version == "1.0" ? ["task": projected] : projected),
+            onSent: { held.settle(true); await fetched?() }, onFailed: { held.settle(false) })
+    }
+
+    private func streamResponse(id: Any, task: String, principal: AgentBridgePrincipal, version: String) async throws -> Response {
+        let events = try await tasks.subscribe(task, owner: principal.id)
+        let held = try await heldResponse(principal: principal)
+        return .stream(id: id, events: events, version: version, metadata: held.metadata,
+            onSent: eventAcknowledgement, settle: held.settle)
+    }
+
+    /// Settle transport delivery only after the selected reply is written.
     private func replyAcknowledgement(_ task: AgentContactTask) -> (@Sendable () async -> Void)? {
         guard !task.text.isEmpty || !task.parts.isEmpty || task.delegatedCompletions?.isEmpty == false else { return nil }
         return { await tasks.recordReplyFetch(task) }
@@ -133,7 +162,16 @@ enum AgentContactRuntime {
         let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
         let acceptedMessage = acceptedMessage ?? turn.accepted
         let session = acceptedMessage?.sessionId ?? principal.storedConversation(turn.context)
-        if acceptedMessage == nil, turn.parts.allSatisfy({ if case .text = $0 { true } else { false } }),
+        // A job's turn is told what it is and where its files are; saving them again after a restart writes the same bytes.
+        let jobLines: String
+        if let job = turn.job {
+            // A contact that is gone gets no folder.
+            _ = try revalidated(principal, dataRoot: dataRoot)
+            let inputs = try AgentContactJob.stage(turn.parts, taskID: turn.taskID, dataRoot: dataRoot)
+            jobLines = AgentBridgeSurface.jobLines(folder: AgentContactJob.folder(taskID: turn.taskID, dataRoot: dataRoot), inputs: inputs, done: job.done)
+        } else { jobLines = "" }
+        // A job is new work, never the answer to a send of the agent's that is waiting on this contact.
+        if acceptedMessage == nil, turn.job == nil, turn.parts.allSatisfy({ if case .text = $0 { true } else { false } }),
            let peerID = try revalidated(principal, dataRoot: dataRoot).peerID {
             let from = "peer:" + peerID
             let offered = await settle {
@@ -147,34 +185,33 @@ enum AgentContactRuntime {
                     parts: [.text("Your reply was returned to the waiting conversation.")])
             }
         }
-        // The run is minted here and the request pins it, so the enqueued row is that same run.
+        // Pin the minted run before enqueue so the canonical row keeps the same identity.
         let runID = acceptedMessage?.runId ?? UUID().uuidString
         let enqueued: EnqueuedUserMessage
         if let acceptedMessage { enqueued = acceptedMessage } else {
-            // Durable, and the task bound to it, before it waits its turn: a
-            // restart while it queues behind another turn in the contact's one
-            // session resumes it from this row (`AgentContactTasks.get`).
+            // Persist the task binding before session admission waits so restart can resume queued input from its row.
             var request = try revalidated(principal, dataRoot: dataRoot).turnRequest(context: turn.context, plain: plain,
-                attachments: attachments, messageID: turn.requestID)
+                attachments: attachments, messageID: turn.requestID, jobLines: jobLines)
             request.pinnedRunID = .some(runID)
             enqueued = try await request.enqueue(on: client)
             try await turn.bindRun(session, enqueued.runId)
         }
-        // One turn at a time in this conversation: a second message waits for
-        // the first reply to finish instead of interleaving with it. Admission
-        // registers the run for Stop before it waits.
-        return try await TurnAdmission.admittedRun(dataRoot: dataRoot, sessionID: session, runID: runID, waitForCapacity: true) {
+        // One turn at a time in this conversation: a second message waits for the first reply to finish instead of interleaving with it. Admission registers
+        // the run for Stop before it waits.
+        let arriving = principal.turnRequest(context: turn.context, plain: plain, attachments: attachments,
+            messageID: turn.requestID, jobLines: jobLines).consuming(enqueued)
+        let admitted = try await TurnAdmission.admittedRun(turn: arriving.turn(), arrival: arriving.arrival(.saved), dataRoot: dataRoot,
+            waitForCapacity: true) { held in
             try Task.checkCancellation()
-            // A message accepted elsewhere (Dot's room, one a restart left queued) binds when admitted.
+            // Bind externally accepted messages only at admission.
             if acceptedMessage != nil { try await turn.bindRun(session, enqueued.runId) }
             // The wait suspends too; bind only current authority.
             let current = try revalidated(principal, dataRoot: dataRoot)
             var request = current.turnRequest(context: turn.context, plain: plain,
-                attachments: attachments, messageID: turn.requestID, originID: turn.bridgeInput?.originID)
+                attachments: attachments, messageID: turn.requestID, originID: turn.bridgeInput?.originID, jobLines: jobLines)
             if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
             if let binding = turn.bridgeInput {
-                // The canonical queued row already carries its complete framed
-                // input. Preserve its selected session/persona without framing twice.
+                // The canonical queued row already carries its complete framed input. Preserve its selected session/persona without framing twice.
                 request.message = plain
                 request.sessionID = session
                 request.verifiedSessionID = .some(session)
@@ -184,8 +221,7 @@ enum AgentContactRuntime {
                     throw AgentContactFailure(code: -32603, message: "Builder reply settlement is unavailable; no turn ran.")
                 }
                 let owner = try AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + current.id)
-                // These are the two live turnRequest shapes: authenticated
-                // contacts have contact lines; anonymous senders have only the header.
+                // Both authenticated contact framing and anonymous header-only input remain live shapes.
                 let replyText: String
                 if current.peerID != nil {
                     guard let words = AgentBridgeSurface.message(inTurn: plain) else {
@@ -201,12 +237,14 @@ enum AgentContactRuntime {
                 }
                 request.queryUserMessage = .some(replyText)
                 await emit(.working)
-                let reply = try await request.consuming(enqueued).chat(on: client)
+                let acceptedRequest = request.consuming(enqueued)
+                let heldTurn = acceptedRequest.turn(id: held.id, parent: held)
+                let reply = try await acceptedRequest.chat(on: client, holding: heldTurn)
                 await MainActor.run {
                     NotificationCenter.default.post(name: .chatTurnCompleted, object: session)
                 }
                 do {
-                    try await ClaudeBridgeMessageRuntime.settleContactReply(reply, request: request,
+                    try await ClaudeBridgeMessageRuntime.settleContactReply(turn: heldTurn, reply, request: request,
                         principal: current, owner: owner, replyID: binding.originID, replyText: replyText,
                         session: session, client: client, sender: completionSender)
                     return ClaudeBridgeMessageRuntime.bridgeOutcome(reply, taskID: turn.taskID, result: [:])
@@ -221,11 +259,14 @@ enum AgentContactRuntime {
                 }
             }
             let text = request.message
-            return try await request.consuming(enqueued).bind {
+            let acceptedRequest = request.consuming(enqueued)
+            let heldTurn = acceptedRequest.turn(id: held.id, parent: held)
+            do {
                 try Task.checkCancellation()
                 await emit(.working)
                 let execution = client.chatStreamExecution(message: text, sessionId: session, model: "", reasoningEffort: "",
-                    fileAccess: request.fileAccess, attachments: attachments, persona: request.persona, surface: current.surface, suppressUserAppend: true)
+                    fileAccess: request.fileAccess, attachments: attachments, persona: request.persona, surface: current.surface,
+                    suppressUserAppend: true, turn: heldTurn)
                 let outcome = try await withTaskCancellationHandler {
                     var final: TurnEngineResult?
                     var waiting = false
@@ -250,7 +291,7 @@ enum AgentContactRuntime {
                                 }
                             case .final(let result): final = result
                             case .error(let message): failure = message
-                            case .notice, .toolUse, .replyTextSettled: break
+                            case .notice, .toolUse, .replyTextSettled, .writing: break
                             }
                         }
                     } catch {
@@ -260,15 +301,21 @@ enum AgentContactRuntime {
                         throw ProviderFailure.report(error, work: ranPartly ? .ranPartly : nil) ?? error
                     }
                     await execution.waitForProducerTermination()
+                    if let final, failure == nil, final.reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       try SwiftNativeChatOrchestrationClient.silentTurn(
+                        dataRoot: dataRoot, sessionId: session, runId: runID, turnId: heldTurn.id) != nil {
+                        return AgentContactOutcome(state: .completed, parts: [],
+                            toolResult: .object(["status": .string("completed"), "silence": .string(heldTurn.id)]))
+                    }
                     try Task.checkCancellation()
                     guard let final, failure == nil else {
                         return AgentContactOutcome(state: waiting ? .inputRequired : .failed,
-                            parts: try final.map { try outputParts($0, taskID: turn.taskID, dataRoot: dataRoot) } ?? [],
-                            detail: waiting ? "Waiting for the person" : (failure ?? "The reply ended without a finished result") + ". Work: " + (ranPartly ? "ran partly." : "outcome unknown."))
+                            parts: try final.map { try outputParts($0, taskID: turn.taskID, dataRoot: dataRoot, job: turn.job) } ?? [],
+                            detail: waiting ? "Waiting for the person" : (failure ?? "The reply ended without a finished result") + ". Work: " + (
+                                ranPartly ? "ran partly." : "outcome unknown."))
                     }
-                    let parts = try outputParts(final, taskID: turn.taskID, dataRoot: dataRoot)
-                    // Only .incomplete is an unfinished turn; an owner that cannot
-                    // say (nil) is read as finished, as the chat's own owner reads it.
+                    let parts = try outputParts(final, taskID: turn.taskID, dataRoot: dataRoot, job: turn.job)
+                    // Only an explicit incomplete outcome retains unfinished-turn state, matching the chat owner.
                     let state: AgentContactTaskState = waiting ? .inputRequired : (final.completionState == .incomplete ? .failed : .completed)
                     return AgentContactOutcome(state: state, parts: parts,
                         detail: state == .failed ? "The work did not finish" : nil)
@@ -276,31 +323,39 @@ enum AgentContactRuntime {
                 await MainActor.run {
                     NotificationCenter.default.post(name: .chatTurnCompleted, object: session)
                 }
-                // A started memory promotion finishes on its own; the reply
-                // and the session's next turn never wait for it.
+                // A started memory promotion finishes on its own; the reply and the session's next turn never wait for it.
                 return outcome
             }
         }
+        switch admitted {
+        case .ran(let outcome): return outcome
+        case .steered(let steered): return ClaudeBridgeMessageRuntime.steeredOutcome(steered)
+        }
     }
 
-    static func outputParts(_ result: TurnEngineResult, taskID: String, dataRoot: URL) throws -> [AgentContactPart] {
+    static func outputParts(_ result: TurnEngineResult, taskID: String, dataRoot: URL, job: AgentContactJob? = nil) throws -> [AgentContactPart] {
         var parts: [AgentContactPart] = result.reply.isEmpty ? [] : [.text(result.reply)]
         if let bytes = result.reply.data(using: .utf8), bytes.count <= 64000,
            let value = try? JSONDecoder().decode(JSONValue.self, from: bytes), case .object = value {
             parts.append(.data(value, metadata: .object(["source": .string("agent"), "taskId": .string(taskID)])))
         }
         // A file too big to send drops out, not the finished reply with it.
-        let omitted = "[Files produced by this reply were too large to send and were left out.]"
+        let omitted = "[Files produced by this reply that were too large or unreadable were left out.]"
         var dropped = false
-        for attachment in ChatGeneratedImageArtifacts.attachments(from: result.toolDispatches, dataRoot: dataRoot) {
-            if let part = try? AgentContactPart.output(attachment, taskID: taskID) { parts.append(part) } else { dropped = true }
-        }
-        // A successful write receipt proves the produced bytes. Do not scan
-        // reply prose for paths or read an arbitrary path from a tool result.
-        // app files.write is write_file, with its args as the input.
-        for file in ChatWrittenFileArtifacts.files(from: result.toolDispatches, maximumBytes: AgentContactPart.maximumFileBytes) {
-            parts.append(.file(name: file.name, mediaType: file.mime, bytes: file.bytes,
-                               metadata: .object(["source": .string("agent"), "taskId": .string(taskID)])))
+        if job != nil {
+            // A job's artifacts are the files in its folder, whichever tool made them.
+            let made = try AgentContactJob.fileParts(taskID: taskID, dataRoot: dataRoot)
+            parts += made.parts
+            dropped = made.unsent > 0
+        } else {
+            for attachment in ChatGeneratedImageArtifacts.attachments(from: result.toolDispatches, dataRoot: dataRoot) {
+                if let part = try? AgentContactPart.output(attachment, taskID: taskID) { parts.append(part) } else { dropped = true }
+            }
+            // Use successful write receipts as produced-file evidence; never infer paths from prose or arbitrary tool results.
+            for file in ChatWrittenFileArtifacts.files(from: result.toolDispatches, maximumBytes: AgentContactPart.maximumFileBytes) {
+                parts.append(.file(name: file.name, mediaType: file.mime, bytes: file.bytes,
+                                   metadata: .object(["source": .string("agent"), "taskId": .string(taskID)])))
+            }
         }
         let size = try JSONSerialization.data(withJSONObject: parts.map(\.wire03)).count
         guard size <= AgentContactPart.maximumOutputBytes else {
@@ -311,31 +366,63 @@ enum AgentContactRuntime {
 }
 
 public enum AgentContactSSE {
-    static func frame(_ event: AgentContactEvent, id: Any, version: String = "0.3", rest: Bool = false) throws -> Data {
+    static func envelope(_ event: AgentContactEvent, id: Any, version: String, metadata: JSONValue) throws -> [String: Any] {
         var envelope = NativeAgentA2AWire.event(event, id: id, version: version)
         guard envelope["error"] == nil else {
             throw AgentContactFailure(code: -32603, message: "The task update could not be encoded; no reply was acknowledged")
         }
+        guard var result = envelope["result"] as? [String: Any] else {
+            throw AgentContactFailure(code: -32603, message: "The task update has no result; held messages remain undelivered")
+        }
+        if case .object(let fields) = metadata, !fields.isEmpty {
+            if version == "1.0" {
+                let key: String
+                switch event {
+                case .snapshot: key = "task"
+                case .status: key = "statusUpdate"
+                case .artifact: key = "artifactUpdate"
+                }
+                guard var payload = result[key] as? [String: Any] else {
+                    throw AgentContactFailure(code: -32603, message: "The task update has no payload; held messages remain undelivered")
+                }
+                payload["metadata"] = metadata.foundationObject
+                result[key] = payload
+            } else { result["metadata"] = metadata.foundationObject }
+        }
+        envelope["result"] = result
+        return envelope
+    }
+
+    static func frame(_ event: AgentContactEvent, id: Any, version: String = "0.3", rest: Bool = false,
+                      metadata: JSONValue = .object([:])) throws -> Data {
+        var envelope = try Self.envelope(event, id: id, version: version, metadata: metadata)
         if version == "0.3", let result = envelope["result"] as? [String: Any] {
             envelope["result"] = try NativeAgentA2AWire.project(result, version: version)
         }
-        let json = try JSONSerialization.data(withJSONObject: rest ? (envelope["result"] ?? envelope) : envelope, options: [.sortedKeys])
+        guard let result = envelope["result"] as? [String: Any] else {
+            throw AgentContactFailure(code: -32603, message: "The stream frame has no result; no reply was acknowledged")
+        }
+        let json = try JSONSerialization.data(withJSONObject: rest ? result : envelope, options: [.sortedKeys])
         var frame = Data("data: ".utf8); frame.append(json); frame.append(Data("\n\n".utf8))
         return frame
     }
 
     public static func write(_ connection: NWConnection, id: Any, events: AsyncStream<AgentContactEvent>, version: String = "0.3", rest: Bool = false,
-                             onSent: @escaping @Sendable (AgentContactEvent) async -> Void) {
-        // IDs are immutable strings or integers validated by the wire parser.
-        // Carry a value type into the writer task, not Foundation's Any graph.
+                             metadata: JSONValue, onSent: @escaping @Sendable (AgentContactEvent) async -> Void,
+                             settle: @escaping @Sendable (Bool) -> Void) {
+        // IDs are immutable strings or integers validated by the wire parser. Carry a value type into the writer task, not Foundation's Any graph.
         let rpcID: JSONValue = (id as? String).map(JSONValue.string) ?? .int((id as? NSNumber)?.int64Value ?? 0)
         let worker = Task {
-            defer { connection.cancel() }
+            var written = false
+            defer { if !written { settle(false) }; connection.cancel() }
             do {
-                try await send(Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".utf8), on: connection)
+                try await send(Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".utf8),
+                    on: connection)
                 for await event in events {
                     try Task.checkCancellation()
-                    try await send(frame(event, id: rpcID.foundationObject, version: version, rest: rest), on: connection)
+                    try await send(frame(event, id: rpcID.foundationObject, version: version, rest: rest,
+                        metadata: written ? .object([:]) : metadata), on: connection)
+                    if !written { written = true; settle(true) }
                     await onSent(event)
                     if version == "1.0" {
                         switch event {
@@ -347,9 +434,8 @@ public enum AgentContactSSE {
                 }
             } catch { /* Only this subscriber ended. Task truth is unchanged. */ }
         }
-        // Preserve the listener's state handler and connection bookkeeping.
-        // Receive EOF is a half-close, so only a failed or closed connection
-        // cancels this subscriber before its final event has been sent.
+        // Preserve the listener's state handler and connection bookkeeping. Receive EOF is a half-close, so only a failed or closed connection cancels this
+        // subscriber before its final event has been sent.
         let previous = connection.stateUpdateHandler
         connection.stateUpdateHandler = { state in
             previous?(state)
@@ -365,8 +451,7 @@ public enum AgentContactSSE {
     }
 
     static func send(_ data: Data, on connection: NWConnection) async throws {
-        // finish is idempotent: cancellation and Network completion claim the
-        // same send, including cancellation before the operation starts.
+        // finish is idempotent: cancellation and Network completion claim the same send, including cancellation before the operation starts.
         let completion = AsyncThrowingStream<Void, Error>.makeStream()
         try await withTaskCancellationHandler {
             try Task.checkCancellation()

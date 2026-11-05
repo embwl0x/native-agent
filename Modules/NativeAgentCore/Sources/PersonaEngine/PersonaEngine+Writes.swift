@@ -4,23 +4,17 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Experiences
-// Blueprint: | `PersonaEngine+Writes.swift` | `SwiftNativePersonaEngine`: shared name validation and sole profile commit owner; fixed document specs; checked existing mutations with private backups; compilation's named missing-only required-document genesis uses shared onboarding templates under completion/document locks |
+// Blueprint: | `PersonaEngine+Writes.swift` | `SwiftNativePersonaEngine`. |
 
 // MARK: - Persona writes
-//
-// Caller authorization still applies to profile and document mutations.
-// Mutations hold the target's shared cross-process file lock. USER.md remains
-// a MemoryV2 UserMDGenerator projection; only checked missing-document genesis
-// can scaffold it here, never ordinary edits.
-// Storage: persona Markdown/recovery copies and memory/profile.json are in local
-// and off-disk backups and the data export. Phone sync projects only the profile;
-// PrivacyMap lists persona documents under persona, profile.json under memory.
+// Keep caller authorization and the shared target lock around mutations; MemoryV2 alone owns ordinary USER edits.
+// Checked missing-document genesis may scaffold USER without replacing existing projection.
+// Backups and export include persona/recovery files and profile; phone sync projects profile only.
+// PrivacyMap owns persona documents under persona and profile under memory.
 
 public enum PersonaWriteError: Error, LocalizedError, Equatable {
     case unknownDocument(String)
-    /// IO failure during the atomic write / read-back.
     case ioFailure(String)
-    /// Invalid persona kind, missing title or unresolvable persona path.
     case invalidInput(String)
 
     public var errorDescription: String? {
@@ -34,8 +28,8 @@ public enum PersonaWriteError: Error, LocalizedError, Equatable {
 
 extension SwiftNativePersonaEngine {
 
-    // Fixed document ids and order are part of the listing contract.
-    static let personalityDocSpecsFixed: [(id: String, title: String, filename: String)] = [
+    // Keep document IDs and ordering stable for listing readers.
+    package static let personalityDocSpecsFixed: [(id: String, title: String, filename: String)] = [
         ("SOUL",   "Soul",             "SOUL.md"),
         ("VOICE",  "Voice",            "VOICE.md"),
         ("GROWTH", "Growth",           "GROWTH.md"),
@@ -43,13 +37,12 @@ extension SwiftNativePersonaEngine {
         ("AGENTS", "Operating Manual", "AGENTS.md"),
     ]
 
-    /// The single operating-manual seed, shared by onboarding and missing-only genesis.
+    /// Share the operating-manual seed between onboarding and checked missing-only genesis.
     package static func operatingManualGenesis(name: String) -> String {
         "# \(name) Operating Manual\n"
     }
 
-    /// Inspect the entry itself, including dangling links. A read failure is
-    /// never absence and must not authorize replacement or inherited content.
+    /// Inspect dangling links as entries; read failure cannot authorize replacement or inherited content.
     static func personaDocumentIsMissing(at path: URL) throws -> Bool {
         do {
             _ = try FileManager.default.attributesOfItem(atPath: path.path)
@@ -57,12 +50,12 @@ extension SwiftNativePersonaEngine {
         } catch let error as CocoaError where error.isFileAbsent {
             return true
         } catch {
-            throw PersonaEngineError.rootUnreadable(reason: "cannot inspect \(path.path): \(error.localizedDescription). Restore access to this document; it has not been replaced.")
+            throw PersonaEngineError.rootUnreadable(
+                reason: "cannot inspect \(path.path): \(error.localizedDescription). Restore access to this document; it has not been replaced.")
         }
     }
 
-    /// The compile owner requests genesis by document id before reading it.
-    /// Recheck absence, completion and identity while holding both locks.
+    /// Recheck absence, completion and identity under both locks before genesis.
     @discardableResult
     public func createMissingRequiredDocument(id: String) async throws -> Bool {
         guard let spec = Self.personalityDocSpecsFixed.first(where: { $0.id == id }) else {
@@ -80,7 +73,8 @@ extension SwiftNativePersonaEngine {
                 let userName: String?
                 if id == "USER", let saved = profile.extras["userName"], saved != .null {
                     guard let text = saved.stringValue else {
-                        throw PersonaWriteError.invalidInput("USER.md genesis cannot read memory/profile.json.userName as text. Repair that field before creating the document.")
+                        throw PersonaWriteError.invalidInput(
+                            "USER.md genesis cannot read memory/profile.json.userName as text. Repair that field before creating the document.")
                     }
                     userName = text
                 } else { userName = nil }
@@ -102,7 +96,11 @@ extension SwiftNativePersonaEngine {
                         throw PersonaWriteError.ioFailure("created document does not match its committed seed")
                     }
                 } catch {
-                    throw PersonaWriteError.ioFailure("\(spec.filename) was created at \(path.path), but verification failed: \(error.localizedDescription). Preserve and inspect the saved bytes before another repair.")
+                    throw PersonaWriteError.ioFailure(
+                        """
+                            \(spec.filename) was created at \(path.path), but verification failed: \(error.localizedDescription). Preserve and inspect the \
+                            saved bytes before another repair.
+                            """)
                 }
                 return true
             }
@@ -111,13 +109,13 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - Profile writes
 
-    /// Validate a submitted name through the shared identity rule, then validate the saved base,
-    /// merge partial fields (traits replace wholesale), stamp and persist under the profile lock.
-    /// Unspecified fields and unknown keys survive; JSON uses two-space indentation and keys sorted by UTF-8 byte order.
+    /// Validate submitted identity and saved base before locked merge; preserve unspecified and unknown fields.
+    /// Replace traits as a whole and serialize with stable UTF-8 key ordering.
     public func savePersonality(body: [String: JSONValue]) async throws -> CompiledPersonalityProfile {
         let editable: Set<String> = ["name", "personaKind", "traits"]
         guard Set(body.keys).isSubset(of: editable) else {
-            throw PersonaWriteError.invalidInput("Profile updates accept name, personaKind and traits only. Edit instructions through the canonical personality documents.")
+            throw PersonaWriteError.invalidInput(
+                "Profile updates accept name, personaKind and traits only. Edit instructions through the canonical personality documents.")
         }
         if let supplied = body["name"] {
             guard case .string(let name) = supplied else {
@@ -132,7 +130,7 @@ extension SwiftNativePersonaEngine {
             .appendingPathComponent("profile.json")
 
         return try await SwiftNativePersistenceCore.withFileLock(profileURL) {
-            // Read raw under the lock so we merge over the latest on-disk state.
+            // Read the latest saved state under the lock before merging.
             let existingRaw: [String: Any]
             do {
                 let data = try Data(contentsOf: profileURL)
@@ -166,9 +164,8 @@ extension SwiftNativePersonaEngine {
         }
     }
 
-    // Profile schema preparation and commits stay here; onboarding owns intent.
-    // profile.json is backed up/exported and listed under memory in PrivacyMap;
-    // the phone receives a compiled profile projection.
+    // Keep schema and persistence here while onboarding owns creation intent.
+    // Back up/export profile and expose it under PrivacyMap/memory; phone receives only its compiled projection.
     package static func onboardingProfileUpdate(
         profilePath: URL,
         agentName: String,
@@ -205,14 +202,14 @@ extension SwiftNativePersonaEngine {
         if baseSHA256 == nil { current = .genesis(name: agentName, personaKind: newKind) }
         else { current = try PersonaCompiler.decodeProfile(raw: raw) }
 
-        // Apply onboarding values to the checked profile, then validate before publication.
+        // Validate checked onboarding state before publication.
         var merged = SwiftNativePersonaEngine.profileToRawDict(current)
         merged["name"] = agentName
         merged["personaKind"] = newKind
         merged["updatedAt"] = NativeTimestampFormat.fractionalZulu(Date())
         let renormalized = try PersonaCompiler.decodeProfile(raw: merged)
         var finalDict = SwiftNativePersonaEngine.profileToRawDict(renormalized)
-        // Add the trimmed user's name after validation; an empty name is omitted.
+        // Add only a validated nonempty trimmed user name.
         let trimmedUserName = userName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedUserName.isEmpty {
             finalDict["userName"] = trimmedUserName
@@ -226,9 +223,9 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - Document writes
 
-    /// Edits require a checked existing document; onboarding/compile genesis initializes it. USER.md is MemoryV2-owned.
-    /// Replacement caps at 30,000 Unicode scalars; append reads under the document lock and refuses overflow.
-    /// Back up to `<file>.bak` and write durably under that lock; return saved content with the file's mtime.
+    /// Require checked existing documents for edits and keep USER under MemoryV2.
+    /// Hold the document lock across prior read, bounded mutation, backup and durable write.
+    /// Return saved content and its modification time.
     public func savePersonalityDoc(id: String, content: String, appending: Bool = false) async throws -> PersonaDocSpec {
         let docId = id.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
 
@@ -243,26 +240,25 @@ extension SwiftNativePersonaEngine {
         let activityPath = activityEventsPath
         let activityDataRoot = dataRootURL
 
-        // Lock order: document, then activity feed. Bookkeeping cannot undo a committed edit.
+        // Acquire document before activity lock; later bookkeeping cannot undo a committed edit.
         let result: PersonaDocSpec = try await SwiftNativePersistenceCore.withFileLock(path) { [self] in
-            // Setup contributes only its section, never a carried-forward SOUL.
-            // Both replacement and append require the real prior document.
+            // Setup supplies only its section; both replacement and append require actual prior content.
             let existing = try Self.readPersonaDocumentForMutation(at: path)
             let nextContent = appending ? existing.text + content : content
             guard !appending || nextContent.unicodeScalars.count <= 30_000 else {
-                throw PersonaWriteError.invalidInput("The combined document exceeds 30,000 code points. Nothing was appended; shorten the draft or edit the document explicitly.")
+                throw PersonaWriteError.invalidInput(
+                    "The combined document exceeds 30,000 code points. Nothing was appended; shorten the draft or edit the document explicitly.")
             }
-            // Preserve the editor's 30000-code-point cap on the combined document.
+            // Enforce the editor's 30,000-scalar bound on the combined document.
             let cappedContent = Self.capByCodePoints(nextContent, cap: 30000)
-            // One pre-edit copy per doc (`SOUL.md.bak`), replaced each save, so
-            // the last version before any edit is always one file away.
+            // Replace one pre-edit recovery copy per document so the immediately prior version remains reachable.
             try SwiftNativePersistenceCore.writeDataAtomicDurable(
                 existing.data,
                 to: path.appendingPathExtension("bak")
             )
             try Self.atomicWriteText(cappedContent, to: path)
 
-            // Invalidate the committed bytes even if subsequent metadata reads fail.
+            // Invalidate committed bytes even if later metadata reads fail.
             await self.publishDerivedPersonaChange(path, reason: "persona_document_saved")
 
             let reread: String
@@ -274,7 +270,11 @@ extension SwiftNativePersonaEngine {
                 }
                 mtime = date
             } catch {
-                throw PersonaWriteError.ioFailure("\(docId).md was saved, but its readback is unavailable. Read the saved document before repeating an edit; repair access to \(path.path). \(error.localizedDescription)")
+                throw PersonaWriteError.ioFailure(
+                    """
+                        \(docId).md was saved, but its readback is unavailable. Read the saved document before repeating an edit; repair access to \
+                        \(path.path). \(error.localizedDescription)
+                        """)
             }
             let spec = PersonaDocSpec(
                 id: spec.id,
@@ -284,7 +284,7 @@ extension SwiftNativePersonaEngine {
                 content: reread,
                 updatedAt: NativeTimestampFormat.fractionalZulu(mtime)
             )
-            // Activity is a separate owed effect; never invite a second append for its failure.
+            // Activity remains separately owed; its failure cannot invite duplicate document append.
             do {
                 try await self.recordPersonaDocActivity(docId: docId)
                 RepairOwed.settle(activityDataRoot, operation: "persona.document_activity",
@@ -303,17 +303,14 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - Document-save activity
 
-    /// The document-save activity feed under this engine's data root.
     var activityEventsPath: URL {
         SwiftNativePersistenceCore.activityEventsPath(dataRoot: dataRootURL)
     }
 
-    /// Save events contain only a fixed document id, constant text and an empty payload.
-    /// Credential-bearing content requires redaction before it can be added here.
-    // activity/events.jsonl: local backup/data export/phone sync exclude it;
-    // off-disk backup and support bundles include it. PrivacyMap: activity.
+    /// Keep save activity payload-free; credential-bearing content requires redaction before inclusion.
+    // Exclude activity from local backup, export and phone sync; include off-disk backup and support bundles under PrivacyMap/activity.
     func recordPersonaDocActivity(docId: String) async throws {
-        // Stamp after the document write, while its lock is still held.
+        // Stamp after the document write while holding its lock.
         let event = SwiftNativePersistenceCore.activityEvent(
             id: UUID().uuidString.lowercased(),
             kind: "memory",
@@ -331,13 +328,12 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - helpers (write-side)
 
-    /// Use the same typed fields for projection and persistence, preserving
-    /// Foundation's NSNumber leaves and unknown profile keys.
+    /// Share typed projection and persistence fields while preserving Foundation leaves and unknown keys.
     package static func profileToRawDict(_ p: CompiledPersonalityProfile) -> [String: Any] {
         profileFields(p).mapValues { $0.foundationObject }
     }
 
-    /// Persist identity and live traits; opaque saved keys survive without becoming instruction fields.
+    /// Keep opaque saved keys without promoting them to instruction fields.
     static func profileFields(_ p: CompiledPersonalityProfile) -> [String: JSONValue] {
         let traits: JSONValue = .object([
             "warmth": .double(p.traits.warmth),
@@ -357,21 +353,21 @@ extension SwiftNativePersonaEngine {
             "traits": traits,
             "updatedAt": .string(p.updatedAt),
         ]
-        // Unknown keys round-trip without replacing typed fields; serialization sorts them with the rest.
+        // Round-trip unknown keys without replacing typed fields; include them in stable serialization ordering.
         for (key, value) in p.extras where obj[key] == nil {
             obj[key] = value
         }
         return obj
     }
 
-    /// Cap by Unicode scalars rather than grapheme clusters.
+    /// Bound Unicode scalars rather than grapheme clusters.
     static func capByCodePoints(_ s: String, cap: Int) -> String {
         let scalars = s.unicodeScalars
         if scalars.count <= cap { return s }
         return String(String.UnicodeScalarView(scalars.prefix(cap)))
     }
 
-    /// Durable write: 0600 temp, fsync, rename and parent-directory fsync.
+    /// Flush a private temporary file before rename, then fsync its parent so durable acknowledgement includes directory publication.
     package static func atomicWriteText(_ content: String, to path: URL) throws {
         do {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(content.utf8), to: path)
@@ -384,7 +380,7 @@ extension SwiftNativePersonaEngine {
 // MARK: - The shared (Mac and phone) profile shape
 
 extension SwiftNativePersonaEngine {
-    /// The Personality tab's full-profile save uses the same Foundation leaf types as JSON decoding.
+    /// Use JSON decoding's Foundation leaf types for full-profile save.
     public func savePersonality(_ profile: PersonalityProfile) async throws -> CompiledPersonalityProfile {
         let body: [String: Any] = [
             "name": profile.name,
@@ -405,8 +401,7 @@ extension SwiftNativePersonaEngine {
 }
 
 extension CompiledPersonalityProfile {
-    /// Field-for-field the profile the Personality tab and the phone read,
-    /// on load and on save alike.
+    /// Share one profile shape across Mac/phone loading and saving.
     public var sharedProfile: PersonalityProfile {
         PersonalityProfile(
             schemaVersion: schemaVersion,

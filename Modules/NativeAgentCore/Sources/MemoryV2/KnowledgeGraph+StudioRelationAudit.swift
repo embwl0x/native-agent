@@ -1,7 +1,4 @@
-// On the backfill trigger, check every journal relation against a graph edge citing its entry.
-// Report mismatches without repairing the graph or blocking recall.
-// Canon recurrence counts later journal entries corroborated by graph edges.
-// Both operations are read-only against the graph.
+// Audit journal citations without repairing the graph or blocking recall; canon recurrence requires later entries corroborated by graph edges.
 
 import Foundation
 import GRDB
@@ -9,13 +6,10 @@ import PersistenceCore
 import Studio
 // Blueprint: | `KnowledgeGraph+StudioRelationAudit.swift` | Checked Studio relation audit and reconciliation evidence |
 
-/// One relation the journal asserts that the graph does not carry back.
 public struct StudioRelationMismatch: Sendable, Equatable {
     public enum Reason: String, Sendable, Equatable {
-        /// No edge of that type exists between the two works at all.
         case edgeMissing = "edge_missing"
-        /// The edge exists but does not cite this entry as a source, so the
-        /// claim's provenance points somewhere else.
+        /// The edge exists but does not cite this entry as a source, so the claim's provenance points somewhere else.
         case entryNotCited = "entry_not_cited"
     }
 
@@ -48,16 +42,12 @@ public struct StudioRelationMismatch: Sendable, Equatable {
 }
 
 public struct StudioRelationAuditReport: Sendable, Equatable {
-    /// False when there is no `memory.sqlite` yet. A graph that has not been
-    /// born cannot be inconsistent with anything.
+    /// Absent memory storage has no graph to audit.
     public var graphAvailable: Bool
     public var relationsChecked: Int
-    /// A later entry about the SAME work, deepening an earlier one. The
-    /// derivation deliberately writes no self-loop for these, so they are
-    /// counted and excused rather than reported as missing.
+    /// Same-work deepening retains journal provenance without a graph self-loop; count it without reporting a missing edge.
     public var selfRelations: Int
-    /// Relations naming an entry the journal does not contain. A fact about the
-    /// journal, not a graph defect — reported separately so the two never blur.
+    /// Relations naming an entry the journal does not contain. A fact about the journal, not a graph defect — reported separately so the two never blur.
     public var unresolvedRelations: Int
     public var mismatches: [StudioRelationMismatch]
 
@@ -66,8 +56,7 @@ public struct StudioRelationAuditReport: Sendable, Equatable {
         unresolvedRelations: 0, mismatches: []
     )
 
-    /// Bound on how many mismatches one report carries. The count stays exact;
-    /// the list is evidence, not a log.
+    /// Bound on how many mismatches one report carries. The count stays exact; the list is evidence, not a log.
     public static let maximumReportedMismatches = 20
 
     public var isConsistent: Bool { mismatches.isEmpty }
@@ -100,13 +89,8 @@ public struct StudioRelationAuditReport: Sendable, Equatable {
 
 extension SwiftNativeKnowledgeGraphIndexer {
 
-    /// Every studio edge the graph holds, as
-    /// `(fromNodeKey, toNodeKey, type) → citing journal entry ids`.
-    ///
-    /// Endpoints use title + creator from `created_by`, including rows with title-only `studio_node_key` stamps.
-    ///
-    /// Restricted to `provenance = studio-journal`, so a same-named memory edge
-    /// can never be mistaken for one of her claims.
+    /// Match studio edges by title and creator, including title-only node stamps. Require `studio-journal` provenance so same-named memory edges cannot stand
+    /// in as evidence.
     func studioEdgeCitations() async throws -> [StudioEdgeKey: Set<String>]? {
         let dbPool: DatabasePool
         do {
@@ -154,7 +138,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// A graph row, keyed the way the writer keys the node it came from.
     static func studioEndpointKey(name: String, type: String, creator: String?) -> String {
         let cleanName = studioClean(name)
         let cleanType = studioClean(type).lowercased()
@@ -165,8 +148,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return studioWorkNodeKey(title: cleanName, creator: studioClean(creator ?? ""))
     }
 
-    /// THE GUARD. Every relation on every entry must be carried by an edge that
-    /// cites that entry. Reports; never repairs; never blocks anything.
+    /// Require an edge citing each asserted relation's entry; report gaps without repairs or blocking.
     public func auditStudioRelations(
         _ entries: [StudioJournalEntry]
     ) async throws -> StudioRelationAuditReport {
@@ -224,17 +206,14 @@ extension SwiftNativeKnowledgeGraphIndexer {
         )
     }
 
-    /// Canon evidence counts strictly later journal entries cited by `studio-journal` edges.
-    /// Work identity is title + creator from the target entry.
-    /// `recallCounts` comes from the studio store's bounded production-pull counter, not the graph.
+    /// Count only strictly later journal entries corroborated by studio edges. Match work by title and creator; recall counts belong to the studio store.
     public func studioCanonEvidence(
         entries: [StudioJournalEntry],
         recallCounts: [String: (count: Int, lastAt: String)]
     ) async throws -> [StudioCanonWorkEvidence] {
         let citations = try await studioEdgeCitations() ?? [:]
         var byCanonKey: [String: StudioCanonWorkEvidence] = [:]
-        // entry id → the work it is about, keyed the way the canon keys works
-        // AND the way the graph keys its nodes.
+        // Share work identity between journal canon and graph nodes.
         var workByEntry: [String: (canonKey: String, nodeKey: String)] = [:]
 
         for entry in entries {
@@ -264,10 +243,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
                       let to = workByEntry[relation.entryId] else { continue }
                 // Two entries about the same work are not that work recurring.
                 guard from.canonKey != to.canonKey else { continue }
-                // LATER, strictly. An entry that predates what it links to is a
-                // forward reference, not a return.
+                // Strictly later entries establish recurrence; forward references do not.
                 guard entry.recordedAt > target.recordedAt else { continue }
-                // And the graph has to carry the claim, citing this entry.
+                // Require the graph edge to cite this entry.
                 let edge = StudioEdgeKey(
                     from: from.nodeKey, to: to.nodeKey, type: relation.kind.rawValue
                 )
@@ -311,9 +289,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     }
 }
 
-/// The studio edge identity shared by derivation, audit and canon evidence.
-/// Endpoints are node keys (type, folded name, and a work's creator), never
-/// SQL row IDs, which may be reused from memory indexing.
+/// Share studio edge identity across derivation, audit and canon: node keys include type, folded name and creator, never reusable SQL row IDs.
 public struct StudioEdgeKey: Hashable, Sendable {
     public let from: String
     public let to: String

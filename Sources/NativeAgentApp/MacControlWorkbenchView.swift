@@ -35,8 +35,6 @@ struct MacControlWorkbenchView: View {
     @State private var resultTitle = "Idle"
     @State private var resultBody = "Try an action to see its results, any errors, and whether it needs your approval."
     var body: some View {
-        // Alive glass: an eyebrow over one group card — the notes, the action
-        // and its inputs, then the result, each a row.
         VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
             AliveEyebrow("Workbench")
             AliveGroupCard {
@@ -46,7 +44,6 @@ struct MacControlWorkbenchView: View {
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if !policySaved {
-                    // Waiting on him (an unsaved edit), so teal, not trouble.
                     Label("Save your Mac control settings before trying an action.", systemImage: "lock.fill")
                         .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.needsYou)
@@ -90,7 +87,8 @@ struct MacControlWorkbenchView: View {
                     let writeAvailability = MacControlWorkbenchAction.fileWrite.availability(
                         policy: policy,
                         policySaved: policySaved,
-                        hasRequiredInput: !input.wrappedValue.filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !input.wrappedValue.fileContent.isEmpty
+                        hasRequiredInput: !input.wrappedValue.filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            && !input.wrappedValue.fileContent.isEmpty
                     )
                     TextField("Path", text: input.filePath)
                         .textFieldStyle(.roundedBorder)
@@ -170,7 +168,6 @@ struct MacControlWorkbenchView: View {
         }
         .accessibilityElement(children: .contain)
     }
-    /// Failed is trouble; waiting for approval waits on him; the rest is quiet.
     private var resultColor: Color {
         switch resultTitle {
         case "Failed": NativeAgentShell.trouble
@@ -178,7 +175,11 @@ struct MacControlWorkbenchView: View {
         default: NativeAgentShell.secondary
         }
     }
-    private func workbenchButton(_ actionTarget: MacControlWorkbenchAction, availability: MacControlWorkbenchAvailability, action: @escaping () async -> Void) -> some View {
+    private func workbenchButton(
+        _ actionTarget: MacControlWorkbenchAction,
+        availability: MacControlWorkbenchAvailability,
+        action: @escaping () async -> Void
+    ) -> some View {
         Button(actionTarget.title, systemImage: actionTarget.systemImage) {
             Task { await action() }
         }
@@ -202,7 +203,7 @@ struct MacControlWorkbenchView: View {
         defer { isRunning = false }
         do {
             let result = try await appModel.macControlRun(action: action, body: body)
-            let receipt = result.toJSON()
+            let receipt = result.toJSON(readContent: nil)
             resultBody = String(decoding: try receipt.serializedData(pretty: true), as: UTF8.self)
             switch ChatToolOutcome.exactResultClass(receipt) {
             case .succeeded:

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import TurnTrace
 // Blueprint: | `MacChatTurnRetry.swift` | `MacChatTurnPresentationPort`: `admitMacChatRetry`, `runAdmittedMacChatRetry` |
 
@@ -40,7 +41,7 @@ public extension MacChatTurnPresentationPort {
             return nil
         }
         // Reserve the session across canonical reads. A second ordinary send
-        // may queue, but cannot race this retry into provider execution.
+        // arrives while it works, but cannot race this retry into provider execution.
         let lifecycleIdentity = MacChatTurnIdentity(
             sessionId: sessionId,
             turnId: TurnTraceContext.mintTurnId()
@@ -60,7 +61,6 @@ public extension MacChatTurnPresentationPort {
             presentMacChatTurn(.status(lifecycle.persisted
                 ? "Regenerate failed: the conversation changed before retry began"
                 : "Regenerate failed: the turn could not be durably admitted"))
-            await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
             return nil
         }
         admitted = true
@@ -69,8 +69,9 @@ public extension MacChatTurnPresentationPort {
 
     func runAdmittedMacChatRetry(
         _ admission: MacChatRetryAdmission,
-        operation: @escaping @MainActor () async -> Bool,
-        didComplete: @MainActor () -> Void
+        operation: @escaping @MainActor (Turn) async -> Bool,
+        didComplete: @MainActor () -> Void,
+        turn: Turn
     ) async {
         let sessionId = admission.identity.sessionId
         let lifecycleIdentity = admission.identity
@@ -83,8 +84,8 @@ public extension MacChatTurnPresentationPort {
                 occurredAt: Date()
             ))
             do {
-                regeneratedTurnCompleted = try await macChatTurns.runAdmittedTurn(sessionID: sessionId, turnID: lifecycleIdentity.turnId) {
-                    await operation()
+                regeneratedTurnCompleted = try await macChatTurns.runAloneTurn(sessionID: sessionId, turnID: lifecycleIdentity.turnId, turn: turn) { turn in
+                    await operation(turn)
                 }
             } catch {
                 presentMacChatTurn(.status(error.localizedDescription))
@@ -102,8 +103,6 @@ public extension MacChatTurnPresentationPort {
         await task.value
         _ = macChatTurns.finishRuntime(sessionId: sessionId, generation: admission.generation)
         if regeneratedTurnCompleted { didComplete() }
-        await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
     }
-
 
 }

@@ -4,18 +4,13 @@ import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
 import os
-// Blueprint: | `LLMProviderStatusFeed.swift` | live provider status feed; checked receipt writes preserve unreadable rows, byte-checked decode reuse, exact credential binding and verdict age checked at use |
+// Blueprint: | `LLMProviderStatusFeed.swift` | checked, credential-bound observation |
 
-/// The durable, last-observed result of a user-initiated native provider
-/// reachability check. This is intentionally a single bounded record rather
-/// than a claim that every configured provider is continuously monitored.
-/// A failed or unavailable probe must replace an earlier green row.
+/// A user-initiated check is one bounded observation, not continuous monitoring; failure must replace an earlier green row.
 public enum LLMProviderStatusFeed {
     public static let relativePath = "llm/provider_status.json"
     public static let staleAfter: TimeInterval = 30 * 24 * 60 * 60
-    /// Small wall-clock disagreement is normal across a recovered process or
-    /// filesystem timestamp boundary. A materially future check, however,
-    /// cannot be evidence that has happened and must not read as current.
+    /// Tolerate small clock disagreement, but materially future evidence cannot establish current health.
     public static let allowedClockSkew: TimeInterval = 5 * 60
 
     public enum Status: String, Sendable, Equatable {
@@ -31,7 +26,6 @@ public enum LLMProviderStatusFeed {
         public let providerID: String?
         public let model: String?
         public let tested: Bool
-        /// The typed cause of a failed check, as the probe encoded it.
         public var cause: String? = nil
         public var credential: String? = nil
         // Readiness preserves the saved spelling and unbounded failure detail.
@@ -46,7 +40,7 @@ public enum LLMProviderStatusFeed {
         case failed(String)
     }
 
-    /// The probe's verdict on a key the provider refused (401, Anthropic's 403).
+    /// Only a check's explicit credential-rejection verdict rejects the key.
     public static let keyRejected = "key rejected"
 
     public static func path(in dataRoot: URL) -> URL {
@@ -60,9 +54,8 @@ public enum LLMProviderStatusFeed {
         case "ok" where result.tested:
             status = .ok
         case "ok", "unknown":
-            // A provider without a native probe may be configured, but that is
-            // not a reachability assertion. Preserve the observation without
-            // pretending the provider was checked.
+            // A provider without a native probe may be configured, but that is not a reachability assertion. Preserve the observation without pretending
+            // the provider was checked.
             status = .unavailable
         default:
             status = .error
@@ -89,14 +82,11 @@ public enum LLMProviderStatusFeed {
         dataRoot: URL,
         checkedAt: Date = Date()
     ) async throws {
-        // The key the check sent, hashed before it was sent: a key saved while
-        // the check ran is never bound to that check's verdict.
+        // The key the check sent, hashed before it was sent: a key saved while the check ran is never bound to that check's verdict.
         try await write(record(for: result, checkedAt: checkedAt), to: path(in: dataRoot), credential: result.credential)
     }
 
-    /// A short hash of the credential a test ran against (a sign-in's access
-    /// token, else the saved key), so only a new credential clears that test's
-    /// failure, never another save of the account's file.
+    /// Hash the checked credential so only a new credential clears its failure, never a metadata save.
     public static func credentialFingerprint(providerID: String, dataRoot: URL) throws -> String? {
         let key: String?
         switch SwiftNativeProviderRouting.connectionProbe(providerID, authMode: nil) {
@@ -114,13 +104,11 @@ public enum LLMProviderStatusFeed {
         SHA256.hash(data: Data(key.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// One checked read of the checks file, made once per routing snapshot;
-    /// every readiness branch asks it, never the file. Only the decoded source
-    /// is reused by exact bytes; verdict age is evaluated at each use.
+    /// Snapshots reuse exact checked source bytes; verdict age is evaluated on every use.
     public struct Receipts: Sendable {
         let rows: [String: Reading]
         var diagnostic: Reading? = nil
-        /// Why the file could not be read; nil when it was read or is absent.
+        /// Missing and unreadable check storage must remain distinguishable.
         public let unreadable: String?
 
         public enum Verdict: Equatable, Sendable {
@@ -130,8 +118,7 @@ public enum LLMProviderStatusFeed {
             case failed(String)
         }
 
-        /// What this provider's last check found for exactly `key`. A row
-        /// that kept no key hash, or hashed another key, proves nothing here.
+        /// A check without the same credential fingerprint proves nothing about this key.
         public func verdict(providerID: String, key: String) -> Verdict {
             if case .failed(let why)? = rows[providerID] { return .failed(why) }
             guard case .current(let record)? = rows[providerID], record.tested,
@@ -186,8 +173,7 @@ public enum LLMProviderStatusFeed {
         }
     }
 
-    /// Validate the shared channel only. Each provider owns its row's damage;
-    /// the latest-check copy must not gate reads or writes of sibling rows.
+    /// Validate the shared channel only. Each provider owns its row's damage; the latest-check copy must not gate reads or writes of sibling rows.
     private static func envelope(_ data: Data, at url: URL) throws -> [String: JSONValue] {
         guard case .object(let file) = try JSONValue.parse(data),
               file["schema"] == .string("llm.provider_status.v2"),
@@ -242,8 +228,7 @@ public enum LLMProviderStatusFeed {
             ]
             if let credential { object["credential"] = .string(credential) }
             if let cause = record.cause { object["cause"] = .string(cause) }
-            // Each provider's own last check too, so a failed one stays on its
-            // row after another provider is checked.
+            // Each provider's own last check too, so a failed one stays on its row after another provider is checked.
             var byProvider: [String: JSONValue] = [:]
             if let data = try ProviderStateValidation.dataIfPresent(at: url) {
                 byProvider = try envelope(data, at: url)

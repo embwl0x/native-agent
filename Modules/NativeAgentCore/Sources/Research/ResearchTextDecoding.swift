@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ResearchTextDecoding.swift` | `ResearchTextDecoding`: response charset parsing outside quoted parameters and strict handling of incomplete terminal UTF-8 |
+// Blueprint: | `ResearchTextDecoding.swift` | `ResearchTextDecoding`: strict response encoding |
 
 struct ResearchTextDecoding {
     let text: String?
@@ -60,8 +60,7 @@ struct ResearchTextDecoding {
         }
     }
 
-    /// Split parameters only outside quoted strings; a filename containing
-    /// ';charset=...' must never choose the response's text encoding.
+    /// Split parameters only outside quoted strings; a filename containing ';charset=...' must never choose the response's text encoding.
     private static func charset(_ header: String) -> (value: String?, error: String?) {
         var pieces: [String] = []
         var current = ""
@@ -106,8 +105,7 @@ struct ResearchTextDecoding {
         return (values.first, nil)
     }
 
-    /// Accept only an actually incomplete terminal scalar. Dropping arbitrary
-    /// trailing bytes could otherwise hide an invalid interior byte.
+    /// Accept only an actually incomplete terminal scalar. Dropping arbitrary trailing bytes could otherwise hide an invalid interior byte.
     private static func incompleteUTF8Suffix(_ data: Data) -> Int? {
         let suffix = Array(data.suffix(3))
         for index in suffix.indices {

@@ -2,35 +2,25 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `TrustCenter+Autonomy.swift` | `PermissionLaw` enum: `posture`, `answer` (the one effective level), `judge`, `toolClass` (the one class resolution per call, read by authorization and scheduling), `doorClass` (a door action as it runs, folded ones as their tool; what a scheduled read is held to), `reachesUser`, `reach(ofPermissions:)` (a part's declared permissions → theirs or their); `SwiftNativeTrustCenter.autonomyLevel` delegates to `PermissionLaw.answer` |
+// Blueprint: | `TrustCenter+Autonomy.swift` | `PermissionLaw`: one posture, class, reach and effective level for authorization and scheduling |
 
 // MARK: - The permission law
 
-/// User's posture, as he set it in Trust.
 public enum PermissionPosture: Sendable {
-    /// Full Mac: she acts.
     case fullMac
-    /// Work mode: she asks before a send or a change to User's world.
+    /// Work asks before sends or changes to the person's world.
     case work
-    /// Safe: nothing beyond her own domain changes.
+    /// Safe: nothing beyond the agent's own domain changes.
     case readOnly
 }
 
-/// Every call is judged by four facts and nothing else: what it is (the class
-/// its declaration gives it), User's posture, the integration switch it touches
-/// (held before any card, and again at dispatch) and who steered the turn (an
-/// untrusted peer meets the floor and the cards). Everything she is — chat,
-/// bots, Workshop, swarm workers, every part she writes — gets the same answer:
-/// a sub-agent is her hands, not a lesser user.
-///
-/// One line divides her world from User's. Hers: her data root and Trust's
-/// workspace roots (her scratch, her worktrees, her abilities, bots, chats and
-/// memory). His: a path beyond those roots, his accounts and integrations, his
-/// Mac's apps, browser, settings and permissions, another app's settings, a
-/// shared remote. Destructive is what cannot be undone on his side of it, and
-/// always asks a person; Safe changes nothing on his side.
+/// Every executor shares judgment from declared class, saved posture, integration switch and steering authority. The agent's data and workspace roots are its
+/// own; external paths, accounts, apps and shared remotes reach the person. Irreversible changes on the person's side always ask; Safe cannot change that side.
 public enum PermissionLaw {
-    public static let fullMacContract = "Under Full Mac I make changes without asking. Permanent deletion still asks, and an untrusted agent's initiating turn asks once at its first effect, quoting its ask; your answer covers that turn and lifts its Work-mode cap. macOS privacy resets still ask."
+    public static let fullMacContract = """
+        Under Full Mac I make changes without asking. Permanent deletion still asks, and an untrusted agent's initiating turn asks once at its first \
+        effect, quoting its ask; your answer covers that turn and lifts its Work-mode cap. macOS privacy resets still ask.
+        """
 
     public static func posture(_ policy: [String: JSONValue]) -> PermissionPosture {
         posture(permissionLevel: policy["permissionLevel"]?.scalarText ?? "",
@@ -38,38 +28,34 @@ public enum PermissionLaw {
                     SwiftNativeSecurityCenter.object(policy["filePolicy"])["outsideWorkspaceDefault"])?.scalarText ?? "")
     }
 
-    /// The one reading of the saved posture: every gate, page and self-admin
-    /// check asks this, so one saved pair never means two postures.
+    /// All gates read the same saved pair so it cannot express different postures.
     public static func posture(permissionLevel: String, outsideWorkspaceDefault: String) -> PermissionPosture {
-        if MacControlGate.fullMacActive(MacControlTrustPolicy(outsideWorkspaceDefault: outsideWorkspaceDefault,
-                                                              permissionLevel: permissionLevel)) { return .fullMac }
+        if outsideWorkspaceDefault == "allow" || permissionLevel == "full_mac_os" { return .fullMac }
         return permissionLevel == "strict" ? .readOnly : .work
     }
 
-    /// The one effective answer for a call, with the reason and the lever
-    /// that would change it. SecurityCenter (with the facts it already
-    /// resolved) and Trust's by-name and Workshop answers both use it.
+    /// Authorization and by-name Trust reads share the same effective answer and remedy.
     public static func answer(tool: String, input: [String: JSONValue]?, policy: [String: JSONValue],
-                              dataRoot: URL) throws -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
+                              dataRoot: URL, turn: Turn?) throws -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
         let roots = SwiftNativeSecurityCenter.trustedWorkspaceRoots(
             filePolicy: SwiftNativeSecurityCenter.object(policy["filePolicy"]), dataRoot: dataRoot)
         let capabilities = try input.map { try SwiftNativeSecurityCenter.profile(tool: SwiftNativeSecurityCenter.policyToolName(tool),
-                                                                         input: $0, dataRoot: dataRoot, trustedWorkspaceRoots: roots).capabilities }
-        return try answer(tool: tool, input: input, policy: policy, capabilities: capabilities)
+                                                                         input: $0, dataRoot: dataRoot, turn: turn, trustedWorkspaceRoots: roots).capabilities }
+        return try answer(tool: tool, input: input, policy: policy, capabilities: capabilities, turn: turn)
     }
 
     static func answer(tool: String, input: [String: JSONValue]?, policy: [String: JSONValue],
-                       capabilities: Set<String>?) throws -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
+                       capabilities: Set<String>?, turn: Turn?) throws -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
         // Steering caps the posture: a turn an untrusted peer steered is judged as Work at most.
-        let peer = CapabilityLifecycle.turnWriteCheck()()
+        let peer = CapabilityLifecycle.turnWriteCheck(turn)()
         let capped = peer != nil && posture(policy) == .fullMac
         let posture = capped ? .work : posture(policy)
-        let (toolClass, level) = try judge(tool: tool, input: input, posture: posture, capabilities: capabilities)
+        let (toolClass, level) = try judge(tool: tool, input: input, posture: posture, capabilities: capabilities, turn: turn)
         let mode = posture == .fullMac ? "Full Mac" : posture == .readOnly ? "Safe" : "Work mode"
         var reason = "trust/policy.json: \(mode) judges \(tool) as \(toolClass), autonomy=\(level)."
         if capped, let peer {
-            // "This turn was steered by X, so it cannot …" → who steers; the answer to its one card lifts the cap.
-            let who = peer.message.components(separatedBy: ", so ").first.map { $0.replacingOccurrences(of: "This turn was steered by ", with: "") } ?? "another agent"
+            let who = peer.message.components(separatedBy: ", so ").first.map { $0.replacingOccurrences(of: "This turn was steered by ", with: "") }
+                ?? "another agent"
             reason += " Full Mac is capped to Work mode while \(who) steers this turn; your answer to its card lifts it."
         }
         let remedy: JSONValue?
@@ -84,12 +70,11 @@ public enum PermissionLaw {
         return (toolClass, level, reason, remedy)
     }
 
-    /// The call's class, reach and posture decide act, ask or refuse.
-    /// With no input, only its declaration counts.
+    /// The call's class, reach and posture decide act, ask or refuse. With no input, only its declaration counts.
     static func judge(tool: String, input: [String: JSONValue]?, posture: PermissionPosture,
-                      capabilities: Set<String>?) throws -> (toolClass: ToolClass, level: String) {
-        let toolClass = try toolClass(tool, input: input ?? [:])
-        let users = try toolClass >= .send || reachesUser(tool, input: input, capabilities: capabilities ?? [])
+                      capabilities: Set<String>?, turn: Turn?) throws -> (toolClass: ToolClass, level: String) {
+        let toolClass = try toolClass(tool, input: input ?? [:], turn: turn)
+        let users = try toolClass >= .send || reachesUser(tool, input: input, capabilities: capabilities ?? [], turn: turn)
         let level: String = switch (toolClass, posture) {
         case (.read, _): "auto"
         case _ where !users: "auto"
@@ -101,13 +86,10 @@ public enum PermissionLaw {
         return (toolClass, level)
     }
 
-    /// What this call is: a read where its binding reads for this input, else
-    /// its declaration's class (a registered tool's schema, a door action's
-    /// row, a part's reach, a host primitive's effect). Shell commands certified
-    /// by the shell owner read; every other command retains its declared class.
-    /// The one class resolution: authorization and scheduling read the same answer for the same call.
-    public static func toolClass(_ tool: String, input: [String: JSONValue]) throws -> ToolClass {
+    /// Authorization and scheduling share input-aware class resolution; only owner-certified shell commands narrow to reads.
+    public static func toolClass(_ tool: String, input: [String: JSONValue], turn: Turn?) throws -> ToolClass {
         let name = ToolNameAliases.canonical(tool)
+        if AuthoredToolEffects.shellIrreversible(name, input: input) { return .destructive }
         if AuthoredToolEffects.shellReadOnly(name, input: input) { return .read }
         if name == "app" {
             let named = ["action", "script"].contains { key in
@@ -115,20 +97,18 @@ public enum PermissionLaw {
                 else if key == "script", case .array(let calls)? = input[key] { !calls.isEmpty }
                 else { false }
             }
-            // Home, a page read, find and a preview change nothing; a folded
-            // action re-enters under its tool's name and is judged there.
+            // Folded actions re-enter under their tool name; discovery and preview have no effects.
             guard named, input["preview"] != .bool(true) else { return .read }
-            guard let action = try AppActionBinding.action(input: input) else { return .write }
+            guard let action = try AppActionBinding.action(input: input, turn: turn) else { return .write }
             return declaredRead(action) || action.folded ? .read : action.toolClass
         }
         if AuthoredToolEffects.isPrimitiveEffect(name) {
             return effectClass(AuthoredToolEffects.primitiveEffect(name, arguments: .object(input)).capabilities)
         }
-        // A part's declaration is the app action that folds it.
-        let action = try AppActionBinding.action(tool: name, input: input) ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name))
+        let action = try AppActionBinding.action(tool: name, input: input, turn: turn) ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name),
+            turn: turn)
         if let action, declaredRead(action) { return .read }
         let declared = AppActionBinding.declaredClass(name) ?? action?.toolClass ?? .write
-        // A send's dry run reaches no one.
         return declared == .send && input["dry_run"] == .bool(true) ? .write : declared
     }
 
@@ -137,59 +117,43 @@ public enum PermissionLaw {
             (!action.readWhen.isEmpty && AppActionBinding.builtInToolName(action.tool)))
     }
 
-    /// What a door action does as it runs: a folded action is judged as the
-    /// tool it hands the call to. Nil when the door has no such action.
-    public static func doorClass(action: String, args: [String: JSONValue]) throws -> ToolClass? {
+    /// Judge folded actions by the tool they actually dispatch; a missing action has no class.
+    public static func doorClass(action: String, args: [String: JSONValue], turn: Turn?) throws -> ToolClass? {
         let call: [String: JSONValue] = ["action": .string(action), "args": .object(args)]
-        guard try AppActionBinding.action(input: call) != nil else { return nil }
+        guard try AppActionBinding.action(input: call, turn: turn) != nil else { return nil }
         let ran = ToolNameAliases.ranCall("app", input: call)
-        return try toolClass(ran.tool, input: ran.input)
+        return try toolClass(ran.tool, input: ran.input, turn: turn)
     }
 
-    /// Whether a write lands on User's side of the line: a command line (nobody
-    /// knows what one reaches), a path beyond her roots (the path policy's own
-    /// reading), another app's settings, his Mac's settings, apps or
-    /// clipboard, a remote, his accounts (the Mac integration tools; a
-    /// notification to him changes nothing of his), or anything whose
-    /// declaration does not say where it reaches. Her app's own door actions
-    /// are hers, and so are her Chrome extension's tabs; a folded door action
-    /// re-enters under its tool's name.
-    static func reachesUser(_ tool: String, input: [String: JSONValue]?, capabilities: Set<String>) throws -> Bool {
+    /// Unknown reach counts on the person's side, including arbitrary command lines. Owned data, workspace and extension tabs remain the agent's; folded calls
+    /// are judged under their tool.
+    static func reachesUser(_ tool: String, input: [String: JSONValue]?, capabilities: Set<String>, turn: Turn?) throws -> Bool {
         let name = ToolNameAliases.canonical(tool)
         if input != nil, !capabilities.isDisjoint(with: [
             "outside_app_data_write", "other_app_settings_write", "system_control", "system_permission_reset",
             "ax_injection", "mac_control", "clipboard_write", "remote_effect",
         ]) { return true }
         if name == "app" { return false }
-        if let schema = AppActionBinding.declaredSchema(name) { return schema.reach == .his }
-        return try AppActionBinding.binding(ToolNameAliases.authoredAction(name))?.reach != .hers
+        if let schema = AppActionBinding.declaredSchema(name) { return schema.reach == .person }
+        return try AppActionBinding.binding(ToolNameAliases.authoredAction(name), turn: turn)?.reach != .agent
     }
 
-    /// Whether a card is a person's even under Full Mac: the call it carries
-    /// cannot be undone on his side (User, 10-17: one card, a human's tap; her
-    /// own approve never stands in for his). A chat tool's card carries the
-    /// tool as its action and the call's `input`; a Workshop step's carries
-    /// the step's `tool` and `args`.
-    public static func humanDecides(action: String, payload: JSONValue) throws -> Bool {
+    /// Irreversible effects on the person's side need their tap even under Full Mac, including cards carrying nested tool arguments.
+    public static func humanDecides(action: String, payload: JSONValue, turn: Turn?) throws -> Bool {
         guard case .object(let payload) = payload else { return false }
-        let step = ExecutionEventVocabulary.matches(action, WorkshopStepApprovalAction.canonical)
-        var tool = action
-        if step, case .string(let name)? = payload["tool"] { tool = name }
         var input: [String: JSONValue] = [:]
-        if case .object(let fields)? = payload[step ? "args" : "input"] { input = fields }
-        return try toolClass(tool, input: input) == .destructive
+        if case .object(let fields)? = payload["input"] { input = fields }
+        return try toolClass(action, input: input, turn: turn) == .destructive
     }
 
-    /// A part's declared permission, as the primitive it names reaches.
-    /// What a part's declared permissions reach: her own data, model and localhost are hers; anything else is his.
-    public static let herReach: Set<String> = ["app_data_read", "app_data_write", "model", "network_localhost"]
+    /// Own data, model and localhost reach the agent's side; all other declared permissions reach the person.
+    public static let agentReach: Set<String> = ["app_data_read", "app_data_write", "model", "network_localhost"]
     public static func reach(ofPermissions permissions: [String]) -> ToolReach {
-        permissions.contains { !herReach.contains($0) && !$0.hasPrefix("app_read:") } ? .his : .hers
+        permissions.contains { !agentReach.contains($0) && !$0.hasPrefix("app_read:") } ? .person : .agent
     }
 
     public static func permissionClass(_ permission: String) -> ToolClass {
-        // These grants can only read: app_read is enforced per Apple Event,
-        // and app_data_read admits only file readers in the owning root.
+        // These grants can only read: app_read is enforced per Apple Event, and app_data_read admits only file readers in the owning root.
         if permission == "app_data_read" || permission.hasPrefix("app_read:") { return .read }
         guard AuthoredToolEffects.isPrimitiveEffect(permission) else { return .write }
         return effectClass(AuthoredToolEffects.primitiveEffect(permission, arguments: nil).capabilities)
@@ -204,11 +168,10 @@ public enum PermissionLaw {
 
 extension SwiftNativeTrustCenter {
     /// Input-aware judgment through the same `PermissionLaw.answer` SecurityCenter uses.
-    public func autonomyLevel(forTool toolName: String, input: [String: JSONValue]?) async throws -> String {
-        try PermissionLaw.answer(tool: toolName, input: input, policy: try await loadTrustPolicyChecked(), dataRoot: dataRoot).level
+    public func autonomyLevel(forTool toolName: String, input: [String: JSONValue]?, turn: Turn?) async throws -> String {
+        try PermissionLaw.answer(tool: toolName, input: input, policy: try await loadTrustPolicyChecked(), dataRoot: dataRoot, turn: turn).level
     }
 
-    /// Format a Date with the shared TrustCenter timestamp helper.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
         SwiftNativeManifestSigner.isoTimestamp(date)
     }

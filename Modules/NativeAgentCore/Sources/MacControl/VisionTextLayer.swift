@@ -5,14 +5,12 @@ import Vision
 // Blueprint: | `VisionTextLayer.swift` | `VisionTextLayerResult`, `VisionTextLayer`, `VisionKitTextRecognizer` |
 #endif
 
-// Whole-frame recognition refines only genuinely tiny or sparse text.
+// Refine only observed tiny or sparse text to avoid unnecessary recognition work.
 
-/// Text boxes and whether conditional OCR refinement ran.
 public struct VisionTextLayerResult: Sendable, Equatable {
     public let boxes: [VisionTextBox]
     public let tiled: Bool
-    /// Why tiling did or did not fire, in one phrase. Stated rather than
-    /// inferred: "no tiny text (median 18.0px)" vs "tiny text (median 7.0px)".
+    /// Explain refinement decisions explicitly rather than forcing callers to infer them from box sizes.
     public let tilingReason: String
     /// Count thrown tile OCR passes so the compiler can report incomplete text recovery.
     public let tileFailures: Int
@@ -26,31 +24,24 @@ public struct VisionTextLayerResult: Sendable, Equatable {
 }
 
 public enum VisionTextLayer {
-    /// Relative frame-height threshold for median text height to trigger tiling.
+    /// Use frame-relative height to detect genuinely tiny text.
     private static let tinyTextHeightFraction: Double = 0.009
-    /// …and an absolute floor, because a small window full of ordinary 13 px
-    /// text is not tiny text; it is a small window.
+    /// An absolute floor prevents ordinary text in small windows from triggering tiny-text refinement.
     private static let tinyTextHeightPixels: Double = 12
-    /// Tiles per axis for conditional OCR refinement.
     private static let tileGrid: Int = 3
-    /// Fractional overlap between adjacent tiles, so a string straddling a
-    /// tile seam is whole in at least one tile.
+    /// Overlap tiles so seam-crossing strings remain whole in at least one crop.
     private static let tileOverlap: Double = 0.15
-    /// Two boxes this close (IoU) with the same text are the same string seen
-    /// twice by two tiles.
+    /// Equal overlapping strings from separate tiles represent one observation.
     private static let dedupeIoU: Double = 0.5
 
-    /// Tiles only recognized text whose median height is below the tiny-text threshold.
+    /// Refine only when observed text clears the tiny-text threshold.
     public static func tilingDecision(
         boxes: [VisionTextBox],
         imageHeight: Double
     ) -> (shouldTile: Bool, reason: String) {
         let heights = boxes.map(\.rect.h).filter { $0 > 0 }.sorted()
         guard !heights.isEmpty else {
-            // No text at all is not evidence of TINY text — it is evidence of
-            // no text (a game canvas, a photo). Tiling a blank frame is pure
-            // waste, and a frame whose text OCR could not see at all is a
-            // different problem than one whose text is small.
+            // No recognized text is not evidence of tiny text; avoid spending tiling work on blank canvases or photos.
             return (false, "no text recognized — nothing to re-scan")
         }
         let median = heights[heights.count / 2]
@@ -62,7 +53,6 @@ public enum VisionTextLayer {
         return (false, "no tiny text (median \(rounded)px)")
     }
 
-    /// Tile rects for the conditional pass, in image pixel coordinates.
     public static func tiles(
         imageSize: VisionSize
     ) -> [VisionRect] {
@@ -84,10 +74,7 @@ public enum VisionTextLayer {
         return out
     }
 
-    /// Local regions around the few strings a sparse canvas did expose. The
-    /// crop makes neighboring HUD/status text large relative to Vision's input
-    /// without manufacturing pixels or paying for a full 3×3 rescan. Heavily
-    /// overlapping regions collapse to one recognition call.
+    /// Crop around sparse observed strings to enlarge neighboring HUD text without a full rescan; merge heavy overlap to bound recognition.
     public static func sparseRecoveryRegions(
         boxes: [VisionTextBox],
         imageSize: VisionSize
@@ -126,8 +113,7 @@ public enum VisionTextLayer {
         return regions
     }
 
-    /// Merge a whole-frame pass with tile passes: the same string seen by two
-    /// tiles is one string; the higher-confidence observation wins.
+    /// Merge duplicate tile observations, retaining the higher-confidence reading.
     public static func dedupe(
         _ boxes: [VisionTextBox]
     ) -> [VisionTextBox] {
@@ -156,10 +142,7 @@ public enum VisionTextLayer {
         return lhs.source < rhs.source
     }
 
-    /// Whole-frame pass, plus a tiling pass ONLY when the text is genuinely
-    /// tiny. Foreground-covered boxes do not trigger expensive refinement of
-    /// another app's text. They remain in the result for whole-frame redaction
-    /// context; the compiler owns exclusion from the published percept.
+    /// Covered text cannot trigger expensive foreign-app refinement, but remains available for whole-frame secret-caption context.
     #if canImport(Vision)
     public static func recognize(
         image: CGImage,
@@ -203,7 +186,7 @@ public enum VisionTextLayer {
             } catch {
                 if error is CancellationError { throw error }
                 try Task.checkCancellation()
-                // Counted, never swallowed: the compiler surfaces this in notes.
+                // Count failed tiles so incomplete recognition stays visible.
                 tileFailures += 1
             }
         }
@@ -221,7 +204,7 @@ public enum VisionTextLayer {
 // MARK: - The real engine
 
 #if canImport(Vision)
-/// Native request execution and normalized-to-pixel observation conversion.
+/// Convert native normalized observations at the pixel boundary.
 public struct VisionKitTextRecognizer: Sendable {
     public init() {}
 
@@ -243,9 +226,7 @@ public struct VisionKitTextRecognizer: Sendable {
     }
 
     public func recognizeText(in image: CGImage, region: VisionRect?) throws -> [VisionTextBox] {
-        // A tile is cropped rather than passed as a regionOfInterest so the
-        // recognizer sees the sub-image at full resolution — which is the
-        // entire point of tiling for tiny text.
+        // Crop tiles rather than using regionOfInterest so tiny text reaches recognition at full sub-image resolution.
         var offset = (x: 0.0, y: 0.0)
         var target = image
         if let region {
@@ -264,7 +245,7 @@ public struct VisionKitTextRecognizer: Sendable {
 
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
-        // UI labels must not be rewritten as prose.
+        // Preserve UI labels verbatim rather than correcting them into prose.
         request.usesLanguageCorrection = false
         let source = region == nil ? "whole_frame" : "tile"
         return try recognizeText(in: target, request: request).compactMap { box in

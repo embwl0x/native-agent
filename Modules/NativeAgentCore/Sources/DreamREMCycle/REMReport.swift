@@ -3,38 +3,33 @@ import CoreFoundation
 
 // MARK: - REMReport
 
-/// Summary the weekly REM run returns to its caller (scheduler / debug menu).
 public struct REMReport: Sendable, Codable, Equatable {
     public var proposalsGenerated: Int
-    /// Historical wire name: the floor applies to supporting experiences OR dream dates.
+    /// The wire field counts supporting experiences or dream dates despite its date-oriented name.
     public var evidenceDatesMin: Int
     public var tombstoneSkips: Int
     public var growthMDEvicted: Int
     public var archivedEntries: Int
-    /// Proposals the store REFUSED, keyed by persona doc ("SOUL.md": 2).
-    /// nil (and omitted on the wire) when nothing was dropped.
+    /// Name refused persona targets; omit the field only when none were refused.
     public var personaTargetDrops: [String: Int]?
-    /// Proposals the store REFUSED for breaking the GROWTH.md passage bound,
-    /// keyed by reason ("over 240 characters": 1). nil when none.
+    /// Name passage-bound refusal reasons; absence means no such refusals.
     public var passageBoundDrops: [String: Int]?
-    /// Distinguishes skipped work from a completed quiet week; nil when not skipped.
+    /// Distinguish skipped work from a quiet completed week.
     public var skipReason: String?
 
-    /// The same terminal classification used by the REM owner and its callers.
+    /// Share the terminal classification with REM's owner and callers.
     public var outcome: REMRunReportPayload.Outcome {
         if skipReason != nil { return .skipped }
         if let unavailableDreamSections, !unavailableDreamSections.isEmpty { return .failed }
         return .completed
     }
-    /// Of the survivors, how many are one lived occasion dreamt about more than
-    /// once — kept and labelled `dwelt_on`, never counted as a pattern. nil when none.
+    /// Count dwelling separately; repeated dreams of one occasion are not recurrence.
     public var dweltOnKept: Int?
-    /// Of the survivors, how many rest on entries with no provenance at all, so
-    /// whether they recurred is not knowable. Said, not assumed.
+    /// Expose unknown provenance rather than infer recurrence.
     public var provenanceUnavailableKept: Int?
-    /// Exact diary sections that remain unreadable and unconsumed; readable siblings proceed.
+    /// Unreadable sections stay unconsumed while readable siblings proceed.
     public var unavailableDreamSections: [String]?
-    /// Transient delivery of committed causes, excluded from the counter-only run ledger.
+    /// Keep committed causes transient and outside the counter-only ledger.
     public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
 
     private enum CodingKeys: String, CodingKey {
@@ -67,22 +62,15 @@ public struct REMReport: Sendable, Codable, Equatable {
     }
 }
 
-/// Durable, privacy-safe summary of one invocation of `runWeeklyREM`.
-///
-/// `REMReport` is the successful-run value returned to an immediate caller.
-/// This envelope is what survives a scheduler wake, app restart, or manual
-/// debug session in the shared run ledger. It deliberately contains counters
-/// and a bounded outcome/reason only — never diary, persona, or proposal text.
+/// Persist only bounded counters, outcome and reason so run evidence survives restart without diary, persona or proposal text.
 public struct REMRunReportPayload: Sendable, Codable, Equatable {
     public enum Outcome: String, Sendable, Codable, Equatable {
-        /// The pipeline reached all commit boundaries (a zero-proposal week is
-        /// still completed and is distinguishable by its real counters).
+        /// Zero proposals still count as completion if every commit boundary was reached.
         case completed
-        /// The weekly reservation was already fresh, so no second LLM pass ran.
+        /// A fresh weekly reservation prevents a second model pass.
         case skipped
-        /// Trust policy rejected the run before any REM persistence work began.
+        /// Trust refusal must precede REM persistence.
         case disabled
-        /// A real execution error or cancellation prevented completion.
         case failed
     }
 
@@ -138,18 +126,17 @@ extension REMRunReportPayload {
     }
 
     private static func nonnegativeInt(_ rawValue: Any?) -> Int? {
-        // Reject genuine booleans by CF type, preserving numeric counts of 0 and 1 despite Bool bridging.
+        // Check CF type to distinguish real booleans while preserving numeric zero and one.
         if isBoolean(rawValue) { return nil }
         guard let value = rawValue as? Int, value >= 0 else { return nil }
         return value
     }
 
-    /// True only for a genuine boolean — a JSON `true`/`false` or a Swift
-    /// `Bool` — never for a number that merely happens to be 0 or 1.
+    /// Reject numeric zero/one as booleans despite Foundation bridging.
     private static func isBoolean(_ rawValue: Any?) -> Bool {
         guard let number = rawValue as? NSNumber else { return false }
         return CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 }
 import CognitiveSubstrate
-// Blueprint: | `REMReport.swift` | `REMReport` owns the typed completed/skipped/failed projection used by its ledger and scheduled caller; `REMRunReportPayload` manual completion validates counters and refuses skipped passes as completion |
+// Blueprint: | `REMReport.swift` | `REMReport`, `REMRunReportPayload`. |

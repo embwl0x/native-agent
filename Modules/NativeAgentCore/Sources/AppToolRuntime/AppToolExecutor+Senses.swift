@@ -16,12 +16,12 @@ extension AppActions {
         }
     }
 
-    /// File-owned discovery also runs before the live hub is installed at launch.
-    /// It projects checked records; executing a sense still requires the hub.
-    static func senses(records: [SenseRecord]? = nil, catalog: [AppAction]? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> [AppAction] {
+    /// File-owned discovery works before the live hub is installed; execution still requires the hub.
+    static func senses(records: [SenseRecord]? = nil, catalog: [AppAction]? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        turn: Turn?) throws -> [AppAction] {
         let records = try records ?? FileSenseRegistry(dataRoot: dataRoot).presentationRecords()
         let catalog = try catalog ?? available(dataRoot: dataRoot)
-        let scope = ChatToolSessionContext.verifiedSessionId ?? ""
+        let scope = turn?.verifiedSessionID ?? ""
         var seen: Set<String> = []
         let views = SenseDoorViews.shared.latest.filter { view in
             view.scope == scope && view.record.verbsEnabled && records.contains {
@@ -38,7 +38,9 @@ extension AppActions {
             default: id = "sense.versions"; input = ["sense_id": .string(record.id)]
             }
             guard let reader = catalog.first(where: { $0.id == id }) else {
-                throw SenseFailure(code: "reader_action_missing", message: "Sense \(record.id) requires \(id), which is missing from the checked action catalog. Repair its action registration.")
+                throw SenseFailure(code: "reader_action_missing", message: """
+                    Sense \(record.id) requires \(id), which is missing from the checked action catalog. Repair its action registration.
+                    """)
             }
             return AppAction(id, record.corner.key, "Read \(record.id) · \(record.corner.key)", reader.args,
                 toolClass: .read, warn: reader.warn, tool: reader.tool, input: reader.input.merging(input) { _, bound in bound },
@@ -54,7 +56,8 @@ extension AppActions {
                 thing.verbs.compactMap { verb -> AppAction? in
                     let id = "sense.\(view.record.id).\(verb)"
                     guard seen.insert(id).inserted else { return nil }
-                    return AppAction(id, view.page.corner.key, verb + " " + thing.name, ["address", "args?:object"], tool: "sense_act", input: ["sense_id": .string(view.record.id), "verb": .string(verb)],
+                    return AppAction(id, view.page.corner.key, verb + " " + thing.name, ["address", "args?:object"], tool: "sense_act",
+                        input: ["sense_id": .string(view.record.id), "verb": .string(verb)],
                         scope: ([view.record.id, view.record.corner.key, view.page.title, thing.detail ?? ""] + view.record.verbs).joined(separator: " "),
                         part: view.record.id)
                 }
@@ -69,12 +72,11 @@ extension AppToolExecutor {
         return nil
     }
 
-    /// A corner is read through its existing action, so the original gate and
-    /// raw reader remain authoritative. The sense adapter lives behind it.
+    /// Sense reads re-enter the original action so its Trust gate and raw reader remain authoritative.
     @MainActor
-    func doorSenseRead(corner: SenseCorner, item: String, input: [String: JSONValue]) async throws -> JSONValue? {
+    func doorSenseRead(corner: SenseCorner, item: String, input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async throws -> JSONValue? {
         guard try await SenseDoor.selectedRecord(for: corner) != nil else { return nil }
-        guard let perform = AppDoorReentry.perform else {
+        guard let perform = execution.perform else {
             return Self.doorRefusal("door_unavailable", "Read this corner from a chat turn.",
                 remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
@@ -82,7 +84,7 @@ extension AppToolExecutor {
         if item.hasPrefix("{"), case .object(let fields) = try JSONValue.parse(Data(item.utf8)) {
             args.merge(fields.filter { !$0.key.hasPrefix("__sense_") }) { _, new in new }
         }
-        let scope = ChatToolSessionContext.verifiedSessionId ?? ""
+        let scope = turn.verifiedSessionID ?? ""
         let siteFailureEvidence: [String: JSONValue] = ["effects": .string("none"),
             "provenance": .string("raw view · Chrome conversation page and reading-place bindings; no page was read")]
         let servedView = SenseDoorViews.shared.latest.reversed().first {
@@ -108,11 +110,12 @@ extension AppToolExecutor {
             let matches = SenseDoorViews.shared.latest.reversed().filter {
                 $0.scope == scope && $0.page.corner == corner
                     && ($0.page.address == item || $0.page.more == item || $0.page.things.contains { $0.address == item }
-                        || ($0.materialRef.map { SenseNativePages.chromeAddress(host: host, url: $0) == item.split(separator: "#", maxSplits: 1).first.map(String.init) } ?? false))
+                        || ($0.materialRef.map { SenseNativePages.chromeAddress(host: host, url: $0) == item.split(separator: "#", maxSplits: 1).first.map(
+                            String.init) } ?? false))
             }
             if let url = matches.first?.materialRef { siteURL = url }
             else {
-                let status = await chrome().conversationTabStatus(ChatToolSessionContext.verifiedSessionId)
+                let status = await chrome().conversationTabStatus(turn.verifiedSessionID)
                 let matches: [[String: JSONValue]] = if case .array(let tabs)? = status["tabs"] {
                     tabs.compactMap { value in
                         guard case .object(let tab) = value, let url = tab["url"]?.scalarText,
@@ -122,7 +125,8 @@ extension AppToolExecutor {
                     }
                 } else { [] }
                 guard matches.count == 1, let tab = matches.first, let url = tab["url"]?.scalarText else {
-                    return Self.failure("invalid_address", "This site place has not been read in this conversation; read its held tab first.", extra: siteFailureEvidence)
+                    return Self.failure("invalid_address", "This site place has not been read in this conversation; read its held tab first.",
+                        extra: siteFailureEvidence)
                 }
                 args["tab_id"] = tab["tab_id"]
                 siteURL = url
@@ -130,8 +134,7 @@ extension AppToolExecutor {
         } else if case .site(let host) = corner, let more = args["more"]?.scalarText,
                   case .object(let cursor) = try JSONValue.parse(Data(more.utf8)),
                   let url = cursor["url"]?.scalarText, URL(string: url)?.host?.lowercased() == host {
-            // Independent control continuations are not the page's single
-            // `more` pointer. Their cursor owns the URL and reading position.
+            // Independent control continuations are not the page's single `more` pointer. Their cursor owns the URL and reading position.
             siteURL = url
         } else { siteURL = nil }
         let view = independentSiteRead ? servedView : SenseDoorViews.shared.latest.reversed().first {
@@ -152,14 +155,14 @@ extension AppToolExecutor {
             guard item.isEmpty || URL(string: url)?.host?.lowercased() == host else {
                 return Self.failure("invalid_address", "Read this corner with a URL on its host.", extra: siteFailureEvidence)
             }
-            if let view, let reader = view.readInput["__sense_action"]?.scalarText, let entry = try AppActions.action(reader) {
+            if let view, let reader = view.readInput["__sense_action"]?.scalarText, let entry = try AppActions.action(reader, turn: turn) {
                 action = reader
                 let names = Set(entry.argSpecs.flatMap(\.names))
                 args = view.readInput.filter { names.contains($0.key) }.merging(args) { _, new in new }
             } else {
                 action = "chrome.snapshot"
                 if Self.inputInt(args["tab_id"]) == nil {
-                    let address = try await chrome().existingPageAddress(host: host)
+                    let address = try await chrome().existingPageAddress(host: host, context: execution.macOperation(dataRoot: securityCenter.dataRoot))
                     args = address.merging(args) { _, supplied in supplied }
                 }
                 args.removeValue(forKey: "url")
@@ -173,8 +176,7 @@ extension AppToolExecutor {
                    return thing.address == SenseNativePages.chromeAddress(host: host, url: url, fragment: fragment)
                }), case .int(let frame)? = node["frameId"] {
                 var readingNode = node
-                // Inline link proofs travel with the prose that renders them.
-                // Its captured position also brings the link back into the read.
+                // Inline link proofs travel with the prose that renders them. Its captured position also brings the link back into the read.
                 if node["inlineProof"] == .bool(true), let path = node["elementPath"]?.scalarText,
                    case .object(let prose)? = nodes.first(where: { value in
                        guard case .object(let row) = value, row["frameId"] == .int(frame),
@@ -182,7 +184,8 @@ extension AppToolExecutor {
                        return parts.contains { if case .object(let part) = $0 { return part["elementPath"] == .string(path) }; return false }
                    }) { readingNode = prose }
                 guard case .object(let position)? = readingNode["readPosition"] else {
-                    return Self.failure("invalid_address", "This site place has no captured reading position; read its held tab again.", extra: siteFailureEvidence)
+                    return Self.failure("invalid_address", "This site place has no captured reading position; read its held tab again.",
+                        extra: siteFailureEvidence)
                 }
                 let frameURL: JSONValue? = if case .array(let frames)? = captured["frames"] {
                     frames.first { if case .object(let row) = $0 { return row["frameId"] == .int(frame) }; return false }
@@ -219,18 +222,17 @@ extension AppToolExecutor {
         }
         call["__session_id"] = input["__session_id"]
         if case .site = corner {
-            // The page URL scopes the request; captured items and folded
-            // continuations resume by position in the current page's material.
+            // The page URL scopes the request; captured items and folded continuations resume by position in the current page's material.
             if siteURL != nil || view != nil { call["__sense_address"] = .string(item) }
         } else if view != nil || item.hasPrefix("{") { call["__sense_address"] = .string(item) }
-        return try await perform("app", call)
+        return try await perform("app", call, turn, execution)
     }
 
     @MainActor
-    func runSenseAct(input: [String: JSONValue]) async -> JSONValue {
+    func runSenseAct(input: [String: JSONValue], turn: Turn, execution: AppActionExecution) async -> JSONValue {
         let id = Self.doorText(input["sense_id"]), verb = Self.doorText(input["verb"])
         let address = Self.doorText(input["address"])
-        let scope = ChatToolSessionContext.verifiedSessionId ?? ""
+        let scope = turn.verifiedSessionID ?? ""
         let view = SenseDoorViews.shared.latest.reversed().first(where: {
             $0.scope == scope && $0.record.id == id && $0.page.things.contains { $0.address == address && $0.verbs.contains(verb) }
         })
@@ -244,7 +246,7 @@ extension AppToolExecutor {
            let record = selected, record.id == id,
            record.version == view.record.version, record.verbsEnabled,
            record.origin != .shared || record.verbs.contains(verb),
-           let runner = SensesHub.shared.runner, let perform = AppDoorReentry.perform else {
+           let runner = SensesHub.shared.runner, let perform = execution.perform else {
             if id == "builtin-chrome", verb == "click" {
                 return Self.doorRefusal("sense_verb_unavailable", "This Chrome thing is no longer available to this sense. Nothing ran.",
                     remedy: "read_page", "Read next_call, then use chrome.click with node_id set to a row number or label from that page.",
@@ -254,8 +256,7 @@ extension AppToolExecutor {
             }
             return Self.failure("sense_verb_unavailable", "Read the corner again before acting on this thing.")
         }
-        // Read authority can have changed since this thing was served. Re-enter
-        // the raw reader under today's policy before handing its material over.
+        // Re-enter the raw reader under current policy; previously served material does not preserve authority.
         let freshSource: SenseActSource
         let siteBoundary: SiteSenseActionBoundary?
         do {
@@ -273,18 +274,15 @@ extension AppToolExecutor {
                 arguments["expected_user_sequence"] = .int(sequence)
             }
             let readAddress = try JSONValue.object(arguments).serialize(pretty: false)
-            // Native screen verbs retain the served frame. mac.act rechecks
-            // current Trust and target drift without replacing that frame.
+            // Native screen verbs retain the served frame. mac.act rechecks current Trust and target drift without replacing that frame.
             let material: SenseMaterial?
             if case .app = view.page.corner {
-                // A new look would invalidate the served frame's handles.
-                // Translate the exact selection Agent saw; mac.act owns the
-                // current Trust, window drift and target re-observation gates.
+                // A new look invalidates served handles; translate the exact observed selection and let mac.act recheck Trust and drift.
                 material = view.capturedMaterial
                 if record.language != .native, material == nil {
                     throw SenseFailure(code: "source_unavailable", message: "Read this app again before acting; its served AX snapshot is unavailable.")
                 }
-            } else { material = try await source.material(for: view.page.corner, address: readAddress) }
+            } else { material = try await source.material(for: view.page.corner, address: readAddress, operation: execution.senseOperation(turn: turn)) }
             if case .site(let host) = view.page.corner {
                 guard let material else {
                     throw SenseFailure(code: "source_unavailable", message: "The site snapshot is unavailable.")
@@ -294,9 +292,7 @@ extension AppToolExecutor {
                 }
                 siteBoundary = try SiteSenseActionBoundary(host: host, address: address, verb: verb,
                     original: original, fresh: material)
-                // The sense translates the thing Agent actually saw. The action
-                // boundary separately binds it to that same element in the
-                // fresh policy-checked snapshot, never to its row number.
+                // Translate the served element; the action boundary binds its identity to the fresh checked snapshot, never its row number.
                 freshSource = SenseActSource(corner: view.page.corner, address: readAddress, source: source, material: original)
             } else {
                 siteBoundary = nil
@@ -307,8 +303,8 @@ extension AppToolExecutor {
         }
         let dataRoot = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        let outcome = await SenseActionContext.$perform.withValue({ actionID, target, value in
-            guard let action = try AppActions.action(actionID), action.tool != "sense_act", case .object(var args) = value else {
+        let act: SenseActionContext.Perform = { actionID, target, value in
+            guard let action = try AppActions.action(actionID, turn: turn), action.tool != "sense_act", case .object(var args) = value else {
                 throw SenseFailure(code: "invalid_action", message: "A sense act must name an existing app action with object arguments.")
             }
             if let siteBoundary {
@@ -331,17 +327,18 @@ extension AppToolExecutor {
                 args[key] = .string(target)
             }
             try Self.requireSenseActionPublic(action, args: args, target: target, dataRoot: dataRoot, personaRoot: personaRoot)
-            let result = try await SenseDoor.$verifyingActCorner.withValue(siteBoundary == nil ? nil : record.corner) {
-                try await perform("app", ["action": .string(action.id), "args": .object(args)])
-            }
+            var actionExecution = execution
+            actionExecution.verifyingActCorner = siteBoundary == nil ? nil : record.corner
+            actionExecution.senseAct = true
+            let result = try await perform("app", ["action": .string(action.id), "args": .object(args)], turn, actionExecution)
             await freshSource.invalidate()
             return result
-        }) {
-            await runner.run(record, request: .act(verb: verb, address: address, args: input["args"] ?? .object([:])), source: freshSource)
         }
+        let outcome = await runner.run(record, request: .act(verb: verb, address: address, args: input["args"] ?? .object([:])),
+            source: freshSource, operation: execution.senseOperation(turn: turn, perform: act))
         switch outcome {
         case .acted(let result, let provenance):
-            SensesHub.shared.didServe(provenance)
+            SensesHub.shared.didServe(provenance, reads: execution.invocation.senseReads)
             if case .object(var fields) = result {
                 fields["provenance"] = .string(provenance.line(now: Date()))
                 return .object(fields)
@@ -350,20 +347,22 @@ extension AppToolExecutor {
                 "result": result, "provenance": .string(provenance.line(now: Date()))])
         case .page(var page, let provenance):
             guard page.corner == record.corner, page.text.utf8.count <= NativePage.maximumTextBytes else {
-                return Self.senseAttributed(Self.failure("bad_output", "The sense returned an invalid page after its act.", extra: ["effects": .string("unknown")]), record: record)
+                return Self.senseAttributed(Self.failure("bad_output", "The sense returned an invalid page after its act.", extra: ["effects": .string(
+                    "unknown")]), record: record)
             }
             if !record.verbsEnabled || record.origin == .shared {
                 for index in page.things.indices { page.things[index].verbs = page.things[index].verbs.filter(record.verbs.contains) }
             }
-            SensesHub.shared.didServe(provenance)
+            SensesHub.shared.didServe(provenance, reads: execution.invocation.senseReads)
             let captured: SenseMaterial? = if case .site = view.page.corner {
-                try? await freshSource.material(for: view.page.corner, address: nil)
+                try? await freshSource.material(for: view.page.corner, address: nil, operation: execution.senseOperation(turn: turn))
             } else { nil }
             SenseDoorViews.shared.remember(page, record: record, source: freshSource, scope: scope,
-                materialRef: view.materialRef, readInput: view.readInput, capturedMaterial: captured)
-            return .string(SenseDoor.render(page, provenance: provenance))
+                materialRef: view.materialRef, readInput: view.readInput, capturedMaterial: captured, turn: turn)
+            return .string(SenseDoor.render(page, provenance: provenance, readContent: execution.invocation.readContent))
         case .failed(let failure):
-            return Self.senseAttributed(Self.failure(failure.code, failure.message + " Check the corner before repeating the act.", extra: ["effects": .string("unknown")]), record: record)
+            return Self.senseAttributed(Self.failure(failure.code, failure.message + " Check the corner before repeating the act.", extra: ["effects": .string(
+                "unknown")]), record: record)
         }
     }
 
@@ -373,13 +372,13 @@ extension AppToolExecutor {
         return .object(["result": result, "provenance": .string(provenance)])
     }
 
-    /// The sandbox denies the entire private app/persona stores even when
-    /// ordinary Trust would permit a read. The sole sense action path does too.
+    /// The sandbox denies the entire private app/persona stores even when ordinary Trust would permit a read. The sole sense action path does too.
     private static func requireSenseActionPublic(_ action: AppAction, args: [String: JSONValue], target: String,
                                                  dataRoot: URL, personaRoot: URL) throws {
-        let privatePages: Set<String> = ["shell", "pairing", "memories", "personality", "trust", "settings", "senses", "diagnostics", "today", "chat", "inbox", "approvals", "providers"]
+        let privatePages: Set<String> = ["shell", "pairing", "memories", "personality", "trust", "settings", "senses", "diagnostics", "today", "chat", "inbox",
+            "approvals", "providers"]
         let privatePrefixes = ["persona.", "memory.", "mind.", "agent.", "trust.", "sense.", "senses.", "secret.", "provider.", "approval."]
-        let executableTools: Set<String> = ["run", "run_shell", "python", "script", "scripts", "script_run", "workshop", "workshop_run", "skill_run"]
+        let executableTools: Set<String> = ["run", "run_shell", "python", "script", "scripts", "script_run", "skill_run"]
         var refused = privatePages.contains(action.page) || privatePrefixes.contains(where: action.id.hasPrefix)
             || executableTools.contains(action.tool) || action.id.hasPrefix("script.") || action.id.hasPrefix("skill.")
         func inspect(_ value: JSONValue) {
@@ -401,7 +400,9 @@ extension AppToolExecutor {
             }
         }
         inspect(.object(args)); inspect(.string(target))
-        if refused { throw SenseFailure(code: "private_store", message: "A sense cannot reach private app stores, persona, memories, credentials, approvals or sense notebooks through an action.") }
+        if refused { throw SenseFailure(code: "private_store", message: """
+            A sense cannot reach private app stores, persona, memories, credentials, approvals or sense notebooks through an action.
+            """) }
     }
 }
 
@@ -417,18 +418,15 @@ private actor SenseActSource: SenseSourceProvider {
 
     func invalidate() { captured = nil }
 
-    func material(for corner: SenseCorner, address: String?) async throws -> SenseMaterial {
+    func material(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> SenseMaterial {
         guard corner == self.corner else { throw SenseFailure(code: "source_unavailable", message: "That corner is outside this act.") }
-        // Once an action has returned, verification reads obtain today's
-        // material through today's Trust policy instead of the earlier view.
+        // Once an action has returned, verification reads obtain today's material through today's Trust policy instead of the earlier view.
         if let captured { return captured }
-        return try await source.material(for: corner, address: self.address)
+        return try await source.material(for: corner, address: self.address, operation: operation)
     }
 }
 
-/// A site's generated code can translate a served verb, never select its own
-/// tab, snapshot, element or action family. Element identity comes from Chrome
-/// itself and survives node renumbering; old extensions cannot grant this proof.
+/// Generated code may translate a served verb but cannot choose routing. Chrome-issued element identity survives renumbering.
 private struct SiteSenseActionBoundary: Sendable {
     let address: String
     let verb: String
@@ -457,7 +455,9 @@ private struct SiteSenseActionBoundary: Sendable {
         }
         guard matched.count == 1, let old = matched.first,
               let identity = Self.string(old["elementIdentity"]) else {
-            throw SenseFailure(code: "node_identity_unavailable", message: "The served thing has no Chrome element identity; reload the updated Chrome extension and read the site again.")
+            throw SenseFailure(code: "node_identity_unavailable", message: """
+                The served thing has no Chrome element identity; reload the updated Chrome extension and read the site again.
+                """)
         }
         let candidates = newNodes.compactMap { value -> [String: JSONValue]? in
             guard case .object(let fields) = value, Self.string(fields["elementIdentity"]) == identity else { return nil }

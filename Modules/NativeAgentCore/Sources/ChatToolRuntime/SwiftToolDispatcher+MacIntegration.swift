@@ -21,7 +21,7 @@ import Studio
 import Senses
 import Research
 import TurnTrace
-// Blueprint: | `SwiftToolDispatcher+MacIntegration.swift` | `SwiftToolDispatcher`: one Mac integration invocation selected by `MacIntegrationGates.byTool`, with Mail binding before admission, backend execution after admission and result observations afterward; due-reminders carries the dispatcher's data root; read-only MapKit routes with every step, segment-distance meaning and explicit no-traffic timing; radius-bounded place search splits inline near/in/around locations and reports the split; distance-fraction lookup shares place/describe |
+// Blueprint: | `SwiftToolDispatcher+MacIntegration.swift` | `SwiftToolDispatcher`; declared integration admission; checked routes and maps |
 
 extension SwiftToolDispatcher {
     @MainActor
@@ -64,7 +64,10 @@ extension SwiftToolDispatcher {
                 "note": .string("Split the query at its first near/in/around because no separate near was supplied.")])
         }
         guard !query.isEmpty, !near.isEmpty else {
-            throw AutonomyGateError.toolDenied(reason: "Place search needs search terms and a place: supply near or include it in query, for example 'coffee near Tampa airport'. Include city/region to disambiguate.")
+            throw AutonomyGateError.toolDenied(reason: """
+                Place search needs search terms and a place: supply near or include it in query, for example 'coffee near Tampa airport'. \
+                Include city/region to disambiguate.
+                """)
         }
         let radius: Double
         switch input["radius_miles"] {
@@ -107,9 +110,11 @@ extension SwiftToolDispatcher {
         try Task.checkCancellation()
         return .object(["status": .string("completed"), "source": .string("MapKit"),
             "query": .string(query), "query_split": querySplit, "near": .object(describe(center)), "radius_miles": .double(radiusMiles),
-            "distance_unit": .string(miles ? "miles" : "km"), "distance_basis": .string("Straight-line distance from the resolved near location, not route distance."),
+            "distance_unit": .string(miles ? "miles" : "km"), "distance_basis": .string(
+                "Straight-line distance from the resolved near location, not route distance."),
             "places": .array(rows), "returned_count": .int(Int64(rows.count)),
-            "message": .string(rows.isEmpty ? "MapKit returned no matching places within \(radiusMiles) miles of the resolved near location." : "Matching places within the radius, sorted by straight-line distance; MapKit results may not include every place.")])
+            "message": .string(rows.isEmpty ? "MapKit returned no matching places within \(radiusMiles) miles of the resolved near location."
+                : "Matching places within the radius, sorted by straight-line distance; MapKit results may not include every place.")])
     }
 
     @MainActor
@@ -155,9 +160,12 @@ extension SwiftToolDispatcher {
             "route_name": .string(route.name), "distance_meters": .double(route.distance),
             "expected_travel_time_seconds": .double(route.expectedTravelTime),
             "traffic": .string("not_included"),
-            "travel_time_basis": .string("MKRoute.expectedTravelTime estimates travel under ideal conditions, without live traffic. No traffic-aware ETA was requested."),
-            "step_distance_basis": .string("Each distance_meters is the route segment associated with that step, not the length of the turn or exit manoeuvre itself."),
-            "steps": .array(steps.map { .object(["index": .int(Int64($0.offset)), "instruction": .string($0.element.instructions), "distance_meters": .double($0.element.distance)]) }),
+            "travel_time_basis": .string(
+                "MKRoute.expectedTravelTime estimates travel under ideal conditions, without live traffic. No traffic-aware ETA was requested."),
+            "step_distance_basis": .string(
+                "Each distance_meters is the route segment associated with that step, not the length of the turn or exit manoeuvre itself."),
+            "steps": .array(steps.map { .object(["index": .int(Int64($0.offset)), "instruction": .string($0.element.instructions),
+                "distance_meters": .double($0.element.distance)]) }),
             "total_steps": .int(Int64(route.steps.count)), "steps_total": .int(Int64(route.steps.count)), "has_more": .bool(false)]
         if let fraction {
             let points = route.polyline.points(), count = route.polyline.pointCount
@@ -190,9 +198,7 @@ extension SwiftToolDispatcher {
 
     // MARK: - Mac integration dispatch
 
-    /// The refusal a switch User turned off gives this tool, whatever the
-    /// posture: asked here at dispatch, and by the approval gate before any
-    /// card, so a card never asks for what the switch would refuse.
+    /// Check the user’s disabled switch at dispatch and before approval so a card never requests a refused action.
     package static func switchRefusal(integration: String, mode: MacIntegrationPermissionMode,
                                       store: MacIntegrationPermissionStore) async throws -> JSONValue? {
         guard let refusal = try await store.readinessChecked().refusal(integration: integration, mode: mode) else { return nil }
@@ -203,7 +209,7 @@ extension SwiftToolDispatcher {
                 instruction: "Only the owner can enable this switch.")]))
     }
 
-    package static func macIntegrationDeniedEnvelope(
+    package static func macIntegrationDeniedEnvelope(invocation: ChatToolInvocation,
         integration: String, mode: MacIntegrationPermissionMode, store: MacIntegrationPermissionStore
     ) async throws -> JSONValue {
         if let refusal = try await switchRefusal(integration: integration, mode: mode, store: store) {
@@ -214,7 +220,7 @@ extension SwiftToolDispatcher {
         if let need = InlineInteractionRegistry.permission(
             [integration], why: fixHint, mode: mode == .read ? .read : .write
         ) {
-            return InlineInteractionNeed.envelope(need)
+            return InlineInteractionNeed.envelope(invocation: invocation, need)
         }
         return ChatToolOutcome.refusedBeforeRunning(.object([
             "status": .string("denied"),
@@ -228,41 +234,42 @@ extension SwiftToolDispatcher {
         ]))
     }
 
-    func dispatchMacIntegrationTool(
+    func dispatchMacIntegrationTool(turn: Turn, invocation: ChatToolInvocation,
         tool: String,
         surface: String,
         input: [String: JSONValue]
     ) async throws -> JSONValue {
-        if MacAppActGate.dataRoot != dataRoot {
-            return try await MacAppActGate.$dataRoot.withValue(dataRoot) {
-                try await dispatchMacIntegrationTool(tool: tool, surface: surface, input: input)
-            }
-        }
         // Bind observed Mail identities before admission, without executing a backend.
         let input = ["mail_save_attachment", "mail_read_batch", "mail_triage_batch"].contains(tool)
-            ? AgentWorkspace.bindMail(input, dataRoot: dataRoot) : input
-        guard let (integration, mode) = MacIntegrationGates.byTool[tool] else {
+            ? AgentWorkspace.bindMail(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation), input, dataRoot: dataRoot) : input
+        guard let access = Self.macIntegrationAccess(forTool: tool) else {
             throw ToolFailureError("Mac integration tool has no permission declaration: \(tool)", effects: .none)
         }
-        let admitted = await fullMacYoloAdmitted(surface: surface)
+        let (integration, mode) = (access.integration, access.mode)
+        let admitted = await fullMacYoloAdmitted(turn: turn, surface: surface)
         let allowed = try await macIntegrationPermissionStore.allows(integration, mode: mode)
         guard allowed else {
-            return try await Self.macIntegrationDeniedEnvelope(integration: integration, mode: mode, store: macIntegrationPermissionStore)
+            return try await Self.macIntegrationDeniedEnvelope(invocation: invocation, integration: integration, mode: mode,
+                store: macIntegrationPermissionStore)
         }
-        guard let bridge = macIntegrationBridge else {
+        guard let integrationBridge = macIntegrationBridge else {
             return ChatToolOutcome.refusedBeforeRunning(.object([
                 "status": .string("failed"),
                 "reason": .string("bridge_not_wired"),
                 "integration": .string(integration),
-                "message": .string("Mac integration is unavailable in this caller. Call app from the installed app's chat tool chain; supplying a session id cannot attach it."),
+                "message": .string("""
+                    Mac integration is unavailable in this caller. Call app from the installed app's chat tool chain; supplying a session id \
+                    cannot attach it.
+                    """),
                 "remedy": .object(["kind": .string("correct_arguments"),
                     "instruction": .string("Call app from the installed app's chat tool chain."), "next_call": .null]),
             ]))
         }
+        let bridge = integrationBridge.serving(turn: turn.with(\.fullMacAdmitted, admitted), context: invocation.macContext(dataRoot: dataRoot))
         let result: JSONValue
         switch tool {
         case "mac_calendar_list_upcoming":
-            result = HerScreen.notedLifeRead("calendar", try await bridge.calendarListUpcoming(input: input), dataRoot: dataRoot)
+            result = AgentScreen.notedLifeRead("calendar", try await bridge.calendarListUpcoming(input: input), dataRoot: dataRoot)
         case "mac_calendar_calendars": result = try await bridge.calendarCalendars(input: input)
         case "mac_calendar_free_busy": result = try await bridge.calendarFreeBusy(input: input)
         case "mac_calendar_create_event": result = try await bridge.calendarCreateEvent(input: input)
@@ -273,7 +280,7 @@ extension SwiftToolDispatcher {
         case "mac_reminders_read": result = try await bridge.remindersRead(input: input)
         case "mac_reminders_update": result = try await bridge.remindersUpdate(input: input)
         case "mac_reminders_list_due_today":
-            result = HerScreen.notedLifeRead("reminders", try await bridge.remindersListDueToday(input: input, dataRoot: dataRoot), dataRoot: dataRoot)
+            result = AgentScreen.notedLifeRead("reminders", try await bridge.remindersListDueToday(input: input, dataRoot: dataRoot), dataRoot: dataRoot)
         case "mac_reminders_create": result = try await bridge.remindersCreate(input: input)
         case "mac_reminders_list_rename": result = try await bridge.remindersListRename(input: input)
         case "mac_reminders_list_create": result = try await bridge.remindersListCreate(input: input)
@@ -291,10 +298,11 @@ extension SwiftToolDispatcher {
             let attachment = try await bridge.mailAttachment(input: input)
             var fileInput = input
             fileInput["path"] = input["destination"] ?? .string("~/Downloads")
-            if try await fullMacToolAccess(surface: surface).fileOpsAllowed {
-                return try await impl_local_connector_tool(tool: tool, input: fileInput, surface: surface, attachment: attachment)
+            if try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed {
+                return try await impl_local_connector_tool(turn: turn, invocation: invocation, tool: tool, input: fileInput, surface: surface,
+                    attachment: attachment)
             }
-            return try await impl_trusted_file_mutation(tool: tool, input: fileInput, attachment: attachment)
+            return try await impl_trusted_file_mutation(turn: turn, invocation: invocation, tool: tool, input: fileInput, attachment: attachment)
         case "mail_list_recent": result = try await bridge.mailListRecent(input: input)
         case "mail_read_batch": result = try await bridge.mailReadBatch(input: input)
         case "mail_triage_batch": result = try await bridge.mailTriageBatch(input: input)
@@ -326,8 +334,9 @@ extension SwiftToolDispatcher {
         default: throw ToolFailureError("Mac integration tool has no backend: \(tool)", effects: .none)
         }
         if ["mail_list_recent", "mail_search", "mail_senders"].contains(tool) {
-            HerReadBadges.shared.note(result, dataRoot: dataRoot)
-            return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: result, dataRoot: dataRoot)
+            AgentReadBadges.shared.note(result, dataRoot: dataRoot)
+            return AgentWorkspace.attachReadReferences(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
+                tool: tool, input: input, result: result, dataRoot: dataRoot)
         }
         if integration == MacIntegrationID.messages, case .object(var fields) = result,
            fields["reason"] == .string("database_unavailable") || fields["history_reason"] == .string("database_unavailable") {

@@ -2,67 +2,61 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import BackgroundLoops
+import Cognition
 import PersistenceCore
 import DreamREMCycle
 import ProviderRouting
-// Blueprint: | `WeeklySelfImprovementLoop.swift` | `WeeklySelfImprovementLoop`: weekly/manual reservation, model synthesis, proposal validation, settlement and digest; EngineLaunch supplies Workshop outcomes through the maintenance part door; unavailable evidence fails the pass; DoctorFacade owns observed digest reads |
+// Blueprint: | `WeeklySelfImprovementLoop.swift` | `WeeklySelfImprovementLoop`; Shared reservation, checked proposals and digest |
 
-/// Weekly analysis of chat, live errors and Doctor health using the configured LLM.
-/// Runtime findings stage approval cards; code findings use the injected builder queue
-/// or remain digest-only. Operational failures return a failed scheduler outcome.
+/// Runtime findings stage approval; code findings use the builder queue or digest only.
+/// Operational failures remain failed scheduler outcomes.
 public struct WeeklySelfImprovementLoop: LoopRunner {
+    public static let defaultPeriod: TimeInterval = 7 * 24 * 60 * 60
     public let loopId: String = "self_improvement_sweep"
-    public let interval: TimeInterval
-    /// A weekly analysis has an hour to read usage and complete its model call.
+    let period: TimeInterval
+    public var wake: OrganWake { .every(period) }
     public var tickTimeoutOverride: TimeInterval? { 3600 }
 
     private let llm: any LLMClient
     let dataRoot: URL
     private let clock: @Sendable () -> Date
-    /// The owning factory combines the self-improvement switch and unattended-work authority.
     private let isEnabled: @Sendable () async -> Bool
-    /// Stages a runtime proposal through the approval inbox and returns its card id.
-    /// Write failures fail the pass and release the weekly reservation.
+    /// Staging failures release the weekly reservation for retry.
     private let stageProposal: @Sendable (SelfImprovementProposal) async throws -> String
     /// The factory files code findings on the builder's queue; nil keeps them digest-only.
     private let fileCodeFinding: (@Sendable (SelfImprovementProposal) async throws -> Void)?
-    /// EngineLaunch supplies weekly execution outcomes through the maintenance part door.
-    /// Empty history omits the signal; unavailable evidence fails the pass.
-    private let workshopOutcomes: @Sendable () async throws -> String
-    /// Previous-card outcomes, lesson misses and standing corrections; the default learns nothing.
+    /// The agent's jobs that ended lately; none omits the signal, unreadable jobs fail the pass.
+    private let jobOutcomes: @Sendable () async throws -> String
+    /// Missing prior learning contributes nothing; it cannot invent a correction.
     private let learning: @Sendable (_ previousCards: [String]?) async throws -> SelfImprovementLearning
-    /// Stages the standing lessons the analyst wrote (memory id → GROWTH line)
-    /// as REM cards and returns their REM proposal ids. Throws like `stageProposal`.
+    /// REM staging shares proposal failure semantics so incomplete learning cannot commit the pass.
     private let stageStandingLessons: @Sendable ([String: String]) async throws -> [String]
 
     public init(
-        interval: TimeInterval = 7 * 24 * 60 * 60,
+        interval: TimeInterval = Self.defaultPeriod,
         llm: any LLMClient,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         clock: @escaping @Sendable () -> Date = { Date() },
         isEnabled: @escaping @Sendable () async -> Bool,
         stageProposal: @escaping @Sendable (SelfImprovementProposal) async throws -> String,
         fileCodeFinding: (@Sendable (SelfImprovementProposal) async throws -> Void)? = nil,
-        workshopOutcomes: @escaping @Sendable () async throws -> String,
+        jobOutcomes: @escaping @Sendable () async throws -> String,
         learning: @escaping @Sendable (_ previousCards: [String]?) async throws -> SelfImprovementLearning = { _ in SelfImprovementLearning() },
         stageStandingLessons: @escaping @Sendable ([String: String]) async throws -> [String] = { _ in [] }
     ) {
-        self.interval = interval
+        self.period = interval
         self.llm = llm
         self.dataRoot = dataRoot
         self.clock = clock
         self.isEnabled = isEnabled
         self.stageProposal = stageProposal
         self.fileCodeFinding = fileCodeFinding
-        self.workshopOutcomes = workshopOutcomes
+        self.jobOutcomes = jobOutcomes
         self.learning = learning
         self.stageStandingLessons = stageStandingLessons
     }
 
-    /// Requests one cadence-bypassing pass without deleting the canonical
-    /// weekly stamp from a view. The request and the loop's stamp decision use
-    /// the same cross-process lock, so a manual click cannot open a duplicate
-    /// execution window beside a periodic/BGTask tick.
+    /// Share the stamp’s cross-process lock so a manual request cannot duplicate periodic or BGTask work.
     public static func requestManualRun(dataRoot: URL) async throws -> String {
         let directory = dataRoot.appendingPathComponent("self_improvement", isDirectory: true)
         let marker = directory.appendingPathComponent("last_weekly_run")
@@ -75,8 +69,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         return token
     }
 
-    /// Clears any unconsumed request after the one-shot caller has received a
-    /// terminal/coalesced result. If the loop consumed it, this is a no-op.
+    /// Clear only unconsumed requests after the caller receives its terminal or coalesced result.
     public static func clearManualRunRequest(dataRoot: URL, token: String) async throws {
         let directory = dataRoot.appendingPathComponent("self_improvement", isDirectory: true)
         let marker = directory.appendingPathComponent("last_weekly_run")
@@ -90,12 +83,25 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         }
     }
 
+    /// Its loop and the manual run both tick here, so the sweep beats here once per pass, worked with the cards it staged.
     public func tickOutcome() async -> LoopTickOutcome {
+        let (outcome, staged) = await sweep()
+        if case .skipped(let reason, _) = outcome, reason == Self.cancelledReason {
+            OrganJudge.beat(loopId, .stopped, note: reason, cadence: wake.period)
+        } else {
+            OrganJudge.beat(loopId, tick: outcome, yield: staged, cadence: wake.period)
+        }
+        return outcome
+    }
+
+    static let cancelledReason = "weekly pass cancelled"
+
+    private func sweep() async -> (outcome: LoopTickOutcome, staged: Int?) {
         guard await isEnabled() else {
             FileHandle.standardError.write(Data(
                 "WeeklySelfImprovementLoop: disabled (enableAutonomy off)\n".utf8
             ))
-            return .off("self-improvement or unattended work switched off")
+            return (.off("self-improvement or unattended work switched off"), nil)
         }
         do {
             try Task.checkCancellation()
@@ -110,7 +116,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             // Reserve under the cross-process lock before analysis; consume manual requests there too.
             // Failures release the reservation so the next tick can retry.
             let nowStamp = ISO8601DateFormatter().string(from: now)
-            let intervalFloor = interval - 24 * 60 * 60
+            let intervalFloor = period - 24 * 60 * 60
             let reservation = await reserveOncePerPeriod(at: marker, stamp: nowStamp) { stored in
                 let forced = FileManager.default.fileExists(atPath: manualRequest.path)
                 if forced {
@@ -123,7 +129,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             let rollback: @Sendable () async -> Void
             switch reservation {
             case .alreadyReserved:
-                return .skipped(reason: "weekly pass already committed")
+                return (.skipped(reason: "weekly pass already committed"), nil)
             case .failed(let error):
                 throw error
             case .reserved(_, let rb):
@@ -136,9 +142,9 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             // Release the reservation on failure; cancellation after staging keeps it.
             do {
             try Task.checkCancellation()
-            var signals = try gatherSignals(now: now)
+            var signals = try await gatherSignals(now: now)
             // Empty execution history contributes no prompt section.
-            let outcomes = try await workshopOutcomes()
+            let outcomes = try await jobOutcomes()
             try Task.checkCancellation()
             if !outcomes.isEmpty { signals += "\n\n" + outcomes }
             let learned = try await learning(previousPassCards())
@@ -154,7 +160,8 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
                 prompt: Self.analysisPrompt(signals: signals, now: now),
                 system: Self.systemPrompt,
                 model: nil,
-                surface: "self_improvement", purpose: "self_improvement", tools: nil
+                tools: nil,
+                call: LLMCall(turn: nil, surface: "self_improvement", purpose: "self_improvement")
             )
             // Invalid output fails the pass; retain the returned bytes in its failed digest.
             let parsed = Self.parseResult(raw)
@@ -162,10 +169,13 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             guard var result = parsed else {
                 throw NSError(domain: "WeeklySelfImprovementLoop", code: 1, userInfo: [
                     NSLocalizedDescriptionKey:
-                        "invalid weekly analysis response: expected nonempty summary, findings with complete evidence/change and valid runtime operations, and standing lesson rows. Returned bytes are retained in the failed digest."
+                        """
+                            invalid weekly analysis response: expected nonempty summary, findings with complete evidence/change and valid runtime operations, \
+                            and standing lesson rows. Returned bytes are retained in the failed digest.
+                            """
                 ])
             }
-            // The cards this pass leaves, by id: the next pass follows them up.
+            // Retain card ids so the next pass can follow their outcomes.
             try Task.checkCancellation()
             for proposal in result.proposals where proposal.kind == .runtime {
                 try Task.checkCancellation()
@@ -193,29 +203,31 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             passSucceeded = true
             await saveDigest(result: result, raw: raw, outcomes: outcomes, cards: cards, now: now, terminal: "done")
             FileHandle.standardError.write(Data(
-                "WeeklySelfImprovementLoop: runtime=\(result.proposals.filter { $0.kind == .runtime }.count) code=\(result.proposals.filter { $0.kind == .code }.count)\n".utf8
+                """
+                    WeeklySelfImprovementLoop: runtime=\(result.proposals.filter { $0.kind == .runtime }.count) \
+                    code=\(result.proposals.filter { $0.kind == .code }.count)\n
+                    """.utf8
             ))
-            return .completed(result: "weekly proposals staged")
+            return (.completed(result: "weekly proposals staged"), cards.count)
             } catch {
                 if let produced {
                     await saveDigest(result: produced.result, raw: produced.raw, outcomes: produced.outcomes,
                                      cards: cards, now: now,
                                      terminal: Task.isCancelled || error is CancellationError ? "stopped" : "failed: \(error)")
                 }
-                // Once staging begins, cancellation cannot unstage its effects.
-                // Keep the reservation then so a retry cannot duplicate them.
+                // Staged effects cannot be unstaged on cancellation; retain the reservation to prevent duplicates.
                 if !passSucceeded && !(stagingStarted && (Task.isCancelled || error is CancellationError)) {
                     await rollback()
                 }
                 throw error
             }
         } catch is CancellationError {
-            return .skipped(reason: "weekly pass cancelled")
+            return (.skipped(reason: Self.cancelledReason), nil)
         } catch {
             FileHandle.standardError.write(Data(
                 "WeeklySelfImprovementLoop: tick failed: \(error)\n".utf8
             ))
-            return .failed(error: String(describing: error))
+            return (.failed(error: String(describing: error)), nil)
         }
     }
 
@@ -227,8 +239,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         }
     }
 
-    /// The ONLY ops a runtime proposal may carry. Each is safe, reversible, and
-    /// already a user-triggerable action; applied only on explicit approval.
+    /// Only safe reversible user-triggerable operations may be proposed, and explicit approval must precede application.
     static let applyOps: Set<String> = ["disable_skill", "enable_skill"]
 
     static func analysisPrompt(signals: String, now: Date) throws -> String {
@@ -240,13 +251,10 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     struct Result: Sendable {
         var summary: String
         var proposals: [SelfImprovementProposal]
-        /// Memory id → the GROWTH line the analyst wrote for it.
         var standing: [String: String] = [:]
     }
 
-    /// Returns nil unless the complete declared response is valid —
-    /// the caller must treat that as a failed pass (retry next tick), NOT as
-    /// an empty "nothing found" result.
+    /// Invalid complete responses fail the pass; nil cannot mean that analysis found nothing.
     static func parseResult(_ raw: String) -> Result? {
         guard let fields = try? JSONValue.decodeCompletion(raw, as: [String: JSONValue].self) else { return nil }
         let obj = fields.mapValues(\.foundationObject)
@@ -262,9 +270,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             else { return nil }
             switch f["kind"] as? String {
             case "runtime":
-                // A staged runtime proposal MUST carry a valid, executable op —
-                // otherwise its Approve button is a dead no-op. No valid op →
-                // invalidate the response (the model was told to classify it "code").
+                // Reject runtime proposals without an executable op so approval cannot become a dead button.
                 guard let apply = f["apply"] as? [String: Any],
                       let op = apply["op"] as? String,
                       applyOps.contains(op),
@@ -298,8 +304,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
 
     // MARK: - Digest
 
-    /// Writes the weekly digest (summary + every finding, runtime and code) to
-    /// `<dataRoot>/self_improvement/digests/YYYY-MM-DD.md` for the UI/report.
+    /// Retain every finding so the digest and UI share one pass’s evidence.
     private func saveDigest(result: Result, raw: String, outcomes: String, cards: [String], now: Date, terminal: String) async {
         await settle {
             do { try self.writeDigest(result: result, raw: raw, outcomes: outcomes, cards: cards, now: now, terminal: terminal) }
@@ -342,8 +347,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
 
     // MARK: - Helpers
 
-    /// The cards the newest digest already written recorded — the previous
-    /// pass's. Nil when there is no earlier digest.
+    /// Follow the newest recorded digest; absence supplies no previous cards.
     private func previousPassCards() throws -> [String]? {
         let dir = dataRoot.appendingPathComponent("self_improvement", isDirectory: true)
             .appendingPathComponent("digests", isDirectory: true)

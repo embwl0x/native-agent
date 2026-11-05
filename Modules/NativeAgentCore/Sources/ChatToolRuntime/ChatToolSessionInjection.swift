@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ChatTurnContracts
-// Blueprint: | `ChatToolSessionInjection.swift` | `ChatToolSessionInjection`: explicit-input extraction, verified-session → tool-loop-session selection and shared internal/tool-specific session injection |
+// Blueprint: | `ChatToolSessionInjection.swift` | `ChatToolSessionInjection`: Caller input cannot verify identity. |
 
 /// Shared session input handling; explicit caller fields confer no verified identity.
 package enum ChatToolSessionInjection {
@@ -16,16 +16,15 @@ package enum ChatToolSessionInjection {
         return ""
     }
 
-    /// Transport-verified session first, then the direct tool loop's session.
-    /// Without either, leave the caller's explicit input intact.
-    package static var currentSession: String? {
-        [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+    /// Transport-verified session first, then the direct tool loop's session. Without either, leave the caller's explicit input intact.
+    package static func currentSession(turn: Turn) -> String? {
+        [turn.verifiedSessionID, turn.session]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
     }
 
-    package static func apply(toolName: String, input: [String: JSONValue]) -> [String: JSONValue] {
-        apply(toolName: toolName, input: input, sessionId: currentSession)
+    package static func apply(turn: Turn, toolName: String, input: [String: JSONValue]) -> [String: JSONValue] {
+        apply(toolName: toolName, input: input, sessionId: currentSession(turn: turn))
     }
 
     package static func apply(
@@ -37,8 +36,7 @@ package enum ChatToolSessionInjection {
               !sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return input
         }
-        // Always inject __session_id so the dispatcher and the app door have
-        // it without the LLM having to remember to pass it.
+        // Inject __session_id so dispatch and the app door do not depend on model-supplied session fields.
         var out = input
         out["__session_id"] = .string(sessionId)
         if toolName == "scratchpad_read" {
@@ -53,7 +51,7 @@ package enum ChatToolSessionInjection {
             out["current_session_id"] = .string(sessionId)
         }
         if toolName == "tool_result_page" {
-            // Auto-fill session_id so the LLM doesn't have to remember it.
+            // Inject the session so model omission cannot lose continuity.
             let hasSession: Bool = {
                 if case .string(let s) = out["session_id"] ?? .null,
                    !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

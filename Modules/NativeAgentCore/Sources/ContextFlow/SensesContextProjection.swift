@@ -1,10 +1,11 @@
 import Context
+import NativeAgentCore
 import Foundation
 import MemoryV2
 import Senses
-// Blueprint: | `SensesContextProjection.swift` | `UnreadSenseNews`: four bounded unread `news` atoms from `SenseNewsBoard`, selected from the published generation, verified still unread before delivery (unread news does not expire), separately rendered and acknowledged only on provider output; seen exclusion also protects retained generations |
+// Blueprint: | `SensesContextProjection.swift` | `UnreadSenseNews`: bounded `news` from `SenseNewsBoard`; verify unread, acknowledge on output |
 
-/// A bounded unread-news slot, separate from topic-selected memories.
+/// Unread news has its own bounded slot so topical memory selection cannot crowd it out.
 public struct UnreadSenseNews: ContextCompiledProjectionProvider, Sendable {
     public static let maximumItems = 4
     public static let maximumUTF8Bytes = 4_096
@@ -72,12 +73,10 @@ public struct UnreadSenseNews: ContextCompiledProjectionProvider, Sendable {
                   !ContextSecretContentPolicy.containsSecretLikeContent(safeAddress),
                   !ContextSecretContentPolicy.containsSecretLikeContent(safeSummary),
                   !ContextSecretContentPolicy.containsSecretLikeContent(raw) else { continue }
-            // The address never spends the delta's reserved space. Ellipses
-            // explicitly identify bounded prefixes; no clipped line is whole.
+            // Reserve delta space before the address; ellipses identify clipped prefixes.
             let address = bounded(NativeContextProjectionText.clean(safeAddress), bytes: 320)
             let lead = "\(time) · \(tag) · \(address) · "
-            // Keep each update visible. Divide the remaining space over the
-            // short lines instead of letting the newest consume older news.
+            // Keep each update visible. Divide the remaining space over the short lines instead of letting the newest consume older news.
             let summaryLines = safeSummary.split(separator: "\n").map { NativeContextProjectionText.clean(String($0)) }
             let summaryBudget = max(0, Self.maximumItemUTF8Bytes - lead.utf8.count)
             let lineBudget = max(4, (summaryBudget - max(0, summaryLines.count - 1)) / max(1, summaryLines.count))

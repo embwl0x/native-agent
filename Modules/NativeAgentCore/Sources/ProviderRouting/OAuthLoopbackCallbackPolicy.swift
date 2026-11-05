@@ -11,7 +11,10 @@ public enum OAuthLoopbackCallbackError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .timedOut:
-            return "oauth_callback_timeout: No browser callback arrived before the sign-in deadline. Start a new sign-in from its original control and finish it before the deadline."
+            return """
+                oauth_callback_timeout: No browser callback arrived before the sign-in deadline. Start a new sign-in from its original control and finish \
+                it before the deadline.
+                """
         case .canceled:
             return "oauth_sign_in_cancelled: The sign-in listener was cancelled. Leave sign-in stopped; no further action is needed."
         case .alreadyWaiting:
@@ -19,7 +22,10 @@ public enum OAuthLoopbackCallbackError: LocalizedError {
         case .invalidTimeout:
             return "oauth_callback_invalid_timeout: The sign-in timeout must be finite, nonnegative and representable by the callback clock."
         case .socket(let message):
-            return "oauth_callback_socket_failed: \(message) Inspect this local socket error and correct the loopback listener before starting a new sign-in from its original control."
+            return """
+                oauth_callback_socket_failed: \(message) Inspect this local socket error and correct the loopback listener before starting a new sign-in \
+                from its original control.
+                """
         }
     }
 }

@@ -3,29 +3,27 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgram.swift` | Program contract separating source digest from caller/candidate version, run/face entries over the same source, and ProgramProgressWindow: shared ContinuousClock renewal, host-wait exclusion and deadlines, with independent supervisor/JSC enforcement |
+// Blueprint: | `OwnedProgram.swift` | Source and candidate identities, run/face entries and shared monotonic progress-window policy |
 
-/// Exact executable bytes, not an admission. The lifecycle owner checks the
-/// selected version and authority before handing a program to the runner.
+/// Executable bytes grant no admission; the lifecycle owner checks selected version and authority before execution.
 public struct OwnedProgram: Codable, Sendable, Equatable {
-    /// `tool` and `skill` survive only as the kind sealed into a part's
-    /// earlier versions (their digests hash it): every one runs as a part.
+    /// Version digests seal their kind, so every part must retain its sealed kind.
     public enum Kind: String, Codable, Sendable { case sense, part = "ability", script, turn, tool, skill }
     public enum Entry: String, Codable, Sendable { case functionBody, run, face, sense }
 
     public let kind: Kind
     public let id: String
-    /// Caller-supplied execution identity; candidates replace it with their full seal.
+    /// Execution identity is caller-supplied; candidate identity seals all inputs.
     public let version: String
     public let source: String
-    /// SHA-256 of source alone; distinct from the candidate's version.
+    /// Hash only source bytes so this digest remains distinct from candidate identity.
     public let digest: String
     public let entry: Entry
     public let schema: JSONValue
     public let dependencies: [String]
     public let permissions: [String]
     public let reach: SenseReach
-    /// Renewable no-progress seconds, excluding host waits: sense 30, ability 10, other 60 by default.
+    /// Host waits must not spend the renewable no-progress window.
     public let seconds: Double
     private let resident: Bool?
     public var isResident: Bool { resident == true }
@@ -35,7 +33,6 @@ public struct OwnedProgram: Codable, Sendable, Equatable {
                 permissions: [String] = [], reach: SenseReach = SenseReach(), seconds: Double? = nil, resident: Bool = false) {
         self.kind = kind; self.id = id; self.version = version; self.source = source; self.entry = entry
         self.schema = schema; self.dependencies = dependencies; self.permissions = permissions; self.reach = reach
-        // Her parts run under one rule.
         self.seconds = seconds ?? (kind == .sense ? 30 : [.part, .tool, .skill].contains(kind) ? 10 : 60)
         self.resident = resident ? true : nil
         digest = SHA256.hash(data: Data(source.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -44,12 +41,9 @@ public struct OwnedProgram: Codable, Sendable, Equatable {
     public var sourceLimit: Int { AbilityStore.sourceLimit }
     public var returnLimit: Int { isPart || kind == .turn ? 4 * 1024 * 1024 : OwnedProgramRunner.returnLimit }
     public var inputLimit: Int { isPart || kind == .turn ? returnLimit : OwnedProgramRunner.inputLimit }
-    /// One of her parts, whichever door made it.
     public var isPart: Bool { [.part, .tool, .skill].contains(kind) }
-    /// The ability file kind its versions live in.
     public var storeKind: AbilityStore.Kind? { isPart ? .part : AbilityStore.Kind(rawValue: kind.rawValue) }
-    /// A part whose code uses steps, decisions or expectations runs strict:
-    /// each call journaled for a resume, and its receipt read exactly.
+    /// Journal strict calls for resume replay and interpret their receipts exactly.
     public var isStrict: Bool {
         isPart && Self.calls(source).usesStrictVerbs
     }
@@ -65,8 +59,7 @@ public struct OwnedProgram: Codable, Sendable, Equatable {
     }
 }
 
-/// The supervisor and JSC watchdog keep independent progress evidence and
-/// enforcement, with one monotonic renewal/host-wait/deadline policy.
+/// The supervisor and JSC enforce independently but must share one monotonic renewal, host-wait and deadline policy.
 public struct ProgramProgressWindow: Sendable {
     public let seconds: Double
     private var last: ContinuousClock.Instant = .now
@@ -79,24 +72,21 @@ public struct ProgramProgressWindow: Sendable {
 }
 
 extension OwnedProgram {
-    /// The runner's own verbs on `app`, which are never actions.
+    /// Runner verbs on `app` are not registry actions.
     public static let verbs: Set<String> = ["read", "find", "log", "expect", "expect_fail", "decide", "step"]
 
-    /// The app actions a part's code calls by name through app members or literal door requests,
-    /// read outside its strings and comments. An id it builds at run time
-    /// can't be seen here, and the run's allowlist still stops it.
+    /// Inspect literal app calls outside strings and comments; runtime-built ids still require the run's allowlist.
     public static func calledActions(_ source: String) -> [String] {
         var seen: Set<String> = []
         return calls(source).literal.filter { $0.inferred && !$0.primitive }.map(\.id).filter { seen.insert($0).inserted }
     }
 
-    /// Keep offsets and lines while hiding literal text; template expressions are code.
+    /// Keep offsets and lines while hiding literal text because template expressions remain code.
     public static func code(_ source: String) -> String {
         lexed(source).code
     }
 
-    /// The same lexical pass supplies call inspection with literal boundaries;
-    /// comments and regular expressions can never become calls or action names.
+    /// Share literal boundaries with call inspection so comments and regular expressions cannot become action names.
     static func lexed(_ source: String) -> (code: String, literals: [Range<Int>]) {
         let text = Array(source.utf16)
         var masked = text, i = 0
@@ -158,7 +148,9 @@ extension OwnedProgram {
                     i += 2; previous = "increment"; continue
                 }
                 i += 1
-                if c == 123 { braces.append(["=", "(", "[", ",", ":", "?", "return", "yield", "await"].contains(previous) || (interpolation && previous.isEmpty)) }
+                if c == 123 {
+                    braces.append(["=", "(", "[", ",", ":", "?", "return", "yield", "await"].contains(previous) || (interpolation && previous.isEmpty))
+                }
                 if c == 125 {
                     if interpolation, braces.isEmpty { masked[i - 1] = 32; return }
                     regexAllowed = !(braces.popLast() ?? false)
@@ -175,21 +167,18 @@ extension OwnedProgram {
 
 }
 
-/// The app registry stays above Senses. These are its current facts, used by
-/// the shared journal; dependencies and permissions never grant an action.
+/// Registry facts flow down into Senses; dependencies and permissions never grant action authority.
 public struct OwnedProgramAction: Sendable {
     public let id: String
     public let partID: String?
     public let page: String
     public let read: Bool
     public let advisory: Bool
-    /// The action runs a program she wrote; a recording never runs one.
+    /// Recordings must not execute nested authored programs.
     public let program: Bool
     public let readOnly: @Sendable ([String: JSONValue]) -> Bool
-    /// False for calls that answer the script without a ledger row of their
-    /// own (a watch's frames: the watch leaves one receipt for them all).
+    /// Watch frames share the watch's receipt rather than creating independent ledger rows.
     public let journaled: Bool
-    /// Its writes are checked against a page version (not version-exempt).
     public let versioned: Bool
     public init(id: String, page: String, read: Bool, advisory: Bool = false, partID: String? = nil, program: Bool = false,
                 journaled: Bool = true, versioned: Bool = false, readOnly: @escaping @Sendable ([String: JSONValue]) -> Bool) {
@@ -198,8 +187,7 @@ public struct OwnedProgramAction: Sendable {
     }
 }
 
-/// Canonical domain evidence, not a second result classifier. The shared
-/// journal applies strict-run rules to these projections at every result depth.
+/// Use canonical domain evidence at every result depth instead of classifying results a second way.
 public struct OwnedProgramReceiptEvidence: Sendable {
     public let successful: Bool
     public let waiting: Bool
@@ -212,11 +200,8 @@ public struct OwnedProgramReceiptEvidence: Sendable {
     }
 }
 
-/// Lanes B/C supply Swift-owned hosts here: app calls re-enter the ordinary
-/// gates in the requesting task's context; tool primitives check the declared
-/// permissions and protected stores on every call. Live senses use their
-/// source-bound adapter on the same OwnedProgramProcess, without turn authority.
-/// Host profiles do not publish versions, expand Trust, or execute fallback code.
+/// App calls hand their execution's turn to ordinary gates; primitives check declared reach and protected stores on every call. Live senses use
+/// source-bound adapters without turn authority; hosts cannot publish versions or expand Trust.
 public protocol OwnedProgramHostProfile: Sendable {
     var actionIDs: [String] { get throws }
     var floorReasons: Set<String> { get }
@@ -228,37 +213,63 @@ public protocol OwnedProgramHostProfile: Sendable {
     func secretLine(_ text: String) -> Bool
     func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence
     func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue?
-    /// What a program's call gets back from its receipt: the tool's own data.
     func answer(_ receipt: JSONValue) -> JSONValue
-    func perform(_ input: [String: JSONValue]) async -> JSONValue
-    func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue
-    func decide(_ question: String, data: JSONValue) async throws -> JSONValue?
-    func checkPrimitive(_ operation: String, arguments: JSONValue) async -> JSONValue?
+    func perform(_ input: [String: JSONValue], execution: OwnedProgramExecution) async -> JSONValue
+    func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures, execution: OwnedProgramExecution) async -> JSONValue
+    func decide(_ question: String, data: JSONValue, execution: OwnedProgramExecution) async throws -> JSONValue?
+    func checkPrimitive(_ operation: String, arguments: JSONValue, execution: OwnedProgramExecution) async -> JSONValue?
     func primitiveAction(_ operation: String) -> OwnedProgramAction?
-    /// Return a terminal receipt with status, effects and result, including
-    /// partial/unknown effects on failure. Preview effects are suppressed; nested programs retain preview.
-    func primitive(_ operation: String, arguments: JSONValue, preview: Bool) async throws -> JSONValue
-    /// Her turn part's synchronous reach (`turn.persona()` and the rest).
-    func reach(_ name: String) async throws -> JSONValue
+    /// Keep partial and unknown effects in terminal receipts; suppress preview effects and propagate preview into nested programs.
+    func primitive(_ operation: String, arguments: JSONValue, preview: Bool, execution: OwnedProgramExecution) async throws -> JSONValue
+    func reach(_ name: String, execution: OwnedProgramExecution) async throws -> JSONValue
 }
 
 extension OwnedProgramHostProfile {
     public func answer(_ receipt: JSONValue) -> JSONValue { receipt }
-    public func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue {
-        await fixture.reply(input)
+    public func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures, execution: OwnedProgramExecution) async -> JSONValue {
+        await fixture.reply(input, execution: execution)
     }
-    public func decide(_ question: String, data: JSONValue) async throws -> JSONValue? { nil }
-    public func checkPrimitive(_ operation: String, arguments: JSONValue) async -> JSONValue? { nil }
+    public func decide(_ question: String, data: JSONValue, execution: OwnedProgramExecution) async throws -> JSONValue? { nil }
+    public func checkPrimitive(_ operation: String, arguments: JSONValue, execution: OwnedProgramExecution) async -> JSONValue? { nil }
     public func primitiveAction(_ operation: String) -> OwnedProgramAction? { nil }
-    public func primitive(_ operation: String, arguments: JSONValue, preview: Bool) async throws -> JSONValue {
+    public func primitive(_ operation: String, arguments: JSONValue, preview: Bool, execution: OwnedProgramExecution) async throws -> JSONValue {
         throw SenseFailure(code: "unsupported", message: "This host does not admit primitive \(operation).")
     }
-    public func reach(_ name: String) async throws -> JSONValue {
-        throw SenseFailure(code: "unsupported", message: "Only her turn part reaches turn.\(name)().")
+    public func reach(_ name: String, execution: OwnedProgramExecution) async throws -> JSONValue {
+        throw SenseFailure(code: "unsupported", message: "Only the agent's turn part reaches turn.\(name)().")
     }
 }
 
 public protocol OwnedProgramRunning: Sendable {
     func run(_ program: OwnedProgram, input: JSONValue?, preview: Bool,
-             replay: OwnedProgramRunner.Replay?, host: any OwnedProgramHostProfile) async -> JSONValue
+             replay: OwnedProgramRunner.Replay?, host: any OwnedProgramHostProfile, execution: OwnedProgramExecution) async -> JSONValue
+}
+
+/// One invocation's input, pinned contracts and call accumulators. The turn is
+/// held here and handed to the host; none of these values comes from a task.
+public struct OwnedProgramExecution: Sendable {
+    /// The model-dispatched tool operation, when this host call serves a part thought.
+    public var toolInvocation: ChatToolInvocation?
+    public var turn: Turn?
+    public var surface: String
+    public var input: JSONValue?
+    public var preview: Bool
+    public var wake: JSONValue?
+    public var options: OwnedProgramRunOptions
+    public var readContent: OwnedProgramRunner.ReadContent?
+    public var dependencySnapshot: (id: String, version: String, shapes: JSONValue)?
+    public var valueIdentity: (id: String, version: String)?
+    public var deadline: ContinuousClock.Instant?
+    public var deadlines: OperationDeadlines
+    public var onActivity: (@Sendable () -> Void)?
+    public init(turn: Turn?, surface: String, deadlines: OperationDeadlines, input: JSONValue? = nil, preview: Bool = false, wake: JSONValue? = nil,
+                options: OwnedProgramRunOptions = .init(), readContent: OwnedProgramRunner.ReadContent? = nil,
+                dependencySnapshot: (id: String, version: String, shapes: JSONValue)? = nil,
+                valueIdentity: (id: String, version: String)? = nil, deadline: ContinuousClock.Instant? = nil,
+                onActivity: (@Sendable () -> Void)? = nil) {
+        self.turn = turn; self.surface = surface; self.input = input; self.preview = preview; self.wake = wake; self.options = options
+        self.readContent = readContent; self.dependencySnapshot = dependencySnapshot; self.valueIdentity = valueIdentity;
+            self.deadline = deadline; self.onActivity = onActivity
+        self.deadlines = deadlines
+    }
 }

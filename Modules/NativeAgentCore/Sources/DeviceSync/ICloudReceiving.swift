@@ -5,6 +5,7 @@ import Cognition
 import Combine
 import NativeAgentShared
 import DeviceSyncState
+import Experiences
 import NativeAgentCore
 import ChatTurnRuntime
 import PersistenceCore
@@ -12,16 +13,50 @@ import MacControl
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `ICloudReceiving.swift` | Observer-bound chat drains and settlement; a retained bounded-cadence pairing/status read runs beside chat, so metadata latency cannot hold phone pickup |
+// Blueprint: | `ICloudReceiving.swift` | Retained chat drains; separate metadata reads cannot hold pickup. |
+
+/// The device a phone chat answers to, read once at admission; the phone writes both fields on every chat (ChatRuntimeControls.metadata).
+public struct ICloudPhoneRoute: Sendable, Equatable {
+    /// iphone or iphone:<device name>; every reply's targetSourceKey, so no other paired phone takes it.
+    let routeKey: String
+    /// The phone's client surface; the reply route's replyTo.
+    let replyTo: String
+    /// The only client surface the phone writes.
+    static let clientSurfaces: Set<String> = ["iphone"]
+    static let repairOperation = "phone.chat.route"
+
+    /// A field the phone always sends is missing or outside its set; `routeKey` is the device a refusal can still reach, nil when none can.
+    struct Malformed: Error {
+        let field: String
+        let words: String
+        let routeKey: String?
+    }
+
+    static func read(_ metadata: [String: String]?) throws(Malformed) -> ICloudPhoneRoute {
+        guard let routeKey = metadata?["routeKey"] else {
+            throw Malformed(field: "routeKey", words: "The iPhone message has no routeKey, so no device can be answered.", routeKey: nil)
+        }
+        guard AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(routeKey) else {
+            throw Malformed(field: "routeKey", words: """
+                The iPhone message's routeKey "\(routeKey.prefix(80))" names no device (accepted: iphone, iphone:<device name>), so none can be \
+                answered.
+                """, routeKey: nil)
+        }
+        guard let surface = metadata?["clientSurface"], clientSurfaces.contains(surface) else {
+            let given = metadata?["clientSurface"].map { "clientSurface \"\($0.prefix(40))\" is unknown" } ?? "clientSurface is missing"
+            throw Malformed(field: "clientSurface", words: """
+                iPhone message refused: its \(given) (accepted: \(clientSurfaces.sorted().joined(separator: ", "))). It wasn't started; update the \
+                iPhone app and send it again.
+                """, routeKey: routeKey)
+        }
+        return ICloudPhoneRoute(routeKey: routeKey, replyTo: surface)
+    }
+}
+
 extension iCloudBridge {
-    public func observeIncomingMessages(onMessage: @escaping (BridgeMessage) async -> Bool) {
-        // One forwarder registration replaces the previous handler.
+    public func observeIncomingMessages(onMessage: @escaping (BridgeMessage, ICloudPhoneRoute) async -> Bool) {
+        // Bind the callback before draining so a late observer cannot appear connected without a delivery route.
         messageHandler = onMessage
-        // Keep the transport callback bound to this bridge as well as draining
-        // records that arrived before the app-side forwarder. The production
-        // setup path already installs this same callback, but registering here
-        // is idempotent (the transport is last-registration-wins) and prevents
-        // a late/recovered observer from becoming a green bridge with no route.
         if let ck = deviceTransport {
             registerIncomingTransportObserver(ck)
             return
@@ -46,8 +81,7 @@ extension iCloudBridge {
             defer {
                 if self?.incomingObserverTaskID == taskID { self?.incomingObserverTask = nil }
             }
-            // Subscription registration is last-writer-wins. Retire the old
-            // registration before installing its replacement, even across await.
+            // Registration is last-writer-wins; retire the old callback before installing another, including across suspension.
             await previous?.value
             guard !Task.isCancelled, let self,
                   self.acceptsIncomingObserver(generation: observerGeneration) else { return }
@@ -61,8 +95,7 @@ extension iCloudBridge {
                     || message.metadata?["kind"] == PhoneRequestResult.messageKind else { return handled }
                 guard message.sender == "ios", let encoded = try? PairingSecret.existingSecretBase64(),
                       let secret = Data(base64Encoded: encoded), message.verifySignature(secret: secret) else { return handled }
-                // These deliveries have no answer of their own. Use the same
-                // signed progress channel as chat acceptance, durably over CK.
+                // Deliveries without answers still need durable signed progress so the phone can observe acceptance.
                 return (try? await self.sendChatMessage(text: "Mac received it", sessionID: message.sessionID,
                     correlationID: message.id, metadata: ["kind": "progress", "stage": "received"])) != nil
             }
@@ -93,21 +126,15 @@ extension iCloudBridge {
         else { return false }
         return BridgeMessage.innerActionSignatureError(data: data, signature: signature, secret: { secret }) == nil
     }
-    /// CK-3b: validate + forward a message pulled from the CloudKit transport,
-    /// mirroring `scanIosOutboxFiles`' checks. Returns true when the message is
-    /// HANDLED (delivered OR permanently rejected) so the transport advances its
-    /// cursor; false only when transiently undeliverable (runtime unavailable) so
-    /// the transport re-delivers next drain (the halt-on-undelivered contract).
+    /// Only handled or permanently rejected messages advance the cursor; transient runtime unavailability must permit redelivery.
     @MainActor
     func handleIncomingFromTransport(_ msg: BridgeMessage, observerGeneration: UInt64? = nil) async -> Bool {
-        // A shared HMAC key proves pairing, not direction. Reject before the
-        // ID cache or action dispatcher can claim an attacker-selected ID.
+        // HMAC proves pairing, not direction; reject before an attacker-selected id can enter caches or dispatch.
         guard msg.sender == "ios" else {
             if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
             syncStatus = "Rejected iPhone message (CloudKit): sender_invalid"
             return true
         }
-        // Already handled (persistent seen-set; the transport also dedups by id).
         if seenMessageIDs.contains(msg.id) { return true }
         let disposition: ICloudIncomingMessageDisposition
         let secret: Data
@@ -120,12 +147,10 @@ extension iCloudBridge {
         }
         if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
         if disposition == .permanentlyRejected(reason: "signature_invalid") {
-            // A phone that now signs with another Mac's key was moved there:
-            // its messages are that Mac's, not an attack on this one.
+            // A phone signing with another Mac's key belongs there; its message is not an attack on this Mac.
             if !phonePairedElsewhere { await claimPhonePairing() }
             if phonePairedElsewhere { return true }
-            // The phone's clock, like contact: an old-key message sent before
-            // newer accepted ones is not the latest word.
+            // An old-key message older than accepted contact is not the phone's latest word.
             let rejectedAt = min(msg.timestamp, Date())
             if rejectedAt > (lastPhoneRejectedAt ?? .distantPast) { lastPhoneRejectedAt = rejectedAt }
             if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
@@ -147,18 +172,18 @@ extension iCloudBridge {
                     // Chat and action ledgers may already own this expired request.
                     break
                 }
-                guard await sendIncomingRejection(msg, reason: Date() > msg.timestamp ? "request_expired" : "clock_ahead") else { return false }
+                // Place, sense and request-result envelopes carry no device route; the phone matches their refusal by correlation.
+                guard await sendIncomingRejection(msg, reason: Date() > msg.timestamp ? "request_expired" : "clock_ahead",
+                                                  routeKey: nil) else { return false }
             }
             nativeLog("[iCloudBridge] dropping iOS→Mac CK msg %@: %@", msg.id, reason)
-            // Do not reserve the rejected envelope's caller-selected ID:
-            // a fresh authenticated envelope may reuse it.
+            // Do not reserve a rejected caller-selected id; a fresh authenticated envelope may reuse it.
             syncStatus = "Rejected iPhone message (CloudKit): \(reason)"
             return true  // permanently rejected: consume, never wedge transport
         case .deliver:
             break
         }
-        // Every signed message is the phone's contact, its answers to our
-        // requests included: a phone that just answered is not silent.
+        // Every signed reply proves contact too; a phone that just answered is not silent.
         notePhoneContact(at: msg.timestamp)
         do {
             try await SignedPeerEvidenceStore.record(
@@ -236,7 +261,7 @@ extension iCloudBridge {
                 }
             }
             if delivery != .rejected { recordSeenMessageID(msg.id) }
-            // Persist consumed IDs synchronously on MainActor to prevent redelivery after restart.
+            // Persist consumed IDs on MainActor before returning so restart cannot redeliver them.
             if delivery != .rejected { persistCKSeenIDs() }
             lastSyncAt = Date()
             syncStatus = "Processed iPhone request (CloudKit)"
@@ -245,7 +270,8 @@ extension iCloudBridge {
         markMacRuntimeUnavailable()
         return false  // transient — retry next drain
     }
-    private func sendIncomingRejection(_ message: BridgeMessage, reason: String) async -> Bool {
+    /// A nil routeKey sends no targetSourceKey: only envelopes that never carry a device route are refused that way.
+    private func sendIncomingRejection(_ message: BridgeMessage, reason: String, routeKey: String?) async -> Bool {
         let text: String
         switch reason {
         case "request_expired":
@@ -259,16 +285,35 @@ extension iCloudBridge {
         }
         do {
             let isOutcomeError = reason == "unknown_outcome" || reason == "message_id_collision"
-            _ = try await sendChatMessage(text: text, sessionID: message.sessionID, correlationID: message.id,
-                                          metadata: ["kind": isOutcomeError ? "error" : "rejection", "reason": reason,
-                                                     "errorDetail": text,
-                                                     "targetSourceKey": message.metadata?["routeKey"]
-                                                        ?? message.metadata?["deviceSourceKey"]
-                                                        ?? message.metadata?["sourceKey"] ?? ""])
+            var metadata = ["kind": isOutcomeError ? "error" : "rejection", "reason": reason, "errorDetail": text]
+            if let routeKey { metadata["targetSourceKey"] = routeKey }
+            _ = try await sendChatMessage(text: text, sessionID: message.sessionID, correlationID: message.id, metadata: metadata)
             return true
         } catch {
             syncStatus = "iPhone response could not be sent — retaining request for retry"
             return false
+        }
+    }
+    /// A chat missing a field the phone always sends never runs. Its refusal goes only to the device it names; with no device named, the
+    /// Mac owes the repair instead of answering a guessed phone.
+    private func refuseMalformedChat(_ message: BridgeMessage, _ malformed: ICloudPhoneRoute.Malformed,
+                                     dataRoot: URL) async -> IncomingChatDelivery {
+        nativeLog("[iCloudBridge] refusing iOS chat %@: malformed %@", message.id, malformed.field)
+        guard let routeKey = malformed.routeKey else {
+            RepairOwed.owe(dataRoot, id: "phone-chat-route:" + message.id, kind: .run,
+                operation: ICloudPhoneRoute.repairOperation, owner: "iPhone chat",
+                words: malformed.words + " Message \(message.id) was not run and nothing was sent back.",
+                lever: "Update the iPhone app so each chat carries \(malformed.field), then send the message again.")
+            return .rejected
+        }
+        do {
+            _ = try await sendChatMessage(text: malformed.words, sessionID: message.sessionID, correlationID: message.id,
+                metadata: ["kind": "error", "reason": "malformed_request", "errorDetail": malformed.words,
+                           "targetSourceKey": routeKey])
+            return .rejected
+        } catch {
+            syncStatus = "iPhone response could not be sent — retaining request for retry"
+            return .deferred
         }
     }
     enum IncomingChatDelivery { case delivered, handled, rejected, deferred }
@@ -280,6 +325,10 @@ extension iCloudBridge {
             inFlightIncomingMessageIDs.remove(message.id)
         }
         let dataRoot = PersistenceCore.defaultDataRoot()
+        let route: ICloudPhoneRoute
+        do throws(ICloudPhoneRoute.Malformed) { route = try ICloudPhoneRoute.read(message.metadata) }
+        catch { return await refuseMalformedChat(message, error, dataRoot: dataRoot) }
+        RepairOwed.settle(dataRoot, operation: ICloudPhoneRoute.repairOperation, evidence: .init(source: "phone-chat", id: message.id))
         let reservation = await Self.reserveChat(message, dataRoot: dataRoot, canDispatch: messageHandler != nil)
         guard isSetUp, generation == setupGeneration else {
             await Self.releaseUndispatchedChat(reservation)
@@ -290,12 +339,11 @@ extension iCloudBridge {
             do {
                 let record = try Self.readChat(message.id, dataRoot: dataRoot)
                 let session = record.assistantSessionId ?? message.sessionID
-                let source = message.metadata?["routeKey"] ?? message.metadata?["deviceSourceKey"] ?? message.metadata?["sourceKey"] ?? ""
                 // A Stop arriving after execution cannot replace its saved words or ending.
                 if let session, let answer = try await SwiftNativeChatOrchestrationClient.savedReply(
                     dataRoot: dataRoot, sessionId: session, runId: message.id) {
                     guard try await recoverReply(answer, route: AgentBridgeCompletionRoute(surface: "ios",
-                        sessionId: session, sourceKey: source, replyTo: message.metadata?["clientSurface"],
+                        sessionId: session, sourceKey: route.routeKey, replyTo: route.replyTo,
                         correlationId: message.id)) != "owed" else { return .deferred }
                 } else if let session, try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(
                     dataRoot: dataRoot, sessionId: session, runId: message.id) {
@@ -304,21 +352,22 @@ extension iCloudBridge {
                 } else {
                     _ = try await sendChatMessage(text: "Stopped.", sessionID: message.sessionID,
                         correlationID: message.id, metadata: ["kind": "cancelled",
-                            "targetSourceKey": source])
+                            "targetSourceKey": route.routeKey])
                 }
                 return await Self.finishChat(message, dataRoot: dataRoot, completed: true) ? .handled : .deferred
             } catch { return .deferred }
         case .completed:
             return .handled
         case .collision:
-            return await sendIncomingRejection(message, reason: "message_id_collision") ? .rejected : .deferred
+            return await sendIncomingRejection(message, reason: "message_id_collision", routeKey: route.routeKey) ? .rejected : .deferred
         case .stale:
-            return await sendIncomingRejection(message, reason: Date() > message.timestamp ? "request_expired" : "clock_ahead") ? .rejected : .deferred
+            return await sendIncomingRejection(message, reason: Date() > message.timestamp ? "request_expired" : "clock_ahead",
+                                               routeKey: route.routeKey) ? .rejected : .deferred
         case .unavailable:
             syncStatus = "iPhone request record unavailable — retaining request for retry"
             return .deferred
         case .interrupted:
-            if let resent = await resendSavedReply(message, dataRoot: dataRoot) { return resent ? .handled : .deferred }
+            if let resent = await resendSavedReply(message, route: route, dataRoot: dataRoot) { return resent ? .handled : .deferred }
             // The checkpoint owns unfinished work; the reservation owns its saved answer.
             do {
                 let record = try Self.readChat(message.id, dataRoot: dataRoot)
@@ -330,25 +379,24 @@ extension iCloudBridge {
                 }
                 guard try await recoverReply(response,
                     route: AgentBridgeCompletionRoute(surface: "ios", sessionId: session,
-                        sourceKey: message.metadata?["routeKey"] ?? message.metadata?["deviceSourceKey"] ?? message.metadata?["sourceKey"],
-                        replyTo: message.metadata?["clientSurface"], correlationId: message.id)) != "owed" else { return .deferred }
+                        sourceKey: route.routeKey, replyTo: route.replyTo, correlationId: message.id)) != "owed" else { return .deferred }
                 return .handled
             } catch { return .deferred }
         case .unreadable:
             // Unknown authority stays byte-preserved and never authorizes dispatch.
-            return await sendIncomingRejection(message, reason: "unknown_outcome") ? .handled : .deferred
+            return await sendIncomingRejection(message, reason: "unknown_outcome", routeKey: route.routeKey) ? .handled : .deferred
         case .reserved:
             break
         }
-        if let resent = await resendSavedReply(message, dataRoot: dataRoot) { return resent ? .handled : .deferred }
+        if let resent = await resendSavedReply(message, route: route, dataRoot: dataRoot) { return resent ? .handled : .deferred }
         guard isSetUp, generation == setupGeneration else {
             await Self.releaseUndispatchedChat(reservation)
             return .deferred
         }
         // After handler entry, retirement must keep its outcome record.
-        let delivered = await messageHandler?(message) ?? false
+        let delivered = await messageHandler?(message, route) ?? false
         if !delivered {
-            guard await sendIncomingRejection(message, reason: "unknown_outcome") else { return .deferred }
+            guard await sendIncomingRejection(message, reason: "unknown_outcome", routeKey: route.routeKey) else { return .deferred }
         }
         guard await Self.finishChat(message, dataRoot: dataRoot, completed: delivered) else { return .deferred }
         return delivered ? .delivered : .handled
@@ -418,7 +466,7 @@ extension iCloudBridge {
                 onTransportSucceeded?()
                 let note = ["\(count) drained", deviceReceiveNote].filter { !$0.isEmpty }.joined(separator: "; ")
                 OrganPulse.record("icloud_drain", found: count, note: note, cadence: nil)
-            case .skipped: OrganPulse.record("icloud_drain", .skipped, note: deviceReceiveNote, cadence: nil)
+            case .skipped: OrganPulse.record("icloud_drain", .held, note: deviceReceiveNote, cadence: nil)
             // No pulse: a drain that keeps failing goes overdue.
             case .failure(let error, _): doctorTransportHealth = Self.transportHealth(error)
             }
@@ -433,8 +481,7 @@ extension iCloudBridge {
         }
         return result.dispatchedCount > 0
     }
-    /// Pairing/status use their own serialized transport readers. Keep them
-    /// out of the chat drain's exclusion; a slow status read is not a slow inbox.
+    /// Separate serialized metadata reads from chat exclusion so slow status cannot hold the inbox.
     func startDeviceMetadataDrainIfIdle(_ ck: CloudKitDeviceTransport, force: Bool = false) {
         guard isSetUp, deviceMetadataDrainTask == nil,
               force || Date() >= nextDeviceMetadataDrainAt else { return }

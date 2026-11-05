@@ -1,21 +1,11 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `CognitiveLivedMoment.swift` | `CognitiveLivedMoment`: a settled turn's journal record (identity, life, forgetting epochs, state owed → meant → lived or refused, fold seq, recorded input with origin principal, carried queue steer and optional claimed wake cares, caring request, meaning) and `LivedMomentDoor`, the interpretation owner's closures |
+// Blueprint: | `CognitiveLivedMoment.swift` | `CognitiveLivedMoment` journal; `LivedMomentDoor` records before folding |
 
-// HER LIFE HAS ONE DOOR (docs/SUBCONSCIOUS.md, "Lived moments").
-//
-// She changes only by living a moment, and every moment that means something
-// comes in by one door. A moment is recorded before it changes her, each part
-// of her lives it once in the order the door folds it. This file is its shape; the
-// journal is `lived_moments` in cognition.sqlite (`CognitiveSQLiteStore+
-// LivedMoments.swift`) and the door is `NativeCognitionRuntime+Door.swift`.
+// Record before living; each part folds a moment once in journal order (docs/SUBCONSCIOUS.md, "Lived moments").
 
-/// Where a moment stands: owed → meant → lived, or refused. Each piece of
-/// her knows the last moment it lived (its `lived` stamp; facts by operation
-/// identity), so the row needs no per-piece outcome: a meant row whose fold
-/// seq is set is a fold that began and did not finish, refolded at the
-/// opening.
+/// Each part owns its lived stamp, so no per-part outcome is stored here. A meant row with a fold seq resumes an unfinished fold at opening.
 public enum CognitiveMomentState: String, Codable, Sendable, Equatable {
     /// Recorded, not yet judged (or its judgment failed: judged again).
     case owed
@@ -23,7 +13,7 @@ public enum CognitiveMomentState: String, Codable, Sendable, Equatable {
     case meant
     /// Its attempt reached its end (fold and facts). The payloads are dropped.
     case lived
-    /// Refused, with its reason (another life, her own work, nothing to live).
+    /// Refused, with its reason (another life, the agent's own work, nothing to live).
     case refused
 }
 
@@ -42,12 +32,10 @@ public struct CognitiveCareWake: Codable, Sendable, Equatable {
     var key: String { watch + "|" + careID.uuidString }
 }
 
-/// The exchange as it settled: everything the interpretation owner needs to
-/// judge it again after a relaunch, captured where it is selected today.
+/// Capture the settled exchange so interpretation can resume after relaunch.
 public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     public var sessionId: String
     public var surface: String
-    /// The incoming words as the promotion carried them.
     public var user: String
     /// The words the person actually asked (`AfterTurnOrigin.userMessage`).
     public var asked: String
@@ -60,16 +48,14 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     public var repliedAt: Date?
     public var took: String?
     public var standingAgentName: String?
-    /// Provenance, kept exactly as the held queue keeps it: the turn's envelope,
-    /// its source checkpoint and its elevated sources.
+    /// Provenance, kept exactly as the held queue keeps it: the turn's envelope, its source checkpoint and its elevated sources.
     public var envelope: JSONValue?
     public var sourceCheckpoint: [String]?
     public var elevatedSources: [String]?
-    /// The same principal and carried steer queue.add would record on this turn.
-    /// Optional only for journal inputs written before promises were inferred.
+    /// Retain the same principal and carried steer as queue.add; missing provenance stays absent.
     public var originPrincipal: String?
     public var carriedSources: [String]?
-    /// Only care-bearing resident wakes enter the journal from her own work.
+    /// Only care-bearing resident wakes enter the journal from the agent's own work.
     public var careWakes: [CognitiveCareWake]?
 
     public var isCareWake: Bool {
@@ -103,7 +89,6 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
         self.careWakes = careWakes
     }
 
-    /// The origin the interpretation reads, rebuilt from the record.
     public var origin: AfterTurnOrigin? {
         guard let messageId else { return nil }
         var origin = AfterTurnOrigin(sessionId: sessionId, runId: runId, messageId: messageId,
@@ -114,13 +99,11 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     }
 }
 
-/// The substrate's deferred-turn entry, recorded: the turn's event and its
-/// frozen caring request (with the exact clipped exchange around it), the
-/// completion slot it answers and the node its ingest touched.
+/// The substrate's deferred-turn entry, recorded: the turn's event and its frozen caring request (with the exact clipped exchange around it), the completion
+/// slot it answers and the node its ingest touched.
 public struct CognitiveDeferredTurnRecord: Codable, Sendable, Equatable {
     public var event: CognitiveEvent
-    /// The explicit terminal edge, when observed before durable recording.
-    /// nil retains the admission without a bound, including legacy records.
+    /// An observed terminal edge bounds admission; nil leaves that evidence unavailable.
     public var endedAt: Date?
     public var caring: CaringAppraisalRequest?
     public var completionNodeKey: String?
@@ -146,15 +129,12 @@ public struct CognitiveDeferredTurnRecord: Codable, Sendable, Equatable {
     }
 }
 
-/// What the moment was.
 public struct CognitiveMomentInput: Codable, Sendable, Equatable {
     public var turn: CognitiveMomentTurn?
     public var deferred: CognitiveDeferredTurnRecord?
-    /// Deliberately disabled cognition has no mind share.
-    /// Missing ordinary context is unavailable evidence, never that permission.
+    /// Deliberately disabled cognition has no mind share. Missing ordinary context is unavailable evidence, never that permission.
     public var factsOnly: Bool?
-    /// Set only after every mind/body save completes for this row's fold seq.
-    /// Absent until every mind/body share has been durably folded.
+    /// Set only after every mind/body save completes for this row's fold seq. Absent until every mind/body share has been durably folded.
     public var folded: UInt64?
 
     public init(turn: CognitiveMomentTurn? = nil, deferred: CognitiveDeferredTurnRecord? = nil,
@@ -166,23 +146,19 @@ public struct CognitiveMomentInput: Codable, Sendable, Equatable {
     }
 }
 
-/// One lived moment, as the journal keeps it.
 public struct CognitiveLivedMoment: Codable, Sendable {
     public var id: String
     /// The `DataRootLife` it belongs to. A row from another life is refused.
     public var life: String
-    /// The current journal kind is `turn`.
     public var kind: String
     public var livedAt: Date
     public var acceptedAt: Date
     public var state: CognitiveMomentState
     public var foldSeq: UInt64?
-    /// The forgetting epochs it was admitted under.
     public var mindEpoch: UInt64
     public var bodyEpoch: UInt64
     public var input: CognitiveMomentInput?
-    /// The interpretation, as the interpretation owner encoded it
-    /// (`AfterTurnInterpretation` lives in MemoryV2, above this module).
+    /// The interpretation, as the interpretation owner encoded it (`AfterTurnInterpretation` lives in MemoryV2, above this module).
     public var meaning: JSONValue?
 
     public init(id: String, life: String, kind: String, livedAt: Date, acceptedAt: Date,
@@ -202,38 +178,29 @@ public struct CognitiveLivedMoment: Codable, Sendable {
         self.meaning = meaning
     }
 
-    /// A turn's identity is its origin: the session and the incoming message.
-    /// One chat message minted twice is one moment.
+    /// A turn's identity is its origin: the session and the incoming message. One chat message minted twice is one moment.
     public static func turnID(sessionId: String, messageId: String) -> String {
         ["turn", sessionId, messageId].map { "\($0.utf8.count):\($0)" }.joined()
     }
 }
 
-/// The door, as the interpretation owner (`AdaptiveMemoryPromoter`) reaches it.
-/// Installed by the cognition runtime. Only recorded turns can fold into her.
+/// Only recorded turns may fold through the interpretation owner's installed door.
 public struct LivedMomentDoor: Sendable {
     /// The data root whose journal this door keeps (never a global default).
     public var dataRoot: URL
-    /// Record the settled turn as owed. Returns its identity, or nil when the
-    /// journal cannot record it (the turn cannot fold).
+    /// Record the settled turn as owed. Returns its identity, or nil when the journal cannot record it (the turn cannot fold).
     public var recordOwed: @Sendable (CognitiveMomentTurn) async -> String?
-    /// The interpretation context for a recorded moment (rebuilt from the
-    /// record after a relaunch); its caring request is saved with the input.
+    /// The interpretation context for a recorded moment (rebuilt from the record after a relaunch); its caring request is saved with the input.
     public var prepare: @Sendable (_ moment: String, _ origin: AfterTurnOrigin, _ reply: String) async -> AfterTurnContext?
-    /// The interpretation came back: written onto the row (`meant`) before any
-    /// part applies it. True only when the write is durable.
+    /// The interpretation came back: written onto the row (`meant`) before any part applies it. True only when the write is durable.
     public var meant: @Sendable (_ moment: String, _ meaning: JSONValue) async -> Bool
-    /// The moment's attempt reached its end (its fold landed and its facts
-    /// are settled): `lived`, payloads dropped.
+    /// The moment's attempt reached its end (its fold landed and its facts are settled): `lived`, payloads dropped.
     public var lived: @Sendable (_ moment: String) async -> Void
-    /// The moment is refused, with its reason.
     public var refuse: @Sendable (_ moment: String, _ reason: String) async -> Void
-    /// Moments of this life still owed or meant, oldest first. Rows
-    /// from another life are refused on the way; age never discards owed work.
-    /// nil means the journal is unavailable, never a proven empty queue.
+    /// Moments of this life still owed or meant, oldest first. Rows from another life are refused on the way; age never discards owed work. nil means the
+    /// journal is unavailable, never a proven empty queue.
     public var unlived: @Sendable () async -> [CognitiveLivedMoment]?
-    /// Import held turns as owed moments in one transaction; true when they landed.
-    /// One moment's row as it now stands (nil when absent or unreadable).
+    /// Import held turns as owed moments in one transaction; true when they landed. One moment's row as it now stands (nil when absent or unreadable).
     public var moment: @Sendable (_ moment: String) async -> CognitiveLivedMoment?
 
     public init(

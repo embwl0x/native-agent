@@ -4,12 +4,10 @@ import TurnTrace
 import NativeAgentCore
 import NativeAgentShared
 import Transcripts
-// Blueprint: | `MacChatTurnLifecycleIntake.swift` | `MacChatTurnPresentationPort`: `beginChatTurnLifecycle`, `applyChatTurnLifecycleInput`; `OtherDoorTurns` retains its trace subscription consumer, counts reply progress only from surface output evidence, stops at engine termination and unsubscribes on exit |
+// Blueprint: | `MacChatTurnLifecycleIntake.swift` | `MacChatTurnPresentationPort`; `beginChatTurnLifecycle`; `applyChatTurnLifecycleInput`; `OtherDoorTurns` |
 
 public extension MacChatTurnPresentationPort {
-    /// Opens the exact generation for one accepted Mac turn. This is the only
-    /// constructor for active lifecycle authority; every later event must name
-    /// the same session and turn id.
+    /// Only admission creates lifecycle authority; later events must match its exact session and turn identity.
     @discardableResult
     func beginChatTurnLifecycle(
         identity: MacChatTurnIdentity,
@@ -19,8 +17,7 @@ public extension MacChatTurnPresentationPort {
         let sessionId = identity.sessionId
         guard !sessionId.isEmpty, !identity.turnId.isEmpty else { return (false, false) }
         macChatTurns.activeTurnIDsBySession[sessionId] = identity.turnId
-        // A new turn starts with nothing on the glass. The previous turn's last
-        // frame is not what this turn is looking at.
+        // A new turn must not inherit the previous turn's screen evidence.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
         let state = MacChatTurnLifecycleState(
             identity: identity,
@@ -64,6 +61,7 @@ public extension MacChatTurnPresentationPort {
                 }
             }
             if reduced.presentation.lastMovementAt != state.presentation.lastMovementAt
+                || reduced.presentation.writing != state.presentation.writing
                 || reduced.presentation.phase != state.presentation.phase
                 || reduced.replyTextSettled != state.replyTextSettled {
                 macChatTurns.activityDidChange?()
@@ -85,15 +83,8 @@ public extension MacChatTurnPresentationPort {
         ))
     }
 
-    /// Fourteen publications a second each rewrote `macChatTurns.lifecycleBySession`
-    /// with a new accumulated length and movement instant, and ChatView reads
-    /// that dictionary (`showThinkingRow`, and the card host under it) — so
-    /// every chunk invalidated the whole Chat screen and re-projected the
-    /// working card for a number nobody can read faster than the card's own
-    /// one-second readout schedule. A bump that only moves the length and the
-    /// clock is coalesced to 1 Hz; anything that could change the card's PHASE
-    /// (the first chunk after a tool call, a retry, a turn not in `.working`)
-    /// goes straight through, so the card never lags what the turn is doing.
+    /// Coalesce length-only movement to 1 Hz to avoid invalidating the chat and reprojecting its card for every chunk.
+    /// Publish phase changes immediately so coalescing never delays first reply, tool progress or retry state.
     @discardableResult
     func recordChatTurnStreamProgress(
         identity: MacChatTurnIdentity,
@@ -141,21 +132,19 @@ public extension MacChatTurnPresentationPort {
             macChatTurns.lifecycleBySession[sessionId] = state
         }
         macChatTurns.activeTurnIDsBySession.removeValue(forKey: sessionId)
-        // The pane is a live view of work in flight. Nothing is in flight now,
-        // so the screenshot of the user's desktop stops being held in memory.
+        // Release desktop frames when work ends so a transient preview does not retain the user's screen.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
         presentMacChatTurn(.intakeClosed)
         return state
     }
 
-    /// Drops only the named turn's transient activity slot.
     func discardChatTurnLifecycleIntake(sessionId: String, turnId: String) {
         guard macChatTurns.activeTurnIDsBySession[sessionId] == turnId else { return }
         macChatTurns.activeTurnIDsBySession.removeValue(forKey: sessionId)
         if macChatTurns.lifecycleBySession[sessionId]?.identity.turnId == turnId {
             macChatTurns.lifecycleBySession.removeValue(forKey: sessionId)
         }
-        // The discarded turn's frame goes with it; nothing will close this key.
+        // Discard the frame with its turn because no later close owns that key.
         macChatTurns.screenPreviewBySession.removeValue(forKey: sessionId)
         presentMacChatTurn(.intakeClosed)
     }
@@ -167,10 +156,7 @@ public extension MacChatTurnPresentationPort {
         do {
             let retained = try await macChatTurns.lifecycleStore.update(state)
             if !retained {
-                // The durable owner no longer contains this exact turn. Keep
-                // the in-memory projection for the current process, but force
-                // the next admission/reload through canonical repair instead
-                // of permanently treating the ledger as reconciled.
+                // Retain the current projection but require canonical repair on the next admission when durable ownership is missing.
                 macChatTurns.chatTurnLifecycleRepairCompleted = false
                 logChatTurnLifecyclePersistenceFailure(
                     "update",
@@ -228,16 +214,13 @@ public extension MacChatTurnPresentationPort {
         }
     }
 
-    /// One bounded launch repair. Existing terminal records carry their closed
-    /// proof; nonterminal records are settled from the canonical transcript's
-    /// exact turnTraceId/outcomeObservation, or outcome-unknown when absent.
+    /// Repair once at launch using exact terminal transcript evidence; absent proof settles unknown, never guessed completion.
     @discardableResult
     func repairChatTurnLifecyclesIfNeeded(
         knownSessionIds: Set<String>,
         at instant: Date = Date(),
         loadProof: @MainActor (MacChatTurnIdentity) async -> MacChatTurnTranscriptTerminalProof
     ) async -> Bool {
-        await macChatTurns.loadQueuedTurnsIfNeeded()
         guard !macChatTurns.chatTurnLifecycleRepairCompleted else { return true }
         let records: [MacChatPersistedTurnLifecycle]
         do {
@@ -313,20 +296,15 @@ public extension MacChatTurnPresentationPort {
 
 }
 
-/// Every door fires the same trace milestones as a Mac turn, so this reads them into
-/// the same lifecycle the card, the thinking glow and Work read. Display only:
-/// no task, no Stop, no durable receipt, and a Mac turn in the session always
-/// wins. It keeps every session's open turn, seeded from the engine's run
-/// registry when it starts, so a turn already running when a chat is opened or
-/// returned to shows too.
+/// Project all doors' trace milestones into the same display state without creating tasks, Stop authority or receipts.
+/// Seed from the engine's open runs so an already-running conversation is visible; a local Mac turn takes precedence.
 @MainActor
 public final class OtherDoorTurns {
     public static let shared = OtherDoorTurns()
-    /// Each session's other-door turn that began and has not ended.
     private var open: [String: MacChatTurnLifecycleState] = [:]
     private var task: Task<Void, Never>?
     private var generation: UUID?
-    /// Her words reaching the surface: movement, and the card reads "replying".
+    /// Words reaching the surface prove movement and select the replying phase.
     private static let outputKinds: Set<String> = [
         TurnLifecycleMilestone.surfaceOutputEnqueued.rawValue,
         TurnLifecycleMilestone.surfaceFirstRender.rawValue,
@@ -349,7 +327,6 @@ public final class OtherDoorTurns {
         }
     }
 
-    /// Puts the session's open turn on its card, unless a Mac turn holds it.
     public func show(_ sessionId: String, _ appModel: any MacChatTurnPresentationPort) {
         guard let state = open[sessionId] else { return }
         let turns = appModel.macChatTurns
@@ -376,14 +353,12 @@ public final class OtherDoorTurns {
         for await event in subscription.stream {
             guard self.generation == generation, !Task.isCancelled else { break }
             guard let sessionId = event.sessionId, let ended = reduce(event, appModel) else { continue }
-            // An ended turn's reply arrives through the store's own publication.
+            // Let the store's own publication deliver the ended turn's reply.
             if !ended { show(sessionId, appModel) }
         }
         await settle { await TurnTraceBus.shared.unsubscribe(subscription.id) }
     }
 
-    /// Opens a turn another door started: false when it is already open or
-    /// the Mac holds it.
     @discardableResult
     private func admit(_ identity: MacChatTurnIdentity, at startedAt: Date, _ appModel: any MacChatTurnPresentationPort) -> Bool {
         let sessionId = identity.sessionId
@@ -397,8 +372,6 @@ public final class OtherDoorTurns {
         return true
     }
 
-    /// Folds one event in: nil when it is not an other-door turn's, else
-    /// whether that turn ended.
     private func reduce(_ event: TurnTraceEvent, _ appModel: any MacChatTurnPresentationPort) -> Bool? {
         guard let sessionId = event.sessionId else { return nil }
         let turns = appModel.macChatTurns
@@ -418,6 +391,12 @@ public final class OtherDoorTurns {
             kind = .working(action: action)
         case let output where Self.outputKinds.contains(output):
             kind = .streamProgress(accumulatedUTF16Length: state.presentation.streamedTextLength + 1)
+        case "stream.tick":
+            var writing: TurnCallWriting?
+            if case .object(let payload) = event.payload, case .string(let call)? = payload["call"], case .int(let bytes)? = payload["bytes"] {
+                writing = TurnCallWriting(call: call, bytes: Int(bytes))
+            }
+            kind = .moved(writing)
         case let terminal where TurnTraceEvent.isTerminalKind(terminal):
             open[sessionId] = nil
             if turns.lifecycle(for: sessionId)?.identity == identity {

@@ -13,7 +13,7 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime` live organism integration: approval lifecycle expectations, somatic ingestion, replay followed by caller-owed or scheduled reflection, felt resolutions and live body projections |
+// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
@@ -21,7 +21,7 @@ extension NativeCognitionRuntime {
         let stream = await ApprovalLifecycleBus.shared.events()
         guard !isFlushedForTermination, approvalLifecycleObservationTask == nil else { return }
         approvalLifecycleObservationTask = Task { [weak self] in
-            // Approval expectations follow the request and the person's decision.
+            // Approval expectations follow both request and decision.
             for await event in stream where event.phase == .requested || event.phase == .resolved {
                 guard !Task.isCancelled else { return }
                 await self?.ingestApprovalLifecycleEvent(event)
@@ -33,15 +33,12 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// The care a life card names, read from its payload.
     public nonisolated static func careLifeCardCareID(_ record: ApprovalRecord) -> UUID? {
         guard case .object(let payload) = record.payload, case .string(let id)? = payload["careId"] else { return nil }
         return UUID(uuidString: id)
     }
 
-    /// An approved life card: the care becomes part of who she is, and the
-    /// approval says so. Called live on the resolution and again by the night
-    /// for one the live path missed; an already-life retry saves before acknowledging.
+    /// Save an already-life retry before acknowledging approval so live and nightly recovery paths share durable proof.
     public func applyCareLifeApproval(_ record: ApprovalRecord) async {
         guard record.decision == "approved", let id = Self.careLifeCardCareID(record) else { return }
         guard await substrateForIntegration().deepenCareToLife(id, source: "approval:\(record.id)") else { return }
@@ -55,10 +52,8 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Restore only still-pending expectations. Old terminal decisions are not
-    /// replayed as fresh relief, while a pending approval survives restart as
-    /// the same correlated expectation. Duplicate timestamps are ignored by
-    /// the predictive ledger.
+    /// Restore only pending expectations; replaying terminal decisions would create fresh relief.
+    /// Preserve correlation across restart and ignore duplicate timestamps.
     func reconcilePendingApprovalExpectationsAtBootstrap() async {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         guard let pending = try? await inbox.list(filter: .pending) else { return }
@@ -69,10 +64,8 @@ extension NativeCognitionRuntime {
                 sourceOrgan: source,
                 correlationID: record.id
             )
-            // Continuity already owns this live expectation. Replaying it on
-            // every launch would inflate evidence and keep shifting its due
-            // horizon. An expired or missing row is re-armed because the
-            // canonical inbox still says a human decision is outstanding.
+            // Retained continuity already owns a live expectation; replay would inflate evidence and shift its horizon.
+            // Rearm only missing or expired rows still pending in the canonical inbox.
             if existing?.status == .pending { continue }
             await ingestApprovalLifecycleEvent(
                 ApprovalLifecycleEvent(phase: .requested, record: record),
@@ -131,11 +124,8 @@ extension NativeCognitionRuntime {
         "approval.\(record.action.isEmpty ? "unknown" : record.action)"
     }
 
-    /// Notable resolutions the body just felt (relief /
-    /// earned disappointment) become substrate nodes with real aboutness.
-    /// Straight into ingestResident — never back through the somatic bus, so
-    /// the body can't loop into itself. Rate-bounded at the source; called
-    /// from BOTH kernel-feed paths (bus-driven observe + direct injection).
+    /// Ingest notable resolutions directly into substrate, never back through the somatic bus, to prevent a body feedback loop.
+    /// Both kernel-feed paths share this source-bounded bridge.
     func drainFeltResolutionsIntoSubstrate() async {
         for felt in await organismKernel.drainResolutionFelt() {
             let isRelief = felt.kind == .relief
@@ -157,7 +147,7 @@ extension NativeCognitionRuntime {
                 kind: .organismResolutionFelt,
                 subject: CognitiveSubjectReference(
                     type: "organism_path",
-                    // Distinct IDs retain each felt moment; the label groups its path.
+                    // Keep distinct felt-event IDs while grouping by path label.
                     id: "\(felt.sourceOrgan)#\(UUID().uuidString.prefix(8))",
                     label: felt.pathKind.rawValue
                 ),
@@ -177,16 +167,14 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// A dormant body owes no effect. An awake body acknowledges only its
-    /// durable identity claim, so retry cannot put it to sleep twice.
+    /// Dormant bodies owe no effect; awake bodies acknowledge only durable identity claims so retries cannot sleep twice.
     public func completeDreamSignal(id: UUID, occurredAt: Date, metadata: [String: JSONValue]) async throws -> Bool {
         await bootstrap()
         guard !isFlushedForTermination else {
             throw PersistenceCoreError.ioFailure("dream completion awaits the running mind")
         }
         if let bootstrapFailure { throw PersistenceCoreError.ioFailure(bootstrapFailure) }
-        // Completion belongs to the dream, not to the optional body effects.
-        // The journal's landed checkpoint is the witness for this no-effect path.
+        // Dream completion is independent of optional body effects; the journal checkpoint witnesses no-effect settlement.
         if !(await organismKernel.snapshot().enabled) {
             sourceWakes.reachDirty = true
             _ = await runEventDrivenReplayWithDeadline(
@@ -255,11 +243,7 @@ extension NativeCognitionRuntime {
         )
     }
 
-    /// Ingest a PRE-BUILT somatic signal — the seam the INTEROCEPTION vitals path
-    /// uses so a `.providerVitalsShift` CognitiveEvent can be mapped by
-    /// `CognitiveSomaticSignals` (the design's required path) and the
-    /// resulting graded signal ride the exact same organism tail as every other
-    /// body signal.
+    /// Feed prebuilt vitals signals through the same ordered organism tail as every other body signal.
     func ingestPreparedOrganismSignal(
         _ signal: SomaticSignal,
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
@@ -283,7 +267,7 @@ extension NativeCognitionRuntime {
     ) async {
         let kind = signal.kind
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(kind))
-        // A committed diary is a new Reach source even after a clean scan.
+        // A committed diary invalidates Reach even after a clean scan.
         if kind == .dreamCompleted { sourceWakes.reachDirty = true }
         await drainFeltResolutionsIntoSubstrate()
         cachedBodyRead = nil
@@ -294,16 +278,11 @@ extension NativeCognitionRuntime {
         }
         await rescheduleResidualRepairDeadline()
         publishRuntimeChange(reason: "somatic:\(kind.rawValue)")
-        // Clause 4: replay is tissue downstream of the canonical dream/REM
-        // write, not an hourly poll pretending to notice it. The somatic signal
-        // contains no replay payload; runReplay rereads the exact injected-root
-        // diary/proposal owners and their durable evidence IDs. The manifest
-        // retains one slow daily integrity sweep for out-of-process writes and
-        // crash-window event loss.
+        // Replay follows canonical dream/REM writes and rereads their durable owners; the signal carries no payload.
+        // One daily integrity pass covers out-of-process writes and crash-window event loss.
         if kind == .dreamCompleted || kind == .remIntegrated {
             let reason = "replay_event:\(kind.rawValue)"
-            // Replay owns its retained flight and terminal accounting. Dream
-            // reflection is acknowledged by the journal, never scheduled twice.
+            // Replay owns flight and terminal accounting; journal acknowledgement prevents duplicate dream reflection.
             _ = await runEventDrivenReplayWithDeadline(reason: reason,
                 material: reflectAfterReplay ? reflectionMaterial : nil)
         }
@@ -314,8 +293,7 @@ extension NativeCognitionRuntime {
         preferenceDefaults.set(enabled, forKey: Self.organismKernelEnabledKey)
         await refreshConfiguration()
         if enabled {
-            // The body was restored at the opening whether or not its effects
-            // were on (dormant); enabling never reloads the file over it.
+            // Enabling effects cannot reload continuity over the body restored during opening.
             await refreshOrganismBodySchema(reason: "enabled")
             await persistOrganismContinuity(reason: "enabled")
         }
@@ -374,12 +352,8 @@ extension NativeCognitionRuntime {
         return await organismKernel.behaviorPosture()
     }
 
-    /// A failed reset restores its baseline only while it still owns the
-    /// kernel revision. Newer events survive a partial persistence failure.
-    /// The substrate stamps turns with the body's epoch; it follows the kernel
-    /// on every exit of reset, settle and clear, so a failed or rolled-back
-    /// forgetting can never leave the two disagreeing (which would refuse
-    /// every later caring dose, reaction and correction cause).
+    /// Restore a failed reset baseline only while its kernel revision still owns the state, preserving newer events.
+    /// Keep substrate and body epochs aligned on every exit so later caring, reaction and correction effects remain admissible.
     func syncBodyEpoch() async {
         let read = await organismKernel.epochAtRevision()
         await substrate.adoptBodyEpoch(read.epoch, revision: read.revision)
@@ -400,7 +374,7 @@ extension NativeCognitionRuntime {
     }
 
     private func applyOrganismContinuity(reset: Bool) async -> OrganismContinuityApplyOutcome {
-        // Restore precedes mutation; reset alone holds the door against folds.
+        // Restore before mutation; reset holds the door against folds.
         await bootstrap()
         if reset { await enterDoor() }
         defer { if reset { leaveDoor() } }
@@ -411,8 +385,7 @@ extension NativeCognitionRuntime {
                 error: "The organism kernel is disabled."
             )
         }
-        // Reset's new body epoch refuses old in-flight body effects, not mind effects.
-        // Only reset may replace damaged continuity; a failed save restores its freeze.
+        // Reset's new epoch excludes old body effects, never mind effects; failed saves restore damaged-continuity protection.
         let wasRestoreFrozen = organismRestoreFailedHard
         if reset { organismRestoreFailedHard = false }
         let action = reset ? "reset" : "settle"
@@ -437,16 +410,14 @@ extension NativeCognitionRuntime {
         return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
     }
 
-    /// Preference/clock invalidation pushes the turn engine's quiet-hours window
-    /// into the body clock; a missing window supplies no diurnal input.
+    /// Push quiet-hours invalidation into the body clock; unavailable preferences supply no diurnal input.
     private func refreshOrganismDiurnalClockIfInvalidated(at fixedAt: Date) async {
         guard !isFlushedForTermination, sourceWakes.clockDirty else { return }
         sourceWakes.clockDirty = false
         let window: TurnQuietHoursWindow?
         do { window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot) }
         catch {
-            // Withhold the diurnal projection while its preference is unavailable.
-            // nil disables this input.
+            // Withhold diurnal projection while its preference is unavailable; nil disables this input.
             await organismKernel.configureDiurnalClock(nil)
             return
         }
@@ -467,14 +438,10 @@ extension NativeCognitionRuntime {
     }
 
     func organismBodySample(at fixedAt: Date) async -> OrganismBodyRead {
-        // The frozen per-turn read (`refreshBodySchemaAndFrozenRead`) enters
-        // here too, so the clock is fresh for the capsule as well as for the
-        // background refresh above.
+        // Refresh the clock for frozen turn reads as well as background projection.
         await refreshOrganismDiurnalClockIfInvalidated(at: fixedAt)
         var liveRead: OrganismBodyRead
-        // This composite host/transport gauge has no complete push owner. Keep
-        // its two-second sampled cache; source-owned preferences
-        // above no longer rescan on this cadence.
+        // Retain the two-second cache only for the composite host/transport gauge, which has no complete push owner.
         if let cached = cachedBodyRead, fixedAt.timeIntervalSince(cached.at) < 2.0 {
             liveRead = cached.read
         } else {
@@ -501,8 +468,7 @@ extension NativeCognitionRuntime {
             )
         } else {
             organismDebugBodyOverride = nil
-            // Provider, tool, memory, phone and thermal facts are
-            // health for the ops posture, never a feeling.
+            // Provider, tool, memory, phone and thermal facts guide operational posture, never feelings.
             return liveRead
         }
     }

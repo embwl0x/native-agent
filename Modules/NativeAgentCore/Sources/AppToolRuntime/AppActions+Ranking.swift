@@ -24,11 +24,10 @@ import ChatTurnContracts
 import ChromeControl
 import TurnTrace
 import Studio
-// Blueprint: | `AppActions+Ranking.swift` | AppActions find ranking; exact IDs precede named pages, then checked semantic/token matches; unembeddable actions have named trace gaps while siblings rank, shared failures stop discovery; counts-only timings |
+// Blueprint: | `AppActions+Ranking.swift` | Exact ids/pages precede checked semantic matches; item gaps stay local |
 
 extension AppActions {
-    /// Exact identities remain intact, regardless of the query's language. A leading + names an id; -<exact id> excludes that action
-    /// explicitly.
+    /// Exact identities remain intact, regardless of the query's language. A leading + names an id; -<exact id> excludes that action explicitly.
     static func named(_ text: String) -> Set<String> {
         Set(text.lowercased().split(whereSeparator: { $0.isWhitespace || ",;!?()".contains($0) })
             .map { String($0.hasPrefix("+") ? $0.dropFirst() : $0[...]) })
@@ -40,8 +39,7 @@ extension AppActions {
 
     static func intentWords(_ text: String) -> [String] { Array(Set(words(text))).sorted() }
 
-    /// The same words as a set, kept per exact text: every turn ranks the same few
-    /// hundred action texts, and re-splitting them was most of ranking's time.
+    /// Cache tokens by exact text because every turn ranks the same action inventory.
     static func wordSet(_ text: String) -> Set<String> {
         wordSetLock.withLock {
             if let known = wordSets[text] { return known }
@@ -54,8 +52,7 @@ extension AppActions {
     private static let wordSetLock = NSLock()
     nonisolated(unsafe) private static var wordSets: [String: Set<String>] = [:]
 
-    /// Page names are whole token sequences, including the door's existing aliases and integration ids. Prefer a longer name at the same
-    /// position so "Mac Integration" names that page, rather than also naming "Mac".
+    /// Prefer the longest whole-token page name at a position so a compound name does not also select its shorter page.
     static func namedPages(_ query: String, actions: [AppAction], pages: [String: QuietToolPage]) -> Set<String> {
         var names: [String: Set<String>] = [:]
         func add(_ name: String, page: String) {
@@ -68,7 +65,7 @@ extension AppActions {
         for page in registeredPages { add(page.title, page: page.id) }
         for (alias, page) in AppDoorNames.aliases where ownPages.contains(page) { add(alias, page: page) }
         for action in actions where action.page != "*" {
-            if let gate = MacIntegrationGates.byTool[action.tool] { add(gate.integration, page: action.page) }
+            if let gate = action.schema?.macIntegration { add(gate.integration, page: action.page) }
         }
         let candidates = names.map { (words: words($0.key), pages: $0.value) }.sorted { $0.words.count > $1.words.count }
         let asked = words(query)
@@ -84,12 +81,12 @@ extension AppActions {
 
     /// Ranking requires a checked catalog and one usable embedding epoch.
     static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2,
-                       inventory snapshot: (actions: [AppAction], authored: [AppAction])? = nil)
+                       inventory snapshot: (actions: [AppAction], authored: [AppAction])? = nil, turn: Turn?)
         async throws -> (actions: [AppAction], namedPages: Set<String>, gaps: [String: String]) {
         let contacts = try AgentPeerStore(dataRoot: dataRoot).list().map(\.name)
         let helpers = try BotDefinitionStore(dataRoot: dataRoot).list().map(\.name)
         let checked: (actions: [AppAction], authored: [AppAction])
-        if let snapshot { checked = snapshot } else { checked = try await inventory(dataRoot: dataRoot) }
+        if let snapshot { checked = snapshot } else { checked = try await inventory(dataRoot: dataRoot, turn: turn) }
         let actions = checked.actions
         let texts = actionTexts(actions, pages: pages, contacts: contacts, helpers: helpers)
         let tokens = named(query)
@@ -100,17 +97,18 @@ extension AppActions {
         }.joined(separator: " ")
         let asked = intentWords(positive)
         let pagesNamed = namedPages(positive, actions: actions, pages: pages)
-        // Semantic ranking is one checked operation. A failed index is not a
-        // successful word-only search.
+        // A failed semantic index cannot certify a successful word-only search.
         func rankingFailure(_ detail: String) -> ToolFailureError {
             ToolFailureError(detail, effects: .none, owner: "action discovery",
                 nextCall: ToolFailureError.call("app", ["page": .string("settings")]), code: "action_ranking_unavailable",
-                instruction: "Read settings for memory search model status and repair the reported model or action-index fault, then repeat discovery.", recovery: .repair)
+                instruction: """
+                    Read settings for memory search model status and repair the reported model or action-index fault, then repeat discovery.
+                    """, recovery: .repair)
         }
         let embedding: (asked: [Float], actions: [Int: [Float]])
         var actionGaps: [String: String] = [:]
         var timings: [String: JSONValue] = [:]
-        defer { TurnTraceBus.fireFromContext(kind: "context.ranking.summary", payload: .object(["stageMs": .object(timings)])) }
+        defer { TurnTraceBus.fireFromContext(kind: "context.ranking.summary", payload: .object(["stageMs": .object(timings)]), turn: turn) }
         do {
             let indexStart = DispatchTime.now().uptimeNanoseconds
             let indexed = try await memory.indexedActionVectors(texts)
@@ -143,7 +141,7 @@ extension AppActions {
                     TurnTraceBus.fireFromContext(kind: "context.ranking.gap", payload: .object([
                         "action": .string(actions[offset].id), "reason": .string(reason),
                         "epoch": .string(indexed.epoch.rawValue)
-                    ]))
+                    ]), turn: turn)
                     continue
                 }
                 guard let vector = vectors[offset] else {
@@ -155,17 +153,14 @@ extension AppActions {
             embedding = (ask, actionVectors)
         } catch let failure as ToolFailureError where failure.failureCode == "action_ranking_unavailable" { throw failure }
         catch { throw rankingFailure(error.localizedDescription) }
-        // Assume most inventory actions are irrelevant with a light-tailed cosine tail in this retrieval epoch.
-        // Semantic matches must clear the shared attention chance bar; small/flat inventories provide no evidence.
-        // Exact tokens and identities stand independently; multilingual coverage belongs to the embedder.
+        // Assume most inventory actions are irrelevant with a light-tailed cosine tail in this retrieval epoch. Semantic matches must clear the shared
+        // attention chance bar; small/flat inventories provide no evidence. Exact tokens and identities stand independently; multilingual coverage belongs to
+        // the embedder.
         let offsets = embedding.actions.keys.sorted()
         let similarities = offsets.map { VectorMath.cosine(embedding.asked, embedding.actions[$0]) }
         let similarityByOffset = Dictionary(uniqueKeysWithValues: zip(offsets, similarities))
         let standings = Dictionary(uniqueKeysWithValues: zip(offsets, VectorMath.standout(similarities)))
-        // Two deviations above the inventory, as a memory needs: what the ask
-        // brings to mind. (10-29: the chance bar over ~420 actions sat near 4.5
-        // deviations, meaning almost never counted and find fell back to shared
-        // words, burying routes like sense.make under hundreds of word matches.)
+        // Two deviations clear the chance bar; a higher threshold over hundreds of actions admits almost no semantic matches.
         let bar = ContextSelectionConfiguration.memoryStandoutDeviations
         var ranked: [(offset: Int, action: AppAction, semantic: Bool, similarity: Double, own: Int, lexical: Int)] = []
         for (offset, action) in actions.enumerated() where !excluded.contains(action.id) {
@@ -184,14 +179,10 @@ extension AppActions {
             let leftPage = pagesNamed.contains($0.action.page) && !$0.action.isItemRead
             let rightPage = pagesNamed.contains($1.action.page) && !$1.action.isItemRead
             if leftPage != rightPage { return leftPage }
-            // On a page the words named, its own words still order it: "disable
-            // my ability" names the abilities page and wants ability.disable first.
+            // Exact requested words still order actions within the named page.
             if leftPage { return $0.own != $1.own ? $0.own > $1.own : $0.offset < $1.offset }
             if $0.semantic != $1.semantic { return $0.semantic }
-            // An action whose own name and title carry the asked words comes
-            // before a vaguer closeness (10-30: "disable my ability" ranked
-            // ability.read over ability.disable); closeness of meaning then
-            // orders the rest, not only standouts.
+            // An action's own name and title outrank vague semantic closeness; semantic scores then order the rest.
             if $0.own != $1.own { return $0.own > $1.own }
             if $0.similarity != $1.similarity { return $0.similarity > $1.similarity }
             if $0.lexical != $1.lexical { return $0.lexical > $1.lexical }
@@ -216,13 +207,12 @@ extension AppActions {
         }
     }
 
-    /// The actions find matches, best first, each id once; item reads are its read_next.
     static func matchedActions(_ ranked: [AppAction]) -> [AppAction] {
         var seen = Set<String>()
         return ranked.filter { !$0.isItemRead && seen.insert($0.id).inserted }
     }
 
-    /// An action's own identity and authored label, without stemming or aliases.
+    /// Identity and authored label comparisons must not stem tokens or expand aliases.
     static func ownWords(_ action: AppAction) -> Set<String> { wordSet(action.id + " " + action.label) }
 
     /// Exact normalized tokens only; morphology belongs to semantic retrieval.

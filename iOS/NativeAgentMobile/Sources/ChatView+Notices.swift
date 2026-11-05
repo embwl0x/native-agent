@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 // Blueprint: | `ChatView+Notices.swift` | One condition-bound banner lane for chat, sync and voice notices |
 
 extension ChatView {
-    /// One banner lane names local failures; sync errors render without retrying.
+    /// Sync failures share the banner lane without triggering another read.
     var chatBanners: [MobileChatBanner] {
         var banners: [MobileChatBanner] = []
         if let offline = bridgeClient.offlineBannerMessage {
@@ -57,22 +57,18 @@ struct MobileChatBanner: Identifiable {
     let message: String
     let systemImage: String
     let tint: Color
-    /// Nil for a notice that lasts as long as its condition (offline).
+    /// Nil leaves a condition-bound notice visible until its condition ends.
     var dismissLabel: String? = nil
     var action: (title: String, handler: () -> Void)? = nil
     var onDismiss: (() -> Void)? = nil
 
-    /// A new message in the same slot counts as a new notice.
+    /// Changed text in the same slot must be treated as a new notice.
     var key: String { id + "\u{1F}" + message }
 }
 
-/// One banner at a time over the chat. The newest notice wins; the others
-/// wait behind "N more", which brings the next one forward. Dismissing the
-/// one on show reveals the next.
 struct MobileChatBannerLane: View {
     let banners: [MobileChatBanner]
     @Environment(\.accessibilityReduceMotion) var reduceMotion
-    /// Banner keys by arrival, newest last.
     @State private var order: [String] = []
 
     private var shown: MobileChatBanner? {
@@ -83,7 +79,6 @@ struct MobileChatBannerLane: View {
         ZStack(alignment: .top) {
             if let shown {
                 MobileChatIssueBanner(banner: shown, moreCount: banners.count - 1) {
-                    // Next one forward: the shown banner goes to the back.
                     order.removeAll { $0 == shown.key }
                     order.insert(shown.key, at: 0)
                 }
@@ -98,12 +93,7 @@ struct MobileChatBannerLane: View {
     }
 }
 
-/// One readable, reachable presentation for transient chat failures. Error
-/// copy can be much longer than the happy-path composer controls (especially
-/// permission guidance), so actions sit on their own row instead of competing
-/// with the message for horizontal space on compact iPhones or at large text
-/// sizes. The close control keeps the platform's minimum touch target and an
-/// outcome-specific VoiceOver label.
+/// Give error actions their own row so long guidance fits compact phones and large text; keep the close target accessible and outcome-specific.
 private struct MobileChatIssueBanner: View {
     let banner: MobileChatBanner
     let moreCount: Int

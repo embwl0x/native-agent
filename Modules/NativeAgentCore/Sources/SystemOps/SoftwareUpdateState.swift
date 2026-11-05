@@ -1,18 +1,17 @@
 import Foundation
 // Blueprint: | `SoftwareUpdateState.swift` | checked update-notice persistence: absent, available, stale or byte-preserved unreadable evidence |
 
-/// Persisted updater evidence; the host supplies Sparkle's version comparison.
+/// Inject Sparkle comparison so persisted notices and host update availability agree.
 @MainActor
 public enum SoftwareUpdateState {
     /// Why a manual update check cannot run. `nil` == updates are really available.
     public enum Unavailability: Equatable {
-        /// No appcast was published for this build (the normal state today).
+        /// No published appcast means no available update feed.
         case feedNotPublished
         /// The bundle carries no usable Sparkle configuration at all (dev builds).
         case notConfigured
 
-        /// Deliberately identical for both cases: the user's takeaway is the same,
-        /// and only `detail` explains which build they are holding.
+        /// Deliberately identical for both cases: the user's takeaway is the same, and only `detail` explains which build they are holding.
         public var message: String { "Automatic updates aren’t available in this build." }
 
         public var detail: String {
@@ -46,8 +45,7 @@ public enum SoftwareUpdateState {
         case unreadable(String)
     }
 
-    /// Configuration boundary used by the app.
-    /// `nil` means Sparkle has a complete, published, non-placeholder feed.
+    /// Only a complete, published, non-placeholder feed counts as configured.
     public static func resolveUnavailability(info: [String: Any]) -> Unavailability? {
         let feedURL = (info["SUFeedURL"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let publicKey = (info["SUPublicEDKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,17 +65,15 @@ public enum SoftwareUpdateState {
         else {
             return .notConfigured
         }
-        // The build must assert the feed at that URL was actually published.
-        // Absent key == not published; a valid-looking URL proves nothing.
+        // The build must assert the feed at that URL was actually published. Absent key == not published; a valid-looking URL proves nothing.
         guard (info["NativeAgentUpdateFeedPublished"] as? Bool) == true else {
             return .feedNotPublished
         }
         return nil
     }
 
-    /// Persistence boundary used by launch. A notice survives
-    /// only for the exact published HTTPS feed/key and only while the offered
-    /// version is newer than the currently installed build.
+    /// Persistence boundary used by launch. A notice survives only for the exact published HTTPS feed/key and only while the offered version is newer than the
+    /// currently installed build.
     private static func persistedNoticeData(
         availableVersion: String,
         info: [String: Any],
@@ -121,14 +117,16 @@ public enum SoftwareUpdateState {
         let notice: PersistedNotice
         do { notice = try JSONDecoder().decode(PersistedNotice.self, from: data) }
         catch {
-            return .unreadable("Saved update notice could not be read: \(error.localizedDescription) Preserved unchanged. Run Check for Updates to obtain fresh evidence.")
+            return .unreadable(
+                "Saved update notice could not be read: \(error.localizedDescription) Preserved unchanged. Run Check for Updates to obtain fresh evidence.")
         }
         guard notice.schemaVersion == PersistedNotice.schemaVersion,
               !notice.availableVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let url = URL(string: notice.feedURL), url.scheme?.lowercased() == "https",
               let host = url.host, !host.isEmpty,
               let key = Data(base64Encoded: notice.publicKey), key.count == 32 else {
-            return .unreadable("Saved update notice has an unsupported or incomplete shape; preserved unchanged. Run Check for Updates to obtain fresh evidence.")
+            return .unreadable(
+                "Saved update notice has an unsupported or incomplete shape; preserved unchanged. Run Check for Updates to obtain fresh evidence.")
         }
         guard resolveUnavailability(info: info) == nil,
               let context = updateContext(info: info),
@@ -161,8 +159,7 @@ public enum SoftwareUpdateState {
         }
     }
 
-    /// Hosts that only ever appear in placeholder/dry-run configuration. A build
-    /// carrying one of these has no real feed no matter what else it claims.
+    /// Hosts that only ever appear in placeholder/dry-run configuration. A build carrying one of these has no real feed no matter what else it claims.
     private static let placeholderHosts: Set<String> = [
         "example.com", "www.example.com", "example.org", "example.net", "localhost",
     ]

@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Comparison.swift` | `MemoryStorage`: comparison-key modes, scope/epoch checks and quantity/polarity matching; callers own candidate execution |
+// Blueprint: | `MemoryStorage+Comparison.swift` | `MemoryStorage`: comparison keys, scope, epochs and polarity |
 
 extension MemoryStorage {
     enum ComparisonMode { case recall, canonical, proposal }
@@ -20,17 +20,15 @@ extension MemoryStorage {
         return mode == .canonical ? text.trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:\"'` ")) : text
     }
 
-    /// Callers retain candidate order, execution and admission's recency rule.
+    /// Preserve caller order and admission recency.
     static func semanticDuplicate(
         _ left: String, _ right: String, similarity: Double
     ) -> Bool {
         return similarity >= memoryNearVerbatimSimilarity && sameQuantityAndNegation(left, right)
     }
 
-    /// Similar wording cannot reassert a changed quantity or polarity.
-    /// This lexical check recognizes ASCII digits and English negation only;
-    /// it is not a multilingual proof of equivalent meaning. Semantic memory
-    /// interpretation remains responsible for judging changed claims.
+    /// Similar wording cannot prove equal quantities or polarity. ASCII digits and English negation only guard lexical duplicates; semantic interpretation
+    /// still judges changed claims across languages.
     static func sameQuantityAndNegation(_ old: String, _ new: String) -> Bool {
         func matches(_ pattern: String, in text: String) -> [String] {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
@@ -44,8 +42,7 @@ extension MemoryStorage {
             && matches(negations, in: old).count == matches(negations, in: new).count
     }
 
-    /// Persona and read-surface scope, independent of lifecycle. Undisclosable
-    /// rows retain a persona-local bucket.
+    /// Persona and read-surface scope, independent of lifecycle. Undisclosable rows retain a persona-local bucket.
     static func disclosureScopeKey(personaId: String, metadata: JSONValue?) -> String {
         let persona = personaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var tags: [String] = []

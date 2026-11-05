@@ -6,9 +6,7 @@ import PersistenceCore
 import Transcripts
 // Blueprint: | `OutcomeTissueV2.swift` | `OutcomeEvidenceState` enum |
 
-/// Closed evidence vocabulary used by Outcome Tissue V2. The distinctions are
-/// intentional: an absent receipt is never silently converted to failure or
-/// zero use.
+/// An absent receipt remains absent; it cannot become failure or zero use.
 public enum OutcomeEvidenceState: String, Codable, Sendable, Equatable, CaseIterable {
     case observed
     case verified
@@ -31,13 +29,10 @@ public struct ResponseOutcomeToolReference: Codable, Sendable, Equatable {
 }
 
 public struct ResponseOutcomeMotorReference: Codable, Sendable, Equatable {
-    /// Universal opaque correlation identity. Domain read models expose the
-    /// same SHA-256 identity so late settlement can be checked without
-    /// persisting action payloads.
+    /// Share the opaque SHA-256 identity across domain read models so late settlement needs no persisted action payload.
     public let actionID: String
-    /// Bounded canonical owner locator needed only to ask the named owner for
-    /// its read model. It is an identifier, never an action argument or grant.
-    /// Older anchors decode with nil and remain honestly unresolvable.
+    /// The bounded owner locator selects a read model; it grants no authority and supplies no action arguments.
+    /// A missing locator remains unresolvable.
     public let ownerActionID: String?
     public let domain: String
     public let verification: OutcomeEvidenceState
@@ -55,9 +50,7 @@ public struct ResponseOutcomeMotorReference: Codable, Sendable, Equatable {
     }
 }
 
-/// Payload-free observation encoded on the same canonical assistant row as the
-/// response. Only facts already known before the transcript lock are included.
-/// Later reactions, delivery, and motor settlement remain append-only receipts.
+/// Retain only payload-free facts known before the transcript lock; later reactions and settlement stay append-only.
 public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     public static let schema = "response.outcome-observation.v2"
     public static let requiredDimensionKeys: Set<String> = [
@@ -73,9 +66,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     public let responsePersistence: String
     public let contextGenerationID: Int64?
     public let contextSelectionReceiptID: String?
-    /// The provider route admitted with the turn context. This is not
-    /// inferred from a model name: callers that do not retain the admitted
-    /// context leave it absent and the provider evidence remains unknown.
+    /// Use the admitted route, never a model-name inference; absent context leaves provider evidence unknown.
     public let providerID: String?
     public let providerModel: String?
     public let reasoningEffort: String?
@@ -169,11 +160,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         return .observed
     }
 
-    /// Raw owner locators are transcript metadata, so retain only the two
-    /// identifier forms NativeAgent's participating owners mint: UUIDs and
-    /// SHA-256 identities. Arbitrary action payload, paths, or model-supplied
-    /// labels never enter the anchor; the universal opaque actionID remains
-    /// sufficient for the durable motor-trace join.
+    /// Retain only owner-minted UUID or SHA-256 locators so paths, payloads and model-supplied labels cannot enter outcome anchors.
     package static func safeOwnerActionID(_ raw: String) -> String? {
         if UUID(uuidString: raw) != nil { return raw }
         return isOpaqueSHA256(raw) ? raw : nil
@@ -266,10 +253,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     }
 }
 
-/// Population-level health for the six closed outcome dimensions. A missing
-/// observation is counted separately rather than becoming six zero buckets,
-/// and a dimension dominated by one non-terminal state remains visible as a
-/// wiring lead instead of looking like measured negative evidence.
+/// Count absent observations separately; a dominant nonterminal state must stay visible rather than look like negative evidence.
 public struct OutcomeDimensionStateAudit: Sendable, Equatable {
     public let sourceStatus: String
     public let totalRows: Int
@@ -367,11 +351,8 @@ public struct OutcomeDimensionStateAudit: Sendable, Equatable {
     }
 }
 
-/// Bounded reader for the canonical persisted assistant population. It reuses
-/// `SessionHistoryReader`, so transcript framing, malformed-row handling and
-/// session identity rules cannot drift into a second parser. Legacy/corrupt
-/// assistant rows with no decodable outcome become explicit absent
-/// observations in the audit rather than disappearing from its denominator.
+/// Read the assistant population through SessionHistoryReader so framing and identity rules cannot drift.
+/// Undecodable outcomes remain absent observations in the denominator.
 public struct OutcomeDimensionStatePopulationReader: Sendable {
     private static let maximumCandidateFiles = 128
     private static let maximumTranscriptBytes = 1_024 * 1_024
@@ -497,7 +478,10 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
         return population.audit(
             sourceStatus: truncated ? "truncated" : "measured",
             populationNote: truncated
-                ? "Outcome population is incomplete: read \(filesRead) of \(candidateCount) candidate transcripts within file, row and byte limits; unreadable or malformed rows are excluded."
+                ? """
+                    Outcome population is incomplete: read \(filesRead) of \(candidateCount) candidate transcripts within file, row and byte limits; \
+                    unreadable or malformed rows are excluded.
+                    """
                 : nil
         )
     }

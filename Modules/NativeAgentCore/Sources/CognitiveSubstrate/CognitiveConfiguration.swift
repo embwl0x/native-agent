@@ -15,16 +15,9 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     public var maximumSummaryCharacters: Int
     public var maximumCapsuleCharacters: Int
     public var maximumWorkspaceItems: Int
-    /// HARD cost ceiling on reflection calls in a ROLLING 24h window — the
-    /// spend fence, NOT the trigger. Admission is unresolved load
-    /// (`reflectionLoadThreshold`); this only says how much a hard day may
-    /// ever spend. The name is historical: the ledger is still the reflection
-    /// receipts, but the window rolls instead of resetting at midnight.
+    /// Rolling 24h spend ceiling, independent of unresolved-load admission; quiet hours can leave room for a harder part of the day.
     public var dailyReflectionCallBudget: Int
-    /// Admission threshold for a SPONTANEOUS reflection: unresolved load
-    /// (summed pressure from live open cares) must reach this before an unattended call is
-    /// admitted. A quiet day never reaches it and spends nothing. A reflection
-    /// a person asked for is not gated by it — only by the ceiling.
+    /// Only unattended reflection needs unresolved care pressure; a person's request is gated solely by the spend ceiling.
     public var reflectionLoadThreshold: Double
     public var reflectionSurface: String
 

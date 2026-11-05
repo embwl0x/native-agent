@@ -4,21 +4,11 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `LLMClient+AnthropicOAuthDirectAdapter.swift` | `AnthropicOAuthTransport`: `requestOutputTokens`, explicit OAuth protocol client identity; indexed content-block validation shared by OAuth text and Anthropic native-tool streams, keeping text/thinking/signature/tool deltas on their own blocks |
+// Blueprint: | `LLMClient+AnthropicOAuthDirectAdapter.swift` | `AnthropicOAuthTransport`, `requestOutputTokens`: OAuth refresh and indexed blocks |
 
 // MARK: - AnthropicOAuthTransport
-//
-// Anthropic Messages transport with bearer credentials from
-// anthropic_oauth_direct.json. Requests use the Claude Code identity and
-// version headers required by the OAuth endpoint.
-//
-// Tokens refresh within 120 seconds of expiry and rotated credentials are
-// persisted. A path-keyed AsyncSerialQueue serializes refresh across adapter
-// instances because a refresh token is single-use. The credential lock also
-// coordinates refresh with settings saves and sign-out.
-//
-// Request encoding and cache-marker placement live in
-// LLMClient+AnthropicOAuthRequestBody.swift.
+// The OAuth endpoint requires Claude Code identity headers. Path-scoped serialization and credential locking prevent duplicate single-use refreshes and
+// coordinate with sign-out/settings.
 
 public final class AnthropicOAuthTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.textMarkers
@@ -29,12 +19,10 @@ public final class AnthropicOAuthTransport: LLMTransport {
     private let session: URLSession
     private let endpoint: URL
     private let refreshEndpoint: URL
-    /// Test-injection override for the auth.json path. Production callers
-    /// leave this nil and the resolver below walks the canonical layout.
+    /// An injected credential path confines alternate runtimes; production resolves the canonical layout.
     private let authPathOverride: URL?
     private let maxTokensOverride: Int?
     private let clientID: String
-    /// Per-call llm.call telemetry writer; the override selects a test data root.
     private let telemetry: LLMCallTraceRecorder
 
     public init(
@@ -55,11 +43,11 @@ public final class AnthropicOAuthTransport: LLMTransport {
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
 
-    public func requestOutputTokens(model: String) throws -> Int {
-        if let limit = LLMCallContext.turnTokenBudget?.available { return limit }
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int {
+        if let limit = call.turn?.tokenBudget?.available { return limit }
         return try FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
-            requestedEffort: LLMCallContext.reasoningEffort,
+            requestedEffort: call.admission?.reasoningEffort,
             explicitOverride: maxTokensOverride, providerID: providerId
         )
     }
@@ -72,8 +60,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         "oauth-2025-04-20",
         "fine-grained-tool-streaming-2025-05-14",
     ]
-    // Explicit protocol identity for this adapter; never inferred from another
-    // application's installed version or a directory read.
+    // Explicit protocol identity for this adapter; never inferred from another application's installed version or a directory read.
     private static let claudeCLIVersion = "2.1.280"
 
     static func makeProductionSession(
@@ -112,41 +99,30 @@ public final class AnthropicOAuthTransport: LLMTransport {
         }
     }
 
-    /// Turn Inspector W2 — fire a `thinking.delta` event onto the in-process
-    /// bus (fire-and-forget, drop-on-backpressure, NEVER awaited). Carries the
-    /// SUMMARIZED thinking text, SECRET-REDACTED by the shared non-digest
-    /// TurnTraceRedactor, then bounded by
-    /// the event's own per-leaf cap. `redacted:true` marks a RedactedThinking
-    /// block rendered honestly as "[redacted]" (never decoded). Skipped when no
-    /// turn is bound. The bus reads surface/sessionId from the ambient
-    /// LLMCallContext (bound upstream by the chat engine), so no surface param
-    /// is threaded here. signature_delta frames are never surfaced.
-    ///
-    /// Inspector display remains opt-in; provider liveness is independent.
-    static func fireThinkingDeltaEvent(_ text: String, redacted: Bool) {
-        guard InspectorThinkingLane.summarizedThinking else { return }
-        guard TurnTraceContext.turnId != nil else { return }
+    /// Inspector thinking is opt-in, secret-redacted and bounded; signatures never surface. Publish without awaiting the bus so display backpressure cannot
+    /// stall provider liveness.
+    static func fireThinkingDeltaEvent(_ text: String, redacted: Bool, call: LLMCall) {
+        guard call.inspectorThinkingSummarized else { return }
+        guard call.turn != nil else { return }
         let safe = redacted ? text : TurnTraceRedactor.redactText(text)
         TurnTraceBus.fireFromContext(
             kind: "thinking.delta",
             payload: .object([
                 "text": .string(safe),
                 "redacted": .bool(redacted),
-            ])
+            ]), turn: call.turn
         )
     }
 
     private func transientNetworkError(_ error: Error, endpoint: URL, operation: String) -> LLMError {
-        .transient(message: "\(providerId) \(operation) failed for \(endpoint.host ?? "api.anthropic.com"): \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))")
+        .transient(message: """
+            \(providerId) \(operation) failed for \(endpoint.host ?? "api.anthropic.com"): \
+            \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))
+            """)
     }
 
     // MARK: - Shared refresh-actor registry
-    //
-    // Production has 4+ callsites constructing fresh adapter instances. A
-    // PER-INSTANCE actor would let two instances refresh in parallel and
-    // rotate the single-use refresh_token twice — the second rotation
-    // burns the credential. Share one AsyncSerialQueue per resolved auth
-    // file path across the process.
+    // Share the refresh queue by credential path across instances so concurrent adapters cannot spend one refresh token twice.
 
     private static let refreshQueueRegistry = OAuthRefreshQueueRegistry()
 
@@ -156,8 +132,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
 
     // MARK: - Model admission
 
-    /// Admit a `claude-` prefix, optionally preceded by `anthropic/` (case-insensitive).
-    /// Strip only that namespace; missing or foreign IDs throw `modelUnavailable`.
+    /// Admit only Claude IDs, stripping the optional Anthropic namespace; foreign IDs require repair.
     static func coerceToClaudeModel(_ requested: String?) throws -> String {
         guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
             // An absent model is a routing fault; the picker owns the selection.
@@ -172,9 +147,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         throw LLMError.modelUnavailable(provider: "anthropic_oauth_direct", model: r)
     }
 
-    /// The requested id when an enumerated remap actually rewrote it, else
-    /// nil. Threaded onto the `llm.call` telemetry row as `substitutedFrom`
-    /// so a surviving remap leaves a trace instead of being invisible.
+    /// Record actual ID rewrites in substitutedFrom so substitutions remain visible.
     static func substitutionTrace(requested: String?, coerced: String) -> String? {
         guard let r = requested?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty else {
             return nil
@@ -182,8 +155,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         return r == coerced ? nil : r
     }
 
-    /// The subscription connection must never carry a native `tools` array
-    /// (ProviderToolCapability); tools reach Claude here only as prompt text.
+    /// The subscription connection must never carry a native `tools` array (ProviderToolCapability); tools reach Claude here only as prompt text.
     private static func refuseNativeTools(_ tools: [LLMToolSchema]?) throws {
         guard let tools, !tools.isEmpty else { return }
         throw LLMError.providerError(message:
@@ -192,39 +164,35 @@ public final class AnthropicOAuthTransport: LLMTransport {
 
     // MARK: - LLMTransport conformance
 
-    /// Structured multi-turn variant. Encodes the LLMMessage array into
-    /// Anthropic Messages-API content blocks (text / tool_use / tool_result)
-    /// so the model sees its prior tool calls AND their results in the
-    /// canonical wire shape. Without this the tool loop never converges —
-    /// see the conversation-shape comment on LLMMessage in LLMClient.swift.
+    /// Structured conversation blocks keep prior calls paired with results so the tool loop can converge.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         return try await LLMMessageStreamEvent.reply(collecting:
-            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
+            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
     public func complete(
-        prompt: String, system: String?, model: String, tools: [LLMToolSchema]?
+        prompt: String, system: String?, model: String, tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
-        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools)
+        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: call)
     }
 
-    /// Streams the messages-shaped text-tool body; native schemas are refused.
+    /// Text-tool streams must refuse native schemas.
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     try Self.refuseNativeTools(tools)
-                    // Model validation errors finish the stream before any output.
+                    // Reject invalid models before any stream output.
                     let coercedModel = try Self.coerceToClaudeModel(model)
                     try await self.runStreamMessages(
                         messages: messages,
@@ -234,7 +202,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
                             requested: model,
                             coerced: coercedModel
                         ),
-                        continuation: continuation
+                        continuation: continuation, call: call
                     )
                 } catch let err as LLMError {
                     continuation.finish(throwing: err)
@@ -244,7 +212,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "streamMessages: \(error)")))
                 }
             }
-            ProviderReplyWork.current?.own(task)
+            call.replyWork?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -254,7 +222,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         system: String?,
         model: String,
         substitutedFrom: String?,
-        continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation, call: LLMCall
     ) async throws {
         // Forced refresh receives the sent token so concurrent rotations reuse the current credential.
         let requestAccount = OAuthRequestAccount()
@@ -278,8 +246,8 @@ public final class AnthropicOAuthTransport: LLMTransport {
                 messages: messages,
                 system: system,
                 coercedModel: model,
-                maxTokens: try requestOutputTokens(model: model),
-                stream: true
+                maxTokens: try requestOutputTokens(model: model, call: call),
+                stream: true, call: call
             )
             req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
             Self.dumpBodyIfEnabled(body, call: "streamMessages")
@@ -288,7 +256,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
             let bytes: URLSession.AsyncBytes
             let response: URLResponse
             do {
-                (bytes, response) = try await ProviderWire.open(session, req)
+                (bytes, response) = try await ProviderWire.open(session, req, call: call)
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
             }
@@ -303,11 +271,12 @@ public final class AnthropicOAuthTransport: LLMTransport {
             var yieldedSemanticOutput = false
             var lastStopReason: String?
             var contentBlocks: [Int: String] = [:]
-            var runaway = RunawayOutputDetector(endsAtToolBoundary: body["stop_sequences"] != nil, diagnosticDataRoot: telemetry.diagnosticDataRoot)
+            var runaway = RunawayOutputDetector(endsAtToolBoundary: body["stop_sequences"] != nil, diagnosticDataRoot: telemetry.diagnosticDataRoot(
+                call: call), call: call)
             // Connect and mid-stream transport errors share a mapping; parser errors and cancellation pass through.
             do {
                 // SSEEventStream owns framing; protocol semantics stay here.
-                for try await sse in SSEEventStream(bytes) {
+                for try await sse in SSEEventStream(bytes, lifetime: call.lifetime) {
                     if try await AnthropicTransport.consumeStreamEvent(
                         sse, usage: &usage, stopReason: &lastStopReason, blocks: &contentBlocks,
                         ttftMs: &ttftMs, semanticOutput: &yieldedSemanticOutput, runaway: &runaway,
@@ -315,8 +284,10 @@ public final class AnthropicOAuthTransport: LLMTransport {
                         model: model, telemetry: telemetry,
                         malformedFrame: "Anthropic OAuth: malformed streamMessages frame",
                         continuation: continuation, substitutedFrom: substitutedFrom,
-                        cacheMarkers: cacheMarkers, inspectThinking: Self.fireThinkingDeltaEvent,
-                        payload: { _, _, _ in false }
+                        cacheMarkers: cacheMarkers, inspectThinking: { text, redacted in
+                            Self.fireThinkingDeltaEvent(text, redacted: redacted, call: call)
+                        },
+                        call: call, payload: { _, _, _ in false }
                     ) { return }
                 }
             } catch let err as LLMError {
@@ -341,10 +312,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
             .appendingPathComponent("anthropic_oauth_direct.json")
     }
 
-    /// Return a fresh access token, refreshing through the shared serial
-    /// actor if the on-disk `expires_at` is within
-    /// the shared renewal margin of now (or in the past), or if forceRefresh
-    /// is set. Mirrors ChatGPTTransport.ensureFreshAccessToken.
+    /// Readiness and execution share the renewal margin and forced-refresh rules.
     func ensureFreshAccessToken(
         forceRefresh: Bool = false,
         staleToken: String? = nil,
@@ -355,19 +323,16 @@ public final class AnthropicOAuthTransport: LLMTransport {
         let data = try Data(contentsOf: path)
         let object = try ProviderStateValidation.credential(data: data)
         try requestAccount.check(object, provider: "anthropic_oauth_direct", rejectedToken: staleToken)
-        // Fast path — no refresh needed.
         if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
             if let exp = exp {
                 if exp.timeIntervalSinceNow > OAuthGrantOperations.renewalMargin {
                     return token
                 }
-                // Else fall through to refresh.
             } else {
                 // No stated expiry: use this access token until rejected.
                 return token
             }
         }
-        // Slow path — serialize.
         let actor = Self.sharedRefreshActor(for: path)
         return try await actor.run { [self] in
             let data = try Data(contentsOf: path)
@@ -398,14 +363,8 @@ public final class AnthropicOAuthTransport: LLMTransport {
         return (token, exp)
     }
 
-    /// Can the credential in `auth` (this adapter's auth file, parsed) serve a
-    /// call? Answered by the rules `ensureFreshAccessToken` itself applies: a
-    /// token `loadAccessTokenAndExpiry` reads, used as-is when it carries no
-    /// expiry or has more than the shared renewal margin left, and otherwise a
-    /// `refresh_token` that `refreshTokens` can spend. Routing readiness and
-    /// the Providers page ask this, so neither reports signed in for a file
-    /// the adapter refuses — a bare `setup_token` key, for one (the app saves
-    /// a setup token as `access_token`).
+    /// Readiness uses the adapter's own credential rules: a readable access token and, near expiry, a usable refresh grant. Presence of unrelated token
+    /// fields cannot prove dispatch readiness.
     public static func credentialStatus(_ auth: [String: Any]?) -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
         let object = auth ?? [:]
         let tokens = OAuthRefreshBinding.tokenSet(object, provider: "anthropic_oauth_direct")
@@ -429,9 +388,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
 
     // MARK: - Token refresh
 
-    /// POST to the OAuth refresh endpoint, persist the rotated tokens
-    /// (atomically, 0600), return the new access token. Refresh failures are
-    /// classified and thrown through this selected OAuth provider's route.
+    /// Refresh failures retain this selected route's failure; persisted rotations are atomic and private.
     @discardableResult
     private func refreshTokens(
         at path: URL, baseline: Data, object obj: [String: Any], requestAccount: OAuthRequestAccount
@@ -475,12 +432,11 @@ public final class AnthropicOAuthTransport: LLMTransport {
         let payload = answer.fields
         try OAuthRefreshBinding.requireSameAccount(payload, original: obj, provider: "anthropic_oauth_direct")
 
-        // Merge: keep client_id / scope / token_type / user_info; replace
-        // access_token, a supplied refresh_token, and the new token's expiry.
+        // Refresh preserves account metadata while replacing token fields and the new token's expiry.
         let rotatedExpiresAt = answer.expiresIn.map { NativeTimestampFormat.basicZulu(Date().addingTimeInterval($0)) }
 
-        // Under the shared path lock, compare token-key generations and merge onto current settings.
-        // Superseded refreshes skip the write and return a current credential only for the same account.
+        // Under the shared path lock, compare token-key generations and merge onto current settings. Superseded refreshes skip the write and return a
+        // current credential only for the same account.
         let generation = CredentialFileLock.credentialGeneration(ofFileContents: baseline)
         enum RefreshWrite { case wrote, superseded(Data), supersededAndGone }
         let outcome: RefreshWrite

@@ -6,7 +6,7 @@ import NativeAgentCore
 import AgentConversations
 import PersistenceCore
 
-// Blueprint: | `AgentContactsSection.swift` | `AgentContactsSection`: contact rows/actions from discovery state; offscreen capture reads never initiate discovery |
+// Blueprint: | `AgentContactsSection.swift` | `AgentContactsSection`: Contact actions; offscreen reads do not discover |
 
 typealias AgentContactRow = EngineRuntime.AgentContactRow
 
@@ -95,13 +95,11 @@ struct AgentContactsSection: View {
             Button("Refresh", systemImage: "arrow.clockwise") { refreshGeneration += 1 }
                 .accessibilityLabel("Refresh agents")
         }
-        // A screenshot's offscreen copy reads the contacts once, from the
-        // last discovery, and is counted so the capture waits for it.
+        // Read discovery once for offscreen capture and count the read so capture waits for it.
         .quietReadTask(live: false) {
             _ = try? await contacts.refresh()
         }
-        // A refresh offers what it finds (discovery.json, her wake), so the
-        // offscreen copy never runs it.
+        // Discovery refresh writes state, so an offscreen copy must not run it.
         .liveTask(id: refreshGeneration) {
             _ = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: root)
             contacts.watch()

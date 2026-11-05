@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `UserDisplayFormatters.swift` | Shared timestamp parsing/cache, lexical home-relative path display and compact duration presentation through `CompactDurationFormatter` |
+// Blueprint: | `UserDisplayFormatters.swift` | Shared timestamp/path display and `CompactDurationFormatter`; parsing is cached |
 
 public enum UserDisplayFormatters {
     /// Shorten the home component without symlink or existence checks.
@@ -10,19 +10,13 @@ public enum UserDisplayFormatters {
 
     // MARK: - Timestamps
 
-    // Value-typed, immutable parse strategies are safe to share and avoid
-    // constructing two Foundation formatter objects for every timestamp in a
-    // list render. Fractional and plain wire shapes remain distinct because
-    // both are produced by NativeAgent's durable stores.
+    // Value-typed, immutable parse strategies are safe to share and avoid constructing two Foundation formatter objects for every timestamp in a list
+    // render. Fractional and plain wire shapes remain distinct because both are produced by NativeAgent's durable stores.
     private static let fractionalISO = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let plainISO = Date.ISO8601FormatStyle()
     private static let timestampParseCache = TimestampParseCache(capacity: 2_048)
 
-    /// Convert an ISO-8601 timestamp (with or without fractional seconds) to
-    /// a relative phrase like "5 weeks ago" / "in 3 hours". On parse failure
-    /// returns the raw input — better than dropping the field, but signals
-    /// upstream to investigate. Power-user UI should also surface the raw
-    /// value in a tooltip.
+    /// Keep unreadable timestamps visible as raw input so a parse failure does not erase evidence.
     public static func humanizeISOTimestamp(_ iso: String) -> String {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return "" }
@@ -33,7 +27,6 @@ public enum UserDisplayFormatters {
         return rel.localizedString(for: date, relativeTo: Date())
     }
 
-    /// Parse an ISO-8601 timestamp to a Date (fractional seconds tolerated).
     public static func parseISOTimestamp(_ iso: String) -> Date? {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
@@ -42,8 +35,7 @@ public enum UserDisplayFormatters {
         }
     }
 
-    /// Timestamp used under a chat bubble. Kept here with the canonical wire
-    /// parser so every bubble does not rebuild its own pair of ISO formatters.
+    /// Timestamp used under a chat bubble. Kept here with the canonical wire parser so every bubble does not rebuild its own pair of ISO formatters.
     public static func chatTimestamp(_ iso: String, calendar: Calendar = .current) -> String {
         guard let date = parseISOTimestamp(iso) else { return iso }
         return date.formatted(
@@ -52,18 +44,14 @@ public enum UserDisplayFormatters {
         )
     }
 
-    /// Relative phrase ("5m ago") with a caller-chosen units style. Use this
-    /// when a call site wants a shorter form than `humanizeISOTimestamp`'s
-    /// `.full`. On parse failure returns `fallback` — pass the raw input to
-    /// echo it back, or a placeholder like "recently".
+    /// Callers choose failure wording explicitly when a timestamp cannot be parsed.
     public static func relativeISOTimestamp(
         _ iso: String,
         unitsStyle: RelativeDateTimeFormatter.UnitsStyle,
         fallback: String
     ) -> String {
         guard let date = parseISOTimestamp(iso) else { return fallback }
-        // Clock skew can put a fresh stamp a hair in the future; "in 0s" is
-        // nonsense to a person, so anything under a minute reads "now".
+        // Clock skew can put a fresh stamp a hair in the future; "in 0s" is nonsense to a person, so anything under a minute reads "now".
         let now = Date()
         if date > now || now.timeIntervalSince(date) < 60 { return "now" }
         let rel = RelativeDateTimeFormatter()
@@ -71,8 +59,7 @@ public enum UserDisplayFormatters {
         return rel.localizedString(for: date, relativeTo: now)
     }
 
-    /// Time-of-day only, localized ("6:02 PM"). On parse failure returns the
-    /// raw input (never drop the field). Uses the current locale/timezone.
+    /// Unreadable timestamps stay visible as raw input; presentation uses the current locale and time zone.
     public static func shortTime(_ iso: String) -> String {
         guard let date = parseISOTimestamp(iso) else { return iso }
         let out = DateFormatter()
@@ -81,16 +68,13 @@ public enum UserDisplayFormatters {
         return out.string(from: date)
     }
 
-    /// Compact duration phrase: "0.4s", "4.6s", "2m 14s", "1h 3m".
     public static func humanizeDuration(_ seconds: Double) -> String {
         CompactDurationFormatter.string(seconds)
     }
 }
 
-/// ISO timestamps are immutable wire values and recur throughout lists and
-/// status chrome. Keep both successful and failed parses in a small FIFO so a
-/// SwiftUI redraw does not rebuild the same Date over and over. The lock keeps
-/// the shared formatter helper safe for background projections too.
+/// ISO timestamps are immutable wire values and recur throughout lists and status chrome. Keep both successful and failed parses in a small FIFO so a
+/// SwiftUI redraw does not rebuild the same Date over and over. The lock keeps the shared formatter helper safe for background projections too.
 private final class TimestampParseCache: @unchecked Sendable {
     private enum Entry {
         case date(Date)

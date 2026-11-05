@@ -7,13 +7,14 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import ChatToolRuntime
+import ChatToolParsing
 import Senses
 import ToolExecution
 import ToolRegistry
 import TrustCenter
-// Blueprint: | `EngineCapabilityLifecycle.swift` | `CapabilityLifecycleCommands` struct; `ability_manage` verbs over `Parts`, the owner's card for a keep and decision receipts; `CapabilityCommandOutcome` invalidates UI projections |
+// Blueprint: | `EngineCapabilityLifecycle.swift` | `CapabilityLifecycleCommands`, `ability_manage`, `Parts`, `CapabilityCommandOutcome` |
 
-/// A command receipt; the mounted parts list is a projection of its saved state.
+/// The mounted parts list projects saved state, not the command receipt.
 public struct CapabilityCommandOutcome: Sendable {
     public let ok: Bool
     public let detail: String
@@ -34,7 +35,6 @@ public struct CapabilityToolStatus: Sendable {
     public let succeeded: Bool
 }
 
-/// Lifecycle authority and decision receipts, independent of the Mac UI model.
 public struct CapabilityLifecycleCommands: Sendable {
     private let dataRoot: URL
     private static let retry = " Read \(AppToolExecutor.doorDoctor) to see what is wrong, then try again."
@@ -43,18 +43,18 @@ public struct CapabilityLifecycleCommands: Sendable {
         dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
-    public func managePart(verb: String, input: [String: JSONValue], steer: [String]) async -> CapabilityCommandOutcome {
-        var result = await runPart(verb: verb, input: input, steer: steer)
+    public func managePart(verb: String, input: [String: JSONValue], steer: [String], turn: Turn,
+                           invocation: Parts.Invocation) async -> CapabilityCommandOutcome {
+        var result = await runPart(verb: verb, input: input, steer: steer, turn: turn, invocation: invocation)
         result.refreshTools = input["preview"] != .bool(true) && !["read", "list"].contains(verb)
         return result
     }
 
-    /// Full Mac admits her keeps with decided rows; she re-enables only what she disabled; dropping is final.
-    private func runPart(verb: String, input: [String: JSONValue], steer: [String]) async -> CapabilityCommandOutcome {
+    /// Full Mac keeps have decided rows; re-enable only self-disabled parts, and treat dropping as final.
+    private func runPart(verb: String, input: [String: JSONValue], steer: [String], turn: Turn,
+                         invocation: Parts.Invocation) async -> CapabilityCommandOutcome {
         let fullMac = await AppToolExecutor.freshQuietPosture(dataRoot: dataRoot)?.name == AppToolExecutor.fullMacModeName
-        // Her door is never the person's own act: a trusted agent that started
-        // the turn is its provenance, as in authorship. His acts come through
-        // his own surfaces (the Tools page, his cards).
+        // Agent provenance is never the person’s act; only their own surface can mark it as theirs.
         let owner = false
         let parts = Parts(root: dataRoot)
         let id = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -69,14 +69,18 @@ public struct CapabilityLifecycleCommands: Sendable {
             if existing == nil, !SwiftToolDispatcher.isAuthorableToolName(Parts.id(id)) {
                 return CapabilityCommandOutcome(false, "\(id) is a built-in tool's name. Pick another id; nothing was saved.", ["id": .string(id)])
             }
-            // What it was before this save: a new ability is a draft kept now; a
-            // revision of one already on stays a re-enable, as the Inbox says.
+            // Retain pre-save state so the Inbox distinguishes a new keep from a re-enable.
             let before = existing.flatMap { $0["status"] } ?? .string("draft")
             do {
-                let receipt = try await parts.save(input, steer: steer, fullMac: fullMac)
+                let receipt = try await parts.save(input, steer: steer, fullMac: fullMac, invocation: invocation)
+                let reply = ToolResult(.object(receipt))
+                // This boundary accepts only the owner's exact, case-sensitive status spelling.
+                let exactStatus = receipt["status"]?.stringValue == reply.status
                 let detail = receipt["detail"]?.scalarText ?? ""
-                guard receipt["status"] == .string("kept") else { return CapabilityCommandOutcome(receipt["status"] != .string("failed"), detail, receipt) }
-                return await decided(CapabilityCommandOutcome(true, detail, receipt.merging(["state_before": before]) { $1 }), input: input, id: id)
+                guard exactStatus && reply.said("kept") else {
+                    return CapabilityCommandOutcome(!(exactStatus && reply.said("failed")), detail, receipt)
+                }
+                return await decided(CapabilityCommandOutcome(true, detail, receipt.merging(["state_before": before]) { $1 }), input: input, id: id, turn: turn)
             } catch PartError.stagedButFailed(let digest, let committed, let why) {
                 return CapabilityCommandOutcome(false, committed
                     ? "\(id) is saved as a draft but the call did not complete: \(why). Fix it and ability.save again."
@@ -86,22 +90,25 @@ public struct CapabilityLifecycleCommands: Sendable {
                 return CapabilityCommandOutcome(false, "\(id.isEmpty ? "The ability" : id) was not saved: \(failure.localizedDescription)",
                     failure.failureEvidence(defaultCode: "ability_save_failed"))
             } catch {
-                return CapabilityCommandOutcome(false, "\(id.isEmpty ? "The ability" : id) was not saved: \(error.localizedDescription)", ["effects": .string("none")])
+                return CapabilityCommandOutcome(false, "\(id.isEmpty ? "The ability" : id) was not saved: \(error.localizedDescription)", ["effects": .string(
+                    "none")])
             }
         case "read", "list":
             do {
                 let offset: Int = if case .int(let n)? = input["offset"] { Int(n) } else { 0 }
                 let step: Int? = if case .int(let n)? = input["step"] { Int(n) } else { nil }
                 let read = verb == "list" ? try parts.list(offset: offset) : try parts.read(id, offset: offset, step: step)
-                let fields: [String: JSONValue] = if case .object(let fields) = read { fields } else { [:] }
-                return CapabilityCommandOutcome(fields["status"] == .string("ok"), fields["detail"]?.scalarText ?? "", fields)
+                let reply = ToolResult(read)
+                let fields: [String: JSONValue] = if case .object(let fields) = reply.payload { fields } else { [:] }
+                let exactStatus = fields["status"]?.stringValue == reply.status
+                return CapabilityCommandOutcome(exactStatus && reply.said("ok"), fields["detail"]?.scalarText ?? "", fields)
             } catch { return CapabilityCommandOutcome(false, "Your abilities didn't read (\(error.localizedDescription))." + Self.retry, [:]) }
-        case "validate": outcome = await parts.validate(id, input: input["input"], capture: input["capture"] == .bool(true))
+        case "validate": outcome = await parts.validate(id, input: input["input"], capture: input["capture"] == .bool(true), invocation: invocation)
         case "enable", "restore":
             outcome = await parts.enable(id, version: input["version"]?.scalarText,
-                                         fullMac: fullMac, ownerAuthorized: owner, preview: preview)
-        case "disable": outcome = parts.disable(id, reason: input["reason"]?.scalarText, steer: steer, fullMac: fullMac, ownerAuthorized: owner)
-        case "drop": outcome = parts.drop(id, pending: input["pending"] == .bool(true), fullMac: fullMac, ownerAuthorized: owner, preview: preview)
+                                         fullMac: fullMac, ownerAuthorized: owner, preview: preview, invocation: invocation)
+        case "disable": outcome = parts.disable(id, reason: input["reason"]?.scalarText, steer: steer, fullMac: fullMac, ownerAuthorized: owner, turn: turn)
+        case "drop": outcome = parts.drop(id, pending: input["pending"] == .bool(true), fullMac: fullMac, ownerAuthorized: owner, preview: preview, turn: turn)
         default: return CapabilityCommandOutcome(false, "No ability verb is called \(verb).", [:])
         }
         var fields = outcome.fields
@@ -112,7 +119,6 @@ public struct CapabilityLifecycleCommands: Sendable {
             return CapabilityCommandOutcome(outcome.ok, outcome.text, fields, toolStatus: status)
         }
         if fields["needs_owner"] == .bool(true) {
-            // The owner's card, answerable on the Mac and their phone (`askUserToInstallScript`).
             let name = fields["name"]?.scalarText ?? id
             let card: ApprovalRecord
             do {
@@ -123,9 +129,10 @@ public struct CapabilityLifecycleCommands: Sendable {
                 card = try await SwiftNativeApprovalInbox(root: dataRoot).askUserToInstallScript(
                     skill: name, skillID: fields["id"]?.scalarText ?? id,
                     digest: digest, why: outcome.text,
-                    script: try JSONValue.object(shown).serialize(pretty: false))
+                    script: try JSONValue.object(shown).serialize(pretty: false), turn: turn)
             } catch {
-                return CapabilityCommandOutcome(false, outcome.text + " The card asking the owner did not file (\(String(describing: error))): tell them.", fields)
+                return CapabilityCommandOutcome(false, outcome.text + " The card asking the owner did not file (\(String(describing: error))): tell them.",
+                    fields)
             }
             let next: JSONValue = .object(["tool": .string("app"), "input": .object(["page": .string("inbox")])])
             return CapabilityCommandOutcome(false, outcome.text + " A card asks the owner, on the Mac and their phone.",
@@ -137,13 +144,13 @@ public struct CapabilityLifecycleCommands: Sendable {
         guard outcome.ok, fields["changed"] != .bool(false) else {
             return CapabilityCommandOutcome(outcome.ok, outcome.text, fields, toolStatus: .init(message: outcome.text, succeeded: outcome.ok))
         }
-        return await decided(CapabilityCommandOutcome(true, outcome.text, fields, toolStatus: .init(message: "Ability on", succeeded: true)), input: input, id: id)
+        return await decided(CapabilityCommandOutcome(true, outcome.text, fields, toolStatus: .init(message: "Ability on", succeeded: true)), input: input,
+            id: id, turn: turn)
     }
 
-    /// A keep of hers the owner sees in their Inbox, as a decided row.
-    private func decided(_ kept: CapabilityCommandOutcome, input: [String: JSONValue], id: String) async -> CapabilityCommandOutcome {
-        if PeerDataTaint.trustedTurn { return kept }
-        let decided = await HarnessDecidedRow.record(
+    private func decided(_ kept: CapabilityCommandOutcome, input: [String: JSONValue], id: String, turn: Turn) async -> CapabilityCommandOutcome {
+        if PeerDataTaint.trustedTurn(turn) { return kept }
+        let decided = await HarnessDecidedRow.record(turn: turn,
             requester: kept.fields["state_before"] == .string("draft") ? "keep ability" : "re-enable ability",
             tool: kept.fields["name"]?.scalarText ?? id, sessionID: input["__session_id"]?.scalarText,
             dataRoot: dataRoot, ran: true)

@@ -14,7 +14,7 @@ import ProviderRouting
 import TurnTrace
 import Transcripts
 import NativeAgentShared
-// Blueprint: | `NativeCognitionRuntime+BodyEvidence.swift` | `NativeCognitionRuntime` body evidence: phone, notification, memory, dream, tool, approval and thermal readings with debug projections |
+// Blueprint: | `NativeCognitionRuntime+BodyEvidence.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
     nonisolated static func makeOrganismBodyRead(
@@ -38,7 +38,7 @@ extension NativeCognitionRuntime {
                     id: "signed-peer:\($0.eventID)",
                     evidenceClass: .signedPeerContact,
                     observedAt: $0.peerCreatedAt,
-                    // The phone's own time, bounded by this authenticated receipt, controls freshness.
+                    // Bound authenticated phone timestamps by receipt time before judging freshness.
                     receivedAt: $0.contactAt
                 )]
             } ?? [],
@@ -169,9 +169,7 @@ extension NativeCognitionRuntime {
             return NotificationDeliveryBelief(generatedAt: now, transportConfigured: configured == true,
                 sourceUnavailable: cause)
         }
-        // The live kernel owns publication failure and signed phone receipt
-        // signals for the keyless route. Optional APNS wakes are diagnostics
-        // of a different effect and cannot judge notification delivery.
+        // The kernel owns keyless publication and signed receipt evidence; optional APNS diagnostics cannot establish delivery.
         var evidence: [BodyEvidenceReference] = []
         var deviceReceived = false
         var deviceFailed = false
@@ -193,8 +191,7 @@ extension NativeCognitionRuntime {
             generatedAt: now,
             transportConfigured: configured == true,
             deviceReceived: deviceReceived,
-            // No canonical display/read receipt exists. Never promote process
-            // receipt or APNS acceptance into those stronger claims.
+            // Without canonical display/read receipts, process receipt or APNS acceptance cannot prove either.
             displayed: false,
             userSeen: false,
             transportFailed: deviceFailed,
@@ -209,8 +206,7 @@ extension NativeCognitionRuntime {
     ) async -> MemoryIntegrityReading {
         let path = dataRoot.appendingPathComponent("memory/memory.sqlite")
         var readable = false
-        // Do not create a missing store to answer a health read. Existing
-        // SQLite is read through MemoryV2's canonical owner, never legacy JSON.
+        // Health reads cannot create a missing store; read existing SQLite through MemoryV2's canonical owner.
         if FileManager.default.isReadableFile(atPath: path.path) {
             do {
                 let store = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
@@ -237,7 +233,7 @@ extension NativeCognitionRuntime {
         now: Date
     ) -> DreamIntegrityReading {
         let latest: Date?
-        do { latest = try ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot) }
+        do { latest = try ConversationHistory.dreamConsolidationMark(dataRoot: dataRoot) }
         catch {
             _ = bodySourceFailure(error, source: "dream_diary/.dream_state.json", dataRoot: dataRoot)
             return DreamIntegrityReading(generatedAt: now, storeAvailable: false, completionEvidence: [])
@@ -261,11 +257,10 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         now: Date
     ) async -> ToolCapabilityReading {
-        // Her hands are her abilities as they stand now: any one on means
-        // configured; a missing or stale run leaves them unproven, never unavailable.
+        // Enabled abilities establish configuration; missing or stale runs remain unproven rather than unavailable.
         let abilities = AbilityStore(dataRoot: dataRoot)
         let configured: Bool
-        let rows: [JSONValue]
+        let liveReceipt: (id: String, at: Date)?
         let configurationDate: Date?
         do {
             configured = try abilities.files(kind: .part, includeProposals: false)
@@ -276,26 +271,14 @@ extension NativeCognitionRuntime {
                 }
                 configurationDate = date
             } else { configurationDate = nil }
-            let read = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
-                .traceEvidence(now: now, maximumReadBytes: 128 * 1_024)
-            guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else {
-                throw PersistenceCoreError.ioFailure("Tool capability trace evidence contains unreadable rows.")
-            }
-            rows = read.rows
+            // The newest successful dispatch receipt is a reading kept in memory; the turn never queries the record for it.
+            liveReceipt = try await TurnTracePersistLane(dataRootOverride: dataRoot).newestSuccessfulReceipt(kind: "tool.dispatch")
         } catch {
-            let cause = bodySourceFailure(error, source: "abilities and turn_traces", dataRoot: dataRoot)
+            let cause = bodySourceFailure(error, source: "abilities and the life record", dataRoot: dataRoot)
             return ToolCapabilityReading(generatedAt: now, configured: false, liveCapabilityObserved: false,
                 evidence: [], sourceUnavailable: cause)
         }
-        let liveReceipt = rows.reversed().compactMap { row -> [String: JSONValue]? in
-            guard case .object(let object) = row, object["kind"] == .string("tool.dispatch"),
-                  object["status"] == .string("ok") else { return nil }
-            return object
-        }.first
-        let liveReceiptAt: Date? = if case .string(let raw)? = liveReceipt?["createdAt"] {
-            TurnTraceEvent.parseISO8601(raw)
-        } else { nil }
-        let live = liveReceiptAt.map {
+        let live = liveReceipt.map(\.at).map {
             $0.timeIntervalSince(now) <= 5 && now.timeIntervalSince($0) <= 6 * 60 * 60
         } == true
         var evidence: [BodyEvidenceReference] = []
@@ -307,13 +290,12 @@ extension NativeCognitionRuntime {
                 receivedAt: date
             ))
         }
-        if live, let liveReceiptAt {
-            let receiptID = if case .string(let id)? = liveReceipt?["id"] { id } else { "tool-success" }
+        if live, let liveReceipt {
             evidence.append(BodyEvidenceReference(
-                id: "tool-live:\(receiptID):\(liveReceiptAt.timeIntervalSince1970)",
+                id: "tool-live:\(liveReceipt.id):\(liveReceipt.at.timeIntervalSince1970)",
                 evidenceClass: .liveToolCapability,
-                observedAt: liveReceiptAt,
-                receivedAt: liveReceiptAt
+                observedAt: liveReceipt.at,
+                receivedAt: liveReceipt.at
             ))
         }
         return ToolCapabilityReading(
@@ -339,7 +321,7 @@ extension NativeCognitionRuntime {
                 writable = fm.isWritableFile(atPath: directory.path)
                     && (!fm.fileExists(atPath: path.path) || fm.isWritableFile(atPath: path.path))
             } else {
-                // A missing approval directory has not demonstrated a write path.
+                // A missing approval directory cannot demonstrate a write path.
                 writable = nil
             }
         } catch {
@@ -357,8 +339,7 @@ extension NativeCognitionRuntime {
         )
     }
 
-    /// Only the live app body senses host heat; other roots read nominal with
-    /// the same evidence shape. Resource pressure never gates quiet repair.
+    /// Only the live body senses host heat; other roots use nominal evidence. Resource pressure never gates quiet repair.
     private nonisolated static func currentResourcePressureReading(
         dataRoot: URL,
         now: Date
@@ -378,7 +359,7 @@ extension NativeCognitionRuntime {
         @unknown default:
             thermal = .elevated
         }
-        // Low Power Mode never changes what she does.
+        // Low Power Mode never changes what the agent does.
         return ResourcePressureReading(
             generatedAt: now,
             thermalPressure: thermal,

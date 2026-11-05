@@ -2,7 +2,8 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OutcomeFeedbackStore.swift` | `OutcomeFeedbackStore` struct; `record`, `recordConversationContinuation`; the locked validation supplies physical rows and append bytes to shared retention |
+import Experiences
+// Blueprint: | `OutcomeFeedbackStore.swift` | `OutcomeFeedbackStore`, `record`, `recordConversationContinuation`. |
 
 public enum OutcomeFeedbackError: Error, Sendable, Equatable {
     case invalidSessionID
@@ -28,23 +29,17 @@ public struct OutcomeReactionEvidenceKey: Sendable, Hashable {
     }
 }
 
-/// Exact thumbs feedback over an already-persisted assistant response.
-///
-/// This is an additive receipt in the existing context feedback root, not a
-/// second transcript or outcome owner. It stores no content, persona, path,
-/// prompt, or provider output. Regenerate remains a separate canonical
-/// transcript reaction.
-/// Storage: feedback.jsonl is excluded from local backup, data export and
-/// phone sync; included in off-disk backup and PrivacyMap's context category.
+/// Payload-free feedback is a detail of the transcript's anchored turn, never a second outcome owner.
+/// The feedback.reaction kind stays private: no backup, export or phone sync.
 public struct OutcomeFeedbackStore: Sendable {
     public static let schema = "response.feedback.v2"
     public static let continuationSchema = "response.reaction.v2"
-    public static let maximumExistingRows = 20_000
-    public static let maximumExistingBytes = 16 * 1_024 * 1_024
+    private static let detailKind = "feedback.reaction"
 
     private let dataRoot: URL
     private let clock: @Sendable () -> Date
     private let makeEventID: @Sendable () -> String
+    private var store: ExperienceStore { ExperienceStore.at(dataRoot) }
 
     public init(
         dataRoot: URL,
@@ -116,28 +111,20 @@ public struct OutcomeFeedbackStore: Sendable {
             return (turnID, surface, selectionReceiptID)
         }
 
-        let feedbackPath = dataRoot
-            .appendingPathComponent("context", isDirectory: true)
-            .appendingPathComponent("feedback.jsonl")
         let rawEventID = makeEventID()
         let eventID = OutcomeTraceIdentity.normalized(rawEventID)
             ?? CausalTransitionEvidence.opaqueIdentity(rawEventID)
-        let observedAt = NativeTimestampFormat.fractionalZulu(clock())
+        let at = clock()
+        let observedAt = NativeTimestampFormat.fractionalZulu(at)
         let reaction = rating == "up" ? "thumbs_up" : "thumbs_down"
-        return try await SwiftNativePersistenceCore.withFileLock(feedbackPath) {
-            let existing = try Self.readExistingFeedbackFile(feedbackPath)
-            let prior = existing.rows.reversed().first { row in
-                guard case .object(let object) = row else { return false }
-                return object["schema"] == .string(Self.schema)
-                    && object["sessionId"] == .string(sessionID)
-                    && object["messageId"] == .string(messageID)
-            }
-            // Repeated clicks on the already-current value are idempotent and
-            // cannot manufacture additional calibration weight.
-            if case .object(let object)? = prior,
-               object["reaction"] == .string(reaction) {
-                return .object(object)
-            }
+        let subject = anchor.turnID
+        // The comparison and the write are one record transaction: the write lands only while the rating it supersedes is still the latest.
+        // A miss means another rating landed between the read and the write; the next pass compares against it.
+        while true {
+            let rows = try await readExistingFeedback(subjects: [subject]).compactMap(\.objectValue)
+            let prior = Self.latestRating(in: rows, sessionID: sessionID, messageID: messageID)
+            // Repeated clicks on the current value are idempotent so they cannot manufacture calibration weight.
+            if let prior, prior["reaction"] == .string(reaction) { return .object(prior) }
             var object: [String: JSONValue] = [
                 "schema": .string(Self.schema),
                 "eventId": .string(eventID),
@@ -154,27 +141,38 @@ public struct OutcomeFeedbackStore: Sendable {
             if let selectionReceiptID = anchor.contextSelectionReceiptID {
                 object["contextSelectionReceiptId"] = .string(selectionReceiptID)
             }
-            if case .object(let priorObject)? = prior,
-               case .string(let priorEventID)? = priorObject["eventId"] {
+            if case .string(let priorEventID)? = prior?["eventId"] {
                 object["supersedesEventId"] = .string(priorEventID)
             }
             let record = JSONValue.object(object)
-            try await appendJSONLCapped(
-                record,
-                to: feedbackPath,
-                maxLines: Self.maximumExistingRows,
-                logLabel: "OutcomeFeedbackStore",
-                maxBytes: Self.maximumExistingBytes,
-                validatedExistingCounts: (existing.physicalRows, existing.bytes)
-            )
-            return record
+            let superseded = prior?["eventId"]
+            let detail = ExperienceStore.Detail(source: "feedback", at: at, subject: subject, kind: Self.detailKind,
+                                                row: try record.serializedData(pretty: false))
+            let wrote = try await store.note(detail) { details in
+                try Self.latestRating(in: Self.feedbackRows(details, subject: subject), sessionID: sessionID, messageID: messageID)?["eventId"]
+                    != superseded
+            }
+            if wrote { return record }
         }
     }
 
-    /// Records only a structurally attributable continuation: the named user
-    /// row must be the transcript tail and the immediately preceding row must
-    /// be one exact anchored assistant outcome. The receipt says conversation
-    /// continued; it never infers approval, disapproval, or sentiment.
+    /// The newest thumbs rating of one answer among its turn's feedback rows.
+    private static func latestRating(in rows: [[String: JSONValue]], sessionID: String, messageID: String) -> [String: JSONValue]? {
+        rows.last { $0["schema"] == .string(schema) && $0["sessionId"] == .string(sessionID) && $0["messageId"] == .string(messageID) }
+    }
+
+    /// The feedback rows among a subject's details, in record order; a feedback detail that is not this turn's object is a corrupt store.
+    private static func feedbackRows(_ details: [ExperienceStore.Detail], subject: String) throws -> [[String: JSONValue]] {
+        try details.filter { $0.kind == detailKind }.map { detail in
+            guard case .object(let object)? = try? JSONValue.parse(detail.row), object["turnId"] == .string(subject) else {
+                throw OutcomeFeedbackError.feedbackStoreCorrupt
+            }
+            return object
+        }
+    }
+
+    /// Attribute continuation only to an exact anchored assistant outcome immediately before the named user tail row.
+    /// Continuation never proves approval, disapproval or sentiment.
     @discardableResult
     public func recordConversationContinuation(
         sessionID rawSessionID: String,
@@ -220,10 +218,10 @@ public struct OutcomeFeedbackStore: Sendable {
         }
         guard let anchor else { return nil }
 
-        let feedbackPath = dataRoot.appendingPathComponent("context/feedback.jsonl")
         let rawEventID = makeEventID()
         let eventID = OutcomeTraceIdentity.normalized(rawEventID)
             ?? CausalTransitionEvidence.opaqueIdentity(rawEventID)
+        let at = clock()
         let record: JSONValue = .object([
             "schema": .string(Self.continuationSchema),
             "eventId": .string(eventID),
@@ -233,30 +231,25 @@ public struct OutcomeFeedbackStore: Sendable {
             "surface": .string(anchor.surface),
             "reaction": .string("conversation_continued"),
             "reactionMessageId": .string(reactionMessageID),
-            "observedAt": .string(NativeTimestampFormat.fractionalZulu(clock())),
+            "observedAt": .string(NativeTimestampFormat.fractionalZulu(at)),
             "observedBy": .string("canonical_transcript_adjacency"),
             "payloadFree": .bool(true),
             "controlAuthority": .bool(false),
         ])
-        return try await SwiftNativePersistenceCore.withFileLock(feedbackPath) {
-            let existing = try Self.readExistingFeedbackFile(feedbackPath)
-            if let prior = existing.rows.first(where: { row in
-                guard case .object(let object) = row else { return false }
-                return object["schema"] == .string(Self.continuationSchema)
-                    && object["reactionMessageId"] == .string(reactionMessageID)
-            }) {
-                return prior
-            }
-            try await appendJSONLCapped(
-                record,
-                to: feedbackPath,
-                maxLines: Self.maximumExistingRows,
-                logLabel: "OutcomeFeedbackStore",
-                maxBytes: Self.maximumExistingBytes,
-                validatedExistingCounts: (existing.physicalRows, existing.bytes)
-            )
-            return record
+        let subject = anchor.turnID
+        func continues(_ row: [String: JSONValue]) -> Bool {
+            row["schema"] == .string(Self.continuationSchema) && row["reactionMessageId"] == .string(reactionMessageID)
         }
+        // The check for an existing continuation and the write are one record transaction.
+        let detail = ExperienceStore.Detail(source: "feedback", at: at, subject: subject, kind: Self.detailKind,
+                                                row: try record.serializedData(pretty: false))
+        let wrote = try await store.note(detail) { details in
+            try Self.feedbackRows(details, subject: subject).contains { row in
+                row["schema"] == .string(Self.continuationSchema) && row["reactionMessageId"] == .string(reactionMessageID)
+            }
+        }
+        if wrote { return record }
+        return try await readExistingFeedback(subjects: [subject]).compactMap(\.objectValue).first(where: continues).map(JSONValue.object)
     }
 
     /// Adjacent assistant/user rows prove continuation only with a same-run originating request.
@@ -295,42 +288,29 @@ public struct OutcomeFeedbackStore: Sendable {
         return false
     }
 
-    /// Exact outcome anchors with structured reaction evidence. Legacy rows
-    /// lacking transcript-bound identities are ignored, never upgraded.
+    /// Ignore feedback without transcript-bound outcome identity; never invent an anchor.
     public func reactionEvidenceKeys() async throws -> Set<OutcomeReactionEvidenceKey> {
-        let path = dataRoot.appendingPathComponent("context/feedback.jsonl")
-        return try await SwiftNativePersistenceCore.withFileLock(path) {
-            let existing = try Self.readExistingFeedbackFile(path)
-            return Set(existing.rows.compactMap { row in
-                guard case .object(let object) = row,
-                      object["schema"] == .string(Self.schema)
-                        || object["schema"] == .string(Self.continuationSchema),
-                      case .string(let sessionID)? = object["sessionId"],
-                      case .string(let messageID)? = object["messageId"],
-                      case .string(let turnID)? = object["turnId"] else { return nil }
-                return OutcomeReactionEvidenceKey(
-                    sessionID: sessionID, messageID: messageID, turnID: turnID
-                )
-            })
-        }
+        let existing = try await readExistingFeedback()
+        return Set(existing.compactMap { row in
+            guard case .object(let object) = row,
+                  object["schema"] == .string(Self.schema)
+                    || object["schema"] == .string(Self.continuationSchema),
+                  case .string(let sessionID)? = object["sessionId"],
+                  case .string(let messageID)? = object["messageId"],
+                  case .string(let turnID)? = object["turnId"] else { return nil }
+            return OutcomeReactionEvidenceKey(
+                sessionID: sessionID, messageID: messageID, turnID: turnID
+            )
+        })
     }
 
-    private static func readExistingFeedbackFile(_ path: URL) throws -> (rows: [JSONValue], physicalRows: Int, bytes: Int) {
-        guard FileManager.default.fileExists(atPath: path.path) else { return ([], 0, 0) }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let number = attributes[.size] as? NSNumber,
-              number.intValue <= maximumExistingBytes,
-              let data = try? Data(contentsOf: path, options: [.mappedIfSafe]) else {
-            throw OutcomeFeedbackError.feedbackStoreCorrupt
-        }
-        var physicalLines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-        if physicalLines.last?.isEmpty == true { physicalLines.removeLast() }
-        let lines = physicalLines.filter { !$0.isEmpty }
-        guard lines.count <= maximumExistingRows else {
-            throw OutcomeFeedbackError.feedbackStoreCorrupt
-        }
-        let rows = try lines.compactMap { line -> JSONValue? in
-            guard let value = try? JSONValue.parse(Data(line)), case .object(let object) = value else {
+    private func readExistingFeedback(subjects: [String]? = nil) async throws -> [JSONValue] {
+        let details = try await store.details(.init(subjects: subjects, kinds: [Self.detailKind]))
+        return try details.map { detail in
+            let value: JSONValue
+            do { value = try JSONValue.parse(detail.row) }
+            catch { throw OutcomeFeedbackError.feedbackStoreCorrupt }
+            guard case .object(let object) = value, object["turnId"] == .string(detail.subject) else {
                 throw OutcomeFeedbackError.feedbackStoreCorrupt
             }
             if object["schema"] == .string(Self.schema) {
@@ -380,11 +360,7 @@ public struct OutcomeFeedbackStore: Sendable {
             } else {
                 throw OutcomeFeedbackError.feedbackStoreCorrupt
             }
-            // Match readJSONL's UTF-8 admission after validating every row.
-            return String(data: Data(line), encoding: .utf8) == nil ? nil : value
+            return value
         }
-        // appendBytes repairs a missing separator before appending the row.
-        let appendBaseBytes = data.count + (!data.isEmpty && data.last != 0x0A ? 1 : 0)
-        return (rows, physicalLines.count, appendBaseBytes)
     }
 }

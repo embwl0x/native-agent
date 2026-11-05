@@ -1,11 +1,12 @@
 import Foundation
+import Experiences
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DreamREMCycle
-// Blueprint: | `SchedulerDueJobRunner+CycleHelpers.swift` | `SchedulerDueJobRunner`: `pruneRetiredRows` preserves legacy intention definitions and migration receipts; `nextEpoch`, `containsLastRunToday`; dream/REM diary and inbox helpers |
+// Blueprint: | `SchedulerDueJobRunner+CycleHelpers.swift` | Cycle wording and diary identities read from matter artifacts |
 
 extension SchedulerDueJobRunner {
     /// Keep recent one-shot completions; held outcomes are never age-retired.
@@ -27,9 +28,8 @@ extension SchedulerDueJobRunner {
             }
             let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
             let enabled = SchedulerJobRuntime.bool(obj["enabled"], default: true)
-            // A paused/disabled intention is still the person's saved words
-            // and schedule. Migration receipts also remain the commit evidence.
-            // Restored rows owe a stopped record and Desk notice, never pruning.
+            // A paused/disabled intention is still the person's saved words and schedule. Migration receipts also remain the commit evidence. Restored rows owe
+            // a stopped record and Desk notice, never pruning.
             if ["notify", "turn", "workshop"].contains(kind) {
                 kept.append(row)
                 continue
@@ -90,7 +90,8 @@ extension SchedulerDueJobRunner {
             for: job,
             afterEpoch: now.timeIntervalSince1970,
             now: { now }
-        ) else { throw NSError(domain: "NativeAgentScheduler", code: -413, userInfo: [NSLocalizedDescriptionKey: "cycle_schedule_missing: no next occurrence"]) }
+        ) else { throw NSError(domain: "NativeAgentScheduler", code: -413,
+            userInfo: [NSLocalizedDescriptionKey: "cycle_schedule_missing: no next occurrence"]) }
         return next
     }
 
@@ -107,20 +108,17 @@ extension SchedulerDueJobRunner {
         }
     }
 
-    static func notificationRowDiaryDateKeys(_ obj: [String: JSONValue]) -> Set<String> {
+    static func matterDiaryDateKeys(_ matter: Experience) -> Set<String> {
         var dates: Set<String> = []
-        if let id = SchedulerJobRuntime.string(obj["id"]),
-           id.hasPrefix("dream-cycle-") {
+        let id = matter.id
+        if id.hasPrefix("dream-cycle-") {
             let dateKey = String(id.dropFirst("dream-cycle-".count).prefix(10))
             if dateKey.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
                 dates.insert(dateKey)
             }
         }
-        guard case .array(let paths)? = obj["related_paths"] else {
-            return dates
-        }
-        for pathValue in paths {
-            guard let path = SchedulerJobRuntime.string(pathValue) else { continue }
+        for ref in matter.face?.artifacts ?? [] where ref.source == Matter.files {
+            let path = ref.id
             let name = (path as NSString).lastPathComponent
             let dateKey = String(name.prefix(10))
             guard dateKey.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else { continue }
@@ -168,7 +166,10 @@ extension SchedulerDueJobRunner {
                 lines.append("Recent conversations scanned: \(sessionsProcessed).")
             }
         } else if entriesWritten > 0 {
-            lines.append("Dream cycle wrote \(entriesWritten) entr\(entriesWritten == 1 ? "y" : "ies") across \(sessionsProcessed) recent conversation\(sessionsProcessed == 1 ? "" : "s").")
+            lines.append("""
+                Dream cycle wrote \(entriesWritten) entr\(entriesWritten == 1 ? "y" : "ies") across \(sessionsProcessed) recent \
+                conversation\(sessionsProcessed == 1 ? "" : "s").
+                """)
         } else {
             lines.append("Dream cycle ran, but there were no new dream entries to write.")
             if sessionsProcessed > 0 {
@@ -189,8 +190,7 @@ extension SchedulerDueJobRunner {
         return lines.joined(separator: "\n\n")
     }
 
-    /// The first non-empty line of the first error that carries one, trimmed to
-    /// 160 characters so a long provider payload cannot swamp the notice.
+    /// The first non-empty line of the first error that carries one, trimmed to 160 characters so a long provider payload cannot swamp the notice.
     static func firstErrorDetailLine(_ errors: [String], limit: Int = 160) -> String? {
         for error in errors {
             for raw in error.split(separator: "\n", omittingEmptySubsequences: true) {
@@ -225,7 +225,7 @@ extension SchedulerDueJobRunner {
     }
 
     static func remRelatedPaths(dataRoot: URL) -> [String] {
-        // REM proposals and pins live at dataRoot; harness/rem_proposals.jsonl is import-only.
+        // REM proposals and pins belong to dataRoot; import-only storage cannot become their live owner.
         [
             dataRoot.appendingPathComponent("rem_proposals.jsonl").path,
             dataRoot.appendingPathComponent("rem_pins.json").path,
@@ -266,14 +266,6 @@ extension SchedulerDueJobRunner {
         if let strings = value as? [String] { return strings }
         if let values = value as? [Any] { return values.map { String(describing: $0) } }
         return []
-    }
-
-    static func jsonValue(from dictionary: [String: Any]) -> JSONValue {
-        guard JSONSerialization.isValidJSONObject(dictionary),
-              let fields = try? NativeActionWire.jsonValueBody(dictionary) else {
-            return .object([:])
-        }
-        return .object(fields)
     }
 
     static func object(_ value: JSONValue) -> [String: JSONValue] {

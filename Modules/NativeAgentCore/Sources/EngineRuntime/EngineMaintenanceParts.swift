@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import BackgroundWork
 import ToolExecution
-// Blueprint: | `EngineMaintenanceParts.swift` | EngineBackgroundWorkPort enters ToolsFacade.withPartDoor for L0 Parts.call of maintenance-assistance and backup-cadence; preserves backup-cadence cancellation as CancellationError; returns typed card prose, optional deadlines and trigger choices without publication or backup execution authority |
+// Blueprint: | `EngineMaintenanceParts.swift` | Effect-free authored maintenance words, deadlines and trigger choices |
 
 extension EngineBackgroundWorkPort {
     func assistanceCard(dataRoot: URL, input: JSONValue) async throws -> AssistanceCardContent {
@@ -23,8 +23,8 @@ extension EngineBackgroundWorkPort {
 
     private func maintenancePart<Value: Codable & Sendable>(dataRoot: URL, id: String, input: JSONValue,
         origin: String, as type: Value.Type) async throws -> Value {
-        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native(origin)) {
-            switch await Parts(root: dataRoot).call(id: id, input: input, as: type) {
+        try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native(origin)) { door in
+            switch await Parts(root: dataRoot).call(id: id, input: input, invocation: door.invocation, as: type) {
             case .success(let content): return content
             case .failure(let error) where error.code == "cancelled": throw CancellationError()
             case .failure(let error): throw error

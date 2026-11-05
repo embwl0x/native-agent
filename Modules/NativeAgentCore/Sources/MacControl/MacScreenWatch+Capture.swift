@@ -8,7 +8,7 @@ import Experiences
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
-// Blueprint: | `MacScreenWatch+Capture.swift` | `MacScreenWatch`: exact-window frame capture, complete secret inspection and masking before publication; newest pending capture is inspected at its 500ms deadline, without another capture; inspection failure ends the active watch |
+// Blueprint: | `MacScreenWatch+Capture.swift` | `MacScreenWatch`: Exact capture with complete secret masks; inspect the newest pending frame even when static |
 
 extension MacScreenWatch {
     public func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -103,22 +103,18 @@ extension MacScreenWatch {
         return SenseFailure(code: failure.rawValue, message: "\(operation): \(message)", remedy: failure.remedy(app: app))
     }
 
-    /// The window's password fields now, in window points, by the desktop
-    /// picture's one-pass index: its whole tree walked and every element
-    /// judged within `inspectionBudget`. A walk that is cut, a control that
-    /// cannot be placed, or a root that is not this window's alone leaves the
-    /// window uninspected.
+    /// Complete whole-window inspection must place every secret control under the exact window root; truncation leaves pixels uninspected.
     func inspect(window frame: MacAXFrame, pixels: [UInt8]?, preceding: [MacAXFrame], at: Double) {
         guard lock.withLock({ ended == nil && !spent }), !Task.isCancelled else { return }
         let source = defaultMacAXElementSource(), deadline = Date().addingTimeInterval(Self.inspectionBudget)
         var why = "Secret-field inspection exceeded its deadline."
-        let found: [MacAXFrame]? = MacAXLimits.$readDeadline.withValue(deadline) {
-            let roots = source.windowRoots(pid: pid).filter { MacAXWindowIdentity.rectsMatch($0.identity.frame, frame) }
+        let found: [MacAXFrame]? = context.holding(\.readDeadline, deadline) {
+            context in let roots = source.windowRoots(pid: pid, context: context).filter { MacAXWindowIdentity.rectsMatch($0.identity.frame, frame) }
             guard roots.count == 1 else { why = "Window selection matched \(roots.count) AX roots."; return nil }
             do {
-                let nodes = try MacScreenViewTextRedaction.inspectSecretFields(source: source, root: roots[0].ref, deadline: deadline)
+                let nodes = try MacScreenViewTextRedaction.inspectSecretFields(source: source, root: roots[0].ref, deadline: deadline, context: context)
                 return MacScreenViewTextRedaction.secretFrames(nodes: nodes,
-                    geometry: MacScreenViewGeometry(bounds: frame, pixelWidth: 1, pixelHeight: 1), deadline: deadline)
+                    geometry: MacScreenViewGeometry(bounds: frame, pixelWidth: 1, pixelHeight: 1), deadline: deadline, context: context)
             } catch {
                 why = (error as? SenseFailure)?.message ?? error.localizedDescription
                 return nil
@@ -137,14 +133,13 @@ extension MacScreenWatch {
             guard ended == nil, !spent, !Task.isCancelled else { return nil }
             inspectedSuccessfully = true
             if fields != secrets {
-                // Pixels painted under the old verdicts go with them.
+                // Drop pixels painted under superseded secret verdicts.
                 secrets = fields; verdict += 1; newest = nil
             }
             return verdict
         }
         guard let painted, let pixels else { return }
-        // Retain both sides of the capture: a field that scrolled out during
-        // the inspection must still mask its pixels in the candidate.
+        // Union pre- and post-capture masks so fields scrolled away during inspection still protect captured pixels.
         let masks = preceding + fields.filter { !preceding.contains($0) }
         publish(pixels: pixels, secrets: masks, window: frame, at: at, painted: painted)
     }

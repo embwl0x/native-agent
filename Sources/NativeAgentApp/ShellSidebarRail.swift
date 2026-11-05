@@ -4,7 +4,7 @@ import SwiftUI
 
 // Blueprint: | `ShellSidebarRail.swift` | `ShellSidebarRail`: canonical rail item presentation, selection and focus-ring rendering |
 
-/// Both shells keep the retained conversation list's unavailable cause visible.
+/// Retained rows must not hide the conversation list's unavailable cause.
 struct ConversationReadNotice: View {
     let detail: String?
     var body: some View {
@@ -18,18 +18,14 @@ struct ConversationReadNotice: View {
     }
 }
 
-/// One word in the rail, with the bar when it is the place you are.
 struct ShellRailItem: View {
     var item: SidebarItem
     var isSelected: Bool
-    /// Something is waiting on him in this place. One 6pt dot after the word —
-    /// no number, no pill. The rail says THAT there is something; the page
-    /// says what it is.
+    /// Show only whether attention is needed; the page owns the details.
     var needsYou: Bool = false
     var attentionUnavailable = false
     var onSelect: () -> Void
-    /// Shared with every other row so the selection bar can travel between
-    /// them instead of blinking off one row and on at the next.
+    /// Share identity across rows so the selection bar can travel instead of blinking.
     var barNamespace: Namespace.ID
 
     @State private var hovering = false
@@ -66,12 +62,7 @@ struct ShellRailItem: View {
             .padding(.leading, NativeAgentShellLayout.railWordInset)
             .frame(height: NativeAgentShellLayout.railItemHeight)
             .overlay(alignment: .leading) {
-                // The bar: 2pt wide, 20pt tall, 4pt in from the edge. Only the
-                // selected row renders it, so matchedGeometryEffect carries it
-                // from the old place to the new one — an identity marker has to
-                // travel or the causal link is lost. Under Reduce Motion every
-                // row keeps its own bar and they cross-fade: travel is exactly
-                // what that setting asks us to drop.
+                // Share bar identity to preserve selection continuity; Reduce Motion crossfades stationary bars.
                 let bar = RoundedRectangle(cornerRadius: 1, style: .continuous)
                     .fill(NativeAgentShell.text)
                     .frame(width: 2, height: 20)
@@ -90,18 +81,19 @@ struct ShellRailItem: View {
         }
         .buttonStyle(.plain)
         .shellKeyboardTarget(.rail)
-        // Space presses a focused Button; Return does the same here.
+        // Return must activate a focused button just as Space does.
         .onKeyPress(.return) { onSelect(); return .handled }
         .onHover { hovering = $0 }
         .help(item.displayName)
         .accessibilityIdentifier("sidebar.item.\(item.rawValue)")
-        .accessibilityLabel(attentionUnavailable ? "\(item.shellRailTitle), attention unavailable" : needsYou ? "\(item.shellRailTitle), waiting for you" : item.shellRailTitle)
+        .accessibilityLabel(attentionUnavailable
+            ? "\(item.shellRailTitle), attention unavailable"
+            : needsYou ? "\(item.shellRailTitle), waiting for you" : item.shellRailTitle)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 }
 
-/// Keyboard focus on a rail word: a rounded ring in the haze's edge light,
-/// inset like the plate's own corners, instead of the square system ring.
+/// Match the rail's rounded plate instead of using the square system focus ring.
 struct ShellRailFocusRing: View {
     @AppStorage(HazeColor.key) private var hazeRaw = HazeColor.defaultValue.rawValue
     @Environment(\.colorScheme) private var colorScheme
@@ -123,25 +115,21 @@ struct ShellRailFocusRing: View {
     }
 }
 
-/// Quiet groups on a floating glass plate, as the layout orders them, with
-/// the last (Settings, as seeded) at the foot.
 struct ShellSidebarRail: View {
     @Environment(AppModel.self) private var appModel
     @Binding var selection: SidebarItem
-    /// The places that have something waiting on him. A dot, never a count —
-    /// the caller does the counting and this rail only says whether.
+    /// The caller owns counts; the rail exposes only whether attention is needed.
     var needsYou: Set<SidebarItem>? = []
     var attentionItem: SidebarItem? = nil
 
-    /// The one id the travelling selection bar is known by.
+    /// One identity preserves the bar's continuity between rows.
     static let selectionBarID = "shell.rail.selection-bar"
     @Namespace private var selectionBar
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
-        // Every row but the last renders at the top; the last is pushed to the
-        // bottom, so the setup door is never mistaken for a place to work.
+        // Anchor Settings at the foot so setup stays distinct from work destinations.
         SurfaceLayoutContent(appModel.engine.layout.availability) { layout in
         let rail = SidebarItem.rail(layout)
         VStack(spacing: 4) {
@@ -150,14 +138,13 @@ struct ShellSidebarRail: View {
             Spacer(minLength: 8)
             if let last = rail.last { row(item: last) }
         }
-        // The bar's travel is one transaction over the whole rail, so both the
-        // leaving and the arriving row read the same animation.
+        // Animate the whole rail in one transaction so departing and arriving bars stay in sync.
         .animation(
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: selection
         )
         }
-        // Rail words share the shell header's baseline at window y 72; Settings keeps the same bottom inset.
+        // Align rail words to the header baseline and retain the same Settings inset.
         .padding(.top, 14 - NativeAgentShellLayout.railPlateInset)
         .padding(.bottom, 14 - NativeAgentShellLayout.railPlateInset)
         .frame(width: NativeAgentShellLayout.railWidth)

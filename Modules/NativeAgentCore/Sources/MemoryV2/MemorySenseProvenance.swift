@@ -3,7 +3,7 @@ import GRDB
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `MemorySenseProvenance.swift` | `MemorySenseProvenance`: shared warning presentation and durable sense-version metadata; `MemoryStorage.markVersionWrong` |
+// Blueprint: | `MemorySenseProvenance.swift` | `MemorySenseProvenance`, `MemoryStorage.markVersionWrong`: warnings and sense-version metadata |
 
 /// Descriptive provenance only: warning does not erase or retire the memory.
 public enum MemorySenseProvenance {
@@ -14,13 +14,13 @@ public enum MemorySenseProvenance {
         return warning
     }
 
-    /// The same qualification wherever a consumer presents this memory.
+    /// Share warning wording across every presentation.
     public static func presentation(_ text: String, metadata: JSONValue?) -> String {
         (warning(in: metadata).map { "[\($0)]\n" } ?? "") + text
     }
 
-    static func stamping(_ metadata: JSONValue?) throws -> JSONValue? {
-        guard let reads = try SenseTurnReads.current?.snapshot(), !reads.isEmpty else { return metadata }
+    static func stamping(_ metadata: JSONValue?, reads: SenseTurnReads?) throws -> JSONValue? {
+        guard let reads = try reads?.snapshot(), !reads.isEmpty else { return metadata }
         var object: [String: JSONValue] = [:]
         if case .object(let value)? = metadata { object = value }
         var versions: [JSONValue] = []

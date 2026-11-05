@@ -9,12 +9,7 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `NativeAgentChatApprovalFiler.swift` | `NativeAgentChatApprovalFiler` actor; `fileApprovalRequest`, `peerRequesterName` |
 
-/// App-owned projection of a chat approval into the canonical ApprovalInbox.
-///
-/// The inbox remains the authority and `ApprovalExecution` remains
-/// the sole post-resolution executor. This filer only preserves the initiating
-/// conversation identity and returns immediately so Mac, detached, Slack, iOS,
-/// and bridge turns never block while waiting for a person.
+/// Return without waiting for the person; the inbox owns authority and ApprovalExecution alone executes decisions.
 public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
     private let dataRoot: URL
 
@@ -26,20 +21,21 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         toolName: String,
         surface: String,
         payload: JSONValue,
-        reason: String
+        reason: String,
+        turn: Turn
     ) async throws -> String {
-        try await fileRequest(Self.requestPayload(toolName: toolName, surface: surface, payload: payload),
-                              reason: reason).id
+        try await fileRequest(Self.requestPayload(toolName: toolName, surface: surface, payload: payload, turn: turn),
+                              reason: reason, turn: turn).id
     }
 
     // The durable request owns redaction and authenticated identity on every surface.
     nonisolated static func requestPayload(toolName: String, surface: String, payload: JSONValue,
-                                           telegram: JSONValue? = nil) -> JSONValue {
-        let payload = MacInjectionArgRedaction.redactedPayload(tool: toolName, payload: payload)
-        let envelope = TurnEnvelope.current(surface: surface)
+                                           turn: Turn, telegram: JSONValue? = nil) -> JSONValue {
+        let payload = MacInjectionArgRedaction.redactedPayload(tool: toolName, payload: payload, turn: turn)
+        let envelope = TurnEnvelope.current(turn: turn, surface: surface)
         let route = envelope.replyRoute
         let origin: JSONValue = .object([
-            "sessionId": Self.nonEmptyStringValue(ChatToolSessionContext.verifiedSessionId),
+            "sessionId": Self.nonEmptyStringValue(turn.verifiedSessionID),
             "chatId": Self.nonEmptyStringValue(envelope.verifiedChatId),
             "userId": Self.nonEmptyStringValue(envelope.verifiedUserId),
             "agent": Self.nonEmptyStringValue(envelope.agent),
@@ -59,15 +55,15 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             "input": payload,
             "origin": origin,
         ]
-        request["peer"] = PeerDataTaint.carriedRecord(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+        request["peer"] = PeerDataTaint.carriedRecord(turn: turn, peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                                       peerID: envelope.verifiedUserId)
-        request["fileAccess"] = ChatToolSessionContext.fileAccess.map(JSONValue.string) ?? .null
-        request["hostCallID"] = SkillRunContext.hostCallID.map { .string($0.uuidString) }
+        request["fileAccess"] = turn.fileAccess.map(JSONValue.string) ?? .null
+        request["hostCallID"] = turn.hostCallID.map { .string($0.uuidString) }
         request["telegram"] = telegram
         return .object(request)
     }
 
-    func fileRequest(_ requestPayload: JSONValue, reason: String) async throws -> ApprovalRecord {
+    func fileRequest(_ requestPayload: JSONValue, reason: String, turn: Turn) async throws -> ApprovalRecord {
         guard case .object(let request) = requestPayload,
               case .string(let toolName)? = request["toolName"],
               case .string(let surface)? = request["surface"],
@@ -93,12 +89,11 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
                 "remoteResolvable": .bool(true),
                 "localOnly": .bool(false),
             ]),
-            matchesPending: { payload in Self.isSameRequest(payload, requestPayload) }
+            turn: turn, matchesPending: { payload in Self.isSameRequest(payload, requestPayload) }
         )
         return outcome.record
     }
 
-    /// The connected agent's name, when a known peer asked.
     public static func peerRequesterName(surface: String, peerID: String?, dataRoot: URL) -> String? {
         guard PeerTurnEffectPolicy.isPeerBridge(surface: surface),
               let peerID, !peerID.isEmpty,
@@ -109,8 +104,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         return name.isEmpty ? nil : name
     }
 
-    /// The separator that lets a reader take the requester back out of a
-    /// title — the in-chat card reads it to name the peer in its own heading.
+    /// Keep requester extraction aligned with the separator used to author card headings.
     public static let requesterTitleSeparator = " asked: "
 
     public static func approvalTitle(toolName: String, requester: String?) -> String {
@@ -118,7 +112,6 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         return "\(requester)\(requesterTitleSeparator)Approve \(toolName)"
     }
 
-    /// The requester a title carries, or nil for the person's own approvals.
     public static func requester(inTitle title: String) -> String? {
         guard let range = title.range(of: requesterTitleSeparator) else { return nil }
         let who = title[title.startIndex..<range.lowerBound]
@@ -126,10 +119,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         return who.isEmpty ? nil : who
     }
 
-    /// Two chat-tool approvals are the same REQUEST when the tool, the surface,
-    /// the arguments and the initiating conversation all match. `origin` carries
-    /// the reply route, which is part of the identity: the same call from two
-    /// chats must stay two approvals.
+    /// Tool, surface, arguments and reply route define identity so matching calls in different chats retain separate approvals.
     private static func attributionFree(_ origin: JSONValue?) -> JSONValue? {
         guard case .object(var fields)? = origin else { return origin }
         fields["answerExperienceID"] = nil
@@ -144,12 +134,12 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             && left["surface"] == right["surface"]
             && left["input"] == right["input"]
             && left["telegram"] == right["telegram"]
-            // Which answer asked is attribution, not identity: the same request from a
-            // later turn is the same pending card (and the card keeps its first answer).
+            // Which answer asked is attribution, not identity: the same request from a later turn is the same pending card (and the card keeps its first
+            // answer).
             && attributionFree(left["origin"]) == attributionFree(right["origin"])
             && left["peer"] == right["peer"]
             && left["hostCallID"] == right["hostCallID"]
-            // A card filed with other hands is another request (an old card has none).
+            // Different file-access authority makes a distinct request, including cards without retained access.
             && left["fileAccess"] == right["fileAccess"]
     }
 
@@ -158,7 +148,8 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
         toolName: String,
         surface: String,
         payload: JSONValue,
-        reason: String
+        reason: String,
+        turn: Turn
     ) async -> JSONValue {
         _ = payload
         return ToolNotRunStatus.approvalFiled.reporting(.object([

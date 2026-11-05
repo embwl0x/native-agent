@@ -55,8 +55,6 @@ struct MemoryUpkeepPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // One memory status block; its Advanced diagnostics fold keeps
-            // every backend row, the data root and the Spotlight reindex.
             MemoryV2NativeStackPanel(
                 snapshot: appModel.engine.memory.diagnostics,
                 summaryStatus: appModel.engine.memory.status,
@@ -64,13 +62,10 @@ struct MemoryUpkeepPanel: View {
                 onReindex: { Task { await reindexSpotlight() } }
             )
         }
-        // Fast mode warms bge at process launch. Follow that one startup
-        // attempt for at most ten seconds and read only runtime state; the
-        // full memory/Spotlight snapshot is intentionally not rescanned.
+        // Observe the one startup embedding attempt for at most ten seconds; do not rescan memory and Spotlight while waiting.
         .task { await appModel.engine.memory.refreshEmbeddingDiagnostics() }
     }
 
-    /// Every result line the upkeep has to say, in the order it happened.
     private var notices: [(text: String, adverse: Bool)] {
         var lines: [(text: String, adverse: Bool)] = []
         if let spotlightStatus, !spotlightStatus.isEmpty {
@@ -85,8 +80,6 @@ struct MemoryUpkeepPanel: View {
         return lines
     }
 
-    /// The list/proposal/status reader, the native status snapshot, and the
-    /// CloudKit account status, in one user-triggered transaction.
     @MainActor
     private func refreshMemorySurface() async {
         guard !isRefreshing else { return }
@@ -106,18 +99,13 @@ struct MemoryUpkeepPanel: View {
         defer { isReindexing = false }
         let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.engine.dataRoot)
         spotlightStatus = outcome.userMessage
-        // The status line and count must be read after the durable result, not
-        // retained from before a delete-and-rebuild attempt.
+        // Read status and counts after the durable rebuild result so they cannot retain pre-delete data.
         await appModel.engine.memory.refreshDiagnostics()
     }
 }
 
-/// A read-only path to the complete saved text. The list preview stays compact;
-/// opening this sheet does not pin, delete, or otherwise mutate the memory.
 struct MemoryFullTextView: View {
     let text: String
-    /// Present only where a correction has somewhere to land (a kept memory
-    /// row). Nil leaves the sheet exactly as it was.
     var onCorrect: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
 
@@ -152,10 +140,7 @@ struct MemoryFullTextView: View {
     }
 }
 
-/// The explicit toolbar refresh has three independently-read boundaries:
-/// app-model content, the native store snapshot, and the optional CloudKit
-/// account state. A failed store probe wins over a generic successful refresh
-/// receipt because zero is meaningful only after the store was actually read.
+/// A failed store probe outranks a generic refresh success: only a successful read can establish zero.
 struct MemoryToolbarRefreshPresentation: Equatable {
     let text: String
     let isAdverse: Bool
@@ -180,10 +165,7 @@ struct MemoryToolbarRefreshPresentation: Equatable {
     }
 }
 
-/// Diagnostics can identify a storage location without putting an account path
-/// into a support screenshot. This follows the Living Status privacy boundary:
-/// a value containing the home directory is evidence of a private location,
-/// not displayable path text.
+/// Home-directory paths identify private locations; omit their account-bearing text from support screenshots.
 enum MemoryAdvancedDiagnosticsIdentifiers: Equatable {
     case unavailable
     case privateLocation
@@ -225,7 +207,6 @@ extension SwiftNativeMemoryIndexer.ReindexOutcome {
         }
     }
 
-    /// What the agent's tool result says: the same line plus the raw cause.
     var agentMessage: String {
         if case .failed(_, let cause) = self { return UserFacingError.forAgent(userMessage, cause: cause) }
         return userMessage
@@ -258,7 +239,6 @@ extension MemoryV2NativeStackSnapshot.EmbedderHealth {
 }
 
 // MARK: - Plain-English memory status copy
-//
 enum MemoryStatusPlainCopy {
     enum StorageAvailability: Equatable {
         case checking
@@ -267,9 +247,7 @@ enum MemoryStatusPlainCopy {
         case unknown
     }
 
-    /// Reconcile the status reader with the direct panel probe. A failed probe
-    /// always wins over stale success data: zero is meaningful only after a
-    /// successful store read.
+    /// A failed direct probe outranks stale status success; zero requires a successful store read.
     static func storageAvailability(
         status: String?,
         snapshotReadable: Bool?
@@ -285,13 +263,10 @@ enum MemoryStatusPlainCopy {
         }
     }
 
-    /// Prefer the v2 status counts when the app has them; fall back to the
-    /// direct SQLite probe on a fresh install where status has not loaded yet.
     static func savedCount(active: Int?, sqliteRecordCount: Int) -> Int {
         active ?? sqliteRecordCount
     }
 
-    /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
     static func statusText(
         health: MemoryV2NativeStackSnapshot.EmbedderHealth,
         storage: StorageAvailability = .readable
@@ -361,8 +336,6 @@ enum MemoryStatusPlainCopy {
         return parts.joined(separator: ". ") + "."
     }
 
-    /// Non-nil only when the user should know something is off. The technical
-    /// reason string stays in Advanced Diagnostics.
     static func attentionDetail(
         health: MemoryV2NativeStackSnapshot.EmbedderHealth,
         storage: StorageAvailability = .readable
@@ -425,15 +398,11 @@ enum MemoryStatusPlainCopy {
 
 private struct MemoryV2NativeStackPanel: View {
     let snapshot: MemoryV2NativeStackSnapshot
-    // Optional so the panel still renders on a fresh install.
     var summaryStatus: MemoryV2Status? = nil
     let isReindexing: Bool
     let onReindex: () -> Void
-    // Collapsed by default; mirrors the Advanced disclosures in TrustCenterView
-    // and MacControlPermissionsView.
     @State private var showAdvancedDiagnostics = false
 
-    // Plain status leads; backend details remain in Advanced Diagnostics.
     private var storageAvailability: MemoryStatusPlainCopy.StorageAvailability {
         MemoryStatusPlainCopy.storageAvailability(
             status: summaryStatus?.status,
@@ -537,7 +506,6 @@ private struct MemoryV2NativeStackPanel: View {
                         ? .red
                         : (snapshot.sqliteRecordCount > 0 ? .green : .secondary)
                 )
-                    // Embedder health distinguishes running, unloaded and broken states with their actual errors.
                     stackRow(
                         icon: snapshot.embedderHealth.needsAttention
                             ? "exclamationmark.triangle.fill"
@@ -574,8 +542,6 @@ private struct MemoryV2NativeStackPanel: View {
                     tint: snapshot.cloudKitAccountStatus == UserFacingError.iCloudSignedIn ? .green : .secondary
                 )
             }
-            // UI-5: the long-term memory profile's real filename lives here,
-            // inside Advanced Diagnostics, and nowhere else in the UI.
             Text("long-term memory profile file: USER.md")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)

@@ -1,7 +1,5 @@
-// MacClipboard.swift — clipboard contracts.
-// Reads apply line-by-line perception redaction so one secret does not hide an entire document.
-// Writes replace the general pasteboard without echoing input.
-// Non-text content is named by UTI without reading its bytes or claiming a size.
+// Redact clipboard text by line so one secret cannot hide an entire document. Writes never echo input; nontext types expose only UTIs, never bytes or guessed
+// sizes.
 
 import Foundation
 import NativeAgentCore
@@ -11,17 +9,14 @@ import PersistenceCore
 import AppKit
 #endif
 
-// Blueprint: | `MacClipboard.swift` | `MacClipboardRead` and pasteboard ports: permission-bound clipboard reads/writes, source redaction and bounded text/type projection |
+// Blueprint: | `MacClipboard.swift` | `MacClipboardRead`: Permission-bound pasteboard reads/writes; bounded redacted text and type metadata |
 
 // MARK: - What one look at the pasteboard found
 
-/// A single pasteboard type present on the general pasteboard.
 public struct MacPasteboardType: Sendable, Equatable {
-    /// The raw UTI (`public.utf8-plain-text`, `public.png`, …).
     public let identifier: String
-    /// Byte count of the data behind this type, when the pasteboard reports
-    /// one. `nil` means "present but the size is not knowable" — never zero,
-    /// which would be a claim.
+    /// Byte count of the data behind this type, when the pasteboard reports one. `nil` means "present but the size is not knowable" — never zero, which would
+    /// be a claim.
     public let bytes: Int?
 
     public init(identifier: String, bytes: Int? = nil) {
@@ -30,16 +25,11 @@ public struct MacPasteboardType: Sendable, Equatable {
     }
 }
 
-/// Everything a read of the general pasteboard can honestly report.
 public struct MacPasteboardContents: Sendable, Equatable {
-    /// The plain-text flavor, RAW. Redaction happens at the serialization
-    /// boundary, never in the seam, so a synthetic source can carry a secret
-    /// and the test still proves the redactor ran.
+    /// Keep raw text within the seam; every serialization must apply redaction before text leaves the process.
     public let text: String?
     public let types: [MacPasteboardType]
-    /// `NSPasteboard.changeCount` — the only stable "did this change" signal
-    /// the system publishes. Reported so a caller can tell a re-read apart
-    /// from a stale one without diffing content.
+    /// Use NSPasteboard.changeCount to distinguish fresh reads without comparing or exposing content.
     public let changeCount: Int
 
     public init(text: String?, types: [MacPasteboardType], changeCount: Int) {
@@ -49,13 +39,10 @@ public struct MacPasteboardContents: Sendable, Equatable {
     }
 }
 
-/// Pasteboard access; production uses `NSPasteboard.general`.
 public protocol MacPasteboardSource: Sendable {
-    /// `nil` when no pasteboard exists on this platform at all — which the
-    /// caller REPORTS rather than dressing up as an empty clipboard.
+    /// A missing pasteboard is unavailable, never evidence of an empty clipboard.
     func read() -> MacPasteboardContents?
-    /// Replace the pasteboard's contents with `text`. Returns false when the
-    /// write failed; the previous contents may already have been cleared.
+    /// A failed replacement may already have cleared the previous contents; false cannot promise preservation.
     func write(text: String) -> Bool
 }
 
@@ -87,8 +74,7 @@ public struct SystemMacPasteboardSource: MacPasteboardSource {
 }
 #endif
 
-/// Non-macOS builds and any environment with no window server. It says so
-/// instead of pretending the clipboard is empty.
+/// Platforms without a window server report unavailability rather than an empty clipboard.
 public struct UnavailableMacPasteboardSource: MacPasteboardSource {
     public init() {}
     public func read() -> MacPasteboardContents? { nil }
@@ -106,16 +92,11 @@ public func defaultMacPasteboardSource() -> any MacPasteboardSource {
 // MARK: - The redaction boundary
 
 public enum MacClipboardRead {
-    /// Default characters returned by one read. Larger than the look cap
-    /// (6,144 bytes) on purpose: the whole point of the ⌘A ⌘C route is a dense
-    /// document the AX walk cannot express, and a cap tuned for a window's
-    /// controls would make this organ useless for the job it exists for.
+    /// Allow more than a window look's text cap because copied documents can be dense prose the AX tree cannot express.
     public static let defaultMaxChars = 8_000
     public static let hardMaxChars = 32_000
     public static let minMaxChars = 0
-    /// A single `clipboard_write` payload cap. Generous — she is writing text
-    /// she composed — but bounded, because an unbounded pasteboard write is a
-    /// memory shape, not a feature.
+    /// Bound writes to prevent an unbounded pasteboard payload from exhausting memory.
     public static let maxWriteChars = 100_000
 
     public static func clampedMaxChars(_ requested: Int?) -> Int {
@@ -123,7 +104,6 @@ public enum MacClipboardRead {
         return min(max(requested, minMaxChars), hardMaxChars)
     }
 
-    /// One redacted line and, when it went dark, WHY.
     public struct RedactedLine: Sendable, Equatable {
         public let line: Int
         public let reason: String
@@ -135,18 +115,8 @@ public enum MacClipboardRead {
         public var didRedact: Bool { !redactedLines.isEmpty }
     }
 
-    /// THE BOUNDARY. Every character that leaves this organ passes through
-    /// here.
-    ///
-    /// Line by line, because a copied document is prose with at most a secret
-    /// IN it. The shared redactor checks each line on its own and under the
-    /// preceding line's label. A secret is replaced by its reason — never
-    /// dropped silently, because a caller who cannot tell redaction from a
-    /// short clipboard will re-read forever.
-    ///
-    /// Deliberately NOT the whole-blob check: a 4,000-character document is
-    /// never a "high entropy token", so testing the blob would redact nothing
-    /// and testing only the blob would miss the password on line 9.
+    /// Redact each line with its preceding label context before text leaves this boundary. Whole-blob entropy misses embedded secrets; retain redaction reasons
+    /// so callers cannot mistake withheld text for a short clipboard and reread forever.
     public static func redacted(_ raw: String) -> Redaction {
         var lines: [String] = []
         var flagged: [RedactedLine] = []
@@ -176,13 +146,13 @@ public enum MacClipboardRead {
         return Redaction(text: lines.joined(separator: "\n"), redactedLines: flagged)
     }
 
-    /// Cut to `maxChars` on a character boundary, reporting whether it cut.
+    /// Cut only on character boundaries and report truncation so partial text stays explicit.
     public static func truncated(_ text: String, maxChars: Int) -> (text: String, truncated: Bool) {
         guard text.count > maxChars else { return (text, false) }
         return (String(text.prefix(maxChars)), true)
     }
 
-    /// The `types` channel: names and sizes, never bytes.
+    /// Types expose names and sizes only; reading bytes would disclose nontext content.
     public static func typesJSON(_ types: [MacPasteboardType]) -> JSONValue {
         .array(types.map { type in
             var row: [String: JSONValue] = ["type": .string(type.identifier)]
@@ -191,9 +161,7 @@ public enum MacClipboardRead {
         })
     }
 
-    /// True when the pasteboard carries something this organ cannot put into
-    /// words — an image, a file promise, an app's private flavor. Used only to
-    /// phrase the answer honestly; the bytes are never read.
+    /// Use unsupported-type evidence only to explain unrenderable contents; never read those bytes.
     public static func hasNonTextTypes(_ types: [MacPasteboardType]) -> Bool {
         types.contains { !isTextType($0.identifier) }
     }

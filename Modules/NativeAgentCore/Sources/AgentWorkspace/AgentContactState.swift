@@ -3,12 +3,11 @@ import PersistenceCore
 import NativeAgentShared
 import Experiences
 import NativeAgentCore
-// Blueprint: | `AgentContactState.swift` | Folds validated contact projections from `AgentPeerStore` into presentation identities; labels only ACP/MCP schemes as such. `AgentLocalHealth` owns 600-second freshness and 300-second refresh spacing; `not_reached` retains unsent failure evidence without counting as broken; exact pull-reply read receipts. Authentication recovery requires structured failure evidence for the exact observed operation; reply prose cannot erase failures. |
+// Blueprint: | `AgentContactState.swift` | `AgentPeerStore`, `AgentLocalHealth`, `not_reached`: contact identity and exact health evidence |
+// Only ACP/MCP schemes get protocol labels; local observations use 600-second freshness and 300-second refresh spacing.
+// Unsent not_reached evidence stays retained without claiming a broken reply route.
 
-/// Who each saved contact is (docs/agent-communication.md, "Every agent is
-/// itself"): its own who, or the who it is explicitly associated with
-/// (`who`). A who is known by its first handle, else by `peer:<id>`. Nothing
-/// else makes two contacts one: no product, vendor, host or lane name.
+/// Identity merges only through explicit association, never a product, vendor or host name.
 public struct AgentContactIdentity: Sendable {
     public let aliases: [String: String]
     public let doors: [String: String]
@@ -25,7 +24,6 @@ public struct AgentContactIdentity: Sendable {
     package init(peers: [[String: String]], handles: [String: [String]] = [:]) {
         self.peers = peers
         let byID = Dictionary(uniqueKeysWithValues: peers.compactMap { peer in peer["id"].map { ($0, peer) } })
-        // An association to a contact that no longer exists is no association.
         func who(_ id: String) -> String { byID[id]?["who"].flatMap { byID[$0] == nil ? nil : $0 } ?? id }
         func key(_ who: String) -> String { handles[who]?.first?.lowercased() ?? "peer:" + who }
         var aliases: [String: String] = [:], doors: [String: String] = [:]
@@ -121,7 +119,8 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/local-health.json") }
     public static func read(_ root: URL) -> [String: Self] {
         do { return try checkedRead(root) }
-        catch { return ["local-health": Self(status: "unknown", detail: "agents/local-health.json is unreadable; saved observations are unavailable.", checkedAt: Date(), authenticated: false)] }
+        catch { return ["local-health": Self(status: "unknown", detail: "agents/local-health.json is unreadable; saved observations are unavailable.",
+            checkedAt: Date(), authenticated: false)] }
     }
     public static func checkedRead(_ root: URL) throws -> [String: Self] {
         do {
@@ -129,7 +128,8 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
     }
     /// Said until a newer observation replaces it, not only while fresh.
-    public var sticky: Bool { brokenSince != nil || ["not_reached", "unverified", "interrupted", "stalled", "no_reply_by_deadline"].contains(observedStatus ?? "") }
+    public var sticky: Bool { brokenSince != nil || ["not_reached", "unverified", "interrupted", "stalled", "no_reply_by_deadline"].contains(observedStatus
+        ?? "") }
     public var current: Bool { presenceStatus != nil || sticky || Self.isRecent(checkedAt) }
     public var word: String? {
         guard current else { return nil }
@@ -141,9 +141,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         let text = (observedStatus ?? availability).replacingOccurrences(of: "_", with: " ")
         return text.prefix(1).uppercased() + text.dropFirst()
     }
-    /// A reply path that is broken, as Doctor and the body report count it. An
-    /// unverified one (its app, program or recipe changed since the proof) is
-    /// not: the next send proves it again.
+    /// Unverified routes need a new send as proof; only broken reply paths count as problems.
     public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(observedStatus ?? availability) }
     /// Presence words, overlaid live at every read: a state, never a problem.
     public static let presenceStatuses: Set<String> = ["recent_activity", "waiting", "inbound_only", "live"]
@@ -168,8 +166,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         return Self.authenticationFailure(record.receipt)
     }
     public static func authenticationFailure(_ receipt: JSONValue?) -> Bool {
-        // Only the route owner's structured authentication evidence qualifies.
-        // Reply prose may describe an entirely different service's failure.
+        // Only the route owner's structured authentication evidence qualifies. Reply prose may describe an entirely different service's failure.
         AgentConversationRecord.sendEvidence(receipt)["needs_authentication"] == .bool(true)
     }
 
@@ -181,9 +178,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     }
 }
 
-/// An agent discovery found on this Mac and offered once (agents/discovery.json,
-/// by candidate id). Declines and disconnects hold across program updates.
-/// Discovery and disconnect share its file lock; a connection ends the offer.
+/// Declines and disconnects survive program updates; discovery and disconnect share a file lock.
 public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
     public var name: String
     public var version: String?
@@ -194,8 +189,7 @@ public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
     public init(name: String) { self.name = name }
 
     public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/discovery.json") }
-    /// Empty only when the file is missing; nil when it is there but does not
-    /// read, so a damaged file is never written over.
+    /// Empty only when the file is missing; nil when it is there but does not read, so a damaged file is never written over.
     public static func read(_ root: URL) -> [String: Self]? {
         try? checkedRead(root)
     }
@@ -212,7 +206,6 @@ public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
         try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(offers), to: url(root))
     }
 
-    /// Open: offered, and neither declined nor connected since.
     public var open: Bool { offeredAt != nil && declinedAt == nil && connectedAt == nil }
     /// Home's PEOPLE line. An `app:` id is an app no recipe knows: nothing to connect.
     public static func line(id: String, name: String) -> String {
@@ -220,7 +213,7 @@ public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
     }
 }
 
-/// Exact replies fetched through a pull door. Old fetches without evidence stay unknown.
+/// Fetches without read evidence stay unknown.
 public enum ContactReplyReads {
     public struct Read: Codable, Sendable {
         public let session: String
@@ -245,7 +238,10 @@ public enum ContactReplyReads {
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(Array(rows.suffix(2048))), to: file)
             } catch {
                 RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "contacts.reply_read", owner: url(dataRoot).path,
-                    words: "The reply was fetched, but its read record could not be saved: \(error.localizedDescription). Do not fetch it again to repair this record.",
+                    words: """
+                        The reply was fetched, but its read record could not be saved: \(error.localizedDescription). Do not fetch it again to repair this \
+                        record.
+                        """,
                     tap: ToolFailureError.fileRepairInstruction(url(dataRoot), shape: "Preserve the Read array and repair its read/write access."))
             }
         }

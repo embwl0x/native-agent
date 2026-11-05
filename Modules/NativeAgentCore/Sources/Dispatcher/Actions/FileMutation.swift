@@ -14,9 +14,7 @@ extension FileSystemActions {
     static func isLink(_ entry: URL) -> Bool {
         (try? entry.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true
     }
-    /// A move or trash of a symlink changes the folder it lives in: that folder is held to the
-    /// writable roots and out of sensitive stores, wherever the link points. Anything else
-    /// is its own resolved path, fenced as always.
+    /// Fence both a symlink's parent and its target: moving the link changes its containing folder.
     static func entryFolderRefusal(_ entry: URL, _ ctx: ConnectorActionContext) -> JSONValue? {
         guard isLink(entry) else { return nil }
         let folder = entry.deletingLastPathComponent()
@@ -27,7 +25,6 @@ extension FileSystemActions {
         if isSensitiveDataPath(folder, ctx) {
             return errResult("Path '\(entry.path)' is under a sensitive data sub-tree. Use dedicated Swift runtime tools instead.", code: "path_not_allowed")
         }
-        // Reads the entry's own spelling as well as where it points.
         if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: entry.path, write: true) {
             return errResult(reason, code: "path_not_allowed")
         }
@@ -47,7 +44,7 @@ extension FileSystemActions {
             do {
                 try CapabilityLifecycle.requireFileMutation(resolved,
                     dataRoot: ctx.dataRoot ?? PersistenceCore.defaultDataRoot(),
-                    personaRoot: ctx.personaRoot)
+                    personaRoot: ctx.personaRoot, turn: ctx.turn)
             } catch { return errResult(error.localizedDescription, code: "path_not_allowed") }
         }
         let allowed = allowedRoots(ctx, write: write)
@@ -72,8 +69,7 @@ extension FileSystemActions {
             return errResult("path is required", code: "bad_input")
         }
         let dataRoot = ctx.dataRoot ?? PersistenceCore.defaultDataRoot()
-        // The named entry goes to the Trash (a symlink itself, never its target);
-        // the fences hold the folder it lives in and where it points.
+        // Trash the link itself; fence its parent and target so either spelling respects write authority.
         let entry = NativeAgentWorkspaceRoot.resolveFileEntryPath(rawPath, dataRoot: dataRoot)
         let resolved = NativeAgentWorkspaceRoot.resolveFileMutationPath(rawPath, dataRoot: dataRoot)
         if let refusal = entryFolderRefusal(entry, ctx) ?? mutationRefusal(resolved, ctx) { return refusal }
@@ -88,8 +84,6 @@ extension FileSystemActions {
                 "message": .string("Moved to the Trash. Restore it from the Trash if needed.")])
         } catch { return errResult(error.localizedDescription, code: "trash_failed") }
     }
-    /// Task-scoped observation of the opened append handle for race fixtures.
-    @TaskLocal static var appendHandleOpened: (@Sendable () -> Void)?
     static func transferFile(_ input: [String: JSONValue], _ ctx: ConnectorActionContext, copy: Bool) -> JSONValue {
         let path = input["path"]?.stringValue ?? "", destination = (input["destination"]?.stringValue ?? "")
         guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -100,8 +94,7 @@ extension FileSystemActions {
             guard case .bool = overwrite else { return errResult("overwrite must be true or false.", code: "bad_input") }
         }
         let dataRoot = ctx.dataRoot ?? PersistenceCore.defaultDataRoot()
-        // A move acts on the named entries (a symlink moves itself, never its target), held to the
-        // folders it changes and to where they point; a copy reads and writes what the paths reach.
+        // Moves act on named entries and their containing folders; copies read and write the resolved targets.
         let resolvedSource = NativeAgentWorkspaceRoot.resolveFileMutationPath(path, dataRoot: dataRoot)
         let resolvedTarget = NativeAgentWorkspaceRoot.resolveFileMutationPath(destination, dataRoot: dataRoot)
         let source = copy ? resolvedSource : NativeAgentWorkspaceRoot.resolveFileEntryPath(path, dataRoot: dataRoot)
@@ -110,13 +103,13 @@ extension FileSystemActions {
         for url in [resolvedSource, resolvedTarget] {
             if let refusal = mutationRefusal(url, ctx, write: !copy || url == resolvedTarget) { return refusal }
         }
-        // Into itself is a folder's question; a moved link carries nothing under it.
+        // Only a folder can contain its destination; a moved link carries no subtree.
         guard source != target, (!copy && isLink(source)) || !isWithinRoots(target, [source]),
               !isWithinRoots(dataRoot, [resolvedSource]) else {
-            return errResult("Cannot transfer an item onto itself, into itself, or transfer NativeAgent's data root or a folder containing it.", code: "path_not_allowed")
+            return errResult(
+                "Cannot transfer an item onto itself, into itself, or transfer NativeAgent's data root or a folder containing it.", code: "path_not_allowed")
         }
-        // A folder carries everything under it: no sensitive store leaves its place inside one, or arrives in one,
-        // and a folder whose whole tree does not read is not moved, since what it holds cannot be told.
+        // A folder transfer carries its whole subtree; refuse unreadable trees and sensitive stores in either direction.
         if isWithinRoots(source, [dataRoot]) || isWithinRoots(target, [dataRoot]),
            (try? source.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
             var unreadable: URL?
@@ -124,11 +117,17 @@ extension FileSystemActions {
             while let url = tree?.nextObject() as? URL {
                 guard let relative = NativeAgentWorkspaceRoot.relativePath(url.path, under: source.path), !relative.isEmpty else { unreadable = url; break }
                 if isSensitiveDataPath(source.appendingPathComponent(relative), ctx) || isSensitiveDataPath(target.appendingPathComponent(relative), ctx) {
-                    return errResult("Path '\(source.path)/\(relative)' is under a sensitive data sub-tree, so the folder holding it is not moved. Move the other files individually.", code: "path_not_allowed")
+                    return errResult("""
+                        Path '\(source.path)/\(relative)' is under a sensitive data sub-tree, so the folder holding it is not moved. Move the other \
+                        files individually.
+                        """, code: "path_not_allowed")
                 }
             }
             if tree == nil || unreadable != nil {
-                return errResult("'\((unreadable ?? source).path)' does not read, so what the folder holds cannot be checked and it is not moved. Move the files you can read individually.", code: "path_not_allowed")
+                return errResult("""
+                    '\((unreadable ?? source).path)' does not read, so what the folder holds cannot be checked and it is not moved. Move the \
+                    files you can read individually.
+                    """, code: "path_not_allowed")
             }
         }
         do {
@@ -136,9 +135,13 @@ extension FileSystemActions {
             return .object(["ok": .bool(true), "status": .string("completed"), "path": .string(source.path),
                 "destination": .string(target.path), "operation": .string(copy ? "copy" : "move")])
         } catch VerifiedPath.Failure.posix(EEXIST) {
-            return errResult("Destination already exists. Choose another path or set overwrite:true only when replacement was requested.", code: "destination_exists")
+            return errResult(
+                "Destination already exists. Choose another path or set overwrite:true only when replacement was requested.", code: "destination_exists")
         } catch VerifiedPath.Failure.posix(EXDEV) {
-            return errResult("Move requires source and destination on the same filesystem. Copy the file explicitly before deciding whether to trash the original.", code: "cross_device_move")
+            return errResult("""
+                Move requires source and destination on the same filesystem. Copy the file explicitly before deciding whether to trash the \
+                original.
+                """, code: "cross_device_move")
         } catch let failure as VerifiedPath.Failure { return errResult(failure.message, code: failure.code) }
         catch { return errResult(error.localizedDescription, code: "transfer_failed") }
     }
@@ -159,7 +162,6 @@ extension FileSystemActions {
             append = requested
         } else { append = false }
         let expectedHash: String?
-        // An empty expected hash means no replacement guard was requested.
         let blankHash: Bool = {
             if case .string(let s)? = input["expected_content_sha256"] {
                 return s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -179,30 +181,19 @@ extension FileSystemActions {
         let dataRoot = ctx.dataRoot ?? PersistenceCore.defaultDataRoot()
         let resolved = NativeAgentWorkspaceRoot.resolveFileMutationPath(rawPath, dataRoot: dataRoot)
         if let refusal = mutationRefusal(resolved, ctx) { return refusal }
-        // before_content for inline diff (only on overwrite, not append), ≤ 200 kB.
+        // Bound before_content to 200 kB for overwrite diffs; appends do not replace prior content.
         var beforeContent: String? = nil
         do {
-            // Descriptor-relative walk: every parent component is opened
-            // O_DIRECTORY|O_NOFOLLOW from the root, so a symlink swapped in
-            // after the sandbox check fails the walk instead of redirecting the
-            // write. The final component is opened / renamed RELATIVE to this
-            // descriptor, never by pathname.
-            //
-            // Missing parents are made by the walk itself (`mkdirat` on the
-            // verified descriptor). The path-based `createDirectory` that used
-            // to run first re-resolved the whole pathname through symlinks and
-            // could therefore create directories outside the writable root.
+            // Open each parent O_DIRECTORY|O_NOFOLLOW from the root and operate relative to the final descriptor. mkdirat creates missing parents there too, so
+            // a symlink swap cannot redirect creation or writing.
             let verified = try VerifiedPath.openParent(of: resolved, createIntermediates: expectedHash == nil)
             defer { verified.release() }
             let data = Data(content.utf8)
             if append {
-                // Append at the kernel's current EOF for every write. Separate
-                // exists/seek/write calls can lose concurrent append payloads,
-                // including when both callers initially see a missing file.
+                // Kernel EOF append avoids losing concurrent payloads across separate exists/seek/write calls.
                 let fd: Int32
                 do {
-                    // Exclusive creation makes concurrent creators resolve to
-                    // one creator and one existing-file open on Darwin.
+                    // Darwin exclusive creation gives concurrent callers one creator and one existing-file open.
                     fd = try VerifiedPath.openFinal(
                         verified, flags: O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_NONBLOCK, mode: 0o666)
                 } catch VerifiedPath.Failure.posix(EEXIST) {
@@ -217,9 +208,8 @@ extension FileSystemActions {
                       metadata.st_nlink == 1 else {
                     return errResult("Append requires a regular file without hard links.", code: "path_not_allowed")
                 }
-                appendHandleOpened?()
-                // Retain Foundation's full-write and I/O-error handling; an
-                // append does not promise transactionality across callers.
+                ctx.didOpenAppendHandle?()
+                // Foundation checks complete writes and I/O errors; append still cannot promise cross-caller transactionality.
                 if let refusal = mutationRefusal(resolved, ctx) { return refusal }
                 try handle.write(contentsOf: data)
             } else {
@@ -246,8 +236,7 @@ extension FileSystemActions {
                     }
                     try? handle.close()
                 }
-                // Create-or-replace atomically within the verified parent;
-                // deferred unlink releases the temporary file on every exit.
+                // Replace atomically inside the verified parent; defer removes the temporary file on every exit.
                 let tmpName = "\(resolved.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString.prefix(8)).tmp"
                 let tmpFD = openat(
                     verified.fd, tmpName,
@@ -258,16 +247,13 @@ extension FileSystemActions {
                 let tmpHandle = FileHandle(fileDescriptor: tmpFD, closeOnDealloc: true)
                 defer { try? tmpHandle.close() }
                 try tmpHandle.write(contentsOf: data)
-                // Preserve private files and executable scripts; keep the
-                // replacement private until its contents are complete.
+                // Preserve private and executable modes; keep replacement private until content is complete.
                 if let existingMode, fchmod(tmpFD, existingMode) != 0 {
                     throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
                 }
                 try tmpHandle.close()
                 if let expectedHash {
-                    // Check the existing bytes through the same verified parent
-                    // immediately before replacement. This is a conflict check,
-                    // not an atomic compare-and-swap against other processes.
+                    // Read expected bytes through the verified parent immediately before replacing; this is not cross-process CAS.
                     do {
                         let currentFD = try VerifiedPath.openFinal(verified, flags: O_RDONLY | O_NONBLOCK)
                         let current = FileHandle(fileDescriptor: currentFD, closeOnDealloc: true)
@@ -290,7 +276,10 @@ extension FileSystemActions {
                               fstat(currentFD, &opened) == 0,
                               fstatat(verified.fd, verified.name, &named, AT_SYMLINK_NOFOLLOW) == 0,
                               opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
-                            return errResult("The file does not match expected_content_sha256 (use the content_sha256 from a whole-file read, not version). Read it again before revising; nothing was written.", code: "file_changed")
+                            return errResult("""
+                                The file does not match expected_content_sha256 (use the content_sha256 from a whole-file read, not version). Read it \
+                                again before revising; nothing was written.
+                                """, code: "file_changed")
                         }
                     } catch {
                         return errResult("The original file could not be verified. Read it again before revising; nothing was written.", code: "file_changed")

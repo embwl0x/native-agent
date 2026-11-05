@@ -5,21 +5,10 @@ import CognitiveSubstrate
 import NativeAgentCore
 import TrustCenter
 import TurnTrace
-// Blueprint: | `TurnRequest.swift` | `TurnRequest`: shared turn binding; `TurnAdmission`: per-session serialization, root-scoped resident reload exclusion, bounded admission queues and release/cancellation capacity signals for durable arrivals |
+// Blueprint: | `TurnRequest.swift` | `TurnRequest` made a `Turn`; `TurnArrival`; `TurnAdmission`: per-session order, offering waiters to the agent's open turn |
 
-enum TurnRelevanceContext {
-    @TaskLocal static var queryUserMessage: String?
-}
-
-/// Everything one ingress decides about a turn, in one value: what was said,
-/// where it goes, who sent it, and the per-turn facts the engine reads from
-/// task-locals. An ingress fills this in and hands it to the binder; it never
-/// builds its own nest of `withValue` calls.
-///
-/// A binding field is doubly optional so a request binds exactly what its
-/// ingress said: left out, it stays UNBOUND (the caller's value is inherited);
-/// given an optional, it is bound to that value — nil included, which clears
-/// an inherited one, as an explicit `withValue(nil)` does.
+/// What one ingress decides about a turn; `turn(parent:)` makes it the `Turn`. Omitted fields inherit the
+/// parent turn's, an explicitly supplied nil clears them: double optionals keep that distinction.
 public struct TurnRequest: Sendable {
     public var message: String
     /// Transport-authored relevance payload; never extracted from message text.
@@ -39,27 +28,18 @@ public struct TurnRequest: Sendable {
     public var careWakes: [CognitiveCareWake]?
     public var suppressUserAppend: Bool
 
-    /// `ChatToolSessionContext.envelope`: authoritative surface identity.
     public var envelope: TurnEnvelope??
-    /// `ChatToolSessionContext.verifiedSessionId`.
     public var verifiedSessionID: String??
-    /// `ChatToolSessionContext.verifiedChatId`.
     public var verifiedChatID: String??
-    /// `ChatToolSessionContext.verifiedUserId`.
     public var verifiedUserID: String??
-    /// Bound through `ChatToolSessionContext.withReplyRoute`, so the turn
-    /// trace names the same destination and thread. Outer nil inherits; inner nil clears.
+    /// The envelope's delivery route: the turn's trace names the same destination and thread. Outer nil inherits; inner nil clears.
     public var replyRoute: ChatToolSessionContext.ReplyRoute??
-    /// `ChatPersistenceContext.originProvenance`, stamped on the user row.
     public var origin: ChatMessageOrigin??
-    /// `ChatPersistenceContext.pinnedTurnRunID`: the enqueued row's run.
+    /// Use the enqueued row's run identity so it is not appended twice.
     public var pinnedRunID: String??
-    /// `ChatPersistenceContext.codexCompletionBinding`.
     public var codexCompletion: CodexCompletionTranscriptBinding??
-    /// `ChatPersistenceContext.replacementAssistantMessageID`: the reply a
-    /// regenerate replaces.
+    /// The exact assistant row a regenerate replaces.
     public var replacementAssistantMessageID: String??
-    /// `LLMCallContext.serviceTier`.
     public var serviceTier: String??
 
     public init(
@@ -112,8 +92,7 @@ public struct TurnRequest: Sendable {
         self.serviceTier = serviceTier
     }
 
-    /// The turn that consumes an enqueued user row: same request, on the
-    /// row's resolved session, adopting its run id, without a second append.
+    /// Enqueued input adopts its resolved session and run identity without a second user append.
     public func consuming(_ enqueued: EnqueuedUserMessage) -> TurnRequest {
         var turn = self
         turn.sessionID = enqueued.sessionId
@@ -122,33 +101,58 @@ public struct TurnRequest: Sendable {
         return turn
     }
 
-    /// The binder: this request's task-locals, bound in one place with the
-    /// async overload for the whole of `operation`. Anything `operation`
-    /// spawns inherits them for its life.
-    ///
-    /// A turn an agent's words start is peer-steered from its first line:
-    /// a named lane latches the taint
-    /// with its line. The generic peer lane unelevated is the peer's by its
-    /// surface and keeps its line; elevated, it marks the peer as elevated,
-    /// so only the floor acts card.
-    public func bind<T>(isolation: isolated (any Actor)? = #isolation,
-                        _ operation: () async throws -> T) async rethrows -> T {
+    /// The turn this request starts: every ingress fact is a part of it. An
+    /// omitted field keeps `parent`'s value, as a nested turn inherits; a
+    /// supplied nil clears it. Peer-started input carries steering from its
+    /// first line; elevated peers keep only the ordinary floor gates.
+    public func turn(id: String = Turn.mintID(), parent: Turn? = nil) -> Turn {
+        let run = (pinnedRunID ?? nil) ?? parent?.run ?? UUID().uuidString
+        var turn = parent?.derived(id: id, run: run) ?? Turn(id: id, run: run)
+        // The request's own session, nil included: nil means resolve one, never the parent's.
+        turn.session = sessionID
+        // One envelope from the explicit ingress fields; nested work keeps the enclosing one unless replaced or cleared.
+        if let envelope { turn.envelope = envelope }
+        else if turn.envelope == nil {
+            turn.envelope = TurnEnvelope(surface: surface, verifiedChatId: verifiedChatID ?? nil,
+                verifiedUserId: verifiedUserID ?? nil, deliveryRoute: replyRoute ?? nil)
+        }
+        if verifiedChatID != nil || verifiedUserID != nil, let envelope = turn.envelope {
+            turn.envelope = TurnEnvelope(surface: envelope.surface, agent: envelope.agent,
+                verifiedChatId: verifiedChatID ?? envelope.verifiedChatId,
+                verifiedUserId: verifiedUserID ?? envelope.verifiedUserId,
+                commandSignatureVerified: envelope.commandSignatureVerified, deliveryRoute: envelope.deliveryRoute,
+                declaredRemote: envelope.declaredRemote, macContinuation: envelope.macContinuation,
+                workIdentity: envelope.workIdentity, answerExperienceID: envelope.answerExperienceID)
+        }
+        if let replyRoute { turn.envelope = turn.envelope.map { $0.withDeliveryRoute(replyRoute) } }
+        if let verifiedSessionID { turn.verifiedSessionID = verifiedSessionID }
+        if let origin { turn.origin = origin }
+        turn.rows.threadKind = threadKind
+        turn.rows.ownedSessionID = ownedSessionID
+        if let codexCompletion { turn.rows.codexCompletion = codexCompletion }
+        if let replacementAssistantMessageID { turn.rows.replacementAssistantMessageID = replacementAssistantMessageID }
+        if let queryUserMessage { turn.queryUserMessage = queryUserMessage }
+        turn.careWakes = careWakes ?? []
+        turn.userText = message
+        turn.fileAccess = fileAccess
+        if let serviceTier { turn.requestedServiceTier = serviceTier }
+        turn.peerSteering = steering(over: turn.peerSteering)
+        return turn
+    }
+
+    /// Recorded steering, including an empty record, is authoritative; an agent's own words steer as that agent.
+    private func steering(over inherited: PeerDataTaint?) -> PeerDataTaint? {
         if case .some(.some(let origin)) = origin, let sources = origin.peerSources {
-            let taint = PeerDataTaint.current ?? PeerDataTaint()
-            // The turn's input is the agent's words: the card quotes them.
+            let taint = inherited ?? PeerDataTaint()
+            // The initiating agent's actual input is the card quote.
             taint.keep(line: message)
             for source in sources { taint.mark(peer: source) }
             for source in origin.elevatedPeerSources ?? [] { taint.elevate(peer: source) }
-            // Recorded steering, including an empty record, is authoritative.
-            return try await Self.bound(PeerDataTaint.$current, taint) {
-                try await bindContext(operation)
-            }
+            return taint
         }
         guard case .some(.some(let origin)) = origin, origin.authored == .agent,
-              let agent = origin.agent, agent != "self", !agent.hasPrefix("bot:") else {
-            return try await bindContext(operation)
-        }
-        let taint = PeerDataTaint.current ?? PeerDataTaint()
+              let agent = origin.agent, agent != "self", !agent.hasPrefix("bot:") else { return inherited }
+        let taint = inherited ?? PeerDataTaint()
         if agent != "agent" {
             taint.mark(peer: (envelope ?? nil)?.verifiedUserId.map { "peer:" + $0 } ?? agent, line: message)
         } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface) {
@@ -156,113 +160,103 @@ public struct TurnRequest: Sendable {
         } else {
             taint.mark(peer: (envelope ?? nil)?.verifiedUserId.map { "peer:" + $0 } ?? "a peer", line: message)
         }
-        return try await Self.bound(PeerDataTaint.$current, taint) { try await bindContext(operation) }
+        return taint
     }
 
-    func bindContext<T>(isolation: isolated (any Actor)? = #isolation,
-                        _ operation: () async throws -> T) async rethrows -> T {
-        // The request is the ingress owner. It supplies one current envelope
-        // from its explicit transport fields before any downstream reader runs.
-        // Nested work inherits its caller's bound envelope unless it explicitly replaces/clears it.
-        let requestEnvelope: TurnEnvelope?
-        if let envelope { requestEnvelope = envelope }
-        else if let inherited = ChatToolSessionContext.envelope { requestEnvelope = inherited }
-        else {
-            requestEnvelope = TurnEnvelope(surface: surface,
-                verifiedChatId: verifiedChatID ?? nil, verifiedUserId: verifiedUserID ?? nil,
-                deliveryRoute: replyRoute ?? nil)
-        }
-        return try await Self.bound(ChatPersistenceContext.$threadKind, .some(threadKind)) {
-        try await Self.bound(ChatPersistenceContext.$ownedSessionID, .some(ownedSessionID)) {
-        try await AfterTurnSource.$careWakes.withValue(careWakes ?? []) {
-        try await Self.bound(ChatToolSessionContext.$envelope, .some(requestEnvelope)) {
-            try await Self.bound(ChatToolSessionContext.$verifiedSessionId, verifiedSessionID) {
-                try await Self.bound(ChatToolSessionContext.$verifiedChatId, .some(requestEnvelope?.verifiedChatId)) {
-                    try await Self.bound(ChatToolSessionContext.$verifiedUserId, .some(requestEnvelope?.verifiedUserId)) {
-                        try await Self.bound(ChatToolSessionContext.$commandSignatureVerified, .some(requestEnvelope?.commandSignatureVerified)) {
-                        try await Self.bound(ChatPersistenceContext.$originProvenance, origin) {
-                            try await Self.bound(ChatPersistenceContext.$pinnedTurnRunID, pinnedRunID) {
-                                try await Self.bound(ChatPersistenceContext.$codexCompletionBinding, codexCompletion) {
-                                    try await Self.bound(ChatPersistenceContext.$replacementAssistantMessageID, replacementAssistantMessageID) {
-                                        try await Self.bound(LLMCallContext.$serviceTier, serviceTier) {
-                                            try await Self.bound(TurnRelevanceContext.$queryUserMessage, queryUserMessage) {
-                                                return try await ChatToolSessionContext.withReplyRoute(replyRoute ?? requestEnvelope?.deliveryRoute, operation: operation)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        }
-        }
-        }
-        }
-    }
-
-    /// Durably append the user row under this request's bindings.
+    /// Durably append the user row as this request's turn. The row's run is the
+    /// request's own pin, never an enclosing turn's.
     public func enqueue(
         on client: SwiftNativeChatOrchestrationClient,
+        parent: Turn? = nil,
         mechanicalRow: CognitiveMechanicalRowKind? = nil,
         awaitingConsumption: Bool = true
     ) async throws -> EnqueuedUserMessage {
-        // The row's run is this request's own pin, never one inherited from an
-        // enclosing turn: a door that registered Stop at admission pins it here.
-        try await bind { try await ChatPersistenceContext.$pinnedTurnRunID.withValue(pinnedRunID ?? nil) {
-            try await client.enqueueUserMessage(
-                message: message,
-                sessionId: sessionID,
-                persona: persona,
-                surface: surface,
-                attachments: attachments,
-                mechanicalRow: mechanicalRow,
-                awaitingConsumption: awaitingConsumption
-            )
-        } }
+        var turn = turn(parent: parent)
+        turn.run = (pinnedRunID ?? nil) ?? UUID().uuidString
+        return try await client.enqueueUserMessage(
+            message: message,
+            sessionId: sessionID,
+            persona: persona,
+            surface: surface,
+            attachments: attachments,
+            mechanicalRow: mechanicalRow,
+            awaitingConsumption: awaitingConsumption,
+            turn: turn
+        )
     }
 
-    /// Run the turn under this request's bindings.
+    /// Run the request as its turn.
     public func chat(
         on client: SwiftNativeChatOrchestrationClient,
+        parent: Turn? = nil,
         progress: TurnEventSink? = nil
     ) async throws -> ChatResponse {
-        try await bind {
-            try await client.chat(
-                message: message,
-                sessionId: sessionID,
-                model: model,
-                reasoningEffort: reasoningEffort,
-                fileAccess: fileAccess,
-                attachments: attachments,
-                persona: persona,
-                surface: surface,
-                suppressUserAppend: suppressUserAppend,
-                progress: progress
-            )
-        }
-    }
-
-    private static func bound<V: Sendable, T>(
-        _ local: TaskLocal<V?>,
-        _ value: V??,
-        isolation: isolated (any Actor)? = #isolation,
-        _ operation: () async throws -> T
-    ) async rethrows -> T {
-        guard let value else { return try await operation() }
-        return try await local.withValue(value, operation: operation)
+        try await client.chat(
+            message: message,
+            sessionId: sessionID,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            fileAccess: fileAccess,
+            attachments: attachments,
+            persona: persona,
+            surface: surface,
+            suppressUserAppend: suppressUserAppend,
+            progress: progress,
+            turn: turn(parent: parent),
+            serviceTier: serviceTier ?? nil
+        )
     }
 }
 
-/// One turn at a time per session, for every ingress that admits through it.
-/// A turn waits here until the one before it in the same session has finished,
-/// so two replies never interleave in one transcript. Durable enqueue and
-/// completion deduplication keep their own owners.
+/// What a door brings into the agent's conversation; admission offers it to the agent's open turn there.
+public struct TurnArrival: Sendable {
+    public enum Row: Sendable, Equatable {
+        /// The turn writes the sender's row.
+        case shown
+        /// The agent's own continuation writes no row, as a hidden bubble writes none.
+        case hidden
+        /// The door saved the row before admission; the turn that takes it consumes that row.
+        case saved
+    }
+    public let words: String
+    public let attachments: [MultimodalAttachment]
+    /// The door's chat surface: the row's source, as its own turn would write it.
+    public let surface: String
+    public let row: Row
+
+    public init(words: String, attachments: [MultimodalAttachment] = [], surface: String, row: Row) {
+        self.words = words
+        self.attachments = attachments
+        self.surface = surface
+        self.row = row
+    }
+}
+
+extension TurnRequest {
+    /// This request as it arrives in the agent's conversation.
+    public func arrival(_ row: TurnArrival.Row) -> TurnArrival {
+        TurnArrival(words: message, attachments: attachments, surface: surface, row: row)
+    }
+}
+
+/// Serialize turns per session so replies cannot interleave; durable enqueue and completion deduplication retain their own owners.
 public actor TurnAdmission {
     public static let shared = TurnAdmission()
-    @TaskLocal public static var token: UUID?
+
+    /// The agent's turn that read an arrival at one of its steps: its run, and the request its door answers.
+    public struct Steered: Sendable, Equatable {
+        public let sessionID: String
+        public let turnID: String
+        public let runID: String
+        public let requestID: String?
+    }
+
+    /// How admission settled an arrival: it ran as its own turn, or the agent's open turn took it.
+    public enum Admitted<Value> {
+        case ran(Value)
+        /// The reading turn's reply answers it, so the door that sent it delivers nothing.
+        case steered(Steered)
+    }
 
     public init() {}
 
@@ -274,12 +268,9 @@ public actor TurnAdmission {
     private var active: [String: UUID] = [:]
     private var waiting: [String: [Waiter]] = [:]
     private var capacityWaiters: [UUID: ScopedWaiter] = [:]
-    /// The runs a restart left in a session, in the order they were said:
-    /// each is admitted before any other turn there, one after another.
+    /// Admit restored runs in their recorded order before any newer session work.
     private var backlog: [String: [String]] = [:]
-    /// Until launch recovery has inventoried accepted contact/builder tasks
-    /// (`restorationComplete`), a new turn in a named session waits here:
-    /// nothing new is admitted there ahead of what was already said.
+    /// Hold new named-session turns until launch recovery inventories accepted backlog, so new work cannot pass earlier input.
     private var restoring = true
     private var restorationFailure: String?
     private var sessionRestorationFailures: [String: String] = [:]
@@ -317,7 +308,7 @@ public actor TurnAdmission {
                   !executingRoots.values.contains(root),
                   let (dataRoot, operation) = pendingResidentRefreshes[root],
                   ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).isEmpty {
-                // No suspension between the idle check and closing admission.
+                // Close admission synchronously after checking idle so no turn can enter between them.
                 residentTransitions.insert(root)
                 pendingResidentRefreshes.removeValue(forKey: root)
                 await operation()
@@ -353,28 +344,53 @@ public actor TurnAdmission {
         public var errorDescription: String? { detail }
     }
 
-    /// Nil session = a new chat nobody else can be in; only root admission applies.
-    /// Durable arrivals wait for queue capacity; unsaved requests still fail full.
-    /// `runID` names the run, so a restored backlog admits it in its place.
-    public func run<T>(dataRoot: URL, sessionID: String?, runID: String? = nil, waitForCapacity: Bool = false, isolation: isolated (any Actor)? = #isolation,
-                       operation: () async throws -> T) async throws -> T {
+    /// New chats need only root admission; durable arrivals wait for capacity while unsaved full-queue requests refuse.
+    /// Restored run identity preserves its ordered backlog position. An arrival that waits is offered to the agent's open turn
+    /// in the conversation: read at a step, it is steered; otherwise its own place comes and it runs as its door's turn.
+    public func run<T>(dataRoot: URL, sessionID: String?, arrival: TurnArrival, runID: String? = nil, waitForCapacity: Bool = false,
+                       isolation: isolated (any Actor)? = #isolation,
+                       turn: Turn, operation: (Turn) async throws -> T) async throws -> Admitted<T> {
         let id = UUID()
-        do {
-            if let sessionID { try await acquire(sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity) }
+        if let steered = try await admit(dataRoot: dataRoot, sessionID: sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity,
+                                         arrival: arrival, turn: turn) {
+            return .steered(steered)
         }
-        catch {
+        return .ran(try await execute(dataRoot: dataRoot, sessionID: sessionID, id: id, turn: turn, operation: operation))
+    }
+
+    /// Work that never joins another turn (a regenerate, a restored run, the agent's wake, a helper's loop) waits only for its own place.
+    public func runAlone<T>(dataRoot: URL, sessionID: String?, runID: String? = nil, waitForCapacity: Bool = false,
+                            isolation: isolated (any Actor)? = #isolation,
+                            turn: Turn, operation: (Turn) async throws -> T) async throws -> T {
+        let id = UUID()
+        _ = try await admit(dataRoot: dataRoot, sessionID: sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity,
+                            arrival: nil, turn: turn)
+        return try await execute(dataRoot: dataRoot, sessionID: sessionID, id: id, turn: turn, operation: operation)
+    }
+
+    private func admit(dataRoot: URL, sessionID: String?, id: UUID, runID: String?, waitForCapacity: Bool,
+                       arrival: TurnArrival?, turn: Turn) async throws -> Steered? {
+        guard let sessionID else { return nil }
+        do {
+            return try await acquire(sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity,
+                                     arrival: arrival, turn: turn, dataRoot: dataRoot)
+        } catch {
             // A restored run that will not be admitted gives up its place.
-            if let sessionID, let runID { await withdraw(sessionID: sessionID, runID: runID) }
+            if let runID { withdraw(sessionID: sessionID, runID: runID) }
             throw error
         }
+    }
+
+    private func execute<T>(dataRoot: URL, sessionID: String?, id: UUID, isolation: isolated (any Actor)? = #isolation,
+                            turn: Turn, operation: (Turn) async throws -> T) async throws -> T {
         do {
             try await enterRoot(rootKey(dataRoot), id: id)
             try Task.checkCancellation()
             // A new session is resolved inside the operation; its own runner
             // closes steering. Only a named session delegates that close here.
             let result: T
-            if sessionID != nil { result = try await Self.$token.withValue(id, operation: operation) }
-            else { result = try await operation() }
+            if sessionID != nil { result = try await operation(turn.with(\.admissionToken, id)) }
+            else { result = try await operation(turn) }
             if let sessionID { await ChatTurnSteering.shared.closeTurn(sessionId: sessionID, token: id) }
             if let sessionID { await release(sessionID, id: id) }
             await leaveRoot(id: id)
@@ -387,8 +403,7 @@ public actor TurnAdmission {
         }
     }
 
-    /// At launch, before anything new is admitted there: the runs a restart
-    /// left queued or interrupted in this session, oldest first.
+    /// Restore queued and interrupted runs oldest first before admitting new work.
     public func restore(sessionID: String, runs: [String]) {
         sessionRestorationFailures[sessionID] = nil
         let known = backlog[sessionID] ?? []
@@ -396,7 +411,6 @@ public actor TurnAdmission {
         backlog[sessionID] = added.isEmpty ? nil : added
     }
 
-    /// The launch recovery has restored every contact conversation's backlog.
     public func restorationComplete() {
         restoring = false
         restorationFailure = nil
@@ -416,7 +430,7 @@ public actor TurnAdmission {
         for continuation in held { continuation.resume() }
     }
 
-    /// A restored run that will not come (it ended, or was never resumed).
+    /// Release restored backlog slots for runs known to have ended or not resumed.
     public func withdraw(sessionID: String, runID: String) {
         guard var runs = backlog[sessionID], let index = runs.firstIndex(of: runID) else { return }
         runs.remove(at: index)
@@ -435,7 +449,8 @@ public actor TurnAdmission {
         if backlog[key]?.isEmpty == true { backlog.removeValue(forKey: key) }
     }
 
-    private func acquire(_ key: String, id: UUID, runID: String?, waitForCapacity: Bool) async throws {
+    private func acquire(_ key: String, id: UUID, runID: String?, waitForCapacity: Bool,
+                         arrival: TurnArrival?, turn: Turn, dataRoot: URL) async throws -> Steered? {
         try Task.checkCancellation()
         if let detail = sessionRestorationFailures[key] { throw RestorationUnavailable(detail: detail) }
         while restoring, !(runID.map { backlog[key]?.contains($0) == true } ?? false) {
@@ -449,24 +464,31 @@ public actor TurnAdmission {
         }
         if let detail = sessionRestorationFailures[key] { throw RestorationUnavailable(detail: detail) }
         try Task.checkCancellation()
+        // A restored run keeps its recorded place; only a live arrival rides the agent's open turn.
+        let rides = runID.map { backlog[key]?.contains($0) != true } ?? true
         while active[key] != nil || !admissible(key, runID: runID) {
             let hasCapacity = (waiting[key]?.count ?? 0) < 8 && waiting.values.reduce(0, { $0 + $1.count }) < 32
             guard hasCapacity || waitForCapacity else { throw Full() }
             // Registration and the capacity check share this actor. A release
             // cannot slip between them; cancellation also wakes the subscriber.
-            let done = ScopedWaiter()
+            // Its offer is made once, only when it takes a place in line (files are read here, not for every turn).
+            let riding = hasCapacity && rides ? arrival.flatMap { ChatTurnSteering.offer($0, turn: turn, dataRoot: dataRoot) } : nil
+            let done = riding?.waiter ?? ScopedWaiter()
             if hasCapacity { waiting[key, default: []].append(Waiter(id: id, runID: runID, done: done)) }
             else { capacityWaiters[id] = done }
+            // In line, the arrival is also offered to the agent's turn here: being read or its own place, whichever comes first.
+            if let riding { await ChatTurnSteering.shared.post(riding, sessionId: key) }
             await done.park()
             if hasCapacity {
+                // The steering actor alone decides read versus its own place; a slot handed to a read arrival passes on.
+                if let riding, case .taken(let steered) = await ChatTurnSteering.shared.withdraw(sessionId: key, run: riding.turn.run) {
+                    if active[key] == id { release(key, id: id) } else { leaveLine(key, id: id) }
+                    return steered
+                }
                 // A handoff owns the slot even if Stop raced it; run's
                 // cancellation check then releases that admitted slot.
-                if active[key] == id { return }
-                if let index = waiting[key]?.firstIndex(where: { $0.id == id }) {
-                    waiting[key]?.remove(at: index)
-                    if waiting[key]?.isEmpty == true { waiting[key] = nil }
-                    signalCapacity()
-                }
+                if active[key] == id { return nil }
+                leaveLine(key, id: id)
                 throw CancellationError()
             }
             capacityWaiters.removeValue(forKey: id)
@@ -474,6 +496,14 @@ public actor TurnAdmission {
         }
         active[key] = id
         admitted(key, runID: runID)
+        return nil
+    }
+
+    private func leaveLine(_ key: String, id: UUID) {
+        guard let index = waiting[key]?.firstIndex(where: { $0.id == id }) else { return }
+        waiting[key]?.remove(at: index)
+        if waiting[key]?.isEmpty == true { waiting[key] = nil }
+        signalCapacity()
     }
 
     private func release(_ key: String, id: UUID) {
@@ -483,8 +513,7 @@ public actor TurnAdmission {
         admitNext(key)
     }
 
-    /// The next turn in an idle session: the restored backlog's head when it
-    /// is waiting (none while it has yet to arrive), else the oldest waiter.
+    /// Wait for a restored head to arrive before admitting later work; otherwise choose the oldest idle-session waiter.
     private func admitNext(_ key: String) {
         guard active[key] == nil, var queue = waiting[key], !queue.isEmpty else { return }
         let index: Int
@@ -505,3 +534,5 @@ public actor TurnAdmission {
         for continuation in subscribers { continuation.resume() }
     }
 }
+
+extension TurnAdmission.Admitted: Sendable where Value: Sendable {}

@@ -3,19 +3,15 @@ import Experiences
 import CryptoKit
 import NativeAgentCore
 
-// Blueprint: | `AfterTurnMemorySurprise.swift` | `AfterTurnMemorySurprise`: the agent's own learned prediction that a turn's interpretation would be a COMPLETE no-op: language-independent, fully covered warm-vector precedents from its labelled record, keyed by agent, memory model and detector version, with the cost law's standing |
+// Blueprint: | `AfterTurnMemorySurprise.swift` | `AfterTurnMemorySurprise`: complete-no-op prediction under learned standing |
 
-/// A prediction about ALL interpretation channels (memories, affect, caring,
-/// cares, promises), never permission to forget a turn: a deferred turn stays owed in
-/// the lived-moment journal and is judged later (docs/COGNITION_WIRING.md,
-/// "Deferral").
+/// A prediction about ALL interpretation channels (memories, affect, caring, cares, promises), never permission to forget a turn: a deferred turn stays owed in
+/// the lived-moment journal and is judged later (docs/COGNITION_WIRING.md, "Deferral").
 public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
-    /// Bumped whenever the detector's meaning changes: labels earned under an
-    /// older detector never grant standing to this one.
+    /// Bumped whenever the detector's meaning changes: labels earned under an older detector never grant standing to this one.
     public static let detectorVersion = 3
     public enum Verdict: String, Codable, Sendable { case nothingNew, somethingNew, unsure }
-    /// Whose record a prediction is scored against: the agent, the memory
-    /// model that judges it (route key), the detector version.
+    /// Whose record a prediction is scored against: the agent, the memory model that judges it (route key), the detector version.
     public struct Scope: Codable, Sendable, Equatable, Hashable {
         public let agent: String
         public let model: String
@@ -25,8 +21,7 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
     public private(set) var reason: String
     public let epoch: String?
     public private(set) var scope: Scope?
-    /// The frozen claim this prediction belongs to (precedent + its contrast
-    /// population); standing is earned per claim.
+    /// The frozen claim this prediction belongs to (precedent + its contrast population); standing is earned per claim.
     public let rule: String?
     public let at: Date?
     public private(set) var vectors: [[Float]]?
@@ -42,16 +37,14 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
              at: nil, vectors: nil, standing: false, lowerBound: nil, costBar: nil, tries: nil, hits: nil)
     }
 
-    /// A turn left owed for another reason keeps the prediction as it was:
-    /// only an actual no-op verdict can become a no-op prediction trial.
+    /// A turn left owed for another reason keeps the prediction as it was: only an actual no-op verdict can become a no-op prediction trial.
     func deferringBecause(_ reason: String) -> Self {
         var deferred = self
         deferred.reason = reason
         return deferred
     }
 
-    /// This prediction scored under the model that judged it (unchanged when
-    /// unscoped or when no judging model is known).
+    /// This prediction scored under the model that judged it (unchanged when unscoped or when no judging model is known).
     func judged(by model: String?) -> Self {
         guard let model, let scope, scope.model != model else { return self }
         var labelled = self
@@ -70,10 +63,8 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
         return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Full traversal, no language: split on Unicode scalar boundaries, then
-    /// bisect until the resident embedder certifies every piece fits. The
-    /// bounds cap optional CPU work, never natural language. Anything not
-    /// fully covered is `unsure`; that cannot grant prediction-based deferral.
+    /// Full traversal, no language: split on Unicode scalar boundaries, then bisect until the resident embedder certifies every piece fits. The bounds cap
+    /// optional CPU work, never natural language. Anything not fully covered is `unsure`; that cannot grant prediction-based deferral.
     static func check(texts: [String], scope: Scope, memory: SwiftNativeMemoryV2,
                       dataRoot: URL, excluding turn: String) async -> Self {
         guard let epoch = await memory.warmEmbeddingEpoch() else {
@@ -121,7 +112,10 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
             catch {
                 await RepairOwed.owe(dataRoot, id: "noop-prediction:" + UUID().uuidString,
                     kind: .act, operation: "memory.noop_embedding", owner: "AfterTurnMemorySurprise",
-                    words: "The resident memory model failed while weighing this turn: \(error.localizedDescription). Repair the model before using no-op predictions.").value
+                    words: """
+                        The resident memory model failed while weighing this turn: \(error.localizedDescription). Repair the model before using no-op \
+                        predictions.
+                        """).value
                 return .unsure("embedding_failed: " + error.localizedDescription)
             }
             guard let batch = embedded,

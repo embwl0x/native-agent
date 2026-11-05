@@ -3,39 +3,28 @@ import Privacy
 import Foundation
 import Experiences
 import PersistenceCore
-// Blueprint: | `AgentConversationLive.swift` | `AgentConversationLive` struct; `projection`; the live hub flushes pending text when the resident owner stops, and already accepted sends publish later text immediately until they settle; flush identities reject superseded coalescing tasks |
+// Blueprint: | `AgentConversationLive.swift` | `AgentConversationLive`, `projection` |
 
-/// What the other agent is doing right now on one send: working since when,
-/// its last sign of life, the reply text streamed so far and its latest tool
-/// or progress note. Display only: never the reply, a receipt, or settlement
-/// evidence. The final answer still lands through the lane's own path.
-///
-/// Keyed by the conversation record id, or `<agent>:<message id>` when a
-/// built-in lane's wake helper reports it (it knows only the message id).
-/// Kept beside `conversations.json`, not inside it: partials are written a few
-/// times a second and the records file wakes the delegation runner and her
-/// screen on every write.
+/// Progress is display-only, never reply or settlement evidence. Keep partials outside conversations.json: frequent writes there would repeatedly wake the
+/// runner and screen. Wake helpers know message IDs, so their keys differ from conversation record IDs.
 public struct AgentConversationLive: Codable, Sendable, Equatable {
     public var key: String
     public var recordID: String?
     public var operationID: String?
     public var agent: String
     public var messageID: String?
-    /// acp, a2a, command, desktop, claude, codex, omp, …
     public var lane: String
-    /// working (the agent is on it), waiting (handed off, no live channel), finished, failed.
     public var state: String
-    /// The lane supplies partial text; false means only the working signal is real.
+    /// False means only the working signal is real, not partial text.
     public var streams: Bool
     public var startedAt: Date
     public var lastActivityAt: Date
-    /// The newest part of the reply being written (tail, bounded).
     public var partial: String?
     public var partialChars: Int
     public var partialTruncated: Bool
     public var note: String?
     public var finishedAt: Date?
-    /// The agent's first sign of work (text, a note, activity); the send's own start is not one.
+    /// The send’s start is not evidence that the other agent began work.
     public var firstActivityAt: Date?
 }
 
@@ -52,7 +41,7 @@ public struct AgentConversationLiveTarget: Sendable, Hashable {
               agent: row.agent, messageID: nil)
     }
 
-    /// A built-in lane's wake helper knows the accepted message id, not the record.
+    /// Wake helpers know the accepted message ID, not the conversation record.
     public static func message(agent: String, messageID: String, dataRoot: URL) -> Self {
         .init(dataRoot: dataRoot, key: messageKey(agent: agent, messageID: messageID), recordID: nil,
               operationID: nil, agent: agent, messageID: messageID)
@@ -61,16 +50,7 @@ public struct AgentConversationLiveTarget: Sendable, Hashable {
     static func messageKey(agent: String, messageID: String) -> String { agent + ":" + messageID.lowercased() }
 }
 
-public enum AgentConversationLiveContext {
-    /// Set around one conversation send so a lane deep in the call can report
-    /// progress without learning about records. Lanes that call back from
-    /// another task capture it first.
-    @TaskLocal public static var target: AgentConversationLiveTarget?
-}
-
-/// One shared update stream. Every lane feeds it; partial text is coalesced to
-/// at most one write and one published event per `interval`, state changes go
-/// out at once.
+/// Coalesce partials per interval; publish state changes immediately.
 public actor AgentConversationLiveHub {
     public static let shared = AgentConversationLiveHub()
     static let interval: Duration = .milliseconds(400)
@@ -89,8 +69,7 @@ public actor AgentConversationLiveHub {
 
     public func start() { if !Task.isCancelled { coalescing = true } }
 
-    /// Accepted sends may still finish after resident admission closes. Flush
-    /// their current words now and publish later words without arming a timer.
+    /// Accepted sends may still finish after resident admission closes. Flush their current words now and publish later words without arming a timer.
     public func shutdown() {
         coalescing = false
         flush()
@@ -106,7 +85,6 @@ public actor AgentConversationLiveHub {
         schedule(target.key, now: true)
     }
 
-    /// Streamed reply text: `delta` appends, `replace` is the whole text so far.
     public func text(_ target: AgentConversationLiveTarget, delta: String? = nil, replace: String? = nil) {
         guard replace != nil || !(delta ?? "").isEmpty else { return }
         edit(target, activity: true) { live in
@@ -115,7 +93,7 @@ public actor AgentConversationLiveHub {
             live.state = "working"
             live.partialChars = replace?.count ?? live.partialChars + (delta?.count ?? 0)
             if replace != nil { live.partialTruncated = false }
-            // Tail only: the newest words are the live part.
+            // Retain the newest words because only the tail is live progress.
             if whole.utf8.count > Self.partialLimit {
                 live.partial = String(whole.suffix(Self.partialLimit / 2))
                 live.partialTruncated = true
@@ -129,17 +107,14 @@ public actor AgentConversationLiveHub {
         edit(target, activity: true) { $0.state = "working"; $0.note = clipped }
     }
 
-    /// A sign of life with nothing to show (bytes on a pipe, a transcript write).
     public func activity(_ target: AgentConversationLiveTarget) {
         edit(target, activity: true) { $0.state = "working" }
     }
 
-    /// When the agent first showed work on this send, while it is still live here.
     public func firstActivity(_ target: AgentConversationLiveTarget) -> Date? {
         entries[target.key]?.live.firstActivityAt
     }
 
-    /// The send's own call returned: `waiting` when the reply comes later.
     public func settle(_ target: AgentConversationLiveTarget, state: String, note: String? = nil) {
         edit(target, now: true) { live in
             live.state = state
@@ -178,8 +153,7 @@ public actor AgentConversationLiveHub {
         let id = UUID()
         pendingFlushID = id
         pendingFlush = Task { [weak self] in
-            // Cancelled means a flush already ran; flushing again here could
-            // cancel the one scheduled after it.
+            // Cancelled means a flush already ran; flushing again here could cancel the one scheduled after it.
             do { try await Task.sleep(for: Self.interval) } catch { return }
             await self?.flush(ifCurrent: id)
         }
@@ -196,8 +170,7 @@ public actor AgentConversationLiveHub {
         pendingFlushID = nil
         let keys = dirty
         dirty.removeAll()
-        // Redacted once here, so the file, agent_read and the event stream all
-        // carry the same scrubbed text; memory keeps the raw tail to append to.
+        // Redact once for disk and every reader; retain the raw tail only in memory for appends.
         let changed = keys.compactMap { key -> (live: AgentConversationLive, root: URL)? in
             guard var entry = entries[key] else { return nil }
             entry.live.partial = entry.live.partial.map(NativeAgentSecretRedactor.redactText)
@@ -216,8 +189,7 @@ public actor AgentConversationLiveHub {
                 report(error, root: root)
             }
         }
-        // Settled (finished or handed off to wait) entries live on disk;
-        // memory keeps only what is still moving.
+        // Persist settled entries; memory retains only active progress.
         for key in keys where !dirty.contains(key) && entries[key]?.live.state != "working" { entries.removeValue(forKey: key) }
     }
 
@@ -243,15 +215,15 @@ public struct AgentConversationLiveStore: Sendable {
         do { data = try Data(contentsOf: fileURL) }
         catch CocoaError.fileReadNoSuchFile { return [:] }
         guard data.count <= 4 * 1024 * 1024 else {
-            throw AgentConversationStore.Failure(message: "Live conversation evidence exceeds its 4 MiB bound; repair \(fileURL.path). Existing bytes were preserved.")
+            throw AgentConversationStore.Failure(
+                message: "Live conversation evidence exceeds its 4 MiB bound; repair \(fileURL.path). Existing bytes were preserved.")
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode([String: AgentConversationLive].self, from: data)
     }
 
-    /// This record's current send, if its agent is still on it. The wake
-    /// helper's entry (by message id) is the closer view, so it wins.
+    /// Prefer the wake helper’s message-level entry because it observes the send more closely.
     public func current(for row: AgentConversationRecord) throws -> AgentConversationLive? {
         guard ["sending", "waiting"].contains(row.phase) else { return nil }
         return try Self.current(for: row, in: all())
@@ -267,14 +239,14 @@ public struct AgentConversationLiveStore: Sendable {
         return live
     }
 
-    @discardableResult func merge(_ changed: [AgentConversationLive], records checkedRecords: [AgentConversationRecord]? = nil) throws -> [String: AgentConversationLive] {
+    @discardableResult func merge(_ changed: [AgentConversationLive],
+        records checkedRecords: [AgentConversationRecord]? = nil) throws -> [String: AgentConversationLive] {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
         return try CredentialFileLock.withLock(fileURL) {
             var rows = try all()
             let before = rows
-            // Reconciliation holds the record lock. Progress flushes read inside
-            // the live-file lock so a late write cannot undo settlement.
+            // Reconciliation holds the record lock. Progress flushes read inside the live-file lock so a late write cannot undo settlement.
             let store = AgentConversationStore(dataRoot: dataRoot)
             let records: [AgentConversationRecord]
             if let checkedRecords {
@@ -321,7 +293,6 @@ public struct AgentConversationLiveStore: Sendable {
 }
 
 extension AgentConversationLive {
-    /// The shape `agent_read` and the event stream carry.
     public func projection(name: String? = nil) -> JSONValue {
         let iso = ISO8601DateFormatter()
         var fields: [String: JSONValue] = ["state": .string(state), "lane": .string(lane), "streams": .bool(streams),

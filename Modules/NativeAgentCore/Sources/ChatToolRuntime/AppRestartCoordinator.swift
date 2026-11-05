@@ -1,4 +1,5 @@
 import Darwin
+import ChatToolParsing
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
@@ -6,32 +7,13 @@ import PersistenceCore
 import ChatTurnContracts
 import Transcripts
 import TurnTrace
-// Blueprint: | `AppRestartCoordinator.swift` | Shared detached native relauncher observes parent exit before opening; tool restart audit/cooldown, originating-turn settlement with a 60-second stalled-turn bound and 120-second exit deadline; operator menu/restore 60-second deadline covering the whole quit (turn wait, their sleep, termination drain); stalled quit aborts relaunch |
+// Blueprint: | `AppRestartCoordinator.swift` | Wait for exit before relaunch; bound stalled settlement and quit. |
 
 // MARK: - AppRelaunch (restart_app / Telegram /restart core)
-// JSON restart receipts and cooldown stamp: local operational state, excluded
-// from backup/export/phone sync; PrivacyMap: restart_audit.
-//
-// Swift app restart support for Telegram /restart and the restart_app tool.
-// The Swift app is an SMAppService login item — quitting does NOT respawn it —
-// so the restart sequence needs a DETACHED relauncher process that outlives
-// the app: it observes our exit within a deadline, then `open`s the app
-// bundle again.
-//
-// ONE core routine for every surface (chat tool `restart_app`, Telegram
-// /restart via its deferred restart operation): cooldown guard, audit
-// envelope, stamp, relauncher spawn, and settlement-triggered termination live
-// here exactly once. Surfaces apply their origin and approval gates before
-// calling this coordinator; Telegram /restart also checks its owner allowlist.
-//
-// Sequencing contract that keeps the turn intact:
-//   cooldown check → audit write → stamp write → relauncher spawn →
-//   success envelope → originating turn settles → terminate.
-// A stalled originating turn has a bounded, explicitly unfinished exit.
-//
-// Production chat files an inline approval card when restart_app requires
-// confirmation. The person approves the card to replay the guarded restart;
-// no manual trust-policy edit is needed.
+// Restart receipts and cooldown stamps are local operational state, excluded from backup/export/phone sync; PrivacyMap: restart_audit. Login items do not
+// respawn on quit, so a detached helper must survive exit to reopen the bundle. All surfaces share cooldown → audit → stamp → relauncher → reply →
+// originating-turn settlement → termination; stalled settlement exits explicitly unfinished. Callers own origin and approval gates, including the remote
+// owner allowlist.
 private final class RestartTurnChanges: @unchecked Sendable {
     let stream: AsyncStream<Void>
     private let token: NSObjectProtocol
@@ -50,46 +32,29 @@ private final class RestartTurnChanges: @unchecked Sendable {
 public actor AppRelaunch {
     // MARK: Constants
 
-    /// Tool-initiated restarts inside this window refuse with an honest
-    /// cooldown envelope — a model stuck in a "restart fixes it" loop must
-    /// not be able to bounce the app every turn.
+    /// The cooldown prevents a model from restarting the app on every turn.
     public static let cooldownSeconds: TimeInterval = 600
-    /// Retained for existing install-delay clients; restart waits for settlement.
     public static let terminateGraceSeconds: TimeInterval = 20
     /// A refused or stalled quit must not leave a surviving helper forever.
     public static let relaunchExitDeadlineSeconds = 120
-    /// The menu/restore relauncher's deadline covers the WHOLE quit, so the
-    /// helper never expires before the app exits: the quit hold's turn wait
-    /// (20 s, `NativeAgentEngine.waitForInFlightTurnsBeforeQuit`) + her sleep
-    /// bound (30 s, `NativeAgentEngine.sleepBound`) + the termination drain's
-    /// wait (3 s) + 7 s of margin for AppKit and process exit.
+    /// The whole-quit deadline includes the turn wait (20 s), sleep (30 s), termination drain (3 s) and 7 s for AppKit and process exit.
     public static let operatorRelaunchExitDeadlineSeconds = 60
     /// Reserve the operator's whole-quit budget within the relauncher's bound.
     public static let stalledTurnSeconds = TimeInterval(relaunchExitDeadlineSeconds - operatorRelaunchExitDeadlineSeconds)
-    /// Process-wide instance used by the chat dispatch case and the app
-    /// layer Telegram bridge. The app layer MUST `configure(...)` it at
-    /// launch with the real terminate and relauncher closures (platform
-    /// operations live above this module); until then requestRestart refuses
-    /// honestly.
+    /// Platform hooks live above this module; refuse restarts until app launch configures both hooks.
     public static let shared = AppRelaunch()
 
     // MARK: App wiring
 
-    /// App-bound port that spawns the detached relauncher argv. The app uses
-    /// posix_spawn with POSIX_SPAWN_SETSID (own session — survives the
-    /// app/launchd job teardown) and stdio on /dev/null.
+    /// A new process session survives app/launchd teardown; /dev/null stdio avoids dead-parent pipes.
     private var spawnRelauncher: (@Sendable (_ argv: [String]) throws -> Void)?
-    /// Schedules app termination after `grace` seconds. Injected from the
-    /// app layer (DispatchQueue.main.asyncAfter → NSApp.terminate) because
-    /// this module must not import AppKit. nil = unconfigured → refuse.
+    /// App-layer termination injection keeps AppKit outside this module; missing wiring refuses restart.
     private var scheduleTerminate: (@Sendable (_ graceSeconds: TimeInterval) -> Void)?
     private let dataRoot = PersistenceCore.defaultDataRoot()
     private let currentPID = ProcessInfo.processInfo.processIdentifier
 
     private init() {}
 
-    /// App-layer wiring point: inject the real terminate scheduler and
-    /// relauncher spawn. Called once from applicationDidFinishLaunching.
     public func configure(
         scheduleTerminate: @escaping @Sendable (_ graceSeconds: TimeInterval) -> Void,
         spawnRelauncher: @escaping @Sendable (_ argv: [String]) throws -> Void
@@ -109,8 +74,7 @@ public actor AppRelaunch {
 
     // MARK: Relauncher command
 
-    /// The same executable runs only the exit observer, before any app state
-    /// or UI is initialized. It survives the parent and aborts on a stalled quit.
+    /// Run the exit observer before app state or UI startup so the helper remains detached from the app lifecycle.
     public static func relauncherArgv(pid: Int32, appPath: String) -> [String] {
         exitObserverArgv(pid: pid, appPath: appPath, seconds: relaunchExitDeadlineSeconds)
     }
@@ -120,8 +84,7 @@ public actor AppRelaunch {
          "--nativeagent-relaunch-after-exit", String(pid), appPath, String(seconds)]
     }
 
-    /// Called at the executable entry point, before single-instance admission.
-    /// kqueue registration precedes the parent read, closing the exit race.
+    /// Called at the executable entry point, before single-instance admission. kqueue registration precedes the parent read, closing the exit race.
     public nonisolated static func runRelaunchHelperIfRequested() -> Bool {
         let args = CommandLine.arguments
         guard args.dropFirst().first == "--nativeagent-relaunch-after-exit" else { return false }
@@ -134,8 +97,7 @@ public actor AppRelaunch {
                             flags: UInt16(EV_ADD | EV_ENABLE | EV_ONESHOT),
                             fflags: UInt32(NOTE_EXIT), data: 0, udata: nil)
         let registered = kevent(queue, &change, 1, nil, 0, nil)
-        // A detached child is adopted when its original parent exits. Never
-        // wait on a reused PID; registration errors while it lives abort.
+        // A detached child is adopted when its original parent exits. Never wait on a reused PID; registration errors while it lives abort.
         if getppid() == pid {
             guard registered == 0 else { return true }
             var event = kevent()
@@ -160,9 +122,6 @@ public actor AppRelaunch {
         return true
     }
 
-    /// Resolve the bundle to relaunch. In a real .app launch Bundle.main IS
-    /// the bundle; under `swift run`/tests it's not, so fall back to the
-    /// canonical install path (script/install_app.sh → ~/Applications).
     public static func appBundlePath() -> String {
         let bundle = Bundle.main.bundleURL
         if bundle.pathExtension == "app" { return bundle.path }
@@ -171,36 +130,21 @@ public actor AppRelaunch {
 
     // MARK: Core routine
 
-    /// The single restart entry point for every surface.
-    /// Returns a JSON envelope; never throws (failures are honest envelopes,
-    /// mirroring the builder-tool convention). On a "restarting" envelope the
-    /// settlement-triggered termination is armed before this returns. Surfaces that
-    /// must flush a reply over a transport FIRST (Telegram /restart) use
-    /// `requestRestartDeferringTerminate` and arm after the send.
-    public func requestRestart(reason: String, source: String) async -> JSONValue {
-        let (envelope, armTerminate) = await requestRestartDeferringTerminate(
+    /// Arm settlement-triggered termination before returning success; transports needing to flush first use the deferred entry point.
+    public func requestRestart(turn: Turn?, reason: String, source: String) async -> JSONValue {
+        let (envelope, armTerminate) = await requestRestartDeferringTerminate(turn: turn,
             reason: reason, source: source
         )
         armTerminate?()
         return envelope
     }
 
-    /// Two-phase variant: runs the FULL guarded routine (cooldown → audit →
-    /// stamp → relauncher spawn) but does NOT arm termination. When the
-    /// envelope status is "restarting", the returned closure schedules the
-    /// settlement wait; the caller invokes it AFTER handing the reply
-    /// to the transport. The restart is already COMMITTED (stamp written,
-    /// relauncher spawned) once the
-    /// closure exists, so the caller MUST invoke it even if the reply send
-    /// fails — otherwise the relauncher waits against a live app while
-    /// the cooldown stamp claims a restart happened.
-    public func requestRestartDeferringTerminate(
+    /// The caller must invoke the returned termination closure after its send attempt, even if sending fails: the stamp and relauncher are already committed.
+    public func requestRestartDeferringTerminate(turn: Turn?,
         reason: String, source: String
     ) async -> (envelope: JSONValue, armTerminate: (@Sendable () -> Void)?) {
         guard !Task.isCancelled else { return (await Self.stopped(), nil) }
-        // Fail closed when the app layer hasn't injected both hooks: spawning
-        // a relauncher without being able to exit would just no-op `open`
-        // against a live app while claiming "restarting".
+        // Require both platform hooks before spawning: opening an app that cannot exit would falsely claim a restart.
         guard let scheduleTerminate, let spawnRelauncher else {
             let missing = [
                 self.scheduleTerminate == nil ? "scheduleTerminate" : nil,
@@ -223,22 +167,16 @@ public actor AppRelaunch {
         let appPath = Self.appBundlePath()
         let argv = Self.relauncherArgv(pid: currentPID, appPath: appPath)
 
-        // Snapshot actor state into lets — withFileLock's body is @Sendable
-        // and must not touch actor-isolated members.
+        // Snapshot actor state into lets — withFileLock's body is @Sendable and must not touch actor-isolated members.
         let auditDir = self.auditDir
         let stampURL = self.stampURL
         let spawn = spawnRelauncher
         let pid = self.currentPID
         let cooldown = Self.cooldownSeconds
         let grace = Self.stalledTurnSeconds
-        let originRun = ChatPersistenceContext.pinnedTurnRunID
-            ?? TurnTraceContext.turnId.flatMap { turn in
-                ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).first { $0.turnId == turn }?.runId
-            }
+        let originRun = turn?.run
 
-        // Everything from cooldown-read to stamp-write runs under flock so
-        // two concurrent restart requests (chat + Telegram) serialize: the
-        // second sees the first's stamp and refuses with `cooldown`.
+        // Lock cooldown-read through stamp-write so concurrent requests cannot both restart the app.
         let result: JSONValue
         do {
             result = try await SwiftNativePersistenceCore.withFileLock(stampURL) {
@@ -246,9 +184,7 @@ public actor AppRelaunch {
                 // Read the clock under the lock so elapsed time includes any wait for a prior restart.
                 let requestedAt = Date()
 
-                // 1. Cooldown guard — refuse honestly inside the window. A
-                //    stamp in the FUTURE (cross-process race remnant, clock
-                //    skew) counts as cooling-down: negative elapsed refuses.
+                // Future stamps still cool down: clock skew must not permit repeated restarts.
                 let lastRestartAt: Date?
                 do {
                     lastRestartAt = try Self.readStampDate(stampURL)
@@ -262,7 +198,10 @@ public actor AppRelaunch {
                     let elapsed = requestedAt.timeIntervalSince(last)
                     if elapsed < cooldown {
                         let detail = elapsed < 0
-                            ? "The last restart stamp (\(NativeTimestampFormat.plainZulu(last))) is in the future relative to now — cross-process race or clock skew. Treating as cooling-down; refusing to restart."
+                            ? """
+                                The last restart stamp (\(NativeTimestampFormat.plainZulu(last))) is in the future relative to now — cross-process \
+                                race or clock skew. Treating as cooling-down; refusing to restart.
+                                """
                             : "A tool-initiated restart fired \(Int(elapsed))s ago; refusing to restart again within \(Int(cooldown))s."
                         return .object([
                             "status": .string("failed"),
@@ -277,10 +216,7 @@ public actor AppRelaunch {
 
                 guard !Task.isCancelled else { return await Self.stopped() }
 
-                // 2. Audit envelope FIRST. Restart is fail-closed on audit
-                //    (unlike fail-soft builder audits): no receipt → no
-                //    restart, because an unauditable app bounce is exactly
-                //    the loop this guard exists to make visible.
+                // Persist the audit before committing a restart so repeated app bounces remain diagnosable.
                 let auditURL = auditDir.appendingPathComponent("\(runId).json")
                 var auditEntry: [String: Any] = [
                     "toolName": "restart_app",
@@ -310,8 +246,7 @@ public actor AppRelaunch {
                 }
 
                 guard !Task.isCancelled else { return await Self.stopped(auditURL: auditURL) }
-                // 3. Cooldown stamp — written only after the audit landed,
-                //    immediately before the restart actually fires.
+                // Publish the cooldown only after its audit is durable and immediately before committing the restart.
                 let stampEntry: [String: Any] = [
                     "firedAt": NativeTimestampFormat.plainZulu(requestedAt),
                     "runId": runId,
@@ -325,7 +260,10 @@ public actor AppRelaunch {
                     var fields = SwiftToolDispatcher.builderFailureFields(error,
                         tool: "restart_app", reason: "stamp_write_failed", effects: .unknown,
                         owner: stampURL.path,
-                        instruction: "Repair the restart stamp's reported storage error without inventing a restart time. The audit was saved; no restart was scheduled.")
+                        instruction: """
+                            Repair the restart stamp's reported storage error without inventing a restart time. The audit was saved; no restart was \
+                            scheduled.
+                            """)
                     fields["audit_path"] = .string(auditURL.path)
                     return .object(fields)
                 }
@@ -333,8 +271,7 @@ public actor AppRelaunch {
                 guard !Task.isCancelled else {
                     return await Self.stopped(auditURL: auditURL, stampURL: stampURL)
                 }
-                // 4. Spawn the detached relauncher. An unsuccessful attempt
-                //    keeps its evidence but does not assert a fired restart.
+                // A failed spawn retains evidence without claiming a committed restart.
                 do {
                     try spawn(argv)
                 } catch {
@@ -349,13 +286,14 @@ public actor AppRelaunch {
                     return .object(fields)
                 }
 
-                // 5. Success envelope. Termination is armed by the CALLER
-                //    (via the returned closure) AFTER the reply is on its
-                //    way to the surface, then waits for its turn's settlement.
+                // The caller arms termination after handing off the reply, preserving originating-turn settlement.
                 return .object([
                     "status": .string("restarting"),
                     "tool": .string("restart_app"),
-                    "note": .string("Restarting after this turn settles. If it stalls for \(Int(grace))s, the app exits with an explicit unfinished outcome. A detached relauncher reopens \(appPath) after process exit; it aborts after \(Self.relaunchExitDeadlineSeconds)s."),
+                    "note": .string("""
+                        Restarting after this turn settles. If it stalls for \(Int(grace))s, the app exits with an explicit unfinished outcome. A \
+                        detached relauncher reopens \(appPath) after process exit; it aborts after \(Self.relaunchExitDeadlineSeconds)s.
+                        """),
                     "runId": .string(runId),
                     "reason": .string(effectiveReason),
                     "source": .string(source),
@@ -373,17 +311,18 @@ public actor AppRelaunch {
                 instruction: "Repair the restart lock's reported storage error; preserve the stamp. No restart was scheduled.")), nil)
         }
 
-        // 6. Only a real "restarting" envelope earns an arm-terminate
-        //    closure; refusals never schedule termination.
+        // Refusals must never schedule termination.
+        let reply = ToolResult(result)
         if case .object(let obj) = result,
-           case .string("restarting")? = obj["status"] {
+           reply.said("restarting"), reply.status == obj["status"]?.stringValue {
             return (result, {
                 Task.detached {
                     if let originRun {
                         let changes = RestartTurnChanges()
                         defer { changes.cancel() }
                         do {
-                            try await BoundedWait.run(seconds: grace, reason: "restart originating turn \(originRun) settlement") {
+                            try await BoundedWait.run(seconds: grace, reason: "restart originating turn \(originRun) settlement",
+                                                       deadlines: OperationDeadlines()) { _ in
                                 var iterator = changes.stream.makeAsyncIterator()
                                 while ChatCancelFlag.inFlightRunIDs().contains(originRun) {
                                     try Task.checkCancellation()
@@ -446,8 +385,7 @@ public actor AppRelaunch {
         do {
             data = try Data(contentsOf: url)
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            // lstat observes the stamp entry itself, including a dangling symlink.
-            // Only confirmed absence bootstraps; preserve every other read failure.
+            // lstat observes the stamp entry itself, including a dangling symlink. Only confirmed absence bootstraps; preserve every other read failure.
             var info = stat()
             guard lstat(url.path, &info) != 0, errno == ENOENT else { throw error }
             return nil
@@ -470,8 +408,6 @@ public actor AppRelaunch {
 }
 
 extension AppRelaunch {
-    /// The operator's menu/restore restart aborts if quitting exceeds
-    /// `operatorRelaunchExitDeadlineSeconds`.
     public nonisolated static func relaunchApp(
         bundlePath: String = Bundle.main.bundlePath,
         pid: Int32 = ProcessInfo.processInfo.processIdentifier,
@@ -488,11 +424,7 @@ extension AppRelaunch {
         terminate()
     }
 
-    /// Production relauncher spawn: posix_spawn with POSIX_SPAWN_SETSID so
-    /// the helper becomes its own session leader — it must survive launchd
-    /// tearing down the app's process group when the login item exits —
-    /// with stdio redirected to /dev/null (nohup-equivalent, no SIGHUP /
-    /// no pipe to a dead parent).
+    /// A separate process session survives launchd teardown; /dev/null prevents SIGHUP and writes to dead-parent pipes.
     @discardableResult
     public nonisolated static func spawnDetached(argv: [String]) throws -> pid_t {
         guard let executable = argv.first, !executable.isEmpty else {
@@ -510,8 +442,6 @@ extension AppRelaunch {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
-        // POSIX_SPAWN_SETSID (Darwin) — child starts in a NEW session,
-        // detached from our session/process group and any controlling tty.
         posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
 
         let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
@@ -526,9 +456,7 @@ extension AppRelaunch {
                 userInfo: [NSLocalizedDescriptionKey: "posix_spawn(\(executable)) failed: \(String(cString: strerror(rc)))"]
             )
         }
-        // If quit is refused, we remain the parent when the helper aborts.
-        // Observe and reap that exit rather than leaving a zombie until the
-        // next app shutdown. Registration precedes the race-closing read.
+        // Reap the helper if quitting is refused; register observation before reading to close the exit race.
         let spawnedPID = childPID
         let exit = DispatchSource.makeProcessSource(identifier: spawnedPID, eventMask: .exit, queue: .global(qos: .utility))
         exit.setEventHandler {

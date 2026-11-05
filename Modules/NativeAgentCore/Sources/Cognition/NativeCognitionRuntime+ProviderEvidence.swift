@@ -8,15 +8,15 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+ProviderEvidence.swift` | `NativeCognitionRuntime` provider evidence: checked bounded lifecycle history from canonical traces; source failures owe repair, missing status remains unknown and cumulative capability beliefs never substitute |
+// Blueprint: | `NativeCognitionRuntime+ProviderEvidence.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
     public nonisolated static func providerPathEvidence(
         providerID: String, dataRoot: URL, since: Date, now: Date = Date()
     ) async throws -> (model: String, observedAt: Date)? {
         let receipt = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
-            .traceEvidence(now: now, since: since)
-        guard receipt.report.malformedLineCount == 0, !receipt.report.trailingPartialLine else {
+            .traceEvidence(now: now, since: since, kinds: ["llm.call"])
+        guard receipt.turns.unreadable == 0 else {
             throw PersistenceCoreError.ioFailure("Provider evidence is incomplete; inspect the retained trace sources before checking the provider.")
         }
         var newest: (model: String, observedAt: Date)?
@@ -62,22 +62,21 @@ extension NativeCognitionRuntime {
     }
 
     func restoreProviderLifecycleEvidence() async {
-        // Keep a bounded evidence window across the canonical turn files and
-        // standalone ledger, then restore the newest provider outcomes.
+        // Bound restored provider evidence from the record.
         let rows: [JSONValue]
         do {
             let read = try await TurnTraceRecentReader(
                 dataRootOverride: dataRoot, rowLimit: Self.maximumProviderLifecycleEvidence * 64
-            ).traceEvidence(maximumReadBytes: 1_048_576)
-            guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else {
+            ).traceEvidence(kinds: ["llm.call"])
+            guard read.turns.unreadable == 0 else {
                 throw PersistenceCoreError.ioFailure("Provider lifecycle history contains unreadable trace rows.")
             }
             rows = read.rows
         } catch {
             RepairOwed.owe(dataRoot, id: "provider-evidence:" + UUID().uuidString, kind: .run,
-                operation: "cognition.provider.evidence", owner: "turn_traces",
+                operation: "cognition.provider.evidence", owner: "experiences/experiences.sqlite",
                 words: "Provider lifecycle history is unavailable: \(error.localizedDescription)",
-                tap: "Repair the named trace source while preserving its bytes. No cumulative belief will replace it.")
+                tap: "Repair the life record while preserving its rows. No cumulative belief will replace it.")
             return
         }
         var restored: [String: ProviderPathEvidence] = [:]
@@ -107,7 +106,7 @@ extension NativeCognitionRuntime {
               case .string(let model)? = payload["model"] else { return nil }
         let outcome: ProviderPathEvidenceOutcome? = {
             guard case .string(let status)? = object["status"] else {
-                return nil // No recorded outcome attests a successful provider call.
+                return nil // No recorded outcome can attest a successful provider call.
             }
             switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             case "ok", "succeeded", "completed": return .succeeded

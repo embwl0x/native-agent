@@ -3,31 +3,32 @@ import PersistenceCore
 import Senses
 import ToolExecution
 import NativeAgentCore
+import ChatTurnContracts
+import ChatToolParsing
 // Blueprint: | `NativeSkillRegistryActions.swift` | owner-facing enable/disable through `Parts`; `enableSkill`, `disableSkill` |
 
-/// The owner's own hand on a part: the Skills page's Install, an approved
-/// card, a self-improvement apply. Each goes through the one lifecycle (`Parts`).
+/// Every owner-facing install, approval and improvement apply shares the Parts lifecycle.
 public enum NativeSkillRegistryActions {
 
-    /// The owner keeps a part, or turns it back on. `reviewedDigest` is the
-    /// exact version the owner read (a card's); one changed since keeps nothing.
-    public static func enableSkill(name: String, dataRoot: URL, reviewedDigest: String?) async throws {
-        let host = AppScriptRunner.Host(call: { _ in .null }, dataRoot: dataRoot)
-        let outcome = await OwnedProgramInvocation.$host.withValue(host) {
-            await Parts(root: dataRoot).enable(name, version: reviewedDigest, fullMac: false, ownerAuthorized: true)
-        }
+    /// Keep only the exact reviewedDigest; a version changed since review requires a new decision.
+    public static func enableSkill(name: String, dataRoot: URL, reviewedDigest: String?, turn: Turn,
+                                   execution: AppActionExecution) async throws {
+        let outcome = await Parts(root: dataRoot).enable(name, version: reviewedDigest,
+            fullMac: false, ownerAuthorized: true, invocation: execution.partInvocation(turn: turn, surface: "ability.enable"))
         guard outcome.ok else {
+            let reply = ToolResult(.object(outcome.fields))
             throw ToolFailureError(outcome.text,
-                effects: outcome.fields["effects"] == .string("none") ? .none : .unknown,
+                effects: reply.effects == .some(.none) ? .none : .unknown,
                 code: "part_enable_incomplete")
         }
     }
 
-    public static func disableSkill(name: String, dataRoot: URL) async throws {
-        let outcome = Parts(root: dataRoot).disable(name, reason: nil, fullMac: false, ownerAuthorized: true)
+    public static func disableSkill(name: String, dataRoot: URL, turn: Turn) async throws {
+        let outcome = Parts(root: dataRoot).disable(name, reason: nil, fullMac: false, ownerAuthorized: true, turn: turn)
         guard outcome.ok else {
+            let reply = ToolResult(.object(outcome.fields))
             throw ToolFailureError(outcome.text,
-                effects: outcome.fields["effects"] == .string("none") ? .none : .unknown,
+                effects: reply.effects == .some(.none) ? .none : .unknown,
                 code: "part_disable_incomplete")
         }
     }

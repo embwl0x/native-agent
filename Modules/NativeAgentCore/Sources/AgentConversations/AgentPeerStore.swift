@@ -8,15 +8,13 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `AgentPeerStore.swift` | Canonical contact decoding, identity projections and proof; authenticated inbound proof connects hosts without a command line too. `isReady` checks route/key proof, unavailable mark and ACP startability, while `AgentContactHealth` owns version/digest freshness. `list` prepares/chmods its directory before reading; summaries retain every contact with reachability and owner trust separately |
+// Blueprint: | `AgentPeerStore.swift` | `isReady`, `AgentContactHealth`, `list` |
 
-// AgentPeerStore owns agents/peers.json's checked contact array. Local backup
-// and export exclude contacts; phone sync projects helpers, never this file or
-// credentials. PrivacyMap lists Agent Contacts.
+// The checked peer array is private contact authority; backup, export and phone projections must respect its privacy map.
 
 public typealias AgentPeerTransport = NativeAgentCore.AgentPeerTransport
 
-/// Historical evidence, not a promise that the route is currently available.
+/// Round-trip history cannot promise current route availability.
 public struct AgentRoundTripProof: Codable, Sendable, Equatable {
     public let at: String
     public let endpoint: URL
@@ -25,8 +23,7 @@ public struct AgentRoundTripProof: Codable, Sendable, Equatable {
     public let workspace: String
     public let credentialKey: String?
     public var appVersion: String?
-    /// The recipe the round trip ran on (`AgentRecipeStore`): its version, and
-    /// its digest, which also catches a hand edit that bumped nothing.
+    /// Retain recipe digest as well as version to detect hand edits that do not bump versions.
     public var recipeVersion: Int?
     public var recipeDigest: String?
 }
@@ -47,13 +44,10 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
         return AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.bundleIDs } ?? []
     }
 
-    /// Its recipe's id (`AgentRecipeStore`): its host's row, or for an A2A
-    /// contact its own id, since its card is a recipe of its own.
+    /// Host recipes use the host ID; A2A contacts own their own card recipe.
     public var recipeID: String? { transport == .a2a ? id : AgentPeerStore.hostRowID(endpoint) }
 
-    /// What "unverified" later compares against: the recipe the send used,
-    /// as the transport captured it when the send started, and the app's own
-    /// version (CFBundleShortVersionString).
+    /// Capture the send’s recipe and app version so later changes invalidate proof.
     func stampVersions(_ proof: inout AgentRoundTripProof, recipe: AgentRecipeStore.Recipe?) throws {
         if let recipe {
             proof.recipeVersion = recipe.recipeVersion
@@ -71,51 +65,37 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// Stable, canonical lowercase UUID. Names are presentation, never identity.
     public var id: String
     public var name: String
-    /// The who this contact is a door of: another contact's id, written only
-    /// as an explicit association. Absent: this contact is its own who.
+    /// The who this contact is a door of: another contact's id, written only as an explicit association. Absent: this contact is its own who.
     public var who: String?
-    /// Names that reach this who besides its id (a lane it answered on before
-    /// contacts carried it). Lookup only; never identity for another contact.
+    /// Aliases locate this contact only; they cannot establish another contact’s identity.
     public var handles: [String]?
-    /// A2A card URL, NativeAgent bridge base URL, or desktop app://bundle ID.
     public var endpoint: URL
     public var transport: AgentPeerTransport
-    /// HOW she reaches it when that is one of her abilities (its id), instead
-    /// of the built-in route `transport` names, which stays saved for moving
-    /// back. Its thread, identity, trust and proof stay the contact's.
-    /// `AgentPeerStore.route` is its only writer.
+    /// An authored ability changes reachability only; contact identity, trust and proof remain with this owner.
     public var ability: String?
     /// Reference only. Credential values must never enter this document.
     public var credentialKey: String?
-    /// Exact resolved executable disclosed and approved when connecting this named host.
+    /// Launch only the exact executable disclosed and approved at connection.
     public var approvedExecutablePath: String? = nil
     /// Desktop target data only, never a script or verified conversation ID.
     public var conversationLabel: String?
-    /// Explicitly disclosed ACP starting directory; absent on older contacts.
+    /// ACP starting directories must be explicitly disclosed.
     public var acpWorkingDirectory: String?
     /// Identity receipt for approvedExecutablePath, never a second launch binding.
     public var acpExecutable: AgentACPExecutable?
-    /// The explicitly selected folder for a workspace-scoped host connection.
+    /// Workspace-scoped connections require an explicitly selected folder.
     public var hostWorkspace: String?
     /// Nonsecret setup state. The routine URL and key live only in Keychain.
     public var grokSetup: String?
     public var grokConversation: String?
-    /// nil: submission has not begun; false: its outcome is unconfirmed;
-    /// true: the request or routine was confirmed. Connect resumes without
-    /// resending a request whose submission may already have happened.
+    /// An unconfirmed submission may already have happened; reconnect must not resend it.
     public var grokBootstrapConfirmed: Bool?
-    /// THE PERSON'S OWN GRANT, and the only thing that can raise an inbound
-    /// peer turn off the restricted `agent-bridge` surface. Absent means no —
-    /// the default for every peer, including one this agent configured or
-    /// discovered for itself. Optional rather than `Bool = false` so an
-    /// existing peers.json round-trips byte-identically until the person sets
-    /// it in Trust Center.
+    /// Only the person’s grant may elevate an inbound peer turn; absence is refusal, including self-discovered peers. Keep the optional field absent until
+    /// explicitly set so untouched persisted rows remain byte-identical.
     public var allowElevation: Bool?
-    /// Fail-closed reading of the grant above.
     public var elevationAllowed: Bool { allowElevation == true }
 
-    /// Why the person's grant cannot take effect on this contact now, from the
-    /// credential owner's checked answer; nil when its own key resolves.
+    /// Credential authority owns whether the person’s grant can take effect; unavailable keys cannot imply permission.
     public func elevationUnavailable(peers: [AgentPeerContact], availability: Result<Bool, ToolFailureError>? = nil) -> ToolFailureError? {
         let available: Bool
         switch availability ?? AgentPeerCredentials.availability(self, peers: peers) {
@@ -124,8 +104,7 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
         }
         if credentialKey == Self.credentialKey(for: id),
            available { return nil }
-        // Connect re-mints a key on this same contact only for a settings host;
-        // any other route's key comes from that agent, through the person.
+        // Only settings-host reconnects mint keys; other routes require the peer’s own credential.
         let repairable = AgentPeerStore.hostRowID(endpoint).flatMap(AgentHostDirectory.row(named:))
             .map { $0.settingsSupported || $0.format == .shellEnvironment } == true && transport == .mcpHost
         return ToolFailureError(AgentPeerCredentials.unavailableDetail, effects: .none,
@@ -135,11 +114,8 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
             tap: repairable ? nil : "Agents > \(name) > connect again with the key \(name) gives you")
     }
 
-    /// THE WHOLE PROOF, and the minimum that can carry it: when a real message
-    /// last came IN through this connection, and when one last went OUT. Two
-    /// timestamps, written only by `recordProof`. Configuration is not
-    /// evidence — an entry that exists proves it was written, and nothing
-    /// else. Optional so an existing peers.json round-trips byte-identically.
+    /// Only recordProof may stamp actual inbound or outbound messages; configuration alone proves no traffic. Optional evidence preserves untouched persisted
+    /// rows byte-for-byte.
     public var provenInboundAt: String?
     public var provenOutboundAt: String?
     public var roundTripProof: AgentRoundTripProof?
@@ -147,7 +123,7 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     var connectionProbe: AgentConnectionProbe?
     public var unavailableAt: String?
 
-    /// Route/key proof, no unavailable mark and ACP startability; AgentContactHealth owns version/digest freshness.
+    /// This owner checks route proof and startability; contact health owns version and digest freshness.
     public var isReady: Bool {
         if transport == .acp && !canStartTurn { return false }
         guard let proof = roundTripProof ?? mcpReturnProof else { return false }
@@ -170,12 +146,9 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
 
     public static func credentialKey(for id: String) -> String { "agent-peer:\(id)" }
 
-    /// HONEST STATES, in the words the agent can act on without knowing what a
-    /// transport is. A handshake, an entry, a saved endpoint: all of them are
-    /// `setUp`. A real inbound message or round trip makes a contact `connected`.
+    /// Setup and handshake evidence prove configuration only; connection requires actual inbound traffic or a round trip.
     public var state: AgentPeerContactState {
-        // Inbound credentials prove a contact's return path. ACP routes
-        // still need their own completed round-trip proof.
+        // Inbound credentials prove a contact's return path. ACP routes still need their own completed round-trip proof.
         let inboundContact = transport != .acp && transport != .desktop
             && credentialKey == Self.credentialKey(for: id) && provenInboundAt != nil
         if unavailableAt == nil && (isReady || inboundContact) { return .connected }
@@ -188,9 +161,7 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
         return receipt
     }
 
-    /// The exact program approved for this contact, re-verified now — what a
-    /// Full Mac launch runs. nil: none was approved, or it changed since.
-    /// Hashed in full every time: this is the check right before that launch.
+    /// Hash the approved program immediately before each Full Mac launch; a changed or missing path is not approved.
     public var verifiedExecutablePath: String? {
         guard let receipt = acpExecutable, (try? receipt.verify()) != nil else { return nil }
         return receipt.path
@@ -204,14 +175,12 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
         }
         return true
     }
-    /// Grok's desktop app is read back: its answer is taken from the same chat.
+    /// Desktop answers must be read from the same chat that received the send.
     public var canAnswerBack: Bool { transport != .desktop || readsReplyInWindow }
     public var readsReplyInWindow: Bool { transport == .desktop && AgentPeerStore.desktopBundleID(endpoint) == GrokBotRoute.bundleID }
 }
 
-/// The four words `agent_contacts`, `agent_connect`, `agent_message` and
-/// `agent_read` all speak. `listed` belongs to a known-agent row with no
-/// contact behind it yet, so it has no contact to hang off.
+/// Listed hosts have no contact yet; shared contact projections cannot invent one.
 public enum AgentPeerContactState: String, Sendable {
     case listed
     case setUp = "set up"
@@ -241,7 +210,11 @@ public enum AgentPeerStoreError: String, Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .invalidContact: return "Contact identity, name or conversation settings are invalid."
-        case .invalidEndpoint: return "Endpoint does not match this contact's transport. Network routes require HTTPS or explicit loopback HTTP without credentials, query or fragment; desktop routes require an exact app bundle identifier; recipe routes require a valid host identity and any configured starting folder."
+        case .invalidEndpoint: return """
+            Endpoint does not match this contact's transport. Network routes require HTTPS or explicit loopback HTTP without credentials, query or \
+            fragment; desktop routes require an exact app bundle identifier; recipe routes require a valid host identity and any configured \
+            starting folder.
+            """
         case .invalidCredentialReference: return "Credential reference must belong to this contact's dedicated namespace."
         case .invalidConfiguration: return "Saved contacts are invalid; existing bytes were preserved."
         case .tooManyContacts: return "Contact limit reached (128)."
@@ -268,7 +241,10 @@ public enum AgentPeerStoreError: String, Error, LocalizedError, Sendable {
         let damaged = [.invalidConfiguration, .configurationTooLarge, .unreadableConfiguration].contains(self)
         if damaged, let file {
             instruction = ToolFailureError.fileRepairInstruction(file,
-                shape: "The file must be a JSON array of at most 128 valid AgentPeerContact records, at most 1048576 bytes; preserve IDs and credential references.")
+                shape: """
+                    The file must be a JSON array of at most 128 valid AgentPeerContact records, at most 1048576 bytes; preserve IDs and credential \
+                    references.
+                    """)
         }
         let code = switch self {
         case .invalidContact: "agent_contact_invalid"
@@ -284,11 +260,8 @@ public enum AgentPeerStoreError: String, Error, LocalizedError, Sendable {
     }
 }
 
-/// The sole configured external-peer address book: agents/peers.json is a JSON
-/// array. Unknown fields and invalid rows fail closed rather than being erased
-/// by a subsequent mutation. All mutations share the canonical sidecar lock.
-/// peers.json: excluded from local backup/export; off-disk includes it;
-/// phone sync carries contact projections. PrivacyMap lists peers.json.
+/// Unreadable or invalid peer rows fail closed instead of being erased by mutation. All mutations use the canonical sidecar lock and preserve the store’s
+/// documented privacy boundaries.
 public struct AgentPeerStore: Sendable {
     public static let maximumContacts = 128
     public static let maximumNameLength = 120
@@ -300,20 +273,19 @@ public struct AgentPeerStore: Sendable {
         fileURL = dataRoot.appendingPathComponent("agents/peers.json")
     }
 
-    /// Prepares the directory and enforces 0700 permissions before the locked read.
+    /// Enforce private directory permissions before locked reads.
     public func list() throws -> [AgentPeerContact] {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) { try read() }
     }
 
     /// Saved contacts for turn orientation; reachability never removes a contact.
-    package func contactSummaries() throws -> [String] {
+    package func contactSummaries(turn: Turn?) throws -> [String] {
         let start = DispatchTime.now().uptimeNanoseconds
         let peers = try read()
         let health = AgentLocalHealth.read(fileURL.deletingLastPathComponent().deletingLastPathComponent())
-        // Availability checks each token against every configured contact.
-        // Read each key once for this summary, including missing/unreadable
-        // results; the next summary and every effect still read afresh.
+        // Availability checks each token against every configured contact. Read each key once for this summary, including missing/unreadable results; the next
+        // summary and every effect still read afresh.
         var credentials: [String: Result<String?, any Error>] = [:]
         func credential(_ id: String) throws -> String? {
             if let kept = credentials[id] { return try kept.get() }
@@ -327,7 +299,10 @@ public struct AgentPeerStore: Sendable {
             switch AgentPeerCredentials.availability(peer, peers: peers, readCredential: credential) {
             case .success(let value): available = value
             case .failure(let failure):
-                return "\(peer.name) (reachability: unavailable; credential error: \(failure.localizedDescription); trusted: \(peer.elevationAllowed ? "on" : "off"))"
+                return """
+                    \(peer.name) (reachability: unavailable; credential error: \(failure.localizedDescription); trusted: \
+                    \(peer.elevationAllowed ? "on" : "off"))
+                    """
             }
             let unavailable = peer.grokSetup == "disconnected" || peer.unavailableAt != nil
                 || !available
@@ -338,7 +313,7 @@ public struct AgentPeerStore: Sendable {
         TurnTraceBus.fireFromContext(kind: "context.contacts.summary", payload: .object([
             "elapsedMs": .int(Int64((DispatchTime.now().uptimeNanoseconds &- start) / 1_000_000)),
             "contactCount": .int(Int64(peers.count)), "credentialReads": .int(Int64(credentials.count))
-        ]))
+        ]), turn: turn)
         return summaries
     }
 
@@ -365,18 +340,11 @@ public struct AgentPeerStore: Sendable {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
-            // The person's elevation grant is NOT configuration a caller may
-            // carry in a contact body — `setElevation` is its only writer, so
-            // an agent-driven configure can neither grant it nor silently
-            // clear one the person already gave.
-            // The proof timestamps are evidence, not configuration, for the
-            // same reason: `recordProof` is their only writer, so a configure
-            // cannot claim a round trip. An explicit reconnect retires proof
-            // from the prior consent under this same lock.
+            // Only setElevation may change the person’s grant, and only recordProof may stamp traffic evidence. Configure cannot grant, erase grants or
+            // manufacture proof; explicit reconnect retires prior consent proof under the same lock.
             var merged = contact
             if let index = peers.firstIndex(where: { $0.id == contact.id }) {
-                // A key belongs to the route it was minted for. Changing a
-                // workspace or endpoint requires a new contact and key.
+                // A key belongs to the route it was minted for. Changing a workspace or endpoint requires a new contact and key.
                 if peers[index].credentialKey != nil,
                    (!Self.sameRoute(peers[index], contact) || peers[index].credentialKey != contact.credentialKey) {
                     throw AgentPeerStoreError.invalidContact.failure(file: fileURL)
@@ -407,8 +375,7 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// Serializes Grok setup/import/revocation, including Keychain effects,
-    /// against this contact's removal. An old card cannot recreate a contact.
+    /// Serialize setup and credential effects with removal so stale cards cannot recreate contacts.
     @discardableResult public func updateGrok(_ id: String, allowDisconnected: Bool = false,
                                              _ edit: (inout AgentPeerContact) throws -> Void) throws -> AgentPeerContact {
         try prepareDirectory()
@@ -423,8 +390,7 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// The ONLY writer of the person's per-peer elevation grant. Callable from
-    /// Trust Center; never from a chat tool.
+    /// Only Trust Center may write person-granted elevation; chat tools cannot reach this writer.
     @discardableResult public func setElevation(peerID: String, allowed: Bool) throws -> AgentPeerContact? {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) {
@@ -437,8 +403,7 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// THE ONLY WRITER of a contact's route: one of her abilities, or nil for
-    /// its built-in route. Nil when the contact is gone.
+    /// Only this writer changes authored contact routes; a removed contact cannot be recreated here.
     public func route(peerID: String, ability: String?) throws -> AgentPeerContact? {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) {
@@ -450,9 +415,7 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// Re-approve the program behind a command or ACP contact's approved path.
-    /// Under the store lock, so a contact disconnected meanwhile is never
-    /// written back; false when the contact or its approved path is no longer that.
+    /// Reapproval holds the store lock so concurrent disconnect cannot restore a removed contact.
     @discardableResult public func approveExecutable(peerID: String, path: String, version: String? = nil) throws -> Bool {
         try prepareDirectory()
         return try CredentialFileLock.withLock(fileURL) {
@@ -460,7 +423,7 @@ public struct AgentPeerStore: Sendable {
             guard let index = peers.firstIndex(where: { $0.id == peerID && [.mcpHost, .acp].contains($0.transport) }) else { return false }
             var receipt = try AgentACPExecutable.capture(path: path)
             receipt.version = version
-            // An ACP contact's approval is its receipt's own resolved path (approvedACPExecutable).
+            // ACP reapproval must use the path resolved in its own receipt.
             peers[index].approvedExecutablePath = peers[index].transport == .acp ? receipt.path : path
             peers[index].acpExecutable = receipt
             try write(peers)
@@ -468,11 +431,8 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// THE ONLY WRITER OF PROOF. A round trip is recorded where it actually
-    /// happens — an inbound request that carried this connection's key, an
-    /// outbound message that really left — and nowhere else. Unknown ids and
-    /// unreadable configuration retain an explicit evidence-persistence debt;
-    /// already completed work is never repeated to recreate a missing proof.
+    /// Only real transport events write proof; missing IDs or unreadable storage retain persistence debt. Never repeat completed work to recreate missing
+    /// evidence.
     public func recordProof(peerID: String, inbound: Bool = false, outbound: Bool = false,
                             message: String? = nil) {
         guard inbound || outbound, Self.validID(peerID) else { return }
@@ -542,9 +502,8 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// Called only by a transport after a validated response to its request.
-    /// Inbound traffic alone never writes round-trip evidence. `recipe` is the
-    /// one the send used, captured when it started; a route no recipe drives has none.
+    /// Only a transport-validated response proves a round trip; inbound traffic alone cannot. Capture the recipe used when the send began, not the current
+    /// recipe.
     public func recordRoundTrip(peerID: String, executable: String? = nil,
                                 version: String? = nil, workspace: String, recipe: AgentRecipeStore.Recipe? = nil) {
         retainEvidence(peerID: peerID, operation: "round-trip") {
@@ -562,7 +521,7 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// Clear unavailable marks at or after `since`, retaining ambiguous same-second timestamps.
+    /// Clear marks only from the requested boundary while preserving ambiguous same-second timestamps.
     public func clearUnavailable(peerID: String, since: Date) {
         retainEvidence(peerID: peerID, operation: "clear-unavailable") {
             var peers = try read()
@@ -602,12 +561,14 @@ public struct AgentPeerStore: Sendable {
         RepairOwed.owe(fileURL.deletingLastPathComponent().deletingLastPathComponent(),
             id: UUID().uuidString.lowercased(), kind: .act,
             operation: "agent.contact.evidence:" + peerID + ":" + operation, owner: fileURL.path,
-            words: "Contact \(peerID) \(operation) evidence could not be retained: \(error.localizedDescription). Its completed work must not be resent to replace missing evidence.",
+            words: """
+                Contact \(peerID) \(operation) evidence could not be retained: \(error.localizedDescription). Its completed work must not be resent \
+                to replace missing evidence.
+                """,
             lever: "Repair the contact evidence store, then reconcile the original operation's receipt.")
     }
 
-    /// Discovery cannot replace an existing identity or its credentials. Exact
-    /// routes reuse identity under the store lock; desktop labels scope routes.
+    /// Discovery cannot replace an existing identity or its credentials. Exact routes reuse identity under the store lock; desktop labels scope routes.
     @discardableResult public func insertDiscovered(_ contact: AgentPeerContact) throws -> AgentPeerContact {
         try Self.validate(contact)
         try prepareDirectory()
@@ -639,8 +600,7 @@ public struct AgentPeerStore: Sendable {
             (lhs.transport != .mcpHost || lhs.hostWorkspace == rhs.hostWorkspace)
     }
 
-    /// The known-agent row id behind an `mcp://<id>` endpoint, or nil. A host
-    /// with no recipe is not an identity this store will accept.
+    /// Only known host recipes may establish mcp endpoint identity.
     public static func hostRowID(_ endpoint: URL) -> String? {
         if let bundle = desktopBundleID(endpoint) {
             return AgentHostDirectory.rows.first { $0.route == .desktopChat && $0.bundleIDs.contains(bundle) }?.id
@@ -708,9 +668,7 @@ public struct AgentPeerStore: Sendable {
         }
         guard contact.conversationLabel == nil else { throw AgentPeerStoreError.invalidContact.failure() }
         if contact.transport == .mcpHost || contact.transport == .acp {
-            // An identity, not an address: nothing here is ever dialled, and
-            // the key this contact owns is the only thing that resolves an
-            // inbound request to it.
+            // Endpoint text is identity only, never a dialled address; the owned key resolves inbound requests.
             let scheme = contact.transport == .acp ? "acp" : "mcp"
             guard let host = contact.endpoint.host, !host.isEmpty,
                   contact.endpoint.absoluteString == scheme + "://" + host,

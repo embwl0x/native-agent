@@ -13,7 +13,8 @@ import CoreFoundation
 import ProviderRouting
 import CryptoKit
 import SQLite3
-// Blueprint: | `AgentContactTaskValues.swift` | Retained inbound task, event and turn vocabulary; canonical execution state stays separate from typed payload-recovery debt and builder's selected input bindings |
+import UniformTypeIdentifiers
+// Blueprint: | `AgentContactTaskValues.swift` | Execution and payload debt remain distinct. |
 public enum AgentContactTaskState: String, Codable, Sendable {
     case submitted, working, inputRequired = "input-required", completed, failed, canceled, stopped
     public var terminal: Bool { self == .completed || self == .failed || self == .canceled || self == .stopped }
@@ -34,6 +35,8 @@ public struct AgentContactTask: Codable, Sendable {
     /// Builder routing/provenance only; transcript owns its accepted words and files.
     public var bridgeInput: AgentContactBridgeInput?
     public var acceptedOutputModes: [String]?
+    /// Set when the contact gave this task as a job rather than a conversation.
+    public var job: AgentContactJob?
     public var toolResult: JSONValue?
     public var delegatedCompletions: [String: AgentContactPart]?
     public var approvalIDs: Set<String>?
@@ -41,7 +44,7 @@ public struct AgentContactTask: Codable, Sendable {
     /// Execution can be terminal while its saved payload still needs repair.
     public var replyRecovery: AgentContactReplyRecovery?
     public var delegatedCompletionDigests: [String: String]?
-    /// Its registered callbacks, by config id: durable before acceptance.
+    /// Persist registered callbacks before accepting execution.
     public var callbacks: [String: AgentContactCallback]?
     var owesCallbacks: Bool {
         callbacks?.values.contains { $0.delivered != state.rawValue } == true
@@ -70,9 +73,10 @@ struct AgentContactTurn: Sendable {
     let principal: AgentBridgePrincipal
     let parts: [AgentContactPart]
     var bindRun: @Sendable (String, String) async throws -> Void = { _, _ in }
-    /// Its input already saved in the conversation: a restart left it queued.
+    /// Restarted queued input is already canonical in the conversation.
     var accepted: EnqueuedUserMessage? = nil
     var bridgeInput: AgentContactBridgeInput? = nil
+    var job: AgentContactJob? = nil
 }
 enum AgentContactProgress: Sendable {
     case working
@@ -87,4 +91,69 @@ struct AgentContactOutcome: Sendable {
     var failure: ProviderFailure.Report? = nil
     var replyRecovery: AgentContactReplyRecovery? = nil
     var toolResult: JSONValue? = nil
+}
+
+/// A job a contact gave the agent over A2A. The brief is the message text and the input files are its file parts; the task's one folder is derived from its id.
+public struct AgentContactJob: Codable, Sendable, Equatable {
+    /// What the contact says will be true when the job is done. Peer words: quoted to the agent as data, never an instruction.
+    public let done: String?
+
+    static let skill = "job"
+    static let maximumDoneBytes = 2000
+
+    /// One folder per task under the agent-runs area; the files the agent makes for the job go here and come back as its artifacts.
+    static func folder(taskID: String, dataRoot: URL) -> URL {
+        AgentHostConnection.builderWorkspaceRoot(dataRoot: dataRoot).appendingPathComponent("agent-bridge-runs/inbound-jobs/" + taskID)
+    }
+
+    /// Save the contact's files under `input/` in the order sent and return their folder-relative names. The folder exists afterwards.
+    static func stage(_ parts: [AgentContactPart], taskID: String, dataRoot: URL) throws -> [String] {
+        let input = folder(taskID: taskID, dataRoot: dataRoot).appendingPathComponent("input")
+        try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        var names: [String] = []
+        for case .file(let name, _, let bytes, _) in parts {
+            // The contact names the file, never where it goes: one plain name inside input/.
+            let plain = (name as NSString).lastPathComponent.replacingOccurrences(of: ":", with: "-")
+            let saved = "\(names.count + 1)-" + (plain.isEmpty || plain.hasPrefix(".") ? "file" : plain)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: input.appendingPathComponent(saved))
+            names.append("input/" + saved)
+        }
+        return names
+    }
+
+    /// The regular files the agent left directly in the folder. Hidden files, links and `input/` are not the agent's to hand back; a file the wire cannot
+    /// carry is counted.
+    static func fileParts(taskID: String, dataRoot: URL) throws -> (parts: [AgentContactPart], unsent: Int) {
+        let entries = try FileManager.default.contentsOfDirectory(at: folder(taskID: taskID, dataRoot: dataRoot),
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            // Only regular files the agent made: a link would hand back whatever it points at.
+            .filter { entry in
+                guard !entry.lastPathComponent.hasPrefix("."),
+                      let values = try? entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return false }
+                return values.isRegularFile == true && values.isSymbolicLink != true
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        var parts: [AgentContactPart] = []
+        var unsent = 0
+        for entry in entries {
+            let mime = UTType(filenameExtension: entry.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+            let attachment = ChatTurnRuntime.MultimodalAttachment(type: "file", base64: "", mime: mime, name: entry.lastPathComponent, path: entry.path)
+            if let part = try? AgentContactPart.output(attachment, taskID: taskID) { parts.append(part) } else { unsent += 1 }
+        }
+        return (parts, unsent)
+    }
+}
+
+extension AgentContactTask {
+    /// A conversation's reply is one artifact. A job's report is one artifact and each file the agent made is another.
+    func replyArtifacts(_ parts: [AgentContactPart]) -> [(id: String, parts: [AgentContactPart])] {
+        guard !parts.isEmpty else { return [] }
+        guard job != nil else { return [(id: id + "-reply", parts: parts)] }
+        var artifacts: [(id: String, parts: [AgentContactPart])] = []
+        let report = parts.filter { if case .file = $0 { false } else { true } }
+        if !report.isEmpty { artifacts.append((id: id + "-reply", parts: report)) }
+        let files = parts.filter { if case .file = $0 { true } else { false } }
+        for (index, file) in files.enumerated() { artifacts.append((id: id + "-file-\(index + 1)", parts: [file])) }
+        return artifacts
+    }
 }

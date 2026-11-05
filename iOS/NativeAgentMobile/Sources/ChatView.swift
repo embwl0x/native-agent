@@ -18,7 +18,7 @@ struct ChatView: View {
     @Environment(VoiceInputController.self) var voiceInput
     @EnvironmentObject var voiceOutput: VoiceOutputController
     @Environment(\.scenePhase) var scenePhase
-    // Respect Reduce Motion on bubble entrance.
+    // Composer motion must respect Reduce Motion.
     @Environment(\.accessibilityReduceMotion) var reduceMotion
     @Environment(ChatStore.self) var store
     let sync = iCloudSyncEngine.shared
@@ -30,16 +30,13 @@ struct ChatView: View {
     @State var showsChatSetup = false
     @State private var historyLimit = ChatView.historyPage
     @State var showsConfiguration = false
-    @State var inboxDetailID: String?
-    @State var inboxGroup: InboxRelatedGroup?
+    @State var showsInbox = false
     @State var openedAgentContactID: String?
     @Environment(\.dynamicTypeSize) var dynamicTypeSize
     @ScaledMetric(relativeTo: .footnote) private var sessionTabWidth: CGFloat = 156
     @FocusState var composerIsFocused: Bool
-    @State var scrollScheduler = ChatScrollScheduler()
-    @State var lastScrollAt = Date.distantPast
-    @State var autoFollowChat = true
-    var showLatestButton: Bool { !autoFollowChat }
+    @State var transcript = MobileTranscriptHandle()
+    var showLatestButton: Bool { !transcript.isAtEnd }
     @State var dismissedSyncError: String?
     @State var showsSyncConnection = false
     @State var selectedPhotoItems: [PhotosPickerItem] = []
@@ -55,7 +52,6 @@ struct ChatView: View {
     @State private var closingPinnedSessionIDs: Set<String> = []
     /// Dictation belongs to its keyed session; switching ends and discards it.
     @State var dictationSessionKey: String?
-    /// Send was tapped while dictating: the send happens when the words land.
     @State var sendWhenDictationLands = false
 
     let maxPendingPhotos = 4
@@ -73,8 +69,7 @@ struct ChatView: View {
         )
     }
 
-    /// An explicitly opened history thread gets a temporary, non-closable
-    /// tab beside main. Opening history never changes the Mac's pin list.
+    /// History gets a temporary nonclosable tab; opening history must not change Mac-owned pins.
     private var anchorSession: ChatSession? {
         guard let selectedID = store.selectedSessionID,
               selectedID != effectiveMainSessionID,
@@ -82,16 +77,13 @@ struct ChatView: View {
         return sync.sessions.first(where: { $0.id == selectedID && $0.archived != true })
     }
 
-    /// Pin reconciliation uses the displayed IDs, including the derived anchor tab.
     var visiblePinnedSessionIDs: Set<String> {
         var ids = Set(sync.sessionNavigation?.rows.map { $0.session.id } ?? [])
         if let anchorSession { ids.insert(anchorSession.id) }
         return ids
     }
 
-    /// History is User's own conversations that have something in them, newest
-    /// first, a page (the Mac's ⌘K count) at a time behind "Show older".
-    /// The engine's working-conversation classification owns bridge filtering.
+    /// Use the engine's working-conversation classification for history filtering; page the user's populated conversations newest first.
     private var historySessions: [ChatSession] {
         let shown = sync.sessions.filter { session in
             return session.archived != true && session.id != effectiveMainSessionID
@@ -128,7 +120,7 @@ struct ChatView: View {
 
     var body: some View {
         chatBody
-            // Versions and rows in the published transcript both count as delivery.
+            // Both version evidence and published rows count as transcript delivery.
             .onChange(of: sync.chatTranscripts) { _, _ in
                 applyPublishedTranscriptToVisibleSession()
             }
@@ -138,7 +130,6 @@ struct ChatView: View {
             .onChange(of: sync.pinnedChatSessions) { _, _ in
                 reconcilePublishedChatSessions()
             }
-            // Main follows the conversation User is in, including while already open.
             .onChange(of: sync.chatAnchor) { _, _ in
                 adoptMainSessionFromSnapshots()
             }
@@ -201,8 +192,7 @@ struct ChatView: View {
                         .opacity(store.isSwitchingSession && !selected ? 0.55 : 1)
                         .accessibilityLabel(tab.title)
 
-                        // Real pins only. The derived anchor tab has no pin to
-                        // remove, so it gets no close control.
+                        // Derived anchor tabs have no real pin to remove, so they cannot expose a close control.
                         if let sessionID = tab.closableSessionID {
                             Button {
                                 closePinnedChatSession(sessionID)
@@ -242,11 +232,11 @@ struct ChatView: View {
         return clean.isEmpty ? fallback : clean
     }
 
-    /// Hold a notification's conversation until the current session load finishes.
+    /// Hold notification navigation until the current session load finishes so the two switches cannot race.
     func consumeNotifiedChatSessionIfNeeded() {
         guard !store.isSwitchingSession, let sessionID = notifiedSessionID else { return }
         notifiedSessionID = nil
-        // Record the choice before skipping a redundant session load.
+        // Record explicit choice even when its session is already loaded.
         if sessionID == effectiveMainSessionID {
             MobileChatSelectionIntent.followMain()
         } else {
@@ -267,9 +257,9 @@ struct ChatView: View {
         guard !store.isSwitchingSession,
               !hasComposerDraft || isInitialBinding,
               !composerIsFocused || afterClearingDraft || isInitialBinding,
-              !isInitialBinding || (!store.isLoading && !store.pendingExchanges.values.contains { $0.sessionID == store.selectedSessionID && $0.request != nil }),
-              // Switching cancels the send task. Keep accepted drafts here
-              // until their exact-session handoff has crossed the transport.
+              !isInitialBinding || (!store.isLoading && !store.pendingExchanges.values.contains { $0.sessionID == store.selectedSessionID
+                  && $0.request != nil }),
+              // Session switches cancel sends; retain accepted drafts until their exact-session handoff crosses transport.
               !store.queuedSends.contains(where: {
                   $0.sessionID == store.selectedSessionID
                       && (!isInitialBinding || $0.preparedMessage != nil || $0.placeholderID != nil)
@@ -293,7 +283,6 @@ struct ChatView: View {
     }
 
     private func applyPublishedTranscriptToVisibleSession() {
-        // Ingestion already updated the shared rows; settle the pending exchange.
         let sessionID = store.selectedSessionID ?? effectiveMainSessionID
         store.applyMacTranscriptRead(sync.transcriptRead(for: sessionID), sessionID: sessionID)
     }
@@ -312,7 +301,7 @@ struct ChatView: View {
     }
 
     private func selectChatSessionTab(_ tab: ChatSessionTab) {
-        autoFollowChat = true
+        followEnd()
         switch tab.kind {
         case .main:
             MobileChatSelectionIntent.followMain()
@@ -331,7 +320,6 @@ struct ChatView: View {
             defer { closingPinnedSessionIDs.remove(sessionID) }
             do {
                 _ = try await sync.unpinChatSession(sessionId: sessionID)
-                // Render the navigation published by the Mac owner after its receipt.
                 await sync.refreshChatSessionListSnapshot()
                 if store.selectedSessionID == sessionID {
                     MobileChatSelectionIntent.followMain()
@@ -341,8 +329,7 @@ struct ChatView: View {
                     )
                 }
             } catch SyncError.responseUnconfirmed {
-                // The retained action and published navigation remain the
-                // owners. An expired wait never submits the unpin again.
+                // An expired unpin wait must not resubmit; retained action evidence and published navigation remain authoritative.
                 store.errorBanner = "Closing this tab is unconfirmed. Waiting for your Mac's updated tabs."
             } catch {
                 store.errorBanner = "Couldn't close that tab: \(error.localizedDescription)"
@@ -352,8 +339,6 @@ struct ChatView: View {
 
     // MARK: - Chat actions
 
-    /// One glass control for everything the chat can do besides talk: a new
-    /// conversation, another answer, spoken replies and the options sheet.
     var chatActionsMenu: some View {
         Menu {
             Menu("History", systemImage: "clock") {
@@ -378,7 +363,7 @@ struct ChatView: View {
             }
             .disabled(store.isSwitchingSession)
 
-            // New chat stays available during a turn; the store cancels its local send and releases loading.
+            // Keep New chat available during work; the store owns local send cancellation and composer release.
             Button {
                 store.startNewSession()
             } label: {
@@ -386,7 +371,6 @@ struct ChatView: View {
             }
             .disabled(store.isSwitchingSession)
 
-            // No reply yet, nothing to answer again: no dead item.
             if store.messages.contains(where: { $0.role == .assistant }) {
                 Button {
                     store.regenerateLast(client: bridgeClient, controls: runtimeControls)

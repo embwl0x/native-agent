@@ -1,9 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `KnowledgeGraph+Disclosure.swift` | `KnowledgeGraphMemoryDisclosure`: graph source references checked against canonical memory disclosure for a requested audience |
+// Blueprint: | `KnowledgeGraph+Disclosure.swift` | `KnowledgeGraphMemoryDisclosure`: source-backed audience checks |
 
-/// Graph metadata names its source; MemoryV2 alone decides whether that source
-/// may reach the audience. This value is scoped to a single read operation.
+/// Graph metadata names its source; MemoryV2 alone decides whether that source may reach the audience. This value is scoped to a single read operation.
 public struct KnowledgeGraphMemoryDisclosure: Sendable {
     private let memoryIDs: Set<String>
     private let factIDs: Set<String>
@@ -28,8 +27,7 @@ public struct KnowledgeGraphMemoryDisclosure: Sendable {
         if case .string(let id)? = object["id"], id.hasPrefix("memfact_") {
             return factIDs.contains(id)
         }
-        // The shared primary-user identity is profile-backed. Its facts and
-        // relationships still need their own permitted memory source above.
+        // The shared primary-user identity is profile-backed. Its facts and relationships still need their own permitted memory source above.
         if object["id"]?.stringValue != nil,
            object["type"]?.stringValue == "person",
            object["role"]?.stringValue == "primary_user" {

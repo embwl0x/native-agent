@@ -4,11 +4,9 @@ import JavaScriptCore
 import Senses
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Persistent sense/resident-part contexts with fresh frozen input per call; exact-source turn leases retain evaluated bodies and report actual body reuse; rehearsal resets context/body/input references; run/face results settle thenables in the JSC API microtask drain, rejecting pending Promises; fresh projection helpers, shared Swift fragment-redaction binding and SenseWire validation, JSC execution watchdog with ProgramProgressWindow arithmetic |
+// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Resident JSC contexts, exact-source turn leases and bounded execution |
 
-/// One program per helper. Resident parts retain their context; rehearsal
-/// passes create fresh contexts in that helper. All kinds use the same
-/// exception latch, host exchange and JSC watchdog.
+/// Resident programs retain context; rehearsal needs a fresh realm. Both share the exception latch, exchange and watchdog.
 final class JavaScriptProgramRuntime {
     private typealias ShouldTerminate = @convention(c) (JSContextRef?, UnsafeMutableRawPointer?) -> Bool
     private typealias SetTimeLimit = @convention(c) (JSContextGroupRef, Double, ShouldTerminate?, UnsafeMutableRawPointer?) -> Void
@@ -21,8 +19,7 @@ final class JavaScriptProgramRuntime {
         guard let context, let cell, let setTimeLimit = JavaScriptProgramRuntime.setTimeLimit,
               let group = JSContextGetGroup(JSContextGetGlobalContext(context)) else { return true }
         let progress = Unmanaged<ProgressWindow>.fromOpaque(cell).takeUnretainedValue()
-        // Flush a trailing accepted advance even when JS has stopped calling
-        // the bridge, so coalescing cannot shorten the runner's stall window.
+        // Flush trailing progress so bridge coalescing cannot shorten the runner's stall window.
         do { try progress.flush() } catch { progress.forwardFailure = error; return true }
         if !progress.awaitingReply, ContinuousClock.now >= progress.window.deadline { return true }
         setTimeLimit(group, 0.25, JavaScriptProgramRuntime.expired, cell)
@@ -166,10 +163,7 @@ final class JavaScriptProgramRuntime {
         }
         let input: [String: Any]
         if entryType == "changed" {
-            // The SDK conversion is used for the change argument as well.
-            // read() returns the supplied change without an app round trip.
-            // File Uint8Array construction belongs to the SDK; source.read()
-            // consumes the exact current material.
+            // Use the SDK's change/Uint8Array conversion so read() consumes the supplied material without an app round trip.
             let converted = context.evaluateScript("sense.source.read()")
             try checkException()
             guard let converted else { throw failure("bad_input", "Missing changed material.") }
@@ -183,7 +177,16 @@ final class JavaScriptProgramRuntime {
         try finish(result)
     }
 
-    private func createContext(sdk: String, inputJSON: String?, kind: OwnedProgram.Kind, part: Bool = false, home: String? = nil, workspace: String? = nil, dataRoot: String? = nil, measurementSystem: String? = nil) throws -> JSContext {
+    private func createContext(
+        sdk: String,
+        inputJSON: String?,
+        kind: OwnedProgram.Kind,
+        part: Bool = false,
+        home: String? = nil,
+        workspace: String? = nil,
+        dataRoot: String? = nil,
+        measurementSystem: String? = nil
+    ) throws -> JSContext {
         guard let setTimeLimit = Self.setTimeLimit, Self.clearTimeLimit != nil else {
             throw failure("unsupported", "JavaScript execution time limits are unavailable.")
         }
@@ -209,7 +212,9 @@ final class JavaScriptProgramRuntime {
             }
             created.setObject(say, forKeyedSubscript: "__log" as NSString)
             if part {
-                guard let home, let workspace, let dataRoot, let measurementSystem else { throw failure("bad_input", "An ability requires its home, workspace, data paths and measurement system from the app.") }
+                guard let home, let workspace, let dataRoot, let measurementSystem else {
+                    throw failure("bad_input", "An ability requires its home, workspace, data paths and measurement system from the app.")
+                }
                 created.setObject(home, forKeyedSubscript: "__home" as NSString)
                 created.setObject(workspace, forKeyedSubscript: "__workspace" as NSString)
                 created.setObject(dataRoot, forKeyedSubscript: "__dataRoot" as NSString)
@@ -221,10 +226,7 @@ final class JavaScriptProgramRuntime {
         let result = created.evaluateScript(sdk, withSourceURL: URL(string: kind == .sense ? "sense-sdk.js" : "app-prelude.js"))
         if inputJSON != nil { updateInput = result }
         if kind != .sense, thrown == nil {
-            // A plain value is the result as it stands. A thenable gets both
-            // handlers inside the same API call as the entry: JSC drains its
-            // microtasks as that call returns to Swift, so the state read
-            // afterwards holds the settled value or error.
+            // Attach thenable handlers in the entry API call so JSC's return-time microtask drain settles the value before Swift reads it.
             callProgram = created.evaluateScript("""
                 (function (resolve) {
                   return function (entry, args) {
@@ -246,14 +248,13 @@ final class JavaScriptProgramRuntime {
                 })(Promise.resolve.bind(Promise))
                 """)
         }
-        for name in ["__senseCall", "__senseRedactText", "__call", "__log", "__input", "__home", "__workspace", "__dataRoot", "__measurementSystem"] { created.globalObject.deleteProperty(name) }
+        for name in ["__senseCall", "__senseRedactText", "__call", "__log", "__input", "__home", "__workspace", "__dataRoot",
+            "__measurementSystem"] { created.globalObject.deleteProperty(name) }
         return created
     }
 
     private func runProgram(_ program: OwnedProgram, message: [String: Any]) throws {
-        // Rehearsals reset their realm; live resident turn leases keep the
-        // opened exact-source program. Every call still replaces frozen input.
-        // The app supplies this flag; the exact program identity was checked above.
+        // Reset rehearsal realms; retain validated exact-source live leases while replacing frozen input on every call.
         if message["freshContext"] as? Bool == true {
             if let context, let group = JSContextGetGroup(context.jsGlobalContextRef) { Self.clearTimeLimit?(group) }
             body = nil; callProgram = nil; updateInput = nil; thrown = nil; context = nil
@@ -270,8 +271,21 @@ final class JavaScriptProgramRuntime {
         let sdk = OwnedProgramRunner.prelude(ids: names, strict: program.isStrict,
                                             input: inputJSON != nil, primitives: program.isPart, turn: program.kind == .turn)
         let fresh = context == nil
-        if fresh { _ = try createContext(sdk: sdk, inputJSON: inputJSON, kind: program.kind, part: program.isPart, home: message["home"] as? String, workspace: message["workspace"] as? String, dataRoot: message["dataRoot"] as? String, measurementSystem: message["measurementSystem"] as? String) }
-        guard let context, let group = JSContextGetGroup(context.jsGlobalContextRef), let setTimeLimit = Self.setTimeLimit else { throw failure("unsupported", "JavaScript context is unavailable.") }
+        if fresh {
+            _ = try createContext(
+                sdk: sdk,
+                inputJSON: inputJSON,
+                kind: program.kind,
+                part: program.isPart,
+                home: message["home"] as? String,
+                workspace: message["workspace"] as? String,
+                dataRoot: message["dataRoot"] as? String,
+                measurementSystem: message["measurementSystem"] as? String
+            )
+        }
+        guard let context, let group = JSContextGetGroup(context.jsGlobalContextRef), let setTimeLimit = Self.setTimeLimit else {
+            throw failure("unsupported", "JavaScript context is unavailable.")
+        }
         setTimeLimit(group, 0.25, Self.expired, progressCell)
         defer { Self.clearTimeLimit?(group) }
         if !fresh, let inputJSON { updateInput?.call(withArguments: [inputJSON]) }
@@ -414,7 +428,7 @@ final class JavaScriptProgramRuntime {
                 if let supplied = initialMaterial, requestedAddress == address {
                     value = supplied
                     if entryProgress.read(address: requestedAddress) {
-                        // The app validates this address against the snapshot it supplied.
+                        // The app validates addresses against the supplied snapshot.
                         try io.send(["id": id, "type": "progress",
                                      "readAddress": requestedAddress.map { $0 as Any } ?? NSNull()])
                         try progress.record()
@@ -433,7 +447,9 @@ final class JavaScriptProgramRuntime {
                 }
                 subscribed = true; value = NSNull()
             case "publish":
-                guard case .object(let page) = JSONValue(fromFoundation: body["page"] ?? NSNull()) else { throw failure("bad_output", "Sense publish requires a page.") }
+                guard case .object(let page) = JSONValue(fromFoundation: body["page"] ?? NSNull()) else {
+                    throw failure("bad_output", "Sense publish requires a page.")
+                }
                 let decoded = try SenseWire.decodePage(page, corner: record.corner)
                 try SenseWire.validatePage(decoded,
                     textError: "Sense page requires an address and at most 40,000 text bytes.")
@@ -447,8 +463,7 @@ final class JavaScriptProgramRuntime {
                 body["news"] = try jsonObject(news)
                 try io.send(body); try progress.record(); value = NSNull()
             case "progress":
-                // No argument means one completed unit; explicit values must
-                // advance the entry's high-water mark. Repeats are inert.
+                // Only increasing explicit progress advances the high-water mark; an omitted argument completes one unit.
                 let n: Double? = body["n"] is NSNull ? nil : (body["n"] as? Double ?? .nan)
                 if let mark = try entryProgress.advance(to: n) { try progress.record(mark: mark) }
                 value = NSNull()
@@ -467,7 +482,8 @@ final class JavaScriptProgramRuntime {
                     throw failure("bad_output", "Sense state requires a key of 1–256 bytes.")
                 }
                 if type == "state_set" {
-                    guard let value = body["value"], try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]).count <= SenseWire.stateValueBytes else {
+                    guard let value = body["value"],
+                        try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]).count <= SenseWire.stateValueBytes else {
                         throw failure("bad_output", "Sense state values must be JSON of at most 16 KiB.")
                     }
                 }
@@ -484,13 +500,13 @@ final class JavaScriptProgramRuntime {
         } catch {
             let failed = (error as? SenseFailure) ?? failure("bad_output", error.localizedDescription)
             latched = failed
-            return (try? jsonString(["failure": ["code": failed.code, "message": failed.message]])) ?? "{\"failure\":{\"code\":\"bad_output\",\"message\":\"Sense bridge failed.\"}}"
+            return (try? jsonString(["failure": ["code": failed.code, "message": failed.message]]))
+                ?? "{\"failure\":{\"code\":\"bad_output\",\"message\":\"Sense bridge failed.\"}}"
         }
     }
 
     private func exchange(_ body: [String: Any], replyType: String) throws -> [String: Any] {
-        // App-owned work may keep progressing while JS is blocked. Exclude
-        // that wait without granting progress to state traffic or repeated reads.
+        // Exclude blocked app work from stall time without counting state traffic or repeated reads as progress.
         progress.suspendForReply()
         defer { progress.resumeAfterReply() }
         try io.send(body)

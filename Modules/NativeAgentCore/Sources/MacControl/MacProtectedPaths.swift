@@ -24,21 +24,14 @@ import ApplicationServices
 import UserNotifications
 #endif
 
-// Blueprint: | `MacProtectedPaths.swift` | `MacControlSensitivePathFence`: protected data paths and the shared OS/store mutation floor, including protected parents; reads and copy sources keep their scope |
+// Blueprint: | `MacProtectedPaths.swift` | `MacControlSensitivePathFence`: Protect data, OS/store mutation and parent paths without widening read fences |
 
 // MARK: - Sensitive-path fence
 
-/// Returns the first refusal, or nil when allowed. Trust file policy is separate.
-///
-/// **TOCTOU residual**: the fence resolves the symlink chain once at check
-/// time, but Foundation does not expose O_NOFOLLOW open semantics so an
-/// attacker who can race a symlink swap BETWEEN the fence's resolution and
-/// the FileManager call can still bypass the check. Callers shrink the
-/// window by re-resolving + re-fencing immediately before the syscall
-/// (see `handleFileRead` / `handleFileList`), but the gap is not closed.
-/// Swift owns this fence; the residual race above remains.
+/// Foundation lacks O_NOFOLLOW semantics here, so a symlink swap between fencing and FileManager remains a TOCTOU risk. Callers re-resolve and re-fence
+/// immediately before syscalls to shrink, but not close, that window; Trust policy is separate.
 public enum MacControlSensitivePathFence {
-    /// Protected files relative to the app's data root, never global basenames.
+    /// Scope protected files to the app data root rather than global basenames.
     public static let bannedDataRootFiles: [String] = [
         "config.json",
         "trust_policy.json",
@@ -60,7 +53,6 @@ public enum MacControlSensitivePathFence {
         "mcp/servers.json",
     ]
 
-    /// Directory prefixes (relative to $HOME) that are NEVER touched.
     public static let bannedHomePrefixes: [String] = [
         ".config/claude-bridge",
         InstallPaths.current.bridgeConfigRelativePath + "/claude-bridge",
@@ -86,7 +78,6 @@ public enum MacControlSensitivePathFence {
         "Pictures/Photos Library.photoslibrary",
     ]
 
-    /// Protected paths relative to the resolved NativeAgent data roots.
     public static let bannedDataRootSegments: [[String]] = [
         ["oauth"],
         ["oauth_tokens"],
@@ -104,14 +95,11 @@ public enum MacControlSensitivePathFence {
         ["codex_child_home"],
         ["senses", "ledger"],
         ["senses", "news"],
-        // The model key lives beside its own logs, so the fence names the
-        // file rather than the directory.
+        // Fence the model key file rather than its directory so neighboring logs remain accessible.
         ["jev", "credential.json"],
     ]
 
-    /// Non-bypassable OS mutation floor. Full Mac grants broad user-space
-    /// access, but it must not authorize mutation of the operating system,
-    /// launch services, or app bundles.
+    /// Full Mac grants user-space access, never mutation of OS files, launch services or app bundles.
     public static let protectedSystemMutationPrefixes: [String] = [
         "/System",
         "/bin",
@@ -133,12 +121,11 @@ public enum MacControlSensitivePathFence {
         "/var/root",
     ]
 
-    /// Protected paths use PersistenceCore.defaultDataRoot()'s process-stable selection.
+    /// Use PersistenceCore’s process-stable data-root selection for every fence.
     private static var swiftDataRootPath: String {
         PersistenceCore.defaultDataRoot().path
     }
 
-    /// Returns nil when path is allowed, or a rejection reason string.
     public static func reason(forPath rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "empty path" }
@@ -209,7 +196,7 @@ public enum MacControlSensitivePathFence {
             }
             let root = normalizedPath(rootRaw)
             if let relative = NativeAgentWorkspaceRoot.relativePath(target, under: root), !relative.isEmpty {
-                // A local backup's payload (backups/<id>/data/…) is the data root again: what is fenced there is fenced in it.
+                // Backup payloads contain another data root and must preserve the same protected paths.
                 if let payload = relative.range(of: "^backups/[^/]+/data/", options: .regularExpression),
                    let reason = checkSingle(path: root + "/" + relative[payload.upperBound...], includingProtectedDescendants: includingProtectedDescendants) {
                     return reason

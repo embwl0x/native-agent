@@ -1,7 +1,6 @@
-// Blueprint: | `PhoneMacControlAction.swift` | Executable phone Mac-control methods and native paths shared by mobile senders and Mac dispatch, including the current system-volume envelope |
+// Blueprint: | `PhoneMacControlAction.swift` | Phone Mac-control routes with native executors; Trust admission stays separate |
 
-/// Route support, independent of Trust admission. Only methods with a native
-/// executor belong here; saving a policy switch cannot supply an executor.
+/// Route support, independent of Trust admission. Only methods with a native executor belong here; saving a policy switch cannot supply an executor.
 public enum PhoneMacControlAction: String, Sendable {
     case appleScript = "runAppleScript"
     case spotlight = "runSpotlight"

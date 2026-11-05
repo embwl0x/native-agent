@@ -13,7 +13,7 @@ import Privacy
 
 extension Parts {
     /// A current seed needs no admission work. Changed bundle bytes land kept and on.
-    package func bundledSeed(_ seed: AbilityStore.File) async throws -> AbilityStore.File? {
+    package func bundledSeed(_ seed: AbilityStore.File, invocation: Invocation) async throws -> AbilityStore.File? {
         let record = seed.record.filter { !["kind", "version"].contains($0.key) }
         guard case .string(let description)? = record["description"], !description.isEmpty else {
             throw PartError.invalid("Seed \(seed.id) needs a description in its record. Fix the bundled seed and relaunch.")
@@ -28,10 +28,10 @@ extension Parts {
         let candidate = try OwnedProgramStore.Candidate(
             program: OwnedProgram(kind: .part, id: seed.id, version: "seed", source: seed.body, entry: .run,
                 schema: schema, dependencies: actions, permissions: permissions, resident: seed.part["resident"] == .bool(true)),
-            manifest: .object(manifest), fixtures: .array([]), dependencyShapes: try dependencyShapes(actions), prior: .null)
+            manifest: .object(manifest), fixtures: .array([]), dependencyShapes: try dependencyShapes(actions, invocation: invocation), prior: .null)
         let version: Int64 = if case .int(let value)? = seed.metadata["version"] { value } else { 1 }
         guard try !store.isCurrentSeed(candidate, version: version) else { return nil }
-        try checkDependencies(candidate)
+        try checkDependencies(candidate, invocation: invocation)
         let signer = SwiftNativeManifestSigner(dataRoot: root)
         let key = try await signer.loadOrCreateSigningKey()
         var file = try store.bundledSeed(candidate, version: version, key: key)

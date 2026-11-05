@@ -1,10 +1,8 @@
 import Foundation
 
-// Blueprint: | `ContextFeedback.swift` | `ContextFeedbackReducer`: deterministic rebuildable utility and use-reachability projection from explicit-bucket feedback and canonical seeds |
+// Blueprint: | `ContextFeedback.swift` | `ContextFeedbackReducer`: rebuildable utility and use reachability |
 
-// FC7 feedback is deliberately a pure, rebuildable projection. This file has
-// no persistence or owning-system dependencies: authority/privacy arrive from
-// canonical sources, and durable learning can leave Context only as a proposal.
+// Feedback is rebuildable: canonical sources supply authority/privacy, and durable learning leaves Context only as a proposal.
 
 public enum ContextCorrectionEffect: String, Codable, Sendable {
     case confirms
@@ -19,7 +17,7 @@ public enum ContextTurnOutcome: String, Codable, Sendable {
 }
 
 public enum ContextFeedbackSignal: Codable, Equatable, Sendable {
-    /// Historical wire name: emitted once at confirmed delivery, not preparation.
+    /// Emitted once at confirmed delivery, never at preparation.
     case selection
     case expansion
     case correction(ContextCorrectionEffect)
@@ -27,8 +25,7 @@ public enum ContextFeedbackSignal: Codable, Equatable, Sendable {
     case outcome(ContextTurnOutcome)
 }
 
-/// A turn-time observation. Time is an explicit bucket rather than a wall-clock
-/// read so the same canonical seed and event log always rebuild the same state.
+/// Explicit time buckets make the same canonical seed and event log rebuild the same state.
 public struct ContextFeedbackEvent: Codable, Equatable, Sendable {
     public let id: String
     public let atomIDs: [ContextAtomID]
@@ -59,7 +56,6 @@ public struct ContextFeedbackEvent: Codable, Equatable, Sendable {
 
 }
 
-/// Canonical scoring inputs rebuilt from the current generation.
 public struct ContextFeedbackSeed: Codable, Equatable, Sendable {
     public let atomID: ContextAtomID
     public let baseUtility: Double
@@ -97,7 +93,7 @@ private struct ContextFeedbackConfiguration: Sendable {
     public let decayRetentionPerBucket: Double = 0.997
     /// Buckets are five minutes (`ContextPreparation.feedbackTimeBucket`).
     public let bucketsPerDay: Double = 288
-    /// ACT-R's base-level decay (Anderson & Schooler 1991; d near 0.5).
+    /// ACT-R base-level decay uses an exponent near 0.5.
     public let useDecay: Double = 0.5
 }
 
@@ -106,10 +102,7 @@ public struct ContextFeedbackAtomState: Equatable, Sendable {
     public let utility: Double
     public let temporaryActivation: Double
     public let decay: Double
-    /// How reachable her history of use keeps it, 0...1: the power-law sum
-    /// over its uses (each served turn, and its creation), Σ age_days^-0.5,
-    /// read as odds of need, odds / (1 + odds). Recent, frequent and spaced
-    /// use keep it high; disuse lets it fade, never to zero, never deleted.
+    /// Power-law use history maps odds of need to odds / (1 + odds): recent, frequent and spaced use sustain reachability; disuse never deletes it.
     public let reachability: Double
 }
 
@@ -130,9 +123,7 @@ public enum ContextFeedbackError: Error, Equatable, Sendable {
     case elapsedOverflow(ContextAtomID)
 }
 
-/// Deterministic FC7 utility reducer. Expansion contributes only to the
-/// separately capped retrieval component. Corrections, retries, and
-/// outcomes affect the bounded outcome component and temporary activation.
+/// Expansion affects only capped retrieval utility; corrections, retries and outcomes affect bounded outcome utility and temporary activation.
 public struct ContextFeedbackReducer: Sendable {
     private let configuration = ContextFeedbackConfiguration()
 
@@ -151,8 +142,7 @@ public struct ContextFeedbackReducer: Sendable {
             working[seed.atomID] = MutableState(seed: seed, configuration: configuration)
         }
 
-        // SQLite supplies append sequence. Keep it within a bucket: IDs are
-        // digests and cannot tell which turn most recently served a memory.
+        // Preserve SQLite append order within a bucket: digest IDs cannot identify the most recent use.
         let ordered = events.enumerated().sorted {
             if $0.element.timeBucket != $1.element.timeBucket { return $0.element.timeBucket < $1.element.timeBucket }
             return $0.offset < $1.offset
@@ -201,7 +191,6 @@ private extension ContextFeedbackReducer {
         var temporaryActivation: Double
         var decay: Double
         var lastTimeBucket: Int64?
-        /// Buckets of its uses: creation, then every turn that served it.
         var uses: [Int64]
 
         init(seed: ContextFeedbackSeed, configuration: ContextFeedbackConfiguration) {

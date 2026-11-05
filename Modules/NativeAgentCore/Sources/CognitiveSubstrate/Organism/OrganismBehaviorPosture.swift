@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `OrganismBehaviorPosture.swift` | `OrganismBehaviorPosture`: typed evidence decisions, optimism thresholds and operational directives; default posture renders nothing |
+// Blueprint: | `OrganismBehaviorPosture.swift` | `OrganismBehaviorPosture`: typed evidence, optimism bounds and directives |
 
 public enum OrganismClaimDiscipline: String, Codable, Sendable, Equatable, CaseIterable {
     case normal
@@ -18,7 +18,7 @@ public enum OrganismToolStrategy: String, Codable, Sendable, Equatable, CaseIter
     case lightweightOnly
 }
 
-/// Diagnostics stay normal; body pressure does not budget her work.
+/// Diagnostics stay normal; body pressure does not budget the agent's work.
 public enum OrganismLoopBudget: String, Codable, Sendable, Equatable, CaseIterable {
     case normal
 }
@@ -101,7 +101,8 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         if bodySchema.approvalRequiresPause {
             return "approval-bound"
         }
-        if bodySchema.providerPathRequiresCaution || bodySchema.toolPathRequiresCaution || predictionSummary.strategyCaution >= 0.18 || chemicalState.vigilance >= 0.24 {
+        if bodySchema.providerPathRequiresCaution || bodySchema.toolPathRequiresCaution || predictionSummary.strategyCaution >= 0.18
+            || chemicalState.vigilance >= 0.24 {
             return "careful"
         }
         if bodySchema.notificationRequiresReceipt {
@@ -201,11 +202,9 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
 
 /// Only confident, current typed beliefs license optimism; this gate can only move posture toward caution.
 public enum BodyBeliefOptimism {
-    /// Domain metrics use the same thresholds that derive provider health.
-    /// Past this the read disagrees with itself or rests on too little support.
+    /// Domain metrics use the same thresholds that derive provider health. Past this the read disagrees with itself or rests on too little support.
     public static let maximumOptimisticUncertainty = 0.55
-    /// Below this the newest evidence has decayed past meaning — the projector's
-    /// `.stale` cutoff.
+    /// Below this the newest evidence has decayed past meaning — the projector's `.stale` cutoff.
     public static let minimumOptimisticFreshness = 0.05
     /// Configuration alone (estimate 0.6) never proves exercised capability.
     public static let minimumOptimisticEstimate = 0.65
@@ -231,15 +230,14 @@ public enum BodyBeliefOptimism {
 }
 
 public extension BodySchema {
-    /// Typed evidence decides posture; compatibility bits apply only when absent.
+    /// Typed evidence governs posture; only absent typed reads admit the bounded Boolean projection.
     var providerPathRequiresCaution: Bool {
         guard providersAvailable else { return true }
         guard let belief = providerPathBelief else { return !providersHealthy }
         return belief.state != .healthy
     }
 
-    /// Unavailable or unknown categories require caution; unproven or stale
-    /// capability withholds optimism through `toolPathIsUnprovenOrStale`.
+    /// Unavailable or unknown categories require caution; unproven or stale capability withholds optimism through `toolPathIsUnprovenOrStale`.
     var toolPathRequiresCaution: Bool {
         guard let reading = toolCapabilityReading else { return !toolHandsAvailable }
         switch reading.category {

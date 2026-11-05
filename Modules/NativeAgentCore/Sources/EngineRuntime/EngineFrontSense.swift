@@ -8,7 +8,7 @@ import PersistenceCore
 import Senses
 import TrustCenter
 
-// Blueprint: | `EngineFrontSense.swift` | One engine workspace activation observer and cancellable 120-second stable-front check; app names only, once per app/local day in mind/front-posted.json; checked activity-model or Full Mac admission, mandatory/default/user exclusions, canonical person presence, console/lock and motor provenance checked before crossing mac:front; stop cancels and joins admitted work without touching activity capture policy |
+// Blueprint: | `EngineFrontSense.swift` | Bounded stable-front perception with presence, policy and provenance gates |
 
 @MainActor
 final class EngineFrontSense {
@@ -43,7 +43,7 @@ final class EngineFrontSense {
         guard !ActivityPolicy.defaultExcludedBundleIDs.contains(bundle),
               !ActivityPolicy.alwaysExcludedBundleIDs.contains(bundle) else { return false }
         let fullMac = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
-            origin: SecurityOriginContext(surface: "native_actions", source: "mac:front"))
+            origin: SecurityOriginContext(surface: "native_actions", source: "mac:front"), turn: nil)
         let policy = try ActivityPolicyStore(dataRoot: dataRoot).loadChecked()
         guard !policy.isExcluded(bundleID: bundle), policy.allowModelAccess || fullMac.admitted,
               !NativeAgentMotorEpoch.isAgentDriven(), MacPersonInput.presence()?.here == true else { return false }
@@ -78,7 +78,7 @@ final class EngineFrontSense {
                 catch CocoaError.fileReadNoSuchFile { posted = Posted(day: day, bundles: []) }
                 if posted.day != day { posted = Posted(day: day, bundles: []) }
                 guard posted.bundles.insert(bundle).inserted else { return }
-                let line = HerScreen.names(dataRoot).person + " is working in " + name + "."
+                let line = AgentScreen.names(dataRoot).person + " is working in " + name + "."
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONEncoder().encode(posted), to: path)
                 _ = await crossing.cross(line, watch: "mac:front", reason: "what is in front of the person",
                                          id: "mac:front:" + bundle + ":" + day, says: line, agent: nil)

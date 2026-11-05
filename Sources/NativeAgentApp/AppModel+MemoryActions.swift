@@ -3,7 +3,6 @@ import NativeAgentShared
 import EngineRuntime
 // Blueprint: | `AppModel+MemoryActions.swift` | `AppModel`: `pinMemory`, `deleteMemory` |
 
-/// The row editor's claim about a pin change: made, or failed and why.
 enum MemoryRowEditorPinOutcome: Equatable {
     case applied(pinned: Bool)
     case failed(String)
@@ -43,7 +42,7 @@ extension AppModel {
         }
     }
 
-    /// False when the memory is still there; `statusText` says why.
+    /// False means the memory remains; statusText retains the cause.
     @MainActor
     func deleteMemory(_ memory: MemoryV2.MemoryRecord) async -> Bool {
         do {

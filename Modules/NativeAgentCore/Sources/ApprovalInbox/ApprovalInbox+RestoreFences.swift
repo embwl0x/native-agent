@@ -2,13 +2,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ApprovalInbox+RestoreFences.swift` | `SwiftNativeApprovalInbox.mergeRestoreFences`: pre-owner restore merge of monotonic spends, resolutions and continuation facts, with unreadable-piece receipts |
+// Blueprint: | `ApprovalInbox+RestoreFences.swift` | `SwiftNativeApprovalInbox.mergeRestoreFences`; Monotonic restore merge. |
 
 extension SwiftNativeApprovalInbox {
-    /// Pre-owner restore merge for monotonic approval facts. This is invoked
-    /// before the app constructs ApprovalInbox, so there is no live writer to
-    /// coordinate with. An unreadable piece is omitted with a receipt; it never
-    /// prevents installing the backup or suppresses another readable piece.
+    /// Merge before constructing the inbox to avoid live writers; receipt unreadable pieces without blocking readable siblings.
     public nonisolated static func mergeRestoreFences(
         safetyRoot: URL,
         destinationRoot: URL
@@ -108,8 +105,7 @@ extension SwiftNativeApprovalInbox {
                   targetObject["payload"] == safetyObject["payload"] else {
                 return "restore fence id \(id) refers to different approval payloads"
             }
-            // Resolution, execution and continuation facts only move forward.
-            // Descriptive payload/title bytes still come from the selected backup.
+            // Resolution, execution and continuation facts only move forward. Descriptive payload/title bytes still come from the selected backup.
             for key in [
                 "status", "decision", "resolvedAt", "decidedBy",
                 "resolutionProvenance", "executedAction", "detail",

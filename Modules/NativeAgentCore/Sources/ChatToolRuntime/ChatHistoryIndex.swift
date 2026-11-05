@@ -6,27 +6,16 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 import ToolRegistry
-// Blueprint: | `ChatHistoryIndex.swift` | SQLite-owned content-addressed history; on-demand rows and receipts, semantics-versioned cancellable absorption, transactional manifest reference reclamation and read-only timestamp/door owner activity for rhythm using the Telegram owner's checked identity supplied through CognitionHost |
+import TurnTrace
+// Blueprint: | `ChatHistoryIndex.swift` | Content hashes deduplicate reads; SQLite owns cold rows and receipts. |
 
-/// One durable index per history. Every transcript line is projected for
-/// search once in its life and kept by the hash of its bytes, so a line that
-/// moves to the archive, is copied into a compaction backup, or survives a
-/// rewrite (a finished reply replacing its partial) is never parsed again. A
-/// file that only grew is read past what was absorbed; any other change
-/// rehashes its lines, which costs a read, and parses only lines never seen.
-/// The turn that writes a transcript absorbs it and launch absorbs whatever
-/// changed while she was away, so a read never replays history.
-///
-/// Derived and rebuildable: chat/index can be dropped at the cost of one
-/// rebuild. SQLite owns cold rows, receipts and manifests; reads materialize
-/// only the requested transcript. Storage failures surface to the reader.
-/// SQLite/WAL/SHM are excluded from backup, export and phone sync; PrivacyMap: chat.
+/// Content hashes prevent reparsing transcript lines copied, archived or rewritten; append-only files read only new bytes. Writes and launch absorb changes so
+/// reads need not replay history. The index is derived and rebuildable; SQLite owns cold rows, receipts and manifests, and readers materialize only the
+/// requested transcript. Storage failures remain visible. SQLite/WAL/SHM stay outside backup/export/phone sync; PrivacyMap: chat.
 public final class ChatHistoryIndex: @unchecked Sendable {
-    /// Bump only when row, receipt redaction or provenance semantics change.
-    /// Old build identities are upgraded once; unrelated builds keep valid rows.
+    /// Bump projection semantics only for row, redaction or provenance changes; unrelated builds must retain valid rows.
     static let projector = "history-projection-3"
 
-    /// The stored table shapes; bump when the tables below change.
     static let schema = 3
 
     public static func shared(dataRoot: URL) -> ChatHistoryIndex {
@@ -39,7 +28,6 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         return index
     }
 
-    /// The writer's call: absorb a transcript it just committed, behind it.
     public static func absorb(_ file: URL, dataRoot: URL) {
         let index = shared(dataRoot: dataRoot)
         Task.detached(priority: .utility) {
@@ -49,9 +37,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         }
     }
 
-    /// Launch: absorb every transcript (the first launch with this index
-    /// builds it, later launches read only what changed). Returns lines
-    /// parsed and seconds taken.
+    /// Launch absorbs only changed transcripts after initial indexing.
     public func absorbAll() async -> (files: Int, parsed: Int, seconds: Double) {
         let started = Date()
         let listed: [(String, URL)]
@@ -59,14 +45,13 @@ public final class ChatHistoryIndex: @unchecked Sendable {
             listed = try ChatSessionRetention.transcriptFiles(
                 dataRoot: dataRoot, archived: ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot))
         } catch {
-            OrganPulse.record("history_index", .skipped, note: "transcripts unlisted: \(error.localizedDescription)")
+            OrganPulse.record("history_index", .failed, note: "transcripts unlisted: \(error.localizedDescription)")
             return (0, 0, 0)
         }
         let before = parsedCount()
         do {
             try pruneMissingFiles()
-            // One utility task leaves cores available to interaction. Projection
-            // batches check cancellation; each transcript yields to other work.
+            // One utility task leaves cores available to interaction. Projection batches check cancellation; each transcript yields to other work.
             for (_, file) in listed {
                 try Task.checkCancellation()
                 do { _ = try lines(at: file, current: true) }
@@ -88,8 +73,8 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
     // MARK: - Reading
 
-    /// Rhythm reads only timestamps and doors from the canonical index, never words.
-    /// Content-addressed copies and repeated message ids contribute one observation.
+    /// Rhythm reads only timestamps and doors from the canonical index, never words. Content-addressed copies and repeated message ids contribute one
+    /// observation.
     public func ownerActivity(since: Date, until: Date, telegramOwnerUserId: Int64?) throws -> [(at: Date, door: String)] {
         let path = dataRoot.appendingPathComponent("chat/index/history.sqlite")
         guard FileManager.default.fileExists(atPath: path.path) else { return [] }
@@ -115,26 +100,22 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         }
     }
 
-    /// One conversation line as history holds it: who said it, when, the
-    /// stored words. For the one reader outside the tool lane, the reading of
-    /// her recent life into cares.
+    /// Cares read stored conversation words and attribution from the canonical index.
     public struct LivedLine: Sendable {
         public let conversation: String
         public let role: String
         public let messageId: String?
-        /// The turn's run: a reply and the message it answers share it.
+        /// Share run identity between each reply and the message it answers.
         public let runId: String?
         public let at: Date
         public let words: String
         public let author: String?
         public let peer: String?
-        /// The writer marked it machinery, not something said.
+        /// Exclude writer-stamped machinery from lived conversation.
         public let mechanical: Bool
     }
 
-    /// Every user and assistant line since `since`, from every transcript and
-    /// its archived copies, in file order per transcript. A line kept in both
-    /// a transcript and an archive copy comes back once.
+    /// Deduplicate retained transcript/archive copies while preserving each transcript's file order.
     public func livedLines(since: Date) throws -> [LivedLine] {
         let listed = try ChatSessionRetention.transcriptFiles(
             dataRoot: dataRoot, archived: ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot))
@@ -152,16 +133,13 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         return out
     }
 
-    /// The rows of one transcript, in file order, with the receipt lane on
-    /// tool rows when asked. Throws when the file cannot be read as UTF-8.
+    /// Preserve transcript file order; unavailable UTF-8 must throw instead of fabricating history.
     func rows(at file: URL, receipts: Bool) throws -> [ChatHistorySearchRow] {
         absorption.lock()
         defer { absorption.unlock() }
         return try materialize(lines(at: file), receipts: receipts)
     }
 
-    /// The transcript's line hashes, absorbing whatever changed since last read;
-    /// `current` also upgrades rows with older projection semantics.
     private func lines(at file: URL, current: Bool = true) throws -> [Data] {
         absorption.lock()
         defer { absorption.unlock() }
@@ -176,7 +154,6 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         let previous = try manifest(path)
         let older = try current && previous.map { try known($0.lines, current: true).count != Set($0.lines).count } == true
         if let previous, previous.stamp == Stamp(info), !older { return previous.lines }
-        // Changed: read what the open file's own stamp describes.
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
         guard fstat(handle.fileDescriptor, &info) == 0 else { throw CocoaError(.fileReadUnknown) }
@@ -186,8 +163,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
     // MARK: - Absorbing
 
     private func absorb(_ handle: FileHandle, path: String, stamp: Stamp, previous: Manifest?, current: Bool) throws -> [Data] {
-        // Writers append or replace atomically (a new inode), so the same
-        // inode at no smaller size only grew past what was absorbed.
+        // Writers append or replace atomically (a new inode), so the same inode at no smaller size only grew past what was absorbed.
         let grew = previous.map { $0.stamp.inode == stamp.inode && stamp.size >= $0.stamp.size } ?? false
         let start = grew ? previous!.absorbed : 0
         try handle.seek(toOffset: UInt64(start))
@@ -220,19 +196,23 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         for batch in stride(from: 0, to: unseen.count, by: 64) {
             var projected: [Data: ChatHistorySearchRow] = [:]
             var receipts: [Data: Receipt] = [:]
-            try AppActionBinding.withCatalog {
-                for (hash, bytes) in unseen[batch..<min(batch + 64, unseen.count)] where !known.contains(hash) && projected[hash] == nil {
-                    try Task.checkCancellation()
-                    guard let line = String(data: bytes, encoding: .utf8) else {
-                        throw CocoaError(.fileReadInapplicableStringEncoding)
-                    }
-                    let (row, receipt) = SwiftToolDispatcher.chatHistorySearchRow(line)
-                    projected[hash] = row
-                    if let receipt { receipts[hash] = try Receipt(receipt) }
+            // One checked catalog belongs to this batch, including lookup misses.
+            // Persisted rows have no live turn; none is invented for projection.
+            let catalog = try AppActionBinding.policyCatalog(turn: nil)
+            TurnTraceBus.fireFromContext(kind: "history.projection.catalog", payload: .object([
+                "bindings": .int(Int64(catalog.count)),
+                "batchRows": .int(Int64(min(64, unseen.count - batch))),
+            ]), turn: nil)
+            for (hash, bytes) in unseen[batch..<min(batch + 64, unseen.count)] where !known.contains(hash) && projected[hash] == nil {
+                try Task.checkCancellation()
+                guard let line = String(data: bytes, encoding: .utf8) else {
+                    throw CocoaError(.fileReadInapplicableStringEncoding)
                 }
+                let (row, receipt) = SwiftToolDispatcher.chatHistorySearchRow(line, catalog: catalog)
+                projected[hash] = row
+                if let receipt { receipts[hash] = try Receipt(receipt) }
             }
-            // Commit each bounded batch. Cancellation preserves completed work;
-            // its path holds the hashes until the final manifest replaces them.
+            // Commit each bounded batch. Cancellation preserves completed work; its path holds the hashes until the final manifest replaces them.
             try store(path: path, manifest: nil, projected: projected, receipts: receipts)
             known.formUnion(projected.keys)
         }
@@ -247,7 +227,9 @@ public final class ChatHistoryIndex: @unchecked Sendable {
             for start in stride(from: 0, to: lines.count, by: 256) {
                 let hashes = Array(lines[start..<min(start + 256, lines.count)])
                 let marks = Array(repeating: "?", count: hashes.count).joined(separator: ",")
-                let receiptColumns = receipts ? ", r.content AS receipt_content, r.searchable AS receipt_searchable, r.instant AS receipt_instant, r.peer AS receipt_peer" : ""
+                let receiptColumns = receipts ? """
+                    , r.content AS receipt_content, r.searchable AS receipt_searchable, r.instant AS receipt_instant, r.peer AS receipt_peer
+                    """ : ""
                 let join = receipts ? " LEFT JOIN receipt r ON r.hash = l.hash" : ""
                 for line in try Row.fetchAll(db, sql: "SELECT l.*\(receiptColumns) FROM line l\(join) WHERE l.hash IN (\(marks))",
                                              arguments: StatementArguments(hashes)) {
@@ -294,13 +276,12 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
     private struct Manifest {
         var stamp: Stamp
-        /// Bytes through the last newline; `terminated` lines end there.
         var absorbed: Int
         var terminated: Int
         var lines: [Data]
     }
 
-    /// A tool row's receipt lane, compressed: it is read only by receipt searches.
+    /// Keep receipt payloads compressed and lazy so ordinary history reads do not load tool evidence.
     private struct Receipt {
         var content: Data
         var searchable: String?
@@ -337,8 +318,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
     private let dataRoot: URL
     private let lock = NSLock()
-    /// Serial absorption keeps one transcript's projection in flight, and a
-    /// manifest/row read cannot race reference reclamation by another writer.
+    /// Serial absorption keeps one transcript's projection in flight, and a manifest/row read cannot race reference reclamation by another writer.
     private let absorption = NSRecursiveLock()
     private var parsed = 0
     private var storeError: String?
@@ -448,10 +428,10 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         lock.lock()
         storeError = error.localizedDescription
         lock.unlock()
-        OrganPulse.record("history_index", .skipped, note: "not durable: \(error.localizedDescription)")
+        OrganPulse.record("history_index", .failed, note: "not durable: \(error.localizedDescription)")
     }
 
-    /// Open only the store. No transcript payload is retained by this owner.
+    /// Keep transcript payloads out of the durable store owner.
     private func openDatabase() throws -> DatabaseQueue {
         lock.lock()
         defer { lock.unlock() }
@@ -501,7 +481,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
                        arguments: [hash, hash])
     }
 
-    /// Check manifests without loading any row or receipt body.
+    /// Manifest checks must not load row or receipt bodies.
     private func pruneMissingFiles() throws {
         absorption.lock()
         defer { absorption.unlock() }

@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import ChatSessionWork
 import ToolRegistry
 import NativeAgentCore
@@ -11,18 +12,17 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
 import DreamREMCycle
-// Blueprint: | `SwiftToolDispatcher+PersonaTools.swift` | `SwiftToolDispatcher`: persona read/write tools; introspection separates durable bundle/build/data-root identity from launch ids and names the surface/model/effort route and context-budget owners; get-persona-document truncates at a valid UTF-8 scalar boundary within its 64 KiB source cap |
+// Blueprint: | `SwiftToolDispatcher+PersonaTools.swift` | `SwiftToolDispatcher`; persona writes; build and route owners |
 
 // MARK: - Persona and runtime introspection tools
 
 extension SwiftToolDispatcher {
     private static let personaDocMaxBytes = 64 * 1024
 
-    func impl_get_persona_doc(input: [String: JSONValue]) async throws -> JSONValue {
+    func impl_get_persona_doc(turn: Turn, input: [String: JSONValue]) async throws -> JSONValue {
         let doc = try requireString(input, input["doc"] == nil && input["kind"] != nil ? "kind" : "doc")
-        // Reject path-traversal characters.
+        // Reject traversal so a document name cannot escape the persona root.
         if doc.contains("/") || doc.contains("..") || doc.hasPrefix(".") {
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: invalid persona doc name '\(doc)'"
@@ -31,19 +31,20 @@ extension SwiftToolDispatcher {
         let docName = doc.hasSuffix(".md") ? doc : "\(doc).md"
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         let result = PersonaSystemActions.personaRead([:],
-            ConnectorActionContext(repoRoot: rootForRead, dataRoot: dataRoot, personaRoot: personaRoot),
+            ConnectorActionContext(repoRoot: rootForRead, dataRoot: dataRoot, personaRoot: personaRoot, turn: turn),
             selectedDocument: personaRoot.appendingPathComponent(docName))
+        let reply = ToolResult(result)
         guard case .object(let fields) = result else {
             throw ToolFailureError("Persona reader returned an invalid response.", effects: .none)
         }
         guard case .string(let text)? = fields["content"] else {
-            throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: " + (fields["error"]?.stringValue ?? "Persona document read failed."))
+            let error = if case .string? = fields["error"] { reply.failure ?? "" } else { "Persona document read failed." }
+            throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: " + error)
         }
         let bytes = Data(text.utf8)
         if bytes.count > Self.personaDocMaxBytes {
             var head = bytes.prefix(Self.personaDocMaxBytes)
-            // The whole document is valid UTF-8; only the final scalar may
-            // straddle this cap. Remove its incomplete bytes, never the cap.
+            // The whole document is valid UTF-8; only the final scalar may straddle this cap. Remove its incomplete bytes, never the cap.
             while !head.isEmpty, String(data: head, encoding: .utf8) == nil { head.removeLast() }
             let headText = String(decoding: head, as: UTF8.self)
             return .string(headText + "\n... [truncated, \(bytes.count) bytes total]")
@@ -51,13 +52,14 @@ extension SwiftToolDispatcher {
         return .string(text)
     }
 
-    func impl_persona_read(input: [String: JSONValue]) async throws -> JSONValue {
+    func impl_persona_read(turn: Turn, input: [String: JSONValue]) async throws -> JSONValue {
         let kind = try requireString(input, "kind")
         let result = PersonaSystemActions.personaRead(["kind": .string(kind)],
             ConnectorActionContext(repoRoot: rootForRead, dataRoot: dataRoot,
-                                   personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)))
+                                   personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot), turn: turn))
+        let reply = ToolResult(result)
         if case .object(let fields) = result, fields["ok"] == .bool(false) {
-            let error = fields["error"]?.stringValue ?? ""
+            let error = if case .string? = fields["error"] { reply.failure ?? "" } else { "" }
             if fields["error_code"] == .string("bad_input") {
                 throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher persona_read " + error)
             }
@@ -74,20 +76,14 @@ extension SwiftToolDispatcher {
         let kind = try requireString(input, "kind")
         let content = try requireString(input, "content")
         let engine = SwiftNativePersonaEngine(root: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot), dataRoot: dataRoot)
-        // GROWTH keeps the lines REM approved, graduated standing lessons among
-        // them (a 10-09 rewrite silently dropped some). One goes only when
-        // `retire` names it with a reason; it is then tombstoned, as a REM deny
-        // is, and the pins follow.
+        // Approved GROWTH lessons leave only through explicit retirement with a reason, tombstone and pin update.
         var retire: [String: String] = [:]
         if case .object(let named)? = input["retire"] {
             for case let (line, .string(why)) in named where !why.trimmingCharacters(in: .whitespaces).isEmpty {
                 retire[line.trimmingCharacters(in: .whitespacesAndNewlines)] = why
             }
         }
-        // Read under GROWTH's own lock, the one REM's writer appends under, so
-        // a lesson published mid-rewrite is in this read or lands after this
-        // write. Strict: an unreadable history refuses rather than reading as
-        // "nothing to protect".
+        // Hold the REM writer’s GROWTH lock across read/write so concurrent lessons cannot be dropped; unreadable history refuses.
         let store = REMProposalStore(dataRoot: dataRoot)
         let keeping: @Sendable (String) throws -> Void = { [retire] current in
             let rows: [REMProposalRow]
@@ -139,8 +135,7 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// The REM lessons standing in a GROWTH body: approved, or appended by an
-    /// approval whose flip has not landed yet. A denied one never stands.
+    /// The REM lessons standing in a GROWTH body: approved, or appended by an approval whose flip has not landed yet. A denied one never stands.
     static func remLines(_ rows: [REMProposalRow], in body: String) -> [String] {
         rows.filter { $0.status != "denied" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
             .map { $0.proposalText.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -166,13 +161,13 @@ extension SwiftToolDispatcher {
         }
     }
 
-    func impl_agent_introspect(input: [String: JSONValue]) async throws -> JSONValue {
+    func impl_agent_introspect(turn: Turn, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let sessionId = ChatToolSessionInjection.explicitSessionId(in: input)
         let fullDetail = (input["detail"]?.stringValue ?? "compact")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "full"
         let pid = ProcessInfo.processInfo.processIdentifier
-        let provider = await Self.providerStamp(dataRoot: dataRoot)
+        let provider = await Self.providerStamp(turn: turn, dataRoot: dataRoot)
         let runtimeInstanceID = "swift-native-\(pid)"
         var response: [String: JSONValue] = [
             "status": .string("ok"),
@@ -194,13 +189,20 @@ extension SwiftToolDispatcher {
                 "runtime_instance_id": .string(runtimeInstanceID), "process_id": .int(Int64(pid)),
                 "note": .string("These ids identify this running process only and change on relaunch; they are not your durable identity."),
             ]),
-            "tool_state": .string("app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots and outcome population health"),
+            "tool_state": .string("""
+                app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots and outcome \
+                population health
+                """),
         ]
         if case .object(let stamp) = provider, case .string(let model)? = stamp["model"] {
-            var window = try await ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
-                forModel: model, providerID: stamp["name"]?.stringValue, dataRoot: dataRoot)
+            var window = try await ContextWindowPolicy.readout(
+                forModel: model, providerID: stamp["name"]?.stringValue, dataRoot: dataRoot,
+                call: LLMCall(turn: turn, surface: turn.runtime?.surface ?? "chat", purpose: "agent.introspect"))
             window["route"] = .object(stamp.filter { ["name", "model", "surface", "reasoning_effort", "source"].contains($0.key) })
-            window["owner"] = .string("The surface's provider/model/effort route selects the model. ProviderRouting's verified model catalog supplies its native window; Settings > Context window and ChatSessionAutocompactionConfig set the effective history budget. Effort is reported as routing context, not a separate window multiplier.")
+            window["owner"] = .string("""
+                The surface's provider/model/effort route selects the model. ProviderRouting's verified model catalog supplies its native \
+                default window. Effort is routing context, not a separate window multiplier.
+                """)
             response["context_window"] = .object(window)
         }
         if !sessionId.isEmpty {
@@ -208,11 +210,11 @@ extension SwiftToolDispatcher {
         }
         guard fullDetail else { return .object(response) }
 
-        let catalog = try await catalogSnapshot(includeSchemas: false)
+        let catalog = try await catalogSnapshot(turn: turn, includeSchemas: false, surface: surface)
         let availableTools = Set(catalog.names.filter { !Self.isModelHidden($0) })
         let modelVisibleAvailableTools = Self.modelVisibleCatalogToolNames(availableTools)
         let activeTools = Self.alwaysOnCoreNames
-            .union(LLMCallContext.turnActiveTools ?? [])
+            .union(turn.offeredTools ?? [])
             .intersection(modelVisibleAvailableTools)
             .sorted()
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
@@ -248,13 +250,8 @@ extension SwiftToolDispatcher {
         return .object(response)
     }
 
-    /// Which binary is answering this turn, independent of this launch's ids.
-    ///
-    /// Reads `NativeAgentBuildIdentity`, the SAME type the local bridge's
-    /// `buildIdentity` payload reports, so an in-turn answer and an
-    /// out-of-band bridge read can never name different binaries.
-    /// `exactSourceRevision` is null on a dirty or unstamped build: absence is
-    /// the honest answer, never a bare `sourceRevision` promoted to proof.
+    /// Share NativeAgentBuildIdentity with the bridge so both reads identify the same binary. A dirty or unstamped build has no exactSourceRevision;
+    /// sourceRevision alone cannot prove it.
     static func buildStamp(identity: NativeAgentBuildIdentity) -> JSONValue {
         .object([
             "version": identity.unavailableReason == nil ? .string(identity.version) : .null,
@@ -266,29 +263,22 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    /// The provider+model actually generating the current turn (live), or the
-    /// surface's configured model when introspect runs outside a turn. Answers
-    /// Agent's "which model is running me right now" — the live turn model can
-    /// differ from the configured one on a per-turn override. `source` tells the
-    /// agent which it got: live_turn / configured / unresolved.
-    static func providerStamp(dataRoot: URL) async -> JSONValue {
+    /// A per-turn override can differ from configured routing; source distinguishes live_turn, configured and unresolved.
+    static func providerStamp(turn: Turn?, dataRoot: URL) async -> JSONValue {
         let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
-        if let turn = ChatTurnRuntimeContext.current,
-           !turn.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Report the exact transport admitted with this turn. Model-family
-            // inference cannot distinguish API-key, OAuth-direct, Codex, or an
-            // OpenRouter route serving the same upstream model.
+        if let runtime = turn?.runtime,
+           !runtime.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Report admitted transport directly; the same model can arrive through API-key, OAuth, bridge or router paths.
             return .object([
-                "name": turn.providerID.map(JSONValue.string) ?? .null,
-                "model": .string(turn.model),
-                "surface": .string(turn.surface),
-                "reasoning_effort": LLMCallContext.reasoningEffort.map(JSONValue.string) ?? .null,
-                "source": .string(turn.providerID == nil ? "unavailable" : "live_turn"),
-                "error": turn.providerID == nil ? .string("The admitted turn provider identity is unavailable; repair the turn context producer.") : .null,
+                "name": runtime.providerID.map(JSONValue.string) ?? .null,
+                "model": .string(runtime.model),
+                "surface": .string(runtime.surface),
+                "reasoning_effort": (turn?.admission?.reasoningEffort).map(JSONValue.string) ?? .null,
+                "source": .string(runtime.providerID == nil ? "unavailable" : "live_turn"),
+                "error": runtime.providerID == nil ? .string("The admitted turn provider identity is unavailable; repair the turn context producer.") : .null,
             ])
         }
-        // Outside a turn there is no turn model in play; report the chat-surface
-        // configured model as the best available answer.
+        // Without a live turn, only the chat surface’s configured model can be reported.
         do {
             let snapshot = try await router.checkedRoutingSnapshot()
             guard let pref = ProviderRoutingSurfaceLookup.value(snapshot.preferences, "chat"), !pref.model.isEmpty else {

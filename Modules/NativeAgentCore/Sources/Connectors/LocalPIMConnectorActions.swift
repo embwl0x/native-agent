@@ -7,7 +7,7 @@ import PersistenceCore
 import Privacy
 import MacIntegration
 import ToolExecution
-// Blueprint: | `LocalPIMConnectorActions.swift` | Shared EventKit authorization facts, checked query booleans and argument refusals for Calendar and Reminders |
+// Blueprint: | `LocalPIMConnectorActions.swift` | Shared EventKit grants, checked query flags and Calendar/Reminders refusals |
 
 @MainActor
 public enum LocalPIMConnectorActions {
@@ -20,7 +20,7 @@ public enum LocalPIMConnectorActions {
         }
     }
 
-    /// The executor's parsers, without constructing a store or requesting access.
+    /// Pure parsing must not construct a store or prompt for access.
     public static func argumentRefusal(tool: String, input: [String: JSONValue]) -> JSONValue? {
         do throws(CalendarArgumentError) {
             switch tool {
@@ -37,7 +37,6 @@ public enum LocalPIMConnectorActions {
         }
     }
 
-    /// Render the already-read OS grant shared by the engine's permission pages.
     public static func authorizationStatusPayload(localId: String, wizardStatus: String) -> [String: JSONValue] {
         let state: String = switch wizardStatus {
         case "granted", "authorized": "ready"
@@ -69,7 +68,6 @@ public enum LocalPIMConnectorActions {
             if let epoch = TimeInterval(trimmed) {
                 return Date(timeIntervalSince1970: epoch)
             }
-            // A local time without a zone, or a bare day (midnight local).
             let local = DateFormatter()
             local.locale = Locale(identifier: "en_US_POSIX")
             local.timeZone = .current
@@ -122,9 +120,10 @@ public enum LocalPIMConnectorActions {
         }
     }
 
-    static func permissionEnvelope(actionId: String, source: String, status: String, mode: InlineInteraction.AccessMode? = nil) -> JSONValue {
-        // A skill never opens a macOS prompt or asks for a grant: it hands back to her.
-        if SkillRunContext.handsBack { return SkillRunContext.handBack("macOS \(source.capitalized) permission") }
+    static func permissionEnvelope(actionId: String, source: String, status: String, mode: InlineInteraction.AccessMode? = nil,
+                                   handsBack: Bool) -> JSONValue {
+        // A skill never opens a macOS prompt or asks for a grant: it hands back to the agent.
+        if handsBack { return SkillRunContext.handBack("macOS \(source.capitalized) permission") }
         let message = "NativeAgent needs \(source.capitalized). Allow it on the permission card."
         return .object([
             "status": .string("needs_permission"),

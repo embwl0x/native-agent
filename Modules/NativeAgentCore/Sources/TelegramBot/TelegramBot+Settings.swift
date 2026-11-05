@@ -1,10 +1,7 @@
 import Foundation
 // Blueprint: | `TelegramBot+Settings.swift` | Mobile operation prerequisites delegate saved field validation to `TelegramConfig.validateSavedConfiguration` |
 
-/// A Telegram settings mutation was rejected before it could make the saved
-/// inbound authorization narrower, wider, or unreadable by accident. Keeping
-/// this distinct from transport errors lets a mounted settings surface report
-/// a configuration failure without claiming that its save took effect.
+/// Distinguish rejected configuration mutations from transport failures so settings never claim an uncommitted save.
 public enum TelegramConfigurationError: Error, Equatable, LocalizedError, Sendable {
     case invalidAllowedChatID(String)
     case invalidAllowedUserID(String)
@@ -19,11 +16,17 @@ public enum TelegramConfigurationError: Error, Equatable, LocalizedError, Sendab
         case .invalidAllowedUserID(let value):
             return "telegram_user_id_invalid: Allowed user ID '\(value)' is not numeric. Use Check sender in Telegram setup and enter that user ID."
         case .existingConfigurationUnreadable:
-            return "telegram_settings_unreadable: Saved settings cannot be read and were not overwritten. Repair telegram/config.json before saving in Telegram setup."
+            return """
+                telegram_settings_unreadable: Saved settings cannot be read and were not overwritten. Repair telegram/config.json \
+                before saving in Telegram setup.
+                """
         case .persistenceFailed(let detail):
             return "telegram_settings_save_failed: \(detail). Inspect telegram/config.json and its directory access before saving in Telegram setup."
         case .destinationRequired:
-            return "telegram_destination_required: No allowed chat or user ID is set. Message your bot, then use Check sender in Telegram setup and add that ID."
+            return """
+                telegram_destination_required: No allowed chat or user ID is set. Message your bot, then use Check sender in \
+                Telegram setup and add that ID.
+                """
         }
     }
 }

@@ -1,4 +1,3 @@
-// Retained moment-row interpretation; current provenance belongs to MemoryDataProvenance.
 
 import Transcripts
 import Foundation
@@ -6,19 +5,16 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MemoryV2+Moments.swift` | `MemoryMoments`: retained moment-row vocabulary and recall origin; live provenance and time helpers belong to MemoryDataProvenance |
+// Blueprint: | `MemoryV2+Moments.swift` | `MemoryMoments`: moment-row classification and recall origin |
 
 // MARK: - The record's vocabulary and shared helpers
 
 public enum MemoryMoments {
-    /// Metadata `lane` AND `kind` of the retired lane's rows.
     public static let lane = "moment"
     public static let kind = "moment"
-    /// The source prefix the lane's rows carry.
     public static let sourcePrefix = "moment-promoter"
 
-    /// True when a proposal/memory row belongs to the retired lane. A row
-    /// staged before `lane` existed is identified by its kind.
+    /// Both lane and kind establish moment identity; rows without a lane still carry their kind.
     public static func isMoment(_ metadata: JSONValue?) -> Bool {
         guard case .object(let obj)? = metadata else { return false }
         if case .string(let value)? = obj["lane"] { return value == lane }
@@ -36,8 +32,7 @@ public enum MemoryMoments {
         }
     }
 
-    /// Keep the conversation seat visible without treating acceptance as proof
-    /// that the person said it. The promoter's source names the original seat.
+    /// Keep the conversation seat visible without treating acceptance as proof that the person said it. The promoter's source names the original seat.
     public static func recallOrigin(source: String?, metadata: JSONValue?, dataRoot: URL = defaultDataRoot()) -> JSONValue? {
         guard isMoment(metadata) || source?.hasPrefix("\(sourcePrefix):") == true else { return nil }
         let sourceSession = source.flatMap {
@@ -56,7 +51,7 @@ public enum MemoryMoments {
         return .object(origin)
     }
 
-    /// A row's own sentence: the lane appended its quote to the stored content.
+    /// Separate the row's own sentence from its appended evidence quote.
     public static func narration(ofStored content: String, metadata: JSONValue?) -> String {
         guard let quote = metadata?.objectValue?["quote"]?.stringValue, !quote.isEmpty else { return content }
         let suffix = " — \"\(quote)\""

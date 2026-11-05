@@ -4,7 +4,7 @@ import UIKit
 import Speech
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+ConversationEvents.swift` | Attaches the store-owned reply receiver; foreground refresh and session-bound dictation callbacks on ChatView |
+// Blueprint: | `ChatView+ConversationEvents.swift` | Store-owned reply receiver; foreground refresh and session-bound dictation callbacks |
 
 extension ChatView {
     func restoreConversation() async {
@@ -45,7 +45,6 @@ extension ChatView {
             guard !voiceInput.isListening, !voiceInput.isStarting else { return }
             voiceOutput.speak(text)
         }
-        // Every session change ends dictation at the shared switch boundary.
         store.onSessionChange = { [voiceInput, origin = $dictationSessionKey] in
             guard voiceInput.isListening || voiceInput.isStarting
                 || origin.wrappedValue != nil else { return }
@@ -101,17 +100,16 @@ extension ChatView {
         if ChatStore.visibleStore === store { ChatStore.visibleStore = nil }
     }
 
-    /// Final words and a pending one-tap send belong only to the dictated conversation.
+    /// Final dictation and a pending send belong only to the conversation that started recording.
     func dictationFinished(_: String, _ newValue: String) {
         let sendNow = sendWhenDictationLands
         sendWhenDictationLands = false
         guard !newValue.isEmpty else { return }
         guard let origin = dictationSessionKey,
               origin == store.queueSessionKey(store.selectedSessionID) else { return }
-        // A voice note is spoken words sent on release; only the text travels.
         if voiceInput.isVoiceNote, sendNow {
             if store.send(text: newValue, client: bridgeClient, controls: runtimeControls) {
-                autoFollowChat = true
+                followEnd()
                 return
             }
             store.errorBanner = "Voice note kept in the draft. Reconnect and tap Send."

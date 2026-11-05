@@ -1,8 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
-// Blueprint: | `ApprovalLifecycle.swift` | `ApprovalLifecycleBus`: post-commit approval transition fan-out and host reply context; the inbox remains decision authority |
+// Blueprint: | `ApprovalLifecycle.swift` | `ApprovalLifecycleBus`; Post-commit fan-out, no decision authority. |
 
 public enum ApprovalLifecyclePhase: String, Sendable, Equatable {
     case requested
@@ -10,9 +11,7 @@ public enum ApprovalLifecyclePhase: String, Sendable, Equatable {
     case executed
 }
 
-/// A process-local edge emitted only after the canonical approval store has
-/// durably accepted a lifecycle transition. Consumers can react without
-/// watching every UI surface that happens to create or resolve approvals.
+/// Emit only after durable acceptance so consumers need no UI-specific watchers.
 public struct ApprovalLifecycleEvent: Sendable, Equatable {
     public let phase: ApprovalLifecyclePhase
     public let record: ApprovalRecord
@@ -25,13 +24,21 @@ public struct ApprovalLifecycleEvent: Sendable, Equatable {
     }
 }
 
-/// Fan-out for durable approval lifecycle edges. The inbox remains the
-/// authority; this bus carries no decisions and cannot mutate an approval.
-/// Ordinary subscribers receive every phase, including replay settlement.
+/// The inbox remains decision authority; this bus only fans out committed lifecycle edges, including replay settlement.
 public actor ApprovalLifecycleBus {
     public static let shared = ApprovalLifecycleBus()
 
-    public typealias HostContext = @Sendable (@escaping @Sendable () async throws -> JSONValue) async throws -> JSONValue
+    /// A waiting host hands over its turn and primitive dependency as values. Replay cannot restore an ambient implementation around a new dispatcher.
+    public struct HostContext: Sendable {
+        public let turn: Turn
+        public let effectOptions: AuthoredEffectOptions
+        public let effectExecutor: AuthoredEffectExecutor?
+        public init(turn: Turn, effectOptions: AuthoredEffectOptions, effectExecutor: AuthoredEffectExecutor?) {
+            self.turn = turn
+            self.effectOptions = effectOptions
+            self.effectExecutor = effectExecutor
+        }
+    }
     private var continuations: [UUID: (host: Bool, reply: AsyncStream<ApprovalLifecycleEvent>.Continuation, context: HostContext?)] = [:]
 
     public func events(forHostCall hostID: UUID? = nil, context: HostContext? = nil) -> AsyncStream<ApprovalLifecycleEvent> {

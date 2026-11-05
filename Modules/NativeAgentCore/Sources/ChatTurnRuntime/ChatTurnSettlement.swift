@@ -35,16 +35,22 @@ extension SwiftNativeChatOrchestrationClient {
             attachment.path.map { Experience.Ref(source: $0, id: attachment.id) } })
     }
 
-    /// The answer is born once, built off the reply path in its own order; a later writer (recovery, a resend) finds it born and leaves it. Its heard settles in the heard's order.
+    /// Create the answer once in reply order; recovery and redelivery preserve its birth. Settle heard records in their own order.
     static func recordAnswer(runID: String, heardID: String, evidence: Experience.Ref?, state: TurnEngineResult.TerminalState,
                              dataRoot: URL, words: String, attachments: [MultimodalAttachment],
-                             conversation: (session: String, turn: String)? = nil) async {
+                             conversation: (session: String, turn: String)? = nil, silence: String? = nil) async {
         let id = Experience.answer(run: runID)
+        let answerEvidence = silence.map { Experience.Ref(source: "silence", id: $0) } ?? evidence
         let answerWrite = ExperienceStore.record(dataRoot, id) { store in
             guard try await store.experience(id) == nil else { return }
-            var answer = Experience(id: id, kind: .answer, cause: [heardID], evidence: evidence.map { [$0] } ?? [],
-                face: face(words, attachments), addressedTo: conversation.map { ["conversation:" + $0.session] } ?? [])
-            if let conversation,
+            var answer = Experience(id: id, kind: .answer, cause: [heardID], evidence: answerEvidence.map { [$0] } ?? [],
+                face: silence == nil ? face(words, attachments) : nil,
+                addressedTo: silence == nil ? conversation.map { ["conversation:" + $0.session] } ?? [] : [])
+            if silence != nil {
+                if let conversation { answer.evidence.append(.init(source: "conversation", id: conversation.session)) }
+                answer.outcome = .init(domain: "turn", status: state.rawValue)
+            }
+            if silence == nil, let conversation,
                let checkpoint = try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: conversation.session, turnId: conversation.turn),
                let owed = checkpoint.owedDelivery(status: state.rawValue) {
                 answer.addressedTo.append(owed.to)
@@ -54,15 +60,21 @@ extension SwiftNativeChatOrchestrationClient {
         }
         let heardWrite = ExperienceStore.record(dataRoot, heardID) { store in
             guard let heard = try await store.experience(heardID) else { return }
+            if silence != nil {
+                await answerWrite.value
+                guard let answerEvidence, let answer = try await store.experience(id), answer.evidence.contains(answerEvidence) else {
+                    throw ExperienceStore.LawError.unknown(id)
+                }
+            }
             var changes: [ExperienceStore.Change] = []
             if state == .waiting { changes.append(.progress("waiting")) }
             else if heard.outcome == nil {
                 changes.append(.outcome(.init(domain: "turn", status: state.rawValue)))
             }
-            // An answer already settled (let go when the turn was interrupted) stays as it was.
+            // Already-settled answers retain their interrupted outcome.
             if heard.owes["answer"]?.phase.isSettled == false {
                 if state == .completed {
-                    changes.append(.obligation(key: "answer", phase: .accepted, evidence: evidence ?? .init(source: "experience", id: id)))
+                    changes.append(.obligation(key: "answer", phase: .accepted, evidence: answerEvidence ?? .init(source: "experience", id: id)))
                 } else if state != .waiting {
                     changes.append(.letGo(key: "answer", reason: state == .stopped ? .cancelled : .failed))
                 }
@@ -78,19 +90,21 @@ extension SwiftNativeChatOrchestrationClient {
         sessionId: String,
         surface: String,
         context: TurnContext?,
-        result: TurnEngineResult
+        result: TurnEngineResult,
+        turn: Turn
     ) -> TurnTraceEvent {
         // Slot failures include neverRan refusals. Attempt counts use ToolLoopTraceObservation.
         let failed = result.toolDispatches.filter {
-            !ChatToolOutcome.outputLooksSuccessful($0.result)
-                && !ChatToolOutcome.wasCancelled($0.result)
-                && !ChatToolOutcome.isWaitingOnPerson($0.result)
+            let reply = ToolResult($0.result)
+            return !ChatToolOutcome.outputLooksSuccessful(reply.payload, verdict: reply.outcome)
+                && reply.outcome != .cancelled
+                && !ChatToolOutcome.isWaitingOnPerson(reply.payload, verdict: reply.outcome)
         }.count
         let expansions = result.toolDispatches.filter { $0.ranCall.tool == "context_expand" }.count
-        // Discovery is `app {find}`: the rounds spent finding an action.
         let discovery = result.toolDispatches.filter {
-            $0.name == "app" && $0.input["find"] != nil && $0.input["action"] == nil
-                && !ChatToolOutcome.wasCancelled($0.result)
+            let reply = ToolResult($0.result)
+            return $0.name == "app" && $0.input["find"] != nil && $0.input["action"] == nil
+                && reply.outcome != .cancelled
         }
         let terminalReason = result.resolvedTerminalReason(dataRoot: dataRoot)
         var payload: [String: JSONValue] = [
@@ -125,14 +139,15 @@ extension SwiftNativeChatOrchestrationClient {
             kind: "turn.terminal",
             sessionId: sessionId,
             surface: surface,
-            payload: .object(payload)
+            payload: .object(payload),
+            turn: turn
         )
     }
 
-    // Record a terminal trace event when a structured turn fails.
     func turnFailedEvent(
         turnId: String, sessionId: String, surface: String, error: Error,
-        observation: ToolLoopTraceObservation? = nil
+        observation: ToolLoopTraceObservation? = nil,
+        turn: Turn
     ) -> TurnTraceEvent {
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         let terminalReason: TurnEngineResult.TerminalReason
@@ -152,13 +167,15 @@ extension SwiftNativeChatOrchestrationClient {
             kind: "turn.failed",
             sessionId: sessionId,
             surface: surface,
-            payload: .object(payload)
+            payload: .object(payload),
+            turn: turn
         )
     }
 
     func turnCancelledEvent(
         turnId: String, sessionId: String, surface: String, location: String,
-        observation: ToolLoopTraceObservation? = nil
+        observation: ToolLoopTraceObservation? = nil,
+        turn: Turn
     ) -> TurnTraceEvent {
         var payload = observation?.tracePayload ?? [:]
         payload["status"] = .string(TurnEngineResult.TerminalState.stopped.rawValue)
@@ -166,7 +183,8 @@ extension SwiftNativeChatOrchestrationClient {
         payload["where"] = .string(location)
         return TurnTraceEvent(
             turnId: turnId, kind: "turn.cancelled", sessionId: sessionId,
-            surface: surface, payload: .object(payload)
+            surface: surface, payload: .object(payload),
+            turn: turn
         )
     }
 
@@ -176,19 +194,20 @@ extension SwiftNativeChatOrchestrationClient {
         message: String, sessionId resolvedSession: String, runId: String, turnId boundTurnId: String, replyRowID: String?,
         heardID: String, model: String, reasoningEffort: String, persona: String?, surface: String,
         suppressUserAppend: Bool, chosenPaths: [String], outputMilestoneGate: TurnLifecycleFirstOutputGate,
-        noticeSink: @escaping @Sendable (String, String) async -> Void
+        noticeSink: @escaping @Sendable (String, String) async -> Void,
+        turn: Turn, work: ChatTurnWork
     ) async -> Result<StructuredChatExecution, any Error> {
         var terminal: TurnTraceEvent
         switch outcome {
         case .success(let produced):
             terminal = metacognitiveTerminalEvent(turnId: boundTurnId, sessionId: resolvedSession,
-                surface: surface, context: produced.context, result: produced.result)
+                surface: surface, context: produced.context, result: produced.result, turn: turn)
         case .failure(let error):
             terminal = error is CancellationError
                 ? turnCancelledEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
-                                     location: "structured_chat", observation: observation)
+                                     location: "structured_chat", observation: observation, turn: turn)
                 : turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
-                                  error: error, observation: observation)
+                                  error: error, observation: observation, turn: turn)
         }
         var settled: Result<StructuredChatExecution, any Error>
         var promotionStarted = false
@@ -199,54 +218,8 @@ extension SwiftNativeChatOrchestrationClient {
         let result = produced.result
         let providerCtx = produced.context
         let reply = result.reply
-        let transcriptRow = TurnSettle.transcriptRow(for: reply)
+        let transcriptRow = TurnSettle.transcriptRow(for: reply, turn: turn)
         let generatedAttachments = produced.attachments
-        // The row the surface drew this reply in, when it drew one for this turn: the answer lands in place instead of replacing it.
-        let answerID = produced.answerID
-        try await appendMessage(
-            sessionId: resolvedSession,
-            role: "assistant",
-            content: transcriptRow.text,
-            runId: runId,
-            attachments: generatedAttachments,
-            persona: persona,
-            source: surface,
-            recalledMemoryIds: result.recalledIds,
-            canonicalAssistantCompletion: true,
-            outcomeResult: result,
-            outcomeContext: providerCtx,
-            outcomeTurnID: boundTurnId,
-            mechanicalRow: transcriptRow.mechanicalRow,
-            requestedResultIntent: TurnSettle.requestedResultIntent(
-                message: message, result: result,
-                sessionID: resolvedSession, runID: runId, surface: surface,
-                resumedRequest: suppressUserAppend && (
-                    message.hasPrefix("[NativeAgent internal interaction continuation]") ||
-                    message.hasPrefix("[NativeAgent internal approval continuation]")
-                )
-            ),
-            messageId: answerID
-        )
-        // The answer is its conversation's once the transcript holds it, and owes the door the turn came from until that door accepts it: the delivery its checkpoint keeps. Its face is that row's words, redacted as the transcript's
-        // evidence is, and the artifacts she chose; built off the reply path.
-        let answerRef = Self.transcriptRef(resolvedSession, answerID)
-        let answerState = result.resolvedTerminalReason(dataRoot: dataRoot).state
-        await Self.recordAnswer(runID: runId, heardID: heardID, evidence: answerRef, state: answerState,
-            dataRoot: dataRoot, words: transcriptRow.text, attachments: generatedAttachments,
-            conversation: (resolvedSession, boundTurnId))
-        if !reply.isEmpty, await outputMilestoneGate.claim() {
-            TurnLifecycleTelemetry.emit(
-                .surfaceOutputEnqueued,
-                surface: surface,
-                sessionId: resolvedSession,
-                observedBy: "structured_stream.return",
-                turnId: boundTurnId,
-                on: turnTraceBus
-            )
-        }
-        // Settlement awaits owed recording, then releases interpretation and private work.
-        await result.afterReply?.start()
-        promotionStarted = result.afterReply?.recordsMemory == true
         var response = ChatResponse(
             runId: runId,
             model: result.modelUsed,
@@ -260,8 +233,72 @@ extension SwiftNativeChatOrchestrationClient {
             providerCallCount: result.providerCallCount,
             terminalState: result.resolvedTerminalReason(dataRoot: dataRoot).state
         )
+        let silence = response.isSilentCompletion ? boundTurnId : nil
+        if let silence, case .object(var payload) = terminal.payload {
+            response.output = ""
+            payload["silence"] = .string(silence)
+            terminal = TurnTraceEvent(turnId: terminal.turnId, ts: terminal.ts, kind: terminal.kind,
+                sessionId: terminal.sessionId, surface: terminal.surface, destinationId: terminal.destinationId,
+                threadId: terminal.threadId, payload: .object(payload), turn: nil)
+        }
+        // Keep the surface's existing reply identity so settlement updates the live row in place.
+        let answerID = produced.answerID
+        if silence == nil {
+            try await appendMessage(
+                sessionId: resolvedSession,
+                role: "assistant",
+                content: transcriptRow.text,
+                runId: runId,
+                attachments: generatedAttachments,
+                persona: persona,
+                source: ChatThreadKind.transcriptSource(surface: turn.arrivalSurface(authorizing: surface)),
+                recalledMemoryIds: result.recalledIds,
+                canonicalAssistantCompletion: true,
+                outcomeResult: result,
+                outcomeContext: providerCtx,
+                outcomeTurnID: boundTurnId,
+                mechanicalRow: transcriptRow.mechanicalRow,
+                requestedResultIntent: TurnSettle.requestedResultIntent(
+                    message: message, result: result,
+                    sessionID: resolvedSession, runID: runId, surface: surface,
+                    resumedRequest: suppressUserAppend && (
+                        message.hasPrefix("[NativeAgent internal interaction continuation]") ||
+                        message.hasPrefix("[NativeAgent internal approval continuation]")
+                    ),
+                    turn: turn),
+                messageId: answerID,
+                turn: turn)
+        }
+        // Spoken answers refer to their saved row; chosen silence refers to the turn, with nothing addressed or owed to a door.
+        let answerRef = Self.transcriptRef(resolvedSession, answerID)
+        let answerState = result.resolvedTerminalReason(dataRoot: dataRoot).state
+        await Self.recordAnswer(runID: runId, heardID: heardID, evidence: answerRef, state: answerState,
+            dataRoot: dataRoot, words: transcriptRow.text, attachments: generatedAttachments,
+            conversation: (resolvedSession, boundTurnId), silence: silence)
+        if let silence {
+            guard try Self.silentTurn(dataRoot: dataRoot, sessionId: resolvedSession, runId: runId,
+                                     turnId: boundTurnId) == silence else {
+                throw ChatOrchestrationError.underlying("The turn's chosen silence could not be saved; repair its experience record.")
+            }
+            await RepairOwed.settle(dataRoot, operation: "session.delivery:" + resolvedSession + ":" + runId,
+                                   evidence: .init(source: "silence", id: silence)).value
+        }
+        if silence == nil, !reply.isEmpty, await outputMilestoneGate.claim() {
+            TurnLifecycleTelemetry.emit(
+                .surfaceOutputEnqueued,
+                surface: surface,
+                sessionId: resolvedSession,
+                observedBy: "structured_stream.return",
+                turnId: boundTurnId,
+                on: turnTraceBus,
+                turn: turn
+            )
+        }
+        // Settlement awaits owed recording, then releases interpretation and private work.
+        await result.afterReply?.start()
+        promotionStarted = result.afterReply?.recordsMemory == true
         response.workingCommentaryCharacters = result.workingCommentaryCharacters
-        let runtimeExecution = ChatTurnExecution.current
+        let runtimeExecution = turn.execution
         if response.terminalState != .completed {
             response.runtimeStatus = runtimeExecution?.waitingForApproval == true ? "waiting for approval"
                 : runtimeExecution?.waitingForInteraction == true ? "waiting on you" : response.terminalState?.rawValue
@@ -270,15 +307,15 @@ extension SwiftNativeChatOrchestrationClient {
             : runtimeExecution?.waitingForInteraction == true
                 ? (runtimeExecution?.waitingInteraction?.title).map { "\($0) — answer it in the conversation." }
                     ?? "Waiting on your answer in the conversation."
-            : LLMCallContext.turnTokenBudget?.exhausted == true ? "Stopped at the per-run token limit." : nil
+            : turn.tokenBudget?.exhausted == true ? "Stopped at the per-run token limit." : nil
         response.statusDetail = runtimeExecution?.statusDetail(response.statusDetail)
         response.pendingApprovalID = runtimeExecution?.pendingApprovalID
         if result.terminalReason == .replyCompleted,
-           let journal = DeskContinuationScope.current,
+           let journal = work.journal,
            await journal.snapshot().runID == runId {
             do {
                 try await journal.completeResponse(JSONValue.fromEncodable(response), reply: response.output,
-                    peerSources: PeerDataTaint.current?.checkpointSources ?? [])
+                    peerSources: turn.peerSteering?.checkpointSources ?? [])
             } catch {
                 nativeLog("Saved reply; its work journal could not settle: %@", String(describing: error))
                 await noticeSink("turn_settlement_failed", "Saved the reply, but couldn't update its work record.")
@@ -287,7 +324,7 @@ extension SwiftNativeChatOrchestrationClient {
         // The saved row's own text, so the phone's transcript snapshot settles the live bubble instead of adding a second copy.
         ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId,
                          response.runtimeStatus.map { .incomplete(transcriptRow.text, status: $0) }
-                             ?? .answered(transcriptRow.text))
+                             ?? .answered(silence == nil ? transcriptRow.text : ""))
         execution = StructuredChatExecution(response: response, turn: .success(result))
         case .failure(let error):
             let cancelled = error is CancellationError
@@ -296,21 +333,22 @@ extension SwiftNativeChatOrchestrationClient {
                 from: observation.toolDispatches, chosen: chosenPaths, dataRoot: dataRoot)
             let saved = try await persistPartialIfNeeded(
                 sessionId: resolvedSession, runId: runId, text: partial, attachments: attachments,
-                cancelled: cancelled, failure: error, source: surface, outcomeContext: context,
-                // The partial is the reply's own row: the id its live bubble was born with.
-                replyRowID: replyRowID, onNotice: noticeSink)
+                cancelled: cancelled, failure: error, source: ChatThreadKind.transcriptSource(surface: turn.arrivalSurface(authorizing: surface)),
+                outcomeContext: context,
+                // Save partial output under the live bubble's original identity.
+                replyRowID: replyRowID, onNotice: noticeSink, turn: turn)
             if saved == nil, !cancelled, Self.shouldPersistFailureMessage(surface: surface) {
                 try await appendFailureMessageIfNeeded(sessionId: resolvedSession, runId: runId,
                     failure: error, persona: persona, surface: surface,
-                    outcomeContext: context, outcomeTurnID: boundTurnId)
+                    outcomeContext: context, outcomeTurnID: boundTurnId, turn: turn)
             }
             var response = ChatResponse(runId: runId, model: model, reasoningEffort: reasoningEffort,
                 output: saved ?? "", sessionId: resolvedSession, attachments: saved == nil ? nil : attachments)
             response.terminalState = cancelled ? .stopped : .failed
             response.runtimeStatus = response.terminalState?.rawValue
-            response.statusDetail = LLMCallContext.turnTokenBudget?.exhausted == true ? "Stopped at the per-run token limit."
+            response.statusDetail = turn.tokenBudget?.exhausted == true ? "Stopped at the per-run token limit."
                 : cancelled ? (saved == nil ? "Stopped." : "Stopped. What was produced has been saved.") : String(describing: error)
-            response.statusDetail = ChatTurnExecution.current?.statusDetail(response.statusDetail)
+            response.statusDetail = turn.execution?.statusDetail(response.statusDetail)
             ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId,
                 cancelled ? .cancelled : .failed(ProviderFailure.report(error)?.personDescription ?? "The reply could not be completed."),
                 savedPartial: saved)
@@ -321,7 +359,7 @@ extension SwiftNativeChatOrchestrationClient {
             // A failed save is still a settled fact. Keep Stop's terminal; a completed effect whose reply could not be saved ends failed.
             if terminal.kind != "turn.cancelled" {
                 terminal = turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
-                    error: error, observation: observation)
+                    error: error, observation: observation, turn: turn)
             }
             nativeLog("Turn reply settlement failed: %@", String(describing: error))
             await noticeSink("turn_settlement_failed", "Couldn't finish saving this turn.")
@@ -346,7 +384,7 @@ extension SwiftNativeChatOrchestrationClient {
         // The accepted message owns its incoming appraisal even without a saved answer; a reply that captured a promotion already owns that appraisal.
         if !promotionStarted {
             let afterReply = await engine.deferMemoryPromotion(userMessage: message, assistantMessage: observation.partialReply,
-                toolDispatches: observation.toolDispatches, sessionId: resolvedSession, surface: surface)
+                toolDispatches: observation.toolDispatches, sessionId: resolvedSession, surface: surface, turn: turn,work: work)
             await afterReply.start()
         }
         return settled
@@ -356,7 +394,8 @@ extension SwiftNativeChatOrchestrationClient {
     static func traceFinalToolContract(
         turnId: String,
         wire: [LLMToolSchema],
-        surface: String?
+        surface: String?,
+        turn: Turn, work: ChatTurnWork
     ) {
         let ordering = SwiftToolDispatcher.canonicalToolOrder(wire.map(\.name))
         // Material bytes use the context.snapshot convention, without schema content.
@@ -376,8 +415,8 @@ extension SwiftNativeChatOrchestrationClient {
             appendedBytes: ordering.appended.reduce(0) { $0 + (bytesByName[$1] ?? 0) }
         )
         // Published for this turn so every `llm.call` row carries the same totals beside the provider's real input/cache token counts.
-        ConversationPrefixTelemetry.sink?.set(weight)
-        // Fired with the turn id in hand: this runs before the task-local turn binding opens, so the context-derived firing dropped every row.
+        work.prefixTelemetry?.set(weight)
+        // Pass the turn ID explicitly because this fires before its task-local binding exists.
         var payload: [String: JSONValue] = [
                 "tools.finalWireCount": .int(Int64(wire.count)),
                 "tools.finalFloorCount": .int(Int64(ordering.floor.count)),
@@ -385,7 +424,6 @@ extension SwiftNativeChatOrchestrationClient {
                 "tools.finalFingerprintSHA256":
                     .string(SwiftNativeTurnEngine.toolSchemaFingerprint(wire)),
                 "tools.finalNameOrderSHA256": .string(ordering.fingerprintSHA256),
-                // Schema-material bytes, not HTTP body size and not tokens.
                 "tools.finalFloorBytes": .int(Int64(weight.floorBytes)),
                 "tools.finalAppendedBytes": .int(Int64(weight.appendedBytes)),
                 "tools.finalWireBytes": .int(Int64(weight.wireBytes)),
@@ -396,9 +434,10 @@ extension SwiftNativeChatOrchestrationClient {
         TurnTraceBus.fire(TurnTraceEvent(
             turnId: turnId,
             kind: "tools.contract",
-            sessionId: LLMCallContext.sessionId,
+            sessionId: turn.session,
             surface: surface,
-            payload: .object(payload)
+            payload: .object(payload),
+            turn: turn
         ))
     }
 }

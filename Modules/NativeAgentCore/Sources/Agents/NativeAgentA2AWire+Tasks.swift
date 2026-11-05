@@ -13,7 +13,7 @@ import CoreFoundation
 import ProviderRouting
 import CryptoKit
 import SQLite3
-// Blueprint: | `NativeAgentA2AWire+Tasks.swift` | Canonical contact task projection and record-owned accepted workers; failed settlement preserves streamed prose and offsets; transmitted reply acknowledgements retain reads independently of execution outcome and route outbound evidence through AgentPeerStore.recordProof for MCP-host reply health; synchronous bridge admission closure precedes generation-ordered passive cleanup; approval/receipt observations, reply waiters/streams and push tails retire on stop, with canceled handles retained through exit; activation restores persisted owed callbacks, including terminal tasks outside live records; coalesced approval-refresh requests retain a pending pass so worker settlement and observation rearming cannot lose their wake; accepted workers and durable recovery finish independently of the listener, and explicit task cancellation remains separate; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
+// Blueprint: | `NativeAgentA2AWire+Tasks.swift` | Accepted workers retain canonical task ownership. |
 /// Retained tasks use the shared chat client; network subscribers never own a turn's lifetime.
 public actor AgentContactTasks {
     typealias Runner = @Sendable (AgentContactTurn, @escaping @Sendable (AgentContactProgress) async -> Void) async throws -> AgentContactOutcome
@@ -49,11 +49,8 @@ public actor AgentContactTasks {
     private nonisolated let bridgeAdmission = AgentContactBridgeAdmission()
     var bridgeIsActive: Bool { accepting && bridgeAdmission.isActive }
     var terminalPayloadWrites = 32
-    /// Set once the launch recovery has read every conversation's saved input.
     var launchRecovered = false
-    /// What the launch recovery found queued in a conversation, by task: its input as saved.
     var restoredInput: [String: AgentContactTurn] = [:]
-    /// Tasks whose turn the launch recovery resumes (queued, or a checkpoint).
     var resuming: Set<String> = []
     static let recovering = "Recovering after the restart"
     init(dataRoot: URL, capacity: Int = 128, runner: @escaping Runner) {
@@ -70,9 +67,8 @@ public actor AgentContactTasks {
         for delivery in pushDeliveries.values { delivery.worker.cancel() }
         for restoration in pushRestorations.values { restoration.worker.cancel() }
     }
-    /// Listener transitions are ordered even when their actor hops arrive out
-    /// of order. Stop retires passive resources; accepted turns keep their
-    /// record-owned worker and settle normally. Explicit cancel is separate.
+    /// Listener transitions are ordered even when their actor hops arrive out of order. Stop retires passive resources; accepted turns keep their record-owned
+    /// worker and settle normally. Explicit cancel is separate.
     public nonisolated func setBridgeAdmission(_ active: Bool, revision: UInt64) {
         bridgeAdmission.set(active, revision: revision)
     }
@@ -121,8 +117,7 @@ public actor AgentContactTasks {
         approvalRefresh = Task {
             defer {
                 approvalRefresh = nil
-                // An inbox read can suspend after a running worker was skipped.
-                // Keep its settlement wake, as well as a retiring observer's wake.
+                // An inbox read can suspend after a running worker was skipped. Keep its settlement wake, as well as a retiring observer's wake.
                 if bridgeIsActive, approvalRefreshPending || lifecycle != generation || approvalObservation == nil {
                     scheduleApprovalRefresh()
                 }
@@ -183,7 +178,8 @@ public actor AgentContactTasks {
                 let succeeded = approvals.allSatisfy { approval in
                     guard case .object(let receipt) = approval.executedAction else { return false }
                     if case .string(let resultClass) = receipt["resultClass"] { return resultClass == "succeeded" }
-                    return ChatToolOutcome.exactResultClass(approval.executedAction!) == .succeeded
+                    let reply = ToolResult(approval.executedAction!)
+                    return reply.outcome == .succeeded
                 }
                 finish(id, outcome: .init(state: succeeded ? .completed : .failed,
                     parts: approvals.compactMap { $0.detail.map(AgentContactPart.text) },
@@ -193,7 +189,8 @@ public actor AgentContactTasks {
             }
         }
     }
-    public func send(_ send: NativeAgentA2AWire.Send, principal: AgentBridgePrincipal, digest: String, protocolName: String = "a2a") async throws -> AgentContactTask {
+    public func send(_ send: NativeAgentA2AWire.Send, principal: AgentBridgePrincipal, digest: String,
+        protocolName: String = "a2a") async throws -> AgentContactTask {
         let pushConfig: AgentContactPushConfig?
         if let value = send.pushConfig { pushConfig = try await AgentContactPushConfig.parse(value, taskID: send.taskID) }
         else { pushConfig = nil }
@@ -217,7 +214,8 @@ public actor AgentContactTasks {
         do {
             if let continued = send.continuedTask {
                 let existing = try get(continued, owner: principal.id)
-                guard !existing.state.terminal else { throw AgentContactFailure(code: -32004, message: "This task has ended. Start a new task in the conversation.") }
+                guard !existing.state.terminal else { throw AgentContactFailure(code: -32004,
+                    message: "This task has ended. Start a new task in the conversation.") }
                 throw AgentContactFailure(code: -32004, message: "This task is still working or waiting for the person's permission card")
             } else {
                 if records.count >= capacity {
@@ -230,6 +228,7 @@ public actor AgentContactTasks {
                 var created = AgentContactTask(id: send.taskID, context: send.context, owner: principal.id,
                                                acceptedOutputModes: send.acceptedOutputModes)
                 created.lifeID = try DataRootLife.current(in: dataRoot)
+                created.job = send.job
                 if let pushConfig {
                     try pushConfig.keep()
                     created.callbacks = [pushConfig.id: pushConfig.callback]
@@ -242,8 +241,7 @@ public actor AgentContactTasks {
         records[task.id] = Record(task: task)
         if let pushConfig { pushConfigs[task.id] = [pushConfig.id: pushConfig] }
         notifyPush(task)
-        // Retain the original locator before launching work. A process exit or
-        // lost response must never authorize executing the same message again.
+        // Retain the original locator before launching work. A process exit or lost response must never authorize executing the same message again.
         if let detail = claims.recordReceipt(key: key, digest: digest, receipt: ["taskID": task.id]) {
             task.detail = detail
             try retain(task)
@@ -252,7 +250,8 @@ public actor AgentContactTasks {
         let acceptedTask = task
         let turn = AgentContactTurn(taskID: acceptedTask.id, context: acceptedTask.context, requestID: send.request,
                                     principal: principal, parts: send.parts,
-                                    bindRun: { session, run in try await self.bindRun(acceptedTask.id, session: session, run: run) })
+                                    bindRun: { session, run in try await self.bindRun(acceptedTask.id, session: session, run: run) },
+                                    job: acceptedTask.job)
         let runner = self.runner
         startWorker(acceptedTask.id) {
             try await runner(turn) { progress in await self.progress(acceptedTask.id, progress) }
@@ -292,13 +291,8 @@ public actor AgentContactTasks {
         records[id]?.worker = worker
         return worker
     }
-    /// A resumed turn settles its reply to the conversation, never to the
-    /// connection that asked: that died with the process. A route that names
-    /// a retained task (a contact's send) resumes inside it, and the worker
-    /// reads the reply back from the transcript. A caller-result route with
-    /// no task locator at all (a /claude/message turn, whose caller reads the
-    /// conversation) resumes plainly; a route that names a task it cannot
-    /// find is still a failure.
+    /// Restarted replies settle through the conversation because the original connection is gone. A named retained task must exist; locator-free caller-result
+    /// routes resume through their canonical conversation.
     public func resume(_ route: AgentBridgeCompletionRoute, runID: String,
                        operation: @escaping @Sendable () async throws -> Void) async throws {
         if route.threadId == nil, route.correlationId == nil { try await operation(); return }
@@ -320,8 +314,7 @@ public actor AgentContactTasks {
             await worker.value
         } onCancel: { worker.cancel() }
     }
-    /// Raw tool RPCs retain their receipt in the same caller-owned task store.
-    /// A repeated transport request reads the original receipt, never reruns it.
+    /// Repeated raw tool RPCs read the retained caller-owned receipt instead of rerunning effects.
     public func beginTool(context: String, request: String, principal: AgentBridgePrincipal,
                           digest: String) throws -> (task: AgentContactTask, execute: Bool) {
         guard bridgeIsActive else { throw CancellationError() }
@@ -332,7 +325,8 @@ public actor AgentContactTasks {
         switch claim {
         case .replay: return (try get(id, owner: principal.id), false)
         case .claimed: break
-        default: throw AgentContactFailure(code: -32004, message: "This request is already active or was used for different content. Read its retained result; do not resend.")
+        default: throw AgentContactFailure(code: -32004,
+            message: "This request is already active or was used for different content. Read its retained result; do not resend.")
         }
         do {
             guard records[id] == nil,
@@ -446,17 +440,16 @@ public actor AgentContactTasks {
                 task.text = task.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
                 task.detail = recovered.outcome.detail
                 task.replyRecovery = recovered.outcome.replyRecovery
+                if let result = recovered.outcome.toolResult { task.toolResult = result }
             } else if task.state.terminal {
-                // Missing payload evidence cannot change a known execution outcome.
-                // Its typed debt remains until this exact source can be read.
+                // Missing payload evidence cannot change a known execution outcome. Its typed debt remains until this exact source can be read.
             } else if let approvals = task.approvalIDs, !approvals.isEmpty {
                 task.state = .inputRequired
                 task.detail = "Waiting for the person to answer the permission card"
             } else if checkpointed {
                 task.state = .working
                 task.detail = "The interrupted turn is awaiting recovery"
-                // Only a checkpoint the launch recovery can read is resumed and holds
-                // its place; a damaged one stays owed here and gives its place up.
+                // Only a checkpoint the launch recovery can read is resumed and holds its place; a damaged one stays owed here and gives its place up.
                 if let session = task.canonicalSession, let run = task.canonicalRunID,
                    (try? SwiftNativeChatOrchestrationClient.hasResumableReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)) == true {
                     resuming.insert(id)
@@ -467,7 +460,7 @@ public actor AgentContactTasks {
                 task.detail = "Queued in the conversation behind the turn ahead of it"
                 resuming.insert(id)
             } else if !launchRecovered, task.canonicalRunID != nil {
-                // Read before the launch recovery: it decides once every saved input is read.
+                // Wait for launch recovery to read every saved input before deciding resumability.
                 task.state = .working
                 task.detail = Self.recovering
             } else {
@@ -481,8 +474,7 @@ public actor AgentContactTasks {
                 records[id] = Record(task: task)
                 order.append(id)
                 scheduleApprovalRefresh()
-                // Its place in the conversation is held by the restored backlog
-                // (TurnAdmission.restore), so it runs in the order it was said.
+                // Its place in the conversation is held by the restored backlog (TurnAdmission.restore), so it runs in the order it was said.
                 if let queued {
                     let runner = self.runner
                     startWorker(id) { try await runner(queued) { progress in await self.progress(id, progress) } }
@@ -507,17 +499,14 @@ public actor AgentContactTasks {
             try retain(completion)
         }
     }
-    /// Called only after a reply-reading door successfully transmitted the reply.
+    /// Only successful transmission through a reply-reading door acknowledges delivery.
     public func recordReplyFetch(_ task: AgentContactTask) {
         AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: task.owner, outbound: true)
         // Reading produced output is independent of how its execution ended.
         guard let session = task.canonicalSession, let run = task.canonicalRunID else { return }
         ContactReplyReads.record(dataRoot: dataRoot, session: session, request: task.id, run: run)
     }
-    /// A message a restart left queued, from its saved input (the chat owner
-    /// reads it): bound to its task and to the contact as it is now (the
-    /// runner revalidates its authority). Nil when its words or files cannot
-    /// be read back whole.
+    /// Resume queued input only when its complete words and files are readable; revalidate current contact authority.
     func queuedTurn(_ task: AgentContactTask, input: CodexCompletionTranscriptEvidence.SavedTurnInput) -> AgentContactTurn? {
         if let binding = task.bridgeInput {
             guard binding.principal.id == task.owner, let session = task.canonicalSession,
@@ -543,7 +532,7 @@ public actor AgentContactTasks {
         return AgentContactTurn(taskID: task.id, context: task.context, requestID: locator.request,
             principal: AgentBridgePrincipal(id: peer.id, peerID: peer.id, elevated: peer.elevationAllowed, displayName: peer.name),
             parts: [.text(words)] + files, bindRun: { session, run in try await self.bindRun(task.id, session: session, run: run) },
-            accepted: EnqueuedUserMessage(sessionId: session, runId: input.runId))
+            accepted: EnqueuedUserMessage(sessionId: session, runId: input.runId), job: task.job)
     }
     func bindRun(_ id: String, session: String, run: String) throws {
         guard var record = records[id], !record.task.state.terminal else { throw AgentContactFailure.missing }
@@ -596,7 +585,7 @@ public actor AgentContactTasks {
             if persistence == "cancelled" || metadata["cancelled"] as? Bool == true { state = .canceled }
             else if persistence == "failed" { state = .failed }
             else if persistence == "persisted", metadata["partial"] as? Bool != true {
-                // A turn that stopped at a card waits on the person; it did not fail.
+                // An approval-held turn awaits the person and must not be reported as failed.
                 state = metadata["completionState"] as? String == "completed" ? .completed
                     : waitingOnPerson ? .inputRequired : .failed
             } else { continue }
@@ -635,11 +624,26 @@ public actor AgentContactTasks {
                           } catch { failures.append("\(key)[\(index)]: \(error.localizedDescription)") }
                         }
                     }
+                if task.job != nil {
+                    // The job's files are in its folder, not in the saved reply.
+                    do {
+                        let made = try AgentContactJob.fileParts(taskID: task.id, dataRoot: dataRoot)
+                        parts += made.parts
+                        if made.unsent > 0 { failures.append("\(made.unsent) job file(s) could not be read or were too large") }
+                    } catch { failures.append("job files: \(error.localizedDescription)") }
+                }
                 let recovery = failures.isEmpty ? nil : AgentContactReplyRecovery(source: url.path,
-                    detail: "Saved reply files could not be recovered: \(failures.joined(separator: "; ")). Repair those files and read this task again; do not resend the work.")
+                    detail: """
+                        Saved reply files could not be recovered: \(failures.joined(separator: "; ")). Repair those files and read this task again; \
+                        do not resend the work.
+                        """)
                 replies.append(.init(state: state, parts: parts, detail: detail, replyRecovery: recovery))
         }
         guard replies.count <= 1 else { throw AgentContactFailure(code: -32603, message: "The conversation has ambiguous completion records") }
+        if replies.isEmpty, let silence = try SwiftNativeChatOrchestrationClient.silentTurn(dataRoot: dataRoot, sessionId: session, runId: run) {
+            return (.init(state: .completed, parts: [],
+                toolResult: .object(["status": .string("completed"), "silence": .string(silence)])), [])
+        }
         if let terminal = replies.first, terminal.state == .canceled {
             return (terminal, [])
         }
@@ -666,8 +670,7 @@ public actor AgentContactTasks {
         }
         return pair.stream
     }
-    /// Lists this run's bounded retained index. Cursor values are tied to the
-    /// authenticated owner and filters, and never grant access to a task.
+    /// Lists this run's bounded retained index. Cursor values are tied to the authenticated owner and filters, and never grant access to a task.
     func list(owner: String, parameters: JSONValue) throws -> JSONValue {
         guard let params = parameters.foundationObject as? [String: Any] else {
             throw AgentContactFailure(code: -32602, message: "Object params required")
@@ -735,7 +738,8 @@ public actor AgentContactTasks {
         let page = Array(remaining.prefix(pageSize))
         var next = ""
         if remaining.count > page.count, let last = page.last {
-            next = try JSONSerialization.data(withJSONObject: ["filter": fingerprint, "updated": last.updated.timeIntervalSinceReferenceDate, "id": last.id], options: [.sortedKeys]).base64EncodedString()
+            next = try JSONSerialization.data(withJSONObject: ["filter": fingerprint, "updated": last.updated.timeIntervalSinceReferenceDate,
+                "id": last.id], options: [.sortedKeys]).base64EncodedString()
         }
         let tasks = try page.map { task in
             var projected = try NativeAgentA2AWire.project(task, version: "1.0")
@@ -766,16 +770,14 @@ public actor AgentContactTasks {
         if records[id]?.rawTool == true {
             throw AgentContactFailure(code: -32002, message: "This tool call is still running and cannot be canceled through this task")
         }
-        // Only a real approval id holds the task. An inline card (connector,
-        // choice) carries none, so input-required alone left it uncancellable.
+        // Only real approval IDs hold tasks; inline choice cards cannot make input-required work uncancellable.
         if records[id]?.worker == nil, records[id]?.task.approvalIDs?.isEmpty == false {
             throw AgentContactFailure(code: -32002, message: "A permission card is waiting. The person must dismiss it before this work can be stopped.")
         }
         records[id]?.cancelling = true
         if let worker = records[id]?.worker {
             worker.cancel()
-            // The runner joins its producer before returning. Cancellation is
-            // not reported as settled while a tool can still be unwinding.
+            // The runner joins its producer before returning. Cancellation is not reported as settled while a tool can still be unwinding.
             await worker.value
         } else { finish(id, outcome: .init(state: .canceled, parts: [])) }
         return try get(id, owner: owner)
@@ -803,8 +805,7 @@ public actor AgentContactTasks {
             record.task.detail = "Waiting for the person to answer the permission card"
             event = .status(record.task, final: false)
         case .text(let delta):
-            // The live draft has a size; her turn does not. Past it the draft
-            // stops growing and the finished reply still replaces it whole.
+            // Bound streamed drafts without bounding the turn; the canonical final reply replaces them whole.
             guard record.task.text.utf8.count + delta.utf8.count <= 1_048_576 else { return }
             let append = !record.task.text.isEmpty
             record.task.text += delta
@@ -822,22 +823,28 @@ public actor AgentContactTasks {
         var recovery = outcome.replyRecovery
         var executionState = outcome.state
         var detail = outcome.detail
+        var toolResult = outcome.toolResult
         if (outcome.state == .failed || outcome.state == .canceled || record.cancelling), parts.isEmpty {
             do {
                 if let recovered = try canonicalReply(record.task) {
                     parts = recovered.outcome.parts.compactMap { $0.accepted(in: acceptedOutputModes) }
                     recovery = recovered.outcome.replyRecovery
-                    if outcome.state == .failed {
+                    if let result = recovered.outcome.toolResult { toolResult = result }
+                    if outcome.state == .failed || recovered.outcome.toolResult?.objectValue?["silence"]?.stringValue != nil {
                         executionState = recovered.outcome.state
                         detail = recovered.outcome.detail
                     }
                 }
             } catch {
                 recovery = AgentContactReplyRecovery(source: record.task.canonicalSession.map { "chat/messages/\($0).jsonl" } ?? id,
-                    detail: "The produced reply could not be read: \(error.localizedDescription). Repair its retained transcript and read this task again; do not resend the work.")
+                    detail: """
+                        The produced reply could not be read: \(error.localizedDescription). Repair its retained transcript and read this task \
+                        again; do not resend the work.
+                        """)
             }
         }
-        if outcome.state == .failed || outcome.state == .canceled || record.cancelling {
+        let silent = executionState == .completed && toolResult?.objectValue?["silence"]?.stringValue != nil
+        if !silent && (outcome.state == .failed || outcome.state == .canceled || record.cancelling) {
             // A failed turn keeps the prose already read by its peer at the same offsets.
             if !parts.contains(where: { if case .text(let text) = $0 { return !text.isEmpty }; return false }),
                !record.task.text.isEmpty,
@@ -846,16 +853,16 @@ public actor AgentContactTasks {
                 parts.insert(draft, at: 0)
             }
         }
-        if !record.task.state.terminal { record.task.state = record.cancelling ? .canceled : executionState }
+        if !record.task.state.terminal { record.task.state = record.cancelling && !silent ? .canceled : executionState }
         record.task.detail = executionState == .completed ? detail : detail ?? record.task.detail
         record.task.failure = executionState == .completed ? nil : outcome.failure
         record.task.replyRecovery = recovery
-        if let result = outcome.toolResult { record.task.toolResult = result }
+        if let toolResult { record.task.toolResult = toolResult }
         record.task.updated = Date()
         record.task.parts = parts
         record.task.text = parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
         record.worker = nil
-        // Ended before its turn was admitted: a restored place it held is let go.
+        // Unadmitted work must release its restored conversation place.
         if let session = record.task.canonicalSession, let run = record.task.canonicalRunID {
             Task { await TurnAdmission.shared.withdraw(sessionID: session, runID: run) }
         }
@@ -869,12 +876,15 @@ public actor AgentContactTasks {
         }
         catch {
             record.task.replyRecovery = AgentContactReplyRecovery(source: dataRoot.appendingPathComponent("agents/a2a-receipts/outcomes.sqlite").path,
-                detail: "The reply settlement could not be saved: \(error.localizedDescription). Repair the receipt store and read this task again; do not resend the work.")
+                detail: """
+                    The reply settlement could not be saved: \(error.localizedDescription). Repair the receipt store and read this task again; do \
+                    not resend the work.
+                    """)
         }
         records[id] = record
-        if !parts.isEmpty {
-            // Replace the streamed draft with the canonical final artifact.
-            broadcast(id, .artifact(task: record.task, artifactID: id + "-reply", parts: parts, append: false, last: true))
+        // Replace the draft with canonical final output; partials cannot substitute for the artifact.
+        for artifact in record.task.replyArtifacts(parts) {
+            broadcast(id, .artifact(task: record.task, artifactID: artifact.id, parts: artifact.parts, append: false, last: true))
         }
         notifyPush(record.task)
         broadcast(id, .status(record.task, final: true))
@@ -894,8 +904,7 @@ public actor AgentContactTasks {
         guard let subscribers = records[id]?.subscribers else { return }
         for (key, continuation) in subscribers {
             if case .dropped = continuation.yield(event) {
-                // A slow consumer reconnects to a full snapshot. Dropping its
-                // stream is never a task-state transition or a replay trigger.
+                // A slow consumer reconnects to a full snapshot. Dropping its stream is never a task-state transition or a replay trigger.
                 continuation.finish(); records[id]?.subscribers.removeValue(forKey: key)
             }
         }

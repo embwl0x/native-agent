@@ -6,9 +6,7 @@ import PersistenceCore
 
 public enum DeskQuickAction: Equatable, Sendable {
     case close(handle: String, outcome: String)
-    /// Palette closes bind to the row version observed while resolving the
-    /// palette result. A later change must refuse at the store boundary rather
-    /// than let Enter acknowledge a different row state as this close.
+    /// Bind palette closes to the observed row revision so Enter cannot acknowledge a later state.
     case closeIfCurrent(handle: String, outcome: String, expectedUpdatedAt: String)
     case setStatus(handle: String, status: DeskStatus)
     case defer_(handle: String, until: String?)
@@ -19,9 +17,7 @@ public enum DeskQuickAction: Equatable, Sendable {
     case nagMute(until: String?)
     case nagUnmute
 
-    /// The default outcome summary for a one-keystroke close. `desk_close`
-    /// REFUSES an empty `summary`, and the honest thing to record is
-    /// where the close came from — not an invented outcome.
+    /// Record the close’s source because the required reason must not invent an outcome.
     public static let deskCloseOutcome = "Closed from the desk."
 
     public var tool: String {
@@ -37,18 +33,17 @@ public enum DeskQuickAction: Equatable, Sendable {
     public var input: [String: JSONValue] {
         switch self {
         case let .close(handle, outcome):
-            return ["handle": .string(handle), "summary": .string(outcome)]
+            return ["handle": .string(handle), "reason": .string(outcome)]
         case let .closeIfCurrent(handle, outcome, expectedUpdatedAt):
             return [
                 "handle": .string(handle),
-                "summary": .string(outcome),
+                "reason": .string(outcome),
                 "expected_updated_at": .string(expectedUpdatedAt),
             ]
         case let .setStatus(handle, status):
             return ["handle": .string(handle), "status": .string(status.rawValue)]
         case let .defer_(handle, until):
-            // An EMPTY `until` is how desk_defer clears a park — the same
-            // encoding the chat tool documents, not a second convention.
+            // Empty until clears a park through the same encoding as the chat tool.
             return ["handle": .string(handle), "until": .string(until ?? "")]
         case let .note(handle, text):
             return ["handle": .string(handle), "text": .string(text)]

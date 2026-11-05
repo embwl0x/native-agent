@@ -1,6 +1,6 @@
 import Foundation
 import BackgroundLoops
-// Blueprint: | `SlackSocketModeLoop+SessionClassification.swift` | `SlackSocketModeLoop`: one closure classifier for receive return, disconnect and transport error; fatal disconnects outrank planned recycling |
+// Blueprint: | `SlackSocketModeLoop+SessionClassification.swift` | `SlackSocketModeLoop`: fatal disconnects outrank recycling |
 
 extension SlackSocketModeLoop {
     static func classifySessionClosure(
@@ -33,13 +33,8 @@ extension SlackSocketModeLoop {
         return sessionDuration < shortLivedSessionFloor ? .failed(error: message) : .completed(result: message)
     }
 
-    /// Slack's `disconnect` reasons are not interchangeable. `link_disabled`
-    /// and `too_many_connections` describe a condition a fast reconnect makes
-    /// WORSE (a disabled app, or this loop already holding too many sockets),
-    /// so they are failures at any session length — the point is to get into
-    /// backoff. Every other reason (`refresh_requested`, `warning`, …) is
-    /// Slack's routine connection rotation and is only a failure when the
-    /// session was too short to have carried any traffic.
+    /// `link_disabled` and `too_many_connections` always need backoff: fast reconnects worsen them. Other reasons describe routine rotation and fail only when
+    /// the session was too short to carry traffic.
     enum SlackDisconnectDisposition: Sendable, Equatable {
         case routine
         case fatal

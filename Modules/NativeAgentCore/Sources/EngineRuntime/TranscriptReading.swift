@@ -30,8 +30,7 @@ extension TranscriptsFacade {
         chatRoot.appendingPathComponent("sessions.json")
     }
 
-    /// The session index, after retention has run under the same lock.
-    /// Missing file → `[]`.
+    /// Read the session index after retention under the same lock; checked absence is empty.
     private nonisolated func sessionRows() async throws -> [[String: JSONValue]] {
         let dataRoot = self.dataRoot
         let url = sessionsPath
@@ -80,9 +79,7 @@ extension TranscriptsFacade {
             return resolved
         }
     }
-    /// The archive tier (`chat/archive/sessions.jsonl`), where Archive and
-    /// retention move a conversation out of the index: the newest row per id,
-    /// less any a door has since brought back into the index. Missing file → `[]`.
+    /// Use the newest archived row per id, excluding sessions restored to the hot index; checked absence is empty.
     public nonisolated func listArchived() async throws -> [NativeAgentShared.ChatSession] {
         let url = sessionsPath
         return try await SwiftNativePersistenceCore.withFileLock(url) {
@@ -101,7 +98,7 @@ extension TranscriptsFacade {
     public nonisolated func loadMessages(sessionId: String, cached: Bool = false) async throws -> [ChatMessage] {
         try await loadTranscript(sessionId: sessionId, cached: cached).messages
     }
-    /// Messages and recollections share one decoded transcript revision.
+    /// Messages and cards share one decoded revision.
     public nonisolated func loadTranscript(sessionId: String, cached: Bool = false) async throws -> TranscriptReadout {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             return .empty
@@ -119,12 +116,9 @@ extension TranscriptsFacade {
         return await projection.attachmentPreviews()
     }
     nonisolated func readTranscript(safeSessionId: String, cached: Bool = true) async throws -> TranscriptReadout {
-        // SessionHistoryReader resolves text/timestamp aliases and preserves raw row metadata in extras.
+        // Use SessionHistoryReader’s resolved fields and retained raw metadata.
         let history = try await cache.history(at: dataRoot.appendingPathComponent("chat/messages/\(safeSessionId).jsonl"), cached: cached)
-        // Prompt history intentionally tolerates damaged rows, but an empty
-        // result caused by a failed read is not a successfully loaded UI
-        // transcript. Propagate that failure to transactional session selection
-        // so it keeps the previous conversation instead of replacing it.
+        // UI selection must propagate read failures rather than replace the conversation with prompt history’s tolerated empty subset.
         guard history.stats.mode != "read_failed" else {
             throw NSError(
                 domain: "NativeClient.ChatHistory", code: 1,
@@ -135,20 +129,14 @@ extension TranscriptsFacade {
         guard rejectedRows == 0 else {
             throw NSError(
                 domain: "NativeClient.ChatHistory", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "The saved conversation is unavailable (\(rejectedRows) damaged rows). Its data was left unchanged; repair the rejected rows before displaying a complete history."]
+                userInfo: [NSLocalizedDescriptionKey: """
+                    The saved conversation is unavailable (\(rejectedRows) damaged rows). Its data was left unchanged; repair the rejected rows before \
+                    displaying a complete history.
+                    """]
             )
         }
-        // Missing/empty new sessions remain valid. A surviving subset is not
-        // a complete transcript; the facade retains its previous publication.
+        // New empty sessions are valid; damaged subsets cannot replace a complete published transcript.
         let coMessages = history.messages
-        // Parse recollections from the same decoded rows as the displayed messages.
-        let recollections = coMessages.compactMap { co -> ChatSessionRecollection? in
-            guard let extras = co.extras else { return nil }
-            return ChatSessionRecollections.recollection(
-                fromTranscriptRow: extras,
-                sessionId: safeSessionId
-            )
-        }
         let messages = try coMessages.map { co -> ChatMessage in
             guard case .object(let row)? = co.extras else {
                 throw NSError(domain: "NativeAgent.ChatHistory", code: 422, userInfo: [
@@ -156,19 +144,14 @@ extension TranscriptsFacade {
                 ])
             }
             var message = try ChatMessage(row: row)
-            // A fork keeps its source rows byte-for-byte, including their
-            // original session IDs. This UI projection belongs to the
-            // requested transcript; actions on an inherited row must not
-            // jump back to the source conversation. Recorded metadata and
-            // on-disk provenance remain untouched.
+            // Project forked rows onto the requested session so actions cannot jump to their source; preserve on-disk ids and provenance.
             message.sessionId = safeSessionId
-            // The history reader already resolves legacy text/timestamp
-            // aliases; the row's own fields must not replace them with defaults.
+            // Keep the history reader’s resolved text and timestamps rather than replacing them with raw-field defaults.
             message.content = co.content
             if !co.timestamp.isEmpty { message.createdAt = co.timestamp }
             return message
         }
-        var projection = TranscriptReadout(messages: messages, recollections: recollections)
+        var projection = TranscriptReadout(messages: messages)
         projection.interactions = InlineInteractionResolver.interactionsByRow(in: coMessages.compactMap(\.extras),
             lifeID: try DataRootLife.current(in: dataRoot))
         return projection

@@ -2,10 +2,10 @@ import NativeAgentShared
 import EngineRuntime
 import Onboarding
 import SwiftUI
-// Blueprint: | `OnboardingProfileRepair.swift` | OnboardingWizard profile-only repair, failure copy, ProfileRepairStep and DoneStep; completion bypasses fresh-install scaffolding and welcome |
+// Blueprint: | `OnboardingProfileRepair.swift` | Profile-only repair and completion; preserves persona and skips fresh-install work |
 
 extension OnboardingWizard {
-    /// Writes only memory/profile.json; failures retain the entered names on this step.
+    /// Retain entered names on failure so repair can continue without re-entry.
     func submitProfileRepair() async {
         guard let appModel = setupModel() else { return }
         state.isLoading = true
@@ -41,8 +41,7 @@ extension OnboardingWizard {
         }
     }
 
-    /// Backend codes are not user-facing copy. Copy names the agent by the
-    /// entered name or "the agent" — never a pronoun.
+    /// Backend codes stay out of user copy; use the entered name or "the agent".
     static func profileRepairFailureMessage(error: String?, detail: String?) -> String {
         switch error {
         case "missing_agent_name":
@@ -76,14 +75,13 @@ struct DoneStep: View {
                 .foregroundStyle(NativeAgentShell.secondary)
             Text("\(state.agentName) is back.")
                 .font(ShellType.display)
-            // A repair changed one file. It says nothing about providers,
-            // so it must not nag about connecting one.
+            // Profile repair provides no evidence about provider readiness.
             Text("The names are saved again. Nothing else on this Mac was changed.")
                 .font(NativeAgentFont.title)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            // A name repair leaves the saved Simple/Advanced choice alone.
+            // Name repair must preserve the saved view choice.
             Button("Start") { onComplete() }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
@@ -92,7 +90,7 @@ struct DoneStep: View {
     }
 }
 
-/// Asks for missing names on a completed install, preserving the existing persona documents.
+/// Preserve persona documents when repairing missing names on a completed install.
 struct ProfileRepairStep: View {
     @Bindable var state: OnboardingWizardState
     let onSave: () -> Void
@@ -113,7 +111,11 @@ struct ProfileRepairStep: View {
                     Text("Enter the names again to finish setting this Mac back up.")
                         .font(NativeAgentFont.display)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("Setup finished on this Mac, but the file holding your name and the agent's name is gone, so a default is being used instead. Nothing here can guess them. The existing personality documents are kept exactly as they are — only the names file is rewritten.")
+                    Text("""
+                        Setup finished on this Mac, but the file holding your name and the agent's name is gone, so a default is being used \
+                        instead. Nothing here can guess them. The existing personality documents are kept exactly as they are — only the names \
+                        file is rewritten.
+                        """)
                         .font(NativeAgentFont.body)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

@@ -3,14 +3,5 @@ import PersistenceCore
 // Blueprint: | `MacAppleScriptBridge.swift` | integration executor namespace; OSA remains in AppleScriptExecution |
 
 // MARK: - MacAppleScriptBridge
-//
-// W2 backend for NativeAgent's Mac Integration Phase 2: AppleScript bridges
-// for Mail / Messages / Notes / Music. MacIntegration builds integration scripts;
-// MacControl owns execution and the app bundle carries the TCC descriptors.
-//
-// All public methods are `async throws -> JSONValue`, take `[String: JSONValue]`
-// input, and return a `{status: completed | denied | failed, ...}` envelope.
-// The permission gate (Phase 1) is enforced upstream of this bridge by
-// MacIntegrationPermissionStore — this layer focuses on executing the
-// AppleScript and translating TCC denials into a structured envelope.
+// MacControl owns execution and the bundle carries TCC descriptors; the upstream permission store owns admission.
 public enum MacAppleScriptBridge {}

@@ -10,9 +10,8 @@ import AppToolRuntime
 import Foundation
 import NativeAgentCore
 import TelegramBot
-// Blueprint: | `TelegramEvidence.swift` | TelegramPresentationSnapshot, transport health, receipt/blocked/error Codable records and concrete tool health receipt |
+// Blueprint: | `TelegramEvidence.swift` | Transport health, checked diagnostics and native receipts |
 
-/// UI diagnostics around the canonical transport/configuration values.
 public struct TelegramPresentationSnapshot: Equatable, Sendable {
     public var transport: TelegramBot.TelegramStatus
     public let configuration: TelegramConfigurationSummary
@@ -35,8 +34,7 @@ public struct TelegramPresentationSnapshot: Equatable, Sendable {
     public var receipts: [TelegramReceipt]
     public var blocked: [TelegramBlockedEvent]
     public var errors: [TelegramErrorEvent]
-    /// Existing diagnostic bytes that cannot be decoded are unavailable, not an
-    /// empty feed. The settings page renders these separately from empty state.
+    /// Undecodable diagnostic bytes are unavailable, never an empty feed.
     public var receiptsIssue: String? = nil
     public var blockedIssue: String? = nil
     public var errorsIssue: String? = nil
@@ -79,10 +77,7 @@ extension TelegramPresentationSnapshot {
         return value
     }
 
-    /// Telegram long polling is a retrying transport. One or two consecutive
-    /// interruptions while the canonical poller is still running are
-    /// observations, not an outage. The third consecutive failure becomes
-    /// actionable so a genuinely unreachable bot still surfaces promptly.
+    /// Allow two transient long-poll interruptions while its owner remains running; the third consecutive failure becomes actionable.
     public var isTransientPollInterruption: Bool {
         guard pollerEnabled,
               let error = normalizedLastError,
@@ -254,7 +249,8 @@ extension TelegramPresentationSnapshot {
             errorHistoryStatus = "recovered_history"
         }
         var object: [String: JSONValue] = [
-            "status": .string(status.isOperational && status.receiptsIssue == nil && status.blockedIssue == nil && status.errorsIssue == nil ? "ok" : "attention"),
+            "status": .string(status.isOperational && status.receiptsIssue == nil && status.blockedIssue == nil && status.errorsIssue == nil ? "ok"
+                : "attention"),
             "enabled": .bool(status.enabled),
             "token_configured": .bool(status.tokenConfigured),
             "poller_running": .bool(status.pollerEnabled),
@@ -270,7 +266,10 @@ extension TelegramPresentationSnapshot {
             "error_entries_with_unreadable_timestamp": .int(Int64(status.errors.count - datedErrors.count)),
             "blocked_history_status": .string(status.blockedIssue != nil ? "unavailable" : status.blocked.isEmpty ? "empty" : "historical_policy_events"),
             "blocked_entries_with_unreadable_timestamp": .int(Int64(status.blocked.count - datedBlocked.count)),
-            "ledger_scope_note": .string("error and blocked ledger counts are bounded history, not current failure counts; active_error and errors since the last successful poll carry current-health meaning; blocked rows are policy decisions, not transport failures"),
+            "ledger_scope_note": .string("""
+                error and blocked ledger counts are bounded history, not current failure counts; active_error and errors since the last successful \
+                poll carry current-health meaning; blocked rows are policy decisions, not transport failures
+                """),
             "active_error": .bool(status.actionableError != nil),
             "poll_retry_transient": .bool(status.isTransientPollInterruption),
             "consecutive_poll_failures": .int(Int64(status.pollBackoffFailures ?? 0)),
@@ -294,11 +293,13 @@ extension TelegramPresentationSnapshot {
         object["last_error"] = status.lastError.map {
             .string(String(NativeAppSecretRedactor.redactText($0).prefix(600)))
         } ?? .null
-        // A partial/unreadable feed supplies no complete count or history verdict.
+        // Partial or unreadable feeds cannot prove complete counts or history.
         for (prefix, issue, keys) in [
             ("receipts", status.receiptsIssue, ["recent_receipt_ledger_entries"]),
-            ("blocked", status.blockedIssue, ["recent_blocked_ledger_entries", "blocked_entries_with_unreadable_timestamp", "latest_blocked_at", "latest_blocked_age_seconds"]),
-            ("errors", status.errorsIssue, ["recent_error_ledger_entries", "error_entries_since_last_successful_poll", "error_entries_with_unreadable_timestamp", "latest_error_at", "latest_error_age_seconds"])
+            ("blocked", status.blockedIssue, ["recent_blocked_ledger_entries", "blocked_entries_with_unreadable_timestamp", "latest_blocked_at",
+                "latest_blocked_age_seconds"]),
+            ("errors", status.errorsIssue, ["recent_error_ledger_entries", "error_entries_since_last_successful_poll",
+                "error_entries_with_unreadable_timestamp", "latest_error_at", "latest_error_age_seconds"])
         ] {
             object[prefix + "_feed_status"] = .string(issue == nil ? "available" : "unavailable")
             object[prefix + "_feed_issue"] = issue.map(JSONValue.string) ?? .null

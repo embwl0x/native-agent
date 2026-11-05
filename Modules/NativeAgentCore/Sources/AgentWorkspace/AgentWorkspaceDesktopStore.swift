@@ -2,7 +2,8 @@ import Foundation
 import CryptoKit
 import Darwin
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceDesktopStore.swift` | `AgentWorkspaceDesktopStore`: `load` and `save` use one version-2 shape with required path, drafts, observations, kept places, focus and action collections; saved desktops require their structural fields too. Missing or damaged current fields refuse the read and preserve existing bytes. |
+// Blueprint: | `AgentWorkspaceDesktopStore.swift` | `AgentWorkspaceDesktopStore`, `load`, `save`: checked v2 desktop; preserve damaged bytes |
+// Required path, drafts, observations, kept places, focus and actions share one v2 shape; missing fields preserve existing bytes.
 
 struct AgentWorkspaceSavedDesktop: Sendable, Equatable {
     var id: String = UUID().uuidString
@@ -36,8 +37,7 @@ struct AgentWorkspaceDesktopState: Sendable, Equatable {
     var placeActions: [String: AgentWorkspaceWorkReceipt] = [:]
 }
 
-/// Durable navigation references and allowlisted draft inputs, never authority,
-/// loaded evidence or executable actions. Reopening obtains fresh owner state.
+/// Durable navigation references and allowlisted draft inputs, never authority, loaded evidence or executable actions. Reopening obtains fresh owner state.
 struct AgentWorkspaceDesktopStore: Sendable {
     private let directory: URL
     private let scopeHash: String
@@ -68,16 +68,14 @@ struct AgentWorkspaceDesktopStore: Sendable {
         let data = try JSONEncoder().encode(wire)
         guard data.count <= Self.byteLimit else { throw Failure.capacity }
         try withDirectory(create: true) { fd in
-            // Refuse to replace an unreadable/corrupt existing desktop. Its
-            // evidence remains available for recovery rather than being erased.
+            // Refuse to replace an unreadable/corrupt existing desktop. Its evidence remains available for recovery rather than being erased.
             _ = try read(fd)
             do { try SwiftNativePersistenceCore.atomicWrite(data, to: fileURL, parentFD: fd) }
             catch { throw Failure.io }
         }
     }
 
-    /// Whitelist stable references, dropping transient cursors and display
-    /// content. Unknown tools are deliberately not serialized as future actions.
+    /// Persist only stable references; unknown tools must not become future actions.
     static func durable(_ location: AgentWorkspaceLocation) -> AgentWorkspaceLocation? {
         switch location {
         case .home: return .home
@@ -94,8 +92,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             return AgentWorkspaceEnvironment.destinations.contains { $0.id == id } ? .area(id) : nil
         case .capabilities: return .home
         case .page(let source, let page):
-            // View offsets carry no content or executable authority. Nested
-            // paging is flattened so malicious stored recursion cannot grow.
+            // View offsets carry no content or executable authority. Nested paging is flattened so malicious stored recursion cannot grow.
             if case .page = source { return nil }
             guard let saved = durable(source), page >= 0, page <= 4096 else { return nil }
             return .page(saved, page)
@@ -124,7 +121,8 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "task_ledger_list": keys = ["task_id"]; required = []
             case "delegation_status": keys = ["task_id"]; required = []
             case "mail_search": keys = ["query", "scope", "mailbox", "unread", "sort", "from", "since", "category", "attachment"]; required = []
-            case "mail_list_recent": keys = ["expected_message_id", "expected_account", "expected_account_id", "scope", "mailbox", "all_categories", "unread", "sort", "from", "since", "category"]; required = []
+            case "mail_list_recent": keys = ["expected_message_id", "expected_account", "expected_account_id", "scope", "mailbox", "all_categories", "unread",
+                "sort", "from", "since", "category"]; required = []
             case "messages_recent_threads": keys = ["thread_id", "query", "unread_only", "sort", "from_me", "since"]; required = []
             case "screen": keys = ["app", "part"]; required = []
             case "bot_list": keys = ["id"]; required = []
@@ -173,8 +171,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             if tool == "recall_memory" || tool == "recall_search" {
                 guard arguments["query"] != nil || arguments["memory_id"] != nil else { return nil }
             }
-            // Preserve validated reading positions. Owners recheck versions
-            // after restart; no loaded evidence or action token is serialized.
+            // Preserve validated reading positions. Owners recheck versions after restart; no loaded evidence or action token is serialized.
             let numericKeys: Set<String>
             switch tool {
             case "read_file": numericKeys = ["offset", "max_bytes"]
@@ -193,7 +190,8 @@ struct AgentWorkspaceDesktopStore: Sendable {
             for key in numericKeys {
                 guard let value = input[key] else { continue }
                 if key == "offset", ["mail_list_recent", "mail_search"].contains(tool), case .object(let cursor) = value {
-                    guard cursor.values.allSatisfy({ if case .int(let number) = $0 { number >= 0 && number < Int.max - 50 } else { false } }) else { return nil }
+                    guard cursor.values.allSatisfy({ if case .int(let number) = $0 { number >= 0 && number < Int.max - 50 } else { false } }) else { return nil
+                        }
                     arguments[key] = value
                     continue
                 }
@@ -254,7 +252,8 @@ struct AgentWorkspaceDesktopStore: Sendable {
         func note(_ input: String?) throws -> String? {
             guard let input else { return nil }
             guard !input.isEmpty, input.utf8.count <= 4096,
-                  !input.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t" }) else { throw Failure.invalid }
+                  !input.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\t" }) else { throw Failure
+                      .invalid }
             return input
         }
         func kept(_ input: [AgentWorkspaceLocation]) throws -> [AgentWorkspaceLocation] {
@@ -342,8 +341,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
         var directoryInfo = stat()
         guard fstat(fd, &directoryInfo) == 0, directoryInfo.st_uid == getuid(),
               directoryInfo.st_mode & 0o077 == 0 else { throw Failure.invalid }
-        // A load for a chat that never saved a desktop has nothing to guard;
-        // only a save creates the lock sidecar, so lookups leave no files.
+        // A load for a chat that never saved a desktop has nothing to guard; only a save creates the lock sidecar, so lookups leave no files.
         var saved = stat()
         if !create, fstatat(fd, scopeHash + ".json", &saved, AT_SYMLINK_NOFOLLOW) != 0, errno == ENOENT { return try body(-1) }
         // Cooperating instances serialize the validation-and-replace boundary.
@@ -362,7 +360,10 @@ struct AgentWorkspaceDesktopStore: Sendable {
             switch self {
             case .invalid: return "The saved workspace could not be read safely. It was preserved without replacement."
             case .io: return "The workspace could not be saved reliably. Existing owner data was not changed."
-            case .capacity: return "This chat's saved desktop would exceed 512 KiB. Existing saved bytes and resident drafts were preserved; finish or discard a draft to make room."
+            case .capacity: return """
+                This chat's saved desktop would exceed 512 KiB. Existing saved bytes and resident drafts were preserved; finish or discard a draft to make \
+                room.
+                """
             }
         }
     }

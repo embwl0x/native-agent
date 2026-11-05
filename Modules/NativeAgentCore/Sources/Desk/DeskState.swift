@@ -14,7 +14,7 @@ public struct ArchiveRecord: Sendable, Equatable {
     public var openedAt: String
     public var closedAt: String
     public var summary: String
-    public var refs: [DeskRef]              // final important only
+    public var refs: [DeskRef]
     public var decisions: [String]
     public var artifacts: [String]
     public var supersededBy: String?
@@ -85,7 +85,6 @@ public struct ArchiveRecord: Sendable, Equatable {
 // MARK: - DeskState (derived — the materialized live view)
 
 public struct DeskState: Sendable, Equatable {
-    /// All LIVE items (archived excluded), in ALIAS ORDER: top-level by numeric seq, each immediately followed by its children in child-seq order.
     public var items: [DeskItem]
     public var generatedTs: String
     public var workSlotsByDay: [String: [String: [String]]]
@@ -111,8 +110,7 @@ public struct DeskState: Sendable, Equatable {
         return slots.values.reduce(0) { $0 + $1.count }
     }
 
-    /// Presentation counts the requested calendar day and only pursuit-lane
-    /// charges. Retired receipts retain their day; unstarted attempts are free.
+    /// Count pursuit charges for the requested day; unstarted attempts consume no budget.
     public func pursuitWorkSessions(on day: String, handle: String) -> Int? {
         guard let item = items.first(where: { $0.handle == handle }) else { return nil }
         return (item.pursuit?.retiredSessionsByDay[day] ?? 0)
@@ -141,7 +139,7 @@ public struct DeskState: Sendable, Equatable {
     }
 
     public var topLevel: [DeskItem] { items.filter { $0.parent == nil } }
-    /// The person's board, before any row caps: closed items and parts remain; MY QUEUE belongs on her home. Archives are already absent from live state.
+    /// Keep all board rows before presentation caps; MY QUEUE belongs on the agent’s home.
     public var board: DeskState {
         var board = self
         board.items.removeAll { $0.project == MyQueue.project }
@@ -150,7 +148,10 @@ public struct DeskState: Sendable, Equatable {
     public var boardCountSummary: String {
         let board = self.board
         let top = board.topLevel
-        return "\(top.filter { !$0.status.isTerminal }.count) of \(top.count) top-level items open; \(board.items.filter { !$0.status.isTerminal }.count) open including parts; MY QUEUE and archives excluded"
+        return """
+            \(top.filter { !$0.status.isTerminal }.count) of \(top.count) top-level items open; \
+            \(board.items.filter { !$0.status.isTerminal }.count) open including parts; MY QUEUE and archives excluded
+            """
     }
     public func children(of handle: String) -> [DeskItem] { items.filter { $0.parent == handle } }
 
@@ -165,8 +166,7 @@ public struct DeskState: Sendable, Equatable {
         ])
     }
 
-    /// Decode a materialized state (compaction base / state.json). STRICT on items: any row that fails DeskItem.fromJSON fails the WHOLE decode — a compaction base that silently dropped one item would vanish it from every future replay, so
-    /// the caller must fail loud instead of folding from a partial base.
+    /// Reject a malformed base whole: a silently dropped item would vanish from every future replay.
     public static func fromJSON(_ value: JSONValue) -> DeskState? {
         guard case .object(let obj) = value,
               case .int(2)? = obj["version"],
@@ -209,7 +209,7 @@ public struct DeskState: Sendable, Equatable {
                     let liveCount = item.workAttempts.filter { $0.lane == .pursuit && $0.day == day && $0.disposition != .unstarted }.count
                     let slots = state.workSessions(on: day, handle: item.handle)
                     let ledgerDay = DeskClock.parseISO(generatedTs).map(DeskClock.dayStamp)
-                    // Historical charges may have been pruned; retained receipts still require their slots above.
+                    // Pruned historical charges do not waive the slot evidence required for retained receipts.
                     guard slots == count + liveCount
                         || (ledgerDay.map { day < $0 } == true && slots == liveCount) else { return nil }
                 }

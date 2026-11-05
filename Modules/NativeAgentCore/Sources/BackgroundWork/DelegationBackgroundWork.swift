@@ -1,4 +1,5 @@
 import Foundation
+import AttentionRouting
 import AgentConversations
 import BackgroundLoops
 import ChatTurnRuntime
@@ -6,7 +7,7 @@ import ChatToolRuntime
 import AgentWorkspace
 import Cognition
 import NativeAgentCore
-import NotificationInbox
+import Experiences
 import PersistenceCore
 import Desk
 import DeviceSync
@@ -14,17 +15,12 @@ import TelegramBot
 import SlackBot
 import NativeAgentShared
 import ProviderRouting
-// Blueprint: | `DelegationBackgroundWork.swift` | `DelegationBackgroundWork` struct; `makeDelegationOutcomeLoop`; one owed-answer notice per peer, retires the duplicate Codex backlog card; one failed-before-answer finding per peer or human route, dated counts and bounded newest-first file refs; per-peer findings persist and refresh every covered delivery ID as a trace ref; closed peer findings settle only those IDs before reply reconciliation; Telegram's index and exact iOS events retain settlement ownership; shared NetworkSense returns re-tick held resident arrivals; tick budget derives from the provider stream wall plus 60 s |
+import StandingBots
+// Blueprint: | `DelegationBackgroundWork.swift` | Delegation matters roll up canonical jobs; handled outcomes read their recorded claims |
 
 // MARK: - DelegationOutcomeLoop registration
-//
-// BackgroundWork joins the canonical projector to its durable terminal cursor
-// and finding delivery. The app supplies platform effects.
-//
-// Codex unlinks a reply-job file once delivery succeeds, but the sibling
-// reply-deliveries ledger durably preserves the terminal turn and bridge
-// receipt. The projector joins that terminal half back to the exact originating
-// message id, and this runner watches the ledger as part of the same lifecycle.
+// The delivery ledger retains terminal evidence after the reply-job file is unlinked.
+// Join it to the exact originating message and watch both in the same lifecycle.
 
 public struct DelegationBackgroundWork: Sendable {
     private let port: any DelegationBackgroundWorkPort
@@ -107,18 +103,9 @@ public struct DelegationBackgroundWork: Sendable {
     }
 
 
-    /// Reacts to bridge-store changes. Routine successful outcomes share one
-    /// bounded informational rollup per source; failed/unconfirmed outcomes
-    /// share one actionable summary per source. Cursor lives at
-    /// `<dataRoot>/logs/delegation_outcome_cursor.json`.
-    ///
-    /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`. When it
-    /// is nil the store follows the injected `dataRoot` and this install's
-    /// ownership of the machine-wide rendezvous
-    /// (`NativeAgentPaths.bridgeConfigRoot(dataRoot:)`), so a fresh root — or a
-    /// secondary copy of the app — never counts another install's replies.
-    /// Same derivation as `BackgroundLoopsAssembly+Heartbeat`'s preserved-reply
-    /// sweep, which reads this very store.
+    /// Bind projection to this install’s resolved bridge root so another install’s replies cannot count.
+    /// Successful outcomes share a source rollup; failed or unconfirmed ones share an actionable summary.
+    /// The durable cursor lives at `<dataRoot>/logs/delegation_outcome_cursor.json`.
     public func makeDelegationOutcomeLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         configRoot: URL? = nil
@@ -126,20 +113,14 @@ public struct DelegationBackgroundWork: Sendable {
         let root = configRoot ?? InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         let deferral = DelegationDeferralState()
         let underlying = DelegationOutcomeLoop(
-            // Normal reconciliation is event-driven. Six hours is only the
-            // missed-vnode/restart integrity sweep.
-            interval: 6 * 60 * 60,
+            wake: .every(6 * 60 * 60),
             cursorPath: DelegationOutcomeLoop.defaultCursorPath(dataRoot: dataRoot),
             readJobsWithAvailability: {
                 do { try await fileFailedHumanReplies(dataRoot: dataRoot) }
                 catch { nativeLog("Reply failure filing failed: %@", error.localizedDescription) }
-                // The default (20) is a chat-tool display budget. A loop that
-                // only ever looked at the newest 20
-                // rows could step over a terminal job during a busy window and
-                // never card it — the cursor would then advance past it.
-                //
-                // Read jobs and availability together so unreadable stores hold the cursor.
-                // Use the resolved root so job projection stays on the assembly's config root.
+                // A display cap could skip terminal jobs as the cursor advances.
+                // Read all jobs with availability so unreadable stores hold the cursor.
+                // The resolved root keeps projection on the assembly’s bridge store.
                 let read = DelegationStatusProjector(configRoot: root, dataRoot: dataRoot)
                     .allJobsWithAvailability(now: Date())
                 let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
@@ -153,24 +134,26 @@ public struct DelegationBackgroundWork: Sendable {
                 do { rows = try AgentConversationStore(dataRoot: dataRoot).records() }
                 catch {
                     return DelegationJobsRead(jobs: jobs, allStoresReadable: false,
-                        availabilityError: "Delegation conversation routing is unavailable: \(error.localizedDescription). Repair the conversation records, then retry outcome reconciliation.")
+                        availabilityError: """
+                            Delegation conversation routing is unavailable: \(error.localizedDescription). Repair the conversation records, then retry \
+                            outcome reconciliation.
+                            """)
                 }
                 if read.allStoresReadable {
-                    do {
-                        _ = try await LiveNotificationInbox.live(dataRoot: dataRoot)
-                            .archiveActive(ids: ["delegation-outcome:codex:undelivered-backlog"], readAt: DeskClock.nowISO())
-                        try await reconcileAdverseRollups(dataRoot: dataRoot, jobs: jobs)
-                    }
+                    do { try await reconcileAdverseRollups(dataRoot: dataRoot, jobs: jobs) }
                     catch { nativeLog("Delegation rollup reconciliation failed: %@", error.localizedDescription) }
-                    for peer in Set(read.jobs.map(\.agent)).union(["codex", "omp", "claude"]).sorted() {
+                    for peer in Set(read.jobs.map(\.agent)).sorted() {
                         let owed = read.jobs.filter { $0.agent == peer && $0.replyOwed }
                         let key = "delivery-residue|" + peer
                         if owed.isEmpty {
                             try? await HarnessQueue.resolve(key: key, note: "No saved answers remain owed.", dataRoot: dataRoot)
                         } else {
-                            // The contact's own name, the one agent.contacts shows, never a reshaped id.
+                            // Preserve the contact name that agent.contacts exposes.
                             let id = peer.hasPrefix("peer:") ? String(peer.dropFirst(5)) : peer
-                            let name = contacts.first { $0.id == id }?.name ?? DelegationOutcomeCard.displayName(source: peer, agent: peer)
+                            // A helper's run is named by its helper, as its conversation row names it; never by its id.
+                            let name = contacts.first { $0.id == id }?.name
+                                ?? owed.lazy.compactMap(\.contactName).first { !$0.isEmpty }
+                                ?? (peer.hasPrefix("bot-run:") ? "a helper" : DelegationOutcomeCard.displayName(source: peer, agent: peer))
                             _ = try? await HarnessQueue.file(HarnessFinding(key: key,
                                 title: "Replies owed to " + name,
                                 summary: "\(owed.count) saved replies to \(name) remain owed: the call that asked for each can no longer take it. "
@@ -189,24 +172,12 @@ public struct DelegationBackgroundWork: Sendable {
                         } catch { nativeLog("Reply failure filing failed: %@", error.localizedDescription) }
                     }
                 }
-                // Feed the already-owned event read to Workspace bookmarks.
-                // Their file event exposes arrivals without Agent opening each
-                // conversation first. No additional polling or provider work.
-                if read.allStoresReadable {
-                    do { try AgentConversationStore(dataRoot: dataRoot).reconcileDelegationReplies(read.jobs) }
-                    catch {
-                        FileHandle.standardError.write(Data(
-                            "DelegationOutcomeLoop: conversation reply projection failed: \(error.localizedDescription)\n".utf8))
-                    }
-                }
-                // Her notice lands only on a matching open row she started
-                // (AgentConversationStore.noteDelegationEvent); anything else
-                // keeps the person's push. An unreadable conversation source
-                // cannot choose a different audience; reconciliation stays owed.
+                // Only matching open delegations get the resident notice; other routes keep the person’s push.
+                // Unreadable conversations cannot select another audience; reconciliation stays owed.
                 return DelegationJobsRead(
                     jobs: jobs.map { snapshot in
                         var job = snapshot
-                        job.reachesHer = rows.contains { conversation in
+                        job.reachesAgent = rows.contains { conversation in
                             guard conversation.agent == job.agent, conversation.personInitiated != true,
                                   ["waiting", "attention", "ready"].contains(conversation.phase),
                                   case .string(let id)? = conversation.readInput?["message_id"] else { return false }
@@ -223,22 +194,16 @@ public struct DelegationBackgroundWork: Sendable {
             observeTransition: { job in
                 if dataRoot.standardizedFileURL
                     == PersistenceCore.defaultDataRoot().standardizedFileURL {
-                    let owners = job.agent == "codex" && !job.acceptedMessageIDs.isEmpty
-                        ? job.acceptedMessageIDs.sorted() : [job.motorOwnerID ?? job.id]
-                    for owner in owners {
-                        var action = job
-                        action.motorOwnerID = owner
-                        await port.observeMotorActionState(action.motorActionReadModel())
-                    }
+                    var action = job
+                    action.motorOwnerID = job.motorOwnerID ?? job.id
+                    await port.observeMotorActionState(action.motorActionReadModel())
                 }
-                // Her turn in the chat she delegated from, not only User's card.
+                // Wake the originating delegated chat as well as surfacing the person’s card.
                 do {
                     try AgentConversationStore(dataRoot: dataRoot).noteDelegationEvent(
                         agent: job.agent, messageIDs: job.acceptedMessageIDs.sorted()
                     ) { row in
-                        // A stall matters only while the answer is still owed; a
-                        // terminal outcome may already have settled the thread
-                        // as ready (an unconfirmed or lost delivery still is news).
+                        // A terminal outcome may already settle the thread; only an owed answer can stall.
                         guard row.phase == "waiting" || job.isTerminal else { return nil }
                         return DelegationOutcomeCard.residentNotice(from: job, conversation: row.label)
                             .map { AgentConversationNotice(event: $0.event, text: $0.text) }
@@ -248,10 +213,9 @@ public struct DelegationBackgroundWork: Sendable {
                         + "for \(job.source):\(job.id): \(error.localizedDescription)\n").utf8))
                     return false
                 }
-                // A failed wake her notice will not carry (it went back down the
-                // channel that failed, or to the caller): an arrival in her own runtime.
+                // Failed-channel notices need an arrival inside the runtime to avoid returning down that channel.
                 if job.terminalOutcome == .failed,
-                   !job.reachesHer || DelegationOutcomeCard.residentNotice(from: job, conversation: "") == nil {
+                   !job.reachesAgent || DelegationOutcomeCard.residentNotice(from: job, conversation: "") == nil {
                     let name = job.displayName
                     let head = (job.agentReplyTextHead ?? job.completionTextHead)?
                         .split(whereSeparator: \.isNewline).first.map { String($0.prefix(140)) }
@@ -261,7 +225,6 @@ public struct DelegationBackgroundWork: Sendable {
                     if signIn { line += ": its sign-in failed or expired" } else if let head { line += ": \"\(head)\"" }
                     ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
                         id: "wake-failed:\(job.source):\(job.id)", line: line, thread: "wake:" + job.agent,
-                        // The quoted head is stamped with the route its ledger entry records.
                         agent: signIn || head == nil || job.agent.isEmpty ? nil : job.agent, home: true)])
                 }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
@@ -271,31 +234,15 @@ public struct DelegationBackgroundWork: Sendable {
                 NotificationCenter.default.post(name: DelegationOutcomeLoop.workRemaining, object: dataRoot)
             },
             readHandledOutcomes: {
-                let inbox = LiveNotificationInbox.livePath(dataRoot: dataRoot)
                 var handled = Set<String>()
-                for path in [inbox, LiveNotificationInbox.archivePath(forInbox: inbox)] {
-                    let lines = try LiveNotificationInbox.readLines(path)
-                    guard lines.allSatisfy({ line in
-                        if line.raw.isEmpty { return true }
-                        if case .object? = line.row { return true }
-                        return false
-                    }) else {
-                        throw CocoaError(.fileReadCorruptFile)
-                    }
-                    for line in lines {
-                        guard case .object(let row)? = line.row,
-                              row["source"] == .string("delegation_outcome") else { continue }
-                        if case .string(let signature)? = row["error_signature"] { handled.insert(signature) }
-                        if case .array(let occurrences)? = row["absorbed_occurrence_ids"] {
-                            for case .string(let id) in occurrences where id.hasPrefix("delegation-outcome:") {
-                                handled.insert("\(id.dropFirst("delegation-outcome:".count)):succeeded")
-                            }
-                        }
-                        if case .array(let jobs)? = row["adverse_jobs"] {
-                            for case .string(let job) in jobs {
-                                let parts = job.split(separator: "|", maxSplits: 1)
-                                if parts.count == 2 { handled.insert("\(parts[1]):\(parts[0])") }
-                            }
+                for matter in try await ForPerson.at(dataRoot).matters()
+                    where matter.face?.from == "delegation_outcome" && ForPerson.reading(matter) != .unread {
+                    for claim in matter.claims {
+                        guard claim.claim.hasPrefix("delegation outcome: ") else { continue }
+                        let outcome = String(claim.claim.dropFirst("delegation outcome: ".count))
+                        guard DelegationOutcome(rawValue: outcome) != nil else { throw CocoaError(.fileReadCorruptFile) }
+                        for ref in claim.evidence where ref.source == Matter.delegations {
+                            handled.insert(ref.id + ":" + outcome)
                         }
                     }
                 }
@@ -310,16 +257,10 @@ public struct DelegationBackgroundWork: Sendable {
             configRoot: root,
             deferral: deferral,
             watchedPaths: [
-                root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs", isDirectory: true),
-                root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs/undelivered", isDirectory: true),
-                root.appendingPathComponent("codex-nativeagent-bridge/reply-deliveries.jsonl"),
-                root.appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true),
                 AgentConversationStore(dataRoot: dataRoot).fileURL,
                 dataRoot.appendingPathComponent("bots/run-queue.json"),
                 dataRoot.appendingPathComponent("bots/shelf-index.json"),
-                // A new arrival books her wake (ResidentWake.nextDeadline).
                 ResidentWake.url(dataRoot),
-                // A queued step or a met condition books the tick that offers it.
                 dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
                 dataRoot.appendingPathComponent("icloud/chat_delivery_receipts.jsonl"),
                 root.appendingPathComponent("claude-bridge/codex-completion-lifecycle", isDirectory: true),
@@ -331,9 +272,7 @@ public struct DelegationBackgroundWork: Sendable {
         )
     }
 
-    /// Settle terminal delegated work back onto the exact Desk item selected
-    /// when it was sent. This is execution/delivery evidence only: it never
-    /// closes the item or promotes an unverified agent answer into task proof.
+    /// Settle only the selected Desk item; delivery evidence neither closes it nor proves the answer correct.
     public func recordBoundDelegationSettlement(
         dataRoot: URL,
         job: DelegationReadout
@@ -353,9 +292,7 @@ public struct DelegationBackgroundWork: Sendable {
             )
             return true
         } catch DeskError.unknownHandle {
-            // The item was archived between delegation and settlement. There
-            // is no live Desk target to update, and retrying forever would pin
-            // the outcome cursor behind an impossible write.
+            // An archived item has no live settlement target; retrying forever would pin the outcome cursor.
             return true
         } catch {
             // Log settlement failures and return false so the loop retries.
@@ -365,267 +302,129 @@ public struct DelegationBackgroundWork: Sendable {
         }
     }
 
-    // MARK: - Inbox upsert
-
-    /// Upsert one delegation-outcome card, then knock for the attention-worthy
-    /// ones. Returns whether the row landed — a `false` keeps the job out of the
-    /// loop's cursor so the next tick retries.
-    ///
-    /// Sticky by the same contract as `fileLoopFailureNotice`: the card carries
-    /// its job key in `error_signature`, and a row already marked read/archived
-    /// for that SAME key keeps the user's status instead of resurrecting as
-    /// unread. In practice the loop never re-files a carded job at all — this is
-    /// the second belt, for the case where a cursor is lost or reset.
-    public func fileDelegationOutcomeNotice(
-        dataRoot: URL,
-        card: DelegationOutcomeCard,
-        read: DelegationJobsRead
-    ) async -> Bool {
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        let row = card.toJSON()
-
-        // Routine successes share one informational rollup per bridge source.
-        if card.outcome == .succeeded, card.severity == "info", !card.resolved,
-           case .object(var rollupRow) = row {
-            let rollupID = "delegation-outcome:\(card.source):successful-rollup"
-            let rollupKey = "delegation_outcome.successful.\(card.source)"
-            rollupRow["id"] = .string(rollupID)
-            rollupRow["error_signature"] = .string(rollupKey)
-            do {
-                _ = try await LiveNotificationInbox.live(dataRoot: dataRoot)
-                    .appendOrRollUpInformational(
-                        .object(rollupRow),
-                        id: rollupID,
-                        rollupKey: rollupKey,
-                        // `rollupID` is ONE stable id shared by every write to
-                        // this card, so it cannot tell a new job from a retry of
-                        // the last one. The per-job card id is the occurrence
-                        // identity: a job counted once is never counted twice,
-                        // and a genuinely new job still bumps the rollup.
-                        occurrenceID: card.cardId
-                    )
+    /// The job owns the outcome; a matter owns what the person has been told about it.
+    public func fileDelegationOutcomeNotice(dataRoot: URL, card: DelegationOutcomeCard, read: DelegationJobsRead) async -> Bool {
+        do {
+            if card.resolved {
+                try await BodyNotice.resolve(key: card.cardId, from: "delegation_outcome", dataRoot: dataRoot)
                 return true
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "DelegationOutcomeLoop: success rollup failed for \(card.cardId): \(error)\n".utf8))
-                return false
             }
-        }
-
-        // Failed or unknown terminal outcomes share a summary per agent; stall cards stay distinct.
-        if card.outcome == .failed || card.outcome == .unknown, !card.resolved,
-           card.severityOverride == nil, card.cardId == "delegation-outcome:\(card.jobKey)" {
-            guard read.allStoresReadable else { return false }
-            return await fileAdverseDelegationRollup(inboxPath: inboxPath, dataRoot: dataRoot, card: card, jobs: read.jobs)
-        }
-
-        do {
-            let inserted = try await LiveNotificationInbox.live(dataRoot: dataRoot)
-                .upsert(id: card.cardId) { existing in
-                    guard case .object(let obj)? = existing else { return (row, true) }
-                    var replacement = row
-                    // A bare job-key signature matches only the same severity.
-                    let signatureMatches: Bool = {
-                        guard case .string(let old)? = obj["error_signature"] else { return false }
-                        if old == card.signature { return true }
-                        guard old == card.jobKey else { return false }
-                        if case .string(let oldSeverity)? = obj["severity"] {
-                            return oldSeverity == card.severity
-                        }
-                        return false
-                    }()
-                    if signatureMatches,
-                       case .string(let oldStatus)? = obj["status"],
-                       oldStatus != "unread",
-                       case .object(var newObj) = row {
-                        newObj["status"] = obj["status"] ?? .string("unread")
-                        newObj["read_at"] = obj["read_at"] ?? .null
-                        replacement = .object(newObj)
-                    }
-                    return (replacement, !signatureMatches)
-                }
-            if inserted {
-                await port.notifyIfAttentionWorthy(
-                    dataRoot: dataRoot,
-                    itemId: card.cardId,
-                    title: card.title,
-                    summary: String(card.summary.prefix(500)),
-                    source: "delegation_outcome",
-                    severity: card.severity
-                )
+            if card.outcome == .succeeded, card.severity == "info" {
+                guard read.allStoresReadable else { return false }
+                try await BodyNotice.resolve(key: card.cardId, from: "delegation_outcome", dataRoot: dataRoot)
+                return try await fileDelegationRollup(dataRoot: dataRoot, card: card, jobs: read.jobs, adverse: false)
+            }
+            if card.outcome == .failed || card.outcome == .unknown,
+               card.severityOverride == nil, card.cardId == "delegation-outcome:\(card.jobKey)" {
+                guard read.allStoresReadable else { return false }
+                try await BodyNotice.resolve(key: card.cardId, from: "delegation_outcome", dataRoot: dataRoot)
+                return try await fileDelegationRollup(dataRoot: dataRoot, card: card, jobs: read.jobs, adverse: true)
+            }
+            try await BodyNotice.tell(key: card.cardId, from: "delegation_outcome",
+                                                  finding: card.signature, dataRoot: dataRoot) { id in
+                let form: Matter.Form = card.severity == "info" ? .done : card.outcome == .unknown ? .ask : .wentWrong
+                try await port.tell(Matter(id: id, form: form, from: "delegation_outcome",
+                    title: card.title, summary: String(card.summary.prefix(500)), words: String(card.detail.prefix(2_000)),
+                    open: "page:delegations", choices: [.init(id: "view", label: "View"), .init(id: "archive", label: "Archive"),
+                                                      .init(id: "dismiss", label: "Dismiss")],
+                    evidence: [.init(source: Matter.delegations, id: card.jobKey)]),
+                    dataRoot: dataRoot, reach: card.severity == "info" ? .inbox : .person(from: nil), turn: nil)
+                try await recordDelegationClaims(id: id, jobs: [(card.jobKey, card.outcome)], dataRoot: dataRoot)
             }
             return true
         } catch {
-            FileHandle.standardError.write(Data(
-                "DelegationOutcomeLoop: card upsert failed for \(card.cardId): \(error)\n".utf8))
+            nativeLog("DelegationOutcomeLoop: matter could not be told for %@: %@", card.cardId, error.localizedDescription)
             return false
         }
     }
 
-    /// One actionable summary card per bridge source for failed and unconfirmed
-    /// jobs ("Codex: 26 failed, 11 unconfirmed"), carrying the latest job's
-    /// detail. The card remembers `outcome|jobKey` entries, so a retried upsert
-    /// counts once and a job whose outcome worsens moves between the counts.
-    /// It pushes only when it becomes unread; further outcomes while it is
-    /// still unread just move the counts.
-    private func fileAdverseDelegationRollup(
-        inboxPath: URL,
-        dataRoot: URL,
-        card: DelegationOutcomeCard,
-        jobs: [DelegationReadout]
-    ) async -> Bool {
-        let rollupID = "delegation-outcome:\(card.source):adverse-rollup"
+    /// Counts read the current jobs, without a second list of absorbed occurrences.
+    private func fileDelegationRollup(dataRoot: URL, card: DelegationOutcomeCard, jobs: [DelegationReadout], adverse: Bool) async throws -> Bool {
+        let members = jobs.filter { job in
+            guard job.source == card.source, let outcome = job.terminalOutcome else { return false }
+            if !adverse { return outcome == .succeeded && !job.stalled }
+            return !["owed", "sent_unconfirmed", "failed_before_answer"].contains(job.deliveryOutcome ?? "")
+                && (outcome == .failed || outcome == .unknown)
+        }
+        guard !members.isEmpty else { return false }
+        let forPerson = ForPerson.at(dataRoot)
+        let key = "delegation-outcome:\(card.source):\(adverse ? "adverse" : "successful")-rollup:"
+        let open = try await forPerson.matters().first {
+            $0.face?.from == "delegation_outcome" && $0.id.hasPrefix(key)
+                && (ForPerson.reading($0) == .unread || ForPerson.reading($0) == .read)
+        }
+        var id = open?.id ?? key + UUID().uuidString.lowercased()
+        let failed = members.filter { $0.terminalOutcome == .failed }.count
+        let unknown = members.filter { $0.terminalOutcome == .unknown }.count
+        let counts = adverse
+            ? [failed > 0 ? "\(failed) failed" : nil, unknown > 0 ? "\(unknown) unconfirmed" : nil].compactMap { $0 }.joined(separator: ", ")
+            : "\(members.count) finished"
         let name = card.contactName ?? DelegationOutcomeCard.displayName(source: card.source, agent: card.agent)
-        do {
-            // nil = invalid card; .some(nil) = landed, no push.
-            let landed = try await SwiftNativePersistenceCore.withFileLock(inboxPath) {
-                () async throws -> (title: String, summary: String)?? in
-                let lines = try LiveNotificationInbox.readLines(inboxPath)
-                func isActive(_ obj: [String: JSONValue]) -> Bool {
-                    guard case .string(let status)? = obj["status"] else { return true }
-                    return status != "archived" && status != "dismissed"
-                }
-                var existing: [String: JSONValue]?
-                for line in lines {
-                    if case .object(let obj)? = line.row, case .string(rollupID)? = obj["id"] {
-                        if isActive(obj) { existing = obj }
-                    }
-                }
-                let (entries, counts) = Self.adverseDelegationRollup(source: card.source, jobs: jobs)
-                guard !entries.isEmpty else { return .some(nil) }
-                let title = "\(name): \(counts)"
-                // The push router dedupes on id + summary, and the id never
-                // changes: counts and the outcome time identify the new fact.
-                let summary = "\(counts). Latest (\(card.createdAt)): \(card.summary)"
-
-                guard case .object(var obj) = card.toJSON() else { return nil }
-                obj["id"] = .string(rollupID)
-                obj["title"] = .string(title)
-                obj["summary"] = .string(String(summary.prefix(500)))
-                obj["detail"] = .string(String(("Latest: \(card.title)\n\(card.detail)").prefix(2_000)))
-                obj["error_signature"] = .string("delegation_outcome.adverse.\(card.source)")
-                obj["adverse_jobs"] = .array(entries.map(JSONValue.string))
-                obj["first_created_at"] = existing?["first_created_at"] ?? existing?["created_at"] ?? obj["created_at"]
-                let wasUnread = existing.map { ($0["status"] ?? .string("unread")) == .string("unread") } ?? false
-                let row = JSONValue.object(obj)
-
-                var mutated: [Data] = []
-                mutated.reserveCapacity(lines.count + 1)
-                for line in lines {
-                    guard case .object(var other)? = line.row, case .string(let id)? = other["id"] else {
-                        mutated.append(line.raw)
-                        continue
-                    }
-                    // The old summary moves to the newest position; the job's own
-                    // per-job row (a stall warning or a legacy card) is superseded.
-                    if id == rollupID, isActive(other) { continue }
-                    if id == card.cardId, isActive(other) {
-                        other["status"] = .string("archived")
-                        other["read_at"] = .string(card.createdAt)
-                        mutated.append(Data(try JSONValue.object(other).serialize(pretty: false).utf8))
-                        continue
-                    }
-                    mutated.append(line.raw)
-                }
-                mutated.append(Data(try row.serialize(pretty: false).utf8))
-                try LiveNotificationInbox.write(mutated, to: inboxPath)
-                return wasUnread ? .some(nil) : .some((title, summary))
-            }
-            guard let landed else { return false }
-            if let push = landed {
-                await port.notifyIfAttentionWorthy(
-                    dataRoot: dataRoot,
-                    itemId: rollupID,
-                    title: push.title,
-                    summary: String(push.summary.prefix(500)),
-                    source: "delegation_outcome",
-                    severity: card.severity
-                )
-            }
-            return true
-        } catch {
-            FileHandle.standardError.write(Data(
-                "DelegationOutcomeLoop: adverse rollup failed for \(card.cardId): \(error)\n".utf8))
-            return false
+        func matter(_ id: String) -> Matter {
+            Matter(id: id, form: !adverse ? .done : failed > 0 ? .wentWrong : .ask, from: "delegation_outcome",
+            title: name + ": " + counts, summary: String((counts + ". Latest: " + card.summary).prefix(500)),
+            words: String(("Latest: " + card.title + "\n" + card.detail).prefix(2_000)), badge: String(members.count),
+            open: "page:delegations", choices: [.init(id: "view", label: "View"), .init(id: "archive", label: "Archive"),
+                                              .init(id: "dismiss", label: "Dismiss")],
+            evidence: members.map { .init(source: Matter.delegations, id: $0.source + ":" + $0.id) })
         }
+        let doors = adverse && !card.reachesAgent ? Door.person(thread: nil) : []
+        if try await forPerson.tell(matter(id), doors: doors) == .settled {
+            id = key + UUID().uuidString.lowercased()
+            try await forPerson.tell(matter(id), doors: doors)
+        }
+        try await recordDelegationClaims(id: id, jobs: members.compactMap { job in
+            job.terminalOutcome.map { (job.source + ":" + job.id, $0) }
+        }, dataRoot: dataRoot)
+        return true
     }
 
-    private static func adverseDelegationRollup(source: String, jobs: [DelegationReadout]) -> (entries: [String], counts: String) {
-        let entries = jobs.compactMap { job -> String? in
-            guard job.source == source,
-                  !["owed", "sent_unconfirmed", "failed_before_answer"].contains(job.deliveryOutcome ?? ""),
-                  let outcome = job.terminalOutcome, outcome == .failed || outcome == .unknown else { return nil }
-            return "\(outcome.rawValue)|\(job.source):\(job.id)"
-        }.sorted()
-        let unconfirmed = entries.filter { $0.hasPrefix("\(DelegationOutcome.unknown.rawValue)|") }.count
-        let failed = entries.count - unconfirmed
-        let counts = [failed > 0 ? "\(failed) failed" : nil, unconfirmed > 0 ? "\(unconfirmed) unconfirmed" : nil]
-            .compactMap { $0 }.joined(separator: ", ")
-        return (entries, counts)
+    /// Claims preserve which observed outcome the person read, even if that job later changes.
+    private func recordDelegationClaims(id: String, jobs: [(String, DelegationOutcome)], dataRoot: URL) async throws {
+        try await ExperienceStore.at(dataRoot).append(jobs.map { key, outcome in
+            .claim(.init(claim: "delegation outcome: " + outcome.rawValue, evidence: [.init(source: Matter.delegations, id: key)]))
+        }, to: id)
     }
 
     private func reconcileAdverseRollups(dataRoot: URL, jobs: [DelegationReadout]) async throws {
-        let path = LiveNotificationInbox.livePath(dataRoot: dataRoot)
-        try await SwiftNativePersistenceCore.withFileLock(path) {
-            let lines = try LiveNotificationInbox.readLines(path)
-            var changed = false
-            let rewritten = try lines.map { line -> Data in
-                guard case .object(var fields)? = line.row, case .string(let id)? = fields["id"],
-                      id.hasPrefix("delegation-outcome:"), id.hasSuffix(":adverse-rollup"),
-                      fields["status"] != .string("archived"), fields["status"] != .string("dismissed") else { return line.raw }
-                let source = String(id.dropFirst("delegation-outcome:".count).dropLast(":adverse-rollup".count))
-                let (entries, counts) = Self.adverseDelegationRollup(source: source, jobs: jobs)
-                let summary = counts.isEmpty ? "Reply outcomes reconciled." : counts
-                let title = DelegationOutcomeCard.displayName(source: source, agent: source) + ": " + summary
-                guard fields["adverse_jobs"] != .array(entries.map(JSONValue.string)) || fields["title"] != .string(title) else { return line.raw }
-                changed = true
-                fields["adverse_jobs"] = .array(entries.map(JSONValue.string))
-                fields["title"] = .string(title)
-                fields["summary"] = .string(summary)
-                if entries.isEmpty {
-                    fields["status"] = .string("archived")
-                    fields["detail"] = .string(summary)
-                }
-                return try JSONValue.object(fields).serializedData(pretty: false)
+        let forPerson = ForPerson.at(dataRoot)
+        for matter in try await forPerson.matters()
+            where matter.face?.from == "delegation_outcome" && matter.id.contains(":adverse-rollup:")
+                && (ForPerson.reading(matter) == .unread || ForPerson.reading(matter) == .read) {
+            guard let marker = matter.id.range(of: ":adverse-rollup:") else { continue }
+            let source = String(matter.id[..<marker.lowerBound].dropFirst("delegation-outcome:".count))
+            let matching = jobs.filter { $0.source == source }
+            let adverse = matching.filter {
+                !["owed", "sent_unconfirmed", "failed_before_answer"].contains($0.deliveryOutcome ?? "")
+                    && ($0.terminalOutcome == .failed || $0.terminalOutcome == .unknown)
             }
-            if changed { try LiveNotificationInbox.write(rewritten, to: path) }
+            // Missing members are not evidence of recovery; only observed replacement outcomes clear the rollup.
+            let refs = (matter.evidence + matter.claims.flatMap(\.evidence)).filter { $0.source == Matter.delegations }
+            guard !refs.isEmpty, refs.allSatisfy({ ref in matching.contains { $0.source + ":" + $0.id == ref.id } }) else { continue }
+            if adverse.isEmpty { try await BodyNotice.resolve(matter, dataRoot: dataRoot) }
+            else if let latest = adverse.first, let card = DelegationOutcomeCard.make(from: latest, now: Date()) {
+                _ = try await fileDelegationRollup(dataRoot: dataRoot, card: card, jobs: jobs, adverse: true)
+            }
         }
     }
 
-    /// Archives per-job failed/unconfirmed/lost cards older than seven days, written
-    /// before those outcomes moved into the per-agent summary. Stall
-    /// and summary cards do not match.
-    public func reconcileStaleAdverseDelegationNotices(
-        dataRoot: URL,
-        now: Date = Date()
-    ) async throws -> Int {
-        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        let prefix = "delegation-outcome:"
-        let ids = try await inbox.rows().compactMap { row -> String? in
-            guard case .object(let object) = row,
-                  case .string("delegation_outcome")? = object["source"],
-                  case .string("actionable")? = object["severity"],
-                  case .string(let id)? = object["id"], id.hasPrefix(prefix),
-                  case .string(let signature)? = object["error_signature"]
-            else { return nil }
-            let jobKey = String(id.dropFirst(prefix.count))
-            let adverse = [jobKey, "\(jobKey):\(DelegationOutcome.failed.rawValue)",
-                           "\(jobKey):\(DelegationOutcome.unknown.rawValue)",
-                           "\(jobKey):\(DelegationOutcome.deliveryLost.rawValue)"]
-            return adverse.contains(signature) ? id : nil
+    /// The passage of seven days retires this notice, without a verdict about the job.
+    public func reconcileStaleAdverseDelegationNotices(dataRoot: URL, now: Date = Date()) async throws -> Int {
+        var count = 0
+        for matter in try await ForPerson.at(dataRoot).matters() {
+            guard matter.face?.from == "delegation_outcome", !matter.id.contains("-rollup:"),
+                  matter.face?.row?.tone == .failed || matter.owes["decide"] != nil,
+                  ForPerson.reading(matter) == .unread || ForPerson.reading(matter) == .read,
+                  let at = NativeTimestampFormat.parseISO8601FractionalFirst(matter.at),
+                  at <= now.addingTimeInterval(-7 * 86_400) else { continue }
+            try await BodyNotice.resolve(matter, dataRoot: dataRoot)
+            count += 1
         }
-        return try await inbox.archiveActive(
-            ids: ids,
-            readAt: DelegationOutcomeCursor.formatISO(now),
-            createdNoLaterThan: now.addingTimeInterval(-7 * 86_400)
-        )
+        return count
     }
 
 }
 
-/// Event-fed reply reconciliation and the exact iOS failure projection.
 actor DelegationDeferralState {
     private var replyReconciliationPending = true
     private var iosFailures: [URL: String] = [:]
@@ -655,9 +454,9 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     let watchedPaths: [URL]
 
     var loopId: String { underlying.loopId }
-    var interval: TimeInterval { underlying.interval }
-    // One delayed peer continuation may include a full resident chat turn.
-    // The manager still owns single-flight execution and cancellation.
+    var wake: OrganWake { underlying.wake }
+    // Reconciliation admits contact work under the checked provider guard.
+    // Retained contact turns own their execution lifetime and cancellation.
     var tickTimeoutOverride: TimeInterval? {
         let config = ProviderStreamGuardConfig.fromEnvironment()
         do { try config.validate(); return config.wallTimeout + 60 }
@@ -672,7 +471,9 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
         do { try ProviderStreamGuardConfig.fromEnvironment().validate() }
         catch { return .failed(error: error.localizedDescription) }
         do { try await work.reconcileClosedReplyFindings(dataRoot: dataRoot, configRoot: configRoot) }
-        catch { return .failed(error: "Reply let-go settlement failed: \(error.localizedDescription). Repair the reply or Desk records before reconciliation.") }
+        catch { return .failed(error: """
+            Reply let-go settlement failed: \(error.localizedDescription). Repair the reply or Desk records before reconciliation.
+            """) }
         if await deferral.takeReplyReconciliation() {
             do { try await port.reconcileReplyDeliveries(dataRoot: dataRoot) }
             catch {
@@ -688,9 +489,7 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                 ))
             }
         } catch {
-            // Outcome delivery remains available if historical inbox cleanup
-            // fails; the idempotent reconciliation retries on the next event or
-            // six-hour integrity tick.
+            // Inbox cleanup failure must not block outcome delivery; retry at the next event or integrity tick.
             FileHandle.standardError.write(Data(
                 "DelegationOutcomeLoop: stale adverse notice reconciliation failed: \(error)\n".utf8
             ))
@@ -710,8 +509,7 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
 
     func physiologyEvents() -> AsyncStream<Void> {
         let deliveryPaths = watchedPaths.filter {
-            $0.path.contains("codex-nativeagent-bridge/") || $0.path.contains("omp-bridge/")
-                || $0.path.contains("codex-completion-lifecycle") || $0.path.contains("/slack/")
+            $0.path.contains("codex-completion-lifecycle") || $0.path.contains("/slack/")
                 || $0.path.contains("/telegram/") || $0.path.contains("/icloud/")
         }
         let ordinaryPaths = watchedPaths.filter { !deliveryPaths.contains($0) }
@@ -722,7 +520,8 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                 notifications: [.NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
                     DelegationOutcomeLoop.workRemaining])
             let deliveryEvents = EventDeadlinePhysiology.storeAndFileEvents(paths: deliveryPaths, loopId: nil)
-            let ordinaryEvents = EventDeadlinePhysiology.storeAndFileEvents(paths: ordinaryPaths, loopId: nil)
+            let ordinaryEvents = EventDeadlinePhysiology.storeAndFileEvents(
+                paths: ordinaryPaths, notifications: [BotRunQueue.didChange], loopId: nil)
             let networkChanges = NetworkSense.changes
             let task = Task {
                 await withTaskGroup(of: String.self) { group in
@@ -738,7 +537,10 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                         do { try await work.fileFailedIOSReplies(dataRoot: dataRoot, deferral: deferral) }
                         catch { nativeLog("Reply failure filing failed: %@", error.localizedDescription) }
                         for await change in journalChanges where change.store == .replyDelivery
-                            && NativeAgentWorkspaceRoot.relativePath(change.path.standardizedFileURL.path, under: dataRoot.standardizedFileURL.path).map({ !$0.isEmpty }) == true {
+                            && NativeAgentWorkspaceRoot.relativePath(
+                                change.path.standardizedFileURL.path,
+                                under: dataRoot.standardizedFileURL.path
+                            ).map({ !$0.isEmpty }) == true {
                             guard !Task.isCancelled else { break }
                             do { try await work.fileFailedIOSReplies(dataRoot: dataRoot, deferral: deferral, changedPath: change.path) }
                             catch { nativeLog("Reply failure filing failed: %@", error.localizedDescription) }
@@ -778,9 +580,7 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                         }
                         return "reply routes"
                     }
-                    // A sibling's infinite stream must not hide a lost source.
-                    // Finish before draining so BackgroundLoops can report and
-                    // rebuild its listener through its existing restart owner.
+                    // Finish before draining: an infinite sibling must not hide source loss from the listener restart owner.
                     if let source = await group.next(), !Task.isCancelled {
                         nativeLog("DelegationOutcomeLoop: %@ event source ended; rebuilding fan-in", source)
                         continuation.finish()
@@ -796,21 +596,18 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     func nextMeaningfulDeadline(after now: Date) async -> Date? {
         let stall = DelegationStatusProjector(configRoot: configRoot, dataRoot: dataRoot)
             .nextStallDeadline(after: now)
-        // Capped healthy batches request their own coalesced event. Only real
-        // domain deadlines belong here; failures wait for repair/source events
-        // or the six-hour missed-event integrity sweep.
+        // Healthy capped outcome batches request coalesced events; deadlines belong to domain work.
+        // Settlement failures do not yet carry their own wake, so this organ retains its six-hour integrity rhythm.
         let conversation = port.nextConversationDeadline(after: now)
         var quietEnd: Date?
         do {
             if let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot),
                window.contains(hour: Calendar.current.component(.hour, from: now)) {
                 quietEnd = window.end(after: now)
-                // The existing saved-delivery pass runs at this exact crossing.
                 await deferral.requestReplyReconciliation()
             }
         } catch {
-            // Preference repair/source events rearm this deadline. The failed
-            // read records repair owed and cannot authorize reply release.
+            // An unreadable preference cannot authorize release; repair/source events rearm the deadline.
         }
         return [stall, conversation, quietEnd].compactMap { $0 }.min()
     }

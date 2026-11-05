@@ -5,9 +5,9 @@ import Transcripts
 import CognitiveSubstrate
 import Studio
 
-// Blueprint: | `DreamProvenance.swift` | `DreamEntryProvenance`, `DreamClaimSection` and `DreamSourceRef`: checked section-scoped claim evidence, exact unavailable lines, source resolution and peer provenance; pending work stays out of model input |
+// Blueprint: | `DreamProvenance.swift` | `DreamEntryProvenance`, `DreamClaimSection`, `DreamSourceRef`. |
 
-/// A malformed claim makes this section unavailable, without discarding siblings.
+/// A malformed claim makes only its own section unavailable; siblings remain readable.
 public struct DreamClaimSection<Claim: Sendable>: Sendable {
     public let content: String
     public let line: Int
@@ -15,7 +15,6 @@ public struct DreamClaimSection<Claim: Sendable>: Sendable {
     public let unavailable: String?
 }
 
-/// An original row, its known exchange, or a consolidated stretch.
 public struct DreamSourceRef: Sendable, Equatable {
     public var kind: String
     public var id: String
@@ -36,8 +35,7 @@ public struct DreamSourceRef: Sendable, Equatable {
     }
 }
 
-/// Each claim keeps only the experiences the dream named for that claim.
-/// The claim block is the source of support; other diary prose establishes no lineage.
+/// Bind support only to experiences named by the claim block; other diary prose establishes no lineage.
 public struct DreamEntryProvenance: Sendable, Codable, Equatable {
     public var quote: String
     public var sourceRefs: [String]
@@ -50,12 +48,10 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
     private static let prefix = "<!-- claim-sources "
     private static let peersPrefix = "<!-- dream-peers "
 
-    /// A day's entry holds one peers line per dream section; the day's peers
-    /// are their union, and unknown when any section's are.
+    /// A day's peer provenance is the union of its sections and unknown if any section is unknown.
     static func peerIds(in content: String) -> [String]? {
         let lines = content.components(separatedBy: "\n").filter { $0.hasPrefix(peersPrefix) }
-        // One marker per dream of the night: a dream without one leaves the
-        // whole day's peers unknown.
+        // A dream without a peer marker leaves the whole day's peer provenance unknown.
         guard !lines.isEmpty, lines.count >= max(1, DreamNight(content).dreams.count) else { return nil }
         return CognitiveReflectionCause.unionPeerIds(lines.map { line in
             guard line.hasSuffix(" -->") else { return nil }
@@ -72,14 +68,10 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         var metadata: [String: JSONValue] = [:]
         if case .object(let value)? = row["metadata"] { metadata = value }
         metadata["sessionId"] = .string(session)
-        if let recollection = ChatSessionRecollections.recollection(fromTranscriptRow: .object(row), sessionId: session) {
-            // Continuity records the participant, not the consumed peer checkpoint.
-            return CognitiveReflectionCause(text: "\(DreamCycleRunner.recollectionRole):\n\(recollection.text)")
-        }
         guard ["user", "assistant"].contains(role), case .string(let content)? = row["content"] else { return nil }
         let text = "\(role):\n\(content)"
         var peers = CognitiveSubstrate.peerIdentity(metadata: metadata, dataRoot: dataRoot).map { [$0] } ?? []
-        let binding = ChatSessionRecollections.continuityBinding(role: role, metadata: metadata)
+        let binding = ConversationHistory.continuityBinding(role: role, metadata: metadata)
         if case .object(let value)? = binding, case .string(let participant)? = value["participant"],
            participant.hasPrefix("peer:") { peers.append(participant) }
         var carried = [metadata["untrusted_sources"]]
@@ -96,7 +88,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         return CognitiveReflectionCause(text: text, sourcePeerIds: Array(Set(peers)).sorted())
     }
 
-    /// Resolve exact cited rows; an exchange identity groups recurrence, not its material.
+    /// Resolve exact cited rows; exchange identity groups recurrence without defining its material.
     static func resolveSources(_ refs: Set<String>, dataRoot: URL,
         messages: [String: (session: String, row: [String: JSONValue])]
     ) async throws -> [String: CognitiveReflectionCause] {
@@ -124,12 +116,11 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         return material
     }
 
-    /// A source reference without its `@<lived date>` tail.
     static func undated(_ reference: String) -> String {
         reference.lastIndex(of: "@").map { String(reference[..<$0]) } ?? reference
     }
 
-    /// Text as words: curly quotes read as straight ones and runs of whitespace as one space.
+    /// Normalize quote typography and whitespace without changing words.
     static func plain(_ text: String) -> String {
         let straight = text.map { char -> Character in
             switch char {
@@ -141,17 +132,18 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         return String(straight).split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
-    /// The claims her prose backs, as lineage lines. A claim the prose or the dream's reading
-    /// does not back is left without lineage and named in `dropped`; it never costs the night.
+    /// Leave unsupported claims without lineage and name them as dropped without discarding the night.
     static func renderBlock(_ claims: [DreamClaim], content: String, sources: [DreamSourceRef], dropped: inout [String]) throws -> String {
         guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers"),
               !content.contains(DreamPendingWork.identityPrefix),
               !content.components(separatedBy: "\n").dropFirst().contains(where: { $0.hasPrefix(DreamNight.againHeading) }) else {
             throw NSError(domain: "NativeAgent.DreamEntryProvenance", code: 1, userInfo: [NSLocalizedDescriptionKey:
-                "The dream's claim check refused the model's reply: its prose contains reserved dream metadata or a section heading. Nothing was written; the night stays owed and the next run retries it."])
+                """
+                    The dream's claim check refused the model's reply: its prose contains reserved dream metadata or a section heading. Nothing was written; \
+                    the night stays owed and the next run retries it.
+                    """])
         }
-        // The model cites a source by its identity; the @date tail it may leave
-        // off or misquote. What is kept is the dream's own reference and date.
+        // Bind the dream's own reference and date rather than trusting a model-repeated date tail.
         let canonical = Dictionary(sources.map { (undated($0.reference), $0.reference) }, uniquingKeysWith: { first, _ in first })
         let prose = plain(content)
         var result = ""
@@ -159,7 +151,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
             let claim = original.provenance
             let quote = "claims[\(index)] \"" + String(claim.quote.prefix(80)) + "\""
             guard !claim.quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { dropped.append("claims[\(index)] has an empty quote"); continue }
-            // A quote is the same words whatever the typography: curly or straight quotes, spacing.
+            // Quote matching tolerates typography and spacing without changing words.
             guard prose.contains(plain(claim.quote)) else { dropped.append(quote + " is not in the dream's prose"); continue }
             let unbound = claim.sourceRefs.filter { canonical[undated($0)] == nil }
             guard unbound.isEmpty else {
@@ -174,8 +166,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         return result
     }
 
-    /// Read the live writer's trailing block, checking every reserved claim line.
-    /// An absent block is unknown evidence; a present damaged block is a named gap.
+    /// Absent claim blocks are unknown; damaged current blocks are named gaps.
     static func readClaims<Claim: Decodable & Sendable>(in content: String, as: Claim.Type) -> [DreamClaimSection<Claim>] {
         let lines = content.components(separatedBy: "\n")
         let starts = [0] + lines.indices.filter { $0 > 0 && lines[$0].hasPrefix(DreamNight.againHeading) }
@@ -194,7 +185,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
                             throw PersistenceCoreError.ioFailure("malformed claim-sources delimiter")
                         }
                         let data = Data(line.dropFirst(prefix.count).dropLast(4).utf8)
-                        // Validate the whole current claim, even when a caller needs only lineage.
+                        // Validate the whole claim even when the caller requests only lineage.
                         _ = try JSONDecoder().decode(DreamClaim.self, from: data)
                         claims.append(try JSONDecoder().decode(Claim.self, from: data))
                     } catch {

@@ -18,11 +18,7 @@ import ProviderRouting
 import TurnTrace
 // Blueprint: | `MobileSnapshotBuilder.swift` | Snapshot integrity vocabulary and bounded mobile projection construction |
 
-/// Reconciles the persisted snapshot-digest cache against the files the iPhone
-/// actually reads.  The digest cache is an optimization, never evidence that
-/// a file remains intact: a same-name file can be truncated or replaced by an
-/// out-of-process iCloud/crash-window event while its old digest still sits in
-/// memory. Exact file observation and explicit launch/repair reconciliation share this check.
+/// Cached digests cannot prove file integrity after external replacement; reconcile exact phone-readable files on observation and repair.
 struct SnapshotFileDigest: Codable, Equatable, Sendable {
     let payload: String
     let wire: String
@@ -52,9 +48,7 @@ enum MacSyncSnapshotIntegrity {
         }
     }
 
-    /// Only files carried by the current mobile snapshot manifest are repaired.
-    /// A missing digest for a retired file is pruned without manufacturing a
-    /// costly rebuild for a contract the phone no longer consumes.
+    /// Repair only current manifest files; stale digest keys cannot justify rebuilding files outside the phone contract.
     static func reconcile(
         digests: [String: SnapshotFileDigest],
         in directory: URL,
@@ -75,9 +69,7 @@ enum MacSyncSnapshotIntegrity {
                 continue
             }
             guard isManaged else {
-                // A stale key must not keep claiming a file that no longer
-                // belongs to the mobile contract, even if a same-name artifact
-                // happens to remain in the directory.
+                // A stale digest cannot claim a file outside the mobile contract, even when a same-name artifact remains.
                 retired.append(filename)
                 continue
             }
@@ -114,9 +106,7 @@ enum MacSyncSnapshotIntegrity {
     }
 }
 
-/// One non-main executor for all snapshot CPU work, including bridge envelopes.
-/// Jobs are synchronous within this actor: no suspension can interleave builds.
-/// The engine retains ownership of demand, lifecycle fences and publication.
+/// Synchronous actor jobs serialize off-main snapshot CPU work; demand, fences and publication stay with the engine.
 actor MobileSnapshotBuilder {
     static let shared = MobileSnapshotBuilder()
 
@@ -139,14 +129,35 @@ actor MobileSnapshotBuilder {
         try MobileInbox.data(from: items, encoder: Self.encoder(), alreadyNewestFirst: true)
     }
 
-    func desk(_ items: [DeskItem], executions: [WorkshopTaskRecord]?) throws -> (data: Data, included: Int) {
-        let evidence = executions?.map { DeskExecutionEvidence(deskHandle: $0.deskHandle, status: $0.status,
-            updatedAt: $0.updatedAt, lastMovementAt: $0.lastMovementAt) }
-        return try MobileDesk.data(from: items, evidence: evidence ?? [], encoder: Self.encoder())
+    /// The jobs carrying Desk items are their movement on the phone, as on the Mac.
+    func desk(_ items: [DeskItem], evidence: [DeskExecutionEvidence]?) throws -> (data: Data, included: Int) {
+        try MobileDesk.data(from: items, evidence: evidence ?? [], encoder: Self.encoder())
     }
 
     func deskReadingCopies(_ items: [DeskItem]) throws -> (data: Data, included: Int) {
         try MobileDeskReadingCopy.data(from: items, encoder: Self.encoder())
+    }
+
+    /// Admit whole faces against the actual transport envelope; one page that cannot fit never displaces its siblings.
+    func faces(_ snapshots: [String: PartFaceSnapshot]) throws -> (data: Data, skipped: [String: String]) {
+        let encoder = Self.encoder()
+        var included: [String: PartFaceSnapshot] = [:]
+        var skipped: [String: String] = [:]
+        var data = try encoder.encode(included)
+        _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": data])
+        for (page, snapshot) in snapshots.sorted(by: { $0.key < $1.key }) {
+            var candidate = included
+            candidate[page] = snapshot
+            let bytes = try encoder.encode(candidate)
+            do {
+                _ = try NAMobileSnapshotStatusCodec.encode(group: .faces, files: ["faces.json": bytes])
+                included = candidate
+                data = bytes
+            } catch DeviceSyncError.payloadTooLarge(let actual, let maximum) {
+                skipped[page] = "Phone snapshot budget exceeded (\(actual) bytes; maximum \(maximum))."
+            }
+        }
+        return (data, skipped)
     }
 
     func status(group: NAMobileSnapshotGroup, directory: URL, committed: [String: Data]) async throws -> String? {
@@ -252,23 +263,13 @@ enum MobileDesk {
     }
 }
 
-/// Complete reading copies of the few Desk items worth having in a pocket. The
-/// compact board (`desk.json`) is unchanged and still carries every row; this
-/// rides beside it and carries the UNCLIPPED text of the items you are most
-/// likely to open away from the Mac — the ones waiting on you, the pinned
-/// active ones, and then the most recently touched ones. Priority order is also
-/// the encoding order, so the size bound drops the least-wanted copies first.
+/// Carry full priority-item text beside the compact board for offline reading; priority encoding drops least-needed copies first.
 enum MobileDeskReadingCopy {
     static let maximumItems = 25
     static let maximumNotesPerItem = 60
-    /// Half the compact board's bound, because the two travel together: the
-    /// .desk group packs desk.json, desk_bounds.json and this file into a
-    /// single 800 KiB status envelope. At 512 KiB each, an ordinary pair of
-    /// full files left the envelope no margin at all; at 256 KiB the copies
-    /// still carry ~10 KiB per item, which is a long note, not a clipped one.
+    /// Reserve half the board budget: desk.json, bounds and copies share an 800 KiB envelope and need compression headroom.
     static let maximumEncodedBytes = 256 * 1024
-    /// Generous per-string ceilings. These exist so one pathological item
-    /// cannot consume the whole file, not to clip ordinary reading material.
+    /// Per-string ceilings keep one pathological item from consuming the whole reading-copy file.
     static let maximumTextCharacters = 20_000
 
     static func priorityRank(requiresOwnerInput: Bool, pinned: Bool) -> Int {
@@ -291,8 +292,7 @@ enum MobileDeskReadingCopy {
             .map { item in
                 MobileDeskItemReadingCopy(
                     handle: item.handle,
-                    // The source timestamp of the copy, so the phone can say how
-                    // old this reading material is rather than imply it is live.
+                    // Source timestamps expose copy age so offline material cannot appear live.
                     capturedAt: item.updatedAt,
                     summary: item.summary.map { String($0.prefix(maximumTextCharacters)) },
                     blockedReason: item.blockedReason.map { String($0.prefix(maximumTextCharacters)) },

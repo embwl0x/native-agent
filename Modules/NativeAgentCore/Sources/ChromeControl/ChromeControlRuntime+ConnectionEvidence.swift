@@ -7,7 +7,7 @@ import NativeAgentCore
 import TrustCenter
 import MacControl
 import NativeAgentShared
-// Blueprint: | `ChromeControlRuntime+ConnectionEvidence.swift` | `ChromeControlRuntime` connection evidence: sole persisted historical facts, current-code setup verification and diagnostics, connection diagnosis, capture/relay errors and observed browser signature preflight; observations never prove connection or permission |
+// Blueprint: | `ChromeControlRuntime+ConnectionEvidence.swift` | `ChromeControlRuntime`; Historical facts never prove connection. |
 
 /// Historical observations only. Never used as connection or permission proof.
 struct ChromeConnectionFacts: Codable {
@@ -52,10 +52,11 @@ final class ChromeBrowserLaunchObserver: @unchecked Sendable {
 }
 
 extension ChromeControlRuntime {
-    public func setupConnectionStatus(fresh: Bool = false) async -> (state: ChromeControlConnectionState, enabled: Bool, diagnostics: [String: JSONValue]) {
+    public func setupConnectionStatus(fresh: Bool = false, context: MacOperationContext) async -> (state: ChromeControlConnectionState, enabled: Bool,
+        diagnostics: [String: JSONValue]) {
         let enabled = await transportAvailable()
         let browsers = await Self.runningChromeProcesses()
-        readExtensionFiles(fresh: fresh)
+        readExtensionFiles(fresh: fresh, context: context)
         reconcileReloadBrowser(browsers)
         var diagnostics = connectionDiagnostics(browsers: browsers)
         if let failure = transportAuthorityFailure {
@@ -68,21 +69,23 @@ extension ChromeControlRuntime {
         return (connectionState, enabled, diagnostics)
     }
 
-    public func verifySetup(since selectedAt: Date) async throws {
+    public func verifySetup(since selectedAt: Date, context: MacOperationContext) async throws {
         do {
-            if try await TurnDeadline.withThrowingDeadline(seconds: 30, {
-                try await self.waitForSetup(since: selectedAt)
+            if try await OperationWaitBudget.withDeadline(seconds: 30, budget: context.waitBudget, { budget in
+                try await context.holding(\.deadline, budget.deadline) { context in
+                    try await self.waitForSetup(since: selectedAt, context: context)
+                }
             }) { return }
-        } catch is TurnDeadline.DeadlineExceeded {}
+        } catch is OperationWaitBudget.Exceeded {}
         try Task.checkCancellation()
-        let failure = await connectionFailure()
+        let failure = await connectionFailure( context: context)
         throw ToolFailureError(failure.message, effects: .occurred, owner: failure.owner,
             nextCall: failure.nextCall, tap: failure.tap)
     }
 
-    private func waitForSetup(since selectedAt: Date) async throws -> Bool {
+    private func waitForSetup(since selectedAt: Date, context: MacOperationContext) async throws -> Bool {
         let events = connectionStates()
-        readExtensionFiles(fresh: true)
+        readExtensionFiles(fresh: true, context: context)
         for await _ in events {
             try Task.checkCancellation()
             if readyChannel != nil, let seen = facts.extensionSeenAt, seen >= selectedAt,
@@ -131,7 +134,10 @@ extension ChromeControlRuntime {
             "extension_last_seen_at": Self.dateJSON(facts.extensionSeenAt),
             "extension_connected_since_runtime_start": .bool(extensionConnectedThisRun),
             "relay_connected": .bool(channel != nil || connectingChannel != nil),
-            "handshake_result": .string(channel != nil ? (extensionHasTabProtocol ? "accepted" : "extension_upgrade_required") : connectingChannel != nil ? "extension_attach_pending" : "not_connected"),
+            "handshake_result": .string(
+                channel != nil
+                    ? (extensionHasTabProtocol
+                        ? "accepted" : "extension_upgrade_required") : connectingChannel != nil ? "extension_attach_pending" : "not_connected"),
             "handshake_at": channel != nil || connectingChannel != nil ? Self.dateJSON(handshakeAt) : .null,
             "handshake_reason": .null,
             "last_handshake_result": facts.handshakeResult.map(JSONValue.string) ?? .null,
@@ -150,7 +156,11 @@ extension ChromeControlRuntime {
             "down_side": readyChannel != nil ? .null : .string(disconnected.side),
             "connection_note": readyChannel != nil ? .string("The app accepted the relay and confirmed the extension's protocol greeting.")
                 : .string(disconnected.reason),
-            "provenance": .string("raw view · Chrome native messaging transport, registered unpacked and bundled manifests, Chrome profile preferences, app listener, macOS running-application inventory and running-code signature validation; last-seen facts are historical observations."),
+            "provenance": .string(
+                """
+                    raw view · Chrome native messaging transport, registered unpacked and bundled manifests, Chrome profile preferences, app listener, \
+                    macOS running-application inventory and running-code signature validation; last-seen facts are historical observations.
+                    """),
         ]
         if reload != .null, reload == facts.extensionReload {
             diagnostics.removeValue(forKey: "extension_reload_last_seen")
@@ -222,7 +232,10 @@ extension ChromeControlRuntime {
             signatureFailures[pid] = refusal
             guard !signatureFailureNoted else { return }
             signatureFailureNoted = true
-            let message = "Chrome's running-browser signature check failed: \(failure.localizedDescription) The relay will refuse Chrome until this check is fixed. raw view · macOS running Chrome process and ChromeHostIdentity signature validation; no page was read."
+            let message = """
+                Chrome's running-browser signature check failed: \(failure.localizedDescription) The relay will refuse Chrome until this check is fixed. \
+                raw view · macOS running Chrome process and ChromeHostIdentity signature validation; no page was read.
+                """
             let id = "chrome-browser-signature-\(ProcessInfo.processInfo.operatingSystemVersionString)-\(failure.check)-\(failure.status)"
             do { try await signatureFailureNote(id, message) }
             catch {
@@ -239,23 +252,28 @@ extension ChromeControlRuntime {
     private func disconnection(chromeRunning: Bool, refusal: ChromeRelayRefusal?) -> (side: String, reason: String) {
         let result: (side: String, reason: String)
         if channel != nil, !extensionHasTabProtocol {
-            result = ("extension_upgrade", extensionReload?.reason ?? extensionFilesError ?? "The connected Chrome extension needs the shipped tab protocol before Chrome control is ready.")
+            result = (
+                "extension_upgrade",
+                extensionReload?.reason
+                    ?? extensionFilesError ?? "The connected Chrome extension needs the shipped tab protocol before Chrome control is ready.")
         } else if listenerDescriptor < 0 {
             result = ("app_listener", "NativeAgent's Chrome listener is not running. " + (listenerFailure ?? "No app-side listener is available."))
         } else if !chromeRunning { result = ("chrome", "Chrome is not running.") }
         else if connectingChannel != nil { result = ("extension_attach", "The app accepted the relay; the extension's attach greeting is still pending.") }
         else if let refusal { result = ("relay_refusal", "Chrome relay refused at \(refusal.check): \(refusal.reason)") }
         else if extensionFiles == nil {
-            result = ("extension_setup", "The NativeAgent extension is not set up in Chrome. \(extensionFilesError ?? "") Call chrome.setup (Set up Chrome) to load it.")
+            result = (
+                "extension_setup",
+                "The NativeAgent extension is not set up in Chrome. \(extensionFilesError ?? "") Call chrome.setup (Set up Chrome) to load it.")
         } else { result = ("extension_link", "Chrome is running, but NativeAgent has no accepted extension connection. The app listener is up.") }
         return (result.side, channel != nil && extensionHasTabProtocol
             ? "The Chrome extension reconnected while this request was being refused. Nothing was sent." : result.reason)
     }
 
-    func connectionFailure() async -> ToolFailureError {
+    func connectionFailure( context: MacOperationContext) async -> ToolFailureError {
         let browsers = await Self.runningChromeProcesses()
         let refusal = currentRefusal(relayRefusal().record, browsers: browsers)
-        readExtensionFiles()
+        readExtensionFiles( context: context)
         let disconnected = disconnection(chromeRunning: !browsers.isEmpty, refusal: refusal)
         if readyChannel != nil || connectingChannel != nil {
             return ToolFailureError(disconnected.reason
@@ -264,7 +282,10 @@ extension ChromeControlRuntime {
                 nextCall: ToolFailureError.call("app", ["action": .string("chrome.status")]))
         }
         return ToolFailureError(disconnected.reason
-            + " Call chrome.setup, then use mac.look and mac.act on Chrome's extensions page to load or reload NativeAgent. Only an accepted connection proves repair.",
+            + """
+                 Call chrome.setup, then use mac.look and mac.act on Chrome's extensions page to load or reload NativeAgent. Only an accepted connection \
+                proves repair.
+                """,
             effects: .none, owner: "Chrome native messaging / " + disconnected.side,
             nextCall: ToolFailureError.call("app", ["action": .string("chrome.setup")]))
     }

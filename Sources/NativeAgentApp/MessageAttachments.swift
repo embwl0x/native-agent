@@ -40,7 +40,11 @@ import Desk
 // Blueprint: | `MessageAttachments.swift` | Transcript-owned local image previews, voice-note partition and attachment chips |
 
 enum ChatAttachmentPresentation {
-    static func partition(_ attachments: [PersistedAttachment]) -> (localImages: [PersistedAttachment], audio: [PersistedAttachment], chips: [PersistedAttachment]) {
+    static func partition(_ attachments: [PersistedAttachment]) -> (
+        localImages: [PersistedAttachment],
+        audio: [PersistedAttachment],
+        chips: [PersistedAttachment]
+    ) {
         let localImages = attachments.filter { attachment in
             attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
                 && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
@@ -53,7 +57,6 @@ enum ChatAttachmentPresentation {
     }
 }
 
-/// The unavailable label for an image projected by the transcript owner.
 enum ChatLocalImageAttachmentPresentation {
     static func unavailableDetail(for attachment: PersistedAttachment) -> String {
         let name = attachment.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -64,7 +67,6 @@ enum ChatLocalImageAttachmentPresentation {
     }
 }
 
-/// Attachments that cannot render inline remain visible as file chips.
 struct MessageAttachmentChipView: View {
     let attachment: PersistedAttachment
 
@@ -154,7 +156,7 @@ struct MessageLocalImageAttachmentView: View {
                         }
                     }
                 }
-        } else if attachment.preview == nil {
+        } else if attachment.preview == nil, imagePath != nil {
             Color.clear
                 .frame(width: 160, height: 120)
                 .overlay { ProgressView().controlSize(.small) }

@@ -1,27 +1,6 @@
 import Foundation
 import CoreFoundation
-// Blueprint: | `StandingBotsModels.swift` | Helper definitions own name, optional personality, unified job brief and provider/budget settings; cadence, run and shelf values |
-
-/// Retained definition/audit documents still carry the sources key. Keep its
-/// one reader until that DATA-FIRST format is explicitly retired.
-private enum LegacyBotSource: Decodable {
-    case http(String)
-    case tool(String)
-
-    var reference: String {
-        switch self { case .http(let url): return url; case .tool(let name): return "tool:" + name }
-    }
-    private enum CodingKeys: String, CodingKey { case type, url, name }
-    init(from decoder: Decoder) throws {
-        if let url = try? decoder.singleValueContainer().decode(String.self) { self = .http(url); return }
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        switch try c.decode(String.self, forKey: .type) {
-        case "http": self = .http(try c.decode(String.self, forKey: .url))
-        case "tool": self = .tool(try c.decode(String.self, forKey: .name))
-        default: throw StandingBotsError.invalidValue("sources accept http {url} or tool {name}")
-        }
-    }
-}
+// Blueprint: | `StandingBotsModels.swift` | Helper identity/job/provider/budget definitions and cadence, run and shelf values |
 
 public enum BotRunLimits {
     /// Person-owned app preference; no bot tool exposes a setter.
@@ -33,7 +12,10 @@ public enum BotRunLimits {
         guard let value = saved as? NSNumber,
               CFGetTypeID(value) != CFBooleanGetTypeID(),
               value.doubleValue.isFinite, (1...15).contains(value.doubleValue) else {
-            throw StandingBotsError.invalidValue("Closest a bot may run is unreadable. Set it to a number from 1 to 15 minutes in Helpers settings before scheduling or changing a cadence.")
+            throw StandingBotsError.invalidValue("""
+                Closest a bot may run is unreadable. Set it to a number from 1 to 15 minutes in Helpers settings before scheduling or \
+                changing a cadence.
+                """)
         }
         return value.doubleValue * 60
     }
@@ -41,8 +23,7 @@ public enum BotRunLimits {
     public static let maximumSeconds: TimeInterval = 120
 }
 
-/// BotRunnerScheduler schedules this cadence through StandingBotsDisk's shared calendar math.
-/// Cron runs on the Mac's local clock; historical saved timeZone values are ignored.
+/// Share calendar math between cadence and scheduler; cron follows the Mac's local civil clock.
 public enum BotCadence: Codable, Equatable, Sendable {
     case manual
     case interval(seconds: TimeInterval)
@@ -62,27 +43,25 @@ public struct BotBudget: Codable, Equatable, Sendable {
 public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public var name: String
-    /// Who this helper is: its own personality, set by the person or by her
-    /// when it is made. Nil is a helper defined by its job alone.
+    /// Nil personality means the helper is defined by its job alone.
     public var personality: String? = nil
     public var brief: String
     public internal(set) var briefVersion: Int
     public var cadence: BotCadence
-    /// An optional outside event that wakes this helper.
     public var eventTrigger: BotEventTrigger? = nil
     public var provider: String? = nil
     public var model: String? = nil
-    /// Missing on legacy definitions; nil follows Providers.
+    /// Nil inherits Providers instead of pinning a model choice.
     public var modelPinned: Bool? = false
     public var reasoningEffort: String? = nil
     public var fast: Bool? = nil
     public var dailyTokenCeiling: Int? = nil
     public var notificationCondition: String? = nil
     public var deleted: Bool? = nil
-    public var sessionID: String { "bot-" + id.uuidString.lowercased() }
+    public var sessionID: String { Self.sessionID(for: id) }
+    public static func sessionID(for id: UUID) -> String { "bot-" + id.uuidString.lowercased() }
 
-    /// Inverse of this owner's session locator. This identifies a particular
-    /// helper for routing, never whose conversation a session is.
+    /// Resolve helper routing only; a locator does not establish conversation ownership.
     public static func id(forSession sessionID: String?) -> UUID? {
         guard let sessionID, sessionID.hasPrefix("bot-") else { return nil }
         return UUID(uuidString: String(sessionID.dropFirst(4)))
@@ -108,7 +87,6 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
 }
 
 extension BotDefinition {
-    private enum LegacyCodingKeys: String, CodingKey { case sources }
     private enum CodingKeys: String, CodingKey {
         case id, name, personality, brief, briefVersion, cadence, budget, paused, createdAt, updatedAt
         case provider, model, modelPinned, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
@@ -122,9 +100,6 @@ extension BotDefinition {
         brief = try c.decode(String.self, forKey: .brief)
         briefVersion = try c.decode(Int.self, forKey: .briefVersion)
         cadence = try c.decode(BotCadence.self, forKey: .cadence)
-        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
-        let oldSources = try legacy.decodeIfPresent([LegacyBotSource].self, forKey: .sources) ?? []
-        if !oldSources.isEmpty { brief += "\n\nSources: " + oldSources.map(\.reference).joined(separator: ", ") }
         budget = try c.decode(BotBudget.self, forKey: .budget)
         paused = try c.decode(Bool.self, forKey: .paused)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
@@ -179,10 +154,7 @@ public struct ShelfSourceLink: Codable, Equatable, Sendable {
 }
 
 public struct ShelfSpend: Codable, Equatable, Sendable {
-    /// What the run ACTUALLY used, when the turn recorded it. The daily
-    /// reservation is a ceiling held in budget accounting, not a measurement:
-    /// writing it here made every entry Agent reads report a spend that nobody
-    /// counted. Nil means no usage was recorded, which is not zero.
+    /// Record measured usage only: a daily reservation is a ceiling, and missing measurement is not zero.
     public var tokens: Int?
     public var seconds: TimeInterval
     public init(tokens: Int?, seconds: TimeInterval) { self.tokens = tokens; self.seconds = seconds }
@@ -208,19 +180,13 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     public var status: BotRunStatus? = nil
     public var statusDetail: String? = nil
     public var sessionID: String? = nil
-    /// The model the run actually ran on, recorded at run time so a settled
-    /// card is honest after the bot's choice changes. Optional: entries
-    /// written before 0.4.12 decode without it.
+    /// Retain the actual run model so settled cards remain honest after provider choices change.
     public var model: String? = nil
-    /// The approval this run stopped on, when it stopped on one. The approval
-    /// record — not this entry — is the canonical word on whether it is still
-    /// waiting, so the shelf reads that record rather than freezing "Waiting for
-    /// approval" until some later run replaces the entry.
+    /// Canonical approval state owns waiting; the shelf must reconcile it rather than freeze the saved status.
     public var approvalID: String? = nil
     /// True for a helper-message answer (bot_ask); nil means this field was not recorded.
     public var asked: Bool? = nil
-    /// A conditioned run has a notification title: true notifies its result,
-    /// false suppresses it, nil notifies that the job couldn't tell.
+    /// A missing verdict still owes notification with uncertainty; only an explicit false suppresses it.
     public var conditionMet: Bool? = nil
     public var conditionNotificationTitle: String? = nil
     public var actualReply: String { reply ?? findings }
@@ -254,7 +220,6 @@ public struct ShelfIndexRow: Equatable, Sendable, Identifiable {
 public struct ShelfReadPage: Equatable, Sendable {
     public let rows: [ShelfIndexRow]
     public let nextCursor: String?
-    /// True when another matching row exists, or an index headline was shortened.
     public let truncated: Bool
     public var nextOffset: Int? = nil
 }
@@ -265,16 +230,13 @@ public struct ShelfReaderCursor: Codable, Equatable, Sendable {
     public internal(set) var readEntryIds: Set<UUID>
 }
 
-/// A due occurrence the scheduler found already past its window with no run.
-/// A record, never a retry: the missed occurrence is skipped and the next one
-/// is scheduled normally.
+/// Record expired occurrences without retrying them; the scheduler advances to the next occurrence.
 public struct BotMissedRun: Codable, Equatable, Sendable {
     public enum Reason: String, Codable, Sendable {
         case autonomyOff, appClosed, asleep, queueBusy, overBudget, notRun
-        /// A gate refused the run before any turn started — a retired model, a
-        /// disconnected account. `detail` carries the gate's own words.
+        /// Refused before any turn began; detail preserves the gate's observed reason.
         case blocked
-        /// Plain words for the card. Only what the scheduler can actually know.
+        /// Show only what the scheduler can establish.
         public var words: String {
             switch self {
             case .autonomyOff: return "Autonomy was off"
@@ -289,13 +251,11 @@ public struct BotMissedRun: Codable, Equatable, Sendable {
     }
     public var dueAt: Date
     public var reason: Reason
-    /// What to fix, in a person's words, when the reason alone does not say.
-    /// Absent on every record written before this.
+    /// Carry an actionable remedy when the reason alone does not explain repair.
     public var detail: String? = nil
     public init(dueAt: Date, reason: Reason, detail: String? = nil) {
         self.dueAt = dueAt; self.reason = reason; self.detail = detail
     }
-    /// "could not run: Choose a model on that account."
     public var words: String {
         [reason.words, detail].compactMap { $0 }.joined(separator: ": ")
     }

@@ -7,10 +7,8 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-import WorkshopExecution
 // Blueprint: | `TriggerWireValues.swift` | Trigger configuration, errors, result envelopes and notification values; lossless saved-field round trips |
 
-/// Invalid trigger input or unavailable configuration storage.
 public enum TriggerSchedulerError: Error, LocalizedError {
     case invalidRequest(String)
     case persistenceFailure(String)
@@ -18,24 +16,24 @@ public enum TriggerSchedulerError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .invalidRequest(let msg): return "schedule_input_invalid: \(msg). Correct the named input in the scheduled Desk task request."
-        case .persistenceFailure(let m): return "schedule_store_unavailable: \(m). Inspect the named scheduler file and repair its contents or access before changing scheduled Desk tasks."
+        case .persistenceFailure(let m):
+            return """
+                schedule_store_unavailable: \(m). Inspect the named scheduler file and repair its contents or access before changing \
+                scheduled Desk tasks.
+                """
         }
     }
 }
 
 /// Preserve unknown top-level fields through extras and per-kind fields through config.
 public struct TriggerConfig: Sendable, Equatable {
-    // Required.
     public var name: String
     public var enabled: Bool
 
-    // Optional typed fields. Absent → nil. Present → some(v).
     public var kind: String?
     public var description: String?
 
-    // The trigger's own `config` dict — flexible bag of per-kind keys
-    // (paths/hour/minute/idle_minutes/etc.). Always JSONValue.object(...)
-    // when present, even if empty.
+    // Keep per-kind config as an object even when empty so its shape survives round trips.
     public var config: JSONValue?
 
     /// Lossless unknown top-level fields, including execution metadata and saved migration markers.
@@ -64,10 +62,8 @@ extension TriggerConfig {
 
     public init?(json: JSONValue) {
         guard case .object(let obj) = json else { return nil }
-        // name is required and must be non-empty.
         guard case .string(let nm) = obj["name"] ?? .null, !nm.isEmpty else { return nil }
         self.name = nm
-        // Missing or non-Boolean enabled values are false.
         if case .bool(let b) = obj["enabled"] ?? .null {
             self.enabled = b
         } else {
@@ -104,11 +100,10 @@ extension TriggerConfig {
     }
 }
 
-/// Enable/disable result with name, optional enabled state and status.
 public struct TriggerStatus: Sendable, Equatable {
     public var name: String
     public var enabled: Bool?
-    public var status: String     // "updated" | "not_found"
+    public var status: String
 
     public init(name: String, enabled: Bool?, status: String) {
         self.name = name
@@ -117,19 +112,18 @@ public struct TriggerStatus: Sendable, Equatable {
     }
 }
 
-/// Fire result with optional inbox-card or Workshop execution identity.
 public struct TriggerFireResult: Sendable, Equatable {
-    public var status: String           // "fired" | "not_found" | "error"
+    public var status: String
     public var name: String?
-    public var itemId: String?          // inbox
-    public var executionId: String?       // Workshop execution
-    public var deskHandle: String?      // Workshop identity for scheduled work
-    public var stub: Bool?              // inbox only
+    public var itemId: String?
+    public var executionId: String?
+    public var deskHandle: String?
+    public var stub: Bool?
     public var error: String?
     /// The newly accepted card; nil when an existing card represents the fire.
-    public var item: JSONValue?         // inbox only
+    public var item: JSONValue?
     /// Whether the router projected transport acceptance or queueing for this card.
-    public var notified: Bool?          // inbox only
+    public var notified: Bool?
 
     public init(
         status: String,
@@ -154,16 +148,14 @@ public struct TriggerFireResult: Sendable, Equatable {
     }
 }
 
-/// What a fired trigger asks the app to push. App-agnostic by construction.
 public struct TriggerNotification: Sendable, Equatable {
     public let triggerName: String
     public let kind: String
     public let title: String
-    public let body: String        // the item summary, truncated for a push
-    public let screen: String      // "inbox"
-    public let source: String      // "trigger:<name>"
-    public let urgency: String     // severity-derived: important → "high"
-    /// The accepted card and its stable inbox identity.
+    public let body: String
+    public let screen: String
+    public let source: String
+    public let urgency: String
     public var ownerWaiting: Bool { kind != "time" && urgency == "high" }
     public let itemId: String
     public let item: JSONValue
@@ -185,6 +177,5 @@ public struct TriggerNotification: Sendable, Equatable {
     }
 }
 
-/// Delivers an accepted card to snapshots, then optionally notifies. Returns
-/// delivery fields or `.null` on failure; delivery never undoes card acceptance.
+/// Delivers an accepted card to snapshots, then optionally notifies. Returns delivery fields or `.null` on failure; delivery never undoes card acceptance.
 public typealias TriggerNotifier = @Sendable (TriggerNotification, Bool) async -> JSONValue

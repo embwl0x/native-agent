@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `BackgroundLoopWakes.swift` | BackgroundLoopLifetimes event listeners, coalesced wakes, wall-clock invalidation, deadlines and retained wake settlement |
+// Blueprint: | `BackgroundLoopWakes.swift` | BackgroundLoopLifetimes listeners, wake coalescing, clock invalidation, deadlines and settlement |
 
 extension BackgroundLoopLifetimes {
     // MARK: Event/deadline physiology
@@ -98,9 +98,7 @@ extension BackgroundLoopLifetimes {
               physiologyGenerations[loopId] == generation,
               let runner = physiologyRunners[loopId]
         else { return }
-        // A delivered event is the ONLY proof a restarted listener actually
-        // works; a stream that ends immediately every time never gets here, so
-        // its consecutive-end count keeps climbing into Doctor.
+        // Only a delivered event proves listener recovery; repeated immediate ends must keep raising the health count.
         if var health = physiologyListenerHealth[loopId], health.consecutiveEnds != 0 || !health.active {
             health.consecutiveEnds = 0
             health.active = true
@@ -156,9 +154,7 @@ extension BackgroundLoopLifetimes {
         let outcome = await executeRegisteredTick(
             loopId: loopId, runner: runner, lifecycle: lifecycle, requiresDue: false
         )
-        // A wake arriving during work joins its physical exit. Preserve one
-        // reconciliation afterwards: the active pass may have left a capped
-        // remainder, or read before this event or deadline crossing.
+        // Join active work, then reconcile once: it may have read before this event or left capped work pending.
         if outcome.isCoalescedSkip,
            automaticLifecycleIsCurrent(lifecycle), physiologyGenerations[loopId] == generation {
             physiologyEventArrived(loopId: loopId, generation: generation)
@@ -186,8 +182,7 @@ extension BackgroundLoopLifetimes {
         physiologyDeadlines[loopId] = deadline
         let delay = min(deadline.timeIntervalSince(current), 365 * 24 * 60 * 60)
         physiologyDeadlineTasks[loopId] = Task { [weak self] in
-            // Clock and zone changes invalidate this one sleep through the
-            // manager's lifecycle-owned observers, then project a new deadline.
+            // Clock and zone changes invalidate the owned sleep so its deadline is projected again.
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
             await self?.firePhysiologyDeadline(
@@ -214,8 +209,7 @@ extension BackgroundLoopLifetimes {
         else { return }
         physiologyDeadlines.removeValue(forKey: loopId)
         physiologyDeadlineTokens.removeValue(forKey: loopId)
-        // This wake is executing now, not a replaceable sleep. Completion can
-        // rearm its successor without cancelling the task doing the projection.
+        // A firing wake is execution, not replaceable sleep; successor projection must not cancel its caller.
         physiologyExecutionTasks[loopId, default: [:]][token] = task
         defer { retirePhysiologyExecution(loopId: loopId, generation: generation, token: token) }
         await firePhysiology(loopId: loopId, generation: generation)
@@ -271,7 +265,7 @@ extension BackgroundLoopLifetimes {
         physiologyListenerHealth.removeValue(forKey: loopId)
         physiologyGenerations.removeValue(forKey: loopId)
         physiologyRunners.removeValue(forKey: loopId)
-        // Replacement registrations must not inherit retired self-write stamps.
+        // Replacement registrations must not inherit the prior registration’s self-write stamps.
         PhysiologySelfWriteRegistry.shared.clear(loopId: loopId)
     }
 

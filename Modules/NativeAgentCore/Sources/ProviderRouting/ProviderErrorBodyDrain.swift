@@ -1,11 +1,10 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ProviderErrorBodyDrain.swift` | `ProviderErrorBodyDrain`: bounded exact-request diagnostic reads with idle deadlines; adapters retain HTTP verdicts and cancellation stays cancellation |
+// Blueprint: | `ProviderErrorBodyDrain.swift` | `ProviderErrorBodyDrain`: bounded request-owned diagnostics |
 
-/// Best-effort error diagnostics with exact-request ownership. HTTP status
-/// classification remains with each adapter; a failed/stalled body read is
-/// not a new provider verdict. User cancellation remains cancellation.
+/// Best-effort error diagnostics with exact-request ownership. HTTP status classification remains with each adapter; a failed/stalled body read is not a
+/// new provider verdict. User cancellation remains cancellation.
 enum ProviderErrorBodyDrain {
     static func read(
         _ bytes: URLSession.AsyncBytes, maxBytes: Int, timeout: TimeInterval
@@ -13,8 +12,8 @@ enum ProviderErrorBodyDrain {
         defer { bytes.task.cancel() }
         try Task.checkCancellation()
         guard maxBytes > 0 else { return Data() }
-        // Read on the caller's task; its progress writer wakes the sole deadline.
-        // `timeout` limits idle time; arriving bytes extend the read up to the absolute cap.
+        // Read on the caller's task; its progress writer wakes the sole deadline. `timeout` limits idle time; arriving bytes extend the read up to the
+        // absolute cap.
         let progress = ProviderErrorBodyDrainProgress()
         let absoluteCap = max(timeout * 5, 10)
         let watchdog = Task {
@@ -53,9 +52,8 @@ enum ProviderErrorBodyDrain {
         progress.finish()
         watchdog.cancel()
         await watchdog.value
-        // A timeout/ordinary read error still returns diagnostic bytes for
-        // normal HTTP mapping. User cancellation must not refresh catalogs or
-        // masquerade as a retryable provider error after Stop/Steer.
+        // A timeout/ordinary read error still returns diagnostic bytes for normal HTTP mapping. User cancellation must not refresh catalogs or masquerade
+        // as a retryable provider error after Stop/Steer.
         try Task.checkCancellation()
         return result
     }

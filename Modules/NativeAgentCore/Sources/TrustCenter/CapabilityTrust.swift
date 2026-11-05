@@ -8,8 +8,6 @@ import ToolRegistry
 // Capability trust is a checked metadata projection, without evaluation writes.
 
 // MARK: - Wire types
-//
-// The app renders these directly (Capabilities, engine.trust).
 
 public struct CapabilityTrustRoot: Sendable, Codable, Hashable, Identifiable {
     public var id: String
@@ -53,8 +51,7 @@ public struct CapabilityCatalogSource: Sendable, Codable, Hashable, Identifiable
     }
 }
 
-// Checked projections of the catalog owner's rows: a present field of the
-// wrong type makes the row malformed, and a malformed row fails the read.
+// Reject malformed catalog fields rather than projecting damaged rows as healthy metadata.
 extension CapabilityCatalogSource {
     public init(row: JSONValue) throws {
         let row = try JSONRow(row)
@@ -151,19 +148,17 @@ public enum CapabilityTrustError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .unknownCapability(let id): return "capability_unknown: No capability matches '\(id)'. Use Capabilities > Refresh, then select a capability from the current list."
-        case .unavailable: return "capability_status_unavailable: Checked connector-action status is unavailable. Ask NativeAgent's maintainer to repair the capability-status wiring; evaluation cannot proceed without a complete checked snapshot."
+        case .unknownCapability(
+            let id): return "capability_unknown: No capability matches '\(id)'. Use Capabilities > Refresh, then select a capability from the current list."
+        case .unavailable: return """
+            capability_status_unavailable: Checked connector-action status is unavailable. Ask NativeAgent's maintainer to repair the \
+            capability-status wiring; evaluation cannot proceed without a complete checked snapshot.
+            """
         }
     }
 }
 
 // MARK: - Pure scoring
-//
-// Base 0.45, +0.15 if
-// provenance present, +0.20 if signature present, +0.10 if
-// status ∈ {active, installed, ready}, +0.10 if lastUsedAt/useCount present,
-// -0.20 if riskClass ∈ {risky_tool, external_write, external_send}. Clamp
-// to [0,1], round to 3 decimals.
 
 public struct CapabilityTrustScore: Sendable, Equatable {
     public let score: Double
@@ -255,9 +250,7 @@ public struct CapabilityRecord: Codable, Sendable, Hashable, Identifiable {
         self.updatedAt = updatedAt
     }
 
-    /// Typed read of the dynamic catalog/intent row, without a JSON byte round-trip.
-    /// The mounted catalog requires both identity and kind; malformed optional
-    /// fields reject the row.
+    /// Identity and kind are required; malformed present optional fields also reject the dynamic row.
     public init(catalogRow row: [String: JSONValue]) throws {
         let row = try JSONRow(.object(row))
         self.init(
@@ -271,7 +264,6 @@ public struct CapabilityRecord: Codable, Sendable, Hashable, Identifiable {
     }
 }
 
-// The network joins capabilityRecordsFull with catalog sources and trust roots.
 
 public actor SwiftNativeCapabilityTrust {
     private let dataRoot: URL
@@ -288,7 +280,6 @@ public actor SwiftNativeCapabilityTrust {
         self.connectorActionStatuses = connectorActionStatuses
     }
 
-    /// Score the first 200 capability records for display.
     public func network() async throws -> CapabilityTrustNetwork {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
         let allRecords = try await capabilityRecordsFull(
@@ -337,7 +328,6 @@ public actor SwiftNativeCapabilityTrust {
         )
     }
 
-    /// Return a read-only score for a capability ID or source ID.
     public func evaluate(capabilityId: String) async throws -> CapabilityTrustEvaluation {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
         let records = try await capabilityRecordsFull(
@@ -367,13 +357,11 @@ public actor SwiftNativeCapabilityTrust {
 }
 
 extension CapabilityRecord {
-    /// One case style for every row: sentence case, proper nouns kept.
     public static func title(for capability: CapabilityRecord) -> String {
         sentenceCase(rawTitle(for: capability))
     }
 
-    /// The records to list: built-in features first, then each service's
-    /// actions together (`slack.*`, `github.*`, …), by title within a group.
+    /// The records to list: built-in features first, then each service's actions together (`slack.*`, `github.*`, …), by title within a group.
     public static func displayRecords(_ records: [CapabilityRecord]) -> [CapabilityRecord] {
         func service(_ record: CapabilityRecord) -> String {
             let id = record.sourceId ?? ""
@@ -385,14 +373,10 @@ extension CapabilityRecord {
         .map(\.2)
     }
 
-    /// "Slack List Channels" → "Slack list channels". Only a title written in
-    /// Title Case is lowered (anything else may carry names this can't know);
-    /// proper nouns, acronyms and mixed-case words (GitHub, iPhone, OAuth1)
-    /// keep their case.
+    /// Lower only Title Case; retain proper nouns, acronyms and mixed-case words because they may be names.
     public static func sentenceCase(_ title: String) -> String {
         var words = title.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
-        // Title-ish when at least half the later words are capitalised
-        // ("X Following timeline"); mixed-case words (iPhone) don't count against.
+        // At least half the later words must be capitalized; mixed-case names do not count against Title Case.
         let later = words.dropFirst().filter { $0.first?.isLetter == true && !smallWords.contains($0) }
         let capitalised = later.filter { $0.first?.isUppercase == true }
         let isTitleCase = !later.isEmpty && capitalised.count * 2 >= later.count
@@ -413,14 +397,12 @@ extension CapabilityRecord {
         return words.joined(separator: " ")
     }
 
-    /// Words kept as written inside a sentence-cased title.
     private static let properNouns: Set<String> = [
         "X", "I", "Mac", "Slack", "Notion", "Gmail", "Google", "Telegram", "Apple",
         "Spotlight", "Safari", "Chrome", "Finder", "Shortcuts", "Calendar",
         "Swift", "Python", "Markdown", "Codex", "Claude",
     ]
 
-    /// Small words a Title Case string leaves lowercase.
     private static let smallWords: Set<String> = [
         "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "via", "with",
     ]
@@ -428,7 +410,6 @@ extension CapabilityRecord {
     private static func rawTitle(for capability: CapabilityRecord) -> String {
         if capability.sourceId == "mac.jxa" { return "Automate Mac apps with JavaScript" }
         let name = (capability.name ?? capability.id)
-        // A skill handle like "after-card-verify" reads "After card verify".
         guard capability.kind == "skill", !name.contains(" ") else { return name }
         return name.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
     }
@@ -441,11 +422,7 @@ extension CapabilityRecord {
         return capability.kind == "skill" ? plainSkillLine(description) : description
     }
 
-    /// A skill's description is written for me to pick it by ("Use this when
-    /// you…"). For User, one clean line: its first sentence that is not that
-    /// trigger line; failing that, the trigger with its lead-in stripped and
-    /// said as me ("I'm shaping a helper…"). Always a capital first, a full
-    /// stop last, and "helper" where the skill says "bot".
+    /// Skill triggers address the agent; the person sees a complete first sentence without trigger framing, using "helper" for "bot".
     public static func plainSkillLine(_ text: String) -> String {
         let leadIns = ["use this skill when ", "use this whenever ", "use this when ", "use whenever ", "use when "]
         func leadIn(_ sentence: String) -> String? {

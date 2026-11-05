@@ -2,7 +2,9 @@ import NativeAgentCore
 import Foundation
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter.swift` | Checked security decisions including unavailable effect profiles and permission-reset approval, current audit JSONL retention without completed archival migration; local backup/export/phone exclusions and Security Audit privacy scope declared at the owner; status accepts the facade's checked policy generation without rereading it |
+import Experiences
+import NativeAgentShared
+// Blueprint: | `SecurityCenter.swift` | Origin-aware checked decisions and retained audit evidence. |
 
 struct OriginAssessment: Sendable {
     var trusted: Bool
@@ -13,7 +15,6 @@ struct OriginAssessment: Sendable {
 struct TelegramSecurityAllowlist: Sendable {
     var chatIds: Set<String>
     var userIds: Set<String>
-    // The label names the transport in origin decisions.
     var surfaceLabel: String = "telegram"
 
     var isEmpty: Bool {
@@ -31,11 +32,7 @@ struct TelegramSecurityAllowlist: Sendable {
         if let userId, userIds.contains(userId) {
             return "\(surfaceLabel) user allowlist matched"
         }
-        // In private Telegram chats, chat.id and from.id are the same. The
-        // tool loop usually carries only session/chat id, so let a user-id
-        // allowlist prove that private-chat origin without weakening groups.
-        // Telegram-only: slack channel/user id namespaces are unrelated, so
-        // this fallback must never cross-match them.
+        // Telegram private-chat ids identify the user; accept that binding only there because Slack namespaces are unrelated.
         if surfaceLabel == "telegram", userId == nil, let chatId, userIds.contains(chatId) {
             return "telegram private user allowlist matched"
         }
@@ -44,6 +41,7 @@ struct TelegramSecurityAllowlist: Sendable {
 }
 
 public actor SwiftNativeSecurityCenter {
+    public static let consentDidWrite = Notification.Name("NativeAgent.consentDidWrite")
     public nonisolated let dataRoot: URL
     let clock: @Sendable () -> Date
     let trustCenter: SwiftNativeTrustCenter
@@ -71,7 +69,10 @@ public actor SwiftNativeSecurityCenter {
     public func status(policy checkedPolicy: Result<[String: JSONValue], any Error>, limit: Int = 8) async throws -> SecurityCenterStatus {
         // Readability proves only the retained history, not complete recording.
         let history: Result<[JSONValue], any Error>
-        do { history = .success(try await SwiftNativePersistenceCore.tailJSONL(auditReceiptsPath, limit: limit, maxBytes: 512 * 1024)) }
+        do {
+            let details = try await ExperienceStore.at(dataRoot).details(.init(kinds: ["consent"], limit: limit, newestFirst: true))
+            history = .success(try details.reversed().map { try JSONValue.parse($0.row) })
+        }
         catch { history = .failure(error) }
         let recent = ((try? history.get()) ?? []).compactMap(Self.receiptSummary)
         let policy: [String: JSONValue]
@@ -104,8 +105,6 @@ public actor SwiftNativeSecurityCenter {
         let killSwitch = Self.bool(security["killSwitchEnabled"], default: false)
         let flags = [
             SecurityStatusFlag(
-                // What this row reads is `killSwitchEnabled`, so it is named
-                // and switched by that.
                 id: "security_center",
                 title: "Kill Switch",
                 status: killSwitch ? "blocked" : "off",
@@ -116,14 +115,20 @@ public actor SwiftNativeSecurityCenter {
                 id: "origin_trust",
                 title: "Origin Trust",
                 status: trustedOrigins > 0 ? "configured" : "limited",
-                detail: trustedOrigins > 0 ? "\(trustedOrigins) approved remote trust \(trustedOrigins == 1 ? "entry" : "entries") across Telegram, Slack, and paired phones. Each request still needs origin verification." : "No approved remote trust entries. A remote request nobody verified can read; anything else it asks for waits for you.",
+                detail: trustedOrigins > 0 ? """
+                    \(trustedOrigins) approved remote trust \(trustedOrigins == 1 ? "entry" : "entries") across Telegram, Slack, and paired phones. \
+                    Each request still needs origin verification.
+                    """ : "No approved remote trust entries. A remote request nobody verified can read; anything else it asks for waits for you.",
                 enabled: true
             ),
             SecurityStatusFlag(
                 id: "signed_remote_commands",
                 title: "Signed Remote Commands",
                 status: "unknown",
-                detail: "Trusted remote requests normally use the Mac's permission law. With strict signing on and the signature waiver for trusted origins disabled, an unsigned effect waits for you.",
+                detail: """
+                    Trusted remote requests normally use the Mac's permission law. With strict signing on and the signature waiver for trusted \
+                    origins disabled, an unsigned effect waits for you.
+                    """,
                 enabled: Self.bool(security["signedRemoteCommandsRequired"], default: true)
             ),
             Self.auditFlag(enabled: Self.bool(security["auditReceiptsEnabled"], default: true), history: history),
@@ -148,7 +153,7 @@ public actor SwiftNativeSecurityCenter {
         case (false, _):
             (status, detail) = ("off", "Recording is off, so gated actions are not being logged.")
         case (true, .failure(let error)):
-            (status, detail) = ("failed", "security/audit.jsonl did not read (\(error.localizedDescription)), so I cannot show what was recorded.")
+            (status, detail) = ("failed", "Consent details did not read (\(error.localizedDescription)), so I cannot show what was recorded.")
         case (true, .success):
             (status, detail) = ("unknown", "The retained audit history reads back; this does not prove every gated action was recorded.")
         }
@@ -166,7 +171,8 @@ public actor SwiftNativeSecurityCenter {
         tool: String,
         input: [String: JSONValue],
         origin: SecurityOriginContext,
-        enforceAutonomy: Bool = true
+        enforceAutonomy: Bool = true,
+        turn: Turn?
     ) async -> SecurityToolEnvelope {
         do {
             let snapshot = try await trustCenter.loadAuthorizationSnapshotChecked()
@@ -177,7 +183,8 @@ public actor SwiftNativeSecurityCenter {
                 origin: origin,
                 enforceAutonomy: enforceAutonomy,
                 snapshot: snapshot,
-                evaluatedAt: evaluatedAt
+                evaluatedAt: evaluatedAt,
+                turn: turn
             )
         } catch {
             return unavailablePolicyEnvelope(
@@ -185,7 +192,8 @@ public actor SwiftNativeSecurityCenter {
                 input: input,
                 origin: origin,
                 error: error,
-                evaluatedAt: clock()
+                evaluatedAt: clock(),
+                turn: turn
             )
         }
     }
@@ -196,12 +204,22 @@ public actor SwiftNativeSecurityCenter {
         origin: SecurityOriginContext,
         enforceAutonomy: Bool,
         snapshot: TrustPolicyAuthorizationSnapshot,
-        evaluatedAt: Date
+        evaluatedAt: Date,
+        turn: Turn?
     ) async throws -> SecurityToolEnvelope {
-        if let reason = MacInjectionArgRedaction.withheldArgumentReason(in: .object(input)) {
+        // A batch's entries re-enter the door separately; an unknown sibling is not the batch's consent decision.
+        let batch: Bool = if tool == "app", case .array? = input["actions"] { true } else { false }
+        if !batch, let reason = MacInjectionArgRedaction.unknownActionReason(in: .object(input)) {
+            throw ToolFailureError(reason, effects: .none, owner: "the action catalog", code: "unknown_action",
+                instruction: "Find the action by what it should do; a removed action's replacement is found the same way.")
+        }
+        if let reason = MacInjectionArgRedaction.withheldArgumentReason(in: .object(input), includingUnknownActions: !batch) {
             throw ToolFailureError(reason, effects: .none, owner: "Action argument contract",
                 code: "argument_contract_unavailable",
-                instruction: "Repair or identify the current action, then submit its original arguments again. Withheld arguments cannot be executed or approved.")
+                instruction: """
+                    Repair or identify the current action, then submit its original arguments again. Withheld arguments cannot be executed or \
+                    approved.
+                    """)
         }
         let policy = snapshot.policy
         let security = Self.object(policy["securityPolicy"])
@@ -214,25 +232,21 @@ public actor SwiftNativeSecurityCenter {
             tool: canonicalTool,
             input: input,
             dataRoot: dataRoot,
+            turn: turn,
             trustedWorkspaceRoots: trustedRoots
         )
-        // Origin trust is part of this exact authorization generation. In
-        // particular, iOS trust lives inside trust/policy.json; rereading that
-        // file here could splice Full Mac from generation A with paired-iOS
-        // trust from generation B, authorizing a combination that never
-        // existed. Connector-owned Telegram/Slack allowlists remain live reads
-        // from their own authority domains.
-        let originAssessment = try await assessOrigin(origin, policy: policy)
+        // Keep origin trust and Full Mac in the same checked policy generation so no mixed snapshot can invent authority. Connector allowlists retain their own
+        // live authority reads.
+        let originAssessment = try await assessOrigin(origin, policy: policy, turn: turn)
         let fullMacYoloAuthority = Self.fullMacYoloAuthority(
             originAssessment: originAssessment,
             snapshot: snapshot
         )
-        // The one decision: User's posture and the class the call declares.
         let (toolClass, autonomyLevel, autonomyReason, autonomyRemedy) = try PermissionLaw.answer(
-            tool: tool, input: input, policy: policy, capabilities: profile.capabilities)
+            tool: tool, input: input, policy: policy, capabilities: profile.capabilities, turn: turn)
         // Typed-secret redaction precedes generic redaction so persisted audit previews cannot contain injected secrets.
         let redacted = Self.redactValue(
-            .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
+            .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input, turn: turn))
         )
         let auditEnabled = Self.bool(security["auditReceiptsEnabled"], default: true)
 
@@ -250,7 +264,7 @@ public actor SwiftNativeSecurityCenter {
             remedy = paused.remedy
         }
 
-        // Safe changes nothing on User's side of the line (the law).
+        // Safe posture cannot change the person's side of the boundary.
         if decision != .block, autonomyLevel == "blocked" {
             decision = .block
             reasons.append(.init(.cause, autonomyReason))
@@ -261,12 +275,8 @@ public actor SwiftNativeSecurityCenter {
             reasons.append(.init(.cause, autonomyReason))
         }
 
-        // Full Mac is authority selected by the trusted operator; it is not an
-        // authentication mechanism for an inbound sender. One rule for a remote
-        // origin nobody authenticated (an untrusted peer, a stranger, an
-        // unsigned request where signing is required): it reads, and anything
-        // else it asks for, on either side of the line, is the person's card.
-        // Trusted origins are judged exactly like the Mac. The kill switch stays a hard deny.
+        // Full Mac grants autonomy, not sender authentication; unauthenticated origins need a card for every non-read. Trusted origins use ordinary local
+        // policy, including the hard kill switch.
         let signatureMissing = !(originAssessment.trusted && Self.bool(security["trustedRemoteHighRiskAllowed"], default: true))
             && Self.bool(security["signedRemoteCommandsRequired"], default: true) && origin.commandSignatureVerified != true
         if decision != .block, originAssessment.isRemote, !originAssessment.trusted || signatureMissing, toolClass != .read {
@@ -305,7 +315,8 @@ public actor SwiftNativeSecurityCenter {
         input: [String: JSONValue],
         origin: SecurityOriginContext,
         error: any Error,
-        evaluatedAt: Date
+        evaluatedAt: Date,
+        turn: Turn?
     ) -> SecurityToolEnvelope {
         let canonicalTool = Self.policyToolName(tool)
         let failure = error as? ToolFailureError
@@ -324,9 +335,10 @@ public actor SwiftNativeSecurityCenter {
             decision: .block,
             allowed: false,
             requiresApproval: false,
-            reasons: [.init(.cause, "\(canonicalTool) could not be authorized: \(error.localizedDescription)")],
+            reasons: [.init(.cause, failure?.code == "unknown_action" ? error.localizedDescription
+                : "\(canonicalTool) could not be authorized: \(error.localizedDescription)")],
             redactedInputPreview: Self.redactValue(
-                .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
+                .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input, turn: turn))
             ),
             auditReceiptsEnabled: true,
             remedy: Repair.remedy(owner: failure?.owner ?? "trust/policy.json", nextCall: nil,
@@ -337,31 +349,24 @@ public actor SwiftNativeSecurityCenter {
 
     public func record(_ envelope: SecurityToolEnvelope) async throws {
         guard envelope.auditReceiptsEnabled else { return }
-        // Owns security/audit.jsonl (envelope JSONL). Prior archives remain inert.
-        // Deliberately local: no local backup, data export or phone sync.
-        // PrivacyMap lists Security Audit. Archive and append share this lock.
-        let path = auditReceiptsPath
-        let event = envelope.toJSONValue()
-        try await SwiftNativePersistenceCore.withFileLock(path) {
-            try await appendJSONLCapped(
-                event,
-                to: path,
-                maxLines: JSONLLineCaps.securityAudit,
-                logLabel: "SecurityCenter.audit",
-                trimWhenBytesExceed: JSONLLineCaps.securityAuditTrimTriggerBytes
-            )
+        guard let at = NativeTimestampFormat.parseISO8601(envelope.createdAt) else {
+            throw PersistenceCoreError.ioFailure("Consent decision \(envelope.id) has an unreadable created_at timestamp")
         }
+        // The envelope carries no turn identity; never substitute its decision or session id for a turn.
+        try await ExperienceStore.at(dataRoot).note([
+            .init(source: "trust", at: at, subject: "", kind: "consent", row: try envelope.toJSONValue().serializedData(pretty: false))
+        ])
+        NotificationCenter.default.post(name: Self.consentDidWrite, object: nil)
     }
 
     private var auditReceiptsPath: URL {
-        dataRoot
-            .appendingPathComponent("security", isDirectory: true)
-            .appendingPathComponent("audit.jsonl")
+        dataRoot.appendingPathComponent("experiences/experiences.sqlite")
     }
 
     func assessOrigin(
         _ origin: SecurityOriginContext,
-        policy: [String: JSONValue]
+        policy: [String: JSONValue],
+        turn: Turn?
     ) async throws -> OriginAssessment {
         let surfaceProfile = ConversationSurfaceProfile(origin.surface)
         let surface = surfaceProfile.id
@@ -370,11 +375,9 @@ public actor SwiftNativeSecurityCenter {
         if !remote {
             return OriginAssessment(trusted: true, reason: "local app surface", isRemote: false)
         }
-        // A bridge turn with no untrusted peer left unanswered among its sources
-        // is authenticated by the person: a peer he trusts (bound by its verified
-        // id), or a command whose one card he answered, named or not.
-        if PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface), CapabilityLifecycle.turnWriteCheck()() == nil {
-            return OriginAssessment(trusted: true, reason: "a peer the person trusts or a command he answered", isRemote: true)
+        // Verified trusted peers and person-approved commands carry authority only when no untrusted source remains.
+        if PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface), CapabilityLifecycle.turnWriteCheck(turn)() == nil {
+            return OriginAssessment(trusted: true, reason: "a peer the person trusts or a command the person answered", isRemote: true)
         }
         if surface == "telegram" || surface == "slack" {
             // Only transport-bound identities prove an allowlisted origin.
@@ -445,10 +448,7 @@ public actor SwiftNativeSecurityCenter {
         return TelegramSecurityAllowlist(chatIds: allowed.chatIds, userIds: allowed.userIds, surfaceLabel: "slack")
     }
 
-    /// The turn's verified SENDER is one the person allowlisted by user id
-    /// on Telegram or Slack: the allowlists `assessOrigin` trusts, without its
-    /// allowed-chat match, which admits anyone in that chat. A private
-    /// Telegram chat's id is its sender's. Unreadable authority throws its cause.
+    /// User allowlists prove the sender; chat allowlists alone admit anyone in that chat. Unreadable authority throws its cause.
     public func remoteSenderIsAllowlisted(_ origin: SecurityOriginContext) async throws -> Bool {
         let surface = ConversationSurfaceProfile(origin.surface).id
         guard let allowed = try await (surface == "telegram" ? telegramSecurityAllowlist()

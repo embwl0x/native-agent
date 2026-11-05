@@ -2,11 +2,9 @@ import Foundation
 import PersistenceCore
 import TelegramBot
 import DeviceSync
-// Blueprint: | `AttentionDeliveryPorts.swift` | Host notification ports return the shared delivery verdict; phone evidence preserves its receipt without inferring acceptance |
+// Blueprint: | `AttentionDeliveryPorts.swift` | Host ports classify delivery; phone receipts never imply acceptance |
 
-/// Transport effects supplied by the host. Destination selection, payload
-/// construction and delivery bookkeeping stay in the router. Every client
-/// classifies its own outcome before it crosses this port.
+/// Each client classifies its transport outcome; the router owns routing and bookkeeping.
 public struct AttentionDeliveryPorts: Sendable {
     struct PhoneResult: Sendable {
         let outcome: NotificationDeliveryOutcome
@@ -20,14 +18,20 @@ public struct AttentionDeliveryPorts: Sendable {
         _ input: [String: JSONValue], _ dataRoot: URL
     ) async -> NotificationDeliveryOutcome
 
+    public typealias TelegramApprovalSender = @Sendable (
+        _ approvalID: String, _ chatID: Int, _ dataRoot: URL
+    ) async -> NotificationDeliveryOutcome
+
     let phone: @Sendable (String, String, [String: String]) async -> PhoneResult
     let telegram: TelegramSender
     let slack: SlackSender
+    let telegramApproval: TelegramApprovalSender
 
     public init(
         phone: @escaping AttentionRouter.PhoneSender,
         telegram: @escaping TelegramSender,
-        slack: @escaping SlackSender
+        slack: @escaping SlackSender,
+        telegramApproval: @escaping TelegramApprovalSender
     ) {
         self.phone = { title, body, info in
             do {
@@ -41,5 +45,6 @@ public struct AttentionDeliveryPorts: Sendable {
         }
         self.telegram = telegram
         self.slack = slack
+        self.telegramApproval = telegramApproval
     }
 }

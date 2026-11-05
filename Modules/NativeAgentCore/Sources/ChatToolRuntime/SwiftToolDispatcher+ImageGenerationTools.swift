@@ -6,17 +6,15 @@ import ProviderRouting
 import Dispatcher
 import ImageIO
 import TrustCenter
-// Blueprint: | `SwiftToolDispatcher+ImageGenerationTools.swift` | `SwiftToolDispatcher`: route-owned image generation, strict format admission, display and references; both backends settle per-file committed rows and failures into one terminal receipt attempt; receipt-write failure retains rows in the response; completed responses normalize to ok for Make, stopped and partial results retain artifacts without claiming completion |
+// Blueprint: | `SwiftToolDispatcher+ImageGenerationTools.swift` | `SwiftToolDispatcher`; Work-owned images; per-file settlement |
 
-// Admission is bound only around an explicitly requested image tool call.
-// Backend clients keep their default-deny policy for callers outside that turn.
+// Admission is carried by the explicit image-generation turn. Calls without a turn consult the saved image policy.
 enum ImageGenerationAdmission {
-    @TaskLocal static var fullMacAdmitted = false
 
-    static func allowed(dataRoot: URL) async throws -> Bool {
-        if ImageGenerationAdmission.fullMacAdmitted { return true }
-        let authority = SavedTrustPolicyAuthority.read(dataRoot: dataRoot)
-        return try authority.flag(block: "multimodalPolicy", key: "image_generation_openai", default: false)
+    static func allowed(turn: Turn?, dataRoot: URL) async throws -> Bool {
+        if turn?.imageGenerationFullMac == true { return true }
+        return try SwiftNativeTrustCenter(dataRoot: dataRoot).savedPolicyFlag(
+            block: "multimodalPolicy", key: "image_generation_openai", default: false)
     }
 
     static func clippedPrompt(_ prompt: String) -> String {
@@ -26,7 +24,7 @@ enum ImageGenerationAdmission {
     }
 }
 
-/// Shared by dispatch and the Codex request normalizer. Only omission defaults.
+/// Dispatch and request normalization share this check; only omission defaults.
 enum ImageGenerationOutputFormat {
     static func decode(_ raw: String?) throws -> String {
         guard let raw else { return "png" }
@@ -53,7 +51,6 @@ enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
     case invalidResponse(String)
     case invalidImageData
     case unsupportedControl(String)
-    /// Refuse unsupported image generation on the Work route and name that route in the result.
     case routeCannotGenerateImages(route: String)
 
     var errorDescription: String? {
@@ -63,17 +60,34 @@ enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
         case .missingPrompt:
             return "prompt is required"
         case .unsupportedProvider(let provider):
-            return "[image_generation_unsupported_provider] Work resolved to unsupported image backend '\(provider)'. Select an image-capable Work route in Providers."
+            return """
+                [image_generation_unsupported_provider] Work resolved to unsupported image backend '\(provider)'. Select an image-capable Work \
+                route in Providers.
+                """
         case .codexUnavailable:
-            return "[image_generation_codex_unavailable] Codex image generation is unavailable. It requires the Codex command-line tool installed on this Mac and signed in with an account that can use Codex image generation. Install the Codex command-line tool if needed, then run `codex login` in Terminal. Signing in to ChatGPT chat in NativeAgent alone does not complete this setup."
+            return """
+                [image_generation_codex_unavailable] Codex image generation is unavailable. It requires the Codex command-line tool installed on \
+                this Mac and signed in with an account that can use Codex image generation. Install the Codex command-line tool if needed, then \
+                run `codex login` in Terminal. Signing in to ChatGPT chat in NativeAgent alone does not complete this setup.
+                """
         case .codexFailed(let exitCode, let message):
             return "[image_generation_codex_failed] codex exec exited \(exitCode): \(message)"
         case .noCodexImagesFound:
-            return "[image_generation_no_artifact] Codex returned no collectable image. Check image-generation access in the installed Codex CLI/account. To choose the separately billed OpenAI API instead, open Providers, set up OpenAI with an API key, then select OpenAI for Work before calling image.generate."
+            return """
+                [image_generation_no_artifact] Codex returned no collectable image. Check image-generation access in the installed Codex \
+                CLI/account. To choose the separately billed OpenAI API instead, open Providers, set up OpenAI with an API key, then select \
+                OpenAI for Work before calling image.generate.
+                """
         case .notConfigured:
-            return "[image_generation_openai_api_unavailable] OpenAI API images need a separately billed API key. In Providers, set up OpenAI and save the key; select OpenAI for Work before calling image.generate."
+            return """
+                [image_generation_openai_api_unavailable] OpenAI API images need a separately billed API key. In Providers, set up OpenAI and \
+                save the key; select OpenAI for Work before calling image.generate.
+                """
         case .authRejected:
-            return "[image_generation_auth_error] OpenAI rejected the API key. Open Providers, choose ‘Set up’ for OpenAI, and replace and save the key, then try again."
+            return """
+                [image_generation_auth_error] OpenAI rejected the API key. Open Providers → Accounts → OpenAI → Add key, and save \
+                the replacement in the protected connection card, then try again.
+                """
         case .apiError(let status, let message):
             if let message, !message.isEmpty {
                 return "[image_generation_api_error] HTTP \(status): \(message)"
@@ -99,20 +113,19 @@ enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
 }
 
 extension SwiftToolDispatcher {
-    func impl_image_generate(input: [String: JSONValue], surface: String = "unknown") async -> JSONValue {
-        let admitted = await fullMacYoloAdmitted(surface: surface)
-        return await ImageGenerationAdmission.$fullMacAdmitted.withValue(admitted) {
-            await impl_admitted_image_generate(input: input, surface: surface)
-        }
+    func impl_image_generate(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String = "unknown") async -> JSONValue {
+        let admitted = await fullMacYoloAdmitted(turn: turn, surface: surface)
+        return await impl_admitted_image_generate(turn: turn.with(\.imageGenerationFullMac, admitted), invocation: invocation, input: input, surface: surface)
     }
 
-    private func impl_admitted_image_generate(input: [String: JSONValue], surface: String) async -> JSONValue {
+    private func impl_admitted_image_generate(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async -> JSONValue {
         let prompt = input["prompt"]?.stringValue ?? ""
         var admittedRoute: (providerID: String, controllerModel: String,
             route: FirstPartyModelCatalog.FirstPartyImageRoute?, snapshot: ProviderRoutingSnapshot)?
         do {
             for key in ["description", "provider", "backend", "model", "format", "count"] where input[key] != nil {
-                throw ImageGenerationToolError.unsupportedControl("\(key) is not an image.generate argument. Use the current action's fields; Work owns provider and model.")
+                throw ImageGenerationToolError.unsupportedControl(
+                    "\(key) is not an image.generate argument. Use the current action's fields; Work owns provider and model.")
             }
             if let value = input["output_format"] {
                 guard case .string = value else {
@@ -125,10 +138,10 @@ extension SwiftToolDispatcher {
                 throw ImageGenerationToolError.unsupportedControl("\(key) is not an image quality control and is not exposed by image_generate.")
             }
             // Validate input before admission; Work alone owns provider/model.
-            guard try await ImageGenerationAdmission.allowed(dataRoot: dataRoot) else {
+            guard try await ImageGenerationAdmission.allowed(turn: turn, dataRoot: dataRoot) else {
                 throw ImageGenerationToolError.trustDenied
             }
-            let resolved = try await workGroupImageRoute()
+            let resolved = try await workGroupImageRoute(turn: turn)
             admittedRoute = resolved
             guard let route = resolved.route else {
                 throw ImageGenerationToolError.routeCannotGenerateImages(route: resolved.providerID)
@@ -137,7 +150,8 @@ extension SwiftToolDispatcher {
             let controllerModel = resolved.controllerModel
             let model = route.model
             if provider != "codex" {
-                for key in ["referenced_image_paths", "action", "previous_response_id", "num_last_images_to_include", "mask", "background", "input_fidelity", "output_compression"] where input[key] != nil && input[key] != .null {
+                for key in ["referenced_image_paths", "action", "previous_response_id", "num_last_images_to_include", "mask", "background",
+                    "input_fidelity", "output_compression"] where input[key] != nil && input[key] != .null {
                     // Strict schemas may supply empty optional reference arrays.
                     if key == "referenced_image_paths", input[key] == .array([]) { continue }
                     throw ImageGenerationToolError.unsupportedControl("\(key) is not implemented for provider=\(provider).")
@@ -146,7 +160,7 @@ extension SwiftToolDispatcher {
             switch provider {
             case "codex":
                 // Trust precedes file reads as well as OAuth/network access.
-                guard try await ImageGenerationAdmission.allowed(dataRoot: dataRoot) else {
+                guard try await ImageGenerationAdmission.allowed(turn: turn, dataRoot: dataRoot) else {
                     throw ImageGenerationToolError.trustDenied
                 }
                 for key in ["prompt", "size", "quality", "output_format", "action", "background"] {
@@ -155,10 +169,12 @@ extension SwiftToolDispatcher {
                         throw ImageGenerationToolError.unsupportedControl("\(key) must be a string.")
                     }
                 }
-                for key in ["previous_response_id", "num_last_images_to_include", "mask", "input_fidelity", "output_compression"] where input[key] != nil && input[key] != .null {
-                    throw ImageGenerationToolError.unsupportedControl("\(key) is not exposed by the Codex OAuth route. Continue edits by supplying the last artifact in referenced_image_paths.")
+                for key in ["previous_response_id", "num_last_images_to_include", "mask", "input_fidelity",
+                    "output_compression"] where input[key] != nil && input[key] != .null {
+                    throw ImageGenerationToolError.unsupportedControl(
+                        "\(key) is not exposed by the Codex OAuth route. Continue edits by supplying the last artifact in referenced_image_paths.")
                 }
-                let references = try await imageGenerationReferences(input["referenced_image_paths"], surface: surface)
+                let references = try await imageGenerationReferences(turn: turn, input["referenced_image_paths"], surface: surface)
                 let request = try CodexImageGenerationRequest(
                     prompt: prompt,
                     size: input["size"]?.stringValue,
@@ -175,14 +191,14 @@ extension SwiftToolDispatcher {
                     dataRoot: dataRoot,
                     controllerModel: controllerModel
                 )
-                let result = try await client.generate(request)
+                let result = try await client.generate(turn: turn, request)
                 let receipt = try await settle { [self] in
                     do {
                         return Result<JSONValue, Error>.success(try await persistCodexImageGenerationResult(
                             result, request: request, prompt: prompt, provider: provider))
                     } catch { return Result<JSONValue, Error>.failure(error) }
                 }.get()
-                return showGeneratedImages(in: receipt)
+                return showGeneratedImages(invocation: invocation, in: receipt)
             case "openai_api":
                 let request = OpenAIImageGenerationRequest(
                     prompt: prompt,
@@ -193,26 +209,26 @@ extension SwiftToolDispatcher {
                     count: Self.jsonInt(input["n"]) ?? 1
                 )
                 let client = SwiftOpenAIImageGenerationClient(dataRoot: dataRoot)
-                let result = try await client.generate(request)
+                let result = try await client.generate(turn: turn, request)
                 let receipt = try await settle { [self] in
                     do {
                         return Result<JSONValue, Error>.success(try await persistOpenAIImageGenerationResult(
                             result, request: request, prompt: prompt))
                     } catch { return Result<JSONValue, Error>.failure(error) }
                 }.get()
-                return showGeneratedImages(in: receipt)
+                return showGeneratedImages(invocation: invocation, in: receipt)
             default:
                 throw ImageGenerationToolError.unsupportedProvider(provider)
             }
         } catch {
-            if let need = imageGenerationNeedEnvelope(error, providerID: admittedRoute?.providerID,
+            if let need = imageGenerationNeedEnvelope(invocation: invocation, error, providerID: admittedRoute?.providerID,
                                                       snapshot: admittedRoute?.snapshot) { return need }
             return imageGenerationErrorEnvelope(error)
         }
     }
 
-    /// Return bounded thumbnails with image rows, retaining full-size paths and explaining failures in visionNote.
-    func showGeneratedImages(in envelope: JSONValue) -> JSONValue {
+    /// Bound thumbnails while retaining full-size paths; visionNote carries delivery failures.
+    func showGeneratedImages(invocation: ChatToolInvocation, in envelope: JSONValue) -> JSONValue {
         guard case .object(var object) = envelope,
               case .array(let rows)? = object["images"], !rows.isEmpty else { return envelope }
         var updated: [JSONValue] = []
@@ -225,7 +241,7 @@ extension SwiftToolDispatcher {
             }
             let outcome = LocalToolImage.showProducedImage(
                 at: URL(fileURLWithPath: path),
-                name: imageRow["filename"]?.stringValue
+                name: imageRow["filename"]?.stringValue, sink: invocation.imageSink
             )
             imageRow["shownToModel"] = .bool(outcome.shown)
             imageRow["visionNote"] = .string(outcome.note)
@@ -247,33 +263,33 @@ extension SwiftToolDispatcher {
         return .object(object)
     }
 
-    func imageGenerationReferences(_ value: JSONValue?, surface: String) async throws -> [CodexImageReference] {
+    func imageGenerationReferences(turn: Turn, _ value: JSONValue?, surface: String) async throws -> [CodexImageReference] {
         guard let value, value != .null else { return [] }
         guard case .array(let paths) = value, paths.count <= 4 else {
             throw ImageGenerationToolError.unsupportedControl("referenced_image_paths must be an array of at most four local image paths.")
         }
         var references: [CodexImageReference] = []
         var bytes = 0
-        let fullMacReadAllowed = try await fullMacToolAccess(surface: surface).fileOpsAllowed
+        let fullMacReadAllowed = try await fullMacToolAccess(turn: turn, surface: surface).fileOpsAllowed
         for path in paths {
             guard case .string(let rawPath) = path, !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ImageGenerationToolError.unsupportedControl("Each referenced_image_paths entry must be a nonempty local path.")
             }
-            // Existing generated attachments are the tool's own output surface.
-            // Permit only its canonical subtree, with symlinks unable to escape it.
+            // Existing generated attachments are the tool's own output surface. Permit only its canonical subtree, with symlinks unable to escape it.
             let artifactRoot = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
                 .appendingPathComponent("generated_images", isDirectory: true)
             let path = NativeAgentWorkspaceRoot.fileSpelling(rawPath)
             let candidate = NativeAgentWorkspaceRoot.resolveFileMutationPath(rawPath, dataRoot: dataRoot)
             let url: URL
-            if (path.hasPrefix("/") || path.hasPrefix("~")), let tail = NativeAgentWorkspaceRoot.relativePath(candidate.path, under: artifactRoot.path), !tail.isEmpty {
+            if (path.hasPrefix("/") || path.hasPrefix("~")), let tail = NativeAgentWorkspaceRoot.relativePath(candidate.path, under: artifactRoot
+                .path), !tail.isEmpty {
                 url = candidate
             } else if fullMacReadAllowed, path.hasPrefix("/") || path.hasPrefix("~") {
                 url = candidate
             } else {
-                url = try await resolveTrustedFilePath(rawPath)
+                url = try await resolveTrustedFilePath(turn: turn, rawPath)
             }
-            try requireNonSensitiveReadPath(url, tool: "image_generate")
+            try requireNonSensitiveReadPath(turn: turn, url, tool: "image_generate")
             let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             guard size <= CodexImageReference.maximumTotalBytes - bytes else {
                 throw ImageGenerationToolError.unsupportedControl("References exceed the 20 MiB total limit.")
@@ -310,7 +326,10 @@ extension SwiftToolDispatcher {
             response["receiptWriteFailure"] = .object([
                 "path": .string(path.path), "error": .string(error.localizedDescription)
             ])
-            response["detail"] = .string("\(message) The terminal receipt write reported an error: \(error.localizedDescription). Inspect receiptWriteFailure.path for its current state. Committed image paths remain in images; do not repeat generation to repair the receipt.")
+            response["detail"] = .string("""
+                \(message) The terminal receipt write reported an error: \(error.localizedDescription). Inspect receiptWriteFailure.path for its \
+                current state. Committed image paths remain in images; do not repeat generation to repair the receipt.
+                """)
         }
         if response["status"] == .string("completed") { response["status"] = .string("ok") }
         response["message"] = .string(message)
@@ -382,7 +401,10 @@ extension SwiftToolDispatcher {
         }
 
         return try await finalizeImageGenerationReceipt(receipt,
-            message: "Saved \(imageRows.count) image(s) with \(result.model); \(failures.count) item(s) could not be decoded or committed. Inspect images and failures.")
+            message: """
+                Saved \(imageRows.count) image(s) with \(result.model); \(failures.count) item(s) could not be decoded or committed. Inspect \
+                images and failures.
+                """)
     }
 
     func persistCodexImageGenerationResult(
@@ -460,7 +482,10 @@ extension SwiftToolDispatcher {
             receipt["backendToolModelEvidenceSource"] = .string("not_exposed_by_builtin")
             receipt["responseModel"] = .string("not_applicable")
             receipt["modelVersion"] = .string("unverified")
-            receipt["modelExplanation"] = .string("Executed through Codex's built-in image_gen.imagegen tool. Its exposed result has no image-model identifier or quality selector; those remain unknown. Quality/size/format/background requests are prompt preferences, not native control guarantees.")
+            receipt["modelExplanation"] = .string("""
+                Executed through Codex's built-in image_gen.imagegen tool. Its exposed result has no image-model identifier or quality selector; \
+                those remain unknown. Quality/size/format/background requests are prompt preferences, not native control guarantees.
+                """)
             receipt["requestedQuality"] = request.quality.map { .string($0) } ?? .string("medium")
             receipt["outboundQuality"] = .string("not_exposed")
             receipt["qualityRequestForwarding"] = .string("prompt_preference")
@@ -480,7 +505,10 @@ extension SwiftToolDispatcher {
                        : (Set(values).count == 1 ? values.first! : "unknown"))
                 receipt[key] = .string(fulfillment)
                 if fulfillment == "not_fulfilled" {
-                    controlWarnings.append(.string("\(key): at least one image differs from the requested setting; inspect providerToolReceipts for requested and actual values."))
+                    controlWarnings.append(.string("""
+                        \(key): at least one image differs from the requested setting; inspect providerToolReceipts for requested and actual \
+                        values.
+                        """))
                 }
             }
             receipt["controlWarnings"] = .array(controlWarnings)
@@ -495,20 +523,25 @@ extension SwiftToolDispatcher {
         let message: String
         let providerName = "Codex OAuth"
         if !failures.isEmpty {
-            message = "Saved \(imageRows.count) image(s) with \(failures.count) collection, worker or commit failure(s). Inspect images and failures; uncommitted sources remain in the run folder."
+            message = """
+                Saved \(imageRows.count) image(s) with \(failures.count) collection, worker or commit failure(s). Inspect images and failures; \
+                uncommitted sources remain in the run folder.
+                """
         } else if result.stopped {
             message = "Stopped image generation. Saved \(imageRows.count) image(s) produced before Stop; the captured output remains in the run folder."
         } else if case .array(let warnings)? = receipt["controlWarnings"], !warnings.isEmpty {
-            message = "Generated \(imageRows.count) image(s) through \(providerName), but some requested controls were not fulfilled. Inspect controlWarnings and providerToolReceipts."
+            message = """
+                Generated \(imageRows.count) image(s) through \(providerName), but some requested controls were not fulfilled. Inspect \
+                controlWarnings and providerToolReceipts.
+                """
         } else {
             message = "Generated \(imageRows.count) image\(imageRows.count == 1 ? "" : "s") through \(providerName)."
         }
         return try await finalizeImageGenerationReceipt(receipt, message: message)
     }
 
-    /// Only Trust, credentials and an unsupported Work route ask the person for a decision.
-    /// Other image-generation errors remain failures.
-    private func imageGenerationNeedEnvelope(
+    /// Only Trust, credentials and an unsupported Work route ask the person for a decision. Other image-generation errors remain failures.
+    private func imageGenerationNeedEnvelope(invocation: ChatToolInvocation,
         _ error: Error, providerID: String?, snapshot: ProviderRoutingSnapshot?
     ) -> JSONValue? {
         guard let typed = error as? ImageGenerationToolError else { return nil }
@@ -519,7 +552,7 @@ extension SwiftToolDispatcher {
                 "image_generation",
                 why: "Making pictures is switched off, so I stopped before trying.",
                 declineConsequence: "It stays off and I'll describe what I'd have drawn instead."
-            ).map { InlineInteractionNeed.envelope($0) }
+            ).map { InlineInteractionNeed.envelope(invocation: invocation, $0) }
 
         case .notConfigured, .authRejected:
             // Missing and rejected keys both ask for a working key.
@@ -527,7 +560,7 @@ extension SwiftToolDispatcher {
             let why = typed == .authRejected
                 ? "The saved key for this provider was rejected, so the picture never started."
                 : "Making pictures here needs an API key I don't have yet."
-            return InlineInteractionNeed.envelope(
+            return InlineInteractionNeed.envelope(invocation: invocation,
                 InlineInteractionRegistry.apiKey(
                     provider: providerID,
                     why: why,
@@ -540,17 +573,21 @@ extension SwiftToolDispatcher {
             guard let providerID, let snapshot else { return nil }
             // The Providers catalog supplies choices; an empty list directs the person to Providers.
             let options: [InlineInteraction.Option]
+            // The card names the account as the Providers page does, never by its id.
+            let route: String
             do {
                 options = try InlineInteractionRegistry.imageCapableModelOptions(
                     providerIDs: imageCandidateProviderIDs(snapshot: snapshot), dataRoot: dataRoot
                 )
+                route = try providerID.isEmpty ? "The model your Work tasks use"
+                    : SwiftNativeProviderRouting(dataRoot: dataRoot).providerDisplayName(providerID)
             } catch {
                 return imageGenerationErrorEnvelope(error)
             }
-            return InlineInteractionNeed.envelope(
+            return InlineInteractionNeed.envelope(invocation: invocation,
                 InlineInteractionRegistry.modelChoice(
                     group: ProviderSurfaceGroups.work.id,
-                    why: "\(providerID.isEmpty ? "The model your Work tasks use" : providerID) can't make pictures.",
+                    why: "\(route) can't make pictures.",
                     options: options,
                     scopedToThisRequest: "this image",
                     declineConsequence: "I'll skip the picture and leave your Work models alone."
@@ -594,8 +631,9 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    /// Resolve Work at dispatch, retaining its provider id even when that route cannot make images.
-    func workGroupImageRoute() async throws -> (
+    /// Work's account draws when it can; otherwise the agent's own ChatGPT sign-in draws (the Codex route, its default model), so pictures never depend on
+    /// which account talks. The selected provider id is kept when neither can draw.
+    func workGroupImageRoute(turn: Turn) async throws -> (
         providerID: String,
         controllerModel: String,
         route: FirstPartyModelCatalog.FirstPartyImageRoute?,
@@ -603,7 +641,7 @@ extension SwiftToolDispatcher {
     ) {
         let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshot()
         // A one-request model choice overrides only this resumed request, never saved routing.
-        if let override = InlineInteractionModelOverride.binding(
+        if let override = InlineInteractionModelOverride.binding(turn: turn,
             forGroup: ProviderSurfaceGroups.work.id
         ) {
             return (
@@ -625,7 +663,12 @@ extension SwiftToolDispatcher {
                 break
             }
         }
-        return (providerID, controllerModel, FirstPartyModelCatalog.imageRoute(forProviderID: providerID), snapshot)
+        if let route = FirstPartyModelCatalog.imageRoute(forProviderID: providerID) { return (providerID, controllerModel, route, snapshot) }
+        let chatGPT = ChatGPTTransport.preferredAuthPath(dataRoot: dataRoot)
+        if FileManager.default.fileExists(atPath: chatGPT.path), let route = FirstPartyModelCatalog.imageRoute(forProviderID: "codex") {
+            return ("codex", "", route, snapshot)
+        }
+        return (providerID, controllerModel, nil, snapshot)
     }
 
     /// Accounts used by active routes or saved model picks; the catalog decides which can draw.

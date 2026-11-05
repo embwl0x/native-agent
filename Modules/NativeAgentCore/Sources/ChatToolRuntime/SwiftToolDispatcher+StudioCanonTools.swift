@@ -7,7 +7,7 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 import TrustCenter
-// Blueprint: | `SwiftToolDispatcher+StudioCanonTools.swift` | `SwiftToolDispatcher`: `impl_studio_canon`, `impl_studio_canon_resolve`; canon membership and proposal reads, agent-only live-turn resolution and idempotent action results |
+// Blueprint: | `SwiftToolDispatcher+StudioCanonTools.swift` | `SwiftToolDispatcher`, `impl_studio_canon`, `impl_studio_canon_resolve`; live-turn resolution |
 
 extension SwiftToolDispatcher {
     private func studioCanonStore() -> SwiftNativeStudioStore {
@@ -18,7 +18,6 @@ extension SwiftToolDispatcher {
         SwiftNativeApprovalInbox(root: dataRoot)
     }
 
-    /// Read membership and pending proposals with the journal entry ids supporting them.
     func impl_studio_canon(input: [String: JSONValue]) async throws -> JSONValue {
         let store = studioCanonStore()
         let rows: [StudioCanonRow]
@@ -95,14 +94,14 @@ extension SwiftToolDispatcher {
         return .object(result)
     }
 
-    /// Resolve only in her live turn, cross-checking the runtime dispatch surface.
-    /// This is the sole proposal-to-row path that stamps `StudioCanonSeat.agent`.
-    func impl_studio_canon_resolve(
+    /// Resolve only in the agent's live turn, cross-checking the runtime dispatch surface. This is the sole proposal-to-row path that stamps
+    /// `StudioCanonSeat.agent`.
+    func impl_studio_canon_resolve(turn: Turn,
         input: [String: JSONValue],
         surface: String
     ) async throws -> JSONValue {
         let provenance: StudioCanonTurnProvenance
-        switch StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
+        switch StudioCanonSeatGate.liveTurnProvenance(turn: turn, dispatchSurface: surface) {
         case .success(let value):
             provenance = value
         case .failure(let refusal):

@@ -8,15 +8,16 @@ import SwiftUI
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-import NotificationInbox
+import Experiences
 import ApprovalTransactions
+import DeviceSync
 import AttentionRouting
 import AppToolRuntime
 import ChatToolRuntime
 import ProviderRouting
-// Blueprint: | `InteractionCardDelivery.swift` | `InteractionCardDelivery`: `answer`, `act`; shared card transactions with native navigation; `AppInlineInteractionPlatformPort` routes Mail readiness to the root's Mac Integration facade; `AppInlineInteractionControlPort`, `InteractionInboxCard` |
+import Experiences
+// Blueprint: | `InteractionCardDelivery.swift` | Shared card transactions and navigation; open card pointers read ForPerson's in-memory inbox |
 
-/// The Mac door into shared card transactions; navigation remains native.
 enum InteractionCardDelivery {
     @MainActor
     static func answer(payload: [String: String], actionID: String, clientID: String, dataRoot: URL) async throws -> [String: String] {
@@ -27,8 +28,8 @@ enum InteractionCardDelivery {
     }
 
     @MainActor
-    static func act(id: String, action: String, dataRoot: URL, quiet: Bool = false) async throws {
-        try await InlineInteractionDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet) { pointer in
+    static func act(id: String, action: String, dataRoot: URL, quiet: Bool = false, turn: Turn) async throws {
+        try await InlineInteractionDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet, turn: turn) { pointer in
             guard let appModel = ApplicationLifetime.shared.appModel else {
                 throw NSError(domain: "InteractionCard", code: 2, userInfo: [
                     NSLocalizedDescriptionKey: "Open NativeAgent on your Mac to finish this request."
@@ -53,7 +54,6 @@ enum InteractionCardDelivery {
     }
 }
 
-/// Binds Core verification to the same live owners and macOS probes as the UI.
 @MainActor
 struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
     func interactionControls() -> (any InlineInteractionControlPort)? {
@@ -65,14 +65,14 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
     }
 
     func chromeConnectionStatus() async -> (enabled: Bool, connected: Bool) {
-        let status = await NativeAgentEngine.live.chrome.setupConnectionStatus()
+        let status = await NativeAgentEngine.live.chrome.setupConnectionStatus(context: .init(dataRoot: PersistenceCore.defaultDataRoot()))
         return (status.enabled, status.state == .connected)
     }
 
     var chromeSteps: String { InlineCards.chromeSteps }
 
-    func pairedPhoneCount() async -> Int? {
-        await NativeAgentEngine.liveDeviceSync.pairedPhones.pairedCount()
+    func phoneStanding() async -> NAPhoneStanding? {
+        await NativeAgentEngine.liveDeviceSync.bridge.checkedPhoneStanding()
     }
 
     func connectorRecords(root: URL) async throws -> [InlineInteractionConnectorStatus] {
@@ -101,8 +101,11 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
     var chromeControlEnabled: Bool { appModel.engine.trust.policy?.chromeControlPolicy?.enabled == true }
     var fullMacGrantIsActive: Bool { appModel.engine.trust.policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) ?? false }
     func enableChromeControl() async { await appModel.saveChromeControlEnabled(true) }
-    func setUpChromeControl() async -> String? {
-        do { _ = try await ChromeExtensionFolder.setUp(); return nil }
+    func setUpChromeControl(turn: Turn) async -> String? {
+        do {
+            _ = try await ChromeExtensionFolder.setUp(turn: turn, context: .init(dataRoot: appModel.engine.dataRoot))
+            return nil
+        }
         catch { return ChromeExtensionFolder.setupMessage(error) }
     }
 
@@ -123,7 +126,9 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
                 )
             },
             refreshTelegram: { _ = await appModel.refreshTelegram() },
-            sendTelegramTestReply: { _ = try await TelegramFacade(dataRoot: dataRoot).sendTelegramTestReply(chatId: $0, manager: appModel.backgroundLoopsManager) },
+            sendTelegramTestReply: { _ = try await TelegramFacade(dataRoot: dataRoot).sendTelegramTestReply(
+                chatId: $0,
+                manager: appModel.backgroundLoopsManager) },
             refresh: { await appModel.refreshForSidebarItem(.connectors) }
         )
         return (outcome.error, outcome.note)
@@ -200,28 +205,21 @@ extension AppInlineInteractionPlatformPort {
         }
     }
 
-    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> Bool {
+    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> [String] {
         try await SystemPermissionPreflight.askMacOSForCard(ids, mode: mode)
     }
 
     func writeInteractionSnapshots() async { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
 
     func openInteractionCards() async throws -> [(id: String, sessionID: String)] {
-        let reads = try await LiveNotificationInbox.live(dataRoot: PersistenceCore.defaultDataRoot()).cardReads()
+        let reads = try await ForPerson.at(PersistenceCore.defaultDataRoot()).inbox()
         var cards: [(id: String, sessionID: String)] = []
-        for read in reads {
+        for row in reads {
+            guard row.id.hasPrefix("interaction:"), ["unread", "read"].contains(row.status) else { continue }
             do {
-                let row = try read.get()
-                guard row.id.hasPrefix("interaction:"), ["unread", "read"].contains(row.status) else { continue }
-                do {
-                    let pointer = try InlineInteractionDelivery.Pointer(item: row)
-                    cards.append((id: pointer.interactionID, sessionID: pointer.sessionID))
-                } catch {
-                    ModuleLog.app("[interaction-notification] card %@ unavailable: %@", row.id, error.localizedDescription)
-                }
-            } catch {
-                ModuleLog.app("[interaction-notification] card unavailable: %@", error.localizedDescription)
-            }
+                let pointer = try InlineInteractionDelivery.Pointer(item: row)
+                cards.append((id: pointer.interactionID, sessionID: pointer.sessionID))
+            } catch { ModuleLog.app("[interaction-notification] card %@ unavailable: %@", row.id, error.localizedDescription) }
         }
         return cards
     }
@@ -234,28 +232,9 @@ extension AppInlineInteractionPlatformPort {
         }
     }
 
-    func postInteractionBanner(title: String, body: String, sessionID: String) async {
-        let posted = await NativeAgentNotifications.postAndReport(title: title, body: body,
-            userInfo: [NativeAgentNotificationActions.sessionKey: sessionID])
-        if !posted.posted {
-            ModuleLog.app("[interaction-notification] banner failed: %@", posted.error ?? posted.delivery)
-        }
-    }
-
-    func residentWakeHeld(sessionID: String, dataRoot: URL) -> Bool {
-        AttentionRouter.holdsResidentWake(session: sessionID, dataRoot: dataRoot)
-    }
-
-    func routeInteractionAttention(id: String, title: String, body: String) async throws {
-        try await AttentionRouter.shared.route(eventId: id, importance: .ownerWaiting, title: title, body: body,
-            userInfo: ["screen": "inbox", "source": InlineInteractionDelivery.source, "itemId": id], pinnedTo: .phone)
-    }
-
-    var telegramApprovalFiler: TelegramApprovalFiler? { ApprovalChatCards.runningTelegram }
 }
 
-/// Reuse the chat card and its existing controls without copying its state to
-/// User's conversation or changing the session that a tap resumes.
+/// Reuse the chat card without copying its state into the person's conversation or changing the resumed session.
 struct InteractionInboxCard: View {
     let origin: Result<InlineInteractionDelivery.Pointer, Error>
     init(item: InboxItemRecord, binding: InlineInteractionChatBinding) {
@@ -287,7 +266,6 @@ struct InteractionInboxCard: View {
                     ProgressView()
                 }
             }
-            // Loaded with no card: answered or gone, so nothing is left to show.
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await binding.verifyOnReturn() } }
@@ -295,7 +273,15 @@ struct InteractionInboxCard: View {
         .onChange(of: chatPageIsVisible) { _, visible in
             if visible { Task { await binding.verifyOnReturn() } }
         }
+        // The card reads its own conversation's cards wherever it is shown, so a host that never opened that conversation (Today) still draws it.
+        .task(id: originSession) {
+            guard case .success(let pointer) = origin,
+                  appModel.engine.transcripts.card(id: pointer.interactionID, in: pointer.sessionID) == nil else { return }
+            await appModel.engine.transcripts.refreshCards(in: pointer.sessionID)
+        }
     }
+
+    private var originSession: String? { if case .success(let pointer) = origin { pointer.sessionID } else { nil } }
 
     private func retry() async {
         isRetrying = true

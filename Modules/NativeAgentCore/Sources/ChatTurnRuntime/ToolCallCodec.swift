@@ -5,29 +5,18 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
-// Blueprint: | `ToolCallCodec.swift` | `ToolCallCodec`: provider tool offerings, streamed prose release and native/text-marker call decoding; the turn loop owns dispatch and budgets |
+// Blueprint: | `ToolCallCodec.swift` | `ToolCallCodec`; Offered wire grammar; dispatch stays with the loop |
 
-/// How the streaming tool loop offers tools to a provider and reads its output
-/// back as prose + tool calls. The loop owns everything else (budgets, bounces,
-/// dispatch, recovery); the codec owns the wire encoding of calls and results.
+/// The codec owns wire encoding only; the loop owns budgets, refusals, dispatch and recovery.
 enum ToolCallCodec: Sendable, Equatable {
-    /// Provider-native tool calling: `tools[]` on the request, calls as
-    /// `.toolCall` stream events. Text never supplies executable calls.
+    /// Native tool events alone supply executable calls; prose never does.
     case native
-    /// A transport with no tool calling (Codex CLI). The
-    /// offered array still reaches the client, whose capability admission
-    /// records the text-only note, and the adapter never forwards it; the
-    /// reply is prose only; neither text nor structured events execute tools.
+    /// Text-only transports forward no tool schemas or executable events; capability admission still records their offered contract.
     case none
-    /// The text-compatibility marker protocol (`TextMarkerCodec`): no
-    /// `tools[]`, the catalog as prose in the system prompt, calls as markers
-    /// in the reply, each round's results as one user message. The Claude
-    /// subscription speaks it.
+    /// The marker protocol carries catalog prose in the system prompt and returns one user result message per round.
     case textMarkers
 
-    /// Chosen from the provider the client resolves for the turn's calls
-    /// (`LLMClient.servingProviderID`). Missing/unknown capability is an
-    /// admission error, never an inferred native-tool protocol.
+    /// Resolve from the serving provider's declared capability; unknown capability fails admission rather than guessing native tools.
     static func forProvider(_ providerID: String) throws -> ToolCallCodec {
         switch try ProviderToolCapability.checkedWire(providerID: providerID) {
         case .native: return .native
@@ -36,11 +25,9 @@ enum ToolCallCodec: Sendable, Equatable {
         }
     }
 
-    /// The `tools` argument for this round's request.
     func requestTools(_ schemas: [LLMToolSchema]) -> [LLMToolSchema]? {
         switch self {
         case .native, .none: schemas.isEmpty ? nil : schemas
-        // The catalog rides the system prompt.
         case .textMarkers: nil
         }
     }
@@ -74,10 +61,25 @@ enum ToolCallCodec: Sendable, Equatable {
         return (carrier.isEmpty ? [] : [.text(carrier)]) + images
     }
 
-    /// Moves the prose in `pending` that can safely reach the surface out of
-    /// it: everything before the earliest potential call marker, else all
-    /// but a 16-character tail so a marker split across chunks is caught
-    /// before any part of it renders. Returns "" when nothing is safe yet.
+    // Result bodies stay typed until request encoding so every transport shares the same pointer rule.
+    func providerMessages(_ messages: [LLMMessage], records: [TurnEngineResult.ToolDispatchRecord],
+                          schemas: [LLMToolSchema], turn: Turn) throws -> [LLMMessage] {
+        guard self == .textMarkers else { return messages }
+        let marker = TextMarkerCodec(schemas: schemas, turnActiveTools: [], turn: turn)
+        return try messages.map { message in
+            let names = try message.content.compactMap { block -> String? in
+                guard case .toolResult(let id, _, _) = block else { return nil }
+                guard let record = records.first(where: { $0.id == id }) else {
+                    throw ToolFailureError("Tool result \(id) has no recorded call; repair its turn before sending it.", effects: .none)
+                }
+                return record.name
+            }
+            guard !names.isEmpty else { return message }
+            return LLMMessage(role: message.role, content: Self.resultBlocks(message.content, toolNames: names, markerCodec: marker))
+        }
+    }
+
+    /// Withhold possible call markers across chunks so partial encoding cannot reach the surface; release safe preceding prose.
     func releasableProse(holding pending: inout String) -> String {
         // Keep a split citation in the same pending buffer as split tool text.
         var citationTail = ""
@@ -99,10 +101,7 @@ enum ToolCallCodec: Sendable, Equatable {
             return ToolCallParser.stripProtocolDebris(
                 TextMarkerCodec.releasableProse(holding: &pending))
         }
-        // Hold only a tail that could still grow into a marker ("<to",
-        // "**tool c"); plain prose goes out now. A fixed 16-character hold
-        // froze the reply's last words until the provider closed the stream
-        // (User 09-26: seconds of "hang" at the last paragraph).
+        // Hold only a suffix that can still become a marker so ordinary final words do not wait for stream closure.
         let held = Self.markerPrefixTailLength(pending)
         let split = pending.index(pending.endIndex, offsetBy: -held)
         let safe = String(pending[..<split])
@@ -112,7 +111,6 @@ enum ToolCallCodec: Sendable, Equatable {
 
     private static let markerStarts = ToolCallParser.protocolMarkerStarts + ["```", "~~~", "NativeAgent tool result #"]
 
-    /// Length of the longest suffix of `text` that is a proper start of a marker.
     static func markerPrefixTailLength(_ text: String) -> Int {
         let placeholder = text.range(of: #"(?<!\w)_\w*\z"#, options: .regularExpression)
             .map { text.distance(from: $0.lowerBound, to: text.endIndex) } ?? 0
@@ -124,22 +122,17 @@ enum ToolCallCodec: Sendable, Equatable {
         return placeholder
     }
 
-    /// What of the held-back tail reaches the surface when the round calls
-    /// tools. The marker protocol shows none of it: from the first marker on
-    /// it is call encoding, and text after the last one was written before
-    /// any result existed.
+    /// Hide the marker suffix at round-end because it is call encoding or prose written before any result existed.
     func proseReleasedAtDispatch(_ pending: String) -> String {
         self == .textMarkers ? "" : visiblePrefix(in: ToolCallParser.stripToolUseMarkers(pending))
     }
 
-    /// Prose before the earliest potential call marker — what a stopped,
-    /// failed or cut-off turn keeps.
+    /// Retain only prose before the first potential marker when a turn stops or fails.
     func visiblePrefix(in text: String) -> String {
         ChatRichContentParser.visibleText(ToolCallParser.visiblePrefix(in: text))
     }
 
-    /// One streamed tool-call event as a call to dispatch; nil for a call
-    /// the loop ignores. Arguments that are not a JSON object fail the round.
+    /// Reject non-object arguments at the round boundary; only offered stream events become dispatchable calls.
     func decode(_ call: LLMStreamToolCall) throws -> ParsedToolCall? {
         // Nothing offered, so nothing streamed is a call.
         if self != .native { return nil }
@@ -151,9 +144,9 @@ enum ToolCallCodec: Sendable, Equatable {
         return ParsedToolCall(id: call.id, name: call.name, input: input)
     }
 
-    /// A finished round's calls from exactly its offered transport grammar.
+    /// Parse finished calls only through this turn's offered transport grammar.
     func roundCalls(
-        streamed: [ParsedToolCall], text: String, schemas: [LLMToolSchema], recordShims: Bool = true
+        streamed: [ParsedToolCall], text: String, schemas: [LLMToolSchema], recordShims: Bool = true, turn: Turn?
     ) throws -> [ParsedToolCall] {
         switch self {
         case .native:
@@ -161,7 +154,7 @@ enum ToolCallCodec: Sendable, Equatable {
         case .none:
             []
         case .textMarkers:
-            try TextMarkerCodec(schemas: schemas, turnActiveTools: []).calls(in: text, recordShims: recordShims)
+            try TextMarkerCodec(schemas: schemas, turnActiveTools: [], turn: turn).calls(in: text, recordShims: recordShims)
         }
     }
 }

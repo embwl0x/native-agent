@@ -1,17 +1,14 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `DataRootLife.swift` | `DataRootLife`; one root life-id, created once when absent as their first life (`first`) and replaced by the restore intent's UUID; `life(of:)` reads a missing stamp as the first life, so an upgrade never reads as a restore; resumable owners stamp at beginning and admit only that life, projecting work from another life stopped with reason restored; CodexCompletionReadout owns lifecycle disk projection and incremental transcript origins bounded to the initial stamp, accepting in-place append growth and leaving later bytes for the next read |
+// Blueprint: | `DataRootLife.swift` | `DataRootLife`, `first`, `life(of:)`; Stamp work at birth; restore stops cross-life work. |
 
-/// A restore brings back what she had, never what she was doing.
-/// Resumable owners retain the life in which work began, never adopt it on read.
+/// A restore brings back what the agent had, never what it was doing. Resumable owners retain the life in which work began, never adopt it on read.
 public enum DataRootLife {
     public static let stoppedReason = "restored"
-    /// Her first life. Work saved before lives were stamped began in it, so an
-    /// upgrade never reads as a restore; only a restore starts a new life.
+    /// Unstamped work belongs to the first life so only a restore, not an upgrade, starts another.
     public static let first = "00000000-0000-0000-0000-000000000000"
 
-    /// The life a stamp names; no stamp is her first life.
     public static func life(of stamp: String?) -> String { stamp ?? first }
 
     public static func current(in root: URL) throws -> String {
@@ -37,8 +34,7 @@ public enum DataRootLife {
         try current(in: root) == life(of: lifeID)
     }
 
-    /// When this root's life began: anything sent to it before then was
-    /// addressed to an earlier life (another install, or what a restore left behind).
+    /// When this root's life began: anything sent to it before then was addressed to an earlier life (another install, or what a restore left behind).
     public static func began(in root: URL) throws -> Date {
         _ = try current(in: root)
         var info = stat()
@@ -56,7 +52,6 @@ public enum DataRootLife {
     }
 }
 
-/// The lifecycle owner's read model, shared below the surface and reporting modules.
 public struct CodexCompletionReadout: Decodable, Sendable {
   private struct Answer: Decodable, Sendable {
     struct Attachment: Decodable, Sendable { let id: String }
@@ -146,7 +141,6 @@ public struct CodexCompletionReadout: Decodable, Sendable {
       forRun: run, in: dataRoot.appendingPathComponent("chat/messages/\(session).jsonl"))
   }
 
-  /// Each transcript is indexed once, then only newly appended whole rows are read.
   private static let transcriptOrigins = TranscriptOrigins()
 
   public static func directories(configRoot: URL, dataRoot: URL) -> [URL] {
@@ -156,8 +150,7 @@ public struct CodexCompletionReadout: Decodable, Sendable {
       }
   }
 
-  /// Work handed to another agent. The person's own replies and their
-  /// Telegram mirror share the lifecycle but are not delegations.
+  /// Work handed to another agent. The person's own replies and their Telegram mirror share the lifecycle but are not delegations.
   public static func delegationDirectories(configRoot: URL, dataRoot: URL) -> [URL] {
     [configRoot.appendingPathComponent("claude-bridge/codex-completion-lifecycle"),
      dataRoot.appendingPathComponent("agent-conversations/codex-completion-lifecycle")]
@@ -184,10 +177,7 @@ public struct CodexCompletionReadout: Decodable, Sendable {
   }
 }
 
-/// Each transcript's run → origin agent (the last user row of the run that
-/// names an origin). Appends extend the index; the shared filesystem version
-/// invalidates it on replacement or a same-size/shrinking rewrite. Inspect the
-/// opened file before every cache hit, including hits for previously seen runs.
+/// Index whole appended rows by run; replacement or non-growing rewrite invalidates the index before any cache hit.
 private final class TranscriptOrigins: @unchecked Sendable {
   private struct Indexed {
     var stamp: SnapshotTailOpLog.FileStamp = .absent
@@ -216,8 +206,7 @@ private final class TranscriptOrigins: @unchecked Sendable {
     }
     let stamp = SnapshotTailOpLog.FileStamp(info)
     let size = UInt64(info.st_size)
-    // The read owns the prefix at this stamp. Appends do not invalidate it;
-    // replacement, shrink or a same-size rewrite do.
+    // The read owns the prefix at this stamp. Appends do not invalidate it; replacement, shrink or a same-size rewrite do.
     func stillHasPrefix(_ current: SnapshotTailOpLog.FileStamp?) -> Bool {
       if current == stamp { return true }
       guard case .present(let device, let inode, let currentSize, _, _, _, _)? = current else { return false }
@@ -226,13 +215,14 @@ private final class TranscriptOrigins: @unchecked Sendable {
     var indexed = transcripts[path.path] ?? Indexed()
     if indexed.stamp == stamp {
       guard stillHasPrefix(SnapshotTailOpLog.fileStamp(path)) else {
-        throw PersistenceCoreError.ioFailure("The conversation transcript was replaced while its origins were being read. Read it again for current provenance.")
+        throw PersistenceCoreError.ioFailure(
+            "The conversation transcript was replaced while its origins were being read. Read it again for current provenance.")
       }
       return indexed.agents[run] ?? nil
     }
     if case .present(let device, let inode, let previousSize, _, _, _, _) = indexed.stamp,
        device == info.st_dev, inode == info.st_ino, size > UInt64(previousSize) {
-      // The transcript owner appends in place and replaces destructive writes.
+      // In-place append preserves the prefix; destructive writes replace the file.
     } else {
       indexed = Indexed()
     }

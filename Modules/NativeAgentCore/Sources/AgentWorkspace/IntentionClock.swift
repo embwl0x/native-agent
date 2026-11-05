@@ -4,16 +4,14 @@ import Desk
 import PersistenceCore
 import TriggerScheduler
 
-// Blueprint: | `IntentionClock.swift` | `IntentionClock`: rhythm occurrences and next moments through scheduler clock math, within grace and until; intervals count from filing or clockStart; importedStart writes complete seconds and fractions in civil time, with one scheduler civil occurrenceID shared by carried and speech keys |
+// Blueprint: | `IntentionClock.swift` | `IntentionClock`: shared scheduler occurrence identity |
+// Apply rhythm grace and until bounds; intervals start from filing or clockStart, and imported anchors retain full civil precision.
 
-/// When an intention's rhythm brings it back. No state of its own: each
-/// occurrence is read from the rhythm, filing time or imported anchor, and until.
+/// Read occurrences from rhythm and anchors without another state ledger.
 public enum IntentionClock {
-    /// How long an occurrence stays due: a Mac asleep through 9:00 still
-    /// brings the 9:00 back at 10:30, not the next morning; never a backlog.
+    /// A two-hour grace keeps missed sleeping-Mac occurrences due without accumulating a backlog.
     public static let grace: TimeInterval = 2 * 3_600
 
-    /// The occurrence due at `now`, or nil.
     public static func occurrence(_ step: DeskStep, at now: Date) -> Date? {
         guard let rhythm = step.rhythm, let filed = filed(step) else { return nil }
         let first = firstOccurrence(step, rhythm: rhythm)
@@ -37,7 +35,6 @@ public enum IntentionClock {
         return latest
     }
 
-    /// The next occurrence after `date`, or nil when the rhythm has ended.
     public static func next(_ step: DeskStep, after date: Date) -> Date? {
         guard let rhythm = step.rhythm, let filed = filed(step) else { return nil }
         let first = firstOccurrence(step, rhythm: rhythm)
@@ -54,8 +51,7 @@ public enum IntentionClock {
         return next
     }
 
-    /// Migrated calendar work keeps the scheduler's civil identity even if
-    /// the zone changes after delivery; it cannot acquire a second effect key.
+    /// Keep imported calendar civil identity through zone changes so an occurrence cannot acquire a second effect key.
     public static func occurrenceID(_ step: DeskStep, at now: Date) -> String? {
         guard let at = occurrence(step, at: now) else { return nil }
         if step.clockStart != nil, let rhythm = step.rhythm, SchedulerJobNormalizer.rhythmInterval(rhythm) == nil {
@@ -66,8 +62,7 @@ public enum IntentionClock {
 
     static func filed(_ step: DeskStep) -> Date? { step.filedAt.flatMap(DeskClock.parseISO) }
 
-    /// Calendar anchors retain the complete civil time, not just the identity's
-    /// minute. A supported firstRunAt of 16:00:30 must never become 16:00:00.
+    /// Calendar anchors retain the complete civil time, not just the identity's minute. A supported firstRunAt of 16:00:30 must never become 16:00:00.
     public static func importedStart(at date: Date, rhythm: JSONValue) -> String {
         if SchedulerJobNormalizer.rhythmInterval(rhythm) != nil {
             return NativeTimestampFormat.microsecondUTCOffset(date, rounding: .up)
@@ -78,13 +73,11 @@ public enum IntentionClock {
         return start
     }
 
-    /// Resolve civil time in the current zone, preserving the subminute part.
-    /// The scheduler still owns minute-based occurrence identity through moves.
+    /// Resolve civil time in the current zone, preserving the subminute part. The scheduler still owns minute-based occurrence identity through moves.
     private static func firstOccurrence(_ step: DeskStep, rhythm: JSONValue) -> Date? {
         guard let start = step.clockStart else { return nil }
         if SchedulerJobNormalizer.rhythmInterval(rhythm) != nil { return DeskClock.parseISO(start) }
-        // Parse whole seconds separately: Foundation's ISO formatter can lose
-        // submillisecond digits. Add the stored fraction only after resolving.
+        // Parse whole seconds separately: Foundation's ISO formatter can lose submillisecond digits. Add the stored fraction only after resolving.
         let parts = start.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
         guard let whole = parts.first, whole.count == 19,
               let civil = DeskClock.parseISO(whole.replacingOccurrences(of: " ", with: "T") + "Z"),

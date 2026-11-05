@@ -1,21 +1,13 @@
 import CryptoKit
 import Foundation
 import GRDB
-// Blueprint: | `MemoryStorage+Integrity.swift` | `MemoryStorage`: `requireSemanticIntegrity`, `spotlightSnapshot` returns eligible exported items and their fingerprint; `createConsistentBackup` |
+// Blueprint: | `MemoryStorage+Integrity.swift` | `MemoryStorage`, `requireSemanticIntegrity`, `spotlightSnapshot`, `createConsistentBackup` |
 
 extension MemoryStorage {
-    /// Validate the semantic payloads SQLite itself cannot type-check. SQLite's
-    /// structural integrity checks do not notice a damaged JSON string or an
-    /// embedding blob whose byte count is no longer a multiple of Float32.
-    /// Treating those values as nil would make a canonical fact look healthy
-    /// after silently dropping evidence, provenance, or recall capability.
-    ///
-    /// The queries are index-independent and stop at the first bad row. The
-    /// canonical memory table is already hard-bounded; the companion tables are
-    /// checked with SQL predicates rather than materialized in Swift.
+    /// SQLite structural checks miss malformed JSON and misaligned Float32 blobs; treating them as nil would silently drop canonical evidence or recall. Check
+    /// semantic payloads with index-independent SQL, stopping at the first bad row without materializing companion tables.
     static func requireSemanticIntegrity(in db: Database) throws {
-        // SQLite permits NULL in a TEXT PRIMARY KEY. Check required scalars
-        // before launch consumers can reach a row subscript that traps.
+        // SQLite permits NULL in a TEXT PRIMARY KEY. Check required scalars before launch consumers can reach a row subscript that traps.
         let memories = try Row.fetchCursor(db, sql: "SELECT * FROM memories")
         while let row = try memories.next() {
             _ = try decodeMemory(row)
@@ -105,11 +97,7 @@ extension MemoryStorage {
             }
         }
 
-        // An epoch names one immutable vector space, so every row bearing the
-        // same non-legacy epoch must have the same byte width. A 4-byte blob is
-        // structurally decodable but is still semantic corruption beside the
-        // 384-dimensional rows in that epoch; recall would otherwise skip it
-        // silently on every query-dimension check.
+        // One verified epoch requires one vector width; a decodable but wrong-width blob is corruption that recall would silently skip.
         if let epoch = try String.fetchOne(db, sql: """
             SELECT epoch FROM (
                 SELECT embedding_epoch AS epoch, length(embedding) AS bytes
@@ -131,15 +119,13 @@ extension MemoryStorage {
         }
     }
 
-    /// Re-run the open-time semantic audit for Doctor, backup validation, and
-    /// focused repair workflows without creating another MemoryV2 owner.
+    /// Share the store's semantic audit with diagnostics, backup validation and repair without another MemoryV2 owner.
     public func requireSemanticIntegrity() async throws {
         try await dbPool.read { db in
             try Self.requireSemanticIntegrity(in: db)
         }
     }
 
-    /// The exact exported Spotlight items and their ID-ordered fingerprint.
     public func spotlightSnapshot() async throws -> (items: [SpotlightItem], fingerprint: String) {
         let now = Date()
         return try await dbPool.read { db in
@@ -171,11 +157,7 @@ extension MemoryStorage {
         }
     }
 
-    /// Create one transactionally coherent copy of the canonical MemoryV2
-    /// database for app backups. Default-root callers are routed through the
-    /// exact storage actor beneath `SwiftNativeMemoryV2.shared`; alternate roots
-    /// stay isolated. The destination is verified before this method returns, so
-    /// a caller never seals a byte-consistent but unreadable SQLite artifact.
+    /// Back up canonical memory in one coherent transaction through its owning actor, isolating alternate roots; verify readability before returning.
     public static func createConsistentBackup(
         dataRoot: URL,
         destinationDatabaseURL destination: URL
@@ -235,9 +217,7 @@ extension MemoryStorage {
             try? destinationQueue.close()
             throw error
         }
-        // Verification may open transient WAL/SHM sidecars on the destination.
-        // They are not part of the coherent online-backup artifact; remove them
-        // only after the verifying connection is closed.
+        // Close verification before removing transient WAL/SHM sidecars; the coherent backup artifact excludes them.
         for suffix in ["-wal", "-shm"] {
             let sidecar = URL(fileURLWithPath: destination.path + suffix)
             if FileManager.default.fileExists(atPath: sidecar.path) {

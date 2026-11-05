@@ -17,17 +17,14 @@ import CryptoKit
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacLookFrames.swift` | LatestRead-owned frame publication with superseded replies withholding action handles; every frame requires its producer's compile caps; batch-scoped immutable frames retain original TTL without replacing live publication |
-/// What a handle resolves back to.
+// Blueprint: | `MacLookFrames.swift` | LatestRead frame publication, explicit compile bounds and batch snapshots retaining original TTL |
 public struct MacLookFrameEntry: Sendable, Equatable {
     public let handle: String
     public let path: [Int]
     public let role: String
     public let label: String?
     public let frame: MacAXFrame?
-    /// The BEFORE side of the effect diff. `mac_act`
-    /// compares the recorded value/enabled against the post-action percept, so
-    /// "the checkbox became checked" is answerable without a second look.
+    /// Retain pre-action values and enabled state so the act reports observed changes without another look.
     public let value: String?
     public let enabled: Bool?
     /// The act echoes whether the handle was position-derived; drift checks still apply.
@@ -37,11 +34,7 @@ public struct MacLookFrameEntry: Sendable, Equatable {
     /// Raw text serves identity checks; outbound diffs/acted_element use full-context redacted JSON.
     public let labelJSON: JSONValue?
     public let valueJSON: JSONValue?
-    /// The compile did NOT hand this element's text out verbatim — either the
-    /// role is a secure field or the redactor's caption/enclosing-group tests
-    /// fired (the unlabeled box inside a group titled "CVV"). Carried so the
-    /// POST-act read — which has no compile context at all — is redacted on
-    /// the same judgement rather than on a context-free second opinion.
+    /// Carry the full-context secret verdict into post-action reads, which cannot reconstruct compiler context.
     public let secret: Bool
     public init(
         handle: String,
@@ -71,9 +64,7 @@ public struct MacLookFrameEntry: Sendable, Equatable {
         self.enabled = enabled
     }
 }
-/// The BEFORE side of a readout diff. Keyed by handle when the
-/// readout has one, by path otherwise, so "the display now says 390" is
-/// answerable from the act's own result.
+/// Key pre-action readouts by handle or path so the act itself reports display changes.
 public struct MacLookReadoutRecord: Sendable, Equatable {
     public let handle: String?
     public let path: [Int]
@@ -81,7 +72,6 @@ public struct MacLookReadoutRecord: Sendable, Equatable {
     public let text: String?
     /// Diff raw text to detect secret changes; emit only the full-context compile redaction.
     public let textJSON: JSONValue?
-    /// The compile declined to hand this text out verbatim.
     public let secret: Bool
     public init(
         handle: String?,
@@ -98,8 +88,7 @@ public struct MacLookReadoutRecord: Sendable, Equatable {
         self.textJSON = textJSON
         self.secret = secret
     }
-    /// Handle when there is one; the observed path otherwise. A readout with
-    /// no handle is still diffable within that topology, but cannot survive a re-layout.
+    /// Path-only readouts are diffable within observed topology but cannot survive relayout.
     public static func key(handle: String?, path: [Int]) -> String {
         if let handle, !handle.isEmpty { return handle }
         return "path:" + path.map(String.init).joined(separator: ",")
@@ -108,7 +97,7 @@ public struct MacLookReadoutRecord: Sendable, Equatable {
 }
 /// Compile bounds establish whether affordance censuses are comparable; cap churn is not navigation.
 public struct MacLookCompileCaps: Sendable, Equatable {
-    /// The walk itself stopped early (node cap, depth cap, unreadable element).
+    /// Early walk termination limits what absence can establish.
     public let truncated: Bool
     public let maxAffordances: Int?
     public let maxNodes: Int?
@@ -139,21 +128,16 @@ public struct MacLookFrame: Sendable, Equatable {
     public let bundleId: String?
     public let windowTitle: String?
     public let entries: [String: MacLookFrameEntry]
-    // Unrecorded before-state cannot support claims of change.
-    /// The target app's pid, so the closed loop can install its AXObserver on
-    /// the app she actually looked at rather than whatever is frontmost by the
-    /// time the verb runs.
+    // Unrecorded state cannot prove change; retain the observed pid so the act subscribes to the app actually read.
     public let pid: Int32?
     public let focusHandle: String?
     public let hasModal: Bool
-    /// Path of the modal recorded in this frame, used to scope `dismiss` to the
-    /// sheet's OWN buttons.
+    /// Scope dismiss to the recorded modal’s own buttons.
     public let modalPath: [Int]?
     /// Before-readouts keyed by handle or path; absent records cannot establish readout changes.
     public let readouts: [String: MacLookReadoutRecord]
     /// Act resolution and post-act reads target this window or refuse; nil leaves only the pid anchor.
     public let windowIdentity: MacAXWindowIdentity?
-    /// The bounds this frame's compile ran under, supplied by its producer.
     public let caps: MacLookCompileCaps
     /// Identity revalidation and post-action reads retain the sight's scope.
     public let completeWindow: Bool
@@ -188,13 +172,8 @@ public struct MacLookFrame: Sendable, Equatable {
         self.hasModal = hasModal
         self.modalPath = modalPath
     }
-    /// - Parameter rendered: how many affordance rows the caller actually
-    ///   SHOWED (the byte budget may have trimmed the tail). Only shown rows
-    ///   mint handles — "handles valid for this frame_id" must mean the handles
-    ///   she saw, not rows dropped on the way out. nil ⇒ every affordance;
-    ///   a glance mints them all and says that `look` lists the addressable controls.
-    /// A redaction object carries a secret verdict; a shortened string does not.
-    /// The post-act read must inherit only the secret verdict.
+    /// Only rendered affordances mint handles; dropped rows grant no address. A glance mints all and directs callers to look. Only secret verdicts carry into
+    /// post-action redaction; shortened strings are not such verdicts.
     static func withheld(_ json: JSONValue?) -> Bool {
         if case .object = json { return true }
         return false
@@ -237,10 +216,7 @@ public struct MacLookFrame: Sendable, Equatable {
         }
         return out
     }
-    /// The readouts as they were, so the next act can say what the
-    /// display CHANGED TO. Every readout is recorded (a readout is not an act
-    /// target, so the "only rows she saw mint handles" rule that governs
-    /// `entries` does not apply — this is diff state, not authority).
+    /// Record every readout for effect diffs; readout history is evidence rather than act authority.
     public static func readoutRecords(from percept: MacLookPercept) -> [String: MacLookReadoutRecord] {
         var out: [String: MacLookReadoutRecord] = [:]
         for readout in percept.readouts {
@@ -281,9 +257,7 @@ public struct MacLookFrame: Sendable, Equatable {
             modalPath: percept.modal?.path,
             readouts: readoutRecords(from: percept),
             windowIdentity: windowIdentity,
-            // The caller records the walk's truncation and the caps it asked
-            // for; a compile under lowered bounds is not comparable with one
-            // that did not use those bounds.
+            // Compare censuses only under matching walk and compile bounds; lower caps do not prove navigation.
             caps: caps,
             completeWindow: completeWindow
         )
@@ -308,8 +282,7 @@ public extension MacPerceptionCompiler {
                 text,
                 valueChars: affordanceValueChars,
                 frame: node.attributes.frame,
-                // A node's own title is its caption for its own value; a node
-                // whose TEXT is the title has no caption above itself.
+                // A node’s title captions its value, but title text cannot caption itself.
                 under: node.attributes.title == text ? nil : node.attributes.title,
                 enclosing: MacScreenViewTextRedaction.enclosingKinds(
                     forNodeAt: node.attributes.frame,
@@ -322,24 +295,12 @@ public extension MacPerceptionCompiler {
         return out
     }
 }
-/// The task-scoped perceptual frame, modelled exactly on `MacScreenViewStore`
-/// and carrying the same three properties:
-///
-///  • SINGLE SLOT PER SOURCE — "the last look" is the only look whose handles
-///    can still be trusted; holding several ids cannot be reasoned around. The
-///    workspace and direct `screen`/`act` each have one.
-///  • TTL — 180 s. A frame older than that is not a description of the screen.
-///  • NO AUTHORITY — `resolve` returns a path and a rect. Action verbs sit
-///    behind the same gates the injection tools already clear; a handle can
-///    only ever redirect an already-approved act at a better target.
-///
-/// It is also NOT resident: nothing writes here except a `mac_look` call, and
-/// an expired frame is simply refused (and cleared on the next look) rather
-/// than being swept by a timer.
+/// One slot per source keeps only the latest look addressable; frames expire after 180 seconds. Handles supply identity, never motor authority; expired frames
+/// refuse without a resident timer.
 @MainActor
 public final class MacLookFrameStore {
     public nonisolated static let shared = MacLookFrameStore()
-    /// Shared lifetime of semantic handles and fused-view marks.
+    /// Semantic handles and fused marks must expire together.
     public nonisolated static let ttlSeconds: TimeInterval = 180
     public enum ResolveFailure: String, Sendable, Equatable, Error {
         case noFrame = "no_frame"
@@ -360,13 +321,9 @@ public final class MacLookFrameStore {
             }
         }
     }
-    /// Workspace and direct calls have independent slots; every act re-resolves the frame's pid/window.
-    @TaskLocal public nonisolated static var source = "direct"
-    /// Immutable observations held only for one batch. Each act still checks
-    /// TTL, process, window and live control identity; no motor authority here.
-    @TaskLocal public nonisolated static var batchFrames: [String: MacLookFrame]?
+
     private var latestBySource: [String: MacLookFrame] = [:]
-    private var latest: MacLookFrame? { latestBySource[Self.source] }
+    private func latest(context: MacOperationContext) -> MacLookFrame? { latestBySource[context.frameSource] }
     private var publications: [String: LatestRead] = [:]
     public nonisolated init() {}
     private func publication(for source: String) -> LatestRead {
@@ -376,9 +333,8 @@ public final class MacLookFrameStore {
         return read
     }
     public func read(
-        _ load: @Sendable () async -> (MacControlResult, MacLookFrame?)
-    ) async -> MacControlResult {
-        let source = Self.source
+        context: MacOperationContext, _ load: @Sendable () async -> (MacControlResult, MacLookFrame?)) async -> MacControlResult {
+        let source = context.frameSource
         var published = false
         do {
             let result = try await publication(for: source).read({
@@ -399,32 +355,30 @@ public final class MacLookFrameStore {
         } catch { return MacSnapshotUnavailable.result(for: error) }
     }
     /// An act's committed post-effect frame advances the publication boundary.
-    public func record(_ frame: MacLookFrame) {
-        let source = Self.source
+    public func record(_ frame: MacLookFrame, context: MacOperationContext) {
+        let source = context.frameSource
         publication(for: source).write { latestBySource[source] = frame }
     }
-    public func latestFrameId() -> String? { latest?.frameId }
-    /// The frame with this id if it is the latest of ANY source (ids are UUIDs).
-    public func frame(frameId: String) -> MacLookFrame? {
-        if let held = Self.batchFrames?[frameId] { return held }
+    public func latestFrameId(context: MacOperationContext) -> String? { latest(context: context)?.frameId }
+    public func frame(frameId: String, context: MacOperationContext) -> MacLookFrame? {
+        if let held = context.batchFrames?[frameId] { return held }
         return latestBySource.values.first { $0.frameId == frameId }
     }
     public func resolve(
         handle: String,
         frameId: String,
-        now: Date
+        now: Date,
+        context: MacOperationContext
     ) -> Result<MacLookFrameEntry, ResolveFailure> {
-        guard !latestBySource.isEmpty || Self.batchFrames?.isEmpty == false else { return .failure(.noFrame) }
-        guard let latest = frame(frameId: frameId) else { return .failure(.staleFrame) }
+        guard !latestBySource.isEmpty || context.batchFrames?.isEmpty == false else { return .failure(.noFrame) }
+        guard let latest = frame(frameId: frameId, context: context) else { return .failure(.staleFrame) }
         guard now.timeIntervalSince(latest.capturedAt) <= Self.ttlSeconds else {
             return .failure(.frameExpired)
         }
         guard let entry = latest.entries[handle] else { return .failure(.unknownHandle) }
         return .success(entry)
     }
-    /// Physical user input or a completed motor action may have moved
-    /// everything. Same safety invalidation the view store carries.
-    /// A dead frame may sit in either slot; clear both (rare path, safe side).
+    /// Physical input or completed motor work can invalidate either source; clear both slots.
     public func invalidate() {
         for read in publications.values { read.write {} }
         latestBySource = [:]

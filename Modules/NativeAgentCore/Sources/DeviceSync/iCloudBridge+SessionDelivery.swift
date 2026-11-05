@@ -3,13 +3,21 @@ import Foundation
 import NativeAgentCore
 import os
 import TrustCenter
-// Blueprint: | `iCloudBridge+SessionDelivery.swift` | Phone continuation recipient resolves the bound device route, retains conflated full-text snapshots and joins admitted publication before reply recovery; fresh phone turns use the mounted forwarder stream |
+// Blueprint: | `iCloudBridge+SessionDelivery.swift` | Bound device route; conflated progress joins before terminal recovery. |
 
 extension iCloudBridge {
-    public func sessionDelivery(_ context: SessionTurnDelivery.Context) -> SessionTurnDelivery.Recipient? {
+    /// A phone route without its device or surface throws, so the owed delivery names the missing field instead of guessing a phone.
+    public func sessionDelivery(_ context: SessionTurnDelivery.Context) throws -> SessionTurnDelivery.Recipient? {
         guard context.dataRoot.standardizedFileURL == sync.dataRoot.standardizedFileURL,
-              let route = context.route, ConversationSurfaceProfile(route.surface).isIOSRemote, let sourceKey = route.sourceKey,
-              AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(sourceKey) else { return nil }
+              let route = context.route, ConversationSurfaceProfile(route.surface).isIOSRemote else { return nil }
+        guard let sourceKey = route.sourceKey, AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(sourceKey) else {
+            throw ToolFailureError("The phone reply route names no device; nothing was sent.", argumentPath: "route.sourceKey",
+                accepted: "iphone, iphone:<device name>", effects: .none)
+        }
+        guard let replyTo = route.replyTo else {
+            throw ToolFailureError("The phone reply route names no client surface; nothing was sent.", argumentPath: "route.replyTo",
+                accepted: ICloudPhoneRoute.clientSurfaces.sorted().joined(separator: ", "), effects: .none)
+        }
         let dataRoot = sync.dataRoot
         let sender = ICloudConflatedSender()
         let text = OSAllocatedUnfairLock(initialState: ICloudTextDeltaCoalescer())
@@ -21,7 +29,7 @@ extension iCloudBridge {
                     _ = try await self.sendChatMessage(text: flush.text, sessionID: context.sessionID,
                         correlationID: context.runID, metadata: ["kind": "text_delta", "live": "true",
                             "seq": String(flush.sequence), "transport": "icloud", "source": "mac",
-                            "replyTo": route.replyTo ?? "iphone", "targetSourceKey": sourceKey])
+                            "replyTo": replyTo, "targetSourceKey": sourceKey])
                 } catch { nativeLog("Phone session preview unavailable: %@", error.localizedDescription) }
             }
         }, finish: {
@@ -30,7 +38,7 @@ extension iCloudBridge {
                 if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot,
                     sessionId: context.sessionID, runId: context.runID) {
                     _ = try await self.recoverReply(response, route: AgentBridgeCompletionRoute(surface: "ios",
-                        sessionId: context.sessionID, sourceKey: sourceKey, replyTo: route.replyTo,
+                        sessionId: context.sessionID, sourceKey: sourceKey, replyTo: replyTo,
                         correlationId: context.runID), liveTurn: true)
                 }
             } catch { nativeLog("Phone session reply remains unconfirmed: %@", error.localizedDescription) }

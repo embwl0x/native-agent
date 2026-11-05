@@ -3,15 +3,15 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `PersonaEngine+Compiler.swift` | `PersonaCompiler`: every compile/snapshot requires checked identity; checked-missing required canonical documents reach their locked genesis owner; unreadable inputs fail by path; batched surfaces share documents and identity; display labels remain nonthrowing; `configuredNames` (checked sender and recipient) |
+// Blueprint: | `PersonaEngine+Compiler.swift` | `PersonaCompiler`, `configuredNames`. |
 
 // MARK: - PersonalityPacket
 
 public struct PersonalityPacket: Sendable, Codable, Equatable {
     public let surface: String
-    public let personaKind: String       // "Custom" | "Default"
+    public let personaKind: String
     public let personaId: String
-    public let fingerprint: String       // SHA-256 hex prefix (16 chars)
+    public let fingerprint: String
     public let compiledSystemPrompt: String
     public let activeDocs: [String: String]
     public let extras: JSONValue?
@@ -94,7 +94,7 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
     public let traits: CompiledPersonalityTraits
     public let updatedAt: String
 
-    /// Unknown profile.json keys round-trip losslessly, disjoint from current fields.
+    /// Round-trip unknown profile keys losslessly without letting them replace typed fields.
     public let extras: [String: JSONValue]
 
     public init(
@@ -115,7 +115,7 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
         self.extras = extras
     }
 
-    /// Only explicit onboarding/repair inputs can create an identity.
+    /// Only explicit onboarding or repair input may create identity.
     package static func genesis(name: String, personaKind: String) -> CompiledPersonalityProfile {
         CompiledPersonalityProfile(
             schemaVersion: 2, personaEngineVersion: "2.0", name: name,
@@ -130,10 +130,8 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
 
 // MARK: - PersonaCompiler
 
-/// Compiles each surface from the engine's persona and data roots.
-/// Selected persona documents, optional MEMORY.md and surface
-/// overrides remain accepted file inputs. Local/off-disk backup and data export
-/// include the persona root; phone sync excludes it; PrivacyMap: persona.
+/// Compile from the engine's selected roots with optional memory and surface guidance.
+/// Backups and export include the persona root; phone sync excludes it, under PrivacyMap/persona.
 public actor PersonaCompiler {
     private struct ResolvedCompilation {
         let packet: PersonalityPacket
@@ -142,11 +140,10 @@ public actor PersonaCompiler {
         let documents: [PersonaContextDocumentSource]
     }
 
-    /// Source engine for this compiler's persona and data roots.
     internal let engine: SwiftNativePersonaEngine
     private let fileManager: FileManager
 
-    /// Canonical prompt order: MEMORY.md is an optional input with no runtime writer; surface guidance follows AGENTS.
+    /// Keep canonical ordering; optional MEMORY has no runtime writer and surface guidance follows AGENTS.
     private static let canonicalDocOrder: [String] = [
         "SOUL", "VOICE", "USER", "GROWTH", "MEMORY", "AGENTS",
     ]
@@ -161,8 +158,7 @@ public actor PersonaCompiler {
 
     // MARK: Public API
 
-    /// Every surface requires the canonical identity and resolves an explicit
-    /// persona selection exactly. An unavailable source fails compilation.
+    /// Require canonical identity and exact saved persona selection; unavailable source fails compilation.
     public func compile(
         surface: String,
         personaOverride: String? = nil,
@@ -204,8 +200,7 @@ public actor PersonaCompiler {
                 documents.append(override)
             } else {
                 if id != "MEMORY" {
-                    // Genesis precedes the read, only for checked absence. A failed
-                    // read never selects a template or another source.
+                    // Genesis requires checked absence; failed reads cannot select templates or another source.
                     _ = try await engine.createMissingRequiredDocument(id: id)
                 }
                 if let canonical = try readDoc(root: root, id: id, order: order, required: id != "MEMORY") {
@@ -235,7 +230,7 @@ public actor PersonaCompiler {
             documents: activeDocs, surface: surface, userMemoryCore: userMemoryCore
         )
 
-        // Fingerprint — SHA-256 over (sorted ids + their contents + surface).
+        // Fingerprint sorted document IDs, contents and surface so selection and source edits invalidate compiled identity.
         let fingerprint = Self.fingerprint(documents: activeDocs, surface: surface)
 
         let packet = PersonalityPacket(
@@ -255,8 +250,7 @@ public actor PersonaCompiler {
         )
     }
 
-    /// Cold compilation and the resident kernel share prompt ordering and USER core projection.
-    /// Source documents and their fingerprints remain whole.
+    /// Share prompt order and USER projection with the resident kernel while retaining whole source documents and fingerprints.
     public static func renderPrompt(
         documents: [String: String],
         surface: String? = nil,
@@ -280,7 +274,7 @@ public actor PersonaCompiler {
         return "Your name is \(name). This saved name is authoritative even when your personal documents use an earlier name."
     }
 
-    /// ContextFlow retains each document's supplying file from the live compiler's read.
+    /// Retain each document's supplying file from the actual compiler read for ContextFlow.
     public func contextSourceSnapshot(
         surface: String,
         personaOverride: String? = nil
@@ -292,8 +286,7 @@ public actor PersonaCompiler {
         return contextSourceSnapshot(resolved)
     }
 
-    /// One read of common documents per selected persona, with surface guidance
-    /// applied to that same immutable input for every kernel in the refresh.
+    /// Read common documents once so every refreshed surface uses the same immutable persona input.
     public func contextSourceSnapshots(
         surfaces: [String],
         personaOverrides: [String: String] = [:]
@@ -350,7 +343,7 @@ public actor PersonaCompiler {
         )
     }
 
-    /// Existing identity is always a checked read. Only onboarding creates a profile.
+    /// Existing identity always requires checked reading; only onboarding creates it.
     public nonisolated static func compileProfile(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> CompiledPersonalityProfile {
@@ -368,8 +361,7 @@ public actor PersonaCompiler {
         }
     }
 
-    /// Routing wording requires both saved identities. Onboarding alone owns
-    /// creating them; consumers never invent a sender or recipient.
+    /// Require both saved identities for routing words; consumers cannot invent sender or recipient.
     public nonisolated static func configuredNames(dataRoot: URL) throws -> (agent: String, user: String) {
         let profile = try compileProfile(dataRoot: dataRoot)
         guard case .string(let supplied)? = profile.extras["userName"],
@@ -379,15 +371,13 @@ public actor PersonaCompiler {
         return (agentDisplayName(profile: profile), supplied.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Shared display-name normalization, including generic names and the
-    /// 80-Unicode-scalar limit.
+    /// Share generic-name normalization and the 80-scalar bound across readers.
     public nonisolated static func agentDisplayName(
         profile: CompiledPersonalityProfile
     ) -> String {
         NativeAgentIdentity.displayName(profile.name)
     }
 
-    /// Read and normalize the saved display name, including generic-label replacement.
     public nonisolated static func agentDisplayName(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String {
@@ -417,8 +407,7 @@ public actor PersonaCompiler {
             }.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    /// Resolve one explicit selection. Only the absence of any saved selection
-    /// selects the canonical root; a missing custom persona cannot select another.
+    /// Only absent selection uses the canonical root; a missing custom persona cannot select another.
     private static func resolveActivePersona(
         root: URL,
         personaOverride: String?,
@@ -432,7 +421,8 @@ public actor PersonaCompiler {
                 if try subdirHasMarker(candidate, fileManager: fileManager) {
                     return ("Custom", name, candidate)
                 }
-                throw PersonaEngineError.rootUnreadable(reason: "Selected persona \(name) has no persona documents at \(candidate.path). Repair the selection or select canonical.")
+                throw PersonaEngineError.rootUnreadable(
+                    reason: "Selected persona \(name) has no persona documents at \(candidate.path). Repair the selection or select canonical.")
             }
         }
         return ("Default", "canonical", nil)
@@ -497,9 +487,9 @@ public actor PersonaCompiler {
         let ids = documents.keys.sorted()
         for id in ids {
             hasher.update(data: Data(id.utf8))
-            hasher.update(data: Data([0x1F])) // unit separator
+            hasher.update(data: Data([0x1F]))
             hasher.update(data: Data((documents[id] ?? "").utf8))
-            hasher.update(data: Data([0x1E])) // record separator
+            hasher.update(data: Data([0x1E]))
         }
         hasher.update(data: Data("surface=".utf8))
         hasher.update(data: Data(surface.utf8))

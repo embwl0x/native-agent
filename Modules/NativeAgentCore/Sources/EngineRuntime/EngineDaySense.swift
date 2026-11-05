@@ -9,7 +9,7 @@ import PersistenceCore
 import Senses
 import TrustCenter
 
-// Blueprint: | `EngineDaySense.swift` | Engine-owned local day perception from cognition's launch/day/clock invalidations; one start-of-day line in mind/day-posted, English word ordinals, up to six already-authorized calendar titles across today/tomorrow, never a permission prompt; stable clock:day crossing shares care rest and priming |
+// Blueprint: | `EngineDaySense.swift` | Clock-driven day perception with authorized calendar titles and care rest |
 
 extension CognitionHost {
     public func perceiveDay(dataRoot: URL) async {
@@ -64,8 +64,7 @@ enum EngineDaySense {
             var line = "It's \(formatter("EEEE").string(from: start)) the \(ordinals[day - 1]) of \(formatter("MMMM").string(from: start))."
             do {
                 let agenda = try await calendarWords(dataRoot: dataRoot, start: start)
-                // A day/zone change during the calendar read belongs to the next
-                // buffered clock invalidation, never to yesterday's sentence.
+                // A day or zone change during the calendar read belongs to the next buffered invalidation.
                 guard !Task.isCancelled, start == calendar.startOfDay(for: Date()) else { return }
                 if let agenda, try await calendarAllowed(dataRoot: dataRoot) { line += agenda }
             } catch is CancellationError {
@@ -104,14 +103,14 @@ enum EngineDaySense {
             var words: [String] = []
             let result = try await LocalPIMConnectorActions.calendarListUpcoming(input: [
                 "day": .string(dayKey(date)), "limit": .int(Int64(remaining))
-            ], titlesOnly: true)
+            ], titlesOnly: true, handsBack: true)
             guard case .array(let events)? = result.objectValue?["events"] else {
                 throw CocoaError(.fileReadNoPermission)
             }
             for event in events.prefix(remaining) {
                 guard let row = event.objectValue, let title = row["title"]?.stringValue else { continue }
                 if row["allDay"] == .bool(true) {
-                    // The same day on two calendars (Halloween on Holidays and a family calendar) is one day.
+                    // Deduplicate a shared holiday across calendars.
                     if !words.contains(title) { words.append(title) }
                 } else if let raw = row["startAt"]?.stringValue,
                           let date = ISO8601DateFormatter().date(from: raw) {

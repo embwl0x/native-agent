@@ -1,11 +1,9 @@
 import Foundation
 
-// Blueprint: | `NaturalExpressionGuidance.swift` | `NaturalExpressionGuidance.isSocialServe`: native requested-result settlement classification of the user-authored message head |
+// Blueprint: | `NaturalExpressionGuidance.swift` | `NaturalExpressionGuidance.isSocialServe`; User-authored head classification |
 
-/// Native settlement classifiers. Authored expression guidance lives in turn.js.
+/// TurnSettle owns native settlement classification; authored expression guidance belongs to turn.js.
 struct NaturalExpressionGuidance {
-    /// Still used by TurnSettle's requested-result obligation. The expression
-    /// cues are gone; this classifier keeps that independent caller unchanged.
     static func isSocialServe(_ userMessage: String) -> Bool {
         // Classify only the user-authored head, excluding appended machine blocks.
         let authored = userMessage.components(separatedBy: "\n\n[").first ?? userMessage
@@ -14,8 +12,7 @@ struct NaturalExpressionGuidance {
               !text.contains("\n"), !text.contains("```"),
               !text.contains("/"), !text.contains("http") else { return false }
         let lower = text.lowercased()
-        // Tasking exclusions run before the laugh/emoji fast paths:
-        // "run it 😅" and "can you check CI? lol" are work.
+        // Exclude work before social fast paths so a laugh or emoji cannot turn a task into a greeting.
         guard !lower.contains("?") else { return false }
         let words = lower.split(whereSeparator: \.isWhitespace)
         guard let first = words.first, !workStarters.contains(first) else { return false }
@@ -40,7 +37,7 @@ struct NaturalExpressionGuidance {
             && lower.allSatisfy { $0.isLetter || $0.isWhitespace || "'’!,.".contains($0) }
     }
 
-    /// Tasking openers excluded by the shared social classifier above.
+    /// Exclude tasking openers before classifying social text.
     static let workStarters: Set<Substring> = [
         "do", "go", "run", "fix", "check", "wipe", "install", "build",
         "commit", "push", "try", "test", "deploy", "restart", "update",
@@ -48,10 +45,7 @@ struct NaturalExpressionGuidance {
         "can", "could", "please", "make", "add", "remove", "delete",
     ]
 
-    /// The user-AUTHORED head of a delivered message: machine blocks appended
-    /// by the pipeline (`"\n\n[tool routing …]"`) are cut, and a bridge prefix
-    /// (`"[from: claude, via bridge] …"`) is stripped so first-word detection
-    /// sees the human's opener. As-delivered, not as-typed.
+    /// Remove appended machine blocks and transport attribution so first-word detection reads the user's authored opener.
     static func authoredHead(_ userMessage: String) -> String {
         var authored = userMessage.components(separatedBy: "\n\n[").first ?? userMessage
         authored = authored.trimmingCharacters(in: .whitespacesAndNewlines)

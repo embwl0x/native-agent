@@ -13,8 +13,7 @@ import TrustCenter
 import Dispatcher
 import MacControl
 import SwarmRuns
-import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`: counted/capped recall and versioned record pages, `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata` |
+// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`, `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata`; bounded recall |
 
 // MARK: - Memory tools
 
@@ -39,23 +38,14 @@ extension SwiftToolDispatcher {
     }
 
     static let maxRecallK: Int = 20
-    /// Total `content` character budget across one recall result set.
-    /// Full content rides along for the top-ranked hits until the budget
-    /// is spent; every hit after that returns preview-only with an
-    /// explanatory note. Worst case at the per-row cap
-    /// (memoryRecallContentCap = 2000) that is 6 full rows (~3k tokens) —
-    /// bounded no matter what k was requested.
+    /// A total content budget bounds recall independently of requested k; later hits remain preview-only.
     static let recallContentBudgetChars: Int = 12_000
 
-    /// Clamp a requested recall k into [1, maxRecallK].
     static func cappedRecallK(_ requested: Int) -> Int {
         min(max(1, requested), maxRecallK)
     }
 
-    /// Serialize recall hits with the total-content budget applied IN RANK
-    /// ORDER: once a hit's content no longer fits the remaining budget,
-    /// that hit and every later one degrade to preview-only with a note.
-    /// Ranking, row selection, previews, and metadata are untouched.
+    /// Spend content budget in rank order; once a row does not fit, all later rows remain preview-only.
     static func recallHitsJSON(_ hits: [MemoryRecallHit], dataRoot: URL) -> [JSONValue] {
         var remainingBudget = recallContentBudgetChars
         var budgetSpent = false
@@ -140,9 +130,8 @@ extension SwiftToolDispatcher {
         return count
     }
 
-    /// Keep meaningful canonical dates without restoring storage timestamp,
-    /// session, or retrieval-backend noise. Never forward arbitrary extras or
-    /// truncate an invalid date into something that looks authoritative.
+    /// Keep meaningful canonical dates without restoring storage timestamp, session, or retrieval-backend noise. Never forward arbitrary extras or truncate an
+    /// invalid date into something that looks authoritative.
     private static func memoryHitTemporalData(_ hit: MemoryRecallHit) -> [String: JSONValue] {
         guard case .object(let extras)? = hit.extras else { return [:] }
         var temporal: [String: JSONValue] = [:]
@@ -155,8 +144,8 @@ extension SwiftToolDispatcher {
         return temporal
     }
 
-    /// Unknown provenance is absent; an invalid display name is dropped without rejecting the memory.
-    /// Bounded display names prevent delimiters or control characters from forging provenance claims.
+    /// Unknown provenance is absent; an invalid display name is dropped without rejecting the memory. Bounded display names prevent delimiters or control
+    /// characters from forging provenance claims.
     static func provenanceMetadata(_ input: [String: JSONValue]) -> [String: JSONValue] {
         func text(_ key: String) -> String? {
             guard case .string(let raw)? = input[key] else { return nil }
@@ -184,11 +173,11 @@ extension SwiftToolDispatcher {
 
 
     func impl_recall_memory(
+        turn: Turn,
         input: [String: JSONValue],
         surface: String = "chat"
     ) async throws -> JSONValue {
-        // Strict structured bindings may populate unused optionals with null
-        // or empty strings. Those are absence, not a second requested mode.
+        // Strict structured bindings may populate unused optionals with null or empty strings. Those are absence, not a second requested mode.
         let supplied = input.filter { key, value in
             if value == .null { return false }
             // A zero offset alone does not request paging.
@@ -219,7 +208,6 @@ extension SwiftToolDispatcher {
         } else { offset = 0 }
         let query = try requireString(input, "query")
         let k = Self.jsonInt(input["k"]) ?? Self.jsonInt(input["limit"]) ?? 5
-        // Bound the requested hit count before recall.
         let cappedK = Self.cappedRecallK(k)
         let response: MemoryV2RecallResponse
         let hits: [MemoryRecallHit]
@@ -228,8 +216,7 @@ extension SwiftToolDispatcher {
             response = try await memoryV2.recall(MemoryV2RecallRequest(
                 text: query,
                 topK: cappedK,
-                // Slot id → MemoryV2 persona vocabulary; resident recalls
-                // unfiltered for every persona slot.
+                // Slot id → MemoryV2 persona vocabulary; resident recalls unfiltered for every persona slot.
                 persona: nil,
                 surface: surface,
                 requiresRelevance: true,
@@ -238,11 +225,10 @@ extension SwiftToolDispatcher {
             hits = response.hits
             disclosureFilteredCount = response.disclosureFilteredCount
             TurnTraceBus.fireFromContext(kind: "memory.recall", surface: surface,
-                payload: .object(response.timings.mapValues { .double($0) }))
+                payload: .object(response.timings.mapValues { .double($0) }), turn: turn)
         } catch {
             try Task.checkCancellation()
-            // The owner supplies the cause and recovery; recall adds only its
-            // availability fields, never a diagnosis inferred from failure.
+            // The owner supplies the cause and recovery; recall adds only its availability fields, never a diagnosis inferred from failure.
             if case .object(var failure) = Self.memoryFailure(error) {
                 failure["memory_available"] = .bool(false)
                 failure["hits"] = .array([])
@@ -303,16 +289,17 @@ extension SwiftToolDispatcher {
         guard let record = try await memoryV2.readMemoryRecord(
             id: id, persona: nil, surface: surface
         ) else {
-            // Missing, retired, tombstoned and disallowed IDs are indistinguishable.
-            // Never query KG as an alternate way around this exact-record gate.
+            // Missing, inactive, tombstoned and disallowed IDs stay indistinguishable; KG must not bypass this exact-record gate.
             return .object(["status": .string("not_found"),
-                "detail": .string("Memory id \(id) was not found for this recall. Call memory.recall with query to find matching ids, or memory.list to list ids.")])
+                "detail": .string("""
+                    Memory id \(id) was not found for this recall. Call memory.recall with query to find matching ids, or memory.list to list \
+                    ids.
+                    """)])
         }
         let text = MemoryTextClip.memoryDisplayText(record.text, kind: record.memoryKind)
         let contentHash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
-        // Eligibility was checked before exposing any version information.
-        // The hash describes exactly the normalized display text whose
-        // Character offsets are paged, not storage bookkeeping timestamps.
+        // Eligibility was checked before exposing any version information. The hash describes exactly the normalized display text whose Character offsets are
+        // paged, not storage bookkeeping timestamps.
         if let expectedHash, expectedHash != contentHash {
             return .object([
                 "status": .string("record_changed"), "id": .string(record.id),
@@ -342,7 +329,10 @@ extension SwiftToolDispatcher {
             ])
         }
         if offset > 0, expectedHash == nil {
-            result["consistency_note"] = .string("This continuation was not version-verified. Compare content_sha256 with earlier pages before combining them; use read_more to keep subsequent pages bound to this version.")
+            result["consistency_note"] = .string("""
+                This continuation was not version-verified. Compare content_sha256 with earlier pages before combining them; use read_more to \
+                keep subsequent pages bound to this version.
+                """)
         }
         if let provenance = Self.memoryProvenanceDisplay(record.extras) {
             result["provenance"] = .string(provenance)
@@ -362,18 +352,17 @@ extension SwiftToolDispatcher {
             result["temporal"] = .object(temporal)
             result["temporal_note"] = .string("Recorded validity dates are not a current-status check; observed_at is when evidence was observed.")
         }
-        // Why this is believed, not just what is believed. The record has
-        // carried an evidence column since v7 and the exact read never showed
-        // it, so "I remember that" and "I have a source for that" were
-        // indistinguishable. Absence is stated rather than implied.
+        // Keep evidence distinct from belief; explicitly disclose when no source was recorded.
         var evidenceTruncated = false
         if let projected = Self.memoryEvidenceProjection(record.evidence, truncated: &evidenceTruncated) {
             result["evidence"] = projected
             result["evidence_present"] = .bool(true)
-            // Always present when evidence is: the note points at this field,
-            // so its absence must not be the only way to read "nothing was cut".
+            // Always present when evidence is: the note points at this field, so its absence must not be the only way to read "nothing was cut".
             result["evidence_truncated"] = .bool(evidenceTruncated)
-            result["evidence_note"] = .string("Recorded at write time, as recorded, bounded for display; evidence_truncated says whether anything was cut — the memory's own claim about its source, not independent verification.")
+            result["evidence_note"] = .string("""
+                Recorded at write time, as recorded, bounded for display; evidence_truncated says whether anything was cut — the memory's own \
+                claim about its source, not independent verification.
+                """)
         } else {
             result["evidence_present"] = .bool(false)
             result["evidence_note"] = .string("No evidence was recorded with this memory. Its text is an assertion with no stored source.")
@@ -381,11 +370,9 @@ extension SwiftToolDispatcher {
         return .object(result)
     }
 
-    /// A bounded, shape-preserving view of the stored evidence. The column is
-    /// free-form JSON lifted from the write's metadata, so it is clamped
-    /// (strings, breadth, depth) rather than reinterpreted: inventing a schema
-    /// here would misreport what was actually recorded. Returns nil when there
-    /// is nothing recorded, so the caller can say so explicitly.
+    /// A bounded, shape-preserving view of the stored evidence. The column is free-form JSON lifted from the write's metadata, so it is clamped (strings,
+    /// breadth, depth) rather than reinterpreted: inventing a schema here would misreport what was actually recorded. Returns nil when there is nothing
+    /// recorded, so the caller can say so explicitly.
     static func memoryEvidenceProjection(
         _ value: JSONValue?, depth: Int = 0, truncated: inout Bool
     ) -> JSONValue? {
@@ -427,8 +414,8 @@ extension SwiftToolDispatcher {
     }
 
     /// MemoryV2 owns the durable write, duplicate policy and metadata kind stamping.
-    func impl_commit_memory(input: [String: JSONValue]) async throws -> JSONValue {
-        // Collect all argument faults into one refusal.
+    func impl_commit_memory(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
+        // Collect faults so one refusal names every required correction.
         var problems: [String] = []
         var supersedes: [String] = []
         if let supplied = input["supersedes"], supplied != .null {
@@ -488,9 +475,7 @@ extension SwiftToolDispatcher {
         }
         let tags = Self.stringArray(input["tags"])
 
-        // Build metadata. kind rides metadata.kind (the convention
-        // MemoryKindStamp / MemoryRecallScoring.kind(of:) read); store() honors
-        // a caller kind verbatim. tags/confidence/importance carried alongside.
+        // Stamp metadata.kind using the vocabulary MemoryKindStamp and MemoryRecallScoring.kind(of:) read.
         var meta: [String: JSONValue] = [
             "confidence": .double(confidence),
             "importance": .double(importance),
@@ -503,17 +488,15 @@ extension SwiftToolDispatcher {
         for (key, value) in Self.provenanceMetadata(input) {
             meta[key] = value
         }
-        // The turn it was kept in, stamped the way moments are: a correction
-        // knows the exchange that caused it (the miss ledger links it).
-        meta.merge(MemoryDataProvenance.turnMetadata(turnId: TurnTraceContext.turnId, origin: AfterTurnSource.origin)) { current, _ in current }
-        // Her own save: the turn that saved it is its source, and its time.
-        let origin = AfterTurnSource.origin
+        // Keep the saving turn’s exchange identity so the miss ledger can link corrections.
+        meta.merge(MemoryDataProvenance.turnMetadata(turnId: turn.id, origin: turn.afterTurnOrigin)) { current, _ in current }
+        // The agent's own save: the turn that saved it is its source, and its time.
+        let origin = turn.afterTurnOrigin
         meta.merge(MemoryDataProvenance.sourceMetadata(sessionId: origin?.sessionId, messageId: origin?.messageId,
-            turnId: TurnTraceContext.turnId, at: origin?.occurredAt ?? Date(), speaker: "self", words: nil)) { current, _ in current }
+            turnId: turn.id, at: origin?.occurredAt ?? Date(), speaker: "self", words: nil)) { current, _ in current }
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
         }
-        // The miss ledger's lesson, named once, here.
         if kind == "correction" {
             meta["lesson"] = .string(MemoryRecoveryReadout.lesson(metadata: .object(meta), text: text))
         }
@@ -530,16 +513,17 @@ extension SwiftToolDispatcher {
                 metadata: .object(meta),
                 supersedes: supersedes,
                 corrects: corrects,
-                correctionReason: correctionReason
+                correctionReason: correctionReason,
+                context: .init(turn: turn, senseReads: invocation.senseRead?.senseReads ?? invocation.senseReads)
             )
         } catch {
             // Keep the owner's refusal, cancellation or failure and its recovery.
             return Self.memoryFailure(error)
         }
 
-        // Stall-visibility trace. Best-effort: a trace IO failure must not fail
-        // the tool — the write already succeeded.
+        // Trace failure cannot negate the already committed write.
         await emitMemoryCommitTrace(
+            turn: turn,
             id: record.id,
             kind: record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind,
             source: "chat.commit_memory",
@@ -548,18 +532,20 @@ extension SwiftToolDispatcher {
         // A replacement awaiting admission demotes what it replaces only when its vector lands.
         let admitted = Self.memoryMetadataValue(record.extras, key: MemoryStorage.pendingAdmissionKey) != .bool(true)
         for id in supersedes where admitted {
-            await FluidContextToolScope.current?.recordAppliedMemoryCorrection(recordID: id, replacementID: record.id)
+            await invocation.preparedContext?.recordAppliedMemoryCorrection(recordID: id, replacementID: record.id)
         }
 
-        // Replacement admission owns the lineage write; report its canonical
-        // outcome or the intent still owed by a cold save.
+        // Replacement admission owns the lineage write; report its canonical outcome or the intent still owed by a cold save.
         var correctionField: JSONValue = .null
         if let corrects, !supersedes.contains(corrects) {
             if corrects == record.id {
                 correctionField = .object([
                     "corrected_id": .string(corrects),
                     "applied": .bool(false),
-                    "note": .string("The saved text resolved to the same existing memory. No self-correction was applied; this call did not retire that record."),
+                    "note": .string("""
+                        The saved text resolved to the same existing memory. No self-correction was applied; this call did not retire that \
+                        record.
+                        """),
                 ])
             } else {
                 do {
@@ -567,7 +553,7 @@ extension SwiftToolDispatcher {
                     let target = try await memoryV2.authorityRecord(id: corrects)
                     let marked = target.map { Self.memoryMetadataValue($0.extras, key: "corrected_by") == .string(record.id) } ?? false
                     if marked {
-                        await FluidContextToolScope.current?.recordAppliedMemoryCorrection(
+                        await invocation.preparedContext?.recordAppliedMemoryCorrection(
                             recordID: corrects, replacementID: record.id
                         )
                     }
@@ -577,12 +563,14 @@ extension SwiftToolDispatcher {
                         "pending_admission": .bool(pending && !marked),
                         "note": .string(marked
                             ? "Old memory marked corrected; it no longer surfaces in recall."
-                            : (pending ? "Replacement saved pending vector admission; correction will apply atomically if the target still matches when admitted."
+                            : (pending ? """
+                                Replacement saved pending vector admission; correction will apply atomically if the target still matches when \
+                                admitted.
+                                """
                                 : "Correction was not applied: the old memory was missing or no longer eligible.")),
                     ])
                 } catch {
-                    // A storage failure is NOT the same as an ineligible id —
-                    // report it as what it is, never as a benign miss.
+                    // A storage failure is NOT the same as an ineligible id — report it as what it is, never as a benign miss.
                     correctionField = .object([
                         "corrected_id": .string(corrects),
                         "applied": .null,
@@ -614,7 +602,7 @@ extension SwiftToolDispatcher {
                     guard row.id != record.id, (row.status ?? "active") == "active",
                           MemoryLifecycle.isRecallEligible(row.lifecycle),
                           let disclosure = MemoryRecordDisclosurePolicy.classify(row),
-                          disclosure.permits(surface: ChatTurnRuntimeContext.current?.surface ?? "chat", personaID: record.personaId)
+                          disclosure.permits(surface: turn.runtime?.surface ?? "chat", personaID: record.personaId)
                     else { return false }
                     let rowTopics = Set(Self.stringArray(Self.memoryMetadataValue(row.extras, key: "context_topics")).map { $0.lowercased() })
                     return !rowTopics.isEmpty && rowTopics == topics
@@ -646,7 +634,11 @@ extension SwiftToolDispatcher {
                     ])
                 }
                 if !existing.isEmpty {
-                    payload["agreement_note"] = .string("These active records declare the same subject/scope; they are not automatically replacements. If the new decision explicitly changes one, use its id with supersedes or corrects. The old rule then stays in history and leaves automatic context. Similarity and age grant no authority.")
+                    payload["agreement_note"] = .string("""
+                        These active records declare the same subject/scope; they are not automatically replacements. If the new decision \
+                        explicitly changes one, use its id with supersedes or corrects. The old rule then stays in history and leaves automatic \
+                        context. Similarity and age grant no authority.
+                        """)
                 }
             } catch {
                 if error is CancellationError { throw error }
@@ -663,21 +655,21 @@ extension SwiftToolDispatcher {
 
     /// Record memory identity and measurements without the committed text.
     private func emitMemoryCommitTrace(
+        turn: Turn,
         id: String,
         kind: String,
         source: String,
         textLength: Int
     ) async {
-        let turnId = TurnTraceContext.turnId ?? "unknown"
         let payload: JSONValue = .object([
             "id": .string(id),
             "kind": .string(kind),
             "source": .string(source),
             "textLength": .int(Int64(textLength)),
-            "turnId": .string(turnId),
+            "turnId": .string(turn.id),
         ])
         let event = TurnTraceEvent(kind: "memory.commit", title: "commit_memory", status: "ok",
-            payload: payload, createdAt: ISO8601DateFormatter().string(from: Date()), turnId: TurnTraceContext.turnId)
+            payload: payload, createdAt: ISO8601DateFormatter().string(from: Date()), turnId: turn.id, turn: turn)
         if TurnTraceContext.turnId != nil { TurnTraceBus.fire(event, on: TurnTraceContext.bus ?? .shared) }
         else { await TurnTracePersistLane(dataRootOverride: dataRoot).append(event) }
     }

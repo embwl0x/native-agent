@@ -4,7 +4,7 @@ import PersistenceCore
 import ProviderRouting
 import StandingBots
 import Transcripts
-// Blueprint: | `BotChatContract.swift` | Helper identity, personality, unified job instructions and checked provider choice; helpers follow Chat unless explicitly pinned; shared following-settings admission names every conflicting field and acknowledges inherited-value no-ops for tools and phone edits |
+// Blueprint: | `BotChatContract.swift` | Follow Chat unless pinned; reject conflicting settings. |
 
 /// Every door into a helper uses its current brief and the same checked choice.
 public struct BotChatContract: Sendable, Equatable {
@@ -14,9 +14,7 @@ public struct BotChatContract: Sendable, Equatable {
     public var reasoningEffort: String? { choice?.reasoningEffort }
     /// Nil only when the choice is unavailable and the turn must be refused.
     public var choice: ProviderTurnChoice?
-    /// What the bot still needs before it can run, or nil when it can.
     public var modelChoiceProblem: String? = nil
-    /// The same checked helper definition that supplies its model choice.
     public var outputBudgetTokens: Int? = nil
 
     public struct FollowingSettingsRefusal: Error, LocalizedError, Sendable {
@@ -24,8 +22,7 @@ public struct BotChatContract: Sendable, Equatable {
         public var errorDescription: String? { problems.map(\.message).joined(separator: "\n") }
     }
 
-    /// Only submitted settings are compared, never the helper's obsolete saved
-    /// tuple. An unset pin flag follows Chat just as an explicit false does.
+    /// Compare submitted fields only; an unset pin flag follows Chat just as explicit false does.
     public static func followingSettings(
         for bot: BotDefinition, fields: [String: JSONValue], dataRoot: URL
     ) async throws -> [String] {
@@ -43,9 +40,15 @@ public struct BotChatContract: Sendable, Equatable {
         var notes: [String] = []
         for (field, label) in settings {
             if fields[field] == values[field] {
-                notes.append("\(field) already matches Chat's \(label); \(bot.name) follows Providers, so it was accepted as a no-op without saving a per-helper value.")
+                notes.append("""
+                    \(field) already matches Chat's \(label); \(bot.name) follows Providers, so it was accepted as a no-op without saving a \
+                    per-helper value.
+                    """)
             } else {
-                problems.append((field, "\(field) applies only to a pinned model; \(bot.name) follows Providers and uses Chat's \(label). Pin a model (model_pinned:true, model, provider) to set it."))
+                problems.append((field, """
+                    \(field) applies only to a pinned model; \(bot.name) follows Providers and uses Chat's \(label). Pin a model \
+                    (model_pinned:true, model, provider) to set it.
+                    """))
             }
         }
         guard problems.isEmpty else { throw FollowingSettingsRefusal(problems: problems) }
@@ -69,7 +72,10 @@ public struct BotChatContract: Sendable, Equatable {
             guard owned != nil || helper else { return nil }
         } catch {
             return BotChatContract(name: "Helper unavailable", instructions: "", choice: nil,
-                modelChoiceProblem: "This conversation's helper ownership could not be read: \(error.localizedDescription). Repair its saved helper definition or session index before continuing.")
+                modelChoiceProblem: """
+                    This conversation's helper ownership could not be read: \(error.localizedDescription). Repair its saved helper definition or \
+                    session index before continuing.
+                    """)
         }
         guard let bot = owned, bot.deleted != true else {
             return BotChatContract(name: "Bot", instructions: "", choice: nil,
@@ -99,7 +105,6 @@ public struct BotChatContract: Sendable, Equatable {
                 reasoningEffort: bot.reasoningEffort ?? "", fast: bot.fast ?? false
             )
         } else {
-            // Unpinned helpers inherit Chat's checked selection.
             let snapshot = try await router.checkedRoutingSnapshot()
             if let notice = snapshot.unusablePickNotice(for: "chat") { throw BotRunnerError.cannotRun(notice) }
             guard let preference = snapshot.preferences["chat"],

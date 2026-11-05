@@ -21,7 +21,10 @@ extension BuiltInToolSchemaFactory {
     func personaSchemas() -> [LLMToolSchema?] {
         [
             requestedSchema(name: "get_persona_doc", toolClass: .read,
-                description: "Read a canonical persona document on demand: SOUL.md, USER.md, AGENTS.md, VOICE.md, GROWTH.md or MEMORY.md. Documents above 64 KiB report truncation; not a complete turn-context readout.",
+                description: """
+                    Read a canonical persona document on demand: SOUL.md, USER.md, AGENTS.md, VOICE.md, GROWTH.md or MEMORY.md. Documents above 64 \
+                    KiB report truncation; not a complete turn-context readout.
+                    """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("doc", ToolSchema.strSchema("One of: SOUL, USER, AGENTS, VOICE, GROWTH, MEMORY")),
@@ -52,7 +55,10 @@ extension BuiltInToolSchemaFactory {
                         ("content", ToolSchema.strSchema("Full replacement document content.")),
                         ("retire", ToolSchema.obj([
                             ("type", .string("object")),
-                            ("description", .string("growth only: each REM-approved line this rewrite drops, exactly as written, mapped to why it goes. A retired line is not offered again.")),
+                            ("description", .string("""
+                                growth only: each REM-approved line this rewrite drops, exactly as written, mapped to why it goes. A retired line \
+                                is not offered again.
+                                """)),
                             ("additionalProperties", ToolSchema.strSchema()),
                         ])),
                     ],
@@ -61,7 +67,10 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "persona_append_section",
                 toolClass: .write, capabilities: ["filesystem_write", "outside_app_data_write", "tool_call"],
-                description: "Append a titled markdown section to your persona document. USER.md is read-only, generated from Memories; use memory.commit for durable user facts.",
+                description: """
+                    Append a titled markdown section to your persona document. USER.md is read-only, generated from Memories; use memory.commit for \
+                    durable user facts.
+                    """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("kind", ToolSchema.strSchema("One of: soul, voice, growth, agents. Do not use user; USER.md is generated from Memories.")),
@@ -72,7 +81,10 @@ extension BuiltInToolSchemaFactory {
                 )
             ),
             requestedSchema(name: "agent_introspect", toolClass: .read, capabilities: ["tool_call"],
-                description: "Inspect your live runtime, provider and conversation identity. app {find} finds actions by what you want done. detail=full includes diagnostic roots and the seven-day outcome population audit.",
+                description: """
+                    Inspect your live runtime, provider and conversation identity. app {find} finds actions by what you want done. detail=full \
+                    includes diagnostic roots and the seven-day outcome population audit.
+                    """,
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("detail", ToolSchema.enumStringSchema(["compact", "full"], "compact (default) or full diagnostics")),

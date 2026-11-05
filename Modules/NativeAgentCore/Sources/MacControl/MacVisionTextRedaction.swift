@@ -1,26 +1,15 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MacVisionTextRedaction.swift` | `VisionTextRedaction`, `VisionRedactedText`; fixed OCR caption/proximity rules with caller-owned text limits; one positional caption/overlap redaction boundary for both OCR readers |
+// Blueprint: | `MacVisionTextRedaction.swift` | `VisionTextRedaction`, `VisionRedactedText`: Shared OCR caption/proximity and overlap redaction |
 
 // MARK: - Shared positional OCR redaction
-//
-// A vision percept rides the ordinary tool sinks — turn trace, persisted tool
-// row, iOS/Telegram sync. A screen that shows a one-time code shows it in
-// PIXELS, and OCR turns those pixels into a string in a JSON payload. So the
-// pixel channel gets the SAME redactor the AX channel uses, not a second one:
-// `MacScreenViewTextRedaction` is reused, never re-implemented. Two copies
-// drift, and the copy that drifts is the one nobody re-reviews (the reason
-// ActivityWatch depends on MacControl for exactly this, Package.swift).
-//
-// OCR boxes use the shared AX caption predicate in their own pixel units.
-// This file owns overlap between recognized fragments, not enclosing AX groups.
+// OCR text reaches trace, persistence and sync, so share AX’s redactor rather than a drifting copy. Use pixel units for caption geometry; this owner handles
+// fragment overlap rather than AX ancestry.
 
 public struct VisionRedactedText: Sendable, Equatable {
-    /// The recognized string, kept in memory for geometry and matching. It is
-    /// NEVER what rides out — `json` is.
+    /// Keep raw strings only for in-memory geometry and matching; outbound text must use redacted JSON.
     public let raw: String
-    /// What the percept emits: the clear string, or the redactor's
-    /// `{redacted, sha256, reason}` digest object.
+    /// Emit approved clear text or the shared redaction object, never unchecked raw text.
     public let json: JSONValue
     public var secret: Bool {
         if case .string = json { return false }
@@ -32,20 +21,17 @@ public struct VisionRedactedText: Sendable, Equatable {
         self.json = json
     }
 
-    /// The clear text when redaction let it through, nil when it withheld it.
-    /// Every prose/summary channel in this module reads THIS, never `raw` —
-    /// the same rule the AX lane's `displayLabel` enforces.
+    /// Every prose and summary channel uses approved display text, never raw OCR.
     public var display: String? { secret ? nil : raw }
 }
 
 public enum VisionTextRedaction {
-    /// OCR captions name a secret in at most 32 characters; proximity uses image pixels.
+    /// Bound secret captions to 32 characters and measure proximity in image pixels.
     private static let maxCaptionChars = 32
     private static let proximityFraction = 0.25
     private static let proximityFloorPixels = 120.0
 
-    /// Is `caption` immediately left of the value on the same line, or directly
-    /// above with horizontal overlap? Coordinates and proximity must share units.
+    /// Caption adjacency and value bounds must share coordinate units.
     public static func isCaption(
         _ caption: VisionRect,
         forValueAt value: VisionRect,
@@ -59,9 +45,7 @@ public enum VisionTextRedaction {
         ) != nil
     }
 
-    /// Every OCR string, redacted under the shared rules, BEFORE anything
-    /// downstream can copy it into a label, a readout, a handle fingerprint or
-    /// a glance line. Positional with the input array.
+    /// Redact every OCR string before labels, readouts, fingerprints or glances can copy it; preserve input ordering.
     public static func redact(
         boxes: [VisionTextBox],
         imageSize: VisionSize,
@@ -89,8 +73,7 @@ public enum VisionTextRedaction {
             }
             return VisionRedactedText(raw: box.text, json: json)
         }
-        // Whole-frame and tile OCR can observe the same secret as different
-        // strings. Withhold every overlapping fragment before any text escapes.
+        // Whole-frame and tile reads may split one secret differently; withhold overlapping fragments before text escapes.
         var pending = redacted.indices.filter { redacted[$0].secret }
         while let secretIndex = pending.popLast() {
             for index in boxes.indices where !redacted[index].secret

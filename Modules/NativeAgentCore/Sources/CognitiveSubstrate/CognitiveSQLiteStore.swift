@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import GRDB
 import PersistenceCore
-// Blueprint: | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore` actor; checked current-schema adoption or fresh initialization, `backupForDoctor`, `commitMaintenance`; historical schema repair chains and retired mirror drains are removed |
+// Blueprint: | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore`, `backupForDoctor`, `commitMaintenance`: checked storage |
 
 struct CognitiveArtifactWrite: Sendable, Equatable {
     var kind: String
@@ -16,33 +16,21 @@ struct CognitiveArtifactWrite: Sendable, Equatable {
 struct CognitiveReceiptWrite: Sendable, Equatable {
     var kind: String
     var payload: JSONValue
-    /// When execution began, for a receipt measured at its insertion point.
+    /// Measure execution at receipt insertion, not at later observation.
     var startedAt: ContinuousClock.Instant? = nil
 }
 
-/// Minimum newest rows retained from each active or migration-compatible
-/// artifact family before generic age-based pruning may spend that family.
-///
-/// BOUNDED WORST CASE — protection is an eviction ORDERING, never a veto.
-/// pruneArtifacts always deletes exactly `count - cap` rows (protected rows sort
-/// last, but they are still spent once the unprotected supply runs out), so the
-/// eligible history is bounded at `cap` no matter how many families are listed here or how
-/// lopsidedly they fill. A full protected family may spend its floor when
-/// the rest of the table has no unprotected rows left.
-/// Kinds the generic cap never counts or evicts. Cares have no count cap:
-/// lane 3's night fades the unused ones, and the four seeds never go.
-/// Reflection rows with status `owed` are unfinished work, also excluded until
-/// their effects and the dream journal's acknowledgment have landed.
+/// Cares are uncapped living state; the night fades unused cares and seeds remain. Owed reflections stay outside history pruning until settlement.
 private let cognitiveUnprunedArtifactKinds: Set<String> = [
     "care", "care_migration", "care_retired_migration", "standing_view", "thought_seed",
 ]
 
+// Retention floors only order eviction; spend protected rows when necessary to enforce the hard cap.
 private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "affect": 32,
-    // One row, rewritten in place: the capsule cadence ledger. Tiny, but losing
-    // it re-opens a suppressed nag on the next relaunch.
+    // One row, rewritten in place: the capsule cadence ledger. Tiny, but losing it re-opens a suppressed nag on the next relaunch.
     "capsule_presentation": 1,
-    // One row: 48 rejections and one disposition undo; her corrections survive pruning.
+    // One row: 48 rejections and one disposition undo; the agent's corrections survive pruning.
     "mind_ledger": 1,
     "disposition": 32,
     "emotional_consolidation": 32,
@@ -59,8 +47,7 @@ private let cognitiveProtectedReceiptMinimums: [String: Int] = [
     "reflection.skipped": 32,
     "emotional_consolidation": 32,
     "replay.integration": 32,
-    // A pending reconciliation is UNFINISHED work, not history: trimming it
-    // silently drops replay evidence that was never integrated (8 live rows).
+    // Pending reconciliation is unfinished work; pruning it would discard replay evidence before integration.
     "replay.reconciliation_pending": 32,
     "workshop.pursuit_proposed": 32,
     "workshop.pursuit_proposal_refused": 32,
@@ -70,15 +57,13 @@ struct CognitiveArtifactFamilyLoad: Sendable, Equatable {
     var key: String
     var kindPrefix: String
     var limit: Int
-    /// Every row of exactly this kind, not a prefix and not capped: `care`
-    /// must not also load `care_migration`, and cares have no count cap.
+    /// Every row of exactly this kind, not a prefix and not capped: `care` must not also load `care_migration`, and cares have no count cap.
     var whole = false
 }
 
 struct CognitiveSQLiteRestoreBundle: Sendable, Equatable {
     var nodes: [CognitiveNode]
-    /// Exact persistence checkpoints for the already-decayed node values.
-    /// Keyed by stable node ID so ContinuityField can rebuild its private index.
+    /// Exact persistence checkpoints for the already-decayed node values. Keyed by stable node ID so ContinuityField can rebuild its private index.
     var nodeDecayAnchors: [UUID: Date]
     var artifacts: [String: [JSONValue]]
 }
@@ -121,10 +106,7 @@ public actor CognitiveSQLiteStore {
             newStore = false
         } catch CocoaError.fileReadNoSuchFile { newStore = true }
         var config = Configuration()
-        // Without a busy timeout GRDB fails a write instantly with SQLITE_BUSY
-        // when any second connection (probe CLI, second process) holds the
-        // lock — the affect/node checkpoint would be lost, and
-        // recordReceipt swallows the throw. Matches every sibling store.
+        // A busy timeout lets concurrent SQLite holders release the lock before an affect/node checkpoint fails.
         config.busyMode = .timeout(2)
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
@@ -145,10 +127,8 @@ public actor CognitiveSQLiteStore {
         return destination
     }
 
-    /// Durable, payload-free replay guard for canonical motor projections.
-    /// Domain owners remain authoritative; this table only prevents an older,
-    /// duplicate, or equal-time contradictory projection from re-entering
-    /// resident physiology after a relaunch.
+    /// Durable, payload-free replay guard for canonical motor projections. Domain owners remain authoritative; this table only prevents an older, duplicate, or
+    /// equal-time contradictory projection from re-entering resident physiology after a relaunch.
     public func admitMotorConsequence(_ model: MotorActionReadModel, at now: Date) async throws -> Bool {
         let actionKey = CausalTransitionEvidence.opaqueIdentity(
             "\(model.domain)|\(model.actionIdentity)"
@@ -174,9 +154,8 @@ public actor CognitiveSQLiteStore {
                 let existingFingerprint: String = try existing.decode(forColumn: "semantic_fingerprint")
                 if existingFingerprint == fingerprint { return false }
                 let existingOwnerUpdatedAt: Double? = try existing.decode(forColumn: "owner_updated_at")
-                // Without a strictly newer canonical owner timestamp, a
-                // contradiction is ambiguous and therefore cannot affect the
-                // resident body. Exact later corrections remain admissible.
+                // Without a strictly newer canonical owner timestamp, a contradiction is ambiguous and therefore cannot affect the resident body. Exact later
+                // corrections remain admissible.
                 guard let ownerUpdatedAt,
                       existingOwnerUpdatedAt.map({ ownerUpdatedAt > $0 }) ?? true else {
                     return false
@@ -225,10 +204,8 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    /// Commit one replay integration as a single SQLite transition. Episodes,
-    /// schema changes, timeline lineage, and the correlated receipt either all
-    /// become durable or none do; evidence is never permanently consumed by a
-    /// partial sequence of best-effort artifact writes.
+    /// Commit one replay integration as a single SQLite transition. Episodes, schema changes, timeline lineage, and the correlated receipt either all become
+    /// durable or none do; evidence is never permanently consumed by a partial sequence of best-effort artifact writes.
     func commitReplayIntegration(
         artifacts: [CognitiveArtifactWrite],
         receiptPayload: JSONValue?,
@@ -256,10 +233,8 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    /// Commit one complete cognition-maintenance transition. Affect, consumed
-    /// residue, emotional consolidation, the exact node snapshot, and their receipts all
-    /// become durable or none do. This deliberately remains inside the one
-    /// canonical cognition store; maintenance does not gain a second ledger.
+    /// Commit one complete cognition-maintenance transition. Affect, consumed residue, emotional consolidation, the exact node snapshot, and their receipts all
+    /// become durable or none do. This deliberately remains inside the one canonical cognition store; maintenance does not gain a second ledger.
     func commitMaintenance(
         nodes: [CognitiveNode],
         artifacts: [CognitiveArtifactWrite],
@@ -286,8 +261,7 @@ public actor CognitiveSQLiteStore {
                 )
             }
 
-            // Exact snapshots are already bounded, but keep the store boundary
-            // defensive if a malformed caller ever exceeds the configured cap.
+            // Exact snapshots are already bounded, but keep the store boundary defensive if a malformed caller ever exceeds the configured cap.
             let nodeCap = max(1, maxNodes)
             try db.execute(
                 sql: """
@@ -380,13 +354,11 @@ public actor CognitiveSQLiteStore {
                 """,
                 arguments: [id.uuidString, kind, payloadJSON, now.timeIntervalSince1970]
             )
-            // Receipts live only in cognitive_receipts (10k cap). Mirroring
-            // them into artifacts crowded durable state out of restoration.
+            // Receipts belong only in cognitive_receipts; artifact capacity must remain available to durable state.
         }
     }
 
-    /// Forget her transient mind: nodes, artifacts and receipts go, and the
-    /// mind's forgetting epoch moves in the SAME transaction (it lives outside
+    /// Forget the agent's transient mind: nodes, artifacts and receipts go, and the mind's forgetting epoch moves in the SAME transaction (it lives outside
     /// what this deletes). Returns the new epoch.
     @discardableResult
     public func clear() async throws -> UInt64 {
@@ -405,10 +377,8 @@ public actor CognitiveSQLiteStore {
         var updatedAt: Double
     }
 
-    /// Return exact deleted ids so family transitions can receipt lifecycle and
-    /// global-cap removals separately. Rows inside each protected quota are chosen
-    /// by durable status first, then newest update; unprotected rows remain the
-    /// first eviction class regardless of age.
+    /// Return exact deleted ids so family transitions can receipt lifecycle and global-cap removals separately. Rows inside each protected quota are chosen by
+    /// durable status first, then newest update; unprotected rows remain the first eviction class regardless of age.
     private static func pruneArtifacts(
         _ db: Database,
         maxArtifacts: Int,
@@ -426,7 +396,10 @@ public actor CognitiveSQLiteStore {
         guard overflow > 0 else { return [] }
         let rows = try Row.fetchAll(
             db,
-            sql: "SELECT id, kind, status, updated_at FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks)) AND NOT (kind = 'reflection_receipt' AND status = 'owed')",
+            sql: """
+                SELECT id, kind, status, updated_at FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks)) AND NOT (kind = 'reflection_receipt' AND \
+                status = 'owed')
+                """,
             arguments: StatementArguments(Array(exempt))
         ).compactMap { row -> ArtifactPruneRow? in
             guard let id: String = try row.decode(forColumn: "id"),
@@ -622,16 +595,27 @@ public actor CognitiveSQLiteStore {
     private static func migrator(newStore: Bool) -> DatabaseMigrator {
         var migrator = DatabaseMigrator()
         migrator.registerMigration("current_cognitive_schema") { db in
-            let tables = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('cognitive_nodes','cognitive_artifacts','cognitive_receipts','cognitive_motor_consequence_admission','cognitive_epochs','lived_moments')") ?? 0
+            let tables = try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
+                ('cognitive_nodes','cognitive_artifacts','cognitive_receipts','cognitive_motor_consequence_admission','cognitive_epochs','lived_moments')
+                """) ?? 0
             if tables > 0 {
                 guard tables == 6 else { throw CognitivePersistenceError.storeUnavailable }
-                // Existing current stores adopt the baseline without rewriting continuity.
-                _ = try Row.fetchAll(db, sql: "SELECT id, kind, subject_type, subject_id, subject_label, activation, salience, confidence, source_class, created_at, last_activated_at, decay_half_life, summary, metadata_json, updated_at, emotional_valence, emotional_arousal, emotional_warmth, lived_seq FROM cognitive_nodes LIMIT 0")
+                _ = try Row.fetchAll(db, sql: """
+                    SELECT id, kind, subject_type, subject_id, subject_label, activation, salience, confidence, source_class, created_at, last_activated_at, \
+                    decay_half_life, summary, metadata_json, updated_at, emotional_valence, emotional_arousal, emotional_warmth, lived_seq FROM \
+                    cognitive_nodes LIMIT 0
+                    """)
                 _ = try Row.fetchAll(db, sql: "SELECT id, kind, status, score, payload_json, created_at, updated_at FROM cognitive_artifacts LIMIT 0")
                 _ = try Row.fetchAll(db, sql: "SELECT id, kind, payload_json, created_at FROM cognitive_receipts LIMIT 0")
-                _ = try Row.fetchAll(db, sql: "SELECT action_key, semantic_fingerprint, owner_updated_at, admitted_at FROM cognitive_motor_consequence_admission LIMIT 0")
+                _ = try Row.fetchAll(db, sql: """
+                    SELECT action_key, semantic_fingerprint, owner_updated_at, admitted_at FROM cognitive_motor_consequence_admission LIMIT 0
+                    """)
                 _ = try Row.fetchAll(db, sql: "SELECT domain, epoch FROM cognitive_epochs LIMIT 0")
-                _ = try Row.fetchAll(db, sql: "SELECT id, life, kind, lived_at, accepted_at, state, fold_seq, mind_epoch, body_epoch, input_json, meaning_json, parts_json, reason, updated_at FROM lived_moments LIMIT 0")
+                _ = try Row.fetchAll(db, sql: """
+                    SELECT id, life, kind, lived_at, accepted_at, state, fold_seq, mind_epoch, body_epoch, input_json, meaning_json, parts_json, reason, \
+                    updated_at FROM lived_moments LIMIT 0
+                    """)
                 return
             }
             guard newStore else { throw CognitivePersistenceError.storeUnavailable }

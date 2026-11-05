@@ -1,5 +1,4 @@
-// Regenerate the active persona root's USER.md from canonical SQLite memory,
-// preserving its marked human preamble. MemoryStorage requests coalesced refreshes.
+// Project canonical memory into USER.md without replacing its marked human preamble.
 
 import Darwin
 import Experiences
@@ -9,7 +8,7 @@ import PersistenceCore
 import PersonaEngine
 import NativeAgentShared
 
-// Blueprint: | `MemoryV2+UserMDGen.swift` | `UserMDGenerator`: coalesced regeneration of derived USER.md at the active canonical persona root; SQLite remains truth; admits `MemoryKindStamp.personKinds`, bounded at `UserMDAutogenMarkers.promptByteCap` |
+// Blueprint: | `MemoryV2+UserMDGen.swift` | `UserMDGenerator`, `MemoryKindStamp.personKinds`, `UserMDAutogenMarkers.promptByteCap` |
 
 public enum UserMDGeneratorError: Error, CustomStringConvertible, LocalizedError {
     /// Onboarding must create the identity anchor before regeneration can project it.
@@ -36,8 +35,7 @@ public enum UserMDGeneratorError: Error, CustomStringConvertible, LocalizedError
     public var errorDescription: String? { description }
 }
 
-/// USER.md is backed up/exported under the persona PrivacyMap scope, never
-/// phone-synced. Onboarding supplies its initial bytes to this commit owner.
+/// USER.md is backed up/exported under the persona PrivacyMap scope, never phone-synced. Onboarding supplies its initial bytes to this commit owner.
 public actor UserMDGenerator {
     // Share exact section markers with the Context compiler and prompt rendering.
     public static let preambleStartMarker = UserMDAutogenMarkers.preambleStart
@@ -51,7 +49,6 @@ public actor UserMDGenerator {
     private let debounceInterval: TimeInterval
     private let nowProvider: @Sendable () -> Date
     private var lastRegen: Date?
-    /// Personas owed a trailing regeneration when the debounce window closes.
     private var pendingPersonas: Set<String> = []
     /// Owns the deadline AND regeneration, until the flight actually exits.
     private var pendingTask: Task<Void, Never>?
@@ -89,7 +86,7 @@ public actor UserMDGenerator {
             .appendingPathComponent("USER.md")
     }
 
-    /// Return the regenerated URL, or nil when coalesced into one owed trailing run.
+    /// Coalesced requests owe one trailing run rather than a second concurrent write.
     @discardableResult
     public func requestRegeneration(persona: String = MemoryV2Defaults.personaID) async throws -> URL? {
         guard !stopped else { throw CancellationError() }
@@ -158,8 +155,7 @@ public actor UserMDGenerator {
         }
     }
 
-    /// Stop future pokes, cancel only a sleeping deadline, then flush accepted
-    /// requests. A regeneration already writing is joined without cancellation.
+    /// Stop future pokes, cancel only a sleeping deadline, then flush accepted requests. A regeneration already writing is joined without cancellation.
     public func shutdown() async {
         if let shutdownTask { await shutdownTask.value; return }
         guard !stopped else { return }
@@ -175,7 +171,7 @@ public actor UserMDGenerator {
         shutdownTask = nil
     }
 
-    /// Regenerate from active memories; refuse until onboarding has completed.
+    /// Onboarding completion is required before regeneration.
     @discardableResult
     public func regenerate(persona: String = MemoryV2Defaults.personaID) async throws -> URL {
         guard !stopped else { throw CancellationError() }
@@ -188,8 +184,7 @@ public actor UserMDGenerator {
         let parent = target.deletingLastPathComponent()
 
         let manifestPath = dataRoot.appendingPathComponent("onboarding/pending-completion.json")
-        // Match onboarding's lock order and hold its manifest lock from the
-        // completion check through replacement of the derived document.
+        // Match onboarding's lock order and hold its manifest lock from the completion check through replacement of the derived document.
         do {
             let generatedAt = try await SwiftNativePersistenceCore.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
                 guard onboardingHasCompleted else {
@@ -249,8 +244,8 @@ public actor UserMDGenerator {
             // Admit only known person kinds; excluded kinds remain recallable outside USER.md.
             guard let kind = MemoryRecallScoring.kind(of: m.metadata),
                   Self.userIdentityKinds.contains(kind) else { return nil }
-            // Require eligible lifecycle, unexpired validity, completed admission and durable content.
-            // The document is surface-independent; prompt rendering applies disclosure filtering.
+            // Require eligible lifecycle, unexpired validity, completed admission and durable content. The document is surface-independent; prompt rendering
+            // applies disclosure filtering.
             guard MemoryLifecycle.isRecallEligible(m.lifecycle) else { return nil }
             guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: m.validTo, at: now) else { return nil }
             // A cold write is not a fact until its vector lands and passes admission.
@@ -273,9 +268,7 @@ public actor UserMDGenerator {
     /// USER.md and userPromptCore share person-kind admission; moments, experiences and ops stay in recall.
     static let userIdentityKinds: Set<String> = MemoryKindStamp.personKinds
 
-    /// Why a memory of `kind` cannot be pinned, or nil when it can. The pinned
-    /// core carries only `userIdentityKinds`; every pin writer (the chat tool,
-    /// the Memories page, the phone) refuses with these words.
+    /// Share pin refusals across chat, Mac and phone; only userIdentityKinds enter the pinned core.
     public static func pinFailure(kind: String?) -> ToolFailureError? {
         if userIdentityKinds.contains(kind ?? "") { return nil }
         return ToolFailureError("Pins carry owner facts; \(kind ?? "a memory with no kind") is excluded.", effects: .none,
@@ -327,7 +320,6 @@ public actor UserMDGenerator {
 }
 
 extension UserMDGenerator {
-    /// Zero-arg shorthand the launch hook uses.
     public func regenerate() async throws -> URL {
         try await self.regenerate(persona: MemoryV2Defaults.personaID)
     }

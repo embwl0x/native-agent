@@ -1,8 +1,7 @@
 import Foundation
 // Blueprint: | `TurnTokenBudget.swift` | `TurnTokenBudget` class; `take`, `beginRequest` |
 
-/// One output allowance shared by every provider request in a turn. UTF-8 bytes
-/// conservatively bound visible output tokens when an adapter has no tokenizer.
+/// One output allowance shared by every provider request in a turn. UTF-8 bytes conservatively bound visible output tokens when an adapter has no tokenizer.
 /// Providers with a wire cap also receive the remaining allowance.
 public final class TurnTokenBudget: @unchecked Sendable {
     private let lock = NSLock()

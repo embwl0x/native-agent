@@ -2,12 +2,7 @@ import Foundation
 
 // Blueprint: | `ActivitySpan.swift` | `ActivitySpan` and `ActivityCloseReason`: persisted activity intervals, redacted titles and close vocabulary |
 
-/// Why an activity span stopped.
-///
-/// `ActivitySpanEngine` emits `windowChange` for a changed, successfully read
-/// opt-in title or a policy change that removes a captured title. The initial
-/// title settles in place. Lost required AX observation ends at the last known
-/// observation with `observationUnavailable`, without inventing an app quit.
+/// Lost required observation closes at the last known instant, without inventing an app quit or later duration.
 public enum ActivityCloseReason: String, Sendable, Codable, CaseIterable {
     case appChange
     case windowChange
@@ -19,13 +14,8 @@ public enum ActivityCloseReason: String, Sendable, Codable, CaseIterable {
     case observationUnavailable
 }
 
-/// One contiguous stretch of time the machine's frontmost app + window title
-/// did not change.
-///
-/// METADATA ONLY. There is exactly one text field carrying anything the human
-/// wrote — `titleRedacted` — and it can only ever hold the output of
-/// `ActivityTitleRedaction.redact`. No `AXValue` is stored here for any element
-/// role, ever; that rule is categorical, not role-conditional.
+/// Only `titleRedacted` may carry user-authored text, and only from `ActivityTitleRedaction.redact`.
+/// Never store AXValue for any element role.
 public struct ActivitySpan: Sendable, Equatable, Identifiable {
     public let id: String
     public let startedAt: Double
@@ -33,10 +23,7 @@ public struct ActivitySpan: Sendable, Equatable, Identifiable {
     public let lastSeenAt: Double
     public let bundleId: String
     public let appName: String
-    /// W5: the frontmost window's title AFTER redaction, or nil when titles are
-    /// not captured for this app (the default). The name carries the invariant
-    /// on purpose — a field called `title` would eventually be assigned a raw
-    /// one by someone reading only the call site.
+    /// The field name makes source redaction explicit so callers cannot assign a raw title by mistake.
     public let titleRedacted: String?
     public let eventCount: Int
     public let closeReason: ActivityCloseReason?
@@ -68,13 +55,10 @@ public struct ActivitySpan: Sendable, Equatable, Identifiable {
 
     public var isOpen: Bool { endedAt == nil }
 
-    /// Wall duration. An open span is measured to its last heartbeat, never to
-    /// "now" — an open row must not grow while nothing is being observed.
+    /// Measure open spans to their last heartbeat; unobserved time must not grow the row.
     public var duration: Double { max(0, (endedAt ?? lastSeenAt) - startedAt) }
 
-    /// UTC offset in minutes at the new span's `startedAt` (W4 timezone correctness:
-    /// buckets are computed at read time in the asking timezone, so the row only
-    /// has to remember the offset at its start).
+    /// The start offset is provenance; query-time buckets use the asking timezone.
     public static func tzOffsetMinutes(at date: Date) -> Int {
         TimeZone.autoupdatingCurrent.secondsFromGMT(for: date) / 60
     }

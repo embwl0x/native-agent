@@ -2,10 +2,9 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PersonaEngine.swift` | `SwiftNativePersonaEngine`: checked read-only canonical document listing and shared reads of authored contents; `PersonaSelection`: sole installation-wide selection for every door |
+// Blueprint: | `PersonaEngine.swift` | `SwiftNativePersonaEngine`, `PersonaSelection`. |
 
-/// One installation-wide persona selection for every conversation door.
-/// Retains the existing preference key so the Mac's saved pick survives upgrades.
+/// Use one installation-wide persona choice for every conversation door.
 public enum PersonaSelection {
     public static func current(defaults: UserDefaults = .standard) -> String? {
         let name = defaults.string(forKey: "chatPersona")?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -20,10 +19,7 @@ public enum PersonaSelection {
 }
 
 // MARK: - PersonaRoot resolution contract
-//
-// One rule, owned by `PersistenceCore.defaultPersonaRoot`: a checkout's
-// `data/` (every dev install) keeps its persona at `<repo>/persona`; any other
-// data root holds it at `<dataRoot>/persona`.
+// PersistenceCore.defaultPersonaRoot owns resolution: checkout data uses sibling persona; other data roots use their own persona.
 
 // MARK: - Errors
 
@@ -37,7 +33,11 @@ public enum PersonaEngineError: Error, LocalizedError {
         switch self {
         case .rootUnreadable(let r): return "persona root unreadable: \(r)"
         case .missingRequiredDocument(let path):
-            return "Required persona document is missing: \(path). Compilation creates only checked-missing required documents after completed onboarding and a checked profile. Complete or repair onboarding and memory/profile.json, then compile again; existing unreadable documents require restoration or access repair."
+            return """
+                Required persona document is missing: \(path). Compilation creates only checked-missing required documents after completed onboarding and a \
+                checked profile. Complete or repair onboarding and memory/profile.json, then compile again; existing unreadable documents require restoration \
+                or access repair.
+                """
         case .profileUnavailable(let path, let reason):
             return "The saved personality profile is unavailable at \(path). Repair or restore access to this file before continuing. \(reason)"
         case .underlying(let m): return m
@@ -48,16 +48,13 @@ public enum PersonaEngineError: Error, LocalizedError {
 // MARK: - Persona-root resolver
 
 public enum PersonaRootResolver {
-    /// Resolve persona strictly inside an injected data root.
-    ///
-    /// Isolated bodies never use checkout persona seeds: always `<dataRoot>/persona`.
+    /// Injected bodies resolve only inside their data root so absence cannot select checkout seeds.
     public static func resolveIsolated(dataRoot: URL) -> URL {
         dataRoot.standardizedFileURL.appendingPathComponent("persona", isDirectory: true)
     }
 }
 
-/// Mutation receipt: `bytesWritten` counts a full replacement; `bytesAppended`
-/// counts the appended section. The unused count is `nil`.
+/// Keep replacement and append byte counts distinct; leave the unused count absent.
 public struct PersonaToolWriteResult: Sendable, Equatable {
     public let kind: String
     public let path: String
@@ -76,14 +73,11 @@ public struct PersonaToolWriteResult: Sendable, Equatable {
 
 // MARK: - SwiftNative impl
 
-/// Native persona document reader and write owner. Each read loads current
-/// disk contents; document snapshots are not cached. Write extensions own
-/// locked persona mutations, while MemoryV2 owns the USER.md projection.
-/// Actor isolation serializes access to this engine's state.
+/// Read current disk contents without document snapshots; extensions own locked writes and MemoryV2 owns USER projection.
+/// Actor isolation serializes engine state.
 public actor SwiftNativePersonaEngine {
     private let root: URL
     private let fileManager: FileManager
-    /// Data root for the canonical saved profile.
     private let dataRoot: URL
 
     public init(
@@ -96,9 +90,7 @@ public actor SwiftNativePersonaEngine {
         self.dataRoot = dataRoot
     }
 
-    /// Persona engine for an injected/secondary body. Unlike the default
-    /// initializer this cannot consult environment, bundle, or checkout seed
-    /// roots when the injected persona is absent.
+    /// Injected bodies cannot consult environment, bundle or checkout seeds when their persona is absent.
     public static func isolated(dataRoot: URL) -> SwiftNativePersonaEngine {
         SwiftNativePersonaEngine(
             root: PersonaRootResolver.resolveIsolated(dataRoot: dataRoot),
@@ -108,15 +100,14 @@ public actor SwiftNativePersonaEngine {
 
     public var personaRoot: URL { root }
 
-    /// Shared data root for profile reads and writes.
     public var dataRootURL: URL { dataRoot }
 
-    /// Read authored contents as written; unavailable documents throw to their caller.
+    /// Read authored contents unchanged; unavailable documents throw.
     public static func readPersonaDocument(at url: URL) throws -> String {
         try readPersonaDocumentContents(at: url).text
     }
 
-    /// One checked UTF-8 read, retaining the exact bytes for a writer's recovery copy.
+    /// Retain exact checked UTF-8 bytes so recovery copies preserve the original.
     static func readPersonaDocumentContents(at url: URL) throws -> (text: String, data: Data) {
         let data = try Data(contentsOf: url)
         guard let text = String(data: data, encoding: .utf8) else {
@@ -129,7 +120,7 @@ public actor SwiftNativePersonaEngine {
 
     // MARK: - Persona document listing
 
-    /// List the actual canonical documents. Reading never creates or substitutes content.
+    /// List actual canonical documents without creating or substituting content.
     public func listPersonaDocSpecs() async throws -> PersonaDocListing {
         var docs: [PersonaDocSpec] = []
         for spec in Self.personalityDocSpecsFixed {
@@ -158,7 +149,6 @@ public actor SwiftNativePersonaEngine {
 
 // MARK: - PersonaDocSpec / PersonaDocListing
 
-/// One persona document as the Personality tab reads and saves it.
 public struct PersonaDocSpec: Sendable, Equatable, Codable {
     public let id: String
     public let title: String
@@ -188,7 +178,7 @@ public struct PersonaDocListing: Sendable, Equatable, Codable {
 }
 
 extension SwiftNativePersonaEngine {
-    /// The saved profile, read and parsed off the main actor.
+    /// Read and parse saved profile off the main actor.
     public nonisolated static func readPersonality(dataRoot: URL) async throws -> PersonalityProfile {
         try await Task.detached { try PersonaCompiler.compileProfile(dataRoot: dataRoot).sharedProfile }.value
     }

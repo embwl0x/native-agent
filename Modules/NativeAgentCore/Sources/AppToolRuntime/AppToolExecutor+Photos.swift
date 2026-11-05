@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Photos
 import MacIntegration
-// Blueprint: | `AppToolExecutor+Photos.swift` | `AppToolExecutor`: `runPhotosRead`; read-only PhotoKit counts and recent asset metadata; nonprompting authorization refusal carries the shared permission-card remedy |
+// Blueprint: | `AppToolExecutor+Photos.swift` | `AppToolExecutor`, `runPhotosRead`; Read-only PhotoKit metadata and permission remedies |
 
 extension AppToolExecutor {
     @MainActor
@@ -36,7 +36,10 @@ extension AppToolExecutor {
         }
         let authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard authorization == .authorized || authorization == .limited else {
-            return Self.failure("photos_access_off", "Photos access is off. Allow Photos on NativeAgent's permission card. If access is restricted by device management, the administrator must allow it.",
+            return Self.failure("photos_access_off", """
+                Photos access is off. Allow Photos on NativeAgent's permission card. If access is restricted by device management, the administrator must \
+                allow it.
+                """,
                 extra: ["remedy": SystemPermissionPreflight.remedy("photos") ?? .null])
         }
         let limited = authorization == .limited
@@ -57,7 +60,8 @@ extension AppToolExecutor {
             let assets = PHAsset.fetchAssets(with: options)
             var result: [String: JSONValue] = ["status": .string("ok"), "count": .int(Int64(assets.count)),
                 "media_type": .string(media), "limited_access": .bool(limited),
-                "coverage": .string(limited ? "Only assets shared with NativeAgent; counts are not whole-library totals." : "Accessible Photos library assets; dates are creation dates.")]
+                "coverage": .string(limited ? "Only assets shared with NativeAgent; counts are not whole-library totals."
+                    : "Accessible Photos library assets; dates are creation dates.")]
             if verb == "recent" {
                 result["assets"] = .array((0..<assets.count).map { index in
                     let asset = assets.object(at: index)

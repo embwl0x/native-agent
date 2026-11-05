@@ -3,13 +3,12 @@ import Foundation
 import Experiences
 import AttentionRouting
 import NativeAgentCore
-import NotificationInbox
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
 import AppToolRuntime
-// Blueprint: | `SchedulerDueJobRunner+Persistence.swift` | `SchedulerDueJobRunner`: execution-result adaptation to canonical scheduler settlement; `appendActivity` |
+// Blueprint: | `SchedulerDueJobRunner+Persistence.swift` | Activity evidence, one scheduled tell, and in-memory dream receipt readings |
 
 extension SchedulerDueJobRunner {
     func update(job: DueJob, result: JobResult, at runDate: Date) async throws {
@@ -59,144 +58,45 @@ extension SchedulerDueJobRunner {
         }
     }
 
-    static let dreamCardPresentation: JSONValue = .object(["icon": .string("moon.stars.fill"), "badge": .string("DREAM"),
-                                                           "words": .string("A dream"), "act_label": .string("Go ahead")])
-    static let remCardPresentation: JSONValue = .object(["icon": .string("sparkles"), "badge": .string("REM"),
-                                                         "words": .string("From my rest"), "act_label": .string("Go ahead")])
-
-    func appendNotificationInbox(
-        title: String,
-        message: String,
-        source: String,
-        severity: String,
-        jobId: String,
-        itemId: String = "scheduled-\(UUID().uuidString.lowercased())",
-        relatedPaths: [String] = [],
-        relatedGroups: [JSONValue] = [],
-        detail: String? = nil,
-        actions: [JSONValue] = [],
-        notifyPhone: Bool = false,
-        presentation: JSONValue = .null
-    ) async throws {
-        let now = Self.iso(Date())
-        // The producer declares what its card means (the inbox's `presentation`).
-        let row: JSONValue = .object([
-            "id": .string(itemId),
-            "created_at": .string(now),
-            "source": .string(source),
-            "severity": .string(severity),
-            "title": .string(NativeAppSecretRedactor.redactText(String(title.prefix(160)))),
-            "summary": .string(NativeAppSecretRedactor.redactText(String(message.prefix(500)))),
-            "detail": .string(NativeAppSecretRedactor.redactText(String((detail ?? message).prefix(2000)))),
-            "related_execution_id": .null,
-            "related_approval_id": .null,
-            "related_paths": .array(relatedPaths.map { .string($0) }),
-            "related_groups": .array(relatedGroups),
-            "actions": .array(actions),
-            "status": .string("unread"),
-            "read_at": .null,
-            "schedulerJobId": .string(jobId),
-            "presentation": presentation,
-        ])
-        // LiveNotificationInbox archives evicted rows before aging out finished history.
-        try await LiveNotificationInbox(path: notificationInboxPath)
-            .appendUnique(row, id: itemId)
-        if notifyPhone {
-            await platform.notifyInboxIfAttentionWorthy(
-                dataRoot: root,
-                itemId: itemId,
-                title: title,
-                summary: message,
-                source: source,
-                severity: severity
-            )
+    @discardableResult
+    func tellScheduledMatter(_ matter: Matter, reach: AttentionRouter.Reach) async throws -> JSONValue {
+        let face = Matter(id: matter.id, form: matter.form, from: matter.from,
+            title: NativeAppSecretRedactor.redactText(String(matter.title.prefix(160))),
+            summary: NativeAppSecretRedactor.redactText(String(matter.summary.prefix(500))),
+            words: NativeAppSecretRedactor.redactText(String(matter.words.prefix(2000))), symbol: matter.symbol,
+            badge: matter.badge, open: matter.open, choices: matter.choices, evidence: matter.evidence, artifacts: matter.artifacts)
+        let outcome = try await platform.attentionRouter.tell(face, reach: reach, turn: nil)
+        var delivered: [JSONValue] = [], errors: [JSONValue] = [], pending: [JSONValue] = []
+        for (door, verdict) in outcome.destinationOutcomes.sorted(by: { $0.key < $1.key }) {
+            switch verdict {
+            case .delivered: delivered.append(.string(door))
+            case .notDelivered(let reason):
+                if outcome.deferredForQuietHours { pending.append(.string(door + ": deferred")) }
+                else { errors.append(.string(door + ": " + reason)) }
+            case .unknown(_, let reason): pending.append(.string(door + ": " + reason))
+            case .suppressed(let preference): pending.append(.string(door + ": suppressed by " + preference))
+            }
         }
+        return .object(["delivered": .array(delivered), "errors": .array(errors),
+                        "not_delivered": .array(pending), "destinations": .object(outcome.destinationFields)])
     }
 
     @discardableResult
     func archiveOlderDreamInboxItems(keeping keepItemId: String) async throws -> Int {
-        try await LiveNotificationInbox(path: notificationInboxPath)
-            .archiveSupersededRows(source: "dream_cycle", groupField: "source", keeping: keepItemId) {
-                let status = $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                return status != "archived" && status != "dismissed"
-            }
+        let forPerson = ForPerson.at(root)
+        var count = 0
+        for old in try await forPerson.matters() where old.face?.from == "dream_cycle" && old.id != keepItemId
+            && (ForPerson.reading(old) == .unread || ForPerson.reading(old) == .read) {
+            try await forPerson.putAway(old.id, .resolved)
+            count += 1
+        }
+        return count
     }
 
-    func notificationInboxContains(source: String, dateKey: String) async throws -> Bool {
-        let rows = try await LiveNotificationInbox(path: notificationInboxPath).rows()
-        for row in rows {
-            guard case .object(let obj) = row else { continue }
-            guard SchedulerJobRuntime.string(obj["source"]) == source else { continue }
-            let diaryDates = Self.notificationRowDiaryDateKeys(obj)
-            if !diaryDates.isEmpty {
-                if diaryDates.contains(dateKey) { return true }
-                continue
-            }
-            guard let created = SchedulerJobRuntime.string(obj["created_at"]),
-                  let date = Self.parseISODate(created) else { continue }
-            if NativeAgentDreamCycleSchedule.runDateKey(date) == dateKey {
-                return true
-            }
+    func dreamMatterExists(dateKey: String) async throws -> Bool {
+        try await ForPerson.at(root).matters().contains {
+            $0.face?.from == "dream_cycle" && Self.matterDiaryDateKeys($0).contains(dateKey)
         }
-        return false
-    }
-
-    func postCycleNotification(title: String, body: String, jobId: String, source: String, itemId: String? = nil) async -> JSONValue {
-        var delivered: [JSONValue] = []
-        var errors: [JSONValue] = []
-        var notDelivered: [JSONValue] = []
-        var macOutcome: NotificationDeliveryOutcome?
-
-        do {
-            // The router defers informational cycle news during quiet hours.
-            var userInfo = ["screen": "inbox", "source": source, "jobId": jobId]
-            if let itemId, !itemId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                userInfo["itemId"] = itemId
-            }
-            let revision: String?
-            if let itemId, let row = try await LiveNotificationInbox.live(dataRoot: root).row(id: itemId) { revision = try LiveNotificationInbox.notificationRevision(row) }
-            else { revision = nil }
-            // Cycle news is informational; the inbox card retains its receipt.
-            let outcome = try await platform.attentionRouter.route(
-                eventId: "scheduler_cycle:\(userInfo["itemId"] ?? jobId)",
-                importance: .informational,
-                title: title,
-                body: body,
-                userInfo: userInfo, macBanner: true,
-                sourceRevision: revision
-            )
-            macOutcome = outcome.destinationOutcomes["mac"]
-            // The router's delivery projection determines the channel receipt.
-            switch outcome.deliveryProjection {
-            case .accepted:
-                delivered.append(.string("push"))
-            case .queued:
-                // CloudKit publication is not signed phone receipt; optional APNS acceptance cannot settle it.
-                notDelivered.append(.string("push: queued (phone receipt pending)"))
-            case .failed:
-                errors.append(.string(
-                    "push: the knock was tried and no channel accepted it; nothing was delivered"))
-            case .deferred, .noChannel:
-                // Not an error — nothing went wrong, and nothing was delivered.
-                notDelivered.append(.string("push: \(outcome.deliveryProjection.rawValue)"))
-            }
-        } catch {
-            errors.append(.string("push: \(error.localizedDescription)"))
-        }
-
-        switch macOutcome {
-        case .delivered?: delivered.insert(.string("mac"), at: 0)
-        case .notDelivered(let reason)?: errors.insert(.string("mac: " + reason), at: 0)
-        case .unknown(_, let reason)?: notDelivered.insert(.string("mac: " + reason), at: 0)
-        case .suppressed(let preference)?: notDelivered.insert(.string("mac: suppressed by " + preference), at: 0)
-        case nil: notDelivered.insert(.string("mac: deferred"), at: 0)
-        }
-        var fields: [String: JSONValue] = [
-            "delivered": .array(delivered),
-            "errors": .array(errors),
-        ]
-        if !notDelivered.isEmpty { fields["not_delivered"] = .array(notDelivered) }
-        return .object(fields)
     }
 
     static func iso(_ date: Date) -> String {

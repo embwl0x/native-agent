@@ -18,18 +18,8 @@ import ProviderRouting
 // Blueprint: | `MacSyncEngine+SnapshotFreshness.swift` | Manifest-derived stale-page accounting and group build outcomes; cancelled reads remain unavailable |
 
 extension MacSyncEngine {
-    /// The staleness marker the phone renders per screen.
-    ///
-    /// `snapshot_skips.json` is LOCAL Mac bookkeeping (Doctor reads it), so a
-    /// skipped group was invisible on the device that was showing the stale
-    /// rows. This publishes the same group→reason map into the snapshot bundle
-    /// iOS already decodes.
-    ///
-    /// Deliberately carries NO timestamp: the file's digest drives snapshot
-    /// publication, and a per-pass timestamp would wake the phone with a
-    /// changed core group on every single tick. A healthy pass publishes `{}`
-    /// rather than deleting the file, because the phone's CloudKit cache only
-    /// ever gains files — a deleted marker would badge Memory as stale forever.
+    /// Publish stale-group reasons to the phone without timestamps so unchanged failures do not wake it every pass. Publish {} on recovery: the phone's
+    /// additive cache cannot clear a stale marker by deletion.
     nonisolated static let snapshotStalenessFilename = "snapshot_staleness.json"
 
     nonisolated static func snapshotStalenessMarkerData(
@@ -44,10 +34,7 @@ extension MacSyncEngine {
         return try? encoder.encode(groups)
     }
 
-    /// Reconcile one pass with durable stale-state truth. A lightweight pass
-    /// must not clear a heavyweight group's prior failure merely because that
-    /// group was not attempted. Successfully attempted groups are cleared;
-    /// current failures replace their prior reason.
+    /// A light pass cannot clear an unattempted heavy group's failure; only successful attempted groups prove recovery.
     @discardableResult
     nonisolated static func updateSnapshotSkipState(
         currentSkips: [String: String],
@@ -62,9 +49,11 @@ extension MacSyncEngine {
             unresolved = prior.filter { $0.key != "_observedAt" }
         } catch {
             if !Self.isNoSuchFileError(error) {
-                // A current pass cannot prove recovery for groups whose prior
-                // obligations are unreadable. Preserve that file unchanged.
-                let reason = "Snapshot failure history is unavailable (\(error.localizedDescription)); restore access to icloud/snapshot_skips.json and rebuild phone snapshots."
+                // Unreadable prior obligations prevent proof of recovery; preserve their bytes.
+                let reason = """
+                    Snapshot failure history is unavailable (\(error.localizedDescription)); restore access to icloud/snapshot_skips.json and rebuild phone \
+                    snapshots.
+                    """
                 nativeLog("[MacSyncEngine] %@", reason)
                 let stems = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames).map {
                     URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
@@ -83,7 +72,6 @@ extension MacSyncEngine {
         return unresolved
     }
 
-    /// Full replacement helper retained for isolated callers and tests.
     nonisolated static func persistSnapshotSkipState(
         _ skips: [String: String],
         dataRoot: URL
@@ -105,7 +93,7 @@ extension MacSyncEngine {
     }
 }
 
-/// Skipped groups retain last-good files and name their staleness in syncError and Doctor's durable state.
+/// Retained snapshots must expose skipped-group staleness in syncError and durable diagnostic state.
 enum SnapshotGroupBuild: Sendable {
     case built(Data)
     case skipped(String)

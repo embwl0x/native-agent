@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import NativeAgentChromeRelayCore
 import PersistenceCore
-// Blueprint: | `ChromeNativeHostRegistration.swift` | `ChromeNativeHostRegistration`: bundled relay identity and native-host manifest install/uninstall; directory-locked ownership checks preserve the registered install and shared extension origin |
+// Blueprint: | `ChromeNativeHostRegistration.swift` | `ChromeNativeHostRegistration`; Locked registration ownership. |
 
 public enum ChromeNativeHostRegistration {
     static let hostID = "com.nativeagent.chrome"

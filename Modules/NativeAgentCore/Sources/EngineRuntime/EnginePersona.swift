@@ -4,10 +4,9 @@ import Observation
 import NativeAgentShared
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `EnginePersona.swift` | PersonaFacade owns checked identity display (blank until available, errors separate), profile/documents and retained read availability for Mac, editors and DeviceSync over PersonaEngine content readers/writers. LatestRead orders reads/failures, committed profile/name/document saves use write; chat/settlement reads retain their own document failure independently of committed reply/save effects. |
+// Blueprint: | `EnginePersona.swift` | Checked profile and document publication with independent save/read outcomes |
 
-/// The saved profile and editable documents for this root. Mac presentation
-/// and phone publication share these reads; PersonaEngine owns their content.
+/// Mac and phone share profile reads; PersonaEngine owns the content.
 @MainActor
 @Observable
 public final class PersonaFacade {
@@ -18,8 +17,7 @@ public final class PersonaFacade {
     public private(set) var documents: [PersonaDocSpec] = []
     public private(set) var profileError: String?
     public private(set) var documentsError: String?
-    /// No identity label until a checked profile is available. The error has
-    /// its own field; it must never become a person's or agent's name.
+    /// Wait for a checked profile before naming identity; errors must never become names.
     public var displayName: String {
         guard profileError == nil, let profile else { return "" }
         return NativeAgentIdentity.displayName(profile.name)

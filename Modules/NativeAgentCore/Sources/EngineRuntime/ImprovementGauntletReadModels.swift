@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ImprovementGauntletReadModels.swift` | `ImprovementGauntletRun` is the stored run schema, typed history reader and manual check runner; `GauntletCheck` |
+// Blueprint: | `ImprovementGauntletReadModels.swift` | `ImprovementGauntletRun`, `GauntletCheck`; Stored promotion evidence |
 
 public struct ImprovementGauntletRun: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -11,7 +11,8 @@ public struct ImprovementGauntletRun: Identifiable, Codable, Hashable, Sendable 
     public var dryRun: Bool?
     public var checks: [GauntletCheck]?
     public var createdAt: String?
-    public init(id: String, objective: String? = nil, promotionClass: String? = nil, status: String, dryRun: Bool? = nil, checks: [GauntletCheck]? = nil, createdAt: String? = nil) {
+    public init(id: String, objective: String? = nil, promotionClass: String? = nil, status: String, dryRun: Bool? = nil, checks: [GauntletCheck]? = nil,
+        createdAt: String? = nil) {
         self.id = id
         self.objective = objective
         self.promotionClass = promotionClass
@@ -46,10 +47,7 @@ extension ImprovementGauntletRun {
         }.value
     }
 
-    /// The manual Swift-native promotion gauntlet: a validated checkout's
-    /// static checks and installed runtime proof plus its signature, recorded in
-    /// the improvements/gauntlet/runs.json contract the gauntlet panel reads.
-    /// A check this Mac cannot run is reported unavailable, never passed.
+    /// Record static checks, installed proof and signature in the panel’s run contract; checks this Mac cannot run stay unavailable, never passed.
     public static func run(
         dataRoot: URL,
         runProcess: (String, [String], URL, TimeInterval) async throws -> (status: Int32, detail: String),

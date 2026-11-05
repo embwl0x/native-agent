@@ -2,36 +2,26 @@ import Foundation
 import NativeAgentCore
 import ProviderRouting
 import os
-// Blueprint: | `ContextBudgetPolicy.swift` | Shared per-row and non-history context budgets for every door; no replay ceiling; derived budget reuse by exact effective window after current model/catalog resolution |
+// Blueprint: | `ContextBudgetPolicy.swift` | ContextBudgetPolicy owner. |
 
-/// Prompt-assembly budgets scale with the effective context window and never undercut floors.
+/// Scale derived prompt budgets with the effective window without undercutting floors.
 public enum ContextBudgetPolicy {
 
     // MARK: - Tuning constants (every number in this file, nowhere else)
 
-    /// Rough characters-per-token for English prose + code. Deliberately on the
-    /// low side of the usual 3.5–4.0 range: undercounting chars-per-token means
-    /// we ask for FEWER characters than the window can hold, which is the safe
-    /// direction to be wrong in.
+    /// Use a low characters-per-token estimate to request fewer characters than the window can hold.
     package static let charactersPerToken = 3.2
 
-    /// Transcript-size approximation when no tokenizer counts are available.
-    /// Shared by transcript status, aging and compaction; model spelling is not tokenizer evidence.
-    /// The 3.2 prompt-budget factor above is a separate, tighter safety margin.
+    /// Share transcript-size approximation across request sizing and status; model spelling cannot establish a tokenizer.
+    /// The prompt-budget ratio is a separate safety margin.
     package static let transcriptCharactersPerToken = 3.5
 
-    /// Window fraction used to scale the derived block budgets.
     static let combinedUtilizationFraction = 0.25
 
-    /// At or below this window, budgets are EXACTLY the pre-policy literals.
-    /// 32,768 is the largest window where today's ~32k characters of assembled
-    /// context is already a substantial share of the budget, so there is
-    /// nothing to win by scaling and everything to lose by regressing a small
-    /// model's prompt.
+    /// Keep floors through 32,768 tokens because fixed assembled context already occupies a substantial share of small windows.
     static let floorWindowTokens = 32_768
 
-    /// Fixed reference mass for gentle per-row/non-history scaling. The 22k
-    /// term preserves that scale; it is never an aggregate replay allowance.
+    /// The 22k reference mass preserves gentle per-row scaling; it is never an aggregate replay allowance.
     static let referenceFloorTotalCharacters =
         22_000 + (5 * (1_200 + memoryRowOverheadChars)) + 4_000
 
@@ -42,19 +32,14 @@ public enum ContextBudgetPolicy {
     static let maximumPacketExpandedCharacters = 48_000
     static let maximumPacketPostMandatoryReserve = 40_000
 
-    /// Per-ROW caps (one user turn, one memory row, one tool receipt) scale far
-    /// more gently than the aggregate: a bigger window means we can afford MORE
-    /// rows, not that any single row suddenly deserves 30× the space. 4× is
-    /// enough to stop clipping a long message while keeping one pathological
-    /// row from eating the block.
+    /// Cap row growth at 4× so larger windows admit more rows without letting one pathological row consume the block.
     static let maximumRowScale = 4.0
 
-    /// Per-row content leaves room for the bullet, newline and provenance marker inside the block cap.
+    /// Leave room for bullet, newline and provenance markup inside the block cap.
     static let memoryRowOverheadChars = 64
 
     static let baseRecallRowLimit = 5
     package static let wideRecallRowLimit = 12
-    /// Wide recall starts at 60% of a 200k-token model window.
     static let wideRecallWindowTokens = 120_000
 
     // MARK: - Packet atom rendering (NORTHSTAR clause 6: reach, not weight)
@@ -64,70 +49,48 @@ public enum ContextBudgetPolicy {
 
     // MARK: - Floors (today's literals, verbatim)
 
-    /// The pre-policy budget table. Every value here shipped before this file
-    /// existed and is reproduced EXACTLY; the floor regime returns these
-    /// structs untouched.
+    /// Return the floor table unchanged below the scaling threshold.
     public struct Floors: Sendable {
-        public let userCap: Int
-        public let systemCap: Int
-        public let compactionSummaryCap: Int
         public let relevantChars: Int
         public let relevantItemCap: Int
     }
 
     /// Every door assembles the same model input; delivery owns reply limits.
     static let floors = Floors(
-        userCap: 1_800,
-        systemCap: 1_200,
-        compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
         relevantChars: 2_400,
         relevantItemCap: 650
     )
 
-    /// Surface-independent floors (memory recall, capsule, ranked packet).
-    /// These were literals at their own call sites, not in the history table.
-    // Their product is also the person picture's bound
-    // (`UserMDAutogenMarkers.promptByteCap`, a base target that cannot read
-    // these): change them together.
-    static let floorMemoryRowChars = 1_200          // TurnEngine.recalledMemoryRowCharCap
-    static let floorRecallRowLimit = 5              // TurnEngine.recalledMemoryRowLimit / recall(k:)
-    static let floorCapsuleChars = 4_000            // Cognitive capsule request
-    static let floorPacketChars = 6_000             // ContextTurnRequest.characterBudget
-    static let floorPacketExpandedChars = 24_000    // ContextTurnRequest.maximumCharacterBudget
+    // Keep this product aligned with UserMDAutogenMarkers.promptByteCap, which cannot read these constants.
+    static let floorMemoryRowChars = 1_200
+    static let floorRecallRowLimit = 5
+    static let floorCapsuleChars = 4_000
+    static let floorPacketChars = 6_000
+    static let floorPacketExpandedChars = 24_000
     static let floorPacketPostMandatoryReserve = 4_000
 
     // MARK: - Resolved budget
 
-    /// The budget for one turn on one surface. Field names for the history
-    /// block match the renderer's former private `Budget` struct exactly, so
-    /// the renderer typealiases straight onto this type.
+    /// Share budget fields directly with the history renderer so policy cannot drift.
     public struct Resolved: Sendable {
-        // History renderer
-        public let userCap: Int
-        public let systemCap: Int
-        public let compactionSummaryCap: Int
         public let relevantChars: Int
         public let relevantItemCap: Int
 
-        // Memory recall block
         public let recallRowLimit: Int
         public let memoryRowChars: Int
         public let memoryBlockChars: Int
 
-        // Cognitive capsule
         public let capsuleChars: Int
 
-        // Fluid-context ranked packet
         public let packetChars: Int
         public let packetExpandedChars: Int
         public let packetPostMandatoryReserve: Int
 
-        // Provenance (trace)
         public let windowTokens: Int?
         public let isDerived: Bool
     }
 
-    /// Scaling input for derived budgets, not a cap on their sum.
+    /// Scaling input for derived budgets, never a cap on their sum.
     public static func derivedCharacterAllowance(windowTokens: Int) -> Int {
         Int(Double(windowTokens) * charactersPerToken * combinedUtilizationFraction)
     }
@@ -140,22 +103,29 @@ public enum ContextBudgetPolicy {
     ) -> Int? {
         guard let raw = modelID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return nil }
-        return ChatSessionAutocompactionConfig.productionDefault().effectiveWindowTokens(
-            forModel: raw, providerID: providerID, dataRoot: dataRoot
-        )
+        return ProviderRouting.verifiedContextLength(forModel: raw, providerID: providerID, dataRoot: dataRoot)
     }
 
     // MARK: - Resolution
 
-    /// Only the derived pure projection is retained, keyed by the exact effective
-    /// window. Model/catalog and saved-window authority are still resolved on
-    /// every model-based call before reaching this cache; no route is frozen.
+    /// Preparation uses the route held by its turn, never a picker reread or a context projection.
+    public static func resolve(turn: Turn, dataRoot: URL?) throws -> Resolved {
+        guard let admission = turn.admission,
+              !admission.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !admission.provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ProviderRoutingError.configurationFailed("Admit this turn's provider and model before preparing its context.")
+        }
+        return try resolve(model: admission.model, providerID: admission.provider, dataRoot: dataRoot)
+    }
+
+    /// Cache only the pure projection by effective window; resolve model and catalog authority on every model-based call.
     private static let resolvedGeneration = OSAllocatedUnfairLock<Resolved?>(initialState: nil)
 
-    /// The one entry point requires the admitted model's actual room.
+    /// Require the admitted model's actual room.
     public static func resolve(windowTokens: Int?) throws -> Resolved {
         guard let windowTokens, windowTokens > 0 else {
-            throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable. Refresh its catalog in Providers before preparing this turn.")
+            throw ProviderRoutingError.configurationFailed(
+                "The selected model's context window is unavailable. Refresh its catalog in Providers before preparing this turn.")
         }
         guard windowTokens > floorWindowTokens else {
             return floorBudget(floors: floors, windowTokens: windowTokens)
@@ -170,16 +140,14 @@ public enum ContextBudgetPolicy {
 
     private static func deriveBudget(windowTokens: Int) -> Resolved {
         let allowance = derivedCharacterAllowance(windowTokens: windowTokens)
-        // Scale from the shared floor total and never below it.
+        // Never scale below the shared floor total.
         let scale = max(1.0, Double(allowance) / Double(referenceFloorTotalCharacters))
         let rowScale = min(scale, maximumRowScale)
 
-        // Wide recall includes the threshold itself.
         let recallRowLimit = windowTokens >= wideRecallWindowTokens
             ? wideRecallRowLimit
             : baseRecallRowLimit
-        // Row size is bounded twice: by the gentle row scale, and by its share
-        // of the memory block ceiling once the row COUNT has doubled.
+        // Bound row size by both gentle growth and its share of the memory block after row-count growth.
         let memoryRowChars = min(
             grow(floorMemoryRowChars, rowScale),
             max(
@@ -189,20 +157,11 @@ public enum ContextBudgetPolicy {
         )
 
         return Resolved(
-            userCap: grow(floors.userCap, rowScale),
-            systemCap: grow(floors.systemCap, rowScale),
-            // The distiller never writes more than maxSummaryChars, so more
-            // room than that buys literally nothing.
-            // The whole recollection renders; per-surface floors would cut it.
-            compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
             relevantChars: min(maximumRelevantCharacters, grow(floors.relevantChars, scale)),
             relevantItemCap: grow(floors.relevantItemCap, rowScale),
             recallRowLimit: recallRowLimit,
             memoryRowChars: memoryRowChars,
-            // The aggregate bound is measured against RENDERED rows, so it
-            // must account for the same per-row markup the row cap was sized
-            // net of. Bounding `limit × content` instead would make the last
-            // full row unrenderable by construction.
+            // Account for rendered row markup so a full final row still fits the aggregate bound.
             memoryBlockChars: min(
                 maximumMemoryBlockCharacters,
                 recallRowLimit * (memoryRowChars + memoryRowOverheadChars)
@@ -222,7 +181,6 @@ public enum ContextBudgetPolicy {
         )
     }
 
-    /// Convenience: resolve straight from a model id.
     public static func resolve(
         model: String?,
         providerID: String? = nil,
@@ -237,13 +195,9 @@ public enum ContextBudgetPolicy {
 
     // MARK: - Internals
 
-    /// Floor regime: the literal table, no multiplication anywhere. `windowTokens`
-    /// is carried through for the trace even though it did not change anything.
+    /// Preserve windowTokens for tracing even when the floor regime needs no scaling.
     private static func floorBudget(floors: Floors, windowTokens: Int?) -> Resolved {
         Resolved(
-            userCap: floors.userCap,
-            systemCap: floors.systemCap,
-            compactionSummaryCap: floors.compactionSummaryCap,
             relevantChars: floors.relevantChars,
             relevantItemCap: floors.relevantItemCap,
             recallRowLimit: floorRecallRowLimit,
@@ -258,7 +212,7 @@ public enum ContextBudgetPolicy {
         )
     }
 
-    /// Truncate scaled values without undercutting the floor; grow(x, 1.0) == x.
+    /// Truncate scaled values without undercutting the floor.
     private static func grow(_ value: Int, _ scale: Double) -> Int {
         max(value, Int(Double(value) * scale))
     }

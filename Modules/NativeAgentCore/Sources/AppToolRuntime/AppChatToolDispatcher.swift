@@ -17,41 +17,37 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-import WorkshopExecution
 import StandingBots
 import ToolRegistry
 import Senses
 import PersonaEngine
-// Blueprint: | `AppChatToolDispatcher.swift` | Composed tool dispatch, Security Center admission and settled-result observers; the common result return files permission remedies through permissions.request and nonblocking per-item batch needs through the existing card owner, retaining the original outcome; `withAuthoredProgramHost` is the one host binding for turns and native scheduled/UI owners, retaining their originating gated reentry; preview retains security evaluation but skips policy recording and motor feedback |
+// Blueprint: | `AppChatToolDispatcher.swift` | `withAuthoredProgramHost`; Gated dispatch and settled-result observation |
 
-/// Composes the engine's tool catalog with Security Center admission,
-/// app effects and settled-result motor observations.
+/// The composed dispatcher shares admission and settled-result observations with the engine's catalog.
 public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolValidating {
     private let platform: ChatToolPlatformPort
-    private let inner: any ToolDispatchClient
+    private let scopedInner: @Sendable (AppActionExecution) -> any ToolDispatchClient
+    private let actionExecution: AppActionExecution
     private let securityCenter: SwiftNativeSecurityCenter
-    /// The app's own tool executors: here only for the self-window handoff an
-    /// `act`/`go`/`screen` result asks this process to finish.
+    /// App executors finish self-window handoffs inside the originating act/go/screen call.
     private let appTools: AppToolExecutor?
     private let motorOutcomeObserver: @Sendable (ToolCausalBoundary.MotorReference) async -> Void
     private let enforceAutonomySecurity: Bool
     private let includeAppOwnedTools: Bool
 
     public init(
-        inner: any ToolDispatchClient = SwiftToolDispatcher(
-            agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(
-                dataRoot: PersistenceCore.defaultDataRoot()
-            )
-        ),
         securityCenter: SwiftNativeSecurityCenter = SwiftNativeSecurityCenter(),
         enforceAutonomySecurity: Bool = true,
         includeAppOwnedTools: Bool = true,
         appTools: AppToolExecutor? = nil,
         motorOutcomeObserver: @escaping @Sendable (ToolCausalBoundary.MotorReference) async -> Void = { _ in },
-        platform: ChatToolPlatformPort
+        platform: ChatToolPlatformPort,
+        scopedInner: @escaping @Sendable (AppActionExecution) -> any ToolDispatchClient,
+        actionExecution: AppActionExecution
     ) {
+        self.scopedInner = scopedInner
+        self.actionExecution = actionExecution
         self.platform = platform
-        self.inner = inner
         self.securityCenter = securityCenter
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.includeAppOwnedTools = includeAppOwnedTools
@@ -59,47 +55,60 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         self.motorOutcomeObserver = motorOutcomeObserver
     }
 
-    /// Core's pre-approval rules — its lazy-load gate covers every tool, the
-    /// app's own among them — carried to the approval membrane, which only
-    /// ever sees this wrapper.
+    /// Carry Core's complete pre-approval gate to the approval membrane, which sees only this wrapper.
     public func preApprovalRefusal(
+        turn: Turn, invocation: ChatToolInvocation,
         tool: String, input: [String: JSONValue], surface: String
     ) async -> JSONValue? {
-        if let validating = inner as? any PreApprovalToolValidating {
-            return await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
+        let execution = actionExecution.receiving(invocation)
+        if let validating = scopedInner(execution) as? any PreApprovalToolValidating {
+            return await validating.preApprovalRefusal(turn: turn, invocation: invocation, tool: tool, input: input, surface: surface)
         }
-        return await (inner as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
+        return await (scopedInner(execution) as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input, turn: turn)
     }
 
     public func approvalCardReason(
         tool: String, input: [String: JSONValue], surface: String
     ) async -> String? {
-        guard let validating = inner as? any PreApprovalToolValidating else { return nil }
+        guard let validating = scopedInner(actionExecution) as? any PreApprovalToolValidating else { return nil }
         return await validating.approvalCardReason(tool: tool, input: input, surface: surface)
     }
 
-    public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    public func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+        invocation: ChatToolInvocation) async throws -> JSONValue {
+        let execution = actionExecution.receiving(invocation)
+        return try await dispatch(tool: tool, input: input, surface: surface, turn: turn, execution: execution)
+    }
+
+    public func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+        execution: AppActionExecution) async throws -> JSONValue {
         let result: JSONValue
         do {
-            result = ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: tool, input: input) { input in
-                try await MacAppActGate.withAdmission(origin: Self.securityOrigin(surface: surface), dataRoot: securityCenter.dataRoot) {
-                    try await dispatchNormalized(tool: tool, input: input, surface: surface)
+            result = ChatToolOutcome.normalizedFailure(try await withToolArguments(turn: turn, invocation: execution.invocation,
+                tool: tool, input: input, surface: surface) { input, invocation in
+                var execution = execution
+                execution.invocation = invocation
+                return try await MacAppActGate.withAdmission(origin: Self.securityOrigin(turn: turn, surface: surface), dataRoot: securityCenter.dataRoot,
+                    turn: turn, context: execution.macOperation(dataRoot: securityCenter.dataRoot)) { admittedTurn, context in
+                    var execution = execution
+                    execution.invocation = execution.invocation.serving(mac: context)
+                    return try await dispatchNormalized(tool: tool, input: input, surface: surface, turn: admittedTurn, execution: execution)
                 }
             }, tool: tool)
         } catch {
-            let filed = await filePermissionRemedy(in: ChatToolOutcome.failure(error: error, tool: tool), input: input, surface: surface)
+            let filed = await filePermissionRemedy(in: ChatToolOutcome.failure(error: error, tool: tool), input: input, surface: surface, turn: turn,
+                execution: execution)
             if filed.objectValue?["permission_card"] != nil { return filed }
             throw error
         }
-        let withCards = await fileBatchNeeds(in: result, tool: tool, input: input, surface: surface)
-        return await filePermissionRemedy(in: withCards, input: input, surface: surface)
+        let withCards = await fileBatchNeeds(in: result, tool: tool, input: input, surface: surface, turn: turn, execution: execution)
+        return await filePermissionRemedy(in: withCards, input: input, surface: surface, turn: turn, execution: execution)
     }
 
-    /// Partial exports carry one nonblocking need envelope per refused file.
-    /// File them before a script/list can wrap the result. The same card owner
-    /// writes each card, without replaying an export that may already have files.
-    private func fileBatchNeeds(in result: JSONValue, tool: String, input: [String: JSONValue], surface: String) async -> JSONValue {
-        guard input["preview"] != .bool(true), !Task.isCancelled, !SkillRunContext.handsBack,
+    /// File per-file needs before scripts/lists wrap them; the card owner must not replay exports that may already have files.
+    private func fileBatchNeeds(in result: JSONValue, tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+        execution: AppActionExecution) async -> JSONValue {
+        guard input["preview"] != .bool(true), !Task.isCancelled, !execution.handsBack,
               case .object(var fields) = result, fields["needCards"] == nil,
               fields["status"] == .string("partial"),
               case .array(let envelopes)? = fields[InlineInteractionWire.needsKey] else { return result }
@@ -109,15 +118,15 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         for (index, envelope) in envelopes.enumerated() {
             guard let need = InlineInteractionNeed.interaction(in: envelope),
                   !InlineInteractionNeed.blocksTurn(need) else { continue }
-            guard let session = ChatToolSessionContext.verifiedSessionId else {
+            guard let session = turn.verifiedSessionID else {
                 filings.append(.object(["id": .string(need.id), "status": .string("unavailable"),
                     "detail": .string("No card was filed: this call has no originating conversation.")]))
                 continue
             }
             if let filed = await InlineInteractionResolver.raise(need, sessionID: session,
                 requestingTool: tool,
-                origin: TurnEnvelope.current(surface: surface), dataRoot: securityCenter.dataRoot) {
-                retainedEnvelopes[index] = InlineInteractionNeed.envelope(filed)
+                origin: TurnEnvelope.current(turn: turn, surface: surface), turn: turn, dataRoot: securityCenter.dataRoot) {
+                retainedEnvelopes[index] = InlineInteractionNeed.envelope(invocation: execution.invocation, filed)
                 retainedIDs[need.id] = filed.id
                 filings.append(.object(["id": .string(filed.id), "session_id": .string(session),
                     "status": .string("filed")]))
@@ -127,8 +136,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             }
         }
         guard !filings.isEmpty else { return result }
-        // The exporter also points to each need from its per-file receipt.
-        // Project those pointers from the same filing result as the envelopes.
+        // Per-file receipt pointers and need envelopes must use the same filing result.
         if case .object(var saved)? = fields["saved"], case .array(let files)? = saved["files"] {
             saved["files"] = .array(files.map { file in
                 guard case .object(var item) = file, case .string(let id)? = item["card_id"],
@@ -138,14 +146,14 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             })
             fields["saved"] = .object(saved)
         }
-        // A filing receipt also keeps an outer folded app return from filing
-        // the same envelopes twice. It never claims the grant was answered.
+        // The filing receipt prevents outer folded returns from filing twice; filing does not prove the grant was answered.
         fields["needCards"] = .array(filings)
         fields[InlineInteractionWire.needsKey] = .array(retainedEnvelopes)
         return .object(fields)
     }
 
-    private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+        execution: AppActionExecution) async throws -> JSONValue {
         // Aliases resolve before dispatch; notifications require an app executor.
         if !includeAppOwnedTools, ["mac_notify", "mobile_notify"].contains(tool) {
             return .object([
@@ -156,9 +164,9 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
                 "tool": .string(tool),
             ])
         }
-        let canonicalInput = ChatToolSessionInjection.apply(toolName: tool, input: input)
-        let result = try await withAuthoredProgramHost(surface: surface) {
-            try await self.dispatchWithoutOrganismPosture(tool: tool, input: canonicalInput, surface: surface)
+        let canonicalInput = ChatToolSessionInjection.apply(toolName: tool, input: input, sessionId: turn.verifiedSessionID)
+        let result = try await withAuthoredProgramHost(surface: surface, turn: turn, execution: execution) { callTurn, execution in
+            try await self.dispatchWithoutOrganismPosture(tool: tool, input: canonicalInput, surface: surface, turn: callTurn, execution: execution)
         }
         if tool != "app" || input["preview"] != .bool(true) {
             await observeMotorOutcomeIfNeeded(tool: tool, result: result)
@@ -166,41 +174,39 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         return result
     }
 
-    /// All executed app and underlying tool results leave through dispatch.
-    /// Read only the owner's remedy, never infer a permission from error prose.
-    private func filePermissionRemedy(in result: JSONValue, input: [String: JSONValue], surface: String) async -> JSONValue {
+    /// All executed app and underlying tool results leave through dispatch. Read only the owner's remedy, never infer a permission from error prose.
+    private func filePermissionRemedy(in result: JSONValue, input: [String: JSONValue], surface: String, turn: Turn,
+        execution: AppActionExecution) async -> JSONValue {
         guard input["preview"] != .bool(true), !Task.isCancelled,
-              !SkillRunContext.handsBack, case .object(var fields) = result,
+              !execution.handsBack, case .object(var fields) = result,
               fields["permission_card"] == nil else { return result }
+        let reply = ToolResult(result)
         let detail = fields["detail"]?.objectValue
-        let calls = [fields["remedy"], detail?["remedy"]].compactMap { remedy -> [String: JSONValue]? in
+        let calls = [reply.remedy, detail?["remedy"]].compactMap { remedy -> [String: JSONValue]? in
             guard case .object(let remedy)? = remedy, case .object(let next)? = remedy["next_call"],
                   next["tool"] == .string("app"), case .object(let call)? = next["input"],
                   call["action"] == .string("permissions.request") else { return nil }
             return call
         }
         guard var call = calls.first else { return result }
-        guard let session = ChatToolSessionContext.verifiedSessionId, let perform = AppDoorReentry.perform else {
+        guard let session = turn.verifiedSessionID, let perform = execution.perform else {
             fields["permission_card"] = .object(["status": .string("unavailable"),
                 "detail": .string("No permission card was filed: this call has no originating conversation and gated app door.")])
             return .object(fields)
         }
         call["__session_id"] = .string(session)
         do {
-            // This is the body's ask, not a part step that waits for an answer.
-            // It still re-enters all gates as the declared request action.
-            let request = try await SkillRunContext.$partID.withValue(nil) {
-                try await perform("app", call)
-            }
+            // The body's request re-enters all gates without waiting as a part step.
+            let request = try await perform("app", call, turn.with(\.partID, nil), execution)
             try Task.checkCancellation()
             if let need = InlineInteractionNeed.interaction(in: request), need.kind == .permission {
                 let filed = try await InlineInteractionResolver.filePermissionRequest(need, sessionID: session,
-                    origin: TurnEnvelope.current(surface: surface), dataRoot: securityCenter.dataRoot)
+                    origin: TurnEnvelope.current(turn: turn, surface: surface), turn: turn, dataRoot: securityCenter.dataRoot)
                 let name = AppleScriptExecution.automationTarget(need.target).map { "Automation for " + $0 }
                     ?? SystemPermissionPreflight.cardSettingsCapability(need.target)?.displayName ?? need.target
                 fields["permission_card"] = .object(["status": .string("up"), "id": .string(filed.id),
                     "session_id": .string(filed.sessionID),
-                    "detail": .string("A permission card for \(name) is up for \(HerScreen.names(securityCenter.dataRoot).person).")])
+                    "detail": .string("A permission card for \(name) is up for \(AgentScreen.names(securityCenter.dataRoot).person).")])
             } else {
                 // Already granted or refused by its real owner: keep that evidence.
                 fields["permission_card"] = request
@@ -211,53 +217,65 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         return .object(fields)
     }
 
-    /// Turns and native owners bind the same host. The caller supplies its
-    /// complete gate chain through AppDoorReentry; this binding grants no reach.
-    public func withAuthoredProgramHost<Value: Sendable>(surface: String,
-        operation: @Sendable () async throws -> Value) async throws -> Value {
-        let host = AppToolExecutor.authoredProgramHost(dataRoot: securityCenter.dataRoot, reach: { operation, arguments in
-            guard let dispatcher = self.inner as? SwiftToolDispatcher else {
+    /// Compose the host and watch dependencies for this operation. The factory
+    /// installs this value in the same gated chain before any nested call runs.
+    public func withAuthoredProgramHost<Value: Sendable>(surface: String, turn: Turn,
+        execution: AppActionExecution,
+        operation: @Sendable (Turn, AppActionExecution) async throws -> Value) async throws -> Value {
+        var scoped = execution
+        scoped.openScreenWatch = { request, hands, callTurn in
+            guard let dispatcher = self.scopedInner(execution) as? SwiftToolDispatcher else {
                 throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
             }
-            return try await dispatcher.performReach(operation, arguments: arguments, surface: surface)
-        }) { id, arguments in
-            if AuthoredToolEffects.call?.tool == id {
-                guard let reentry = AppDoorReentry.perform else {
-                    return .object(["status": .string("refused"), "effects": .string("none"),
-                                    "reason": .string("door_unavailable"), "detail": .string("A primitive needs the originating turn's gate chain.")])
-                }
-                let requester = SkillRunContext.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: self.securityCenter.dataRoot))'s \($0)" }
-                return await SkillRunContext.$requester.withValue(requester) {
-                    do { return try await reentry(id, arguments) }
-                    catch { return ChatToolOutcome.failure(error: error, tool: id) }
-                }
-            }
-            let envelope = await self.securityCenter.evaluateTool(tool: id, input: arguments,
-                origin: Self.securityOrigin(surface: surface), enforceAutonomy: self.enforceAutonomySecurity)
-            guard envelope.decision != .block, !self.enforceAutonomySecurity || !envelope.requiresApproval else {
-                return Self.securityGateResponse(envelope)
-            }
-            return nil
+            return try await dispatcher.openScreenWatch(turn: callTurn, invocation: execution.invocation, request, hands: hands, surface: surface)
         }
-        return try await OwnedProgramInvocation.$host.withValue(host) {
-            try await MacScreenWatch.$open.withValue({ request, hands in
-                guard let dispatcher = self.inner as? SwiftToolDispatcher else {
+        scoped.waitForInteraction = { need, tool, input, callTurn in
+            guard let session = callTurn.verifiedSessionID else {
+                return AppToolExecutor.failure("door_unavailable", "A card needs the originating conversation.")
+            }
+            return await InlineInteractionResolver.waitForAnswer(need, tool: tool, input: input,
+                sessionID: session, dataRoot: self.securityCenter.dataRoot, turn: callTurn,
+                invocation: execution.invocation, deadlines: execution.deadlines)
+        }
+        let hostExecution = scoped
+        let host = AppToolExecutor.authoredProgramHost(dataRoot: securityCenter.dataRoot, turn: turn, execution: hostExecution,
+            reach: { operation, arguments, callTurn in
+                guard let dispatcher = self.scopedInner(hostExecution) as? SwiftToolDispatcher else {
                     throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
                 }
-                return try await dispatcher.openScreenWatch(request, hands: hands, surface: surface)
-            }) {
-                try await AppDoorReentry.$waitForInteraction.withValue({ need, tool, input in
-                    guard let session = ChatToolSessionContext.verifiedSessionId else {
-                        return AppToolExecutor.failure("door_unavailable", "A card needs the originating conversation.")
-                    }
-                    return await InlineInteractionResolver.waitForAnswer(need, tool: tool, input: input,
-                        sessionID: session, dataRoot: self.securityCenter.dataRoot)
-                }) {
-                    try await MacAppActGate.withAdmission(origin: Self.securityOrigin(surface: surface), dataRoot: securityCenter.dataRoot,
-                                                         operation: operation)
+                return try await dispatcher.performReach(turn: callTurn, operation, arguments: arguments, surface: surface)
+            }) { id, arguments, program, perform in
+                guard let callTurn = program.turn else {
+                    return AppToolExecutor.failure("door_unavailable", "An authored action needs its originating turn.")
                 }
+                let callExecution = hostExecution.serving(program)
+                if let perform {
+                    guard let reentry = callExecution.perform else {
+                        return .object(["status": .string("refused"), "effects": .string("none"),
+                            "reason": .string("door_unavailable"), "detail": .string("A primitive needs the originating turn's gate chain.")])
+                    }
+                    // The deferred body belongs to this admission, not the earlier host composition.
+                    var primitiveExecution = callExecution
+                    primitiveExecution.authoredCall = (tool: id, perform: perform)
+                    let requester = callTurn.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: self.securityCenter.dataRoot))'s \($0)" }
+                    do { return try await reentry(id, arguments, callTurn.with(\.requester, requester), primitiveExecution) }
+                    catch { return ChatToolOutcome.failure(error: error, tool: id) }
+                }
+                let envelope = await self.securityCenter.evaluateTool(tool: id, input: arguments,
+                    origin: Self.securityOrigin(turn: callTurn, surface: surface), enforceAutonomy: self.enforceAutonomySecurity, turn: callTurn)
+                guard envelope.decision != .block, !self.enforceAutonomySecurity || !envelope.requiresApproval else {
+                    return Self.securityGateResponse(envelope)
+                }
+                return nil
             }
-        }
+        scoped.host = host
+        let bound = scoped
+        return try await MacAppActGate.withAdmission(origin: Self.securityOrigin(turn: turn, surface: surface),
+            dataRoot: securityCenter.dataRoot, turn: turn, context: execution.macOperation(dataRoot: securityCenter.dataRoot)) { admittedTurn, context in
+                var bound = bound
+                bound.invocation = bound.invocation.serving(mac: context)
+                return try await operation(admittedTurn, bound)
+            }
     }
 
     private func observeMotorOutcomeIfNeeded(tool: String, result: JSONValue) async {
@@ -267,31 +285,31 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         await motorOutcomeObserver(reference)
     }
 
-    private func dispatchWithoutOrganismPosture(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        if AuthoredToolEffects.admissionOnly {
+    private func dispatchWithoutOrganismPosture(tool: String, input: [String: JSONValue], surface: String, turn: Turn,
+        execution: AppActionExecution) async throws -> JSONValue {
+        if let refusal = await unrecognizedAppActionRefusal(tool: tool, input: input, surface: surface,
+            turn: turn, invocation: execution.invocation) { return refusal }
+        if execution.admissionOnly {
             return .object(["status": .string("refused"), "effects": .string("none"),
                             "reason": .string("door_unavailable"), "detail": .string("Primitive admission requires the turn's autonomy gate.")])
         }
-        let envelope = await securityCenter.evaluateTool(
-            tool: tool,
-            input: input,
-            origin: Self.securityOrigin(surface: surface),
-            enforceAutonomy: enforceAutonomySecurity
-        )
-        // A preview still passes the real security decision. Its evidence is
-        // trace-only; it must not add a durable act or policy receipt.
+        let envelope: SecurityToolEnvelope
+        if let admission = execution.invocation.securityAdmission {
+            envelope = try admission.decision(tool: tool, input: input, surface: surface, turn: turn, sessionID: turn.verifiedSessionID)
+        } else {
+            // Direct app-dispatch clients enter consent here; composed calls carry the outer membrane's decision.
+            envelope = await securityCenter.evaluateTool(tool: tool, input: input,
+                origin: Self.securityOrigin(turn: turn, surface: surface), enforceAutonomy: enforceAutonomySecurity, turn: turn)
+        }
         if tool != "app" || input["preview"] != .bool(true) { try await securityCenter.record(envelope) }
-        // Composed chat and approved replay resolve asks in the outer approval
-        // membrane. Recheck hard blocks here without asking a second time.
         guard envelope.decision != .block,
               !enforceAutonomySecurity || !envelope.requiresApproval else {
             return Self.securityGateResponse(envelope)
         }
         try Task.checkCancellation()
-        let result = try await inner.dispatch(tool: tool, input: input, surface: surface)
-        // An ask for something already set up raises no card: a card that
-        // reads as its receipt from the start would leave the turn waiting on
-        // nobody. The owner's answer goes back instead, and she carries on.
+        let result = try await scopedInner(execution).dispatch(tool: tool, input: input, surface: surface, turn: turn,
+            invocation: execution.toolInvocation)
+        // An already-satisfied request returns the owner's answer; a card would leave the turn waiting on nobody.
         if includeAppOwnedTools, tool == InlineInteractionWire.toolName,
            let need = InlineInteractionNeed.interaction(in: result),
            let done = await InlineInteractionResolver.liveProjection(need, dataRoot: PersistenceCore.defaultDataRoot()).state.outcome?.summary {
@@ -307,45 +325,43 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         if includeAppOwnedTools, ["agent_connect", "agent_message"].contains(tool),
            case .object(let plan) = result,
            [JSONValue.string("grok_setup"), .string("grok_disconnect"), .string("grok_send")].contains(plan["status"] ?? .null) {
-            return await platform.grok(plan, PersistenceCore.defaultDataRoot(), inner, surface)
+            return await platform.grok(plan, PersistenceCore.defaultDataRoot(), scopedInner(execution), surface, turn,
+                execution.macOperation(dataRoot: securityCenter.dataRoot))
         }
         if includeAppOwnedTools, tool == "agent_message", case .object(let plan) = result,
            plan["status"] == .string("desktop_chat_send") {
-            return await platform.desktopChat(plan, PersistenceCore.defaultDataRoot())
+            return await platform.desktopChat(plan, PersistenceCore.defaultDataRoot(), turn,
+                execution.macOperation(dataRoot: securityCenter.dataRoot), execution.invocation.conversation)
         }
         if includeAppOwnedTools, let appTools, ["act", "go", "screen"].contains(tool) {
-            // Her-screen 09-24: a workspace call never takes the self route; it
-            // would read her own pages, the Chat page among them.
-            if WorkspaceMacCall.active, case .object(let payload) = result, case .object(let detail)? = payload["detail"],
+            // Workspace calls must not take the self route, which would read the agent's own pages.
+            if execution.workspaceMacCall, case .object(let payload) = result, case .object(let detail)? = payload["detail"],
                detail["status"] == .string("in_process_route") { return WorkspaceMacCall.refusal }
             return await AppToolExecutor.performMacSelfAppRoute(result) { input in
-                await appTools.runSelfAppRoute(input: input, surface: surface)
+                await appTools.runSelfAppRoute(input: input, surface: surface, turn: turn, execution: execution)
             }
         }
-        // Desktop contacts are send-only: `agent_read` no longer opens or
-        // inspects the other app, so only a send reaches the desktop route.
+        // Desktop contacts are send-only, so only sends reach the desktop route.
         if includeAppOwnedTools, tool == "agent_message",
            case .object(let plan) = result, plan["transport"] == .string("desktop"),
            plan["status"] == .string("requires_interaction") {
-            let sent = await platform.desktop(plan, inner, surface)
-            return await GrokDesktopReply.follow(sent, dataRoot: PersistenceCore.defaultDataRoot())
+            let sent = await platform.desktop(plan, scopedInner(execution), surface, turn, execution.turnWork,
+                execution.macOperation(dataRoot: securityCenter.dataRoot))
+            return await GrokDesktopReply.follow(conversation: execution.invocation.conversation, sent,
+                dataRoot: PersistenceCore.defaultDataRoot())
         }
         return result
     }
 
-    /// Each full-catalog row carries what the Security Center would decide for
-    /// it right now — the Tools page reads this. Core's rows say what a tool
-    /// is; this gate says whether it may run here.
-    /// The Tools page's manifest with each row's Trust decision here. Not a
-    /// tool call: nothing is dispatched, gated or loaded.
-    public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
-        guard let swift = inner as? SwiftToolDispatcher else {
+    /// The Tools manifest projects Security Center decisions without dispatching or loading tools; catalog facts remain Core-owned.
+    public func toolManifest(detail: String? = nil, surface: String = "chat", turn: Turn) async throws -> JSONValue {
+        guard let swift = scopedInner(actionExecution) as? SwiftToolDispatcher else {
             return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("unavailable"), "tools": .array([])]))
         }
-        return await withTrust(catalog: try await swift.toolManifest(detail: detail, surface: surface), surface: surface)
+        return await withTrust(catalog: try await swift.toolManifest(turn: turn, detail: detail, surface: surface), surface: surface, turn: turn)
     }
 
-    private func withTrust(catalog: JSONValue, surface: String) async -> JSONValue {
+    private func withTrust(catalog: JSONValue, surface: String, turn: Turn) async -> JSONValue {
         guard case .object(var object) = catalog, case .array(let rows)? = object["tools"], !rows.isEmpty else {
             return catalog
         }
@@ -360,8 +376,8 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             let envelope = await securityCenter.evaluateTool(
                 tool: name,
                 input: [:],
-                origin: Self.securityOrigin(surface: surface),
-                enforceAutonomy: enforceAutonomySecurity
+                origin: Self.securityOrigin(turn: turn, surface: surface),
+                enforceAutonomy: enforceAutonomySecurity, turn: turn
             )
             let effectiveAutonomy: String
             switch envelope.decision {
@@ -381,22 +397,20 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         return .object(object)
     }
 
-    public func listAvailableTools() async throws -> [String] {
-        try await inner.listAvailableTools().sorted()
+    public func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
+        try await scopedInner(actionExecution).listAvailableTools(turn: turn, surface: surface).sorted()
     }
 
-    public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas(named: names).sorted { $0.name < $1.name }
+    public func listAvailableToolSchemas(named names: Set<String>, turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        try await scopedInner(actionExecution).listAvailableToolSchemas(named: names, turn: turn, surface: surface).sorted { $0.name < $1.name }
     }
 
-    public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas().sorted { $0.name < $1.name }
+    public func listAvailableToolSchemas(turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        try await scopedInner(actionExecution).listAvailableToolSchemas(turn: turn, surface: surface).sorted { $0.name < $1.name }
     }
 
-    public static func securityOrigin(surface: String) -> SecurityOriginContext {
-        var origin = SecurityOriginContext.currentTurn(
-            verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface
-        )
+    public static func securityOrigin(turn: Turn, surface: String) -> SecurityOriginContext {
+        var origin = SecurityOriginContext.currentTurn(turn: turn, surface: surface)
         origin.source = "app_chat_tool_dispatcher"
         return origin
     }
@@ -416,7 +430,8 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             "reason": .string(envelope.primaryReason),
             "reasons": .array(envelope.reasons.map { .string($0.persistedValue) }),
             "capabilities": .array(envelope.capabilities.map { .string($0) }),
-            "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this tool." : "Security Center blocked this tool before execution."),
+            "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this tool."
+                : "Security Center blocked this tool before execution."),
         ]
         refusal["remedy"] = envelope.remedy
         return ChatToolOutcome.refusedBeforeRunning(.object(refusal))

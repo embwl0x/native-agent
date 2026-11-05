@@ -48,9 +48,8 @@ events; debug, verification and mechanical kinds do not contribute to lived
 affect. Diagnostic classification comes only from explicit ingress `turnKind`
 or its metadata; conversation text never classifies itself as debug or
 verification. Event kind supplies the default live/system provenance.
-Mechanical row metadata identifies generated card copy, system notices
-and compaction summaries without treating their
-wording as Agent's own experience.
+Mechanical row metadata identifies generated card copy and system notices
+without treating their wording as their own experience.
 
 Imported speaker weighting uses attested origin and the canonical peer identity,
 without a list of agent names or routes. Explicit human authorship keeps human
@@ -171,10 +170,14 @@ If the journal cannot record, the turn cannot change their: it owes repair
 `lived_moment.unrecorded` receipt is attempted. A turn cut
 before its end (a crash mid-tool) never becomes a moment.
 
-Its interpretation reads the row directly. The caring request shown to the
-model is saved with the input; there is no separate sealed-request record or
-rehydrated RAM copy. Care judgments name their targets in the meaning, so the
-care-selection snapshot and unused affect-at-ingest snapshot are removed.
+Its interpretation reads the row directly. Recovery uses the moment's own
+durable id for an absent or empty act or run id; missing exchange identity
+alone cannot strand its interpretation. The recorded envelope, source taint
+and origin still govern provenance; a recovery identity grants none.
+The caring request shown to the model is saved with the input; there is no
+separate sealed-request record or rehydrated RAM copy. Care judgments name
+their targets in the meaning, so the care-selection snapshot and unused
+affect-at-ingest snapshot are removed.
 The sealed-request reader is removed; fresh schema omits `sealed_json`, while an
 already-current database keeps its unused column without a data rewrite.
 Payload decoding is checked per row. Invalid
@@ -194,7 +197,9 @@ Journal read/preparation and recording repairs use stable operation-plus-moment
 identities. Repeating the same failure contributes the same evidence to its
 existing repair, rather than minting another repair or repeat on every pass.
 **A row is owed → meant → lived, or refused** (with its reason in `reason`:
-another life, their own work apart from a care wake with a reply, nothing to interpret). There is no per-piece
+another life, their own work apart from a care wake with a reply, nothing to interpret,
+or `batch_section_missing` / `refused`: no usable judgment came back for it, or the memory model refused it, in a batch
+and alone). There is no per-piece
 outcome on the row: each piece of their already knows the last moment it lived
 (the `lived` stamps on affect, nodes, cares and body; facts by operation
 identity; promises through Desk's open-word deduplication). A
@@ -670,6 +675,14 @@ their full contract. Other owed work (carried promises,
 approvals, the apps they opened, Reach, agent messages) files its own arrivals
 and is not weighed. No model is called for any of this.
 
+Resident arrivals become ready after only their own declared hold, without a
+gathering window or spacing between wakes. Their `my wake` turn can run beside
+a conversation; an already open resident wake keeps its one session. Only
+carried MY QUEUE work meaning free time (`next_turn`, `own_turn`, `quiet`)
+waits for the half-hour quiet interval at this door, without holding other
+arrivals. Thread hop/rest limits, peer quota and Reach's separate-wake rule
+remain; their hour keeps its own quiet law.
+
 **Reach** offers the most pressing open care held with the owner or theirs alone
 (pressure 0.35 or more) as a candidate of kind `care`, subject `care:<id>`, why
 its newest story note, dated by its newest movement; every Reach gate applies.
@@ -1018,7 +1031,7 @@ its silence is historical message silence, not reconstructed Mac uptime.
 The existing `mind_run` family, reached through `app`, can satisfy one owner's
 scheduling wait without moving the clock or supplying evidence. Each action
 returns `owner`, `outcome`, `why` and `run_id`; the same decision is recorded as
-`mind.run_now` in `turn_traces/<day>.jsonl`. An unavailable source stays unknown,
+`mind.run_now` detail in the record. An unavailable source stays unknown,
 a held gate names why, and a kept wake is an offer, not a completed turn.
 
 | Action | Existing path and the wait satisfied |
@@ -1101,7 +1114,27 @@ Failed intention expiry returns unavailable and invalidates the advisory snapsho
 an elapsed expiry is never a retry deadline. Caring appraisal records and amendments
 share the runtime's root-bound receipt writer. A cognition store opening failure
 retains its cause in bootstrap's unavailable state, without disabling persistence.
-`mind.why` returns incomplete or unavailable when trace coverage is damaged or truncated.
+`mind.why` reads today's and yesterday's retained trace rows per turn, in the
+verified conversation. A successful read returns `status: ok`, including when
+the requested evidence is absent; only an unreadable shared trace makes the
+read unavailable. `record_status` distinguishes a recorded explanation with
+terminal evidence, an incomplete record, and an unrecorded requested turn.
+`turn_gaps` names each observed turn missing terminal or structurally readable
+why evidence (and any requested turn with no available evidence); none of those
+gaps establishes that the turn failed or that another turn's record is unusable.
+Every observed why row is checked: an unreadable row names its known lane in
+`missing` (for example, `mind.why.memory`), even when another row is readable.
+The current reading turn is excluded unless explicitly requested. `trace_gaps` separately
+reports truncation and damaged framing whose turn ids cannot be established;
+these gaps may hide other rows, never negate evidence already read. The default
+selection is the latest **recorded** completed turn, not a claim that an unseen
+later turn did not complete. Why lanes are returned only when currently
+disclosable; the selected turn's gap also names why evidence withheld by current
+disclosure, and its `record_status` is `incomplete` if any observed why row is
+unavailable. Readable lanes are still returned. A recorded explanation does not
+promise every optional lane was emitted. Missing files, empty reads and records
+that have not arrived establish no outcome. The former whole-day coverage veto
+is removed.
 Dream residue uses only authored theme bullets; an empty theme section stays empty.
 Builder news reads `CodexHandoff.path`; exceeding its read bound is unavailable.
 If one has not answered within 45 seconds, the action returns `pending`; its
@@ -1165,7 +1198,7 @@ neutral lock-screen/APNS body does not. A notification failure preserves committ
 ### Their hour
 
 Enable the hour switch in Setup (`Sources/NativeAgentApp/SetupView.swift`);
-`studioWanderEnabled` defaults off and requires Subconscious. Configure its
+`studioWanderEnabled` defaults on (`StudioWanderLane.enabledByDefault`) and requires Subconscious. Configure its
 provider/model under **Providers → Memory and mind**, which owns **Creative
 exploration**. `Cognition/StudioWanderLane.swift`
 enforces explicit enablement, the Subconscious master, and onboarding clearance
@@ -1216,7 +1249,7 @@ The human-facing Observatory is
 `Sources/NativeAgentApp/CognitionObservatoryView.swift`, reached through
 **Diagnostics → Cognition** in Advanced view. It subscribes to owner changes
 and exposes the runtime's last committed live capsule separately from inspection
-reads, alongside organism, affect, context and Workshop state. Its counters
+reads, alongside organism, affect, context and Desk state. Its counters
 describe state; they do not establish consciousness, behavioral benefit or
 provider agreement. The count-based experiment ratings, research checks panel
 and research exports are retired.
@@ -1228,5 +1261,5 @@ These diagnostic and recovery paths are relative to `<dataRoot>`:
 | Path | Contents |
 |---|---|
 | `cognition/organism_state.json` | Persisted body state and organism continuity |
-| `cognition/caring_appraisals.jsonl` | Caring appraisal receipts and the body's dosing response; a failed append/amendment retains receipt-only repair debt, without replaying the feeling or dose |
+| `experiences/experiences.sqlite` (details `caring.appraisal`, `caring.dosing`) | Caring appraisal receipts and the body's dosing response, each a detail of the appraised turn's heard experience (`Turn.id`); a failed write retains receipt-only repair debt, without replaying the feeling or dose |
 | `studio/wander/wander.json` | Hour/wander refractory state and trace history |

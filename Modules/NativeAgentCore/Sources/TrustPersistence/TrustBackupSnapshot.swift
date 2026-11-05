@@ -10,7 +10,7 @@ import MemoryV2
 import Privacy
 import SystemOps
 import os
-// Blueprint: | `TrustBackupSnapshot.swift` | TrustBackupPersistence current sealed snapshot evidence; checked complete enumeration, explicit canonical persona destination, link containment and pre-staging restorable validation |
+// Blueprint: | `TrustBackupSnapshot.swift` | Complete sealed evidence, canonical persona and contained links. |
 
 struct NativeBackupIntegrityFile: Codable, Equatable, Sendable {
     let path: String
@@ -18,8 +18,7 @@ struct NativeBackupIntegrityFile: Codable, Equatable, Sendable {
     let sha256: String
 }
 
-/// A symlink in the data root, kept in a local backup's manifest as its raw `readlink` target instead of bytes; restore
-/// recreates the link itself.
+/// Manifest raw link targets so restore recreates the link rather than copying its referent.
 struct NativeBackupLink: Equatable {
     let path: String
     let target: String
@@ -96,8 +95,7 @@ extension TrustBackupPersistence {
                   case .string(let target)? = link["target"],
                   Self.isValidBackupFilePath(path),
                   !target.isEmpty, target.utf8.count <= 4_096,
-                  // Case-folded: on a case-insensitive volume `A` and `a/b` overlap, and recreating one would write through the
-                  // other.
+                  // Case-fold overlap checks because case-insensitive volumes alias differently cased paths.
                   !links.contains(where: {
                       let (a, b) = ($0.path.lowercased(), path.lowercased())
                       return NativeAgentWorkspaceRoot.relativePath(b, under: a) != nil || NativeAgentWorkspaceRoot.relativePath(a, under: b) != nil
@@ -131,8 +129,7 @@ extension TrustBackupPersistence {
             }
             copied.append(path)
         }
-        // Links live only below `memory/` (`memory/agent/notes.jsonl` points into the persona root): restore's effect-fence
-        // overlays and authority checks never touch Memory, so none reads or writes through a recreated link.
+        // Links are confined below memory, where restore authority and effect-fence overlays never traverse them.
         for link in links {
             guard link.path.hasPrefix("memory/"), copied.contains("memory"),
                   !Self.pathEntryExists(dataDir.appendingNativeRelativePath(link.path)),
@@ -183,7 +180,8 @@ extension TrustBackupPersistence {
         try Self.requireRegularFile(dataDir.appendingPathComponent("persona/SOUL.md"), maximumBytes: nil)
         if requireRestorableAuthority {
             guard copied.contains("abilities"), copied.contains("chat/sessions.json") else {
-                throw Self.backupError(code: 422, "Restore requires captured current abilities and session index scopes; no restore was staged or current data replaced.")
+                throw Self.backupError(code: 422,
+                    "Restore requires captured current abilities and session index scopes; no restore was staged or current data replaced.")
             }
             try Self.requireRegularDirectory(dataDir.appendingPathComponent("abilities"))
             try Self.validateBackupChatSessionIndex(dataDir: dataDir)
@@ -220,7 +218,8 @@ extension TrustBackupPersistence {
             guard values.isRegularFile == true else {
                 throw Self.backupError(code: 422, "Backup contains a non-regular file: \(item.lastPathComponent)")
             }
-            guard let relative = NativeAgentWorkspaceRoot.relativePath(item.standardizedFileURL.path, under: root.standardizedFileURL.path), !relative.isEmpty else {
+            guard let relative = NativeAgentWorkspaceRoot.relativePath(item.standardizedFileURL.path, under: root.standardizedFileURL.path), !relative
+                .isEmpty else {
                 throw Self.backupError(code: 422, "Backup member escapes its data directory.")
             }
             guard Self.isValidBackupFilePath(relative) else {
@@ -290,8 +289,7 @@ extension TrustBackupPersistence {
         .object(["path": .string(link.path), "target": .string(link.target)])
     }
 
-    /// Copies a link as a link (its raw target, never its bytes); `takeBackupLinks` then moves it from `data/` into the
-    /// manifest.
+    /// Copy links without following them; takeBackupLinks moves their raw targets into the manifest.
     static func copyBackupLink(from source: URL, to destination: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -301,8 +299,7 @@ extension TrustBackupPersistence {
         )
     }
 
-    /// Removes every link copied into a backup's `data/` and returns them for the manifest, so the sealed bytes stay regular
-    /// files only.
+    /// Remove copied links into the manifest so sealed backup bytes contain only regular files.
     static func takeBackupLinks(in dataDir: URL) throws -> [NativeBackupLink] {
         let fm = FileManager.default
         let entries = try Self.backupEntries(in: dataDir)

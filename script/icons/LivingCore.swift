@@ -1,8 +1,7 @@
 import AppKit
 import CoreGraphics
 
-// Shared Living Core composition. Platform renderers own only their frame and
-// output format; any pixel change to the core now has exactly one source.
+// Share core pixels across platform renderers so visual changes have one source.
 func color(_ hex: UInt, _ alpha: CGFloat = 1) -> NSColor {
     NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
             green: CGFloat((hex >> 8) & 0xFF) / 255,

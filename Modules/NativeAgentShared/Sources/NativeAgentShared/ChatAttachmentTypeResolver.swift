@@ -1,11 +1,10 @@
 import Foundation
-// Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver` enum; `typeAndMime`, `fileByteLimit`, `submittingSpeech` keeps composer wording on its utterances |
+// Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver`, `typeAndMime`, `fileByteLimit`, `submittingSpeech` |
 
 /// Supported chat files have the same type and byte ceiling on every door.
 public enum ChatAttachmentTypeResolver {
     public static let fileByteLimit = 10_000_000
 
-    /// The composer submits one wording for its recordings, including typed context.
     public static func submittingSpeech(_ attachments: [MultimodalAttachment], text: String) -> [MultimodalAttachment] {
         attachments.map {
             var attachment = $0

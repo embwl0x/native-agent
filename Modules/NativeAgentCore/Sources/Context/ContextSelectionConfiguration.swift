@@ -13,8 +13,7 @@ public enum ContextSelectionError: Error, Equatable, Sendable {
 public struct ContextScoreWeights: Equatable, Sendable {
     public let lexicalExact: Double = 2.4
     public let tokenOverlap: Double = 1.7
-    /// Meaning weighs what the words weigh (exact 2.4 + overlap 1.7), read
-    /// from the model's floor (`ContextSelection.score`).
+    /// Scale meaning to lexical weight (exact 2.4 + overlap 1.7) from the model's floor.
     public let semanticCosine: Double = 4.0
     public let sharedIdentifiers: Double = 1.5
     public let activation: Double = 1.2
@@ -25,11 +24,9 @@ public struct ContextScoreWeights: Equatable, Sendable {
     public let decay: Double = 0.5
     public let redundancyPenalty: Double = 1.1
     public let characterCostPenaltyCap: Double = 0.35
-    /// Message-coverage weight; 0 disables its contribution while scores remain in receipts.
+    /// Zero disables coverage contribution without removing its receipt.
     public let messageCoverage: Double = 1.5
-    /// Rerank bonus for the first atom from a not-yet-selected source.
     public let diversityNewSourceBonus: Double = 0.14
-    /// Rerank bonus for the first atom of a not-yet-selected kind.
     public let diversityNewKindBonus: Double = 0.10
 
     public init() {}
@@ -39,54 +36,31 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     public let maximumDynamicAtoms: Int = 12
     public let maximumAtomsPerSource: Int = 2
     public let maximumAtomsPerKind: Int = 4
-    /// Kind-specific overrides of `maximumAtomsPerKind`. Memory atoms get a
-    /// larger quota by default so high-scoring memories are not crowded out
-    /// of the 12-atom dynamic budget by the uniform per-kind cap.
+    /// Give memory a larger kind quota so the uniform cap cannot crowd high-scoring memories out of the 12-atom budget.
     public let maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8, .relationship: 4]
     public let minimumRelevance: Double = 0.05
-    /// Per embedding model (`model_id`): the cosine that model reads as
-    /// unrelated, so `score` can put meaning on the model's own scale (raw bge
-    /// cosine bunches every memory between 0.5 and 0.66). With fewer than three
-    /// comparable memories, its scaled semantic contribution supplies relevance;
-    /// larger populations use relative relevance.
+    /// Per-model floors account for compressed cosine ranges. Fewer than three comparable memories use scaled semantics; larger populations use relative
+    /// relevance.
     public let memorySemanticFloors: [String: Double] = ["bge-large-en-v1.5": 0.55]
-    /// Effective memory row cap on a message of at most
-    /// `shortMessageTokenCount` content tokens — the same token set (and the
-    /// boundary) the `messageCoverage` length damp uses, so a message
-    /// too short to evidence coverage is also too short to earn a full memory
-    /// lane. Applied as `min(cap, shortMessageMemoryRowCap)`.
+    /// Use the coverage damp's token set and short-message boundary so weak coverage cannot earn a full memory allocation.
     public let shortMessageMemoryRowCap: Int = 6
-    /// Relevance requires lexical evidence or standing out against the
-    /// leave-one-out population (each memory's general pull removed) by two
-    /// standard deviations: what the message brings to mind. Fewer than three
-    /// comparable vectors use the model-scaled semantic contribution at
-    /// `minimumRelevance`. The deviation floor is fixed, independent of the
-    /// number of atoms and readings recorded in the receipt.
+    /// Require lexical evidence or two leave-one-out deviations after removing general pull. Fewer than three vectors use model-scaled semantics; receipt
+    /// populations never change the floor.
     public static let memoryStandoutDeviations: Double = 2.0
-    /// An ambient moment's bar. With her ~70 memories, chance alone puts one or
-    /// two past two deviations for any text, so a moment nobody addressed to
-    /// her ("could not read: bad_input") surfaced noise (10-29); past three,
-    /// chance passes about one memory in ten moments.
+    /// Three deviations reduce chance matches for ambient moments to about one memory per ten moments at a population near 70.
     public static let ambientStandoutDeviations: Double = 3.0
-    /// REST. A memory served on one of the last `memoryRestTurns` exchanges is
-    /// already in the conversation; it comes again only when it stands out one
-    /// deviation more than the bar (`ContextSelector.memoryStandout` + 1), so
-    /// nothing rides every turn on a touch that barely clears.
+    /// Recently served memories are already in conversation; require one extra standout deviation so a marginal touch cannot repeat every turn.
     public let memoryRestTurns: Int = 3
     public let weights: ContextScoreWeights = ContextScoreWeights()
 
-    /// Content-token count at or below which a message counts as short.
     public static let shortMessageTokenCount = 4
 
     public init() {}
 
-    /// The unrelated-cosine mark for vectors from `modelID`; nil for a model
-    /// with no entry (its meaning then scores on the raw cosine).
+    /// The unrelated-cosine mark for vectors from `modelID`; nil for a model with no entry (its meaning then scores on the raw cosine).
     public func memorySemanticFloor(forModel modelID: String?) -> Double? {
         modelID.flatMap { memorySemanticFloors[$0] }
     }
-    /// Effective per-kind cap: the override for `kind` when present, else the
-    /// uniform `maximumAtomsPerKind`.
     public func maximumAtoms(forKind kind: ContextAtomKind) -> Int {
         maximumAtomsPerKindOverrides[kind] ?? maximumAtomsPerKind
     }

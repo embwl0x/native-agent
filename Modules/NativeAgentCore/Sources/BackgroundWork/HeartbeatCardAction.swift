@@ -2,9 +2,7 @@ import BackgroundLoops
 import Foundation
 // Blueprint: | `HeartbeatCardAction.swift` | `HeartbeatCardAction` enum; `cardActions` |
 
-/// The closed action vocabulary emitted on heartbeat-authored inbox cards.
-/// These ids cross the persisted inbox boundary, so an unknown value must be
-/// rejected before a card reaches the UI with a button no executor understands.
+/// Reject unknown persisted action ids before publishing a button that no executor understands.
 public enum HeartbeatCardAction: String, CaseIterable, Sendable {
     case openApprovals = "open_approvals"
     case archive
@@ -31,9 +29,7 @@ public enum HeartbeatCardAction: String, CaseIterable, Sendable {
         }
     }
 
-    /// Canonicalizes the condition-specific controls and always supplies the
-    /// two terminal inbox controls. An unregistered authored id is a producer
-    /// defect, not a reason to publish an unresolvable card.
+    /// Terminal inbox controls always remain; an unregistered authored id is a producer defect.
     public static func cardActions(
         authored: [HeartbeatNoticeAction]
     ) throws -> [HeartbeatNoticeAction] {

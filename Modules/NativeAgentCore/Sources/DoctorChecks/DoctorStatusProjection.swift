@@ -3,9 +3,8 @@ import NativeAgentCore
 import PersistenceCore
 import Experiences
 import NativeAgentShared
-// Blueprint: | `DoctorStatusProjection.swift` | `DoctorReadout` enum; `healthReadings`, `persistDoctorSnapshot`, `recordReadings`, `repairProjection`; Experiences owns repair obligations and settlement, while Doctor owns the measured postcondition and executable repair call; historical calls are never reanimated; DoctorPlainCopy owns severity classification for Doctor/Support aggregation and adverse admission |
+// Blueprint: | `DoctorStatusProjection.swift` | `DoctorReadout`: `healthReadings`, `persistDoctorSnapshot`, `recordReadings`, `repairProjection` |
 
-/// Cached health projection; host probes and display redaction arrive from the caller.
 public enum DoctorReadout {
     /// A snapshot from another process launch cannot describe this launch's window.
     private static let launchID = UUID().uuidString
@@ -20,23 +19,20 @@ public enum DoctorReadout {
             }
             let owed = repairs.map { experience -> CheckResult in
                 let reading = rows.first { experience.outcome?.domain == "doctor.check:" + $0.id }
-                // Historical evidence keeps its person step; only the measured
-                // owner can supply an executable repair call.
-                let tap = reading?.repairTap ?? RepairOwed.claim(experience, "tap")
+                // Retained evidence keeps its human step; only a current measured owner can supply executable repair.
+                let tap = reading?.repairTap ?? RepairDebt(experience).tap
                 let checkID = (experience.outcome?.domain).flatMap { $0.hasPrefix("doctor.check:") ? String($0.dropFirst("doctor.check:".count)) : nil }
-                // The check emits one sentence, with calls and remedies separate;
-                // preserve its filenames and use its current severity even if adverse.
+                // Preserve evidence filenames and current severity; remedies and calls retain separate fields.
                 let words = experience.face?.words ?? experience.id
-                return CheckResult(source: reading?.repairOwner ?? RepairOwed.claim(experience, "owner"), nextCall: reading?.repairCall,
+                return CheckResult(source: reading?.repairOwner ?? RepairDebt(experience).owner, nextCall: reading?.repairCall,
                     id: experience.id, title: reading?.title ?? checkID ?? "Repair owed", status: reading?.status ?? "unmeasured",
-                    detail: reading.map { $0.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; repair owed since \(experience.at)." } ?? words,
+                    detail: reading.map { $0.detail.trimmingCharacters(
+                        in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; repair owed since \(experience.at)." } ?? words,
                     harm: reading?.harm, receipt: reading?.receipt, repairApplied: reading?.repairApplied, human_action: tap,
                     repair_available: reading?.repair_available, automaticRepairEligible: reading?.automaticRepairEligible,
                     ask: reading?.ask, owner: reading?.owner, repairExperience: experience)
             }
-            // Measurements remain inspectable; their unresolved failures are
-            // rendered from the experience that owns them, including unknowns,
-            // under the status the check reads now.
+            // Keep measurements inspectable while unresolved failures render from their owning experience at current severity.
             let owedIDs = Set(owed.map(\.checkID))
             return rows.filter { !owedIDs.contains($0.id) || $0.ask != nil } + owed
         } catch {
@@ -44,13 +40,14 @@ public enum DoctorReadout {
                 id: "doctor.repair_store", title: "Repairs owed", status: "fail",
                 detail: "Repair obligations could not be read: \(error.localizedDescription)",
                 human_action: ToolFailureError.fileRepairInstruction(dataRoot.appendingPathComponent("experiences/experiences.sqlite"),
-                    shape: "This SQLite experience store retains original experiences, claims, evidence and obligation phases. Preserve their identities and settlement history."))]
+                    shape: """
+                        This SQLite experience store retains original experiences, claims, evidence and obligation phases. Preserve their identities \
+                        and settlement history.
+                        """))]
         }
     }
 
-    /// Each measurement owns its repair. A report, restart, or unknown reading
-    /// cannot accept it; only this check's passing postcondition, or a reading
-    /// that the part is off or not needed, can.
+    /// Only this check's passing, off or unneeded postcondition settles its repair; unknown readings and restarts cannot.
     public static func recordReadings(_ rows: [CheckResult], dataRoot: URL) async {
         let measurement = UUID().uuidString
         for row in rows where row.repairExperience == nil {
@@ -58,8 +55,7 @@ public enum DoctorReadout {
             let evidence = Experience.Ref(source: "doctor", id: measurement + ":" + row.id)
             if DoctorSafeRepairPolicy.isAdverse(row.status), row.ask == nil,
                let owner = row.repairOwner, row.repairCall != nil || row.repairTap != nil {
-                // One failing check is one owed repair: a later failing reading
-                // adds its evidence and current words to the open one.
+                // Add evidence to the open repair so repeated failure does not create duplicate obligations.
                 await ExperienceStore.record(dataRoot, "repair:" + operation) { store in
                     if let open = try await store.open().first(where: { $0.owes["repair"]?.phase.isSettled == false
                         && $0.outcome?.domain == operation }) {
@@ -70,8 +66,7 @@ public enum DoctorReadout {
                         nextCall: row.repairCall, tap: row.repairTap)
                 }.value
             } else if ["ok", "off", "not needed"].contains(row.status) {
-                // Off by config or not needed owes nothing: the reading settles
-                // a debt met while the part was meant to run, so no later run renders it.
+                // Off or unneeded settles the prior obligation; later runs must not render debt for intentionally inactive work.
                 await RepairOwed.settle(dataRoot, operation: operation, evidence: evidence).value
             }
         }
@@ -104,12 +99,8 @@ public enum DoctorReadout {
         return (core + liveChecks, measuredAt)
     }
 
-    /// The one writer of `doctor/latest.json`: checks, runAt, measuredAt and launchID,
-    /// under the file's lock so a full run and a health-card write never race.
-    /// A full Doctor run replaces the rows; the health card's core-only reading
-    /// updates its rows `inPlace`, keeping the live rows it did not measure, and
-    /// `measuredAt` then stays the oldest reading still in the file. Only a
-    /// missing file starts fresh: one that cannot be read or decoded throws.
+    /// Serialize all latest.json writers under one lock; full runs replace rows and core-only reads update in place. Preserve unmeasured live rows and their
+    /// oldest measuredAt; only a missing file can start fresh.
     public static func persistDoctorSnapshot(
         _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String, inPlace: Bool = false
     ) async throws {
@@ -139,7 +130,8 @@ public enum DoctorReadout {
     private static func cacheFailure(_ error: Error, path: URL) -> CheckResult {
         CheckResult(source: path.path, id: "doctor.cache", title: "Saved health readings", status: "fail",
             detail: "Doctor readings could not be read or published: \(error.localizedDescription)",
-            human_action: ToolFailureError.fileRepairInstruction(path, shape: "Preserve the measured checks and their runAt, measuredAt and launchID; repair the unreadable Doctor snapshot."))
+            human_action: ToolFailureError.fileRepairInstruction(
+                path, shape: "Preserve the measured checks and their runAt, measuredAt and launchID; repair the unreadable Doctor snapshot."))
     }
 
     private static func readCachedReadings(at path: URL) throws -> (checks: [CheckResult], measuredAt: String)? {
@@ -150,12 +142,14 @@ public enum DoctorReadout {
         guard !payload.launchID.isEmpty,
               let runAt = NativeTimestampFormat.parseISO8601FractionalFirst(payload.runAt),
               NativeTimestampFormat.parseISO8601FractionalFirst(payload.measuredAt) != nil else {
-            throw PersistenceCoreError.ioFailure("Invalid Doctor snapshot metadata at \(path.path): launchID, runAt and measuredAt must identify the retained measurements.")
+            throw PersistenceCoreError.ioFailure(
+                "Invalid Doctor snapshot metadata at \(path.path): launchID, runAt and measuredAt must identify the retained measurements.")
         }
         guard payload.launchID == launchID else { return nil }
         let age = Date().timeIntervalSince(runAt)
         guard age >= 0 else {
-            throw PersistenceCoreError.ioFailure("Doctor snapshot runAt is in the future at \(path.path); verify the clock and repair its measurement metadata.")
+            throw PersistenceCoreError.ioFailure(
+                "Doctor snapshot runAt is in the future at \(path.path); verify the clock and repair its measurement metadata.")
         }
         guard age < 60 else { return nil }
         return (payload.checks, payload.measuredAt)
@@ -191,11 +185,9 @@ extension DoctorReadout {
         switch id {
         case "codex_login", "llm", "codex_login_helper", "live.providers": "Provider"
         case "live.background_loops", "live.bridges",
-             // Per-turn prompt-prefix cache health is a property of the running
-             // app, not of stored data.
+             // Prefix-cache health describes the running app, not stored data.
              "prompt_prefix_health", "model.shims": "Runtime"
-        // Her subconscious is not a subsystem of the body — it gets its own
-        // group so a capsule that stopped arriving reads as what it is.
+        // Group cognition separately so missing capsules remain visible as cognition findings.
         case "subconscious_vitals": "Cognition"
         case "searxng", "telegram", "connectors", "live.telegram", "live.search": "Connectors"
         case "storage", "chat_sessions", "session_identity", "persona_engine", "backups", "write_test", "live.memory": "Data"
@@ -226,6 +218,20 @@ extension DoctorReadout {
 }
 
 public enum DoctorPlainCopy {
+    public static func sectionTitle(for group: String) -> String {
+        switch group {
+        case "Provider": "AI provider"
+        case "Runtime": "The app itself"
+        case "Cognition": "Inner state"
+        case "Connectors": "Connected services"
+        case "Data": "Your data"
+        case "Tools": "Tools"
+        case "Autonomy": "Actions I take on my own"
+        case "Release": "Stored data health"
+        default: group
+        }
+    }
+
     public struct Summary: Equatable {
         public var healthy = 0
         public var warning = 0
@@ -237,7 +243,6 @@ public enum DoctorPlainCopy {
 
         public var total: Int { healthy + warning + failing + unclear + reading + off + notNeeded }
 
-        /// Vocabulary understood by NativeAgentTheme.statusColor / StatusBadge.
         public var statusText: String {
             if failing > 0 { return "failed" }
             if warning > 0 { return "warn" }
@@ -259,7 +264,7 @@ public enum DoctorPlainCopy {
             return "failing"
         case "unmeasured":
             return "reading"
-        // Off by config or not needed: no fault, and no healthy work either.
+        // Off or unneeded proves neither a fault nor healthy work.
         case "off", "not needed":
             return status.lowercased()
         default:
@@ -289,7 +294,7 @@ public enum DoctorPlainCopy {
         if summary.warning > 0 { return "The app is running, but some parts need attention." }
         if summary.unclear > 0 { return "The app is running. Some checks came back unclear." }
         if summary.reading > 0 { return "The app is running. Some checks are readings." }
-        // Off and not needed are not faults, but they are not "everything" either.
+        // Inactive parts cannot establish the health of everything.
         let inactive = [(summary.off, "off"), (summary.notNeeded, "not needed")]
             .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
         return inactive.isEmpty ? "Everything looks healthy." : "Healthy; " + inactive.joined(separator: ", ") + "."
@@ -310,8 +315,7 @@ public enum DoctorPlainCopy {
         return "\(checked): " + parts.joined(separator: ", ") + "."
     }
 
-    /// Turn a loop identifier such as `github_tracking` into `Github tracking`.
-    /// The raw identifier still renders inside the Details disclosure.
+    /// Humanize loop labels while retaining raw identifiers in Details for diagnosis.
     public static func friendlyLoopName(_ loopId: String) -> String {
         let spaced = loopId
             .replacingOccurrences(of: "_", with: " ")

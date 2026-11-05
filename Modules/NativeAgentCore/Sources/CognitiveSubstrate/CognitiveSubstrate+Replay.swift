@@ -2,12 +2,11 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`; schema status and dated REM resolutions share the inbox's checked decision snapshot by proposal identity and read displaced content from the proposal owner; adoption requires its application claim; unmatched or unreadable history stays explicitly unavailable |
+// Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`, proposal-owned REM history |
 
 extension CognitiveSubstrate {
-    /// Scheduled replay's checked boundary. All replay artifacts, lineage, and
-    /// its receipt commit in one SQLite transaction; in-memory state rolls back
-    /// on failure so evidence remains eligible for a later retry.
+    /// Scheduled replay's checked boundary. All replay artifacts, lineage, and its receipt commit in one SQLite transaction; in-memory state rolls back on
+    /// failure so evidence remains eligible for a later retry.
     @discardableResult
     public func integrateReplayChecked(
         _ input: CognitiveReplayIntegrationInput
@@ -143,10 +142,7 @@ extension CognitiveSubstrate {
                 at: now
             )
         }
-        // G-M2: the replay path writes episodes/schemas/evidence directly (not
-        // via the single-item record helpers), so enforce their caps here, after
-        // the commit succeeds. Timeline is already capped inside
-        // recordTimelineEventInMemory. Newest rows survive; only old ones evict.
+        // Direct replay writes bypass item helpers, so enforce episode/schema/evidence caps after commit; newest retained rows survive.
         enforceEpisodeCap()
         enforceSchemaProposalCap()
         enforceReplayEvidenceCap()
@@ -157,9 +153,8 @@ extension CognitiveSubstrate {
             timelineEventIds: timelineEventIds
         )
         } catch {
-            // Actor reentrancy permits unrelated mutations while SQLite is
-            // committing. Roll back only values still equal to this replay's
-            // staged delta; never overwrite a newer concurrent mutation.
+            // Actor reentrancy permits unrelated mutations while SQLite is committing. Roll back only values still equal to this replay's staged delta; never
+            // overwrite a newer concurrent mutation.
             for (id, staged) in stagedEpisodes where episodes[id] == staged {
                 if let prior = priorEpisodes[id] { episodes[id] = prior }
                 else { episodes.removeValue(forKey: id) }
@@ -210,8 +205,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    // Canonical timeline source titles also feed developmental recall. Keep
-    // those bytes native; growth-week.js owns only the readout projection.
+    // Canonical timeline source titles also feed developmental recall. Keep those bytes native; growth-week.js owns only the readout projection.
     static func growthRowTitle(for event: CognitiveDevelopmentalTimelineEvent) -> String {
         let title = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = title.lowercased()
@@ -219,9 +213,7 @@ extension CognitiveSubstrate {
             lower.hasPrefix("schema proposal")
             || lower.hasSuffix("rem proposal")
         guard namesTheActNotTheThing else { return title }
-        // THE FIRST SENTENCE, not the whole lesson. A title is a name; a
-        // paragraph in the name slot pushes the verdict and the reason off the
-        // end of the line, which is the same failure by another route.
+        // Use the first sentence as a title so the verdict and reason still fit.
         let lesson = {
             let flat = event.summary.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             return flat.count > 160 ? String(flat.prefix(159)) + "…" : flat
@@ -231,8 +223,7 @@ extension CognitiveSubstrate {
             return lesson
         }
         let sentence = String(lesson[lesson.startIndex...stop])
-        // A "sentence" of three words is an abbreviation the scanner tripped
-        // on, not a name; keep the whole lesson rather than a stub.
+        // A three-word split may be an abbreviation; retain the lesson instead of a misleading stub.
         return sentence.count >= 16 ? sentence : lesson
     }
 
@@ -244,7 +235,8 @@ extension CognitiveSubstrate {
         developmentalTimelineSnapshot(proposals: proposals, events: Array(developmentalTimeline.values), limit: limit)
     }
 
-    func developmentalTimelineSnapshot(proposals: [CognitiveSchemaProposal], events: [CognitiveDevelopmentalTimelineEvent], limit: Int) -> [CognitiveDevelopmentalTimelineEvent] {
+    func developmentalTimelineSnapshot(proposals: [CognitiveSchemaProposal], events: [CognitiveDevelopmentalTimelineEvent],
+        limit: Int) -> [CognitiveDevelopmentalTimelineEvent] {
         let regenerated = Set(proposals.map(\.lineageId))
         var result = events.compactMap { event -> CognitiveDevelopmentalTimelineEvent? in
             let isProposal = event.kind == .schemaProposal || event.kind == .proposalResolution
@@ -257,8 +249,7 @@ extension CognitiveSubstrate {
             }
             return event
         }
-        // REM history is a view of its proposal and current decision, including
-        // decisions made after the creation left the retained timeline window.
+        // REM history is a view of its proposal and current decision, including decisions made after the creation left the retained timeline window.
         for proposal in proposals {
             var event = CognitiveDevelopmentalTimelineEvent(
                 id: stableArtifactID("proposal|\(proposal.id)"), kind: .schemaProposal,
@@ -297,7 +288,9 @@ extension CognitiveSubstrate {
     ) -> CognitiveDevelopmentalTimelineEvent {
         let now = dependencies.now()
         let event = CognitiveDevelopmentalTimelineEvent(
-            id: stableArtifactID("timeline|\(kind.rawValue)|\(artifactId?.uuidString ?? lineageId)|\(bounded(title, maxCharacters: 80))|\(bounded(summary, maxCharacters: 80))"),
+            id: stableArtifactID("""
+                timeline|\(kind.rawValue)|\(artifactId?.uuidString ?? lineageId)|\(bounded(title, maxCharacters: 80))|\(bounded(summary, maxCharacters: 80))
+                """),
             kind: kind,
             title: bounded(title.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
             summary: bounded(summary.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),

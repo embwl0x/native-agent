@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import NativeAgentCore
 import PersistenceCore
 import Dispatcher
@@ -6,18 +7,19 @@ import MacControl
 import MacIntegration
 import CoreGraphics
 import Senses
-// Blueprint: | `SwiftToolDispatcher+DesktopPixels.swift` | `SwiftToolDispatcher`: `desktopPixelsRequested`, `desktopPixels`; composed images retain capture-time AX hit evidence and named masking failures, never identities or pixels for uninspectable layers; screenshot saving uses cancellable SubprocessWork and settles observed saved paths exactly once without model pixel delivery |
+// Blueprint: | `SwiftToolDispatcher+DesktopPixels.swift` | `SwiftToolDispatcher`, `desktopPixelsRequested`, `desktopPixels`; masked capture; settled saves |
 
 extension SwiftToolDispatcher {
-    func impl_mac_screenshot_save(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    func impl_mac_screenshot_save(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         func invalid(_ code: String, _ detail: String, field: String, accepted: String) -> ToolFailureError {
             ToolFailureError(detail, argumentPath: "args.\(field)", accepted: accepted, effects: .none,
                 nextCall: ToolFailureError.call("app", ["find": .string("mac.screenshot_save")]),
-                code: code, status: .refused, instruction: "Correct args.\(field); inspect mac.screenshot_save for the accepted call.", recovery: .correctArguments)
+                code: code, status: .refused, instruction: "Correct args.\(field); inspect mac.screenshot_save for the accepted call.",
+                    recovery: .correctArguments)
         }
-        let access = try await fullMacToolAccess(surface: surface)
+        let access = try await fullMacToolAccess(turn: turn, surface: surface)
         guard access.fileOpsAllowed, access.accessibilityAllowed else {
-            if let need = macControlCategoryNeedEnvelope(
+            if let need = macControlCategoryNeedEnvelope(invocation: invocation,
                 categories: ["accessibility", "file_ops"], mode: .write,
                 why: "Screen control and file access let me save a screenshot on your Mac."
             ) { return need }
@@ -34,7 +36,8 @@ extension SwiftToolDispatcher {
         }
         let selectors = ["window_id", "app", "region"].filter { input[$0] != nil && input[$0] != .null }
         guard selectors.count <= 1 else {
-            throw invalid("conflicting_capture_selectors", "Choose only one of window_id, app or region.", field: "window_id|app|region", accepted: "at most one selector")
+            throw invalid("conflicting_capture_selectors", "Choose only one of window_id, app or region.", field: "window_id|app|region",
+                accepted: "at most one selector")
         }
         var args = ["-x", "-t", "png"]
         if let window = input["window_id"] {
@@ -50,14 +53,16 @@ extension SwiftToolDispatcher {
             }
             guard Set(matches.compactMap { $0[kCGWindowOwnerPID as String] as? Int }).count == 1,
                   let id = matches.first?[kCGWindowNumber as String] as? Int else {
-                throw invalid("capture_app_not_unique", "No unique visible app named '\(app)'; supply window_id for an exact window.", field: "app", accepted: "one visible app, or an exact window_id instead")
+                throw invalid("capture_app_not_unique", "No unique visible app named '\(app)'; supply window_id for an exact window.",
+                    field: "app", accepted: "one visible app, or an exact window_id instead")
             }
             args += ["-l", String(id)]
         } else if let region = optionalString(input, "region") {
             let parts = region.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             let values = parts.compactMap(Int.init)
             guard parts.count == 4, values.count == 4, values[2] > 0, values[3] > 0 else {
-                throw invalid("invalid_capture_region", "region must be x,y,width,height in screen points with positive width and height.", field: "region", accepted: "x,y,width,height; integer screen points; width and height > 0")
+                throw invalid("invalid_capture_region", "region must be x,y,width,height in screen points with positive width and height.",
+                    field: "region", accepted: "x,y,width,height; integer screen points; width and height > 0")
             }
             args += ["-R", values.map(String.init).joined(separator: ",")]
         }
@@ -67,8 +72,9 @@ extension SwiftToolDispatcher {
         let requested = optionalString(input, "path") ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Desktop/Screenshot \(formatter.string(from: Date())).png").path
         let path = URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(requested)).standardizedFileURL.resolvingSymlinksInPath()
-        guard path.pathExtension.lowercased() == "png", !connectorPathIsSensitiveData(path, dataRoot: dataRoot) else {
-            throw invalid("capture_path_denied", "Choose a PNG path outside sensitive app data.", field: "path", accepted: "PNG path outside protected app data")
+        guard path.pathExtension.lowercased() == "png", !connectorPathIsSensitiveData(path, dataRoot: dataRoot, turn: turn) else {
+            throw invalid("capture_path_denied", "Choose a PNG path outside sensitive app data.", field: "path",
+                accepted: "PNG path outside protected app data")
         }
         var paths = [path]
         if selectors.isEmpty {
@@ -90,7 +96,8 @@ extension SwiftToolDispatcher {
             }
         }
         guard paths.allSatisfy({ !FileManager.default.fileExists(atPath: $0.path) }) else {
-            throw invalid("capture_path_exists", "A screenshot path already exists; choose another path.", field: "path", accepted: "unused PNG path, including numbered paths for additional displays")
+            throw invalid("capture_path_exists", "A screenshot path already exists; choose another path.", field: "path",
+                accepted: "unused PNG path, including numbered paths for additional displays")
         }
         try Task.checkCancellation()
         let process = ManagedProcess()
@@ -99,8 +106,7 @@ extension SwiftToolDispatcher {
         process.standardInput = FileHandle.nullDevice
         let capture = try InvokeOutputCapture(process: process, stderrCap: 8 * 1024)
         return await SubprocessWork(process).run { [paths] exit -> JSONValue in
-            // SubprocessWork joins physical termination and enters settle
-            // before this single observation, including when Stop won.
+            // SubprocessWork joins physical termination and enters settle before this single observation, including when Stop won.
             let output = capture.finish()
             let saved = paths.filter { ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 }
             let complete = exit.launched && exit.code == 0 && saved.count == paths.count
@@ -123,7 +129,8 @@ extension SwiftToolDispatcher {
             if exit.stopped || !complete {
                 result["reason"] = .string(exit.stopped ? "screenshot_save_stopped"
                     : exit.launchError != nil ? "screenshot_process_launch_failed" : "screenshot_save_incomplete")
-                result["remedy"] = Repair.reconcile(instruction: "Inspect the destination directory and retained paths before another save; files may already exist.",
+                result["remedy"] = Repair.reconcile(
+                    instruction: "Inspect the destination directory and retained paths before another save; files may already exist.",
                     nextCall: .object(["tool": .string("app"), "input": .object([
                         "action": .string("files.list"), "args": .object(["path": .string(path.deletingLastPathComponent().path)]),
                     ])]))
@@ -132,8 +139,7 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Strict provider schemas may spell omitted optional fields as null.
-    /// Blank string selectors are also absent, matching the four-verb reader.
+    /// Strict provider schemas may spell omitted optional fields as null. Blank string selectors are also absent, matching the four-verb reader.
     static func desktopPixelsRequested(_ input: [String: JSONValue]) throws -> Bool {
         guard let value = input["pixels"], value != .null else { return false }
         guard case .bool(let requested) = value else {
@@ -142,8 +148,7 @@ extension SwiftToolDispatcher {
                 code: "invalid_pixels", status: .refused, instruction: "Set args.pixels to a boolean.", recovery: .correctArguments)
         }
         guard requested else { return false }
-        // Her-screen Phase 6: pixels:true WITH app or part is that window's
-        // (or region's) image through the ordinary screen read, not the desktop.
+        // An app or part selector requests its window image through the ordinary screen reader.
         for key in ["app", "part"] {
             guard let selector = input[key], selector != .null else { continue }
             if case .string(let text) = selector,
@@ -153,10 +158,10 @@ extension SwiftToolDispatcher {
         return true
     }
 
-    /// Reached only after the ordinary screen read authority gate. A bounded AX
-    /// read supplies the same secret-field masking as app-window captures. No
-    /// focus change, permission request, persistent file, or action verification.
-    static func desktopPixels(
+    /// Reached only after the ordinary screen read authority gate. A bounded AX read supplies the same secret-field masking as app-window captures. No focus
+    /// change, permission request, persistent file, or action verification.
+    static func desktopPixels(turn: Turn, invocation: ChatToolInvocation,
+        context: MacOperationContext,
         input: [String: JSONValue],
         source: any MacScreenCaptureSource = defaultMacScreenCaptureSource(),
         renderer: any MacScreenImageRenderer = defaultMacScreenImageRenderer(),
@@ -175,7 +180,7 @@ extension SwiftToolDispatcher {
             failed("cancelled", "Desktop capture was cancelled.", instruction: "The capture stopped; no image was delivered.",
                 remedy: Repair.terminal(instruction: "The capture was cancelled. No further capture runs for this request."))
         }
-        guard LocalToolImage.sink != nil else {
+        guard invocation.imageSink != nil else {
             return failed("image_delivery_unavailable", "This text-only call cannot display desktop pixels.",
                 instruction: "Request pixels from a model tool turn.",
                 remedy: Repair.terminal(instruction: "This call has no image delivery channel. Request pixels from a model tool turn if an image is needed."))
@@ -185,28 +190,27 @@ extension SwiftToolDispatcher {
             return failed("screen_recording_not_trusted", "Screen Recording permission is missing. No permission prompt was opened.",
                 instruction: "Ask the owner to enable Screen Recording.", remedy: MacScreenCaptureFailure.screenRecordingNotTrusted.remedy())
         }
-        // Waking or stepping NativeAgent's windows aside can change the desktop
-        // even when a later capture fails; no image is not proof of no effects.
+        // Wake and window movement can precede capture failure; no image cannot prove no effects.
         desktopEffects = "unknown"
         do {
-            if let refusal = try await SwiftNativeMacControl().wakeScreenIfCovered(action: "view", body: input) {
+            if let refusal = try await SwiftNativeMacControl().wakeScreenIfCovered(action: "view", body: input, turn: turn, context: context) {
                 return refusal.output
             }
         } catch is CancellationError { return cancelled() }
         catch let covered as MacScreenLock.Covered {
             return failed(covered.code, covered.detail,
                 instruction: "Wake the screen, then capture again; no capture was delivered.",
-                // User's Mac is never password-locked: the cover is a screensaver she wakes.
+                // The user’s Mac is never password-locked; the cover is a screensaver to wake.
                 remedy: Repair.remedy(owner: "Mac display",
-                    nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mac.look")])]), tap: "sign in on the Mac, only if a password prompt remains",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mac.look")])]),
+                        tap: "sign in on the Mac, only if a password prompt remains",
                     instruction: "Use mac.look (it wakes the screen first), then capture again; only a password prompt needs the person."))
         } catch {
             return failed("desktop_wake_failed", error.localizedDescription,
                 instruction: "Inspect the current app's text and controls; correct the reported wake failure before requesting pixels.")
         }
         guard !Task.isCancelled else { return cancelled() }
-        // Wait up to 1.5 s for two consecutive window inventories to agree;
-        // cancellation stops the wait.
+        // Wait up to 1.5 s for two consecutive window inventories to agree; cancellation stops the wait.
         guard var windows = desktopWindowInventory() else {
             return failed("desktop_window_list_unavailable", "The desktop window list could not be read for masking. No image was delivered.",
                 instruction: "Read the front app's text and controls to establish available coverage; desktop masking needs a readable window list.")
@@ -224,15 +228,14 @@ extension SwiftToolDispatcher {
         }
         let shot: MacScreenShot
         guard !Task.isCancelled else { return cancelled() }
-        switch await source.capture(rect: nil) {
+        switch await source.capture(rect: nil, context: context) {
         case .failure(let failure): return failed(failure.rawValue, failure.errorDescription ?? failure.rawValue,
             instruction: "Use the capture cause's remedy.", remedy: failure.remedy())
         case .success(let captured): shot = captured
         }
         guard !Task.isCancelled else { return cancelled() }
-        // Recheck the shot-time inventory before inspection: moved or vanished
-        // windows refuse capture; newly appeared windows are masked in full.
-        // Later movement prevents a window from matching its inspected root.
+        // Recheck the shot-time inventory before inspection: moved or vanished windows refuse capture; newly appeared windows are masked in full. Later
+        // movement prevents a window from matching its inspected root.
         guard let settled = desktopWindowInventory() else {
             return failed("desktop_window_list_unavailable", "The capture-time desktop window list could not be read for masking. No image was delivered.",
                 instruction: "Read the front app's text and controls to establish available coverage; desktop masking needs a readable window list.")
@@ -250,9 +253,7 @@ extension SwiftToolDispatcher {
             return failed("desktop_image_size_unsupported", "Desktop capture has invalid dimensions or exceeds 40 megapixels.",
                 instruction: "Read the app's text and controls, then request a specific app or region within the image limit.")
         }
-        // Small enough that no provider rescales it (long side ≤ 1568, short side
-        // ≤ 768, ≤ 1.15 MP): what the model is shown is what the receipt measures,
-        // so a point she reads off the picture is the point her hand goes to.
+        // Long side ≤ 1568, short side ≤ 768, ≤ 1.15 MP avoids provider rescaling, preserving point coordinates.
         let long = Double(max(shot.pixelWidth, shot.pixelHeight)), short = Double(min(shot.pixelWidth, shot.pixelHeight))
         let scale = min(1, 1568 / long, 768 / short, (1_150_000 / (long * short)).squareRoot())
         guard let image = shot.cgImage else {
@@ -260,7 +261,8 @@ extension SwiftToolDispatcher {
                 instruction: "Inspect text and controls; repair the capture source before requesting more desktop pixels.")
         }
         let layers: [DesktopLayer]
-        do { layers = try await desktopLayers(shot: shot, windows: windows, appeared: appeared, scale: scale, source: source, accessibility: accessibility) }
+        do { layers = try await desktopLayers(shot: shot, windows: windows, appeared: appeared, scale: scale,
+            source: source, accessibility: accessibility, context: context) }
         catch is CancellationError { return cancelled() }
         catch {
             let failure = error as? ToolFailureError
@@ -268,9 +270,8 @@ extension SwiftToolDispatcher {
                 instruction: failure?.instruction ?? "Inspect text and controls; repair desktop masking before requesting more pixels.",
                 remedy: failure?.code == "accessibility_not_trusted" ? MacFourVerbsReply.privacyRemedy("accessibility_not_trusted") : nil)
         }
-        // Gray content footprints, then compose independently inspected window pixels
-        // with field or whole-window masks back to front: translucent areas reveal gray,
-        // and rear masks cannot cover front windows.
+        // Gray content footprints, then compose independently inspected window pixels with field or whole-window masks back to front: translucent areas reveal
+        // gray, and rear masks cannot cover front windows.
         let maskedWindows = layers.filter { $0.image == nil }.count
         guard let masked = composeDesktop(shot: shot, image: image, layers: layers, scale: scale) else {
             return failed("desktop_mask_render_failed", "Desktop preview rendering failed while applying safe masks. No image was delivered.",
@@ -280,9 +281,12 @@ extension SwiftToolDispatcher {
             pixelWidth: masked.width, pixelHeight: masked.height, cgImage: masked)
         guard !Task.isCancelled else { return cancelled() }
         guard let png = renderer.renderPNG(shot: maskedShot, placements: [], secretFrames: [], downscale: 1) else {
-            return failed("image_encode_failed", "Desktop image encoding failed.", instruction: "Inspect text and controls; repair image encoding before requesting more desktop pixels.")
+            return failed("image_encode_failed", "Desktop image encoding failed.",
+                instruction: "Inspect text and controls; repair image encoding before requesting more desktop pixels.")
         }
-        let delivered = LocalToolImage.deliverPNG(png, name: LocalToolImage.screenshotName(of: "the primary desktop", source: "primary-desktop"), width: masked.width, height: masked.height)
+        let delivered = LocalToolImage.deliverPNG(png, name: LocalToolImage.screenshotName(of: "the primary desktop", source: "primary-desktop"),
+            width: masked.width, height: masked.height, sink: invocation.imageSink)
+        let reply = ToolResult(delivered)
         guard case .object(var result) = delivered else { return delivered }
         result["capture_scope"] = .string("primary_desktop")
         result["captured_at"] = .string(ISO8601DateFormatter().string(from: Date()))
@@ -293,10 +297,14 @@ extension SwiftToolDispatcher {
             return .object(["window_id": .int(Int64(layer.number)), "message": .string(failure)])
         }
         if !maskingFailures.isEmpty { result["masking_failures"] = .array(maskingFailures) }
-        var note = "Primary-display pixels, bounded so the model sees them at the receipt's own size (short side ≤ 768 px). Secret fields are masked; windows whose contents could not be safely inspected are masked in full. Inspect the image to assess the outcome; capture success alone does not verify an action. Protected content may be unavailable."
-        if result["status"] == .string("ok") {
+        var note = """
+            Primary-display pixels, bounded so the model sees them at the receipt's own size (short side ≤ 768 px). Secret fields are masked; \
+            windows whose contents could not be safely inspected are masked in full. Inspect the image to assess the outcome; capture success \
+            alone does not verify an action. Protected content may be unavailable.
+            """
+        if reply.said("ok"), reply.status == result["status"]?.stringValue {
             let frame = MacImageFrames.remember(MacScreenViewGeometry(bounds: shot.bounds, pixelWidth: masked.width,
-                pixelHeight: masked.height, capture: shot.capture?.composing(layers.map { ($0.number, $0.capture) })))
+                pixelHeight: masked.height, capture: shot.capture?.composing(layers.map { ($0.number, $0.capture) })), turn: turn)
             result["image"] = frame.fields
             note += " " + frame.words
         }
@@ -304,8 +312,7 @@ extension SwiftToolDispatcher {
         return .object(result)
     }
 
-    /// One window of the picture: its frame, and its own pixels with its
-    /// secret fields when it was inspected, else masked whole.
+    /// One window of the picture: its frame, and its own pixels with its secret fields when it was inspected, else masked whole.
     struct DesktopLayer {
         let number: Int
         let frame: MacAXFrame
@@ -317,7 +324,7 @@ extension SwiftToolDispatcher {
 
     private static func desktopLayers(
         shot: MacScreenShot, windows: [[String: Any]], appeared: [[String: Any]] = [], scale: Double,
-        source: any MacScreenCaptureSource, accessibility: any MacAXElementSource
+        source: any MacScreenCaptureSource, accessibility: any MacAXElementSource, context: MacOperationContext
     ) async throws -> [DesktopLayer] {
         guard shot.bounds.w > 0, shot.bounds.h > 0,
               [shot.bounds.x, shot.bounds.y, shot.bounds.w, shot.bounds.h].allSatisfy(\.isFinite) else {
@@ -325,7 +332,8 @@ extension SwiftToolDispatcher {
                 code: "desktop_capture_bounds_invalid", instruction: "Inspect text and controls; repair the capture bounds before requesting desktop pixels.")
         }
         guard accessibility.isTrusted() else {
-            throw ToolFailureError("Accessibility permission is required for desktop masking. No permission prompt was opened; no image was delivered.", effects: .none,
+            throw ToolFailureError(
+                "Accessibility permission is required for desktop masking. No permission prompt was opened; no image was delivered.", effects: .none,
                 code: "accessibility_not_trusted", instruction: "Ask the owner to enable NativeAgent in System Settings > Privacy & Security > Accessibility.")
         }
         let geometry = MacScreenViewGeometry(shot: shot)
@@ -333,13 +341,11 @@ extension SwiftToolDispatcher {
         let pixelsPerPoint = Double(shot.pixelWidth) / shot.bounds.w
         var layers: [DesktopLayer] = []
         var rootsByPID: [Int32: [MacAXWindowHandle]] = [:]
-        // One enumeration of the windows on screen serves every window's capture.
-        let capture = await source.windowCapture()
-        // Inspect front to back within the shared deadline; mask every remaining
-        // window in full when the budget expires.
+        // Share one window enumeration across captures to keep the inventory coherent.
+        let capture = await source.windowCapture(context: context)
+        // Inspect front to back within the shared deadline; mask every remaining window in full when the budget expires.
         let budget = Date().addingTimeInterval(desktopMaskingBudget)
         var chromeByPID: [Int32: Bool] = [:]
-        // Every CG frame of each app, read once, for the reverse match below.
         var framesByPID: [Int32: [MacAXFrame]] = [:]
         for window in windows + appeared {
             guard let pid = window[kCGWindowOwnerPID as String] as? Int32, let bounds = window[kCGWindowBounds as String] as? NSDictionary,
@@ -354,7 +360,8 @@ extension SwiftToolDispatcher {
             guard let bounds = window[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: bounds) else {
                 throw ToolFailureError("Desktop masking could not read a window's bounds. No image was delivered.", effects: .none,
-                    code: "desktop_window_bounds_unavailable", instruction: "Inspect text and controls; repair the window inventory before requesting desktop pixels.")
+                    code: "desktop_window_bounds_unavailable",
+                        instruction: "Inspect text and controls; repair the window inventory before requesting desktop pixels.")
             }
             let frame = MacAXFrame(x: rect.minX, y: rect.minY, w: rect.width, h: rect.height)
             guard [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else {
@@ -363,27 +370,30 @@ extension SwiftToolDispatcher {
             }
             guard geometry.intersects(frame),
                   (window[kCGWindowAlpha as String] as? Double ?? 1) > 0 else { continue }
-            // Raised Dock and Window Server chrome is excluded; all other raised
-            // windows remain content and retain masking.
+            // Raised Dock and Window Server chrome is excluded; all other raised windows remain content and retain masking.
             let layer = window[kCGWindowLayer as String] as? Int ?? 0
             if layer != 0, isChrome(window, cache: &chromeByPID) { continue }
             // Fully covered windows need no inspection or layer.
             let display = CGRect(x: shot.bounds.x, y: shot.bounds.y, width: shot.bounds.w, height: shot.bounds.h)
-            if desktopCovered(rect.intersection(display), by: layers.map { CGRect(x: $0.frame.x, y: $0.frame.y, width: $0.frame.w, height: $0.frame.h) }) { continue }
+            if desktopCovered(rect.intersection(display), by: layers.map { CGRect(x: $0.frame.x, y: $0.frame.y, width: $0.frame.w,
+                height: $0.frame.h) }) { continue }
             let number = window[kCGWindowNumber as String] as? Int ?? -1
             guard let pid = window[kCGWindowOwnerPID as String] as? Int32 else {
                 throw ToolFailureError("Desktop masking could not identify a window's app. No image was delivered.", effects: .none,
-                    code: "desktop_window_owner_unavailable", instruction: "Inspect text and controls; repair the window-owner inventory before requesting desktop pixels.")
+                    code: "desktop_window_owner_unavailable",
+                        instruction: "Inspect text and controls; repair the window-owner inventory before requesting desktop pixels.")
             }
             guard Date() < budget else {
                 layers.append(DesktopLayer(number: number, frame: frame, image: nil, secrets: []))
                 continue
             }
-            // Each window's AX reads share half the remaining budget, bounding slow
-            // inspection without consuming the later windows' entire budget.
+            // Each window's AX reads share half the remaining budget, bounding slow inspection without consuming the later windows' entire budget.
             let share = Date().addingTimeInterval(budget.timeIntervalSinceNow / 2)
+            var inspection = context
+            let deadline = ContinuousClock.now.advanced(by: .seconds(max(0, share.timeIntervalSinceNow)))
+            inspection.deadline = context.deadline.map { min($0, deadline) } ?? deadline
             if rootsByPID[pid] == nil {
-                rootsByPID[pid] = MacAXLimits.$readDeadline.withValue(share) { accessibility.windowRoots(pid: pid) }
+                rootsByPID[pid] = accessibility.windowRoots(pid: pid, context: inspection)
             }
             // Root discovery can spend the window's share: nothing more starts past it.
             guard Date() < share else {
@@ -392,38 +402,34 @@ extension SwiftToolDispatcher {
             }
             let matches = rootsByPID[pid, default: []].filter { $0.identity.frame.map { near($0, frame) } ?? false }
             var inspectionFailure: String?
-            // The match must hold both ways: two CG windows of one app near one
-            // frame (a document and a hidden sibling panel) would both match the
-            // same AX root, and one window's inspection would then vouch for the
-            // other's pixels. The root must match this window alone, else masked whole.
+            // Require a unique match both ways; nearby CG windows sharing an AX root cannot vouch for each other’s pixels.
             if matches.count == 1, let root = matches.first, let rootFrame = root.identity.frame,
                framesByPID[pid, default: []].filter({ near($0, rootFrame) }).count == 1 {
-                // Inspect every element before and after capture; secret fields
-                // must stay fixed while other content may change. Incomplete or
-                // unreadable inspection, unplaceable controls, or a changed root
-                // masks the whole window; zero-area controls paint nothing.
+                // Inspect every element before and after capture; secret fields must stay fixed while other content may change. Incomplete or unreadable
+                // inspection, unplaceable controls, or a changed root masks the whole window; zero-area controls paint nothing.
                 var imageTargets: [MacImageCapture.PointTarget] = []
                 func fields(recordTargets: Bool = false) -> [MacAXFrame]? {
                     let nodes: [MacAXNode]
                     do {
                         nodes = try MacScreenViewTextRedaction.inspectSecretFields(
-                            source: accessibility, root: root.ref, deadline: share)
+                            source: accessibility, root: root.ref, deadline: share, context: inspection)
                     } catch {
                         inspectionFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
                         return nil
                     }
-                    guard let secrets = MacScreenViewTextRedaction.secretFrames(nodes: nodes, geometry: geometry, deadline: share) else { return nil }
+                    guard let secrets = MacScreenViewTextRedaction.secretFrames(nodes: nodes, geometry: geometry, deadline: share,
+                        context: inspection) else { return nil }
                     if recordTargets {
                         imageTargets = MacImageCapture.pointTargets(nodes: nodes, pid: pid,
-                            deadline: share, source: defaultMacAXActSource())
+                            deadline: share, source: defaultMacAXActSource(), context: inspection)
                     }
                     return secrets
                 }
-                // A secret that moved masks the window whole: the capture's instant is unknown, and a union of its two places leaves the pixels between them bare.
+                // A moving secret masks the whole window: its unknown capture instant can expose pixels between its two positions.
                 if let before = fields(recordTargets: true),
                    case .success(let own) = await capture(number, max(1, Int((frame.w * pixelsPerPoint * scale).rounded()))),
                    let image = own.cgImage,
-                   MacAXLimits.$readDeadline.withValue(share, operation: { accessibility.windowRoots(pid: pid) })
+                   accessibility.windowRoots(pid: pid, context: inspection)
                        .contains(where: { $0.identity == root.identity }),
                    let after = fields(), Set(after) == Set(before) {
                     layers.append(DesktopLayer(number: number, frame: frame, image: image, secrets: before,
@@ -431,13 +437,11 @@ extension SwiftToolDispatcher {
                     continue
                 }
             }
-            // Uninspectable content is a sensitive region in its entirety,
-            // including our own windows (which AX deliberately cannot read).
+            // Uninspectable content is a sensitive region in its entirety, including our own windows (which AX deliberately cannot read).
             layers.append(DesktopLayer(number: number, frame: frame, image: nil, secrets: [],
                 inspectionFailure: inspectionFailure))
         }
-        // A window that appeared as the shot was taken may be in the pixels, in
-        // front of anything: masked whole, painted last.
+        // A window that appeared as the shot was taken may be in the pixels, in front of anything: masked whole, painted last.
         var late: [DesktopLayer] = []
         for window in appeared {
             guard let bounds = window[kCGWindowBounds as String] as? NSDictionary, let rect = CGRect(dictionaryRepresentation: bounds) else { continue }
@@ -450,10 +454,8 @@ extension SwiftToolDispatcher {
         return late + layers
     }
 
-    /// The composite at delivery size: the desktop shot with every content
-    /// window's footprint painted gray, then back to front each window's own
-    /// pixels with its field masks, or nothing. Image space is top-left in
-    /// global points; the context is bottom-left in pixels.
+    /// The composite at delivery size: the desktop shot with every content window's footprint painted gray, then back to front each window's own pixels with
+    /// its field masks, or nothing. Image space is top-left in global points; the context is bottom-left in pixels.
     static func composeDesktop(shot: MacScreenShot, image: CGImage, layers: [DesktopLayer], scale: Double) -> CGImage? {
         let width = max(1, Int((Double(image.width) * scale).rounded())), height = max(1, Int((Double(image.height) * scale).rounded()))
         guard shot.bounds.w > 0, shot.bounds.h > 0,
@@ -467,9 +469,8 @@ extension SwiftToolDispatcher {
         }
         context.interpolationQuality = .high
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        // Opaque, not blurred: a blur of a short code is still the code. Every
-        // content window's footprint first, so nothing of the shot shows under
-        // a translucent paste.
+        // Opaque, not blurred: a blur of a short code is still the code. Every content window's footprint first, so nothing of the shot shows under a
+        // translucent paste.
         context.setFillColor(gray: 0.08, alpha: 1)
         for layer in layers { context.fill(rect(layer.frame)) }
         for layer in layers.reversed() {
@@ -480,7 +481,6 @@ extension SwiftToolDispatcher {
         return context.makeImage()
     }
 
-    /// Nothing of `rect` is left once every cover is cut out of it.
     static func desktopCovered(_ rect: CGRect, by covers: [CGRect]) -> Bool {
         var pieces = [rect]
         for cover in covers {
@@ -498,12 +498,10 @@ extension SwiftToolDispatcher {
         return false
     }
 
-    /// Total time budget, in seconds, for the desktop masking walk.
     static let desktopMaskingBudget: TimeInterval = 4.8
 
-    /// Apple's own chrome, by the executable of the process that owns the
-    /// window (a name is anyone's to take): the Dock, and the Window Server's
-    /// menu bar. Nothing else is exempt from masking.
+    /// Apple's own chrome, by the executable of the process that owns the window (a name is anyone's to take): the Dock, and the Window Server's menu bar.
+    /// Nothing else is exempt from masking.
     static func isChrome(_ window: [String: Any], cache: inout [Int32: Bool]) -> Bool {
         guard let pid = window[kCGWindowOwnerPID as String] as? Int32 else { return false }
         if let known = cache[pid] { return known }
@@ -517,8 +515,7 @@ extension SwiftToolDispatcher {
     }
 
 
-    /// Every window of the shot-time inventory is still there, unmoved, and in
-    /// the same front-to-back order: the masks were cut by that order.
+    /// Every window of the shot-time inventory is still there, unmoved, and in the same front-to-back order: the masks were cut by that order.
     private static func desktopWindowsHeld(_ before: [[String: Any]], through after: [[String: Any]]) -> Bool {
         let now = Dictionary(after.compactMap { window in (window[kCGWindowNumber as String] as? Int).map { ($0, window) } },
                              uniquingKeysWith: { first, _ in first })
@@ -537,7 +534,7 @@ extension SwiftToolDispatcher {
         ) as? [[String: Any]] else { return nil }
         let keys = [kCGWindowNumber, kCGWindowOwnerPID, kCGWindowOwnerName, kCGWindowLayer, kCGWindowBounds, kCGWindowAlpha]
             .map { $0 as String }
-        // Shotgun is left out of the capture, so it is left out of the masks.
+        // Exclude person-only overlays from masks because they are absent from capture.
         return windows.filter { window in
             !((window[kCGWindowNumber as String] as? Int).map(PersonOnlyWindows.contains(number:)) ?? false)
         }.map { window in

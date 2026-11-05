@@ -1,18 +1,11 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `ActivityRetention.swift` | `ActivityRetentionRunner`: checked completed-run cadence before pruning; unreadable state preserves bytes and pauses retention; durable stamp follows successful pruning |
+// Blueprint: | `ActivityRetention.swift` | `ActivityRetentionRunner`: checked prune cadence; unavailable state pauses cleanup; completion is durable |
 
-/// W10 — retention enforcement.
-///
-/// Configurable (`ActivityPolicy.retentionDays`, default 30), scheduled, and
-/// durable across restarts: the last-run stamp lives next to the DB, so a
-/// process that never stays up for a whole day still prunes. A prune that only
-/// runs on a timer inside a long-lived process is a prune that never runs on a
-/// laptop.
+/// Persist the prune cadence so laptops that restart within a day still enforce retention.
 public struct ActivityRetentionRunner: Sendable {
-    /// How often the prune is allowed to run. Retention is a 30-day window;
-    /// enforcing it hourly buys nothing and VACUUMs the file for no reason.
+    /// Hourly enforcement adds needless VACUUM work to a 30-day retention window.
     public static let defaultInterval: TimeInterval = 6 * 3600
 
     public let stateURL: URL
@@ -31,7 +24,7 @@ public struct ActivityRetentionRunner: Sendable {
         return last + Self.defaultInterval - now
     }
 
-    /// nil: no state file yet (fresh). Throws: the file is there and unreadable or corrupt (a fault, not fresh).
+    /// Missing state is fresh; existing unreadable or corrupt state is a fault.
     public func lastRunAt() throws -> Double? {
         let attributes: [FileAttributeKey: Any]
         do { attributes = try FileManager.default.attributesOfItem(atPath: stateURL.path) }
@@ -50,16 +43,12 @@ public struct ActivityRetentionRunner: Sendable {
 
     public func isDue(now: Double) throws -> Bool {
         guard let last = try lastRunAt() else { return true }
-        // A last-run stamp in the FUTURE means the clock moved backwards. Treat
-        // it as due rather than as a licence to skip pruning until the clock
-        // catches up — which, after a large backwards step, could be years.
+        // A backwards clock step must not defer pruning until a future stamp catches up.
         if last > now { return true }
         return now - last >= Self.defaultInterval
     }
 
-    /// Prune if due, then durably record the completed maintenance pass.
-    /// A failed cadence read stops before pruning or writing the stamp. The
-    /// existing bytes remain available for repair; unknown cadence is not due.
+    /// Read cadence before pruning; failure preserves its bytes and cannot count as due.
     public func runIfDue(
         store: ActivitySpanStore,
         policy: ActivityPolicy,

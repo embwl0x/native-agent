@@ -1,21 +1,18 @@
-// Canonical memories, proposals, and rejection tombstones in
-// <dataRoot>/memory/memory.sqlite, owned by the MemoryStorage actor.
+// MemoryStorage alone owns canonical memories, proposals and rejection tombstones.
 
 import Foundation
 import GRDB
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryV2+Storage.swift` | `MemoryStorage` actor, shared database pool and canonical mutations; bounded admission and eviction, transactional duplicate/supersession writes, scalar `statusCounts` and checked `curationPage` |
+// Blueprint: | `MemoryV2+Storage.swift` | `MemoryStorage`, `statusCounts`, `curationPage`: canonical mutations and bounded curation |
 
 // MARK: - MemoryStorage actor
 
-/// Owns memory.sqlite's schema (including kg_*). Local backup and export take
-/// SQLite snapshots, never journal sidecars; PrivacyMap: memory. The phone
-/// receives active-memory, proposal and graph projections, never these files.
+/// Owns memory.sqlite's schema (including kg_*). Local backup and export take SQLite snapshots, never journal sidecars; PrivacyMap: memory. The phone receives
+/// active-memory, proposal and graph projections, never these files.
 public actor MemoryStorage {
-    // Same-module storage extensions share this pool rather than reopening
-    // the database.
+    // Same-module storage extensions share this pool rather than reopening the database.
     let dbPool: DatabasePool
     public let path: URL
     let memoryLimit: Int
@@ -32,8 +29,7 @@ public actor MemoryStorage {
         if let message { nativeLog("MemoryV2 Spotlight: %@", message) }
     }
     var knowledgeGraphHook: (@Sendable (String) async -> Void)?
-    /// Ordered projection lanes resolve canonical eligibility when they run.
-    /// A hook queued after suspension carries identity, never stale intent.
+    /// Ordered projection lanes resolve canonical eligibility when they run. A hook queued after suspension carries identity, never stale intent.
     var spotlightProjectionTail: Task<Void, Never>?
     var knowledgeGraphProjectionTail: Task<Void, Never>?
     var userMDProjectionTail: Task<Void, Never>?
@@ -55,7 +51,7 @@ public actor MemoryStorage {
         var config = Configuration()
         config.foreignKeysEnabled = true
         config.busyMode = .timeout(2)
-        // Limit retained WAL size to 4 MB on every pool connection.
+        // Bound retained WAL to 4 MB on every connection.
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
             // Match Swift's cursor comparisons, including Unicode identifiers.
@@ -82,10 +78,7 @@ public actor MemoryStorage {
 
     // MARK: - Hard memory bound
 
-    /// Delete the least valuable rows until the table satisfies `limit`.
-    /// Capacity eviction is forgetting, not rejection, so it intentionally does
-    /// not create tombstones. Call only while already holding the canonical
-    /// SQLite write transaction.
+    /// Evict under the canonical write transaction; capacity forgetting creates no rejection tombstones.
     @discardableResult
     static func pruneMemoriesToBound(
         in db: Database,
@@ -96,9 +89,7 @@ public actor MemoryStorage {
         let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memories") ?? 0
         let overflow = count - boundedLimit
         guard overflow > 0 else { return [] }
-        // Correction and supersession are history, never capacity eviction, and so is a memory
-        // a pending replacement will demote once admitted. Refuse admission
-        // when retaining them leaves too few disposable rows.
+        // Corrections, supersession history and pending replacement targets are not capacity victims; refuse admission if disposable capacity is insufficient.
         let rows = try Row.fetchAll(db, sql: """
             SELECT * FROM memories
             WHERE json_extract(metadata_json, '$.superseded_by') IS NULL
@@ -118,8 +109,7 @@ public actor MemoryStorage {
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
             return lhs.id < rhs.id
         }
-        // The row being admitted is never its own eviction: refuse instead,
-        // so the caller's transaction rolls back whole.
+        // The row being admitted is never its own eviction: refuse instead, so the caller's transaction rolls back whole.
         let evicted = Array(ordered.filter { !preservingIDs.contains($0.id) }.prefix(overflow))
         guard evicted.count == overflow else { throw MemoryStorageError.capacityExceeded }
         // Admission must not trade protected tissue for a lower-priority row.
@@ -138,11 +128,8 @@ public actor MemoryStorage {
         return evicted
     }
 
-    /// Lower ranks are evicted first. Archived and recall-excluded rows are
-    /// disposable before active tissue; temporary/stale facts precede ordinary
-    /// confirmed facts; pinned and identity memories are protected until every
-    /// other class is exhausted. If protected rows alone exceed the hard cap,
-    /// their oldest rows are still evicted so the bound remains real.
+    /// Evict excluded and archived rows before temporary/stale facts, then ordinary facts. Protect pinned and identity rows until no other class remains;
+    /// oldest protected rows still yield when the hard cap requires it.
     private static func retentionEvictionRank(_ memory: StoredMemory) -> Int {
         if memory.status != "active" { return 0 }
         let lifecycle = MemoryLifecycle.normalized(memory.lifecycle)
@@ -175,14 +162,14 @@ public actor MemoryStorage {
 
     // MARK: - Memory CRUD
 
-    /// Duplicate matching and evidence accumulation share the insertion write
-    /// transaction, so simultaneous stores cannot lose counts or provenance.
+    /// Duplicate matching and evidence accumulation share the insertion write transaction, so simultaneous stores cannot lose counts or provenance.
     public func admitMemory(
         _ memory: StoredMemory, insertIfMissing: Bool, preserveID: Bool,
-        superseding: [SupersedingAcceptance] = []
+        superseding: [SupersedingAcceptance] = [],
+        context: MemoryWriteContext
     ) async throws -> StoredMemory? {
         var stamped = memory
-        stamped.metadata = try MemorySenseProvenance.stamping(stamped.metadata)
+        stamped.metadata = try context.stamping(stamped.metadata)
         let memory = stamped
         let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory], [StoredMemory]) in
             try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
@@ -219,9 +206,7 @@ public actor MemoryStorage {
         return result.0
     }
 
-    /// Admission's duplicate rule, shared by a warm write and an owed vector
-    /// landing: the same text in the same scope, or (with a vector) a recent
-    /// near-paraphrase in the same scope that is not a correction.
+    /// Warm writes and owed-vector landing share duplicate admission: same text and scope, or a recent same-scope near-paraphrase that is not a correction.
     static func admissionDuplicate(of memory: StoredMemory, among rows: [StoredMemory],
                                    in db: Database) throws -> StoredMemory? {
         let now = Date()
@@ -254,12 +239,11 @@ public actor MemoryStorage {
         return duplicate
     }
 
-    /// Marks a vector-less row written with a caller-owned id until it lands.
+    /// Preserve caller-owned identity until vector admission.
     static let preservesIDKey = "admission_preserves_id"
-    /// A cold write is saved but not admitted until its vector lands and
-    /// passes the checks; a turn withholds it until then.
+    /// A cold write is saved but not admitted until its vector lands and passes the checks; a turn withholds it until then.
     public static let pendingAdmissionKey = "admission_pending"
-    /// What a cold replacement demotes once admitted; until then those stay as they are.
+    /// Cold replacements leave their targets intact until admission.
     static let pendingSupersedesKey = "admission_supersedes"
 
     static func owingAdmission(_ metadata: JSONValue?, preservingID: Bool,
@@ -290,8 +274,7 @@ public actor MemoryStorage {
         return false
     }
 
-    /// The incoming write becomes evidence on the row it duplicates. An owed
-    /// row folding late also carries its own lineage and occurrences across.
+    /// The incoming write becomes evidence on the row it duplicates. An owed row folding late also carries its own lineage and occurrences across.
     static func foldDuplicate(_ memory: StoredMemory, into existing: StoredMemory, in db: Database,
                               carryingHistory: Bool = false) throws -> StoredMemory {
         var row = existing
@@ -315,8 +298,7 @@ public actor MemoryStorage {
         }
         var patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
             existing: MemoryRecord(stored: row), newSource: memory.source, newMetadata: memory.metadata)
-        // Explicit scope replaces scope only on the same text, never
-        // on a merely similar record. Omission retains the old scope.
+        // Explicit scope replaces scope only on the same text, never on a merely similar record. Omission retains the old scope.
         if Self.comparisonKey(row.content, mode: .canonical) == key,
            case .object(let incoming)? = memory.metadata,
            case .array(let topics)? = incoming["context_topics"], !topics.isEmpty {
@@ -349,8 +331,7 @@ public actor MemoryStorage {
         try Self.recordCorrectionOccurrence(metadata: memory.metadata, rowID: memory.id, createdAt: memory.createdAt,
                                            on: row.id, in: db)
         if carryingHistory, memory.id != row.id {
-            // Move the full record, never the bounded metadata preview. The
-            // same origin already on the survivor remains one occurrence.
+            // Move the full record, never the bounded metadata preview. The same origin already on the survivor remains one occurrence.
             if try Row.fetchOne(db, sql: """
                 SELECT 1 FROM correction_occurrences a JOIN correction_occurrences b ON a.origin_id = b.origin_id
                 WHERE a.memory_id = ? AND b.memory_id = ?
@@ -376,10 +357,11 @@ public actor MemoryStorage {
     @discardableResult
     public func insertMemory(
         _ memory: StoredMemory,
-        superseding: [SupersedingAcceptance] = []
+        superseding: [SupersedingAcceptance] = [],
+        context: MemoryWriteContext
     ) async throws -> StoredMemory {
         var stamped = memory
-        stamped.metadata = try MemorySenseProvenance.stamping(stamped.metadata)
+        stamped.metadata = try context.stamping(stamped.metadata)
         let memory = stamped
         let (saved, demoted, evicted) = try await dbPool.write { db -> (StoredMemory, [StoredMemory], [StoredMemory]) in
             try Self.requireNotTombstoned(memory, in: db)
@@ -412,7 +394,7 @@ public actor MemoryStorage {
         return saved
     }
 
-    /// Runs inside the caller's write transaction.
+    /// Stay inside the caller's write transaction.
     static func executeMemoryInsert(_ memory: StoredMemory, in db: Database, recordCorrection: Bool = true) throws {
         try db.execute(sql: """
             INSERT INTO memories
@@ -439,7 +421,6 @@ public actor MemoryStorage {
         }
     }
 
-    /// Active rows whose vector is owed, oldest first.
     public func memoriesOwingVectors(limit: Int, epoch: MemoryEmbeddingEpoch) async throws -> [(id: String, content: String)] {
         try await dbPool.read { db in
             try Row.fetchAll(db, sql: """
@@ -455,10 +436,8 @@ public actor MemoryStorage {
 
     enum OwedVectorLanding { case landed, archived(reason: String), superseded }
 
-    /// An owed vector lands through the same checks a warm write passes, in
-    /// one transaction on the row's exact words (a newer write always wins):
-    /// a paraphrase of a rejected claim, or a duplicate admission would have
-    /// collapsed, is archived with its reason in the row instead of landing.
+    /// Land owed vectors under warm-write checks in one exact-content transaction. Newer writes win; rejected paraphrases and collapsed duplicates retain their
+    /// archival reason.
     func landOwedVector(id: String, content: String, vector: [Float],
                         epoch: MemoryEmbeddingEpoch) async throws -> OwedVectorLanding {
         let (outcome, changed) = try await dbPool.write { db -> (OwedVectorLanding, [StoredMemory]) in
@@ -471,8 +450,7 @@ public actor MemoryStorage {
             var reason: String?
             var folded: StoredMemory?
             var demoted: [StoredMemory] = []
-            // A caller-owned id (one lesson origin per proposal) is admitted
-            // as itself, never folded into another row, as its warm write was.
+            // Preserve caller-owned IDs through admission, matching warm-write identity.
             let preservesID = Self.metadataFlag(owed.metadata, Self.preservesIDKey)
             do {
                 try Self.requireNotTombstoned(owed, in: db)
@@ -489,9 +467,7 @@ public actor MemoryStorage {
                     reason = "folded into \(duplicate.id), a duplicate found when its owed vector landed"
                 }
             }
-            // An admitted replacement demotes what it replaces now, all or none,
-            // as its warm write would have; one that changed or left meanwhile
-            // refuses it, as a warm write is refused.
+            // Admit replacements and demote unchanged targets atomically; target drift refuses the replacement.
             let supersessions = Self.owedSupersessions(owed.metadata)
             if reason == nil || folded != nil, !supersessions.isEmpty {
                 let replacement = folded ?? owed
@@ -513,7 +489,6 @@ public actor MemoryStorage {
                             '$.\(Self.pendingSupersedesKey)')
                     WHERE id = ?
                     """, arguments: [Self.encodeEmbedding(vector), epoch.rawValue, id])
-                // Admitted now: the projections that withheld it publish it.
                 let landed = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
                     .map(Self.decodeMemory)
                 return (.landed, [landed].compactMap { $0 } + demoted)
@@ -536,7 +511,6 @@ public actor MemoryStorage {
         return outcome
     }
 
-    /// One primary-key lookup of exactly these rows, unfiltered.
     public func memories(ids: [String]) async throws -> [StoredMemory] {
         guard !ids.isEmpty else { return [] }
         return try await dbPool.read { db in
@@ -557,10 +531,11 @@ public actor MemoryStorage {
     /// A conditional edit skips a row whose approved original has changed.
     public func updateMemory(
         id: String, patch: MemoryPatch, expectedContent: String? = nil,
-        onlyIf: (@Sendable (StoredMemory) -> Bool)? = nil
+        onlyIf: (@Sendable (StoredMemory) -> Bool)? = nil,
+        context: MemoryWriteContext
     ) async throws -> StoredMemory? {
-        let turnProvenance = try MemorySenseProvenance.stamping(nil)
-        let turnDataProvenance = MemoryDataProvenance.stamping(nil)
+        let turnProvenance = try MemorySenseProvenance.stamping(nil, reads: context.senseReads)
+        let turnDataProvenance = MemoryDataProvenance.stamping(nil, turn: context.turn)
         let (updated, demoted) = try await dbPool.write { db -> (StoredMemory?, [StoredMemory]) in
             guard var existing = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory) else {
                 return (nil, [])
@@ -578,8 +553,7 @@ public actor MemoryStorage {
             if let st = patch.status { existing.status = st }
             if let lifecycle = patch.lifecycle { existing.lifecycle = MemoryLifecycle.normalized(lifecycle) }
             if let validFrom = patch.validFrom { existing.validFrom = validFrom }
-            // Reactivating a record reopens its truth interval. Correction
-            // lineage stays in metadata; a closed interval cannot stay current.
+            // Reactivating a record reopens its truth interval. Correction lineage stays in metadata; a closed interval cannot stay current.
             if patch.status == "active", MemoryLifecycle.isRecallEligible(existing.lifecycle) {
                 existing.validTo = nil
             }
@@ -617,9 +591,7 @@ public actor MemoryStorage {
                 existing.metadata = .object(metadata)
             }
             if owesVector {
-                // New words without a vector owe one (the old vector described
-                // the old words) and wait for admission as a cold insert does,
-                // under this row's own id.
+                // Changed words invalidate their old vector; retain this row's identity while owing new-vector admission.
                 existing.embedding = nil
                 existing.embeddingEpoch = nil
                 existing.metadata = Self.owingAdmission(existing.metadata, preservingID: true)
@@ -631,8 +603,7 @@ public actor MemoryStorage {
                 try Self.requireNotTombstoned(existing, in: db)
             }
             if admittingOwedVector {
-                // An active row awaiting admission that now has its vector is
-                // admitted here, with its landing's checks, so it never stays withheld.
+                // Available vectors must pass landing checks before an active pending row becomes visible.
                 demoted = try Self.owedSupersessions(priorMetadata).map { try Self.demoteSuperseded($0, by: existing, in: db) }
                 if case .object(var metadata)? = existing.metadata {
                     for key in [Self.pendingAdmissionKey, Self.preservesIDKey, Self.pendingSupersedesKey] { metadata[key] = nil }
@@ -679,8 +650,7 @@ public actor MemoryStorage {
 
     @discardableResult
     public func deleteMemory(id: String) async throws -> Bool {
-        // Fetch the row first so the Spotlight + USER.md hooks can fire
-        // with the actual persona/content even after deletion.
+        // Read before deletion so projection hooks retain the actual persona and content.
         let result: (deleted: Bool, row: StoredMemory?) = try await dbPool.write { db in
             let row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory)
             try db.execute(sql: "DELETE FROM memories WHERE id = ?", arguments: [id])
@@ -705,8 +675,7 @@ public actor MemoryStorage {
         return result.deleted
     }
 
-    /// `keepingGraduated`: the Memories page keeps a graduated lesson in view
-    /// as history; every other "active" read is recall's and leaves it out.
+    /// Keep graduated lessons visible as Memories-page history, outside active recall.
     public func listMemories(
         persona: String? = nil,
         status: String? = "active",
@@ -736,8 +705,7 @@ public actor MemoryStorage {
             || (record.status == "archived" && MemoryLifecycle.isRecallEligible(lifecycle))
     }
 
-    /// Check disclosure over small ordered projections; decode full rows only
-    /// for this page, within the same SQLite read transaction.
+    /// Check disclosure over small ordered projections; decode full rows only for this page, within the same SQLite read transaction.
     public func curationPage(
         archived: Bool, kind: String?, surface: String, persona: String?, newestFirst: Bool,
         afterKey: (String, String)?, offset: Int, limit: Int
@@ -790,7 +758,7 @@ public actor MemoryStorage {
         }
     }
 
-    /// Scalar status counts keep lifecycle and JSON boolean pin semantics.
+    /// Share lifecycle and JSON boolean pin semantics in scalar counts.
     public func statusCounts() async throws -> (memories: Int, active: Int, pinned: Int, pendingProposals: Int) {
         try await dbPool.read { db in
             guard let row = try Row.fetchOne(db, sql: """
@@ -805,8 +773,8 @@ public actor MemoryStorage {
         }
     }
 
-    /// Atomically increment use_count and stamp last_used_at for returned recall hits.
-    /// Usage is access, not content: updated_at and recall_generation stay unchanged.
+    /// Atomically increment use_count and stamp last_used_at for returned recall hits. Usage is access, not content: updated_at and recall_generation stay
+    /// unchanged.
     public func recordRecallHits(ids: [String], at when: String = MemoryStorage.nowISO8601()) async throws {
         guard !ids.isEmpty else { return }
         try await dbPool.write { db in

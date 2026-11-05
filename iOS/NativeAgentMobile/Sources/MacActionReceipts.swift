@@ -71,9 +71,7 @@ struct RemoteActionCard: Identifiable, Equatable {
     }
 }
 
-/// App-session receipt ownership for Mac Tools. A waiting approval is the
-/// user's only direct breadcrumb from an interrupted remote action to
-/// Activity, so ordinary receipt trimming may never evict it.
+/// Never trim waiting-approval receipts: they are the user's route from an interrupted Mac action to Activity.
 @MainActor
 final class RemoteActionLedger: ObservableObject {
     static let shared = RemoteActionLedger()
@@ -139,8 +137,6 @@ final class RemoteActionLedger: ObservableObject {
     }
 }
 
-/// One receipt as a row: what ran, its state and age in secondary text, and
-/// the next step only when there is one.
 struct RemoteActionCardView: View {
     let action: RemoteActionCard
     let onRetry: () -> Void

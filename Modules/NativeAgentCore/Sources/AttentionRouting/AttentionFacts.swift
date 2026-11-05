@@ -9,68 +9,30 @@ import PersistenceCore
 import TelegramBot
 import Experiences
 import Transcripts
-// Blueprint: | `AttentionFacts.swift` | Attention importance, origin and delivery projections derive from the common transport verdict; queued and absent evidence never mean accepted |
+import ApprovalInbox
+// Blueprint: | `AttentionFacts.swift` | Shared transport verdicts drive attention; queued or absent evidence never proves acceptance |
 
-/// What KIND of fact a notification carries. This, not the sending subsystem,
-/// decides whether User is interrupted.
-public enum AttentionImportance: String, Sendable, CaseIterable, Codable {
-    /// Agent is blocked on User, or is deliberately reaching for him (an
-    /// approval, a needs-you edge, an explicitly invoked notify tool).
-    case ownerWaiting = "owner_waiting"
-    /// Something went wrong, stalled, or was lost. Bad news travels.
-    case adverse
-    /// A thing finished the way it was supposed to. Never knocks — the rollup
-    /// card already carries it.
-    case routineSuccess = "routine_success"
-    /// News and scheduled deliveries (the morning brief). One phone push; the
-    /// inbox card is the receipt.
-    case informational
-    /// The result of explicitly requested work, from any ingress.
-    case requestedResult = "requested_result"
-
-    /// Map inbox severity to the attention class; unknown severity never interrupts.
-    public static func fromInboxSeverity(_ severity: String) -> AttentionImportance {
-        switch severity.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "critical", "actionable":
-            return .adverse
-        case "important":
-            return .informational
-        default:
-            // "info" and anything unrecognized. An unknown severity is NOT a
-            // reason to interrupt User.
-            return .routineSuccess
-        }
-    }
-}
-
-/// The supplied conversation's surface.
 public enum AttentionSurface: String, Sendable, CaseIterable, Codable {
     case chat
     case ios
     case telegram
-    /// Slack threads can receive knocks from work started there.
     case slack
 }
 
-/// The router's only outputs.
+/// The one door a pinned caller names; every other matter goes to the person's doors.
 public enum AttentionDelivery: String, Sendable, Equatable, Codable {
     case phone
+    case mac
     case telegram
-    /// Back to the exact conversation the fact came from — the Telegram topic
-    /// or Slack thread whose turn produced it. Not a fourth channel to
-    /// configure: it is the channel the PERSON opened, reused.
+    /// Reuse the originating conversation so the reply stays beside the work.
     case conversation
-    case none
 }
 
 /// Authorized destination and thread minted by the originating turn, never an inbound allowlist.
 public struct AttentionOrigin: Sendable, Equatable, Codable {
     public let surface: AttentionSurface
-    /// The conversation on that surface, when there is one. Carried into the
-    /// push payload so a tap lands on the thought's own conversation instead of
-    /// a generic screen.
+    /// Carried in the push payload so a tap opens the fact's own conversation.
     public let sessionId: String?
-    /// The chat/channel to answer into, and the topic/thread within it.
     public let destinationId: String?
     public let threadId: String?
 
@@ -86,9 +48,7 @@ public struct AttentionOrigin: Sendable, Equatable, Codable {
         self.threadId = Self.trimmed(threadId)
     }
 
-    /// From the live reply route of the turn that is asking — the same value
-    /// `codex_message`/`claude_message` already return on. Nil when the route
-    /// names no surface this router can reach.
+    /// Use the asking turn's live reply route; unsupported surfaces have no return route.
     public init?(replyRoute: ChatToolSessionContext.ReplyRoute?, sessionId: String? = nil) {
         guard let replyRoute,
               let surface = AttentionSurface(rawValue: replyRoute.surface.lowercased())
@@ -101,9 +61,26 @@ public struct AttentionOrigin: Sendable, Equatable, Codable {
         )
     }
 
-    /// Can this knock actually be returned to the conversation, or is naming
-    /// the surface all we have? A Mac or iOS conversation has no way in from a
-    /// background actor, so it is not a route — it is a label on the payload.
+    /// Approval origins are written by the chat-tool and live ACP filers; other payloads do not supply a conversation route.
+    public init?(approval: ApprovalRecord) throws {
+        guard let payload = approval.payload.objectValue,
+              payload["kind"] == .string("chat_tool_approval") || payload["kind"] == .string("agent_acp_live_approval"),
+              let value = payload["origin"] else { return nil }
+        guard let origin = value.objectValue, let raw = origin["surface"]?.stringValue else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        // A supported conversation surface is required for a return route; peer and job surfaces have no person transport here.
+        guard let surface = AttentionSurface(rawValue: raw) else { return nil }
+        func optional(_ key: String) throws -> String? {
+            guard let value = origin[key], value != .null else { return nil }
+            guard let string = value.stringValue else { throw CocoaError(.fileReadCorruptFile) }
+            return string
+        }
+        self.init(surface: surface, sessionId: try optional("sessionId"),
+                  destinationId: try optional("destinationId"), threadId: try optional("threadId"))
+    }
+
+    /// Mac and iOS conversations are payload labels: background actors cannot reply into them.
     var canReturnToConversation: Bool {
         guard let destinationId, !destinationId.isEmpty else { return false }
         switch surface {
@@ -120,100 +97,89 @@ public struct AttentionOrigin: Sendable, Equatable, Codable {
 }
 
 public struct AttentionOutcome: Sendable {
-    /// What the routing table chose. `.none` means the class does not knock.
-    public let delivery: AttentionDelivery
-    /// The phone receipt, when a phone push actually went out.
     public let receipt: MobileNotificationDeliveryReceipt?
-    public let transportOutcome: NotificationDeliveryOutcome?
     public let destinationOutcomes: [String: NotificationDeliveryOutcome]
     public var suppressed: Bool {
-        if case .suppressed? = transportOutcome { return true }
-        return false
+        !destinationOutcomes.isEmpty && destinationOutcomes.values.allSatisfy {
+            if case .suppressed = $0 { return true }; return false
+        }
     }
     /// Quiet hours retain the immutable intent without admitting its effect.
     public let deferredForQuietHours: Bool
-    /// Her resident wake's knock in quiet hours: kept in the inbox, sent when they end.
-    public var heldForResidentWake = false
-    /// The knock's own identity (its event and the reason that made it a
-    /// distinct knock): the event id the phone signs its receipt with.
-    public internal(set) var knock: String?
 
     init(
-        delivery: AttentionDelivery,
         receipt: MobileNotificationDeliveryReceipt?,
         deferredForQuietHours: Bool = false,
-        transportOutcome: NotificationDeliveryOutcome? = nil,
         destinationOutcomes: [String: NotificationDeliveryOutcome] = [:]
     ) {
-        self.delivery = delivery
         self.receipt = receipt
         self.deferredForQuietHours = deferredForQuietHours
-        self.transportOutcome = transportOutcome
         self.destinationOutcomes = destinationOutcomes
     }
 
-    static let routineSuccess = AttentionOutcome(delivery: .none, receipt: nil)
-
-    /// The intent remains pending in its ledger through quiet hours.
-    static let quietHours = AttentionOutcome(
-        delivery: .none, receipt: nil, deferredForQuietHours: true)
+    static let routineSuccess = AttentionOutcome(receipt: nil)
 
     /// One projection of the transport outcome; saving the card is a separate fact.
     public enum Delivery: String, Sendable, Equatable {
-        /// The routing table chose no channel: nothing was attempted.
+        /// No channel means no send was attempted.
         case noChannel = "no_channel"
-        /// Quiet hours. The intent is retained; no send was admitted.
+        /// The retained intent waits for quiet hours; no send was admitted.
         case deferred
-        /// Handed to a transport that has not confirmed it reached the device.
+        /// Transport handoff remains unconfirmed at the device.
         case queued
-        /// A transport accepted it.
         case accepted
-        /// Tried, and no channel took it.
         case failed
 
-        /// True only when a transport took the knock. "Not failed" is not this.
-        public var reachedAChannel: Bool { self == .accepted }
     }
 
-    public var deliveryProjection: Delivery {
-        if deferredForQuietHours { return .deferred }
-        if let transportOutcome {
-            switch transportOutcome {
-            case .delivered: return .accepted
-            case .suppressed: return .noChannel
-            case .notDelivered: return .failed
-            case .unknown: return .queued
+    public var destinationProjections: [String: Delivery] {
+        destinationOutcomes.mapValues { outcome in
+            switch outcome {
+            case .delivered: .accepted
+            case .suppressed: .noChannel
+            case .notDelivered: deferredForQuietHours ? .deferred : .failed
+            case .unknown: .queued
             }
         }
-        guard delivery != .none else { return .noChannel }
-        return .failed // No checked transport verdict is never acceptance.
     }
 
-    /// Phone-pinned callers receive signed bridge acceptance and APNS transport
-    /// evidence. Fails loud rather than fabricating it — a receipt must record
-    /// something that actually ran (NORTHSTAR clause 2).
+    /// All unsuppressed destinations must accept; one accepted door cannot settle the others.
+    public var deliveryProjection: Delivery {
+        let projections = destinationProjections.values
+        if projections.contains(.failed) { return .failed }
+        if projections.contains(.queued) { return .queued }
+        if projections.contains(.deferred) { return .deferred }
+        if projections.contains(.accepted) { return .accepted }
+        return .noChannel
+    }
+
+    public var destinationFields: [String: JSONValue] {
+        destinationProjections.mapValues { JSONValue.string($0.rawValue) }
+    }
+
+    /// A phone-pinned call requires its phone publication receipt; other doors cannot supply one or prove phone display.
     public func requireReceipt() throws -> MobileNotificationDeliveryReceipt {
-        if case .suppressed(let preference)? = transportOutcome {
+        if case .suppressed(let preference)? = destinationOutcomes["phone"] {
             throw ToolFailureError("Not sent: this notification channel is off (" + preference + ").", effects: .none,
                 owner: preference, code: "notification_suppressed")
         }
-        if receipt == nil, case .unknown(_, let reason)? = transportOutcome {
+        if receipt == nil, case .unknown(_, let reason)? = destinationOutcomes["phone"] {
             throw ToolFailureError("Phone notification outcome is unknown: " + reason, effects: .unknown,
-                owner: "notify/deliveries.json", code: "notification_unconfirmed",
-                instruction: "Reconcile the retained occurrence before requesting another notification.", recovery: .reconcile)
+                owner: "experiences", code: "notification_unconfirmed",
+                instruction: "Wait for the phone's receipt before requesting another notification.", recovery: .reconcile)
         }
-        if case .notDelivered(let reason)? = transportOutcome {
-            throw ToolFailureError("Phone notification was not delivered: " + reason, effects: .none,
-                owner: "notify/deliveries.json", code: "notification_not_delivered")
-        }
-        if heldForResidentWake {
+        if deferredForQuietHours {
             throw NSError(domain: "AttentionRouter", code: -503, userInfo: [NSLocalizedDescriptionKey:
-                "Held, not sent: the person's quiet hours are on. It waits in the inbox and goes to his phone when they end."])
+                "Held, not sent: the person's quiet hours are on. It goes to the person's doors when they end."])
+        }
+        if case .notDelivered(let reason)? = destinationOutcomes["phone"] {
+            throw ToolFailureError("Phone notification was not delivered: " + reason, effects: .none,
+                owner: "experiences", code: "notification_not_delivered")
         }
         guard let receipt else {
             throw NSError(domain: "AttentionRouter", code: -503, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "notification routed to \(delivery.rawValue); no paired-device receipt exists",
+                    "No paired-device receipt exists; destination outcomes: \(destinationFields)",
             ])
         }
         return receipt

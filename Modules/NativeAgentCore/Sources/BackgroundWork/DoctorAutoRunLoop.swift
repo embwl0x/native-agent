@@ -19,11 +19,10 @@ import ProviderRouting
 import Experiences
 import ToolRegistry
 import Cognition
-// Blueprint: | `DoctorAutoRunLoop.swift` | `DoctorAutoRunLoop` and configured factory; native Doctor ask eligibility and sticky cards with maintenance-assistance prose; Doctor and loop failures owe repair through DoctorReadout; config-bound loop restarts and honest outcomes |
+// Blueprint: | `DoctorAutoRunLoop.swift` | Doctor asks are episodes in ForPerson; measured source checks clear them |
 
 extension MaintenanceBackgroundWork {
-    /// Fresh measurements rebuild the memoizing behavioural checks.
-    /// Event-driven measurements pass true; periodic sweeps retain the memo.
+    /// Event-driven measurements rebuild memoized checks; the Doctor's rhythm retains the memo.
     public func makeAutoDoctorLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         intervalSeconds: TimeInterval? = nil,
@@ -43,112 +42,72 @@ extension MaintenanceBackgroundWork {
         )
     }
 
-    /// What Doctor could not repair itself — sign-ins and permissions — goes
-    /// to User as ONE inbox card listing every step. The card updates in place,
-    /// keeps his read/dismiss status while the list is unchanged, and is
-    /// archived and marked cleared once nothing is left to ask.
+    /// One episode groups the steps the person must take; a measured clear ends it before any later recurrence.
     public func fileDoctorAsk(dataRoot: URL, rows: [CheckResult]) async -> Bool {
-        let cardID = "doctor-ask"
-        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        let asks: [JSONValue] = rows.filter(DoctorSafeRepairPolicy.isUserAsk).compactMap { row in
-            row.human_action.map { .object(["title": .string(row.title), "action": .string($0)]) }
-        }
+        // No measurements cannot prove the previous condition cleared.
+        guard !rows.isEmpty else { nativeLog("[Doctor] ask clearance unavailable: no checks measured"); return false }
         do {
+            let previous = try await ForPerson.at(dataRoot).matters().first { $0.face?.from == "doctor_ask" }
+            if let previous, previous.progress != "resolved", previous.outcome?.domain != "doctor_ask" {
+                let watched = previous.evidence.filter { $0.source == "doctor/latest.json" }.map(\.id)
+                guard !watched.isEmpty, watched.allSatisfy({ id in
+                    rows.contains { $0.id == id && ["healthy", "warning", "failing"].contains(DoctorPlainCopy.bucket(for: $0.status)) }
+                }) else {
+                    nativeLog("[Doctor] ask episode kept: its source checks are missing or unmeasured")
+                    return false
+                }
+            }
+            let requested = rows.filter(DoctorSafeRepairPolicy.isUserAsk).sorted { $0.id < $1.id }
+            let asks: [JSONValue] = try requested.map { row in
+                guard let action = row.human_action, !action.isEmpty else { throw JSONRow.Malformed.field("human_action") }
+                return .object(["title": .string(row.title), "action": .string(action)])
+            }
             guard !asks.isEmpty else {
-                // Cleared whatever User did with the card (read, archived or
-                // dismissed), so a recurrence surfaces fresh.
-                let uncleared = try await inbox.rows().contains { row in
-                    guard case .object(let card) = row, card["id"] == .string(cardID) else { return false }
-                    return card["resolved_reason"] != .string("doctor_clear")
+                if let previous, previous.outcome?.domain != "doctor_ask", previous.progress != "resolved" {
+                    let watched = previous.evidence.filter { $0.source == "doctor/latest.json" }.map(\.id)
+                    guard watched.allSatisfy({ id in rows.contains { $0.id == id && DoctorPlainCopy.bucket(for: $0.status) == "healthy" } })
+                    else {
+                        nativeLog("[Doctor] ask episode kept: its source checks have not measured recovery")
+                        return false
+                    }
                 }
-                if uncleared {
-                    try await inbox.updateStatus(id: cardID, status: "archived", readAt: nil,
-                                                 metadata: ["resolved_reason": .string("doctor_clear")])
-                }
+                try await BodyNotice.resolve(key: "doctor-ask", from: "doctor_ask", dataRoot: dataRoot)
                 return true
             }
             let content = try await port.assistanceCard(dataRoot: dataRoot,
                 input: .object(["kind": .string("doctor"), "asks": .array(asks)]))
-            let detail = content.detail
-            let now = ISO8601DateFormatter().string(from: Date())
-            let title = content.title
-            let newOccurrence = try await inbox.upsert(id: cardID) { existing in
-                var card: [String: JSONValue] = [
-                    "id": .string(cardID),
-                    "created_at": .string(now),
-                    "source": .string("doctor_ask"),
-                    "severity": .string("actionable"),
-                    "title": .string(title),
-                    "summary": .string(content.summary),
-                    "detail": .string(detail),
-                    "related_execution_id": .null,
-                    "related_approval_id": .null,
-                    "related_paths": .array([]),
-                    "related_groups": .array([]),
-                    "actions": .array([
-                        .object(["id": .string("archive"), "label": .string("Archive"),
-                                 "description": .string("Archive this card")]),
-                        .object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                                 "description": .string("Dismiss this card")]),
-                    ]),
-                    "status": .string("unread"),
-                    "read_at": .null,
-                ]
-                // Same list User already saw: keep his status, no resurfacing.
-                if case .object(let previous)? = existing, previous["detail"] == .string(detail),
-                   previous["resolved_reason"] != .string("doctor_clear") {
-                    for key in ["status", "read_at", "created_at"] {
-                        if let value = previous[key] { card[key] = value }
-                    }
-                    return (.object(card), false)
-                }
-                return (.object(card), true)
-            }
-            // Card filing acknowledges Doctor's transition independently of
-            // transport acceptance. Unread failed sends remain eligible.
-            do {
-                guard let value = try await inbox.rows().first(where: {
-                    if case .object(let card) = $0 { return card["id"] == .string(cardID) }
-                    return false
-                }), case .object(let card) = value, card["detail"] == .string(detail),
-                    newOccurrence || card["status"] == .string("unread"),
-                    case .string(let createdAt)? = card["created_at"] else { return true }
-                let eventID = "\(cardID):\(createdAt):\(AttentionRouter.stableDigest(detail))"
-                try await port.routeDoctorAsk(eventID: eventID, title: title, detail: detail)
-            } catch {
-                nativeLog("[Doctor] sign-in ask push failed: %@", error.localizedDescription)
+            try await BodyNotice.tell(key: "doctor-ask", from: "doctor_ask",
+                finding: try JSONValue.array(requested.map { .string($0.id) } + asks).serialize(pretty: false), dataRoot: dataRoot) { id in
+                try await port.tell(Matter(id: id, form: .ask, from: "doctor_ask",
+                    title: content.title, summary: content.summary, words: content.detail,
+                    open: "page:doctor", choices: [.init(id: "archive", label: "Archive"), .init(id: "dismiss", label: "Dismiss")],
+                    evidence: requested.map { .init(source: "doctor/latest.json", id: $0.id) }),
+                    dataRoot: dataRoot, reach: .person(from: nil), turn: nil)
             }
             return true
         } catch {
-            nativeLog("[Doctor] sign-in ask card write failed: %@", error.localizedDescription)
+            nativeLog("[Doctor] sign-in ask could not be told: %@", error.localizedDescription)
             return false
         }
     }
 }
 
-/// Writes bounded Doctor results to `doctor/latest.json` through DoctorReadout.
-///
-/// tick() remains non-throwing, but doctor or storage failure is a typed failed
-/// outcome. A transient error may recover next tick; hiding it as success would
-/// make the health owner lie about the body it is meant to inspect.
+/// Doctor or storage failure must return a failed outcome; hiding it as success would falsify health.
 public struct DoctorAutoRunLoop: LoopRunner {
     public let loopId: String = "doctor_auto_run"
-    public let interval: TimeInterval
+    public let wake: OrganWake
     private let configuration: AutoDoctorConfig
     private let runChecks: @Sendable () async throws -> [CheckResult]
     private let storage: @Sendable () async throws -> URL
 
-    /// `storage` returns the directory that will hold `latest.json`. Default
-    /// resolves to `<defaultDataRoot()>/doctor`. The closure is async/throws
-    /// so callers can plug in env-derived roots or mkdir-on-demand logic
-    /// without forcing the work onto every callsite.
+    /// Async throwing storage resolution supports lazy root creation without forcing it onto every caller.
     public init(
         interval: TimeInterval,
         configuration: AutoDoctorConfig = .init(),
         runChecks: @escaping @Sendable () async throws -> [CheckResult],
         storage: @escaping @Sendable () async throws -> URL = { defaultDoctorStorageDir() }
     ) {
-        self.interval = interval
+        self.wake = .every(interval)
         self.configuration = configuration
         self.runChecks = runChecks
         self.storage = storage
@@ -161,16 +120,12 @@ public struct DoctorAutoRunLoop: LoopRunner {
             // Measurement age starts before checks; runAt remains the snapshot write time.
             let measuredAt = Date()
             let results = try await runChecks()
-            // No checks ran ⇒ nothing was inspected. Persisting `{"checks":[]}`
-            // would be worse than useless: every reader derives "healthy" from
-            // "no check has status fail", so an empty snapshot reads as a clean
-            // bill of health for a body nobody examined.
+            // Readers derive health from checks; an empty unmeasured snapshot would falsely appear healthy.
             guard !results.isEmpty else {
                 return .skipped(reason: "no Doctor checks ran: none produced a result, or another Doctor run was in flight")
             }
             let dir = try await storage()
-            // Two clocks, never one: `runAt` is when this file was written,
-            // `measuredAt` when the checks were asked — the age of the findings.
+            // Snapshot publication time and measurement age are distinct clocks.
             let formatter = ISO8601DateFormatter()
             try await DoctorReadout.persistDoctorSnapshot(
                 results, to: dir.appendingPathComponent("latest.json"),
@@ -183,7 +138,6 @@ public struct DoctorAutoRunLoop: LoopRunner {
     }
 }
 
-/// Default storage directory for DoctorAutoRunLoop's latest.json output.
 public func defaultDoctorStorageDir() -> URL {
     defaultDataRoot().appendingPathComponent("doctor", isDirectory: true)
 }
@@ -220,9 +174,7 @@ public extension MaintenanceBackgroundWork {
             human_action: fix?.step, ask: fix?.ask, owner: nil)], dataRoot: dataRoot)
     }
 
-    /// The error as one plain clause: the human text out of an NSError dump
-    /// (`Error Domain=X Code=N "text" UserInfo={…}`, quotes escaped or not),
-    /// first line, redacted.
+    /// Redact the first plain error clause so NSError metadata cannot leak through the card.
     static func loopFailureCause(_ error: String) -> String {
         if isTelegramTokenRejected(error) { return "Telegram rejected the bot token" }
         var text = NativeAppSecretRedactor.redactText(error)
@@ -245,9 +197,7 @@ public extension MaintenanceBackgroundWork {
         error.lowercased().contains("telegram") && error.contains("notConfigured")
     }
 
-    /// The recovery step for a loop's failure, and whether it is a sign-in or
-    /// a permission; nil when no specific step is known. The failure card and Doctor's
-    /// loop row both read it, so they never disagree.
+    /// Shared recovery wording keeps the failure card and Doctor row consistent; unknown remedies remain nil.
     static func loopSettingFix(loopId: String, error: String) -> (step: String, ask: DoctorAskKind?)? {
         let e = error.lowercased()
         if loopId == "offdisk_backup", e.contains("backup-cadence part failed (") { return (backupCadenceRepairStep, nil) }
@@ -270,9 +220,9 @@ public extension MaintenanceBackgroundWork {
         dataRoot: URL, loopId: String, healthyAt: Date
     ) async -> Bool {
         do {
-            let operation = "operation: doctor.check:" + DoctorLoopRecovery.checkPrefix + loopId
+            let operation = "doctor.check:" + DoctorLoopRecovery.checkPrefix + loopId
             let owed = try await ExperienceStore.at(dataRoot).projection().filter {
-                $0.owes["repair"]?.phase.isSettled == false && $0.claims.contains { $0.claim == operation }
+                $0.owes["repair"]?.phase.isSettled == false && RepairDebt($0).operation == operation
             }
             guard owed.allSatisfy({
                 guard let at = NativeTimestampFormat.parseISO8601FractionalFirst($0.at) else { return false }
@@ -286,13 +236,8 @@ public extension MaintenanceBackgroundWork {
     }
 }
 
-/// Honest result of `BackgroundLoopLifetimes.restartLoop(id:)`.
-///
-/// `.restarted` is the only outcome that means the running loop now reflects
-/// the config on disk. `.requiresRelaunch` means the loop is alive but still
-/// running its launch-time configuration. `.unknown` means this manager has no
-/// such loop registered (or the rebuild left it unregistered) — nothing can be
-/// promised about it either way.
+/// Only restarted proves current configuration is running. Relaunch-required retains captured configuration;
+/// unknown registration proves neither a live loop nor its absence.
 public enum LoopRestartOutcome: Sendable, Equatable {
     case restarted(loopId: String)
     case requiresRelaunch(loopId: String)
@@ -310,8 +255,7 @@ public enum LoopRestartOutcome: Sendable, Equatable {
         }
     }
 
-    /// User-facing sentence for a surface that just asked for a restart.
-    /// `nil` when the restart actually happened and there is nothing to say.
+    /// A successful restart needs no user-facing warning.
     public var surfaceMessage: String? {
         switch self {
         case .restarted:

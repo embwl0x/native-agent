@@ -4,14 +4,14 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ProviderRoutingValues.swift` | Provider and surface scalar interpretation with stable saved JSON vocabulary; saved reasoning-effort projection normalizes spelling and checks the exact route descriptor without substituting another effort; declared OpenRouter no-selector rows admit omission only |
+// Blueprint: | `ProviderRoutingValues.swift` | checked scalar vocabulary; no inferred controls |
 
 extension SwiftNativeProviderRouting {
     nonisolated static func normalizeProviderId(_ raw: String) -> String {
         ProviderFamilyIdentity.normalize(raw)
     }
-    /// Reads `providers/surfaces.json` and returns the explicitly-pinned model for `surface` only when the key is present (and non-empty). Returns nil for any unpinned surface, so dream / REM can fall back to the chat-surface picker
-    /// without confusing a catalog seed for a user pin. Parse `providers/surfaces.json` as nested model/effort/tier controls only as objects. The checked state boundary has already validated string-valued controls.
+    /// Only explicit nonempty pins override group inheritance. Read nested controls from the checked routing owner, never infer a user pick from catalog
+    /// seeds.
     nonisolated static func parseSurfacesFile(_ raw: JSONValue) -> (JSONValue, JSONValue, JSONValue) {
         guard case .object(let obj) = raw, !obj.isEmpty else {
             return (.object([:]), .object([:]), .object([:]))
@@ -37,7 +37,7 @@ extension SwiftNativeProviderRouting {
         }
         return (.object(models), .object(efforts), .object(tiers))
     }
-    /// Identify surfaces with catalog-retired picks so their whole tuple is removed. Unknown OpenRouter/self-hosted IDs remain admitted by this check.
+    /// Only positively retired catalog picks lose their tuple; unknown gateway/self-hosted IDs remain admitted.
     nonisolated static func surfacesWithRetiredPicks(
         _ models: JSONValue,
         accountModels: [String: Set<String>] = [:],
@@ -93,19 +93,21 @@ extension SwiftNativeProviderRouting {
         let supported = supportedReasoningEfforts
             ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: providerID ?? "")
         guard let supported else {
-            throw ProviderRoutingError.configurationFailed("The Think controls for \(model) on \(providerID ?? "the selected account") are unknown. Refresh its catalog in Providers.")
+            throw ProviderRoutingError.configurationFailed(
+                "The Think controls for \(model) on \(providerID ?? "the selected account") are unknown. Refresh its catalog in Providers.")
         }
         if providerID == "openrouter", supported.isEmpty,
            normalized.isEmpty || normalized == "default" { return normalized }
         guard supported.contains(normalized) else {
-            throw ProviderRoutingError.configurationFailed("Think level '\(raw)' is unsupported for \(model). Choose one of \(supported.joined(separator: ", ")) in Providers.")
+            throw ProviderRoutingError.configurationFailed(
+                "Think level '\(raw)' is unsupported for \(model). Choose one of \(supported.joined(separator: ", ")) in Providers.")
         }
         return normalized
     }
     nonisolated static func normalizeServiceTierStatic(_ raw: String) -> String {
         raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
-    /// Read a nonempty string from already checked routing state.
+    /// Scalar reads consume already checked state.
     nonisolated static func stringFrom(_ node: JSONValue, key: String) -> String? {
         guard case .object(let obj) = node, case .string(let value)? = obj[key], !value.isEmpty else { return nil }
         return value

@@ -14,17 +14,12 @@ public enum InjectionApprovalVerification: String, Sendable, Equatable {
     case bodyMismatch = "approval_is_for_a_different_body"
     case alreadyConsumed = "approval_already_consumed"
     case malformedRecord = "approval_record_malformed"
-    /// The DURABLE spend marker could not be recorded (unreadable or corrupt
-    /// marker store, failed write). Fail-closed: an injection whose spend
-    /// cannot be persisted is an injection nothing would stop replaying after
-    /// a restart, so it does not run.
+    /// Refuse if single-use spend cannot persist, or restart could replay the same injection.
     case spendUnavailable = "approval_spend_unrecordable"
 }
 
-/// Requires a resolved-approved canonical inbox record matching the tool,
-/// body digest and any recorded surface, with no completed execution evidence.
-/// The inbox's durable spend enforces single use across tasks, processes and restarts.
-/// Spend precedes `.verified` and remains permanent even when execution fails.
+/// Verify exact canonical approval, tool, body and recorded surface before permanently spending it.
+/// Spend precedes verification success and survives execution failure across tasks, processes and restarts.
 public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
     private let inbox: SwiftNativeApprovalInbox
 
@@ -40,7 +35,8 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
         approvalID: String,
         tool: String,
         surface: String,
-        input: [String: JSONValue]
+        input: [String: JSONValue],
+        turn: Turn
     ) async throws -> InjectionApprovalVerification {
         let id = approvalID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return .recordNotFound }
@@ -63,17 +59,15 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
             ?? record.action
         guard Self.normalized(recordTool) == Self.normalized(tool) else { return .toolMismatch }
 
-        // Surface is checked when the record carries one. A record that predates
-        // the field (or a non-chat filer that omits it) is not silently trusted
-        // for the tool/body checks below — those still run.
+        // Check recorded surface when present; its absence never bypasses the exact tool and body checks.
         if let recordSurface = Self.string(payload["surface"]),
            Self.normalized(recordSurface) != Self.normalized(surface) {
             return .surfaceMismatch
         }
 
         guard case .object(let recordInput)? = payload["input"] else { return .malformedRecord }
-        guard let approvedDigest = MacInjectionApprovalDigest.digest(tool: tool, input: recordInput),
-              let callDigest = MacInjectionApprovalDigest.digest(tool: tool, input: input) else {
+        guard let approvedDigest = MacInjectionApprovalDigest.digest(tool: tool, input: recordInput, turn: turn),
+              let callDigest = MacInjectionApprovalDigest.digest(tool: tool, input: input, turn: turn) else {
             return .malformedRecord
         }
         guard approvedDigest == callDigest else { return .bodyMismatch }

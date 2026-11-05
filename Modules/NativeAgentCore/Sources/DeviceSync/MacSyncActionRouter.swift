@@ -1,7 +1,6 @@
 import Foundation
 import ChatTurnRuntime
 import ChatTurnContracts
-import os
 import ApprovalInbox
 import Cognition
 import CognitiveSubstrate
@@ -13,7 +12,7 @@ import PersistenceCore
 import Desk
 import ProviderRouting
 import Transcripts
-// Blueprint: | `MacSyncActionRouter.swift` | `MacSyncActionRouter` struct; `surfaceSelection`; routing receipts use committed selection snapshots; approval, memory and inbox mutations return affected canonical records/removals for the shared phone projection; no complete inbox or memory lists in action replies; other readback revisions are captured on the Mac before the canonical read |
+// Blueprint: | `MacSyncActionRouter.swift` | `MacSyncActionRouter`, `surfaceSelection`; Canonical mutation receipts and bounded readbacks. |
 
 @MainActor
 struct MacSyncActionRouter {
@@ -70,10 +69,7 @@ struct MacSyncActionRouter {
         ]
     }
 
-    /// A model-control receipt is only successful after the canonical routing
-    /// owner reads back the requested model.  The iPhone must not show a
-    /// successful remote mutation merely because the Mac accepted its inbox
-    /// message.
+    /// Only canonical routing readback proves a model mutation; inbox acceptance cannot claim success.
     nonisolated static func canonicalSurfaceModelResponse(
         surface: String,
         requestedModel: String,
@@ -105,8 +101,7 @@ struct MacSyncActionRouter {
         )
     }
 
-    /// Publish organism evidence only after the canonical phone-delivery receipt is durable.
-    /// Receipt direction is explicit in the current phone schema.
+    /// Publish organism evidence only after the canonical phone-delivery receipt is durable. Receipt direction is explicit in the current phone schema.
     static func notificationReceiptResponse(
         payload: [String: String],
         confirm: (String, String, String) async -> Bool,
@@ -159,8 +154,7 @@ struct MacSyncActionRouter {
     unowned let sync: DeviceSync
     var cancelChatTask: (String, [String]) -> MacSyncEngine.MacSyncChatCancelOutcome
 
-    /// The runs a cancelChat action names, if any. An empty result means the
-    /// caller did not name one and the session's current turn is the target.
+    /// No named run means the session's current turn; named runs must never silently retarget it.
     static func cancelChatRunIDs(from payload: [String: String]) -> [String] {
         let raw = payload["runId"] ?? ""
         return raw
@@ -213,8 +207,10 @@ struct MacSyncActionRouter {
         do {
             switch action.action {
             case "set_trust_policy": return observed(try await applyTrustAction(payload))
-            case "create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job", "cancel_scheduler_job": return observed(try await schedulerAction(action.action, payload: payload))
-            case "get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message": return observed(try await helpersAction(action.action, payload: payload))
+            case "create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job",
+                "cancel_scheduler_job": return observed(try await schedulerAction(action.action, payload: payload))
+            case "get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread",
+                "send_agent_message": return observed(try await helpersAction(action))
             case "set_connector_enabled", "disconnect_connector": return observed(try await connectorAction(action))
             case "disconnect_telegram", "set_telegram_settings": return await telegramAction(action)
             case "chat_history_page": return observed(try await chatHistoryPage(action))
@@ -278,36 +274,12 @@ struct MacSyncActionRouter {
                     .appendNote(handle, text: note)
                 return observed(["status": "ok", "handle": handle])
 
-            case "submitWorkshopTask":
+            // Phone builds in hand still name it submitWorkshopTask.
+            case "submitDeskTask", "submitWorkshopTask":
                 let title = payload["title"] ?? "iOS Desk Task"
                 let objective = payload["objective"] ?? ""
-                let result = try await api.submitWorkshopExecution(title: title, objective: objective)
-                var response = [
-                    "status": "ok",
-                    "deskHandle": result.desk_handle ?? "",
-                    "deskAlias": result.desk_alias ?? "",
-                ]
-                if let executionID = result.executionId {
-                    response[InboxActionExecutionIdVocabulary.wireKey] = executionID
-                }
-                return response
-
-            case "approveStep", "rejectStep":
-                let rejecting = action.action == "rejectStep"
-                let executionId = InboxActionExecutionIdVocabulary.executionId(payload) ?? ""
-                let stepId = payload["stepId"] ?? ""
-                guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
-                    let response = ["status": "error", "error": "missing_real_step_id"]
-                    return rejecting ? observed(response) : response
-                }
-                try await api.resolveWorkshopStep(
-                    executionId: executionId,
-                    stepId: stepId,
-                    decision: rejecting ? "reject" : "approve",
-                    provenance: .signedIOS(clientID: action.clientId, decidedBy: "ios_signed_operator")
-                )
-                let response = ["status": "ok"]
-                return rejecting ? observed(response) : response
+                let result = try await api.submitDeskTask(title: title, objective: objective)
+                return ["status": "ok", "deskHandle": result.desk_handle, "deskAlias": result.desk_alias, "job": result.job]
 
             case "approveMemoryProposal":
                 let proposalId = payload["proposalId"] ?? ""
@@ -336,6 +308,22 @@ struct MacSyncActionRouter {
                         decision: String(action.action.dropLast("Approval".count)), action: action)
                 }
                 return action.action == "approveApproval" ? response : observed(response)
+
+            case "faceAction":
+                guard let page = payload["page"], !page.isEmpty,
+                      let row = payload["row"], !row.isEmpty,
+                      let faceAction = payload["action"], !faceAction.isEmpty else {
+                    return observed(["status": "error", "ok": "false", "code": "invalid_face_action",
+                                     "message": "faceAction requires page, row and action."])
+                }
+                do {
+                    let words = try await api.faceAction(page: page, row: row, action: faceAction, value: payload["value"], device: action.clientId)
+                    var response = ["status": "ok", "ok": "true"]
+                    if let words { response["message"] = words }
+                    return observed(response)
+                } catch let error as PartCallError {
+                    return observed(["status": "error", "ok": "false", "code": error.code, "message": error.message])
+                }
 
             case "interaction_action":
                 guard action.payload.count == 1,
@@ -456,8 +444,7 @@ struct MacSyncActionRouter {
                 return observed(await steerChat(payload))
 
             case "cancelChat":
-                // A discarded target spelling must not become "Stop the current
-                // turn" when the current run/session field was not supplied.
+                // A discarded target spelling cannot turn a missing run/session into Stop-current.
                 guard Set(payload.keys).isSubset(of: ["sessionId", "source", "sourceKey", "runId"]) else {
                     return observed(["status": "error", "ok": "false", "code": "invalid_payload",
                         "message": "cancelChat requires current sessionId, source, sourceKey and runId fields."])
@@ -478,12 +465,7 @@ struct MacSyncActionRouter {
                             "message": "cancelChat rejected an invalid sessionId.",
                         ])
                     }
-                    // A Stop that names its runs is the Mac's own Stop when one
-                    // of them is in flight here, from whichever door started it:
-                    // the shared turn owner keeps those exact requested ids
-                    // through the marker write (never a later run). A named
-                    // run not yet here is held in its admission row — dispatch
-                    // refuses it — and that is said as pending, never as a stop that happened.
+                    // Stop retains exact requested ids across the marker write; absent runs remain pending admission refusals, never claimed stops.
                     let runIDs = Self.cancelChatRunIDs(from: payload)
                     for runID in runIDs {
                         try await iCloudBridge.recordChatStop(session: safeSessionId, runID: runID, dataRoot: sync.dataRoot)
@@ -650,7 +632,10 @@ struct MacSyncActionRouter {
                 return observed(response)
 
             case "mac_control":
-                return try await api.remoteMacControl(payload: payload)
+                // A signed phone action starts its own act on the phone's verified door.
+                let request = TurnRequest(message: "", sessionID: nil, surface: "ios",
+                    envelope: TurnEnvelope(surface: "ios", commandSignatureVerified: true), pinnedRunID: action.msgId)
+                return try await api.remoteMacControl(payload: payload, turn: request.turn())
 
             default:
                 return observed(["status": "error", "message": "Unknown action: \(action.action)"])
@@ -725,7 +710,6 @@ struct MacSyncActionRouter {
             }
             if !liveWaiter {
                 message = message ?? row.detail.map { String($0.unicodeScalars.prefix(512)) }
-                // Preserve the bounded execution-description wire field.
                 var execution: [String: Any] = [:]
                 if let status { execution["status"] = status }
                 if let error { execution["error"] = error }
@@ -759,27 +743,27 @@ struct MacSyncActionRouter {
 }
 
 extension MacSyncActionRouter {
-    /// The phone's Steer, admitted on the control lane so it reaches the turn
-    /// already working in that chat while it runs: she reads it at her next
-    /// step, as on the Mac and Telegram. The phone hears "steered" once a
-    /// round has read it, or "steer_returned" when the turn ended first (with
-    /// its original run identity), and then sends it as its own
-    /// message. No working turn for this door: not taken, said so at once.
+    /// The phone's Steer (builds 49-51): its words are an ios arrival through the one admission. Read by the agent's turn in progress,
+    /// the phone hears "steered"; if its own place comes first, "steer_returned" and the phone sends them through its chat door.
     func steerChat(_ payload: [String: String]) async -> [String: String] {
         guard let sessionId = payload["sessionId"].flatMap(NativeAgentChatSessionID.normalizedPathComponent),
               let runId = payload["runId"], UUID(uuidString: runId) != nil,
               let text = payload["text"], !text.isEmpty, text.utf8.count <= 64_000 else {
             return ["status": "error", "ok": "false", "message": "steerChat needs a chat, a run id and its words."]
         }
-        let routeKey = payload["routeKey"] ?? ""
+        // The phone names its device on every steer; outcome notices go to that device alone, never to every phone.
+        guard let routeKey = payload["routeKey"], AgentBridgeCompletionRoute.isValidIOSDeviceRouteKey(routeKey) else {
+            return ["status": "error", "ok": "false",
+                    "message": "steerChat needs routeKey naming this iPhone (accepted: iphone, iphone:<device name>); nothing was steered."]
+        }
         let route = ChatToolSessionContext.ReplyRoute(surface: "ios", sourceKey: routeKey, replyTo: "iphone", correlationId: runId)
         let bridge = sync.bridge
-        func tell(_ kind: String, _ words: String, _ extra: [String: String] = [:]) async -> Bool {
+        func tell(_ kind: String, _ words: String) async -> Bool {
             let id = "steer-" + MacSyncSnapshotIntegrity.digest(Data("\(runId)\n\(kind)".utf8))
             do {
                 _ = try await bridge.sendChatMessage(text: words, sessionID: sessionId, correlationID: runId,
                     metadata: ["kind": kind, "transport": "icloud", "source": "mac", "replyTo": "iphone",
-                               "targetSourceKey": routeKey].merging(extra) { $1 }, messageID: id)
+                               "targetSourceKey": routeKey], messageID: id)
                 return true
             } catch {
                 bridge.syncStatus = "Phone steering outcome delivery remains owed: \(error.localizedDescription)"
@@ -787,34 +771,29 @@ extension MacSyncActionRouter {
                 return false
             }
         }
-        // 0 offered, 1 reserved (its row written), 2 read.
-        let phase = OSAllocatedUnfairLock(initialState: 0)
-        let taken = await ChatTurnSteering.shared.offer(ChatTurnSteering.Offer(id: "ios-steer:" + runId, text: text,
-            envelope: TurnEnvelope(surface: "ios", deliveryRoute: route), origin: nil, runID: runId),
-            sessionId: sessionId, onDelivered: { offer, committed in
-                let read = !committed && offer.receivingTurnID != nil
-                let next = phase.withLock { phase -> Bool in
-                    switch (phase, committed, read) {
-                    case (0, false, false): phase = 1; return true
-                    case (1, false, true): phase = 2; return true
-                    case (2, false, true): return true
-                    case (2, true, _): return true
-                    default: return false
-                    }
-                }
-                // Reading belongs to this turn. The retained phone notice owns
-                // its delivery repair and cannot un-read or abort her answer.
-                if next, read { _ = await tell("steered", "Read in the reply in progress") }
-                return next
-            }, onReturned: { _ in
-                // A model already read phase 2 even if its phone notification
-                // failed. Re-signal that outcome; never ask for a duplicate turn.
-                if phase.withLock({ $0 }) == 2 {
-                    _ = await tell("steered", "Read in the reply in progress")
-                } else {
-                    _ = await tell("steer_returned", "Sending it as its own message", ["rowWritten": phase.withLock { $0 } == 1 ? "true" : "false"])
-                }
-            })
-        return ["status": "ok", "ok": "true", "steered": taken ? "true" : "false"]
+        guard await ChatTurnSteering.shared.isTurnOpen(sessionId: sessionId) else {
+            return ["status": "ok", "ok": "true", "steered": "false"]
+        }
+        let turn = TurnRequest(message: text, sessionID: sessionId, surface: "ios",
+            envelope: TurnEnvelope(surface: "ios", commandSignatureVerified: true, deliveryRoute: route),
+            verifiedSessionID: sessionId, replyRoute: route, pinnedRunID: runId).turn()
+        let wait = Task {
+            try await TurnAdmission.shared.run(dataRoot: PersistenceCore.defaultDataRoot(), sessionID: sessionId,
+                arrival: TurnArrival(words: text, surface: "ios", row: .shown), turn: turn) { _ in }
+        }
+        let engine = sync.engine
+        engine.waitingSteers[sessionId, default: [:]][runId] = { wait.cancel() }
+        Task {
+            let result = await wait.result
+            engine.waitingSteers[sessionId]?[runId] = nil
+            switch result {
+            case .success(.steered): _ = await tell("steered", "Read in the reply in progress")
+            // Stopped while it waited: the phone settles it in its own steered shape, and never sends it again.
+            case .failure(let error) where error is CancellationError: _ = await tell("steered", "Stopped before it was read")
+            // Its own place came, or admission refused it: the phone's own chat door then owns it.
+            case .success(.ran), .failure: _ = await tell("steer_returned", "Sending it as its own message")
+            }
+        }
+        return ["status": "ok", "ok": "true", "steered": "true"]
     }
 }

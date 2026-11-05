@@ -8,11 +8,10 @@ import ProviderRouting
 import MacIntegration
 import MacControl
 
-// Blueprint: | `InlineInteractionResolver+ChatLifecycle.swift` | `InlineInteractionResolver` owns local and signed-phone control effects with retained provenance, local OS prompts, permission return checks and verified card settlement |
+// Blueprint: | `InlineInteractionResolver+ChatLifecycle.swift` | `InlineInteractionResolver`; Verify control effects. |
 
 extension InlineInteractionResolver {
-    /// Adjacent identical declined or failed asks render once, at the newest
-    /// receipt, with a repeat count. Separated asks remain separate events.
+    /// Adjacent identical declined or failed asks render once, at the newest receipt, with a repeat count. Separated asks remain separate events.
     private static func collapsingAnsweredRepeats(
         _ pairs: [(rowID: String, interaction: InlineInteraction)]
     ) -> (pairs: [(rowID: String, interaction: InlineInteraction)], counts: [String: Int]) {
@@ -44,15 +43,12 @@ extension InlineInteractionResolver {
         return (kept, counts)
     }
 
-    /// The transcript owner uses this collapse for every card surface.
     public struct CollapsedCards {
         public var pairs: [(rowID: String, interaction: InlineInteraction)]
-        /// How many asks each surviving line stands for, by interaction id.
         public var counts: [String: Int]
         /// Folded asks exclude superseded rows, which still have a quiet line.
         public var foldedCount: Int
 
-        /// One heading for the distinct visible lines and their folded asks.
         public var heading: String {
             let cards = pairs.count == 1 ? "1 card" : "\(pairs.count) cards"
             return foldedCount > 0 ? "\(cards), \(foldedCount) folded" : cards
@@ -71,8 +67,7 @@ extension InlineInteractionResolver {
         )
     }
 
-    /// What makes two asks the same ask: what is needed, what it is needed
-    /// for, and which axis. Not the wording, and not the tool that hit it.
+    /// Ask identity follows need, purpose and axis, independently of wording or the blocked tool.
     private static func askKey(_ interaction: InlineInteraction) -> String {
         "\(interaction.kind.rawValue)|\(interaction.target)|\(interaction.mode?.rawValue ?? "")"
     }
@@ -106,7 +101,7 @@ extension InlineInteractionResolver {
     public static func runControl(
         _ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor,
         sessionID: String, value: String?, choice: String?, values: [String: String],
-        fullSetup: Bool, controls: any InlineInteractionControlPort, dataRoot: URL,
+        fullSetup: Bool, turn: Turn, controls: any InlineInteractionControlPort, dataRoot: URL,
         present: @MainActor (InlineInteractionDescriptor.Control) -> Void,
         watch: @MainActor () -> Void, refresh: @MainActor () async -> Void
     ) async {
@@ -123,9 +118,7 @@ extension InlineInteractionResolver {
         }
         switch descriptor.control {
         case .internetAccounts:
-            // Mail's card does what Mail's readiness says: the card is the person's
-            // yes to reading Mail, one check lets macOS ask to control Mail, and
-            // Internet Accounts opens only when Mail has no account to read.
+            // Mail readiness determines the control: check permission first, and open Internet Accounts only for a missing account.
             do {
                 _ = try await MacIntegrationPermissionStore(dataRoot: dataRoot).setWithReceipt(
                     integrationId: "mail", read: true, write: nil, actionID: "\(interaction.id)-mail",
@@ -149,7 +142,7 @@ extension InlineInteractionResolver {
                 await refresh()
                 return
             }
-            if let error = await controls.setUpChromeControl() {
+            if let error = await controls.setUpChromeControl(turn: turn) {
                 await finish(selection: "chrome", error: error)
             } else {
                 watch()
@@ -196,8 +189,7 @@ extension InlineInteractionResolver {
         }
     }
 
-    /// One effect dispatcher for a local control or an authenticated phone tap.
-    /// Phone provenance reaches the permission owner; OS prompting stays local.
+    /// One effect dispatcher for a local control or an authenticated phone tap. Phone provenance reaches the permission owner; OS prompting stays local.
     static func applyControlEffect(
         _ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor, value: String?, values: [String: String],
         controls: any InlineInteractionControlPort, dataRoot: URL, phone: (actionID: String, clientID: String)? = nil
@@ -246,11 +238,11 @@ extension InlineInteractionResolver {
             do { selection = try await selectionForReturn(current, dataRoot: dataRoot) }
             catch {
                 _ = try await complete(id: id, sessionID: sessionID, expectedRevision: current.revision,
-                    setupError: error.localizedDescription, dataRoot: dataRoot)
+                    setupError: error.localizedDescription, turn: nil, dataRoot: dataRoot)
                 continue
             }
             _ = try await complete(id: id, sessionID: sessionID, selection: selection,
-                scope: current.kind == .modelChoice ? .persistent : nil, expectedRevision: current.revision, dataRoot: dataRoot)
+                scope: current.kind == .modelChoice ? .persistent : nil, expectedRevision: current.revision, turn: nil, dataRoot: dataRoot)
             } catch { recordControlFailure(id, dataRoot: dataRoot, error: error) }
         }
     }
@@ -260,10 +252,7 @@ extension InlineInteractionResolver {
         controls: any InlineInteractionControlPort,
         dataRoot: URL, phone: (actionID: String, clientID: String)? = nil
     ) async throws -> Bool {
-        // Every capability in the chain, in one grant — the card asked once.
-        // The need carries the axis the blocked call wanted, so each capability
-        // gets THAT axis and no more, which is exactly what the card's scope
-        // lines told the person they were allowing.
+        // Grant only the requested axis across the whole chain, matching the scope the card showed.
         let mode = interaction.mode
         var categories: [String] = []
         for capability in interaction.allTargets {
@@ -280,10 +269,7 @@ extension InlineInteractionResolver {
                     actionID: "\(phone?.actionID ?? interaction.id)-\(capability)",
                     surface: phone == nil ? "inline_card" : "ios",
                     provenance: phone.map { .signedIOS(clientID: $0.clientID) } ?? .local(),
-                    // The card asked for ONE axis and says so on its scope
-                    // line; granting it must not revoke the other one the
-                    // person already gave. Additive, merged under the store's
-                    // own lock.
+                    // Merge the requested axis under the store lock so granting it cannot revoke the other axis.
                     onlyAddingAxes: true
                 )
             } catch {
@@ -294,8 +280,7 @@ extension InlineInteractionResolver {
             await controls.grantMacControlCategories(categories, dataRoot: dataRoot, logTag: phone == nil ? "interaction" : "signed-phone-card")
         }
         guard phone == nil else { return false }
-        // macOS is asked only for what the app side actually allowed: a Trust
-        // write refused outside Full Mac never leads to a macOS prompt.
+        // macOS is asked only for what the app side actually allowed: a Trust write refused outside Full Mac never leads to a macOS prompt.
         let granted: [String: MacIntegrationPermission]
         if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
             granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked()
@@ -309,13 +294,9 @@ extension InlineInteractionResolver {
             }
             return (granted[capability]?.read ?? false) || (granted[capability]?.write ?? false)
         }
-        if try await platform.askMacOSForCard(allowed, mode: mode) {
-            return true
-        }
-
-        // The store is re-read by the resolver; a capability that did not take
-        // fails the card rather than settling it.
-        return false
+        // The card keeps running while macOS leaves anything unresolved, or while a grant waits on the restart only this card's tap performs.
+        let unresolved = try await platform.askMacOSForCard(allowed, mode: mode)
+        return !unresolved.isEmpty || !SystemPermissionPreflight.awaitingLaunch(allowed).isEmpty
     }
 
     public static func setCapabilityFlag(
@@ -323,16 +304,13 @@ extension InlineInteractionResolver {
         controls: any InlineInteractionControlPort,
         dataRoot: URL, askMacOS: Bool = true
     ) async throws -> Bool {
-        // The ONE field the card named, patched into the locked generation
-        // through the same helper `interaction_act` uses. Sending back the
-        // whole cached multimodal block overwrote any other switch the person
-        // had flipped since that cache was read.
+        // Patch only the named field under the owner lock so concurrent changes to other switches survive.
         guard let flag = InlineInteractionRegistry.capabilityFlags[interaction.target] else {
             return false
         }
         await controls.grantCapabilityFlag(policyKey: flag.policyKey, dataRoot: dataRoot, logTag: askMacOS ? "interaction" : "signed-phone-card")
         if askMacOS, flag.id != "screen_capture" || controls.screenCaptureEnabled,
-           try await platform.askMacOSForCard([flag.id], mode: nil) {
+           !(try await platform.askMacOSForCard([flag.id], mode: nil)).isEmpty {
             return true
         }
         // Trust is re-read by the resolver; the tap is not the authority.
@@ -365,9 +343,7 @@ extension InlineInteractionResolver {
             model: option.modelID)
     }
 
-    /// The one way any door answers a model choice: begin on the card's
-    /// revision, save a lasting choice through the Mac's controls, complete
-    /// with what that save did. A door adds only its authentication.
+    /// Every door begins on the card revision and settles from the Mac control's actual save outcome.
     public static func answerModelChoice(
         _ card: InlineInteraction, sessionID: String, picked: String, scope: InlineInteraction.Scope?,
         attribution: String? = nil, controls: @MainActor () -> (any InlineInteractionControlPort)?, dataRoot: URL
@@ -406,7 +382,7 @@ extension InlineInteractionResolver {
             } catch { setupError = error.localizedDescription }
         }
         return try await complete(id: card.id, sessionID: sessionID, selection: picked, scope: scope,
-            expectedRevision: expectedRevision, attribution: attribution, setupError: setupError, dataRoot: dataRoot)
+            expectedRevision: expectedRevision, attribution: attribution, setupError: setupError, turn: nil, dataRoot: dataRoot)
     }
 
     public static func settleVerifiedControls(
@@ -421,18 +397,51 @@ extension InlineInteractionResolver {
         return allSettled
     }
 
-    /// Complete against the session captured at the tap; a control can outlive
-    /// a conversation switch, and a refusal must not disappear into UI refresh.
+    /// Complete against the session captured at the tap; a control can outlive a conversation switch, and a refusal must not disappear into UI refresh.
     public static func completeControl(
         _ id: String, sessionID: String, expectedRevision: Int, selection: String?, scope: InlineInteraction.Scope?,
         setupError: String?, note: String?, dataRoot: URL
     ) async {
         do {
             _ = try await complete(id: id, sessionID: sessionID, selection: selection,
-                scope: scope, expectedRevision: expectedRevision, setupError: setupError, note: note, dataRoot: dataRoot)
+                scope: scope, expectedRevision: expectedRevision, setupError: setupError, note: note, turn: nil, dataRoot: dataRoot)
         } catch {
             recordControlFailure(id, dataRoot: dataRoot, error: error)
         }
+    }
+
+    /// A running permission card carries itself: on every wake it re-reads macOS, records the one item it now waits on, and when that moved off the item
+    /// it waited on, asks for the new one, which opens its pane. Only a tap starts a walk, so a pending card is never driven. The walk begins once the tap's
+    /// own ask has handed the card over (`handed`) or the card already recorded an item; its first read only records, because the tap opened that pane.
+    static func walk(id: String, sessionID: String, handed: Bool, dataRoot: URL) async {
+        let current: InlineInteraction
+        do {
+            guard let found = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else { return }
+            current = found
+        } catch {
+            recordControlFailure(id, dataRoot: dataRoot, error: error)
+            return
+        }
+        guard current.kind == .permission, case .running = current.state, handed || current.waitingOn != nil,
+              descriptor(for: current, dataRoot: dataRoot).control == .macPermissionGrant else { return }
+        let now = await SystemPermissionPreflight.waitingOn(current.allTargets, mode: current.mode)
+        guard now != current.waitingOn, !Task.isCancelled else { return }
+        var moved = current
+        moved.waitingOn = now
+        moved.revision += 1
+        let revision = current.revision
+        do {
+            try await persist(moved, sessionID: sessionID, dataRoot: dataRoot, expecting: { card in
+                guard case .running = card.state else { return false }
+                return card.revision == revision
+            })
+        } catch {
+            recordControlFailure(id, dataRoot: dataRoot, error: error)
+            return
+        }
+        guard current.waitingOn != nil, case .target(let next)? = now else { return }
+        do { _ = try await platform.askMacOSForCard([next], mode: current.mode) }
+        catch { recordControlFailure(id, dataRoot: dataRoot, error: error) }
     }
 
     static func recordControlFailure(_ id: String, dataRoot: URL, error: any Error) {
@@ -445,11 +454,7 @@ extension InlineInteractionResolver {
 }
 
 extension InlineInteractionResolver {
-    /// Every open permission card settles by itself the moment its permission
-    /// is there: on launch, when the app becomes active, when System Settings
-    /// quits, or when a permission source learns of a grant in-process (a
-    /// Location answer). The cards come from the inbox on disk, so a card
-    /// filed under an earlier build or never touched settles like any other.
+    /// Re-read durable open cards on permission-source events so grants settle even without a tap on this card.
     @MainActor
     public final class GrantWatch {
         public static let shared = GrantWatch()
@@ -505,7 +510,6 @@ extension InlineInteractionResolver {
             generation == identity && !Task.isCancelled
         }
 
-        /// A card the person just acted on, with the view to refresh when it settles.
         public func watchUntilGranted(_ id: String, sessionID: String, dataRoot: URL, refresh: @escaping @MainActor () async -> Void) {
             guard let wake, permissionSource?.isCancelled == false else { return }
             let key = dataRoot.standardizedFileURL.path + ":" + id
@@ -521,7 +525,10 @@ extension InlineInteractionResolver {
             catch {
                 RepairOwed.owe(dataRoot, id: "interaction-card-census", kind: .act,
                     operation: "interaction.cards", owner: "inbox",
-                    words: "Open permission cards could not be read: \(error.localizedDescription). Repair the inbox; no card has been declared absent or settled.")
+                    words: """
+                        Open permission cards could not be read: \(error.localizedDescription). Repair the inbox; no card has been declared absent or \
+                        settled.
+                        """)
                 return
             }
             for card in cards {
@@ -548,6 +555,9 @@ extension InlineInteractionResolver {
                     grantWatches[key] = nil
                     if let refresh = refreshers.removeValue(forKey: key) { completed.append(refresh) }
                     settled = true
+                } else {
+                    await InlineInteractionResolver.walk(id: card.id, sessionID: card.sessionID, handed: grantWatches[key] != nil,
+                        dataRoot: card.dataRoot)
                 }
             }
             guard settled, current(identity) else { return }

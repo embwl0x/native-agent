@@ -1,6 +1,9 @@
 import AppToolRuntime
 import AuthoredCapabilities
+import ChatToolRuntime
+import ChatTurnRuntime
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import Observation
 import PersistenceCore
@@ -17,9 +20,13 @@ public final class PresentationFaces {
     @ObservationIgnored private var epochs: [String:UInt64] = [:]
     public nonisolated init(dataRoot: URL) { self.dataRoot=dataRoot }
 
-    public func words(_ key: String) -> String? {
+    public func words(_ key: String) -> String? { words(key, readyOnly: false) }
+
+    /// A transport carries only ready authored words; local readers may also show the owner's failure diagnostic.
+    public func words(_ key: String, readyOnly: Bool) -> String? {
         if let snapshot=faces[key]?.snapshots["presentation-copy"] {
             if snapshot.status == .ready { return snapshot.face?.sections.first?.rows.first?.title }
+            if readyOnly { return nil }
             return "Readout "+snapshot.status.rawValue+": "+(snapshot.error?.message ?? snapshot.status.rawValue)
         }
         return nil
@@ -38,10 +45,12 @@ public final class PresentationFaces {
         if let existing = faces[key] { face = existing } else {
             let root=dataRoot
             face=PartFaces(dataRoot:root) { id,input,version in
-                let host=AppToolExecutor.authoredProgramHost(dataRoot:root) { _,_ in nil }
-                return await OwnedProgramInvocation.$host.withValue(host) {
-                    await Parts(root:root).face(id:id,input:input,version:version)
-                }
+                let invocation = ChatToolInvocation()
+                let work = ChatTurnWork(toolInvocation: invocation)
+                let execution = AppActionExecution(invocation: invocation, deadlines: work.deadlines, turnWork: work)
+                let host=AppToolExecutor.authoredProgramHost(dataRoot:root, turn: nil, execution: execution) { _,_,_,_ in nil }
+                return await Parts(root: root).face(id: id, input: input, version: version,
+                    invocation: .init(host: host, execution: .init(turn: nil, surface: "presentation", deadlines: execution.deadlines)))
             }
             faces[key] = face
         }

@@ -3,12 +3,10 @@ import UIKit
 import NativeAgentShared
 import CryptoKit
 import SwiftUI
-// Blueprint: | `iCloudBridge+CloudKit.swift` | Shared launch/foreground catch-up with pairing-bound status and retained incomplete refresh; pairing-only resync never waits on incoming setup; its warning shows only after a catch-up read failed, never for one skipped into the foreground receive or still running; fast foreground receive skips busy drains, generation-fenced account recovery and fetch/status cancellation on inactivity/teardown |
+// Blueprint: | `iCloudBridge+CloudKit.swift` | Pairing-bound catch-up/presence; retained incomplete reads, bounded receive and fenced recovery |
 
 extension iCloudBridge {
-    /// Reads the Mac's presence beat (nothing pushes it) into the confirmation,
-    /// and the key the account's pairing record holds: a beat under this
-    /// phone's key may be an old record of a Mac that has since changed keys.
+    /// Read both presence and current pairing key: a beat under an old key cannot prove the Mac still uses this phone's key.
     func readMacPresence() async {
         guard pairingStore?.isRepairingConnection != true,
               let secret = pairingStore?.iCloudPairingSecret else { return }
@@ -86,7 +84,7 @@ extension iCloudBridge {
             transport.observeStatus(
                 key: NAProviderCatalogStatusCodec.statusKey,
                 pairingSecret: { [weak self] in await self?.pairingSecretForPhoneRequests },
-                onApply: { @MainActor [weak self = self] value, writtenAt, originatingPairing in
+                onApply: { @MainActor [weak self = self] value, writtenAt, originatingPairing, _ in
                     guard self?.setupGeneration == generation else { return false }
                     let applied = await iCloudSyncEngine.shared.applyProviderCatalogStatus(value, originatingPairing: originatingPairing) {
                         self?.setupGeneration == generation
@@ -102,13 +100,14 @@ extension iCloudBridge {
                 transport.observeStatus(
                     key: group.statusKey,
                     pairingSecret: { [weak self] in await self?.pairingSecretForPhoneRequests },
-                    onApply: { value, writtenAt, originatingPairing in
+                    onApply: { value, writtenAt, originatingPairing, recovery in
                         guard await self.setupGeneration == generation else { return false }
                         return await iCloudSyncEngine.shared.applyCloudKitSnapshotStatus(
                             value,
                             group: group,
                             originatingPairing: originatingPairing,
-                            writtenAt: writtenAt
+                            writtenAt: writtenAt,
+                            recovery: recovery
                         )
                     }
                 )
@@ -126,8 +125,7 @@ extension iCloudBridge {
         }
     }
 
-    /// Silent pushes can be dropped while suspended. Opening the phone pulls
-    /// the same messages and status as launch, even when already paired.
+    /// Foreground catch-up must read messages/status even when paired because iOS can drop silent pushes while suspended.
     @objc private nonisolated func cloudKitAppDidBecomeActive(_ note: Notification) {
         Task { @MainActor in
             self.startForegroundReceiving()
@@ -148,8 +146,7 @@ extension iCloudBridge {
         foregroundPresenceTask = nil
     }
 
-    /// Chat does not wait behind the many snapshot/status reads. Both push and
-    /// this foreground deadline use the transport's existing single-flight drain.
+    /// Keep Chat independent of bulk snapshot reads; foreground/push receives share the transport's single-flight drain.
     func startForegroundReceiving() {
         guard UIApplication.shared.applicationState == .active || TalkModeController.shared.isActive,
               let transport = deviceTransport else { return }
@@ -167,9 +164,7 @@ extension iCloudBridge {
                     if case .success = result {
                         self.onTransportSucceeded?()
                         if iCloudSyncEngine.shared.cloudKitCatchUpIncomplete, !self.deviceDrainInFlight {
-                            // A coalesced catch-up did not receive this completion.
-                            // Finish its status/cache work with the actual read,
-                            // without holding chat behind it or racing another read.
+                            // Finish coalesced catch-up status/cache work with the actual read without holding Chat or racing another read.
                             Task { @MainActor in
                                 guard self.setupGeneration == generation,
                                       self.pairingStore?.iCloudPairingSecret == pairing,
@@ -214,7 +209,6 @@ extension iCloudBridge {
         guard generation == setupGeneration, !Task.isCancelled else { return }
         _ = await transport.ensurePushSubscriptions()
         guard generation == setupGeneration else { return }
-        // The drain applies pairing before messages, including first pairing.
         _ = await drainDeviceTransportResult(refreshCachedSnapshots: true)
         guard generation == setupGeneration, !Task.isCancelled else { return }
         await readMacPresence()
@@ -232,9 +226,7 @@ extension iCloudBridge {
         return pairingStore.applyCloudKitPairingSecret(secret)
     }
 
-    /// Pairing refresh can be requested by a message being delivered by the
-    /// initial setup drain. Read only pairing here; waiting for incoming setup
-    /// would await the very delivery that called us.
+    /// Pairing refresh may run inside initial message delivery; awaiting that setup drain would deadlock its caller.
     @discardableResult
     func refreshPairingFromCloudKit() async -> Bool {
         guard pairingStore?.isRepairingConnection != true,
@@ -245,24 +237,33 @@ extension iCloudBridge {
         return changed
     }
 
-    /// Drain active CloudKit pairing, messages and status; true means a message was dispatched.
-    /// Overlapping drains coalesce into at most one queued rerun; the transport owns atomic delivery.
+    /// Coalesce overlapping drains into at most one rerun; transport owns atomic message delivery.
     @discardableResult
-    func drainDeviceTransport() async -> Bool {
-        (await drainDeviceTransportResult()).dispatchedCount > 0
+    func drainDeviceTransport(recovery: DeviceSyncRecovery = .init()) async -> Bool {
+        (await drainDeviceTransportResult(recovery: recovery)).dispatchedCount > 0
     }
 
     private func drainDeviceTransportResult(
         refreshCachedSnapshots: Bool = false,
-        completedIncoming: (result: DeviceSyncDrainResult, accountGeneration: UInt64, pairing: Data?)? = nil
+        completedIncoming: (result: DeviceSyncDrainResult, accountGeneration: UInt64, pairing: Data?)? = nil,
+        recovery: DeviceSyncRecovery = .init()
     ) async -> DeviceSyncDrainResult {
-        guard NADeviceSyncRecoveryBudget.hasTime, let ck = deviceTransport else { return .skipped(0) }
+        guard recovery.hasTime, let ck = deviceTransport else { return .skipped(0) }
         let generation = setupGeneration
-        await deviceIncomingSetupTask?.value
-        guard generation == setupGeneration, NADeviceSyncRecoveryBudget.hasTime else { return .skipped(0) }
+        if let setup = deviceIncomingSetupTask {
+            if let deadline = recovery.deadline {
+                do {
+                    try await OperationWaitBudget.withDeadline(seconds: max(0, deadline.timeIntervalSinceNow)) { _ in
+                        await setup.value
+                    }
+                } catch { return .skipped(0) } // Setup keeps its own task; expiry ends only this recovery wait.
+            } else {
+                await setup.value
+            }
+        }
+        guard generation == setupGeneration, recovery.hasTime else { return .skipped(0) }
         let sync = iCloudSyncEngine.shared
-        // Retain the requested catch-up before coalescing. The active or queued
-        // drain can finish it; a skipped caller cannot lose the cache refresh.
+        // Retain catch-up before coalescing so a skipped caller cannot lose the owed cache refresh.
         if refreshCachedSnapshots, pairingStore?.isPaired == true {
             sync.cloudKitCatchUpIncomplete = true
         }
@@ -271,53 +272,53 @@ extension iCloudBridge {
         defer {
             if generation == setupGeneration {
                 deviceDrainInFlight = false
+                saveSeenMacRecords()
                 if deviceDrainQueued {
                     deviceDrainQueued = false
-                    if NADeviceSyncRecoveryBudget.hasTime {
-                        Task { await self.drainDeviceTransport() }
+                    if recovery.hasTime {
+                        Task { await self.drainDeviceTransport(recovery: recovery) }
                     }
                 }
             }
         }
         let accountGeneration = completedIncoming?.accountGeneration ?? accountFailureGeneration
-        // Read pairing before a new incoming pull. A completed foreground
-        // read can serve this catch-up only while its pairing is still current.
-        await ck.drainPairing()
-        guard generation == setupGeneration, NADeviceSyncRecoveryBudget.hasTime else { return .skipped(0) }
+        // Reuse foreground read only while its pairing remains current; read pairing before a fresh pull.
+        await ck.drainPairing(recovery: recovery)
+        guard generation == setupGeneration, recovery.hasTime else { return .skipped(0) }
         let result: DeviceSyncDrainResult
         if let completedIncoming {
             guard completedIncoming.pairing == pairingStore?.iCloudPairingSecret else { return .skipped(0) }
-            // Foreground already delivered and reported these messages. Reuse
-            // its outcome; a second pull could just coalesce again.
+            // Reuse the foreground delivery outcome so a second pull cannot merely coalesce again.
             result = completedIncoming.result
         } else {
-            result = await ck.drainIncoming()
+            result = await ck.drainIncoming(recovery: recovery)
         }
         guard generation == setupGeneration else { return .skipped(0) }
         if case .failure(.account(let failure), _) = result {
             recordAccountFailure(failure)
         }
         if completedIncoming == nil, case .success = result { onTransportSucceeded?() }
+        // The launch's first completed drain tries the records it holds once.
+        if case .success = result { await retryHeldMacRecords() }
         let dispatched = result.dispatchedCount
-        if completedIncoming == nil, dispatched > 0 { NADeviceSyncRecoveryBudget.didApplyData?() }
-        guard generation == setupGeneration, NADeviceSyncRecoveryBudget.hasTime else { return result }
-        let statusResult = await ck.drainStatusResult()
+        if completedIncoming == nil, dispatched > 0 { recovery.didApplyData?() }
+        guard generation == setupGeneration, recovery.hasTime else { return result }
+        let statusResult = await ck.drainStatusResult(recovery: recovery)
         guard generation == setupGeneration else { return .skipped(0) }
         if case .success = result, case .success = statusResult {
-            // Only a complete remote pull authorizes a cache read to clear the
-            // stale warning. Partial status handlers cannot clear it meanwhile.
+            // Only a complete remote pull may clear stale-cache warning; partial status handlers cannot.
             if refreshCachedSnapshots || sync.cloudKitCatchUpIncomplete,
                pairingStore?.isPaired == true {
-                guard NADeviceSyncRecoveryBudget.hasTime else { return result }
+                guard recovery.hasTime else { return result }
                 let refreshed = await sync.refreshLightweightSnapshots()
                 guard generation == setupGeneration else { return .skipped(0) }
-                if refreshed { sync.cloudKitCatchUpIncomplete = false; sync.cloudKitCatchUpFailed = false }
+                if refreshed { sync.cloudKitCatchUpIncomplete = false; sync.cloudKitCatchUpFailures = 0 }
             }
         } else if pairingStore?.isPaired == true {
             sync.cloudKitCatchUpIncomplete = true
-            // Only a read that failed is a warning; a skipped one merged into another read and stays owed.
-            if case .failure = result { sync.cloudKitCatchUpFailed = true }
-            if case .failure = statusResult { sync.cloudKitCatchUpFailed = true }
+            // Warn only on failed reads; skipped/coalesced reads remain owed work.
+            if case .failure = result { sync.cloudKitCatchUpFailures += 1 }
+            else if case .failure = statusResult { sync.cloudKitCatchUpFailures += 1 }
         }
         if case .success = result, case .success = statusResult,
            accountGeneration == accountFailureGeneration, accountFailure != nil {
@@ -326,8 +327,7 @@ extension iCloudBridge {
         return result
     }
 
-    /// Only a completed successful read can retire an older account failure.
-    /// A failure reported by any concurrent CloudKit work remains authoritative.
+    /// Only successful completed reads retire account failures; concurrent CloudKit failures remain authoritative.
     private func clearAccountFailureAfterSuccessfulDrain(_ result: DeviceSyncDrainResult, accountGeneration: UInt64, source: String) {
         guard case .success = result, accountGeneration == accountFailureGeneration, accountFailure != nil else { return }
         accountFailure = nil
@@ -335,14 +335,13 @@ extension iCloudBridge {
         NSLog("[phone-pipe] account recovered after successful incoming drain source=%@", source)
     }
 
-    /// Drain only our device-sync subscription pushes while CloudKit is active.
     @discardableResult
-    func drainIfDeviceSyncPush(_ userInfo: [AnyHashable: Any]) async -> Bool {
+    func drainIfDeviceSyncPush(_ userInfo: [AnyHashable: Any], recovery: DeviceSyncRecovery = .init()) async -> Bool {
         guard deviceTransport != nil else { return false }
         #if canImport(CloudKit)
         guard CloudKitDeviceTransport.isDeviceSyncNotification(userInfo)
                 || (userInfo["nativeAgentWake"] as? String) == "notification" else { return false }
-        return await drainDeviceTransport()
+        return await drainDeviceTransport(recovery: recovery)
         #else
         return false
         #endif

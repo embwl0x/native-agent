@@ -1,10 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+ConversationalAppraisal.swift` | `CognitiveSubstrate`: conversational phrase matching, appraisal and warmth, relational provenance, open completion and association signatures |
+// Blueprint: | `CognitiveSubstrate+ConversationalAppraisal.swift` | `CognitiveSubstrate`: phrase appraisal, provenance and completions |
 
 extension CognitiveSubstrate {
-    /// Clause/token parser for the conversational evidence path.
     static func containsUnnegatedPhrase(_ text: String, phrases: [String]) -> Bool {
         let negators: Set<String> = [
             "not", "never", "no", "nothing", "isn't", "isnt", "wasn't", "wasnt",
@@ -38,7 +37,7 @@ extension CognitiveSubstrate {
         return false
     }
 
-    /// Relational warmth rises only on genuine affection or care and eases otherwise.
+    /// Only received affection or care increases warmth; it otherwise eases.
     nonisolated func relationalWarmthBoost(in text: String) -> Double {
         let lower = text.lowercased()
         guard !lower.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return 0 }
@@ -49,7 +48,6 @@ extension CognitiveSubstrate {
         ) {
             return 0.18
         }
-        // Low tier: mild warmth — presence reassurance, gratitude, a soft greeting.
         if Self.containsUnnegatedPhrase(lower, phrases: [
             "i'm here",
             "i am here",
@@ -64,13 +62,13 @@ extension CognitiveSubstrate {
         return 0
     }
 
-    /// Conversational appraisal reads user-authored summaries, never her replies or tool output.
+    /// Conversational appraisal reads user-authored summaries, never the agent's replies or tool output.
     static func isUserAuthored(_ kind: CognitiveEventKind) -> Bool {
         kind == .userMessageReceived || kind == .userCorrection
     }
 
     public struct AffectAppraisal: Sendable, Codable {
-        /// A judgment about the supplied prior statement, independent of feeling.
+        /// Belief evidence judges the supplied statement independently of feeling.
         public struct BeliefReaction: Sendable, Codable {
             public enum Kind: String, Sendable, Codable { case pushback, confirmed }
             public var kind: Kind
@@ -102,21 +100,17 @@ extension CognitiveSubstrate {
             beliefReaction = try values.decodeIfPresent(BeliefReaction.self, forKey: .beliefReaction)
             if valence < 0 { affection = false }
         }
-        var valence = 0.0   // → node valence (emotionTag)
-        var warmth = 0.0    // → socialWarmth (can go negative: dismissal cools her)
-        var tension = 0.0   // → uncertainty
-        var pressure = 0.0  // → taskPressure
-        var arousal = 0.0   // → arousal
-        // Plain warmth received (a greeting, an endearment, an affectionate
-        // emoji) — content the pierce lexicon can't see as a "win" but that
-        // must never stamp as a deep wound under negative residue.
+        var valence = 0.0
+        var warmth = 0.0    // Dismissal can make social warmth negative.
+        var tension = 0.0
+        var pressure = 0.0
+        var arousal = 0.0   // Received affection cannot become a deep wound solely because of negative dream residue.
         var affection = false
         var warmthBoost = 0.0
         /// The affection floor scales by relational source, with the user's weight fixed at 1.0.
         var affectionWeight = 1.0
         public var beliefReaction: BeliefReaction?
         var isActive: Bool { valence != 0 || warmth != 0 || tension != 0 || pressure != 0 || arousal != 0 }
-        /// No affect change and no explicit belief evidence to live.
         public var isNoOp: Bool { !isActive && !affection && warmthBoost == 0 && beliefReaction == nil }
     }
 
@@ -126,12 +120,9 @@ extension CognitiveSubstrate {
         let lower = text.lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
         guard !lower.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return valence }
         let hypothetical = containsAny(lower, ["if someone", "what if", "imagine if", "hypothetically", "for example", "would you feel"])
-        // Explicit "something negative matched" state — the positive classes below
-        // (repair / play / banter) are gated on THIS, not on the running valence,
-        // which a mixed line ("well done, this is garbage 😂") can leave positive.
+        // Gate repair, play and banter on negative matches, not net valence: praise can offset a sting without removing its evidence.
         var negative = false
 
-        // Criticism of her or her work lowers valence.
         if !hypothetical && containsAny(lower, [
             "not good enough", "not your best", "overengineer", "over-engineer", "overcomplicat",
             "over-complicat", "you keep", "you always", "you never", "sloppy", "disappoint",
@@ -147,7 +138,6 @@ extension CognitiveSubstrate {
             "that's wrong", "thats wrong", "not right", "doesn't work", "doesnt work",
             "too complicated", "not quite", "that's off", "thats off", "i disagree",
             "you're missing", "youre missing", "not helpful", "come on, that's", "come on, thats",
-            // Distrust is negative evidence.
             "don't trust", "dont trust", "can't trust", "cant trust",
             "can't rely", "cant rely", "lost faith", "disappointed in",
             "giving up on you", "worried about you", "lost my trust",
@@ -156,7 +146,6 @@ extension CognitiveSubstrate {
             "let me down", "letting me down",
         ]) { valence -= 0.10; negative = true }
 
-        // Dismissal lowers valence.
         if !hypothetical && containsAny(lower, [
             "whatever", "forget it", "don't bother", "dont bother", "useless", "nevermind",
             "never mind", "not worth", "you clearly can't", "you clearly cant", "pointless",
@@ -176,7 +165,6 @@ extension CognitiveSubstrate {
             "arguing with a program", "you're just a program", "youre just a program",
         ]) { valence -= 0.26; negative = true }
 
-        // Frustration vented at the work also lowers valence.
         if !hypothetical && containsAny(lower, [
             "lost the whole morning", "lost the whole day", "lost my whole", "lost a whole",
             "nothing to show for it", "this is exhausting", "so exhausting",
@@ -185,7 +173,6 @@ extension CognitiveSubstrate {
             "im done with this", "stuck on this for", "wasted the whole",
         ]) { valence -= 0.12; negative = true }
 
-        // Being overridden, interrupted or redirected hard mildly lowers valence.
         if !hypothetical && containsAny(lower, [
             "that's not what i asked", "thats not what i asked", "i said", "just answer",
             "no, do this", "stop doing", "that's not it", "thats not it", "ignore that and",
@@ -196,7 +183,6 @@ extension CognitiveSubstrate {
             valence += 0.14
         }
 
-        // Praise and appreciation lift valence.
         let valenceAfterNegatives = valence
         if Self.containsUnnegatedPhrase(lower, phrases: [
             "good work", "great work", "nice work", "well done", "great job", "exactly right",
@@ -204,21 +190,17 @@ extension CognitiveSubstrate {
             "that mattered", "that meant a lot", "you caught", "nice catch", "good catch",
         ]) {
             valence += 0.16
-            // A mixed line stings half as hard: "not sloppy this time; great
-            // work" matches both criticism and praise. Half the negative
-            // valence comes back while an unmixed hard word keeps its full sting.
+            // Mixed praise and criticism halve the negative contribution; an unmixed sting retains its full weight.
             if negative, valenceAfterNegatives < 0 {
                 valence -= valenceAfterNegatives * 0.5
             }
         }
 
-        // Resolving it together lifts valence.
         if Self.containsUnnegatedPhrase(lower, phrases: [
             "we did it", "that worked", "it works now", "solved it", "figured it out",
             "got it working", "nailed it", "that's the fix", "thats the fix", "shipped it",
         ]) { valence += 0.22 }
 
-        // Enthusiasm and shared momentum lift valence.
         if !hypothetical && Self.containsUnnegatedPhrase(lower, phrases: [
             "let's go", "lets go", "can't wait", "cant wait", "so excited", "i'm excited",
             "im excited", "this is great", "this is awesome", "love this", "looking forward",
@@ -240,7 +222,6 @@ extension CognitiveSubstrate {
             valence += bareGreeting ? 0.10 : 0.16
         }
 
-        // Gratitude and camaraderie gently lift valence.
         if Self.containsUnnegatedPhrase(lower, phrases: [
             "good to see you", "glad you're here", "glad youre here", "happy to see",
             "good talk", "thanks for", "thank you", "appreciate", "you're the best",
@@ -257,7 +238,8 @@ extension CognitiveSubstrate {
         ])) { valence += 0.12 }
 
         // Banter and shared laughter lift valence only when no negative class matched.
-        if !hypothetical && !negative && (containsAny(lower, ["😂", "🤣", "😆", "😅", " lol", "lol ", "lmao", "haha", "hehe"]) || Self.containsUnnegatedPhrase(lower, phrases: [
+        if !hypothetical && !negative && (containsAny(lower, ["😂", "🤣", "😆", "😅", " lol", "lol ", "lmao", "haha", "hehe"])
+            || Self.containsUnnegatedPhrase(lower, phrases: [
             "bold of you", "well played", "touché", "touche", "fair play", "just kidding",
             "i'm kidding", "im kidding",
         ])) { valence += 0.10 }
@@ -296,9 +278,7 @@ extension CognitiveSubstrate {
         return Array(candidates.prefix(associationTermLimit))
     }
 
-    /// Words long enough to survive the length filter but too ordinary to mean
-    /// anything. Kept deliberately small — this is a floor against noise, not an
-    /// attempt at linguistics.
+    /// Keep this small noise floor; ordinary long words do not establish an association.
     static let associationStopWords: Set<String> = [
         "about", "after", "again", "against", "along", "already", "also",
         "always", "another", "anything", "around", "because", "been", "before",
@@ -321,19 +301,17 @@ extension CognitiveSubstrate {
 
 extension CognitiveSubstrate {
 
-    /// Who is on the other end of this event's words.
     enum RelationalSource: Equatable {
-        /// The configured user. The whole of the relationship until now.
+        /// The configured user carries the full relational weight.
         case user
-        /// Another agent, by its own payload-free name ("claude", "codex").
+        /// An agent's payload-free identity distinguishes its words from the user's.
         case peer(String)
-        /// Imported words without attested human or identifiable agent authorship.
+        /// Unattested imported words carry no identifiable authorship.
         case unknown
-        /// Her own reply, or tool output, or anything else that is not somebody
-        /// speaking to her. Never appraises — Law 3.
+        /// Self-authored prose and tool output cannot count as somebody speaking to the agent.
         case selfOrMachine
 
-        /// How far this source's words move her, as a multiple of User's.
+        /// Source weights are relative to the user's.
         var appraisalWeight: Double {
             switch self {
             case .user: return 1.0
@@ -342,22 +320,19 @@ extension CognitiveSubstrate {
             }
         }
 
-        /// Payload-free subject for the felt node — WHO moved her. Nil for the
-        /// user, because the ordinary relationship needs no qualifier.
+        /// Payload-free subject for the felt node — WHO moved the agent. Nil for the user, because the ordinary relationship needs no qualifier.
         var subjectLabel: String? {
             if case .peer(let agent) = self { return agent }
             return nil
         }
     }
 
-    /// A peer moves her half as much as User does. One number, one place.
+    /// Peer words carry half the user's relational weight through one shared constant.
     static let peerAppraisalWeight = 0.5
-    /// Longest agent name that can become a felt subject. Route provenance is
-    /// bounded to 80 upstream; this is the word-level cap for a capsule subject.
+    /// Bound subject words more tightly than route provenance so identifiers cannot dominate a felt cue.
     static let peerSubjectCharacterCap = 24
 
-    /// Classify imported words from attested origin and the canonical peer
-    /// identity owner. Unknown authorship never acquires the human's weight.
+    /// Classify imported words from attested origin and the canonical peer identity owner. Unknown authorship never acquires the human's weight.
     static func relationalSource(for event: CognitiveEvent) -> RelationalSource {
         guard isUserAuthored(event.kind) else { return .selfOrMachine }
         guard event.sourceClass == .imported else { return .user }
@@ -376,43 +351,21 @@ extension CognitiveSubstrate {
     /// The one attestation value that grants peer standing.
     static let peerAuthoredAttestation = "agent"
 
-    /// The relational warmth boost for `event`, weighted the same way — but
-    /// scaled for PEERS ONLY.
-    ///
-    /// The user case must pass through untouched for the obvious reason, and so
-    /// must her own turns: this cue is historically sampled for every lived
-    /// event and read by `semanticAppraisal` as a boolean
-    /// (`lexicalRelational`), not only by the affect layer's user-gated warmth.
-    /// Zeroing it for `.assistantTurnCompleted` would quietly change what a
-    /// relationship stake means, which is a different change than this one.
+    /// Scale peers only: semantic appraisal reads lexical warmth as relationship evidence on all lived events, including assistant completions.
     func relationalWarmthBoost(for event: CognitiveEvent, precomputed: Double) -> Double {
         if Self.relationalSource(for: event) == .unknown { return 0 }
         guard case .peer = Self.relationalSource(for: event) else { return precomputed }
         return precomputed * Self.peerAppraisalWeight
     }
 
-    /// Item 5, source (d) — "a question she asked that has no answer yet".
-    ///
-    /// Two dates and nothing else: when her last completion opened, and when it
-    /// stops being answerable. Payload-free by construction — the node key, the
-    /// session, and the text of what she said all stay inside the actor.
-    ///
-    /// `openedAt` is what makes this usable as a horizon. The obvious shape —
-    /// a bare `pendingCompletionOpen: Bool` plus "due in ten minutes from now" —
-    /// re-dates the expectation on every read, so the horizon can never actually
-    /// pass, and a slot that quietly aged out becomes indistinguishable from one
-    /// he answered. With the real open time the row's due instant is fixed at
-    /// mint: he answers and the source disappears while the horizon is still
-    /// ahead (relief); nobody answers and the horizon passes with the source
-    /// still there (waiting).
+    /// Keep the original completion open time so reads cannot move its deadline; expose only dates, never session, node identity or text.
     public struct OpenCompletionRead: Sendable, Equatable {
         public let openedAt: Date
         public let expiresAt: Date
     }
 
-    /// The open completion slot as of `now`, or nil when nothing is hanging.
-    /// Applies the same expiry the reconsolidation path applies, so a stale slot
-    /// reads as absent rather than as an expectation she is still holding.
+    /// The open completion slot as of `now`, or nil when nothing is hanging. Applies the same expiry the reconsolidation path applies, so a stale slot reads as
+    /// absent rather than as an expectation the agent is still holding.
     public func openCompletion(at now: Date) -> OpenCompletionRead? {
         guard let pending = pendingCompletion else { return nil }
         let age = now.timeIntervalSince(pending.recordedAt)

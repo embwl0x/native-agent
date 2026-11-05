@@ -15,8 +15,7 @@ import ProviderRouting
 import AppToolRuntime
 // Blueprint: | `AgentPresence.swift` | Agent presence card and Core Animation breathing orb reflect shared turn state and motion preferences |
 
-/// The agent card shows current activity and shimmers throughout a turn.
-/// Its turn-state reads stay separate from the sidebar's other rows.
+/// Keep turn-state reads separate so updates do not invalidate the sidebar's other rows.
 struct SimpleAgentCard: View {
     let selected: Bool
     @Environment(AppModel.self) private var appModel
@@ -25,10 +24,9 @@ struct SimpleAgentCard: View {
 
     static let radius: CGFloat = 14
 
-    /// The window's serif title.
     static let nameFont = Font.system(size: 28, weight: .semibold, design: .serif)
 
-    /// Show delegation, thinking, replying, an owner wait or presence; steps stay in the transcript.
+    /// Keep steps in the transcript; the card summarizes the current activity.
     private var doing: (text: String, waiting: Bool) {
         if appModel.isBusy || appModel.isChatStreaming,
            let presentation = appModel.engine.turns.lifecycle(for: appModel.activeChatSessionId)?.presentation,
@@ -47,7 +45,6 @@ struct SimpleAgentCard: View {
     var body: some View {
         let name = AgentVoice(name: appModel.agentDisplayName).name
         let line = doing
-        // The rim while the reply streams; before it, the plate shimmers.
         let replying = (appModel.isBusy || appModel.isChatStreaming) && !appModel.engine.turns.isThinkingBeforeReply(for: appModel.activeChatSessionId)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
@@ -75,8 +72,7 @@ struct SimpleAgentCard: View {
         .background { shape.fill(selected ? NativeAgentShell.softFill : .clear) }
         .background { ThinkingGlow(kind: .shimmer, cornerRadius: Self.radius, wholeTurn: true) }
         .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: shape)
-        // A background window loses the glass's own rim; the hairline keeps
-        // the card's edge there.
+        // Keep a hairline because background windows lose the glass rim.
         .overlay {
             if activeState == .inactive || reduceTransparency {
                 shape.strokeBorder(NativeAgentShell.hairline, lineWidth: 1).allowsHitTesting(false)
@@ -98,7 +94,6 @@ private struct SimpleBreathingOrb: View {
     var body: some View {
         BreathingOrbLayer(haze: HazeColor(stored: colorRaw), still: reduceMotion)
             .frame(width: 22, height: 22)
-            // Round the 14pt disc with a 2pt gap.
             .overlay { if replying { WorkingRim(cornerRadius: 8).frame(width: 16, height: 16) } }
             .padding(-4)
             .accessibilityHidden(true)

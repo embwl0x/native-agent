@@ -3,40 +3,29 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import Studio
-// Blueprint: | `StudioWanderLane.swift` | `StudioWanderLane` enum; installation, eligibility, carried-hour state and prompt for studio wandering; explicit run-now wait satisfaction reaches both quiet/refractory policy and locked beginHour without bypassing live-turn admission or reading damaged state as empty |
+// Blueprint: | `StudioWanderLane.swift` | `StudioWanderLane`. |
 
-/// The hour's installation, refractory law and durable trace share cognition's
-/// runtime owner. Installation is resolved before reading state; an absent
-/// lane must leave no receipt. Declining spends the hour just as choosing does.
+/// Resolve installation before state reads so disabled hours leave no receipt; a decline still spends an admitted hour.
 public enum StudioWanderLane {
 
     // MARK: Installation
 
-    /// Whether the lane exists at all in this build/install.
     public enum Installation: Sendable, Equatable {
         case installed
-        /// Named so the absence is legible in a Doctor read or a log line, and
-        /// so "off" and "public build" are never the same observable state.
+        /// Distinguish disabled preference from public-build restriction in diagnostics.
         case notInstalled(reason: String)
 
         public var isInstalled: Bool { self == .installed }
     }
 
-    /// The UserDefaults key behind the Settings switch, beside the Subconscious
-    /// master. Default is OFF: an install that never opened Settings never
-    /// spends her hour, and a public build before onboarding cannot install the
-    /// lane at all.
+    /// Public pre-onboarding builds cannot install this work.
     public static let enabledDefaultsKey = "studioWanderEnabled"
 
-    /// Resolve installation from booleans the caller derives. The public-safety
-    /// read stays app-side (`NativeAgentPublicSafety.shouldForceNeutralOrganism`)
-    /// so this module keeps no Bundle/environment dependency.
-    ///
-    /// - Parameters:
-    ///   - enabled: the stored switch. `nil` means "never chosen" → off.
-    ///   - forcedNeutral: public-safe build that has not completed onboarding.
-    ///   - subconsciousEnabled: the master switch the Settings row sits beside.
-    ///     Her hour is background cognition; it cannot outlive its own master.
+    /// A new agent has the hour from day one; the person can turn it off.
+    public static let enabledByDefault = true
+
+    /// Resolve from caller-supplied choices so this module owns no Bundle/environment dependency.
+    /// Absent hour choice takes `enabledByDefault`; the Subconscious master also bounds installation.
     public static func resolveInstallation(
         enabled: Bool?,
         forcedNeutral: Bool,
@@ -48,7 +37,7 @@ public enum StudioWanderLane {
         guard subconsciousEnabled else {
             return .notInstalled(reason: "subconscious_off")
         }
-        guard enabled == true else {
+        guard enabled ?? enabledByDefault else {
             return .notInstalled(reason: "switch_off")
         }
         return .installed
@@ -56,21 +45,14 @@ public enum StudioWanderLane {
 
     // MARK: Gates
 
-    /// Quiet means quiet: no accepted turn for half an hour. Deliberately the
-    /// SAME interval the identity-dream lane uses
-    /// (`OrganismResidualRepair.dreamQuietInterval`), because it is the same
-    /// question — is she being spoken to right now — and two different answers
-    /// to it would be two different bodies.
+    /// Share the identity-dream half-hour quiet interval so both owners agree whether a conversation is active.
     public static let quietInterval: TimeInterval = 30 * 60
 
-    /// Automatically at most once per day; explicit mind.wander satisfies this
-    /// wait in both decide and beginHour. Mirrors the dream's 24-hour refractory rather than
-    /// a calendar day so a wander at 23:50 cannot be followed by another at
-    /// 00:10.
+    /// Use a rolling 24-hour refractory so midnight cannot admit adjacent hours.
+    /// Explicit mind.wander satisfies only this scheduling wait.
     public static let refractoryInterval: TimeInterval = 24 * 60 * 60
 
-    /// Project the same quiet/refractory boundaries decide uses onto the
-    /// runtime's existing deadline. A live turn is released by its idle edge.
+    /// Project admission's quiet/refractory boundaries on the existing deadline; live turns release through idle edges.
     public static func nextEligibility(now: Date, lastTurnActivityAt: Date?, lastWanderAt: Date?) -> Date? {
         [lastTurnActivityAt?.addingTimeInterval(quietInterval),
          lastWanderAt?.addingTimeInterval(refractoryInterval)]
@@ -78,32 +60,17 @@ public enum StudioWanderLane {
     }
 
     public enum Decision: String, Sendable, Equatable, CaseIterable {
-        /// Every gate is satisfied: she may spend the hour now.
         case wander
-        /// The lane is not installed. Never produced by `decide` — the caller
-        /// must not reach `decide` at all when the switch is off — but named so
-        /// a receipt or a test can say it.
+        /// Resolve installation before decide so disabled work cannot enter admission.
         case notInstalled = "not_installed"
-        /// A turn is running or still settling. Her hour is not for the middle
-        /// of a conversation.
+        /// Do not run an unattended hour during an active or settling turn.
         case turnInFlight = "turn_in_flight"
-        /// Something happened inside the quiet window.
         case notQuiet = "not_quiet"
-        /// She already had her hour inside the refractory.
         case alreadyToday = "already_today"
     }
 
-    /// THE WHOLE LAW.
-    ///
-    /// - Parameters:
-    ///   - now: the caller's clock (injected; this type never reads one).
-    ///   - turnInFlight: the runtime's own latch.
-    ///   - lastTurnActivityAt: the most recent instant a turn was observed in
-    ///     flight. `nil` means none has been seen, which IS quiet.
-    ///   - lastWanderAt: from the durable state; `nil` means she has never had
-    ///     one.
-    /// The person's quiet hours are not here: they hold what reaches him
-    /// (AttentionRouter), never her own work (User 10-12).
+    /// Use the caller's clock and canonical turn activity; absent activity is quiet and absent durable wander time is unspent.
+    /// Person-facing quiet hours belong to delivery routing and cannot block the agent's own work.
     public static func decide(
         now: Date,
         turnInFlight: Bool,
@@ -123,23 +90,22 @@ public enum StudioWanderLane {
         return .wander
     }
 
-    // MARK: What she did with it
+    // MARK: What the agent did with it
 
-    /// The terminal outcome of one admitted hour, including interrupted work.
+    /// Every admitted hour has a terminal outcome, including interruption.
     public enum Outcome: String, Sendable, Equatable, CaseIterable {
-        /// She chose something and received the actual artifact.
         case chose
-        /// She declined. A valid outcome, with no streak to break and no
-        /// backlog to inherit.
+        /// Declining is complete without streaks or inherited backlog.
         case declined
-        /// She chose something and the artifact could NOT be obtained, so the
-        /// encounter did not happen. Her veto: honest encounters only.
+        /// Without the actual artifact, an attempted encounter is no_artifact.
         case noArtifact = "no_artifact"
         case stopped
         case failed
 
-        /// Each admitted hour records one terminal receipt, even when it ends
-        /// the same way as an earlier hour.
+        /// A failed or stopped hour was not had, so the day's hour stays the agent's.
+        public var spendsTheDay: Bool { self != .failed && self != .stopped }
+
+        /// Record each admitted hour even if its terminal outcome repeats.
         public var receiptKind: String {
             switch self {
             case .chose: return "studio.wander_chose"
@@ -153,20 +119,15 @@ public enum StudioWanderLane {
 
     // MARK: Durable state + the Desk-visible trace
 
-    /// One bounded file holds BOTH the refractory stamp and the trace, because
-    /// they are the same fact recorded twice otherwise. No JSONL, no cap
-    /// registry entry, no retention lane: the file has a fixed maximum size by
-    /// construction.
+    /// Store refractory and trace together because they describe one fact; fixed capacity bounds the file without another retention owner.
     public static let maximumTraceLines = 60
 
-    /// One line of what she did. `line` is the whole Desk-visible trace: her own
-    /// short sentence when she wrote one, otherwise a plain statement of the
-    /// outcome. Never a verdict, never an adjective we chose for her.
+    /// Keep the agent's own closing line when present, otherwise describe the outcome without an invented verdict.
     public struct TraceEntry: Sendable, Equatable {
         public var at: String
         public var outcome: Outcome
         public var line: String
-        /// The journal entry id when — and only when — she filed one herself.
+        /// Record a journal ID only for an entry the agent filed.
         public var journalEntryID: String?
 
         public init(at: String, outcome: Outcome, line: String, journalEntryID: String? = nil) {
@@ -214,8 +175,7 @@ public enum StudioWanderLane {
         public static let empty = State()
     }
 
-    /// `<dataRoot>/studio/wander/wander.json`. Created lazily by the first
-    /// completed hour; an uninstalled lane never touches it.
+    /// Create durable state lazily; an uninstalled hour never touches it.
     public static func statePath(dataRoot: URL) -> URL {
         dataRoot
             .appendingPathComponent("studio", isDirectory: true)
@@ -245,15 +205,13 @@ public enum StudioWanderLane {
             }
             return entry
         }
-        guard trace.count <= maximumTraceLines, trace.isEmpty || last != nil else { throw StateError.malformed }
-        return State(lastWanderAt: last, trace: trace)
+        guard trace.count <= maximumTraceLines, last != nil || !trace.contains(where: \.outcome.spendsTheDay) else { throw StateError.malformed }
+        return State(lastWanderAt: spentAt(reserved: last, trace: trace), trace: trace)
     }
 
     public enum StateError: Error { case malformed, refractory }
 
-    /// Reserve the existing durable refractory BEFORE any provider/tool effect.
-    /// Explicit run-now satisfies only this interval, never the checked state read.
-    /// A crash or failed final trace cannot authorize replay on the next launch.
+    /// Reserve refractory before provider/tool effects so crashes cannot authorize replay; explicit run-now bypasses no state check.
     public static func beginHour(dataRoot: URL, at: Date, satisfyWait: Bool = false) async throws {
         let path = statePath(dataRoot: dataRoot)
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -269,10 +227,16 @@ public enum StudioWanderLane {
         }
     }
 
-    /// Record ONE ended hour: advance the refractory and append its line.
-    ///
-    /// The refractory advances on a decline exactly as it does on a choice. The
-    /// hour was hers; spending it by saying no is spending it.
+    /// The day's hour is spent by the newest hour that was had. An admission newer than every ended hour is still in flight, or crashed with
+    /// unknown effects, so it holds; one whose ending did not spend the day gives the day back.
+    static func spentAt(reserved: Date?, trace: [TraceEntry]) -> Date? {
+        let had = trace.filter(\.outcome.spendsTheDay).compactMap { NativeTimestampFormat.parseISO8601FractionalFirst($0.at) }.max()
+        guard let reserved, let newest = trace.last, let ended = NativeTimestampFormat.parseISO8601FractionalFirst(newest.at),
+              ended >= reserved, !newest.outcome.spendsTheDay else { return reserved ?? had }
+        return had
+    }
+
+    /// A decline consumes refractory just like a choice because the admitted hour was spent; a failed or stopped hour does not.
     public static func recordEndedHour(
         dataRoot: URL,
         entry: TraceEntry,
@@ -284,10 +248,10 @@ public enum StudioWanderLane {
         )
         try await SwiftNativePersistenceCore.withFileLock(path) {
             let existing = try await loadState(dataRoot: dataRoot)
-            let trace = (existing.trace + [entry]).suffix(maximumTraceLines)
+            let trace = Array((existing.trace + [entry]).suffix(maximumTraceLines))
             try await SwiftNativePersistenceCore.writeJSON(
                 .object([
-                    "last_wander_at": .string(NativeTimestampFormat.sixDigitUTCOffset(at)),
+                    "last_wander_at": spentAt(reserved: at, trace: trace).map { .string(NativeTimestampFormat.sixDigitUTCOffset($0)) } ?? .null,
                     "trace": .array(trace.map { $0.toJSON() }),
                 ]),
                 to: path
@@ -295,20 +259,14 @@ public enum StudioWanderLane {
         }
     }
 
-    // MARK: Her own material
+    // MARK: The agent's own material
 
-    /// Her cares, invitations and recent writing; nothing is invented,
-    /// recommended or ranked. Empty material still lets her explore,
-    /// return a question or decline.
+    /// Offer only real material without assignment or ranking; empty material still permits exploration or decline.
     public struct Material: Sendable, Equatable {
-        /// The studio-intake part's invitation for what is in reach.
         public var invitations: [String]
-        /// Titles she has written about lately — so she can notice a rut, not
-        /// so anything avoids one for her.
+        /// Recent titles let the agent notice repetition without imposing an automatic avoidance rule.
         public var recentJournalTitles: [String]
-        /// Her own open cares, most pressing first.
-        /// ("[w1] topic — her question"; the key lets her say which one a
-        /// question carries on). Offered ahead of everything else, never assigned.
+        /// Offer pressing cares with explicit keys so the agent can choose which question continues, without assignment.
         public var cares: [String]
 
         public init(
@@ -321,7 +279,7 @@ public enum StudioWanderLane {
             self.cares = cares
         }
 
-        /// No invitations or open cares; the hour still reaches her for judgment.
+        /// No material still leaves the hour's judgment to the agent.
         public var isEmpty: Bool {
             invitations.isEmpty && cares.isEmpty
         }
@@ -337,35 +295,25 @@ public enum StudioWanderLane {
         }
     }
 
-    /// The one prompt. It offers and never assigns; the word "choose" appears
-    /// beside the word "decline" every time it appears at all.
-    ///
-    /// Deliberately contains no verdict, no suggestion of what is good, and no
-    /// mention of how long it has been since the last one. Her rule: "invitations
-    /// left on a table, never assignments."
-    ///
-    /// It also states the decline case POSITIVELY — "a full answer, complete in
-    /// itself" — rather than by denying a scoreboard. Telling her there is no
-    /// streak and no quota puts both words in front of her and invites her to
-    /// wonder what is being counted; saying nothing about counting is the only
-    /// way to mean it.
+    /// Offer choice and decline equally without verdicts, quotas or absence pressure.
+    /// Frame decline positively as complete; mentioning a nonexistent scoreboard would itself introduce one.
     public static func prompt(_ material: Material) throws -> String {
         var sections: [String] = [
-            try completionPolicy("her-hour", section: "prompt"),
+            try completionPolicy("wander-hour", section: "prompt"),
         ]
-        sections[0] += try completionPolicy("her-hour", section: "question")
+        sections[0] += try completionPolicy("wander-hour", section: "question")
         if material.isEmpty {
-            sections.append(try completionPolicy("her-hour", section: "empty"))
+            sections.append(try completionPolicy("wander-hour", section: "empty"))
         }
         if !material.cares.isEmpty {
-            sections.append(try completionPolicy("her-hour", section: "cares") + Material.bullets(material.cares))
+            sections.append(try completionPolicy("wander-hour", section: "cares") + Material.bullets(material.cares))
         }
         if !material.invitations.isEmpty {
-            sections.append(try completionPolicy("her-hour", section: "invitations") + Material.bullets(material.invitations))
+            sections.append(try completionPolicy("wander-hour", section: "invitations") + Material.bullets(material.invitations))
         }
         if !material.recentJournalTitles.isEmpty {
             sections.append(
-                try completionPolicy("her-hour", section: "journal") + Material.bullets(material.recentJournalTitles)
+                try completionPolicy("wander-hour", section: "journal") + Material.bullets(material.recentJournalTitles)
             )
         }
         return sections.joined(separator: "\n\n")

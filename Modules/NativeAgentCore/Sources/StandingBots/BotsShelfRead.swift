@@ -1,8 +1,7 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `BotsShelfRead.swift` | Shelf and Desk consume `BotRunnerScheduler.BotSchedule`; one running/queued/model-choice/pause/run-status classification for Mac, quiet reads and iPhone; approval and run-feed read models |
+// Blueprint: | `BotsShelfRead.swift` | `BotRunnerScheduler.BotSchedule` drives shared shelf, Desk and phone classification |
 
-/// A bot occurrence that never ran, for the Desk's schedule fold. Read-only.
 public struct DeskMissedBot: Identifiable, Equatable, Sendable {
     public let id: UUID
     public let name: String
@@ -21,7 +20,6 @@ public struct DeskMissedBot: Identifiable, Equatable, Sendable {
     }
 }
 
-/// An unpaused bot on a schedule, for the Desk's schedule fold. Read-only.
 public struct DeskTimedBot: Identifiable, Equatable, Sendable {
     public let id: UUID
     public let name: String
@@ -36,27 +34,29 @@ public struct DeskTimedBot: Identifiable, Equatable, Sendable {
     }
 }
 
-/// What the Bots page says when unattended work is switched off.
 public enum BotsShelfUnattended {
-    public static let pageLine = "Scheduled and event runs are off. Run once still works \u{2014} turn on \u{201C}Let me work unattended\u{201D} in Trust, or choose Full Mac."
+    public static let pageLine = """
+        Scheduled and event runs are off. Run once still works \u{2014} turn on \u{201C}Let me work unattended\u{201D} in \
+        Trust, or choose Full Mac.
+        """
     public static let cardLine = "Won\u{2019}t run on its own: unattended work is off"
 }
 
-/// Value-only shelf projection. No store, acknowledgement, scheduling or budget writes.
+/// Shelf projection cannot write stores, acknowledgements, scheduling or budgets.
 public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     public var definition: BotDefinition
     public var entries: [ShelfEntry]
     public var nextRun: Date?
-    /// The last occurrence the scheduler found already past its window.
     public var missed: BotMissedRun?
-    /// The last event that woke this bot, when it wakes on one.
     public var lastEvent: BotEventRecord? = nil
-    /// The scheduler's unattended admission; false suppresses scheduled dates,
-    /// while queued manual requests remain runnable.
+    /// Unattended refusal suppresses scheduled dates while explicit manual requests remain runnable.
     public var unattendedAllowed: Bool = true
     public var followingModel: String? = nil
     public var running = false
     public var queued = false
+    public var startedAt: Date? = nil
+    public var modelChoiceIssue: String? = nil
+    public var runReadIssue: String? = nil
     public enum Status: String, Sendable {
         case running = "Running", queued = "Queued", paused = "Paused", new = "New"
         case needsModelChoice = "Choose a model"
@@ -81,7 +81,6 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     public var statusWord: String {
         status.rawValue
     }
-    /// "Missed Sep 12 at 9:00 AM · the Mac was asleep", or nothing to say.
     public var missedLine: String? {
         guard let missed else { return nil }
         return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.words)"
@@ -90,7 +89,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     /// Equal timestamps retain the first entry in recorded order.
     public var latestEntry: ShelfEntry? { entries.max { $0.runAt < $1.runAt } }
     public var id: UUID { definition.id }
-    public var needsModelChoice: Bool { definition.needsModelChoice }
+    public var needsModelChoice: Bool { definition.needsModelChoice || modelChoiceIssue != nil }
     public static func shortDate(_ date: Date) -> String { metadataDate(date) }
     private static func metadataDate(_ date: Date) -> String {
         let formatter = DateFormatter()
@@ -101,7 +100,6 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     public var choiceLine: String {
         definition.modelSelection(currentModel: followingModel) + " · " + cadence
     }
-    /// "Wakes on: Slack · C0123ABCD", plus the last event when one arrived.
     public var wakeLine: String? {
         guard let trigger = definition.eventTrigger else { return nil }
         var line = "Wakes on: " + trigger.label
@@ -117,10 +115,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         }
         return line
     }
-    /// "Twice daily · Next Sep 9 at 11:00 AM", "Paused", or "Manual": whether it will run again.
-    /// Only a manual bot with NO event trigger still runs with the gate off:
-    /// the person pressing Run once is the whole schedule. A manual bot that
-    /// wakes on events does not — BotEventIntake holds the event.
+    /// Manual-only work carries explicit authority; event-triggered manual cadences still require unattended admission.
     public var runsWithUnattendedOff: Bool {
         guard definition.eventTrigger == nil else { return false }
         if case .manual = definition.cadence { return true }
@@ -129,15 +124,13 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     public var scheduleLine: String {
         if needsModelChoice { return "Choose a model" }
         if definition.paused { return "Paused" }
-        // Unattended work off: the scheduler returns no deadline and the event
-        // intake holds every event, so a time or a wake line would be a lie.
+        // A date or wake line would promise work the scheduler and event intake cannot admit.
         if !unattendedAllowed, !runsWithUnattendedOff { return BotsShelfUnattended.cardLine }
         if let wakeLine { return wakeLine }
         if case .manual = definition.cadence { return "Manual" }
         if let nextRun { return "\(cadence) · Next \(Self.metadataDate(nextRun))" }
         return "\(cadence) · Not scheduled yet"
     }
-    /// "Last Sep 10 at 1:47 AM · Next Sep 17 at 1:47 AM", or the part that exists.
     public var timingLine: String {
         var parts: [String] = []
         if let last = latestEntry { parts.append("Last \(Self.metadataDate(last.runAt))") }
@@ -146,8 +139,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         }
         return parts.isEmpty ? "No runs yet" : parts.joined(separator: " · ")
     }
-    /// "Sep 10 at 1:47 AM · Blocked. I don't have a headless fetch tool": when it last
-    /// spoke and the first line of what it said, so a card is never just a timestamp.
+    /// Pair the observed reply with its time so a result card conveys more than a timestamp.
     public var lastOutcomeLine: String {
         guard let last = latestEntry else { return "No runs yet" }
         let firstLine = last.actualReply.split(whereSeparator: \.isNewline)
@@ -184,68 +176,17 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     public static func read(root: URL, timing: BotRunnerScheduler.BotSchedule, followingModel: String? = nil) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
         let events = try BotEventStore(dataRoot: root).lastEvents()
-        // One checked bulk read for the whole shelf, instead of paginating
-        // every bot's history and then re-reading each row through `entry`
-        // (each of which decoded and sorted every book of every bot).
+        // One checked bulk read avoids repeatedly decoding and sorting the entire shelf.
         let stored = try shelf.entriesByBot()
-        let runs = try BotRunQueue(dataRoot: root).activeAndQueuedIDs()
+        let runs = try BotRunQueue(dataRoot: root).shelfRuns()
         return try BotDefinitionStore(dataRoot: root).list().map { bot in
             let entries = stored[bot.id] ?? []
             return BotsShelfRecord(definition: bot, entries: entries,
                                    nextRun: timing.dates[bot.id],
                                    missed: bot.cadence == .manual ? nil : timing.missed[bot.id], lastEvent: events[bot.id],
                                    unattendedAllowed: timing.unattended, followingModel: followingModel,
-                                   running: runs.active.contains(bot.id), queued: runs.queued.contains(bot.id))
+                                   running: runs.active.contains(bot.id), queued: runs.queued.contains(bot.id),
+                                   startedAt: runs.started[bot.id], runReadIssue: runs.issues[bot.id])
         }.sorted { $0.definition.createdAt < $1.definition.createdAt }
-    }
-}
-
-/// The run feed behind a bot's detail. Five uneventful checks used to push
-/// yesterday's finding off the card; consecutive completed `.nothingNew` runs
-/// now fold into one dated row that keeps its count, and the exact runs are
-/// still there when the row is opened.
-public enum BotRunFeed {
-    public enum Row: Identifiable {
-        case run(ShelfEntry)
-        case quiet([ShelfEntry])   // newest first, at least two
-
-        public var id: String {
-            switch self {
-            case .run(let entry): return entry.id.uuidString
-            case .quiet(let entries): return "quiet:\(entries.first?.id.uuidString ?? "")"
-            }
-        }
-    }
-
-    /// A run that said nothing and ended cleanly. Findings, artifacts, failures
-    /// and approval waits are never folded.
-    public static func isQuiet(_ entry: ShelfEntry) -> Bool {
-        entry.runtimeStatus == .completed
-            && entry.runHealth == .nothingNew
-            && entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && (entry.artifacts ?? []).isEmpty
-    }
-
-    public static func rows(_ sortedEntries: [ShelfEntry]) -> [Row] {
-        var rows: [Row] = []
-        var quiet: [ShelfEntry] = []
-        func flush() {
-            if quiet.count >= 2 {
-                rows.append(.quiet(quiet))
-            } else {
-                rows.append(contentsOf: quiet.map { Row.run($0) })
-            }
-            quiet = []
-        }
-        for entry in sortedEntries {
-            if isQuiet(entry) {
-                quiet.append(entry)
-            } else {
-                flush()
-                rows.append(.run(entry))
-            }
-        }
-        flush()
-        return rows
     }
 }

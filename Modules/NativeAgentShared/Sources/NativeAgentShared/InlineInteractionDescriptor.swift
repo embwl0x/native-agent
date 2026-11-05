@@ -1,45 +1,25 @@
 import Foundation
 
-// Blueprint: | `InlineInteractionDescriptor.swift` | Registry-supplied control/location bindings and shared `InlineCardField` connector vocabulary for Mac and phone |
+// Blueprint: | `InlineInteractionDescriptor.swift` | Shared control bindings and `InlineCardField` vocabulary; no executable descriptors |
 
-/// What the card needs to know about the thing being asked for, and WHICH
-/// existing control resolves it.
-///
-/// Renderers select an existing control and render its shared field description.
-/// Connector setup and field vocabulary add no service branch to either renderer.
-///
-/// A descriptor never carries a URL, a selector, a settings path, or anything
-/// else executable. `control` is a CLOSED enum of controls this app already
-/// ships; the app maps it to the real sheet. An id with no control resolves to
-/// `.unavailable` and the card says so rather than offering a dead button.
+/// Renderers select shared controls without service branches. Descriptors contain no executable URLs, selectors or paths; unknown controls remain
+/// unavailable.
 public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
-    /// Which existing control opens. Closed by construction: the model cannot
-    /// invent one, and a build that does not know a value decodes `.unknown`.
+    /// A closed enum prevents model-invented controls; unknown values remain inert.
     public enum Control: String, Codable, Sendable, Equatable {
-        /// Connectors' own setup: a manual token paste (Slack, Telegram).
         case connectorManualToken = "connector_manual_token"
         case internetAccounts = "internet_accounts"
-        /// Trust's Chrome switch, the extension folder and Chrome's extensions
-        /// page, settled when the extension connects.
+        /// Chrome setup settles only when the extension connects.
         case chromeSetup = "chrome_setup"
-        /// The iPhone pairing page, settled when a phone is paired.
         case pairDevice = "pair_device"
-        /// Trust's Mac Control switch plus the per-capability grant.
         case macPermissionGrant = "mac_permission_grant"
-        /// The Trust POSTURE forbids this capability outright, so no card may
-        /// grant it: Safe and Workspace are the person's own standing choice
-        /// and a card never changes them. The only honest control is the page
-        /// where that choice lives.
+        /// Cards cannot change the person’s standing Trust posture; they must open its owning page.
         case trustPostureRequired = "trust_posture_required"
-        /// Providers' group model save.
         case providerGroupModel = "provider_group_model"
-        /// Providers' API-key sheet.
         case providerAPIKey = "provider_api_key"
-        /// The keyring: a pasted secret, or a sign-in NativeAgent runs.
         case keyring
-        /// A capability flag write through Trust's own writer.
+        /// Capability changes go through Trust’s writer.
         case capabilityFlag = "capability_flag"
-        /// An answer picked in the card itself; nothing outside opens.
         case inlineChoice = "inline_choice"
         /// Known id, no executable control on this build. Renders unavailable.
         case unavailable
@@ -50,7 +30,6 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
             self = Control(rawValue: raw) ?? .unknown
         }
 
-        /// True when the card may offer a working primary action.
         public var isActionable: Bool {
             switch self {
             case .unavailable, .unknown: return false
@@ -59,8 +38,7 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
         }
     }
 
-    /// The setup's owning surface. Native setup and browser sign-in stay on
-    /// the Mac; supported phone controls can submit sealed input.
+    /// The setup's owning surface. Native setup and browser sign-in stay on the Mac; supported phone controls can submit sealed input.
     public enum Location: String, Codable, Sendable, Equatable {
         case anywhere
         case macRequired = "mac_required"
@@ -78,11 +56,9 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
     public var kind: InlineInteraction.Kind
     public var target: String
     public var displayName: String
-    /// SF Symbol name, when the registry knows one.
     public var icon: String?
     public var control: Control
     public var location: Location
-    /// Why the control is unavailable, when it is. One sentence, shown as-is.
     public var unavailableReason: String?
 
     public init(
@@ -113,7 +89,10 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
                 InlineCardField(label: "Bot token", placeholder: "123456789:ABC… from @BotFather",
                                 helper: stays, id: "token"),
                 InlineCardField(label: "Allowed chat ID", placeholder: "Numeric chat ID",
-                                helper: "Send your bot a message, then open Telegram setup and use Check sender to find your ID. Only a recipient you admit can reach the agent.",
+                                helper: """
+                                    Send your bot a message, then open Telegram setup and use Check sender to find your ID. Only a recipient you \
+                                    admit can reach the agent.
+                                    """,
                                 isSecret: false, id: "allowed_chat_id"),
             ]
         case "slack":
@@ -140,7 +119,6 @@ public struct InlineCardField: Sendable, Equatable {
     public var placeholder: String
     public var helper: String?
     public var isSecret: Bool
-    /// The key the value travels under when a card collects several.
     public var id: String
     /// An optional field never holds the primary back.
     public var isOptional: Bool

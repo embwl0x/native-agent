@@ -1,13 +1,12 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-// Blueprint: | `InstallPaths.swift` | Install-owned paths and explicit Chrome manifest bundle ownership, public release preparation and login-item location admission |
+// Blueprint: | `InstallPaths.swift` | Install-owned ports, bridge paths and Chrome relay identity. |
 
 /// Owns paths outside the data root, preserving shipped rendezvous names and namespacing other bundle ids.
 public struct InstallPaths: Sendable {
     public static let privateBundleIdentifier = "com.example.nativeagent.mac"
     public static let current: InstallPaths = {
-        // Bundled helpers live beside the app executable in Contents/MacOS.
         let app = Bundle.main.executableURL?.resolvingSymlinksInPath()
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         return InstallPaths(bundleIdentifier: currentAppBundleIdentifier()
@@ -22,13 +21,14 @@ public struct InstallPaths: Sendable {
         self.home = home
     }
 
-    public var usesLegacyPaths: Bool {
-        bundleIdentifier == Self.privateBundleIdentifier || bundleIdentifier == "io.github.embwl0x.nativeagent.mac"
+    /// The private and public installs own the unsuffixed rendezvous names and ports their bridge clients connect to; any other bundle namespaces.
+    public var usesPrimaryPaths: Bool {
+        bundleIdentifier == Self.privateBundleIdentifier || bundleIdentifier == canonicalPublicBundleIdentifier
     }
-    public func name(_ legacy: String) -> String {
-        usesLegacyPaths ? legacy : legacy + "-" + bundleIdentifier
+    public func name(_ base: String) -> String {
+        usesPrimaryPaths ? base : base + "-" + bundleIdentifier
     }
-    public var bridgeConfigRelativePath: String { usesLegacyPaths ? ".config" : ".config/" + bundleIdentifier }
+    public var bridgeConfigRelativePath: String { usesPrimaryPaths ? ".config" : ".config/" + bundleIdentifier }
     public var bridgeConfigRoot: URL { home.appendingPathComponent(bridgeConfigRelativePath, isDirectory: true) }
     /// Every bundle owns its Chrome socket; the manifest's owner selects the relay.
     public var chromeSocket: URL {
@@ -42,9 +42,8 @@ public struct InstallPaths: Sendable {
     public func loopbackPorts(
         secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")
     ) -> LoopbackPorts {
-        guard secondary || !usesLegacyPaths else { return LoopbackPorts(bridge: 8771, browserIPC: 8766) }
-        // FNV-1a over the bundle id: the same set every launch and build, in
-        // 18700-19696, below macOS's ephemeral range.
+        guard secondary || !usesPrimaryPaths else { return LoopbackPorts(bridge: 8771, browserIPC: 8766) }
+        // FNV-1a over the bundle id: the same set every launch and build, in 18700-19696, below macOS's ephemeral range.
         var hash: UInt32 = 2_166_136_261
         for byte in bundleIdentifier.utf8 { hash = (hash ^ UInt32(byte)) &* 16_777_619 }
         let base = UInt16(18_700 + Int(hash % 100) * 10)
@@ -53,8 +52,7 @@ public struct InstallPaths: Sendable {
     public var chromeManifest: URL {
         home.appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts/com.nativeagent.chrome.json")
     }
-    /// A secondary install names its own entry, like its ports, so two installs
-    /// on one Mac never collide in another app's settings.
+    /// Secondary installs need distinct entries so their settings cannot collide.
     public func agentHostEntryName(
         secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")
     ) -> String {
@@ -62,16 +60,15 @@ public struct InstallPaths: Sendable {
         (secondary ? "nativeagent-" + bundleIdentifier : name("nativeagent"))
             .replacingOccurrences(of: "_", with: "__").replacingOccurrences(of: ".", with: "_d")
     }
-    /// Bridge protocol owners keep private inboxes/jobs, quarantine bytes and
-    /// worktree pointers here; excluded from app backup/export/phone file sync.
-    /// Contact status and canonical transcript projections are separate.
-    /// PrivacyMap resolves each bridge directory through this same root.
+    /// Bridge protocol owners keep private inboxes/jobs, quarantine bytes and worktree pointers here; excluded from app backup/export/phone file sync. Contact
+    /// status and canonical transcript projections are separate. PrivacyMap resolves each bridge directory through this same root.
     public func bridgeConfigRoot(dataRoot: URL, defaultRoot: URL? = nil,
                                  secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")) -> URL {
         // Relocated test/dev roots still stay self-contained, including readers.
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "NATIVE_AGENT_DATA_ROOT")
-        return !secondary && dataRoot.resolvingSymlinksInPath().path == (defaultRoot ?? defaultDataRoot(environment: environment)).resolvingSymlinksInPath().path
+        return !secondary && dataRoot.resolvingSymlinksInPath().path == (defaultRoot ?? defaultDataRoot(environment: environment))
+            .resolvingSymlinksInPath().path
             ? bridgeConfigRoot : dataRoot.appendingPathComponent("bridge-config", isDirectory: true)
     }
     public func bridgeDiscoveryDirectory(dataRoot: URL, defaultRoot: URL? = nil,
@@ -81,17 +78,6 @@ public struct InstallPaths: Sendable {
     }
     public func ownsChromeManifest(_ manifest: [String: Any]) -> Bool {
         manifest["nativeagent_bundle_id"] as? String == bundleIdentifier
-    }
-
-    public func bridgeEnvironment(configRoot: URL) -> [String: String] {
-        let claude = configRoot.appendingPathComponent("claude-bridge")
-        return [
-            "NATIVE_AGENT_RETURN_BRIDGE_DIR": claude.path,
-            "NATIVE_AGENT_CODEX_BRIDGE_DESCRIPTOR_PATH": claude.appendingPathComponent("bridge.json").path,
-            "NATIVE_AGENT_CODEX_BRIDGE_TOKEN_PATH": claude.appendingPathComponent("token").path,
-            "NATIVE_AGENT_CODEX_WAKEUP_CONFIG": configRoot.appendingPathComponent("codex-nativeagent-bridge/wakeup.json").path,
-            "NATIVE_AGENT_OMP_BRIDGE_DIR": configRoot.appendingPathComponent("omp-bridge").path,
-        ]
     }
 
     public static let publicReleaseDataMarker = "public_release_data_root.json"
@@ -113,7 +99,7 @@ public struct InstallPaths: Sendable {
     @discardableResult
     public static func preparePublicReleaseDataRootIfNeeded() -> PublicReleaseDataRootPreparationResult {
         let fm = FileManager.default
-        // Round 3: empty env = unset (Core resolver parity).
+        // An empty environment override is unset, matching the core resolver.
         guard (ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty else { return .notNeeded }
         guard isPublicReleaseBundle else { return .notNeeded }
 
@@ -161,10 +147,7 @@ public struct InstallPaths: Sendable {
         }
     }
 
-    /// True only for a distributed public build: no REPO_PATH dev stamp, a real
-    /// .app bundle, and a VERSION resource. Dev installs from install_app.sh are
-    /// always stamped, so they can never read as public-release. Gates the
-    /// data-root marker and the first-run welcome greeting.
+    /// Require public bundle identity without a development stamp before marking the root or showing first-run welcome.
     public static let isPublicReleaseBundle: Bool = {
         let fm = FileManager.default
         guard let resourcesURL = Bundle.main.resourceURL else { return false }

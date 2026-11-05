@@ -23,8 +23,7 @@ import ContextFlow
 import AuthoredCapabilities
 // Blueprint: | `ReachLedger.swift` | `ReachLedger`: bounded outreach facts, checked reads and locked answer-settlement writes at cognition/reach.json |
 
-/// Housekeeping facts, bounded. Never a closeness score; never read into
-/// a prompt.
+/// Keep bounded pacing facts out of prompts; they never score closeness.
 struct ReachLedger: Codable, Equatable {
     struct Offer: Codable, Equatable {
         var id: String
@@ -33,40 +32,30 @@ struct ReachLedger: Codable, Equatable {
         var source: String
         var why: String
         var offeredAt: Date
-        /// offered (her turn is pending), sending (written just before
-        /// delivery), sent, declined (she passed), withheld (the moment passed
-        /// before it went).
         var outcome: String
         var sentAt: Date?
         var session: String?
-        /// A push went out with it: an interruption.
         var knocked: Bool?
-        /// Speech may have landed while its separate notification failed.
+        /// Speech may land even if its separate notification fails.
         var knockFailure: String?
-        /// He took a turn within a day after it (true) or did not (false).
         var answered: Bool?
-        /// The first verified owner turn in the window, kept at its event
-        /// boundary even while delivery is still awaiting confirmation.
+        /// Retain the first verified person turn even while speech confirmation is pending.
         var answeredAt: Date?
-        /// How it landed is in the care that sent it.
+        /// Store how an offer landed with its originating care.
         var landed: Bool?
-        /// When the thing itself happened, for the delivery-time re-check.
+        /// Retain source time for the delivery-time recheck.
         var at: Date?
 
-        /// Confirmed in his conversation.
         var isSent: Bool { outcome == "sent" }
-        /// `sending` is written before delivery and a crash can leave it
-        /// behind: it may have reached him, so pacing holds back for it, but
-        /// it is never counted as sent nor settled as answered.
-        var mayHaveReachedHim: Bool { isSent || outcome == "sending" }
+        /// Persist sending before delivery; after a crash it holds pacing without claiming sent or answered.
+        var mayHaveReachedPerson: Bool { isSent || outcome == "sending" }
     }
     var offers: [Offer] = []
     static let cap = 40
 
     static func url(_ root: URL) -> URL { root.appendingPathComponent("cognition/reach.json") }
 
-    /// Nil when the ledger exists and cannot be read: an unreadable history
-    /// is never an empty one to pace by or write over, so outreach waits.
+    /// Unreadable history is never empty permission to send or overwrite; outreach waits.
     static func read(_ root: URL) -> ReachLedger? {
         guard FileManager.default.fileExists(atPath: url(root).path) else { return ReachLedger() }
         do {
@@ -97,8 +86,7 @@ struct ReachLedger: Codable, Equatable {
         }
     }
 
-    /// The housekeeping counters, as numbers for the record (receipts, the
-    /// probe). The gates read the rows directly.
+    /// Derive gates from rows directly; counters are diagnostic projection only.
     func counters(lastUserTurn: Date?, now: Date) -> [String: JSONValue] {
         let week = offers.filter { now.timeIntervalSince($0.offeredAt) <= 7 * 86_400 }
         var subjects: [String: Int] = [:]

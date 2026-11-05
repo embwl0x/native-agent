@@ -1,10 +1,9 @@
 import Foundation
-// Blueprint: | `ProviderReplyWork.swift` | Whole-reply stop ownership: sticky transport stop, producer joins, and cancellation-independent collection through actual exit/drain |
+import NativeAgentCore
+// Blueprint: | `ProviderReplyWork.swift` | stop joins transport exit and drain |
 
-/// One whole reply owns the work it stops. Collection itself stays alive so
-/// the provider can close its wire, drain output and publish its actual end.
+/// One whole reply owns the work it stops. Collection itself stays alive so the provider can close its wire, drain output and publish its actual end.
 final class ProviderReplyWork: @unchecked Sendable {
-    @TaskLocal static var current: ProviderReplyWork?
 
     private struct Producer: Sendable {
         let stop: @Sendable () -> Void
@@ -16,8 +15,7 @@ final class ProviderReplyWork: @unchecked Sendable {
 
     var isStopped: Bool { lock.withLock { stopped } }
 
-    /// HTTP stops its producer task. Pipe-backed producers instead stop their
-    /// process, keeping the forwarding task uncancelled until EOF and drain.
+    /// HTTP stops its producer task. Pipe-backed producers instead stop their process, keeping the forwarding task uncancelled until EOF and drain.
     func own(_ task: Task<Void, Never>, stop: (@Sendable () -> Void)? = nil) {
         let producer = Producer(stop: stop ?? { task.cancel() }, join: { await task.value })
         let stopNow = lock.withLock {
@@ -35,8 +33,7 @@ final class ProviderReplyWork: @unchecked Sendable {
         for producer in owned { producer.stop() }
     }
 
-    /// A joined producer can have installed another while it was ending.
-    /// Walk every registration, including those made during an earlier join.
+    /// A joined producer can have installed another while it was ending. Walk every registration, including those made during an earlier join.
     func join() async {
         var joined = 0
         while true {
@@ -45,5 +42,13 @@ final class ProviderReplyWork: @unchecked Sendable {
             for producer in batch { await producer.join() }
             joined += batch.count
         }
+    }
+}
+
+private enum ReplyWorkPart: LLMCallPart { static let unset: ProviderReplyWork? = nil }
+extension LLMCall {
+    var replyWork: ProviderReplyWork? {
+        get { self[ReplyWorkPart.self] }
+        set { self[ReplyWorkPart.self] = newValue }
     }
 }

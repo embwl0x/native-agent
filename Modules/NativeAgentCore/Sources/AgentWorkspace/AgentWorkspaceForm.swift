@@ -3,19 +3,15 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `AgentWorkspaceForm.swift` | `AgentWorkspaceForm` struct; `readingHelperSettings`, `withSchemaIssue` |
 
-/// A form for one currently advertised owner schema. Bound target fields are
-/// supplied by the selected card and cannot be replaced by form values.
+/// A form for one currently advertised owner schema. Bound target fields are supplied by the selected card and cannot be replaced by form values.
 struct AgentWorkspaceForm: Sendable, Equatable {
     let tool: String
     let title: String
     let bound: [String: JSONValue]
     let parameters: JSONValue
-    /// Drafts are input, never an admitted action. Only explicitly supported
-    /// non-authority fields can cross restart; the current owner is rechecked.
+    /// Drafts are input, never an admitted action. Only explicitly supported non-authority fields can cross restart; the current owner is rechecked.
     let draftID: UUID
-    /// The name this draft keeps while it is open (`draft.3f2a9c01`), unlike an
-    /// offered action id that expires with the view. Eight hex characters: at
-    /// most four drafts are resident, and a name matching two is refused.
+    /// Eight hex characters identify at most four resident drafts; reject ambiguity and retain names beyond view-bound action IDs.
     var lastingName: String { "draft." + draftID.uuidString.prefix(8).lowercased() }
     private(set) var draftValues: [String: JSONValue] = [:]
     private(set) var showOptionalFields = false
@@ -85,8 +81,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
 
     private static let harnessFields: Set<String> = ["__session_id", "current_session_id", "sender", "surface"]
 
-    // Exact-helper settings present ordinary editable fields; the
-    // form packs the owner's object only at submission, under the same schema.
+    // Exact-helper settings present ordinary editable fields; the form packs the owner's object only at submission, under the same schema.
     private var helperFields: [String: JSONValue]? {
         guard tool == "bot_update", bound["id"] != nil,
               case .object(let root) = parameters, case .object(let properties)? = root["properties"],
@@ -144,15 +139,13 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         return copy
     }
 
-    /// A single selected field takes plain text. Choosing this action only edits
-    /// the resident draft; submission remains a separate, explicitly selected action.
+    /// Selecting a field edits only resident input; submission requires its own explicit action.
     func editing(field: String, text: String) throws -> Self {
         try updating(fields: .array([.object(["field": .string(field), "value": .string(text)])]), text: nil)
     }
 
-    /// Preserve incomplete and type-invalid text so correction never requires
-    /// rebuilding the rest of the form. Unknown/duplicate/bound fields and
-    /// oversized inputs are rejected without changing the original draft.
+    /// Preserve incomplete and type-invalid text so correction never requires rebuilding the rest of the form. Unknown/duplicate/bound fields and oversized
+    /// inputs are rejected without changing the original draft.
     func updating(fields: JSONValue?, text: String?) throws -> Self {
         var supplied: [String: JSONValue] = [:]
         if let fields, fields != .null {
@@ -171,9 +164,13 @@ struct AgentWorkspaceForm: Sendable, Equatable {
                       case .string(let name)? = pair["field"], let value = pair["value"],
                       properties[name] != nil, supplied[name] == nil else {
                     if tool.hasPrefix("desk_") {
-                        throw Failure(message: "Desk fields must be unique editable names: \(properties.keys.sorted().joined(separator: ", ")). Selected target fields cannot be replaced. Nothing was run.")
+                        throw Failure(message: """
+                            Desk fields must be unique editable names: \(properties.keys.sorted().joined(separator: ", ")). Selected target fields cannot be \
+                            replaced. Nothing was run.
+                            """)
                     }
-                    throw Failure(message: "A field is unknown, repeated, or belongs to the selected target. Your existing draft is still here; nothing was run.")
+                    throw Failure(
+                        message: "A field is unknown, repeated, or belongs to the selected target. Your existing draft is still here; nothing was run.")
                 }
                 guard value == .null || Self.isString(value) else {
                     throw Failure(message: "Field values must be text, or JSON null for a nullable field. Your existing draft is still here; nothing was run.")
@@ -183,7 +180,8 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         }
         if let text {
             guard let key = singleTextField, supplied[key] == nil else {
-                throw Failure(message: "Choose the field to edit, or use named fields. Text on this form is only a shortcut for its single required text field.")
+                throw Failure(
+                    message: "Choose the field to edit, or use named fields. Text on this form is only a shortcut for its single required text field.")
             }
             supplied[key] = .string(text)
         }
@@ -197,9 +195,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         return copy
     }
 
-    /// Workspace forms advertise workspace-relative paths. Freeze that meaning
-    /// before saving/submission so the source cwd cannot redirect it.
-    /// Explicit selected/absolute targets retain their existing owner semantics.
+    /// Freeze workspace-relative paths before saving or submission so source cwd cannot redirect them; retain explicit absolute targets.
     func resolvingWorkspacePath(root: URL) throws -> Self {
         guard ["write_file", "read_file", "list_dir"].contains(tool), bound["path"] == nil,
               case .string(let raw)? = draftValues["path"] else { return self }
@@ -243,7 +239,8 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         let spec = properties[name]?.objectValue ?? [:]
         var field: [String: JSONValue] = ["field": .string(name),
             "label": .string(AgentWorkspaceEnvironment.title(name)), "required": .bool(required.contains(name)),
-            "type": spec["type"] ?? (Self.types(properties[name]).isEmpty ? .string("structured") : .array(Self.types(properties[name]).sorted().map(JSONValue.string)))]
+            "type": spec["type"] ?? (Self.types(properties[name]).isEmpty ? .string("structured") : .array(Self.types(properties[name]).sorted().map(JSONValue
+                .string)))]
         if case .string(let description)? = spec["description"] { field["help"] = .string(String(description.prefix(550))) }
         if let choices = spec["enum"] { field["choices"] = choices }
         if let value = spec["default"] { field["default"] = value }
@@ -288,14 +285,14 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         }
         var actions: [AgentWorkspaceButton] = [.init(label: "Keep entered fields", action: .saveForm(self))]
         if needsOutcomeReview {
-            // Only immutable selected targets identify the previous effect;
-            // editable fields may already describe a different intended action.
+            // Only immutable selected targets identify the previous effect; editable fields may already describe a different intended action.
             if let source = AgentWorkspaceEnvironment.readback(tool: tool, input: bound) {
                 actions.insert(.init(label: "Check previous result", action: .open(source)), at: 0)
             }
             actions.append(.init(label: "I checked the outcome — prepare another attempt", action: .reviewDraft(self)))
         } else if schemaIssue == nil {
-            actions.insert(.init(label: tool == "write_file" && bound["expected_content_sha256"] != nil ? "Save revision" : "Submit " + title, action: .submit(self),
+            actions.insert(.init(label: tool == "write_file" && bound["expected_content_sha256"] != nil ? "Save revision" : "Submit " + title, action: .submit(
+                self),
                 needsText: singleTextField.map { draftValues[$0] == nil } ?? false), at: 0)
         }
         for name in corrections.prefix(3).reversed() {
@@ -309,10 +306,12 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         }
         actions.append(.init(label: "Discard this draft (later, by name: \(lastingName).discard)", action: .discardDraft(self)))
         if properties.keys.contains(where: { !required.contains($0) }) {
-            actions.append(.init(label: showOptionalFields ? "Hide optional fields" : "More options", action: .open(.form(showingOptionalFields(!showOptionalFields)))))
+            actions.append(.init(label: showOptionalFields ? "Hide optional fields" : "More options", action: .open(.form(showingOptionalFields(
+                !showOptionalFields)))))
         }
         var content: [String: JSONValue] = [
-            "status": .string(needsOutcomeReview ? "outcome_review_required" : !corrections.isEmpty ? "needs_correction" : missingRequired.isEmpty ? "draft_ready" : "draft_in_progress"),
+            "status": .string(needsOutcomeReview ? "outcome_review_required" : !corrections.isEmpty ? "needs_correction" : missingRequired.isEmpty
+                ? "draft_ready" : "draft_in_progress"),
             "fields": .array(visible.map { name in .object([
                 "field": .string(name), "required": .bool(required.contains(name)),
                 "has_value": .bool(draftValues[name] != nil)
@@ -320,16 +319,28 @@ struct AgentWorkspaceForm: Sendable, Equatable {
             "missing_required": .array(missingRequired.sorted().map(JSONValue.string)),
             "needs_correction": .array(corrections.map(JSONValue.string)),
             "optional_fields_hidden": .int(Int64(properties.keys.filter { !visible.contains($0) }.count)),
-            "input_help": .string("Edit fields or choose options; your entries stay. Only Submit runs the action. Check an uncertain outcome before preparing another attempt."),
-            "restart_storage": .string(canPersist ? "Draft inputs can be saved in this chat; storage status is reported by the desktop. Reopening rechecks the current schema and never submits." : "Temporary draft: this form can contain live targets or authority and is not written to disk. It stays resident until explicitly discarded or completed; restart will not retain it.")
+            "input_help": .string(
+                "Edit fields or choose options; your entries stay. Only Submit runs the action. Check an uncertain outcome before preparing another attempt."),
+            "restart_storage": .string(canPersist
+                ? "Draft inputs can be saved in this chat; storage status is reported by the desktop. Reopening rechecks the current schema and never submits."
+                : """
+                Temporary draft: this form can contain live targets or authority and is not written to disk. It stays resident until explicitly discarded \
+                or completed; restart will not retain it.
+                """)
         ]
         if let notice { content["notice"] = .string(notice) }
         if tool == "write_file", bound["expected_content_sha256"] != nil {
-            content["input_help"] = .string("Edit the text and choose Save revision. The destination stays attached; saving checks the original file and opens the saved result. Leaving preserves this draft.")
+            content["input_help"] = .string("""
+                Edit the text and choose Save revision. The destination stays attached; saving checks the original file and opens the saved result. Leaving \
+                preserves this draft.
+                """)
         }
         if let schemaIssue { content["schema_attention"] = .string(schemaIssue) }
         if helperFields != nil {
-            content["input_help"] = .string("Edit only the settings you want to change, then Save settings. The selected helper, its conversation and saved replies stay attached. Leaving keeps your edits; nothing runs automatically.")
+            content["input_help"] = .string("""
+                Edit only the settings you want to change, then Save settings. The selected helper, its conversation and saved replies stay attached. \
+                Leaving keeps your edits; nothing runs automatically.
+                """)
             actions = actions.map { action in
                 var action = action
                 if case .submit = action.action { action.label = "Save settings" }
@@ -351,11 +362,14 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     }
 
     func arguments(fields: JSONValue?, text: String?) throws -> [String: JSONValue] {
-        guard !needsOutcomeReview else { throw Failure(message: "Check the previous outcome and explicitly prepare another attempt before submitting. Nothing was repeated.") }
-        guard schemaIssue == nil else { throw Failure(message: "The current owner schema is unavailable or changed. This draft is preserved; nothing was run.") }
+        guard !needsOutcomeReview else { throw Failure(
+            message: "Check the previous outcome and explicitly prepare another attempt before submitting. Nothing was repeated.") }
+        guard schemaIssue == nil else { throw Failure(message: "The current owner schema is unavailable or changed. This draft is preserved; nothing was run.")
+            }
         let draft = try updating(fields: fields, text: text)
         guard draft.missingRequired.isEmpty else {
-            throw Failure(message: "Still needed: " + draft.missingRequired.sorted().map(AgentWorkspaceEnvironment.title).joined(separator: ", ") + ". Your draft is still here; nothing was run.")
+            throw Failure(message: "Still needed: " + draft.missingRequired.sorted().map(AgentWorkspaceEnvironment.title).joined(separator: ", ")
+                + ". Your draft is still here; nothing was run.")
         }
         var args = bound
         if helperFields != nil {
@@ -369,8 +383,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         return args
     }
 
-    /// Explicit input owners only. Generic capability forms, browser page snapshots,
-    /// credentials and approval/connection payloads deliberately stay resident.
+    /// Explicit input owners only. Generic capability forms, browser page snapshots, credentials and approval/connection payloads deliberately stay resident.
     var canPersist: Bool {
         let allowed: Set<String> = ["write_file", "commit_memory", "recall_memory", "mail_search",
             "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item",
@@ -378,7 +391,8 @@ struct AgentWorkspaceForm: Sendable, Equatable {
             "mac_calendar_create_event", "mac_reminders_create", "mac_reminders_query", "mac_reminders_update", "image_generate", "bot_create", "bot_update"]
         let stableTargets: Set<String> = ["path", "expected_content_sha256", "name", "id", "handle", "memory_id", "message_id", "expected_message_id",
             "thread_id", "conversation_session_id", "agent", "conversation"]
-        let forbidden = ["token", "secret", "password", "credential", "authorization", "cookie", "header", "approval", "permission", "trust", "provider", "session_grant"]
+        let forbidden = ["token", "secret", "password", "credential", "authorization", "cookie", "header", "approval", "permission", "trust", "provider",
+            "session_grant"]
         return allowed.contains(tool) && Set(bound.keys).isSubset(of: stableTargets)
             && bound.values.allSatisfy { value in
                 if case .string(let text) = value { return text.utf8.count <= 8192 && !text.contains("\0") }
@@ -459,8 +473,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         if case .array(let branches)? = row["anyOf"], !branches.contains(where: { permitsNull($0, depth: depth + 1) }) { return false }
         if case .array(let branches)? = row["oneOf"], branches.filter({ permitsNull($0, depth: depth + 1) }).count != 1 { return false }
         if case .array(let branches)? = row["allOf"], !branches.allSatisfy({ permitsNull($0, depth: depth + 1) }) { return false }
-        // These less common combinators need an owner's full validator; never
-        // assume an explicit null is allowed by an unrecognized restriction.
+        // These less common combinators need an owner's full validator; never assume an explicit null is allowed by an unrecognized restriction.
         if ["not", "if", "then", "else", "$ref"].contains(where: { row[$0] != nil }) { return false }
         return true
     }
@@ -486,8 +499,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
                 }
                 parsed = decoded
             } else {
-                // Only an owner-advertised choice can populate a typed resident
-                // value. Caller-supplied field updates still require text/null.
+                // Only an owner-advertised choice can populate a typed resident value. Caller-supplied field updates still require text/null.
                 parsed = rawValue
             }
             let kind: String

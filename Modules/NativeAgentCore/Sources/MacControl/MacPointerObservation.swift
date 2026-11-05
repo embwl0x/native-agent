@@ -5,10 +5,9 @@ import PersistenceCore
 import CoreGraphics
 #endif
 
-// Blueprint: | `MacPointerObservation.swift` | `MacPointerPosition` and `MacRegionAim`: actual cursor observation and clear-region aiming; unavailable position never becomes an invented origin |
+// Blueprint: | `MacPointerObservation.swift` | `MacPointerPosition`, `MacRegionAim`: Actual cursor and clear-region aim; unknown never invents origin |
 
-/// A read from the system cursor, never the point the hand intended to reach.
-/// Nil is unavailable; the origin must not be fabricated as a fallback.
+/// Read the actual cursor, never the intended target; unavailable position must not become an invented origin.
 public struct MacPointerPosition: Sendable, Equatable {
     public let x: Double
     public let y: Double
@@ -41,8 +40,7 @@ public struct SystemMacPointerPositionSource: Sendable {
     }
 }
 
-/// Choose a fresh clear point in a broad region, without changing its identity
-/// or pretending that an explicitly requested covered point is somewhere else.
+/// Clear-region aiming must preserve identity and cannot relocate an explicitly requested covered point.
 public enum MacRegionAim {
     public static func pathIsClear(from start: MacPointerPosition, to end: MacPointerPosition,
                                    excluding exclusions: [MacAXFrame]) -> Bool {
@@ -88,8 +86,7 @@ public enum MacRegionAim {
                     MacAXFrame(x: rect.x, y: bottom, w: rect.w, h: rect.y + rect.h - bottom),
                 ].filter { $0.w >= 4 && $0.h >= 4 }
             }.sorted { $0.w * $0.h > $1.w * $1.h }
-            // Bound fragmented window arrangements. Dropping a candidate can
-            // only make this unavailable; every retained candidate stays clear.
+            // Bound fragmented arrangements; dropping candidates may refuse an aim but cannot make an unsafe one valid.
             if clear.count > 128 { clear = Array(clear.prefix(128)) }
             if clear.isEmpty { return nil }
         }

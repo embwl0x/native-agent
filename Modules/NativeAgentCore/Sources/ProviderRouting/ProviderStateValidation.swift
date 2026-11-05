@@ -5,8 +5,8 @@ import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `ProviderStateValidation.swift` | `ProviderStateValidation` enum; `dataIfPresent`, `credential` |
 
-/// Checked inputs for provider credential mutations. Listing and routing retain
-/// their own read contracts; unrelated registry rows are never a mutation gate.
+/// Checked inputs for provider credential mutations. Listing and routing retain their own read contracts; unrelated registry rows are never a mutation
+/// gate.
 public enum ProviderStateValidation {
     public static func dataIfPresent(at path: URL) throws -> Data? {
         var info = stat()
@@ -14,8 +14,7 @@ public enum ProviderStateValidation {
             if errno == ENOENT { return nil }
             throw invalid("provider file is unreadable")
         }
-        // Inspect the directory entry first so a dangling link is an unreadable
-        // credential, not an absent one. Then admit its regular-file target.
+        // Inspect the directory entry first so a dangling link is an unreadable credential, not an absent one. Then admit its regular-file target.
         if (info.st_mode & S_IFMT) == S_IFLNK {
             guard stat(path.path, &info) == 0 else {
                 throw invalid("provider symlink target is unreadable")
@@ -34,8 +33,7 @@ public enum ProviderStateValidation {
         return try credentialMetadata(at: path)
     }
 
-    /// Explicit sign-in validates existing metadata without requiring the
-    /// superseded Keychain grant to remain readable.
+    /// Explicit sign-in validates existing metadata without requiring the superseded Keychain grant to remain readable.
     public static func credentialMetadata(at path: URL) throws -> [String: Any] {
         guard let data = try dataIfPresent(at: path) else { return [:] }
         return try credential(data: data)
@@ -50,7 +48,7 @@ public enum ProviderStateValidation {
     }
 
     public static func credential(_ object: [String: Any]) throws {
-        // Preserve Foundation's error for invalid input without encoding valid objects.
+        // Preserve the serialization owner's error for invalid JSON.
         if !JSONSerialization.isValidJSONObject(object) {
             _ = try JSONSerialization.data(withJSONObject: object)
         }
@@ -110,8 +108,7 @@ public enum ProviderStateValidation {
         }
     }
 
-    /// Decode only the row being removed with routing's supported Provider codec.
-    /// A nil result means the registry is absent or has no matching row to change.
+    /// Decode only the target registry row so unrelated row damage cannot block removal.
     public static func registryRemovingProvider(at path: URL, providerID: String) throws -> [JSONValue]? {
         guard let data = try dataIfPresent(at: path) else { return nil }
         guard case .array(let rows) = try JSONDecoder().decode(JSONValue.self, from: data) else {

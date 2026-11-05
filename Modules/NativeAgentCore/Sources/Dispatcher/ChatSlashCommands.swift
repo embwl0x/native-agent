@@ -1,9 +1,9 @@
 import Foundation
 
-// Blueprint: | `ChatSlashCommands.swift` | `ChatSlashCommandRegistry` and routing: shared command recognition and execution host contract; surface presentation remains local |
+// Blueprint: | `ChatSlashCommands.swift` | `ChatSlashCommandRegistry`: shared recognition and execution; local presentation |
 
 public enum ChatSlashCommandRoute: String, Sendable, CaseIterable {
-    case clear, compact, model, think, fast, persona, remember, note, scratch
+    case clear, model, think, fast, persona, remember, note, scratch
     case help, tools, export, new
     case settings, connect, helpers, agents, today, desk, memory, forget, voice, context
 }
@@ -24,7 +24,6 @@ public enum ChatSlashCommandRegistry {
     public static let all: [ChatSlashCommandDescriptor] = [
         .init(route: .new, command: "new", description: "Start a fresh chat", placeholder: ""),
         .init(route: .clear, command: "clear", description: "Wipe all messages in this session", placeholder: ""),
-        .init(route: .compact, command: "compact", description: "Force-compact context window", placeholder: ""),
         .init(route: .model, command: "model", description: "Set model", placeholder: "model <id>"),
         .init(route: .think, command: "think", description: "Set reasoning effort", placeholder: "think <level>"),
         .init(route: .fast, command: "fast", description: "Set GPT priority processing", placeholder: "fast <on|off>"),
@@ -59,23 +58,15 @@ public enum ChatSlashCommandRegistry {
 }
 
 
-// All chat surfaces share recognition; presentation remains with the surface.
 public enum ChatSlashCommandRouting {
     public enum Decision: Equatable, Sendable {
-        /// Not a command (plain text, or `/tmp/foo` and other non-command
-        /// slash text, which must reach the agent unchanged).
+        /// Non-command slash text, including paths, must reach the agent unchanged.
         case sendAsMessage
-        /// A recognized command. The payload is the command line with the
-        /// leading slash already dropped, matching `handleSlashCommand`.
         case dispatch(String)
-        /// A recognized command on a surface that cannot run it. The payload
-        /// is the bare command name, for the toast.
         case unsupportedHere(String)
-        /// A command-shaped word that is absent from the registry.
         case unknownCommand(String)
     }
 
-    /// `supportsDispatch` is the surface's answer to whether it can run commands.
     public static func decide(
         text: String,
         supportsDispatch: Bool
@@ -86,16 +77,14 @@ public enum ChatSlashCommandRouting {
         let name = (body.components(separatedBy: .whitespacesAndNewlines).first ?? "")
             .lowercased()
         guard ChatSlashCommandRegistry.commandNames.contains(name) else {
-            // Paths (/tmp/file), URLs and other slash prose remain ordinary
-            // messages. A bare command word must never silently become a turn.
+            // Paths and slash prose remain messages; a command-shaped word must never silently start a turn.
             return name.range(of: "^[a-z][a-z0-9_-]*$", options: .regularExpression) != nil
                 ? .unknownCommand(name) : .sendAsMessage
         }
         return supportsDispatch ? .dispatch(body) : .unsupportedHere(name)
     }
 
-    /// Consumer-readable, and it names where the command DOES work rather than
-    /// just refusing.
+    /// Name a supported surface so refusal also offers a way to run the command.
     public static func unsupportedMessage(command: String) -> String {
         "/\(command) only works in the main chat window."
     }
@@ -115,7 +104,6 @@ public protocol ChatSlashCommandHost: AnyObject, Sendable {
     var chatSlashReasoningEfforts: [String] { get }
     func stageChatSlashBrain()
     func saveChatSlashBrain() async -> String
-    func compactChatSlashSession() async -> String
     func rememberChatSlashFact(_ text: String) async -> (succeeded: Bool, message: String)
     func commitChatSlashNote(_ text: String) async -> (succeeded: Bool, message: String)
     func writeChatSlashScratch(key: String, value: String, sessionId: String) async -> (succeeded: Bool, message: String)
@@ -155,12 +143,6 @@ public extension ChatSlashCommandRouting {
                 return .refused("/\(command) takes no arguments")
             }
             return .presentation(route, argument: argument)
-        case .compact:
-            if host.activeChatSessionId.isEmpty {
-                toast("No active session to compact")
-            } else {
-                Task { @MainActor in toast(await host.compactChatSlashSession()) }
-            }
         case .model:
             if !argument.isEmpty {
                 host.chatModel = argument

@@ -4,16 +4,11 @@ import PersistenceCore
 
 // Blueprint: | `SimpleViewMode.swift` | `ViewModeSwitch`: Simple/Advanced/Agent selection and shared top chrome placement |
 
-// Simple view places agent contacts and helpers beside chat, with other tasks asked of the agent.
 
-/// Simple | Advanced | Agent: a small glass segmented control in the title strip,
-/// clear of the traffic lights. A pill is right here — it IS a segmented
-/// control (house rule 2).
 struct ViewModeSwitch: View {
     @AppStorage(SimpleViewMode.key) private var raw = ""
 
     var body: some View {
-        // The Mac's own segmented control (User 09-27: all controls native).
         Picker("View", selection: Binding(
             get: { SimpleViewMode.resolved(raw) },
             set: { raw = $0 }
@@ -30,7 +25,6 @@ struct ViewModeSwitch: View {
 }
 
 extension View {
-    /// The switch at the window's top right, and the first-launch default.
     func viewModeSwitch() -> some View {
         overlay {
             VStack {
@@ -48,17 +42,9 @@ extension View {
 private let simpleTopFade: CGFloat = 24
 
 extension View {
-    /// A scroll view's pinned top chrome, in its top inset. The header
-    /// cannot be a `safeAreaBar` (it pinned the main thread), and the
-    /// system's scroll edge effect does not act under a plain inset, so the
-    /// scrolled words are alpha-masked instead, in Simple and Advanced alike
-    /// (Advanced's sheet let lines show through under the header). The mask
-    /// sits inside the inset: its frame is the scroll view's safe area, below
-    /// the header and the title strip, so a line fades out over the last
-    /// `simpleTopFade` points before the header and is gone under it. The
-    /// header is outside the mask and keeps its hits. The mask reaches
-    /// through the bottom inset so lines still pass under the composer.
-    /// Static geometry.
+    /// Use static inset geometry because safeAreaBar can block the main thread.
+    /// Alpha-mask scrolled words because a plain inset has no system scroll-edge effect.
+    /// Keep the header outside the mask for hit-testing; extend through the bottom inset for the composer.
     func roomTopChrome<Chrome: View>(@ViewBuilder _ chrome: () -> Chrome) -> some View {
         mask(alignment: .top) {
             VStack(spacing: 0) {
@@ -73,8 +59,6 @@ extension View {
 }
 
 extension EnvironmentValues {
-    /// The layout profile (ui/layout.json) the surfaces under it draw with:
-    /// Simple's shell sets simple, so its chat shows no conversations column
-    /// (as seeded) and has no Work pane; every page elsewhere is Advanced's.
+    /// Share the layout profile so Simple chat omits Advanced-only columns and the Work pane.
     @Entry var layoutProfile = SimpleViewMode.advanced
 }

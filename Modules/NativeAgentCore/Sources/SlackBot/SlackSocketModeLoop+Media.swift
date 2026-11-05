@@ -4,7 +4,7 @@ import ChatTurnRuntime
 import PersistenceCore
 import NativeAgentShared
 import BackgroundLoops
-// Blueprint: | `SlackSocketModeLoop+Media.swift` | `SlackSocketModeLoop`: inbound file parsing, bounded image hydration, attachment notices and uploadable image selection |
+// Blueprint: | `SlackSocketModeLoop+Media.swift` | `SlackSocketModeLoop`: inbound files, bounded image hydration and upload selection |
 
 extension SlackSocketModeLoop {
     enum AttachmentFailure: Error {
@@ -38,25 +38,30 @@ extension SlackSocketModeLoop {
         }
     }
 
-    func attachmentAwareReply(_ hydration: AttachmentHydration, original: SlackInboundMessage, sessionId: String) async throws -> SlackSocketModeReply {
+    func attachmentAwareReply(_ hydration: AttachmentHydration, original: SlackInboundMessage, sessionId: String,
+                              handler: SlackHandler) async throws -> SlackSocketModeReply {
         let inbound = hydration.inbound
         if inbound.text.isEmpty && inbound.attachments.isEmpty {
             return SlackSocketModeReply(text: hydration.notice ?? "No readable message was received.")
         }
         let preview = replyPreview(for: original, sessionId: sessionId)
-        guard let runID = ChatPersistenceContext.pinnedTurnRunID else { throw SlackInboundJournalError.malformed }
+        let runID = handler.turn.run
         let lease = SessionTurnDelivery.mount(dataRoot: dataRoot, sessionID: sessionId, runID: runID,
             recipient: .init(progress: noticeSink(for: original, preview: preview)))
         defer { SessionTurnDelivery.unmount(dataRoot: dataRoot, sessionID: sessionId, runID: runID, lease: lease) }
         var reply: SlackSocketModeReply
         do {
-            reply = try await generateReply(inbound, sessionId: sessionId)
+            reply = try await generateReply(inbound, sessionId: sessionId, handler: handler)
         } catch {
             await settle { await preview.finish() }
             throw error
         }
         await settle { await preview.finish() }
-        if let notice = hydration.notice { reply.text = notice + "\n\n" + reply.text }
+        if reply.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, reply.attachments.isEmpty,
+           try SwiftNativeChatOrchestrationClient.silentTurn(dataRoot: dataRoot, sessionId: sessionId, runId: runID) != nil {
+            return reply
+        }
+        if reply.readBy == nil, let notice = hydration.notice { reply.text = notice + "\n\n" + reply.text }
         return reply
     }
 

@@ -1,7 +1,7 @@
 import Foundation
 import Browser
 import PersistenceCore
-// Blueprint: | `SurfaceRuntimeStatusModels.swift` | Approval-backed notification pending status and browser status models; browser preserves owner recovery cause and named damaged-run projections alongside capture paths |
+// Blueprint: | `SurfaceRuntimeStatusModels.swift` | Approval-backed pending status and browser recovery availability |
 
 public struct NotificationRuntimeStatus: Codable, Hashable {
     public var status: String
@@ -25,7 +25,8 @@ public struct BrowserRuntimeStatus: Codable, Hashable {
     public var recoveryIssue: String?
     public var admissionIssues: [JSONValue]?
     public var unavailableRuns: [JSONValue]?
-    public init(status: String, sourcePath: String? = nil, screenshotPath: String? = nil, activeRuns: [BrowserRun]? = nil, receiptCount: Int? = nil, latestReceipt: BrowserRun? = nil, createdAt: String? = nil,
+    public init(status: String, sourcePath: String? = nil, screenshotPath: String? = nil, activeRuns: [BrowserRun]? = nil, receiptCount: Int? = nil,
+        latestReceipt: BrowserRun? = nil, createdAt: String? = nil,
                 recoveryIssue: String? = nil, admissionIssues: [JSONValue]? = nil, unavailableRuns: [JSONValue]? = nil) {
         self.status = status
         self.sourcePath = sourcePath

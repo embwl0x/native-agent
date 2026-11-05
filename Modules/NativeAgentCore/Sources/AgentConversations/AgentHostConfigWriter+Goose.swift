@@ -3,41 +3,39 @@ import Yams
 // Blueprint: | `AgentHostConfigWriter+Goose.swift` | `AgentHostConfigWriter`: `writeGooseEntry`, `removeGooseEntry` |
 
 extension AgentHostConfigWriter {
-    static func writeGooseEntry(path: String, name: String, entryJSON: String, backupRecordURL: URL) throws -> Outcome {
-        try edit(path: path, backupRecordURL: backupRecordURL, initial: Data("extensions: {}\n".utf8)) {
-            guard let result = try GooseEntrySplice.edit($0, name: name, entry: entryJSON) else { return nil }
+    static func writeGooseEntry(configuration: AgentHostConfigWriter.Operation, path: String, name: String, entryJSON: String,
+        backupRecordURL: URL) throws -> Outcome {
+        try edit(configuration: configuration, path: path, backupRecordURL: backupRecordURL, initial: Data("extensions: {}\n".utf8)) { data, configuration in
+            guard let result = try GooseEntrySplice.edit(configuration: configuration, data, name: name, entry: entryJSON) else { return nil }
             guard !result.replaced else {
-                if result.data == $0 { return nil }
+                if result.data == data { return nil }
                 return result
             }
-            if checking == true { throw Failure.unparsable("missing connector at \(path):extensions.\(name); connect this host") }
-            // Validate the proposed document too: appending after a YAML end
-            // marker must never turn one valid document into two.
-            _ = try GooseEntrySplice.edit(result.data, name: name, entry: nil)
+            if configuration.checking == true { throw Failure.unparsable("missing connector at \(path):extensions.\(name); connect this host") }
+            // Validate the proposed document too: appending after a YAML end marker must never turn one valid document into two.
+            _ = try GooseEntrySplice.edit(configuration: configuration, result.data, name: name, entry: nil)
             return result
         }
     }
 
-    static func removeGooseEntry(path: String, name: String, backupRecordURL: URL) throws -> Outcome {
-        try edit(path: path, backupRecordURL: backupRecordURL, removing: true) {
-            try GooseEntrySplice.edit($0, name: name, entry: nil)
+    static func removeGooseEntry(configuration: AgentHostConfigWriter.Operation, path: String, name: String, backupRecordURL: URL) throws -> Outcome {
+        try edit(configuration: configuration, path: path, backupRecordURL: backupRecordURL, removing: true) { data, configuration in
+            try GooseEntrySplice.edit(configuration: configuration, data, name: name, entry: nil)
         }
     }
 }
 
-/// YAML is parsed for validity and source locations, never serialized back.
-/// Our value is a single JSON flow mapping (also valid YAML), so its boundary
-/// stays unambiguous even when adjacent settings contain multiline strings.
+/// YAML is parsed for validity and source locations, never serialized back. Our value is a single JSON flow mapping (also valid YAML), so its boundary stays
+/// unambiguous even when adjacent settings contain multiline strings.
 enum GooseEntrySplice {
-    static func edit(_ data: Data, name: String, entry: String?) throws
+    static func edit(configuration: AgentHostConfigWriter.Operation, _ data: Data, name: String, entry: String?) throws
         -> (data: Data, replaced: Bool, removed: Bool)? {
         func refused() -> AgentHostConfigWriter.Failure {
             .unparsable("these settings cannot be edited safely; nothing was changed")
         }
         guard let text = String(data: data, encoding: .utf8),
               !text.hasPrefix("\u{feff}"),
-              // Aliases/merges can make a syntactically local edit affect other
-              // sections. Refuse them, including ambiguous quoted spellings.
+              // Aliases/merges can make a syntactically local edit affect other sections. Refuse them, including ambiguous quoted spellings.
               text.range(of: #"(^|\s)[&*][^\s]+|<<\s*:"#, options: .regularExpression) == nil else { throw refused() }
         var documents: [Node] = []
         do {
@@ -71,14 +69,15 @@ enum GooseEntrySplice {
             guard let mark = ours.key.mark, lines.indices.contains(mark.line - 1) else { throw refused() }
             let index = mark.line - 1
             let line = lines[index]
-            // Only replace/remove the single-line flow entry we write. A
-            // hand-authored block of our name is a collision, not ours to erase.
+            // Only replace/remove the single-line flow entry we write. A hand-authored block of our name is a collision, not ours to erase.
             let prefix = String(repeating: " ", count: mark.column - 1) + JSONEntrySplice.quoted(name) + ": "
             guard line.hasPrefix(prefix),
                   (try? JSONSerialization.jsonObject(with: Data(line.dropFirst(prefix.count).utf8))) is [String: Any]
             else { throw refused() }
             if let entry {
-                if try AgentHostConfigWriter.checkEntry(String(line.dropFirst(prefix.count)), expected: entry, json: true, at: "extensions." + name) { return nil }
+                if try AgentHostConfigWriter.checkEntry(configuration: configuration, String(line.dropFirst(prefix.count)), expected: entry, json: true,
+                    at: "extensions."
+                    + name) { return nil }
                 lines[index] = prefix + entry
             }
             else { lines.remove(at: index) }
@@ -92,8 +91,7 @@ enum GooseEntrySplice {
             guard let range = lines[index].range(of: "{}") else { throw refused() }
             lines[index].removeSubrange(range)
         } else {
-            // Yams' mapping style comes from the ending event, so use
-            // source positions to recognize the documented block form.
+            // Yams' mapping style comes from the ending event, so use source positions to recognize the documented block form.
             guard let colon = lines[index].firstIndex(of: ":"),
                   let firstMark = servers.first?.key.mark, firstMark.line > sectionMark.line else { throw refused() }
             let suffix = lines[index][lines[index].index(after: colon)...].trimmingCharacters(in: .whitespaces)

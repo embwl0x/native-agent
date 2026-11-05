@@ -3,8 +3,6 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `ApprovalInbox+InjectionSpend.swift` | `SwiftNativeApprovalInbox`: `consumeInjectionApproval`, `loadSpends` |
 
-// The versioned spend object is locally backed up and exported, never phone
-// synced, and inventoried under PrivacyMap's Approvals category.
 extension SwiftNativeApprovalInbox {
     public static let injectionSpendSchema = "mac-injection-approval-spend.v1"
 

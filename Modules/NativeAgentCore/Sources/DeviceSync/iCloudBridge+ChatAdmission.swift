@@ -11,7 +11,7 @@ import PersistenceCore
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `iCloudBridge+ChatAdmission.swift` | Durable chat admission, scoped Stop evidence, reply binding, exact signed publication retention and checked settlement in the one bridge ledger; unknown submissions stay nonterminal |
+// Blueprint: | `iCloudBridge+ChatAdmission.swift` | One durable ledger for admission, Stop, signed reply retention and settlement. |
 
 extension iCloudBridge {
     enum ChatAdmission: Sendable {
@@ -19,8 +19,7 @@ extension iCloudBridge {
         case completed, interrupted, cancelled, unreadable, collision, stale, unavailable
     }
 
-    /// The chat ledger's one schema includes admission, reply binding and recovery.
-    /// Optional admission fields are absent on Mac-originated reply obligations.
+    /// Admission fields are absent on Mac-originated reply obligations; both share the same ledger schema.
     struct ChatRecord: Codable, Sendable {
         var id: String?
         var direction: String
@@ -59,8 +58,7 @@ extension iCloudBridge {
         return data
     }
 
-    /// The admission ledger retains an accepted scoped Stop across transport delay and restart.
-    /// Nonterminal Stop-only rows are never eligible for terminal retention pruning.
+    /// Stop-only rows must survive transport delay and restart; nonterminal stops are ineligible for retention pruning.
     nonisolated static func recordChatStop(session: String, runID: String, dataRoot: URL) async throws {
         let path = chatURL(runID, dataRoot: dataRoot)
         try await SwiftNativePersistenceCore.withFileLock(path) {
@@ -124,8 +122,7 @@ extension iCloudBridge {
                 case .missing:
                     break
                 }
-                // A message sent before this life began was another life's to answer
-                // (an earlier install on this Mac, or before a restore): history, never a turn.
+                // Pre-life messages are history owned by another install or restore, never new turns.
                 if message.timestamp < (try DataRootLife.began(in: dataRoot)) { return .completed }
                 let age = Date().timeIntervalSince(message.timestamp)
                 guard age <= 24 * 60 * 60, age >= -15 * 60 else { return .stale }
@@ -146,8 +143,7 @@ extension iCloudBridge {
         }
     }
 
-    /// Only the caller that has not entered a handler may release its new row.
-    /// Exact bytes keep an interrupted or subsequently advanced row intact.
+    /// Release only before handler entry; exact-byte comparison protects interrupted or advanced rows.
     nonisolated static func releaseUndispatchedChat(_ admission: ChatAdmission) async {
         await settle {
             if case .reserved(let url, let contents) = admission {
@@ -199,8 +195,7 @@ extension iCloudBridge {
         }
     }
 
-    /// Recovery reads the producer's retained envelope, including when the
-    /// receipt write failed. A generated recovery id is not its publication id.
+    /// Recovery must use the retained producer envelope's publication id, never a generated recovery id.
     nonisolated static func retainedReplyPublication(correlationID: String, runID: String, dataRoot: URL) throws -> BridgeMessage? {
         let directory = dataRoot.appendingPathComponent("icloud/chat_transactions", isDirectory: true)
         let files: [URL]
@@ -238,8 +233,7 @@ extension iCloudBridge {
                       let saved = record.outboundMessage, saved.verifySignature(secret: secret) else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
-                // Timestamp/signature are retained from the first publication;
-                // every authored body field must still describe the same effect.
+                // Retain first-publication time and signature; authored body fields must still describe the same effect.
                 let candidate = BridgeMessage.make(id: message.id, sender: message.sender, text: message.text,
                     sessionID: message.sessionID, correlationID: message.correlationID,
                     metadata: message.metadata, attachments: message.attachments, timestamp: saved.timestamp)

@@ -13,7 +13,6 @@ import Dispatcher
 import MacControl
 import Context
 import SwarmRuns
-import WorkshopExecution
 import Transcripts
 // Blueprint: | `SwiftToolDispatcher+ContextTraceTools.swift` | `SwiftToolDispatcher`: `impl_context_lookup`, `impl_scratchpad_read`, bounded anchored `impl_recent_trace_summary` pages; receipts span conversations by default, rank non-read actions first and scan complete retained since windows; `trace.usage` and `trace.model_calls` share this route and `TurnTraceRecentReader` for recorded sums, purpose counts and retention coverage; explicit session filters and bound turn refs |
 
@@ -21,7 +20,8 @@ import Transcripts
 
 extension SwiftToolDispatcher {
     func impl_context_lookup(input: [String: JSONValue]) async throws -> JSONValue {
-        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["context_lookup"]).turnSchemas().compactMap { $0 }.first)
+        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["context_lookup"]).turnSchemas()
+            .compactMap { $0 }.first)
         if let type = input["type"], type != .string("lookup_feature_surface") {
             throw AutonomyGateError.toolDenied(reason: "capabilities.lookup type must be lookup_feature_surface.")
         }
@@ -33,15 +33,15 @@ extension SwiftToolDispatcher {
             query = text
         } else { query = "" }
         let result = await SwiftNativeContextClient().lookup(query: query)
-        // The lookup has finished. "ready" describes the feature catalog, not
-        // a tool still waiting to run.
+        // "ready" describes the catalog, not pending execution.
         guard case .object(var fields) = result.toJSON() else { return result.toJSON() }
         fields["status"] = .string("ok")
         return .object(fields)
     }
 
     func impl_scratchpad_read(input: [String: JSONValue]) async throws -> JSONValue {
-        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["scratchpad_read"]).turnSchemas().compactMap { $0 }.first)
+        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["scratchpad_read"]).turnSchemas()
+            .compactMap { $0 }.first)
         let input = input.filter { $0.value != .string("") }
         let rawSessionID = input["session_id"]?.stringValue ?? ""
         let sessionID = rawSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -91,8 +91,9 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    func impl_recent_trace_summary(input: [String: JSONValue]) async throws -> JSONValue {
-        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["recent_trace_summary"]).turnSchemas().compactMap { $0 }.first)
+    func impl_recent_trace_summary(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue]) async throws -> JSONValue {
+        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["recent_trace_summary"]).turnSchemas()
+            .compactMap { $0 }.first)
         if input["view"]?.stringValue == "model_calls" {
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls()
         }
@@ -130,7 +131,8 @@ extension SwiftToolDispatcher {
                 "detail": .string("kind selects events such as tool.dispatch; name selects a tool or action. Nothing was read."),
                 "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(next)])])])
         }
-        let nameFilter = input["name"]?.stringValue.map { ToolNameAliases.appAction(ToolNameAliases.canonical($0)) ?? $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        let nameFilter = input["name"]?.stringValue.map { ToolNameAliases.appAction(ToolNameAliases.canonical($0)) ?? $0.trimmingCharacters(
+            in: .whitespacesAndNewlines).lowercased() }
             .flatMap { $0.isEmpty ? nil : $0 }
         let statusFilter = input["status"]?.stringValue
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -141,7 +143,6 @@ extension SwiftToolDispatcher {
         }()
         let turnID = input["turn_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let trace = input["trace"]?.stringValue
         var fields: [String] = []
         if let requested = input["fields"], requested != .null {
             guard (turnID?.isEmpty == false || completedTurns != nil),
@@ -161,16 +162,15 @@ extension SwiftToolDispatcher {
         do {
             snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(
                 history: receiptID != nil || completedTurns != nil || turnID?.isEmpty == false,
-                since: since ?? (receiptID != nil && trace == nil ? Date.distantPast : nil),
-                holding: receiptID != nil ? ["tool.dispatch"] : [],
-                trace: receiptID != nil ? trace : nil)
+                since: since ?? (receiptID != nil ? Date.distantPast : nil),
+                holding: receiptID != nil ? ["tool.dispatch"] : [])
         } catch {
             return .object([
                 "status": .string("failed"),
                 "error": .string(String(describing: error)),
                 "count": .int(0),
                 "traces": .array([]),
-                "source": .string("data/turn_traces/<current-day>.jsonl"),
+                "source": .string("detail"),
             ])
         }
 
@@ -216,7 +216,7 @@ extension SwiftToolDispatcher {
             let action = receipt["action"]?.stringValue ?? payload["name"]?.stringValue ?? payload["tool"]?.stringValue ?? ""
             let arguments = payload["args"]?.stringValue.flatMap { try? JSONValue.parse(Data($0.utf8)) }
             let args = if case .object(let args)? = arguments { args } else { [String: JSONValue]() }
-            let policy = try AppActionBinding.action(input: ["action": .string(action), "args": args["args"] ?? .object(args)])
+            let policy = try AppActionBinding.action(input: ["action": .string(action), "args": args["args"] ?? .object(args)], turn: turn)
             return result["effects"] == .string("occurred")
                 || (policy?.read == false && (arguments != nil || policy?.readWhen.isEmpty == true))
         }
@@ -345,12 +345,14 @@ extension SwiftToolDispatcher {
             return ("recent_trace_summary", ["turn_id": .string(id), "view": .string("receipts"), "session_id": row["session_id"] ?? .null], "Trace turn")
         } + (missingTurn ? candidateIDs.map { id in
             let session = events.first { $0.turnId == id && $0.sessionId != nil }?.sessionId
-            return ("recent_trace_summary", ["turn_id": .string(id), "view": .string("receipts"), "session_id": session.map(JSONValue.string) ?? .null], "Trace turn")
+            return ("recent_trace_summary", ["turn_id": .string(id), "view": .string("receipts"), "session_id": session.map(JSONValue.string)
+                ?? .null], "Trace turn")
         } : [])
         let refs: [JSONValue]
         let refNote: String
         do {
-            refs = try AgentWorkspace.readReferences(reads, dataRoot: dataRoot)
+            refs = try AgentWorkspace.readReferences(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
+                reads, dataRoot: dataRoot)
             refNote = "Open an observed read_ref or candidate_turn_ref with app {item:ref}; its exact turn and session are bound server-side."
         } catch {
             refs = reads.map { _ in .null }
@@ -362,7 +364,7 @@ extension SwiftToolDispatcher {
             return .object(row)
         }
         var response: [String: JSONValue] = [
-            "status": .string(missingTurn ? "no_match" : "ok"),
+            "status": .string(missingTurn ? "no_match" : snapshot.completeSequences ? "ok" : "partial"),
             "detail": missingTurn ? .string("No retained turn matches turn_id. Use an exact candidate_turn_id; no matching trace evidence was read.") : .null,
             "candidate_turn_ids": missingTurn ? .array(candidateIDs.map(JSONValue.string)) : .array([]),
             "candidate_turn_refs": missingTurn ? .array(refs.suffix(candidateIDs.count).filter { $0 != .null }) : .array([]),
@@ -371,9 +373,10 @@ extension SwiftToolDispatcher {
             "has_more": .bool(hasMore),
             "next_call": hasMore ? .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(next)])]) : .null,
             "traces": .array(summaries),
-            "source": .string("data/turn_traces/\((snapshot.sourceURLs.first ?? snapshot.sourceURL).lastPathComponent)"),
-            "sources": .array(snapshot.sourceURLs.map { .string("data/turn_traces/\($0.lastPathComponent)") }),
-            "scan_truncated": .bool(snapshot.truncated),
+            "source": .string("detail"),
+            "sources": .array([.string("detail")]),
+            "scan_truncated": .bool(snapshot.limitReached),
+            "unreadable_rows": .int(Int64(snapshot.unreadable)),
             "completed_turn_ids": .array(completedIDs.map(JSONValue.string)),
             "requested_completed_turns": completedTurns.map { .int(Int64($0)) } ?? .null,
             "shown_note": .string("shown is an action label, not evidence that the screen moved."),
@@ -382,16 +385,23 @@ extension SwiftToolDispatcher {
             "scope": .string(normalizedSessionFilter == nil ? "all conversations" : "session"),
         ]
         if receiptView {
-            response["order_note"] = .string("Non-read actions first, then reads; newest first within each group. Receipts include attempts and failures; inspect resultClass and resultReceipt for recorded effects.")
+            response["order_note"] = .string("""
+                Non-read actions first, then reads; newest first within each group. Receipts include attempts and failures; inspect resultClass \
+                and resultReceipt for recorded effects.
+                """)
         }
         if receiptID != nil, summaries.isEmpty {
             response["status"] = .string("unavailable")
-            response["detail"] = .string(snapshot.truncated
+            response["detail"] = .string(!snapshot.completeSequences
                 ? "The receipt was not found in incomplete retained evidence. Its absence and the operation's outcome are unknown; do not replay it."
                 : "No retained dispatch receipt matches receipt_id. This does not establish the original operation's outcome; do not replay it.")
         }
         if effectsOnly {
-            response["effects_note"] = .string("Successful non-read actions, excluding previews and explicit no-effect results. args/result are bounded redacted previews for target and effect; paired inner/app receipts can describe one action. No matches is not proof of no changes; check scan_truncated and has_more. Dispatch success does not prove the effect still persists.")
+            response["effects_note"] = .string("""
+                Successful non-read actions, excluding previews and explicit no-effect results. args/result are bounded redacted previews for \
+                target and effect; paired inner/app receipts can describe one action. No matches is not proof of no changes; check \
+                scan_truncated and has_more. Dispatch success does not prove the effect still persists.
+                """)
         }
         let bounded = try EncodedPrefix.largestPrefix(count: summaries.count, maximumEncodedBytes: 32 * 1024) { count in
             if count < summaries.count {

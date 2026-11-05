@@ -17,7 +17,7 @@ private struct StatusEntry: TimelineEntry {
     }
     var status: String {
         switch content {
-        case .placeholder: "Her status"
+        case .placeholder: "Agent status"
         case .snapshot(let snapshot): snapshot.status(at: date)
         case .unavailable(let cause): "Status unavailable: \(cause). Open NativeAgent to repair or republish its widget snapshot."
         }
@@ -87,8 +87,8 @@ struct NativeAgentStatusWidget: Widget {
         StaticConfiguration(kind: NativeAgentWidgetSnapshot.kind, provider: StatusProvider()) { entry in
             StatusView(entry: entry)
         }
-        .configurationDisplayName("Her status")
-        .description("What she's doing and what's waiting on you.")
+        .configurationDisplayName("Agent status")
+        .description("What the agent is doing and what's waiting on you.")
         .supportedFamilies([.systemSmall])
     }
 }

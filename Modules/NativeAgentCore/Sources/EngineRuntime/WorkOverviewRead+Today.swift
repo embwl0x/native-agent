@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Experiences
 import Cognition
 import NativeAgentCore
 import NativeAgentShared
@@ -19,69 +20,13 @@ import AgentConversations
 import TrustCenter
 import AgentWorkspace
 import TurnTrace
-// Blueprint: | `WorkOverviewRead+Today.swift` | `TodayReadout` freezes checked sources and provenance, including bounded trace counts for thinking and open MY QUEUE intentions' next clock moments within seven days, feeds the pure `today-readout.js` faces through L0's version/epoch cache, binds source IDs to native dates and note links, and publishes through `LatestRead`; waiting counts share a pure face too. `TodayDreamDigest` reads the latest dream through `DreamNight`; native input supplies its title, mood and timestamp, never diary Markdown for JS to parse. Narration, grouping, due words and ordering live in the part. Unbound rows are omitted individually with native reasons; other activity, Ahead, earlier notes and note links remain. Native unavailable evidence, localization and live clock gutters remain. Mac and quiet reads consume the same prepared rows |
-
-/// One line of her day. Payload-free by construction: a title, one plain
-/// sentence, and when it happened (or is due). `details` is non-empty only on
-/// a row that FOLDS several things — the card then opens on click.
-public struct TodayRow: Identifiable, Equatable, Sendable {
-    public struct Span: Equatable, Sendable {
-        public let start: Date?
-        public let end: Date
-        public init(start: Date?, end: Date) { self.start=start; self.end=end }
-    }
-    public let id: String
-    public let title: String
-    public let line: String
-    /// When it happened, or when a horizon falls due.
-    public let at: Date
-    /// A horizon sorts after everything that already happened and shows a
-    /// weekday instead of a clock.
-    public let isHorizon: Bool
-    /// The things this row folds. Empty on a plain row.
-    public let details: [String]
-    /// A folded row spans a stretch of the day; the gutter shows the span.
-    private let fixedGutter: String?
-    private let liveSpan: Span?
-    public var gutter: String? {
-        if let span=liveSpan {
-            let live=Date().timeIntervalSince(span.end)<10*60
-            if let start=span.start { return live ? TodayWords.clock(start)+"–now" : TodayWords.clockSpan(start,span.end) }
-            return live ? "now" : TodayWords.clock(span.end)
-        }
-        return fixedGutter
-    }
-    /// Only the diary key travels with the summary; the reader owns the body.
-    public let dreamDate: String?
-
-    public init(
-        id: String,
-        title: String,
-        line: String,
-        at: Date,
-        isHorizon: Bool = false,
-        details: [String] = [],
-        gutter: String? = nil,
-        dreamDate: String? = nil,
-        liveSpan: Span? = nil
-    ) {
-        self.id = id
-        self.title = title
-        self.line = line
-        self.at = at
-        self.isHorizon = isHorizon
-        self.details = details
-        self.fixedGutter = gutter
-        self.liveSpan = liveSpan
-        self.dreamDate = dreamDate
-    }
-}
+import Experiences
+// Blueprint: | `WorkOverviewRead+Today.swift` | Frozen Today sources at the experience record's sequence; engine.pages projects today-readout.js |
 
 // MARK: - Plain-words formatting
 
 public enum TodayWords {
-    /// Counts are spelled, never rendered as numerals — this page shows her
-    /// life, not a queue depth.
+    /// Spell counts so the page reads as lived experience rather than queue depth.
     public static func spelled(_ count: Int) -> String {
         switch count {
         case 1: return "One"
@@ -98,39 +43,29 @@ public enum TodayWords {
         }
     }
 
-    /// The same word, mid-sentence.
     public static func spelledLower(_ count: Int) -> String {
         spelled(count).lowercased()
     }
 
-    /// THE STRIPPER. Every title and every line on this page goes through it.
-    ///
-    /// Sources write markdown — a diary entry is a heading, a distillation is
-    /// bullets, a proposal reason carries `**bold**` and `[links](url)`. None
-    /// of that is her voice, and a stray `#` or `**` on a card reads as a bug.
-    /// Removes the markers, keeps the words, and collapses the whole thing to
-    /// one line. Never truncates — `bounded` does that.
+    /// Sources contain Markdown; show only words in a single line. Keep truncation in `bounded` so stripping preserves complete prose.
     public static func plain(_ raw: String) -> String {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return "" }
         text = unlinked(text)
         let lines = text.split(whereSeparator: \.isNewline).map { rawLine -> String in
             var line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
-            // Leading block markers: headings, quotes, bullets, numbered items.
             var wasHeading = false
             while let first = line.first, first == "#" || first == ">" {
                 wasHeading = wasHeading || first == "#"
                 line.removeFirst()
                 line = line.trimmingCharacters(in: .whitespaces)
             }
-            // A heading folded into running text needs its full stop.
+            // Add a full stop when folding headings into running prose.
             if wasHeading, let last = line.last, !".!?:".contains(last) { line += "." }
             for bullet in ["- ", "* ", "+ "] where line.hasPrefix(bullet) {
                 line.removeFirst(bullet.count)
             }
-            // Inline emphasis and code spans. `_` is deliberately left alone:
-            // it lives inside identifiers far more often than around emphasis.
-            // Backslashes are not display text.
+            // Preserve underscores because they often belong to identifiers; Markdown emphasis and escapes are not display words.
             line.removeAll { $0 == "*" || $0 == "`" || $0 == "\\" }
             return line.trimmingCharacters(in: .whitespaces)
         }
@@ -140,8 +75,7 @@ public enum TodayWords {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// `[text](url)` → `text`. Bare `[text]` is left alone; it is more often a
-    /// real bracket than a broken link.
+    /// Strip link destinations but preserve bare brackets because they often carry actual words.
     private static func unlinked(_ text: String) -> String {
         var out = ""
         var rest = Substring(text)
@@ -163,8 +97,7 @@ public enum TodayWords {
         return out + rest
     }
 
-    /// Bounded at a SENTENCE boundary when one is near the end of the window,
-    /// otherwise at a word boundary. Never mid-word, never mid-character.
+    /// Prefer nearby sentence or word boundaries; never split words or characters.
     public static func bounded(_ text: String, limit: Int) -> String {
         guard text.count > limit else { return text }
         let window = text.prefix(limit)
@@ -179,21 +112,19 @@ public enum TodayWords {
         return String(window) + "…"
     }
 
-    /// Strip, then bound. The one call every line on the page makes.
+    /// Strip before bounding every displayed line.
     public static func line(_ text: String, limit: Int = 180) -> String {
         bounded(plain(text), limit: limit)
     }
 
-    /// The Mac's own short time ("4:30 AM" in a US locale), in the display
-    /// zone: the one clock every User-facing time wears.
+    /// Use the system’s localized short time and the shared display zone for every user-facing clock.
     public static func clock(_ date: Date, calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         var style = Date.FormatStyle(date: .omitted, time: .shortened)
         style.timeZone = calendar.timeZone
         return date.formatted(style)
     }
 
-    /// The system's own interval: "5:40 – 5:45 AM" when both ends share a
-    /// period, else "11:50 AM – 1:10 PM".
+    /// Use the system interval formatter so shared periods remain localized.
     public static func clockSpan(_ start: Date, _ end: Date, calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         guard clock(start, calendar: calendar) != clock(end, calendar: calendar), start < end else {
             return clock(start, calendar: calendar)
@@ -202,9 +133,7 @@ public enum TodayWords {
         return (start..<end).formatted(style)
     }
 
-    /// A weekday names a day within the week either side; further out it is
-    /// the date (with the year when it is not this one), so a run a year away
-    /// never reads as this Thursday.
+    /// Name dates beyond the adjacent week so distant runs cannot look like this week’s weekday.
     public static func weekday(_ date: Date, now: Date = Date(), calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         let style = Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone)
         guard abs(date.timeIntervalSince(now)) >= 6.5 * 86_400 else { return date.formatted(style.weekday(.abbreviated)) }
@@ -212,8 +141,7 @@ public enum TodayWords {
         return date.formatted(sameYear ? style.month(.abbreviated).day() : style.month(.abbreviated).day().year())
     }
 
-    /// "Today", "Tonight", "Tomorrow" or the weekday — from the real date and
-    /// hour, so a 4:30 am dream is never called tonight's.
+    /// Use actual date and hour so early-morning dreams cannot appear as tonight’s.
     public static func dayWord(_ date: Date, now: Date = Date(), calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         if calendar.isDate(date, inSameDayAs: now) {
             return calendar.component(.hour, from: date) >= 18 ? "Tonight" : "Today"
@@ -223,8 +151,7 @@ public enum TodayWords {
         return date.formatted(Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone).weekday(.wide))
     }
 
-    /// Raw ids out of a line: `conversation-cbd5dce3af1b903c`, UUIDs, long
-    /// hex. What is left is tidied so no empty "()" or trailing colon remains.
+    /// Remove machine ids and tidy leftover punctuation so routing cannot leak into prose.
     public static func withoutIDs(_ text: String) -> String {
         var out = text
             .replacing(/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/, with: "")
@@ -238,9 +165,7 @@ public enum TodayWords {
         return out
     }
 
-    /// The honest date of something still open from an earlier day:
-    /// "Yesterday", then the weekday inside the last week, then "9 Sep".
-    /// Never "today" — a note that waited says how long it waited.
+    /// Show how long an open note has waited; never label earlier-day obligations as today.
     public static func dayLabel(_ date: Date, now: Date = Date(), calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         if calendar.isDateInYesterday(date) { return "Yesterday" }
         let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day ?? 0
@@ -248,8 +173,7 @@ public enum TodayWords {
         return date.formatted(Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone).day().month(.abbreviated))
     }
 
-    /// The first sentence of a source's own prose, stripped and bounded.
-    /// Never rewritten, only shortened.
+    /// Shorten source prose without rewriting it.
     public static func firstSentence(_ text: String, limit: Int = 180) -> String {
         let stripped = plain(text)
         guard !stripped.isEmpty else { return "" }
@@ -265,8 +189,7 @@ public enum TodayWords {
         return String(first).uppercased() + text.dropFirst()
     }
 
-    /// ISO-8601 with or without fractional seconds — the two shapes every
-    /// store in this app writes.
+    /// Accept both ISO-8601 timestamp shapes current stores write.
     public static func parseTimestamp(_ raw: String?) -> Date? {
         guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -277,52 +200,12 @@ public enum TodayWords {
 
 // MARK: - The dream digest
 
-/// Title + mood of the night's dream: the latest one, read through `DreamNight`
-/// like every other reader of the diary.
+/// Share `DreamNight` diary selection with every reader.
 public enum TodayDreamDigest {
     public static func parse(_ markdown: String) -> (title: String, mood: String)? {
         guard let dream = DreamNight(markdown).latest, let title = dream.title else { return nil }
         return (title, dream.mood ?? "")
     }
-}
-
-// MARK: - The snapshot her own lanes produce
-
-/// The lanes assembled by the engine's Today projection. File-backed reads
-/// run outside the main actor; views retain no second assembled day.
-public struct TodaySnapshot: Sendable, Equatable {
-    public var loaded = false
-    /// One folded row: "I kept six moments today", opening onto the quotes.
-    public var kept: TodayRow?
-    public var dream: TodayRow?
-    public var facing: TodayRow?
-    /// The enabled dream scheduler's next due time.
-    public var nextDream: TodayRow?
-    public var recollection: TodayRow?
-    /// A lane that could not be READ, as opposed to a lane that was read and
-    /// was empty. Same distinction DeskLaneState.classify keeps for the Desk:
-    /// a locked or corrupt memory store must never render as "nothing waiting,
-    /// nothing kept". The page says one grey line; the reason is not shown,
-    /// because a store error is machinery, not her day.
-    public var memoryUnreadable = false
-    public var projectionError: String?
-    public var ahead: [TodayRow] = []
-
-    public static let empty = TodaySnapshot()
-
-}
-
-/// Notes from earlier days that are not waiting on him: one group per source
-/// and title, so the same failure twice is one row.
-public struct TodayEarlierNote: Identifiable, Sendable {
-    public let id: String
-    public let title: String
-    public let isFailure: Bool
-    public var count: Int
-    /// The newest in the group — its date, and the note a click opens.
-    public var at: Date
-    public var oldest: Date
-    public var newest: InboxItemRecord
 }
 
 extension WorkOverviewRead {
@@ -336,11 +219,10 @@ extension WorkOverviewRead {
         max(0, (total ?? 0) - approvals)
     }
 
-    /// The same Desk/notes sentence in visible and quiet Today.
     public static func waitingDeskInput(count: Int, split: (items: Int, notes: Int)?) -> JSONValue {
-        .object(["mode":.string("waiting"),"count":.int(Int64(count)),"countWord":.string(DeskPageWords.spelledLower(count)),
-            "split":split.map { .object(["items":.int(Int64($0.items)),"notes":.int(Int64($0.notes)),
-                "itemsWord":.string(DeskPageWords.spelledLower($0.items)),"notesWord":.string(DeskPageWords.spelledLower($0.notes))]) } ?? .null])
+        .object(["mode": .string("waiting"), "count": .int(Int64(count)), "countWord": .string(DeskPageWords.spelledLower(count)),
+            "split": split.map { .object(["items": .int(Int64($0.items)), "notes": .int(Int64($0.notes)),
+                "itemsWord": .string(DeskPageWords.spelledLower($0.items)), "notesWord": .string(DeskPageWords.spelledLower($0.notes))]) } ?? .null])
     }
 
     public static func waitingSplit(kinds: [WorkOverviewReference.Kind: Int]?, onDesk: Int) -> (items: Int, notes: Int)? {
@@ -358,7 +240,7 @@ extension WorkOverviewRead {
             guard ($0.messageCount ?? 0) > 0,
                   let at = TodayWords.parseTimestamp($0.updatedAt ?? $0.createdAt),
                   calendar.isDate(at, inSameDayAs: now) else { return false }
-            return !ChatShellConversationRow.isWorking($0) && !ChatShellConversationRow.isHerOwn($0, openingLines: openingLines)
+            return !ChatShellConversationRow.isWorking($0) && !ChatShellConversationRow.isAgentOwn($0, openingLines: openingLines)
         }
             .map { ($0.id, ChatShellConversationRow.surface(for: $0)) }, uniquingKeysWith: { first, _ in first })
     }
@@ -378,82 +260,20 @@ extension WorkOverviewRead {
 
 }
 
-/// The assembled day for one engine. The window and semantic read render this
-/// same publication; source invalidation and cognition belong to this owner.
-private struct TodayDecision: Sendable {
-    struct Row: Sendable {
-        let id: String
-        let title: String
-        let line: String
-        let sources: [String]
-        let details: [String]
-    }
-    struct Earlier: Sendable {
-        let title: String
-        let sources: [String]
-        let failure: Bool
-        let count: Int
-    }
-    let did: [Row]
-    let ahead: [Row]
-    let earlier: [Earlier]
-    let omissions: [String]
-
-    init(face: PartFace) {
-        var omissions = face.sections.filter { $0.id.hasPrefix("omitted:") }.map { section in
-            let reason = section.rows.isEmpty ? "no source." : "missing facts: " + section.rows.map(\.id).joined(separator: ", ") + "."
-            return "Today row \(section.id.dropFirst("omitted:".count)) omitted: " + reason
-        }
-        func rows(_ prefix: String) -> [Row] {
-            face.sections.filter { $0.id.hasPrefix(prefix) }.compactMap { section in
-                let id=String(section.id.dropFirst(prefix.count))
-                guard let title = section.title else {
-                    omissions.append("Today row \(id) unavailable: missing title.")
-                    return nil
-                }
-                guard let first = section.rows.first else {
-                    omissions.append("Today row \(id) unavailable: missing source rows.")
-                    return nil
-                }
-                let details=face.sections.first { $0.id == "details:"+id }?.rows.map(\.title) ?? []
-                return Row(id:id,title:title,line:first.title,
-                    sources:section.rows.map(\.id),details:details)
-            }
-        }
-        did=rows("did:"); ahead=rows("ahead:")
-        var earlier: [Earlier] = []
-        for section in face.sections where section.id.hasPrefix("earlier:") {
-            for row in section.rows {
-                let failure=row.id.hasPrefix("failure:")
-                let newest=failure ? String(row.id.dropFirst("failure:".count)) : row.id
-                if let oldest=row.detail, let value=row.value, let count=Int(value), count>0 {
-                    earlier.append(Earlier(title:row.title,sources:newest == oldest ? [newest] : [newest,oldest],failure:failure,count:count))
-                } else { omissions.append("Earlier note \(newest) omitted: no count or bound date range.") }
-            }
-        }
-        self.earlier=earlier
-        self.omissions=omissions
-    }
-}
-
 private struct TodaySource: Sendable {
-    struct Fact: Sendable {
-        let at: Date
-        var start: Date?
-        var end: Date?
-        var horizon = false
-        var dreamDate: String?
-        var note: InboxItemRecord?
-    }
     var input: [String: JSONValue] = [:]
-    var facts: [String: Fact] = [:]
+    let epoch: UInt64
+    var owed = false
     var memoryUnreadable = false
     var dreamUnavailable = false
     var unavailable: [String] = []
 
     @MainActor
-    static func read(_ engine: NativeAgentEngine, activeSessionID: String) async -> TodaySource {
-        var source = TodaySource()
+    static func read(_ engine: NativeAgentEngine, activeSessionID: String) async throws -> TodaySource {
+        // Read the record position before the packet so a later packet cannot be replaced by an older reader.
+        let seq = try await ExperienceStore.at(engine.dataRoot).lastDetailSeq()
+        var source = TodaySource(epoch: UInt64(seq ?? 0))
+        source.input["recordSeq"] = seq.map(JSONValue.int) ?? .null
         var characterSet = Set<String>()
         let now = Date(), calendar = Calendar.autoupdatingCurrent
         func today(_ at: Date) -> Bool { calendar.isDate(at, inSameDayAs: now) }
@@ -479,12 +299,31 @@ private struct TodaySource: Sendable {
             source.unavailable.append("Notes source has not been read.")
         } else { notesState = engine.inbox.items.isEmpty ? "empty" : "available" }
         source.input["sourceStates"] = .object(["conversations": .string(sessionState), "notes": .string(notesState)])
+        let approvals = WorkOverviewRead.waitingApprovals(engine.approvals.records)
+        let asks = engine.inbox.items.filter { $0.requiresOwnerInput && !$0.hasLinkedApproval }.sorted { $0.created_at > $1.created_at }
+        var waiting = approvals.map { approval -> JSONValue in
+            let title = ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason)
+            return .object(["id": .string("approval:" + approval.id), "title": .string(title.isEmpty ? approval.action : title),
+                "detail": .string(TodayWords.line(approval.reason)), "open": .string("approval:" + approval.id)])
+        }
+        waiting += asks.map { item in
+            .object(["id": .string("card:" + item.id), "title": .string(item.title),
+                "detail": .string(TodayWords.line(item.summary)), "open": .string("card:" + item.id)])
+        }
+        if let line = engine.sync.standing?.waitingLine {
+            waiting.append(.object(["id": .string("phone"), "title": .string(line), "open": .string("page:pairing")]))
+        }
+        let onDesk = WorkOverviewRead.waitingOnDesk(total: engine.desk.ownerWaitingCount, approvals: approvals.count)
+        let split = WorkOverviewRead.waitingSplit(kinds: engine.desk.ownerWaitingKinds, onDesk: onDesk)
+        let deskCount = split?.items ?? onDesk
+        if deskCount > 0 { source.input["waitingDesk"] = WorkOverviewRead.waitingDeskInput(count: deskCount, split: split.map { ($0.items, 0) }) }
+        source.input["waitingRows"] = .array(waiting)
+        source.owed = !waiting.isEmpty || deskCount > 0
         do {
             let thinking = try await TurnTraceThinkingReader.shared.read(dataRoot: engine.dataRoot, now: now)
             func counts(_ value: TurnTraceThinkingReader.Counts) -> JSONValue {
                 .object(["calls": .int(Int64(value.calls)), "turns": .int(Int64(value.turns))])
             }
-            source.facts["thinking"] = .init(at: now)
             source.input["thinking"] = .object(["state": .string("available"), "at": .double(now.timeIntervalSince1970),
                 "today": counts(thinking.today), "week": counts(thinking.week)])
         } catch {
@@ -500,7 +339,6 @@ private struct TodaySource: Sendable {
                     let body = quote.isEmpty ? TodayWords.plain(record.text) : quote
                     if !body.isEmpty {
                         let key = "moment:" + record.id
-                        source.facts[key] = .init(at: at)
                         moments.append(.object(["key": .string(key), "at": .double(at.timeIntervalSince1970),
                             "quote": .string(TodayWords.bounded(body, limit: 200))]))
                     }
@@ -515,15 +353,21 @@ private struct TodaySource: Sendable {
         }
         do {
             let diary = try await engine.cognitionView.dreamDiary(limit: 1)
-            if (diary.unreadableEntries ?? 0) > 0 { source.dreamUnavailable = true }
+            if (diary.unreadableEntries ?? 0) > 0 {
+                source.dreamUnavailable = true
+                source.unavailable.append("Dream diary has unreadable entries.")
+            }
             if let entry = diary.entries.first {
                 let markdown = entry.text
-                if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { source.dreamUnavailable = true }
+                if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    source.dreamUnavailable = true
+                    source.unavailable.append("Dream entry is empty.")
+                }
                 if let at = TodayWords.parseTimestamp(entry.modifiedAt), today(at) {
                     if let digest = TodayDreamDigest.parse(markdown) {
-                        source.facts["dream"] = .init(at: at, dreamDate: entry.date)
                         source.input["dream"] = .object(["state": .string(source.dreamUnavailable ? "partial" : "available"),
-                            "title": .string(digest.title), "mood": .string(digest.mood), "at": .double(at.timeIntervalSince1970)])
+                            "title": .string(digest.title), "mood": .string(digest.mood), "at": .double(at.timeIntervalSince1970),
+                            "open": .string("dream:" + entry.date)])
                     } else {
                         source.dreamUnavailable = true
                         source.unavailable.append("Dream title unavailable.")
@@ -555,15 +399,16 @@ private struct TodaySource: Sendable {
                 source.unavailable.append("Dream schedule source absent."); scheduleUnavailable = true
             }
         }
-        if let next { source.facts["nextDream"] = .init(at: next) }
-        source.input["nextDream"] = .object(["state":.string(next != nil ? "available" : scheduleUnavailable ? "unavailable" : "empty"),"enabled":.bool(dreamEnabled),"at":next.map { .double($0.timeIntervalSince1970) } ?? .null])
+        source.input["nextDream"] = .object([
+            "state":.string(next != nil ? "available" : scheduleUnavailable ? "unavailable" : "empty"),
+            "enabled":.bool(dreamEnabled),
+            "at":next.map { .double($0.timeIntervalSince1970) } ?? .null])
         } catch {
             source.dreamUnavailable = true
             source.unavailable.append(error.localizedDescription)
             source.input["nextDream"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
         if let toward = await engine.cognitionView.towardRead() {
-            source.facts["facing"] = .init(at: toward.dueAt, horizon: !today(toward.dueAt))
             let weekday=toward.dueAt.formatted(Date.FormatStyle(calendar:calendar,timeZone:calendar.timeZone).weekday(.wide))
             source.input["toward"] = .object(["state":.string("available"),"label": .string(TodayWords.line(toward.displayLabel)),
                 "past":.bool(toward.dueAt <= now),"hour":.int(Int64(calendar.component(.hour,from:toward.dueAt))),
@@ -586,7 +431,6 @@ private struct TodaySource: Sendable {
                 guard let next, next >= now, next <= horizon,
                       MyQueue.until(entry).endsAt.map({ next < $0 }) ?? true else { return nil }
                 let key = "intention:" + entry.item.handle
-                source.facts[key] = .init(at: next)
                 return .object(["key": .string(key), "at": .double(next.timeIntervalSince1970),
                     "time": .string(ResidentWake.shown(next)), "words": .string(entry.step.words)])
             }
@@ -595,23 +439,15 @@ private struct TodaySource: Sendable {
             source.unavailable.append("Intentions source unavailable: " + error.localizedDescription)
             source.input["intentions"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
-        var recollections: [JSONValue] = [], builders: [JSONValue] = []
+        var builders: [JSONValue] = []
         var loaded: [String: [ChatMessage]] = [:]
         for id in WorkOverviewRead.todaySessionIDs(sessions) {
             do {
                 let transcript = try await engine.transcripts.loadTranscript(sessionId: id, cached: true)
                 loaded[id] = transcript.messages
-                for row in transcript.recollections {
-                    if let at = row.createdAt, today(at) {
-                        let key = "recollection:" + (row.rowId ?? row.sessionId)
-                        source.facts[key] = .init(at: at)
-                        recollections.append(.object(["key": .string(key), "at": .double(at.timeIntervalSince1970),
-                            "text": .string(TodayWords.firstSentence(row.text))]))
-                    }
-                }
             } catch { source.unavailable.append("Transcript \(id): \(error.localizedDescription)") }
         }
-        // The open thread's live persisted rows belong to the same canonical owner.
+        // Read open-thread rows from the same canonical owner.
         if !activeSessionID.isEmpty { loaded[activeSessionID] = engine.transcripts.messages(for: activeSessionID) }
         let surfaces = WorkOverviewRead.conversationSurfaces(sessions, openingLines: engine.transcripts.openingLines)
         var conversations: [JSONValue] = []
@@ -633,12 +469,12 @@ private struct TodaySource: Sendable {
                     if let first = turns.first { start = turns.first(where: { $0.1 })?.0 ?? first.0 }
                 }
                 let key = "conversation:" + session.id
-                source.facts[key] = .init(at: start ?? end, start: start, end: end)
-                conversations.append(.object(["key": .string(key), "surface": .string(surface),"at":.double((start ?? end).timeIntervalSince1970),
+                conversations.append(.object(["key": .string(key), "surface": .string(surface),
+                    "open": .string("chat:" + session.id), "at": .double((start ?? end).timeIntervalSince1970),
                     "start":start.map { .double($0.timeIntervalSince1970) } ?? .null,"end":.double(end.timeIntervalSince1970)]))
             }
         }
-        // Provenance is admission evidence, never inferred from titles or prose.
+        // Admit provenance from recorded evidence, never titles or prose.
         let contacts: [AgentPeerContact]?
         do { contacts = try AgentPeerStore(dataRoot: engine.dataRoot).list() }
         catch {
@@ -654,31 +490,37 @@ private struct TodaySource: Sendable {
                    let agent = origin.agent?.trimmingCharacters(in: .whitespacesAndNewlines), !agent.isEmpty,
                    let contacts,
                    let at = TodayWords.parseTimestamp(message.createdAt), at <= now, today(at) {
+                    // A peer's reply to the agent's send is authored "agent" and names its one sender in peerSources.
+                    let sourced = Set(([agent] + (origin.peerSources ?? [])).filter { $0.hasPrefix("peer:") })
                     let peerID = message.metadata?.envelope?.verifiedUserId
-                        ?? (agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : nil)
+                        ?? (sourced.count == 1 ? sourced.first.map { String($0.dropFirst(5)) } : nil)
                     let name = peerID.flatMap { id in contacts.first { $0.id == id }?.name }
-                    let display = name ?? (peerID == nil && agent != "agent" ? agent : "another agent")
+                    // A named agent is a proper name; one that did not name itself stays "another agent" mid-sentence.
+                    let display = name ?? (peerID == nil && agent != "agent" ? TodayWords.capitalizedFirst(agent) : "another agent")
                     let key = "builder:" + sessionID + ":" + message.id
-                    source.facts[key] = .init(at: at)
-                    builders.append(.object(["key": .string(key), "session": .string(sessionID), "agent": .string(TodayWords.line(display, limit: 80)),"at":.double(at.timeIntervalSince1970)]))
+                    builders.append(.object([
+                        "key": .string(key),
+                        "session": .string(sessionID), "open": .string("chat:" + sessionID),
+                        "agent": .string(TodayWords.line(display, limit: 80)),
+                        "at":.double(at.timeIntervalSince1970)]))
                 }
             }
         }
         let notes = engine.inbox.items.filter { $0.isActivityPending && !$0.isSystemLane }.compactMap { item -> JSONValue? in
             if let at = TodayWords.parseTimestamp(item.created_at) {
                 let key = "inbox:" + item.id
-                source.facts[key] = .init(at: at, note: item)
-                // Only the native owner's job identity is allowed to bind a fold.
+                // Only native owner job identity may bind a folded group.
                 let job = item.relatedDelegationID.flatMap { $0.isEmpty ? nil : $0 }
-                return .object(["key": .string(key), "at": .double(at.timeIntervalSince1970), "today": .bool(today(at)),
+                return .object(["key": .string(key), "open": .string("card:" + item.id),
+                    "at": .double(at.timeIntervalSince1970), "today": .bool(today(at)),
                     "source": .string(item.source), "title": .string(TodayWords.withoutIDs(TodayWords.line(item.title,limit:90))),
                     "summary": .string(TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))), "job": job.map(JSONValue.string) ?? .null])
             }
             source.unavailable.append("Note time unavailable: " + item.id)
             return nil
         }
-        source.input["recollections"] = .array(recollections)
-        source.input["conversations"] = .array(conversations.sorted { ($0.objectValue?["key"]?.stringValue ?? "") < ($1.objectValue?["key"]?.stringValue ?? "") })
+        source.input["conversations"] = .array(conversations
+            .sorted { ($0.objectValue?["key"]?.stringValue ?? "") < ($1.objectValue?["key"]?.stringValue ?? "") })
         source.input["builders"] = .array(builders.sorted { ($0.objectValue?["key"]?.stringValue ?? "") < ($1.objectValue?["key"]?.stringValue ?? "") })
         source.input["notes"] = .array(notes)
         source.input["availability"] = .object(["state": .string(source.unavailable.isEmpty ? "available" : "partial"),
@@ -702,95 +544,62 @@ private struct TodaySource: Sendable {
             lhs.utf16.count != rhs.utf16.count ? lhs.utf16.count > rhs.utf16.count : lhs < rhs
         }
         source.input["clusters"] = .array(clusters.map(JSONValue.string))
+        try Task.checkCancellation()
         return source
     }
 
-    func row(_ decision: TodayDecision.Row) throws -> TodayRow {
-        let sources = try decision.sources.map { key -> Fact in
-            if let fact = facts[key] { return fact }
-            throw PartCallError(code: "unbound_source", message: "Today row names an unknown source: " + key)
-        }
-        guard let firstSource = sources.first, let first = sources.map(\.at).min(),
-              let end = sources.map({ $0.end ?? $0.at }).max() else {
-            throw PartCallError(code: "unbound_source", message: "Today row has no source.")
-        }
-        var at = first, gutter: String?, span: TodayRow.Span?
-        if decision.id == "talked" {
-            let start = sources.compactMap(\.start).min()
-            at = start ?? end
-            span = .init(start:start,end:end)
-        } else if decision.id == "kept" || decision.id == "worked" || decision.id.hasPrefix("claude-fold:") {
-            gutter = TodayWords.clockSpan(first,end)
-        }
-        return TodayRow(id: decision.id, title: decision.title, line: decision.line, at: at,
-            isHorizon: firstSource.horizon, details: decision.details, gutter: gutter, dreamDate: firstSource.dreamDate,liveSpan:span)
-    }
 }
 
+/// Feeds the page owner; the face is the only Today model every door reads.
 @MainActor
 @Observable
 public final class TodayReadout {
-    public private(set) var snapshot = TodaySnapshot.empty
-    public private(set) var didRows: [TodayRow] = []
-    public private(set) var earlierNotes: [TodayEarlierNote] = []
-    public private(set) var noteItems: [String: InboxItemRecord] = [:]
-    private var dayFaces: PartFaces?
-    @ObservationIgnored private var dayInput: JSONValue?
-    @ObservationIgnored private var dayEpoch: UInt64 = 0
-    private var waitingFaces: PartFaces?
-    @ObservationIgnored private var waitingInput: JSONValue?
-    @ObservationIgnored private var waitingEpoch: UInt64 = 0
-
-    public func waitingLine(count: Int, split: (items: Int, notes: Int)?) -> String {
-        if waitingInput != WorkOverviewRead.waitingDeskInput(count:count,split:split) { return "Reading Today…" }
-        if let snapshot=waitingFaces?.snapshots["today-readout"], snapshot.sourceEpoch == waitingEpoch { return waitingWords(snapshot) }
-        return "Today readout unavailable."
-    }
-
-    private func waitingWords(_ snapshot: PartFaceSnapshot) -> String {
-        if snapshot.status == .ready, let text=snapshot.face?.sections.first?.rows.first?.title { return text }
-        return "Today "+snapshot.status.rawValue+": "+(snapshot.error?.message ?? snapshot.status.rawValue)
-    }
-
-    public func prepareWaiting(_ engine: NativeAgentEngine, count: Int, split: (items: Int, notes: Int)?) async -> String {
-        let input=WorkOverviewRead.waitingDeskInput(count:count,split:split)
-        if waitingInput != input { waitingInput=input; waitingEpoch += 1 }
-        let faces: PartFaces
-        if let existing = waitingFaces { faces = existing } else {
-            let root=engine.dataRoot, cognition=engine.ports.cognitionHost
-            faces=PartFaces(dataRoot:root) { id,input,version in
-                await cognition.readoutFace(id:id,input:input,version:version,dataRoot:root)
-            }
-            waitingFaces = faces
-        }
-        return waitingWords(await faces.sourceChanged(id:"today-readout",epoch:waitingEpoch,input:input))
-    }
-    public var dreamUnavailable = false
     private var readCount = 0
     public var isReading: Bool { readCount > 0 }
     @ObservationIgnored private var sourceTask: Task<Void, Never>?
-    @ObservationIgnored private lazy var dayRead = LatestRead()
+    @ObservationIgnored private var inboxTask: Task<Void, Never>?
+    @ObservationIgnored private lazy var sourceRead = LatestRead()
+    @ObservationIgnored private var watchedSessions: [String] = []
+    /// The conversation the Mac has open, read live rather than from disk; empty when no door has one open.
+    @ObservationIgnored public var activeSessionID = ""
+    /// What a door that is showing Today also refreshes on each change (the Mac's queues and work status); nil when no door shows it.
+    @ObservationIgnored public var extras: (@MainActor () async -> Void)?
 
     public nonisolated init() {}
 
     deinit {
         sourceTask?.cancel()
+        inboxTask?.cancel()
     }
 
-    public func start(engine: NativeAgentEngine,
-               activeSessionID: @escaping @MainActor () -> String,
-               refreshQueues: @escaping @MainActor () async -> Void,
-               publishWorkStatus: @escaping @MainActor () async -> Void) {
+    /// Today is read by its owner from launch, at every change of what it reads, for every door; no door's view starts it. A change in
+    /// today's conversations re-arms the watch over their transcripts.
+    public func start(engine: NativeAgentEngine) {
         stop()
         let root = engine.dataRoot
-        let transcripts = WorkOverviewRead.todaySessionIDs(engine).compactMap {
+        watchedSessions = WorkOverviewRead.todaySessionIDs(engine)
+        let transcripts = watchedSessions.compactMap {
             NativeAgentChatSessionID.normalizedPathComponent($0)
                 .map { root.appendingPathComponent("chat/messages/\($0).jsonl") }
         }
-        sourceTask = Task { [weak self, weak engine] in
+        let refresh: @MainActor @Sendable () async -> Void = { [weak self, weak engine] in
+            guard let self, let engine else { return }
+            await self.extras?()
+            await self.refresh(engine, activeSessionID: self.activeSessionID)
+        }
+        // What is for the person lives in memory (ForPerson); its changes wake Today, never a file watch.
+        inboxTask = Task {
+            let debouncer = StoreReloadDebouncer(delay: .milliseconds(250)) { await refresh() }
+            await debouncer.setVisible(true)
+            for await _ in await ForPerson.at(root).changes() {
+                guard !Task.isCancelled else { break }
+                await debouncer.signal()
+            }
+            await debouncer.cancel()
+        }
+        sourceTask = Task {
             await EventDeadlinePhysiology.refreshOnChanges(paths: [
                 root.appendingPathComponent("workflows/approvals/requests.json"),
-                root.appendingPathComponent("notifications/inbox.jsonl"),
                 root.appendingPathComponent("memory/memory.sqlite"),
                 root.appendingPathComponent("memory/memory.sqlite-wal"),
                 root.appendingPathComponent("trust/policy.json"),
@@ -801,10 +610,10 @@ public final class TodayReadout {
                 root.appendingPathComponent("chat/sessions.json"),
                 root.appendingPathComponent("chat/messages", isDirectory: true),
             ] + transcripts, notifications: [.NSSystemTimeZoneDidChange, .NSCalendarDayChanged,
-                .turnTraceTerminalPersisted, AbilityStore.didChange]) {
-                await refreshQueues()
-                await publishWorkStatus()
-                if let engine { await self?.refresh(engine, activeSessionID: activeSessionID()) }
+                .turnTraceTerminalPersisted, AbilityStore.didChange]) { [weak self, weak engine] in
+                await refresh()
+                guard let self, let engine else { return }
+                if WorkOverviewRead.todaySessionIDs(engine) != self.watchedSessions { self.start(engine: engine) }
             }
         }
     }
@@ -812,82 +621,28 @@ public final class TodayReadout {
     public func stop() {
         sourceTask?.cancel()
         sourceTask = nil
+        inboxTask?.cancel()
+        inboxTask = nil
     }
 
     public func refresh(_ engine: NativeAgentEngine, activeSessionID: String) async {
         readCount += 1
         defer { readCount -= 1 }
-        await dayRead.read({
-            let source = await TodaySource.read(engine, activeSessionID: activeSessionID)
-            var snapshot = TodaySnapshot()
-            snapshot.loaded = true
-            snapshot.memoryUnreadable = source.memoryUnreadable
-            do {
-                let input = JSONValue.object(source.input)
-                if dayInput != input { dayInput=input; dayEpoch += 1 }
-                let faces: PartFaces
-                if let existing = dayFaces { faces = existing } else {
-                    let root=engine.dataRoot, cognition=engine.ports.cognitionHost
-                    faces=PartFaces(dataRoot:root) { id,input,version in
-                        await cognition.readoutFace(id:id,input:input,version:version,dataRoot:root)
-                    }
-                    dayFaces = faces
-                }
-                let projected=await faces.sourceChanged(id:"today-readout",epoch:dayEpoch,input:input)
-                if projected.status != .ready {
-                    throw projected.error ?? PartCallError(code:projected.status.rawValue,message:"The Today projection is unavailable.")
-                }
-                guard let face = projected.face else { throw PartCallError(code:"bad_face",message:"The Today projection returned no face.") }
-                let decision=TodayDecision(face:face)
-                var unavailable = source.unavailable + decision.omissions
-                func bindRows(_ rows: [TodayDecision.Row]) -> [TodayRow] {
-                    rows.compactMap { row in
-                        do { return try source.row(row) }
-                        catch {
-                            unavailable.append("Today row \(row.id) omitted: " + error.localizedDescription)
-                            return nil
-                        }
-                    }
-                }
-                let did = bindRows(decision.did)
-                let ahead = bindRows(decision.ahead)
-                snapshot.ahead = ahead
-                let byID = Dictionary((did + ahead).map { ($0.id,$0) }, uniquingKeysWith: { first, _ in first })
-                snapshot.kept = byID["kept"]; snapshot.dream = byID["dream"]
-                snapshot.facing = byID["facing"] ?? byID["facingDream"]
-                snapshot.nextDream = byID["nextDream"]
-                snapshot.recollection = did.first { $0.id.hasPrefix("recollection:") }
-                let earlier = decision.earlier.compactMap { group -> TodayEarlierNote? in
-                    do {
-                        let notes = try group.sources.map { key -> (InboxItemRecord,Date) in
-                            if let fact = source.facts[key], let note = fact.note { return (note,fact.at) }
-                            throw PartCallError(code: "unbound_source", message: "Earlier note names an unknown source: " + key)
-                        }.sorted { $0.1 > $1.1 }
-                        guard let newest = notes.first, let oldest = notes.last else {
-                            throw PartCallError(code: "unbound_source", message: "Earlier note has no source.")
-                        }
-                        return TodayEarlierNote(id: group.sources.joined(separator: "|"), title: group.title,
-                            isFailure: group.failure, count: group.count, at: newest.1,
-                            oldest: oldest.1, newest: newest.0)
-                    } catch {
-                        unavailable.append("Earlier note \(group.sources.joined(separator: "|")) omitted: " + error.localizedDescription)
-                        return nil
-                    }
-                }
-                var items: [String: InboxItemRecord] = [:]
-                let boundIDs = Set(did.map(\.id))
-                for row in decision.did where row.sources.count == 1 && boundIDs.contains(row.id) {
-                    if let note = source.facts[row.sources[0]]?.note { items[row.id] = note }
-                }
-                snapshot.projectionError = unavailable.isEmpty ? nil : unavailable.joined(separator: "; ")
-                return (snapshot,did,earlier,items,source.dreamUnavailable)
-            } catch {
-                snapshot.projectionError = "Today unavailable: " + error.localizedDescription
-                return (snapshot,[],[],[:],source.dreamUnavailable)
-            }
-        }, publish: {
-            (snapshot, didRows, earlierNotes, noteItems, dreamUnavailable) = $0
-        })
+        let epoch = engine.pages.snapshots["today"]?.sourceEpoch ?? 0
+        var packet: Result<TodaySource, Error>?
+        await sourceRead.read({
+            do { return Result<TodaySource, Error>.success(try await TodaySource.read(engine, activeSessionID: activeSessionID)) }
+            catch { return .failure(error) }
+        }, publish: { packet = $0 })
+        guard let packet, !Task.isCancelled else { return }
+        switch packet {
+        case .success(let source):
+            await engine.pages.sourceChanged(id: "today-readout", page: "today", epoch: source.epoch,
+                input: .object(source.input), owed: source.owed)
+        case .failure(let error):
+            if error is CancellationError { return }
+            // A failed record read publishes only its cause, never an empty day.
+            await engine.pages.publish(page: "today", epoch: epoch) { throw error }
+        }
     }
-
 }

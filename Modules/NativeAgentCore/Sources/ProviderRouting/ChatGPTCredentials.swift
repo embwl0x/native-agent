@@ -6,14 +6,13 @@ import PersistenceCore
 import TurnTrace
 // Blueprint: | `ChatGPTCredentials.swift` | ChatGPTTransport credential discovery, exact account binding and serialized single-use token refresh |
 extension ChatGPTTransport {
-    /// Explicit injection wins; otherwise use the shared credential discovery
-    /// and CLI-adoption consent rules in OpenAIOAuthCredentials.
-    /// Effort levels the signed-in account's discovered catalog lists for `model`.
-    func accountModel(_ model: String) -> CodexAccountModelCatalog.Model? {
+    /// Explicit injection wins; otherwise use the shared credential discovery and CLI-adoption consent rules in OpenAIOAuthCredentials. Effort levels the
+    /// signed-in account's discovered catalog lists for `model`.
+    func accountModel(_ model: String, preview: Bool = false) -> CodexAccountModelCatalog.Model? {
         CodexAccountModelCatalog.matchingModels(
             providerID: "openai_oauth_direct",
             oauthAuthURL: resolveAuthPath(),
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(), preview: preview
         ).first { $0.id == model }
     }
     func resolveAuthPath() -> URL {
@@ -60,8 +59,7 @@ extension ChatGPTTransport {
         return (usable, detail, OAuthCredentialHealth(configured: usable, expiresAt: expiry.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             canRefresh: canRefresh, requiresRefresh: !fresh))
     }
-    /// The CLI owns token rotation. Re-read its file once on expiry or 401;
-    /// never acquire a credential lock or spend its single-use refresh grant.
+    /// The CLI owns token rotation. Re-read its file once on expiry or 401; never acquire a credential lock or spend its single-use refresh grant.
     private func rereadCLIAccessToken(
         at path: URL, staleToken: String?, requestAccount: OAuthRequestAccount
     ) throws -> String {
@@ -79,15 +77,13 @@ extension ChatGPTTransport {
         }
         return access
     }
-    /// Re-read under path-scoped refresh serialization and retain the request's
-    /// account binding. A forced refresh reuses a token rotated since staleToken.
+    /// Re-read under path-scoped refresh serialization and retain the request's account binding. A forced refresh reuses a token rotated since staleToken.
     func ensureFreshAccessToken(
         forceRefresh: Bool = false,
         staleToken: String? = nil,
         requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
         try OAuthProductionSession.validate(session)
-        // Fast path OUTSIDE the lock — check disk; return if still fresh.
         let path = resolveAuthPath()
         let isCLI = Self.isUserCodexPath(path)
         guard let blob0 = try Self.loadAuthBlob(at: path) else {
@@ -108,17 +104,15 @@ extension ChatGPTTransport {
                 requestAccount: requestAccount)
         }
         if !forceRefresh {
-            // Freshness uses the earlier of JWT exp and persisted expires_at.
+            // The earlier JWT or persisted expiry bounds freshness.
             if Self.accessTokenIsFresh(Self.effectiveExpiry(access0, blob: blob0), buffer: Int(OAuthGrantOperations.renewalMargin)) {
                 return access0
             }
-            // Missing expiry requires refresh.
+            // Unknown expiry requires refresh.
         }
-        // Slow path — serialize via the refresh queue so concurrent callers
-        // share ONE refresh instead of double-rotating refresh_token.
+        // Serialize refreshes to avoid spending a single-use token twice.
         return try await Self.sharedRefreshActor(for: path).run {
-            // Re-load INSIDE the critical section: another waiter may have
-            // already refreshed while we were queued.
+            // Re-read inside the queue because a preceding waiter may have rotated the token.
             guard self.resolveAuthPath().standardizedFileURL == path.standardizedFileURL else {
                 throw OAuthRequestAccount.changed("openai_oauth_direct")
             }
@@ -136,19 +130,16 @@ extension ChatGPTTransport {
             }
             if !forceRefresh {
                 if Self.accessTokenIsFresh(Self.effectiveExpiry(access, blob: blob), buffer: Int(OAuthGrantOperations.renewalMargin)) {
-                    return access  // someone else already refreshed
+                    return access
                 }
             }
             return try await self.refreshTokens(at: path, baseline: baseline, blob: blob, requestAccount: requestAccount)
         }
     }
-    /// Codex refreshes on its own once a token is inside its last 5 minutes,
-    /// and a child job can run for many minutes, so a child starts only with
-    /// an hour or more left.
+    /// A child may run for minutes and the CLI refreshes in its last five, so require an hour of validity at spawn.
     private static let codexChildRefreshBufferSec: Int = 3_600
 
-    /// Validate the selected credential before spawning. App-owned credentials
-    /// renew through the normal refresh queue and sync their access-only copy;
+    /// Validate the selected credential before spawning. App-owned credentials renew through the normal refresh queue and sync their access-only copy;
     /// CLI-owned sessions remain read-only. Never resolve a second path here.
     public static func prepareCodexChildHome(_ codexHome: URL, authPath: URL) async throws {
         guard credentialStatus(try loadAuthBlob(at: authPath), path: authPath).usable else {
@@ -167,7 +158,6 @@ extension ChatGPTTransport {
         }
         try syncCodexChildCopy(from: authPath)
     }
-    /// Refresh and persist tokens at the original app-owned path.
     @discardableResult
     private func refreshTokens(
         at path: URL, baseline: Data, blob: [String: Any], requestAccount: OAuthRequestAccount
@@ -229,8 +219,7 @@ extension ChatGPTTransport {
         if let idToken = payload["id_token"] as? String, !idToken.isEmpty {
             merged["id_token"] = idToken
         }
-        // Re-extract account_id if the new access token has one and we
-        // don't already have it persisted (fresh sign-in path).
+        // Fresh sign-ins may need account_id extracted from the new access token.
         if let access = merged["access_token"] as? String,
            (merged["account_id"] as? String)?.isEmpty ?? true {
             if let acct = Self.extractAccountIDFromJWT(access) {
@@ -243,14 +232,12 @@ extension ChatGPTTransport {
         newBlob.removeValue(forKey: "expires_at")
         newBlob.removeValue(forKey: "expires_in")
         newBlob["expires_at"] = answer.expiresIn.map { NativeTimestampFormat.plainZulu(Date().addingTimeInterval($0)) }
-        // Compare original bytes and write under the sign-in/sign-out credential
-        // lock. Changed/deleted credentials must not be overwritten or resurrected;
+        // Compare original bytes and write under the sign-in/sign-out credential lock. Changed/deleted credentials must not be overwritten or resurrected;
         // any replacement token must still match the request's original account.
         enum RefreshWrite { case wrote, superseded(Data), supersededAndGone }
         let outcome: RefreshWrite
         do {
-            // Serialize the blob to bytes outside the closure so we don't
-            // carry a non-Sendable [String: Any] across the boundary.
+            // Serialize before crossing the closure boundary to avoid sending non-Sendable JSON.
             let bytes = try JSONSerialization.data(
                 withJSONObject: newBlob,
                 options: [.prettyPrinted, .sortedKeys]
@@ -259,9 +246,7 @@ extension ChatGPTTransport {
                 guard let current = try ProviderStateValidation.dataIfPresent(at: path) else { return .supersededAndGone }
                 guard current == baseline else { return .superseded(current) }
                 try Self.writeAuthBytesAtomically(bytes, to: path)
-                // The rotation is already on disk, so a failed child copy must
-                // not fail this refresh; the next Codex spawn re-syncs it and
-                // fails loudly there (`prepareCodexChildHome`).
+                // A failed child copy cannot invalidate a persisted rotation; the next spawn re-syncs it and reports failure there.
                 do {
                     try Self.writeCodexChildCopy(bytes, of: path)
                 } catch {

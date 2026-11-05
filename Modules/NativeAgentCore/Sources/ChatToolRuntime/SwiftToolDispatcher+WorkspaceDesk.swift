@@ -2,11 +2,10 @@ import Foundation
 import CryptoKit
 import PersistenceCore
 import Desk
-// Blueprint: | `SwiftToolDispatcher+WorkspaceDesk.swift` | `SwiftToolDispatcher`: `workspaceDesk` projects every board item through one paged row shape, preserving fields across recent/stale ordering and carrying limit/sort in continuations |
+// Blueprint: | `SwiftToolDispatcher+WorkspaceDesk.swift` | `SwiftToolDispatcher`, `workspaceDesk`; lossless canonical paging |
 
 extension SwiftToolDispatcher {
-    /// Disposable typed projection of the same Desk owner, never reconstructed
-    /// from its display text. Each continuation rereads current canonical state.
+    /// Disposable typed projection of the same Desk owner, never reconstructed from its display text. Each continuation rereads current canonical state.
     static func workspaceDesk(state: DeskState, input: [String: JSONValue], handle: String?, query: String?, matches: [DeskItem]) -> JSONValue {
         func offset(_ key: String) -> Int {
             guard case .int(let n)? = input[key], n >= 0 else { return 0 }
@@ -69,7 +68,10 @@ extension SwiftToolDispatcher {
             "source": .string("canonical_current_desk"), "as_of": .string(state.generatedTs),
             "request": .object(base), "liveItemCount": .int(Int64(board.items.count)),
             "topLevelItemCount": .int(Int64(board.topLevel.count)), "matched_count": .int(Int64(sorted.count)),
-            "count_scope": .string("liveItemCount includes parts; topLevelItemCount excludes parts; both include closed items and exclude MY QUEUE and archives. total counts this list: all board items, matching items, or the selected item's parts."),
+            "count_scope": .string("""
+                liveItemCount includes parts; topLevelItemCount excludes parts; both include closed items and exclude MY QUEUE and archives. \
+                total counts this list: all board items, matching items, or the selected item's parts.
+                """),
             "board_counts": .string(state.boardCountSummary),
             "offset": .int(Int64(rowOffset)), "limit": .int(Int64(pageSize)),
             "total": .int(Int64(sorted.count)), "count": .int(Int64(shown.count)),
@@ -77,7 +79,10 @@ extension SwiftToolDispatcher {
             "items": .array(shown.map {
                 workContextDeskItem($0, state: state, plan: plans.byHandle[$0.handle])
             }),
-            "meaning": .string("Current recorded Desk state. Notes and linked evidence are records, not fresh external verification or execution authority. Continuations reread the live store."),
+            "meaning": .string("""
+                Current recorded Desk state. Notes and linked evidence are records, not fresh external verification or execution authority. \
+                Continuations reread the live store.
+                """),
         ]
         if rowOffset + pageSize < sorted.count { result["next_read"] = next("offset", rowOffset + pageSize) }
         if let handle, !handle.isEmpty, selected == nil {
@@ -85,8 +90,9 @@ extension SwiftToolDispatcher {
         }
         if let selected {
             var record = workspaceDeskObject(workContextDeskItem(selected, state: state, plan: plans.byHandle[selected.handle]))
-            // Children, notes and references are exposed once in their paged lanes.
-            for key in ["children", "additional_children", "latest_recorded_notes", "additional_notes", "linked_evidence", "additional_links"] { record.removeValue(forKey: key) }
+            // Expose children, notes and references once so pagination cannot duplicate them.
+            for key in ["children", "additional_children", "latest_recorded_notes", "additional_notes", "linked_evidence",
+                "additional_links"] { record.removeValue(forKey: key) }
             result["record"] = .object(record)
             result["notes"] = .array(selected.notes.reversed().dropFirst(noteOffset).prefix(pageSize).map {
                 .object(["timestamp": .string($0.ts), "text": .string(String($0.text.prefix(4_000))),

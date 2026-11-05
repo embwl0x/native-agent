@@ -1,18 +1,17 @@
 import Foundation
+import NativeAgentCore
 import Desk
 import PersistenceCore
 import StandingBots
-import WorkshopExecution
 import TurnTrace
 import TrustCenter
 import TriggerScheduler
 import ToolExecution
-// Blueprint: | `DeskContinuationScheduler.swift` | `DeskContinuationScheduler` actor; `nextDeadline`, `runDue`; checkpointed runs retain their process-resume owner; `prompt` calls the editable `turn-continuation` seed through L0, then inserts native checkpoint evidence into typed cue slots without sending receipt/partial-reply text into JavaScript; claims, verification and CAS stay native; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
+// Blueprint: | `DeskContinuationScheduler.swift` | `DeskContinuationScheduler`, `nextDeadline`, `runDue`, `prompt`, `turn-continuation`; native claims |
 
 public actor DeskContinuationScheduler {
     public static let ownerReceiptChanged = Notification.Name("NativeAgent.desk.ownerReceiptChanged")
-    /// A domain's answer about one pending step. `waiting`: its owner is still
-    /// working. `unknown`: no verified receipt — the continuation stops and asks.
+    /// Unknown has no verified receipt and must stop to ask; waiting remains owned by the working domain.
     public enum Verdict: Sendable { case settled(String), waiting, unknown(String) }
     public typealias Resume = @Sendable (DeskItem, DeskContinuation) async throws -> Void
     public typealias Verify = @Sendable (DeskContinuation.Step, DeskContinuation) async throws -> Verdict
@@ -39,12 +38,15 @@ public actor DeskContinuationScheduler {
                 let runs: Result<Set<String>, Error>
                 if let cached = checkpoints[sessionId] { runs = cached }
                 else {
-                    // Each checkpoint is read on its own: one damaged file never hides the
-                    // readable ones, and a damaged file might be this run's, so it counts.
+                    // Isolate damaged checkpoints so readable siblings remain visible; a damaged file may still belong to this run.
                     runs = Result {
                         var ids = Set<String>()
                         for turnId in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: sessionId) {
-                            do { if let checkpoint = try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId) { ids.insert(checkpoint.runId) } }
+                            do { if let checkpoint = try TurnCheckpoint.read(
+                                dataRoot: dataRoot,
+                                sessionId: sessionId,
+                                turnId: turnId
+                            ) { ids.insert(checkpoint.runId) } }
                             catch { ids.insert(record.runID) }
                         }
                         return ids
@@ -62,15 +64,12 @@ public actor DeskContinuationScheduler {
         switch record.state {
         case .ready: return true
         case .running: return record.processID != DeskContinuationScope.processID
-        // A stopped continuation asked on the task; reopening it re-checks.
         case .blocked: return item.status != .blocked
         case .complete, .canceled, .stopped: return false
         }
     }
 
-    /// When the task is actionable by Desk sequencing — its own and every
-    /// ancestor's blockers and deferrals respected. Nil while a blocker or
-    /// cycle holds it; a deferral only moves the date.
+    /// Ancestor blockers and deferrals constrain actionability; a cycle cannot supply a deadline.
     private func dueDate(_ item: DeskItem, in state: DeskState, now: Date,
                          checkpoints: inout [String: Result<Set<String>, Error>],
                          plans: inout [Date: DeskSequencing.Plan]) -> Date? {
@@ -85,8 +84,7 @@ public actor DeskContinuationScheduler {
         }
         if plans[at] == nil { plans[at] = DeskSequencing.compute(state, now: at) }
         guard plans[at]?.byHandle[item.handle]?.isReady == true else { return nil }
-        // The owner receipt, rather than a retry date, makes a waiting step
-        // actionable. This also retires dates saved by the old minute poll.
+        // Only an owner receipt makes a waiting step actionable; a retry date is not completion evidence.
         return record.reason == "waiting_for_owner_receipt" ? at : max(record.nextRunAt, at)
     }
 
@@ -99,9 +97,7 @@ public actor DeskContinuationScheduler {
             var plans: [Date: DeskSequencing.Plan] = [:]
             let now = Date()
             return state.items.compactMap { item -> Date? in
-                // Bot/workshop invalidations re-check these receipts. A
-                // waiting owner has no crossing of its own; an ancestor's
-                // deferral still does.
+                // Owner invalidations settle waiting receipts; ancestor deferrals can still book a deadline.
                 let due = dueDate(item, in: state, now: now, checkpoints: &checkpoints, plans: &plans)
                 if item.continuation?.reason == "waiting_for_owner_receipt",
                    let due, due <= now { return nil }
@@ -127,9 +123,7 @@ public actor DeskContinuationScheduler {
                 var unknown: [DeskContinuation.Step] = []
                 for var step in record.pending {
                     let verdict: Verdict
-                    // Reopening a stopped task settles nothing: every pending step
-                    // is re-checked through its domain, except a read by its
-                    // tool's declared class, which changed nothing to verify.
+                    // Reopening settles nothing: verify each pending effect through its domain; declared reads changed nothing.
                     if try Self.declaredRead(step) { verdict = .settled("interrupted read; no effects") }
                     else if step.owner == "helper" { verdict = try helperReceipt(step) }
                     else { verdict = try await verify(step, record) }
@@ -150,9 +144,7 @@ public actor DeskContinuationScheduler {
                 record.pending = unresolved
                 record.revision = UUID().uuidString
                 if !unresolved.isEmpty {
-                    // A wake can race the owner's completion, or be this record's
-                    // own write. Keep a still-waiting receipt unchanged, so the
-                    // Desk invalidation cannot manufacture another retry.
+                    // A wake may race completion or echo this write; unchanged waiting receipts must not manufacture retries.
                     if unknown.isEmpty, pendingUnchanged, record.state == .ready,
                        record.reason == "waiting_for_owner_receipt" { continue }
                     record.state = unknown.isEmpty ? .ready : .blocked
@@ -190,9 +182,7 @@ public actor DeskContinuationScheduler {
                     }
                     throw error
                 }
-                // Preserve the one-dispatch cap when several owner receipts
-                // settle together. Only a successful dispatch earns this wake;
-                // an unchanged waiting/failed receipt never retries itself.
+                // Simultaneous owner receipts share one dispatch cap; unchanged waiting or failed receipts cannot retry themselves.
                 let nextNow = Date()
                 if !Task.isCancelled, state.items.contains(where: { other in
                     other.handle != item.handle && dueDate(other, in: state, now: nextNow,
@@ -230,15 +220,13 @@ public actor DeskContinuationScheduler {
         return .settled("helper request \(requestID) completed")
     }
 
-    /// The caller binds its originating app door. Checkpoint verification,
-    /// claims and reply routing remain native; the part supplies only words.
+    /// Hold the originating turn; the part supplies words while native code owns verification, claims and routing.
     private enum Cue: Codable, Sendable { case text(String), remainingWork, settled, lastReply }
 
-    public static func prompt(item: DeskItem, record: DeskContinuation, dataRoot: URL) async throws -> String {
-        // A receipt or partial answer may quote Git output or a handoff.
-        // Those bytes never enter JavaScript (parts decision 13).
+    public static func prompt(item: DeskItem, record: DeskContinuation, dataRoot: URL, invocation: Parts.Invocation) async throws -> String {
+        // Receipts and partial answers can quote external content; keep those bytes outside JavaScript.
         switch await Parts(root: dataRoot).call(id: "turn-continuation",
-            input: .object(["handle": .string(item.handle)]), as: [Cue].self) {
+            input: .object(["handle": .string(item.handle)]), invocation: invocation, as: [Cue].self) {
         case .success(let cue):
             return cue.map { segment in
                 switch segment {
@@ -252,10 +240,10 @@ public actor DeskContinuationScheduler {
         }
     }
 
-    /// A read only when its whole input reads: a saved input that does not
-    /// parse (a truncated checkpoint) is unknown, and goes to its domain.
+    /// An unreadable saved input is unknown and must go to its domain, never be inferred to be a read.
     static func declaredRead(_ step: DeskContinuation.Step) throws -> Bool {
         guard case .object(let input)? = try? JSONValue.parse(Data(step.input.utf8)) else { return false }
-        return try PermissionLaw.toolClass(step.tool, input: input) == .read
+        // This is stored-effect reconciliation before resume admits a turn.
+        return try PermissionLaw.toolClass(step.tool, input: input, turn: nil) == .read
     }
 }

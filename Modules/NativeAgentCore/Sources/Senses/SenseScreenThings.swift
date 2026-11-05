@@ -1,9 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `SenseScreenThings.swift` | Exact screen thing selections, captured related-action bindings on composite rows, and in-turn mac.act verb requests |
+// Blueprint: | `SenseScreenThings.swift` | Exact window selections, related-action bindings and in-turn mac.act verbs |
 
-/// Window handles retain exact selections. Supplemental AX surfaces use the
-/// existing native target resolver, which re-observes them before acting.
+/// Keep exact window handles; re-observe supplemental AX targets through the native resolver before acting.
 public enum SenseScreenThings {
     public static let accessibilityReadLine = "raw view · accessibility · Read directly from the app's accessibility tree."
     public static func isNativeScreenPage(_ page: NativePage) -> Bool {
@@ -12,8 +11,7 @@ public enum SenseScreenThings {
         return string(object(value)["__sense_screen_frame"]) != nil
     }
 
-    /// What a screen page prints for a thing: the handle of an exact window
-    /// selection (the page states its frame once), else the whole address.
+    /// Use exact selection handles so the page need state its frame only once; other addresses remain whole.
     public static func printed(_ address: String) -> String {
         guard address.hasPrefix("{"), case .object(let fields)? = try? JSONValue.parse(Data(address.utf8)),
               string(fields["frame_id"]) != nil, let handle = string(fields["handle"]) else { return address }
@@ -48,18 +46,15 @@ public enum SenseScreenThings {
             let label = string(node["label"])
             let name = label == role ? kind : label ?? kind
             let address = try JSONValue.object(["app": .string(bundleID), "frame_id": .string(frame), "handle": .string(handle)]).serialize(pretty: false)
-            let detail = [string(node["value"]), string(node["state"]), node["enabled"] == .bool(false) ? "disabled" : nil].compactMap { $0 }.joined(separator: "; ")
-            // A look affordance is interactive: the loop presses it (AXPress or
-            // the click at its frame). Its row says nothing about editability.
+            let detail = [string(node["value"]), string(node["state"]), node["enabled"] == .bool(false) ? "disabled" : nil]
+                .compactMap { $0 }.joined(separator: "; ")
+            // A look affordance is pressable, but supplies no evidence of editability.
             return NativeThing(name: name, kind: kind, address: address, detail: detail.isEmpty ? nil : detail,
                 verbs: node["enabled"] == .bool(false) ? [] : verbs(role: role, actions: ["AXPress"], settable: []))
         }
     }
 
-    /// The one verb table: what a control advertises, never its role alone.
-    /// Press needs AXPress; typing and focus need a settable value or focus,
-    /// so a read-only field offers neither. Select and toggle are a press (or
-    /// the click at its frame) on a row or a checkable.
+    /// Advertise verbs from actual capabilities, never role alone: pressing requires AXPress or a frame click, while typing/focus requires settable state.
     public static func verbs(role: String, actions: [String], settable: [String]) -> [String] {
         var verbs = actions.contains("AXPress") ? ["press"] : []
         if editableRoles.contains(role) {

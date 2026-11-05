@@ -1,20 +1,11 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: shared terminal decoding/receipts and SSE content/reasoning/tool fragments, usage and root errors; nonempty malformed JSON always fails; terminal/tool alignment validation preserves provider failures |
+// Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: checked stream terminals and fragments |
 
-/// Shared decoder for OpenAI-compatible Chat Completions streams.
-///
-/// Consumes `choices[0].delta` content, reasoning, and indexed tool fragments;
-/// captures root-level usage wherever it appears; and surfaces root error
-/// frames before checking choices so the provider's actual error survives.
-///
-/// Tool calls accumulate in first-seen order. Finalization checks the DONE
-/// sentinel, retained finish reason, complete tool batch, and nonempty output.
-/// Adapters own authentication and request bodies; consumption owns stream events and receipts.
+/// Root errors precede choices so the provider's cause survives. Calls retain wire order and require a terminal verdict, complete arguments and nonempty
+/// output.
 public struct ChatCompletionsStreamDecoder {
-    /// Human-facing provider name used to prefix a mid-stream error message
-    /// (e.g. "Moonshot: quota exceeded for kimi-k3").
     private let providerLabel: String
     private let retainReasoning: Bool
 
@@ -22,38 +13,34 @@ public struct ChatCompletionsStreamDecoder {
     private var toolAccum: [Int: Accum] = [:]
     private var toolOrder: [Int] = []
 
-    /// True once a `[DONE]` sentinel has been consumed. When the byte stream
-    /// ends with this still false, the adapter throws `streamTruncated`.
+    /// EOF without the DONE sentinel is truncation.
     public private(set) var sawDone = false
-    /// Accumulated only when the route needs reasoning replay (Moonshot).
+    /// Only routes requiring reasoning replay accumulate it.
     public private(set) var reasoning = ""
-    /// Root-level usage captured from any frame that carried it, mapped to the
-    /// telemetry shape. `nil` when the stream sent no usage frame — the recorder
-    /// omits nil keys, so the row simply carries no token fields.
+    /// Missing usage stays nil so receipts cannot invent token counts.
     public private(set) var usage: LLMUsage?
     public private(set) var reachedLengthLimit = false
     private var terminalBoundaryReason: LLMToolBoundaryReason?
     private var streamError: Error?
     private var refusalText = ""
     var errorDetail: String? { streamError.map(ProviderFailure.diagnosticDescription) }
-    private var runaway = RunawayOutputDetector()
+    private var runaway: RunawayOutputDetector
     public var toolBoundaryReason: LLMToolBoundaryReason? {
         reachedLengthLimit ? .outputLimit : terminalBoundaryReason ?? runaway.toolBoundaryReason
     }
 
-    public init(providerLabel: String, retainReasoning: Bool = false, diagnosticDataRoot: URL? = nil) {
+    public init(providerLabel: String, retainReasoning: Bool = false, diagnosticDataRoot: URL? = nil, call: LLMCall) {
         self.providerLabel = providerLabel
         self.retainReasoning = retainReasoning
-        self.runaway = RunawayOutputDetector(diagnosticDataRoot: diagnosticDataRoot)
+        self.runaway = RunawayOutputDetector(diagnosticDataRoot: diagnosticDataRoot, call: call)
     }
 
 
-    /// Read failures share EOF's finalizer; cancellation and provider verdicts
-    /// remain errors rather than permission to execute retained calls.
+    /// Read failures share EOF's finalizer; cancellation and provider verdicts remain errors rather than permission to execute retained calls.
     mutating func consume<Events: AsyncSequence>(
         _ events: Events, continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation,
         request: URLRequest, providerID: String, model: String, idPrefix: String,
-        started: UInt64, telemetry: LLMCallTraceRecorder,
+        started: UInt64, telemetry: LLMCallTraceRecorder, call: LLMCall,
         onCalls: ([LLMStreamToolCall], String) async -> Void = { _, _ in }
     ) async throws where Events.Element == SSEEvent {
         var ttftMs: Int?
@@ -67,15 +54,16 @@ public struct ChatCompletionsStreamDecoder {
                     ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
                 }
                 if frame.reasoning != nil { continuation.yield(.keepAlive) }
-                if providerID == "xai_oauth_direct" {
-                    for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
-                }
+                // A tool fragment is movement; a named call says what it is writing.
+                let toolMovement: LLMMessageStreamEvent? = frame.toolCallDeltaCount == 0 ? nil
+                    : frame.callInput.map(LLMMessageStreamEvent.callInput) ?? .keepAlive
+                if providerID == "xai_oauth_direct", let toolMovement { continuation.yield(toolMovement) }
                 if let content = frame.content {
                     sawContent = true
                     continuation.yield(.textDelta(content))
                 }
                 if providerID != "xai_oauth_direct" {
-                    for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
+                    if let toolMovement { continuation.yield(toolMovement) }
                 } else if frame.finishReason == "tool_calls" || frame.finishReason == "stop" {
                     continuation.yield(.keepAlive)
                 }
@@ -93,9 +81,9 @@ public struct ChatCompletionsStreamDecoder {
             try finalizedToolCalls(idPrefix: idPrefix, providerID: providerID, sawContent: sawContent)
         }
         if reachedLengthLimit {
-            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot)
+            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot(call: call), call: call)
         }
-        await telemetry.record(
+        await telemetry.record(call: call,
             requestBody: request.httpBody, provider: providerID, model: model, streaming: true,
             usage: usage, ttftMs: ttftMs,
             durationMs: Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000),
@@ -108,29 +96,18 @@ public struct ChatCompletionsStreamDecoder {
         if let reason = toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
     }
 
-    /// One decoded frame's surface-relevant content. Every field is
-    /// empty/nil/zero for a frame the adapter should ignore (role-only delta,
-    /// usage-only empty-choices frame, empty keep-alive).
     public struct DecodedFrame: Sendable, Equatable {
-        /// This frame was the `[DONE]` sentinel — the adapter breaks its loop.
         public var isDone = false
-        /// Non-empty assistant content delta to yield as `.textDelta`.
         public var content: String?
-        /// Non-empty `reasoning_content` delta on this frame (also folded into
-        /// `reasoning` when replay is enabled). Adapters that surface a thinking liveness signal yield
-        /// `.keepAlive` when this is non-nil.
+        /// Reasoning deltas renew liveness without becoming reply text.
         public var reasoning: String?
-        /// Count of raw `tool_calls` entries in this frame's delta. Moonshot
-        /// yields one `.keepAlive` per entry so its idle clock survives long
-        /// argument accumulation.
+        /// Each tool fragment renews Moonshot's idle clock during long argument accumulation.
         public var toolCallDeltaCount = 0
-        /// `finish_reason` on the first choice, if present (xAI liveness).
+        /// The named call this frame's fragments wrote into, with its input so far.
+        public var callInput: LLMStreamCallInput?
         public var finishReason: String?
     }
 
-    /// Consume one SSE `data:` payload. Throws `LLMError.providerError` on a
-    /// root-level error frame. Mutates the tool-call / reasoning / usage / done
-    /// accumulators.
     public mutating func consume(payload: String) throws -> DecodedFrame {
         var frame = DecodedFrame()
         if toolBoundaryReason != nil {
@@ -151,8 +128,7 @@ public struct ChatCompletionsStreamDecoder {
         }
         // Root error frames carry no choices; surface them before reading deltas.
         try throwIfChatCompletionsProviderError(root)
-        // Usage rides either the dedicated final empty-choices frame or the
-        // last delta frame itself — capture it wherever it appears.
+        // Usage rides either the dedicated final empty-choices frame or the last delta frame itself — capture it wherever it appears.
         if let usageObj = root["usage"] as? [String: Any] {
             usage = LLMUsage.fromOpenAIChatCompletions(usageObj)
         }
@@ -205,6 +181,9 @@ public struct ChatCompletionsStreamDecoder {
                     }
                     if let args = function["arguments"] as? String { toolAccum[index, default: Accum()].arguments += args }
                 }
+                if let call = toolAccum[index], !call.name.isEmpty {
+                    frame.callInput = LLMStreamCallInput(name: call.name, input: call.arguments.utf8)
+                }
             }
         }
         return frame
@@ -232,8 +211,7 @@ public struct ChatCompletionsStreamDecoder {
         return next
     }
 
-    /// Return committed calls with their boundary, or retain the read failure
-    /// when no calls survived. Wire provider IDs preserve existing diagnostics.
+    /// Return committed calls with their boundary, or retain the read failure when no calls survived. Wire provider IDs preserve existing diagnostics.
     mutating func finalizedToolCalls(
         idPrefix: String,
         providerID: String,
@@ -260,7 +238,8 @@ public struct ChatCompletionsStreamDecoder {
             guard !id.isEmpty, !name.isEmpty,
                   (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) is [String: Any] else {
                 if toolBoundaryReason == nil {
-                    throw LLMError.providerError(message: "\(providerLabel): incomplete tool call (call ID, name and object arguments are required); repair the provider stream")
+                    throw LLMError.providerError(
+                        message: "\(providerLabel): incomplete tool call (call ID, name and object arguments are required); repair the provider stream")
                 }
                 continue
             }
@@ -279,8 +258,7 @@ public struct ChatCompletionsStreamDecoder {
 // MARK: - Shared adapter helpers
 
 extension Result where Failure == Error {
-    /// Length terminals retain their usage receipt without claiming success.
-    /// Other parse failures keep their existing no-success-receipt behavior.
+    /// Length terminals retain their usage receipt without claiming success. Other parse failures keep their existing no-success-receipt behavior.
     func chatCompletionsTerminalStatus() throws -> String {
         switch self {
         case .success: return "ok"
@@ -291,8 +269,7 @@ extension Result where Failure == Error {
     }
 }
 
-/// Both completion lanes reject provider errors before reading message/delta,
-/// including errors carried by a choice rather than the root envelope.
+/// Both completion lanes reject provider errors before reading message/delta, including errors carried by a choice rather than the root envelope.
 private func throwIfChatCompletionsProviderError(_ object: [String: Any]) throws {
     if let error = object["error"] as? [String: Any] {
         throw ProviderFailure.wireError(error)
@@ -310,17 +287,15 @@ private func throwIfChatCompletionsProviderError(_ object: [String: Any]) throws
 
 
 
-/// Apply the three streaming Chat-Completions content headers shared by every
-/// chat-completions adapter's SSE request. `Authorization` is provider-specific
-/// (api key vs. OAuth access token) and stays with the caller.
+/// SSE content headers are shared; authentication stays with the provider-specific caller.
 func applyStreamingLLMHeaders(to request: inout URLRequest) {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
     request.setValue("NativeAgent (Darwin)", forHTTPHeaderField: "User-Agent")
 }
 
-/// Cancellation, wrapped failures and transport classification have one boundary.
-/// Only otherwise unclassified errors use the caller's bounded contextual detail.
+/// Cancellation, wrapped failures and transport classification have one boundary. Only otherwise unclassified errors use the caller's bounded contextual
+/// detail.
 func mapTransportError(_ error: Error, fallback: @autoclosure () -> LLMError) -> Error {
     if error is CancellationError { return CancellationError() }
     let nsError = error as NSError
@@ -338,7 +313,7 @@ func mapTransportError(_ error: Error, fallback: @autoclosure () -> LLMError) ->
     return ProviderFailure.normalize(fallback())
 }
 
-/// HTTP status and Retry-After remain structured data across adapters and surfaces.
+/// Keep HTTP status and Retry-After structured across adapters and surfaces.
 func throwIfChatCompletionsError(
     status: Int,
     data: Data,
@@ -353,7 +328,7 @@ func throwIfChatCompletionsError(
     ), detail: "HTTP \(status): \(detail)")
 }
 
-/// Retry-After accepts RFC 7231 seconds/date forms, clamps to 0...retryAfterMaxSeconds, or returns nil.
+/// Retry-After admits RFC 7231 seconds/date forms within the shared cap; invalid input stays nil.
 func parseRetryAfterSeconds(from response: URLResponse?, now: Date = Date()) -> Int? {
     guard let http = response as? HTTPURLResponse else { return nil }
     guard
@@ -362,7 +337,7 @@ func parseRetryAfterSeconds(from response: URLResponse?, now: Date = Date()) -> 
         !raw.isEmpty
     else { return nil }
     if let secs = Int(raw) { return max(0, min(secs, LLMError.retryAfterMaxSeconds)) }
-    // HTTP-date form (e.g. "Wed, 21 Oct 2026 07:28:00 GMT").
+    // HTTP-date is the alternate RFC 7231 form.
     let fmt = DateFormatter()
     fmt.locale = Locale(identifier: "en_US_POSIX")
     fmt.timeZone = TimeZone(identifier: "GMT")

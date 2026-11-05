@@ -1,11 +1,9 @@
 import CognitiveSubstrate
 import Foundation
 
-// Blueprint: | `CognitiveAttentionResidentProjection.swift` | `ResidentAttention`: lock-backed immutable cognition/organism handoff for turn reads without actor, disk or provider work |
+// Blueprint: | `CognitiveAttentionResidentProjection.swift` | `ResidentAttention`. |
 
-/// Lock-backed immutable handoff from the canonical cognition/organism owners
-/// to turn preparation. Writers publish after state transitions; readers never
-/// enter an actor, touch disk, schedule work, or call a model.
+/// Publish immutable state after owner transitions so turn reads need no actor hop, disk, scheduling or model call.
 final class ResidentAttention: @unchecked Sendable {
     private struct PursuitIntent: Sendable, Equatable {
         let activeTask: String

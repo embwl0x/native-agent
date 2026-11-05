@@ -38,12 +38,17 @@ extension SwiftToolDispatcher {
                 "tool": .string("apply_patch"),
                 "reason": .string("codex_apply_patch_format_not_supported"),
                 "detail": .string("NativeAgent chat apply_patch accepts unified diffs. Codex *** Begin Patch format is not interpreted by the app runtime."),
-                "fix": .string("Retry with files.patch using relative a/ and b/ paths and cwd set to their directory. Replace the example's path, old/new lines and hunk ranges with the actual edit; include \\ No newline at end of file only after lines that lack a final newline."),
+                "fix": .string("""
+                    Retry with files.patch using relative a/ and b/ paths and cwd set to their directory. Replace the example's path, old/new lines \
+                    and hunk ranges with the actual edit; include \\ No newline at end of file only after lines that lack a final newline.
+                    """),
                 "example_call": .object([
                     "action": .string("files.patch"),
                     "args": .object([
                         "cwd": .string("/absolute/path/to/repo"),
-                        "patch": .string("--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"),
+                        "patch": .string("""
+                            --- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n
+                            """),
                     ]),
                 ]),
             ]), nil)
@@ -65,13 +70,15 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string("apply_patch"),
                 "reason": .string("invalid_unified_patch"),
-                "detail": .string("Provide a unified diff with paired ---/+++ file headers and complete @@ -old,count +new,count @@ hunks whose line counts match the body."),
+                "detail": .string("""
+                    Provide a unified diff with paired ---/+++ file headers and complete @@ -old,count +new,count @@ hunks whose line counts match \
+                    the body.
+                    """),
             ]), nil)
         }
         return (nil, contextPatch.applicable ? contextPatch.files : nil)
     }
-    /// Syntax only: no subprocess, file lookup, permission prompt or audit.
-    /// Git still owns applicability, index state and binary payload decoding.
+    /// Syntax admission has no effects; Git owns applicability, index state and binary decoding.
     private static func builderUnifiedPatchIsValid(_ patch: String) -> Bool {
         guard patch.hasSuffix("\n") else { return false }
         let lines = patch.components(separatedBy: "\n")
@@ -176,7 +183,7 @@ extension SwiftToolDispatcher {
         }
         return sawChange && (!inFile || fileHasHunk) && (!gitHeader || gitHasChange)
     }
-    static func impl_apply_patch(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> JSONValue {
+    static func impl_apply_patch(turn: Turn, input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> JSONValue {
         let validation = builderValidatePatch(input: input)
         if let refusal = validation.refusal {
             // Argument checks are pure; only an execution attempt writes an audit.
@@ -252,9 +259,8 @@ extension SwiftToolDispatcher {
         defer {
             try? FileManager.default.removeItem(at: tmpURL)
         }
-        // Git's C-locale non-repository diagnostic is negative discovery
-        // evidence. Every other failure retains its exit and cause; it cannot
-        // select plain apply. Discovery and apply share this admitted launch.
+        // Git's C-locale non-repository diagnostic is negative discovery evidence. Every other failure retains its exit and cause; it cannot select plain
+        // apply. Discovery and apply share this admitted launch.
         let command = """
         if [ "$1" = true ]; then
             discovery=$(LC_ALL=C git rev-parse --git-dir 2>&1)
@@ -270,6 +276,7 @@ extension SwiftToolDispatcher {
         exec git apply "$2"
         """
         return await runShellLikeProcess(
+            turn: turn,
             toolName: "apply_patch",
             executable: "/bin/sh",
             args: ["-c", command, "apply_patch", threeWay ? "true" : "false", tmpURL.path],

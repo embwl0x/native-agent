@@ -1,12 +1,8 @@
 import Foundation
 // Blueprint: | `MacMessagesTypedString.swift` | bounded attributed-body archive decoding |
 
-/// Independently implemented from wire-format facts documented by the format's
-/// reverse engineer, Christopher Sardegna:
-/// https://chrissardegna.com/blog/reverse-engineering-apples-typedstream-format/
-/// No imessage-exporter/crabstep implementation is copied or linked (both GPL).
-/// Reads only the leading Foundation string, never instantiates archived classes
-/// or interprets attributes, selectors, attachments, or executable objects.
+/// Independent wire-format implementation: https://chrissardegna.com/blog/reverse-engineering-apples-typedstream-format/ No GPL implementation is copied or
+/// linked. Decode only the leading Foundation string; never instantiate archived classes or interpret executable objects.
 enum MacMessagesTypedString {
     static let maximumArchiveBytes = 64 * 1024
 
@@ -28,8 +24,7 @@ enum MacMessagesTypedString {
         let deadline: TimeInterval
         var offset = 0
         var strings: [String] = []
-        // nil slots belong to object instances, not classes. This makes an
-        // object reference invalid wherever the grammar requires a class.
+        // nil slots belong to object instances, not classes. This makes an object reference invalid wherever the grammar requires a class.
         var classes: [[ClassDescription]?] = []
 
         mutating func body() throws -> String {
@@ -54,12 +49,10 @@ enum MacMessagesTypedString {
             guard try sharedString() == "+" else { throw Invalid.unsupported }
             let bodyLength = try length()
             let text = try rawString(count: bodyLength)
-            // The exact byte length determines the body boundary. A literal
-            // marker within the text cannot stop this read or become metadata.
+            // The exact byte length determines the body boundary. A literal marker within the text cannot stop this read or become metadata.
             try expect(0x86)
             if attributedRoot {
-                // Only the string prefix is decoded. Attribute contents remain
-                // uninterpreted; never search them for another plausible string.
+                // Only the string prefix is decoded. Attribute contents remain uninterpreted; never search them for another plausible string.
                 guard offset < bytes.count, bytes.last == 0x86 else { throw Invalid.unsupported }
             } else if offset != bytes.count { throw Invalid.unsupported }
             try checkBudget()
@@ -111,8 +104,7 @@ enum MacMessagesTypedString {
             return strings[index]
         }
 
-        /// Only unsigned lengths needed here. Reserved markers, 64-bit numbers,
-        /// negative lengths and lengths exceeding the archive budget are refused.
+        /// Only unsigned lengths needed here. Reserved markers, 64-bit numbers, negative lengths and lengths exceeding the archive budget are refused.
         private mutating func length() throws -> Int {
             let marker = try byte()
             let width: Int

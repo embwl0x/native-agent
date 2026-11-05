@@ -1,32 +1,21 @@
 /* NativeAgent ability
 {"id":"native-morning-brief","kind":"ability","version":1,
  "reach":{"capabilities":["model"]},"face":{"page":"inbox"},
- "record":{"description":"Compose the morning brief and its inbox card from checked native source packets. Return inactive schedule defaults on operation defaults. Publication, consent, claims and delivery belong to the native scheduler.","actions":["calendar.upcoming","mail.recent","workshop.status"],"inputSchema":{"type":"object","required":["operation"],"properties":{"operation":{"type":"string","enum":["defaults","brief"]}}}}}
+ "record":{"description":"Compose the morning brief and its inbox card from checked native source packets. Return inactive schedule defaults on operation defaults. Publication, consent, claims and delivery belong to the native scheduler.","actions":["calendar.upcoming","mail.recent"],"inputSchema":{"type":"object","required":["operation"],"properties":{"operation":{"type":"string","enum":["defaults","brief"]}}}}}
 */
 function run(input) {
     if (input.operation === "defaults") return {
         inbox:[{name:"morning_brief",kind:"time",enabled:false,config:{hour:8,minute:0,notify:true},description:"Daily morning brief at configured hour."}],
-        workshop:[{name:"morning_brief",kind:"time",config:{hour:8,minute:0},objective:"Read calendar + email summary, draft a morning brief",title:"Morning Brief",trust_required:"send_approval",enabled:false}],
         notify:{morning_brief:true}
     };
     const current = Date.parse(input.now), yesterday = Date.parse(input.yesterday), label = input.dayLabel;
-    const desk = input.desk, log = input.worklog, workshop = input.workshop, inbox = input.inbox, sessions = input.sessions;
+    const desk = input.desk, log = input.worklog, inbox = input.inbox, sessions = input.sessions;
     const plural = (n, one, many) => n === 1 ? one : many;
     const open = desk.state === "ready" ? desk.statuses.filter(s => ["now","next","blocked","todo","flag","watch"].includes(s)).length : 0;
     const summaries = (log.rows || []).filter(row => {
         const time = Date.parse(row.ts);
         return time >= yesterday && time <= current && row.summary.trim();
     }).map(row => row.summary.trim()).slice(-5);
-    let active = 0, moved = 0, workshopAvailable = workshop.state === "ready";
-    for (const row of workshop.rows || []) {
-        const status = row && typeof row.status === "string" ? row.status.toLowerCase() : "";
-        if (!status || status === "corrupt") { workshopAvailable = false; continue; }
-        if (!["done","completed","failed","canceled","cancelled"].includes(status)) active++;
-        if (["completedAt","completed_at","updatedAt","updated_at"].some(key => {
-            const time = typeof row[key] === "string" ? Date.parse(row[key]) : NaN;
-            return time >= current - 86400000 && time <= current;
-        })) moved++;
-    }
     const unread = inbox.state === "ready" ? inbox.unread : null;
     let session = null, sessionAvailable = sessions.state === "ready";
     for (const row of sessions.rows || []) {
@@ -36,11 +25,9 @@ function run(input) {
         if (!Number.isFinite(at)) { sessionAvailable = false; continue; }
         if (session === null || at > session.at) session = {title:typeof row.title === "string" ? row.title.trim() : "",at};
     }
-    const unavailable = desk.state !== "ready" || log.state === "unavailable" || !workshopAvailable || unread === null || !sessionAvailable;
+    const unavailable = desk.state !== "ready" || log.state === "unavailable" || unread === null || !sessionAvailable;
     const facts = [];
     if (open > 0) facts.push(open + " open desk " + plural(open,"item","items"));
-    if (moved > 0) facts.push(moved + " Workshop " + plural(moved,"task","tasks") + " moved");
-    else if (active > 0) facts.push(active + " Workshop " + plural(active,"task","tasks") + " active");
     if (unread > 0) facts.push(unread + " unread");
     if (summaries.length) facts.push(summaries.length + " log " + plural(summaries.length,"entry","entries") + " since yesterday");
     const counts = facts.length
@@ -51,7 +38,6 @@ function run(input) {
     const sections = [];
     if (open && desk.body) sections.push("## Desk\n\n" + desk.body);
     if (summaries.length) sections.push("## Since yesterday\n\n" + summaries.map(s => "- " + s).join("\n"));
-    if (active || moved) sections.push("## Workshop\n\n- " + active + " active\n- " + moved + " moved in the last 24h");
     if (unread > 0) sections.push("## Inbox\n\n- " + unread + " unread " + plural(unread,"item","items"));
     if (unread === null) sections.push("## Inbox\n\nUnavailable: " + inbox.error);
     if (session && session.title) {
@@ -63,7 +49,8 @@ function run(input) {
     const lines = [
         "[SYSTEM: You are writing the lead of today's morning brief for " + label + ".]",
         "Objective: Prepare today's concise briefing from canonical calendar, inbox, project, and Desk state. Cite the evidence used, identify unknowns, and surface the completed report in NativeAgent without sending externally unless separately approved.",
-        "You may read live context with these tools if they are available: app calendar.upcoming, app mail.recent, app workshop.status. If a required tool is unavailable or denied, name what remains unknown and the repair it needs.",
+        "You may read live context with these tools if they are available: app calendar.upcoming, app mail.recent. " +
+          "If a required tool is unavailable or denied, name what remains unknown and the repair it needs.",
         "", "Verified snapshot (newer verified evidence may qualify it; cite the change):", "- Counts: " + counts
     ];
     if (sections.length) lines.push("", sections.join("\n\n"));

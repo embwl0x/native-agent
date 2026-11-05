@@ -15,7 +15,7 @@ import Desk
 import Experiences
 import Studio
 import Transcripts
-// Blueprint: | `NativeCognitionRuntime+Readouts.swift` | `NativeCognitionRuntime` change stream, Observatory, Doctor and capsule readouts; `GrowthWeekFace` binds frozen facts to the part face cache |
+// Blueprint: | `NativeCognitionRuntime+Readouts.swift` | `NativeCognitionRuntime`, `GrowthWeekFace`. |
 
 extension NativeCognitionRuntime {
     public func changes() -> AsyncStream<NativeCognitionRuntimeChange> {
@@ -59,8 +59,7 @@ extension NativeCognitionRuntime {
             canonicalAffect: await substrate.canonicalAffectProjection(at: inspectFixedAt), fixedAt: inspectFixedAt)
         let read = await substrate.frozenRead(at: inspectFixedAt)
         let configuration = read.configuration
-        // One inspection supplies felt mode and cold-start preview without consuming
-        // cadence; live previews mirror the last delivered capsule.
+        // One nonconsuming inspection supplies mode and cold preview; live previews mirror the last delivered capsule.
         let inspectRequest = requestWithOrganismProjection(
             CognitiveCapsuleRequest(
                 surface: "chat",
@@ -72,7 +71,7 @@ extension NativeCognitionRuntime {
             toward: organism.toward,
             at: inspectFixedAt
         )
-        // All workspace-derived fields share the same substrate read epoch.
+        // Read all workspace-derived fields from the same substrate epoch.
         let feltMode = await substrate.feltModeReading(for: inspectRequest, from: read)
 
         let capsulePreview: CognitiveCapsule?
@@ -85,7 +84,7 @@ extension NativeCognitionRuntime {
                 at: last.capsule.generatedAt
             )
         } else {
-            let synthetic = await substrate.compileFrozenCapsulePresentation(inspectRequest, from: read).capsule
+            let synthetic = await substrate.compileFrozenCapsulePresentation(inspectRequest, from: read, turn: nil).capsule
             let nonEmpty = synthetic.combined.isEmpty ? nil : synthetic
             capsulePreview = nonEmpty
             capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil, at: nil)
@@ -168,8 +167,7 @@ extension NativeCognitionRuntime {
     }
 }
 
-/// The source epoch belongs to this readout, publication ordering to L0's
-/// LatestRead. No projection helper is ever launched from a view render.
+/// Keep source epoch with the readout and publication ordering in LatestRead; view rendering cannot launch projection work.
 actor GrowthWeekFace {
     private let faces: Task<PartFaces, Never>
     private var previous: JSONValue?
@@ -184,8 +182,7 @@ actor GrowthWeekFace {
     }
 
     func read(_ input: JSONValue) async -> PartFaceSnapshot {
-        // Native window membership is in the frozen packet. An unchanged
-        // read reuses the face; an edited part invalidates it through L0.
+        // Reuse the face for an unchanged frozen packet; part edits invalidate through its owner.
         if input != previous { epoch &+= 1; previous = input }
         let selectedEpoch = epoch
         return await faces.value.sourceChanged(id: "growth-week", epoch: selectedEpoch, input: input)

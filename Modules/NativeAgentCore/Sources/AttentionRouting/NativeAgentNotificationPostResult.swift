@@ -10,7 +10,7 @@ public struct NativeAgentNotificationPostResult: Sendable {
         return .notDelivered(reason: error ?? delivery)
     }
 
-    static func fromLedger(_ outcome: NotificationDeliveryOutcome, id: String, held: Bool = false) -> Self {
+    static func from(_ outcome: NotificationDeliveryOutcome, id: String, held: Bool = false) -> Self {
         let status: String
         let delivery: String
         let error: String?
@@ -35,7 +35,18 @@ public struct NativeAgentNotificationPostResult: Sendable {
     public let badgeSetting: String
     public let error: String?
 
-    public init(identifier: String, status: String, delivery: String, posted: Bool, visibleAlertsEnabled: Bool, authorizationStatus: String, alertSetting: String, soundSetting: String, badgeSetting: String, error: String?) {
+    public init(
+        identifier: String,
+        status: String,
+        delivery: String,
+        posted: Bool,
+        visibleAlertsEnabled: Bool,
+        authorizationStatus: String,
+        alertSetting: String,
+        soundSetting: String,
+        badgeSetting: String,
+        error: String?
+    ) {
         self.identifier = identifier
         self.status = status
         self.delivery = delivery

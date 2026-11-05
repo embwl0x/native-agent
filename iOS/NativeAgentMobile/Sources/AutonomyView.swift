@@ -1,6 +1,5 @@
 import SwiftUI
 
-/// Self-improvement is managed on the Mac.
 struct AutonomyView: View {
     var body: some View {
         AlivePage(title: "Self-Improvement", line: "Changes to how I work.") {

@@ -4,11 +4,10 @@ import NativeAgentShared
 import CryptoKit
 import NativeAgentCore
 import os
-// Blueprint: | `TranscriptRowStamp.swift` | One saved-row speaker/steering/contact projection for metadata and persisted preview stamps; imported or generic-agent rows attest no speaker |
+// Blueprint: | `TranscriptRowStamp.swift` | Verified speaker and steering stamps; imports attest none |
 
-/// Projects the saved row's verified envelope speaker or specific origin, steering peers
-/// and contact status. Generic agents and imports (`unattested`, `<id>-reply`, `agent-live:`)
-/// attest no speaker.
+/// Projects the saved row's verified envelope speaker or specific origin, steering peers and contact status. Generic agents and imports (`unattested`,
+/// `<id>-reply`, `agent-live:`) attest no speaker.
 public struct TranscriptRowStamp: Sendable, Equatable {
     public let source: String?
     public let steeredBy: [String]
@@ -54,7 +53,7 @@ public struct TranscriptRowStamp: Sendable, Equatable {
                   byPerson: metadata["byPerson"] == .bool(true), unattested: metadata["unattested"] == .bool(true), untrusted: untrusted)
     }
 
-    /// As an index row keeps it beside the preview it stamps.
+    /// Keep the speaker stamp beside the index preview it attests.
     public var json: JSONValue {
         .object(["source": source.map(JSONValue.string) ?? .null, "steered_by": .array(steeredBy.map(JSONValue.string)), "contact": .bool(contact)])
     }
@@ -73,6 +72,6 @@ public struct TranscriptRowStamp: Sendable, Equatable {
         self.init(source: source, steeredBy: steering, contact: contact)
     }
 
-    /// The index row key that carries the stamp of its `lastMessagePreview`.
+    /// Persist preview text and its stamp under the same index row.
     public static let previewKey = "lastMessagePreviewStamp"
 }

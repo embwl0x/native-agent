@@ -26,11 +26,8 @@ extension SwiftToolDispatcher {
         s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
-    // The PATH shim disables SwiftPM's inner sandbox while the selected outer profile keeps confinement.
-    /// The `swift` wrapper installed on PATH for sandboxed spawns. Injects
-    /// `--disable-sandbox` only for the subcommands that accept it, only when the
-    /// caller has not already passed it, and always re-execs the real toolchain
-    /// binary by absolute path (so the shim can never recurse into itself).
+    /// SwiftPM cannot nest its sandbox under the selected outer profile. Inject --disable-sandbox only for supported subcommands without an explicit flag; an
+    /// absolute real-driver path prevents recursion.
     static func builderSwiftPMShimScript(realSwiftPath: String) -> String {
         """
         #!/bin/sh
@@ -53,25 +50,23 @@ extension SwiftToolDispatcher {
         exec "$real" "$@"
         """
     }
-    /// Absolute path of the real `swift` driver, resolved without consulting the
-    /// shim directory. `/usr/bin/swift` is the system xcrun stub and is what an
-    /// unsandboxed spawn would have hit anyway.
+    /// Resolve the real driver outside the shim directory to prevent recursion.
     static func builderRealSwiftPath() throws -> String {
         let path = "/usr/bin/swift"
         guard FileManager.default.isExecutableFile(atPath: path) else {
             throw ToolFailureError("The required Swift driver is not executable.", effects: .none,
-                owner: path, code: "builder_swift_unavailable", instruction: "Repair the selected Xcode command-line toolchain before launching the sandboxed command.")
+                owner: path, code: "builder_swift_unavailable", instruction: """
+                    Repair the selected Xcode command-line toolchain before launching the sandboxed command.
+                    """)
         }
         return path
     }
-    /// Required launch preparation: errors refuse the launch at their cause.
-    /// Executable shim/staging files live in OS temp, outside backup/export/
-    /// phone sync and the data-root PrivacyMap, like this owner's patch text.
+    /// Shim preparation failures refuse launch at their cause. Executable staging stays in OS temp, outside backup/export/phone sync and the data-root
+    /// PrivacyMap.
     static func builderSwiftPMShimDirectory(baseDirectory: URL? = nil) throws -> URL {
         let realSwift = try builderRealSwiftPath()
         let fm = FileManager.default
-        // Per-user private temp (/var/folders/<hash>/T, mode 700) — not the
-        // world-writable /tmp, so the shim cannot be pre-planted by another user.
+        // Per-user private temp (/var/folders/<hash>/T, mode 700) — not the world-writable /tmp, so the shim cannot be pre-planted by another user.
         let dir = (baseDirectory ?? fm.temporaryDirectory)
             .appendingPathComponent(InstallPaths.current.name("nativeagent-swiftpm-shim"), isDirectory: true)
         let shim = dir.appendingPathComponent("swift", isDirectory: false)
@@ -112,13 +107,8 @@ extension SwiftToolDispatcher {
             guard seenTrustPaths.insert(path).inserted else { return nil }
             return #"        (deny file-write* (subpath "\#(Self.sbplEscapeLiteral(path))"))"#
         }.joined(separator: "\n")
-        // allow-default then carve file-write* down to the workspace + build
-        // caches; the LAST matching rule wins in SBPL, so the trailing deny on
-        // the trust dir overrides the workspace allow for that subpath. NOTE:
-        // this is WRITE confinement — reads, process-exec, and network stay open
-        // by design (git fetch/push + SwiftPM package resolution need network;
-        // denying it would cut capability). It contains workspace-escaping
-        // WRITES, not secret reads; receipts say sandbox_mode=workspace_write.
+        // SBPL's last matching rule wins, so deny Trust writes after allowing workspace/cache writes. Reads, exec and network stay open for Git and package
+        // resolution; workspace_write confines writes, not secret reads.
         return """
         (version 1)
         (allow default)
@@ -137,13 +127,8 @@ extension SwiftToolDispatcher {
         \(trustRules)
         """
     }
-    /// Developer Mode removes workspace-only confinement without removing the
-    /// non-bypassable system and authority floor. The process may write across
-    /// ordinary user space (Desktop, Documents, checked-out repositories, and
-    /// build caches), while macOS still enforces denials for protected OS roots,
-    /// credentials, and NativeAgent-owned state. The canonical workspace is
-    /// allowed back after the data-root denial because public installs place it
-    /// inside Application Support.
+    /// Developer Mode permits user-space writes but retains the system, credential and authority floor. Re-allow the canonical workspace after denying the data
+    /// root because public installs place it in Application Support.
     static func builderDeveloperSandboxProfile(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String {
@@ -173,15 +158,13 @@ extension SwiftToolDispatcher {
     """
     enum BuilderShellSandboxMode: String, Sendable {
         case readOnly = "read_only"
-        /// Strict / locked-down posture: workspace-confined AND the off-ramps
-        /// (env break-glass, `securityPolicy.shellSandboxEnabled`) do not apply.
+        /// Strict / locked-down posture: workspace-confined AND the off-ramps (env break-glass, `securityPolicy.shellSandboxEnabled`) do not apply.
         case lockedDown = "locked_down"
         case workspaceWrite = "workspace_write"
         case developerFullMac = "developer_full_mac"
         case off
     }
-    /// The trust modes User means by "yolo": the operator has explicitly taken
-    /// the wrapper off, so the harness must not second-guess it with one.
+    /// Explicit Full Mac authority removes the workspace wrapper; the harness must respect that choice.
     static let builderYoloPermissionLevels: Set<String> = [
         "full_mac_os",
     ]
@@ -198,15 +181,12 @@ extension SwiftToolDispatcher {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { permissionLevel = trimmed }
         }
-        // Tier 3 first: a locked-down posture outranks every off-ramp below,
-        // including the env break-glass. Checked before the env var on purpose.
+        // Locked-down posture outranks policy and environment escape hatches.
         if permissionLevel == "strict" {
             return .lockedDown
         }
-        // Tier 1: yolo. Explicit permission level AND a live Full Mac window.
-        if Self.builderYoloPermissionLevels.contains(permissionLevel),
-           let trust = MacControlPolicy.fromTrustPolicyObject(policy).trustPolicy,
-           MacControlGate.fullMacActive(trust) {
+        // Full Mac requires both explicit permission level and current authority.
+        if Self.builderYoloPermissionLevels.contains(permissionLevel), PermissionLaw.posture(policy) == .fullMac {
             return .off
         }
         if let v = environment["NATIVE_AGENT_SHELL_SANDBOX"],
@@ -222,10 +202,7 @@ extension SwiftToolDispatcher {
         }
         return .workspaceWrite
     }
-    /// How a command line starts, decided once for every caller (the shell
-    /// tools and a part's program): the sandbox Trust selects, the folder it
-    /// may start in, and the SwiftPM shim first on PATH inside the sandbox.
-    /// Nil when that folder is not one the command may start in.
+    /// Share Trust's sandbox, admitted cwd and PATH shim across shell and part launches; an unadmitted starting folder cannot run.
     struct BuilderLaunch: Sendable {
         let mode: BuilderShellSandboxMode
         let executable: String
@@ -234,20 +211,18 @@ extension SwiftToolDispatcher {
         let pathPrefix: String?
         let environment: [String: String]?
     }
-    static func builderLaunch(executable: String, args: [String], cwd: String, dataRoot: URL, readWords: [String]? = nil) async throws -> BuilderLaunch? {
-        // The workspace is infrastructure, not a model-created side effect.
-        // Launch prepares it for every entry surface.
+    static func builderLaunch(turn: Turn, executable: String, args: [String], cwd: String, dataRoot: URL,
+        readWords: [String]? = nil) async throws -> BuilderLaunch? {
+        // The workspace is infrastructure, not a model-created side effect. Launch prepares it for every entry surface.
         _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
-        // Resolve the effective confinement posture before cwd validation.
-        // Full Mac YOLO deliberately removes the workspace wrapper, so it must
-        // also be able to start in a user-selected external project. Ordinary
-        // modes retain the canonical workspace/source-checkout boundary.
+        // Resolve the effective confinement posture before cwd validation. Full Mac YOLO deliberately removes the workspace wrapper, so it must also be able to
+        // start in a user-selected external project. Ordinary modes retain the canonical workspace/source-checkout boundary.
         let mode = try await builderShellSandboxMode(dataRoot: dataRoot)
         let directory = builderNormalizeCwd(cwd, dataRoot: dataRoot, allowOutsideWorkspace: mode == .off)
         guard directory.rejection == nil else { return nil }
         let resolvedCwd = directory.path
         if let readWords {
-            let read = FileReadSourceMaterial.shellReadLaunch(words: readWords, cwd: resolvedCwd, dataRoot: dataRoot)
+            let read = FileReadSourceMaterial.shellReadLaunch(words: readWords, cwd: resolvedCwd, dataRoot: dataRoot, turn: turn)
             return BuilderLaunch(mode: .readOnly, executable: "/usr/bin/sandbox-exec", arguments: read.arguments,
                                  cwd: resolvedCwd, pathPrefix: nil, environment: read.environment)
         }
@@ -261,6 +236,7 @@ extension SwiftToolDispatcher {
                              cwd: resolvedCwd, pathPrefix: shim.path, environment: nil)
     }
     static func runShellLikeProcess(
+        turn: Turn,
         toolName: String,
         executable: String,
         args: [String],
@@ -268,25 +244,12 @@ extension SwiftToolDispatcher {
         timeoutSeconds: Int,
         sourcePayloadForAudit: String? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        // Two narrow seams used by the agent-host command adapter alone. Left
-        // nil/false, every existing caller behaves exactly as it did.
-        //
-        // `environmentOverride` replaces this app's inherited environment — it
-        // holds provider keys and the bridge token, which an EXTERNAL agent's
-        // command must never be handed.
-        //
-        // `reapDescendantsOnExit` also settles the process group when the
-        // direct child exits, not only on timeout: an agent CLI can leave
-        // something running behind it, and that must not outlive the turn or
-        // the temp directory the run was given.
+        // Scrub external-agent environments to protect provider keys and bridge credentials; reap descendants so they cannot outlive the run or its directory.
         environmentOverride: [String: String]? = nil,
         closeStandardInput: Bool = false,
         reapDescendantsOnExit: Bool = false,
-        // A command tool (shell, bash): the call completed once the command
-        // ran, and its exit code, output and timeout are the command's answer.
         exitIsAnswer: Bool = false,
-        // Each stdout line as it is written, for a caller that shows progress
-        // live. The envelope is unchanged. Agent-host command runs only.
+        // Streaming output feeds live progress without changing the command envelope.
         onStdoutLine: (@Sendable (String) -> Void)? = nil
     ) async -> JSONValue {
         // Allocate run identity and start time before validation so pre-spawn failures receive audit receipts.
@@ -294,11 +257,9 @@ extension SwiftToolDispatcher {
         let started = Date()
         let readWords = ["shell", "bash"].contains(toolName)
             ? sourcePayloadForAudit.flatMap { AuthoredToolEffects.shellReadOnlyWords(["cmd": .string($0)]) } : nil
-        // Normalize and bound-check cwd. On failure: write a pre-spawn
-        // audit envelope, then return a clean denied envelope (carry the
-        // audit_error if the write itself failed so it's visible).
+        // Retain a pre-spawn audit when cwd admission fails; surface audit_error too if recording that refusal fails.
         let checkedLaunch: BuilderLaunch?
-        do { checkedLaunch = try await builderLaunch(executable: executable, args: args, cwd: cwd, dataRoot: dataRoot, readWords: readWords) }
+        do { checkedLaunch = try await builderLaunch(turn: turn, executable: executable, args: args, cwd: cwd, dataRoot: dataRoot, readWords: readWords) }
         catch { return ChatToolOutcome.failure(error: error, tool: toolName, effects: ToolFailureError.Effects.none) }
         guard let launch = checkedLaunch else {
             let auditEntry: [String: Any] = [
@@ -339,16 +300,7 @@ extension SwiftToolDispatcher {
         let process = ManagedProcess()
         process.executableURL = URL(fileURLWithPath: launch.executable)
         process.arguments = launch.arguments
-        // Environment. SwiftPM nesting shim, only relevant when we DID wrap: `sandbox_apply` refuses to nest, and SwiftPM
-        //     self-sandboxes its manifest compile, so ANY `swift build/test/run/
-        //     package` under our wrapper dies with "Invalid manifest" before a
-        //     line of Swift executes — including indirect ones inside a shell
-        //     script (e.g. script/task_ledger.sh). Confinement is not supposed to
-        //     mean execution denial, so instead of lifting the wrapper we put a
-        //     `swift` shim first on PATH that injects `--disable-sandbox`. The
-        //     OUTER profile still confines every write (verified empirically:
-        //     `swift run --disable-sandbox` builds AND runs under the workspace
-        //     profile, while an out-of-workspace write is still denied).
+        // SwiftPM's manifest sandbox cannot nest. Put the --disable-sandbox shim first on PATH while the outer profile retains write confinement.
         var env = launch.environment ?? environmentOverride ?? ProcessInfo.processInfo.environment
         var effectiveCompatRewrites: [String] = []
         let developerDirectory = await Self.builderSelectedDeveloperDirectory(environment: env)
@@ -421,7 +373,8 @@ extension SwiftToolDispatcher {
             let durationMs = Int(Date().timeIntervalSince(started) * 1000)
             // A launched shell timeout is command data; an explicit Stop is cancellation.
             let timeoutIsAnswer = exitIsAnswer && exit.launched && exit.timedOut
-            let status = exit.terminationError != nil ? "failed" : exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0 ? "completed" : "failed"
+            let status = exit.terminationError != nil ? "failed" : exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0
+                ? "completed" : "failed"
             var auditEntry: [String: Any] = [
                 "toolName": toolName,
                 "runId": runId,
@@ -452,12 +405,7 @@ extension SwiftToolDispatcher {
                 auditEntry["compat_rewrites"] = resolvedCompatRewrites
             }
             let (auditURL, auditErr) = builderWriteAudit(runId: runId, entry: auditEntry, dataRoot: dataRoot)
-            // Envelope-side truncation cap (~32KB each). Head+tail, NOT
-            // head-only: build/test errors land at the END of the stream, so
-            // a bare .prefix(32K) kept the progress noise and dropped the
-            // errors — blinding her on any build that outran the cap. Keep
-            // 8KB head (command echo + first/root-cause error) + 24KB tail
-            // (final errors + test summary + exit). Same budget, errors survive.
+            // Keep 8 KiB of head and 24 KiB of tail: command/root-cause context and final errors survive the 32 KiB envelope cap.
             let (envStdout, envStdoutTruncated) = SwiftToolDispatcher.headTailPreserve(
                 stdoutText, headBudget: 8_192, tailBudget: 24_576)
             let (envStderr, envStderrTruncated) = SwiftToolDispatcher.headTailPreserve(
@@ -481,7 +429,6 @@ extension SwiftToolDispatcher {
                 "outer_sandbox_policy": .string("policy"),
                 "audit_path": .string(auditURL.path),
             ]
-            // What a person reads on the row: it ran, and what it answered.
             if exitIsAnswer {
                 envelope["summary"] = .string(exit.launched
                     ? "Ran · exit \(exitCode)" + (exit.timedOut ? " · timed out after \(clampedTimeout) s" : "")
@@ -495,7 +442,9 @@ extension SwiftToolDispatcher {
                     nextCall: .object(["tool": .string("app"), "input": .object(["find": .string("shell")])]))
             } else if exit.timedOut {
                 if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
-                envelope["detail"] = .string("The process exceeded the effective \(clampedTimeout)-second builder timeout and its owned process group was terminated.")
+                envelope["detail"] = .string("""
+                    The process exceeded the effective \(clampedTimeout)-second builder timeout and its owned process group was terminated.
+                    """)
             } else if exit.stopped {
                 envelope["reason"] = .string("stopped")
                 envelope["detail"] = .string(exit.launched

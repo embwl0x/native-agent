@@ -3,7 +3,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
-// Blueprint: | `Research+Helpers.swift` | Research URL/time helpers and one per-directory receipt retention owner; checked file ages precede deletion, actual completion owns release, retained repairable errors surface in fetch readouts without failing completed fetches |
+// Blueprint: | `Research+Helpers.swift` | Checked receipt retention preserves completed fetches |
 
 extension SwiftNativeResearchClient {
     // MARK: Helpers
@@ -21,7 +21,6 @@ extension SwiftNativeResearchClient {
         return comps?.url
     }
 
-    /// ISO-8601 with fractional seconds and a `+00:00` UTC suffix.
     public nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
@@ -32,8 +31,7 @@ extension SwiftNativeResearchClient {
 
     // MARK: Receipt retention
 
-    /// Bound on fetched-source receipts and retained search receipts
-    /// in `receiptsDir`; search results are returned without a duplicate file.
+    /// Search returns results without duplicating a receipt file; retention bounds only retained receipt files.
     static let receiptRetentionLimit = 200
 
     private struct RetentionState: Sendable {
@@ -52,17 +50,17 @@ extension SwiftNativeResearchClient {
                 "status": .string(state.error != nil ? "failed" : (state.running ? "pending" : (state.completed ? "ok" : "unmeasured"))),
                 "in_flight": .bool(state.running),
                 "error": state.error.map(JSONValue.string) ?? .null,
-                "remedy": state.error == nil ? .null : .string("Check receipt file metadata and write access in \(directory.path). The next fetch requests a new retention pass; the completed fetch is still valid."),
+                "remedy": state.error == nil ? .null : .string("""
+                    Check receipt file metadata and write access in \(directory.path). The next fetch requests a new retention pass; the completed fetch is \
+                    still valid.
+                    """),
             ])
         }
     }
 
-    /// Keep the newest `receiptRetentionLimit` receipt files; delete the
-    /// rest. Housekeeping: it runs on its own, off this call's return path, so
-    /// an arrived result never waits on a directory scan, and a prune failure
-    /// never fails the fetch that just succeeded. Only receipt-shaped
-    /// files are eligible (`source-*.json`, or `<uuid>.json`): `config.json`
-    /// and the `lab/` subdirectory share the directory and are never touched.
+    /// Keep the newest `receiptRetentionLimit` receipt files; delete the rest. Housekeeping: it runs on its own, off this call's return path, so an arrived
+    /// result never waits on a directory scan, and a prune failure never fails the fetch that just succeeded. Only receipt-shaped files are eligible
+    /// (`source-*.json`, or `<uuid>.json`): `config.json` and the `lab/` subdirectory share the directory and are never touched.
     nonisolated func pruneReceiptsIfNeeded() {
         let receiptsDir = receiptsDir
         guard Self.aging.withLock({ states in
@@ -91,9 +89,8 @@ extension SwiftNativeResearchClient {
                     }
                 }
             } catch {
-                // A VolumeIO deadline ends our wait, not an issued prune. Its
-                // body may later publish its actual result; onFinish releases
-                // the directory only when the physical operation has ended.
+                // A VolumeIO deadline ends our wait, not an issued prune. Its body may later publish its actual result; onFinish releases the directory only
+                // when the physical operation has ended.
                 Self.recordRetentionFailure(error, directory: receiptsDir, onlyIfUnfinished: true)
             }
         }
@@ -109,7 +106,9 @@ extension SwiftNativeResearchClient {
             return true
         }
         if recorded {
-            NSLog("[Research.retention] %@: %@. Completed fetch preserved; repair receipt metadata/access before the next retention pass.", directory.path, detail)
+            NSLog("""
+                [Research.retention] %@: %@. Completed fetch preserved; repair receipt metadata/access before the next retention pass.
+                """, directory.path, detail)
         }
     }
 

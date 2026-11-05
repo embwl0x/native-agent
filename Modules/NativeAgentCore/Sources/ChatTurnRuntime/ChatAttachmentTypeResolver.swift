@@ -3,7 +3,7 @@ import AppKit
 import UniformTypeIdentifiers
 import NativeAgentShared
 
-// Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver`: type/size admission, bounded off-main file reads and voice draft attachments |
+// Blueprint: | `ChatAttachmentTypeResolver.swift` | `ChatAttachmentTypeResolver`; Bounded off-main attachment admission |
 
 public typealias ChatAttachmentTypeResolver = NativeAgentShared.ChatAttachmentTypeResolver
 
@@ -77,8 +77,7 @@ public extension ChatAttachmentTypeResolver {
         public init(message: String) { self.message = message }
     }
 
-    /// Type and size, decided before any read. Shared with the agent's own
-    /// composer verbs so a file she attaches meets the same rules.
+    /// Shared admission keeps composer attachments under the same type and size rules.
     static func attachmentKind(
         _ url: URL, resolveType: (String) -> (type: String, mime: String)?
     ) -> Result<(type: String, mime: String), AttachmentRefusal> {
@@ -93,7 +92,7 @@ public extension ChatAttachmentTypeResolver {
         return .success(attachmentInfo)
     }
 
-    /// The bounded read, off the main actor.
+    /// Keep bounded file reads off the main actor.
     static func readAttachment(
         _ url: URL, kind: (type: String, mime: String)
     ) async -> Result<NativeAgentShared.MultimodalAttachment, AttachmentRefusal> {

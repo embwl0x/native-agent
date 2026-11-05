@@ -6,8 +6,7 @@ public enum ContextOriginClass: String, Codable, CaseIterable, Sendable {
     case remoteAuthenticated = "remote_authenticated"
     case untrusted
 }
-/// A fail-closed projection of authorization decisions made by the runtime.
-/// Selection consumes these decisions; it never grants permissions itself.
+/// A fail-closed projection of authorization decisions made by the runtime. Selection consumes these decisions; it never grants permissions itself.
 public struct ContextSelectionAuthorization: Codable, Equatable, Sendable {
     public let allowedOrigins: Set<ContextOriginClass>
     public let allowedPrivacy: Set<ContextPrivacy>
@@ -34,8 +33,7 @@ public enum ContextSelectionCacheState: String, Codable, Sendable {
     case miss
     case unavailable
 }
-/// Pure, turn-scoped input to context selection. `selectionTimeBucket` is used
-/// instead of wall-clock reads so identical inputs remain restart deterministic.
+/// Pure, turn-scoped input to context selection. `selectionTimeBucket` is used instead of wall-clock reads so identical inputs remain restart deterministic.
 public struct NeedSignal: Codable, Equatable, Sendable {
     public let message: String
     public let extractedEntities: Set<ContextEntity>
@@ -52,12 +50,10 @@ public struct NeedSignal: Codable, Equatable, Sendable {
     public let cognitiveActivation: [ContextAtomID: Double]
     public let feedbackUtilityOverrides: [ContextAtomID: Double]
     public let feedbackDecayOverrides: [ContextAtomID: Double]
-    /// How reachable each atom is from its history of use, 0...1
-    /// (`ContextFeedbackAtomState.reachability`). The memory lane ranks by it.
+    /// Rank memory by use-history reachability from `ContextFeedbackAtomState`, never a separate history.
     public let memoryReachability: [ContextAtomID: Double]
-    /// Exchanges since the atom was last served in this session's retained
-    /// transcript (0 = the preceding exchange: a user message plus its reply).
-    /// A memory served this recently rests unless the message singles it out.
+    /// Exchanges since the atom was last served in this session's retained transcript (0 = the preceding exchange: a user message plus its reply). A memory
+    /// served this recently rests unless the message singles it out.
     public let servedTurnsAgo: [ContextAtomID: Int]
     public let precoveredSourceIDs: Set<ContextSourceID>
     public let mandatoryAtomIDs: Set<ContextAtomID>
@@ -66,27 +62,19 @@ public struct NeedSignal: Codable, Equatable, Sendable {
     public let staleRuntimeAtomIDs: Set<ContextAtomID>
     public let secretBearingAtomIDs: Set<ContextAtomID>
     public let queryEmbedding: [Float]?
-    /// The question in the other voice, same vector space as `queryEmbedding`.
-    /// See `ContextQueryEmbeddingValue.alternateValues`.
+    /// The question in the other voice, same vector space as `queryEmbedding`. See `ContextQueryEmbeddingValue.alternateValues`.
     public let alternateQueryEmbedding: [Float]?
-    /// A follow-up's own words (and their other voice), each a separate
-    /// reading. See `ContextQueryEmbeddingValue.ownWordsValues`. Nil or
-    /// empty when the query is the message itself; absent in older saved signals.
+    /// Score a follow-up's own words as separate readings; nil or empty when the query is the message itself.
     public let ownWordsQueryEmbeddings: [[Float]]?
     public let queryEmbeddingModelFingerprint: String?
-    /// The embedder's model id; picks the meaning scale
-    /// (`ContextSelectionConfiguration.memorySemanticFloors`).
+    /// Model ID selects the matching semantic floor.
     public let queryEmbeddingModelID: String?
     public let availableGenerationID: Int64?
     public let characterBudget: Int
     public let mandatoryCharacterBudget: Int
-    /// Body length above which the CALLER's packet renderer replaces an atom's
-    /// full text with a lead + `context_expand` pointer. The selector uses it
-    /// to publish a matching expandable pointer. Summarized representations
-    /// remain expandable independently. `0` = the caller renders bodies whole.
+    /// Match expansion pointers to the caller's truncation threshold; zero renders whole bodies, while summaries stay independently expandable.
     public let packetAtomExpandThresholdChars: Int
-    /// Shared upper bound on nonmandatory memory and correction atoms.
-    /// Mandatory atoms bypass this quota; `nil` uses the selector's quota.
+    /// Shared upper bound on nonmandatory memory and correction atoms. Mandatory atoms bypass this quota; `nil` uses the selector's quota.
     public let memoryAtomRowLimit: Int?
     public let selectionTimeBucket: Int64
     public let timeBucketSeconds: Int

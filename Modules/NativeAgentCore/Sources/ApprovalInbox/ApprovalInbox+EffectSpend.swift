@@ -3,11 +3,9 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ApprovalInbox+EffectSpend.swift` | `SwiftNativeApprovalInbox` effect spends: durable consumption immediately before execution; a spend is not an outcome or permission to replay |
+// Blueprint: | `ApprovalInbox+EffectSpend.swift` | `SwiftNativeApprovalInbox`; Durable spend fences replay, not outcome. |
 
-/// Result of durably consuming a generic approval immediately before its
-/// effect boundary. A spend is intentionally not an outcome: it records that
-/// execution may have started, so a restart must not blindly repeat it.
+/// A durable spend records possible execution, never an outcome or authority to repeat the effect.
 public enum ApprovalEffectSpendOutcome: String, Sendable, Equatable {
     case spent
     case alreadySpent
@@ -15,14 +13,10 @@ public enum ApprovalEffectSpendOutcome: String, Sendable, Equatable {
 }
 
 extension SwiftNativeApprovalInbox {
-    // This versioned spend object is included in local backup and export,
-    // excluded from phone sync, and listed under PrivacyMap's Approvals.
     public static let effectSpendSchema = "approval-effect-spend.v1"
     static let effectSpendCap = 2000
 
-    /// Kept separate from injection_spends.json: injection verification owns
-    /// its narrower capability fence, while this store owns ordinary approved
-    /// chat-tool and connector execution starts.
+    /// Injection verification owns its capability fence separately from ordinary approved execution starts.
     nonisolated var effectSpendPath: URL { Self.effectSpendPath(root: root) }
 
     public func consumeApprovedEffect(
@@ -74,8 +68,7 @@ extension SwiftNativeApprovalInbox {
                 return .spent
             }
         } catch {
-            // Existing malformed bytes are never interpreted as an empty
-            // ledger and are never overwritten. The effect stays blocked.
+            // Existing malformed bytes are never interpreted as an empty ledger and are never overwritten. The effect stays blocked.
             return .unavailable
         }
     }

@@ -17,8 +17,7 @@ import MacIntegration
 import TurnTrace
 // Blueprint: | `SwiftToolDispatcher+BuilderTools.swift` | `SwiftToolDispatcher`: `builderSourceRepoRoot`, `builderWorkspaceRoot`, `builderAllowedRoots`; workspace-default shell cwd and explicit pre-launch/executed receipts; certified shell reads use the Git reader's fixed argv/environment/sandbox; `builderLaunch`, the one way a command line starts (sandbox, starting folder, SwiftPM shim) for the shell tools and a part's program; builder and detached installer terminal audits run in SubprocessWork settlement |
 extension SwiftToolDispatcher {
-    /// Preserve the owner's failure contract; add operation evidence only for
-    /// errors that have not supplied a cause or recovery lever themselves.
+    /// Preserve the owner's failure contract; add operation evidence only for errors that have not supplied a cause or recovery lever themselves.
     static func builderFailureFields(
         _ error: any Error, tool: String, reason: String, effects: ToolFailureError.Effects,
         owner: String, instruction: String
@@ -41,13 +40,11 @@ extension SwiftToolDispatcher {
         }
         return fields
     }
-    /// The owner and its plain fix; a builder failure never routes to another
-    /// coding-agent call to repair itself (circular, and absent without Codex).
+    /// Report the owning failure directly; routing builder repair through another coding-agent call is circular.
     static func builderFailureRemedy(owner: String, instruction: String) -> JSONValue {
         Repair.remedy(owner: owner, nextCall: nil, tap: instruction, instruction: "Tell the person: \(owner). \(instruction)")
     }
-    /// Conventional source checkout retained only as one validated candidate.
-    /// Public installs do not need this path in order to execute ordinary work.
+    /// Conventional source checkout retained only as one validated candidate. Public installs do not need this path in order to execute ordinary work.
     static let nativeAgentRepoRoot: String =
         NSString(string: "~/Projects/NativeAgent").expandingTildeInPath
     package static func builderSourceRepoRoot(dataRoot: URL) -> URL? {
@@ -96,7 +93,9 @@ extension SwiftToolDispatcher {
             return (resolved, "working_directory_sensitive_path_denied", reason)
         }
         return allowOutsideWorkspace ? (resolved, nil, nil)
-            : (resolved, "working_directory_outside_workspace_denied", "An external coding directory requires active Full Mac YOLO with outside-workspace access set to allow.")
+            : (resolved, "working_directory_outside_workspace_denied", """
+                An external coding directory requires active Full Mac YOLO with outside-workspace access set to allow.
+                """)
     }
     static func builderSourceCheckoutRequiredEnvelope(tool: String, dataRoot: URL) -> JSONValue {
         let runId = UUID().uuidString
@@ -124,7 +123,10 @@ extension SwiftToolDispatcher {
             "runId": .string(runId),
             "audit_path": .string(auditURL.path),
             "detail": .string(
-                "This NativeAgent self-maintenance operation requires a verified source checkout. Ordinary shell, bash, git, patch, and project work remain available inside the canonical workspace."
+                """
+                    This NativeAgent self-maintenance operation requires a verified source checkout. Ordinary shell, bash, git, patch, and project \
+                    work remain available inside the canonical workspace.
+                    """
             ),
         ]
         if let auditError { envelope["audit_error"] = .string(auditError) }
@@ -143,17 +145,8 @@ extension SwiftToolDispatcher {
             ),
         ])
     }
-    /// Fresh macOS installs keep developer-tool shims such as `/usr/bin/git`,
-    /// `python3`, and `strings` even when no Xcode/Command Line Tools payload is
-    /// installed. Invoking one opens Apple's interactive installer. A tool turn
-    /// must never manufacture UI or start an install handoff merely by probing
-    /// host readiness.
-    ///
-    /// `DEVELOPER_DIR` is Apple's supported per-process override. Pointing it
-    /// at a deliberately absent path makes those shims fail immediately with
-    /// an ordinary `xcrun` error, while Homebrew/non-Apple binaries remain
-    /// unaffected. Preserve an explicit caller override and a real selected
-    /// developer directory.
+    /// macOS developer-tool shims open an interactive installer when tools are missing; readiness probes must not trigger UI. An absent DEVELOPER_DIR makes
+    /// Apple shims fail immediately without affecting non-Apple tools; preserve explicit overrides and valid selected directories.
     static func builderEnvironmentSuppressingDeveloperToolsPrompt(
         environment: [String: String],
         selectedDeveloperDirectory: String?
@@ -172,8 +165,7 @@ extension SwiftToolDispatcher {
         guarded["DEVELOPER_DIR"] = "/.nativeagent-no-developer-tools"
         return (guarded, true)
     }
-    /// `xcode-select --print-path` is the noninteractive Apple readiness probe.
-    /// It exits nonzero on a fresh install without opening the installer.
+    /// Use xcode-select --print-path for readiness because failure does not open Apple's installer.
     static func builderSelectedDeveloperDirectory(
         environment: [String: String]
     ) async -> String? {
@@ -189,14 +181,8 @@ extension SwiftToolDispatcher {
         let selected = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return selected.isEmpty ? nil : selected
     }
-    /// Is `xcodebuild` invoked anywhere in this command?
-    ///
-    /// Detection for a REFUSAL, not for a lift — so it is deliberately BROAD
-    /// where the old lift detector was deliberately narrow. The costs are
-    /// asymmetric now: a false positive costs a clear message the operator can
-    /// argue with, a false negative costs the exit-74 riddle below. So this
-    /// scans every token, not just segment heads, and matches on the last path
-    /// component rather than a trusted-path allowlist.
+    /// Detect xcodebuild broadly by each token's last path component: a false positive is actionable, while a miss fails inside its non-nestable package
+    /// sandbox.
     static func builderCommandInvokesXcodebuild(_ cmd: String) -> Bool {
         let separators: Set<Character> = [" ", "\t", "\n", "\r", ";", "|", "&", "(", ")", "`", "<", ">"]
         for token in cmd.split(whereSeparator: { separators.contains($0) }) {
@@ -325,7 +311,7 @@ extension SwiftToolDispatcher {
         builderResolveString(input, keys: ["package_path"])
             ?? builderDefaultCwd(dataRoot: dataRoot)
     }
-    static func impl_shell(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    static func impl_shell(turn: Turn, input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
                            executable: String = "/bin/sh", toolName: String = "shell") async -> JSONValue {
         guard case .string(let cmd)? = input["cmd"], !cmd.isEmpty else {
             return .object([
@@ -339,9 +325,7 @@ extension SwiftToolDispatcher {
         }
         let cwd = builderResolveCwd(input, dataRoot: dataRoot, workspaceDefault: true)
         let timeout = builderResolveTimeout(input, defaultSeconds: 120, maxSeconds: 600)
-        // No command escapes the profile. xcodebuild physically cannot run
-        // inside it, so it is refused with a reason instead of being lifted or
-        // left to fail as exit 74 — see builderXcodebuildRefusalEnvelope.
+        // Refuse xcodebuild inside confinement because its package sandbox cannot nest; the caller needs the owning refusal.
         if builderCommandInvokesXcodebuild(cmd) {
             do {
                 if try await builderShellSandboxMode(dataRoot: dataRoot) != .off {
@@ -350,6 +334,7 @@ extension SwiftToolDispatcher {
             } catch { return ChatToolOutcome.failure(error: error, tool: toolName, effects: ToolFailureError.Effects.none) }
         }
         return await runShellLikeProcess(
+            turn: turn,
             toolName: toolName,
             executable: executable,
             args: ["-c", cmd],
@@ -360,7 +345,7 @@ extension SwiftToolDispatcher {
             exitIsAnswer: true
         )
     }
-    static func impl_git(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> JSONValue {
+    static func impl_git(turn: Turn, input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> JSONValue {
         let parsedArgs: [String]
         switch input["args"] {
         case .array(let rawArgs)?:
@@ -399,6 +384,7 @@ extension SwiftToolDispatcher {
         let cwd = builderResolveCwd(input, dataRoot: dataRoot)
         let timeout = builderResolveTimeout(input, defaultSeconds: 60, maxSeconds: 600)
         return await runShellLikeProcess(
+            turn: turn,
             toolName: "git",
             executable: "/usr/bin/env",
             args: ["git"] + parsedArgs,
@@ -408,7 +394,8 @@ extension SwiftToolDispatcher {
             dataRoot: dataRoot
         )
     }
-    static func impl_swift_package(command: String, input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> JSONValue {
+    static func impl_swift_package(turn: Turn, command: String, input: [String: JSONValue],
+        dataRoot: URL = PersistenceCore.defaultDataRoot()) async -> JSONValue {
         let tool = "swift_\(command)"
         let packagePath = swiftPMResolvedPackagePath(input, dataRoot: dataRoot)
         let timeout = builderResolveTimeout(input, defaultSeconds: command == "build" ? 600 : 900, maxSeconds: 3600)
@@ -445,6 +432,7 @@ extension SwiftToolDispatcher {
         }
         args += selectors
         return await runShellLikeProcess(
+            turn: turn,
             toolName: tool,
             executable: "/usr/bin/env",
             args: args,

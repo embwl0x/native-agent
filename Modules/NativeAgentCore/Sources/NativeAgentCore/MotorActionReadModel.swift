@@ -1,12 +1,9 @@
 import Foundation
 
-// Blueprint: | `MotorActionReadModel.swift` | `MotorActionReadModel`: shared payload-free phase, deadline and verification language; canonical domain reducers retain authority |
+// Blueprint: | `MotorActionReadModel.swift` | `MotorActionReadModel`: progress projection; domain authority stays native |
 
-/// Shared, read-only language for observing action progress across NativeAgent.
-///
-/// This is a projection, never an executor or authority owner. Domain reducers
-/// remain canonical and `domainState` preserves their exact vocabulary so the
-/// shared phase cannot erase a meaningful distinction.
+/// Shared, read-only language for observing action progress across NativeAgent. This is a projection, never an executor or authority owner. Domain reducers
+/// remain canonical and `domainState` preserves their exact vocabulary so the shared phase cannot erase a meaningful distinction.
 public enum MotorActionPhase: String, Codable, Sendable, CaseIterable {
     case proposed
     case ready
@@ -30,8 +27,7 @@ public enum MotorActionPhase: String, Codable, Sendable, CaseIterable {
     }
 }
 
-/// Whether a claimed action outcome has been checked against canonical reality.
-/// `unverified` is intentionally distinct from `notRequired`: completion and
+/// Whether a claimed action outcome has been checked against canonical reality. `unverified` is intentionally distinct from `notRequired`: completion and
 /// verification are not synonyms.
 public enum MotorVerificationState: String, Codable, Sendable, CaseIterable {
     case notStarted = "not_started"
@@ -43,9 +39,8 @@ public enum MotorVerificationState: String, Codable, Sendable, CaseIterable {
     case unknown
 }
 
-/// Exact deadline policy already enforced by a domain owner. A duration is
-/// deliberately not rendered as a projected wall-clock timestamp; each owner
-/// remains authoritative for when its attempt or operation actually begins.
+/// Exact deadline policy already enforced by a domain owner. A duration is deliberately not rendered as a projected wall-clock timestamp; each owner remains
+/// authoritative for when its attempt or operation actually begins.
 public struct MotorActionDeadlineReadModel: Codable, Sendable, Equatable {
     public enum Scope: String, Codable, Sendable, CaseIterable {
         case stepAttempt = "step_attempt"
@@ -69,8 +64,7 @@ public struct MotorActionReadModel: Codable, Sendable, Equatable {
     public let verification: MotorVerificationState
     public let expectedNextEvidence: String?
     public let updatedAt: String?
-    /// Opaque correlation of the canonical domain cancellation target. This is
-    /// never a dispatch argument; `nil` means no shared cancellation identity.
+    /// Opaque correlation of the canonical domain cancellation target. This is never a dispatch argument; `nil` means no shared cancellation identity.
     public let cancellationIdentity: String?
     /// Existing domain deadline policy only; never a projected/invented timer.
     public let deadline: MotorActionDeadlineReadModel?
@@ -98,8 +92,7 @@ public struct MotorActionReadModel: Codable, Sendable, Equatable {
     }
 }
 
-/// Narrow observation seam shared by action domains. Implementations must be
-/// side-effect free: no dispatch, transition, approval, notification, or write.
+/// Narrow observation seam shared by action domains. Implementations must be side-effect free: no dispatch, transition, approval, notification, or write.
 public protocol MotorActionReadModelProviding: Sendable {
     func motorActionReadModel(actionId: String) async throws -> MotorActionReadModel?
 }

@@ -1,11 +1,10 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `OwnedProgramCalls.swift` | Static prelude call/argument-shape inspection (unknown expressions defer to the door; rooted host files consume root before dispatch): literal callable-door actions/batches, dot/bracket app actions, app reads/calls, canonical host door actions and primitives, nested part calls including host part.call input, impossible binding shapes and dynamic-name warnings; never executes source |
+// Blueprint: | `OwnedProgramCalls.swift` | Static prelude call and argument inspection; unknown expressions retain runtime validation |
 
 extension OwnedProgram {
     public struct Calls: Sendable {
-        /// Unknown expressions are not evaluated. Known object keys still say
-        /// which fields are supplied even when their values come from input.
+        /// Do not evaluate unknown expressions; known keys still establish supplied fields.
         public indirect enum Argument: Sendable {
             case unknown
             case value(JSONValue)
@@ -27,11 +26,10 @@ extension OwnedProgram {
                 }
             }
 
-            /// Only a proven mismatch refuses. Unknown values keep the ordinary
-            /// point-of-call validator; they are never filled with dummy values.
+            /// Refuse only proven mismatches; unknown values retain point-of-call validation rather than dummy values.
             public func problem(schema: JSONValue, path: String = "args") -> String? {
                 if case .unknown = self { return nil }
-                if let value { return value.schemaProblem(schema: schema, path: path).map { "\($0.path) must be \($0.expected) (\($0.keyword))" } }
+                if let value { return value.schemaProblem(schema: schema, path: path).map(\.words) }
                 let rules = schema.objectValue ?? [:]
                 for key in ["anyOf", "oneOf"] {
                     if let choices = rules[key]?.arrayValue {
@@ -74,14 +72,13 @@ extension OwnedProgram {
         }
         public struct Literal: Sendable {
             public let id: String
-            /// Primitive dispatch is case/whitespace sensitive before the app
-            /// door canonicalizes an action name. Preserve that distinction.
+            /// Preserve primitive dispatch's case and whitespace sensitivity before app-door canonicalization.
             public let spelling: String
             public let primitive: Bool
-            /// Direct app members and literal door requests derive dependencies; indirect calls must declare them.
+            /// Indirect calls must declare dependencies because only literal door requests and direct app members can derive them.
             public let inferred: Bool
             public let line: Int
-            /// Nil means the argument list itself is computed (e.g. spread).
+            /// Nil means the argument list is computed, so its fields cannot be inferred.
             public let given: [Argument]?
         }
         public var literal: [Literal] = []
@@ -90,9 +87,7 @@ extension OwnedProgram {
         public var usesStrictVerbs = false
     }
 
-    /// Static inspection, not an evaluator or a proof of arbitrary JavaScript.
-    /// Nonliteral names (including concatenation and template interpolation) keep
-    /// their runtime gates. Calls inside template expressions are still inspected.
+    /// Static inspection cannot prove arbitrary JavaScript; nonliteral names retain runtime gates, while template expressions remain inspectable code.
     public static func calls(_ source: String) -> Calls {
         struct Token {
             let text: String
@@ -123,9 +118,7 @@ extension OwnedProgram {
         }
         func text(_ i: Int) -> String { tokens.indices.contains(i) ? tokens[i].text : "" }
         func literal(_ i: Int) -> String? { tokens.indices.contains(i) ? tokens[i].literal : nil }
-        // The prelude deliberately lets her replace conveniences such as part
-        // and screen. Local helpers/parameters with those names are her code,
-        // not invalid calls into the prelude. Respect lexical binding scopes.
+        // Respect lexical bindings so authored helpers named part or screen are not mistaken for prelude calls.
         let roots: Set<String> = ["app", "host", "part", "screen", "hand"]
         var pairs: [Int: Int] = [:], stack: [Int] = []
         for i in tokens.indices {
@@ -158,8 +151,7 @@ extension OwnedProgram {
             let parameters = open.flatMap { start in close.map { (start + 1)..<$0 } } ?? (arrow ? (i - 1)..<i : i..<i)
             for p in parameters where roots.contains(text(p)) { bindings.append((text(p), range)) }
         }
-        // Method and catch parameters also bind locally. Control expressions
-        // such as if/while are not declarations of the names they read.
+        // Method and catch parameters bind locally; if/while expressions do not declare the names they read.
         for open in pairs.keys where text(open) == "(" {
             guard let close = pairs[open], text(close + 1) == "{", let end = pairs[close + 1],
                   !["if", "while", "for", "with", "switch"].contains(text(open - 1)) else { continue }
@@ -169,8 +161,7 @@ extension OwnedProgram {
         }
         for i in tokens.indices {
             if text(i) == "function", roots.contains(text(i + 1)) {
-                // A named function expression binds only its own body; a
-                // declaration binds its enclosing scope, including forward calls.
+                // Function expressions bind only their body; declarations bind the enclosing scope, including forward calls.
                 let expression = ["=", "(", ",", ":", "return"].contains(text(i - 1))
                 if expression, let close = pairs[i + 2], let end = pairs[close + 1] {
                     bindings.append((text(i + 1), (close + 1)..<(end + 1)))
@@ -185,8 +176,7 @@ extension OwnedProgram {
                 else { cursor += 1 }
             }
         }
-        // A name is literal only when the whole expression is one string.
-        // In particular, 'authored.' + id is never an unknown 'authored.' action.
+        // Only an entire single-string expression is a literal name; concatenated prefixes cannot identify an action.
         func argument(_ i: Int) -> String? {
             guard [",", ")"].contains(text(i + 1)) else { return nil }
             return literal(i)
@@ -212,7 +202,12 @@ extension OwnedProgram {
             guard let first = range.first else { return .unknown }
             if range.count == 1 {
                 if let value = literal(first) { return .value(.string(value)) }
-                switch text(first) { case "true": return .value(.bool(true)); case "false": return .value(.bool(false)); case "null": return .value(.null); default: break }
+                switch text(first) {
+                case "true": return .value(.bool(true));
+                case "false": return .value(.bool(false));
+                case "null": return .value(.null);
+                default: break
+                }
             }
             let number = range.map { text($0) }.joined()
             if let value = Int64(number) { return .value(.int(value)) }
@@ -241,8 +236,7 @@ extension OwnedProgram {
             guard !ranges.contains(where: { $0.first.map { text($0) == "." } ?? false }) else { return nil }
             return ranges.dropFirst(dropping).map(argumentShape)
         }
-        // Only a request's own fields count: action-looking data in args is
-        // not a call. Skip nested values using the same delimiter pairs.
+        // Inspect only a request's own fields; action-looking nested data is not a call.
         func property(_ name: String, in object: Int) -> Int? {
             guard text(object) == "{", let end = pairs[object] else { return nil }
             var cursor = object + 1, found: Int?
@@ -259,8 +253,10 @@ extension OwnedProgram {
                     let stop = segments(object + 1, end).first { $0.contains(start) }?.upperBound ?? start
                     args = argumentShape(start..<stop)
                 } else { args = .object([:]) }
-                // A spread/computed request can supply or replace action/args.
-                let opaque = pairs[object].map { end in segments(object + 1, end).contains { $0.first.map { text($0) == "." || text($0) == "[" } ?? false } } ?? true
+                // Spreads and computed requests can replace action/args, so their shape is unknown.
+                let opaque = pairs[object].map { end in
+                    segments(object + 1, end).contains { $0.first.map { text($0) == "." || text($0) == "[" } ?? false }
+                } ?? true
                 add(id, inferred: true, line: tokens[value].line, given: opaque ? nil : [args])
             } else { dynamic("app({action:…})", line) }
         }
@@ -269,7 +265,7 @@ extension OwnedProgram {
                 dynamic("app(request)", line); return
             }
             if property("action", in: object) != nil { doorAction(object, line: line); return }
-            guard let batch = property("actions", in: object) else { return } // find/read have no action dependency
+            guard let batch = property("actions", in: object) else { return }
             guard text(batch) == "[", let end = pairs[batch], [",", "}"].contains(text(end + 1)) else {
                 dynamic("app({actions:…})", line); return
             }
@@ -284,7 +280,7 @@ extension OwnedProgram {
             }
         }
         for start in tokens.indices where roots.contains(text(start)) {
-            // obj.app is somebody else's property, not the bound app object.
+            // A property named app is not the bound app object.
             if start > 0, [".", "?"].contains(text(start - 1)) { continue }
             if bindings.contains(where: { $0.name == text(start) && $0.scope.contains(start) }) { continue }
             let root = text(start), line = tokens[start].line
@@ -310,7 +306,8 @@ extension OwnedProgram {
                 } else { break }
             }
             guard text(cursor) == "(" else { continue }
-            if let close = pairs[cursor], text(close + 1) == "{" { continue } // method declaration, not a call
+            // A following body marks a declaration, so it cannot become a call dependency.
+            if let close = pairs[cursor], text(close + 1) == "{" { continue }
             let spelling = ([root] + members).joined(separator: ".")
             if computed { dynamic(spelling, line); continue }
             if members.isEmpty {
@@ -334,7 +331,10 @@ extension OwnedProgram {
                 } else if members.count == 2, !verbs.contains(members[0]), members[0] != "call", !members[0].contains(".") {
                     add(members.joined(separator: "."), inferred: true, line: line, given: given(cursor))
                 } else {
-                    result.refusals.append("\(spelling)(…) at line \(line) is not a callable app binding. Use app.<page>.<action>(args), app[\"page.action\"](args), or app.call(actionID,args).")
+                    result.refusals.append("""
+                        \(spelling)(…) at line \(line) is not a callable app binding. Use app.<page>.<action>(args), app[\"page.action\"](args), or \
+                        app.call(actionID,args).
+                        """)
                 }
             } else if root == "host" {
                 let operation: String?
@@ -346,13 +346,15 @@ extension OwnedProgram {
                 } else if OwnedProgramRunner.hostDoorActions.contains(members.joined(separator: ".")) {
                     add(members.joined(separator: "."), line: line, given: given(cursor)); continue
                 } else {
-                    result.refusals.append("\(spelling)(…) at line \(line) is not exposed by the program prelude. Use app.<page>.<action>(args) for app actions or host.call(operation,args) for host primitives.")
+                    result.refusals.append("""
+                        \(spelling)(…) at line \(line) is not exposed by the program prelude. Use app.<page>.<action>(args) for app actions or \
+                        host.call(operation,args) for host primitives.
+                        """)
                     continue
                 }
                 if let operation {
                     var arguments = given(cursor, dropping: members == ["call"] ? 1 : 0)
-                    // The host prelude consumes root and resolves its path
-                    // before files.* reaches the app door. It is not a door field.
+                    // The host prelude consumes root before files.* dispatch, so root is not a door field.
                     if operation.hasPrefix("files."), var list = arguments,
                        case .object(var fields)? = list.first, fields["root"] != nil {
                         fields.removeValue(forKey: "root")
@@ -383,8 +385,7 @@ extension OwnedProgram {
         return result
     }
 
-    /// Decode a JavaScript string without executing any source. A template with
-    /// expressions is not one literal; escaped delimiters and Unicode are names too.
+    /// Decode names without executing source; interpolated templates are not literals, while escaped delimiters and Unicode still identify names.
     private static func callLiteral(_ raw: [UInt16]) -> String? {
         guard let quote = raw.first, [34, 39, 96].contains(quote), raw.count >= 2, raw.last == quote else { return nil }
         var decoded: [UInt16] = [], i = 1

@@ -4,7 +4,7 @@ import SwiftUI
 
 // Blueprint: | `AppearanceController.swift` | `AppearanceController`: one explicit light/dark answer applied consistently to SwiftUI and AppKit |
 
-/// SwiftUI and AppKit receive explicit light/dark values; dark mode off follows the live system appearance.
+/// Apply explicit values to SwiftUI and AppKit so both layers agree while following live system appearance when dark mode is off.
 @MainActor
 @Observable
 final class AppearanceController {
@@ -14,9 +14,7 @@ final class AppearanceController {
     private static let systemKey = "AppleInterfaceStyle"
     private static let systemChanged = Notification.Name("AppleInterfaceThemeChangedNotification")
 
-    /// Settings ▸ Appearance ▸ "Prefer the dark window, whatever the system is doing."
     private(set) var preferDark: Bool
-    /// The system's own setting, live.
     private(set) var systemIsDark: Bool
 
     var isDark: Bool { preferDark || systemIsDark }
@@ -41,7 +39,7 @@ final class AppearanceController {
         apply()
     }
 
-    /// Both layers, explicitly, every time.
+    /// Apply both layers together so their appearances cannot diverge.
     func apply() {
         NSApp.appearance = appearance
         DetachedChatWindowController.shared.applyAppearanceToOpenPanels(appearance)

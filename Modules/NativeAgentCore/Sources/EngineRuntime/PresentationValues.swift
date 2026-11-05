@@ -37,16 +37,12 @@ public struct CapabilitySummaryResponse: Codable, Hashable, Sendable {
 
 }
 
-// Shared display values keep formatting consistent across surfaces.
+// Share display formatting across surfaces.
 
 public typealias UserDisplayFormatters = NativeAgentShared.UserDisplayFormatters
 
 extension String {
-    /// Truncate a display string, appending `suffix` when (and only when) the
-    /// string is longer than `limit` — a string of exactly `limit` chars is
-    /// returned whole. Some call sites cap the *trigger* threshold and the
-    /// *retained* prefix independently (e.g. "trip at >80 but keep 77"); pass
-    /// `keeping` for those, otherwise the retained prefix uses `limit`.
+    /// Truncate only beyond `limit`; `keeping` lets callers reserve suffix space without changing the trigger threshold.
     public func truncated(to limit: Int, keeping: Int? = nil, suffix: String = "…") -> String {
         guard count > limit else { return self }
         return String(prefix(keeping ?? limit)) + suffix

@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentConversationExchange.swift` | `AgentConversationExchange`: `started`, `absorb`, `validate`; protocol message strings are bound separately from operation UUIDs; partial text is retained separately from a finished reply; each exchange retains its receipt's shelf result UUID across subsequent sends |
+// Blueprint: | `AgentConversationExchange.swift` | `AgentConversationExchange`, `started`, `absorb`, `validate` |
 
 extension AgentConversationExchange {
     package static let textLimit = 8 * 1024
@@ -22,9 +22,7 @@ extension AgentConversationExchange {
         let hadReply = reply != nil
         let observing = if case .object(let fields)? = row.receipt { fields["reply_observation"] == .string("running") } else { false }
         defer {
-            // Stamped when it settles, and again if a reply lands after that.
-            // A route that watched the answer finish says when (`replied_at`, the
-            // last change it saw), not when it noticed it had stopped changing.
+            // Use the last observed reply change as its finish time, not the later moment stability was noticed.
             if !observing, row.phase != "waiting", settledAt == nil || (!hadReply && reply != nil) {
                 settledAt = Self.repliedAt(row.receipt, after: sentAt, key: reply == nil ? "ended_at" : "replied_at") ?? Date()
             }
@@ -44,23 +42,14 @@ extension AgentConversationExchange {
         replyTruncated = text.map { answer.truncated || $0.truncated } ?? false
     }
 
-    /// Extract before making any ledger or receipt excerpt. The canonical
-    /// contact thread receives these words, never the bounded exchange copy.
+    /// Extract full words before receipt clipping; the canonical contact thread must retain the complete reply.
     static func answer(_ root: [String: JSONValue]) -> (text: String?, truncated: Bool) {
         let value = AgentConversationRecord.sendEvidence(.object(root))
-        let original = AgentConversationView.codingReply(value)
-        if root["jobs"] != nil {
-            return original
-        }
-        return (Self.string(value["reply"]) ?? Self.string(value["answer"])
-                ?? original.text ?? Self.string(value["findings"]),
-                value["reply_truncated"] == .bool(true)
-                || (Self.string(value["reply"]) == nil && Self.string(value["answer"]) == nil
-                    && original.text != nil && original.truncated))
+        return (Self.string(value["reply"]) ?? Self.string(value["answer"]) ?? Self.string(value["findings"]),
+                value["reply_truncated"] == .bool(true))
     }
 
-    /// sent_at, first_activity_at, replied_at (or ended_at with no reply) and
-    /// elapsed_ms between sending and that moment: measured, never inferred.
+    /// Timing evidence must be measured, never inferred.
     var timing: [String: JSONValue] {
         var fields: [String: JSONValue] = ["sent_at": .string(NativeTimestampFormat.fractionalZulu(sentAt))]
         if let firstActivityAt { fields["first_activity_at"] = .string(NativeTimestampFormat.fractionalZulu(firstActivityAt)) }
@@ -90,7 +79,8 @@ extension AgentConversationExchange {
                     && (entry.prompt != nil || !entry.promptTruncated)
                     && (entry.reply != nil || !entry.replyTruncated)
               }), try JSONEncoder().encode(history).count <= byteLimit else {
-            throw historyFailure("Saved conversation history is invalid; existing records were preserved.", code: "agent_conversation_history_invalid", file: file)
+            throw historyFailure("Saved conversation history is invalid; existing records were preserved.", code: "agent_conversation_history_invalid",
+                file: file)
         }
     }
 
@@ -99,19 +89,18 @@ extension AgentConversationExchange {
         let encoder = JSONEncoder()
         var sizes = try result.map { try encoder.encode($0).count }
         var size = 2 + sizes.reduce(0, +) + max(0, sizes.count - 1)
-        // Oldest first, never a held receipt (or one being handed over): its
-        // delivery identity is still owed. Full payloads live in ContactThread.
+        // Never prune held or handing-over exchanges while their delivery identity is owed; full payloads live in ContactThread.
         while result.count > 1, result.count > countLimit || size > byteLimit {
             guard let oldest = result.indices.dropLast().first(where: { !["held", "delivering"].contains(result[$0].status) }) else {
                 throw ToolFailureError("Conversation capacity is held by queued messages awaiting the contact's check-in.", effects: .unknown,
                     nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]),
-                    code: "agent_conversation_capacity", instruction: "Wait for the contact's check-in; read contacts for delivery state. Preserve queued messages.", recovery: .inspect)
+                    code: "agent_conversation_capacity",
+                        instruction: "Wait for the contact's check-in; read contacts for delivery state. Preserve queued messages.", recovery: .inspect)
             }
             size -= sizes.remove(at: oldest) + 1
             result.remove(at: oldest)
         }
-        // JSON escaping can exceed raw UTF-8 size. Preserve the newest exchange
-        // with explicit clipping even for heavily escaped source text.
+        // JSON escaping can exceed raw UTF-8 size. Preserve the newest exchange with explicit clipping even for heavily escaped source text.
         while size > byteLimit, !result.isEmpty {
             let last = result.count - 1
             if let reply = result[last].reply, reply.utf8.count > 0 {
@@ -130,7 +119,11 @@ extension AgentConversationExchange {
     private static func historyFailure(_ message: String, code: String, file: URL) -> ToolFailureError {
         ToolFailureError(message, effects: .unknown, owner: file.path,
             code: code, instruction: ToolFailureError.fileRepairInstruction(file,
-                shape: "Preserve conversation records and queued messages. Each exchange history has at most 32 unique UUID entries and 65536 encoded bytes; prompt, reply and partialReply are at most 8192 UTF-8 bytes each. Dates must be finite, between Date.distantPast and Date.distantFuture, with elapsed milliseconds representable as Int64.") + " Repair the saved history from retained evidence without discarding queued messages.")
+                shape: """
+                    Preserve conversation records and queued messages. Each exchange history has at most 32 unique UUID entries and 65536 encoded \
+                    bytes; prompt, reply and partialReply are at most 8192 UTF-8 bytes each. Dates must be finite, between Date.distantPast and \
+                    Date.distantFuture, with elapsed milliseconds representable as Int64.
+                    """) + " Repair the saved history from retained evidence without discarding queued messages.")
     }
 
     static func clipped(_ text: String, limit: Int) -> (text: String, truncated: Bool) {

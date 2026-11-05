@@ -3,37 +3,26 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ConnectorHealthDecay.swift` | `ConnectorHealthDecay` and checked `ConnectorProofLedger`: credential-backed health from latest actual receipts, decayed by age without polling; unreadable UTF-8/schema evidence is unavailable, never an empty ledger |
+// Blueprint: | `ConnectorHealthDecay.swift` | `ConnectorHealthDecay` and checked `ConnectorProofLedger`: receipt-backed health decays without polling |
 
-// Credential-backed health follows the latest real action receipt. A failure
-// of authorization or transport supersedes success; proof decays without polling.
+// Credential-backed health follows the latest real action receipt. A failure of authorization or transport supersedes success; proof decays without polling.
 
 public enum ConnectorHealthDecay {
-    /// A connector untouched for seven days stops reading green.
     public static let provenWindow: TimeInterval = 7 * 24 * 60 * 60
 
     public enum Verification: String, Sendable, Equatable {
-        /// A real connector call succeeded inside the window.
         case fresh
-        /// A real call succeeded once, but not inside the window.
         case stale
-        /// A credential exists; no successful call has ever been recorded.
         case configured
     }
 
-    /// Health value written for anything that is not currently proven. Chosen
-    /// so the existing "is this green" predicates on both platforms fall
-    /// through to their not-healthy branch (the iOS reader treats every value
-    /// outside {ok, healthy, ready, connected, active} as needs-attention), and
-    /// so the Mac's own `ConnectorUIState` can name it explicitly.
+    /// Both platforms treat values outside {ok, healthy, ready, connected, active} as unverified.
     public static let unverifiedHealth = "unverified"
 
-    /// Auth value written when a credential exists but nothing has ever proven
-    /// it works — rendered "configured, unverified".
+    /// Credentials without action proof are configured, never verified.
     public static let configuredAuth = "configured"
 
-    /// Stamped only by the runtime's credential-backed branches. The overlay
-    /// clears the saved key, so registry bytes cannot grant proof.
+    /// Only credential-backed runtime receipts may stamp proof; saved registry bytes cannot grant it.
     public static let proofSourceKey = "healthProofSource"
 
     /// Credential-backed health requires a real connection receipt.
@@ -45,15 +34,11 @@ public enum ConnectorHealthDecay {
         window: TimeInterval = provenWindow
     ) -> Verification {
         guard let lastSuccessAt else { return .configured }
-        // A timestamp in the future is still evidence the call happened; clock
-        // skew must not read as decay.
+        // Future timestamps still prove a call happened; clock skew must not imply decay.
         return now.timeIntervalSince(lastSuccessAt) <= window ? .fresh : .stale
     }
 
-    /// Apply the decay to one already-derived registry row.
-    ///
-    /// `outcome` is the newest non-dry-run connection outcome. Credential-backed
-    /// rows derive health from it, including when no receipt has arrived.
+    /// Only the newest real connection outcome can establish health; missing receipts remain unverified.
     public static func apply(
         to row: [String: JSONValue],
         outcome: (at: Date, succeeded: Bool, authorizationFailed: Bool)?,
@@ -80,9 +65,7 @@ public enum ConnectorHealthDecay {
             out["healthStatus"] = .string(unverifiedHealth)
             out["lastCheckedAt"] = .string(isoTimestamp(lastSuccessAt!))
         case .configured:
-            // A credential and nothing behind it. There was never a check, so
-            // there is no honest `lastCheckedAt` — the frozen stamp dies here
-            // rather than being carried forward as if it meant something.
+            // Without a real check there is no honest lastCheckedAt to retain.
             out["authState"] = .string(configuredAuth)
             out["healthStatus"] = .string(unverifiedHealth)
             out["lastCheckedAt"] = .null
@@ -96,7 +79,6 @@ public enum ConnectorHealthDecay {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// Same ISO-8601 spelling the rest of this module emits.
     public static func isoTimestamp(_ date: Date) -> String {
         SwiftNativeConnectorsClient.isoTimestamp(date)
     }
@@ -104,23 +86,14 @@ public enum ConnectorHealthDecay {
 
 // MARK: - Connector-action outcomes
 
-/// Reads the newest connector outcome per connector out of
-/// `connectors/actions/receipts.jsonl`. This is the ONLY "the integration
-/// actually worked" signal in the system — connector actions and Slack HTTP
-/// proofs share ConnectorActionReceipt's schema and append owner.
+/// Connector actions and Slack HTTP proofs share this canonical receipt schema and append owner.
 public enum ConnectorProofLedger {
-    /// Receipt statuses that mean the provider was reached and answered.
-    /// `dry_run` is deliberately absent: a dry run never left the machine.
+    /// Exclude dry_run: a preview never reaches the provider.
     public static let successStatuses: Set<String> = ["succeeded", "completed", "ok"]
 
-    /// The tail scanned on each read. Bounded so a multi-megabyte append-only
-    /// ledger never becomes a full-file parse on every Connectors refresh. The
-    /// failure mode of a too-short tail is a connector reading `configured`
-    /// instead of `stale` — both render "unverified", so the bound can only
-    /// under-claim, never fabricate a green.
+    /// Bound refresh parsing; a short tail can underclaim configured versus stale, but cannot fabricate health.
     public static let maxTailBytes = 512 * 1024
 
-    /// Newest success or connection rejection per family, keyed by `canonicalID`.
     public static func latestByConnector(
         root: URL,
         maxTailBytes: Int = maxTailBytes
@@ -146,8 +119,7 @@ public enum ConnectorProofLedger {
             guard successStatuses.contains(status) || status == "failed" else { continue }
             let rejection = connectionRejection(row["output"])
             if status == "failed", rejection == nil { continue }
-            // Local status success proves no transport; a failed credential
-            // check still invalidates an earlier successful call.
+            // Local status success proves no transport; a failed credential check still invalidates an earlier successful call.
             if let action = row["actionId"]?.stringValue?.lowercased(),
                status != "failed", action.hasSuffix(".status") {
                 continue
@@ -162,11 +134,12 @@ public enum ConnectorProofLedger {
 
     private static func ledgerUnavailable(_ path: URL) -> NSError {
         NSError(domain: "NativeAgentConnectorProof", code: -1,
-            userInfo: [NSLocalizedDescriptionKey: "Connector evidence is unreadable or malformed at \(path.path). Repair the receipt ledger before trusting connection health."])
+            userInfo: [NSLocalizedDescriptionKey: """
+                Connector evidence is unreadable or malformed at \(path.path). Repair the receipt ledger before trusting connection health.
+                """])
     }
 
-    /// True for rejected authorization, false for a failed transport, nil for
-    /// action/local failures that say nothing about the connection's health.
+    /// True for rejected authorization, false for a failed transport, nil for action/local failures that say nothing about the connection's health.
     private static func connectionRejection(_ output: JSONValue?) -> Bool? {
         guard case .object(let fields)? = output else { return nil }
         let error = fields["error"]?.stringValue?.lowercased() ?? ""
@@ -183,7 +156,6 @@ public enum ConnectorProofLedger {
         return nil
     }
 
-    /// Registry ids and receipt `connectorId`s compare as one key, trimmed and lowercased.
     public static func canonicalID(_ raw: String) -> String {
         ConnectorOAuthRegistry.normalizedConnectorID(raw)
     }

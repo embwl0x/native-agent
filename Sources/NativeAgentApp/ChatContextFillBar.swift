@@ -9,19 +9,16 @@ import MemoryV2
 import PersistenceCore
 import ProviderRouting
 
-// Blueprint: | `ChatContextFillBar.swift` | `ContextFillPresentation` and context strip/ring: measured usage, model window and compaction controls; missing figures stay visibly unavailable |
+// Blueprint: | `ChatContextFillBar.swift` | `ContextFillPresentation`: Shared context usage; missing measurements remain unavailable |
 
-/// Values shown in the context strip. The strip is a readout, so an absent
-/// provider figure must stay visibly absent instead of becoming a confident
-/// zero. Keeping this at the rendering seam lets the UI and accessibility
-/// label share that truth.
+/// Absent provider figures must stay absent so visible and accessibility readouts cannot invent zero usage.
 enum ContextFillPresentation {
     struct Usage: Equatable {
         let percent: Double
         let fillFraction: Double
     }
 
-    /// The window's size; 0 is a window no catalog row states, never a size.
+    /// Zero means the catalog states no window size, never a measured size.
     static func window(_ budget: Int) -> String? {
         budget > 0 ? NumberFormatter.localizedString(from: NSNumber(value: budget), number: .decimal) : nil
     }
@@ -36,12 +33,7 @@ enum ContextFillPresentation {
         return String(format: "%.0f%%", value.rounded())
     }
 
-    static func compactionPercent(_ status: SessionContextStatus) -> String {
-        guard status.budget > 0 else { return "unavailable" }
-        return roundedPercent(Double(status.auto_compact_threshold) / Double(status.budget) * 100)
-    }
-
-    /// The owner's measured or estimated share of the selected model window.
+    /// Use the owner's measured or estimated share rather than inventing usage locally.
     static func usage(_ status: SessionContextStatus) -> Usage {
         let percent = status.budget > 0 ? status.percent : 0
         return Usage(
@@ -51,46 +43,17 @@ enum ContextFillPresentation {
     }
 }
 
-enum ContextFillCompactionPresentation {
-    enum ButtonState: Equatable {
-        case hidden
-        case ready
-        case compacting
-    }
-
-    static func buttonState(
-        status: SessionContextStatus?,
-        isCompacting: Bool
-    ) -> ButtonState {
-        guard status?.compactable == true else { return .hidden }
-        return isCompacting ? .compacting : .ready
-    }
-
-    static func failureMessage(for result: ChatSessionCompactionOutcome) -> String? {
-        guard !result.compacted else { return nil }
-        let detail = result.reason.trimmingCharacters(in: .whitespacesAndNewlines)
-        let suffix = detail.isEmpty ? nil : detail
-        return suffix.map { "Context compaction did not run: \($0)" }
-            ?? "Context compaction did not run. Try again after the next context refresh."
-    }
-}
-
 struct ContextFillBar: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
     private var status: SessionContextStatus? { appModel.engine.providers.sessions[sessionId]?.context }
-    @State private var isCompacting = false
-    @State private var compactionError: String? = nil
-    private var lastError: String? { compactionError ?? appModel.engine.providers.sessions[sessionId]?.error }
+    private var lastError: String? { appModel.engine.providers.sessions[sessionId]?.error }
 
     private var usage: ContextFillPresentation.Usage {
         guard let status else { return .init(percent: 0, fillFraction: 0) }
         return ContextFillPresentation.usage(status)
     }
     private var pct: Double { usage.percent }
-    private var compactButtonState: ContextFillCompactionPresentation.ButtonState {
-        ContextFillCompactionPresentation.buttonState(status: status, isCompacting: isCompacting)
-    }
     private var fillColor: Color {
         if pct >= 80 { return .red }
         if pct >= 60 { return .orange }
@@ -104,7 +67,6 @@ struct ContextFillBar: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
 
-            // Bar — capsule with proportional fill
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary)
@@ -134,12 +96,6 @@ struct ContextFillBar: View {
                         }
                         Text("chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens))")
                             .foregroundStyle(NativeAgentShell.secondary)
-                        Image(systemName: "rectangle.compress.vertical")
-                            .font(ShellType.captionSemibold)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .accessibilityHidden(true)
-                        Text(formatExactTokens(s.auto_compact_threshold))
-                            .foregroundStyle(NativeAgentShell.secondary)
                         if let delta = s.turn_delta_tokens {
                             Image(systemName: delta >= 0 ? "arrow.up.right" : "arrow.down.right")
                                 .font(ShellType.captionSemibold)
@@ -158,61 +114,18 @@ struct ContextFillBar: View {
                 Text("—").font(ShellType.captionCode).foregroundStyle(.tertiary).frame(width: 280)
             }
 
-            // Compact-now button when the runtime says transcript reduction is
-            // meaningful. Its accessibility identity stays stable while its
-            // visible state explains whether a request is in flight.
-            if compactButtonState != .hidden {
-                Button {
-                    Task { await compactNow() }
-                } label: {
-                    if compactButtonState == .compacting {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: "rectangle.compress.vertical")
-                    }
-                }
-                .buttonStyle(.borderless)
-                .help(
-                    compactButtonState == .compacting
-                        ? "Compacting older messages into a summary…"
-                        : "Compact older messages into a summary so the rest of the context window is free."
-                )
-                .disabled(compactButtonState == .compacting)
-                .accessibilityIdentifier("chat.context-fill.compact-button")
-                .accessibilityLabel(
-                    compactButtonState == .compacting ? "Compacting context" : "Compact context now"
-                )
-                .accessibilityValue(
-                    compactButtonState == .compacting ? "In progress" : "Available"
-                )
-            }
-
             if let lastError {
-                let retryCompaction = compactionError != nil
-                let retryLabel = retryCompaction
-                    ? "Compaction failed. Retry"
-                    : "Context status unavailable. Retry"
                 Button {
-                    Task {
-                        if retryCompaction {
-                            await compactNow()
-                        } else {
-                            await refresh()
-                        }
-                    }
+                    Task { await refresh() }
                 } label: {
-                    Label(
-                        retryCompaction ? "Compaction failed" : "Context unavailable",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
+                    Label("Context unavailable", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
                 }
                 .buttonStyle(.borderless)
-                .disabled(isCompacting)
-                .help("\(retryLabel): \(lastError)")
+                .help("Context status unavailable. Retry: \(lastError)")
                 .accessibilityIdentifier("chat.context-fill.retry-button")
-                .accessibilityLabel(retryLabel)
+                .accessibilityLabel("Context status unavailable. Retry")
             }
         }
         .padding(.horizontal, 8)
@@ -240,14 +153,19 @@ struct ContextFillBar: View {
             " Change from the preceding turn's final provider request: \(formatSignedTokens($0)) tokens."
         } ?? ""
         let window = s.budget > 0 ? "your \(s.budget)-token window" : "a window no catalog states for this model"
-        let usageDescription = "The last matching provider request recorded \(s.used_tokens) input tokens of \(window). Transcript and other-input shares were not measured.\(deltaDescription)"
-        return "\(usageDescription) Mode: \(mode). Compaction separately sizes the next built request. Effective compact trigger: \(ContextFillPresentation.compactionPercent(s)) (\(s.auto_compact_threshold) tokens). The trigger and target leave room for the response. The fold aims for 55% of the window at default, lowered when output needs more room; background aging uses the same trigger. A completed fold is checked against its target; protected history or a fold that cannot reduce it reports the cause."
+        let usageDescription = """
+            The last matching provider request recorded \(s.used_tokens) input tokens of \(window). Transcript and other-input shares were not \
+            measured.\(deltaDescription)
+            """
+        return usageDescription + " Mode: " + mode + ". Whole oldest turns leave replay at the model window; the transcript stays on disk."
     }
 
     private func contextAccessibilityLabel(_ s: SessionContextStatus) -> String {
         let source = "last observed provider input"
         let fill = s.budget > 0 ? "of \(s.budget) tokens, \(formatPercent(s.percent))" : "tokens, window unknown"
-        return "Context: \(s.used_tokens) \(fill), \(source). Stored chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens)) tokens; automatic compaction at \(s.auto_compact_threshold)."
+        return """
+            Context: \(s.used_tokens) \(fill), \(source). Stored chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens)) tokens.
+            """
     }
 
     @MainActor
@@ -255,30 +173,10 @@ struct ContextFillBar: View {
         await appModel.engine.providers.refreshSession(sessionId)
     }
 
-    @MainActor
-    private func compactNow() async {
-        guard !isCompacting else { return }
-        isCompacting = true; defer { isCompacting = false }
-        compactionError = nil
-        do {
-            let result = try await appModel.compactSession(
-                sessionId: sessionId,
-                model: status?.model,
-                providerID: appModel.engine.providers.sessions[sessionId]?.choice?.provider,
-                force: true
-            )
-            if let failure = ContextFillCompactionPresentation.failureMessage(for: result) {
-                compactionError = failure
-                return
-            }
-            await refresh()
-        } catch {
-            compactionError = UserFacingError.cause(error, action: "compact this chat")
-        }
-    }
+
 }
 
-/// Read-only context ring over the same engine-owned session context as ContextFillBar.
+/// Read the same engine-owned context as the strip so the ring cannot disagree.
 struct ComposerContextRing: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
@@ -297,11 +195,14 @@ struct ComposerContextRing: View {
     }
 
     private var helpText: String {
-        guard let status else { return appModel.engine.providers.sessions[sessionId]?.error ?? "Context usage unavailable; no matching provider measurement has loaded." }
+        guard let status else {
+            return appModel.engine.providers.sessions[sessionId]?.error
+                ?? "Context usage unavailable; no matching provider measurement has loaded."
+        }
         let used = NumberFormatter.localizedString(from: NSNumber(value: status.used_tokens), number: .decimal)
         guard let window = ContextFillPresentation.window(status.budget) else { return "Context: \(used) tokens; window unknown" }
         let source = "last observed provider input"
-        return "Context: \(used) of \(window) tokens (\(ContextFillPresentation.roundedPercent(usage.percent))); \(source). Effective compact trigger: \(ContextFillPresentation.compactionPercent(status)) (\(status.auto_compact_threshold) tokens); the target leaves room for output; aging uses the same effective trigger."
+        return "Context: \(used) of \(window) tokens (\(ContextFillPresentation.roundedPercent(usage.percent))); \(source)."
     }
 
     var body: some View {

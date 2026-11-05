@@ -3,10 +3,14 @@ import SwiftUI
 import Agents
 import AgentConversations
 import NativeAgentShared
+import EngineRuntime
+import NativeAgentCore
+import ChatTurnContracts
+import MacControl
 
-// Blueprint: | `GrokSecureSetupCard.swift` | `GrokSecureSetupCard`: masked credential submission through secure setup, without exposing secret values in the view |
+// Blueprint: | `GrokSecureSetupCard.swift` | `GrokSecureSetupCard`: secure credential submission without secret exposure |
 
-/// The masked field writes only to Keychain, never via chat or a tool.
+/// Secure-field input goes only to Keychain, never chat or tools.
 struct GrokSecureSetupCard: View {
     let dataRoot: URL
     let contact: AgentPeerContact
@@ -20,7 +24,10 @@ struct GrokSecureSetupCard: View {
             if ["creating", "secure-paste"].contains(contact.grokSetup ?? "") {
                 Text("Routine credentials").font(.headline)
                 if contact.grokConversation == nil {
-                    Text("Connect briefly brings Grok Bot forward to send the routine request. If the current Bot cannot be identified, enter its exact sidebar name here, then Connect again.").font(.caption)
+                    Text("""
+                        Connect briefly brings Grok Bot forward to send the routine request. If the current Bot cannot be identified, enter its exact \
+                        sidebar name here, then Connect again.
+                        """).font(.caption)
                     TextField("Bot name", text: $botName)
                     Button("Use this Bot") {
                         do {
@@ -31,7 +38,10 @@ struct GrokSecureSetupCard: View {
                         } catch { status = "Could not save the Bot selection: " + failureDetail(error) }
                     }.disabled(busy || botName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                Text(contact.grokSetup == "creating" ? "Routine setup is not confirmed. Connect again to continue this contact's setup. If a request was already submitted, it will not be sent again; approve it in Grok Bot if asked." : GrokBotRoute.securePasteBlocker).font(.caption)
+                Text(contact.grokSetup == "creating" ? """
+                    Routine setup is not confirmed. Connect again to continue this contact's setup. If a request was already submitted, it will not be sent \
+                    again; approve it in Grok Bot if asked.
+                    """ : GrokBotRoute.securePasteBlocker).font(.caption)
                 Button("Read routine securely") { importNative(contact) }.disabled(busy)
                 SecureField("Paste {\"url\":\"…\",\"key\":\"…\"}", text: $paste)
                     .textFieldStyle(.roundedBorder).privacySensitive()
@@ -58,8 +68,10 @@ struct GrokSecureSetupCard: View {
         Task { @MainActor in
             defer { busy = false }
             do {
-                guard try await GrokBotConnection.importSecureCredentials(peer: contact.id, dataRoot: dataRoot,
-                    desktop: NativeAgentEngine.live.agents.desktop) else { return }
+                let turn = Turn().with(\.envelope, .personOnMac("mac_ui:grok.import"))
+                guard try await GrokBotConnection.importSecureCredentials(turn: turn, mac: .init(dataRoot: dataRoot),
+                    peer: contact.id, dataRoot: dataRoot,
+                    desktop: NativeAgentEngine.forRoot(dataRoot).agents.desktop) else { return }
                 ready()
             } catch {
                 status = failureDetail(error)
@@ -70,8 +82,7 @@ struct GrokSecureSetupCard: View {
         status = "Set up. Credentials are in Keychain. Send a test message; approve the local reply command in Grok Bot if asked."
     }
     private func failureDetail(_ error: any Error) -> String {
-        // A failed credential operation may echo its input. Remove the exact
-        // secure-field contents as well as the shared credential patterns.
+        // Credential errors may echo input; redact the exact secure-field value as well as known secret patterns.
         let detail = paste.isEmpty ? error.localizedDescription
             : error.localizedDescription.replacingOccurrences(of: paste, with: "[redacted]")
         return String(TurnSecretRedactor.redactText(detail).prefix(1_000))

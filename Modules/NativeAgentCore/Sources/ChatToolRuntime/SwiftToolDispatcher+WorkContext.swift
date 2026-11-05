@@ -1,4 +1,5 @@
 import AgentWorkspace
+import ChatToolParsing
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -6,14 +7,12 @@ import Desk
 import MacIntegration
 // Blueprint: | `SwiftToolDispatcher+WorkContext.swift` | `SwiftToolDispatcher`: `impl_work_context`, `workContextDeskItem`, `boundedWorkContextValue` |
 
-/// Read-time query shaping only, never a semantic decision or another memory
-/// index. Keep a one-letter subject such as X while dropping conversational
+/// Read-time query shaping only, never a semantic decision or another memory index. Keep a one-letter subject such as X while dropping conversational
 /// scaffolding that would otherwise match nearly every transcript.
 
 extension SwiftToolDispatcher {
-    /// One lazy read brings work, conversation and Mail evidence together.
-    /// Their existing readers remain the owners; no memory write or replay.
-    func impl_work_context(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    /// Share existing evidence readers; this lazy read must not write memory or replay work.
+    func impl_work_context(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let rawQuery = try requireString(input, "query").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawQuery.isEmpty, rawQuery.count <= 400 else {
             throw AutonomyGateError.toolDenied(reason: "work_context: give a work topic in 1–400 characters")
@@ -46,19 +45,18 @@ extension SwiftToolDispatcher {
         default: throw AutonomyGateError.toolDenied(reason: "work_context: session_id must be a string")
         }
         if let session = requestedSession, !session.isEmpty {
-            // Validate before either owner read; an invalid scope must not
-            // silently fall back to another session or a global search.
+            // Validate before either owner read; an invalid scope must not silently fall back to another session or a global search.
             guard NativeAgentChatSessionID.normalizedPathComponent(session) != nil else {
                 throw AutonomyGateError.toolDenied(reason: "work_context: invalid session_id")
             }
             historyInput["session_id"] = .string(session)
         }
 
-        async let mail = workContextMail(query: query, surface: surface)
-        async let history = impl_search_chat_history(
+        async let mail = workContextMail(turn: turn, invocation: invocation, query: query, surface: surface)
+        async let history: JSONValue = impl_search_chat_history(
             input: historyInput, invokedAs: "search_chat_history",
             workContextQuery: query,
-            excludingRunID: ChatTurnExecution.current?.historyRunID
+            excludingRunID: turn.run
         )
         var deskResult: JSONValue
         var historyResult: JSONValue
@@ -111,7 +109,11 @@ extension SwiftToolDispatcher {
             if case .object(let result) = result {
                 var lane: [String: JSONValue] = [
                     "status": .string("ok"), "source": .string("canonical_chat_history"),
-                    "meaning": .string("Historical excerpts balanced across work turns and the newest matching context. Recorded tool activity helps ranking; it does not establish success or authority. Excerpts may contain proposals, superseded decisions or claims, not current-state verification or automatically the last agreement."),
+                    "meaning": .string("""
+                        Historical excerpts balanced across work turns and the newest matching context. Recorded tool activity helps ranking; it \
+                        does not establish success or authority. Excerpts may contain proposals, superseded decisions or claims, not \
+                        current-state verification or automatically the last agreement.
+                        """),
                     "excerpts": result["hits"] ?? .array([]),
                 ]
                 for key in ["coverage", "coverage_note", "searched_session_count", "hit_count", "has_more", "selection_policy"] {
@@ -145,27 +147,39 @@ extension SwiftToolDispatcher {
             ])
         }
         let mailResult = try await mail
+        let reply = ToolResult(mailResult)
         if case .object(let lane) = mailResult,
-           lane["status"] != .string("completed") || lane["accounts_not_listed"] != nil { partial = true }
+           !(reply.said("completed") && reply.status == lane["status"]?.stringValue) || lane["accounts_not_listed"] != nil { partial = true }
         return .object([
             "status": .string(partial ? "partial" : "ok"),
             "query": .string(rawQuery), "matched_topic": .string(query.text),
             "request": .object(continuation),
             "current_work": deskResult, "supporting_history": historyResult,
             "mail": mailResult,
-            "matching_policy": .string("Desk and chat: whole topic words within 64 words; at least 60 percent topic coverage. Incidental paths do not establish a topic match unless the query asks for a path. Mail: OR matching against sender and subject metadata only."),
-            "coverage": .string("Bounded lexical recall of live Desk titles, projects, summaries and latest notes, plus saved chat message content. Mail searches sender and subject for significant query words with OR matching: newest first, up to five inbox messages from the last 90 days, within 1.5 seconds when Mail Read is allowed and ready. Mail bodies, Messages, Notes, memory, archived Desk records, files and other external systems were not searched. No matches do not establish absence."),
-            "next_step": .string("Use the current record and dated excerpts to orient; open their exact read locators where agreement, completion or authority needs confirmation. Nothing was resumed or repeated."),
+            "matching_policy": .string("""
+                Desk and chat: whole topic words within 64 words; at least 60 percent topic coverage. Incidental paths do not establish a topic \
+                match unless the query asks for a path. Mail: OR matching against sender and subject metadata only.
+                """),
+            "coverage": .string("""
+                Bounded lexical recall of live Desk titles, projects, summaries and latest notes, plus saved chat message content. Mail searches \
+                sender and subject for significant query words with OR matching: newest first, up to five inbox messages from the last 90 days, \
+                within 1.5 seconds when Mail Read is allowed and ready. Mail bodies, Messages, Notes, memory, archived Desk records, files and \
+                other external systems were not searched. No matches do not establish absence.
+                """),
+            "next_step": .string("""
+                Use the current record and dated excerpts to orient; open their exact read locators where agreement, completion or authority \
+                needs confirmation. Nothing was resumed or repeated.
+                """),
         ])
     }
 
-    private func workContextMail(query: WorkContextQuery, surface: String) async throws -> JSONValue {
+    private func workContextMail(turn: Turn, invocation: ChatToolInvocation, query: WorkContextQuery, surface: String) async throws -> JSONValue {
         let since = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-90 * 86_400))
         let input: [String: JSONValue] = ["query": .array(query.terms.map(JSONValue.string)),
             "sort": .string("newest"), "limit": .int(5), "since": .string(since)]
         let outcome = await raceAgainstTimeout(seconds: 1.5) { [self] in
             let readiness = try await macIntegrationPermissionStore.readinessChecked()
-            let admitted = await fullMacYoloAdmitted(surface: surface)
+            let admitted = await fullMacYoloAdmitted(turn: turn, surface: surface)
             guard try await macIntegrationPermissionStore.allows(MacIntegrationID.mail, mode: .read) else {
                 return JSONValue.object(["status": .string("unavailable"), "message": .string(
                     readiness.refusal(integration: MacIntegrationID.mail, mode: .read)
@@ -176,12 +190,14 @@ extension SwiftToolDispatcher {
                     "message": .string("Mail is not ready: the app's Mail reader is unavailable; Mail was not searched.")])
             }
             try Task.checkCancellation()
-            return try await bridge.mailSearch(input: input)
+            return try await bridge.serving(turn: turn.with(\.fullMacAdmitted, admitted),
+                context: invocation.macContext(dataRoot: dataRoot)).mailSearch(input: input)
         }
         switch outcome {
         case .value(let result):
             try Task.checkCancellation()
-            return AgentWorkspace.attachReadReferences(tool: "mail_search", input: input, result: result, dataRoot: dataRoot)
+            return AgentWorkspace.attachReadReferences(workspace: ChatWorkspaceBinding.operation(turn: turn, invocation: invocation),
+                tool: "mail_search", input: input, result: result, dataRoot: dataRoot)
         case .timedOut:
             return .object(["status": .string("skipped"),
                 "message": .string("Mail search exceeded 1.5 seconds and was skipped; Desk and chat results are retained. No Mail matches were established.")])
@@ -200,7 +216,7 @@ extension SwiftToolDispatcher {
         var out: [String: JSONValue] = [
             "handle": .string(item.handle), "alias": .string(item.alias), "title": .string(String(item.title.prefix(300))),
             "project": .string(String(item.project.prefix(200))),
-            "status": .string(item.statusDescription), "display_status": .string(HerScreen.deskState(item)), "updated_at": .string(item.updatedAt),
+            "status": .string(item.statusDescription), "display_status": .string(AgentScreen.deskState(item)), "updated_at": .string(item.updatedAt),
             "is_open": .bool(!item.status.isTerminal),
             "read_locator": workContextRead("desk_read", ["handle": .string(item.handle)]),
             "latest_recorded_notes": .array(item.notes.suffix(3).map {
@@ -232,7 +248,8 @@ extension SwiftToolDispatcher {
         }
         let children = state.children(of: item.handle)
         out["children"] = .array(children.prefix(5).map {
-            .object(["handle": .string($0.handle), "alias": .string($0.alias), "title": .string(String($0.title.prefix(300))), "status": .string($0.statusDescription),
+            .object(["handle": .string($0.handle), "alias": .string($0.alias), "title": .string(String($0.title.prefix(300))), "status": .string(
+                $0.statusDescription),
                      "read_locator": workContextRead("desk_read", ["handle": .string($0.handle)])])
         })
         out["additional_children"] = .bool(children.count > 5)
@@ -249,8 +266,7 @@ extension SwiftToolDispatcher {
         return .object(out)
     }
 
-    /// Preserve structured evidence, visibly clip large free text. Full records
-    /// remain at the exact Desk locator; this projection never reads files.
+    /// Preserve structured evidence, visibly clip large free text. Full records remain at the exact Desk locator; this projection never reads files.
     static func boundedWorkContextValue(_ value: JSONValue) -> JSONValue {
         switch value {
         case .string(let text):

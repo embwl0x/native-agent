@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `iCloudSyncEngine+Actions.swift` | Signed action submission, send serialization and connection-repair admission; response verification, correlation, settlement and bounded arrival waiting |
+// Blueprint: | `iCloudSyncEngine+Actions.swift` | Signed submissions and repair admission; verified responses, settlement and bounded arrival waits |
 
 private let decisionActionPollTimeoutSeconds: Double = 300
 private let decisionActionPollIntervalSeconds: Double = 0.75
@@ -23,8 +23,7 @@ extension iCloudSyncEngine {
         }
     }
 
-    /// Submit a signed envelope and return its message ID for response waiting.
-    /// Capture pairing before off-main signing and I/O; unsigned actions are rejected.
+    /// Capture pairing before off-main signing/I/O; unsigned actions must never enter transport.
     @discardableResult
     func sendAction(_ action: InboxAction, intentionalNewRequest: Bool = false) async throws -> String {
         let requestedTransaction = action.transactionId ?? action.msgId
@@ -69,7 +68,10 @@ extension iCloudSyncEngine {
             try await writeTransaction(id: transactionId, action: action.action, state: "queued", attempts: 1, msgId: action.msgId)
         } catch {
             if wasRetained {
-                throw SyncError.responseUnconfirmed("The original action remains unresolved, and its local receipt could not be saved: \(error.localizedDescription). Check the Mac before submitting new work.")
+                throw SyncError.responseUnconfirmed("""
+                    The original action remains unresolved, and its local receipt could not be saved: \(error.localizedDescription). Check the Mac before \
+                    submitting new work.
+                    """)
             }
             throw error
         }
@@ -109,7 +111,10 @@ extension iCloudSyncEngine {
                         attempts: 1, error: sendError.localizedDescription
                     )
                 } catch {
-                    let message = "Mac action delivery is not confirmed (\(sendError.localizedDescription)); its local receipt could not be saved (\(error.localizedDescription)). Keep the original request identity and check the Mac before submitting new work."
+                    let message = """
+                        Mac action delivery is not confirmed (\(sendError.localizedDescription)); its local receipt could not be saved \
+                        (\(error.localizedDescription)). Keep the original request identity and check the Mac before submitting new work.
+                        """
                     syncError = message
                     throw SyncError.responseUnconfirmed(message)
                 }
@@ -126,7 +131,10 @@ extension iCloudSyncEngine {
                 timeoutSeconds: 30, operation: "iCloud sendAction")
         } catch {
             let sendError = error
-            let message = "Mac action delivery is not confirmed: \(sendError.localizedDescription). Keep the original request identity and check the Mac before submitting new work."
+            let message = """
+                Mac action delivery is not confirmed: \(sendError.localizedDescription). Keep the original request identity and check the Mac before \
+                submitting new work.
+                """
             syncError = message
             throw SyncError.responseUnconfirmed(message)
         }
@@ -136,16 +144,14 @@ extension iCloudSyncEngine {
         do {
             try await writeTransaction(id: transactionId, action: action.action, state: "sent", attempts: 1)
         } catch {
-            throw SyncError.responseUnconfirmed("The action was published, but its local receipt could not be saved: \(error.localizedDescription). Check the Mac before submitting new work.")
+            throw SyncError.responseUnconfirmed(
+                "The action was published, but its local receipt could not be saved: \(error.localizedDescription). Check the Mac before submitting new work.")
         }
         return result
     }
 
 
-    /// Best-effort signed acknowledgement that one exact notification event
-    /// reached the iOS process (APNS) or its signed iCloud bridge reader. This does
-    /// not claim banner display or that the user saw it. Failure is intentionally
-    /// non-blocking; the Mac prediction remains pending and can expire honestly.
+    /// Receipt ACK proves process delivery only, never banner display or user attention; failed ACK leaves Mac prediction pending to expire.
     func sendNotificationReceipt(eventID: String, channel: String) async {
         let cleanID = eventID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard NativeAgentDeviceEventIdentity.isCanonical(cleanID) else { return }
@@ -166,28 +172,29 @@ extension iCloudSyncEngine {
         }
     }
 
-    /// Poll responses directory for a reply to msgId. Returns nil if not yet available.
-    /// `settlesAnswersFromPreviousPairing`: the automatic sends' settle paths,
-    /// which have no one to warn.
+    /// Automatic sends may settle previous-pairing responses without a UI warning; a missing response remains unavailable.
     func pollResponse(msgId: String, expectedAction: String? = nil,
-                      settlesAnswersFromPreviousPairing: Bool = false) async throws -> [String: String]? {
+                      settlesAnswersFromPreviousPairing: Bool = false, budget: OperationWaitBudget = .init()) async throws -> [String: String]? {
         do {
             return try await readActionResponse(msgId: msgId, expectedAction: expectedAction,
-                settlesAnswersFromPreviousPairing: settlesAnswersFromPreviousPairing)
+                settlesAnswersFromPreviousPairing: settlesAnswersFromPreviousPairing, budget: budget)
         } catch {
-            let message = "Response evidence for \(msgId) is unavailable: \(error.localizedDescription). The action remains unresolved; check Connection in Settings and the Mac before submitting new work."
+            let message = """
+                Response evidence for \(msgId) is unavailable: \(error.localizedDescription). The action remains unresolved; check Connection in Settings and \
+                the Mac before submitting new work.
+                """
             syncError = message
             throw SyncError.responseUnconfirmed(message)
         }
     }
 
     private func readActionResponse(msgId: String, expectedAction: String?,
-                                   settlesAnswersFromPreviousPairing: Bool) async throws -> [String: String]? {
+                                   settlesAnswersFromPreviousPairing: Bool, budget: OperationWaitBudget) async throws -> [String: String]? {
         let generation = lifecycleGeneration
         guard UUID(uuidString: msgId) != nil else { throw SyncError.persistence("Invalid response message identity.") }
         guard let responsesDir else { throw SyncError.notSetup }
         let fileURL = responsesDir.appendingPathComponent("\(msgId).json")
-        let data = try await VolumeIO.run {
+        let data = try await VolumeIO.run(budget: budget) {
             try Self.readActionMailboxFile(at: fileURL)
         }
         guard generation == lifecycleGeneration else { throw CancellationError() }
@@ -200,7 +207,7 @@ extension iCloudSyncEngine {
               expectedAction == nil || responseAction == expectedAction else {
             throw SyncError.persistence("Mac response omitted or mismatched its message, transaction or action identity.")
         }
-        if let pending = try await pendingCloudKitAction(msgId: msgId) {
+        if let pending = try await pendingCloudKitAction(msgId: msgId, budget: budget) {
             guard pending.transactionId == transactionId, pending.action == responseAction else {
                 throw SyncError.persistence("Mac response does not match the retained signed request.")
             }
@@ -213,17 +220,12 @@ extension iCloudSyncEngine {
         }
         if BridgeMessage.innerActionSignatureError(data: data, signature: signature, secret: { secret }) != nil {
             if settlesAnswersFromPreviousPairing, prefersCloudKitSnapshotCache {
-                // The CloudKit mailbox holds only responses this phone
-                // verified on arrival, with the key it held then. One that
-                // no longer verifies was answered under a pairing this
-                // phone has since replaced: the ledger settles it, never a
-                // re-pair warning about an exchange that works. Nothing is
-                // deleted, so a request still waiting on it reads exactly
-                // what it read before, and its retry keeps its identity.
+                // Mailbox responses were verified on arrival; replaced-key answers settle through the ledger without deleting bytes or changing retry identity.
                 try await settleAnswerFromPreviousPairing(
                     msgId: msgId,
                     transactionId: transactionId,
-                    action: responseAction
+                    action: responseAction,
+                    budget: budget
                 )
                 return nil
             } else {
@@ -245,25 +247,25 @@ extension iCloudSyncEngine {
                 state: state,
                 error: verified["error"] ?? verified["message"],
                 response: verified,
-                msgId: msgId
+                msgId: msgId,
+                budget: budget
             )
         } catch {
             throw SyncError.persistence("iCloud response was verified but its transaction receipt could not be persisted: \(error.localizedDescription)")
         }
-        // A verified response can still leave execution unsettled. Keep its
-        // original signed envelope until the Mac supplies a terminal outcome.
+        // Verified response does not imply terminal execution; retain the original envelope until a terminal outcome arrives.
         if Self.isTerminalTransactionState(state) {
             do {
-                try await retirePendingCloudKitAction(msgId: msgId)
+                try await retirePendingCloudKitAction(msgId: msgId, budget: budget)
             } catch {
-                throw SyncError.persistence("The terminal action response was saved, but its pending envelope could not be retired: \(error.localizedDescription)")
+                throw SyncError.persistence(
+                    "The terminal action response was saved, but its pending envelope could not be retired: \(error.localizedDescription)")
             }
         }
         return verified
     }
 
-    /// Submit exactly this request and await its original response. A refusal
-    /// is returned unchanged; only the person can choose a new submission.
+    /// Await this exact request's response; return refusal unchanged because only the user can choose a new submission.
     func sendActionAndWait(
         _ action: InboxAction,
         intentionalNewRequest: Bool = false,
@@ -298,7 +300,8 @@ extension iCloudSyncEngine {
             )
         }
         if InboxAction.responseResultClass(response) == "unknown" {
-            throw SyncError.responseUnconfirmed(response["message"] ?? "The Mac has not confirmed this action's outcome. Check the Mac before submitting new work.")
+            throw SyncError.responseUnconfirmed(response["message"]
+                ?? "The Mac has not confirmed this action's outcome. Check the Mac before submitting new work.")
         }
         if InboxAction.responseResultClass(response) != "succeeded" || explicitlyUnapplied {
             throw SyncError.macRejected(response["message"] ?? error ?? "Mac rejected the action.")
@@ -306,8 +309,7 @@ extension iCloudSyncEngine {
         return response
     }
 
-    /// Waits on local arrival with bounded transport backstops. Unreadable or
-    /// rejected evidence ends this wait explicitly and remains retained.
+    /// Bound arrival waiting; retain rejected/unreadable evidence and explicitly end the wait.
     func pollWithTimeout(
         msgId: String,
         timeout: Double,
@@ -333,8 +335,7 @@ extension iCloudSyncEngine {
                 return resp
             }
             let now = Date()
-            // A signalled arrival is already durable locally, so only an
-            // unpushed backstop window has to pay for a drain.
+            // A signalled response is already durable; drain transport only after an unpushed backstop interval.
             if iCloudBridge.shared.usesCloudKitDeviceTransport,
                !waiters.hasArrived(msgId),
                now.timeIntervalSince(lastDrainAt) >= backstop {
@@ -348,15 +349,12 @@ extension iCloudSyncEngine {
                 ? (waiters.hasArrived(msgId) ? backstop : max(0, backstop - now.timeIntervalSince(lastDrainAt))) : interval
             let tick = min(delay, remaining)
             if waiters.hasArrived(msgId) {
-                // An arrival signal can outlive its file. Pay the interval
-                // rather than spin on the retained signal; bad bytes already
-                // leave this wait through the checked reader above.
+                // Arrival signals can outlive files; wait an interval rather than spin on a retained signal.
                 guard let delay = UInt64(exactly: (max(0, tick) * 1_000_000_000).rounded(.towardZero)) else {
                     throw SyncError.persistence("The Mac response waiting interval is invalid.")
                 }
                 try await Task.sleep(nanoseconds: delay)
             } else {
-                // Wakes early on a push; otherwise ticks the cheap local read.
                 _ = await waiters.wait(msgId, timeout: tick)
             }
             try Task.checkCancellation()
@@ -371,7 +369,10 @@ extension iCloudSyncEngine {
         } catch let error as SyncError {
             throw error
         } catch {
-            throw SyncError.responseUnconfirmed("The Mac response is not confirmed, and the retained request could not be read: \(error.localizedDescription). Check the Mac before submitting new work.")
+            throw SyncError.responseUnconfirmed("""
+                The Mac response is not confirmed, and the retained request could not be read: \(error.localizedDescription). Check the Mac before submitting \
+                new work.
+                """)
         }
     }
 
@@ -386,8 +387,7 @@ extension iCloudSyncEngine {
         if let sessionId, !sessionId.isEmpty {
             payload["sessionId"] = sessionId
         }
-        // The runs this Stop is for. The Mac cancels a named run only while it
-        // still holds the session; a later turn is not this Stop's business.
+        // Stop names only runs still holding this session; later turns must not inherit cancellation.
         let namedRuns = runIDs.filter { !$0.isEmpty }
         if !namedRuns.isEmpty {
             payload["runId"] = namedRuns.joined(separator: ",")
@@ -412,8 +412,7 @@ extension iCloudSyncEngine {
         return result["status"] ?? result["result"] ?? ""
     }
 
-    /// The phone's Steer, on the Mac's control lane. True when the turn
-    /// working in that chat took it; the Mac then says how it ended.
+    /// Steer targets the working turn through Mac control; only the Mac evidences acceptance and its eventual outcome.
     func steerChat(sessionId: String, runId: String, text: String) async throws -> Bool {
         let action = InboxAction.make(action: "steerChat", payload: [
             "sessionId": sessionId, "runId": runId, "text": text, "routeKey": ChatRuntimeControls.deviceSourceKey,
@@ -423,8 +422,7 @@ extension iCloudSyncEngine {
         return result["steered"] == "true"
     }
 
-    /// Remove a tab through the signed Mac-owned pin mutation seam. This does
-    /// not archive or delete the underlying chat session.
+    /// Unpin through the signed Mac owner without archiving/deleting the underlying conversation.
     @discardableResult
     func unpinChatSession(sessionId: String) async throws -> String {
         let clean = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)

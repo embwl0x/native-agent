@@ -12,8 +12,7 @@ import BackgroundWork
 import Synchronization
 // Blueprint: | `ContactAddressBook.swift` | ContactListFacade owns checked address-book doors and their LatestRead publication and contact-change watch |
 
-/// The engine's address book: one checked row per door, including its grant
-/// and effective elevation verdict. Agents, Trust and contact threads read it.
+/// Share one checked row per door across surfaces without merging its grant or elevation verdict.
 @MainActor @Observable
 public final class ContactListFacade {
     public nonisolated let dataRoot: URL
@@ -32,7 +31,7 @@ public final class ContactListFacade {
         try await refreshDoors().doors.filter(\.primary)
     }
 
-    /// Return this read's doors and conversations even when a newer read owns publication.
+    /// Return this read even when a newer read owns publication.
     func refreshDoors() async throws -> (doors: [AgentContactRow], records: Result<[AgentConversationRecord], Error>) {
         let root = dataRoot
         return try await latest.read({
@@ -63,15 +62,13 @@ public final class ContactListFacade {
         }).get()
     }
 
-    /// Watch contact and conversation owners for address-book changes.
     public func watch() {
         guard watchTask == nil else { return }
         let root = dataRoot
         watchTask = Task { [weak self] in
             let events = FileChangeEvents(paths: ["agents/peers.json", "agents/conversations.json",
                 "agents/discovery.json", "chat/sessions.json"].map { root.appendingPathComponent($0) }
-                + [AgentLocalHealth.url(root), InstallPaths.current.bridgeConfigRoot(dataRoot: root)
-                    .appendingPathComponent("claude-bridge/claude-live")], emitInitial: true)
+                + [AgentLocalHealth.url(root)], emitInitial: true)
             let dot = NotificationCenter.default.addObserver(forName: ChatGPTDotIPCTransport.didChange,
                 object: nil, queue: nil) { [weak self] _ in
                 Task { @MainActor [weak self] in _ = try? await self?.refresh() }

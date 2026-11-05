@@ -41,37 +41,32 @@ extension AppModel: FirstRunWelcomePort {
     @discardableResult
     func maybeSendFirstRunGreeting() async -> FirstRunGreetingOutcome {
         let outcome = await firstRunWelcomeTransaction.maybeSendFirstRunGreeting(port: self)
-        // ChatView's later provider/session triggers do not inspect the
-        // returned outcome. Keep a rejected preparation visible there too.
+        // Later provider/session triggers ignore the returned outcome, so rejected preparation must also remain visible in state.
         if case .rejected = outcome, let message = outcome.routeFailureMessage {
             statusText = message
         }
-        // `.delivered` means the greeting turn has finished, whichever trigger
-        // started it — only now may macOS post its "Login Item Added" banner.
+        // Only a completed greeting permits the macOS login-item banner, regardless of which trigger started it.
         if case .delivered = outcome { AppDelegate.registerLoginItemInBackground() }
         return outcome
     }
 
-    /// Engine-owned first-conversation section title used to match persona-write receipts.
+    /// Match persona-write receipts against the engine-owned section title.
     var firstConversationReceiptTitle: String? {
         engine.transcripts.firstConversationReceiptTitle
     }
 
-    /// The person's own name, as the persona documents know it — the only
-    /// source for the exact section title the write must use.
+    /// Read the exact section title from persona documents so the write matches the person's own name.
     var firstConversationPersonName: String {
         get throws { try engine.transcripts.firstConversationPersonName }
     }
 
-    /// Production requires a fresh successful provider read. An old cached
-    /// ready row is not authority to create a first-run turn after a failed
-    /// refresh.
+    /// Require a fresh successful provider read; stale ready rows cannot authorize a first-run turn after refresh failure.
     func firstRunGreetingHasReadyProvider() async -> Bool {
         let providersFresh = await loadProvidersForChat()
         return providersFresh && engine.providers.hasReadyConnection
     }
 
-    /// The greeting uses ordinary chat admission after the first-run claim.
+    /// First-run claims do not bypass ordinary chat admission.
     func sendFirstRunGreeting(
         _ kickoff: String,
         sessionID: String

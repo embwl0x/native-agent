@@ -2,17 +2,9 @@ import Foundation
 // Blueprint: | `VisionRoleGuess.swift` | `VisionRoleGuess` |
 
 // MARK: - Role and STATE guesses
-//
-// Everything here is a GUESS and is emitted as one. An unknown role is
-// `AXUnknown` with a low role confidence — never a guessed `AXButton` at 1.0.
-// The roles are the AX lane's vocabulary on purpose: a consumer must not need
-// a second branch to read a vision row.
-//
-// Shapes only. There is no rule in this file that could not be written by
-// someone who had never seen the app under the cursor.
+// Roles are shape-based guesses in the shared AX vocabulary; unknown evidence stays AXUnknown with low confidence.
 
 public enum VisionRoleGuess {
-    /// The AX-vocabulary role names this layer can produce.
     public static let button = "AXButton"
     public static let textField = "AXTextField"
     public static let row = "AXRow"
@@ -20,8 +12,7 @@ public enum VisionRoleGuess {
     public static let scrollArea = "AXScrollArea"
     public static let unknown = "AXUnknown"
 
-    /// Roles a caller can meaningfully ACT on with a click/type. Used by the
-    /// abstain rule: two overlapping decorative regions are not a dilemma.
+    /// Only actionable roles create target ambiguity; overlapping decoration does not.
     public static let actionable: Set<String> = [button, textField, row, checkBox]
 
     public struct Guess: Sendable, Equatable {
@@ -38,7 +29,6 @@ public enum VisionRoleGuess {
         public let rect: VisionRect
         public let imageSize: VisionSize
         public let sources: [VisionEvidenceSource]
-        /// OCR boxes whose area is mostly inside `rect`.
         public let containedText: [VisionTextBox]
 
         public init(
@@ -58,9 +48,7 @@ public enum VisionRoleGuess {
             let frame = imageSize.width * imageSize.height
             return frame > 0 ? rect.area / frame : 0
         }
-        /// Is the contained text CENTRED in the region? The single most useful
-        /// button/field discriminator there is: a button's caption is centred,
-        /// a field's content starts at its left inset.
+        /// Centered captions suggest buttons while left-inset text suggests fields.
         var textIsCentred: Bool {
             guard let text = textBounds else { return false }
             let offset = abs(text.centerX - rect.centerX)
@@ -83,9 +71,7 @@ public enum VisionRoleGuess {
     }
 
     public static func guess(_ inputs: Inputs) -> Guess {
-        // A band candidate IS a row by construction — that is what the y-band
-        // clusterer detected (a repeated multi-text band), and no pixel fact
-        // is going to overturn it.
+        // Repeated multi-text bands already establish a row shape; later role guesses cannot overturn that evidence.
         if inputs.sources.contains(.textBand), !inputs.sources.contains(.colorRegion) {
             return Guess(role: row, confidence: 0.55)
         }
@@ -95,7 +81,7 @@ public enum VisionRoleGuess {
                 confidence: 0.65
             )
         }
-        // A saliency-only blob is exactly as unknown as it sounds.
+        // Saliency alone cannot establish a semantic role.
         if inputs.sources == [.saliency] {
             return Guess(role: unknown, confidence: 0.2)
         }
@@ -103,28 +89,24 @@ public enum VisionRoleGuess {
         let aspect = inputs.aspect
         let short = inputs.label.count <= 28
 
-        // A big region holding a lot of text is a CONTENT AREA — the
-        // scrollable-region candidate Agent asked for. Checked before the
-        // control shapes because a panel can also be wide.
+        // Classify text-heavy content areas before controls because panels can share their wide shapes.
         if inputs.areaFraction >= 0.12, inputs.containedText.count >= 4 {
             return Guess(
                 role: scrollArea,
                 confidence: 0.45
             )
         }
-        // Small and near-square with a fill of its own: a checkbox/toggle.
+        // Near-square regions with their own fill may indicate checkable controls.
         let minSide = min(inputs.rect.w, inputs.rect.h)
         if aspect >= 0.7, aspect <= 1.4, minSide <= max(28, inputs.imageSize.height * 0.05),
            inputs.containedText.isEmpty {
             return Guess(role: checkBox, confidence: 0.4)
         }
-        // Centred short caption inside a filled box: the classic button, and
-        // the case rectangle detection misses entirely when the button is
-        // filled and borderless (spike v0).
+        // Centered short captions can identify filled borderless buttons that rectangle edges miss.
         if !inputs.containedText.isEmpty, short, inputs.textIsCentred, aspect >= 1.2, aspect <= 12 {
             return Guess(role: button, confidence: 0.6)
         }
-        // Wide, and either empty or left-inset: a text entry candidate.
+        // Wide empty or left-inset regions suggest text entry.
         if aspect >= 2.5, inputs.containedText.isEmpty || inputs.textIsLeftAligned {
             return Guess(
                 role: textField,
@@ -132,8 +114,7 @@ public enum VisionRoleGuess {
             )
         }
         if !inputs.containedText.isEmpty, short, aspect >= 1.2 {
-            // It has a caption but the caption is not centred and it is not
-            // wide enough to read as a field. Lower confidence, honest role.
+            // Uncentered narrow captions justify only a lower-confidence role guess.
             return Guess(role: button, confidence: 0.35)
         }
         return Guess(role: unknown, confidence: 0.15)
@@ -141,24 +122,12 @@ public enum VisionRoleGuess {
 
     // MARK: - State
 
-    /// CAPTION CONTRAST is the luminance SPREAD inside the caption's box —
-    /// max minus min over the sampled cells. Spread, not "mean caption vs mean
-    /// fill": the mean of a text box is glyphs blended with the fill behind
-    /// them, so a white caption on a dark button and a grey caption on a grey
-    /// button can land at the same mean and the greyed control reads live.
-    /// Spread separates them the way an eye does — a live label has dark and
-    /// light cells in the same small box; a greyed one has neither.
-    ///
-    /// Below `disabledContrast` reads greyed, at or above `liveContrast` reads
-    /// live, and BETWEEN THE TWO we form no view at all, which is a different
-    /// and more honest answer than `false`.
+    /// Use caption luminance spread: blended means can make white-on-dark and grey-on-grey captions indistinguishable. Between disabled and live contrast
+    /// thresholds, publish no state rather than an invented false.
     public static let disabledContrast = 0.18
     public static let liveContrast = 0.30
 
-    /// `disabled` is the load-bearing guess: a confident click on a control
-    /// that is actually greyed out is the hopeful click this contract exists
-    /// to prevent. So it gets computed for every actionable row, both ways,
-    /// and it is never a bare boolean.
+    /// Every actionable row needs a confidence-bearing disabled guess so hopeful clicks cannot rely on a bare enabled boolean.
     public static func stateGuess(
         role: String,
         fillLuminance: Double?,
@@ -179,7 +148,7 @@ public enum VisionRoleGuess {
                     confidence: 0.5
                 )
             }
-            // Between the two thresholds: no flag. We do not know.
+            // Between thresholds, absence means unknown.
         }
 
         var selected: VisionStateFlag?
@@ -207,11 +176,7 @@ public enum VisionRoleGuess {
 
     // MARK: - Destructive-action risk
 
-    /// Verbs whose action a caller cannot take back. Agent asked for
-    /// destructive-action risk tagging; this is the general, label-shaped
-    /// version of it — a tag on the row, never a refusal invented here.
-    /// Irreversible acts need stronger confirmation than a reversible one,
-    /// and the row is where that fact belongs.
+    /// Irreversible verbs need stronger caller confirmation; retain a risk tag on the row rather than inventing a refusal here.
     public static let destructiveTokens: [String] = [
         "delete", "remove", "erase", "destroy", "wipe", "format", "reset",
         "discard", "revoke", "uninstall", "empty trash", "move to trash",

@@ -4,39 +4,36 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `PartThoughtTools.swift` | Restricted app-tool dispatcher for a part's thought, through its exact ToolHost and originating gate chain, with no independent effect authority; aggregates canonical nested receipt effects, including unknown in-flight effects, through thought failure/cancellation |
+// Blueprint: | `PartThoughtTools.swift` | Part thought shares the originating ToolHost and gate chain; retains uncertain effects |
 
-/// The model reaches exactly the same host as the part's JavaScript. An app
-/// schema advertises a vocabulary, never authority; ToolHost still checks the
-/// selected version, declared dependencies and originating gate at every effect.
+/// Model calls share the JavaScript ToolHost; advertised schemas grant no authority beyond version, dependency and origin gates.
 actor PartThoughtTools: ToolDispatchClient {
     let host: any OwnedProgramHostProfile
     let names: [String]
-    let userText: String?
+    let execution: OwnedProgramExecution
     private var inFlight = 0
     private var observed: Set<String> = []
 
-    init(host: any OwnedProgramHostProfile, names: [String], userText: String?) {
-        self.host = host; self.names = names; self.userText = userText
+    init(host: any OwnedProgramHostProfile, names: [String], execution: OwnedProgramExecution) {
+        self.host = host; self.names = names; self.execution = execution
     }
 
-    /// Receipt evidence survives a failed/cancelled provider turn. An effect
-    /// still awaiting its receipt cannot truthfully be reported as absent.
+    /// Receipt evidence survives a failed/cancelled provider turn. An effect still awaiting its receipt cannot truthfully be reported as absent.
     var effects: String {
         inFlight > 0 ? "unknown" : ["unknown", "partial", "occurred"].first(where: observed.contains) ?? "none"
     }
 
-    func listAvailableTools() async throws -> [String] {
+    func listAvailableTools(turn: Turn?, surface: String) async throws -> [String] {
         guard Set(names).isSubset(of: ["app"]) else {
             throw SenseFailure(code: "bad_input", message: "model.call tools names the app tool; actions remain the part's declared reach.")
         }
         return names
     }
-    func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        let offered = Set(try await listAvailableTools())
+    func listAvailableToolSchemas(turn: Turn?, surface: String) async throws -> [LLMToolSchema] {
+        let offered = Set(try await listAvailableTools(turn: turn, surface: surface))
         return AppToolExecutor.appToolSchemas().filter { offered.contains($0.name) }
     }
-    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    func dispatch(tool: String, input: [String: JSONValue], surface: String, turn: Turn, invocation: ChatToolInvocation) async throws -> JSONValue {
         try Task.checkCancellation()
         guard names.contains(tool), tool == "app" else {
             throw SenseFailure(code: "undeclared_dependency", message: "The thought requested a tool it was not offered.")
@@ -48,7 +45,12 @@ actor PartThoughtTools: ToolDispatchClient {
             try host.action(id)?.readOnly(args) == true
         } else { input["page"] != nil || input["find"] != nil }
         inFlight += 1
-        let receipt = await ChatToolSessionContext.$userText.withValue(userText) { await host.perform(input) }
+        let userText = execution.turn?.userText
+        var execution = execution
+        // The thought's prompt is not the originating request's words.
+        execution.turn = turn.with(\.userText, userText)
+        execution.toolInvocation = invocation
+        let receipt = await host.perform(input, execution: execution)
         let fields = if case .object(let fields) = receipt { fields } else { [String: JSONValue]() }
         let effects = OwnedProgramRunner.effects(fields)?.stringValue
         observed.insert(effects.flatMap { ["none", "occurred", "partial", "unknown"].contains($0) ? $0 : nil }

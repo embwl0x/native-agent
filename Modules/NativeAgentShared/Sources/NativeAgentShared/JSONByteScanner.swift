@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `JSONByteScanner.swift` | Lexical JSON string, value, object-member and array-element byte spans; callers own validation and duplicate-key policy |
+// Blueprint: | `JSONByteScanner.swift` | JSON byte spans; callers own validation and duplicate keys |
 
 /// Lexical spans in caller-validated bytes, including offset-preserving JSONC masks.
 public enum JSONByteScanner {

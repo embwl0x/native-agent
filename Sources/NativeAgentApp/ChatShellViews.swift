@@ -5,19 +5,16 @@ import EngineRuntime
 import SwiftUI
 import NativeAgentShared
 import TrustCenter
-// Blueprint: | `ChatShellViews.swift` | `ShellRoomHeader`; `ShellConversationRow` reads subtitle timestamps from its injected transcript-root opening-line owner |
+// Blueprint: | `ChatShellViews.swift` | `ShellRoomHeader`, `ShellConversationRow`: Shared header and owner-read subtitles |
 
-// MARK: - The header: her name and one dot
+// MARK: - The header: the agent's name and one dot
 
 struct ShellRoomHeader: View {
     var name: String
-    /// The dot shows waits and failures; the composer alone states settled trust.
+    /// The dot reports waits and failures; only the composer states settled trust.
     var status: ChatShellStatus
-    /// Simple view starts a fresh thread here or through /new.
     var onNewChat: (() -> Void)? = nil
-    /// Unread notes appear as one "N updates" capsule.
     var notes: InboxNotesCapsule? = nil
-    /// The Work pane's button, main window only (WorkPane.swift).
     var work: WorkPaneHeaderButton? = nil
 
     var body: some View {
@@ -43,7 +40,7 @@ struct ShellRoomHeader: View {
 
             Spacer(minLength: 12)
 
-            // Transcript search lives in Chat → Find in Conversation (⌘F).
+            // Keep transcript search in Find in Conversation so the header has one role.
 
             work
 
@@ -72,7 +69,7 @@ struct ShellRoomHeader: View {
                 .padding(.leading, 4)
             }
         }
-        // The header shares the transcript and composer's column and inner gutter.
+        // Align header, transcript and composer to one column and gutter.
         .padding(.horizontal, NativeAgentShellLayout.roomGutter)
         .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
         .padding(.leading, NativeAgentShellLayout.roomLeadingInset)
@@ -85,20 +82,19 @@ struct ShellRoomHeader: View {
 
 // MARK: - The conversations column
 
-/// One row: a title a person recognises, and where and when it happened.
 struct ShellConversationRow: View {
     var session: ChatSession
     var openingLines: ChatShellOpeningLine
     var selected: Bool
     var isPinned: Bool
-    /// The row shows its pin control while hovered or pinned.
+    /// Show pin controls only while hovered or pinned to keep ordinary rows quiet.
     var onTogglePin: () -> Void = {}
 
     @State private var hovering = false
     @FocusState private var pinFocused: Bool
 
     var body: some View {
-        // Native List owns selection; the row displays its words and pin.
+        // Native List owns selection; rows only display their content.
         let title = ChatShellConversationRow.title(for: session)
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
@@ -106,7 +102,7 @@ struct ShellConversationRow: View {
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
-            // Last-line previews distinguish conversations without changing their titles.
+            // Use previews to distinguish conversations without rewriting their titles.
             let preview = ChatShellConversationRow.listPreview(for: session, title: title)
             HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                 if !preview.isEmpty {
@@ -154,7 +150,7 @@ struct ShellConversationRow: View {
 
 // MARK: - Tool traffic
 
-/// Transcript activity shares one disclosure row with no fill or border.
+/// Use one bare disclosure so activity does not add another plate.
 struct ChatActivityRow<Leading: View, Detail: View>: View {
     let title: String
     var trailing: String = ""
@@ -163,15 +159,12 @@ struct ChatActivityRow<Leading: View, Detail: View>: View {
     @ViewBuilder var leading: () -> Leading
     @ViewBuilder var detail: () -> Detail
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.readingPlace) private var readingPlace
 
-    /// Where opened detail starts: past the chevron and its gap.
     static var indent: CGFloat { 18 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                if !isExpanded { readingPlace?.opening() }
                 withAnimation(NativeAgentMotion.respecting(
                     NativeAgentMotion.arrive, reduceMotion: reduceMotion
                 )) { isExpanded.toggle() }
@@ -214,7 +207,7 @@ struct ChatActivityRow<Leading: View, Detail: View>: View {
                         .transition(NativeAgentMotion.arrivalFade)
                 }
             }
-            // Clip the transition's travel, not the moving rows themselves.
+            // Clip transition travel without clipping the moving rows.
             .clipped()
         }
         .padding(.vertical, NativeAgentSpacing.xs)
@@ -236,8 +229,7 @@ extension ChatActivityRow where Leading == EmptyView {
     }
 }
 
-/// A worker's reply, folded: the headline row opens onto the words, and the
-/// routing slip it came wrapped in never renders here.
+/// Fold the helper reply without exposing its routing envelope.
 struct ShellEnvelopeRow: View {
     var content: String
     @State private var expanded = false
@@ -245,41 +237,6 @@ struct ShellEnvelopeRow: View {
     var body: some View {
         ChatActivityRow(title: ChatShellEnvelope.headline(content), isExpanded: $expanded) {
             Text(DelegatedReplyEnvelope(content).reply)
-        }
-    }
-}
-
-/// ONE quiet row per turn. Opening it says what she actually touched, in
-/// sentences, and each sentence opens onto that call's result.
-struct ShellToolRow: View {
-    @Environment(AppModel.self) private var appModel
-    var messages: [ChatMessage]
-    @State private var expanded = false
-    private struct Revision: Equatable, Sendable { let messages: [ChatMessage]; let expanded: Bool }
-    @State private var preparedRevision: Revision?
-    private var words: PresentationFaces { appModel.engine.transcripts.presentation }
-    private var headlineKey: String { "headline:"+(messages.first?.id ?? "empty") }
-
-    var body: some View {
-        let shown=Array(messages.prefix(ChatShellToolSummary.detailLimit))
-        let current=preparedRevision == Revision(messages:messages,expanded:expanded)
-        let headline=current ? (words.words(headlineKey) ?? "Activity unavailable.") : "Reading activity…"
-        ChatActivityRow(title:headline,isExpanded:$expanded) {
-            VStack(alignment:.leading,spacing:0) {
-                ForEach(shown,id:\.id) { message in
-                    ToolPillView(message:message,headline:current ? (words.words("detail:"+message.id) ?? "Readout unavailable.") : "Reading activity…")
-                }
-                if let overflow=ChatShellToolSummary.overflowLine(total:messages.count,shown:shown.count) {
-                    Text(overflow).foregroundStyle(NativeAgentShell.tertiary).padding(.vertical,NativeAgentSpacing.xs)
-                }
-            }
-        }
-        .accessibilityElement(children:.contain)
-        .accessibilityLabel(headline)
-        .quietReadTask(id:Revision(messages:messages,expanded:expanded)) {
-            let revision=Revision(messages:messages,expanded:expanded)
-            await appModel.engine.transcripts.prepareToolFold(revision.messages, expanded: revision.expanded)
-            if !Task.isCancelled { preparedRevision=revision }
         }
     }
 }
@@ -326,11 +283,8 @@ struct ShellEmptyRoom: View {
 
 // MARK: - Trouble
 
-/// One orange card in the room describing the unfinished turn: what it
-/// provably did, and the one retry that fits. The failed bubble above keeps
-/// the cause; the raw error stays under Details.
+/// Report proven effects and a valid retry in the trouble card; retain the cause and raw error in the failed bubble.
 struct ShellTroubleCard: View {
-    /// The failed assistant row at the tail.
     var message: ChatMessage
     var failure: ChatTurnFailure
     var showsStuckLink: Bool
@@ -341,8 +295,7 @@ struct ShellTroubleCard: View {
     @State private var showsDetails = false
 
     private var meta: ChatMessageMetadata? { message.metadata }
-    /// Nil where Retry cannot run: a rejected turn that may have run steps is
-    /// refused by regenerate itself, so the card offers no button it can't keep.
+    /// Offer Retry only when regenerate can honor it; uncertain prior effects require the shared refusal or confirmation.
     private var retryLabel: String? {
         if meta?.providerRefusalDraft == true { return "Retry draft" }
         if meta?.providerRefusal == true { return nil }

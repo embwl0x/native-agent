@@ -2,7 +2,7 @@ import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AbandonedTurnReconciler.swift` | `TurnCheckpoint` retains its originating DataRootLife; reads project stopped/restored across lives, ordinary reconciliation settles through the Stop terminal record before retirement; independent checkpoint discovery, strict day validation, sweep-local terminal index and guarded retirement |
+// Blueprint: | `AbandonedTurnReconciler.swift` | `TurnCheckpoint`: Life-bound checkpoint recovery and guarded retirement |
 
 /// The conversation is rebuilt from the transcript; only in-flight state lives here.
 public struct TurnCheckpoint: Codable, Sendable, Equatable {
@@ -20,23 +20,19 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public let fileAccess: String
     public let capabilityProfile: String?
     public var peerSources: [String]?
-    /// The steering peers the person's card answered in this run: a resume
-    /// continues under that one card, never a second.
+    /// The steering peers the person's card answered in this run: a resume continues under that one card, never a second.
     public var answeredPeers: [String]?
-    /// What she attached to this reply with `reply.attach`, in order: a
-    /// resume chooses them again, each behind the attachment fence once more.
+    /// What the agent attached to this reply with `reply.attach`, in order: a resume chooses them again, each behind the attachment fence once more.
     public var replyChoices: [String]?
     public let commandSignatureVerified: Bool?
     public let declaredRemote: Bool?
     public let helperDefinition: JSONValue?
     public var keptProse = ""
     public var workingCommentaryCharacters = 0
-    public var workingNotes = ""
     /// Persisted sentinel: 1 while a call awaits its receipt, nil otherwise; never a step index.
     public var runningStep: Int?
     public var deliveryPending = false
-    /// Input events and started-effect identities. Relaunch reruns `step`
-    /// to reconstruct state and effects; returned effect bodies are not stored.
+    /// Input events and started-effect identities. Relaunch reruns `step` to reconstruct state and effects; returned effect bodies are not stored.
     public var log: [JSONValue]?
 
     public var hasRedeliveryOwner: Bool {
@@ -45,10 +41,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
         return AgentBridgeCompletionRoute.Kind(surface: surface)?.hasRedeliveryOwner == true
     }
 
-    /// What a turn that ended with `status` owes its door: its reply, kept here
-    /// for redelivery, as `deliver:<surface>` to `<surface>:<destination>`, owed
-    /// until that door says it holds it. Nil when nothing redelivers it, or when
-    /// the door cannot yet say so (the phone): an obligation must be able to settle.
+    /// Retain replies until a capable door acknowledges delivery; absent delivery support must not create an obligation that can never settle.
     public func owedDelivery(status: String) -> (key: String, to: String)? {
         guard hasRedeliveryOwner, status == "completed" || status == "waiting",
               case .string(let surface)? = replyRoute["surface"],
@@ -121,19 +114,14 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
 
 /// Checkpointed turns resume; a missing checkpoint keeps recovery owed.
 public struct AbandonedTurnReconciler: Sendable {
-    /// Ordinary trace window; checkpoints are discovered independently of age.
-    public static let dayWindow = 3
-
-    /// Upper bound on the catch-up scan after a gap. Without it, an install
-    /// that has been off for months would read its whole trace history.
-    public static let maximumDayWindow = 30
-
-    /// Bound newly recorded obligations per sweep, including failed writes.
+    /// Bound incremental discovery; checkpoints are discovered independently of this record window.
+    public static let maximumAcceptedPerPass = 2_000
     public static let maximumWritesPerPass = 25
 
     /// Pinned at launch; only a previous process's turns are candidates.
     public static let processEpoch = Date()
 
+    private static let cursorKind = "turn.reconciliation.cursor"
     private let dataRoot: URL
     private let lane: TurnTracePersistLane
     private let now: @Sendable () -> Date
@@ -145,8 +133,9 @@ public struct AbandonedTurnReconciler: Sendable {
         now: @escaping @Sendable () -> Date = { Date() },
         processEpoch: Date = AbandonedTurnReconciler.processEpoch
     ) {
-        self.lane = lane
-        self.dataRoot = dataRoot ?? lane.resolvedDataRoot()
+        let root = dataRoot ?? lane.resolvedDataRoot()
+        self.dataRoot = root
+        self.lane = TurnTracePersistLane(dataRootOverride: root)
         self.now = now
         self.processEpoch = processEpoch
     }
@@ -157,8 +146,7 @@ public struct AbandonedTurnReconciler: Sendable {
         /// Turns accepted in this process are left alone.
         public let tooRecentToJudge: Int
         public let resumable: [TurnCheckpoint]
-        /// Why the sweep could not conclude: a day file it could not read or a
-        /// row it could not append. Nil for a conclusive sweep.
+        /// A failed or unreadable record/checkpoint, or an unconfirmed write. Nil reports no failure in this sweep.
         public let failure: String?
 
         public init(acceptedScanned: Int, reconciled: [String], tooRecentToJudge: Int,
@@ -174,7 +162,6 @@ public struct AbandonedTurnReconciler: Sendable {
     private struct Accepted {
         let ts: Date
         let sessionId: String?
-        let surface: String?
     }
 
     private static func isSettled(_ event: TurnTraceEvent) -> Bool {
@@ -184,61 +171,41 @@ public struct AbandonedTurnReconciler: Sendable {
         return true
     }
 
-    /// Discover checkpoints and reconcile a bounded legacy trace window.
+    /// Discover accepted turns by sequence and checkpoints independently of age. Each turn's terminal evidence is read by its own subject.
     @discardableResult
     public func sweep(inFlightTurnIds: Set<String> = []) async -> Outcome {
         let today = now()
         var accepted: [String: Accepted] = [:]
-        var terminated: Set<String> = []
-        var terminalIndex: [URL: (terminated: Set<String>, replyReady: Set<String>)] = [:]
-
+        var terminalIndex: [String: TraceRead] = [:]
         var persistenceFailures: [String] = []
-        let scan: (newestOffset: Int, oldestOffset: Int)?
-        do { scan = try scanRange(today: today) }
-        catch {
-            scan = nil
+        var scannedSeq: Int64?
+        do {
+            let cursor = try await persistedCursor()
+            let read = try await lane.events(.init(kinds: ["turn.accepted"], after: cursor, limit: Self.maximumAcceptedPerPass))
+            if !read.isClean {
+                persistenceFailures.append("Turn recovery discovery has \(read.unreadable) unreadable accepted details.")
+            }
+            for event in read.events {
+                guard !event.turnId.isEmpty, event.turnId != "unknown" else {
+                    persistenceFailures.append("An accepted detail has no turn identity.")
+                    continue
+                }
+                if accepted[event.turnId] == nil { accepted[event.turnId] = Accepted(ts: event.ts, sessionId: event.sessionId) }
+            }
+            scannedSeq = read.lastSeq
+        } catch {
             persistenceFailures.append("Turn recovery scan coverage is unavailable: \(error.localizedDescription)")
         }
-        // Catch-up terminals are written today, outside a historical window.
-        // Read them before selecting candidates so prior passes do not spend
-        // the attempt budget again. Today's accepted turns stay outside that window.
-        let scanDays = scan.map { Array($0.newestOffset...$0.oldestOffset) } ?? []
-        let terminalOnlyDays = (scan?.newestOffset ?? 0) > 0 ? [0] : []
-        func readDay(_ path: URL, includeAccepted: Bool) async throws {
-            guard terminalIndex[path] == nil else { return }
-            var terminalTurns = Set<String>()
-            var replyReadyTurns = Set<String>()
-            let read = try await TurnTraceReplayReader.read(path)
-            guard read.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
-            for event in read.events {
-                let turnId = event.turnId
-                if event.kind == "turn.accepted" {
-                    guard includeAccepted, !turnId.isEmpty, turnId != "unknown", accepted[turnId] == nil else { continue }
-                    accepted[turnId] = Accepted(ts: event.ts, sessionId: event.sessionId, surface: event.surface)
-                } else if Self.isSettled(event) {
-                    terminalTurns.insert(turnId)
-                    if case .object(let payload) = event.payload,
-                       payload["status"] == .string("completed") || payload["status"] == .string("waiting") {
-                        replyReadyTurns.insert(turnId)
-                    }
-                }
+
+        func readTurn(_ turnId: String) async throws -> TraceRead {
+            if let read = terminalIndex[turnId] { return read }
+            let read = try await lane.events(.init(subjects: [turnId]))
+            guard read.isClean else {
+                throw PersistenceCoreError.ioFailure("Turn \(turnId) has \(read.unreadable) unreadable details.")
             }
-            terminalIndex[path] = (terminalTurns, replyReadyTurns)
+            terminalIndex[turnId] = read
+            return read
         }
-        // An unreadable day hides only what it holds: checkpoints are still found
-        // and judged on their own days, and the window stays pending.
-        for dayOffset in terminalOnlyDays + scanDays {
-            guard let day = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
-            else { continue }
-            let path = lane.path(for: day)
-            do {
-                try await readDay(path, includeAccepted: dayOffset >= (scan?.newestOffset ?? 0))
-                terminated.formUnion(terminalIndex[path]!.terminated)
-            } catch {
-                persistenceFailures.append("\(path.lastPathComponent) is unreadable: \(error.localizedDescription)")
-            }
-        }
-        let ledgerComplete = persistenceFailures.isEmpty
 
         var tooRecent = 0
         var written: [String] = []
@@ -246,8 +213,8 @@ public struct AbandonedTurnReconciler: Sendable {
         var deferred = false
         var resumable: [TurnCheckpoint] = []
         var checkpoints: [String: TurnCheckpoint] = [:]
-        // Unreadable checkpoints owe their own repair; their siblings still resume.
         var unreadable: Set<String> = []
+        // Unreadable checkpoints owe their own repair; their siblings still resume.
         do {
             let root = dataRoot.appendingPathComponent("chat/session_state")
             if FileManager.default.fileExists(atPath: root.path) {
@@ -263,12 +230,14 @@ public struct AbandonedTurnReconciler: Sendable {
                                 else { continue }
                                 checkpoints[turnId] = checkpoint
                                 if accepted[turnId] == nil {
-                                    accepted[turnId] = Accepted(ts: checkpoint.acceptedAt,
-                                        sessionId: checkpoint.sessionId, surface: checkpoint.surface)
+                                    accepted[turnId] = Accepted(ts: checkpoint.acceptedAt, sessionId: checkpoint.sessionId)
                                 }
                             } catch {
                                 unreadable.insert(turnId)
-                                let detail = "Turn checkpoint is unreadable; repair chat/session_state/\(sessionId)/turn-\(turnId).json before resuming: \(error)"
+                                let detail = """
+                                    Turn checkpoint is unreadable; repair chat/session_state/\(sessionId)/turn-\(turnId).json before \
+                                    resuming: \(error)
+                                    """
                                 persistenceFailures.append(detail)
                                 Self.owe(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId, detail: detail)
                             }
@@ -286,49 +255,41 @@ public struct AbandonedTurnReconciler: Sendable {
             Self.owe(dataRoot: dataRoot, sessionId: "", turnId: "", detail: detail)
             return Outcome(acceptedScanned: accepted.count, reconciled: [], tooRecentToJudge: 0, failure: detail)
         }
-        // A turn with no checkpoint is judged from the ledger alone, so only a
-        // ledger read whole may owe its recovery.
         let candidates = accepted
-            .filter { (checkpoints[$0.key] != nil || (ledgerComplete && !terminated.contains($0.key)))
-                && !inFlightTurnIds.contains($0.key)
+            .filter { !inFlightTurnIds.contains($0.key)
                 && !unreadable.contains($0.key) && !unreadable.contains($0.value.sessionId ?? "") }
             .sorted {
                 if (checkpoints[$0.key] != nil) != (checkpoints[$1.key] != nil) { return checkpoints[$0.key] != nil }
                 return $0.value.ts < $1.value.ts
             }
+        // An active turn's accepted row must remain before the cursor, ready for the next process to judge.
+        if accepted.keys.contains(where: { inFlightTurnIds.contains($0) }) { deferred = true }
         for (turnId, row) in candidates {
-            // A turn this process accepted is never abandoned by this process;
-            // one a previous process accepted cannot still be running.
+            guard !Task.isCancelled else { deferred = true; break }
             guard row.ts < processEpoch || checkpoints[turnId]?.stoppedReason != nil else {
                 tooRecent += 1
                 continue
             }
+            let read: TraceRead
+            do { read = try await readTurn(turnId) }
+            catch {
+                let detail = "Cannot check turn \(turnId)'s terminal: \(error)"
+                persistenceFailures.append(detail)
+                Self.owe(dataRoot: dataRoot, sessionId: row.sessionId ?? "unknown", turnId: turnId, detail: detail)
+                continue
+            }
+            let hasTerminal = read.events.contains(where: Self.isSettled)
             if let checkpoint = checkpoints[turnId] {
                 do {
-                    let days = Set([row.ts, checkpoint.updatedAt, today].flatMap { day in
-                        [day] + [-1, 1].compactMap { TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: $0, to: day) }
-                    }.map { lane.path(for: $0) })
-                    for path in days { try await readDay(path, includeAccepted: false) }
-                    let hasTerminal = days.contains { terminalIndex[$0]!.terminated.contains(turnId) }
                     if let reason = checkpoint.stoppedReason {
                         let terminal = TurnTraceEvent(turnId: turnId, ts: checkpoint.updatedAt, kind: "turn.cancelled",
                             sessionId: checkpoint.sessionId, surface: checkpoint.surface,
-                            payload: .object(["status": .string("stopped"), "terminalReason": .string(reason)]))
+                            payload: .object(["status": .string("stopped"), "terminalReason": .string(reason)]), turn: nil)
                         let result: Result<Void, any Error> = await settle { [lane, dataRoot] in
                             do {
-                                if !hasTerminal {
-                                    let target = lane.path(for: terminal.ts)
-                                    _ = try await lane.appendGuarded(terminal, alsoLocking: Array(days)) { current in
-                                        guard current.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
-                                        var events = current.events
-                                        for path in days where path != target && FileManager.default.fileExists(atPath: path.path) {
-                                            let read = TurnTraceReplayReader.parse(try Data(contentsOf: path))
-                                            guard read.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
-                                            events += read.events
-                                        }
-                                        return !events.contains { $0.turnId == turnId && Self.isSettled($0) }
-                                    }
-                                }
+                                _ = try await lane.appendGuarded(terminal, unless: { events in
+                                    events.contains(where: Self.isSettled)
+                                })
                                 try checkpoint.remove(dataRoot: dataRoot)
                                 return .success(())
                             } catch { return .failure(error) }
@@ -338,65 +299,60 @@ public struct AbandonedTurnReconciler: Sendable {
                         continue
                     }
                     if hasTerminal, checkpoint.deliveryPending, !checkpoint.hasRedeliveryOwner {
-                        // A finished turn whose route cannot redeliver: the retirement row
-                        // lands durably (deduped) before the file goes, so a kill between the
-                        // two retires it again next launch and never loses the row.
+                        // The retirement detail lands before the checkpoint goes; a kill between them cannot lose the detail.
                         let retired = TurnTraceEvent(turnId: turnId, kind: "turn.checkpoint_retired",
                             sessionId: checkpoint.sessionId, surface: checkpoint.surface,
-                            payload: .object(["reason": .string("no_redelivery_owner")]))
-                        let wrote = try await lane.appendGuarded(retired) { current in
-                            !current.events.contains { $0.kind == "turn.checkpoint_retired" && $0.turnId == turnId }
-                        }
+                            payload: .object(["reason": .string("no_redelivery_owner")]), turn: nil)
+                        let wrote = try await lane.appendGuarded(retired, unless: { events in
+                            events.contains { $0.kind == "turn.checkpoint_retired" && $0.turnId == turnId }
+                        })
                         if wrote { await TurnTraceBus.shared.deliverToSubscribers(retired) }
                         try checkpoint.remove(dataRoot: dataRoot)
                         continue
                     }
-                    let replyReady = checkpoint.deliveryPending
-                        && days.contains { terminalIndex[$0]!.replyReady.contains(turnId) }
+                    let replyReady = checkpoint.deliveryPending && read.events.contains { event in
+                        guard Self.isSettled(event), case .object(let payload) = event.payload else { return false }
+                        return payload["status"] == .string("completed") || payload["status"] == .string("waiting")
+                    }
                     if !hasTerminal || replyReady { resumable.append(checkpoint) }
                     else { try checkpoint.remove(dataRoot: dataRoot) }
                 } catch {
-                    let detail = "Cannot check checkpoint terminal: \(error)"
+                    let detail = "Cannot reconcile checkpoint \(turnId): \(error)"
                     persistenceFailures.append(detail)
                     Self.owe(dataRoot: dataRoot, sessionId: checkpoint.sessionId, turnId: turnId, detail: detail)
                 }
                 continue
             }
+            guard !hasTerminal else { continue }
             let id = "turn-recovery:" + turnId
-            // A turn whose recovery is already owed is settled for this sweep;
-            // only a new record spends the pass's write quota.
-            if (try? await ExperienceStore.at(dataRoot).experience(id)) != nil {
-                written.append(turnId)
+            do {
+                if try await ExperienceStore.at(dataRoot).experience(id) != nil {
+                    written.append(turnId)
+                    continue
+                }
+            } catch {
+                persistenceFailures.append("Turn \(turnId)'s recovery obligation is unreadable: \(error)")
                 continue
             }
-            guard writeAttempts < Self.maximumWritesPerPass else {
-                deferred = true
-                break
-            }
+            guard writeAttempts < Self.maximumWritesPerPass else { deferred = true; break }
             writeAttempts += 1
             await Self.owe(dataRoot: dataRoot, sessionId: row.sessionId ?? "unknown", turnId: turnId,
-                detail: "The accepted turn has no saved checkpoint or confirmed terminal. Restore its checkpoint from retained evidence before resuming; do not repeat uncertain effects.", id: id).value
+                detail: """
+                    The accepted turn has no saved checkpoint or confirmed terminal. Restore its checkpoint from retained evidence before resuming; do not \
+                    repeat uncertain effects.
+                    """, id: id).value
             do {
                 guard try await ExperienceStore.at(dataRoot).experience(id) != nil else { throw CocoaError(.fileWriteUnknown) }
                 written.append(turnId)
             } catch { persistenceFailures.append("Turn recovery could not keep its repair obligation: \(error)") }
         }
-        // The cursor advances only over scanned days whose candidates are confirmed.
-        // A failed read/append or deferred candidate leaves the window pending.
-        // Stable repair identities make another sweep of unfinished turns idempotent.
-        if persistenceFailures.isEmpty, !deferred, let scan, let newestScannedDay = TurnTracePersistLane.dayCalendar.date(
-            byAdding: .day, value: -scan.newestOffset, to: today
-        ) {
-            do { try writeCursor(day: newestScannedDay) }
-            catch { persistenceFailures.append("Turn recovery cursor could not be published at \(cursorPath.path): \(error.localizedDescription)") }
+        // A failed read/write, deferred work or a current-process turn leaves its accepted sequence pending.
+        if persistenceFailures.isEmpty, !deferred, tooRecent == 0, let scannedSeq {
+            do { try await writeCursor(seq: scannedSeq, at: today) }
+            catch { persistenceFailures.append("Turn recovery cursor could not be recorded: \(error.localizedDescription)") }
         }
-        return Outcome(
-            acceptedScanned: accepted.count,
-            reconciled: written,
-            tooRecentToJudge: tooRecent,
-            resumable: resumable,
-            failure: persistenceFailures.isEmpty ? nil : persistenceFailures.joined(separator: "\n")
-        )
+        return Outcome(acceptedScanned: accepted.count, reconciled: written, tooRecentToJudge: tooRecent, resumable: resumable,
+                       failure: persistenceFailures.isEmpty ? nil : persistenceFailures.joined(separator: "\n"))
     }
 
     static func operation(sessionId: String, turnId: String) -> String {
@@ -415,78 +371,24 @@ public struct AbandonedTurnReconciler: Sendable {
     @discardableResult
     static func owe(dataRoot: URL, sessionId: String, turnId: String, detail: String, id: String = UUID().uuidString) -> Task<Void, Never> {
         RepairOwed.owe(dataRoot, id: id, kind: .run,
-            evidence: [.init(source: "turn_traces", id: turnId)], operation: operation(sessionId: sessionId, turnId: turnId),
+            evidence: [.init(source: "experiences/experiences.sqlite", id: turnId)], operation: operation(sessionId: sessionId, turnId: turnId),
             owner: owner(sessionId: sessionId, turnId: turnId), words: detail,
             nextCall: repairCall(sessionId: sessionId, turnId: turnId))
     }
 
-    /// Day-offsets from `today` this sweep reads (0 = today), oldest offset
-    /// last. Ordinarily `dayWindow` days ending today; after a gap it reaches
-    /// back to the last swept day so a turn abandoned outside the ordinary
-    /// window is not missed. When the gap is longer than `maximumDayWindow`
-    /// the window sits at the OLD end of the backlog — the sweep drains the
-    /// oldest unswept days first and the cursor advances by that much, so the
-    /// next sweep continues where this one stopped rather than skipping to
-    /// today.
-    private func scanRange(today: Date) throws -> (newestOffset: Int, oldestOffset: Int) {
-        // Without a cursor, drain from before the oldest trace day, oldest-first.
-        guard let cursorDay = try persistedCursorDay() ?? oldestTraceDay().flatMap({
-            TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -1, to: $0)
-        }) else {
-            // Nothing has ever been traced. Ordinary window ending today.
-            return (0, Self.dayWindow - 1)
+    /// The cursor is a detail in the record it describes; no second state store or day file is read.
+    private func persistedCursor() async throws -> Int64? {
+        let read = try await lane.events(.init(subjects: [""], kinds: [Self.cursorKind], limit: 1, newestFirst: true))
+        guard read.isClean else { throw CocoaError(.fileReadCorruptFile) }
+        guard let event = read.events.first else { return nil }
+        guard case .object(let fields) = event.payload, case .int(let seq)? = fields["lastSeq"] else {
+            throw PersistenceCoreError.ioFailure("Turn recovery cursor has no readable lastSeq; unreviewed work remains pending.")
         }
-        let calendar = TurnTracePersistLane.dayCalendar
-        let lastOffset = max(0, calendar.dateComponents(
-            [.day],
-            from: calendar.startOfDay(for: cursorDay),
-            to: calendar.startOfDay(for: today)
-        ).day ?? 0)
-        // Days back that still need a look, counting the cursor day itself.
-        let unswept = max(Self.dayWindow, lastOffset + 1)
-        let window = min(Self.maximumDayWindow, unswept)
-        let oldestOffset = unswept - 1
-        return (oldestOffset - (window - 1), oldestOffset)
+        return seq
     }
 
-    /// The day recorded by the last sweep, if the cursor file is readable.
-    private func persistedCursorDay() throws -> Date? {
-        let data: Data
-        do { data = try Data(contentsOf: cursorPath) }
-        catch CocoaError.fileReadNoSuchFile { return nil }
-        guard case .object(let obj) = try JSONValue.parse(data),
-              case .string(let day)? = obj["lastSweptDay"],
-              let last = TurnTracePersistLane.day(from: day) else {
-            throw PersistenceCoreError.ioFailure("Unreadable turn recovery cursor at \(cursorPath.path). Repair its lastSweptDay without advancing past unreviewed work.")
-        }
-        return last
-    }
-
-    /// Oldest `yyyy-MM-dd.jsonl` day file on disk, or nil when none exist.
-    /// Read from the lane's own directory so writer root overrides apply.
-    private func oldestTraceDay() throws -> Date? {
-        let dir = lane.path(for: now()).deletingLastPathComponent()
-        let entries: [URL]
-        do { entries = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) }
-        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
-        return entries
-            .filter { $0.pathExtension == "jsonl" }
-            .compactMap {
-                TurnTracePersistLane.day(
-                    from: $0.deletingPathExtension().lastPathComponent
-                )
-            }
-            .min()
-    }
-
-    private var cursorPath: URL {
-        dataRoot
-            .appendingPathComponent("turn_traces", isDirectory: true)
-            .appendingPathComponent("abandoned-reconciler-cursor.json")
-    }
-
-    private func writeCursor(day date: Date) throws {
-        let day = TurnTracePersistLane.dayString(from: date)
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data("{\"lastSweptDay\":\"\(day)\"}".utf8), to: cursorPath)
+    private func writeCursor(seq: Int64, at: Date) async throws {
+        try await lane.appendChecked(TurnTraceEvent(turnId: "unknown", ts: at, kind: Self.cursorKind,
+            payload: .object(["lastSeq": .int(seq)]), turn: nil))
     }
 }

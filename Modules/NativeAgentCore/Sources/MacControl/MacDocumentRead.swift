@@ -1,7 +1,5 @@
-// Saved documents extract directly; live documents accumulate overlapping AX
-// frames through the shared walker with document bounds. Full AXTextArea values
-// need no scrolling. Every cut is reported, secrets are redacted in context,
-// and the existing tool-result spill retains the text without a second pager.
+// Saved files and live AX accumulation share redaction and spill retention; full AXTextArea values need no scroll. Report every cut so partial text cannot
+// masquerade as a whole document.
 
 import Foundation
 import NativeAgentCore
@@ -27,83 +25,49 @@ import AppKit
 import Carbon
 #endif
 
-// Blueprint: | `MacDocumentRead.swift` | `MacDocumentRead`: bounded document extraction and scrolling accumulation; observed scrollbar restoration, admitted file access, deadlines and redacted read frames |
+// Blueprint: | `MacDocumentRead.swift` | `MacDocumentRead`: Bounded extraction, accumulation and observed scroll restoration |
 
 public enum MacDocumentRead {
     // MARK: - Bounds, and why each one
 
-    /// Viewport-fulls one call will read before it stops and SAYS it stopped.
-    /// Forty screens of a document is a book chapter; past that the honest
-    /// answer is "there is more, ask again" rather than an unbounded loop
-    /// driving the user's scroll wheel.
+    /// Forty viewports bound a book-chapter-sized read; report remaining content instead of driving the scroll wheel indefinitely.
     public static let maxFrames = 40
-    /// The hard safety ceiling on accumulated characters. Not a display cap —
-    /// the spill pager carries everything under it losslessly — but an
-    /// unbounded accumulator is a memory shape, not a feature.
+    /// Cap accumulated characters to bound memory while the spill pager retains everything under the cap losslessly.
     public static let maxAccumulatedChars = 400_000
-    /// Nodes one FRAME's walk may visit. Far above `MacAXLimits.hardMaxNodes`
-    /// (400) because a page of dense text is hundreds of `AXStaticText` runs,
-    /// and deliberately in this file rather than by raising that constant.
+    /// Dense pages contain hundreds of static-text runs, so document frames need a larger node budget without widening ordinary perception caps.
     public static let maxNodesPerFrame = 3_000
-    /// Depth one frame's walk descends. Web content nests deeply.
+    /// Web document content nests deeply, requiring a document-specific depth budget.
     public static let maxDepthPerFrame = 30
-    /// Characters kept from ONE text node. A node longer than this is a whole
-    /// document in one `AXTextArea` — which is the good case, and the reason
-    /// this is 200x `MacAXLimits.hardValueChars` rather than equal to it.
+    /// A single AXTextArea can hold a whole document, so its value cap is 200 times the ordinary look cap.
     public static let maxCharsPerNode = 40_000
-    /// How far back the overlap merge looks for the seam between two frames.
     public static let maxOverlapLines = 400
-    /// Bytes of a file this organ will read. A 32 MB PDF is a large book.
+    /// A 32 MB file budget accommodates book-sized PDFs while bounding extraction memory.
     public static let maxFileBytes = 32 * 1024 * 1024
-    /// PDF pages one call extracts.
     public static let maxPDFPages = 400
-    /// The overlap band deliberately left between two scroll steps, as a
-    /// fraction of the viewport height. Scrolling a FULL viewport leaves the
-    /// two frames sharing no line, and a merge with no seam cannot tell
-    /// "continued" from "jumped past something".
+    /// Leave an overlap band so adjacent frames share a merge seam; full-viewport scrolls cannot distinguish continuation from skipped text.
     public static let scrollOverlapFraction = 0.15
-    /// Floor and ceiling on that band, in points.
     public static let minScrollOverlapPoints = 40.0
     public static let maxScrollOverlapPoints = 200.0
 
     // MARK: - The clock
-    //
-    // `read` is a LIVE read: it runs outside the operation store's deadline
-    // path ON PURPOSE, because a replayable operation record would let a later
-    // call answer with a document that has since changed. What that bought was
-    // an organ with NO bound on it at all — and it is the heaviest AX caller in
-    // the module, hundreds of synchronous round trips per frame across up to
-    // `maxFrames` frames. One app that stops answering and the whole turn hangs
-    // behind AX's own six-second-per-call default, times every call.
-    //
-    // Two bounds, because they catch different failures:
-    //   • `axMessagingTimeoutSeconds` — ONE round trip to the app being read.
-    //     Set on that app's element only, never process-wide (the system-wide
-    //     timeout belongs to exactly one organ, and it is not this one).
-    //   • `deadlineSeconds` — the wall clock across the whole accumulation, for
-    //     an app that answers every call, just slowly.
-    // Whichever bites, the answer says so: a partial document is reported as
-    // truncated by the clock, and a read that got nothing refuses in words.
+    // Live reads bypass replayable operation records because documents can change between calls. Bound both per-app AX round trips and total wall time: one
+    // catches unanswered calls, the other slow cumulative progress. Report partial text as clock-truncated and refuse empty deadline-exhausted reads.
 
-    /// The bound on one AX round trip to the app being read.
+    /// Bound individual AX calls so an unresponsive app cannot multiply the system timeout across every node.
     public static let axMessagingTimeoutSeconds: Float = 2.0
-    /// The bound on the whole screen route.
+    /// Bound total accumulation so individually responsive AX calls cannot prolong the turn indefinitely.
     public static let deadlineSeconds: Double = 20.0
-    /// The refusal code and truncation slug the clock uses.
+    /// Share the clock failure slug between refusals and partial-read truncation.
     public static let timedOutReason = "read_timed_out"
     public static let deadlineTruncationReason = "deadline"
 
-    /// Roles whose value/title is DOCUMENT TEXT. Controls are deliberately
-    /// absent: `read` answers "what does it say", and a toolbar button's label
-    /// is not part of the contract. `AXSecureTextField` is absent for a
-    /// stronger reason — see `secureFieldRoles` below.
+    /// Collect document text roles only; control labels are not document prose, and secure fields never enter this channel.
     public static let textRoles: Set<String> = [
         "AXStaticText", "AXHeading", "AXTextArea", "AXTextField",
         "AXLink", "AXParagraph", "AXCell", "AXListMarker",
     ]
 
-    /// Roles that hold a SECRET. Reused from the closed loop rather than
-    /// re-listed, so one edit covers both.
+    /// Roles that hold a SECRET. Reused from the closed loop rather than re-listed, so one edit covers both.
     public static var secureFieldRoles: Set<String> { MacActClosedLoop.secureFieldRoles }
 
     // MARK: - What the target IS
@@ -111,13 +75,11 @@ public enum MacDocumentRead {
     public enum DocumentKind: Sendable, Equatable {
         case pdf
         case text
-        /// The path exists but this organ cannot put it into words. The string
-        /// is the extension, so the refusal can name it.
+        /// Retain unsupported extensions so the refusal can name the format it cannot extract.
         case unsupported(String)
     }
 
-    /// Extensions read as plain text. Deliberately a list, not "anything that
-    /// decodes": a `.png` decodes to garbage that LOOKS like a short document.
+    /// Use an explicit text extension list; arbitrary binary data can decode into plausible garbage.
     public static let textExtensions: Set<String> = [
         "txt", "text", "md", "markdown", "csv", "tsv", "log",
         "json", "yaml", "yml", "toml", "xml", "html", "htm", "swift", "py",
@@ -134,17 +96,13 @@ public enum MacDocumentRead {
 
     // MARK: - One frame of the screen, in text
 
-    /// What ONE bounded walk of a container found.
     public struct Frame: Sendable, Equatable {
         public let lines: [String]
-        /// True when a bound cut the walk, so "the document ends here" is
-        /// never claimed by a walk that simply stopped.
+        /// True when a bound cut the walk, so "the document ends here" is never claimed by a walk that simply stopped.
         public let truncated: Bool
-        /// Every kept line came from an AXTextArea value, and no bound cut
-        /// the frame. Those values contain the whole text, beyond the viewport.
+        /// Every kept line came from an AXTextArea value, and no bound cut the frame. Those values contain the whole text, beyond the viewport.
         public let wholeText: Bool
-        /// Secure fields SEEN (never read). Used only to phrase the refusal
-        /// when a container turns out to be nothing but a password box.
+        /// Secure fields SEEN (never read). Used only to phrase the refusal when a container turns out to be nothing but a password box.
         public let secureNodes: Int
         public let didRedact: Bool
 
@@ -157,24 +115,22 @@ public enum MacDocumentRead {
         }
     }
 
-    /// Document-order text with document bounds and secure-subtree pruning.
+    /// Prune secure subtrees before collecting text so credentials never enter a read frame.
     public static func frameLines(
         source: any MacAXElementSource,
         root: MacAXElementRef,
         characterLimit: Int = maxAccumulatedChars,
-        shouldStop: () -> Bool = { Task.isCancelled }
-    ) -> Frame {
+        context: MacOperationContext, shouldStop: () -> Bool = { Task.isCancelled }) -> Frame {
         var lines: [String] = []
         var wholeText = true
         var secure = Set<Int>()
-        let snapshot = MacAccessibilityReader.walk(source: source, root: root, limits: .document,
-            read: { ref in
-                guard let a = source.attributes(of: ref) else { return nil }
+        let snapshot = MacAccessibilityReader.walk(source: source, root: root, limits: .document, read: { ref, context in
+                guard let a = source.attributes(of: ref, context: context) else { return nil }
                 if secureFieldRoles.contains(a.role) || a.subrole.map(secureFieldRoles.contains) == true {
                     secure.insert(ref.id)
                 }
                 return a
-            }, deadline: .distantFuture, descendInto: { !secure.contains($0.id) }, shouldStop: shouldStop)
+            }, deadline: .distantFuture, descendInto: { !secure.contains($0.id) }, context: context, shouldStop: shouldStop)
         let collected = snapshot.nodes.filter { node in
             node.element.map { secure.contains($0.id) } != true
         }.map { node in
@@ -182,9 +138,8 @@ public enum MacDocumentRead {
                 path: node.path.isEmpty && node.attributes.role == "AXWindow" ? [] : [0] + node.path)
         }
         var truncated = snapshot.truncated
-        // Keep captions and ancestry until the shared screen redactor has
-        // judged every line; values alone cannot identify a CVV.
-        let context = MacScreenViewTextRedaction.nodeSecretContext(collected)
+        // Keep captions and ancestry until the shared screen redactor has judged every line; values alone cannot identify a CVV.
+        let secretContext = MacScreenViewTextRedaction.nodeSecretContext(collected)
         let limit = max(0, min(characterLimit, maxAccumulatedChars))
         var characters = 0
         var didRedact = false
@@ -194,7 +149,7 @@ public enum MacDocumentRead {
             guard let raw = value ?? nonEmpty(a.title) else { continue }
             if raw.count > maxCharsPerNode { truncated = true }
             let enclosing = MacScreenViewTextRedaction.enclosingKinds(
-                forNodeAt: a.frame, path: node.path, among: context.enclosingCaptions
+                forNodeAt: a.frame, path: node.path, among: secretContext.enclosingCaptions
             )
             for line in split(raw) {
                 let redacted: JSONValue
@@ -203,7 +158,7 @@ public enum MacDocumentRead {
                 } else {
                     redacted = MacScreenViewTextRedaction.redactedNodeString(
                         line, valueChars: maxCharsPerNode, frame: a.frame,
-                        under: a.value == nil ? nil : a.title, enclosing: enclosing, context: context
+                        under: a.value == nil ? nil : a.title, enclosing: enclosing, context: secretContext
                     )
                 }
                 let text: String
@@ -226,7 +181,7 @@ public enum MacDocumentRead {
                 if kept.count < text.count { truncated = true; break collection }
             }
         }
-        SenseAppReadCapture.current?.appendFrame(nodes: MacScreenViewTextRedaction.redactedNodesJSON(collected,
+        context.appCapture?.appendFrame(nodes: MacScreenViewTextRedaction.redactedNodesJSON(collected,
             valueChars: max(1, collected.reduce(0) { max($0, max($1.attributes.title?.count ?? 0, $1.attributes.value?.count ?? 0)) })),
             truncated: truncated)
         return Frame(lines: lines, truncated: truncated, secureNodes: secure.count,
@@ -239,8 +194,7 @@ public enum MacDocumentRead {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// One AX value can be a whole paragraph or a whole document. Split it into
-    /// LINES, because the line is the unit the cross-frame merge identifies on.
+    /// Split AX values into lines because cross-frame identity and merging operate on lines, even when one value holds an entire document.
     static func split(_ raw: String) -> [String] {
         String(raw.prefix(maxCharsPerNode))
             .components(separatedBy: .newlines)
@@ -250,18 +204,8 @@ public enum MacDocumentRead {
 
     // MARK: - Cross-frame identity: the merge
 
-    /// The accumulator. Cross-frame identity, applied to TEXT.
-    ///
-    /// The live scene tracker (`SwiftToolDispatcherFourVerbLiveScene`) does this
-    /// for visual regions by matching geometry, colour and salience across
-    /// frames. A line of text needs none of that: two frames of the same
-    /// document share a literal run of identical lines at the seam, and the
-    /// longest such run IS the identity. So the same idea, in the form the
-    /// substrate actually offers.
-    ///
-    /// Longest-overlap merge, not a seen-set: a set would silently delete the
-    /// second occurrence of "Signed:" thirty pages later, and a document full
-    /// of repeated headings would come back gutted.
+    /// Merge the longest identical line run at the frame seam. A global seen-set would delete legitimate repeated headings or signatures elsewhere in the
+    /// document.
     public struct Accumulator: Sendable {
         public private(set) var lines: [String] = []
         public private(set) var sawGap = false
@@ -285,7 +229,7 @@ public enum MacDocumentRead {
             }
         }
 
-        /// Returns true when this frame has nothing new, independently of the character cap.
+        /// Text novelty is independent of the character cap and cannot prove scroll position.
         public mutating func absorb(_ frame: [String]) -> Bool {
             guard !frame.isEmpty else {
                 previousFrame = frame
@@ -296,20 +240,17 @@ public enum MacDocumentRead {
                 previousFrame = frame
                 return false
             }
-            // 1. Identical text adds nothing; it says nothing about scroll position.
+            // Identical text adds nothing but cannot prove scroll position.
             if frame == previousFrame {
                 previousFrame = frame
                 return true
             }
-            // 2. The seam. Longest run of lines shared by the accumulated tail
-            //    and this frame's head.
+            // Use the longest shared tail/head run so repeated lines cannot create an arbitrary seam.
             if let result = mergeOnOverlap(frame) {
                 previousFrame = frame
                 return result
             }
-            // 3. No seam. Before calling that a gap, strip the STICKY CHROME —
-            //    a header/footer that is redrawn identically in every frame
-            //    sits at the boundary and hides the real seam behind itself.
+            // Strip sticky headers/footers before declaring a gap because identical chrome can hide the scrolling text's real seam.
             let stripped = Self.strippingSticky(frame, sharedWith: previousFrame)
             if stripped.isEmpty {
                 previousFrame = frame
@@ -319,7 +260,7 @@ public enum MacDocumentRead {
                 previousFrame = frame
                 return result
             }
-            // 4. Genuinely no shared line. Keep the content and SAY so.
+            // Keep unmatched content and report the missing seam rather than silently discard text.
             append(stripped)
             previousFrame = frame
             sawGap = true
@@ -340,8 +281,7 @@ public enum MacDocumentRead {
             return nil
         }
 
-        /// Drop the leading and trailing runs this frame shares with the last
-        /// one. Those are the parts of the window that do NOT scroll.
+        /// Leading/trailing runs shared with the prior frame are sticky chrome, not document progress.
         static func strippingSticky(_ frame: [String], sharedWith previous: [String]) -> [String] {
             guard !previous.isEmpty else { return frame }
             var head = 0
@@ -361,8 +301,7 @@ public enum MacDocumentRead {
 
     // MARK: - The scroll step
 
-    /// How far one step scrolls a container of this height, in points, with the
-    /// deliberate overlap band held back so the merge always has a seam.
+    /// Retain the overlap band in every scroll step so accumulation has a merge seam.
     public static func scrollStepPoints(viewportHeight: Double) -> Int32 {
         let height = max(1, viewportHeight)
         let overlap = min(maxScrollOverlapPoints, max(minScrollOverlapPoints, height * scrollOverlapFraction))
@@ -374,11 +313,10 @@ public enum MacDocumentRead {
 
     public struct Extracted: Sendable, Equatable {
         public let text: String
-        /// PDF page count, when the format has pages.
         public let pages: Int?
-        /// True when a cap or a page without text left the extraction incomplete.
+        /// Keep incomplete extraction explicit when caps or textless pages omit content.
         public let truncated: Bool
-        /// One-based PDF page numbers inspected but omitted for lack of text.
+        /// Retain one-based omitted page numbers so textless gaps are identifiable.
         public let pagesWithoutText: [Int]
 
         public init(text: String, pages: Int?, truncated: Bool, pagesWithoutText: [Int] = []) {
@@ -389,8 +327,7 @@ public enum MacDocumentRead {
         }
     }
 
-    /// Every way an extraction can honestly fail. Each maps to WORDS at the
-    /// handler, never to a bare code.
+    /// Map extraction failures to actionable words rather than bare codes.
     public enum ExtractionFailure: String, Sendable, Equatable, Error {
         case fileTooLarge = "file_too_large"
         case unreadableDocument = "unreadable_document"
@@ -399,10 +336,7 @@ public enum MacDocumentRead {
         case encryptedDocument = "encrypted_document"
         case noTextInDocument = "no_text_in_document"
         case unsupportedType = "unsupported_document_type"
-        /// The path is behind the module's sensitive-path fence. Reading a
-        /// document is not a reason for that fence to stop applying: a keychain
-        /// or a credentials file is exactly as sensitive when it is asked for as
-        /// a "document".
+        /// Document extraction obeys the sensitive-path fence because keychains and credential files remain sensitive when requested as documents.
         case sensitivePath = "sensitive_path_denied"
     }
 
@@ -430,9 +364,8 @@ public enum MacDocumentRead {
         }
     }
 
-    /// Document extraction is strict UTF-8, or UTF-16 with a byte-order mark.
-    /// Reject invalid sequences and decoded NULs; never guess another encoding
-    /// or manufacture replacement characters. Validate the entire byte slice.
+    /// Document extraction is strict UTF-8, or UTF-16 with a byte-order mark. Reject invalid sequences and decoded NULs; never guess another encoding or
+    /// manufacture replacement characters. Validate the entire byte slice.
     static func decodeText(_ data: Data) -> String? {
         let bom = Array(data.prefix(2))
         let decoded: String?
@@ -478,9 +411,7 @@ public enum MacDocumentRead {
         }
         let joined = pieces.joined(separator: "\n\n")
         guard !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            // A scanned contract: pages of pixels with no text layer. This
-            // organ does not OCR — `screen` is the eye for pixels — and saying
-            // so is the answer, not an empty document.
+            // Scanned PDFs may have no text layer; report that format limit rather than claim an empty document or silently switch to OCR.
             return .failure(.noTextInDocument)
         }
         return .success(Extracted(text: joined, pages: total, truncated: truncated, pagesWithoutText: pagesWithoutText))
@@ -492,8 +423,7 @@ public enum MacDocumentRead {
 
     // MARK: - Words
 
-    /// Every refusal this organ can make, IN WORDS. One place, so the words a
-    /// caller reads and the words a test pins are the same string.
+    /// Keep refusal wording at one owner so all callers receive the same recovery direction.
     public static func words(for failure: ExtractionFailure, path: String) -> String {
         let name = (path as NSString).lastPathComponent
         switch failure {
@@ -537,8 +467,7 @@ public enum MacDocumentRead {
     public static let scrollUnavailableWords =
         "I can read what is on screen but I cannot scroll it, so this is only the first screenful."
 
-    /// The clock ran out before a single line came back — the app is not
-    /// answering, which is a different fact from a window with no text in it.
+    /// No text before deadline means unresponsive, which is distinct from a readable window with no text.
     public static func timedOutWords(app: String) -> String {
         "\(app) stopped answering while I was reading it — I waited "
             + "\(Int(deadlineSeconds)) seconds and got nothing back, so I stopped rather than "
@@ -546,8 +475,7 @@ public enum MacDocumentRead {
             + "balling; try again once it is responding."
     }
 
-    /// The clock ran out PART WAY. There is a real answer; it is just not all
-    /// of one, and saying which is the whole point.
+    /// Retain text read before the deadline and report incompleteness rather than discard the partial answer.
     public static func deadlineWords(app: String) -> String {
         "\(app) was answering too slowly to finish the document inside "
             + "\(Int(deadlineSeconds)) seconds, so this is what I had read when I stopped — the "
@@ -570,66 +498,65 @@ final class MacDocumentScrollRestoration: @unchecked Sendable {
     }
     #endif
 
-    static func capture(source: any MacAXElementSource, container: MacAXElementRef) -> MacDocumentScrollRestoration? {
+    static func capture(source: any MacAXElementSource, container: MacAXElementRef, context: MacOperationContext) -> MacDocumentScrollRestoration? {
         #if canImport(ApplicationServices) && os(macOS)
         guard let source = source as? SystemMacAXElementSource else { return nil }
         var candidate = source.element(container)
         for _ in 0..<32 {
             guard let node = candidate else { return nil }
             _ = source.prepareForRead(node)
-            if let bar = MacAXAttributeRead.copyElement(node, kAXVerticalScrollBarAttribute) {
+            if let bar = MacAXAttributeRead.copyElement(node, kAXVerticalScrollBarAttribute, context: context) {
                 let bar = source.prepareForRead(bar)
                 var settable = DarwinBoolean(false)
                 guard AXUIElementIsAttributeSettable(bar, kAXValueAttribute as CFString, &settable) == .success,
                       settable.boolValue,
-                      let value = MacAXAttributeRead.copyRaw(bar, kAXValueAttribute) as? NSNumber,
+                      let value = MacAXAttributeRead.copyRaw(bar, kAXValueAttribute, context: context) as? NSNumber,
                       value.doubleValue.isFinite else { return nil }
                 return MacDocumentScrollRestoration(owner: node, scrollbar: bar, value: value)
             }
-            if MacAXAttributeRead.copyString(node, kAXRoleAttribute) == "AXWindow" { return nil }
-            candidate = MacAXAttributeRead.copyElement(node, kAXParentAttribute)
+            if MacAXAttributeRead.copyString(node, kAXRoleAttribute, context: context) == "AXWindow" { return nil }
+            candidate = MacAXAttributeRead.copyElement(node, kAXParentAttribute, context: context)
         }
         #endif
         return nil
     }
 
-    func restore() -> Bool {
+    func restore(context: MacOperationContext) -> Bool {
         #if canImport(ApplicationServices) && os(macOS)
-        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute),
+        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute, context: context),
               CFEqual(current, scrollbar) else { return false }
         // Avoid even a no-op write when the downward end probe never moved.
-        if isRestored { return true }
-        guard MacDriverContext.binding?.allowsAction == true else { return false }
-        guard (try? SystemMacAXElementSource.ensureRenderer(scrollbar, refresh: true)) != nil else { return false }
-        guard MacDriverContext.binding?.allowsAction == true else { return false }
+        if isRestored(context: context) { return true }
+        guard context.driver?.allowsAction(context: context) == true else { return false }
+        guard (try? SystemMacAXElementSource.ensureRenderer(scrollbar, refresh: true, context: context)) != nil else { return false }
+        guard context.driver?.allowsAction(context: context) == true else { return false }
         return AXUIElementSetAttributeValue(scrollbar, kAXValueAttribute as CFString, value) == .success
         #else
         return false
         #endif
     }
 
-    var isRestored: Bool {
+    func isRestored(context: MacOperationContext) -> Bool {
         #if canImport(ApplicationServices) && os(macOS)
-        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute),
+        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute, context: context),
               CFEqual(current, scrollbar),
-              let observed = MacAXAttributeRead.copyRaw(scrollbar, kAXValueAttribute) as? NSNumber else { return false }
+              let observed = MacAXAttributeRead.copyRaw(scrollbar, kAXValueAttribute, context: context) as? NSNumber else { return false }
         return observed == value
         #else
         return false
         #endif
     }
 
-    /// Read the same scrollbar that owns restoration. Missing/invalid boundary
-    /// evidence stays unknown; an unchanged position alone never proves the end.
-    var observedPosition: (value: Double, atEnd: Bool?)? {
+    /// Read the same scrollbar that owns restoration. Missing/invalid boundary evidence stays unknown; an unchanged position alone never proves the end.
+    func observedPosition(context: MacOperationContext) -> (value: Double, atEnd: Bool?)? {
         #if canImport(ApplicationServices) && os(macOS)
-        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute),
+        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute, context: context),
               CFEqual(current, scrollbar),
-              let observed = MacAXAttributeRead.copyRaw(scrollbar, kAXValueAttribute) as? NSNumber,
+              let observed = MacAXAttributeRead.copyRaw(scrollbar, kAXValueAttribute, context: context) as? NSNumber,
               observed.doubleValue.isFinite else { return nil }
         let position = observed.doubleValue
-        guard let minimum = MacAXAttributeRead.copyRaw(scrollbar, kAXMinValueAttribute) as? NSNumber,
-              let maximum = MacAXAttributeRead.copyRaw(scrollbar, kAXMaxValueAttribute) as? NSNumber,
+        guard let minimum = MacAXAttributeRead.copyRaw(scrollbar, kAXMinValueAttribute, context: context) as? NSNumber,
+              let maximum = MacAXAttributeRead.copyRaw(scrollbar, kAXMaxValueAttribute, context: context) as? NSNumber,
               minimum.doubleValue.isFinite, maximum.doubleValue.isFinite,
               minimum.doubleValue < maximum.doubleValue,
               position >= minimum.doubleValue, position <= maximum.doubleValue else {
@@ -642,9 +569,9 @@ final class MacDocumentScrollRestoration: @unchecked Sendable {
     }
 
     /// The read began below the document's first line; `nil` when the app gives no minimum.
-    var startedBelowBeginning: Bool? {
+    func startedBelowBeginning(context: MacOperationContext) -> Bool? {
         #if canImport(ApplicationServices) && os(macOS)
-        guard let minimum = MacAXAttributeRead.copyRaw(scrollbar, kAXMinValueAttribute) as? NSNumber else { return nil }
+        guard let minimum = MacAXAttributeRead.copyRaw(scrollbar, kAXMinValueAttribute, context: context) as? NSNumber else { return nil }
         return value.doubleValue > minimum.doubleValue
         #else
         return nil

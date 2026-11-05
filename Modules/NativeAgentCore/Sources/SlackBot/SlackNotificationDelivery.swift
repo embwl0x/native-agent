@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `SlackNotificationDelivery.swift` | `SlackWebAPI.notificationOutcome`: checked preflight, explicit API rejections and uncertain dispatch classification into the shared notification verdict |
+// Blueprint: | `SlackNotificationDelivery.swift` | `SlackWebAPI.notificationOutcome`: checked preflight, API refusal and uncertain dispatch |
 
 extension SlackWebAPI {
     public static func notificationOutcome(input: [String: JSONValue], dataRoot: URL) async -> NotificationDeliveryOutcome {
@@ -22,8 +22,7 @@ extension SlackWebAPI {
             if let status = response["httpStatus"]?.exactIntegerValue, status >= 500 || status == 408 {
                 return .unknown(sent: true, reason: "Slack returned an inconclusive server failure")
             }
-            // A real Slack ok:false/error reply refuses the send. A parser's
-            // synthetic non_json_response/http_N error is not an API refusal.
+            // A real Slack ok:false/error reply refuses the send. A parser's synthetic non_json_response/http_N error is not an API refusal.
             if response["ok"] == .bool(false), let reason = response["error"]?.stringValue,
                !reason.isEmpty, reason != "non_json_response", !reason.hasPrefix("http_") {
                 return .notDelivered(reason: reason)

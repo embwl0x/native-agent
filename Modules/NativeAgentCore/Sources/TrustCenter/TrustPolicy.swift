@@ -1,32 +1,27 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `TrustPolicy.swift` | Typed UI subset, not full authority: security/provider/personality/iOS-remote blocks remain in the raw checked policy sent to the phone |
+// Blueprint: | `TrustPolicy.swift` | UI subset cannot replace raw checked authority. |
 
 // MARK: - TrustPolicy
 
-/// Typed UI subset of `trust/policy.json`. Security, provider, personality and
-/// iOS-remote blocks remain in the raw checked dictionary, the full authority
-/// also sent to the phone; encoding this subset cannot replace it.
+/// This UI subset cannot replace raw authority, whose additional blocks also reach the phone.
 public struct TrustPolicy: Sendable, Codable, Hashable {
     public var permissionLevel: String
     public var autonomyDefault: String?
     public var updatedAt: String?
     public var appDataRoot: String?
-    public var workshopPolicy: TrustWorkshopPolicy?
     public var filePolicy: TrustFilePolicy?
     public var chromeControlPolicy: TrustChromeControlPolicy?
     public var multimodalPolicy: TrustMultimodalPolicy?
     public var developerMode: Bool = false
     public var enableAutonomy: Bool = false
-    // Persisted trainingPolicy retains the dream and REM gates.
     public var trainingPolicy: TrustTrainingPolicy?
     public var memoryPolicy: TrustMemoryPolicy?
     public var macControlPolicy: MacControlPolicyWireSnapshot?
 
     enum CodingKeys: String, CodingKey {
         case permissionLevel, autonomyDefault, updatedAt, appDataRoot
-        case workshopPolicy
         case filePolicy, chromeControlPolicy, multimodalPolicy
         case developerMode, enableAutonomy, trainingPolicy, memoryPolicy, macControlPolicy
     }
@@ -36,7 +31,6 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         autonomyDefault: String? = nil,
         updatedAt: String? = nil,
         appDataRoot: String? = nil,
-        workshopPolicy: TrustWorkshopPolicy? = nil,
         filePolicy: TrustFilePolicy? = nil,
         chromeControlPolicy: TrustChromeControlPolicy? = nil,
         multimodalPolicy: TrustMultimodalPolicy? = nil,
@@ -50,7 +44,6 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         self.autonomyDefault = autonomyDefault
         self.updatedAt = updatedAt
         self.appDataRoot = appDataRoot
-        self.workshopPolicy = workshopPolicy
         self.filePolicy = filePolicy
         self.chromeControlPolicy = chromeControlPolicy
         self.multimodalPolicy = multimodalPolicy
@@ -61,8 +54,6 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         self.macControlPolicy = macControlPolicy
     }
 
-    /// The typed read of one raw policy generation (a checked load or the
-    /// generation a patch just wrote).
     public init(policyObject: [String: JSONValue]) throws {
         let data = try JSONValue.object(policyObject).serializedData(pretty: false)
         self = try JSONDecoder().decode(TrustPolicy.self, from: data)
@@ -74,7 +65,6 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         autonomyDefault = try c.decodeIfPresent(String.self, forKey: .autonomyDefault)
         updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
         appDataRoot = try c.decodeIfPresent(String.self, forKey: .appDataRoot)
-        workshopPolicy = try c.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
         filePolicy = try c.decodeIfPresent(TrustFilePolicy.self, forKey: .filePolicy)
         chromeControlPolicy = try c.decodeIfPresent(TrustChromeControlPolicy.self, forKey: .chromeControlPolicy)
         multimodalPolicy = try c.decodeIfPresent(TrustMultimodalPolicy.self, forKey: .multimodalPolicy)
@@ -149,12 +139,9 @@ public struct TrustMultimodalPolicy: Sendable, Codable, Hashable {
     }
 }
 
-// Dream and REM gates retain their persisted trainingPolicy block.
+// Missing dream and REM fields must use the canonical enabled defaults rather than silently disabling their gates.
 public struct TrustTrainingPolicy: Sendable, Codable, Hashable {
-    // TrustCenter+Defaults ships dream_scheduler TRUE; a policy that never
-    // wrote the key must read as enabled, not silently off.
     public var dream_scheduler: Bool = true
-    // REM is enabled when the saved policy omits this key.
     public var rem_cycle_enabled: Bool = true
 
     public init(
@@ -173,14 +160,15 @@ public struct TrustTrainingPolicy: Sendable, Codable, Hashable {
 }
 
 public struct TrustMemoryPolicy: Sendable, Codable, Hashable {
+    public static let adaptivePromotionDefault = true
     public var cross_session_recall: Bool = true
     public var knowledge_graph_enabled: Bool = true
-    public var adaptive_promotion: Bool = false
+    public var adaptive_promotion: Bool
 
     public init(
         cross_session_recall: Bool = true,
         knowledge_graph_enabled: Bool = true,
-        adaptive_promotion: Bool = false
+        adaptive_promotion: Bool = TrustMemoryPolicy.adaptivePromotionDefault
     ) {
         self.cross_session_recall = cross_session_recall
         self.knowledge_graph_enabled = knowledge_graph_enabled
@@ -191,7 +179,7 @@ public struct TrustMemoryPolicy: Sendable, Codable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         cross_session_recall = try c.decodeIfPresent(Bool.self, forKey: .cross_session_recall) ?? true
         knowledge_graph_enabled = try c.decodeIfPresent(Bool.self, forKey: .knowledge_graph_enabled) ?? true
-        adaptive_promotion = try c.decodeIfPresent(Bool.self, forKey: .adaptive_promotion) ?? false
+        adaptive_promotion = try c.decodeIfPresent(Bool.self, forKey: .adaptive_promotion) ?? Self.adaptivePromotionDefault
     }
 }
 

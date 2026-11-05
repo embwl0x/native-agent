@@ -3,10 +3,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `TelegramProgressFace.swift` | Per-card source epoch and L0 PartFaces cache over sanitized canonical phase and timing; native availability/failure and output redaction; Telegram progress/status voice comes from telegram-progress.js, entered through the originating app door |
+// Blueprint: | `TelegramProgressFace.swift` | Per-card epoch and LatestRead cache over redacted facts; parts author progress words |
 
-/// A card owns one cache. Frozen native facts change its source epoch;
-/// LatestRead owns publication when projections overlap. No view runs code.
+/// A card owns one cache. Frozen native facts change its source epoch; LatestRead owns publication when projections overlap. No view runs code.
 @MainActor
 final class TelegramProgressFace {
     private let faces: PartFaces
@@ -42,7 +41,7 @@ final class TelegramProgressFace {
         return .object([
             "kind": .string("progress"), "phase": .string(phase.rawValue),
             "terminal": .bool(phase.isTerminal), "replyTextSettled": .bool(replyTextSettled),
-            "action": state.currentAction.map(JSONValue.string) ?? .null,
+            "action": (state.writing?.line ?? state.currentAction).map(JSONValue.string) ?? .null,
             "delegate": state.delegateName.map(JSONValue.string) ?? .null,
             "elapsed": .double(max(0, (state.endedAt ?? max(now, state.startedAt)).timeIntervalSince(state.startedAt))),
             "sinceMovement": .double(sinceMovement)

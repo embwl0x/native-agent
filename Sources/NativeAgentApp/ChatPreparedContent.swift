@@ -39,7 +39,7 @@ import UniformTypeIdentifiers
 import Desk
 // Blueprint: | `ChatPreparedContent.swift` | Settled rich text, list/table preparation and bounded Markdown/content caches retaining shared parse outcomes |
 
-// Settled inline Markdown is shared with Copy and streaming paragraphs.
+// Share settled inline Markdown with Copy and streaming so rendered words agree.
 final class ChatMarkdownCache: @unchecked Sendable {
     static let shared = ChatMarkdownCache()
     private let cache = ChatContentCache<ChatRichContentParser.InlineOutcome>()
@@ -58,8 +58,7 @@ final class ChatMarkdownCache: @unchecked Sendable {
         return parsed
     }
 
-    /// What Copy puts on the clipboard: the words as the bubble draws them,
-    /// so a pasted reply carries no `**` (fenced code stays as written).
+    /// Copy rendered words without Markdown markers while preserving fenced code as written.
     static func plainText(_ content: String) -> String {
         ChatRichContentCache.blocks(content).map { block in
             switch block {
@@ -70,7 +69,7 @@ final class ChatMarkdownCache: @unchecked Sendable {
     }
 }
 
-/// Match streaming paragraph gaps with blank-line height paragraphGap − lineSpacing; collapse extra blanks.
+/// Match streaming paragraph gaps while collapsing extra blank lines so settling preserves geometry.
 enum ChatParagraphGap {
     private static let cache = ChatContentCache<AttributedString>()
 
@@ -79,8 +78,7 @@ enum ChatParagraphGap {
         let key = "\(lineSpacing)|" + content
         if let hit = cache.lookup(key) { return hit }
         var out = parsed
-        // Character offsets of each run of 2+ newlines, last first, so an
-        // edit never moves an offset still to be visited.
+        // Edit newline runs last-first so earlier offsets remain valid.
         var runs: [(start: Int, count: Int)] = []
         var offset = 0
         var runStart = -1
@@ -108,11 +106,9 @@ enum ChatParagraphGap {
     }
 }
 
-// Fence splitting (`ChatRichContentParser`) and link sanitizing
-// (`ChatLinkPolicy`) live in NativeAgentShared so the iPhone uses the same rules.
+// Share fence splitting and link sanitizing with the phone so both surfaces use the same rules.
 
-/// Prose-only list projection: fenced code never reaches this parser. Keep
-/// ordinary prose on its bare Text path and preserve inline Markdown in items.
+/// Keep fenced code out of prose list parsing and retain inline Markdown in items.
 enum ChatProseListParser {
     typealias Row = ChatRichContentParser.ProseRow
     private static let cache = ChatContentCache<[Row]>()
@@ -125,8 +121,7 @@ enum ChatProseListParser {
     }
 }
 
-/// A settled prose projection is retained by its leaf, so cache eviction cannot
-/// turn a later render into a synchronous parse.
+/// Retain prepared prose at its leaf so cache eviction cannot force synchronous parsing during later renders.
 struct ChatPreparedContent: View {
     let text: String
     let lineSpacing: CGFloat
@@ -151,7 +146,7 @@ struct ChatPreparedContent: View {
 
     private var source: Source { Source(text: text, spacing: lineSpacing, proseOnly: proseOnly) }
 
-    /// Prepare ordinary replies before mounting to preserve settle geometry; long text prepares off-main.
+    /// Prepare before mounting to preserve settle geometry; long text must prepare off-main.
     init(text: String, lineSpacing: CGFloat, seatsRight: Bool = false, proseOnly: Bool = false) {
         self.text = text
         self.lineSpacing = lineSpacing
@@ -181,9 +176,9 @@ struct ChatPreparedContent: View {
     }
 
     var body: some View {
-        // Keep a mounted task host even while no content has finished preparing.
+        // Keep the task host mounted before preparation finishes so the task has a lifetime.
         VStack(alignment: seatsRight ? .trailing : .leading, spacing: 0) {
-            // While a changed text prepares, the last prepared words stay up.
+            // Keep the previous words visible while changed text prepares.
             if preparedSource == source || !blocks.isEmpty {
                 if blocks.count == 1, case .prose(let segments) = blocks[0] {
                     proseSegments(segments)
@@ -298,7 +293,7 @@ struct ChatPreparedContent: View {
     }
 }
 
-// Cache fenced-content splitting once per distinct string within the shared bounds.
+// Cache splitting by distinct string within shared bounds so settled renders reuse parsing.
 final class ChatRichContentCache: @unchecked Sendable {
     static let shared = ChatRichContentCache()
     private let cache = ChatContentCache<[ChatContentBlock]>()
@@ -312,9 +307,7 @@ final class ChatRichContentCache: @unchecked Sendable {
             return hit
         }
 
-        // Only fenced content is worth an entry: the fast path already returns
-        // a single prose block without allocating, so caching it would evict
-        // real work to store a wrapper.
+        // Cache only fenced content; storing a fast-path prose wrapper would evict useful work.
         guard content.contains("```") else { return [.prose(ChatRichContentParser.visibleText(content))] }
 
         RenderAudit.bump("richcontent.split")

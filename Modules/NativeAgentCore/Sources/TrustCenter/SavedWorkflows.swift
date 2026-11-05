@@ -2,17 +2,12 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SavedWorkflows.swift` | `SavedWorkflows`: one checked registry schema and stable timestamp sorting for read-only list/projection; list and Capabilities project current saved templates without seed normalization; `WorkflowStep`, `WorkflowRecord`; no default seeding or read-side writes; backup/export inclusion, no raw phone sync and workflows privacy coverage are declared here |
+// Blueprint: | `SavedWorkflows.swift` | `SavedWorkflows`, `WorkflowStep`, `WorkflowRecord`; Checked read-only templates. |
 
-// Owns workflows/registry.json: a JSON object array of saved planning templates.
-// Reads share the registry lock and never seed defaults.
-// Local backup/export include workflows; phone sync has no raw registry, and
-// PrivacyMap lists workflows. ApprovalInbox owns the separate approvals subtree.
-// The retired run engine's runs.jsonl and run_state files remain untouched.
+// Read saved planning templates under the registry lock without seeding defaults; approvals retain their own owner.
 
 extension SavedWorkflows {
-    /// The same list as records, for the Capabilities panel; a malformed row
-    /// fails the read.
+    /// Capabilities uses the same checked rows so malformed workflow data cannot become healthy metadata.
     public func listWorkflowRecords() async throws -> [WorkflowRecord] {
         try await listWorkflows().map(WorkflowRecord.init(row:))
     }
@@ -73,8 +68,7 @@ public final class SavedWorkflows: Sendable {
 
     private var registryPath: URL { root.appendingPathComponent("workflows/registry.json") }
 
-    /// Only an absent directory entry means empty; damaged or unreadable
-    /// saved workflows must survive a list attempt, including a dangling symlink.
+    /// Only an absent directory entry means empty; damaged or unreadable saved workflows must survive a list attempt, including a dangling symlink.
     private static func readWorkflowRegistry(_ path: URL) throws -> [[String: JSONValue]] {
         let data: Data
         do {
@@ -109,7 +103,6 @@ public final class SavedWorkflows: Sendable {
         return try await SwiftNativePersistenceCore.withFileLock(registryPath, body)
     }
 
-    /// Capability aggregation shares the checked saved-template projection.
     package static func readProjection(dataRoot: URL) throws -> [JSONValue] {
         try projectedRegistry(readWorkflowRegistry(dataRoot.appendingPathComponent("workflows/registry.json")))
     }

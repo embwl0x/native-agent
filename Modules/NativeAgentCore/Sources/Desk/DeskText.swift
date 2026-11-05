@@ -5,20 +5,13 @@ import PersistenceCore
 // Blueprint: | `DeskText.swift` | `DeskPage`: compact board and exact-record text, sequencing segments, duration and archive presentation |
 
 // MARK: - DeskPage — pure DeskState -> compact text renderer
-//
-// Pure, deterministic projection; state is authoritative and `now` controls age.
-// Top-level rows show status (kind for watch), project, title, summary and the
-// most-actionable child (now before next). Multiple children or an unhighlighted
-// lone child render below. Latest blocked/flagged notes render as ordinary text.
-// Caps: 25 top-level items, including up to 3 newest terminal items.
-// Compact rows show refs:N from three refs; exact records retain every ref.
+// State is authoritative; inject now so presentation ages consistently.
 
 public enum DeskPage {
 
     public static let topLevelCap = 25
     public static let doneCap = 3
 
-    /// Aliases shown inline on a `blocked-on` segment before collapsing to `+N`.
     public static let blockedOnAliasCap = 3
 
     public static func render(
@@ -29,14 +22,12 @@ public enum DeskPage {
         let plan = DeskSequencing.compute(state, now: now)
         var lines: [String] = []
         lines.append("desk · owner · rev \(state.generatedTs) · stale ok")
-        // Derived held labels now/next rows that are blocked or deferred.
         lines.append("status: " + DeskStatus.allCases.map(\.displayLabel).joined(separator: " · ")
             + " · held (derived: now/next that is blocked or deferred)")
 
         for item in cappedTopLevel(plan.children) {
             lines.append(renderTopLevel(item, in: state, now: now, archiveGrace: archiveGrace, plan: plan))
             if let note = noteLine(item) { lines.append(note) }
-            // List multiple children, or a lone child not already surfaced by the parent highlight.
             let kids = plan.children[item.handle] ?? []
             let listKids = kids.count >= 2 || (kids.count == 1 && childHighlight(item, plan: plan) == nil)
             if listKids {
@@ -48,7 +39,7 @@ public enum DeskPage {
             }
         }
 
-        // Next-up rows render aliases, never internal handles.
+        // Present view-local aliases, never internal handles.
         let nextUp = plan.nextUp.compactMap { h in state.items.first { $0.handle == h } }
         if !nextUp.isEmpty {
             lines.append("next up:")
@@ -59,7 +50,6 @@ public enum DeskPage {
         return lines.joined(separator: "\n")
     }
 
-    /// The derived `held` token marks unready now/next rows without a waitingOn description.
     static func statusToken(_ item: DeskItem, plan: DeskSequencing.Plan) -> String {
         if !item.status.isTerminal, item.waitingOn?.isEmpty == false { return item.statusDescription }
         let base = (item.status == .watch) ? item.kind.rawValue : item.status.rawValue
@@ -70,7 +60,6 @@ public enum DeskPage {
 
     // MARK: - Sequencing segments (blocked-on / deferred / cycle / rollup)
 
-    /// Shared row/desk_breakdown sequencing segments in render order; blockers use aliases.
     public static func sequencingSegments(
         _ item: DeskItem,
         in state: DeskState,
@@ -80,7 +69,6 @@ public enum DeskPage {
         guard let itemPlan = plan.byHandle[item.handle] else { return [] }
         var segs: [String] = []
         if includeRollup, itemPlan.totalCount > 0 {
-            // Closed counts both done and canceled descendants.
             segs.append("\(itemPlan.doneCount)/\(itemPlan.totalCount) closed")
         }
         if !itemPlan.effectiveBlockers.isEmpty {
@@ -105,10 +93,7 @@ public enum DeskPage {
 
     // MARK: - Top-level selection + caps
 
-    /// Show up to 25 top-level items: newest-active open items, then up to 3 newest-closed items.
-    ///
-    /// The recency cap counts TERMINAL items (done AND canceled), not `.done`
-    /// alone — canceled rows are closed work with the same zero live signal.
+    /// Cap recent closed rows across both done and canceled work because each has zero live signal.
     public static func cappedTopLevel(_ children: [String?: [DeskItem]]) -> [DeskItem] {
         let top = children[nil] ?? []
         let open = top.filter { !$0.status.isTerminal }
@@ -121,8 +106,7 @@ public enum DeskPage {
         return Array((open + closed).prefix(topLevelCap))
     }
 
-    /// Newest `updatedAt` across the item and its whole subtree — a campaign
-    /// whose steps are being worked is active even if its own row is not.
+    /// Descendant activity keeps a parent active even without a direct touch.
     public static func lastActive(_ item: DeskItem, in children: [String?: [DeskItem]]) -> String {
         SwiftNativeDeskStore.descendants(of: item.handle, in: children).map(\.updatedAt).max()
             .map { max($0, item.updatedAt) } ?? item.updatedAt
@@ -140,7 +124,6 @@ public enum DeskPage {
         let token2 = statusToken(item, plan: plan)
         var segs: [String] = ["\(item.alias) \(token2) \(item.project)", item.title]
 
-        // Self-authored pursuits show their private name when present.
         if item.isPursuit {
             if let priv = item.pursuit?.privateName, !priv.isEmpty {
                 segs.append("✦pursuit “\(priv)”")
@@ -156,9 +139,7 @@ public enum DeskPage {
         if let highlight = childHighlight(item, plan: plan) {
             segs.append(highlight)
         }
-        // Parent progress and sequencing markers derive from the subtree.
         segs.append(contentsOf: sequencingSegments(item, in: state, plan: plan, includeRollup: true))
-        // Compact lines show refs:N only for at least three refs; the full set stays in the store and tab.
         if item.refs.count >= 3 {
             segs.append("refs:\(item.refs.count)")
         }
@@ -174,8 +155,6 @@ public enum DeskPage {
         return segs.joined(separator: " · ")
     }
 
-    /// The most-actionable active child collapsed inline (`now` wins over
-    /// `next`). nil when no now/next child exists.
     static func childHighlight(_ item: DeskItem, plan: DeskSequencing.Plan) -> String? {
         let kids = (plan.children[item.handle] ?? []).filter { plan.byHandle[$0.handle]?.isReady ?? true }
             .sorted { SwiftNativeDeskStore.aliasSeq($0.alias) < SwiftNativeDeskStore.aliasSeq($1.alias) }
@@ -188,7 +167,6 @@ public enum DeskPage {
         return nil
     }
 
-    /// One high-signal note line: a blocked/flagged item's latest note.
     static func noteLine(_ item: DeskItem) -> String? {
         guard let last = item.notes.last else { return nil }
         guard item.status == .blocked || item.status == .flag else { return nil }
@@ -197,10 +175,8 @@ public enum DeskPage {
 
     // MARK: - Staleness / archive countdown
 
-    /// `stale:<dur>` when the item's cadence.lastRefreshAt is older than its
-    /// staleAfter window. nil when no lastRefreshAt / staleAfter, or still fresh.
     static func staleSegment(_ item: DeskItem, now: Date) -> String? {
-        // Deferred items suppress staleness for every caller, with or without a sequencing plan.
+        // Deferred work suppresses staleness consistently across callers.
         guard !DeskSequencing.isDeferred(item, now: now) else { return nil }
         guard let lastRaw = item.cadence.lastRefreshAt,
               let last = DeskClock.parseISO(lastRaw),
@@ -211,7 +187,7 @@ public enum DeskPage {
         return "stale:\(humanDuration(elapsed))"
     }
 
-    /// Archival eligibility after the grace window; archival is explicit.
+    /// Eligibility does not archive work; archival remains explicit.
     static func archiveCountdown(_ item: DeskItem, in children: [String?: [DeskItem]], now: Date, archiveGrace: TimeInterval) -> String? {
         guard item.status.isTerminal, item.kind != .standing, !item.pinned,
               item.continuation?.pending.isEmpty ?? true,
@@ -225,10 +201,7 @@ public enum DeskPage {
 
     // MARK: - Duration helpers
 
-    /// Compact human duration: < 1h → "<n>m", < 1d → "<n>h", else "<n>d".
-    /// Rounds to the nearest unit so a value sitting on a bucket boundary (e.g.
-    /// a full 48h grace window) renders cleanly and is robust to the sub-second
-    /// drift of an ISO round-trip rather than tipping a day down by 1ms.
+    /// Round to the nearest unit so ISO drift cannot tip a boundary down by a millisecond.
     static func humanDuration(_ seconds: TimeInterval) -> String {
         let s = max(0, seconds)
         if s < 3600 { return String(format: "%.0f", (s / 60).rounded()) + "m" }
@@ -236,7 +209,6 @@ public enum DeskPage {
         return String(format: "%.0f", (s / 86_400).rounded()) + "d"
     }
 
-    /// Parse a duration string like "30m" / "2h" / "1d" into seconds.
     static func parseDuration(_ s: String) -> TimeInterval? {
         let trimmed = s.trimmingCharacters(in: .whitespaces)
         guard let unit = trimmed.last, let integer = Int(trimmed.dropLast()), integer > 0 else { return nil }
@@ -255,7 +227,6 @@ public enum DeskPage {
 
 // MARK: - The full record (one exact item)
 
-/// Exact-item text retains the full summary, dependencies, refs and capped notes; nothing stored.
 public extension DeskPage {
     static func renderRecord(
         _ item: DeskItem,
@@ -285,9 +256,7 @@ public extension DeskPage {
         lines.append("  opened \(item.openedAt) · updated \(item.updatedAt)"
             + (item.closedAt.map { " · closed \($0)" } ?? ""))
 
-        // Dependencies BOTH ways. A stored blockedOn edge says what this item
-        // waits for; the reverse scan says who is waiting on IT, which is the
-        // half that is invisible from the item's own row.
+        // Reverse edges reveal who waits on this item, which its own dependencies cannot show.
         if !item.blockedOn.isEmpty {
             lines.append("  depends on:")
             for handle in item.blockedOn {
@@ -330,8 +299,7 @@ public extension DeskPage {
         return lines.joined(separator: "\n")
     }
 
-    /// One ref as a line. Identity fields first, cached labels after, so a
-    /// stale cached title can never hide the thing it points at.
+    /// Render identity first so stale cached labels cannot hide the actual destination.
     static func refLine(_ ref: DeskRef) -> String {
         switch ref.kind {
         case let .file(path, line, label):

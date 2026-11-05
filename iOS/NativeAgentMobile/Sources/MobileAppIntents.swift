@@ -49,7 +49,7 @@ struct MobileAskIntent: AppIntent {
 
 struct MobileRememberIntent: AppIntent {
     static let title: LocalizedStringResource = "Remember with Your Agent"
-    static let description = IntentDescription("Send your agent a memory note and return her reply.")
+    static let description = IntentDescription("Send your agent a memory note and return the agent's reply.")
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     @available(iOS 27, *)
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
@@ -166,11 +166,16 @@ struct MobileTalkIntent: AppIntent {
 
 struct NativeAgentMobileShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
-        AppShortcut(intent: MobileAskIntent(), phrases: ["Ask \(\.$agent) in \(.applicationName)", "Ask my agent in \(.applicationName)"], shortTitle: "Ask Your Agent", systemImageName: "person.bubble")
-        AppShortcut(intent: MobileRememberIntent(), phrases: ["Tell \(\.$agent) to remember in \(.applicationName)", "Remember in \(.applicationName)"], shortTitle: "Remember", systemImageName: "brain")
-        AppShortcut(intent: MobileApproveIntent(), phrases: ["Approve a request for \(\.$agent) in \(.applicationName)", "Approve in \(.applicationName)"], shortTitle: "Approve", systemImageName: "checkmark.shield")
-        AppShortcut(intent: MobileStatusIntent(), phrases: ["Check on \(\.$agent) in \(.applicationName)", "Status in \(.applicationName)"], shortTitle: "Status", systemImageName: "waveform.path.ecg")
+        AppShortcut(intent: MobileAskIntent(), phrases: ["Ask \(\.$agent) in \(.applicationName)", "Ask my agent in \(.applicationName)"],
+            shortTitle: "Ask Your Agent", systemImageName: "person.bubble")
+        AppShortcut(intent: MobileRememberIntent(), phrases: ["Tell \(\.$agent) to remember in \(.applicationName)", "Remember in \(.applicationName)"],
+            shortTitle: "Remember", systemImageName: "brain")
+        AppShortcut(intent: MobileApproveIntent(), phrases: ["Approve a request for \(\.$agent) in \(.applicationName)", "Approve in \(.applicationName)"],
+            shortTitle: "Approve", systemImageName: "checkmark.shield")
+        AppShortcut(intent: MobileStatusIntent(), phrases: ["Check on \(\.$agent) in \(.applicationName)", "Status in \(.applicationName)"],
+            shortTitle: "Status", systemImageName: "waveform.path.ecg")
         AppShortcut(intent: MobileQuickAskIntent(), phrases: ["Quick Ask in \(.applicationName)"], shortTitle: "Quick Ask", systemImageName: "bubble.left")
-        AppShortcut(intent: MobileTalkIntent(), phrases: ["Talk to \(\.$agent) in \(.applicationName)", "Talk to my agent in \(.applicationName)"], shortTitle: "Talk", systemImageName: "phone.fill")
+        AppShortcut(intent: MobileTalkIntent(), phrases: ["Talk to \(\.$agent) in \(.applicationName)", "Talk to my agent in \(.applicationName)"],
+            shortTitle: "Talk", systemImageName: "phone.fill")
     }
 }

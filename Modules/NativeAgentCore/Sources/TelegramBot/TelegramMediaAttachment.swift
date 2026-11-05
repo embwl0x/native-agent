@@ -2,11 +2,10 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `TelegramMediaAttachment.swift` | `TelegramMediaDownloader`: two-stage file metadata/download admission with declared-size and actual-byte bounds |
+// Blueprint: | `TelegramMediaAttachment.swift` | `TelegramMediaDownloader`: bound declared and actual bytes |
 
 // MARK: - TelegramMediaAttachment
 
-/// A Telegram media attachment (photo, voice, video, document, …).
 public struct TelegramMediaAttachment: Sendable, Codable {
     public let kind: String
     public let fileId: String
@@ -61,13 +60,7 @@ public enum TelegramMediaDownloadError: Error, Equatable {
 
 // MARK: - TelegramMediaDownloader
 
-/// Two-stage media downloader:
-///   1. POST https://api.telegram.org/bot<token>/getFile { file_id } → learn file_path + file_size
-///   2. GET  https://api.telegram.org/file/bot<token>/<file_path>  → raw bytes
-///
-/// Honors a max-size cap: if getFile reports file_size > maxBytes the download is
-/// refused with `.oversized` before any byte transfer occurs. The actual body is
-/// also bounded while downloading, even when the reported size is absent/wrong.
+/// Reject declared oversize before transfer and bound actual bytes too, since Telegram may omit or misstate the size.
 public actor TelegramMediaDownloader {
     private let session: URLSession
 
@@ -111,7 +104,8 @@ public actor TelegramMediaDownloader {
             throw failure
         }
 
-        if let reportedSize = (result["file_size"]?.integerValue.flatMap(Int.init(exactly:)) ?? result["file_size"]?.stringValue.flatMap(Int.init)), reportedSize > maxBytes {
+        if let reportedSize = (result["file_size"]?.integerValue.flatMap(Int.init(exactly:))
+            ?? result["file_size"]?.stringValue.flatMap(Int.init)), reportedSize > maxBytes {
             throw TelegramMediaDownloadError.oversized(reportedBytes: reportedSize, capBytes: maxBytes)
         }
 

@@ -3,18 +3,15 @@ import NativeAgentShared
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TranscriptRows.swift` | `ContactThread` uses PersistenceCore's canonical JSONL serialization and owns durable append and exact-byte row edits/replacement for chat, compaction and archive restoration; writes share the owner lock and compound caller lock boundaries; session-index mutate provides checked read/edit/commit. `read` shares tail/incremental byte reads; `Line` retains each row's stamp, words, speaker and answers-id; `project` is the shared presentation; displayed contact speech alone calls `consume`; `DelegatedReplyEnvelope` shares reply/header syntax for search and presentation under caller-owned provenance admission |
+// Blueprint: | `TranscriptRows.swift` | `ContactThread`, `read`, `Line`, `project`, `consume`, `DelegatedReplyEnvelope`: Locked transcripts; shared display |
 
-/// The shared storage and reading of conversations. Routing extends this owner;
-/// presentation never derives a speaker from the session that holds a row.
+/// The shared storage and reading of conversations. Routing extends this owner; presentation never derives a speaker from the session that holds a row.
 public enum ContactThread {
-    // Transcript JSONL is locally/off-disk backed up and inventoried under chat.
-    // Production export excludes it; ChatExport writes Markdown and
-    // DeviceSync publishes bounded person-visible rows.
+    // Transcript JSONL is locally/off-disk backed up and inventoried under chat. Production export excludes it; ChatExport writes Markdown and DeviceSync
+    // publishes bounded person-visible rows.
 
-    /// Canonical transcript bytes have one strict UTF-8/JSON-object boundary.
-    /// The general JSONValue parser admits historical nonfinite tokens, so it
-    /// cannot establish that a saved transcript row is undamaged.
+    /// Canonical transcript bytes have one strict UTF-8/JSON-object boundary. The general parser admits nonfinite tokens, so only strict UTF-8/JSON-object
+    /// admission can establish undamaged transcript bytes.
     public static func decodeRow(_ data: Data) throws -> [String: JSONValue] {
         guard String(data: data, encoding: .utf8) != nil else { throw CocoaError(.fileReadInapplicableStringEncoding) }
         let raw = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
@@ -43,8 +40,7 @@ public enum ContactThread {
         }
     }
 
-    /// Edit one admitted row; every other byte, including blank lines and
-    /// final-newline state, belongs to the original transcript.
+    /// Edit one admitted row; every other byte, including blank lines and final-newline state, belongs to the original transcript.
     public static func editingRow(in bytes: Data, last: Bool = false,
                                   matching: ([String: JSONValue]) -> Bool,
                                   replacement: ([String: JSONValue]) throws -> [JSONValue]) throws -> Data? {
@@ -183,10 +179,8 @@ public enum ContactThread {
         return try handle.readToEnd()
     }
 
-    /// One stamped-row projection for sessions, contact threads and retained
-    /// previews; answer selection requires the matching canonical line.
-    /// A cache/index read omits `mark`; only the selected display
-    /// supplies it, so each displayed contact line is consumed exactly once.
+    /// One stamped-row projection for sessions, contact threads and retained previews; answer selection requires the matching canonical line. A cache/index
+    /// read omits `mark`; only the selected display supplies it, so each displayed contact line is consumed exactly once.
     public static func project(_ rows: some Sequence<Line>, style: TextStyle = .verbatim, thread owner: String? = nil,
                                person: String = "the person", own: String = "you", names: [String: String] = [:],
                                contactPrefix: String = "", unlistedPeer: String? = nil, unattested: String? = nil,
@@ -234,9 +228,10 @@ public enum ContactThread {
                     }
                 }
             }
-            if (style == .log || owner != nil) && row.text.isEmpty { return nil }
-            // A recorded route can name unattested words for display alone;
-            // `consume` still sees only the stamp ("another agent").
+            if (style == .log || owner != nil) && row.text.isEmpty {
+                guard row.mine, row.sendID != nil, case .array(let files)? = row.metadata["attachments"], !files.isEmpty else { return nil }
+            }
+            // A recorded route can name unattested words for display alone; `consume` still sees only the stamp ("another agent").
             let source = row.source ?? [unattested, Line.object(row.metadata["origin"])["agent"]?.stringValue,
                 Line.object(row.metadata["envelope"])["agent"]?.stringValue].compactMap { $0 }
                 .first { !["", "agent", "peer", "another agent"].contains($0) }
@@ -248,8 +243,7 @@ public enum ContactThread {
         }
     }
 
-    /// Reading marks the speaker alone. Recorded steering is provenance;
-    /// reading it never steers this turn or marks her words as someone else's.
+    /// Reading marks the speaker alone. Recorded steering is provenance; reading it never steers this turn or marks the agent's words as someone else's.
     @discardableResult
     public static func consume(_ line: Line, mark: (_ principal: String, _ words: String) -> Void) -> [String] {
         for speaker in line.speakers { mark(speaker, line.text) }
@@ -266,8 +260,7 @@ public enum ContactThread {
     }
 }
 
-/// Syntax shared by delegated-reply presentation and search. Callers decide
-/// whether recorded provenance admits interpreting a row as an envelope.
+/// Syntax shared by delegated-reply presentation and search. Callers decide whether recorded provenance admits interpreting a row as an envelope.
 public struct DelegatedReplyEnvelope: Sendable {
     public let text: String
     public let header: Substring

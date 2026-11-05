@@ -1,11 +1,13 @@
 import ChatTurnRuntime
+import ChatTurnContracts
+import NativeAgentCore
 import Foundation
 import NativeAgentShared
 import MacControl
 import ProviderRouting
 import Transcripts
 
-// Blueprint: | `NativeAgentEngine+IntentChat.swift` | `NativeAgentEngine.replyToIntent`: captures the person's location before shared chat queue admission; chat applies the saved choice |
+// Blueprint: | `NativeAgentEngine+IntentChat.swift` | `NativeAgentEngine.replyToIntent`; Capture location before queue admission |
 
 extension NativeAgentEngine {
     public func replyToIntent(_ message: String) async throws -> String {
@@ -19,27 +21,32 @@ extension NativeAgentEngine {
         _ = try? await ConversationAnchor.publish(
             sessionId: sessionID, source: "siri", conversationKind: .direct
         )
-        // Capture where User was before entering the shared session queue.
+        // Capture the user’s prior session before entering the shared queue.
         let takeover = await MacWorkContinuation.admit(message)
-        let reply = try await MacWorkContinuation.$current.withValue(takeover) {
-            try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID) {
-                try await TurnRequest(
-                    message: message,
-                    sessionID: sessionID,
-                    model: selection.model,
-                    reasoningEffort: selection.reasoningEffort,
-                    // The saved choice is applied by the chat itself.
-                    fileAccess: "auto",
-                    attachments: [],
-                    persona: nil,
-                    surface: "chat",
-                    suppressUserAppend: false,
-                    replacementAssistantMessageID: nil,
-                    serviceTier: selection.serviceTier,
-                    threadKind: .direct
-                ).chat(on: self.chatClient(profile: .mac))
-            }
+        var turn = Turn(session: sessionID)
+        turn.envelope = .personOnMac("siri:chat")
+        turn.macContinuation = takeover
+        let admitted = try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID,
+            arrival: TurnArrival(words: message, surface: "chat", row: .shown), turn: turn) { turn in
+            try await TurnRequest(
+                message: message,
+                sessionID: sessionID,
+                model: selection.model,
+                reasoningEffort: selection.reasoningEffort,
+                fileAccess: "auto",
+                attachments: [],
+                persona: nil,
+                surface: "chat",
+                suppressUserAppend: false,
+                replacementAssistantMessageID: nil,
+                serviceTier: selection.serviceTier,
+                threadKind: .direct
+            ).chat(on: self.chatClient(profile: .mac), parent: turn)
         }
-        return reply.output
+        switch admitted {
+        case .ran(let reply): return reply.output
+        // The agent's turn in progress read it; its reply in the conversation answers it.
+        case .steered: return "\(AgentVoice.live.Subject) \(AgentVoice.live.verb("be")) taking that into the work in progress now."
+        }
     }
 }

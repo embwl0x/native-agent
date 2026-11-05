@@ -11,7 +11,7 @@ import CognitiveSubstrate
 import ChatToolRuntime
 import ChatToolParsing
 import ToolRegistry
-// Blueprint: | `ChatOrchestrationClient+LivedObservations.swift` | `SwiftNativeChatOrchestrationClient`: persisted incoming-turn origin and bounded redacted message/tool/progress cognitive events with explicit authorship |
+// Blueprint: | `ChatOrchestrationClient+LivedObservations.swift` | `SwiftNativeChatOrchestrationClient`; Explicit provenance and bounded cognitive events |
 
 extension SwiftNativeChatOrchestrationClient {
     static func afterTurnOrigin(in rows: [JSONValue], sessionId: String, runId: String) throws -> AfterTurnOrigin? {
@@ -53,8 +53,7 @@ extension SwiftNativeChatOrchestrationClient {
         switch normalizedRole {
         case "user":
             kind = .userMessageReceived
-            // A bridge worker is not the human. Out-of-band origin, never its
-            // forgeable text prefix, decides this trust class.
+            // Out-of-band origin decides trust class; a bridge worker's typed prefix cannot establish human authorship.
             sourceClass = origin == nil ? .userStated : .imported
             importance = 0.65
         case "assistant":
@@ -79,10 +78,7 @@ extension SwiftNativeChatOrchestrationClient {
             "source": .string(source),
         ]
         if normalizedRole == "user", let origin {
-            // Keep the cognitive ledger correlated with the canonical
-            // transcript without copying attacker-sized TaskLocal strings.
-            // This is recorded route provenance, not a named-agent identity
-            // attestation (the bridge currently uses one shared bearer).
+            // Keep bounded transcript correlation in the cognitive ledger; route provenance is not process identity attestation.
             var cognitiveOrigin: [String: JSONValue] = [
                 "surface": .string(String(origin.surface.unicodeScalars.prefix(80))),
             ]
@@ -121,9 +117,7 @@ extension SwiftNativeChatOrchestrationClient {
                     .string(String(redactedSummary.suffix(300)))
             }
         }
-        // Carried onto the node so the READ side can recognise the row later
-        // without re-deriving anything — and so a stored node says which
-        // machinery wrote it, not merely that something did.
+        // Keep writer provenance on the node so readers need not infer it from prose.
         if let mechanicalRow {
             metadata[CognitiveMechanicalRowKind.metadataKey] = .string(mechanicalRow.rawValue)
         }
@@ -222,7 +216,8 @@ extension SwiftNativeChatOrchestrationClient {
         sessionId: String,
         runId: String?,
         surface: String,
-        event: TurnStreamEvent
+        event: TurnStreamEvent,
+        turn: Turn
     ) async {
         guard let cognitiveRuntime else { return }
         let occurredAt = clock()
@@ -230,17 +225,14 @@ extension SwiftNativeChatOrchestrationClient {
         case .toolUse(let name, let input):
             let safeName = name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !safeName.isEmpty else { return }
-            // Canonical motor owners emit their own exact action identity and
-            // lifecycle. A generic start here cannot be correlated with that
-            // terminal state and would leave false pending physiology. An app
-            // call is judged as the tool it runs.
+            // Motor owners emit exact lifecycle identities. Generic starts here cannot pair with their terminals and would leave false pending state.
             let ranInput: [String: JSONValue] = if case .object(let fields) = input { fields } else { [:] }
             let ranTool = ToolNameAliases.ranTool(safeName, input: ranInput)
             guard !ChatToolOutcome.hasCanonicalMotorOwner(ranTool),
-                  let invocationID = ToolReceipt.currentInvocationID else { return }
+                  let invocationID = turn.invocationID else { return }
             // Persisted physiology uses by-tool redaction before cutting its preview.
             let inputPreview = Self.compactCognitiveJSON(
-                MacInjectionArgRedaction.redactedPayload(tool: safeName, payload: input),
+                MacInjectionArgRedaction.redactedPayload(tool: safeName, payload: input, turn: turn),
                 maxCharacters: 240
             )
             var metadata: [String: JSONValue] = [
@@ -288,7 +280,7 @@ extension SwiftNativeChatOrchestrationClient {
                 metadata: metadata
             ))
 
-        case .toolResult, .delta, .final, .notice, .replyTextSettled:
+        case .toolResult, .delta, .final, .notice, .replyTextSettled, .writing:
             return
         }
     }

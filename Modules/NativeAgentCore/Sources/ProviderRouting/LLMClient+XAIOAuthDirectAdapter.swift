@@ -3,24 +3,22 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `LLMClient+XAIOAuthDirectAdapter.swift` | `XAIOAuthTransport`: app-owned OAuth token lifecycle and Grok completion/stream transport with shared refresh serialization |
+// Blueprint: | `LLMClient+XAIOAuthDirectAdapter.swift` | `XAIOAuthTransport`: path-serialized token refresh |
 
 public let XAIOAuthDirectExhaustedMarker = "xai_oauth_direct_exhausted: re-sign-in required"
 
-/// xAI Grok OAuth provider for NativeAgent-owned credentials.
-///
-/// It authenticates against xAI and calls Grok models at https://api.x.ai/v1.
+/// App-owned xAI credentials authenticate the first-party model route.
 public final class XAIOAuthTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
     /// This transport sends no output-cap field.
-    public func requestOutputTokens(model: String) throws -> Int { 0 }
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
 
     public let providerId: String = "xai_oauth_direct"
 
     public static let defaultEndpoint = URL(string: "https://api.x.ai/v1/chat/completions")!
     public static let defaultRefreshEndpoint = URL(string: ProviderOAuthConfig.xaiTokenEndpoint)!
     public static let clientID = ProviderOAuthConfig.xaiClientID
-    /// The default is the provider catalog's first row.
+    /// Only the provider catalog can supply a default.
     public static var defaultModel: String {
         FirstPartyModelCatalog.models(forProviderID: "xai_oauth_direct").first?.id ?? ""
     }
@@ -54,21 +52,21 @@ public final class XAIOAuthTransport: LLMTransport {
         prompt: String,
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         let messages = [LLMMessage.user(prompt)]
-        return try await completeMessages(messages: messages, system: system, model: model, tools: tools)
+        return try await completeMessages(messages: messages, system: system, model: model, tools: tools, call: call)
     }
 
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         // The stream owns the account-bound refresh and the one 401 retry, as a turn's does.
         return try await LLMMessageStreamEvent.reply(collecting:
-            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
+            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
 
@@ -77,7 +75,7 @@ public final class XAIOAuthTransport: LLMTransport {
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         let session = self.session
         let endpoint = self.endpoint
@@ -103,7 +101,7 @@ public final class XAIOAuthTransport: LLMTransport {
                             messages: messages,
                             system: system,
                             tools: tools,
-                            stream: true
+                            stream: true, call: call
                         )
                         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
@@ -111,7 +109,7 @@ public final class XAIOAuthTransport: LLMTransport {
                         let bytes: URLSession.AsyncBytes
                         let response: URLResponse
                         do {
-                            (bytes, response) = try await ProviderWire.open(session, req)
+                            (bytes, response) = try await ProviderWire.open(session, req, call: call)
                         } catch {
                             throw mapTransportError(error, fallback: self.transientNetworkError(error, operation: "streamMessages"))
                         }
@@ -122,11 +120,12 @@ public final class XAIOAuthTransport: LLMTransport {
                             throw LLMError.authRejected(provider: "xai_oauth_direct", detail: XAIOAuthDirectExhaustedMarker)
                         }
                         try await ProviderWire.validateChatCompletions(bytes, response)
-                        var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI", diagnosticDataRoot: telemetry.diagnosticDataRoot)
+                        var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI", diagnosticDataRoot: telemetry.diagnosticDataRoot(call: call),
+                            call: call)
                         try await decoder.consume(
-                            SSEEventStream(bytes), continuation: continuation,
+                            SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
                             request: req, providerID: providerId, model: effectiveModel, idPrefix: "xai_tool",
-                            started: requestStartNs, telemetry: telemetry
+                            started: requestStartNs, telemetry: telemetry, call: call
                         )
                         continuation.finish()
                         return
@@ -139,7 +138,7 @@ public final class XAIOAuthTransport: LLMTransport {
                     continuation.finish(throwing: error)
                 }
             }
-            ProviderReplyWork.current?.own(task)
+            call.replyWork?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -151,7 +150,7 @@ public final class XAIOAuthTransport: LLMTransport {
         messages: [LLMMessage],
         system: String?,
         tools: [LLMToolSchema]?,
-        stream: Bool
+        stream: Bool, call: LLMCall
     ) throws -> [String: Any] {
         var body: [String: Any] = [
             "model": model,
@@ -161,7 +160,7 @@ public final class XAIOAuthTransport: LLMTransport {
         // Streaming requests ask for token usage on the final SSE frame.
         if stream { body["stream_options"] = ["include_usage": true] }
         try OpenAITransport.applyTools(to: &body, tools: tools)
-        try FirstPartyExecutionControls.applyXAIControls(to: &body, model: model)
+        try FirstPartyExecutionControls.applyXAIControls(to: &body, model: model, call: call)
         return body
     }
 
@@ -294,8 +293,8 @@ public final class XAIOAuthTransport: LLMTransport {
         if let idToken = payload["id_token"] as? String {
             updates["id_token"] = idToken
         }
-        // Under the shared path lock, compare token-key generations and merge onto current settings.
-        // Superseded refreshes skip the write and return a current credential only for the same account.
+        // Under the shared path lock, compare token-key generations and merge onto current settings. Superseded refreshes skip the write and return a
+        // current credential only for the same account.
         let generation = CredentialFileLock.credentialGeneration(ofFileContents: state.bytes)
         return try CredentialFileLock.withLock(tokenPath) {
             let current = try XAIOAuthCredentialStore.read(at: tokenPath)
@@ -320,7 +319,11 @@ public final class XAIOAuthTransport: LLMTransport {
     }
 
     private func transientNetworkError(_ error: Error, operation: String) -> LLMError {
-        .transient(message: "\(providerId) \(operation) failed for \(endpoint.host ?? "api.x.ai"): \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))")
+        .transient(
+            message: """
+                \(providerId) \(operation) failed for \(endpoint.host ?? "api.x.ai"): \
+                \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))
+                """)
     }
 
     /// Expiry is the earlier of persisted expires_at and JWT exp, including opaque-token support.
@@ -400,10 +403,7 @@ private func jwtExpiry(_ token: String) -> Date? {
     return nil
 }
 
-/// The `expires_at` this adapter itself persisted on the last refresh, in
-/// the flat token set. `parseExpiresAt` accepts ISO
-/// basic, full ISO (with or without fractional seconds) and unix stamps; it
-/// is shared with the other OAuth adapters.
+/// Expiry parsing is shared across adapters and accepts the persisted ISO and Unix forms.
 private func persistedExpiry(_ obj: [String: Any]) -> Date? {
     let raw = obj["expires_at"]
     guard let raw else { return nil }

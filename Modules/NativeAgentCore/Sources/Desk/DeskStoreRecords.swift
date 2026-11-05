@@ -17,7 +17,6 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case archiveRefusedUnresolvedContinuation(handle: String)
     case archiveRefusedPendingMigration(handle: String)
     case queueCreationRequiresQueuePath
-    // Pursuit invariants.
     case pursuitCapReached(openCount: Int)
     case pursuitFieldMissing(reason: String)
     case pursuitDossierInvalid(reason: String)
@@ -30,7 +29,6 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case unknownReservation(reservationId: String, handle: String)
     case reservationAlreadyComplete(reservationId: String, handle: String)
     case workReservationNotReady(handle: String)
-    // Sequencing edges (blocked-on / defer).
     case blockedOnUnknown(handle: String, blocker: String)
     case blockedOnSelf(handle: String)
     case blockedOnCycle(handle: String, handles: [String])
@@ -39,9 +37,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case liveActivityMetadataEmpty(field: String)
     case laneOfUnknown(handle: String, laneOf: String)
     case laneOfSelf(handle: String)
-    /// The compaction base exists on disk but does not decode. Replaying from
-    /// the tail alone would silently blank every compacted item, so reads FAIL
-    /// LOUD instead (fail-loud over fail-over).
+    /// A malformed base cannot replay from tail alone without losing compacted items.
     case compactionBaseCorrupt(path: String)
     /// Unreadable bytes remain a retryable I/O error, distinct from a corrupt compaction base.
     case compactionBaseUnreadable(path: String)
@@ -96,7 +92,10 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
         case let .reservationAlreadyComplete(reservationId, handle):
             return "desk: reservation \(reservationId) on \(handle) is already complete; a slot completes once"
         case .workReservationNotReady(let handle):
-            return "desk: cannot reserve work on \(handle); inspect its pursuit lifetime and resolve its or its ancestor's blockers, owner input, or deferral first"
+            return """
+                desk: cannot reserve work on \(handle); inspect its pursuit lifetime and resolve its or its ancestor's blockers, owner input, or \
+                deferral first
+                """
         case let .blockedOnUnknown(handle, blocker):
             return "desk: cannot block \(handle) on '\(blocker)' — no live item with that handle; blockers point at ITEMS, not prose"
         case .blockedOnSelf(let handle):
@@ -114,20 +113,24 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
         case .laneOfSelf(let handle):
             return "desk: \(handle) cannot be its own laneOf parent"
         case .compactionBaseCorrupt(let path):
-            return "desk: compaction base at \(path) exists but does not decode — refusing to replay from the tail alone (that would silently drop every compacted item)"
+            return """
+                desk: compaction base at \(path) exists but does not decode — refusing to replay from the tail alone (that would silently drop \
+                every compacted item)
+                """
         case .compactionBaseUnreadable(let path):
             return "desk: compaction base at \(path) exists but its bytes could not be read (transient IO) — retry rather than treating the desk as corrupt"
         case let .journalUnavailable(path, reason):
-            return "desk: journal at \(path) is unavailable: \(reason). Preserve the file and reconcile the named record to the current writer's shape before replaying."
+            return """
+                desk: journal at \(path) is unavailable: \(reason). Preserve the file and reconcile the named record to the current writer's \
+                shape before replaying.
+                """
         case .invalidOperation(let token):
             return "desk: \(token) does not encode a complete current operation; no journal row was written. Repair its arguments at the mutation owner."
         }
     }
 }
 
-/// "Last recorded non-terminal status" for one item — the reconcile repair's
-/// reopen target. Lives in the compaction base because it is derived from RAW
-/// op history (a terminal item's pre-terminal status is not in DeskState).
+/// Retain preterminal status because terminal live rows cannot supply a reopening target.
 struct DeskNonTerminalRecord: Sendable, Equatable {
     var status: DeskStatus
     var blockedReason: String?
@@ -153,17 +156,11 @@ struct DeskNonTerminalRecord: Sendable, Equatable {
     }
 }
 
-/// The op-log's compaction snapshot. `state` is the FULL reduced desk state
-/// through `lastCompactedOpId`; `aliasHighWater` and `lastNonTerminal` carry
-/// the two ledgers that live in raw op history rather than in DeskState.
-/// Replay seeds from it and applies only ops that follow `lastCompactedOpId`.
+/// Carry state and raw-history ledgers through the compacted prefix so replay can safely use only the tail.
 struct DeskCompactionBase: Sendable {
     let state: DeskState
-    /// Highest create-op alias seq ever assigned per parent scope ("" = top
-    /// level, otherwise the parent handle). nextAlias takes max(highWater,
-    /// tail creates) + 1 so a retired alias is never reused after truncation.
+    /// Keep alias high-water across truncation so archived siblings' aliases cannot be reused.
     let aliasHighWater: [String: Int]
-    /// handle → last recorded non-terminal status (reconcile's reopen target).
     let lastNonTerminal: [String: DeskNonTerminalRecord]
     let lastCompactedOpId: String
     let compactedAt: String
@@ -186,7 +183,7 @@ struct DeskCompactionBase: Sendable {
         guard case .object(let obj) = value,
               case .int(1)? = obj["version"],
               let stateVal = obj["state"], let state = DeskState.fromJSON(stateVal),
-              // The sole surviving snapshot must preserve every stored value.
+              // The sole snapshot must preserve every stored value.
               deskBaseRoundTripIsFaithful(decoded: state, onDisk: stateVal),
               case .string(let lastCompactedOpId)? = obj["lastCompactedOpId"],
               !lastCompactedOpId.isEmpty,
@@ -216,36 +213,28 @@ struct DeskCompactionBase: Sendable {
     }
 }
 
-/// The current snapshot preserves its exact JSON tree. No scalar migration,
-/// synthesized ledger or clamped saved bound is admitted here.
+/// Preserve exact accounting; synthesized ledgers or clamped bounds would change saved state.
 func deskBaseRoundTripIsFaithful(decoded state: DeskState, onDisk: JSONValue) -> Bool {
     state.toJSON() == onDisk
 }
 
-/// One consistent read of the replayable feed: compaction base (if any), the
-/// tail ops that FOLLOW it, and the raw op-log line count (pre prefix-drop —
-/// the compaction threshold keys on actual file size).
+/// Pair base and following tail; count physical rows before prefix-drop so compaction tracks actual size.
 struct DeskFeed: Sendable {
     let base: DeskCompactionBase?
     var ops: [DeskOp]
     var fileOpCount: Int
-    /// Physical feed integrity. Functional reads require every row before a
-    /// feed is returned; diagnostics may report rejected records separately.
+    /// Require complete integrity for functional reads while retaining rejected-row diagnostics.
     var integrity: SnapshotTailOpLog.OpLogIntegrity = .clean
 
-    /// Compaction thresholds count physical `desk_ops.jsonl` rows, including undecodable ops.
+    /// Undecodable rows still consume feed space.
     var compactionRowCount: Int { integrity.feedRowCount(decodedCount: fileOpCount) }
 
-    /// Account for ops this writer just appended to the file under the flock.
     mutating func noteAppendedRows(_ count: Int) {
         fileOpCount += count
         integrity = integrity.appendingRows(count)
     }
 
-    /// Newest committed timestamp across base + tail — the Lamport floor every
-    /// commit stamp must clear. After a truncate the tail can be empty; without
-    /// the base's generatedTs a second writer process could stamp BEHIND
-    /// compacted ops and break commit-order == timestamp-order.
+    /// Floor commits on both base and tail so another writer cannot stamp behind compacted operations.
     var maxCommittedTs: String? {
         let tailMax = ops.map(\.ts).max()
         let baseTs: String? = base.flatMap { $0.state.generatedTs.isEmpty ? nil : $0.state.generatedTs }

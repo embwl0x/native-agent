@@ -5,69 +5,67 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityAccounting.swift` | Locked execution settlement and learned-use accounting; observed dependency snapshots and refresh receipts share the terminal state write without changing sealed candidate identity |
+// Blueprint: | `AbilityAccounting.swift` | Locked terminal evidence and learned-use accounting |
 extension AbilityStore {
-    /// Terminal accounting survives caller cancellation with its causal act.
-    /// A run owns this once; projections do not manufacture run evidence.
-    public func settleRun(id: String, version: String, receipt: JSONValue, input: JSONValue?, dependencySnapshot: JSONValue? = nil) async -> JSONValue {
-        let cause = Experience.currentAct
+    /// Terminal accounting survives caller cancellation with its causal act. A run owns this once; projections do not manufacture run evidence.
+    public func settleRun(id: String, version: String, receipt: JSONValue, input: JSONValue?, dependencySnapshot: JSONValue? = nil,
+        turn: Turn?) async -> JSONValue {
         return await settle {
-            Experience.$currentAct.withValue(cause) {
-                var fields = receipt.objectValue ?? [:]
-                do {
-                    try Self.withLock {
-                        let recorded = try accounting(id: id) {
-                            // Observed contracts are evidence of this invocation,
-                            // not a replacement for the candidate's sealed inputs.
-                            if let snapshot = dependencySnapshot?.objectValue, try readFile(id: id, slot: .current) != nil,
-                               let file = try [Slot.current, .previous].compactMap({ try readFile(id: id, slot: $0) }).first(where: { identity($0) == version }) {
-                                let selected = version + "@" + String(file.metadata["version"]?.integer ?? 1)
-                                let evidence = try readState()[id]?.objectValue?["runs"]?.objectValue?["versions"]?.objectValue?[selected]?.objectValue
-                                let before = evidence?["dependencySnapshot"]?.objectValue ?? [:]
-                                let sealed = file.metadata["candidate"]?.objectValue?["dependencyShapes"]?.objectValue ?? [:]
-                                let changed = snapshot.keys.sorted().filter { action in
-                                    guard snapshot[action] != .null else { return false }
-                                    let prior = before[action].flatMap { $0 == .null ? nil : $0 } ?? sealed[action]
-                                    // No observation is not evidence that a schema changed.
-                                    return prior != nil && prior != .null && prior != snapshot[action]
-                                }
-                                fields["dependencySnapshot"] = .object(snapshot)
-                                if !changed.isEmpty {
-                                    fields["refreshed"] = .array(changed.map { .string("refreshed: \($0) schema changed; this ability's statically readable calls still fit; computed arguments are checked at the door") })
-                                }
+            var fields = receipt.objectValue ?? [:]
+            do {
+                try Self.withLock {
+                    let recorded = try accounting(id: id, turn: turn) {
+                        // Observed contracts are evidence of this invocation, not a replacement for the candidate's sealed inputs.
+                        if let snapshot = dependencySnapshot?.objectValue, try readFile(id: id, slot: .current) != nil,
+                           let file = try [Slot.current, .previous].compactMap({ try readFile(id: id, slot: $0) }).first(where: { identity(
+                               $0) == version }) {
+                            let selected = version + "@" + String(file.metadata["version"]?.integer ?? 1)
+                            let evidence = try readState()[id]?.objectValue?["runs"]?.objectValue?["versions"]?.objectValue?[selected]?.objectValue
+                            let before = evidence?["dependencySnapshot"]?.objectValue ?? [:]
+                            let sealed = file.metadata["candidate"]?.objectValue?["dependencyShapes"]?.objectValue ?? [:]
+                            let changed = snapshot.keys.sorted().filter { action in
+                                guard snapshot[action] != .null else { return false }
+                                let prior = before[action].flatMap { $0 == .null ? nil : $0 } ?? sealed[action]
+                                // No observation is not evidence that a schema changed.
+                                return prior != nil && prior != .null && prior != snapshot[action]
                             }
-                            let recorded = try recordRunEvidence(id: id, version: version, receipt: .object(fields), input: input, nativeSense: nil)
-                            return (recorded.written, recorded)
+                            fields["dependencySnapshot"] = .object(snapshot)
+                            if !changed.isEmpty {
+                                fields["refreshed"] = .array(changed.map { .string("""
+                                    refreshed: \($0) schema changed; this ability's statically readable calls still fit; computed arguments are checked \
+                                    at the door
+                                    """) })
+                            }
                         }
-                        if !recorded.written {
-                            fields.removeValue(forKey: "refreshed"); fields.removeValue(forKey: "dependencySnapshot")
-                        }
-                        if let upgrade = recorded.upgrade {
-                            fields["upgrade"] = .string(upgrade)
-                        }
+                        let recorded = try recordRunEvidence(id: id, version: version, receipt: .object(fields), input: input, nativeSense: nil, turn: turn)
+                        return (recorded.written, recorded)
                     }
-                } catch {
-                    fields.removeValue(forKey: "refreshed"); fields.removeValue(forKey: "dependencySnapshot")
-                    fields["accounting_error"] = .string(error.localizedDescription)
+                    if !recorded.written {
+                        fields.removeValue(forKey: "refreshed"); fields.removeValue(forKey: "dependencySnapshot")
+                    }
+                    if let upgrade = recorded.upgrade {
+                        fields["upgrade"] = .string(upgrade)
+                    }
                 }
-                return .object(fields)
+            } catch {
+                fields.removeValue(forKey: "refreshed"); fields.removeValue(forKey: "dependencySnapshot")
+                fields["accounting_error"] = .string(error.localizedDescription)
             }
+            return .object(fields)
         }
     }
-    /// Terminal evidence belongs to the stem, including on a peer-steered run.
-    /// Returns the upgrade signal this run raised: `reason@step` when the same
-    /// world stop at the same place ended 2 of the part's last 3 runs, said once.
+    /// The stem alone records terminal evidence, including peer-steered runs; repeated world stops signal reason@step once per upgrade.
     @discardableResult
-    public func recordRun(id: String, version: String, receipt: JSONValue, input: JSONValue? = nil, nativeSense: JSONValue? = nil) throws -> String? {
-        try accounting(id: id) {
-            let recorded = try recordRunEvidence(id: id, version: version, receipt: receipt, input: input, nativeSense: nativeSense)
+    public func recordRun(id: String, version: String, receipt: JSONValue, input: JSONValue? = nil, nativeSense: JSONValue? = nil,
+        turn: Turn?) throws -> String? {
+        try accounting(id: id, turn: turn) {
+            let recorded = try recordRunEvidence(id: id, version: version, receipt: receipt, input: input, nativeSense: nativeSense, turn: turn)
             return (recorded.written, recorded.upgrade)
         }
     }
-    /// How many of her model rounds one turn spent calling the part, kept for
-    /// its recent uses: her own curve, read with its run totals as learned.use.
-    public func recordRounds(id: String, rounds: Int) throws {
-        try accounting(id: id) {
+    /// Retain per-turn model rounds beside run totals so learned.use reflects actual cost.
+    public func recordRounds(id: String, rounds: Int, turn: Turn?) throws {
+        try accounting(id: id, turn: turn) {
             try Self.withLock {
                 guard try readFile(id: id, slot: .current) != nil else { return (false, ()) }
                 var state = try readState(), row = state[id]?.objectValue ?? [:], runs = row["runs"]?.objectValue ?? [:]
@@ -78,17 +76,15 @@ extension AbilityStore {
             }
         }
     }
-    func accounting<T>(id: String, _ write: () throws -> (written: Bool, value: T)) throws -> T {
+    func accounting<T>(id: String, turn: Turn?, _ write: () throws -> (written: Bool, value: T)) throws -> T {
         let recorded: (written: Bool, value: T)
         do { recorded = try write() }
         catch {
-            // The ledger's write is apart from what the run did: its failure owes
-            // repair to the file that refused it, never to the act, whose own
-            // outcome and remedy stand.
+            // Ledger failure owes the file repair without replacing the act's own outcome or remedy.
             let failure = error as? ToolFailureError
                 ?? repairFailure(source: root.appendingPathComponent("state.json"), detail: error.localizedDescription)
             RepairOwed.owe(dataRoot, id: "abilities-accounting:" + UUID().uuidString.lowercased(), kind: .run,
-                           cause: Experience.currentAct.map { [$0] } ?? [], operation: "abilities.accounting",
+                           cause: turn?.act.map { [$0] } ?? [], operation: "abilities.accounting",
                            owner: failure.owner ?? root.appendingPathComponent("state.json").path,
                            words: failure.message, nextCall: failure.nextCall)
             throw failure
@@ -98,7 +94,9 @@ extension AbilityStore {
         return recorded.value
     }
     /// Not written when the run's part or version is gone.
-    private func recordRunEvidence(id: String, version: String, receipt: JSONValue, input: JSONValue?, nativeSense: JSONValue?) throws -> (written: Bool, upgrade: String?) {
+    private func recordRunEvidence(id: String, version: String, receipt: JSONValue, input: JSONValue?, nativeSense: JSONValue?, turn: Turn?) throws -> (
+        written: Bool,
+        upgrade: String?) {
         try Self.withLock {
             // Native/bundled reads have a registry record but no executable file.
             guard let current = try readFile(id: id, slot: .current) ?? nativeSense.map({
@@ -160,8 +158,7 @@ extension AbilityStore {
             versions[selected] = .object(evidence)
             versions = versions.filter { $0.key == currentKey || $0.key == previousKey }
             runs["versions"] = .object(versions)
-            // Where each of its last three runs ended; a world stop that keeps
-            // ending it at one place is an upgrade it owes, said once.
+            // Repeated world stops at one place owe one upgrade signal.
             var upgrade: String?
             if input != nil {
                 let back = fields["hand_back"]?.objectValue ?? [:]
@@ -194,16 +191,20 @@ extension AbilityStore {
                     let fault = fields["error"]?.objectValue ?? fields["stopped"]?.objectValue ?? fields
                     let detail = fault["message"]?.stringValue ?? fault["detail"]?.stringValue ?? fault["reason"]?.stringValue ?? "Ability execution failed."
                     RepairOwed.owe(dataRoot, id: run, kind: .run,
-                        cause: Experience.currentAct.map { [$0] } ?? [], operation: operation,
+                        cause: turn?.act.map { [$0] } ?? [], operation: operation,
                         owner: source + " > " + version,
                         words: TurnSecretRedactor.redactText(detail) + (file.kind == .turn
                             ? " Tell the person: NativeAgent's turn part failed; preserve its versions and reconcile prior effects."
                             : " Revise code/source in next_call through " + (file.kind == .sense ? "sense.make" : "ability.save")
                                 + ", keep that version, reconcile any prior effects, then perform the failed operation again."),
                         lever: file.kind == .sense ? "sense.make" : file.kind == .part ? "ability.enable" : nil,
-                        nextCall: try repairCall(file), tap: file.kind == .turn ? "Report NativeAgent's turn-part execution defect at \(source), version \(version), to the person; preserve every retained version and prior effect." : nil)
+                        nextCall: try repairCall(file), tap: file.kind == .turn ? """
+                            Report NativeAgent's turn-part execution defect at \(source), version \(version), to the person; preserve every retained version \
+                            and prior effect.
+                            """ : nil)
                 } else if outcome == "ok" {
-                    RepairOwed.settle(dataRoot, operation: operation, evidence: .init(source: "abilities/state.json", id: id + ":" + selected + ":" + String(count)))
+                    RepairOwed.settle(dataRoot, operation: operation, evidence: .init(source: "abilities/state.json", id: id + ":" + selected + ":" + String(
+                        count)))
                 }
             }
             return (true, upgrade)
@@ -216,7 +217,8 @@ extension AbilityStore {
         let fault = fields["error"]?.objectValue ?? fields["stopped"]?.objectValue ?? fields
         let reason = fault["reason"]?.stringValue ?? fields["reason"]?.stringValue ?? ""
         if ["timeout", "resource_limit", "cancelled"].contains(reason) { return "cut" }
-        if ["network", "http", "connection_failed", "connection_closed", "transport", "network_error", "http_error", "transport_error"].contains(reason) { return "network" }
+        if ["network", "http", "connection_failed", "connection_closed", "transport", "network_error", "http_error", "transport_error"].contains(
+            reason) { return "network" }
         if ["javascript", "script_syntax", "script_name", "bad_output", "output_limit", "unreadable_return",
             "expect_failed", "expected_failure_not_seen", "expected_failure_succeeded", "validation_failed",
             "expect_fail_async", "expect_fail_nested", "expect_fail_one_call", "diverged", "script_error",
@@ -231,14 +233,14 @@ extension AbilityStore {
         if fault["origin"] == .string("javascript") || fields["status"] == .string("error") && reason.isEmpty { return "error" }
         return "refused"
     }
-    /// Read-only accounting snapshot, cached only for the exact checked file identity.
+    /// Cache accounting only by its exact checked file identity.
     public func states() throws -> [String: JSONValue] {
         try Self.withLock { return try readState() }
     }
     public func saveState(id: String, fields: [String: JSONValue]) throws {
         try updateState(id: id) { $0 = fields }
     }
-    /// One part's accounting, changed under the store's lock.
+    /// Accounting mutations require the store lock.
     public func updateState(id: String, _ change: (inout [String: JSONValue]) -> Void) throws {
         try Self.withLock {
             var stats = try readState(), fields = stats[id]?.objectValue ?? [:]

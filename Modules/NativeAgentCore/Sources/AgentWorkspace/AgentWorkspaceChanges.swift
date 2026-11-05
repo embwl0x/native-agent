@@ -2,16 +2,15 @@ import Foundation
 import CryptoKit
 import PersistenceCore
 import ChatToolParsing
-// Blueprint: | `AgentWorkspaceChanges.swift` | `AgentWorkspaceChanges` enum; `evaluate`, `evaluateHumanListing`, conversation change observations through the bound owner port |
+// Blueprint: | `AgentWorkspaceChanges.swift` | `AgentWorkspaceChanges`, `evaluate`, `evaluateHumanListing`: source-stamped conversation change evidence |
 
-/// Small comparison receipts, never another content store or unread-message
-/// owner. The caller records a stamp only after presenting a successful read.
+/// Small comparison receipts, never another content store or unread-message owner. The caller records a stamp only after presenting a successful read.
 enum AgentWorkspaceChanges {
-    static func workspaceChangeObservation(_ row: AgentConversationRecord,
+    static func workspaceChangeObservation(workspace: WorkspaceOperation, _ row: AgentConversationRecord,
                                           location: AgentWorkspaceLocation,
                                           previous: Stamp?) -> Observation? {
         evaluate(location: location,
-            result: AgentWorkspacePorts.current.conversations.presentation(row), previous: previous)
+            result: workspace.ports.conversations.presentation(row), previous: previous)
     }
 
     struct Stamp: Sendable, Equatable, Codable {
@@ -49,8 +48,7 @@ enum AgentWorkspaceChanges {
         }
     }
 
-    /// Returns nil for navigation, effects and unsupported owners. An unreadable
-    /// supported source is explicitly unavailable and never resets its baseline.
+    /// Returns nil for navigation, effects and unsupported owners. An unreadable supported source is explicitly unavailable and never resets its baseline.
     static func evaluate(location: AgentWorkspaceLocation, result: JSONValue, previous: Stamp?) -> Observation? {
         guard let source = source(location) else { return nil }
         guard let identity = identity(location: location),
@@ -60,8 +58,7 @@ enum AgentWorkspaceChanges {
             return .init(state: .unavailable, nextStamp: previous,
                          detail: "A successful comparable read is unavailable; the previous successful view is retained.")
         }
-        // A contact's latest conversation may change between reads. Keep that
-        // owner-supplied identity distinct even when the open locator is broad.
+        // A contact's latest conversation may change between reads. Keep that owner-supplied identity distinct even when the open locator is broad.
         if source.tool == "agent_read", let row = result.objectValue {
             digestInput["source_conversation"] = row["conversation"] ?? row["conversation_id"]
         }
@@ -71,7 +68,8 @@ enum AgentWorkspaceChanges {
         let replyFingerprint: String?
         if source.tool == "agent_read" {
             if case .array(let exchanges)? = digestInput["exchanges"] {
-                replyFingerprint = hash(.array(exchanges.map { selected($0.objectValue ?? [:], ["text", "message_id", "conversation_id", "task_id", "artifacts"]) }))
+                replyFingerprint = hash(.array(exchanges.map { selected($0.objectValue ?? [:], ["text", "message_id", "conversation_id", "task_id",
+                    "artifacts"]) }))
             } else {
                 replyFingerprint = hash(selected(digestInput, ["reply", "parts", "artifacts"]))
             }
@@ -94,15 +92,15 @@ enum AgentWorkspaceChanges {
             : .init(state: .changed, nextStamp: stamp, detail: "", kind: kind)
     }
 
-    /// An index revision is enough to flag changed recorded activity, but not
-    /// enough to claim a new message or mark the conversation read. Only an
-    /// actual successful transcript view can update the comparison baseline.
+    /// An index revision is enough to flag changed recorded activity, but not enough to claim a new message or mark the conversation read. Only an actual
+    /// successful transcript view can update the comparison baseline.
     static func evaluateHumanListing(location: AgentWorkspaceLocation, row: [String: JSONValue], previous: Stamp?) -> Observation? {
         guard let source = source(location), source.tool == "chat_conversations", let identity = identity(location: location),
               row["conversation_session_id"] == source.input["conversation_session_id"] else { return nil }
         guard successful(row), let revision = row["source_revision"],
               revision != .null, let current = hash(revision) else {
-            return .init(state: .unavailable, nextStamp: previous, detail: "The conversation index has no comparable current revision; open it to read current messages.")
+            return .init(state: .unavailable, nextStamp: previous,
+                detail: "The conversation index has no comparable current revision; open it to read current messages.")
         }
         guard let previous, previous.isValid, previous.identity == identity, let old = previous.ownerRevisionFingerprint else {
             return .init(state: .firstSeen, nextStamp: previous, detail: "This conversation has not been successfully opened in this workspace yet.")
@@ -113,8 +111,7 @@ enum AgentWorkspaceChanges {
             kind: old == current ? nil : "source_changed")
     }
 
-    /// Storage index only: raw paths, queries, identities and content stay out
-    /// of the comparison receipt. Exact input pages remain separate baselines.
+    /// Storage index only: raw paths, queries, identities and content stay out of the comparison receipt. Exact input pages remain separate baselines.
     static func identity(location: AgentWorkspaceLocation) -> String? {
         guard let source = source(location) else { return nil }
         let input = source.input.filter { !["__session_id", "details"].contains($0.key) }
@@ -126,10 +123,9 @@ enum AgentWorkspaceChanges {
         case .work(let query): return ("work_context", ["query": .string(query)])
         case .page(let source, _): return self.source(source)
         case .record(let tool, let input, _):
-            guard ["read_file", "read_page", "agent_read", "work_context", "desk_read", "read_chat_message", "shelf_read", "chat_conversations"].contains(tool) else { return nil }
-            // Details is an owner-specific diagnostic receipt (for coding
-            // agents, a jobs collection), not the comparable conversation
-            // projection. Its availability is reported by that receipt itself.
+            guard ["read_file", "read_page", "agent_read", "work_context", "desk_read", "read_chat_message", "shelf_read", "chat_conversations"].contains(
+                tool) else { return nil }
+            // Diagnostic Details is not a comparable conversation; its own receipt reports availability.
             if tool == "agent_read", input["details"] == .bool(true) { return nil }
             return (tool, input)
         default: return nil
@@ -141,9 +137,8 @@ enum AgentWorkspaceChanges {
             return .object(["content": .string(text)])
         }
         if tool == "shelf_read" {
-            // A successful history page can contain failed/interrupted jobs
-            // and shortened headlines. Those are recorded outcomes, not a
-            // failure to read this page. Compare only its disclosed index.
+            // A successful history page can contain failed/interrupted jobs and shortened headlines. Those are recorded outcomes, not a failure to read this
+            // page. Compare only its disclosed index.
             guard let row = result.objectValue, row["status"] == .string("ok"),
                   row["ok"] != .bool(false), row["error"] == nil, row["error_code"] == nil,
                   case .array(let entries)? = row["entries"],
@@ -168,11 +163,13 @@ enum AgentWorkspaceChanges {
                 // Stable excerpts and aborted jobs remain comparable recorded history.
                 guard exchanges.allSatisfy({ $0.objectValue != nil }) else { return nil }
                 return .object(["exchanges": .array(exchanges.map { exchange in
-                    selected(exchange.objectValue ?? [:], ["from", "text", "message_id", "conversation_id", "task_id", "reply_state", "execution_state", "needs_input", "needs_authentication", "artifacts"])
+                    selected(exchange.objectValue ?? [:], ["from", "text", "message_id", "conversation_id", "task_id", "reply_state", "execution_state",
+                        "needs_input", "needs_authentication", "artifacts"])
                 }), "state": row["state"] ?? row["status"] ?? .null])
             }
             guard row["reply"] != nil || row["state"] != nil else { return nil }
-            return selected(row, ["agent", "conversation", "state", "status", "reply", "last_send_completed", "last_send_terminal", "last_send_needs_input", "last_send_needs_authentication", "completed", "terminal", "needs_input", "needs_authentication", "artifacts", "parts"])
+            return selected(row, ["agent", "conversation", "state", "status", "reply", "last_send_completed", "last_send_terminal", "last_send_needs_input",
+                "last_send_needs_authentication", "completed", "terminal", "needs_input", "needs_authentication", "artifacts", "parts"])
         case "chat_conversations":
             guard row["conversation_session_id"] != nil, case .array(let messages)? = row["messages"],
                   messages.allSatisfy({ $0.objectValue.map(successful) == true }),
@@ -200,19 +197,20 @@ enum AgentWorkspaceChanges {
     }
 
     private static func successful(_ row: [String: JSONValue]) -> Bool {
-        ChatToolOutcome.hasReadEvidence(.object(row), completeOnly: true)
+        let reply = ToolResult(.object(row))
+        return reply.hasReadEvidence(completeOnly: true)
     }
 
     private static func selected(_ row: [String: JSONValue], _ keys: Set<String>) -> JSONValue {
-        // Recursively remove transport/read-time decoration only. Never modify
-        // or interpret strings: quoted JSON and status words remain evidence.
+        // Recursively remove transport/read-time decoration only. Never modify or interpret strings: quoted JSON and status words remain evidence.
         scrub(.object(row.filter { keys.contains($0.key) }))
     }
 
     private static func scrub(_ value: JSONValue) -> JSONValue {
         switch value {
         case .object(let row):
-            let transient: Set<String> = ["as_of", "generated_at", "generated_ts", "read_at", "fetched_at", "observed_at", "updated_at", "read_locator", "read_with", "read_more", "reply_with", "inspect_receipt", "actions", "organism_posture", "duration_ms", "elapsed_ms"]
+            let transient: Set<String> = ["as_of", "generated_at", "generated_ts", "read_at", "fetched_at", "observed_at", "updated_at", "read_locator",
+                "read_with", "read_more", "reply_with", "inspect_receipt", "actions", "organism_posture", "duration_ms", "elapsed_ms"]
             return .object(row.filter { !transient.contains($0.key) }.mapValues(scrub))
         case .array(let rows): return .array(rows.map(scrub))
         default: return value

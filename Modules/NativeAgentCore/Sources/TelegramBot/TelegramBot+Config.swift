@@ -4,10 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import NativeAgentShared
-// Blueprint: | `TelegramBot+Config.swift` | Saved shape validation, exact positive `voice_max_bytes` and TransportAllowlist's normalized integer IDs; `ownerUserId` is canonical; one locked `readConfigurationStatus` separates readable metadata and credential failure; throwing readers preserve unavailable causes; Keychain references are the only credential form and ProviderRouting owns model/effort; conditional saves resolve kept tokens under the config lock and advance revisions, including disconnect |
+// Blueprint: | `TelegramBot+Config.swift` | `voice_max_bytes`, `ownerUserId`, `readConfigurationStatus`: locked grants and revisions |
 
-/// Credential-free configuration for management surfaces. Runtime configuration
-/// remains authoritative; a surface may supply its resolved routing selection.
+/// Credential-free configuration for management surfaces. Runtime configuration remains authoritative; a surface may supply its resolved routing selection.
 public struct TelegramConfigurationSummary: Sendable, Equatable {
     public let tokenConfigured: Bool
     public let allowedChatIds: [String]
@@ -29,12 +28,7 @@ public struct TelegramConfigurationSummary: Sendable, Equatable {
 }
 
 // MARK: - TelegramConfig
-//
-// Canonical path: `<dataRoot>/telegram/config.json`.
-// See docs/canonical_data_paths.md.
-// Local backup includes this configuration object; export excludes it. Phone
-// sync projects Telegram status/configuration without credentials. PrivacyMap
-// lists Telegram as nonexportable.
+// Back up configuration locally, exclude it from export, and sync no credentials to the phone (PrivacyMap: telegram).
 
 public struct TelegramConfig: Sendable, Equatable {
     public struct SavedRevision: Sendable, Equatable {
@@ -58,8 +52,7 @@ public struct TelegramConfig: Sendable, Equatable {
     public let tokenConfigured: Bool
     public let allowedChatIds: Set<Int64>
     public let allowedUserIds: Set<Int64>
-    /// A private chat id is its user's id. Chat-only setups may identify the
-    /// owner too, provided there is exactly one private destination.
+    /// A private chat id is its user's id. Chat-only setups may identify the owner too, provided there is exactly one private destination.
     public var ownerUserId: Int64? {
         let owners = allowedUserIds.isEmpty ? Set(allowedChatIds.filter { $0 > 0 }) : allowedUserIds
         guard owners.count == 1, let owner = owners.first, owner > 0 else { return nil }
@@ -90,8 +83,7 @@ public struct TelegramConfig: Sendable, Equatable {
         self.voiceMaxBytes = max(1, voiceMaxBytes)
     }
 
-    /// One locked status read retains validated metadata and the actual credential
-    /// failure separately. A credential fault never triggers a second config read.
+    /// One locked read separates metadata from credential failure; a bad grant must not trigger another config read.
     public static func readConfigurationStatus(dataRoot: URL) ->
         (configuration: Result<TelegramConfig?, Error>, credentialError: Error?) {
         let path = dataRoot.appendingPathComponent("telegram/config.json")
@@ -107,9 +99,7 @@ public struct TelegramConfig: Sendable, Equatable {
         } catch { return (.failure(error), nil) }
     }
 
-    /// Management callers distinguish missing settings from unavailable grants.
-    /// Explicit replacement or disconnect reads validated metadata without
-    /// requiring the credential it is replacing.
+    /// Replacement and disconnect need validated metadata even when the selected credential is unavailable.
     public static func loadSavedConfiguration(
         dataRoot: URL,
         includeDisconnected: Bool = true,
@@ -122,9 +112,6 @@ public struct TelegramConfig: Sendable, Equatable {
         }
     }
 
-    /// Write the per-feature `<dataRoot>/telegram/config.json` form. Used by
-    /// the Telegram settings panel so the user can paste a token without editing
-    /// disk by hand.
     public static func saveToDisk(
         _ cfg: TelegramConfig,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -139,8 +126,7 @@ public struct TelegramConfig: Sendable, Equatable {
             if let expectedRevision, try savedRevision(dataRoot: dataRoot) != expectedRevision {
                 throw PersistenceCoreError.ioFailure("Telegram settings changed while saving. The token was not saved.")
             }
-            // Resolve a blank draft only after the revision check, while the
-            // same lock excludes disconnect and every other config writer.
+            // Resolve a blank draft only after the revision check, while the same lock excludes disconnect and every other config writer.
             let token = keepExistingToken
                 ? (try loadSavedConfiguration(dataRoot: dataRoot)?.botToken ?? "") : cfg.botToken
             var payload: [String: JSONValue] = [
@@ -180,7 +166,10 @@ public struct TelegramConfig: Sendable, Equatable {
                 }
             }
             guard fields["enabled"] == .bool(false) || fields[tokenReferenceField] != nil else {
-                throw PersistenceCoreError.ioFailure("Enabled Telegram settings have no Keychain credential reference. Save the bot token again in Connectors → Telegram; existing settings were preserved.")
+                throw PersistenceCoreError.ioFailure("""
+                    Enabled Telegram settings have no Keychain credential reference. Save the bot token again in Connectors → Telegram; \
+                    existing settings were preserved.
+                    """)
             }
             for field in ["configuration_revision"] {
                 guard let value = fields[field] else { continue }
@@ -213,10 +202,7 @@ public struct TelegramConfig: Sendable, Equatable {
             }
             token = saved
         } else { token = "" }
-        // Transport callers require a token; settings readback may explicitly
-        // include the disconnected state. In either case,
-        // enabled=false MUST round-trip — return the config with enabled=false
-        // so the UI's saved-disabled toggle survives a restart.
+        // Preserve enabled=false on readback so the saved disabled toggle survives a restart.
         if token.isEmpty && !includeDisconnected { return nil }
         let enabled = obj["enabled"] != .bool(false)
         let allowed = try TransportAllowlist.telegram(fields: obj)
@@ -254,10 +240,11 @@ public struct TelegramConfig: Sendable, Equatable {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             guard try Data(contentsOf: url) == data else { throw DeviceSecretKeychain.Failure.unavailable }
         } catch {
-            // The atomic publication may have committed. Preserve both grants
-            // until the selected reference can be read; never restore old bytes
-            // or delete a possibly-selected credential after uncertain readback.
-            throw PersistenceCoreError.ioFailure("Telegram settings publication could not be confirmed at \(url.path): \(error.localizedDescription). Read that file and its selected Keychain reference before saving again; the credentials were retained.")
+            // Publication may have committed: retain both grants until readback identifies the selected reference; never restore uncertain bytes.
+            throw PersistenceCoreError.ioFailure("""
+                Telegram settings publication could not be confirmed at \(url.path): \(error.localizedDescription). Read that file \
+                and its selected Keychain reference before saving again; the credentials were retained.
+                """)
         }
         if let oldReference, oldReference != reference {
             do { try DeviceSecretKeychain.delete(service: tokenService, account: oldReference) }
@@ -265,8 +252,7 @@ public struct TelegramConfig: Sendable, Equatable {
         }
     }
 
-    /// Carry a readable current grant (including disconnect); return the source
-    /// failure for the restore receipt, while installation write failures throw.
+    /// Carry a readable current grant (including disconnect); return the source failure for the restore receipt, while installation write failures throw.
     public static func preserveCredential(safetyRoot: URL, destinationRoot: URL) throws -> String? {
         let destination = destinationRoot.appendingPathComponent("telegram/config.json")
         return try CredentialFileLock.withLock(destination) {

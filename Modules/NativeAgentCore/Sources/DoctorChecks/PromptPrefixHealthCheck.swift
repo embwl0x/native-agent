@@ -4,33 +4,13 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 
-// Blueprint: | `PromptPrefixHealthCheck.swift` | `PromptPrefixHealthCheck`: measured prefix/cache-shape health from real turn observations and provider token receipts |
+// Blueprint: | `PromptPrefixHealthCheck.swift` | `PromptPrefixHealthCheck`: measured prefix/cache health from turn and provider evidence |
 
 // MARK: - Prompt prefix health (Runtime)
-//
-// The v2Prefix shape keeps stable system material ahead of a transcript whose
-// head moves only through the cursor's row/character hysteresis (1.15 / 0.70).
-// Changing turn context rides after that prefix. Anthropic breakpoints and
-// OpenAI routing mark this same layout; provider limits still govern cache hits.
-// That property is invisible from the UI: a regression does not throw, it just
-// quietly stops reading cache and starts paying full price on every turn. It
-// drifted silently once already, which is why this row exists.
-//
-// Everything below is READ-ONLY over `data/turn_traces/*.jsonl`, bounded by
-// `TurnTraceWindowReader` (tailed day files, at most 7 of them), and runs ONLY
-// when Doctor runs. Nothing here is on a timer, a chat hook, or the cognition
-// runtime.
-//
-// The measurement window starts at THIS BUILD's launch (DoctorWindowFloor).
-// Grading a rolling history window meant grading pre-fix turns — arithmetically
-// true and operationally a lie about the build that is actually running.
-//
-// NORTHSTAR clause 2 is the spec for what it may say:
-//   * A day file that exists but will not read is a FAIL, not a zero.
-//   * A window with no v2 turns reads UNMEASURED, never "0 problems".
-//   * The window it used is NAMED in the row, every time.
-//   * The uncached per-turn block is named out loud, so nobody reads the hit
-//     rate as "the cache is broken" when it is working exactly as designed.
+// Stable system material precedes a transcript whose cursor moves only at 1.15/0.70 hysteresis; changing context follows. Anthropic breakpoints and OpenAI
+// routing use this layout, but provider limits still govern cache hits. Silent cache misses cost full input reads, so measure from bounded traces only during
+// explicit Doctor runs. Start at this build's launch: older turns cannot describe the running build. Failed reads fail; no eligible turns stay unmeasured.
+// Name the window and uncached block to avoid misleading hit rates.
 
 public struct PromptPrefixHealthCheck: DoctorCheck {
     public let id: String = "prompt_prefix_health"
@@ -41,25 +21,16 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     private let root: URL
     private let cache: DoctorScanCache
 
-    /// Hard ceiling on day FILES opened. The measurement window's floor is
-    /// this build's launch (see DoctorWindowFloor); this only bounds the read.
-    private let maximumDayFiles = 7
-    /// How many offending turnIds to name before summarizing.
     private let maximumNamedTurns = 5
-    /// Tolerance: one violation per session per day is noise (a model swap, a
-    /// provider-side eviction, a clock skew). More than that is drift.
+    /// Allow one violation per session/day for model swaps, provider eviction or clock skew; repeated violations signal drift.
     private let toleratedPerSessionDay = 1
-    /// Below this, an Anthropic lane is not really reusing its prefix.
     private let minimumAnthropicHitPercent = 50.0
-    /// The hit rate is a RATE, so it needs enough turns to mean anything. The
-    /// window opens at this build's launch, so right after a relaunch there
-    /// may be two turns; the percentage is still shown, just not graded.
-    /// (The (a)/(b)/(c) violations are deterministic per-turn evidence, not
-    /// rates, so a single one still counts against the tolerance.)
+    /// Grade rates only with enough turns; show small-sample percentages without a health verdict. Deterministic per-turn violations still count against
+    /// tolerance even with a small sample.
     private let minimumHitRateTurns = 10
     // Headroom above the provider's 1,024-token caching minimum.
     private let minimumCacheInputTokens = 2_048
-    /// The longest cache breakpoint TTL (the stable block's 1h).
+    /// Stable-block cache entries expire after the longest breakpoint TTL of one hour.
     private let cacheTTLSeconds: TimeInterval = 3_600
 
     public init(
@@ -72,9 +43,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
     // MARK: - Turn model
 
-    /// The FIRST llm.call of one turn — the only call whose cache read says
-    /// anything about cross-turn prefix reuse. Later calls in the same turn
-    /// (tool loops) reuse within the turn and would flatter the number.
+    /// Only the first llm.call measures cross-turn reuse; later tool-loop calls would flatter the number.
     private struct TurnObservation {
         var sessionId: String
         var turnId: String
@@ -122,10 +91,10 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     // MARK: - Measurement
 
     private func measure() async -> CheckResult {
-        var v2FirstCalls: [String: TurnObservation] = [:]   // turnId → first call
+        var v2FirstCalls: [String: TurnObservation] = [:]
         var callsByTurn: [String: [TurnObservation]] = [:]
-        var toolFingerprints: [String: String] = [:]        // turnId → tool schema sha
-        var providerTokens: [String: ProviderTokens] = [:]  // provider → v2 token sums
+        var toolFingerprints: [String: String] = [:]
+        var providerTokens: [String: ProviderTokens] = [:]
         var v2CallCount = 0
         var unshapedCallCount = 0
         var ignoredSurfaces = 0
@@ -135,88 +104,85 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         guard let window = DoctorWindowFloor.resolve(root: root, now: moment) else {
             return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
                 id: id, title: title, status: "unmeasured",
-                detail: "This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring this build.")
+                detail: """
+                    This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring \
+                    this build.
+                    """)
         }
-        let summary = await TurnTraceWindowReader.scan(
-            root: root,
-            now: moment,
-            days: window.dayFilesToRead(now: moment, maximum: maximumDayFiles),
-            floor: window.floor,
-            kinds: ["llm.call", "context.snapshot"]
-        ) { row in
-            let payload = row.payload.objectValue ?? [:]
-            switch row.kind {
-            case "context.snapshot":
-                if let sha = payload["toolSchemaFingerprintSHA256"]?.stringValue,
-                   !row.turnId.isEmpty {
-                    toolFingerprints[row.turnId] = sha
-                }
-            case "llm.call":
-                // The payload identifies the actual call; the envelope may
-                // still identify the chat turn hosting a helper request.
-                let surface = payload["surface"]?.stringValue ?? row.surface
-                guard surface == "chat" else {
-                    ignoredSurfaces += 1
-                    return
-                }
-                let provider = payload["provider"]?.stringValue ?? "unknown"
-                let additive = LLMUsage.persistedAdditiveInputCounters(payload["additiveInputCounters"], provider: provider)
-                let usage = LLMUsage(
-                    inputTokens: payload["inputTokens"]?.intValue,
-                    cacheReadInputTokens: payload["cacheReadInputTokens"]?.intValue,
-                    cacheCreationInputTokens: payload["cacheCreationInputTokens"]?.intValue,
-                    additiveInputCounters: additive
-                )
-                if let input = usage.logicalInputTokens(provider: provider),
-                   input < minimumCacheInputTokens {
-                    ignoredSmallCalls += 1
-                    return
-                }
-                let shape = payload["shapeVersion"]?.stringValue
-                switch shape {
-                case "v2Prefix":
-                    v2CallCount += 1
+        let summary: TurnTraceScanSummary
+        do {
+            summary = try await TurnTraceWindowReader.scan(
+                root: root,
+                now: moment,
+                floor: window.floor,
+                kinds: ["llm.call", "context.snapshot"]
+            ) { row in
+                let payload = row.payload.objectValue ?? [:]
+                switch row.kind {
+                case "context.snapshot":
+                    if let sha = payload["toolSchemaFingerprintSHA256"]?.stringValue,
+                       !row.turnId.isEmpty {
+                        toolFingerprints[row.turnId] = sha
+                    }
+                case "llm.call":
+                    // Payload names the actual call; the envelope may name a hosting helper's chat turn.
+                    let surface = payload["surface"]?.stringValue ?? row.surface
+                    guard surface == "chat" else {
+                        ignoredSurfaces += 1
+                        return
+                    }
+                    let provider = payload["provider"]?.stringValue ?? "unknown"
+                    let additive = LLMUsage.persistedAdditiveInputCounters(payload["additiveInputCounters"], provider: provider)
+                    let usage = LLMUsage(
+                        inputTokens: payload["inputTokens"]?.intValue,
+                        cacheReadInputTokens: payload["cacheReadInputTokens"]?.intValue,
+                        cacheCreationInputTokens: payload["cacheCreationInputTokens"]?.intValue,
+                        additiveInputCounters: additive
+                    )
+                    if let input = usage.logicalInputTokens(provider: provider),
+                       input < minimumCacheInputTokens {
+                        ignoredSmallCalls += 1
+                        return
+                    }
+                    let shape = payload["shapeVersion"]?.stringValue
+                    switch shape {
+                    case "v2Prefix":
+                        v2CallCount += 1
+                    default:
+                        // Automatic caching needs usage counters; it cannot supply Anthropic shape receipts.
+                        unshapedCallCount += 1
+                        if provider.lowercased().contains("anthropic") { return }
+                    }
+
+                    guard !row.turnId.isEmpty else { return }
+                    let observation = TurnObservation(
+                        sessionId: row.sessionId ?? "unknown",
+                        turnId: row.turnId,
+                        at: row.ts,
+                        cacheRead: payload["cacheReadInputTokens"]?.intValue,
+                        cacheCreation: payload["cacheCreationInputTokens"]?.intValue,
+                        historyContextWindow: payload["historyContextWindow"]?.stringValue,
+                        fingerprint: payload["prefixFingerprintSHA256"]?.stringValue,
+                        prefixDigests: Self.stringArray(payload["prefixMessageDigests"]),
+                        volatileChars: payload["volatileBlockChars"]?.intValue,
+                        toolFingerprint: payload["component.toolsSHA256"]?.stringValue,
+                        stableFingerprint: payload["component.stablePrefixSHA256"]?.stringValue,
+                        provider: provider,
+                        inputTokens: payload["inputTokens"]?.intValue ?? 0,
+                        additiveInputCounters: additive
+                    )
+                    callsByTurn[row.turnId, default: []].append(observation)
+                    if let existing = v2FirstCalls[row.turnId], existing.at <= observation.at { return }
+                    v2FirstCalls[row.turnId] = observation
                 default:
-                    // Automatic-cache lanes need usage counters, not Anthropic's shape receipt.
-                    unshapedCallCount += 1
-                    if provider.lowercased().contains("anthropic") { return }
+                    return
                 }
-
-                guard !row.turnId.isEmpty else { return }
-                let observation = TurnObservation(
-                    sessionId: row.sessionId ?? "unknown",
-                    turnId: row.turnId,
-                    at: row.ts,
-                    cacheRead: payload["cacheReadInputTokens"]?.intValue,
-                    cacheCreation: payload["cacheCreationInputTokens"]?.intValue,
-                    historyContextWindow: payload["historyContextWindow"]?.stringValue,
-                    fingerprint: payload["prefixFingerprintSHA256"]?.stringValue,
-                    prefixDigests: Self.stringArray(payload["prefixMessageDigests"]),
-                    volatileChars: payload["volatileBlockChars"]?.intValue,
-                    toolFingerprint: payload["component.toolsSHA256"]?.stringValue,
-                    stableFingerprint: payload["component.stablePrefixSHA256"]?.stringValue,
-                    provider: provider,
-                    inputTokens: payload["inputTokens"]?.intValue ?? 0,
-                    additiveInputCounters: additive
-                )
-                callsByTurn[row.turnId, default: []].append(observation)
-                if let existing = v2FirstCalls[row.turnId], existing.at <= observation.at { return }
-                v2FirstCalls[row.turnId] = observation
-            default:
-                return
             }
-        }
-
-        // Rule 3: an input we could not read is never a clean number.
-        if let day = summary.unreadableDays.first {
-            let file = root.appendingPathComponent("turn_traces/\(day).jsonl")
-            return CheckResult(source: file.path,
+        } catch {
+            return CheckResult(source: TurnTraceWindowReader.source,
                 id: id, title: title, status: "fail",
-                detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
-                    + " not be read (\(summary.unreadableDays.joined(separator: ", "))), so prefix-cache health is unmeasured \(window.describedAs).",
-                harm: "Prefix reuse problems cannot be diagnosed from the saved turns.",
-                human_action: ToolFailureError.fileRepairInstruction(file,
-                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
+                detail: "The experience record could not be read, so prefix-cache health is unmeasured \(window.describedAs): \(error).",
+                harm: "Prefix reuse problems cannot be diagnosed from the saved turns.")
         }
 
         let coverageDetail = summary.coverageDetail
@@ -227,31 +193,27 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             + " below \(minimumCacheInputTokens) input tokens (too small to judge cache reuse)"
 
         if summary.isEmptyFeed {
-            return CheckResult(source: "turn_traces/",
+            return CheckResult(source: TurnTraceWindowReader.source,
                 id: id, title: title, status: "unmeasured",
-                detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
-                    + " data/turn_traces, so prefix-cache health has not been observed; \(shapeLine).",
+                detail: "UNMEASURED \(window.describedAs) — no matching trace details were recorded,"
+                    + " so prefix-cache health has not been observed; \(shapeLine)\(coverageDetail).",
                 repair: nil
             )
         }
         guard !v2FirstCalls.isEmpty else {
-            return CheckResult(source: "turn_traces/",
-                // A bounded tail is not a failed measurement before the first eligible turn.
+            return CheckResult(source: TurnTraceWindowReader.source,
                 id: id, title: title, status: "unmeasured",
-                detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
-                    + " trace day(s) read and \(summary.matchedRows) row(s) in window, but not"
+                detail: "UNMEASURED \(window.describedAs) — \(summary.eventsRead) event(s) read in window, but not"
                     + " one eligible chat call used the current prompt format, so prefix reuse cannot be measured; \(shapeLine)\(coverageDetail).",
                 repair: nil
             )
         }
 
-        // Attach the tool-array fingerprint each turn actually shipped.
         for (turnId, sha) in toolFingerprints where v2FirstCalls[turnId]?.toolFingerprint == nil {
             v2FirstCalls[turnId]?.toolFingerprint = sha
         }
 
-        // Compare adjacent requests, not the first request with every later one:
-        // an unchanged miss after a load is not explained by that earlier load.
+        // Compare adjacent requests: an unchanged miss cannot be explained by an earlier tool load.
         var explainedMidTurnMisses = 0
         for calls in callsByTurn.values {
             let ordered = calls.sorted { $0.at < $1.at }
@@ -280,8 +242,11 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 let total = tokens.total.addingReportingOverflow(logical)
                 let read = (tokens.read ?? 0).addingReportingOverflow(call.cacheRead ?? 0)
                 guard !total.overflow, !read.overflow else {
-                    return CheckResult(source: "turn_traces/", id: id, title: title, status: "fail",
-                        detail: "UNMEASURED \(window.describedAs) — provider \(call.provider) token totals exceed the supported integer range at turn \(call.turnId), session \(call.sessionId), timestamp \(call.at). Inspect the retained llm.call usage receipts.")
+                    return CheckResult(source: TurnTraceWindowReader.source, id: id, title: title, status: "fail",
+                        detail: """
+                            UNMEASURED \(window.describedAs) — provider \(call.provider) token totals exceed the supported integer range at turn \
+                            \(call.turnId), session \(call.sessionId), timestamp \(call.at). Inspect the retained llm.call usage receipts.
+                            """)
                 }
                 tokens.total = total.partialValue
                 if call.cacheRead != nil { tokens.read = read.partialValue }
@@ -289,7 +254,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             }
         }
 
-        // Sessions, each in turn order.
         var sessions: [String: [TurnObservation]] = [:]
         for observation in v2FirstCalls.values {
             sessions[observation.provider + "|" + observation.sessionId, default: []].append(observation)
@@ -309,7 +273,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         // Cache expiry and changed stable blocks exempt rebuilt turns from drift.
         var exemptExpired = 0
         var exemptStableChange = 0
-        // (sessionId, calendar day) → violations, for the tolerance.
         var violationsPerSessionDay: [String: Int] = [:]
 
         var volatileSamples: [Int] = []
@@ -333,9 +296,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 }()
                 let bucket = "\(sessionId)|\(TurnTracePersistLane.dayString(from: turn.at))"
                 var violated = false
-                // The previous turn's LAST request is what this one could read.
+                // This turn can reuse the preceding turn's last request, not its first.
                 let previousLast = (callsByTurn[previous.turnId] ?? [previous]).max { $0.at < $1.at } ?? previous
-                // Rebuilt: read under the floor share of what the previous request cached. Creation alone is growth.
+                // Creation alone can be growth; rebuilding requires reading below the previous request's cached share.
                 let cachedBefore = (previousLast.cacheRead ?? 0) + (previousLast.cacheCreation ?? 0)
                 let rebuilt = turn.cacheRead.map { $0 == 0 || Double($0) * 100 < Double(cachedBefore) * minimumAnthropicHitPercent } ?? false
                 // The longest breakpoint TTL is 1h; past it nothing is left to read.
@@ -348,7 +311,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     continue
                 }
 
-                // (a) cross-turn cache read.
                 if recollectionChanged {
                     exemptSlid += 1
                 } else if toolsChanged {
@@ -360,10 +322,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     }
                 }
 
-                // (b) prefix stability. The invariant is that this turn's
-                // cacheable prefix EXTENDS the previous turn's: the previous
-                // digest list is a prefix of this one. Missing receipts cannot
-                // establish whether a prefix moved.
+                // The current cacheable prefix must extend the previous digest list; missing receipts cannot prove movement.
                 let prefixMoved: Bool? = {
                     if !turn.prefixDigests.isEmpty, !previous.prefixDigests.isEmpty {
                         return !turn.prefixDigests.starts(with: previous.prefixDigests)
@@ -373,9 +332,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 if prefixMoved == nil { unmeasuredPrefixPairs += 1 }
                 if prefixMoved == true, !recollectionChanged {
                     if toolsChanged {
-                        // A structured lane that legitimately reshaped its tool
-                        // array reshapes the prefix with it. Counted and named,
-                        // never folded into the failure.
+                        // Legitimate tool-array changes reshape the prefix; name them separately instead of counting failure.
                         driftExplainedByTools += 1
                     } else {
                         driftTurns.append(turn.turnId)
@@ -383,7 +340,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     }
                 }
 
-                // (c) a non-first turn rebuilding the prefix the previous request cached (cold reads are (a)'s).
                 if rebuilt, turn.cacheRead != 0, !recollectionChanged, !toolsChanged {
                     creationBreaks.append((turn.turnId, cachedBefore - (turn.cacheRead ?? 0)))
                     violated = true
@@ -397,7 +353,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             $0 + max(0, $1 - toleratedPerSessionDay)
         }
 
-        // (e) per-provider hit rate from admitted current observations.
         var providerLines: [String] = []
         var anthropicBelowFloor: [String] = []
         for (provider, tokens) in providerTokens.sorted(by: { $0.key < $1.key }) {
@@ -415,8 +370,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var parts: [String] = []
         parts.append(
             "\(window.describedAs): \(v2FirstCalls.count) eligible chat turn(s) across"
-                + " \(sessions.count) session(s) over \(summary.daysPresent.count) trace day(s)"
+                + " \(sessions.count) session(s) over \(summary.observedDays) day(s) with matching events"
         )
+        parts.append(summary.windowCovered)
         parts.append(
             coldTurns.isEmpty
                 ? "0 cold non-first Anthropic turns"
@@ -482,20 +438,26 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 "\(excess) violation(s) above the tolerance of \(toleratedPerSessionDay)"
                     + " per session per day"
             )
-            humanAction = "Correct NativeAgent's prompt assembly so the identity block remains a strict prefix of the stable block and one cache breakpoint sits at the end of the stable mass (v2Prefix)."
+            humanAction = """
+                Correct NativeAgent's prompt assembly so the identity block remains a strict prefix of the stable block and one cache \
+                breakpoint sits at the end of the stable mass (v2Prefix).
+                """
         } else if !anthropicBelowFloor.isEmpty {
             status = "warn"
             parts.append(
                 "Anthropic lane(s) below the \(Int(minimumAnthropicHitPercent))% floor:"
                     + " \(anthropicBelowFloor.joined(separator: ", "))"
             )
-            humanAction = "Review NativeAgent's prompt assembly using volatileBlockChars and the stable mass for the affected Anthropic sessions to correct repeated prefix rebuilds."
+            humanAction = """
+                Review NativeAgent's prompt assembly using volatileBlockChars and the stable mass for the affected Anthropic sessions to \
+                correct repeated prefix rebuilds.
+                """
         } else if !summary.coverageParts.isEmpty || unjudgedFirstCalls > 0 || unmeasuredPrefixPairs > 0 {
             // Incomplete coverage or missing metrics cannot certify health.
             status = "unmeasured"
         }
 
-        return CheckResult(source: "turn_traces/",
+        return CheckResult(source: TurnTraceWindowReader.source,
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
             harm: DoctorSafeRepairPolicy.isAdverse(status) ? "Repeated prompt processing uses extra provider time and tokens." : nil,
@@ -513,14 +475,12 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         return named + (overflow > 0 ? ", +\(overflow) more" : "")
     }
 
-    /// Historical trace formats remain identifiable after the switch retires.
     private func shapeMixLine(v2: Int, unshaped: Int) -> String {
         return "shape mix over the window: v2Prefix=\(v2) call(s),"
             + " no shapeVersion field=\(unshaped)"
     }
 
-    /// (c) volatile block size distribution. Percentiles, not a mean — one
-    /// enormous turn should not move the number the operator reads.
+    /// Use percentiles so one enormous turn cannot distort the displayed volatile-block size.
     private func volatileLine(_ samples: [Int]) -> String {
         guard !samples.isEmpty else {
             return "volatileBlockChars UNMEASURED (no v2 turn reported the field)"

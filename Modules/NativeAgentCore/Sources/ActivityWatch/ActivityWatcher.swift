@@ -4,7 +4,7 @@ import ApplicationServices
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `ActivityWatcher.swift` | `ActivityWatcher`: capture-thread lifetime, checked observation degradation/recovery and ordered store pump; bounded stop outcome exposes the retained settlement task; only the drained pump releases installation and pending restart ownership |
+// Blueprint: | `ActivityWatcher.swift` | `ActivityWatcher`: capture-thread lifecycle and ordered store pump; only the drained pump releases restart ownership |
 
 /// Metadata-only capture drives `ActivitySpanEngine` and forwards its commands
 /// verbatim. One dedicated thread owns AX; callbacks never await the store.
@@ -12,13 +12,11 @@ import NativeAgentShared
 public final class ActivityWatcher: @unchecked Sendable {
     // MARK: Capture boundaries
 
-    /// Five minutes is a capture boundary, not a UI preference: a smaller
-    /// value makes ordinary pauses look like app changes and a larger one
-    /// silently overstates every inactive session.
+    /// Five minutes avoids treating ordinary pauses as app changes without overstating long inactive sessions.
     public static let defaultIdleThreshold: TimeInterval = 300
     static let tickInterval: TimeInterval = 60
 
-    /// Frontmost loginwindow signals lock; plausible AX data cannot open a span.
+    /// Frontmost loginwindow means lock even if AX supplies plausible titles.
     public static let loginWindowBundleID = "com.apple.loginwindow"
 
     public enum LifecycleState: String, Sendable, Equatable {
@@ -38,7 +36,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     let lifecycleChanged: (@Sendable (LifecycleState) -> Void)?
     let observationIssue: (@Sendable (String) -> Void)?
 
-    // Cross-thread scalars. Guarded by `lock`.
+    // Guard cross-thread scalars with lock.
     let lock = NSLock()
     var _runLoop: CFRunLoop?
     private var _captureCommandSource: CFRunLoopSource?
@@ -48,38 +46,29 @@ public final class ActivityWatcher: @unchecked Sendable {
     var _stopRequested = false
     var _restartAfterStop = false
     var _lifecycleState: LifecycleState = .stopped
-    /// Mirror of `policy.captureEnabled`, readable off the capture thread. The
-    /// engine owns the authoritative copy; `startBounded()` must decide whether
-    /// to create the capture thread BEFORE there is one to ask.
+    /// Cache capture consent for startup because its authoritative engine thread does not exist yet.
     var _captureEnabled: Bool
     var _policyAvailable = true
-    /// The last policy actually pushed through `updatePolicy`. Compared against
-    /// incoming policy changes so queued updates use the latest authority.
+    /// Compare incoming changes with the last propagated policy so queued updates cannot restore stale consent.
     var _lastKnownPolicy: ActivityPolicy
-    /// Whether the observers/thread/pump are currently installed.
     var _installed = false
     var _generation: UInt64 = 0
 
     // Capture-thread-only. Never touched off the capture thread.
     var workspaceObserverTokens: [NSObjectProtocol] = []
     var presenceObserver: NSObjectProtocol?
-    /// The span state machine.
     var engine: ActivitySpanEngine
     var observer: AXObserver?
     var observerContext: ActivityObserverContext?
     var observedPID: pid_t?
     var tickTimer: CFRunLoopTimer?
-    /// The span was closed by the IDLE deadline and the tick timer was kept
-    /// running so ordinary interaction can reopen it. Cleared the moment a span
-    /// opens again, or when the timer stops for any other reason.
+    /// Keep the idle-closed timer alive so interaction can reopen capture without an app switch.
     var idleResumeWatch = false
     var screensAsleep = false
     var sessionInactive = false
-    /// Set by `com.apple.screenIsLocked` / cleared by `com.apple.screenIsUnlocked`.
     var screenLockedByNotification = false
-    /// Distributed-centre observer tokens (screen lock/unlock).
     var lockTokens: [NSObjectProtocol] = []
-    /// Monotonic anchor for `safeNow()`.
+    /// Use a monotonic anchor so wall-clock steps cannot inflate observation time.
     private var spanStartWall: Double = 0
     private var spanStartMono: Double = 0
 
@@ -122,9 +111,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         return _captureEnabled && _policyAvailable
     }
 
-    /// True only when the observers are actually installed and running — what
-    /// the menu-bar indicator renders. Distinct from `isCaptureEnabled`: an
-    /// enabled-but-stopped watcher shows no indicator.
+    /// Derive the indicator from installed, running observers; enabled consent alone does not prove capture.
     public var isCapturing: Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -136,9 +123,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         withLock { _lifecycleState }
     }
 
-    /// App-facing startup that never parks the main actor on an AX/run-loop
-    /// bootstrap. If the capture thread does not acknowledge readiness in time,
-    /// its partial installation is retired through the same stop/settlement owner.
+    /// Suspend startup off the main actor; an unready partial installation remains owned through settlement.
     @discardableResult
     public func startBounded(timeout: TimeInterval = 5) async -> Bool {
         let enabled = withLock { () -> Bool in
@@ -182,8 +167,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         return running
     }
 
-    /// The real installer. Private on purpose: every path into it goes through
-    /// the `_captureEnabled` check above, so there is exactly one gate.
+    /// Keep installation private so every entry passes the capture-consent gate.
     @discardableResult
     private func beginStartInstalled() -> UInt64? {
         lock.lock()
@@ -254,8 +238,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         threadExitToken = NotificationCenter.default.addObserver(
             forName: .NSThreadWillExit, object: thread, queue: nil
         ) { [self] _ in
-            // The capture body has returned: no source can enqueue another
-            // write. Closing its stream lets the owned pump retire everything.
+            // Close the stream only after capture exit so the pump drains every accepted write.
             withLock { continuation.finish() }
         }
         thread.start()
@@ -267,14 +250,11 @@ public final class ActivityWatcher: @unchecked Sendable {
     public struct StopRequest: Sendable {
         public enum Outcome: String, Sendable, Equatable { case settled, settlementPending }
         public let outcome: Outcome
-        /// The existing store pump, retained through real thread exit and drain.
-        /// This join has no deadline; a wedged capture thread keeps it pending.
+        /// Retain the pump through physical thread exit; a wedged thread leaves this join pending without a deadline.
         public let settlement: Task<Void, Never>?
     }
 
-    /// Bounded request: at most five seconds for handoff and five for settlement.
-    /// A pending result does not release capture ownership. The lifecycle owner
-    /// retains/joins `settlement` separately under its own outer wait bound.
+    /// Bound handoff and settlement waits at five seconds each; pending settlement retains capture ownership.
     public func requestStop() async -> StopRequest {
         let (generation, pump) = withLock {
             _stopRequested = _installed
@@ -292,9 +272,7 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     private func stopInstalled(generation: UInt64) async {
         let (proceed, announceStopping) = withLock { () -> (Bool, Bool) in
-            // Nothing installed → nothing to tear down. This is the ordinary
-            // case when capture was never enabled, and it must not block on a
-            // run-loop hop that will never be serviced (there is no run loop).
+            // Without an installed run loop, a shutdown hop can never be serviced and must not be awaited.
             guard _generation == generation, _installed, !_stopping else { return (false, false) }
             _stopping = true
             let announce = _lifecycleState != .stopping
@@ -304,8 +282,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         guard proceed else { return }
         if announceStopping { lifecycleChanged?(.stopping) }
 
-        // Bounded handoff: a wedged run loop must not hang shutdown forever, and
-        // the continuation must resume exactly once whichever path wins.
+        // Bound a wedged run-loop handoff and resume its continuation exactly once.
         let gate = ContinuationOnce<Void>()
         let watchdog = Task {
             do { try await Task.sleep(nanoseconds: 5_000_000_000) }
@@ -321,9 +298,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         await gate.wait()
         watchdog.cancel()
 
-        // Acknowledgment is not exit. The exit notification closes the stream;
-        // only the pump's actual drain releases installation/restart ownership.
-        // A timeout returns degraded; the retained pump remains the settlement handle.
+        // Acknowledgement is not exit: return degraded on timeout while the retained pump owns settlement and restart.
         guard await waitForThreadExit(generation: generation, timeout: 5) else {
             let timedOut = withLock { () -> Bool in
                 guard _generation == generation, _installed, _stopping else { return false }
@@ -335,10 +310,8 @@ public final class ActivityWatcher: @unchecked Sendable {
         }
     }
 
-    /// Called only by the pump after thread exit and its last accepted write.
+    /// Only the pump after thread exit and final write may release installation ownership.
     private func finishStoppedThread() {
-        // Back to the uninstalled state, so a later off→on policy flip can
-        // re-install cleanly instead of finding `_installed` stuck true.
         let restart = withLock { () -> Bool in
             if let threadExitToken { NotificationCenter.default.removeObserver(threadExitToken) }
             threadExitToken = nil
@@ -418,8 +391,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         withLock { _stopping || _stopRequested }
     }
 
-    /// Capture-thread observation availability is distinct from teardown. A
-    /// degraded observer keeps the existing timer/workspace sources for repair.
+    /// Degraded observation retains timer/workspace sources for repair rather than pretending teardown completed.
     func observationUnavailable(_ detail: String) {
         feed(.observationUnavailable)
         detachObserver()
@@ -472,17 +444,10 @@ public final class ActivityWatcher: @unchecked Sendable {
         _runLoop = CFRunLoopGetCurrent()
         lock.unlock()
 
-        // PROCESS-GLOBAL AX messaging timeout. Per AXUIElement.h, passing the
-        // system-wide element sets it for the whole process; setting it on any
-        // other element applies ONLY to that element. Without this the read
-        // that *fetches* the next element is itself unbounded.
+        // Set the system-wide AX timeout; element-local limits cannot bound reads that fetch the next element.
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25)
 
-        // A signalled source is both the keepalive and the cross-thread command
-        // channel. `CFRunLoopPerformBlock` can remain queued indefinitely when
-        // the only other source is AX (or AX is unavailable), leaving lifecycle
-        // state at `.running` while workspace/sleep events never reach the
-        // engine.
+        // Keep a signalled command source: AX alone may leave lifecycle blocks queued forever when no source runs.
         var commandSourceContext = CFRunLoopSourceContext(
             version: 0,
             info: Unmanaged.passUnretained(self).toOpaque(),
@@ -506,15 +471,13 @@ public final class ActivityWatcher: @unchecked Sendable {
         lock.unlock()
         CFRunLoopAddSource(CFRunLoopGetCurrent(), commandSource, .defaultMode)
 
-        // Installation and removal share the capture thread. A stop requested
-        // during startup cannot remove tokens while they are still being added.
+        // Serialize source removal with installation so startup-stop cannot remove tokens while they are added.
         installWorkspaceObservers()
         installLockNotificationObservers()
 
         let policy = withLock { _lastKnownPolicy }
         emit(engine.updatePolicy(policy, at: safeNow()))
-        // Startup reconciliation: spans a prior process left open are closed at
-        // their own last_seen_at and marked abandoned.
+        // Settle abandoned rows at their own last observation before capturing new activity.
         emit(engine.startupReconcile())
         seedFromFrontmostApplication()
         drainCaptureBlocks()
@@ -524,9 +487,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         started.signal()
         started.unlock()
 
-        // The command source keeps this loop alive even without AX. Returning
-        // without an owned stop means that spine is lost: degrade and retire,
-        // rather than re-entering a sourceless loop every 10 ms forever.
+        // An unowned run-loop exit loses the command spine; degrade and retire instead of spinning without sources.
         if !isStopping {
             CFRunLoopRunInMode(.defaultMode, .greatestFiniteMagnitude, false)
             if !isStopping { transitionLifecycle(to: .degraded) }
@@ -540,12 +501,12 @@ public final class ActivityWatcher: @unchecked Sendable {
         lock.unlock()
         // Finish accepted policy/purge work even when Stop skipped the loop.
         for block in blocks { block() }
-        // Close before exit is acknowledged and the pump drains.
+        // Close the span before acknowledging exit and draining the pump.
         feed(.terminate(at: safeNow()))
         removeWorkspaceObservers()
         detachObserver()
         stopTickTimer()
-        // NSThreadWillExit closes the pump after this body returns.
+        // Let thread-exit notification close the pump only after this body returns.
     }
 
     @discardableResult
@@ -554,8 +515,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     ) -> (accepted: Bool, drainingPump: Task<Void, Never>?) {
         lock.lock()
         guard _captureBlocks != nil else {
-            // Decide and capture the old pump together; a restart must not
-            // make a rejected request join the new, still-running pump.
+            // Capture rejection and the old pump together so a restart cannot make rejection join a new live pump.
             let pump = pumpTask
             lock.unlock()
             return (false, pump)
@@ -581,8 +541,7 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     // MARK: - Engine plumbing (capture thread only)
 
-    /// Push one event into the shared state machine and forward what it wants
-    /// written. Span writes and live exclusion purges share the same pump.
+    /// Forward events through one state machine and pump so span writes and exclusion purges stay ordered.
     func feed(_ event: ActivityInputEvent) {
         emit(engine.process(event))
     }

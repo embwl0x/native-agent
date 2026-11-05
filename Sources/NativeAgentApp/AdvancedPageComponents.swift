@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 // Blueprint: | `AdvancedPageComponents.swift` | Shared Advanced page sections and read status |
 
-/// A stable quiet slot for a page read; cached content stays mounted below it.
+/// Keep cached content mounted while the page read reports its status.
 struct PageReadStatus: View {
     let isReading: Bool
     var text: String?
@@ -22,21 +22,14 @@ struct PageReadStatus: View {
 }
 
 // MARK: - The Advanced page kit
-//
-// Page components use shell type and colour without painting another material.
 
-/// How a section's content sits under its eyebrow.
 enum AdvancedSectionCard {
-    /// ONE group card, each child a row with a hairline between.
     case rows
-    /// ONE card holding the content as a single stack of controls.
     case single
-    /// No card: the content brings its own cards.
     case bare
 }
 
-/// THE section block on every settings and Advanced page: the kit's eyebrow,
-/// the content under it in the shape `card` names, and an optional quiet line.
+/// Use shared section chrome so settings and Advanced pages keep the same hierarchy.
 struct AdvancedSection<Content: View>: View {
     let title: String
     var card: AdvancedSectionCard = .rows
@@ -59,7 +52,7 @@ struct AdvancedSection<Content: View>: View {
             if let note {
                 Text(note)
                     .font(ShellType.rowDetail)
-                    // Secondary, not tertiary: tertiary fails where the haze peaks.
+                    // Tertiary ink loses contrast at the haze peak.
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 2)
@@ -70,8 +63,7 @@ struct AdvancedSection<Content: View>: View {
     }
 }
 
-/// What would fill this, said in the page's own left column. No plate, no
-/// glyph, no tinted button — an empty state is a sentence, not a poster.
+/// Keep empty states in the page's text column so they do not compete with content.
 struct AdvancedEmptyState: View {
     let title: String
     var detail: String = ""
@@ -101,8 +93,7 @@ struct AdvancedEmptyState: View {
     }
 }
 
-/// A read that has not landed yet. One line, one small spinner — never a
-/// centred `ProgressView` claiming the whole pane.
+/// Keep loading inline so it does not claim the whole pane.
 struct AdvancedWaitingLine: View {
     let text: String
 
@@ -119,9 +110,7 @@ struct AdvancedWaitingLine: View {
     }
 }
 
-/// A status, said in the room's three state colours. `calm` when a thing is up,
-/// `trouble` when it is not, the teal ONLY where something waits on a person
-/// (house rule 1), and the quiet ink for everything that is merely a fact.
+/// Reserve teal for waiting on a person; calm, trouble and quiet ink distinguish the other states.
 enum AdvancedStatusWords {
     static func color(_ status: String?) -> Color {
         switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -139,7 +128,7 @@ enum AdvancedStatusWords {
         }
     }
 
-    /// No slugs in front of a person: `needs_setup` is "Needs setup".
+    /// Translate storage slugs into readable labels.
     static func label(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if let known = known[trimmed.lowercased()] { return known }
@@ -158,8 +147,7 @@ enum AdvancedStatusWords {
     ]
 }
 
-/// One status word. The badge it replaces was a tinted capsule; on the sheet a
-/// coloured word says the same thing without a second plate.
+/// Use a colored word to avoid stacking another plate on the sheet.
 struct AdvancedStatusWord: View {
     let status: String?
     var text: String?
@@ -172,7 +160,6 @@ struct AdvancedStatusWord: View {
     }
 }
 
-/// A fact beside a row — what the pill used to carry, without the pill.
 struct AdvancedMeta: View {
     let text: String
 
@@ -186,8 +173,7 @@ struct AdvancedMeta: View {
     }
 }
 
-/// A number and what it counts. Bare by construction: these sit INSIDE a card,
-/// and a card inside a card is the plate-on-plate the pass exists to remove.
+/// Keep metrics bare because they already sit inside a card.
 struct AdvancedStat: View {
     let title: String
     let value: String

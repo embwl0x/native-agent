@@ -4,12 +4,9 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `PairedPhoneStore.swift` | Paired-phone array mutations using PairedPhoneAuthority's one Phone schema; local backup/export/phone exclusions and Paired Phones privacy scope are declared here |
+// Blueprint: | `PairedPhoneStore.swift` | Canonical pairing-array mutations; local approval authority excluded from export and sync. |
 
-/// Main-actor serialization keeps removal and decision verification ordered.
-/// Owns paired_phones.json's Phone array, decoded by PairedPhoneAuthority.
-/// Local backup, export and phone sync exclude this Mac's pairing authority;
-/// PrivacyMap lists Paired Phones.
+/// Main-actor serialization orders removals and approval checks; Mac pairing authority stays out of backup, export and phone sync.
 @MainActor
 public final class PairedPhoneStore: ObservableObject {
     public typealias Phone = PairedPhoneAuthority.Phone
@@ -45,14 +42,14 @@ public final class PairedPhoneStore: ObservableObject {
         try PairedPhoneAuthority.read(at: url)
     }
 
-    /// Phones paired right now, read from disk (a setup card's done-check).
-    public func pairedCount() async -> Int? {
+    /// The owner file read fresh; nil when it can't be read, with `message` saying why.
+    public func checkedPhones() async -> [Phone]? {
         let url = url
-        let result = await storage.perform { Result { try Self.pairedCountChecked(at: url) } }
+        let result = await storage.perform { Result { try Self.read(at: url) } }
         switch result {
-        case .success(let count): return count
+        case .success(let rows): return rows
         case .failure(let error):
-            message = "The paired-phone count could not be read: \(error.localizedDescription). Restore access to paired_phones.json and try again."
+            message = "The paired phones could not be read: \(error.localizedDescription). Restore access to paired_phones.json and try again."
             return nil
         }
     }
@@ -100,8 +97,7 @@ public final class PairedPhoneStore: ObservableObject {
         }
     }
 
-    /// Called only after transport authentication. A key holder may request
-    /// pairing, but only the local Pair button can grant approval authority.
+    /// Authentication permits pairing requests, but only the local Pair button can grant approval authority.
     func authorize(_ action: InboxAction) async -> String? {
         let url = url
         do {
@@ -138,7 +134,7 @@ public final class PairedPhoneStore: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .unavailable: "I couldn’t read the paired phones. I haven’t accepted this decision."
-            case .notPaired: "This phone isn’t paired. Open Settings → Pair iPhone / iPad on this Mac to pair it."
+            case .notPaired: "This phone can’t approve yet. On this Mac, open Connectors → iPhone, match the phone’s code, and choose Pair."
             }
         }
     }

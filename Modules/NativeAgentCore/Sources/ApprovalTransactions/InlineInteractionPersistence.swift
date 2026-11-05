@@ -23,19 +23,12 @@ import ChatSessionWork
 import AgentConversations
 import ChatToolParsing
 import DreamREMCycle
-import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
 // Blueprint: | `InlineInteractionPersistence.swift` | Checked same-row persistence and originating envelopes |
 extension InlineInteractionResolver {
-    //
-    // Same-row replacement, keyed by the interaction id, under the
-    // transcript's own lock — the locked receipt replacement the approval
-    // executor uses. The row keeps its id, createdAt, source and envelope, and
-    // keeps `kind: inline_interaction` FOREVER: a settled card stays a compact
-    // card in scrollback ("GitHub connected"), it does not decay into a
-    // generic tool receipt.
+    // Replace under the transcript lock while preserving row identity and kind so settled cards remain compact in scrollback.
     nonisolated static func path(_ sessionID: String, _ dataRoot: URL) -> URL {
         dataRoot
             .appendingPathComponent("chat", isDirectory: true)
@@ -44,15 +37,7 @@ extension InlineInteractionResolver {
                 "\(NativeAgentChatSessionID.normalizedPathComponent(sessionID) ?? sessionID).jsonl"
             )
     }
-    /// The envelope of the turn that raised this card.
-    ///
-    /// Read from the SAME row the interaction lives on — `metadata.envelope` is
-    /// written there by the card's producer (`raise` or `appendToolMessage`)
-    /// with the same origin used to stamp its continuation, and
-    /// the resolver's own locked rewrite preserves it. So it is the originating
-    /// envelope by construction, with no second copy to drift.
-    ///
-    /// Provenance only: it says WHO and WHERE, and the gate still re-decides.
+    /// Read provenance from the interaction's own preserved row so no second envelope can drift; gates still decide authority.
     public static func originEnvelope(
         of id: String, sessionID: String, dataRoot: URL
     ) async throws -> TurnEnvelope? {
@@ -84,14 +69,7 @@ extension InlineInteractionResolver {
             throw ResolveError.staleRevision(expected: expected, actual: interaction.revision)
         }
     }
-    /// A POST-CLAIM continuation transition, written only over the exact
-    /// predecessor this caller is carrying on from.
-    ///
-    /// Everything after the claim used to write unconditionally, so a row that
-    /// had moved on disk — reclaimed by a relaunch, invalidated by Stop,
-    /// superseded by a newer identical ask — was overwritten by whatever this
-    /// process still held in memory, and a card could read `resumed` for a turn
-    /// nobody started. The claim itself is CAS'd; so is every step after it.
+    /// Compare-and-swap every post-claim step so stale process state cannot overwrite reclamation, Stop or supersession.
     static func persistTransition(
         _ interaction: InlineInteraction,
         from predecessor: InlineInteraction.Continuation.ResumeState,
@@ -107,15 +85,12 @@ extension InlineInteractionResolver {
             }
         )
     }
-    /// `ifRevision` is the revision the caller READ before deciding on this
-    /// transition; `expecting` is a predicate evaluated on the row as it exists
-    /// INSIDE the lock. Both make the write a compare-and-swap: the compare
-    /// happens against what is actually persisted, and a loser is told the
-    /// card moved instead of resurrecting what another writer settled.
+    /// Compare revision and predecessor under the write lock so a losing writer cannot resurrect settled work.
     static func persist(
         _ interaction: InlineInteraction,
         sessionID: String,
         ifRevision expected: Int? = nil,
+        decision: Owed.Phase? = nil,
         dataRoot: URL,
         expecting: (@Sendable (InlineInteraction) -> Bool)? = nil
     ) async throws {
@@ -124,6 +99,10 @@ extension InlineInteractionResolver {
                 try await SwiftNativeChatOrchestrationClient.persistInlineInteraction(
                     interaction, at: path(sessionID, dataRoot), ifRevision: expected,
                     expecting: expecting)
+                // The saved answer settles before publication or continuation, even if delivery never filed its experience.
+                if let decision {
+                    await recordDecision(interaction, phase: decision, sessionID: sessionID, dataRoot: dataRoot).value
+                }
                 await ApprovalChatCards.publishInteractionChange(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot)
                 // Notify the open conversation after transcript and mirror publication.
                 NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionID)
@@ -131,6 +110,22 @@ extension InlineInteractionResolver {
                 return Result<Void, Error>.success(())
             } catch { return .failure(error) }
         }.get()
+    }
+    @discardableResult
+    static func recordDecision(_ interaction: InlineInteraction, phase: Owed.Phase, sessionID: String,
+                               dataRoot: URL, born: Bool = true) -> Task<Void, Never> {
+        Owed.record(dataRoot, id: "interaction:" + interaction.id, kind: .decision, key: "decide", to: "person",
+            phase: phase, evidence: [.init(source: "chat/messages/" + sessionID, id: interaction.id)], born: born)
+    }
+    /// Reconcile an existing debt from the saved decision alone, never from a live projection or a missing card.
+    static func reconcileDecision(_ saved: InlineInteraction, sessionID: String, dataRoot: URL) {
+        let phase: Owed.Phase
+        switch saved.state {
+        case .settled: phase = .accepted
+        case .declined, .superseded: phase = .letGo(.cancelled)
+        default: return
+        }
+        recordDecision(saved, phase: phase, sessionID: sessionID, dataRoot: dataRoot, born: false)
     }
     public nonisolated static func receiptEnvelope(_ interaction: InlineInteraction) -> JSONValue {
         SwiftNativeChatOrchestrationClient.inlineInteractionReceiptEnvelope(interaction)

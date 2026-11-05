@@ -1,20 +1,21 @@
 import Foundation
+import Experiences
 import AgentWorkspace
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `EngineCarriedHabits.swift` | Resident-wake terminals and persisted dispatch closure join in either order; complete top-level dispatch evidence records one trial per turn for the carried work identity's first authored handling (else ordered action ids) and llm.call count, including private keeps; all trace reads stay off the turn path |
+// Blueprint: | `EngineCarriedHabits.swift` | Join terminal and dispatch evidence off-turn to record carried-work trials |
 
 enum EngineCarriedHabits {
     static func record(turn: String, dataRoot: URL) async {
-        // Terminal persistence can overtake fire-and-forget trace ingress.
-        // This background observer waits for those accepted rows, never the turn.
+        // Terminal persistence can overtake trace ingress; this background observer waits for accepted rows without holding the turn.
         await TurnTraceBus.shared.drainForProcessExit()
         do {
-            let snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot, rowLimit: 20_000)
-                .read(history: true, holding: [turn])
-            let events = snapshot.events.filter { $0.turnId == turn }
-            guard snapshot.malformedRows == 0, !snapshot.trailingPartialLine,
+            let read = try await TurnTracePersistLane(dataRootOverride: dataRoot).events(.init(subjects: [turn], kinds: [
+                "turn.accepted", "turn.terminal", "turn.cancelled", "turn.failed", "work.identified", "tool.dispatch", "tool.dispatch.closed", "llm.call",
+            ]))
+            let events = read.events
+            guard read.isClean,
                   events.contains(where: { $0.kind == "turn.accepted" && $0.sessionId == ResidentWake.session }),
                   let terminal = events.last(where: { TurnTraceEvent.isTerminalKind($0.kind) }),
                   let work = events.first(where: { $0.kind == "work.identified" })?.payload.objectValue?["workIdentity"]?.stringValue,
@@ -26,8 +27,7 @@ enum EngineCarriedHabits {
         } catch { nativeLog("carried turn %@ could not be read: %@", turn, error.localizedDescription) }
     }
 
-    /// Read the dispatch owner's coverage and receipts directly. This evidence
-    /// is independent of the retired practice compiler's candidates and tapes.
+    /// Read coverage and receipts directly from their dispatch owner.
     private static func handling(_ events: [TurnTraceEvent]) -> [String]? {
         let dispatches = events.filter { $0.kind == "tool.dispatch" }
         let closed = events.filter { $0.kind == "tool.dispatch.closed" }

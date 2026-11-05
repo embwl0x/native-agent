@@ -4,7 +4,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `ToolReceipts.swift` | ChatShellToolSummary frozen tool facts, status classification and exact persona-write receipts; TranscriptsFacade prepares shared fold headlines and up to four expanded details |
+// Blueprint: | `ToolReceipts.swift` | Frozen tool facts, shared status and exact successful persona-write receipts |
 
 @MainActor
 public extension TranscriptsFacade {
@@ -34,7 +34,7 @@ public enum ChatShellToolSummary {
 
     public typealias Status = ChatToolOutcome.FoldStatus
 
-    /// The same metadata precedence as the expanded tool receipt.
+    /// Share metadata precedence with expanded receipts.
     public static func status(
         kind: String?, ok: Bool?, resultSummary: String?, resultStatus: String? = nil,
         interactionState: String? = nil
@@ -49,8 +49,7 @@ public enum ChatShellToolSummary {
             "needsYou":.int(Int64(max(0,min(needsYou,count-failed))))])
     }
 
-    /// The file a tool call touched, when its input names one. Returns the last
-    /// path component only — the room is not a place for absolute paths.
+    /// Show only the filename; absolute paths do not belong in conversation copy.
     public static func touchedFile(inputJSON: String?) -> String? {
         guard let inputJSON,
               let data = inputJSON.data(using: .utf8),
@@ -65,7 +64,7 @@ public enum ChatShellToolSummary {
         return nil
     }
 
-    /// Frozen tool facts and recorded outcome for the authored presentation face.
+    /// Freeze tool facts and recorded outcome before authored presentation.
     public static func detailInput(toolName: String?, inputJSON: String?, status: Status = .plain) -> JSONValue {
         let call=toolName.map { ToolNameAliases.shown($0,inputJSON:inputJSON) }
         let name=(call?.name ?? toolName ?? "").trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
@@ -85,19 +84,19 @@ public enum ChatShellToolSummary {
             "possessive":.string(AgentVoice.live.possessive)])
     }
 
-    /// Show the exact first line of a successful persona write under its answer.
-    /// Failed writes keep their tool row; unanswered writes keep their card.
+    /// Quote only successful persona writes; failures retain tool rows and unanswered writes retain cards.
     public static func personaReceipt(
         toolName: String?, inputJSON: String?, resultSummary: String?, requiredTitle: String
     ) -> (outcome: String, meta: String)? {
         guard toolName == "persona_append_section" || toolName == "app",
-              let resultSummary, let result = try? JSONValue.parse(Data(resultSummary.utf8)),
-              (ChatToolOutcome.recordedResultClass(result) ?? ChatToolOutcome.exactResultClass(result)) == .succeeded,
-              let path = ChatTranscriptEvidenceRendering.receiptField("path", in: result)?.stringValue, !path.isEmpty else { return nil }
+              let resultSummary, let result = try? JSONValue.parse(Data(resultSummary.utf8)) else { return nil }
+        let reply = ToolResult(result)
+        guard (ChatToolOutcome.recordedResultClass(reply.payload) ?? reply.outcome) == .succeeded,
+              let path = ChatTranscriptEvidenceRendering.receiptField("path", in: reply.payload)?.stringValue, !path.isEmpty else { return nil }
         guard let inputJSON,
               let data = inputJSON.data(using: .utf8),
               let call = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              // Through the app door the write is persona.append, its input under args.
+              // The app door nests `persona.append` input under args.
               let object = toolName == "app"
                 ? (call["action"] as? String == "persona.append" ? call["args"] as? [String: Any] : nil) : call,
               let title = (object["title"] as? String)?
@@ -106,15 +105,14 @@ public enum ChatShellToolSummary {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !title.isEmpty, !content.isEmpty
         else { return nil }
-        // Match the first conversation's own write on its exact progression title.
+        // Match the conversation’s exact progression-title write.
         guard title == requiredTitle else { return nil }
-        // Quote the written content's first line verbatim.
+        // Quote written words verbatim.
         let line = content.split(separator: "\n", omittingEmptySubsequences: true)
             .first.map(String.init) ?? content
         return (line, "Written to \((path as NSString).lastPathComponent) · \(title)")
     }
 
-    /// The trailer under a clipped detail list, or nil when nothing is hidden.
     public static func overflowLine(total: Int, shown: Int) -> String? {
         guard total > shown else { return nil }
         return "and \(total - shown) more"

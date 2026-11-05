@@ -8,18 +8,21 @@ import ToolRegistry
 import TrustCenter
 import Senses
 import ToolExecution
+import TurnTrace
 import NativeAgentShared
 import AuthoredCapabilities
-// Blueprint: | `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding` enum; `pending`, `glance`, read-only elsewhere gathering and late disclosure/consumption bind owner ports; workspace tool port derives bounded built/recent ability names from canonical tool, skill and sense availability |
+// Blueprint: | `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding`, `pending`, `glance`: Bind owner ports without copying authority. |
 
 package enum ChatWorkspaceBinding {
-    package static let ports = AgentWorkspacePorts.Binding(conversations: Conversations(), tools: Tools())
+    package static func operation(turn: Turn?, invocation: ChatToolInvocation) -> WorkspaceOperation {
+        WorkspaceOperation(ports: .init(conversations: Conversations(turn: turn),
+            tools: Tools(invocation: invocation.partInvocation(turn: turn, surface: "workspace"))), turn: turn,
+            insideDispatch: invocation.insideWorkspace)
+    }
 
     /// Read for a turn's facts: announced only at delivery (`announceDelivered`).
-    package static func pending(dataRoot: URL?, scope: String?) async -> JSONValue? {
-        await AgentWorkspacePorts.$binding.withValue(ports) {
-            await AgentWorkspaceArrivals.pending(dataRoot: dataRoot, scope: scope, announce: false)
-        }
+    package static func pending(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL?, scope: String?) async -> JSONValue? {
+        await AgentWorkspaceArrivals.pending(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, announce: false)
     }
 
     package static func announceDelivered(dataRoot: URL, scope: String, in input: String) async {
@@ -30,27 +33,37 @@ package enum ChatWorkspaceBinding {
         await AgentWorkspaceNavigation.shared.currentPlace(dataRoot: dataRoot, scope: scope)
     }
 
-    package static func glance(dataRoot: URL, scope: String, turn: Date?, message: String) async -> PreparedWorkspaceGlance {
-        await AgentWorkspacePorts.$binding.withValue(ports) {
-            await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn, message: message)
-        }
+    package static func glance(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, at: Date?,
+        message: String) async -> PreparedWorkspaceGlance {
+        await AgentScreen.glance(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, turn: at, message: message)
     }
 
-    package static func readElsewhere(dataRoot: URL, scope: String, turn: Date) -> HerScreen.ElsewhereReading? {
-        AgentWorkspacePorts.$binding.withValue(ports) {
-            HerScreen.readElsewhere(dataRoot: dataRoot, scope: scope, turn: turn)
-        }
+    package static func readElsewhere(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, at: Date,
+                                      live: [String]) async -> AgentScreen.ElsewhereReading? {
+        await AgentScreen.readElsewhere(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, turn: at,
+                                live: live, since: nil)
     }
 
-    package static func elsewhere(dataRoot: URL, scope: String, surface: String, peer: Bool, turn: Date?,
-                                  reading: HerScreen.ElsewhereReading?) async -> String? {
-        await AgentWorkspacePorts.$binding.withValue(ports) {
-            await HerScreen.elsewhere(dataRoot: dataRoot, scope: scope, surface: surface, peer: peer,
-                                      turn: turn, reading: reading)
+    package static func breath(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, peer: Bool, since: Date?,
+                               shown: Set<String>, at: Date) async -> (text: String?, read: Bool, acts: [String]) {
+        let reading = await AgentScreen.breath(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, peer: peer,
+                         since: since, shown: shown, now: at)
+        if let text = reading.text {
+            TurnTraceBus.fireFromContext(kind: "context.breath", sessionId: scope,
+                payload: .object(["lines": .array(text.components(separatedBy: "\n").map(JSONValue.string)),
+                                  "read": .bool(reading.read)]), turn: turn)
         }
+        return reading
+    }
+
+    package static func elsewhere(turn: Turn, invocation: ChatToolInvocation, dataRoot: URL, scope: String, surface: String, peer: Bool, at: Date?,
+                                  reading: AgentScreen.ElsewhereReading?) async -> String? {
+        await AgentScreen.elsewhere(workspace: operation(turn: turn, invocation: invocation), dataRoot: dataRoot, scope: scope, surface: surface, peer: peer,
+                                  turn: at, reading: reading)
     }
 
     private struct Conversations: AgentWorkspaceConversationPort {
+        let turn: Turn?
         func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth] {
             try AgentContactHealth.read(dataRoot: dataRoot)
         }
@@ -71,13 +84,15 @@ package enum ChatWorkspaceBinding {
             try GrokRequestStore(dataRoot: dataRoot).answeredRequests()
         }
         func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue {
-            // The read consumed each message it shows under its own row's stamp.
-            await HumanConversationReader.open(sessionID: sessionID, limit: limit, dataRoot: dataRoot)
+            guard let turn else {
+                throw ToolFailureError("Opening a conversation requires the originating turn.", effects: .none)
+            }
+            // Consume only shown messages under their owner's stamp.
+            return await HumanConversationReader.open(turn: turn, sessionID: sessionID, limit: limit, dataRoot: dataRoot)
         }
         func presentation(_ row: AgentConversationRecord) -> JSONValue {
             AgentConversationView.conversationPresentation(row)
         }
-        func liveHandOff(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.liveHandOff(row) }
         func unsettledAttention(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.unsettledAttention(row) }
         func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL) throws {
             guard peer.hasPrefix("peer:") else { return }
@@ -86,7 +101,7 @@ package enum ChatWorkspaceBinding {
                 throw AgentConversationStore.Failure(message: "Contact \(peer) is unavailable; reopen its room from the current contacts.")
             }
             guard contact.transport == .grokBot else { return }
-            // Its hand-over goes to the chat that asked; seen in another, it still goes.
+            // A hand-over belongs to the requesting chat even when viewed elsewhere.
             for (answer, words) in answers {
                 guard try store.read(answer, peer: id).conversationID == scope else { continue }
                 try store.shown(answer, peer: id, by: "the room") { $0 == words }
@@ -95,17 +110,18 @@ package enum ChatWorkspaceBinding {
     }
 
     private struct Tools: AgentWorkspaceToolPort {
+        let invocation: Parts.Invocation
         func readoutFace(_ input: JSONValue, dataRoot: URL) async -> PartCallResult<PartFace> {
-            await WorkspaceFaces.read(input, dataRoot: dataRoot)
+            await WorkspaceFaces.read(input, dataRoot: dataRoot, invocation: invocation)
         }
         func readout(_ input: JSONValue, dataRoot: URL) async throws -> JSONValue {
-            let result: PartCallResult<JSONValue> = await Parts(root: dataRoot).call(id: "workspace-readout", input: input)
+            let result: PartCallResult<JSONValue> = await Parts(root: dataRoot).call(id: "workspace-readout", input: input, invocation: invocation)
             switch result {
             case .success(let value): return value
             case .failure(let error): throw error
             }
         }
-        func builtAbilities(dataRoot: URL, now: Date) async -> String {
+        func builtAbilities(dataRoot: URL, now: Date) async throws -> String {
             do {
                 async let senses = FileSenseRegistry(dataRoot: dataRoot).all()
                 let tools = try await SwiftNativeToolRegistry(root: dataRoot).listTools()
@@ -142,53 +158,39 @@ package enum ChatWorkspaceBinding {
                 return prefix + (shown.isEmpty && more == 0 ? "none" : shown.joined(separator: ", "))
                     + (more > 0 ? (shown.isEmpty ? "" : ", ") + "+\(more) more" : "") + suffix
             } catch {
-                return "Your built abilities are unavailable: " + String(error.localizedDescription.prefix(150))
+                throw error
             }
         }
 
-        func usableAgentLanes(dataRoot: URL) throws -> Set<String> {
-            try Set(["codex", "claude", "omp"].filter {
-                try SwiftToolDispatcher.builtInAgentLaneUsable($0, dataRoot: dataRoot,
-                    configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot))
-            })
-        }
         func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String> {
             SwiftToolDispatcher.modelVisibleCatalogToolNames(names)
         }
         func appAction(_ tool: String) -> String? { ToolNameAliases.appAction(tool) }
-        func macIntegrationGate(_ name: String) -> (integration: String, mode: MacIntegrationPermissionMode)? {
-            MacIntegrationGates.byTool[ToolNameAliases.canonical(name)]
+        func macIntegrationAccess(_ name: String) -> MacIntegrationAccess? {
+            SwiftToolDispatcher.macIntegrationAccess(forTool: name)
         }
-        func markConsumed(peer: String) { PeerDataTaint.markConsumed(peer: peer) }
         func withWebScheme(_ value: String) -> String { SwiftToolDispatcher.withWebScheme(value) }
+        func markConsumed(peer: String) { PeerDataTaint.markConsumed(peer: peer) }
         func builderSourceRepoRoot(dataRoot: URL) -> URL? { SwiftToolDispatcher.builderSourceRepoRoot(dataRoot: dataRoot) }
         var listedPeerState: String { AgentPeerContactState.listed.rawValue }
     }
 }
 
-/// The helper room and its native preview share one root-scoped pure face.
-/// Source equality controls the source epoch; L0 owns publication and version
-/// invalidation. No world state, observations or action authority live here.
+/// Each helper-room reading receives its host explicitly. The face owner handles
+/// publication and version invalidation without retaining another call's host.
 @MainActor private final class WorkspaceFaces {
-    private static var roots: [URL: WorkspaceFaces] = [:]
     private let faces: PartFaces
-    private var input: JSONValue?
-    private var epoch: UInt64 = 0
 
-    private init(dataRoot: URL, host: (any OwnedProgramToolHost)?) {
+    private init(dataRoot: URL, invocation: Parts.Invocation) {
         faces = PartFaces(dataRoot: dataRoot) { id, input, version in
-            return await OwnedProgramInvocation.$host.withValue(host) {
-                await Parts(root: dataRoot).face(id: id, input: input, version: version)
-            }
+            await Parts(root: dataRoot).face(id: id, input: input, version: version, invocation: invocation)
         }
     }
 
-    static func read(_ input: JSONValue, dataRoot: URL) async -> PartCallResult<PartFace> {
+    static func read(_ input: JSONValue, dataRoot: URL, invocation: Parts.Invocation) async -> PartCallResult<PartFace> {
         let root = dataRoot.standardizedFileURL
-        if roots[root] == nil { roots[root] = WorkspaceFaces(dataRoot: root, host: OwnedProgramInvocation.host) }
-        let owner = roots[root]!
-        if owner.input != input { owner.input = input; owner.epoch += 1 }
-        let snapshot = await owner.faces.sourceChanged(id: "workspace-readout", epoch: owner.epoch, input: input)
+        let owner = WorkspaceFaces(dataRoot: root, invocation: invocation)
+        let snapshot = await owner.faces.sourceChanged(id: "workspace-readout", epoch: 0, input: input)
         if snapshot.status == .ready, let face = snapshot.face { return .success(face) }
         return .failure(snapshot.error ?? .init(code: snapshot.status.rawValue, message: "Workspace face " + snapshot.status.rawValue))
     }

@@ -4,72 +4,32 @@ import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import Darwin
-// Blueprint: | `DelegationStatusProjection.swift` | Delegation source inventory and read snapshots; retained facts preserve originating DataRootLife and unknown delivery; lifecycle decode and transcript-origin failures name item gaps in partial source coverage while readable siblings proceed |
+// Blueprint: | `DelegationStatusProjection.swift` | Retained reply deliveries; an unreadable record is its own gap and readable siblings proceed |
+// Retain originating DataRootLife; lifecycle and transcript-origin gaps affect only their unreadable item.
 
 public struct DelegationStatusProjector: Sendable {
-    /// Default: `~/.config/claude-bridge/wake-jobs`.
-    public var claudeJobsDirectory: URL
-    /// Default: `~/.config/codex-nativeagent-bridge/reply-jobs`.
-    public var codexJobsDirectory: URL
-    /// Default: `~/.config/codex-nativeagent-bridge/reply-deliveries.jsonl`. This is the terminal half of the Codex lifecycle after successful jobs leave `reply-jobs/`.
-    public var codexDeliveriesFile: URL
-    /// Default: `~/.config/omp-bridge/wake-jobs`.
-    public var ompJobsDirectory: URL
+    private let configRoot: URL
     private let dataRoot: URL
 
-    public static let completionTextHeadLimit = 200
     public static let defaultLimit = 20
     public static let maxLimit = 100
 
-    /// Every source read by the projection, including existing jobs updated in place.
+    private var directories: [URL] { CodexCompletionReadout.delegationDirectories(configRoot: configRoot, dataRoot: dataRoot) }
+
+    /// Every source read by the projection, including existing records updated in place.
     package var watchedPaths: [URL] {
-        let directories = [claudeJobsDirectory, codexJobsDirectory, codexJobsDirectory.appendingPathComponent("undelivered"), ompJobsDirectory]
-            + CodexCompletionReadout.delegationDirectories(
-                configRoot: claudeJobsDirectory.deletingLastPathComponent().deletingLastPathComponent(), dataRoot: dataRoot)
-        return directories.flatMap { directory in
+        directories.flatMap { directory in
             [directory] + ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []).sorted { $0.path < $1.path }
-        } + [codexDeliveriesFile, codexDeliveriesFile.deletingLastPathComponent().appendingPathComponent("codex-inbox.jsonl")]
-            + ["claude-inbox.jsonl", "claude-replies.jsonl"].map { claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent($0) }
+        }
     }
 
-    /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`: the stand-in for `~/.config`, which is what makes the tests hermetic.
+    /// Resolve the lifecycle stores under the dispatcher's same config root.
     public init(configRoot: URL? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
-        let root = configRoot ?? InstallPaths.current.bridgeConfigRoot
-        self.claudeJobsDirectory = root
-            .appendingPathComponent("claude-bridge", isDirectory: true)
-            .appendingPathComponent("wake-jobs", isDirectory: true)
-        self.codexJobsDirectory = root
-            .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
-            .appendingPathComponent("reply-jobs", isDirectory: true)
-        self.codexDeliveriesFile = root
-            .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
-            .appendingPathComponent("reply-deliveries.jsonl")
-        self.ompJobsDirectory = root
-            .appendingPathComponent("omp-bridge", isDirectory: true)
-            .appendingPathComponent("wake-jobs", isDirectory: true)
+        self.configRoot = configRoot ?? InstallPaths.current.bridgeConfigRoot
     }
 
-    public init(
-        claudeJobsDirectory: URL,
-        codexJobsDirectory: URL,
-        codexDeliveriesFile: URL? = nil,
-        ompJobsDirectory: URL? = nil,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) {
-        self.dataRoot = dataRoot
-        self.claudeJobsDirectory = claudeJobsDirectory
-        self.codexJobsDirectory = codexJobsDirectory
-        self.codexDeliveriesFile = codexDeliveriesFile ?? codexJobsDirectory
-            .deletingLastPathComponent()
-            .appendingPathComponent("reply-deliveries.jsonl")
-        self.ompJobsDirectory = ompJobsDirectory ?? codexJobsDirectory
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true)
-    }
-
-    /// Read all supported stores and return the newest `limit` jobs, newest first. Unreadable/absent directories contribute zero rows rather than failing the whole call — a machine with only one bridge configured still gets a useful
-    /// answer.
+    /// Read stores independently so an absent or unreadable store cannot hide readable siblings.
     public func recentJobs(now: Date, limit: Int = DelegationStatusProjector.defaultLimit) -> [DelegationReadout] {
         let bounded = max(1, min(limit, Self.maxLimit))
         return readSnapshot(now: now, limit: bounded).jobs
@@ -88,8 +48,7 @@ public struct DelegationStatusProjector: Sendable {
         )
     }
 
-    /// Complete ordered projection for reconciliation owners. This is deliberately separate from `recentJobs`: the latter is a model-visible display budget, while a durable outcome cursor must never skip an older record merely because more
-    /// than 100 newer jobs arrived in one burst.
+    /// Reconciliation needs complete history; the model-visible page limit must not skip older unsettled records.
     public func allJobs(now: Date) -> [DelegationReadout] {
         readSnapshot(now: now).jobs
     }
@@ -105,134 +64,18 @@ public struct DelegationStatusProjector: Sendable {
         )
     }
 
-    /// Read each source once. Availability describes this same observation, while the historical array APIs still return every readable job.
+    /// Read jobs and availability together so each verdict describes the same observation.
     package func readSnapshot(now: Date, limit: Int? = nil, offset: Int = 0,
-                      agent: String? = nil, messageID: String? = nil, jobID: String? = nil) -> DelegationStatusReadSnapshot {
+                      agent: String? = nil, jobID: String? = nil) -> DelegationStatusReadSnapshot {
         let life: String
         do { life = try DataRootLife.current(in: dataRoot) }
         catch { return .init(jobs: [], sources: [.init(source: "life-id", agent: "self", status: "unavailable")], matchedCount: 0) }
-        func inLife(_ original: DelegationReadout, _ job: [String: JSONValue]) -> DelegationReadout {
-            guard DataRootLife.life(of: Self.string(job, "lifeID")) != life, original.deliveryOutcome != "delivered" else { return original }
-            var row = original
-            row.state = "stopped"; row.status = "stopped"; row.deliveryOutcome = "stopped"
-            row.deliveryReason = DataRootLife.stoppedReason; row.stalled = false; row.stallBasis = .terminal; row.stallDeadline = nil
-            return row
-        }
         var rows: [DelegationReadout] = []
         var sources: [DelegationSourceAvailability] = []
-        let claude = Self.readDirectory(claudeJobsDirectory, source: "claude_jobs", agent: "claude")
-        sources.append(claude.availability)
-        for (url, object) in claude.objects {
-            if let row = Self.projectClaude(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
-            else {
-                sources[sources.count - 1].status = "partial"
-                sources[sources.count - 1].malformedRecords += 1
-                sources[sources.count - 1].detail = "A Claude job has no messageId: " + url.path + ". Repair it from the writer's retained identity evidence."
-            }
-        }
-        // A live-session reply has a linked receipt, but no wake job. Exact reads must include that receipt without inventing a runner.
-        if let messageID = messageID ?? jobID, agent == nil || agent == "claude",
-           !rows.contains(where: { $0.acceptedMessageIDs.contains(messageID) }) { do {
-            if let reply = try liveReplies([messageID])[messageID] {
-                let stamp = reply.createdAt
-                var row = DelegationReadout(id: messageID, acceptedMessageIDs: [messageID],
-                    source: "claude", agent: "claude", topicSlug: nil,
-                    deskHandle: nil, state: "replied", status: "replied", runStatus: nil, createdAt: nil,
-                    claimedAt: nil, startedAt: nil, lastLiveness: nil, completedAt: nil, elapsedSeconds: nil,
-                    stalled: false, stallBasis: .terminal, deliveryLost: nil, deliveryOutcome: nil,
-                    completionTextHead: nil, recordKind: "linked_reply")
-                Self.retainReply(reply.text, truncated: reply.truncated, in: &row)
-                row.recencyKey = Self.date(stamp)
-                rows.append(row)
-                sources.append(DelegationSourceAvailability(source: "claude_replies", agent: "claude", readableRecords: 1))
-            }
-        } catch {
-            var unavailable = DelegationSourceAvailability(source: "claude_replies", agent: "claude")
-            unavailable.status = "unavailable"; unavailable.unreadableFiles = 1; unavailable.detail = error.localizedDescription
-            sources.append(unavailable)
-        } }
-        var codexRows: [String: DelegationReadout] = [:]
-        for (directory, source, undelivered) in [
-            (codexJobsDirectory, "codex_jobs", false),
-            (codexJobsDirectory.appendingPathComponent("undelivered", isDirectory: true), "codex_undelivered", true),
-        ] {
-            let read = Self.readDirectory(directory, source: source, agent: "codex")
-            sources.append(read.availability)
-            for (url, object) in read.objects {
-                if let row = Self.projectCodex(url: url, undelivered: undelivered, now: now, object: object) {
-                    codexRows[row.id] = inLife(row, object)
-                } else {
-                    sources[sources.count - 1].status = "partial"
-                    sources[sources.count - 1].malformedRecords += 1
-                    sources[sources.count - 1].detail = [sources.last?.detail,
-                        "A Codex job has no valid recorded id: " + url.path].compactMap { $0 }.joined(separator: "\n")
-                }
-            }
-        }
-        // Successful delivery removes the reply-job file. The durable ledger is therefore not optional history: it is the canonical terminal half of the same lifecycle. A proven delivered receipt outranks a stale in-flight projection for
-        // the same originating message id.
-        let deliveries = Self.deliveryCache.read(codexDeliveriesFile)
-        sources.append(deliveries.availability)
-        for key in Array(codexRows.keys) {
-            guard var retained = codexRows[key], retained.deliveryOutcome == "unknown" else { continue }
-            let ids = retained.acceptedMessageIDs.intersection(deliveries.deliveredIDs).sorted()
-            retained.recoveryNote = ids.isEmpty
-                ? "No later delivered receipt matched the retained accepted-message IDs in readable evidence. Inspect the original reply before deciding; absence is not proof of loss."
-                : "Delivered receipt(s) also reference accepted message ID(s): \(ids.joined(separator: ", ")). Compare thread/turn identity and completion before treating this retained reply as consumed; no replay or deletion performed."
-            codexRows[key] = retained
-        }
-        // A job reconciled into its delivered receipts keeps answering to its own id (job.N).
-        var reconciledReceipts: [String: Set<String>] = [:]
-        for key in Array(codexRows.keys) {
-            guard let job = codexRows[key], !job.acceptedMessageIDs.isEmpty else { continue }
-            let reconciled = job.acceptedMessageIDs.allSatisfy { id in
-                guard let receipt = deliveries.byID[id] else { return false }
-                if receipt.completionDeliveryID == job.completionDeliveryID,
-                   ["owed", "failed_before_answer", "let_go"].contains(receipt.deliveryOutcome ?? "") { return true }
-                guard let thread = job.recordedThreadID, let turn = job.recordedTurnID,
-                      receipt.recordedThreadID == thread, receipt.recordedTurnID == turn else { return false }
-                return job.deliveryOutcome != "unknown" || receipt.deliveryOutcome == "delivered"
-            }
-            if reconciled {
-                reconciledReceipts[job.id] = job.acceptedMessageIDs
-                codexRows.removeValue(forKey: key)
-            }
-        }
-        rows.append(contentsOf: codexRows.values)
-        let omp = Self.readDirectory(ompJobsDirectory, source: "omp_jobs", agent: "omp")
-        sources.append(omp.availability)
-        for (url, object) in omp.objects {
-            if let row = Self.projectOMP(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
-            else {
-                sources[sources.count - 1].status = "partial"
-                sources[sources.count - 1].malformedRecords += 1
-                sources[sources.count - 1].detail = [sources.last?.detail,
-                    "An OMP job has no valid recorded messageId: " + url.path].compactMap { $0 }.joined(separator: "\n")
-            }
-        }
-        func matches(_ row: DelegationReadout) -> Bool {
-            (agent == nil || row.agent == agent) && (messageID == nil || row.acceptedMessageIDs.contains(messageID!))
-                && (jobID == nil || row.id == jobID || reconciledReceipts[jobID!]?.contains(row.id) == true)
-        }
-        rows = rows.filter(matches)
-        // Cached terminal rows are already ordered. Only retain enough candidates for this page; full reconciliation deliberately retains every receipt.
-        if agent == nil || agent == "codex" {
-            if let messageID {
-                if let row = deliveries.byID[messageID], matches(row) {
-                    rows.append(row)
-                }
-            } else {
-                for row in deliveries.ordered where matches(row) {
-                    rows.append(row)
-                }
-            }
-        }
-        var states: [String: (state: CodexCompletionReadout, path: URL)] = [:]
-        let matchedLifecycles = Set(rows.compactMap(\.completionDeliveryID))
-        for directory in CodexCompletionReadout.delegationDirectories(
-            configRoot: claudeJobsDirectory.deletingLastPathComponent().deletingLastPathComponent(), dataRoot: dataRoot) {
+        var seen: Set<String> = []
+        for directory in directories {
             var lifecycles = Self.readDirectory(directory, source: "completion_lifecycle", agent: "self")
-            for (url, fields) in lifecycles.objects {
+            for (url, fields) in lifecycles.objects.sorted(by: { $0.0.path < $1.0.path }) {
                 let state: CodexCompletionReadout
                 do {
                     state = try JSONDecoder().decode(CodexCompletionReadout.self,
@@ -246,8 +89,6 @@ public struct DelegationStatusProjector: Sendable {
                 }
                 guard let status = state.status else { continue }
                 let id = state.deliveryId
-                states[id] = (state: state, path: url)
-                guard !matchedLifecycles.contains(id) else { continue }
                 let principal: String
                 do { principal = try state.knownPrincipal(dataRoot: dataRoot) ?? "unattributed" }
                 catch {
@@ -257,147 +98,26 @@ public struct DelegationStatusProjector: Sendable {
                     lifecycles.availability.detail = [lifecycles.availability.detail, gap].compactMap { $0 }.joined(separator: "\n")
                     continue
                 }
-                let terminal = status != "owed"
                 var row = DelegationReadout(id: id, source: state.source ?? principal, agent: principal,
-                    topicSlug: nil, deskHandle: nil, state: status, status: nil, runStatus: nil,
+                    topicSlug: nil, deskHandle: nil, state: status == "delivered" ? "settled" : status, status: nil, runStatus: nil,
                     createdAt: nil, claimedAt: nil, startedAt: nil, lastLiveness: nil,
                     completedAt: nil, elapsedSeconds: nil, stalled: false,
-                    stallBasis: terminal ? .terminal : .none, deliveryLost: nil, deliveryOutcome: nil, completionTextHead: nil)
+                    stallBasis: status == "owed" ? .none : .terminal, deliveryLost: nil, deliveryOutcome: status, completionTextHead: nil)
                 row.completionDeliveryID = id
                 row.deliveryUpdatedAt = state.updatedAt
                 row.recordKind = "completion_lifecycle"
                 row.recoveryNote = status == "stopped" ? DataRootLife.stoppedReason : url.path
-                row.recencyKey = Self.firstDate(state.updatedAt)
-                if matches(row) { rows.append(row) }
+                row.recencyKey = Self.date(state.updatedAt)
+                guard (agent == nil || row.agent == agent) && (jobID == nil || row.id == jobID),
+                      seen.insert(row.source + ":" + id).inserted else { continue }
+                rows.append(row)
             }
             sources.append(lifecycles.availability)
         }
-        for index in rows.indices {
-            if rows[index].recordKind == "delivery_receipt",
-               ["owed", "failed_before_answer"].contains(rows[index].deliveryOutcome ?? "") {
-                rows[index].recoveryNote = codexDeliveriesFile.path
-            }
-            guard let id = rows[index].completionDeliveryID, let lifecycle = states[id] else { continue }
-            let state = lifecycle.state
-            if let status = state.status,
-               status == "stopped" || !["delivered", "owed", "failed_before_answer", "let_go"].contains(rows[index].deliveryOutcome ?? "") {
-                rows[index].deliveryOutcome = status
-                rows[index].deliveryUpdatedAt = state.updatedAt
-                rows[index].state = status == "delivered" ? "settled" : status
-                if status == "stopped" { rows[index].recoveryNote = DataRootLife.stoppedReason }
-                if status == "failed_before_answer" {
-                    rows[index].recoveryNote = lifecycle.path.path
-                }
-            }
-            rows[index].deliveryLost = nil
-        }
-        var answers: [String: DelegationReadout] = [:]
-        rows = rows.sorted { $0.id < $1.id }.filter { row in
-            guard let id = row.completionDeliveryID,
-                  states[id] != nil || ["delivered", "owed", "failed_before_answer", "let_go"].contains(row.deliveryOutcome ?? "") else { return true }
-            let key = row.source + ":" + id
-            if var prior = answers[key] {
-                prior.acceptedMessageIDs.formUnion(row.acceptedMessageIDs)
-                prior.completionTextHead = prior.completionTextHead ?? row.completionTextHead
-                answers[key] = prior
-            } else { answers[key] = row }
-            return false
-        }
-        rows.append(contentsOf: answers.values)
-        for index in rows.indices where rows[index].agent == "codex" && rows[index].completionDeliveryID != nil {
-            // A new accepted action still needs settlement when its answer was already counted.
-            rows[index].deliveryReceiptVersion = (rows[index].deliveryReceiptVersion ?? "")
-                + "|" + rows[index].acceptedMessageIDs.sorted().joined(separator: ",")
-        }
         let matchedCount = rows.count
         rows.sort(by: Self.newestFirst)
-        var page = Array(rows.dropFirst(min(offset, rows.count)).prefix(limit ?? rows.count))
-        // A thread reads as ask and answer. Only the returned page is joined, from the tail of the inbox, so this stays a bounded read.
-        let wanted = Set(page.flatMap { $0.acceptedMessageIDs })
-        if !wanted.isEmpty { do {
-            let asks = try Self.requestRecords(inbox: codexDeliveriesFile.deletingLastPathComponent()
-                .appendingPathComponent("codex-inbox.jsonl"), ids: wanted)
-            for index in page.indices where page[index].requestTextHead == nil {
-                page[index].requestTextHead = page[index].acceptedMessageIDs.sorted().lazy.compactMap { asks[$0]?["text"] }.first.flatMap(Self.head)
-            }
-        } catch {
-            var unavailable = DelegationSourceAvailability(source: "codex_inbox", agent: "codex")
-            unavailable.status = "unavailable"; unavailable.unreadableFiles = 1; unavailable.detail = error.localizedDescription
-            sources.append(unavailable)
-        } }
-        // Conversation handles come from the bridge inbox.
-        let claudeIDs = Set(page.filter { $0.agent == "claude" }.flatMap { $0.acceptedMessageIDs })
-        if !claudeIDs.isEmpty { do {
-            let handles = try Self.requestRecords(inbox: claudeJobsDirectory.deletingLastPathComponent()
-                .appendingPathComponent("claude-inbox.jsonl"), ids: claudeIDs)
-            // Live replies join by accepted message ID from the bridge chat.
-            let replies = try liveReplies(claudeIDs)
-            for index in page.indices where page[index].agent == "claude" {
-                page[index].conversationID = page[index].acceptedMessageIDs.sorted().lazy.compactMap { handles[$0]?["conversationId"] }.first
-                if page[index].agentReplyTextHead == nil,
-                   let reply = page[index].acceptedMessageIDs.sorted().lazy.compactMap({ replies[$0] }).first {
-                    Self.retainReply(reply.text, truncated: reply.truncated, in: &page[index])
-                }
-            }
-        } catch {
-            var unavailable = DelegationSourceAvailability(source: "claude_conversation", agent: "claude")
-            unavailable.status = "unavailable"; unavailable.unreadableFiles = 1; unavailable.detail = error.localizedDescription
-            sources.append(unavailable)
-        } }
+        let page = Array(rows.dropFirst(min(offset, rows.count)).prefix(limit ?? rows.count))
         return DelegationStatusReadSnapshot(jobs: page, sources: sources, matchedCount: matchedCount)
-    }
-
-    /// Live-session answers retain full text or a 400-character head.
-    private func liveReplies(_ ids: Set<String>) throws -> [String: (text: String, truncated: Bool, createdAt: String?)] {
-        let url = claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent("claude-replies.jsonl")
-        // Read whole: the bridge's own retention (500 answers) bounds this file, and a tail window would drop older answers it still keeps.
-        return try Self.requestRecords(inbox: url, ids: ids, window: .max).compactMapValues { record in
-            guard let text = record["replyText"] ?? record["replyTextHead"] else { return nil }
-            return (text, record["replyText"] != nil ? record["replyTruncated"] == "true" : text.hasSuffix("…"), record["createdAt"])
-        }
-    }
-
-    public static func requestRecords(inbox url: URL, ids: Set<String>, window: Int = 524_288) throws -> [String: [String: String]] {
-        let key = url.standardizedFileURL.path + "#" + String(window)
-        let stamp = try? DelegationFileCache.stamp(url)
-        let all: [String: [String: String]]
-        if let stamp, let cached = fileCache.tail(key, stamp: stamp) {
-            all = cached
-        } else {
-            all = try tailTexts(inbox: url, window: window)
-            if let stamp { fileCache.putTail(key, stamp: stamp, all) }
-        }
-        return all.filter { ids.contains($0.key) }
-    }
-
-    private static func tailTexts(inbox url: URL, window: Int) throws -> [String: [String: String]] {
-        let file: FileHandle
-        do { file = try FileHandle(forReadingFrom: url) }
-        catch let error as CocoaError where error.isFileAbsent { return [:] }
-        defer { try? file.close() }
-        let size = try file.seekToEnd(), offset = size > UInt64(window) ? size - UInt64(window) : 0
-        try file.seek(toOffset: offset)
-        let bytes = try file.readToEnd() ?? Data()
-        let end = bytes.lastIndex(of: 0x0A).map { $0 + 1 } ?? bytes.startIndex
-        var lines = bytes[..<end].split(separator: 0x0A).map { Data($0) }
-        if offset > 0, !lines.isEmpty { lines.removeFirst() }
-        var found: [String: [String: String]] = [:]
-        for line in lines {
-            // A true flag (the inbox's `read`) reads as "true"; false is absent.
-            guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  ["id", "messageId"].contains(where: { (object[$0] as? String)?.isEmpty == false }) else {
-                throw ToolFailureError("Malformed bridge ledger row in " + url.path, effects: .none, owner: url.path,
-                    instruction: "Repair the complete record from retained message evidence; do not infer an identity or replay a send.", recovery: .repair)
-            }
-            let fields = object.compactMapValues { value -> String? in
-                guard let text = value as? String ?? ((value as? Bool) == true ? "true" : nil), !text.isEmpty else { return nil }
-                return text
-            }
-            for key in ["id", "messageId"] {
-                if let id = object[key] as? String { found[id, default: [:]].merge(fields) { _, new in new } }
-            }
-        }
-        return found
     }
 
     static func newestFirst(_ lhs: DelegationReadout, _ rhs: DelegationReadout) -> Bool {
@@ -409,11 +129,9 @@ public struct DelegationStatusProjector: Sendable {
         }
     }
 
-    private static let deliveryCache = DelegationDeliveryCache()
     private static let fileCache = DelegationFileCache()
 
-    /// Earliest future crossing of the same deadline/stall-seconds rules used by `stalled`. File events trigger immediate rereads while work moves; this exact deadline is what makes a writer that goes quiet observable without adding a
-    /// polling heartbeat.
+    /// Schedule the exact stall crossing so quiet writers become observable without polling.
     public func nextStallDeadline(after now: Date) -> Date? {
         allJobs(now: now)
             .compactMap(\.stallDeadline)
@@ -455,7 +173,7 @@ public struct DelegationStatusProjector: Sendable {
                 availability.unreadableFiles += 1
                 continue
             }
-            // Unchanged since the last read: reuse its parse.
+            // Reuse the parse only while its file stamp is unchanged.
             if let stamp, let cached = previous[name], cached.stamp == stamp {
                 parsedFiles[name] = cached
                 availability.readableRecords += 1
@@ -479,8 +197,9 @@ public struct DelegationStatusProjector: Sendable {
         return (objects, availability)
     }
 
-    // MARK: - Shared helpers
-
-    /// Delivery grace stays above the bridge POST ceiling to allow settlement.
-    static let deliveryStallSeconds: TimeInterval = 660
+    /// Both fractional and whole-second UTC timestamps are valid record times.
+    static func date(_ iso: String?) -> Date? {
+        guard let iso, !iso.isEmpty else { return nil }
+        return NativeTimestampFormat.parseISO8601FractionalFirst(iso)
+    }
 }

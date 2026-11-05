@@ -7,8 +7,7 @@ enum MobileAskDestination: String, AppEnum {
     static let caseDisplayRepresentations: [Self: DisplayRepresentation] = [.ask: "Quick Ask"]
 }
 
-/// Compiled into both the app and its control extension so OpenIntent executes
-/// in the app. The group flag also survives a cold scene launch.
+/// Compiled into app and control extension so OpenIntent executes in the app; the group flag survives cold launch.
 struct MobileQuickAskIntent: OpenIntent {
     static let title: LocalizedStringResource = "Quick Ask"
     @Parameter(title: "Destination", default: .ask) var target: MobileAskDestination

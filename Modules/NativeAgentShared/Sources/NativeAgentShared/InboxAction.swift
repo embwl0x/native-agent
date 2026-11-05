@@ -5,8 +5,8 @@ import Foundation
 public struct InboxAction: Codable, Sendable {
     /// Classify current Mac string responses at the signed response boundary.
     public static func responseResultClass(_ response: [String: String]) -> String {
-        // Ledger replay can report uncertainty as an error without result_class.
-        // That code is evidence of an unknown outcome, never confirmed failure.
+        // Ledger replay can report uncertainty as an error without result_class. That code is evidence of an unknown outcome, never confirmed
+        // failure.
         if response["code"] == "unknown_outcome" { return "unknown" }
         if let verdict = response["result_class"] { return verdict }
         let status = (response["status"] ?? "").lowercased()

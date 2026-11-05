@@ -16,7 +16,6 @@ import CognitiveSubstrate
 
 // MARK: - Public types
 
-/// Errors owned by the Swift-native chat client.
 public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
     case replyHeldForQuietHours
     case emptyMessage
@@ -36,7 +35,6 @@ public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
     }
 }
 
-/// Shared chat-turn output, transcript messages, attachments and execution metadata.
 public struct ChatResponse: Sendable, Codable, Equatable {
     public var runId: String
     public var model: String
@@ -55,13 +53,17 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     public var runtimeStatus: String? = nil
     public var terminalState: TurnEngineResult.TerminalState? = nil
     public var statusDetail: String? = nil
-    /// The approval a bot turn stopped on, when `runtimeStatus` says it is
-    /// waiting for one. The approval record stays canonical about whether it
-    /// still is.
+    /// Carry the exact waiting approval; only its canonical record determines whether waiting continues.
     public var pendingApprovalID: String? = nil
     /// Leading characters of `output` spoken before tool rounds; kept on person-facing surfaces
     /// (see `TurnEngineResult.workingCommentaryCharacters`).
     public var workingCommentaryCharacters: Int? = nil
+
+    /// Completion is explicit; missing output alone never proves the agent's choice to say nothing.
+    public var isSilentCompletion: Bool {
+        terminalState == .completed && output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && attachments?.isEmpty != false
+    }
 
     /// The final answer at the recorded boundary, including an empty suffix.
     /// An absent boundary keeps the whole reply; an invalid one yields no answer.
@@ -114,14 +116,12 @@ public typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
 
 public typealias TurnEventSink = @Sendable (TurnStreamEvent) async -> Void
 
-/// Receipt for an ack-on-enqueue user append: the message row is durably in
-/// the session transcript, independent of any turn that later consumes it.
+/// An enqueue receipt proves durable input independently of the turn that may later consume it.
 public struct EnqueuedUserMessage: Sendable {
     /// The checked canonical session the row landed in. Callers must create and
     /// retain a new session identity before enqueueing; persistence never mints
     /// one from a missing value.
     public let sessionId: String
-    /// The runId stamped on the enqueued user row.
     public let runId: String
 
     public init(sessionId: String, runId: String) {

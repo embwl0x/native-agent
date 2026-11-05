@@ -1,10 +1,8 @@
 import Foundation
 // Blueprint: | `VisionTextBandLayer.swift` | `VisionTextBand`, `VisionTextBandLayer` |
 
-// Vertical overlap forms text bands; repeated pitch across multi-text bands
-// identifies rows even when their pixels have no fill contrast.
+// Repeated text pitch identifies rows even when fill contrast is absent.
 
-/// A horizontal band of text — the primitive rows are built from.
 public struct VisionTextBand: Sendable, Equatable {
     public internal(set) var rect: VisionRect
     public internal(set) var texts: [VisionTextBox]
@@ -16,24 +14,18 @@ public struct VisionTextBand: Sendable, Equatable {
 }
 
 public enum VisionTextBandLayer {
-    /// Two text boxes belong to the same band when their vertical extents
-    /// overlap by at least this fraction of the SHORTER box.
+    /// Measure vertical overlap against the shorter box so differently sized text can share a band.
     private static let verticalOverlapFraction: Double = 0.5
-    /// A band needs at least this many texts to be a row candidate (a lone
-    /// heading is not a list row).
+    /// Require multiple texts so a lone heading cannot become a row.
     private static let minTextsPerBand: Int = 2
-    /// Repeated pitch has to be visible across at least this many bands —
-    /// three is the smallest number that can show a REPEAT rather than a gap.
+    /// Three bands are the minimum evidence of repeated pitch rather than one gap.
     private static let minRepeatedBands: Int = 3
-    /// Consecutive band pitches within this fraction of each other count as
-    /// "the same pitch".
+    /// Pitch tolerance permits ordinary layout variation without treating unrelated bands as a list.
     private static let pitchTolerance: Double = 0.28
-    /// A row candidate's rect is the band's bounding box, widened to the
-    /// common left/right extent of the run by this padding fraction of the
-    /// band height — a row's hit area is not the text's hit area.
+    /// Widen rows to the run’s common extent because a row’s hit area exceeds its text.
     private static let bandPaddingFraction: Double = 0.35
 
-    /// Cluster all text boxes by vertical overlap, independently of columns.
+    /// Cluster independently of columns so aligned labels and values can form rows.
     public static func bands(
         from boxes: [VisionTextBox]
     ) -> [VisionTextBand] {
@@ -54,9 +46,7 @@ public enum VisionTextBandLayer {
         return bands.sorted { $0.rect.y < $1.rect.y }
     }
 
-    /// Vertical overlap as a fraction of the SHORTER extent. Using the shorter
-    /// one is what lets a tall row label and a short badge in the same row
-    /// cluster together.
+    /// Shorter-extent overlap keeps tall labels and short badges in the same row.
     static func overlapFraction(_ lhs: VisionRect, _ rhs: VisionRect) -> Double {
         let top = max(lhs.y, rhs.y)
         let bottom = min(lhs.maxY, rhs.maxY)
@@ -67,12 +57,7 @@ public enum VisionTextBandLayer {
         return overlap / shorter
     }
 
-    /// Bands with ≥ `minTextsPerBand` texts AND a pitch that repeats across
-    /// ≥ `minRepeatedBands` bands ⇒ list rows. Row rect = band bounding box,
-    /// padded vertically and widened to the run's common horizontal extent.
-    ///
-    /// The pitch requirement is doing real work: two adjacent labelled fields
-    /// are also two multi-text bands, and without a REPEAT they are not a list.
+    /// Require repeated pitch across multi-text bands; adjacent labeled fields alone are not a list.
     public static func rowCandidates(
         from boxes: [VisionTextBox]
     ) -> [VisionCandidate] {
@@ -80,9 +65,7 @@ public enum VisionTextBandLayer {
         let multi = all.filter { $0.texts.count >= minTextsPerBand }
         guard multi.count >= minRepeatedBands else { return [] }
 
-        // Longest run of consecutive bands whose centre-to-centre pitch stays
-        // within tolerance. A list's rows are evenly spaced; a stack of
-        // unrelated multi-text bands is not.
+        // Use the longest regular-pitch run to distinguish lists from unrelated text stacks.
         var bestRun: [VisionTextBand] = []
         var index = 0
         while index < multi.count - 1 {
@@ -111,10 +94,7 @@ public enum VisionTextBandLayer {
                 w: max(0, right - left),
                 h: band.rect.h + pad * 2
             )
-            // Bounds confidence is deliberately MODEST: a row's true hit area
-            // extends past its text and we are inferring the edges from the
-            // run, not seeing them. Saying 0.9 here would be the fabricated
-            // certainty the contract forbids.
+            // Inferred row edges need modest confidence because text does not reveal the complete hit area.
             return VisionCandidate(
                 rect: rect,
                 sources: [.textBand],

@@ -9,7 +9,8 @@ public struct MemoryV2Status: Codable, Hashable {
     public var afterTurn: AfterTurnMemoryRecoveryStatus?
     public var createdAt: String?
     public var storageFailure: String?
-    public init(status: String, version: String? = nil, embedding: MemoryV2Embedding? = nil, counts: MemoryV2Counts? = nil, afterTurn: AfterTurnMemoryRecoveryStatus? = nil, createdAt: String? = nil, storageFailure: String? = nil) {
+    public init(status: String, version: String? = nil, embedding: MemoryV2Embedding? = nil, counts: MemoryV2Counts? = nil,
+        afterTurn: AfterTurnMemoryRecoveryStatus? = nil, createdAt: String? = nil, storageFailure: String? = nil) {
         self.status = status
         self.version = version
         self.embedding = embedding
@@ -20,16 +21,15 @@ public struct MemoryV2Status: Codable, Hashable {
     }
 }
 
-/// Her journal's owed turns, as status reads them.
 public struct AfterTurnMemoryRecoveryStatus: Codable, Hashable, Sendable {
     public let status: String
     /// Recorded, not yet lived; nil when no journal is open for this data root.
     public let owedCount: Int?
 
     public var lines: [String] {
-        guard let owedCount else { return ["Her lived-moment journal is not open here, so owed turns cannot be counted."] }
+        guard let owedCount else { return ["The agent's lived-moment journal is not open here, so owed turns cannot be counted."] }
         guard owedCount > 0 else { return [] }
-        return ["\(owedCount) turns owed to her: recorded, not yet lived. The next idle pass, her wake or the night lives them."]
+        return ["\(owedCount) turns owed to the agent: recorded, not yet lived. The next idle pass, the agent's wake or the night lives them."]
     }
 }
 
@@ -57,22 +57,19 @@ public struct MemoryV2Counts: Codable, Hashable {
     }
 }
 
-/// One time she was given a correction, in the miss ledger
-/// (`MemoryRecoveryReadout.misses`).
 public struct MemoryMiss: Codable, Hashable, Sendable, Identifiable {
     public var originId: String
     public var memoryId: String
     public var text: String
-    /// When, and the ISO week that falls in ("2026-W41").
     public var at: String
     public var week: String
     public var sessionId: String?
-    /// `history:<message id>` in that session; nil on rows kept before turns were stamped.
+    /// Missing kept-turn evidence has no transcript locator.
     public var history: String?
     public var id: String { "\(memoryId.utf8.count):\(memoryId)" + originId }
 }
 
-/// Full-window counts and at most ten examples, newest first, for one lesson.
+/// Count the full window before bounding examples to ten, newest first.
 public struct MemoryMissLesson: Codable, Hashable, Sendable, Identifiable {
     public var lesson: String
     public var countsByWeek: [String: Int]

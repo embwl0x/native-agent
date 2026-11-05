@@ -1,4 +1,3 @@
-// Pairing uses automatic iCloud KVS bootstrap and an explicit Check for Mac refresh.
 import SwiftUI
 import NativeAgentShared
 
@@ -6,22 +5,35 @@ enum IOSPairingPresentation {
     private static var appName: String {
         NativeAgentIdentity.displayName(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
     }
-    static var macPairingRoute: String { "\(appName) on your Mac → Connectors → iPhone (in Simple view, ask your agent to pair this phone and open the pairing card)" }
+    static var macPairingRoute: String { """
+        \(appName) on your Mac → Connectors → iPhone (in Simple view, ask your agent to pair this phone and open the pairing \
+        card)
+        """ }
     static let title = "Pair with the Mac app to get started."
-    /// The operating requirement, stated at pairing, in the agent's own voice:
-    /// this phone is a window onto the Mac, so the Mac has to be up.
+    /// Explain at pairing that the phone depends on the Mac being awake.
     static var macDependence: String {
         "I run on your Mac. Keep it awake with \(appName) open and I can answer you here."
     }
-    static var iCloudReadySteps: [String] { ["Open \(appName) on your Mac.", "Use the same Apple Account on both.", "Wait for the pairing key, then tap Connect."] }
-    static let iCloudUnavailableSteps = ["Open Settings → Apple Account.", "Sign in with your Mac’s account and turn on iCloud Drive.", "Come back here to pair."]
+    static var iCloudReadySteps: [String] { ["Open \(appName) on your Mac.", "Use the same Apple Account on both.",
+        "Wait for the pairing key, then tap Connect."] }
+    static let iCloudUnavailableSteps = ["Open Settings → Apple Account.", "Sign in with your Mac’s account and turn on iCloud Drive.",
+        "Come back here to pair."]
     static var iCloudUnavailableDetail: String { numbered(iCloudUnavailableSteps) }
     private static func numbered(_ steps: [String]) -> String {
         steps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
     }
-    static var manualSectionDetail: String { "Open \(macPairingRoute), then tap Check for Mac. Keep the Mac app open and both devices connected to the internet." }
-    static var missingKeyMessage: String { "The Mac’s pairing details haven’t arrived. Open \(macPairingRoute), check that both devices are online, then tap Check for Mac again." }
-    static var notSignedSyncMessage: String { "iCloud sync is waiting for pairing. Open \(macPairingRoute), then open Pair with Mac on this phone and tap Check for Mac." }
+    static var manualSectionDetail: String { """
+        Open \(macPairingRoute), then tap Check for Mac. Keep the Mac app open and both devices connected to the \
+        internet.
+        """ }
+    static var missingKeyMessage: String { """
+        The Mac’s pairing details haven’t arrived. Open \(macPairingRoute), check that both devices are online, then tap Check \
+        for Mac again.
+        """ }
+    static var notSignedSyncMessage: String { """
+        iCloud sync is waiting for pairing. Open \(macPairingRoute), then open Pair with Mac on this phone and tap Check for \
+        Mac.
+        """ }
 }
 
 struct PairingView: View {
@@ -77,15 +89,14 @@ struct PairingView: View {
                             .font(.callout)
                     }
 
-                    // One way forward: Connect once the Mac's key is here,
-                    // otherwise look for it again.
                     let canConnect = bridge.available && pairingStore.isICloudSigned
                     Button {
                         if canConnect {
                             connectionTask = Task { await connectViaICloud() }
                         } else { checkForMac() }
                     } label: {
-                        Text(isConnecting ? "Waiting for Mac confirmation…" : isCheckingForMac ? "Checking for Mac…" : canConnect ? "Connect" : "Check for Mac")
+                        Text(isConnecting ? "Waiting for Mac confirmation…" : isCheckingForMac ? "Checking for Mac…"
+                            : canConnect ? "Connect" : "Check for Mac")
                             .font(.body.weight(.semibold))
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, minHeight: 52)
@@ -134,8 +145,6 @@ struct PairingView: View {
 
     @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
 
-    /// The steps as one card: three numbered steps, then whether the Mac's
-    /// pairing key has arrived.
     private var stepsCard: some View {
         let steps = bridge.available ? IOSPairingPresentation.iCloudReadySteps : IOSPairingPresentation.iCloudUnavailableSteps
         return AliveCard {
@@ -166,7 +175,8 @@ struct PairingView: View {
                                          : AnyShapeStyle(AlivePalette.secondary))
                         .frame(width: 28)
                 }
-                Text(isCheckingForMac ? "Checking for Mac…" : pairingStore.isICloudSigned ? "Pairing key is here" : !bridge.available ? "iCloud is unavailable on this phone." : "Waiting for the Mac’s pairing key")
+                Text(isCheckingForMac ? "Checking for Mac…" : pairingStore.isICloudSigned ? "Pairing key is here" : !bridge.available
+                    ? "iCloud is unavailable on this phone." : "Waiting for the Mac’s pairing key")
                     .font(.subheadline)
                     .foregroundStyle(AlivePalette.secondary)
             }

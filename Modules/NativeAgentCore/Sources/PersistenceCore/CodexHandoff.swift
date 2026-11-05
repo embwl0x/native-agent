@@ -1,10 +1,9 @@
 import Foundation
 
-// Blueprint: | `CodexHandoff.swift` | `CodexHandoff.path`: one explicit handoff identity for connector reads and cognition/file wakes; no filesystem-dependent selection |
+// Blueprint: | `CodexHandoff.swift` | `CodexHandoff.path`; One explicit handoff identity. |
 
 public enum CodexHandoff {
-    /// An explicit process configuration selects its exact file. Otherwise
-    /// User's cross-project handoff has this single canonical identity.
+    /// Explicit process configuration selects the exact file; otherwise use the canonical cross-project handoff.
     public static var path: URL {
         if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_CODEX_HANDOFF_PATH"],
            !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

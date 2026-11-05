@@ -6,13 +6,11 @@ import Darwin
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `SensesHub.swift` | Lock-protected sense installation; readiness reads the installation owner's exact task through a cancellation-aware ScopedWaiter bounded to four seconds or the earlier caller deadline, with unavailable reads leaving installation alive; installation success names one repair notification, live-watch aggregation, exact-version view events and served/wrong-version provenance |
-/// Process-wide wiring, set once at launch by the app, so Core call sites
-/// (the door and the readers) reach the senses without
-/// depending on the app. Every member is optional: nil = senses not wired.
+// Blueprint: | `SensesHub.swift` | Locked installation task, bounded cancellable readiness, watch inventory and exact-version provenance |
+/// Wire at launch so Core readers reach senses without depending on the app; nil means not installed.
 public final class SensesHub: @unchecked Sendable {
     public static let shared = SensesHub()
-    /// Installation's successful repair edge, not a second readiness snapshot.
+    /// Use installation's own success edge rather than another readiness snapshot.
     public static let didBecomeReady = Notification.Name("NativeAgent.sensesReady")
     private let lock = NSLock()
     private var _registry: FileSenseRegistry?
@@ -20,8 +18,7 @@ public final class SensesHub: @unchecked Sendable {
     private var _source: SenseSourceProvider?
     private var _memoryProvenanceSink: (any SenseMemoryProvenanceSink)?
     private var _crossing: (any SenseCrossing)?
-    // The installation owner's exact task and completion, never a copied
-    // ready flag. A cancelled waiter leaves installation and siblings alone.
+    // Read installation's exact task and completion; cancelling a waiter must leave installation and sibling waiters alive.
     private var _installation: (task: Task<Void, Error>, finished: ScopedWaiter)?
 
     public func installReadiness(_ task: Task<Void, Error>, finished: ScopedWaiter) {
@@ -33,23 +30,23 @@ public final class SensesHub: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; return _installation
     }
 
-    public func waitUntilReady() async throws {
+    public func waitUntilReady(deadline parentDeadline: ContinuousClock.Instant? = nil) async throws {
         guard let installation else {
             throw SenseFailure(code: "source_unavailable", message: "Senses installation has not started.")
         }
-        // Bound only this read's wait. Installation keeps its repair observation
-        // and every sibling retains its own parker. Never infer ready from expiry.
+        // Bound only this read's wait; expiry proves no readiness and must preserve installation repair and sibling waiters.
         let ceiling = ContinuousClock.now.advanced(by: .seconds(4))
-        let deadline = TaskWaitDeadline.current.map { min($0, ceiling) } ?? ceiling
-        try await TaskWaitDeadline.$current.withValue(deadline) {
-            await installation.finished.park()
-            try Task.checkCancellation()
-            guard !TaskWaitDeadline.expired else {
-                throw SenseFailure(code: "source_unavailable", message: "Senses registration did not finish within this read's readiness wait. Inspect Doctor's Senses installation reading (launch.senses); if it names a failure, preserve and repair that source. A canonical repair change rechecks registration. This sense read did not run; other resident work continues.")
-            }
+        let deadline = parentDeadline.map { min($0, ceiling) } ?? ceiling
+        await installation.finished.park(budget: .init(deadline: deadline))
+        try Task.checkCancellation()
+        guard ContinuousClock.now < deadline else {
+            throw SenseFailure(code: "source_unavailable", message: """
+                Senses registration did not finish within this read's readiness wait. Inspect Doctor's Senses installation reading (launch.senses); if \
+                it names a failure, preserve and repair that source. A canonical repair change rechecks registration. This sense read did not run; \
+                other resident work continues.
+                """)
         }
         try Task.checkCancellation()
-        if TaskWaitDeadline.expired { throw TaskWaitDeadline.Exceeded() }
         try await installation.task.value
     }
     public func installCrossing(_ crossing: any SenseCrossing) {
@@ -61,11 +58,11 @@ public final class SensesHub: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         _memoryProvenanceSink = sink
     }
-    /// Call after a page is actually served in her turn, before returning it.
-    public func didServe(_ provenance: SenseProvenance) {
-        SenseTurnReads.current?.record(provenance)
+    /// Record served evidence only after serving a page and before returning it.
+    public func didServe(_ provenance: SenseProvenance, reads: SenseTurnReads?) {
+        reads?.record(provenance)
     }
-    /// Call for viewWrong on the version whose served view was wrong.
+    /// Attribute a wrong view to the exact version that served it.
     public func markVersionWrong(senseID: String, version: Int) async throws {
         let sink = memoryProvenanceSink
         guard let sink else {
@@ -114,19 +111,13 @@ public final class SensesHub: @unchecked Sendable {
             }), !Task.isCancelled else {
                 return "This sense is off or its view has changed."
             }
-            try await Self.$passiveObservation.withValue(false) {
-                if case .failed(let failure) = await receiver.run(record, request: .event(event), source: source) {
-                    throw failure
-                }
+            if case .failed(let failure) = await receiver.run(record, request: .event(event), source: source,
+                operation: .init(turn: nil)) {
+                throw failure
             }
             return nil
         } catch {
             return "This sense could not handle the event: \(error.localizedDescription)"
         }
     }
-    /// Watch entries, source callbacks, restarts and unattended part wakes are
-    /// observations, independently of the turn that started the live sense.
-    /// On-call admission retains this origin so retirement stops unattended
-    /// work while an accepted human interaction settles with its caller.
-    @TaskLocal public static var passiveObservation = false
 }

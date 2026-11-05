@@ -3,26 +3,19 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `LLMClient+OpenRouterAdapter.swift` | `OpenRouterTransport`: namespaced model routing, reasoning controls and authenticated OpenRouter completion/stream transport |
+// Blueprint: | `LLMClient+OpenRouterAdapter.swift` | `OpenRouterTransport`: gateway-owned model transport |
 
-/// OpenRouter chat-completions adapter. OpenRouter speaks the OpenAI
-/// chat-completions wire format at `https://openrouter.ai/api/v1/chat/completions`
-/// and uses the Bearer api key saved in
-/// `<dataRoot>/providers/openrouter.json::api_key`. Used by SwiftNativeLLMClient
-/// for slash-namespaced model ids (`anthropic/claude-...`, `openai/...`,
-/// `meta-llama/...`, etc.) — those are OpenRouter routing targets, not
-/// first-party Anthropic / OpenAI calls.
+/// Namespaced IDs are gateway targets on OpenRouter's own authenticated route; they must not dispatch to first-party adapters.
 public final class OpenRouterTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
     /// This transport sends no output-cap field.
-    public func requestOutputTokens(model: String) throws -> Int { 0 }
+    public func requestOutputTokens(model: String, call: LLMCall) throws -> Int { 0 }
 
     public let providerId: String = "openrouter"
     private let session: URLSession
     private let endpoint: URL
     private let apiKeyOverride: String?
     private let dataRootOverride: URL?
-    /// Record `llm.call` usage for accounting and the Turn Inspector.
     private let telemetry: LLMCallTraceRecorder
 
     public init(
@@ -41,22 +34,22 @@ public final class OpenRouterTransport: LLMTransport {
         )
     }
 
-    /// A 404 is already the answer for this call; the catalog learns it on
-    /// its own task, so the failure never waits on a discovery request.
+    /// A 404 is already the answer for this call; the catalog learns it on its own task, so the failure never waits on a discovery request.
     private static func refreshCatalog(dataRoot: URL, session: URLSession) {
         Task.detached { _ = await OpenRouterModelCatalog.models(dataRoot: dataRoot, session: session, refresh: true) }
     }
 
     /// Send the exact admitted effort from this route's current catalog.
-    static func applyReasoningControls(to body: inout [String: Any], model: String, dataRoot: URL) throws {
-        let catalog = try SwiftNativeProviderRouting(dataRoot: dataRoot).checkedCatalogModels(for: "openrouter")
+    static func applyReasoningControls(to body: inout [String: Any], model: String, dataRoot: URL, call: LLMCall) throws {
+        let catalog = try SwiftNativeProviderRouting(dataRoot: dataRoot).checkedCatalogModels(for: "openrouter", preview: call.preview)
         guard let row = catalog.first(where: { $0.id == model }) else {
             throw ProviderRoutingError.configurationFailed("OpenRouter has no current controls for \(model). Refresh its model catalog in Providers.")
         }
         if row.supported_reasoning_efforts == [],
-           LLMCallContext.reasoningEffort == nil || LLMCallContext.reasoningEffort == "" || LLMCallContext.reasoningEffort == "default" { return }
-        guard let requested = LLMCallContext.reasoningEffort ?? row.default_reasoning_effort else {
-            throw ProviderRoutingError.configurationFailed("OpenRouter's default Think control for \(model) is unknown. Refresh its model catalog in Providers.")
+           call.admission?.reasoningEffort == nil || call.admission?.reasoningEffort == "" || call.admission?.reasoningEffort == "default" { return }
+        guard let requested = call.admission?.reasoningEffort ?? row.default_reasoning_effort else {
+            throw ProviderRoutingError.configurationFailed(
+                "OpenRouter's default Think control for \(model) is unknown. Refresh its model catalog in Providers.")
         }
         let effort = try SwiftNativeProviderRouting.normalizeReasoningEffortStatic(
             requested, model: model, providerID: "openrouter",
@@ -78,29 +71,28 @@ public final class OpenRouterTransport: LLMTransport {
         prompt: String,
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         return try await LLMMessageStreamEvent.reply(collecting:
-            self.streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools), using: telemetry)
+            { held in self.streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
-    /// Preserve images and assistant-tool/result turns on OpenRouter's OpenAI-compatible wire.
-    /// The stream owns the 404 catalog refresh, as a turn's does.
+    /// Preserve images and assistant-tool/result turns on OpenRouter's OpenAI-compatible wire. The stream owns the 404 catalog refresh, as a turn's does.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) async throws -> String {
         return try await LLMMessageStreamEvent.reply(collecting:
-            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
+            { held in self.streamMessages(messages: messages, system: system, model: model, tools: tools, call: held) }, using: telemetry, call: call)
     }
 
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
-        tools: [LLMToolSchema]?
+        tools: [LLMToolSchema]?, call: LLMCall
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
         let session = self.session
         let endpoint = self.endpoint
@@ -125,14 +117,14 @@ public final class OpenRouterTransport: LLMTransport {
                         "stream": true,
                         "stream_options": ["include_usage": true],
                     ]
-                    try Self.applyReasoningControls(to: &body, model: model, dataRoot: dataRoot)
+                    try Self.applyReasoningControls(to: &body, model: model, dataRoot: dataRoot, call: call)
                     try OpenAITransport.applyTools(to: &body, tools: tools)
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
                     do {
-                        (bytes, response) = try await ProviderWire.open(session, req)
+                        (bytes, response) = try await ProviderWire.open(session, req, call: call)
                     } catch {
                         throw mapTransportError(error, fallback: .underlying(
                             message: "connection refused: \(endpoint.host ?? "openrouter")"
@@ -145,11 +137,12 @@ public final class OpenRouterTransport: LLMTransport {
                             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
                         }
                     }
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter", diagnosticDataRoot: telemetry.diagnosticDataRoot)
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter", diagnosticDataRoot: telemetry.diagnosticDataRoot(call: call),
+                        call: call)
                     try await decoder.consume(
-                        SSEEventStream(bytes), continuation: continuation,
+                        SSEEventStream(bytes, lifetime: call.lifetime), continuation: continuation,
                         request: req, providerID: providerId, model: model, idPrefix: "openrouter",
-                        started: startedNs, telemetry: telemetry
+                        started: startedNs, telemetry: telemetry, call: call
                     )
                     continuation.finish()
                 } catch let error as LLMError {
@@ -162,7 +155,7 @@ public final class OpenRouterTransport: LLMTransport {
                     ))
                 }
             }
-            ProviderReplyWork.current?.own(task)
+            call.replyWork?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }

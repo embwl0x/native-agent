@@ -3,19 +3,19 @@ import Desk
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `HarnessQueue.swift` | `HarnessQueue` enum, `HarnessFinding` struct; `file`, `resolve`, `fold`: keyed findings refresh in place, preserving closure and person ownership; carried lines name their desk.N and the queue.done call; carry offers and direct intention speech share the wake ledger's retained material fingerprint, including IntentionClock occurrence identities (civil for migrated calendar work) and person transition times; prompt moments bypass free-time quiet, and system notes name experience/news/body-signal releases |
+// Blueprint: | `HarnessQueue.swift` | `HarnessQueue`, `HarnessFinding`, `file`, `resolve`, `fold`: stable finding and carry identities |
+// Carry offers and direct speech share the wake ledger's material fingerprint, including civil clock occurrences and person transitions.
 
-/// One finding, with one Desk identity and the person who can tend it.
+/// Each finding keeps its Desk identity and the person who can tend it.
 public struct HarnessFinding: Sendable, Equatable {
     public enum Owner: String, Sendable { case agent, builder, owner }
     public enum Source: String, Sendable { case doctor, sweep, loop, bridge, agent }
 
-    /// Stable across repeats: the Doctor check id or the sweep's finding id.
+    /// Use the producer's stable finding identity so repeats update one item.
     public var key: String
     public var title: String
     public var summary: String
     public var owner: Owner
-    /// The trace, approval, file or check it came from.
     public var refs: [DeskRef]
     public var source: Source
 
@@ -53,10 +53,9 @@ extension ResidentWake {
         let peers = (step?.peers ?? []).filter { !CapabilityLifecycle.ownerTrusts($0) }
         let provenance = peers.isEmpty ? "" : " Peer steering retained: " + peers.joined(separator: ", ")
             + ". The answer covers this turn and its carried steps, without permanently trusting the peer."
-        // What released it since she last wrote on it (a condition, news or body signal).
         let released = MyQueue.entry(item).map { MyQueue.releaseNotes(for: $0).map { $0.text + " " }.joined() } ?? ""
         let words = item.summary ?? step?.words ?? item.title
-        // Its name rides with it, so what she is shown she can finish.
+        // Retain the step's name so the displayed step can be finished.
         let name = "desk." + item.alias
         let done = "app {action:\"queue.done\", args:{id:\"\(name)\"}}"
         let wait = "desk.wait {handle:\"\(name)\", on: <the card, message or debt id it needs>}: you are woken when that settles, not before."
@@ -67,9 +66,15 @@ extension ResidentWake {
             line = "You meant to, now (" + Self.shown(IntentionClock.occurrence(step, at: crossing) ?? crossing) + "): \(words) (\(name))." + next
                 + " Keep it open unless it is finished for good; then \(done)."
         } else if step != nil {
-            line = "You meant to (\(name)): \(words). Do what you judge right. Once it is done, \(done); if it can't move yet, say what it waits on with \(wait)"
+            line = """
+                You meant to (\(name)): \(words). Do what you judge right. Once it is done, \(done); if it can't move yet, say what it \
+                waits on with \(wait)
+                """
         } else {
-            line = "Yours to carry, \(name): \(item.title) — \(words). Do what you judge right. Close it with desk.close {handle:\"\(name)\"} only once it is actually done. If it can't move yet, say what it waits on with \(wait)"
+            line = """
+                Yours to carry, \(name): \(item.title) — \(words). Do what you judge right. Close it with \
+                desk.close {handle:\"\(name)\", reason} only once it is actually done. If it can't move yet, say what it waits on with \(wait)
+                """
         }
         switch step.map({ MyQueue.Until($0.until) }) ?? .once {
         case .words(let until): line += " It is done when: \(until). Once it is, \(done)."
@@ -77,16 +82,13 @@ extension ResidentWake {
         case .once, .standing: break
         }
         if let say = step?.say { line += " Say this as it is, nothing added: \"\(say)\"" }
-        var arrival = Item(id: key + "." + String(crossing.timeIntervalSince1970),
+        return Item(id: key + "." + String(crossing.timeIntervalSince1970),
             line: released + line + provenance,
             key: key, thread: key,
             at: crossing, session: step?.session,
             filedAt: step.map { $0.filedAt ?? item.openedAt }, materialFingerprint: carriedFingerprint(item, at: crossing, dataRoot: dataRoot))
-        arrival.clock = step.flatMap { MyQueue.When($0.when, card: $0.card)?.isPrompt } ?? false
-        return arrival
     }
 
-    /// A time as she reads it on the Mac's clock ("Thu 16:00").
     package static func shown(_ date: Date) -> String {
         let format = DateFormatter()
         format.locale = Locale(identifier: "en_US_POSIX")
@@ -94,9 +96,8 @@ extension ResidentWake {
         return format.string(from: date)
     }
 
-    /// What an offer of carried work is measured from: the item's material state
-    /// and the step it queues (refiling it is a change), never notes or stamps.
-    /// A rhythm's occurrence or a person's transition is material: each one is a new offer.
+    /// What an offer of carried work is measured from: the item's material state and the step it queues (refiling it is a change), never notes or stamps. A
+    /// rhythm's occurrence or a person's transition is material: each one is a new offer.
     package static func carriedFingerprint(_ item: DeskItem, at now: Date, dataRoot: URL) -> String {
         let step = item.step.map { step -> [String] in
             var fields: [String] = [step.words, step.when, step.card ?? "", step.actionText ?? "", step.session ?? "", step.filedAt ?? ""]
@@ -114,9 +115,7 @@ extension ResidentWake {
         return ([DeskObservationEvaluator.materialFingerprint(item)] + step).joined(separator: "\u{1F}")
     }
 
-    /// Her habit finished or fixed words reached the transcript without a wake. Retain the
-    /// same accepted carry record a delivered turn leaves, without spending a
-    /// wake or a thread hop. Notes alone do not consume a clock occurrence.
+    /// Habit completion or transcript delivery consumes the same carry record as a wake; notes alone never consume a clock occurrence.
     package func recordCarriedDelivery(_ item: DeskItem, dataRoot: URL, at now: Date,
                                       reason: String = "said", notes: [String]) throws -> CarriedSettlement {
         var delivered = Self.carriedArrival(item, crossing: now, dataRoot: dataRoot)
@@ -164,11 +163,9 @@ extension ResidentWake {
         }
     }
 
-    /// The carry projection reads the wake owner's spacing and hop law here,
-    /// without duplicating its ledger or importing its implementation details.
+    /// The carry projection reads the wake owner's hop law here, without duplicating its ledger or importing its implementation details.
     package static func carriedOpportunities(dataRoot: URL, items: [DeskItem], at now: Date) -> [String: Date]? {
-        // An older offer had no fingerprint. Establish its baseline without
-        // inventing a change; subsequent material changes compare against it.
+        // A missing fingerprint establishes a baseline, never evidence of change.
         guard let saved = shared.kept(dataRoot, { ledger -> Ledger in
             for index in ledger.recent.indices where ledger.recent[index].materialFingerprint == nil {
                 if let item = items.first(where: { "carry." + $0.handle == ledger.recent[index].key }) {
@@ -191,9 +188,7 @@ extension ResidentWake {
                 guard materialChanged || changed > offered.at else { return nil }
                 if materialChanged { changed = max(changed, now) }
             }
-            // A clock moment comes at its time: the spacing between wakes holds only the rest.
-            let clock = item.step.flatMap { MyQueue.When($0.when, card: $0.card) }.map { if case .at = $0 { return true }; if case .every = $0 { return true }; return false } ?? false
-            var due = clock ? changed : max(changed, ledger.lastWake?.addingTimeInterval(spacing) ?? .distantPast)
+            var due = changed
             if let hop = ledger.hops[key], hop.count >= maxHops {
                 let rested = hop.at.addingTimeInterval(rest)
                 due = max(due, Date(timeIntervalSinceReferenceDate: rested.timeIntervalSinceReferenceDate.nextUp))
@@ -203,12 +198,11 @@ extension ResidentWake {
     }
 }
 
-/// The app files its own work: one Desk item per finding in project
-/// `harness` (origin system), closed when the finding reads ok again.
+/// File one Desk item per system finding; close it only when the finding reads ok.
 public enum HarnessQueue {
     public static let project = "harness"
 
-    /// The original item; Doctor closure and person ownership survive repeats.
+    /// Preserve Doctor closure and person ownership across repeat findings.
     @discardableResult
     public static func file(_ finding: HarnessFinding, dataRoot: URL, refreshRefs: Bool = false) async throws -> DeskItem {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
@@ -233,28 +227,24 @@ public enum HarnessQueue {
         return item
     }
 
-    /// The finding reads ok again: its open item closes with `note`, and a
-    /// wake for any item with this key that has not reached her is taken back
-    /// (an item an interrupted resolve already closed included).
+    /// Resolution retracts pending wakes even when an interrupted resolve already closed the item.
     @discardableResult
     public static func resolve(key: String, note: String, dataRoot: URL, observedAt: Date? = nil) async throws -> Bool {
         return try await settle(dataRoot: dataRoot, observedAt: observedAt) { $0 == key ? note : nil }
     }
 
-    /// Every open finding whose key starts with one of these prefixes closes
-    /// with that prefix's note, in one pass (including legacy Doctor signatures).
+    /// Close matching finding-key prefixes in one pass, retaining each prefix's note.
     public static func resolve(keyPrefixes notes: [String: String], dataRoot: URL) async throws {
         try await settle(dataRoot: dataRoot) { key in notes.first { key.hasPrefix($0.key) }?.value }
     }
 
-    /// Retire per-record findings after their rollup is filed, in one settlement pass.
+    /// Settle per-record findings only after their rollup is filed.
     public static func fold(keyPrefixes: [String], into title: String, dataRoot: URL) async throws {
         try await settle(dataRoot: dataRoot) { key in
             keyPrefixes.contains(where: { key.hasPrefix($0) }) ? "folded into " + title : nil
         }
     }
 
-    /// `noteFor` answers an item's finding key with its closing note, or nil.
     @discardableResult
     private static func settle(dataRoot: URL, observedAt: Date? = nil,
                                _ noteFor: @escaping @Sendable (String) -> String?) async throws -> Bool {
@@ -278,7 +268,7 @@ public enum HarnessQueue {
         return !items.contains { !$0.status.isTerminal && answer($0) != nil }
     }
 
-    /// Open findings, newest first; the standing Body item is not one.
+    /// Keep the standing Body item out of the open-finding list.
     public static func open(_ state: DeskState) -> [DeskItem] {
         state.items.filter { $0.project == project && $0.kind != .standing && !$0.status.isTerminal }
             .sorted { $0.openedAt > $1.openedAt }

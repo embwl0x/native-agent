@@ -3,10 +3,9 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import CryptoKit
-// Blueprint: | `StudioJournalEntry.swift` | Encounter, journal and amendment vocabulary; strict current saved-row decoding rejects malformed present fields and elements; corrections project without rewriting journal bytes |
+// Blueprint: | `StudioJournalEntry.swift` | Strict encounter rows and projected amendments |
 
-/// Shared field checks for current saved Studio records. Missing optional fields
-/// are legitimate; a present malformed field rejects the entire owning row.
+/// Shared field checks for current saved Studio records. Missing optional fields are legitimate; a present malformed field rejects the entire owning row.
 struct StudioSavedRow {
     let fields: [String: JSONValue]
     init(_ value: JSONValue) throws {
@@ -54,7 +53,7 @@ public enum StudioRelationKind: String, Sendable, CaseIterable, Equatable {
     case deepens, contradicts, revises, echoes
 }
 
-/// What was encountered. `title` is the only required part — the rest is whatever is actually known, never invented to fill a field.
+/// Only title is required; optional encounter facts must never be invented.
 public struct StudioWork: Sendable, Equatable {
     public var title: String
     public var creator: String?
@@ -102,8 +101,7 @@ public struct StudioWork: Sendable, Equatable {
     }
 }
 
-/// HOW the work was received. Both fields are free text on purpose: the design names examples ("original, reproduction, screening, playthrough, excerpt"), not a closed set, and a closed enum would force a caller to misdescribe a reception
-/// the vocabulary does not cover — the exact dishonesty the honest-encounter rule exists to prevent.
+/// Free-text reception fields avoid forcing an honest encounter into a vocabulary that cannot describe it.
 public struct StudioReception: Sendable, Equatable {
     public var how: String?
     public var wholeOrPart: String?
@@ -157,7 +155,7 @@ public struct StudioOrigin: Sendable, Equatable {
     }
 }
 
-/// Where the judgment stands. `abstained` is a first-class outcome, not a failure — and it carries an optional reason, never a penalty.
+/// Abstention is a valid outcome with an optional reason, never a penalty.
 public struct StudioStanceValue: Sendable, Equatable {
     public var kind: StudioStance
     public var reason: String?
@@ -182,7 +180,7 @@ public struct StudioStanceValue: Sendable, Equatable {
     }
 }
 
-/// Self-contained provenance linking a new judgment to an earlier entry; both remain in the journal. The knowledge graph owns traversal and cites entries on its edges; recall filters inspect the stored links.
+/// Keep linked judgments intact; the graph owns traversal while recall filters read stored provenance.
 public struct StudioRelation: Sendable, Equatable {
     public var kind: StudioRelationKind
     public var entryId: String
@@ -219,11 +217,9 @@ public struct StudioJournalEntry: Sendable, Equatable {
     public var stance: StudioStanceValue
     public var relations: [StudioRelation]
     public var tags: [String]
-    /// Corrections filed against this entry, oldest first. NEVER written into `journal.jsonl` — they live in `journal/amendments.jsonl` and are projected onto the entry on every read, so the entry reads as corrected without the line it was
-    /// written on ever changing. See `StudioAmendment`.
+    /// Project amendments on every read without rewriting append-only journal bytes.
     public var amendments: [StudioAmendment]
-    /// TRUE when `journal/amendments.jsonl` could not be read whole on the read that produced this entry — a malformed row, a row this build cannot decode, or a file-level read failure. Which entry lost a correction is not knowable from a
-    /// damaged file, so every entry in that read says so, and nothing may present the response as healthy. Never written to disk.
+    /// Incomplete correction history warns every entry: damage cannot identify which response lost a correction. Never persisted.
     public var correctionsUnreadable: Bool = false
 
     public init(
@@ -256,8 +252,7 @@ public struct StudioJournalEntry: Sendable, Equatable {
         self.correctionsUnreadable = correctionsUnreadable
     }
 
-    /// The response as it now READS: the original text with every correction shown in place. A superseded passage is kept and struck through, the correction stands beside it with its date and reason, and an appended correction becomes a
-    /// dated block at the end. Nothing here removes a word she wrote — a reader can always see what the entry used to say.
+    /// Show corrections in place with original words struck through, date and reason; appended corrections remain dated blocks.
     public var responseAsCorrected: String? {
         guard !amendments.isEmpty else { return response }
         var text = correctedResponse().text
@@ -307,7 +302,7 @@ public struct StudioJournalEntry: Sendable, Equatable {
         if let response, !response.isEmpty { obj["response"] = .string(response) }
         if !relations.isEmpty { obj["relations"] = .array(relations.map { $0.toJSON() }) }
         if !tags.isEmpty { obj["tags"] = .array(tags.map { .string($0) }) }
-        // Only ever present on a READ (the append path writes a fresh entry with none). `response` above stays exactly as it was written; this pair is what makes the correction visible wherever the entry is shown.
+        // Project corrections only on reads; the stored response remains byte-for-byte unchanged.
         if !amendments.isEmpty {
             obj["amendments"] = .array(amendments.map { $0.toJSON() })
             if let corrected = responseAsCorrected { obj["response_as_corrected"] = .string(corrected) }
@@ -346,15 +341,14 @@ public struct StudioJournalEntry: Sendable, Equatable {
 
 // MARK: - Amendment
 
-/// A factual correction in journal/amendments.jsonl; journal bytes stay append-only. Reads project corrections onto entries; a changed judgment belongs in a new encounter. Nil supersedes adds a dated block; passage corrections keep the
-/// original struck through with date and reason.
+/// Amendments preserve append-only journal bytes. Nil supersedes appends a dated block; passage corrections retain struck-through originals.
 public struct StudioAmendment: Sendable, Equatable {
     public var id: String
     public var entryId: String
     public var amendedAt: String
-    /// Why it is being corrected, in her words. Required — a correction with no reason is a rewrite wearing a date.
+    /// Require a reason so a correction cannot silently rewrite history.
     public var reason: String
-    /// The exact passage of the original `response` this supersedes, or nil for an appended correction.
+    /// Nil appends; a passage correction must name exact original response text.
     public var supersedes: String?
     public var correction: String
 
@@ -374,7 +368,7 @@ public struct StudioAmendment: Sendable, Equatable {
         self.correction = correction
     }
 
-    /// The date a reader sees on the correction — day precision, which is what a corrected record needs to say.
+    /// Day precision is sufficient for the displayed correction date.
     public var amendedOn: String { String(amendedAt.prefix(10)) }
 
     public func toJSON() -> JSONValue {

@@ -10,15 +10,8 @@ import NativeAgentShared
 // Blueprint: | `MemoryApprovalTransactions.swift` | `MemoryApprovalTransactions` enum; `applyResolvedKindBackfill`, `stageKindBackfillIfNeeded` |
 
 public enum MemoryApprovalTransactions {
-    /// Applies a resolved memory.kind_backfill record (U3 wave-2 item 5 —
-    /// mirror of applyResolvedMemoryRepair's shape). Approved → stamp each
-    /// row's LLM-proposed kind through the store's own write path; the
-    /// content-hash stale guard inside MemoryKindBackfill.apply skips any
-    /// row whose content drifted since staging. Denied → store untouched
-    /// and the staging stamp stays (a refused backfill is never
-    /// re-proposed). Cancellation clears the stamp. Application/read failures
-    /// preserve the same decision for repair; the shared approval owner keeps
-    /// the returned outcome through its execution-receipt write.
+    /// Apply through the memory owner's content-hash guard so changed rows stay untouched. Denial keeps its staging stamp to prevent re-proposal; cancellation
+    /// clears it. Failures retain the decision for repair and the shared owner retains outcomes until receipted.
     public static func applyResolvedKindBackfill(
         from rec: ApprovalRecord,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -40,7 +33,10 @@ public enum MemoryApprovalTransactions {
                     "applied": .array(outcome.applied.map { .string($0) }),
                     "skippedStale": .array(outcome.skippedStale.map { .string($0) }),
                     "failed": .object(outcome.failed.mapValues { .string($0) }),
-                ]), detail: "kind backfill applied: \(outcome.applied.count) rows stamped, \(outcome.skippedStale.count) stale-skipped, \(outcome.failed.count) failed")
+                ]), detail: """
+                    kind backfill applied: \(outcome.applied.count) rows stamped, \(outcome.skippedStale.count) stale-skipped, \
+                    \(outcome.failed.count) failed
+                    """)
             case "denied":
                 return .init(action: .object(["op": .string("memory_kind_backfill_deny")]),
                     detail: "kind backfill denied — rows untouched")
@@ -53,13 +49,10 @@ public enum MemoryApprovalTransactions {
         }
     }
 
-    /// Stages the kind-backfill approval card if the legacy kind-less rows
-    /// still exist and no card was staged before (U3 wave-2 item 5).
-    /// Canonical approval creation, Full Mac admission and the pending-card
-    /// check use this root's inbox, including automatic applications.
+    /// Stage kind-less rows only once through this root's canonical inbox, including automatic Full Mac applications.
     public static func stageKindBackfillIfNeeded(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        makeLLMClient: @Sendable () -> any LLMClient
+        makeLLMClient: @Sendable (PrivateWorkContextAssembly) -> any LLMClient
     ) async {
         let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .fullMacYoloAuthority(
@@ -67,7 +60,7 @@ public enum MemoryApprovalTransactions {
                     surface: "desk",
                     source: "memory_kind_backfill_stager",
                     isRemote: false
-                )
+                ), turn: nil
             )
         if yolo.state == .explicitlyBlocked {
             return
@@ -80,19 +73,17 @@ public enum MemoryApprovalTransactions {
             return
         }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        // Prefer on-device classification; remote classification uses the resolved Memory route.
-        // Both accept only an exact supplied category.
-        let llm = makeLLMClient()
+        // Prefer on-device classification; remote classification uses the resolved Memory route. Both accept only an exact supplied category.
+        let llm = makeLLMClient(.taskOnly)
         let classifier: @Sendable (String, [String]) async throws -> String = { content, taxonomy in
             if OnDeviceClassification.isAvailable {
                 return try await MemoryKindBackfill.foundationModelsClassifier(
                     content: content, taxonomy: taxonomy)
             }
-            let raw = try await PrivateWorkContextAssembly.$current.withValue(.taskOnly) {
-                try await llm.complete(
-                    prompt: OnDeviceClassification.classifyPrompt(content: content, categories: taxonomy),
-                    system: try completionPolicy("kind-classification", section: "system"), model: nil, surface: "memory", purpose: "kind_backfill", tools: nil)
-            }
+            let raw = try await llm.complete(
+                prompt: OnDeviceClassification.classifyPrompt(content: content, categories: taxonomy),
+                system: try completionPolicy("kind-classification", section: "system"), model: nil, tools: nil,
+                call: LLMCall(turn: nil, surface: "memory", purpose: "kind_backfill"))
             return try OnDeviceClassification.matchCategory(reply: raw, categories: taxonomy)
         }
         _ = await MemoryKindBackfill.stageIfNeeded(
@@ -100,32 +91,31 @@ public enum MemoryApprovalTransactions {
             storage: storage,
             classifier: classifier,
             createApproval: { body in
-                // Classification may outlive a Trust change. Admission and the
-                // canonical writes share Trust's existing policy-file lock.
-                try await SwiftNativePersistenceCore.withFileLock(SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot)) {
+                // Classification may outlive a Trust change. Admission and the canonical writes share Trust's existing policy-file lock.
+                try await SwiftNativePersistenceCore.withFileLock(SwiftNativeTrustCenter.policyURL(dataRoot: dataRoot)) {
                     let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
                         .fullMacYoloAuthority(origin: SecurityOriginContext(
-                            surface: "desk", source: "memory_kind_backfill_stager", isRemote: false))
+                            surface: "desk", source: "memory_kind_backfill_stager", isRemote: false), turn: nil)
                     if yolo.state == .explicitlyBlocked {
                         throw NSError(domain: "MemoryKindBackfill", code: 403, userInfo: [
                             NSLocalizedDescriptionKey: yolo.reason
                         ])
                     }
                     if yolo.admitted {
-                        let staged = try await inbox.create(body)
+                        let staged = try await inbox.create(body, turn: nil)
                         let admitted = try await inbox.resolve(staged.id, decision: .approved,
                             provenance: .local(decidedBy: "full_mac_yolo"))
                         await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot)
                         return admitted.id
                     }
-                    return try await inbox.create(body).id
+                    return try await inbox.create(body, turn: nil).id
                 }
             },
             approvalIsPending: { id in try await inbox.get(id).status == "pending" },
             listPendingBackfills: {
                 let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
                     .fullMacYoloAuthority(origin: SecurityOriginContext(
-                        surface: "desk", source: "memory_kind_backfill_stager", isRemote: false))
+                        surface: "desk", source: "memory_kind_backfill_stager", isRemote: false), turn: nil)
                 if yolo.admitted { return [] }
                 return try await inbox.list(
                     filter: ApprovalFilter(status: "pending", action: MemoryKindBackfill.action)

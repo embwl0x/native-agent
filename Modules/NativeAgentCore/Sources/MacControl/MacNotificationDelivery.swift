@@ -16,15 +16,14 @@ import OSAKit
 import os
 #endif
 
-// Blueprint: | `MacNotificationDelivery.swift` | `NotificationPostReceipt` and `NotificationPosting`: notification acceptance and authorization evidence, without claiming delivery or observation |
+// Blueprint: | `MacNotificationDelivery.swift` | `NotificationPostReceipt`, `NotificationPosting`: Acceptance evidence never proves observed delivery |
 
 public enum NotificationAuthorizationDisposition: String, Sendable, Equatable {
     case authorized
     case provisional
 }
 
-/// Submission acknowledges delivery acceptance, without proving it was seen,
-/// heard or acted on.
+/// Acceptance does not prove a notification was seen, heard or acted on.
 public struct NotificationPostReceipt: Sendable, Equatable {
     public let authorization: NotificationAuthorizationDisposition
     public let requestIdentifier: String?

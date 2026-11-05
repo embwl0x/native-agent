@@ -12,7 +12,7 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `NativeCognitionRuntime+BodyContinuity.swift` | `NativeCognitionRuntime` body continuity: restore-gated organism persistence through one coalescing drain and atomic writer |
+// Blueprint: | `NativeCognitionRuntime+BodyContinuity.swift` | `NativeCognitionRuntime`. |
 
 extension NativeCognitionRuntime {
     private var organismPersistentStateURL: URL {
@@ -24,9 +24,7 @@ extension NativeCognitionRuntime {
     func restoreOrganismContinuityIfAvailable() async {
         guard !organismContinuityRestored else { return }
         organismContinuityRestored = true
-        // The body persists only once its restore has finished: a missing file
-        // is her first life, a decoded file is her body, a failed decode
-        // freezes the file (`organismRestoreFailedHard`).
+        // Persist only after restore; a failed decode freezes saved continuity rather than overwriting it with a fresh body.
         defer { organismContinuityReadable = true }
         let url = organismPersistentStateURL
         guard FileManager.default.fileExists(atPath: url.path) else { return }
@@ -36,7 +34,6 @@ extension NativeCognitionRuntime {
             decoder.dateDecodingStrategy = .iso8601
             let state = try decoder.decode(OrganismPersistentState.self, from: data)
             await organismKernel.restorePersistentState(state)
-            // A clean restore unfreezes continuity persistence.
             organismRestoreFailedHard = false
             await substrate.recordReceipt(
                 kind: "organism.restore",
@@ -47,7 +44,7 @@ extension NativeCognitionRuntime {
                 ])
             )
         } catch {
-            // A failed decode freezes writes so the saved continuity survives.
+            // A failed decode freezes writes to preserve saved continuity.
             organismRestoreFailedHard = true
             await substrate.recordReceipt(
                 kind: "organism.restore_failed",
@@ -67,14 +64,12 @@ extension NativeCognitionRuntime {
         return await awaitOrganismContinuityPersistence(through: generation)
     }
 
-    /// Advances the desired durable generation without suspending the caller.
-    /// The actor owns exactly one drain task regardless of event burst size.
+    /// One actor-owned drain coalesces durable generations without suspending signal ingestion.
     @discardableResult
     func scheduleOrganismContinuityPersistence(reason: String) -> UInt64? {
         // Never write through a failed restore; remain memory-only until a clean boot.
         guard !organismRestoreFailedHard else { return nil }
-        // Never write before the restore finished: a body written then would be
-        // a fresh one over hers.
+        // Never save before restore finishes or fresh state could overwrite saved continuity.
         guard organismContinuityReadable else { return nil }
         organismPersistenceRequestedGeneration &+= 1
         organismPersistenceLatestReason = String(reason.prefix(120))
@@ -92,7 +87,7 @@ extension NativeCognitionRuntime {
         }
         let id = UUID(), done = ScopedWaiter()
         organismPersistenceWaiters[generation, default: [:]][id] = OrganismPersistenceWait(done: done)
-        // An awaited save never waits out the debounce, even when cancelled.
+        // An awaited save bypasses debounce even when cancelled.
         organismPersistenceDebounceTask?.cancel()
         await Task { await done.park() }.value
         let result = organismPersistenceWaiters[generation]!.removeValue(forKey: id)!.result!
@@ -100,14 +95,14 @@ extension NativeCognitionRuntime {
         return result
     }
 
-    /// Serial latest-state drain coalesces arrivals during a write into one subsequent snapshot.
+    /// Coalesce arrivals during a write into one subsequent latest-state snapshot.
     private func drainOrganismContinuityPersistence() async {
         while !Task.isCancelled {
             guard organismPersistenceCompletedGeneration < organismPersistenceRequestedGeneration else {
                 organismPersistenceDrainTask = nil
                 return
             }
-            // Un-awaited saves coalesce for 30 seconds; a waiter flushes immediately.
+            // Coalesce unawaited saves for 30 seconds; awaited saves flush immediately.
             if !organismPersistenceWaiters.values.contains(where: { $0.values.contains(where: { $0.result == nil }) }),
                let last = organismPersistenceLastWriteAt,
                ContinuousClock.now < last + .seconds(30) {
@@ -148,7 +143,7 @@ extension NativeCognitionRuntime {
     }
 
     private func writeOrganismContinuitySnapshot(reason: String) async -> Bool {
-        // Dormant or awake, the body's continuity is kept and saved.
+        // Preserve continuity whether body effects are dormant or awake.
         let state = await organismKernel.exportContinuity()
         do {
             let url = organismPersistentStateURL
@@ -167,9 +162,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Encoding and filesystem work run outside the cognition actor. Awaiting
-    /// this detached job keeps write ordering in the sole drain while allowing
-    /// new sensory events to enter the actor during a slow disk operation.
+    /// Run encoding and filesystem work outside the actor; the sole drain awaits it to preserve ordering while sensory events continue.
     private nonisolated static func writeOrganismPersistentState(
         _ state: OrganismPersistentState,
         to url: URL

@@ -5,8 +5,6 @@ import NativeAgentShared
 
 // MARK: - Page
 
-/// True inside an AlivePage: the kit's sections, cards and rows are then
-/// iOS's own List sections and cells.
 private struct AliveInListKey: EnvironmentKey { static let defaultValue = false }
 extension EnvironmentValues {
     var aliveInList: Bool {
@@ -15,16 +13,10 @@ extension EnvironmentValues {
     }
 }
 
-/// A tab root hides the bar and wears the big serif door at one fixed height;
-/// a pushed page or a sheet keeps its bar (Back, Done) and a smaller door.
+/// Tab roots share a fixed header height; pushed pages and sheets retain Back/Done navigation.
 enum AlivePageStyle { case root, pushed }
 
-/// A page's door: a serif word with an optional trailing control on its row
-/// (never a separate toolbar row), and ONE line under it. With `showsStatus`
-/// (the chat header only), that line becomes the Mac connection status
-/// whenever the Mac is not live; every other page's line describes the page.
-/// The line is always held, so nothing below jumps when it arrives or swaps.
-/// With `dot`, the agent's light sits before the name.
+/// Reserve the subtitle's height so status changes cannot move content; only Chat substitutes Mac status.
 struct AlivePageHeader<Trailing: View>: View {
     let title: String
     var line: String?
@@ -111,8 +103,7 @@ private struct AliveConnectionLine: View {
     }
 }
 
-/// The trailing control in a title row (the chat's `…`, the Desk's `+`): a
-/// 44pt glass circle, because it floats on the functional layer.
+/// The 44pt title control uses glass because it floats above content.
 struct AliveTitleControlLabel: View {
     let systemImage: String
 
@@ -126,8 +117,7 @@ struct AliveTitleControlLabel: View {
     }
 }
 
-/// A room, header, optional freshness/accessory and native sections.
-/// Only the chat header and connection surfaces describe Mac status.
+/// Only Chat and connection surfaces describe Mac status.
 struct AlivePage<Trailing: View, Content: View>: View {
     let title: String
     var line: String?
@@ -150,8 +140,6 @@ struct AlivePage<Trailing: View, Content: View>: View {
     }
 
     var body: some View {
-        // iOS's own grouped List: native cells, separators, press highlight
-        // and chevrons; her room and haze stay behind it.
         List {
             Section {
                 VStack(alignment: .leading, spacing: 14) {
@@ -181,10 +169,7 @@ extension AlivePage where Trailing == EmptyView {
 }
 
 extension View {
-    /// The page chrome around any scroll or list: the room, the bar (hidden at
-    /// a tab root, kept with Back when pushed), the undrawn title that
-    /// VoiceOver still reads, the fade under the status bar (and, pushed,
-    /// under the floating Back button), and the fade under the floating tab bar.
+    /// Keep titles accessible without duplicating the visible header; fades protect content under floating navigation.
     func alivePageChrome(title: String, root: Bool) -> some View {
         mobileReadingScreen()
             .navigationTitle(title)
@@ -194,21 +179,16 @@ extension View {
             .aliveBottomFade()
     }
 
-    /// The room fades over the system scroll edge under floating controls.
-    /// The bottom safe area keeps the last row clear.
+    /// Fade content below floating controls; reserve bottom space so the last row remains reachable.
     func aliveBottomFade() -> some View {
         modifier(AliveBottomFade(room: AliveRoom()))
     }
 
-    /// The same fade over a room with its own mood (the chat's).
     func aliveBottomFade<Room: View>(room: Room) -> some View {
         modifier(AliveBottomFade(room: room))
     }
 
-    /// Scrolled content fades out under the status bar. `holdsBar` (a pushed
-    /// page): the room itself (colour AND haze, like the bottom fade) covers
-    /// the status bar and the bar with the floating Back button, fading out
-    /// just below it, so nothing reads through the button.
+    /// Cover both room colour and haze beneath the pushed Back button so content cannot show through it.
     @ViewBuilder func aliveTopFade(_ on: Bool = true, holdsBar: Bool = false) -> some View {
         if holdsBar {
             overlay {
@@ -232,7 +212,6 @@ extension View {
         } else if on {
             overlay(alignment: .top) {
                 GeometryReader { g in
-                    // From the screen's top edge down to the end of the status bar.
                     let y = g.frame(in: .global).minY
                     LinearGradient(colors: [AlivePalette.room, AlivePalette.room.opacity(0)],
                                    startPoint: .top, endPoint: .bottom)
@@ -248,8 +227,6 @@ extension View {
         }
     }
 
-    /// A list row that is only its content: no cell, no separator, the page's
-    /// side inset.
     func aliveListRow(top: CGFloat = 0, bottom: CGFloat = 0) -> some View {
         listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -265,7 +242,6 @@ private struct AliveBottomFade<Room: View>: ViewModifier {
         content.scrollEdgeEffectStyle(.soft, for: .bottom)
         .overlay {
             GeometryReader { g in
-                // From 24pt above whatever floats at the bottom to the edge.
                 let fade = g.safeAreaInsets.bottom + 24
                 room.mask {
                     VStack(spacing: 0) {

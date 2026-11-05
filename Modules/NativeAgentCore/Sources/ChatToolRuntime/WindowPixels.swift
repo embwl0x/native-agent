@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import CoreGraphics
 import CryptoKit
 import ImageIO
@@ -16,15 +17,16 @@ import NativeAgentShared
 import Senses
 import AgentConversations
 import StandingBots
-// Blueprint: | `WindowPixels.swift` | Call-scoped pixel attachments require successful region cropping before geometry-bound deduplication and bounded JPEG delivery; failed crops attach no image; delivered frames retain capture provenance |
+// Blueprint: | `WindowPixels.swift` | Crop before deduplication; bounded JPEGs retain capture provenance |
 
-/// One attachment per screen call, reusing its captured frame and thin-AX reason.
-/// Background window capture raises nothing; attach runs after the verb.
-/// Screen Recording is preflighted, never requested, and missing access is reported.
+/// One attachment per screen call, reusing its captured frame and thin-AX reason. Background window capture raises nothing; attach runs after the verb. Screen
+/// Recording is preflighted, never requested, and missing access is reported.
 final class FourVerbPixelAttachment: @unchecked Sendable {
     static let maxLongSide = 1024
     static let maxBytes = 150_000
 
+    let turn: Turn
+    let invocation: ChatToolInvocation
     let part: String?
     let forced: Bool
     private let lock = NSLock()
@@ -44,7 +46,9 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
     private var window = ""
     private var region: (name: String, frame: MacAXFrame)?
 
-    init(part: String?, forced: Bool) {
+    init(part: String?, forced: Bool, turn: Turn, invocation: ChatToolInvocation) {
+        self.turn = turn
+        self.invocation = invocation
         self.part = part
         self.forced = forced
     }
@@ -76,7 +80,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         region = (name, frame)
     }
 
-    /// The look rejected this capture as not its own window: drop its pixels.
+    /// Reject pixels from a capture the look could not bind to its window.
     private var discarded = false
     func discard() {
         lock.lock(); defer { lock.unlock() }
@@ -86,8 +90,6 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         region = nil
     }
 
-    /// A numbered pixel region by its rendered name ("visual region 3"),
-    /// "region 3", "3", or the OCR label a pixel target carries.
     static func region(named part: String, in targets: [MacFourVerbsSupplementalTarget]) -> (name: String, frame: MacAXFrame)? {
         func normalize(_ text: String) -> String {
             text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
@@ -109,29 +111,40 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         return nil
     }
 
-    /// The delivered image's frame fields (MacImageFrames), once `attach` sent one.
     private(set) var imageFrame: JSONValue?
 
-    /// The one line `screen` adds, or nil when nothing about pixels needs
-    /// saying (an AX-rich window she did not ask pixels of).
+    /// An AX-rich window needs no pixel note unless pixels were requested.
     func attach() -> String? {
         lock.lock(); defer { lock.unlock() }
         imageFrame = nil
         guard recorded, reason != nil || forced else { return nil }
         let why = reason.map { "thin accessibility: \($0)" } ?? "pixels:true"
         guard screenRecording else {
-            return "Pixels (\(why)): screen_recording_not_trusted. No image was attached or permission prompt opened. The text read above retains its stated coverage. Request app {action:\"permissions.request\",args:{capability:\"screenRecording\",why:\"Allow NativeAgent to see the screen?\"}}; the owner decides."
+            return """
+                Pixels (\(why)): screen_recording_not_trusted. No image was attached or permission prompt opened. The text read above retains \
+                its stated coverage. Request app {action:\"permissions.request\",args:{capability:\"privacy:screenRecording\",why:\"Allow NativeAgent to \
+                see the screen?\"}}; the owner decides.
+                """
         }
         guard !discarded else {
-            return "Pixels (\(why)): capture_window_changed. The window changed during capture; no image was attached. The text read above retains its stated coverage. Use mac.look for the affected app to inspect its current state."
+            return """
+                Pixels (\(why)): capture_window_changed. The window changed during capture; no image was attached. The text read above retains \
+                its stated coverage. Use mac.look for the affected app to inspect its current state.
+                """
         }
         guard let png else {
             let recovery = captureRemedy.flatMap { try? $0.serialize(pretty: false) }
                 ?? "Inspect the affected app's menu with mac.menu; correct the capture failure before another image request."
-            return "Pixels (\(why)): \(unavailable ?? "capture_failed"). \(captureDetail ?? "No usable image was returned.") No image was attached. The text read above retains its stated coverage. \(recovery)"
+            return """
+                Pixels (\(why)): \(unavailable ?? "capture_failed"). \(captureDetail ?? "No usable image was returned.") No image was attached. \
+                The text read above retains its stated coverage. \(recovery)
+                """
         }
-        guard LocalToolImage.sink != nil else {
-            return "Pixels (\(why)): image_delivery_unavailable. This call cannot carry an image. The text read above retains its stated coverage; request pixels from a model tool turn if an image is needed."
+        guard invocation.imageSink != nil else {
+            return """
+                Pixels (\(why)): image_delivery_unavailable. This call cannot carry an image. The text read above retains its stated coverage; \
+                request pixels from a model tool turn if an image is needed.
+                """
         }
         var scope = "the window"
         if let region { scope = "\(region.name), cropped at higher detail" }
@@ -151,20 +164,19 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
             }
             source = (crop.image, crop.origin, crop.logicalSize)
         }
-        // Same window, same region, byte-identical source frame → the image
-        // already in her context stands. Checked before JPEG fitting.
+        // Deduplicate identical window/region/source bytes before JPEG fitting; the delivered frame already represents them.
         let key = window + "|" + (region?.name ?? "")
         let geometryKey = [source.origin.x, source.origin.y, source.logicalSize.width, source.logicalSize.height]
             .map { String($0) }.joined(separator: "|")
         let fingerprint = SHA256.hash(data: Data((png + "|" + geometryKey).utf8)).map { String(format: "%02x", $0) }.joined()
-        let turn = forced ? nil : ChatTurnExecution.current
-        if let previousID = turn?.attachedPixelFrame(window: key, fingerprint: fingerprint),
-           let previous = MacImageFrames.frame(previousID) {
+        let execution = forced ? nil : turn.execution
+        if let previousID = execution?.attachedPixelFrame(window: key, fingerprint: fingerprint),
+           let previous = MacImageFrames.frame(previousID, turn: turn) {
             let old = previous.geometry
             let frame = MacImageFrames.remember(MacScreenViewGeometry(bounds: old.bounds,
-                pixelWidth: old.pixelWidth, pixelHeight: old.pixelHeight, capture: capture), id: frameID)
+                pixelWidth: old.pixelWidth, pixelHeight: old.pixelHeight, capture: capture), id: frameID, turn: turn)
             imageFrame = frame.fields
-            turn?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID)
+            execution?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID)
             return "Pixels (\(why)): \(scope) is unchanged since its image was attached earlier this turn; not sent again. " + frame.words
         }
         guard let jpeg = Self.boundedJPEG(source.image) else {
@@ -176,23 +188,27 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         let title = parts.count > 2 && !parts[2].isEmpty && parts[2] != app ? " “" + parts[2] + "”" : ""
         let name = LocalToolImage.screenshotName(of: app + title + (region.map { ", " + $0.name } ?? ""), source: key)
         let delivered = LocalToolImage.deliverPNG(jpeg.data, name: name,
-            width: jpeg.width, height: jpeg.height, mediaType: "image/jpeg")
-        guard case .object(let result) = delivered, result["status"] == .string("ok") else {
+            width: jpeg.width, height: jpeg.height, mediaType: "image/jpeg", sink: invocation.imageSink)
+        let reply = ToolResult(delivered)
+        guard case .object(let result) = delivered, reply.said("ok"), reply.status == result["status"]?.stringValue else {
             return "Pixels (\(why)): this result already carries its image limit; none was attached."
         }
         let placement = background ? "captured where it sits, nothing raised" : "the front window as shown"
-        let attached = "Pixels attached (\(why)): one \(jpeg.width)×\(jpeg.height) JPEG, \(max(1, jpeg.data.count / 1000)) KB, of \(scope) (\(placement)). It follows this result."
+        let attached = """
+            Pixels attached (\(why)): one \(jpeg.width)×\(jpeg.height) JPEG, \(max(1, jpeg.data.count / 1000)) KB, of \(scope) (\(placement)). \
+            It follows this result.
+            """
         // The final size and the screen rect it covers travel together, so a point in it is a place.
         guard source.logicalSize.width > 0, source.logicalSize.height > 0 else { return attached }
         let frame = MacImageFrames.remember(MacScreenViewGeometry(
             bounds: MacAXFrame(x: source.origin.x, y: source.origin.y, w: source.logicalSize.width, h: source.logicalSize.height),
-            pixelWidth: jpeg.width, pixelHeight: jpeg.height, capture: capture), id: frameID)
+            pixelWidth: jpeg.width, pixelHeight: jpeg.height, capture: capture), id: frameID, turn: turn)
         imageFrame = frame.fields
-        ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID, image: name)
+        turn.execution?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID, image: name)
         return attached + " " + frame.words
     }
 
-    /// Long side ≤ 1024 px and ≤ 150 KB: quality steps first, then 3/4 scale.
+    /// Long side ≤ 1024 px and ≤ 150 KB bounds provider input; try quality steps before 3/4 scaling.
     static func boundedJPEG(_ image: CGImage) -> (data: Data, width: Int, height: Int)? {
         let longest = max(image.width, image.height)
         guard longest > 0, let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }

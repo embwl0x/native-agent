@@ -2,25 +2,17 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `JSONLRetention.swift` | SwiftNativePersistenceCore owns the activity event envelope, path and append; producers preserve redacted values, IDs and timestamps; JSONLCapCheckCounter owns cap-check cadence |
+// Blueprint: | `JSONLRetention.swift` | Path-owned envelope, capped append and retention cadence. |
 
 // MARK: - JSONL retention
 
-/// Per-path append counter driving `JSONLLineCaps.capCheckStride`. Process-local
-/// and deliberately not persisted: a fresh process checks on its first append to
-/// each path, which is exactly when an inherited over-cap file needs trimming.
+/// Process-local counters check each path on its first append so inherited over-cap files are trimmed.
 final class JSONLCapCheckCounter: @unchecked Sendable {
     static let shared = JSONLCapCheckCounter()
     private let lock = NSLock()
     private var counts: [String: Int] = [:]
 
-    /// True when this append should evaluate the line cap in full (ignoring any
-    /// byte trigger). Fires on the 1st, (stride+1)th, … append to `path`.
-    /// Bound on distinct tracked paths. The production feed set is a couple of
-    /// dozen fixed paths, but `appendJSONLCapped` also serves per-session and
-    /// per-run files, so an unbounded map would creep in a long-lived process.
-    /// Overflowing simply forgets the counts — the only cost is one extra full
-    /// cap evaluation per path afterwards, which is the SAFE direction.
+    /// Bound tracked paths because per-session/run feeds are unbounded; forgetting counts only adds safe cap evaluations.
     private static let maximumTrackedPaths = 4096
 
     func isFullCheckDue(path: URL, stride: Int) -> Bool {
@@ -35,10 +27,7 @@ final class JSONLCapCheckCounter: @unchecked Sendable {
         return next % stride == 1
     }
 
-    /// Read-only preview used by pre-trim evidence owners. The caller holds
-    /// the path's file lock, so no same-path capped append can advance between
-    /// this preview and the later consuming `isFullCheckDue` call. Keeping the
-    /// preview non-mutating also means a failed append does not spend a stride.
+    /// Preview without spending a stride; the caller's file lock prevents intervening appends before consumption.
     func isFullCheckDueOnNextAppend(path: URL, stride: Int) -> Bool {
         guard stride > 1 else { return true }
         let key = path.standardizedFileURL.path
@@ -51,9 +40,8 @@ final class JSONLCapCheckCounter: @unchecked Sendable {
     }
 }
 
-/// Select line retention, then byte retention, and durably publish once.
-/// The caller holds the feed's lock. Checked append bytes may be carried in
-/// to avoid rereading a diagnostic feed admitted before its append.
+/// Select line retention, then byte retention, and durably publish once. The caller holds the feed's lock. Checked append bytes may be carried in to avoid
+/// rereading a diagnostic feed admitted before its append.
 @discardableResult
 public func enforceJSONLRetention(
     at path: URL,
@@ -167,10 +155,7 @@ private func selectJSONLRetention(
     return (Data(retained.utf8), original.indices.filter { !kept.contains($0) }.map { original[$0] })
 }
 
-/// Owns activity/events.jsonl: the event envelope, path and capped append.
-/// Producers supply their original redacted values, IDs and timestamps.
-/// Local backup/export and phone sync exclude it; off-disk backup and support
-/// bundles include it; PrivacyMap lists activity/. FeedPolicy.swift owns retention beside this enforcement.
+/// Producers retain original redacted evidence; FeedPolicy owns retention and this owner enforces it.
 extension SwiftNativePersistenceCore {
     public static func activityEventsPath(dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent("activity/events.jsonl")
@@ -195,12 +180,7 @@ extension SwiftNativePersistenceCore {
     }
 }
 
-/// Appends `event` to `path`, then trims the file
-/// to its newest `maxLines` lines, logging what the rotation dropped. Every
-/// live `activity/events.jsonl` writer routes through here to bound the feed.
-///
-/// Append and retention share `withFileLock(path)`, reusing a held same-path
-/// lock. Only a compound transaction protected by a different path bypasses it.
+/// Append and retention share the path lock; only a compound transaction under a different path bypasses it.
 public func appendJSONLCapped(
     _ event: JSONValue,
     to path: URL,
@@ -230,8 +210,7 @@ public func appendJSONLCapped(
     let diagnosticByteBound = policy?.maxBytes != nil
     let payload = try SwiftNativePersistenceCore.serializeJSONL([event])
     let diagnosticAppendBytes: Int? = diagnosticByteBound ? payload.count : nil
-    // Reject rather than truncate a new diagnostic record that cannot fit in
-    // its file's hard budget. Audit/authoritative callers do not inherit this.
+    // Reject rather than truncate a new diagnostic record that cannot fit in its file's hard budget. Audit/authoritative callers do not inherit this.
     if diagnosticByteBound, let effectiveMaxBytes {
         guard payload.count <= effectiveMaxBytes else {
             throw JSONLPathOwnedAppendError.recordExceedsByteLimit(
@@ -242,10 +221,7 @@ public func appendJSONLCapped(
     let work: @Sendable () async throws -> Void = {
         var checkedData: Data?
         var selection: (retained: Data?, dropped: [Substring]?)?
-        // Do not keep growing an inherited malformed diagnostic feed merely
-        // because retention cannot decode it. Preserve the evidence and refuse
-        // this append before it crosses the ceiling; no quarantine copy can
-        // itself become an unbounded second ledger.
+        // Refuse growth past the ceiling when malformed diagnostics cannot trim; preserve evidence without an unbounded second ledger.
         if let diagnosticAppendBytes, let effectiveMaxBytes,
            FileManager.default.fileExists(atPath: path.path) {
             let currentBytes = ((try? FileManager.default.attributesOfItem(
@@ -263,8 +239,7 @@ public func appendJSONLCapped(
         let fullCheckWillBeDue = JSONLCapCheckCounter.shared.isFullCheckDueOnNextAppend(
             path: path, stride: capCheckStride
         )
-        // Soft triggers count at bounded stride checkpoints; hard byte ceilings
-        // are checked on every append.
+        // Soft triggers count at bounded stride checkpoints; hard byte ceilings are checked on every append.
         let shouldCheckLines = validatedExistingCounts.map { $0.lines + 1 > effectiveMaxLines }
             ?? (fullCheckWillBeDue || effectiveTrimTrigger == nil)
         if let beforePotentialLineCap {
@@ -300,9 +275,7 @@ public func appendJSONLCapped(
             if !checkedData!.isEmpty, checkedData!.last != 0x0A { checkedData!.append(0x0A) }
             checkedData!.append(payload)
         }
-        // Spend the checkpoint only after a successful append. The caller's
-        // file lock keeps the earlier evidence-hook preview and this decision
-        // together. Full checkpoints always evaluate rows, regardless of size.
+        // Spend checkpoints only after append succeeds under the preview's lock; full checkpoints ignore byte triggers.
         _ = JSONLCapCheckCounter.shared.isFullCheckDue(
             path: path, stride: capCheckStride
         )
@@ -325,7 +298,6 @@ public func appendJSONLCapped(
         }
     }
     if takeLock {
-        // Append and cap share the feed lock; acquisition failure throws.
         try await SwiftNativePersistenceCore.withFileLock(path, work)
     } else {
         // Caller holds the compound transaction's different-path lock.
@@ -337,28 +309,22 @@ public enum JSONLPathOwnedAppendError: Error, Equatable {
     case unregisteredPath(String)
     case recordExceedsByteLimit(String, Int, Int)
     case unreadableDiagnosticFeed(String)
-    /// The shared byte writer refuses uncapped appends to path-owned feeds.
+    /// Refuse uncapped writes so callers cannot bypass path-owned retention.
     case rawAppendToPathOwnedFeed(String)
 }
 
-/// Permit for the sanctioned capped-append route. Set ONLY by
-/// `appendJSONLCapped` around the inner raw append; read by
-/// `SwiftNativePersistenceCore.appendBytes`. Task-local rather than a flag on
-/// the type so it cannot leak across concurrent appends.
+/// Task-local permission confines raw appends to the capped owner without leaking authority across concurrent appends.
 enum JSONLPathOwnedAppendPermit {
     @TaskLocal static var isInsideCappedAppend: Bool = false
 }
 
-/// Append through the path-owned cap registry. An unregistered path fails loud
-/// so a typo or newly introduced writer cannot silently bypass retention.
-/// Same-path lock reentry keeps an enclosing feed transaction intact.
+/// Reject unregistered paths so typos and new writers cannot bypass retention; same-path reentry preserves transactions.
 public func appendPathOwnedJSONL(
     _ event: JSONValue,
     to path: URL,
     logLabel: String,
     durable: Bool = false,
-    // Passthrough to `appendJSONLCapped`'s pre-trim hook, for the owners whose
-    // feed must not lose a row to a trim. It throws to STOP the append.
+    // Owners may refuse the append when pre-trim evidence cannot be preserved.
     beforePotentialLineCap: (@Sendable ([Substring]?) async throws -> Void)? = nil
 ) async throws {
     guard let policy = jsonlPathOwnedCapPolicy(for: path) else {

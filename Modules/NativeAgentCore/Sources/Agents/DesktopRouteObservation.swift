@@ -6,18 +6,13 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `DesktopRouteObservation.swift` | Existing operation-owned AX/workspace/keyboard observation, exact boundary timer and bounded unsupported-source polling |
-/// One desktop operation's observation, registered before its first predicate
-/// read. AX/workspace/input events wake it; a one-shot timer settles a quiet
-/// interval or ends a bounded wait. With no supported AX notifications, reads
-/// wake every 250ms only inside the caller's deadline. Every caller stops it.
-/// Observation is a wake, never a precondition: a failed registration or
-/// renewal is reported only after the caller has read its condition.
+// Blueprint: | `DesktopRouteObservation.swift` | Event wakes retain bounded deadlines. |
+/// Register before the first predicate read; events wake bounded waits and one-shot timers settle quiet intervals. Without AX notifications, sample only inside
+/// the caller’s deadline at 250 ms. Read the condition before surfacing observation failure; every caller must stop its observer.
 @MainActor final class DesktopRouteObservation {
     enum Wake: String, Sendable {
         case initialRead = "initial_read"
-        // The AX stream includes its registration-race signal. A wake does
-        // not claim that a change notification or content change occurred.
+        // The AX stream includes its registration-race signal. A wake does not claim that a change notification or content change occurred.
         case accessibility = "accessibility_subscription"
         case workspace, keyboard
         case boundary = "time_boundary"
@@ -36,9 +31,9 @@ import Senses
     private var workspace: [NSObjectProtocol] = []
     private var input: [Any] = []
 
-    init(bundleID: String, accessibility: Bool = true, keyboard: Bool = false) throws {
+    init(bundleID: String, context: MacOperationContext, accessibility: Bool = true, keyboard: Bool = false) throws {
         try Task.checkCancellation()
-        do { source = accessibility ? try MacAppSourceEvents(bundleID: bundleID) : nil }
+        do { source = accessibility ? try MacAppSourceEvents(bundleID: bundleID, context: context) : nil }
         catch is CancellationError { throw CancellationError() }
         catch {
             source = nil
@@ -73,7 +68,10 @@ import Senses
                         pair.continuation.yield(.accessibility)
                     }
                     guard !Task.isCancelled else { return }
-                    self?.sourceFailure = GrokRoutineAccessibility.Failure(detail: "Accessibility observation ended before the condition was confirmed. Bring the app forward with its Accessibility tree available, then continue.")
+                    self?.sourceFailure = GrokRoutineAccessibility.Failure(detail: """
+                        Accessibility observation ended before the condition was confirmed. Bring the app forward with its Accessibility tree \
+                        available, then continue.
+                        """)
                 } catch {
                     guard !Task.isCancelled else { return }
                     if let reason = Self.unsupportedReason(error) { self?.pollingReason = reason }
@@ -111,7 +109,8 @@ import Senses
         } else {
             timer.schedule(deadline: .distantFuture)
             guard pollingReason == nil else {
-                throw GrokRoutineAccessibility.Failure(detail: "Desktop interval observation requires the step's own deadline; no unbounded interval reader was started.")
+                throw GrokRoutineAccessibility.Failure(
+                    detail: "Desktop interval observation requires the step's own deadline; no unbounded interval reader was started.")
             }
         }
         var iterator = stream.makeAsyncIterator()

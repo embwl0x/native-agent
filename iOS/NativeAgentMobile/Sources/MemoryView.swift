@@ -1,6 +1,6 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `MemoryView.swift` | Memory page and proposal rows read the shared sync projection; composes mutation and local search owners |
+// Blueprint: | `MemoryView.swift` | Memories to keep: the memory proposals page and its rows read the shared sync projection; the memories themselves are the memories face |
 
 // MARK: - MemoryView
 
@@ -10,34 +10,13 @@ struct MemoryView: View {
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var showsConnection = false
     @ObservedObject private var bridge = iCloudBridge.shared
-    @State private var segment: MemorySegment
-    /// Search filters only the memory snapshot already synced to this phone.
-    @State private var searchQuery = ""
-    /// Tab roots own navigation; pushed destinations use the caller’s stack.
+    /// Pushed destinations reuse their caller's stack; only tab roots own navigation.
     private let embedInNavigationStack: Bool
 
-    enum MemorySegment: String, CaseIterable {
-        case memories = "Memories"
-        case proposals = "Proposals"
-    }
+    /// Proposals age from their own delivery.
+    static let snapshotGroup = "memory_proposals"
 
-    /// The Mac snapshot group behind each tab. They fail INDEPENDENTLY —
-    /// `memories` and `memory_proposals` are separate fetches on the Mac — so a
-    /// badge pinned to one group leaves the other tab looking fresh while the
-    /// Mac already knows its rows are old.
-    static func snapshotGroup(for segment: MemorySegment) -> String {
-        switch segment {
-        case .memories: return "memories"
-        case .proposals: return "memory_proposals"
-        }
-    }
-
-    init(initialSegment: MemorySegment = .memories, embedInNavigationStack: Bool = true) {
-        var segment = initialSegment
-        #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("-memorySampleProposals") { segment = .proposals }
-        #endif
-        _segment = State(initialValue: segment)
+    init(embedInNavigationStack: Bool = true) {
         self.embedInNavigationStack = embedInNavigationStack
     }
 
@@ -53,27 +32,9 @@ struct MemoryView: View {
 
     @ViewBuilder
     private var memoryContent: some View {
-        Group {
-            switch segment {
-            case .memories:
-                MemoryListView(store: store, searchQuery: searchQuery, header: AnyView(memoryHeader))
-            case .proposals:
-                ProposalsListView(store: store, header: AnyView(memoryHeader))
-            }
-        }
-        // At the tab root the bar has nothing to hold; pushed, it keeps Back.
-        .alivePageChrome(title: "Memories", root: embedInNavigationStack)
-        // The search floats over the list, above the tab bar, like the
-        // composer. Outside the chrome, so the list's bottom fade runs under it.
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            // Nothing to search until something has arrived.
-            if segment == .memories && (!store.memories.isEmpty || MemorySamples.isOn || !searchQuery.isEmpty) {
-                AliveSearchField(prompt: "Search memories", text: $searchQuery)
-                    .padding(.horizontal, AliveMetrics.pageInset)
-                    .padding(.top, 6)
-                    .padding(.bottom, 8)
-            }
-        }
+        ProposalsListView(store: store, header: AnyView(memoryHeader))
+        // Keep Back when pushed; tab roots need no navigation bar.
+        .alivePageChrome(title: "Memories to keep", root: embedInNavigationStack)
         .sheet(isPresented: $showsConnection) {
             PairingView(onSkip: { showsConnection = false }, onPaired: { showsConnection = false })
         }
@@ -83,24 +44,17 @@ struct MemoryView: View {
 
     private var headerLine: String {
         let sample = MemorySamples.isOn
-        switch segment {
-        case .memories:
-            return MemoryWords.memoriesLine(sample ? MemorySamples.memories.count : store.memories.count)
-        case .proposals:
-            guard sample || sync.memoryProposalsSnapshotLoaded else { return "Memory proposals have not arrived from the Mac yet." }
-            let count = sample && store.memoryProposals.isEmpty ? MemorySamples.proposals.count : store.memoryProposals.count
-            return MemoryWords.proposalsLine(count)
-        }
+        guard sample || sync.memoryProposalsSnapshotLoaded else { return "Memory proposals have not arrived from the Mac yet." }
+        let count = sample && store.memoryProposals.isEmpty ? MemorySamples.proposals.count : store.memoryProposals.count
+        return MemoryWords.proposalsLine(count)
     }
 
     private var memoryHeader: some View {
         VStack(alignment: .leading, spacing: 14) {
-            AlivePageHeader(title: "Memories", line: headerLine,
+            AlivePageHeader(title: "Memories to keep", line: headerLine,
                             style: embedInNavigationStack ? .root : .pushed)
                 .padding(.horizontal, 4)
             memorySyncStatus
-            AliveSegmentedPicker(selection: $segment, options: MemorySegment.allCases) { $0.rawValue }
-                .padding(.top, 6)
             if let error = MemoryErrorLinePresentation.visibleMessage(store.error) {
                 MemoryErrorLine(message: error) {
                     store.dismissError()
@@ -121,28 +75,24 @@ struct MemoryView: View {
     }
 
     private var memorySyncStatus: some View {
-        // Reuse the freshness cadence and rules; connection and snapshot age
-        // are independent facts, presented together with one recovery.
+        // Connection and snapshot age are independent facts; share freshness cadence and offer one recovery.
         TimelineView(MacSnapshotFreshnessSchedule(
-            lastSyncedAt: sync.transportDeliveryAt(screenGroup: Self.snapshotGroup(for: segment)),
+            lastSyncedAt: sync.transportDeliveryAt(screenGroup: Self.snapshotGroup),
             fixed: sampleSyncState != nil, showsFreshAge: true)) { context in
             let sample = sampleSyncState
             let state = StatusConnectionPresentation.syncState(
-                // This segment's own delivery clock, not the cache-read clock.
+                // Age proposals from their delivery, never from a cache read.
                 lastSyncedAt: sample == "stale"
                     ? context.date.addingTimeInterval(-7200)
                     : sample != nil
                         ? nil
-                        : sync.transportDeliveryAt(screenGroup: Self.snapshotGroup(for: segment)),
+                        : sync.transportDeliveryAt(screenGroup: Self.snapshotGroup),
                 now: context.date)
-            let reason = MacSnapshotGroupStaleness.reason(in: sync.staleSnapshotGroups, group: Self.snapshotGroup(for: segment))
+            let reason = MacSnapshotGroupStaleness.reason(in: sync.staleSnapshotGroups, group: Self.snapshotGroup)
             let sharedError = MemoryErrorLinePresentation.visibleMessage(sync.syncError)
-            // The Mac's status is said once, in the chat header and More ›
-            // Connection. Here: unpaired, only the one way on; paired, only
-            // this page's own age when it is stale or never arrived.
+            // Keep Mac status in Chat/Connection; this page explains only pairing or its own stale/missing delivery.
             let unpaired = sample == nil && !pairingStore.usesICloudTransport
-            // A paired phone that lost its Apple Account: no snapshot can
-            // arrive, so the age alone would not say why or how to fix it.
+            // Apple Account loss blocks snapshots; age alone cannot explain the cause or remedy.
             let accountFailure = sample == nil ? bridge.accountFailure : nil
             let noAccount = sample == "noAccount" || accountFailure != nil
             let attention = sharedError != nil || reason != nil || StatusConnectionPresentation.needsAttention(state)
@@ -167,7 +117,6 @@ struct MemoryView: View {
                     UIApplication.shared.open(url)
                 }
             } else if attention {
-                // The page note every page wears: what is true, and one way on.
                 let title = sharedError != nil ? "My memories couldn\u{2019}t update"
                     : reason != nil ? "My memories may be out of date"
                     : MacSnapshotPageFreshness.line(for: state)
@@ -188,7 +137,6 @@ struct MemoryView: View {
     }
 }
 
-/// Plain words for the page: counts spelled out, kinds named for people.
 enum MemoryWords {
     static func memoriesLine(_ n: Int) -> String {
         switch n {
@@ -237,8 +185,7 @@ enum MemoryWords {
     }
 }
 
-/// View-only fixtures for `-memorySample`; never inserted into the store or
-/// sent to the Mac.
+/// Memory screenshot fixtures stay view-local; never insert them into the store or send them.
 enum MemorySamples {
     static var isOn: Bool {
         #if DEBUG
@@ -250,16 +197,21 @@ enum MemorySamples {
 
     static let memories: [MemoryRecord] = decode("""
     [
-      {"id":"sample-1","layer":"semantic","text":"Keep mornings open for focused work and save errands for the afternoon.","importance":0.8,"confidence":1,"tags":["routine","focus"],"createdAt":"2026-09-07"},
-      {"id":"sample-2","layer":"episodic","text":"A walk by the water was a good way to end a busy week.","importance":0.6,"confidence":1,"tags":["weekend","outdoors"],"createdAt":"2026-09-07"},
-      {"id":"sample-3","layer":"semantic","text":"When planning a project, start with a short outline and one useful next step.","importance":0.7,"confidence":1,"tags":["planning"],"createdAt":"2026-09-07"}
+      {"id":"sample-1","layer":"semantic","text":"Keep mornings open for focused work and save errands for the \
+    afternoon.","importance":0.8,"confidence":1,"tags":["routine","focus"],"createdAt":"2026-09-07"},
+      {"id":"sample-2","layer":"episodic","text":"A walk by the water was a good way to end a busy \
+    week.","importance":0.6,"confidence":1,"tags":["weekend","outdoors"],"createdAt":"2026-09-07"},
+      {"id":"sample-3","layer":"semantic","text":"When planning a project, start with a short outline and one useful next \
+    step.","importance":0.7,"confidence":1,"tags":["planning"],"createdAt":"2026-09-07"}
     ]
     """)
 
     static let proposals: [MemoryProposalRecord] = decode("""
     [
-      {"proposal_id":"sample-p1","fact_text":"Prefers a short summary first, with the details after.","status":"pending","createdAt":"2026-09-07","supporting_session_ids":["a","b"],"recurrence_count":3},
-      {"proposal_id":"sample-p2","fact_text":"Likes to finish the week with a walk outside.","status":"pending","createdAt":"2026-09-07","supporting_session_ids":[],"recurrence_count":1}
+      {"proposal_id":"sample-p1","fact_text":"Prefers a short summary first, with the details \
+    after.","status":"pending","createdAt":"2026-09-07","supporting_session_ids":["a","b"],"recurrence_count":3},
+      {"proposal_id":"sample-p2","fact_text":"Likes to finish the week with a walk \
+    outside.","status":"pending","createdAt":"2026-09-07","supporting_session_ids":[],"recurrence_count":1}
     ]
     """)
 
@@ -324,7 +276,8 @@ struct ProposalsListView: View {
         List {
             header.aliveListRow(top: 0, bottom: 10)
             if proposals.isEmpty && !iCloudSyncEngine.shared.memoryProposalsSnapshotLoaded && !isSample {
-                AliveCalmState(title: "Proposals unavailable", line: "The Mac proposal snapshot has not arrived. Keep NativeAgent open on the paired Mac and refresh after reconnecting.")
+                AliveCalmState(title: "Proposals unavailable",
+                    line: "The Mac proposal snapshot has not arrived. Keep NativeAgent open on the paired Mac and refresh after reconnecting.")
                     .aliveListRow()
             } else if proposals.isEmpty {
                 AliveCalmState(
@@ -337,7 +290,7 @@ struct ProposalsListView: View {
                     MemoryProposalRow(
                         proposal: proposal,
                         isDeciding: store.decidingMemoryProposalIDs.contains(proposal.id),
-                        // Sample rows are pictures only; they never reach the Mac.
+                        // Sample rows are presentation only and must not reach the Mac.
                         onApprove: { if !isSample { store.approveMemoryProposal(proposal) } },
                         onDeny: { if !isSample { store.rejectMemoryProposal(proposal) } }
                     )
@@ -352,7 +305,6 @@ struct ProposalsListView: View {
     }
 }
 
-/// Something I would like to remember, and your two answers.
 struct MemoryProposalRow: View {
     let proposal: MemoryProposalRecord
     let isDeciding: Bool

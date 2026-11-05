@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `PersonaModels.swift` | Shared personality traits, saved profile, onboarding-name speech context, identity name validation and display names; PersonaEngine owns canonical storage |
+// Blueprint: | `PersonaModels.swift` | Shared persona values and name validation; PersonaEngine owns identity |
 
 public struct PersonalityTraits: Codable, Hashable, Sendable {
     public var warmth: Double

@@ -3,7 +3,7 @@ import BackgroundLoops
 import NativeAgentCore
 import TriggerScheduler
 import StandingBots
-// Blueprint: | `TriggerSchedulerBackgroundWork.swift` | `TriggerSchedulerBackgroundWork` composes sequential jobs, bots and continuations inside the managed tick; `BackgroundLoopLifetimes` alone owns task lifetime and shutdown settlement; event/deadline runner for canonical scheduler jobs and inbox occurrences; briefing prompt and synthesis policy live in `native-morning-brief.js` |
+// Blueprint: | `TriggerSchedulerBackgroundWork.swift` | `TriggerSchedulerBackgroundWork`, `BackgroundLoopLifetimes`, `native-morning-brief.js`; scheduling |
 
 public enum TriggerSchedulerBackgroundWork {
     public struct JobWork: Sendable {
@@ -22,11 +22,11 @@ public enum TriggerSchedulerBackgroundWork {
     ) -> JobWork {
         return JobWork(
             runDueJobs: {
-                let jobs = await runDueJobs(5)
-                guard !Task.isCancelled else { return jobs }
-                let botJobs = await bots.runDue()
-                guard !Task.isCancelled else { return jobs + botJobs }
-                return jobs + botJobs + (await continuations?.runDue() ?? [])
+                async let jobs = runDueJobs(5)
+                async let botJobs = bots.runDue()
+                async let deskJobs = continuations?.runDue() ?? []
+                let due = await (jobs, botJobs, deskJobs)
+                return due.0 + due.1 + due.2
             },
             activityFailure: {
                 let jobs = await activityFailure()
@@ -48,9 +48,7 @@ public enum TriggerSchedulerBackgroundWork {
 
 public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     public let loopId = "trigger_scheduler_due_work"
-    /// Missed-event integrity only. Normal work wakes from canonical file
-    /// invalidations or an exact persisted due instant.
-    public let interval: TimeInterval = 6 * 60 * 60
+    public let wake: OrganWake = .onChange
     public var tickTimeoutOverride: TimeInterval? { 1800 }
     public var eventCoalescingDelay: TimeInterval { 0.5 }
 
@@ -60,9 +58,7 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     let triggerScheduler: SwiftNativeTriggerScheduler
     let runDueJobs: @Sendable () async -> [String]
     let shutdownJobs: @Sendable () async -> Void
-    /// Read immediately after `runDueJobs`. A durable scheduler effect without
-    /// its activity evidence is deliberately a failed loop receipt, not a
-    /// quiet "nothing due" tick that lets later trigger effects proceed.
+    /// Read activity immediately after effects; missing evidence must fail before later trigger effects proceed.
     let schedulerActivityFailure: @Sendable () async -> String?
     let nextSchedulerJobDeadline: @Sendable (Date) async -> Date?
 
@@ -95,14 +91,10 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
             dataRoot.appendingPathComponent("bots/definitions"),
             dataRoot.appendingPathComponent("bots/runner-jobs.json"),
             dataRoot.appendingPathComponent("bots/run-queue.json"),
-            // Scheduled bot admission now reads the master Autonomy switch, so
-            // flipping it is the event that re-arms (or retires) the bot
-            // deadline — the same watch the Workshop pump keeps.
+            // The Autonomy switch governs bot admission and must rearm or retire its deadline.
             dataRoot.appendingPathComponent("trust/policy.json"),
             triggerScheduler.inboxPath,
             triggerScheduler.inboxStatePath,
-            triggerScheduler.workshopExecutionsPath,
-            triggerScheduler.workshopExecutionStatePath,
             // Session changes wake reconciliation; only `time` triggers are clock-due.
             dataRoot.appendingPathComponent("chat/sessions.json"),
         ], loopId)
@@ -130,8 +122,7 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         }
 
         let active = (fires.compactMap(\.name) + dueJobs).sorted()
-        // Reading every trigger cleanly is this loop's work, due or not: it is
-        // what proves a failed read repaired, without waiting for a fire.
+        // A clean read proves source repair even when no trigger is due to fire.
         guard !active.isEmpty else { return .completed(result: "every trigger read; nothing due") }
         return .completed(result: "settled \(active.count) due item(s): \(active.joined(separator: ", "))")
     }

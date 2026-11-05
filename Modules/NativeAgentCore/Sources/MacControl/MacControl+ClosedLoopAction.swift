@@ -12,20 +12,16 @@ import CoreGraphics
 #if canImport(UserNotifications)
 import UserNotifications
 #endif
-// Blueprint: | `MacControl+ClosedLoopAction.swift` | `SwiftNativeMacControl.handleAct`: same process/window and rendered identity on every act; fresh entry for resolve-time drift and per-step effects; canonical post-effect publication |
+// Blueprint: | `MacControl+ClosedLoopAction.swift` | `SwiftNativeMacControl.handleAct`: Same-window live identity and per-step declared effects |
 
 extension SwiftNativeMacControl {
-    /// What one verb's mechanism did, before the effect is measured.
     struct MacActPerformed {
         var ok: Bool
-        /// `ax_action` | `ax_set_value` | `keystroke_injection` |
-        /// explicitly requested `cgevent_*` gestures | `none`
         var method: String
         var requestedAction: String
 
         var error: String?
-        /// The element the verb actually acted ON. For `dismiss` this is the
-        /// modal's button, not the handle she named.
+        /// Dismissal acts on the modal button, which can differ from the handle originally named.
         var target: MacAXActTarget
         var postState: MacAXActTarget?
         var actedHandle: String
@@ -34,20 +30,12 @@ extension SwiftNativeMacControl {
         var textBeforeWrite: String? = nil
     }
 
-    /// `act` — perceive-act-verify in ONE call.
-    ///
-    /// Observe before acting, then return the declared-effect verdict and fresh
-    /// percept together. Notifications wake the read; they do not prove its effect.
-    ///
-    /// Ordinary acts use policy, Full Mac, category, TCC and driver admission.
-    /// Explicit approved replays also validate and consume a body-bound single-use
-    /// capability. A frame/handle names a target and grants no authority.
-    func handleAct(_ body: [String: JSONValue]) async -> MacControlResult {
+    /// Return the declared-effect verdict with fresh perception; notifications only wake reads. Frame handles grant no authority, and explicit replays still
+    /// consume a body-bound capability after normal admission.
+    func handleAct(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
         let started = now()
 
-        // 1. THE REQUEST. Every malformed field is refused, never defaulted:
-        //    an act aimed at a guessed target is the failure this whole tool
-        //    exists to prevent.
+        // Refuse malformed fields rather than inventing a target.
         guard let rawVerb = body["verb"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawVerb.isEmpty else {
             return injectionRefusal(
@@ -113,13 +101,10 @@ extension SwiftNativeMacControl {
         let waitMs = MacActClosedLoop.clampedWaitMs(body["wait_ms"]?.integerValue.flatMap(Int.init(exactly:)))
         // Anchored background AX actions stay in their app; work needing foreground input returns `needs_front` without raising.
         let background = body["background"] == .bool(true)
-        let frontBefore = accessibilitySource.frontmostApp()
+        let frontBefore = accessibilitySource(context: context).frontmostApp()
 
-        // 2. HANDLE → PATH, through the frame store and its own failure
-        //    vocabulary. Each failure names what to do next, because "that
-        //    didn't work" with no reason is what sends a model into a retry
-        //    loop against a screen that has moved on.
-        let resolved = await lookFrameStore.resolve(handle: handle, frameId: frameId, now: started)
+        // Frame resolution failures retain their own remedies so callers cannot blindly retry against a changed screen.
+        let resolved = await lookFrameStore.resolve(handle: handle, frameId: frameId, now: started, context: context)
         var entry: MacLookFrameEntry
         switch resolved {
         case .failure(let failure):
@@ -136,7 +121,7 @@ extension SwiftNativeMacControl {
         case .success(let hit):
             entry = hit
         }
-        guard let frame = await lookFrameStore.frame(frameId: frameId) else {
+        guard let frame = await lookFrameStore.frame(frameId: frameId, context: context) else {
             return injectionRefusal(
                 action: "act",
                 error: MacLookFrameStore.ResolveFailure.noFrame.rawValue,
@@ -145,12 +130,11 @@ extension SwiftNativeMacControl {
             )
         }
 
-        // 3. THE SAME GATES `ax_act` clears. The TCC grant, then the human's
-        //    physical priority.
-        if let refusal = injectionPreconditions(action: "act", requiresSink: false) {
+        // Recheck the system grant and physical-input priority before resolving an action target.
+        if let refusal = injectionPreconditions(action: "act", requiresSink: false, context: context) {
             return refusal
         }
-        if let refusal = await attentionActionRefusal(action: "act", body: body) {
+        if let refusal = await attentionActionRefusal(action: "act", body: body, turn: turn, context: context) {
             return refusal
         }
 
@@ -170,19 +154,16 @@ extension SwiftNativeMacControl {
                 ]
             )
         }
-        if let continuation = MacWorkContinuation.current, continuation.isPending,
+        if let continuation = turn.macContinuation, continuation.isPending,
            let captured = continuation.window {
             guard framePid == captured.pid, let observed = frame.windowIdentity,
                   observed.role == captured.role, observed.subrole == captured.subrole,
                   observed.title == captured.title, observed.frame == captured.frame else {
                 return injectionRefusal(action: "act", error: "continuation_target_mismatch", status: 409,
-                    extra: ["guidance": .string(continuation.modelContext)])
+                    extra: ["guidance": .string(continuation.modelContext(context: context))])
             }
         }
-        // 4a½. A frame that names OUR OWN process (only possible from a store
-        //      populated before the self-inspection fence shipped) must refuse
-        //      BEFORE `windows(pid:)` or any other actuator call starts an AX
-        //      transaction against ourselves — see `MacAnchoredRead.selfProcess`.
+        // Refuse self-process frames before any actuator AX call to prevent in-process AppKit re-entry deadlock.
         if framePid == getpid() {
             await lookFrameStore.invalidate()
             return injectionRefusal(
@@ -201,7 +182,7 @@ extension SwiftNativeMacControl {
         }
         // Match the observed window by persistent identity; missing or ambiguous matches refuse instead of choosing current focus.
         let actWindows: [MacAXWindowRef]
-        do { actWindows = try accessibilityActSource.windows(pid: framePid) }
+        do { actWindows = try accessibilityActSource(context: context).windows(pid: framePid, context: context) }
         catch { return injectionRefusal(action: "act", error: "window_evidence_unavailable", status: 409,
             extra: ["guidance": .string(error.localizedDescription), "posted_events": .int(0)]) }
         if actWindows.isEmpty, MacScreenLock.isLocked() {
@@ -285,14 +266,13 @@ extension SwiftNativeMacControl {
             pid: framePid,
             window: frame.windowIdentity,
             complete: frame.completeWindow
-        )
+        , context: context)
         let identityRead: MacAXRead
         switch identityAnchor {
         case .read(let hit):
             identityRead = hit
         case .appGone, .windowGone, .windowDrifted, .rendererUnavailable, .selfProcess:
-            // Nothing to verify against and nothing to act on: the frame is
-            // dead, so it must stop resolving handles as well.
+            // Nothing to verify against and nothing to act on: the frame is dead, so it must stop resolving handles as well.
             await lookFrameStore.invalidate()
             let (error, reason): (String, String) = {
                 switch identityAnchor {
@@ -318,14 +298,12 @@ extension SwiftNativeMacControl {
                 ]
             )
         }
-        // The SAME scoping the look ran under, or a page handle would be
-        // compared against a window walk that never reaches the page and every
-        // act on a web control would refuse as drift.
+        // Reuse the look's scope so a page handle is not compared with a window walk that cannot reach it.
         let identityScoped: MacAXRead
         do {
             identityScoped = try pageScoped(identityRead, limits: identityLimits,
                 scope: MacLookScope.parse(body["scope"]?.stringValue) ?? .page,
-                completeWindow: frame.completeWindow).read
+                completeWindow: frame.completeWindow, context: context).read
         } catch {
             return injectionRefusal(action: "act", error: "renderer_classification_unavailable", status: 409,
                 extra: ["guidance": .string(error.localizedDescription), "posted_events": .int(0)])
@@ -338,11 +316,7 @@ extension SwiftNativeMacControl {
             focusPath: identityScoped.focusPath,
             uncapped: true
         )
-        // The live element is looked up in the SAME channels the frame entry
-        // could have been minted from — affordances at that path, else the
-        // recompiled FOCUS when the focus sits there. An unlabeled focused
-        // control (Notes' empty note body) is never an affordance, so an
-        // affordance-only lookup refused every act on it as `element_absent`.
+        // Resolve through every channel that can mint a frame entry, including focus; an unlabeled focused editor need not be an affordance.
         if let drift = MacActClosedLoop.identityDrift(
             entry: entry,
             live: MacActClosedLoop.liveIdentity(entry: entry, percept: identityPercept)
@@ -369,8 +343,7 @@ extension SwiftNativeMacControl {
                 ]
             )
         }
-        // A position-derived handle inside a list row: rows are recycled as
-        // the list scrolls, so its position cannot prove which record it is.
+        // A position-derived handle inside a list row: rows are recycled as the list scrolls, so its position cannot prove which record it is.
         if entry.ambiguous, identityScoped.snapshot.nodes.contains(where: {
             MacLookHandle.contentIdentityRoles.contains($0.attributes.role) && entry.path.starts(with: $0.path)
         }) {
@@ -393,7 +366,7 @@ extension SwiftNativeMacControl {
             return injectionRefusal(action: "act", error: "handle_drifted", status: 409)
         }
         let target: MacAXActTarget
-        switch accessibilityActSource.resolve(path: live.path, inWindow: actWindow) {
+        switch accessibilityActSource(context: context).resolve(path: live.path, inWindow: actWindow, context: context) {
         case .unavailable(let detail):
             return injectionRefusal(action: "act", error: "ax_evidence_unavailable", status: 409,
                 extra: ["guidance": .string(detail), "posted_events": .int(0)])
@@ -450,10 +423,8 @@ extension SwiftNativeMacControl {
         }
         let entrySecret = entry.secret || currentEntry.secret
         entry = currentEntry
-        // 5. The rendered identity above confirms the originally named control.
-        //    Check the resolved target against that fresh observation: a field's
-        //    value-derived label may have changed in an earlier batch step.
-        //    Drift between this observation and path resolution still refuses.
+        // Check the resolved target against fresh rendered identity; prior batch input can change a value-derived label, while later path drift must still
+        // refuse.
         if let reason = MacActClosedLoop.driftReason(
             expectedRole: entry.role,
             expectedLabel: entry.label,
@@ -485,10 +456,8 @@ extension SwiftNativeMacControl {
             )
         }
 
-        // Identity comes from the retained observation; effect evidence starts
-        // NOW. Earlier batch steps must never prove this step's consequence.
-        // Identity lookup is uncapped; effects use the same presentation cap
-        // on both sides so omitted controls cannot look like removals.
+        // Identity comes from the retained observation; effect evidence starts NOW. Earlier batch steps must never prove this step's consequence. Identity
+        // lookup is uncapped; effects use the same presentation cap on both sides so omitted controls cannot look like removals.
         let effectAffordanceCap = body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacPerceptionCompiler.maxAffordances
         let effectPercept = MacPerceptionCompiler.compile(snapshot: identityScoped.snapshot,
             secretContext: MacScreenViewTextRedaction.nodeSecretContext(identityScoped.snapshot.nodes),
@@ -529,13 +498,13 @@ extension SwiftNativeMacControl {
             )
         }
 
-        // 7. PERFORM. A typed field's value before input is the baseline its readback is judged against.
-        let textBeforeInput = verb == .type ? accessibilityActSource.reread(target)?.value : nil
+        // Capture pre-input field value so readback can distinguish a change from unchanged state.
+        let textBeforeInput = verb == .type ? accessibilityActSource(context: context).reread(target, context: context)?.value : nil
         let performedAt = now()
         let performed: MacActPerformed?
         if let placement {
             performed = await placeInSavePanel(placement, target: target, window: actWindow, pid: framePid,
-                                              handle: handle, frontBefore: frontBefore)
+                                              handle: handle, frontBefore: frontBefore, turn: turn, context: context)
         } else { performed = await performAct(
             body: body, verb: verb,
             handle: handle,
@@ -549,12 +518,11 @@ extension SwiftNativeMacControl {
             direction: direction,
             background: background,
             keystrokes: body["keystrokes"] == .bool(true)
-        ) }
+        , turn: turn, context: context) }
         await screenViewStore.invalidate()
 
         guard let performed else {
-            // Only reachable for a verb whose mechanism does not exist on this
-            // element — reported by name, never as a silent no-op.
+            // Missing mechanisms produce named refusals so unsupported verbs cannot report silent success.
             return injectionRefusal(
                 action: "act",
                 error: verb == .dismiss ? "no_dismiss_target" : "verb_not_supported_on_element",
@@ -576,9 +544,7 @@ extension SwiftNativeMacControl {
             )
         }
 
-        // 8. WAIT FOR THE EFFECT. Nothing arriving inside wait_ms is a REAL
-        //    outcome, not a failure: it means this app published no
-        //    notification, which the caller needs to know.
+        // No notification within wait_ms is an unobserved outcome, never proof that the action failed or did nothing.
         let clock = now
         // Navigation waits for a transition, not a selection reaction; explicit `wait_ms` overrides the bounded default.
         let navigationVerb = MacActClosedLoop.navigationVerbs.contains(verb)
@@ -596,10 +562,9 @@ extension SwiftNativeMacControl {
         // Close a background-opened menu through its owning element and report whether it closed.
         var menuLeftOpen: Bool?
         if background, wait.notifications.contains("AXMenuOpened") {
-            menuLeftOpen = accessibilityActSource.perform(performed.target, action: "AXCancel") != .performed
+            menuLeftOpen = accessibilityActSource(context: context).perform(performed.target, action: "AXCancel", turn: turn, context: context) != .performed
         }
 
-        // 9. RE-COMPILE the same look percept and DIFF it against the frame.
         let limits = Self.axLimits(from: body)
         // Post-action readback stays anchored to the frame's window so its effect and next frame describe the acted-on surface.
         let (read, seam, postAnchor) = await lookSnapshot(
@@ -608,7 +573,7 @@ extension SwiftNativeMacControl {
             anchorPid: framePid,
             anchorWindow: frame.windowIdentity,
             completeWindow: frame.completeWindow
-        )
+        , context: context)
         let redactValue = verb == .type
         var effect: [String: JSONValue] = [
             "observed": .bool(wait.observed),
@@ -624,9 +589,7 @@ extension SwiftNativeMacControl {
                     labelJSON: entry.labelJSON,
                     valueJSON: entry.valueJSON
                 ),
-                // The post-act read carries NO compile context, so a value the
-                // look hid would come back in the clear here. The frame's own
-                // verdict decides: secret before ⇒ secret after, digest only.
+                // Post-act reads lack caption context; preserve the frame's secret verdict and expose only a digest for values it withheld.
                 "after": performed.postState.map {
                     MacActReceiptRendering.actedElementJSON(
                         $0,
@@ -656,11 +619,11 @@ extension SwiftNativeMacControl {
             "requested_action": .string(performed.requestedAction),
             "path": .array(live.path.map { .int(Int64($0)) }),
             "seam": .object(seam),
-            // Until the post-action read supplies evidence there is no verdict.
+            // Leave the verdict unset until post-action evidence arrives.
             "verified": .bool(false),
             "value_redacted": .bool(redactValue),
         ]
-        // Ordinal handles remain actionable but report their positional ambiguity.
+        // Report positional ambiguity even when ordinal handles remain actionable.
         if entry.ambiguous {
             output["handle_ambiguous"] = .bool(true)
             output["handle_ambiguity"] = .string(
@@ -670,9 +633,8 @@ extension SwiftNativeMacControl {
         }
         for (key, value) in performed.extra { output[key] = value }
         if let error = performed.error { output["error"] = .string(error) }
-        // Whether the person's front app moved during this act — the proof
-        // flag for "User's screen touched".
-        let frontAfter = accessibilitySource.frontmostApp()
+        // Compare front-app reads so the receipt reports whether this act touched the person's screen.
+        let frontAfter = accessibilitySource(context: context).frontmostApp()
         output["front_app_changed"] = .bool(frontBefore?.processIdentifier != frontAfter?.processIdentifier)
         output["background"] = .bool(background)
         if let menuLeftOpen {
@@ -695,39 +657,40 @@ extension SwiftNativeMacControl {
         }
         func verdict(_ diff: MacActClosedLoop.EffectDiff?, selected: Bool? = nil) -> MacActClosedLoop.ActClassification {
             let windowsAfter: [MacAXWindowRef]
-            do { windowsAfter = try accessibilityActSource.windows(pid: framePid) }
+            do { windowsAfter = try accessibilityActSource(context: context).windows(pid: framePid, context: context) }
             catch { return MacActClosedLoop.ActClassification(status: "acted_unobserved", reason: "window_readback_unavailable",
                 note: "The action was delivered, but its window readback failed: " + error.localizedDescription + " Inspect this app before another action.") }
             if verb == .type, performed.method == "ax_set_value",
                let before = performed.textBeforeWrite, before != performed.expectedText,
-               accessibilityActSource.reread(performed.target)?.value == before {
+               accessibilityActSource(context: context).reread(performed.target, context: context)?.value == before {
                 return MacActClosedLoop.ActClassification(status: "acted_unobserved",
                     reason: "text_write_unverified",
                     note: "AX acknowledged the text write, but the value reads unchanged. Inspect the readback before another write.")
             }
             return MacActClosedLoop.verify(declaration,
-                value: accessibilityActSource.reread(performed.target)?.value,
+                value: accessibilityActSource(context: context).reread(performed.target, context: context)?.value,
                 valueBefore: performed.textBeforeWrite ?? textBeforeInput,
                 selected: selected,
-                focused: accessibilityActSource.focusedElement(pid: framePid).flatMap { _ in
-                    accessibilityActSource.focusedWindow(pid: framePid).map {
-                        accessibilityActSource.isFocusedElement(performed.target, pid: framePid) && $0.handle == actWindow.handle
+                focused: accessibilityActSource(context: context).focusedElement(pid: framePid, context: context).flatMap { _ in
+                    accessibilityActSource(context: context).focusedWindow(pid: framePid, context: context).map {
+                        accessibilityActSource(context: context).isFocusedElement(performed.target, pid: framePid, context: context) && $0.handle == actWindow
+                            .handle
                     }
                 },
                 surfaceChanged: windowsAfter.contains { window in
                     !actWindows.contains { $0.handle == window.handle }
                 } ? true : nil,
-                dismissed: accessibilityActSource.windowPresence(actWindow).map { !$0 },
-                processGone: accessibilitySource.appInfo(pid: framePid) == nil,
+                dismissed: accessibilityActSource(context: context).windowPresence(actWindow, context: context).map { !$0 },
+                processGone: accessibilitySource(context: context).appInfo(pid: framePid) == nil,
                 diff: diff, notifications: wait.notifications,
-                pointerOnTarget: accessibilityActSource.reread(performed.target)?.frame.flatMap { frame in
+                pointerOnTarget: accessibilityActSource(context: context).reread(performed.target, context: context)?.frame.flatMap { frame in
                     self.pointerPositionSource.currentPosition().map { $0.isInside(frame) }
                 },
                 redactingText: entrySecret,
-                // A readout counts once it reads the same again, element by element.
+                // A readout verifies only after an element-by-element stable reread.
                 press: verb == .click ? (effectBefore, entry, { row in
                     guard let node = read?.snapshot.nodes.first(where: { $0.path == row.path }), let element = node.element,
-                          let fresh = self.accessibilitySource.attributes(of: element) else { return false }
+                          let fresh = self.accessibilitySource(context: context).attributes(of: element, context: context) else { return false }
                     return fresh.value == node.attributes.value && fresh.title == node.attributes.title
                 }) : nil,
                 destinationJSON: entry.labelJSON ?? .null, windowTitleJSON: effect["window_title"])
@@ -808,7 +771,7 @@ extension SwiftNativeMacControl {
             secretContext: MacScreenViewTextRedaction.nodeSecretContext(read.snapshot.nodes),
             app: read.app,
             windowTitle: read.rootTitle,
-            // Same read epoch as the post-act walk, anchored to its root.
+            // Anchor focus to the same root and epoch as the post-act walk.
             focusPath: read.focusPath,
             maxAffordances: body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacPerceptionCompiler.maxAffordances,
             uncapped: frame.completeWindow
@@ -816,7 +779,8 @@ extension SwiftNativeMacControl {
         // Record compile bounds so census comparison cannot mistake truncation for navigation.
         let afterCaps = MacLookCompileCaps(
             truncated: after.truncated,
-            maxAffordances: frame.completeWindow ? nil : body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacPerceptionCompiler.maxAffordances,
+            maxAffordances: frame.completeWindow ? nil : body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:))
+                ?? MacPerceptionCompiler.maxAffordances,
             maxNodes: frame.completeWindow ? nil : limits.maxNodes,
             maxDepth: frame.completeWindow ? nil : limits.maxDepth
         )
@@ -848,12 +812,11 @@ extension SwiftNativeMacControl {
 
         // The verb's reply look reads this same post-effect walk (a timed-out walk is read afresh).
         if frame.completeWindow, !read.snapshot.truncationReasons.contains("time_budget") {
-            MacSightCaptureBinding.current?.walked = (read, seam)
-            MacSightCaptureBinding.current?.percept = after
+            context.capture?.walked = (read, seam)
+            context.capture?.percept = after
         }
 
-        // 10. A NEW FRAME, so the next verb continues from the state the act
-        //     produced instead of from a description of the screen before it.
+        // Publish a fresh frame so the next verb sees the state produced by this act.
         let capturedAt = now()
         let newFrameId = UUID().uuidString
         await lookFrameStore.record(MacLookFrame.from(
@@ -861,13 +824,11 @@ extension SwiftNativeMacControl {
             frameId: newFrameId,
             capturedAt: capturedAt,
             windowTitle: read.rootTitle,
-            // The new frame is anchored to the window the ACT happened in —
-            // the same window the read above was anchored to, re-read fresh so
-            // a moved or retitled window carries its new identity forward.
+            // Retain the acted-on window and refresh its identity so moves and retitles carry forward without switching surfaces.
             windowIdentity: read.windowIdentity ?? frame.windowIdentity,
             caps: afterCaps,
             completeWindow: frame.completeWindow
-        ))
+        ), context: context)
         output["frame_id"] = .string(newFrameId)
         output["captured_at"] = .string(NativeTimestampFormat.plainZulu(capturedAt))
         output["frame_ttl_seconds"] = .int(Int64(MacLookFrameStore.ttlSeconds))
@@ -891,24 +852,9 @@ extension SwiftNativeMacControl {
         )
     }
 
-    /// Plan and run ONE verb. Every mechanism here is an EXISTING one:
-    /// `MacAccessibilityActuator.act` (the requested AX action only),
-    /// the actuator's own `perform`, and `MacHandRepertoire` +
-    /// the event sink (the same path `mac_keystroke` / `mac_scroll` use).
-    /// Nothing new posts events and nothing new mutates AX.
-    ///
-    /// Returns nil when the element exposes NO mechanism for the verb — the
-    /// caller turns that into a named refusal, never a silent no-op.
-    /// Did the pointer end where it started? Computed from the two READS, so a
-    /// nudge that failed to return the cursor cannot report success — and a
-    /// null (either position unreadable) stays null rather than collapsing to
-    /// `true`.
-    ///
-    /// SUB-PIXEL tolerance, not one pixel. The nudge's displacement IS one
-    /// pixel, so a 1.0 slack would call "moved one pixel and stayed there" a
-    /// successful restore — the precise failure this exists to catch. Only
-    /// float noise is forgiven; any real displacement, including the user's own
-    /// hand during the settle wait, reads `false`, which is the truth.
+    /// Use the shared actuator and event sink so every verb retains their gates. Unsupported mechanisms return nil for a named refusal. Cursor restoration
+    /// compares two reads; unreadable positions stay unknown. Only subpixel noise is tolerated because the nudge itself moves one point, and a one-point
+    /// tolerance would falsely verify a cursor left displaced.
     static func pointerRestoredJSON(before: MacSessionState, after: MacSessionState) -> JSONValue {
         guard let bx = before.cursorX, let by = before.cursorY,
               let ax = after.cursorX, let ay = after.cursorY else { return .null }

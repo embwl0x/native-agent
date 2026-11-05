@@ -41,7 +41,7 @@ attentional continuity. Its `ContinuityField` and the organism's
   and chemistry. `OrganismBodySchemaSampler` owns sampled readings.
 - The runtime samples body evidence and canonical affect before projection.
   `NativeCognitionRuntime.organismBodySample` caches its base body read for
-  two seconds; provider health is derived only from checked lifecycle evidence. Unreadable trace history owes repair and never selects a cumulative capability belief as a substitute. Status-less outcomes remain unknown; summaries cannot attest success. The unproduced Workshop cognitive event/node and memory-hygiene signal vocabularies are removed.
+  two seconds; provider health is derived only from checked lifecycle evidence. Unreadable trace history owes repair and never selects a cumulative capability belief as a substitute. Status-less outcomes remain unknown; summaries cannot attest success. The unproduced memory-hygiene signal vocabulary is removed.
 - The shared after-turn interpretation supplies caring judgments.
   The door (`NativeCognitionRuntime.foldTurnMoment`) folds a lived moment:
   `CognitiveSubstrate.foldTurn` applies affect and validates caring admission,
@@ -272,7 +272,7 @@ The adapter refuses `organismResolutionFelt` as somatic input.
 the substrate, so a body consequence cannot feed back into itself.
 
 The [wiring map](COGNITION_WIRING.md#shared-work-slot-admission) owns reflection's
-shared two-hour Workshop slot, unused-claim release and spent-window retention.
+two-hour background slot, unused-claim release and spent-window retention.
 
 ### Persistence + decay
 
@@ -281,7 +281,7 @@ shared two-hour Workshop slot, unused-claim release and spent-window retention.
 the stored state and restoration/decay behavior. Only its current schema is accepted: encounter, epoch, lived watermark, field identities, outcome weights and current body fields are checked, with no rekeying or invented old defaults. The persisted body bits remain the continuity representation and transient typed readings rebuild from their sensors. Capability outcome weights
 spend the full elapsed interval on their seven-day half-life, independently of
 the 72-hour tissue-decay cap. Dream completion evidence reads only the checked
-`ChatSessionRecollections.dreamConsolidationMark` owner (`lastDreamedAt`);
+`ConversationHistory.dreamConsolidationMark` owner (`lastDreamedAt`);
 diary modification times and parent writability cannot establish completion or
 store health. Missing marks contribute no completion evidence; damaged marks
 make the reading unavailable. The completion effect follows the

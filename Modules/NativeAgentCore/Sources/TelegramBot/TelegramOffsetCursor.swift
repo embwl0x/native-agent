@@ -1,13 +1,9 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `TelegramOffsetCursor.swift` | `TelegramOffsetCursor`: monotonic durable getUpdates cursor; only missing state bootstraps and corrupt state cannot replay commands |
+// Blueprint: | `TelegramOffsetCursor.swift` | `TelegramOffsetCursor`: monotonic; only missing state bootstraps |
 
-/// The durable Telegram `getUpdates` cursor.
-///
-/// This is a security-sensitive boundary: treating corrupt bytes as offset zero
-/// replays old updates, which can repeat a command or external tool action.
-/// Missing is the sole bootstrap value; every existing file must be valid.
+/// Only missing state bootstraps: treating damaged cursor bytes as zero can replay commands and external actions.
 public struct TelegramOffsetCursor: Sendable {
     public static let maximumPayloadBytes = 4 * 1024
 
@@ -19,8 +15,7 @@ public struct TelegramOffsetCursor: Sendable {
         self.fileURL = fileURL
     }
 
-    /// Loads the stored cursor. An absent file is the fresh-install cursor 0;
-    /// malformed, unreadable, or out-of-range state deliberately throws.
+    /// Loads the stored cursor. An absent file is the fresh-install cursor 0; malformed, unreadable, or out-of-range state deliberately throws.
     public func load() throws -> Int {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: fileURL.path) else { return 0 }
@@ -50,9 +45,7 @@ public struct TelegramOffsetCursor: Sendable {
         return try Self.offset(from: decoded)
     }
 
-    /// Advances the cursor without ever moving it backwards. The read, compare,
-    /// and durable write share the canonical sidecar lock so a second process
-    /// cannot overwrite a newer cursor with an older poll result.
+    /// Lock read, compare and write together so another process cannot overwrite a newer cursor with an older poll result.
     @discardableResult
     public func advance(to requestedOffset: Int) async throws -> Int {
         guard requestedOffset >= 0 else {
@@ -107,13 +100,25 @@ public enum TelegramOffsetCursorError: Error, Sendable, Equatable, LocalizedErro
     public var errorDescription: String? {
         switch self {
         case .unreadable(let detail):
-            return "telegram_cursor_unreadable: \(detail). Restore read access to this bot's last_offset.json; do not reset it to zero, which can replay actions."
+            return """
+                telegram_cursor_unreadable: \(detail). Restore read access to this bot's last_offset.json; do not reset it to zero, \
+                which can replay actions.
+                """
         case .oversized(let actualBytes, let maximumBytes):
-            return "telegram_cursor_oversized: Cursor is \(actualBytes) bytes; limit \(maximumBytes). Repair this bot's last_offset.json with its confirmed offset; resetting to zero can replay actions."
+            return """
+                telegram_cursor_oversized: Cursor is \(actualBytes) bytes; limit \(maximumBytes). Repair this bot's \
+                last_offset.json with its confirmed offset; resetting to zero can replay actions.
+                """
         case .malformed:
-            return "telegram_cursor_malformed: Cursor is malformed. Repair this bot's last_offset.json as {\"offset\":N} using its confirmed offset; resetting to zero can replay actions."
+            return """
+                telegram_cursor_malformed: Cursor is malformed. Repair this bot's last_offset.json as {\"offset\":N} using its \
+                confirmed offset; resetting to zero can replay actions.
+                """
         case .invalidOffset:
-            return "telegram_cursor_invalid: Offset must be a nonnegative whole number. Repair this bot's last_offset.json using its confirmed offset; resetting to zero can replay actions."
+            return """
+                telegram_cursor_invalid: Offset must be a nonnegative whole number. Repair this bot's last_offset.json using its \
+                confirmed offset; resetting to zero can replay actions.
+                """
         }
     }
 }

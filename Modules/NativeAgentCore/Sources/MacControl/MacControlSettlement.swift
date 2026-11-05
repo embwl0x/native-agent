@@ -3,12 +3,14 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+import Experiences
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
-// Blueprint: | `MacControlSettlement.swift` | Desktop operation settlement and current refusal audit receipts; incomplete process channels retain output with unknown effects; an unanswered deadline/Stop records unknown effects, never an invented body acknowledgement |
+// Blueprint: | `MacControlSettlement.swift` | Settlement retains output and unknown effects; refusal audit failures never invent acknowledgement |
 
 extension SwiftNativeMacControl {
+    public static let auditDidWrite = Notification.Name("NativeAgent.macControlAuditDidWrite")
     enum OperationSettlementTrigger: Equatable {
         case ordinary
         case deadline
@@ -59,7 +61,7 @@ extension SwiftNativeMacControl {
             return Self.attachingOperation(result, record: record)
 
         case .failure(let error):
-            if error is TaskWaitDeadline.Exceeded {
+            if error is OperationWaitBudget.Exceeded {
                 let record = try await operationStore.transition(operationId: operationId,
                     to: .outcomeUnknown, verification: .unverified,
                     expectedNextEvidence: "Inspect the affected app before another action",
@@ -128,38 +130,35 @@ extension SwiftNativeMacControl {
         }
     }
 
-    // MARK: blocked-receipt audit append
+    // MARK: blocked-receipt audit
 
-    /// Append a refusal under the shared cross-process lock. A failed audit must not turn a refused action into an executed one. Local JSONL evidence: off-disk backup only; no local backup/export/phone copy; PrivacyMap: mac_control_audit.
+    /// Failed audit cannot authorize a refused act. The checked record write reports its own failure and leaves the refusal intact. The detail is
+    /// about the refused turn (its id is its heard experience's id).
     func emitBlockedAudit(
         action: String,
         category: String,
         reason: String,
         trigger: String,
         policy _: MacControlPolicy,
-        body _: [String: JSONValue]
+        body _: [String: JSONValue],
+        turn: Turn
     ) async {
-        guard let path = auditAppendPath else { return }
+        guard let auditDataRoot else { return }
+        let at = now()
         let receipt = JSONValue.object([
             "id": .string(UUID().uuidString.lowercased()),
             "method": .string(action),
             "category": .string(category),
             "trigger": .string(trigger),
-            "executed_at": .string(NativeTimestampFormat.plainZulu(now())),
+            "executed_at": .string(NativeTimestampFormat.plainZulu(at)),
             "blocked": .bool(true),
             "block_reason": .string(reason),
         ])
         do {
-            let line = try receipt.serialize(pretty: false)
-            try await SwiftNativePersistenceCore.withFileLock(path) {
-                try await SwiftNativePersistenceCore.appendAuditLineRaw(line, to: path)
-                // Retention shares the append lock.
-                let dropped = try enforceJSONLRetention(at: path, maxLines: JSONLLineCaps.macControlAudit)
-                if dropped > 0 {
-                    nativeLog("MacControl.audit: %@ cap dropped %d oldest line(s)",
-                          path.lastPathComponent, dropped)
-                }
-            }
+            try await ExperienceStore.at(auditDataRoot).note([
+                .init(source: "mac", at: at, subject: turn.id, kind: "mac.act.audit", row: try receipt.serializedData(pretty: false))
+            ])
+            NotificationCenter.default.post(name: Self.auditDidWrite, object: auditDataRoot)
         } catch {
             // The refusal stands, but losing its audit evidence is observable.
             nativeLog("MacControl.audit: refusal record failed (%@)",

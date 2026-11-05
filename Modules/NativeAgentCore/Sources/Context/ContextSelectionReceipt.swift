@@ -15,8 +15,7 @@ public struct ContextBudgetUsage: Codable, Equatable, Sendable {
     public let usedCharacters: Int
     public let mandatoryCharacters: Int
 }
-/// Generation-pinned lexical material compiled once for the RAM hot path.
-/// The canonical atom remains authoritative; this is rebuildable derived state.
+/// Generation-pinned lexical material compiled once for the RAM hot path. The canonical atom remains authoritative; this is rebuildable derived state.
 public struct ContextSelectionIndexEntry: Equatable, Sendable {
     public let bodyTokens: Set<String>
     public let searchableTokens: Set<String>
@@ -42,8 +41,7 @@ public struct ContextSelectionIndexEntry: Equatable, Sendable {
             + searchableTokens.subtracting(bodyTokens).reduce(0) { $0 + 24 + $1.utf8.count }
     }
 }
-/// Live selection measures with the monotonic clock. Other provenance remains
-/// decodable for archived receipts and never enters a production latency window.
+/// Live selection measures with the monotonic clock. Other provenance remains decodable for archived receipts and never enters a production latency window.
 public enum ContextSelectionLatencyProvenance: String, Codable, Equatable, Sendable {
     case monotonicClock = "monotonic_clock"
     case callerSupplied = "caller_supplied"
@@ -71,9 +69,7 @@ public struct ContextSelectionReceipt: Equatable, Sendable {
     public let selectionLatencyProvenance: ContextSelectionLatencyProvenance?
     /// Comparable memories × query readings, diagnostic population only; never changes the floor.
     public let memoryPopulation: Int
-    /// Candidates below the selector's `memoryStandout`.
     public let memoryFloorDroppedCount: Int
-    /// Touched memory candidates record touch, reachability and rest state.
     public let memoryRecall: [ContextMemoryRecallScore]
 }
 extension ContextSelectionReceipt: Codable {
@@ -143,13 +139,10 @@ extension ContextSelectionReceipt: Codable {
         try values.encode(memoryPopulation, forKey: .memoryPopulation)
     }
 }
-/// Why one memory came into the turn, or rested: the message's touch in
-/// standard deviations above how close it sits to every memory (nil when it
-/// touched by words alone), and how reachable her use has kept it.
+/// Separate lexical-only touch from population-relative semantic touch and history-based reachability.
 public struct ContextMemoryRecallScore: Codable, Equatable, Sendable {
     public let atomID: ContextAtomID
-    /// Relative relevance, or the model-scaled semantic contribution when
-    /// fewer than three comparable memories are available.
+    /// Relative relevance, or the model-scaled semantic contribution when fewer than three comparable memories are available.
     public let relevance: Double?
     public let reachability: Double
     public let rested: Bool

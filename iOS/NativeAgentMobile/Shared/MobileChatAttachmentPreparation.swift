@@ -15,11 +15,13 @@ enum MobileChatAttachmentPreparation {
             result = Result {
                 let size = try readable.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                 guard size > 0, size <= ChatAttachmentTypeResolver.fileByteLimit else {
-                    throw NSError(domain: "ChatAttachment", code: 2, userInfo: [NSLocalizedDescriptionKey: "Documents must be nonempty and no larger than 10 MB."])
+                    throw NSError(domain: "ChatAttachment", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Documents must be nonempty and no larger than 10 MB."])
                 }
                 let bytes = try Data(contentsOf: readable)
                 guard !bytes.isEmpty, bytes.count <= ChatAttachmentTypeResolver.fileByteLimit else {
-                    throw NSError(domain: "ChatAttachment", code: 2, userInfo: [NSLocalizedDescriptionKey: "Documents must be nonempty and no larger than 10 MB."])
+                    throw NSError(domain: "ChatAttachment", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Documents must be nonempty and no larger than 10 MB."])
                 }
                 return bytes
             }

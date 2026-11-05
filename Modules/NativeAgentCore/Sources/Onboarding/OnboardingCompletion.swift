@@ -6,14 +6,13 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `OnboardingCompletion.swift` | Durable completion intent and recovery; all five canonical persona documents and profile bytes verify before the sentinel |
+// Blueprint: | `OnboardingCompletion.swift` | intent verifies persona bytes before the sentinel |
 extension SwiftNativeOnboardingClient {
     struct OnboardingTargetIntent: Codable, Sendable {
         let role: String
         let content: String
         let sha256: String
-        /// Hash of the bytes that existed when the transaction was prepared.
-        /// Nil means the target was required to be absent.
+        /// Hash of the bytes that existed when the transaction was prepared. Nil means the target was required to be absent.
         let baseSHA256: String?
     }
     struct OnboardingTransactionManifest: Codable, Sendable {
@@ -32,8 +31,8 @@ extension SwiftNativeOnboardingClient {
     var transactionManifestPath: URL {
         dataRoot.appendingPathComponent(Self.pendingTransactionRelativePath)
     }
-    /// Publish exact content, base hashes/absence and normalized identity before any persona byte.
-    /// Retries resume only that intent; unrelated bytes or identities fail closed.
+    /// Publish exact content, base hashes/absence and normalized identity before any persona byte. Retries resume only that intent; unrelated bytes or
+    /// identities fail closed.
     public func completeOnboarding(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult {
         let agentName = payload.agentName.trimmingCharacters(in: .whitespacesAndNewlines)
         let userName = payload.userName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -182,8 +181,7 @@ extension SwiftNativeOnboardingClient {
                 try Self.ensureCommitted(intent, to: target)
             }
         }
-        // The completion marker is deliberately last. A successful result is
-        // impossible until every document and profile byte is durable.
+        // The completion marker is deliberately last. A successful result is impossible until every document and profile byte is durable.
         guard let sentinelIntent = intents["sentinel"], let sentinelURL = targetURLs["sentinel"] else {
             throw OnboardingError.ioFailure("onboarding transaction missing completion sentinel")
         }

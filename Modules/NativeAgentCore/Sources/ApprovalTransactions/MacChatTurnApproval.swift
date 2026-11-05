@@ -5,18 +5,13 @@ import ChatTurnRuntime
 import NativeAgentShared
 // Blueprint: | `MacChatTurnApproval.swift` | canonical turn approval projection, card visibility and inline authority state |
 
-/// A turn's approval projected from the canonical inbox, with only proven
-/// decisions represented as approved or denied.
+/// A turn's approval projected from the canonical inbox, with only proven decisions represented as approved or denied.
 public struct MacChatTurnCardApproval: Sendable, Equatable {
     public let approvalId: String
-    /// The action the inbox record names (its `action` field, e.g. the tool).
     public let toolName: String
     public let reason: String?
-    /// The row's redacted payload preview, bounded to one line.
     public var inputSummary: String? = nil
-    /// WHO asked, when the asker was not the person — a peer on the agent
-    /// bridge, named as the person named it in Trust → Connected agents.
-    /// Nil for the person's own approvals, which is every ordinary turn.
+    /// Name peer requesters from Trust; the person's own approvals need no requester label.
     public var requester: String? = nil
     public let outcome: ApprovalRequest.Outcome
 
@@ -25,10 +20,8 @@ public struct MacChatTurnCardApproval: Sendable, Equatable {
 }
 
 public enum TurnApprovalRead {
-    /// An exact-turn approval carries this session and was requested no earlier
-    /// than the turn opened. Deduplicated rows use lastRequestedAt, since their
-    /// creation can belong to an earlier turn. Unreadable provenance fails closed.
-    /// Pending wins, then newest request, then id for deterministic selection.
+    /// An exact-turn approval carries this session and was requested no earlier than the turn opened. Deduplicated rows use lastRequestedAt, since their
+    /// creation can belong to an earlier turn. Unreadable provenance fails closed. Pending wins, then newest request, then id for deterministic selection.
     public static func approval(
         sessionId: String,
         turnStartedAt: Date,
@@ -76,11 +69,9 @@ public enum TurnApprovalRead {
         )
     }
 
-    /// Longest input line the card will show before eliding.
     private static let inputSummaryLimit = 120
 
-    /// Fields worth naming first: they are the ones that decide whether a
-    /// person says yes. Order is the display preference, not an allowlist.
+    /// Fields worth naming first: they are the ones that decide whether a person says yes. Order is the display preference, not an allowlist.
     private static let preferredInputKeys = [
         "path", "file_path", "filepath", "paths", "directory", "dir",
         "to", "recipient", "recipients", "chat_id", "channel",
@@ -88,11 +79,7 @@ public enum TurnApprovalRead {
         "query", "pattern", "name", "title", "text", "message", "body",
     ]
 
-    /// One short line describing the input, from the inbox row's own preview.
-    ///
-    /// The inbox stores a caller-written preview when there is one and the
-    /// serialized payload otherwise (`ApprovalInbox.stageApproval`), so this
-    /// reads an object when it can and falls back to the raw string.
+    /// The inbox preview is caller-authored prose or serialized payload; only structured payloads can be unwrapped.
     private static func inputSummary(_ row: ApprovalRecord) -> String? {
         guard let raw = nonEmpty(row.payloadPreview) else { return nil }
         guard let data = raw.data(using: .utf8),
@@ -101,8 +88,7 @@ public enum TurnApprovalRead {
         else {
             return redactedLine(raw)
         }
-        // The filer's envelope is not the tool input. Unwrap it before key
-        // selection, then redact every value again before displaying it.
+        // The filer's envelope is not the tool input. Unwrap it before key selection, then redact every value again before displaying it.
         let fields = (chatApprovalInput(parsed) ?? parsed)
             .filter { !ApprovalActionText.isInternalField($0.key) }
         let ordered = preferredInputKeys.compactMap { key -> (String, Any)? in
@@ -121,8 +107,6 @@ public enum TurnApprovalRead {
         return nil
     }
 
-    /// The tool arguments inside `NativeAgentChatApprovalFiler`'s payload, or
-    /// nil when this preview is not one of those payloads.
     private static func chatApprovalInput(_ fields: [String: Any]) -> [String: Any]? {
         guard fields["kind"] as? String == "chat_tool_approval",
               let input = fields["input"] as? [String: Any]
@@ -149,8 +133,7 @@ public enum TurnApprovalRead {
         }
     }
 
-    /// Redact by value before bounding, so a truncated secret cannot survive.
-    /// Flatten whitespace and omit control characters, including bidi overrides.
+    /// Redact by value before bounding, so a truncated secret cannot survive. Flatten whitespace and omit control characters, including bidi overrides.
     private static func redactedLine(_ line: String) -> String? {
         let raw = NativeAppSecretRedactor.redactText(line)
         var flattened = ""
@@ -186,10 +169,7 @@ public enum TurnApprovalRead {
 }
 
 extension MacChatTurnCardApproval {
-    /// Outcomes worth keeping chrome on screen after the turn itself settles.
-    /// A proven decision is finished business and lives on in Activity →
-    /// Approvals; an unproven one is exactly the thing that must be said out
-    /// loud, the same rule `.outcomeUnknown` earns its card by.
+    /// Keep unproven outcomes visible after the turn; proven decisions remain available in Approvals.
     public var keepsCardVisible: Bool {
         switch outcome {
         case .pending, .expired, .unresolved: return true

@@ -2,8 +2,7 @@ import Foundation
 import PersistenceCore
 // Blueprint: | `AgentWorkspaceConversation.swift` | `AgentWorkspaceConversation` enum; `project` |
 
-/// Conversation controls retain the navigation owner's selected contact and
-/// conversation. Remote text/locators never choose a recipient or replay a send.
+/// Conversation controls retain the navigation owner's selected contact and conversation. Remote text/locators never choose a recipient or replay a send.
 enum AgentWorkspaceConversation {
     static func project(input: [String: JSONValue], title: String, result: JSONValue) -> WorkspacePage {
         guard case .string(let agent)? = input["agent"], !agent.isEmpty else {
@@ -17,7 +16,8 @@ enum AgentWorkspaceConversation {
         else if case .string(let status)? = content["status"] { phase = status }
         else { phase = "unknown" }
         let waiting = ["sending", "waiting", "queued", "running", "working", "pending", "delivering", "accepted"].contains(phase)
-        let needsAttention = ["attention", "failed", "unavailable", "outcome_unknown", "reconnect_required", "needs_setup", "blocked", "denied", "blocked_by_trust", "session_unavailable", "no_outbound_route"].contains(phase)
+        let needsAttention = ["attention", "failed", "unavailable", "outcome_unknown", "reconnect_required", "needs_setup", "blocked", "denied",
+            "blocked_by_trust", "session_unavailable", "no_outbound_route"].contains(phase)
             || content["error"] != nil || content["last_send_error"] != nil
             || (content["last_send_needs_authentication"] ?? content["needs_authentication"]) == .bool(true)
         var latest = input
@@ -37,8 +37,7 @@ enum AgentWorkspaceConversation {
         detail["details"] = .bool(true)
         actions.append(.init(label: needsAttention ? "Inspect what needs attention" : "Conversation details",
             action: .open(.record(tool: "agent_read", input: detail, title: title))))
-        // A contact with no saved exchange has nothing to refresh or diagnose.
-        // Keep the one useful action rather than offering empty reply readers.
+        // A contact with no saved exchange has nothing to refresh or diagnose. Keep the one useful action rather than offering empty reply readers.
         if ["not_opened", "no_history", "unknown_contact"].contains(phase) { actions.removeAll() }
         var items: [AgentWorkspaceItem] = []
         if case .object(var history)? = content["session_history"] {
@@ -64,8 +63,7 @@ enum AgentWorkspaceConversation {
             history.removeValue(forKey: "coverage"); history.removeValue(forKey: "order")
             content["session_history"] = .object(history)
         }
-        // Exact-protocol readers are not the current named conversation. Do
-        // not offer a Reply that would silently use another selected thread.
+        // Exact-protocol readers are not the current named conversation. Do not offer a Reply that would silently use another selected thread.
         let advanced = ["conversation_id", "message_id", "task_id"].contains { input[$0] != nil }
         let unknown = ["outcome_unknown", "session_unavailable"].contains(phase)
             || content["status"] == .string("outcome_unknown")
@@ -85,12 +83,10 @@ enum AgentWorkspaceConversation {
             || ["reconnect_required", "needs_setup", "unavailable", "no_outbound_route"].contains(content["status"]?.stringValue ?? phase)) {
             actions.append(.init(label: "Check connections", action: .open(.area("connections"))))
         }
-        // The same exact selection backs both actions. Diagnostics are one
-        // explicit click away instead of requiring protocol IDs from Agent.
+        // Both actions retain the exact selection; diagnostics must not require protocol IDs from the agent.
         content.removeValue(forKey: "reply_with")
         content.removeValue(forKey: "inspect_receipt")
-        // Navigation holds identities and source references. Keep their exact
-        // values in Details, without making Agent parse them around each reply.
+        // Keep exact identities in Details so reading replies does not require parsing locators.
         for key in ["agent", "agent_id", "can_reply", "conversation_id", "message_id", "task_id", "read_with", "meaning", "order"] {
             content.removeValue(forKey: key)
         }
@@ -108,7 +104,6 @@ enum AgentWorkspaceConversation {
                 for key in ["conversation_id", "message_id", "task_id", "read_with", "reply_with", "work_completion"] {
                     row.removeValue(forKey: key)
                 }
-                // With the words present, the bookkeeping around them is noise.
                 if row["text"] != nil {
                     for key in ["reply_state", "execution_state", "text_kind", "text_coverage", "delivery_outcome", "from"] {
                         row.removeValue(forKey: key)

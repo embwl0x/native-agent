@@ -21,9 +21,8 @@ import MacControl
 import Darwin
 import ChatTurnContracts
 import ChatToolParsing
-// Blueprint: | `TranscriptSessionMutations.swift` | TranscriptsFacade creates current generation-zero sessions; rename/archive and canonical transcript clear preserve lock ordering |
+// Blueprint: | `TranscriptSessionMutations.swift` | Canonical session creation, archive and generation-checked clearing |
 extension TranscriptsFacade {
-    /// A new session row at the top of the index.
     public nonisolated func create(title: String, sourceKey: String? = nil) async throws -> NativeAgentShared.ChatSession {
         let dataRoot = self.dataRoot
         let id = UUID().uuidString
@@ -55,7 +54,6 @@ extension TranscriptsFacade {
         }
         return try NativeAgentShared.ChatSession(row: sessionRow)
     }
-    /// Patch a session's title (rename) and/or archived flag.
     public nonisolated func update(id: String, title: String?, archived: Bool?) async throws -> NativeAgentShared.ChatSession {
         let sessionsPath = self.sessionsPath
         let nowIso = ISO8601DateFormatter().string(from: Date())
@@ -64,8 +62,7 @@ extension TranscriptsFacade {
             var row = sessions[idx]
             if let title { row["title"] = .string(title) }
             if let archived { row["archived"] = .bool(archived) }
-            // A rename is not a conversation event: the row's time is
-            // when someone last spoke, so only an archive flip bumps it.
+            // Renames do not change speech time; only archive flips bump the index stamp.
             if archived != nil { row["updatedAt"] = .string(nowIso) }
             sessions[idx] = row
             return row
@@ -76,15 +73,12 @@ extension TranscriptsFacade {
         }
         return try NativeAgentShared.ChatSession(row: updated)
     }
-    /// A user-initiated archive leaves the hot index immediately. Retention
-    /// later bounds the archive tier, but it must not be responsible for the
-    /// visible archive action: an archived chat may never linger in
-    /// `sessions.json` or append duplicate retry records to the archive tail.
+    /// Archive immediately leaves the hot index; retention bounds history but cannot delay the action or duplicate archive retries.
     public nonisolated func archive(id: String) async throws -> NativeAgentShared.ChatSession? {
         try await ChatSessionRetention.archiveSession(id: id, dataRoot: dataRoot)
             .map(NativeAgentShared.ChatSession.init(row:))
     }
-    /// Clear the canonical flat transcript under its lock and publish the empty index row.
+    /// Lock transcript clearing and publish the empty index row through the canonical owner.
     public nonisolated func clear(sessionId: String) async throws {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw NSError(
@@ -101,12 +95,10 @@ extension TranscriptsFacade {
             .appendingPathComponent("session_state", isDirectory: true)
             .appendingPathComponent(safeSessionId, isDirectory: true)
             .appendingPathComponent("provider_usage.json")
-        // Refuse known index corruption before deleting any transcript bytes.
-        // Keep locks separate: other writers have their own transcript/index
-        // ordering, so clear must not add a nested cross-file lock dependency.
+        // Reject index damage before deleting bytes; keep locks separate to avoid cross-file ordering dependencies.
         _ = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) {
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-            // Refuse an exhausted generation before deleting bytes: remote readers must prove the clear is newer.
+            // Reject exhausted generations before deletion because remote clear requires proof of a newer generation.
             if let row = rows.first(where: { $0["id"] == .string(safeSessionId) }),
                ChatSessionIndexFile.isTranscriptGenerationExhausted(in: row) {
                 nativeLog("TranscriptsFacade.clear: refusing to clear \(safeSessionId) — its transcript version is at Int64.max and cannot advance")
@@ -134,7 +126,7 @@ extension TranscriptsFacade {
                     } catch CocoaError.fileReadNoSuchFile {
                         return false
                     }
-                    // A concurrent provider call owns its replacement receipt.
+                    // Concurrent provider calls own their replacement receipts.
                     guard current == usageBeforeClear else { return false }
                     try FileManager.default.removeItem(at: usagePath)
                     return true
@@ -149,8 +141,7 @@ extension TranscriptsFacade {
                 }
             }
             try await ChatSessionIndexFile.mutate(at: sessionsPath) { rows in
-                // A real append after clear owns the new index projection. Its
-                // normal writer will synchronize it; never zero its preview.
+                // A concurrent append owns its new index projection; never zero its preview.
                 guard try messagesPath.resourceValues(forKeys: [.fileSizeKey]).fileSize == 0,
                       let index = rows.firstIndex(where: { $0["id"] == .string(safeSessionId) })
                 else { return }
@@ -159,7 +150,7 @@ extension TranscriptsFacade {
                 rows[index]["lastMessageAt"] = .null
                 rows[index]["lastMessagePreview"] = .null
                 rows[index]["updatedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
-                // A newer generation authorizes remote transcript clearing; a wall-clock timestamp cannot.
+                // Only a newer generation authorizes remote clearing; wall time cannot prove it.
                 ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
             }
         } catch {

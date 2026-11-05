@@ -12,12 +12,13 @@ import DeviceSync
 import TrustCenter
 import Studio
 import StandingBots
+import MemoryV2
 import AVFoundation
-// Blueprint: | `QuietSelfAdminSettings.swift` | QuietSettings authority and shared validation; static-first catalog composes model, personality, bot and mounted platform rows; asynchronous phone lookup reaches its current owner |
+// Blueprint: | `QuietSelfAdminSettings.swift` | Shared authority/validation and platform settings catalog |
 
 public enum QuietSettings {
-    /// What a Trust posture entry says below Full Mac. It names the one line that never moves: the agent may lower its own fence, never
-    /// raise it.
+    public static let trustVoicePreferenceDidChange = Notification.Name("NativeAgent.trustVoicePreferenceDidChange")
+    /// Below Full Mac the agent may lower its own fence, never raise it.
     public static let belowFullMacRefusal =
         "Trust posture is read-only unless this Mac is already in Full Mac. Full Mac is wide open "
         + "and the agent may change these there — but only the person can turn on Full Mac."
@@ -28,90 +29,81 @@ public enum QuietSettings {
 
     // MARK: - Lower-only
 
-    /// Full Mac, bound by `app_setting_set` around a row's check and write: there a raise is hers too, so `usersCall` refuses nothing.
-    @TaskLocal public static var fullMac = false
-
-    /// User himself, from his signed phone: what is User's call is his to move, as it is on the Mac's own pages.
-    @TaskLocal public static var byOwner = false
-
-    /// A quoted request may restore the switch's last receipted agent change.
-    @TaskLocal public static var restoringPreviousValue = false
-
-    /// Why a raise is refused below Full Mac: Trust going up is User's (his floor), said with where he does it.
-    public static func usersCall(_ change: String, _ whereUserDoesIt: String) -> QuietSettingError? {
-        fullMac || byOwner || restoringPreviousValue ? nil : .users("\(change) raises Trust, so it is the owner's call. Ask them to do it: \(whereUserDoesIt).")
+    /// Trust raises below Full Mac remain the user's decision; refusals name their control.
+    public static func usersCall(_ change: String, _ whereUserDoesIt: String, turn: Turn) -> QuietSettingError? {
+        turn.settingFullMac || turn.settingByOwner || turn.restoresPreviousSetting ? nil : .users(
+            "\(change) raises Trust, so it is the owner's call. Ask them to do it: \(whereUserDoesIt).")
     }
 
-    /// Safe changes use the page setter and readback; raises follow `usersCall`, and unchanged values do nothing.
+    /// Lower-only writes share page setters/readback and refuse raises through usersCall; unchanged values do nothing.
     public static func lowerOnly(
         id: String, page: String, label: String, safe: Bool = false, whereUserDoesIt: String,
         note: String = "",
         read: @escaping @MainActor @Sendable (any QuietSettingsHost) async throws -> Bool,
-        write: @escaping @MainActor @Sendable (any QuietSettingsHost, Bool) async throws -> Void
+        write: @escaping @MainActor @Sendable (any QuietSettingsHost, Bool, QuietSettingWrite) async throws -> Void
     ) -> QuietSetting {
         let way = safe ? "on" : "off"
-        // The unsafe direction is User's. Asked by `check` for the preview and again by `write` against the state it reads itself, so a
-        // change User makes in between is never undone.
-        let users: @Sendable (Bool) -> QuietSettingError? = { wanted in
-            wanted == safe ? nil : usersCall("Turning \(label) \(wanted ? "on" : "off")", whereUserDoesIt)
+        // Recheck direction during the write against current state so intervening user changes cannot be undone.
+        let users: @Sendable (Bool, Turn) -> QuietSettingError? = { wanted, turn in
+            wanted == safe ? nil : usersCall("Turning \(label) \(wanted ? "on" : "off")", whereUserDoesIt, turn: turn)
         }
         return QuietSetting(
             id: id, page: page, label: label, kind: .boolean,
             note: ["You may turn this \(way); turning it \(safe ? "off" : "on") is the owner's below Full Mac.", note]
                 .filter { !$0.isEmpty }.joined(separator: " "),
             read: { .bool(try await read($0)) },
-            write: { host, value in
+            write: { host, value, context in
                 let wanted = try boolValue(value, label)
                 guard wanted != (try await read(host)) else { return }
-                if let refused = users(wanted) { throw refused }
-                try await write(host, wanted)
+                if let refused = users(wanted, context.turn) { throw refused }
+                try await write(host, wanted, context)
                 guard try await read(host) == wanted else {
                     throw QuietSettingError.unavailable(
                         "\(label) did not turn \(way): the page's own setter did not take. "
                         + "Check \(AppToolExecutor.doorDoctor), then try again.")
                 }
             },
-            check: { host, value in
+            check: { host, value, turn in
                 let wanted: Bool
                 do { wanted = try boolValue(value, label) } catch { return error as? QuietSettingError }
                 do { guard wanted != (try await read(host)) else { return nil } }
                 catch { return .unavailable("\(label) could not be read: \(error.localizedDescription). Repair its settings owner before changing it.") }
-                return users(wanted)
+                return users(wanted, turn)
             }
         )
     }
 
-    /// An allowlist the agent may only shorten. Adding anyone back is User's.
+    /// The agent may shorten allowlists; additions require the user.
     public static func narrowOnly(
         id: String, page: String, label: String, whereUserDoesIt: String, note: String = "",
         read: @escaping @MainActor @Sendable (any QuietSettingsHost) async throws -> [String],
-        write: @escaping @MainActor @Sendable (any QuietSettingsHost, [String]) async throws -> Void
+        write: @escaping @MainActor @Sendable (any QuietSettingsHost, [String], QuietSettingWrite) async throws -> Void
     ) -> QuietSetting {
-        // Adding is User's. Asked by `check` for the preview and again by `write` against the list it reads itself.
-        let users: @Sendable ([String], [String]) -> QuietSettingError? = { wanted, current in
+        // Recheck additions against the list read at mutation, not the preview snapshot.
+        let users: @Sendable ([String], [String], Turn) -> QuietSettingError? = { wanted, current, turn in
             let added = wanted.filter { !current.contains($0) }
-            return added.isEmpty ? nil : usersCall("Adding \(added.joined(separator: ", ")) to \(label)", whereUserDoesIt)
+            return added.isEmpty ? nil : usersCall("Adding \(added.joined(separator: ", ")) to \(label)", whereUserDoesIt, turn: turn)
         }
         return QuietSetting(
             id: id, page: page, label: label, kind: .list,
             note: ["You may remove entries; adding one is the owner's below Full Mac. Send the whole list you want.", note]
                 .filter { !$0.isEmpty }.joined(separator: " "),
             read: { .array(try await read($0).map { .string($0) }) },
-            write: { host, value in
+            write: { host, value, context in
                 let wanted = try listValue(value, label)
                 let current = try await read(host)
-                if let refused = users(wanted, current) { throw refused }
+                if let refused = users(wanted, current, context.turn) { throw refused }
                 guard Set(wanted) != Set(current) else { return }
-                try await write(host, wanted)
+                try await write(host, wanted, context)
                 guard Set(try await read(host)) == Set(wanted) else {
                     throw QuietSettingError.unavailable(
                         "\(label) did not change: the page's own save did not take. Check \(AppToolExecutor.doorDoctor), then try again.")
                 }
             },
-            check: { host, value in
+            check: { host, value, turn in
                 let wanted: [String]
                 do { wanted = try listValue(value, label) } catch { return error as? QuietSettingError }
-                do { return users(wanted, try await read(host)) }
+                do { return users(wanted, try await read(host), turn) }
                 catch { return .unavailable("\(label) could not be read: \(error.localizedDescription). Repair its settings owner before changing it.") }
             }
         )
@@ -146,8 +138,7 @@ public enum QuietSettings {
         throw QuietSettingError.badValue("\(label) takes a whole number.")
     }
 
-    /// A list, from an array or from newline-separated text. Blank lines are dropped, because a list with an empty entry in it is never
-    /// what was meant, and an empty list is a legitimate value (it clears the list).
+    /// Drop blank list entries; an empty list is a valid explicit clear.
     static func listValue(_ value: JSONValue, _ label: String) throws -> [String] {
         let raw: [String]
         switch value {
@@ -178,8 +169,7 @@ public enum QuietSettings {
         return match
     }
 
-    /// A UserDefaults-backed preference. Reading and writing the same key the `@AppStorage` property wrapper uses is what makes the live
-    /// page update the moment the write lands — AppStorage observes the same store.
+    /// Use the page's @AppStorage key and store so writes update the live UI.
     static func defaultsBool(
         id: String, page: String, label: String, key: String,
         defaultOn: Bool = false, note: String = ""
@@ -194,10 +184,13 @@ public enum QuietSettings {
                 }
                 return .bool(enabled)
             },
-            write: { _, value in
+            write: { _, value, context in
                 UserDefaults.standard.set(try boolValue(value, label), forKey: key)
+                if key == "voiceAutoRead" {
+                    NotificationCenter.default.post(name: Self.trustVoicePreferenceDidChange, object: nil)
+                }
             }
-        )
+        ).watchingDefaults(key)
     }
 
     private static func defaultsInt(
@@ -211,36 +204,34 @@ public enum QuietSettings {
                 let store = UserDefaults.standard
                 return .int(Int64(store.object(forKey: key) == nil ? fallback : store.integer(forKey: key)))
             },
-            write: { _, value in
+            write: { _, value, context in
                 let parsed = try intValue(value, label)
                 guard parsed >= minimum, parsed <= maximum else {
                     throw QuietSettingError.badValue("\(label) takes \(minimum) to \(maximum).")
                 }
                 UserDefaults.standard.set(parsed, forKey: key)
             }
-        )
+        ).watchingDefaults(key)
     }
 
-    /// A UserDefaults-backed switch whose page control also tells the running app. A bare write to the key changed what the page showed and
-    /// nothing else until relaunch; `apply` is the page's own setter, which stores the key as well. The default is the one the page and its
-    /// reader share.
+    /// Live switches require the page's setter to persist and notify the runtime; the page and reader share the default.
     private static func liveBool(
         id: String, page: String, label: String, key: String, defaultOn: Bool,
         note: String = "",
-        apply: @escaping @MainActor @Sendable (any QuietSettingsHost, Bool) async throws -> Void
+        apply: @escaping @MainActor @Sendable (any QuietSettingsHost, Bool, QuietSettingWrite) async throws -> Void
     ) -> QuietSetting {
         QuietSetting(
             id: id, page: page, label: label, kind: .boolean, note: note,
             read: { _ in .bool(storedBool(key, defaultOn)) },
-            write: { appModel, value in try await apply(appModel, try boolValue(value, label)) }
-        )
+            write: { appModel, value, context in try await apply(appModel, try boolValue(value, label), context) }
+        ).watchingDefaults(key)
     }
 
     private static func storedBool(_ key: String, _ defaultOn: Bool) -> Bool {
         UserDefaults.standard.object(forKey: key) as? Bool ?? defaultOn
     }
 
-    /// One inner-life lane. Like its switch on the page, it cannot be turned on while the inner life itself is off — it runs inside it.
+    /// Inner-life lanes cannot run while their enclosing inner life is off.
     private static func cognitionLane(
         id: String, page: String = "settings", label: String, key: String, defaultOn: Bool,
         lane: QuietCognitionLane
@@ -248,14 +239,20 @@ public enum QuietSettings {
         liveBool(
             id: id, page: page, label: label, key: key, defaultOn: defaultOn,
             note: "Runs inside the inner life (settings.inner_life).",
-            apply: { appModel, enabled in
+            apply: { appModel, enabled, context in
                 if enabled, !storedBool("cognitiveSubstrateEnabled", true) {
                     throw QuietSettingError.unavailable(
                         "\(label) runs inside the inner life, which is off. Turn on settings.inner_life first.")
                 }
                 await appModel.setCognitionLane(lane, enabled: enabled)
             }
-        )
+        ).ownedByMind()
+    }
+
+    /// Stored alongside Trust, but read from its checked owner without depending on the Trust page's loaded projection.
+    @MainActor
+    static func readMindPolicy(_ host: any QuietSettingsHost) async throws -> TrustPolicy {
+        try await SwiftNativeTrustCenter(dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()).getTrust()
     }
 
     /// Patch only the requested memory field into the checked, locked policy.
@@ -275,7 +272,7 @@ public enum QuietSettings {
         }
     }
 
-    /// Notifications ▸ "Let her raise things unasked", as the page reads it: shipped on when unset, nil when the policy cannot be read.
+    /// Notifications use the page's shipped-on unset default; unreadable policy remains nil.
     @MainActor
     private static func notificationsMasterOn(_ appModel: any QuietSettingsHost) async -> Bool? {
         let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -288,8 +285,7 @@ public enum QuietSettings {
         return true
     }
 
-    /// Read-only mirror of a Trust posture control. Present so the agent can SAY what the posture is — an agent that cannot read the fence
-    /// cannot explain why it just refused something.
+    /// Posture remains readable so the agent can explain the fence that refused a call.
     private static func posture(
         id: String, label: String, note: String = "",
         read: @escaping @MainActor @Sendable (any QuietSettingsHost) async -> JSONValue
@@ -305,7 +301,7 @@ public enum QuietSettings {
         id: String, label: String, kind: QuietSetting.Kind, choices: [String] = [],
         note: String = "",
         read: @escaping @MainActor @Sendable (any QuietSettingsHost) async -> JSONValue,
-        write: @escaping @MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void
+        write: @escaping @MainActor @Sendable (any QuietSettingsHost, JSONValue, QuietSettingWrite) async throws -> Void
     ) -> QuietSetting {
         QuietSetting(
             id: id, page: "trust", label: label, kind: kind, choices: choices,
@@ -332,12 +328,15 @@ public enum QuietSettings {
         if VoiceOutputModeSelection.resolve(for: policy) == .openAI { return name }
         guard let voice = VoicePreference.nativeVoice(identifier: name) else {
             throw QuietSettingError.badValue(
-                "The read-aloud voice \"\(name)\" is not installed on this Mac. Use an installed AVSpeechSynthesisVoice identifier, or leave it empty for the Mac's own voice.")
+                """
+                    The read-aloud voice \"\(name)\" is not installed on this Mac. Use an installed AVSpeechSynthesisVoice identifier, or leave it empty for \
+                    the Mac's own voice.
+                    """)
         }
         return voice.identifier
     }
 
-    /// One Mac-control verb, written through the page's own policy writer.
+    /// Mac-control verbs share the page's policy writer.
     private static func macControlVerb(
         id: String, label: String, field: String,
         get: @escaping @Sendable (MacControlPolicyWireSnapshot) -> Bool
@@ -353,7 +352,7 @@ public enum QuietSettings {
             id: "trust.mac_control_\(id)", label: label, kind: .boolean,
             note: "Part of the Mac control policy. Changes only this switch.",
             read: { appModel in .bool((appModel.trustPolicy?.macControlPolicy).map(get) ?? false) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, label)
                 let policy = try loadedTrustPolicy(appModel, label)
                 guard policy.macControlPolicy != nil else {
@@ -366,15 +365,14 @@ public enum QuietSettings {
         )
     }
 
-    /// The fence every quiet trust write carries into the merge: the posture this Mac is locked at when the write lands must still be Full
-    /// Mac. A person's downgrade between the read and the write wins, because the merge refuses instead of applying the agent's stale plan.
+    /// Recheck Full Mac under the merge lock so a concurrent user downgrade defeats stale authority.
     public static let requireFullMacLock: @Sendable ([String: JSONValue]) throws -> Void = { locked in
         guard AppToolExecutor.lockedPolicyIsFullMac(locked) else {
             throw QuietSettingError.unavailable(belowFullMacRefusal)
         }
     }
 
-    /// One switch through the checked Trust writer, with its outcome checked.
+    /// Trust writes use the checked writer and verify its outcome.
     @MainActor
     private static func saveMacControl(
         _ appModel: any QuietSettingsHost, field: String, enabled: Bool, _ label: String
@@ -403,7 +401,6 @@ public enum QuietSettings {
     private static let staticRows: [QuietSetting] = {
         var rows: [QuietSetting] = []
 
-        // ── Chat ────────────────────────────────────────────────────────────
         rows.append(defaultsBool(
             id: "chat.mood_tint", page: "chat", label: "Warmth in the glass",
             key: MoodTintPreference.key, defaultOn: true,
@@ -417,7 +414,7 @@ public enum QuietSettings {
             note: "On: when the agent starts driving the Mac from this chat, the main window "
                 + "steps aside into Shotgun, a small floating chat the person keeps typing in while "
                 + "the agent drives. Off: the agent works in the background and the window stays put. "
-                + "Hers to set (10-17: asked to put herself back in Shotgun, she had no switch to reach)."
+                + "The agent's to set (10-17: asked to go back in Shotgun, the agent had no switch to reach)."
         ))
         rows += chatModelRows
         rows.append(QuietSetting(
@@ -431,47 +428,6 @@ public enum QuietSettings {
             label: "Read replies aloud", key: "voiceAutoRead",
             note: "Speaks new replies through the speakers."
         ))
-        rows.append(QuietSetting(
-            id: "chat.context_window_mode", page: "chat", label: "Context window",
-            kind: .choice, choices: ["model", "custom"],
-            note: "model: the selected model's detected window. custom: the person's cap, "
-                + "never past the detected window. chat.compaction_percent sets Compact at for every model.",
-            read: { _ in
-                .string(ChatSessionAutocompactionConfig.productionDefault().contextWindowMode.rawValue)
-            },
-            write: { _, value in
-                UserDefaults.standard.set(
-                    try choiceValue(value, "Context window", ["model", "custom"]),
-                    forKey: ChatSessionAutocompactionConfig.contextWindowModeKey
-                )
-            }
-        ))
-        rows.append(defaultsInt(
-            id: "chat.compaction_threshold_tokens", page: "chat",
-            label: "Context window custom size (tokens)", key: ChatSessionAutocompactionConfig.defaultsKey,
-            // The Settings stepper's range and default, so a size written here is one Settings can show (0 read as "0 tokens" there).
-            fallback: ChatSessionAutocompactionConfig.defaultThresholdTokens,
-            minimum: 50_000, maximum: 500_000,
-            note: "Used when Context window is custom."
-        ))
-        rows.append(QuietSetting(
-            id: "chat.compaction_percent", page: "chat", label: "Compact at (% of the model's window)",
-            kind: .number,
-            note: "Whole percentage 30–95, default 85. Applies to every detected or Custom-capped model window. May be raised or lowered at the person's request. Fold target scales by 55/85; aging uses the same trigger.",
-            read: { _ in
-                let config = ChatSessionAutocompactionConfig.productionDefault()
-                if let failure = config.configurationFailure { throw QuietSettingError.unavailable(failure) }
-                return .int(Int64(config.compactionPercent))
-            },
-            write: { _, value in
-                guard let percent = value.exactIntegerValue,
-                      ChatSessionAutocompactionConfig.compactionPercentRange.contains(percent) else {
-                    throw QuietSettingError.badValue("Compact at accepts a whole percentage from 30–95%.")
-                }
-                UserDefaults.standard.set(percent, forKey: ChatSessionAutocompactionConfig.compactionPercentKey)
-            }
-        ))
-
         rows.append(defaultsBool(
             id: "chat.quiet_mode", page: "chat",
             label: "Quiet mode (no audio out)", key: VoicePreference.quietKey,
@@ -486,11 +442,11 @@ public enum QuietSettings {
                 + "on the cloud route. Locally this takes an installed AVSpeechSynthesisVoice identifier; "
                 + "display names and language codes are not accepted. On the cloud route it is the route's own voice name.",
             read: { _ in .string(VoicePreference.name()) },
-            write: { host, value in
+            write: { host, value, context in
                 let name = try readAloudVoiceValue(value, host: host)
                 UserDefaults.standard.set(name, forKey: VoicePreference.nameKey)
             },
-            check: { host, value in
+            check: { host, value, turn in
                 do {
                     _ = try readAloudVoiceValue(value, host: host)
                     return nil
@@ -504,7 +460,6 @@ public enum QuietSettings {
 
         rows += providerRows
 
-        // ── Trust (read everything, change nothing that widens authority) ────
         rows.append(posture(
             id: "trust.permission_level", label: "Permission level",
             note: "strict is Safe; balanced is Work mode when the outside-workspace policy is deny, "
@@ -532,14 +487,13 @@ public enum QuietSettings {
                 let preset = MobileTrustAction.Preset.matching(policy: policy, accessMode: appModel.agentAccessMode(from: policy))
                 return .string(preset?.rawValue ?? "")
             },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let choices = MobileTrustAction.Preset.quietWritable.map(\.rawValue)
                 let wanted = try choiceValue(value, "Trust preset", choices)
                 guard let preset = MobileTrustAction.Preset.quietWritable.first(where: { $0.rawValue == wanted }) else {
                     throw QuietSettingError.badValue("Trust preset takes one of: \(choices.joined(separator: ", ")).")
                 }
-                // The page's own action, which writes every axis of the preset in one patch. It is called without the Full Mac
-                // confirmation, so a plan that needs one is refused here rather than applied — the fence the agent cannot move.
+                // Apply the page's complete preset patch without Full Mac confirmation; refuse any plan requiring that user-only confirmation.
                 switch await appModel.applyTrustPreset(
                     preset, guardedByLockedPolicy: requireFullMacLock
                 ) {
@@ -555,7 +509,7 @@ public enum QuietSettings {
         rows.append(fullMacPosture(
             id: "trust.unattended_work", label: "Let the agent work unattended", kind: .boolean,
             read: { appModel in .bool(appModel.trustPolicy?.enableAutonomy ?? false) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Let the agent work unattended")
                 let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
                     body: ["enableAutonomy": enabled],
@@ -570,7 +524,7 @@ public enum QuietSettings {
             note: "Carries the destructive-action, shell and system-control gates with it, "
                 + "which is what the Trust page's own save does.",
             read: { appModel in .bool(appModel.trustPolicy?.developerMode ?? false) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Developer mode")
                 // Patch only this field and recheck Full Mac under the writer's lock.
                 let saved: TrustPolicy
@@ -598,7 +552,7 @@ public enum QuietSettings {
             note: "The master switch over the Mac control policy. Off, none of the per-verb "
                 + "allows below apply.",
             read: { appModel in .bool(appModel.trustPolicy?.macControlPolicy?.enabled ?? false) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Mac control")
                 try await saveMacControl(appModel, field: "enabled", enabled: enabled, "Mac control")
             }
@@ -636,15 +590,13 @@ public enum QuietSettings {
             ("cloud_voice", "Use the cloud voice for reading aloud", "tts_openai", \TrustMultimodalPolicy.tts_openai,
              "Off reads with the Mac voice. This is the route, not whether anything is spoken."),
             ("screen_capture", "Allow screen capture", "screen_capture", \TrustMultimodalPolicy.screen_capture, ""),
-            ("image_understanding", "Allow image understanding", "vision_api_calls", \TrustMultimodalPolicy.vision_api_calls, ""),
-            ("pdf_reading", "Allow reading PDFs", "file_ingestion_pdf", \TrustMultimodalPolicy.file_ingestion_pdf, ""),
             ("image_generation", "Allow image generation", "image_generation_openai", \TrustMultimodalPolicy.image_generation_openai, ""),
         ] as [(String, String, String, KeyPath<TrustMultimodalPolicy, Bool> & Sendable, String)] {
             rows.append(lowerOnly(
                 id: "trust.\(id)", page: "trust", label: label,
                 whereUserDoesIt: "Trust → Features → \(label)", note: note,
                 read: { $0.trustPolicy?.multimodalPolicy?[keyPath: keyPath] ?? false },
-                write: { appModel, enabled in
+                write: { appModel, enabled, context in
                     guard appModel.trustPolicy?.multimodalPolicy != nil else {
                         throw QuietSettingError.unavailable(
                             "The Trust policy has not loaded yet, so this setting cannot be changed. Try again in a moment.")
@@ -655,8 +607,10 @@ public enum QuietSettings {
                             let current: JSONValue? = if case .object(let block)? = locked["multimodalPolicy"] {
                                 block[field]
                             } else { nil }
-                            if enabled, current != .bool(true), !QuietSettings.restoringPreviousValue, !AppToolExecutor.lockedPolicyIsFullMac(locked) {
-                                throw QuietSettingError.users("Turning \(label) on raises Trust, so it is the owner's call. Ask them to do it: Trust → Features → \(label).")
+                            if enabled, current != .bool(true), !context.turn.restoresPreviousSetting, !AppToolExecutor.lockedPolicyIsFullMac(locked) {
+                                throw QuietSettingError.users("""
+                                    Turning \(label) on raises Trust, so it is the owner's call. Ask them to do it: Trust → Features → \(label).
+                                    """)
                             }
                         })
                     appModel.applySavedTrustPolicy(saved, status: "Multimodal policy saved")
@@ -664,8 +618,7 @@ public enum QuietSettings {
             ).onTab("features"))
         }
 
-        // ── Notifications ─────────────────────────────────────────────────── Helpers on the rail is the layout's (layout.write, rail's
-        // bots block).
+        // Helpers on the rail belong to layout.write's bots block.
         rows.append(defaultsBool(
             id: "notifications.channel_push", page: "notifications",
             label: "Deliver to the phone", key: NotificationChannelPreference.pushKey,
@@ -708,50 +661,65 @@ public enum QuietSettings {
             }
         ))
 
+        for (id, label, field, keyPath) in [
+            ("image_understanding", "Image understanding", "vision_api_calls", \TrustMultimodalPolicy.vision_api_calls),
+            ("pdf_reading", "Read PDFs", "file_ingestion_pdf", \TrustMultimodalPolicy.file_ingestion_pdf),
+            ("docx_reading", "Read Word documents", "file_ingestion_docx", \TrustMultimodalPolicy.file_ingestion_docx),
+        ] as [(String, String, String, KeyPath<TrustMultimodalPolicy, Bool> & Sendable)] {
+            rows.append(QuietSetting(
+                id: "settings.\(id)", page: "settings", label: label, kind: .boolean,
+                note: field == "file_ingestion_docx" ? "Saved reading preference; DOCX attachments are not yet supported." : "",
+                read: { host in
+                    .bool((try await readMindPolicy(host).multimodalPolicy ?? TrustMultimodalPolicy())[keyPath: keyPath])
+                },
+                write: { host, value, _ in
+                    let enabled = try boolValue(value, label)
+                    let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
+                        body: ["multimodalPolicy": [field: enabled]],
+                        dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                    host.applySavedTrustPolicy(saved, status: "\(label) saved")
+                    guard saved.multimodalPolicy?[keyPath: keyPath] == enabled else {
+                        throw QuietSettingError.unavailable("\(label) was not saved: its stored value did not change.")
+                    }
+                }
+            ).ownedByMind())
+        }
         rows += personalityRows
         rows.append(QuietSetting(
             id: "memories.knowledge_graph", page: "settings", label: "Knowledge graph",
-            kind: .boolean, requiresTrustPolicy: true,
-            read: { appModel in .bool(try loadedTrustPolicy(appModel, "Knowledge graph").memoryPolicy?.knowledge_graph_enabled ?? true) },
-            write: { appModel, value in
+            kind: .boolean,
+            read: { host in .bool(try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: host.dataRootOverride)) },
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Knowledge graph")
-                guard await appModel.patchMemoryPolicy(
-                    knowledgeGraphEnabled: enabled, adaptivePromotion: nil) else {
-                    throw QuietSettingError.unavailable("The memory policy write did not take.")
-                }
+                try await saveMemoryPolicy(appModel, "Knowledge graph", field: "knowledge_graph_enabled",
+                    enabled: enabled, expecting: \.knowledge_graph_enabled)
             }
-        ))
+        ).ownedByMind())
         rows.append(QuietSetting(
             id: "memories.cross_session", page: "settings", label: "Remember across conversations",
             kind: .boolean,
             note: "Brings in what is relevant from every past conversation, not just this one.",
-            requiresTrustPolicy: true,
-            read: { appModel in .bool((try loadedTrustPolicy(appModel, "Remember across conversations").memoryPolicy ?? TrustMemoryPolicy()).cross_session_recall) },
-            write: { appModel, value in
+            read: { host in .bool(try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: host.dataRootOverride)) },
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Remember across conversations")
                 try await saveMemoryPolicy(
                     appModel, "Remember across conversations", field: "cross_session_recall", enabled: enabled,
                     expecting: \.cross_session_recall)
             }
-        ))
+        ).ownedByMind())
         rows.append(QuietSetting(
             id: "memories.recur_to_facts", page: "settings", label: "Recurring memories are proposed as facts",
             kind: .boolean,
             note: "What keeps coming back is proposed as a durable fact to accept.",
-            requiresTrustPolicy: true,
-            read: { appModel in .bool((try loadedTrustPolicy(appModel, "Recurring memories are proposed as facts").memoryPolicy ?? TrustMemoryPolicy()).adaptive_promotion) },
-            write: { appModel, value in
+            read: { host in .bool(try MemoryPolicyGate.adaptivePromotionEnabled(dataRoot: host.dataRootOverride)) },
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "Recurring memories are proposed as facts")
-                guard await appModel.patchMemoryPolicy(
-                    knowledgeGraphEnabled: nil, adaptivePromotion: enabled) else {
-                    throw QuietSettingError.unavailable(
-                        "The memory policy write did not take. Check \(AppToolExecutor.doorDoctor), then try again.")
-                }
+                try await saveMemoryPolicy(appModel, "Recurring memories are proposed as facts", field: "adaptive_promotion",
+                    enabled: enabled, expecting: \.adaptive_promotion)
             }
-        ))
+        ).ownedByMind())
         rows.append(personalityName)
 
-        // ── Settings ────────────────────────────────────────────────────────
         rows.append(defaultsBool(
             id: "settings.dark_mode", page: "settings",
             label: "Dark appearance", key: "nativeagent.darkMode", defaultOn: true
@@ -771,18 +739,18 @@ public enum QuietSettings {
                 }
                 return .string(raw)
             },
-            write: { _, value in
+            write: { _, value, context in
                 UserDefaults.standard.set(try choiceValue(value, "Haze colour", HazeColor.allCases.map(\.rawValue)), forKey: HazeColor.key)
             }
-        ))
+        ).watchingDefaults(HazeColor.key))
         rows.append(QuietSetting(
             id: "settings.view_mode", page: "settings",
             label: "View", kind: .choice, choices: SimpleViewMode.choices,
             note: "simple: the agent, its agents and helpers beside one chat, no settings pages. "
                 + "advanced: the full app. agent: a window onto the agent's own screen.",
             read: { _ in .string(try SimpleViewMode.checkedCurrent()) },
-            write: { _, value in UserDefaults.standard.set(try choiceValue(value, "View", SimpleViewMode.choices), forKey: SimpleViewMode.key) }
-        ))
+            write: { _, value, context in UserDefaults.standard.set(try choiceValue(value, "View", SimpleViewMode.choices), forKey: SimpleViewMode.key) }
+        ).watchingDefaults(SimpleViewMode.key))
         rows.append(defaultsBool(
             id: "settings.developer_surfaces", page: "settings",
             label: "Show developer surfaces", key: "showDeveloperSurfaces"
@@ -790,27 +758,27 @@ public enum QuietSettings {
         rows.append(liveBool(
             id: "settings.global_hotkey", page: "settings",
             label: "Global hotkey", key: "globalHotkeyEnabled", defaultOn: true,
-            apply: { appModel, enabled in appModel.setGlobalHotkeyEnabled(enabled) }
+            apply: { appModel, enabled, context in appModel.setGlobalHotkeyEnabled(enabled) }
         ))
         rows.append(liveBool(
             id: "settings.inner_life", page: "settings",
             label: "An inner life", key: "cognitiveSubstrateEnabled", defaultOn: true,
             note: "The master over the lanes below. On turns them all on with it; off turns them all off.",
-            apply: { appModel, enabled in
+            apply: { appModel, enabled, context in
                 let (running, problem) = await appModel.setInnerLifeEnabled(enabled)
                 if running != enabled {
                     throw QuietSettingError.unavailable(
                         problem ?? "The inner life did not turn \(enabled ? "on" : "off").")
                 }
-                if let problem { QuietWriteDetail.record("held_off", .string(problem)) }
+                if let problem { context.detail.record("held_off", .string(problem)) }
             }
-        ))
+        ).ownedByMind())
         rows.append(cognitionLane(
-            id: "settings.inner_life_capsule", page: "diagnostics", label: "Give me a thought summary",
+            id: "settings.inner_life_capsule", label: "Give me a thought summary",
             key: "cognitiveSubstrateCapsuleEnabled", defaultOn: true, lane: .capsule
         ))
         rows.append(cognitionLane(
-            id: "settings.inner_life_background", page: "diagnostics", label: "Keep thinking in the background",
+            id: "settings.inner_life_background", label: "Keep thinking in the background",
             key: "cognitiveSubstrateBackgroundEnabled", defaultOn: true, lane: .background
         ))
         rows.append(cognitionLane(
@@ -818,21 +786,21 @@ public enum QuietSettings {
             key: "cognitiveSubstrateReflectionEnabled", defaultOn: false, lane: .reflection
         ))
         rows.append(QuietSetting(
-            id: "settings.daily_reflection_budget", page: "diagnostics",
+            id: "settings.daily_reflection_budget", page: "settings",
             label: "Reflections in 24 hours", kind: .number,
             note: "Reflections in any 24 hours, 0 to 8 — the Cognition page's stepper.",
             read: { _ in
                 .int(Int64(UserDefaults.standard.object(
                     forKey: "cognitiveSubstrateDailyReflectionBudget") as? Int ?? 2))
             },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let budget = try intValue(value, "Reflections in 24 hours")
                 guard (0...8).contains(budget) else {
                     throw QuietSettingError.badValue("Reflections in 24 hours takes 0 to 8.")
                 }
                 await appModel.setReflectionBudget(budget)
             }
-        ))
+        ).watchingDefaults("cognitiveSubstrateDailyReflectionBudget").ownedByMind())
         rows.append(cognitionLane(
             id: "settings.organism_kernel", label: "Moods, energy, and a clock of my own",
             key: "organismKernelEnabled", defaultOn: false, lane: .organism
@@ -848,45 +816,44 @@ public enum QuietSettings {
                 }
                 return .string(raw)
             },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let raw = try choiceValue(value, "Memory in every reply", ["off", "active"])
                 guard let mode = ContextFlowMode(rawValue: raw) else { return }
                 let effective = try await appModel.setContextFlowMode(mode)
                 if effective != mode {
-                    QuietWriteDetail.record("effective_now", .string(effective.rawValue))
-                    QuietWriteDetail.record("held_off", .string(
+                    context.detail.record("effective_now", .string(effective.rawValue))
+                    context.detail.record("held_off", .string(
                         "Saved as \(raw), but it is \(effective.rawValue) right now: setup, safety or an "
                         + "environment override holds it there."))
                 }
             }
-        ))
+        ).watchingDefaults("contextFlowMode").ownedByMind())
         rows.append(liveBool(
-            id: "settings.her_hour", page: "settings",
-            label: "My hour", key: "studioWanderEnabled", defaultOn: false,
+            id: "settings.wander_hour", page: "settings",
+            label: "My hour", key: StudioWanderLane.enabledDefaultsKey, defaultOn: StudioWanderLane.enabledByDefault,
             note: "Once a day, when nothing is happening, an hour with no task set. Runs inside the "
                 + "inner life (settings.inner_life).",
-            apply: { _, enabled in
+            apply: { _, enabled, context in
                 if enabled, !storedBool("cognitiveSubstrateEnabled", true) {
                     throw QuietSettingError.unavailable(
                         "My hour runs inside the inner life, which is off. Turn on settings.inner_life first.")
                 }
-                UserDefaults.standard.set(enabled, forKey: "studioWanderEnabled")
+                UserDefaults.standard.set(enabled, forKey: StudioWanderLane.enabledDefaultsKey)
                 await NativeCognitionRuntime.reloadStudioWanderInstallation()
             }
-        ))
+        ).ownedByMind())
 
-        // ── Desk ────────────────────────────────────────────────────────────
         rows.append(QuietSetting(
             id: "research.search_url", page: "desk", label: "Search service",
             kind: .text,
             note: "The SearXNG address research searches through, as http://host:port. auto looks for "
                 + "one running on this Mac and saves what it finds.",
             read: { appModel in .string(appModel.searchServiceURL) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let raw = try stringValue(value, "Search service").trimmingCharacters(in: .whitespaces)
                 if raw.caseInsensitiveCompare("auto") == .orderedSame {
                     do {
-                        _ = try await appModel.findSearchService()
+                        _ = try await appModel.findSearchService(context: context)
                     } catch {
                         throw QuietSettingError.unavailable(
                             "Search service was not selected: \(error.localizedDescription). Check "
@@ -904,14 +871,13 @@ public enum QuietSettings {
             }
         ))
 
-        // ── Notifications (the proactive inbox) ─────────────────────────────
         rows.append(QuietSetting(
             id: "notifications.raise_unasked", page: "notifications",
             label: "Raise things unasked", kind: .boolean,
             note: "The master over the triggers below. The agent may turn it off; turning it on is "
                 + "the person's.",
             read: { appModel in (await notificationsMasterOn(appModel)).map { .bool($0) } ?? .null },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 guard !(try boolValue(value, "Raise things unasked")) else {
                     throw QuietSettingError.unavailable(
                         "Turning this on is the person's call: it lets the agent reach out unasked. "
@@ -935,7 +901,8 @@ public enum QuietSettings {
             id: "notifications.triggers_on", page: "notifications",
             label: "Triggers that are on", kind: .list,
             liveChoices: { host in
-                guard let host = host() else { throw QuietSettingError.unavailable("The settings owner is unavailable. Open settings again before reading triggers.") }
+                guard let host = host() else { throw QuietSettingError.unavailable(
+                    "The settings owner is unavailable. Open settings again before reading triggers.") }
                 return try await host.inboxTriggers().map(\.name)
             },
             note: "The kinds of thing raised unasked, by name. Send the whole list that should be on; "
@@ -945,7 +912,7 @@ public enum QuietSettings {
                 let triggers = try await appModel.inboxTriggers()
                 return .array(triggers.filter(\.enabled).map { .string($0.name) })
             },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let wanted = Set(try listValue(value, "Triggers that are on"))
                 let triggers: [QuietInboxTrigger]
                 do {
@@ -956,7 +923,7 @@ public enum QuietSettings {
                         + "\(error.localizedDescription). Try again in a moment.")
                 }
                 let names = triggers.map(\.name)
-                // Switching one on is hers only while the person's master is on.
+                // Only the user's enabled master permits the agent to turn on an individual trigger.
                 let turningOn = triggers.contains { wanted.contains($0.name) && !$0.enabled }
                 if turningOn, await notificationsMasterOn(appModel) != true {
                     throw QuietSettingError.unavailable(
@@ -970,7 +937,7 @@ public enum QuietSettings {
                         + "\(names.joined(separator: ", ")).")
                 }
                 var switched: [JSONValue] = []
-                defer { QuietWriteDetail.record("triggers_switched", .array(switched)) }
+                defer { context.detail.record("triggers_switched", .array(switched)) }
                 for trigger in triggers where wanted.contains(trigger.name) != trigger.enabled {
                     do {
                         try await appModel.setInboxTrigger(trigger.name, enabled: !trigger.enabled)
@@ -990,22 +957,29 @@ public enum QuietSettings {
         return rows
     }()
 
+    /// Preference invalidation uses the keys declared beside the registry readers, never a second list of settings.
+    @MainActor
+    public static func defaultsKeys(forPage page: String, host: any QuietSettingsHost) -> [String] {
+        // Defaults-backed rows are declared here or by the platform; lower-only rows read their checked stores.
+        (staticRows + host.platformSettings).filter { $0.page == page }.compactMap(\.defaultsKey)
+    }
+
     /// Snapshot bot values only for a read; mutations keep fresh store readers.
     @MainActor
     public static func all(host: (any QuietSettingsHost)?, snapshotBots: Bool = false) throws -> [QuietSetting] {
-        try staticRows + botRows(host, snapshot: snapshotBots) + (host?.lowerOnlyRows ?? []) + (host?.platformSettings ?? [])
+        try staticRows + botRows(host, snapshot: snapshotBots) + (host?.lowerOnlyRows(forPage: nil) ?? []) + (host?.platformSettings ?? [])
     }
 
     @MainActor
     public static func settings(forPage page: String, host: (any QuietSettingsHost)?) throws -> [QuietSetting] {
-        // A page's settings: its own rows, its Mac integration's trust switch, and the memory model on the memories page.
+        // Page settings include the page's own rows, its Mac integration switch and the memories page's model.
         let belongs: (QuietSetting) -> Bool = { setting in
             setting.page == page || (setting.page == "mac_integration" && setting.id == "trust.mac_integration_\(page)")
                 || (page == "memories" && setting.id == "providers.memory_and_mind_model")
         }
         return try staticRows.filter(belongs)
             + (page == "bots" ? botRows(host, snapshot: true) : [])
-            + (host?.lowerOnlyRows ?? []).filter(belongs)
+            + (host?.lowerOnlyRows(forPage: page) ?? []).filter(belongs)
             + (host?.platformSettings ?? []).filter(belongs)
     }
 
@@ -1015,7 +989,7 @@ public enum QuietSettings {
         if key.hasPrefix("phone.") { return try await host?.phoneSetting(id: key) }
         let fixed = staticRows + (host?.platformSettings ?? [])
         if let setting = fixed.first(where: { $0.id.lowercased() == key }) { return setting }
-        let lower = try host?.lowerOnlyRows ?? []
+        let lower = try host?.lowerOnlyRows(forPage: nil) ?? []
         if !key.hasPrefix("bots.") {
             if let setting = lower.first(where: { $0.id.lowercased() == key }) { return setting }
             if let setting = fixed.first(where: { $0.label.lowercased() == key }) { return setting }

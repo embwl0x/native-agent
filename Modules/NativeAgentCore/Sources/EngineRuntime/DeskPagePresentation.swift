@@ -1,3 +1,4 @@
+import AgentConversations
 import Foundation
 import Cognition
 import OSLog
@@ -6,29 +7,26 @@ import StandingBots
 import NativeAgentShared
 import Desk
 import TriggerScheduler
-import WorkshopExecution
 // Blueprint: | `DeskPagePresentation.swift` | Desk page snapshots, attention, project/deadline composition and wording from one frozen board read |
 public struct DeskPageSnapshot: Sendable {
     public let id = UUID()
     public var board: DeskBoardRead?
     public var loaded: Bool { board != nil }
     public var items: [DeskItem] { board?.items ?? [] }
-    /// Her MY QUEUE resolves by ID but is not a row on his board.
+    /// The agent’s queue resolves by id without becoming a row on the user’s board.
     public var boardItems: [DeskItem] { board?.deskState?.board.items ?? [] }
     public var deskUnavailable: String? { board?.deskError }
     public var generatedTs: String? { board?.deskState?.generatedTs }
-    public var executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord> { board?.executions ?? .rows([]) }
+    public var agentJobs: DeskLaneState<AgentJob> { board?.agentJobs ?? .rows([]) }
     public var overview: WorkOverview? { board?.overview }
-    /// Sequencing and every prepared row are derived once, off the main actor,
-    /// from this read's board, explicit `now`, bot rows, reminders and schedule.
-    /// Readiness and deadline selection use this same frozen clock.
+    /// Derive rows and readiness once off the main actor from the same board and frozen clock.
     public var plan = DeskSequencing.Plan()
     public var now = Date.distantPast
     public var jobs: [ScheduledJob] = []
     public var nagConfig = DeskNagConfig()
     public var nagConfigError: String?
     public var botScheduleError: String?
-    public var herHour: DeskHerHourPresentation.State = .absent
+    public var wanderHour: DeskWanderHourPresentation.State = .absent
     public var missedBots: [DeskMissedBot] = []
     public var timedBots: [DeskTimedBot] = []
     public var botsUnavailable: String?
@@ -42,14 +40,12 @@ public struct DeskPageSnapshot: Sendable {
     }
 }
 
-/// One line from the engine's newest Her Hour trace, never another Desk task.
-/// An uninstalled lane is absent from the page.
-public enum DeskHerHourPresentation {
+/// Project the newest hour trace without creating a Desk task; an uninstalled part stays absent.
+public enum DeskWanderHourPresentation {
     public enum State: Sendable, Equatable {
         case absent
-        /// Her own closing line, plus how long ago. Nothing else: no verdict,
-        /// no outcome adjective we chose, no progress.
-        case line(text: String, symbol: String)
+        /// Show the agent’s closing words without adding a verdict or progress claim.
+        case line(text: String, symbol: String, at: String? = nil)
     }
 
     static func state(
@@ -60,12 +56,10 @@ public enum DeskHerHourPresentation {
         guard installed, let entry else { return .absent }
         let words = entry.line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !words.isEmpty else { return .absent }
-        let when = DeskRelativeTimePresentation.text(forISO: entry.at, now: now)
-        return .line(text: "\(bounded(words)) · \(when)", symbol: symbol(entry.outcome))
+        return .line(text: bounded(words), symbol: symbol(entry.outcome), at: entry.at)
     }
 
-    /// Icons, not labels. The three endings are equal in standing — a decline is
-    /// not a lesser outcome — so none of them gets a word here that ranks it.
+    /// Use icons without ranking endings: declining has equal standing.
     static func symbol(_ outcome: StudioWanderLane.Outcome) -> String {
         switch outcome {
         case .chose: return "eye"
@@ -96,7 +90,7 @@ public enum DeskAttentionStrip {
 public enum DeskPageContent {
     public typealias Content = (projects: [ProjectRow], owner: [DeskItem], blocked: [DeskItem],
         watches: [DeskItem], stale: [DeskItem], other: [DeskItem], history: [DeskItem],
-        executions: [WorkshopExecutionRecord], activity: DeskLiveActivityPresentation.State, deadline: Date?)
+        endedJobs: [AgentJob], activity: DeskLiveActivityPresentation.State, deadline: Date?)
 
     public static func active(_ items: [DeskItem]) -> [DeskItem] {
         DeskBoardLayout.activeItems(items)
@@ -167,14 +161,12 @@ public enum DeskPageWords {
         "eighty", "ninety",
     ]
 
-    /// Mid-sentence: "twenty-one", "a hundred and twenty-one".
     public static func spelledLower(_ count: Int) -> String {
         guard count >= 0 else { return String(count) }
         if (1...10).contains(count) { return TodayWords.spelledLower(count) }
         return lower(count)
     }
 
-    /// Sentence-leading: "Twenty-one".
     public static func spelled(_ count: Int) -> String {
         if (1...10).contains(count) { return TodayWords.spelled(count) }
         return TodayWords.capitalizedFirst(spelledLower(count))
@@ -202,10 +194,7 @@ public enum DeskPageWords {
 public extension DeskPageContent {
     // MARK: projects
 
-    /// One sentence about where a project actually stands: what is holding it,
-    /// or what comes next, or — when the board says nothing — that nothing is
-    /// named. Derived from the same sequencing plan the projection renders, so
-    /// this line and the desk text cannot disagree.
+    /// Derive the project sentence from the rendered sequencing plan so words and board cannot disagree.
     static func projectLine(_ item: DeskItem, in state: DeskState, plan: DeskSequencing.Plan) -> String {
         let itemPlan = plan.byHandle[item.handle]
         if let blockers = itemPlan?.effectiveBlockers, !blockers.isEmpty {
@@ -228,11 +217,7 @@ public extension DeskPageContent {
         return "No next step written down yet."
     }
 
-    /// One plain sentence for why a row is stuck. The inspector keeps the
-    /// whole stamped reason on every row, which is how twenty-one items became
-    /// a wall of the same paragraph; this cuts at a word boundary and never
-    /// carries markdown. Without a written reason, the open items it waits on
-    /// or its latest note say why before "no reason" does.
+    /// Bound stuck reasons to one plain sentence; retain the complete stamped reason in the inspector.
     static func stuckReason(_ item: DeskItem, in items: [DeskItem]) -> String {
         if let raw = item.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty {
@@ -269,12 +254,7 @@ public extension DeskPageContent {
 
     // MARK: Schedule
 
-    /// Only enabled jobs run. The rows beneath this headline already say
-    /// "Paused." for the rest, so counting every saved record made the fold
-    /// contradict its own contents.
-    /// A missed occurrence is neither running nor paused, so it is counted on
-    /// its own: nothing ran, and the page says so instead of staying silent.
-    /// `bots` is the unpaused bots on a schedule; each one runs on a timer too.
+    /// Count enabled jobs and scheduled unpaused helpers; missed occurrences need their own count because neither running nor paused describes them.
     static func scheduleHeadline(_ jobs: [ScheduledJob], missed: Int = 0, bots: Int = 0) -> String {
         guard missed >= 0, bots >= 0 else { return "Timer count unavailable" }
         let paused = jobs.count - jobs.filter(\.enabled).count
@@ -315,17 +295,14 @@ public extension DeskPageContent {
         public let title: String
         public let line: String
         public let meta: String
-        /// The plan's "x of y done", when the board has one; the row then
-        /// shows a bar instead of `meta`.
+        /// A plan’s progress bar replaces `meta` when counts exist.
         public var done: Int? = nil
         public var total: Int? = nil
         public let draft: String
-        /// Untouched for two weeks, or a 0-of-N plan nobody has moved in a
-        /// week: it sits in the folded "Parked" group, not with the live work.
+        /// Park plans untouched for two weeks, or zero-progress plans untouched for one week, so live work remains visible.
         public var parked = false
     }
 
-    /// "Running, step two of five." + "3m ago" → "Running, step two of five · 3m ago".
     private static func detail(_ parts: String...) -> String {
         parts
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -334,17 +311,18 @@ public extension DeskPageContent {
             .joined(separator: " · ")
     }
 
-    private static func computeProjectRows(snapshot: DeskPageSnapshot, evidence: [String: DeskExecutionEvidence], now: Date) -> (rows: [ProjectRow], parkingExpiry: Date?) {
+    private static func computeProjectRows(snapshot: DeskPageSnapshot, evidence: [String: DeskExecutionEvidence], now: Date) -> (rows: [ProjectRow],
+        parkingExpiry: Date?) {
         guard snapshot.deskUnavailable == nil else { return ([], nil) }
         let state = DeskState(items: snapshot.boardItems, generatedTs: "")
         let plan = snapshot.plan
-        let familyParents = snapshot.executions.unavailableReason == nil ? DeskProgramFamilyPresentation.workingParentIDs(
+        let familyParents = snapshot.agentJobs.unavailableReason == nil ? DeskProgramFamilyPresentation.workingParentIDs(
             from: state.items, evidence: evidence, now: now) : []
         var parkingExpiry: Date?
         let rows = projects(state.items, excluding: familyParents).map { item in
             let handles = DeskParking.subtreeHandles(item.handle, in: plan.children)
-            let live = snapshot.executions.items.filter {
-                $0.deskHandle.map(handles.contains) == true && !$0.isTerminal
+            let live = snapshot.agentJobs.items.filter {
+                $0.desk.map(handles.contains) == true && !$0.state.isTerminal
             }.sorted { $0.updatedAt > $1.updatedAt }.first
             let parking = DeskParking.parking(item, in: state, plan: plan, live: live != nil, now: now)
             if let boundary = parking.boundary, boundary > now {
@@ -354,17 +332,12 @@ public extension DeskPageContent {
             var meta = Self.detail(activity, DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
             var counts: (done: Int, total: Int)?
             if let live {
-                let label = DeskActivityState.execution(.init(deskHandle: live.deskHandle, status: live.status, updatedAt: live.updatedAt, lastMovementAt: live.lastMovementAt), now: now).label
-                let step = DeskExecutionPresentation.progress(
-                    status: live.status,
-                    planCount: live.plan.count,
-                    completedCount: live.stepsCompleted.count)
-                meta = step.map { "\(label), \($0)" } ?? label
+                meta = DeskActivityState.execution(DeskMovementPresentation.evidence(of: live), now: now).label
             } else if let itemPlan = plan.byHandle[item.handle], itemPlan.totalCount > 0 {
                 meta = Self.detail(activity, "\(itemPlan.doneCount) of \(itemPlan.totalCount) done")
                 counts = (itemPlan.doneCount, itemPlan.totalCount)
             }
-            // One Parked rule, shared with the agent's home (DeskParking).
+            // Share the home’s Parked rule through `DeskParking`.
             return ProjectRow(
                 id: item.handle,
                 title: DeskPageContent.title(item),
@@ -378,8 +351,7 @@ public extension DeskPageContent {
         return (rows, parkingExpiry)
     }
 
-    /// What a row says when it reaches Chat: the item by handle, and the reason
-    /// she stored — whole, not the row's shortened line.
+    /// Chat carries the stored reason whole, not the row’s clipped presentation.
     static func draft(about item: DeskItem) -> String {
         let reason = [item.blockedReason, item.waitingOn]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -394,7 +366,7 @@ public extension DeskPageContent {
         nags loadedNags: DeskNagConfig, timedBots timedSnapshot: [DeskTimedBot],
         jobStamps: [String], hourExpiry: Date?
     ) -> Content {
-        let evidence = DeskMovementPresentation.evidence(loaded.executions.items)
+        let evidence = DeskMovementPresentation.evidence(loaded.agentJobs.items)
         let (projects, parkingExpiry) = computeProjectRows(snapshot: loaded, evidence: evidence, now: presentationNow)
         let items = loaded.boardItems
         let owner = DeskPageContent.waitingOnOwner(items)
@@ -404,14 +376,14 @@ public extension DeskPageContent {
         let shown = Set((owner + blocked + watches + stale).map(\.handle) + projects.map(\.id))
         let other = DeskAttentionStrip.sortedDeskItems(DeskPageContent.active(items).filter { !shown.contains($0.handle) })
         let history = DeskAttentionStrip.sortedDeskItems(items.filter { $0.status.isTerminal })
-        let executions = loaded.executions.items.filter { $0.isTerminal }
+        let endedJobs = loaded.agentJobs.items.filter { $0.state.isTerminal }
             .sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
         let lane: DeskLaneState<DeskItem> = loaded.deskUnavailable.map { .unavailable($0) } ?? .rows(items)
-        let activity = DeskLiveActivityPresentation.make(deskItems: lane, executions: loaded.executions,
+        let activity = DeskLiveActivityPresentation.make(deskItems: lane, jobs: loaded.agentJobs,
                                                         evidence: evidence,
                                                         generatedTs: loaded.generatedTs, now: presentationNow)
-        let movementExpiry = loaded.executions.items.filter { $0.status == "running" }.compactMap {
-            DeskActivityState.movementDate($0.lastMovementAt)?.addingTimeInterval(DeskActivityState.movementWindow)
+        let movementExpiry = loaded.agentJobs.items.filter { $0.state == .working }.map {
+            $0.updatedAt.addingTimeInterval(DeskActivityState.movementWindow)
         }.filter { $0 > presentationNow }.min()
         let watchExpiry = DeskPageContent.watches(items).compactMap {
             UserDisplayFormatters.parseISOTimestamp($0.updatedAt)?.addingTimeInterval(
@@ -426,8 +398,7 @@ public extension DeskPageContent {
         }.filter { $0 > presentationNow }.min()
         let relativeStamps = items.map(\.updatedAt)
             + items.compactMap { $0.pursuit?.lastWorkedAt }
-            + loaded.executions.items.map(\.updatedAt)
-            + loaded.executions.items.compactMap(\.lastMovementAt)
+            + loaded.agentJobs.items.map { NativeTimestampFormat.fractionalZulu($0.updatedAt) }
             + jobStamps
             + [loaded.generatedTs].compactMap { $0 }
         let relativeDates = relativeStamps.compactMap(UserDisplayFormatters.parseISOTimestamp)
@@ -435,9 +406,10 @@ public extension DeskPageContent {
         let relativeExpiry = relativeDates.map {
             DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: presentationNow)
         }.min()
+        let dayExpiry = history.isEmpty ? nil : Calendar.current.dateInterval(of: .day, for: presentationNow)?.end
         let deadline = [activity.nextRefreshAt, movementExpiry, watchExpiry, deferExpiry, muteExpiry,
-                        nowExpiry, parkingExpiry, relativeExpiry, hourExpiry]
+                        nowExpiry, parkingExpiry, relativeExpiry, hourExpiry, dayExpiry]
             .compactMap { $0 }.filter { $0 > presentationNow }.min()
-        return (projects, owner, blocked, watches, stale, other, history, executions, activity, deadline)
+        return (projects, owner, blocked, watches, stale, other, history, endedJobs, activity, deadline)
     }
 }

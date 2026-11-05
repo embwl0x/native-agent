@@ -9,7 +9,7 @@ import Glibc
 import Darwin
 #endif
 import NativeAgentShared
-// Blueprint: | `EmbeddingModelDownload.swift` | `EmbeddingModelDownload` actor; checked descriptor, installation ownership and resumable part reads; target commit independent of cleanup failure; only changed installs release/reconcile the resident model; retained cancellation-aware extraction through actual subprocess exit |
+// Blueprint: | `EmbeddingModelDownload.swift` | `EmbeddingModelDownload`: checked resumable installation and convergence |
 
 /// One owner task survives navigation; status surfaces observe Core's push stream.
 @MainActor @Observable
@@ -50,8 +50,7 @@ public final class EmbeddingModelDownloadController {
                 if try await downloader.install(createOnly: createOnly) {
                     installCommitted = true
                     activating = true
-                    // Once the verified directory has committed, a late Pause must
-                    // not cancel corpus convergence and strand two vector spaces.
+                    // Once the verified directory has committed, a late Pause must not cancel corpus convergence and strand two vector spaces.
                     let converged = await Task.detached(priority: .utility) {
                         _ = await SwiftNativeMemoryV2.shared.releaseEmbeddingMemory(reason: "verified model installed")
                         return await SwiftNativeMemoryV2.shared.reconcileEmbeddingEpochAtLaunch()
@@ -84,7 +83,6 @@ public final class EmbeddingModelDownloadController {
 
     public func doctorUserPaused() async throws -> Bool { try await downloader.isUserPaused() }
 
-    /// Doctor joins the same owner task used by the two visible rows.
     public func resumeForDoctor() async -> Bool {
         guard task == nil else { return false }
         start()
@@ -93,9 +91,7 @@ public final class EmbeddingModelDownloadController {
     }
 }
 
-/// Downloads the standalone release without changing the serving embedding model.
-/// extras/coreml and extras/.coreml-download are local installation state:
-/// excluded from backup/export and phone sync, listed in PrivacyMap.
+/// Keep standalone downloads separate from the serving model. PrivacyMap excludes extras/coreml and extras/.coreml-download from backup, export and phone sync.
 public actor EmbeddingModelDownload {
     public struct Status: Sendable {
         public var phase: String = "Not started"
@@ -103,8 +99,7 @@ public actor EmbeddingModelDownload {
         public var total: Int64 = 0
         public var running = false
         public var available = false
-        /// Set only by this operation's target commit, never by inspection of
-        /// an already-current target. Cleanup has its own outcome.
+        /// Set only by this operation's target commit, never by inspection of an already-current target. Cleanup has its own outcome.
         public var installedRelease: String?
         public var cleanupFailure: String?
         public init() {}
@@ -137,8 +132,7 @@ public actor EmbeddingModelDownload {
         }
     }
 
-    /// nil is reserved for no configured descriptor. Configured bytes must be
-    /// readable and valid; corruption never selects bundled distribution.
+    /// nil is reserved for no configured descriptor. Configured bytes must be readable and valid; corruption never selects bundled distribution.
     public static func configuredDescriptor(at url: URL?) throws -> Descriptor? {
         guard let url else { return nil }
         do {
@@ -260,11 +254,13 @@ public actor EmbeddingModelDownload {
 
     /// Unknown ownership cannot authorize replacement or a fabricated marker.
     public static func ownershipRepairInstruction(at target: URL) -> String {
-        "Preserve \(target.path) by moving the whole directory intact to a sibling recovery name, then choose Check / resume on the Memory model download row to install the verified release. Do not invent release.sha256."
+        """
+            Preserve \(target.path) by moving the whole directory intact to a sibling recovery name, then choose Check / resume on the Memory model download \
+            row to install the verified release. Do not invent release.sha256.
+            """
     }
 
-    /// Ownership and manifest usability are independent checked facts. Unknown
-    /// ownership preserves bytes and states the gap; it never means "custom".
+    /// Ownership and manifest usability are independent checked facts. Unknown ownership preserves bytes and states the gap; it never means "custom".
     public static func inspectInstallation(at target: URL) throws -> Installation {
         guard try exists(target) else {
             return Installation(ownership: .absent, model: nil, modelFailure: nil)
@@ -295,7 +291,9 @@ public actor EmbeddingModelDownload {
         case .absent: return true
         case .unknown(let reason):
             let usability = installation.modelFailure ?? "The model manifest and artifacts passed inspection."
-            throw Failure.installation(path: target.path, reason: "Installation unverified: ownership unknown; preserved unchanged. \(reason) \(usability) \(Self.ownershipRepairInstruction(at: target))")
+            throw Failure.installation(path: target.path, reason: """
+                Installation unverified: ownership unknown; preserved unchanged. \(reason) \(usability) \(Self.ownershipRepairInstruction(at: target))
+                """)
         case .downloader(let installed):
             if installed == release, installation.model != nil {
                 publish("Memory model up to date")
@@ -369,9 +367,8 @@ public actor EmbeddingModelDownload {
         for observer in observers.values { observer.yield(status) }
     }
 
-    /// A release digest names the resume directory, so changed assets cannot reuse old bytes.
-    /// Completed 1 MiB subranges survive cancellation, failures, and process restarts.
-    /// True only when this invocation commits a replacement/new target.
+    /// Key resume directories by release digest so changed assets cannot reuse bytes. Persist completed 1 MiB subranges across interruption; success requires
+    /// this invocation to commit the target.
     public func install(createOnly: Bool = false) async throws -> Bool {
         guard !status.running else { return false }
         guard let descriptorURL else {
@@ -489,8 +486,7 @@ public actor EmbeddingModelDownload {
             } else {
                 try FileManager.default.moveItem(at: candidate, to: target)
             }
-            // This is the target commit boundary. Optional cleanup cannot
-            // change the result or suppress the controller's convergence.
+            // This is the target commit boundary. Optional cleanup cannot change the result or suppress the controller's convergence.
             status.installedRelease = sha
             publish("Memory model installed")
             do { try FileManager.default.removeItem(at: work) }
@@ -512,8 +508,7 @@ public actor EmbeddingModelDownload {
 
 #if os(macOS)
 private extension EmbeddingModelDownload {
-    /// The install flight retains this child until actual exit. Cancellation
-    /// kills extraction before install's staging cleanup can remove its files.
+    /// The install flight retains this child until actual exit. Cancellation kills extraction before install's staging cleanup can remove its files.
     final class Extraction: @unchecked Sendable {
         private struct State {
             var cancelled = false
@@ -550,8 +545,7 @@ private extension EmbeddingModelDownload {
             } onCancel: {
                 self.state.withLock { state in
                     state.cancelled = true
-                    // Start and cancel share the lock, including cancellation
-                    // before launch. Never report exit while ditto is writing.
+                    // Start and cancel share the lock, including cancellation before launch. Never report exit while ditto is writing.
                     if self.process.isRunning { kill(self.process.processIdentifier, SIGKILL) }
                 }
             }

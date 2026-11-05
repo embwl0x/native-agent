@@ -2,12 +2,13 @@ import Foundation
 import BackgroundWork
 import DeviceSync
 import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 import StandingBots
 import ProviderRouting
 import ChatToolRuntime
 import Experiences
-// Blueprint: | `EngineDeviceSyncHelpers.swift` | Phone helper edit validation, revisions, provider pin/follow semantics and contact commands; following edits share field-specific refusals and inherited-value no-op notes with tools; `editBotDefinition` fresh merge/timing; `botsShelfRead` supplies one helper status projection to Mac and DeviceSync; action receipts use the committed definition independently of snapshot refresh, whose `helpers_snapshot_error` marks the phone's shared helpers snapshot stale without failing the committed action; successful refresh replaces it without status overrides |
+// Blueprint: | `EngineDeviceSyncHelpers.swift` | `editBotDefinition`, `botsShelfRead`, `helpers_snapshot_error`; Checked helper edits and snapshots |
 
 extension NativeAgentEngine {
     public func deviceHelpersSnapshot() async throws -> MobileHelpersSnapshot {
@@ -58,8 +59,7 @@ extension NativeAgentEngine {
             var selection = bot
             selection.name = edit.name
             selection.modelPinned = modelPinned
-            // Empty strings are unset controls. The full-form Boolean is
-            // explicit (including false) unless the phone marks it unsubmitted.
+            // Empty strings leave controls unset; the Boolean is explicit, even false, unless marked unsubmitted.
             var fields: [String: JSONValue] = [:]
             if edit.fastIsSet != false { fields["fast"] = .bool(edit.fast) }
             if !edit.provider.isEmpty { fields["provider"] = .string(edit.provider) }
@@ -117,7 +117,7 @@ extension NativeAgentEngine {
             guard let id else { throw HelperRemoteError.invalid }
             var bot = try store.get(id)
             guard bot.deleted != true else { throw HelperRemoteError.stale }
-            // Read optional result detail before any effect commits.
+            // Read optional result detail before committing any effect.
             var resultDetail: String?
             if let resultID = payload["result_id"] {
                 guard let resultID = UUID(uuidString: resultID) else { throw HelperRemoteError.invalid }
@@ -143,7 +143,7 @@ extension NativeAgentEngine {
         }
     }
 
-    public func deviceAgentThreadAction(action: String, payload: [String: String]) async throws -> [String: String] {
+    public func deviceAgentThreadAction(action: String, payload: [String: String], turn: Turn) async throws -> [String: String] {
         let root = dataRoot
         guard let id = payload["id"] else { throw HelperRemoteError.invalid }
         let threads = try await Task.detached(priority: .utility) { try await AgentContactThreads.mobileThreads(root: root, contacts: self.contacts) }.value
@@ -153,7 +153,7 @@ extension NativeAgentEngine {
             guard let text = payload["text"], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   text.count <= 16_000, let session = payload["session_id"],
                   try await transcripts.list().contains(where: { $0.id == session }) else { throw HelperRemoteError.session }
-            if let failure = await sendContactMessage(agent: id, text: text, session: session, root: root) {
+            if let failure = await sendContactMessage(agent: id, text: text, session: session, root: root, turn: turn) {
                 return ["status": "error", "message": failure]
             }
             refreshed = try await Task.detached(priority: .utility) { try await AgentContactThreads.mobileThreads(root: root, contacts: self.contacts) }.value
@@ -182,8 +182,7 @@ extension NativeAgentEngine {
         }
         var receipt = ["status": "ok", "helper": String(decoding: try JSONEncoder().encode(edit), as: UTF8.self),
                        "paused": String(bot.paused)]
-        // The action's committed definition is its receipt. A broader read
-        // failure describes snapshot freshness, never failure of that effect.
+        // The committed definition proves the effect; a broader snapshot read failure concerns freshness only.
         do {
             let snapshot = try await deviceHelpersSnapshot()
             receipt["helpers_snapshot"] = String(decoding: try JSONEncoder().encode(snapshot), as: UTF8.self)

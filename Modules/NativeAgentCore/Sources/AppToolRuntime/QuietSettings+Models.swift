@@ -24,7 +24,7 @@ import MemoryV2
 import StandingBots
 import TurnTrace
 import Studio
-// Blueprint: | `QuietSettings+Models.swift` | QuietSettings model/account/effort choices and provider-group transactions; thinking and fast writes preserve model/account inheritance |
+// Blueprint: | `QuietSettings+Models.swift` | Group model/account/effort transactions retain inheritance |
 
 extension QuietSettings {
     /// Wait for the chat brain's saved outcome before reporting the setting as changed.
@@ -43,38 +43,40 @@ extension QuietSettings {
         providerID: String,
         model: String,
         reasoningEffort: String,
-        serviceTier: String
+        serviceTier: String,
+        context: QuietSettingWrite
     ) async throws {
         let result = try await writeProviderGroup(appModel, group: group, providerID: providerID,
-            model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier, clearOverride: false)
-        QuietWriteDetail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
+            model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier, clearOverride: false, context: context)
+        context.detail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
     }
 
     @MainActor private static func writeProviderGroup(
         _ appModel: any QuietSettingsHost, group: ProviderSurfaceGroup, providerID: String?,
-        model: String?, reasoningEffort: String?, serviceTier: String?, clearOverride: Bool
+        model: String?, reasoningEffort: String?, serviceTier: String?, clearOverride: Bool, context: QuietSettingWrite
     ) async throws -> ProviderGroupWriteResult {
         do {
             let result = try await appModel.saveProviderGroupSelection(
                 group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
                 serviceTier: serviceTier, clearOverride: clearOverride
             )
-            QuietWriteDetail.record("undo_unavailable", .string("This receipt's old value does not contain the group's previous model choices; set those choices explicitly to restore them."))
+            context.detail.record("undo_unavailable", .string("""
+                This receipt's old value does not contain the group's previous model choices; set those choices explicitly to restore them.
+                """))
             return result
         } catch let failure as ProviderGroupWriteFailure {
-            QuietWriteDetail.record("surfaces_changed", .null)
-            QuietWriteDetail.record("forward_intent", failure.forwardIntent)
-            QuietWriteDetail.record("intent_status", .string(failure.intentStatus))
-            QuietWriteDetail.record("projections_committed", .array(failure.projectionsCommitted.map(JSONValue.string)))
-            QuietWriteDetail.record("projections_pending", .array(failure.projectionsPending.map(JSONValue.string)))
-            QuietWriteDetail.record("projections_unknown", .array(failure.projectionsUnknown.map(JSONValue.string)))
-            QuietWriteDetail.record("surfaces_pending_recovery", .array(failure.surfacesPendingRecovery.map { .string($0) }))
+            context.detail.record("surfaces_changed", .null)
+            context.detail.record("forward_intent", failure.forwardIntent)
+            context.detail.record("intent_status", .string(failure.intentStatus))
+            context.detail.record("projections_committed", .array(failure.projectionsCommitted.map(JSONValue.string)))
+            context.detail.record("projections_pending", .array(failure.projectionsPending.map(JSONValue.string)))
+            context.detail.record("projections_unknown", .array(failure.projectionsUnknown.map(JSONValue.string)))
+            context.detail.record("surfaces_pending_recovery", .array(failure.surfacesPendingRecovery.map { .string($0) }))
             throw failure
         }
     }
 
-    /// The row's "Use Chat's choice" (`ProviderSettingsView.clearGroupOverride`): every member but Chat itself drops its own pick and
-    /// follows Chat again, all of them or none. Model/account inheritance is owned by the routing snapshot.
+    /// Clearing a group override restores Chat inheritance atomically across all non-Chat members via the routing snapshot.
     private static func providerGroupUseChat(_ group: ProviderSurfaceGroup) -> QuietSetting {
         let label = "\(group.title): use Chat's choice"
         @Sendable func hasOwnChoice(_ snapshot: ProviderRoutingSnapshot) -> Bool {
@@ -91,7 +93,7 @@ extension QuietSettings {
                     dataRoot: PersistenceCore.defaultDataRoot()).checkedRoutingSnapshot()
                 return .bool(!hasOwnChoice(snapshot))
             },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let before = try await SwiftNativeProviderRouting(
                     dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
                 ).checkedRoutingSnapshot()
@@ -105,26 +107,22 @@ extension QuietSettings {
                 }
                 let result = try await writeProviderGroup(
                     appModel, group: group, providerID: nil, model: nil,
-                    reasoningEffort: nil, serviceTier: nil, clearOverride: true
+                    reasoningEffort: nil, serviceTier: nil, clearOverride: true, context: context
                 )
-                QuietWriteDetail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
+                context.detail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
             }
         )
     }
 
-    /// The two activities that keep a model of their own outside the Providers page: the Telegram page's Model, and the Settings picker for
-    /// my hour (`SetupStudioWanderPicker`). Each is a one-member group, so it is pinned through the same rows and the same all-or-nothing
-    /// write as a whole group. (The Settings reflection picker is not here: it writes the whole Memory and mind group, which
-    /// providers.memory_and_mind_* is.)
+    /// Telegram and studio hour are single-member groups so they share all-or-nothing group writes; reflection uses Memory and mind.
     private static let surfacePins: [ProviderSurfaceGroup] = [
         ProviderSurfaceGroup(id: "telegram", title: "Telegram", members: [.init("telegram", "Telegram")]),
         ProviderSurfaceGroup(
-            id: "her_hour", title: "My hour",
+            id: "wander_hour", title: "My hour",
             members: [.init(NativeCognitionRuntime.studioWanderSurface, "My hour")]),
     ]
 
-    /// The three activity groups are the whole of the Providers page's model choice (`ProviderSurfaceGroups`), and a group's pick is
-    /// written to every surface it claims — exactly what `requestSetGroupSelection` does when a person changes the picker.
+    /// Each provider group writes every surface it owns, matching the page's requestSetGroupSelection transaction.
     private static func providerGroupModel(_ group: ProviderSurfaceGroup) -> QuietSetting {
         QuietSetting(
             id: "providers.\(group.id)_model",
@@ -141,7 +139,7 @@ extension QuietSettings {
                 }
                 return .string(preference.model)
             },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let model = try stringValue(value, "\(group.title) model")
                     .trimmingCharacters(in: .whitespaces)
                 guard !model.isEmpty else {
@@ -149,7 +147,9 @@ extension QuietSettings {
                 }
                 let lead = group.surfaces.first ?? group.id
                 guard let preference = try await currentPreference(surface: lead) else {
-                    throw QuietSettingError.unavailable("\(group.title)'s current choice is unavailable. Choose its account, model and controls together in Providers.")
+                    throw QuietSettingError.unavailable("""
+                        \(group.title)'s current choice is unavailable. Choose its account, model and controls together in Providers.
+                        """)
                 }
                 let providerID = try await leadProvider(group)
                 let effort = preference.reasoningEffort
@@ -165,18 +165,24 @@ extension QuietSettings {
                         + "models, set providers.\(group.id)_account first.")
                 }
                 guard choice.reasoningCapabilitiesKnown else {
-                    throw QuietSettingError.unavailable("\(model)'s thinking capabilities have not been read. Refresh its provider catalog before changing this model.")
+                    throw QuietSettingError.unavailable("""
+                        \(model)'s thinking capabilities have not been read. Refresh its provider catalog before changing this model.
+                        """)
                 }
                 guard choice.efforts.contains(effort)
                     || (providerID == "openrouter" && choice.efforts.isEmpty && (effort.isEmpty || effort == "default")) else {
-                    throw QuietSettingError.badValue("\(model) does not support the saved Think level '\(effort)'. Choose model and controls together in Providers; no setting changed.")
+                    throw QuietSettingError.badValue("""
+                        \(model) does not support the saved Think level '\(effort)'. Choose model and controls together in Providers; no setting changed.
+                        """)
                 }
                 if tier == "priority", !choice.supportsFast {
-                    throw QuietSettingError.badValue("\(model) does not support the saved Fast choice. Choose model and controls together in Providers; no setting changed.")
+                    throw QuietSettingError.badValue("""
+                        \(model) does not support the saved Fast choice. Choose model and controls together in Providers; no setting changed.
+                        """)
                 }
                 try await writeGroupSelection(
                     appModel, group: group, providerID: providerID, model: model,
-                    reasoningEffort: effort, serviceTier: tier
+                    reasoningEffort: effort, serviceTier: tier, context: context
                 )
             }
         )
@@ -190,7 +196,7 @@ extension QuietSettings {
             kind: .choice,
             liveChoices: { try await groupEfforts(group, $0()) },
             read: { _ in .string(try await currentPreference(surface: group.surfaces.first ?? group.id)?.reasoningEffort ?? "") },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let lead = group.surfaces.first ?? group.id
                 guard let preference = try await currentPreference(surface: lead), !preference.model.isEmpty else {
                     throw QuietSettingError.unavailable(
@@ -202,16 +208,14 @@ extension QuietSettings {
                     model: preference.model, modelSetting: "providers.\(group.id)_model")
                 let result = try await writeProviderGroup(
                     appModel, group: group, providerID: nil, model: nil,
-                    reasoningEffort: effort, serviceTier: nil, clearOverride: false
+                    reasoningEffort: effort, serviceTier: nil, clearOverride: false, context: context
                 )
-                QuietWriteDetail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
+                context.detail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
             }
         )
     }
 
-    /// Fast is not a flag of its own anywhere: it is `serviceTier == "priority"`, which is exactly what the Providers row's Fast toggle
-    /// writes. Registering it as a boolean saves the agent from having to know that, while the value that lands is identical to the
-    /// person's own click.
+    /// Fast projects serviceTier == priority as a boolean so the agent and page use the same persisted choice.
     private static func providerGroupFast(_ group: ProviderSurfaceGroup) -> QuietSetting {
         QuietSetting(
             id: "providers.\(group.id)_fast",
@@ -223,7 +227,7 @@ extension QuietSettings {
                 .bool(try await currentPreference(surface: group.surfaces.first ?? group.id)?
                     .serviceTier == "priority")
             },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let enabled = try boolValue(value, "\(group.title) fast")
                 let lead = group.surfaces.first ?? group.id
                 let routing = SwiftNativeProviderRouting(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
@@ -236,25 +240,28 @@ extension QuietSettings {
                     let catalog = try routing.checkedCatalogModels(for: providerID)
                     guard let model = catalog.first(where: { $0.id == preference.model }),
                           let fast = model.supports_fast else {
-                        throw QuietSettingError.unavailable("Fast capability for \(preference.model) on \(providerID) is unknown. Refresh its models in Providers.")
+                        throw QuietSettingError.unavailable("""
+                            Fast capability for \(preference.model) on \(providerID) is unknown. Refresh its models in Providers.
+                            """)
                     }
                     guard fast else {
-                        throw QuietSettingError.badValue("\(preference.model) does not offer a fast tier on \(providerID). Choose a model that does in Providers.")
+                        throw QuietSettingError.badValue("""
+                            \(preference.model) does not offer a fast tier on \(providerID). Choose a model that does in Providers.
+                            """)
                     }
                 }
                 // A tier change is a partial transaction: the resolved model and account checked above are not new selections.
                 let result = try await writeProviderGroup(
                     appModel, group: group, providerID: nil, model: nil,
                     reasoningEffort: nil, serviceTier: enabled ? "priority" : "default",
-                    clearOverride: false
+                    clearOverride: false, context: context
                 )
-                QuietWriteDetail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
+                context.detail.record("surfaces_changed", .array(result.surfacesChanged.map { .string($0) }))
             }
         )
     }
 
-    /// The accounts the Providers page's own account menu offers — every eligible provider, by the same test the menu applies (a rejected
-    /// key reads needs_key). `app_settings_list` reports this list and the write enforces it, so the two are one list.
+    /// Account choices and validation share the Providers menu's eligibility rules; rejected keys remain needs_key.
     @MainActor
     private static func connectedAccountIDs(_ appModel: (any QuietSettingsHost)?) async throws -> [String] {
         guard let appModel else { throw QuietSettingError.unavailable("The provider settings owner is unavailable. Open Providers again.") }
@@ -264,7 +271,7 @@ extension QuietSettings {
             .map(\.id)
     }
 
-    /// A group's connected account and a model that account serves, reconciled in one group transaction.
+    /// Reconcile a group's connected account and served model in one transaction.
     private static func providerGroupAccount(_ group: ProviderSurfaceGroup) -> QuietSetting {
         QuietSetting(
             id: "providers.\(group.id)_account",
@@ -278,8 +285,8 @@ extension QuietSettings {
                     .activeProvidersForSurfacesChecked()
                 return .string(providers[group.surfaces.first ?? group.id] ?? "")
             },
-            write: { appModel, value in
-                // Accept only the page's connected accounts.
+            write: { appModel, value, context in
+                // Reject accounts the page does not offer.
                 let connected = try await connectedAccountIDs(appModel)
                 guard !connected.isEmpty else {
                     throw QuietSettingError.unavailable(
@@ -295,27 +302,33 @@ extension QuietSettings {
                     throw QuietSettingError.unavailable("\(group.title) has no model selected. Choose its account and model together in Providers.")
                 }
                 guard let model = catalog.first(where: { $0.id == preference.model }) else {
-                    throw QuietSettingError.badValue("\(account) does not offer \(preference.model). Choose the account and model together in Providers; no setting changed.")
+                    throw QuietSettingError.badValue("""
+                        \(account) does not offer \(preference.model). Choose the account and model together in Providers; no setting changed.
+                        """)
                 }
                 guard let efforts = model.supported_reasoning_efforts else {
                     throw QuietSettingError.unavailable("Think controls for \(preference.model) on \(account) are unknown. Refresh its models in Providers.")
                 }
                 guard efforts.contains(preference.reasoningEffort)
                     || (account == "openrouter" && efforts.isEmpty && (preference.reasoningEffort.isEmpty || preference.reasoningEffort == "default")) else {
-                    throw QuietSettingError.badValue("Think level '\(preference.reasoningEffort)' is unsupported for \(preference.model) on \(account). Choose a supported level in Providers; no setting changed.")
+                    throw QuietSettingError.badValue("""
+                        Think level '\(preference.reasoningEffort)' is unsupported for \(preference.model) on \(account). Choose a supported level in \
+                        Providers; no setting changed.
+                        """)
                 }
                 if preference.serviceTier == "priority", model.supports_fast != true {
-                    throw QuietSettingError.badValue("Fast is unsupported or unknown for \(preference.model) on \(account). Choose a supported tier in Providers; no setting changed.")
+                    throw QuietSettingError.badValue("""
+                        Fast is unsupported or unknown for \(preference.model) on \(account). Choose a supported tier in Providers; no setting changed.
+                        """)
                 }
                 try await writeGroupSelection(
                     appModel, group: group, providerID: account, model: preference.model,
-                    reasoningEffort: preference.reasoningEffort, serviceTier: preference.serviceTier
+                    reasoningEffort: preference.reasoningEffort, serviceTier: preference.serviceTier, context: context
                 )
             }
         )
     }
 
-    /// The account a group's lead surface runs on.
     private static func leadProvider(_ group: ProviderSurfaceGroup) async throws -> String {
         let providers = try await SwiftNativeProviderRouting(dataRoot: PersistenceCore.defaultDataRoot())
             .activeProvidersForSurfacesChecked()
@@ -325,7 +338,7 @@ extension QuietSettings {
         return provider
     }
 
-    /// The models an account offers, from its checked account catalog.
+    /// Model choices require the account's checked catalog.
     @MainActor
     private static func offeredModels(
         _ appModel: (any QuietSettingsHost)?, providerID: String
@@ -338,8 +351,7 @@ extension QuietSettings {
         return account.models
     }
 
-    /// The Think menu contains the selected model's checked descriptor. A
-    /// missing descriptor is unavailable; a declared empty list offers no levels.
+    /// The Think menu contains the selected model's checked descriptor. A missing descriptor is unavailable; a declared empty list offers no levels.
     @MainActor
     private static func groupEfforts(
         _ group: ProviderSurfaceGroup, _ appModel: (any QuietSettingsHost)?
@@ -353,7 +365,7 @@ extension QuietSettings {
         return model.efforts
     }
 
-    /// The composer's Think menu contains only the selected model's declared levels.
+    /// Only the selected model's declared thinking levels may appear in the menu.
     @MainActor
     private static func chatEfforts(_ appModel: (any QuietSettingsHost)?) async throws -> [String] {
         guard let appModel else { throw QuietSettingError.unavailable("The chat settings owner is unavailable. Open Chat again.") }
@@ -364,7 +376,7 @@ extension QuietSettings {
         return model.efforts
     }
 
-    /// A thinking level the model actually takes. The refusal names the levels and where a model with others is chosen.
+    /// Thinking refusals name supported levels and the control for choosing another model.
     private static func effortValue(
         _ value: JSONValue, _ label: String, _ choices: [String], model: String, modelSetting: String
     ) throws -> String {
@@ -395,7 +407,7 @@ extension QuietSettings {
             note: "Empty means Chat follows the Providers Chat group. Setting it here pins this surface only. "
                 + "The choices are the models of the account Chat is on.",
             read: { appModel in .string(appModel.chatModel) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 let model = try stringValue(value, "Chat's own model")
                     .trimmingCharacters(in: .whitespaces)
                 let offered = try await offeredModels(appModel, providerID: appModel.chatProvider).map(\.id)
@@ -415,7 +427,7 @@ extension QuietSettings {
             liveChoices: { try await chatEfforts($0()) },
             note: "The choices are the levels Chat's own model takes.",
             read: { appModel in .string(appModel.chatReasoningEffort) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 appModel.chatReasoningEffort = try effortValue(
                     value, "Chat thinking", try await chatEfforts(appModel),
                     model: appModel.chatModel.isEmpty ? "Chat's model" : appModel.chatModel,
@@ -427,7 +439,7 @@ extension QuietSettings {
             id: "chat.fast_mode", page: "chat", label: "Chat fast mode",
             kind: .boolean,
             read: { appModel in .bool(appModel.chatFastMode) },
-            write: { appModel, value in
+            write: { appModel, value, context in
                 appModel.chatFastMode = try boolValue(value, "Chat fast mode")
                 try await settleChatBrain(appModel, "Chat fast mode")
             }
@@ -437,20 +449,25 @@ extension QuietSettings {
 
     static let providerRows: [QuietSetting] = {
         var rows: [QuietSetting] = []
-        // ── Providers ───────────────────────────────────────────────────────
         rows.append(QuietSetting(
             id: "providers.routing_repair", page: "providers", label: "Reconstruct provider routing", kind: .text,
-            note: "Read the three BaseHash values and preserved source bytes (base64). Set JSON text with those same hashes and complete surfaces and active objects, including Chat. Choose every model/account explicitly; omitted overrides are removed. Original bytes are retained by digest. No credentials change.",
+            note: """
+                Read the three BaseHash values and preserved source bytes (base64). Set JSON text with those same hashes and complete surfaces and active \
+                objects, including Chat. Choose every model/account explicitly; omitted overrides are removed. Original bytes are retained by digest. No \
+                credentials change.
+                """,
             read: { host in
                 do {
                     let input = try await SwiftNativeProviderRouting(dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()).routingRepairInput()
                     return .string(try input.serialize(pretty: false))
                 } catch { return .string(error.localizedDescription) }
             },
-            write: { host, value in
+            write: { host, value, context in
                 let input = try JSONValue.parse(Data(try stringValue(value, "Provider routing reconstruction").utf8))
                 try await SwiftNativeProviderRouting(dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()).reconstructRouting(input)
-                QuietWriteDetail.record("undo_unavailable", .string("Original routing bytes are retained beside each file by digest; reconstruct explicitly to restore them."))
+                context.detail.record("undo_unavailable", .string("""
+                    Original routing bytes are retained beside each file by digest; reconstruct explicitly to restore them.
+                    """))
             }
         ))
         for group in ProviderSurfaceGroups.all {
@@ -478,7 +495,7 @@ extension QuietSettings {
         read: { _ in
             let routing = SwiftNativeProviderRouting(dataRoot: PersistenceCore.defaultDataRoot())
             let active = try await routing.activeProvidersForSurfacesChecked()
-            // The Work group's first resolved account, the same order the image tools walk.
+            // Work resolves its first account in the same order as image tools.
             let provider = ProviderSurfaceGroups.work.surfaces
                 .compactMap { active[$0] }
                 .first { !$0.isEmpty }

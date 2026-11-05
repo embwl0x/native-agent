@@ -9,15 +9,22 @@ import DoctorChecks
 import DeviceSync
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `AppDelegate+BackgroundTasks.swift` | Background task handlers and AppDoctorPort; BrowserIPC health reads one discovery-admitted listener snapshot from the browser owner |
+// Blueprint: | `AppDelegate+BackgroundTasks.swift` | Background handlers; browser health uses the discovery-admitted listener |
 
 extension AppDelegate {
     static func registerBackgroundTaskHandlers() {
         do {
-            for entry in BackgroundLoopLifetimes.systemBackgroundActivities {
+            let activities: [(loopId: String, wake: OrganWake)] = [
+                ("self_improvement_sweep", .every(WeeklySelfImprovementLoop.defaultPeriod)),
+            ]
+            for entry in activities {
+                guard let period = entry.wake.period else {
+                    NSLog("[BackgroundTasks] Registration refused: %@ runs on change, not an OS rhythm.", entry.loopId)
+                    continue
+                }
                 let activity = NSBackgroundActivityScheduler(
                     identifier: try NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(entry.loopId))
-                activity.interval = entry.interval
+                activity.interval = period
                 activity.tolerance = 12 * 60 * 60
                 activity.repeats = true
                 activity.qualityOfService = .utility
@@ -35,7 +42,6 @@ extension AppDelegate {
     }
 }
 
-/// Mounted Inspector and bridge effects for the engine's Doctor owner.
 struct AppDoctorPort: EngineDoctorPlatformPort {
     let dataRoot: URL
     var backgroundLoopsManager: BackgroundLoopLifetimes = .shared

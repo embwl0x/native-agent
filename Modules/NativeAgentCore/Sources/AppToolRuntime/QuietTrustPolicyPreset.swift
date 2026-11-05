@@ -5,9 +5,8 @@ import TrustCenter
 // Blueprint: | `QuietTrustPolicyPreset.swift` | `MobileTrustAction.Preset` policy plans, locked save and effective-policy matching |
 
 extension MobileTrustAction.Preset {
-    /// The presets the agent may apply to itself while this Mac is in Full Mac.
-    /// Full Mac is deliberately absent: lowering the fence is allowed, raising
-    /// it to Full Mac is the person's alone.
+    /// The presets the agent may apply to itself while this Mac is in Full Mac. Full Mac is deliberately absent: lowering the fence is allowed, raising it to
+    /// Full Mac is the person's alone.
     public static var quietWritable: [MobileTrustAction.Preset] { [.safe, .workMode, .builder] }
 
     public static func matching(policy: TrustPolicy, accessMode: String?) -> MobileTrustAction.Preset? {

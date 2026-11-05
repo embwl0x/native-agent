@@ -24,7 +24,11 @@ struct MobileSchedulerView: View {
                             NavigationLink {
                                 MobileSchedulerJobDetail(jobID: job.id)
                             } label: {
-                                AliveRow(job.name, detail: "\(job.kind) · \(job.schedulerState)\n\(job.schedule)\nNext run: \(job.enabled ? schedulerDate(job.nextRunAt, macTimeZone: snapshot.mac_time_zone) : "Not scheduled")\nLast run: \(schedulerDate(job.lastRunAt, macTimeZone: snapshot.mac_time_zone)) · \(job.lastRunStatus ?? "Not run yet")") {
+                                AliveRow(job.name, detail: """
+                                    \(job.kind) · \(job.schedulerState)\n\(job.schedule)\nNext run: \
+                                    \(job.enabled ? schedulerDate(job.nextRunAt, macTimeZone: snapshot.mac_time_zone) : "Not scheduled")\nLast run: \
+                                    \(schedulerDate(job.lastRunAt, macTimeZone: snapshot.mac_time_zone)) · \(job.lastRunStatus ?? "Not run yet")
+                                    """) {
                                     AliveChevron()
                                 }
                             }
@@ -72,7 +76,8 @@ private struct MobileSchedulerJobDetail: View {
                     LabeledContent("Status", value: job.schedulerState).aliveRow()
                     Text(job.schedule).aliveRow()
                     LabeledContent("Mac time zone", value: sync.schedulerSnapshot?.mac_time_zone ?? "Not available").aliveRow()
-                    LabeledContent("Next run", value: job.enabled ? schedulerDate(job.nextRunAt, macTimeZone: sync.schedulerSnapshot?.mac_time_zone) : "Not scheduled").aliveRow()
+                    LabeledContent("Next run", value: job.enabled ? schedulerDate(job.nextRunAt, macTimeZone: sync.schedulerSnapshot?.mac_time_zone)
+                        : "Not scheduled").aliveRow()
                     LabeledContent("Last run", value: schedulerDate(job.lastRunAt, macTimeZone: sync.schedulerSnapshot?.mac_time_zone)).aliveRow()
                     LabeledContent("Last status", value: job.lastRunStatus ?? "Not run yet").aliveRow()
                 }

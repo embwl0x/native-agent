@@ -3,14 +3,9 @@ import PersistenceCore
 import Experiences
 // Blueprint: | `SignedPeerEvidence.swift` | `SignedPeerEvidence` struct |
 
-/// Latest authenticated observation of the paired iOS peer: the one record of
-/// when the phone was last heard from.
-///
-/// This is derived body evidence, not a transport queue or another message
-/// ledger. Writers may call it only after the originating envelope has passed
-/// HMAC and freshness validation. A status record is not one: it names no
-/// device, and any installation on the iCloud account can rewrite it. No payload, token, user text, or signature is
-/// retained; the signed event identity is enough to correlate the observation.
+/// Record paired-phone evidence only after HMAC and freshness validation; retain no payload, token, speech or signature.
+/// A shared iCloud status cannot establish device identity because any account installation can rewrite it.
+/// Keep this derived observation separate from transport queues and message ledgers.
 public struct SignedPeerEvidence: Codable, Equatable, Sendable {
     public enum Channel: String, Codable, Sendable {
         case chat
@@ -21,8 +16,7 @@ public struct SignedPeerEvidence: Codable, Equatable, Sendable {
     public var channel: Channel
     public var peerCreatedAt: Date
     public var observedAt: Date
-    /// When the phone was last there: its own timestamp, never later than the
-    /// Mac received it, so an hours-old backlog drained now stays hours old.
+    /// Clamp phone event time to Mac receipt time so draining an old backlog cannot make the phone seem freshly present.
     public var contactAt: Date { min(peerCreatedAt, observedAt) }
 }
 

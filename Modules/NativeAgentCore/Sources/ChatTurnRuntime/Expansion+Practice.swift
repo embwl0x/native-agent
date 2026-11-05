@@ -6,10 +6,10 @@ import Privacy
 import ChatToolParsing
 import ToolRegistry
 import TrustCenter
-// Blueprint: | `Expansion+Practice.swift` | `Expansion`: exact template/argument-flow inference, field-independent situations, measured costs under shared `Expectation` standing, v3 per-mind/authority record fold and diagnostics |
+// Blueprint: | `Expansion+Practice.swift` | `Expansion`; `Expectation`; Measured authority-separated practice |
 
 extension Expansion {
-    /// Measured practice costs and resource bounds; `Expectation` owns standing.
+    /// Expectation owns standing; these measurements bound costs and resources without deciding admission.
     enum Law {
         static func median(_ values: [Double]) -> Double? {
             let sorted = values.filter(\.isFinite).sorted()
@@ -18,8 +18,7 @@ extension Expansion {
             return sorted.count % 2 == 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
         }
 
-        /// Hit benefit is the median follow-up gap; miss cost is the median stem run, or observed mind run.
-        /// Prepared acts save the confirmation round; provider token cost is unmeasured.
+        /// Use measured median gaps and runs for benefit and cost; prepared acts save a confirmation round, while token cost stays unknown.
         static func measure(_ record: Record, _ template: Template, among: Int? = nil)
             -> (stands: Bool, lower: Double, bar: Double?, cHit: Double?, cMiss: Double?) {
             let cHit = median(template.gaps)
@@ -29,8 +28,7 @@ extension Expansion {
             return (standing.stands, standing.lower, standing.bar, cHit, cMiss)
         }
 
-        // Resource bounds: they bound memory and work, and decide nothing.
-        // Examples per situation is the window the forms are read from.
+        // Resource caps bound work and storage without deciding standing; examples form the situation's observation window.
         static let leafCap = 2048
         static let pathsPerValue = 8
         static let examplesPerSituation = 8
@@ -40,7 +38,6 @@ extension Expansion {
         static let threadCap = 64
         static let costCap = 16
         static let callCap = 4096
-        /// A delivered read's own result may carry the next one, this deep.
         static let chain = 3
     }
 
@@ -54,7 +51,6 @@ extension Expansion {
         let nature: Nature
         /// Never wait longer for it than the round it would save.
         let within: Double
-        /// What it usually takes to run (c_miss).
         let expected: Double
         let why: JSONValue
     }
@@ -83,7 +79,7 @@ extension Expansion {
         let lower: Double
         let bar: Double?
         let known: Set<String>
-        /// An opening claim is labelled by the actual first call, shown or not.
+        /// Label opening claims with the actual first call, even when its prediction was not shown.
         var firstCall = false
         var planned = false
         var delivered = false
@@ -99,7 +95,6 @@ extension Expansion {
 
     struct Last: Sendable {
         let situation: String
-        /// Each text or number of the step's call and result, by the paths that held it.
         let index: [String: [String]]
         let returnedAt: Date
     }
@@ -109,7 +104,6 @@ extension Expansion {
         let at: Date
     }
 
-    /// One mind's calls in one conversation's turn, in order.
     struct CallThread: Sendable {
         let caller: Caller
         var calls = 0
@@ -127,11 +121,9 @@ extension Expansion {
     }
 
     struct Book: Codable, Sendable {
-        /// v3 folds model-separated practices and field-qualified situations.
         static let current = 3
         var version = Book.current
-        /// Per mind and authority (`agent`, `own` or
-        /// `steered:<principals>`, joined by U+0001).
+        /// Separate practice by mind and authority so principals cannot borrow another scope's standing.
         var practices: [String: Practice] = [:]
 
         mutating func fold() throws {
@@ -142,7 +134,7 @@ extension Expansion {
                 var practice = folded[old.key] ?? Practice(agent: old.agent, steered: old.steered, at: old.lastAt)
                 practice.lastAt = max(practice.lastAt, old.lastAt)
                 for (key, situation) in old.situations.sorted(by: { $0.key < $1.key }) {
-                    // The field list preceded woke; never edit the wake's text.
+                    // Exclude qualified fields from the wake label so its authored text stays unchanged.
                     let name: String
                     if let fields = key.range(of: " fields:") {
                         let woke = key.range(of: " woke:", range: fields.upperBound..<key.endIndex)
@@ -190,11 +182,9 @@ extension Expansion {
 
     struct Practice: Codable, Sendable {
         var agent: String
-        /// The untrusted principals that steered every turn this practice
-        /// learned from; empty for the mind's own turns.
+        /// Preserve every untrusted principal that steered the learned practice; empty means the mind's own authority.
         var steered: [String]
         var situations: [String: Situation] = [:]
-        /// Per situation and prediction form.
         var records: [String: Record] = [:]
         var lastAt: Date
 
@@ -214,8 +204,7 @@ extension Expansion {
         init(at: Date) { lastAt = at }
     }
 
-    /// One next call: as the mind wrote it, where each of its values could
-    /// have come from, how long after the result it came, and how long it ran.
+    /// Keep exact call values, their observed sources and follow-up costs so predictions remain grounded in actual work.
     struct Example: Codable, Sendable {
         var at: Date
         var call: [String: JSONValue]
@@ -227,19 +216,17 @@ extension Expansion {
     struct Record: Codable, Sendable {
         var situation: String
         var form: String
-        /// Since its last change: standing is earned on these.
+        /// Earn standing only on trials since the last detected change.
         var tries = 0
         var hits = 0
         var lifetimeTries = 0
         var lifetimeHits = 0
         var unknown = 0
-        /// Misses in a row now.
         var misses = 0
         var changes = 0
         var delivered = 0
         var prepared = 0
         var withheld = 0
-        /// The stem's own runs of it, in seconds.
         var costs: [Double] = []
         var lastAt: Date
 
@@ -249,10 +236,7 @@ extension Expansion {
             lastAt = at
         }
 
-        /// A run of misses the record before it makes improbable, under even
-        /// its highest plausible miss rate (1 − its lower bound), with less
-        /// than one such run expected among its tries (probability < 1/tries),
-        /// is a change: standing is earned again from the run on.
+        /// A miss streak resets standing only when even the highest plausible miss rate makes fewer than one such streak likely across its tries.
         static func invalid(_ field: String) -> NSError {
             NSError(domain: "Expansion", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid or overflowing expansion counter at " + field])
         }
@@ -316,11 +300,8 @@ extension Expansion {
         }
     }
 
-    /// The after check, on what the mind did next, never on what it says.
-    /// Unshown, a prediction hits when the next call is exactly it. A read
-    /// that rode along hits only when a later call carries something only it
-    /// showed (used); called again, it missed; otherwise nothing is known.
-    /// A prepared act hits when the mind makes it.
+    /// Judge prediction by subsequent calls, never prose. An unshown exact next call hits; a delivered read hits only through later use.
+    /// Repeated reads miss; absent evidence remains unknown. Prepared acts hit only when the mind performs them.
     static func outcome(_ attempt: Try, tool: String?, next: [String: JSONValue]?) -> Outcome {
         let again: Bool
         if tool == "app", let next {
@@ -340,15 +321,15 @@ extension Expansion {
     }
 
     /// A call carrying a key or token (`:secret` args) is never kept.
-    static func carriesSecret(_ call: [String: JSONValue]) throws -> Bool {
+    static func carriesSecret(_ call: [String: JSONValue], turn: Turn?) throws -> Bool {
         if NativeAgentSecretRedactor.secretPath(.object(call), at: "call") != nil { return true }
-        guard let binding = try AppActionBinding.action(input: call), !binding.secretArgs.isEmpty else { return false }
+        guard let binding = try AppActionBinding.action(input: call, turn: turn), !binding.secretArgs.isEmpty else { return false }
         guard case .object(let args)? = call["args"] else { return false }
         return binding.secretArgs.contains { args[$0] != nil }
     }
 
     /// Predict repeated forms only when every argument has a shared exact source or structural constant.
-    static func templateEvidence(_ examples: [Example]) throws -> (templates: [Template], rejected: [String: Int]) {
+    static func templateEvidence(_ examples: [Example], turn: Turn?) throws -> (templates: [Template], rejected: [String: Int]) {
         var rejected: [String: Int] = [:]
         var groups: [String: [(example: Example, values: [String: JSONValue], paths: [String])]] = [:]
         var order: [String] = []
@@ -358,7 +339,8 @@ extension Expansion {
                 rejected["incomplete_traversal", default: 0] += 1; continue
             }
             let paths = flat.map { $0.path }
-            guard let key = try? JSONValue.array([.string(verb(tool: "app", input: example.call)), structure(.object(example.call))]).serialize(pretty: false) else {
+            guard let key = try? JSONValue.array([.string(verb(tool: "app", input: example.call)), structure(.object(example.call))]).serialize(
+                pretty: false) else {
                 rejected["unserializable_shape", default: 0] += 1; continue
             }
             if groups[key] == nil { order.append(key) }
@@ -373,7 +355,7 @@ extension Expansion {
             }
             var slots: [Leaf] = []
             var judged = false
-            let binding = try AppActionBinding.action(input: latest.example.call)
+            let binding = try AppActionBinding.action(input: latest.example.call, turn: turn)
             let properties: [String: JSONValue]? = {
                 guard let descriptor = binding?.descriptor,
                       let parsed = try? JSONValue.parse(descriptor.schema.parametersJSON),
@@ -415,10 +397,7 @@ extension Expansion {
         return (templates, rejected)
     }
 
-    /// A value that may stand as a constant: a true or false (or null), the
-    /// call's own verb (its action id, or a page the door has), or a member
-    /// of an enum the action's schema declares for that argument. Every
-    /// other value, text or number, must flow from a source.
+    /// Only booleans, null, the call's verb or schema-declared enum members may be constants; all other values require an observed source.
     static func structural(_ value: JSONValue, at path: String, properties: [String: JSONValue]?, rename: [String: String]) -> Bool {
         switch value {
         case .bool, .null: return true
@@ -442,8 +421,7 @@ extension Expansion {
         }
     }
 
-    /// The follow-up this step predicts, filled from its sources now; nil
-    /// when a source it needs is gone or two of them disagree.
+    /// Missing or conflicting sources make the prediction unavailable rather than guessing an argument.
     static func fill(_ template: Template, from values: [String: JSONValue]) -> [String: JSONValue]? {
         var call = JSONValue.object(template.shape)
         for leaf in template.leaves {
@@ -462,8 +440,7 @@ extension Expansion {
 
     // MARK: - Shapes
 
-    /// The door's own grammar for what a call is: an action, a page or page
-    /// item, find, a batch or script, a home item, home; another tool by name.
+    /// Use the door's own grammar so action, page, find, batch, script and named-tool calls retain distinct identities.
     static func verb(tool: String, input: [String: JSONValue]) -> String {
         guard tool == "app" else { return "tool:" + tool }
         func text(_ key: String) -> String {
@@ -478,30 +455,29 @@ extension Expansion {
         return item ? "item" : "home"
     }
 
-    /// The situation a result makes: the call's verb and argument names, the
-    /// result's status word, and for a turn's first call
-    /// what woke the turn.
+    /// Include verb, argument names, result status and opening wake so practice matches the actual situation.
     static func situation(tool: String, input: [String: JSONValue], result: JSONValue, woke: String?) -> String {
+        let reply = ToolResult(result)
         var parts = [verb(tool: tool, input: input)]
         if case .object(let args)? = input["args"] { parts.append("args:" + args.keys.sorted().joined(separator: ",")) }
-        parts.append("status:" + ChatToolOutcome.statusWord(result))
+        parts.append("status:" + ChatToolOutcome.statusWord(reply.payload, verdict: reply.outcome))
         if let woke { parts.append("woke:" + woke) }
         return parts.joined(separator: " ")
     }
 
     /// Opening perception neither acts nor prepares an act's preview.
-    static func openingRead(_ call: [String: JSONValue]) throws -> Bool {
-        try call["preview"] != .bool(true) && nature(call) == .read
+    static func openingRead(_ call: [String: JSONValue], turn: Turn?) throws -> Bool {
+        try call["preview"] != .bool(true) && nature(call, turn: turn) == .read
     }
 
     /// Reads run, acts preview; batches, scripts and home items cannot be predictions.
-    static func nature(_ call: [String: JSONValue]) throws -> Nature? {
+    static func nature(_ call: [String: JSONValue], turn: Turn?) throws -> Nature? {
         if call["actions"] != nil || call["script"] != nil { return nil }
         if case .string(let id)? = call["action"], !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            guard let binding = try AppActionBinding.action(input: call) else { return nil }
+            guard let binding = try AppActionBinding.action(input: call, turn: turn) else { return nil }
             // A preview runs nothing: the door's posture, and Trust's reading of it.
             if call["preview"] == .bool(true) { return .read }
-            return try enforcedRead(call, binding) ? .read : .act
+            return try enforcedRead(call, binding, turn: turn) ? .read : .act
         }
         func text(_ key: String) -> String { if case .string(let value)? = call[key] { value } else { "" } }
         let place = AppDoorNames.place(page: text("page"), item: text("item"))
@@ -510,10 +486,10 @@ extension Expansion {
     }
 
     /// A read needs both Trust’s argument-sensitive class and an enforced read-only declaration.
-    static func enforcedRead(_ call: [String: JSONValue], _ binding: AppActionBinding) throws -> Bool {
+    static func enforcedRead(_ call: [String: JSONValue], _ binding: AppActionBinding, turn: Turn?) throws -> Bool {
         guard binding.read, binding.capabilities.isSubset(of: readCapabilities) else { return false }
         let ran = ToolNameAliases.ranCall("app", input: call)
-        guard try PermissionLaw.toolClass(ran.tool, input: ran.input) == .read else { return false }
+        guard try PermissionLaw.toolClass(ran.tool, input: ran.input, turn: turn) == .read else { return false }
         return binding.toolClass == .read || (!binding.readWhen.isEmpty && AppActionBinding.builtInToolName(binding.tool))
     }
 
@@ -523,7 +499,6 @@ extension Expansion {
         input.filter { !$0.key.hasPrefix("__") && !(preview && $0.key == "preview") }
     }
 
-    /// Two calls are the same when every value at every path is.
     static func same(_ left: [String: JSONValue], _ right: [String: JSONValue]) -> Bool? {
         var one: [(path: String, value: JSONValue)] = [], two: [(path: String, value: JSONValue)] = []
         guard JSONValue.object(left).leaves(into: &one, limit: Law.leafCap, depthLimit: 128),
@@ -541,7 +516,7 @@ extension Expansion {
         }
     }
 
-    /// A scalar as one comparable word; numbers compare by value.
+    /// Compare numeric scalars by value rather than spelling.
     static func token(_ value: JSONValue) -> String? {
         switch value {
         case .string(let text): return "s:" + text
@@ -557,8 +532,7 @@ extension Expansion {
         }
     }
 
-    /// Only text and numbers can flow from a result into an argument; a true
-    /// or a null matches everything and is a constant when it is one.
+    /// Only text and numbers flow from results; booleans and null are constants, since matching them would invent sources.
     static func sourceToken(_ value: JSONValue) -> String? {
         switch value {
         case .string, .int, .double: return token(value)
@@ -568,13 +542,16 @@ extension Expansion {
 
     static func rounded(_ value: Double) -> Double { (value * 1000).rounded() / 1000 }
 
-    /// Diagnostics: each mind's predictions, situation, record and standing,
-    /// and how often the stem really ran or prepared one.
     public func summary(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> String {
         let root = dataRoot.standardizedFileURL.path
         load(root)
         if let reason = unavailable[root] { return "Expansion record unavailable: " + reason }
-        var lines = ["A prediction reaches the opening thought or rides inside the result before it while the lower bound of its hit rate (Wilson, one-sided, z = √(2 ln(m/0.05)) for the m predictions this mind's record is testing) beats c_miss / (c_miss + c_hit): c_hit is the median time this mind took to make the call after the turn started or the result came back, c_miss the median time that call takes to run. Only reads run at turn start; follow-up acts are only previewed."]
+        var lines = ["""
+            A prediction reaches the opening thought or rides inside the result before it while the lower bound of its hit rate (Wilson, one-sided, z \
+            = √(2 ln(m/0.05)) for the m predictions this mind's record is testing) beats c_miss / (c_miss + c_hit): c_hit is the median time this \
+            mind took to make the call after the turn started or the result came back, c_miss the median time that call takes to run. Only reads run \
+            at turn start; follow-up acts are only previewed.
+            """]
         if savePending(root) { lines.append("Practice has changes awaiting a durable save.") }
         let practices = (books[root]?.practices.values.map { $0 } ?? []).sorted { $0.lastAt > $1.lastAt }
         if practices.isEmpty { lines.append("No mind has made a call through the door yet.") }
@@ -585,7 +562,7 @@ extension Expansion {
             if !practice.steered.isEmpty { head += ", in turns steered by " + practice.steered.joined(separator: ", ") }
             lines.append(head + ": \(practice.situations.count) situations, \(practice.records.count) predictions")
             let evidence: [String: (templates: [Template], rejected: [String: Int])]
-            do { evidence = try practice.situations.mapValues { try Self.templateEvidence($0.examples) } }
+            do { evidence = try practice.situations.mapValues { try Self.templateEvidence($0.examples, turn: nil) } }
             catch { return "Expansion action catalog unavailable: " + error.localizedDescription + ". Repair the catalog before reading predictions." }
             let rejected = evidence.values.reduce(into: [String: Int]()) { counts, item in
                 for (reason, count) in item.rejected { counts[reason, default: 0] += count }
@@ -599,7 +576,10 @@ extension Expansion {
                 let template = evidence[record.situation]?.templates.first { $0.form == record.form }
                 let measure = template.map { Law.measure(record, $0, among: among) }
                 var parts = [(record.situation.hasPrefix("start woke:") ? "at " : "after ") + record.situation + " -> " + record.form,
-                             "\(record.hits)/\(record.tries) since its last change (\(record.lifetimeHits)/\(record.lifetimeTries) in all, \(record.unknown) unknown, \(record.changes) changes)"]
+                             """
+                                 \(record.hits)/\(record.tries) since its last change (\(record.lifetimeHits)/\(record.lifetimeTries) in all, \
+                                 \(record.unknown) unknown, \(record.changes) changes)
+                                 """]
                 if let measure {
                     parts.append(String(format: "lower %.2f", measure.lower)
                                  + (measure.bar.map { String(format: " vs bar %.2f", $0) } ?? " (cost not measured yet)")

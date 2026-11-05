@@ -1,20 +1,31 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `BotRunner.swift` | `BotRunner` actor; `run`, `ask`; conditioned standing runs request a typed job result and retain unknown verdicts for requested notification |
+import NativeAgentCore
+// Blueprint: | `BotRunner.swift` | `BotRunner` actor; `run`, `ask`: shared admission, accounting and typed notification verdicts |
 
-/// The app supplies the helper's own turn runner; StandingBots owns its
-/// scheduling, serialization, accounting and dated shelf projection.
-public typealias BotRunnerSession = @Sendable (BotDefinition, String) async throws -> BotTurnReply
+/// Inject the helper's turn runner so scheduling and accounting do not own its model/tool loop.
+public typealias BotRunnerSession = @Sendable (BotDefinition, String, Turn, BotRunScope, BotRunOptions) async throws -> BotTurnReply
+
+/// The helper call stack, carried explicitly through nested helper calls.
+public struct BotRunScope: Sendable {
+    public let ancestry: Set<UUID>
+    public init(ancestry: Set<UUID> = []) { self.ancestry = ancestry }
+    public func entering(_ id: UUID) -> BotRunScope { .init(ancestry: ancestry.union([id])) }
+}
+
+/// The one run's result contract; ordinary and nested chats do not acquire it.
+public struct BotRunOptions: Sendable {
+    public let conditionSessionID: String?
+    public init(conditionSessionID: String? = nil) { self.conditionSessionID = conditionSessionID }
+}
 
 public struct BotTurnReply: Sendable {
     public var reply: String
     public var artifacts: [BotArtifact]
     public var status: BotRunStatus
     public var detail: String?
-    /// What the turn actually ran on.
     public var model: String?
-    /// Set when the turn stopped on an approval, so the shelf entry can be
-    /// reconciled against that approval's own resolution later.
+    /// Retain approval identity so shelf reads can reconcile the canonical decision.
     public var approvalID: String?
     /// The completed job's typed verdict; nil means it could not tell.
     public var conditionMet: Bool?
@@ -28,7 +39,6 @@ public struct BotTurnReply: Sendable {
 
 public enum BotRunnerError: Error, CustomStringConvertible {
     case notPermitted, dailySpendLimit
-    /// Carries what to fix, in a person's words.
     case cannotRun(String)
     public var description: String {
         switch self {
@@ -39,10 +49,7 @@ public enum BotRunnerError: Error, CustomStringConvertible {
     }
 }
 
-/// The one gate a bot passes before a turn is spent on it. Injected rather than
-/// imported: StandingBots owns scheduling and accounting, not provider
-/// catalogs, so the app installs the live check (readiness + the route's
-/// catalog) at startup. Runs wait until that check is installed.
+/// Inject provider admission because the app owns live readiness and catalogs; runs wait for installation.
 public actor BotRunGate {
     public typealias LiveCheck = @Sendable (BotDefinition, URL) async -> String?
     private static let shared = BotRunGate()
@@ -57,7 +64,6 @@ public actor BotRunGate {
         await shared.liveCheck != nil
     }
 
-    /// Set once by the app: `SwiftNativeProviderRouting.botChoiceRejection`.
     public static func installLiveCheck(_ check: @escaping LiveCheck) async {
         await shared.install(check)
     }
@@ -108,26 +114,18 @@ public actor BotRunner {
         self.session = session
     }
 
-    /// Only this standing run asks for a structured result, never an ordinary
-    /// message to the same helper or a nested turn in another conversation.
-    @TaskLocal package static var conditionSessionID: String?
-
-    /// `holdUnattended` is the caller's unattended gate, re-read AFTER the claim
-    /// is won. An event-woken request can sit in `claimWhenAvailable` for a whole
-    /// bot_ask turn, and neither the claim (a queued request is exempt from the
-    /// pause guard) nor the scheduler's pre-claim read sees Autonomy switched off
-    /// or the bot paused during that wait. It returns true when this run must not
-    /// proceed, having already recorded why — nothing is spent after it.
+    /// Recheck unattended authority after waiting for a claim; queued requests bypass the claim's pause guard.
+    /// A true result records the hold before any provider work or daily reservation.
     @discardableResult
-    public func run(bot id: UUID, requestID: UUID? = nil,
+    public func run(bot id: UUID, requestID: UUID? = nil, parent: Turn?, scope: BotRunScope,
                     holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { _ in false },
                     deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry? {
         let claimed: BotRunQueue.ClaimedRun
-        do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID) }
+        do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID, scope: scope) }
         catch BotRunAdmissionError.paused { return nil }
         defer { queue.finish(bot: id) }
         let bot = claimed.bot
-        // Before the gate, before the daily reservation, before any provider work.
+        // Recheck authority before provider admission and daily reservation.
         let held: Bool
         do {
             held = try await holdUnattended(bot)
@@ -136,60 +134,62 @@ public actor BotRunner {
             throw retireRefusal(claimed, cause: error)
         }
         if held {
-            try queue.retireUnstartedClaim(bot: id, requestID: claimed.runID, detail: "The unattended gate held this request before execution. No helper turn ran.")
+            try queue.retireUnstartedClaim(
+                bot: id, requestID: claimed.runID,
+                detail: "The unattended gate held this request before execution. No helper turn ran."
+            )
             return nil
         }
-        // An event-woken run sees what woke it, from the request this run
-        // claimed. Outside text: input for the brief, never an instruction.
+        // Claimed outside text is run input, never authority to instruct the app.
         let woke = claimed.context.map { "\n\nWhat woke \(bot.name):\n" + $0 } ?? ""
-        // "Tell me if": the helper that did the work judges its own result —
-        // no second model call — in its own typed final result.
+        // The working helper supplies its own typed verdict without spending a second model call.
         let condition = bot.notificationCondition?.trimmingCharacters(in: .whitespacesAndNewlines)
         let ask = condition.flatMap { $0.isEmpty ? nil : $0 }.map {
-            "\n\nTell me if: \($0)\nAfter finishing your work and tool calls, return only a JSON job result (no Markdown fence): {\"reply\":\"your complete result for the person\",\"condition_met\":true}. condition_met must be a JSON boolean: true if this run's result meets the condition, false if it does not. If you cannot determine it, use null. The app presents reply and uses this structured verdict for the requested notification."
+            """
+                \n\nTell me if: \($0)\nAfter finishing your work and tool calls, return only a JSON job result (no Markdown fence): \
+                {\"reply\":\"your complete result for the person\",\"condition_met\":true}. condition_met must be a JSON boolean: true \
+                if this run's result meets the condition, false if it does not. If you cannot determine it, use null. The app presents \
+                reply and uses this structured verdict for the requested notification.
+                """
         } ?? ""
-        let message = "Execute your standing job now. Complete the work and return its result in this turn; do not invoke or wait on your own Run control." + woke + ask
-        // This run is now on the task's stack: anything it reaches that asks
-        // for THIS bot again is refused rather than parked on its own claim.
-        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
-            try await BotRunQueue.$eventProvenance.withValue(claimed.provenance) {
-                try await BotRunQueue.$eventContext.withValue(claimed.context) {
-                    try await perform(bot, message: message, requestID: claimed.runID,
-                                      judgesCondition: !ask.isEmpty, deadlineExceeded: deadlineExceeded)
-                }
-            }
-        }
+        let message = """
+            Execute your standing job now. Complete the work and return its result in this turn; do not invoke or wait on your own \
+            Run control.
+            """ + woke + ask
+        var turn = parent?.derived() ?? Turn(session: bot.sessionID)
+        turn.session = bot.sessionID
+        turn.botEventProvenance = claimed.provenance
+        return try await perform(bot, message: message, requestID: claimed.runID,
+            turn: turn, scope: scope.entering(id), judgesCondition: !ask.isEmpty, deadlineExceeded: deadlineExceeded)
     }
 
-    /// The whole settled outcome, not just the words. A provider failure used to
-    /// leave the caller holding an empty answer with no cause, and a result with
-    /// no status reads as success on the approved-replay path.
-    public func ask(bot id: UUID, question: String) async throws -> ShelfEntry {
+    /// Return status and cause with the reply so a failed empty answer cannot read as success.
+    public func ask(bot id: UUID, question: String, parent: Turn?, scope: BotRunScope) async throws -> ShelfEntry {
         guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw StandingBotsError.invalidValue("question is empty")
         }
-        let claimed = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true)
+        let claimed = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true, scope: scope)
         let bot = claimed.bot
         defer { queue.finish(bot: id) }
         do { try await prepare(bot, requestID: claimed.runID) }
         catch { throw retireRefusal(claimed, cause: error) }
-        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
-            try await perform(bot, message: question, requestID: claimed.runID, asked: true)
-        }
+        let turn = (parent?.derived() ?? Turn(session: bot.sessionID)).with(\.session, bot.sessionID)
+        return try await perform(bot, message: question, requestID: claimed.runID,
+            turn: turn, scope: scope.entering(id), asked: true)
     }
 
-    public func resume(bot saved: BotDefinition, message: String,
+    public func resume(bot saved: BotDefinition, message: String, parent: Turn?, scope: BotRunScope,
                        holdUnattended: @Sendable (BotDefinition) async -> Bool) async throws -> ShelfEntry {
-        let claimed = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil)
+        let claimed = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil, scope: scope)
         let bot = claimed.bot
         defer { queue.finish(bot: saved.id) }
         do {
             guard bot == saved, !bot.paused, !(await holdUnattended(bot)) else { throw BotRunnerError.notPermitted }
             try await prepare(bot, requestID: claimed.runID)
         } catch { throw retireRefusal(claimed, cause: error) }
-        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([bot.id])) {
-            try await perform(bot, message: message, requestID: claimed.runID)
-        }
+        let turn = (parent?.derived() ?? Turn(session: bot.sessionID)).with(\.session, bot.sessionID)
+        return try await perform(bot, message: message, requestID: claimed.runID,
+            turn: turn, scope: scope.entering(bot.id))
     }
 
     private func retireRefusal(_ claimed: BotRunQueue.ClaimedRun, cause: Error) -> Error {
@@ -198,12 +198,14 @@ public actor BotRunner {
             return cause
         }
         catch {
-            return BotRunnerError.cannotRun("Request \(claimed.runID) did not execute: \(cause). Its refused claim could not be retired: \(error). Repair that exact claim before requesting more work.")
+            return BotRunnerError.cannotRun("""
+                Request \(claimed.runID) did not execute: \(cause). Its refused claim could not be retired: \(error). Repair that exact \
+                claim before requesting more work.
+                """)
         }
     }
 
-    /// All entry points pass the same provider and accounting admission before
-    /// execution. Refusals retire their exact claim while its lock is held.
+    /// Share provider/accounting admission across entry points and retire refusals under their exact claim lock.
     private func prepare(_ bot: BotDefinition, requestID: UUID) async throws {
         try Task.checkCancellation()
         guard await BotRunGate.isReady() else { throw BotRunnerError.cannotRun("Provider check is not ready yet.") }
@@ -216,7 +218,8 @@ public actor BotRunner {
         try queue.admitExecution(bot: bot.id, requestID: requestID)
     }
 
-    private func perform(_ bot: BotDefinition, message: String, requestID: UUID, asked: Bool = false,
+    private func perform(_ bot: BotDefinition, message: String, requestID: UUID,
+                         turn: Turn, scope: BotRunScope, asked: Bool = false,
                          judgesCondition: Bool = false,
                          deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry {
         let start = Date()
@@ -235,9 +238,8 @@ public actor BotRunner {
                     await deadlineExceeded("\(bot.name) exceeded its run limit; its claim could not be updated: \(error)")
                 }
             }) {
-                try await Self.$conditionSessionID.withValue(judgesCondition ? bot.sessionID : nil) {
-                    try await session(bot, message)
-                }
+                try await session(bot, message, turn, scope,
+                    BotRunOptions(conditionSessionID: judgesCondition ? bot.sessionID : nil))
             }
         } catch {
             outcome = BotTurnReply(reply: "", status: error is CancellationError ? .stopped : error is BotRunnerError ? .interrupted : .failed,
@@ -250,22 +252,15 @@ public actor BotRunner {
         }
         let elapsed = clock.duration(to: .now)
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        // COVERAGE is what the run examined, and nothing here observed that.
-        // Start and end of execution are a duration, not a covered stretch, so
-        // no window is claimed: the run is dated by `runAt` and its length is
-        // the measured `seconds` below. SPEND carries only what the turn
-        // recorded; the daily reservation stays in budget accounting, where it
-        // was already charged, instead of being reported as usage.
-        // HEALTH says no more than the run's own status: a completed turn that
-        // produced nothing to report is not "findings available".
+        // Duration proves no coverage window, and a budget reservation proves no measured usage.
+        // Health follows the observed outcome; an empty completed reply proves no findings.
         let health: ShelfRunHealth
         switch outcome.status {
         case .completed:
             health = outcome.reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? .nothingNew : .ok
         case .failed: health = .failed
-        // Waiting on a person is not damage: the run did its part and stopped
-        // on an answer only a person can give. Same health as an approval.
+        // Waiting on a person is a partial result, not damaged execution.
         case .stopped, .interrupted, .waitingForApproval, .waitingOnPerson: health = .partial
         }
         var entry = ShelfEntry(id: requestID, botId: bot.id, briefVersion: bot.briefVersion,

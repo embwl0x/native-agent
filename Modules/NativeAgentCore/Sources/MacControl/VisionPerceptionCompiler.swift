@@ -4,8 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `VisionPerceptionCompiler.swift` | `VisionPerceptionError`, `VisionRowDraft`, `VisionPerceptionCompiler` |
 
-// OCR, positional redaction, colour regions, text bands and saliency fuse into
-// bounded pixel evidence. This compiler neither captures nor sends input.
+// Pixel evidence compiles without owning capture or input, preserving the perception/effect boundary.
 
 public enum VisionPerceptionError: Error, LocalizedError {
     case undecodableImage
@@ -18,8 +17,6 @@ public enum VisionPerceptionError: Error, LocalizedError {
     }
 }
 
-/// One candidate's working state between the element layer and the emitted
-/// row.
 struct VisionRowDraft {
     let candidate: VisionCandidate
     let guess: VisionRoleGuess.Guess
@@ -47,9 +44,7 @@ public struct VisionPerceptionCompiler: Sendable {
     ) throws -> VisionPercept {
         try Task.checkCancellation()
         let imageSize = VisionSize(width: Double(image.width), height: Double(image.height))
-        // Foreground window pixels are not evidence about the captured app.
-        // Remove them before text/colour/saliency fusion and temporal identity,
-        // not merely from the final motor list. Coordinates are image-local.
+        // Exclude foreground-window pixels before fusion and temporal identity; they are not evidence about the captured app.
         func isVisible(_ rect: VisionRect) -> Bool {
             !excludedRegions.contains { $0.intersection(rect).area > 0 }
         }
@@ -61,9 +56,7 @@ public struct VisionPerceptionCompiler: Sendable {
 
         var notes: [String] = []
 
-        // 1. TEXT + 2. REDACTION. Redaction happens HERE, before a single
-        //    string can reach a label, a readout, a handle fingerprint or a
-        //    glance line. There is no downstream path that sees raw OCR text.
+        // Redact before any OCR string can enter a label, readout, fingerprint or glance.
         let textResult = try VisionTextLayer.recognize(
             image: image, using: VisionKitTextRecognizer(),
             ignoredForRefinement: excludedRegions
@@ -78,8 +71,7 @@ public struct VisionPerceptionCompiler: Sendable {
         let allRedactedTexts = VisionTextRedaction.redact(
             boxes: textResult.boxes, imageSize: imageSize
         )
-        // Preserve redaction's whole-frame caption context before excluding
-        // foreign-window text from the app's percept.
+        // Preserve whole-frame secret-caption context before excluding foreign-window text.
         let texts = Array(zip(textResult.boxes, allRedactedTexts)).filter { isVisible($0.0.rect) }
         let visibleTextBoxes = texts.map(\.0)
         let redactedTexts = texts.map(\.1)
@@ -87,7 +79,6 @@ public struct VisionPerceptionCompiler: Sendable {
             notes.append("\(redactedTexts.filter(\.secret).count) recognized string(s) redacted")
         }
 
-        // 3. ELEMENT LAYER (a) colour regions, (b) y-band rows.
         let colorResult = VisionColorRegionLayer.candidates(grid: grid)
         if colorResult.capped {
             notes.append("colour-region layer hit its \(VisionColorRegionLayer.maxCandidates)-candidate cap")
@@ -96,12 +87,7 @@ public struct VisionPerceptionCompiler: Sendable {
             from: visibleTextBoxes
         )
 
-        // A colour region that IS a recognized string, or that sits INSIDE
-        // one, is glyph ink — the text layer already has it. Emitting it as a
-        // control would invent an affordance out of a label, and the inside
-        // case is not hypothetical: the counter of a bold 24 pt "A" is a
-        // 9×9 filled near-square, which the role layer will happily read as a
-        // checkbox unless it is dropped here.
+        // Regions inside recognized text are glyph ink, not controls; otherwise a letter’s enclosed counter can become a guessed checkbox.
         let colorCandidates = colorResult.candidates.filter { candidate in
             isVisible(candidate.rect) && !visibleTextBoxes.contains { box in
                 box.rect.iou(candidate.rect) >= glyphRunIoU
@@ -111,7 +97,7 @@ public struct VisionPerceptionCompiler: Sendable {
 
         var candidates = merge(colorCandidates + bandCandidates.filter { isVisible($0.rect) })
 
-        // 4. ELEMENT LAYER (c) saliency — rank, and add what (a)+(b) missed.
+        // Saliency adds only candidates absent from text and colour layers.
         try Task.checkCancellation()
         do {
             let regions = try VisionKitSalienceProvider().salientRegions(in: image).filter { isVisible($0.rect) }
@@ -122,9 +108,7 @@ public struct VisionPerceptionCompiler: Sendable {
         } catch {
             if error is CancellationError { throw error }
             try Task.checkCancellation()
-            // Saliency is additive: an ordinary failure retains text and
-            // colour evidence, but cancellation must not publish a frame. What
-            // it would have added is unobserved, not absent, and the percept says so.
+            // Saliency failure is a named gap while sibling evidence survives; cancellation forbids publishing the frame.
             notes.append("saliency layer failed (\(error.localizedDescription)); controls only it would find were not looked for")
         }
         candidates = candidates.filter { isVisible($0.rect) }
@@ -136,7 +120,6 @@ public struct VisionPerceptionCompiler: Sendable {
             candidates = Array(candidates.prefix(maxAffordances))
         }
 
-        // 5. ROLES, STATES, LABELS.
         let drafts: [VisionRowDraft] = candidates.map { candidate in
             let contained = texts.filter {
                 $0.0.rect.coverage(by: candidate.rect) >= containmentFraction
@@ -147,10 +130,7 @@ public struct VisionPerceptionCompiler: Sendable {
                 sources: candidate.sources,
                 containedText: contained.map(\.box)
             ))
-            // The LABEL is assembled from what redaction LET THROUGH. A
-            // withheld string contributes nothing — not its characters, not a
-            // digest — because the label goes on to seed the handle
-            // fingerprint, and a handle keyed by a secret is a secret.
+            // Only approved clear text can seed labels or fingerprints; a digest-derived handle would still encode the secret.
             let visible = contained.filter { !$0.redacted.secret }
                 .sorted { $0.box.rect.x < $1.box.rect.x }
                 .map(\.redacted.raw)
@@ -164,8 +144,7 @@ public struct VisionPerceptionCompiler: Sendable {
                 )
             }
             let fill = candidate.fillLuminance ?? grid.meanLuminance(in: candidate.rect)
-            // The strongest spread among the region's text runs: one live
-            // caption is enough to say the control is live.
+            // One live caption provides contrast evidence even if other runs are muted.
             let captionContrast = contained.isEmpty
                 ? nil
                 : contained.compactMap { grid.luminanceSpread(in: $0.box.rect) }.max()
@@ -183,10 +162,10 @@ public struct VisionPerceptionCompiler: Sendable {
             .compactMap(\.fill).sorted()
         let rowFillBaseline: Double? = rowFills.count >= 2 ? rowFills[rowFills.count / 2] : nil
 
-        // 6. ABSTAIN — every row retains its refusal reason.
+        // Retain each row’s abstention reason rather than dropping uncertainty.
         let abstainReasons = abstain(drafts.map { ($0.candidate.rect, $0.guess.role, $0.label?.display) })
 
-        // 7. Token collisions lower target confidence, including hash collisions.
+        // Token collisions must lower confidence, including collisions between distinct hashes.
         let tokens = drafts.map { draft in
             VisionHandles.token(fingerprint: VisionHandles.fingerprint(
                 roleGuess: draft.guess.role,
@@ -197,7 +176,7 @@ public struct VisionPerceptionCompiler: Sendable {
         }
         let tokenCounts = tokens.reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }
 
-        // 8. Affordances retain bounds and target confidence; each state has its own.
+        // Keep target and state confidence separate so one cannot imply certainty about another.
         var rows: [VisionAffordanceRow] = []
         for (index, draft) in drafts.enumerated() {
             let state = VisionRoleGuess.stateGuess(
@@ -237,9 +216,7 @@ public struct VisionPerceptionCompiler: Sendable {
             ))
         }
 
-        // 9. READOUTS — prominent standalone values, i.e. text that is not
-        //    inside any candidate and stands out by size. Same job as the AX
-        //    lane's readouts: what the screen SAYS, ranked by prominence.
+        // Rank standalone unclaimed text by prominence as the pixel counterpart to AX readouts.
         let readoutsAll = self.readouts(
             texts: texts,
             claimed: drafts.flatMap { $0.containedText.map(\.box.rect) },
@@ -266,9 +243,7 @@ public struct VisionPerceptionCompiler: Sendable {
 
     // MARK: - Fusion helpers
 
-    /// One element seen by two layers is ONE element. Merged largest-first so
-    /// the surviving rect is the one with real edges, and the sources union so
-    /// the row can say it was corroborated.
+    /// Merge largest first to retain observed edges and union provenance for corroboration.
     func merge(_ candidates: [VisionCandidate]) -> [VisionCandidate] {
         var kept: [VisionCandidate] = []
         for candidate in candidates.sorted(by: { $0.rect.area > $1.rect.area }) {
@@ -280,9 +255,7 @@ public struct VisionPerceptionCompiler: Sendable {
                 kept[index] = VisionCandidate(
                     rect: merged.rect,
                     sources: merged.sources,
-                    // Corroboration by a second layer is real evidence about
-                    // the bounds; it is capped so it can never manufacture
-                    // certainty out of two weak signals.
+                    // Cap corroboration so two weak signals cannot manufacture certainty.
                     boundsConfidence: min(0.9, max(merged.boundsConfidence, candidate.boundsConfidence) + 0.08),
                     fillLuminance: merged.fillLuminance ?? candidate.fillLuminance,
                     salience: max(merged.salience, candidate.salience),
@@ -296,23 +269,13 @@ public struct VisionPerceptionCompiler: Sendable {
         return VisionColorRegionLayer.readingOrder(kept)
     }
 
-    /// THE ABSTAIN RULE.
-    ///
-    /// Two candidates are ambiguous when each one's ACTION POINT falls inside
-    /// the other. That is the precise statement of "we cannot address these
-    /// separately": the point we would click for either lands in a region
-    /// claimed by both, so a click carries no information about which one we
-    /// meant. Partial overlap alone is NOT ambiguity — a button sitting inside
-    /// a list row is perfectly clickable, and abstaining there would be the
-    /// over-refusal that makes refusal meaningless.
-    ///
-    /// Both rows are marked. Marking only one would silently elect a winner.
+    /// Abstain on both rows when each action point falls inside the other; a one-sided verdict would silently elect a winner. Partial overlap alone is valid,
+    /// as for a button inside a list row.
     func abstain(_ items: [(rect: VisionRect, role: String, label: String?)]) -> [Int: String] {
         var out: [Int: String] = [:]
         for index in items.indices {
             let item = items[index]
-            // Weak rows abstain on their own account: an unlabeled region we
-            // could not even role-guess is not something to hand an actuator.
+            // Weak unlabeled regions need their own abstention before reaching an actuator.
             if item.role == VisionRoleGuess.unknown, item.label?.isEmpty != false {
                 out[index] = "unlabeled region with no role guess — not separately addressable"
             }
@@ -334,10 +297,7 @@ public struct VisionPerceptionCompiler: Sendable {
         return out
     }
 
-    /// The `target` PRIOR: with no query, how separately addressable is this
-    /// row? Bounds dominate because a target you cannot bound is a target you
-    /// cannot hit; ambiguity caps it hard, because an abstaining row must not
-    /// be able to clear an actuator's bar by having pretty numbers elsewhere.
+    /// Bounds dominate target confidence; hard abstention caps cannot be outweighed by attractive scores elsewhere.
     func targetPrior(
         bounds: Double,
         role: Double,
@@ -355,9 +315,7 @@ public struct VisionPerceptionCompiler: Sendable {
         return value
     }
 
-    /// Prominent standalone values: text nobody claimed as a control's caption,
-    /// standing out by size. Ranked by prominence, capped, and every one of
-    /// them redacted already.
+    /// Standalone values need prominence ranking and bounds even after source redaction.
     func readouts(
         texts: [(VisionTextBox, VisionRedactedText)],
         claimed: [VisionRect],

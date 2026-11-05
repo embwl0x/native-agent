@@ -10,23 +10,17 @@ import PersistenceCore
 import ToolRegistry
 import Senses
 import Desk
-// Blueprint: | `AppToolExecutor+ChromeFields.swift` | `AppToolExecutor`: `resolveChromeTarget`, `chromeFields`, `runChromeFieldsCall`; one attempt per observed field, retaining prior receipts and refusing further follow-ups after a Trust receipt failure; failed batches return without a replacement page |
+// Blueprint: | `AppToolExecutor+ChromeFields.swift` | `AppToolExecutor`, `resolveChromeTarget`, `chromeFields`, `runChromeFieldsCall`; observed-field batches |
 
-/// Chrome jobs in one call. A row can be named by its
-/// label, snapshot_id defaults to the last page read on the tab, and a form
-/// is filled and sent in one call (`fields` + `submit`) — the way `act steps`
-/// works for Mac apps. Every act still goes through the extension one by one,
-/// each clearing the same Trust gate her own call would.
+/// Every field act clears the extension's Trust gate independently, even when a form is filled and submitted in one call.
 extension AppToolExecutor {
     public typealias ChromeRun = (String, [String: JSONValue]) async throws -> JSONValue
 
     public struct ChromeFields {
         var pairs: [(label: String, value: String)] = []
-        /// A button's label or row to click after filling, or "enter" to press Enter in the last field.
         var submit: String?
     }
 
-    /// Which acts a verb can use on a row.
     private static let chromeWants: [String: Set<String>] = [
         "browser.chrome_click": ["click", "fill", "type"], "browser.chrome_double_click": ["double_click", "click", "fill", "type"],
         "browser.chrome_fill": ["fill"], "browser.chrome_type": ["type"], "browser.chrome_select": ["select"],
@@ -35,43 +29,42 @@ extension AppToolExecutor {
         "browser.chrome_scroll_target": ["scroll"],
     ]
 
-    /// Fills in what the last page read on this tab already says: a row named
-    /// by its label, a missing snapshot_id, option labels, one value as a list.
-    /// A refusal when a named row is not on that page; nil otherwise.
-    public func resolveChromeTarget(_ actionId: String, _ input: inout [String: JSONValue]) -> JSONValue? {
-        guard let refusal = resolveChromeRows(actionId, &input) else { return nil }
+    /// Resolve defaults from this tab's last served page; refuse labels that it did not show.
+    public func resolveChromeTarget(_ actionId: String, _ input: inout [String: JSONValue], turn: Turn, execution: AppActionExecution) -> JSONValue? {
+        guard let refusal = resolveChromeRows(actionId, &input, turn: turn, execution: execution) else { return nil }
         guard case .object(var fields) = refusal else { return refusal }
         fields["effects"] = .string("none")
         fields["provenance"] = .string("raw view · Chrome conversation page bindings and displayed row index; no extension request was sent")
         return .object(fields)
     }
 
-    private func resolveChromeRows(_ actionId: String, _ input: inout [String: JSONValue]) -> JSONValue? {
+    private func resolveChromeRows(_ actionId: String, _ input: inout [String: JSONValue], turn: Turn, execution: AppActionExecution) -> JSONValue? {
         if actionId == "browser.chrome_scroll" || actionId == "browser.chrome_drag" {
-            if actionId == "browser.chrome_drag", let refusal = resolveChromeRow(actionId, &input) { return refusal }
+            if actionId == "browser.chrome_drag", let refusal = resolveChromeRow(actionId, &input, turn: turn, execution: execution) { return refusal }
             guard let target = input["target_node_id"], !(target.scalarText ?? "").isEmpty else { return nil }
             var destination = input
             destination["node_id"] = target
-            if let refusal = resolveChromeRow(actionId == "browser.chrome_drag" ? "browser.chrome_drop_target" : "browser.chrome_scroll_target", &destination) { return refusal }
+            if let refusal = resolveChromeRow(actionId == "browser.chrome_drag" ? "browser.chrome_drop_target" : "browser.chrome_scroll_target",
+                &destination, turn: turn, execution: execution) { return refusal }
             input["target_node_id"] = destination["node_id"]
             input["snapshot_id"] = destination["snapshot_id"]
             return nil
         }
-        return resolveChromeRow(actionId, &input)
+        return resolveChromeRow(actionId, &input, turn: turn, execution: execution)
     }
 
-    private func resolveChromeRow(_ actionId: String, _ input: inout [String: JSONValue]) -> JSONValue? {
+    private func resolveChromeRow(_ actionId: String, _ input: inout [String: JSONValue], turn: Turn, execution: AppActionExecution) -> JSONValue? {
         if actionId == "browser.chrome_select", case .string(let one)? = input["values"] { input["values"] = .array([.string(one)]) }
         guard let wants = Self.chromeWants[actionId],
               let node = input["node_id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !node.isEmpty else { return nil }
-        // The site sense owns its fresh source proof. Public calls own only
-        // the numbers or labels that their last page actually showed.
-        if SenseDoor.verifyingActCorner != nil { return nil }
+        // The site sense owns its fresh source proof. Public calls own only the numbers or labels that their last page actually showed.
+        if execution.verifyingActCorner != nil { return nil }
         if node.range(of: #"^n\d+$"#, options: .regularExpression) != nil {
             return .object(["ok": .bool(false), "error": .string("internal_node_id"),
                 "reason": .string("Internal node ids are not row numbers. Use the row number shown on this page or its label. Nothing was sent.")])
         }
-        guard let page = ChromePageMirror.page(tab: Self.chromeTabID(input["tab_id"]), dataRoot: securityCenter.dataRoot, session: ChatToolSessionContext.verifiedSessionId) else {
+        guard let page = ChromePageMirror.page(tab: Self.chromeTabID(input["tab_id"]), dataRoot: securityCenter.dataRoot, session: turn
+            .verifiedSessionID) else {
             return .object(["ok": .bool(false), "error": .string("no_page_read"),
                 "reason": .string("No page has been read in this conversation. Read the page with chrome.snapshot before choosing a row. Nothing was sent.")])
         }
@@ -79,7 +72,9 @@ extension AppToolExecutor {
         let given = input["snapshot_id"]?.scalarText ?? ""
         guard given.isEmpty || given == page.snapshotID else {
             return .object(["ok": .bool(false), "error": .string("snapshot_stale"),
-                "reason": .string("The supplied snapshot does not match the page last read. Read the page again with browser.chrome_snapshot. Nothing was sent.")])
+                "reason": .string("""
+                    The supplied snapshot does not match the page last read. Read the page again with browser.chrome_snapshot. Nothing was sent.
+                    """)])
         }
         let byNumber = node.range(of: #"^\d+$"#, options: .regularExpression) != nil
         var row: ChromePageMirror.Row?
@@ -141,8 +136,6 @@ extension AppToolExecutor {
             ?? (prefixed.count == 1 ? prefixed[0] : nil))?.value
     }
 
-    /// `fields` as {label: value} or "Label: value; Label: value", and
-    /// `submit` (a button label or row, or true to press Enter). Nil when absent.
     public static func chromeFields(_ input: [String: JSONValue]) throws -> ChromeFields? {
         var fields = ChromeFields()
         func invalid(_ path: String, _ detail: String) -> ToolFailureError {
@@ -189,11 +182,9 @@ extension AppToolExecutor {
         return fields.pairs.isEmpty && fields.submit == nil ? nil : fields
     }
 
-    /// chrome_fill{fields, submit} on the current page, or chrome_navigate{url,
-    /// fields, submit} after the page loads. Every label is found before
-    /// anything is typed, so a missing field leaves the form untouched.
+    /// Resolve every field before typing so a missing label leaves the form untouched.
     public func runChromeFieldsCall(actionId: String, input: [String: JSONValue], fields: ChromeFields, direct: Bool,
-                             surface: String, run: ChromeRun) async throws -> JSONValue {
+                             surface: String, turn: Turn, execution: AppActionExecution, run: ChromeRun) async throws -> JSONValue {
         var tab = Self.chromeTabID(input["tab_id"])
         var head: [String] = []
         var receipts: [JSONValue] = []
@@ -207,12 +198,12 @@ extension AppToolExecutor {
             tab = granted
             head.append(Self.chromeReceiptLine(actionId, row))
         }
-        let session = ChatToolSessionContext.verifiedSessionId
+        let session = turn.verifiedSessionID
         func refused(_ why: String) -> JSONValue {
             .object(["ok": .bool(false), "error": .string("fields_not_sent"), "receipt": .array(receipts),
                      "reason": .string((head + [why]).joined(separator: "\n"))])
         }
-        let snapshotAdmission = await chromeFollowUpCheck("browser.chrome_snapshot", surface: surface)
+        let snapshotAdmission = await chromeFollowUpCheck("browser.chrome_snapshot", surface: surface, turn: turn)
         if case .object(var stop)? = snapshotAdmission.refusal {
             stop["completed"] = .array(head.map(JSONValue.string))
             stop["receipt"] = .array(receipts)
@@ -221,18 +212,23 @@ extension AppToolExecutor {
         }
         var seen = ChromePageMirror.page(tab: tab, dataRoot: securityCenter.dataRoot, session: session)
         func read() async throws -> ChromePageMirror.Page {
-            // The whole page: a field below the fold is still on the form.
-            let snapshot = try await run("browser.chrome_snapshot", ["tab_id": tab.map(JSONValue.int) ?? .null, "max_nodes": .int(200), "scope": .string("page")])
+            // Offscreen fields still belong to the same form.
+            let snapshot = try await run("browser.chrome_snapshot", ["tab_id": tab.map(JSONValue.int) ?? .null, "max_nodes": .int(200), "scope": .string(
+                "page")])
             guard case .object(let row) = snapshot, case .int(let id)? = row["tabId"],
                   case .string(let snapshotID)? = row["snapshotId"], !snapshotID.isEmpty else {
-                throw ToolFailureError("Chrome page unavailable: " + (ChatToolOutcome.explanation(snapshot) ?? "The snapshot did not provide a tab and snapshot identity."),
+                throw ToolFailureError("Chrome page unavailable: " + (ChatToolOutcome.explanation(snapshot)
+                    ?? "The snapshot did not provide a tab and snapshot identity."),
                     effects: .none, owner: "Chrome page snapshot", code: "chrome_page_unavailable")
             }
             tab = id
-            mirrorChromePage(snapshot, projection: ChromePageText.project(snapshot))
+            mirrorChromePage(snapshot, projection: ChromePageText.project(snapshot, turn: turn), turn: turn)
             guard let page = ChromePageMirror.page(tab: id, dataRoot: securityCenter.dataRoot, session: session),
                   page.snapshotID == snapshotID else {
-                throw ToolFailureError("Chrome's returned snapshot could not publish its matching page mirror. Read the tab after repairing its snapshot; do not repeat fields already sent.",
+                throw ToolFailureError("""
+                    Chrome's returned snapshot could not publish its matching page mirror. Read the tab after repairing its snapshot; do not repeat fields \
+                    already sent.
+                    """,
                     effects: .none, owner: "Chrome page mirror", code: "chrome_page_unavailable")
             }
             return page
@@ -247,10 +243,9 @@ extension AppToolExecutor {
         var page: ChromePageMirror.Page
         do { page = try await read() }
         catch { return refused("The page could not be read, so nothing was filled: " + error.localizedDescription) }
-        // Row numbers mean the page she saw (or, with none, this first read).
+        // Row numbers mean the page the agent saw (or, with none, this first read).
         if seen == nil { seen = page }
-        // Find every field (and the button) first: a missing or ambiguous
-        // name leaves the form untouched. Then fill in page order.
+        // Find every field (and the button) first: a missing or ambiguous name leaves the form untouched. Then fill in page order.
         var plan: [(label: String, value: String, index: Int)] = []
         var missing: [String] = [], unclear: [String] = []
         func check(_ label: String, _ wants: Set<String>) -> Int? {
@@ -266,8 +261,7 @@ extension AppToolExecutor {
         }
         if let submit = fields.submit, !["enter", "true"].contains(submit.lowercased()) { _ = check(submit, ["click"]) }
         if !missing.isEmpty || !unclear.isEmpty {
-            // Her row numbers stay those of the page she saw: this unseen
-            // whole-page read must not become what n12 means next call.
+            // The agent's row numbers stay those of the page it saw: this unseen whole-page read must not become what n12 means next call.
             if let seen, seen.snapshotID != page.snapshotID { ChromePageMirror.publish(seen, dataRoot: securityCenter.dataRoot, session: session) }
             return refused("Nothing was filled. " + (missing.isEmpty ? "" : "No field with that name on " + ChromePageText.safe(page.title) + ": "
                 + missing.joined(separator: ", ") + ". ") + (unclear.isEmpty ? "" : "More than one row matches: " + unclear.joined(separator: "; ") + ". ")
@@ -279,7 +273,7 @@ extension AppToolExecutor {
         var followUpRefusal: JSONValue?
         func act(_ tool: String, target: String, wants: Set<String>, extra: [String: JSONValue], shown: String, submission: Bool = false) async -> Bool {
             if tool != actionId {
-                let admission = await chromeFollowUpCheck(tool, surface: surface, enforceAutonomy: submission ? true : nil)
+                let admission = await chromeFollowUpCheck(tool, surface: surface, turn: turn, enforceAutonomy: submission ? true : nil)
                 if let stop = admission.stop {
                     followUpRefusal = admission.refusal
                     lines.append("✗ " + shown + ": " + stop); return false
@@ -288,7 +282,8 @@ extension AppToolExecutor {
             let row: ChromePageMirror.Row
             switch ChromePageMirror.find(target, wants: wants, in: page, seen: seen) {
             case .row(let match): row = match
-            case .ambiguous(let rows): lines.append("✗ " + shown + ": the page changed and more than one row matches (" + ChromePageMirror.named(rows) + "); not sent"); return false
+            case .ambiguous(let rows): lines.append("✗ " + shown + ": the page changed and more than one row matches (" + ChromePageMirror.named(rows)
+                + "); not sent"); return false
             case .none: lines.append("✗ " + shown + ": no longer on the page"); return false
             }
             var call = extra
@@ -304,7 +299,8 @@ extension AppToolExecutor {
                 if case .object(let done) = result, done["outcome"] == .string("succeeded") {
                     lines.append("✓ " + shown + rowPlace); lastTool = tool; return true
                 }
-                let why: String = if case .object(let done) = result, case .string(let text)? = done["reason"] ?? done["error"] ?? done["outcome"] { text } else { "no clear outcome" }
+                let why: String = if case .object(let done) = result, case .string(let text)? = done["reason"] ?? done["error"]
+                    ?? done["outcome"] { text } else { "no clear outcome" }
                 lines.append("✗ " + shown + rowPlace + ": " + ChromePageText.safe(why) + "; not retried"); return false
             } catch {
                 receipts.append(ChatToolOutcome.failure(error: error, tool: tool))
@@ -316,7 +312,8 @@ extension AppToolExecutor {
         for (index, item) in plan.enumerated() {
             if index > 0 {
                 do { page = try await read() }
-                catch { lines.append("✗ Page refresh failed: " + ChromePageText.safe(error.localizedDescription) + "; remaining fields were not sent. Read this tab again before continuing."); ok = false; break }
+                catch { lines.append("✗ Page refresh failed: " + ChromePageText.safe(error.localizedDescription)
+                    + "; remaining fields were not sent. Read this tab again before continuing."); ok = false; break }
             }
             guard let row = ChromePageMirror.find(item.label, wants: valueActs, in: page, seen: seen).row, let tool = tool(for: row) else {
                 lines.append("✗ " + ChromePageText.safe(item.label) + ": no longer on the page, or no longer one row"); ok = false; break
@@ -335,13 +332,16 @@ extension AppToolExecutor {
         }
         if ok, let submit = fields.submit {
             do { page = try await read() }
-            catch { lines.append("✗ Page refresh failed: " + ChromePageText.safe(error.localizedDescription) + "; submission was not sent. Read this tab again before continuing."); ok = false }
+            catch { lines.append("✗ Page refresh failed: " + ChromePageText.safe(error.localizedDescription)
+                + "; submission was not sent. Read this tab again before continuing."); ok = false }
             if ok, submit.lowercased() == "enter" || submit.lowercased() == "true" {
                 if let last {
-                    ok = await act("browser.chrome_keypress", target: last, wants: ["keypress"], extra: ["key": .string("Enter")], shown: "Enter", submission: true)
+                    ok = await act("browser.chrome_keypress", target: last, wants: ["keypress"], extra: ["key": .string("Enter")], shown: "Enter",
+                        submission: true)
                 } else { lines.append("✗ Enter: no field was filled to press it in"); ok = false }
             } else if ok {
-                ok = await act("browser.chrome_click", target: submit, wants: ["click"], extra: [:], shown: "click " + ChromePageText.safe(submit), submission: true)
+                ok = await act("browser.chrome_click", target: submit, wants: ["click"], extra: [:], shown: "click " + ChromePageText.safe(submit),
+                    submission: true)
             }
         }
         let summary = (ok ? "" : "Stopped: ") + lines.joined(separator: " · ")
@@ -359,7 +359,7 @@ extension AppToolExecutor {
         ]
         result["follow_up_refusal"] = followUpRefusal
         if direct, ok {
-            let fresh = await freshChromePage(after: lastTool, tab: page.tab, sequence: nil, input: input, surface: surface, run: run)
+            let fresh = await freshChromePage(after: lastTool, tab: page.tab, sequence: nil, input: input, surface: surface, turn: turn, run: run)
             result["text"] = .string((head + [summary, "", fresh.text]).joined(separator: "\n"))
         } else if direct {
             result["text"] = .string((head + [summary]).joined(separator: "\n"))
@@ -368,7 +368,7 @@ extension AppToolExecutor {
     }
 
     /// Snapshot rows remain attached to their workspace and exact tab until it closes.
-    func mirrorChromePage(_ result: JSONValue, projection: ChromePageText.VisiblePageText, closedBy actionId: String? = nil) {
+    func mirrorChromePage(_ result: JSONValue, projection: ChromePageText.VisiblePageText, turn: Turn, closedBy actionId: String? = nil) {
         guard case .object(let page) = result else { return }
         if actionId == "browser.chrome_close_tab" {
             guard page["tabClosed"] == .bool(true), case .int(let tab)? = page["tabId"] else { return }
@@ -380,15 +380,12 @@ extension AppToolExecutor {
               let text = projection.text else { return }
         ChromePageMirror.publish(.init(tab: tab, title: ChromePageText.safe(page["title"]?.scalarText ?? ""),
                                        url: ChromePageText.safe(page["url"]?.scalarText ?? ""), snapshotID: id, text: text,
-                                       rows: projection.rows), dataRoot: securityCenter.dataRoot, session: ChatToolSessionContext.verifiedSessionId)
+                                       rows: projection.rows), dataRoot: securityCenter.dataRoot, session: turn.verifiedSessionID)
     }
 
-    /// Same address, same scroll position and height, and the same rows (as
-    /// far as both reads go; a read of another scope compares position only):
-    /// nothing moved or changed.
+    /// Compare address, viewport and all shared rows; reads of different scopes can prove position only.
     public static func chromePageUnchanged(before: String, after: String) -> Bool {
-        // A fingerprint, not the header's wording: title/address line, scroll
-        // position, and every row's text (row numbers aside).
+        // Compare captured content and scroll position, excluding display row numbers.
         func print(_ text: String) -> [String] {
             let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
             let second = lines.count > 1 ? lines[1] : ""
@@ -403,7 +400,6 @@ extension AppToolExecutor {
         return nil
     }
 
-    /// Row lines' text with the row number off.
     private static func chromeRowTexts<S: StringProtocol>(_ lines: [S]) -> [String] {
         let lines = lines.map { String($0) }
         return ChromePageText.rowRanges(lines).map { range in
@@ -411,12 +407,10 @@ extension AppToolExecutor {
         }
     }
 
-    /// A zero text delta is not a viewport comparison. Only the content
-    /// agent's observation can establish that nothing changed in view.
+    /// A zero text delta is not a viewport comparison. Only the content agent's observation can establish that nothing changed in view.
     public static func onlyNewRows(_ page: String, before: String, viewportChanged: Bool? = nil) -> (text: String, new: Int) {
-        // A row counts as already shown only when the same text stood beside
-        // the same neighbour (above or below) before: a new "Load more" with
-        // new rows around it is new.
+        // A row counts as already shown only when the same text stood beside the same neighbour (above or below) before: a new "Load more" with new rows around
+        // it is new.
         func keys(_ texts: [String]) -> [(String, String, String)] {
             texts.indices.map { (texts[$0], $0 > 0 ? texts[$0 - 1] : "", $0 + 1 < texts.count ? texts[$0 + 1] : "") }
         }
@@ -436,11 +430,10 @@ extension AppToolExecutor {
         }
         let new = chromeRowTexts(kept).count
         guard left > 0 else { return (page, new) }
-        // Keep the observed rows when the viewport changed (or its comparison
-        // is incomplete), even if a previous document read included them.
+        // Keep the observed rows when the viewport changed (or its comparison is incomplete), even if a previous document read included them.
         lines = new == 0 && viewportChanged != false
             ? page.split(separator: "\n", omittingEmptySubsequences: false) : kept
-        // After the rows, before the footer: say what was left out.
+        // Place omission evidence before the footer so it stays associated with the rows.
         let lastRow = ChromePageText.rowRanges(lines.map(String.init)).last
         var at = lastRow?.upperBound
             ?? lines.firstIndex(where: { $0.isEmpty }).map { $0 + 1 } ?? lines.count
@@ -457,8 +450,7 @@ extension AppToolExecutor {
         return (lines.joined(separator: "\n"), new)
     }
 
-    /// A successful act as one line: what it did and anything it measured
-    /// (scroll distance, typed count), without ids the page already carries.
+    /// Compact act summaries omit ids already carried by the page.
     public static func chromeReceiptLine(_ actionId: String, _ obj: [String: JSONValue]) -> String {
         if actionId == "browser.chrome_scroll" {
             func number(_ key: String) -> Int? {

@@ -3,7 +3,7 @@ import GRDB
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `KnowledgeGraph+PrimaryUserIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: shared `profileNames`, `primaryUserName`, `consolidatePrimaryUserEntities`, `removeUnreferencedPrimaryUserRole` |
+// Blueprint: | `KnowledgeGraph+PrimaryUserIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`, `profileNames`, `primaryUserName`, `consolidatePrimaryUserEntities`, `removeUnreferencedPrimaryUserRole` |
 
 extension SwiftNativeKnowledgeGraphIndexer {
     struct PrimaryUserConsolidation {
@@ -11,9 +11,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         var relationshipsRemoved: Int = 0
     }
 
-    /// Resolve the user identity only from onboarding's canonical profile.
-    /// Generic or unavailable values retain the role label rather than
-    /// guessing a person's name from accepted-memory prose.
+    /// Resolve the user identity only from onboarding's canonical profile. Generic or unavailable values retain the role label rather than guessing a person's
+    /// name from accepted-memory prose.
     static func primaryUserName(explicit: String?, saved: String?) -> String {
         if let explicit {
             return usableProfileName(explicit, rejecting: ["user", "the user"]) ?? "the user"
@@ -21,25 +20,30 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return saved ?? "the user"
     }
 
-    /// Read onboarding's names together so graph extraction and memory query
-    /// expansion use the same identity and rejection vocabulary.
+    /// Read onboarding's names together so graph extraction and memory query expansion use the same identity and rejection vocabulary.
     public static func profileNames(profileURL: URL) throws -> (agent: String?, user: String?) {
         let data: Data
         do { data = try Data(contentsOf: profileURL) }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile { return (nil, nil) }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw MemoryStorageError.databaseUnavailable("\(profileURL.path) is not a profile object; repair the saved identity before graph indexing or name expansion.")
+            throw MemoryStorageError.databaseUnavailable("""
+                \(profileURL.path) is not a profile object; repair the saved identity before graph indexing or name expansion.
+                """)
         }
         let profile = try PersonaCompiler.decodeProfile(raw: object)
         if let userName = profile.extras["userName"], userName.stringValue == nil {
-            throw MemoryStorageError.databaseUnavailable("\(profileURL.path): userName must be a string; repair the saved identity before graph indexing or name expansion.")
+            throw MemoryStorageError.databaseUnavailable("""
+                \(profileURL.path): userName must be a string; repair the saved identity before graph indexing or name expansion.
+                """)
         }
         func checkedName(_ raw: String?, key: String, rejecting: Set<String>) throws -> String? {
             guard let raw else { return nil }
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, !rejecting.contains(trimmed.lowercased()) else { return nil }
             guard let name = usableProfileName(raw, rejecting: rejecting) else {
-                throw MemoryStorageError.databaseUnavailable("\(profileURL.path): \(key) is not a usable saved name; repair its length or control characters before indexing.")
+                throw MemoryStorageError.databaseUnavailable("""
+                    \(profileURL.path): \(key) is not a usable saved name; repair its length or control characters before indexing.
+                    """)
             }
             return name
         }
@@ -92,10 +96,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// Merge only identities proven to denote the configured primary-user
-    /// role: exact generic person labels, the exact configured person name,
-    /// and a derived concept bearing that exact configured name. Arbitrary
-    /// manual people and concepts remain untouched.
+    /// Merge only identities proven to denote the configured primary-user role: exact generic person labels, the exact configured person name, and a derived
+    /// concept bearing that exact configured name. Arbitrary manual people and concepts remain untouched.
     static func consolidatePrimaryUserEntities(
         _ db: Database,
         primaryUserName: String
@@ -256,8 +258,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return PrimaryUserConsolidation(entitiesRemoved: db.changesCount)
     }
 
-    /// The shared identity comes from the profile, not the last fact indexed.
-    /// Source evidence belongs to each fact and relationship separately.
+    /// The shared identity comes from the profile, not the last fact indexed. Source evidence belongs to each fact and relationship separately.
     private static func primaryUserMetadata(
         name: String, existing: [String: JSONValue] = [:]
     ) -> [String: JSONValue] {

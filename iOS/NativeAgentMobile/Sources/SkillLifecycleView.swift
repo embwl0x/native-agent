@@ -1,13 +1,10 @@
-// SkillLifecycleView.swift — iOS skill catalog (iCloud-only).
-// Data: iCloudSyncEngine reads `snapshots/skills_snapshot.json` (Mac publishes).
-// Built-in persona guidance is read, never run. Executable parts live on Tools.
+// Built-in guidance is read, never run; executable parts belong on Tools.
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `SkillLifecycleView.swift` | Built-in guidance snapshot renderer and ID-resolved details; empty guidance directs to abilities on Tools; SkillsToolsView owns catalog refresh/loading |
+// Blueprint: | `SkillLifecycleView.swift` | Built-in guidance and ID-resolved details; Tools owns abilities; SkillsToolsView owns refresh/loading |
 
 // MARK: - Snapshot model
 
-/// Current built-in guidance metadata, published by InstalledSkillInventory.
 struct SkillManifestEntry: Decodable, Identifiable, Hashable, Sendable {
     let id: String
     let name: String
@@ -38,7 +35,6 @@ struct SkillManifestEntry: Decodable, Identifiable, Hashable, Sendable {
 // MARK: - Top-level view
 
 struct SkillLifecycleView: View {
-    /// Rides under the page header (Skills & Tools puts its page switch here).
     let accessory: AnyView
     let isLoading: Bool
     let error: String?
@@ -107,7 +103,7 @@ struct SkillLifecycleView: View {
     }
 
     private var emptyDescription: String {
-        "Skills are built-in guidance. Her abilities are on the Tools page."
+        "Skills are built-in guidance. The agent's abilities are on the Tools page."
     }
 }
 

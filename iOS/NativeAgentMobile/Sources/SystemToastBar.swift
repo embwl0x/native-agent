@@ -12,10 +12,8 @@ public struct iOSSystemToastBar: View {
     }
 
     public var body: some View {
-        // Show the newest notices; dismissal timers start on push.
         let visibleToasts = Array(center.queue.suffix(Self.maxVisible))
 
-        // The container coordinates sampling for stacked glass pills.
         GlassEffectContainer(spacing: 8) {
             pillStack(visibleToasts)
         }
@@ -35,8 +33,7 @@ public struct iOSSystemToastBar: View {
         .frame(maxWidth: .infinity, alignment: .center)
         .animation(AppMotion.snappy, value: center.queue.map(\.id))
         .allowsHitTesting(!center.queue.isEmpty)
-        // The overlay caller keeps the status bar's safe area, so the stack
-        // sits just under it on iPhone and iPad alike.
+        // The overlay caller preserves status-bar safe area so the stack stays beneath it on phone and tablet.
     }
 }
 
@@ -74,7 +71,7 @@ private struct iOSSystemToastPill: View {
                 Image(systemName: "xmark")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(AlivePalette.secondary)
-                    .frame(minWidth: 44, minHeight: 44) // iOS touch target
+                    .frame(minWidth: 44, minHeight: 44) // Preserve the minimum iOS touch target.
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -91,14 +88,9 @@ private struct iOSSystemToastPill: View {
 
 // MARK: - Mac connection chip
 
-// Connection presentation reads the phone's assessment without another fetch.
 
-/// A compact connection indicator for a navigation bar. Every state is named:
-/// a green dot alone makes a healthy connection look like unexplained chrome,
-/// especially when the user has no reason to know the dot is tappable.
+/// Name every connection state so a healthy dot still explains its meaning and tappability.
 struct MacStatusChip: View {
-    /// The chat header's status line: the agent says where it is, in its own
-    /// words and the header's type, instead of an icon and a system label.
     var speaksAsAgent = false
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     private let sync = iCloudSyncEngine.shared
@@ -124,8 +116,7 @@ struct MacStatusChip: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            // A bare 8pt dot is far under the 44pt minimum target, so pad the
-            // hit area without padding the visual.
+            // Pad the 8pt dot's hit area to 44pt without changing its visual size.
             .contentShape(Rectangle())
             .frame(minWidth: 44, minHeight: 44)
         }
@@ -154,7 +145,6 @@ private struct MacStatusDetail: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            // The three facts, never one: what holds, what waits on whom.
             ForEach(connection.facts, id: \.label) { item in
                 AliveConnectionFactLine(label: item.label, fact: item.fact)
             }
@@ -179,7 +169,7 @@ private struct MacStatusDetail: View {
 
 // MARK: - Sync error banner
 
-/// Shows the full engine warning; a new message or cleared error releases dismissal.
+/// Release dismissal on changed/cleared engine warnings so new failures remain visible.
 struct MacSyncErrorBanner: View {
     private let sync = iCloudSyncEngine.shared
     @State private var dismissedMessage: String?
@@ -195,8 +185,7 @@ struct MacSyncErrorBanner: View {
     var body: some View {
         Group {
             if let message {
-                // A headline and its detail at full width, the action on its
-                // own row: nothing is squeezed into a side column (10-31).
+                // Keep guidance full-width and actions on their own row so compact layouts do not squeeze either.
                 let split = MacSyncErrorBannerPresentation.headline(message)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -245,11 +234,7 @@ struct MacSyncErrorBanner: View {
         .sheet(isPresented: $showsConnection) {
             NavigationStack { SettingsViewFull(opensConnection: true) }
         }
-        // The latch must only survive as long as the condition does. Without
-        // this, dismissing "snapshots still downloading", letting a sync
-        // succeed, and then hitting the SAME failure again would leave the
-        // banner permanently silent — a dismissal in one situation would
-        // swallow a genuinely new occurrence later.
+        // Clear dismissal with its condition so a later occurrence of the same sync failure can show again.
         .onChange(of: sync.syncError) { _, newValue in
             if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
                 dismissedMessage = nil
@@ -265,7 +250,6 @@ enum MacSyncErrorBannerPresentation {
         return message.isEmpty ? nil : message
     }
 
-    /// The first sentence leads; the rest is detail. A one-sentence message has no detail.
     static func headline(_ message: String) -> (headline: String, detail: String?) {
         guard let end = message.range(of: ". ") else { return (message, nil) }
         let detail = message[end.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -281,10 +265,7 @@ enum MacSyncErrorBannerPresentation {
 }
 
 extension View {
-    /// Pins `MacSyncErrorBanner` to the top of a screen without disturbing the
-    /// layout underneath it (a `safeAreaInset` reflows scroll content rather
-    /// than covering it, which matters on Chat where the last bubble must stay
-    /// visible).
+    /// Use safeAreaInset so banners reflow Chat instead of covering the last bubble.
     func macSyncErrorBanner() -> some View {
         safeAreaInset(edge: .top, spacing: 0) { MacSyncErrorBanner() }
     }

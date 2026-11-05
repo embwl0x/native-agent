@@ -1,12 +1,9 @@
 import Foundation
-// Blueprint: | `Modules/NativeAgentCore/Sources/NativeAgentCore/AgentBridgeCompletionRoute.swift` | Shared completion route/requester identity and destination validation; `isValidIOSDeviceRouteKey` |
+// Blueprint: | `Modules/NativeAgentCore/Sources/NativeAgentCore/AgentBridgeCompletionRoute.swift` | `isValidIOSDeviceRouteKey` |
 
 public struct AgentBridgeCompletionRoute: Sendable, Equatable, Codable {
-  /// Current iOS clients mint an exact per-device route as `iphone` or
-  /// `iphone:<device name>`. The generic `mobile_app` source key is a session
-  /// identity shared by every mobile client, not a reply destination. Accepting
-  /// arbitrary non-empty strings (notably the old `app` fallback) can make an
-  /// iCloud write look successful while every device correctly filters it out.
+  /// Only iphone or iphone:<device name> names a device reply route; mobile_app is shared session identity. A generic route can accept an iCloud write that
+  /// every device filters out.
   public static func isValidIOSDeviceRouteKey(_ raw: String) -> Bool {
     let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !value.isEmpty, value.utf8.count <= 200,
@@ -24,20 +21,18 @@ public struct AgentBridgeCompletionRoute: Sendable, Equatable, Codable {
 
     public init?(surface: String) {
       switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-      case "chat", "app", "mac", "github-command", "mission", "missions", "workshop": self = .local
+      case "chat", "github-command", "workshop": self = .local
       case "caller-result": self = .callerResult
       case "telegram": self = .telegram
       case "slack": self = .slack
-      case "ios", "iphone", "mobile", "icloud": self = .ios
+      case "ios": self = .ios
       default: return nil
       }
     }
 
     public var hasRedeliveryOwner: Bool { self == .telegram || self == .slack || self == .ios }
-    /// Its destination says when it holds a reply (Telegram's and Slack's
-    /// servers keep the conversation). The phone has redelivery, but no
-    /// authenticated per-reply receipt from durable phone storage back to
-    /// this owner. CloudKit acceptance alone cannot settle that obligation.
+    /// Its destination says when it holds a reply (Telegram's and Slack's servers keep the conversation). The phone has redelivery, but no authenticated
+    /// per-reply receipt from durable phone storage back to this owner. CloudKit acceptance alone cannot settle that obligation.
     public var acceptsDurably: Bool { self == .telegram || self == .slack }
   }
 
@@ -48,8 +43,7 @@ public struct AgentBridgeCompletionRoute: Sendable, Equatable, Codable {
   public let sourceKey: String?
   public let replyTo: String?
   public let correlationId: String?
-  /// Where the turn that produced the answer ran, when that is not the chat
-  /// it answers (a contact's own conversation): its result marker is there.
+  /// Where the turn that produced the answer ran, when that is not the chat it answers (a contact's own conversation): its result marker is there.
   public let turnSessionId: String?
   public let requesterUserId: String?
 

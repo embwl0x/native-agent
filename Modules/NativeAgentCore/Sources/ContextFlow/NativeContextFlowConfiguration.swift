@@ -8,9 +8,8 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import TurnTrace
-import WorkshopExecution
 import NativeAgentShared
-// Blueprint: | `NativeContextFlowConfiguration.swift` | `NativeContextFlowConfiguration`, checked mode/budget resolution, mode status, startup error and observatory health; invalid settings remain unavailable, absent settings use the documented defaults; onboarding-safe mode and RAM budget resolution |
+// Blueprint: | `NativeContextFlowConfiguration.swift` | `NativeContextFlowConfiguration`: checked modes/budgets; absent defaults; invalid unavailable |
 
 public struct NativeContextFlowConfiguration: Sendable, Equatable {
     public static let modeEnvironmentKey = "NATIVE_AGENT_CONTEXT_FLOW_MODE"
@@ -31,8 +30,7 @@ public struct NativeContextFlowConfiguration: Sendable, Equatable {
         let isPublicSafe = NativeAgentPublicSafety.isPublicSafeMode(environment: environment)
         let preOnboarding = isPublicSafe
             && !NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
-        // Validate every present setting, even under an environment override or
-        // before onboarding. Only absence supplies a default.
+        // Validate every present setting, even under an environment override or before onboarding. Only absence supplies a default.
         let savedMode: ContextFlowMode?
         if let raw = defaults.object(forKey: modeDefaultsKey) {
             guard let value = raw as? String, let parsed = ContextFlowMode(rawValue: value) else {

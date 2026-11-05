@@ -18,8 +18,7 @@ public func parseExpiresAt(_ raw: Any?) -> Date? {
     SwiftNativeProviderRouting.parseAuthExpiresAt(raw)
 }
 
-/// A refresh belongs to one sign-in. If the endpoint supplies no identity,
-/// a fresh local sign-in ID still prevents borrowing a previous grant.
+/// A refresh belongs to one sign-in. If the endpoint supplies no identity, a fresh local sign-in ID still prevents borrowing a previous grant.
 public enum OAuthRefreshBinding {
     static func string(_ value: Any?) -> String? {
         guard let value = value as? String else { return nil }
@@ -85,10 +84,8 @@ public enum OAuthRefreshBinding {
     }
 }
 
-/// Lives for one request, including its refresh queue wait and HTTP retry.
-/// Access-only credentials can continue unchanged, but cannot adopt a new token
-/// without a recorded account binding. Read-only CLI sessions can instead
-/// prove account continuity from their token identity.
+/// Lives for one request, including its refresh queue wait and HTTP retry. Access-only credentials can continue unchanged, but cannot adopt a new token
+/// without a recorded account binding. Read-only CLI sessions can instead prove account continuity from their token identity.
 final class OAuthRequestAccount: @unchecked Sendable {
     private let lock = NSLock()
     private var original: (account: String?, access: String?)?
@@ -114,8 +111,7 @@ final class OAuthRequestAccount: @unchecked Sendable {
                 return
             }
         } else {
-            // Token-only callers can prove continuity with the rejected JWT's
-            // account claim; opaque tokens require the retained request binding.
+            // Token-only callers can prove continuity with the rejected JWT's account claim; opaque tokens require the retained request binding.
             if let rejectedToken, rejectedToken != access {
                 guard let rejectedAccount = OAuthRefreshBinding.identity(["access_token": rejectedToken], provider: provider),
                       rejectedAccount == account else { throw Self.changed(provider) }

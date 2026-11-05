@@ -7,7 +7,7 @@ import DeviceSync
 // Blueprint: | `ChatView+PinnedSessions.swift` | `ChatView`: human pin reads and pruning; additive pinning delegates to `TranscriptsFacade` |
 
 extension ChatView {
-    /// Human pins exclude the anchor, which must not become a persisted pin.
+    /// Exclude the live anchor from saved human pins so following a conversation cannot persist it as a pin.
     func humanPinnedSessionIds() -> [String] {
         appModel.engine.transcripts.pinnedSessionIDs
     }
@@ -15,8 +15,7 @@ extension ChatView {
     func prunePinnedSessions() {
         guard !appModel.engine.transcripts.sessions.isEmpty else { return }
         let liveIds = Set(appModel.engine.transcripts.sessions.map(\.id))
-        // Prunes the HUMAN's list. Using the merged list here would write the
-        // anchor into their pins on the first prune pass.
+        // Prune only the user's saved list; pruning the merged projection would persist the live anchor.
         let current = humanPinnedSessionIds()
         let pruned = current.filter { liveIds.contains($0) }
         guard pruned != current else { return }
@@ -32,8 +31,7 @@ extension ChatView {
 
     func pinSession(_ sessionId: String, selectAfterPin: Bool = true) {
         guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionId }) else { return }
-        // Explicitly pinning the anchor is allowed and meaningful: it says
-        // "keep this one even after it stops being the live conversation".
+        // Explicit anchor pins must survive after that conversation stops being live.
         do {
             let result = try appModel.engine.transcripts.pinSession(sessionId)
             guard result.shared else {
@@ -64,12 +62,12 @@ extension ChatView {
             showToast("This tab was already unpinned")
             }
         } catch {
-            // A failed retention write leaves the visible pin unchanged.
+            // A failed retention write must leave the visible pin unchanged.
             showToast("Pinned tab could not be closed; it remains pinned")
         }
     }
 
-    // Plain-text drops are accepted, but SessionDragSource emits only the custom session type.
+    // Accept plain-text drops while preserving the producer's custom session type.
     func handlePinnedSessionDrop(providers: [NSItemProvider]) -> Bool {
         var accepted = false
         for provider in providers {

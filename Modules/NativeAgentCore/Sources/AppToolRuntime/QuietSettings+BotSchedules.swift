@@ -24,11 +24,10 @@ import ChromeControl
 import MemoryV2
 import TurnTrace
 import Studio
-// Blueprint: | `QuietSettings+BotSchedules.swift` | QuietSettings bot cadence parsing and schedule rows; snapshot reads stay scoped to display and writes reread the definition |
+// Blueprint: | `QuietSettings+BotSchedules.swift` | Bot cadence rows; mutation rereads canonical definitions |
 
 extension QuietSettings {
-    /// A bot's cadence, in one line the model can both read and write: `manual`, `interval:900`, or `cron:<expression>`, on the Mac's local
-    /// clock.
+    /// Cadence text must round-trip between the model and scheduler on the Mac's local clock.
     public static func cadenceText(_ cadence: BotCadence) -> String {
         switch cadence {
         case .manual: return "manual"
@@ -67,11 +66,7 @@ extension QuietSettings {
         BotDefinitionStore(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
     }
 
-    /// One cadence row and one paused row per bot that exists right now.
-    ///
-    /// Bots are made and deleted while the app runs, so this part of the registry cannot be a compile-time list. It is still a registry and
-    /// not reflection: each row names one bot by id and carries the same two store calls the Bots page makes (`update`, `pause`). A bot
-    /// that has been deleted simply has no rows, which is the honest answer to "can I change its schedule".
+    /// Bots change at runtime, so rows bind exact ids to page-owned update/pause calls; deleted bots expose no stale controls.
     @MainActor
     static func botRows(_ appModel: (any QuietSettingsHost)?, snapshot: Bool = false) throws -> [QuietSetting] {
         guard let appModel else { throw QuietSettingError.unavailable("The helper settings owner is unavailable. Open Bots again before reading schedules.") }
@@ -93,11 +88,10 @@ extension QuietSettings {
                         let current = try botStore(appModel).get(bot.id)
                         return .string(cadenceText(current.cadence))
                     },
-                    write: { appModel, value in
+                    write: { appModel, value, context in
                         let text = try stringValue(value, "\(name) schedule")
                         let store = botStore(appModel)
-                        // Read fresh: `update` refuses a definition edited from a stale read, so the row must not carry the snapshot it was
-                        // listed with.
+                        // Reread definitions at mutation: update rejects stale snapshots retained from row discovery.
                         var edited = try store.get(bot.id)
                         edited.cadence = try parseCadence(text, "\(name) schedule")
                         _ = try store.update(edited)
@@ -114,7 +108,7 @@ extension QuietSettings {
                         let current = try botStore(appModel).get(bot.id)
                         return .bool(current.paused)
                     },
-                    write: { appModel, value in
+                    write: { appModel, value, context in
                         _ = try botStore(appModel).pause(
                             bot.id, paused: try boolValue(value, "\(name) paused"))
                     }

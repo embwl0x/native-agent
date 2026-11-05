@@ -1,8 +1,8 @@
 import Foundation
 import SwiftUI
-// Blueprint: | `MobileHelpers.swift` | Helper row/edit revisions and required Boolean Fast submission intent; shared plain agent state/time summaries and other-room exchange data, compact preview view and chronological placement for Mac and phone |
+// Blueprint: | `MobileHelpers.swift` | Revisioned helper edits and reading copies; explicit Fast intent |
 
-/// HerScreen's reading copy of a concluded exchange, never a chat message.
+/// AgentScreen's reading copy of a concluded exchange, never a chat message.
 public struct OtherRoomExchange: Codable, Hashable, Identifiable, Sendable {
     public let id: String
     public let sessionID: String
@@ -85,8 +85,7 @@ public struct MobileHelperEdit: Codable, Sendable {
     public var modelPinned: Bool? = false
     public var think = ""
     public var fast = false
-    /// False means the hidden Fast control was not submitted. Every edit and
-    /// receipt carries intent; a missing field is not an older-client command.
+    /// Every edit and receipt carries explicit Fast intent; an unsubmitted hidden control must not change it.
     public var fastIsSet = false
     public var timing = "manual"
     public var hours = ""

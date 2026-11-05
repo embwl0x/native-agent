@@ -7,8 +7,7 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-import WorkshopExecution
-// Blueprint: | `TriggerInboxPublication.swift` | SwiftNativeTriggerScheduler inbox preparation, locked durable acceptance, notification delivery and activity receipts |
+// Blueprint: | `TriggerInboxPublication.swift` | Locked inbox acceptance before delivery and receipts |
 
 extension SwiftNativeTriggerScheduler {
     // MARK: fire_now — Swift-native
@@ -36,7 +35,6 @@ extension SwiftNativeTriggerScheduler {
             ))
         }
 
-        // Look up the trigger row.
         let configs: [TriggerConfig]
         let seed: MorningBriefDefaults
         do {
@@ -103,8 +101,7 @@ extension SwiftNativeTriggerScheduler {
                     delivery = await notifier(note, shouldNotify)
                     notified = shouldNotify && delivery.objectValue?["delivered"] == .bool(true)
                     if delivery == .null {
-                        // The sender reported failure. Say so on the record
-                        // rather than logging "ok".
+                        // A failed sender must produce a failed receipt, never an ok record.
                         status = "warn"
                         detail += "; card saved but delivery reported failure"
                     } else if case .object(let d) = delivery {
@@ -126,7 +123,10 @@ extension SwiftNativeTriggerScheduler {
                         detail += "; notifier handled the notification"
                     }
                 } else if shouldNotify {
-                    Self.logger.error("trigger '\(name, privacy: .public)' resolved notify=true but NO notifier was injected into this scheduler — the inbox item landed, the push did NOT")
+                    Self.logger.error("""
+                        trigger '\(name, privacy: .public)' resolved notify=true but NO notifier was injected into this scheduler — the inbox item landed, \
+                        the push did NOT
+                        """)
                     status = "warn"
                     detail += "; notify requested but no notifier wired — push NOT dispatched"
                 }
@@ -187,13 +187,8 @@ extension SwiftNativeTriggerScheduler {
         )
     }
 
-    /// The delivery receipt. Written on EVERY fire — `notified: false` when the
-    /// push was suppressed, `status: "warn"` when it was requested but
-    /// unwireable. Matches the activity envelope
-    /// (`PersonaEngine.makePersonaActivityEvent`):
-    /// `{id, kind, title, detail, status, missionId, payload, createdAt}`.
-    /// Best-effort: a failed receipt write is logged, never thrown — the item
-    /// already landed and un-firing it would be worse.
+    /// Record suppressed or unwireable pushes explicitly in the shared activity envelope. Receipt failure logs without undoing an already accepted inbox item
+    /// or inviting duplicate delivery.
     private func appendTriggerEvent(
         item: JSONValue, itemId: String, name: String, kind: String,
         notified: Bool, placeholder: Bool, deduped: Bool, delivery: JSONValue,
@@ -227,7 +222,8 @@ extension SwiftNativeTriggerScheduler {
                 event, to: activityFeedPath, logLabel: "TriggerScheduler"
             )
         } catch {
-            Self.logger.error("trigger '\(name, privacy: .public)' fired but its activity receipt FAILED to write: \(String(describing: error), privacy: .public)")
+            Self.logger.error(
+                "trigger '\(name, privacy: .public)' fired but its activity receipt FAILED to write: \(String(describing: error), privacy: .public)")
         }
     }
 

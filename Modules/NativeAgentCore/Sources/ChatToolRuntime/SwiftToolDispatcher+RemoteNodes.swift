@@ -2,7 +2,7 @@ import Foundation
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`: remote node listing and execution; stopped SSH receipts retain captured evidence with unknown remote effects; admission refusals stay distinct from transport failures |
+// Blueprint: | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`; SSH admission; unknown effects on Stop |
 
 extension SwiftToolDispatcher {
     func impl_remote_node_list() async throws -> JSONValue {
@@ -71,7 +71,10 @@ extension SwiftToolDispatcher {
             ]
             if receipt.cancelled {
                 output["effects"] = .string("unknown")
-                output["detail"] = .string("Local SSH was stopped. The remote command may still have taken effect; inspect the retained output and remote state before another execution.")
+                output["detail"] = .string("""
+                    Local SSH was stopped. The remote command may still have taken effect; inspect the retained output and remote state before \
+                    another execution.
+                    """)
             }
             return .object(output)
         } catch is CancellationError {

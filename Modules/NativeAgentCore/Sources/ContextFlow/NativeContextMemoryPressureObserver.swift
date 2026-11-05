@@ -1,11 +1,9 @@
 import Context
 import Foundation
 
-// Blueprint: | `NativeContextMemoryPressureObserver.swift` | `DispatchContextMemoryPressureObserver`: cancellable OS pressure event bridge; runtime and coordinator retain trim policy |
+// Blueprint: | `NativeContextMemoryPressureObserver.swift` | `DispatchContextMemoryPressureObserver`: cancellable OS pressure bridge |
 
-/// The platform event source is deliberately a tiny lifecycle owner. The
-/// runtime owns the policy and the coordinator owns trimming; this bridge only
-/// translates an OS pressure edge into the shared Context pressure value.
+/// Only translate pressure events here; runtime and coordinator retain policy and trimming ownership.
 final class DispatchContextMemoryPressureObserver: @unchecked Sendable {
     private let lock = NSLock()
     private var source: DispatchSourceMemoryPressure?
@@ -23,9 +21,7 @@ final class DispatchContextMemoryPressureObserver: @unchecked Sendable {
             eventMask: [.normal, .warning, .critical],
             queue: DispatchQueue(label: "NativeAgent.ContextFlow.MemoryPressure", qos: .utility)
         )
-        // This queue is deliberately outside the runtime actor. The handler
-        // crosses back through an async value boundary instead of inheriting
-        // actor isolation into Dispatch's event closure.
+        // Dispatch invokes this off-actor; cross back with an async value instead of inheriting isolation into its closure.
         source.setEventHandler { @Sendable [weak self, weak source] in
             guard let self, let source else { return }
             let pressure = NativeContextFlowRuntime.memoryPressureLevel(

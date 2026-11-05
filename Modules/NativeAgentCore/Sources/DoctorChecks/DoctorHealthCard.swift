@@ -4,7 +4,7 @@ import Foundation
 public struct HealthCardSubsystem: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var label: String
-    public var status: String  // "ok" | "warn" | "error"
+    public var status: String
     public var detail: String
     public var fixAction: String?
     public init(id: String, label: String, status: String, detail: String, fixAction: String? = nil) {
@@ -23,9 +23,9 @@ public struct HealthCardSubsystem: Codable, Hashable, Identifiable, Sendable {
 }
 
 public struct HealthCard: Codable, Hashable, Sendable {
-    public var overall: String  // "ok" | "warn" | "error"
+    public var overall: String
     public var subsystems: [HealthCardSubsystem]
-    public var createdAt: String?  // Older cached cards may omit the timestamp.
+    public var createdAt: String?
     public init(overall: String, subsystems: [HealthCardSubsystem], createdAt: String? = nil) {
         self.overall = overall
         self.subsystems = subsystems

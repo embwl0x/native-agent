@@ -4,38 +4,11 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskStore.swift` | `SwiftNativeDeskStore` struct; process-wide `currentRevision` advances before and after each awaited canonical append under the ops lock; `continuation`, `setContinuation`, `heldBy` (nonacquiring hold read); keyed system findings persist findingKey through create, compaction and archive, preserve closure and person ownership under their filing lock; explicit reopening refreshes evidence in that transaction or files anew after archive, with opt-in ref replacement on the same `updateTitle` op; terminalParentsWithNonTerminalDescendants is the pure Doctor/repair selection, with mutation-time revalidation under the ops lock; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
-//
-// Canonical state is base + ops, with every mutation appended under the
-// ops-feed flock so replay and compaction cannot race a committed append.
-//
-// STORE PATHS (under <dataRoot>/desk/):
-//   • desk_ops.jsonl   (+ .lock) — append-only op events. The canonical TRUTH
-//     is base+tail: dropping an old op is only ever done by compaction, which
-//     first snapshots the FULL reduced state (plus the ledgers that live in
-//     raw op history) into desk_ops_base.json.
-//   • desk_ops_base.json         — compaction snapshot the replay seeds from.
-//   • desk_archive.jsonl         — display/idempotency receipts capped at newest-5000 via appendJSONLCapped.
-//
-// OP-LOG COMPACTION: once the feed crosses `opsCompactionThreshold` lines, the locked write
-// transaction snapshots the reduced state into the base and truncates the
-// op-log atomically. Replay = base + ops that FOLLOW `lastCompactedOpId`.
-// Reads take ops FIRST, base SECOND, and prefix-drop via `lastCompactedOpId`,
-// so a crash between base-write and truncate is healed (never lost, never
-// double-applied). Three ledgers live in RAW op history, not DeskState, and
-// ride the base explicitly:
-//   1. aliasHighWater — nextAlias scans every create ever made (incl. archived
-//      items') so an alias is NEVER reused; truncation without the high-water
-//      map would resurrect retired aliases.
-//   2. lastNonTerminal — the reconcile repair's "reopen to last recorded
-//      non-terminal status" target.
-//   3. the Lamport commit-stamp floor — commitStamp must floor on the BASE's
-//      generatedTs once the tail is truncated, or a second writer process
-//      could stamp behind compacted ops.
-/// Owns desk_ops JSONL/base v1, ArchiveRecord JSONL and DeskHold JSON.
-/// Coverage: excluded from local backups and production export; off-disk includes
-/// desk/. Phone sync projects items/bounds/details, not archive or holds;
-/// PrivacyMap lists the tree.
+// Blueprint: | `DeskStore.swift` | `SwiftNativeDeskStore`, `currentRevision`, `continuation`, `setContinuation`, `heldBy`, `updateTitle` |
+// Flocked base-plus-tail replay prevents compaction from racing committed appends.
+// Snapshot before truncation and prefix-drop on replay prevent loss and duplicate application.
+// Preserve alias high-water, reopening targets and the commit-stamp floor because live rows cannot recover them.
+/// Local export and phone sync exclude archive and holds; off-disk backup retains the Desk tree.
 public struct SwiftNativeDeskStore: Sendable {
     public struct CreateResult: Sendable, Equatable {
         public let item: DeskItem
@@ -46,22 +19,16 @@ public struct SwiftNativeDeskStore: Sendable {
         }
     }
     public static let logLabel = "DeskStore"
-    /// Shared by every store instance; admission reads it without Desk I/O.
+    /// Share revisions across store instances so admission needs no Desk I/O.
     static let truthRevision = Mutex<UInt64>(0)
     public static var currentRevision: UInt64 { truthRevision.withLock { $0 } }
-    /// Default archive-grace window for done items (48h) before they become
-    /// sweep-eligible.
     public static let defaultArchiveGrace: TimeInterval = 48 * 60 * 60
-    /// HARD CAPS (store-enforced, not prompt-enforced) — the Workshop budget.
-    /// ≤2 OPEN self-pursuits at once; ≤2 work sessions per pursuit per day;
-    /// ≤6 workshop work sessions per day across all pursuits.
+    /// Enforce pursuit and work-session budgets in the store so prompts cannot bypass them.
     public static let maxOpenAgentPursuits = 2
     public static let maxWorkSessionsPerPursuitPerDay = 2
     public static let maxWorkSessionsGlobalPerDay = 6
     public let dataRoot: URL
     let changeBus: StoreChangeBus
-    /// Op-log lines that trigger a snapshot+truncate at the end of the next
-    /// locked write transaction (mirrors GitHubCommandStore).
     let opsCompactionThreshold = 2_048
     public init(
         dataRoot: URL,
@@ -71,13 +38,9 @@ public struct SwiftNativeDeskStore: Sendable {
         self.changeBus = changeBus
     }
     var deskDir: URL { dataRoot.appendingPathComponent("desk", isDirectory: true) }
-    /// `<dataRoot>/desk/desk_ops.jsonl`.
     public var opsPath: URL { deskDir.appendingPathComponent("desk_ops.jsonl") }
-    /// `<dataRoot>/desk/desk_ops_base.json` — the compaction snapshot the
-    /// op-log replays FROM. Written atomically BEFORE the op-log truncate; a
-    /// crash between the two is healed by the replay prefix-drop.
+    /// Write the base before truncation so prefix-drop can recover interrupted compaction.
     public var basePath: URL { deskDir.appendingPathComponent("desk_ops_base.json") }
-    /// `<dataRoot>/desk/desk_archive.jsonl`.
     public var archivePath: URL { deskDir.appendingPathComponent("desk_archive.jsonl") }
     public func continuation(_ handle: String) async throws -> DeskContinuation? {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -86,9 +49,8 @@ public struct SwiftNativeDeskStore: Sendable {
             return try inCurrentLife(Self.compact(base: feed.base, feed.ops)).items.first { $0.handle == handle }?.continuation
         }
     }
-    /// Commit a continuation revision (CAS). A newly blocked continuation
-    /// also stops and asks on the task itself: status blocked, waiting on the
-    /// owner. Reopening the task re-checks pending steps through their domain.
+    /// Commit continuation revisions with CAS; blocked continuations ask on the task itself.
+    /// Reopening rechecks pending effects through their domain.
     public func setContinuation(_ handle: String, expectedRevision: String?, record: DeskContinuation,
                                 requiresActive: Bool = false) async throws {
         guard DeskContinuation.fromJSON(record.toJSON()) != nil else { throw DeskContinuationError.unsafe }
@@ -111,7 +73,10 @@ public struct SwiftNativeDeskStore: Sendable {
                item.status != .blocked || !item.requiresOwnerInput {
                 let ask = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle,
                     body: .setStatus(status: .blocked,
-                        blockedReason: "Continuation stopped (\(record.reason ?? "blocked")). Check the unfinished step through its own domain, then set this task back to todo to continue, or cancel it.",
+                        blockedReason: """
+                            Continuation stopped (\(record.reason ?? "blocked")). Check the unfinished step through its own domain, then set \
+                            this task back to todo to continue, or cancel it.
+                            """,
                         waitingOn: "owner", progress: nil, assignee: nil, laneOf: nil))
                 try Self.validateHierarchyTransition(ask, in: state)
                 try Self.validatePursuitInvariants(ask, in: state, viaGenericPath: true)
@@ -123,15 +88,8 @@ public struct SwiftNativeDeskStore: Sendable {
             _ = try await appendAndRecompactUnlocked(op, feed: feed)
         }
     }
-    /// Next monotonic alias among the siblings of `parentHandle`. Scans ALL
-    /// create ops (not just live items) so an alias is NEVER reused after a
-    /// sibling closes OR archives, and seeds from the compaction base's
-    /// aliasHighWater so the guarantee survives an op-log truncate. Counts
-    /// BOTH create_item and open_pursuit creates — pursuits draw from the same
-    /// top-level sequence (they used to be invisible to this scan, which let
-    /// the next createItem REUSE a pursuit's alias — duplicate depth-0 alias).
-    /// Top-level (parentHandle == nil) yields "N"; children yield
-    /// "<parentAlias>.<M>", both starting at 1.
+    /// Scan every create and base high-water so aliases stay unique after closure, archival or truncation.
+    /// Pursuits share the top-level sequence with ordinary creates.
     static func validateAliasDomain(base: DeskCompactionBase?, ops: [DeskOp]) throws {
         var aliases = base?.state.items.map(\.alias) ?? []
         for op in ops {

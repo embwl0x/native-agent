@@ -9,12 +9,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
 
-// Blueprint: | `WorkPaneMakeView.swift` | Make refs/version previews over canonical studio state; image-owner errors stay visible without switching renderer, and export shows both output outcomes without truncation |
+// Blueprint: | `WorkPaneMakeView.swift` | Canonical Make versions; image failures stay visible; export retains both outcomes |
 
-/// The Work pane's Make tab: what I made, one version at a time, with the
-/// earlier ones one click back (`MakeStudio`). A mockup renders in an offline
-/// web view; an image from image.generate carries Try again, Variations and
-/// Use this; anything else shows through Quick Look. Nil `ref` is the newest.
+/// Keep versions on canonical Make refs; nil selects newest without creating another studio owner.
 struct WorkPaneMakeView: View {
     let ref: String?
     @Environment(AppModel.self) private var appModel
@@ -22,7 +19,7 @@ struct WorkPaneMakeView: View {
     @State private var prepared: MakeStudio.Preview?
     @State private var previewRead = LatestRead()
     @State private var revision = 0
-    /// Index into the ref's versions; nil is the newest.
+    /// Nil follows the newest version instead of pinning an index.
     @State private var shown: Int?
     @State private var making = false
     @State private var saving = false
@@ -60,7 +57,7 @@ struct WorkPaneMakeView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        // The shelf shows its last good read; what it could not read is said.
+        // Retain good shelf data while naming any failed read.
         .safeAreaInset(edge: .bottom) {
             if let fault = shelf.fault {
                 Text(fault)
@@ -77,7 +74,6 @@ struct WorkPaneMakeView: View {
             note = nil
             shelf.start()
         }
-        // A new version lands in front.
         .onChange(of: shelf.meta(ref).map { "\($0.ref) \($0.versions.count)" }) { shown = nil }
     }
 
@@ -183,9 +179,7 @@ struct WorkPaneMakeView: View {
 
     // MARK: - The three buttons
 
-    /// The same prompt through image.generate's own call and gates, as a
-    /// click of User's (`DeskToolDispatchRouter`); the image lands as the
-    /// ref's next version (`__make_ref`), and the shelf brings it forward.
+    /// Dispatch with the user's click authority through image.generate gates, retaining the same Make ref.
     private func tryAgain(_ ref: String, prompt: String) {
         making = true
         note = nil
@@ -204,7 +198,7 @@ struct WorkPaneMakeView: View {
         }
     }
 
-    /// Asked of me in this chat, through the composer's own send.
+    /// Use the composer send path so variations keep the conversation's acceptance rules.
     private func variations(_ ref: String, _ version: MakeStudio.Version) {
         Task {
             let acceptance = await appModel.startActiveChatTurn(
@@ -213,8 +207,7 @@ struct WorkPaneMakeView: View {
         }
     }
 
-    /// Into the conversation's project folder when it has one, else where
-    /// User picks; the prompt rides beside it as <name>.prompt.txt.
+    /// Keep the prompt beside the exported image; use the project folder or the user's chosen destination.
     private func use(_ file: URL, ref: String, version: MakeStudio.Version, prompt: String) {
         guard !saving else { return }
         saving = true
@@ -246,7 +239,7 @@ struct WorkPaneMakeView: View {
         }
     }
 
-    /// Nil when the call made its image; otherwise what it said.
+    /// Nil requires an actual image; otherwise retain the call's outcome.
     private static func failureText(_ result: JSONValue) -> String? {
         guard case .object(let fields) = result else { return "image.generate gave no answer." }
         if fields["status"] == .string("ok") { return nil }
@@ -257,10 +250,8 @@ struct WorkPaneMakeView: View {
     }
 }
 
-/// A mockup, offline and script-free: every load that is not a local file, data or blob is
-/// blocked by a content rule list compiled before the first load; navigation
-/// stays inside the mockup's own folder, which is all it may read; no script
-/// message handler reaches the app, and nothing opens a window.
+/// Compile network-blocking rules before loading; navigation may read only the mockup folder.
+/// Keep scripts and message handlers absent so offline markup cannot reach app actions or open windows.
 struct MakeMockupView: NSViewRepresentable {
     let file: URL
     let folder: URL
@@ -272,8 +263,7 @@ struct MakeMockupView: NSViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        // No scripts: content rules can't reach WebRTC's sockets, so a script
-        // could still talk to the network. A mockup is markup and CSS.
+        // Content rules cannot block WebRTC sockets, so offline mockups must disable scripts.
         configuration.defaultWebpagePreferences.allowsContentJavaScript = false
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = context.coordinator
@@ -361,7 +351,6 @@ struct MakeMockupView: NSViewRepresentable {
     }
 }
 
-/// Anything that is not a mockup or an image, through Quick Look.
 struct MakeQuickLookView: NSViewRepresentable {
     let file: URL
     let revision: Int

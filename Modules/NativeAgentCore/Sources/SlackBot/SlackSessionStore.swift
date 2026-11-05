@@ -74,8 +74,7 @@ struct SlackSessionStore: Sendable {
         return resolved
     }
 
-    /// Called only under the map lock. Keep the damaged original in place so
-    /// subsequent reads cannot mistake quarantine for a missing authority store.
+    /// Called only under the map lock. Keep the damaged original in place so subsequent reads cannot mistake quarantine for a missing authority store.
     private func loadSessionMap() throws -> [String: JSONValue] {
         let quarantine = sessionMapPath.appendingPathExtension("damaged")
         let bytes: Data
@@ -124,9 +123,8 @@ struct SlackSessionStore: Sendable {
         }
     }
 
-    /// Expired bindings stop protecting inactive sessions from transcript
-    /// retention. Only the hot set is bounded; durable cold locators are not
-    /// trimmed and still resolve a returning old thread.
+    /// Expired bindings stop protecting inactive sessions from transcript retention. Only the hot set is bounded; durable cold locators are not trimmed and
+    /// still resolve a returning old thread.
     private static func retainThreadBindings(
         sessions: inout [String: JSONValue],
         archived: inout [String: JSONValue],
@@ -155,8 +153,7 @@ struct SlackSessionStore: Sendable {
                 sessions.removeValue(forKey: binding.key)
             }
         }
-        // Cold bindings are durable locators for retained conversations. The
-        // hot thread map stays bounded; old conversations remain resumable.
+        // Cold bindings are durable locators for retained conversations. The hot thread map stays bounded; old conversations remain resumable.
     }
 
     private func ensureSessionRow(id: String, inbound: SlackInboundMessage) async throws {
@@ -170,8 +167,7 @@ struct SlackSessionStore: Sendable {
         } else {
             title = "Slack \(inbound.channelId)"
         }
-        // The adapter declares what the conversation is: a DM is a direct
-        // conversation, a channel, thread or group has other people in it.
+        // The adapter declares what the conversation is: a DM is a direct conversation, a channel, thread or group has other people in it.
         try await ChatSessionIndexFile.ensureSession(
             id: id,
             title: title,

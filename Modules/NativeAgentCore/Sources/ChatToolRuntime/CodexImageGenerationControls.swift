@@ -67,7 +67,9 @@ extension CodexImageGenerationRequest {
         case "low": result.quality = "low"
         case "high": result.quality = "high"
         case "auto": result.quality = "auto"
-        default: throw ImageGenerationToolError.unsupportedControl("Codex quality must be low, medium, high or auto; Flare/Sunburst, xhigh and max are not subscription selectors.")
+        default: throw ImageGenerationToolError.unsupportedControl("""
+            Codex quality must be low, medium, high or auto; Flare/Sunburst, xhigh and max are not subscription selectors.
+            """)
         }
         result.outputFormat = try ImageGenerationOutputFormat.decode(outputFormat)
         result.action = clean(action).isEmpty ? "auto" : clean(action)

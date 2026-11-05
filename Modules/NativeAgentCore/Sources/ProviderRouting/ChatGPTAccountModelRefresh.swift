@@ -3,13 +3,13 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `ChatGPTAccountModelRefresh.swift` | `ChatGPTAccountModelRefresh`: account-scoped UI/sign-in model discovery and checked cache publication outside provider dispatch |
+// Blueprint: | `ChatGPTAccountModelRefresh.swift` | `ChatGPTAccountModelRefresh`: account discovery outside dispatch |
 
 /// Account discovery is UI/sign-in maintenance, never part of provider dispatch.
 public actor ChatGPTAccountModelRefresh {
     public static let shared = ChatGPTAccountModelRefresh()
     public static let didRefresh = Notification.Name("ChatGPTAccountModelRefresh.didRefresh")
-    // Codex's ModelsClient sends its protocol version as client_version.
+    // Model discovery must send the Codex protocol version as client_version.
     private static let clientVersion = "0.159.0"
     private struct CredentialKey: Hashable {
         let root: URL
@@ -23,14 +23,13 @@ public actor ChatGPTAccountModelRefresh {
             .appendingPathComponent("models_cache.json")
     }
 
-    /// Missing/unreadable/unbound caches are stale; successful reads last 24 hours.
-    /// Automatic failures cool down for five minutes; explicit refresh bypasses it.
+    /// Missing/unreadable/unbound caches are stale; successful reads last 24 hours. Automatic failures cool down for five minutes; explicit refresh
+    /// bypasses it.
     @discardableResult
     public func refresh(dataRoot: URL, force: Bool = false) async throws -> Bool {
         let root = dataRoot.standardizedFileURL
         let authPath = ChatGPTTransport.preferredAuthPath(dataRoot: root)
-        // This maintenance operation writes only the app-owned account cache;
-        // do not discover an inactive sign-in when runtime selected another one.
+        // This maintenance operation writes only the app-owned account cache; do not discover an inactive sign-in when runtime selected another one.
         guard authPath.standardizedFileURL == NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root).standardizedFileURL else { return false }
         guard let token = try ChatGPTTransport.storedAccessToken(at: authPath) else { return false }
         var key = CredentialKey(root: root, accessToken: token)
@@ -52,8 +51,7 @@ public actor ChatGPTAccountModelRefresh {
             failedAt[key] = Date()
             throw error
         }
-        // Token renewal is serialized by the adapter; discovery joins using
-        // the token it will actually send, including its failure cooldown.
+        // Token renewal is serialized by the adapter; discovery joins using the token it will actually send, including its failure cooldown.
         key = CredentialKey(root: root, accessToken: context.accessToken)
         if let flight = flights[key] { return try await flight.value }
         if !force {

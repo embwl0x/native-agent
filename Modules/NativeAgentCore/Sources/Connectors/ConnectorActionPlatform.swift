@@ -23,12 +23,11 @@ public struct ConnectorActionStatusEvidence: Sendable {
     }
 }
 
-/// Host bindings for platform access and already-owned runtime read projections.
 public protocol ConnectorActionPlatform: Sendable {
     func attentionRouter() -> AttentionRouter
-    func macAction(_ action: ConnectorPlatformAction, input: [String: JSONValue]) async throws -> JSONValue
-    func spotlight(input: [String: JSONValue]) async throws -> MacControlResult
-    func postMessage(title: String, body: String) async -> [String: JSONValue]
+    func macAction(_ action: ConnectorPlatformAction, input: [String: JSONValue], turn: Turn) async throws -> JSONValue
+    func spotlight(input: [String: JSONValue], turn: Turn) async throws -> MacControlResult
+    func postMessage(title: String, body: String, turn: Turn) async -> [String: JSONValue]
     func macAssistantStatusClient() -> any MacAssistantStatusClient
     func statusEvidence(actionID: String) async throws -> ConnectorActionStatusEvidence?
     func runGit(_ arguments: [String], repoRoot: URL, timeout: TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)

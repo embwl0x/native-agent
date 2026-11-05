@@ -1,10 +1,7 @@
 import Foundation
 // Blueprint: | `LivingStatusRefreshCoalescer.swift` | `LivingStatusRefreshCoalescer` struct; `requestRefresh`, `completePass` |
 
-/// Bounded refresh ownership for the mounted Living Status card. File watching,
-/// cognition events, and the manual button may all request while one snapshot
-/// read is in flight. Each episode has one trailing pass. An invalidation
-/// during that pass starts a subsequent episode after the caller's delay.
+/// Coalesce invalidations into one read and trailing pass; changes during that pass start a delayed next episode.
 public struct LivingStatusRefreshCoalescer: Equatable, Sendable {
     public init() {}
 
@@ -12,7 +9,6 @@ public struct LivingStatusRefreshCoalescer: Equatable, Sendable {
     public private(set) var trailingPassQueued = false
     public private(set) var trailingPassConsumed = false
 
-    /// Returns true for the caller that must begin a refresh episode.
     public mutating func requestRefresh() -> Bool {
         guard isRefreshing else {
             isRefreshing = true
@@ -25,8 +21,7 @@ public struct LivingStatusRefreshCoalescer: Equatable, Sendable {
         return false
     }
 
-    /// Returns true if an invalidation still needs a read. When the trailing
-    /// pass was consumed, the next episode must be deferred by the caller.
+    /// The caller must defer the next episode once this trailing pass is consumed.
     public mutating func completePass() -> Bool {
         guard isRefreshing else { return false }
         if trailingPassQueued {

@@ -9,17 +9,11 @@ import SwiftUI
 
 // Blueprint: | `ShotgunView.swift` | `ShotgunView`: driving-session transcript/composer, live step and Stop/Resume/Watch controls through existing owners |
 
-/// What Shotgun shows (Shotgun.swift owns the window): her live step as one
-/// line on top, the last ten messages of the selected conversation with her reply
-/// streaming in, a composer that sends into that same chat (and queues while
-/// she works), Stop while a turn runs, Resume while the person holds the Mac,
-/// Watch for the masked screen glimpse, Expand/Open for the full window. A
-/// finished turn reads "Done · Open" and later folds into a small name pill.
-/// One glass surface; nothing inside it is glass.
+/// Keep transcript, composer and Stop on the same driving session so remote turns stay controllable.
 struct ShotgunView: View {
     static let radius: CGFloat = 22
 
-    /// Reports the folded pill's measured size so the window can hug it.
+    /// Measure the folded view so the window can hug its pill.
     let onSize: (CGSize) -> Void
 
     @Environment(AppModel.self) private var appModel
@@ -37,32 +31,34 @@ struct ShotgunView: View {
         let turns = appModel.engine.turns
         let turn = turns.lifecycle(for: sessionId)?.presentation
         let preview = turns.screenPreview(for: sessionId)
-        // A turn from another door (Telegram) has no Mac lifecycle: it runs while it
-        // is in flight on this root, and Stop reaches it by its session.
+        // Remote turns lack a Mac lifecycle; use root flight state and session Stop.
         let remoteRunning = controller.driver.map { driver in
             driver.session == sessionId && turns.inFlightTurns().contains { $0.turnId == driver.turn }
         } ?? false
         let running = turns.isBusy(sessionId) || turn.map { !$0.isTerminal } == true || remoteRunning
+        // Shotgun's projection: the last ten user and assistant rows plus every decision (a pending approval, a card waiting on the
+        // person, a mirrored card), grouped as their own run so the document shows exactly that.
         let transcript = {
             let all = appModel.engine.transcripts.messages(for: sessionId)
             let approvals = Dictionary(appModel.engine.approvals.records.map { ($0.id, $0.status) }, uniquingKeysWith: { first, _ in first })
             let cardsAvailable: Bool
             if case .unavailable = appModel.engine.transcripts.transcriptReadStatus(for: sessionId) { cardsAvailable = false }
             else { cardsAvailable = true }
-            var shown: [ChatMessage] = [], decisions: [(message: ChatMessage, pending: Bool, cards: [InlineCardModel])] = []
-            var mirrors = Set<String>(), lastAssistantId: String?, waiting = false
+            var said: [String] = [], decisions = Set<String>(), cardsByRow: [String: [TranscriptReadout.Card]] = [:]
+            var mirrors = Set<String>(), waiting = false
             for message in all {
-                if message.role == "user" || message.role == "assistant" { shown.append(message) }
-                if message.role == "assistant" { lastAssistantId = message.id }
+                if message.role == "user" || message.role == "assistant" { said.append(message.id) }
                 let pending = message.metadata?.isPendingApproval == true
                     && ((message.metadata?.approvalId).flatMap { approvals[$0] }.map { $0 == "pending" } ?? true)
-                let cards = cardsAvailable ? message.inlineCards.compactMap { $0.model.needsAttention ? $0.model : nil } : []
+                let cards = cardsAvailable ? message.inlineCards.filter { $0.model.needsAttention } : []
                 if let mirror = message.metadata?.interactionMirror { mirrors.insert(mirror.sessionID) }
                 if pending || !cards.isEmpty { waiting = true }
-                if pending || !cards.isEmpty || message.metadata?.interactionMirror != nil { decisions.append((message, pending, cards)) }
+                if pending || !cards.isEmpty || message.metadata?.interactionMirror != nil { decisions.insert(message.id) }
+                if !cards.isEmpty { cardsByRow[message.id] = cards }
             }
-            return (shown: Array(shown.suffix(10)), decisions: decisions, mirrors: mirrors, waiting: waiting,
-                    lastAssistantId: lastAssistantId, tailId: all.last.flatMap { $0.role == "assistant" ? $0.id : nil })
+            let shown = decisions.union(said.suffix(10))
+            return (groups: MessageGrouper.projection(for: all.filter { shown.contains($0.id) }), cardsByRow: cardsByRow,
+                    failed: ChatTurnFailure.read(all) != nil, mirrors: mirrors, waiting: waiting)
         }()
         let waiting = transcript.waiting
         let done = !running && !waiting && turn?.isTerminal == true
@@ -71,8 +67,7 @@ struct ShotgunView: View {
                 pill
             } else {
                 full(sessionId: sessionId, turn: turn, preview: preview, running: running,
-                     shown: transcript.shown, decisions: transcript.decisions,
-                     lastAssistantId: transcript.lastAssistantId, tailId: transcript.tailId)
+                     groups: transcript.groups, cardsByRow: transcript.cardsByRow, failed: transcript.failed)
             }
         }
         .preferredColorScheme(AppearanceController.shared.colorScheme)
@@ -102,8 +97,7 @@ struct ShotgunView: View {
 
     private func full(
         sessionId: String, turn: TurnPresentationState?, preview: MacChatScreenPreview?, running: Bool,
-        shown: [ChatMessage], decisions: [(message: ChatMessage, pending: Bool, cards: [InlineCardModel])],
-        lastAssistantId: String?, tailId: String?
+        groups: MessageGrouper.GroupedTranscript, cardsByRow: [String: [TranscriptReadout.Card]], failed: Bool
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             header(turn: turn, preview: preview, running: running)
@@ -119,59 +113,36 @@ struct ShotgunView: View {
                     )
                     .accessibilityLabel("What I am looking at: \(preview.caption)")
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(shown) { message in
-                        if message.id == tailId {
-                            StreamingTailBubble(
-                                message: message,
-                                isLastAssistant: message.id == lastAssistantId,
-                                isLive: appModel.engine.turns.streamingBubbleIds[sessionId] == message.id
-                            )
-                        } else {
-                            MessageBubble(message: message, isLastAssistant: message.id == lastAssistantId)
-                                .equatable()
-                        }
-                    }
-                    // Decisions belong to this session, regardless of the prose cap.
-                    ForEach(decisions, id: \.message.id) { decision in
-                        if decision.pending {
-                            InlineApprovalCard(message: decision.message)
-                        }
-                        ChatInlineCardHost(cards: decision.cards) { card, action in
-                            inlineCards.handle(card: card, action: action, appModel: appModel)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            TranscriptDocumentView(
+                sessionID: sessionId,
+                groups: groups,
+                cardsByRow: cardsByRow,
+                showsTrouble: failed,
+                streamingMessageID: appModel.engine.turns.streamingBubbleIds[sessionId]
+            )
+            .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
+                inlineCards.handle(card: card, action: action, appModel: appModel)
             }
-            .scrollIndicators(.automatic)
-            // Opens at the newest and stays there while the reply grows.
-            .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(.bottom, for: .alignment)
-            .defaultScrollAnchor(.bottom, for: .sizeChanges)
-            .frame(maxHeight: .infinity, alignment: .bottom)
-            ChatQueuedTurnsView(sessionId: sessionId, isBusy: appModel.engine.turns.isBusy(sessionId))
+            .environment(\.transcriptOpenSettings) { [inlineCards] in inlineCards.openPage(.settings) }
+            .frame(maxHeight: .infinity)
             composer(sessionId: sessionId, running: running)
         }
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
-            // Drag it from anywhere that is not a control or the transcript.
+            // Exclude controls and transcript so dragging cannot steal their interactions.
             Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture())
         }
         .background {
             // Reduce Transparency asks for more opacity, never less.
             if reduceTransparency { ConcentricRectangle().fill(NativeAgentShell.room) }
-            // The same working shimmer the composer carries, lit for the turn.
             ThinkingGlow(kind: .shimmer, cornerRadius: Self.radius, wholeTurn: true)
         }
-        // The window's own corners: the glass fills the panel edge to edge.
+        // Fill the window corners so the glass has no inset seam.
         .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: ConcentricRectangle())
         .ignoresSafeArea()
     }
 
-    /// Done, folded: the agent's name, which opens NativeAgent, and ×.
     private var pill: some View {
         HStack(spacing: 10) {
             word(appModel.agentDisplayName, emphasis: true) { ShotgunController.shared.unfold() }
@@ -186,7 +157,6 @@ struct ShotgunView: View {
         }
         .glassEffect(reduceTransparency ? .identity : HouseGlass.plate, in: Capsule())
         .gesture(WindowDragGesture())
-        // The window hugs the pill.
         .onGeometryChange(for: CGSize.self) { $0.size } action: { onSize($0) }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea()
@@ -205,14 +175,13 @@ struct ShotgunView: View {
 
     // MARK: - Header
 
-    /// One line, replaced in place: what is happening now, or how it ended.
     @ViewBuilder
     private func header(turn: TurnPresentationState?, preview: MacChatScreenPreview?, running: Bool) -> some View {
         HStack(spacing: 10) {
             if running, let turn {
                 PulsingDot(color: NativeAgentShell.secondary, size: 7, animates: true)
                     .frame(width: 12)
-                // While she drives, the verb's own words win, as on the turn card.
+                // Prefer the driving verb's own words so the header agrees with the turn card.
                 let line = preview?.isShowable == true ? preview?.caption ?? "" : WorkPaneSteps.liveLine(turn)
                 Text(line)
                     .font(ShellType.label)
@@ -236,7 +205,7 @@ struct ShotgunView: View {
                     .foregroundStyle(NativeAgentShell.secondary)
             }
             Spacer(minLength: 4)
-            // The refusal can finish its turn before he hands the Mac back.
+            // The refusal can finish its turn before the person hands the Mac back.
             if !ShotgunController.shared.driverAllowed,
                ShotgunController.shared.selectedSessionID != nil {
                 word("Resume", emphasis: true) { ShotgunController.shared.resume() }
@@ -258,7 +227,6 @@ struct ShotgunView: View {
             }
         }
         .contentShape(Rectangle())
-        // The header is the handle the window is dragged by.
         .gesture(WindowDragGesture())
     }
 
@@ -318,7 +286,7 @@ struct ShotgunView: View {
                 .accessibilityLabel(running ? "Stop" : "Send")
                 .contextMenu {
                     if running {
-                        Button("Send next") { send(sessionId: sessionId) }
+                        Button("Send into reply in progress") { send(sessionId: sessionId) }
                             .disabled(!canSend)
                     }
                 }
@@ -343,8 +311,7 @@ struct ShotgunView: View {
             : .scale(scale: 0.5).combined(with: .opacity).animation(NativeAgentMotion.arrivalCurve)
     }
 
-    /// Into the same chat; while she is busy it waits in the send-next queue,
-    /// exactly as from the main composer.
+    /// Every composer sends through the same conversation admission.
     private func send(sessionId: String) {
         let draft = appModel.composerDraft(for: sessionId)
         let submitted = draft.text
@@ -355,11 +322,10 @@ struct ShotgunView: View {
         Task { @MainActor in
             defer { sending = false }
             switch await appModel.startChatTurnForSession(text, sessionId: sessionId) {
-            case .accepted, .queued:
+            case .accepted:
                 let unchanged = draft.text == submitted && draft.editedAt == editedAt
                 appModel.clearChatDraftAfterSend(submitted, sessionId: sessionId, editedAt: editedAt)
-                // Sent: the keyboard goes back to the app she is driving, and
-                // any keystrokes of hers that waited on this message go on.
+                // Return keyboard ownership after acceptance so the drive can continue.
                 if ShotgunController.shared.selectedSessionID == sessionId, unchanged {
                     ShotgunController.shared.giveKeyboardBack()
                 }

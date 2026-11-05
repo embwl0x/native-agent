@@ -6,11 +6,9 @@ import CoreGraphics
 
 public struct VisionColorRegionResult: Sendable, Equatable {
     public let candidates: [VisionCandidate]
-    /// The frame's dominant colour — the "background" every candidate differs
-    /// from. Exposed because the disabled/greyed heuristic needs it.
+    /// Expose background colour so disabled-state guesses share the candidate detector’s reference.
     public let backgroundLuminance: Double
-    /// True when `maxCandidates` bit. Never silent: a capped list that reads
-    /// as complete is how "there are no more buttons" becomes a lie.
+    /// Report candidate caps so incomplete evidence cannot look complete.
     public let capped: Bool
 
     public init(candidates: [VisionCandidate], backgroundLuminance: Double, capped: Bool) {
@@ -20,15 +18,13 @@ public struct VisionColorRegionResult: Sendable, Equatable {
     }
 }
 
-/// A frame's pixels, sampled once into a coarse grid. Shared by the region
-/// grower and the state heuristics so a frame is decoded exactly once.
+/// Share one decoded coarse grid across region and state heuristics.
 public struct VisionPixelGrid: Sendable {
     public let columns: Int
     public let rows: Int
     public let stepX: Double
     public let stepY: Double
     public let imageSize: VisionSize
-    /// Row-major RGB triples, channels 0…1.
     public let samples: [SIMD3<Double>]
 
     public init(
@@ -59,9 +55,7 @@ public struct VisionPixelGrid: Sendable {
         return VisionRect(x: x, y: y, w: max(0, right - x), h: max(0, bottom - y))
     }
 
-    /// Mean linear-ish luminance over an image-pixel rect (Rec. 709 weights on
-    /// the sampled grid — good enough to tell a greyed control from a live one,
-    /// which is all it is used for).
+    /// Rec. 709 luminance over the coarse grid is sufficient for approximate greyed-control comparison.
     public func meanLuminance(in rect: VisionRect) -> Double? {
         let c0 = max(0, Int(rect.x / stepX))
         let c1 = min(columns - 1, Int((rect.maxX - 1) / stepX))
@@ -81,9 +75,7 @@ public struct VisionPixelGrid: Sendable {
         return total / Double(count)
     }
 
-    /// Luminance SPREAD (max − min) over an image-pixel rect. The greyed-out
-    /// signal: a live caption has dark and light cells inside one small box, a
-    /// greyed one has neither. See `VisionRoleGuess.disabledContrast`.
+    /// Caption luminance spread distinguishes live contrast from greyed text; mean brightness cannot.
     public func luminanceSpread(in rect: VisionRect) -> Double? {
         let c0 = max(0, Int(rect.x / stepX))
         let c1 = min(columns - 1, Int((rect.maxX - 1) / stepX))
@@ -104,7 +96,7 @@ public struct VisionPixelGrid: Sendable {
         return highest - lowest
     }
 
-    /// Decode a CGImage into the coarse grid. One decode per frame.
+    /// Decode once per frame so every heuristic sees the same grid.
     public static func sample(
         image: CGImage,
         longAxisSamples: Int
@@ -117,10 +109,7 @@ public struct VisionPixelGrid: Sendable {
         let columns = max(1, width / stride)
         let rows = max(1, height / stride)
 
-        // Draw once into a known RGBA8 buffer: a CGImage can be any colour
-        // space / bit depth / alpha layout, and reading `dataProvider` bytes
-        // directly would be a silent misparse on the first frame that is not
-        // what we assumed.
+        // Normalize into RGBA8 before reading bytes; CGImage providers may use arbitrary colour spaces, depths and alpha layouts.
         let bytesPerRow = columns * 4
         var buffer = [UInt8](repeating: 0, count: bytesPerRow * rows)
         let space = CGColorSpaceCreateDeviceRGB()
@@ -165,42 +154,31 @@ public struct VisionPixelGrid: Sendable {
 }
 
 public enum VisionColorRegionLayer {
-    /// Target sample count along the frame's long axis.
     static let gridLongAxisSamples: Int = 320
-    /// Two colours within this squared RGB distance (channels 0…1) are "the
-    /// same fill".
+    /// Squared RGB distance defines approximate shared fill colour.
     private static let colorTolerance: Double = 0.02
-    /// A region must differ from the background by at least this squared RGB
-    /// distance to be a candidate at all.
+    /// Require fill contrast against the background before emitting a candidate.
     private static let backgroundTolerance: Double = 0.006
-    /// Smallest candidate, as a fraction of frame area.
     private static let minAreaFraction: Double = 0.00015
-    /// Largest candidate, as a fraction of frame area — above this it is the
-    /// window's own background or a full-bleed panel, not a control.
+    /// Exclude window backgrounds and full-bleed panels from control candidates.
     private static let maxAreaFraction: Double = 0.5
-    /// Smallest candidate in pixels on either axis.
     private static let minSidePixels: Double = 8
-    /// Fraction of a candidate row/column that must match the seed colour for
-    /// the region to absorb it. Below 1.0 on purpose — see the growth loop.
+    /// Accept majority fill so caption glyphs cannot stop growth at the first text row.
     private static let growMatchFraction: Double = 0.65
-    /// Two candidates overlapping by at least this IoU are one candidate.
+    /// Merge substantial overlap so border and interior do not become duplicate controls.
     private static let dedupeIoU: Double = 0.55
-    /// Cap on emitted candidates; a texture-heavy frame (a game, a photo) can
-    /// otherwise produce thousands. Reported when it bites — a silent cap
-    /// reads as "that's all there was".
+    /// Cap texture-heavy scenes and report truncation rather than implying thousands of fragments are complete.
     static let maxCandidates: Int = 200
 
     static func distanceSquared(_ lhs: SIMD3<Double>, _ rhs: SIMD3<Double>) -> Double {
-        // Spell out the fixed three channels: generic SIMD reduction spends
-        // substantial time in element access in installed development builds.
+        // Fixed RGB operations avoid costly generic SIMD element access in installed development builds.
         let red = lhs.x - rhs.x
         let green = lhs.y - rhs.y
         let blue = lhs.z - rhs.z
         return red * red + green * green + blue * blue
     }
 
-    /// Coarse-grid scan → similar-colour box growth → dedupe.
-    /// Rows without fill contrast rely on text-band candidates.
+    /// Text bands cover rows whose pixels lack fill contrast.
     public static func candidates(
         grid: VisionPixelGrid
     ) -> VisionColorRegionResult {
@@ -209,10 +187,7 @@ public enum VisionColorRegionLayer {
             return VisionColorRegionResult(candidates: [], backgroundLuminance: 0, capped: false)
         }
 
-        // 1. BACKGROUND = the most common quantized colour on the grid. Not
-        //    "the corner pixel": a full-bleed image or a sidebar makes the
-        //    corner a lie, and the modal colour degrades gracefully into "the
-        //    biggest flat area" on a frame with no background at all.
+        // Use modal quantized colour rather than a corner that may belong to a sidebar or full-bleed image.
         var histogram: [SIMD3<Int>: Int] = [:]
         for sample in grid.samples {
             let key = SIMD3(Int(sample.x * 16), Int(sample.y * 16), Int(sample.z * 16))
@@ -229,16 +204,10 @@ public enum VisionColorRegionLayer {
             (Double(dominant.z) + 0.5) / 16
         )
         let backgroundLuminance = 0.2126 * background.x + 0.7152 * background.y + 0.0722 * background.z
-        // The background centroid is constant for this frame. Region growth
-        // revisits boundary cells many times; never recompute this distance
-        // for every seed/edge probe. No cache survives the current image.
+        // Compute the frame-local background centroid once because growth revisits boundary cells.
         let backgroundDistances = grid.samples.map { distanceSquared($0, background) }
 
-        // 2. GROW: every non-background cell seeds a rectangular region that
-        //    expands while its neighbours keep the seed's colour. Rectangular
-        //    (not free-form flood) on purpose — a control's ACTION POINT and
-        //    its bounds have to be a box, and a box that grew to real edges is
-        //    the bounds confidence signal.
+        // Grow rectangles so candidate bounds and action points share a box with observed edges.
         var visited = [Bool](repeating: false, count: grid.columns * grid.rows)
         var raw: [VisionCandidate] = []
         var capped = false
@@ -254,28 +223,8 @@ public enum VisionColorRegionLayer {
                 }
 
                 var c0 = column, c1 = column, r0 = row, r1 = row
-                // A candidate row/column is absorbed when MOST of it matches
-                // the seed, not all of it. All-match was the first version and
-                // it was wrong in the case that matters most: a filled button
-                // with a caption. Growing down from the button's top edge, the
-                // first row containing glyphs fails an all-match test, so the
-                // region stops at the text and the emitted candidate is a
-                // strip above the label instead of the button. Glyphs are a
-                // MINORITY of a control's row; a real boundary (a border, the
-                // window background) fails across the whole span at once and
-                // still stops the growth.
-                // A cell belongs to the region when it is BOTH close enough to
-                // the seed AND closer to the seed than to the background.
-                //
-                // The second clause is not decoration. `colorTolerance` is an
-                // absolute distance, and on a light UI the gap between a white
-                // field and a light-grey window background (0.015 in squared
-                // RGB) is SMALLER than a tolerance loose enough to survive
-                // anti-aliasing (0.02) — so the absolute test alone let a white
-                // field absorb the entire window and the field then vanished
-                // through the max-area filter. Nearest-centroid is scale-free
-                // and cannot make that mistake: a background-coloured cell is
-                // by definition closest to the background.
+                // Majority fill lets growth cross caption glyphs while genuine boundaries still stop it. Require both seed proximity and greater closeness to
+                // seed than background so tolerant light fills cannot absorb the whole window.
                 func belongs(_ column: Int, _ row: Int) -> Bool {
                     let cellIndex = row * grid.columns + column
                     let cell = grid.samples[cellIndex]
@@ -319,19 +268,12 @@ public enum VisionColorRegionLayer {
                 guard areaFraction >= minAreaFraction,
                       areaFraction <= maxAreaFraction else { continue }
 
-                // BOUNDS CONFIDENCE: a region that stopped growing well inside
-                // the frame, on all four sides, has real edges. One that ran
-                // into the frame edge is a crop, and says so with less
-                // confidence rather than the same confidence.
+                // Interior stopping edges earn confidence; touching the frame edge may indicate cropping and must lower it.
                 let touchesEdge = c0 == 0 || r0 == 0 || c1 == grid.columns - 1 || r1 == grid.rows - 1
                 let contrast = min(1, backgroundDistances[index] / 0.08)
                 let boundsConfidence = (touchesEdge ? 0.45 : 0.75) + 0.2 * contrast
                 let luminance = 0.2126 * seed.x + 0.7152 * seed.y + 0.0722 * seed.z
-                // The rectangular grower deliberately owns action bounds, but
-                // it cannot distinguish a disk from a square: both occupy a
-                // near-square box. Walk the seed's connected colour component
-                // separately and retain only a conservative silhouette fact.
-                // This does not alter bounds, candidates, or motor points.
+                // Rectangular bounds cannot distinguish disks from squares; inspect the connected component for a conservative silhouette only.
                 let visualShape: String? = {
                     var queue: [(column: Int, row: Int)] = [(column, row)]
                     var cursor = 0
@@ -387,8 +329,7 @@ public enum VisionColorRegionLayer {
             }
         }
 
-        // 3. DEDUPE, largest first: a bordered field yields both the border
-        //    ring and its interior; the outer box is the control.
+        // Merge largest first so bordered fields retain their outer control bounds.
         var kept: [VisionCandidate] = []
         for candidate in raw.sorted(by: { $0.rect.area > $1.rect.area }) {
             let duplicate = kept.contains { existing in
@@ -407,8 +348,7 @@ public enum VisionColorRegionLayer {
         )
     }
 
-    /// Deterministic reading order. Two frames of the same scene must compile
-    /// to the same rows in the same order or handles are not stable.
+    /// Deterministic reading order keeps identical scenes from changing handles.
     static func readingOrder(_ candidates: [VisionCandidate]) -> [VisionCandidate] {
         VisionRect.readingOrder(candidates, rect: \.rect, tolerance: 2, geometryPrecedes: geometryPrecedes) {
             $0.rect.area == $1.rect.area ? geometryPrecedes($0, $1) : $0.rect.area > $1.rect.area

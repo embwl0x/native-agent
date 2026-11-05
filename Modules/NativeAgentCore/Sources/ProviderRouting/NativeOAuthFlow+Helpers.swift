@@ -6,7 +6,7 @@ import Darwin
 import PersistenceCore
 import NativeAgentShared
 import TurnTrace
-// Blueprint: | `NativeOAuthFlow+Helpers.swift` | PKCE and OAuthGrantOperations.post, the redirect-refusing transport for all token grants; one token-response validator for required access, optional refresh and optional positive expiry before persistence; initial native grants require refresh authority; adapters retain sessions, encoding, 20/30-second request bounds and error classification; owned sessions and device polls have elapsed resource bounds. Device authorization requires the server code lifetime and polls at its valid interval through expiry, denial or cancel |
+// Blueprint: | `NativeOAuthFlow+Helpers.swift` | redirect-refusing bounded grants; checked token replies |
 
 extension NativeOAuthFlow {
     public struct InlineSetupOutcome: Sendable {
@@ -19,9 +19,7 @@ extension NativeOAuthFlow {
         }
     }
 
-    /// A failure and its recovery in fixed words. The raw text goes to the local log
-    /// only, through the chat secret redactor with every typed value removed
-    /// too; it never reaches the card, the transcript or the agent.
+    /// Endpoint text can echo secrets: redact every typed value into local logs only, and use fixed recovery words in cards, transcripts and model results.
     public nonisolated static func inlineSetupFailureReason(
         _ raw: String, service: String, secret: String = "token", typed: [String] = [],
         otherwise: String? = nil
@@ -54,11 +52,7 @@ extension NativeOAuthFlow {
         return otherwise ?? "\(service): other error (details in the app log)."
     }
 
-    /// A pasted provider key, checked with the provider BEFORE it is saved —
-    /// Providers' own probe (`testProvider` with the draft key), so a key the
-    /// provider rejects is never written and never reads as connected. A
-    /// provider Providers has no probe for (e.g. Codex, xAI) is saved and
-    /// says so rather than claiming a check that did not happen.
+    /// Probe draft keys before saving so rejected keys cannot look connected. Routes without a probe must say their saved key remains unproven.
     @MainActor
     public static func saveInlineProviderKey(
         _ key: String, providerName name: String,
@@ -87,9 +81,7 @@ extension NativeOAuthFlow {
             return InlineSetupOutcome(error: refusal(failure, raw: probe.error ?? ""))
         }
         do {
-            // Providers' own configure call — the same one its sheet makes.
-            // `defaultModel: nil` so saving a key never silently repoints the
-            // provider at a different model.
+            // Use the provider sheet's configure owner with no model change; saving a key cannot repoint the route.
             try await configureProvider()
         } catch {
             return InlineSetupOutcome(error: inlineSetupFailureReason(
@@ -121,8 +113,7 @@ public struct PKCE {
 public enum OAuthGrantOperations {
     public static let renewalMargin: TimeInterval = 120
 
-    /// Provider answers are admitted here, never by the saved-state reader.
-    /// Keep tokens opaque and diagnostics fixed: no response values are echoed.
+    /// Provider answers are admitted here, never by the saved-state reader. Keep tokens opaque and diagnostics fixed: no response values are echoed.
     public struct TokenResponse {
         public let fields: [String: Any]
         public let accessToken: String
@@ -157,8 +148,7 @@ public enum OAuthGrantOperations {
                 return value
             }
             let access = try token(fields["access_token"])
-            // Optional JSON null carries no value, just like omission. Network
-            // metadata is not a saved credential and has no saved-file schema.
+            // Optional JSON null carries no value, just like omission. Network metadata is not a saved credential and has no saved-file schema.
             func supplied(_ key: String) -> Any? {
                 guard let value = fields[key], !(value is NSNull) else { return nil }
                 return value
@@ -197,9 +187,7 @@ public enum OAuthGrantOperations {
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// One token-endpoint exchange (a code or a refresh grant): the body
-    /// posted as a form or JSON, the JSON answer back. A refusal says only its
-    /// status: a token endpoint's body can echo a secret no pattern knows.
+    /// Token endpoints can echo unknown secrets, so refusal diagnostics expose status alone.
     public static func postToken(_ endpoint: String, _ body: [String: String], json: Bool = false, basic: Bool = false) async throws -> [String: Any] {
         let (status, answer) = try await post(endpoint, body, json: json, basic: basic)
         if status >= 400 {
@@ -212,14 +200,10 @@ public enum OAuthGrantOperations {
         return answer
     }
 
-    /// One POST to a sign-in endpoint, its status and JSON answer back
-    /// whatever the status. `basic` sends the client's id and secret as HTTP
-    /// Basic (RFC 6749 2.3.1), the secret then left out of the body. A
-    /// redirect is refused, not followed: a 307/308 would carry the body's
-    /// codes and secrets to a host the card never named.
-    /// The whole exchange has at most 20 seconds, even if bytes keep arriving;
-    /// a device poll may give it less, bounded by the code's remaining lifetime.
-    public static func post(_ endpoint: String, _ body: [String: String], json: Bool = false, basic: Bool = false, timeout: TimeInterval = 20) async throws -> (status: Int, answer: [String: Any]?) {
+    /// Refuse redirects because 307/308 can forward secrets to an unapproved host. HTTP Basic omits the client secret from the body; bound the whole
+    /// exchange, not only idle time.
+    public static func post(_ endpoint: String, _ body: [String: String], json: Bool = false, basic: Bool = false,
+        timeout: TimeInterval = 20) async throws -> (status: Int, answer: [String: Any]?) {
         guard let url = URL(string: endpoint), url.scheme == "https" else {
             throw NSError(domain: "NativeOAuthFlow", code: -2, userInfo: [NSLocalizedDescriptionKey: "The token endpoint must be an https URL."])
         }
@@ -228,8 +212,7 @@ public enum OAuthGrantOperations {
                 (try? JSONSerialization.jsonObject(with: data)) as? [String: Any])
     }
 
-    /// Shared transport for sign-in and adapter refresh. Adapters keep their
-    /// session, encoding and error classification; every grant refuses redirects.
+    /// Shared transport for sign-in and adapter refresh. Adapters keep their session, encoding and error classification; every grant refuses redirects.
     public static func post(
         _ url: URL, _ body: [String: String], json: Bool = false, basic: Bool = false,
         timeout: TimeInterval = 20, session suppliedSession: URLSession? = nil,
@@ -241,7 +224,8 @@ public enum OAuthGrantOperations {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         var body = body
         if basic, let id = body["client_id"], let secret = body.removeValue(forKey: "client_secret") {
-            let encode = { (text: String) in text.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? text }
+            let encode = { (text: String) in text.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~")))
+                ?? text }
             req.setValue("Basic " + Data("\(encode(id)):\(encode(secret))".utf8).base64EncodedString(), forHTTPHeaderField: "Authorization")
         }
         if json {
@@ -264,21 +248,18 @@ public enum OAuthGrantOperations {
         return (data, resp)
     }
 
-    /// A device sign-in's code (RFC 8628): what the person enters, where,
-    /// until when, and how often to ask whether they have.
+    /// Device authorization must retain its code lifetime and polling interval.
     public struct DeviceCode: Sendable, Equatable {
         public let deviceCode: String
         public let userCode: String
         public let verificationURI: URL
-        /// The link with the code already in it, when the service gives one.
+        /// Use the provider's complete verification link only when supplied.
         public let verificationURIComplete: URL?
         public let expiresAt: Date
         public let interval: TimeInterval
     }
 
-    /// Why a device sign-in ended without a token, in fixed words: an error
-    /// code it recognizes (RFC 8628 3.5, RFC 6749 5.2) said its own way, any
-    /// other only by its HTTP status, never the endpoint's text.
+    /// Only recognized RFC error codes or HTTP status may explain device failure; endpoint prose can echo secrets.
     public enum DeviceSignInFailure: Error, Equatable, LocalizedError {
         case expired, denied, refused(String)
         init(_ answer: [String: Any]?, status: Int) {
@@ -298,13 +279,15 @@ public enum OAuthGrantOperations {
             switch self {
             case .expired: "oauth_code_expired: The code expired before approval. Get a new code with Try again on the sign-in card."
             case .denied: "oauth_sign_in_declined: The sign-in was declined. Leave it declined; no further action is needed unless the person asks to sign in."
-            case .refused(let why): "oauth_sign_in_rejected: The service rejected sign-in: \(why). Correct the sign-in parameters in app card.request before asking the person to sign in."
+            case .refused(let why): """
+                oauth_sign_in_rejected: The service rejected sign-in: \(why). Correct the sign-in parameters in app card.request before asking the person \
+                to sign in.
+                """
             }
         }
     }
 
-    /// A device authorization endpoint's code for the person to approve
-    /// elsewhere. `client` is the client_id and any client_secret.
+    /// Device authorization data must stay bound to its client.
     public static func deviceCode(_ endpoint: String, client: [String: String], scopes: String?, basic: Bool = false) async throws -> DeviceCode {
         var form = client
         form["scope"] = scopes
@@ -326,12 +309,8 @@ public enum OAuthGrantOperations {
                           expiresAt: Date().addingTimeInterval(lifetime), interval: interval)
     }
 
-    /// Asks the token endpoint at the server's interval (5 seconds more at
-    /// each slow_down, RFC 8628 3.5; never a sleep past the code's expiry)
-    /// until the person approves (the token answer comes back), declines, or
-    /// the code expires.
-    /// A dropped connection or a 5xx while they approve is asked again at the
-    /// next interval; cancelling the task stops it.
+    /// Poll at the server interval, adding five seconds on slow_down; never sleep beyond code expiry. Retry connection loss/5xx only within that lifetime,
+    /// and honor cancellation.
     public static func deviceToken(_ code: DeviceCode, endpoint: String, client: [String: String], basic: Bool = false) async throws -> [String: Any] {
         var interval = max(code.interval, 1)
         var form = client
@@ -363,8 +342,7 @@ public enum OAuthGrantOperations {
         throw DeviceSignInFailure.expired
     }
 
-    /// A number of seconds an answer gives as a number or a string, within
-    /// what a date and a sleep hold (0 to about 68 years); invalid input is nil.
+    /// Bound supplied seconds to representable date/sleep values; invalid input stays nil.
     public static func seconds(_ raw: Any?) -> TimeInterval? {
         if let number = raw as? NSNumber {
             guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
@@ -445,8 +423,7 @@ public enum OAuthGrantOperations {
             }
         }
         let patterns: [(String, String)] = [
-            // Short bearer values and PATs, JWTs and refresh tokens are stricter
-            // OAuth-boundary additions to the shared baseline.
+            // Short bearer values and PATs, JWTs and refresh tokens are stricter OAuth-boundary additions to the shared baseline.
             ("Bearer [A-Za-z0-9._-]+",                               bearerReplacement),
             ("github_pat_[A-Za-z0-9_]{20,}",                          "github_pat_***REDACTED***"),
             ("eyJ[A-Za-z0-9._-]+\\.[A-Za-z0-9._-]+\\.[A-Za-z0-9._-]+", "***REDACTED***"),

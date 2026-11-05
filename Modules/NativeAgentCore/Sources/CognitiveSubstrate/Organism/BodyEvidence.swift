@@ -5,9 +5,8 @@ import PersistenceCore
 
 // Blueprint: | `BodyEvidence.swift` | Body evidence classes, secret-free identities and bounded freshness/uncertainty metrics |
 
-/// Secret-free evidence classes shared by the narrow body-read projections.
-/// These are correlation references only; payloads, credentials, paths, user
-/// text, and provider output never enter the body belief layer.
+/// Secret-free evidence classes shared by the narrow body-read projections. These are correlation references only; payloads, credentials, paths, user text, and
+/// provider output never enter the body belief layer.
 public enum BodyEvidenceClass: String, Codable, Sendable, Equatable, CaseIterable {
     case signedPeerContact
     case apnsAcceptance
@@ -24,15 +23,14 @@ public enum BodyEvidenceClass: String, Codable, Sendable, Equatable, CaseIterabl
     case liveToolCapability
     case approvalStore
     case processThermalState
-    /// Read only from persisted body evidence; Low Power Mode is no longer sensed.
+    /// Persisted evidence alone supports this reading.
     case lowPowerMode
 }
 
 public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let evidenceClass: BodyEvidenceClass
-    /// Source-domain time. Retained for provenance, but never used to settle
-    /// physiology. Freshness is always computed from locally received time.
+    /// Source-domain time. Retained for provenance, but never used to settle physiology. Freshness is always computed from locally received time.
     public let observedAt: Date
     public let receivedAt: Date
     public let reliability: Double
@@ -86,9 +84,7 @@ public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable 
     }
 }
 
-/// Common bounded metrics used by every typed body read. It is a projection,
-/// never a canonical evidence store. Hostile decoding is normalized, evidence
-/// is deduplicated and capped, and future local-receipt times are discarded.
+/// Typed reads are bounded projections, not evidence owners; normalize hostile decoding and reject future local receipts.
 public struct BodyBeliefMetrics: Codable, Sendable, Equatable {
     public let generatedAt: Date
     public let estimate: Double

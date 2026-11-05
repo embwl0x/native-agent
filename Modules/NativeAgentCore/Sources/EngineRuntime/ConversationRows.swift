@@ -9,20 +9,16 @@ import ApprovalInbox
 import ChatTurnRuntime
 import ApprovalTransactions
 import ChatSessionWork
-// Blueprint: | `ConversationRows.swift` | `ChatShellConversationRow`, `ChatShellEnvelope` and running-session routes project conversation identity and visible rows; `ChatShellOpeningLine` owns bounded preparation, cached revisions and `LatestRead` publication per standardized data root; classification and subtitles use that owner; human titles stay native and automated title prose is prepared by the batched presentation face; trouble derives from loaded messages |
+// Blueprint: | `ConversationRows.swift` | `ChatShellConversationRow`, `ChatShellEnvelope`, `ChatShellOpeningLine`, `LatestRead` |
 
-/// A conversation row's two lines. The list must never show a machine id: a
-/// Telegram chat id or an iOS session hash tells a person nothing, and the
-/// bridge's `[from: …]` routing prefix is plumbing, not a title.
+/// Hide machine ids and routing prefixes: they do not provide meaningful conversation titles.
 public enum ChatShellConversationRow {
     public static let bridgePrefix = BridgeRoutingPrefix.prefix
     public static let titleLimit = 30
 
-    /// True for her conversations that are not his own with her — with other
-    /// agents and with her helpers. The row's recorded kind decides their
-    /// section, using the same rule that decides his default chat.
+    /// Use recorded kind consistently for conversation grouping and the user’s default chat.
     public static func isWorking(_ session: NativeAgentShared.ChatSession) -> Bool {
-        !SessionConversation.kind(session).isHisConversation
+        !SessionConversation.kind(session).isPersonConversation
     }
 
     /// Recorded origin decides bridge routing; typed routing prefixes cannot establish provenance.
@@ -36,8 +32,7 @@ public enum ChatShellConversationRow {
 
     public static func hasBridgePrefix(_ value: String?) -> Bool {
         guard let value else { return false }
-        // Bounded: a routing group lives in the first 96 characters or nowhere,
-        // so this must not copy a whole streaming reply to find out.
+        // Bound routing-prefix inspection to 96 characters to avoid copying streaming replies.
         return BridgeRoutingPrefix.hasGroup(value)
     }
 
@@ -49,20 +44,15 @@ public enum ChatShellConversationRow {
         BridgeRoutingPrefix.stripping(text)
     }
 
-    /// The agent named by a `[from: <agent>, via bridge]` prefix, capitalized
-    /// for the small tag above the bubble. nil when there is no such prefix.
-    /// The value is length-capped and alphanumeric-only, so a hostile payload
-    /// cannot smuggle control characters into the tag.
+    /// Cap the routing tag to alphanumerics so hostile payloads cannot inject control characters.
     public static func bridgeAgentTag(_ text: String) -> String? {
-        // The group is capped at 96 characters, so the bounded head holds all
-        // of it — and the whole message is never copied to read a 24-char name.
+        // The 96-character head contains the full routing group without copying the whole message.
         let trimmed = BridgeRoutingPrefix.boundedHead(text)
         guard let group = bridgeGroup(trimmed) else { return nil }
         let close = trimmed.index(before: group.endIndex)
         let inside = trimmed[trimmed.index(trimmed.startIndex, offsetBy: bridgePrefix.count)..<close]
         let agent = inside.split(separator: ",").first.map(String.init)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        // A script is named as what it is, not as a squashed filename.
         if agent.lowercased() == "install_app.sh" { return "Install script" }
         let safe = agent.filter { $0.isLetter || $0.isNumber }
         guard !safe.isEmpty, safe.count <= 24 else { return nil }
@@ -73,7 +63,7 @@ public enum ChatShellConversationRow {
     public static func isMachineTitle(_ title: String, session: NativeAgentShared.ChatSession) -> Bool {
         let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty || value == NativeAgentShared.ChatSession.placeholderTitle { return true }
-        // Recovery names a session after the fact; it is a label, not a title.
+        // Recovery labels are not user titles.
         if value == "Recovered Chat" { return true }
         if session.source == "ios", value == "iOS chat \(session.id.prefix(8))" { return true }
         let key = (session.sourceKey ?? "").split(separator: ":")
@@ -92,25 +82,16 @@ public enum ChatShellConversationRow {
         return false
     }
 
-    /// The row's first line.
-    ///
-    /// The source, in order:
-    ///  1. The stored session title. Persistence writes it once, from the
-    ///     first user message (`shouldReplaceSessionTitle`).
-    ///  2. `openingLine` — usable user speech from ChatShellOpeningLine's scan,
-    ///     when the stored title is a machine id or placeholder.
-    ///  3. "New conversation".
-    ///
-    /// The last message is never a source. No summarizer, no model call.
+    /// Resolve titles from the stored title, then usable opening speech, then "New conversation"; never summarize the last message.
     public static func titleSource(for session: NativeAgentShared.ChatSession, openingLine: String?) -> (text: String, automated: Bool) {
         let stored=stripBridgePrefix(session.title), opening=stripBridgePrefix(openingLine ?? "")
         let candidate = !isMachineTitle(stored,session:session) ? stored : opening
         if candidate.isEmpty { return ("New conversation",false) }
         let text=candidate.trimmingCharacters(in:.whitespacesAndNewlines)
-        // Exact historical machine envelopes classify source identity. Human
-        // titles keep the native title path; editable copy cannot rename them.
+        // Recorded machine envelopes classify identity; editable titles cannot rename that source.
         let automated=text.hasPrefix("[Woken by ") || text.hasPrefix("Current standing instructions for ")
-            || text.contains(/^Codex (replied to (your message|\d+ queued messages)|(wakeup failed|turn stalled|wakeup produced no reply)( for \d+ queued messages)?)\.(\s|$)/)
+            || text.contains(
+                /^Codex (replied to (your message|\d+ queued messages)|(wakeup failed|turn stalled|wakeup produced no reply)( for \d+ queued messages)?)\.(\s|$)/)
         return automated ? (text,true) : (clamp(plainText(candidate)),false)
     }
 
@@ -118,10 +99,9 @@ public enum ChatShellConversationRow {
         plainText(stripBridgePrefix(session.lastMessagePreview ?? ""))
     }
 
-    /// The last thing said, cut at a word; empty when it repeats the title.
     public static func listPreview(for session: NativeAgentShared.ChatSession, title: String) -> String {
         let said = preview(for: session)
-        // A cut title matches on its words so far; a whole one, exactly.
+        // Compare a cut title by its words so far; compare a complete title exactly.
         let repeats = title.hasSuffix("…")
             ? title.count > 1 && said.hasPrefix(title.dropLast())
             : said == title
@@ -130,24 +110,19 @@ public enum ChatShellConversationRow {
     }
     public static let previewLimit = 26
 
-    /// Titles carry whatever the person typed, including markdown. A row is
-    /// plain text: backticks, `**bold**`, list bullets and heading hashes are
-    /// markup, not words, and reading them in a sidebar is noise.
+    /// Rows render plain words, so strip Markdown from user-supplied titles.
     public static func plainText(_ value: String) -> String {
         var text = value.replacingOccurrences(of: "\n", with: " ")
-        // A leading wrapper tag ("[Telegram voice message] …") is plumbing.
         while text.hasPrefix("["), let close = text.firstIndex(of: "]"),
               text.distance(from: text.startIndex, to: close) <= 40 {
             text = String(text[text.index(after: close)...]).trimmingCharacters(in: .whitespaces)
         }
-        // A voice turn arrives as "Transcript: …"; the word is the pipeline's.
         if let range = text.range(of: #"^\W*transcript\W*"#, options: [.regularExpression, .caseInsensitive]) {
             text = String(text[range.upperBound...]).trimmingCharacters(in: .whitespaces)
         }
         for marker in ["```", "**", "__", "~~", "`", "*"] {
             text = text.replacingOccurrences(of: marker, with: "")
         }
-        // A leading line marker only: "# Title", "> quoted", "- item".
         var trimmed = Substring(text.trimmingCharacters(in: .whitespacesAndNewlines))
         while let first = trimmed.first, first == "#" || first == ">" || first == "-" {
             trimmed = trimmed.dropFirst()
@@ -156,30 +131,25 @@ public enum ChatShellConversationRow {
         return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Where the conversation is happening, in the words a person uses.
     @MainActor
     public static func surface(for session: NativeAgentShared.ChatSession) -> String {
         if isWorking(session) { return "Connected agent" }
         switch session.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "telegram": return "Telegram"
-        case "ios", "iphone", "ipad", "mobile", "icloud": return "iPhone"
+        case "ios": return "iPhone"
         case "slack": return "Slack"
-        case "bridge", "agent_bridge", "claude", "codex": return "Connected agent"
+        case "agent-bridge": return "Connected agent"
         default: return "Mac"
         }
     }
 
-    /// Local conversations show only their age; other surfaces also name
-    /// where the conversation happened.
     public static let localSurface = "Mac"
 
-    /// Cut at a word boundary, never mid-word.
     static func clamp(_ value: String, limit: Int = titleLimit) -> String {
         let flat = value.replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard flat.count > limit else { return flat }
-        // One character past the limit tells us whether the cut already fell
-        // on a boundary; otherwise back up to the last space inside it.
+        // Inspect one extra character to preserve word boundaries when clipping.
         let window = flat.prefix(limit + 1)
         let head: Substring
         if let space = window.lastIndex(of: " ") {
@@ -192,12 +162,10 @@ public enum ChatShellConversationRow {
     }
 }
 
-/// A completion envelope: the routing slip a worker's reply arrives in
-/// ("Originating message id: …", topic, status, then "--- Claude's reply ---").
-/// The room shows the reply and folds the slip, the way tool traffic folds.
+/// Fold routing metadata separately so the room shows the worker’s reply.
 public enum ChatShellEnvelope {
     public static func isEnvelope(_ content: String, envelope: ChatMessageOriginMetadata?) -> Bool {
-        // Recorded envelopes require a built-in bridge origin; historical rows without envelopes fold on their opening.
+        // Recorded envelopes require built-in bridge provenance; rows without envelopes classify by their opening.
         if let envelope {
             guard let agent = envelope.agent, ["codex", "claude", "omp"].contains(agent),
                   envelope.surface == agent + "-bridge" else { return false }
@@ -205,10 +173,9 @@ public enum ChatShellEnvelope {
         return DelegatedReplyEnvelope(content).isHistorical
     }
 
-    /// Completion status with the slip's duration, when present.
     public static func headline(_ content: String) -> String {
         let decoded = DelegatedReplyEnvelope(content)
-        // Codex completion titles carry failure, stalls and missing replies without a status line.
+        // Completion titles may carry failure or stalls without a status line.
         if let title = decoded.codexTitle, !title.hasPrefix("codex replied to ") {
             return "The connected agent didn't finish"
         }
@@ -229,9 +196,7 @@ public enum ChatShellEnvelope {
     }
 }
 
-/// Opening words and the last turn's timestamp.
-/// ChatTranscriptCache warms each generation/count before index publication;
-/// renderers distinguish an unresolved row from an empty transcript.
+/// Warm transcript generations before index publication; unresolved rows must remain distinct from empty transcripts.
 @MainActor
 @Observable
 public final class ChatShellOpeningLine {
@@ -245,11 +210,10 @@ public final class ChatShellOpeningLine {
         return owner
     }
 
-    /// Scan by rows so large context blocks do not hide user speech; the byte
-    /// ceiling prevents reading a runaway file whole.
+    /// Scan by rows so context blocks cannot hide user speech; cap bytes to bound runaway files.
     nonisolated private static let rowBudget = 200
     nonisolated private static let byteCeiling = 1 << 20
-    /// Read granularity; a transcript row is rarely larger than this.
+    /// A row rarely exceeds this read granularity.
     nonisolated private static let chunkSize = 64 * 1024
     nonisolated private static let tailBytes = 8_192
     struct OpeningLine: Sendable, Equatable {
@@ -264,9 +228,7 @@ public final class ChatShellOpeningLine {
     private let dataRoot: URL
     private init(dataRoot: URL) { self.dataRoot = dataRoot }
 
-    /// Scan usable user speech, preferring the first line without a bridge
-    /// prefix, with the first bridge-prefixed user line as fallback.
-    /// nil when the bounded scan finds no usable user speech.
+    /// Prefer unprefixed user speech for titles; return nil when the bounded scan finds no usable speech.
     public func line(for session: NativeAgentShared.ChatSession) -> String? {
         projection(for: session).line
     }
@@ -331,8 +293,7 @@ public final class ChatShellOpeningLine {
             guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else { break }
             read += chunk.count
             buffer.append(chunk)
-            // Everything up to the last newline is whole rows; the remainder
-            // is a partial row and waits for the next chunk.
+            // Keep partial rows for the next chunk rather than decoding incomplete bytes.
             guard let lastBreak = buffer.lastIndex(of: newline) else { continue }
             let whole = buffer[..<lastBreak]
             buffer = Data(buffer[buffer.index(after: lastBreak)...])
@@ -351,13 +312,11 @@ public final class ChatShellOpeningLine {
                 }
             }
         }
-        // Only bridge-prefixed user speech was found.
         projection.line = firstBridge
         return projection
     }
 
-    /// Usable user text; other roles, empty text and bracketed pipeline notes
-    /// cannot name the conversation.
+    /// Only usable user speech can name a conversation.
     nonisolated private static func spokenLine(_ object: [String: Any]) -> String? {
         guard let content = object["content"] as? String
         else { return nil }
@@ -367,9 +326,7 @@ public final class ChatShellOpeningLine {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard role == "user" else { return nil }
-        // A row that is nothing but a bracketed pipeline note — "[The user
-        // sent an image with no caption…]" — carries no words to name a
-        // conversation with. Keep looking.
+        // Bracketed pipeline notes contain no user words to name a conversation.
         if trimmed.hasPrefix("["), trimmed.hasSuffix("]"), !trimmed.contains("\n") {
             return nil
         }
@@ -399,47 +356,33 @@ public final class ChatShellOpeningLine {
 }
 
 extension ChatShellConversationRow {
-    /// A prepared, nonempty session with a machine title and no user opening
-    /// in the bounded scan, including her morning briefs and own starts.
     @MainActor
-    public static func isHerOwn(_ session: NativeAgentShared.ChatSession, openingLines: ChatShellOpeningLine) -> Bool {
+    public static func isAgentOwn(_ session: NativeAgentShared.ChatSession, openingLines: ChatShellOpeningLine) -> Bool {
         guard openingLines.isPrepared(for: session),
               isMachineTitle(stripBridgePrefix(session.title), session: session),
               (session.messageCount ?? 0) > 0 else { return false }
         return openingLines.line(for: session) == nil
     }
 
-    /// Render the title already resolved by TranscriptsFacade.
     @MainActor
     public static func title(for session: NativeAgentShared.ChatSession) -> String {
         session.displayTitle
     }
 }
 
-/// A reachable identity for each chat session running outside the foreground.
-///
-/// Titles are attacker-influenced. A session title can be auto-derived from
-/// message content, and message content includes untrusted bridge payloads, so
-/// a title can carry newlines, control characters, bidi overrides, or
-/// unbounded length. This projection therefore hard-bounds every title before
-/// it reaches a menu: control characters removed (not replaced with something
-/// that could re-parse), collapsed to a single line, and truncated. A session
-/// with no usable title falls back to a short form of its id so the row is
-/// still selectable rather than blank.
+/// Titles can contain untrusted payloads. Bound scalars, remove controls and collapse whitespace before menus; empty titles still need selectable
+/// identity.
 public struct MacChatRunningSessionRoute: Sendable, Equatable {
     public let sessionId: String
-    /// Safe, bounded, single-line menu text. Never the raw stored title.
+    /// Never expose raw stored titles in menus.
     public let title: String
 
-    /// Total Unicode-scalar ceiling, including the truncation marker. A single
-    /// extended grapheme may contain thousands of combining scalars, so
-    /// `String.count`/`prefix` is not a data bound for attacker-influenced UI.
+    /// Bound Unicode scalars: one grapheme may contain thousands of combining marks, so `String.count` is not a data bound.
     public static let titleScalarLimit = 48
 
-    /// Maximum input scalars inspected while deriving one title.
     public static let titleInputScalarLimit = 512
 
-    /// Preserve OtherRunningChats' ordered, unique IDs while preparing safe labels.
+    /// Preserve the owner’s ordered, unique ids when deriving safe labels.
     public static func routes(sessionIds: [String], sessions: [NativeAgentShared.ChatSession]) -> [MacChatRunningSessionRoute] {
         let sessionsById = Dictionary(
             sessions.map { ($0.id, $0) },
@@ -452,12 +395,7 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
             )
         }
 
-        // Every multi-route label gets an ordinal suffix, rather than only
-        // labels that collide before suffixing. Otherwise a stored title such
-        // as `X [1:a]` can collide with the generated label for another `X`
-        // row. The ordinal is unique in this ordered projection and the suffix
-        // is never truncated, so menu and VoiceOver labels stay distinct even
-        // when titles are adversarially chosen.
+        // Suffix every multi-route label with an untruncated unique ordinal; hostile titles can otherwise collide with generated suffixes.
         guard candidates.count > 1 else { return candidates }
         return candidates.enumerated().map { offset, route in
             return MacChatRunningSessionRoute(
@@ -471,16 +409,12 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
         }
     }
 
-    /// Bound the engine's resolved display title for a single menu line.
     private static func displayTitle(session: NativeAgentShared.ChatSession?, sessionId: String) -> String {
         guard let session else { return fallbackTitle(sessionId: sessionId) }
         return sanitize(session.displayTitle) ?? ""
     }
 
-    /// Strip everything that could break out of a single menu line, collapse
-    /// whitespace, and stop after a bounded number of Unicode scalars. Removal,
-    /// not substitution — a replacement character is one more thing a spoofing
-    /// payload can lean on.
+    /// Remove controls instead of substituting characters a spoofing payload could exploit; collapse and bound the remaining text.
     private static func sanitize(_ raw: String?) -> String? {
         guard let raw else { return nil }
         var scalars: [Unicode.Scalar] = []
@@ -504,16 +438,12 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
                 pendingSpace = !scalars.isEmpty
                 continue
             }
-            // A leading combining/enclosing mark has no visible base and can
-            // produce an apparently blank or misleading menu label. Marks are
-            // retained only after a visible scalar has established a base.
+            // Require a visible base before combining marks so labels cannot appear blank or misleading.
             if scalars.isEmpty, isCombiningMark(scalar) {
                 continue
             }
             if pendingSpace {
-                // Leave room for both the collapsed space and this visible
-                // scalar. Never emit a trailing space immediately before the
-                // truncation marker.
+                // Reserve space for the collapsed space and visible scalar; never leave a trailing space before truncation.
                 guard scalars.count + 1 < titleScalarLimit else {
                     truncated = true
                     break
@@ -549,9 +479,7 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
         }
     }
 
-    /// A menu containing indistinguishable labels is technically clickable but
-    /// not navigable in practice or through VoiceOver, so multi-route menus
-    /// receive a bounded, deterministic identity suffix.
+    /// Distinct bounded identity suffixes keep multi-route menus navigable visually and through VoiceOver.
     private static func disambiguatedTitle(
         _ title: String,
         sessionId: String,
@@ -569,8 +497,7 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
         return String(String.UnicodeScalarView(baseScalars + suffixScalars))
     }
 
-    /// A short, stable stand-in that is always non-empty, so the menu row stays
-    /// clickable even for an untitled or unknown session.
+    /// Untitled or unknown sessions still need a nonempty, clickable label.
     private static func fallbackTitle(sessionId: String) -> String {
         guard let tail = safeSessionIDTail(sessionId) else { return "Untitled session" }
         return "Session " + tail
@@ -593,9 +520,9 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
 
     private static func isSafeSessionIDScalar(_ scalar: Unicode.Scalar) -> Bool {
         switch scalar.value {
-        case 48...57, 65...90, 97...122: // 0-9, A-Z, a-z
+        case 48...57, 65...90, 97...122:
             return true
-        case 45, 58, 95: // -, :, _
+        case 45, 58, 95:
             return true
         default:
             return false
@@ -603,10 +530,7 @@ public struct MacChatRunningSessionRoute: Sendable, Equatable {
     }
 }
 
-/// The banner's live-state projection. It is deliberately derived from the
-/// runtime streaming set rather than session-list membership: a turn may still
-/// be real while its index row is refreshing, and the user needs a route/Stop
-/// affordance for that adverse state instead of a silently missing banner.
+/// Derive live banners from runtime streaming, not the refreshing index, so active turns always retain route and Stop controls.
 public enum OtherRunningChats {
     public static func otherRunning(
         streamingSessionIDs: Set<String>,
@@ -631,11 +555,10 @@ public enum OtherRunningChats {
     }
 }
 
-/// Whether the room is showing trouble, and how stuck she is. Derived from the
-/// transcript that is already loaded — no counter, no new state to go stale.
+/// Derive trouble from loaded transcripts so a second counter cannot drift.
 public enum ChatShellTroubleState {
     /// Cancellation takes precedence over partial/error flags because Stop is not failure.
-    /// Persisted `mechanicalKind: systemRow` rows also count as failed turns.
+    /// Persisted `mechanicalKind: systemRow` rows also indicate failed turns.
     public static func isFailed(_ message: ChatMessage) -> Bool {
         if message.metadata?.cancelled == true { return false }
         return message.metadata?.error?.isEmpty == false
@@ -643,7 +566,7 @@ public enum ChatShellTroubleState {
             || message.metadata?.mechanicalKind == "systemRow"
     }
 
-    /// Count trailing assistant failures across user retries; a pending user turn or clean assistant reply ends the run.
+    /// A pending user turn or clean assistant reply ends the trailing-failure run.
     public static func consecutiveFailures(_ messages: [ChatMessage]) -> Int {
         var count = 0
         var sawAssistant = false
@@ -667,9 +590,7 @@ extension ChatShellConversationRow {
     @MainActor
     public static func subtitle(for session: NativeAgentShared.ChatSession, openingLines: ChatShellOpeningLine,
                                 relativeTimestamp: (String) -> String) -> String {
-        // The row's time is when someone last spoke, read from the transcript's
-        // tail; the index stamp is the fallback. A rename or a migration can
-        // touch the stamp; it cannot touch the transcript.
+        // Use transcript speech time for row age; index stamps also change on renames and migration.
         let stamp = openingLines.stamp(for: session) ?? session.updatedAt ?? session.createdAt
         let relative = relativeTimestamp(stamp)
         let place = surface(for: session)

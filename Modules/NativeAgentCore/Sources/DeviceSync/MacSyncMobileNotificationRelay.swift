@@ -4,7 +4,7 @@ import Cognition
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `MacSyncMobileNotificationRelay.swift` | Sole notifications/push_tokens.json mutation owner; reply alerts claim the shared delivery ledger before phone publication, whose checked failures preserve uncertain effects; immutable publications retain retry timestamps/content; APNs supplies only the send effect; no duplicate mobile_push/tokens.json writes |
+// Blueprint: | `MacSyncMobileNotificationRelay.swift` | Sole registration writer; immutable publication intents keyed by the canonical event |
 
 public struct MacSyncMobileNotificationRelay: Sendable {
     unowned let sync: DeviceSync
@@ -30,9 +30,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         let registrationLock = dataRoot.appendingPathComponent("notifications/push-token-registration")
         try await SwiftNativePersistenceCore.withFileLock(registrationLock) {
             var root = try readObjectStore(path)
-            // A push token is one device credential. When APNs reassigns or a
-            // restored phone presents an existing token under a new device id,
-            // retain only the newest owner in the canonical map.
+            // One token is one device credential; reassignment must leave only its newest owner.
             root = root.filter { existingDeviceID, value in
                 guard existingDeviceID != deviceId,
                       case .object(let existing) = value else { return true }
@@ -51,11 +49,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         }
     }
 
-    /// APNs answered 410 for this token: Apple last confirmed it dead at
-    /// `unregisteredAt`. Under the registration lock, remove only that alert
-    /// token (the entry's work-activity state stays), and only where it was
-    /// registered before that moment: a phone that re-registered the same
-    /// token since keeps it. A live phone re-registers on launch.
+    /// Under the registration lock, retire only alert tokens registered before Apple's 410 timestamp. Preserve newer registrations of the same token and the
+    /// entry's independent work activity.
     static func prunePushToken(_ token: String, unregisteredAt: Date, dataRoot: URL) async throws {
         let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
         @Sendable func registeredBefore(_ stamp: JSONValue?) -> Bool {
@@ -125,8 +120,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 if let startToken { registration.startToken = startToken }
                 if let observedWorkIDs {
                     for (id, outcome) in registration.startOutcomes ?? [:] where outcome == .unknown || outcome == .notObserved {
-                        // Absence on foreground is an observation, not proof of rejection.
-                        // Keep the reservation even when ActivityKit has no matching activity.
+                        // Foreground absence does not prove rejection; retain the unknown-start reservation.
                         registration.startOutcomes?[id] = observedWorkIDs.contains(id) ? .observed : .notObserved
                     }
                 }
@@ -202,8 +196,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                                 token = startToken; event = "start"
                             }
                             if event == "start" {
-                                // Reserve before the external effect. A lost response or failed
-                                // final write leaves an unknown start that must not be replayed.
+                                // Reserve before sending so lost responses or receipt failures cannot authorize a duplicate start.
                                 registration.startedIDs.insert(row.id)
                                 if registration.startOutcomes == nil { registration.startOutcomes = [:] }
                                 registration.startOutcomes?[row.id] = .unknown
@@ -222,8 +215,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                                     registration.startReservations?.removeValue(forKey: row.id)
                                 } else if failure.tokenIsInvalid {
                                     registration.activityTokens.removeValue(forKey: row.id)
-                                    // Keep the start reservation: an invalid update
-                                    // token does not authorize a duplicate start.
+                                    // An invalid update token cannot authorize a duplicate start; retain its reservation.
                                 }
                                 if event == "start" || failure.tokenIsInvalid {
                                     entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
@@ -255,10 +247,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     }
 
     @discardableResult
-    /// `predictDelivery: false` is for callers that already opened (and own the
-    /// failure side of) the delivery prediction for this same event identity —
-    /// the iCloud chat reply path does. Double-ingesting one event's start
-    /// would make one notification look like two.
+    /// Callers owning this event's prediction set predictDelivery false so a single notification cannot count twice.
     public func sendNotification(
         title: String,
         body: String,
@@ -280,10 +269,11 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             // Server acceptance is unknown: the prediction stays open, never a confirmed failure.
             throw NotificationDeliveryFailure(.unknown(sent: true, reason: unknown.localizedDescription), unknown.localizedDescription)
         } catch is CancellationError {
-            throw NotificationDeliveryFailure(.unknown(sent: true, reason: "Phone publication was cancelled; acceptance unconfirmed"), "Phone publication was cancelled; acceptance unconfirmed")
+            throw NotificationDeliveryFailure(
+                .unknown(sent: true, reason: "Phone publication was cancelled; acceptance unconfirmed"),
+                "Phone publication was cancelled; acceptance unconfirmed")
         } catch let failure as ToolFailureError where failure.effects != .none {
-            // An unreadable/conflicting retained publication can describe an
-            // earlier effect. Preserve the owner's uncertainty across this port.
+            // Unreadable or conflicting retained intent may describe an earlier effect; preserve that uncertainty.
             throw NotificationDeliveryFailure(.unknown(sent: true, reason: failure.localizedDescription), failure.localizedDescription)
         } catch {
             if predictDelivery {
@@ -293,26 +283,13 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         }
     }
 
-    /// Ordinary alerts use CloudKit's visible subscription; requested results use their
-    /// signed reader. Transport failure never selects another alert renderer.
+    /// CloudKit renders ordinary alerts; signed readers deliver results. Transport failure cannot select another renderer.
     private func sendSignedNotification(title: String, body: String, userInfo: [String: String],
                                         eventID: String) async throws -> MobileNotificationDeliveryReceipt {
-        let timestamp: Date
-        if userInfo["source"] == "requested_result" {
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            guard let createdAt = userInfo["resultCreatedAt"], let settled = formatter.date(from: createdAt) else {
-                throw NSError(domain: "RequestedResult", code: 3,
-                              userInfo: [NSLocalizedDescriptionKey: "The result has no valid settlement timestamp."])
-            }
-            timestamp = settled
-        } else {
-            timestamp = Date()
-        }
         var eventInfo = userInfo
         eventInfo["eventId"] = eventID
         let publication = try await retainPublication(
-            title: title, body: body, userInfo: eventInfo, eventID: eventID, timestamp: timestamp)
+            title: title, body: body, userInfo: eventInfo, eventID: eventID, timestamp: Date())
         // The retained intent is what goes out on every attempt, byte for byte.
         var metadata = ["kind": "notification", "title": publication.title, "body": publication.body]
         for (key, value) in publication.userInfo { metadata["userInfo.\(key)"] = value }
@@ -334,10 +311,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         let timestamp: Date
     }
 
-
-    /// The publication owns its timestamp before the first external effect.
-    /// A timeout, restart or concurrent caller must reuse exactly that intent;
-    /// missing means first publication, while unreadable bytes remain a failure.
+    /// Retain intent and time before sending; timeout, restart and concurrency must reuse them, while unreadable bytes remain failures.
     private func retainPublication(title: String, body: String, userInfo: [String: String],
                                    eventID: String, timestamp: Date) async throws -> NotificationPublication {
         let path = sync.dataRoot.appendingPathComponent("notifications/publications/\(eventID).json")
@@ -351,12 +325,13 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                     return publication
                 }
                 let publication = try JSONDecoder().decode(NotificationPublication.self, from: data)
-                // The event id already derives from the alert's identity fields; the words
-                // (and a requested result's settlement time) are what must not change.
-                guard publication.title == title, publication.body == body,
-                      userInfo["source"] != "requested_result" || publication.timestamp == timestamp else {
+                // One event keeps its exact words and route; a retry reuses the first publication's time.
+                guard publication.title == title, publication.body == body, publication.userInfo == userInfo else {
                     throw NSError(domain: "NativeAgentMobileNotify", code: 2, userInfo: [
-                        NSLocalizedDescriptionKey: "This notification event already has different retained content. Preserve its publication and repair the producer's event identity; retrying must not replace the original alert."
+                        NSLocalizedDescriptionKey: """
+                            This notification event already has different retained content. Preserve its publication and repair the producer's event \
+                            identity; retrying must not replace the original alert.
+                            """
                     ])
                 }
                 return publication
@@ -366,7 +341,10 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 effects: .unknown, owner: "phone notifications",
                 nextCall: ToolFailureError.call("app", ["page": .string("pairing")]),
                 code: "notification_publication_unavailable",
-                instruction: "Preserve the publication bytes and repair their read/write failure or the producer's conflicting event identity before retrying. An earlier attempt may already have reached the phone.",
+                instruction: """
+                    Preserve the publication bytes and repair their read/write failure or the producer's conflicting event identity before retrying. An \
+                    earlier attempt may already have reached the phone.
+                    """,
                 recovery: .repair)
         }
     }
@@ -438,51 +416,21 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             return false
         }
 
-        let ledger = NotificationDeliveryLedger(dataRoot: sync.dataRoot)
         var info = request.userInfo
         if let urgency = request.urgency { info["urgency"] = urgency }
+        info["eventId"] = request.eventID
+        guard NotificationChannelPreference.push() else { return false }
         do {
-            let occurrence = try NotificationOccurrence(eventID: request.eventID, cardID: nil,
-                title: request.title, body: request.body, reason: kind, userInfo: info,
-                importance: kind == "error" ? "adverse" : "informational", route: "phone",
-                destinations: ["phone"], honorsQuietHours: false)
-            let id = try await ledger.retain(occurrence)
-            let suppression = NotificationChannelPreference.push() ? nil : NotificationChannelPreference.pushKey
-            guard let claim = try await ledger.claim(id, destination: "phone", suppressedBy: suppression) else {
-                return try ledger.read().entries[id]?.rows["phone"]?.outcome == .delivered
-            }
-            await beginDeliveryPrediction(eventID: id, source: "icloud_chat_reply")
-            var userInfo = claim.occurrence.userInfo
-            userInfo["eventId"] = id
-            let verdict: NotificationDeliveryOutcome
-            do {
-                let receipt = try await sendNotification(title: claim.occurrence.title, body: claim.occurrence.body,
-                    userInfo: userInfo, predictDelivery: false)
-                verdict = receipt.notificationOutcome
-            } catch let failure as NotificationDeliveryFailure { verdict = failure.outcome }
-            catch { verdict = .unknown(sent: true, reason: error.localizedDescription) }
-            let failure: String? = await settle {
-                do { try await ledger.finish(claim, outcome: verdict); return nil }
-                catch { return error.localizedDescription }
-            }
-            if let failure {
-                nativeLog("[iCloudBridge] notification %@ settlement unavailable: %@", id, failure)
-                return false
-            }
-            if case .notDelivered(let reason) = verdict {
-                nativeLog("[iCloudBridge] notification %@ not delivered: %@", id, reason)
-                await failDeliveryPrediction(eventID: id, source: "icloud_chat_reply")
-            }
-            return try ledger.read().entries[id]?.rows["phone"]?.outcome == .delivered
+            // A reply's identity is its request's event: the retained publication and the phone's receipt keep it on repeat.
+            let receipt = try await sendNotification(title: request.title, body: request.body, userInfo: info)
+            return receipt.notificationOutcome == .delivered
         } catch {
             nativeLog("[iCloudBridge] chat reply notification remains owed correlation=%@: %@", correlationID, error.localizedDescription)
             return false
         }
     }
 
-    /// Builds the exact provider payload used by `sendICloudReplyPushNotification`.
-    /// A missing correlation/kind is not allowed to collapse unrelated replies
-    /// into one notification identity, and blank text never starts a prediction.
+    /// Correlation and kind must bind reply identity; blank text cannot start a prediction.
     static func iCloudReplyPushNotificationRequest(
         text: String,
         sessionID: String?,
@@ -502,9 +450,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             "source": "icloud_chat_reply",
             "correlationId": cleanCorrelationID,
             "kind": cleanKind,
-            // `NativeAgentDeviceEventIdentity` recognizes `dedupKey`; without
-            // it reply pushes fell through to a fresh UUID each time and APNS
-            // could not collapse retry/duplicate delivery attempts.
+            // dedupKey binds retry attempts to one event so APNs can collapse duplicates.
             "dedupKey": "icloud_chat_reply:\(cleanCorrelationID):\(cleanKind)",
         ]
         if let sessionID,
@@ -524,9 +470,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
 
 }
 
-/// The bounded, redacted notification request that crosses from an iCloud chat
-/// reply into the APNS provider boundary. Provider acceptance is deliberately
-/// not a claim that an iPhone displayed the notification.
+/// Only bounded, redacted reply requests cross the provider boundary; acceptance cannot prove phone display.
 struct ICloudReplyPushNotificationRequest: Sendable, Equatable {
     let title: String
     let body: String

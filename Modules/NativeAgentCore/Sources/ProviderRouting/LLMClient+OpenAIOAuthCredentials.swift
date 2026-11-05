@@ -2,23 +2,18 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `LLMClient+OpenAIOAuthCredentials.swift` | `ChatGPTTransport.preferredAuthPath`: the single ChatGPT/Codex credential-path resolver for readiness, all adapters, maintenance, child execution and explicit CLI inspection; selection preserves present unreadable credentials for the checked reader; app-owned writes and root-consented CLI adoption share this owner; child homes derive from an already-selected credential; hasAccessToken is a checked token-presence read, not execution readiness |
+// Blueprint: | `LLMClient+OpenAIOAuthCredentials.swift` | `ChatGPTTransport.preferredAuthPath`: one pinned credential source |
 
 extension ChatGPTTransport {
-    /// Inspection of the independently signed-in Codex program is distinct
-    /// from permission for NativeAgent providers to use that account.
+    /// Inspection of the independently signed-in Codex program is distinct from permission for NativeAgent providers to use that account.
     public enum AuthPathSource {
         case runtime
         case sharedCLI
         case commandCLI
     }
 
-    /// The only ChatGPT/Codex credential-path resolver, shared by readiness,
-    /// adapters and child processes. The default root honors process overrides;
-    /// alternate roots use their own sign-in or explicitly adopted CLI session.
-    /// Writes pass `allowSharedFallbacks: false`; CLI inspection is explicit and
-    /// never grants provider execution permission. A selected path is pinned
-    /// through execution/refresh, including an explicit injected path.
+    /// One resolver pins credentials through execution and refresh. App writes stay app-owned; shared CLI adoption requires consent and CLI inspection
+    /// grants no execution authority.
     public static func preferredAuthPath(
         dataRoot: URL? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -60,13 +55,11 @@ extension ChatGPTTransport {
     private static func credentialFileExists(at url: URL) -> Bool {
         var info = stat()
         if lstat(url.path, &info) == 0 { return true }
-        // Only an absent path admits discovery/adoption. Inaccessible paths
-        // and dangling credential symlinks must reach the checked reader.
+        // Only an absent path admits discovery/adoption. Inaccessible paths and dangling credential symlinks must reach the checked reader.
         return errno != ENOENT
     }
 
-    /// Checked token presence, not path selection or execution readiness.
-    /// An absent access token (including CLI API-key mode) is false;
+    /// Checked token presence, not path selection or execution readiness. An absent access token (including CLI API-key mode) is false;
     /// malformed/unreadable saved bytes throw.
     public static func hasAccessToken(at url: URL) throws -> Bool {
         try storedAccessToken(at: url) != nil
@@ -77,8 +70,7 @@ extension ChatGPTTransport {
             .appendingPathComponent(".codex", isDirectory: true)
     }
 
-    /// Shared CLI credentials stay read-only, including explicit overrides
-    /// and app-owned paths that resolve through a symlink into ~/.codex.
+    /// Shared CLI credentials stay read-only, including explicit overrides and app-owned paths that resolve through a symlink into ~/.codex.
     static func isUserCodexPath(_ path: URL) -> Bool {
         let home = defaultUserCodexHome()
         return NativeAgentWorkspaceRoot.relativePath(path.standardizedFileURL.path, under: home.standardizedFileURL.path) != nil
@@ -88,16 +80,13 @@ extension ChatGPTTransport {
 
     // MARK: - Shared CLI session adoption consent
 
-    /// Whether the user has decided about adopting the shared Codex CLI
-    /// session (`~/.codex/auth.json`) as the app's ChatGPT sign-in.
+    /// Adoption consent is independent of the shared CLI session's presence.
     public enum CLISessionAdoptionConsent: String {
         case allowed
         case declined
     }
 
-    /// Checked authority read. Compatibility callers may still ask only for
-    /// the decision, but UI/repair paths must preserve the distinction between
-    /// a genuinely missing record and existing bytes that cannot be trusted.
+    /// Checked reads distinguish absent consent from damaged authority so repair/UI cannot treat corruption as a decision.
     public enum CLISessionAdoptionConsentState: Equatable, Sendable {
         case missing
         case allowed
@@ -113,19 +102,13 @@ extension ChatGPTTransport {
         }
     }
 
-    /// Consent record path: `<dataRoot>/providers/cli_session_adoption.json`.
     public static func cliAdoptionConsentPath(dataRoot: URL? = nil) -> URL {
         (dataRoot ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("cli_session_adoption.json")
     }
 
-    /// Read the recorded decision. Missing file means NO decision — the
-    /// shared CLI candidate stays out of auth resolution until the user
-    /// explicitly allows it (0.3.8 lesson: a fresh install silently adopting
-    /// the machine's CLI session looked signed-in with nobody having
-    /// consented). Unreadable or malformed existing state is treated as
-    /// no-consent and is never rewritten.
+    /// Only explicit consent admits the shared CLI session. Missing or unreadable consent grants nothing; damaged bytes stay untouched.
     public static func cliAdoptionConsent(dataRoot: URL? = nil) -> CLISessionAdoptionConsent? {
         cliAdoptionConsentState(dataRoot: dataRoot).decision
     }
@@ -177,9 +160,7 @@ extension ChatGPTTransport {
         try data.write(to: path, options: [.atomic])
     }
 
-    /// Explicit repair for corrupt authority. The exact bytes are copied and
-    /// read back before the authoritative path is removed. The next read is
-    /// therefore genuinely `.missing`; no decision is invented by repair.
+    /// Verify a byte-preserved backup before removing corrupt authority so repair invents no decision.
     @discardableResult
     public static func backupAndResetCorruptCLIAdoptionConsent(
         dataRoot: URL? = nil
@@ -208,8 +189,7 @@ extension ChatGPTTransport {
         return backup
     }
 
-    /// Load only this selected credential. Confirmed absence is nil;
-    /// present unreadable or invalid bytes retain the owning read failure.
+    /// Load only this selected credential. Confirmed absence is nil; present unreadable or invalid bytes retain the owning read failure.
     func loadAuthBlob() throws -> [String: Any]? {
         try Self.loadAuthBlob(at: resolveAuthPath())
     }
@@ -222,8 +202,7 @@ extension ChatGPTTransport {
                 throw CocoaError(.fileReadCorruptFile)
             }
             try ProviderStateValidation.credential(object)
-            // Codex also writes API-key sessions with no ChatGPT token set.
-            // Valid metadata without access_token is absence, not corruption.
+            // Codex also writes API-key sessions with no ChatGPT token set. Valid metadata without access_token is absence, not corruption.
             if let tokens = object["tokens"] as? [String: Any],
                let access = tokens["access_token"] as? String,
                access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -245,8 +224,7 @@ extension ChatGPTTransport {
         return access
     }
 
-    /// Atomic writer for the flock-guarded refresh path, whose closure
-    /// captures only `Data`/`URL`.
+    /// Atomic writer for the flock-guarded refresh path, whose closure captures only `Data`/`URL`.
     static func writeAuthBytesAtomically(_ data: Data, to path: URL) throws {
         guard !isUserCodexPath(path) else {
             throw LLMError.failure(.codexCLISessionExpired)
@@ -260,20 +238,17 @@ extension ChatGPTTransport {
 
     /// App-authenticated Codex children use an access-only CODEX_HOME so the app owns token refresh.
     public static func codexChildHome(dataRoot: URL) -> URL {
-        // Credential/session copy: excluded from backup/export/phone sync;
-        // PrivacyMap: codex_child_home. Codex owns its internal file schemas.
+        // Exclude child credentials from backup, export and phone sync; PrivacyMap: codex_child_home. The CLI owns its file schemas.
         dataRoot.standardizedFileURL.appendingPathComponent("codex_child_home", isDirectory: true)
     }
 
-    /// Derive the child home from ONE already-resolved credential. Missing
-    /// credentials fail at execution; they never remove CODEX_HOME and let the
-    /// CLI choose a different account.
+    /// Derive the child home from ONE already-resolved credential. Missing credentials fail at execution; they never remove CODEX_HOME and let the CLI
+    /// choose a different account.
     public static func codexHomeForChild(authPath: URL) -> URL {
         codexChildHome(mirroring: authPath) ?? authPath.deletingLastPathComponent()
     }
 
-    /// The child home that mirrors `authPath`, or nil when `authPath` is not an
-    /// app-owned `<root>/codex_home/auth.json`.
+    /// Only app-owned credentials may have a mirrored child home.
     public static func codexChildHome(mirroring authPath: URL) -> URL? {
         let home = authPath.standardizedFileURL.deletingLastPathComponent()
         guard authPath.lastPathComponent == "auth.json",
@@ -282,9 +257,8 @@ extension ChatGPTTransport {
         return codexChildHome(dataRoot: home.deletingLastPathComponent())
     }
 
-    /// `<home>/auth.json` once its real path is proven to sit directly in the
-    /// data root, apart from `codex_home` and ~/.codex. A symlinked child home
-    /// or auth.json pointing anywhere else is refused, never followed.
+    /// `<home>/auth.json` once its real path is proven to sit directly in the data root, apart from `codex_home` and ~/.codex. A symlinked child home or
+    /// auth.json pointing anywhere else is refused, never followed.
     private static func checkedCodexChildAuthPath(home: URL) throws -> URL {
         let root = home.standardizedFileURL.deletingLastPathComponent()
         let realRoot = root.resolvingSymlinksInPath().standardizedFileURL
@@ -302,9 +276,7 @@ extension ChatGPTTransport {
         return auth
     }
 
-    /// Write the child copy of the credential bytes just written to `authPath`:
-    /// the same tokens with an empty refresh token. Caller holds `authPath`'s
-    /// `CredentialFileLock`.
+    /// Caller holds the credential lock; child copies omit refresh authority.
     static func writeCodexChildCopy(_ bytes: Data, of authPath: URL) throws {
         guard let home = codexChildHome(mirroring: authPath) else { return }
         guard let blob = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
@@ -327,8 +299,7 @@ extension ChatGPTTransport {
         )
     }
 
-    /// Bring the child copy in line with the app credential at `authPath`, or
-    /// remove it when the app is signed out.
+    /// Child credentials must track app rotation and sign-out.
     static func syncCodexChildCopy(from authPath: URL) throws {
         guard let home = codexChildHome(mirroring: authPath) else { return }
         try CredentialFileLock.withLock(authPath) {
@@ -343,10 +314,7 @@ extension ChatGPTTransport {
         }
     }
 
-    /// Read a persisted `expires_at` from the auth blob. Looks at both
-    /// the top level (where some flows write) and `tokens.expires_at`
-    /// (where others write). Accepts ISO basic / ISO with fractional / or
-    /// numeric (seconds-from-epoch). Returns nil if absent or unparseable.
+    /// Flows persist expiry at the top level or under tokens; both ISO and numeric forms are current inputs. Unknown expiry stays nil.
     static func persistedExpiresAt(blob: [String: Any], tokens: [String: Any]) -> Int? {
         let raw: Any? = blob["expires_at"] ?? tokens["expires_at"]
         guard let raw = raw else { return nil }
@@ -357,7 +325,6 @@ extension ChatGPTTransport {
         return Int(exactly: expiry.timeIntervalSince1970.rounded(.towardZero))
     }
 
-    /// Read `exp` claim from a JWT payload. Returns nil when missing.
     static func tokenExpiresAt(_ token: String) -> Int? {
         guard let payload = jwtPayload(token, omittingEmptySubsequences: false) else { return nil }
         if let exp = payload["exp"] as? Int { return exp }
@@ -365,7 +332,6 @@ extension ChatGPTTransport {
         return nil
     }
 
-    /// Extract chatgpt_account_id from the JWT's https://api.openai.com/auth claim.
     static func extractAccountIDFromJWT(_ token: String) -> String? {
         guard let payload = jwtPayload(token, omittingEmptySubsequences: false) else { return nil }
         guard let authClaim = payload["https://api.openai.com/auth"] as? [String: Any] else {

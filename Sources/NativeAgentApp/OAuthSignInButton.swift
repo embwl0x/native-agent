@@ -1,16 +1,11 @@
 import ProviderRouting
 
-// Blueprint: | `OAuthSignInButton.swift` | `OAuthSignInButton` and presenter: in-process sign-in/sign-out, CLI session consent and current credential-state presentation |
-// NativeOAuthFlow owns browser authorization and persisted credentials.
+// Blueprint: | `OAuthSignInButton.swift` | `OAuthSignInButton`: sign-in, CLI consent and persisted credential presentation |
 
 import SwiftUI
 import AuthenticationServices
 import PersistenceCore
 
-/// Drop into Settings, onboarding, or anywhere else.
-/// Examples:
-///   OAuthSignInButton(provider: .chatgpt)
-///   OAuthSignInButton(provider: .anthropic)
 struct OAuthSignInButton: View {
     let provider: OAuthProvider
     @Environment(AppModel.self) private var appModel
@@ -47,9 +42,7 @@ struct OAuthSignInButton: View {
                             .font(ShellType.label)
                     }
                 }
-                // House rule 1 — one accent, one job. A brand fill per provider
-                // is a second, third and fourth accent on one page, so the
-                // sign-in control is a plain bordered button like every other.
+                // Per-provider fills would compete with the page's single accent.
                 .buttonStyle(.bordered)
                 .disabled(buttonControl.isDisabled || flowTask != nil)
 
@@ -150,7 +143,10 @@ struct OAuthSignInButton: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("NativeAgent will preserve the unreadable bytes in a backup, then reset only this consent decision. It will not change or delete your Codex CLI sign-in.")
+            Text("""
+                NativeAgent will preserve the unreadable bytes in a backup, then reset only this consent decision. It will not change \
+                or delete your Codex CLI sign-in.
+                """)
         }
     }
 
@@ -167,7 +163,6 @@ struct OAuthSignInButton: View {
     private func runFlow() async {
         // Keep the task owned until cancellation has torn down the old flow.
         defer { flowTask = nil }
-        // ChatGPT uses the direct in-process browser OAuth, like Anthropic/Grok.
         lastError = nil
         print("[oauth-signin] starting native flow for \(provider.id)")
 
@@ -201,9 +196,7 @@ struct OAuthSignInButton: View {
         await appModel.loadProvidersForChat()
     }
 
-    /// User accepted the "use your existing Codex CLI sign-in" offer: record
-    /// consent, then re-resolve — the shared session becomes a candidate and
-    /// the badge labels it as an adopted CLI session.
+    /// Persist consent before the shared CLI session can become a candidate.
     @MainActor
     private func acceptCLISessionOffer() async {
         lastError = nil
@@ -232,11 +225,10 @@ struct OAuthSignInButton: View {
 
 // MARK: - Provider catalog
 
-/// Identity for each OAuth provider exposed in NativeAgent. No brand colour:
-/// the sign-in control is bordered, so a per-provider tint has nowhere to go.
+/// Bordered controls keep provider branding from introducing competing accents.
 struct OAuthProvider {
-    let id: String                  // provider_id
-    let displayShort: String        // "ChatGPT", "Claude" — used in button label
+    let id: String
+    let displayShort: String
     let iconSystemName: String
 
     static let chatgpt = OAuthProvider(
@@ -285,9 +277,7 @@ final class OAuthSignInPresenter: NSObject, ASWebAuthenticationPresentationConte
     }
 }
 
-/// The persisted-credential outcome shown by every OAuth sign-in control.
-/// It is intentionally derived from the same root-aware read as the runtime,
-/// rather than from a mounted SwiftUI control or an optimistic write result.
+/// Read persisted root-scoped credentials so mounted controls cannot claim optimistic success.
 enum OAuthSignInPresentation {
     enum State: Equatable {
         case idle

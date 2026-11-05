@@ -2,10 +2,9 @@ import Darwin
 import Dispatch
 import Foundation
 
-// Blueprint: | `FileChangeWatcher.swift` | `FileChangeWatcher`: independent subscription identity and cancellation; registry `Entry` owns one path's shared vnode, ancestor observation and replacement rearming with serialized teardown |
+// Blueprint: | `FileChangeWatcher.swift` | `FileChangeWatcher`, `Entry`; Shared vnode, independent cancellation. |
 
-/// Cancellation can arrive during a read; notification tokens retire once
-/// without sharing their non-Sendable storage with the reader task.
+/// Cancellation can arrive during a read; notification tokens retire once without sharing their non-Sendable storage with the reader task.
 package final class ObservationNotifications: @unchecked Sendable {
     private let lock = NSLock()
     private let center: NotificationCenter
@@ -152,8 +151,7 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
                 install(fd: fd, directory: false, mask: [.write, .extend, .rename, .delete, .revoke, .attrib, .link])
                 return
             }
-            // Existing targets that cannot be opened (such as sockets) stay
-            // directory-watched; only a missing target triggers recursive arming.
+            // Existing targets that cannot be opened (such as sockets) stay directory-watched; only a missing target triggers recursive arming.
             let missing = errno == ENOENT
             var parent = path.deletingLastPathComponent()
             var child = path
@@ -183,8 +181,7 @@ private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
                 guard let self, let source, !self.isStopped else { return }
                 let event = source.data
                 if directory {
-                    // Move to the nearest existing ancestor or the target;
-                    // arm the new inode before delivering its creation edge.
+                    // Move to the nearest existing ancestor or the target; arm the new inode before delivering its creation edge.
                     self.arm()
                     if FileManager.default.fileExists(atPath: self.path.path) {
                         self.registry?.publish(path: self.path, flags: .write)

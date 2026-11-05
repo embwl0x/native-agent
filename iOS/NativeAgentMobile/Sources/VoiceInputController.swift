@@ -1,5 +1,3 @@
-// VoiceInputController.swift — voice input for NativeAgent iOS
-// One capture owner for tap dictation and held voice notes.
 import Foundation
 import Observation
 import UIKit
@@ -7,7 +5,7 @@ import Speech
 import AVFoundation
 import os
 import NativeAgentShared
-// Blueprint: | `VoiceInputController.swift` | Session-bound microphone capture and bounded recognition finalization through the on-device SpeechAnalyzer; unsupported devices/locales report their blocker |
+// Blueprint: | `VoiceInputController.swift` | Session-bound capture and bounded on-device recognition; unsupported devices/locales name blockers |
 
 enum VoiceInputAuthorizationPresentation {
     static func speechFailureMessage(
@@ -33,8 +31,8 @@ enum VoiceInputAuthorizationPresentation {
 final class VoiceInputController {
     var isListening = false
     var isStarting = false
-    var transcript = ""         // live partial transcript
-    var lastFinalTranscript = "" // populated when user releases
+    var transcript = ""
+    var lastFinalTranscript = ""
     var error: String?
     var statusText: String?
     var hasReceivedAudio = false
@@ -42,7 +40,6 @@ final class VoiceInputController {
     var isVoiceNote = false
     var isLocked = false
     var startedAt: Date?
-    /// Recent mic loudness, 0...1, oldest first; only the composer's waveform reads it.
     var levels: [Float] = []
 
     @ObservationIgnored private var audioToken: UUID?
@@ -66,7 +63,6 @@ final class VoiceInputController {
         self.requestMicrophoneAuthorization = requestMicrophoneAuthorization
         Haptics.isRecording = { [weak self] in self?.isListening == true }
 
-        // Stop cleanly when the app backgrounds (e.g. home-button press mid-hold)
         NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil,
@@ -88,8 +84,7 @@ final class VoiceInputController {
     func start(voiceNote: Bool = false, names: [String] = []) async {
         guard !TalkModeController.shared.isPresented else { return }
         guard !Task.isCancelled, !isStarting, !waitingForFinalAfterStop else { return }
-        // If already listening, cancel the previous session first so we never
-        // leak the audio engine across multiple rapid presses.
+        // Cancel prior capture before starting so rapid presses cannot leak audio engines.
         finalResultTimeout?.cancel()
         finalResultTimeout = nil
         if hasRecognitionTask { teardownAudio(cancelTask: true) }
@@ -122,7 +117,6 @@ final class VoiceInputController {
             }
         }
 
-        // 1. Speech recognition auth
         let speechStatus = await requestSpeechAuthorization()
         guard desiredListening, generation == startGeneration else { return }
         guard speechStatus == .authorized else {
@@ -132,7 +126,7 @@ final class VoiceInputController {
             return
         }
 
-        // 2. Microphone authorization is separate from speech recognition.
+        // Microphone and speech recognition require independent authorization.
         statusText = "Requesting microphone permission..."
         let micGranted = await requestMicrophoneAuthorization()
         guard desiredListening, generation == startGeneration else { return }
@@ -195,7 +189,7 @@ final class VoiceInputController {
         }
         hasRecognitionTask = true
 
-        // 6. Start engine after the recognition task is ready to consume buffers.
+        // Start capture only after recognition is ready to consume its buffers.
         do {
             try await MobileDictation.shared.startInput(token: token)
             hasStartedAudioSession = true
@@ -225,14 +219,14 @@ final class VoiceInputController {
         statusText = hasReceivedAudio && transcript.isEmpty ? "Hearing you..." : "Listening..."
     }
 
-    /// Speech sits roughly between -50 and -10 dBFS; map that span onto 0...1.
+    /// Map roughly -50 through -10 dBFS to 0...1 because that span covers speech levels.
     private func pushLevel(_ rms: Float) {
         let decibels = 20 * log10(max(rms, 0.000_01))
         levels.append(min(1, max(0, (decibels + 50) / 40)))
         if levels.count > 96 { levels.removeFirst(levels.count - 96) }
     }
 
-    /// End audio on touch-up, then allow recognition to finalize before publishing.
+    /// End audio on touch-up but publish only after bounded recognition finalization.
     func stop() {
         guard !waitingForFinalAfterStop else { return }
         let hadRecordingSession = isListening || hasStartedAudioSession
@@ -291,7 +285,7 @@ final class VoiceInputController {
             teardownAudio(cancelTask: true)
             return
         }
-        // Only the words travel (User 10-31): no audio file to export or upload.
+        // Only recognized words travel; never export or upload the captured audio.
         lastFinalTranscript = utterance.text
         waitingForFinalAfterStop = false
         teardownAudio(cancelTask: true)
@@ -319,8 +313,7 @@ final class VoiceInputController {
         UIApplication.shared.open(url)
     }
 
-    /// iOS answers on its own queue; a callback written inside main-actor code
-    /// would be checked onto the main actor and trap there (talk mode 10-31).
+    /// iOS calls back on its own queue; defining this callback inside MainActor would trigger an isolation trap.
     nonisolated static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
         await withCheckedContinuation { cont in
             SFSpeechRecognizer.requestAuthorization { status in
@@ -341,9 +334,7 @@ actor MobileDictation {
     private var tapInstalled = false
     private var modern: MobileSpeechAnalyzer?
 
-    /// Release the ordinary mic/read-aloud route before the call takes it.
-    /// Pending output cleanup then sees no matching token and cannot close
-    /// the call's audio session after its asynchronous preparation.
+    /// Release ordinary audio ownership before Talk prepares so pending cleanup cannot close the new call session.
     func prepareForTalk() async throws {
         if let inputToken { try await stopInput(token: inputToken, cancelTask: true) }
         if routeToken != nil {
@@ -373,7 +364,10 @@ actor MobileDictation {
         let locale = await MobileSpeechAnalyzer.supportedLocale()
         guard inputToken == token, !Task.isCancelled else { throw CancellationError() }
         guard let locale else {
-            return "On-device speech recognition does not support this device or language. Choose a supported iPhone language in Settings before trying voice input again."
+            return """
+                On-device speech recognition does not support this device or language. Choose a supported iPhone language in Settings before trying voice \
+                input again.
+                """
         }
         let modern = try await MobileSpeechAnalyzer(locale: locale, sourceFormat: format, names: names)
         guard inputToken == token, !Task.isCancelled else { await modern.cancel(); throw CancellationError() }

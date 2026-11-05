@@ -1,10 +1,9 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ContextProjectionSources.swift` | `ContextCompiledProjectionProvider`: incremental rebuildable source projections, generation-bound exclusions and delivery/publication hooks; compiled projections carry unavailable-source reasons and opt-in checked unchanged sources for health recovery |
+// Blueprint: | `ContextProjectionSources.swift` | `ContextCompiledProjectionProvider`: derived sources, exclusions and checked publication |
 
-/// The chosen atoms a provider drops, and the degraded-source receipts for
-/// what it could not verify (dropped too).
+/// Drop unverifiable atoms with degraded-source receipts.
 public struct ContextTurnExclusion: Sendable {
     public var atomIDs: Set<ContextAtomID>
     public var unverified: [ContextDegradedSourceNotice]
@@ -15,11 +14,9 @@ public struct ContextTurnExclusion: Sendable {
     }
 }
 
-/// Hash changes and retirements from one owner's current source inventory.
 public struct ContextCompiledProjectionResult: Sendable, Equatable {
     public let changedSources: [ContextCompiledSource]
     public let removedSourceIDs: Set<ContextSourceID>
-    /// Checked reads, including unchanged sources, and failures beside retained inputs.
     public let verifiedSources: [ContextCompiledSource]
     public let sourceFailures: [ContextSourceID: String]
     public init(
@@ -54,31 +51,22 @@ public struct ContextCompiledProjectionResult: Sendable, Equatable {
     }
 }
 
-/// A rebuildable projection whose output is already compiled for ContextStore.
-/// The provider owns source discovery and validation but does not publish or
-/// mutate either its source of truth or the Context generation store.
+/// Providers discover and validate derived inputs without mutating canonical sources or publishing Context generations.
 public protocol ContextCompiledProjectionProvider: Sendable {
-    /// Stable process-local identity used to coalesce and selectively rebuild
-    /// this projection. It names derived work only; canonical authority remains
-    /// with the provider's source stores.
+    /// Process-local identity coalesces derived work only; canonical authority stays with source stores.
     var projectionIdentifier: String { get }
 
-    /// Canonical invalidation namespaces that require this projection to be
-    /// rebuilt. Each provider declares its current contract explicitly.
+    /// Each provider explicitly declares which canonical invalidations require rebuilding.
     var invalidationNamespaces: Set<String> { get }
 
-    /// Exact canonical file whose changes this projection consumes. A staged
-    /// candidate under another root is not a mutation of the live source.
-    /// Nil explicitly declares a namespace-wide, non-file source.
+    /// Exact canonical file whose changes this projection consumes. A staged candidate under another root is not a mutation of the live source. Nil explicitly
+    /// declares a namespace-wide, non-file source.
     var invalidationSourceURL: URL? { get }
 
     /// Point-of-use policy exclusions, including sources in retained generations.
     var excludedSourceOwners: Set<String> { get }
 
-    /// Checked when the turn's atoms are chosen, and again at expansion: the
-    /// provider drops any chosen atom its owner no longer stands behind
-    /// (aged out, retired, changed, or not disclosed on this surface), naming
-    /// what it could not verify. Rebuilds only refresh what is published.
+    /// Check chosen atoms at selection and expansion against their canonical owner; name unverifiable content rather than trusting a retained generation.
     func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
                 surface: ContextSurface) async -> ContextTurnExclusion
     func didDeliver(_ items: [ContextPacketItem]) async
@@ -89,7 +77,7 @@ public protocol ContextCompiledProjectionProvider: Sendable {
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult
 
-    /// Synchronous acceptance of the published generation after arena publication.
+    /// Accept the generation synchronously only after arena publication.
     func didPublish(generation: ContextStoredGeneration)
 }
 

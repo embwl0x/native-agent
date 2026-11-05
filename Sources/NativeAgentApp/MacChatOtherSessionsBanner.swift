@@ -4,7 +4,6 @@ import SwiftUI
 
 // Blueprint: | `MacChatOtherSessionsBanner.swift` | `MacChatOtherSessionsBanner`: navigation and stop controls directly over the other running sessions |
 
-/// Every nonempty list offers navigation to its running work and a stop control.
 struct MacChatOtherSessionsBanner: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 

@@ -3,10 +3,10 @@ import NativeAgentShared
 import MacControl
 import SQLite3
 import PersistenceCore
-// Blueprint: | `MacAppleScriptBridge+MailIndex.swift` | `MacAppleScriptBridge`: read-only Envelope Index queries, one checked account-header decoder shared by sender counts and mailbox pages, explicit complete/partial account coverage, failed uncovered pages and sender formatting |
+// Blueprint: | `MacAppleScriptBridge+MailIndex.swift` | `MacAppleScriptBridge`: account coverage and read-only mailbox pages |
 
 extension MacAppleScriptBridge {
-    static func mailIndexDatabase() -> OpaquePointer? {
+    static func mailIndexDatabase(context: MacOperationContext) -> OpaquePointer? {
         let library = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mail")
         let version = ((try? FileManager.default.contentsOfDirectory(atPath: library.path)) ?? [])
             .compactMap { $0.hasPrefix("V") ? Int($0.dropFirst()) : nil }.max()
@@ -17,20 +17,21 @@ extension MacAppleScriptBridge {
             if let database { sqlite3_close(database) }
             return nil
         }
-        if let database { sqlite3_busy_timeout(database, 500); FoldedText.register(database) }
+        if let database { sqlite3_busy_timeout(database, 500); FoldedText.register(database, context: context) }
         return database
     }
 
-    public static func mailSenders(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func mailSenders(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         let scope = input["scope"] ?? .string("inbox")
         guard scope == .string("inbox") || scope == .string("all"),
               input["unread_only"] == nil || input["unread_only"] == .bool(true) || input["unread_only"] == .bool(false) else {
             return failedEnvelope(integration: "mail", reason: "invalid_mail_filter")
         }
         do {
-            let header = scope == .string("inbox") ? try await runAppleScript(mailWorkspaceScript(input: [:]), bundleID: "com.apple.mail") : ""
+            let header = scope == .string("inbox") ? try await runAppleScript(mailWorkspaceScript(input: [:]), bundleID: "com.apple.mail", context: context)
+                : ""
             if let setup = readSetupEnvelope(raw: header, integration: "mail") { return setup }
-            let task = Task.detached(priority: .utility) { mailIndexSenders(header: header, input: input) }
+            let task = Task.detached(priority: .utility) { mailIndexSenders(header: header, input: input, context: context) }
             let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
             try Task.checkCancellation()
             return result
@@ -51,7 +52,10 @@ extension MacAppleScriptBridge {
                   let inbox = decodeConversationTransport(fields[3]) else {
                 throw NSError(domain: "NativeAgentMailTransport", code: -1, userInfo: [
                     "state": "malformed_mail_account_header",
-                    NSLocalizedDescriptionKey: "Mail returned an invalid account/mailbox record at line \(index + 1). Repair the mailbox transport before reading it again; no coverage was inferred.",
+                    NSLocalizedDescriptionKey: """
+                        Mail returned an invalid account/mailbox record at line \(index + 1). Repair the mailbox transport before reading it again; no \
+                        coverage was inferred.
+                        """,
                 ])
             }
             return (name, id, inbox)
@@ -84,7 +88,7 @@ extension MacAppleScriptBridge {
         return (filter, nil)
     }
 
-    static func mailIndexSenders(header: String, input: [String: JSONValue]) -> JSONValue {
+    static func mailIndexSenders(header: String, input: [String: JSONValue], context: MacOperationContext) -> JSONValue {
         let scope = input["scope"]?.scalarText ?? "inbox"
         let accounts: [(name: String, id: String, inbox: String)]
         do { accounts = scope == "inbox" ? try mailIndexAccounts(header) : [] }
@@ -93,7 +97,7 @@ extension MacAppleScriptBridge {
             return failedEnvelope(integration: "mail", reason: "inbox_coverage_unavailable",
                 message: "Mail returned no inbox account mailboxes. Sender coverage could not be established; no empty sender list was inferred.")
         }
-        guard let database = mailIndexDatabase() else { return failedEnvelope(integration: "mail", reason: "mail_index_unavailable") }
+        guard let database = mailIndexDatabase(context: context) else { return failedEnvelope(integration: "mail", reason: "mail_index_unavailable") }
         defer { sqlite3_close(database) }
         // Stop expensive aggregation rather than returning guessed or partial totals.
         let deadline = NSNumber(value: ProcessInfo.processInfo.systemUptime + 2)
@@ -166,9 +170,8 @@ extension MacAppleScriptBridge {
             "unread_only": .bool(input["unread_only"] == .bool(true)), "senders": .array(rows)])
     }
 
-    /// Read-only Envelope Index pages under Full Disk Access use the script's account mailboxes, Mail's positions and index counts.
-    /// Queries cover the whole mailbox's subject and sender; missing accounts are named in `accounts_not_listed`.
-    static func mailIndexPage(header: String, input: [String: JSONValue], query: [String]?) -> JSONValue {
+    /// Index queries cover whole-mailbox subjects and senders; missing account coverage stays explicit.
+    static func mailIndexPage(header: String, input: [String: JSONValue], query: [String]?, context: MacOperationContext) -> JSONValue {
         guard let scope = mailReadScope(input) else { return failedEnvelope(integration: "mail", reason: "unsupported_mailbox") }
         let limit: Int
         do { limit = try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50) }
@@ -198,11 +201,11 @@ extension MacAppleScriptBridge {
             return failedEnvelope(integration: "mail", reason: "mailbox_coverage_unavailable",
                 message: "Mail returned no account mailboxes in this scope. Mailbox coverage could not be established; no empty message list was inferred.")
         }
-        guard let database = mailIndexDatabase() else {
+        guard let database = mailIndexDatabase(context: context) else {
             return failedEnvelope(integration: "mail", reason: "mail_index_unavailable")
         }
         defer { sqlite3_close(database) }
-        /// Runs `sql` with integer/text bindings, one closure call per row; false when it cannot run.
+        /// A query that cannot run is distinct from a query returning no rows.
         func each(_ sql: String, _ bindings: [Any], _ row: (OpaquePointer) -> Void) -> Bool {
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
@@ -224,23 +227,28 @@ extension MacAppleScriptBridge {
             LEFT JOIN subjects s ON s.ROWID = m.subject LEFT JOIN addresses a ON a.ROWID = m.sender
             LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id
             """
-        // Each row's place in the mailbox as Mail numbers it (newest first), so
-        // a filtered row still carries its true position.
-        let positions = "(SELECT m.ROWID AS id, row_number() OVER (ORDER BY m.date_received DESC, m.ROWID DESC) AS position FROM messages m WHERE \(inboxMessages)) p"
+        // Each row's place in the mailbox as Mail numbers it (newest first), so a filtered row still carries its true position.
+        let positions = """
+            (SELECT m.ROWID AS id, row_number() OVER (ORDER BY m.date_received DESC, m.ROWID DESC) AS position FROM messages m WHERE \(inboxMessages)) p
+            """
         // Inbox lists default to Primary and Transactions unless all_categories; searches cover every category.
         let categories = ["primary", "transactions", "updates", "promotions"]
-        let primaryOnly = scope == "inbox" && query == nil && ["unread", "sort", "from", "since", "category", "attachment"].allSatisfy { input[$0] == nil } && input["all_categories"] != .bool(true)
+        let primaryOnly = scope == "inbox" && query == nil && ["unread", "sort", "from", "since", "category", "attachment"]
+            .allSatisfy { input[$0] == nil } && input["all_categories"] != .bool(true)
         var filter = "1"
         if primaryOnly { filter += " AND coalesce(g.model_category, 0) IN (0, 1)" }
         if case .bool(let unread)? = input["unread"] { filter += " AND m.read = \(unread ? 0 : 1)" }
-        // The subject as shown (its "Re: " prefix too), case and accents aside.
+        // Include the displayed subject prefix in matching; case and accents do not distinguish a match.
         let patterns = (query ?? []).map(FoldedText.fold)
         var bindings: [Any] = patterns
         func bind(_ value: Any) -> String { bindings.append(value); return "?\(bindings.count + 3)" }
         if !patterns.isEmpty {
             filter += " AND (" + patterns.indices.map { index in
                 let parameter = "?\(index + 4)"
-                return "(folded_contains(coalesce(m.subject_prefix, '') || coalesce(s.subject, ''), \(parameter)) OR folded_contains(a.address, \(parameter)) OR folded_contains(a.comment, \(parameter)))"
+                return """
+                    (folded_contains(coalesce(m.subject_prefix, '') || coalesce(s.subject, ''), \(parameter)) OR folded_contains(a.address, \(parameter)) OR \
+                    folded_contains(a.comment, \(parameter)))
+                    """
             }.joined(separator: " OR ") + ")"
         }
         let iso = ISO8601DateFormatter()
@@ -265,8 +273,8 @@ extension MacAppleScriptBridge {
             }
             filter += " AND EXISTS (SELECT 1 FROM attachments x WHERE x.message = m.ROWID\(nameFilter))"
         }
-        // Every account type's mailbox URL is `scheme://<account id>/<mailbox path>`
-        // (imap, ews, pop, local), so an inbox is its account id and Mail's own name for it.
+        // Every account type's mailbox URL is `scheme://<account id>/<mailbox path>` (imap, ews, pop, local), so an inbox is its account id and Mail's own name
+        // for it.
         var mailboxes: [(id: Int, account: String, path: String)] = []
         guard each("SELECT ROWID, url FROM mailboxes", [], { statement in
             if let url = URL(string: text(statement, 1)), let host = url.host {
@@ -292,14 +300,19 @@ extension MacAppleScriptBridge {
                        "message": .string("This account's requested mailbox was not found in Mail's index, so its mail is not in this list.")]))
                 continue
             }
-            guard each("SELECT coalesce(g.model_category, 0), count(*), coalesce(sum(m.read = 0), 0) FROM messages m LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id WHERE \(inboxMessages) GROUP BY coalesce(g.model_category, 0)", [mailbox], {
+            guard each("""
+                SELECT coalesce(g.model_category, 0), count(*), coalesce(sum(m.read = 0), 0) FROM messages m LEFT JOIN message_global_data g ON g.ROWID = \
+                m.global_message_id WHERE \(inboxMessages) GROUP BY coalesce(g.model_category, 0)
+                """, [mailbox], {
                       let category = Int(sqlite3_column_int64($0, 0)), categoryUnread = Int(sqlite3_column_int64($0, 2))
                       total += Int(sqlite3_column_int64($0, 1)); unread += categoryUnread
                       unreadByCategory[categories.indices.contains(category) ? categories[category] : "unclassified", default: 0] += categoryUnread
                   }),
-                  filter == "1" || each("SELECT count(*) FROM messages m \(joins) WHERE \(inboxMessages) AND \(filter)", [mailbox, 0, 0] + bindings, { count = Int(sqlite3_column_int64($0, 0)) }),
+                  filter == "1" || each("SELECT count(*) FROM messages m \(joins) WHERE \(inboxMessages) AND \(filter)", [mailbox, 0, 0]
+                      + bindings, { count = Int(sqlite3_column_int64($0, 0)) }),
                   each("""
-                    SELECT m.ROWID, g.message_id_header, m.subject_prefix, s.subject, a.comment, a.address, m.date_received, m.read, g.model_category, p.position
+                    SELECT m.ROWID, g.message_id_header, m.subject_prefix, s.subject, a.comment, a.address, m.date_received, m.read, g.model_category, \
+                    p.position
                     FROM \(positions) JOIN messages m ON m.ROWID = p.id \(joins)
                     WHERE \(filter) ORDER BY p.position \(oldest ? "DESC" : "ASC") LIMIT ?2 OFFSET ?3
                     """, [mailbox, limit, offset] + bindings, { statement in
@@ -308,7 +321,8 @@ extension MacAppleScriptBridge {
                         let received = sqlite3_column_type(statement, 6) == SQLITE_NULL ? ""
                             : iso.string(from: Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(statement, 6))))
                         var row: [String: JSONValue] = ["message_id": .int(sqlite3_column_int64(statement, 0)), "expected_message_id": .string(messageID),
-                            "subject": .string(text(statement, 2) + text(statement, 3)), "sender": .string(mailSenderText(comment: text(statement, 4), address: text(statement, 5))),
+                            "subject": .string(text(statement, 2) + text(statement, 3)), "sender": .string(mailSenderText(comment: text(statement, 4),
+                                address: text(statement, 5))),
                             "date": .string(received), "unread": .bool(sqlite3_column_int(statement, 7) == 0),
                             "position": .int(sqlite3_column_int64(statement, 9)), "body_status": .string("not_loaded"), "scope": .string(scope)]
                         if !account.name.isEmpty { row["expected_account"] = .string(account.name) }
@@ -367,7 +381,10 @@ extension MacAppleScriptBridge {
         result["has_more"] = .bool(hasMore)
         if filter != "1" { result["matching_total"] = .int(Int64(boxes.reduce(0) { $0 + $1.count })) }
         if query != nil {
-            result["note"] = .string("Matched the supplied filters across the whole \(scope) mailbox; query searches sender and subject, from searches sender only. Bodies were not searched.")
+            result["note"] = .string("""
+                Matched the supplied filters across the whole \(scope) mailbox; query searches sender and subject, from searches sender only. Bodies were not \
+                searched.
+                """)
         } else if primaryOnly {
             result["note"] = .string("Primary and Transactions only (Mail's categories); all_categories: true lists Updates and Promotions too.")
         }
@@ -379,7 +396,10 @@ extension MacAppleScriptBridge {
             result["inbox_total"] = result["mailbox_total"]
             result["inbox_unread"] = .int(Int64(boxes.reduce(0) { $0 + $1.unread }))
             result["inbox_unread_by_category"] = .object(unreadByCategory.mapValues { .int(Int64($0)) })
-            result["category_note"] = .string("Exact unread counts across all inbox categories, independent of this page's filters. Mail's Primary category is not a guarantee that the sender is a person; unclassified covers unknown category codes.")
+            result["category_note"] = .string("""
+                Exact unread counts across all inbox categories, independent of this page's filters. Mail's Primary category is not a guarantee that the \
+                sender is a person; unclassified covers unknown category codes.
+                """)
         }
         if !notListed.isEmpty {
             if boxes.isEmpty { result["reason"] = .string("mailbox_coverage_unavailable") }
@@ -389,7 +409,9 @@ extension MacAppleScriptBridge {
             result["inbox_unread_by_category"] = nil; result["category_note"] = nil
             result["accounts_not_listed"] = .array(notListed)
             let names = notListed.compactMap { if case .object(let o) = $0, case .string(let n)? = o["account"] { n.isEmpty ? "an account" : n } else { nil } }
-            result["message"] = .string("Not listed: \(names.joined(separator: ", ")); see accounts_not_listed.\(boxes.isEmpty ? "" : " The other accounts are listed.")")
+            result["message"] = .string("""
+                Not listed: \(names.joined(separator: ", ")); see accounts_not_listed.\(boxes.isEmpty ? "" : " The other accounts are listed.")
+                """)
         }
         return .object(result)
     }

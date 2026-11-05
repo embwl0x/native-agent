@@ -1,17 +1,15 @@
 import NativeAgentShared
 import Foundation
 import PersistenceCore
-// Blueprint: | `DeskOperations.swift` | `DeskOpBody` enum and exact current-form operation decoder; explicit clears and complete collections; typed release conditions; `updateTitle` optionally replaces refs with the same replayable summary update |
+// Blueprint: | `DeskOperations.swift` | `DeskOpBody`: complete ops and explicit clears; `updateTitle` commits refs atomically |
 
 // MARK: - Ops (DeskOp) — one event each; compact() folds into DeskState
 
-/// The mutation payload. Every op also carries a `handle` (the item it targets,
-/// or — for create — the newly assigned handle). Every persisted operation
-/// must decode completely before the feed can be replayed.
+/// Persisted operations must decode completely before replay so no mutation disappears.
 public enum DeskOpBody: Sendable, Equatable {
-    case createItem(alias: String, kind: DeskKind, project: String, title: String, parent: String?, summary: String?, assignee: String?, laneOf: String?, origin: DeskOrigin, pursuit: Pursuit?, findingKey: String? = nil)
-    /// A dedicated token identifies dossier-gated self-authored pursuits.
-    /// Origin is implicitly .agent, kind implicitly .project.
+    case createItem(alias: String, kind: DeskKind, project: String, title: String, parent: String?, summary: String?, assignee: String?, laneOf: String?,
+        origin: DeskOrigin, pursuit: Pursuit?, findingKey: String? = nil)
+    /// A dedicated token prevents generic creation from bypassing pursuit evidence gates.
     case openPursuit(alias: String, project: String, title: String, summary: String?, pursuit: Pursuit, notify: NotifyPolicy)
     case setStatus(
         status: DeskStatus,
@@ -23,23 +21,20 @@ public enum DeskOpBody: Sendable, Equatable {
     )
     case updateTitle(title: String?, summary: String?, refs: [DeskRef]? = nil)
     case addRef(ref: DeskRef)
-    case updateRef(refId: String, cachedFields: [String: JSONValue])
     case appendNote(text: String, author: String? = "system", releaseCondition: String? = nil)
-    /// One atomic user veto: the pursuit becomes canceled and carries the
-    /// durable rationale in the same replayable event.
+    /// Record veto and cancellation atomically so the rationale survives replay.
     case vetoPursuit(note: String)
     case setCadence(cadence: Cadence)
     case setNotify(policy: NotifyPolicy)
     case closeItem(outcomeSummary: String, status: DeskStatus)   // status ∈ {done, canceled}
-    case markNotified(at: String)   // notify fired — stamps notify.lastNotifiedAt, NOT updatedAt
+    case markNotified(at: String)
     case archiveItem
     case reserveWorkAttempt(attemptId: String, lane: DeskWorkAttempt.Lane, day: String, slot: String)
     case completeWorkAttempt(attemptId: String, receipt: String, disposition: DeskWorkDisposition? = nil, artifactRefs: [String] = [])
     case handOffWorkReceipt(reservationId: String)
-    case workLog(receipt: String)   // desk_work_log — a plain work receipt note
-    // Sequencing seam. Both REPLACE (never merge) so the op is the whole truth
-    // of the field at that point in the feed.
-    case setBlockedOn(handles: [String])   // replaces the WHOLE blocker set
+    case workLog(receipt: String)
+    // Replace complete fields so each operation owns the full replay truth.
+    case setBlockedOn(handles: [String])
     case setDeferUntil(until: String?)     // nil / "" CLEARS the parked date
     case setContinuation(record: DeskContinuation)
 
@@ -50,7 +45,6 @@ public enum DeskOpBody: Sendable, Equatable {
         case .setStatus: return "set_status"
         case .updateTitle: return "update_title"
         case .addRef: return "add_ref"
-        case .updateRef: return "update_ref"
         case .appendNote: return "append_note"
         case .vetoPursuit: return "veto_pursuit"
         case .setCadence: return "set_cadence"
@@ -105,7 +99,6 @@ public struct DeskOp: Sendable, Equatable {
             put("assignee", assignee)
             put("laneOf", laneOf)
             put("findingKey", findingKey)
-            // The current writer omits the default owner origin.
             if origin != .owner { obj["origin"] = .string(origin.rawValue) }
             if let pursuit { obj["pursuit"] = pursuit.toJSON() }
         case let .openPursuit(alias, project, title, summary, pursuit, notify):
@@ -128,9 +121,6 @@ public struct DeskOp: Sendable, Equatable {
             if let refs { obj["refs"] = .array(refs.map { $0.toJSON() }) }
         case let .addRef(ref):
             obj["ref"] = ref.toJSON()
-        case let .updateRef(refId, cachedFields):
-            obj["refId"] = .string(refId)
-            obj["cachedFields"] = .object(cachedFields)
         case let .appendNote(text, author, releaseCondition):
             obj["text"] = .string(text)
             put("author", author)
@@ -163,13 +153,10 @@ public struct DeskOp: Sendable, Equatable {
         case let .workLog(receipt):
             obj["receipt"] = .string(receipt)
         case let .setBlockedOn(handles):
-            // ALWAYS emitted, even EMPTY — an empty set is a CLEAR, and the
-            // omit-empty `put` helper above would drop it and silently lose the
-            // clear on replay (the exact shape of the update_title empty-summary
-            // bug this file already carries a scar from).
+            // Emit even an empty set: omission would lose an explicit clear on replay.
             obj["blockedOn"] = .array(handles.map { .string($0) })
         case let .setDeferUntil(until):
-            // Same reason: "" IS the clear and must survive the round-trip.
+            // An empty string is an explicit clear and must survive replay.
             obj["until"] = .string(until ?? "")
         case let .setContinuation(record):
             obj["continuation"] = record.toJSON()
@@ -185,7 +172,8 @@ public struct DeskOp: Sendable, Equatable {
               let handle = obj["handle"]?.stringValue else { return nil }
         let body: DeskOpBody
         guard !opId.isEmpty, !handle.isEmpty, DeskClock.parseISO(ts) != nil,
-              DeskJSON.optionalStringsAreValid(obj, keys: ["parent", "summary", "assignee", "laneOf", "origin", "findingKey", "blockedReason", "waitingOn", "title", "author", "disposition"])
+              DeskJSON.optionalStringsAreValid(obj, keys: ["parent", "summary", "assignee", "laneOf", "origin", "findingKey", "blockedReason", "waitingOn",
+                  "title", "author", "disposition"])
         else { return nil }
         let pursuit = obj["pursuit"].flatMap(Pursuit.fromJSON)
         if obj["pursuit"] != nil && pursuit == nil { return nil }
@@ -248,10 +236,6 @@ public struct DeskOp: Sendable, Equatable {
         case "add_ref":
             guard let refVal = obj["ref"], let ref = DeskRef.fromJSON(refVal) else { return nil }
             body = .addRef(ref: ref)
-        case "update_ref":
-            guard let refId = obj["refId"]?.stringValue else { return nil }
-            guard case .object(let fields)? = obj["cachedFields"] else { return nil }
-            body = .updateRef(refId: refId, cachedFields: fields)
         case "append_note":
             guard let text = obj["text"]?.stringValue, DeskNote.fromJSON(value) != nil else { return nil }
             body = .appendNote(text: text, author: obj["author"]?.stringValue, releaseCondition: obj["releaseCondition"]?.stringValue)

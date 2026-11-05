@@ -23,9 +23,11 @@ struct TelegramView: View {
                     AliveDivider()
                     AliveRow("Telegram poll loop", detail: snapshot.pollStatusMessage ?? (snapshot.pollerRunning ? "Running" : "Not running")) { EmptyView() }
                     AliveDivider()
-                    AliveRow("Last successful poll", detail: snapshot.lastSuccessfulPollAt.map(UserDisplayFormatters.humanizeISOTimestamp) ?? "None") { EmptyView() }
+                    AliveRow("Last successful poll", detail: snapshot.lastSuccessfulPollAt.map(UserDisplayFormatters.humanizeISOTimestamp)
+                        ?? "None") { EmptyView() }
                     AliveDivider()
-                    AliveRow("Set up on your Mac", detail: "Open Telegram on your Mac to add or replace the bot token. Tokens cannot be sent through iCloud.") { EmptyView() }
+                    AliveRow("Set up on your Mac",
+                        detail: "Open Telegram on your Mac to add or replace the bot token. Tokens cannot be sent through iCloud.") { EmptyView() }
                 }
                 MobileAppSettingsSections(pages: ["telegram"], title: "Who can reach me")
 

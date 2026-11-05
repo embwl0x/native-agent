@@ -4,33 +4,11 @@ import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `ProviderVitalsSensor.swift` | `ProviderVitalsSensor`: passive lifecycle-derived latency/error bands, first-output evidence and persisted bounded health state |
+// Blueprint: | `ProviderVitalsSensor.swift` | `ProviderVitalsSensor`: passive bounded lifecycle evidence |
 
 // MARK: - INTEROCEPTION: provider vitals sensor
-//
-// A passive body-sense organ.
-// It listens to the EXISTING `LLMCallLifecycleEvent` seam that the shared
-// provider router (SwiftNativeLLMClient / LLMClient+Real.swift) already threads
-// around every real adapter call, and maintains per-provider exponential moving
-// averages of latency, error rate and consecutive-failure runs. From those it
-// derives a BANDED health state (nominal / sluggish / degraded) with hysteresis,
-// and emits a transition ONLY when a provider's band actually changes.
-//
-// HARD CONSTRAINTS (proof obligations):
-//  - Passive: the sensor NEVER issues a provider call. It has no LLMClient and
-//    no network capability — it only observes lifecycle evidence it is handed.
-//  - Turn-path zero-I/O: `observe(_:)` performs at most one in-memory EMA
-//    update and one band recomputation. It touches no disk. Snapshotting to the
-//    telemetry dir is a SEPARATE, explicitly-called, off-turn-path method.
-//  - Transition-only emission: while a provider's band is stable, `observe`
-//    returns nil regardless of call volume — no downstream organism ingest.
-//
-// The lifecycle seam is payload-free (start/terminal timings + phase). It
-// therefore feeds `durationMs` (terminal.occurredAt − started.occurredAt), the
-// error signal, and time-to-first-output (terminal.firstOutputAt − started) for
-// a streamed call that produced output. Tokens/sec is modelled as an EMA too,
-// but the lifecycle path leaves it nil; a richer producer can supply it
-// through `observe(sample:)` without any change to this actor.
+// Observe lifecycle evidence passively: no provider calls or turn-path I/O. Update bounded in-memory latency/error EMAs and emit only band changes;
+// persistence is explicitly off-turn. Missing output timings stay unknown.
 
 public enum ProviderVitalsBand: Int, Sendable, Codable, Equatable, Comparable, CaseIterable {
     case nominal = 0
@@ -50,18 +28,13 @@ public enum ProviderVitalsBand: Int, Sendable, Codable, Equatable, Comparable, C
     }
 }
 
-/// Direction of a band change — whether the provider got worse or recovered.
-/// Drives whether the somatic sibling reads as sluggishness (worsening) or
-/// relief (recovery).
+/// Worsening and recovery drive distinct somatic signals.
 public enum ProviderVitalsDirection: String, Sendable, Codable, Equatable {
     case worsening
     case recovering
 }
 
-/// One explicit vitals sample. The lifecycle path fills `durationMs`, `isError`
-/// and, for a streamed call with output, `ttftMs`; it leaves `tokensPerSec`
-/// nil. `isCancelled` samples are ignored by the sensor (a user-cancelled
-/// call is not provider ill-health).
+/// Cancellation is not provider ill-health; lifecycle samples omit throughput when it was not measured.
 public struct ProviderVitalsSample: Sendable, Equatable {
     public var providerId: String
     public var occurredAt: Date
@@ -90,15 +63,14 @@ public struct ProviderVitalsSample: Sendable, Equatable {
     }
 }
 
-/// Emitted only on a real band transition for one provider.
+/// Stable bands emit nothing regardless of call volume.
 public struct ProviderVitalsTransition: Sendable, Equatable {
     public var providerId: String
     public var from: ProviderVitalsBand
     public var to: ProviderVitalsBand
     public var direction: ProviderVitalsDirection
     public var occurredAt: Date
-    /// EMA read at transition time — carried as evidence for the felt signal.
-    /// Never any prompt/completion text.
+    /// Transition evidence retains timings, never prompt or completion text.
     public var emaLatencyMs: Double?
     public var baselineLatencyMs: Double?
     public var emaErrorRate: Double
@@ -126,7 +98,7 @@ public struct ProviderVitalsTransition: Sendable, Equatable {
         self.consecutiveFailures = consecutiveFailures
     }
 
-    /// How far the provider is running from its own baseline latency.
+    /// Compare latency to this provider's own baseline.
     public var latencyRatio: Double? {
         guard let ema = emaLatencyMs, let base = baselineLatencyMs, base > 0 else { return nil }
         return ema / base
@@ -157,7 +129,7 @@ public actor ProviderVitalsSensor {
         var emaErrorRate: Double = 0
         var consecutiveFailures: Int = 0
         var sampleCount: Int = 0
-        /// LRU stamp for the bounded provider-row store.
+        /// Bound row storage by last sample.
         var lastSampleAt: Date?
     }
 
@@ -170,34 +142,25 @@ public actor ProviderVitalsSensor {
     private static let enterDegraded = 2.0
     private static let exitDegraded = 1.4
     private var states: [String: State] = [:]
-    /// Start timestamps for in-flight calls, keyed by lifecycle id, so a
-    /// terminal event can compute the call's duration. Bounded — a call whose
-    /// terminal never arrives is evicted once the map exceeds the cap.
+    /// Bound in-flight starts so a missing terminal event cannot leak memory forever.
     private var openCallStarts: [String: Date] = [:]
     private var openCallOrder: [String] = []
     private static let maxOpenCalls = 512
 
-    /// First outputs, per provider + model + stream kind: the adapter's
-    /// `ttftMs` (request to first text or tool output) in seconds, oldest first.
-    /// The trace is their durable record: read once at launch, then each live
-    /// call's `ttftMs` joins here under the same definition. Nothing is written.
+    /// Seed first-output samples once from retained traces, then join live receipts under the same request-to-output definition; never write another
+    /// ledger.
     private struct FirstOutputKey: Hashable { let provider, model: String; let streamKind: String? }
     private var firstOutputs: [FirstOutputKey: [(seconds: Double, bytes: Int?)]] = [:]
-    /// Rows the retained trace sources could not decode at launch: their first
-    /// outputs are missing from the sample, and Diagnostics says how many.
+    /// Unreadable retained rows stay a named evidence gap in Diagnostics.
     private var unreadableTraceRows = 0
-    /// Stream-guard cuts per provider id (`provider.noReply`): not first
-    /// outputs, counted beside them.
+    /// Guard cuts are failures beside first outputs, never timing samples.
     private var noReplyCuts: [String: Int] = [:]
 
     public init() {}
 
     // MARK: Lifecycle
 
-    /// Passive lifecycle observation: `started` events only record the call's
-    /// start time; terminal events derive one sample, update the EMAs and join
-    /// a first output or a cut, all in memory. Returns the band transition (if
-    /// any) so an owner can route it onward.
+    /// Lifecycle observation updates memory only; its caller owns routing a band transition.
     @discardableResult
     public func ingest(lifecycle event: LLMCallLifecycleEvent) -> ProviderVitalsTransition? {
         switch event.phase {
@@ -228,8 +191,7 @@ public actor ProviderVitalsSensor {
         }
     }
 
-    /// Ingest one explicit sample. Returns a transition iff the band changed.
-    /// This is the single in-memory EMA update the proof obligations require.
+    /// One sample performs one bounded in-memory EMA/band update.
     @discardableResult
     public func observe(sample: ProviderVitalsSample) -> ProviderVitalsTransition? {
         guard !sample.isCancelled else { return nil }
@@ -238,8 +200,7 @@ public actor ProviderVitalsSensor {
         var state = states[key] ?? State()
         let previousBand = state.band
 
-        // Fast latency EMA. The slow baseline is deliberately NOT updated here
-        // — see below, after the band for this sample is known.
+        // Resolve this sample's band before deciding whether it may teach the slow baseline.
         if let duration = sample.durationMs {
             state.emaLatencyMs = ema(state.emaLatencyMs, duration, alpha: Self.fastAlpha)
         }
@@ -249,7 +210,6 @@ public actor ProviderVitalsSensor {
         if let tps = sample.tokensPerSec {
             state.emaTokensPerSec = ema(state.emaTokensPerSec, tps, alpha: Self.fastAlpha)
         }
-        // Error-rate EMA + consecutive-failure run.
         let errorPoint = sample.isError ? 1.0 : 0.0
         state.emaErrorRate = ema(state.emaErrorRate, errorPoint, alpha: Self.fastAlpha) ?? errorPoint
         let (failures, failuresOverflow) = state.consecutiveFailures.addingReportingOverflow(1)
@@ -260,8 +220,7 @@ public actor ProviderVitalsSensor {
             nativeLog("Provider vitals counter exhausted for %@; count is saturated", key)
         }
 
-        // Band with hysteresis. Cold-start providers are pinned nominal until
-        // enough samples have accumulated to trust the EMAs.
+        // Cold-start providers need enough evidence before EMA strain can change their band.
         let strain = state.sampleCount < Self.warmupSamples ? 0 : self.strain(for: state)
         let nextBand = resolveBand(current: state.band, strain: strain)
         state.band = nextBand
@@ -274,11 +233,7 @@ public actor ProviderVitalsSensor {
 
         state.lastSampleAt = sample.occurredAt
         states[key] = state
-        // Provider-row cap: evict the least-recently-sampled NOMINAL rows past
-        // the bound (never evict a row mid-story — sluggish/degraded rows carry
-        // live band state a transition depends on; with a real provider
-        // population under 10, eviction only ever hits junk ids). Snapshot
-        // serialization is bounded by the same cap for free.
+        // Evict only nominal rows: sluggish/degraded rows retain live transition state. The same cap bounds serialized snapshots.
         if states.count > Self.maxTrackedProviders {
             let evictable = states
                 .filter { $0.value.band == .nominal && $0.key != key }
@@ -305,16 +260,14 @@ public actor ProviderVitalsSensor {
 
     // MARK: First outputs
 
-    /// Launch-owned, once, read behind her: the retained trace's first outputs
-    /// and cuts up to `cutoff`, joined ahead of the calls this run has already
-    /// observed live (their rows are the ones after the cutoff).
+    /// Join launch traces through the cutoff ahead of live samples so neither source is double-counted.
     public func readFirstOutputs(
         dataRoot: URL, before cutoff: Date
     ) async throws {
         let read = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
-            .traceEvidence(now: cutoff, since: .distantPast)
-        unreadableTraceRows = read.report.malformedLineCount
-        // Oldest first; the ledger part is not windowed by `now`.
+            .traceEvidence(now: cutoff, since: .distantPast, kinds: ["llm.call", "provider.noReply"])
+        unreadableTraceRows = read.turns.unreadable
+        // Retained record order, not current wall time, owns the sample window.
         var rows = read.rows[...]
         while case .object(let last)? = rows.last, case .string(let raw)? = last["createdAt"],
               let at = TurnTraceEvent.parseISO8601(raw), at > cutoff {
@@ -337,7 +290,7 @@ public actor ProviderVitalsSensor {
         for (key, samples) in live { samples.forEach { joinFirstOutput(key, seconds: $0.seconds, bytes: $0.bytes) } }
     }
 
-    /// The stream guard's question at stream start, for a request of `requestBytes`.
+    /// First-output admission uses the actual encoded request size.
     public func firstOutputDeadline(provider: String, model: String, streamKind: String?, requestBytes: Int) -> FirstOutputDeadline {
         let samples = firstOutputs[firstOutputKey(provider, model, streamKind)] ?? []
         let perByte = samples.compactMap { sample in sample.bytes.flatMap { $0 > 0 ? sample.seconds / Double($0) : nil } }.max()
@@ -345,7 +298,6 @@ public actor ProviderVitalsSensor {
                                    slowestPerByte: perByte, requestBytes: requestBytes)
     }
 
-    /// Diagnostics: each provider's first outputs beside its cuts.
     public func firstOutputReport() -> String {
         "Retained traces at launch: \(unreadableTraceRows) rows unreadable\n"
         + Set(firstOutputs.keys.map(\.provider)).union(noReplyCuts.keys).sorted().map { provider in
@@ -372,10 +324,7 @@ public actor ProviderVitalsSensor {
         FirstOutputKey(provider: normalizedProviderId(provider), model: model.lowercased(), streamKind: streamKind)
     }
 
-    /// The trace's own retention rule, no clock: it keeps its newest
-    /// `JSONLLineCaps.traceEvents` rows, so a key keeps at most that many first
-    /// outputs and one leaves only when a newer one pushes it out. (The trace
-    /// is shared with other rows, so after a relaunch a key may hold fewer.)
+    /// Trace retention bounds first-output history; shared trace rows may leave fewer samples after relaunch.
     private func joinFirstOutput(_ key: FirstOutputKey, seconds: Double, bytes: Int?) {
         guard seconds >= 0, UInt64(exactly: (seconds * 1_000_000_000).rounded(.up)) != nil,
               bytes.map({ $0 >= 0 }) ?? true else {
@@ -409,10 +358,7 @@ public actor ProviderVitalsSensor {
         )
     }
 
-    /// Serializable snapshot (counts/timings/band only — no prompt content).
-    /// The generation and state timestamps make restart restore age-bounded;
-    /// without them a months-old degraded band could be mistaken for live
-    /// provider health.
+    /// Persist timestamps/generation with timing-only state so old degraded bands cannot look current after restart.
     public func snapshotJSON(generatedAt: Date = Date()) -> JSONValue {
         var providers: [String: JSONValue] = [:]
         for key in states.keys.sorted() {
@@ -438,9 +384,7 @@ public actor ProviderVitalsSensor {
         ])
     }
 
-    /// Restore recent provider health at process bootstrap. Invalid rows are
-    /// ignored independently, while an absent/stale/future snapshot restores
-    /// nothing. In-flight lifecycle starts are intentionally never persisted.
+    /// Restore rows independently; absent, stale or future snapshots prove no current health. Never persist in-flight starts.
     @discardableResult
     public func restoreSnapshot(
         dataRoot: URL? = nil,
@@ -518,9 +462,7 @@ public actor ProviderVitalsSensor {
         return true
     }
 
-    /// Off-turn-path snapshot persistence. This is the ONLY disk write in the
-    /// organ and it is never called from `observe(_:)` — an owner schedules it
-    /// on a periodic/idle timer. Non-fatal on failure.
+    /// Only explicit off-turn persistence writes disk; observation never does, and snapshot faults cannot fail calls.
     public func persistSnapshot(
         dataRoot: URL? = nil
     ) async {
@@ -539,10 +481,7 @@ public actor ProviderVitalsSensor {
 
     // MARK: - Internals
 
-    /// Composite strain scalar. Bands map at ~1.0 (sluggish) and ~2.0
-    /// (degraded); each contributor is scaled so its own "concerning" level
-    /// lands near those anchors. Strain is the max across contributors — any one
-    /// bad dimension is enough.
+    /// Scale concerning strain near 1 and degraded strain near 2; take the maximum so one bad dimension is sufficient.
     private func strain(for state: State) -> Double {
         var contributors: [Double] = []
         // Error rate: 25% → 1.0, 50% → 2.0.

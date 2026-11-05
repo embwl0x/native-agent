@@ -1,7 +1,6 @@
 import Foundation
-// Blueprint: | `ProviderRecoveryPolicy.swift` | Shared failure classification; surfaces never replay a provider call (delivery redials live in ProviderStreamGuard's `ProviderWire`) |
+// Blueprint: | `ProviderRecoveryPolicy.swift` | `ProviderWire`: typed verdicts; wire-owned redelivery |
 
-/// Shared provider failure classification.
 public enum ProviderRecoveryPolicy {
     /// One typed recovery verdict serves every adapter and surface while preserving the selected model.
     public static func isRecoverable(_ error: Error) -> Bool {

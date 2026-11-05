@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import StandingBots
-// Blueprint: | `BuiltInToolSchemaFactory.swift` | `BuiltInToolSchemaFactory` struct; `schemas` composes domain declarations in catalog order; lazy `requestedSchema`; common constructors come from `PersistenceCore.ToolSchema` |
+// Blueprint: | `BuiltInToolSchemaFactory.swift` | `BuiltInToolSchemaFactory`, `schemas`, `requestedSchema`, `PersistenceCore.ToolSchema`: Lazy schemas. |
 
 /// Per-request schema construction; descriptions and parameters stay lazy.
 package struct BuiltInToolSchemaFactory {
@@ -18,9 +18,10 @@ package struct BuiltInToolSchemaFactory {
     func requestedSchema(
         name: String,
         toolClass: ToolClass,
-        reach: ToolReach = .hers,
+        reach: ToolReach = .agent,
         capabilities: Set<String>? = nil,
         effectInputPolicy: ToolEffectInputPolicy = .fixed,
+        macIntegration: MacIntegrationAccess? = nil,
         description: @autoclosure () -> String,
         parametersJSON: @autoclosure () -> Data
     ) -> LLMToolSchema? {
@@ -31,6 +32,7 @@ package struct BuiltInToolSchemaFactory {
             reach: reach,
             capabilities: capabilities ?? toolClass.baseCapabilities,
             effectInputPolicy: effectInputPolicy,
+            macIntegration: macIntegration,
             description: description(),
             parametersJSON: parametersJSON()
         )
@@ -61,14 +63,12 @@ package struct BuiltInToolSchemaFactory {
             ("type", .string("array")),
             ("items", ToolSchema.obj(itemProps)),
         ]
-        // A bound the validator enforces must also be a bound the schema
-        // STATES, or the model only discovers it by being refused.
+        // A bound the validator enforces must also be a bound the schema STATES, or the model only discovers it by being refused.
         if let minItems { props.append(("minItems", .int(Int64(minItems)))) }
         if let maxItems { props.append(("maxItems", .int(Int64(maxItems)))) }
         if let desc { props.append(("description", .string(desc))) }
         return ToolSchema.obj(props)
     }
-    // Mail and notification recipients accept either a string or an array.
     func stringOrStringArraySchema(_ desc: String? = nil) -> JSONValue {
         var props: [(String, JSONValue)] = [
             ("anyOf", .array([
@@ -82,7 +82,6 @@ package struct BuiltInToolSchemaFactory {
         if let desc { props.append(("description", .string(desc))) }
         return ToolSchema.obj(props)
     }
-    // Date fields accept ISO-8601 strings or epoch integers.
     func stringOrIntSchema(_ desc: String? = nil) -> JSONValue {
         var props: [(String, JSONValue)] = [
             ("anyOf", .array([
@@ -127,19 +126,6 @@ package struct BuiltInToolSchemaFactory {
             ("description", .string(description)),
         ])
     }
-    func conversationModeSchema() -> JSONValue {
-        ToolSchema.enumStringSchema(
-            ["new", "resume"],
-            "Choose new for unrelated work and omit conversation_id. Choose resume only for a contextual follow-up and pass the exact conversationId returned by this same tool. The mode is required."
-        )
-    }
-    func conversationReferenceSchema(_ agent: String, _ tool: String) -> JSONValue {
-        ToolSchema.strSchema(
-            "Resume only: exact \(agent):… conversationId returned by an earlier \(tool). "
-            + "For new work omit this field, or send an empty string when the caller serializes every optional field. "
-            + "Never invent a placeholder or pass this NativeAgent conversation's session_id."
-        )
-    }
 
     func recallParameters() -> Data {
         ToolSchema.params(
@@ -147,9 +133,14 @@ package struct BuiltInToolSchemaFactory {
                 ("query", ToolSchema.nullable(ToolSchema.strSchema("Search text; null in ID page mode."))),
                 ("k", ToolSchema.nullable(ToolSchema.intSchema("Search result count, default 5; null in ID page mode."))),
                 ("memory_id", ToolSchema.nullable(ToolSchema.strSchema("Exact id from a recall hit; null in search mode. Set query/k to null when paging."))),
-                ("offset", ToolSchema.nullable(ToolSchema.intSchema("Copy next_offset to continue the same query/k (ranked candidate offset), or the same memory_id (character offset). Default 0."))),
+                ("offset", ToolSchema.nullable(ToolSchema.intSchema("""
+                    Copy next_offset to continue the same query/k (ranked candidate offset), or the same memory_id (character offset). Default 0.
+                    """))),
                 ("max_characters", ToolSchema.nullable(ToolSchema.intSchema("ID mode only: positive page size, capped at 2000. Null in search mode."))),
-                ("expected_content_sha256", ToolSchema.nullable(ToolSchema.strSchema("ID mode: content_sha256 from the previous page, supplied by read_more. Null for a first page or search. A mismatch returns record_changed without text."))),
+                ("expected_content_sha256", ToolSchema.nullable(ToolSchema.strSchema("""
+                    ID mode: content_sha256 from the previous page, supplied by read_more. Null for a first page or search. A mismatch returns \
+                    record_changed without text.
+                    """))),
             ],
             required: []
         )

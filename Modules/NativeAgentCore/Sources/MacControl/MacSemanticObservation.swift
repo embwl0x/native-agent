@@ -19,38 +19,29 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacSemanticObservation.swift` | Semantic look capture and exact-node search; stopped and windowless named apps are successful empty observations without launching or opening anything |
+// Blueprint: | `MacSemanticObservation.swift` | Shared semantic reads and exact-node search; named stopped/windowless apps report absence without launch |
 extension SwiftNativeMacControl {
-    /// The Chromium/Electron live seam. Runs BEFORE the walk that matters.
-    ///
-    /// The AX source prepares advertised renderer capabilities before the walk.
-    /// A cold renderer is awaited on its own AX notifications in this read.
-    /// Native AX windows return immediately. Only renderer content growth
-    /// renews the stall window; notifications merely trigger another read.
-    ///
-    /// Activation belongs to the source, including direct/native reads and acts;
-    /// renderer notifications here only await content, never certify actions.
-    ///
-    /// - Parameters anchorPid/anchorWindow: every post-act walk, including renderer re-reads,
-    ///   targets the acted window or carries its anchor failure; never publish another window's frame.
+    /// Prepare renderer capabilities before the shared walk; native windows return immediately. Cold renderers wait on AX notifications, but only observed
+    /// content growth renews the stall deadline. Activation belongs to the AX source; notifications never certify actions, and post-act reads retain the
+    /// acted-window anchor.
     func lookSnapshot(
         limits: MacAXLimits,
         scope: MacLookScope = .page,
         anchorPid: Int32? = nil,
         anchorWindow: MacAXWindowIdentity? = nil,
         completeWindow: Bool = false,
-        section: String? = nil
+        section: String? = nil,
+        context: MacOperationContext
     ) async -> (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?) {
         var seam: [String: JSONValue] = [
             "chromium_family": .bool(false),
             "enhanced_ax_set": .bool(false),
             "rewalked": .bool(false),
         ]
-        // Resolve the application before walking a window. An AXWebArea is
-        // an effect of Chromium activation, never its prerequisite.
-        let pid = anchorPid ?? anchorWindow?.pid ?? accessibilitySource.frontmostApp()?.processIdentifier
+        // Resolve the app before walking; Chromium’s AXWebArea appears only after activation.
+        let pid = anchorPid ?? anchorWindow?.pid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier
         if pid == getpid() { return (nil, seam, .selfProcess) }
-        let app = pid.flatMap { accessibilitySource.appInfo(pid: $0) }
+        let app = pid.flatMap { accessibilitySource(context: context).appInfo(pid: $0) }
         let chromium: Bool
         do { chromium = try MacChromiumAccessibility.looksChromium(bundleId: app?.bundleIdentifier, pid: pid, snapshot: nil) }
         catch { return (nil, seam, .rendererUnavailable(error.localizedDescription)) }
@@ -58,8 +49,8 @@ extension SwiftNativeMacControl {
         var rendererEvents: MacAppSourceEvents?
         var observationError: Error?
         defer { rendererEvents?.cancel() }
-        if accessibilitySource is SystemMacAXElementSource, let pid {
-            do { try await SystemMacAXElementSource.prepareRenderer(pid: pid) }
+        if accessibilitySource(context: context) is SystemMacAXElementSource, let pid {
+            do { try await SystemMacAXElementSource.prepareRenderer(pid: pid, context: context) }
             catch {
                 seam["renderer_activation"] = .object(MacChromiumAccessibilityState.shared.evidence(pid: pid))
                 seam["renderer_wait_note"] = .string(error.localizedDescription)
@@ -67,7 +58,7 @@ extension SwiftNativeMacControl {
                 return (nil, seam, .rendererUnavailable(error.localizedDescription))
             }
             let evidence = MacChromiumAccessibilityState.shared.evidence(pid: pid)
-            seam["renderer_activation"] = MacObservationMode.current == .passive
+            seam["renderer_activation"] = context.observationMode == .passive
                 ? .object(["status": .string("passive_unchanged")]) : .object(evidence)
             seam["enhanced_ax_set"] = .bool(evidence["status"] == .string("enabled"))
             if chromium {
@@ -77,25 +68,22 @@ extension SwiftNativeMacControl {
         }
         #endif
         func anchoredRead() -> MacAnchoredRead {
-            anchoredSnapshot(limits: limits, pid: pid, window: anchorWindow, complete: completeWindow || chromium, section: section)
+            anchoredSnapshot(limits: limits, pid: pid, window: anchorWindow, complete: completeWindow || chromium, section: section, context: context)
         }
         let firstAnchor = anchoredRead()
         #if canImport(ApplicationServices) && os(macOS)
-        if accessibilitySource is SystemMacAXElementSource, let pid, MacObservationMode.current != .passive {
+        if accessibilitySource(context: context) is SystemMacAXElementSource, let pid, context.observationMode != .passive {
             seam["renderer_activation"] = .object(MacChromiumAccessibilityState.shared.evidence(pid: pid))
         }
         #endif
-        // A self-process target is a refusal on BOTH the anchored and the
-        // unanchored path — the caller needs the reason, not a generic
-        // "no window" (the walk was refused, not absent).
+        // Self-process targets must explain refusal on anchored and unanchored reads rather than claim no window.
         if case .selfProcess = firstAnchor { return (nil, seam, firstAnchor) }
         if case .rendererUnavailable = firstAnchor { return (nil, seam, firstAnchor) }
         let read: MacAXRead? = {
             if case .read(let hit) = firstAnchor { return hit }
             return nil
         }()
-        // Only the ANCHORED call reports an anchor failure; an unanchored look
-        // has no window to have lost.
+        // Only anchored reads can report a lost anchor; unanchored reads never owned one.
         let anchorFailure: MacAnchoredRead? = {
             guard anchorPid != nil || anchorWindow != nil else { return nil }
             if case .read = firstAnchor { return nil }
@@ -108,21 +96,19 @@ extension SwiftNativeMacControl {
         ) -> (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?) {
             guard let value = candidate.read else { return (nil, candidate.seam, nil) }
             let outcome: (read: MacAXRead, seam: [String: JSONValue])
-            do { outcome = try pageScoped(value, limits: limits, scope: scope, completeWindow: completeWindow) }
+            do { outcome = try pageScoped(value, limits: limits, scope: scope, completeWindow: completeWindow, context: context) }
             catch { return (nil, candidate.seam, .rendererUnavailable(error.localizedDescription)) }
             var merged = candidate.seam
             for (key, item) in outcome.seam { merged[key] = item }
             return (outcome.read, merged, nil)
         }
         #if canImport(ApplicationServices) && os(macOS)
-        // The seam only exists for the LIVE source. A synthetic/unavailable
-        // source has no app element to flag, and pretending otherwise would be
-        // a stub that reports work it did not do.
-        guard accessibilitySource is SystemMacAXElementSource else { return scoped((read, seam)) }
-        // A minimized window can expose only an empty shell.
-        if let read, let source = accessibilitySource as? SystemMacAXElementSource,
+        // Only live sources have app elements to activate; unavailable sources cannot claim preparation ran.
+        guard accessibilitySource(context: context) is SystemMacAXElementSource else { return scoped((read, seam)) }
+        // Minimized windows may expose empty shells rather than readable content.
+        if let read, let source = accessibilitySource(context: context) as? SystemMacAXElementSource,
            let window = source.element(read.root),
-           MacAXAttributeRead.copyBool(window, kAXMinimizedAttribute) == true {
+           MacAXAttributeRead.copyBool(window, kAXMinimizedAttribute, context: context) == true {
             seam["window_minimized"] = .bool(true)
             return (read, seam, nil)
         }
@@ -130,22 +116,18 @@ extension SwiftNativeMacControl {
         else { return scoped((read, seam)) }
         let rendererWindow = read?.windowIdentity
         func rendererRead() -> MacAnchoredRead {
-            anchoredSnapshot(limits: limits, pid: pid, window: rendererWindow, complete: true, section: section)
+            anchoredSnapshot(limits: limits, pid: pid, window: rendererWindow, complete: true, section: section, context: context)
         }
         var result = scoped((read, seam))
         func rendererReady(_ inspected: (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?)) -> Bool {
             guard let read = inspected.read else { return false }
             let areas = read.snapshot.nodes.filter { $0.attributes.role == "AXWebArea" }
-            // A Chromium app's native windows have no renderer to await.
+            // Native Chromium windows have no renderer to await.
             guard !areas.isEmpty else { return true }
-            // Each renderer supplies its own load state. A ready sidebar does
-            // not certify a hollow sibling, and a loaded blank document is not
-            // mistaken for a still-loading one. AXLoaded is Chromium's tree
-            // load state; AXElementBusy also covers dynamic document work.
-            guard let source = accessibilitySource as? SystemMacAXElementSource else { return false }
+            // Each renderer owns readiness; a ready sidebar cannot certify a hollow sibling, and loaded blank documents remain valid.
+            guard let source = accessibilitySource(context: context) as? SystemMacAXElementSource else { return false }
             return areas.allSatisfy { area in
-                // Existing content is readable immediately, even while the
-                // document is busy. A sibling's text cannot certify this area.
+                // Read existing content even while busy; sibling text cannot certify this area.
                 if read.snapshot.nodes.contains(where: { node in
                     node.path.count > area.path.count && node.path.starts(with: area.path)
                         && [node.attributes.title, node.attributes.value].contains {
@@ -155,19 +137,17 @@ extension SwiftNativeMacControl {
                 guard let ref = area.element else { return false }
                 let state: (loaded: Bool?, busy: Bool?) = MacAXExecutionLane.sync {
                     guard let element = source.element(ref) else { return (nil, nil) }
-                    return (MacAXAttributeRead.copyBool(element, "AXLoaded"),
-                            MacAXAttributeRead.copyBool(element, kAXElementBusyAttribute))
+                    return (MacAXAttributeRead.copyBool(element, "AXLoaded", context: context),
+                            MacAXAttributeRead.copyBool(element, kAXElementBusyAttribute, context: context))
                 }
                 return state.loaded == true && state.busy != true
             }
         }
-        // Track each renderer's subtree, excluding window/chrome changes and
-        // the web area's own loading title. Live AX identity survives path
-        // changes; rearranging existing nodes is not content growth. A sibling
-        // shrinking must not hide growth in another renderer.
-        func rendererContent(_ inspected: (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?)) -> [(element: AXUIElement, nodes: Int, textBytes: Int)] {
+        // Track renderer-local growth by live identity, excluding chrome, loading titles and rearrangements; sibling shrinkage cannot hide growth.
+        func rendererContent(_ inspected: (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?)) -> [(element: AXUIElement, nodes: Int,
+            textBytes: Int)] {
             guard let read = inspected.read,
-                  let source = accessibilitySource as? SystemMacAXElementSource else { return [] }
+                  let source = accessibilitySource(context: context) as? SystemMacAXElementSource else { return [] }
             let areas = read.snapshot.nodes.filter { $0.attributes.role == "AXWebArea" }
             var content: [(element: AXUIElement, nodes: Int, textBytes: Int)] = []
             for area in areas {
@@ -184,21 +164,19 @@ extension SwiftNativeMacControl {
             }
             return content
         }
-        // Use the SAME complete window walk/readiness as the returned page,
-        // not a shallow web-area probe or a count of empty grouping nodes.
-        func readyResult(_ ready: (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?)) -> (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?) {
+        // Readiness and returned pages need the same complete window walk, not shallow counts of empty groups.
+        func readyResult(_ ready: (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?)) -> (read: MacAXRead?, seam: [String: JSONValue],
+            anchor: MacAnchoredRead?) {
             guard let read = ready.read else { return ready }
             if !MacChromiumAccessibility.hasWebArea(read.snapshot) {
-                // No renderer exists in this observed window tree. Do not call
-                // that proof of a loaded document: native Electron windows
-                // remain immediate, and a shell-only read names its boundary.
+                // No observed renderer is not proof of a loaded document; report shell boundaries while leaving native windows immediate.
                 var native = ready
                 native.seam["enhanced_ax_content"] = .string("no_renderer_tree")
-                if MacObservationMode.current == .passive, native.seam["enhanced_ax_set"] != .bool(true) {
-                    native.seam["renderer_wait_note"] = .string("raw view · passive observation · Renderer accessibility is not enabled; observation waits for the app's exposed content.")
+                if context.observationMode == .passive, native.seam["enhanced_ax_set"] != .bool(true) {
+                    native.seam["renderer_wait_note"] = .string(
+                        "raw view · passive observation · Renderer accessibility is not enabled; observation waits for the app's exposed content.")
                 }
-                // A native window is a complete immediate read, not a failed
-                // renderer read. Its ordinary screen provenance names AX.
+                // Native windows are immediate complete AX reads, not renderer failures.
                 return native
             }
             var settled = ready
@@ -220,30 +198,30 @@ extension SwiftNativeMacControl {
             reported.seam["renderer_wait_note"] = .string("raw view · accessibility · " + note)
             return reported
         }
-        if MacAXLimits.readDeadline.map({ Date() >= $0 }) == true {
+        if context.readDeadline.map({ Date() >= $0 }) == true {
             return unavailable("time_budget", "partial: budget reached; this is only the accessibility content read so far.")
         }
         if rendererEvents == nil {
-            // Some renderers expose notification support only after AX is
-            // enabled. Complete that same registration transaction now and
-            // close its race with the stream's initial reread.
-            do { rendererEvents = try MacAppSourceEvents(pid: pid) }
+            // Renderer notifications may become available only after activation; finish registration and reread to close that race.
+            do { rendererEvents = try MacAppSourceEvents(pid: pid, context: context) }
             catch { observationError = error }
         }
         guard let rendererEvents else {
             return unavailable("observation_unavailable",
-                "The renderer's content could not be awaited because app accessibility notifications are unavailable: \(observationError?.localizedDescription ?? "no observer").")
+                """
+                    The renderer's content could not be awaited because app accessibility notifications are unavailable: \
+                    \(observationError?.localizedDescription ?? "no observer").
+                    """)
         }
         var previousContent = rendererContent(result)
-        rendererEvents.watchContentStall(seconds: MacChromiumAccessibility.rendererStallSeconds)
+        rendererEvents.watchContentStall(seconds: MacChromiumAccessibility.rendererStallSeconds, context: context)
         return await withTaskCancellationHandler {
             do {
-                // Registration itself yields once: this reread closes the install
-                // race. Further reads follow AX callbacks or the stall boundary.
+                // Registration yields; its immediate reread closes the install race before callbacks or stall expiry drive further reads.
                 for try await _ in rendererEvents.stream {
                     try Task.checkCancellation()
                     result.seam["ax_watch_coverage"] = rendererEvents.coverage
-                    if MacAXLimits.readDeadline.map({ Date() >= $0 }) == true {
+                    if context.readDeadline.map({ Date() >= $0 }) == true {
                         return unavailable("time_budget", "partial: budget reached; this is only the accessibility content read so far.")
                     }
                     let changedAnchor = rendererRead()
@@ -266,7 +244,10 @@ extension SwiftNativeMacControl {
                     }
                     if rendererEvents.contentStalled {
                         return unavailable("stalled",
-                            "The renderer did not expose ready content and its accessibility subtree gained no nodes or text for \(Int(MacChromiumAccessibility.rendererStallSeconds)) seconds. This is its current accessibility tree.")
+                            """
+                                The renderer did not expose ready content and its accessibility subtree gained no nodes or text for \
+                                \(Int(MacChromiumAccessibility.rendererStallSeconds)) seconds. This is its current accessibility tree.
+                                """)
                     }
                 }
                 throw CancellationError()
@@ -274,7 +255,10 @@ extension SwiftNativeMacControl {
                 return unavailable("cancelled", "The renderer read was cancelled before ready content arrived. This is its current accessibility tree.")
             } catch {
                 return unavailable("observation_unavailable",
-                    "The renderer's accessibility observation stopped before ready content arrived: \(error.localizedDescription). This is its current accessibility tree.")
+                    """
+                        The renderer's accessibility observation stopped before ready content arrived: \(error.localizedDescription). This is its current \
+                        accessibility tree.
+                        """)
             }
         } onCancel: {
             rendererEvents.cancel()
@@ -283,15 +267,11 @@ extension SwiftNativeMacControl {
         return scoped((read, seam))
         #endif
     }
-    /// `mac_look` — the perception compiler's tool surface.
-    ///
-    /// Three grades of attention over ONE walk. `stare` is DELEGATED to
-    /// `handleAXTree` rather than reimplemented, so the full-tree payload can
-    /// never drift from `mac_ax_tree`'s.
-    func handleLook(_ body: [String: JSONValue]) async -> MacControlResult {
-        await lookFrameStore.read { await self.captureLook(body) }
+    /// All grades share one walk; delegate stare to handleAXTree so full-tree semantics cannot drift.
+    func handleLook(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> MacControlResult {
+        await lookFrameStore.read(context: context) { await self.captureLook(body, turn: turn, context: context) }
     }
-    private func captureLook(_ body: [String: JSONValue]) async -> (MacControlResult, MacLookFrame?) {
+    private func captureLook(_ body: [String: JSONValue], turn: Turn, context: MacOperationContext) async -> (MacControlResult, MacLookFrame?) {
         var capturedFrame: MacLookFrame?
         let started = now()
         let grade = (body["grade"]?.stringValue ?? "look").lowercased()
@@ -308,8 +288,8 @@ extension SwiftNativeMacControl {
                 durationMs: Int(now().timeIntervalSince(started) * 1000)
             ), nil)
         }
-        guard accessibilitySource.isTrusted() else { return (axUntrustedResult(action: "look"), nil) }
-        // Read a named running app's front window without focusing, launching or raising it.
+        guard accessibilitySource(context: context).isTrusted() else { return (axUntrustedResult(action: "look"), nil) }
+        // Named-app reads never focus, launch or raise the app.
         var anchorPid: Int32?
         var anchoredApp: MacAXAppInfo?
         if let requested = body["app"]?.stringValue?
@@ -331,7 +311,7 @@ extension SwiftNativeMacControl {
             }
             let resolution = MacBackgroundSight.resolve(
                 requested,
-                among: accessibilitySource.runningApps()
+                among: accessibilitySource(context: context).runningApps()
             )
             guard case .matched(let app) = resolution else {
                 let words = MacBackgroundSight.words(for: resolution, requested: requested)
@@ -373,8 +353,7 @@ extension SwiftNativeMacControl {
             anchoredApp = app
         }
         if grade == "stare" {
-            // The SAME payload mac_ax_tree returns, from the same handler.
-            let tree = handleAXTree(body)
+            let tree = handleAXTree(body, context: context)
             var output: [String: JSONValue] = [:]
             if case .object(let object) = tree.output { output = object }
             output["grade"] = .string("stare")
@@ -400,10 +379,10 @@ extension SwiftNativeMacControl {
             ), nil)
         }
         let limits = Self.axLimits(from: body)
-        let continuation = MacObservationMode.current == .passive ? nil
-            : MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
+        let continuation = context.observationMode == .passive ? nil
+            : turn.macContinuation.flatMap { $0.isPending ? $0 : nil }
         if let continuation {
-            if let refusal = continuation.refusal() {
+            if let refusal = continuation.refusal(context: context) {
                 return (MacControlResult(ok: false, action: "look",
                     output: .object(continuation.refusalOutput(refusal)), error: "continuation_unavailable",
                     durationMs: 0), nil)
@@ -411,17 +390,16 @@ extension SwiftNativeMacControl {
             anchorPid = continuation.app?.processIdentifier
             anchoredApp = continuation.app
         }
-        // A look replying to an act reads the window its owner re-read after
-        // the effect, while that is still the window this look anchors to.
-        let carried = MacSightCaptureBinding.current?.walked.flatMap { observed -> (read: MacAXRead, seam: [String: JSONValue])? in
+        // Reuse the owner’s post-effect read only while its window matches this look’s anchor.
+        let carried = context.capture?.walked.flatMap { observed -> (read: MacAXRead, seam: [String: JSONValue])? in
             guard continuation == nil, body["section"] == nil, body["app_map"] == .bool(true), grade == "look",
-                  let pid = anchorPid ?? accessibilitySource.frontmostApp()?.processIdentifier,
-                  observed.read.app?.processIdentifier == pid, let window = accessibilitySource.windowRoot(pid: pid),
-                  accessibilitySource.sameElement(window, observed.read.root) else { return nil }
+                  let pid = anchorPid ?? accessibilitySource(context: context).frontmostApp()?.processIdentifier,
+                  observed.read.app?.processIdentifier == pid, let window = accessibilitySource(context: context).windowRoot(pid: pid, context: context),
+                  accessibilitySource(context: context).sameElement(window, observed.read.root) else { return nil }
             return observed
         }
         // Clear rejected carried reads before replacement, so a timeout cannot expose the old window.
-        if carried == nil { MacSightCaptureBinding.current?.walked = nil }
+        if carried == nil { context.capture?.walked = nil }
         let snapshotted: (read: MacAXRead?, seam: [String: JSONValue], anchor: MacAnchoredRead?) = if let carried {
             (carried.read, carried.seam, nil)
         } else {
@@ -432,13 +410,13 @@ extension SwiftNativeMacControl {
                 anchorWindow: continuation?.window,
                 completeWindow: body["app_map"] == .bool(true) && grade == "look",
                 section: body["section"]?.stringValue
-            )
+            , context: context)
         }
         var read = snapshotted.read
         var seam = snapshotted.seam
         let anchor = snapshotted.anchor
         if case .selfProcess? = anchor {
-            return (selfInspectionResult(action: "look", started: started), nil)
+            return (selfInspectionResult(action: "look", started: started, context: context), nil)
         }
         if case .rendererUnavailable(let reason)? = anchor {
             return (MacControlResult(ok: false, action: "look", output: .object([
@@ -448,28 +426,25 @@ extension SwiftNativeMacControl {
         }
         let minimized = seam["window_minimized"] == .bool(true)
         if body["app_map"] != .bool(true), !minimized, let seek = body["seek"]?.stringValue, let current = read {
-            let found = seekScoped(current, seek: seek, limits: limits)
+            let found = seekScoped(current, seek: seek, limits: limits, context: context)
             read = found.read
             for (key, item) in found.seam { seam[key] = item }
         }
-        // For an anchored look, record WHO is in front (pid) and
-        // its key window, so an act that brings its app forward can put exactly that back —
-        // with or without a window to read.
-        // Never an AX read of our own process.
+        // Record front app and key window for anchored acts even when no readable target exists; never self-AX.
         let frontmostAppJSON: JSONValue = {
-            guard anchoredApp != nil, let front = accessibilitySource.frontmostApp(),
+            guard anchoredApp != nil, let front = accessibilitySource(context: context).frontmostApp(),
                   case .object(var object) = front.toJSON() else { return .null }
             if front.processIdentifier != getpid(),
-               let window = accessibilityActSource.focusedWindow(pid: front.processIdentifier) {
+               let window = accessibilityActSource(context: context).focusedWindow(pid: front.processIdentifier, context: context) {
                 object["window"] = window.identity.toJSON()
-                MacSightCaptureBinding.current?.foreground = MacForegroundSnapshot(app: front, window: window.identity)
+                context.capture?.foreground = MacForegroundSnapshot(app: front, window: window.identity)
             } else if front.processIdentifier == getpid() {
                 // Our own process is activated through AppKit, never self-AX.
-                MacSightCaptureBinding.current?.foreground = MacForegroundSnapshot(app: front, window: nil)
+                context.capture?.foreground = MacForegroundSnapshot(app: front, window: nil)
             } else {
                 do {
-                    if try accessibilityActSource.windows(pid: front.processIdentifier).isEmpty {
-                        MacSightCaptureBinding.current?.foreground = MacForegroundSnapshot(app: front, window: nil)
+                    if try accessibilityActSource(context: context).windows(pid: front.processIdentifier, context: context).isEmpty {
+                        context.capture?.foreground = MacForegroundSnapshot(app: front, window: nil)
                     }
                 } catch {
                     object["window_capture_error"] = .string(error.localizedDescription)
@@ -477,14 +452,10 @@ extension SwiftNativeMacControl {
             }
             return .object(object)
         }()
-        let runningApps = runningAppProjection()
+        let runningApps = runningAppProjection(context: context)
         guard let read, !minimized else {
-            // An anchored read that found nothing is a DIFFERENT fact from "no
-            // frontmost window": the app is running but has no readable window
-            // (minimized, or all windows closed). Saying the frontmost thing
-            // would describe a window that was never asked about.
-            // The session flag also covers a passwordless saver. Only the
-            // shared wake owner can report a remaining login window as locked.
+            // An anchored app without a readable window differs from no frontmost window; describe only the requested app. Saver flags cannot diagnose
+            // authentication; only the shared wake owner establishes a remaining lock.
             let covered = MacScreenLock.isLocked()
             let status = covered ? "display_obstructed"
                 : minimized ? "window_minimized"
@@ -495,7 +466,7 @@ extension SwiftNativeMacControl {
                 "status": .string(status),
                 "error": .string(status),
             ].merging(runningApps) { _, new in new }
-            if MacAXLimits.readDeadline.map({ Date() >= $0 }) == true {
+            if context.readDeadline.map({ Date() >= $0 }) == true {
                 output["message"] = .string("partial: budget reached; no readable accessibility content arrived within the read budget.")
                 return (MacControlResult(ok: false, action: "look", output: .object(output), error: "time_budget",
                     durationMs: Int(now().timeIntervalSince(started) * 1000)), nil)
@@ -517,28 +488,26 @@ extension SwiftNativeMacControl {
                     "\(name)'s window is minimized. go name:\"\(name)\" front:true brings it back when the task authorizes bringing it forward. "
                     + "Its menu bar still works: mac.act app:\"\(name)\" target:\"File > New\" makes a new window."
                 )
-            } else if anchoredApp == nil, let front = accessibilitySource.frontmostApp(),
+            } else if anchoredApp == nil, let front = accessibilitySource(context: context).frontmostApp(),
                       front.processIdentifier != getpid() {
-                // The windowless front app still takes keys: say which one it is.
+                // Windowless front apps still take keys, so retain their identity.
                 output["frontmost_app"] = front.toJSON()
             } else if let anchoredApp, case .windowGone? = anchor {
-                // A captured window disappearing says nothing about the app's
-                // other windows. Preserve that act/continuation precondition.
+                // A vanished captured window says nothing about sibling windows; preserve the act’s exact precondition.
                 output["requested_app"] = .string(anchoredApp.name)
                 output["frontmost_app"] = frontmostAppJSON
                 output["message"] = .string("The requested \(anchoredApp.name) window is gone; no other window was read.")
             } else if let anchoredApp {
                 output["requested_app"] = .string(anchoredApp.name)
                 output["frontmost_app"] = frontmostAppJSON
-                // Absence is what this look found, not a failed read or a
-                // request to create a window. Acts still require their own window.
+                // Observed absence is not read failure or permission to create a window; acts still need their own target.
                 output["status"] = .string("ok")
                 output.removeValue(forKey: "error")
                 output["app"] = .string(anchoredApp.name)
-                let running = accessibilitySource.runningApps().contains { $0.processIdentifier == anchoredApp.processIdentifier }
+                let running = accessibilitySource(context: context).runningApps().contains { $0.processIdentifier == anchoredApp.processIdentifier }
                 output["running"] = .bool(running)
                 if running { output["windows"] = .int(0) }
-                let menuReading = running ? menuBarReading(pid: anchoredApp.processIdentifier) : nil
+                let menuReading = running ? menuBarReading(pid: anchoredApp.processIdentifier, context: context) : nil
                 let menus = menuReading.map { MacMenuBar.topLevelNames($0.items) } ?? []
                 if let menuReading { output["menu_coverage"] = MacMenuBar.json(menuReading, statesKnown: false, depth: 1) }
                 if !menus.isEmpty { output["menus"] = .array(menus.map(JSONValue.string)) }
@@ -560,30 +529,28 @@ extension SwiftNativeMacControl {
         }
         seam.merge(read.snapshot.readGapsJSON) { _, gap in gap }
         let secretContext = MacScreenViewTextRedaction.nodeSecretContext(read.snapshot.nodes)
-        let percept = (carried == nil ? nil : MacSightCaptureBinding.current?.percept) ?? MacPerceptionCompiler.compile(
+        let percept = (carried == nil ? nil : context.capture?.percept) ?? MacPerceptionCompiler.compile(
             snapshot: read.snapshot,
             secretContext: secretContext,
             app: read.app,
             windowTitle: read.rootTitle,
-            // Same read epoch as the walk, anchored to the walked root.
+            // Keep the same read epoch and root anchor as the walk.
             focusPath: read.focusPath,
             maxAffordances: body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacPerceptionCompiler.maxAffordances,
             uncapped: body["app_map"] == .bool(true) && grade == "look"
         )
-        // Four-verb sight keeps the complete action index. Native page windows
-        // fold presentation later; a page budget never changes target identity.
+        // Retain the complete action index before page folding; presentation budgets cannot alter identity.
         let fourVerbs = body["app_map"] == .bool(true) && grade == "look"
         let redactedNodes = fourVerbs ? read.snapshot.nodes.map {
             JSONValue.object(MacScreenViewTextRedaction.redactedNodeFields($0, valueChars: .max, context: secretContext))
         } : []
-        // A walk that ran out of time is not the whole window: the view reads that one afresh.
+        // A timed-out walk is incomplete; view capture must inspect that window afresh.
         if fourVerbs, read.section == nil, !read.snapshot.truncationReasons.contains("time_budget") {
-            MacSightCaptureBinding.current?.walked = (read, seam)
+            context.capture?.walked = (read, seam)
         }
-        // Authored senses receive the same complete source snapshot. The
-        // native screen page is compiled from that read, not a second walk.
+        // Authored senses and native pages share the complete source snapshot rather than another walk.
         let needsMaterial = fourVerbs && (seam["chromium_family"] == .bool(true) || body["sense_material"] == .bool(true))
-        let accessibility: [String: JSONValue]? = needsMaterial || (fourVerbs && SenseAppReadCapture.current != nil && read.app?.bundleIdentifier != nil) ? {
+        let accessibility: [String: JSONValue]? = needsMaterial || (fourVerbs && context.appCapture != nil && read.app?.bundleIdentifier != nil) ? {
             let snapshot = read.snapshot
             return [
                 "nodes": .array(redactedNodes), "count": .int(Int64(redactedNodes.count)),
@@ -596,17 +563,15 @@ extension SwiftNativeMacControl {
         let windowKind = fourVerbs
             ? MacAppMaps.windowKind(role: read.windowIdentity?.role, subrole: read.windowIdentity?.subrole)
             : nil
-        // Render FIRST, so the frame mints handles only for the rows she will
-        // actually see (the byte budget may trim the tail) — "handles valid for
-        // this frame_id" means the handles in THIS payload. A glance shows no
-        // rows, so it mints every affordance and says how many are addressable.
+        // Render before minting handles so byte-trimmed rows cannot remain addressable. Glances mint every affordance and advertise their count despite showing
+        // no rows.
         let capturedAt = now()
-        let frameId = MacSightCaptureBinding.current?.frameID ?? UUID().uuidString
-        OwnedProgramRunner.ReadContent.current?.record(.string(frameId), content: .string("<frame>"))
-        OwnedProgramRunner.ReadContent.current?.depend(on: .object([
+        let frameId = context.capture?.frameID ?? UUID().uuidString
+        context.readContent?.record(.string(frameId), content: .string("<frame>"))
+        context.readContent?.depend(on: .object([
             "app": read.app?.toJSON() ?? .null, "window": read.windowIdentity?.toJSON() ?? .null,
         ]))
-        if fourVerbs, let capture = SenseAppReadCapture.current, let bundle = read.app?.bundleIdentifier, var tree = accessibility {
+        if fourVerbs, let capture = context.appCapture, let bundle = read.app?.bundleIdentifier, var tree = accessibility {
             tree["seam"] = .object(seam)
             tree["frame_id"] = .string(frameId)
             tree["app_bundle_id"] = .string(bundle)
@@ -622,9 +587,10 @@ extension SwiftNativeMacControl {
             if fourVerbs {
                 let compilation = try MacScreenPageCompiler.compile(snapshot: read.snapshot, redactedNodes: redactedNodes,
                     percept: percept, frameID: frameId,
-                    isFront: anchoredApp.map { accessibilitySource.frontmostApp()?.processIdentifier == $0.processIdentifier } ?? true,
-                    menuReading: read.app.map { menuBarReading(pid: $0.processIdentifier) },
-                    settableAttributes: { node in node.element.map { accessibilitySource.settableAttributes(of: $0) } ?? [] })
+                    isFront: anchoredApp.map { accessibilitySource(context: context).frontmostApp()?.processIdentifier == $0.processIdentifier } ?? true,
+                    menuReading: read.app.map { menuBarReading(pid: $0.processIdentifier, context: context) },
+                    settableAttributes: { node in node.element.map { accessibilitySource(context: context).settableAttributes(of: $0, context: context) }
+                        ?? [] })
                 nativePage = compilation.page
                 nativePageJSON = try JSONValue.parse(JSONEncoder().encode(compilation.page))
                 nativePageBlocks = compilation.blocks
@@ -636,7 +602,7 @@ extension SwiftNativeMacControl {
         }
         let captureStamp = JSONValue.string(NativeTimestampFormat.plainZulu(capturedAt))
         let envelope: [String: JSONValue] = {
-            OwnedProgramRunner.ReadContent.current?.record(.object(["frame_id": .string(frameId), "captured_at": captureStamp]),
+            context.readContent?.record(.object(["frame_id": .string(frameId), "captured_at": captureStamp]),
                 content: .object(["frame_id": .string(frameId)]))
             var output: [String: JSONValue] = [
                 "trusted": .bool(true),
@@ -649,13 +615,13 @@ extension SwiftNativeMacControl {
                 // Anchored reads need not be frontmost.
                 "front": .bool(
                     anchoredApp.map {
-                        accessibilitySource.frontmostApp()?.processIdentifier == $0.processIdentifier
+                        accessibilitySource(context: context).frontmostApp()?.processIdentifier == $0.processIdentifier
                     } ?? true
                 ),
                 "anchored": .bool(anchoredApp != nil),
-                // A front:true act can restore the app that was in front.
+                // Explicit front acts may restore the previously frontmost app.
                 "frontmost_app": frontmostAppJSON,
-                // Callers may lower the read limits; publish their resolved bounds.
+                // Publish resolved limits so comparisons know whether callers lowered them.
                 "limits": .object([
                     "max_nodes": .int(Int64(limits.maxNodes)),
                     "max_depth": .int(Int64(limits.maxDepth)),
@@ -663,7 +629,7 @@ extension SwiftNativeMacControl {
                     "hard_max_depth": .int(Int64(MacAXLimits.hardMaxDepth)),
                 ]),
             ].merging(runningApps) { _, new in new }
-            // Window coverage includes areas that publish no AX elements.
+            // Coverage must account for areas with no AX elements.
             if let windowFrame = read.windowIdentity?.frame {
                 output["window_frame"] = windowFrame.toJSON()
             }
@@ -704,7 +670,11 @@ extension SwiftNativeMacControl {
         } catch {
             return (MacControlResult(ok: false, action: "look",
                 output: .object(["error": .string("look_encoding_failed"),
-                    "message": .string("The screen reading could not be encoded: \(error.localizedDescription). Read the screen again after repairing the source value; no frame was published.")]),
+                    "message": .string(
+                        """
+                            The screen reading could not be encoded: \(error.localizedDescription). Read the screen again after repairing the source value; no \
+                            frame was published.
+                            """)]),
                 error: "look_encoding_failed", durationMs: Int(now().timeIntervalSince(started) * 1000)), nil)
         }
         var output = envelope
@@ -714,7 +684,7 @@ extension SwiftNativeMacControl {
                case .array(let rows)? = object["affordances"] { return rows.count }
             return 0
         }
-        // Both grades mint handles; look includes only the retained rows.
+        // Look mints only retained rows; glance mints all.
         capturedFrame = MacLookFrame.from(
             percept: percept,
             frameId: frameId,
@@ -722,8 +692,7 @@ extension SwiftNativeMacControl {
             windowTitle: read.rootTitle,
             rendered: renderedRows,
             windowIdentity: read.windowIdentity,
-            // Recorded so the NEXT act can tell "the window changed" from "the
-            // recompile ran under different bounds and lost rows".
+            // Record bounds so cap churn cannot be mistaken for window change.
             caps: MacLookCompileCaps(
                 truncated: percept.truncated,
                 maxAffordances: fourVerbs ? nil : body["max_affordances"]?.integerValue.flatMap(Int.init(exactly:)) ?? MacPerceptionCompiler.maxAffordances,
@@ -733,12 +702,12 @@ extension SwiftNativeMacControl {
             completeWindow: fourVerbs
         )
         if let bundle = read.app?.bundleIdentifier {
-            SenseAppReadCapture.current?.augment(bundleID: bundle,
+            context.appCapture?.augment(bundleID: bundle,
                 fields: ["affordances": output["affordances"] ?? .array([])])
         }
-        if fourVerbs { MacSightCaptureBinding.current?.percept = percept }
+        if fourVerbs { context.capture?.percept = percept }
         guard let observedApp = read.app,
-              accessibilitySource.appInfo(pid: observedApp.processIdentifier) == observedApp else {
+              accessibilitySource(context: context).appInfo(pid: observedApp.processIdentifier) == observedApp else {
             return (MacControlResult(ok: false, action: "look", output: .object([
                 "frame_id": .null, "message": .string("The observed app is no longer available; no frame was published."),
             ]), error: "app_gone", durationMs: Int(now().timeIntervalSince(started) * 1000)), nil)
@@ -752,10 +721,7 @@ extension SwiftNativeMacControl {
             nativePage: nativePage
         ), capturedFrame)
     }
-    /// The `ax_find` query, echoed back with its free-text fields shape-tested.
-    /// `role` is an AX role constant (`AXButton`), never user text, so it rides
-    /// out as-is — redacting it would break the caller's ability to see what it
-    /// asked for with no secret to protect.
+    /// Shape-check free-text query echoes; AX role constants remain intact because redacting them would obscure the requested role.
     static func redactedQueryJSON(_ query: MacAXQuery, valueChars: Int) -> JSONValue {
         func redacted(_ text: String?) -> JSONValue {
             guard let text else { return .null }
@@ -767,7 +733,7 @@ extension SwiftNativeMacControl {
             "value": redacted(query.value),
         ])
     }
-    func handleAXFind(_ body: [String: JSONValue]) throws -> MacControlResult {
+    func handleAXFind(_ body: [String: JSONValue], context: MacOperationContext) throws -> MacControlResult {
         let started = now()
         let query = MacAXQuery(
             role: body["role"]?.stringValue,
@@ -777,14 +743,12 @@ extension SwiftNativeMacControl {
         if query.isEmpty {
             throw MacControlError.missingField("role|title|value")
         }
-        guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "ax_find") }
-        // Search the SAME bounded tree ax_tree returns: node/depth caps stay
-        // hard, and the truncation state rides along so a zero-match answer is
-        // distinguishable from "the button was past the cap".
+        guard accessibilitySource(context: context).isTrusted() else { return axUntrustedResult(action: "ax_find") }
+        // Find shares tree caps and truncation reporting so no match cannot imply absence beyond the read boundary.
         let limits = Self.axLimits(from: body)
-        let anchored = axSnapshot(limits: limits)
+        let anchored = axSnapshot(limits: limits, context: context)
         if case .selfProcess = anchored {
-            return selfInspectionResult(action: "ax_find", started: started)
+            return selfInspectionResult(action: "ax_find", started: started, context: context)
         }
         if case .rendererUnavailable(let reason) = anchored {
             return MacControlResult(ok: false, action: "ax_find", output: .object(["message": .string(reason)]),

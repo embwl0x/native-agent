@@ -28,14 +28,13 @@ extension ClaudeBridgeRuntime {
         let rawScenario = (json["scenario"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let shouldClear = action == "clear" || rawScenario.lowercased() == "clear"
-        // Clamped here: Int(ttlSeconds) below traps on "inf" or 1e300.
+        // Clamp before Int conversion because infinity and enormous finite values trap.
         let ttlSeconds = Self.timeInterval(json["ttlSeconds"]).flatMap { $0.isFinite ? min(600, max(5, $0)) : nil } ?? 120
 
-        // Same WorkLatch + asyncAfter bound as handleMessage/handleTool.
         let workLatch = WorkLatch()
         let workTask = startRequest(conn: conn, latch: workLatch, priority: .utility) { [weak self] _ in
             guard let self else { return }
-            // Every response path below goes through respond(...), so the work Task and the deadline timer can never both write the response.
+            // All paths must share the response latch so work and deadline cannot both reply.
             func respond(_ status: Int, _ obj: [String: Any]) {
                 guard workLatch.claim() else { return }
                 self.writeJSON(conn, status: status, obj: obj)

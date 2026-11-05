@@ -5,34 +5,19 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `DeskClock.swift` | `DeskClock` enum; `nowISO`, `commitStamp` |
 
-// Shared formatting for Desk and TaskLedger: instants are UTC stamps, calendar
-// days are the Mac's current zone (law 7); monotonic issuance belongs to Desk.
+// UTC instants and local calendar days serve different ordering and day-bucket needs.
 
 public enum DeskClock {
-    // DateFormatter's SSSSSS only resolves to the millisecond (the trailing
-    // three digits are always zeros), so two "now" stamps in the same
-    // millisecond come out byte-identical — which lets the updatedAt CAS in
-    // markNotifiedIfUnchanged false-succeed and swallow a same-millisecond
-    // change. Guard: quantize to integer milliseconds and never re-issue a
-    // value <= the last one, so in-process nowISO() is strictly monotonic.
+    // DateFormatter resolves only milliseconds; monotonic issuance prevents same-millisecond CAS collisions.
     private static let lastIssuedMs = Mutex<Int64>(0)
 
-    /// Strictly monotonic "now" stamp: if the wall clock hasn't advanced past
-    /// the last issued millisecond (or stepped backwards), bump by 1ms.
+    /// Advance by a millisecond when the clock stalls or steps back so issued stamps stay ordered.
     public static func nowISO() -> String {
         isoFromMs(issueMs(floorMs: 0))
     }
 
-    /// Commit-time stamp for an op appended under the ops flock: strictly
-    /// greater than BOTH every stamp this process has issued AND the newest
-    /// ts already committed to the feed. In-process monotonicity alone is not
-    /// enough at the commit point — a stamp minted at op construction can
-    /// stall before the lock and commit BEHIND a later-issued notify stamp
-    /// (evaluator then swallows the change), and a second writer process
-    /// (e.g. chat-drive) shares the flock but not this process's monotonic
-    /// state. Flooring on the committed feed makes commit order == timestamp
-    /// order in both cases (Lamport-style: a corrupt far-future ts on disk
-    /// would drag stamps forward, trading wall-clock accuracy for ordering).
+    /// Floor on both issued and committed stamps under the flock so concurrent processes preserve commit order.
+    /// A corrupt future stamp trades wall-clock accuracy for that ordering guarantee.
     public static func commitStamp(notBefore lastCommitted: String?) -> String {
         var floorMs: Int64 = 0
         if let lastCommitted, let d = parseISO(lastCommitted) {
@@ -50,32 +35,22 @@ public enum DeskClock {
     }
 
     private static func isoFromMs(_ ms: Int64) -> String {
-        // +0.1ms keeps Double representation error from ever landing the
-        // reconstructed Date in the previous millisecond; DateFormatter
-        // rounds at the half-millisecond so the output is exactly `ms`.
+        // A 0.1ms bias absorbs Double error while remaining below DateFormatter’s rounding midpoint.
         nowISO(Date(timeIntervalSince1970: (Double(ms) + 0.1) / 1000.0))
     }
 
-    /// Pure UTC formatter for an explicit Date, without monotonic issuance.
     public static func nowISO(_ date: Date) -> String {
         NativeTimestampFormat.sixDigitUTCOffset(date)
     }
-
-    /// Parse an ISO-8601 timestamp produced by `nowISO`. Tolerant of both the
-    /// microsecond `+00:00` form and a bare-seconds fallback.
     public static func parseISO(_ s: String) -> Date? {
         NativeTimestampFormat.parseISO8601FractionalFirst(s)
     }
 
-    /// Parse a bare `yyyy-MM-dd` day stamp: its midnight in the Mac's zone.
     public static func parseDay(_ s: String) -> Date? {
         NativeTimestampFormat.parseCalendarDay(s)
     }
 
-    /// True when `s` parses as a calendar date — either a bare `yyyy-MM-dd` day
-    /// stamp (the felt-salience / reservation day form) or a full ISO timestamp.
-    /// Used by dossier structural validation: an unparseable date can't stand as
-    /// evidence.
+    /// Unparseable dates cannot stand as dossier evidence.
     public static func isParseableDate(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return false }
@@ -83,20 +58,15 @@ public enum DeskClock {
         return parseISO(t) != nil
     }
 
-    /// Collapse a parseable date/timestamp string to its `yyyy-MM-dd` local day, so
-    /// distinct-DAY counting can't be fooled by two timestamps on one day or a
-    /// bare day vs its midnight ISO form. nil for an unparseable string.
+    /// Normalize local days so timestamp variants cannot inflate distinct-day evidence.
     public static func normalizedDay(_ s: String) -> String? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if NativeTimestampFormat.parseCalendarDay(t) != nil { return t }   // already a bare day
+        if NativeTimestampFormat.parseCalendarDay(t) != nil { return t }
         if let d = parseISO(t) { return dayStamp(d) }
         return nil
     }
 
-    /// Deterministic reservation id for a (handle, day, slot) triple — the same
-    /// triple always yields the same id, so a replayed reserve op is idempotent
-    /// and the caps count distinct reservations without a mutable counter. Slot
-    /// is lowercased + non-alphanumerics collapsed to keep the id wire-clean.
+    /// Stable normalized reservation IDs make replay idempotent and caps count distinct reservations.
     public static func reservationId(handle: String, day: String, slot: String) -> String {
         let bare = handle.hasPrefix("desk_") ? String(handle.dropFirst("desk_".count)) : handle
         func clean(_ s: String) -> String {
@@ -110,15 +80,11 @@ public enum DeskClock {
             : "wattempt_\(lane.rawValue)_\(reservationId(handle: handle, day: day, slot: slot).dropFirst(5))"
     }
 
-    /// The `yyyy-MM-dd` day, in the Mac's zone, for a timestamp — the reservation/day bucket.
     public static func dayStamp(_ date: Date) -> String {
         NativeTimestampFormat.calendarDay(date)
     }
 
-    /// New stable item handle.
     public static func newHandle() -> String { "desk_" + UUID().uuidString.lowercased() }
-    /// New stable ref id (for in-place ref updates).
     public static func newRefId() -> String { "deskref_" + UUID().uuidString.lowercased() }
-    /// New op id.
     public static func newOpId() -> String { "deskop_" + UUID().uuidString.lowercased() }
 }

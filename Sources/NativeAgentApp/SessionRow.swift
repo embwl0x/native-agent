@@ -3,11 +3,9 @@ import AppKit
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `SessionRow.swift` | `SessionRow` and `ChatRenameStateMachine`: session pin/source presentation and one terminal rename result across submit/cancel/focus loss |
+// Blueprint: | `SessionRow.swift` | `SessionRow`, `ChatRenameStateMachine`: pin/origin display; exactly-once rename settlement |
 
-/// Shared state transitions for the conversation-row rename editor.
-/// A structural disappearance is always a cancel, and only one terminal event
-/// may escape even when Escape is immediately followed by focus loss.
+/// Disappearance cancels; Escape followed by focus loss must still emit only one terminal rename event.
 struct ChatRenameStateMachine: Equatable {
     enum EndResult: Equatable {
         case ignored
@@ -48,9 +46,7 @@ struct ChatRenameStateMachine: Equatable {
     }
 }
 
-/// Session-level origin is a trust boundary. Unlike a message's origin, this
-/// follows the whole conversation in the sidebar, so never interpolate a raw
-/// stored value or silently hide a missing one.
+/// Session origin is a trust boundary; never interpolate raw stored values or hide a missing one.
 struct ChatSidebarSessionSourceBadge: Equatable {
     enum Tone: Equatable {
         case remote
@@ -73,11 +69,11 @@ struct ChatSidebarSessionSourceBadge: Equatable {
             return nil
         case "telegram":
             return Self(label: "Telegram", symbol: "paperplane.fill", tone: .remote)
-        case "ios", "iphone", "ipad":
+        case "ios":
             return Self(label: "iPhone / iPad", symbol: "iphone", tone: .remote)
         case "slack":
             return Self(label: "Slack", symbol: "bubble.left.and.bubble.right.fill", tone: .remote)
-        case "bridge", "agent_bridge":
+        case "agent-bridge":
             return Self(label: "Bridge", symbol: "arrow.left.arrow.right", tone: .remote)
         default:
             return Self(label: "External source", symbol: "exclamationmark.triangle", tone: .unknown)
@@ -85,7 +81,7 @@ struct ChatSidebarSessionSourceBadge: Equatable {
     }
 }
 
-// Rows omit previews but search includes them; rename matches PinnedSessionTab's commit/cancel behavior.
+// Search includes omitted previews so compact rows do not reduce discoverability.
 struct SessionRow: View {
     enum PinState {
         case unpinned
@@ -108,7 +104,7 @@ struct SessionRow: View {
     var onSelect: () -> Void
     var renaming: Bool = false
     var onRenameBegin: (() -> Void)? = nil
-    /// nil = rename canceled/no-op; non-nil = commit this cleaned title.
+    /// Nil is cancellation or no-op; only a non-nil cleaned title commits.
     var onRenameEnd: ((String?) -> Void)? = nil
 
     @State private var hovering = false
@@ -116,11 +112,7 @@ struct SessionRow: View {
 
     @State private var renameState = ChatRenameStateMachine()
     @FocusState private var titleFocused: Bool
-    // One rename ends exactly once. Esc fires onExitCommand AND the resulting
-    // focus loss fires the onChange commit before the parent's renaming=false
-    // re-render lands — without this guard a canceled edit could still
-    // commit. (PinnedSessionTab gets this for free from its local isRenaming;
-    // this row's rename state lives in the parent, so the sync guard is local.)
+    // Escape triggers focus loss before the parent redraws; a local guard prevents a canceled rename from committing.
 
     var body: some View {
         HStack(spacing: 6) {
@@ -171,7 +163,6 @@ struct SessionRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background {
-            // Hover fills unselected rows with Reduce Motion-aware animation.
             RoundedRectangle(cornerRadius: 8)
                 .fill(selected
                     ? AnyShapeStyle(Color.accentColor.opacity(0.16))
@@ -182,8 +173,7 @@ struct SessionRow: View {
             value: hovering
         )
         .onHover { hovering = $0 }
-        // LazyVStack recycles rows by identity — clear hover on disappear so a
-        // recycled row can't reappear pre-lit with the rename pencil showing.
+        // LazyVStack recycles rows; clear hover so a reused row cannot reappear pre-lit.
         .onDisappear { hovering = false }
     }
 
@@ -196,8 +186,7 @@ struct SessionRow: View {
                 .lineLimit(1)
                 .focused($titleFocused)
                 .onSubmit { endRename(renameState.submit(currentTitle: session.displayTitle)) }
-                // Submit or genuine focus loss commits; Escape, selection changes
-                // and structural disappearance cancel through the single-fire state machine.
+                // Route submit, focus loss and cancellation through one state machine to prevent duplicate settlement.
                 .onKeyPress(.escape) {
                     endRename(renameState.cancel())
                     return .handled
@@ -219,8 +208,7 @@ struct SessionRow: View {
                 .font(.subheadline.weight(selected ? .semibold : .regular))
                 .lineLimit(1)
                 .truncationMode(.tail)
-                // Keep the drag source and pointer hit-testing unchanged,
-                // but expose the same selection action to VoiceOver.
+                // Expose selection to VoiceOver without changing drag or pointer hit-testing.
                 .accessibilityLabel(session.displayTitle)
                 .accessibilityAddTraits(.isButton)
                 .accessibilityValue(selected ? "Selected" : "Not selected")

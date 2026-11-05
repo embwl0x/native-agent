@@ -1,43 +1,40 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SenseDoor.swift` | Registry-first reads (explicit raw:true skips selection), sense failures returned as themselves with no second read, bundled-kind ownership, exact served provenance and file-material envelopes; empty app observations pass through without material or stale served views; the admitted request owns/cancels its shared raw flight, and cancelled reads cannot cache late material; captured views retain the turn's growth refusal, discarding refused file bytes while preserving screen/site read and action snapshots; distinct private web/visible browser/group-owned Chrome provenance, same-corner act verification without re-entry, wrong-version reporting, captured native/JS site action material, Chrome envelope continuations and native screen continuation snapshots |
+// Blueprint: | `SenseDoor.swift` | Registry-first reads, exact captured views and provenance; raw reads stay explicit and acts retain ordinary gates |
 
-/// The door's read adapter. The original reader still clears its own fences;
-/// its result is retained for a failure or a request for the raw view.
+/// Retain the admitted raw result for explicit raw views and failure evidence; its reader still owns admission.
 public enum SenseDoor {
-    @TaskLocal public static var readingRaw = false
-    /// Post-action verification must not enqueue a read behind the sense
-    /// entry that is awaiting this same door action's result.
-    @TaskLocal public static var verifyingActCorner: SenseCorner?
 
     public static func read(
         corner: SenseCorner, address: String?, input: [String: JSONValue], scope: String = "",
         nativeCorner: SenseCorner? = nil,
         nativeReadSupported: Bool = true,
         fileAlreadyReadable: Bool = false,
-        raw: @escaping @Sendable () async throws -> JSONValue,
-        material: @escaping @Sendable (JSONValue) async throws -> SenseMaterial
+        operation: SenseReadOperation,
+        raw: @escaping @Sendable (SenseReadOperation) async throws -> JSONValue,
+        material: @escaping @Sendable (JSONValue, SenseReadOperation) async throws -> SenseMaterial
     ) async throws -> JSONValue {
         let bundle: String? = if case .app(let bundle) = corner { bundle } else { nil }
         let capture = SenseAppReadCapture(bundleID: bundle)
-        return try await SenseAppReadCapture.$current.withValue(capture) {
-            try await readCaptured(corner: corner, address: address, input: input, scope: scope,
+        var operation = operation
+        operation.appCapture = capture
+        return try await readCaptured(corner: corner, address: address, input: input, scope: scope,
                 nativeCorner: nativeCorner, nativeReadSupported: nativeReadSupported, fileAlreadyReadable: fileAlreadyReadable,
-                raw: raw, material: material)
-        }
+                operation: operation, raw: raw, material: material)
     }
 
     private static func readCaptured(
         corner: SenseCorner, address: String?, input: [String: JSONValue], scope: String,
         nativeCorner: SenseCorner?, nativeReadSupported: Bool, fileAlreadyReadable: Bool,
-        raw: @escaping @Sendable () async throws -> JSONValue,
-        material: @escaping @Sendable (JSONValue) async throws -> SenseMaterial
+        operation: SenseReadOperation,
+        raw: @escaping @Sendable (SenseReadOperation) async throws -> JSONValue,
+        material: @escaping @Sendable (JSONValue, SenseReadOperation) async throws -> SenseMaterial
     ) async throws -> JSONValue {
-        // An explicit raw read is the caller's choice of view: it needs no sense selection.
-        guard !readingRaw, input["raw"] != .bool(true), verifyingActCorner != corner else {
+        // An explicit raw view needs no sense selection.
+        guard !operation.options.raw, input["raw"] != .bool(true), operation.options.verifyingActCorner != corner else {
             return try await readView(corner: corner, address: address, input: input, scope: scope,
-                record: nil, nativeReadSupported: nativeReadSupported, raw: raw, material: material)
+                record: nil, nativeReadSupported: nativeReadSupported, operation: operation, raw: raw, material: material)
         }
         let record: SenseRecord?
         do {
@@ -45,7 +42,7 @@ public enum SenseDoor {
         } catch is CancellationError { throw CancellationError() }
         catch {
             let failure = SenseFailure(error, code: "registry_failure")
-            var fields = failure.failureEvidence().merging([
+            let fields = failure.failureEvidence().merging([
                 "ok": .bool(false), "error_code": .string(failure.code), "error": .string(failure.message),
                 "remedy": failure.remedy ?? Repair.reconcile(
                     instruction: "Inspect and repair the sense registry failure; no sense page was served.",
@@ -57,14 +54,16 @@ public enum SenseDoor {
         var readInput = input
         if case .app = corner, input["wrong"] == .bool(true) { readInput.removeValue(forKey: "wrong") }
         let result = try await readView(corner: corner, address: address, input: readInput, scope: scope,
-            record: record, nativeReadSupported: nativeReadSupported, raw: raw, material: material)
+            record: record, nativeReadSupported: nativeReadSupported, operation: operation, raw: raw, material: material)
         guard isSuccessfulRaw(result) else { return result }
         if input["wrong"] == .bool(true) {
             if case .fileKind = corner, fileAlreadyReadable {
                 return growthReply(result, note: "This file is readable by today's reader; a rejected text view does not grow a file sense.")
             }
-            // She fixes it here, in her turn; then it's built.
-            return growthReply(result, note: "Noted. Fix it now: write how \(corner.key) should read with app sense.make (it runs on this place and shows you the page; keep:true makes it stay).")
+            return growthReply(result, note: """
+                Noted. Fix it now: write how \(corner.key) should read with app sense.make (it runs on this place and shows you the page; keep:true makes \
+                it stay).
+                """)
         }
         return result
     }
@@ -78,17 +77,16 @@ public enum SenseDoor {
     private static func readView(
         corner: SenseCorner, address: String?, input: [String: JSONValue], scope: String,
         record: SenseRecord?, nativeReadSupported: Bool,
-        raw: @escaping @Sendable () async throws -> JSONValue,
-        material: @escaping @Sendable (JSONValue) async throws -> SenseMaterial
+        operation: SenseReadOperation,
+        raw: @escaping @Sendable (SenseReadOperation) async throws -> JSONValue,
+        material: @escaping @Sendable (JSONValue, SenseReadOperation) async throws -> SenseMaterial
     ) async throws -> JSONValue {
-        if verifyingActCorner == corner {
-            return signedRaw(try await raw(), line: "raw view · builtin-chrome · site act verification")
+        if operation.options.verifyingActCorner == corner {
+            return signedRaw(try await raw(operation), line: "raw view · builtin-chrome · site act verification")
         }
-        guard !readingRaw else { return try await raw() }
+        guard !operation.options.raw else { return try await raw(operation) }
         let registry = SensesHub.shared.registry
-        // The Mac door has already rechecked read authority. A continuation
-        // reads the snapshot it names, retaining that snapshot's exact handles
-        // instead of applying old offsets to a new window and replacing its frame.
+        // Continue the named snapshot after Mac read admission so old offsets cannot select handles in a new window.
         if case .app = corner, input["raw"] != .bool(true), input["wrong"] != .bool(true),
            case .string(let requested)? = input["__sense_address"],
            requested.hasPrefix("{"), case .object(let cursor) = try JSONValue.parse(Data(requested.utf8)),
@@ -98,59 +96,63 @@ public enum SenseDoor {
                $0.scope == scope && $0.page.corner == corner && $0.record.id == record.id
                    && $0.record.version == record.version && $0.page.more == requested
             }), let fullPage = served.fullPage else {
-                throw SenseFailure(code: "screen_snapshot_unavailable", message: "That screen snapshot is no longer available. Read the app again for a current page; the old cursor was not applied to a new window.")
+                throw SenseFailure(code: "screen_snapshot_unavailable", message: """
+                    That screen snapshot is no longer available. Read the app again for a current page; the old cursor was not applied to a new window.
+                    """)
             }
             var page = try SenseNativePages.window(fullPage, arguments: cursor)
             page.address = requested
             if case .app(let bundle) = corner, case .accessibility(let tree)? = served.capturedMaterial {
-                SenseAppReadCapture.current?.record(bundleID: bundle, tree: tree)
+                operation.appCapture?.record(bundleID: bundle, tree: tree)
             }
-            try await recordRead(record, registry: registry)
+            try await recordRead(record, registry: registry, turn: operation.turn)
             var provenance = SenseProvenance(record: record); provenance.uses += 1
-            SensesHub.shared.didServe(provenance)
+            SensesHub.shared.didServe(provenance, reads: operation.senseReads)
             SenseDoorViews.shared.remember(page, record: record, source: served.source, scope: scope,
                 materialRef: served.materialRef, readInput: served.readInput, capturedMaterial: served.capturedMaterial,
-                fullPage: fullPage, growthCheck: served.growthCheck)
-            return .string(render(page, provenance: provenance))
+                fullPage: fullPage, growthCheck: served.growthCheck, turn: operation.turn)
+            return .string(render(page, provenance: provenance, readContent: operation.readContent))
         }
         if record?.status != .on { SenseDoorViews.shared.forget(corner: corner, scope: scope) }
         let source = DoorSource(corner: corner, input: input, address: address, raw: raw, material: material)
-        if case .app = corner, case .object(let result) = try await source.rawResult(),
+        if case .app = corner, case .object(let result) = try await source.rawResult(operation: operation),
            result["ok"] == .bool(true), case .object(let observation)? = result["detail"],
            observation["status"] == .string("ok"),
            observation["running"] == .bool(false)
                 || (observation["running"] == .bool(true) && observation["windows"] == .int(0)) {
-            // There is no window material to interpret or page to bind. This
-            // is the successful source observation, not a broken sense.
+            // No window material is a successful source observation, not evidence of a broken sense.
             SenseDoorViews.shared.forget(corner: corner, scope: scope)
             return .object(result)
         }
         if let record, record.status == .unavailable, input["raw"] != .bool(true) {
-            return senseFailure(SenseFailure(code: "sense_unavailable", message: record.unavailableReason ?? "Sense is unavailable; repair it and switch it on to retry."), record: record)
+            return senseFailure(
+                SenseFailure(code: "sense_unavailable", message: record.unavailableReason ?? "Sense is unavailable; repair it and switch it on to retry."),
+                record: record
+            )
         }
         guard input["raw"] != .bool(true), input["wrong"] != .bool(true),
               let record, record.status == .on, nativeReadSupported || record.language != .native else {
-            let result = try await source.rawResult()
+            let result = try await source.rawResult(operation: operation)
             if case .fileKind = corner, case .object(let fields) = result,
                fields["error_code"] == .string("binary_file"),
                case .object(let next)? = fields["next_call"], case .object(let call)? = next["input"],
                call["action"] == .string("sense.make") {
-                let captured = try await source.material(for: corner, address: address)
-                let page = try await source.page(for: corner, address: address)
+                let captured = try await source.material(for: corner, address: address, operation: operation)
+                let page = try await source.page(for: corner, address: address, operation: operation)
                 let reader = SenseRecord(id: "raw", corner: corner, status: .draft, language: .native, origin: .builtIn, entry: nil, createdAt: Date())
                 SenseDoorViews.shared.remember(page, record: reader, source: source, scope: scope,
-                    materialRef: address, readInput: input, capturedMaterial: captured)
+                    materialRef: address, readInput: input, capturedMaterial: captured, turn: operation.turn)
             }
             if input["raw"] == .bool(true), isSuccessfulRaw(result) {
                 if case .fileKind = corner {
                     guard case .object(let fields) = result, fields["ok"] == .bool(true),
                           case .string? = fields["path"], case .string? = fields["content"] else { return result }
                 }
-                let captured = try await source.material(for: corner, address: address)
-                let page = try await source.page(for: corner, address: address)
+                let captured = try await source.material(for: corner, address: address, operation: operation)
+                let page = try await source.page(for: corner, address: address, operation: operation)
                 let reader = SenseRecord(id: "raw", corner: corner, status: .draft, language: .native, origin: .builtIn, entry: nil, createdAt: Date())
                 SenseDoorViews.shared.remember(page, record: reader, source: source, scope: scope,
-                    materialRef: address, readInput: input, capturedMaterial: captured)
+                    materialRef: address, readInput: input, capturedMaterial: captured, turn: operation.turn)
             }
             if case .fileKind = corner {
                 let reason = input["wrong"] == .bool(true) ? "view marked wrong"
@@ -176,39 +178,48 @@ public enum SenseDoor {
             return signedRaw(result, line: "raw view · \(reader) · \(reason)")
         }
         if record.language == .native {
-            // Day-one wrappers retain the existing raw representation and
-            // presentation; provenance is outside that payload.
-            let result = try await source.rawResult()
+            // Preserve raw payload representation and presentation; provenance belongs outside it.
+            let result = try await source.rawResult(operation: operation)
             guard isSuccessfulRaw(result) else {
                 if case .fileKind = corner { return rawView(result, reason: "today's reader refused this read") }
                 return signedRaw(result, line: "raw view · \(record.id) reader refused this read")
             }
-            let page = try await source.page(for: corner, address: address)
+            let page = try await source.page(for: corner, address: address, operation: operation)
             if case .site = corner, case .string(let requested)? = input["__sense_address"], requested.hasPrefix("site:"),
                requested.split(separator: "#", maxSplits: 1).first.map(String.init) != page.address {
                 return signedRaw(.object(["status": .string("failed"), "error": .string("page_changed"),
                     "effects": .string("none"), "reason": .string("This reading place belongs to a different page; read the held tab again.")]),
                     line: "raw view · captured Chrome page identity disagrees with the requested place; no native page was served")
             }
-            try await recordRead(record, registry: registry)
+            try await recordRead(record, registry: registry, turn: operation.turn)
             var provenance = SenseProvenance(record: record)
             provenance.uses += 1
-            SensesHub.shared.didServe(provenance)
-            let fullPage: NativePage? = if case .app = corner { try await source.fullPage() } else { nil }
+            SensesHub.shared.didServe(provenance, reads: operation.senseReads)
+            let fullPage: NativePage? = if case .app = corner { try await source.fullPage(operation: operation) } else { nil }
             let captured: SenseMaterial?
-            if case .app(let bundle) = corner, let tree = SenseAppReadCapture.current?.tree(bundleID: bundle) {
+            if case .app(let bundle) = corner, let tree = operation.appCapture?.tree(bundleID: bundle) {
                 captured = .accessibility(tree)
             } else if record.id == "builtin-chrome" {
-                captured = try await source.material(for: corner, address: address)
+                captured = try await source.material(for: corner, address: address, operation: operation)
             } else { captured = await (source as? DoorSource)?.captured }
-            SenseDoorViews.shared.remember(page, record: record, source: source, scope: scope, materialRef: address, readInput: input, capturedMaterial: captured, fullPage: fullPage)
+            SenseDoorViews.shared.remember(
+                page,
+                record: record,
+                source: source,
+                scope: scope,
+                materialRef: address,
+                readInput: input,
+                capturedMaterial: captured,
+                fullPage: fullPage, turn: operation.turn
+            )
             if let requested = input["__sense_address"], case .string(let address) = requested,
                address.hasPrefix("{"), case .object(let fields) = try JSONValue.parse(Data(address.utf8)),
                fields["__sense_text_offset"] != nil {
-                return .string(render(page, provenance: provenance)
+                return .string(render(page, provenance: provenance, readContent: operation.readContent)
                     + (SenseScreenThings.captureStatus(in: result).map { "\n" + $0 } ?? ""))
             }
-            if case .string(let text) = result { return .string("Place: \(page.address)\n" + text + "\n" + provenance.line(now: Date())) }
+            if case .string(let text) = result { return .string("Place: \(page.address)\n" + text + "\n" + provenance.line(now: Date(), readContent: operation
+                .readContent)) }
             if case .object(var fields) = result {
                 if case .app = corner {
                     if input["structured"] == .bool(true) { fields["things"] = try JSONValue.parse(JSONEncoder().encode(page.things)) }
@@ -227,24 +238,23 @@ public enum SenseDoor {
                     fields["detail"] = .object(detail)
                 }
                 fields["sense_place"] = .string(page.address)
-                fields["sense_provenance"] = .string(provenance.line(now: Date()))
+                fields["sense_provenance"] = .string(provenance.line(now: Date(), readContent: operation.readContent))
                 return .object(fields)
             }
-            return .object(["raw": result, "sense_place": .string(page.address), "sense_provenance": .string(provenance.line(now: Date()))])
+            return .object(["raw": result, "sense_place": .string(page.address), "sense_provenance": .string(provenance.line(now: Date(), readContent: operation
+                .readContent))])
         }
-        do { _ = try await source.material(for: corner, address: address) }
+        do { _ = try await source.material(for: corner, address: address, operation: operation) }
         catch {
             return senseFailure(SenseFailure(error, code: "source_unavailable"), record: record)
         }
         guard let runner = SensesHub.shared.runner else {
             return senseFailure(SenseFailure(code: "runner_unavailable", message: "The sense runner is unavailable."), record: record)
         }
-        let outcome = await $readingRaw.withValue(true) {
-            await SenseActionContext.$perform.withValue(nil) {
-                let requested: String? = if case .string(let value)? = input["__sense_address"] { value } else { address }
-                return await runner.run(record, request: .read(address: requested), source: source)
-            }
-        }
+        var readOperation = operation
+        readOperation.options.raw = true; readOperation.perform = nil
+        let requested: String? = if case .string(let value)? = input["__sense_address"] { value } else { address }
+        let outcome = await runner.run(record, request: .read(address: requested), source: source, operation: readOperation)
         switch outcome {
         case .page(var page, let provenance):
             guard page.corner == corner, page.text.utf8.count <= NativePage.maximumTextBytes else {
@@ -255,24 +265,29 @@ public enum SenseDoor {
                     page.things[index].verbs = record.verbsEnabled ? page.things[index].verbs.filter(record.verbs.contains) : []
                 }
             }
-            SensesHub.shared.didServe(provenance)
+            SensesHub.shared.didServe(provenance, reads: operation.senseReads)
             let captured: SenseMaterial? = switch corner {
-            case .app, .site: try await source.material(for: corner, address: address)
-            // Whatever this read already captured; never a second read.
+            case .app, .site: try await source.material(for: corner, address: address, operation: operation)
+            // Reuse material already captured by this read without a second source read.
             default: await (source as? DoorSource)?.captured
             }
             if case .site = corner, let more = page.more,
                case .pageSnapshot(.object(let snapshot))? = captured, let cursor = snapshot["readMore"] {
                 _ = SenseNativePages.chromeContinuation(snapshot, cursor: cursor, scope: scope, alias: more)
             }
-            SenseDoorViews.shared.remember(page, record: record, source: source, scope: scope, materialRef: address, readInput: input, capturedMaterial: captured)
-            if case .site = corner, case .object(var fields) = try await source.rawResult() {
-                // Structured Chrome consumers keep the exact snapshot/action
-                // proof envelope; the served native view and signature travel
-                // alongside it. Direct text callers receive the rendered page.
-                let servedText = render(page, provenance: provenance)
-                // A place's own sense is its page; don't also hand her the
-                // builtin's text and continuations for the same place.
+            SenseDoorViews.shared.remember(
+                page,
+                record: record,
+                source: source,
+                scope: scope,
+                materialRef: address,
+                readInput: input,
+                capturedMaterial: captured, turn: operation.turn
+            )
+            if case .site = corner, case .object(var fields) = try await source.rawResult(operation: operation) {
+                // Structured Chrome consumers need the exact snapshot/action envelope beside the served view; direct text callers receive the rendered page.
+                let servedText = render(page, provenance: provenance, readContent: operation.readContent)
+                // A place's own sense must not duplicate the builtin's text and continuations.
                 if record.origin != .builtIn { fields.removeValue(forKey: "text"); fields.removeValue(forKey: "element_more") }
                 fields["sense_page"] = .string(servedText)
                 fields["source_bytes"] = fields["bytes"]
@@ -280,12 +295,11 @@ public enum SenseDoor {
                 fields["has_more"] = .bool(page.more != nil || !page.folded.isEmpty || fields["has_more"] == .bool(true))
                 if let more = page.more { fields["sense_more"] = .string(more) }
                 fields["sense_place"] = .string(page.address)
-                fields["sense_provenance"] = .string(provenance.line(now: Date()))
+                fields["sense_provenance"] = .string(provenance.line(now: Date(), readContent: operation.readContent))
                 return .object(fields)
             }
             if case .fileKind = corner {
-                // Identity comes from the exact material delivered to the sense,
-                // never the raw reader's first byte window (or package refusal).
+                // Derive identity from material delivered to the sense, not the raw reader's first byte window or package refusal.
                 guard var fields = await source.fileEnvelope() else {
                     return senseFailure(SenseFailure(code: "bad_output", message: "The sense file read has no material receipt."), record: record)
                 }
@@ -293,12 +307,12 @@ public enum SenseDoor {
                 fields["has_more"] = .bool(hasMore)
                 fields["truncated"] = .bool(hasMore)
                 if let more = page.more { fields["next"] = .string(more) }
-                fields["sense_page"] = .string(render(page, provenance: provenance))
+                fields["sense_page"] = .string(render(page, provenance: provenance, readContent: operation.readContent))
                 fields["sense_place"] = .string(page.address)
-                fields["sense_provenance"] = .string(provenance.line(now: Date()))
+                fields["sense_provenance"] = .string(provenance.line(now: Date(), readContent: operation.readContent))
                 return .object(fields)
             }
-            return .string(render(page, provenance: provenance))
+            return .string(render(page, provenance: provenance, readContent: operation.readContent))
         case .failed(let failure):
             return senseFailure(failure, record: record)
         case .acted:
@@ -309,12 +323,14 @@ public enum SenseDoor {
     public static func selectedRecord(for corner: SenseCorner, nativeCorner: SenseCorner? = nil) async throws -> SenseRecord? {
         try await SensesHub.shared.waitUntilReady()
         guard let registry = SensesHub.shared.registry else {
-            throw SenseFailure(code: "registry_unavailable", message: "The sense registry is not installed. Repair runtime assembly before reading through a sense; raw:true explicitly reads the source.")
+            throw SenseFailure(code: "registry_unavailable", message: """
+                The sense registry is not installed. Repair runtime assembly before reading through a sense; raw:true explicitly reads the source.
+                """)
         }
         let records = try await registry.all()
         if let exact = records.first(where: { $0.corner == corner && $0.status == .on }) { return exact }
         if let unavailable = records.first(where: { $0.corner == corner && $0.status == .unavailable }) { return unavailable }
-        // An explicit off-switch for the concrete corner also disables fallback.
+        // Respect a concrete corner's off-switch before considering a generic reader.
         if records.contains(where: { $0.corner == corner && $0.status == .off }) { return nil }
         guard let generic = nativeCorner ?? BuiltInSenses.fallbackCorner(for: corner), generic != corner else { return nil }
         return records.first { $0.corner == generic && ($0.status == .on || $0.status == .unavailable) }
@@ -326,8 +342,8 @@ public enum SenseDoor {
         return .object(["raw": result, "sense_provenance": .string(line)])
     }
 
-    private static func recordRead(_ record: SenseRecord, registry: FileSenseRegistry?) async throws {
-        try await registry?.recordUse(senseID: record.id, version: record.version)
+    private static func recordRead(_ record: SenseRecord, registry: FileSenseRegistry?, turn: Turn?) async throws {
+        try await registry?.recordUse(senseID: record.id, version: record.version, turn: turn)
     }
 
     private static func isSuccessfulRaw(_ result: JSONValue) -> Bool {
@@ -342,18 +358,15 @@ public enum SenseDoor {
         signedRaw(result, line: "raw view · " + reader + " · " + reason)
     }
 
-    public static func render(_ page: NativePage, provenance: SenseProvenance) -> String {
+    public static func render(_ page: NativePage, provenance: SenseProvenance, readContent: OwnedProgramRunner.ReadContent? = nil) -> String {
         if SenseScreenThings.isNativeScreenPage(page) {
-            // Screen things are already inline, in their document position.
-            // Continuations retain that one representation and action index.
-            // The built-in screen sense supplies the reader attribution.
-            // Preserve exceptional raw-view reasons, but don't also print the
-            // compiler's ordinary accessibility attribution beneath it.
+            // Keep inline screen things and their action index on continuations; preserve exceptional raw-view reasons without duplicating ordinary reader
+            // attribution.
             let text = provenance.senseID == "builtin-screen"
                 ? page.text.components(separatedBy: "\n").filter { $0 != SenseScreenThings.accessibilityReadLine }.joined(separator: "\n")
                 : page.text
             var lines = ["Place: \(page.address)", text + screenContinuationText(page)]
-            lines.append(provenance.line(now: Date()))
+            lines.append(provenance.line(now: Date(), readContent: readContent))
             return lines.joined(separator: "\n")
         }
         var lines = ["Place: \(page.address)", page.title + " [" + page.address + "]", page.text]
@@ -370,14 +383,13 @@ public enum SenseDoor {
                 } ?? "")
                 + (thing.verbs.isEmpty ? "" : " · " + thing.verbs.joined(separator: ", "))
         }
-        // One line per thing; the act syntax once per page.
         if page.things.contains(where: { !$0.verbs.isEmpty }) {
             lines.append("Act: app {action: \"sense.\(provenance.senseID).<verb>\", args: {address: \"<thing's [address]>\"}}")
         }
         if !page.folded.isEmpty { lines.append("Folded: " + page.folded.joined(separator: ", ")) }
         if let more = page.more { lines.append("More: " + more) }
         lines.append("Read: app {page: \"\(page.corner.key)\", item: \"\(page.address)\"}")
-        let provenanceLine = provenance.line(now: Date())
+        let provenanceLine = provenance.line(now: Date(), readContent: readContent)
         let text = lines.filter { !$0.isEmpty }.joined(separator: "\n")
         return text + "\n" + provenanceLine
     }
@@ -394,14 +406,16 @@ public enum SenseDoor {
         return lines.isEmpty ? "" : "\n" + lines.joined(separator: "\n")
     }
 
-    /// A sense that cannot serve its page says so with its own identity and
-    /// repair. Nothing reads the place a second way behind it: raw:true is
-    /// the caller's explicit choice, never an automatic recovery.
+    /// Return sense failures with identity and repair; a second raw read requires the caller's explicit raw:true choice.
     private static func senseFailure(_ failure: SenseFailure, record: SenseRecord) -> JSONValue {
         let read = JSONValue.object(["tool": .string("app"), "input": .object(["action": .string("sense.versions"),
             "args": .object(["sense_id": .string(record.id)])])])
         let remedy = failure.remedy ?? Repair.remedy(owner: "sense \(record.id) v\(record.version)", nextCall: read, tap: nil,
-            instruction: "Read this sense's retained versions and failure. Reread the original place with raw:true, then revise its code with sense.make for place \(record.corner.key); inspect the trial's page, then keep that exact trial_id and digest with keep:true. Do not turn an owner-disabled sense on yourself.")
+            instruction: """
+                Read this sense's retained versions and failure. Reread the original place with raw:true, then revise its code with sense.make for place \
+                \(record.corner.key); inspect the trial's page, then keep that exact trial_id and digest with keep:true. Do not turn an owner-disabled \
+                sense on yourself.
+                """)
         return .object(failure.failureEvidence().merging(["ok": .bool(false),
             "error_code": .string(failure.code), "error": .string(failure.message),
             "sense_id": .string(record.id), "sense_version": .int(Int64(record.version)),
@@ -414,15 +428,15 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
     let corner: SenseCorner
     let input: [String: JSONValue]
     let address: String?
-    let raw: @Sendable () async throws -> JSONValue
-    let convert: @Sendable (JSONValue) async throws -> SenseMaterial
+    let raw: @Sendable (SenseReadOperation) async throws -> JSONValue
+    let convert: @Sendable (JSONValue, SenseReadOperation) async throws -> SenseMaterial
     var result: Task<JSONValue, Error>?
     var captured: SenseMaterial?
     var fileRead: [String: JSONValue]?
     var completePage: NativePage?
 
-    init(corner: SenseCorner, input: [String: JSONValue], address: String?, raw: @escaping @Sendable () async throws -> JSONValue,
-         material: @escaping @Sendable (JSONValue) async throws -> SenseMaterial) {
+    init(corner: SenseCorner, input: [String: JSONValue], address: String?, raw: @escaping @Sendable (SenseReadOperation) async throws -> JSONValue,
+         material: @escaping @Sendable (JSONValue, SenseReadOperation) async throws -> SenseMaterial) {
         self.corner = corner; self.input = input; self.address = address; self.raw = raw; convert = material
     }
 
@@ -439,7 +453,7 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
 
     func fileEnvelope() -> [String: JSONValue]? { fileRead }
 
-    func changes(for corner: SenseCorner, address: String?) async throws -> AsyncStream<SenseSourceChange> {
+    func changes(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> AsyncStream<SenseSourceChange> {
         guard input["__sense_action"] != .string("web.read") else {
             throw SenseFailure(code: "unsupported", message: "A fetched web document has no event-backed live source; no Chrome page was substituted.")
         }
@@ -454,21 +468,23 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
                 throw SenseFailure(code: "source_unavailable", message: "A file watch requires its admitted read address.")
             }
             arguments["path"] = .string(path)
-            return try await source.changes(for: corner, address: JSONValue.object(arguments).serialize(pretty: false))
+            return try await source.changes(for: corner, address: JSONValue.object(arguments).serialize(pretty: false), operation: operation)
         }
-        return try await source.changes(for: corner, address: readAddress())
+        return try await source.changes(for: corner, address: readAddress(), operation: operation)
     }
 
     nonisolated func readAddress() throws -> String {
-        var arguments = input.filter { (!$0.key.hasPrefix("__") || ["__sense_reader", "__sense_action"].contains($0.key)) && !["raw", "wrong", "why"].contains($0.key) }
+        var arguments = input.filter { (!$0.key.hasPrefix("__")
+            || ["__sense_reader", "__sense_action"].contains($0.key)) && !["raw", "wrong", "why"].contains($0.key)
+        }
         if case .fileKind = corner, arguments["path"] == nil, let address { arguments["path"] = .string(address) }
         if case .app(let id) = corner, arguments["app"] == nil { arguments["app"] = .string(id) }
         if case .stream(id: "web") = corner, arguments["url"] == nil, let address { arguments["url"] = .string(address) }
         return try JSONValue.object(arguments).serialize(pretty: false)
     }
 
-    func page(for corner: SenseCorner, address: String?) async throws -> NativePage {
-        let result = try await rawResult()
+    func page(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> NativePage {
+        let result = try await rawResult(operation: operation)
         let text = if case .site = corner, case .object(let fields) = result, case .string(let content)? = fields["text"] { content }
             else if let content = SenseScreenThings.text(in: result) { content }
             else if case .string(let text) = result { text } else { try result.serialize(pretty: false) }
@@ -489,8 +505,10 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
         }
         let things: [NativeThing]
         var pageAddress = try (address ?? readAddress())
-        let chromeRead = !["web.read", "browser.text", "browser.links"].contains({ if case .string(let action)? = input["__sense_action"] { action } else { "" } }())
-        if case .site = corner, chromeRead, case .pageSnapshot(let snapshot) = try await material(for: corner, address: address) {
+        let chromeRead = !["web.read", "browser.text", "browser.links"].contains({
+            if case .string(let action)? = input["__sense_action"] { action } else { "" }
+        }())
+        if case .site = corner, chromeRead, case .pageSnapshot(let snapshot) = try await material(for: corner, address: address, operation: operation) {
             things = try SenseNativePages.chromeThings(snapshot)
             if case .object(let fields) = snapshot, case .string(let url)? = fields["url"], let host = URL(string: url)?.host {
                 pageAddress = SenseNativePages.chromeAddress(host: host, url: url)
@@ -506,21 +524,24 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
         return try SenseNativePages.window(entire, arguments: arguments)
     }
 
-    func fullPage() async throws -> NativePage {
+    func fullPage(operation: SenseReadOperation) async throws -> NativePage {
         if let completePage { return completePage }
-        _ = try await page(for: corner, address: address)
+        _ = try await page(for: corner, address: address, operation: operation)
         guard let completePage else { throw SenseFailure(code: "source_unavailable", message: "The native screen snapshot is unavailable.") }
         return completePage
     }
 
-    /// This admitted read owns its shared raw flight through actual exit.
-    /// Cancellation propagates to it and prevents late material publication.
-    func rawResult() async throws -> JSONValue {
+    /// The admitted read owns its shared raw flight through exit; cancellation prevents late material publication.
+    func rawResult(operation: SenseReadOperation) async throws -> JSONValue {
         try Task.checkCancellation()
         let task: Task<JSONValue, Error>
         if let result { task = result }
         else {
-            task = Task { try await SenseDoor.$readingRaw.withValue(true) { try await raw() } }
+            task = Task {
+                var rawOperation = operation
+                rawOperation.options.raw = true; rawOperation.perform = nil
+                return try await raw(rawOperation)
+            }
             result = task
         }
         let value = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
@@ -528,23 +549,22 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
         return value
     }
 
-    func material(for corner: SenseCorner, address: String?) async throws -> SenseMaterial {
+    func material(for corner: SenseCorner, address: String?, operation: SenseReadOperation) async throws -> SenseMaterial {
         guard corner == self.corner else { throw SenseFailure(code: "source_unavailable", message: "That corner is outside this read.") }
-        // Addresses returned by a sense select its things, never another file,
-        // app or tab. The converter retains this call's authorized material.
+        // Sense addresses select only things in this call's authorized material, never another file, app or tab.
         if let captured { return captured }
         let material: SenseMaterial
         if input["raw"] == .bool(true) {
-            material = try await convert(rawResult())
+            material = try await convert(rawResult(operation: operation), operation)
         } else if case .fileKind = corner {
             guard let provider = SensesHub.shared.source else {
                 throw SenseFailure(code: "source_unavailable", message: "The admitted file source is unavailable.")
             }
-            material = try await provider.material(for: corner, address: readAddress())
-        } else { material = try await convert(rawResult()) }
+            material = try await provider.material(for: corner, address: readAddress(), operation: operation)
+        } else { material = try await convert(rawResult(operation: operation), operation) }
         if case .app(let bundle) = corner, case .accessibility(let tree) = material {
             try Task.checkCancellation()
-            SenseAppReadCapture.current?.record(bundleID: bundle, tree: tree)
+            operation.appCapture?.record(bundleID: bundle, tree: tree)
         }
         try Task.checkCancellation()
         captured = material
@@ -552,9 +572,7 @@ private actor DoorSource: SenseNativePageSource, SenseSourceWatchingProvider, Se
     }
 }
 
-/// Only served things can be acted on. This bounded, in-memory index grants no
-/// authority: the door rechecks the current registry version and every request
-/// an act makes passes through the normal tool chain.
+/// Served-view lookup grants no authority: acts must recheck the registry version and pass every request through ordinary gates.
 public final class SenseDoorViews: @unchecked Sendable {
     public static let shared = SenseDoorViews()
     private let lock = NSLock()
@@ -594,8 +612,8 @@ public final class SenseDoorViews: @unchecked Sendable {
 
     public func remember(_ page: NativePage, record: SenseRecord, source: any SenseSourceProvider, scope: String,
                          materialRef: String?, readInput: [String: JSONValue], capturedMaterial: SenseMaterial? = nil,
-                         fullPage: NativePage? = nil, growthCheck: (@Sendable () -> String?)? = nil) {
-        let turnCheck = CapabilityLifecycle.turnWriteCheck()
+                         fullPage: NativePage? = nil, growthCheck: (@Sendable () -> String?)? = nil, turn: Turn?) {
+        let turnCheck = CapabilityLifecycle.turnWriteCheck(turn)
         let source: any SenseSourceProvider = (source as? DoorSource)?.fresh() ?? source
         let makeSource: @Sendable () -> any SenseSourceProvider = {
             if let door = source as? DoorSource { return door.fresh() }
@@ -603,7 +621,17 @@ public final class SenseDoorViews: @unchecked Sendable {
         }
         lock.withLock {
             views.removeAll { $0.page.address == page.address && $0.record.id == record.id && $0.scope == scope }
-            views.append(View(page: page, record: record, makeSource: makeSource, scope: scope, materialRef: materialRef, readInput: readInput, capturedMaterial: capturedMaterial, growthCheck: { turnCheck()?.message ?? growthCheck?() }, fullPage: fullPage))
+            views.append(View(
+                page: page,
+                record: record,
+                makeSource: makeSource,
+                scope: scope,
+                materialRef: materialRef,
+                readInput: readInput,
+                capturedMaterial: capturedMaterial,
+                growthCheck: { turnCheck()?.message ?? growthCheck?() },
+                fullPage: fullPage
+            ))
             if views.count > 32 { views.removeFirst(views.count - 32) }
         }
     }

@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import Security
 
-// Blueprint: | `ChromeSocketIdentity.swift` | `ChromeSocketIdentity`: throwing kernel audit-token peer validation against the running caller's designated signer; Security check/status and POSIX errno survive refusal, unsigned identity is refused |
+// Blueprint: | `ChromeSocketIdentity.swift` | `ChromeSocketIdentity`; Kernel peer and signer proof with exact failures. |
 
 public enum ChromeSocketIdentity {
     // Peer identity inherits the running caller's signer, never a peer file's requirement.

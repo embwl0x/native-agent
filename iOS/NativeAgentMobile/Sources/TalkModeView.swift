@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 import NativeAgentShared
-// Blueprint: | `TalkModeView.swift` | The call face is their room: the chosen haze, their name in serif, a presence that breathes and lifts with whoever is speaking, each side's latest line, glass mute/end; Reduce Motion stills it, Reduce Transparency keeps it legible |
+// Blueprint: | `TalkModeView.swift` | Haze call face, latest words and mute/end; accessible motion/transparency and speaking presence |
 
 struct TalkModeView: View {
     let talk: TalkModeController
@@ -9,7 +9,6 @@ struct TalkModeView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var shades: [Color] { HazeColor(stored: hazeRaw).shades.map { Color(hex: $0) } }
-    /// Whoever is speaking lifts the presence: her voice, or the live mic level.
     private var level: CGFloat {
         CGFloat(talk.isSpeaking ? talk.speechPulse : (talk.isMuted ? 0 : talk.inputLevel))
     }
@@ -44,7 +43,7 @@ struct TalkModeView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// A breath every ~4.5 s, lifted by the speaking voice. Still under Reduce Motion.
+    /// The speaking voice lifts a ~4.5 s breath; Reduce Motion must still it.
     private var presence: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || !(talk.isActive || talk.isStarting))) { context in
             let t = context.date.timeIntervalSinceReferenceDate
@@ -74,7 +73,6 @@ struct TalkModeView: View {
         .accessibilityHidden(true)
     }
 
-    /// Each side's latest line, large enough to read at arm's length.
     private var captions: some View {
         VStack(alignment: .leading, spacing: 16) {
             line(talk.agentName, talk.agentCaption, emphasized: true)

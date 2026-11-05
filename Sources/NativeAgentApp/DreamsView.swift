@@ -2,13 +2,11 @@ import TrustCenter
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `DreamsView.swift` | `DreamsView`: shared diary reads, exact palette date selection without substituting another entry, dream/REM controls and unavailable/error presentation |
-// Dream and REM switches belong to Settings → Inner life; this page reads them.
+// Blueprint: | `DreamsView.swift` | `DreamsView`: checked diary reads, exact dates and Dream/REM controls |
 import SwiftUI
 import DreamREMCycle
 import PersistenceCore
 
-/// Manual Dream and REM actions share availability, each from its own authority read.
 enum DreamRunAvailability: Equatable {
     case checking
     case enabled
@@ -28,10 +26,7 @@ enum DreamRunAvailability: Equatable {
     var canRun: Bool { self == .enabled }
 }
 
-/// The Dreams surface displays failures from diary reads, manual Dream/REM
-/// runs, and gate writes. A non-nil operation error is
-/// evidence of failure even when a producer supplied no usable diagnostic;
-/// never erase that state into an empty red strip or a success-shaped surface.
+/// A non-nil operation error proves failure even without diagnostic text; never render it as success or an empty error strip.
 enum DreamErrorBannerPresentation {
     static let maximumDetailCharacters = 280
     static let missingDetailText = "Dreams operation failed, but no diagnostic detail was returned."
@@ -48,9 +43,7 @@ enum DreamErrorBannerPresentation {
     }
 }
 
-/// The diary refresh outcome is distinct from the diary's content. An empty
-/// array after a successful read is an honest empty diary; a failed read over
-/// retained entries is stale data, and a failed first read is unavailable.
+/// Only a successful empty read proves an empty diary; failed reads leave retained entries stale or the first load unavailable.
 enum DreamDiaryRefreshPresentation: Equatable {
     case current
     case retainedStale(entryCount: Int)
@@ -74,8 +67,7 @@ enum DreamDiaryRefreshPresentation: Equatable {
     var unavailableEmptyState: Bool { self == .unavailable }
 }
 
-/// A successful diary read can still omit individual damaged files. Keep that
-/// third state distinct from both an empty diary and a total reader failure.
+/// A successful read may omit damaged files; keep partial coverage distinct from empty and failed reads.
 enum DreamDiaryListPresentation: Equatable {
     case readable
     case incomplete(unreadableEntries: Int)
@@ -94,9 +86,7 @@ enum DreamDiaryListPresentation: Equatable {
     }
 }
 
-/// The detail pane must distinguish an unselected diary from a selected date
-/// whose fetch did not yield an entry. The latter is an unavailable read, never
-/// an instruction to select a dream again.
+/// A selected date with no fetched entry is unavailable, not an unselected diary.
 enum DreamEntryDetailPresentation: Equatable {
     case loading
     case entry
@@ -138,8 +128,6 @@ struct DreamsView: View {
     private var diaryTotalEntries: Int? { diaryOwner.diary?.totalEntries }
     private var diaryUnreadableEntries: Int { diaryOwner.diary?.unreadableEntries ?? 0 }
 
-    /// One page of the diary; "Show older dreams" adds another page, so every
-    /// entry, archived ones included, is reachable from the list.
     private static let diaryPage = 60
     @State private var diaryLimit = DreamsView.diaryPage
 
@@ -193,7 +181,6 @@ struct DreamsView: View {
         }
     }
 
-    /// The header speaks in the agent's voice once the diary has been read.
     private var headerLine: String? {
         if diaryLoadFailed && entries.isEmpty { return "I couldn't read my dream diary just now." }
         guard hasReadDiaryGate else { return nil }
@@ -204,7 +191,6 @@ struct DreamsView: View {
         return kept + (dreamEnabledFromDiary ? "." : "; my dream cycle is off.")
     }
 
-    // ── Controls ──────────────────────────────────────────────────────────────
     private var controlBar: some View {
         VStack(alignment: .leading, spacing: 12) {
             AliveGroupCard {
@@ -259,7 +245,6 @@ struct DreamsView: View {
         }
     }
 
-    // ── Content (master/detail, with empty + loading states) ────────────────────
     @ViewBuilder
     private var content: some View {
         if entries.isEmpty {
@@ -275,7 +260,10 @@ struct DreamsView: View {
             } else if case .incomplete(let unreadableEntries) = diaryListPresentation {
                 AdvancedEmptyState(
                     title: "Dream diary incomplete",
-                    detail: "\(unreadableEntries) diary file\(unreadableEntries == 1 ? "" : "s") could not be read, so this is not evidence that no dreams have been recorded.",
+                    detail: """
+                        \(unreadableEntries) diary file\(unreadableEntries == 1 ? "" : "s") could not be read, so this is not evidence that no dreams have \
+                        been recorded.
+                        """,
                     actionTitle: "Retry",
                     action: { refresh() }
                 )
@@ -289,10 +277,8 @@ struct DreamsView: View {
             VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
             AliveEyebrow("My diary")
             HSplitView {
-                // Left: diary dates, newest first.
                 List(selection: $selectedDate) {
-                    // Week titles are plain rows: a plain List pins section
-                    // headers, and over the clear background they stacked.
+                    // Use plain week rows because List pins section headers and stacks them over clear backgrounds.
                     ForEach(DreamDiaryWeeks.weeks(entries)) { week in
                         Text(week.title)
                             .font(ShellType.captionMedium)
@@ -325,7 +311,6 @@ struct DreamsView: View {
                 .scrollContentBackground(.hidden)
                 .frame(minWidth: 200, idealWidth: 240)
 
-                // Right: selected entry, rendered readably.
                 detailPanel
                     .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -343,11 +328,8 @@ struct DreamsView: View {
             let reading = DreamReaderText.reading(entry.text)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    // Lead with the dream's own title; the date is a caption.
                     VStack(alignment: .leading, spacing: 2) {
-                        // The file's date is the day the dream is about; its
-                        // time is when I wrote it (the 03:30 run lands the next
-                        // morning), so the two are named apart.
+                        // Name the dream's date and write time separately because overnight runs write about the preceding day.
                         let night = "Night of " + DreamReaderText.friendlyDate(entry.date)
                         Text(reading.title ?? night)
                             .accessibilityIdentifier("dreams.selected-entry.\(entry.date)")
@@ -396,7 +378,6 @@ struct DreamsView: View {
         }
     }
 
-    // Light markdown line renderer, mirroring ContentView.receiptLine().
     @ViewBuilder
     private func dreamLine(_ raw: String) -> some View {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
@@ -434,7 +415,6 @@ struct DreamsView: View {
         }
     }
 
-    // ── Actions ─────────────────────────────────────────────────────────────────
     @MainActor
     private func refresh() {
         refreshTask?.cancel()
@@ -449,7 +429,7 @@ struct DreamsView: View {
         guard !isRunningDream else { return }   // synchronous guard — no double-fire
         isRunningDream = true
         Task {
-            let ok = await appModel.runDreamPassForDreams()
+            let ok = await appModel.runDreamPassForDreams().ok
             isRunningDream = false
             if ok { await loadDiary(selectLatest: true) }
         }
@@ -468,7 +448,6 @@ struct DreamsView: View {
         }
     }
 
-    // ── Loaders ───────────────────────────────────────────────────────────────
     @MainActor
     private func loadDiary(selectLatest: Bool = false) async {
         appModel.dreamError = nil
@@ -539,7 +518,10 @@ struct DreamsView: View {
         case .checking:
             return "Checking REM-cycle permission."
         case .enabled:
-            return "I reread the last week of dreams, draft up to five growth notes from patterns that recur on two or more days, and send them to you for approval. Dreams older than two weeks move to the archive."
+            return """
+                I reread the last week of dreams, draft up to five growth notes from patterns that recur on two or more days, and send them to you for \
+                approval. Dreams older than two weeks move to the archive.
+                """
         case .disabled:
             return "Weekly dream consolidation is off. Turn it on in Settings \u{25B8} Inner life."
         case .unavailable:
@@ -569,12 +551,8 @@ struct DreamsView: View {
     }
 }
 
-// ── Reader text ────────────────────────────────────────────────────────────────
 
-/// How a stored entry reads on screen. `DreamCycleRunner` writes
-/// `# Dream — <date>` then `**<title>**`; the date is already in the list and
-/// the caption, so that heading is dropped (only an exact match of the
-/// pattern) and the title leads the reader.
+/// Drop only the exact stored date heading: the list and caption already carry it, leaving the dream's title to lead.
 enum DreamReaderText {
     static func reading(_ content: String) -> (title: String?, body: String) {
         var lines = content.components(separatedBy: "\n")[...]
@@ -589,8 +567,7 @@ enum DreamReaderText {
         else { return (nil, content) }
         lines = lines.dropFirst()
         dropBlank()
-        // A night dreamt again holds several dreams, each under its own title:
-        // the night leads, and every dream keeps its title in the body.
+        // Keep each dream's title when a night has several entries.
         guard DreamNight(content).dreams.count <= 1 else { return (nil, lines.joined(separator: "\n")) }
         var title: String?
         if let line = lines.first?.trimmingCharacters(in: .whitespaces),
@@ -605,8 +582,7 @@ enum DreamReaderText {
         return (title, lines.joined(separator: "\n"))
     }
 
-    /// `2026-09-22` → "Tue, Sep 22" (with the year only when it isn't this
-    /// one). Anything that isn't a plain date stays as written.
+    /// Leave non-date identifiers unchanged; include the year only outside the current year.
     static func friendlyDate(_ key: String, now: Date = Date(),
                              calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
         let parser = ISO8601DateFormatter()
@@ -622,13 +598,10 @@ enum DreamReaderText {
     }
 }
 
-// ── Date row ───────────────────────────────────────────────────────────────────
 private struct DreamDateRow: View {
     let entry: DreamEntry
 
-    /// The night's dream (the latest, as Today and `dream_diary_read` name
-    /// it): its title, or my own opening words. A byte count tells a reader
-    /// nothing about which night this was.
+    /// Use the latest dream's title or opening words; a byte count cannot identify a night.
     private var excerpt: String {
         TodayWords.line(entry.night.latest.map { $0.title ?? $0.firstLine } ?? "", limit: 90)
     }
@@ -650,14 +623,10 @@ private struct DreamDateRow: View {
     }
 }
 
-/// Bounded, user-visible completion for the same response returned by
-/// `BackgroundLoopsAssembly.runRem`. A synchronous manual run has already completed;
-/// calling it "started" hides both no-op weeks and malformed responses.
+/// A synchronous REM response has completed; report its bounded outcome rather than claiming it merely started.
 enum DreamsREMActionFeedback: Equatable {
     case completed(proposals: Int, archivedEntries: Int)
-    /// A root too young to recur — the pass ran and found nothing worth
-    /// consolidating. A normal outcome, reported as one line, never as a
-    /// failure.
+    /// Finding nothing worth consolidating is a normal completed outcome, not a failure.
     case nothingToConsolidate
     case failed(String)
 

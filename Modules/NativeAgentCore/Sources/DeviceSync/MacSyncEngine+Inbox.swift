@@ -7,12 +7,11 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Inbox.swift` | MacSyncEngine: shared inner-action ledger decisions, freshness, response recovery, reservation and settlement; the ledger response wins, and strictly bound executed rows without one recover HMAC-verified matching response files through the same owner for both transports and stale pending files; transport acquisition, delivery and archival remain separate |
+// Blueprint: | `MacSyncEngine+Inbox.swift` | Both transports share ledger admission, replay, recovery and settlement. |
 
 extension MacSyncEngine {
 
-    /// Both transports consult the same bound ledger before freshness, then
-    /// reserve immediately before dispatch. Transport acquisition and delivery stay outside.
+    /// Both transports share ledger admission before freshness and reserve immediately before dispatch.
     private func inboxTransactionDecision(
         _ action: InboxAction, transactionId: String, digest: String?, envelopeFreshnessError: String? = nil
     ) async -> (record: ICloudTransactionRecord?, executed: Bool,
@@ -37,7 +36,12 @@ extension MacSyncEngine {
                 record.response = await retainedInboxResponse(action, record: record, digest: digest)
                 prior = record
             } else {
-                refusal = ("transaction_id_collision", "This command carries a transaction id that already belongs to a different command, so it was refused rather than answered with that command's result.")
+                refusal = (
+                    "transaction_id_collision",
+                    """
+                        This command carries a transaction id that already belongs to a different command, so it was refused rather than answered with that \
+                        command's result.
+                        """)
             }
         }
         let executed = prior.map { Self.inboxActionDidExecute($0.state) } ?? false
@@ -45,8 +49,7 @@ extension MacSyncEngine {
                 refusal == nil && !executed ? inboxActionFreshnessError(action) ?? envelopeFreshnessError : nil)
     }
 
-    /// A retained ledger response wins. Otherwise, only a strictly bound executed
-    /// row can recover a signed response file and settle its missing result.
+    /// Only a strictly bound executed row may recover its missing result from a signed response file.
     private func retainedInboxResponse(
         _ action: InboxAction, record: ICloudTransactionRecord, digest: String?
     ) async -> [String: String]? {
@@ -72,8 +75,7 @@ extension MacSyncEngine {
         return nil
     }
 
-    /// The ledger response owns replay; a response file never overrides it.
-    /// Without a retained result, report uncertainty rather than confirmed failure.
+    /// The ledger owns replay; missing retained results remain uncertain and response files cannot override them.
     private func replayInboxResponse(
         _ action: InboxAction, record: ICloudTransactionRecord?, refusal: (code: String, message: String)?
     ) throws -> [String: String] {
@@ -107,8 +109,7 @@ extension MacSyncEngine {
                                attempts: 1, error: response["message"], response: response, directory: directory)
     }
 
-    /// The admitted processor retains ownership through retirement cleanup.
-    /// A rematerialized original may replace this claim only for the same envelope.
+    /// Retain ownership through cleanup; a rematerialized claim may replace it only for the same envelope.
     private func releaseUndispatchedDriveClaim(pendingURL: URL, originalURL: URL, envelope: Data) async {
         await sync.storage.perform {
             let coordinator = NSFileCoordinator(filePresenter: nil)
@@ -157,7 +158,6 @@ extension MacSyncEngine {
         }
     }
 
-
     // MARK: - Inbox watcher (NSMetadataQuery on inbox/)
 
     func startInboxQuery(docsURL: URL) {
@@ -165,7 +165,10 @@ extension MacSyncEngine {
         let q = NSMetadataQuery()
         // Exclude archived and pending files at the query boundary to avoid spurious wake-ups.
         q.predicate = NSPredicate(
-            format: "%K BEGINSWITH %@ AND NOT (%K CONTAINS '/_rejected/') AND NOT (%K BEGINSWITH 'processed_') AND NOT (%K BEGINSWITH 'rejected_') AND NOT (%K BEGINSWITH 'pending_') AND %K ENDSWITH '.json'",
+            format: """
+                %K BEGINSWITH %@ AND NOT (%K CONTAINS '/_rejected/') AND NOT (%K BEGINSWITH 'processed_') AND NOT (%K BEGINSWITH 'rejected_') AND NOT (%K \
+                BEGINSWITH 'pending_') AND %K ENDSWITH '.json'
+                """,
             NSMetadataItemPathKey,
             inboxDir.path,
             NSMetadataItemPathKey,
@@ -202,8 +205,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// Unauthenticated IDs must never reserve accepted-message IDs, responses,
-    /// or transactions. Retain only the offending bytes, keyed by their digest.
+    /// Unauthenticated IDs grant no reservation; retain offending bytes only by digest.
     func quarantineUnauthenticatedInboxFile(data: Data, fileURL: URL, inboxDir: URL, reason: String) async {
         syncError = "Rejected inbox file \(fileURL.lastPathComponent): \(reason)"
         if reason.contains("pairing secret unavailable") { return }
@@ -245,13 +247,10 @@ extension MacSyncEngine {
             transactionId: transactionId,
             message: validationError
         ) else {
-            // Do not consume an invalid remote action unless its
-            // signed rejection durably exists for the peer to read.
+            // Consume invalid actions only after their signed rejection is durable for the peer.
             return
         }
-        // Retain the signed rejection and archive this exact stale envelope,
-        // without reserving its message or transaction identity.
-        // The .done suffix excludes this archive from subsequent .json queries.
+        // Archive rejected bytes without claiming identities; .done prevents the JSON query from dispatching them.
         let archiveURL = inboxDir.appendingPathComponent("rejected_\(fileURL.lastPathComponent).done")
         await Task.detached(priority: .utility) { [fileURL, archiveURL] in
             try? FileManager.default.moveItem(at: fileURL, to: archiveURL)
@@ -285,14 +284,11 @@ extension MacSyncEngine {
         }.value
         guard isActive, generation == snapshotLifecycleGeneration else { return }
 
-        // fix-KVS-quota: sweep stale inbox_response_* KVS keys every pass so the
-        // 1024-key/1MB ubiquitous-store quota is never reached (which would kill
-        // ALL iCloud sync silently). The per-key iCloud file stats inside run off
-        // the main actor; awaited so eviction completes before we list the inbox.
+        // Reclaim response keys before listing to preserve KVS's 1,024-key/1 MB headroom; blocking file stats stay off main.
         await sweepInboxResponseKVSKeys()
         guard isActive, generation == snapshotLifecycleGeneration else { return }
 
-        // Directory listing — can block on iCloud-resident directories; do it off main.
+        // iCloud directory listing can block, so run it off main.
         let files: [URL]
         do {
             files = try await Task.detached(priority: .utility, operation: { [inboxDir] in
@@ -300,7 +296,10 @@ extension MacSyncEngine {
                     includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles)
             }).value
         } catch {
-            syncError = "The iPhone action inbox could not be listed: \(error.localizedDescription). Restore the inbox folder's access and reconnect; no new command was admitted."
+            syncError = """
+                The iPhone action inbox could not be listed: \(error.localizedDescription). Restore the inbox folder's access and reconnect; no new command \
+                was admitted.
+                """
             return
         }
 
@@ -407,7 +406,7 @@ extension MacSyncEngine {
             }
         }
 
-        // Second directory listing (after stale-pending sweep) — off main.
+        // Re-list after pending-file cleanup off main because iCloud directories can block.
         let refreshedFiles: [URL]
         do {
             refreshedFiles = try await Task.detached(priority: .utility, operation: { [inboxDir] in
@@ -415,7 +414,10 @@ extension MacSyncEngine {
                     includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles)
             }).value
         } catch {
-            syncError = "The iPhone action inbox could not be listed: \(error.localizedDescription). Restore the inbox folder's access and reconnect; no new command was admitted."
+            syncError = """
+                The iPhone action inbox could not be listed: \(error.localizedDescription). Restore the inbox folder's access and reconnect; no new command \
+                was admitted.
+                """
             return
         }
 
@@ -429,15 +431,14 @@ extension MacSyncEngine {
         var didProcessMutation = false
         for fileURL in jsonFiles {
             guard isActive, generation == snapshotLifecycleGeneration else { return }
-            // Coordinated read of iCloud inbox file — SEVERE blocking risk; do it off main.
+            // Coordinated iCloud reads can block, so keep them off main.
             guard let data = await Task.detached(priority: .utility, operation: { [fileURL] in
                 Self.coordinatedRead(at: fileURL)
             }).value else { continue }
             guard isActive, generation == snapshotLifecycleGeneration else { return }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            // R11-N26: On JSON decode failure, move the file to _rejected/ so it
-            // doesn't re-trigger on every sync cycle (infinite retrigger bug).
+            // Quarantine malformed JSON so the same bytes cannot retrigger every sync cycle.
             guard let action = try? decoder.decode(InboxAction.self, from: data) else {
                 syncError = "Rejected inbox file \(fileURL.lastPathComponent): malformed JSON"
                 nativeLog("[MacSyncEngine] Rejected malformed inbox file: \(fileURL.lastPathComponent)")
@@ -495,9 +496,7 @@ extension MacSyncEngine {
 
             guard isActive, generation == snapshotLifecycleGeneration else { return }
             if ledgerRefusal != nil || alreadyExecuted {
-                // Answer, never redispatch. A refusal deliberately writes no
-                // ledger row: whatever is there belongs to the run we could not
-                // read, or to the other action holding this id.
+                // Refusals cannot write ledger state owned by an unreadable or conflicting action; answer without redispatch.
                 guard let response = try? replayInboxResponse(action, record: priorTransaction, refusal: ledgerRefusal) else {
                     syncError = "Pairing secret unavailable; iCloud command \(action.msgId) remains unanswered."
                     continue
@@ -540,8 +539,7 @@ extension MacSyncEngine {
                     kvs.set(redeliveredMsgId, forKey: "inbox_response_\(redeliveredMsgId)")
                     return kvs.synchronize()
                 }
-                // Only an action whose outcome IS known is closed out here; a
-                // refusal leaves no processed id, because nothing ran.
+                // Close out only known outcomes; refusals must not claim processed identity for work that never ran.
                 if ledgerRefusal == nil {
                     recordProcessed(action.msgId)
                     await saveProcessedIds()
@@ -564,9 +562,7 @@ extension MacSyncEngine {
             )
 
             guard isActive, generation == snapshotLifecycleGeneration else { return }
-            // The body may treat this as peer-presence evidence only after the
-            // action's HMAC and timestamp have passed validation. Token and
-            // pairing-file timestamps prove configuration, not contact.
+            // Only validated HMAC and time prove contact; pairing files and tokens prove configuration.
             if let peerCreatedAt = ISO8601DateFormatter().date(from: action.createdAt) {
                 sync.bridge.notePhoneContact(at: peerCreatedAt)
                 do {
@@ -626,7 +622,7 @@ extension MacSyncEngine {
                 continue
             }
 
-            // Write response (coordinated iCloud write) — SEVERE blocking risk; do it off main.
+            // Await coordinated response writes off main; iCloud coordination can block.
             guard let responseURL = InboxActionFileBoundary.jsonURL(
                 in: responsesDir,
                 validatedID: ids.messageID
@@ -636,7 +632,13 @@ extension MacSyncEngine {
             guard responseWritten else {
                 let failure = "Could not write iCloud response for \(action.msgId); command left pending."
                 if generation == snapshotLifecycleGeneration { syncError = failure }
-                await writeTransaction(id: transactionId, action: action.action, state: "response_write_failed", attempts: 1, error: failure, directory: transactionDir)
+                await writeTransaction(
+                    id: transactionId,
+                    action: action.action,
+                    state: "response_write_failed",
+                    attempts: 1,
+                    error: failure,
+                    directory: transactionDir)
                 await Task.detached(priority: .utility) { [pendingURL] in
                     try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: pendingURL.path)
                 }.value
@@ -690,7 +692,6 @@ extension MacSyncEngine {
                 )
             }
 
-            // KVS notification to iOS
             let msgId = action.msgId
             _ = await withCKTimeout("MacSyncEngine.processInboxFiles.responseKVS") {
                 let kvs = NSUbiquitousKeyValueStore.default
@@ -704,16 +705,14 @@ extension MacSyncEngine {
         }
 
         if didProcessMutation {
-            // Refresh once after a burst of iCloud actions so iOS sees updated
-            // state without refetching heavyweight snapshots per command.
+            // Refresh once per burst so each command does not rebuild heavyweight phone projections.
             await writeSnapshots(forceHeavy: true)
             guard isActive, generation == snapshotLifecycleGeneration else { return }
             NotificationCenter.default.post(name: .iCloudInboxDidProcess, object: nil)
         }
     }
 
-
-    /// Verify response readback with one retry, log failures, and return false to keep the command pending.
+    /// Failed response readback must keep the command pending.
     func writeInboxResponse(_ response: [String: String], to responseURL: URL) async -> Bool {
         let responseData: Data
         do {
@@ -739,10 +738,7 @@ extension MacSyncEngine {
         return false
     }
 
-    /// Process the existing signed iPhone action envelope after CloudKit has
-    /// verified the outer BridgeMessage. The action still passes the same
-    /// inner-HMAC, freshness, idempotency, TrustCenter/router, receipt, and
-    /// response-signing boundaries as the legacy Drive inbox.
+    /// CloudKit outer verification cannot replace inner HMAC, freshness, idempotency, Trust, receipt or response-signing checks.
     func processCloudKitActionMessage(_ message: BridgeMessage) async -> Bool {
         guard isActive else { return false }
         let generation = snapshotLifecycleGeneration
@@ -795,8 +791,7 @@ extension MacSyncEngine {
         let freshnessError = decision.freshnessError
         let refusal = decision.refusal
 
-        // Transport-only fast path: the shared ledger decision and response
-        // projection still own replay; no response file can override them.
+        // Transport may accelerate delivery, but only the shared ledger owns replay and response projection.
         if processedMsgIds.contains(action.msgId), alreadyExecuted {
             guard let response = try? replayInboxResponse(action, record: priorTransaction, refusal: nil) else { return false }
             guard await iCloudBridge.appendInboundActionSuccessReceipt(messageID: action.msgId,
@@ -818,9 +813,7 @@ extension MacSyncEngine {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
                 return false
             }
-            // Deliberately no ledger write and no response file: whatever is at
-            // either path belongs to the run we could not read, or to the other
-            // action holding this id, and must not be clobbered.
+            // Unreadable or conflicting identity owns both ledger and response paths; neither may be overwritten.
             do {
                 try await sync.bridge.sendCloudKitActionResponse(signed, correlationID: action.msgId)
                 return true
@@ -868,8 +861,7 @@ extension MacSyncEngine {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
                 return false
             }
-            // A stale envelope has not executed. Return its authenticated
-            // refusal without claiming either identity or a response-file slot.
+            // Refuse stale, unexecuted work without claiming its identities or response path.
             do {
                 try await sync.bridge.sendCloudKitActionResponse(signed, correlationID: action.msgId)
                 return true
@@ -910,8 +902,7 @@ extension MacSyncEngine {
             await settleInboxAction(action, transactionId: transactionId, response: response, directory: transactionDir)
         }
 
-        // Persist before sending so a CloudKit delivery failure can retry the
-        // response without repeating the already-authorized external effect.
+        // Persist before delivery so a retry sends the response without repeating the external effect.
         guard await writeInboxResponse(response, to: responseURL) else {
             if generation == snapshotLifecycleGeneration {
                 syncError = "Could not persist CloudKit response for \(action.msgId); action will not be acknowledged."

@@ -1,23 +1,27 @@
 import Foundation
 import PersistenceCore
+import ChatToolParsing
 
-// Blueprint: | `PersistedToolReceipt.swift` | `PersistedToolReceipt.project`: bounded, redacted historical tool facts and exact continuations; oversized locators are omitted rather than clipped; `SwiftNativeTurnEngine.landedEffect` reads declared landed effects from execution receipts |
+// Blueprint: | `PersistedToolReceipt.swift` | `PersistedToolReceipt.project`; `SwiftNativeTurnEngine.landedEffect` |
 
 extension SwiftNativeTurnEngine {
-    /// Read landed effects from execution receipts, including batches and scripts.
-    /// A part answers for itself. Ignore previews and unsettled outcomes; return
-    /// "part" only for parts alone, otherwise the strongest landed effect.
+    /// Read effects from each batch or script receipt; ignore previews and unsettled outcomes.
+    /// Parts answer for themselves; use `part` only when no stronger landed effect exists.
     nonisolated static func landedEffect(_ receipt: JSONValue) -> String? {
         var landed: Set<String> = []
         func walk(_ value: JSONValue) {
             guard case .object(let fields) = value else { return }
-            // A saved receipt too big to keep whole carries it, kept before it was bounded.
+            // Preserve effect evidence before bounding oversized saved receipts.
             if case .string(let kept)? = fields["landedEffect"] { landed.insert(kept); return }
-            // A script's primitive rows declare their class as read_only alone.
+            let reply = ToolResult(value)
+            // Primitive script rows attest their own read-only class.
             let own = if case .string(let effect)? = fields["effect"] { effect }
                 else if case .bool(let read)? = fields["read_only"] { read ? "read" : "write" } else { String?.none }
             // Explicit effects win ("none" did not land, even executed); execution answers only without them.
-            let did = fields["effects"].map { [.string("occurred"), .string("partial")].contains($0) } ?? (fields["execution"] == .string("executed"))
+            // Presence matters: an unrecognized declaration must still suppress execution inference.
+            let did = fields["effects"] != nil
+                ? (reply.effects == .occurred || reply.effects == .partial)
+                : fields["execution"] == .string("executed")
             if let own, did {
                 landed.insert(own)
             }
@@ -30,15 +34,14 @@ extension SwiftNativeTurnEngine {
     }
 }
 
-/// A historical receipt, not another copy of the source or an extension of a
-/// turn-scoped output handle. Preserve small factual fields before the preview
-/// so later exact history reads need not rely on the assistant's own summary.
+/// Preserve small factual fields before clipping so later history reads need not infer effects from assistant prose.
 enum PersistedToolReceipt {
     static func project(tool: String, value: JSONValue, json: String, maximumCharacters: Int) -> String? {
         guard json.count > maximumCharacters else { return nil }
+        let reply = ToolResult(value)
         let read = ["read_page", "read_file", "list_dir"].contains(tool) && value.objectValue != nil
         var fields: [String: JSONValue] = [
-            "original_result_class": .string(ChatToolOutcome.exactResultClass(value).rawValue),
+            "original_result_class": .string(reply.outcome.rawValue),
             "original_characters": .int(Int64(json.count)),
             "transcript_projection": .string(read ? "bounded_read_receipt" : "bounded_tool_receipt"),
             "full_result_in_transcript": .bool(false),
@@ -75,17 +78,27 @@ enum PersistedToolReceipt {
             if let next = original["next"], next != .null {
                 if ChatTranscriptEvidenceRendering.historicalContinuationIsExact(next) {
                     evidence["next"] = next
-                    evidence["continuation_note"] = .string("Historical read continuation. Access and source-version checks depend on the reader; changed source content may require a fresh read.")
+                    evidence["continuation_note"] = .string("""
+                        Historical read continuation. Access and source-version checks depend on the reader; changed source content may require a \
+                        fresh read.
+                        """)
                 } else {
                     omitted.append("next")
-                    evidence["continuation_note"] = .string("Historical continuation unavailable: oversized, redacted or invalid. Read the source afresh; do not reconstruct this continuation.")
+                    evidence["continuation_note"] = .string("""
+                        Historical continuation unavailable: oversized, redacted or invalid. Read the source afresh; do not reconstruct this \
+                        continuation.
+                        """)
                 }
             }
             fields.merge([
                 "evidence": .object(evidence),
                 "evidence_fields_omitted": .array(omitted.map(JSONValue.string)),
                 "verification_scope": .string("historical_tool_response_not_current_source_state"),
-                "note": .string("Tool result truncated in transcript. Evidence fields describe the original read; the preview is incomplete. Temporary result handles only work in their originating turn. This receipt does not promise that the full source is still retained. Do not repeat an action merely to recover its output."),
+                "note": .string("""
+                    Tool result truncated in transcript. Evidence fields describe the original read; the preview is incomplete. Temporary result \
+                    handles only work in their originating turn. This receipt does not promise that the full source is still retained. Do not repeat \
+                    an action merely to recover its output.
+                    """),
             ]) { _, selected in selected }
         } else {
             for key in ["status", "ok", "success", "isError", "is_error", "failed", "refused", "timed_out", "timeout",
@@ -118,7 +131,6 @@ enum PersistedToolReceipt {
             guard let serialized = try? JSONValue.object(fields).serialize(pretty: false) else { return nil }
             if serialized.count <= maximumCharacters { return serialized }
             if previewLimit == 0 {
-                // Keep exact continuations before optional descriptive groups.
                 guard read, let key = ["coverage", "source_receipt", "selection"].first(where: { evidence[$0] != nil }) else { return nil }
                 evidence.removeValue(forKey: key)
                 omitted.append(key)

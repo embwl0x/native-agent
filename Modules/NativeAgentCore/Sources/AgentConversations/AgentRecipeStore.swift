@@ -3,47 +3,34 @@ import Experiences
 import NativeAgentCore
 import os
 import PersistenceCore
-// Blueprint: | `AgentRecipeStore.swift` | `AgentRecipeStore` enum: one recipe per agent host under agents/recipes/, seeded from the host tables and bundled `Resources/grok-routine.json` through the existing authored-field-preserving merge, read by `AgentHostDirectory.rows`, and one per A2A contact under its id (`AgentHostRow.A2A`, `recipe(for:)` seeds a missing one on the spot); every consumer checks the current catalog under the store/file locks, reusing the last read only while every recipe file keeps its stat identity; `load`, `recipe`, `launch` (Trust's reader), `read`/`write` (the door's, one shape check, under the file lock; write can create a new host.id without overwriting existing bytes), `learn` (a dry run's findings, source "learned"), `dryRun` |
+// Blueprint: | `AgentRecipeStore.swift` | `AgentRecipeStore`, `Resources/grok-routine.json`, `AgentHostDirectory.rows`, `AgentHostRow.A2A`, `recipe(for:)`, `load`, `recipe`, `launch`, `read`, `write`, `learn`; dry-run mode belongs to the explicit conversation operation |
 
-/// HOW THIS APP REACHES EACH AGENT, as files she can read and fix.
-///
-/// One recipe per agent host under agents/recipes/<host-id>.json: the row
-/// every connect, send and health check reads (`AgentHostDirectory.rows`),
-/// with its launch line, search paths and window labels; and one per A2A
-/// contact under its id, its card. Host tables and bundled JSON are seeds. A
-/// missing file is seeded at version 1; later seeds update only fields still
-/// owned by the seed. Authored fields survive every update. A host no table
-/// knows loads from its file alone.
+/// Saved recipes own every connect, send and health read; tables and bundles only seed them. Reseeding may update only seed-owned fields; authored values
+/// survive, including hosts absent from the table.
 public enum AgentRecipeStore {
     public struct Recipe: Codable, Sendable, Equatable {
-        /// 1 as seeded; each `write` bumps it. A hand edit bumps nothing.
+        /// Hand edits need not bump versions, so versions alone cannot prove identity.
         public var recipeVersion: Int
-        /// The app build whose table this recipe was seeded from.
         public var seededFrom: String
         public var updatedAt: String
-        /// What wrote this version: "seeded", "re-seeded", "written" or "learned".
         public var source: String
-        /// `host`'s digest as this app last wrote it; a hand edit leaves it behind.
+        /// The last app-written digest detects unversioned hand edits.
         public var digest: String
         public var host: AgentHostRow
-        /// The last seed and fields authors took over, retained in this same recipe.
         public var seedHost: AgentHostRow? = nil
         public var authoredFields: [String]? = nil
 
-        /// What a round trip's proof records, so any later change reads as one.
+        /// Round-trip proof must capture recipe identity so later edits invalidate it.
         public var hostDigest: String { get throws { try JSONValue.fromEncodable(host).digest } }
     }
 
     private struct Loaded: Sendable {
         var root: URL
         var recipes: [Recipe]
-        /// Files that did not read as a recipe, by host id: what is wrong and how to fix it.
         var problems: [String: String]
     }
 
-    /// The bound data root and the last catalog read from it, kept with the
-    /// stat identity of every file it read. Reused only while every one of
-    /// them is unchanged, so each read is still a checked current read.
+    /// Reuse the catalog only while the folder and every read file retain their stat identities.
     private struct Catalog: Sendable {
         var root: URL?
         var stamps: [String: SnapshotTailOpLog.FileStamp] = [:]
@@ -52,14 +39,6 @@ public enum AgentRecipeStore {
 
     private static let catalog = OSAllocatedUnfairLock<Catalog>(initialState: Catalog())
 
-    /// Bound from `agent_message`'s `dry_run` input: the contact runs its recipe
-    /// dry. An ACP send stops after its handshake, a desktop chat finds its
-    /// controls without typing, a command line checks its executable and args, an
-    /// A2A send stops after its card, auth and one task listing; nothing she
-    /// wrote goes out and no other route runs.
-    @TaskLocal package static var dryRun = false
-
-    /// Every host's recipe from a checked current read of the bound data root.
     public static var recipes: [Recipe] { withLoaded { $0.recipes } }
 
     public static var rows: [AgentHostRow] { recipes.map(\.host) }
@@ -91,9 +70,7 @@ public enum AgentRecipeStore {
         }.get()
     }
 
-    /// An A2A contact's recipe. A missing file is seeded now
-    /// (`AgentHostDirectory.seed`); one that is there and does not read as a
-    /// recipe throws, saying what does not read.
+    /// Seed missing A2A recipes, but report unreadable existing files instead of replacing them.
     public static func recipe(for peer: AgentPeerContact) throws -> Recipe {
         try withLoaded { state -> Result<Recipe, ShapeError> in
             if let failure = state.problems["catalog"] { return .failure(ShapeError(description: failure)) }
@@ -118,7 +95,7 @@ public enum AgentRecipeStore {
         }.get()
     }
 
-    /// What a host's validated recipe launches, for the Trust boundary (`AgentHostLaunches`).
+    /// Trust must inspect the validated recipe’s actual launch.
     public static func launch(_ id: String, dataRoot: URL) throws -> AgentHostLaunches.Launch {
         guard validID(id) else { throw ShapeError(description: "Invalid host recipe identity.") }
         let file = folder(dataRoot).appendingPathComponent(id + ".json")
@@ -131,7 +108,6 @@ public enum AgentRecipeStore {
         }
     }
 
-    /// At launch: seed what is missing (or still an older seed), then read every recipe.
     public static func load(dataRoot: URL) {
         // Listed outside the lock: reading contacts reads host recipes.
         do {
@@ -148,7 +124,6 @@ public enum AgentRecipeStore {
         }
     }
 
-    /// `agent.recipe`: one host's recipe with the version a write replaced, or every host's.
     public static func read(host: String?) -> JSONValue {
         withLoaded { state in
             let folder = folder(state.root)
@@ -174,15 +149,12 @@ public enum AgentRecipeStore {
         }
     }
 
-    /// `agent.recipe_write`: one host's whole recipe, created or replaced. The document is
-    /// the recipe as read, edited: every field the shape has and none it
-    /// lacks, at the version it was read. The write bumps that version and
-    /// keeps the replaced file as <id>.previous.json; writing that back, at
-    /// whatever version it carries, undoes it.
+    /// Writes require the complete checked shape at its read version; retain the replaced file for explicit undo.
     public static func write(host: String, document: JSONValue, undoing receipt: JSONValue? = nil) -> JSONValue {
         let given: Recipe
         do { given = try validated(document) }
-        catch { return refused("invalid_recipe", "recipe doesn't match a recipe's shape: \(error). Start from agent.recipe's recipe and change only what you mean to.") }
+        catch { return refused("invalid_recipe",
+            "recipe doesn't match a recipe's shape: \(error). Start from agent.recipe's recipe and change only what you mean to.") }
         return withLoaded { state in
             let id = AgentHostDirectory.named(host, in: state.recipes, \.host)?.host.id ?? host
             guard let index = state.recipes.firstIndex(where: { $0.host.id == id }) else {
@@ -192,7 +164,7 @@ public enum AgentRecipeStore {
                     guard (try? FileManager.default.destinationOfSymbolicLink(atPath: file.path)) == nil else {
                         return refused("existing_recipe", "\(file.path) is a symbolic link. Replace it with a regular file before writing its recipe.")
                     }
-                    // One that did not load is kept beside it, never written over unseen.
+                    // Preserve unreadable files instead of overwriting unseen content.
                     if FileManager.default.fileExists(atPath: file.path) {
                         let previous = folder(state.root).appendingPathComponent(id + ".previous.json")
                         try? FileManager.default.removeItem(at: previous)
@@ -214,10 +186,9 @@ public enum AgentRecipeStore {
             let file = folder(state.root).appendingPathComponent(id + ".json")
             let previous = folder(state.root).appendingPathComponent(id + ".previous.json")
             do {
-                // Read, compare, keep the previous and write under the file's lock.
+                // Compare and write under the same file lock, retaining the replaced version.
                 return try CredentialFileLock.withLock(file) {
-                    // A hand edit since this app read the file is never written over unseen;
-                    // a valid one is what the next read shows.
+                    // A concurrent hand edit wins and must never be overwritten unseen.
                     let onDisk = try validated(file: file)
                     guard onDisk == state.recipes[index] else {
                         if onDisk.host.id == id { state.recipes[index] = onDisk }
@@ -231,15 +202,20 @@ public enum AgentRecipeStore {
                         return refused("stale_recipe", "The recipe changed after that receipt. Read it again with agent.recipe.")
                     }
                     guard given.host.id == saved.host.id else { return refused("invalid_recipe", "host.id stays \(saved.host.id).") }
-                    // Undo: the version a write replaced goes back whatever version it carries.
+                    // Explicit undo accepts the retained version without requiring its version to advance.
                     let restored = (try? validated(file: previous)).flatMap { $0.host == given.host ? $0.recipeVersion : nil }
                     guard restored != nil || given.recipeVersion == saved.recipeVersion else {
-                        return refused("stale_recipe", "That recipe was read at version \(given.recipeVersion); it is at \(saved.recipeVersion) now. Read it again with agent.recipe.")
+                        return refused("stale_recipe", """
+                            That recipe was read at version \(given.recipeVersion); it is at \(saved.recipeVersion) now. Read it again with \
+                            agent.recipe.
+                            """)
                     }
-                    let changed = JSONValue.differences((try? JSONValue.fromEncodable(saved.host)) ?? .null, (try? JSONValue.fromEncodable(given.host)) ?? .null)
+                    let changed = JSONValue.differences((try? JSONValue.fromEncodable(saved.host)) ?? .null, (try? JSONValue.fromEncodable(
+                        given.host)) ?? .null)
                     guard !changed.isEmpty else {
                         return .object(["status": .string("unchanged"), "changed": .bool(false), "host": .string(id),
-                                        "recipe_version": .int(Int64(saved.recipeVersion)), "detail": .string("That is the recipe as it is. Nothing was written.")])
+                                        "recipe_version": .int(Int64(saved.recipeVersion)), "detail": .string(
+                                            "That is the recipe as it is. Nothing was written.")])
                     }
                     try commit(&saved, host: given.host, source: "written", file: file, previous: previous)
                     state.recipes[index] = saved
@@ -249,7 +225,10 @@ public enum AgentRecipeStore {
                         "path": .string(file.path), "previous": .string(previous.path),
                         "detail": .string((restored.map { "Restored \(saved.host.displayName)'s recipe version \($0) as version \(saved.recipeVersion). " }
                             ?? "\(saved.host.displayName)'s recipe is version \(saved.recipeVersion) now. ")
-                            + "One call undoes it: app {action: undo}. A contact reached by it reads Unverified since the recipe changed until its next message proves it.")]
+                            + """
+                                One call undoes it: app {action: undo}. A contact reached by it reads Unverified since the recipe changed until its \
+                                next message proves it.
+                                """)]
                     if let restored { receipt["restored_version"] = .int(Int64(restored)) }
                     return .object(receipt)
                 }
@@ -257,10 +236,7 @@ public enum AgentRecipeStore {
         }
     }
 
-    /// What a dry run learned (`AgentContactHealth.repair`), written as `write`
-    /// writes (version bumped, the replaced one kept for undo) under source
-    /// "learned". Only over the recipe the run started from: it throws, saying
-    /// why, when that changed since (her write wins) or could not be written.
+    /// Learn only over the exact recipe the dry run started from; concurrent authored edits win.
     public static func learn(_ started: Recipe, host: AgentHostRow) throws -> Recipe {
         try withLoaded { state -> Result<Recipe, ShapeError> in
             let file = folder(state.root).appendingPathComponent(started.host.id + ".json")
@@ -275,11 +251,14 @@ public enum AgentRecipeStore {
                     state.recipes[index] = saved
                     return .success(saved)
                 }
-            } catch { return .failure(ShapeError(description: "Recipe save failed: \(error.localizedDescription). \(file.path) or \(previous.path) may have changed; inspect both files on disk before another write.")) }
+            } catch { return .failure(ShapeError(description: """
+                Recipe save failed: \(error.localizedDescription). \(file.path) or \(previous.path) may have changed; inspect both files on disk \
+                before another write.
+                """)) }
         }.get()
     }
 
-    /// The next version: the file it replaces kept as <id>.previous.json.
+    /// Retain the replaced version for explicit undo.
     private static func commit(_ saved: inout Recipe, host: AgentHostRow, source: String, file: URL, previous: URL) throws {
         let next = saved.recipeVersion.addingReportingOverflow(1)
         guard saved.recipeVersion > 0, !next.overflow else {
@@ -305,8 +284,14 @@ public enum AgentRecipeStore {
     private static func writeFailed(file: URL, previous: URL?, error: Error) -> JSONValue {
         .object(["status": .string("failed"), "reason": .string("write_failed"), "changed": .null,
             "effects": .string("unknown"), "path": .string(file.path), "previous": previous.map { .string($0.path) } ?? .null,
-            "detail": .string("Recipe save failed: \(error.localizedDescription). The recipe\(previous == nil ? "" : " or its previous-version backup") may have changed."),
-            "remedy": Repair.reconcile(instruction: "Inspect the recipe and any previous-version file on disk before another write; ask the person to resolve the reported storage failure, preserving every version.",
+            "detail": .string("""
+                Recipe save failed: \(error.localizedDescription). The recipe\(previous == nil ? "" : " or its previous-version backup") may have \
+                changed.
+                """),
+            "remedy": Repair.reconcile(instruction: """
+                Inspect the recipe and any previous-version file on disk before another write; ask the person to resolve the reported storage \
+                failure, preserving every version.
+                """,
                 nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("files.read"),
                     "args": .object(["path": .string(file.path)])])]))])
     }
@@ -316,7 +301,7 @@ public enum AgentRecipeStore {
                  "detail": .string(state.problems[AgentHostDirectory.normalize(host)] ?? "No recipe for \(host). agent.recipe with no host lists them.")])
     }
 
-    /// The one shape check, for a file read and a write alike.
+    /// Reads and writes must share one shape check.
     private static func validated(_ document: JSONValue) throws -> Recipe {
         try document.validate(schema: writeArgumentSchema)
         let recipe = try document.decodedExactly(as: Recipe.self)
@@ -325,7 +310,8 @@ public enum AgentRecipeStore {
         }
         if AgentHostDirectory.seed.contains(where: { $0.id == recipe.host.id }),
            recipe.seedHost == nil || recipe.authoredFields == nil {
-            throw ShapeError(description: "Seeded hosts require explicit seedHost and authoredFields; preserve and repair missing provenance from retained evidence")
+            throw ShapeError(
+                description: "Seeded hosts require explicit seedHost and authoredFields; preserve and repair missing provenance from retained evidence")
         }
         _ = try recipe.hostDigest
         return recipe
@@ -333,7 +319,6 @@ public enum AgentRecipeStore {
 
     private typealias ShapeError = JSONValue.ShapeError
 
-    /// A recipe file, through the one shape check.
     private static func validated(file: URL) throws -> Recipe {
         let document = try JSONValue.parse(Data(contentsOf: file))
         return try validated(document)
@@ -341,9 +326,7 @@ public enum AgentRecipeStore {
 
     private static func withLoaded<T: Sendable>(dataRoot: URL? = nil, _ body: @Sendable (inout Loaded) -> T) -> T {
         catalog.withLock { catalog in
-            // A synchronous read and every write share this lock; each consumer
-            // receives its own copy. The retained read serves only while every
-            // recipe file still has the identity it was read at.
+            // Reads and writes share a lock; retained snapshots serve only while every file identity is unchanged.
             let root = catalog.root ?? dataRoot ?? PersistenceCore.defaultDataRoot()
             let before = stamps(folder(root))
             var current: Loaded
@@ -360,8 +343,7 @@ public enum AgentRecipeStore {
         }
     }
 
-    /// The stat identity of the recipe folder and every recipe file in it;
-    /// nil when any of them cannot be inspected.
+    /// Any uninspectable recipe identity invalidates the retained catalog.
     private static func stamps(_ folder: URL) -> [String: SnapshotTailOpLog.FileStamp]? {
         guard let own = SnapshotTailOpLog.fileStamp(folder) else { return nil }
         var stamps = ["": own]
@@ -384,13 +366,14 @@ public enum AgentRecipeStore {
         var seedProblems: [String: String] = [:]
         do {
             guard let file = Bundle.module.url(forResource: "grok-routine", withExtension: "json") else {
-                throw ShapeError(description: "The bundled grok-routine.json seed is missing; tell the person this copy of NativeAgent is missing its Grok navigation seed")
+                throw ShapeError(
+                    description: "The bundled grok-routine.json seed is missing; tell the person this copy of NativeAgent is missing its Grok navigation seed")
             }
             let routine = try JSONValue.parse(Data(contentsOf: file)).decodedExactly(as: AgentHostRow.GrokRoutine.self)
             if let index = hosts.firstIndex(where: { $0.id == "grok-bot" }) { hosts[index].grokRoutine = routine }
         } catch {
             seedProblems["grok-bot"] = "Grok Bot's navigation seed could not be read: \(error.localizedDescription)"
-            // Do not seed a missing/invalid shipped recipe over her saved one.
+            // Do not seed a missing/invalid shipped recipe over the agent's saved one.
             hosts.removeAll { $0.id == "grok-bot" }
         }
         if seedMissing {
@@ -407,7 +390,6 @@ public enum AgentRecipeStore {
         }
         for name in names where name.hasSuffix(".json") {
             let id = String(name.dropLast(5))
-            // <id>.previous.json is the version a write replaced, kept for undo.
             guard validID(id) else { continue }
             let why: String
             do {
@@ -421,7 +403,7 @@ public enum AgentRecipeStore {
             owe(root, id: id, file: folder.appendingPathComponent(name), words: problems[id]!,
                 recipe: hosts.first { $0.id == id })
         }
-        // The table's order first, as `AgentHostDirectory.row(named:)` always matched.
+        // Keep seed table ordering so name resolution precedence stays stable.
         recipes.sort { (order.firstIndex(of: $0.host.id) ?? order.count, $0.host.id) < (order.firstIndex(of: $1.host.id) ?? order.count, $1.host.id) }
         return Loaded(root: root, recipes: recipes, problems: problems)
     }
@@ -429,7 +411,7 @@ public enum AgentRecipeStore {
     private static func seed(_ host: AgentHostRow, in folder: URL, from build: String) {
         let file = folder.appendingPathComponent(host.id + ".json")
         var fresh = Recipe(recipeVersion: 1, seededFrom: build, updatedAt: ISO8601DateFormatter().string(from: Date()),
-                           source: "seeded", digest: "", host: host, seedHost: host, authoredFields: [])
+                source: "seeded", digest: "", host: host, seedHost: host, authoredFields: [])
         do {
             fresh.digest = try fresh.hostDigest
             try CredentialFileLock.withLock(file) {
@@ -437,7 +419,10 @@ public enum AgentRecipeStore {
                     var saved = try validated(file: file)
                     let previous = folder.appendingPathComponent(host.id + ".previous.json")
                     guard let baseline = saved.seedHost, let authoredFields = saved.authoredFields else {
-                        throw ShapeError(description: "Seed provenance (seedHost and authoredFields) is missing; preserve this authored recipe and repair its provenance from retained evidence before seed merging")
+                        throw ShapeError(description: """
+                            Seed provenance (seedHost and authoredFields) is missing; preserve this authored recipe and repair its provenance from \
+                            retained evidence before seed merging
+                            """)
                     }
                     let before = try JSONValue.fromEncodable(saved.host)
                     let authored = Set(authoredFields).union(JSONValue.differences(try JSONValue.fromEncodable(baseline), before))
@@ -472,13 +457,12 @@ public enum AgentRecipeStore {
         }))
     }
 
-    /// A recipe file that stays wrong until it is written: owed until a write of
-    /// that host's recipe works. A seeded host's call carries its seed; any other
-    /// recipe is read first, corrected, and written whole.
+    /// Recipe repair stays owed until its write succeeds; unknown hosts require a checked full document.
     private static func owe(_ root: URL, id: String, file: URL, words: String, recipe host: AgentHostRow?) {
         var call = ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(file.path)])])
         if let host {
-            var seeded = Recipe(recipeVersion: 1, seededFrom: "seed", updatedAt: "", source: "seeded", digest: "", host: host, seedHost: host, authoredFields: [])
+            var seeded = Recipe(recipeVersion: 1, seededFrom: "seed", updatedAt: "", source: "seeded", digest: "", host: host, seedHost: host,
+                authoredFields: [])
             do {
                 seeded.digest = try seeded.hostDigest
                 call = ToolFailureError.call("app", ["action": .string("agent.recipe_write"),

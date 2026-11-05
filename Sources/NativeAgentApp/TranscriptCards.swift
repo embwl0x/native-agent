@@ -10,14 +10,11 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `TranscriptCards.swift` | ChatInlineCardHost draws the page mount's current-message card models; the action environment reaches the interaction owner |
+// Blueprint: | `TranscriptCards.swift` | Mounted transcript cards; action environment reaches the interaction owner |
 
 // MARK: - The transcript host
 
-/// Anchors a card to the turn it belongs to, inside the transcript, at the tool
-/// row where the interaction lives. It appears in place and settles in place:
-/// the entrance animation fires once, on insertion, and Reduce Motion turns it
-/// off. Nothing here scrolls the reader anywhere.
+/// Anchor cards to their turn and animate only insertion so updates never move the reader.
 struct ChatInlineCardHost: View {
     let cards: [InlineCardModel]
     let action: @MainActor (InlineCardModel, InlineCardAction) -> Void
@@ -28,9 +25,7 @@ struct ChatInlineCardHost: View {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                 ForEach(cards) { card in
                     InlineCardView(model: card) { taken in action(card, taken) }
-                        // Identity is the request, so a re-observation of the
-                        // same blocked request updates this card instead of
-                        // stacking a second one.
+                        // Key by request so re-observation updates the existing card instead of stacking another.
                         .id(card.id)
                         .transition(NativeAgentMotion.fade)
                 }
@@ -42,7 +37,7 @@ struct ChatInlineCardHost: View {
     }
 }
 
-/// Where a card's action goes. Default: nowhere.
+/// Default to no action so an unbound card cannot mutate state.
 struct InlineCardActionKey: EnvironmentKey {
     static let defaultValue: @Sendable @MainActor (InlineCardModel, InlineCardAction) -> Void = { _, _ in }
 }

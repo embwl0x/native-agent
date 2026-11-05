@@ -1,11 +1,9 @@
-// Settings owns Telegram, Providers and Mac settings; More links to Personality, Trust and Connectors.
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `SettingsViewFull.swift` | Device settings with immediate appearance control and release-only version; shared SettingsStore refresh/loading and snapshot availability presentation; push diagnostics live in Status |
+// Blueprint: | `SettingsViewFull.swift` | Device settings, appearance and release version; shared refresh/availability; push diagnostics in Status |
 
 enum SettingsMacHealthPresentation {
     static func versionText(_ version: String) -> String {
-        // release.sh stamps internal builds as <version>-dev.<sha8>[.dirty].
         version.components(separatedBy: "-dev.").first ?? version
     }
 
@@ -41,10 +39,11 @@ struct SettingsViewFull: View {
     @State private var repairResult: String?
     @State private var isForceRefreshing = false
     @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
+    @State private var pushedFace: FaceDestination?
 
     var body: some View {
         ScrollViewReader { proxy in
-            settingsPage.onAppear {
+            settingsPage.navigationDestination(item: $pushedFace) { $0.view }.onAppear {
                 if opensConnection { proxy.scrollTo("connection", anchor: .top) }
             }
         }
@@ -113,16 +112,19 @@ struct SettingsViewFull: View {
             AliveSection("On your Mac") {
                 macLink("Telegram", "Telegram settings on your Mac") { TelegramView() }
                 AliveDivider()
-                macLink("Providers", "The models I think with") { ProviderSettingsView() }
+                macLink("Providers", "The models I think with") { MobileFacePage(page: "providers") }
             }
-            MobileAppSettingsSections()
+            MobileFaceRows(page: "settings") { pushedFace = $0 }
             PhonePlacesSettings()
             PhoneSensesSettings()
             AliveSection("Live Activities") {
                 Toggle("Show task names on the Lock Screen", isOn: Binding(
                     get: { turnActivity.isEnabled }, set: { turnActivity.setEnabled($0) }))
                     .aliveRow()
-                AliveNote("Includes work started on the Mac, Telegram, helpers and agent bridges. Task names may be visible while this iPhone is locked. Without an APNs key on the Mac, activities start when this app is open or next wakes; updates can be delayed while it is asleep.")
+                AliveNote("""
+                    Includes work started on the Mac, Telegram, helpers and agent bridges. Task names may be visible while this iPhone is locked. Without an \
+                    APNs key on the Mac, activities start when this app is open or next wakes; updates can be delayed while it is asleep.
+                    """)
                 if let error = turnActivity.errorMessage { AliveNote(error) }
             }
 
@@ -165,9 +167,7 @@ struct SettingsViewFull: View {
                 }
             })
             .environmentObject(pairingStore)
-            // A full-screen cover sits above ContentView's TabView-safe-area
-            // toast host. Re-host the shared queue here so pairing-time
-            // delivery and sync feedback remains visible.
+            // Full-screen pairing covers the tab toast host; rehost the same queue so sync/delivery feedback remains visible.
             .safeAreaInset(edge: .bottom) {
                 iOSSystemToastBar(center: SystemToastCenter.shared)
             }
@@ -183,13 +183,11 @@ struct SettingsViewFull: View {
     }
 
     private var connectionGroup: some View {
-        // Connection-wide, so the newest delivery across groups is the
-        // honest value here — but still a DELIVERY, not a cache read.
+        // Connection recency uses the newest delivery across groups, never a cache read.
         let snapshotState = StatusConnectionPresentation.syncState(
             lastSyncedAt: iCloudSyncEngine.shared.lastTransportDeliveryAt
         )
         return AliveSection("Connection") {
-            // The connection is three facts, each with who can fix it and how.
             ForEach(bridgeClient.connection.facts, id: \.label) { item in
                 AliveConnectionFactLine(label: item.label, fact: item.fact)
                 AliveDivider()
@@ -215,7 +213,7 @@ struct SettingsViewFull: View {
                 AliveTapRow(title: "Connection setup help") { showRePairSheet = true }
             } else {
                 AliveTapRow(title: isForceRefreshing ? "Checking for Mac updates…" : "Check for Mac updates") {
-                    // Refresh both pairing material and settings snapshots without blocking MainActor.
+                    // Refresh pairing and settings without blocking MainActor.
                     Task {
                         guard !isForceRefreshing else { return }
                         isForceRefreshing = true

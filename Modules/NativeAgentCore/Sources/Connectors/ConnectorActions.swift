@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import ChatToolParsing
 import Darwin
 import NativeAgentCore
@@ -14,9 +15,9 @@ import AppToolRuntime
 import DeviceSync
 import AttentionRouting
 import MacIntegration
-// Blueprint: | `ConnectorActions.swift` | `ConnectorActions` uses shared admission, input values and approval replay; CodexHandoff owns handoff identity, direct read failures throw while work journals retain project rows with a named handoff gap and partial status; native reads redact before display bounds; work snapshots return directly without unused copies; credential-bearing text never enters a part |
+// Blueprint: | `ConnectorActions.swift` | `ConnectorActions`: shared admission; CodexHandoff identity; redacted native reads; journal gaps |
 
-/// Connector action policy, orchestration and receipts. Platform effects are supplied by the host.
+/// Host adapters supply effects; connector policy and receipts stay here.
 public struct ConnectorActions: Sendable {
     private let platform: any ConnectorActionPlatform
 
@@ -29,7 +30,8 @@ public struct ConnectorActions: Sendable {
         dryRun: Bool,
         input: [String: JSONValue] = [:],
         surface: String = "connector_action",
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
+        turn: Turn
     ) async throws -> ConnectorActionReceipt {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let descriptor = connectorActionDescriptors().first(where: { $0.id == trimmed }) else {
@@ -43,7 +45,7 @@ public struct ConnectorActions: Sendable {
             dryRun: dryRun,
             input: input,
             surface: surface,
-            dataRoot: dataRoot
+            dataRoot: dataRoot, turn: turn
         )
     }
 
@@ -53,17 +55,19 @@ public struct ConnectorActions: Sendable {
         input: [String: JSONValue] = [:],
         approvedReplayApprovalID: String? = nil,
         surface: String = "connector_action",
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
+        turn: Turn
     ) async throws -> ConnectorActionReceipt {
         let yoloAdmitted = !dryRun && approvedReplayApprovalID == nil
-            ? await ChatFullMacYoloAdmission.admitted(surface: surface,
-                dataRoot: dataRoot, source: "native_client_direct_action")
+            ? await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+                origin: .currentTurn(turn: turn, surface: surface, source: "native_client_direct_action"), turn: turn).admitted
             : false
         if descriptor.requiresApproval, !dryRun, approvedReplayApprovalID == nil, !yoloAdmitted {
             let approval = try await Self.createConnectorActionApproval(
                 descriptor,
                 input: input,
-                dataRoot: dataRoot
+                dataRoot: dataRoot,
+                turn: turn
             )
             return try await Self.appendConnectorActionReceipt(
                 descriptor: descriptor,
@@ -96,25 +100,25 @@ public struct ConnectorActions: Sendable {
             case "codex.handoff":
                 output = try Self.readCodexHandoff(input: input)
             case "mac.spotlight_search":
-                output = try await runMacSpotlightSearch(input: input)
+                output = try await runMacSpotlightSearch(input: input, turn: turn)
             case "mac.calendar_list_upcoming":
-                output = try await platform.macAction(.calendarListUpcoming, input: input)
+                output = try await platform.macAction(.calendarListUpcoming, input: input, turn: turn)
             case "mac.reminders_list_due_today":
-                output = try await platform.macAction(.remindersListDueToday, input: input)
+                output = try await platform.macAction(.remindersListDueToday, input: input, turn: turn)
             case "mac.mail_list_recent":
-                output = try await platform.macAction(.mailListRecent, input: input)
+                output = try await platform.macAction(.mailListRecent, input: input, turn: turn)
             case "mac.messages_list_recent":
-                output = try await platform.macAction(.messagesRecentThreads, input: input)
+                output = try await platform.macAction(.messagesRecentThreads, input: input, turn: turn)
             case "mac.notes_list_recent":
-                output = try await platform.macAction(.notesListRecent, input: input)
+                output = try await platform.macAction(.notesListRecent, input: input, turn: turn)
             case "mac.notes_search":
-                output = try await platform.macAction(.notesSearch, input: input)
+                output = try await platform.macAction(.notesSearch, input: input, turn: turn)
             case "mac.contacts_search":
-                output = try await platform.macAction(.contactsSearch, input: input)
+                output = try await platform.macAction(.contactsSearch, input: input, turn: turn)
             case "mac.notify":
-                output = try await self.runMacNotify(input: input)
+                output = try await self.runMacNotify(input: input, turn: turn)
             case "mobile.notify":
-                output = try await runMobileNotify(input: input)
+                output = try await runMobileNotify(input: input, turn: turn)
             case "mac_assistant.watch_templates":
                 output = try await self.runMacAssistantWatchTemplates()
             case "scheduler.schedule_job", "scheduler.create_job":
@@ -126,7 +130,10 @@ public struct ConnectorActions: Sendable {
             default:
                 guard descriptor.id.hasSuffix(".status") else {
                     throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-                        NSLocalizedDescriptionKey: "Connector action \(descriptor.id) needs a live Swift provider executor. This action is registered but no Swift executor owns its effects yet."
+                        NSLocalizedDescriptionKey: """
+                            Connector action \(descriptor.id) needs a live Swift provider executor. This action is registered but no Swift executor owns \
+                            its effects yet.
+                            """
                     ])
                 }
                 output = try await connectorStatusActionOutput(descriptor)
@@ -155,20 +162,21 @@ public struct ConnectorActions: Sendable {
         )
     }
 
-    public func runMacSpotlightSearch(input: [String: JSONValue], toolName: String = "mac.spotlight_search") async throws -> JSONValue {
+    public func runMacSpotlightSearch(input: [String: JSONValue], toolName: String = "mac.spotlight_search", turn: Turn) async throws -> JSONValue {
         let query = input["query"]?.scalarText ?? ""
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -400, userInfo: [
                 NSLocalizedDescriptionKey: "\(toolName) requires query"
             ])
         }
-        let result = try await platform.spotlight(input: input)
-        return NativeAppSecretRedactor.redactValue(result.toJSON())
+        let result = try await platform.spotlight(input: input, turn: turn)
+        // A connector's search runs outside any owned program: there is no read capture to record into.
+        return NativeAppSecretRedactor.redactValue(result.toJSON(readContent: nil))
     }
 
-    public func runMacNotify(input: [String: JSONValue], toolName: String = "mac.notify") async throws -> JSONValue {
+    public func runMacNotify(input: [String: JSONValue], toolName: String = "mac.notify", turn: Turn) async throws -> JSONValue {
         let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
-        var obj = await platform.postMessage(title: title, body: message)
+        var obj = await platform.postMessage(title: title, body: message, turn: turn)
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
             "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
@@ -176,18 +184,13 @@ public struct ConnectorActions: Sendable {
         return .object(obj)
     }
 
-    public func runMobileNotify(input: [String: JSONValue]) async throws -> JSONValue {
+    public func runMobileNotify(input: [String: JSONValue], turn: Turn) async throws -> JSONValue {
         let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mobile.notify")
-        // Item 26: one exit, through the router. Owner-waiting and PINNED to
-        // the phone — `mobile.notify` names its channel. Payload unchanged.
-        let receipt = try await platform.attentionRouter().route(
-            eventId: "mobile_notify:\(AttentionRouter.stableDigest(title + "|" + message))",
-            importance: .ownerWaiting,
-            title: title,
-            body: message,
-            userInfo: ["screen": "inbox", "source": input["source"]?.scalarText ?? "connector_action"],
-            pinnedTo: .phone
-        ).requireReceipt()
+        // mobile.notify pins delivery to the phone, with routing and settlement owned by the router.
+        let matter = Matter(id: "mobile_notify:" + UUID().uuidString.lowercased(), form: .words,
+            from: input["source"]?.scalarText ?? "connector_action", title: title, summary: message,
+            open: turn.verifiedSessionID.map { "chat:" + $0 })
+        let receipt = try await platform.attentionRouter().tell(matter, reach: .pinned(.phone, from: nil), turn: turn).requireReceipt()
         var obj = receipt.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
@@ -425,7 +428,9 @@ public struct ConnectorActions: Sendable {
             let parts = String(line).split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
             guard parts.count == 5, let epoch = TimeInterval(parts[2]), epoch.isFinite else {
                 throw NSError(domain: "NativeAgentJournal", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Git returned a malformed commit row. Repair the journal's git-output reader before using these dates."])
+                    userInfo: [NSLocalizedDescriptionKey: """
+                        Git returned a malformed commit row. Repair the journal's git-output reader before using these dates.
+                        """])
             }
             return .object([
                 "sha": .string(parts[0]),
@@ -476,7 +481,8 @@ public struct ConnectorActions: Sendable {
     public static func createConnectorActionApproval(
         _ descriptor: ConnectorActionDescriptor,
         input: [String: JSONValue],
-        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
+        dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot(),
+        turn: Turn
     ) async throws -> ApprovalRecord {
         let payload: JSONValue = .object([
             "kind": .string("connector_action_v1"),
@@ -502,7 +508,7 @@ public struct ConnectorActions: Sendable {
             "remoteResolvable": .bool(true),
             "localOnly": .bool(false),
             "payload": payload,
-        ]))
+        ]), turn: turn)
     }
 
     public static func validateApprovedConnectorReplay(
@@ -530,10 +536,12 @@ public struct ConnectorActions: Sendable {
         output: JSONValue,
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
-        // These reads return source state as data; returning proves the read completed.
-        let directRead = !dryRun && output.objectValue?["status"] != .string("pending_approval") && ["codex.handoff", "mac_assistant.watch_templates"].contains(descriptor.id)
-        let facts = (directRead ? ChatToolOutcome.ExactResultClass.succeeded : ChatToolOutcome.exactResultClass(output)).receipt
-        let status = facts.ok == false ? facts.status : directRead ? "completed" : output.objectValue?["status"]?.stringValue ?? (facts.ok == true ? "completed" : facts.status)
+        let reply = ToolResult(output)
+        let directRead = !dryRun && output.objectValue?["status"] != .string(
+            "pending_approval") && ["codex.handoff", "mac_assistant.watch_templates"].contains(descriptor.id)
+        let facts = (directRead ? ChatToolOutcome.ExactResultClass.succeeded : reply.outcome).receipt
+        let status = facts.ok == false ? facts.status : directRead ? "completed" : output.objectValue?["status"]?.stringValue ?? (
+            facts.ok == true ? "completed" : facts.status)
         let createdAt = SwiftNativeManifestSigner.isoTimestamp(Date())
         let recorded: Result<ConnectorActionReceipt, Error> = await settle {
             do {
@@ -541,7 +549,7 @@ public struct ConnectorActions: Sendable {
                     actionId: descriptor.id, connectorId: descriptor.connectorId,
                     name: descriptor.name, status: status, ok: facts.ok, dryRun: dryRun,
                     approvalId: approvalId, createdAt: createdAt,
-                    output: output, dataRoot: dataRoot
+                    output: reply.payload, dataRoot: dataRoot
                 ))
             } catch {
                 return .failure(NSError(domain: "NativeAgentConnectorSettlement", code: 1, userInfo: [

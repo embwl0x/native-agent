@@ -4,20 +4,20 @@ import NativeAgentCore
 import BackgroundLoops
 import BackgroundWork
 import Synchronization
-// Blueprint: | `EngineDoctorHealthReads.swift` | EngineDoctorRuntime assembles health cards through DoctorReadout, merges live report rows and reuses completed support reports within the existing TTL |
+// Blueprint: | `EngineDoctorHealthReads.swift` | Shared live health cards and bounded completed-report reuse |
 
 extension EngineDoctorRuntime {
     public static var supportSnapshotDoctorReuseTTL: TimeInterval { 90 }
 
     public static func mergeReport(_ current: DoctorReport, liveChecks: [CheckResult]) -> DoctorReport {
         let liveIDs = Set(liveChecks.map(\.id))
-        // Core rows keep their original measurement and owed projection.
+        // Preserve core measurements and their owed projection.
         let checks = current.checks.filter { !liveIDs.contains($0.checkID) } + liveChecks
         return DoctorReport(status: DoctorReadout.doctorRollup(checks.map(\.status)), repaired: current.repaired, checks: checks)
     }
 
     public func getHealthCard() async throws -> HealthCard {
-        // Live owners refresh every read; DoctorReadout owns the offline cache and compatible snapshot.
+        // Refresh live owners on each read; `DoctorReadout` owns offline caching.
         let now = ISO8601DateFormatter().string(from: Date())
         let liveChecks = await liveDoctorCoverageChecks()
         let reading = await DoctorReadout.healthReadings(

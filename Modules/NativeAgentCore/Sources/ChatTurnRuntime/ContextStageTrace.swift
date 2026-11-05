@@ -4,9 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `ContextStageTrace.swift` | `ContextStageTrace`, stage vocabularies and lifecycle telemetry: bounded context timing, counts and recall/admission trace recording |
+// Blueprint: | `ContextStageTrace.swift` | `ContextStageTrace`; Payload-free bounded context telemetry |
 
-/// Closed vocabulary for base-context and session-history summary stages.
+/// Keep summary stage names closed so producers cannot invent indistinguishable trace kinds.
 enum ContextStageName: String, CaseIterable, Sendable {
     case contextFlowAttention = "contextFlow.attention"
     case contextFlowPrepare = "contextFlow.prepare"
@@ -31,7 +31,6 @@ enum ContextStageName: String, CaseIterable, Sendable {
     case promptRead = "history.prompt_read"
     case recallQuery = "history.recall_query"
     case contextBase = "context.base"
-    case digest = "history.digest"
     case prepare = "history.prepare"
     case render = "history.render"
     case checkpoint = "turn.checkpoint"
@@ -47,20 +46,12 @@ enum ContextStageName: String, CaseIterable, Sendable {
     case dispatchRemainder = "turn.dispatch_remainder"
 }
 
-/// Closed vocabulary for the out-of-band `context.stage` feed. This feed is
-/// intentionally separate from the per-turn context summary, so an arbitrary
-/// string here would make a second producer indistinguishable from the memory
-/// promotion lane that currently owns it.
+/// Keep the out-of-band stage vocabulary closed so unrelated producers cannot impersonate memory promotion.
 enum ContextStageEmissionName: String, CaseIterable, Sendable {
     case memoryPromotion = "memory.promotion"
 }
 
-/// Turn-local, payload-free timing collector for the cognition attention read.
-///
-/// The turn engine owns the collector and installs it with a task-local value;
-/// app-owned cognition records admission and cancellation. This keeps the
-/// measurements inside the existing `context.summary` receipt instead of
-/// creating another trace writer or persistent telemetry owner.
+/// The engine binds one turn-local collector so attention timings stay in the existing payload-free summary, without another writer.
 public final class CognitiveAttentionTraceRecorder: Sendable {
     public struct Snapshot: Sendable, Equatable {
         public let admissionMilliseconds: Int64?
@@ -107,18 +98,11 @@ public enum TurnLifecycleMilestone: String, CaseIterable, Sendable {
     case contextReady = "context.ready"
     case providerRequestStarted = "provider.requestStarted"
     case providerFirstDelta = "provider.firstDelta"
-    /// The in-flight conversation was trimmed mid-turn to keep fitting the
-    /// model's window — either measured over the pressure line before a call,
-    /// or after the provider refused the body as too long. Payload is the
-    /// compaction receipt (mode, trigger, charsBefore, charsAfter).
-    case contextIntraTurnCompaction = "context.intraTurnCompaction"
     case surfaceOutputEnqueued = "surface.outputEnqueued"
     case surfaceFirstRender = "surface.firstRender"
 }
 
-/// Fire-and-forget FC0 lifecycle telemetry. Callers supply the observation
-/// boundary because only the owning provider/surface can name these moments
-/// honestly. Payloads are timings, counts, and bounded identifiers only.
+/// Only the owning surface or provider can name its observation boundary; trace only timings, counts and bounded identifiers.
 public enum TurnLifecycleTelemetry {
     public static func emit(
         _ milestone: TurnLifecycleMilestone,
@@ -129,7 +113,8 @@ public enum TurnLifecycleTelemetry {
         counts: [String: Int64] = [:],
         flags: [String: Bool] = [:],
         turnId: String? = TurnTraceContext.turnId,
-        on bus: TurnTraceBus? = nil
+        on bus: TurnTraceBus? = nil,
+        turn: Turn?
     ) {
         guard let turnId else { return }
         var payload: [String: JSONValue] = [
@@ -151,7 +136,8 @@ public enum TurnLifecycleTelemetry {
             kind: milestone.rawValue,
             sessionId: sessionId,
             surface: surface,
-            payload: .object(payload)
+            payload: .object(payload),
+            turn: turn
         ), on: bus ?? TurnTraceContext.bus ?? .shared)
     }
 
@@ -204,6 +190,7 @@ enum MemoryRecallTraceOutcome: Sendable, Equatable {
 }
 
 struct ContextStageTrace: Sendable {
+    private let turn: Turn?
     struct Timing: Sendable {
         let name: String
         let elapsedMs: Int64
@@ -217,7 +204,8 @@ struct ContextStageTrace: Sendable {
     private var memoryRecallOutcome: MemoryRecallTraceOutcome?
     private var injectedMemoryIDs: [String]?
 
-    init() {
+    init(turn: Turn?) {
+        self.turn = turn
         self.startedNs = DispatchTime.now().uptimeNanoseconds
     }
 
@@ -259,8 +247,7 @@ struct ContextStageTrace: Sendable {
         counts[name.rawValue + "Micros"] = bounded
     }
 
-    /// Same clock as `record(_:since:)` but preserved at microsecond
-    /// resolution — for stages whose per-turn work is sub-millisecond.
+    /// Preserve microseconds so sub-millisecond stages remain measurable on the same clock.
     mutating func recordMicroseconds(_ name: ContextStageName, since startNs: UInt64) {
         let elapsed = Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000)
         setMicroseconds(name, microseconds: elapsed)
@@ -291,10 +278,7 @@ struct ContextStageTrace: Sendable {
         memoryRecallOutcome = outcome
     }
 
-    /// The memory records that went INTO the turn, counted as
-    /// `memory.recallHits`. Their ids ride the summary, an empty list too, so
-    /// a week of traces can say which rows reach nearly every conversation
-    /// (the weekly sweep's standing lessons).
+    /// Carry delivered memory IDs, including an empty set, so traces can identify which memories actually reach turns.
     mutating func setInjectedMemoryIDs(_ ids: [String]) {
         injectedMemoryIDs = ids
         counts["memory.recallHits"] = Int64(ids.count)
@@ -328,7 +312,8 @@ struct ContextStageTrace: Sendable {
         TurnTraceBus.fireFromContext(
             kind: kind,
             surface: surface,
-            payload: .object(payload)
+            payload: .object(payload),
+            turn: turn
         )
         return totalMs
     }
@@ -339,7 +324,8 @@ struct ContextStageTrace: Sendable {
         surface: String,
         counts: [String: Int64] = [:],
         flags: [String: Bool] = [:],
-        labels: [String: String] = [:]
+        labels: [String: String] = [:],
+        turn: Turn?
     ) {
         TurnTraceBus.fireFromContext(
             kind: "context.stage",
@@ -351,7 +337,8 @@ struct ContextStageTrace: Sendable {
                 "counts": .object(counts.mapValues { .int(max(0, $0)) }),
                 "flags": .object(flags.mapValues(JSONValue.bool)),
                 "labels": .object(labels.mapValues(JSONValue.string)),
-            ])
+            ]),
+            turn: turn
         )
     }
 }

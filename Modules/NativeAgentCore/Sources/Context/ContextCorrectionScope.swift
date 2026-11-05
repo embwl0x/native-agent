@@ -1,18 +1,12 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `ContextCorrectionScope.swift` | `ContextCorrectionScope`: applicability gates for canonical corrections and endpoint-scoped graph relations; selection utility grants no authority |
+// Blueprint: | `ContextCorrectionScope.swift` | `ContextCorrectionScope`: canonical scope gates, never authority |
 
-/// Applicability is not authority. Existing corrections remain global unless
-/// their canonical memory explicitly supplies topics; attention/utility cannot
-/// make a topic-scoped correction apply to an unrelated conversation.
-///
-/// Knowledge-graph relations require endpoint matches; exclusions report `outsideContextScope`.
-///
-/// Atoms without a scoping entity remain global.
+/// Applicability grants no authority: only canonical topics scope corrections; attention cannot widen them. Graph relations require endpoint matches
+/// (`outsideContextScope` otherwise); unscoped atoms stay global.
 public enum ContextCorrectionScope {
     public static let entityKind = "context_topic"
-    /// Endpoint entities of a knowledge-graph relation atom.
     public static let relationshipEntityKind = "kg_entity"
     /// STUDIO pointers are scoped by work title, creator and medium, never judgment text.
     public static let studioEntityKind = "studio_work"
@@ -26,7 +20,6 @@ public enum ContextCorrectionScope {
         }
     }
 
-    /// Kind-scoped atoms, explicitly scoped memories, then studio endpoints.
     /// Scope comes from the atom's own metadata, never ambient attention.
     static func scopingEntityKind(for atom: ContextAtomDraft) -> String? {
         if let byKind = scopingEntityKind(for: atom.kind) { return byKind }
@@ -34,26 +27,18 @@ public enum ContextCorrectionScope {
         return atom.entities.contains { $0.kind == studioEntityKind } ? studioEntityKind : nil
     }
 
-    /// Entity kinds that mark an atom as BELONGING TO THE BUILD: a Desk item, a
-    /// project, a workshop execution. An atom carrying one of these is a piece
-    /// of engineering backlog, whatever its atom kind.
+    /// Engineering entities mark backlog regardless of atom kind.
     public static let engineeringEntityKinds: Set<String> = [
-        "desk_handle", "project", "workshop_execution",
+        "desk_handle", "project",
     ]
 
-    /// The subset of those kinds whose label NAMES THE ITEM ITSELF. The resident
-    /// projection puts a `desk_handle` (the item's title) AND a `project` (the
-    /// shared label, "NativeAgent" on every item) on every atom it emits
-    /// (NativeResidentWorkContextProjection.swift:196-198), so matching the
-    /// project label would re-admit the entire backlog the moment a personal
-    /// question happened to say the product's name. Only a title counts as
-    /// naming a specific work item.
+    /// Only an item's title names specific work; the shared project label would admit the entire backlog whenever the product is mentioned.
     public static let engineeringTitleEntityKinds: Set<String> = [
-        "desk_handle", "workshop_execution",
+        "desk_handle",
     ]
 
-    /// Build-specific topic tokens match whole words through the shared tokenizer.
-    /// Interpersonal terms such as "design", "preference" and "personal" are excluded.
+    /// Build-specific topic tokens match whole words through the shared tokenizer. Interpersonal terms such as "design", "preference" and "personal" are
+    /// excluded.
     public static let engineeringTopicTokens: Set<String> = [
         "backlog", "branch", "build", "builds", "ci", "codex", "commit",
         "compile", "delegation", "deploy", "deployment", "desk", "diff",
@@ -65,16 +50,10 @@ public enum ContextCorrectionScope {
         "worktree",
     ]
 
-    /// Memory-record labels (the record's own `kind`/`layer`) that name the
-    /// build rather than the person. `instruction`, `preference` and
-    /// `correction` are excluded on purpose: interpersonal memory uses exactly
-    /// those labels.
+    /// Exclude instruction, preference and correction labels: interpersonal memories use them too.
     public static let engineeringRecordLabels: Set<String> = ["project"]
 
-    /// Does this atom's OWN metadata mark it as build material, by topic tag or
-    /// memory-record label? Returns the labels a turn could name to bring it
-    /// back in; `nil` means the atom carries no engineering marker and stays
-    /// global, exactly as before.
+    /// Nil means no engineering marker: the atom stays global.
     static func engineeringTopicLabels(for atom: ContextAtomDraft) -> [String]? {
         var labels: [String] = []
         for tag in atom.triggers where !Set(words(tag)).isDisjoint(with: engineeringTopicTokens) {
@@ -91,12 +70,9 @@ public enum ContextCorrectionScope {
         _ atom: ContextAtomDraft, message: String, recentTurns: [String],
         subjectEntities: Set<ContextEntity> = []
     ) -> Bool {
-        // Structured subjects do not depend on English follow-up recognition.
-        // These are extracted turn entities, never ambient attention terms.
+        // Extracted turn subjects work across languages; ambient attention grants no scope.
         let subjectWords = subjectEntities.flatMap { [$0.label, $0.id] }.joined(separator: "\n")
-        // Backlog needs current-turn evidence on every turn, not just questions
-        // about her inner life. Attention terms and a shared project name do
-        // not make a particular engineering item relevant to casual chat.
+        // Backlog always needs current-turn evidence; ambient attention and a shared project name do not identify a work item.
         let isEngineering = atom.entities.contains { engineeringEntityKinds.contains($0.kind) }
         if isEngineering {
             let titles = atom.entities
@@ -105,8 +81,7 @@ public enum ContextCorrectionScope {
             return mentions(titles, message: message, recentTurns: recentTurns)
                 || mentions(titles, message: subjectWords, recentTurns: [])
         }
-        // An unscoped atom stays global unless its own metadata identifies
-        // engineering work. That work needs evidence from this turn too.
+        // Engineering metadata requires evidence from this turn even on an otherwise unscoped atom.
         guard let scopingKind = scopingEntityKind(for: atom) else {
             return engineeringTopicsApply(atom, message: message + "\n" + subjectWords, recentTurns: recentTurns)
         }
@@ -114,17 +89,13 @@ public enum ContextCorrectionScope {
         guard !topics.isEmpty else {
             return engineeringTopicsApply(atom, message: message + "\n" + subjectWords, recentTurns: recentTurns)
         }
-        // Personal-topic corrections also apply when this turn addresses her inner life,
-        // even without a literal topic match.
+        // Inner-life questions admit personal corrections without a literal topic match.
         if scopingKind == entityKind,
            isPersonalTask(message),
            topics.contains(where: isPersonalTopic) {
             return true
         }
-        // A studio pointer has a SECOND admission: the turn itself is a taste
-        // judgment (a design review, an aesthetic call). Naming the work is the
-        // ordinary way in; being asked which of two things is better is the
-        // other. Neither is "the message happened to be long".
+        // A taste judgment can admit a studio pointer without naming the work; message length grants no admission.
         if scopingKind == studioEntityKind, isTasteJudgmentTask(message) { return true }
         return mentions(topics, message: message, recentTurns: recentTurns)
             || mentions(topics, message: subjectWords, recentTurns: [])
@@ -142,10 +113,7 @@ public enum ContextCorrectionScope {
         return !scopingTopics(atom, kind: kind).isEmpty
     }
 
-    /// The fail-open exit, one question later: global unless this atom's own
-    /// topic tags or memory-record label name the build, in which case the
-    /// current turn has to name its subject. A broad label counts only when
-    /// the memory supplies no more specific subject.
+    /// Engineering metadata requires the turn to name its subject; a broad label counts only without a more specific subject.
     private static func engineeringTopicsApply(
         _ atom: ContextAtomDraft, message: String, recentTurns: [String]
     ) -> Bool {
@@ -156,14 +124,11 @@ public enum ContextCorrectionScope {
         return mentions(subjects.isEmpty ? labels : subjects, message: message, recentTurns: recentTurns)
     }
 
-    /// Does the turn NAME one of these labels, as a contiguous word run?
-    /// Extracted unchanged from `applies` so the engineering check above uses the
-    /// same notion of "the message is about this" as the topic check below.
+    /// Share contiguous-word matching between engineering and topic admission.
     private static func mentions(
         _ labels: [String], message: String, recentTurns: [String]
     ) -> Bool {
-        // Carry scope through a short referential follow-up, not through a
-        // greeting or an unrelated topic simply because it follows work.
+        // Carry scope through a short referential follow-up, not through a greeting or an unrelated topic simply because it follows work.
         let followup = isReferentialFollowup(message)
         let texts = [message] + (followup ? Array(recentTurns.suffix(2)) : [])
         return labels.contains { label in
@@ -181,13 +146,9 @@ public enum ContextCorrectionScope {
 
     // MARK: - Personal turns
 
-    // The lexical personal/taste/follow-up shortcuts below recognize English
-    // only. Literal topic matching and supplied structured subjects work across
-    // scripts; these shortcuts are not a universal intent classifier.
+    // English-only intent shortcuts supplement cross-script literal topics and structured subjects.
 
-    /// Topics that make a correction a rule about PERSONAL conversation rather
-    /// than about the work. Matched as a word run inside the topic label, so
-    /// "personal conversations" and "personal answers" both qualify.
+    /// Whole-word runs admit related personal-topic labels without requiring exact label equality.
     static func isPersonalTopic(_ topic: String) -> Bool {
         let tokens = Set(words(topic))
         return !tokens.isDisjoint(with: [
@@ -196,8 +157,7 @@ public enum ContextCorrectionScope {
         ])
     }
 
-    /// Personal admission requires addressing her and naming her inner life.
-    /// Build vocabulary and question phrasing do not constrain this predicate.
+    /// Personal admission requires addressing the agent's inner life, independent of build vocabulary or question phrasing.
     public static func isPersonalTask(_ message: String) -> Bool {
         let tokens = words(message)
         guard !tokens.isEmpty else { return false }
@@ -207,8 +167,7 @@ public enum ContextCorrectionScope {
         }
         let addressed = !present.isDisjoint(with: ["you", "your", "yours", "yourself"])
         guard addressed else { return false }
-        // Her inner life, named. Bare "think" and "like" are excluded on
-        // purpose: "what do you think" is the most common ops question there is.
+        // Bare "think" and "like" also occur in operational questions and cannot establish personal intent.
         return !present.isDisjoint(with: [
             "feeling", "feelings", "feel", "felt", "thinking", "thought",
             "thoughts", "experienced", "experience", "experiences",
@@ -220,21 +179,16 @@ public enum ContextCorrectionScope {
 
     // MARK: - Taste-judgment turns
 
-    /// Taste admission requires a judgment request and an aesthetic object, or an explicit taste phrase.
-    /// Matching uses whole words from the shared tokenizer.
+    /// Whole-word matching requires a judgment request with an aesthetic object, or an explicit taste phrase.
     public static func isTasteJudgmentTask(_ message: String) -> Bool {
         let tokens = words(message)
         guard !tokens.isEmpty else { return false }
         let joined = " " + tokens.joined(separator: " ") + " "
-        // A taste call on its face — no second signal needed.
         for phrase in ["design review", "art direction", "aesthetic call"]
         where joined.contains(" " + phrase + " ") {
             return true
         }
-        // Each token also contributes its bare singular, so "which of these
-        // covers is better" reads the same as "which cover is better". This is
-        // the only stemming here and it is deliberately one rule: membership is
-        // tested against fixed sets, so a wrong singular matches nothing.
+        // Bare singulars admit plural objects; fixed-set membership keeps a mistaken singular from inventing a match.
         var present = Set(tokens)
         for token in tokens where token.count > 3 && token.hasSuffix("s") {
             present.insert(String(token.dropLast()))
@@ -256,8 +210,7 @@ public enum ContextCorrectionScope {
         return aesthetic
     }
 
-    /// Deliberately conservative: an incidental "it" in "how is it going?"
-    /// or "is it raining?" is not permission to bring prior work forward.
+    /// Incidental pronouns in greetings or weather questions must not carry work forward.
     public static func isReferentialFollowup(_ message: String) -> Bool {
         let tokens = words(message)
         guard !tokens.isEmpty, tokens.count <= 16 else { return false }

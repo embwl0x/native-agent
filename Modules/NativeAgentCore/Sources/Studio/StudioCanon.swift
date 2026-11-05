@@ -3,19 +3,17 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Experiences
-// Blueprint: | `StudioCanon.swift` | Strict current membership rows require explicit provenance/evidence; append-only membership and unchanged native fingerprints (fixed 90-day silence ledger units); editable `Resources/abilities/studio-canon.js` owns proposals and silence deadlines; production-pull failures retain successful recall and exact unconfirmed pulls through Experiences repair debt, which blocks canon count evidence until reconciled; native capacity and agent-only append authority remain |
+// Blueprint: | `StudioCanon.swift` | `Resources/abilities/studio-canon.js`: Append-only canon and repair debt |
 
-// Native storage owns canon identity, membership, evidence and the append-only decision ledger.
-// studio-canon.js owns proposal selection, reasons and silence deadlines; proposals never decide membership.
+// Native storage owns canon identity, membership, evidence and the append-only decision ledger. studio-canon.js owns proposal selection, reasons and silence
+// deadlines; proposals never decide membership.
 
 // MARK: - Vocabulary
 
 public enum StudioCanonStanding: String, Sendable, CaseIterable, Equatable {
-    /// A work that holds. The argument for it lives in the entries cited.
+    /// Cited entries carry the argument for membership.
     case canon
-    /// A work she keeps returning to in order to say no. Anti-canon is part of
-    /// a developed taste, not a failure state, and it is reachable only by her
-    /// saying so — nothing derives it from a judgment's tone.
+    /// Anti-canon requires an explicit agent decision; a judgment's tone never implies rejection.
     case antiCanon = "anti_canon"
 }
 
@@ -23,38 +21,29 @@ public enum StudioCanonAction: String, Sendable, CaseIterable, Equatable {
     case promote, demote
 }
 
-/// What argued for a proposal. Recorded on the row so a canon entry can always
-/// say why it was even asked about.
+/// Retain the argument so each proposal remains explainable.
 public enum StudioCanonEvidenceKind: String, Sendable, CaseIterable, Equatable {
     case recurrence
     case pulledInProduction = "pulled_in_production"
     case silence
 }
 
-/// One decided row on the canon ledger. Append-only: a later row supersedes an
-/// earlier one for the same work, and neither is ever rewritten.
+/// Append-only decisions preserve history; later rows supersede earlier rows for the same work.
 public struct StudioCanonRow: Sendable, Equatable {
-    /// The proposal this row resolves — the approval record id, so a row can
-    /// always be traced back to the card she actually saw.
+    /// The approval record ties this resolution to the exact card shown.
     public var proposalID: String
     public var action: StudioCanonAction
     public var standing: StudioCanonStanding
     public var workTitle: String
     public var workCreator: String?
     public var decidedAt: String
-    /// The seat that decided. Only an agent seat may appear on a promote or
-    /// demote row — see `StudioCanonSeat`.
+    /// Only an agent seat may promote or demote.
     public var decidedBy: String
-    /// WHERE the decision was actually made, derived from the runtime rather
-    /// than from anything the caller said: the live chat turn's own surface and
-    /// turn identity. A row that cannot name them is refused, so "she decided
-    /// this, in a turn, on this surface" is a fact on the ledger rather than an
-    /// assumption about who called a tool.
+    /// Runtime-derived surface and turn identity prove where the decision occurred; caller assertions cannot establish provenance.
     public var decidedOnSurface: String
     public var decidedInTurn: String
     public var evidenceKind: StudioCanonEvidenceKind
-    /// The journal entry ids that argued for this. Bounded; the row is
-    /// provenance, not a log.
+    /// Bound citations because this row is provenance, not a log.
     public var evidenceEntryIDs: [String]
     public var note: String?
 
@@ -141,7 +130,6 @@ public struct StudioCanonRow: Sendable, Equatable {
     }
 }
 
-/// A work's CURRENT standing, derived from the append-only rows.
 public struct StudioCanonMember: Sendable, Equatable {
     public var workTitle: String
     public var workCreator: String?
@@ -166,19 +154,15 @@ public struct StudioCanonMember: Sendable, Equatable {
 
 // MARK: - Evidence in
 
-/// Everything the law is allowed to know about one work. Assembled by the
-/// caller from the GRAPH (recurrence) and the recall counter (production
-/// pulls); nothing here is inferred from the text of a judgment.
+/// Graph recurrence and actual recall pulls supply evidence; judgment text cannot imply either.
 public struct StudioCanonWorkEvidence: Sendable, Equatable {
     public var title: String
     public var creator: String?
-    /// Distinct LATER journal entries whose `deepens`/`echoes` relation resolves
-    /// to this work. Ids, not a count, so the proposal can cite them.
+    /// Retain later related entry IDs so the proposal can cite its recurrence evidence.
     public var recurrenceEntryIDs: [String]
     /// Live-turn studio_recall pulls that returned this work; evidence, not a preference score.
     public var recallHits: Int
-    /// The most recent thing that touched this work at all: a new entry about
-    /// it, or a pull of it. Empty means "nothing recorded", which never demotes.
+    /// Missing touch evidence never demotes a work.
     public var lastActivityAt: String
 
     public init(
@@ -198,7 +182,7 @@ public struct StudioCanonWorkEvidence: Sendable, Equatable {
     public var workKey: String { StudioCanonLaw.workKey(title: title, creator: creator) }
 }
 
-/// One thing to ASK her. Never a decision, and it carries no verdict of its own.
+/// One thing to ASK the agent. Never a decision, and it carries no verdict of its own.
 public struct StudioCanonProposalDraft: Sendable, Equatable {
     public var action: StudioCanonAction
     public var workTitle: String
@@ -235,20 +219,12 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
         self.reasonLine = reasonLine
     }
 
-    /// The LANE key: this work, this direction. At most one card may be OPEN on
-    /// it at a time — two live questions about the same work is noise.
+    /// One open card per work and direction prevents duplicate questions.
     public var key: String {
         "\(action.rawValue)|\(StudioCanonLaw.workKey(title: workTitle, creator: workCreator))"
     }
 
-    /// What this proposal is ARGUING FROM, not merely what it is about.
-    ///
-    /// The lane key alone was the wrong dedupe across resolved cards: denying
-    /// one card silenced the work forever, so a judgment she kept deepening for
-    /// another year could never be asked about again. A denial should settle THE
-    /// ARGUMENT SHE SAW, not the subject. So a resolved card blocks only a
-    /// proposal built on the SAME evidence — new entries, a new pull count, or a
-    /// later silence window all produce a new fingerprint and may be asked once.
+    /// A denial settles its exact evidence, not the subject; new entries, pull counts or silence windows permit a new question.
     public var evidenceFingerprint: String {
         var parts = [key, evidenceKind.rawValue]
         switch evidenceKind {
@@ -257,8 +233,7 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
             parts.append("recurrences:\(recurrenceCount)")
             parts.append("pulls:\(recallHits)")
         case .silence:
-            // The window this demotion is arguing from. A work that stays silent
-            // another 90 days is a genuinely new question, not a repeat.
+            // A further 90-day silence window is a new argument.
             parts.append("silent_since:\(lastActivityAt)")
             parts.append("windows:\(elapsedSilenceWindows)")
         }
@@ -270,15 +245,12 @@ public struct StudioCanonProposalDraft: Sendable, Equatable {
 // MARK: - The law
 
 public enum StudioCanonLaw {
-    /// Existing silence fingerprints count these fixed ledger windows. The
-    /// editable proposal/deadline policy lives in studio-canon.js; changing it
-    /// cannot reinterpret the identity of an argument already decided.
+    /// Fixed ledger windows preserve decided argument identities when editable silence policy changes.
     public static let silenceIdentityWindow: TimeInterval = 90 * 24 * 60 * 60
-    /// Bound on one pass. Canon-tending is deliberate and low-frequency; an
-    /// inbox of twenty cards is homework, which the design forbids.
+    /// Bound a pass so canon tending cannot flood the inbox.
     public static let maximumProposalsPerPass = 3
 
-    /// Title + creator, folded. Two spellings of one work are one work.
+    /// Fold title and creator so spelling variants share one identity.
     public static func workKey(title: String, creator: String?) -> String {
         func fold(_ value: String) -> String {
             value.replacingOccurrences(of: "\r\n", with: "\n")
@@ -292,9 +264,7 @@ public enum StudioCanonLaw {
         return fold(title) + "\u{1f}" + fold(creator ?? "")
     }
 
-    /// Current standing per work key, from the append-only rows in file order.
-    /// A later row supersedes an earlier one; a `demote` removes membership
-    /// without erasing the promote row that preceded it.
+    /// Later rows supersede membership without erasing earlier decisions.
     public static func membership(from rows: [StudioCanonRow]) -> [String: StudioCanonMember] {
         var result: [String: StudioCanonMember] = [:]
         for row in rows {
@@ -314,8 +284,7 @@ public enum StudioCanonLaw {
         return result
     }
 
-    /// Export neutral facts, then bind the part's references back to those
-    /// facts. The part supplies no counts, entry ids, membership or identity.
+    /// Export neutral facts, then bind the part's references back to those facts. The part supplies no counts, entry ids, membership or identity.
     public static func project(
         evidence: [StudioCanonWorkEvidence],
         membership: [String: StudioCanonMember],
@@ -326,7 +295,8 @@ public enum StudioCanonLaw {
         let works = Dictionary(evidence.map { ($0.workKey, $0) }, uniquingKeysWith: { first, _ in first })
         let activity = Dictionary(evidence.map { ($0.workKey, $0.lastActivityAt) }, uniquingKeysWith: { max($0, $1) })
         func stamp(_ key: String, _ member: StudioCanonMember) -> String { max(works[key]?.lastActivityAt ?? "", member.since) }
-        func seconds(_ stamp: String) -> JSONValue { NativeTimestampFormat.parseISO8601FractionalFirst(stamp).map { .double($0.timeIntervalSince1970) } ?? .null }
+        func seconds(_ stamp: String) -> JSONValue { NativeTimestampFormat.parseISO8601FractionalFirst(stamp).map { .double($0.timeIntervalSince1970) }
+            ?? .null }
         func deadlineSeconds(_ stamp: String) -> JSONValue { deadlineDate(stamp).map { .double($0.timeIntervalSince1970) } ?? .null }
         let workFacts: [JSONValue] = evidence.sorted { $0.workKey < $1.workKey }.map { work in
             .object(["key": .string(work.workKey), "title": .string(work.title),
@@ -391,8 +361,7 @@ public enum StudioCanonLaw {
 
 /// Only the agent's live tool turn may decide canon membership; the owner cannot approve it.
 public enum StudioCanonSeat {
-    /// The only seat a canon row may carry: her own tool lane, reached when SHE
-    /// calls `studio_canon_resolve` during a turn.
+    /// Only an explicit resolve call from the agent's live turn can supply this seat.
     public static let agent = "studio_agent"
 
     public static func isAgent(_ decidedBy: String?) -> Bool {
@@ -400,12 +369,10 @@ public enum StudioCanonSeat {
     }
 }
 
-/// Decision surface and identity come from live turn task-locals, never caller-supplied provenance.
+/// Decision surface and identity come from the held live turn, never caller-supplied provenance.
 public struct StudioCanonTurnProvenance: Sendable, Equatable {
-    /// The surface the LIVE turn is running on, as the tool loop bound it.
     public let surface: String
-    /// The turn's own identity — the pinned run id when the surface has one,
-    /// otherwise the transport-verified session. Never model-supplied.
+    /// The held turn's run, never model-supplied identity.
     public let turnID: String
 
     public init(surface: String, turnID: String) {
@@ -420,23 +387,21 @@ public struct StudioCanonTurnProvenance: Sendable, Equatable {
 
 public extension SwiftNativeStudioStore {
 
-    /// `<dataRoot>/studio/canon/`.
     var canonDirectory: URL {
         studioRoot.appendingPathComponent("canon", isDirectory: true)
     }
 
-    /// `<dataRoot>/studio/canon/canon.jsonl` — append-only promote/demote rows.
+    /// Append-only decisions preserve superseded membership.
     var canonPath: URL {
         canonDirectory.appendingPathComponent("canon.jsonl")
     }
 
-    /// `<dataRoot>/studio/canon/recall_hits.json` — the bounded production-pull
-    /// counter. See `noteRecallPulls`.
+    /// Bound production-pull evidence independently of journal retention.
     var canonRecallHitsPath: URL {
         canonDirectory.appendingPathComponent("recall_hits.json")
     }
 
-    /// Every decided row, in file order. Missing file is an empty canon.
+    /// A missing ledger means an empty canon.
     func readCanon() async throws -> [StudioCanonRow] {
         try await Self.readCanon(at: canonPath)
     }
@@ -451,24 +416,17 @@ public extension SwiftNativeStudioStore {
         return decoded
     }
 
-    /// Current membership, canon and anti-canon together.
     func canonMembership() async throws -> [String: StudioCanonMember] {
         StudioCanonLaw.membership(from: try await readCanon())
     }
 
-    /// Append ONE decided row. Idempotent by `proposalID`: resolving the same
-    /// card twice (the crash-window reconcile does exactly that) writes one row.
-    ///
-    /// Refuses any seat but hers — the sole-approver rule, enforced at the last
-    /// place a row could reach the disk rather than only at the tool.
+    /// Deduplicate by proposal ID across interrupted resolution; enforce agent-only authority at the final disk boundary.
     @discardableResult
     func appendCanonRow(_ row: StudioCanonRow) async throws -> Bool {
         guard StudioCanonSeat.isAgent(row.decidedBy) else {
             throw StudioCanonError.approvalNotFromAgentSeat(row.decidedBy)
         }
-        // A row that cannot say WHERE it was decided is not hers by evidence,
-        // only by assertion. Refuse it here too, at the last place a row can
-        // reach the disk, so no future caller can skip the tool's gate.
+        // Require decision provenance here so no caller can bypass the live-turn gate.
         guard StudioCanonTurnProvenance(
             surface: row.decidedOnSurface, turnID: row.decidedInTurn
         ).isComplete else {
@@ -514,8 +472,8 @@ public extension SwiftNativeStudioStore {
 
     // MARK: Production pulls
 
-    /// Count works actually returned by live-turn recall as native evidence for the editable canon policy.
-    /// Bound to maximumTrackedWorks keys by evicting the least recently pulled; no preference or decay.
+    /// Count works actually returned by live-turn recall as native evidence for the editable canon policy. Bound to maximumTrackedWorks keys by evicting the
+    /// least recently pulled; no preference or decay.
     func noteRecallPulls(
         titles: [(title: String, creator: String?)],
         now: Date = Date(),
@@ -550,8 +508,7 @@ public extension SwiftNativeStudioStore {
                 table[key] = .object(row)
             }
             if table.count > maximumTrackedWorks {
-                // Evict the least recently pulled. A counter that grows forever
-                // is telemetry; this one is evidence with a bound.
+                // Bound evidence by evicting the least recently pulled work.
                 let updated = try Self.checkedRecallCounts(.object(["works": .object(table)]))
                 let keep = Set(updated.sorted { $0.value.lastAt > $1.value.lastAt }.prefix(maximumTrackedWorks).map(\.key))
                 table = table.filter { keep.contains($0.key) }
@@ -570,7 +527,10 @@ public extension SwiftNativeStudioStore {
                 + "\(stamp) for work keys: "
                 + titles.map { StudioCanonLaw.workKey(title: $0.title, creator: $0.creator) }.joined(separator: ", ")
             let instruction = ToolFailureError.fileRepairInstruction(path,
-                shape: "Reconcile the unconfirmed pull in this repair's evidence against the existing counter before restoring counting; a later successful pull cannot prove this one was counted. Do not repeat the completed recall.")
+                shape: """
+                    Reconcile the unconfirmed pull in this repair's evidence against the existing counter before restoring counting; a later successful pull \
+                    cannot prove this one was counted. Do not repeat the completed recall.
+                    """)
             if !committed {
                 let operation = Self.recallCountingOperation
                 let debt = ExperienceStore.record(dataRoot, "repair:" + operation) { store in
@@ -578,8 +538,7 @@ public extension SwiftNativeStudioStore {
                         kind: .act, evidence: [.init(source: "studio/canon/recall_hits.json", id: stamp)],
                         operation: operation, owner: path.path, words: words, tap: path.path)
                     if let open = try await RepairOwed.openDebt(store, operation: operation, owner: path.path) {
-                        // Repeated failures share one debt, but every pull keeps
-                        // its exact timestamp, works and cause for reconciliation.
+                        // Repeated failures share one debt, but every pull keeps its exact timestamp, works and cause for reconciliation.
                         try await store.append([.claim(.init(claim: words, evidence: []))], to: open.id)
                     }
                 }
@@ -595,16 +554,13 @@ public extension SwiftNativeStudioStore {
     private func requireRecallCountingAvailable() async throws {
         let experiences = try await ExperienceStore.at(dataRoot).projection()
         if let owed = experiences.first(where: { RepairOwed.isOwed($0)
-            && RepairOwed.claim($0, "operation") == Self.recallCountingOperation
-            && RepairOwed.claim($0, "owner") == canonRecallHitsPath.path }) {
+            && RepairDebt($0).matches(operation: Self.recallCountingOperation, owner: canonRecallHitsPath.path) }) {
             throw StudioCanonError.recallCountingRepairOwed(owed.id)
         }
     }
 
-    /// The counter, read back as `workKey → (count, lastAt)`.
     func recallPullCounts() async throws -> [String: (count: Int, lastAt: String)] {
-        // An existing failed pull is evidence the counter is incomplete, even
-        // when its older bytes still decode. Never read that as zero/fewer pulls.
+        // An existing failed pull is evidence the counter is incomplete, even when its older bytes still decode. Never read that as zero/fewer pulls.
         try await requireRecallCountingAvailable()
         let value = try Self.readRecallCounter(at: canonRecallHitsPath)
         return try Self.checkedRecallCounts(value)
@@ -633,10 +589,9 @@ public extension SwiftNativeStudioStore {
 }
 
 public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
-    /// User approved a canon card. The whole point of the lane is that he can't.
+    /// The owner cannot decide the agent's canon membership.
     case approvalNotFromAgentSeat(String)
-    /// The call did not come from her live chat turn — a bridge tool run, an
-    /// approval executor, a replay, or a background lane.
+    /// Bridge, approval, replay and background calls cannot assert a live-turn decision.
     case decisionHasNoLiveTurn
     case missingWorkTitle
     case unknownProposal(String)
@@ -647,12 +602,15 @@ public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .recallCountingRepairOwed(let id):
-            return "studio canon: production-pull counting has unconfirmed evidence in Experience \(id); reconcile that repair before treating the stored counts as complete. A later successful pull cannot settle it."
+            return """
+                studio canon: production-pull counting has unconfirmed evidence in Experience \(id); reconcile that repair before treating the stored counts \
+                as complete. A later successful pull cannot settle it.
+                """
         case .unavailableRecallCounts:
             return "studio canon: recall counts are invalid or exhausted; counting is unavailable and stored bytes were preserved."
         case .approvalNotFromAgentSeat(let seat):
-            return "studio canon: '\(seat)' is not the agent seat. The canon is hers to tend — "
-                + "only she may promote or demote a work, through studio_canon_resolve. "
+            return "studio canon: '\(seat)' is not the agent seat. The canon is the agent's to tend — "
+                + "only the agent may promote or demote a work, through studio_canon_resolve. "
                 + "Nothing was written."
         case .decisionHasNoLiveTurn:
             return "studio canon: a canon decision has to be made IN a turn — yours, on a local "

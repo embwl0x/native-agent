@@ -3,7 +3,7 @@ import SwiftUI
 import AppKit
 #endif
 
-// Blueprint: | `ColorHex.swift` | `NativeAgentSpacing`, `NativeAgentRadius`, `HazeColor`, `HazeMood` and `Color.init(hex:)`: shared geometry and appearance values |
+// Blueprint: | `ColorHex.swift` | `NativeAgentSpacing`, `NativeAgentRadius`, `HazeColor`, `HazeMood`, `Color.init(hex:)`: shared values |
 
 public enum NativeAgentSpacing {
     public static let xs: CGFloat = 4
@@ -14,7 +14,6 @@ public enum NativeAgentSpacing {
     public static let pageInset: CGFloat = 20
     public static let section: CGFloat = 28
     public static let pageTop: CGFloat = 36
-    // Content-specific exceptions to the general spacing steps.
     public static let rowInsetV: CGFloat = 14
     public static let eyebrowGap: CGFloat = 10
 }
@@ -33,8 +32,6 @@ public extension Color {
                   blue: Double(hex & 0xFF) / 255, opacity: opacity)
     }
 
-    /// Initialize from a 6- or 8-digit hex string, e.g. "FF3300" or "FFFF3300".
-    /// Returns nil for invalid input.
     init?(hex: String) {
         var h = hex.trimmingCharacters(in: .alphanumerics.inverted)
         guard h.count == 6 || h.count == 8 else { return nil }
@@ -50,8 +47,7 @@ public extension Color {
     }
 }
 
-/// One hue, three shades. The whole palette — the agent may pick any of these
-/// by chat and nothing else (`settings.haze_color`).
+/// One hue, three shades. The whole palette — the agent may pick any of these by chat and nothing else (`settings.haze_color`).
 public enum HazeColor: String, CaseIterable, Identifiable, Sendable {
     case teal, blue, violet, rose, amber, forest, graphite
     /// An unsupported saved value has no selected hue until the person repairs it.
@@ -67,7 +63,6 @@ public enum HazeColor: String, CaseIterable, Identifiable, Sendable {
 
     public var id: String { rawValue }
 
-    /// The accessibility name, and the word the Settings swatch speaks.
     public var name: String {
         switch self {
         case .unavailable: return "Unsupported saved color"
@@ -103,7 +98,6 @@ public enum HazeMood: Equatable, Sendable {
         }
     }
 
-    /// Multiplier on the idle animation loops.
     public var speed: Float {
         switch self {
         case .idle: return 1

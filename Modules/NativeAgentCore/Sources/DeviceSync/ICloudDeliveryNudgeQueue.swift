@@ -1,11 +1,8 @@
 import Foundation
 
-// Blueprint: | `ICloudDeliveryNudgeQueue.swift` | `ICloudDeliveryNudgeQueue`: one bounded single-flight KVS wake worker; a nudge never proves transport delivery |
+// Blueprint: | `ICloudDeliveryNudgeQueue.swift` | `ICloudDeliveryNudgeQueue`; Bounded single-flight wake hints. |
 
-/// The KVS wake-up is not delivery confirmation: it merely gives the paired
-/// device a prompt to drain its real transport. Keep the retry plan bounded,
-/// observable, and single-flight so a chat burst cannot create an unbounded
-/// set of sleeping tasks.
+/// Nudges only prompt a transport drain; a bounded single worker prevents chat bursts spawning unbounded sleeping tasks.
 enum ICloudDeliveryNudgeDisposition: Sendable, Equatable {
     case synchronized
     case unavailable
@@ -47,9 +44,7 @@ actor ICloudDeliveryNudgeQueue {
         self.observeOutcome = observeOutcome
     }
 
-    /// Enqueue exactly one declared nudge per plan delay. A single worker owns
-    /// every pending message, including bursts, rather than spawning one task
-    /// per delay per outbound message.
+    /// One worker owns all delayed nudges so bursts cannot multiply tasks per message and delay.
     func schedule(for messageID: String) {
         let scheduledAt = Date()
         for delayNanoseconds in delaysNanoseconds {

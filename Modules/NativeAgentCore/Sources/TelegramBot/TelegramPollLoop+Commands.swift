@@ -1,12 +1,25 @@
 import Foundation
 import NativeAgentShared
 import ChatTurnContracts
+import ChatTurnRuntime
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `TelegramPollLoop+Commands.swift` | `TelegramPollLoop`: `handleControlHandoff`, `clearQueueAcknowledgement`, `handleSlashCommand`; saved-answer retry retains notification policy; admitted commands/callbacks bind their Telegram surface, verified chat/sender and work identity in TurnEnvelope; Telegram has no command-signature scheme |
+// Blueprint: | `TelegramPollLoop+Commands.swift` | `TelegramPollLoop`, `handleControlHandoff`, `clearQueueAcknowledgement`, `handleSlashCommand` |
+// Commands and callbacks carry verified sender, surface and work identity; Telegram has no command-signature scheme.
 
 extension TelegramPollLoop {
+    /// The admitted Telegram act carries its exact sender and reply destination through queueing.
+    func telegramTurn(message: TelegramMessage, session: String? = nil, run: String = UUID().uuidString,
+                      id: String = Turn.mintID()) -> Turn {
+        var turn = Turn(id: id, run: run, session: session)
+        turn.verifiedSessionID = session
+        turn.envelope = TurnEnvelope(surface: "telegram", verifiedChatId: String(message.chatId),
+            verifiedUserId: message.fromUserId.map(String.init),
+            deliveryRoute: .init(surface: "telegram", destinationId: String(message.chatId),
+                threadId: message.destination.threadId.map(String.init), requesterUserId: message.fromUserId.map(String.init)))
+        return turn
+    }
     func handleControlHandoff(update: TelegramUpdate, message: TelegramMessage, text: String,
                               admissionReady: @escaping @Sendable () -> Void) async {
         let (turnId, card) = await turnCoordinator.prepareControlHandoff(destination: message.destination)
@@ -21,32 +34,31 @@ extension TelegramPollLoop {
         await sendCommandReply(reply, kind: "control_handoff", update: update, message: message, text: text)
     }
 
-    /// Remove a starting turn's queue acknowledgement through its one lifecycle operation.
     func clearQueueAcknowledgement(chatId: Int, messageId: Int) async {
         do { try await Self.defaultDeleteMessage(token, chatId, messageId) }
         catch {
             await recordError(context: "queue_acknowledgement_delete", error:
-                "Queue acknowledgement \(messageId) in chat \(chatId) could not be removed: \(error). The turn has started; inspect that message before removing it. Do not repeat the turn.")
+                """
+                    Queue acknowledgement \(messageId) in chat \(chatId) could not be removed: \(error). The turn has started; inspect \
+                    that message before removing it. Do not repeat the turn.
+                    """)
         }
     }
 
-    /// Returns true only when the command transferred ownership of its durable
-    /// inbox claim to a tracked turn. Ordinary commands finish synchronously
-    /// and let the poll loop settle their claim.
+    /// True transfers claim settlement to a tracked turn; ordinary commands leave settlement with the poll loop.
     func handleSlashCommand(
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
     ) async -> Bool {
-        await ChatToolSessionContext.$envelope.withValue(TurnEnvelope(surface: "telegram", verifiedChatId: String(message.chatId),
+        let turn = Turn().with(\.envelope, TurnEnvelope(surface: "telegram", verifiedChatId: String(message.chatId),
             verifiedUserId: message.fromUserId.map(String.init), commandSignatureVerified: nil,
-            workIdentity: "telegram:command:\(botIdentity):\(update.updateId)")) {
-            await handleAdmittedSlashCommand(update: update, message: message, text: text)
-        }
+            workIdentity: "telegram:command:\(botIdentity):\(update.updateId)"))
+        return await handleAdmittedSlashCommand(update: update, message: message, text: text, turn: turn)
     }
 
     private func handleAdmittedSlashCommand(
-        update: TelegramUpdate, message: TelegramMessage, text: String
+        update: TelegramUpdate, message: TelegramMessage, text: String, turn: Turn
     ) async -> Bool {
         guard text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") else {
             return false
@@ -107,7 +119,7 @@ extension TelegramPollLoop {
             return await handleRetryCommand(args: parsed.args, update: update, message: message, text: text)
 
         case .sessions, .resume:
-            await handleExistingBotCommand(parsed: parsed, update: update, message: message, text: text)
+            await handleExistingBotCommand(parsed: parsed, update: update, message: message, text: text, turn: turn)
             return false
 
         case .status:
@@ -126,7 +138,7 @@ extension TelegramPollLoop {
             return false
 
         case .model where parsed.args.isEmpty:
-            await handleModelMenuCommand(parsed: parsed, update: update, message: message, text: text)
+            await handleModelMenuCommand(parsed: parsed, update: update, message: message, text: text, turn: turn)
             return false
 
         case .approve, .deny:
@@ -140,7 +152,7 @@ extension TelegramPollLoop {
             return false
 
         default:
-            await handleExistingBotCommand(parsed: parsed, update: update, message: message, text: text)
+            await handleExistingBotCommand(parsed: parsed, update: update, message: message, text: text, turn: turn)
             return false
         }
     }
@@ -161,14 +173,13 @@ extension TelegramPollLoop {
             return true
         }
 
-        return await ChatToolSessionContext.$envelope.withValue(TurnEnvelope(surface: "telegram", verifiedChatId: String(parsed.chatId),
+        let turn = Turn().with(\.envelope, TurnEnvelope(surface: "telegram", verifiedChatId: String(parsed.chatId),
             verifiedUserId: parsed.fromUserId.map(String.init), commandSignatureVerified: nil,
-            workIdentity: "telegram:callback:\(botIdentity):\(parsed.callbackId)")) {
-            await dispatchAuthenticatedModelSelection(parsed, update: update)
-        }
+            workIdentity: "telegram:callback:\(botIdentity):\(parsed.callbackId)"))
+        return await dispatchAuthenticatedModelSelection(parsed, update: update, turn: turn)
     }
 
-    private func dispatchAuthenticatedModelSelection(_ parsed: TelegramModelSelectionCallback, update: TelegramUpdate) async -> Bool {
+    private func dispatchAuthenticatedModelSelection(_ parsed: TelegramModelSelectionCallback, update: TelegramUpdate, turn: Turn) async -> Bool {
         let menu: TelegramModelMenu
         do { menu = try await bot.telegramModelMenuForSurface("telegram") }
         catch {
@@ -180,7 +191,7 @@ extension TelegramPollLoop {
         switch parsed.action {
         case .providers:
             do {
-                let presentation = try await bot.modelPickerPresentation("providers", menu: menu)
+                let presentation = try await bot.modelPickerPresentation("providers", menu: menu, turn: turn)
                 try await Self.defaultEditMessageTextWithReplyMarkup(
                     token,
                     parsed.chatId,
@@ -208,7 +219,7 @@ extension TelegramPollLoop {
                 return true
             }
             do {
-                let presentation = try await bot.modelPickerPresentation("models", menu: menu, providerId: providers[providerIndex].id)
+                let presentation = try await bot.modelPickerPresentation("models", menu: menu, providerId: providers[providerIndex].id, turn: turn)
                 try await Self.defaultEditMessageTextWithReplyMarkup(
                     token,
                     parsed.chatId,
@@ -243,12 +254,12 @@ extension TelegramPollLoop {
                 return true
             }
             do {
-                let presentation = try await bot.modelPickerPresentation("selected", menu: menu, providerId: provider.id, modelId: model.id)
+                let presentation = try await bot.modelPickerPresentation("selected", menu: menu, providerId: provider.id, modelId: model.id, turn: turn)
                 try Task.checkCancellation()
                 try await bot.saveTelegramModelSelection(
                     surface: "telegram",
                     provider: provider.id,
-                    model: model.id
+                    model: model.id, turn: turn
                 )
                 try await Self.defaultEditMessageTextWithReplyMarkup(
                     token,
@@ -271,7 +282,8 @@ extension TelegramPollLoop {
         parsed: TelegramParsedSlashCommand,
         update: TelegramUpdate,
         message: TelegramMessage,
-        text: String
+        text: String,
+        turn: Turn
     ) async {
         let menu: TelegramModelMenu
         do { menu = try await bot.telegramModelMenuForSurface("telegram") }
@@ -282,7 +294,7 @@ extension TelegramPollLoop {
         }
         let presentation: (text: String, markup: JSONValue)
         do {
-            presentation = try await bot.modelPickerPresentation("providers", menu: menu)
+            presentation = try await bot.modelPickerPresentation("providers", menu: menu, turn: turn)
         } catch {
             await recordError(context: "model_menu_part", error: String(describing: error), update: update, message: message, text: text)
             if !Task.isCancelled {
@@ -309,7 +321,10 @@ extension TelegramPollLoop {
             )
         } catch {
             FileHandle.standardError.write(
-                Data("TelegramPollLoop: model menu send failed for update \(update.updateId): \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8)
+                Data("""
+                    TelegramPollLoop: model menu send failed for update \(update.updateId): \
+                    \(TurnSecretRedactor.redactText(String(describing: error)))\n
+                    """.utf8)
             )
             await recordError(context: "send_model_menu", error: String(describing: error), update: update, message: message, text: text)
         }
@@ -320,6 +335,7 @@ extension TelegramPollLoop {
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String,
+        turn: Turn,
         admissionReady: @Sendable () -> Void = {}
     ) async {
         do {
@@ -327,7 +343,7 @@ extension TelegramPollLoop {
                 parsed,
                 destination: message.destination,
                 fromUserId: message.fromUserId,
-                chatType: message.chatType
+                chatType: message.chatType, turn: turn
             )
             admissionReady()
             if let reply = outcome.reply {
@@ -387,7 +403,7 @@ extension TelegramPollLoop {
                         }
                         guard let retained = try await retainedAssistantDelivery(for: claim), !retained.isDelivered else { return }
                         let delivery = makeAssistantDelivery(
-                            destination: message.destination, turnId: UUID(), errorContext: "retry_saved_reply",
+                            destination: message.destination, draftKey: "telegram:update:\(claim.updateId)", turn: nil, errorContext: "retry_saved_reply",
                             update: claim.update, message: originalMessage, text: nil, silent: retained.silent == true
                         )
                         switch await delivery.finalize(reply: retained.reply, savedDelivery: retained, resendUnknown: args == ["resend"]) {
@@ -414,7 +430,8 @@ extension TelegramPollLoop {
             }
         } catch {
             await recordError(context: "retry_saved_reply", error: String(describing: error), update: update)
-            await sendCommandReply("I couldn't read the saved answer delivery. Check the Mac error log before retrying.", kind: "retry_unavailable", update: update, message: message, text: text)
+            await sendCommandReply("I couldn't read the saved answer delivery. Check the Mac error log before retrying.",
+                kind: "retry_unavailable", update: update, message: message, text: text)
             return false
         }
         if args == ["resend"] {
@@ -473,7 +490,8 @@ extension TelegramPollLoop {
             if let messageId = retryClaim.queueAcknowledgementMessageId {
                 await clearQueueAcknowledgement(chatId: message.chatId, messageId: messageId)
             }
-            await runTurn(turnId: turnId, update: update, message: message,
+            let turn = telegramTurn(message: message, session: sessionId, run: turnId.uuidString)
+            await runTurn(turnId: turnId, turn: turn, update: update, message: message,
                 text: text, sessionId: sessionId) { card in
                 await card.transition(.retrying(action: "Taking another run at your last message"))
                 let prepared: (text: String, attachments: [TelegramMediaAttachment], receiptKind: String)
@@ -481,105 +499,23 @@ extension TelegramPollLoop {
                     prepared = try await prepareIncomingMedia(text: retryText,
                         caption: retryMessage.text ?? Self.caption(from: retryMessage),
                         voice: Self.voiceAttachment(from: retryMessage), media: Self.chatAttachment(from: retryMessage),
-                        update: update, message: retryMessage)
+                        update: update, message: retryMessage, turn: turn)
                 } else { prepared = (retryText, [], "reply") }
                 return (prepared.text, prepared.attachments, "retry_reply",
-                    TelegramChatAttemptContext(replyTo: retryMessage?.replyTo,
+                    TelegramChatAttemptContext(turn: turn, replyTo: retryMessage?.replyTo,
                         fromUserId: retryMessage?.fromUserId ?? message.fromUserId,
-                        suppressUserAppend: true, sessionId: sessionId,
-                        runId: turnId.uuidString, threadId: message.destination.threadId))
+                        suppressUserAppend: true, threadId: message.destination.threadId))
             }
         }
 
-        return await admitTurn(update: update, message: message, text: text,
-            input: retryText, sessionId: sessionId, retryInput: (retryText, retryMessage),
-            queuedNotice: ("Queued retry", "retry_queued", "send_retry_queued_notice"),
-            busyNotice: ("I'm still working on the last one — send /stop first.", "retry_busy", "send_command_reply"),
-            queueErrorContext: "retry_queue_update",
-            invalidQueueNotice: "I couldn't line that retry up safely. Try again once I've finished this one.",
+        return await turnCoordinator.startTrackedTurn(destination: message.destination, text: retryText,
             operation: retryOperation) != nil
-    }
-
-    /// Durable admission precedes acknowledgement delivery; the send retains its returned identity through settlement.
-    func admitTurn(
-        id: UUID = UUID(), priority: TaskPriority? = nil,
-        update: TelegramUpdate, message: TelegramMessage, text: String, input: String, sessionId: String,
-        retryInput: (text: String, message: TelegramMessage?)? = nil,
-        queuedNotice: (text: String, kind: String, sendError: String),
-        busyNotice: (text: String, kind: String, sendError: String),
-        queueErrorContext: String = "queue_update", invalidQueueNotice: String? = nil,
-        operation: @escaping @Sendable (UUID) async -> Void
-    ) async -> Int? {
-        if await turnCoordinator.startTrackedTurn(id: id, destination: message.destination,
-            text: input, priority: priority, operation: operation) != nil { return 0 }
-        guard await turnCoordinator.canEnqueue(destination: message.destination) else {
-            do {
-                try await Self.defaultSendMessage(token, message.destination, busyNotice.text)
-                await recordReceipt(kind: busyNotice.kind, update: update, message: message, text: text, reply: busyNotice.text)
-            } catch {
-                await recordError(context: busyNotice.sendError, error: String(describing: error), update: update, message: message, text: text)
-            }
-            return nil
-        }
-        let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
-        let queued: TelegramUpdateClaim
-        do {
-            queued = try await inbox.transition(updateId: update.updateId, from: [.processing], to: .queued,
-                resolvedRetryText: retryInput?.text, resolvedRetryMessage: retryInput?.message, resolvedSessionId: sessionId)
-            guard queued.phase == .queued, retryInput == nil || queued.resolvedRetryText == retryInput?.text else {
-                if let invalidQueueNotice {
-                    await sendCommandReply(invalidQueueNotice, kind: busyNotice.kind, update: update, message: message, text: text)
-                } else {
-                    await recordError(context: queueErrorContext, error: "durable queue transition failed", update: update, message: message, text: text)
-                }
-                return nil
-            }
-        } catch {
-            await recordError(context: queueErrorContext, error: String(describing: error), update: update, message: message, text: text)
-            return nil
-        }
-        let preview = String(input.replacingOccurrences(of: "\n", with: " ").prefix(120))
-        let position = await turnCoordinator.enqueueTrackedTurn(turnId: id, updateId: update.updateId,
-            destination: message.destination, text: input, acknowledgementMessageId: queued.queueAcknowledgementMessageId,
-            operation: operation, onStart: { messageId in
-                guard let messageId else { return }
-                await clearQueueAcknowledgement(chatId: message.chatId, messageId: messageId)
-            })
-        guard let position else {
-            _ = try? await inbox.transition(updateId: update.updateId, from: [.queued], to: .completed)
-            return nil
-        }
-        if queued.queueAcknowledgementMessageId == nil {
-            // Command ownership joins the send while admission releases intake.
-            _ = await turnCoordinator.runCommandUntilAdmitted(destination: message.destination) { admitted in
-                admitted()
-                guard await turnCoordinator.queuedTurn(destination: message.destination, updateId: update.updateId) != nil else { return }
-                do {
-                    let messageId = try await Self.defaultSendMessageWithReplyMarkupReturningId(token, message.destination,
-                        "\(queuedNotice.text) · \(preview)", TelegramQueuedTurnControlCallback.replyMarkup(updateId: update.updateId))
-                    await settle {
-                        do {
-                            _ = try await inbox.recordQueueAcknowledgement(updateId: update.updateId, messageId: messageId)
-                            if !(await turnCoordinator.bindQueueAcknowledgement(destination: message.destination,
-                                updateId: update.updateId, messageId: messageId)) {
-                                await clearQueueAcknowledgement(chatId: message.chatId, messageId: messageId)
-                            }
-                            await recordReceipt(kind: queuedNotice.kind, update: update, message: message, text: text, reply: queuedNotice.text)
-                        } catch {
-                            await recordError(context: "queue_acknowledgement_record", error: String(describing: error), update: update, message: message, text: text)
-                        }
-                    }
-                } catch {
-                    await recordError(context: queuedNotice.sendError, error: String(describing: error), update: update, message: message, text: text)
-                }
-            }
-        }
-        return position
     }
 
     /// Claim ownership begins before processing and ends after delivery settlement.
     func runTurn(
         turnId: UUID,
+        turn: Turn,
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String,
@@ -591,9 +527,10 @@ extension TelegramPollLoop {
         let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
         await turnCoordinator.beginUpdateProcessing(update.updateId)
         do {
+            // The run and conversation are pinned now, so a replay at launch keeps both.
             let processing = try await inbox.transition(
                 updateId: update.updateId, from: [.queued, .processing], to: .processing,
-                assistantRunId: turnId.uuidString, assistantSessionId: sessionId)
+                assistantRunId: turnId.uuidString, assistantSessionId: sessionId, resolvedSessionId: sessionId)
             guard processing.phase == .processing else {
                 await turnCoordinator.endUpdateProcessing(update.updateId)
                 return nil
@@ -612,9 +549,12 @@ extension TelegramPollLoop {
             return nil
         }
         await card.start()
-        let delivery = makeAssistantDelivery(destination: message.destination, turnId: turnId,
+        let delivery = makeAssistantDelivery(destination: message.destination, draftKey: turn.id, turn: turn,
             errorContext: "send_reply", update: update, message: message, text: text)
         var preparedText: String?
+        var readBy: String?
+        var silent = false
+        var heldForLaunch = false
         do {
             guard let prepared = try await prepare(card) else {
                 await turnCoordinator.endUpdateProcessing(update.updateId)
@@ -622,11 +562,27 @@ extension TelegramPollLoop {
             }
             preparedText = prepared.text
             await card.transition(.working(action: nil))
-            let (reply, imagePaths) = try await runChatHandler(
+            let (reply, imagePaths, readingTurn) = try await runChatHandler(
                 destination: message.destination, text: prepared.text, attachments: prepared.attachments,
                 progress: makeProgressSink(delivery: delivery, card: card), context: prepared.context)
-            try Task.checkCancellation()
-            if !reply.isEmpty || !imagePaths.isEmpty {
+            readBy = readingTurn
+            if readingTurn == nil, reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, imagePaths.isEmpty {
+                silent = try SwiftNativeChatOrchestrationClient.silentTurn(
+                    dataRoot: dataRoot, sessionId: sessionId, runId: turnId.uuidString) != nil
+            }
+            // Read arrivals and completed silence are already settled even if Stop races the door's return.
+            if readingTurn == nil, !silent { try Task.checkCancellation() }
+            if let readingTurn {
+                // The agent's turn in progress read it and that turn's reply answers it: this update sends nothing; settlement completes it.
+                await delivery.stop()
+                await card.transition(.completed(summary: "Read by the agent's turn in progress"))
+                await recordReceipt(kind: "steered", update: update, message: message, text: prepared.text,
+                    reply: "Read by the agent's turn \(readingTurn)")
+            } else if silent {
+                await delivery.stop()
+                await card.transition(.completed(summary: "Ended silently"))
+                await recordReceipt(kind: "silence", update: update, message: message, text: prepared.text, reply: "")
+            } else if !reply.isEmpty || !imagePaths.isEmpty {
                 switch await delivery.finalize(reply: reply, imagePaths: imagePaths) {
                 case .held: break
                 case .delivered:
@@ -648,26 +604,37 @@ extension TelegramPollLoop {
                     update: update, message: message, text: text)
             }
         } catch is CancellationError {
+            let held = await turnCoordinator.shutdownInterruptedTurn(destination: message.destination, turnId: turnId)
+            heldForLaunch = held
             await settle {
                 await delivery.stop()
-                await card.transition(.canceled(reason: "Stopped by user"))
+                await card.transition(.canceled(reason: held ? "Interrupted by shutdown" : "Stopped by user"))
                 await recordReceipt(kind: "turn_canceled", update: update, message: message, text: text, reply: "(Telegram turn stopped.)")
             }
         } catch {
-            FileHandle.standardError.write(Data("TelegramPollLoop: chat handler failed for update \(update.updateId): \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8))
+            FileHandle.standardError.write(Data("""
+                TelegramPollLoop: chat handler failed for update \(update.updateId): \
+                \(TurnSecretRedactor.redactText(String(describing: error)))\n
+                """.utf8))
             await recordError(context: "chat_handler", error: String(describing: error), update: update, message: message, text: text)
             let notice = Self.chatErrorNotice(for: error)
             await card.transition(.failed(reason: notice))
             await deliverTurnNotice(notice, delivery: delivery, receiptKind: "error_notice",
                 sendErrorContext: "send_error_notice", update: update, message: message, text: text)
         }
-        await settle {
+        await settle { [readBy, silent, heldForLaunch] in
             do {
+                // Shut down before the agent's turn started it: the claim stays in .processing and launch runs it again.
+                if heldForLaunch, try await neverStarted(inbox.claim(updateId: update.updateId)) {
+                    await turnCoordinator.endUpdateProcessing(update.updateId)
+                    return
+                }
                 let saved = try await retainedAssistantDelivery(for: inbox.claim(updateId: update.updateId))
                 let failedBeforeAnswer = try inbox.claim(updateId: update.updateId).failedBeforeAnswer
                 let phase = await card.snapshot().state.phase
                 _ = try await inbox.transition(updateId: update.updateId, from: [.processing],
-                    to: saved == nil && phase == .canceled ? .stopped : saved?.isDelivered == true ? (failedBeforeAnswer ? .failedBeforeAnswer : .completed) : saved?.outcomeUnknown == true ? .sentUnconfirmed : .outcomeUnknown)
+                    to: readBy != nil || silent ? .completed : saved == nil && phase == .canceled ? .stopped : saved?.isDelivered == true ? (failedBeforeAnswer
+                        ? .failedBeforeAnswer : .completed) : saved?.outcomeUnknown == true ? .sentUnconfirmed : .outcomeUnknown)
             } catch {
                 await recordError(context: "queued_update_complete", error: String(describing: error),
                     update: update, message: message, text: text)
@@ -677,10 +644,7 @@ extension TelegramPollLoop {
         return preparedText
     }
 
-    /// One human sentence: what she's doing, which model in plain words,
-    /// and whether anything is waiting on User. No flags, no session ids, no
-    /// poller internals — those live in receipts and the Mac app, which is
-    /// where someone debugging the surface actually looks.
+    /// Keep status human-readable; detailed flags and identifiers belong in receipts and the Mac app.
     func buildStatusReply(destination: TelegramDestination) async -> String {
         let turn = await turnCoordinator.snapshot(destination: destination)
         let phase = await turnCoordinator.activeCard(destination: destination)?.snapshot().state.phase
@@ -706,7 +670,7 @@ extension TelegramPollLoop {
             ? " Approval status is unavailable; check the pending buttons or Desk in the Mac app." : "")
     }
 
-    /// A short, single-line, token-redacted echo of what she's working on.
+    /// A short, single-line, token-redacted echo of what the agent is working on.
     static func statusPreview(_ raw: String) -> String {
         let flattened = TurnTraceRedactor.redactText(raw)
             .replacingOccurrences(of: "\n", with: " ")
@@ -728,23 +692,23 @@ extension TelegramPollLoop {
             await recordReceipt(kind: kind, update: update, message: message, text: text, reply: reply)
         } catch {
             FileHandle.standardError.write(
-                Data("TelegramPollLoop: command reply send failed for update \(update.updateId): \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8)
+                Data("""
+                    TelegramPollLoop: command reply send failed for update \(update.updateId): \
+                    \(TurnSecretRedactor.redactText(String(describing: error)))\n
+                    """.utf8)
             )
             await recordError(context: "send_command_reply", error: String(describing: error), update: update, message: message, text: text)
         }
     }
 
-    /// Run one control command in its own task, and settle its durable claim only
-    /// once the command (reply included) has finished.
+    /// Run one control command in its own task, and settle its durable claim only once the command (reply included) has finished.
     func runCommandDetached(
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
     ) async {
         let loop = self
-        // Ingress waits only for a session binding mutation, never its reply.
-        // The poller processes updates in order, so the next turn cannot
-        // resolve the old binding while /new or /resume is still committing.
+        // Await binding changes before admitting the next update so /new and /resume cannot resolve into the previous conversation.
         let isStop = TelegramCommandRegistry.parse(text: text)?.definition.handler == .stop
             || UserMessageIntentSignals.isControlHandoff(text)
         await turnCoordinator.runCommandUntilAdmitted(destination: isStop ? nil : message.destination) { admissionReady in
@@ -760,6 +724,7 @@ extension TelegramPollLoop {
                         (parsed.definition.name == "session" && ["new", "reset", "clear"].contains(parsed.args.first?.lowercased() ?? "")) {
                 await loop.handleExistingBotCommand(
                     parsed: parsed, update: update, message: message, text: text,
+                    turn: loop.telegramTurn(message: message),
                     admissionReady: admissionReady
                 )
                 transferred = false

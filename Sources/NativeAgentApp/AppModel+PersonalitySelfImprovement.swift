@@ -6,20 +6,16 @@ import PersonaEngine
 import DoctorChecks
 import DreamREMCycle
 import Cognition
-// Blueprint: | `AppModel+PersonalitySelfImprovement.swift` | Mac personality editor outcomes delegate profile/document publication and writes to `engine.persona`; support diagnostics and proposal actions |
+// Blueprint: | `AppModel+PersonalitySelfImprovement.swift` | `engine.persona`: Profile/document writes through the persona owner; support and proposals |
 
-/// The identity field is one of the few profile fields with immediate live UI
-/// effect.  Its save outcome must be derived from the persisted profile the
-/// writer returned, not from the name the editor attempted to submit.
+/// Derive the live identity outcome from the persisted profile returned by the writer, never the submitted name.
 enum PersonalityNameSaveOutcome: Equatable {
     case saved(PersonalityProfile)
     case refused(String)
     case failed(String)
 }
 
-/// A personality-document refresh either replaces the in-memory document set
-/// with one canonical reader result, or leaves that last known set intact and
-/// reports exactly why it could not be refreshed.
+/// Replace documents only after a successful canonical read; retain the last set and report failed refreshes.
 enum PersonalityDocumentsReloadOutcome: Equatable {
     case loaded(documentCount: Int)
     case failed(detail: String, retainedDocumentCount: Int)
@@ -27,7 +23,7 @@ enum PersonalityDocumentsReloadOutcome: Equatable {
 
 @MainActor
 extension AppModel {
-    /// The same save, with the persistence error left intact.
+    /// Preserve persistence errors in the save result.
     @MainActor
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
         do {
@@ -76,7 +72,7 @@ extension AppModel {
         }
         supportDiagnosticsLoading = true
         defer { supportDiagnosticsLoading = false }
-        // Reuse a completed Doctor report while it is still fresh.
+        // Reuse a completed Doctor report while fresh to avoid duplicate work.
         let reuse = EngineDoctorRuntime<AppDoctorPort>.reusableSupportReport(
             report: engine.doctor.report, completedAt: engine.doctor.reportCompletedAt
         )
@@ -122,8 +118,7 @@ extension AppModel {
         }
     }
 
-    // MemoryFacade publishes checked pending rows and failure together;
-    // the Mac supplies only its decision animation transaction.
+    // MemoryFacade owns pending rows and failures; the Mac supplies only the decision animation.
     @MainActor
     func loadMemoryProposals(animateDecision: Bool = false) async {
         _ = await decodeLogged("getMemoryProposals") {
@@ -151,7 +146,6 @@ extension AppModel {
         await engine.approvals.refresh()
     }
 
-    /// Fetch a single diary entry by date (YYYY-MM-DD). Returns nil on 404/error.
     @MainActor
     func fetchDreamEntry(date: String) async -> DreamEntry? {
         dreamError = nil
@@ -163,9 +157,7 @@ extension AppModel {
         }
     }
 
-    /// Run a REM consolidation pass now. The returned presentation comes from
-    /// the real native completion record, so the Dreams button can distinguish
-    /// a completed zero-proposal week from an incomplete or failed invocation.
+    /// Use the native completion record so zero proposals cannot conceal an incomplete or failed REM run.
     @MainActor
     func runRemPass() async -> DreamsREMActionFeedback {
         dreamError = nil
@@ -186,8 +178,6 @@ extension AppModel {
         }
     }
 
-    /// Toggle the deep dream kill switch (personalityPolicy.dream_cycle_enabled).
-    /// Persists via the deep-merged trust patch and refreshes `engine.trust.policy`.
     @MainActor
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
@@ -202,8 +192,6 @@ extension AppModel {
         }
     }
 
-    /// Toggle the REM kill switch (trainingPolicy.rem_cycle_enabled).
-    /// Persists via the deep-merged trust patch and refreshes `engine.trust.policy`.
     @MainActor
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool {
         dreamError = nil
@@ -218,12 +206,8 @@ extension AppModel {
         }
     }
 
-    /// The Settings page's "An inner life" switch, one call for the page and
-    /// for app_setting_set: the master over every lane, the hour's cached
-    /// installation (the hour cannot outlive the master), and — turning on —
-    /// Fluid Context's Active default when no choice was ever made. Returns
-    /// the runtime's own state and, when it is not running as asked, the
-    /// sentence that says why.
+    /// The inner-life master owns the hour's lifetime; enable Fluid Context's Active default only if no choice exists.
+    /// Return the runtime's state and cause when it cannot run as requested.
     @MainActor
     func setInnerLifeEnabled(_ enabled: Bool) async -> (state: NativeSubconsciousRuntimeState, problem: String?) {
         let (state, contextFlowReady) = await engine.cognitionView.setInnerLifeEnabled(
@@ -246,26 +230,24 @@ extension AppModel {
         return (state, problem)
     }
 
-    /// Dream-tab-scoped dream run: routes errors to `dreamError` (not the
-    /// Self-Improvement banner) and skips the self-improvement reload.
-    /// Returns true on success so
-    /// the caller only reloads (which clears dreamError) when the run succeeded.
+    /// Keep dream-run errors on the Dreams tab and reload only after success so failures remain visible. busy names effects kept owed
+    /// because a shared slot was held: the run succeeded, and those wait for the next one.
     @MainActor
-    func runDreamPassForDreams() async -> Bool {
+    func runDreamPassForDreams() async -> (ok: Bool, busy: [String]) {
         dreamError = nil
         do {
             let result = try await NativeAgentEngine.runDream(dataRoot: engine.dataRoot, trigger: .manual)
             if let detail = DreamReport.completionFailure(result) {
                 dreamError = "Dream cycle failed: \(detail)"
                 statusText = "Dream cycle failed"
-                return false
+                return (false, [])
             }
             statusText = DreamReport.statusText(result)
-            return true
+            return (true, result["busy"] as? [String] ?? [])
         } catch {
             dreamError = UserFacingError.message(error, action: "run the dream cycle")
             statusText = "Dream cycle failed"
-            return false
+            return (false, [])
         }
     }
 

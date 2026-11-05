@@ -3,29 +3,23 @@ import PersistenceCore
 import TriggerScheduler
 // Blueprint: | `BotRunnerScheduler.swift` | `BotRunnerScheduler` actor; `effectiveSchedule` shares reconciled timing and admission with live deadlines |
 
-/// One persisted due/reservation record per definition, projected into the
-/// existing BackgroundLoops deadline owner. Definitions remain canonical.
+/// Definitions remain canonical; persisted reservations project into the shared deadline owner.
 public actor BotRunnerScheduler {
     private struct Job: Codable, Equatable {
         let revision: Date
-        /// Due date or in-flight reservation; completion replans it.
         var next: Date
         var reason: String? = nil
         var failureID: UUID? = nil
         var minimumInterval: TimeInterval? = nil
         var scheduledFrom: Date? = nil
         var lastRunAt: Date? = nil
-        /// The last occurrence this scheduler found already past its window.
         var missed: BotMissedRun? = nil
-        /// The Mac's zone when `next` was resolved; a cron re-resolves when
-        /// the Mac moves (User 10-15).
+        /// Preserve the resolving zone so cron times can follow the Mac when it moves.
         var zone: String? = TimeZone.autoupdatingCurrent.identifier
         /// `next` and the zone it was resolved in are only ever written together.
         mutating func plan(_ date: Date) { next = date; zone = TimeZone.autoupdatingCurrent.identifier }
     }
-    /// When this scheduler came up, fixed at construction — a `static let` would
-    /// be initialized on first read, which is always after the due date and
-    /// would call every overdue occurrence "the app was closed".
+    /// Capture construction time: lazy static initialization would misclassify every overdue job as app downtime.
     private let startedAt = Date()
     private let disk: StandingBotsDisk
     private let definitions: BotDefinitionStore
@@ -33,11 +27,8 @@ public actor BotRunnerScheduler {
     private let queue: BotRunQueue
     private let shelf: ShelfStore
     private let events: BotEventStore
-    /// The master Autonomy switch, read fresh before every unattended admission.
-    /// Scheduled bot work is exactly the unattended provider spend that switch
-    /// exists to stop (it gates Workshop the same way). An explicitly queued
-    /// manual request is the user asking and stays outside it. Default `true`
-    /// keeps secondary/test roots, which have no trust policy, unchanged.
+    /// Recheck unattended authority on admission; manual requests carry the user's explicit authority.
+    /// Roots without a trust policy use the supplied default.
     private let isAutonomyEnabled: @Sendable () async -> Bool
     public private(set) var failure: String?
     private var inFlight: [UUID: Task<Void, Never>] = [:]
@@ -67,7 +58,7 @@ public actor BotRunnerScheduler {
         public let unattended: Bool
     }
 
-    /// Read-only reconciliation: no deadline writes, claims or missed-run mutations.
+    /// Read-only projection must not mutate deadlines, claims or missed occurrences.
     public func effectiveSchedule() async throws -> BotSchedule {
         let unattended = await isAutonomyEnabled()
         let bots = try definitions.list()
@@ -93,8 +84,7 @@ public actor BotRunnerScheduler {
                           missed: Dictionary(missed, uniquingKeysWith: { first, _ in first }), unattended: unattended)
     }
 
-    /// How late an occurrence may be and still just run late. Being later than
-    /// one whole cadence (never less than the floor) means the window passed.
+    /// One cadence bounds lateness, with the minimum-spacing floor preventing overly short windows.
     private static func lateness(_ bot: BotDefinition) throws -> TimeInterval {
         let minimum = try BotRunLimits.checkedMinimumInterval()
         guard case .interval(let seconds) = bot.cadence else { return minimum }
@@ -105,15 +95,12 @@ public actor BotRunnerScheduler {
         try StandingBotsDisk.nextOccurrence(bot, after: date, lastRunAt: lastRunAt, beyond: due)
     }
 
-    /// A person's Run once keeps the schedule unless it would run again inside
-    /// the minimum spacing, so "daily at 09:00" still means 09:00. `due` is the
-    /// occurrence a scheduled run claimed; the next one lies past it.
+    /// Manual work preserves the civil schedule unless minimum spacing requires moving the next occurrence.
     private func completed(_ id: UUID, at date: Date, reschedule: Bool = true, beyond due: Date? = nil) throws {
         let bot = try definitions.get(id)
         try disk.locked {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-            // A run that completed disproves a block; an occurrence that never
-            // ran is still a fact about that occurrence.
+            // Completion disproves a current block but cannot erase an earlier missed occurrence.
             let missed = jobs[id.uuidString]?.missed
             let cleared = missed?.reason == .blocked ? nil : missed
             if !reschedule {
@@ -142,14 +129,11 @@ public actor BotRunnerScheduler {
         for bot in bots where !bot.paused {
             let key = bot.id.uuidString
             var replan = jobs[key]?.revision != bot.updatedAt || jobs[key]?.minimumInterval != minimumInterval
-            // A zone move re-plans nothing: a cron's pending occurrence keeps
-            // its wall clock in the Mac's new zone. The time-zone notification already
-            // wakes this pass; a run in flight is placed on completion. A job saved
-            // before zones were recorded is planned afresh.
+            // Preserve pending cron wall time in the new zone; in-flight work replans on completion.
+            // A missing resolving zone requires fresh planning.
             if !replan, case .cron = bot.cadence, inFlight[bot.id] == nil, var job = jobs[key],
                job.reason == nil, job.zone != TimeZone.autoupdatingCurrent.identifier {
-                // A carried time inside the floor after the last run is planned afresh too,
-                // as is a civil minute the new zone skips (a DST gap shifts it an hour).
+                // Replan times inside the spacing floor and civil minutes skipped by DST.
                 if let old = job.zone.flatMap(TimeZone.init(identifier:)),
                    let carried = SchedulerJobRuntime.wallClock(job.next, from: old, to: .autoupdatingCurrent),
                    SchedulerJobRuntime.wallClock(carried, from: .autoupdatingCurrent, to: old)
@@ -161,8 +145,7 @@ public actor BotRunnerScheduler {
             if replan {
                 let anchor = jobs[key]?.revision == bot.updatedAt
                     ? (jobs[key]?.scheduledFrom ?? max(bot.updatedAt, Date())) : bot.updatedAt
-                // An edit reschedules the bot; it does not erase the record of
-                // an occurrence that never ran.
+                // Rescheduling cannot erase evidence of an occurrence that never ran.
                 let missed = jobs[key]?.missed
                 let lastRunAt = jobs[key]?.lastRunAt
                 do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor, lastRunAt: lastRunAt),
@@ -170,7 +153,8 @@ public actor BotRunnerScheduler {
                                      scheduledFrom: anchor, lastRunAt: lastRunAt,
                                      missed: missed) }
                 catch { jobs[key] = Job(revision: bot.updatedAt, next: .distantFuture,
-                                        reason: String(describing: error), failureID: UUID(), minimumInterval: minimumInterval, lastRunAt: lastRunAt, missed: missed) }
+                                        reason: String(describing: error), failureID: UUID(), minimumInterval: minimumInterval,
+                                        lastRunAt: lastRunAt, missed: missed) }
             }
         }
         guard jobs.values.allSatisfy({ $0.next.timeIntervalSince1970.isFinite && $0.revision.timeIntervalSince1970.isFinite
@@ -184,9 +168,7 @@ public actor BotRunnerScheduler {
             var jobs = try disk.read([String: Job].self, at: path) ?? [:]
             let previous = jobs
             try reconcile(bots, jobs: &jobs)
-            // Deadline projection and due-work selection both come through
-            // here. Replacing an unchanged watched file wakes the scheduler
-            // again, including its inbox/dream scans, indefinitely.
+            // Rewriting an unchanged watched file would wake deadline projection indefinitely.
             if jobs != previous {
                 try disk.write(jobs, at: path)
             }
@@ -195,23 +177,19 @@ public actor BotRunnerScheduler {
         for bot in bots {
             guard let job = jobs[bot.id.uuidString], let reason = job.reason, let id = job.failureID else { continue }
             failure = "Bot scheduling unavailable: \(reason)"
+            var entry = ShelfEntry(id: id, botId: bot.id, briefVersion: bot.briefVersion,
+                runAt: job.revision, coverageStart: job.revision, coverageEnd: job.revision,
+                headline: "Could not check", findings: "", changedSinceLastGood: "Unknown: invalid schedule.",
+                uncertainties: [reason], runHealth: .failed, spend: ShelfSpend(tokens: 0, seconds: 0))
+            entry.sessionID = bot.sessionID
             do {
-                try shelf.append(ShelfEntry(id: id, botId: bot.id, briefVersion: bot.briefVersion,
-                    runAt: job.revision, coverageStart: job.revision, coverageEnd: job.revision,
-                    headline: "Could not check", findings: "", changedSinceLastGood: "Unknown: invalid schedule.",
-                    uncertainties: [reason], runHealth: .failed, spend: ShelfSpend(tokens: 0, seconds: 0)))
+                try shelf.append(entry)
             } catch StandingBotsError.alreadyExists { /* Already reported this definition revision. */ }
         }
         return jobs
     }
 
-    /// This scheduler's own last pass. The gap between two passes is the only
-    /// positive evidence it has that the machine stopped running it.
-    private struct Tick: Codable { var at: Date }
-    private var tickPath: URL { disk.root.appendingPathComponent("runner-tick.json") }
-
-    /// A due occurrence whose window has passed with no run: record it, skip it,
-    /// schedule the next one. A record, not a retry — the Autonomy gate stands.
+    /// Record and skip expired occurrences; retrying them would bypass unattended authority.
     private func noteMissed(_ bots: [BotDefinition], autonomyEnabled: Bool) {
         let now = Date()
         let live = bots.filter { !$0.paused }
@@ -219,61 +197,45 @@ public actor BotRunnerScheduler {
         do {
             try disk.locked {
                 var jobs = try disk.read([String: Job].self, at: path) ?? [:]
-                let lastTick = try disk.read(Tick.self, at: tickPath)?.at
                 var changed = false
                 for bot in live {
                     let key = bot.id.uuidString
                     guard var job = jobs[key], job.reason == nil, job.next != .distantFuture,
                           now.timeIntervalSince(job.next) > (try Self.lateness(bot)) else { continue }
-                    job.missed = BotMissedRun(dueAt: job.next, reason: try Self.reason(
-                        bot, due: job.next, autonomyEnabled: autonomyEnabled,
-                        startedAt: startedAt, lastTick: lastTick, now: now))
+                    job.missed = BotMissedRun(dueAt: job.next, reason: Self.reason(
+                        due: job.next, autonomyEnabled: autonomyEnabled, startedAt: startedAt))
                     job.plan(try next(bot, after: now, lastRunAt: job.lastRunAt, beyond: job.next))
                     job.scheduledFrom = now
                     jobs[key] = job
                     changed = true
                 }
                 if changed { try disk.write(jobs, at: path) }
-                try disk.write(Tick(at: now), at: tickPath)
             }
         } catch { failure = "Bot scheduling unavailable: \(error)" }
     }
 
-    /// Only what the scheduler can prove: the gate was shut; or no scheduler
-    /// existed when the occurrence came due; or one did and its own tick record
-    /// shows it never ran a pass across that window — a machine that stopped.
-    /// Anything else is the honest blank.
-    private static func reason(_ bot: BotDefinition, due: Date, autonomyEnabled: Bool,
-                               startedAt: Date, lastTick: Date?, now: Date) throws -> BotMissedRun.Reason {
+    /// Quiet time between source changes is not evidence that the app slept.
+    private static func reason(due: Date, autonomyEnabled: Bool, startedAt: Date) -> BotMissedRun.Reason {
         guard autonomyEnabled else { return .autonomyOff }
         if due < startedAt { return .appClosed }
-        guard let lastTick, lastTick < due, now.timeIntervalSince(lastTick) > (try lateness(bot)) else { return .notRun }
-        return .asleep
+        return .notRun
     }
 
-    /// Why the post-claim gate held the run in flight, kept so the caller
-    /// records the reason the gate ACTUALLY saw. Rereading the switch afterwards
-    /// infers it, and infers wrong: a switch flipped off and back on during the
-    /// claim wait reads as enabled again and the occurrence is filed `.notRun`,
-    /// and a pause is filed the same way with nothing saying so.
+    /// Retain the gate's observed reason; rereading a toggled switch could invent a different refusal.
     private var lastUnattendedHold: [UUID: (reason: BotMissedRun.Reason, detail: String?)] = [:]
 
-    /// The unattended gates, re-read after an event-woken request has won its
-    /// claim. `paused` is the definition the claim itself read, under the store
-    /// lock. Returns true — having recorded the hold — when nothing may be spent.
+    /// Recheck after the claim wait using its locked definition; record any hold before spending.
     private func holdUnattendedRun(bot id: UUID, paused: Bool) async throws -> Bool {
         let enabled = await isAutonomyEnabled()
         let stopped = isShutDown || Task.isCancelled
         guard stopped || !enabled || paused else { return false }
         let detail = stopped ? "Background work stopped" : (enabled ? "the bot is paused" : "Autonomy is off")
-        // There is no `.paused` reason; `.notRun` plus the gate's own words is
-        // the honest record for a bot paused under us.
+        // A pause uses the not-run reason with the gate's own words.
         lastUnattendedHold[id] = enabled ? (.notRun, detail) : (.autonomyOff, nil)
         try events.hold(bot: id, detail: detail)
         return true
     }
 
-    /// An occurrence that reached the runner and never ran.
     private func recordMissed(_ id: UUID, due: Date, reason: BotMissedRun.Reason,
                               detail: String? = nil) throws {
         try disk.locked {
@@ -291,9 +253,7 @@ public actor BotRunnerScheduler {
             let bots = try definitions.list()
             let jobs = try reconciled(bots)
             if try queue.pending().keys.contains(where: { inFlight[$0] == nil && jobs[$0.uuidString]?.reason == nil }) { return now }
-            // Autonomy off: no scheduled occurrence is admissible, so none is a
-            // deadline either. Reporting one would wake this loop on a due job
-            // the gate then refuses, forever.
+            // Refused jobs cannot remain deadlines: they would wake and refuse forever.
             return projection(bots, jobs: jobs, unattended: await isAutonomyEnabled()).dates.values.min()
         } catch { failure = "Bot scheduling unavailable: \(error)"; return nil }
     }
@@ -302,8 +262,7 @@ public actor BotRunnerScheduler {
         isShutDown = true
         let tasks = Array(inFlight.values)
         for task in tasks { task.cancel() }
-        // Bodies keep claims until session, shelf, accounting and deadline
-        // reporters have all settled; concurrent shutdown callers join too.
+        // Retain claims through all settlement; concurrent shutdown callers join the same work.
         for task in tasks { await task.value }
     }
 
@@ -320,34 +279,35 @@ public actor BotRunnerScheduler {
                 guard inFlight[id] == nil else { continue }
                 let requestID = request.runID
                 guard bots.contains(where: { $0.id == id }) else {
-                    try queue.rejectPending(bot: id, requestID: requestID, detail: "This helper is deleted or unavailable in the checked definition list. No helper turn ran.")
+                    try queue.rejectPending(
+                        bot: id, requestID: requestID,
+                        detail: "This helper is deleted or unavailable in the checked definition list. No helper turn ran."
+                    )
                     continue
                 }
                 try Task.checkCancellation()
                 guard reconciledJobs[id.uuidString]?.reason == nil else {
-                    try queue.rejectPending(bot: id, requestID: requestID, detail: "This helper's schedule is invalid: \(reconciledJobs[id.uuidString]?.reason ?? "schedule unavailable"). No helper turn ran.")
+                    try queue.rejectPending(bot: id, requestID: requestID, detail: """
+                        This helper's schedule is invalid: \(reconciledJobs[id.uuidString]?.reason ?? "schedule unavailable"). No helper turn \
+                        ran.
+                        """)
                     continue
                 }
-                // An event-woken request is unattended spend, and it can reach
-                // here long after it was accepted — behind other work, or after
-                // a restart. The gates are read where it actually runs, not only
-                // where it was taken in. A manual Run once is the person asking.
+                // Recheck unattended authority after queue delay or restart; manual requests remain explicitly authorized.
                 if request.isEvent {
                     let enabled = await isAutonomyEnabled()
                     guard !isShutDown, !Task.isCancelled else { return completed }
                     let paused = try definitions.get(id).paused
                     if !enabled || paused {
-                        try queue.rejectPending(bot: id, requestID: requestID, detail: enabled ? "The bot is paused. No helper turn ran." : "Autonomy is off. No helper turn ran.")
+                        try queue.rejectPending(
+                            bot: id, requestID: requestID,
+                            detail: enabled ? "The bot is paused. No helper turn ran." : "Autonomy is off. No helper turn ran."
+                        )
                         try events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
                         continue
                     }
                 }
-                // The claim below can wait out a whole bot_ask turn. For an
-                // event-woken request the same two gates are read AGAIN once the
-                // claim is won — before the run gate, the daily reservation and
-                // any provider call — because the switch or the bot can change
-                // during that wait and a queued request is exempt from the
-                // claim's own pause guard.
+                // Claim waits can outlast authority changes; queued requests bypass the claim's pause guard.
                 let isEvent = request.isEvent
                 let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
                     guard isEvent else { return false }
@@ -357,7 +317,7 @@ public actor BotRunnerScheduler {
                 inFlight[id] = Task {
                     defer { self.finished(id) }
                     do {
-                        if let entry = try await runner.run(bot: id, requestID: requestID,
+                        if let entry = try await runner.run(bot: id, requestID: requestID, parent: nil, scope: BotRunScope(),
                                                             holdUnattended: holdUnattended,
                                                             deadlineExceeded: { await self.reportDeadline(id, detail: $0) }) {
                             try self.completed(id, at: Date(), reschedule: isEvent)
@@ -371,7 +331,6 @@ public actor BotRunnerScheduler {
             let scheduledBots = try definitions.list()
             let scheduledJobs = try reconciled(scheduledBots)
             noteMissed(scheduledBots, autonomyEnabled: autonomyEnabled)
-            // Unattended admission boundary: scheduled occurrences only.
             guard autonomyEnabled else { return completed }
             let now = Date()
             for bot in scheduledBots where !bot.paused && scheduledJobs[bot.id.uuidString].map({ $0.next <= now }) == true {
@@ -389,8 +348,7 @@ public actor BotRunnerScheduler {
                     let now = Date()
                     guard let job = jobs[key], job.next <= now else { return nil }
                     let due = job.next
-                    // Reserve before any network/model work, across processes.
-                    // Crash recovery skips this occurrence; never replays spend.
+                    // Reserve across processes before provider work; crash recovery skips the occurrence to prevent replay.
                     jobs[key] = Job(revision: fresh.updatedAt,
                                     next: try next(fresh, after: now.addingTimeInterval(BotRunLimits.maximumSeconds), lastRunAt: now, beyond: due),
                                     minimumInterval: try BotRunLimits.checkedMinimumInterval(),
@@ -400,32 +358,26 @@ public actor BotRunnerScheduler {
                     try disk.write(jobs, at: path)
                     return due
                 }
-                // A manual request also satisfies a coincident due occurrence.
+                // Manual work satisfies coincident due work to avoid duplicate execution.
                 if let due = reserved, requests[bot.id] == nil {
                     try Task.checkCancellation()
                     inFlight[bot.id] = Task {
                     defer { self.finished(bot.id) }
                     do {
-                        // The claim below can wait out a whole bot_ask turn, so
-                        // the same gate an event request re-reads after its claim
-                        // is re-read here too: without it an occurrence waiting
-                        // behind an active bot_ask reserves and spends after
-                        // unattended work was switched off.
+                        // Recheck after claim waits so disabling unattended work prevents reservation and spend.
                         let botID = bot.id
                         lastUnattendedHold.removeValue(forKey: botID)
                         let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
                             try await self.holdUnattendedRun(bot: botID, paused: claimed.paused)
                         }
-                        if let entry = try await runner.run(bot: bot.id, holdUnattended: holdUnattended,
+                        if let entry = try await runner.run(bot: bot.id, parent: nil, scope: BotRunScope(), holdUnattended: holdUnattended,
                                                           deadlineExceeded: { await self.reportDeadline(bot.id, detail: $0) }) {
                             try self.completed(bot.id, at: Date(), beyond: due)
                             settled.append("bot:\(entry.botId.uuidString)")
                         } else if let held = lastUnattendedHold[botID] {
-                            // The post-claim gate held it and already knows why.
                             try recordMissed(bot.id, due: due, reason: held.reason,
                                              detail: held.detail)
                         } else {
-                            // Claimed nothing — the claim's own pause guard.
                             try recordMissed(bot.id, due: due, reason: .notRun)
                         }
                     } catch { rejected(bot.id, due: due, error: error) }

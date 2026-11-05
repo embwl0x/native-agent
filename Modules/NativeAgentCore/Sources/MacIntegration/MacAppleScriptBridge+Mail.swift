@@ -1,37 +1,31 @@
+import MacControl
 import AuthoredCapabilities
 import Foundation
 import AppKit
 import SQLite3
 import PersistenceCore
-// Blueprint: | `MacAppleScriptBridge+Mail.swift` | `MacAppleScriptBridge`: Mail reads and mutations, distinct compose/target refusals and exact reply-result decoding with unknown-effect reconciliation |
+// Blueprint: | `MacAppleScriptBridge+Mail.swift` | `MacAppleScriptBridge`: exact Mail effects and reply evidence |
 
 extension MacAppleScriptBridge {
     // MARK: MAIL
 
-    /// List recent inbox or sent metadata. Input: "limit" (default 10, max 50).
-    /// Returns: {status, count, messages: [{subject, sender, date, snippet}]}
-    public static func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        try await mailWorkspaceRead(input: input)
+    public static func mailListRecent(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
+        try await mailWorkspaceRead(input: input, context: context)
     }
 
-    /// Search mailbox pages by subject/sender fragments (OR) and index filters.
-    /// Returns: same shape as mailListRecent.
-    public static func mailSearch(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func mailSearch(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         let query = inputStringArray(input["query"]).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         guard (input["query"] == nil || !query.isEmpty), query.allSatisfy({ !$0.isEmpty }) else {
             return failedEnvelope(integration: "mail", reason: "missing_query")
         }
-        return try await mailWorkspaceRead(input: input, query: query)
+        return try await mailWorkspaceRead(input: input, query: query, context: context)
     }
 
-    /// Send mail via Mail.app. Required: "to" (string or array), "subject", "body".
-    /// Optional: "cc", "bcc".
-    /// Returns: {status, action: "sent", to, subject}.
-    public static func mailSend(input: [String: JSONValue]) async throws -> JSONValue {
-        try await mailCompose(input: input, send: true)
+    public static func mailSend(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
+        try await mailCompose(input: input, send: true, context: context)
     }
 
-    private static func mailCompose(input: [String: JSONValue], send: Bool) async throws -> JSONValue {
+    private static func mailCompose(input: [String: JSONValue], send: Bool, context: MacOperationContext) async throws -> JSONValue {
         let toList = inputStringArray(input["to"])
         guard !toList.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_to")
@@ -79,7 +73,7 @@ extension MacAppleScriptBridge {
         end tell
         """
         do {
-            let raw = try await runAppleScript(source, bundleID: "com.apple.mail").trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw = try await runAppleScript(source, bundleID: "com.apple.mail", context: context).trimmingCharacters(in: .whitespacesAndNewlines)
             if !send { return mailDraftResult(raw, input: input) }
             guard raw == "sent" else { return failedEnvelope(integration: "mail", reason: "mail_refused_send") }
             return .object([
@@ -97,9 +91,8 @@ extension MacAppleScriptBridge {
 
     // MARK: MAIL MANAGE
 
-    /// One bounded job over selected identities. Keep completed receipts when
-    /// cancellation or an uncertain script stops the remaining work; never replay.
-    public static func mailBatch(input: [String: JSONValue], effects: Bool) async -> JSONValue {
+    /// One bounded job over selected identities. Keep completed receipts when cancellation or an uncertain script stops the remaining work; never replay.
+    public static func mailBatch(input: [String: JSONValue], effects: Bool, context: MacOperationContext) async -> JSONValue {
         let markReadOnly = effects && input["messages"] != nil
         let key = markReadOnly ? "messages" : "items"
         guard Set(input.keys).subtracting(["__session_id"]) == [key], case .array(let items)? = input[key],
@@ -165,7 +158,7 @@ extension MacAppleScriptBridge {
                         actions[action] = .object(["status": .string("not_attempted")])
                         continue
                     }
-                    let result = await mailBatchMutation(locator: locator, action: action, value: value)
+                    let result = await mailBatchMutation(locator: locator, action: action, value: value, context: context)
                     actions[action] = result
                     if case .object(let outcome) = result,
                        outcome["status"] == .string("outcome_unknown") || outcome["status"] == .string("denied") || Task.isCancelled {
@@ -186,7 +179,7 @@ extension MacAppleScriptBridge {
                     : states.contains(.string("completed")) ? "partial" : "failed")
             } else {
                 do {
-                    let body = try mailFileRead(input: row, batch: true)
+                    let body = try mailFileRead(input: row, batch: true, context: context)
                     receipt.merge(body) { _, new in new }
                     receipt["status"] = .string("completed")
                 } catch let back as SkillRunContext.HandBack {
@@ -223,7 +216,7 @@ extension MacAppleScriptBridge {
         """
     }
 
-    private static func mailBatchMutation(locator: MailReadLocator, action: String, value: JSONValue) async -> JSONValue {
+    private static func mailBatchMutation(locator: MailReadLocator, action: String, value: JSONValue, context: MacOperationContext) async -> JSONValue {
         guard let account = locator.account else { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
         let body: String
         switch action {
@@ -269,7 +262,7 @@ extension MacAppleScriptBridge {
         end tell
         """
         do {
-            let raw = try await runAppleScript(source, bundleID: "com.apple.mail")
+            let raw = try await runAppleScript(source, bundleID: "com.apple.mail", context: context)
             if raw == "__MESSAGE_CHANGED__" { return failedEnvelope(integration: "mail", reason: "message_changed_or_moved_refresh_inbox") }
             return mailMutationResult(raw, action: action)
         } catch is CancellationError {
@@ -285,20 +278,17 @@ extension MacAppleScriptBridge {
         }
     }
 
-    /// Mark read, archive or delete by message_id + expected_message_id from mail_list_recent,
-    /// or by subject and optional sender; archive and delete refuse multiple matches.
-    /// Returns: {status, action, matched_count, subject}.
-    public static func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue {
-        if input["messages"] != nil { return await mailBatch(input: input, effects: true) }
+    /// Archive and delete require an unambiguous match to avoid changing another message.
+    public static func mailMarkRead(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
+        if input["messages"] != nil { return await mailBatch(input: input, effects: true, context: context) }
         return await mailManage(input: input, action: "marked_read", single: false, body: """
             repeat with msg in hits
                 set read status of msg to true
             end repeat
-            """)
+            """, context: context)
     }
 
-    /// Archive one inbox message (move to the Archive mailbox); "no_archive_mailbox" when none exists.
-    public static func mailArchive(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func mailArchive(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         await mailManage(input: input, action: "archived", single: true, body: """
             set archiveBox to missing value
             set msg to item 1 of hits
@@ -307,12 +297,12 @@ extension MacAppleScriptBridge {
             end try
             if archiveBox is missing value then return "__NO_ARCHIVE__"
             move msg to archiveBox
-            """)
+            """, context: context)
     }
 
-    /// Find one inbox message through its checked Apple Event locator; lookup failure stops the mutation.
-    /// Move to Trash explicitly; `delete` can be permanent under account settings.
-    public static func mailDelete(input: [String: JSONValue]) async throws -> JSONValue {
+    /// Find one inbox message through its checked Apple Event locator; lookup failure stops the mutation. Move to Trash explicitly; `delete` can be permanent
+    /// under account settings.
+    public static func mailDelete(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
         let exact = MailReadLocator.parse(input)
         if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil {
             return failedEnvelope(integration: "mail", reason: "invalid_message_locator")
@@ -348,12 +338,14 @@ extension MacAppleScriptBridge {
                 error errText number errNum
             end try
             """
-        return await mailManage(input: input, action: "deleted", single: true, body: moveToTrash)
+        return await mailManage(input: input, action: "deleted", single: true, body: moveToTrash, context: context)
     }
 
-    private static func mailManage(input: [String: JSONValue], action: String, single: Bool, body: String) async -> JSONValue {
+    private static func mailManage(input: [String: JSONValue], action: String, single: Bool, body: String, context: MacOperationContext) async -> JSONValue {
         let exact = MailReadLocator.parse(input)
-        if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
+        if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil {
+            return failedEnvelope(integration: "mail", reason: "invalid_message_locator")
+        }
         let subject = input["subject"]?.scalarText ?? ""
         guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_message_selector") }
         let whereClause = exact.map { "id is \($0.id)" }
@@ -361,9 +353,7 @@ extension MacAppleScriptBridge {
         let deadline = action == "deleted" ? "lookupDeadline" : nil
         let check = exact.map { mailIdentityCheck($0, list: "hits", fail: "-2", deadline: deadline) }
             ?? (single ? "if n > 1 then return \"-3|\" & (n as text)" : "")
-        // The lookup is bounded (a whose-scan of a huge inbox otherwise runs on
-        // Mail's ~120s default, holding the one AppleScript queue after the 15s
-        // gate gave up). It runs before any change, so a timeout changed nothing.
+        // Bound lookup before any mutation: Mail's default timeout can hold the shared script queue after the caller gives up.
         let source = """
         \(deadline == nil ? "" : "set lookupDeadline to (current date) + 6")
         tell application "__NativeAgentApp__"
@@ -385,7 +375,7 @@ extension MacAppleScriptBridge {
         end tell
         """
         do {
-            return mailMutationResult(try await runAppleScript(source, bundleID: "com.apple.mail"), action: action)
+            return mailMutationResult(try await runAppleScript(source, bundleID: "com.apple.mail", context: context), action: action)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "mail", app: app)
         } catch {
@@ -398,7 +388,8 @@ extension MacAppleScriptBridge {
         switch text {
         case "0": return failedEnvelope(integration: "mail", reason: "no_matching_message")
         case "__LOOKUP_TIMED_OUT__": return failedEnvelope(integration: "mail", reason: "mail_lookup_timed_out")
-        case "-2": return failedEnvelope(integration: "mail", reason: action == "deleted" ? "mail_delete_target_changed" : "message_changed_or_moved_refresh_inbox")
+        case "-2": return failedEnvelope(integration: "mail", reason: action == "deleted" ? "mail_delete_target_changed"
+            : "message_changed_or_moved_refresh_inbox")
         case "__NO_ARCHIVE__": return failedEnvelope(integration: "mail", reason: "no_archive_mailbox")
         case "__NO_TRASH__": return failedEnvelope(integration: "mail", reason: "no_trash_mailbox")
         case "__ALREADY_TRASH__": return failedEnvelope(integration: "mail", reason: "message_already_in_trash")
@@ -407,7 +398,10 @@ extension MacAppleScriptBridge {
         let parts = text.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
         if parts.first == "-3", parts.count == 2 {
             return .object(["status": .string("failed"), "integration": .string("mail"), "reason": .string("several_messages_match"),
-                "message": .string("\(parts[1]) inbox messages have that subject, so nothing changed. Pass the message_id and expected_message_id from mail_list_recent, or add sender.")])
+                "message": .string("""
+                    \(parts[1]) inbox messages have that subject, so nothing changed. Pass the message_id and expected_message_id from mail_list_recent, or \
+                    add sender.
+                    """)])
         }
         guard let count = Int64(parts.first ?? ""), count > 0 else {
             return .object([
@@ -419,16 +413,14 @@ extension MacAppleScriptBridge {
                         "subject": .string(parts.count == 2 ? String(parts[1]) : "")])
     }
 
-    /// Reply by exact inbox/message identity, or a unique subject/sender.
-    /// Required: body. Optional: sender for subject-addressed disambiguation, reply_all (bool,
-    /// default false).
-    /// Returns: {status, action: "sent_reply", subject}.
-    public static func mailReply(input: [String: JSONValue]) async throws -> JSONValue {
-        try await mailRespond(input: input, send: true)
+    /// Reply only to an exact identity or unique subject/sender so another conversation cannot receive the reply.
+    public static func mailReply(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
+        try await mailRespond(input: input, send: true, context: context)
     }
 
-    public static func mailDraft(input: [String: JSONValue]) async throws -> JSONValue {
-        let result = try await (input["to"] != nil ? mailCompose(input: input, send: false) : mailRespond(input: input, send: false))
+    public static func mailDraft(input: [String: JSONValue], context: MacOperationContext) async throws -> JSONValue {
+        let result = try await (input["to"] != nil ? mailCompose(input: input, send: false, context: context) : mailRespond(input: input, send: false,
+            context: context))
         guard case .object(var row) = result else { return result }
         if row["effects"] == .string("none") { row["created"] = .bool(false); return .object(row) }
         guard ["completed", "outcome_unknown", "unknown"].contains(row["status"]?.scalarText ?? "") else { return result }
@@ -470,9 +462,11 @@ extension MacAppleScriptBridge {
         return .object(result)
     }
 
-    private static func mailRespond(input: [String: JSONValue], send: Bool) async throws -> JSONValue {
+    private static func mailRespond(input: [String: JSONValue], send: Bool, context: MacOperationContext) async throws -> JSONValue {
         let exact = MailReadLocator.parse(input)
-        if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
+        if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil {
+            return failedEnvelope(integration: "mail", reason: "invalid_message_locator")
+        }
         let subject = input["subject"]?.scalarText ?? ""
         guard exact != nil || !subject.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_message_selector")
@@ -517,7 +511,7 @@ extension MacAppleScriptBridge {
         end tell
         """
         do {
-            let raw = try await runAppleScript(source, bundleID: "com.apple.mail").trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw = try await runAppleScript(source, bundleID: "com.apple.mail", context: context).trimmingCharacters(in: .whitespacesAndNewlines)
             switch raw {
             case "-2": return failedEnvelope(integration: "mail", reason: "message_changed_or_ambiguous_refresh_inbox")
             case "0": return failedEnvelope(integration: "mail", reason: "no_matching_message")
@@ -535,7 +529,10 @@ extension MacAppleScriptBridge {
                     "effects": .string("unknown"), "reason": .string("unexpected_mail_reply_result"),
                     "requested_message": .object(input.filter { MailReadLocator.fields.union(["subject", "sender"]).contains($0.key) }),
                     "action": .string(send ? "sent_reply" : "draft_save_unconfirmed"),
-                    "message": .string("Mail returned an unrecognized reply result. Check the original conversation and \(send ? "Sent and Outbox" : "Drafts") before trying again."),
+                    "message": .string("""
+                        Mail returned an unrecognized reply result. Check the original conversation and \(send ? "Sent and Outbox" : "Drafts") before trying \
+                        again.
+                        """),
                 ])
             }
             return .object([
@@ -550,9 +547,7 @@ extension MacAppleScriptBridge {
         }
     }
 
-    /// Build the AppleScript `whose` predicate for Mail message lookup —
-    /// subject is required, sender is optional. Inputs MUST already be
-    /// escapeForAppleScript'd.
+    /// Inputs must already be escaped for AppleScript before entering the lookup predicate.
     private static func mailMatchWhereClause(subjectAS: String, sender: String?) -> String {
         if let s = sender, !s.isEmpty {
             let senderAS = escapeForAppleScript(s)

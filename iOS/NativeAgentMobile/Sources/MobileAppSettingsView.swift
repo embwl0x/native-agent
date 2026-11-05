@@ -1,8 +1,6 @@
 import SwiftUI
 import NativeAgentShared
 
-/// One section per settings page, in the Mac's order, or only `pages`. The
-/// page that shows it refreshes the shared Mac readback.
 struct MobileAppSettingsSections: View {
     var pages: [String]?
     var title: String?
@@ -52,7 +50,7 @@ private struct MobileAppSettingRow: View {
                 AliveValueRow(label: row.label, value: "Unavailable: the Mac did not supply a value.")
             }
         }
-        // The Mac's read-back moves the control; submission only stops taps.
+        // Only Mac readback moves the control; submission disables duplicate taps.
         .allowsHitTesting(!sync.appSettingsSaving.contains(row.id))
     }
 
@@ -97,8 +95,6 @@ private struct MobileAppSettingRow: View {
         }
     }
 
-    /// A word id the Mac stores (`read_only`, `low_memory`) reads as words;
-    /// anything else (a model id, a number) is shown as the Mac spells it.
     static func label(forChoice value: String) -> String {
         guard !value.isEmpty, value.allSatisfy({ $0.isLowercase || $0 == "_" }) else { return value }
         let words = value.replacingOccurrences(of: "_", with: " ")

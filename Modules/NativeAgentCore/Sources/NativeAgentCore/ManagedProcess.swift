@@ -1,10 +1,9 @@
 import Darwin
 import Foundation
 
-// Blueprint: | `ManagedProcess.swift` | `ManagedProcess` starts one checked process group before exec, including descriptor-pinned cwd/inheritance, owns optional capture deadlines, retains its waitable leader through group settlement, and reports incomplete termination separately from exit; `OwnedProcessGroup` is the one group-signal owner shared with ACP |
+// Blueprint: | `ManagedProcess.swift` | `ManagedProcess`, `OwnedProcessGroup`: checked process groups and settlement |
 
-/// A child whose process group is established by posix_spawn, before any child
-/// code runs. The waitable leader reserves the PID/PGID until settlement ends.
+/// A child whose process group is established by posix_spawn, before any child code runs. The waitable leader reserves the PID/PGID until settlement ends.
 public final class ManagedProcess: @unchecked Sendable {
     /// These are the two process QoS classes accepted by Darwin's spawn API.
     public enum Priority: Sendable, Equatable { case utility, background }
@@ -19,8 +18,7 @@ public final class ManagedProcess: @unchecked Sendable {
     public var standardOutput: Any?
     public var standardError: Any?
     public var qualityOfService: Priority?
-    /// An explicit launch that hands a background app to the person may
-    /// relinquish descendants on ordinary exit. Stop always closes the group.
+    /// An explicit launch that hands a background app to the person may relinquish descendants on ordinary exit. Stop always closes the group.
     public var reapDescendantsOnExit = true
     public var terminationHandler: (@Sendable (ManagedProcess) -> Void)? {
         get { state.withLock { $0.handler } }
@@ -45,8 +43,7 @@ public final class ManagedProcess: @unchecked Sendable {
     public var terminationStatus: Int32 { terminationError == nil ? state.withLock { $0.status } : -1 }
     public var terminationError: String? { state.withLock { $0.group }?.failure }
     public var timedOut: Bool { state.withLock { $0.timedOut } }
-    /// The original lease survives PID reuse; cancellation never reacquires a
-    /// different process's authority from its numeric PID.
+    /// The original lease survives PID reuse; cancellation never reacquires a different process's authority from its numeric PID.
     public var groupSnapshot: ProcessTreeSnapshot {
         let group = state.withLock { $0.group }
         return ProcessTreeSnapshot(rootPID: group?.pid ?? 0, rootIdentity: nil,
@@ -74,8 +71,7 @@ public final class ManagedProcess: @unchecked Sendable {
             state.withLock { $0.deadline = timer }
             timer.resume()
         }
-        // The parent must not retain the child's side of a pipe: otherwise
-        // physical exit can never produce EOF for the existing capture owner.
+        // The parent must not retain the child's side of a pipe: otherwise physical exit can never produce EOF for the existing capture owner.
         var closed = Set<ObjectIdentifier>()
         for (value, isInput) in [(standardInput, true), (standardOutput, false), (standardError, false)] {
             guard let pipe = value as? Pipe else { continue }
@@ -83,10 +79,11 @@ public final class ManagedProcess: @unchecked Sendable {
             guard closed.insert(ObjectIdentifier(handle)).inserted else { continue }
             do { try handle.close() }
             catch {
-                // A capture setup failure cannot retire its only deadline while
-                // leaving the launched effect running. Close this same lease.
+                // A capture setup failure cannot retire its only deadline while leaving the launched effect running. Close this same lease.
                 if group.send(SIGSTOP), group.send(SIGKILL) { group.observeStop() }
-                group.recordFailure("The parent's child-side pipe could not close after spawn: \(error.localizedDescription). The process launched; effects are unknown.")
+                group.recordFailure("""
+                    The parent's child-side pipe could not close after spawn: \(error.localizedDescription). The process launched; effects are unknown.
+                    """)
             }
         }
         let reapDescendants = reapDescendantsOnExit
@@ -94,8 +91,8 @@ public final class ManagedProcess: @unchecked Sendable {
             var info = siginfo_t()
             var result: Int32
             var stopped = false
-            // Darwin's waitid also answers WEXITED for a stopped child and WNOWAIT repeats it; end and expiry
-            // stop the group before the kill. A stop is not an exit: look again until the leader is a zombie.
+            // Darwin's waitid also answers WEXITED for a stopped child and WNOWAIT repeats it; end and expiry stop the group before the kill. A stop is not an
+            // exit: look again until the leader is a zombie.
             repeat {
                 result = waitid(P_PID, id_t(group.pid), &info, WEXITED | WNOWAIT)
                 stopped = result == 0 && (info.si_code == CLD_STOPPED || info.si_code == CLD_TRAPPED)
@@ -113,8 +110,7 @@ public final class ManagedProcess: @unchecked Sendable {
         }
     }
 
-    /// Joins the owner's terminal observation, which can explicitly report an
-    /// incomplete stop. A failed signal never pretends that the child exited.
+    /// Joins the owner's terminal observation, which can explicitly report an incomplete stop. A failed signal never pretends that the child exited.
     public func waitForSettlement() { finished.wait() }
 
     private func expire() {
@@ -123,8 +119,7 @@ public final class ManagedProcess: @unchecked Sendable {
             state.timedOut = true
             return group
         }
-        // The lease itself serializes signals against reaping. Call outside
-        // the state lock: signal failures announce through this process owner.
+        // The lease itself serializes signals against reaping. Call outside the state lock: signal failures announce through this process owner.
         if let group, group.send(SIGSTOP), group.send(SIGKILL) { group.observeStop() }
     }
 
@@ -154,8 +149,7 @@ private final class NSLockedState<Value>: @unchecked Sendable {
     }
 }
 
-/// A PGID is signalable only while this owner still holds its unreaped child.
-/// No tree or root-PID signal substitutes for a failed group operation.
+/// A PGID is signalable only while this owner still holds its unreaped child. No tree or root-PID signal substitutes for a failed group operation.
 public final class OwnedProcessGroup: @unchecked Sendable {
     public let pid: Int32
     public let identity = UUID()
@@ -176,8 +170,7 @@ public final class OwnedProcessGroup: @unchecked Sendable {
                              qualityOfService: ManagedProcess.Priority? = nil,
                              directoryDescriptor: Int32? = nil,
                              inheritedDescriptor: (source: Int32, target: Int32)? = nil) throws -> OwnedProcessGroup {
-        // C argv/env/path strings cannot carry NUL. Refuse rather than exec a
-        // truncated argument or a different environment entry/path.
+        // C argv/env/path strings cannot carry NUL. Refuse rather than exec a truncated argument or a different environment entry/path.
         guard !executable.isEmpty, !executable.contains("\0"),
               arguments.allSatisfy({ !$0.contains("\0") }),
               directory.map({ !$0.path.contains("\0") }) != false,
@@ -222,8 +215,7 @@ public final class OwnedProcessGroup: @unchecked Sendable {
             }
             try checked(posix_spawn_file_actions_adddup2(&actions, descriptor, target))
         }
-        // dup removes CLOEXEC on the verified source. The shared spawn owner
-        // makes the requested child FD inheritable and closes the parent's dup.
+        // dup removes CLOEXEC on the verified source. The shared spawn owner makes the requested child FD inheritable and closes the parent's dup.
         var inherited: Int32 = -1
         defer { if inherited >= 0 { _ = Darwin.close(inherited) } }
         if let inheritedDescriptor {
@@ -257,9 +249,8 @@ public final class OwnedProcessGroup: @unchecked Sendable {
             guard killpg(pid, signal) != 0 else { return true }
             let refusal = errno
             if refusal == ESRCH { return true }
-            // Darwin answers EPERM, not ESRCH, when every member has exited and the
-            // waitable leader is held unreaped: nothing is left to signal. A live
-            // member this owner may not signal is a real failure.
+            // Darwin answers EPERM, not ESRCH, when every member has exited and the waitable leader is held unreaped: nothing is left to signal. A live member
+            // this owner may not signal is a real failure.
             if refusal == EPERM {
                 do { if try !hasLiveGroupMembers() { return true } }
                 catch {
@@ -267,7 +258,10 @@ public final class OwnedProcessGroup: @unchecked Sendable {
                     return false
                 }
             }
-            recordFailure("Process group \(pid) signal \(signal) failed: \(POSIXError(POSIXErrorCode(rawValue: refusal) ?? .EIO).localizedDescription). Termination is incomplete; do not repeat its work.")
+            recordFailure("""
+                Process group \(pid) signal \(signal) failed: \(POSIXError(POSIXErrorCode(rawValue: refusal) ?? .EIO).localizedDescription). Termination is \
+                incomplete; do not repeat its work.
+                """)
             return false
         }
         return result
@@ -278,16 +272,14 @@ public final class OwnedProcessGroup: @unchecked Sendable {
         onFailure?()
     }
 
-    /// A bounded checked group observation must establish that every remaining
-    /// member is exited before the caller may release its waitable leader.
-    /// Unavailable inspection or a surviving member retains the leader/PGID.
+    /// A bounded checked group observation must establish that every remaining member is exited before the caller may release its waitable leader. Unavailable
+    /// inspection or a surviving member retains the leader/PGID.
     public func closeExitedGroup() -> Bool {
         guard send(SIGKILL) else { return false }
         return verifyStoppedGroup()
     }
 
-    /// SIGKILL itself is not terminal proof. This bounded observation also
-    /// covers a leader that never reaches waitid's exited state.
+    /// SIGKILL itself is not terminal proof. This bounded observation also covers a leader that never reaches waitid's exited state.
     public func observeStop() {
         let start = lock.withLock { () -> Bool in
             guard !stopObservationStarted, !reaped else { return false }
@@ -345,8 +337,7 @@ public final class OwnedProcessGroup: @unchecked Sendable {
         throw POSIXError(.EOVERFLOW)
     }
 
-    /// Call only after waitid established exit, or after the ACP owner closed
-    /// its group. The one leader stays waitable until all group signals end.
+    /// Call only after waitid established exit, or after the ACP owner closed its group. The one leader stays waitable until all group signals end.
     public func reapExitedLeader() {
         lock.withLock {
             guard !reaped else { return }

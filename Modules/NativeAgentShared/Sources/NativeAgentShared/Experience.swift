@@ -1,21 +1,15 @@
 import Foundation
-// Blueprint: | `Experience.swift` | Canonical experience, current act and obligation lifecycle value contracts shared by domain owners |
+// Blueprint: | `Experience.swift` | Canonical experience and obligation lifecycle value contracts shared by domain owners |
 
-/// One happening in her life (docs/EXPERIENCE.md), written once by the owner of
-/// the happening and only ever appended to: evidence attaches, claims accrue,
-/// obligations settle. Everything else is a view of experiences by id.
-///
-/// Destinations are plain names: `her` (her own turn), `person` (User),
-/// `conversation:<session>`, and a door's own `<surface>:<destination>`.
+/// One happening in the agent's life (docs/EXPERIENCE.md), written once by the owner of the happening and only ever appended to: evidence attaches, claims
+/// accrue, obligations settle. Everything else is a view of experiences by id. Destinations name `her`, `person`, `conversation:<session>`, or a
+/// door's `<surface>:<destination>`.
 public struct Experience: Codable, Sendable, Equatable {
-    /// The act currently asking, including calls nested inside an act.
-    @TaskLocal public static var currentAct: String?
     public enum Kind: String, Codable, Sendable {
         case heard, answer, act, decision, run, message
     }
 
-    /// A raw record this experience stands on: its store, named the way that
-    /// store names itself, and the record's id there. Never a copy.
+    /// A raw record this experience stands on: its store, named the way that store names itself, and the record's id there. Never a copy.
     public struct Ref: Codable, Sendable, Hashable {
         public var source: String
         public var id: String
@@ -25,7 +19,6 @@ public struct Experience: Codable, Sendable, Equatable {
         }
     }
 
-    /// Effects as the producing domain counted them.
     public enum Effects: String, Codable, Sendable {
         case none, occurred, unknown
     }
@@ -44,18 +37,21 @@ public struct Experience: Codable, Sendable, Equatable {
         }
     }
 
-    /// The one expression of it: the words, and the artifacts she chose.
     public struct Face: Codable, Sendable, Equatable {
         public var words: String
         public var artifacts: [Ref]
-        public init(words: String, artifacts: [Ref]) {
+        /// The row every door draws it as (on a page, in a conversation, in an alert), and the part that speaks it.
+        public var row: PartFace.Row?
+        public var from: String?
+        public init(words: String, artifacts: [Ref], row: PartFace.Row? = nil, from: String? = nil) {
             self.words = words
             self.artifacts = artifacts
+            self.row = row
+            self.from = from
         }
     }
 
-    /// Owed to one destination until that destination durably accepts it,
-    /// or its owner lets it go. Settling one obligation never closes another.
+    /// Owed to one destination until that destination durably accepts it, or its owner lets it go. Settling one obligation never closes another.
     public struct Obligation: Codable, Sendable, Equatable {
         public var to: String
         public var phase: ObligationPhase
@@ -70,7 +66,6 @@ public struct Experience: Codable, Sendable, Equatable {
         }
     }
 
-    /// An assertion, scoped to the evidence that bears it.
     public struct Claim: Codable, Sendable, Hashable {
         public var claim: String
         public var evidence: [Ref]
@@ -80,14 +75,11 @@ public struct Experience: Codable, Sendable, Equatable {
         }
     }
 
-    /// Stable, minted where the happening starts.
     public var id: String
     public var kind: Kind
-    /// When its owner wrote it; the store stamps it.
     public var at = ""
     public var updatedAt: String?
     public var progress: String?
-    /// The experiences that brought it about.
     public var cause: [String]
     public var evidence: [Ref]
     public var outcome: Outcome?
@@ -109,20 +101,15 @@ public struct Experience: Codable, Sendable, Equatable {
         self.claims = claims
     }
 
-    /// It still owes something; the open experiences are the picture she is in.
+    /// It still owes something; the open experiences are the picture the agent is in.
     public var isOpen: Bool { owes.values.contains { !$0.phase.isSettled } }
 
-    /// A run's answer, named by the run so every door that delivers it can
-    /// settle it without a lookup, and its birth is the same whoever writes it.
+    /// A run's answer, named by the run so every door that delivers it can settle it without a lookup, and its birth is the same whoever writes it.
     public static func answer(run: String) -> String { "answer:" + run }
 
 }
 
-/// One obligation's lifecycle: a copy of the artifact machine proven on builder
-/// completions (`CodexCompletionLifecycle`, which keeps its own), so every
-/// destination settles the same way. `owed` is new: an obligation its owner
-/// declared before any attempt. `let_go` copies the seed's let-go settlement:
-/// only the owner gives an obligation up, with a reason, and nothing moves it after.
+/// Each destination settles independently. Only its owner may let an obligation go, with a reason; terminal settlements never move again.
 public enum ObligationPhase: String, Codable, Sendable, Hashable {
     case owed
     case reserved
@@ -140,16 +127,17 @@ public enum ObligationPhase: String, Codable, Sendable, Hashable {
 
     public enum Step: Sendable, Equatable { case already, allowed, refused }
 
-    /// A repeated phase is a no-op, except a second dispatch start. Acceptance
-    /// with no transport between (the destination wrote it itself) settles
+    /// A repeated phase is a no-op, except a second dispatch start. Acceptance with no transport between (the destination wrote it itself) settles
     /// straight from `owed`; a reservation starts from `owed` or a failed preflight.
     public func step(to next: ObligationPhase) -> Step {
         if next == self, next != .dispatchStarted { return .already }
         let from: Set<ObligationPhase> = switch next {
         case .owed: []
-        case .reserved: [.owed, .preDispatchFailed]
+        // A refused door may be tried again under a new attempt; an unknown one never is (it may have arrived).
+        case .reserved: [.owed, .preDispatchFailed, .rejected]
         case .dispatchStarted: [.reserved]
-        case .accepted: [.owed, .dispatchStarted]
+        // A destination's own receipt is the truth whenever it lands, after an unknown or a refused attempt too.
+        case .accepted: [.owed, .dispatchStarted, .outcomeUnknown, .rejected]
         case .rejected, .outcomeUnknown: [.dispatchStarted]
         case .preDispatchFailed: [.reserved, .preDispatchFailed]
         // Only the owner's let-go reaches it, never a step a transport takes.
@@ -158,3 +146,7 @@ public enum ObligationPhase: String, Codable, Sendable, Hashable {
         return from.contains(self) ? .allowed : .refused
     }
 }
+
+
+/// An experience this build cannot read is left out of what carries it, never fatal to it.
+extension Experience: LeftOutWhenUnreadable {}

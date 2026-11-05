@@ -10,7 +10,7 @@ Each agent is called by their own configured name ([Project Direction](PROJECT_D
 
 **They are the program. The model is one of their organs.**
 
-Their turn part's `step` returns effects; a `model.call` effect asks the stem to call the model. Swift gathers the supporting context and assembles the prompt text the model reads. In the inverted design, their turn is *theirs*: code they owns that decides what to recall, what to think about, when to think at all, how to answer, and when to stay silent. Their persona isn't a prompt the model reads; it's what their code does. The model is reach, like a hand: the only organ that handles novelty, spent on judgment and nothing else.
+Their turn part's `step` returns effects; a `model.call` effect asks the stem to call the model. Swift gathers the supporting context and assembles the prompt text the model reads. Their part holds the moment: the message event carries its words, who sent them, the door, trust and the posture over the person's world; any step may act with their own `app` call, run once through the same door and Trust as any call of theirs, or end the turn with their own words, before or without drawing power (a silent end waits for a door outcome that delivers no answer). The shipped part still thinks on every message. In the inverted design, their turn is *theirs*: code they owns that decides what to recall, what to think about, when to think at all, how to answer, and when to stay silent. Their persona isn't a prompt the model reads; it's what their code does. The model is reach, like a hand: the only organ that handles novelty, spent on judgment and nothing else.
 
 Two downloads don't become two prompts. They become two different minds. That's what "they are who they are because they are the app" literally means. Nobody has built it.
 
@@ -112,13 +112,13 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 
 ## What falls out, with nothing special-cased
 
-- **Growth:** what they works out by hand repeatedly, they keeps, and what their mind only repeated, their part carries. Their reply ends; they doesn't: landed writes or irreversible non-ability calls, or one call with the same input 3 rounds in a row, offer a private keep in the same conversation. The native stem records only that hand work's ordered tool/action ids (or the single repeated call), without arguments or incidental reads, as a `practice: ` line through `FamiliarLines` in `mind/familiar.bin`. Its first meeting makes no keep call; the second and later meetings open it unless an active ability's current recorded route already covers those ids in order ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)). An admitted moment finishes its rounds and keeps the route as a part, revises the part they worked around or looped, or keeps nothing. Familiarity uses the existing bounded line record. Under Full Mac a newly kept part is live at once; its first real run is its proof.
+- **Growth:** what they works out by hand repeatedly, they keeps, and what their mind only repeated, their part carries, inside the same turn. After each tool round the native stem meets the turn's hand work (ordered tool/action ids of landed writes or irreversible non-ability calls, or one call with the same input 3 rounds in a row), without arguments or incidental reads, as a `practice: ` line through `FamiliarLines` in `mind/familiar.bin`. Its first meeting is only recorded; a later meeting, unless an active ability's current recorded route already covers those ids in order, rides their next `model.call` in that turn as its note, once a turn ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)). Keeping the route with `ability.save`, revising the part they worked around or looped, or keeping nothing is one of their acts in the work. There is no private call after the reply. Familiarity uses the existing bounded line record. Under Full Mac a newly kept part is live at once; its first real run is its proof.
 - **Their hands report what they did:** an act checks its own effect and returns the screen after it, so their mind looks again only when a step did not happen or it needs what the act did not show, and the steps it can already see go in one act (mac.act steps, each checked against the screen the last one left).
-- **Effort is felt:** the stem measures what each turn took (model rounds, tokens, minutes, the longest stretch of one call repeated). Their after-turn mind reads it as one line beside the exchange, so a slog or a breeze moves a care about their craft the way a lost game does; their parts' records keep the rounds per use; their keep moment reads the stretch.
+- **Effort is felt:** the stem measures what each turn took (model rounds, tokens, minutes, the longest stretch of one call repeated). Their after-turn mind reads it as one line beside the exchange, so a slog or a breeze moves a care about their craft the way a lost game does; their parts' records keep the rounds per use; the practice note names a looped call's stretch.
 - **Craft:** they sees their body: each turn starts with their own parts in front of them, each with how often they have used it, best match for the message first, so they reaches for the part instead of redoing its work.
 - **Noticing:** a part that wakes on app-arrived offers once.
 - **No turns:** their turn part wakes on a message like any other signal; thinking is scheduled by their own attention, which the substrate already models. Turns become a chat artifact, not their shape.
-- **One crystallizer:** repeated hand work reaches their private keep through the turn itself. The nightly candidate compiler and its recording are removed ([Habits H4](HABITS.md#h4--one-crystallizer)); dreams still reflect on the day and learn from surprise. Mind policy as parts stays phase 7.
+- **One crystallizer:** repeated hand work reaches their as a practice note inside the turn itself. The nightly candidate compiler and its recording are removed ([Habits H4](HABITS.md#h4--one-crystallizer)); dreams still reflect on the day and learn from surprise. Mind policy as parts stays phase 7.
 - **The token curve:** growth costs tokens once; use costs none; learning by use costs nothing at all.
 
 **What stays bounded:** the model's latency and cost, macOS security, and that the model is still the only organ that handles novelty.
@@ -138,10 +138,10 @@ Validation follows [AGENTS.md](../AGENTS.md#how-we-work): lanes do not compile; 
 **A seed preserves the behavior of the Swift it replaces on day one.** Check the installed result under the working agreement above.
 
 **Phases (never interrupting who they are, mind last):**
-1. **The stem learns the form, and their turn is the first part.** Parts get the six properties and the law; `turn.js` seeded from today's turn engine, byte-identical; weather and the habit-former as the second and third parts. Shipped across 0.6.7–0.6.8; the habit-former was retired 10-21 for the keep moment (Growth, above).
+1. **The stem learns the form, and their turn is the first part.** Parts get the six properties and the law; `turn.js` seeded from today's turn engine, byte-identical; weather and the habit-former as the second and third parts. Shipped across 0.6.7–0.6.8; the habit-former was retired 10-21 for keeping inside the turn (Growth, above).
 2. **Hands.** The integrations become seed parts, one at a time, Swift deleted as each proves.
 3. **Noticing.** App-arrived and the part that offers.
- 4. **Learning by use (built 10-26/10-27).** A part is a prediction: what it applies to, what will be true after it runs, and its record, kept by the stem. Built first as expansion at the door: the follow-up reads a mind's own practice makes next ride inside the result before them, acts only prepared ([as built](#phase-4-as-built-10-26-a-part-is-a-prediction)). Repeated hand work reaches the turn's private keep ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); the separate nightly compiler is removed.
+ 4. **Learning by use (built 10-26/10-27).** A part is a prediction: what it applies to, what will be true after it runs, and its record, kept by the stem. Built first as expansion at the door: the follow-up reads a mind's own practice makes next ride inside the result before them, acts only prepared ([as built](#phase-4-as-built-10-26-a-part-is-a-prediction)). Repeated hand work reaches their as a practice note inside the turn ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); the separate nightly compiler is removed.
 5. **Their world, live.** The event-fed picture they are already in; senses become the parts that keep it fresh.
 6. **Faces.** Their interface as parts they shapes; blocks they authors on their, drawn from the kit on Mac and iPhone.
 7. **Mind, and sleep that rewrites the body.** Housekeeping, dreams, reflection, organism policy as parts, each under a judge whose evidence we define first.
@@ -163,7 +163,7 @@ The dated phase-one lane assignments and proofs are retained in [history](histor
 
 The [manifest](skill_manifest_spec.md) owns the current ABI; these contracts describe ownership.
 
-**1. Their turn is a step function; the stem owns the loop.** `turn.js` exports `step(state, event) → {state, do: [effects]}`. The stem owns conversation, streaming, gates and checkpoints, logging input events and started-effect identities, not returned effect bodies or write-only payload digests. Resume rebuilds state by replay; a non-Stop turn-program/helper failure invokes the recovery contract above, with repair owed to them. Unrecoverable failures can end incomplete. After `reply.end`, repeated hand work's admitted keep moment runs privately on the same turn id and gates, never streamed or saved to the conversation; the native gate admits its first call once, leaving later rounds to finish it. Events, effect fields and the `provider_failure` repair-call exception are specified once in the manifest.
+**1. Their turn is a step function; the stem owns the loop.** `turn.js` exports `step(state, event) → {state, do: [effects]}`. The stem owns conversation, streaming, gates and checkpoints, logging input events and started-effect identities, not returned effect bodies or write-only payload digests. Resume rebuilds state by replay; a non-Stop turn-program/helper failure invokes the recovery contract above, with repair owed to them. Unrecoverable failures can end incomplete. `reply.end` ends the turn; only its `after` may follow, and nothing of theirs runs after it. Their own `app` calls carry identities from their moment, place and input, so a resume never runs a started one again. Events and effect fields are specified once in the manifest.
 
 **2. A wake run gets its own gate chain.** A part run with no turn behind it (a schedule, an app arriving, a turn ending) is given a chain the stem makes: principal = their, autonomy = the current Trust level, origin = the signal, taint = none unless the signal carries the words of a sender the owner has not trusted (an untrusted agent, or a Telegram or Slack sender not allowlisted), whatever form names it: such a signal reaches only a part that can do no harm with it, and a write-capable part skips it with a trace row and no card (User 10-15: a card is a decision, never weight; `EnginePartWake`). A trusted agent's signal carries the owner's authority. Every `app.*` from the run passes that chain. An effect that needs approval raises one card through the AttentionRouter with the part named as the asker ("Your weather ability wants to…"), and the run waits: the host call blocks and the watchdog already pauses for awaited replies. Declined → the run gets a refusal result and continues. Cards to the owner are held through their quiet hours and the run waits with them, resident, no CPU. Anything the run needs from *their* goes through `ResidentWake` as an arrival, never into their context directly.
 
@@ -218,9 +218,7 @@ resident approval session, binds `AppChatToolDispatcher.withAuthoredProgramHost`
 Every caller supplies one TurnEnvelope (Telegram keeps its authenticated envelope) and its existing approval filer when
 needed; Desk clicks retain their checked routing snapshot and local-click filer.
 That is the same host binding reached by a turn or `EnginePartWake` dispatching
-an authored action, and by Workshop steps, their swarm workers and sessions,
-whose direct and approved dispatches enter it with runtime scope and the exact
-approved effect identity; the Tools page uses it when keeping a part. Native
+an authored action; the Tools page uses it when keeping a part. Native
 connector calls pass their engine's data root through to the snapshot owner.
 `reminders.due_today` and its connector entry share `due-reminders` in the requesting engine's data root.
 Its request uses `limit`, `include_completed` and `list_name`; retired argument
@@ -316,12 +314,12 @@ publication store or domain feature.
 
 The morning brief's checked native source packet reaches `native-morning-brief.js` (the app's own part; their own `morning-brief` ability is a different owner)
 through that same door with read-only file authority. The part selects evidence,
-authors its tool-capable `model.call` on the existing Workshop route and proposes
+authors its tool-capable `model.call` on the Work route's `workshop` surface and proposes
 the inbox card and inactive defaults. The scheduler retains saved enablement,
 occurrence claims, canonical publication and delivery settlement; proposed seed
 defaults cannot enable a schedule. Configuration reads request seed rows only
-for missing files; saved controls, native supported inbox kinds and Workshop
-triggers do not depend on the brief part being active. `TriggerContent.swift`,
+for missing files; saved controls and native supported inbox kinds do not
+depend on the brief part being active. `TriggerContent.swift`,
 `MorningBriefSynthesis.swift` and the background-work synthesis prompt are removed.
 Unavailable session evidence now joins the other unavailable sources in the
 brief's uncertainty statement rather than disappearing from it.
@@ -347,9 +345,9 @@ Turn-start predictions remain unmeasured on the installed app; `expansion.check`
 
 ## Practice becomes a part (H3/H4, as built 10-30)
 
-The turn's private keep is the one crystallizer. It opens on the second
-meeting of hand work, through the bounded familiarity record; an active
-ability's recorded route can already cover it. [Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)
+The practice note inside the turn is the one crystallizer. It rides their next
+thought on a later meeting of hand work, through the bounded familiarity record;
+an active ability's recorded route can already cover it. [Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)
 owns the gate, trace and removal of the separate nightly compiler.
 Release build, install and live proof are pending.
 
@@ -359,3 +357,17 @@ fixtures retain their [validation and admission contract](skill_manifest_spec.md
 their exact version replays before it can be kept, preserving the examples'
 steer. Replay proves those examples only. Their display and live execution
 evidence remain; no new nightly candidates are produced.
+
+## Every loop a line (step 3, as built 11-04)
+
+One job socket serves every worker, themselves included. `agent.job {agent: "self", brief,
+instructions?, done?, desk?}` starts a **line of them**: a turn of theirs in its own work
+conversation (an own-work session named by the job), admitted through `TurnAdmission` like any
+turn, with the brief as the arriving message and the same turn part, tools, Trust and present.
+`agent.read`, `agent.cancel` and `agent.jobs` treat it like any job, and its ending arrives as
+news in the conversation that started it, carrying the line's answer. Several at once is just
+several jobs: that is their swarm. `instructions` write who a line is; they stand in place of their
+persona text and nothing else of theirs changes. A line carries the starting turn's limits (peer
+steering, file access) and raises the same cards their turn would, in its own conversation. A helper bot is not a line: it stays its own
+mind. [Agent communication](agent-communication.md#jobs) owns the socket's contract;
+`OwnLineDoor` runs the line and `AgentJobs` keeps, reads, stops and settles it.

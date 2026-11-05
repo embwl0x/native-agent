@@ -1,19 +1,15 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ApprovalInbox+SkillScriptInstall.swift` | `SwiftNativeApprovalInbox.askUserToInstallScript`: exact-digest executable review cards and install bindings; every deciding surface must show saved review |
+// Blueprint: | `ApprovalInbox+SkillScriptInstall.swift` | `SwiftNativeApprovalInbox.askUserToInstallScript`; Exact-digest reviews. |
 
-/// User's card for a skill script only he turns on (skills-as-code): approved,
-/// from the Mac or his phone, it admits exactly the digest it shows, through
-/// the Skills page's own Install; denied, the script stays drafted. One card
-/// per script digest, its `lastRequestedAt` stamped when asked again.
+/// Approval admits only the reviewed script digest through the Skills install owner; denial leaves it drafted.
 extension SwiftNativeApprovalInbox {
     public static let skillScriptInstallAction = "skill.script_install"
-    /// The card carries exact source, header and bounded fixtures.
     public static let skillScriptPreviewLimit = 300_000
 
-    /// These decisions admit code as the owner's. Every deciding surface must
-    /// show the saved review; a shortened notification cannot offer approval.
+    /// These decisions admit code as the owner's. Every deciding surface must show the saved review; a shortened notification cannot offer approval.
     public nonisolated static func requiresExecutableReview(action: String, payload: JSONValue) -> Bool {
         if action == skillScriptInstallAction { return true }
         guard action == "self_improvement.apply", case .object(let fields) = payload,
@@ -24,7 +20,8 @@ extension SwiftNativeApprovalInbox {
 
     @discardableResult
     public func askUserToInstallScript(
-        skill: String, skillID: String, digest: String, why: String, script: String
+        skill: String, skillID: String, digest: String, why: String, script: String,
+        turn: Turn?, handsBack: Bool = false
     ) async throws -> ApprovalRecord {
         guard digest.count == 64, digest.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
               !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -39,13 +36,12 @@ extension SwiftNativeApprovalInbox {
                 + "approving installs nothing. Deny leaves it drafted."),
             "payloadPreview": .string(script),
             "payload": .object(["skill": .string(skillID), "name": .string(skill), "digest": .string(digest)]),
-        ])) { payload in
+        ]), turn: turn, handsBack: handsBack) { payload in
             guard case .object(let bound) = payload else { return false }
             return bound["skill"] == .string(skillID) && bound["digest"] == .string(digest)
         }.record
     }
 
-    /// The skill and exact digest an install card binds, nil when malformed.
     public static func skillScriptInstallBinding(_ record: ApprovalRecord) -> (skill: String, digest: String)? {
         guard record.action == skillScriptInstallAction, case .object(let bound) = record.payload,
               case .string(let skill)? = bound["skill"], case .string(let digest)? = bound["digest"],

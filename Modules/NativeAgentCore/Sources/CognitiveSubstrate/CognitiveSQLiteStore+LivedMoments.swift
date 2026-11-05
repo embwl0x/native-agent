@@ -3,13 +3,9 @@ import GRDB
 import PersistenceCore
 import Experiences
 import NativeAgentShared
-// Blueprint: | `CognitiveSQLiteStore+LivedMoments.swift` | `CognitiveSQLiteStore`: the current lived-moment journal (`lived_moments`): record owed, save input and meaning, assign fold seq, settle lived or refused, prune settled payload-free rows; checked decoding refuses damaged rows individually with reason, preserves payloads and owes repair |
+// Blueprint: | `CognitiveSQLiteStore+LivedMoments.swift` | `CognitiveSQLiteStore`: checked `lived_moments` journal and settlement |
 
-// THE JOURNAL (docs/SUBCONSCIOUS.md, "Lived moments"). One table in her own
-// cognition store, outside what `clear()` deletes and outside the restore
-// bundle: a bad journal row can never fail her mind's restore, and forgetting
-// her mind never forgets that a moment was lived. The fold seq is allocated
-// from `cognitive_epochs` (domain `fold_seq`) so Clear cannot reset it either.
+// The journal and fold-seq allocation sit outside Clear and restore, so forgetting never re-lives a moment and a damaged row cannot fail mind restore.
 
 extension CognitiveSQLiteStore {
     static func createLivedMomentsSchema(_ db: Database) throws {
@@ -104,8 +100,7 @@ extension CognitiveSQLiteStore {
         catch { return MomentRead(id: id, failure: String(describing: error)) }
     }
 
-    /// Refuse a damaged row individually, preserving every payload byte and
-    /// owing its repair. This is not settlement of any of its mind share.
+    /// Refuse a damaged row individually, preserving every payload byte and owing its repair. This is not settlement of any of its mind share.
     public func refuseUnreadableMoment(_ id: String, why: String) async throws {
         nativeLog("cognition: moment %@ unreadable, payload preserved: %@", id, why)
         await RepairOwed.owe(databaseURL.deletingLastPathComponent().deletingLastPathComponent(),
@@ -148,8 +143,7 @@ extension CognitiveSQLiteStore {
         return db.changesCount > 0
     }
 
-    /// Record a moment. An identity already recorded is left as it is (a
-    /// re-delivery is inert); returns whether this call recorded it.
+    /// Record a moment. An identity already recorded is left as it is (a re-delivery is inert); returns whether this call recorded it.
     @discardableResult
     public func recordMoment(_ moment: CognitiveLivedMoment) async throws -> Bool {
         let row = try Self.encodedMoment(moment)
@@ -168,8 +162,7 @@ extension CognitiveSQLiteStore {
         return read?.moment
     }
 
-    /// Moments in these states,
-    /// begun folds by fold seq first, the rest in the order they were accepted.
+    /// Resume begun folds by fold seq before accepting unbegun moments in arrival order.
     public func loadMoments(states: [CognitiveMomentState]) async throws -> [CognitiveLivedMoment] {
         let names = states.map(\.rawValue)
         guard !names.isEmpty else { return [] }
@@ -189,7 +182,6 @@ extension CognitiveSQLiteStore {
         return moments
     }
 
-    /// Save an unsettled moment's mutable half: state, input and meaning.
     public func saveMoment(_ moment: CognitiveLivedMoment) async throws {
         let input = try Self.encoded(moment.input)
         let meaning = try Self.encoded(moment.meaning)
@@ -202,8 +194,7 @@ extension CognitiveSQLiteStore {
         }
     }
 
-    /// Settle a moment `lived` or `refused` (with its reason): payloads
-    /// dropped, identity kept. A settled moment stays as it was.
+    /// Settle a moment `lived` or `refused` (with its reason): payloads dropped, identity kept. A settled moment stays as it was.
     public func settleMoment(_ id: String, as state: CognitiveMomentState, reason: String? = nil) async throws {
         try await dbQueue.write { db in
             try db.execute(sql: """
@@ -215,9 +206,8 @@ extension CognitiveSQLiteStore {
         }
     }
 
-    /// The moment's fold seq: allocated once from the allocation Clear never
-    /// resets. A moment whose fold began keeps the seq it had (a refold after
-    /// a crash); a meant row with a seq is exactly that.
+    /// The moment's fold seq: allocated once from the allocation Clear never resets. A moment whose fold began keeps the seq it had (a refold after a crash); a
+    /// meant row with a seq is exactly that.
     public func beginFold(_ id: String) async throws -> UInt64? {
         try await dbQueue.write { db -> UInt64? in
             guard let row = try Row.fetchOne(
@@ -235,8 +225,7 @@ extension CognitiveSQLiteStore {
         }
     }
 
-    /// Payload-free settled rows before `date` are pruned. An unsettled row,
-    /// or a damaged row whose payload is preserved for repair, is never pruned.
+    /// Payload-free settled rows before `date` are pruned. An unsettled row, or a damaged row whose payload is preserved for repair, is never pruned.
     @discardableResult
     public func pruneMoments(settledBefore date: Date) async throws -> Int {
         try await dbQueue.write { db -> Int in
@@ -250,7 +239,6 @@ extension CognitiveSQLiteStore {
         }
     }
 
-    /// How many moments are not yet lived (owed or meant).
     public func unlivedMomentCount() async throws -> Int {
         try await dbQueue.read { db -> Int in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM lived_moments WHERE kind = 'turn' AND state IN ('owed', 'meant')") ?? 0

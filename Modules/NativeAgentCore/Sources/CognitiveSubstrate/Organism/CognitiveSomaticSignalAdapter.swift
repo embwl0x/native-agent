@@ -3,15 +3,12 @@ import PersistenceCore
 // Blueprint: | `CognitiveSomaticSignalAdapter.swift` | `CognitiveSomaticSignals` enum; `signal`, `safeSourceComponent` |
 
 public enum CognitiveSomaticSignals {
-    /// Closed producer/adapter contract for cognitive evidence whose somatic
-    /// consequence is already owned by the exact ProviderRouting lifecycle.
-    /// The cognitive event still circulates through the substrate; only the
-    /// second, uncorrelated body signal is suppressed.
+    /// Closed producer/adapter contract for cognitive evidence whose somatic consequence is already owned by the exact ProviderRouting lifecycle. The cognitive
+    /// event still circulates through the substrate; only the second, uncorrelated body signal is suppressed.
     public static let somaticOwnerMetadataKey = "somaticOwner"
     public static let providerLifecycleSomaticOwner = "provider_lifecycle"
 
-    /// Infrastructure evidence updates body health and posture; human causes,
-    /// caring, work, sleep and interests move feelings.
+    /// Infrastructure evidence updates body health and posture; human causes, caring, work, sleep and interests move feelings.
     public static func movesFeelings(_ kind: SomaticSignalKind) -> Bool {
         switch kind {
         case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled,
@@ -26,14 +23,8 @@ public enum CognitiveSomaticSignals {
         }
     }
 
-    /// Her own outcomes are human causes for agency and
-    /// confidence, though their signals are transport-shaped: a verified
-    /// action of hers that landed (the motor owner's `verification:
-    /// satisfied`), an effectful tool call of hers that succeeded (a canonical
-    /// outcome whose risk class is above a read, or that says `effects:
-    /// occurred` — a Desk item closed, a message sent, a file written), a
-    /// clean skill run. Her own work failing lowers
-    /// confidence a little. Reads, pings and transport results are nil.
+    /// Only verified motor effects, effectful tool outcomes and clean skill runs support agency/confidence. Reads and transport acceptance establish no
+    /// outcome.
     public static func ownOutcomeDose(_ event: CognitiveEvent) -> (agency: Double, confidence: Double)? {
         guard event.turnKind.contributesToLivedState else { return nil }
         let verification = stringValue(event.metadata["verification"])
@@ -78,8 +69,7 @@ public enum CognitiveSomaticSignals {
     private static func somaticKind(for event: CognitiveEvent) -> SomaticSignalKind? {
         switch event.kind {
         case .organismResolutionFelt:
-            // Minted FROM the organism's own resolution drain — feeding it
-            // back would loop the body into itself.
+            // Minted FROM the organism's own resolution drain — feeding it back would loop the body into itself.
             return nil
         case .userMessageReceived:
             return .userSpoke
@@ -100,17 +90,10 @@ public enum CognitiveSomaticSignals {
                 == providerLifecycleSomaticOwner {
                 return nil
             }
-            // Failures outside the ProviderRouting lifecycle still need their
-            // fallback body consequence. Suppression requires the explicit
-            // closed marker above; absence never implies ownership.
+            // Only the explicit lifecycle marker suppresses a second body signal; absent ownership evidence must not suppress a real failure.
             return .providerFailed
         case .providerVitalsShift:
-            // The graded, continuous sibling of `.providerFailure`. A worsening
-            // band transition rides the SAME `.providerFailed` axis (its grade
-            // carried by the event's importance → signal intensity); a recovery
-            // transition reads as relief on `.providerRecovered`. No new somatic
-            // kind, no new capsule slot — sluggishness is a value on an axis the
-            // body already feels.
+            // Grade worsening provider bands on the existing failure axis and recovery on relief; no separate somatic kind is needed.
             return providerVitalsSignalKind(from: event)
         case .appWake:
             return .appWake
@@ -119,10 +102,7 @@ public enum CognitiveSomaticSignals {
         }
     }
 
-    /// Direction key written by the vitals owner. Worsening → felt as
-    /// sluggishness on the provider-failed axis; recovering → relief. An absent
-    /// or unrecognized direction defaults to worsening (fail-loud: a health
-    /// shift with no legible direction is treated as the concerning case).
+    /// Vitals metadata carries direction; unreadable direction is concerning rather than evidence of recovery.
     public static let vitalsDirectionMetadataKey = "vitalsDirection"
 
     private static func providerVitalsSignalKind(from event: CognitiveEvent) -> SomaticSignalKind {
@@ -139,7 +119,7 @@ public enum CognitiveSomaticSignals {
         case .organismResolutionFelt:
             return "organism"
         case .userMessageReceived, .assistantTurnCompleted:
-            // Peer organs use out-of-band origin, never message claims; User retains chat/chat.<surface> names.
+            // Peer organs use out-of-band identity, never message claims; user turns keep chat/chat.<surface> names.
             if case .peer(let agent) = CognitiveSubstrate.relationalSource(for: event),
                let safePeer = safeSourceComponent(agent) {
                 return "chat.peer.\(safePeer)"
@@ -249,14 +229,9 @@ public enum CognitiveSomaticSignals {
         return string.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Internal rather than private so the shared-secret-filter pins can assert
-    /// this site answers the same way the other two do.
     static func safeSourceComponent(_ value: String?) -> String? {
         guard let value, !value.isEmpty else { return nil }
-        // One shared secret filter (`JSONValueBounding`), so a source component
-        // and a metadata value can never disagree about what a credential is.
-        // The private copy this replaces matched `sk-` unanchored, which threw
-        // away every ordinary `desk-…` / `task-…` component.
+        // Share `JSONValueBounding` credential detection so source components and metadata cannot disagree about secrets.
         guard !JSONValueBounding.containsSecretLikeValue(value) else { return nil }
         return String(value.prefix(60))
     }

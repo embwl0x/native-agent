@@ -42,8 +42,7 @@ extension TelegramPollLoop {
                 for (key, value) in patch { obj[key] = value }
             }
         } catch {
-            // Never write over a state file that did not read back. Logged
-            // here, not through recordError, which writes state.json too.
+            // Never write over a state file that did not read back. Logged here, not through recordError, which writes state.json too.
             await appendErrorLog(
                 .object([
                     "id": .string(UUID().uuidString),
@@ -57,10 +56,8 @@ extension TelegramPollLoop {
         }
     }
 
-    /// Sole checked state.json reader for polling and management diagnostics.
-    /// Only missing means empty; unreadable or non-object state is unavailable.
-    /// Local/off-disk backup, support state snapshot, phone status projection;
-    /// no production export. PrivacyMap: telegram.
+    /// Sole checked state.json reader for polling and management diagnostics. Only missing means empty; unreadable or non-object state is unavailable.
+    /// Local/off-disk backup, support state snapshot, phone status projection; no production export. PrivacyMap: telegram.
     public static func readState(dataRoot: URL) async throws -> [String: JSONValue] {
         let current: JSONValue
         do {
@@ -85,8 +82,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// A short, non-reversible fingerprint of the bot token. The token itself
-    /// never reaches state.json; this only has to tell one token from another.
+    /// A short, non-reversible fingerprint of the bot token. The token itself never reaches state.json; this only has to tell one token from another.
     static func botTokenFingerprint(_ token: String) -> String {
         String(
             SHA256.hash(data: Data(token.utf8))
@@ -96,9 +92,7 @@ extension TelegramPollLoop {
         )
     }
 
-    /// How long a cached identity is trusted. A rename is rare, so an hourly
-    /// getMe would be waste; a day is short enough that a stale @username
-    /// self-corrects without anyone clearing state.
+    /// A day-long username cache corrects renames without wasteful hourly getMe requests.
     static let botUsernameCacheSeconds: TimeInterval = 24 * 60 * 60
 
     /// Cache bot usernames by token fingerprint and expiry; failed lookups leave required mentions unaddressed.
@@ -148,7 +142,8 @@ extension TelegramPollLoop {
         do {
             let projection = try await bot.commandProjection()
             if case .object(let menu)? = root["commandMenu"], menu["synced"] == .bool(true),
-               (menu["commandCount"]?.integerValue.flatMap(Int.init(exactly:)) ?? menu["commandCount"]?.stringValue.flatMap(Int.init)) == projection.commands.count,
+               (menu["commandCount"]?.integerValue.flatMap(Int.init(exactly:)) ?? menu["commandCount"]?.stringValue.flatMap(
+                   Int.init)) == projection.commands.count,
                menu["registryVersion"]?.stringValue == projection.version,
                menu["botIdentity"]?.stringValue == botIdentity,
                menu["syncedAt"]?.stringValue != nil {
@@ -221,10 +216,7 @@ extension TelegramPollLoop {
         )
     }
 
-    /// A disabled bot can show the owner who messaged it without executing
-    /// anything or granting the sender authority. Preserve the whole fetched
-    /// page in the canonical inbox before advancing, so later checks progress
-    /// and enabling the bot can still process those updates with admission.
+    /// Retain setup pages before advancing so enabling later still admits them normally; discovery never grants sender authority.
     public static func discoverSenders(token: String, dataRoot: URL) async throws -> Int {
         let loop = TelegramPollLoop(token: token, revokeDriverControl: {}, dataRoot: dataRoot)
         try await loop.prepareBotIngressStorage()
@@ -277,7 +269,6 @@ extension TelegramPollLoop {
         if let preview = _tgPreview(text) {
             row["textPreview"] = .string(preview)
         }
-        // Locked append with 5 MB rotation and one backup.
         await appendErrorLog(
             .object(row),
             to: telegramDir.appendingPathComponent("errors.jsonl")

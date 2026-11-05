@@ -4,10 +4,8 @@ import NativeAgentShared
 // Blueprint: | `NativeOAuthFlow+Loopback.swift` | `NativeOAuthFlow`: `startOpenAILoopbackFlow`, `callbackPageMessage` |
 
 // MARK: - Loopback OAuth (ChatGPT / OpenAI)
-//
-// ChatGPT sign-in requires the loopback redirect http://localhost:1455/auth/callback and a PKCE exchange.
-// Buffer each connection and accept only exact callback paths with code/error; other probes receive 404.
-// Open the browser only when the listener is ready; port conflicts fail and cancellation closes the listener.
+// The ChatGPT client requires its registered loopback redirect and PKCE. Open the browser only after listener readiness; port conflicts fail and
+// cancellation closes the listener.
 
 extension NativeOAuthFlow {
 
@@ -88,9 +86,7 @@ extension NativeOAuthFlow {
         return OAuthFlowResult(ok: true, error: nil)
     }
 
-    /// The browser tab's one line once the callback lands. The token exchange
-    /// hasn't run yet, so the tab claims nothing; the app comes forward with
-    /// the real result (OAuthSignInButton.runFlow).
+    /// The callback precedes token exchange, so the browser tab cannot claim sign-in success; the app presents the actual result.
     public static func callbackPageMessage(_ url: URL) -> String {
         let declined = URLComponents(url: url, resolvingAgainstBaseURL: false)?
             .queryItems?.contains { $0.name == "error" } == true

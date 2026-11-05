@@ -4,20 +4,16 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `FluidContextToolScope.swift` | `FluidContextToolScope` enum; expanded memory pages retain stored untrusted sources |
-
-package enum FluidContextToolScope {
-    @TaskLocal package static var current: ContextPreparedTurn?
-}
+// Blueprint: | `FluidContextToolScope.swift` | Explicit prepared-context dependency; expanded memory pages retain stored untrusted sources |
 
 extension SwiftToolDispatcher {
-    func impl_context_expand(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    func impl_context_expand(turn: Turn, invocation: ChatToolInvocation, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let locator = (input["atom_id"]?.stringValue ?? "")
             .replacingOccurrences(of: "[context_expand ", with: "")
             .replacingOccurrences(of: "[context.expand ", with: "")
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "]")))
         if locator.hasPrefix("history:") {
-            guard let sessionID = ChatToolSessionContext.verifiedSessionId ?? LLMCallContext.sessionId,
+            guard let sessionID = turn.verifiedSessionID ?? turn.session,
                   !sessionID.isEmpty else {
                 throw AutonomyGateError.toolDenied(reason: "History expansion requires the current conversation.")
             }
@@ -44,15 +40,17 @@ extension SwiftToolDispatcher {
             }
             return .object(fields)
         }
-        guard let prepared = FluidContextToolScope.current else {
+        guard let prepared = invocation.preparedContext else {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("context_generation_unavailable"),
-                "message": .string("No context packet was prepared for this turn (context flow off, or its build failed), so there is nothing to expand; read the source directly instead (memory_search, read_file, or the tool that produced it)."),
+                "message": .string("""
+                    No context packet was prepared for this turn (context flow off, or its build failed), so there is nothing to expand; read the \
+                    source directly instead (memory_search, read_file, or the tool that produced it).
+                    """),
             ])
         }
-        // Blank means the one on offer; with several, name them (she sent {}
-        // three times on 09-24 and got only a code back).
+        // Blank selects the sole offered atom; multiple atoms require an explicit selection.
         let offered = prepared.packet.expandablePointers.map(\.atomID.rawValue)
         var given = locator.split(separator: " ").first.map(String.init)
         if given?.isEmpty != false, offered.count == 1 { given = offered[0] }
@@ -75,7 +73,10 @@ extension SwiftToolDispatcher {
                 "status": .string("failed"),
                 "effects": .string("none"),
                 "reason": .string("pointer_not_offered_this_turn"),
-                "message": .string("That atom id is not in this turn's context pointer list (ids from earlier turns expire); use an id listed this turn, or read the source directly."),
+                "message": .string("""
+                    That atom id is not in this turn's context pointer list (ids from earlier turns expire); use an id listed this turn, or read \
+                    the source directly.
+                    """),
                 "atom_id": .string(rawAtomID),
             ])
         }
@@ -92,8 +93,7 @@ extension SwiftToolDispatcher {
         default:
             throw ContextExpansionError.invalidCharacterOffset
         }
-        // Expansion re-checks the one atom it opens, as the choice did: an atom
-        // its owner retired or narrowed since the turn began is not opened.
+        // Expansion re-checks the one atom it opens, as the choice did: an atom its owner retired or narrowed since the turn began is not opened.
         let withheld = await prepared.verify(pointer)
         if !withheld.atomIDs.isEmpty {
             let why = withheld.unverified.map(\.reason).joined(separator: "; ")

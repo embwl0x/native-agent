@@ -2,19 +2,19 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwiftNativeManifestSigner.swift` | `SwiftNativeManifestSigner` actor; 32-byte regular 0600 signing authority with explicit backup/export/sync/privacy decisions; `canonicalBytes`, read-only `existingSigningKey` for proof checks |
+// Blueprint: | `SwiftNativeManifestSigner.swift` | `SwiftNativeManifestSigner`, `canonicalBytes`, `existingSigningKey`; Exact signing authority. |
 
 // MARK: - SwiftNativeManifestSigner
-//
-// Owns tools/.manifest_signing_key: exactly 32 binary bytes, regular 0600 file.
-// Local backup includes it; export and phone sync exclude it. PrivacyMap counts it under Tools, including hidden files.
 
 public enum ManifestSigningError: Error, LocalizedError {
     case keyUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
-        case .keyUnavailable(let m): return "manifest_signing_key_unavailable: \(m). Ask the owner to repair or restore the original 32-byte signing key as a regular 0600 file at tools/.manifest_signing_key; never replace an existing signing identity."
+        case .keyUnavailable(let m): return """
+            manifest_signing_key_unavailable: \(m). Ask the owner to repair or restore the original 32-byte signing key as a regular 0600 file at \
+            tools/.manifest_signing_key; never replace an existing signing identity.
+            """
         }
     }
 }
@@ -33,8 +33,7 @@ public actor SwiftNativeManifestSigner {
 
     // MARK: - canonical bytes
 
-    /// Canonical compact JSON expected by the signed tool registry.
-    /// Non-ASCII characters are emitted as `\uXXXX` escapes and keys sort by UTF-8 byte order.
+    /// Canonical compact JSON expected by the signed tool registry. Non-ASCII characters are emitted as `\uXXXX` escapes and keys sort by UTF-8 byte order.
     public static func canonicalBytes(_ manifest: [String: JSONValue]) throws -> Data {
         var body = manifest
         body.removeValue(forKey: "manifestSignature")
@@ -58,7 +57,8 @@ public actor SwiftNativeManifestSigner {
                 throw ToolFailureError("Signing input has a non-finite number at \(path). Replace it with a finite JSON number; keep any existing signing key.",
                     argumentPath: path, accepted: "A finite JSON number.", effects: .unknown,
                     code: "manifest_canonicalization_failed",
-                    instruction: "Replace the named value with a finite JSON number before signing; preserve any existing signing key.", recovery: .correctArguments)
+                    instruction: "Replace the named value with a finite JSON number before signing; preserve any existing signing key.",
+                        recovery: .correctArguments)
             }
             if d == d.rounded() && abs(d) < 1e16 {
                 out += String(format: "%.1f", d)
@@ -94,9 +94,7 @@ public actor SwiftNativeManifestSigner {
 
     // MARK: - key
 
-    /// Exactly 32 regular 0600 bytes; create only if missing. Invalid authority stays
-    /// byte-preserved and unavailable, never rotated. Local backup carries tools;
-    /// off-disk backup, export and phone sync exclude the key. PrivacyMap lists tools.
+    /// Bootstrap only missing signing authority; exact regular 0600 bytes remain unavailable and byte-preserved when invalid.
     public func loadOrCreateSigningKey() throws -> Data {
         do {
             return try CheckedFixedSizeSecretFile.loadOrCreate(at: keyPath, byteCount: 32) {
@@ -113,11 +111,13 @@ public actor SwiftNativeManifestSigner {
             effects: effects, owner: keyPath.path,
             tap: "Finder > Go > Go to Folder > \(keyPath.deletingLastPathComponent().path) > .manifest_signing_key > Get Info",
             code: "manifest_signing_key_unavailable",
-            instruction: "Ask the owner to repair or restore the original 32-byte signing key as a regular 0600 file; never replace an existing signing identity.")
+            instruction: """
+                Ask the owner to repair or restore the original 32-byte signing key as a regular 0600 file; never replace an existing signing \
+                identity.
+                """)
     }
 
-    /// Local backup only; excluded from production export and phone sync.
-    /// PrivacyMap lists tools as nonexportable. Metadata watches use this path.
+    /// Metadata watches share this path; only local backup may carry the signing key.
     public nonisolated var keyPath: URL { dataRoot.appendingPathComponent("tools/.manifest_signing_key") }
 
     /// Read-only proof checks never create signing authority.
@@ -187,11 +187,7 @@ public actor SwiftNativeManifestSigner {
         )
         let ti = date.timeIntervalSince1970
         let frac = ti - floor(ti)
-        // Round (not truncate) to microseconds. Date stores time as Double,
-        // and at modern epochs (~1.7e9 s) the float resolution is ~4e-7 s,
-        // so a Date constructed for ".000001+00:00" lands fractionally
-        // below 1e-6 and truncation would emit ".000000". Cap at 999_999
-        // so a rounding bump can't silently roll over to the next second.
+        // Round floating-point dates to microseconds to avoid truncating representable instants; cap to prevent second rollover.
         var micros = Int((frac * 1_000_000.0).rounded())
         if micros < 0 { micros = 0 }
         if micros > 999_999 { micros = 999_999 }

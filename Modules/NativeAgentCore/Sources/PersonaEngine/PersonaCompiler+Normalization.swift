@@ -3,10 +3,10 @@ import CoreFoundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PersonaCompiler+Normalization.swift` | `PersonaCompiler.decodeProfile` validates the complete current saved profile without inventing identity, traits or timestamps |
+// Blueprint: | `PersonaCompiler+Normalization.swift` | `PersonaCompiler.decodeProfile`. |
 
 extension PersonaCompiler {
-    /// Decode the one saved schema. Onboarding supplies explicit genesis inputs; a damaged saved field must never become a creation default.
+    /// Decode only the saved schema; damaged fields cannot become genesis defaults because onboarding owns creation.
     public static func decodeProfile(raw: [String: Any]) throws -> CompiledPersonalityProfile {
         func invalid(_ path: String, _ expected: String) -> PersonaEngineError {
             .underlying("memory/profile.json.\(path) must be \(expected). Repair that field before continuing.")

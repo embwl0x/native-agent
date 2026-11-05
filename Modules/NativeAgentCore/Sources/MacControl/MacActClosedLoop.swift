@@ -6,17 +6,13 @@ import TrustCenter
 import ApplicationServices
 #endif
 
-// Blueprint: | `MacActClosedLoop.swift` | Closed-loop action grammar, rendered-identity re-resolution, positional cohort/geometry guards, declared effects and bounded notification waits |
+// Blueprint: | `MacActClosedLoop.swift` | Closed-loop grammar, live identity, geometry guards, declared effects and bounded waits |
 
-// Actions use the existing actuator and event sink; effect verification
-// compiles the same read organ after the observation settles.
-
+// Verify effects with the same read organ after observation settles so action receipts and perception share evidence.
 
 // MARK: - One read epoch
 
-/// One walk and everything anchored to it: the tree, the app, the window title,
-/// the focus path relative to THAT root, and the root itself (needed by the
-/// page-first descent and by the act's identity re-check).
+/// Keep tree, focus, window and root in one read epoch so page descent and action identity checks share an anchor.
 public struct MacAXRead: Sendable {
     public let snapshot: MacAXTreeSnapshot
     public let app: MacAXAppInfo?
@@ -46,15 +42,11 @@ public struct MacAXRead: Sendable {
     }
 }
 
-/// The surface a semantic look observes.
 public enum MacLookScope: String, Sendable, Equatable, CaseIterable {
-    /// The web page, when the window has one. The DEFAULT: a browser's whole
-    /// value is the page, and the chrome is one summary line.
+    /// Prefer page scope so browser chrome cannot consume the page's walk budget.
     case page
-    /// The browser's own controls — the window walk, as it always was.
     case chrome
-    /// One walk over the whole window; the page competes with the chrome for
-    /// the node budget.
+    /// Whole-window scope shares one budget between page and chrome.
     case both
 
     public static func parse(_ raw: String?) -> MacLookScope? {
@@ -66,8 +58,7 @@ public enum MacLookScope: String, Sendable, Equatable, CaseIterable {
 
 // MARK: - Verbs
 
-/// What she can do to a handle. Deliberately a small closed vocabulary: the
-/// model names an INTENTION, and this file decides the mechanism.
+/// A closed verb vocabulary lets the model name intent while this owner chooses the mechanism.
 public enum MacActVerb: String, Sendable, Equatable, CaseIterable {
     case click
     case doubleClick = "double_click"
@@ -91,7 +82,6 @@ public enum MacActScrollDirection: String, Sendable, Equatable {
 // MARK: - The loop's constants and pure logic
 
 public enum MacActClosedLoop {
-    /// Subscribed effect kinds cover value, focus, window/sheet, title/layout, menu, selection/row-count and live-region changes.
     public static let notificationKinds: [String] = [
         "AXValueChanged",
         "AXFocusedUIElementChanged",
@@ -107,18 +97,12 @@ public enum MacActClosedLoop {
         "AXLiveRegionChanged",
     ]
 
-    /// Default wait for the first notification.
     public static let defaultWaitMs = 300
-    /// HARD cap. A verb that waits longer than this is a hang wearing a
-    /// perception costume — the caller gets `none_observed` and can look again.
+    /// Bound waits so an unresponsive UI returns none_observed instead of hanging the turn.
     public static let maxWaitMs = 2000
-    /// After the first notification, keep collecting for this long: a real UI
-    /// change fires a burst (Calculator: AXValueChanged then AXTitleChanged),
-    /// and a diff built from the first one alone describes half the effect.
+    /// Collect a short notification burst so a value change followed by a title change cannot produce a half-effect diff.
     public static let quietWindowMs = 80
-    /// Notification kinds reported in the result.
     public static let maxReportedNotifications = 12
-    /// Affordance rows per diff bucket.
     public static let maxDiffRows = 10
 
     /// Refuse non-editable targets rather than activating them through a typing approximation.
@@ -130,14 +114,11 @@ public enum MacActClosedLoop {
         "AXSecureTextField",
     ]
 
-    /// Whether `type` has any business on this element.
     public static func canType(role: String) -> Bool { typeableRoles.contains(role) }
 
     // MARK: - Secure keyboard entry
 
-    /// A named refusal for a synthesized-input site: the machine-readable
-    /// reason plus the sentence the caller is owed. Same shape and same job as
-    /// `KeyWindowRefusal` — this is the second thing that eats keystrokes.
+    /// Secure-input refusals retain both a machine-readable reason and an actionable sentence.
     public struct SecureInputRefusal: Equatable, Sendable {
         public let reason: String
         public let note: String
@@ -147,10 +128,7 @@ public enum MacActClosedLoop {
         }
     }
 
-    /// Roles that hold a SECRET. `AXSecureTextField` stays in `typeableRoles`
-    /// deliberately: the answer to "type into a password field" is not the
-    /// generic `verb_not_supported_on_element` shrug the non-editable roles
-    /// get, it is a refusal that says what the element is and why I stopped.
+    /// Keep secure fields in typeableRoles so password targets receive a specific credential refusal rather than a generic unsupported-verb answer.
     public static let secureFieldRoles: Set<String> = ["AXSecureTextField"]
 
     public static func isSecureField(role: String) -> Bool {
@@ -160,9 +138,7 @@ public enum MacActClosedLoop {
     public static let secureFieldReason = "secure_field_target"
     public static let secureInputReason = "secure_input_active"
 
-    /// `type` aimed at a password field. A deliberate boundary, not a
-    /// mechanism failure: even where AXSetValue would carry it, filling
-    /// someone's password box is not an act I take on my own.
+    /// Credential entry belongs to the person even when AXSetValue could technically write the field.
     public static func secureFieldRefusal(role: String) -> SecureInputRefusal? {
         guard isSecureField(role: role) else { return nil }
         return SecureInputRefusal(
@@ -174,7 +150,6 @@ public enum MacActClosedLoop {
         )
     }
 
-    /// Name why this act's mechanism requires the target window in front.
     public static func needsFrontReason(_ requestedAction: String) -> String {
         switch requestedAction {
         case "AXPress": return "that control doesn't answer an accessibility press, so it needs a real click"
@@ -189,13 +164,14 @@ public enum MacActClosedLoop {
         guard active else { return nil }
         return SecureInputRefusal(
             reason: secureInputReason,
-            note: "Secure keyboard entry blocks synthetic typing; nothing was posted. Dismiss or unfocus its source, often a password field, Terminal sudo prompt or password manager, before continuing."
+            note: """
+                Secure keyboard entry blocks synthetic typing; nothing was posted. Dismiss or unfocus its source, often a password field, Terminal sudo \
+                prompt or password manager, before continuing.
+                """
         )
     }
 
-    /// Labels a modal's dismiss button is allowed to carry, lowercased.
-    /// Ordered: the least destructive answer first, so a sheet offering both
-    /// "Cancel" and "OK" is cancelled rather than confirmed.
+    /// Try modal dismiss labels from least destructive to most so a sheet offering Cancel and OK is cancelled.
     public static let dismissLabels: [String] = ["cancel", "close", "dismiss", "done", "ok"]
 
     public static func clampedWaitMs(_ requested: Int?) -> Int {
@@ -216,35 +192,19 @@ public enum MacActClosedLoop {
         }
     }
 
-    /// nil ⇒ the frame's window is key and synthesized input may be posted.
-    ///
-    /// - Parameter focusedWindow: the app's focused window, or nil when the
-    ///   source cannot tell. Cannot-tell is NOT a match and NOT a mismatch: the
-    ///   app-level check has already passed by then, and inventing a
-    ///   window-level verdict from silence would refuse every act on a source
-    ///   that simply does not publish the attribute.
+    /// Nil permits input only after app admission. A source with no focused-window evidence cannot alone establish a window match or mismatch.
     public static func keyWindowRefusal(
         framePid: Int32,
         frontmostPid: Int32?,
         frontmostName: String?,
-        /// The ELEMENT HANDLE of the window this frame was matched to, and of
-        /// the app's focused window. Handles, not identities: the identity
-        /// matcher exists to FIND the frame's window among an app's windows and
-        /// its sole-candidate rule deliberately tolerates a retitle, which is
-        /// right there and wrong here — asked "is this the key window?" it
-        /// answers "yes" for the only window it was handed. The act path has
-        /// already matched the frame to a concrete window, so the honest
-        /// question is whether that window IS the focused one, and that is
-        /// handle equality.
+        /// Compare concrete window handles for key ownership; descriptive identity matching tolerates retitles and its sole-candidate rule cannot prove which
+        /// window is focused.
         frameWindowHandle: Int?,
         focusedWindowHandle: Int?,
         frameWindowTitle: String?,
         focusedWindowTitle: String?,
-        /// How many windows the frame's app has RIGHT NOW, when the caller
-        /// knows. Only consulted when the focused window could not be named:
-        /// with one window, "this app is frontmost" already proves the frame's
-        /// window is the key one, and with several it proves nothing. nil ⇒ the
-        /// caller did not ask, and the old silence-tolerating rule stands.
+        /// When focus is unknown, a known single-window app has no window ambiguity; multiple windows prove nothing. Nil leaves the source's window count
+        /// unknown.
         appWindowCount: Int? = nil
     ) -> KeyWindowRefusal? {
         let frameWindowTitle = receiptText(frameWindowTitle)
@@ -266,9 +226,8 @@ public enum MacActClosedLoop {
                     + "nothing was selected. Bring that window to the front and call mac.look again."
             )
         }
-        // Right app, wrong window of it. Asserted ONLY when both handles are
-        // known: a source that cannot name its focused window has told us
-        // nothing, and silence is not a mismatch.
+        // Right app, wrong window of it. Asserted ONLY when both handles are known: a source that cannot name its focused window has told us nothing, and
+        // silence is not a mismatch.
         if let frameWindowHandle, let focusedWindowHandle, frameWindowHandle != focusedWindowHandle {
             return KeyWindowRefusal(
                 reason: "window_not_key",
@@ -293,14 +252,7 @@ public enum MacActClosedLoop {
 
     // MARK: drift
 
-    /// Why the live element is NOT the thing she named.
-    ///
-    /// The frame is up to 180 s old and a handle is a REFERENCE, not a lease:
-    /// between the look and the act the app may have rebuilt the window, and
-    /// the child-index path the handle resolves through would then address a
-    /// DIFFERENT control. Acting anyway is the worst failure this tool has —
-    /// "press Save" pressing "Delete" — so the identity is re-checked against
-    /// the live element and a mismatch fails loud.
+    /// Handles are references, not leases: rebuilt child paths can point at another control. Recheck live identity before acting.
     public static func driftReason(
         expectedRole: String,
         expectedLabel: String?,
@@ -311,29 +263,22 @@ public enum MacActClosedLoop {
         if liveRole != expectedRole {
             return "role"
         }
-        // The label is only compared when the FRAME recorded one. An affordance
-        // label can be title-derived or value-derived (a popup button publishes
-        // its own state as its name), so the live side is read the same way the
-        // compiler read it: title first, value as the fallback.
+        // Compare labels only when the frame recorded one, using the compiler's title/value identity ordering so popup state stays comparable.
         guard let expectedLabel = normalizedLabel(expectedLabel) else { return nil }
         let live = normalizedLabel(liveTitle) ?? normalizedLabel(liveValue)
         guard let live else { return "label" }
         return live == expectedLabel ? nil : "label"
     }
 
-    /// How far a positional handle's element may have moved and still be the
-    /// same element. Two points: enough for a re-layout's sub-pixel rounding,
-    /// far less than any real row height.
+    /// Two points tolerate layout rounding while remaining below a real row height.
     public static let positionalDriftTolerancePoints: Double = 2
 
-    /// Which identity component moved, and what is there now.
     public struct IdentityDrift: Sendable, Equatable {
         public let on: String
         public let found: JSONValue
     }
 
-    /// Resolve the recorded rendered identity on the live screen. Positional
-    /// identities still require their original cohort and geometry below.
+    /// Resolve the recorded rendered identity on the live screen. Positional identities still require their original cohort and geometry below.
     public static func liveIdentity(
         entry: MacLookFrameEntry,
         percept: MacLookPercept
@@ -344,11 +289,8 @@ public enum MacActClosedLoop {
         guard let focus = percept.focus, focus.handle == entry.handle, let handle = focus.handle else {
             return nil
         }
-        // Built from the FOCUS channel exactly as `MacLookFrame.entries` built
-        // the entry from it: the rendered handle, the role, and the label the
-        // compile redacted under the full node context. `frame` stays nil — the
-        // focus channel publishes no rect, which is why a focus-derived entry is
-        // never `ambiguous` and never reaches the positional branch.
+        // Focus-derived entries use the same rendered handle, role and contextual redaction as the frame. They have no rect and cannot enter positional
+        // matching.
         return MacLookAffordance(
             handle: handle,
             role: focus.role,
@@ -359,8 +301,7 @@ public enum MacActClosedLoop {
         )
     }
 
-    /// An identity not found in this observation cannot authorize an act;
-    /// an incomplete/unreadable observation does not prove removal.
+    /// An identity not found in this observation cannot authorize an act; an incomplete/unreadable observation does not prove removal.
     public static func identityDrift(
         entry: MacLookFrameEntry,
         live: MacLookAffordance?
@@ -466,20 +407,17 @@ public enum MacActClosedLoop {
         }
     }
 
-    /// Navigation waits for a subscribed structural-transition notification or its deadline, not an early selection change; element destruction alone does not prove navigation.
+    /// Navigation waits for structural transition or deadline; early selection and element destruction alone do not prove it.
     public static let navigationNotificationKinds: Set<String> = [
-        // Finder retitles the window to the opened folder — the measured signal.
+        // Finder retitles its window to the opened folder, providing a navigation signal.
         "AXTitleChanged",
         "AXFocusedWindowChanged",
         "AXWindowCreated",
-        // A sheet opening IS a transition, and `navigated` already counts it.
+        // A new sheet supplies the modal transition counted by navigated.
         "AXSheetCreated",
     ]
 
-    /// A navigation verb's default budget. The 300 ms default was tuned on
-    /// Calculator, where the effect IS the first notification; a folder load is
-    /// a different order of magnitude. Still under `maxWaitMs`, and still a
-    /// DEADLINE, not a sleep — the wait ends the moment the signal arrives.
+    /// Navigation gets a larger default than immediate value changes because folder loads take longer; the deadline still ends early on a transition.
     public static let navigationWaitMs = 1500
 
     public static func waitForEffect(
@@ -522,12 +460,8 @@ public enum MacActClosedLoop {
 
     // MARK: - The Open command
 
-    /// Does the destination we LANDED on correspond to what we asked to open?
-    /// Finder retitles the window to the opened folder's name, so the acted
-    /// row's label and the post-act title are directly comparable.
-    ///
-    /// Nil means NOT CHECKABLE, which is not the same as matched — the caller
-    /// falls back to the structural floor rather than promoting.
+    /// Finder retitles to the destination folder, permitting direct label/title comparison. Nil means uncheckable; only structural evidence can then establish
+    /// arrival.
     public static func destinationMatchesIntent(
         title: String?,
         intendedTarget: String?
@@ -549,12 +483,9 @@ public enum MacActClosedLoop {
 
     public struct ActClassification: Sendable, Equatable {
         public let status: String
-        /// A machine-readable code, `nil` on a clean `acted`.
         public let reason: String?
-        /// The same verdict in a sentence the caller can act on.
         public let note: String?
-        /// A press verified by a settled readout alone: enough to tell her it
-        /// worked, never enough to teach or clear a press route.
+        /// A press verified by a settled readout alone: enough to tell the agent it worked, never enough to teach or clear a press route.
         public let readoutOnly: Bool
         static let readoutOnlyScope = "readout_only"
 
@@ -577,8 +508,7 @@ public enum MacActClosedLoop {
         }
     }
 
-    /// The act declares its effect before input. All routes use this judge;
-    /// pixels and notification counts alone cannot satisfy a declaration.
+    /// The act declares its effect before input. All routes use this judge; pixels and notification counts alone cannot satisfy a declaration.
     enum DeclaredEffect {
         case text(String?)
         case placement(MacSavePanelPlacement, String?)
@@ -612,8 +542,7 @@ public enum MacActClosedLoop {
         switch effect {
         case .text(let expected):
             readback = "The complete AXValue matches the declared edit."
-            // Canonical field masking makes the complete text unavailable,
-            // including short masked values and fields with no secure subrole.
+            // Canonical field masking makes the complete text unavailable, including short masked values and fields with no secure subrole.
             guard let expected, let value = value(),
                   !MacScreenViewBuilder.isSecretField(role: "AXTextField", subrole: nil, label: nil, value: value) else {
                 return ActClassification(status: "acted_unobserved", reason: "effect_unreadable",
@@ -629,10 +558,12 @@ public enum MacActClosedLoop {
                     let tail = String(decoding: Array(text.utf16.dropFirst(max(0, offset - 1)).prefix(40)), as: UTF16.self)
                     return receiptText(tail) ?? ""
                 }
-                // The field was read. Only a field that moved off its pre-typing value took
-                // the input (an app that capitalizes or curls quotes changed it); unknown or
-                // unchanged is not evidence that anything landed.
-                let quoted = "typed \"\(excerpt(expected))\", it reads \"\(excerpt(value))\" (from UTF-16 offset \(offset); typed length \(expected.utf16.count), read length \(value.utf16.count))"
+                // The field was read. Only a field that moved off its pre-typing value took the input (an app that capitalizes or curls quotes changed it);
+                // unknown or unchanged is not evidence that anything landed.
+                let quoted = """
+                    typed \"\(excerpt(expected))\", it reads \"\(excerpt(value))\" (from UTF-16 offset \(offset); typed length \(expected.utf16.count), read \
+                    length \(value.utf16.count))
+                    """
                 guard let valueBefore, value != valueBefore else {
                     return ActClassification(status: "acted_unobserved",
                         reason: valueBefore == nil ? "text_differs" : "text_unchanged",
@@ -648,7 +579,9 @@ public enum MacActClosedLoop {
             let actual = directory.flatMap(URL.init(string:))
             guard actual?.isFileURL == true, actual?.standardizedFileURL.resolvingSymlinksInPath() == wanted else {
                 return ActClassification(status: directory == nil ? "acted_unobserved" : "acted_mismatch",
-                    reason: "save_panel_placement_unverified", note: "Directory URL reads \(receiptText(directory) ?? "unavailable"); expected \(receiptText(wanted.absoluteString) ?? "").")
+                    reason: "save_panel_placement_unverified", note: """
+                        Directory URL reads \(receiptText(directory) ?? "unavailable"); expected \(receiptText(wanted.absoluteString) ?? "").
+                        """)
             }
             return verify(.text(placement.name), value: value(), redactingText: redactingText)
         case .selectAll:
@@ -692,18 +625,15 @@ public enum MacActClosedLoop {
                 : diff?.modalAppeared == true ? "A modal appeared in the target app."
                 : "The target's accessibility surface changed."
             mismatch = "The target's AX surface is unchanged; a surface transition was expected."
-            // Notifications wake the read; only the owning process's window
-            // inventory or its modal readback establishes the declared effect.
-            // Confirmed creation satisfies the declaration even when the
-            // pressed control's subtree in the existing surface is unchanged.
+            // Notifications wake the read; only the owning process's window inventory or its modal readback establishes the declared effect. Confirmed creation
+            // satisfies the declaration even when the pressed control's subtree in the existing surface is unchanged.
             if surfaceChanged == true {
                 matches = true
             } else if let press, let diff {
                 let evidence = pressEvidence(diff, before: press.before, pressed: press.target,
                                              settled: press.settled)
                 readoutOnly = evidence.readoutOnly
-                // An unrelated change leaves the result uncertain, even with
-                // a complete census. It earns no route-learning evidence.
+                // An unrelated change leaves the result uncertain, even with a complete census. It earns no route-learning evidence.
                 matches = evidence.consequence ? true : nil
             } else if processGone || dismissed == true || diff?.modalDisappeared == true
                 || diff?.modalAppeared == true {
@@ -712,15 +642,19 @@ public enum MacActClosedLoop {
                 if diff.windowTitleChanged, let destination,
                    destinationMatchesIntent(title: diff.windowTitleAfter, intendedTarget: destination) == false {
                     return ActClassification(status: "acted_mismatch", reason: "destination_mismatch",
-                        note: "The window reads \"\(receiptText(diff.windowTitleAfter, redacted: windowTitleJSON) ?? "")\"; expected destination \"\(receiptText(destination, redacted: destinationJSON) ?? "")\".")
+                        note: """
+                            The window reads \"\(receiptText(diff.windowTitleAfter, redacted: windowTitleJSON) ?? "")\"; expected destination \
+                            \"\(receiptText(destination, redacted: destinationJSON) ?? "")\".
+                            """)
                 }
-                // Without press evidence an unchanged surface cannot tell an
-                // ignored press from one that changed nothing (All Clear on a
-                // clear calculator): that is unobserved, never a mismatch. Only
-                // a contradiction (the destination above) is a mismatch.
+                // Without press evidence an unchanged surface cannot tell an ignored press from one that changed nothing (All Clear on a clear calculator):
+                // that is unobserved, never a mismatch. Only a contradiction (the destination above) is a mismatch.
                 matches = diff.navigated ? true : nil
                 if !diff.navigated, diff.diffComparable {
-                    unobserved = "The press went out; the target's accessibility surface reads the same, which cannot tell an ignored press from one that changed nothing."
+                    unobserved = """
+                        The press went out; the target's accessibility surface reads the same, which cannot tell an ignored press from one that changed \
+                        nothing.
+                        """
                 }
             } else { matches = surfaceChanged }
         case .dismissed:
@@ -759,20 +693,10 @@ public enum MacActClosedLoop {
         return "[redacted]"
     }
 
-    /// Diff the BEFORE frame (what she looked at and named handles from)
-    /// against the AFTER percept (compiled from the same window, post-act).
-    ///
-    /// Keyed by HANDLE, because that is the identity she holds. A handle whose
-    /// fingerprint changed (an app retitling C → AC) shows up as one removal
-    /// and one addition, which is the truth: the control was renamed, and the
-    /// old handle no longer addresses it.
+    /// Compare handles across pre/post frames. A changed fingerprint is a removal and addition because the renamed control no longer has the captured identity.
     // MARK: dismiss target selection
 
-    /// The button inside the CURRENT frame's modal that closes it.
-    ///
-    /// Scoped by PATH PREFIX to the modal, not searched window-wide: a window
-    /// behind a sheet often has its own "Close", and pressing that instead of
-    /// the sheet's would act on the wrong surface entirely.
+    /// Scope dismiss buttons to the current modal's path prefix; a Close button in the window behind must never receive the dismissal.
     public static func dismissTarget(
         in frame: MacLookFrame
     ) -> MacLookFrameEntry? {

@@ -16,7 +16,10 @@ extension SenseHelperProcess {
         return value
     }
 
-    private nonisolated static func materialValue(_ material: SenseMaterial, dataRoot: URL) throws -> (JSONValue, (path: String, bytes: Int, version: String, data: Data)?) {
+    private nonisolated static func materialValue(
+        _ material: SenseMaterial,
+        dataRoot: URL
+    ) throws -> (JSONValue, (path: String, bytes: Int, version: String, data: Data)?) {
         switch material {
         case .accessibility(let tree): return (.object(["kind": .string("accessibility"), "tree": tree]), nil)
         case .file(let path, let bytes, let captured):
@@ -78,7 +81,7 @@ extension SenseHelperProcess {
         return data
     }
 
-    /// Stored ZIP keeps package member identities intact without granting the helper filesystem access or staging a copy of User's material in scratch.
+    /// ZIP preserves package member identity without helper filesystem access or scratch copies of the person's material.
     private nonisolated static func packageArchive(_ root: URL, dataRoot: URL) throws -> (data: Data, bytes: Int) {
         let files = try ExistingCornersSourceProvider.packageManifest(root).filter(\.isFile).map(\.url)
         func word<T: FixedWidthInteger>(_ number: T, into data: inout Data) {

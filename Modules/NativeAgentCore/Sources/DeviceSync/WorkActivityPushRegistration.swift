@@ -4,7 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `WorkActivityPushRegistration.swift` | Work-activity push registration, start reservation state and pairing fingerprints with unchanged saved Codable keys |
+// Blueprint: | `WorkActivityPushRegistration.swift` | Push registration, retained start reservations and pairing fingerprints. |
 struct WorkActivityPushRegistration: Codable, Equatable, Sendable {
     enum StartOutcome: String, Codable, Sendable {
         case unknown, accepted, observed, notObserved
@@ -21,13 +21,12 @@ struct WorkActivityPushRegistration: Codable, Equatable, Sendable {
     var activityTokens: [String: String] = [:]
     var lastContents: [String: MobileWorkActivity.ContentState] = [:]
     var startedIDs: Set<String> = []
-    // Optional so registrations saved before start reservations remain readable.
     var startOutcomes: [String: StartOutcome]?
     var startReservations: [String: StartReservation]?
 
     mutating func retireInactiveStarts(activeIDs: Set<String>, now: Date) {
         if startReservations == nil { startReservations = [:] }
-        // Adopt legacy reservations into retention once; their start time is unknown.
+        // Unknown start time needs a retention anchor before pruning can be bounded.
         for id in startedIDs where startReservations?[id] == nil {
             startReservations?[id] = StartReservation(retainedAt: now,
                                                      expiresAt: lastContents[id]?.updatedAt.addingTimeInterval(5 * 60) ?? now)

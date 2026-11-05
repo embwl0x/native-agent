@@ -4,14 +4,8 @@ import PersistenceCore
 // Blueprint: | `MacFourVerbs.swift` | `MacFourVerbs` struct |
 
 // MARK: - Four verbs — screen · act · go · wait
-// Resolve names against fresh perception and return results in words through the existing dispatch and safety owners.
-// Workspace screens may carry exact control bindings; the workspace owns their tokens and fresh selections after refusal.
-// Screen text retains compiler redaction through `MacScreenRender` and `MacScreenText`.
-// Withheld labels cannot be named; resolution uses display text only, and typed text is never echoed.
-//
-// `act` accepts names and points on an image already delivered to the model.
-// The physical owner resolves captured-image geometry and retains per-event
-// driver, focus and attention admission; a point grants no authority.
+// Workspace bindings retain their owner’s identity and admission; image points grant no authority. Withheld labels cannot be named, compiler
+// redaction survives rendering, and typed text is never echoed.
 
 // MARK: - The four verbs
 
@@ -22,15 +16,10 @@ public struct MacFourVerbs: Sendable {
     let clock = SystemMacFourVerbsClock()
     let supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)?
     let namedLocationRoots: [URL]
-    /// AUTHORITY, explicitly: subscribing is not perception. Nothing is
-    /// installed until the first `sight()` has SUCCEEDED, and that sight goes
-    /// through `host.dispatch("look")`, which runs the full gate pre-flight
-    /// (accessibility category + an active Full Mac window). A refused look
-    /// returns blind before a single observer exists.
+    /// Subscribe only after `sight()` passes the dispatch permission gates; a refused look must leave no observer installed.
     let effectObserverSource: any MacAXEffectObserverSource
     let appActivationSource: any MacAppActivationObserverSource
-    /// Her-screen 09-24 — the last app window this verb saw, for her home's
-    /// "my windows". Nil unless the caller asks.
+    /// Home’s window reporting is opt-in; unrequested observations remain nil.
     public var sightRecorder: MacSightRecorder?
 
     public init(
@@ -51,15 +40,12 @@ public struct MacFourVerbs: Sendable {
 
 }
 
-/// The last window one verb call saw: its app, its kind (AX role/subrole,
-/// never a title) and its top readout as the look redacted it.
+/// Window identity uses role/subrole rather than a potentially sensitive title; readouts retain look redaction.
 public final class MacSightRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var seen: (app: String, kind: String?, readouts: [String], before: [String])?
     public init() {}
-    /// Every readout the look let through, ranked; `before` is the same app's
-    /// readouts one look earlier in this call (an act's pre-action look), so
-    /// the one the act changed can be told apart.
+    /// Compare ranked readouts against the same app’s pre-action look to identify what the act changed.
     func record(app: String, kind: String?, readouts: [String]) {
         lock.withLock { seen = (app, kind, readouts, seen?.app == app ? seen?.readouts ?? [] : []) }
     }

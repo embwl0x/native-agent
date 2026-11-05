@@ -1,8 +1,7 @@
 import Foundation
-// Blueprint: | `SlackSocketModeSupport.swift` | `SlackHandlingCompletion` keeps deferred settings operations within the accepted handler's lifetime, after reply settlement; checked socket errors |
+// Blueprint: | `SlackSocketModeSupport.swift` | `SlackHandlingCompletion` retains deferred settings work through reply settlement; checked socket errors |
 
-/// Settings restarts run after reply delivery settles, within the accepted
-/// handler's retained lifetime rather than in detached work.
+/// Settings restarts run after reply delivery settles, within the accepted handler's retained lifetime rather than in detached work.
 actor SlackHandlingCompletion {
     private var operations: [@Sendable () async -> Void] = []
 

@@ -1,14 +1,10 @@
 import Foundation
+import NativeAgentCore
 import ToolRegistry
-// Blueprint: | `MacChatStreamAccumulator.swift` | `ChatStreamAccumulator` actor consumes core `TurnStreamEvent` directly and sanitizes activity; deltas arm one publication deadline, rearmed only for owed text; settlement/termination cancel and join publication |
+// Blueprint: | `MacChatStreamAccumulator.swift` | `ChatStreamAccumulator`; `TurnStreamEvent`; Coalesced deltas; joined final publication |
 
-/// Stream-local accumulator for one chat turn's deltas.
-///
-/// Token intake, append and length accounting stay here; only changed display
-/// snapshots cross to MainActor. Publication retires when no text has changed.
-///
-/// `takeIfChanged` only hands back growing text. A settled-state update joins
-/// the publisher and flushes the full snapshot before changing presentation.
+/// Accumulate deltas off MainActor and publish changed snapshots only.
+/// Join and flush before settlement so an older queued frame cannot overwrite the final reply.
 public actor ChatStreamAccumulator {
     public init() {}
     public static let publishInterval: TimeInterval = 0.07
@@ -18,15 +14,14 @@ public actor ChatStreamAccumulator {
     private var ticker: Task<Void, Error>?
     private var nextPublicationAt: ContinuousClock.Instant?
 
-    /// Consume tokens here, not in the MainActor caller. Only changed display
-    /// snapshots cross back; a provider pause never leaves a trailing chunk
-    /// waiting for the next token. Join the publisher before completion/error
-    /// so an already-enqueued snapshot cannot overwrite the final reply.
+    /// Publish changed text off the token path so provider pauses leave no stranded chunk.
+    /// Join publication before completion or error so stale frames cannot overwrite settlement.
     public func consume(
         _ stream: AsyncThrowingStream<TurnStreamEvent, Error>,
         interval: TimeInterval,
         activityIdentity: MacChatTurnIdentity,
         onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void,
+        onMovement: @escaping @Sendable (TurnCallWriting?) async -> Void,
         publish: @escaping @MainActor @Sendable (String, Int, Bool?) throws -> Void
     ) async throws -> String {
         defer { ticker = nil; nextPublicationAt = nil }
@@ -53,6 +48,9 @@ public actor ChatStreamAccumulator {
                     if let activity = MacChatTurnActivityBoundary.activity(
                         from: update, identity: activityIdentity, shown: shown, at: Date()
                     ) { await onTurnActivity(activity) }
+                    continue
+                case .writing(let writing):
+                    await onMovement(writing)
                     continue
                 case .error(let message):
                     throw NSError(domain: "NativeAgentStream", code: -1,
@@ -108,7 +106,6 @@ public actor ChatStreamAccumulator {
         }
     }
 
-    /// The latest text, but only when it has grown since the last take.
     private func takeIfChanged() -> String? {
         guard accumulatedUTF16 > takenUTF16 else { return nil }
         takenUTF16 = accumulatedUTF16
